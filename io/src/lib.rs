@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+pub mod amd_vi;
+mod amd_vi_tests;
 pub mod coherent_pool;
 mod coherent_pool_tests;
 pub mod iommu;
@@ -160,6 +162,9 @@ pub enum IoError {
     /// A reserved DMA pool range was refused: unaligned, empty, overlapping
     /// another pool, or intersecting System RAM.
     PoolRejected,
+    /// An IOMMU command (invalidation + completion wait) did not complete
+    /// in time; the affected translation must be treated as live.
+    Timeout,
 }
 
 impl fmt::Display for IoError {
@@ -173,6 +178,7 @@ impl fmt::Display for IoError {
                 f.write_str("io: non-coherent device has no reserved DMA pool")
             }
             IoError::PoolRejected => f.write_str("io: reserved DMA pool range refused"),
+            IoError::Timeout => f.write_str("io: IOMMU command completion timed out"),
         }
     }
 }
@@ -719,6 +725,9 @@ fn alloc_with(
     if len == 0 {
         return Err(IoError::NoMemory);
     }
+    // Gate for the late per-domain opt-in (`iommu::init`): physical DMA
+    // addresses may now be in a device's hands.
+    iommu::note_dma_issued();
     // Round the request up to a power-of-two page count and allocate that
     // many PHYSICALLY-CONTIGUOUS frames from the buddy, so a device can DMA
     // the whole buffer through a single (phys, len) descriptor — the block

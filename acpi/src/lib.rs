@@ -3019,8 +3019,19 @@ pub unsafe fn parse_ivrs(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
         return Err(AcpiError::BadTableChecksum);
     }
     let n = parse_ivrs_body(body);
+    *IVRS_COPY.lock() = Some(body.to_vec());
     IVRS_PARSED.store(true, Ordering::Release);
     Ok(n)
+}
+
+/// Heap copy of the checksum-verified IVRS (SDT header included), kept so
+/// the AMD-Vi backend (`narf_io::amd_vi::ivrs`) can decode IVHD device
+/// entries and IVMD blocks after firmware memory may have been reclaimed.
+static IVRS_COPY: IrqSafeSpinLock<Option<alloc::vec::Vec<u8>>> = IrqSafeSpinLock::new(None);
+
+/// The IVRS bytes [`parse_ivrs`] verified, if it succeeded.
+pub fn ivrs_table_copy() -> Option<alloc::vec::Vec<u8>> {
+    IVRS_COPY.lock().clone()
 }
 
 pub fn is_ivrs_known() -> bool {

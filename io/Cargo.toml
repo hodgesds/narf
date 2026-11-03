@@ -16,6 +16,8 @@ narf-lib          = { path = "../lib" }
 narf-memory       = { path = "../memory" }
 narf-capabilities = { path = "../capabilities" }
 narf-acpi         = { path = "../acpi" }
+narf-boot         = { path = "../boot" }
+narf-time         = { path = "../time" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]

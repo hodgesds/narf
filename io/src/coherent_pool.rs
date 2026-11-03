@@ -344,7 +344,10 @@ pub fn alloc_coherent_for(
         None if crate::iommu::mode() == crate::iommu::IommuMode::PerDomain => {
             return Err(IoError::NotMapped)
         }
-        None => dma_mask,
+        None => {
+            crate::iommu::note_dma_issued();
+            dma_mask
+        }
     };
     let mut buf = match (&dev.pool, dev.coherence) {
         (Some(pool), _) => pool.alloc(len, domain, phys_mask)?,

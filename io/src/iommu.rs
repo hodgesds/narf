@@ -17,11 +17,11 @@
 //! `generic_pt/fmt/{amdv1,vtdss}.h`) and a per-domain IOVA allocator
 //! ([`crate::iova`], Linux `iova.c`). Unmap is strict, as Linux
 //! `iommu.strict=1`: clear PTEs → backend IOTLB invalidation +
-//! completion wait → free IOVA → caller frees frames. `init` still
-//! selects `Identity`: no silicon backend (AMD-Vi command buffer /
-//! device table, VT-d queued invalidation, SMMUv3 STE/CMDQ) is
-//! implemented yet, so nothing in the boot path enables
-//! `PerDomain` today.
+//! completion wait → free IOVA → caller frees frames. `init` selects
+//! `Identity` unless the boot command line opts in with
+//! `iommu.passthrough=0`; then an AMD-Vi platform brings up the
+//! [`crate::amd_vi`] silicon backend and enters `PerDomain`. VT-d and
+//! SMMUv3 backends do not exist.
 //!
 //! Specs:
 //! - AMD I/O Virtualization Technology (IOMMU) Specification,
@@ -145,6 +145,12 @@ pub enum IommuInitError {
 /// `parse_ivrs`), inspects the first reported unit, and sets up
 /// identity-mapping mode.
 ///
+/// Opt-in only: with `iommu.passthrough=0` on the kernel command line, an
+/// AMD-Vi platform whose devices have not yet been handed any DMA address
+/// brings up the [`crate::amd_vi`] backend and enters
+/// [`IommuMode::PerDomain`]; [`per_domain_opt_in`] reports the outcome.
+/// Without the switch nothing changes: identity mode, hardware untouched.
+///
 /// Idempotent only in the failure case: a successful init
 /// records the vendor + caps and rejects subsequent calls.
 pub fn init() -> Result<IommuMode, IommuInitError> {
@@ -232,7 +238,78 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
     STATE.primary_mmio_base.store(mmio_base, Ordering::Release);
     *STATE.mode.lock() = IommuMode::Identity;
 
-    Ok(IommuMode::Identity)
+    if !per_domain_requested_in(narf_boot::cmdline()) {
+        *OPT_IN.lock() = PerDomainOptIn::NotRequested;
+        return Ok(IommuMode::Identity);
+    }
+    let outcome = if vendor != IommuVendor::AmdVi {
+        PerDomainOptIn::NoBackend
+    } else if IDENTITY_DMA_ISSUED.load(Ordering::Acquire) {
+        // A device already holds a physical DMA address; attaching it
+        // later would make that address fault. Linux decides the default
+        // domain type before any driver probes.
+        PerDomainOptIn::DmaAlreadyHandedOut
+    } else {
+        match crate::amd_vi::boot_enable() {
+            Ok(hw) => match enable_per_domain(hw) {
+                Ok(()) => PerDomainOptIn::Enabled,
+                Err(_) => PerDomainOptIn::AlreadyPerDomain,
+            },
+            Err(e) => PerDomainOptIn::Failed(e),
+        }
+    };
+    *OPT_IN.lock() = outcome;
+    Ok(mode())
+}
+
+/// Boot switch for per-domain translation: Linux `iommu.passthrough=0`
+/// (default DMA domains instead of identity). Absent ⇒ [`IommuMode::Identity`].
+pub const PER_DOMAIN_CMDLINE_KEY: &str = "iommu.passthrough";
+
+/// Whether `cmdline` asks for per-domain translation (`iommu.passthrough=`
+/// `0` / `n` / `N` / `off`, the false spellings of Linux `kstrtobool`).
+pub fn per_domain_requested_in(cmdline: &str) -> bool {
+    narf_boot::args::KernelCmdline::new(cmdline)
+        .value(PER_DOMAIN_CMDLINE_KEY)
+        .is_some_and(|v| matches!(v, "0" | "n" | "N" | "off"))
+}
+
+/// Outcome of the `iommu.passthrough=0` opt-in, for boot diagnostics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PerDomainOptIn {
+    /// [`init`] has not run.
+    Unknown,
+    /// Switch absent: identity mode, IOMMU hardware untouched.
+    NotRequested,
+    /// AMD-Vi backend up, [`IommuMode::PerDomain`] active.
+    Enabled,
+    /// Requested on a platform without a silicon backend (VT-d).
+    NoBackend,
+    /// Requested, but [`init`] ran after a DMA buffer was already handed
+    /// out with a physical address; mode stays identity.
+    DmaAlreadyHandedOut,
+    /// Per-domain mode was already active (test harness).
+    AlreadyPerDomain,
+    /// AMD-Vi bring-up failed; mode stays identity.
+    Failed(crate::amd_vi::EnableError),
+}
+
+static OPT_IN: IrqSafeSpinLock<PerDomainOptIn> = IrqSafeSpinLock::new(PerDomainOptIn::Unknown);
+
+/// Set once any DMA address is handed out before per-domain mode.
+static IDENTITY_DMA_ISSUED: AtomicBool = AtomicBool::new(false);
+
+/// What the per-domain opt-in did.
+pub fn per_domain_opt_in() -> PerDomainOptIn {
+    *OPT_IN.lock()
+}
+
+/// Record that a device received a DMA address outside per-domain mode.
+#[inline]
+pub(crate) fn note_dma_issued() {
+    if !IDENTITY_DMA_ISSUED.load(Ordering::Relaxed) {
+        IDENTITY_DMA_ISSUED.store(true, Ordering::Release);
+    }
 }
 
 /// Currently-active vendor.
@@ -339,18 +416,13 @@ unsafe fn read_amd_caps(base: u64) -> Option<IommuCaps> {
     if efr == 0 || efr == u64::MAX {
         return None;
     }
-    // EFR layout (rev 3.10 §3.5.1.21):
-    //   [4]      HATS — host address translation size:
-    //              00 = 4-level (48-bit)
-    //              01 = 5-level (57-bit)
-    //              10 = 6-level (reserved)
-    //   [5..6]   GATS — guest size, ignored here.
-    //   [7..14]  IA — invalidation-acknowledge bit, etc.
-    let hats = ((efr >> 4) & 0x3) as u8;
+    // EFR[11:10] HATS (Linux `FEATURE_HATS`): max host levels = HATS + 4
+    // (`amd_iommu_hpt_level`); 3 is reserved.
+    let hats = ((efr >> crate::amd_vi::FEATURE_HATS_SHIFT) & 0x3) as u8;
     let max_iova_bits = match hats {
         0 => 48,
-        1 => 57,
-        _ => 48, // safe default
+        1 | 2 => 57,
+        _ => 48, // reserved: safe default
     };
     Some(IommuCaps {
         vendor: IommuVendor::AmdVi as u8,
@@ -683,6 +755,24 @@ pub trait IommuHw: Send + Sync {
     fn sync_map(&self, _domain_id: u16, _iova: u64, _len: u64) -> Result<(), IoError> {
         Ok(())
     }
+    /// Firmware-mandated identity ranges for `bdf` (AMD IVMD unity /
+    /// exclusion ranges, VT-d RMRR; Linux `IOMMU_RESV_DIRECT` from
+    /// `get_resv_regions`). [`IommuDomain::attach`] reserves each range in
+    /// the domain's IOVA space and maps it 1:1 before pointing the device
+    /// at the table (Linux `iommu_create_device_direct_mappings`).
+    /// Default: none.
+    fn direct_mappings(&self, _bdf: Bdf) -> alloc::vec::Vec<DirectMapping> {
+        alloc::vec::Vec::new()
+    }
+}
+
+/// One identity-mapped range `[start, end)` (page aligned) a device must
+/// keep reaching after it is attached to a translating domain.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DirectMapping {
+    pub start: u64,
+    pub end: u64,
+    pub perms: IommuPerms,
 }
 
 static BACKEND: IrqSafeSpinLock<Option<&'static dyn IommuHw>> = IrqSafeSpinLock::new(None);
@@ -950,6 +1040,35 @@ impl Paging {
         })
     }
 
+    /// Reserve `m` in the IOVA space and map it 1:1 (pages already mapped
+    /// identically are kept). Ranges above [`crate::amd_vi::MAX_DIRECT_MAP_BYTES`]
+    /// or outside the table's IOVA width are refused (`NoMemory` /
+    /// `OutOfIova`).
+    fn map_direct(&mut self, m: DirectMapping) -> Result<(), IoError> {
+        if m.end <= m.start || m.perms == IommuPerms::NONE {
+            return Ok(());
+        }
+        let (lo, hi) = (m.start >> 12, (m.end - 1) >> 12);
+        if hi >= 1u64 << (PT_IOVA_BITS - 12) {
+            return Err(IoError::OutOfIova);
+        }
+        if m.end - m.start > crate::amd_vi::MAX_DIRECT_MAP_BYTES {
+            return Err(IoError::NoMemory);
+        }
+        self.iova.reserve(lo, hi);
+        for pfn in lo..=hi {
+            let iova = pfn << 12;
+            if let Some(pte) = walk(self.pt.format, self.pt.root, iova) {
+                if pte & PTE_OA_MASK == iova {
+                    continue;
+                }
+                return Err(IoError::DomainMismatch);
+            }
+            self.pt.map_page(iova, iova, m.perms)?;
+        }
+        Ok(())
+    }
+
     /// Clear `pages` leaves at `pfn`, invalidate, then free the IOVA.
     /// Linux `__iommu_dma_unmap` (strict): `iommu_unmap_fast` →
     /// `iommu_iotlb_sync` → `iommu_dma_free_iova`. A failed flush
@@ -1082,6 +1201,10 @@ impl IommuDomain {
                 if attached.iter().any(|(b, _)| *b == bdf) {
                     return Err(IoError::DomainMismatch);
                 }
+                for m in p.hw.0.direct_mappings(bdf) {
+                    p.map_direct(m)?;
+                }
+                core::sync::atomic::fence(Ordering::SeqCst);
                 p.hw.0.attach(bdf, self.domain_id, p.pt.root, PT_LEVELS)?;
                 attached.push((bdf, self.domain_id));
                 p.attached.push(bdf);

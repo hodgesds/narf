@@ -168,7 +168,16 @@ pub trait IommuHw: Send + Sync {                      // one per unit type
     /// Invalidate + completion wait; Ok = no cached translation survives.
     fn flush_iotlb(&self, domain_id: u16, iova: u64, len: u64) -> Result<(), IoError>;
     fn sync_map(&self, domain_id: u16, iova: u64, len: u64) -> Result<(), IoError>; // default Ok
+    /// IVMD unity / RMRR ranges; attach maps them 1:1 first. Default empty.
+    fn direct_mappings(&self, bdf: Bdf) -> Vec<DirectMapping>;
 }
+pub struct DirectMapping { pub start: u64, pub end: u64, pub perms: IommuPerms } // [start, end)
+pub enum IoError { /* … */ Timeout }              // invalidation did not complete
+pub const PER_DOMAIN_CMDLINE_KEY: &str = "iommu.passthrough";
+pub fn per_domain_requested_in(cmdline: &str) -> bool; // "0" | "n" | "N" | "off"
+pub enum PerDomainOptIn { Unknown, NotRequested, Enabled, NoBackend,
+                          DmaAlreadyHandedOut, AlreadyPerDomain, Failed(amd_vi::EnableError) }
+pub fn per_domain_opt_in() -> PerDomainOptIn;
 pub fn enable_per_domain(hw: &'static dyn IommuHw) -> Result<(), IoError>; // → IommuMode::PerDomain
 pub fn default_domain(bdf: Bdf) -> Result<Arc<IommuDomain>, IoError>;     // iommu_get_dma_domain
 pub fn release_default_domain(bdf: Bdf) -> Result<(), IoError>;
@@ -202,11 +211,102 @@ the x86 interrupt window `0xfee0_0000..=0xfeef_ffff` (and, for AMD v1, the
 HyperTransport window `0xfd_0000_0000..=0xff_ffff_ffff`). Intermediate
 tables live until the domain is destroyed; a domain dropped with devices
 still attached leaks its tables. `iommu_model::ModelIommu` is a recording
-software backend for tests only. **No silicon backend exists yet**: `init`
-still selects `Identity`, so nothing in the boot path enters `PerDomain`.
-AMD-Vi (device table + command buffer + `COMPLETION_WAIT`), VT-d (context
-tables + queued invalidation) and SMMUv3 (STE + CMDQ `CMD_SYNC`) backends
-are open work.
+software backend for tests only.
+
+**AMD-Vi silicon backend** (module `amd_vi`, Linux
+`drivers/iommu/amd/{init.c,iommu.c,amd_iommu_types.h}`):
+
+```rust
+pub mod amd_vi {
+    pub mod ivrs {                       // init_iommu_from_acpi / init_memory_definitions
+        pub fn parse(table: &[u8]) -> Result<IvrsInfo, IvrsError>;
+        pub struct IvrsInfo { iv_info, ivhd_type, units: Vec<IvhdUnit>, unity: Vec<UnityRange> }
+        pub struct IvhdUnit { ivhd_type, flags, devid, cap_ptr, mmio_phys, pci_seg, info,
+                              efr_attr, efr_reg, devices: Vec<DevRange>,
+                              aliases: Vec<AliasRange>, specials: Vec<SpecialDevice>,
+                              acpi_hids: Vec<AcpiHidDevice> }
+    }
+    pub trait AmdViRegs: Send + Sync { fn read64; fn write64; fn read32; fn write32; }
+    pub struct MmioRegs;                 // ioremap(Device) of the 16 KiB register block
+    pub fn bring_up(info: &IvrsInfo, map: &dyn Fn(&IvhdUnit) -> Option<Box<dyn AmdViRegs>>)
+        -> Result<AmdVi, BringUpError>;
+    pub struct AmdVi;                    // impl IommuHw; poll_events / event_count /
+                                         // recent_events / read_dte / unit_rings / alias_of
+    pub fn boot_enable() -> Result<&'static AmdVi, EnableError>; // used by iommu::init
+    pub fn active() -> Option<&'static AmdVi>;
+    pub fn poll_events() -> usize;
+    // Linux-exact encoders: cmd_completion_wait, cmd_inv_dte, cmd_inv_iommu_pages,
+    // cmd_inv_all, build_inv_address, dte_initial / dte_passthrough / dte_blocked /
+    // dte_translated.
+}
+```
+
+- **Opt-in only.** `init` keeps selecting `Identity` and never touches
+  IOMMU hardware unless the kernel command line carries
+  `iommu.passthrough=0` (Linux's switch for DMA-translated default
+  domains). Then, on an AMD-Vi platform where no DMA address has yet been
+  handed out (`alloc_with` / `alloc_coherent_for` set a gate), `init`
+  runs `amd_vi::boot_enable` and `enable_per_domain`; otherwise it stays
+  `Identity` and `per_domain_opt_in()` says why. Today `frame/` calls
+  `init` after the initcall stages have probed drivers, so the opt-in
+  reports `DmaAlreadyHandedOut` until `frame/` calls `init` before the
+  initcalls (a TCB change, pending maintainer review).
+- **IVRS.** Linux `get_highest_supported_ivhd_type`: only IVHD blocks of
+  the highest supported type are used. Device entries 01h/02h/03h/04h/
+  42h/43h/46h/47h/48h(IOAPIC, HPET)/F0h give the requester-ID → unit
+  lookup, aliases and the IVHD DTE setting flags (first range wins). IVMD
+  20h/21h/22h with the unity or exclusion flag become direct mappings
+  (exclusion = read/write unity, as Linux). Units outside PCI segment 0
+  are ignored (`narf_bus::dma::configure` only attaches segment 0).
+- **Device table.** One 2 MiB (65 536 × 32 B) order-9 block shared by the
+  segment's units; base register = `phys | 0x1ff`. Every DTE starts as
+  Linux's identity entry (`set_dte_passthrough`: `V|TV|IR|IW`, `Mode 0`,
+  domain 0) plus IVHD flag bits (erratum 63: SysMgt = 01b ⇒ `IW`), so an
+  unattached device DMAs untranslated. Attach writes the v1 entry
+  (`TV`, `Mode = levels`, root[51:12], `IR|IW`, domain ID) for the device
+  and its alias (`clone_aliases`); requesters sharing an alias must share
+  a domain. Detach follows the trait contract and **blocks**
+  (`V|TV`, `Mode 0`, no `IR`/`IW`) once the last user of a requester ID
+  leaves. DTE updates go upper half → blocking low quadword → domain ID →
+  new low quadword (Linux uses one `cmpxchg16b`). A requester no IVHD
+  covers is refused (`NotMapped`).
+- **Commands.** 512-entry ring, `COMPLETION_WAIT` storing a monotonic
+  sequence number to a per-unit semaphore page, polled for 100 ms
+  (Linux `LOOP_TIMEOUT`); failure is `IoError::Timeout`, which makes
+  `IommuDomain` quarantine the IOVA and leak the frames. Attach =
+  `INVALIDATE_DEVTAB_ENTRY`(+alias) + wait; detach = those +
+  `INVALIDATE_IOMMU_PAGES` (domain, all, `PDE`) + wait; unmap =
+  `INVALIDATE_IOMMU_PAGES` with Linux's `build_inv_address` size encoding +
+  wait on every segment-0 unit. An attach whose wait fails leaves the
+  device blocked. ATS is never enabled, so `INVALIDATE_IOTLB_PAGES` is
+  never sent.
+- **Enable sequence** per unit (`early_enable_iommu`): `iommu_disable`
+  (CmdBufEn, EvtIntEn, EvtLogEn, GALogEn, GAIntEn, PPRLogEn, PPRIntEn,
+  IommuEn, IRTCacheDis cleared) → `iommu_init_flags` (HtTunEn / PassPW /
+  ResPassPW / Isoc from the IVHD flags, Coherent, InvTimeout = 1 s) →
+  device-table base → command buffer + head/tail reset + CmdBufEn →
+  IommuEn → `INVALIDATE_IOMMU_ALL` (EFR.IA) or per-DTE + per-domain
+  invalidation → event log (512 entries) + EvtLogEn. A failure disables
+  the units again before the tables are freed.
+- **Event log** is polled (no MSI) after every command wait and by
+  `amd_vi::poll_events`: per-type counters (IO_PAGE_FAULT = type 2), the
+  last 16 decoded events, Linux's erratum-732 zero-entry retry and
+  overflow restart (`amd_iommu_restart_event_logging`).
+- **Not enabled:** interrupt remapping (DTE `IV`/`IntCtl` = 0: MSIs and
+  IOAPIC/HPET interrupts pass through untranslated; no IRT, GA, XT,
+  2K-IRTE), ATS, PPR/EPH, guest translation, SNP, the event interrupt.
+  Linux's AMD-Vi errata code targets family 15h (746, ATS write check) or
+  SNP systems; nothing applies to family 17h (Renoir) / 19h (Phoenix)
+  beyond erratum 63 / 732 handling above.
+- **Validation status.** Only kernel-test smokes against a register model
+  (`io/iommu/amdvi`) exist, written and not yet executed. Native
+  validation needs QEMU's emulated AMD IOMMU, e.g.
+  `qemu-system-x86_64 -machine q35 -device amd-iommu,intremap=off
+  -device <endpoint> … -append "… iommu.passthrough=0"` (`amd-iommu` must
+  precede the PCI endpoints; QEMU then publishes the IVRS), plus the
+  `frame/` change that calls `iommu::init` before the initcalls. No AMD-Vi silicon has run this code. VT-d
+  (context tables + queued invalidation) and SMMUv3 (STE + CMDQ
+  `CMD_SYNC`) backends are open work.
 
 `DmaPool` is deliberately per queue, rather than a global allocator cache:
 that maintains NUMA/device affinity and prevents unrelated RX/TX completion

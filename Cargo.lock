@@ -2932,10 +2932,12 @@ name = "narf-io"
 version = "0.0.0"
 dependencies = [
  "narf-acpi",
+ "narf-boot",
  "narf-capabilities",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
