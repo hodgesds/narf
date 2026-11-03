@@ -22,6 +22,7 @@ enum Event {
     Page(usize),
     HciStop,
     HciRestart,
+    EndSwap,
     Write8(u16, u8),
     Write32(u16, u32),
 }
@@ -150,6 +151,10 @@ impl Io for Model {
     }
     async fn hci_restart(&mut self) -> Result<(), NativeError> {
         self.events.push(Event::HciRestart);
+        Ok(())
+    }
+    fn end_swap(&mut self) -> Result<(), NativeError> {
+        self.events.push(Event::EndSwap);
         Ok(())
     }
 }
@@ -449,6 +454,9 @@ fn smoke_rtw88_wow_resume_reason_and_firmware_restore() -> TestResult {
             || io.mem[REG_SYS_FUNC_EN as usize] & 1 == 0
         {
             return TestResult::Fail("rtw_wow_resume_trx did not reopen RX DMA/BB");
+        }
+        if io.events.last() != Some(&Event::EndSwap) {
+            return TestResult::Fail("swap window not closed last");
         }
     }
     for (reason, check) in [

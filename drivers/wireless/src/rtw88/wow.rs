@@ -429,6 +429,9 @@ pub(super) trait Io: Send {
     fn hci_stop(&mut self) -> Result<(), NativeError>;
     /// `rtw_hci_setup` + `rtw_hci_start`.
     async fn hci_restart(&mut self) -> Result<(), NativeError>;
+    /// After `rtw_wow_resume_trx`: close the firmware-swap window and
+    /// readmit host packet producers on the restored normal image.
+    fn end_swap(&mut self) -> Result<(), NativeError>;
 }
 
 async fn poll32<I: Io>(
@@ -612,6 +615,7 @@ async fn resume_inner<I: Io>(
     // rtw_wow_resume_trx
     update32(io, REG_RXPKT_NUM, BIT_RW_RELEASE, 0)?;
     bb_start(io, txpause)?;
+    io.end_swap()?;
     Ok(())
 }
 

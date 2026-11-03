@@ -2303,11 +2303,41 @@ has no IRQ line, so `rtw_pci_enable_interrupt` is not mirrored (HIMRs stay
 zero). Any failure is `State::Terminal`. Unexecuted case:
 `smoke_rtw88_wow_packet_core_halt_restart_from_zero`.
 
-**Not wired (why the row stays open).** No native backend implements
-`wow::Io` or `firmware_transport::Io::claim_swap` (default `Unsupported`):
-the native reserved-page channel is single-use (`claim_pristine`), plus a
-`system_pm_native` branch that keeps D0/the retained station instead of
-card-off is missing. `WirelessNetIface::wowlan_support`
+**Firmware swap window (`reserved_page.rs` swap mode, `pci_swap.rs`,
+`wow_owner.rs`).** Chosen design: the retained `reserved_page::Backend`
+beacon channel reopens in a swap mode rather than a second native page
+owner. `firmware_transport::Io::claim_swap(boundary)` (boundary from
+`reserved_page::station_boundary`: C21 460, C22 1938, the same values
+`runtime_ps_page` uses) requires the station-era closed channel
+(`Terminal`, published, completed, disarmed), `0x308` = the retained ring,
+`0x204` = boundary and `BCNQ_DL`/`EN_BCN_FUNC` clear, then the native
+`Registers::claim_swap`: from `State::Packets` only with no pending
+H2C/mailbox, no retune/tracking maintenance, a ready packet core,
+`retune_quiet` (TX rings retired, MAC queue pages free) and
+`REG_RXPKT_NUM` RW_RELEASE|RXDMA_IDLE set, into the new `State::Swap`
+(BME/CR/mappings live, packet producers refused, H2C ring and mailbox
+open). Every page in the window (`Owner::run` sections at page 0,
+`Io::swap_page` at the boundary = Linux `rtw_fw_download_rsvd_page`)
+restores `0x204` to the station boundary (Linux restores
+`fifo.rsvd_boundary`), restores `BCNQ_DL` and zeroes the consumed
+descriptor (`runtime_ps_page` tail), so the window never holds an armed
+descriptor. In swap mode `finish_dma` calls `Registers::finish_swap`
+(window stays open) instead of bring-up's park. A re-claim inside the
+open window (resume restores the normal image) is accepted.
+`Io::end_swap` closes it: Backend back to `Terminal` + disarmed (the
+`runtime_ps_page` precondition), native `Swap` -> `Packets`. `hci_stop`
+may run from `Swap`; `hci_restart` returns to `Swap`. `wow_owner.rs`
+implements `wow::Io` on `Owner<I>` (C22, `Phase::Station` only):
+`download` = `swap_firmware` + `rtw_fw_send_general_info`/`phydm_info`
+(sequences 0/1, as the fresh bring-up image), `reserved_page` =
+`swap_page`, `h2c` = `station_control::send` mailbox, `hci_*`/`end_swap`
+forwarded; `wow::resume` ends with `end_swap`. A failed swap poisons the
+owner (`Phase::Failed`) and every later `wow::Io` call refuses. Unexecuted
+case: `smoke_rtw88_wow_reserved_page_swap_window`.
+
+**Not wired (why the row stays open).** The native `wow::Io` and swap
+window exist, but the `system_pm_native` branch that keeps D0 and the
+retained station instead of card-off is missing. `WirelessNetIface::wowlan_support`
 therefore stays `None` for rtw88. Five fixture cases are written and
 unexecuted: `smoke_rtw88_wow_support_and_validation`,
 `smoke_rtw88_wow_pattern_cam_layout`,

@@ -118,7 +118,7 @@ impl Native {
     /// H2C/mailbox command, no retune, every TX ring retired. PCI BME, CR
     /// and every retained mapping are unchanged; `hci_restart` reverses it.
     pub(super) fn halt_packets(&mut self) -> Result<(), Error> {
-        if self.state != State::Packets
+        if !matches!(self.state, State::Packets | State::Swap)
             || self.command_ring.pending()
             || self.mailbox_pending
             || self.retune.is_some()
@@ -175,5 +175,78 @@ impl Native {
             self.state = State::Terminal;
         }
         result
+    }
+}
+/// `REG_RXPKT_NUM` `BIT_RW_RELEASE` | `BIT_RXDMA_IDLE` (`rtw_wow_rx_dma_stop`).
+const RXPKT_NUM: u16 = 0x0284;
+const RX_RELEASED_IDLE: u32 = 1 << 18 | 1 << 17;
+impl Native {
+    /// `wow.c::rtw_wow_swap_fw` precondition on the live station owner.
+    /// From `Packets`: no pending H2C/mailbox command, no retune or tracking
+    /// maintenance, a ready packet core whose every TX ring retired with the
+    /// MAC queue pages free (`retune_quiet`), and RX DMA released and idle
+    /// (`rtw_wow_stop_trx` ran; NARF refuses a swap under live RX DMA where
+    /// Linux only logs). The window keeps BME/CR and every mapping; packet
+    /// producers stay closed (`transmit_allowed`) until `end_swap`. Inside
+    /// the window (resume restores the normal image) a quiet re-claim is
+    /// accepted unchanged.
+    pub(super) fn enter_swap(&mut self) -> Result<(), Error> {
+        if self.command_ring.pending() || self.mailbox_pending {
+            return Err(Error::State);
+        }
+        match self.state {
+            State::Swap => return Ok(()),
+            State::Packets => {}
+            _ => return Err(Error::State),
+        }
+        if self.retune.is_some()
+            || self.tracking_maintenance
+            || !self.packet.as_ref().is_some_and(|core| core.ready())
+        {
+            return Err(Error::State);
+        }
+        if !self.retune_quiet()? {
+            return Err(Error::State);
+        }
+        let rx = self.read32(RXPKT_NUM)?;
+        if rx == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if rx & RX_RELEASED_IDLE != RX_RELEASED_IDLE {
+            return Err(Error::State);
+        }
+        self.state = State::Swap;
+        Ok(())
+    }
+    /// End of a swapped-image download (`Owner::run` -> `finish_dma`): the
+    /// new firmware is running; unlike bring-up's `finish_dma` the owner is
+    /// not parked and stays in the swap window.
+    pub(super) fn complete_swap(&mut self) -> Result<(), Error> {
+        if self.state != State::Swap || self.command_ring.pending() {
+            self.state = State::Terminal;
+            return Err(Error::State);
+        }
+        // Prove BME/MEM/INTx are still exactly the live packet setting.
+        self.read32(PCI_CTRL).and_then(|v| {
+            if v == u32::MAX {
+                Err(Error::Gone)
+            } else {
+                Ok(())
+            }
+        })
+    }
+    /// `rtw_wow_resume_trx` done: close the swap window and readmit the
+    /// packet core that `restart_packets` reset (or never halted).
+    pub(super) fn leave_swap(&mut self) -> Result<(), Error> {
+        if self.state != State::Swap
+            || self.command_ring.pending()
+            || self.mailbox_pending
+            || !self.packet.as_ref().is_some_and(|core| core.ready())
+        {
+            self.state = State::Terminal;
+            return Err(Error::State);
+        }
+        self.state = State::Packets;
+        Ok(())
     }
 }

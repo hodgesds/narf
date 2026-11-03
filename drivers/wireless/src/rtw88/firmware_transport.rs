@@ -7,6 +7,8 @@ use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::FirmwareError;
 #[path = "runtime_lps.rs"]
 pub(super) mod runtime_lps;
+#[path = "wow_owner.rs"]
+mod wow_owner;
 /// Outcome of one power-save H2C publication attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PsSubmit {
@@ -568,8 +570,19 @@ pub(super) unsafe trait Io: Send {
     }
     /// `wow.c::rtw_wow_swap_fw` precondition: the original station's TRX is
     /// stopped (`rtw_wow_stop_trx`) and the firmware reserved-page channel
-    /// may be reused for a section download. No backend grants this yet.
-    fn claim_swap(&mut self) -> Result<(), Error> {
+    /// may be reused for a section download at page 0, restoring the
+    /// station reserved-page `boundary` afterwards. The window stays open
+    /// (`finish_dma` does not park) until [`Io::end_swap`].
+    fn claim_swap(&mut self, _boundary: u16) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// `rtw_fw_download_rsvd_page` inside the swap window: one reserved-page
+    /// image at the station boundary.
+    async fn swap_page(&mut self, _: &[u8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Close the swap window (`rtw_wow_resume_trx` done).
+    fn end_swap(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
     /// `rtw_hci_stop` (PCI `rtw_pci_stop`): reversible host ring reset.
@@ -1560,7 +1573,9 @@ impl<I: Io> Owner<I> {
         if self.phase != Phase::Station || self.did != image.did {
             return Err(Error::State);
         }
-        self.io.claim_swap()?;
+        let boundary =
+            super::reserved_page::station_boundary(self.did).ok_or(Error::Unsupported)?;
+        self.io.claim_swap(boundary)?;
         self.phase = Phase::Failed;
         let parsed = parse(self.did, &image.bytes)?;
         narf_time::timeout(narf_time::Deadline::after_ms(2000), self.run(&parsed))

@@ -231,9 +231,9 @@ unsafe impl Port for Native {
             .is_some_and(crate::rtw88::power_policy::Gate::allows_rx_ba)
     }
     fn transmit_allowed(&mut self) -> Result<(), packet::Error> {
-        // A halted owner (`rtw_hci_stop`) admits no packet work until
-        // `restart_packets` re-arms the rings.
-        if self.state == State::Halted {
+        // A halted owner (`rtw_hci_stop`) or the firmware-swap window admits
+        // no packet work until `restart_packets` / `end_swap`.
+        if matches!(self.state, State::Halted | State::Swap) {
             return Err(packet::Error::State);
         }
         self.check_packet_permission().map_err(access_error)

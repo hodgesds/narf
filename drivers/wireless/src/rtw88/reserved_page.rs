@@ -341,6 +341,31 @@ pub(super) unsafe trait Registers: Send {
     fn hci_restart(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    /// `wow.c::rtw_wow_swap_fw` precondition on the live packet owner: TRX
+    /// stopped and quiet, RX DMA released and idle. Re-claim inside an open
+    /// swap window is allowed.
+    fn claim_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// The swapped image runs (`Owner::run` tail); stay in the swap window
+    /// instead of parking as bring-up's `finish_dma` does.
+    fn finish_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Close the swap window and readmit packet producers.
+    fn end_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+}
+/// `mac.c::rtw_set_trx_fifo_info` `rsvd_boundary` as station pages use it
+/// (`runtime_ps_page`): the firmware swap restores this value, as Linux
+/// `rtw_fw_write_data_rsvd_page` restores `fifo.rsvd_boundary`.
+pub(super) fn station_boundary(did: u16) -> Option<u16> {
+    match did {
+        0xc821 => Some(460),
+        0xc822 => Some(1938),
+        _ => None,
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
@@ -361,6 +386,9 @@ pub(super) struct Backend<R: Registers, M: Memory> {
     completed: bool,
     /// The completed beacon descriptor was zeroed under parked authority.
     disarmed: bool,
+    /// `rtw_wow_swap_fw` window: the station boundary every swap page
+    /// restores (`station_boundary`). `None` outside the window.
+    swap: Option<u16>,
 }
 impl<R: Registers, M: Memory> core::fmt::Debug for Backend<R, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -403,23 +431,34 @@ impl<R: Registers, M: Memory> Backend<R, M> {
             boundary,
             completed: false,
             disarmed: false,
+            swap: None,
         })
     }
     fn word(memory: &mut M, offset: usize, value: u32) -> Result<(), Error> {
         memory.write(offset, &value.to_le_bytes())
     }
     async fn page(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.page_at(data, 0).await
+    }
+    /// Firmware page at `target` (0 for firmware sections; the station
+    /// boundary for swap-window reserved pages, Linux
+    /// `rtw_fw_download_rsvd_page`). Inside a swap window the completion
+    /// restores the station boundary, `BCNQ_DL` and disarms the descriptor.
+    async fn page_at(&mut self, data: &[u8], target: u16) -> Result<(), Error> {
         if self.state != PageState::Idle {
             return Err(Error::State);
         }
-        if data.is_empty() || data.len() > PAYLOAD {
+        if data.is_empty() || data.len() > PAYLOAD || target & !0xfff != 0 {
             return Err(Error::Image);
         }
         // Poison before MMIO, page or descriptor mutation. An outstanding TD
         // and a cancelled restoration sequence must never permit buffer reuse.
         self.state = PageState::Terminal;
+        if self.swap.is_some() {
+            self.disarmed = false;
+        }
         let beacon = self.io.read8(0x550)?;
-        self.io.write16(0x204, 1 << 15)?; // page0 + W1C prior beacon-valid
+        self.io.write16(0x204, target | 1 << 15)?; // page + W1C prior beacon-valid
         if self.io.read16(0x204)? & 1 << 15 != 0 {
             return Err(Error::Prerequisite);
         }
@@ -480,10 +519,24 @@ impl<R: Registers, M: Memory> Backend<R, M> {
         frame.acquire();
         // Fresh beacon-valid proves the exact serially published page reached
         // device TXBUF. Only completed transfers restore registers/reopen reuse.
-        self.io.write16(0x204, self.boundary | 1 << 15)?;
+        let restore = self.swap.unwrap_or(self.boundary);
+        self.io.write16(0x204, restore | 1 << 15)?;
         self.io.write8(0x550, beacon)?;
         self.io.write8(0x422, queue)?;
         self.io.write8(0x101, cr)?;
+        if self.swap.is_some() {
+            // runtime_ps_page tail: BCNQ_DL back to the station value and the
+            // consumed descriptor zeroed, so the window never leaves an armed
+            // beacon descriptor behind (hci_stop / sleep / failure).
+            self.io.write8(0x383, work)?;
+            if self.io.read8(0x383)? & 0x10 != 0 {
+                return Err(Error::Prerequisite);
+            }
+            let ring = self.ring.as_mut().ok_or(Error::State)?;
+            ring.write(0, &[0; 16])?;
+            ring.sync();
+            self.disarmed = true;
+        }
         self.state = PageState::Idle;
         Ok(())
     }
@@ -729,7 +782,71 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         self.io.lte_restore(value).await
     }
     async fn finish_dma(&mut self) -> Result<(), Error> {
+        if self.swap.is_some() {
+            // `rtw_wow_swap_fw`: the swapped image runs on the live station;
+            // the window stays open instead of bring-up's park.
+            if self.state != PageState::Idle || !self.disarmed {
+                self.state = PageState::Terminal;
+                return Err(Error::State);
+            }
+            let result = self.io.finish_swap();
+            if result.is_err() {
+                self.state = PageState::Terminal;
+            }
+            return result;
+        }
         self.io.finish_dma().await
+    }
+    fn claim_swap(&mut self, boundary: u16) -> Result<(), Error> {
+        if let Some(open) = self.swap {
+            if self.state != PageState::Idle || !self.disarmed || open != boundary {
+                return Err(Error::State);
+            }
+            let result = self.io.claim_swap();
+            if result.is_err() {
+                self.state = PageState::Terminal;
+            }
+            return result;
+        }
+        // Only the exact original mapping after a real completed and
+        // disarmed transfer (radio handoff, or a finished station page) may
+        // reopen; a poisoned/cancelled transfer stays retained and closed.
+        if self.state != PageState::Terminal
+            || !self.published
+            || !self.completed
+            || !self.disarmed
+            || boundary & !0xfff != 0
+        {
+            return Err(Error::State);
+        }
+        let ring = self.ring.as_ref().ok_or(Error::State)?;
+        let base = address(ring, 16, 256)?;
+        if self.io.read32(0x308)? != base
+            || self.io.read16(0x204)? & 0xfff != boundary
+            || self.io.read8(0x383)? & 0x10 != 0
+            || self.io.read8(0x550)? & 8 != 0
+        {
+            return Err(Error::Prerequisite);
+        }
+        self.io.claim_swap()?;
+        self.swap = Some(boundary);
+        self.state = PageState::Idle;
+        Ok(())
+    }
+    async fn swap_page(&mut self, data: &[u8]) -> Result<(), Error> {
+        let boundary = self.swap.ok_or(Error::State)?;
+        self.page_at(data, boundary).await
+    }
+    fn end_swap(&mut self) -> Result<(), Error> {
+        if self.swap.is_none() || self.state != PageState::Idle || !self.disarmed {
+            return Err(Error::State);
+        }
+        // Back to the station-era closed channel: only runtime_ps_page may
+        // reuse it (it requires Terminal + disarmed + completed).
+        self.state = PageState::Terminal;
+        self.io.end_swap()?;
+        self.swap = None;
+        Ok(())
     }
     fn begin_mac(&mut self) -> Result<(), Error> {
         if self.state != PageState::Idle {

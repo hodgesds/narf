@@ -27,6 +27,9 @@ enum State {
     Commands,
     Calibrated,
     Packets,
+    /// `rtw_wow_swap_fw` window (`pci_swap.rs`): packet producers closed,
+    /// BME/CR/mappings live, firmware page/H2C/mailbox channels open.
+    Swap,
     /// `rtw_hci_stop`: ring pointers reset, BME/CR/mappings retained;
     /// only `restart_packets` leaves it (or a failure -> Terminal).
     Halted,
@@ -275,13 +278,14 @@ impl Native {
                 | State::Commands
                 | State::Calibrated
                 | State::Packets
+                | State::Swap
                 | State::Halted
         ) {
             return Err(Error::State);
         }
         let active = matches!(
             self.state,
-            State::Active | State::Commands | State::Packets | State::Halted
+            State::Active | State::Commands | State::Packets | State::Swap | State::Halted
         );
         let gate = self.packet_gate.clone().map(|g| {
             if self.tracking_maintenance {
@@ -706,7 +710,9 @@ unsafe impl Registers for Native {
         } else {
             super::command::iqk8821c_associated(self.tracking_sequence)
         };
-        if (self.state != State::Commands && !mission)
+        // The swap window carries the swapped image's general/phydm info
+        // (`rtw_wow_swap_fw`) on the same retained H2C ring.
+        if (!matches!(self.state, State::Commands | State::Swap) && !mission)
             || self.command_ring.pending()
             || mission && *packet != expected
         {
@@ -768,7 +774,7 @@ unsafe impl Registers for Native {
         result
     }
     fn poll_h2c(&mut self) -> Result<bool, Error> {
-        if (self.state != State::Commands
+        if (!matches!(self.state, State::Commands | State::Swap)
             && !(self.state == State::Packets
                 && (self.tracking_maintenance || self.retune.is_some())))
             || !self.command_ring.pending()
@@ -915,7 +921,9 @@ unsafe impl Registers for Native {
         super::wmm::readback(|r| self.read32(r), gains)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        if !matches!(self.state, State::Calibrated | State::Packets) || self.mailbox_pending {
+        if !matches!(self.state, State::Calibrated | State::Packets | State::Swap)
+            || self.mailbox_pending
+        {
             return Err(Error::State);
         }
         let state = self.read8(0x1cc)?;
@@ -1598,7 +1606,9 @@ unsafe impl Registers for Native {
         }
     }
     fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        if !matches!(self.state, State::Calibrated | State::Packets) || !self.mailbox_pending {
+        if !matches!(self.state, State::Calibrated | State::Packets | State::Swap)
+            || !self.mailbox_pending
+        {
             return Err(Error::State);
         }
         let state = self.read8(0x1cc)?;
@@ -1656,6 +1666,15 @@ unsafe impl Registers for Native {
     }
     fn hci_restart(&mut self) -> Result<(), Error> {
         self.restart_packets()
+    }
+    fn claim_swap(&mut self) -> Result<(), Error> {
+        self.enter_swap()
+    }
+    fn finish_swap(&mut self) -> Result<(), Error> {
+        self.complete_swap()
+    }
+    fn end_swap(&mut self) -> Result<(), Error> {
+        self.leave_swap()
     }
     fn dma_reclaimable(&self) -> bool {
         !self.published

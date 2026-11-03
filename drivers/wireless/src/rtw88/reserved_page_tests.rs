@@ -119,6 +119,10 @@ struct Model {
     /// One-shot hook after HMEBOX_EXT staging and before the scoped low-word
     /// publication of the PS H2C whose first two bytes match.
     ps_gap: Option<([u8; 2], Hook)>,
+    /// `REG_FIFOPAGE_CTRL_2` page each doorbell targeted.
+    targets: Vec<u16>,
+    /// Native swap-window calls (`claim`/`finish`/`end`).
+    swap_calls: Vec<&'static str>,
 }
 #[derive(Clone)]
 struct Port(Arc<IrqSafeSpinLock<Model>>);
@@ -847,6 +851,8 @@ unsafe impl Registers for Port {
             let frame = model.frame.lock().bytes.clone();
             let length = usize::from(u16::from_le_bytes([frame[0], frame[1]]));
             model.packets.push(frame[..DESC + length].to_vec());
+            let target = u16::from_le_bytes([model.bytes[0x204], model.bytes[0x205]]) & 0xfff;
+            model.targets.push(target);
             model.doorbells += 1;
             if !model.stall {
                 model.bytes[0x205] |= 0x80;
@@ -945,6 +951,21 @@ unsafe impl Registers for Port {
     }
     async fn finish_dma(&mut self) -> Result<(), Error> {
         self.access()
+    }
+    fn claim_swap(&mut self) -> Result<(), Error> {
+        self.access()?;
+        self.0.lock().swap_calls.push("claim");
+        Ok(())
+    }
+    fn finish_swap(&mut self) -> Result<(), Error> {
+        self.access()?;
+        self.0.lock().swap_calls.push("finish");
+        Ok(())
+    }
+    fn end_swap(&mut self) -> Result<(), Error> {
+        self.access()?;
+        self.0.lock().swap_calls.push("end");
+        Ok(())
     }
     fn begin_mac(&mut self) -> Result<(), Error> {
         self.access()?;
@@ -1451,6 +1472,8 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         ps_corrupt_power: false,
         ps_staged: Vec::new(),
         ps_gap: None,
+        targets: Vec::new(),
+        swap_calls: Vec::new(),
     })));
     let backend = Backend::new(
         port.clone(),
@@ -1889,4 +1912,78 @@ fn smoke_rtw88_reserved_page_dma_stop_proof_reclaims_published_mappings() -> Tes
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_reserved_page_dma_stop_proof_reclaims_published_mappings
+);
+
+/// `wow.c::rtw_wow_swap_fw` on the retained beacon channel: reopen only a
+/// completed + disarmed station-era mapping at the live station boundary,
+/// firmware sections at page 0 and WoW pages at the boundary, each restoring
+/// the boundary and disarming; `finish_dma` stays in the window and
+/// `end_swap` returns the channel to the station-era closed state.
+fn smoke_rtw88_wow_reserved_page_swap_window() -> TestResult {
+    let (mut backend, port, drops) = allocated();
+    backend.claim_pristine().unwrap();
+    narf_scheduler::block_on(backend.reserved_page(&[0x12; 64])).unwrap();
+    if backend.claim_swap(1938).is_ok() {
+        return TestResult::Fail("bring-up page channel reopened as a swap window");
+    }
+    // Station era: finish_radio disarmed the completed descriptor.
+    backend.state = PageState::Terminal;
+    backend.disarmed = true;
+    {
+        let mut model = port.0.lock();
+        model.bytes[0x308..0x30c].copy_from_slice(&0x10000u32.to_le_bytes());
+        model.bytes[0x383] &= !0x10;
+        model.bytes[0x550] &= !8;
+    }
+    if backend.claim_swap(1938).is_ok() || backend.state != PageState::Terminal {
+        return TestResult::Fail("swap opened against a different live boundary");
+    }
+    port.0.lock().bytes[0x204..0x206].copy_from_slice(&1938u16.to_le_bytes());
+    if backend.claim_swap(1938).is_err() || backend.swap != Some(1938) {
+        return TestResult::Fail("quiet disarmed station channel did not open the swap window");
+    }
+    narf_scheduler::block_on(backend.reserved_page(&[0x34; 4096])).unwrap();
+    if narf_scheduler::block_on(backend.finish_dma()).is_err() {
+        return TestResult::Fail("swapped image end parked/refused the window");
+    }
+    let pages = vec![0u8; 464];
+    narf_scheduler::block_on(backend.swap_page(&pages)).unwrap();
+    {
+        let model = port.0.lock();
+        let ring = model.ring.lock();
+        if model.targets[model.targets.len() - 2..] != [0, 1938]
+            || u16::from_le_bytes(model.bytes[0x204..0x206].try_into().unwrap()) != 1938
+            || model.bytes[0x383] & 0x10 != 0
+            || word(&ring.bytes, 0) != 0
+            || !backend.disarmed
+        {
+            return TestResult::Fail("swap pages not at page0/boundary or left armed");
+        }
+        if model.swap_calls != ["claim", "finish"] {
+            return TestResult::Fail("native swap window calls wrong");
+        }
+    }
+    if backend.end_swap().is_err()
+        || backend.state != PageState::Terminal
+        || backend.swap.is_some()
+        || !backend.disarmed
+        || !backend.completed
+    {
+        return TestResult::Fail("end_swap did not restore the station-era channel");
+    }
+    if narf_scheduler::block_on(backend.swap_page(&pages)).is_ok() {
+        return TestResult::Fail("closed window accepted a page");
+    }
+    if backend.claim_swap(1938).is_err() || port.0.lock().swap_calls.len() != 4 {
+        return TestResult::Fail("next suspend could not reopen the window");
+    }
+    drop(backend);
+    if drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("published mappings reclaimed by the swap window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/wow",
+    smoke_rtw88_wow_reserved_page_swap_window
 );
