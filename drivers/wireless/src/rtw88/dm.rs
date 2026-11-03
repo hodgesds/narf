@@ -7,7 +7,8 @@
 //! thermal RF power tracking (with LCK) and EDCCA adaptivity, using the
 //! per-chip ops from `rtw8822c.c` (`false_alarm_statistics`, `cck_pd_set`,
 //! `cfo_track`, `pwr_track`, `adaptivity`, `config_tx_path`) and
-//! `rtw8821c.c` (`false_alarm_statistics`, `cck_pd_set`).
+//! `rtw8821c.c` (`false_alarm_statistics`, `cck_pd_set`). RTL8822C DPK
+//! calibration and `rtw8822c_dpk_track` live in [`super::dpk`] (bit 7).
 //!
 //! Nothing here runs without a separately signed `N2xD` continuation
 //! ([`KIND`]); its payload selects the mechanisms and their measured bounds.
@@ -25,8 +26,9 @@ pub(super) const PATH_DIV: u16 = 1 << 3;
 pub(super) const CFO: u16 = 1 << 4;
 pub(super) const PWR_TRACK: u16 = 1 << 5;
 pub(super) const EDCCA: u16 = 1 << 6;
+pub(super) const DPK: u16 = 1 << 7;
 const C21_MECHANISMS: u16 = DIG | CCK_PD | RA;
-const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDCCA;
+const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDCCA | DPK;
 /// Linux `RTW_WATCH_DOG_DELAY_TIME`.
 pub(super) const PERIOD_MS: u64 = 2000;
 
@@ -44,7 +46,13 @@ rtw_phy_ra_track H2C58 wl_phy_info, every4th RA_INFO40 no_update rssi masks fff0
 8822c tx path diversity path_a/b rssi avg 1a04 f0000000 8/4, 820 ff 31/32, 1e2c ffff 0400, bb reset 2 bit0; \
 8822c cfo tail*2.5 avg enable20 stop10 adj10 xcap 1040 23:10 x|x<<7, only BT disabled scoreboard aa bit1, single station else step to efuse; \
 8822c pwr_track type0 RF42 bit19 trigger then 7e EWMA thermal(10,4) delta<=29 type0 2g/cck swing tables 18a0/41a0 7f, lck>=8 bb/b0/ca/c9/cc; \
-8822c adaptivity normal l2h=max(igi+8,48) h2l-8, ETSI 45/JP60 l2h=igi+12 or ini h2l-7 84c byte2/3 +0x80; no DPK tracking without DPK";
+8822c adaptivity normal l2h=max(igi+8,48) h2l-8, ETSI 45/JP60 l2h=igi+12 or ini h2l-7 84c byte2/3 +0x80; \
+8822c phy_calibration rfk_power_save + do_dpk on rf18 channel change (reload same ch): bb backup 520..41a4 rf 0/1a/55/63/87/8f/de, \
+tx_pause 522=ff 1e70=2, dpk_mac_bb/afe_is_dpk/afe_no_dpk tables, pre_setting 1b08 1f100000|1f0d0000 1be4 3b23170b 1be8 775f5347, \
+gnt_wl 70 bit26 + ltecoex 38 byte1 77, one-shot 1b00 cmd 0x14/16/1a/1c +path (+2 bw80) <<8|48 then 2d9c==55, cal_pwr 1bb4 bit12 1bfc bit31, \
+gainloss rxbb dc 92 84800/1, dc corr 200/40..65, pas_agc dgain 1535/768 loss 0x4000000 log2 db 250/1000 txbb -2/+3 cnt6, \
+coef 20x 1bd4 tbl, saturate 1000/0fff fallback 1fff/04001fff, txagc-6 1b67, gs dgain*910>>10 /10 rounded, coef1 0x16c00/gs 1b18, \
+enable 1b08/1b60 bit31 gs; dpk_track ewma thermal(10,4) delta-k_delta 1b58[6:0] bounded by payload window; restore dpd off";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     bounds(did, p).is_some()
@@ -65,6 +73,8 @@ pub(super) struct Bounds {
     pub(super) power_down: u8,
     /// Thermal-meter envelope [lo, hi] the program was measured over.
     pub(super) thermal: [u8; 2],
+    /// Largest |DPK PWSF offset| `rtw8822c_dpk_track` may apply (DPK only).
+    pub(super) dpk_window: u8,
 }
 
 pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
@@ -81,6 +91,7 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
         power_up: p[5],
         power_down: p[6],
         thermal: [p[7], p[8]],
+        dpk_window: p[9],
     };
     if b.enabled == 0
         || b.enabled & !allowed != 0
@@ -91,7 +102,9 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
         || b.power_down > 0x3f
         || b.thermal[0] > b.thermal[1]
         || b.thermal[1] > 63
-        || p[9..].iter().any(|&v| v != 0)
+        || b.dpk_window > 0x3f
+        || (b.enabled & DPK == 0 && b.dpk_window != 0)
+        || p[10..].iter().any(|&v| v != 0)
     {
         return None;
     }
@@ -303,11 +316,11 @@ pub(super) fn rf_power_2_rssi(power: &[i8]) -> u8 {
 
 /// Linux `DECLARE_EWMA(name, 10, weight)` with `weight` a power of two.
 #[derive(Clone, Copy, Debug, Default)]
-struct Ewma {
+pub(super) struct Ewma {
     internal: u64,
 }
 impl Ewma {
-    fn add(&mut self, value: u8, shift: u32) {
+    pub(super) fn add(&mut self, value: u8, shift: u32) {
         let v = u64::from(value) << 10;
         self.internal = if self.internal == 0 {
             v
@@ -315,7 +328,7 @@ impl Ewma {
             ((self.internal << shift) - self.internal + v) >> shift
         };
     }
-    fn read(&self) -> u8 {
+    pub(super) fn read(&self) -> u8 {
         (self.internal >> 10).min(255) as u8
     }
 }
@@ -485,6 +498,7 @@ pub(super) struct Tracker {
     delta_power: [i8; 2],
     base_igi: u8,
     base_edcca: u32,
+    dpk: Option<super::dpk::Dpk>,
 }
 
 impl Tracker {
@@ -529,6 +543,8 @@ impl Tracker {
             delta_power: [0; 2],
             base_igi: 0,
             base_edcca: 0,
+            dpk: (facts.c22() && bounds.enabled & DPK != 0)
+                .then(|| super::dpk::Dpk::new(bounds.dpk_window, bounds.thermal)),
         }
     }
     pub(super) fn bounds(&self) -> Bounds {
@@ -551,6 +567,10 @@ impl Tracker {
     }
     pub(super) fn delta_power(&self) -> [i8; 2] {
         self.delta_power
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn dpk(&self) -> Option<&super::dpk::Dpk> {
+        self.dpk.as_ref()
     }
     pub(super) fn pd_level(&self) -> u8 {
         self.cck_pd_lv[0][0]
@@ -1210,6 +1230,9 @@ impl Tracker {
         if self.on(CCK_PD) {
             self.cck_pd_restore(io, base)?;
         }
+        if let Some(dpk) = self.dpk.as_mut() {
+            dpk.restore(io, base).await?;
+        }
         self.initialized = false;
         Ok(())
     }
@@ -1319,6 +1342,10 @@ impl Tracker {
         }
         if c22 && self.on(CFO) {
             auth.run(|| self.cfo(io, period.linked))?;
+        }
+        // rtw_phy_dpk_track sits between CFO and power tracking.
+        if let Some(dpk) = self.dpk.as_mut() {
+            dpk.period(io, auth).await?;
         }
         if c22 && self.on(PWR_TRACK) {
             self.pwr_track(io, auth).await?;

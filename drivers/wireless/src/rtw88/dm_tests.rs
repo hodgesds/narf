@@ -192,7 +192,7 @@ fn smoke_rtw88_dm_payload_admission_per_chip() -> TestResult {
         payload(ALL, 0x5b, 4, 8, 8, 8),
         payload(ALL, 0x1f, 4, 8, 8, 8),
         payload(ALL, 0x40, 5, 8, 8, 8),
-        payload(ALL | 1 << 7, 0x40, 4, 8, 8, 8),
+        payload(ALL | 1 << 8, 0x40, 4, 8, 8, 8),
     ];
     let mut t = ok;
     t[7] = 51;

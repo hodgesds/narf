@@ -1757,6 +1757,7 @@ dm kind. New programs add a `Kind` instead of another bespoke loader.
 | CFO (4) | `rtw8822c_cfo_track`, crystal `0x1040[23:10]`, BT scoreboard reset, window bounded by payload | C22 |
 | thermal power tracking (5) | `rtw8822c_pwr_track` type 0: RF42 trigger, EWMA(10,4), 2G/CCK swing tables, LCK at 8 steps, `0x18a0`/`0x41a0[6:0]` delta clamped to the signed up/down bound; samples outside the signed thermal window refuse | C22 |
 | EDCCA adaptivity (6) | `rtw8822c_adaptivity` normal/ETSI(45)/JP(60) from the regulatory country (wireless-regdb DFS region), `0x84c` bytes 2/3 | C22 |
+| DPK calibration + tracking (7) | `rtw8822c_phy_calibration` RFK power-save bracket around `rtw8822c_do_dpk`, then `rtw8822c_dpk_track` (`dpk.rs`); payload byte 9 bounds the PWSF offset | C22 |
 
 The continuation binds at association and the watchdog runs only on an
 established station. Each register group runs inside admission + continuation
@@ -1767,9 +1768,38 @@ level-0 CCK PD) under the base gate only and stops tracking for that
 association. Deviations from Linux, each a qualification bound: the RRSR base
 is the qualified mask rather than `RRSR_INIT_2G`; DIG/CCK-PD/crystal/power
 deltas are capped by the signed payload; there is no unlinked DIG because the
-continuation binds at association. DPK tracking is not offered: Linux
-`rtw8822c_dpk_track` returns without a DPK result, and this profile runs no
-DPK calibration.
+continuation binds at association.
+
+DPK (`dpk.rs`, bit 7, RTL8822C only, payload byte 9 = `dpk_window`
+<= 0x3f and zero unless bit 7 is set) ports Linux v7.3 `rtw8822c.c`:
+`rtw8822c_do_dpk` (BB `0x520..0x41a4`/RF `0,1a,55,63,87,8f,de` backups,
+`dpk_tx_pause`, `rtw8822c_table.c` `dpk_mac_bb`/`dpk_afe_is_dpk`/
+`dpk_afe_no_dpk`, `dpk_pre_setting`, `dpk_result_reset`, per-path
+`dpk_gainloss` with the `pas_agc` gain/loss state machine and
+`psd_log2base`, `dpk_by_path` one-shot + 20 coefficients, saturation check
+and bypass coefficients, `fill_result` TXAGC-6, `dpk_on`/`dpk_cal_gs`,
+`dpk_cal_coef1`, `dpk_enable_disable`, RF/BB restore + RXBB DC), every
+one-shot bracketed by `dpk_set_gnt_wl` (`0x70` bit26 plus LTE-coex indirect
+`0x38` byte1 = 0x77 through `util.c::ltecoex_{read_reg,reg_write}`), and the
+`rtw8822c_rfk_power_save(false/true)` bracket of `rtw8822c_phy_calibration`.
+`is_dpk_pwr_on` holds because the C22 base loads `rfk_init_tbl`
+(`phy.c::rtw_load_rfk_table`). Calibration runs in the first watchdog
+period after the D grant binds and again whenever RF18's channel differs
+from the calibrated one (Linux reruns `phy_calibration` from
+`rtw_chip_prepare_tx` after each channel set); otherwise each period runs
+`rtw8822c_dpk_track` (EWMA(10,4) thermal, `0x1b58[6:0]` PWSF offset).
+Deviations, each fail-closed or a qualification bound: thermal reads outside
+the signed thermal window refuse (restore); the PWSF offset is clamped to
+`dpk_window`; an LTE-coex indirect access that never becomes ready
+(`check_hw_ready`) is a `Timeout` instead of Linux's logged zero; a zero GS
+refuses instead of dividing by zero in `dpk_cal_coef1`; there is no
+`dpk_reload` because each association starts a fresh tracker and recalibrates;
+GAPK (`rtw8822c_do_gapk`) is not run, matching the retained base IQK, so
+DPK runs on the post-IQK state without TX gain-gap calibration. The BB/RF
+backup is held until the source restore completes, so a mid-calibration
+authority loss or hardware failure still restores it (including the `0x522`
+TX pause) under the base gate; base restore also clears both PWSF offsets,
+re-enters RFK power save and turns DPD off on both paths.
 
 Linux rtw88 reads no `ht_operation_mode` and takes no protection action
 (`mac80211.c`, `tx.c`), so the retained station now admits APs that advertise
@@ -1777,7 +1807,10 @@ HT protection modes 1..3 unchanged. The check was local to rtw88; no shared
 `JoinPlan` change was needed.
 
 Evidence: nine `drivers/wireless/rtw88/dm_engine` register-model cases
-(`dm_tests.rs`), and composed C21/C22 Open/WPA2 watchdog, revocation-restore
+(`dm_tests.rs`), five `drivers/wireless/rtw88/dpk` cases (`dpk_tests.rs`:
+payload admission/`psd_log2base`, calibration enabling DPD with GS and
+backup restore, window/envelope/restore tracking, channel-change
+recalibration, LTE timeout and revocation; written, unexecuted), and composed C21/C22 Open/WPA2 watchdog, revocation-restore
 and refusal cases (`dm_station_tests.rs`, `drivers/wireless/rtw88/dm/rtl882{1,2}c`)
 plus HT protection modes 1..3 (`drivers/wireless/rtw88/ht_protection/*`).
 These are software/model results. A real signed N2xD measurement and physical
@@ -2200,7 +2233,7 @@ Remaining software ledger:
 | C21/C22 RTS threshold | Separate N21X/N22X over exact current H/R/T; native24Mbps RTS descriptor/control program, actual response-rate admission, drained current-authority setting, CCX/immutable-DMA/FIFO completion and EAPOL exclusion implemented. Twelve native cases pass on both architectures; real measured X assets/RTS-CTS/physical acceptance remain external |
 | C21/C22 HT TX coding (LDPC/STBC) | N2xC continuation: base RX STBC1 (+C22 RX LDPC) advertisement, qualified TX LDPC (both) / TX STBC (C22) intersected with the peer, W5 bit7/bits9:8, RA_INFO bit26, revocation downgrade. Real N2xC measurement external |
 | C21/C22 all-AC WMM / all-TID QoS | N2xQ continuation: cfg80211_classify8021d + ACM downgrade, BK/VI/VO/BE rings with QSEL=TID, any-TID RX, revocation to BE/TID0. Real N2xQ measurement external |
-| Generic continuation contract + dm watchdog | Reusable signed N2x<tag> loader; N2xD rtw_watch_dog_work/rtw_phy_dynamic_mechanism port: DIG/CCK-PD/RA on both chips, path diversity/CFO/thermal power tracking/EDCCA on C22; base restore on revocation. Real N2xD measurement external; no DPK tracking |
+| Generic continuation contract + dm watchdog | Reusable signed N2x<tag> loader; N2xD rtw_watch_dog_work/rtw_phy_dynamic_mechanism port: DIG/CCK-PD/RA on both chips, path diversity/CFO/thermal power tracking/EDCCA/DPK calibration+tracking on C22; base restore on revocation. Real N2xD measurement external |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive/active channel1 scan with probe IEs, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |
@@ -2328,7 +2361,7 @@ changes. None is a physical blocker unless stated.
 |---|---|
 | `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13 (base legacy CCK1 profile off channel 1). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
 | `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
-| `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
+| `dpk_tracking` | Source-complete for C22 under N22D bit 7 (`dpk.rs`, §3 dm section): `rtw8822c_do_dpk` + `rtw8822c_dpk_track`. Five register-model cases are written, unexecuted; GAPK, a real signed N22D DPK measurement and physical acceptance remain external. |
 | `five_ghz_operation` | 2.4GHz noninitial retune now exists (N2xO), but 5GHz needs the `rtw8822c_set_channel_bb`/`_rf` 5GHz branches, 5GHz AGC/RF table selection (`rtw_phy_setup_phy_cond` band conditions), 5GHz efuse power groups and a measured 5GHz envelope; `scan.rs` admits 2.4GHz only. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
 | `multi_stream_ht` | Source-complete for actual2T2R RTL8822CE under separate N22H256v2: cumulative per-path factory ceilings, measured combined-chain envelope, native quiet/parked two-path gains/readbacks, original local RX16/peer TX negotiation and actual RA/TXWD/RXD MCS8..15. C21 is1TX-path hardware. Five native cases are written; release/native and physical acceptance remain pending. |

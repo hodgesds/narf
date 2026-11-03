@@ -54,6 +54,9 @@ mod dm_station_tests;
 #[cfg(feature = "kernel-test")]
 mod dm_tests;
 mod dma_stop;
+mod dpk;
+#[cfg(feature = "kernel-test")]
+mod dpk_tests;
 pub mod efuse;
 mod endpoints;
 mod fallback;
