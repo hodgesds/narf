@@ -83,6 +83,9 @@ pub(crate) struct State {
     pub(crate) voltage_level: u8,
     pub(crate) pmdemand: Params,
     pub(crate) cursor_visible: [bool; PIPES],
+    /// The request each active pipe was computed from; a live pipe must
+    /// keep exactly this configuration across a repartition.
+    pub(crate) requests: [Option<PipeRequest>; PIPES],
 }
 
 /// Typed refusals and failures.
@@ -106,6 +109,15 @@ pub(crate) enum ResourceError {
     Readback,
     /// CDCLK change failed.
     Clock(CdclkError),
+    /// No lit pipe can take its new DDB without overlapping another
+    /// pipe's current allocation.
+    DdbOrdering,
+    /// A lit pipe's configuration would change; that needs its modeset.
+    LivePipeChanged,
+    /// The transition needs every pipe off (unknown firmware CDCLK).
+    RequiresPipesOff,
+    /// The hardware no longer holds the programmed resource state.
+    Diverged,
 }
 
 impl From<WmError> for ResourceError {
@@ -272,6 +284,7 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
         voltage_level,
         pmdemand,
         cursor_visible,
+        requests: request.pipes,
     };
     // Every computed level must be representable in its register.
     if state.plane_registers().is_none() {
@@ -326,32 +339,45 @@ impl State {
     /// state for disabled planes; a hidden cursor keeps only its DDB.
     pub(crate) fn plane_registers(&self) -> Option<Vec<(u64, u32)>> {
         let mut regs = Vec::with_capacity(PIPES * (PLANES + 1) * 10);
-        for (pipe, alloc) in self.dbuf.pipes.iter().enumerate() {
-            let active = self.dbuf.active_pipes & (1 << pipe) != 0;
-            for (plane, (wm, ddb)) in alloc.wm.iter().zip(alloc.planes).enumerate() {
-                let w = if active { *wm } else { PlaneWm::default() };
-                regs.extend(plane_wm_image(pipe, plane, &w)?);
-                let ddb = if active { ddb.reg() } else { 0 };
-                regs.push((plane_buf_cfg(pipe, plane), ddb));
-            }
-            let w = if active && self.cursor_visible[pipe] {
-                alloc.cursor_wm
-            } else {
-                PlaneWm::default()
-            };
-            // The cursor WM must be encodable even while hidden.
-            if active {
-                cursor_wm_image(pipe, &alloc.cursor_wm)?;
-            }
-            regs.extend(cursor_wm_image(pipe, &w)?);
-            let ddb = if active { alloc.cursor.reg() } else { 0 };
-            regs.push((cursor_buf_cfg(pipe), ddb));
+        for pipe in 0..PIPES {
+            regs.extend(self.pipe_registers(pipe, self.cursor_visible[pipe])?);
         }
+        Some(regs)
+    }
+
+    /// One pipe's plane and cursor WM/DDB image; `cursor_visible` selects
+    /// whether the cursor's watermarks are programmed.
+    pub(crate) fn pipe_registers(
+        &self,
+        pipe: usize,
+        cursor_visible: bool,
+    ) -> Option<Vec<(u64, u32)>> {
+        let mut regs = Vec::with_capacity((PLANES + 1) * 10);
+        let alloc = self.dbuf.pipes.get(pipe)?;
+        let active = self.dbuf.active_pipes & (1 << pipe) != 0;
+        for (plane, (wm, ddb)) in alloc.wm.iter().zip(alloc.planes).enumerate() {
+            let w = if active { *wm } else { PlaneWm::default() };
+            regs.extend(plane_wm_image(pipe, plane, &w)?);
+            let ddb = if active { ddb.reg() } else { 0 };
+            regs.push((plane_buf_cfg(pipe, plane), ddb));
+        }
+        let w = if active && cursor_visible {
+            alloc.cursor_wm
+        } else {
+            PlaneWm::default()
+        };
+        // The cursor WM must be encodable even while hidden.
+        if active {
+            cursor_wm_image(pipe, &alloc.cursor_wm)?;
+        }
+        regs.extend(cursor_wm_image(pipe, &w)?);
+        let ddb = if active { alloc.cursor.reg() } else { 0 };
+        regs.push((cursor_buf_cfg(pipe), ddb));
         Some(regs)
     }
 }
 
-fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, ResourceError> {
+pub(crate) fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, ResourceError> {
     let v = io.read32(r);
     if v == u32::MAX || !io.display_access_ok() {
         Err(ResourceError::NoDevice)
@@ -360,7 +386,11 @@ fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, ResourceError> {
     }
 }
 
-fn checked(io: &(impl MmioWindow + ?Sized), r: u64, v: u32) -> Result<(), ResourceError> {
+pub(crate) fn checked(
+    io: &(impl MmioWindow + ?Sized),
+    r: u64,
+    v: u32,
+) -> Result<(), ResourceError> {
     io.write32(r, v);
     if read(io, r)? == v {
         Ok(())
@@ -369,7 +399,7 @@ fn checked(io: &(impl MmioWindow + ?Sized), r: u64, v: u32) -> Result<(), Resour
     }
 }
 
-fn wait(
+pub(crate) fn wait(
     io: &(impl MmioWindow + ?Sized),
     r: u64,
     mask: u32,

@@ -376,12 +376,18 @@ impl Dbuf {
     /// `mbus_ctl_join_update` with every pipe needing a modeset
     /// (`MBUS_JOIN_PIPE_SELECT_NONE`).
     pub(crate) fn mbus_ctl(&self) -> u32 {
+        self.mbus_ctl_select(None)
+    }
+
+    /// `mbus_ctl_join_update`: `pipe` is the joined pipe when it stays
+    /// lit without a modeset (`intel_mbus_joined_pipe`), else NONE.
+    pub(crate) fn mbus_ctl_select(&self, pipe: Option<usize>) -> u32 {
         let base = if self.joined {
             (1 << 31) | (1 << 30)
         } else {
             0
         };
-        base | (7 << 26)
+        base | (pipe.map_or(7, |p| p as u32 & 7) << 26)
     }
 
     /// `pipe_mbus_dbox_ctl` for display 14.00.
@@ -406,18 +412,27 @@ impl Dbuf {
     /// `DBUF_TRACKER_STATE_SERVICE(8)` (`gen12_dbuf_slices_config`) and the
     /// MDCLK/CDCLK minimum tracker (ratio 2, doubled when joined).
     pub(crate) fn dbuf_ctl(&self, slice: usize, old: u32, enabled: u8) -> u32 {
-        let ratio = if self.joined { 4 } else { 2 };
-        let request = if enabled & (1 << slice) != 0 {
-            DBUF_POWER_REQUEST
-        } else {
-            0
-        };
-        (old & !(DBUF_POWER_REQUEST | DBUF_POWER_STATE | DBUF_TRACKER_MASK))
-            | request
-            | (8 << 19)
-            | ((ratio - 1) << 16)
+        dbuf_ctl_value(slice, old, enabled, self.joined)
     }
+}
 
+/// `DBUF_CTL_S(slice)` with an explicit join state: live transitions
+/// change the minimum tracker together with MBUS joining
+/// (`intel_dbuf_mdclk_min_tracker_update`), not with slice power.
+pub(crate) fn dbuf_ctl_value(slice: usize, old: u32, enabled: u8, joined: bool) -> u32 {
+    let ratio = if joined { 4 } else { 2 };
+    let request = if enabled & (1 << slice) != 0 {
+        DBUF_POWER_REQUEST
+    } else {
+        0
+    };
+    (old & !(DBUF_POWER_REQUEST | DBUF_POWER_STATE | DBUF_TRACKER_MASK))
+        | request
+        | (8 << 19)
+        | ((ratio - 1) << 16)
+}
+
+impl Dbuf {
     /// `intel_dbuf_bw_min_cdclk` from per-plane data rates.
     pub(crate) fn bw_min_cdclk(&self, pipes: &[Option<PipeInput>; PIPES]) -> u32 {
         let mut max_bw = [0u32; SLICES];
