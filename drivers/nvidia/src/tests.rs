@@ -3787,3 +3787,95 @@ kernel_test_in!(
     "drivers/nvidia/pcie_recovery",
     smoke_pcie_recovery_callback_vote_table
 );
+
+// ── PCI probe-decline (#1177) ─────────────────────────────────────
+
+fn smoke_nvidia_pci_probe_declines_wrong_vendor() -> TestResult {
+    // #1177: the nvidia-class entry is a class match (PCI class
+    // 0x03, display), so `probe` is offered every display
+    // controller — AMD, Intel, virtio-gpu, … A wrong vendor is an
+    // identity mismatch, not a broken device: the ProbeError
+    // contract (bus spec §9.3) requires the `NotForThisDriver`
+    // decline so `probe_all` falls through to the next candidate.
+    // Pre-fix this returned `BadDevice`, a terminal error that
+    // stops the walk, so this smoke fails on the unfixed tree.
+    // The vendor check is the first statement in `pci::probe`,
+    // preceding any device access, so a synthetic device suffices
+    // on both arches.
+    use crate::pci;
+    use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr, ProbeError};
+    use narf_capabilities::Cap;
+    use narf_memory::PhysAddr;
+    let addr = PcieAddr::new(0, 0, 1, 0);
+    let dev = BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            // Intel — a non-NVIDIA vendor behind the class backstop.
+            vendor: 0x8086,
+            // Uninspected on the decline path.
+            device: 0x0000,
+            // Display class, VGA subclass.
+            class: 0x030000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: PhysAddr::new(0),
+        },
+    };
+    let cap = Cap::<BusDeviceCap, narf_capabilities::Write>::bootstrap();
+    match pci::probe(dev, cap) {
+        Err(ProbeError::NotForThisDriver) => TestResult::Pass,
+        Err(ProbeError::BadDevice) => {
+            TestResult::Fail("nvidia: wrong vendor declined as BadDevice, not NotForThisDriver")
+        }
+        Err(_) => TestResult::Fail("nvidia: wrong vendor rejected with the wrong error"),
+        Ok(_) => TestResult::Fail("nvidia: probe must not claim a wrong-vendor device"),
+    }
+}
+kernel_test_in!(
+    "drivers/nvidia/pci",
+    smoke_nvidia_pci_probe_declines_wrong_vendor
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_nvidia_pci_probe_accepts_nvidia_device() -> TestResult {
+    // Positive half of #1177: a device whose vendor IS NVIDIA must
+    // not be declined — the probe proceeds to bring-up and binds.
+    // Runs against the machine's real NVIDIA function; Skips where
+    // no display-class NVIDIA function is enumerated (QEMU CI).
+    // x86_64-only: the enumeration re-runs init over QEMU q35's
+    // ECAM window, mirroring the smbus accept smoke (#1176).
+    use crate::chip::{NVIDIA_VENDOR, PCI_CLASS_DISPLAY};
+    use crate::pci;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{devices, BusDeviceCap, ProbeError};
+    use narf_capabilities::Cap;
+    // SAFETY: the kernel-test harness runs post-boot, so the
+    // allocator is online and the bootloader handoff is complete;
+    // `ECAM_DEFAULT_BASE` is QEMU q35's known-good ECAM window and
+    // the enumerator only reads config space (rejecting all-1s),
+    // so re-running init here is sound. (Same pattern as the
+    // smbus accept smoke, #1176.)
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let Some(dev) = devs.iter().find(|d| {
+        d.id.vendor == NVIDIA_VENDOR && ((d.id.class >> 16) & 0xFF) as u8 == PCI_CLASS_DISPLAY
+    }) else {
+        return TestResult::Skip("no NVIDIA display device enumerated on this machine");
+    };
+    let cap = Cap::<BusDeviceCap, narf_capabilities::Write>::bootstrap();
+    match pci::probe(*dev, cap) {
+        Ok(()) => TestResult::Pass,
+        Err(ProbeError::NotForThisDriver) => {
+            TestResult::Fail("nvidia: probe declined a real NVIDIA device")
+        }
+        Err(_) => TestResult::Fail("nvidia: probe of a real NVIDIA device failed"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/nvidia/pci",
+    smoke_nvidia_pci_probe_accepts_nvidia_device
+);
