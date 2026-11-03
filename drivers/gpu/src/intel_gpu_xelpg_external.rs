@@ -408,6 +408,8 @@ pub(crate) fn preflight_idle<M: MmioWindow + ?Sized>(
 
 /// Phase 2: program and light the route. See the module header for the
 /// sequence. The probe must come from [`probe_sink`] on this window.
+// Refusal hands the owned probe/route back inline: it must not allocate.
+#[allow(clippy::result_large_err)]
 pub fn activate<M: MmioWindow + ?Sized>(
     io: &M,
     probe: MtlSinkProbe,
@@ -728,6 +730,8 @@ impl MtlExternalRoute {
 
     /// Release AUX power and Type-C ownership of a stopped route. A live
     /// or quarantined route is handed back.
+    // The retained route returns inline on refusal: it must not allocate.
+    #[allow(clippy::result_large_err)]
     pub fn release<M: MmioWindow + ?Sized>(
         self,
         io: &M,

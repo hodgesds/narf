@@ -306,6 +306,8 @@ fn rd<M: MmioWindow + ?Sized>(io: &M, off: u64) -> Result<u32, HdmiError> {
 /// Program and light the HDMI route in `intel_ddi_pre_enable_hdmi` →
 /// `intel_ddi_enable` → `intel_ddi_enable_hdmi` order. Refusals return the
 /// probe; programming failures return a `Stopped` or `Quarantined` route.
+// Refusal hands the owned probe/route back inline: it must not allocate.
+#[allow(clippy::result_large_err)]
 pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     io: &M,
     probe: MtlHdmiProbe,
@@ -514,6 +516,8 @@ impl MtlHdmiRoute {
     }
 
     /// Release the Type-C connection of a stopped route.
+    // The retained route returns inline on refusal: it must not allocate.
+    #[allow(clippy::result_large_err)]
     pub fn release<M: MmioWindow + ?Sized>(self, io: &M) -> Result<(), (MtlHdmiRoute, HdmiError)> {
         if self.state != HdmiRouteState::Stopped {
             return Err((self, ExternalError::Quarantined.into()));
