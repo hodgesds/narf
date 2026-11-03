@@ -23,6 +23,9 @@ const MAX_COPY: usize = 1024 * 1024;
 const MAX_QUERIES: usize = 64;
 const MAX_CONTEXTS: usize = 64;
 const MAX_VMS: usize = 64;
+/// The proto-context's key inside CREATE's private, unshared Namespaces.
+/// It is never a visible name: publication re-keys it to the reserved ID.
+const PROTO_NAME: u32 = u32::MAX;
 
 /// A submission profile, deliberately separate from display generation gates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1046,11 +1049,7 @@ impl RenderFile {
         };
         let size = u32_at(request, 4);
         if set {
-            return Err(if size < 32 {
-                FsError::InvalidData
-            } else {
-                FsError::NoDevice
-            });
+            return Err(sseu_set_refusal(size));
         }
         if size == 0 {
             put32(request, 4, 32);
@@ -1438,85 +1437,112 @@ impl RenderFile {
         if (cmd == abi::GEM_CONTEXT_CREATE && flags != 0) || flags & !3 != 0 {
             return Err(FsError::InvalidData);
         }
-        let mut params = Vec::new();
+        // CREATE_EXT applies proto parameters before source finalization on
+        // every admitted generation. Sample cached admission before locking.
+        let low_latency_admitted = crate::intel_gpu_xe::low_latency_supported(info);
+        // i915_gem_context_create_ioctl makes the proto-context before the
+        // chain and create_setparam applies each SETPARAM link through
+        // set_proto_ctx_param as i915_user_extensions reaches it, so a link's
+        // error ends the walk before any later link is read. The proto is an
+        // unshared host-only container under a private name, never the
+        // visible namespace: even reentrant copyout cannot find or
+        // finalize/claim either of its context graphs. An error discards it,
+        // as err_pc's proto_context_close does, before any name is reserved;
+        // its contexts, maps and Arc drops all happen outside the guard.
+        let mut proto = Namespaces::new();
+        proto.initialize();
+        proto.contexts.insert(
+            PROTO_NAME,
+            Context::new(
+                Arc::new(Vm {
+                    _identity: PROTO_NAME,
+                }),
+                false,
+            ),
+        );
         if cmd == abi::GEM_CONTEXT_CREATE_EXT && flags & 1 != 0 {
-            let mut engines_set = false;
             abi::user_extensions(user, u64_at(&request, 8), |address, name| {
+                // create_extensions[]: SETPARAM; CLONE is invalid_ext.
                 if name != 0 {
                     return Err(FsError::InvalidData);
                 }
                 let ext = read(user, address, 56)?;
-                let param = ext[32..].to_vec();
+                let mut param = ext[32..].to_vec();
                 if u32_at(&param, 0) != 0 {
                     return Err(FsError::InvalidData);
                 }
-                // set_proto_ctx_param applies each extension in chain order.
-                let engines = if u64_at(&param, 8) == abi::CONTEXT_PARAM_ENGINES {
-                    if engines_set {
-                        return Err(FsError::InvalidData);
-                    }
-                    engines_set = true;
-                    Some(read_engines(
-                        info,
-                        user,
-                        u32_at(&param, 4),
-                        u64_at(&param, 16),
-                    )?)
-                } else {
-                    None
-                };
-                params.push((param, engines));
-                Ok(())
+                self.proto_parameter(info, user, &mut proto, &mut param, low_latency_admitted)
             })?;
         }
-        // CREATE_EXT applies proto parameters before source finalization on
-        // every admitted generation. Sample cached admission before locking.
-        let low_latency_admitted = crate::intel_gpu_xe::low_latency_supported(info);
-        // Retain exactly the referenced existing VMs under the namespace
-        // guard. The bounded vectors allocate before the guard, and all
-        // private contexts/maps/configuration and Arc drops occur outside it.
-        let vm_ids: Vec<_> = params
-            .iter()
-            .filter(|(param, _)| u64_at(param, 8) == 9)
-            .filter_map(|(param, _)| u32::try_from(u64_at(param, 16)).ok())
-            .collect();
-        let mut vms = Vec::with_capacity(vm_ids.len());
-        let pending = {
-            let mut namespaces = self.namespaces.lock();
-            let (id, nonce) = namespaces.reserve_context()?;
-            for vm_id in vm_ids {
-                if let Some(vm) = namespaces.vms.get(&vm_id) {
-                    vms.push((vm_id, vm.clone()));
-                }
-            }
-            PendingContext {
-                namespaces: &self.namespaces,
-                id,
-                nonce,
-            }
-        };
-        let id = pending.id;
-        // Reuse the exact proto handler on an unshared host-only container,
-        // never on the visible namespace. Even reentrant copyout cannot find
-        // or finalize/claim either of these private context graphs.
-        let mut proto = Namespaces::new();
-        proto.initialize();
-        proto
+        let context = proto
             .contexts
-            .insert(id, Context::new(Arc::new(Vm { _identity: id }), false));
-        for (vm_id, vm) in vms {
-            proto.vms.insert(vm_id, vm);
-        }
-        for (mut param, engines) in params {
-            put32(&mut param, 0, id);
-            proto.parameter(&mut param, true, engines, low_latency_admitted)?;
-        }
-        let context = proto.contexts.remove(&id).expect("owned private proto");
+            .remove(&PROTO_NAME)
+            .expect("owned private proto");
         let default = proto.contexts.remove(&0).expect("private context0");
         drop(proto);
+        // Linux allocates the context ID only after the chain applied.
+        let reserved = self.namespaces.lock().reserve_context();
+        let (id, nonce) = reserved?;
+        let pending = PendingContext {
+            namespaces: &self.namespaces,
+            id,
+            nonce,
+        };
         put32(&mut request, 0, id);
         user.write(arg, &request)?;
         pending.publish(context, default)
+    }
+
+    /// One CREATE_EXT SETPARAM link, i915_gem_context.c::set_proto_ctx_param
+    /// on the private proto. Only lookups that Linux makes at the link
+    /// itself touch the visible namespace.
+    fn proto_parameter(
+        &self,
+        info: &DeviceInfo,
+        user: &dyn IoctlContext,
+        proto: &mut Namespaces,
+        param: &mut [u8],
+        low_latency_admitted: bool,
+    ) -> Result<(), FsError> {
+        put32(param, 0, PROTO_NAME);
+        let size = u32_at(param, 4);
+        let value = u64_at(param, 16);
+        let engines = match u64_at(param, 8) {
+            // set_proto_ctx_sseu, as GEM_CONTEXT_SETPARAM's.
+            7 => return Err(sseu_set_refusal(size)),
+            abi::CONTEXT_PARAM_ENGINES => {
+                // set_proto_ctx_engines: "Cannot set engines twice" precedes
+                // the size check and every copy.
+                proto.engines_settable(PROTO_NAME)?;
+                Some(read_engines(info, user, size, value)?)
+            }
+            9 => {
+                // set_proto_ctx_vm takes its i915_gem_vm_lookup reference at
+                // this link. The clone is side-effect free, so parameter()
+                // still checks size first; a replaced or unused reference is
+                // dropped after the guard.
+                if let Ok(vm_id) = u32::try_from(value) {
+                    let vm = self.namespaces.lock().vms.get(&vm_id).cloned();
+                    if let Some(vm) = vm {
+                        drop(proto.vms.insert(vm_id, vm));
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        proto.parameter(param, true, engines, low_latency_admitted)
+    }
+}
+
+/// set_proto_ctx_sseu / set_sseu: `args->size < sizeof(user_sseu)` is
+/// -EINVAL, then `GRAPHICS_VER(i915) != 11` (every NARF i915 profile) is
+/// -ENODEV, before the payload is copied.
+fn sseu_set_refusal(size: u32) -> FsError {
+    if size < 32 {
+        FsError::InvalidData
+    } else {
+        FsError::NoDevice
     }
 }
 
@@ -2638,6 +2664,152 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_extension_validation_is_transactional
+    );
+
+    /// Destroys one VM handle from inside the outer ioctl's first copy-in of
+    /// the extension link at `at`.
+    struct DestroyVmOnRead<'a> {
+        file: &'a RenderFile,
+        user: &'a User,
+        at: u64,
+        vm: u32,
+        done: core::sync::atomic::AtomicBool,
+    }
+    impl IoctlContext for DestroyVmOnRead<'_> {
+        fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError> {
+            if address == self.at && !self.done.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                let nested = User::new();
+                let mut destroy = [0; 16];
+                put32(&mut destroy, 12, self.vm);
+                nested.store(64, &destroy);
+                invoke(self.file, &nested, abi::GEM_VM_DESTROY).expect("nested VM destroy");
+            }
+            self.user.read(address, destination)
+        }
+        fn write(&self, address: u64, source: &[u8]) -> Result<(), FsError> {
+            self.user.write(address, source)
+        }
+        fn nonblocking(&self) -> bool {
+            false
+        }
+    }
+
+    /// MIT Linux b90c984d i915_gem_context.c::create_setparam:2265 applies
+    /// each SETPARAM link through set_proto_ctx_param:877 as
+    /// i915_user_extensions reaches it, and i915_gem_context_create_ioctl
+    /// allocates the ID only after the chain. A link's own errno therefore
+    /// wins over a later unreadable link, and set_proto_ctx_vm's lookup
+    /// happens at its link.
+    fn smoke_i915_context_create_ext_applies_each_setparam_at_its_link() -> TestResult {
+        check(|| {
+            const UNREADABLE: u64 = 0x7fff_0000;
+            let file = RenderFile::new();
+            let user = User::new();
+            user.store(64, &[0; 16]);
+            invoke(&file, &user, abi::GEM_VM_CREATE).map_err(|_| "VM create")?;
+            let vm = u32_at(&user.load(64, 16), 12);
+            // A SETPARAM link: next_extension, then drm_i915_gem_context_param.
+            let link = |at: u64, next: u64, size: u32, param: u64, value: u64| {
+                let mut ext = [0; 56];
+                put64(&mut ext, 0, next);
+                put32(&mut ext, 36, size);
+                put64(&mut ext, 40, param);
+                put64(&mut ext, 48, value);
+                user.store(at, &ext);
+            };
+            let request = |chain: u64| {
+                let mut request = [0; 16];
+                put32(&mut request, 4, 1);
+                put64(&mut request, 8, chain);
+                user.store(64, &request);
+            };
+            let create = |chain: u64| {
+                request(chain);
+                invoke(&file, &user, abi::GEM_CONTEXT_CREATE_EXT)
+            };
+            // Each refusal is set_proto_ctx_param's at the first link; the
+            // second link's address is unreadable and is never reached.
+            for (size, param, value, expected, why) in [
+                (1, 4, 1, FsError::InvalidData, "NO_ERROR_CAPTURE size"),
+                (1, 9, u64::from(vm), FsError::InvalidData, "VM size"),
+                (0, 9, 1 << 32, FsError::NotFound, "VM upper_32_bits"),
+                (0, 9, u64::from(vm) + 1, FsError::NotFound, "VM lookup"),
+                (31, 7, 0, FsError::InvalidData, "SSEU size"),
+                (32, 7, 0, FsError::NoDevice, "SSEU GRAPHICS_VER != 11"),
+                (
+                    0,
+                    abi::CONTEXT_PARAM_LOW_LATENCY,
+                    0,
+                    FsError::InvalidData,
+                    "LOW_LATENCY",
+                ),
+                (
+                    4,
+                    abi::CONTEXT_PARAM_ENGINES,
+                    0,
+                    FsError::InvalidData,
+                    "ENGINES size",
+                ),
+                (0, u64::MAX, 0, FsError::InvalidData, "unknown parameter"),
+            ] {
+                link(256, UNREADABLE, size, param, value);
+                if create(256) != Err(expected) {
+                    return Err(why);
+                }
+            }
+            // A link that applies continues the walk into the unreadable one.
+            link(256, UNREADABLE, 0, 4, 1);
+            if create(256) != Err(FsError::BadAddress) {
+                return Err("an applied link did not continue the walk");
+            }
+            // The first refusing link wins over a later refusing one.
+            link(256, 512, 0, 4, 1);
+            link(512, 768, 32, 7, 0);
+            link(768, UNREADABLE, 0, 9, u64::from(vm) + 1);
+            if create(256) != Err(FsError::NoDevice) {
+                return Err("a later link's errno won");
+            }
+            if file.namespaces.lock().next_context != 1 {
+                return Err("a failed chain reserved a context name");
+            }
+            // set_proto_ctx_vm took its reference at the VM link, so the
+            // handle's destruction while a later link is read leaves the
+            // proto bound to that VM.
+            let original = file.namespaces.lock().vms.get(&vm).cloned().ok_or("VM")?;
+            link(256, 512, 0, 9, u64::from(vm));
+            link(512, 0, 0, 4, 1);
+            request(256);
+            let reentrant = DestroyVmOnRead {
+                file: &file,
+                user: &user,
+                at: 512 + 12,
+                vm,
+                done: core::sync::atomic::AtomicBool::new(false),
+            };
+            file.dispatch(
+                &info(Generation::MeteorLake),
+                abi::GEM_CONTEXT_CREATE_EXT,
+                64,
+                &reentrant,
+            )
+            .expect("Intel command")
+            .map_err(|_| "VM destroyed after its link")?;
+            let id = u32_at(&user.load(64, 16), 0);
+            let namespaces = file.namespaces.lock();
+            if namespaces.vms.contains_key(&vm)
+                || !Arc::ptr_eq(
+                    &namespaces.contexts.get(&id).ok_or("context")?.vm,
+                    &original,
+                )
+            {
+                return Err("VM was not resolved at its own link");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_context_create_ext_applies_each_setparam_at_its_link
     );
 
     /// MIT Linux b90c984d i915_gem_create.c::{i915_gem_create_ext_ioctl,

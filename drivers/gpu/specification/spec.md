@@ -928,6 +928,13 @@ dispatched (EINVAL outside the caller's table); next_extension copied only
 after the handler ran. There is no visited set: a cycle is applied again until
 E2BIG or until its handler refuses (a LOAD_BALANCE that revisits its slot is
 EEXIST).
+CONTEXT_CREATE_EXT follows i915_gem_context_create_ioctl/create_setparam: each
+SETPARAM link (ctx_id nonzero is EINVAL) is applied through set_proto_ctx_param
+to a private proto-context when the walk reaches it, so a link's errno ends the
+walk before any later link is copied. VM is looked up at its link (later handle
+destruction does not unbind it); SSEU is EINVAL below 32 bytes, otherwise
+ENODEV (GRAPHICS_VER != 11). The context ID is reserved only after the whole
+chain applied, and any error discards the proto with no name consumed.
 Context zero is implicit and, like i915 GRAPHICS_VER 12, finalized at open;
 created contexts stay proto-contexts until execbuffer, GETPARAM or reset-stats
 lookup. Each context owns legacy RCS0 and BCS0 states; an explicit engine map
