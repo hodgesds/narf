@@ -1948,9 +1948,8 @@ no failures and only the existing shared RNG-registration skip. The release
 production boot and both btrfs postflights also pass. The debug group pass is
 deferred to the end of this integration wave.
 
-The live and Pipe B-D modules have no production caller yet. Until the external
-route calls them, they and a few related items carry a temporary
-`allow(dead_code)` outside test builds. Remove it with that join. Pipe scalers,
+The live and Pipe B-D modules now have their production caller, the MTL external
+route, and no longer carry a temporary dead-code allowance. Pipe scalers,
 planar formats, bigjoiner, DSC and VRR remain open. None of this has run on
 physical Intel hardware.
 
@@ -2129,6 +2128,43 @@ Two topology gaps remain against Linux at this checkpoint:
 - GT0 has never reported an L3 bank entry. That predates this work.
 
 All eight release groups pass 2,100 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
+### MTL external outputs on Pipes B–D beside the lit panel — release gates recorded
+
+On MTL, external DP and HDMI monitors now run on Pipes B–D, next to the lit
+laptop panel. Previously they took Pipe A and needed the panel dark.
+- Each activation picks the lowest free pipe. Watermarks, DBUF, CDCLK and PM
+  demand are repartitioned live around the lit panel. The panel is never
+  blanked.
+- Enable and disable follow Linux's `hsw_crtc_enable` and `hsw_crtc_disable`.
+  The pipe DMC is enabled first and disabled last, and PW_2 powers Pipes B–D.
+- Removing the monitor gives Pipe A its whole profile back.
+- Every pipe-arm write now runs inside vblank evasion with interrupts masked,
+  as Linux does.
+- PM demand uses the route's own port clock.
+- The external route's state is published for lock-free readers.
+
+Integration needed one production fix. When a monitor was removed, the
+repartition re-joined the display memory bus with Pipe A selected, as Linux
+does. The panel's fixed-profile check accepted only the modeset's "no pipe"
+selection. As a result, after any external monitor was unplugged, KMS flips,
+the cursor and PSR on the panel refused until the next modeset. The check now
+accepts either selection, matching Linux's readout, and a new test pins it.
+
+These items are still open and go to a follow-up worker:
+- KMS flips and the cursor on Pipe A refuse while an external monitor is lit,
+  because their profile is single-pipe.
+- PSR refuses while an external monitor is lit.
+- An active FBC or DSB on the panel refuses the external monitor with Busy.
+- Linetime watermarks, pipe chicken and frame-start delay are not programmed
+  for Pipes B–D.
+- CDCLK and PM demand stay raised after the last pipe is released with no
+  panel.
+
+All eight release groups pass 2,113 tests, with no failures and only the
 existing shared RNG-registration skip. The release production boot and both
 btrfs postflights also pass. The debug group pass is deferred to the end of
 this integration wave. None of this has run on physical Intel hardware.

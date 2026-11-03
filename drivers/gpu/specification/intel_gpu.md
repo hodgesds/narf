@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.48** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.49** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -38,8 +38,9 @@
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
 > VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
-> queries, and display-14 PSR on hardware inputs pass release native
-> model gates — see §20).
+> queries, display-14 PSR on hardware inputs, and MTL external outputs
+> on Pipes B–D beside the lit panel pass release native model gates —
+> see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3913,11 +3914,11 @@ max(old, new) before anything else, as the forward pre-plane request did.
 spec.md §3: reserve resources, program timings, let the port owner train,
 enable the transcoder and arm the primary, then disable and release. The
 fixed Pipe-A path is unchanged. Its KMS services still require the
-single-pipe layout and refuse while another pipe is lit. No production port
-caller exists yet, so these entries are reached only by native fixtures.
-Until the port owner calls them, the live and pipe modules, four
-`ResourceError` variants and `State::requests` carry a temporary
-`allow(dead_code)` outside native-test builds. Remove it with that join.
+single-pipe layout and refuse while another pipe is lit. The MTL external
+route is the production caller (see "External outputs on Pipes B–D beside the
+lit panel" below), so the temporary `allow(dead_code)` these entries carried
+until that join is gone; only `Pipes::state()` stays fixture-only behind a
+test gate.
 Seven more fixtures cover DDB ordering and cycle refusal, MBUS join and
 unjoin sequencing, adding and removing a pipe beside a lit panel, write-free
 refusals, reverse undo and the pipe owner's enable/release and refusals.
@@ -4616,3 +4617,23 @@ through the owner's typed admission. The new smokes are, in
 `smoke_mtl_modeset_reports_pipe_a_dmc_around_its_crtc`. The hook-pass smoke
 in `drivers/gpu/intel_gpu` now also checks the published pipe and samples the
 lock-free readers from inside a pass.
+
+Integration: the join needed one production fix. `mbus_ctl_join_update`
+selects the joined pipe when it stays lit without a modeset
+(`intel_mbus_joined_pipe`), so the live repartition that gives Pipe A its
+whole profile back re-joins MBUS with Pipe A selected. The owned modeset
+joins with NONE. `Profile::capture` accepted only NONE, so after any
+external route stopped, KMS flips, the cursor and PSR on the panel refused
+until the next modeset. The DP, HDMI and failed-activation smokes caught it.
+The capture now accepts either select while joined; Linux's MBUS readout
+only takes `MBUS_JOIN`. Another pipe's select, a missing hashing mode or an
+unjoined MBUS still refuse. `smoke_mtl_resource_profile_accepts_either_joined_mbus_select`
+in `drivers/gpu/intel_gpu_cursor` pins both cases.
+
+`ActivateError` carries a `large_enum_variant` allowance: like the existing
+`result_large_err` allowances, it hands the owner back by value, once per
+activation. All eight release groups pass 2,113 tests with no failures and no
+Intel skips; the only skip is the existing shared RNG-registration skip.
+Every new fixture passes. These are native models, not physical Intel
+evidence. The debug group pass is deferred to the end of the current
+integration wave.
