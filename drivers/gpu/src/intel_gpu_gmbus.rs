@@ -46,6 +46,16 @@
 //!   `gmbus_wait` folds into every wait and reports as the
 //!   NAK / no-such-slave outcome. Same bit, correct name.
 //!
+//! ## Pin numbering correction (2026-11, Linux b90c984d)
+//!
+//! [`PinPair`] encoded DDI A..F as GMBUS pins 2..7. The source numbering
+//! (`intel_gmbus.h` `GMBUS_PIN_*`, tables in `intel_gmbus.c`) is DDI A/B/C
+//! = 1/2/3 and TC1..TC6 = 9..14, so every Gen12 DDC transfer selected the
+//! wrong wires (DDI B drove "dpc"). The per-PCH table is
+//! [`GmbusPinTable`] (`get_gmbus_pin`: icp for TGP/ADP, dg1, dg2, mtp
+//! for Meteor Lake and later); the Gen12 DDI default is
+//! [`gen12_ddc_pin`] (`intel_hdmi_default_ddc_pin`).
+//!
 //! ## Transport protocol (implemented by [`GmbusBus`])
 //!
 //! One call = one I²C transfer, shaped after i915's
@@ -97,6 +107,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_gt::Gen12Platform;
 
 // ── Register offsets (TGL PRM Vol. 12 §"GMBUS Registers") ────────
 
@@ -135,52 +146,152 @@ pub const GMBUS0_HOLD_EXT: u32 = 1 << 7;
 /// bytes and never set it.
 pub const GMBUS0_BYTE_CNT_OVERRIDE: u32 = 1 << 6;
 
-/// GMBUS pin pair encoding (bits[2:0] of `GMBUS0`). Each value
-/// selects which DDI's I²C lines the controller drives.
+/// A GMBUS pin number, the value `intel_gmbus.c` writes into `GMBUS0`
+/// with the rate (`bus->reg0 = pin | GMBUS_RATE_100KHZ`). Names and
+/// values are `intel_gmbus.h`'s `GMBUS_PIN_*` for the BXT/CNP-and-later
+/// numbering every display this driver programs uses. What a pin is
+/// wired to depends on the PCH pin table ([`GmbusPinTable`]); this type
+/// is only the number.
 ///
-/// Source: TGL PRM Vol. 12 §"GMBUS0 — Pin Pair Selection".
+/// Correction (Linux b90c984d): this enum used to encode DDI A..F as
+/// 2..7 (a PRM pair-index reading). The source numbering is DDI A/B/C =
+/// 1/2/3 (`GMBUS_PIN_1_BXT`..`GMBUS_PIN_3_BXT`, "dpa"/"dpb"/"dpc" in
+/// `gmbus_pins_icp`) and Type-C TC1..TC6 = 9..14
+/// (`GMBUS_PIN_9_TC1_ICP`..`GMBUS_PIN_14_TC6_TGP`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PinPair {
-    /// Disable GMBUS (default at reset).
+    /// `GMBUS_PIN_DISABLED`.
     Disabled = 0,
-    /// Dedicated CRT/VGA legacy I²C — pre-Gen11 only; reserved on
-    /// TGL+. Listed for completeness.
-    LegacyCrt = 1,
-    /// DDI A (combo PHY pair 1).
-    DdiA = 2,
-    /// DDI B.
-    DdiB = 3,
-    /// DDI C.
-    DdiC = 4,
-    /// DDI D / TC1 on USB-C boards.
-    DdiD = 5,
-    /// DDI E / TC2.
-    DdiE = 6,
-    /// DDI F / TC3.
-    DdiF = 7,
+    /// `GMBUS_PIN_1_BXT` ("dpa" on ICP/DG1/DG2/MTP).
+    Pin1Bxt = 1,
+    /// `GMBUS_PIN_2_BXT` ("dpb").
+    Pin2Bxt = 2,
+    /// `GMBUS_PIN_3_BXT` ("dpc").
+    Pin3Bxt = 3,
+    /// `GMBUS_PIN_4_CNP` ("dpd" on DG1/DG2/MTP).
+    Pin4Cnp = 4,
+    /// `GMBUS_PIN_5_MTP` ("dpe" on MTP).
+    Pin5Mtp = 5,
+    /// `GMBUS_PIN_9_TC1_ICP` ("tc1").
+    Pin9Tc1 = 9,
+    /// `GMBUS_PIN_10_TC2_ICP` ("tc2").
+    Pin10Tc2 = 10,
+    /// `GMBUS_PIN_11_TC3_ICP` ("tc3").
+    Pin11Tc3 = 11,
+    /// `GMBUS_PIN_12_TC4_ICP` ("tc4").
+    Pin12Tc4 = 12,
+    /// `GMBUS_PIN_13_TC5_TGP` ("tc5" on ICP-table PCHs).
+    Pin13Tc5 = 13,
+    /// `GMBUS_PIN_14_TC6_TGP` ("tc6" on ICP-table PCHs).
+    Pin14Tc6 = 14,
 }
 
 impl PinPair {
-    /// Pack into bits[2:0] of `GMBUS0`.
+    /// The `GMBUS0` pin value (ORed with the rate field).
     pub const fn encode(self) -> u32 {
         self as u32
     }
+
+    /// The Type-C DDC pin for `enum tc_port` index `tc` (TC1 = 0), as
+    /// `icl_encoder_to_ddc_pin` computes it: `GMBUS_PIN_9_TC1_ICP + tc`.
+    pub const fn type_c(tc: u8) -> Option<Self> {
+        Some(match tc {
+            0 => PinPair::Pin9Tc1,
+            1 => PinPair::Pin10Tc2,
+            2 => PinPair::Pin11Tc3,
+            3 => PinPair::Pin12Tc4,
+            4 => PinPair::Pin13Tc5,
+            5 => PinPair::Pin14Tc6,
+            _ => return None,
+        })
+    }
 }
 
-/// The GMBUS pin pair a DDI's DDC lines hang off (PRM Vol. 12
-/// GMBUS0 pin-pair table: DDI A..F = pairs 2..7). DDI G/H have
-/// no GMBUS-addressable DDC pair on Gen12 and return `None`.
-pub fn pin_pair_for(ddi: Ddi) -> Option<PinPair> {
-    Some(match ddi {
-        Ddi::A => PinPair::DdiA,
-        Ddi::B => PinPair::DdiB,
-        Ddi::C => PinPair::DdiC,
-        Ddi::D => PinPair::DdiD,
-        Ddi::E => PinPair::DdiE,
-        Ddi::F => PinPair::DdiF,
-        _ => return None,
-    })
+/// The PCH pin table `intel_gmbus.c::get_gmbus_pin` selects (newest
+/// first: `PCH_MTL` and later → `gmbus_pins_mtp`, `PCH_DG2` →
+/// `gmbus_pins_dg2`, `PCH_DG1` → `gmbus_pins_dg1`, `PCH_ICP` and later →
+/// `gmbus_pins_icp`). Older tables (CNP, BXT, SKL, BDW, gen4) belong to
+/// displays this driver never programs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GmbusPinTable {
+    /// `gmbus_pins_icp` (PCH_ICP, PCH_TGP, PCH_ADP).
+    Icp,
+    /// `gmbus_pins_dg1`.
+    Dg1,
+    /// `gmbus_pins_dg2`.
+    Dg2,
+    /// `gmbus_pins_mtp` (PCH_MTL, PCH_LNL).
+    Mtp,
+}
+
+impl GmbusPinTable {
+    /// The table for a display generation. Tiger Lake (PCH_TGP) and
+    /// Alder/Raptor Lake S/P/N (PCH_ADP, `intel_pch.c::intel_pch_type`)
+    /// are `>= PCH_ICP` and below `PCH_DG1`; Meteor/Arrow Lake fake
+    /// `PCH_MTL` and display 20+ fakes `PCH_LNL`
+    /// (`intel_pch_fake_for_south_display`), both `>= PCH_MTL`.
+    pub const fn for_generation(generation: crate::intel_gpu::Generation) -> Self {
+        use crate::intel_gpu::Generation;
+        match generation {
+            Generation::TigerLake | Generation::AlderLake => GmbusPinTable::Icp,
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
+                GmbusPinTable::Mtp
+            }
+        }
+    }
+
+    /// `gmbus_pins_*[pin].name`, or `None` when the table has no such
+    /// pin (`intel_gmbus_is_valid_pin` false).
+    pub const fn name(self, pin: PinPair) -> Option<&'static str> {
+        use GmbusPinTable::{Dg1, Dg2, Icp, Mtp};
+        Some(match (self, pin) {
+            (_, PinPair::Pin1Bxt) => "dpa",
+            (_, PinPair::Pin2Bxt) => "dpb",
+            (_, PinPair::Pin3Bxt) => "dpc",
+            (Dg1 | Dg2 | Mtp, PinPair::Pin4Cnp) => "dpd",
+            (Mtp, PinPair::Pin5Mtp) => "dpe",
+            (Icp | Dg2 | Mtp, PinPair::Pin9Tc1) => "tc1",
+            (Icp | Mtp, PinPair::Pin10Tc2) => "tc2",
+            (Icp | Mtp, PinPair::Pin11Tc3) => "tc3",
+            (Icp | Mtp, PinPair::Pin12Tc4) => "tc4",
+            (Icp, PinPair::Pin13Tc5) => "tc5",
+            (Icp, PinPair::Pin14Tc6) => "tc6",
+            _ => return None,
+        })
+    }
+
+    /// `intel_gmbus_is_valid_pin`.
+    pub const fn is_valid(self, pin: PinPair) -> bool {
+        self.name(pin).is_some()
+    }
+}
+
+/// The default DDC pin of a Gen12 DDI, `intel_hdmi.c` b90c984d
+/// `intel_hdmi_default_ddc_pin` with no VBT pin: Alder Lake S uses
+/// `adls_encoder_to_ddc_pin` (PHY A → pin 1, every other port →
+/// `GMBUS_PIN_9_TC1_ICP + phy - PHY_B`, its TC1..TC4 being PHY B..E);
+/// Tiger Lake and Alder Lake P/N use `icl_encoder_to_ddc_pin` (combo
+/// PHY A/B → `GMBUS_PIN_1_BXT + port`, Type-C → `GMBUS_PIN_9_TC1_ICP +
+/// tc`). Combo is PHY A/B on display 12 and on ADL-P
+/// (`intel_phy_is_combo`); Type-C is PORT_TC1..TC6 (DDI D..I) on Tiger
+/// Lake and TC1..TC4 (DDI D..G) on ADL-P/N, per the platform port masks
+/// in `intel_display_device.c`. A DDI the platform does not have (the
+/// source's WARN paths) has no pin. Every result is valid in
+/// `gmbus_pins_icp`, the table these PCHs select.
+pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
+    match (family, ddi) {
+        (_, Ddi::A) => Some(PinPair::Pin1Bxt),
+        (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H) => None,
+        (_, Ddi::B) => Some(PinPair::Pin2Bxt),
+        (_, Ddi::C) => None,
+        (_, Ddi::D) => Some(PinPair::Pin9Tc1),
+        (_, Ddi::E) => Some(PinPair::Pin10Tc2),
+        (_, Ddi::F) => Some(PinPair::Pin11Tc3),
+        (_, Ddi::G) => Some(PinPair::Pin12Tc4),
+        (Gen12Platform::TigerLake, Ddi::H) => Some(PinPair::Pin13Tc5),
+        (_, Ddi::H) => None,
+    }
 }
 
 // ── GMBUS1 — command (TGL PRM Vol. 12 §"GMBUS1") ─────────────────
@@ -353,7 +464,7 @@ impl EdidReadProgram {
 /// driving the registers by hand must reproduce that sequence
 /// (see the module header's "Transport protocol").
 pub fn build_edid_read(pin_pair: PinPair, bytes: u16) -> Result<EdidReadProgram, GmbusError> {
-    if matches!(pin_pair, PinPair::Disabled | PinPair::LegacyCrt) {
+    if matches!(pin_pair, PinPair::Disabled) {
         return Err(GmbusError::InvalidPinPair);
     }
     if bytes == 0 || bytes > 0x1FF {
@@ -408,16 +519,22 @@ impl GmbusStatus {
 
 impl TryFrom<u32> for PinPair {
     type Error = GmbusError;
+    /// Decode a pin number (exactly a `GMBUS_PIN_*` value; 6..8 and
+    /// 15+ name no pin in the BXT+ numbering).
     fn try_from(v: u32) -> Result<Self, Self::Error> {
-        Ok(match v & 0x7 {
+        Ok(match v {
             0 => PinPair::Disabled,
-            1 => PinPair::LegacyCrt,
-            2 => PinPair::DdiA,
-            3 => PinPair::DdiB,
-            4 => PinPair::DdiC,
-            5 => PinPair::DdiD,
-            6 => PinPair::DdiE,
-            7 => PinPair::DdiF,
+            1 => PinPair::Pin1Bxt,
+            2 => PinPair::Pin2Bxt,
+            3 => PinPair::Pin3Bxt,
+            4 => PinPair::Pin4Cnp,
+            5 => PinPair::Pin5Mtp,
+            9 => PinPair::Pin9Tc1,
+            10 => PinPair::Pin10Tc2,
+            11 => PinPair::Pin11Tc3,
+            12 => PinPair::Pin12Tc4,
+            13 => PinPair::Pin13Tc5,
+            14 => PinPair::Pin14Tc6,
             _ => return Err(GmbusError::InvalidPinPair),
         })
     }
@@ -775,10 +892,18 @@ pub mod tests {
     // ── Codec smokes ─────────────────────────────────────────
 
     fn smoke_pin_pair_round_trip() -> TestResult {
-        for v in 0u32..=7 {
-            let pp = PinPair::try_from(v).expect("valid range");
+        // intel_gmbus.h b90c984d: GMBUS_PIN_DISABLED, GMBUS_PIN_1_BXT..
+        // GMBUS_PIN_5_MTP, GMBUS_PIN_9_TC1_ICP..GMBUS_PIN_14_TC6_TGP. The
+        // former 0..=7 range encoded DDI A..F as 2..7, which is wrong.
+        for v in [0u32, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14] {
+            let pp = PinPair::try_from(v).expect("GMBUS_PIN_* value");
             if pp.encode() != v {
                 return TestResult::Fail("pin pair encode round-trip");
+            }
+        }
+        for v in [6u32, 7, 8, 15, 0x202] {
+            if PinPair::try_from(v) != Err(GmbusError::InvalidPinPair) {
+                return TestResult::Fail("non-GMBUS_PIN values must not decode");
             }
         }
         TestResult::Pass
@@ -786,12 +911,13 @@ pub mod tests {
     kernel_test_in!("drivers/gpu/intel_gpu_gmbus", smoke_pin_pair_round_trip);
 
     fn smoke_edid_read_program_layout() -> TestResult {
-        let p = match build_edid_read(PinPair::DdiB, 128) {
+        let p = match build_edid_read(PinPair::Pin2Bxt, 128) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("clean inputs rejected"),
         };
-        if p.gmbus0 & 0x7 != PinPair::DdiB.encode() {
-            return TestResult::Fail("pin pair not in GMBUS0[2:0]");
+        // reg0 = pin | GMBUS_RATE_100KHZ (intel_gmbus.c gmbus setup).
+        if p.gmbus0 != GMBUS0_RATE_100KHZ | 2 {
+            return TestResult::Fail("GMBUS0 must be GMBUS_RATE_100KHZ | pin");
         }
         if p.gmbus1 & GMBUS1_DIR_READ == 0 {
             return TestResult::Fail("read direction not set");
@@ -846,7 +972,7 @@ pub mod tests {
     );
 
     fn smoke_edid_read_rejects_oversize() -> TestResult {
-        match build_edid_read(PinPair::DdiB, 600) {
+        match build_edid_read(PinPair::Pin2Bxt, 600) {
             Err(GmbusError::TooManyBytes) => TestResult::Pass,
             _ => TestResult::Fail("oversize byte count must be rejected"),
         }
@@ -1357,7 +1483,7 @@ pub mod tests {
 
     fn smoke_transport_edid_base_block_read() -> TestResult {
         let fake = FakeGmbus::new();
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 128];
         if bus.read_edid(&mut out).is_err() {
             return TestResult::Fail("base EDID read must succeed against the fake sink");
@@ -1401,7 +1527,7 @@ pub mod tests {
         let image = test_edid_image();
         // E-DDC segment pointer: block group 256..511 is
         // segment 1 (VESA E-EDID §"Segment Pointer").
-        if gmbus_write(&fake, PinPair::DdiB, DDC_SLAVE_SEGMENT, &[1]).is_err() {
+        if gmbus_write(&fake, PinPair::Pin2Bxt, DDC_SLAVE_SEGMENT, &[1]).is_err() {
             return TestResult::Fail("segment pointer write must succeed");
         }
         let seg_writes: [(u64, u32); 5] = [
@@ -1416,7 +1542,7 @@ pub mod tests {
         }
         // Block 2 (image bytes 256..384): segment 1, index 0.
         let mut block2 = [0u8; 128];
-        if gmbus_read(&fake, PinPair::DdiB, DDC_SLAVE_EDID, 0, &mut block2).is_err() {
+        if gmbus_read(&fake, PinPair::Pin2Bxt, DDC_SLAVE_EDID, 0, &mut block2).is_err() {
             return TestResult::Fail("block 2 read must succeed");
         }
         if block2 != image[256..384] {
@@ -1425,7 +1551,7 @@ pub mod tests {
         // Block 3 (image bytes 384..512): segment persists,
         // index 128.
         let mut block3 = [0u8; 128];
-        if gmbus_read(&fake, PinPair::DdiB, DDC_SLAVE_EDID, 128, &mut block3).is_err() {
+        if gmbus_read(&fake, PinPair::Pin2Bxt, DDC_SLAVE_EDID, 128, &mut block3).is_err() {
             return TestResult::Fail("block 3 read must succeed");
         }
         if block3 != image[384..512] {
@@ -1450,7 +1576,7 @@ pub mod tests {
 
     fn smoke_transport_two_byte_index_uses_gmbus5() -> TestResult {
         let fake = FakeGmbus::new();
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let image = test_edid_image();
         let mut out = [0u8; 64];
         if bus
@@ -1486,7 +1612,7 @@ pub mod tests {
     fn smoke_transport_nak_refusal_and_recovery() -> TestResult {
         let fake = FakeGmbus::new();
         fake.set_edid_present(false);
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 128];
         match bus.read_edid(&mut out) {
             Err(GmbusError::SlaveNack) => {}
@@ -1520,7 +1646,7 @@ pub mod tests {
     fn smoke_transport_bus_timeout() -> TestResult {
         let fake = FakeGmbus::new();
         fake.set_wedge(true);
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 16];
         match bus.read(DDC_SLAVE_EDID, &mut out) {
             Err(GmbusError::Timeout) => {}
@@ -1542,7 +1668,7 @@ pub mod tests {
     fn smoke_transport_stall_timeout() -> TestResult {
         let fake = FakeGmbus::new();
         fake.set_stall(true);
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 16];
         match bus.read(DDC_SLAVE_EDID, &mut out) {
             Err(GmbusError::HardwareTimeout) => {}
@@ -1560,7 +1686,7 @@ pub mod tests {
         // 0x20 TMDS_CONFIG — the drm_scdc_helper map the HDMI
         // session consumes): write [0x20, 0x03], read back.
         let fake = FakeGmbus::new();
-        if gmbus_write(&fake, PinPair::DdiB, SCDC_ADDR, &[0x20, 0x03]).is_err() {
+        if gmbus_write(&fake, PinPair::Pin2Bxt, SCDC_ADDR, &[0x20, 0x03]).is_err() {
             return TestResult::Fail("SCDC register write must succeed");
         }
         if fake.scdc_at(0x20) != 0x03 {
@@ -1576,7 +1702,7 @@ pub mod tests {
             _ => return TestResult::Fail("write preload must precede the GMBUS1 program"),
         }
         let mut out = [0u8; 1];
-        if gmbus_read(&fake, PinPair::DdiB, SCDC_ADDR, 0x20, &mut out).is_err() {
+        if gmbus_read(&fake, PinPair::Pin2Bxt, SCDC_ADDR, 0x20, &mut out).is_err() {
             return TestResult::Fail("SCDC register read must succeed");
         }
         if out != [0x03] {
@@ -1590,7 +1716,7 @@ pub mod tests {
         // SCDC registers.
         if gmbus_write(
             &fake,
-            PinPair::DdiB,
+            PinPair::Pin2Bxt,
             SCDC_ADDR,
             &[0x20, 0x03, 0xAA, 0xBB, 0xCC, 0xDD],
         )
@@ -1614,47 +1740,196 @@ pub mod tests {
     );
 
     fn smoke_transport_pin_pair_selection() -> TestResult {
-        // DDI A..F map to pin pairs 2..7 (PRM Vol. 12 pin-pair
-        // table); DDI G/H have no GMBUS pair.
-        let table = [
-            (Ddi::A, PinPair::DdiA),
-            (Ddi::B, PinPair::DdiB),
-            (Ddi::C, PinPair::DdiC),
-            (Ddi::D, PinPair::DdiD),
-            (Ddi::E, PinPair::DdiE),
-            (Ddi::F, PinPair::DdiF),
+        // Corrected against Linux b90c984d intel_hdmi.c
+        // intel_hdmi_default_ddc_pin (was DDI A..F = 2..7):
+        // icl_encoder_to_ddc_pin on TGL/ADL-P/ADL-N (combo A/B =
+        // GMBUS_PIN_1_BXT + port, TC = GMBUS_PIN_9_TC1_ICP + tc),
+        // adls_encoder_to_ddc_pin on ADL-S (A = 1, TC1..4 = 9..12).
+        use Gen12Platform::{AlderLakeN, AlderLakeP, AlderLakeS, TigerLake};
+        let ddis = [
+            Ddi::A,
+            Ddi::B,
+            Ddi::C,
+            Ddi::D,
+            Ddi::E,
+            Ddi::F,
+            Ddi::G,
+            Ddi::H,
         ];
-        for (ddi, pair) in table {
-            if pin_pair_for(ddi) != Some(pair) {
-                return TestResult::Fail("DDI → pin pair mapping wrong");
+        let rows: [(Gen12Platform, [Option<u32>; 8]); 4] = [
+            (
+                TigerLake,
+                [
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    Some(13),
+                ],
+            ),
+            (
+                AlderLakeP,
+                [
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    None,
+                ],
+            ),
+            (
+                AlderLakeN,
+                [
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    None,
+                ],
+            ),
+            (
+                AlderLakeS,
+                [
+                    Some(1),
+                    None,
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    None,
+                ],
+            ),
+        ];
+        for (family, want) in rows {
+            for (ddi, pin) in ddis.iter().zip(want) {
+                let got = gen12_ddc_pin(family, *ddi);
+                if got.map(PinPair::encode) != pin {
+                    return TestResult::Fail("Gen12 DDI -> DDC pin differs from Linux");
+                }
+                // Every resolved pin exists in gmbus_pins_icp.
+                if got.is_some_and(|p| !GmbusPinTable::Icp.is_valid(p)) {
+                    return TestResult::Fail("Gen12 DDC pin must be valid in gmbus_pins_icp");
+                }
             }
         }
-        if pin_pair_for(Ddi::G).is_some() || pin_pair_for(Ddi::H).is_some() {
-            return TestResult::Fail("DDI G/H must have no GMBUS pin pair");
-        }
-        // The select write carries rate | pair: DDI E at the
-        // default rate is 6; DDI C at 400 kHz is 0x204.
+        // The select write carries rate | pin: TC4 (12) at the
+        // default rate is 0x0C; DDI B ("dpb", 2) at 400 kHz is 0x202.
         let fake = FakeGmbus::new();
-        let bus = GmbusBus::new(&fake, PinPair::DdiE);
+        fake.set_pin(12);
+        let bus = GmbusBus::new(&fake, PinPair::Pin12Tc4);
         let mut out = [0u8; 4];
         if bus.read(DDC_SLAVE_EDID, &mut out).is_err() {
-            return TestResult::Fail("DDI E read must succeed");
+            return TestResult::Fail("TC4 DDC read must succeed on pin 12");
         }
-        if fake.writes().first() != Some(&(GMBUS0, 6)) {
-            return TestResult::Fail("select write must be rate | DdiE (6)");
+        if fake.writes().first() != Some(&(GMBUS0, 0x0C)) {
+            return TestResult::Fail("select write must be rate | GMBUS_PIN_12_TC4_ICP");
         }
         let fake2 = FakeGmbus::new();
-        let bus2 = GmbusBus::with_rate(&fake2, PinPair::DdiC, GMBUS0_RATE_400KHZ);
+        fake2.set_pin(2);
+        let bus2 = GmbusBus::with_rate(&fake2, PinPair::Pin2Bxt, GMBUS0_RATE_400KHZ);
         if bus2.read(DDC_SLAVE_EDID, &mut out).is_err() {
-            return TestResult::Fail("DDI C read must succeed");
+            return TestResult::Fail("DDI B DDC read must succeed on pin 2");
         }
-        if fake2.writes().first() != Some(&(GMBUS0, 0x204)) {
-            return TestResult::Fail("select write must be 400 kHz | DdiC (0x204)");
+        if fake2.writes().first() != Some(&(GMBUS0, 0x202)) {
+            return TestResult::Fail("select write must be 400 kHz | GMBUS_PIN_2_BXT");
+        }
+        // The old encoding (DDI B = 3) drives "dpc": nothing answers.
+        let fake3 = FakeGmbus::new();
+        fake3.set_pin(2);
+        if GmbusBus::new(&fake3, PinPair::Pin3Bxt).read(DDC_SLAVE_EDID, &mut out)
+            != Err(GmbusError::SlaveNack)
+        {
+            return TestResult::Fail("a sink wired to dpb must not answer on dpc");
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gmbus",
         smoke_transport_pin_pair_selection
+    );
+
+    fn smoke_gmbus_pin_tables_match_linux() -> TestResult {
+        // intel_gmbus.c b90c984d gmbus_pins_icp/dg1/dg2/mtp.
+        let all = [0u32, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14];
+        let tables: [(GmbusPinTable, &[(u32, &str)]); 4] = [
+            (
+                GmbusPinTable::Icp,
+                &[
+                    (1, "dpa"),
+                    (2, "dpb"),
+                    (3, "dpc"),
+                    (9, "tc1"),
+                    (10, "tc2"),
+                    (11, "tc3"),
+                    (12, "tc4"),
+                    (13, "tc5"),
+                    (14, "tc6"),
+                ],
+            ),
+            (
+                GmbusPinTable::Dg1,
+                &[(1, "dpa"), (2, "dpb"), (3, "dpc"), (4, "dpd")],
+            ),
+            (
+                GmbusPinTable::Dg2,
+                &[(1, "dpa"), (2, "dpb"), (3, "dpc"), (4, "dpd"), (9, "tc1")],
+            ),
+            (
+                GmbusPinTable::Mtp,
+                &[
+                    (1, "dpa"),
+                    (2, "dpb"),
+                    (3, "dpc"),
+                    (4, "dpd"),
+                    (5, "dpe"),
+                    (9, "tc1"),
+                    (10, "tc2"),
+                    (11, "tc3"),
+                    (12, "tc4"),
+                ],
+            ),
+        ];
+        for (table, named) in tables {
+            for v in all {
+                let pin = match PinPair::try_from(v) {
+                    Ok(pin) if pin.encode() == v => pin,
+                    _ => return TestResult::Fail("GMBUS_PIN_* values must round-trip"),
+                };
+                let want = named.iter().find(|(n, _)| *n == v).map(|(_, name)| *name);
+                if table.name(pin) != want || table.is_valid(pin) != want.is_some() {
+                    return TestResult::Fail("pin table differs from intel_gmbus.c");
+                }
+            }
+        }
+        // get_gmbus_pin table selection by display generation.
+        use crate::intel_gpu::Generation;
+        if GmbusPinTable::for_generation(Generation::TigerLake) != GmbusPinTable::Icp
+            || GmbusPinTable::for_generation(Generation::AlderLake) != GmbusPinTable::Icp
+            || GmbusPinTable::for_generation(Generation::MeteorLake) != GmbusPinTable::Mtp
+            || GmbusPinTable::for_generation(Generation::LunarLake) != GmbusPinTable::Mtp
+        {
+            return TestResult::Fail("table selection must follow get_gmbus_pin");
+        }
+        if PinPair::type_c(0) != Some(PinPair::Pin9Tc1)
+            || PinPair::type_c(5) != Some(PinPair::Pin14Tc6)
+            || PinPair::type_c(6).is_some()
+        {
+            return TestResult::Fail("Type-C pin must be GMBUS_PIN_9_TC1_ICP + tc");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gmbus",
+        smoke_gmbus_pin_tables_match_linux
     );
 }

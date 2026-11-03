@@ -41,13 +41,13 @@
 //! clocks without a source table (the SNPS C10 and computed C20
 //! algorithms are not implemented; the latter also needs the MTL-U /
 //! ARL-S `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy
-//! port), Type-C DDC (GMBUS pins 9-12 are not representable by the shared
-//! pin-pair encoder), a busy pipe A or an active DDI. Audio, deep color,
-//! YCbCr and HDMI 2.1 FRL remain out of scope.
+//! port), a busy pipe A or an active DDI. Audio, deep color, YCbCr and
+//! HDMI 2.1 FRL remain out of scope.
 //!
-//! The shared Gen12 GMBUS `PinPair` enum is used only as a raw pin
-//! number here: `PinPair::DdiA` encodes 2, which on the MTP pin table is
-//! `GMBUS_PIN_2_BXT` = DDI B.
+//! DDC pins come from the corrected GMBUS numbering
+//! ([`crate::intel_gpu_gmbus::PinPair`], `gmbus_pins_mtp`): DDI B is pin 2
+//! ("dpb"), a declared legacy TCn is pin 8 + n ("tc1".."tc4"); see
+//! [`ddc_pin`].
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -187,11 +187,23 @@ pub fn hdmi_pll_request(
     })
 }
 
-/// The DDC pin for an HDMI-capable MTL port (see module header).
+/// The DDC pin of an HDMI-capable MTL port, valid in `gmbus_pins_mtp`.
+/// DDI B is `intel_hdmi_default_ddc_pin`'s `dg1_encoder_to_ddc_pin`
+/// (`PCH_MTL >= PCH_DG1`: PHY B + 1 = `GMBUS_PIN_2_BXT`, "dpb"). That
+/// formula gives Type-C (PHY F..I) pins 6..9, which the MTP table does
+/// not wire to TC1..TC4, so Linux takes a Type-C port's DDC only from its
+/// VBT child (`intel_bios_hdmi_ddc_pin`, mapped by `map_ddc_pin` with
+/// `adlp_ddc_pin_map`: `ADLP_DDC_BUS_PORT_TCn` = `GMBUS_PIN_9_TC1_ICP +
+/// n - 1`, "tc1".."tc4"). A declared legacy port carries that VBT fact
+/// here: TCn's DDC is the MTP "tcn" pin. DDI A (internal) has none.
 pub const fn ddc_pin(port: XeLpgPort) -> Option<PinPair> {
     match port {
-        XeLpgPort::B => Some(PinPair::DdiA),
-        _ => None,
+        XeLpgPort::A => None,
+        XeLpgPort::B => Some(PinPair::Pin2Bxt),
+        XeLpgPort::Tc1 => Some(PinPair::Pin9Tc1),
+        XeLpgPort::Tc2 => Some(PinPair::Pin10Tc2),
+        XeLpgPort::Tc3 => Some(PinPair::Pin11Tc3),
+        XeLpgPort::Tc4 => Some(PinPair::Pin12Tc4),
     }
 }
 
@@ -299,30 +311,6 @@ pub fn release_hdmi_probe<M: MmioWindow + ?Sized>(
         Some(conn) => tc_disconnect(io, &conn).map_err(HdmiError::from),
         None => Ok(()),
     }
-}
-
-/// Connect a declared legacy Type-C port for HDMI and resolve its PLL
-/// for `mode` (the DDC for Type-C is refused by [`probe_hdmi`]; callers
-/// with an out-of-band mode use this).
-pub fn connect_legacy_tc<M: MmioWindow + ?Sized>(
-    io: &M,
-    port: XeLpgPort,
-    mode: Mode,
-) -> Result<MtlHdmiProbe, HdmiError> {
-    let pll = hdmi_pll_request(port, mode.pixel_clock_khz, true)?;
-    let conn = tc_connect(io, port, true, HDMI_LANES)?;
-    if conn.mode != TcMode::Legacy {
-        let _ = tc_disconnect(io, &conn);
-        return Err(HdmiError::NotLegacy);
-    }
-    Ok(MtlHdmiProbe {
-        port,
-        tc: Some(conn),
-        mode,
-        pll,
-        edid: [0; crate::intel_gpu_hdmi::EDID_CAPACITY],
-        edid_len: 0,
-    })
 }
 
 /// Lifecycle of an HDMI route (same meaning as the DP route's).

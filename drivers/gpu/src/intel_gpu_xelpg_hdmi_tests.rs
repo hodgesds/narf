@@ -357,12 +357,6 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
             false,
             HdmiError::NotLegacy,
         ),
-        (
-            Generation::MeteorLake,
-            XeLpgPort::Tc3,
-            true,
-            HdmiError::DdcUnavailable,
-        ),
     ];
     for (generation, port, legacy, error) in cases {
         match probe_hdmi(&NoAccess, generation, port, legacy) {
@@ -370,8 +364,26 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
             _ => return TestResult::Fail("HDMI probe refusals must precede MMIO"),
         }
     }
-    if ddc_pin(XeLpgPort::B) != Some(PinPair::DdiA) || ddc_pin(XeLpgPort::Tc1).is_some() {
-        return TestResult::Fail("MTP DDC pin 2 (dpb) must be the only mapped pin");
+    // Corrected GMBUS numbering (Linux b90c984d): DDI B = GMBUS_PIN_2_BXT
+    // ("dpb"), TCn = GMBUS_PIN_9_TC1_ICP + n - 1, all in gmbus_pins_mtp.
+    // The Type-C DDC refusal is lifted now the pins are expressible.
+    let pins = [
+        (XeLpgPort::B, 2u32, "dpb"),
+        (XeLpgPort::Tc1, 9, "tc1"),
+        (XeLpgPort::Tc2, 10, "tc2"),
+        (XeLpgPort::Tc3, 11, "tc3"),
+        (XeLpgPort::Tc4, 12, "tc4"),
+    ];
+    for (port, pin, name) in pins {
+        match ddc_pin(port) {
+            Some(p)
+                if p.encode() == pin
+                    && crate::intel_gpu_gmbus::GmbusPinTable::Mtp.name(p) == Some(name) => {}
+            _ => return TestResult::Fail("MTL DDC pin differs from gmbus_pins_mtp"),
+        }
+    }
+    if ddc_pin(XeLpgPort::A).is_some() {
+        return TestResult::Fail("internal DDI A has no external DDC pin");
     }
     TestResult::Pass
 }

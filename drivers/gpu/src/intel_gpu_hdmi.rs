@@ -78,9 +78,10 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_dp::sink_id_for;
 use crate::intel_gpu_gmbus::{
-    build_edid_read, gmbus1_byte_count, gmbus1_slave_addr, GmbusError, GmbusStatus, PinPair,
-    DDC_SLAVE_EDID, DDC_SLAVE_SEGMENT, GMBUS0, GMBUS0_RATE_100KHZ, GMBUS1, GMBUS1_DIR_READ,
-    GMBUS1_ENT, GMBUS1_STO, GMBUS1_SW_CLR_INT, GMBUS1_SW_RDY, GMBUS2, GMBUS3, GMBUS5,
+    build_edid_read, gen12_ddc_pin, gmbus1_byte_count, gmbus1_slave_addr, GmbusError, GmbusStatus,
+    PinPair, DDC_SLAVE_EDID, DDC_SLAVE_SEGMENT, GMBUS0, GMBUS0_RATE_100KHZ, GMBUS1,
+    GMBUS1_DIR_READ, GMBUS1_ENT, GMBUS1_STO, GMBUS1_SW_CLR_INT, GMBUS1_SW_RDY, GMBUS2, GMBUS3,
+    GMBUS5,
 };
 use crate::intel_gpu_modeset::{Framebuffer, Mode, Modeset, ModesetError};
 use crate::intel_gpu_pipes::Transcoder;
@@ -105,8 +106,8 @@ pub enum DdcError {
     Timeout,
     /// The transfer completed with fewer bytes than requested.
     ShortTransfer,
-    /// The DDI has no GMBUS pin pair (Type-C DDIs D+ on the
-    /// GEN11 HPD path are not GMBUS-addressable here).
+    /// The platform has no such DDI, so it has no DDC pin
+    /// ([`crate::intel_gpu_gmbus::gen12_ddc_pin`]).
     NoPinPair,
 }
 
@@ -114,20 +115,6 @@ impl From<GmbusError> for DdcError {
     fn from(e: GmbusError) -> Self {
         DdcError::Gmbus(e)
     }
-}
-
-/// The GMBUS pin pair a DDI's DDC lines hang off (PRM Vol. 12
-/// GMBUS0 pin-pair table: DDI A..F = pairs 2..7).
-pub fn pin_pair_for(ddi: Ddi) -> Option<PinPair> {
-    Some(match ddi {
-        Ddi::A => PinPair::DdiA,
-        Ddi::B => PinPair::DdiB,
-        Ddi::C => PinPair::DdiC,
-        Ddi::D => PinPair::DdiD,
-        Ddi::E => PinPair::DdiE,
-        Ddi::F => PinPair::DdiF,
-        _ => return None,
-    })
 }
 
 fn gmbus_idle<M: MmioWindow + ?Sized>(mmio: &M) {
@@ -720,9 +707,14 @@ fn mode_from_edid(edid_raw: &[u8]) -> Result<Mode, HdmiError> {
 /// Phase 1 of a connect: run the DDC conversation — read the
 /// complete EDID over GMBUS and derive the mode and the
 /// sink's SCDC capabilities. No display registers are touched
-/// beyond the GMBUS block.
+/// beyond the GMBUS block. The DDC pin is the family's default
+/// ([`gen12_ddc_pin`]); a DDI the family does not have refuses
+/// before any access.
 pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<HdmiSinkProbe, HdmiError> {
-    let pin = pin_pair_for(ddi).ok_or(DdcError::NoPinPair)?;
+    let family = mmio
+        .gen12_display_family()
+        .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
+    let pin = gen12_ddc_pin(family, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
@@ -753,7 +745,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     let family = mmio
         .gen12_display_family()
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pin = pin_pair_for(probe.ddi).ok_or(DdcError::NoPinPair)?;
+    let pin = gen12_ddc_pin(family, probe.ddi).ok_or(DdcError::NoPinPair)?;
     let mut scrambling = false;
     if probe.scrambling_required {
         configure_scdc(mmio, pin, &probe.hf_vsdb)?;
@@ -1384,9 +1376,14 @@ pub mod tests {
         // program for DDI B / 128 bytes, byte-for-byte:
         // SW_RDY|CYCLE_WAIT|count 128|slave 0x50|read.
         let sink = mmio.sink.borrow();
-        let codec = build_edid_read(PinPair::DdiB, 128).map(|p| p.gmbus1);
+        let codec = build_edid_read(PinPair::Pin2Bxt, 128).map(|p| p.gmbus1);
         if codec != Ok(0x4280_00A1) || sink.programs.first() != codec.as_ref().ok() {
             return TestResult::Fail("first GMBUS program must be the codec EDID read");
+        }
+        // Tiger Lake DDI B's DDC is GMBUS_PIN_2_BXT ("dpb" in
+        // gmbus_pins_icp), selected at 100 kHz (Linux b90c984d).
+        if mmio.writes_to(GMBUS0).first() != Some(&(GMBUS0_RATE_100KHZ | 2)) {
+            return TestResult::Fail("DDI B DDC must select GMBUS pin 2 (dpb)");
         }
         // A <=340 Mcsc mode must not touch SCDC at all.
         if sink.slaves_touched().contains(&DDC_SLAVE_SCDC) || !sink.scdc_applied.is_empty() {
@@ -1663,14 +1660,26 @@ pub mod tests {
 
     fn smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal() -> TestResult {
         use crate::intel_gpu_gt::Gen12Platform;
-        for (family, expected) in [
-            (Gen12Platform::TigerLake, 0x84000000),
-            (Gen12Platform::AlderLakeS, 0x84000000),
-            (Gen12Platform::AlderLakeP, 0x94000000),
-            (Gen12Platform::AlderLakeN, 0x94000000),
+        // Alder Lake S has no DDI B (port mask A + TC1..TC4,
+        // intel_display_device.c), so it has no DDC pin there
+        // (intel_gpu_gmbus::gen12_ddc_pin) and its row runs on DDI A.
+        let no_b = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(alloc::vec![0u8; 128]));
+        *no_b.family.borrow_mut() = Some(Gen12Platform::AlderLakeS);
+        if !matches!(
+            probe_sink(&no_b, Ddi::B),
+            Err(HdmiError::Ddc(DdcError::NoPinPair))
+        ) || !no_b.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("ADL-S DDI B must refuse without a DDC pin");
+        }
+        for (family, ddi, expected) in [
+            (Gen12Platform::TigerLake, Ddi::B, 0x84000000),
+            (Gen12Platform::AlderLakeS, Ddi::A, 0x84000000),
+            (Gen12Platform::AlderLakeP, Ddi::B, 0x94000000),
+            (Gen12Platform::AlderLakeN, Ddi::B, 0x94000000),
         ] {
             let mmio = HdmiSinkMmio::new(
-                Ddi::B,
+                ddi,
                 GmbusSink::new(fixture_edid_hdmi(
                     148_500,
                     1920,
@@ -1681,7 +1690,7 @@ pub mod tests {
                 )),
             );
             *mmio.family.borrow_mut() = Some(family);
-            let conn = connect(&mmio, Ddi::B, &test_fb(8192)).unwrap();
+            let conn = connect(&mmio, ddi, &test_fb(8192)).unwrap();
             assert_eq!(conn.family, family);
             assert_eq!(mmio.writes_to(0x70180).last(), Some(&expected));
             let before = mmio.writes.borrow().len();

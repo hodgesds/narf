@@ -1498,3 +1498,107 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_service_hdmi_unplug_mid_redetect_and_failed_stop
 );
+
+fn smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin() -> TestResult {
+    use crate::intel_gpu_xelpg_hpd::{icp_tc_hpd_long, sde_tc_hotplug};
+    // TC2 declared as a native HDMI connector (the VBT fact Linux would
+    // read); its DDC is gmbus_pins_mtp "tc2" = GMBUS_PIN_10_TC2_ICP.
+    let mut policy = MtlPortPolicy::NO_VBT;
+    policy.tc[1] = MtlPortDecl::LEGACY_HDMI;
+    let edid_720p = edid_for(74_250, 1280, 370, 110, 40, 720, 30, 5, 5);
+    let mut sink = Sink::new(0x14, Vec::new());
+    sink.nack_all = true;
+    let mut io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pica_isr.set(0);
+    io.sde_isr.set(sde_tc_hotplug(1));
+    io.ddc = FakeGmbus::with_edid(&edid_720p);
+    io.ddc.set_pin(10);
+    let mut monitor = MtlHpdMonitor::new(policy.hpd_config());
+    let mut service = MtlExternalService::with_policy(policy);
+    let event = match monitor.poll(&io) {
+        Some(event) if event.kind == MtlHpdKind::Connected(LiveMode::Legacy) => event,
+        _ => return TestResult::Fail("declared legacy TC2 sink must be detected as legacy"),
+    };
+    match service.handle(&io, event, &mut fb_for) {
+        ServiceOutcome::Activated {
+            port: XeLpgPort::Tc2,
+            protocol: MtlProtocol::Hdmi,
+            mode,
+            ..
+        } if mode.h_active == 1280 && mode.pixel_clock_khz == 74_250 => {}
+        _ => return TestResult::Fail("legacy TC2 must light HDMI over its tc2 DDC pin"),
+    }
+    let buf = io.read32(XeLpgPort::Tc2.buf_ctl1());
+    if buf & (TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP) != TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP
+        || io.ddc.writes_to(crate::intel_gpu_gmbus::GMBUS0).first() != Some(&10)
+        || io.read32(TRANS_CLK_SEL_A) != 0x7000_0000
+        || io.aux_power.get()
+    {
+        return TestResult::Fail("legacy HDMI must own the PHY, use pin 10 and PHY_G clocking");
+    }
+    // Unplug: SDE TC long pulse with the level low.
+    io.sde_isr.set(0);
+    io.phy.write32(
+        SHOTPLUG_CTL_TC,
+        io.phy.read32(SHOTPLUG_CTL_TC) | icp_tc_hpd_long(1),
+    );
+    match monitor.poll(&io) {
+        Some(event) if event.kind == MtlHpdKind::Disconnected => {
+            if !matches!(
+                service.handle(&io, event, &mut fb_for),
+                ServiceOutcome::Withdrawn {
+                    port: XeLpgPort::Tc2
+                }
+            ) {
+                return TestResult::Fail("legacy unplug must withdraw the HDMI route");
+            }
+        }
+        _ => return TestResult::Fail("legacy TC2 unplug must be reported"),
+    }
+    if io.read32(XeLpgPort::Tc2.buf_ctl1()) & (TC_PHY_OWNERSHIP | TCSS_POWER_REQUEST) != 0 {
+        return TestResult::Fail("withdrawal must release legacy Type-C ownership");
+    }
+    // The IOM never hands the PHY over: refused before any DDC traffic.
+    let mut sink = Sink::new(0x14, Vec::new());
+    sink.nack_all = true;
+    let mut io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pica_isr.set(0);
+    io.sde_isr.set(sde_tc_hotplug(1));
+    io.ddc = FakeGmbus::with_edid(&edid_720p);
+    io.ready.set(false);
+    let mut service = MtlExternalService::with_policy(policy);
+    let event = MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind: MtlHpdKind::Connected(LiveMode::Legacy),
+    };
+    if !matches!(
+        service.handle(&io, event, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Hdmi(HdmiError::Route(ExternalError::Tc(TcError::PhyNotReady))),
+            ..
+        }
+    ) || !io.ddc.writes().is_empty()
+        || io.read32(XeLpgPort::Tc2.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+    {
+        return TestResult::Fail("unready legacy PHY must refuse before DDC");
+    }
+    // The same port over DP-alt is refused by policy without MMIO.
+    let event = MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+    };
+    if !matches!(
+        service.handle(&NoAccess, event, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Dp(ExternalError::UnsupportedPort),
+            ..
+        }
+    ) {
+        return TestResult::Fail("HDMI-only legacy port must refuse DP-alt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin
+);
