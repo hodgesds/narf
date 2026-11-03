@@ -508,6 +508,9 @@ pub(super) mod n51;
 /// RTL8851B channel IQK (`rtw8851b_iqk`, path A).
 #[path = "rfk/n51_iqk.rs"]
 pub(super) mod n51_iqk;
+/// RTL8851B channel TSSI (`rtw8851b_tssi`, `rtw8851b_tssi_scan`, path A).
+#[path = "rfk/n51_tssi.rs"]
+pub(super) mod n51_tssi;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "rfk/tests.rs"]

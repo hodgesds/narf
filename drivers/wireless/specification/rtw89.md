@@ -4016,7 +4016,33 @@ Diagnostic-only reads in `rtw89_debug` arguments are not issued.
 Unexecuted case:
 `smoke_rtw89_n51_iqk_lok_group_select_and_restore_follow_rtw8851b`.
 
-**Remaining for the row.** Channel TSSI/DPK (rtw8851b_rfk.c), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+**Channel TSSI (`rfk::n51_tssi`).** `n51_tssi::Tssi::run` is
+rtw8851b_rfk.c `rtw8851b_tssi(PHY_0)` on RF path A
+(`RTW8851B_TSSI_PATH_NR` 1), between `BTC_WRFKT_IQK` ONESHOT START/STOP
+(`Kind::IqkPath`, as Linux): `_tssi_disable`, `rtw8851b_tssi_sys_defs` +
+`_sys_a_defs_{2g,5g}`, `_init_txpwr_defs_a` and `_he_tb_defs_a`,
+`_dck_defs_a`, `_tssi_set_tmeter_tbl`, `_dac_gain_defs_a`,
+`_slope_a_defs_{2g,5g}`, `_align_a_{2g,5g}_defs` (`_tssi_alignment_default`;
+RTL8851B never sets `alignment_done`), `_slope_defs_a`, `_tssi_enable`
+(`_track_defs_a`, `_mv_avg_defs_a`, MV_CLR/TSSI_EN, RF 0x10055 TRK_EN,
+`B_P0_TSSI_OFT` 0xc0 with the OFT_EN toggle; `is_tssi_mode[A]`) and
+`_tssi_set_efuse_to_de` (CCK `tssi_cck[cck_group] + trim`, MCS
+`ofdm_de + trim` with the TSSI_EXTRA `(s8 + s8) / 2` average, the B
+`tssi_groups` being textually identical). All fourteen tables are
+generated verbatim from rtw8851b_rfk_table.c (`n51_tssi_tables.rs`).
+`Tssi::scan` is `rtw8851b_tssi_scan` (`rfk_band_changed`: no TSSI-mode gate,
+no BTC notification) and `Tssi::scan_notify` is
+`rtw8851b_wifi_scan_notify` -> `rtw8851b_tssi_default_txagc` (scan end:
+OFT 0xc0 + OFT_EN toggle; `_tssi_alimentk_done` writes nothing).
+`n51_tssi::Tracking` is fw.c `rtw89_build_txpwr_trk_tbl_from_elm` for the
+2/5GHz `needed_bitmap` (types 4..=15, present types consumed in bit order,
+6G rows skipped when present); thermal rows by `subband_type`
+(2GA_P/N [0], 5GA_P/N [0..2]). The static `rtw89_8851b_trk_cfg` fallback is
+not carried, so a container without TXPWR_TRK is refused. Thermal 0xff
+programs TMETER/RFCTM 32 and zero offsets, as Linux. Unexecuted case:
+`smoke_rtw89_n51_tssi_tmeter_de_and_enable_follow_rtw8851b`.
+
+**Remaining for the row.** Channel DPK with `dpk_track`/`lck_track` (rtw8851b_rfk.c), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)

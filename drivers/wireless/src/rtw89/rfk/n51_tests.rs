@@ -376,3 +376,135 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_n51_iqk_lok_group_select_and_restore_follow_rtw8851b
 );
+
+/// rtw8851b_rfk.c `rtw8851b_tssi(PHY_0)` / `rtw8851b_tssi_scan` /
+/// `rtw8851b_tssi_default_txagc`: path-A tables, TXPWR_TRK thermal rows
+/// (RTL8851B 2/5GHz bitmap), enable and the factory DE values.
+fn smoke_rtw89_n51_tssi_tmeter_de_and_enable_follow_rtw8851b() -> TestResult {
+    use super::super::super::factory_51::Calibration;
+    use super::super::super::operating_channel::{Profile, Width};
+    use super::super::n51_tssi::{Tracking, Tssi};
+    use narf_wireless::association::channel::Band;
+    // Bitmap 0xfff0 (no 6G): types 4..=7 three rows, 8..=15 one row each;
+    // every byte of row r is r.
+    let mut element = vec![0xf0, 0xff, 0, 0, 0, 0, 0, 0];
+    for row in 0..20u8 {
+        element.extend(core::iter::repeat_n(row, 30));
+    }
+    let Ok(tracking) = Tracking::parse(&element) else {
+        return TestResult::Fail("RTL8851B TXPWR_TRK element refused");
+    };
+    let mut missing = element.clone();
+    missing[1] = 0x7f;
+    if Tracking::parse(&missing).is_ok() || Tracking::parse(&element[..8 + 19 * 30]).is_ok() {
+        return TestResult::Fail("RTL8851B TXPWR_TRK accepted a missing type or short element");
+    }
+    let mut cal = Calibration {
+        thermal: 0x20,
+        tssi_cck: [5, 0, 0, 0, 0, 0],
+        tssi_mcs: [0; 19],
+        tssi_trim: [-3, 0, 0, 0, 0, 0, 0, 0],
+        trim_programmed: true,
+        thermal_trim: 0,
+        thermal_programmed: false,
+        pa_bias: 0,
+        pa_programmed: false,
+        gain_offset: [0; 5],
+        offset_valid: false,
+        gain_comp: [0; 5],
+        comp_valid: false,
+        adc_td: 0,
+    };
+    cal.tssi_mcs[0] = 10;
+    cal.tssi_mcs[5] = -5;
+    cal.tssi_mcs[6] = -2;
+    let Some(g1) = Profile::new(Band::Ghz2, 1) else {
+        return TestResult::Fail("channel 1 profile refused");
+    };
+    let mut io = Model::new();
+    let mut tssi = Tssi::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { tssi.run(&mut io, g1, &cal, &tracking) }) != Some(Ok(())) {
+        return TestResult::Fail("RTL8851B TSSI did not complete on a ready model");
+    }
+    let Some(r) = tssi.results().cloned() else {
+        return TestResult::Fail("RTL8851B TSSI published no result");
+    };
+    // 2.4GHz: down = 2GA_N (row 14), up = 2GA_P (row 15).
+    if r.thermal[0] != 0xf2f2_f2f2
+        || r.thermal[15] != 0x0f0f_0f0f
+        || io.word(0x5c00) != 0xf2f2_f2f2
+        || io.word(0x5c3c) != 0x0f0f_0f0f
+        || (io.word(0x5810) >> 10) & 0x3f != 0x20
+    {
+        return TestResult::Fail("RTL8851B TSSI 2.4GHz thermal table differs");
+    }
+    // CCK 5 + trim -3 = 2; MCS 10 + -3 = 7.
+    if r.de != [2, 7]
+        || (io.word(0x5858) >> 12) & 0x3ff != 2
+        || (io.word(0x5830) >> 12) & 0x3ff != 7
+        || !r.tssi_mode
+        || io.word(0x5818) & 0xff != 0xc0
+        || io.word(0x5818) & (1 << 28) == 0
+        || io.word(0x5820) & (1 << 31) == 0
+        || io.rf[0][0x55] & (1 << 7) == 0
+    {
+        return TestResult::Fail("RTL8851B TSSI DE / enable differs");
+    }
+    let order: Vec<_> = io.trace.iter().filter(|t| t.0 >= 48).copied().collect();
+    if order != [(48, Kind::IqkPath as u32, 0), (48, Kind::IqkPath as u32, 1)]
+        || io.trace.iter().any(|t| t.0 == 17)
+    {
+        return TestResult::Fail("RTL8851B TSSI ONESHOT bracket or path B differs");
+    }
+    // Band-change scan at 5GHz ch36/80 (center 42): 5GA rows [0], the
+    // TSSI_EXTRA (mcs[5] + mcs[6]) / 2 = -3, trim group 2 = 0.
+    let Some(a80) = Profile::new_5ghz(36, Width::Mhz80) else {
+        return TestResult::Fail("channel 36/80 profile refused");
+    };
+    let mut io = Model::new();
+    let mut tssi = Tssi::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { tssi.scan(&mut io, a80, &cal, &tracking) }) != Some(Ok(())) {
+        return TestResult::Fail("RTL8851B TSSI scan did not complete");
+    }
+    let Some(r) = tssi.results().cloned() else {
+        return TestResult::Fail("RTL8851B TSSI scan published no result");
+    };
+    if r.thermal[0] != 0xfafa_fafa
+        || r.thermal[15] != 0x0909_0909
+        || r.de[1] != -3
+        || (io.word(0x5838) >> 12) & 0x3ff != 0x3fd
+        || io.trace.iter().any(|t| t.0 >= 48)
+    {
+        return TestResult::Fail("RTL8851B TSSI scan 5GHz rows / extra-group DE differ");
+    }
+    // Erased thermal: TMETER/RFCTM 32 and zero offsets.
+    cal.thermal = 0xff;
+    let mut io = Model::new();
+    io.words[(0x10000 + 0x5c00) / 4] = 0x1234;
+    let mut tssi = Tssi::default();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    if ready(unsafe { tssi.run(&mut io, g1, &cal, &tracking) }) != Some(Ok(()))
+        || io.word(0x5c00) != 0
+        || (io.word(0x5810) >> 10) & 0x3f != 32
+    {
+        return TestResult::Fail("RTL8851B TSSI erased-thermal path differs");
+    }
+    // Scan end reprograms OFT 0xc0 with the OFT_EN toggle; scan start is
+    // I/O-free.
+    let mut io = Model::new();
+    // SAFETY: private inert register/RF model; no hardware or DMA.
+    let start = ready(unsafe { Tssi::scan_notify(&mut io, true) });
+    let quiet = io.trace.is_empty();
+    // SAFETY: same inert model.
+    let end = ready(unsafe { Tssi::scan_notify(&mut io, false) });
+    if start != Some(Ok(())) || !quiet || end != Some(Ok(())) || io.word(0x5818) != 0x1000_00c0 {
+        return TestResult::Fail("RTL8851B TSSI scan-end default TXAGC differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_n51_tssi_tmeter_de_and_enable_follow_rtw8851b
+);
