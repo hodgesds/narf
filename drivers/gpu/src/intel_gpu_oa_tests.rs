@@ -1280,3 +1280,126 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_reset_suspend_loss_and_buffer_retention
 );
+
+/// xe_oa_mmap: EACCES, then whole-buffer length, then read-only
+/// MAP_PRIVATE. A mapping passing all three is NARF's ENODEV, never a
+/// read()-backed private copy that would consume reports.
+fn smoke_oa_mmap_source_checks_and_private_pfn_refusal() -> TestResult {
+    const READ: u32 = 1;
+    const PRIVATE: u32 = 2;
+    let backend = Backend::new(device(47, MTL, 1270));
+    let wire = Wire::new();
+    let first = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let size = 128 << 10;
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, A24U40), (3, first), (6, 1), (12, size as u64)],
+    );
+    assert_eq!(file.mmap_max_prot(0), READ);
+    assert_eq!(
+        file.validate_mmap(0, size, READ, PRIVATE),
+        Err(FsError::NoDevice)
+    );
+    // The source never inspects vm_pgoff.
+    assert_eq!(
+        file.validate_mmap(1 << 20, size, READ, PRIVATE),
+        Err(FsError::NoDevice)
+    );
+    for len in [size - 4096, size + 4096, 16 << 20] {
+        assert_eq!(
+            file.validate_mmap(0, len, READ, PRIVATE),
+            Err(FsError::InvalidData)
+        );
+    }
+    // VM_WRITE, VM_EXEC, MAP_SHARED and MAP_SHARED_VALIDATE (VM_MAYSHARE).
+    for (prot, flags) in [
+        (READ | 2, PRIVATE),
+        (READ | 4, PRIVATE),
+        (READ, 1),
+        (READ, 3),
+        (0, 1),
+    ] {
+        assert_eq!(
+            file.validate_mmap(0, size, prot, flags),
+            Err(FsError::InvalidData)
+        );
+    }
+    // Privilege precedes the size and VMA checks.
+    let denied = File {
+        session: session_of(&backend),
+        backend: backend.clone(),
+        gate: DENY,
+    };
+    assert_eq!(
+        denied.validate_mmap(0, 4096, READ | 2, 1),
+        Err(FsError::PermissionDenied)
+    );
+    drop(denied);
+    drop(file);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_mmap_source_checks_and_private_pfn_refusal
+);
+
+/// create_dynamic_oa_sysfs_entry / sysfs_remove_group: metrics/<uuid>/id
+/// follows the registry, including lowest-free id reuse.
+fn smoke_oa_metrics_sysfs_uuid_id_follows_registry() -> TestResult {
+    use narf_filesystem::sysfs::Kobject;
+    let backend = Backend::new(device(46, MTL, 1270));
+    let wire = Wire::new();
+    let card = Kobject::new_root("card46");
+    install_metrics_for_test(46, &card);
+    install_metrics_for_test(46, &card);
+    assert_eq!(card.child_names(), ["metrics"]);
+    let metrics = card.get_child("metrics").unwrap();
+    assert!(metrics.child_names().is_empty());
+    let name = |n| alloc::string::String::from_utf8(uuid(n).to_vec()).unwrap();
+    let id = |n| {
+        metrics
+            .get_child(&name(n))
+            .and_then(|entry| entry.attr_show("id"))
+    };
+    assert_eq!(add(&backend, &wire, 1, &[(0x9888, 1)]), 1);
+    assert_eq!(add(&backend, &wire, 2, &[(0x9888, 2)]), 2);
+    assert_eq!(id(1).as_deref(), Some("1\n"));
+    assert_eq!(id(2).as_deref(), Some("2\n"));
+    assert_eq!(metrics.get_child(&name(1)).unwrap().attr_names(), ["id"]);
+    // A refused duplicate publishes nothing.
+    assert_eq!(
+        add_config(
+            Some(&*backend),
+            config_wire(&wire, 0x10000, uuid(1), &[(0x9888, 1)]),
+            &wire,
+            ALLOW
+        ),
+        Err(Error::Errno(EADDRINUSE))
+    );
+    assert_eq!(metrics.child_names().len(), 2);
+    let remove = |id: u64| {
+        wire.put(0x3000, &id.to_le_bytes());
+        remove_config(Some(&*backend), 0x3000, &wire, ALLOW)
+    };
+    assert_eq!(remove(1), Ok(0));
+    assert_eq!(id(1), None);
+    assert_eq!(remove(1), Err(Error::Fs(FsError::NotFound)));
+    assert_eq!(metrics.child_names(), [name(2)]);
+    // The lowest free id is reused under the new uuid's directory.
+    assert_eq!(add(&backend, &wire, 3, &[(0x9888, 3)]), 1);
+    assert_eq!(id(3).as_deref(), Some("1\n"));
+    for n in [1, 2] {
+        assert_eq!(remove(n), Ok(0));
+    }
+    assert!(metrics.child_names().is_empty());
+    // A card without the published directory keeps the registry alone.
+    let other = Backend::new(device(45, MTL, 1270));
+    assert_eq!(add(&other, &wire, 4, &[(0x9888, 4)]), 1);
+    assert!(metrics.child_names().is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_metrics_sysfs_uuid_id_follows_registry
+);

@@ -1335,3 +1335,23 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_eu_stall",
     smoke_eu_stall_exact_lnl_source_profile_sparse_dss_and_cache_refusal
 );
+
+/// dev.xe.observation_paranoid: proc_dointvec_minmax over [0, 1] and the
+/// `paranoid && !perfmon_capable()` gate every OA/EU-stall check uses.
+fn smoke_observation_paranoid_sysctl_range_and_gate() -> TestResult {
+    assert!(observation_allowed(1, true));
+    assert!(!observation_allowed(1, false));
+    assert!(observation_allowed(0, false));
+    assert_eq!(read_paranoid(), "1\n");
+    for bad in ["2", "-1", "", "x", "1x", "4294967297"] {
+        assert_eq!(write_paranoid(bad), Err(FsError::InvalidData));
+        assert_eq!(read_paranoid(), "1\n");
+    }
+    assert_eq!(write_paranoid("1"), Ok(()));
+    assert_eq!(read_paranoid(), "1\n");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_observation_paranoid_sysctl_range_and_gate
+);

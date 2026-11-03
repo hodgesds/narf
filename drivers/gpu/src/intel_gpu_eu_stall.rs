@@ -95,8 +95,46 @@ pub enum Operation {
     Enable,
     Disable,
 }
+/// xe_observation.c xe_observation_paranoid: `dev.xe.observation_paranoid`,
+/// proc_dointvec_minmax over 0..=1, default 1.
+static OBSERVATION_PARANOID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+static SYSCTL_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// `xe_observation_paranoid && !perfmon_capable()` refuses; perfmon_capable
+/// is CAP_PERFMON or CAP_SYS_ADMIN. Every OA and EU-stall gate uses this.
 pub(crate) fn capable() -> bool {
-    narf_filesystem::caller_capable(38) || narf_filesystem::caller_capable(21)
+    observation_allowed(
+        OBSERVATION_PARANOID.load(Ordering::Acquire),
+        narf_filesystem::caller_capable(38) || narf_filesystem::caller_capable(21),
+    )
+}
+fn observation_allowed(paranoid: u32, perfmon: bool) -> bool {
+    paranoid == 0 || perfmon
+}
+fn read_paranoid() -> alloc::string::String {
+    alloc::format!("{}\n", OBSERVATION_PARANOID.load(Ordering::Acquire))
+}
+/// proc_dointvec_minmax: one decimal int in [0, 1], else EINVAL.
+fn write_paranoid(value: &str) -> Result<(), FsError> {
+    let value: i32 = value.parse().map_err(|_| FsError::InvalidData)?;
+    if !(0..=1).contains(&value) {
+        return Err(FsError::InvalidData);
+    }
+    OBSERVATION_PARANOID.store(value as u32, Ordering::Release);
+    Ok(())
+}
+/// xe_observation_sysctl_register (`dev/xe`, mode 0644), once, when the
+/// first Intel card is published. A write needs the procfs owner's DAC.
+pub(crate) fn register_sysctl() {
+    if SYSCTL_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_filesystem::procfs::sys::register_sysctl(narf_filesystem::procfs::sys::SysctlEntry {
+        path: "dev/xe/observation_paranoid",
+        read: read_paranoid,
+        write: Some(write_paranoid),
+        perms: 0o644,
+    });
 }
 #[derive(Clone, Copy)]
 struct Gate {

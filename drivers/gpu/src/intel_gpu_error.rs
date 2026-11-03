@@ -421,8 +421,10 @@ pub(crate) fn show(index: u32) -> String {
         |report| report.text(),
     )
 }
-pub(crate) fn populate_card(index: u32, node: &narf_filesystem::sysfs::Kobject) {
+pub(crate) fn populate_card(index: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
     narf_filesystem::sysfs::kobject_add_attr(node, "error", move || show(index));
+    crate::intel_gpu_eu_stall::register_sysctl();
+    crate::intel_gpu_oa::populate_card(index, node);
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

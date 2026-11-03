@@ -782,7 +782,61 @@ pub(crate) fn add_config(
     registry
         .configs
         .insert(id, Arc::new(Config { id, uuid, regs }));
+    // create_dynamic_oa_sysfs_entry: metrics/<uuid>/id, under the same lock
+    // so a racing REMOVE_CONFIG cannot leave a stale directory.
+    metrics_add(device.card, &uuid, id);
     Ok(u64::from(id))
+}
+
+/// xe_oa_register: `metrics` under the card's primary-minor node. NARF
+/// publishes it only with the OA opt-in, when the unit can exist.
+static METRICS: [IrqSafeSpinLock<Option<Arc<narf_filesystem::sysfs::Kobject>>>; 64] =
+    [const { IrqSafeSpinLock::new(None) }; 64];
+
+pub(crate) fn populate_card(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
+    if enabled() {
+        install_metrics(card, node);
+    }
+}
+fn install_metrics(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
+    let Some(slot) = METRICS.get(card as usize) else {
+        return;
+    };
+    let mut slot = slot.lock();
+    if slot.is_none() {
+        *slot = Some(narf_filesystem::sysfs::Kobject::new_child(
+            node.clone(),
+            "metrics",
+        ));
+    }
+}
+fn metrics_add(card: u32, uuid: &[u8; 36], id: u32) {
+    let Some(metrics) = METRICS
+        .get(card as usize)
+        .and_then(|slot| slot.lock().clone())
+    else {
+        return;
+    };
+    let Ok(name) = core::str::from_utf8(uuid) else {
+        return;
+    };
+    let entry = narf_filesystem::sysfs::Kobject::new_child(metrics, name);
+    // show_dynamic_id: "%d\n", mode 0444.
+    narf_filesystem::sysfs::kobject_add_attr(&entry, "id", move || alloc::format!("{id}\n"));
+}
+fn metrics_remove(card: u32, uuid: &[u8; 36]) {
+    if let (Some(metrics), Ok(name)) = (
+        METRICS
+            .get(card as usize)
+            .and_then(|slot| slot.lock().clone()),
+        core::str::from_utf8(uuid),
+    ) {
+        metrics.remove_child(name);
+    }
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn install_metrics_for_test(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
+    install_metrics(card, node);
 }
 
 /// xe_oa_remove_config_ioctl.
@@ -799,6 +853,8 @@ pub(crate) fn remove_config(
     let id = u32::try_from(u64::from_le_bytes(word)).map_err(|_| FsError::NotFound)?;
     let mut registry = REGISTRY[device.card as usize].lock();
     let config = registry.configs.remove(&id).ok_or(FsError::NotFound)?;
+    // sysfs_remove_group before idr_remove, under metrics_lock.
+    metrics_remove(device.card, &config.uuid);
     registry.regs -= config.regs.len();
     Ok(0)
 }
@@ -1106,6 +1162,39 @@ impl FileOps for File {
     }
     fn nonblock_read_eagain(&self) -> bool {
         true
+    }
+    /// xe_oa_mmap's checks in source order: paranoid && !perfmon_capable
+    /// (EACCES), a length other than the whole OA buffer (EINVAL), then
+    /// VM_WRITE/VM_EXEC/VM_SHARED/VM_MAYSHARE (EINVAL: read-only
+    /// MAP_PRIVATE only). The source then remap_pfn_range()s the buffer
+    /// pages; NARF's syscall layer has no read-only private device-PFN
+    /// mapping (it would fall back to read()-backed copies, which consume
+    /// reports), so a mapping that passes every check is ENODEV.
+    fn validate_mmap(
+        &self,
+        _offset: u64,
+        len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<u32, FsError> {
+        const PROT_WRITE: u32 = 2;
+        const PROT_EXEC: u32 = 4;
+        const MAP_SHARED: u32 = 1;
+        if !(self.gate.capable)() {
+            return Err(FsError::PermissionDenied);
+        }
+        if len as u64 != u64::from(self.session.buffer) {
+            return Err(FsError::InvalidData);
+        }
+        // MAP_SHARED and MAP_SHARED_VALIDATE both set VM_MAYSHARE.
+        if prot & (PROT_WRITE | PROT_EXEC) != 0 || flags & MAP_SHARED != 0 {
+            return Err(FsError::InvalidData);
+        }
+        Err(FsError::NoDevice)
+    }
+    /// vm_flags_mod(.., VM_MAYWRITE | VM_MAYEXEC): read is the ceiling.
+    fn mmap_max_prot(&self, _offset: u64) -> u32 {
+        1
     }
     fn poll_readiness(&self) -> u32 {
         if (self.gate.capable)() {
