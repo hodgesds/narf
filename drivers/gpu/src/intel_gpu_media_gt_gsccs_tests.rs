@@ -7,7 +7,7 @@
 // (GUC_GSC_OTHER_CLASS mapping/enable masks, golden LRC, regsets), xe_lrc.c
 // dg2_xcs_offsets, xe_ring_ops.c emit_job_gen12_gsc and
 // instructions/xe_gsc_commands.h.
-use super::media_gt_sched::{media_tick, media_until, start_media, Hw};
+use super::media_gt_sched::{media_tick, media_until, start_media, start_media_at, Hw};
 use super::*;
 use crate::intel_gpu_engine::{Engine, EngineSet};
 use crate::intel_gpu_gt::media::gsc::load::{Gsccs, LoadError};
@@ -592,8 +592,9 @@ fn media_guc_with_huc(
     arena: &Arena,
     huc: &crate::intel_gpu_huc::Firmware,
     adopt: bool,
+    now: u64,
 ) -> crate::intel_gpu_gt::media::MediaGuc<Window, Arena> {
-    let mut guc = super::media_huc::start(w, arena, Some((huc, adopt)));
+    let mut guc = super::media_huc::start_at(w, arena, Some((huc, adopt)), now);
     guc.honour_gsc_reset_workaround().unwrap();
     guc.schedule_gsccs().unwrap();
     guc
@@ -631,7 +632,7 @@ fn smoke_media_gsc_owner_without_mei_loads_auths_huc_and_ends_load_fail() -> Tes
     let (w, arena) = media_model();
     let huc =
         crate::intel_gpu_huc::Firmware::from_fixture(MTL, &super::media_huc::huc_gsc()).unwrap();
-    let mut guc = media_guc_with_huc(&w, &arena, &huc, false);
+    let mut guc = media_guc_with_huc(&w, &arena, &huc, false, 0);
     let mut hw = Hw::default();
     let (now, polled) = media_until(&mut guc, &w, &mut hw, 1, |p| p.is_ready());
     assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
@@ -695,7 +696,9 @@ fn smoke_media_gsc_owner_without_mei_loads_auths_huc_and_ends_load_fail() -> Tes
     // GT reset: a new media GuC adopts the HuC; the failed GSC never reloads.
     let now = stop_and_end(&mut owner, guc, &w, &arena, &mut hw, now + 1);
     assert_eq!(arena.live_allocations(), 0);
-    let mut guc = media_guc_with_huc(&w, &arena, &huc, true);
+    // The new incarnation starts on the fixture clock with a fresh GuC.
+    hw.new_incarnation();
+    let mut guc = media_guc_with_huc(&w, &arena, &huc, true, now + 1);
     let (now, polled) = media_until(&mut guc, &w, &mut hw, now + 1, |p| p.is_ready());
     assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
     let jobs = hw.gsc_jobs.len();
@@ -761,7 +764,10 @@ fn smoke_media_gsc_owner_proxy_resume_reload_and_interrupted_load() -> TestResul
     };
     let mut hw = Hw::default();
     let run = |owner: &mut Owner, hw: &mut Hw, fw: &mut Firmware, from: u64| {
-        let mut guc = start_media(&w, &arena);
+        // Each incarnation starts on the fixture clock where the last ended,
+        // with a GuC that has registered and run nothing yet.
+        hw.new_incarnation();
+        let mut guc = start_media_at(&w, &arena, from);
         guc.honour_gsc_reset_workaround().unwrap();
         guc.schedule_gsccs().unwrap();
         let (now, polled) = media_until(&mut guc, &w, hw, from, |p| p.is_ready());

@@ -124,6 +124,16 @@ pub(super) fn start(
     arena: &Arena,
     huc: Option<(&huc::Firmware, bool)>,
 ) -> MediaGuc<Window, Arena> {
+    start_at(w, arena, huc, 0)
+}
+
+/// `start` at `now` on the fixture clock (an incarnation after a stop).
+pub(super) fn start_at(
+    w: &Window,
+    arena: &Arena,
+    huc: Option<(&huc::Firmware, bool)>,
+    now: u64,
+) -> MediaGuc<Window, Arena> {
     let media = MediaGt::initialized_for_test(MTL, MEDIA_GMD, FUSE);
     w.0.borrow_mut().regs.insert(0x380d00, RPM_CONFIG0);
     MediaGuc::start(
@@ -133,7 +143,7 @@ pub(super) fn start(
         huc,
         media_config(),
         &media,
-        0,
+        now,
     )
     .unwrap()
 }

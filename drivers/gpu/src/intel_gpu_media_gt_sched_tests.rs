@@ -281,6 +281,16 @@ pub(super) fn media_until(
 }
 
 impl Hw {
+    /// A new media GuC incarnation on the same device (after a verified
+    /// stop): the GuC has nothing registered and no ring has run yet. The
+    /// arena reuses freed GGTT ranges, so contexts from the last incarnation
+    /// may come back at the same bases. What GSCCS0 executed stays recorded.
+    pub(super) fn new_incarnation(&mut self) {
+        self.executed.clear();
+        self.registered.clear();
+        self.ppgtt.clear();
+    }
+
     /// Engine bases whose private-PPGTT rings the model executed.
     pub(super) fn ppgtt_engines(&self) -> &[u32] {
         &self.ppgtt
@@ -297,6 +307,21 @@ pub(super) fn start_media_with(
     arena: &Arena,
     topology: crate::intel_gpu_gt::media::MediaTopology,
 ) -> MediaGuc<Window, Arena> {
+    start_media_full(w, arena, topology, 0)
+}
+
+/// `start_media` at `now` on the fixture clock, for an incarnation started
+/// after an earlier one ran: its wake deadline counts from `now`.
+pub(super) fn start_media_at(w: &Window, arena: &Arena, now: u64) -> MediaGuc<Window, Arena> {
+    start_media_full(w, arena, Default::default(), now)
+}
+
+fn start_media_full(
+    w: &Window,
+    arena: &Arena,
+    topology: crate::intel_gpu_gt::media::MediaTopology,
+    now: u64,
+) -> MediaGuc<Window, Arena> {
     let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
     let media =
         MediaGt::initialized_for_test(MTL, MEDIA_GMD, FUSE).with_topology_for_test(topology);
@@ -308,7 +333,7 @@ pub(super) fn start_media_with(
         None,
         media_config(),
         &media,
-        0,
+        now,
     )
     .unwrap()
 }
