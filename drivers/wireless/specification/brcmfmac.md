@@ -422,8 +422,8 @@ Remaining VHT options are not host features of this FullMAC family:
 - 160 MHz: Linux advertises it only from a firmware `bw_cap` 160 bit. The
   retained BCM43602 is an 802.11ac Wave-1 3x3 80 MHz part, so this profile
   ignores that bit. Other covered chips report the capability bits only from
-  firmware facts ("Additional PCIe chip profiles" below); 160 MHz operation
-  is not implemented.
+  firmware facts and operate at 160 MHz only on a firmware-reported 160
+  chanspec ("Additional PCIe chip profiles" below).
 
 The actual selected BSS's complete original HT/VHT/WMM/rate IEs pass shared
 `Offer::from_elements`; complete known basic/legacy rates, membership
