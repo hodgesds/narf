@@ -1531,6 +1531,17 @@ struct StationLink {
     /// from the shared RX ring by the other station owner (Linux
     /// `mt76_rx` -> `mt792x_rx_get_wcid` -> per-`mt792x_sta` delivery).
     demuxed: VecDeque<CapturedData>,
+    /// This owner's receive floor: the shared capture epoch of its last
+    /// key/association fence. A copy captured before it is never this
+    /// owner's (the other owner's fences do not move it).
+    epoch: u64,
+    /// Set by this owner's fence; the next time it becomes receive-current
+    /// next to another owner it moves its floor past every copy captured
+    /// while the shared capture stayed open only for that other owner.
+    fenced: bool,
+    /// Terminal TX statuses of this owner's data entries retired by the
+    /// other station owner's waits (`data_pending` is one device FIFO).
+    tx_credit: VecDeque<u8>,
 }
 /// The concurrent group vif's station owner and its own role state
 /// (`State::RadioReady` = WCID only, `ScanReady` = DEV_INFO/BSS published,
@@ -1567,6 +1578,9 @@ impl StationLink {
             received_msdu: VecDeque::new(),
             rx_fragments: fragment::Cache::default(),
             demuxed: VecDeque::new(),
+            epoch: 0,
+            fenced: false,
+            tx_credit: VecDeque::new(),
         }
     }
 }
@@ -1580,7 +1594,7 @@ struct Session<B: Backend> {
     transferred: usize,
     boot_started: Option<u64>,
     scan_seq: u8,
-    data_pending: VecDeque<u64>,
+    data_pending: group_link::DataPending,
     /// The home vif's station owner (BSS0, peer WCID 1).
     station: StationLink,
     /// A concurrent P2P group vif's station owner (Linux mt7921 keeps one
@@ -1618,7 +1632,7 @@ impl<B: Backend> Session<B> {
             transferred: 0,
             boot_started: None,
             scan_seq: 0,
-            data_pending: VecDeque::with_capacity(crate::mt7921::packet_tx::PIPELINE),
+            data_pending: group_link::DataPending::default(),
             station: StationLink::new(crate::mt7921::vif_slots::Link::HOME),
             group: None,
             wtbl: crate::mt7921::vif_slots::Wtbl::default(),
@@ -1642,6 +1656,16 @@ impl<B: Backend> Session<B> {
         &mut self,
         ms: u64,
         mut f: impl FnMut(&mut B) -> Result<Option<T>, Error>,
+    ) -> Result<T, Error> {
+        self.wait_split(ms, |backend, _| f(backend)).await
+    }
+    /// `wait` whose poll also borrows the swapped-out station owner, so a
+    /// station wait can hand the other owner's frames and TX completions
+    /// to it instead of discarding them (`group_link::route_station_rx`).
+    async fn wait_split<T>(
+        &mut self,
+        ms: u64,
+        mut f: impl FnMut(&mut B, &mut Option<GroupOwner>) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
         let start = self.backend.now_ns();
         poll_fn(|cx| {
@@ -1711,7 +1735,7 @@ impl<B: Backend> Session<B> {
             {
                 return Poll::Ready(Err(Error::Timeout));
             }
-            match f(&mut self.backend) {
+            match f(&mut self.backend, &mut self.group) {
                 Ok(Some(value)) => Poll::Ready(Ok(value)),
                 Err(error) => Poll::Ready(Err(error)),
                 Ok(None) => {

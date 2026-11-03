@@ -23,6 +23,86 @@ use core::ops::{Deref, DerefMut};
 /// Captured packets one link may hold for its owner before the oldest drop.
 const DEMUX_DEPTH: usize = 64;
 
+/// One device-wide data/management TX FIFO (`data_pending`) whose entries
+/// carry their owner: `Some(link)` for a station owner's frame, `None` for
+/// a non-station owner (AP, P2P device). The native token pipeline retires
+/// in submission order, so the front entry owns the next completion.
+#[derive(Debug, Default)]
+pub(super) struct DataPending {
+    entries: alloc::collections::VecDeque<(u64, Option<Link>)>,
+}
+impl DataPending {
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+    }
+    /// The oldest entry's submission time.
+    pub(super) fn front(&self) -> Option<&u64> {
+        self.entries.front().map(|(started, _)| started)
+    }
+    pub(super) fn pop_front(&mut self) -> Option<u64> {
+        self.entries.pop_front().map(|(started, _)| started)
+    }
+    pub(super) fn pop_owner(&mut self) -> Option<Option<Link>> {
+        self.entries.pop_front().map(|(_, owner)| owner)
+    }
+    /// A non-station owner's entry.
+    pub(super) fn push_back(&mut self, started: u64) {
+        self.entries.push_back((started, None));
+    }
+    /// A station owner's entry.
+    pub(super) fn push_owned(&mut self, started: u64, link: Link) {
+        self.entries.push_back((started, Some(link)));
+    }
+    /// The oldest entry `link` waits on (its own or a non-station one).
+    pub(super) fn oldest_for(&self, link: Link) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(_, owner)| owner.is_none_or(|owner| owner == link))
+            .map(|(started, _)| *started)
+    }
+    /// Entries a station owner still owns.
+    pub(super) fn owned_by(&self, link: Link) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, owner)| *owner == Some(link))
+            .count()
+    }
+}
+
+/// Whether a decoded RX copy belongs to the other associated station
+/// owner: its peer WCID (`mt792x_rx_get_wcid`), or, for a copy without
+/// this owner's WCID, a transmitter equal to the other owner's BSSID (a
+/// group-addressed or WTBL-miss copy of that BSS) when that BSS is not
+/// also this owner's.
+fn owns_rx(
+    other: &GroupOwner,
+    (own_wcid, own_bssid): (u16, Option<[u8; 6]>),
+    native: &super::scan::NativeRx<'_>,
+) -> bool {
+    if !matches!(other.state, State::Associated { .. }) {
+        return false;
+    }
+    if native.wcid == u16::from(other.station.link.peer()) {
+        return true;
+    }
+    native.wcid != own_wcid
+        && other.station.bss.as_ref().is_some_and(|bss| {
+            Some(bss.bssid) != own_bssid && native.frame.get(10..16) == Some(&bss.bssid[..])
+        })
+}
+fn push_demuxed(other: &mut GroupOwner, packet: super::CapturedData) {
+    if other.station.demuxed.len() >= DEMUX_DEPTH {
+        other.station.demuxed.pop_front();
+    }
+    other.station.demuxed.push_back(packet);
+}
+
 /// The session with the group link swapped into its station owner. Dropping
 /// it (normal return or a cancelled borrowed future) restores the home
 /// owner, so the home role can never be left behind a group operation.
@@ -217,6 +297,8 @@ impl<B: Backend> Session<B> {
             || station.permission.is_some()
             || !station.tx_fragments.is_empty()
             || !station.control_pending.is_empty()
+            || !station.tx_credit.is_empty()
+            || self.data_pending.owned_by(link) != 0
         {
             return Err(Error::Busy);
         }
@@ -263,20 +345,94 @@ impl<B: Backend> Session<B> {
         self.other_station_permission()
             .is_none_or(|live| live == permission)
     }
-    pub(super) fn other_owns_wcid(&self, wcid: u16) -> bool {
-        self.group.as_ref().is_some_and(|other| {
-            matches!(other.state, State::Associated { .. })
-                && u16::from(other.station.link.peer()) == wcid
-        })
+    /// Whether a decoded copy belongs to the other (swapped-out) station
+    /// owner (`owns_rx`).
+    pub(super) fn other_owns_rx(&self, native: &super::scan::NativeRx<'_>) -> bool {
+        let own = self.own_rx_identity();
+        self.group
+            .as_ref()
+            .is_some_and(|other| owns_rx(other, own, native))
+    }
+    fn own_rx_identity(&self) -> (u16, Option<[u8; 6]>) {
+        (
+            u16::from(self.station.link.peer()),
+            self.station.bss.as_ref().map(|bss| bss.bssid),
+        )
     }
     /// Queue an original RX copy for the other station owner; its own
     /// `receive_ethernet` drains it before the shared ring.
     pub(super) fn forward_to_other(&mut self, packet: super::CapturedData) {
         if let Some(other) = self.group.as_mut() {
-            if other.station.demuxed.len() >= DEMUX_DEPTH {
-                other.station.demuxed.pop_front();
+            push_demuxed(other, packet);
+        }
+    }
+
+    /// A station wait over the shared raw RX ring (auth/SAE/assoc/EAPOL):
+    /// every drained copy the other station owner owns goes to that
+    /// owner's demux queue (Linux `mt76_rx` -> `mt792x_rx_get_wcid` keeps
+    /// delivering every vif while one vif's MLME waits); `f` sees only the
+    /// remaining copies, at most 16 per poll. Without a group owner this is
+    /// the former `wait` over `receive_data`.
+    pub(super) async fn wait_station_rx<T>(
+        &mut self,
+        ms: u64,
+        mut f: impl FnMut(&mut B, &[u8]) -> Result<Option<T>, Error>,
+    ) -> Result<T, Error> {
+        let own = self.own_rx_identity();
+        self.wait_split(ms, |backend, other| {
+            for _ in 0..16 {
+                let Some(packet) = backend.receive_data_captured()? else {
+                    break;
+                };
+                if let Some(other) = other.as_mut() {
+                    if super::scan::rx_native_with_amsdu(&packet.bytes)
+                        .is_some_and(|native| owns_rx(other, own, &native))
+                    {
+                        push_demuxed(other, packet);
+                        continue;
+                    }
+                }
+                if let Some(value) = f(backend, &packet.bytes)? {
+                    return Ok(Some(value));
+                }
             }
-            other.station.demuxed.push_back(packet);
+            Ok(None)
+        })
+        .await
+    }
+
+    /// Whether a copy captured under `epoch` can belong to `station`: not
+    /// before that owner's own last fence, not after the current stamp.
+    /// With one owner the floor is always the current epoch (every renewal
+    /// moves it), i.e. the former `epoch == receive_epoch`.
+    pub(super) fn epoch_admits(&self, station: &StationLink, epoch: u64) -> bool {
+        epoch != 0 && epoch >= station.epoch && epoch <= self.receive_epoch
+    }
+
+    /// Retire the front `data_pending` entry for `completion` (the native
+    /// token FIFO completes in submission order). An entry of the other
+    /// station owner is credited to that owner and `None` returned, so one
+    /// owner's waits never consume the other's completion; an entry of a
+    /// retired owner is discarded. This owner's (or a non-station owner's)
+    /// entry returns the completion.
+    pub(super) fn retire_data(
+        &mut self,
+        completion: crate::mt7921::packet_tx::Completion,
+    ) -> Option<crate::mt7921::packet_tx::Completion> {
+        match self.data_pending.pop_owner() {
+            Some(Some(link)) if link != self.station.link => {
+                if let Some(other) = self
+                    .group
+                    .as_mut()
+                    .filter(|other| other.station.link == link)
+                {
+                    if other.station.tx_credit.len() < crate::mt7921::packet_tx::PIPELINE {
+                        other.station.tx_credit.push_back(completion.status);
+                    }
+                }
+                None
+            }
+            _ => Some(completion),
         }
     }
 

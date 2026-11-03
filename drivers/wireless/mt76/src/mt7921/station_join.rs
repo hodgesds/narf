@@ -456,13 +456,53 @@ impl<B: Backend> Session<B> {
                 |epoch| epoch.checked_add(1),
             )
             .map_err(|_| Error::Bounds)?;
-        self.backend.close_receive_capture(self.receive_epoch);
+        self.station.epoch = self.receive_epoch;
+        // A fence of this owner is not a fence of the other station owner:
+        // the shared capture stays open while that owner is current, and
+        // this owner moves its floor again before it next admits a copy.
+        self.close_own_receive_capture();
         Ok(())
     }
+    /// Close this owner's copy-time port. The shared capture stays open
+    /// while the other station owner is current (its copies keep their
+    /// copy-time port) and this owner is marked fenced instead
+    /// (`sync_receive_capture`). Without a group owner: a plain close.
+    pub(super) fn close_own_receive_capture(&mut self) {
+        self.backend.close_receive_capture(self.receive_epoch);
+        if self.other_receive_current().unwrap_or(false)
+            && self
+                .backend
+                .open_receive_capture(self.receive_epoch)
+                .is_ok()
+        {
+            self.station.fenced = true;
+        }
+    }
     /// Open the shared capture while either station owner is current.
+    /// A copy's `port_open` is copy-time state of the shared capture, so an
+    /// owner that was not current while the capture stayed open for the
+    /// other owner is marked fenced, and on becoming current it renews the
+    /// epoch (its floor) before admitting anything: no copy captured while
+    /// its own port was closed can reach it. Single-owner sessions never
+    /// open the capture for a non-current owner, so nothing changes there.
     pub(super) fn sync_receive_capture(&mut self) -> Result<bool, Error> {
-        if self.receive_current(self.receive_epoch)? || self.other_receive_current()? {
+        let mut own = self.receive_current(self.receive_epoch)?;
+        if own && self.station.fenced {
+            self.renew_receive_epoch()?;
+            self.station.fenced = false;
+            own = self.receive_current(self.receive_epoch)?;
+        }
+        let other = self.other_receive_current()?;
+        if own || other {
             self.backend.open_receive_capture(self.receive_epoch)?;
+            if !own {
+                self.station.fenced = true;
+            }
+            if !other {
+                if let Some(group) = self.group.as_mut() {
+                    group.station.fenced = true;
+                }
+            }
             Ok(true)
         } else {
             self.backend.close_receive_capture(self.receive_epoch);
@@ -488,8 +528,7 @@ impl<B: Backend> Session<B> {
         state: &State,
         epoch: u64,
     ) -> Result<bool, Error> {
-        if epoch == 0
-            || self.receive_epoch != epoch
+        if !self.epoch_admits(station, epoch)
             || station.peer_lost
             || !matches!(state, State::Associated { .. })
             || station
@@ -674,7 +713,7 @@ impl<B: Backend> Session<B> {
                 if let Some(security) = &mut self.station.security {
                     if security.pending.len() < 16 {
                         security.pending.push_back((pdu, packet.pn.is_some()));
-                        self.backend.close_receive_capture(self.receive_epoch);
+                        self.close_own_receive_capture();
                     }
                 }
                 continue;
@@ -921,7 +960,18 @@ impl<B: Backend> Session<B> {
             let Some(packet) = packet else {
                 return Ok(None);
             };
-            if packet.epoch != self.receive_epoch {
+            // The other station owner's copy (peer WCID or BSS): hand the
+            // original to that link before this owner's epoch/channel
+            // gates (Linux `mt792x_rx_get_wcid` -> its `mt792x_sta`); that
+            // owner applies its own gates when it drains the queue.
+            if self.group.is_some()
+                && super::scan::rx_native_with_amsdu(&packet.bytes)
+                    .is_some_and(|native| self.other_owns_rx(&native))
+            {
+                self.forward_to_other(packet);
+                continue;
+            }
+            if !self.epoch_admits(&self.station, packet.epoch) {
                 self.clear_aggregate_receive();
                 continue;
             }
@@ -931,12 +981,6 @@ impl<B: Backend> Session<B> {
             };
             if native.channel != channel {
                 self.clear_aggregate_receive();
-                continue;
-            }
-            // The other station owner's peer WCID: hand the original copy
-            // to that link (Linux `mt792x_rx_get_wcid` -> its `mt792x_sta`).
-            if self.other_owns_wcid(native.wcid) {
-                self.forward_to_other(packet);
                 continue;
             }
             // PMF management admission before any MLME/BA consumer: mac80211
@@ -1274,7 +1318,7 @@ impl<B: Backend> Session<B> {
                             if let Some(pdu) = extract_eapol(frame) {
                                 if security.pending.len() < 16 {
                                     security.pending.push_back((pdu.to_vec(), protected));
-                                    self.backend.close_receive_capture(self.receive_epoch);
+                                    self.close_own_receive_capture();
                                 }
                             }
                         }
@@ -1356,24 +1400,17 @@ impl<B: Backend> Session<B> {
                 .await;
             match result {
                 Ok(completion) => {
-                    self.data_pending.pop_front();
+                    let Some(completion) = self.retire_data(completion) else {
+                        continue;
+                    };
                     if completion.status != 0 {
                         return Err(self.fail_data(Error::Rejected(completion.status)));
                     }
-                    let Some(next) = self.station.tx_fragments.pop_front() else {
+                    if self.station.tx_fragments.is_empty() {
                         return Ok(completion);
-                    };
-                    self.check_station_tx()?;
-                    if let Err(error) = self.backend.submit_fragment(self.station.link, &next) {
-                        return Err(self.fail_data(error));
                     }
-                    self.data_pending.push_back(self.backend.now_ns());
-                    let tid = if next.first() == Some(&0x88) {
-                        next[24] & 7
-                    } else {
-                        0
-                    };
-                    self.note_sequence_publication(tid);
+                    self.check_station_tx()?;
+                    self.advance_fragment()?;
                 }
                 Err(error) => return Err(self.fail_data(error)),
             }
@@ -1385,7 +1422,8 @@ impl<B: Backend> Session<B> {
         self.scan_packets.clear();
         self.scanning = false;
         self.station.tx_fragments.clear();
-        self.backend.close_receive_capture(self.receive_epoch);
+        self.station.tx_credit.clear();
+        self.close_own_receive_capture();
         self.station.security = None;
         self.station.permission = None;
         self.station.wmm = None;
@@ -1500,7 +1538,8 @@ impl<B: Backend> Session<B> {
             Err(Error::Busy) => return Err(Error::Busy),
             Err(error) => return Err(self.fail_data(error)),
         }
-        self.data_pending.push_back(self.backend.now_ns());
+        self.data_pending
+            .push_owned(self.backend.now_ns(), self.station.link);
         self.note_sequence_publication(tid);
         if self.station.wmm.is_some() {
             self.station.used_tids |= 1 << tid;
@@ -1571,7 +1610,8 @@ impl<B: Backend> Session<B> {
             Err(error) => return Err(self.fail_data(error)),
         }
         self.station.tx_fragments = fragments;
-        self.data_pending.push_back(self.backend.now_ns());
+        self.data_pending
+            .push_owned(self.backend.now_ns(), self.station.link);
         self.note_sequence_publication(tid);
         if self.station.wmm.is_some() {
             self.station.used_tids |= 1 << tid;
@@ -1579,9 +1619,50 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
+    /// Submit this owner's next software fragment after its predecessor's
+    /// terminal TX (the caller checked the station grant).
+    fn advance_fragment(&mut self) -> Result<(), Error> {
+        let Some(next) = self.station.tx_fragments.pop_front() else {
+            return Ok(());
+        };
+        if let Err(error) = self.backend.submit_fragment(self.station.link, &next) {
+            return Err(self.fail_data(error));
+        }
+        self.data_pending
+            .push_owned(self.backend.now_ns(), self.station.link);
+        let tid = if next.first() == Some(&0x88) {
+            next[24] & 7
+        } else {
+            0
+        };
+        self.note_sequence_publication(tid);
+        Ok(())
+    }
+
+    /// Apply terminal TX statuses the other station owner's waits retired
+    /// for this owner (`retire_data`): a failure fails this owner's data
+    /// path, a success releases its next fragment.
+    fn settle_tx_credit(&mut self) -> Result<(), Error> {
+        while let Some(status) = self.station.tx_credit.pop_front() {
+            if status != 0 {
+                return Err(self.fail_data(Error::Rejected(status)));
+            }
+            if !self.station.tx_fragments.is_empty() {
+                if let Err(error) = self.check_station_tx() {
+                    return Err(self.fail_data(error));
+                }
+                self.advance_fragment()?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn poll_data_tx(&mut self) -> Result<bool, Error> {
+        self.settle_tx_credit()?;
         for _ in 0..packet_tx::PIPELINE {
-            let Some(&started) = self.data_pending.front() else {
+            // Only this owner's oldest entry bounds its wait; the other
+            // owner's entries ahead of it are credited to that owner.
+            let Some(started) = self.data_pending.oldest_for(self.station.link) else {
                 return Ok(!self.data_controls_pending());
             };
             if let Err(error) = self.backend.check() {
@@ -1592,25 +1673,18 @@ impl<B: Backend> Session<B> {
                 Err(error) => return Err(self.fail_data(error)),
             };
             if let Some(completion) = completion {
-                self.data_pending.pop_front();
+                let Some(completion) = self.retire_data(completion) else {
+                    continue;
+                };
                 if completion.status != 0 {
                     return Err(self.fail_data(Error::Rejected(completion.status)));
                 }
                 // The next fragment follows its predecessor's terminal TX.
-                if let Some(next) = self.station.tx_fragments.pop_front() {
+                if !self.station.tx_fragments.is_empty() {
                     if let Err(error) = self.check_station_tx() {
                         return Err(self.fail_data(error));
                     }
-                    if let Err(error) = self.backend.submit_fragment(self.station.link, &next) {
-                        return Err(self.fail_data(error));
-                    }
-                    self.data_pending.push_back(self.backend.now_ns());
-                    let tid = if next.first() == Some(&0x88) {
-                        next[24] & 7
-                    } else {
-                        0
-                    };
-                    self.note_sequence_publication(tid);
+                    self.advance_fragment()?;
                 }
                 continue;
             }
@@ -1703,18 +1777,13 @@ impl<B: Backend> Session<B> {
             self.send_management(&frame, u16::from(self.station.link.peer()))
                 .await?;
             let step = self
-                .wait(3_000, |backend| {
-                    for _ in 0..16 {
-                        let Some(packet) = backend.receive_data()? else {
-                            break;
-                        };
-                        if let Some(reply) = rx_on_channel(&packet, rx_channel) {
-                            if let Some(step) = plan
-                                .sae_authentication_response(reply, &mut session)
-                                .map_err(|_| Error::MalformedEvent)?
-                            {
-                                return Ok(Some(step));
-                            }
+                .wait_station_rx(3_000, |_, packet| {
+                    if let Some(reply) = rx_on_channel(packet, rx_channel) {
+                        if let Some(step) = plan
+                            .sae_authentication_response(reply, &mut session)
+                            .map_err(|_| Error::MalformedEvent)?
+                        {
+                            return Ok(Some(step));
                         }
                     }
                     Ok(None)
@@ -1824,6 +1893,7 @@ impl<B: Backend> Session<B> {
         self.station.tx_fragments.clear();
         self.station.received_msdu.clear();
         self.station.demuxed.clear();
+        self.station.tx_credit.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.station.security = None;
         self.station.wmm = None;
@@ -1928,18 +1998,13 @@ impl<B: Backend> Session<B> {
                     .await?;
 
                 // 4. Wait for Authentication Response:
-                self.wait(3_000, |backend| {
-                    for _ in 0..16 {
-                        let Some(packet) = backend.receive_data()? else {
-                            break;
-                        };
-                        if let Some(frame) = rx_on_channel(&packet, rx_channel) {
-                            if let Some(assoc) = plan
-                                .authentication_response(frame)
-                                .map_err(|_| Error::MalformedEvent)?
-                            {
-                                return Ok(Some(assoc.to_vec()));
-                            }
+                self.wait_station_rx(3_000, |_, packet| {
+                    if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                        if let Some(assoc) = plan
+                            .authentication_response(frame)
+                            .map_err(|_| Error::MalformedEvent)?
+                        {
+                            return Ok(Some(assoc.to_vec()));
                         }
                     }
                     Ok(None)
@@ -1954,18 +2019,13 @@ impl<B: Backend> Session<B> {
 
             // 6. Wait for Association Response:
             let aid = self
-                .wait(3_000, |backend| {
-                    for _ in 0..16 {
-                        let Some(packet) = backend.receive_data()? else {
-                            break;
-                        };
-                        if let Some(frame) = rx_on_channel(&packet, rx_channel) {
-                            if let Some(aid) = plan
-                                .association_response(frame)
-                                .map_err(|_| Error::MalformedEvent)?
-                            {
-                                return Ok(Some(aid));
-                            }
+                .wait_station_rx(3_000, |_, packet| {
+                    if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                        if let Some(aid) = plan
+                            .association_response(frame)
+                            .map_err(|_| Error::MalformedEvent)?
+                        {
+                            return Ok(Some(aid));
                         }
                     }
                     Ok(None)
@@ -2138,21 +2198,12 @@ impl<B: Backend> Session<B> {
                     // Retry replies remain bounded by the operation's 30 s budget.
                     for _ in 0..16 {
                         let result = self
-                            .wait(3_000, |backend| {
-                                for _ in 0..16 {
-                                    let Some(packet) = backend.receive_data()? else {
-                                        break;
-                                    };
-                                    if let Some(pdu) =
-                                        peer_eapol(&packet, own, bss.bssid, rx_channel)
+                            .wait_station_rx(3_000, |backend, packet| {
+                                if let Some(pdu) = peer_eapol(packet, own, bss.bssid, rx_channel) {
+                                    if let Some(result) = security
+                                        .process(pdu, false, |out| backend.random_bytes(out))?
                                     {
-                                        if let Some(result) =
-                                            security.process(pdu, false, |out| {
-                                                backend.random_bytes(out)
-                                            })?
-                                        {
-                                            return Ok(Some(result));
-                                        }
+                                        return Ok(Some(result));
                                     }
                                 }
                                 Ok(None)
@@ -2276,7 +2327,7 @@ impl<B: Backend> Session<B> {
             _ => return Err(Error::Busy),
         };
         self.cancel_transmit_ba_restart();
-        self.backend.close_receive_capture(self.receive_epoch);
+        self.close_own_receive_capture();
         self.boot_started = Some(self.backend.now_ns());
         // ieee80211_set_disassoc sends the deauthentication before the
         // station's keys are flushed: under PMF it is CCMP protected.
@@ -2303,13 +2354,17 @@ impl<B: Backend> Session<B> {
         self.station.tx_fragments.clear();
         self.station.received_msdu.clear();
         self.station.demuxed.clear();
+        self.station.tx_credit.clear();
         let peer_lost = self.station.peer_lost;
         self.stage(Stage::StaRecord);
         let result = async {
+            // Drain the device FIFO; the other owner's entries are
+            // credited to it, never consumed as this owner's.
             while !self.data_pending.is_empty() {
-                self.wait(TIMEOUT_MS, |backend| backend.management_complete())
+                let completion = self
+                    .wait(TIMEOUT_MS, |backend| backend.management_complete())
                     .await?;
-                self.data_pending.pop_front();
+                let _ = self.retire_data(completion);
             }
             self.retire_transmit_ba(false).await?;
             self.retire_receive_ba(peer).await?;

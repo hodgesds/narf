@@ -319,6 +319,7 @@ impl<B: Backend> Session<B> {
         self.station.tx_fragments.clear();
         self.station.received_msdu.clear();
         self.station.demuxed.clear();
+        self.station.tx_credit.clear();
         self.station.rx_fragments.clear();
         self.data_pending.clear();
         self.events.clear();

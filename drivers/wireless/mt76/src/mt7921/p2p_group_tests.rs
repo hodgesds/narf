@@ -694,7 +694,13 @@ fn group_association() -> Result<(), &'static str> {
         return Err("group management/EAPOL TX left the group vif");
     }
     // RX demux: the group peer's WCID belongs to the group owner.
-    if !session.other_owns_wcid(2) || session.other_owns_wcid(1) {
+    let group_rx = rx_copy(&bss, own, 2);
+    let home_rx = rx_copy(&bss, own, 1);
+    let owns = |session: &NativeSession, packet: &[u8]| {
+        super::super::super::super::scan::rx_native_with_amsdu(packet)
+            .is_some_and(|native| session.other_owns_rx(&native))
+    };
+    if !owns(&session, &group_rx) || owns(&session, &home_rx) {
         return Err("RX WCID demux owner");
     }
     // One shared channel context: a different grant is refused.
@@ -739,6 +745,101 @@ fn group_association() -> Result<(), &'static str> {
     }
     Ok(())
 }
+/// A native RX copy on channel 6 from `bss` to `own` under RXD `wcid`
+/// (`MT_RXD1_NORMAL_WLAN_IDX`).
+fn rx_copy(bss: &crate::mt7921::firmware_transport::ScanBss, own: [u8; 6], wcid: u16) -> Vec<u8> {
+    let mut frame = vec![0u8; 32];
+    frame[0] = 0x08;
+    frame[1] = 0x02;
+    frame[4..10].copy_from_slice(&own);
+    frame[10..16].copy_from_slice(&bss.bssid);
+    frame[16..22].copy_from_slice(&bss.bssid);
+    frame[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]);
+    super::super::receive::packet(&frame, wcid, false)
+}
+
+fn group_routing() -> Result<(), &'static str> {
+    use crate::mt7921::packet_tx::Completion;
+    use crate::mt7921::vif_slots::{Link, Vif};
+    let (mut session, bss) = super::super::super::ht20_tests::prepared(6, true);
+    let vif = Vif::new(1).map_err(|_| "vif")?;
+    let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let link = run(Box::pin(session.start_group_link(vif, own))).map_err(|_| "group start")?;
+    run(Box::pin(session.associate_group(
+        link,
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2Psk { psk: [0x55; 32] },
+        test_permission(),
+        &[],
+        Network::P2p,
+    )))
+    .map_err(|_| "group association")?;
+    // 0. A home station wait drains the shared ring: the group peer's
+    // WCID copy and a WTBL-miss copy from the group BSS go to the group
+    // owner's demux queue; the wait sees only the home copy.
+    let home_frame = rx_copy(&bss, own, 1);
+    session.backend.packets.clear();
+    session.backend.captured_packets.clear();
+    session.backend.packets.push_back(rx_copy(&bss, own, 2));
+    session.backend.packets.push_back(rx_copy(&bss, own, 0x3ff));
+    session.backend.packets.push_back(home_frame.clone());
+    let seen =
+        run(Box::pin(session.wait_station_rx(100, |_, packet| {
+            Ok(Some(packet.to_vec()))
+        })))
+        .map_err(|_| "home wait")?;
+    let group = session.group.as_ref().ok_or("group owner")?;
+    if seen != home_frame || group.station.demuxed.len() != 2 {
+        return Err("a station wait consumed or dropped the other owner's RX");
+    }
+    // A home fence moves only the home floor: the group's queued copies
+    // stay admissible to it, the shared capture stays open for it, and the
+    // home owner is marked fenced (it renews before admitting anything).
+    let queued = group.station.demuxed.front().ok_or("queued")?.epoch;
+    let group_floor = group.station.epoch;
+    session.renew_receive_epoch().map_err(|_| "renew")?;
+    let group = session.group.as_ref().ok_or("group owner")?;
+    if group.station.epoch != group_floor
+        || !session.epoch_admits(&group.station, queued)
+        || session.epoch_admits(&session.station, queued)
+        || !session.backend.receive_open
+        || !session.station.fenced
+    {
+        return Err("a home fence invalidated or closed the group owner's RX");
+    }
+    // 1. TX completions are attributed by owner: the group's entry ahead
+    // of the home entry is credited to the group, never consumed by home.
+    session.data_pending.clear();
+    session.data_pending.push_owned(1, link);
+    session.data_pending.push_owned(2, Link::HOME);
+    if session.data_pending.oldest_for(Link::HOME) != Some(2)
+        || session.data_pending.owned_by(link) != 1
+    {
+        return Err("per-owner pending accounting");
+    }
+    let done = |token| Completion { token, status: 0 };
+    if session.retire_data(done(1)).is_some()
+        || session.group.as_ref().map(|g| g.station.tx_credit.len()) != Some(1)
+        || session.retire_data(done(2)).map(|c| c.token) != Some(2)
+        || !session.data_pending.is_empty()
+    {
+        return Err("a home wait consumed the group owner's TX completion");
+    }
+    // An owner with credited completions or entries is not idle.
+    if session.close_group_link(link) != Err(Error::Busy) {
+        return Err("group closed with credited TX");
+    }
+    Ok(())
+}
+fn mt76_p2p_group_owner_routes_rx_and_tx_completions() -> TestResult {
+    group_routing().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_group_owner_routes_rx_and_tx_completions
+);
+
 fn mt76_p2p_group_link_drives_association_on_group_vif() -> TestResult {
     group_association().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
