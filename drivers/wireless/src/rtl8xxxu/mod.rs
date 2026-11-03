@@ -72,10 +72,12 @@ mod rtl8192e_ra;
 mod rtl8192e_radio;
 mod rtl8192e_tables;
 pub mod rtl8723b;
+mod rtl8723b_admission;
 pub mod rtl8723b_init;
 mod rtl8723b_iqk;
 mod rtl8723b_packet;
 mod rtl8723b_phy;
+mod rtl8723b_policy;
 mod rtl8723b_power;
 mod rtl8723b_radio;
 mod rtl8723b_tables;
@@ -268,6 +270,38 @@ pub fn rtl8xxxu_probe(
             let _ = writeln!(
                 narf_console::Writer,
                 "  rtl8192eu: admission {:?}",
+                admitted.as_ref().map(|a| a.permission)
+            );
+        });
+    } else if family == regs::ChipFamily::Rtl8723bu {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8723bu:   firmware required at /firmware/rtlwifi/rtl8723bu_nic.bin"
+        );
+        narf_scheduler::spawn(async move {
+            let result = firmware.wait_initialize_registered().await;
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8723bu: firmware attempt {:?}",
+                result
+            );
+            if result.is_err() {
+                return;
+            }
+            if let Some(factory) = firmware.factory_8723b() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8723bu:   signed record required at /firmware/{}",
+                    rtl8723b_policy::Calibration::asset_name(&factory),
+                );
+            }
+            // Unprovisioned (no record/policy/authority) stays unadmitted.
+            // Admission alone publishes no netdev and opens no MAC TX/RX.
+            let admitted = rtl8723b_admission::wait_admit(firmware.clone()).await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8723bu: admission {:?}",
                 admitted.as_ref().map(|a| a.permission)
             );
         });

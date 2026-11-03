@@ -858,3 +858,58 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8723bu",
     smoke_rtl8723bu_bt_coex_policy
 );
+
+fn smoke_rtl8723bu_admission_and_start() -> TestResult {
+    use super::rtl8192e_policy::tests::domain;
+    use super::rtl8192e_radio::Width;
+    use super::rtl8723b_admission::{admit, classify, Admission};
+    use super::rtl8723b_policy::tests::{parse, record};
+    use super::rtl8723b_policy::Error as PolicyError;
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    let factory = owner.factory_8723b().unwrap();
+    let missing = Err(PolicyError::Firmware(
+        narf_firmware::FirmwareError::NotFound,
+    ));
+    let bad = Err(PolicyError::Format);
+    if classify(true, true, &Ok(domain(20, 40)), &missing) != Ok(Admission::PendingAssets)
+        || classify(true, true, &Ok(domain(20, 40)), &bad).is_ok()
+    {
+        return TestResult::Fail("8723bu admission classify");
+    }
+    let rec = parse(
+        &record(&factory, 0x000f_ffff, &[(1, 0, 60), (6, 0, 60)]),
+        &factory,
+    )
+    .unwrap();
+    let admitted = match admit(&owner, domain(20, 40), rec) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("8723bu admission refused"),
+    };
+    if admitted.permission.primary() != 1 || admitted.permission.width() != Width::Ht20 {
+        return TestResult::Fail("8723bu initial permission");
+    }
+    match narf_scheduler::block_on(owner.start_8723b(&admitted.permission)) {
+        Ok(0x000f_ffff) => {}
+        _ => return TestResult::Fail("8723bu start failed"),
+    }
+    // enable_rf's BT handover ran, then channel 1 HT20 was programmed.
+    if io.writes(0x0948) != vec![0x80u32.to_le_bytes().to_vec()]
+        || io.writes(0x0483) != vec![vec![0]]
+    {
+        return TestResult::Fail("8723bu start sequence");
+    }
+    // A retune needs its own permission: channel 6 is refused untouched.
+    io.0.lock().ops.clear();
+    if narf_scheduler::block_on(owner.tune_8723b(&admitted.permission, 6, Width::Ht20)).is_ok()
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("8723bu retune without permission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_admission_and_start
+);

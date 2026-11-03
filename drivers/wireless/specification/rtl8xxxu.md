@@ -1452,9 +1452,72 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   `rtl8723bu_set_ps_tdma` and the table); RA reports are left to the
   caller. `assoc` is `rtl8xxxu_is_assoc` supplied by the station.
 
-Signed records and the station are not implemented, and the production
-probe does not start an RTL8723BU owner; C2H BT-info records are therefore
-not yet routed from a live receive path. USB IDs are exactly Linux `core.c::dev_table`
+#### RTL8723BU signed records (`N8BP` v1)
+
+`rtl8723b_policy::Calibration::load_registered(factory, vid, pid)` opens
+only `rtl8xxxu/rtl8723bu-cal-v1-<12 lowercase MAC hex digits>.bin` through
+the current firmware-registry capability, with mandatory signer metadata
+(as N92P/N8PC). Linux `8723b.c::rtl8723b_set_tx_power` programs raw
+factory indices (the path-B EFUSE bases + diff index 0, into the single
+path-A transmitter) with no dBm conversion or board curve, so the record
+qualifies exactly the indices `rtl8723b_phy::tx_power` programs for the one
+TX chain; no board value ships in the tree. Little endian. Header (128
+bytes):
+
+| Offset | Value |
+|---|---|
+| 0 | magic `N8BP` (distinct from `N8PC`/`N8HT`/`N92P`) |
+| 4 | version:u16 = 1 |
+| 6 | header bytes:u16 = 128 |
+| 8 | exact total payload bytes:u32 |
+| 12 | USB VID:u16, 14 PID:u16, 16 chip:u16 = 0x8723 |
+| 18 | cut, 19 profile = 1 (USB 2.4 GHz HT20/40 1T1R station, no power tracking), 20 function bits (WiFi bit 0, BT bit 1, GPS bit 2), 21 ROM rev |
+| 22 | factory MAC[6] |
+| 28 | EFUSE path A then B: CCK[6], HT40[5], OFDM/HT20/HT40 diffs[4] each (23 bytes per path, two's complement) |
+| 74 | crystal cap, channel plan |
+| 76 | thermal, IQK/LCK, PA type, LNA type, board option, BT setting, antenna option, RFE option |
+| 84 | envelope:u8 = 1 (whole qualified board operating envelope), 85 reserved = 0 |
+| 86 | maximum antenna gain:i16 quarter-dBi 0..128; 88 board-qualified EIRP:i16 quarter-dBm -512..256 |
+| 90 | rows:u16 1..31, 92 reserved[2] = 0 |
+| 94 | admitted RA mask:u32 (`DESC_RATE` bits 0..19 only: CCK, OFDM, MCS0..7; nonzero) |
+| 98 | reserved[30] = 0 |
+
+Each 16-byte row: primary channel (1..13), width code (0 = HT20, also for
+non-HT 20 MHz; 1 = HT40 above, primary 1..9; 2 = below, 5..13),
+reserved[2]; the programmed CCK, OFDM and MCS indices (must equal
+`tx_power` for that EFUSE/channel/width), reserved; CCK/OFDM/MCS conducted
+upper bounds:i16 quarter-dBm (-512..256, or `0x7fff` unknown); reserved:i16.
+Rows strictly increase by (channel, width).
+
+`Calibration::permission(domain, primary, width)` is the N92P rule set for
+one chain: every overlapping regulatory rule must cover the occupied span,
+allow the width and carry no flags; the most restrictive ceiling (EIRP) is
+intersected with the board EIRP; every admitted rate class must have a
+known bound with bound + antenna gain ≤ ceiling, else the channel is
+refused (never narrowed). `Permission::check` revalidates factory/VID/PID/
+channel/width before programming. Synthetic test records validate
+format/arithmetic only.
+
+Production probe (`rtl8xxxu_probe`): the RTL8723BU owner starts like the
+RTL8192EU: `wait_initialize_registered()` waits for
+`rtlwifi/rtl8723bu_nic.bin`, the owner runs to `RadioReady`, then
+`rtl8723b_admission::wait_admit` waits for the signed `N8BP` record, the
+signed `wireless-regulatory.bin` and the network authority (missing assets
+retry every 500 ms; unsigned/invalid/mismatched/unqualified-initial-channel
+records are terminal `Profile`). Admission yields the channel-1 HT20
+`Permission`; it publishes no netdev and opens no MAC TX/RX.
+`Owner::start_8723b(permission)` revalidates the permission, then runs
+`rtl8723b_enable_rf` (with the BT-coex handover) and the admitted initial
+channel; `Owner::tune_8723b(permission, primary, width)` is
+`rtl8xxxu_config`'s `rtl8723b_set_tx_power` + `config_channel`, refused
+before any transfer without an exact permission.
+
+Remaining for a native RTL8723BU station (not implemented): the station
+composition (`receive_runtime`/`station_runtime`/`service_runtime` and the
+netdev are RTL8188EU-specific), so C2H BT-info and RA records are not yet
+routed from a live receive path into `Owner::c2h_bt_8723b` /
+`ra_watchdog_8723b`, and `restart_parked` is not wired for RTL8723BU. No
+RTL8723BU netdev is published. USB IDs are exactly Linux `core.c::dev_table`
 `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
