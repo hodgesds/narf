@@ -2,6 +2,7 @@
 //! Native BMI conversations over the ordinary boot-test target model.
 use super::*;
 use crate::ath10k::firmware::calibration::prepare_for_address;
+use crate::ath10k::firmware::platform::{Platform, Source};
 use narf_bus::PcieAddr;
 
 const PRE: &str = "ath10k/pre-cal-pci-0002:03:04.1.bin";
@@ -35,7 +36,8 @@ fn smoke_ath10k_pre_cal_download_precedes_flash_identity_and_native_otp() -> Tes
             id,
             "",
             &image,
-            address()
+            address(),
+            &Platform::default()
         )),
         Some(Ok(Some(_)))
     ) {
@@ -84,7 +86,8 @@ fn smoke_ath10k_final_cal_file_is_done_mode_without_eeprom_or_otp_calibration() 
             id,
             "",
             &image,
-            address()
+            address(),
+            &Platform::default()
         )),
         Some(Ok(Some(_)))
     ) {
@@ -132,6 +135,7 @@ fn smoke_ath10k_short_cal_geometry_and_otp_failure_never_activate_firmware() -> 
             "",
             &image,
             address(),
+            &Platform::default(),
         )) != Some(Err(Error::Calibration))
             || bmi
                 .transport
@@ -157,6 +161,7 @@ fn smoke_ath10k_short_cal_geometry_and_otp_failure_never_activate_firmware() -> 
         "",
         &image,
         address(),
+        &Platform::default(),
     )) != Some(Err(Error::Calibration))
         || bmi.transport.executions != [(p.patch, 0x8000), (p.patch, 0x10000)]
         || bmi
@@ -172,4 +177,110 @@ fn smoke_ath10k_short_cal_geometry_and_otp_failure_never_activate_firmware() -> 
 kernel_test_in!(
     "drivers/wireless/ath10k/firmware",
     smoke_ath10k_short_cal_geometry_and_otp_failure_never_activate_firmware
+);
+
+/// Linux `ath10k_core_pre_cal_download`: a `pre-calibration` NVMEM cell
+/// beats the pre-cal file and reaches host-interest memory before the FLASH
+/// board-ID OTP; `ath10k_download_cal_data`: with no file, the
+/// `qcom,calibration-data` property is done mode without EEPROM or OTP
+/// calibration. A refused NVMEM provider never falls back to the file.
+fn smoke_ath10k_platform_nvmem_pre_cal_and_dt_cal_drive_native_bmi() -> TestResult {
+    let (p, id, mut files, image) = setup();
+    files.0.insert(PRE.into(), vec![0x66; p.calibration]);
+    let sources = Platform {
+        pre_nvmem: Source::Present(vec![0x5a; p.calibration]),
+        dt: Source::Present(vec![0x77; p.calibration]),
+        ..Platform::default()
+    };
+    let mut bmi = Bmi::new(Target::default());
+    if !matches!(
+        ready(prepare_for_address(
+            &mut bmi,
+            &mut files,
+            p,
+            id,
+            "",
+            &image,
+            address(),
+            &sources
+        )),
+        Some(Ok(Some(_)))
+    ) {
+        return TestResult::Fail("NVMEM pre-cal native boot failed");
+    }
+    let target = &bmi.transport;
+    let mut board_bytes = Vec::new();
+    for (at, bytes) in &target.writes {
+        if (0x430000..0x430000 + p.board as u32).contains(at) {
+            board_bytes.extend_from_slice(bytes);
+        }
+    }
+    if target.executions != [(p.patch, 0x8000), (p.patch, 0x10000)]
+        || board_bytes != [vec![0x5a; p.calibration], vec![0x55; p.board]].concat()
+        || !target.eeprom_queries.is_empty()
+    {
+        return TestResult::Fail("NVMEM pre-cal precedence/ordering");
+    }
+
+    let (p, id, mut files, image) = setup();
+    let sources = Platform {
+        dt: Source::Present(vec![0x77; p.calibration]),
+        ..Platform::default()
+    };
+    let mut bmi = Bmi::new(Target::default());
+    if !matches!(
+        ready(prepare_for_address(
+            &mut bmi,
+            &mut files,
+            p,
+            id,
+            "",
+            &image,
+            address(),
+            &sources
+        )),
+        Some(Ok(Some(_)))
+    ) {
+        return TestResult::Fail("DT cal native boot failed");
+    }
+    let target = &bmi.transport;
+    let mut board_bytes = Vec::new();
+    for (at, bytes) in &target.writes {
+        if (0x430000..0x430000 + p.board as u32).contains(at) {
+            board_bytes.extend_from_slice(bytes);
+        }
+    }
+    if target.executions != [(p.patch, 0x10)]
+        || board_bytes != vec![0x77; p.calibration]
+        || !target.eeprom_queries.is_empty()
+    {
+        return TestResult::Fail("DT cal did not retain Linux done-mode semantics");
+    }
+
+    let (p, id, mut files, image) = setup();
+    files.0.insert(PRE.into(), vec![0x66; p.calibration]);
+    let sources = Platform {
+        pre_nvmem: Source::Refused(Error::Unsupported),
+        ..Platform::default()
+    };
+    let mut bmi = Bmi::new(Target::default());
+    if ready(prepare_for_address(
+        &mut bmi,
+        &mut files,
+        p,
+        id,
+        "",
+        &image,
+        address(),
+        &sources,
+    )) != Some(Err(Error::Unsupported))
+        || !bmi.transport.executions.is_empty()
+    {
+        return TestResult::Fail("unavailable NVMEM provider fell back to the file");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/firmware",
+    smoke_ath10k_platform_nvmem_pre_cal_and_dt_cal_drive_native_bmi
 );

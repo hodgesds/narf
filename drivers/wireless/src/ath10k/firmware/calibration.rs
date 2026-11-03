@@ -2,6 +2,7 @@
 //! Exact PCI-function calibration files, following Linux core.c
 //! ath10k_fetch_cal_file/download_cal_file/core_pre_cal_config.
 //! Signed registry inputs retain the same source owner as executable/BDF data.
+use super::platform::{Platform, Source};
 use super::*;
 use narf_bus::PcieAddr;
 
@@ -11,41 +12,99 @@ pub(super) enum Mode {
     Final,
 }
 
+/// Where Linux's `ar->cal_mode` came from (`ATH10K_{PRE_,}CAL_MODE_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Origin {
+    Nvmem,
+    File,
+    Dt,
+}
+
 #[derive(Debug)]
 pub(super) struct Calibration {
     pub mode: Mode,
+    pub origin: Origin,
     pub bytes: Vec<u8>,
 }
 
-/// Optional lookup at the current loader checkpoint. Missing is not a receipt
-/// for a different function; malformed or revoked signed input is terminal.
+/// Linux `ath10k_fetch_cal_file` for one exact PCI function.
+fn file(
+    files: &mut impl Files,
+    address: Option<PcieAddr>,
+    prefix: &str,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(address) = address else {
+        return Ok(None);
+    };
+    let name = format!(
+        "ath10k/{prefix}-pci-{:04x}:{:02x}:{:02x}.{}.bin",
+        address.segment, address.bus, address.device, address.function
+    );
+    match files.load(&name) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(Error::Missing) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn platform(source: &Source) -> Result<Option<Vec<u8>>, Error> {
+    match source {
+        Source::Absent => Ok(None),
+        Source::Present(bytes) => Ok(Some(bytes.clone())),
+        Source::Refused(error) => Err(error.clone()),
+    }
+}
+
+/// Optional lookup at the current loader checkpoint without DT/NVMEM
+/// sources. Missing is not a receipt for a different function; malformed or
+/// revoked signed input is terminal.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn load(
     files: &mut impl Files,
     address: Option<PcieAddr>,
     profile: Profile,
 ) -> Result<Option<Calibration>, Error> {
-    let Some(address) = address else {
-        return Ok(None);
-    };
-    if address.device > 31 || address.function > 7 {
+    select(files, address, profile, &Platform::default())
+}
+
+/// Linux `ath10k_core_pre_cal_download` then `ath10k_download_cal_data`
+/// source precedence: pre-cal NVMEM cell, pre-cal file, pre-cal DT property,
+/// then cal NVMEM cell, cal file, cal DT property (EEPROM and OTP follow in
+/// [`prepare_for_address`]). Linux falls through on any source error except
+/// `-EPROBE_DEFER`; here a present source that is refused or malformed is
+/// terminal, so a broken factory input never silently selects another one.
+pub(super) fn select(
+    files: &mut impl Files,
+    address: Option<PcieAddr>,
+    profile: Profile,
+    sources: &Platform,
+) -> Result<Option<Calibration>, Error> {
+    if address.is_some_and(|address| address.device > 31 || address.function > 7) {
         return Err(Error::Unsupported);
     }
-    for (mode, prefix) in [(Mode::Pre, "pre-cal"), (Mode::Final, "cal")] {
-        let name = format!(
-            "ath10k/{prefix}-pci-{:04x}:{:02x}:{:02x}.{}.bin",
-            address.segment, address.bus, address.device, address.function
-        );
-        match files.load(&name) {
-            Ok(bytes) => {
+    for (mode, prefix, nvmem, dt) in [
+        (Mode::Pre, "pre-cal", &sources.pre_nvmem, &sources.pre_dt),
+        (Mode::Final, "cal", &sources.nvmem, &sources.dt),
+    ] {
+        for origin in [Origin::Nvmem, Origin::File, Origin::Dt] {
+            let bytes = match origin {
+                Origin::Nvmem => platform(nvmem)?,
+                Origin::File => file(files, address, prefix)?,
+                Origin::Dt => platform(dt)?,
+            };
+            if let Some(bytes) = bytes {
                 // Keep the per-silicon calibration geometry from Linux's
-                // hw_params, rather than accepting arbitrary partial input.
+                // hw_params (`cal_data_len`), rather than accepting arbitrary
+                // partial input.
                 if bytes.len() != profile.calibration || bytes.len() & 3 != 0 {
                     return Err(Error::Calibration);
                 }
-                return Ok(Some(Calibration { mode, bytes }));
+                return Ok(Some(Calibration {
+                    mode,
+                    origin,
+                    bytes,
+                }));
             }
-            Err(Error::Missing) => {}
-            Err(error) => return Err(error),
         }
     }
     Ok(None)
@@ -108,6 +167,7 @@ pub(super) fn signed_input(name: &str) -> bool {
 
 /// Native BMI preparation for an exact enumerated PCI function. The caller
 /// supplies the address from its existing exclusive PCI-device binding.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::ath10k) async fn prepare_for_address<T: Transport>(
     bmi: &mut Bmi<T>,
     files: &mut impl Files,
@@ -116,8 +176,9 @@ pub(in crate::ath10k) async fn prepare_for_address<T: Transport>(
     variant: &str,
     image: &Image,
     address: Option<PcieAddr>,
+    sources: &Platform,
 ) -> Result<Option<OtpIdentity>, Error> {
-    let calibration = load(files, address, profile)?;
+    let calibration = select(files, address, profile, sources)?;
     if profile.pll {
         super::super::clock::enable(bmi).await?;
     }

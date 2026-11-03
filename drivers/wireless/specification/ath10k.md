@@ -1302,7 +1302,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   `drivers/wireless/ath10k/eeprom` and
   `smoke_ath10k_qca9887_eeprom_calibration_replaces_board_data_and_skips_otp`
   cover the register sequence, fallbacks and non-QCA9887 isolation.
-  DT/NVMEM sources remain unimplemented. The EEPROM bytes are factory
+  DT/NVMEM sources precede the EEPROM (see below). The EEPROM bytes are factory
   calibration only; regulatory and transmit-power authority are unchanged.
 - Exact PCI-function calibration files use Linux's
   `ath10k/pre-cal-pci-<domain:bus:device.function>.bin` then
@@ -1318,7 +1318,35 @@ actual-device RF/power/interoperability acceptance remain separate.
   or refused present file fails before firmware activation. The same immutable
   source owner retains the actual file capability through mission startup.
   Native file-selection/BMI and signed-registry execution gates are pending.
-  DT/NVMEM calibration still needs an actual platform source provider.
+- Alternate DT/NVMEM calibration sources (`firmware::platform::Platform`,
+  `firmware::calibration::select`) follow `core.c::ath10k_core_pre_cal_download`
+  and `ath10k_download_cal_data`: pre-calibration NVMEM cell, pre-cal file,
+  `qcom,pre-calibration-data` (legacy `qcom,ath10k-pre-calibration-data` only
+  when absent); then the `calibration` cell, cal file, `qcom,calibration-data`
+  (legacy `qcom,ath10k-calibration-data`); then QCA9887 EEPROM, then OTP.
+  `Calibration::origin` records Linux's `cal_mode` source. The node is the PCI
+  function's own (`drivers/pci/of.c::pci_set_of_node` via
+  `narf_firmware_fdt::for_pci_function` on the boot DTB, `devfn_path` hops
+  from the host bridge of the function's domain); without a DTB or node every
+  source is absent. `ath10k_core_check_dt` reads `qcom,calibration-variant`
+  (legacy `qcom,ath10k-calibration-variant`), truncated like `strscpy` to 31
+  bytes, replacing the SMBIOS variant for board names. NVMEM cells resolve
+  through `narf_firmware_fdt::rmem_cell` (`of_nvmem_cell_get`); the one
+  in-tree provider is `drivers/nvmem/rmem.c` (`nvmem-rmem` reserved memory,
+  fixed-layout cells), copied through a retained write-back mapping. Every
+  source must be exactly `cal_data_len` bytes. DT/NVMEM bytes carry the boot
+  Devicetree's platform-firmware authority, not a registry signature.
+  Deliberate deviation: Linux falls through to the next source on any error
+  except `-EPROBE_DEFER`; here a present source that is malformed, out of its
+  region, bit-field, unreadable or behind an unregistered provider (MTD, I2C
+  EEPROM, QFPROM, other layouts: Linux `-EPROBE_DEFER`) fails boot before
+  PLL/BMI work, so broken factory data never selects another source. Smokes
+  `smoke_ath10k_dt_nvmem_sources_follow_pci_function_node`,
+  `smoke_ath10k_nvmem_cell_failures_are_terminal_sources`,
+  `smoke_ath10k_calibration_source_precedence_matches_linux` and
+  `smoke_ath10k_platform_nvmem_pre_cal_and_dt_cal_drive_native_bmi` (synthetic
+  DTBs and BMI target) are written but unexecuted; no physical board or
+  platform DTB is claimed.
 - `firmware::Image::{parse, load}` own the API 2–6 container and expose
   bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
   versions. `Files` supplies owned immutable bytes and `Files::wait_missing`
@@ -2329,7 +2357,7 @@ DFS qualification (VHT20/40/80, the bounded 80+80 owner and contiguous VHT160
 are implemented; contiguous VHT160 awaits release/native validation); physical acceptance of the §3.4 hardware key offload;
 P2P roles; wake offload is implemented in §3.6 (TLV + WOWLAN + RAW images;
 net-detect not implemented) and awaits release/native validation;
-DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented).
+DT/NVMEM calibration sources are implemented (nvmem-rmem provider only) and await native validation.
 Automatic credential replay after recovery is implemented (§ recovery, rebind)
 and awaits coordinated release/native acceptance.
 The signed indoor installation continuation is implemented in §3.1 and awaits

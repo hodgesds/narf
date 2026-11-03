@@ -5,10 +5,11 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// A nested test tree node.
-pub(crate) struct TreeNode<'a> {
-    pub(crate) name: &'a str,
-    pub(crate) props: &'a [(&'a str, &'a [u8])],
-    pub(crate) children: &'a [TreeNode<'a>],
+#[derive(Debug)]
+pub struct TreeNode<'a> {
+    pub name: &'a str,
+    pub props: &'a [(&'a str, &'a [u8])],
+    pub children: &'a [TreeNode<'a>],
 }
 
 fn emit(s: &mut Vec<u8>, strings: &mut Vec<u8>, node: &TreeNode<'_>) {
@@ -36,7 +37,7 @@ fn emit(s: &mut Vec<u8>, strings: &mut Vec<u8>, node: &TreeNode<'_>) {
     s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes());
 }
 
-pub(crate) fn build_tree(root: &[TreeNode<'_>]) -> Vec<u8> {
+pub fn build_tree(root: &[TreeNode<'_>]) -> Vec<u8> {
     let mut s = Vec::new();
     let mut strings = Vec::new();
     let top = TreeNode {

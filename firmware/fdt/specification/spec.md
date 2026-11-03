@@ -184,6 +184,26 @@ pub fn default_shared_dma_pool(blob: &[u8]) -> Option<SharedDmaPool>;
 /// `of_reserved_mem_device_init` for a PCI function: `memory-region[0]` of
 /// its node, if that is a usable `shared-dma-pool`.
 pub fn pci_function_dma_pool(blob: &[u8], domain: u16, devfns: &[u8]) -> Option<SharedDmaPool>;
+
+/// Linux `drivers/nvmem/core.c::of_nvmem_cell_get(np, id)` for a consumer
+/// node's properties: `id`'s index in `nvmem-cell-names`, that entry of
+/// `nvmem-cells` (each target's `#nvmem-cell-cells`, absent = 0; more than
+/// one argument is `Invalid`), then the cell's parent, one more hop out of an
+/// `nvmem-layout` container. The only registered provider is `rmem.c`: an
+/// enabled `/reserved-memory` child compatible `nvmem-rmem` with a static
+/// first `reg`, whose cells come only from its `fixed-layout` container
+/// (`nvmem_add_cells_from_dt`: `reg = <offset bytes>`, valid `bits` kept,
+/// children without `reg` skipped, any malformed sibling fails the whole
+/// provider). `NotFound` = `-ENOENT`; `ProviderUnavailable` =
+/// `-EPROBE_DEFER` (other providers/layouts, disabled or dynamic regions,
+/// unregistered cells). Reading the bytes is the caller's job (`rmem_read`
+/// bounds the cell by `size`).
+pub enum NvmemError { NotFound, Invalid, ProviderUnavailable }
+pub struct RmemCell { pub base: u64, pub size: u64, pub offset: u32, pub bytes: u32, pub bits: Option<(u32, u32)> }
+pub fn rmem_cell(blob: &[u8], consumer: PropIter<'_>, id: &str) -> Result<RmemCell, NvmemError>;
+
+/// `#[doc(hidden)] pci::tests::{TreeNode, build_tree}`: the synthetic DTB
+/// builder used by this crate's and dependent crates' smokes.
 ```
 
 ## 5. Test surface
@@ -203,11 +223,15 @@ pub fn pci_function_dma_pool(blob: &[u8], domain: u16, devfns: &[u8]) -> Option<
 | `smoke_fdt_dma_coherent_inheritance` | nearest `dma-coherent`/`dma-noncoherent` wins, default, dma-mem unresolved |
 | `smoke_fdt_pci_host_bridge_dma_coherence` | PCI inherits the host bridge, domain/ambiguity rules |
 | `smoke_fdt_shared_dma_pool_and_memory_region` | pool acceptance, `linux,dma-default` last-wins, function `memory-region` |
+| `smoke_fdt_nvmem_rmem_fixed_layout_cells` | named cell through `#nvmem-cell-cells`, rmem region, `bits`, ENOENT/legacy/foreign/disabled/dynamic/other-layout/broken-sibling classification |
+| `smoke_fdt_nvmem_cell_with_two_arguments_is_invalid` | `#nvmem-cell-cells = <2>` is `-EINVAL` |
 
 ## 6. Out of scope (v0.1)
 
-- `phandle` resolution (we surface raw `phandle` bytes; the
-  consumer does the lookup).
+- General `phandle` resolution (raw `phandle` bytes are surfaced; the
+  consumer does the lookup), except `nvmem-cells` in `rmem_cell`.
+- NVMEM providers other than `nvmem-rmem` and layouts other than
+  `fixed-layout`.
 - Overlay / fixup application.
 - Property-encoded-array helpers beyond `(u32_be, …)` decode.
 - Dynamic `/reserved-memory` allocation (`size` without `reg`);

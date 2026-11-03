@@ -141,8 +141,10 @@ pub fn reserved_memory_region(blob: &[u8], phandle: u32) -> Option<(u64, u64)> {
     out
 }
 
+/// Synthetic-tree builder shared with dependent crates' Devicetree smokes.
+#[doc(hidden)]
 #[path = "pci_tests.rs"]
-pub(crate) mod tests;
+pub mod tests;
 
 /// A PCI function's legacy INTx resolved through its host bridge's
 /// `interrupt-map`: the interrupt controller's phandle and its specifier.

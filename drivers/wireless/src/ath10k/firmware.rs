@@ -10,7 +10,9 @@ use alloc::{format, string::String, vec::Vec};
 use core::ops::Range;
 
 mod calibration;
+mod platform;
 pub(super) use calibration::prepare_for_address;
+pub(super) use platform::Platform;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -427,7 +429,17 @@ pub(super) async fn prepare<T: Transport>(
     variant: &str,
     image: &Image,
 ) -> Result<Option<OtpIdentity>, Error> {
-    prepare_for_address(bmi, files, profile, identity, variant, image, None).await
+    prepare_for_address(
+        bmi,
+        files,
+        profile,
+        identity,
+        variant,
+        image,
+        None,
+        &Platform::default(),
+    )
+    .await
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

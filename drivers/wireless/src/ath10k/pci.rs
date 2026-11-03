@@ -1238,7 +1238,14 @@ async fn boot_task(
                     subsystem_vendor: device.id.subsystem_vendor,
                     subsystem_device: device.id.subsystem_id,
                 };
-                let variant = crate::ath11k::board::check_smbios().bdf_ext;
+                // Linux `ath10k_core_check_smbios` then `ath10k_core_check_dt`,
+                // whose variant (when present) replaces the SMBIOS one. The
+                // function's DT/NVMEM calibration sources are read once here.
+                let sources = super::firmware::Platform::for_device(&device);
+                let variant = sources
+                    .variant
+                    .clone()
+                    .unwrap_or_else(|| crate::ath11k::board::check_smbios().bdf_ext);
                 let variant = core::str::from_utf8(&variant)
                     .map_err(|_| super::firmware::Error::Unsupported)?;
                 let address = match device.addr {
@@ -1253,6 +1260,7 @@ async fn boot_task(
                     variant,
                     &image,
                     Some(address),
+                    &sources,
                 )
                 .await?;
                 files.seal()?;
