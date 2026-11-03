@@ -89,6 +89,11 @@ Probe takeover and `intel_gpu::relight_display` share generation dispatch:
 Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Lunar Lake
 and Panther Lake refuse programming with `ModesetError::UnsupportedGeneration`.
 This dispatch does not enable Xe-LPG power management, which remains gated.
+The Xe-LPG modeset reports Pipe A's DMC dark after its crtc disable and lit
+before its port PLL (`XeLpgModeset::with_pipe_dmc` substitutes the sink), and
+`intel_gpu_modeset_xelpg::owned_panel_mode()` returns the mode whose owned
+display-14 resource profile the last successful modeset established (`None`
+once Pipe A goes dark or on an inherited layout).
 `Generation::external_display_supported` admits only Gen12: external
 DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
 that gate before register access. This necessary generation gate does not
@@ -100,25 +105,38 @@ separate display-14 external contract follows.
 ### Meteor/Arrow Lake external DP SST, Type-C and hotplug
 
 `intel_gpu_xelpg_external` owns at most one external DisplayPort SST route on
-pipe/transcoder A for `Generation::MeteorLake`:
+the lowest free Pipe B–D and its same-index transcoder for
+`Generation::MeteorLake`, next to the lit internal panel (Pipe A is never
+driven by it):
 `probe_sink(io, generation, port, legacy_port)` returns an `MtlSinkProbe`
 that holds the Type-C connection and the AUX power request, plus the sink's
 `max_downspread` and the `ssc` decision (`intel_gpu_vbt::dp_ssc_enabled`: the
 policy's `use_ssc` and DP_MAX_DOWNSPREAD_0_5; the service applies its policy).
 `intel_gpu_xelpg::dp_pll_request(port, rate, lanes, dp_alt, protocol_switch,
 ssc)` zeroes the C10 SSC bytes and clears `SSC_ENABLE_PLLB` without SSC.
-`activate(io, probe, fb)` returns a Live `MtlExternalRoute`, or
+`activate(io, probe, fb, &MtlDisplay)` returns a Live `MtlExternalRoute`, or
 `ActivateError::Refused` (the probe comes back with nothing programmed) or
 `ActivateError::Failed` (the route comes back Stopped or Quarantined).
+`MtlDisplay { panel, pipe_dmc }` is what the activation shares the display
+with: the owned panel mode (`intel_gpu_modeset_xelpg::owned_panel_mode`, the
+only lit Pipe A the route adopts) and the `intel_gpu_dc_states::PipeDmc` sink
+for the pipe's DMC lifetime (`MtlDisplay::production(panel)` uses
+`ServicePipeDmc`; `MtlDisplay::NONE` reports nowhere). The route reserves its
+pipe through the Pipe B–D owner (live resource transaction with the panel lit,
+PM demand at the route's port clock) and releases it on stop;
+`MtlExternalRoute::pipe()`/`reserved()` report it.
 `MtlExternalRoute::stop`/`release`/`link_ok` and `MtlExternalService::handle`
-complete the lifecycle. `service_mtl_external(io, generation, alloc)` polls
-the process-wide hotplug owner once and returns a `ServiceOutcome`
-(Activated with the mode/framebuffer to publish, Refused, Withdrawn, Retained
-or Unchanged). `teardown_mtl_external` runs from the KMS suspend and GT-reset
-retirement paths. Other generations, DDI A, TBT-alt sinks, Type-C pin
-assignment D, over-budget streams, a lit pipe A and an active DDI refuse with
-typed `ExternalError`s before any affected register write. A stop that cannot
-be observed quarantines the route and keeps its Type-C/AUX/framebuffer leases.
+complete the lifecycle. `service_mtl_external(io, generation, display, alloc)`
+polls the process-wide hotplug owner once and returns a `ServiceOutcome`
+(Activated with the pipe, mode and framebuffer to publish, Refused, Withdrawn,
+Retained or Unchanged). `teardown_mtl_external` runs from the KMS suspend and
+GT-reset retirement paths. Other generations, DDI A, TBT-alt sinks, Type-C pin
+assignment D, over-budget streams, an active DDI (`PortBusy`), no free
+Pipe B–D (`NoFreePipe`), a lit Pipe A that is not the owned panel profile
+(`PipeBusy`) and the Pipe B–D owner's admission (`Pipe(PipeRefusal)`) refuse
+with typed `ExternalError`s before any register write. A stop that cannot be
+observed, or a release that cannot repartition, quarantines the route and
+keeps its Type-C/AUX/framebuffer leases and its pipe reservation.
 
 `intel_gpu_xelpg_hpd` publishes `ConnectorStatus` per owned pin (DDI B and
 TC1-TC4) and `MtlHpdEvent`s (Connected(mode), Disconnected, ShortPulse,
@@ -130,13 +148,18 @@ source Type-C connect/disconnect and the display-14 AUX power well
 each control word. The Gen12 `IntelAux::new` encoding is unchanged.
 `intel_gpu::poll_dp_hpd_events` and the runtime actor's `service_external_sst`
 run the MTL hotplug pass on Meteor Lake only; an activated route is published
-with a session serial and withdrawn by exactly that serial, and
-`external_routes_stopped` counts it. Every hardware-touching entry runs in one
-DC-off bracket, and `route_live()` is the DC-entry refusal predicate.
+with a session serial and its pipe (`intel_gpu::active_external_pipe`) and
+withdrawn by exactly that serial, and `external_routes_stopped` counts it.
+`routes_stopped()`/`route_live()` read the `RoutePresence` the service
+publishes when each pass ends (no lock, no transient "not stopped" while a
+pass merely holds the service); `external_route_blocks_dc()` reads the
+service itself and refuses DC5/DC6 while it is contended or its route is live
+or quarantined. Every hardware-touching entry runs in one DC-off bracket.
 
 `intel_gpu_xelpg_hdmi` provides HDMI TMDS (`hdmi_pll_request`,
 `probe_hdmi(io, generation, port, legacy_port, ddc)`, `release_hdmi_probe`,
-`read_edid_ddc`, `activate_hdmi`, `MtlHdmiRoute::stop/release`) for DDI B and
+`read_edid_ddc`, `activate_hdmi(io, probe, fb, &MtlDisplay)`,
+`MtlHdmiRoute::stop/release/pipe`) on Pipes B–D like the DP route, for DDI B and
 declared legacy Type-C ports on the policy's DDC pin (`MtlHdmiProbe::ddc`;
 `None` refuses `DdcUnavailable`), from the source tables up to 594 MHz, with an
 AVI infoframe. `parse_sink_scdc` and `tmds_link` give the HF-VSDB/HF-SCDB sink
@@ -2773,7 +2796,11 @@ transforms.
 - `pipe_lit`, `pipe_dark` and `enable_lit_pipes` tie pipe DMC enables to pipe
   lifetimes. The service hooks `pipe_lit_for_bar` / `pipe_dark_for_bar`
   (public, inert without a display-14 service) are for every owner that
-  lights or darkens a pipe.
+  lights or darkens a pipe. Owners report through the `PipeDmc` trait
+  (`enable_pipe` first in a crtc enable, `disable_pipe` last in a crtc
+  disable); `ServicePipeDmc` calls the hooks with the service's BAR and
+  `NoPipeDmc` reports nowhere. The MTL modeset reports Pipe A and the Pipe
+  B–D owner each external pipe.
 - `begin_load`, `finish_load`, `release_held` and the
   `suspend_begin`/`commit`/`abort` methods manage the DMC lifecycle.
 
@@ -8505,23 +8532,31 @@ retain cursor refusal.
 Runtime capture rechecks exact resources, fixed timing and every other pipe,
 including an active blank pipe, before using this ownership proof.
 
-**Intel display14 Pipe B-D owner (crate-internal).** `intel_gpu_xelpg_pipes::Pipes`
-is the entry the external-output (port/PHY) owner uses to light Pipes B-D on
-display14.00 next to the unchanged fixed Pipe-A path. `adopt_panel` proves the
-owned Pipe-A resource image and whether it is lit. `reserve(ExternalPipe)`
-(pipe, mode, 4 KiB-aligned linear XRGB8888 GGTT surface, stride, highest port
-clock, combo PHY or Type-C) computes and commits DBUF/DDB/WM/CDCLK/PM demand
-while lit pipes stay lit. `program_timings` writes transcoder timings and
-source size with the pipe off. The caller then owns port clock, PHY,
-`TRANS_DDI_FUNC_CTL`, `DP_TP_CTL`, M/N and link training. `enable` sets
-`TRANSCONF` with its STATE acknowledgement and arms the primary plane, proved
-by a fresh frame and `PLANE_SURFLIVE`. `disable` turns the plane and
-transcoder off. After the caller stops its port, `release` repartitions
-without the pipe. Pipe A, scaled/tiled/other-format primaries, changed lit
-pipes, an unknown firmware CDCLK, live FBC/DSB, foreign lit pipes and
-unorderable DDB moves are typed refusals before any write; later failures
-undo executed steps in reverse. While another pipe is lit, the fixed Pipe-A
-KMS services keep refusing their single-pipe resource proof.
+**Intel display14 Pipe B-D owner.** `intel_gpu_xelpg_pipes::Pipes`
+(crate-visible; its production caller is the MTL external DP/HDMI route,
+whose public contract is above) lights Pipes B-D on display14.00 next to the
+unchanged fixed Pipe-A path. `adopt_panel` proves the owned Pipe-A resource
+image (with the primary's current tiling) and whether it is lit; `adopt(None,
+0)` starts from every pipe off. `admit(ExternalPipe)` makes every refusal of
+`reserve` with reads only. `reserve(ExternalPipe, &dyn PipeDmc)` (pipe, mode,
+4 KiB-aligned linear XRGB8888 GGTT surface, stride, the port clock the route
+runs at, combo PHY or Type-C) computes and commits DBUF/DDB/WM/CDCLK/PM demand
+while lit pipes stay lit, then reports `intel_dmc_enable_pipe`.
+`program_timings` writes source size, transcoder timings, the per-pipe RGB
+bypass and the no-DPT plane chicken with the pipe off. The caller owns port
+clock, PHY, `TRANS_CLK_SEL`, `TRANS_DDI_FUNC_CTL`, `DP_TP_CTL`, M/N, infoframes
+and link training. `enable` sets `TRANSCONF` with its STATE acknowledgement;
+`arm_primary` writes the noarm plane registers and then `PLANE_CTL` +
+`PLANE_SURF` inside vblank evasion with local interrupts masked, proved by a
+fresh frame and `PLANE_SURFLIVE`. `disable_primary` and `disable` turn the
+plane and transcoder off. After the caller stops its port, `release(pipe,
+&dyn PipeDmc)` reports `intel_dmc_disable_pipe` and repartitions without the
+pipe (the last pipe forgets the state instead). Pipe A, scaled/tiled/
+other-format primaries, changed lit pipes, an unknown firmware CDCLK, live
+FBC/DSB, foreign lit pipes and unorderable DDB moves are typed refusals
+before any write; later failures undo executed steps in reverse. While
+another pipe is lit, the fixed Pipe-A KMS services keep refusing their
+single-pipe resource proof.
 
 One retained private WC32 KiB BO supplies two cursor slots through an exclusive
 GGTT lease. After exposure its BO/address are never rebound; ambiguous drop
