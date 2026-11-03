@@ -273,3 +273,114 @@ kernel_test_in!(
     "drivers/wireless/ath9k/calibration",
     smoke_ath9k_ar9287_ht40_adc_dc_offset_correction
 );
+
+/// `ath_ani_calibrate` / `ar9002_hw_calibrate` on the self-completing model:
+/// the first short calibration consumes the init NF into the history, the
+/// long calibration reloads and restarts NF, and the 20 min
+/// `ath9k_hw_reset_calvalid` restart re-runs the IQ per-calibration once no
+/// NF calibration is in flight.
+fn smoke_ath9k_ar9287_periodic_nf_history_and_iq_restart() -> TestResult {
+    let mut io = Model::new();
+    let mut cal = Calibration::default();
+    let Ok(report) = run(&mut cal, &mut io, &image(3), 3) else {
+        return TestResult::Fail("two-chain AR9287 calibration refused");
+    };
+    let map = image(3);
+    let mut p = Periodic::new(&report, 0);
+    let before = io.writes.len();
+    if p.tick(&mut io, &map, 500) != Ok(Tick::default()) || io.writes.len() != before {
+        return TestResult::Fail("periodic calibration ran before its interval");
+    }
+    match p.tick(&mut io, &map, 1000) {
+        Ok(t) if t.shortcal && !t.longcal && t.noise_floor == Some(-97) && t.iq.is_none() => {}
+        _ => return TestResult::Fail("first short calibration did not read the init NF"),
+    }
+    if !p.caldone()
+        || p.private_nf() != [-97, -120]
+        || io.raw(0x9864) & 0x1ff != 0x19c
+        || io.raw(0xa864) & 0x1ff != 0x19c
+    {
+        return TestResult::Fail("NF history/load or -50 maxCCA restore differs");
+    }
+    let before = io.writes.len();
+    if p.tick(&mut io, &map, 2000) != Ok(Tick::default()) || io.writes.len() != before {
+        return TestResult::Fail("short calibration ran after caldone");
+    }
+    match p.tick(&mut io, &map, 30_000) {
+        Ok(t) if t.longcal && t.temp_delta.is_none() => {}
+        _ => return TestResult::Fail("long calibration not run at 30 s"),
+    }
+    if io.raw(0x9860) & 0x2_8002 != 0x2_8002 {
+        return TestResult::Fail("ath9k_hw_start_nfcal(false) not issued on long calibration");
+    }
+    // 20 min after the last short calibration: CalValid is cleared; the NF
+    // calibration in flight defers the IQ restart.
+    if p.tick(&mut io, &map, 1_201_000).is_err() || p.caldone() || p.iq_state() != CalState::Waiting
+    {
+        return TestResult::Fail("ath9k_hw_reset_calvalid restart differs");
+    }
+    if p.tick(&mut io, &map, 1_202_000).is_err() || p.iq_state() != CalState::Waiting {
+        return TestResult::Fail("IQ restarted while NF calibration was running");
+    }
+    if p.tick(&mut io, &map, 1_203_000).is_err()
+        || p.iq_state() != CalState::Running
+        || io.raw(0x99f0) != 0
+    {
+        return TestResult::Fail("IQ per-calibration not set up");
+    }
+    if p.tick(&mut io, &map, 1_204_000).is_err() || p.iq_state() != CalState::Running {
+        return TestResult::Fail("IQ collected while DO_CAL was set");
+    }
+    match p.tick(&mut io, &map, 1_205_000) {
+        Ok(t) if t.iq == Some([Some((29, 15)), Some((61, 3))]) => {}
+        _ => return TestResult::Fail("periodic IQ coefficients differ"),
+    }
+    if !p.caldone() || p.iq_state() != CalState::Done || io.raw(0x9920) & 0x800 == 0 {
+        return TestResult::Fail("IQ per-calibration did not complete");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/calibration",
+    smoke_ath9k_ar9287_periodic_nf_history_and_iq_restart
+);
+
+/// Hardware whose NF engine never completes once started.
+struct Stuck(Model);
+impl RegisterIo for Stuck {
+    fn read32(&mut self, register: u64) -> u32 {
+        if register == 0x9860 {
+            return self.0.raw(register);
+        }
+        self.0.read32(register)
+    }
+    fn write32(&mut self, register: u64, value: u32) {
+        self.0.write32(register, value);
+    }
+    fn delay_us(&mut self, us: u64) {
+        self.0.now += us;
+    }
+}
+
+/// A 22.2 ms `ath9k_hw_loadnf` timeout is Linux's `-ETIMEDOUT`, which
+/// `ath_ani_calibrate` answers with `ath9k_queue_reset`; `caldone` drops.
+fn smoke_ath9k_ar9287_periodic_nf_load_timeout_requests_reset() -> TestResult {
+    let mut io = Model::new();
+    let mut cal = Calibration::default();
+    let Ok(report) = run(&mut cal, &mut io, &image(3), 3) else {
+        return TestResult::Fail("two-chain AR9287 calibration refused");
+    };
+    let mut stuck = Stuck(io);
+    let mut p = Periodic::new(&report, 0);
+    if p.tick(&mut stuck, &image(3), 1000) != Err(BringUpError::Timeout) || p.caldone() {
+        return TestResult::Fail("stuck NF load did not request a reset");
+    }
+    if stuck.0.raw(0x9864) & 0x1ff == 0x19c {
+        return TestResult::Fail("-50 maxCCA written while the NF load was pending");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/calibration",
+    smoke_ath9k_ar9287_periodic_nf_load_timeout_requests_reset
+);

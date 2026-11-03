@@ -1408,12 +1408,34 @@ Bring-up (scheduled retries on `Policy`): `calibration::ar9287` runs under
 `Permission::with_ceiling(Grant::ceiling(host))` with the record and the
 host permission re-checked on every poll; then `Native::new_ar9287` →
 `mac::prepare_chip` → optional MSI → `Packet::prepare` → `station::Radio`
-(noise seed: chain-0 sanitized NF) → `interface::publish`. Periodic:
-every `ATH_LONG_CALINTERVAL` (30 s, `link.c::ath_ani_calibrate`) the
-supervisor runs the `ar9002_hw_calibrate(longcal)` AR9287 step,
-`ar9287_hw_olc_temp_compensation`, through `Station::long_calibration` →
-`Packet::long_calibration` (no transmission in flight) → `Native` under
-`access` (PCI, physical readback, permission, record). PA offset
+(noise seed: chain-0 sanitized NF) → `interface::publish`. Periodic
+calibration: `calibration::ar9287::Periodic`, retained per generation in
+`Calibrated::Ar9287`, implements `link.c::ath_ani_calibrate` without ANI
+and `ar9002_calib.c::ar9002_hw_calibrate` for the 20 MHz owner. The
+supervisor ticks it every 500 ms through `Station::long_calibration` →
+`Packet::long_calibration` (no transmission in flight; Busy retries next
+tick) → `Native` under `access` (PCI, physical readback, permission,
+record). Timers start at composition (`ath_start_ani`); the NF history is
+initialized at the AR9287 nominal (`ath9k_init_nfcal_hist_buffer`, no
+`nf_2g.cal` on AR9002) with the init NF calibration still pending its
+`ath9k_hw_getnf`, and the init IQ calibration counts as `CalValid`. While
+not `caldone`, short calibrations run every `ATH_STA_SHORT_CALINTERVAL`
+(1 s): `ar9002_hw_per_calibration` for `iq_cal_single_sample` (setup with
+`PER_MAX_LOG_COUNT`/`CALMODE_IQ`/`DO_CAL`, one collected sample,
+`ar9002_hw_iqcalibrate` per chain — a chain with zero denominators keeps
+its coefficients — and chain-0 `IQCORR_ENABLE`; `AR9002_CAL_MAX_TIME`
+timeout clears `DO_CAL` and waits), never while `AGC_CONTROL_NF` is set.
+Every `ATH_RESTART_CALINTERVAL` (20 min) `ath9k_hw_reset_calvalid` clears
+`CalValid` and restarts it. Every `ATH_LONG_CALINTERVAL` (30 s, with
+`LONGCAL_PENDING` respin) or with `NFCAL_PENDING`: `ath9k_hw_getnf`
+(`do_getnf`, `nf_sanitize` with the -127/-112/-97 AR9287 limits, the
+five-entry history with `invalidNFcount`, median `privNF`, `limit->max`
+clamp), `ath9k_hw_loadnf` (privNF per receiving chain, 22.2 ms load wait,
+-50 maxCCA restore) and on long calibration `ath9k_hw_start_nfcal(false)`
+plus `ar9287_hw_olc_temp_compensation`. A NF load timeout (Linux
+`-ETIMEDOUT` → `ath9k_queue_reset(RESET_TYPE_CALIBRATION)`) or any other
+calibration failure fails the station, so the supervisor's generation
+reset follows. ANI (`ath9k_hw_ani_monitor`) is not run. PA offset
 calibration is AR9285/AR9271-only on Linux and ADC DC is an HT40
 per-calibration, so neither runs on this 20 MHz owner. Remove (under
 `CONTROL`) retires the station, proves DMA stopped and only then releases
@@ -1426,11 +1448,12 @@ flight), retires the station and FULL_SLEEPs the chip; `pm_resume`
 (`pci.c::ath_pci_resume`) re-disables PCI RETRY_TIMEOUT (config 0x41) and
 spawns the same reset, which republishes a fresh generation. Smokes (written, not
 executed): `smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo`,
+`smoke_ath9k_ar9287_periodic_nf_history_and_iq_restart`,
+`smoke_ath9k_ar9287_periodic_nf_load_timeout_requests_reset`,
 `smoke_ath9k_ar9287_native_profile_binds_admission_and_chains`.
 
-Known AR9287 gaps: periodic NF/IQ
-per-calibration is not run (only the long-calibration temperature
-compensation); HT20/HT40 TX power and every HT owner are out of scope as for
+Known AR9287 gaps: ANI is not run; the probe requires the channel-1
+record as the initial primary; HT20/HT40 TX power and every HT owner are out of scope as for
 the AR9285 legacy base; closed-loop maps stay refused. No physical AR9287
 receipt exists.
 

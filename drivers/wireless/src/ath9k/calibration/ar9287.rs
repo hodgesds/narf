@@ -339,5 +339,366 @@ pub(in crate::ath9k) fn olc_temp_compensation(
     Ok(Some(delta))
 }
 
+/// `ath9k.h` `ATH_STA_SHORT_CALINTERVAL`, `ATH_LONG_CALINTERVAL` and
+/// `ATH_RESTART_CALINTERVAL` (ms); `ar9002_calib.c::AR9002_CAL_MAX_TIME`.
+const SHORT_MS: u64 = 1000;
+const LONG_MS: u64 = 30_000;
+const RESTART_MS: u64 = 1_200_000;
+const CAL_MAX_MS: u64 = 30_000;
+/// `calib.h` `ATH9K_NF_CAL_HIST_MAX` / `AR_PHY_CCA_FILTERWINDOW_LENGTH`.
+const HIST: usize = 5;
+const FILTER_WINDOW: u8 = 5;
+/// `AR_PHY_AGC_CONTROL` and its `NF`, `ENABLE_NF`, `NO_UPDATE_NF` bits.
+const AGC: u64 = 0x9860;
+const AGC_NF: u32 = 0x2;
+const AGC_ENABLE_NF: u32 = 0x8000;
+const AGC_NO_UPDATE_NF: u32 = 0x20000;
+/// `AR_PHY_TIMING_CTRL4(0)` `DO_CAL`.
+const DO_CAL: u32 = 0x10000;
+
+/// `ath9k_cal_list::calState` of the single AR9287 20 MHz per-calibration
+/// (`iq_cal_single_sample`; ADC DC is HT40-only, ADC gain unsupported).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath9k) enum CalState {
+    Waiting,
+    Running,
+    Done,
+}
+
+/// One `ath_ani_calibrate` outcome.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::ath9k) struct Tick {
+    pub longcal: bool,
+    pub shortcal: bool,
+    /// `chan->noisefloor` after a completed `ath9k_hw_getnf`.
+    pub noise_floor: Option<i16>,
+    /// New per-chain IQ coefficients written by `ar9002_hw_iqcalibrate`.
+    pub iq: Option<[Option<(u8, i8)>; 2]>,
+    /// `ar9287_hw_olc_temp_compensation` delta on a long calibration.
+    pub temp_delta: Option<i32>,
+}
+
+/// Periodic calibration state of one AR9287 generation: the `ath_common`
+/// ANI timers and `caldone`, the `ath9k_hw_cal_data` NF history,
+/// `CalValid` and `NFCAL_PENDING`/`LONGCAL_PENDING` flags, and the IQ
+/// per-calibration list entry. ANI itself is not part of this owner.
+#[derive(Clone, Debug)]
+pub(in crate::ath9k) struct Periodic {
+    rx_chainmask: u8,
+    init_pdadc: u8,
+    hist: [[i16; HIST]; 2],
+    index: [usize; 2],
+    priv_nf: [i16; 2],
+    invalid: [u8; 2],
+    nfcal_pending: bool,
+    longcal_pending: bool,
+    iq: CalState,
+    iq_valid: bool,
+    iq_start_ms: u64,
+    caldone: bool,
+    longcal_ms: u64,
+    shortcal_ms: u64,
+    resetcal_ms: u64,
+}
+impl Periodic {
+    /// State after `calibration::ar9287::Calibration::run` at `now_ms`
+    /// (`ath_start_ani` timers): `ath9k_init_nfcal_hist_buffer` at the
+    /// nominal NF (AR9287 has no `nf_2g.cal`), the init NF calibration
+    /// still pending its `ath9k_hw_getnf`, and the IQ calibration that run
+    /// completed (`CalValid`).
+    pub(in crate::ath9k) fn new(report: &Report, now_ms: u64) -> Self {
+        Self {
+            rx_chainmask: report.rx_chainmask,
+            init_pdadc: report.init_pdadc,
+            hist: [[NF_NOMINAL; HIST]; 2],
+            index: [0; 2],
+            priv_nf: [NF_NOMINAL; 2],
+            invalid: [FILTER_WINDOW; 2],
+            nfcal_pending: true,
+            longcal_pending: false,
+            iq: CalState::Done,
+            iq_valid: true,
+            iq_start_ms: now_ms,
+            caldone: false,
+            longcal_ms: now_ms,
+            shortcal_ms: now_ms,
+            resetcal_ms: 0,
+        }
+    }
+    pub(in crate::ath9k) fn caldone(&self) -> bool {
+        self.caldone
+    }
+    pub(in crate::ath9k) fn iq_state(&self) -> CalState {
+        self.iq
+    }
+    pub(in crate::ath9k) fn private_nf(&self) -> [i16; 2] {
+        self.priv_nf
+    }
+
+    /// `link.c::ath_ani_calibrate` without ANI: long calibration every 30 s,
+    /// short calibrations every second while not `caldone`, and the 20 min
+    /// `ath9k_hw_reset_calvalid` restart. An `Err` is Linux's
+    /// `ath9k_queue_reset(RESET_TYPE_CALIBRATION)`: the caller must close
+    /// this generation.
+    pub(in crate::ath9k) fn tick(
+        &mut self,
+        io: &mut impl RegisterIo,
+        image: &[u8],
+        now_ms: u64,
+    ) -> Result<Tick, BringUpError> {
+        let mut tick = Tick::default();
+        if now_ms.wrapping_sub(self.longcal_ms) >= LONG_MS {
+            tick.longcal = true;
+            self.longcal_ms = now_ms;
+        }
+        if !self.caldone {
+            if now_ms.wrapping_sub(self.shortcal_ms) >= SHORT_MS {
+                tick.shortcal = true;
+                self.shortcal_ms = now_ms;
+                self.resetcal_ms = now_ms;
+            }
+        } else if now_ms.wrapping_sub(self.resetcal_ms) >= RESTART_MS {
+            self.caldone = self.reset_calvalid();
+            if self.caldone {
+                self.resetcal_ms = now_ms;
+            }
+        }
+        if tick.longcal || tick.shortcal {
+            match self.calibrate(io, image, tick.longcal, now_ms, &mut tick) {
+                Ok(done) => self.caldone = done,
+                Err(error) => {
+                    self.caldone = false;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(tick)
+    }
+
+    /// `calib.c::ath9k_hw_reset_calvalid` for the one-entry list.
+    fn reset_calvalid(&mut self) -> bool {
+        if self.iq != CalState::Done {
+            return true;
+        }
+        self.iq_valid = false;
+        self.iq = CalState::Waiting;
+        false
+    }
+
+    /// `ar9002_calib.c::ar9002_hw_calibrate` (20 MHz, no PA calibration on
+    /// AR9287); returns `!percal_pending`.
+    fn calibrate(
+        &mut self,
+        io: &mut impl RegisterIo,
+        image: &[u8],
+        mut longcal: bool,
+        now_ms: u64,
+        tick: &mut Tick,
+    ) -> Result<bool, BringUpError> {
+        let nfcal = read(io, AGC)? & AGC_NF != 0;
+        let nfcal_pending = self.nfcal_pending;
+        if longcal {
+            self.longcal_pending = true;
+        } else if self.longcal_pending {
+            longcal = true;
+        }
+        let mut percal_pending = matches!(self.iq, CalState::Running | CalState::Waiting);
+        if percal_pending && !nfcal {
+            if !self.per_calibration(io, now_ms, tick)? {
+                return Ok(false);
+            }
+            // The single-entry list has no other waiting calibration.
+            percal_pending = self.iq == CalState::Waiting;
+        }
+        if percal_pending && !nfcal && !longcal {
+            self.reset_calibration(io, now_ms)?;
+            return Ok(false);
+        }
+        if longcal || nfcal_pending {
+            if self.getnf(io, tick)? {
+                self.loadnf(io)?;
+            }
+            if longcal {
+                self.longcal_pending = false;
+                self.start_nfcal(io)?;
+                tick.temp_delta = olc_temp_compensation(io, image, self.init_pdadc)?;
+            }
+        }
+        Ok(!percal_pending)
+    }
+
+    /// `ar9002_hw_per_calibration` for `iq_cal_single_sample`.
+    fn per_calibration(
+        &mut self,
+        io: &mut impl RegisterIo,
+        now_ms: u64,
+        tick: &mut Tick,
+    ) -> Result<bool, BringUpError> {
+        match self.iq {
+            CalState::Running => {
+                if read(io, 0x9920)? & DO_CAL == 0 {
+                    // MIN_CAL_SAMPLES (1): collect, then post-process.
+                    tick.iq = Some(self.iqcalibrate(io)?);
+                    self.iq_valid = true;
+                    self.iq = CalState::Done;
+                    Ok(true)
+                } else if now_ms.wrapping_sub(self.iq_start_ms) > CAL_MAX_MS {
+                    modify(io, 0x9920, DO_CAL, 0)?;
+                    self.iq = CalState::Waiting;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            _ if !self.iq_valid => {
+                self.reset_calibration(io, now_ms)?;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// `ath9k_hw_reset_calibration` → `ar9002_hw_setup_calibration`
+    /// (`PER_MAX_LOG_COUNT`, `AR_PHY_CALMODE_IQ`, `DO_CAL`).
+    fn reset_calibration(
+        &mut self,
+        io: &mut impl RegisterIo,
+        now_ms: u64,
+    ) -> Result<(), BringUpError> {
+        field(io, 0x9920, 0xf000, 12, 10)?;
+        write(io, 0x99f0, 0)?;
+        modify(io, 0x9920, 0, DO_CAL)?;
+        self.iq_start_ms = now_ms;
+        self.iq = CalState::Running;
+        Ok(())
+    }
+
+    /// `ar9002_hw_iqcal_collect` (one sample) and `ar9002_hw_iqcalibrate`
+    /// over `numChains`: a chain whose denominators are zero keeps its
+    /// coefficients, then chain 0 `IQCORR_ENABLE` is set.
+    fn iqcalibrate(
+        &mut self,
+        io: &mut impl RegisterIo,
+    ) -> Result<[Option<(u8, i8)>; 2], BringUpError> {
+        let chains = self.rx_chainmask.count_ones() as usize;
+        let mut out = [None; 2];
+        for (chain, slot) in out.iter_mut().enumerate().take(chains) {
+            let at = chain as u64 * CHAIN;
+            let i = measurement_for(io, 0x9c10 + at, VERSION)?;
+            let q = measurement_for(io, 0x9c14 + at, VERSION)?;
+            let correlation = measurement_for(io, 0x9c18 + at, VERSION)?;
+            *slot = iq_coefficients(i, q, correlation).ok();
+        }
+        for (chain, coefficients) in out.iter().enumerate() {
+            let Some((i, q)) = coefficients else { continue };
+            let at = 0x9920 + chain as u64 * CHAIN;
+            field(io, at, 0x7e0, 5, u32::from(*i))?;
+            field(io, at, 0x1f, 0, *q as u32)?;
+        }
+        modify(io, 0x9920, 0, 0x800)?;
+        Ok(out)
+    }
+
+    /// `calib.c::ath9k_hw_getnf`: `ar9002_hw_do_getnf` for the receiving
+    /// control chains, `ath9k_hw_nf_sanitize`, and
+    /// `ath9k_hw_update_nfcal_hist_buffer`.
+    fn getnf(&mut self, io: &mut impl RegisterIo, tick: &mut Tick) -> Result<bool, BringUpError> {
+        if read(io, AGC)? & AGC_NF != 0 {
+            return Ok(false);
+        }
+        let mut nf = [0i16; 2];
+        for (chain, value) in nf.iter_mut().enumerate() {
+            if chain == 1 && self.rx_chainmask & 2 == 0 {
+                break;
+            }
+            let raw = ((read(io, NF_REGS[chain])? >> 20) & 0x1ff) as i16;
+            let raw = (raw << 7) >> 7;
+            *value = if raw == 0 {
+                0
+            } else if raw > NF_MAX {
+                NF_MAX
+            } else if raw < NF_MIN {
+                NF_NOMINAL
+            } else {
+                raw
+            };
+        }
+        self.nfcal_pending = false;
+        for (chain, &value) in nf.iter().enumerate() {
+            if self.rx_chainmask & (1 << chain) == 0 {
+                continue;
+            }
+            self.hist[chain][self.index[chain]] = value;
+            self.index[chain] = (self.index[chain] + 1) % HIST;
+            if self.invalid[chain] > 0 {
+                self.invalid[chain] -= 1;
+                self.priv_nf[chain] = value;
+            } else {
+                // ath9k_hw_get_nf_hist_mid: reverse sort, element 2.
+                let mut sorted = self.hist[chain];
+                sorted.sort_unstable_by(|a, b| b.cmp(a));
+                self.priv_nf[chain] = sorted[(HIST - 1) >> 1];
+            }
+            // NFCAL_INTF is never set (no beacon-stuck path on a station).
+            if self.priv_nf[chain] != 0 && self.priv_nf[chain] > NF_MAX {
+                self.priv_nf[chain] = NF_MAX;
+            }
+        }
+        tick.noise_floor = Some(self.priv_nf[0]);
+        Ok(true)
+    }
+
+    /// `calib.c::ath9k_hw_loadnf` with the history `privNF` per receiving
+    /// control chain; a 22.2 ms load timeout is `-ETIMEDOUT`.
+    fn loadnf(&mut self, io: &mut impl RegisterIo) -> Result<(), BringUpError> {
+        let agc = read(io, AGC)?;
+        for (chain, register) in NF_REGS.iter().enumerate() {
+            if self.rx_chainmask & (1 << chain) != 0 {
+                modify(io, *register, 0x1ff, nf_field(self.priv_nf[chain]))?;
+            }
+        }
+        if agc & AGC_NF != 0 {
+            modify(io, AGC, AGC_NF, 0)?;
+        }
+        modify(io, AGC, AGC_ENABLE_NF, 0)?;
+        modify(io, AGC, AGC_NO_UPDATE_NF, 0)?;
+        modify(io, AGC, 0, AGC_NF)?;
+        let mut loaded = false;
+        for _ in 0..22_200 {
+            if read(io, AGC)? & AGC_NF == 0 {
+                loaded = true;
+                break;
+            }
+            io.delay_us(10);
+        }
+        if agc & AGC_NF != 0 {
+            if agc & AGC_ENABLE_NF != 0 {
+                modify(io, AGC, 0, AGC_ENABLE_NF)?;
+            }
+            if agc & AGC_NO_UPDATE_NF != 0 {
+                modify(io, AGC, 0, AGC_NO_UPDATE_NF)?;
+            }
+            modify(io, AGC, 0, AGC_NF)?;
+        }
+        if !loaded {
+            return Err(BringUpError::Timeout);
+        }
+        for (chain, register) in NF_REGS.iter().enumerate() {
+            if self.rx_chainmask & (1 << chain) != 0 {
+                modify(io, *register, 0x1ff, nf_field(-50))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `calib.c::ath9k_hw_start_nfcal(ah, false)`.
+    fn start_nfcal(&mut self, io: &mut impl RegisterIo) -> Result<(), BringUpError> {
+        self.nfcal_pending = true;
+        modify(io, AGC, 0, AGC_ENABLE_NF)?;
+        modify(io, AGC, 0, AGC_NO_UPDATE_NF)?;
+        modify(io, AGC, 0, AGC_NF)
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

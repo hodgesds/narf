@@ -32,6 +32,9 @@ pub(super) enum Calibrated {
         profile: super::mac::Profile,
         /// Retained factory map for temperature compensation.
         image: alloc::boxed::Box<[u8]>,
+        /// `ath_ani_calibrate` NF/IQ/long-calibration state of this
+        /// generation. A regular mutex: the NF load may poll for 22.2 ms.
+        periodic: narf_lib::mutex::Mutex<super::calibration::ar9287::Periodic>,
     },
 }
 /// Raw BAR access for the AR9287 long calibration, only inside `access`.
@@ -289,6 +292,10 @@ impl Native {
                 grant,
                 profile,
                 image: image.into(),
+                periodic: narf_lib::mutex::Mutex::new(super::calibration::ar9287::Periodic::new(
+                    &report,
+                    narf_time::monotonic_ns() / 1_000_000,
+                )),
             },
             channel_mask,
             Some(InstalledPower::Twenty(powers)),
@@ -682,25 +689,29 @@ impl Port for Native {
         }
     }
     fn long_calibration(&self) -> Result<Option<i32>, Error> {
-        let Calibrated::Ar9287 { report, image, .. } = &self.calibrated else {
+        let Calibrated::Ar9287 {
+            image, periodic, ..
+        } = &self.calibrated
+        else {
             return Err(Error::State);
         };
+        let mut periodic = periodic.try_lock().ok_or(Error::Busy)?;
         // Physical readback, current regulatory permission and the signed
-        // record are re-proved by access() before the compensation runs.
+        // record are re-proved by access() before any calibration write.
         self.access(self.active.load(Ordering::Acquire), || {
             let mut io = LongCal {
                 native: self,
                 lost: false,
             };
-            let delta = super::calibration::ar9287::olc_temp_compensation(
-                &mut io,
-                image,
-                report.init_pdadc,
-            );
+            let tick = periodic.tick(&mut io, image, narf_time::monotonic_ns() / 1_000_000);
             if io.lost {
                 return Err(Error::Access);
             }
-            delta.map_err(|_| Error::Descriptor)
+            match tick {
+                Ok(tick) => Ok(tick.temp_delta),
+                Err(super::identity::BringUpError::Timeout) => Err(Error::Timeout),
+                Err(_) => Err(Error::Descriptor),
+            }
         })
     }
     fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {

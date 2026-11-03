@@ -34,9 +34,9 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 /// The initial primary the signed record and calibration bind (channel 1).
 const PRIMARY: u16 = 2412;
-/// `ath9k.h::ATH_LONG_CALINTERVAL` (30 s) of `link.c::ath_ani_calibrate`.
-const LONG_CAL_NS: u64 = 30_000_000_000;
-/// Terminal-generation poll interval, the AR9285 supervisor's.
+/// Terminal-generation and calibration-timer poll interval (the AR9285
+/// supervisor's); `calibration::ar9287::Periodic` owns the Linux
+/// `ath_ani_calibrate` intervals.
 const SUPERVISE_NS: u64 = 500_000_000;
 /// (PCI device, unique bus-match name). `hw.h::AR9287_DEVID_PCI` and
 /// `AR9287_DEVID_PCIE`.
@@ -429,18 +429,18 @@ async fn reset(
     initialize(owner).await
 }
 
-/// Rejoin supervisor and `link.c::ath_ani_calibrate` long-calibration
-/// cadence. A terminal station generation (disassociation, link loss, fatal
+/// Rejoin supervisor and `link.c::ath_ani_calibrate` cadence. A terminal station generation (disassociation, link loss, fatal
 /// interrupt or failed DMA) is followed by a cold generation reset into a
 /// fresh passive station, exactly as the AR9285 supervisor does; a pinned
-/// or removed owner is never followed. Every `ATH_LONG_CALINTERVAL` the live
-/// station runs `ar9002_hw_calibrate(longcal)`'s AR9287 step,
+/// or removed owner is never followed. Every tick the live station runs the
+/// due `ar9002_hw_calibrate` steps: short IQ per-calibrations while not
+/// `caldone`, the 20 min `ath9k_hw_reset_calvalid` restart, and every
+/// `ATH_LONG_CALINTERVAL` the NF history/load/restart plus
 /// `ar9287_hw_olc_temp_compensation` (PA offset calibration is
 /// AR9285/AR9271 only; ADC DC is an HT40 per-calibration and this owner is
-/// 20 MHz).
+/// 20 MHz). A failed calibration closes the generation, which is then reset.
 async fn supervise(owner: Shared) {
     let mut failures = 0u32;
-    let mut long_due = narf_time::monotonic_ns().saturating_add(LONG_CAL_NS);
     loop {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(SUPERVISE_NS)).await;
         let station = {
@@ -463,19 +463,18 @@ async fn supervise(owner: Shared) {
             if radio.terminal() {
                 true
             } else {
-                let now = narf_time::monotonic_ns();
-                if now >= long_due {
-                    match radio.long_calibration() {
-                        Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
-                        Err(error) => {
-                            let _ = writeln!(
-                                narf_console::Writer,
-                                "ath9k: AR9287 long calibration closed: {:?}",
-                                error
-                            );
-                        }
+                // The native periodic owner decides which of the long,
+                // short and restart calibrations are due at this tick.
+                match radio.long_calibration() {
+                    Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
+                    Err(error) => {
+                        // The generation is now closed; the next tick resets.
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "ath9k: AR9287 periodic calibration closed: {:?}",
+                            error
+                        );
                     }
-                    long_due = now.saturating_add(LONG_CAL_NS);
                 }
                 false
             }
@@ -487,7 +486,6 @@ async fn supervise(owner: Shared) {
         match reset(&owner, None, None).await {
             Ok(_) => {
                 failures = 0;
-                long_due = narf_time::monotonic_ns().saturating_add(LONG_CAL_NS);
                 let generation = owner.lock().await.generation;
                 let _ = writeln!(
                     narf_console::Writer,
