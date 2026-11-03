@@ -1976,6 +1976,30 @@ Still open: the external route does not yet hold its own DC_off reference
 the Pipe B-D resource owner. HDMI above 340 MHz, Thunderbolt-alt and DP
 UHBR/MST remain. None of this has run on physical Intel hardware.
 
+### Display-14 FBC and the external-route DC join — release gates recorded
+
+Meteor Lake and Arrow Lake now run frame buffer compression on a KMS-owned
+Pipe-A framebuffer. The compressed buffer is placed in stolen memory (DSM)
+following Linux's MTL layout. The placement avoids the WOPCM, the BIOS GSC
+region and every page the boot framebuffer can reach through the aperture, and
+it refuses any page the kernel page allocator could own. Compression stops at
+the start of every KMS session and before console reclaim, suspend and GPU
+reset recovery.
+
+The MTL external outputs are now joined to the DC-state service. Every
+external hardware pass holds a display power reference, and a live or stuck
+route keeps the display out of DC5/DC6 between passes. Integration fixed one
+fixture whose test arithmetic was wrong (the stolen-memory RAM-page check) and
+added a fixture that drives the real external bracket with the DC state
+machine.
+
+All eight release groups pass 2,019 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. The first eligible flip scans the GGTT aperture once,
+about 10^5 register reads; that one-time cost runs on the present path. None of
+this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

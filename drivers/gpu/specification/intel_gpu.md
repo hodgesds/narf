@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.41** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.42** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -34,8 +34,8 @@
 > MTL/Arrow standalone media GT lifecycle owner, display-14 DMC,
 > DC_off and lit-panel DC5/DC6 services, and display14 resource
 > transactions with live repartitioning and SAGV, and MTL external
-> DP/HDMI outputs with Type-C ownership and owned hotplug pass release
-> native model gates — see §20).
+> DP/HDMI outputs with Type-C ownership, owned hotplug and DC_off join,
+> and display-14 FBC pass release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3422,7 +3422,7 @@ that state:
 | PSR enable / KMS inhibit / dirty notify | Enable runs at probe before the service exists, in firmware DC0. Inhibit runs inside a `Guard` takeover or recovery. Notify holds a reference. |
 | PWM backlight | Unreachable: `backlight_supported()` is Gen12-only. |
 | Full-AUX backlight | Fixed in this slice: reference per AUX transaction, availability probe, PPS gate access and relight step. The earlier "owner installed" re-entry gate is removed. |
-| HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. External admission is Gen12-only, and the bridge takes `legacy()`. Display-14 external routes and HPD (integrated from the outputs lane) take one `DcUser::External` reference per hardware pass (their `with_dc_off` bracket) and register a liveness predicate with `register_external_live`, which refuses re-entry while a route is live or quarantined. |
+| HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. Gen12 external admission and the bridge take `legacy()`. Joined: every MTL external hardware pass (HPD poll, event handling with Type-C connect/disconnect, probe, activate, stop, and the suspend/GT-reset teardown) runs in `intel_gpu_xelpg_external::with_dc_off`, which takes one `DcUser::External` reference before its first register access and runs nothing if DC states cannot be exited. Probe registers `external_route_blocks_dc` with `register_external_live`, so a live or quarantined route, or a pass in progress, refuses re-entry between passes. |
 | Frame-counter, scanline and pipe-status reads | Under `Guard`, the modeset reference or the format-refresh reference. |
 | Format discovery (GETPLANE, IN_FORMATS) | `publish_console_formats` runs under Init at install, under `LegacyGuard` on console replacement, and under the publication-refresh reference. |
 | debugfs / sysfs readers | No debugfs. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
@@ -3508,6 +3508,16 @@ skips. The only skip is the existing shared RNG-registration skip. Group 6 now
 also selects `drivers/gpu/intel_gpu_dc_states`. The release production boot and
 both btrfs postflights pass. The debug group pass is deferred to the end of the
 current integration wave.
+
+The FBC and external-DC follow-up passes all eight release groups (2,019 unique
+tests) together with the external-route join. Group 6 now also selects
+`drivers/gpu/intel_gpu_stolen` and `drivers/gpu/intel_gpu_fbc`. Integration
+corrected `smoke_stolen_cfb_avoids_boot_fb_wopcm_and_gsc`: first fit places
+its 2 MiB request in the free 4..6 MiB gap, so the system-RAM probe page now
+sits inside that gap. The one-time GGTT aperture scan that excludes
+boot-framebuffer pages runs in the first eligible `present()`, under the KMS
+session mutex and a DC_off reference. It is not under an IRQ-safe lock, but
+it is about 10^5 MMIO reads for a 256 MiB aperture in one executor poll.
 
 ### Display14 resource transactions — release gates recorded
 
@@ -3743,11 +3753,17 @@ eighth group selects `drivers/gpu/intel_gpu_xelpg_tc`,
 `drivers/gpu/intel_gpu_xelpg_hdmi`. The debug group pass is deferred to the
 end of the current integration wave.
 
-Open until the DC-state join lands: the DC-off bracket still runs its closure
-directly. The probe drain and the runtime pass enter through `legacy()` and
-`legacy_drain()`, which hold a KMS DC_off reference, and the DC service
-refuses re-entry while `external_routes_stopped` reports the MTL route. The
-suspend and GT-reset retirement (`retire_mtl_external`) runs without a
-reference. On Gen12, `routes_stopped()` can report a transient "not stopped"
-when two callers contend for the service's `try_lock`. The Gen12 hook paths
-otherwise return before any register access.
+DC-state join (integrator): `with_dc_off` now holds one `DcUser::External`
+reference for each hardware pass and returns `ExternalError::DisplayPower`,
+running nothing, when DC states cannot be exited. The hotplug poll then
+reports no event, an event pass reports `Refused`, and teardown reports the
+route retained. Probe registers `external_route_blocks_dc` (a live or
+quarantined route, or a pass in progress) as the DC service's liveness
+predicate. A native fixture drives the real bracket and service passes over
+the route model with the display-14 DC state machine on the same registers.
+It checks that DC exit precedes the first pass write, that a live or
+quarantined route refuses DC6, that DC6 re-enters 17 ms after a verified
+stop, and that a failed exit touches no route register. On Gen12,
+`routes_stopped()` can still report a transient "not stopped" when two callers
+contend for the service's `try_lock`. The Gen12 hook paths otherwise return
+before any register access.
