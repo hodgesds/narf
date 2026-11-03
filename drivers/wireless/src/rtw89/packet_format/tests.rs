@@ -246,7 +246,7 @@ fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
     };
     // Fixed-rate (CCK1) authentication on CH8, with a TX report.
     let bytes = frame(100, true);
-    let Ok((header, queue)) = transmit_c(&bytes, OWN, 0, 5, 0x1234_5000, true, 0) else {
+    let Ok((header, queue)) = transmit_c(&bytes, OWN, 0, 5, 0x1234_5000, true, 0, None) else {
         return TestResult::Fail("C management TXWD refused");
     };
     let mut wp = [0u8; 8];
@@ -275,7 +275,7 @@ fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
         return TestResult::Fail("C v1 body/info/WP/address-info differs from Linux layout");
     }
     // OFDM6 fixed rate lands in body7 DATA_RATE.
-    let Ok((header, _)) = transmit_c(&bytes, OWN, 0, 5, 0x1234_5000, false, OFDM6) else {
+    let Ok((header, _)) = transmit_c(&bytes, OWN, 0, 5, 0x1234_5000, false, OFDM6, None) else {
         return TestResult::Fail("C OFDM6 management TXWD refused");
     };
     if word(&header, 28) != (1 << 31 | u32::from(OFDM6) << 16) || word(&header, 44) != 0 {
@@ -283,8 +283,16 @@ fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
     }
     // Firmware-RA non-QoS data on ACH0: no body7 rate, lowest rate in info1.
     let data = frame(2304, false);
-    let Ok((header, queue)) = transmit_c(&data, OWN, 0, 7, 0xf_1234_5000, false, FIRMWARE_RA | 4)
-    else {
+    let Ok((header, queue)) = transmit_c(
+        &data,
+        OWN,
+        0,
+        7,
+        0xf_1234_5000,
+        false,
+        FIRMWARE_RA | 4,
+        None,
+    ) else {
         return TestResult::Fail("C firmware-RA data TXWD refused");
     };
     if queue != Queue::Data
@@ -305,7 +313,8 @@ fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
     let mut qos = frame(100, false);
     qos[0] = 0x88;
     qos[24..26].fill(0);
-    let Ok((header, queue)) = transmit_c(&qos, OWN, 0, 1, 0x1000, false, FIRMWARE_RA | 4) else {
+    let Ok((header, queue)) = transmit_c(&qos, OWN, 0, 1, 0x1000, false, FIRMWARE_RA | 4, None)
+    else {
         return TestResult::Fail("C WMM QoS TID0 TXWD refused");
     };
     if queue != Queue::Data
@@ -317,11 +326,41 @@ fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
     {
         return TestResult::Fail("C QoS TXWD differs from rtw89_core_fill_txdesc_v1");
     }
-    // A-MSDU QoS, extended range and descriptor bounds.
+    // Originator A-MPDU (signed C Ampdu program): body3 AGG_EN, info1
+    // MAX_AGGNUM, info2 AMPDU_DENSITY at the v0 positions
+    // (`rtw89_build_txwd_body3`/`_info1`/`_info2_v1`), plus info0_v1 DATA_ER.
+    let agg = Some(Agg {
+        num: 63,
+        density: 5,
+    });
+    let Ok((header, _)) = transmit_c(
+        &qos,
+        OWN,
+        0,
+        1,
+        0x1000,
+        false,
+        FIRMWARE_RA | DATA_ER | 4,
+        agg,
+    ) else {
+        return TestResult::Fail("C A-MPDU QoS TXWD refused");
+    };
+    if word(&header, 12) & 1 << 12 == 0
+        || word(&header, 32) != 1 << 15
+        || word(&header, 36) != (4 << 16 | 63)
+        || word(&header, 40) != 5 << 18
+        || word(&header, 28) != 0
+    {
+        return TestResult::Fail("C A-MPDU/ER TXWD differs from rtw89_core_fill_txdesc_v1");
+    }
+    // A-MSDU QoS, fixed-rate aggregation/ER, non-QoS aggregation and
+    // descriptor bounds.
     let mut amsdu = qos.clone();
     amsdu[24] = 0x80;
-    if transmit_c(&amsdu, OWN, 0, 1, 0x1000, false, FIRMWARE_RA).is_ok()
-        || transmit_c(&data, OWN, 0, 1, 0x1000, false, FIRMWARE_RA | DATA_ER).is_ok()
+    if transmit_c(&amsdu, OWN, 0, 1, 0x1000, false, FIRMWARE_RA, None).is_ok()
+        || transmit_c(&qos, OWN, 0, 1, 0x1000, false, 4, agg).is_ok()
+        || transmit_c(&data, OWN, 0, 1, 0x1000, false, DATA_ER, None).is_ok()
+        || transmit_c(&data, OWN, 0, 1, 0x1000, false, FIRMWARE_RA, agg).is_ok()
         || descriptor_len(0xf_1234_5000, 70) != Ok([70, 0, 0xc0, 0x43, 0, 0x50, 0x34, 0x12])
         || descriptor_len(0x1000, C_HEADER_MAX + 1).is_ok()
         || descriptor(0xf_1234_5000) != descriptor_len(0xf_1234_5000, HEADER)

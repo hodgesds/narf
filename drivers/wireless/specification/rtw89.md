@@ -3492,9 +3492,9 @@ and no DFS/NO_IR rule over the span), and station retune/CSA go through
 
 Known gaps for the `rtl8852c` row: native execution on hardware (no C
 board record exists, so actual admission needs a provisioned board);
-HT/VHT/HE, A-MPDU/BA (C `bacam_num` 8 dynamic BA CAM),
-LPS, WoW, monitor and AP are not implemented for C (WMM, all-AC QoS and
-firmware RA: see below) (C track work covers
+VHT, widths above 20MHz, A-MSDU,
+LPS, WoW, monitor and AP are not implemented for C (WMM, all-AC QoS,
+firmware RA, HT20/HE20 and A-MPDU/BA: see below) (C track work covers
 DIG/CFO/EDCCA/IFS-CLM, not `rtw8852c_rfk_track`). The C station uses 20MHz only (wide C profiles are reachable
 only through `retune_channel_c`, not from the station). Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
@@ -3563,7 +3563,7 @@ v0 positions; no aggregation). EDCA (`H2C_FUNC_USR_EDCA`) and the RA H2C
 (`rtw89_fw_h2c_ra`, `chip_gen` AX) are the same AX formats as B. An
 unprovisioned board, or a C record without the bits, keeps the legacy
 station. Unexecuted case:
-`smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra`
+`smoke_rtw8852c_base_record_programs_follow_b_program_layout`
 (plus the extended `smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info`
 and `smoke_rtw89_native_rejects_unsupported_extents`).
 
@@ -3583,8 +3583,36 @@ strict-priority drain and `admit_all_tids` are the B code: core.c
 `rtw89_core_get_qsel`/`rtw89_core_get_ch_dma` are not chip-specific for AX.
 An unprovisioned board or a record without bit 3 keeps BE/TID0. B bytes are
 unchanged. Unexecuted cases:
-`smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra`,
+`smoke_rtw8852c_base_record_programs_follow_b_program_layout`,
 `smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs`.
+
+**C HT20/HE20 and originator A-MPDU (`Program::{Ht,He,Ampdu}` on C).**
+`radio_policy_c::PROGRAMS` now admits every B `Program` bit in B's fixed
+order (WMM, all-AC QoS, firmware RA, HT, HE, A-MPDU; same dependencies),
+each extended with a C recipe over the B `ht`/`he`/`ampdu` fingerprints.
+`Native::station_{ht,he,ampdu}_allowed` on C read `c_program`; A-MSDU
+(a separate B `N52A` companion, not a `Program` bit) stays `Ok(false)`
+and `Core::enable_amsdu` refuses C. The C station path is the B code:
+local HT20/HE20 capability (core.c `rtw89_init_ht_cap`/`rtw89_init_he_cap`
+are chip-independent apart from 160MHz bits and `no_ng16`, both cleared by
+the 20MHz/no-beamformee restriction; C is TX-A1/RX-AB like B), the AX RA
+H2C (`rtw89_fw_h2c_ra`), BA recipient through the C `RTW89_BACAM_V0_EXT`
+CAM (above), ADDBA originator and `R_AX_AMPDU_AGG_LIMIT` 0xc610
+(`rtw89_phy_ra_recalc_agg_limit`, AX `mac_def`; `h2c_ampdu_cmac_tbl` is
+NULL in `rtw8852c_chip_ops`), and RX over `Descriptor::parse_v1`. On TX,
+`Core::enable_aggregation` and `submit_inner` admit C aggregates (C
+fragments stay refused), `tx_transport::prepare_header` admits the HE
++HTC QoS form on C, and `packet_format::transmit_c` takes `agg` and
+`DATA_ER`: `rtw89_core_fill_txdesc_v1` keeps body3 `AGG_EN`/`BK`, info1
+`MAX_AGGNUM`/`A_CTRL_BSR`/`DATA_RTY_LOWEST_RATE` and info2 `AMPDU_DENSITY`
+(`rtw89_build_txwd_info2_v1`) at the v0 positions and info0_v1 carries
+`DATA_ER`. Widths stay 20MHz: the C station does not widen (HT40/VHT80 on
+C waits for the shared B wide-channel station path and the `N5CC` 40/80
+profiles; no C VHT program exists). B bytes are unchanged. Unexecuted
+cases: `smoke_rtw8852c_base_record_programs_follow_b_program_layout`,
+`smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info` (A-MPDU/ER),
+`smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs`,
+`smoke_rtw89_native_rejects_unsupported_extents` (C +HTC).
 
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s
@@ -3596,7 +3624,7 @@ eight `H2C_FUNC_MAC_BA_CAM` (class 0xc, function 0, DONE_ACK) bodies
 with core.c `rtw89_core_acquire_sta_ba_entry`'s TID0/5 replacement, and
 `codec::ba_cam_v0_ext` (no W0 ENTRY_IDX; W1 ENTRY_IDX_V1, STD_EN, BAND =
 `mac_idx` 0; an invalidation carries only MACID and W1 ENTRY_IDX_V1). The
-recipient path is reached only under the (not yet admitted) C HT program.
+recipient path is reached under the signed C HT program (above).
 B bytes are unchanged. Unexecuted case:
 `smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c`.
 

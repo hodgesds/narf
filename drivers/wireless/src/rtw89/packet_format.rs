@@ -353,11 +353,15 @@ struct Tx<'a> {
 }
 /// RTL8852C ordinary station TXWD (core.c `rtw89_core_fill_txdesc_v1`,
 /// pci.c `rtw89_pci_fill_txaddr_info_v1`): management, non-QoS and (under
-/// the signed C WMM program) QoS data at a fixed rate or firmware RA, no
-/// aggregation, A-MSDU, +HTC or fragments. With `sec_en` false the v1
-/// body2 `TID_INDICATE`, info1 and info2 fields sit where v0 has them.
+/// the signed C programs) QoS data at a fixed rate or firmware RA, with HE
+/// +HTC, `DATA_ER` and originator A-MPDU; no A-MSDU or fragments. With
+/// `sec_en` false the v1 body2 `TID_INDICATE`, body3 `AGG_EN`/`BK`, info0
+/// `DATA_ER` (`rtw89_build_txwd_info0_v1`), info1 `MAX_AGGNUM`/`A_CTRL_BSR`/
+/// `DATA_RTY_LOWEST_RATE` and info2 `AMPDU_DENSITY`
+/// (`rtw89_build_txwd_info2_v1`) sit where v0 has them.
 /// The v1 body carries `ADDR_INFO_NUM`, moves USE_RATE/DATA_RATE into body
 /// dword7 and has no HW SSN fields (management keeps the host SW_SEQ).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn transmit_c(
     frame: &[u8],
     own: [u8; 6],
@@ -366,8 +370,9 @@ pub(super) fn transmit_c(
     address: u64,
     report: bool,
     rate: u8,
+    agg: Option<Agg>,
 ) -> Result<(Vec<u8>, Queue), Error> {
-    if rate & DATA_ER != 0 || amsdu(frame) {
+    if amsdu(frame) {
         return Err(Error::Frame);
     }
     transmit_profile_inner(Tx {
@@ -379,7 +384,7 @@ pub(super) fn transmit_c(
         address,
         report,
         rate,
-        agg: None,
+        agg,
         limit: None,
         fragments: false,
     })
@@ -420,7 +425,7 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
     extent(address, frame.len())?;
     let c = match chip {
         ChipId::Rtl8852B => false,
-        ChipId::Rtl8852C if !fragments && agg.is_none() && limit.is_none() => true,
+        ChipId::Rtl8852C if !fragments && limit.is_none() => true,
         _ => return Err(Error::Metadata),
     };
     let prepare = if fragments {

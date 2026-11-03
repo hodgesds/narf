@@ -413,7 +413,8 @@ fn prepare_header_profile(
     ) || !fragments && fc & 0x0400 != 0
         || fragments
             && (fc & 0x0400 == 0 && frame[22] & 15 == 0 || fc & 0x0400 != 0 && frame[22] & 15 == 15)
-        || fc & 0x8000 != 0 && (chip != ChipId::Rtl8852B || fc & 0xfc != 0x88)
+        || fc & 0x8000 != 0
+            && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) || fc & 0xfc != 0x88)
         || fc & 0x0300 == 0x0300
         || !fragments && frame[22] & 0xf != 0
     {

@@ -426,7 +426,10 @@ impl Core {
     /// signed aggregate program (`Program::Ampdu`, which requires HT20)
     /// enables this, before `start`.
     pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Prepared || self.rx < RxPhy::Ht || self.chip != ChipId::Rtl8852B {
+        if self.phase != Phase::Prepared
+            || self.rx < RxPhy::Ht
+            || !matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
+        {
             return Err(Error::State);
         }
         self.aggregate = true;
@@ -469,6 +472,8 @@ impl Core {
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
             || !self.aggregate
+            // No C A-MSDU path (`transmit_c` refuses A-MSDU subframes).
+            || self.chip == ChipId::Rtl8852C
             || limit == 0
             || limit > super::tx_amsdu::MAX_BODY
         {
@@ -559,9 +564,7 @@ impl Core {
         if self.phase != Phase::Running || self.ap {
             return Err(Error::State);
         }
-        if agg.is_some() && !self.aggregate
-            || self.chip == ChipId::Rtl8852C && (fragment.is_some() || agg.is_some())
-        {
+        if agg.is_some() && !self.aggregate || self.chip == ChipId::Rtl8852C && fragment.is_some() {
             return Err(Error::Packet);
         }
         // HE extended-range SU TX belongs to the signed HE program only.
@@ -645,6 +648,7 @@ impl Core {
                         packet.body.dma_addr().raw(),
                         radio_report,
                         rate,
+                        agg,
                     )?
                 } else if fragment.is_some() {
                     format::transmit_fragment(

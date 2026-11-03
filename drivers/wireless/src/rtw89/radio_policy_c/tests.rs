@@ -259,7 +259,7 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans
 );
-fn smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra() -> TestResult {
+fn smoke_rtw8852c_base_record_programs_follow_b_program_layout() -> TestResult {
     let exact = board(Profile::INITIAL, 7);
     let cap = authority();
     let flags = Program::FirmwareRa.flags();
@@ -282,7 +282,8 @@ fn smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra() -> Test
     {
         return TestResult::Fail("C program allowances differ from the signed flags");
     }
-    // Programs without a C path, unknown bits or unmet dependencies.
+    // Every B program bit (HT20/HE20/A-MPDU included); unknown bits and
+    // unmet dependencies stay refused.
     for flags in [
         Program::Ht.flags(),
         Program::QosAll.flags(),
@@ -295,7 +296,13 @@ fn smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra() -> Test
         bad[57] = flags;
         bad[16..48].copy_from_slice(&exact.with_programs(flags).identity);
         let accepted = Qualification::from_verified(&bad, Some([3; 32]), exact, cap).is_ok();
-        if accepted != (flags == Program::Wmm.flags() || flags == Program::QosAll.flags()) {
+        let admitted = [
+            Program::Wmm.flags(),
+            Program::QosAll.flags(),
+            Program::Ht.flags(),
+            Program::Ampdu.flags(),
+        ];
+        if accepted != admitted.contains(&flags) {
             return TestResult::Fail("C program flag admission differs");
         }
     }
@@ -313,7 +320,23 @@ fn smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra() -> Test
         }
         Err(_) => return TestResult::Fail("signed C WMM + all-AC QoS + RA record refused"),
     }
-    if exact.with_programs(all).identity == exact.with_programs(flags).identity {
+    // The full HE20 + A-MPDU set extends the identity once per program.
+    let full = Program::Ampdu.flags() | Program::He.bit() | Program::QosAll.bit();
+    let mut he = base_image(exact);
+    he[57] = full;
+    he[16..48].copy_from_slice(&exact.with_programs(full).identity);
+    match Qualification::from_verified(&he, Some([3; 32]), exact, cap) {
+        Ok(mut q) => {
+            q.model_domain = base(cap).model_domain;
+            if q.allows(Program::He) != Ok(true) || q.allows(Program::Ampdu) != Ok(true) {
+                return TestResult::Fail("signed C HE20/A-MPDU programs not allowed");
+            }
+        }
+        Err(_) => return TestResult::Fail("signed C full program record refused"),
+    }
+    if exact.with_programs(full).identity == exact.with_programs(full & !Program::He.bit()).identity
+        || exact.with_programs(all).identity == exact.with_programs(flags).identity
+    {
         return TestResult::Fail("all-AC QoS did not extend the C identity");
     }
     let plain = base(cap);
@@ -328,5 +351,5 @@ fn smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra() -> Test
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw8852c_base_record_programs_are_wmm_qos_all_and_firmware_ra
+    smoke_rtw8852c_base_record_programs_follow_b_program_layout
 );

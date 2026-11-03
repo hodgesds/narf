@@ -35,7 +35,14 @@ const BASE_FLAGS: u8 = 3;
 /// Optional operating programs a C base record may enable (byte 57, the
 /// B `radio_policy::Program` bit layout and dependencies). Only programs
 /// whose whole C path exists are admitted; the others stay refused.
-pub(super) const PROGRAMS: [Program; 3] = [Program::Wmm, Program::QosAll, Program::FirmwareRa];
+pub(super) const PROGRAMS: [Program; 6] = [
+    Program::Wmm,
+    Program::QosAll,
+    Program::FirmwareRa,
+    Program::Ht,
+    Program::He,
+    Program::Ampdu,
+];
 fn programs_valid(flags: u8) -> bool {
     let known = PROGRAMS.iter().fold(BASE_FLAGS, |m, p| m | p.bit());
     Program::valid(flags) && flags & !known == 0
@@ -67,8 +74,25 @@ fn extend(program: Program, identity: [u8; 32]) -> [u8; 32] {
             hash.update(&identity);
             hash.update(&super::station_control::firmware_ra_fingerprint());
         }
-        // Not admitted by `programs_valid`; never part of a C identity.
-        _ => hash.update(b"NARF RTL8852C unadmitted program"),
+        Program::Ht => {
+            hash.update(
+                b"NARF RTL8852C HT20 optional operating recipe v1;rx_desc_v1;bacam_v0_ext8",
+            );
+            hash.update(&identity);
+            hash.update(&super::station_control::ht_fingerprint());
+        }
+        Program::He => {
+            hash.update(
+                b"NARF RTL8852C HE20 optional operating recipe v1;txwd_info0_v1 DATA_ER;rx_desc_v1",
+            );
+            hash.update(&identity);
+            hash.update(&super::station_control::he_fingerprint());
+        }
+        Program::Ampdu => {
+            hash.update(b"NARF RTL8852C originator BA TX A-MPDU optional operating recipe v1;txwd_body3/info1/info2 v1 agg;h2c_ampdu_cmac_tbl NULL on 8852C");
+            hash.update(&identity);
+            hash.update(&super::station_control::ampdu_fingerprint());
+        }
     }
     hash.finalize()
 }

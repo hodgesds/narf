@@ -1102,8 +1102,9 @@ fn smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs() -> TestR
     let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
         return TestResult::Fail("C ordinary rings refused");
     };
-    if core.enable_aggregation().is_ok() || core.enable_amsdu(1).is_ok() {
-        return TestResult::Fail("C admitted an A-MPDU or A-MSDU program");
+    // Signed C A-MPDU on HT RX; A-MSDU has no C path.
+    if core.enable_aggregation().is_err() || core.enable_amsdu(1).is_ok() {
+        return TestResult::Fail("C A-MPDU refused or A-MSDU admitted");
     }
     // Signed C all-AC QoS: ACH1..3 at the `_V1` DESA (0x1238/0x1240/0x1248)
     // with the shared NUM registers (0x1026/0x1028/0x102a).
