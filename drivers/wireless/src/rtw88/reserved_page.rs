@@ -246,6 +246,28 @@ pub(super) unsafe trait Registers: Send {
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
         Err(Error::Unsupported)
     }
+    fn station_channel(&self) -> (u8, u64) {
+        (1, 1)
+    }
+    fn station_channel_grant(
+        &mut self,
+        _: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_retune_begin(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_retune_iqk(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_retune_finish(&mut self, _: u8) -> Result<u64, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_tx_ba(
         &mut self,
         _: alloc::sync::Arc<super::tx_ba_power::Grant>,
@@ -540,6 +562,28 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
         self.io.station_gate()
+    }
+    fn station_channel(&self) -> (u8, u64) {
+        self.io.station_channel()
+    }
+    fn station_channel_grant(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.io.station_channel_grant(channel)
+    }
+    fn station_retune_begin(
+        &mut self,
+        channel: u8,
+        grant: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<bool, Error> {
+        self.io.station_retune_begin(channel, grant)
+    }
+    fn station_retune_iqk(&mut self) -> Result<(), Error> {
+        self.io.station_retune_iqk()
+    }
+    fn station_retune_finish(&mut self, channel: u8) -> Result<u64, Error> {
+        self.io.station_retune_finish(channel)
     }
     fn station_bind_tx_ba(
         &mut self,

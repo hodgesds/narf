@@ -63,6 +63,13 @@ pub(super) struct Native {
     mailbox_pending: bool,
     tracking_maintenance: bool,
     tracking_sequence: u16,
+    /// Target primary while a native retune owns the radio. New TX
+    /// publication is refused and hardware TX stays paused until finish;
+    /// cancellation leaves it set (fail closed, non-Ready).
+    retune: Option<u8>,
+    /// Committed operating primary and completed retune programs.
+    channel: u8,
+    channel_epoch: u64,
 }
 impl core::fmt::Debug for Native {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -167,6 +174,9 @@ impl Native {
             mailbox_pending: false,
             tracking_maintenance: false,
             tracking_sequence: 3,
+            retune: None,
+            channel: 1,
+            channel_epoch: 1,
         };
         owner
             .tx
@@ -670,10 +680,16 @@ unsafe impl Registers for Native {
         result
     }
     fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
-        let mission = self.state == State::Packets && self.tracking_maintenance;
+        let retune = self.state == State::Packets && self.retune.is_some();
+        let mission = self.state == State::Packets && self.tracking_maintenance || retune;
+        let expected = if retune {
+            self.retune_iqk_packet()
+        } else {
+            super::command::iqk8821c_associated(self.tracking_sequence)
+        };
         if (self.state != State::Commands && !mission)
             || self.command_ring.pending()
-            || mission && *packet != super::command::iqk8821c_associated(self.tracking_sequence)
+            || mission && *packet != expected
         {
             return Err(Error::State);
         }
@@ -734,7 +750,8 @@ unsafe impl Registers for Native {
     }
     fn poll_h2c(&mut self) -> Result<bool, Error> {
         if (self.state != State::Commands
-            && !(self.state == State::Packets && self.tracking_maintenance))
+            && !(self.state == State::Packets
+                && (self.tracking_maintenance || self.retune.is_some())))
             || !self.command_ring.pending()
         {
             return Err(Error::State);
@@ -1153,6 +1170,100 @@ unsafe impl Registers for Native {
         self.station_allowed()?;
         self.packet_gate.clone().ok_or(Error::State)
     }
+    fn station_channel(&self) -> (u8, u64) {
+        (self.channel, self.channel_epoch)
+    }
+    fn station_channel_grant(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.station_allowed()?;
+        let kind = super::channel_policy::kind(channel).ok_or(Error::Unsupported)?;
+        let base = self
+            .packet_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .without_channel();
+        // Unprovisioned or unadmitted records leave the channel unavailable.
+        Ok(super::qualification::Source::Registered
+            .load(kind, &base)
+            .ok()
+            .filter(|g| base.with_channel(g.clone()).is_ok()))
+    }
+    fn station_retune_begin(
+        &mut self,
+        channel: u8,
+        grant: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<bool, Error> {
+        if self.state != State::Packets
+            || self.tracking_maintenance
+            || self.mailbox_pending
+            || self.command_ring.pending()
+            || self.retune.is_some_and(|c| c != channel)
+            || (channel == 1) != grant.is_none()
+        {
+            return Err(Error::State);
+        }
+        if self.retune.is_none() {
+            let current = self.packet_gate.as_ref().ok_or(Error::State)?;
+            if !current.base_only() {
+                return Err(Error::State);
+            }
+            let base = current.without_channel();
+            let target = match grant {
+                Some(g) => base.with_channel(g)?,
+                None => base,
+            };
+            if target.channel() != channel {
+                return Err(Error::State);
+            }
+            target.current().map_err(Error::Power)?;
+            // From here no new TX is published; every retune write runs under
+            // the target channel's gate (its regulatory span and the base).
+            self.retune = Some(channel);
+            self.packet_gate = Some(target);
+            self.with_packet(|core, _| {
+                core.set_operating_channel(channel);
+                Ok(())
+            })
+            .map_err(|_| Error::State)?;
+            // REG_TXPAUSE: hold every queue across the RF/BB rewrite.
+            self.write8(0x522, 0xff)?;
+        }
+        if self.read8(0x522)? != 0xff {
+            return Err(Error::Prerequisite);
+        }
+        self.retune_quiet()
+    }
+    fn station_retune_iqk(&mut self) -> Result<(), Error> {
+        if self.retune.is_none() {
+            return Err(Error::State);
+        }
+        let packet = self.retune_iqk_packet();
+        self.submit_h2c(&packet)
+    }
+    fn station_retune_finish(&mut self, channel: u8) -> Result<u64, Error> {
+        if self.retune != Some(channel)
+            || self.command_ring.pending()
+            || self.read8(0x522)? != 0xff
+            || !self.retune_quiet()?
+        {
+            return Err(Error::State);
+        }
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        if gate.channel() != channel {
+            return Err(Error::State);
+        }
+        gate.current().map_err(Error::Power)?;
+        self.write8(0x522, 0)?;
+        if self.read8(0x522)? != 0 {
+            return Err(Error::Prerequisite);
+        }
+        self.channel = channel;
+        self.channel_epoch = self.channel_epoch.checked_add(1).ok_or(Error::State)?;
+        self.retune = None;
+        Ok(self.channel_epoch)
+    }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
         self.station_allowed()?;
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
@@ -1332,7 +1443,7 @@ unsafe impl Registers for Native {
         super::ht::request(&base)
     }
     fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
-        if !self.mailbox_ready()? {
+        if self.retune.is_some() || !self.mailbox_ready()? {
             return Err(Error::State);
         }
         let cleanup = words == [1, 0, 0, 0, 0, 0, 0, 0];
@@ -1363,7 +1474,7 @@ unsafe impl Registers for Native {
         // Linux fw.c rtw_fw_send_h2c_command: HMETFR box free, then
         // HMEBOX_EXT (w1), then HMEBOX (w0). Firmware latches the command on
         // the low-word write only, so the extended staging alone is inert.
-        if self.state != State::Packets || !self.mailbox_ready()? {
+        if self.state != State::Packets || self.retune.is_some() || !self.mailbox_ready()? {
             return Err(Error::State);
         }
         self.check_packet_permission()?;
@@ -1573,6 +1684,52 @@ impl Native {
         }
         self.published = false;
         Ok(())
+    }
+    /// Linux pre-association IQK H2C for this chip during a retune:
+    /// `rtw8822c_do_iqk` clear=1, `rtw8821c_do_iqk` clear=0/segment=0.
+    fn retune_iqk_packet(&self) -> [u8; 32] {
+        if self.device.id.device == 0xc822 {
+            super::command::iqk(self.tracking_sequence)
+        } else {
+            super::command::iqk8821c(self.tracking_sequence)
+        }
+    }
+    /// Every TX ring and the packet core have retired and the MAC queues
+    /// report their reserved pages free (same receipts as tracking quiet).
+    fn retune_quiet(&mut self) -> Result<bool, Error> {
+        if !self
+            .with_packet(|core, port| {
+                core.maintenance_quiet(|r| super::packet_core::Port::index(port, r))
+            })
+            .map_err(|_| Error::State)?
+        {
+            return Ok(false);
+        }
+        for r in super::dma_stop::TX_INDEX {
+            let v = self.read32(r)?;
+            if v == u32::MAX {
+                return Err(Error::Gone);
+            }
+            if v & 0xfff != (v >> 16) & 0xfff {
+                return Ok(false);
+            }
+        }
+        if self.read16(0x10c)? != 0xc5a0 {
+            return Err(Error::Prerequisite);
+        }
+        for r in [0x230, 0x234, 0x238, 0x23c] {
+            let n = if r == 0x23c { 14 } else { 16 };
+            if self.read16(r)? != n {
+                return Err(Error::Prerequisite);
+            }
+            if self.read16(r + 2)? != n {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub(super) fn retune_active(&self) -> bool {
+        self.retune.is_some()
     }
     fn check_packet_permission(&mut self) -> Result<(), Error> {
         if let Some(g) = self

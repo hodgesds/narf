@@ -32,6 +32,10 @@ pub(super) struct Plan {
     pub probes: Vec<Vec<u8>>,
     /// Random scan SA for an active request (`rtw_core_scan_start`).
     pub address: Option<[u8; 6]>,
+    /// Requested 2.4GHz primaries in request order, deduplicated. Empty
+    /// means every admitted primary. Admission against the signed
+    /// per-channel records happens at the interface.
+    pub channels: Vec<u8>,
 }
 
 /// mac80211 `get_random_mask_addr`: random bits outside `mask`, `addr`
@@ -67,7 +71,7 @@ fn validate_ies(mut bytes: &[u8]) -> Result<(), WirelessError> {
     Ok(())
 }
 
-fn probe(own: [u8; 6], ssid: &[u8], extra: &[u8]) -> Result<Vec<u8>, WirelessError> {
+pub(super) fn probe(own: [u8; 6], ssid: &[u8], extra: &[u8]) -> Result<Vec<u8>, WirelessError> {
     let mut frame = Vec::new();
     frame
         .try_reserve_exact(OWN_LENGTH + extra.len())
@@ -88,8 +92,9 @@ fn probe(own: [u8; 6], ssid: &[u8], extra: &[u8]) -> Result<Vec<u8>, WirelessErr
     Ok(frame)
 }
 
-/// Admit one channel1 scan request. Passive requests keep the original
-/// receive-only behaviour; active requests add the software-scan probes.
+/// Admit one 2.4GHz/20MHz scan request (channels 1..=13; frequencies are
+/// authoritative). Passive requests keep the original receive-only
+/// behaviour; active requests add the software-scan probes.
 pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, WirelessError> {
     if request
         .random_mac
@@ -97,8 +102,11 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
         .is_some_and(|r| r.mask[0] & 1 == 0 || r.addr[0] & 1 != 0)
         || request.colocated_6ghz
         || !request.active && !request.extra_ies.is_empty()
-        || request.frequencies_mhz.iter().any(|f| *f != 2412)
-        || request.channels.iter().any(|ch| *ch != 1)
+        || request
+            .frequencies_mhz
+            .iter()
+            .any(|f| !(2412..=2472).contains(f) || (f - 2407) % 5 != 0)
+        || request.channels.iter().any(|ch| !(1..=13).contains(ch))
         || request.active && request.ssids.len() > usize::from(MAX_SSIDS)
         || request.ssids.len() > 32
         || request.ssids.iter().any(|s| s.len() > 32)
@@ -111,12 +119,27 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
         None if request.duration_mandatory => return Err(WirelessError::InvalidArgs),
         None => 200,
     };
+    let mut channels = Vec::new();
+    for channel in request
+        .frequencies_mhz
+        .iter()
+        .map(|f| ((f - 2407) / 5) as u8)
+        .chain(request.channels.iter().map(|c| *c as u8))
+    {
+        if !channels.contains(&channel) {
+            channels
+                .try_reserve(1)
+                .map_err(|_| WirelessError::HardwareError)?;
+            channels.push(channel);
+        }
+    }
     if !request.active {
         // A passive software scan transmits nothing; the address is unused.
         return Ok(Plan {
             dwell_ms,
             probes: Vec::new(),
             address: None,
+            channels,
         });
     }
     if own == [0; 6] || own[0] & 1 != 0 {
@@ -146,5 +169,6 @@ pub(super) fn plan(request: &ScanRequest, own: [u8; 6]) -> Result<Plan, Wireless
         dwell_ms,
         probes,
         address,
+        channels,
     })
 }

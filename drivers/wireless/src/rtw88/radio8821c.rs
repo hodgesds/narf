@@ -115,10 +115,10 @@ fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> 
     let old = read(io, reg)?;
     io.write32(reg, (old & !bits) | (value << bits.trailing_zeros()))
 }
-fn rf_read(io: &mut impl Io, address: u8) -> Result<u32, Error> {
+pub(super) fn rf_read(io: &mut impl Io, address: u8) -> Result<u32, Error> {
     Ok(read(io, 0x2800 + u16::from(address) * 4)? & 0xfffff)
 }
-async fn rf(io: &mut impl Io, address: u8, bits: u32, value: u32) -> Result<(), Error> {
+pub(super) async fn rf(io: &mut impl Io, address: u8, bits: u32, value: u32) -> Result<(), Error> {
     if bits == 0
         || bits & !0xfffff != 0
         || value
@@ -206,6 +206,62 @@ async fn channel(
     }
     verify_channel(io, swing, btg)?;
     Ok(swing)
+}
+/// Linux `rtw8821c_set_channel` retune between 2.4GHz/20MHz primaries on the
+/// retained non-SRRC C21: `_bb`, `rtw_set_channel_mac`, `_rxdfir` and
+/// `_bb_swing` are identical for channels 1..=13 (source `ch_param` CCK
+/// filters, swing and DFIR stay as programmed), so only `_rf` changes: RF
+/// LUTDBG/0x64, the RF18 channel byte and the XTALX2 bit19 toggle.
+pub(super) async fn retune_channel(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    if !(1..=13).contains(&ch) {
+        return Err(Error::Unsupported);
+    }
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | 0xc00 | u32::from(ch);
+    rf(io, 0xdf, 1 << 6, 1).await?;
+    rf(io, 0x64, 15, 15).await?;
+    rf(io, 0x18, 0xfffff, rf18).await?;
+    rf(io, 0xb8, 1 << 19, 0).await?;
+    rf(io, 0xb8, 1 << 19, 1).await
+}
+/// `rtw8821c_set_tx_power_index_by_rate` for the retained CCK/OFDM words;
+/// HT/VHT words stay zero (no HT program on a noninitial channel).
+pub(super) fn write_txagc(io: &mut impl Io, indices: [u8; 12]) -> Result<(), Error> {
+    for (slot, reg) in TXAGC.into_iter().enumerate() {
+        let value = if slot < 3 {
+            u32::from_le_bytes(
+                indices[slot * 4..slot * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
+        } else {
+            0
+        };
+        io.write32(reg, value)?;
+    }
+    Ok(())
+}
+pub(super) fn verify_retune(io: &mut impl Io, ch: u8, indices: [u8; 12]) -> Result<(), Error> {
+    if rf_read(io, 0x18)? & 0x70fff != 0xc00 | u32::from(ch) {
+        return Err(Error::Prerequisite);
+    }
+    for (slot, reg) in TXAGC.into_iter().enumerate() {
+        let expected = if slot < 3 {
+            u32::from_le_bytes(
+                indices[slot * 4..slot * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
+        } else {
+            0
+        };
+        if read(io, reg)? != expected {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x440)? != 0x1f || read(io, 0x1bf0)? & 0x100ff != 0 {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
     verify_geometry(io, swing, btg)?;

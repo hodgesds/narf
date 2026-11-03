@@ -122,6 +122,10 @@ impl Grant {
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         self.power.ht_facts()
     }
+    /// Factory CCK/OFDM index ceilings for one 2.4GHz channel group.
+    pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
+        self.power.group_limits(group)
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,

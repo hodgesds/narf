@@ -202,6 +202,15 @@ pub(super) fn trx(io: &mut impl Io) -> Result<(), Error> {
     toggle_igi(io)
 }
 pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
+    channel_to(io, 1).await
+}
+/// Linux `rtw8822c_set_channel` for one 2.4GHz/20MHz primary: `_bb`
+/// (SCOTRK/TXDFIR per channel, channel14 never admitted), `rtw_set_channel_mac`,
+/// `_rf` (RF18 channel byte) and `rtw8822c_toggle_igi`.
+pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    if !(1..=13).contains(&ch) {
+        return Err(Error::Unsupported);
+    }
     for (reg, bits, value) in [
         (0x1a14, 0x300, 0),
         (0x1a9c, 1 << 20, 1),
@@ -212,7 +221,7 @@ pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
         (0x41ac, 0xf000, 5),
         (0x18ac, 0x1f0, 6),
         (0x41ac, 0x1f0, 6),
-        (0xc30, 0xfff, 0x9aa),
+        (0xc30, 0xfff, super::channel_policy::scotrk(ch)),
         (0x1a20, 0xffff0000, 0x5284),
         (0x1a24, u32::MAX, 0x3e18fec8),
         (0x1a28, 0xffff, 0x0a88),
@@ -221,7 +230,7 @@ pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
         (0x1aa0, u32::MAX, 0x00faf0de),
         (0x1aac, u32::MAX, 0x00122344),
         (0x1ab0, u32::MAX, 0x0fffffff),
-        (0x808, 0x70, 1),
+        (0x808, 0x70, super::channel_policy::txdfir(ch)),
         (0x810, 0x3ff0, 0x19b),
         (0x9b0, 15, 0),
         (0x9b0, 0xffc0, 0),
@@ -245,7 +254,7 @@ pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
     io.write8(0x454, check & !(1 << 7))?;
     let reg18 = (rf_read(io, 0, 0x18)?
         & !((1 << 16) | (1 << 9) | (1 << 8) | 255 | (3 << 17) | (3 << 12)))
-        | 1
+        | u32::from(ch)
         | 3 << 12;
     mask(io, 0x1c90, 1 << 8, 0)?;
     for path in 0..2 {

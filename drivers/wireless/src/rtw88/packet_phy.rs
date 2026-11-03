@@ -22,7 +22,11 @@ pub(super) enum Error {
 }
 impl Evidence {
     pub(super) fn initial_channel(self) -> bool {
-        self.page <= 1 && self.bandwidth == 0 && self.channel.is_none_or(|c| c == 1)
+        self.on_channel(1)
+    }
+    /// 20MHz CCK/OFDM page on `channel`; C21 reports no channel.
+    pub(super) fn on_channel(self, channel: u8) -> bool {
+        self.page <= 1 && self.bandwidth == 0 && self.channel.is_none_or(|c| c == channel)
     }
 }
 

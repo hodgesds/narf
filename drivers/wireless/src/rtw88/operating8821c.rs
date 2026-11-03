@@ -81,20 +81,28 @@ pub(super) struct Envelope {
     thermal: [u8; 2],
     ht_limit: Option<u8>,
     factory_limits: [u8; 2],
+    /// Per-channel-group factory ceilings for groups 0..=4, None if erased.
+    group_limits: [Option<[u8; 2]>; 5],
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
+    group_limits(factory, 0) // C21 factor1, channel1 group0, max_power_index0x3f.
+}
+/// Linux phy.c `rtw_phy_get_2g_tx_power_index` over `rtw_get_channel_group`
+/// `group` (0..=4 for 2.4GHz channels 1..13): CCK `cck_base[group]` and 1S
+/// OFDM `bw40_base[group] + ofdm_diff`, without erased-cell defaults.
+pub(super) fn group_limits(factory: &Factory8821c, group: usize) -> Result<[u8; 2], QError> {
     // Original C21 BTG RFE2/4 substitutes pathB's 2G record for physical RF-A.
     let path = u8::from(matches!(factory.rfe(), 2 | 4));
     let raw = factory.power_path(path).ok_or(QError::Factory)?;
-    if raw[0] > 63 || raw[6] > 63 || raw[11] == 255 {
+    if group > 4 || raw[group] > 63 || raw[6 + group] > 63 || raw[11] == 255 {
         return Err(QError::Factory);
     }
     let nibble = i16::from(raw[11] & 15);
-    let ofdm = i16::from(raw[6]) + if nibble & 8 != 0 { nibble - 16 } else { nibble };
+    let ofdm = i16::from(raw[6 + group]) + if nibble & 8 != 0 { nibble - 16 } else { nibble };
     if ofdm < 0 {
         return Err(QError::Factory);
     }
-    Ok([raw[0], ofdm.min(63) as u8]) // C21 factor1, channel1 group0, max_power_index0x3f.
+    Ok([raw[group], ofdm.min(63) as u8])
 }
 impl Source {
     pub(super) fn load(
@@ -149,6 +157,7 @@ impl Source {
             e.ht_limit = factory
                 .power_path(path)
                 .and_then(|p| super::ht::factory_limit(p, 1, 63));
+            e.group_limits = core::array::from_fn(|g| group_limits(factory, g).ok());
             e
         })
     }
@@ -156,6 +165,9 @@ impl Source {
 impl Envelope {
     pub(super) fn factory_limits(&self) -> [u8; 2] {
         self.factory_limits
+    }
+    pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
+        self.group_limits.get(group).copied().flatten()
     }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         Some(super::ht::Facts {
@@ -235,6 +247,7 @@ impl Envelope {
             thermal,
             ht_limit: None,
             factory_limits: limits,
+            group_limits: [None; 5],
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {

@@ -61,6 +61,9 @@ impl Native {
         &mut self,
         b: &[Vec<u8>],
     ) -> Result<Vec<u64>, packet::Error> {
+        if self.retune_active() {
+            return Err(packet::Error::State);
+        }
         self.with_packet(|core, port| core.submit_batch(port, b))
     }
     pub(in crate::rtw88) fn configure_packet_profile(
@@ -147,6 +150,9 @@ impl Native {
         frame: &[u8],
         radio_report: bool,
     ) -> Result<u64, packet::Error> {
+        if self.retune_active() {
+            return Err(packet::Error::State);
+        }
         self.with_packet(|core, port| core.submit(port, frame, radio_report))
     }
     pub(in crate::rtw88) fn scan_packet_address(
@@ -501,6 +507,9 @@ fn smoke_rtw8822ce_native_packet_revocation_precedes_cpu_dma_config_and_mmio(
         mailbox_pending: false,
         tracking_maintenance: false,
         tracking_sequence: 3,
+        retune: None,
+        channel: 1,
+        channel_epoch: 1,
     };
     cap.revoke();
     // Invalid physical config/BAR and absent allocations are deliberate. The

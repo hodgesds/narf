@@ -434,6 +434,36 @@ pub(super) unsafe trait Io: Send {
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
         Err(Error::Unsupported)
     }
+    /// Committed operating primary and its retune epoch (initial = 1).
+    fn station_channel(&self) -> (u8, u64) {
+        (1, 1)
+    }
+    /// Optional signed N2xO record admitting noninitial `channel` over the
+    /// exact current base. None if unprovisioned or not admitted.
+    fn station_channel_grant(
+        &mut self,
+        _: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        Ok(None)
+    }
+    /// Install the target channel gate (base for channel 1), stop new TX
+    /// publication and pause hardware TX. Re-entrant for the same target;
+    /// returns whether every TX queue has drained.
+    fn station_retune_begin(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    /// Submit the chip's pre-association IQK H2C during a retune.
+    fn station_retune_iqk(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Commit the programmed target, reopen TX and return the new epoch.
+    fn station_retune_finish(&mut self, _: u8) -> Result<u64, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_host(&mut self, _: narf_net::native_emission::Lifetime) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -767,13 +797,30 @@ impl<I: Io> Owner<I> {
         dwell_ms: u64,
         probes: &[alloc::vec::Vec<u8>],
         address: Option<[u8; 6]>,
+        channels: &[u8],
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
-            .scan_for(&mut self.io, dwell_ms, probes, address)
+            .scan_for(&mut self.io, dwell_ms, probes, address, channels)
             .await
+    }
+    /// Noninitial primaries admitted by a provisioned signed N2xO record
+    /// over the current base (bit N = channel N; bit 1 always set).
+    pub(super) fn station_admitted_channels(&mut self) -> u16 {
+        let mut mask = 1 << 1;
+        if self.station.is_some() {
+            for channel in 2..=super::channel_policy::LAST {
+                if matches!(self.io.station_channel_grant(channel), Ok(Some(_))) {
+                    mask |= 1 << channel;
+                }
+            }
+        }
+        mask
+    }
+    pub(super) fn station_channel(&self) -> u8 {
+        self.station.as_deref().map_or(1, |s| s.channel())
     }
     pub(super) async fn station_associate(
         &mut self,
@@ -1590,6 +1637,9 @@ impl<I: Io> Owner<I> {
         self.io.finish_dma().await
     }
 }
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "channel_policy_tests.rs"]
+mod channel_policy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mac/tests.rs"]
 mod mac_tests;

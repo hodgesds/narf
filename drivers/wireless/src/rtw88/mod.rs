@@ -42,6 +42,7 @@
 extern crate alloc;
 
 mod calibration8821c;
+mod channel_policy;
 mod coding;
 #[cfg(feature = "kernel-test")]
 mod coding_tests;

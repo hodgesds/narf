@@ -164,6 +164,15 @@ pub(super) struct State {
     last_now: u64,
     tracking: Tracking,
     power_tracking: Option<Box<super::tracking8821c::Tracker>>,
+    /// Committed operating primary (`channel_policy`); 1 is the base.
+    channel: u8,
+    /// Primary on which the last RF calibration (IQK) completed. Initial
+    /// preparation calibrated channel 1; any other retune clears it, like
+    /// Linux `rtw_set_channel` setting `need_rfk`.
+    rfk_channel: Option<u8>,
+    /// A native retune is in progress; the station reports Failed until it
+    /// commits, so a cancelled retune never looks Passive again.
+    retuning: bool,
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -263,6 +272,9 @@ impl State {
             last_now: 0,
             tracking: Tracking::default(),
             power_tracking: None,
+            channel: 1,
+            rfk_channel: Some(1),
+            retuning: false,
         }
     }
     /// Exact retained factory/radio facts for the dm watchdog statistics.
@@ -389,7 +401,7 @@ impl State {
         self.own
     }
     pub(super) fn phase(&self) -> Phase {
-        if self.admission.closed() && self.phase != Phase::Stopped {
+        if self.admission.closed() && self.phase != Phase::Stopped || self.retuning {
             Phase::Failed
         } else {
             self.phase
@@ -419,6 +431,7 @@ impl State {
     pub(super) fn lps_peer(&self) -> Option<([u8; 6], [u8; 6], u16)> {
         if self.phase() != Phase::Open
             || !self.ready()
+            || self.channel != 1
             || self.extension.is_some()
             || self.ht.is_some()
             || self.rx_ba_grant.is_some()
@@ -456,7 +469,7 @@ impl State {
                 wake |= super::runtime_ps_wire::wake_event(body);
             }
             if let Some(frame) = step.frame {
-                if frame.phy.is_some_and(|p| !p.initial_channel()) {
+                if frame.phy.is_some_and(|p| !p.on_channel(self.channel)) {
                     continue;
                 }
                 if self.lost(&frame) {
@@ -763,7 +776,7 @@ impl State {
                 break;
             }
             if let Some(mut frame) = step.frame {
-                if frame.phy.is_some_and(|p| !p.initial_channel()) {
+                if frame.phy.is_some_and(|p| !p.on_channel(self.channel)) {
                     continue;
                 }
                 let aggregate = frame.bytes().first() == Some(&0x88)
@@ -1296,8 +1309,15 @@ impl State {
         dwell_ms: u64,
         probes: &[Vec<u8>],
         address: Option<[u8; 6]>,
+        channels: &[u8],
     ) -> Result<Vec<ObservedBss>, Error> {
-        if !(1..=1024).contains(&dwell_ms) || probes.len() > 4 {
+        if !(1..=1024).contains(&dwell_ms)
+            || probes.len() > 4
+            || channels.len() > usize::from(super::channel_policy::LAST)
+            || channels
+                .iter()
+                .any(|c| super::channel_policy::group(*c).is_none())
+        {
             return Err(Error::Profile);
         }
         if self.phase() != Phase::Passive {
@@ -1325,7 +1345,7 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(a))))??;
             self.scan_address = Some(a);
         }
-        let result = self.scan_inner(io, dwell_ms, probes).await;
+        let result = self.scan_channels(io, dwell_ms, probes, channels).await;
         if self.scan_address.take().is_some() {
             // rtw_core_scan_complete: back to the own address on every exit.
             let own = self.own;
@@ -1337,6 +1357,97 @@ impl State {
             }
         }
         result
+    }
+    /// mac80211 software scan over `channels` (empty: the current one).
+    /// Each channel is retuned without RF calibration (`RTW_FLAG_SCANNING`),
+    /// probes carry that channel's DS parameter, and the scan returns to the
+    /// pre-scan channel (`rtw_core_scan_complete`). The operating channel is
+    /// restored even on failure; a failed restore leaves the station failed.
+    async fn scan_channels(
+        &mut self,
+        io: &mut impl Io,
+        dwell_ms: u64,
+        probes: &[Vec<u8>],
+        channels: &[u8],
+    ) -> Result<Vec<ObservedBss>, Error> {
+        let home = self.channel;
+        if channels.is_empty() || channels == [home] {
+            return self.scan_inner(io, dwell_ms, probes).await;
+        }
+        let mut result = Ok(Vec::new());
+        for channel in channels.iter().copied() {
+            let mut tuned = Vec::new();
+            for probe in probes {
+                tuned.push(super::channel_policy::probe_for(probe, channel).ok_or(Error::Profile)?);
+            }
+            result = match self.retune(io, channel, false).await {
+                Ok(()) => self.scan_inner(io, dwell_ms, &tuned).await,
+                Err(e) => Err(e),
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+        let restored = self.retune(io, home, false).await;
+        let observed = result?;
+        restored?;
+        Ok(observed)
+    }
+    /// Native retune owner (`main.c::rtw_set_channel` order) for an
+    /// unassociated station: load the signed record, install the target gate,
+    /// pause and drain TX, program the chip channel and TX power (plus IQK
+    /// when `rfk`), then commit the epoch and reopen TX. Any failure or
+    /// cancellation leaves TX closed and the station failed.
+    pub(super) async fn retune(
+        &mut self,
+        io: &mut impl Io,
+        channel: u8,
+        rfk: bool,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Passive || self.pending.is_some() {
+            return Err(Error::State);
+        }
+        if channel == self.channel && (!rfk || self.rfk_channel == Some(channel)) {
+            return Ok(());
+        }
+        let grant = if channel == 1 {
+            None
+        } else {
+            Some(
+                self.admission
+                    .run(|| io.station_channel_grant(channel))?
+                    .ok_or(Error::Profile)?,
+            )
+        };
+        self.retuning = true;
+        let mut quiet = false;
+        for _ in 0..1000 {
+            let g = grant.clone();
+            if self.admission.run(|| io.station_retune_begin(channel, g))? {
+                quiet = true;
+                break;
+            }
+            self.poll(io)?;
+            self.environment.pause().await;
+        }
+        if !quiet {
+            return Err(Error::Timeout);
+        }
+        self.phase = Phase::Failed;
+        self.rfk_channel = None;
+        let gate = self.admission.run(|| io.station_gate())?;
+        super::channel_policy::program(io, &gate, rfk).await?;
+        self.admission.run(|| io.station_retune_finish(channel))?;
+        self.channel = channel;
+        if rfk {
+            self.rfk_channel = Some(channel);
+        }
+        self.phase = Phase::Passive;
+        self.retuning = false;
+        Ok(())
+    }
+    pub(super) fn channel(&self) -> u8 {
+        self.channel
     }
     async fn scan_inner(
         &mut self,
@@ -1380,17 +1491,27 @@ impl State {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if candidate.bss.channel != 1 || candidate.basic_rates & 1 == 0 {
+        if super::channel_policy::group(candidate.bss.channel).is_none()
+            || candidate.basic_rates & 1 == 0
+        {
             return Err(Error::Profile);
         }
+        // rtw_ops_mgd_prepare_tx: tune to the BSS primary and run RF
+        // calibration there unless it is already current.
+        self.retune(io, candidate.bss.channel, true).await?;
+        // Noninitial channels carry only the base legacy CCK1 profile.
+        let base_channel = self.channel == 1;
         let mode = if pmk.is_some() {
             SecurityMode::Wpa2Psk
         } else {
             SecurityMode::Open
         };
-        let extension = io
-            .station_extension()?
-            .filter(|g| candidate.basic_rates & !g.rates() == 0);
+        let extension = if base_channel {
+            io.station_extension()?
+                .filter(|g| candidate.basic_rates & !g.rates() == 0)
+        } else {
+            None
+        };
         let proposed = match &extension {
             Some(g)
                 if g.wmm()
@@ -1534,7 +1655,10 @@ impl State {
             }
             self.ht = Some(h);
         }
-        if let Some(g) = io.station_continuation(&super::dm::KIND)? {
+        if let Some(g) = io
+            .station_continuation(&super::dm::KIND)?
+            .filter(|_| base_channel)
+        {
             let gate = io.station_gate()?;
             if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
                 self.tracking.grant = Some(g);

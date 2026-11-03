@@ -109,7 +109,7 @@ impl RadioIo {
             quiesces: 0,
         }
     }
-    fn reference() -> Self {
+    pub(super) fn reference() -> Self {
         let mut io = Self::new();
         io.radio = true;
         for (i, v) in io.base.regs.iter_mut().enumerate() {

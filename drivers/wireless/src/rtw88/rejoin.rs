@@ -29,8 +29,9 @@ impl Pending {
             }
             _ => return Err(Error::Wireless(WirelessError::NotSupported)),
         };
-        if request.channel != 1
-            || request.frequency_mhz != 2412
+        // The rebound interface admits only signed per-channel primaries.
+        if super::channel_policy::frequency(request.channel.min(255) as u8).map(u32::from)
+            != Some(request.frequency_mhz)
             || request.ssid.is_empty()
             || request.ssid.len() > 32
             || request.bssid == [0; 6]

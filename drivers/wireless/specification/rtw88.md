@@ -749,7 +749,8 @@ exactly once; C2H bytes are never treated as Wi-Fi payload. Current PCI authorit
 the retained signed calibration cap and fresh authenticated policy are checked
 before every native packet publication and progress step.
 
-Scan admits channel1/2412 MHz only, bounded dwell and SSID filters.
+Scan admits channel1/2412 MHz plus any signed N2xO primary (see the
+noninitial-channel section below), bounded dwell and SSID filters.
 Active scanning and driver-admitted extra probe IEs are implemented on that
 channel (`src/rtw88/scan.rs`, `station.rs::scan_for`) as Linux's software
 scan: this profile has no `FW_FEATURE_SCAN_OFFLOAD`, so `rtw_ops_hw_scan`
@@ -2027,6 +2028,90 @@ no owner on a second removal. A removal whose RXDMA never idles reports the mapp
 pinned. A lifecycle removed before any owner existed refuses a later
 `initialize_bytes`.
 
+### C21/C22 noninitial 2.4GHz/20MHz operating channels and retune (`N2xO`)
+
+`channel_policy.rs` admits primaries 2..=13 at 20MHz on the retained C21/C22
+station; channel 1 keeps its base N22Cv2/N21S program unchanged. Channel 14
+(CCK-only) and 5GHz stay unadmitted. Each noninitial primary N is admitted
+only by an optional separately signed continuation
+`rtw88/rtw882{1,2}ce-channelNN-v1-<mac>.bin` (generic `qualification.rs`
+layout, tag `O`, one static `Kind` per primary whose source contract hashes
+the Linux functions below and the primary). Payload: primary, width 20,
+antenna gain, qualified ceiling, three measured peaks (calibration, response,
+data; quarter dBm), C22 per-path CCK references or C21 twelve CCK/OFDM TXAGC
+indices, zero tail. The record must bind the exact base identity
+(`Gate::extension_request`), and its TX power must not exceed the factory
+base of the primary's own `phy.c::rtw_get_channel_group` (C22
+`cck_base[group]` plus the RFE response adjustment per path, C21
+`cck_base[group]` and `bw40_base[group] + ofdm_diff`). Nothing is derived from
+another channel's measurement and no record is fabricated: without provisioned
+records the interface advertises and accepts channel 1 only, as before.
+
+`Gate::with_channel` binds a record only over a base-only gate (no WMM/HT/BA/
+protection/coding/QoS/fallback/tracking continuation) and its live check is part
+of `Gate::current`/`current_in`: the current record capability plus the
+installed regulatory domain, whose overlapping rules must be plain, cover the
+primary's 20MHz occupied span and admit every peak plus antenna gain. While a
+record is bound, `extension_base`, `with_extension`, `with_continuation` and
+`with_power_tracking` refuse, and the station skips the extension, HT and dm
+continuations, so noninitial primaries carry the base legacy CCK1 Open/WPA2
+profile only. LPS (`lps_peer`) is refused off channel 1.
+
+Native retune owner (`station.rs::retune`, `pci_firmware.rs`
+`station_retune_{begin,iqk,finish}`), unassociated Passive station only:
+`begin` installs the target gate (base for channel 1), refuses all new TX
+publication (ordinary/batch packets, HMEBOX and PS mailboxes), sets
+REG_TXPAUSE 0x522=0xff, points packet-core PHY admission at the target and
+reports quiet only after the packet core, every TX ring index pair and the
+reserved-page queues drain (same receipts as N21W maintenance). The station
+then programs, in Linux 7.3-rc4 order, `main.c::rtw_set_channel` ->
+chip `set_channel` and `phy.c::rtw_phy_set_tx_power_level`:
+
+- C22 `rtw8822c_set_channel`: `_bb` 2.4GHz/20MHz with SCOTRK 0xc30
+  0x9aa/0x96a(11,12)/0x969(13) and TXDFIR0 0x808[6:4] 3 on 13 else 1,
+  `rtw_set_channel_mac`, `_rf` RF18 channel byte on both paths inside the
+  3-wire reset, `rtw8822c_toggle_igi`; CCK references from the record.
+- C21 `rtw8821c_set_channel` non-SRRC: `_bb`/MAC/`_rxdfir`/`_bb_swing` are
+  identical across 1..=13, so only `_rf` (LUTDBG, 0x64, RF18 channel byte,
+  XTALX2 bit19 toggle) runs, then the record's TXAGC words 0x1d00..0x1d08
+  (HT/VHT words zero).
+
+Scan retunes skip RF calibration like `RTW_FLAG_SCANNING`. Association first
+retunes to the BSS primary with calibration as `mac80211.c::
+rtw_ops_mgd_prepare_tx` -> `phy_calibration` does: C22 `rtw8822c_do_iqk`
+(clear=1, DPD kept off, gains reapplied) and C21 `rtw8821c_do_iqk`
+(clear=0/segment=0, stale RF_DTXLOK refused, host clear, IQK fail mask
+0x1bf0 must be clear). The IQK H2C is the only command admitted during a
+retune. REG_RPT_CIP has no host reset, so the C22 completion is accepted only
+after a post-submission transition into IQK_DONE (a non-0xaa value observed
+first); Linux polls the level only. Readbacks then check RF18 channel/band/BW,
+SCOTRK/TXDFIR (C22), the programmed CCK references or TXAGC words, RRSR 0x1f
+and (C21) the IQK fail mask. `finish` requires an idle H2C ring, the paused and
+quiet hardware, the target gate current again, clears TXPAUSE, commits the
+primary and advances the retune epoch (`station_channel`, initial 1). Any
+failure or cancellation after `begin` leaves TX refused and the station
+reporting Failed; nothing reopens it except teardown.
+
+Scan (`scan.rs::plan`) maps authoritative frequencies or channel numbers to
+2.4GHz primaries 1..=13; the interface refuses any unadmitted one and expands
+an empty list to every admitted primary. `scan_for` visits each requested
+primary (Probe Request DS Parameter Set rewritten per channel), then retunes
+back to the pre-scan channel even after an error. Scan results report each
+BSS's own primary/frequency; association and safe rejoin accept any admitted
+primary. C22 PHY status must report the current primary (`on_channel`); C21
+reports none.
+
+Remaining before physical acceptance (no row closure is claimed here): no
+signed N2xO record exists for any board, so on real hardware only channel 1
+is admitted until per-channel measurements are provisioned; channel switch
+while associated (CSA/roam) is not supported (Linux mac80211 would retune via
+`rtw_ops_config`); extension programs (WMM/HT/BA/RTS/coding/QoS/fallback/dm/
+N21W/LPS) remain channel-1 qualified. Three new cases are written and
+unexecuted at the time of writing:
+`smoke_rtw88_channel_policy_linux_groups_bb_rf_and_probe_ds`,
+`smoke_rtw88_channel_record_admission_and_regulatory_span`,
+`smoke_rtw8821ce_retune_txagc_and_rf18_readback`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -2241,10 +2326,10 @@ changes. None is a physical blocker unless stated.
 
 | Row | Blocker |
 |---|---|
-| `additional_operating_channels` | `station.rs::associate` refuses `candidate.bss.channel != 1` and `scan.rs::plan` admits 2412 MHz only. The C21/C22 radio programs (`radio.rs`, `radio8821c.rs`) write fixed channel1 RF/BB/TXAGC values. Needs ports of `rtw8822c_set_channel`/`rtw8821c_set_channel` plus a per-channel measured envelope. |
+| `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13 (base legacy CCK1 profile off channel 1). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
 | `beamforming` | Linux `bf.c::rtw_bf_assoc` acts only on a VHT peer (`vht_cap` SU beamformer/beamformee), so this is blocked on `vht`. |
 | `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
-| `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
+| `five_ghz_operation` | 2.4GHz noninitial retune now exists (N2xO), but 5GHz needs the `rtw8822c_set_channel_bb`/`_rf` 5GHz branches, 5GHz AGC/RF table selection (`rtw_phy_setup_phy_cond` band conditions), 5GHz efuse power groups and a measured 5GHz envelope; `scan.rs` admits 2.4GHz only. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
 | `multi_stream_ht` | Source-complete for actual2T2R RTL8822CE under separate N22H256v2: cumulative per-path factory ceilings, measured combined-chain envelope, native quiet/parked two-path gains/readbacks, original local RX16/peer TX negotiation and actual RA/TXWD/RXD MCS8..15. C21 is1TX-path hardware. Five native cases are written; release/native and physical acceptance remain pending. |
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |

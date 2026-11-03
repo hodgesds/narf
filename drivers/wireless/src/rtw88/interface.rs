@@ -59,6 +59,9 @@ pub(super) struct Device<I: Io> {
     rts: AtomicU32,
     bssid: AtomicU64,
     ht_capability: IrqSafeSpinLock<Option<[u8; 26]>>,
+    /// Admitted 2.4GHz primaries (bit N = channel N): channel 1 plus every
+    /// channel with a provisioned signed N2xO record over the current base.
+    channels: core::sync::atomic::AtomicU16,
     receive_generation: AtomicU64,
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
@@ -139,6 +142,7 @@ impl<I: Io + 'static> Device<I> {
             rts: AtomicU32::new(u32::MAX),
             bssid: AtomicU64::new(0),
             ht_capability: IrqSafeSpinLock::new(None),
+            channels: core::sync::atomic::AtomicU16::new(1 << 1),
             receive_generation: AtomicU64::new(0),
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
@@ -279,20 +283,31 @@ impl<I: Io + 'static> Device<I> {
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
-        let (authority, ht) = {
+        let (authority, ht, channels) = {
             let mut retained = self.lifecycle.retained.lock().await;
             let owner = retained.as_mut().ok_or(Error::State)?;
-            (owner.station_publication()?, owner.station_ht_capability())
+            (
+                owner.station_publication()?,
+                owner.station_ht_capability(),
+                owner.station_admitted_channels(),
+            )
         };
         self.admission.run(|| {
             authority.invoke(|| {
                 self.admitted.store(true, Ordering::Release);
                 *self.ht_capability.lock() = ht;
+                self.channels.store(channels, Ordering::Release);
                 Ok(())
             })
         })?;
         attempt.armed = false;
         Ok(())
+    }
+    fn admitted_channels(&self) -> Vec<u32> {
+        let mask = self.channels.load(Ordering::Acquire);
+        (1..=u32::from(super::channel_policy::LAST))
+            .filter(|c| mask & (1 << c) != 0)
+            .collect()
     }
     fn link(&self, peer: Option<[u8; 6]>, port: bool) {
         self.link_inner(peer, port, false);
@@ -723,7 +738,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             base_mac: self.local,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![1],
+                channels: self.admitted_channels(),
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
@@ -744,7 +759,18 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let plan = super::scan::plan(&request, self.local)?;
+        let mut plan = super::scan::plan(&request, self.local)?;
+        let admitted = self.admitted_channels();
+        if plan
+            .channels
+            .iter()
+            .any(|c| !admitted.contains(&u32::from(*c)))
+        {
+            return Err(WirelessError::NotSupported);
+        }
+        if plan.channels.is_empty() && admitted.len() > 1 {
+            plan.channels = admitted.iter().map(|c| *c as u8).collect();
+        }
         self.control_ready()?;
         let mut attempt = Attempt {
             device: self,
@@ -758,7 +784,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             return Err(WirelessError::Busy);
         }
         let result = owner
-            .station_scan(plan.dwell_ms, &plan.probes, plan.address)
+            .station_scan(plan.dwell_ms, &plan.probes, plan.address, &plan.channels)
             .await;
         attempt.armed = false;
         if result.is_err() {
@@ -783,9 +809,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             })
             .map(|c| BssInfo {
                 bssid: c.bss.bssid,
+                frequency_mhz: super::channel_policy::frequency(c.bss.channel).map_or(0, u32::from),
+                channel: u32::from(c.bss.channel),
                 ssid: c.bss.ssid,
-                channel: 1,
-                frequency_mhz: 2412,
                 rssi: i8::MIN,
                 security: if c.ap_rsne.is_some() {
                     narf_wireless::scan::BssSecurity::Wpa2
@@ -799,7 +825,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
-        if request.channel != 1 || request.frequency_mhz != 2412 {
+        if !self.admitted_channels().contains(&request.channel)
+            || super::channel_policy::frequency(request.channel as u8).map(u32::from)
+                != Some(request.frequency_mhz)
+        {
             return Err(WirelessError::NotSupported);
         }
         let pmk = match request.security {

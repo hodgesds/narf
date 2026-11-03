@@ -26,6 +26,9 @@ pub(super) struct Board {
     identity: [u8; 32],
     mac: [u8; 6],
     maximum: [u8; 2],
+    /// Per-path CCK reference ceilings for 2.4GHz channel groups 0..=4
+    /// (Linux `rtw_get_channel_group`), None if erased or out of range.
+    groups: [Option<[u8; 2]>; 5],
     ht: Option<super::ht::Facts>,
 }
 impl Board {
@@ -53,6 +56,19 @@ impl Board {
             }
             *limit = bound as u8;
         }
+        let groups = core::array::from_fn(|group| {
+            let mut limit = [0; 2];
+            for (path, slot) in limit.iter_mut().enumerate() {
+                let base = *factory.power_path(path as u8)?.get(group)?;
+                let bound =
+                    i16::from(base) + values::CCK_RESPONSE_ADJUST[usize::from(info.rfe)][path];
+                if base > 127 || !(0..=127).contains(&bound) {
+                    return None;
+                }
+                *slot = bound as u8;
+            }
+            Some(limit)
+        });
         let mut hash = narf_crypto::sha256::Sha256::new();
         hash.update(b"NARF RTL8822CE awake ch1 legacy20 basic1 txA rxAB v2");
         hash.update(b"fresh DACK IQK; no GAPK DPD tracking; software CCMP raw RX");
@@ -78,6 +94,7 @@ impl Board {
             identity: hash.finalize(),
             mac: factory.mac(),
             maximum,
+            groups,
             ht: factory
                 .power_path(0)
                 .and_then(|a| super::ht::factory_limit(a, 2, 127))
@@ -179,6 +196,10 @@ pub struct Gate {
     /// Separately qualified N2xF DATA rate fallback over the extension.
     /// Revocation returns to fixed-rate DATA.
     fallback: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    /// Separately signed N2xO noninitial 2.4GHz/20MHz channel program over
+    /// the exact base. Present only while retuned away from channel 1; its
+    /// live regulatory/capability check is part of `current`.
+    channel: Option<alloc::sync::Arc<super::qualification::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -325,7 +346,7 @@ impl Gate {
         Ok(gate)
     }
     pub(super) fn extension_base(&self) -> Option<ExtensionBase> {
-        if self.extension.is_some() {
+        if self.extension.is_some() || self.channel.is_some() {
             return None;
         }
         match &self.scope {
@@ -342,7 +363,7 @@ impl Gate {
         }
     }
     pub(super) fn calibrated_base(&self) -> Option<CalibratedBase> {
-        if self.extension.is_some() {
+        if self.extension.is_some() || self.channel.is_some() {
             return None;
         }
         match &self.scope {
@@ -374,6 +395,7 @@ impl Gate {
             coding: None,
             qos: None,
             fallback: None,
+            channel: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -394,6 +416,66 @@ impl Gate {
             coding: None,
             qos: None,
             fallback: None,
+            channel: None,
+        }
+    }
+    /// Current operating 2.4GHz primary: 1 for the base, else the bound
+    /// N2xO record's channel.
+    pub(super) fn channel(&self) -> u8 {
+        self.channel
+            .as_ref()
+            .and_then(|g| super::channel_policy::Record::decode(self.did(), g.payload()))
+            .map_or(1, |r| r.channel)
+    }
+    pub(super) fn channel_grant(&self) -> Option<alloc::sync::Arc<super::qualification::Grant>> {
+        self.channel.clone()
+    }
+    /// True when only the base program is bound: no extension, HT, BA,
+    /// protection, coding/QoS/fallback or power tracking continuation.
+    pub(super) fn base_only(&self) -> bool {
+        self.extension.is_none()
+            && self.ht.is_none()
+            && self.rx_ba.is_none()
+            && self.tx_ba.is_none()
+            && self.protection.is_none()
+            && self.coding.is_none()
+            && self.qos.is_none()
+            && self.fallback.is_none()
+            && self.tracking.is_none()
+    }
+    pub(super) fn without_channel(&self) -> Self {
+        let mut gate = self.clone();
+        gate.channel = None;
+        gate
+    }
+    /// Bind one N2xO channel record over this exact base-only gate.
+    pub(super) fn with_channel(
+        &self,
+        g: alloc::sync::Arc<super::qualification::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        let record = super::channel_policy::Record::decode(self.did(), g.payload())
+            .ok_or(super::firmware_transport::Error::State)?;
+        if !self.base_only()
+            || self.channel.is_some()
+            || super::channel_policy::kind(record.channel).is_none_or(|k| !g.is(k))
+            || !g.matches(self)
+            || !super::channel_policy::within_factory(self, &record)
+        {
+            return Err(super::firmware_transport::Error::State);
+        }
+        super::channel_policy::current(&g, self.did())?;
+        let mut gate = self.clone();
+        gate.channel = Some(g);
+        Ok(gate)
+    }
+    /// Factory per-group ceilings: C22 per-path CCK references, C21
+    /// [CCK, OFDM] indices.
+    pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
+        match &self.scope {
+            Scope::C22 { calibration, .. } => {
+                calibration.board.groups.get(group).copied().flatten()
+            }
+            Scope::C21(g) => g.group_limits(group),
         }
     }
     pub(super) fn did(&self) -> u16 {
@@ -410,6 +492,9 @@ impl Gate {
     }
     pub(super) fn current(&self) -> Result<(), Error> {
         self.host_current()?;
+        if let Some(g) = &self.channel {
+            super::channel_policy::current(g, self.did()).map_err(|_| Error::Policy)?;
+        }
         if let Some(g) = &self.tracking {
             g.invoke(|| Ok(())).map_err(|_| Error::Authority)?;
         }
@@ -484,6 +569,9 @@ impl Gate {
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
         self.host_current()?;
+        if let Some(g) = &self.channel {
+            super::channel_policy::current_in(g, self.did(), domain).map_err(|_| Error::Policy)?;
+        }
         match &self.scope {
             Scope::C22 {
                 calibration,
@@ -515,6 +603,11 @@ impl Gate {
         }
     }
     pub(super) fn cck_gains(&self) -> Option<[u8; 2]> {
+        if let Some(g) = &self.channel {
+            return super::channel_policy::Record::decode(self.did(), g.payload())
+                .filter(|_| self.did() == 0xc822)
+                .map(|r| r.gains);
+        }
         match &self.scope {
             Scope::C22 { permission, .. } => Some(permission.gains),
             Scope::C21(_) => None,
@@ -567,7 +660,11 @@ impl Gate {
         &self,
         g: alloc::sync::Arc<super::station_profile::Grant>,
     ) -> Result<Self, super::firmware_transport::Error> {
-        if self.did() != g.did() || self.extension.is_some() || !g.matches(self) {
+        if self.did() != g.did()
+            || self.extension.is_some()
+            || self.channel.is_some()
+            || !g.matches(self)
+        {
             return Err(super::firmware_transport::Error::State);
         }
         g.check()?;
@@ -683,7 +780,7 @@ impl Gate {
             && self.extension.is_some()
             && self.fallback.is_none()
             && super::fallback::bounds(g.payload());
-        if !coding && !qos && !fallback {
+        if !coding && !qos && !fallback || self.channel.is_some() {
             return Err(super::firmware_transport::Error::State);
         }
         g.check(self)?;
@@ -755,7 +852,7 @@ impl Gate {
         &self,
         g: alloc::sync::Arc<super::tracking8821c::Grant>,
     ) -> Result<Self, super::firmware_transport::Error> {
-        if self.tracking.is_some() || !g.matches(self) {
+        if self.tracking.is_some() || self.channel.is_some() || !g.matches(self) {
             return Err(super::firmware_transport::Error::State);
         }
         g.invoke(|| Ok(()))?;
@@ -846,6 +943,11 @@ impl Gate {
         Ok(())
     }
     pub(super) fn c21_indices(&self) -> Option<[u8; 12]> {
+        if let Some(g) = &self.channel {
+            return super::channel_policy::Record::decode(self.did(), g.payload())
+                .filter(|_| self.did() == 0xc821)
+                .map(|r| r.indices);
+        }
         match &self.scope {
             Scope::C21(g) => Some(g.indices()),
             Scope::C22 { .. } => None,
