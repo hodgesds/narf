@@ -2829,14 +2829,45 @@ GRDOM_FULL and clears only ER_PREP after the reset, or after a failed one.
 Media scheduling is then admitted beside loaded GSC firmware. Without the
 option nothing changes.
 
-NARF does not load GSC firmware yet. The GSC worker (firmware load over GSCCS,
-the MKHI compatibility query, HuC authentication via the GSC, proxy start) is
-implemented against native models only. Production lacks three things: GSCCS0
-as a scheduled media engine with a kernel queue; a device-lifetime 4 MiB GSC
-private object in stolen memory whose GGTT mapping no later GT0 incarnation
-reuses, retained until an FLR; and the MEI GSC proxy client. No GSC memory is
-handed out and nothing is submitted to GSCCS, so query7 type1 still reports
-only the GuC-authenticated HuC.
+With the option the runtime also loads the GSC. `media::gsc::owner::GscOwner`
+lives for the device, as `struct xe_gsc` does. It fetches `i915/mtl_gsc_1.bin`
+once, and with an available image the media GuC schedules GSCCS0
+(`MediaGuc::schedule_gsccs`). Otherwise `disable_unavailable_interrupts`
+writes GUNIT_GSC_INTR_ENABLE 0 and GUNIT_GSC_INTR_MASK all ones, as
+check_gsc_availability does. GSCCS0 (`Engine::Gsccs0`: base 0x11a000,
+GUC_GSC_OTHER_CLASS 5, hardware class OTHER 4, instance 6, forcewake domain
+bit 13) is reserved: `EngineSet::from_class_instance` and `logical_mask`
+skip it, the scheduler refuses it for user work, and GT1's publication,
+queries and placements never contain it. Its contexts use a 600 ms preempt
+timeout. `media::GscQueue` implements the worker's `Gsccs` trait through
+`MediaGuc::submit_gsc`. That admits only an 8-dword GSC_HECI_CMD_PKT or a
+4-dword GSC_FW_LOAD (`engine::gsc_job_valid`), one job at a time.
+
+The 4 MiB private object is a device-lifetime DSM claim
+(`stolen::Carve::place_gsc`, `stolen::gsc_claim`) shared with FBC through a
+registry keyed by the DSM base: the CFB carve avoids the GSC claim, and the
+GSC claim avoids recent CFB claims, the WOPCM, the Wa_14019821291 region and
+the boot framebuffer. It is never released or moved. `stolen::StolenObject`
+reaches it from the CPU through BAR2 (`Bar2Window`) at io_base + offset.
+`SharedArena::map_gsc_stolen` (also `BootAllocator::map_gsc_stolen`) writes
+its 1024 DM PTEs (`PteFormat::encode_ggtt_stolen`) at the fixed GGTT window
+`stolen::GSC_GGTT` (288 MiB, ledger `Kind::Gsc`) on every GT1 start. The
+per-media-GuC objects (version packet, HuC packet, proxy channel) come from
+the GT0 arena, attach on Running, and are freed by `end_session` after the
+verified stop. Before a media stop the runtime lets a running load finish
+(`quiesce`, xe_gsc_stop_prepare); `interrupt` makes an interrupted load
+LOAD_FAIL. The tile IRQ controller's `route_gsc`/`unroute_gsc` own
+GUNIT_GSC_INTR_ENABLE/MASK and HECI2_RSVD_INTR_MASK, and decode bank-0 bits
+31 (GSCCS0) and 30 (HECI2) into `take_gsc_events`.
+
+Without a CSME component the outcome is Linux's without
+CONFIG_INTEL_MEI_GSC_PROXY. The firmware loads, the compatibility query must
+report major 102, and a HuC the media GuC authenticated is also authenticated
+through the GSC (a failure there makes query7 type1 ENODEV). Proxy start then
+fails with ENODEV, and the GSC is LOAD_FAIL and never reloads.
+`intel_gpu_gt::register_csme_proxy` / `unregister_csme_proxy` take a
+`CsmeProxy` (blocking `send`/`recv`), which the next GT1 start uses for the
+proxy channel.
 
 PXP stays disabled on every native Xe device, as Linux without
 CONFIG_INTEL_MEI_GSC_PROXY (xe->pxp is NULL):
@@ -3046,7 +3077,10 @@ at most `CARVE_CHUNK_PTES` GGTT entries per call, and `place` (only after a
 complete survey) runs `find_compression_limit` over `Dsm::place`.
 `CarveSlot::poll` never blocks: it returns a finished result for the same
 size and limit floor, or `Pending` after launching (once) the off-path job,
-which reports through `finish` or `abandon`.
+which reports through `finish` or `abandon`. `Carve::place` records its CFB
+in the function's claim registry and avoids the media GT's GSC claim
+(`Carve::place_gsc`; see the MTL/Arrow GSC section); `Dsm::reserve` excludes
+another owner's range.
 `intel_gpu_fbc` provides display 14's `check_plane`, the CFB
 stride/size/limit helpers and the `Fbc` owner. The owner's
 `enable`/`activate`/`nuke`/`invalidate`/`flush`/`disable` methods never touch
