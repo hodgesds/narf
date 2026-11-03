@@ -141,6 +141,9 @@ pub(super) struct State {
     qos: Option<(Arc<super::qualification::Grant>, u8)>,
     tx_ba: super::tx_ba::Originators,
     tx_config: Option<super::packet_format::Aggregation>,
+    /// `sta->deflink.agg.max_rc_amsdu_len` from the latest firmware RA
+    /// report (`fw.c::get_max_amsdu_len`); 0 is unlimited, as before any.
+    amsdu_rc: usize,
     data_pending: VecDeque<Pending>,
     data_drain: Option<(u64, Option<u8>)>,
     qos_sequence: [u16; 8],
@@ -271,6 +274,7 @@ impl State {
             scan_address: None,
             tx_ba: super::tx_ba::Originators::new(),
             tx_config: None,
+            amsdu_rc: 0,
             data_pending: VecDeque::new(),
             data_drain: None,
             qos_sequence: [1; 8],
@@ -863,6 +867,9 @@ impl State {
             let step = io.packet_poll()?;
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
+            }
+            if let Some(body) = &step.c2h {
+                self.amsdu_ra_report(body);
             }
             if let (Some(body), Some(t)) = (&step.c2h, self.power_tracking.as_mut()) {
                 t.c2h(body);
@@ -2255,6 +2262,10 @@ impl State {
             if let Some(g) = io.station_tx_ba_extension()? {
                 self.admission.run(|| io.station_bind_tx_ba(g.clone()))?;
                 super::tx_ba::program(io)?;
+                // The ADDBA request offers A-MSDU only where the producer
+                // may run (`rtw_ops_can_aggregate_in_amsdu`: not 2.4GHz).
+                self.tx_ba
+                    .request_amsdu(super::band5::primary(self.channel));
                 self.tx_ba_grant = Some(g);
             }
             // The RTS program (N2xR), the dynamic mechanism (N2xD) and N21W
@@ -2483,6 +2494,8 @@ impl State {
         Ok(())
     }
 }
+#[path = "station_tx_amsdu.rs"]
+mod amsdu;
 #[path = "station_tx_ba.rs"]
 mod tx;
 /// The primary is passive-only (cfg80211 RADAR / NO_IR) under `policy`.

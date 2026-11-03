@@ -424,7 +424,7 @@ unsafe impl Port for Model {
             .iter()
             .find(|p| p.0 == address)
             .ok_or(Error::Address)?;
-        if length > format::MAX_MPDU || format::TX_DESC + length > extent {
+        if length > format::MAX_TX_MPDU || format::TX_DESC + length > extent {
             return Err(Error::Address);
         }
         let pointer = pointer as *const u8;
@@ -1040,7 +1040,9 @@ fn all_tid_control_denials() -> Result<(), &'static str> {
     }
     for mut frame in originator_controls(5) {
         if frame.len() == 33 {
-            frame[27] |= 1;
+            // Capability bit0 (A-MSDU supported) is the 5GHz producer's
+            // request; the SSN fragment field stays reserved.
+            frame[31] |= 1;
         } else if frame.len() == 20 {
             frame[16] |= 1;
         } else {

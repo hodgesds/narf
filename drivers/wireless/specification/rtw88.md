@@ -1723,8 +1723,8 @@ external measured X asset.
 No CTS-to-self or new AP HT-protection mode is inferred from the source RTS
 path. Current width/stream/channel restrictions remain unchanged. Source
 `rtw_ops_can_aggregate_in_amsdu` explicitly declines TX A-MSDU on2.4GHz;
-this channel1 owner therefore does not add a TX A-MSDU producer. That source
-policy is not a claim that the silicon lacks broader-band A-MSDU capability.
+the channel-1 owner therefore adds no TX A-MSDU producer. The 5GHz producer
+is described in "5GHz TX A-MSDU and A-MSDU in A-MPDU".
 
 
 ### Separately signed continuation contracts and the dm watchdog
@@ -2805,6 +2805,61 @@ unexecuted: `smoke_rtw88_band5_linux_groups_and_factory_power`,
 `smoke_rtw8822ce_channel5_bb_mac_rf_program`,
 `smoke_rtw8821ce_channel20_cross_band_readback`.
 
+### 5GHz TX A-MSDU and A-MSDU in A-MPDU (`station_tx_amsdu.rs`)
+
+Linux `main.c::rtw_register_hw` sets `TX_AMSDU` and, for C21/C22
+(`amsdu_in_ampdu = true`), `SUPPORTS_AMSDU_IN_AMPDU`; mac80211
+`tx.c::ieee80211_amsdu_aggregate` builds the aggregate and
+`mac80211.c::rtw_ops_can_aggregate_in_amsdu` declines it while
+`hal.current_band_type` is 2.4GHz. The station mirrors that path:
+
+- **Gate** (`State::amsdu_limit`): an associated 5GHz (`DataProfile::band5`)
+  HT/VHT QoS profile with a negotiated peer. On 2.4GHz nothing changes, and
+  `packet_format::classify_profile` refuses the A-MSDU-present QoS bit
+  (0x80) on any 2.4GHz or non-HT profile.
+- **Size** (`agg.max_amsdu_len`, `ht.c`/`vht.c`): the peer VHT maximum MPDU
+  length (`Limit::from_vht_capability`) on an N2xV association, else HT
+  capability bit11 (`Limit::from_ht_capability`); narrowed to the native
+  allocation `MAX_TX_MPDU` = 3891 bytes (VHT 3895 less FCS; covers HT 3839
+  plus QoS header and CCMP) and to `max_rc_amsdu_len` from the latest
+  firmware RA report (`fw.c::rtw_fw_ra_report_iter` bit rate via
+  `cfg80211_calculate_bitrate_{ht,vht}`, `get_max_amsdu_len`: below 55Mbps 1,
+  then 1200/2600/3500, unlimited from 700Mbps; unlimited before any report).
+  At most `PREFIX` = 8 same-TID admitted frames per aggregate; EAPOL and
+  other control-port protocols are never aggregated
+  (`narf_wireless::amsdu::encode`).
+- **Frame**: QoS DATA, A-MSDU-present, Address3 = BSSID
+  (`ieee80211_amsdu_prepare_head`), one SN; a protected association uses the
+  shared `Security::transmit_amsdu_qos` (one PN, CCMP over the whole
+  aggregate). Descriptor QSEL is the TID (A-MSDU bit masked); the PCI TX
+  buffers (`packet_core::Core::prepare`, four batch buffers) and the BD
+  length bound grow to `MAX_TX_MPDU`. MPDUs other than A-MSDUs keep the
+  2304-byte bound.
+- **Outside BA**: `send_batch` with no active agreement on the TID emits
+  one A-MSDU MPDU of the longest fitting prefix (at least two frames) on
+  the ordinary single-packet path; the interface hands `send_batch` a FIFO
+  prefix while `amsdu_ready` (`batch_capacity` 16).
+- **In A-MPDU**: ADDBA requests carry the A-MSDU-supported bit
+  (`agg-tx.c::ieee80211_send_addba_request`) only when the association is on
+  5GHz, so the qualified 2.4GHz N2xT request bytes are unchanged; native
+  `originator_control_tid` admits either value. A response without A-MSDU
+  permission for the TID sets the sticky per-TID `no_amsdu`
+  (`IEEE80211_TXQ_NO_AMSDU`, `ieee80211_process_addba_resp`). Each burst
+  subframe is one MSDU or one A-MSDU, chosen before any SN/PN is consumed
+  under the N2xT count/byte/airtime bound; `Aggregation::admits_lengths`
+  bounds a VHT descriptor rate by the HT20 MCS of the same stream count
+  (MCS8/9 by MCS7) instead of indexing past the HT table.
+
+Not covered: no RX direction change (RX A-MSDU/recipient permission is the
+existing R contract); no peer-specific `max_amsdu_subframes` (extended
+capabilities) is parsed, the 8-frame prefix bounds the subframe count; the
+RA report is read for mac_id 0 only. No physical 5GHz board run exists.
+Written, unexecuted:
+`smoke_rtw88_tx_amsdu_descriptor_admission_is_5ghz_only`,
+`smoke_rtw88_tx_amsdu_ra_report_bounds_max_rc_amsdu_len`,
+`smoke_rtw88_tx_ba_addba_amsdu_request_and_no_amsdu`,
+`smoke_rtw88_tx_amsdu_vht_aggregate_airtime_bound`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming
@@ -3033,7 +3088,7 @@ changes. None is a physical blocker unless stated.
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Driven only by coexistence (`rtw_vif_smps_iter` on `hal.txrx_1ss`), so blocked on `radio_coexistence`. |
 | `system_suspend` | Source-complete for actual C21/C22 identity-DMA PCI-PM D0 profiles: retained uncancelled native retirement/card-off/D3hot receipts, original-source C22 RFE6 DBI pad, D0/config restoration and fresh cold provisioning on the original netdev. Foreground cancellation rolls workers back; old keys/cookies never revive and fresh association stays explicit. Six native cases are written; release/native and physical S3 acceptance remain pending. |
-| `tx_amsdu_5ghz` | Blocked on `five_ghz_operation`. |
+| `tx_amsdu_5ghz` | Source-complete on 5GHz HT/VHT associations (see "5GHz TX A-MSDU and A-MSDU in A-MPDU"): gated producer, peer/allocation/RA-report size bound, CCMP over the aggregate, ADDBA A-MSDU request bit and NO_AMSDU. Four cases written, unexecuted; physical acceptance pending. |
 | `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
 | `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
 | `wow` | Source layer only (see "RTL8822CE Wake-on-WLAN source layer"): authenticated `wow_fw_name` load, `rtw_wow_swap_fw` download hook, full `wow.c` suspend/resume sequence, pattern CAM, WoW H2Cs and wake-reason decode with five unexecuted fixture cases. WPA2 AOAC security-CAM PTK/GTK install + software-CCMP restore (`security_cam.rs`). Native `wow::Io` over the reserved-page swap window and reversible host-DMA halt; `set_wowlan`/`wowlan_config`/`wowlan_support` advertised for C22; `system_pm_native` WoW branch (D3hot without card-off, cold fallback on any failure; RFE6 stays cold). Unexecuted fixtures; no physical board run. |

@@ -35,10 +35,13 @@ impl Core {
         if !port.originator_ba_allowed() || !cfg.admits(self.data_profile, frames) {
             return Err(Error::Access);
         }
-        let tid = *frames
+        // QoS TID without the A-MSDU-present bit; `transmit_profile` admits
+        // that bit only for a 5GHz HT/VHT profile.
+        let tid = frames
             .first()
             .and_then(|f| f.get(24))
-            .ok_or(Error::Packet)?;
+            .ok_or(Error::Packet)?
+            & 0x7f;
         let queue = self.data_profile.tid_queue(tid).ok_or(Error::Packet)?;
         let ring = queue_slot(queue);
         port.batch_allowed(tid, self.data_profile)?;
@@ -63,7 +66,7 @@ impl Core {
             .try_reserve(count)
             .map_err(|_| Error::Memory)?;
         for (slot, frame) in frames.iter().enumerate() {
-            if frame.len() < 26 || frame[0] != 0x88 || frame[24..26] != [tid, 0] {
+            if frame.len() < 26 || frame[0] != 0x88 || frame[24] & 0x7f != tid || frame[25] != 0 {
                 return Err(Error::Packet);
             }
             let sequence = (self.reports + slot as u8) << 2;

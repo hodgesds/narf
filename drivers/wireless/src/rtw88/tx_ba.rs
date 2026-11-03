@@ -65,6 +65,14 @@ pub(super) struct Originator {
     control: Option<Control>,
     active: Option<(u8, u16, u64)>,
     teardown: bool,
+    /// The ADDBA request carries the A-MSDU-supported bit
+    /// (`agg-tx.c::ieee80211_send_addba_request`); set only while the 5GHz
+    /// TX A-MSDU producer is admissible.
+    request_amsdu: bool,
+    /// The peer's ADDBA response cleared A-MSDU permission: like
+    /// `IEEE80211_TXQ_NO_AMSDU`, this TID stops aggregating MSDUs for the
+    /// rest of the association.
+    no_amsdu: bool,
 }
 impl Originator {
     #[cfg(feature = "kernel-test")]
@@ -79,7 +87,13 @@ impl Originator {
             control: None,
             active: None,
             teardown: false,
+            request_amsdu: false,
+            no_amsdu: false,
         }
+    }
+    /// `tx.c::ieee80211_amsdu_aggregate`'s `IEEE80211_TXQ_NO_AMSDU` test.
+    pub(super) fn amsdu_allowed(&self) -> bool {
+        !self.no_amsdu
     }
     pub(super) fn active(&self) -> Option<u8> {
         self.active.map(|a| a.0)
@@ -108,8 +122,14 @@ impl Originator {
         self.tried = true;
         let mut b = header(own, ap);
         b.extend_from_slice(&[0, self.dialog]);
-        // No TX A-MSDU producer is advertised by this dialog.
-        b.extend_from_slice(&(2 | u16::from(self.tid) << 2 | u16::from(window) << 6).to_le_bytes());
+        // A-MSDU support is requested only while the 5GHz producer may run.
+        b.extend_from_slice(
+            &(u16::from(self.request_amsdu)
+                | 2
+                | u16::from(self.tid) << 2
+                | u16::from(window) << 6)
+                .to_le_bytes(),
+        );
         b.extend_from_slice(&[0, 0]);
         b.extend_from_slice(&(ssn << 4).to_le_bytes());
         self.control = Some(Control {
@@ -163,6 +183,11 @@ impl Originator {
         }
         let p = u16::from_le_bytes([b[29], b[30]]);
         let window = p >> 6;
+        // `ieee80211_process_addba_resp`: a response for this TID without
+        // A-MSDU permission sets NO_AMSDU whether or not it is accepted.
+        if p & 1 == 0 && (p >> 2) & 15 == u16::from(self.tid) {
+            self.no_amsdu = true;
+        }
         if b[27..29] != [0, 0]
             || p & 2 == 0
             || (p >> 2) & 15 != u16::from(self.tid)
@@ -345,6 +370,17 @@ impl Originators {
     }
     pub(super) fn active(&self, tid: u8) -> Option<u8> {
         self.tids.get(usize::from(tid)).and_then(Originator::active)
+    }
+    /// Later ADDBA requests carry the A-MSDU-supported bit (5GHz producer).
+    pub(super) fn request_amsdu(&mut self, on: bool) {
+        for t in &mut self.tids {
+            t.request_amsdu = on;
+        }
+    }
+    pub(super) fn amsdu_allowed(&self, tid: u8) -> bool {
+        self.tids
+            .get(usize::from(tid))
+            .is_some_and(Originator::amsdu_allowed)
     }
     pub(super) fn any_active(&self) -> bool {
         self.tids.iter().any(|t| t.active().is_some())

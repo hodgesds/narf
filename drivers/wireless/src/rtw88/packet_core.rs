@@ -235,9 +235,9 @@ impl Core {
         if port.index(0x3b4)? & 0x0fff_0fff != 0 {
             return Err(Error::State);
         }
-        let frame = port.allocate(format::TX_DESC + format::MAX_MPDU)?;
+        let frame = port.allocate(format::TX_DESC + format::MAX_TX_MPDU)?;
         let base = frame.dma_addr().raw();
-        if frame.len() < format::TX_DESC + format::MAX_MPDU
+        if frame.len() < format::TX_DESC + format::MAX_TX_MPDU
             || base == 0
             || base & 3 != 0
             || base
@@ -252,9 +252,9 @@ impl Core {
             .try_reserve_exact(4)
             .map_err(|_| Error::Memory)?;
         for _ in 0..4 {
-            let buffer = port.allocate(format::TX_DESC + format::MAX_MPDU)?;
-            format::buffer_descriptor(buffer.dma_addr().raw(), format::MAX_MPDU)?;
-            if buffer.len() < format::TX_DESC + format::MAX_MPDU {
+            let buffer = port.allocate(format::TX_DESC + format::MAX_TX_MPDU)?;
+            format::buffer_descriptor(buffer.dma_addr().raw(), format::MAX_TX_MPDU)?;
+            if buffer.len() < format::TX_DESC + format::MAX_TX_MPDU {
                 return Err(Error::Address);
             }
             port.memory(|| copy_to(&buffer, 0, &[0; format::TX_DESC]))?;

@@ -160,13 +160,18 @@ impl State {
         if !self.ready() {
             return 0;
         }
+        // An aggregation prefix (up to four A-MPDU subframes of A-MSDUs);
+        // the interface never hands more than 16 frames.
+        if self.amsdu_ready() {
+            return 16;
+        }
         self.tx_ba_grant
             .as_ref()
             .filter(|_| self.tx_ba.any_active())
             .map_or(1, |g| g.count())
     }
     pub(in crate::rtw88) fn batch_active(&self) -> bool {
-        self.tx_config.is_some() && self.tx_ba.any_active()
+        self.tx_config.is_some() && self.tx_ba.any_active() || self.amsdu_ready()
     }
     /// Produce exact headers/PNs only after reserving native batch capacity.
     /// A failed publication consumes those values and terminally closes; no
@@ -206,6 +211,10 @@ impl State {
         }
         let tid = self.data_tid(first);
         if self.tx_ba.active(tid).is_none() {
+            // 5GHz: one A-MSDU MPDU of the same-TID admitted prefix.
+            if let Some(count) = self.send_amsdu_inner(io, frames, tid)? {
+                return Ok(count);
+            }
             // Consume only the original FIFO head. A different TID/VO/EAPOL
             // cannot be relabelled into an already active TID0 agreement.
             self.send_inner(io, first)?;
@@ -221,26 +230,39 @@ impl State {
         }
         io.packet_aggregation(Some(cfg))?;
         self.tx_config = Some(cfg);
-        let mut selected = Vec::new();
+        // Each A-MPDU subframe is one MSDU or (5GHz, peer-permitted) one
+        // A-MSDU of the next same-TID prefix. Every byte/airtime bound is
+        // checked before consuming any producer sequence or packet-key PN.
+        let mut selected: Vec<(usize, usize, usize)> = Vec::new();
         selected
-            .try_reserve_exact(frames.len().min(usize::from(cfg.count)))
+            .try_reserve_exact(usize::from(cfg.count))
             .map_err(|_| Error::State)?;
         let mut sizes = [0; 4];
-        for ethernet in frames.iter().take(usize::from(cfg.count)) {
+        let mut at = 0;
+        while at < frames.len() && selected.len() < usize::from(cfg.count) {
+            let ethernet = frames[at];
             if !admitted(ethernet, self.own) {
                 return Err(Error::Profile);
             }
-            // Select the complete same-TID FIFO prefix and all byte/airtime
-            // bounds before consuming any producer sequence or packet-key PN.
             if self.data_tid(ethernet) != tid {
                 break;
             }
-            let length = ethernet.len() + 20 + if self.security.is_some() { 16 } else { 0 };
-            sizes[selected.len()] = length;
-            if !cfg.admits_lengths(self.data_profile, sizes[..=selected.len()].iter().copied()) {
+            let slot = selected.len();
+            let fits = |length: usize| {
+                let mut s = sizes;
+                s[slot] = length;
+                cfg.admits_lengths(self.data_profile, s[..=slot].iter().copied())
+            };
+            let (count, length) = self.amsdu_prefix(&frames[at..], tid, fits).unwrap_or((
+                1,
+                ethernet.len() + 20 + if self.security.is_some() { 16 } else { 0 },
+            ));
+            sizes[slot] = length;
+            if !cfg.admits_lengths(self.data_profile, sizes[..=slot].iter().copied()) {
                 break;
             }
-            selected.push((*ethernet, length));
+            selected.push((at, count, length));
+            at += count;
         }
         if selected.is_empty() {
             return Err(Error::Profile);
@@ -250,11 +272,18 @@ impl State {
             .try_reserve_exact(selected.len())
             .map_err(|_| Error::State)?;
         let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
-        for (ethernet, length) in selected {
+        for (start, count, length) in selected {
             let expected = self.next_qos(tid)?;
-            let bytes = if let Some(s) = &mut self.security {
-                s.transmit_ethernet_qos(ethernet, tid)?
+            let bytes = if count > 1 {
+                let b = self.amsdu_mpdu(&frames[start..start + count], tid, expected)?;
+                if self.security.is_none() {
+                    self.qos_sequence[usize::from(tid)] = (expected + 1) & 4095;
+                }
+                b
+            } else if let Some(s) = &mut self.security {
+                s.transmit_ethernet_qos(frames[start], tid)?
             } else {
+                let ethernet = frames[start];
                 let mut b = vec![0x88, 1, 0, 0];
                 b.extend_from_slice(&ap);
                 b.extend_from_slice(&self.own);
@@ -288,6 +317,6 @@ impl State {
         }
         self.data_drain = Some((now, Some(tid)));
         self.tx_ba.note_tx(tid, now);
-        Ok(self.data_pending.len())
+        Ok(at)
     }
 }

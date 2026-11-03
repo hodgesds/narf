@@ -10,6 +10,13 @@ pub(super) const TX_BD: usize = 16;
 pub(super) const RX_DESC: usize = 24;
 pub(super) const RX_BD: usize = 8;
 pub(super) const MAX_MPDU: usize = 2304;
+/// TX allocation bound for one QoS A-MSDU MPDU without FCS: the smallest
+/// VHT maximum MPDU length (`IEEE80211_MAX_MPDU_LEN_VHT_3895`) less the
+/// hardware FCS. It also covers the default HT 3839-byte A-MSDU body plus
+/// the 26-byte QoS header and CCMP header/MIC (3881). Peers advertising a
+/// larger A-MSDU/MPDU length are narrowed to it; only a 5GHz HT/VHT QoS
+/// MPDU with the A-MSDU-present bit may exceed `MAX_MPDU`.
+pub(super) const MAX_TX_MPDU: usize = 3895 - 4;
 pub(super) const MAX_HT_RX: usize = 26 + 16 + narf_wireless::amsdu::MAX_BYTES;
 /// VHT RX MPDU bound including FCS (advertised maximum MPDU length 3895).
 pub(super) const MAX_VHT_RX: usize = 3895;
@@ -61,14 +68,16 @@ impl Aggregation {
         if bytes > usize::from(self.bytes) {
             return false;
         }
-        let symbols = (16 + bytes * 8 + 6).div_ceil(NDBPS[usize::from(profile.rate() - 12)]);
+        // A VHT descriptor rate is bounded by the HT20 MCS of the same stream
+        // count (MCS8/9 by MCS7), which never undercounts its airtime.
+        let rate = match profile.rate() {
+            r @ 0x2c..=0x35 => 12 + (r - 0x2c).min(7),
+            r @ 0x36.. => 20 + (r - 0x36).min(7),
+            r => r,
+        };
+        let symbols = (16 + bytes * 8 + 6).div_ceil(NDBPS[usize::from(rate - 12)]);
         bytes <= usize::from(self.bytes)
-            && (if profile.rate() >= 20 || profile.stbc {
-                40
-            } else {
-                36
-            }) + symbols * 4
-                + count * 16
+            && (if rate >= 20 || profile.stbc { 40 } else { 36 }) + symbols * 4 + count * 16
                 <= usize::from(self.airtime)
     }
 }
@@ -400,7 +409,15 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
     if profile.mcs != 0 && native_bar(frame) && originator_control(frame) && frame[10..16] == own {
         return Ok(Queue::Management);
     }
-    if !(24..=MAX_MPDU).contains(&frame.len())
+    // `mac80211.c::rtw_ops_can_aggregate_in_amsdu`: TX A-MSDU only outside
+    // 2.4GHz, on an HT/VHT QoS profile.
+    let amsdu = profile.band5
+        && profile.qos
+        && profile.mcs != 0
+        && frame.len() >= 26
+        && frame[0] == 0x88
+        && frame[24] & 0x80 != 0;
+    if !(24..=if amsdu { MAX_TX_MPDU } else { MAX_MPDU }).contains(&frame.len())
         || !unicast(&own)
         || frame[10..16] != own
         || frame[0] & 3 != 0
@@ -429,15 +446,17 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         0xd0 if profile.mcs != 0 && recipient_control(frame) => Ok(Queue::Management),
         0xd0 if profile.mcs != 0 && originator_control(frame) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
-        // QoS Control: TID only (normal ack, no EOSP/A-MSDU), byte1 zero.
+        // QoS Control: TID (normal ack, no EOSP), byte1 zero; the A-MSDU
+        // present bit only under the 5GHz `amsdu` admission above.
         0x88 if profile.qos
             && frame.len() >= 26
-            && frame[24] & 0xf0 == 0
+            && frame[24] & 0x70 == 0
+            && (frame[24] & 0x80 == 0 || amsdu)
             && frame[25] == 0
             && frame[1] & 3 == 1
             && unicast(&frame[4..10]) =>
         {
-            profile.tid_queue(frame[24]).ok_or(Error::Frame)
+            profile.tid_queue(frame[24] & 15).ok_or(Error::Frame)
         }
         _ => Err(Error::Frame),
     }
@@ -459,7 +478,9 @@ pub(super) fn originator_control_tid(b: &[u8]) -> Option<u8> {
         (33, 0) => {
             let p = u16::from_le_bytes([b[27], b[28]]);
             let tid = ((p >> 2) & 15) as u8;
-            (p & 3 == 2 && tid < 6 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0)
+            // Policy immediate; the A-MSDU-supported bit is the 5GHz
+            // producer's request (`agg-tx.c::ieee80211_send_addba_request`).
+            (p & 2 == 2 && tid < 6 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0)
                 .then_some(tid)
         }
         (30, 2) => {
@@ -590,7 +611,7 @@ pub(super) fn transmit_profile(
 }
 pub(super) fn buffer_descriptor(address: u64, length: usize) -> Result<[u8; TX_BD], Error> {
     let extent = TX_DESC.checked_add(length).ok_or(Error::Address)?;
-    if (!(24..=MAX_MPDU).contains(&length) && length != 20)
+    if (!(24..=MAX_TX_MPDU).contains(&length) && length != 20)
         || address == 0
         || address & 3 != 0
         || address
