@@ -320,6 +320,7 @@ fn smoke_xe_mtl_media_gt1_engine_cycles_and_topology() -> TestResult {
         geometry: 0,
         compute: 0x5,
         eu_per_dss: 0x00f3,
+        l3_bank: 0x0f0f,
     };
     let mut guc = start_media_with(&mw, &marena, topology);
     assert_eq!(
@@ -346,7 +347,8 @@ fn smoke_xe_mtl_media_gt1_engine_cycles_and_topology() -> TestResult {
     });
     info.backend = Some(sampler.clone());
     // query_gt_topology: GT0's entries unchanged, then GT1's geometry,
-    // compute and SIMD8 EU-per-DSS masks with gt_id 1.
+    // compute, 8-byte L3 bank (xe_gt_topology_report_l3: media before 30)
+    // and SIMD8 EU-per-DSS masks with gt_id 1.
     let topo = xe_query(&file, &info, &user, 5);
     assert_eq!(&topo[..gt0_topology.len()], &gt0_topology[..]);
     assert_eq!(
@@ -354,6 +356,7 @@ fn smoke_xe_mtl_media_gt1_engine_cycles_and_topology() -> TestResult {
         &[
             1, 0, 1, 0, 4, 0, 0, 0, 0, 0, 0, 0, // DSS_GEOMETRY
             1, 0, 2, 0, 4, 0, 0, 0, 5, 0, 0, 0, // DSS_COMPUTE
+            1, 0, 3, 0, 8, 0, 0, 0, 0x0f, 0x0f, 0, 0, 0, 0, 0, 0, // L3_BANK
             1, 0, 4, 0, 2, 0, 0, 0, 0xf3, 0, // EU_PER_DSS (SIMD8)
         ]
     );

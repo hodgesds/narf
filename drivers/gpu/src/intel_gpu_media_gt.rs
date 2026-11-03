@@ -219,8 +219,10 @@ impl MediaIp {
 /// forcewake (gt_init_with_gt_forcewake runs it for the media GT too). At
 /// graphics 12.70-12.74 get_num_dss_regs selects one geometry and one compute
 /// register, and load_eu_mask reads XELP_EU_ENABLE without inversion as SIMD8
-/// (one fuse bit is two EUs). Linux keeps whatever GT1 reports, including
-/// empty masks; nothing here is inferred from GT0.
+/// (one fuse bit is two EUs). load_l3_bank_mask runs too, and
+/// xe_gt_topology_report_l3 reports a media GT's L3 bank mask before media
+/// version 30. Linux keeps whatever GT1 reports, including empty masks;
+/// nothing here is inferred from GT0.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct MediaTopology {
     /// XELP_GT_GEOMETRY_DSS_ENABLE (0x913c + GSI).
@@ -229,12 +231,34 @@ pub struct MediaTopology {
     pub compute: u32,
     /// SIMD8 EU mask per DSS expanded from XELP_EU_ENABLE (0x9134 + GSI).
     pub eu_per_dss: u16,
+    /// xe_l3_bank_mask_t (XE_MAX_L3_BANK_MASK_BITS = 64) from MIRROR_FUSE3
+    /// (0x9118 + GSI) and XEHP_FUSE4 (0x9114 + GSI); see `l3_bank_mask`.
+    pub l3_bank: u64,
 }
 
 /// regs/xe_gt_regs.h topology fuse mirrors (pre-GSI offsets).
 const GEOMETRY_DSS_ENABLE: u64 = 0x913c;
 const COMPUTE_DSS_ENABLE: u64 = 0x9144;
 const EU_ENABLE: u64 = 0x9134;
+const MIRROR_FUSE3: u64 = 0x9118;
+const XEHP_FUSE4: u64 = 0x9114;
+
+/// xe_gt_topology.c::load_l3_bank_mask for GRAPHICS_VERx100 >= 1270 below
+/// graphics 20 (every MTL/Arrow GT, the media GT included, since the branch
+/// keys on the device's graphics IP): each GT_L3_EXC_MASK (XEHP_FUSE4 6:4)
+/// bit sets a two-bank pair of a node's pattern (gen_l3_mask_from_pattern
+/// with 0x3, 2 bits), and that pattern repeats every 4 bits for each
+/// MEML3_EN_MASK (MIRROR_FUSE3 3:0) node. Overlaps are ORed, as there.
+pub(crate) fn l3_bank_mask(fuse3: u32, fuse4: u32) -> u64 {
+    let nodes = fuse3 & 0xf;
+    let banks = (fuse4 >> 4) & 0x7;
+    let per_node = (0..3)
+        .filter(|bit| (banks >> bit) & 1 != 0)
+        .fold(0u64, |mask, bit| mask | (0x3 << (bit * 2)));
+    (0..4)
+        .filter(|node| (nodes >> node) & 1 != 0)
+        .fold(0, |mask, node| mask | (per_node << (node * 4)))
+}
 
 impl MediaTopology {
     /// Two identical samples of GT1's fuse mirrors under GT1 wake. As for
@@ -247,13 +271,15 @@ impl MediaTopology {
                 media.read32(GEOMETRY_DSS_ENABLE),
                 media.read32(COMPUTE_DSS_ENABLE),
                 media.read32(EU_ENABLE),
+                media.read32(MIRROR_FUSE3),
+                media.read32(XEHP_FUSE4),
             )
         };
         let first = sample();
         if first != sample() {
             return Err(MediaError::Unstable);
         }
-        let (geometry, compute, raw_eu) = first;
+        let (geometry, compute, raw_eu, fuse3, fuse4) = first;
         if raw_eu & !0xff != 0 {
             return Err(MediaError::Unavailable);
         }
@@ -264,6 +290,7 @@ impl MediaTopology {
             geometry,
             compute,
             eu_per_dss,
+            l3_bank: l3_bank_mask(fuse3, fuse4),
         })
     }
 }

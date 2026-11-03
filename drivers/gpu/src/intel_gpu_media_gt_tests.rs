@@ -1175,16 +1175,26 @@ kernel_test_in!(
 /// GT as well: XELP_GT_GEOMETRY_DSS_ENABLE, XEHP_GT_COMPUTE_DSS_ENABLE and
 /// XELP_EU_ENABLE through GT1's GSI window under GT wake, SIMD8 at graphics
 /// 12.7x. GT1 keeps whatever it reports (including empty masks) and GT0's
-/// own fuses are never read or reused.
+/// own fuses are never read or reused. load_l3_bank_mask's 12.70 branch also
+/// reads GT1's MIRROR_FUSE3 and XEHP_FUSE4.
 fn smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake() -> TestResult {
     let soc = Soc::new(MEDIA_1300, SPARSE_FUSE);
     // GT0's fuses differ; GT1 must report only its own mirrors.
-    for (reg, value) in [(0x913c, 0xff), (0x9144, 0xf0), (0x9134, 0xff)] {
+    for (reg, value) in [
+        (0x913c, 0xff),
+        (0x9144, 0xf0),
+        (0x9134, 0xff),
+        (0x9118, 0xf),
+        (0x9114, 0x70),
+    ] {
         soc.set(reg, value);
     }
     soc.set(0x38913c, 0x0000_0003);
     soc.set(0x389144, 0x0000_0006);
     soc.set(0x389134, 0b1000_0101);
+    // MEML3_EN nodes 0 and 2; GT_L3_EXC_MASK bank pairs 0 and 1.
+    soc.set(0x389118, 0b0101);
+    soc.set(0x389114, 0b011 << 4);
     let mut owner = MediaGt::new(MTL, 1274);
     let (result, _) = drive(&mut owner, &soc, 0, 100_000);
     let Ok(facts) = result else {
@@ -1197,6 +1207,8 @@ fn smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake() -> TestResult 
             compute: 6,
             // load_eu_mask: each enabled fuse bit is a pair of SIMD8 EUs.
             eu_per_dss: 0xc033,
+            // Node pattern 0b1111 at bits 0 and 8.
+            l3_bank: 0x0f0f,
         }
     );
     // Read under GT wake, after the engine fuse and before any engine well.
@@ -1205,11 +1217,14 @@ fn smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake() -> TestResult 
     let geometry = soc.first_read(0x38913c);
     let compute = soc.first_read(0x389144);
     let eu = soc.first_read(0x389134);
+    let fuse3 = soc.first_read(0x389118);
+    let fuse4 = soc.first_read(0x389114);
     let wells = soc.first_write(0x38a540, 0x0001_0001);
     kt_assert!(gt_wake.is_some() && gt_wake < fuse && fuse < geometry);
     kt_assert!(geometry < compute && compute < eu && eu < wells);
+    kt_assert!(eu < fuse3 && fuse3 < fuse4 && fuse4 < wells);
     kt_assert_eq!(soc.topology_reads.get(), 2, "two identical samples");
-    for gt0 in [0x913c, 0x9144, 0x9134] {
+    for gt0 in [0x913c, 0x9144, 0x9134, 0x9118, 0x9114] {
         kt_assert!(soc.first_read(gt0).is_none(), "GT0 fuse never read");
     }
     kt_assert!(soc.gt0_untouched());
@@ -1245,4 +1260,33 @@ fn smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake
+);
+
+/// xe_gt_topology.c::load_l3_bank_mask for GRAPHICS_VERx100 >= 1270 below
+/// graphics 20: GT_L3_EXC_MASK (XEHP_FUSE4 6:4) bits select two-bank pairs
+/// of one node's pattern and every MEML3_EN_MASK (MIRROR_FUSE3 3:0) node
+/// repeats it 4 bits further, ORing any overlap as gen_l3_mask_from_pattern.
+fn smoke_media_gt_topology_l3_bank_mask_follows_xe_gt_topology() -> TestResult {
+    use crate::intel_gpu_gt::media::l3_bank_mask;
+    for (fuse3, fuse4, mask) in [
+        (0, 0x70, 0),
+        (0xf, 0, 0),
+        (0x1, 0x10, 0x3),
+        (0x1, 0x30, 0xf),
+        (0x5, 0x30, 0x0f0f),
+        (0xf, 0x30, 0xffff),
+        (0x8, 0x20, 0xc000),
+        // Pair 2 (bits 5:4) reaches into the next node's pattern.
+        (0x3, 0x40, 0x330),
+        (0x3, 0x70, 0x3ff),
+        // Bits outside MEML3_EN_MASK and GT_L3_EXC_MASK are ignored.
+        (0xffff_fff1, 0xffff_ff9f, 0x3),
+    ] {
+        kt_assert_eq!(l3_bank_mask(fuse3, fuse4), mask);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gt_topology_l3_bank_mask_follows_xe_gt_topology
 );

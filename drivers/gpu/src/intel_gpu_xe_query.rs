@@ -289,10 +289,14 @@ fn query_wire(
             // query_gt_topology walks for_each_gt: the published media GT
             // follows with its own GSI-read fuses in the same per-GT layout
             // (geometry, compute, then SIMD8 EU per DSS at graphics 12.7x).
+            // xe_gt_topology_report_l3 keeps a media GT's L3 bank entry
+            // before media version 30, as xe_l3_bank_mask_t's 8 bytes. GT0's
+            // entries above remain NARF's existing ones (no L3 bank entry).
             if let Some(media) = info.backend.as_ref().and_then(|b| b.media_gt()) {
                 masks.extend([
                     (1, 1, media.topology.geometry.to_le_bytes().to_vec()),
                     (1, 2, media.topology.compute.to_le_bytes().to_vec()),
+                    (1, 3, media.topology.l3_bank.to_le_bytes().to_vec()),
                     (1, 4, media.topology.eu_per_dss.to_le_bytes().to_vec()),
                 ]);
             }
