@@ -2308,7 +2308,7 @@ production feature. Unsupported functionality remains unadvertised.
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC not enabled (DSM allocator exclusivity is provable read-only; boot-framebuffer retirement and a console frontbuffer-flush hook outside drivers/gpu remain); color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region and boot-framebuffer pages, proven outside system RAM; color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -3422,7 +3422,7 @@ that state:
 | PSR enable / KMS inhibit / dirty notify | Enable runs at probe before the service exists, in firmware DC0. Inhibit runs inside a `Guard` takeover or recovery. Notify holds a reference. |
 | PWM backlight | Unreachable: `backlight_supported()` is Gen12-only. |
 | Full-AUX backlight | Fixed in this slice: reference per AUX transaction, availability probe, PPS gate access and relight step. The earlier "owner installed" re-entry gate is removed. |
-| HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. External admission is Gen12-only, and the bridge takes `legacy()`. |
+| HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. External admission is Gen12-only, and the bridge takes `legacy()`. Display-14 external routes and HPD (integrated from the outputs lane) must hold `DcUser::ExternalRoute` for the route lifetime and `DcUser::Hotplug` per HPD or probe pass. |
 | Frame-counter, scanline and pipe-status reads | Under `Guard`, the modeset reference or the format-refresh reference. |
 | Format discovery (GETPLANE, IN_FORMATS) | `publish_console_formats` runs under Init at install, under `LegacyGuard` on console replacement, and under the publication-refresh reference. |
 | debugfs / sysfs readers | No debugfs. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
@@ -3432,36 +3432,58 @@ that state:
 
 Refused and remaining work:
 
-- **FBC is not implemented.** The pinned `intel_fbc.c` places the compressed
-  framebuffer in stolen memory and programs `ILK_DPFC_CB_BASE` with a byte
-  offset inside DSM, so no CPU mapping is needed.
-  - On MTL, `xe_ttm_stolen_mgr.c::detect_bar2_integrated` sizes DSM from GGC
-    (0x108040, GMS field) and carves off the WOPCM on top (`STOLEN_RESERVED`
-    0x1082C0). It also carves off a BIOS `Wa_14019821291` GSC region found
-    through the media GT's `GSCPSMI_BASE`. The physical base is
-    `INTEL_GEN11_BSM_DW0/1` (PCI config 0xC0/0xC4).
-  - Page-allocator exclusivity of that range is provable read-only: the buddy
-    allocator is seeded only from Usable boot regions, and
-    `narf_memory::frame::is_system_ram` is false for every page it could own.
-    No memory/ change is needed for that half.
-  - Two blockers remain outside `drivers/gpu`. First, the boot GOP
-    framebuffer sits inside DSM behind the BAR2 aperture, and its CPU writers
-    in `graphics/` and `fb/` (boot console, panic sinks) have not been proven
-    retired after the KMS publish. Second, the kernel console draws into the
-    owned scanout with no per-draw frontbuffer-flush hook, and FBC needs a nuke
-    after every CPU write.
-  - Nothing enables FBC, and KMS takeover keeps refusing an inherited
-    `FBC_CTL` enable.
+- **FBC is limited to KMS-owned framebuffers.** `intel_gpu_fbc` drives FBC A
+  on the fixed MTL/Arrow Pipe-A primary only while that plane scans out a
+  KMS-owned GEM framebuffer. It is never used on the console or boot
+  framebuffer. This sidesteps both blockers the earlier record named.
+  - **Lifecycle:**
+    - Every KMS session starts with `intel_fbc_invalidate`.
+    - The latch of each flip, and of each DIRTYFB re-present, runs
+      `__intel_fbc_flush`: an active FBC is nuked, and an inactive eligible
+      one is activated (activation ends with a nuke).
+    - Console restore, legacy guards and reset recovery disable FBC first.
+      Recovery disables it through a loss-tolerant view, so the inherited
+      fetcher inventory never sees this driver's FBC.
+    - An FBC this driver did not activate is never touched, and KMS takeover
+      still refuses it.
+  - **Eligibility** is display 14's `intel_fbc_check_plane`: XRGB8888 and
+    similar formats only (the XR30 input is refused); no PSR1 (Wa_14016291713;
+    no stepping readout, so refused on every display 14 part); no selective
+    update; the size limits. Display 14 has no FBC CDCLK term and no FBC
+    watermark term, so no worker-A hook was needed.
+  - **CFB:** stride and size follow `_intel_fbc_cfb_stride`, the limit
+    follows `find_compression_limit`, and the base must be below 2^28.
+  - **Hardware conversation:** Wa_22014263786 and wa_18038517565, `CB_BASE`,
+    then the `GLK_FBC_STRIDE` override, `DPFC_CONTROL`, and a nuke.
+  - **CFB placement** is in DSM, done by `intel_gpu_stolen` per
+    `detect_bar2_integrated`. It excludes the first 4 KiB, the WOPCM above
+    `STOLEN_RESERVED`, everything above the media GT's Wa_14019821291
+    `GSCPSMI_BASE`, and every DSM page that a present DM PTE maps inside the
+    CPU-mappable GGTT range `[0, BAR2 length)`. That last exclusion is the
+    boot framebuffer and any other aperture writer; this driver never writes
+    a DM PTE. Every placed page is then proven not system RAM
+    (`narf_memory::frame::is_system_ram`), so the page allocator can never
+    own it.
+  - **Placement is bounded:** two ranges per function, and the CFB is
+    retained for the card's lifetime. A failed placement is not retried.
+  - **Cost and trade-off:**
+    - The aperture scan reads one 64-bit PTE per 4 KiB of BAR2, once per
+      card, at the first eligible latch.
+    - A cursor- or color-only session leaves FBC off until the next flip;
+      that is conservative and loses compression in the meantime.
+    - Reading `GSCPSMI_BASE` without media forcewake can return 0. That is
+      treated, as xe treats it, as "workaround not applied".
 - **PSR2 selective fetch and panel replay remain unqualified** (§10).
 - **Other remaining display power work:** per-well reference counts beyond
   DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
   at suspend, DC3CO, pipe DMC programs, and display stepping.
 
-Eighteen native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc` there are four:
+Twenty-seven native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc`
+there are four:
 `smoke_xelpdp_dmc_parse_skips_pipe_programs`,
 `smoke_xelpdp_dmc_parse_refusals`, `smoke_xelpdp_dmc_load_conversation` and
 `smoke_xelpdp_dmc_disable_and_geometry`. In
-`drivers/gpu/intel_gpu_dc_states` there are thirteen:
+`drivers/gpu/intel_gpu_dc_states` there are fourteen:
 `smoke_dc_states_register_facts_pinned`,
 `smoke_dc_states_write_stick_discipline`,
 `smoke_dc_states_init_held_until_program_loaded`,
@@ -3473,8 +3495,8 @@ Eighteen native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc` there 
 `smoke_dc_states_program_loss_reloads_before_reentry`,
 `smoke_dc_states_arm_gates_refuse`,
 `smoke_dc_states_firmware_authority_refusal`,
-`smoke_dc_states_reference_inert_without_service` and
-`smoke_dc_states_audit_unreachable_display_paths_on_mtl`. In
+`smoke_dc_states_reference_inert_without_service`,
+`smoke_dc_states_audit_unreachable_display_paths_on_mtl` and `smoke_dc_states_external_route_guard_blocks_reentry`. In `drivers/gpu/intel_gpu_stolen` there are two: `smoke_stolen_discovery_decodes_pinned_fields` and `smoke_stolen_cfb_avoids_boot_fb_wopcm_and_gsc`. In `drivers/gpu/intel_gpu_fbc` there are six: `smoke_fbc_display14_eligibility_and_console_refusal`, `smoke_fbc_cfb_geometry_and_compression_limit`, `smoke_fbc_enable_activate_nuke_conversation`, `smoke_fbc_flush_nukes_on_flip_and_dirtyfb`, `smoke_fbc_disabled_before_console_reclaim_suspend_and_reset` and `smoke_fbc_inherited_enable_untouched_and_refused`. In
 `drivers/gpu/intel_gpu_aux` there is one:
 `smoke_intel_aux_backlight_every_register_access_holds_display_power`. These
 are register-model fixtures. The physical KMS, modeset, publication, suspend

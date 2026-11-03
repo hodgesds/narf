@@ -2663,6 +2663,22 @@ inert elsewhere):
 - The full-AUX panel-backlight transport (`PanelAccess::power`) holds a
   reference for each AUX transaction, availability probe, PPS gate access and
   relight step; a refused reference reads as unavailable.
+- `acquire_for_bar(bar, DcUser::ExternalRoute)` is held by an external route
+  owner from activation until its stop is verified, which blocks DC
+  re-entry. `DcUser::Hotplug` covers each HPD pass and each connect-time
+  AUX/PHY probe.
+
+`intel_gpu_stolen` decodes display-14 DSM (`layout` from GGC,
+`STOLEN_RESERVED`, the media `GSCPSMI_BASE`, BAR2 and PCI BSM). It excludes
+aperture-reachable DM-PTE pages (`aperture_dsm_pages`). `Dsm::place`
+first-fits a bounded range and proves every page is not system RAM.
+`intel_gpu_fbc` provides display 14's `check_plane`, the CFB
+stride/size/limit helpers and the `Fbc` owner. The owner's
+`enable`/`activate`/`nuke`/`invalidate`/`flush`/`disable` methods never touch
+an FBC it did not activate. KMS uses `Platform::fbc_carve` and
+`fbc_recovery_view` (both inert by default). Every session invalidates; a
+latched `present` flushes; console restore, legacy guards and recovery
+disable.
 - KMS install creates the service. The GT publication hook acquires, loads
   and releases. `quiesce_for_legacy` brackets system-suspend preparation.
 
