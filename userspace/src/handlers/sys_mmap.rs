@@ -835,6 +835,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // this point, but it cannot recycle the backing while this Arc is
             // held and then transferred into the mapping-owner table.
             narf_filesystem::mmap_relocation::install(crate::mapped_file::relocate_device_frames);
+            narf_filesystem::mmap_relocation::install_revocation(
+                crate::mapped_file::revoke_device_frames,
+            );
+            crate::mapped_file::install_device_refault_wait();
             let backing = match ops.mmap_backing(offset, len as usize) {
                 Ok(backing) => Some(backing),
                 Err(narf_filesystem::FsError::Unsupported) => None,

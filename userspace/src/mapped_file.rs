@@ -197,6 +197,56 @@ pub(crate) fn relocate_device_frames(
     })
 }
 
+/// The device-revocation half of the same bridge (Linux
+/// `unmap_mapping_range` for a runtime-suspending device): every process
+/// root, plus the active one, is the snapshot the memory census checks.
+/// Installs the refault waiter first, so a fault on the range can park.
+pub(crate) fn revoke_device_frames(
+    start: u64,
+    len: u64,
+    census: narf_memory::address_space::DeviceAliasCensus,
+    refault: Arc<dyn narf_memory::address_space::DeviceFrameRefault>,
+) -> Result<narf_memory::address_space::DeviceFrameRevocation, FsError> {
+    install_device_refault_wait();
+    let mut spaces = crate::handlers::all_address_spaces();
+    if let Some(current) = crate::handlers::active_user_as() {
+        if !spaces.iter().any(|space| Arc::ptr_eq(space, &current)) {
+            spaces.push(current);
+        }
+    }
+    // SAFETY: the driver owns the aperture and its alias census for as long
+    // as the returned handle lives; the snapshot's Arcs keep roots live and
+    // the census covers unpublished fork metadata.
+    unsafe {
+        narf_memory::address_space::revoke_device_frames(
+            &spaces,
+            PhysAddr::new(start),
+            len,
+            census,
+            refault,
+        )
+    }
+    .map_err(|error| match error {
+        AddressSpaceError::AllocationFailed => FsError::OutOfMemory,
+        AddressSpaceError::AlignmentMismatch => FsError::InvalidData,
+        _ => FsError::Busy,
+    })
+}
+
+/// Make faults on revoked device frames park instead of failing. Installed
+/// on the device mmap path and before every revocation.
+pub(crate) fn install_device_refault_wait() {
+    narf_memory::address_space::install_refault_wait(Some(wait_device_refault));
+}
+
+/// Parks the faulting own-stack task on the driver's refault, exactly as a
+/// file fault parks on its read (`demand_frame`).
+fn wait_device_refault(
+    future: narf_memory::address_space::DeviceRefaultFuture,
+) -> Option<Result<(), narf_memory::address_space::DeviceRefaultError>> {
+    crate::handlers::poll_io_to_completion(future)
+}
+
 #[derive(Clone)]
 struct FileWriteback {
     offset: u64,
