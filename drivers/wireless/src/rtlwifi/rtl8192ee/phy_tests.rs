@@ -340,3 +340,64 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_channel_and_bw40
 );
+
+/// `_rtl92ee_phy_simularity_compare`: signed odd entries, the zero-RX
+/// candidate rule and per-section copies into `result[3]`.
+fn smoke_rtl8192ee_iqk_simularity_compare() -> TestResult {
+    use super::iqk::simularity_compare;
+    let mut r = [[0u32; 8]; 4];
+    r[0] = [0x100, 0x3fe, 0x100, 0x10, 0x100, 0, 0x100, 0];
+    r[1] = [0x101, 0x002, 0x100, 0x10, 0x100, 0, 0x100, 0];
+    if !simularity_compare(&mut r, 0, 1) {
+        return TestResult::Fail("-2 and +2 are within MAX_TOLERANCE");
+    }
+    r[1][2] = 0x120;
+    r[3] = [0; 8];
+    if simularity_compare(&mut r, 0, 1) || r[3][0] != 0x100 || r[3][2] != 0 || r[3][4] != 0x100 {
+        return TestResult::Fail("path A RX mismatch must not copy RX, but TX/B");
+    }
+    // c2 RX all zero names c1 as the path-A RX candidate; the [3] mismatch
+    // still sets the bitmap, so only the agreeing TX section is copied.
+    let mut r = [[0u32; 8]; 4];
+    r[0] = [0x100, 0, 0x120, 0x10, 0, 0, 0, 0];
+    r[1] = [0x101, 0, 0, 0, 0, 0, 0, 0];
+    if simularity_compare(&mut r, 0, 1) || r[3][0] != 0x100 || r[3][1] != 0 {
+        return TestResult::Fail("zero-RX candidate selection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_iqk_simularity_compare
+);
+
+/// Full `rtl92ee_phy_iq_calibrate(false)` on an idle model: runs 0 and 1
+/// agree (candidate 0), MAC/BB backups reloaded after run 1.
+fn smoke_rtl8192ee_iqk_full_run_restores_backups() -> TestResult {
+    let io = RfFake::new();
+    {
+        let mut g = io.0.lock();
+        g.regs[0x522] = 0x12;
+        g.regs[0xc04] = 0x33;
+        g.regs[0x85c] = 0x44;
+    }
+    let report = match narf_scheduler::block_on(super::iqk::calibrate(&io)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("calibrate failed on the model"),
+    };
+    if report.final_candidate != 0 {
+        return TestResult::Fail("identical runs must select candidate 0");
+    }
+    let g = io.0.lock();
+    if g.regs[0x522] != 0x12 || g.regs[0xc04] != 0x33 || g.regs[0x85c] != 0x44 {
+        return TestResult::Fail("MAC/BB/ADDA backups not reloaded");
+    }
+    if g.regs[usize::from(super::iqk::RFPGA0_IQK) + 3] != 0 {
+        return TestResult::Fail("left in IQK mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_iqk_full_run_restores_backups
+);

@@ -29,6 +29,9 @@
 //! - [`txpower`] — factory TX power decode and the TXAGC writes
 //!   (`_rtl92ee_read_txpower_info_from_hwpg`, `rtl92ee_phy_set_txpower_level`).
 //! - [`channel`] — `rtl92ee_phy_sw_chnl` and `rtl92ee_phy_set_bw_mode` (20/40).
+//! - [`iqk`] — `rtl92ee_phy_iq_calibrate` (paths A and B, three-run
+//!   similarity selection, matrix fill, result-register recovery) and
+//!   `_rtl92ee_phy_lc_calibrate`.
 //! - `packet_owner.rs` — the BD-ring profile of the retained owner, mounted
 //!   as `prepare::packet::ee92` (allocation, publication, TXBD_IDX
 //!   doorbells, RXQ_TXBD_IDX consumption and the deferred DMA releases).
@@ -39,6 +42,7 @@ pub mod adapter;
 pub mod channel;
 pub mod fw;
 pub mod headerfile;
+pub mod iqk;
 pub mod mac;
 pub mod phy;
 pub mod pwrseq;

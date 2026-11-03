@@ -2174,6 +2174,18 @@ diagnostic (`pci::bring_up` does not retain it).
   RRSR+2 sub-channel, RFMOD, `0xce4[31:30]`, CCK sideband, LSTF, `0x818
   [27:26]`) and `rtl92ee_phy_rf6052_set_bandwidth` (`rfreg_chnlval[0]` to
   both paths, as Linux).
+- `iqk` — `rtl92ee_phy_iq_calibrate(false)`: up to three
+  `_rtl92ee_phy_iq_calibrate(t, is2t)` runs (t = 0 backs up 16 ADDA, the
+  `0x522/0x550/0x551` bytes + `0x040` dword and 9 BB registers; ADDA on
+  `0x0fc01616`, IQK BB setup, `0x520[23:16] = 0xff`; two retries each of
+  path A TX/RX, path-A standby, path B TX/RX; reloads only for t != 0,
+  incl. Linux's double `0xc50 = 0x50`), `_rtl92ee_phy_simularity_compare`
+  (signed odd entries, MAX_TOLERANCE 5, zero-RX candidate rule), the
+  matrix fills with Linux's u32 wrapping and unmasked values (Linux's
+  path-B fill reads/writes `ROFDM0_XATXIQIMBALANCE`; kept) and the save of
+  the nine result registers (`recover` = `b_recovery`).
+  `_rtl92ee_phy_lc_calibrate(false)` is implemented but, as in Linux
+  (no caller on 8192EE), not run.
   Test `smoke_rtl8192ee_tables_and_check_condition_walk` (written,
   unexecuted).
 
