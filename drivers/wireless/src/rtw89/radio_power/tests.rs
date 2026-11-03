@@ -282,3 +282,56 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_power_rfe_selection_signed_decoding_and_invalid_override_fail_closed
 );
+fn smoke_rtw89_b_power_plan_selects_actual_primary_limits_fir_and_binding() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let Ok(initial) = Plan::fixture_defaults() else {
+        return TestResult::Fail("initial power fixture");
+    };
+    if initial.channel() != Profile::INITIAL
+        || initial.limits_and_ru() != (channels::CHANNELS[0].limits, channels::CHANNELS[0].ru)
+    {
+        return TestResult::Fail("initial plan lost its exact channel1 source limits");
+    }
+    let digest = |plan: &Plan| {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        plan.bind(&mut hash);
+        hash.finalize()
+    };
+    let mut seen = alloc::vec::Vec::new();
+    for primary in 1..=14u8 {
+        let Some(profile) = Profile::new(Band::Ghz2, primary) else {
+            return TestResult::Fail("typed2.4GHz primary refused");
+        };
+        let Ok(plan) = Plan::fixture_defaults_for_channel(profile) else {
+            return TestResult::Fail("per-channel power fixture");
+        };
+        let source = channels::CHANNELS[usize::from(primary - 1)];
+        if plan.channel() != profile || plan.limits_and_ru() != (source.limits, source.ru) {
+            return TestResult::Fail("plan did not select the actual primary limits/RU");
+        }
+        let fir = profile.cck_fir(0);
+        if (primary == 14) != (fir[0] == 0x023b13ff)
+            || profile.cck_fir(1)[0] == fir[0] && primary != 14
+        {
+            return TestResult::Fail("CCK DFIR shape/channel14 selection differs from Linux");
+        }
+        let hash = digest(&plan);
+        if seen.contains(&hash) {
+            return TestResult::Fail("distinct primaries share one power binding");
+        }
+        seen.push(hash);
+    }
+    if digest(&initial) != seen[0] {
+        return TestResult::Fail("channel1 fixture binding changed between constructors");
+    }
+    // Linux rtw8852b_table.c WW: 40MHz CCK is invalid on1/2 and12..14.
+    let at = |primary: u8| channels::CHANNELS[usize::from(primary - 1)].limits[0][2];
+    if at(1) != 0 || at(2) != 0 || at(3) != 50 || at(6) != 56 || at(12) != 0 || at(14) != 0 {
+        return TestResult::Fail("frozen per-channel limits differ from the Linux table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_power_plan_selects_actual_primary_limits_fir_and_binding
+);

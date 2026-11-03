@@ -2,6 +2,7 @@
 // Original B static power SHA256 d8db5fb88a09dc7ae56f6bbe60c472a7e194b4dec260d5a0341afd317a6df276
 use super::Plan;
 pub(super) const DEFAULT: Plan = Plan {
+    channel: super::Profile::INITIAL,
     byrate: [
         80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 76, 72, 80, 80, 80, 80, 80, 76, 72, 68, 64, 60, 56,
         52, 80, 80, 80, 80, 80, 80, 80, 80, 80, 76, 72, 68, 64, 60, 56, 52, 80, 80, 80, 80,

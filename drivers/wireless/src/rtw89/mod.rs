@@ -95,6 +95,7 @@ mod mac_runtime;
 mod mac_runtime_regs;
 mod monitor;
 mod monitor_wire;
+mod operating_channel;
 mod packet_core;
 mod packet_format;
 pub mod pci;

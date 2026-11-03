@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! Exact B fixed WW/ch1/20 power *configuration*, never a dBm authorization.
 //! Final measured peaks and current host policy independently gate emission.
+use super::operating_channel::Profile;
 use super::{
     radio_assets::{Assets, Element},
     rfk::{Error, Interface},
 };
+#[path = "operating_power_defaults.rs"]
+mod channels;
 #[path = "radio_power/defaults.rs"]
 mod defaults;
 #[path = "radio_power/recipe.rs"]
@@ -12,6 +15,7 @@ mod recipe;
 pub(super) const RECIPE: [u8; 32] = recipe::RECIPE;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
+    channel: Profile,
     byrate: [i8; 44],
     offset: [i8; 5],
     limits: [[i8; 8]; 2],
@@ -61,19 +65,48 @@ fn entries(
     }))
 }
 impl Plan {
+    pub(super) fn channel(&self) -> Profile {
+        self.channel
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::rtw89) fn fixture_defaults() -> Result<Self, Error> {
         Self::from_elements(&[], 1)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::rtw89) fn fixture_defaults_for_channel(channel: Profile) -> Result<Self, Error> {
+        Self::from_elements_for_channel(&[], 1, channel)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::rtw89) fn limits_and_ru(&self) -> ([[i8; 8]; 2], [[i8; 3]; 2]) {
+        (self.limits, self.ru)
     }
 
     pub fn from_assets(assets: &Assets, rfe: u8) -> Result<Self, Error> {
         Self::from_elements(assets.elements(), rfe)
     }
+    pub(super) fn from_assets_for_channel(
+        assets: &Assets,
+        rfe: u8,
+        channel: Profile,
+    ) -> Result<Self, Error> {
+        Self::from_elements_for_channel(assets.elements(), rfe, channel)
+    }
     fn from_elements(elements: &[Element], rfe: u8) -> Result<Self, Error> {
+        Self::from_elements_for_channel(elements, rfe, Profile::INITIAL)
+    }
+    fn from_elements_for_channel(
+        elements: &[Element],
+        rfe: u8,
+        channel: Profile,
+    ) -> Result<Self, Error> {
         if rfe == 255 {
             return Err(Error::Policy);
         }
         let mut plan = defaults::DEFAULT;
+        plan.channel = channel;
+        let captured = channels::CHANNELS[usize::from(channel.primary() - 1)];
+        plan.limits = captured.limits;
+        plan.ru = captured.ru;
         if let Some(bytes) = selected(elements, 9, rfe)? {
             plan.byrate = [0; 44];
             plan.offset = [0; 5];
@@ -134,7 +167,7 @@ impl Plan {
                 if e[0] >= 2 || e[1] >= 2 || e[2] >= 3 || e[3] >= 2 || e[4] >= 16 || e[5] >= 14 {
                     return Err(Error::Table);
                 }
-                if e[4] != 0 || e[5] != 0 {
+                if e[4] != 0 || e[5] != channel.primary() - 1 {
                     continue;
                 }
                 let base = match (e[0], e[2]) {
@@ -153,7 +186,7 @@ impl Plan {
                 if e[0] >= 8 || e[1] >= 2 || e[2] >= 16 || e[3] >= 14 {
                     return Err(Error::Table);
                 }
-                if e[0] < 3 && e[2] == 0 && e[3] == 0 {
+                if e[0] < 3 && e[2] == 0 && e[3] == channel.primary() - 1 {
                     plan.ru[e[1] as usize][e[0] as usize] = e[4] as i8;
                 }
             }
@@ -174,7 +207,12 @@ impl Plan {
     /// Bind signed source units and the exact fixed power/response profile. These
     /// bytes make no physical power claim; measured conducted maxima are separate.
     pub fn bind(&self, hash: &mut narf_crypto::sha256::Sha256) {
-        hash.update(b"B WW0 ch1 20 source RF2 MAC1 BB3;equal A/B ref0;CCK+OFDM autoresponse;no SAR/antenna offset curves");
+        if self.channel == Profile::INITIAL {
+            hash.update(b"B WW0 ch1 20 source RF2 MAC1 BB3;equal A/B ref0;CCK+OFDM autoresponse;no SAR/antenna offset curves");
+        } else {
+            hash.update(b"B WW0 native noninitial2.4GHz20 source RF2 MAC1 BB3;equal A/B ref0;actual perchannel CCK/OFDM/MCS/RU limits;no inferred dBm/SAR/antenna offset curves");
+            self.channel.bind(hash);
+        }
         for row in [
             &self.byrate[..],
             &self.offset[..],
@@ -202,17 +240,7 @@ impl Plan {
             offset |= ((i32::from(*v >> 1) as u32) & 15) << (4 * i);
         }
         emit(0xd204, 0xfffff, offset)?;
-        let fir = if self.shape[0] == 0 {
-            [
-                0x023d23ff, 0x0029b354, 0x000fc1c8, 0x00fdb053, 0x00f86f9a, 0x06faef92, 0x00fe5fcc,
-                0x00ffdff5,
-            ]
-        } else {
-            [
-                0x023d83ff, 0x002c636a, 0x0013f204, 0x00008090, 0x00f87fb0, 0x06f99f83, 0x00fdbfba,
-                0x00003ff5,
-            ]
-        };
+        let fir = self.channel.cck_fir(self.shape[0]);
         for (i, v) in fir.into_iter().enumerate() {
             emit(0x10000 + 0x2300 + i as u32 * 4, u32::MAX, v)?;
         }

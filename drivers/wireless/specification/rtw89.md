@@ -2120,6 +2120,56 @@ ownership. All old literal registrations are retained. Cases and physical
 acceptance are pending; no native pass or throughput claim is made here. Exact
 local Linux file hashes accompany the source handoff.
 
+### RTL8852B noninitial 2.4GHz/20MHz retune composition (partial; no native caller)
+
+`operating_channel::Profile` is the typed 2.4GHz/20MHz primary (1..=14, any
+other band refused) with the Linux 7.3-rc4 rtw8852b_common.c SCO barker/CCK
+thresholds, `rtw8852bx_sco_mapping` compensation, CCK TXFIR / tx-shape DFIR
+(flat/sharp, sharp_14 for 14) and rtw8852b_rfk.c `_tssi_get_{cck,ofdm,trim}_group`.
+`radio_power::Plan::from_assets_for_channel` selects that primary's WW0 limits
+and RU limits (`operating_power_defaults.rs`, all 14x2 rows machine-compared to
+rtw8852b_table.c) and binds a distinct noninitial header plus the profile;
+channel 1 keeps its original binding bytes. The v2 `radio_policy::Board`
+constructor refuses any noninitial plan, so no old channel-1 qualification is
+reinterpreted.
+
+Step owners take the profile and keep their channel-1 wrappers unchanged:
+`channel_bb::prepare_for_channel` (`__rtw8852bx_set_channel_bb`, critical
+readback of `B_CH_IDX_SEG0` = `rtw89_encode_chan_idx` = actual primary),
+`channel_rf::prepare_for_channel` (`_ctrl_ch`/`_ch_setting` CFGCH field and
+readback), `iqk::prepare_for_channel` (`_iqk_get_ch_info` R_IQKCH channel;
+RFK MCC table index 0 is retained for one retuned entity per
+`rtw89_rfk_chan_lookup`), `tssi::prepare_for_channel` (`_tssi_set_efuse_to_de`
+groups; 2.4GHz system/thermal/slope/alignment-default tables are
+channel-independent; alignment is re-measured, never reloaded from another
+channel) and `rfk::ChannelRxDck::prepare_with_tssi` (`_rx_dck` pauses
+`B_P0_TSSI_TRK_EN` while the previous channel's TSSI is enabled).
+
+`radio_full::Radio::retune` runs on a Ready owner only, in Linux order: core.c
+`__rtw89_set_channel` (transition enter, MAC/BB, RF, set_txpwr, transition
+finish; same band so no `rtw89_chip_rfk_band_changed` TSSI scan) then rtw8852b.c
+`rtw8852b_rfk_channel` (RXDCK, IQK, 30ms, TSSI, 30ms, DPK; 8852B DPK reload is
+disabled so DPK recalibrates). Init-only power reference, trim and RX-AB are
+not repeated. It fresh-starts every step owner, so earlier results retire;
+`channel()` is the completed typed channel and `epoch()` counts completed
+programs (initial = 1). The channel programmed is always the one bound in the
+power plan. Failure or cancellation leaves the radio non-Ready.
+
+Remaining before the `additional_operating_channels` row is whole (no row
+credit): a signed per-channel full-program qualification/record replacing the
+v2 channel-1 Board for noninitial plans; the native `command_native` retune
+owner (drain ordinary TX/CMAC/autoresponse, call `Radio::retune` under the
+current host occupied-span permission, republish the retained retune epoch to
+RF tracking/LPS/monitor/station consumers, reopen queues); scan/association
+over channels 2..13 with per-channel N52B/HT/HE operating programs; and native
+two-arch plus physical validation. Channel 14 stays unadvertised. Five new
+cases are written and unexecuted:
+`smoke_rtw89_b_operating_profile_matches_linux_groups_and_refuses_other_bands`,
+`smoke_rtw89_b_power_plan_selects_actual_primary_limits_fir_and_binding`,
+`smoke_rtw89_b_channel_bb_programs_and_reads_back_each_actual_primary`,
+`smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary`,
+`smoke_rtw89_b_full_radio_retunes_ready_owner_to_actual_primary_and_advances_epoch`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before

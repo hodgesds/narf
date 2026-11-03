@@ -154,6 +154,11 @@ impl Board {
         power: &Plan,
         phycap: &super::firmware_phycap::Receipt,
     ) -> Result<Self, Error> {
+        // Preserve v2's exact channel1 meaning. Noninitial plans require their
+        // own typed full-program constructor/record, never an old header alias.
+        if power.channel() != super::operating_channel::Profile::INITIAL {
+            return Err(Error::Identity);
+        }
         let base = super::calibration_policy::Board::new(factory, device, assets)
             .map_err(|_| Error::Identity)?;
         let identity = factory.identity().ok_or(Error::Identity)?;

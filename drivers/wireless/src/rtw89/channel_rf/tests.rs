@@ -237,3 +237,50 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_rf_synth_fail_cancel_and_lock_deadline_are_terminal
 );
+/// Linux rtw8852b_rfk.c `_ctrl_ch`/`_ch_setting`: FIELD_PREP(RR_CFGCH_CH,
+/// central_ch) on A/B DAV then A/B DDV words, 2.4GHz band bits clear.
+fn smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let Some(&(seed, lock, busy, count, hash)) = CASES.first() else {
+        return TestResult::Fail("RF frozen reference cases");
+    };
+    for primary in 1..=13u8 {
+        let Some(profile) = Profile::new(Band::Ghz2, primary) else {
+            return TestResult::Fail("typed2.4GHz primary refused");
+        };
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned RF words; no native caller or grant.
+        let result = ready(unsafe { owner.prepare_for_channel(&mut io, profile) });
+        if result != Some(Ok(())) || owner.state() != State::SynthConfigured {
+            return TestResult::Fail("noninitial primary RF synth/readback failed");
+        }
+        if io.count != count || (primary == 1) != (io.hash == hash) {
+            return TestResult::Fail("RF synth stream is not the source order for this primary");
+        }
+        for p in 0..2 {
+            for a in [RR_CFGCH, RR_CFGCH_V1] {
+                let word = io.rf[p][Model::slot(a)];
+                if word & RR_CFGCH_CH != u32::from(primary)
+                    || word & (RR_CFGCH_BAND0 | RR_CFGCH_BAND1) != 0
+                {
+                    return TestResult::Fail("RF channel word lost the actual 2.4GHz primary");
+                }
+            }
+        }
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        io.ignore = true;
+        let mut owner = Channel::default();
+        // SAFETY: inert model that drops writes; readback must refuse readiness.
+        if ready(unsafe { owner.prepare_for_channel(&mut io, profile) }).is_none_or(|r| r.is_ok())
+            || owner.state() == State::SynthConfigured
+        {
+            return TestResult::Fail("ignored RF primary programming became ready");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary
+);

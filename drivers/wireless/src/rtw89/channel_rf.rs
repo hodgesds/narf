@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact initial B channel1/20MHz RF synth core. This is not the complete BB,
-//! IQK/TSSI/DPK channel continuation and has no native startup caller yet.
+//! Exact B 2.4GHz/20MHz RF synth core (Linux rtw8852b_rfk.c
+//! rtw8852b_set_channel_rf: _ctrl_ch, _ctrl_bw, _rxbb_bw). Initial channel1 and
+//! typed noninitial primaries share this one source order. This is not the
+//! complete BB, IQK/TSSI/DPK channel continuation.
 use super::{
+    operating_channel::Profile,
     power,
     rfk::{self, Interface},
 };
@@ -118,7 +121,8 @@ impl<I: Interface> Access<'_, I> {
         }
         Ok(())
     }
-    async fn channel(&mut self, p: u8, direct: bool) -> Result<(), Error> {
+    /// Linux `_ch_setting`: `direct=false` is the DAV RR_CFGCH word.
+    async fn channel(&mut self, p: u8, direct: bool, primary: u8) -> Result<(), Error> {
         let a = if direct { RR_CFGCH_V1 } else { RR_CFGCH };
         let mut v = self.read(p, a, RFREG_MASK).await?;
         v &= !(RR_CFGCH_BAND1
@@ -127,7 +131,7 @@ impl<I: Interface> Access<'_, I> {
             | RR_CFGCH_BCN
             | RR_CFGCH_BAND0
             | RR_CFGCH_CH);
-        v |= 1 << RR_CFGCH_CH.trailing_zeros();
+        v |= (u32::from(primary) << RR_CFGCH_CH.trailing_zeros()) & RR_CFGCH_CH;
         v &= !(RR_CFGCH_POW_LCK | RR_CFGCH_TRX_AH | RR_CFGCH_BCN | RR_CFGCH_BW2) & RFREG_MASK;
         v |= RR_CFGCH_BW2;
         if p == 0 && !direct {
@@ -159,6 +163,17 @@ impl Channel {
     /// terminalizes/retains uncertain native ownership if this future is dropped.
     /// The current basic-calibration artifact alone does not authorize this step.
     pub async unsafe fn prepare(&mut self, io: &mut impl Interface) -> Result<(), Error> {
+        // SAFETY: same contract; fixed original channel1 profile.
+        unsafe { self.prepare_for_channel(io, Profile::INITIAL).await }
+    }
+    /// # Safety
+    /// Same as [`Self::prepare`], and the current signed envelope plus host
+    /// permission cover THIS actual typed primary's synth/LCK emissions.
+    pub async unsafe fn prepare_for_channel(
+        &mut self,
+        io: &mut impl Interface,
+        channel: Profile,
+    ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
@@ -166,7 +181,7 @@ impl Channel {
         let mut a = Access(io);
         for direct in [false, true] {
             for p in 0..2 {
-                a.channel(p, direct).await?;
+                a.channel(p, direct, channel.primary()).await?;
             }
         }
         for direct in [false, true] {
@@ -188,7 +203,8 @@ impl Channel {
             | RR_CFGCH_POW_LCK
             | RR_CFGCH_TRX_AH
             | RR_CFGCH_BCN;
-        let expected = (1 << RR_CFGCH_CH.trailing_zeros())
+        let expected = ((u32::from(channel.primary()) << RR_CFGCH_CH.trailing_zeros())
+            & RR_CFGCH_CH)
             | ((CFGCH_BW_20M << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW)
             | RR_CFGCH_BW2;
         for direct in [false, true] {

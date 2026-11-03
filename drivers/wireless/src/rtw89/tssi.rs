@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact one-shot B PHY0/channel1/20MHz/RF_AB TSSI with real PMAC alignment.
+//! Exact one-shot B PHY0/2.4GHz20MHz/RF_AB TSSI with real PMAC alignment.
+//! Initial channel1 and typed noninitial primaries differ only in Linux
+//! `_tssi_set_efuse_to_de` CCK/OFDM/trim groups; 2.4GHz system, thermal,
+//! slope and `_tssi_alignment_default` tables are channel-independent.
 //! Source calibration inputs and measurements do not grant ordinary RF TX.
 use super::{
     factory_b::Calibration,
+    operating_channel::Profile,
     power,
     rfk::{self, Interface},
     rfk_tables as recipe,
@@ -60,6 +64,24 @@ impl Tssi {
         calibration: &Calibration,
         tracking: &Tracking,
         gain_bases: [i8; 2],
+    ) -> Result<(), Error> {
+        // SAFETY: same contract; fixed original channel1 profile.
+        unsafe {
+            self.prepare_for_channel(io, calibration, tracking, gain_bases, Profile::INITIAL)
+                .await
+        }
+    }
+    /// # Safety
+    /// Same as [`Self::prepare`], after THIS actual typed primary's BB/RF/IQK.
+    /// Linux re-measures alignment on a channel without a cache entry; this
+    /// retained owner never reloads another channel's alignment.
+    pub(super) async unsafe fn prepare_for_channel(
+        &mut self,
+        io: &mut impl Interface,
+        calibration: &Calibration,
+        tracking: &Tracking,
+        gain_bases: [i8; 2],
+        channel: Profile,
     ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
@@ -151,7 +173,7 @@ impl Tssi {
             result.alignment[path as usize] = values;
         }
         enable(&mut access).await?;
-        result.de = de(&mut access, calibration)?;
+        result.de = de(&mut access, calibration, channel)?;
         access.0.admit()?;
         access.0.end(rfk::Kind::Tssi).await?;
         access.0.admit()?;
@@ -278,15 +300,19 @@ async fn enable<I: Interface>(a: &mut Access<'_, I>) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Linux `_tssi_set_efuse_to_de`: `_tssi_get_{cck,ofdm,trim}_group`; 2.4GHz has
+/// no TSSI_EXTRA_GROUP averaging.
 fn de<I: Interface>(
     a: &mut Access<'_, I>,
     calibration: &Calibration,
+    channel: Profile,
 ) -> Result<[[i16; 2]; 2], Error> {
+    let [cck_group, ofdm_group, trim_group] = channel.tssi_groups();
     let mut values = [[0; 2]; 2];
     for (path, value) in values.iter_mut().enumerate() {
-        let trim = i16::from(calibration.tssi_trim[path][0]);
-        let cck = i16::from(calibration.tssi_cck[path][0]) + trim;
-        let ofdm = i16::from(calibration.tssi_mcs[path][0]) + trim;
+        let trim = i16::from(calibration.tssi_trim[path][trim_group]);
+        let cck = i16::from(calibration.tssi_cck[path][cck_group]) + trim;
+        let ofdm = i16::from(calibration.tssi_mcs[path][ofdm_group]) + trim;
         let offset = (path as u32) << 13;
         for address in [0x5858, 0x5860] {
             a.wm(address + offset, 0x3ff000, cck as u32)?;

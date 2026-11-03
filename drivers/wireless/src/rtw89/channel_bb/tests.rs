@@ -235,3 +235,69 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_channel_bb_error_cancel_and_readback_keep_attempt_terminal
 );
+fn field(io: &Model, address: u32, mask: u32) -> u32 {
+    let a = (0x10000 + address) as usize;
+    (u32::from_le_bytes(io.bytes[a..a + 4].try_into().unwrap()) & mask) >> mask.trailing_zeros()
+}
+/// Linux rtw8852b_common.c `__rtw8852bx_set_channel_bb` for each typed primary:
+/// `rtw8852bx_ctrl_sco_cck`, `rtw8852bx_sco_mapping`, CCK TXFIR and
+/// `rtw89_encode_chan_idx` (2.4GHz base0 | primary), with critical readback.
+fn smoke_rtw89_b_channel_bb_programs_and_reads_back_each_actual_primary() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    const SCO: [(u8, u32, u32, u32); 6] = [
+        (1, 0x1cfea, 0x27de3, 109),
+        (2, 0x1d0e1, 0x27f35, 108),
+        (6, 0x1d4b9, 0x2847f, 108),
+        (7, 0x1d5b0, 0x285d2, 107),
+        (11, 0x1d988, 0x28b1c, 106),
+        (13, 0x1db75, 0x28dc1, 106),
+    ];
+    let (g, c) = inputs(3);
+    let mut initial = Model::new(0xa5, 3);
+    let mut owner = Channel::default();
+    // SAFETY: inert exact channel1 baseline for the shared source order.
+    if ready(unsafe { owner.prepare(&mut initial, &g, &c, [-91, 101]) }) != Some(Ok(())) {
+        return TestResult::Fail("BB channel1 baseline");
+    }
+    for primary in 1..=13u8 {
+        let Some(profile) = Profile::new(Band::Ghz2, primary) else {
+            return TestResult::Fail("typed2.4GHz primary refused");
+        };
+        let mut io = Model::new(0xa5, 3);
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned MAC/BB words; no native caller or grant.
+        let r = ready(unsafe { owner.prepare_for_channel(&mut io, &g, &c, [-91, 101], profile) });
+        if r != Some(Ok(())) || owner.state() != State::Configured {
+            return TestResult::Fail("noninitial primary failed BB programming/readback");
+        }
+        if field(&io, R_MAC_PIN_SEL, B_CH_IDX_SEG0) != u32::from(primary)
+            || field(&io, R_TXFIR0, B_TXFIR_C01) != 0x3d23ff
+            || io.count != initial.count
+            || (primary == 1) != (io.hash == initial.hash)
+        {
+            return TestResult::Fail("BB channel index/FIR/write stream differs from source");
+        }
+        if let Some(&(_, barker, cck, comp)) = SCO.iter().find(|row| row.0 == primary) {
+            if field(&io, R_RXSCOBC, B_RXSCOBC_TH) != barker
+                || field(&io, R_RXSCOCCK, B_RXSCOCCK_TH) != cck
+                || field(&io, R_FC0_BW_V1, B_FC0_BW_INV) != comp
+            {
+                return TestResult::Fail("BB SCO thresholds/compensation differ from Linux");
+            }
+        }
+        // A model that drops writes must never satisfy the primary readback.
+        let mut io = Model::new(0xa5, 3);
+        io.ignore = true;
+        let mut owner = Channel::default();
+        // SAFETY: inert model that ignores writes; readback must refuse readiness.
+        let r = ready(unsafe { owner.prepare_for_channel(&mut io, &g, &c, [-91, 101], profile) });
+        if !matches!(r, Some(Err(_))) || owner.state() != State::Preparing {
+            return TestResult::Fail("ignored primary programming became ready");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_channel_bb_programs_and_reads_back_each_actual_primary
+);

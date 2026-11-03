@@ -8,6 +8,7 @@ use super::{
 };
 #[path = "channel_bb/regs.rs"]
 mod regs;
+use super::operating_channel::Profile;
 use regs::*;
 #[path = "channel_bb/recipe.rs"]
 mod recipe;
@@ -173,6 +174,26 @@ impl Channel {
         c: &Calibration,
         bases: [i8; 2],
     ) -> Result<(), Error> {
+        // SAFETY: exact existing initial preparation contract, fixed original
+        // channel1 profile, same retained current interface/factory/calibration.
+        unsafe {
+            self.prepare_for_channel(io, g, c, bases, Profile::INITIAL)
+                .await
+        }
+    }
+    /// # Safety
+    /// Same exclusive retained B/PHY0/SCC source owner, closed ordinary TX and
+    /// autonomous responses, actual gain/factory bases. The current signed full
+    /// envelope and host permission must cover THIS actual primary/channel
+    /// MAC/BB/RF/RFK and its calibration emissions; no initial1 record alias.
+    pub async unsafe fn prepare_for_channel(
+        &mut self,
+        io: &mut impl Interface,
+        g: &Gain,
+        c: &Calibration,
+        bases: [i8; 2],
+        channel: Profile,
+    ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
@@ -186,22 +207,19 @@ impl Channel {
             (B_AX_CHECK_CCK_EN | B_AX_RTS_LIMIT_IN_OFDM6) as u8,
             0,
         )?;
-        a.phy(R_RXSCOBC, B_RXSCOBC_TH, 0x1cfea)?;
-        a.phy(R_RXSCOCCK, B_RXSCOCCK_TH, 0x27de3)?;
+        let sco = channel.sco();
+        a.phy(R_RXSCOBC, B_RXSCOBC_TH, sco[0] as i32)?;
+        a.phy(R_RXSCOCCK, B_RXSCOCCK_TH, sco[1] as i32)?;
         a.phy(R_PATH0_BAND_SEL_V1, B_PATH0_BAND_SEL_MSK_V1, 1)?;
         a.phy(R_PATH1_BAND_SEL_V1, B_PATH1_BAND_SEL_MSK_V1, 1)?;
-        a.phy(R_FC0_BW_V1, B_FC0_BW_INV, 109)?;
+        a.phy(R_FC0_BW_V1, B_FC0_BW_INV, channel.sco_compensation() as i32)?;
         for (address, value) in [
-            (R_TXFIR0, 0x3d23ff),
-            (R_TXFIR2, 0x29b354),
-            (R_TXFIR4, 0xfc1c8),
-            (R_TXFIR6, 0xfdb053),
-            (R_TXFIR8, 0xf86f9a),
-            (R_TXFIRA, 0xfaef92),
-            (R_TXFIRC, 0xfe5fcc),
-            (R_TXFIRE, 0xffdff5),
-        ] {
-            a.phy(address, B_TXFIR_C01, value)?;
+            R_TXFIR0, R_TXFIR2, R_TXFIR4, R_TXFIR6, R_TXFIR8, R_TXFIRA, R_TXFIRC, R_TXFIRE,
+        ]
+        .into_iter()
+        .zip(channel.cck_fir(0))
+        {
+            a.phy(address, B_TXFIR_C01, value as i32)?;
         }
         a.gain(g, c, bases)?;
         let rx =
@@ -226,7 +244,7 @@ impl Channel {
         }
         a.phy(R_UPD_CLK_ADC, B_ENABLE_CCK, 1)?;
         a.phy(R_RXCCA, B_RXCCA_DIS, 0)?;
-        a.phy(R_MAC_PIN_SEL, B_CH_IDX_SEG0, 1)?;
+        a.phy(R_MAC_PIN_SEL, B_CH_IDX_SEG0, i32::from(channel.primary()))?;
         a.phy(R_PATH0_5MDET_V1, B_PATH0_5MDET_EN, 0)?;
         a.phy(R_PATH1_5MDET_V1, B_PATH1_5MDET_EN, 0)?;
         a.phy(R_ASSIGN_SBD_OPT_V1, B_ASSIGN_SBD_OPT_EN_V1, 0)?;
@@ -249,7 +267,7 @@ impl Channel {
             (
                 0x10000 + R_MAC_PIN_SEL,
                 B_CH_IDX_SEG0,
-                bits(B_CH_IDX_SEG0, 1),
+                bits(B_CH_IDX_SEG0, i32::from(channel.primary())),
             ),
             (
                 0x10000 + R_RSTB_ASYNC,

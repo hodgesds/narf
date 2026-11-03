@@ -3,6 +3,7 @@
 //! Linux rtw8852b_rfk.c, including path-local backup and restore. The enclosing
 //! native owner supplies measured emission/coexistence/current-policy authority.
 use super::{
+    operating_channel::Profile,
     power,
     rfk::{Error, Interface, Kind},
 };
@@ -367,6 +368,18 @@ impl Iqk {
     /// The enclosing native one-shot attempt owns shutdown and retains all DMA
     /// on failure/cancellation; no concurrent PHY/packet/reset/PM owner exists.
     pub(super) async unsafe fn prepare(&mut self, io: &mut impl Interface) -> Result<(), Error> {
+        // SAFETY: same contract; fixed original channel1 profile.
+        unsafe { self.prepare_for_channel(io, Profile::INITIAL).await }
+    }
+    /// # Safety
+    /// Same as [`Self::prepare`], after THIS actual typed primary's BB/RF retune.
+    /// Linux `_iqk_get_ch_info` records `chan->channel` in R_IQKCH; RTL8852B keeps
+    /// RFK MCC table index0 for one retuned entity (`rtw89_rfk_chan_lookup`).
+    pub(super) async unsafe fn prepare_for_channel(
+        &mut self,
+        io: &mut impl Interface,
+        channel: Profile,
+    ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
@@ -397,7 +410,11 @@ impl Iqk {
             access.wm(R_IQKINF, B_IQKINF_VER, 0x2a)?;
             access.wm(R_IQKCH, B_IQKCH_BAND << (path * 16), 0)?;
             access.wm(R_IQKCH, B_IQKCH_BW << (path * 16), 0)?;
-            access.wm(R_IQKCH, B_IQKCH_CH << (path * 16), 1)?;
+            access.wm(
+                R_IQKCH,
+                B_IQKCH_CH << (path * 16),
+                u32::from(channel.primary()),
+            )?;
             for (index, &register) in tables::BACKUP_BB.iter().enumerate() {
                 self.results.bb_backup[p][index] = access.bb(register, u32::MAX)?;
             }
