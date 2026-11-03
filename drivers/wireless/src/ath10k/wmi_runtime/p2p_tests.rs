@@ -775,3 +775,29 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_ap_builders_carry_vdev
 );
+
+/// A P2P client station slot carries its own vdev and address, owns no
+/// peer id or MSDU before association, and parks at most `SLOT_INBOX`
+/// sibling-routed HTT events.
+fn smoke_ath10k_p2p_station_slot_parks_bounded() -> TestResult {
+    use super::super::{StationSlot, SLOT_INBOX};
+    use crate::ath10k::htt_runtime as htt;
+    let mut slot = StationSlot::client(1, OWN);
+    if slot.vdev != Some(1) || slot.own != Some(OWN) || slot.peer.is_some() {
+        return TestResult::Fail("client slot identity");
+    }
+    if slot.owns_peer(5) || slot.owns_msdu(5) {
+        return TestResult::Fail("unassociated slot owns ids");
+    }
+    for _ in 0..SLOT_INBOX + 4 {
+        slot.park(htt::Event::Progress);
+    }
+    if slot.inbox.len() != SLOT_INBOX || !slot.receipts.is_empty() {
+        return TestResult::Fail("inbox bound");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_station_slot_parks_bounded
+);

@@ -100,7 +100,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), Error> {
         use narf_wireless::sae::SaeSession;
         let join = plan.sae().ok_or(Error::Unsupported)?;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         let session = if join.h2e() {
             SaeSession::new_h2e_bytes(ssid, password, own, bssid)

@@ -57,7 +57,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let Some(frame) = deauthentication {
             // Best effort, as mac80211 proceeds with teardown regardless; the
             // frame is already encrypted, so no key outlives `fail()`.
-            management::validate(&frame, self.ready.ok_or(Error::Failed)?.mac, prepared.bssid)?;
+            management::validate(&frame, self.station_own()?, prepared.bssid)?;
             let _ = self.send_management_frame(&frame).await;
         }
 

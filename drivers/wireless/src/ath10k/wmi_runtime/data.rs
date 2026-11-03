@@ -138,6 +138,10 @@ impl State {
         self.incoming.clear();
         self.received.clear();
     }
+    /// Whether MSDU `id` is in this data owner's TX pipeline.
+    pub(super) fn owns_msdu(&self, id: u16) -> bool {
+        self.pending.owns(id)
+    }
     pub(super) fn protection_idle(&self) -> bool {
         self.pending.is_empty()
     }
@@ -323,7 +327,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// DEAUTH_LEAVING) on a local disconnect; under PMF it must be
     /// CCMP-protected with the PTK before the keys are retired.
     pub(super) fn pmf_deauthentication(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         let Some(security) = self
             .station
@@ -391,7 +395,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let Some(frame) = self.station.data.as_mut().and_then(|d| d.management.take()) else {
             return Ok(false);
         };
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         super::management::validate(&frame, own, bssid)?;
         self.send_management_frame(&frame).await?;
@@ -500,7 +504,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.station.peer.is_some() || self.station.data.is_some() {
             return Err(Error::Failed);
         }
-        Ok(self.ready.ok_or(Error::Failed)?.mac)
+        Ok(self.station_own()?)
     }
     pub fn fail_station_data(&mut self) {
         self.beacon_hints.retire();
@@ -636,7 +640,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             })
             .await?;
         }
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let cached = self
             .scan_cache
             .iter()
@@ -746,7 +750,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
         }
-        while self.htt.take_tx_receipt().is_some() {}
+        while self.take_station_receipt().is_some() {}
         self.station.data = Some(State {
             security,
             pending: Pipeline::new()?,
@@ -821,7 +825,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<(Vec<u8>, htt::tx::Parameters), Error> {
         let link = self.station_link().ok_or(Error::Failed)?;
         self.check_data_policy(domain)?;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
+        let vdev = self.station_vdev();
         let data = self.station.data.as_mut().ok_or(Error::Failed)?;
         if !data.pending.data_admissible() || data.security.as_ref().is_some_and(|s| !s.port_open())
         {
@@ -890,7 +895,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let parameters = htt::tx::Parameters {
             kind: htt::tx::Kind::Raw,
-            vdev: self.primary.id(),
+            vdev,
             tid: tx_qos::descriptor_tid(&frame),
             hardware_crypto: hardware,
         };
@@ -1052,7 +1057,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             } else {
                 htt::tx::Kind::Raw
             },
-            vdev: self.primary.id(),
+            vdev: self.station_vdev(),
             tid: 16,
             hardware_crypto: native_wifi && reply.get(1).is_some_and(|fc| fc & 0x40 != 0),
         })
@@ -1100,9 +1105,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<bool, Error> {
         validate()?;
         self.data_check()?;
-        let event = match self.pending.pop_front() {
-            Some(e) => e,
-            None => checked_policy(self.station_progress(), validate).await?,
+        // A sibling slot's parked events first (`htt_rx.c` delivers by
+        // `peer->vdev_id`), then the radio's queue, then a fresh poll.
+        let event = match self.station.inbox.pop_front() {
+            Some(e) => self.slot_event(e)?,
+            None => match self.pending.pop_front() {
+                Some(e) => e,
+                None => checked_policy(self.station_progress(), validate).await?,
+            },
         };
         let (idle, reply) = self.data_event(event, nonce)?;
         if let Some(reply) = reply {
@@ -1217,7 +1227,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if peer.associated.is_none() || peer.mapped().is_none() {
             return Err(Error::Failed);
         }
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let bssid = peer.bssid;
         let data = self.station.data.as_mut().ok_or(Error::Failed)?;
         let addresses = Addresses { own, bssid };
@@ -1233,6 +1243,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     }
                 } else {
                     data.rx_ba.discard_ppdu();
+                    // htt_rx.c ath10k_htt_rx_h_ppdu: the peer id selects
+                    // `peer->vif`; another slot's peer gets its own batch.
+                    if let Some(sibling) = self
+                        .p2p_client
+                        .as_deref_mut()
+                        .filter(|s| s.owns_peer(batch.peer))
+                    {
+                        sibling.park(htt::Event::Rx(batch));
+                    }
                 }
             }
             htt::Event::InOrder(indication, frames) => {
@@ -1253,6 +1272,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     }
                 } else {
                     data.rx_ba.discard_ppdu();
+                    // htt_rx.c ath10k_htt_rx_h_rx_offload / in-order: the
+                    // indication's vdev and peer select the sibling slot.
+                    let primary = self.primary.id();
+                    if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| {
+                        !indication.offload
+                            && !indication.fragment
+                            && indication.vdev == s.vdev.unwrap_or(primary)
+                            && s.owns_peer(indication.peer)
+                    }) {
+                        sibling.park(htt::Event::InOrder(indication, frames));
+                    }
                 }
             }
             htt::Event::Wmi(bytes)
@@ -1260,6 +1290,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             {
                 let management = self.wire.management(&bytes[4..], self.features)?;
                 let f = &management.frame;
+                // A sibling station's BSS management (A2 or A3 its BSSID)
+                // is its own: wmi.c ath10k_wmi_event_mgmt_rx hands it to
+                // mac80211, which matches the frame to that vif.
+                if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| {
+                    s.peer.as_ref().is_some_and(|p| {
+                        f.len() >= 22 && (f[10..16] == p.bssid || f[16..22] == p.bssid)
+                    })
+                }) {
+                    sibling.park(htt::Event::Wmi(bytes.clone()));
+                }
                 if management.status & !0x40 == 0
                     && wire::channel_to_frequency(management.channel)
                         == Some(peer.permission.frequency)
@@ -1386,6 +1426,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             htt::Event::Message(bytes) if !matches!(bytes.first(), Some(3 | 4)) => {
+                // BA/fragment/PFC notes name a peer id; each slot filters by
+                // its own peer, so the sibling sees a copy.
+                if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| s.peer.is_some()) {
+                    sibling.park(htt::Event::Message(bytes.clone()));
+                }
                 let ba = data.rx_ba.note(&bytes, |id| peer.owns(id))?;
                 // Fragment/PFC and their additional ownership remain separate.
                 if !ba && matches!(bytes.first(), Some(0xb | 0xc | 0xd | 0x16 | 0x17 | 0x18)) {
@@ -1396,9 +1441,25 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         // Linux ath10k_htt_rx_tx_compl_ind -> ath10k_txrx_tx_unref: each ID
         // in a (possibly multi-MSDU) indication retires independently.
-        while let Some(receipt) = self.htt.take_tx_receipt() {
+        // txrx.c ath10k_txrx_tx_unref: the msdu id names its skb and vif,
+        // so a sibling slot's id is handed to that slot.
+        while let Some(receipt) = self
+            .station
+            .receipts
+            .pop_front()
+            .or_else(|| self.htt.take_tx_receipt())
+        {
             match data.pending.complete(receipt) {
-                Completion::Foreign | Completion::Data { .. } => {}
+                Completion::Foreign => {
+                    if let Some(sibling) = self
+                        .p2p_client
+                        .as_deref_mut()
+                        .filter(|s| s.owns_msdu(receipt.id))
+                    {
+                        sibling.receipts.push_back(receipt);
+                    }
+                }
+                Completion::Data { .. } => {}
                 Completion::Reply { outcome, .. } if outcome != Outcome::Ack => {
                     return Err(Error::Firmware(u32::from(receipt.status)));
                 }

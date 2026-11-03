@@ -141,6 +141,10 @@ impl Pipeline {
         });
         Ok(())
     }
+    /// Whether MSDU `id` is one of this pipeline's in-flight entries.
+    pub(super) fn owns(&self, id: u16) -> bool {
+        self.entries.iter().any(|e| e.id == id)
+    }
     /// Retire the ID named by one terminal HTT receipt.
     pub(super) fn complete(&mut self, receipt: htt::TxReceipt) -> Completion {
         let Some(at) = self.entries.iter().position(|e| e.id == receipt.id) else {

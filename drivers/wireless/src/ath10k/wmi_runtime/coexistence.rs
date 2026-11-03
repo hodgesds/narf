@@ -231,7 +231,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let Some(profile) = ht::Profile::offer(
             caps,
             cached,
-            self.ready.ok_or(Error::Failed)?.mac,
+            self.station_own()?,
             ht::Phy::Ht40,
             self.chains.ok_or(Error::Failed)?,
         )?
@@ -280,6 +280,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .is_some_and(|s| s.blocked())
     }
     pub(super) fn observe_coexistence(&mut self, event: &htt::Event) -> Result<(), Error> {
+        let own = self.station.own.or(self.ready.map(|r| r.mac));
         let Some(state) = self.station.coexistence.as_mut() else {
             return Ok(());
         };
@@ -298,7 +299,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             state.observe(&bss)?;
         }
         if wire::channel_to_frequency(m.channel) == Some(state.primary) {
-            state.action(&m.frame, self.ready.ok_or(Error::Failed)?.mac)?;
+            state.action(&m.frame, own.ok_or(Error::Failed)?)?;
         }
         if !blocked && state.blocked() {
             self.coexistence_epoch
@@ -397,8 +398,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         if report {
             self.check_data_policy(domain)?;
-            let frame = state.frame(self.ready.ok_or(Error::Failed)?.mac);
-            management::validate(&frame, self.ready.ok_or(Error::Failed)?.mac, state.bssid)?;
+            let frame = state.frame(self.station_own()?);
+            management::validate(&frame, self.station_own()?, state.bssid)?;
             self.failed = true;
             self.send_management_frame(&frame).await?;
             self.check_data_policy(domain)?;
@@ -486,7 +487,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let event = checked_policy(self.station_progress(), &validate).await?;
-            while let Some(receipt) = self.htt.take_tx_receipt() {
+            while let Some(receipt) = self.take_station_receipt() {
                 self.coexistence_receipt(receipt)?;
             }
             if self

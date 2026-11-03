@@ -42,7 +42,8 @@ impl Peer {
                 if id >= 2048 {
                     return Err(Error::Malformed);
                 }
-                if b[1] != 0 || b[4..10] != self.bssid {
+                // htt_rx.c PEER_MAP `vdev_id` (byte 1) must be this peer's vdev.
+                if b[1] != self.vdev || b[4..10] != self.bssid {
                     if self.ids[usize::from(id) / 64] & (1u64 << (id % 64)) != 0 {
                         return Err(Error::Malformed);
                     }
@@ -148,7 +149,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         frequency: u16,
     ) -> Result<(Permission, Option<ht::Profile>), Error> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let chains = self.chains.ok_or(Error::Failed)?;
         // Only the station client consumes the radar `beacon_found` witness.
         let hint = self.beacon_hints.client_receipt(domain);
@@ -374,7 +375,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             beacon_interval: cached.beacon_interval,
             information_elements: wire::owned(&cached.information_elements)?,
         };
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
         let offered_ht = self.station.peer.as_ref().ok_or(Error::Failed)?.ht;
         let vdev = self.station.peer.as_ref().ok_or(Error::Failed)?.vdev;
@@ -578,8 +579,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.bind_coexistence_width(bssid, &permission)?;
         let rd = self.wire.domain(&permission)?;
         let power = self.wire.power(&permission)?;
-        // A station BSS lives on the managed vdev; a P2P client passes its own.
-        let vdev = self.primary.id();
+        // A station BSS lives on its slot's vdev: the managed vdev for the home
+        // station, the P2P_CLI vdev for a P2P client (`arvif->vdev_id`).
+        let vdev = self.station_vdev();
         let mut start = self
             .wire
             .start_station(vdev, &permission, beacon_interval, dtim)?;
@@ -696,7 +698,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         let permission = peer.permission.clone();
         permission.check(domain)?;
-        management::validate(frame, self.ready.ok_or(Error::Failed)?.mac, peer.bssid)?;
+        management::validate(frame, self.station_own()?, peer.bssid)?;
         if frame[0] == 0 {
             let bss = self
                 .scan_cache
@@ -735,7 +737,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .transmit(
                         htt::tx::Parameters {
                             kind: htt::tx::Kind::Management,
-                            vdev: self.primary.id(),
+                            vdev: self.station_vdev(),
                             tid: 17,
                             hardware_crypto: false,
                         },
@@ -748,7 +750,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             management::Path::Inline(command) => {
-                let command = management::inline(command, self.primary.id(), frame)?;
+                let command = management::inline(command, self.station_vdev(), frame)?;
                 self.htt
                     .wmi
                     .htc
@@ -762,7 +764,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             management::Path::Reference => {
                 let (id, address) = self.htt.wmi.htc.transport.prepare_wmi_management(frame)?;
-                let command = management::reference(self.primary.id(), id, address, frame)?;
+                let command = management::reference(self.station_vdev(), id, address, frame)?;
                 self.htt
                     .wmi
                     .htc
@@ -815,7 +817,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let bssid = peer.bssid;
         let frequency = peer.permission.frequency;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         if let Some(frame) = frame {
             self.transmit_management(domain, frame).await?;
         }
@@ -922,6 +924,26 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if self.observe_roc_peer(bytes)? {
                 return Ok(htt::Event::Progress);
             }
+            if let Some(peer) = &mut self.station.peer {
+                if peer.record(bytes)? {
+                    return Ok(htt::Event::Progress);
+                }
+            }
+            // htt_rx.c ath10k_peer_map_event keys the peer by its vdev: a
+            // map/unmap this slot did not record may be the sibling's.
+            if matches!(bytes.first(), Some(3 | 4)) {
+                if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| s.peer.is_some()) {
+                    sibling.park(htt::Event::Message(bytes.clone()));
+                }
+            }
+        }
+        Ok(event)
+    }
+    /// An event a sibling slot parked for this one: only this slot's own
+    /// peer map/unmap bookkeeping runs again (radio-level observers already
+    /// saw the event when it was first polled).
+    pub(super) fn slot_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        if let htt::Event::Message(bytes) = &event {
             if let Some(peer) = &mut self.station.peer {
                 if peer.record(bytes)? {
                     return Ok(htt::Event::Progress);

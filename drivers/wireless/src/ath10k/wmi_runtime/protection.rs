@@ -75,7 +75,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             {
                 return Err(Error::Failed);
             }
-            while let Some(receipt) = self.htt.take_tx_receipt() {
+            while let Some(receipt) = self.take_station_receipt() {
                 if let Some(data) = &mut self.station.data {
                     data.protection_receipt(receipt)?;
                 }

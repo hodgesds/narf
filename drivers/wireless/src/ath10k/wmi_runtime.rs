@@ -125,7 +125,22 @@ pub(super) struct StationSlot {
     power_save: Option<bool>,
     protection: Option<StationProtection>,
     coexistence: Option<alloc::boxed::Box<coexistence::State>>,
+    /// The vdev this slot's BSS peer, data and management use; `None` is
+    /// the managed vdev (`Radio::primary`), so the home slot follows an AP
+    /// that replaced and restored it on the same id.
+    vdev: Option<u8>,
+    /// The slot's own (A2) address; `None` is the INIT address.
+    own: Option<[u8; 6]>,
+    /// HTT events another slot's data step polled but this slot's peer or
+    /// vdev owns (`htt_rx.c`: RX is delivered to `peer->vdev_id`'s vif).
+    inbox: VecDeque<htt::Event>,
+    /// TX completions for this slot's MSDU ids taken by another slot
+    /// (`txrx.c::ath10k_txrx_tx_unref`: msdu_id -> skb -> its vif).
+    receipts: VecDeque<htt::TxReceipt>,
 }
+/// Bound on HTT events parked for an idle sibling slot; overflow fails
+/// that slot's data owner rather than growing without limit.
+const SLOT_INBOX: usize = 256;
 impl StationSlot {
     const fn new() -> Self {
         Self {
@@ -135,7 +150,61 @@ impl StationSlot {
             power_save: None,
             protection: None,
             coexistence: None,
+            vdev: None,
+            own: None,
+            inbox: VecDeque::new(),
+            receipts: VecDeque::new(),
         }
+    }
+    /// A P2P client slot on its own STA/P2P_CLI vdev and address.
+    // Bound by the P2P client netdev role (iftype 8) in a later step.
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+    pub(super) const fn client(vdev: u8, own: [u8; 6]) -> Self {
+        let mut slot = Self::new();
+        slot.vdev = Some(vdev);
+        slot.own = Some(own);
+        slot
+    }
+    /// Park an HTT event for this slot. Every slot filters by its own peer
+    /// ids, vdev and BSSID, so a copy it does not own is ignored there.
+    fn park(&mut self, event: htt::Event) {
+        if self.inbox.len() >= SLOT_INBOX {
+            if let Some(data) = &mut self.data {
+                data.fail();
+            }
+            return;
+        }
+        self.inbox.push_back(event);
+    }
+    /// Whether this slot's BSS peer owns HTT peer id `id`.
+    fn owns_peer(&self, id: u16) -> bool {
+        self.peer.as_ref().is_some_and(|p| p.owns(id))
+    }
+    /// Whether this slot's data owner has MSDU `id` in flight.
+    fn owns_msdu(&self, id: u16) -> bool {
+        self.data.as_ref().is_some_and(|d| d.owns_msdu(id))
+    }
+}
+/// Runs the radio's station paths on the P2P client slot: the slots are
+/// exchanged for the guard's lifetime and restored on drop, including when
+/// an async step holding it is cancelled.
+pub(super) struct ClientScope<'a, T: Hif + HostMemory + HttMemory> {
+    radio: &'a mut Radio<T>,
+}
+impl<T: Hif + HostMemory + HttMemory> core::ops::Deref for ClientScope<'_, T> {
+    type Target = Radio<T>;
+    fn deref(&self) -> &Radio<T> {
+        self.radio
+    }
+}
+impl<T: Hif + HostMemory + HttMemory> core::ops::DerefMut for ClientScope<'_, T> {
+    fn deref_mut(&mut self) -> &mut Radio<T> {
+        self.radio
+    }
+}
+impl<T: Hif + HostMemory + HttMemory> Drop for ClientScope<'_, T> {
+    fn drop(&mut self) {
+        self.radio.exchange_client();
     }
 }
 #[derive(Debug)]
@@ -147,6 +216,9 @@ pub(super) struct Radio<T> {
     /// The managed netdev's station owner on `primary` (Linux's home
     /// `arvif`); the P2P client slot is a second, independent owner.
     station: StationSlot,
+    /// The P2P client's station slot while one exists (outside a
+    /// `ClientScope`; inside one it holds the home slot).
+    p2p_client: Option<alloc::boxed::Box<StationSlot>>,
     ap: Option<alloc::boxed::Box<ap::Session>>,
     ap_staging: Option<alloc::boxed::Box<ap::Staging>>,
     ap_history: Option<alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<ap_key::History>>>,
@@ -203,6 +275,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn new(htt: htt::Runtime<T>, dialect: Dialect, features: u64) -> Self {
         Self {
             station: StationSlot::new(),
+            p2p_client: None,
             ap: None,
             ap_staging: None,
             ap_history: None,
@@ -558,6 +631,53 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// The managed role's firmware vdev id (WMI `vdev_id`, HTT routing key).
     pub(in crate::ath10k) fn primary_vdev(&self) -> u32 {
         u32::from(self.primary.id())
+    }
+    /// The vdev the current station slot uses.
+    pub(super) fn station_vdev(&self) -> u8 {
+        self.station.vdev.unwrap_or(self.primary.id())
+    }
+    /// The current station slot's own address.
+    pub(super) fn station_own(&self) -> Result<[u8; 6], Error> {
+        match self.station.own {
+            Some(own) => Ok(own),
+            None => Ok(self.ready.ok_or(Error::Failed)?.mac),
+        }
+    }
+    fn exchange_client(&mut self) {
+        if let Some(client) = self.p2p_client.as_deref_mut() {
+            core::mem::swap(&mut self.station, client);
+        }
+    }
+    /// Enter the P2P client slot, if one exists. The client slot must not be
+    /// removed while the scope is held (it then holds the home slot).
+    // Bound by the P2P client netdev role (iftype 8) in a later step.
+    #[allow(dead_code)]
+    pub(super) fn client_scope(&mut self) -> Option<ClientScope<'_, T>> {
+        self.p2p_client.as_ref()?;
+        self.exchange_client();
+        Some(ClientScope { radio: self })
+    }
+    /// The next TX completion for the current slot: one a sibling handed
+    /// over, else the HTT queue, passing a sibling-owned id to that slot
+    /// (`txrx.c::ath10k_txrx_tx_unref` resolves msdu_id to its vif).
+    pub(super) fn take_station_receipt(&mut self) -> Option<htt::TxReceipt> {
+        if let Some(receipt) = self.station.receipts.pop_front() {
+            return Some(receipt);
+        }
+        loop {
+            let receipt = self.htt.take_tx_receipt()?;
+            if !self.station.owns_msdu(receipt.id) {
+                if let Some(sibling) = self
+                    .p2p_client
+                    .as_deref_mut()
+                    .filter(|s| s.owns_msdu(receipt.id))
+                {
+                    sibling.receipts.push_back(receipt);
+                    continue;
+                }
+            }
+            return Some(receipt);
+        }
     }
 }
 fn beacon(event: &Management, channels: &[u16]) -> Result<Option<ScanBss>, Error> {
