@@ -37,6 +37,9 @@ pub(super) struct Profile {
     local: LocalPhy,
     offered: Offer,
     coexistence_narrowed: bool,
+    /// Our advertised VHT Supported Channel Width Set bits (`vht_cap_info`
+    /// & 0xc): 0 below 160 MHz, 4 for 160, 8 for 160 and 80+80.
+    width_set: u32,
 }
 /// Requested local PHY: the HT20/HT40 profiles, or VHT (HT20/40 plus a
 /// VHT80-capable element) that only a 5GHz 80 MHz-qualified BSS reaches.
@@ -221,7 +224,7 @@ impl Profile {
         if phy == Phy::Vht && (!vht_supported(caps) || cached.frequency < 3000) {
             return Ok(None);
         }
-        Self::offer_local(caps, cached, own, local(caps, phy, chains)?, chains)
+        Self::offer_local(caps, cached, own, local(caps, phy, chains)?, chains, 0)
     }
     fn offer_local(
         caps: &Capabilities,
@@ -229,6 +232,7 @@ impl Profile {
         own: [u8; 6],
         local: LocalPhy,
         chains: Chains,
+        width_set: u32,
     ) -> Result<Option<Self>, Error> {
         let bss = bss(cached)?;
         ApElements::parse(&bss.information_elements).map_err(plan_error)?;
@@ -250,8 +254,24 @@ impl Profile {
         let h = offered.ht();
         // Center indices38/46/151/159 are not valid20MHz primaries, so
         // channel::frequency (a primary inventory) deliberately rejects them.
-        let center = (if cached.frequency < 3000 { 2407 } else { 5000 })
+        let full = (if cached.frequency < 3000 { 2407 } else { 5000 })
             + 5 * u16::from(offered.center_channel());
+        // A contiguous160 selection reports the 160 MHz center; keep the
+        // 80+80 shape instead (`regulatory::Permission`): `center` is the
+        // primary80 segment, the wide `center2` its adjacent half.
+        let contiguous = offered.width() == Width::OneSixty && !offered.discontiguous();
+        let center = if contiguous {
+            primary80(full, cached.frequency)
+        } else {
+            full
+        };
+        let center2 = second_center(
+            offered.width(),
+            offered.discontiguous(),
+            full,
+            center,
+            offered.secondary_center_channel(),
+        );
         let secondary = match offered.width() {
             Width::Forty => offered
                 .occupied_channels()
@@ -271,10 +291,20 @@ impl Profile {
         let eighty =
             offered.width() == Width::Eighty && offered.vht().is_some() && secondary.is_some();
         let wide = offered.width() == Width::OneSixty
-            && offered.discontiguous()
             && offered.vht().is_some()
-            && secondary.is_some();
+            && secondary.is_some()
+            && (offered.discontiguous() || width_set != 0);
         if !(matches!(offered.width(), Width::Twenty | Width::Forty) || eighty || wide) {
+            return Err(Error::Unsupported);
+        }
+        let vht = offered
+            .vht()
+            .map(|v| vht(v, offered.width(), chains, center2, contiguous, width_set));
+        // mac80211 `ieee80211_vht_cap_ie_to_sta_vht_cap` drops the peer's
+        // width set our own does not cover (an 80+80 AP seen by a 160-only
+        // station); its station bandwidth would then stay 80 MHz
+        // (`ieee80211_sta_cap_rx_bw`), which no contiguous160 owner models.
+        if contiguous && vht.is_some_and(|v| v.capabilities & 12 == 0) {
             return Err(Error::Unsupported);
         }
         Ok(Some(Self {
@@ -292,19 +322,11 @@ impl Profile {
             peer_tx_stbc: peer_tx_stbc(h),
             center,
             secondary,
-            vht: offered.vht().map(|v| {
-                vht(
-                    v,
-                    offered.width(),
-                    chains,
-                    offered
-                        .secondary_center_channel()
-                        .map(|c| 5000 + 5 * u16::from(c)),
-                )
-            }),
+            vht,
             local,
             offered,
             coexistence_narrowed: false,
+            width_set,
         }))
     }
     pub(super) fn local(self) -> LocalPhy {
@@ -342,15 +364,27 @@ impl Profile {
         if n.vht().is_some() != self.vht.is_some() {
             return Err(Error::Unsupported);
         }
+        let contiguous = n.width() == Width::OneSixty && !n.discontiguous();
+        let center2 = second_center(
+            n.width(),
+            n.discontiguous(),
+            5000 + 5 * u16::from(n.center_channel()),
+            self.center,
+            n.secondary_center_channel(),
+        );
         self.vht = n.vht().map(|v| {
             vht(
                 v,
                 n.width(),
                 self.chains,
-                n.secondary_center_channel()
-                    .map(|c| 5000 + 5 * u16::from(c)),
+                center2,
+                contiguous,
+                self.width_set,
             )
         });
+        if contiguous && self.vht.is_some_and(|v| v.capabilities & 12 == 0) {
+            return Err(Error::Unsupported);
+        }
         Ok(self)
     }
     /// Linux `ath10k_peer_assoc_h_ht` peer flags beyond HT/BW40: LDPC
@@ -558,11 +592,44 @@ impl Profile {
 /// length is the minimum (ours is 3895, field 0); SGI80 is symmetric; the
 /// peer's RX STBC needs our selected TX STBC and its TX STBC our RX STBC
 /// promise; beamforming roles need ours (none) and 160/80+80 our width.
+/// cfg80211 chandef `center_freq1` of the 80 MHz half of a contiguous160
+/// channel (centre `full`) that holds `primary` (a 20 MHz primary or the
+/// primary80 center itself).
+fn primary80(full: u16, primary: u16) -> u16 {
+    if primary < full {
+        full - 40
+    } else {
+        full + 40
+    }
+}
+/// The wide `center2` (MHz): the other segment of an 80+80 selection, or
+/// the adjacent half of a contiguous160 one whose primary80 is `center`.
+fn second_center(
+    width: Width,
+    discontiguous: bool,
+    full: u16,
+    center: u16,
+    segment: Option<u8>,
+) -> Option<u16> {
+    if discontiguous {
+        segment.map(|c| 5000 + 5 * u16::from(c))
+    } else if width == Width::OneSixty {
+        Some(2 * full - center)
+    } else {
+        None
+    }
+}
+/// `contiguous` selects mac80211's own-width intersection for the peer's
+/// Supported Channel Width Set (`width_set` = ours): 160-only keeps only
+/// the peer's 160 bit, 160+80+80 keeps the peer's whole field. Linux
+/// `ath10k_mac_get_phymode_vht` then picks VHT160 or VHT80_80 from it.
 fn vht(
     v: &association::phy::VhtNegotiation,
     width: Width,
     chains: Chains,
     center2: Option<u16>,
+    contiguous: bool,
+    width_set: u32,
 ) -> Vht {
     let peer = v.peer_capability();
     let body = v.peer_capability_body();
@@ -570,7 +637,15 @@ fn vht(
     Vht {
         capabilities: (peer & kept)
             | if center2.is_some() {
-                (2 << 2) | if v.tx_sgi160() { 64 } else { 0 }
+                (if contiguous {
+                    match width_set {
+                        4 => peer & 4,
+                        8 => peer & 12,
+                        _ => 0,
+                    }
+                } else {
+                    2 << 2
+                }) | if v.tx_sgi160() { 64 } else { 0 }
             } else {
                 0
             }
@@ -593,6 +668,7 @@ fn vht(
         eighty: width == Width::Eighty,
         wide: center2.map(|center2| wide::Wide {
             center2,
+            contiguous,
             nss: ((0..4u8)
                 .rev()
                 .find(|n| v.tx_mcs_map() >> (n * 2) & 3 != 3)
