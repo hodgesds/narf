@@ -3063,6 +3063,23 @@ grant is published. Remaining blockers, verified against the tree:
    Open: the station worker. `interface.rs`/`pci_firmware.rs` still drive
    `packet_core::Core` and `ready_now`; a USB station needs an async worker
    owning `usb_packet::Owner` plus the async register `Io`.
+   Precise blocker for that worker: the station state machine reaches the
+   hardware only through `firmware_transport::Io`, and part of that surface
+   is still synchronous *and* register-touching on the PCI backend:
+   `mailbox_ready`/`mailbox_submit`/`mailbox_consumed` (HMEBOX/HMETFR,
+   0x1cc), `ps_mailbox_submit`, `submit_h2c`/`poll_h2c`, `park_radio`,
+   `station_ht_program_quiet`, `station_power_tracking_quiet` and the
+   `station_profile_readback` family. The NARF USB stack exposes EP0 only
+   as `USBDevice::control_in`/`control_out` futures (no begin/poll control
+   receipt like `begin_bulk_*`), so a USB backend cannot implement those
+   methods without blocking, and no synchronous polled EP0 primitive is
+   allowed (blocker 1). One of these is needed first: (a) begin/poll EP0
+   receipts in `narf-drivers-usb`, which a USB `Io` could then drive from
+   the synchronous methods the same way `usb_packet::Owner` drives bulk; or
+   (b) converting those `Io` methods to `impl Future` as blocker 1 did,
+   with PCI completing them in the first poll. `packet_*` can map onto
+   `usb_packet::Owner` directly, because its `submit`/`poll` are already
+   non-blocking.
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,
