@@ -525,3 +525,124 @@ pub(super) async fn set_channel(
     cca(io, info, center, width, PATH_AB).await?;
     rfe(io, info, center, PATH_AB, PATH_AB).await
 }
+
+/// `rtw8822b_set_tx_power_index_by_rate` words for one path: four rate
+/// indices per word at `offset_txagc[path]` (0x1d00 / 0x1d80) + `rate & 0xfc`,
+/// indexed by DESC_RATE (`__RTW_RATE_SECTION_2SS_MAX`). Indices
+/// are caller-supplied coded values (`max_power_index` 0x3f), never dBm.
+pub(super) async fn write_txagc(
+    io: &mut impl Io,
+    path: u8,
+    indices: &[u8; 64],
+) -> Result<(), Error> {
+    let base: u16 = match path {
+        0 => 0x1d00,
+        1 => 0x1d80,
+        _ => return Err(Error::Unsupported),
+    };
+    if indices.iter().any(|&v| v > 0x3f) {
+        return Err(Error::Unsupported);
+    }
+    // rtw_rate_section CCK/OFDM/HT1S/HT2S (0x00..0x1b) and VHT1S/VHT2S
+    // (0x2c..0x3f); HT3S/HT4S (0x1c..0x2b) are beyond 2SS and never written.
+    for (word, rates) in indices.chunks_exact(4).enumerate() {
+        if (7..11).contains(&word) {
+            continue;
+        }
+        let value = u32::from_le_bytes([rates[0], rates[1], rates[2], rates[3]]);
+        io.write32(base + (word as u16) * 4, value).await?;
+    }
+    Ok(())
+}
+
+/// One completed B22 calibration-only IQK receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Calibration {
+    pub channel: u8,
+    pub bandwidth_mhz: u8,
+    pub thermal_before: u8,
+    pub thermal_after: u8,
+    /// `REG_IQKFAILMSK` (0x1bf0) after completion.
+    pub iqk_status: u32,
+}
+
+/// RF-A `RF_T_METER` (0x42) bits 15:10, checked against the envelope.
+async fn temperature(
+    io: &mut impl Io,
+    envelope: &super::calibration8822b::Envelope,
+) -> Result<u8, Error> {
+    let value = ((rf_read(io, 0, 0x42).await? & 0xfc00) >> 10) as u8;
+    envelope
+        .temperature(value)
+        .map_err(Error::Calibration8822b)?;
+    Ok(value)
+}
+/// `rtw8822b_pwr_track` triggers RF42[17:16]=3 on one watchdog pass and reads
+/// the meter on the next (2 s `RTW_WATCH_DOG_DELAY_TIME`); there is no done bit.
+async fn convert_temperature(
+    io: &mut impl Io,
+    envelope: &super::calibration8822b::Envelope,
+) -> Result<u8, Error> {
+    rf(io, 0, 0x42, 3 << 16, 3).await?;
+    io.delay_us(2_000_000).await;
+    temperature(io, envelope).await
+}
+
+/// `rtw8822b_phy_calibration` = `rtw8822b_do_iqk` (`rtw_fw_do_iqk` clear 0,
+/// segment 0; 300 × 20 ms RF08 `0xabcde` poll; RF08 cleared; 0x1bf0
+/// reload/fail mask) on ch1/20 at all-zero coded TXAGC, after the source
+/// `rtw_fw_send_general_info`/`rtw_fw_send_phydm_info`. Linux only logs the
+/// fail mask; this calibration-only receipt refuses failed or reloaded IQK and
+/// a stale pre-existing done marker. The radio is parked afterwards.
+pub(super) async fn calibrate(
+    io: &mut impl Io,
+    mac: super::mac::Info,
+    info: Info,
+    envelope: &super::calibration8822b::Envelope,
+) -> Result<Calibration, Error> {
+    io.begin_calibration8821c()?;
+    if (read(io, 0xf0).await? >> 12) & 15 != u32::from(info.cut) {
+        return Err(Error::Unsupported);
+    }
+    let thermal_before = convert_temperature(io, envelope).await?;
+    set_channel(io, info, 1, Width::Twenty).await?;
+    for path in 0..2 {
+        write_txagc(io, path, &[0; 64]).await?;
+    }
+    if rf_read(io, 0, 0x08).await? == 0xabcde {
+        return Err(Error::Prerequisite);
+    }
+    io.begin_commands()?;
+    super::command::send(io, &super::command::general(mac, 0)?).await?;
+    super::command::send(io, &super::command::phydm8822b(info, 1)?).await?;
+    super::command::send(io, &super::command::iqk8821c(2)).await?;
+    let mut completed = false;
+    for attempt in 0..300 {
+        temperature(io, envelope).await?;
+        if rf_read(io, 0, 0x08).await? == 0xabcde {
+            completed = true;
+            break;
+        }
+        if attempt < 299 {
+            io.delay_us(20000).await;
+        }
+    }
+    if !completed {
+        return Err(Error::Timeout);
+    }
+    rf(io, 0, 0x08, 0xfffff, 0).await?;
+    let status = read(io, 0x1bf0).await?;
+    if status & 0x100ff != 0 {
+        return Err(Error::Prerequisite);
+    }
+    let thermal_after = convert_temperature(io, envelope).await?;
+    io.park_radio().await?;
+    io.finish_calibration8821c()?;
+    Ok(Calibration {
+        channel: 1,
+        bandwidth_mhz: 20,
+        thermal_before,
+        thermal_after,
+        iqk_status: status,
+    })
+}

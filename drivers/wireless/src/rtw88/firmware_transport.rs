@@ -42,6 +42,8 @@ pub enum Error {
     Firmware(FirmwareError),
     Power(super::power_policy::Error),
     Calibration8821c(super::calibration8821c::Error),
+    /// RTL8822BE `N2BQ` calibration envelope (`calibration8822b`).
+    Calibration8822b(super::calibration8822b::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -846,6 +848,8 @@ pub(super) struct Owner<I: Io> {
     phy: Option<super::phy::Info>,
     phy8821c: Option<super::phy8821c::Info>,
     phy8822b: Option<super::phy8822b::Info>,
+    calibration8822b: Option<super::radio8822b::Calibration>,
+    envelope8822b: Option<alloc::sync::Arc<super::calibration8822b::Envelope>>,
     /// C21 host interface; keys the PHY rows and every signed C21 record.
     interface: super::phy8821c::Interface,
     calibration8821c: Option<super::radio8821c::Info>,
@@ -886,6 +890,8 @@ impl<I: Io> Owner<I> {
             phy: None,
             phy8821c: None,
             phy8822b: None,
+            calibration8822b: None,
+            envelope8822b: None,
             interface: super::phy8821c::Interface::Pcie,
             calibration8821c: None,
             envelope8821c: None,
@@ -1702,7 +1708,7 @@ impl<I: Io> Owner<I> {
         let phy = self.phy8821c.ok_or(Error::State)?;
         let mut checked = super::radio8821c::Checked {
             io: &mut self.io,
-            envelope: &envelope,
+            envelope: &*envelope,
             policy,
         };
         let result = narf_time::timeout(
@@ -1739,6 +1745,96 @@ impl<I: Io> Owner<I> {
         self.phy8822b = Some(info);
         self.phase = Phase::PhyTablesPrepared;
         Ok(info)
+    }
+    fn calibration_board8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::calibration8822b::Board, Error> {
+        if self.did != 0xb822 {
+            return Err(Error::Unsupported);
+        }
+        super::calibration8822b::Board::new(
+            factory,
+            self.phy8822b.ok_or(Error::State)?,
+            self.mac.ok_or(Error::State)?,
+            self.hardware.ok_or(Error::State)?,
+            self.image_digest.ok_or(Error::State)?,
+        )
+        .map_err(Error::Calibration8822b)
+    }
+    /// Metadata a provisioner measures and signs as `N2BQ`; grants nothing.
+    pub(super) fn calibration_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::calibration8822b::Request, Error> {
+        if !matches!(
+            self.phase,
+            Phase::PhyTablesPrepared | Phase::Calibration8821cPrepared
+        ) {
+            return Err(Error::State);
+        }
+        Ok(self.calibration_board8822b(factory)?.request())
+    }
+    pub(super) fn calibration_info8822b(&self) -> Option<super::radio8822b::Calibration> {
+        self.calibration8822b
+    }
+    pub(super) fn preflight_calibration8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::calibration8822b::Source,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<alloc::sync::Arc<super::calibration8822b::Envelope>, Error> {
+        if self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let envelope = source
+            .load(self.calibration_board8822b(factory)?)
+            .map_err(Error::Calibration8822b)?;
+        envelope.validate(domain).map_err(Error::Calibration8822b)?;
+        Ok(alloc::sync::Arc::new(envelope))
+    }
+    /// RTL8822BE `rtw8822b_phy_calibration` on ch1/20 inside the `N2BQ`
+    /// envelope (`radio8822b::calibrate`). The owner records its internal
+    /// phase as `Calibration8821cPrepared`; every later C21 continuation
+    /// checks `0xc821` and so never accepts this owner.
+    pub(super) async fn prepare_calibration8822b<F>(
+        &mut self,
+        factory: &super::efuse8822b::Factory8822b,
+        envelope: alloc::sync::Arc<super::calibration8822b::Envelope>,
+        policy: F,
+    ) -> Result<super::radio8822b::Calibration, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.did != 0xb822 || self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        if !envelope.matches(self.calibration_board8822b(factory)?) {
+            return Err(Error::Calibration8822b(
+                super::calibration8822b::Error::Identity,
+            ));
+        }
+        envelope
+            .validate(&policy()?)
+            .map_err(Error::Calibration8822b)?;
+        self.phase = Phase::Failed;
+        self.envelope8822b = Some(envelope.clone()); // before the first device access/await
+        let mac = self.mac.ok_or(Error::State)?;
+        let phy = self.phy8822b.ok_or(Error::State)?;
+        let mut checked = super::radio8821c::Checked {
+            io: &mut self.io,
+            envelope: &*envelope,
+            policy,
+        };
+        let result = narf_time::timeout(
+            narf_time::Deadline::after_ms(12000),
+            super::radio8822b::calibrate(&mut checked, mac, phy, &envelope),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.calibration8822b = Some(result);
+        self.phase = Phase::Calibration8821cPrepared;
+        Ok(result)
     }
     pub(super) async fn prepare_phy8821c(
         &mut self,

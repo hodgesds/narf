@@ -9,6 +9,31 @@ use narf_firmware::{FirmwareBlob, FirmwareError};
 use narf_wireless::reg::RegulatoryDomain;
 
 pub(super) const LENGTH: usize = 128;
+/// A measured calibration envelope that encloses each native operation in
+/// its capability and current policy (C21 `N21Q`, B22 `N2BQ`).
+pub(super) trait Enclosure: Sync {
+    fn invoke<T, F, Op>(
+        &self,
+        policy: &F,
+        operation: Op,
+    ) -> Result<T, super::firmware_transport::Error>
+    where
+        F: Fn() -> Result<RegulatoryDomain, super::firmware_transport::Error>,
+        Op: FnOnce() -> Result<T, super::firmware_transport::Error>;
+}
+impl Enclosure for Envelope {
+    fn invoke<T, F, Op>(
+        &self,
+        policy: &F,
+        operation: Op,
+    ) -> Result<T, super::firmware_transport::Error>
+    where
+        F: Fn() -> Result<RegulatoryDomain, super::firmware_transport::Error>,
+        Op: FnOnce() -> Result<T, super::firmware_transport::Error>,
+    {
+        Envelope::invoke(self, policy, operation)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Firmware(FirmwareError),

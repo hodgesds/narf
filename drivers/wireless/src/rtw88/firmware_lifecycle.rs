@@ -406,6 +406,77 @@ impl<I: Io> Lifecycle<I> {
         }
         result
     }
+    pub(super) async fn calibration_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::calibration8822b::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .calibration_request8822b(factory)
+    }
+    pub(super) async fn calibration_info8822b(&self) -> Option<super::radio8822b::Calibration> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::calibration_info8822b)
+    }
+    /// RTL8822BE `N2BQ`-enclosed ch1/20 firmware IQK: `PhyTablesPrepared →
+    /// Calibrating → Calibrated`. A missing, unsigned, mismatched or
+    /// policy-refused record leaves the pure `PhyTablesPrepared` checkpoint.
+    pub(super) async fn prepare_calibration8822b_with<F>(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::calibration8822b::Source,
+        policy: F,
+    ) -> Result<super::radio8822b::Calibration, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let envelope = owner.preflight_calibration8822b(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::Calibrating;
+        let _attempt = Attempt(self);
+        let result = owner
+            .prepare_calibration8822b(factory, envelope, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Calibrated,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_calibration8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::radio8822b::Calibration, Error> {
+        narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| Error::Calibration8822b(super::calibration8822b::Error::Policy))?;
+        self.prepare_calibration8822b_with(
+            factory,
+            super::calibration8822b::Source::Registered,
+            || {
+                narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8822b(
+                    super::calibration8822b::Error::Policy,
+                ))
+            },
+        )
+        .await
+    }
     pub(super) async fn prepare_phy8821c(
         &self,
         factory: &super::efuse::Factory8821c,

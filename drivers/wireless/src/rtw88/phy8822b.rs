@@ -62,6 +62,10 @@ impl Info {
         })
     }
 }
+/// The exact preselected rows `apply_table` programs for `info`.
+pub(super) fn rows(info: Info, kind: usize) -> Option<&'static [(u16, u32)]> {
+    tables::select(info.cut, info.rfe, kind)
+}
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn tables_for_test(cut: u8, rfe: u8, kind: usize) -> Option<&'static [(u16, u32)]> {
     tables::select(cut, rfe, kind)

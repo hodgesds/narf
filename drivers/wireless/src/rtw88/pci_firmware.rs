@@ -582,11 +582,14 @@ unsafe impl Registers for Native {
         self.state = State::PhyTablesPrepared;
         Ok(())
     }
+    /// Also the RTL8822BE (`0xb822`) `N2BQ` calibration envelope: the same
+    /// closed-MAC/parked-PCI state machine around one firmware IQK program.
     fn begin_calibration8821c(&mut self) -> Result<(), Error> {
-        if self.device.id.device != 0xc821 || self.state != State::PhyTablesPrepared {
+        let did = self.device.id.device;
+        if !matches!(did, 0xc821 | 0xb822) || self.state != State::PhyTablesPrepared {
             return Err(Error::State);
         }
-        if self.mmio.len < 0x2c00 {
+        if self.mmio.len < if did == 0xb822 { 0x5000 } else { 0x2c00 } {
             return Err(Error::Unsupported);
         }
         self.state = State::Calibrating8821c;
@@ -600,7 +603,7 @@ unsafe impl Registers for Native {
         Ok(())
     }
     fn finish_calibration8821c(&mut self) -> Result<(), Error> {
-        if self.device.id.device != 0xc821
+        if !matches!(self.device.id.device, 0xc821 | 0xb822)
             || self.state != State::Configuring
             || self.command_ring.pending()
         {
@@ -662,7 +665,8 @@ unsafe impl Registers for Native {
     }
     fn begin_commands(&mut self) -> Result<(), Error> {
         if !(self.state == State::PhyTablesPrepared
-            || self.device.id.device == 0xc821 && self.state == State::Calibrating8821c)
+            || matches!(self.device.id.device, 0xc821 | 0xb822)
+                && self.state == State::Calibrating8821c)
             || self.command_buffer.is_some()
         {
             return Err(Error::State);

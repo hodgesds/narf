@@ -44,6 +44,7 @@ extern crate alloc;
 mod band5;
 mod bf;
 mod calibration8821c;
+mod calibration8822b;
 mod channel_policy;
 mod coding;
 #[cfg(feature = "kernel-test")]

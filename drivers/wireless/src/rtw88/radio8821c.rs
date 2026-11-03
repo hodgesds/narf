@@ -883,15 +883,17 @@ pub(super) async fn prepare(
     })
 }
 
-pub(super) struct Checked<'a, I, F> {
+/// Encloses every native operation in a measured calibration envelope (C21
+/// `N21Q` by default; B22 `N2BQ` through `calibration8822b`).
+pub(super) struct Checked<'a, I, F, E = Envelope> {
     pub io: &'a mut I,
-    pub envelope: &'a Envelope,
+    pub envelope: &'a E,
     pub policy: F,
 }
 #[async_trait::async_trait]
 // SAFETY: current measured authority/policy encloses every underlying native
 // operation; the retained backend alone owns DMA and its terminal receipts.
-unsafe impl<I: Io, F> Io for Checked<'_, I, F>
+unsafe impl<I: Io, F, E: super::calibration8821c::Enclosure> Io for Checked<'_, I, F, E>
 where
     F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
 {

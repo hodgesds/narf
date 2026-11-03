@@ -342,3 +342,160 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_set_channel_follows_rtw8822b_set_channel
 );
+
+fn b22_board_factory(rfe: u8, thermal: u8) -> super::super::efuse8822b::Factory8822b {
+    let mut map = *b22_factory(rfe, 0x20).logical();
+    map[0xba] = thermal;
+    super::super::efuse8822b::Factory8822b::for_test(map).unwrap()
+}
+fn b22_record(request: &super::super::calibration8822b::Request) -> alloc::vec::Vec<u8> {
+    let mut bytes = alloc::vec![0; 128];
+    bytes[..4].copy_from_slice(b"N2BQ");
+    for (at, value) in [(4, 1u16), (6, 128), (12, 0x10ec), (14, 0xb822)] {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[8..12].copy_from_slice(&128u32.to_le_bytes());
+    bytes[16..48].copy_from_slice(&request.identity);
+    bytes[48..54].copy_from_slice(&request.mac);
+    bytes[54] = 1;
+    bytes[55] = 20;
+    for (at, value) in [(56, 4i16), (58, 76), (60, 40)] {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[62] = 20;
+    bytes[63] = 30;
+    bytes[64..66].copy_from_slice(b"US");
+    bytes
+}
+
+fn smoke_rtw8822be_n2bq_envelope_binds_board_and_refuses_unprovisioned() -> TestResult {
+    use super::super::calibration8822b::{Board, Error as E, Source};
+    use super::super::{mac, phy8822b::Info};
+    use narf_capabilities::Cap;
+    let mac = mac::Info {
+        cut: 1,
+        reserved_boundary: 1996,
+        h2c_page: 2036,
+        firmware_tx_page: 2044,
+    };
+    let board = |rfe, thermal, mac: mac::Info| {
+        let factory = b22_board_factory(rfe, thermal);
+        let phy = Info::from_factory(&factory, 1, b22_features(2)).unwrap();
+        Board::new(&factory, phy, mac, b22_features(2), [9; 32])
+    };
+    // An erased thermal meter or a non-B22 FIFO geometry never qualifies.
+    if board(3, 0xff, mac) != Err(E::Factory)
+        || board(
+            3,
+            25,
+            mac::Info {
+                h2c_page: 500,
+                ..mac
+            },
+        ) != Err(E::Identity)
+    {
+        return TestResult::Fail("8822B calibration board admitted an erased/foreign facet");
+    }
+    let (b3, b5) = match (board(3, 25, mac), board(5, 25, mac)) {
+        (Ok(b3), Ok(b5)) => (b3, b5),
+        _ => return TestResult::Fail("8822B calibration board rejected a provisioned map"),
+    };
+    let request = b3.request();
+    if request.identity == b5.request().identity
+        || request.filename != "rtw88/rtw8822be-iqk-v1-00e04c22b802.bin"
+    {
+        return TestResult::Fail("8822B N2BQ request does not bind RFE/identity/filename");
+    }
+    let load = |bytes, signer, board| {
+        Source::Verified {
+            bytes,
+            signer,
+            cap: Cap::bootstrap(),
+        }
+        .load(board)
+    };
+    let good = b22_record(&request);
+    let mut c21 = good.clone();
+    c21[..4].copy_from_slice(b"N21Q");
+    let mut hot = good.clone();
+    hot[63] = 24; // board thermal 25 outside the measured window
+    if load(good.clone(), None, b3).err() != Some(E::Unsigned)
+        || load(c21, Some([7; 32]), b3).err() != Some(E::Format)
+        || load(hot, Some([7; 32]), b3).err() != Some(E::Format)
+        || load(good.clone(), Some([7; 32]), b5).err() != Some(E::Identity)
+    {
+        return TestResult::Fail("8822B N2BQ decode admitted a foreign/unsigned record");
+    }
+    let envelope = match load(good, Some([7; 32]), b3) {
+        Ok(envelope) => envelope,
+        Err(_) => return TestResult::Fail("8822B N2BQ rejected its exact signed record"),
+    };
+    let us = narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: alloc::vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2422,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 20,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    };
+    let mut other = us.clone();
+    other.country_code = *b"DE";
+    if envelope.validate(&us).is_err()
+        || envelope.validate(&other).is_ok()
+        || !envelope.matches(b3)
+        || envelope.matches(b5)
+        || envelope.temperature(31).is_ok()
+    {
+        return TestResult::Fail("8822B N2BQ policy/thermal/board checks differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bq_envelope_binds_board_and_refuses_unprovisioned
+);
+
+fn smoke_rtw8822be_iqk_commands_and_txagc_follow_linux() -> TestResult {
+    use super::super::{command, phy8822b::Info, radio8822b};
+    let info = Info::from_factory(&b22_factory(5, 0x20), 3, b22_features(2)).unwrap();
+    let packet = match command::phydm8822b(info, 1) {
+        Ok(packet) => packet,
+        Err(_) => return TestResult::Fail("8822B phydm H2C rejected RFE5"),
+    };
+    // H2C_PKT_PHYDM_INFO: rfe_option, FW_RF_2T2R, cut, BB_PATH_AB/AB.
+    if packet[8..12] != [5, 2, 3, 0x33] || command::iqk8821c(2)[8] != 0 {
+        return TestResult::Fail("8822B phydm/IQK H2C fields differ from fw.c");
+    }
+    let mut io = super::mac_tests::Model::new(1, 1);
+    let mut indices = [0u8; 64];
+    for (i, v) in indices.iter_mut().enumerate() {
+        *v = i as u8 & 0x3f;
+    }
+    if narf_scheduler::block_on(radio8822b::write_txagc(&mut io, 1, &indices)).is_err()
+        || narf_scheduler::block_on(radio8822b::write_txagc(&mut io, 0, &[0x40; 64])).is_ok()
+    {
+        return TestResult::Fail("8822B TXAGC index bound differs");
+    }
+    let words: alloc::vec::Vec<_> = io
+        .trace
+        .iter()
+        .filter(|op| op.0 == 1 && op.1 == 32)
+        .map(|op| (op.2, op.3))
+        .collect();
+    // 12 words per path: CCK..HT2S (0x00..0x1b) and VHT1S/VHT2S (0x2c..0x3f).
+    if words.len() != 12
+        || words[0] != (0x1d80, 0x03020100)
+        || words[6] != (0x1d98, 0x1b1a1918)
+        || words[7] != (0x1dac, 0x2f2e2d2c)
+        || words[11] != (0x1dbc, 0x3f3e3d3c)
+    {
+        return TestResult::Fail("8822B TXAGC words differ from set_tx_power_index_by_rate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_iqk_commands_and_txagc_follow_linux
+);
