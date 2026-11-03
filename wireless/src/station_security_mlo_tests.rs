@@ -652,3 +652,122 @@ kernel_test_in!(
     "wireless/station_security/mlo",
     smoke_mld_m1_nonce_boundaries_authenticated_kdes_group_rekey_and_replay
 );
+
+const OWN_LINK2: [u8; 6] = [2, 0, 0, 0, 0, 0x21];
+const AP_LINK2: [u8; 6] = [2, 0, 0, 0, 0, 0x22];
+fn further_context(id: u8) -> Context {
+    let mut bytes = vec![0x10, 1, 10];
+    bytes.extend_from_slice(&AP_MLD);
+    bytes.extend_from_slice(&[id, 0, 0]);
+    Local::single_link(OWN_MLD)
+        .unwrap()
+        .context(OWN_LINK2, AP_LINK2, &BasicMultiLink::parse(&bytes).unwrap())
+        .unwrap()
+}
+fn further_kdes(id: u8, with_link: bool, gtk: [u8; 16]) -> Vec<u8> {
+    let mut value = Vec::new();
+    if with_link {
+        let mut link = vec![id | 0x10];
+        link.extend_from_slice(&AP_LINK2);
+        link.extend_from_slice(&ie(48, &pmf_rsne()).unwrap());
+        value.extend_from_slice(&field(19, &link));
+    }
+    let mut g = vec![id << 4 | 1, 3, 0, 0, 0, 0, 0];
+    g.extend_from_slice(&gtk);
+    value.extend_from_slice(&field(16, &g));
+    let mut i = vec![5, 0, 1, 0, 0, 0, 0, 0, id << 4];
+    i.extend_from_slice(&[0x5a; 16]);
+    value.extend_from_slice(&field(17, &i));
+    value
+}
+fn multi_link_kdes() -> Result<(), &'static str> {
+    use crate::eapol::mlo::{self, Error as E, Kind, Profile};
+    let (assoc, link) = (context(1), further_context(2));
+    let rsne = ie(48, &pmf_rsne()).unwrap();
+    let profile = Profile {
+        rsne: &rsne,
+        rsnxe: None,
+        gtk_len: 16,
+        igtk_len: Some(16),
+    };
+    // M2: MLD MAC KDE, then one MLO Link KDE (no RSNE) per further link.
+    let m2 = mlo::message2_links(assoc, &[link], &[]).map_err(|_| "multi-link M2")?;
+    let mut expected = field(3, &OWN_MLD);
+    let mut info = vec![2];
+    info.extend_from_slice(&OWN_LINK2);
+    expected.extend_from_slice(&field(19, &info));
+    if m2 != expected || mlo::message2_links(assoc, &[assoc], &[]) != Err(E::Profile) {
+        return Err("multi-link M2 Link KDE layout or assoc-link exclusion");
+    }
+    let flags =
+        crate::eapol::KI_ENCRYPTED_KEY_DATA | crate::eapol::KI_INSTALL | crate::eapol::KI_SECURE;
+    let mut m3 = keys(assoc, [1; 16], IGTK, true);
+    m3.extend_from_slice(&further_kdes(2, true, [7; 16]));
+    let got = mlo::authenticated_link_keys(
+        assoc,
+        &[(link, profile)],
+        Kind::Pairwise3,
+        flags,
+        &m3,
+        profile,
+    )
+    .map_err(|_| "multi-link M3 rejected")?;
+    if got.len() != 2
+        || got[0].link_id != 1
+        || got[0].gtk.key != [1; 16]
+        || got[1].link_id != 2
+        || got[1].gtk.key != [7; 16]
+        || got[1].gtk.key_id != 1
+        || got[1].gtk.rsc[..2] != [3, 0]
+        || got[1].igtk.as_ref().map(|igtk| igtk.key_id) != Some(5)
+    {
+        return Err("multi-link M3 per-link GTK/IGTK/PN");
+    }
+    // M3 needs every accepted link's Link KDE; group rekeys need each GTK.
+    let mut unlinked = keys(assoc, [1; 16], IGTK, true);
+    unlinked.extend_from_slice(&further_kdes(2, false, [7; 16]));
+    let group = further_kdes(2, false, [8; 16]);
+    if mlo::authenticated_link_keys(
+        assoc,
+        &[(link, profile)],
+        Kind::Pairwise3,
+        flags,
+        &unlinked,
+        profile,
+    ) != Err(E::Link)
+        || mlo::authenticated_link_keys(
+            assoc,
+            &[(link, profile)],
+            Kind::Group1,
+            crate::eapol::KI_ENCRYPTED_KEY_DATA,
+            &group,
+            profile,
+        ) != Err(E::Key)
+    {
+        return Err("multi-link M3/group accepted a missing per-link KDE");
+    }
+    // A KDE for a link outside the association is refused, and the
+    // single-link profile still refuses any affiliated link's KDE.
+    let mut stranger = m3.clone();
+    stranger.extend_from_slice(&further_kdes(3, false, [9; 16]));
+    if mlo::authenticated_link_keys(
+        assoc,
+        &[(link, profile)],
+        Kind::Pairwise3,
+        flags,
+        &stranger,
+        profile,
+    ) != Err(E::Link)
+        || mlo::authenticated_keys(assoc, Kind::Pairwise3, flags, &m3, profile) != Err(E::Link)
+    {
+        return Err("per-link KDE outside the association accepted");
+    }
+    Ok(())
+}
+fn smoke_mld_multi_link_m2_link_kdes_and_per_link_group_keys() -> TestResult {
+    multi_link_kdes().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "wireless/station_security/mlo",
+    smoke_mld_multi_link_m2_link_kdes_and_per_link_group_keys
+);

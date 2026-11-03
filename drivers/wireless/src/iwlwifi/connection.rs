@@ -75,6 +75,8 @@ pub struct Connection {
     eht: Option<alloc::sync::Arc<super::sc_eht::Profile>>,
     six: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     mld: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
+    /// Accepted further links (valid; at most one also active).
+    mld_links: Vec<super::sc_mlo_assoc::ValidLink>,
     client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
@@ -187,6 +189,7 @@ impl Connection {
             eht: None,
             six: None,
             mld: None,
+            mld_links: Vec::new(),
             client: None,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -306,10 +309,67 @@ impl Connection {
         beacon: Beacon,
         auth: AuthMethod,
         tx_chains: u32,
+        local_phy: super::ht_vht::Local,
+        roam_from: Option<[u8; 6]>,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        client: Option<(super::p2p_client::Plan, narf_net::native_emission::Lifetime)>,
+    ) -> Result<Self, &'static str> {
+        Self::associate_links_in_domain(
+            hw,
+            local,
+            beacon,
+            auth,
+            tx_chains,
+            local_phy,
+            roam_from,
+            domain,
+            client,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Associate as a non-AP MLD requesting the further affiliated links
+    /// in `further` (mlme.c `ieee80211_mgd_assoc` with several links).
+    /// Links the native profile cannot admit are not requested; accepted
+    /// links stay valid but inactive until `activate_mld_link`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn associate_mld_links(
+        hw: &mut Hardware,
+        local: [u8; 6],
+        beacon: Beacon,
+        auth: AuthMethod,
+        tx_chains: u32,
+        local_phy: super::ht_vht::Local,
+        further: Vec<super::MldLinkCandidate>,
+    ) -> Result<Self, &'static str> {
+        let domain = narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| "wireless regulatory domain is not configured")?;
+        let policy = super::mld_policy::Source::native();
+        hw.install_rf_policy(super::mld_policy::Authority::Transaction(
+            policy.transaction(&domain)?,
+        ))?;
+        let connection = Self::associate_links_in_domain(
+            hw, local, beacon, auth, tx_chains, local_phy, None, &domain, None, further,
+        )
+        .await?;
+        let fence = policy.bind(connection.regulatory_program())?;
+        hw.install_rf_policy(super::mld_policy::Authority::Station(fence))?;
+        Ok(connection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn associate_links_in_domain(
+        hw: &mut Hardware,
+        local: [u8; 6],
+        beacon: Beacon,
+        auth: AuthMethod,
+        tx_chains: u32,
         mut local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
         client: Option<(super::p2p_client::Plan, narf_net::native_emission::Lifetime)>,
+        further: Vec<super::MldLinkCandidate>,
     ) -> Result<Self, &'static str> {
         if let Some((plan, _)) = &client {
             if !super::p2p_go::host_allows(domain, plan.channel) {
@@ -547,6 +607,32 @@ impl Connection {
         if mld.is_some() && (!local_phy.eht || !hw.eht_supported() || !profile.pmf) {
             return Err("native MLD current EHT/PMF source absent");
         }
+        let admission = super::sc_mlo_assoc::Admission {
+            domain,
+            permissions: &permissions,
+            local: local_phy,
+        };
+        // Further links only for a 2.4/5GHz MLD station owner on the Sc/Bz
+        // MLD ABI with a fresh (non-roaming, non-P2P) association.
+        if mld.is_some()
+            && six.is_none()
+            && client.is_none()
+            && roam_from.is_none()
+            && !hw.is_mvm89()
+            && !further.is_empty()
+        {
+            let candidates: Vec<_> = further
+                .iter()
+                .filter_map(|candidate| {
+                    admission
+                        .local_for(&candidate.beacon)
+                        .map(|phy| (&candidate.beacon, candidate.own_link, phy))
+                })
+                .collect();
+            // A candidate the shared plan cannot request is simply not
+            // requested; the association link is unchanged either way.
+            let _ = profile.negotiate_links(&beacon, local, local_phy, &candidates);
+        }
         hw.ensure_platform_power().await?;
         if client.is_some() {
             hw.prepare_p2p_client().await?;
@@ -697,6 +783,7 @@ impl Connection {
             eht: None,
             six,
             mld,
+            mld_links: Vec::new(),
             client,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -796,10 +883,18 @@ impl Connection {
             // mlme.c places the Basic MLE before EHT Capabilities; the
             // Reassociation Request has the 6-octet current AP field too.
             let ies_start = if response_subtype == 0x30 { 34 } else { 28 };
+            // A multiple-link request carries one COMPLETE per-STA profile
+            // per further link, inheriting against this exact frame.
+            let element = match profile.links.as_deref() {
+                Some(plan) => plan
+                    .mld_request_element(request.get(ies_start..).unwrap_or(&[]))
+                    .map_err(|_| "native MLD multiple-link request element invalid")?,
+                None => mld.request_element().to_vec(),
+            };
             narf_wireless::association::mlo::insert_request_element(
                 &mut request,
                 ies_start,
-                mld.request_element(),
+                &element,
             );
             mld.project_management(&mut request);
         }
@@ -817,6 +912,53 @@ impl Connection {
             return Err("AP rejected association");
         }
         profile.check_response(&reply[6..])?;
+        let mut valid_links = Vec::new();
+        if let Some(plan) = profile.links.as_deref_mut() {
+            plan.accept_mld_links(&reply[6..], response.aid)
+                .map_err(|_| "native MLD per-link association response invalid")?;
+            let h2e = profile.sae.as_ref().is_some_and(|join| join.h2e());
+            for link in plan.mld_links().iter().filter(|link| link.accepted()) {
+                let candidate = further
+                    .iter()
+                    .find(|candidate| {
+                        candidate.beacon.bssid == link.context().peer_link()
+                            && candidate.own_link == link.context().own_link()
+                    })
+                    .ok_or("native MLD accepted link was not requested")?;
+                // mlme.c fails the association when an accepted link
+                // cannot be configured.
+                valid_links.push(admission.accept(
+                    hw,
+                    &candidate.beacon,
+                    link,
+                    h2e,
+                    response.aid,
+                    tx_chains,
+                    profile.pmf,
+                )?);
+            }
+        }
+        if !valid_links.is_empty() {
+            let links = valid_links
+                .iter()
+                .map(|link| {
+                    Ok(security::FurtherLinkSecurity {
+                        context: link.context,
+                        ap_rsn: link
+                            .beacon
+                            .rsn
+                            .clone()
+                            .ok_or("native MLD further link has no RSNE")?,
+                        ap_rsnxe: profile.rsn_extensions(&link.beacon.information_elements)?.1,
+                    })
+                })
+                .collect::<Result<Vec<_>, &'static str>>()?;
+            this.security
+                .as_mut()
+                .ok_or("native MLD further links without a secure session")?
+                .with_further_links(links)?;
+        }
+        this.mld_links = valid_links;
         if let Some(client) = &this.client {
             client.plan.response(&reply[6..])?;
         }
@@ -2072,17 +2214,7 @@ impl Connection {
             return Ok(None);
         };
         if let Some(mld) = &self.mld {
-            if frame.len() >= 36
-                && matches!(frame[0], 0x80 | 0x50)
-                && frame[10..16] == mld.context.peer_link()
-                && frame[16..22] == mld.context.peer_link()
-            {
-                mld.confirm_beacon(
-                    mpdu.body(24, 0)
-                        .and_then(|body| body.get(12..))
-                        .ok_or("native MLD live beacon body invalid")?,
-                )?;
-            }
+            mld.confirm_mpdu_beacon(mpdu)?;
         }
         if frame.len() >= 24 && frame[10..16] == peer && frame[16..22] == peer {
             if frame[0] == 0x80 {
@@ -2210,6 +2342,168 @@ impl Connection {
         Ok(Some(ethernet))
     }
 
+    /// Pairwise SEC_KEY STA mask: every active link STA.
+    fn pairwise_mask(&self) -> u32 {
+        self.mld.as_ref().map_or(1, |mld| mld.sta_mask())
+    }
+
+    /// The accepted further links' MLD Link IDs (valid links).
+    pub fn mld_valid_links(&self) -> u16 {
+        self.mld_links
+            .iter()
+            .fold(0, |mask, link| mask | 1 << link.link_id())
+    }
+
+    /// The currently active Link IDs (association link plus any further).
+    pub fn mld_active_links(&self) -> u16 {
+        self.mld.as_ref().map_or(0, |mld| mld.active_links())
+    }
+
+    /// Adopt one further link's authenticated MLO GTK/IGTK. An inactive
+    /// link keeps them for its activation (mac80211 installs keys of a
+    /// link only when it becomes active, `ieee80211_key_switch_links`);
+    /// an active link's changed keys are replaced on its link STA only.
+    async fn adopt_link_keys(
+        &mut self,
+        hw: &mut Hardware,
+        keys: security::LinkGroupKeys,
+    ) -> Result<(), &'static str> {
+        let index = self
+            .mld_links
+            .iter()
+            .position(|link| link.link_id() == keys.link_id)
+            .ok_or("MLD key delivery names an unknown link")?;
+        if let Some((owner, _)) = self.mld_links[index].active {
+            let old = self.mld_links[index].keys.as_ref();
+            let mut installs = Vec::new();
+            if old.is_none_or(|old| old.group != keys.group || old.group_id != keys.group_id) {
+                installs.push((keys.group_id, &keys.group, keys.group_rx_pn));
+            }
+            if let Some((igtk, id, ipn)) = &keys.igtk {
+                if old
+                    .and_then(|old| old.igtk.as_ref())
+                    .is_none_or(|(old, old_id, _)| old != igtk || old_id != id)
+                {
+                    installs.push((*id as u8, igtk, *ipn));
+                }
+            }
+            hw.drain_transmits().await?;
+            for (id, key, pn) in installs {
+                let body = super::sc_security::key_command_for(
+                    1 << owner.station,
+                    id,
+                    true,
+                    false,
+                    Some(key),
+                    pn,
+                )?;
+                if !hw.command(5, 0x18, &body[..]).await?.payload.is_empty() {
+                    hw.fail();
+                    return Err("unexpected native per-link key receipt");
+                }
+            }
+        }
+        self.mld_links[index].keys = Some(keys);
+        Ok(())
+    }
+
+    /// Activate one accepted further link (mac80211
+    /// `_ieee80211_set_active_links` adding a link; iwl mld allows two
+    /// active links). TX is drained first; the link's PHY/LINK/STA/power
+    /// bodies come from its own negotiated facts, its group keys from its
+    /// own MLO KDEs, and its link STA gets its own TLC configuration
+    /// (`iwl_mld_config_tlc_link`). A device-visible failure fails the
+    /// device.
+    pub async fn activate_mld_link(
+        &mut self,
+        hw: &mut Hardware,
+        link_id: u8,
+    ) -> Result<(), &'static str> {
+        let binding = self.mld.clone().ok_or("no native MLD association")?;
+        let index = self
+            .mld_links
+            .iter()
+            .position(|link| link.link_id() == link_id)
+            .ok_or("native MLD link is not a valid accepted link")?;
+        if !self.authorized
+            || binding.secondary().is_some()
+            || self.mld_links[index].keys.is_none()
+            || hw.is_mvm89()
+        {
+            return Err("native MLD further link cannot be activated now");
+        }
+        let primary = *binding.primary();
+        let mut ids = hw.mld_fw_ids()?;
+        ids.claim(primary.fw_link, primary.station)?;
+        let (fw_link, station) = ids.allocate()?;
+        let phy_id = super::sc_mlo::PhyIds::station().allocate()?;
+        let valid = &self.mld_links[index];
+        let owner = super::sc_mlo::LinkOwner {
+            spec_link: link_id,
+            fw_link,
+            station,
+            channel: valid.channel(),
+            own_link: valid.context.own_link(),
+            peer_link: valid.context.peer_link(),
+        };
+        let further = valid.further_link(hw, owner, phy_id)?;
+        let tlc = valid.tlc(hw, station)?;
+        let baid_tids: Vec<u8> = (0..self.rx_ba.len() as u8)
+            .filter(|&tid| self.rx_ba[usize::from(tid)].is_some())
+            .collect();
+        let pairwise = self.pairwise_key.is_some().then_some(self.pmf_negotiated);
+        hw.drain_transmits().await?;
+        let next = super::sc_mlo::activate_further_link(
+            hw,
+            &binding,
+            &further,
+            pairwise,
+            &baid_tids,
+            &valid.group_keys(),
+        )
+        .await?;
+        if let Err(error) = hw.station_tlc(&tlc).await {
+            hw.fail();
+            return Err(error);
+        }
+        hw.install_mld_link(next.clone())?;
+        self.mld = Some(next);
+        self.mld_links[index].active = Some((owner, phy_id));
+        Ok(())
+    }
+
+    /// Deactivate the active further link, the inverse of
+    /// `activate_mld_link`; the link stays valid with its keys retained.
+    pub async fn deactivate_mld_link(
+        &mut self,
+        hw: &mut Hardware,
+        link_id: u8,
+    ) -> Result<(), &'static str> {
+        let binding = self.mld.clone().ok_or("no native MLD association")?;
+        let index = self
+            .mld_links
+            .iter()
+            .position(|link| link.link_id() == link_id && link.active.is_some())
+            .ok_or("native MLD link is not active")?;
+        let valid = &self.mld_links[index];
+        let (owner, phy_id) = valid.active.ok_or("native MLD link is not active")?;
+        let further = valid.further_link(hw, owner, phy_id)?;
+        let group_ids: Vec<u8> = valid.group_keys().iter().map(|key| key.id).collect();
+        let baid_tids: Vec<u8> = (0..self.rx_ba.len() as u8)
+            .filter(|&tid| self.rx_ba[usize::from(tid)].is_some())
+            .collect();
+        let pairwise = self.pairwise_key.is_some().then_some(self.pmf_negotiated);
+        hw.drain_transmits().await?;
+        let next = super::sc_mlo::deactivate_further_link(
+            hw, &binding, &further, pairwise, &baid_tids, &group_ids,
+        )
+        .await?;
+        hw.install_mld_link(next.clone())?;
+        self.mld = Some(next);
+        self.mld_links[index].active = None;
+        Ok(())
+    }
+
     pub async fn handle_eapol(
         &mut self,
         hw: &mut Hardware,
@@ -2236,7 +2530,7 @@ impl Connection {
         // Unauthenticated EAPOL must not close an established port or
         // poison replay state. A missing valid response times out during
         // initial association; an established connection simply drops it.
-        let response = match security.process(&ethernet[14..]) {
+        let mut response = match security.process(&ethernet[14..]) {
             Ok(response) => response,
             Err(reason) => {
                 #[cfg(feature = "kernel-test")]
@@ -2249,6 +2543,12 @@ impl Connection {
                 return Ok(());
             }
         };
+        // Each further link's MLO GTK/IGTK belongs to that link alone.
+        let link_keys = response
+            .keys
+            .as_mut()
+            .map(|keys| core::mem::take(&mut keys.links))
+            .unwrap_or_default();
         let igtk_changed = response
             .keys
             .as_ref()
@@ -2279,7 +2579,36 @@ impl Connection {
                         .filter(|_| igtk_changed)
                         .map(|(material, _, _)| material),
                 ];
-                self.key_history.reserve(candidates)
+                self.key_history.reserve(candidates)?;
+                for link in &link_keys {
+                    let valid = self
+                        .mld_links
+                        .iter()
+                        .find(|valid| valid.link_id() == link.link_id)
+                        .ok_or("MLD key delivery names an unknown link")?;
+                    if link.group_id > 3
+                        || link
+                            .igtk
+                            .as_ref()
+                            .is_some_and(|(_, id, pn)| !(4..=5).contains(id) || *pn >= 1 << 48)
+                    {
+                        return Err("invalid MLD further-link key identity/replay floor");
+                    }
+                    let old = valid.keys.as_ref();
+                    self.key_history.reserve([
+                        old.is_none_or(|old| old.group != link.group)
+                            .then_some(&link.group),
+                        link.igtk
+                            .as_ref()
+                            .filter(|(new, _, _)| {
+                                old.and_then(|old| old.igtk.as_ref())
+                                    .is_none_or(|(old, _, _)| old != new)
+                            })
+                            .map(|(material, _, _)| material),
+                        None,
+                    ])?;
+                }
+                Ok(())
             })();
             if let Err(reason) = validated {
                 self.authorized = false;
@@ -2323,9 +2652,18 @@ impl Connection {
                 if self.pairwise_key.as_ref() != Some(pairwise) {
                     hw.drain_transmits().await?;
                     if self.pairwise_key.is_some() {
-                        remove_key(hw, 0, false, self.pmf_negotiated).await?;
+                        remove_key(hw, self.pairwise_mask(), 0, false, self.pmf_negotiated).await?;
                     }
-                    install_key(hw, 0, false, self.pmf_negotiated, pairwise, 0).await?;
+                    install_key(
+                        hw,
+                        self.pairwise_mask(),
+                        0,
+                        false,
+                        self.pmf_negotiated,
+                        pairwise,
+                        0,
+                    )
+                    .await?;
                     if let Some(old) = &mut self.pairwise_key {
                         old.zeroize();
                     }
@@ -2344,10 +2682,11 @@ impl Connection {
             // it would reset firmware/host packet numbers (KRACK).
             if self.group_keys[id] != Some(keys.group) {
                 if self.group_keys[id].is_some() {
-                    remove_key(hw, keys.group_id, true, self.pmf_negotiated).await?;
+                    remove_key(hw, 1, keys.group_id, true, self.pmf_negotiated).await?;
                 }
                 install_key(
                     hw,
+                    1,
                     keys.group_id,
                     true,
                     self.pmf_negotiated,
@@ -2377,9 +2716,9 @@ impl Connection {
                     return Err("invalid IGTK key index");
                 }
                 if self.mfp.find_by_key_id(key_id).is_some() {
-                    remove_key(hw, key_id as u8, true, true).await?;
+                    remove_key(hw, 1, key_id as u8, true, true).await?;
                 }
-                install_key(hw, key_id as u8, true, true, &material, ipn).await?;
+                install_key(hw, 1, key_id as u8, true, true, &material, ipn).await?;
                 pending_igtk = Some((material, key_id, ipn));
             }
         }
@@ -2403,6 +2742,9 @@ impl Connection {
             // packets copied while the port is closed can never acquire the
             // post-M4 epoch. The final marker below proves that boundary.
             self.receive_epoch = hw.close_receive_epoch()?;
+        }
+        for keys in link_keys {
+            self.adopt_link_keys(hw, keys).await?;
         }
         // Initial M2/M4 are plaintext; later replies use the installed PTK.
         if !mld_pairwise_rekey {
@@ -2585,8 +2927,17 @@ fn extract_anti_clogging_token(body: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     (!body.is_empty()).then(|| body.to_vec())
 }
 
-async fn remove_key(hw: &mut Hardware, id: u8, group: bool, pmf: bool) -> Result<(), &'static str> {
-    let body = super::sc_security::key_command(id, group, pmf, None, 0)?;
+/// `sta_mask`: the pairwise key spans every active link STA; the
+/// association link's group keys name only STA0 (`iwl_mld_get_key_sta_mask`).
+async fn remove_key(
+    hw: &mut Hardware,
+    sta_mask: u32,
+    id: u8,
+    group: bool,
+    pmf: bool,
+) -> Result<(), &'static str> {
+    super::sc_security::key_command(id, group, pmf, None, 0)?;
+    let body = super::sc_security::key_command_for(sta_mask, id, group, pmf, None, 0)?;
     let receipt = hw.command(5, 0x18, &body[..]).await?;
     if !receipt.payload.is_empty() {
         return Err("unexpected native key-removal receipt");
@@ -2596,6 +2947,7 @@ async fn remove_key(hw: &mut Hardware, id: u8, group: bool, pmf: bool) -> Result
 
 async fn install_key(
     hw: &mut Hardware,
+    sta_mask: u32,
     id: u8,
     group: bool,
     pmf: bool,
@@ -2605,7 +2957,8 @@ async fn install_key(
     if hw.version(5, 0x18).map(|v| v.0) != Some(1) {
         return Err("unsupported security key command");
     }
-    let body = super::sc_security::key_command(id, group, pmf, Some(key), rx_pn)?;
+    super::sc_security::key_command(id, group, pmf, None, 0)?;
+    let body = super::sc_security::key_command_for(sta_mask, id, group, pmf, Some(key), rx_pn)?;
     let receipt = hw.command(5, 0x18, &body[..]).await?;
     if !receipt.payload.is_empty() {
         return Err("unexpected native key-install receipt");

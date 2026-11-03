@@ -268,6 +268,14 @@ impl Drop for State {
     }
 }
 impl Hardware {
+    /// The actual FW_NUM_STATIONS/FW_NUM_LINKS facts bounding MLD firmware
+    /// link/station ids (Linux mld.h `IWL_MLD_ALLOC_FN`).
+    pub(in crate::iwlwifi) fn mld_fw_ids(
+        &self,
+    ) -> Result<super::super::sc_mlo::FwIds, &'static str> {
+        super::super::sc_mlo::FwIds::new(self.p2p.counts.1, self.p2p.counts.0)
+    }
+
     /// A credit wait polls only one64-descriptor RFH batch. Consume the
     /// actual already-completed fallback prefix before native publication,
     /// including an END beyond that budget. A moving/full prefix remains a

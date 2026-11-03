@@ -133,6 +133,8 @@ mod sc_eht;
 mod sc_emlsr;
 mod sc_he;
 mod sc_mlo;
+mod sc_mlo_assoc;
+pub use sc_mlo_assoc::MldLinkCandidate;
 mod sc_security;
 mod sc_tx_amsdu;
 pub mod scan_api;

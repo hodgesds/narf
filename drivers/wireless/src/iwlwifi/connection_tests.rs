@@ -61,6 +61,7 @@ fn connection() -> Connection {
         eht: None,
         six: None,
         mld: None,
+        mld_links: Vec::new(),
         client: None,
         mld_eapol: VecDeque::new(),
         tx_amsdu: super::super::sc_tx_amsdu::Limits::default(),

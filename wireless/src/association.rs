@@ -137,6 +137,8 @@ pub struct JoinPlan {
     mld: Option<Box<mlo::Context>>,
     /// Additional requested MLD links (empty for every single-link plan).
     links: Vec<MldLink>,
+    /// The local non-AP MLD whose Basic MLE this plan requests with.
+    mld_local: Option<mlo::Local>,
 }
 
 /// One link of a multiple-link MLD request: the actual BSS of that
@@ -163,6 +165,9 @@ pub struct MldLink {
     context: mlo::Context,
     plan: JoinPlan,
     status: Option<u16>,
+    /// The accepted per-STA profile with the outer response inherited
+    /// (mlo::link_elements), as mlme.c ieee80211_assoc_config_link parses.
+    response: Vec<u8>,
 }
 impl MldLink {
     /// The per-link identity: same MLD addresses, this link's MACs and id.
@@ -182,6 +187,11 @@ impl MldLink {
     pub fn accepted(&self) -> bool {
         self.status == Some(0)
     }
+    /// This link's response elements (its per-STA profile with the outer
+    /// response inherited); `None` unless the link was accepted.
+    pub fn response_elements(&self) -> Option<&[u8]> {
+        self.accepted().then_some(self.response.as_slice())
+    }
     pub fn offered_phy(&self) -> Option<&phy::Offer> {
         self.plan.offered_phy.as_ref()
     }
@@ -195,6 +205,15 @@ impl MldLink {
         self.plan.legacy_rates()
     }
 }
+
+/// One affiliated link's response outcome: link id, per-STA status and,
+/// for an accepted link, its negotiated legacy rates/basic set/PHY and its
+/// inherited response view.
+type LinkOutcome = (
+    u8,
+    u16,
+    Option<(u16, u16, Option<phy::Negotiated>, Vec<u8>)>,
+);
 
 #[derive(Default)]
 struct PrepareProfile<'a> {
@@ -949,6 +968,7 @@ impl JoinPlan {
                 context: other,
                 plan: link,
                 status: None,
+                response: Vec::new(),
             });
         }
         // Replace the one-link request MLE with the per-STA profiles form,
@@ -960,9 +980,25 @@ impl JoinPlan {
             start += 2 + usize::from(length);
         }
         plan.assoc.drain(start..start + single.len());
-        let outer = mlo::present_elements(&plan.assoc[28..])?;
+        let element = plan.mld_request_element(&plan.assoc[28..])?;
+        mlo::insert_request_element(&mut plan.assoc, 28, &element);
+        Ok(plan)
+    }
+    /// The Basic MLE for an association request whose other elements are
+    /// `outer` (mlme.c ieee80211_assoc_add_ml_elem): one COMPLETE per-STA
+    /// profile per requested further link, each with Non-Inheritance
+    /// computed against the actual outer frame. A native owner that builds
+    /// its own request bytes passes them here so the profiles inherit
+    /// exactly what that frame carries. A single-link plan yields its
+    /// one-link element.
+    pub fn mld_request_element(&self, outer: &[u8]) -> Result<Vec<u8>, Error> {
+        let mld = self.mld_local.ok_or(Error::InvalidBss)?;
+        if self.links.is_empty() {
+            return Ok(mld.request_element());
+        }
+        let outer = mlo::present_elements(outer)?;
         let mut profiles = Vec::new();
-        for link in &plan.links {
+        for link in &self.links {
             let (capability, elements) = link.plan.profile_elements()?;
             mlo::push_request_profile(
                 &mut profiles,
@@ -973,9 +1009,7 @@ impl JoinPlan {
                 &outer,
             )?;
         }
-        let element = mld.request_element_with_profiles(&profiles);
-        mlo::insert_request_element(&mut plan.assoc, 28, &element);
-        Ok(plan)
+        Ok(mld.request_element_with_profiles(&profiles))
     }
     fn prepare_link(
         request: MldLinkRequest<'_>,
@@ -1334,6 +1368,7 @@ impl JoinPlan {
             six_ghz,
             mld,
             links: Vec::new(),
+            mld_local: profile.mld,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -1418,20 +1453,14 @@ impl JoinPlan {
             return Err(Error::Protocol);
         }
         let elements = &bytes[30..];
-        let profiles = match self.mld.as_deref() {
-            Some(mld) if !self.links.is_empty() => {
-                let requested = self
-                    .links
-                    .iter()
-                    .fold(0u16, |mask, link| mask | 1 << link.link_id());
-                match mld.multi_link_response(elements, requested) {
-                    Ok(profiles) => profiles,
-                    Err(_) => {
-                        self.phase = Phase::Failed;
-                        return Err(Error::Protocol);
-                    }
+        let outcomes = match self.mld.as_deref() {
+            Some(_) if !self.links.is_empty() => match self.affiliated_outcomes(elements) {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    self.phase = Phase::Failed;
+                    return Err(error);
                 }
-            }
+            },
             Some(mld) => {
                 if mld.response(elements).is_err() {
                     self.phase = Phase::Failed;
@@ -1448,52 +1477,62 @@ impl JoinPlan {
                 return Err(error);
             }
         };
-        // mlme.c ieee80211_assoc_config_link per affiliated link: a non-zero
-        // per-STA status drops only that link; any invalid accepted link
-        // fails the whole association before anything is committed.
-        let mut outcomes = Vec::with_capacity(profiles.len());
-        for response in &profiles {
-            let Some(link) = self
-                .links
-                .iter()
-                .find(|link| link.link_id() == response.link_id())
-            else {
-                self.phase = Phase::Failed;
-                return Err(Error::Protocol);
-            };
-            if response.status() != 0 {
-                outcomes.push((response.link_id(), response.status(), None));
-                continue;
-            }
-            let result = (|| {
-                if response
-                    .address()
-                    .is_some_and(|address| address != link.context().peer_link())
-                    || !link.plan.response_capability(response.capability())
-                {
-                    return Err(Error::Protocol);
-                }
-                let view = mlo::link_elements(elements, response.elements())?;
-                link.plan.negotiate_response(&view)
-            })();
-            match result {
-                Ok(value) => outcomes.push((response.link_id(), 0, Some(value))),
-                Err(error) => {
-                    self.phase = Phase::Failed;
-                    return Err(error);
-                }
-            }
-        }
         // Commit only after all frame, IE and rate checks have passed.
         self.rates = rates;
         self.basic = basic;
         self.negotiated_phy = negotiated_phy;
         self.phase = Phase::Associated { aid };
+        self.commit_affiliated(outcomes, aid);
+        Ok(Some(aid))
+    }
+    /// Affiliated-link outcomes of a multiple-link response
+    /// (mlme.c ieee80211_assoc_config_link per affiliated link): a non-zero
+    /// per-STA status drops only that link; any invalid accepted link fails
+    /// the whole association before anything is committed.
+    fn affiliated_outcomes(&self, elements: &[u8]) -> Result<Vec<LinkOutcome>, Error> {
+        let mld = self.mld.as_deref().ok_or(Error::Protocol)?;
+        let requested = self
+            .links
+            .iter()
+            .fold(0u16, |mask, link| mask | 1 << link.link_id());
+        let profiles = mld
+            .multi_link_response(elements, requested)
+            .map_err(|_| Error::Protocol)?;
+        let mut outcomes = Vec::with_capacity(profiles.len());
+        for response in &profiles {
+            let link = self
+                .links
+                .iter()
+                .find(|link| link.link_id() == response.link_id())
+                .ok_or(Error::Protocol)?;
+            if response.status() != 0 {
+                outcomes.push((response.link_id(), response.status(), None));
+                continue;
+            }
+            if response
+                .address()
+                .is_some_and(|address| address != link.context().peer_link())
+                || !link.plan.response_capability(response.capability())
+            {
+                return Err(Error::Protocol);
+            }
+            let view = mlo::link_elements(elements, response.elements())?;
+            let (rates, basic, negotiated) = link.plan.negotiate_response(&view)?;
+            outcomes.push((
+                response.link_id(),
+                0,
+                Some((rates, basic, negotiated, view)),
+            ));
+        }
+        Ok(outcomes)
+    }
+    fn commit_affiliated(&mut self, outcomes: Vec<LinkOutcome>, aid: u16) {
         for (link_id, status, value) in outcomes {
             if let Some(link) = self.links.iter_mut().find(|link| link.link_id() == link_id) {
                 link.status = Some(status);
                 match value {
-                    Some((rates, basic, negotiated)) => {
+                    Some((rates, basic, negotiated, view)) => {
+                        link.response = view;
                         link.plan.rates = rates;
                         link.plan.basic = basic;
                         link.plan.negotiated_phy = negotiated;
@@ -1503,7 +1542,36 @@ impl JoinPlan {
                 }
             }
         }
-        Ok(Some(aid))
+    }
+    /// Per-link statuses of a multiple-link response whose association link
+    /// a native owner has already accepted with its own frame/rate checks
+    /// (mlme.c ieee80211_assoc_success). Only the affiliated links are
+    /// validated and committed; the association link's plan state is not
+    /// touched. Returns the accepted further links' Link ID mask. Any
+    /// invalid accepted link fails every link, as Linux fails the whole
+    /// association.
+    pub fn accept_mld_links(&mut self, elements: &[u8], aid: u16) -> Result<u16, Error> {
+        if self.links.is_empty()
+            || !(1..=2007).contains(&aid)
+            || self.links.iter().any(|link| link.status.is_some())
+        {
+            return Err(Error::Busy);
+        }
+        let outcomes = match self.affiliated_outcomes(elements) {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                for link in &mut self.links {
+                    link.plan.phase = Phase::Failed;
+                }
+                return Err(error);
+            }
+        };
+        self.commit_affiliated(outcomes, aid);
+        Ok(self
+            .links
+            .iter()
+            .filter(|link| link.accepted())
+            .fold(0, |mask, link| mask | 1 << link.link_id()))
     }
     fn response_capability(&self, capability: u16) -> bool {
         capability & 3 == 1

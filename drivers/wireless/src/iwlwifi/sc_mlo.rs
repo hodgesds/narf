@@ -288,30 +288,36 @@ impl Binding {
         }
         Ok(())
     }
+    /// Beacon/probe-response proof routed through the owner that received
+    /// it: each link's beacons must name the AP MLD and that link's own
+    /// spec link id (Linux mlme.c `ieee80211_rx_mgmt_beacon` per link).
+    pub fn confirm_mpdu_beacon(&self, mpdu: &Mpdu<'_>) -> Result<(), &'static str> {
+        let Some(link) = self.owner_of(mpdu) else {
+            return Ok(());
+        };
+        let frame = mpdu.frame;
+        if frame.len() >= 36
+            && matches!(frame[0], 0x80 | 0x50)
+            && frame[10..16] == link.peer_link
+            && frame[16..22] == link.peer_link
+        {
+            self.confirm_link_beacon(
+                link,
+                mpdu.body(24, 0)
+                    .and_then(|body| body.get(12..))
+                    .ok_or("native MLD bound beacon body invalid")?,
+            )?;
+        }
+        Ok(())
+    }
     pub fn check_pending(&self, hw: &super::runtime::Hardware) -> Result<(), &'static str> {
         for packet in &hw.notifications {
             if packet.receive_queue != 0 || packet.header.group_id != 0 || packet.header.cmd != 0xc1
             {
                 continue;
             }
-            let Some(mpdu) = super::scan_api::mpdu(&packet.payload) else {
-                continue;
-            };
-            let frame = mpdu.frame;
-            let Some(link) = self.owner_of(&mpdu) else {
-                continue;
-            };
-            if frame.len() >= 36
-                && matches!(frame[0], 0x80 | 0x50)
-                && frame[10..16] == link.peer_link
-                && frame[16..22] == link.peer_link
-            {
-                self.confirm_link_beacon(
-                    link,
-                    mpdu.body(24, 0)
-                        .and_then(|body| body.get(12..))
-                        .ok_or("native MLD bound beacon body invalid")?,
-                )?;
+            if let Some(mpdu) = super::scan_api::mpdu(&packet.payload) {
+                self.confirm_mpdu_beacon(&mpdu)?;
             }
         }
         Ok(())
@@ -373,6 +379,9 @@ pub(super) struct FurtherLink {
     pub link: [u8; 208],
     /// STA_CONFIG body carrying the link STA's negotiated PHY facts.
     pub peer: [u8; 104],
+    /// REDUCE_TX_POWER (SET_LINK) body for this link's FW id, from its own
+    /// host/AP power limit (Linux mld/power.c `iwl_mld_set_tx_power`).
+    pub power: Vec<u8>,
 }
 
 /// A per-link group key delivered for that link by the MLO 4-way/group
@@ -467,6 +476,12 @@ async fn further_link_commands(
     put32(&mut link, 12, u32::from(further.phy_id));
     put32(&mut link, 24, LINK_MODIFY_RATES_INFO);
     hw.command(3, 9, &link).await?;
+    // BSS_CHANGED_TXPOWER follows the channel assignment, before the link
+    // can become active or transmit.
+    if further.power.get(4..8) != Some(&u32::from(owner.fw_link).to_le_bytes()[..]) {
+        return Err("native MLD further link power names another link");
+    }
+    hw.command(1, 0x9f, &further.power).await?;
     let mut peer = further.peer;
     apply_peer_owner(&binding.context, owner, &mut peer);
     hw.station_peer(&peer).await?;

@@ -37,14 +37,22 @@ pub struct Keys {
     pub gtk: Gtk,
     pub igtk: Option<Igtk>,
 }
+const LINKS: usize = 15;
 #[derive(Default)]
 struct Kdes<'a> {
     mac: Option<&'a [u8]>,
-    link: Option<&'a [u8]>,
-    gtk: Option<&'a [u8]>,
-    igtk: Option<&'a [u8]>,
+    link: [Option<&'a [u8]>; LINKS],
+    gtk: [Option<&'a [u8]>; LINKS],
+    igtk: [Option<&'a [u8]>; LINKS],
     rsne: Option<&'a [u8]>,
     rsnxe: Option<&'a [u8]>,
+}
+impl Kdes<'_> {
+    fn any_link_kde(&self) -> bool {
+        [&self.link, &self.gtk, &self.igtk]
+            .iter()
+            .any(|slots| slots.iter().any(Option::is_some))
+    }
 }
 fn set<'a>(slot: &mut Option<&'a [u8]>, value: &'a [u8]) -> Result<(), Error> {
     if slot.replace(value).is_some() {
@@ -52,7 +60,18 @@ fn set<'a>(slot: &mut Option<&'a [u8]>, value: &'a [u8]) -> Result<(), Error> {
     }
     Ok(())
 }
-fn parse(bytes: &[u8], context: Context) -> Result<Kdes<'_>, Error> {
+/// Per-link KDEs (MLO GTK/IGTK/Link) may name only a link in `links`.
+fn link_slot<'b, 'a>(
+    slots: &'b mut [Option<&'a [u8]>; LINKS],
+    link: u8,
+    links: u16,
+) -> Result<&'b mut Option<&'a [u8]>, Error> {
+    if usize::from(link) >= LINKS || links & (1 << link) == 0 {
+        return Err(Error::Link);
+    }
+    Ok(&mut slots[usize::from(link)])
+}
+fn parse(bytes: &[u8], links: u16) -> Result<Kdes<'_>, Error> {
     if bytes.len() > 4096 {
         return Err(Error::Length);
     }
@@ -79,31 +98,31 @@ fn parse(bytes: &[u8], context: Context) -> Result<Kdes<'_>, Error> {
                         set(&mut result.mac, data)?;
                     }
                     16 => {
-                        if data.len() < 7 || data[0] >> 4 != context.link_id() {
+                        if data.len() < 7 {
                             return Err(Error::Link);
                         }
                         if data[0] & 8 != 0 {
                             return Err(Error::Flags);
                         }
-                        set(&mut result.gtk, data)?;
+                        set(link_slot(&mut result.gtk, data[0] >> 4, links)?, data)?;
                     }
                     17 => {
-                        if data.len() < 9 || data[8] >> 4 != context.link_id() {
+                        if data.len() < 9 {
                             return Err(Error::Link);
                         }
                         if data[8] & 15 != 0 {
                             return Err(Error::Flags);
                         }
-                        set(&mut result.igtk, data)?;
+                        set(link_slot(&mut result.igtk, data[8] >> 4, links)?, data)?;
                     }
                     19 => {
-                        if data.len() < 7 || data[0] & 15 != context.link_id() {
+                        if data.len() < 7 {
                             return Err(Error::Link);
                         }
                         if data[0] & 0xc0 != 0 {
                             return Err(Error::Flags);
                         }
-                        set(&mut result.link, data)?;
+                        set(link_slot(&mut result.link, data[0] & 15, links)?, data)?;
                     }
                     // No mixed legacy group keys, Extended Key ID, or
                     // unnegotiated beacon-protection/BIGTK in this profile.
@@ -153,11 +172,11 @@ fn link_profile(link: &[u8], context: Context, profile: Profile<'_>) -> Result<(
 /// M1's AP MLD MAC is checked before nonce consumption or PTK derivation.
 /// M1 itself is not MIC authenticated; this binds it to the selected peer.
 pub fn message1(context: Context, bytes: &[u8]) -> Result<(), Error> {
-    let parsed = parse(bytes, context)?;
+    let parsed = parse(bytes, 1 << context.link_id())?;
     if parsed.mac != Some(context.peer_mld().as_slice()) {
         return Err(Error::Address);
     }
-    if parsed.link.is_some() || parsed.gtk.is_some() || parsed.igtk.is_some() {
+    if parsed.any_link_kde() {
         return Err(Error::Profile);
     }
     Ok(())
@@ -165,21 +184,52 @@ pub fn message1(context: Context, bytes: &[u8]) -> Result<(), Error> {
 /// M2 repeats the station RSNE/RSNXE and adds its MLD MAC KDE. Hostap skips
 /// Link KDEs for the association link; this profile requests no other link.
 pub fn message2(context: Context, association_ies: &[u8]) -> Result<Vec<u8>, Error> {
-    if association_ies.len() > 4084 {
+    message2_links(context, &[], association_ies)
+}
+/// M2 for a multiple-link association: after the MLD MAC KDE, one MLO Link
+/// KDE (link id, this station's link MAC, no RSNE/RSNXE) per further link
+/// the AP accepted, never for the association link (hostap wpa.c
+/// wpa_supplicant_send_2_of_4 over `mlo.req_links`).
+pub fn message2_links(
+    context: Context,
+    further: &[Context],
+    association_ies: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if association_ies.len() > 4084 - 13 * further.len() {
         return Err(Error::Length);
     }
-    let parsed = parse(association_ies, context)?;
-    if parsed.mac.is_some()
-        || parsed.link.is_some()
-        || parsed.gtk.is_some()
-        || parsed.igtk.is_some()
-    {
+    let links = further_mask(context, further.iter())?;
+    let parsed = parse(association_ies, links | 1 << context.link_id())?;
+    if parsed.mac.is_some() || parsed.any_link_kde() {
         return Err(Error::Profile);
     }
     let mut bytes = association_ies.to_vec();
     bytes.extend_from_slice(&[221, 10, 0, 0x0f, 0xac, 3]);
     bytes.extend_from_slice(&context.own_mld());
+    for link in further {
+        bytes.extend_from_slice(&[221, 11, 0, 0x0f, 0xac, 19, link.link_id()]);
+        bytes.extend_from_slice(&link.own_link());
+    }
     Ok(bytes)
+}
+/// Further links must be distinct affiliated links of the same MLD pair.
+fn further_mask<'a>(
+    context: Context,
+    further: impl Iterator<Item = &'a Context>,
+) -> Result<u16, Error> {
+    let mut links = 0u16;
+    for link in further {
+        let bit = 1u16 << link.link_id();
+        if link.own_mld() != context.own_mld()
+            || link.peer_mld() != context.peer_mld()
+            || link.link_id() == context.link_id()
+            || links & bit != 0
+        {
+            return Err(Error::Profile);
+        }
+        links |= bit;
+    }
+    Ok(links)
 }
 /// Validate key delivery after actual descriptor/MIC/AES-unwrapping checks.
 /// Native adapters must install only into this exact selected link context.
@@ -190,7 +240,29 @@ pub fn authenticated_keys(
     bytes: &[u8],
     profile: Profile<'_>,
 ) -> Result<Keys, Error> {
-    if profile.gtk_len != 16 || profile.igtk_len != Some(16) {
+    let mut keys = authenticated_link_keys(context, &[], kind, key_info, bytes, profile)?;
+    keys.pop().ok_or(Error::Key)
+}
+/// Multiple-link key delivery (hostap wpa.c
+/// wpa_validate_mlo_ieee8021x_3_of_4_kde and the MLO group-key handler):
+/// every link of the association, the association link first and then
+/// each `further` accepted link with that link's own AP RSNE/RSNXE, needs
+/// its MLO GTK KDE; M3 also needs each link's MLO Link KDE naming that
+/// link's AP address with RSNE (and RSNXE when advertised) identical to
+/// its beacon. A KDE for any link outside the association is refused. The
+/// result is in the same order: association link, then `further`.
+pub fn authenticated_link_keys(
+    context: Context,
+    further: &[(Context, Profile<'_>)],
+    kind: Kind,
+    key_info: u16,
+    bytes: &[u8],
+    profile: Profile<'_>,
+) -> Result<Vec<Keys>, Error> {
+    if core::iter::once(&profile)
+        .chain(further.iter().map(|(_, profile)| profile))
+        .any(|profile| profile.gtk_len != 16 || profile.igtk_len != Some(16))
+    {
         return Err(Error::Profile);
     }
     let required = KI_ENCRYPTED_KEY_DATA
@@ -202,7 +274,8 @@ pub fn authenticated_keys(
     if key_info & required != required {
         return Err(Error::Flags);
     }
-    let parsed = parse(bytes, context)?;
+    let links = further_mask(context, further.iter().map(|(link, _)| link))?;
+    let parsed = parse(bytes, links | 1 << context.link_id())?;
     if kind == Kind::Pairwise3 && parsed.mac != Some(context.peer_mld().as_slice())
         || parsed
             .mac
@@ -220,12 +293,27 @@ pub fn authenticated_keys(
             return Err(Error::Profile);
         }
     }
-    match parsed.link {
+    let mut keys = Vec::with_capacity(1 + further.len());
+    for (link, profile) in core::iter::once((&context, &profile))
+        .chain(further.iter().map(|(link, profile)| (link, profile)))
+    {
+        keys.push(link_keys(&parsed, *link, kind, *profile)?);
+    }
+    Ok(keys)
+}
+fn link_keys(
+    parsed: &Kdes<'_>,
+    context: Context,
+    kind: Kind,
+    profile: Profile<'_>,
+) -> Result<Keys, Error> {
+    let index = usize::from(context.link_id());
+    match parsed.link[index] {
         Some(link) => link_profile(link, context, profile)?,
         None if kind == Kind::Pairwise3 => return Err(Error::Link),
         None => {}
     }
-    let gtk = parsed.gtk.ok_or(Error::Key)?;
+    let gtk = parsed.gtk[index].ok_or(Error::Key)?;
     if gtk.len() != 7 + profile.gtk_len {
         return Err(Error::Length);
     }
@@ -237,8 +325,7 @@ pub fn authenticated_keys(
         key: gtk[7..].to_vec(),
         rsc,
     };
-    let igtk = parsed
-        .igtk
+    let igtk = parsed.igtk[index]
         .map(|data| {
             if data.len() != 9 + 16 {
                 return Err(Error::Length);

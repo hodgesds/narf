@@ -21,6 +21,9 @@ pub(super) struct Profile {
     pub sae: Option<SaeJoin>,
     pub offer: Option<narf_wireless::association::phy::Offer>,
     pub mld: Option<alloc::boxed::Box<narf_wireless::association::mlo::Context>>,
+    /// A multiple-link request plan (`JoinPlan::prepare_mld_links`) whose
+    /// association link equals this profile; `None` for one link.
+    pub links: Option<alloc::boxed::Box<JoinPlan>>,
 }
 
 /// Retired material cannot return with reset replay/nonce state during this
@@ -54,6 +57,19 @@ impl KeyHistory {
         // or cancelled installation must not become a same-owner retry.
         self.digests.extend_from_slice(&fresh[..count]);
         Ok(())
+    }
+}
+
+fn bss(beacon: &Beacon) -> Bss {
+    Bss {
+        bssid: beacon.bssid,
+        ssid: beacon.ssid.clone(),
+        channel: beacon.channel,
+        band: None,
+        signal_dbm: None,
+        capability: beacon.capabilities,
+        beacon_interval: beacon.interval,
+        information_elements: beacon.information_elements.clone(),
     }
 }
 
@@ -135,22 +151,14 @@ impl Profile {
                     sae: None,
                     offer: None,
                     mld: None,
+                    links: None,
                 });
             }
             AuthMethod::Open => SecurityMode::Open,
             AuthMethod::Wpa2Psk(_) => SecurityMode::Wpa2Psk,
             AuthMethod::Wpa3Sae { .. } => SecurityMode::Wpa3Sae { pwe: SaePwe::Both },
         };
-        let bss = Bss {
-            bssid: beacon.bssid,
-            ssid: beacon.ssid.clone(),
-            channel: beacon.channel,
-            band: None,
-            signal_dbm: None,
-            capability: beacon.capabilities,
-            beacon_interval: beacon.interval,
-            information_elements: beacon.information_elements.clone(),
-        };
+        let bss = bss(beacon);
         // Preserve the legacy no-PMF offer when the peer cannot negotiate
         // it, like the Gen2 station owner. An MFPC AP enables optional PMF;
         // MFPR is then admitted only with a usable BIP-CMAC-128 profile.
@@ -224,7 +232,97 @@ impl Profile {
             sae: plan.sae().cloned(),
             offer: plan.offered_phy().copied(),
             mld: plan.mld().copied().map(alloc::boxed::Box::new),
+            links: None,
         })
+    }
+
+    /// Request the further affiliated links of the selected AP MLD
+    /// (mlme.c ieee80211_mgd_assoc with several `req->links`): each
+    /// candidate is prepared from its own actual beacon with the same
+    /// native local PHY admission as the association link, and the
+    /// resulting multiple-link plan must reproduce this profile's
+    /// association-link security and MLD context exactly. Candidates that
+    /// cannot be prepared are not requested; if none remain the profile
+    /// stays single-link. Returns the requested candidates' indices.
+    pub fn negotiate_links(
+        &mut self,
+        beacon: &Beacon,
+        own: [u8; 6],
+        local: Local,
+        further: &[(&Beacon, [u8; 6], Local)],
+    ) -> Result<Vec<usize>, &'static str> {
+        use narf_wireless::association::{MldLinkPhy, MldLinkRequest};
+        let Some(context) = self.mld.as_deref().copied() else {
+            return Ok(Vec::new());
+        };
+        let mode = SecurityMode::Wpa3Sae { pwe: SaePwe::Both };
+        if !self.pmf
+            || !matches!(
+                self.akm,
+                Some(security::Akm::Wpa3Sae | security::Akm::Wpa3SaeExtKey)
+            )
+        {
+            return Err("native MLD multiple-link request requires SAE/PMF");
+        }
+        let mld = narf_wireless::association::mlo::Local::single_link(context.own_mld())
+            .map_err(|_| "native MLD local address invalid")?;
+        let options = JoinOptions::default()
+            .with_akms(AkmSet::ALL)
+            .with_pmf(Pmf::Optional);
+        let assoc_bss = bss(beacon);
+        let assoc_phy = local_phy(local, beacon.channel)?.ok_or("native MLD EHT PHY absent")?;
+        let assoc = MldLinkRequest {
+            bss: &assoc_bss,
+            own_link: own,
+            phy: MldLinkPhy::Phy(assoc_phy),
+        };
+        let mut chosen = Vec::new();
+        let mut bsses = Vec::new();
+        let mut phys = Vec::new();
+        for (index, (candidate, own_link, local)) in further.iter().enumerate() {
+            let link_bss = bss(candidate);
+            let Ok(Some(phy)) = local_phy(*local, candidate.channel) else {
+                continue;
+            };
+            let request = MldLinkRequest {
+                bss: &link_bss,
+                own_link: *own_link,
+                phy: MldLinkPhy::Phy(phy),
+            };
+            // Each candidate alone must form a valid request with the
+            // association link before it joins the combined request.
+            if JoinPlan::prepare_mld_links(assoc, &[request], &beacon.ssid, mode, options, mld)
+                .is_ok()
+            {
+                chosen.push(index);
+                bsses.push((link_bss, *own_link));
+                phys.push(phy);
+            }
+        }
+        if chosen.is_empty() {
+            return Ok(chosen);
+        }
+        let requests: Vec<_> = bsses
+            .iter()
+            .zip(&phys)
+            .map(|((bss, own_link), phy)| MldLinkRequest {
+                bss,
+                own_link: *own_link,
+                phy: MldLinkPhy::Phy(*phy),
+            })
+            .collect();
+        let plan = JoinPlan::prepare_mld_links(assoc, &requests, &beacon.ssid, mode, options, mld)
+            .map_err(|_| "native MLD multiple-link request invalid")?;
+        let same = Self::from_plan(&plan, mode)?;
+        if same.akm != self.akm
+            || same.pmf != self.pmf
+            || same.rsne != self.rsne
+            || same.mld.as_deref() != Some(&context)
+        {
+            return Err("native MLD multiple-link plan changed the association link");
+        }
+        self.links = Some(alloc::boxed::Box::new(plan));
+        Ok(chosen)
     }
 
     pub(super) fn rsn_extensions(
@@ -251,7 +349,9 @@ impl Profile {
     /// Optional response RSNEs cannot silently change the negotiated AKM,
     /// cipher or PMF facts. SAE responses may omit the SAE PMKID.
     pub fn check_response(&self, mut ies: &[u8]) -> Result<(), &'static str> {
-        if let Some(context) = self.mld.as_deref() {
+        // A multiple-link response carries affiliated profiles; it is
+        // validated per link by `JoinPlan::accept_mld_links` instead.
+        if let Some(context) = self.mld.as_deref().filter(|_| self.links.is_none()) {
             context
                 .response(ies)
                 .map_err(|_| "native MLD association response changed selected context")?;

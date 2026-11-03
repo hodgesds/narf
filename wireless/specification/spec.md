@@ -320,8 +320,27 @@ commits; a non-zero per-STA status drops only that link.
 legacy rates. `BasicMultiLink::from_ies` and the response path reassemble a
 Basic MLE from the Fragment elements following a255-octet MLE, and a
 per-STA profile from its Fragment subelements (`cfg80211_defragment_element`,
-`ieee80211_mle_get_sta_prof`); any other Fragment element is refused. No
-native driver requests or activates an additional link yet.
+`ieee80211_mle_get_sta_prof`); any other Fragment element is refused.
+
+A native owner that writes its own request bytes calls
+`JoinPlan::mld_request_element(outer)`: the same Basic MLE with per-STA
+profiles whose Non-Inheritance is computed against exactly the `outer`
+elements of that frame (a single-link plan returns its one-link element).
+After accepting its association link itself it calls
+`JoinPlan::accept_mld_links(response_ies, aid) -> Result<u16>`, which
+validates and commits only the affiliated links (same rules as above; the
+association link's plan state is untouched) and returns the accepted Link
+ID mask; a second call or invalid AID is `Busy`. `MldLink::response_elements()`
+is that accepted link's inherited response view (`None` otherwise).
+
+EAPOL (hostap wpa.c): `eapol::mlo::message2_links(context, further, ies)`
+appends, after the MLD MAC KDE, one MLO Link KDE (link id, own link MAC, no
+RSNE/RSNXE) per accepted further link, never for the association link.
+`eapol::mlo::authenticated_link_keys(context, further, kind, info, data,
+profile)` returns per-link `Keys` (association link first): every link needs
+its MLO GTK KDE, M3 every link's MLO Link KDE with that link's own AP RSNE/
+RSNXE, and a per-link KDE naming any link outside the association is refused.
+MLO BIGTK stays refused (beacon protection is not negotiated).
 
 **UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
 `UhrCapability::parse(body, from_ap)` / `UhrOperation::parse` implement the

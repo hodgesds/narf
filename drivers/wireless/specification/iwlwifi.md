@@ -4144,16 +4144,56 @@ Two written, unexecuted cases in `drivers/wireless/iwlwifi/mlo`:
 `smoke_iwl_mld_further_link_owner_and_sta_mask`,
 `smoke_iwl_mld_further_link_key_queue_baid_bodies`.
 
-Still open for a second active link: multi-link association request
-per-STA profiles and per-link response status (mac80211
-`ieee80211_assoc_add_ml_elem`/`ieee80211_assoc_success`) in the native
-connection, building the further link's PHY/LINK/STA bodies and per-link
-MLO GTK/IGTK/BIGTK delivery from that link's own accepted facts, routing
-per-link group RX PN and beacon proof through the further owner, invoking
-the activation/deactivation primitives from EMLSR link selection with TX
-quiescing, MLO scan freshness for selection, missed-beacon/EMLSR
-notification routing in the native receive path, EML OMN, TID-to-link
-mapping and the public narf_wireless multiple-link surface.
+**Native multiple-link association (partial; nothing advertised).**
+`Connection::associate_mld_links(hw, local, beacon, auth, tx_chains,
+local_phy, further: Vec<MldLinkCandidate { beacon, own_link }>)` requests
+further affiliated links (mac80211 `ieee80211_mgd_assoc`) only for a fresh,
+non-P2P, 2.4/5GHz SAE/PMF EHT MLD owner on the Sc/Bz MLD ABI (not MVM API89).
+Each candidate gets the association link's native local-PHY admission on its
+own channel (160MHz only with a permitted span there) and
+`sc_security::Profile::negotiate_links` prepares
+`JoinPlan::prepare_mld_links`; a candidate the shared plan refuses is not
+requested, and the association-link security/MLD facts must be unchanged.
+The native request inserts `JoinPlan::mld_request_element` against its own
+frame before EHT Capabilities. The response's association link keeps the
+native checks; `accept_mld_links` then validates per-STA statuses
+(`ieee80211_assoc_success`), and each accepted link must pass
+`sc_mlo_assoc::Admission::accept` from its own beacon and inherited response
+view: WMM, shared-offer PHY parse, response confirm, HE/EHT profiles,
+MCC width, host/firmware span power min AP power, and native rates. Any
+accepted link failing that fails the association, as mlme.c does. Accepted
+links become valid but inactive (`ieee80211_vif_set_links`: one active link
+on a station).
+
+The secure session binds each accepted link with its own beacon RSNE/RSNXE
+(`Session::with_further_links`): M2 carries their MLO Link KDEs and every
+M3/group message must deliver each link's MLO GTK (and IGTK with PMF). A
+further link's keys are recorded in the connection's history and retained
+for activation; an active link's changed keys are replaced on its link STA
+only. The pairwise key now spans `Binding::sta_mask`.
+
+`Connection::activate_mld_link(hw, link_id)` (authorized, keys present, no
+active further link) drains TX, allocates FW link/STA ids from the actual
+NUM_LINKS/NUM_STATIONS facts and a PHY id, builds PHY/LINK/STA bodies with
+the same station_api builders from that link's own facts plus a per-link
+REDUCE_TX_POWER (SET_LINK, its FW link id, v10/v11 only; Linux
+`iwl_mld_set_tx_power`, sent after channel assignment), runs
+`activate_further_link`, then configures TLC for that link STA only
+(`iwl_mld_config_tlc_link`, sta_mask BIT(fw_sta_id)).
+`deactivate_mld_link` is the inverse; the link stays valid with its keys.
+Beacon/probe proof for every owner, including an active further link, goes
+through `Binding::confirm_mpdu_beacon` (that link's spec id).
+`mld_valid_links()`/`mld_active_links()` report the masks. Written,
+unexecuted: `smoke_mld_native_owner_request_element_and_link_statuses`,
+`smoke_mld_multi_link_m2_link_kdes_and_per_link_group_keys`.
+
+Still open for a second active link: per-link group RX PN (a further link's
+group data still shares the association link's group replay table, so it
+can only be dropped, never replayed); 6GHz further links; no device/nl80211
+caller supplies candidates yet; EMLSR link selection driving activation with
+MLO scan freshness, missed-beacon/ESR_MODE_NOTIF/EMLSR_TRANS_FAIL_NOTIF
+routing, MAC client esr fields; EML OMN, TID-to-link mapping and the
+public narf_wireless multiple-link surface.
 
 
 ### 3.67 Complete native6GHz discovery, refinement and live TPE (validation pending)

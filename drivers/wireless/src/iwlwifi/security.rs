@@ -35,6 +35,47 @@ pub struct KeyUpdate {
     /// when management-frame protection was negotiated (PSK or SAE).
     /// IGTK material, key index and the KDE IPN (receive replay floor).
     pub igtk: Option<([u8; 16], u16, u64)>,
+    /// Each accepted further MLD link's own GTK/IGTK from its MLO GTK/IGTK
+    /// KDEs, in `Session::with_further_links` order. Empty otherwise.
+    pub links: Vec<LinkGroupKeys>,
+}
+
+/// One further link's group keys and their receive replay floors. They are
+/// installed only on that link's firmware STA (`iwl_mld_get_key_sta_mask`).
+pub struct LinkGroupKeys {
+    pub link_id: u8,
+    pub group: [u8; 16],
+    pub group_id: u8,
+    pub group_rx_pn: u64,
+    pub igtk: Option<([u8; 16], u16, u64)>,
+}
+
+impl core::fmt::Debug for LinkGroupKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LinkGroupKeys")
+            .field("link_id", &self.link_id)
+            .field("group_id", &self.group_id)
+            .field("mfp", &self.igtk.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LinkGroupKeys {
+    fn drop(&mut self) {
+        self.group.zeroize();
+        if let Some((igtk, _, _)) = &mut self.igtk {
+            igtk.zeroize();
+        }
+    }
+}
+
+/// A further accepted MLD link's identity and its own AP RSNE/RSNXE bodies
+/// (from that link's beacon), which its M3 MLO Link KDE must repeat.
+#[derive(Clone)]
+pub(super) struct FurtherLinkSecurity {
+    pub context: narf_wireless::association::mlo::Context,
+    pub ap_rsn: Vec<u8>,
+    pub ap_rsnxe: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for KeyUpdate {
@@ -581,6 +622,8 @@ pub struct Session {
     /// Logical PTK/KDE identity is additive to the physical native peer.
     /// The caller must retain the matching firmware/physical link owner.
     mld: Option<Box<narf_wireless::association::mlo::Context>>,
+    /// Accepted further links of a multiple-link association.
+    further: Vec<FurtherLinkSecurity>,
     last_request: Vec<u8>,
     last_response: Vec<u8>,
     initial_key_data: Vec<u8>,
@@ -631,6 +674,7 @@ impl Session {
             sta_rsn: None,
             rsn_extensions: None,
             mld: None,
+            further: Vec::new(),
             last_request: Vec::new(),
             last_response: Vec::new(),
             initial_key_data: Vec::new(),
@@ -663,6 +707,37 @@ impl Session {
         }
         self.mld = Some(Box::new(context));
         Ok(self)
+    }
+
+    /// Bind the further links the AP accepted in a multiple-link
+    /// association response before the 4-way handshake starts. M2 then
+    /// names each with an MLO Link KDE and M3/group messages must deliver
+    /// every link's own GTK (and IGTK with PMF).
+    pub(super) fn with_further_links(
+        &mut self,
+        links: Vec<FurtherLinkSecurity>,
+    ) -> Result<(), &'static str> {
+        let context = self
+            .mld
+            .as_deref()
+            .ok_or("native MLD further links without MLD")?;
+        if self.ptk.is_some()
+            || !self.last_request.is_empty()
+            || links.is_empty()
+            || links.len() >= 15
+            || links.iter().enumerate().any(|(at, link)| {
+                link.context.own_mld() != context.own_mld()
+                    || link.context.peer_mld() != context.peer_mld()
+                    || link.context.link_id() == context.link_id()
+                    || links[..at]
+                        .iter()
+                        .any(|other| other.context.link_id() == link.context.link_id())
+            })
+        {
+            return Err("native MLD further links do not match the association");
+        }
+        self.further = links;
+        Ok(())
     }
 
     /// Echo `rsn` (the exact association-request RSNE body) in message 2
@@ -736,6 +811,7 @@ impl Session {
                 candidate.rsn_extensions = self.rsn_extensions.clone();
                 candidate.pmf = self.pmf;
                 candidate.mld = self.mld.clone();
+                candidate.further = self.further.clone();
                 let reply = candidate.process_inner(pdu, true)?;
                 self.pending_rekey = Some(candidate);
                 return Ok(reply);
@@ -829,7 +905,8 @@ impl Session {
                 reply.key_data.extend_from_slice(station);
             }
             if let Some(context) = self.mld.as_deref() {
-                reply.key_data = mlo::message2(*context, &reply.key_data)
+                let further: Vec<_> = self.further.iter().map(|link| link.context).collect();
+                reply.key_data = mlo::message2_links(*context, &further, &reply.key_data)
                     .map_err(|_| "native MLD M2 association/context mismatch")?;
             }
             self.ptk = Some(ptk);
@@ -890,6 +967,7 @@ impl Session {
             if pairwise_message && self.complete && *clear != self.initial_key_data {
                 return Err("retransmitted M3 changed key data");
             }
+            let mut further_keys = Vec::new();
             let (group, group_id, pn, selected_igtk) = if let Some(context) = self.mld.as_deref() {
                 let mut rsne = alloc::vec![48, self.ap_rsn.len() as u8];
                 rsne.extend_from_slice(&self.ap_rsn);
@@ -900,8 +978,39 @@ impl Session {
                         ie
                     })
                 });
-                let selected = mlo::authenticated_keys(
+                let ies: Vec<_> = self
+                    .further
+                    .iter()
+                    .map(|link| {
+                        let mut rsne = alloc::vec![48, link.ap_rsn.len() as u8];
+                        rsne.extend_from_slice(&link.ap_rsn);
+                        let rsnxe = link.ap_rsnxe.as_ref().map(|body| {
+                            let mut ie = alloc::vec![244, body.len() as u8];
+                            ie.extend_from_slice(body);
+                            ie
+                        });
+                        (rsne, rsnxe)
+                    })
+                    .collect();
+                let further: Vec<_> = self
+                    .further
+                    .iter()
+                    .zip(&ies)
+                    .map(|(link, (rsne, rsnxe))| {
+                        (
+                            link.context,
+                            mlo::Profile {
+                                rsne,
+                                rsnxe: rsnxe.as_deref(),
+                                gtk_len: 16,
+                                igtk_len: Some(16),
+                            },
+                        )
+                    })
+                    .collect();
+                let mut keys = mlo::authenticated_link_keys(
                     *context,
+                    &further,
                     if pairwise_message {
                         mlo::Kind::Pairwise3
                     } else {
@@ -916,27 +1025,29 @@ impl Session {
                         igtk_len: Some(16),
                     },
                 )
-                .map_err(|_| "native MLD authenticated per-link key data invalid")?;
-                let group_id = selected.gtk.key_id;
-                let pn = u64::from_le_bytes(selected.gtk.rsc);
-                let gtk = Zeroizing::new(selected.gtk.key);
-                let group = gtk
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| "invalid native MLD GTK length")?;
-                let igtk = selected
-                    .igtk
-                    .map(|key| -> Result<([u8; 16], u16, u64), &'static str> {
-                        let material = Zeroizing::new(key.key);
-                        let material = material
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| "invalid native MLD IGTK length")?;
-                        let mut ipn = [0; 8];
-                        ipn[..6].copy_from_slice(&key.ipn);
-                        Ok((material, key.key_id, u64::from_le_bytes(ipn)))
-                    })
-                    .transpose()?;
+                .map_err(|_| "native MLD authenticated per-link key data invalid")?
+                .into_iter();
+                let selected = keys
+                    .next()
+                    .ok_or("native MLD association-link keys absent")?;
+                let (group, group_id, pn, igtk) = mld_link_material(selected)?;
+                for link in keys {
+                    let link_id = link.link_id;
+                    let (group, group_id, group_rx_pn, igtk) = mld_link_material(link)?;
+                    if group_rx_pn >> 48 != 0 {
+                        return Err("invalid further-link GTK replay counter");
+                    }
+                    if self.pmf && igtk.is_none() && pairwise_message && !self.complete {
+                        return Err("PMF message 3 lacks a further-link IGTK");
+                    }
+                    further_keys.push(LinkGroupKeys {
+                        link_id,
+                        group,
+                        group_id,
+                        group_rx_pn,
+                        igtk: if self.pmf { igtk } else { None },
+                    });
+                }
                 (group, group_id, pn, igtk)
             } else {
                 let gtk = rekey::parse_gtk_kde(&clear).ok_or("message lacks GTK")?;
@@ -994,6 +1105,7 @@ impl Session {
                     group_id,
                     group_rx_pn: pn,
                     igtk,
+                    links: further_keys,
                 })
             };
             if pairwise_message && !self.complete {
@@ -1056,4 +1168,30 @@ fn matches_rsnxe(mut bytes: &[u8], expected: Option<&[u8]>) -> bool {
         bytes = &bytes[2 + usize::from(bytes[1])..];
     }
     found == expected
+}
+
+/// One link's authenticated MLO GTK/IGTK as native key material.
+type LinkMaterial = ([u8; 16], u8, u64, Option<([u8; 16], u16, u64)>);
+fn mld_link_material(keys: mlo::Keys) -> Result<LinkMaterial, &'static str> {
+    let group_id = keys.gtk.key_id;
+    let pn = u64::from_le_bytes(keys.gtk.rsc);
+    let gtk = Zeroizing::new(keys.gtk.key);
+    let group = gtk
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid native MLD GTK length")?;
+    let igtk = keys
+        .igtk
+        .map(|key| -> Result<([u8; 16], u16, u64), &'static str> {
+            let material = Zeroizing::new(key.key);
+            let material = material
+                .as_slice()
+                .try_into()
+                .map_err(|_| "invalid native MLD IGTK length")?;
+            let mut ipn = [0; 8];
+            ipn[..6].copy_from_slice(&key.ipn);
+            Ok((material, key.key_id, u64::from_le_bytes(ipn)))
+        })
+        .transpose()?;
+    Ok((group, group_id, pn, igtk))
 }

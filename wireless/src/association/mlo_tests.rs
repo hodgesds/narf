@@ -767,3 +767,62 @@ fn inheritance() -> Result<(), &'static str> {
     Ok(())
 }
 smoke!(smoke_mld_per_link_element_inheritance, inheritance);
+
+/// A native owner builds its own request bytes and accepts its association
+/// link itself: `mld_request_element` must inherit against the frame it is
+/// given, and `accept_mld_links` commits only the affiliated links.
+fn native_owner_links() -> Result<(), &'static str> {
+    let (first, second) = (protected(2), second_link(5));
+    let mut plan = multi(&first, &second).map_err(|_| "two-link MLD request refused")?;
+    let request = associate(&mut plan)?;
+    // The plan's own request: its MLE is inherited against the other
+    // elements, which exclude that MLE itself.
+    let mle_at = request[28..]
+        .windows(3)
+        .position(|w| w[0] == 255 && w[2] == 107)
+        .ok_or("request MLE absent")?
+        + 28;
+    let mut outer = request[28..mle_at].to_vec();
+    outer.extend_from_slice(&request[mle_at + 2 + usize::from(request[mle_at + 1])..]);
+    let element = plan
+        .mld_request_element(&[])
+        .map_err(|_| "native request element against an empty outer frame")?;
+    let parsed = mlo::BasicMultiLink::from_ies(&element).map_err(|_| "native MLE unparsable")?;
+    check!(
+        parsed.profile_links() == 1 << 5
+            && plan
+                .mld_request_element(&outer)
+                .is_ok_and(|same| request.windows(same.len()).any(|w| w == same)),
+        "native request element differs from the plan's own inheritance"
+    );
+    let mut native = multi(&first, &second).unwrap();
+    check!(
+        native.accept_mld_links(&multi_reply(&first, &second, 0, true, AP2)[30..], 0)
+            == Err(Error::Busy),
+        "invalid AID accepted"
+    );
+    check!(
+        native.accept_mld_links(&multi_reply(&first, &second, 0, true, AP2)[30..], 7) == Ok(1 << 5)
+            && native.mld_links()[0].response_elements().is_some()
+            && native.mld_links()[0].negotiated_phy().is_some()
+            && native.phase() == Phase::Prepared,
+        "native per-link acceptance changed the association link or lost the view"
+    );
+    check!(
+        native.accept_mld_links(&multi_reply(&first, &second, 0, true, AP2)[30..], 7)
+            == Err(Error::Busy),
+        "per-link statuses accepted twice"
+    );
+    let mut rejected = multi(&first, &second).unwrap();
+    check!(
+        rejected.accept_mld_links(&multi_reply(&first, &second, 1, true, AP2)[30..], 7) == Ok(0)
+            && rejected.mld_links()[0].status() == Some(1)
+            && rejected.mld_links()[0].response_elements().is_none(),
+        "rejected per-STA status granted a valid link"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_mld_native_owner_request_element_and_link_statuses,
+    native_owner_links
+);
