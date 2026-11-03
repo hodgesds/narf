@@ -738,6 +738,8 @@ pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
 mod intel_gpu_exec_sync;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_fbc;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_fence;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_forcewake;
@@ -829,6 +831,8 @@ pub mod intel_gpu_scanout;
 mod intel_gpu_scanout_io;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_slpc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_stolen;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_timestamp;
 #[cfg(feature = "intel")]

@@ -212,6 +212,17 @@ pub(crate) trait Platform:
             crate::intel_gpu_dc_states::DcUser::Kms,
         ))
     }
+    /// Place a display-14 FBC CFB of `size` bytes (1:1) in DSM: returns
+    /// (DSM offset, placed bytes, compression limit). Default: no FBC.
+    fn fbc_carve(&self, _size: u64, _min_limit: u32) -> Option<(u32, u64, u32)> {
+        None
+    }
+    /// A view that may reach registers while a GT-reset loss is being
+    /// recovered, used only to stop an owned FBC before recovery's
+    /// inherited-fetcher inventory. Default: none.
+    fn fbc_recovery_view(&self) -> Option<Self> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -534,10 +545,61 @@ impl Platform for Physical {
         )
         .map_err(|_| crate::intel_gpu_user::io_error())
     }
+    fn fbc_carve(&self, size: u64, min_limit: u32) -> Option<(u32, u64, u32)> {
+        use crate::intel_gpu_stolen as dsm;
+        if self.generation != Generation::MeteorLake || !self.access_ok() {
+            return None;
+        }
+        let (gmadr_base, gmadr_len) =
+            crate::intel_gpu::with_controller(|gpu| (gpu.gmadr.phys.raw(), gpu.gmadr.len))?;
+        let config = |offset| narf_bus::pci::read_config32(&self.cap, &self.device, offset).ok();
+        let read64 =
+            |offset| u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32);
+        let layout = dsm::layout(dsm::Facts {
+            ggc: self.read32(dsm::GGC),
+            stolen_reserved_lo: self.read32(dsm::STOLEN_RESERVED),
+            gscpsmi_base: read64(dsm::MEDIA_GSCPSMI_BASE),
+            gmadr_base,
+            gmadr_len,
+            bsm_dw0: config(dsm::PCI_BSM_DW0)?,
+            bsm_dw1: config(dsm::PCI_BSM_DW1)?,
+        })
+        .ok()?;
+        // Every DSM page a CPU can reach through the aperture: present DM
+        // PTEs in GGTT [0, BAR2 length). This covers the boot framebuffer.
+        let entries = (gmadr_len / dsm::PAGE).min(self.bar.len.saturating_sub(GGTT_ARRAY_BASE) / 8);
+        let pages = dsm::aperture_dsm_pages((0..entries).map(|i| read64(GGTT_ARRAY_BASE + 8 * i)));
+        if !self.access_ok() {
+            return None;
+        }
+        let mut stolen = dsm::Dsm::new(layout, pages);
+        let mut offset = None;
+        let (limit, bytes) =
+            crate::intel_gpu_fbc::find_compression_limit(size, min_limit, |bytes| {
+                match stolen.place(bytes, dsm::PAGE, dsm::CFB_BASE_MAX, |phys| {
+                    narf_memory::frame::is_system_ram(narf_memory::PhysAddr::new(phys))
+                }) {
+                    Ok(placed) => {
+                        offset = Some(placed);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            })?;
+        Some((u32::try_from(offset?).ok()?, bytes, limit))
+    }
+    fn fbc_recovery_view(&self) -> Option<Self> {
+        let mut view = self.clone();
+        view.recovering = true;
+        view.access_ok().then_some(view)
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Result<(), FsError> {
+pub(crate) fn inherited_fetchers_idle(
+    mmio: &impl MmioWindow,
+    generation: Generation,
+) -> Result<(), FsError> {
     fetchers_idle(mmio, generation, false)
 }
 /// Recovery alone may observe Pipe-A DSB0/1 backed by a retained transport.
@@ -656,6 +718,11 @@ struct State<M: Platform> {
     /// Exclusive inactive display12 RAM stays within this Device even after
     /// visible bypass restoration. No inherited active LUT is ever adopted.
     gen12_lut_ram_owned: bool,
+    /// Display-14 FBC A over a DSM-placed CFB; active only while a KMS GEM
+    /// framebuffer is latched, stopped at every session start.
+    fbc: Option<crate::intel_gpu_fbc::Fbc>,
+    /// No CFB could be placed (or not display 14): never retried.
+    fbc_refused: bool,
 }
 
 #[derive(Debug)]
@@ -946,6 +1013,8 @@ impl<M: Platform> Device<M> {
                 gen12_primary: None,
                 gen12_cursor_profile: None,
                 gen12_lut_ram_owned: false,
+                fbc: None,
+                fbc_refused: false,
             }),
         }
     }
@@ -964,6 +1033,14 @@ impl<M: Platform> Device<M> {
             return Ok(());
         }
         let _power = self.platform.display_power()?;
+        // An owned FBC must stop before recovery's fetcher inventory, which
+        // refuses any enabled FBC; the loss-blocked window cannot reach it.
+        if let Some(fbc) = state.fbc.as_mut() {
+            match self.platform.fbc_recovery_view() {
+                Some(view) => fbc.disable(&view),
+                None => fbc.disable(&self.platform),
+            }
+        }
         state.blocked = true;
         state.failed = true;
         state.paused = true;
@@ -1181,11 +1258,16 @@ impl<M: Platform> Device<M> {
         Ok(())
     }
     pub(crate) async fn session(&self) -> Result<Guard<'_, M>, FsError> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         if state.blocked || state.failed || self.platform.reset_lost() {
             return Err(FsError::NoDevice);
         }
         let _power = self.platform.display_power()?;
+        // intel_fbc_invalidate: compression stops before this session
+        // touches the plane, takeover inventory or frontbuffer.
+        if let Some(fbc) = state.fbc.as_mut() {
+            fbc.invalidate(&self.platform);
+        }
         Ok(Guard {
             device: self,
             state,
@@ -1212,6 +1294,9 @@ impl<M: Platform> Device<M> {
     pub(crate) fn legacy_drain(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let mut state = self.state.try_lock().ok_or(FsError::Busy)?;
         let _power = self.platform.display_power()?;
+        if let Some(fbc) = state.fbc.as_mut() {
+            fbc.disable(&self.platform);
+        }
         state.blocked = true;
         Ok(LegacyGuard {
             state,
@@ -1695,11 +1780,65 @@ impl<M: Platform> Guard<'_, M> {
             self.state.failed = true;
             return Err(scanout_error(error));
         }
-        self.finish_pending()
+        let stamp = self
+            .finish_pending()
             .await?
-            .ok_or_else(crate::intel_gpu_user::io_error)
+            .ok_or_else(crate::intel_gpu_user::io_error)?;
+        // __intel_fbc_flush after the latch (flips and DIRTYFB re-presents).
+        self.fbc_after_latch(geometry);
+        Ok(stamp)
+    }
+    /// Display-14 FBC on the latched KMS framebuffer: place the CFB once,
+    /// then nuke or (re)activate; any ineligible plane disables.
+    fn fbc_after_latch(&mut self, geometry: Geometry) {
+        use crate::intel_gpu_fbc::{cfb_size, check_plane, min_limit, override_stride, Fbc};
+        let psr = crate::intel_gpu_edp::psr_active();
+        let plane = crate::intel_gpu_fbc::Plane {
+            kms_owned: self.state.current.is_some(),
+            format: if self.state.xr30_timing.is_some() || self.state.xr30_epoch.is_some() {
+                crate::intel_gpu_fbc::Format::Other
+            } else {
+                crate::intel_gpu_fbc::Format::Xrgb8888
+            },
+            width: geometry.width,
+            height: geometry.height,
+            x: 0,
+            y: 0,
+            stride_bytes: geometry.pitch,
+            per_pixel_alpha: false,
+            rotated_90: false,
+            interlaced: false,
+            psr1: psr,
+            selective_update: psr,
+        };
+        if self.state.fbc.is_none() && !self.state.fbc_refused && check_plane(&plane).is_ok() {
+            let size = cfb_size(plane.format, plane.width, plane.height, plane.stride_bytes);
+            match self
+                .device
+                .platform
+                .fbc_carve(size, min_limit(plane.format))
+            {
+                Some((offset, bytes, limit)) => {
+                    self.state.fbc = Some(Fbc::new(
+                        offset,
+                        bytes,
+                        limit,
+                        override_stride(plane.format, plane.width, plane.stride_bytes),
+                    ))
+                }
+                None => self.state.fbc_refused = true,
+            }
+        }
+        if let Some(fbc) = self.state.fbc.as_mut() {
+            let _ = fbc.flush(&self.device.platform, &plane);
+        }
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
+        // Console reclaim: FBC is fully disabled before the console
+        // framebuffer is scanned out again.
+        if let Some(fbc) = self.state.fbc.as_mut() {
+            fbc.disable(&self.device.platform);
+        }
         self.finish_cursor().await?;
         if self
             .state
