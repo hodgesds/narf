@@ -1871,9 +1871,11 @@ pub async fn try_bind_audio_already_addressed(
 /// stop, per the sound layer's contract) and drop the registry
 /// entries. Returns how many entries were removed.
 ///
-/// There is no supervisor caller on main yet — the USB detach
-/// passes (PRs #846/#847) call this from their per-slot teardown
-/// once they land.
+/// This is the class-registry unbind hook for "snd-usb-audio"
+/// (registered in `register_initcalls`): the supervisor's
+/// `detach_slot` reaches it via `class_registry::dispatch_unbind`
+/// on the per-slot detach path, so an unplugged device's card
+/// leaves the registry instead of leaking (#1318).
 pub fn unbind_audio(slot_id: u8) -> usize {
     let removed: Vec<UacDevice> = {
         let mut reg = UAC_DEVICES.lock();
@@ -1894,6 +1896,16 @@ pub fn unbind_audio(slot_id: u8) -> usize {
         }
     }
     removed.len()
+}
+
+/// Class-registry unbind hook for "snd-usb-audio": adapts infallible
+/// `unbind_audio` to the [`UsbUnbindFn`] contract with an
+/// unconditional `Ok(())` (#893: a hook reports failure with
+/// `Err(())`, never by panicking). Idempotent: a second dispatch
+/// for the same slot simply removes zero entries.
+pub fn detach_uac_slot(slot_id: u8) -> Result<(), ()> {
+    let _ = unbind_audio(slot_id);
+    Ok(())
 }
 
 /// Unbind every bound UAC device (all slots). See `unbind_audio`.
@@ -2271,5 +2283,15 @@ pub fn probe(
 }
 
 pub fn register_initcalls() {
-    let _ = crate::class_registry::register_class_driver("snd-usb-audio", &UAC_MATCH, probe);
+    // Register with the unbind hook (#1318): the supervisor's
+    // `detach_slot` reaches `detach_uac_slot` via `dispatch_unbind`
+    // on unplug, so the slot's card leaves the registry instead of
+    // leaking. Previously this used plain `register_class_driver`
+    // with no hook, and `unbind_audio` had no production caller.
+    let _ = crate::class_registry::register_class_driver_with_unbind(
+        "snd-usb-audio",
+        &UAC_MATCH,
+        probe,
+        detach_uac_slot,
+    );
 }
