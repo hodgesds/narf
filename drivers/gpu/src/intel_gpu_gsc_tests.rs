@@ -7,6 +7,9 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::cell::RefCell;
 use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
+/// A blob mutation and the refusal it must produce.
+type Refusal = (fn(&mut Vec<u8>), GscError);
+
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -138,7 +141,7 @@ fn smoke_media_gsc_layout_parse_and_every_refusal() -> TestResult {
     );
     // Too small for the layout pointers.
     kt_assert_eq!(GscImage::parse(&image[..79]), Err(GscError::NoData));
-    let refusals: [(fn(&mut Vec<u8>), GscError); 9] = [
+    let refusals: [Refusal; 9] = [
         // boot1 extends past the blob.
         (|i| put32(i, 36, 0x1000), GscError::NoData),
         (|i| put32(i, 32, 0xffff_ff00), GscError::NoData),
@@ -220,7 +223,7 @@ fn smoke_media_huc_gsc_image_versions_offsets_and_refusals() -> TestResult {
         cpd.map(|c| (c.manifest, c.css)),
         Ok((Version::new(8, 5, 4, 1), None))
     );
-    let refusals: [(fn(&mut Vec<u8>), GscError); 9] = [
+    let refusals: [Refusal; 9] = [
         (|i| i[10] = 16, GscError::Invalid),
         (|i| put32(i, 4, 1000), GscError::NoData),
         (
