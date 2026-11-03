@@ -5891,9 +5891,11 @@ PTL, Gen12 and the media-GT OAM units are not published.
 Query 8 returns the source's zero-unit reply until that owner and the
 execution epoch are published. After that it returns one OAG unit (id 0,
 gt 0) with its published render and compute engines in hw-engine order and
-the cached `xe_oa_timestamp_frequency`. On 12.55 that is RPM_CONFIG0's CTC
-shift, read once at publication. Capabilities are BASE, OA_BUFFER_SIZE,
-WAIT_NUM_REPORTS and OA_UNIT_GT_ID. SYNCS and OAM are not advertised.
+the cached `xe_oa_timestamp_frequency`. On 12.55 and 12.70–12.74
+(Wa_18013179988, including its rules continuation) it applies RPM_CONFIG0's
+CTC shift, read once at publication. Capabilities are BASE,
+OA_BUFFER_SIZE, WAIT_NUM_REPORTS and OA_UNIT_GT_ID. SYNCS and OAM are not
+advertised.
 
 Observation routing copies the parameter in and checks extensions. It then
 routes type 0 to OA and type 1 to EU-stall, whose nonzero op is EINVAL
@@ -5998,3 +6000,68 @@ existing GuC model:
 The model now recognises a render ring whose first LRI targets a source OA
 register as a configuration job. The asynchronous runtime backend has no
 fixture of its own. Silicon and Mesa acceptance remain open.
+
+**Device coredump against `xe_devcoredump.c`.** Linux prints text sections
+in this order:
+
+- the reason, kernel, module, times and process;
+- `xe_device_snapshot_print`, then the GT and tile;
+- the GuC log and the GuC CT;
+- the GuC exec-queue contexts with their LRC, HWSP and HWCTX bodies;
+- the job's batch addresses;
+- one HW-engine register snapshot per engine, from GuC error capture or
+  `xe_engine_manual_capture`;
+- the DUMPABLE VMAs.
+
+NARF's CAP_SYSLOG-gated version-3 bundle already holds the GuC log and CT
+copies, scalar context facts, eight bounded LRC (including PPHWSP), ring
+and group-scratch slots, and bounded DUMPABLE system/WC/USERPTR prefixes.
+These differences remain:
+
+- Format and lifetime. NARF writes a binary bundle, not ascii85 text, and
+  has no `devcoredump/data` class node. Its protected descriptor uses a
+  generation-matched clear and a two-buffer limit instead of the one-hour
+  release.
+- Header. There is no process name/pid, kernel release or
+  `xe_device_snapshot_print` block.
+- HW engines. The sanitized report keeps only six redacted registers per
+  engine and four globals. NARF does not register GuC error-capture lists
+  (ADS capture registration and STATE_CAPTURE parsing). It does not take
+  the full manual list: HWSTAM, HWS_PGA, RING_HEAD/TAIL/CTL, MI_MODE, MODE,
+  ESR/EMR/EIR/IMR, IPEHR, INSTDONE, INDIRECT_RING_STATE, CURRENT_LRCA, the
+  64-bit ACTHD/BBADDR/START/DMA_FADD/EXECLIST pairs, RCU_MODE, SC_INSTDONE,
+  SFC_DONE and FORCEWAKE_GT.
+- Contexts and job. There are no exec-queue policy fields (timeouts,
+  timeslice, priority, pending state, workqueue head/tail) and no decoded
+  per-lane batch address section.
+- VM. Local-memory and oversized VMAs are marked unavailable or truncated
+  instead of being dumped whole.
+
+**i915 perf surfaces against `i915_getparam.c`, `i915_query.c` and
+`i915_perf.c`.** These are not implemented:
+
+- DRM_I915_PERF_OPEN, PERF_ADD_CONFIG and PERF_REMOVE_CONFIG, and query
+  item 3 (PERF_CONFIG).
+- GETPARAM 54 (PERF_REVISION) stays 0, as the truthful no-i915-perf signal.
+- GETPARAM 57 (OA_TIMESTAMP_FREQUENCY) stays 0. Linux returns the clock,
+  with the same Wa_18013179988 CTC shift on DG2 and 12.70–12.74.
+
+Porting i915 perf is not plumbing over the Xe OA unit. Its records carry
+`drm_i915_perf_record_header` sample and loss records, it has its own
+property set and separate mux, boolean and flex configuration lists, and
+its metrics are in sysfs. GETPARAM 57 also needs the CTC shift cached
+without the OA opt-in. GETPARAM 46/47 already return the source's EINVAL
+from 12.55 onward.
+
+**EU-stall open errno.** EU-stall open now returns ENODEV without a
+published owner before it returns EACCES for missing privilege, as
+`xe_eu_stall_stream_open` does. It used to return EPERM first. Later
+read/control refusals stay EPERM.
+
+Changed fixtures:
+
+- `smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close`
+  expected EPERM for a denied open. It now expects EACCES.
+- `smoke_lnl_eu_stall_raw_query_open_cancel_reopen_and_full_reset_owner`
+  expected EPERM for its raw-ioctl denial and for its revocation across the
+  attach await. Both now expect EACCES.
