@@ -37,6 +37,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .authorized
             .unwrap_or(!ap.plan.settings.control_port.enabled);
         let ps = ap_wire::power_save(
+            ap.plan.vdev,
             mac,
             station.uapsd_queues.unwrap_or(0),
             station.uapsd_max_sp.unwrap_or(0),
@@ -83,7 +84,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         self.ap_command(
-            &ap_wire::peer_parameter(mac, 3, u32::from(authorized))?,
+            &ap_wire::peer_parameter(self.ap_vdev()?, mac, 3, u32::from(authorized))?,
             &current,
         )
         .await?;
@@ -158,6 +159,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         next.authorized = Some(authorized);
         let assoc = ap_wire::associate(&ap.plan, &next, true)?;
         let ps = ap_wire::power_save(
+            ap.plan.vdev,
             next.mac,
             next.uapsd_queues.unwrap_or(0),
             next.uapsd_max_sp.unwrap_or(0),
@@ -177,8 +179,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         ap.peers[index].authorized = false;
         ap.busy = true;
         self.ap_quiet(&current).await?;
-        self.ap_command(&ap_wire::peer_parameter(mac, 3, 0)?, &current)
-            .await?;
+        self.ap_command(
+            &ap_wire::peer_parameter(self.ap_vdev()?, mac, 3, 0)?,
+            &current,
+        )
+        .await?;
         self.ap_command(&assoc, &current).await?;
         if self.ap_uapsd() {
             for command in &ps {
@@ -186,7 +191,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         self.ap_command(
-            &ap_wire::peer_parameter(mac, 3, u32::from(authorized))?,
+            &ap_wire::peer_parameter(self.ap_vdev()?, mac, 3, u32::from(authorized))?,
             &current,
         )
         .await?;

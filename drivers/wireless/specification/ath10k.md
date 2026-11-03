@@ -2114,6 +2114,14 @@ will bind; none of them grants RF, peer, key or data authority.
   passes the vdev recorded in its `Peer` (the managed vdev for the home
   station); the AP owner passes the managed vdev it replaced. vdev0
   encodings are byte-identical to the former implicit builders.
+- **AP builders take a vdev.** `ap_wire::Plan` records the AP-type vdev
+  (`Plan::new(vdev, ..)`; today the managed vdev the AP replaced). The
+  beacon/probe templates, the AP VDEV_SET_PARAMs, PEER_ASSOC (byte 16),
+  PEER_SET_PARAM, AP_PS_PEER_PARAM and VDEV_UP address it, as do the AP's
+  VDEV_START/DOWN/STOP, its own/client peer create/delete, HTT and WMI
+  management TX and RX_IN_ORD admission (`ap_vdev`). The session's beacon
+  TX status and VDEV_STOPPED must carry that vdev; a PEER_DELETE_RESP for
+  another vdev is ignored rather than fatal.
 - **GO beacon P2P IE.** `go_beacon_ie` follows
   `mac.c::ath10k_mac_setup_bcn_p2p_ie` + `ath10k_mac_remove_vendor_ie`:
   for a GO vdev the first WFA P2P vendor IE after the beacon fixed fields
@@ -2219,6 +2227,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_device_vdev_nss_on_own_id`,
 `smoke_ath10k_p2p_offchannel_builders_carry_vdev`,
 `smoke_ath10k_p2p_station_builders_carry_vdev`,
+`smoke_ath10k_p2p_ap_builders_carry_vdev`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`.
 

@@ -678,3 +678,100 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_station_builders_carry_vdev
 );
+
+/// TLV AP builders address the plan's AP-type vdev (`arvif->vdev_id` in
+/// `mac.c::ath10k_mac_setup_bcn_tmpl`/`_prb_tmpl`, `ath10k_mac_set_*`
+/// vdev params, `ath10k_peer_assoc_prepare`, `ath10k_station_assoc` peer
+/// and AP-PS params): templates, vdev params, PEER_SET_PARAM and AP_PS at
+/// byte 8, PEER_ASSOC after the peer address at byte 16. Re-zeroing the
+/// vdev reproduces the vdev0 encoding.
+fn smoke_ath10k_p2p_ap_builders_carry_vdev() -> TestResult {
+    use super::super::ap_wire;
+    let mut beacon = vec![0; 36];
+    beacon[0] = 0x80;
+    beacon[4..10].fill(255);
+    beacon[10..16].copy_from_slice(&OWN);
+    beacon[16..22].copy_from_slice(&OWN);
+    beacon[32..34].copy_from_slice(&100u16.to_le_bytes());
+    beacon[34] = 1;
+    beacon.extend_from_slice(&[
+        0, 4, b'n', b'a', b'r', b'f', 1, 4, 0x82, 0x84, 0x8b, 0x96, 3, 1, 1,
+    ]);
+    let config = narf_wireless::ApConfig {
+        ssid: b"narf".to_vec(),
+        beacon_head: beacon,
+        beacon_tail: Vec::new(),
+        probe_resp: None,
+        beacon_interval: 100,
+        dtim_period: 2,
+        frequency_mhz: 2412,
+        channel_width: 0,
+        center_freq1_mhz: None,
+        center_freq2_mhz: None,
+        hidden_ssid: 0,
+        privacy: false,
+        mbssid: None,
+        mbssid_elems: Vec::new(),
+        ema_rnr_elems: Vec::new(),
+        fils_discovery: None,
+        unsol_bcast_probe_resp: None,
+        ftm_responder: None,
+        twt_responder: false,
+        he_obss_pd: None,
+        he_bss_color: None,
+    };
+    const PEER: [u8; 6] = [2, 0, 0, 0, 0, 0x22];
+    let station = narf_wireless::StationConfig {
+        mac: PEER,
+        aid: 1,
+        listen_interval: 10,
+        supported_rates: vec![2, 4, 11, 22],
+        wme: Some(false),
+        uapsd_queues: Some(0),
+        uapsd_max_sp: Some(0),
+        mfp: Some(false),
+        capability: None,
+        ext_capability: None,
+        ht_capability: None,
+        vht_capability: None,
+        he_capability: None,
+        he_6ghz_capability: None,
+        authorized: Some(true),
+        station_tx_power: None,
+    };
+    let settings = narf_wireless::ApStartSettings::default();
+    let built = |vdev: u8| -> Result<Vec<(Vec<u8>, usize)>, Error> {
+        let plan = ap_wire::Plan::new(vdev, config.clone(), settings.clone(), OWN, false)?;
+        let mut out = vec![
+            (ap_wire::beacon(&plan)?, 8),
+            (ap_wire::probe(&plan)?, 8),
+            (ap_wire::associate(&plan, &station, false)?, 16),
+            (ap_wire::peer_parameter(vdev, PEER, 3, 1)?, 8),
+        ];
+        for command in ap_wire::parameters(&plan)? {
+            out.push((command, 8));
+        }
+        for command in ap_wire::power_save(vdev, PEER, 1, 1)? {
+            out.push((command, 8));
+        }
+        Ok(out)
+    };
+    let (Ok(zero), Ok(two)) = (built(0), built(2)) else {
+        return TestResult::Fail("AP builder refused");
+    };
+    if zero.len() != two.len() || zero.len() != 16 {
+        return TestResult::Fail("AP builder count");
+    }
+    for ((z, at), (t, _)) in zero.iter().zip(two.iter()) {
+        let mut patched = t.clone();
+        patched[*at] = 0;
+        if wire::word(t, *at) != Ok(2) || wire::word(z, *at) != Ok(0) || patched != *z {
+            return TestResult::Fail("AP builder vdev layout");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_ap_builders_carry_vdev
+);

@@ -51,9 +51,13 @@ pub(super) struct Plan {
     pub wmm: Option<narf_wireless::wmm::Parameters>,
     pub rsn: Option<narf_wireless::rsn::RsnIe>,
     pub probe: Vec<u8>,
+    /// The AP-type vdev every template, parameter, peer and VDEV_UP command
+    /// of this plan addresses (`arvif->vdev_id` throughout mac.c).
+    pub vdev: u8,
 }
 impl Plan {
     pub fn new(
+        vdev: u8,
         config: ApConfig,
         settings: ApStartSettings,
         own: [u8; 6],
@@ -247,7 +251,7 @@ impl Plan {
             candidate.beacon_head[0] = 0x80;
             candidate.beacon_head[4..10].fill(0xff);
             candidate.beacon_tail.clear();
-            let parsed = Self::new(candidate, settings.clone(), own, uapsd)?;
+            let parsed = Self::new(vdev, candidate, settings.clone(), own, uapsd)?;
             if parsed.rsn != rsn
                 || parsed.rates != supported
                 || parsed.basic != basic
@@ -295,6 +299,7 @@ impl Plan {
             wmm,
             rsn,
             probe,
+            vdev,
         })
     }
     pub fn peer_rates(&self, station: &StationConfig) -> Result<u16, Error> {
@@ -397,7 +402,15 @@ pub(super) fn delete(vdev: super::p2p::Vdev) -> Result<Vec<u8>, Error> {
     vdev.delete(&wire::Wire::new(crate::ath10k::wmi_boot::Dialect::Tlv))
 }
 pub(super) fn beacon(plan: &Plan) -> Result<Vec<u8>, Error> {
-    let mut out = command(0x7003, 103, &[0, plan.tim as u32, plan.beacon.len() as u32])?;
+    let mut out = command(
+        0x7003,
+        103,
+        &[
+            u32::from(plan.vdev),
+            plan.tim as u32,
+            plan.beacon.len() as u32,
+        ],
+    )?;
     out.extend_from_slice(&((105u32 << 16) | 8).to_le_bytes());
     out.extend_from_slice(&[0; 8]);
     let padded = plan.beacon.len().next_multiple_of(4);
@@ -407,7 +420,11 @@ pub(super) fn beacon(plan: &Plan) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 pub(super) fn probe(plan: &Plan) -> Result<Vec<u8>, Error> {
-    let mut out = command(0x7007, 104, &[0, plan.probe.len() as u32])?;
+    let mut out = command(
+        0x7007,
+        104,
+        &[u32::from(plan.vdev), plan.probe.len() as u32],
+    )?;
     out.extend_from_slice(&((105u32 << 16) | 8).to_le_bytes());
     out.extend_from_slice(&[0; 8]);
     let padded = plan.probe.len().next_multiple_of(4);
@@ -437,16 +454,32 @@ pub(super) fn parameters(plan: &Plan) -> Result<Vec<Vec<u8>>, Error> {
         (7, if capability & (1 << 10) != 0 { 2 } else { 1 }),
         (8, if capability & (1 << 5) != 0 { 2 } else { 1 }),
     ] {
-        out.push(command(0x5008, 95, &[0, parameter, value])?);
+        out.push(command(
+            0x5008,
+            95,
+            &[u32::from(plan.vdev), parameter, value],
+        )?);
     }
     Ok(out)
 }
-pub(super) fn peer_parameter(mac: [u8; 6], id: u32, value: u32) -> Result<Vec<u8>, Error> {
-    let mut out = command(0x6004, 100, &[0, 0, 0, id, value])?;
+/// TLV `WMI_PEER_SET_PARAM` for `mac` on the AP `vdev`.
+pub(super) fn peer_parameter(
+    vdev: u8,
+    mac: [u8; 6],
+    id: u32,
+    value: u32,
+) -> Result<Vec<u8>, Error> {
+    let mut out = command(0x6004, 100, &[u32::from(vdev), 0, 0, id, value])?;
     out[12..18].copy_from_slice(&mac);
     Ok(out)
 }
-pub(super) fn power_save(mac: [u8; 6], queues: u8, max_sp: u8) -> Result<[Vec<u8>; 3], Error> {
+/// TLV `WMI_AP_PS_PEER_PARAM` for `mac` on the AP `vdev`.
+pub(super) fn power_save(
+    vdev: u8,
+    mac: [u8; 6],
+    queues: u8,
+    max_sp: u8,
+) -> Result<[Vec<u8>; 3], Error> {
     if queues & !15 != 0 || max_sp > 3 {
         return Err(Error::Malformed);
     }
@@ -458,7 +491,7 @@ pub(super) fn power_save(mac: [u8; 6], queues: u8, max_sp: u8) -> Result<[Vec<u8
         }
     }
     let make = |id, value| {
-        let mut out = command(0xe001, 130, &[0, 0, 0, id, value])?;
+        let mut out = command(0xe001, 130, &[u32::from(vdev), 0, 0, id, value])?;
         out[12..18].copy_from_slice(&mac);
         Ok::<_, Error>(out)
     };
@@ -479,6 +512,7 @@ pub(super) fn associate(
     let mut out = wire::packet(0x6005, 76 + 16 + 16 + padded)?;
     wire::put(&mut out, 4, 101 << 16 | 76);
     out[8..14].copy_from_slice(&station.mac);
+    wire::put(&mut out, 16, u32::from(plan.vdev));
     wire::put(&mut out, 20, u32::from(!reassociate));
     wire::put(&mut out, 24, u32::from(station.aid));
     let uapsd = station.wme == Some(true) && station.uapsd_queues.is_some_and(|q| q != 0);

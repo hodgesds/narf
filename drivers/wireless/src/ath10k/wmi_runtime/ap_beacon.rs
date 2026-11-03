@@ -35,6 +35,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             config.probe_resp = Some(probe);
         }
         let next = ap_wire::Plan::new(
+            ap.plan.vdev,
             config,
             ap.plan.settings.clone(),
             ap.own.mac,

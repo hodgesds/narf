@@ -522,7 +522,7 @@ impl Session {
             }
             0x7004 if self.vdev == Vdev::Up && !self.failed => {
                 let body = wire::tag(&bytes[4..], 222)?;
-                if body.len() != 8 || wire::word(body, 0)? != 0 {
+                if body.len() != 8 || wire::word(body, 0)? != u32::from(self.plan.vdev) {
                     return Err(Error::Malformed);
                 }
                 let status = wire::word(body, 4)?;
@@ -532,20 +532,24 @@ impl Session {
                 self.beacon_ok = true;
             }
             // Delete response carries no consumed identity in Linux. One
-            // outstanding original vdev0 teardown plus drained native prefix
+            // outstanding AP-vdev teardown plus drained native prefix
             // supplies correlation; no guessed body/status is decoded.
             0x5006 if self.vdev == Vdev::DeleteSent => self.vdev_deleted = true,
             0x5002 if self.vdev == Vdev::StopSent => {
                 let body = wire::tag(&bytes[4..], 41)?;
-                if body.len() != 4 || wire::word(body, 0)? != 0 {
+                if body.len() != 4 || wire::word(body, 0)? != u32::from(self.plan.vdev) {
                     return Err(Error::Malformed);
                 }
                 self.native_stopped = true;
             }
             0x6007 => {
                 let body = wire::tag(&bytes[4..], 451)?;
-                if body.len() != 12 || wire::word(body, 0)? != 0 {
+                if body.len() != 12 {
                     return Err(Error::Malformed);
+                }
+                // Another vdev's (P2P_DEVICE/offchannel) peer is not ours.
+                if wire::word(body, 0)? != u32::from(self.plan.vdev) {
+                    return Ok(());
                 }
                 let mac = &body[4..10];
                 if mac == self.own.mac && self.own.deleting {

@@ -77,7 +77,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if matches!(phase, Vdev::Up | Vdev::Started | Vdev::StopSent) {
             // Autonomous beaconing is silenced before waiting on old DATA.
             // DOWN transport receipt alone is not a STOPPED/DMA-idle proof.
-            self.ap_command(&self.wire.down_station(self.primary.id())?, validate)
+            self.ap_command(&self.wire.down_station(self.ap_vdev()?)?, validate)
                 .await?;
             self.ap_barrier(validate).await?;
         }
@@ -107,7 +107,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             if matches!(phase, Vdev::Up | Vdev::Started | Vdev::StopSent) {
                 self.ap_publish(
-                    &self.wire.stop_station(self.primary.id())?,
+                    &self.wire.stop_station(self.ap_vdev()?)?,
                     Publication::Vdev(Vdev::StopSent),
                     validate,
                 )

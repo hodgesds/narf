@@ -121,7 +121,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let id = self.htt.begin_transmit(
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
-                vdev: self.primary.id(),
+                vdev: self.ap_vdev()?,
                 tid,
                 hardware_crypto: false,
             },
@@ -194,6 +194,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             config.probe_resp = None;
             config.hidden_ssid = 0;
             let offered = super::ap_wire::Plan::new(
+                ap.plan.vdev,
                 config,
                 ap.plan.settings.clone(),
                 ap.own.mac,
@@ -255,7 +256,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             management::Path::Htt => Token::Htt(self.htt.begin_transmit(
                 htt::tx::Parameters {
                     kind: htt::tx::Kind::Management,
-                    vdev: self.primary.id(),
+                    vdev: self.ap_vdev()?,
                     tid: 17,
                     hardware_crypto: false,
                 },
@@ -276,7 +277,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     control: true,
                 });
                 self.ap_command(
-                    &management::reference(self.primary.id(), id, address, &request.frame)?,
+                    &management::reference(self.ap_vdev()?, id, address, &request.frame)?,
                     &current,
                 )
                 .await?;

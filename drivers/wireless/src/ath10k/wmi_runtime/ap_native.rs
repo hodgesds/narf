@@ -79,6 +79,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .as_ref()
             .is_some_and(|ap| !ap.failed && !ap.busy && ap.vdev == Vdev::Up && ap.own.mapped())
     }
+    /// The AP-type vdev the running AP session addresses.
+    pub(super) fn ap_vdev(&self) -> Result<u8, Error> {
+        self.ap.as_ref().map(|ap| ap.plan.vdev).ok_or(Error::Failed)
+    }
     pub(in crate::ath10k) fn ap_current(
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -129,7 +133,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .as_ref()
                     .is_some_and(|ap| ap.vdev == Vdev::StartSent)
             {
-                if self.wire.start_response(self.primary.id(), &bytes[4..])? == Some(()) {
+                if self.wire.start_response(self.ap_vdev()?, &bytes[4..])? == Some(()) {
                     self.ap.as_mut().unwrap().vdev = Vdev::Started;
                 }
             } else {
@@ -155,7 +159,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 // Decapped offload/fragment forms supply no AP RAW authority.
                 if !indication.offload
                     && !indication.fragment
-                    && u32::from(indication.vdev) == self.primary_vdev()
+                    && Ok(indication.vdev) == self.ap_vdev()
                 {
                     for frame in frames {
                         self.ap.as_mut().ok_or(Error::Failed)?.receive(
@@ -312,7 +316,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.ap_publish(
-            &self.wire.offchannel_peer(self.primary.id(), mac)?,
+            &self.wire.offchannel_peer(self.ap_vdev()?, mac)?,
             ap::Publication::CreatePeer(mac),
             validate,
         )
@@ -324,7 +328,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.ap_publish(
-            &self.wire.delete_offchannel_peer(self.primary.id(), mac)?,
+            &self.wire.delete_offchannel_peer(self.ap_vdev()?, mac)?,
             ap::Publication::DeletePeer(mac),
             validate,
         )
@@ -367,7 +371,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let own = self.ready.ok_or(Error::Failed)?.mac;
-        let plan = ap_wire::Plan::new(config, settings, own, self.ap_uapsd())?;
+        let plan = ap_wire::Plan::new(self.primary.id(), config, settings, own, self.ap_uapsd())?;
         if self.ap_staging.as_ref().is_some_and(|staging| {
             !staging.current() || !plan.config.privacy && !staging.keys.is_empty()
         }) {
@@ -456,7 +460,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         .await?;
         let plan = &self.ap.as_ref().unwrap().plan;
         let mut start = self.wire.start_station(
-            self.primary.id(),
+            self.ap_vdev()?,
             &permission,
             plan.config.beacon_interval as u16,
             plan.config.dtim_period as u8,
@@ -471,7 +475,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .await?;
         self.ap_command(&beacon, &current).await?;
         self.ap_command(&probe, &current).await?;
-        let mut up = ap_wire::command(0x5005, 92, &[0, 0, 0, 0])?;
+        let vdev = self.ap.as_ref().ok_or(Error::Failed)?.plan.vdev;
+        let mut up = ap_wire::command(0x5005, 92, &[u32::from(vdev), 0, 0, 0])?;
         up[16..22].copy_from_slice(&own);
         self.ap_publish(&up, ap::Publication::Vdev(Vdev::Up), &current)
             .await?;
@@ -555,7 +560,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let id = self.htt.begin_transmit(
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
-                vdev: self.primary.id(),
+                vdev: self.ap_vdev()?,
                 tid,
                 hardware_crypto: false,
             },

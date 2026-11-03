@@ -149,8 +149,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         self.ap_quiet(&current).await?;
         if let Some(mac) = mac {
-            self.ap_command(&super::ap_wire::peer_parameter(mac, 3, 0)?, &current)
-                .await?;
+            self.ap_command(
+                &super::ap_wire::peer_parameter(self.ap_vdev()?, mac, 3, 0)?,
+                &current,
+            )
+            .await?;
             self.ap_barrier(&current).await?;
         }
         let ap = self.ap.as_mut().unwrap();
