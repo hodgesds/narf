@@ -162,10 +162,10 @@ pub(super) fn rx_map(streams: u8) -> u16 {
 /// `rtw_init_vht_cap` for the bound N2xV association: SGI80 (RX always,
 /// TX per the record), RX STBC, RX LDPC per chip (`rtw_chip_has_rx_ldpc`),
 /// A-MPDU exponent 0 like the HT capability, maximum MPDU 3895, MCS0..9 RX
-/// on the HT program's streams and the record's TX selection, and SU
-/// beamformee with `hal.bfee_sts_cap` (`bf.rs`). TX STBC, TX LDPC, HTC-VHT
-/// and MU beamformee are not advertised (no separately qualified VHT coding
-/// program; no VHT Group ID Management / `rtw_bf_set_gid_table`).
+/// on the HT program's streams and the record's TX selection, and SU and MU
+/// beamformee with `hal.bfee_sts_cap` (`bf.rs`, including VHT Group ID
+/// Management -> `rtw_bf_set_gid_table`). TX STBC, TX LDPC and HTC-VHT are
+/// not advertised (no separately qualified VHT coding program).
 pub(super) fn local(
     did: u16,
     streams: u8,
@@ -185,7 +185,7 @@ pub(super) fn local(
             .with_beamforming(narf_wireless::association::phy::VhtBeamforming {
                 su_beamformee_sts: Some(super::bf::BFEE_STS),
                 su_beamformer_sounding: None,
-                mu_beamformee: false,
+                mu_beamformee: true,
             })
             .ok()
     })

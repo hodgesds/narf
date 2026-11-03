@@ -565,11 +565,11 @@ fn smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback() -> TestResult 
     let cap = local.capability_body();
     let info = u32::from_le_bytes([cap[0], cap[1], cap[2], cap[3]]);
     // SHORT_GI_80 bit5, RXSTBC_1 bit8, RXLDPC bit4 per chip, MPDU 3895,
-    // SU beamformee bit12 with BEAMFORMEE_STS 3 (`bfee_sts_cap`); no TX
-    // STBC, SU beamformer or MU beamformee.
-    if info & (1 << 5 | 1 << 8) != (1 << 5 | 1 << 8)
+    // SU beamformee bit12 with BEAMFORMEE_STS 3 (`bfee_sts_cap`) and MU
+    // beamformee bit20; no TX STBC, SU beamformer or MU beamformer.
+    if info & (1 << 5 | 1 << 8 | 1 << 20) != (1 << 5 | 1 << 8 | 1 << 20)
         || info & 3 != 0
-        || info & (1 << 7 | 1 << 11 | 1 << 19 | 1 << 20) != 0
+        || info & (1 << 7 | 1 << 11 | 1 << 19) != 0
         || info & (1 << 12 | 7 << 13) != (1 << 12 | 3 << 13)
         || cap[4..6] != [0xfa, 0xff]
         || cap[8..10] != [0xfa, 0xff]

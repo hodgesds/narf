@@ -2764,7 +2764,7 @@ N2xB). The association PHY is `LocalPhy::vht80` = `rtw_init_ht_cap` 20/40
 narrowed (`vht::local`): maximum MPDU 3895, SHORT_GI_80 (TX per record
 flag), RXSTBC_1, RXLDPC per chip, A-MPDU exponent 0, RX MCS0..9 on the HT
 program's streams, TX map = record streams x highest MCS; no TX STBC/LDPC,
-HTC-VHT or beamforming. The offer must be 80MHz with VHT on the record's
+HTC-VHT; SU/MU beamformee per "VHT SU and MU beamformee". The offer must be 80MHz with VHT on the record's
 center (else `Profile`); `widen(Wide::Eighty)` binds and runs
 `vht::program` under the retune owner, `station_width_begin` sets PHY
 admission width 2 (`query_phy_status_page1` RXSC 13+ / RXSC0 = current).
@@ -2861,39 +2861,88 @@ Written, unexecuted:
 `smoke_rtw88_tx_amsdu_vht_aggregate_airtime_bound`.
 
 
-### VHT SU beamformee (`bf.rs`)
+### VHT SU and MU beamformee (`bf.rs`)
 
 Bound only on an N2xV VHT80 association (Linux reads `vht_cap`):
 
 - **Advertisement** (`vht::local`, `main.c::rtw_init_vht_cap`): SU
-  beamformee (bit12) with Beamformee STS 3 (`hal.bfee_sts_cap`, four NDP
-  STS); the shared request narrows it to the AP's roles. MU beamformee
-  (bit20) is not advertised: Linux needs `rtw_bf_set_gid_table` over VHT
-  Group ID Management for MU, which is not ported.
+  beamformee (bit12) and MU beamformee (bit20) with Beamformee STS 3
+  (`hal.bfee_sts_cap`, four NDP STS); the shared request narrows them to the
+  AP's roles like `mlme.c::ieee80211_add_vht_ie` (both dropped without the
+  AP's SU beamformer bit11, MU dropped without its MU beamformer bit19), so
+  this single station is the `mu_mimo_owner` exactly when MU stays in the
+  request.
 - **Association** (`State::bf_assoc`, after the native peer commit like
   `rtw_ops_bss_info_changed` `BSS_CHANGED_ASSOC` -> `bf.c::rtw_bf_assoc`):
-  when the negotiated VHT `su_beamformee()` holds (local cap and AP SU
-  beamformer bit11), `Bfee::su` takes `sound_dim` from the AP's sounding
-  dimensions field, register index 0 and `nc_index` from the chip's RX paths
-  (C22 2R 1, C21 1R 0). `bf::phy_init` (`rtw_bf_phy_init`, which Linux runs
-  at chip init and the retained init does not) precedes `bf::enable_su`
-  (`rtw_bf_enable_bfee_su`: SND_PTCL_CTRL 0x9b under mask 0x9f, BFMER0
-  address, CSI report parameter coef 3 / codebook 1 / grouping 0 / nr / nc,
-  NDP standby 0x70; C22 `rtw8822c_bf_enable_bfee_su` also sets
-  `BIT_WMAC_USE_NDPARATE`, clears the AP-mode bit12 and writes `CSI_RRSR`
-  0x550). Every word is read back under the station admission.
-- **Cleanup** (`State::stop`, `rtw_bf_disassoc` -> `rtw_bf_remove_bfee_su`):
-  SND_PTCL_CTRL 0x98 and the BFMER0/CSI words cleared, best effort since the
-  owner is already closed; a fresh association reprograms.
+  MU is preferred. When the negotiated VHT `mu_beamformee()` holds,
+  `Bfee::mu` binds `bf::Role::Mu` with `p_aid = (bssid[5] << 1) |
+  (bssid[4] >> 7)` and `aid` the association ID (`& 0xfff`); otherwise, when
+  `su_beamformee()` holds, `Bfee::su` binds `Role::Su` with `sound_dim` from
+  the AP's sounding dimensions field, register index 0. `nc_index` follows
+  the chip's RX paths (C22 2R 1, C21 1R 0). `bf::phy_init`
+  (`rtw_bf_phy_init`, which Linux runs at chip init and the retained init
+  does not) precedes the enable. Every word is read back under the station
+  admission.
+  - SU (`bf::enable_su`, `rtw_bf_enable_bfee_su`): SND_PTCL_CTRL 0x9b under
+    mask 0x9f, BFMER0 address, CSI report parameter coef 3 / codebook 1 /
+    grouping 0 / nr / nc, NDP standby 0x70; C22
+    `rtw8822c_bf_enable_bfee_su` also sets `BIT_WMAC_USE_NDPARATE`, clears
+    the AP-mode bit12 and writes `CSI_RRSR` 0x550.
+  - MU (`bf::enable_mu`, `rtw_bf_enable_bfee_mu` on both chips):
+    `rtw_bf_init_bfer_entry_mu` (BFMER0 address, `p_aid` at 0x6ea, CSI
+    parameter coef 0 / codebook 1 / nr 1 / nc at 0x6f4, `MU_BF_CTL` 0x1680
+    keeping bits 15:14 with `my_aid` and `HAL_CSI_SEG_4K`);
+    `rtw_bf_cfg_sounding(DESC_RATE6M)` (SND_PTCL_CTRL 0x9b, NDP standby
+    0x26, RXFLTMAP1 bit4 and RXFLTMAP4 0x68a bit4 cleared,
+    `BIT_WMAC_USE_NDPARATE | csi_rsc << 13` with bit12 cleared;
+    `CSI_RSC_PRIMARY_20M_BW` on C22, `CSI_RSC_FOLLOW_RX_PACKET_BW` on C21);
+    RXFLTMAP0 `ACTIONNOACK` bit14 set; RXFLTMAP1 `BF` bits 4|5 set. Linux
+    rewrites RXFLTMAP1 from `hal.rxfltmap1`, the chip `mac_init` value
+    (C22 0xffff, C21 0x0fff); the retained C21 init is followed by the
+    source MAC table (0x6a2/0x6a3 0xff), so the register is 0xffff (which
+    `rx_ba::readback` requires) and the Linux C21 shadow is stale. The shadow
+    here is the retained register, so both chips end at
+    `shadow | BIT_RXFLTMAP1_BF` without narrowing the init's control
+    subtypes.
+- **Group ID** (`State::gid_management` in the RX loop, mac80211
+  `rx.c::ieee80211_rx_h_action` -> `vht.c::ieee80211_process_mu_groups` ->
+  `BSS_CHANGED_MU_GROUPS` -> `bf.c::rtw_bf_set_gid_table`): only while the
+  bound role is MU, a VHT Group ID Management action (category 21, action 1,
+  at least 50 bytes: 8-byte membership + 16-byte user position), unprotected
+  (VHT is non-robust), individually addressed to the station from the
+  associated AP (A2 = A3 = BSSID) is consumed; when membership or position
+  differ from the last programmed `MuGroup` (zero from association, like the
+  `mlme.c` reset), `bf::set_gid` runs `rtw_bf_cfg_mu_bfee`: `MU_TX_CTL`
+  0x14c0 table-valid bits cleared then bits 0|1 set and `BIT_EN_MU_MIMO`
+  clear; table select 0x14c1 (low 3 bits) 0 then 1, each with `GID_VLD`
+  0x14c4 and `USER_POS` 0x14c8/0x14cc from the little-endian membership /
+  position words. The control byte and the last-selected table 1 are read
+  back (Linux never reselects table 0). Outside the MU role the frame is not
+  consumed, as `rtw_bf_set_gid_table` returns for non-MU vifs.
+- **Cleanup** (`State::stop`, `rtw_bf_disassoc` -> `bf::remove`): SU
+  `rtw_bf_remove_bfee_su` (SND_PTCL_CTRL 0x98, BFMER0/CSI words cleared);
+  MU `rtw_bf_remove_bfee_mu` (SND_PTCL_CTRL 0x98, `rtw_bf_del_bfer_entry_mu`
+  clears BFMER0 0x6e4..0x6eb, `MU_BF_CTL` and `MU_TX_CTL` byte 0, then
+  `rtw_bf_del_sounding` mask 0x9f to 0 since no SU/MU count remains; the CSI
+  word, `BBPSF_CTRL` and RX filter maps keep their values as in Linux). Best
+  effort since the owner is already closed; the `MuGroup` resets and a fresh
+  association reprograms.
 
-Not covered: MU beamformee, SU/MU beamformer (station never sounds),
+Not covered: SU/MU beamformer (station never sounds),
 `rtw_dynamic_csi_rate` (watchdog `rtw_bf_cfg_csi_rate` needs the dm
 `min_rssi`, and the dm watchdog is not bound on 5GHz; the CSI rate stays at
-`rtw_bf_phy_init`'s OFDM6), HT/VHT20/40 associations. No physical sounding
-exchange has been run. Written, unexecuted:
-`smoke_rtw88_bf_phy_init_and_su_bfee_program`; the VHT capability check in
+`rtw_bf_phy_init`'s OFDM6), HT/VHT20/40 associations, Group ID Management
+received while the runtime-PS LPS collector owns RX (`lps_collect` does not
+parse it; the next awake poll processes later notifications). Linux
+`rtw_bf_assoc` reads the unnarrowed band capability, so for an AP with bit19
+but not bit11 (invalid per 802.11) it would bind MU without having
+advertised it; here MU binds only when advertised. No physical sounding or
+MU-MIMO exchange has been run. Written, unexecuted:
+`smoke_rtw88_bf_phy_init_and_su_bfee_program`,
+`smoke_rtw88_bf_mu_bfee_enable_and_remove`,
+`smoke_rtw88_bf_vht_group_id_management_table`; the VHT capability check in
 `smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback` now expects
-SU beamformee with STS field 3.
+SU and MU beamformee with STS field 3.
 
 ## 4. Invariants
 
@@ -3110,7 +3159,7 @@ changes. None is a physical blocker unless stated.
 | Row | Blocker |
 |---|---|
 | `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13, per-channel continuation records over the channel-scoped base (`scope_request`), Linux-level C22 IQK completion, and associated CSA/ECSA following mac80211 software CSA (base profile in place; bound continuations disconnect). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
-| `beamforming` | SU beamformee source-complete on N2xV VHT80 associations (see "VHT SU beamformee"): advertisement, `rtw_bf_assoc`/`rtw_bf_phy_init`/`rtw_bf_enable_bfee_su` with readback, disassoc cleanup. MU beamformee (GID table) and dynamic CSI rate not ported. One case written, unexecuted; physical acceptance pending. |
+| `beamforming` | SU and MU beamformee source-complete on N2xV VHT80 associations (see "VHT SU and MU beamformee"): SU+MU advertisement, MU-preferred `rtw_bf_assoc`, `rtw_bf_phy_init`/`rtw_bf_enable_bfee_su`/`rtw_bf_enable_bfee_mu` with readback, VHT Group ID Management -> `rtw_bf_set_gid_table` while the role is MU, role-matched disassoc cleanup. Dynamic CSI rate (needs dm `min_rssi`, absent on 5GHz) and beamformer roles not ported. Three cases written, unexecuted; physical acceptance pending. |
 | `dpk_tracking` | Source-complete for C22 under N22D bit 7 (`dpk.rs`, §3 dm section): `rtw8822c_do_dpk` + `rtw8822c_dpk_track`. Five register-model cases are written, unexecuted; GAPK, a real signed N22D DPK measurement and physical acceptance remain external. |
 | `five_ghz_operation` | 2.4GHz noninitial retune now exists (N2xO), but 5GHz needs the `rtw8822c_set_channel_bb`/`_rf` 5GHz branches, 5GHz AGC/RF table selection (`rtw_phy_setup_phy_cond` band conditions), 5GHz efuse power groups and a measured 5GHz envelope; `scan.rs` admits 2.4GHz only. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |

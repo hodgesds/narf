@@ -195,8 +195,11 @@ pub(super) struct State {
     /// Hardware runs the N2xB 40MHz pair or the N2xV 80MHz block
     /// (`ht40::program` / `vht::program` committed).
     wide: bool,
-    /// Bound SU beamformee entry (`bf.c::rtw_bf_assoc`), N2xV only.
+    /// Bound SU or MU beamformee entry (`bf.c::rtw_bf_assoc`), N2xV only.
     bfee: Option<super::bf::Bfee>,
+    /// `bss_conf.mu_group` last programmed by `rtw_bf_set_gid_table`;
+    /// zero from association (`mlme.c` resets it on disassociation).
+    mu_group: super::bf::MuGroup,
     /// cfg80211 `beacon_found` for passive-only (RADAR / NO_IR) primaries
     /// (shared `narf_wireless::reg::witness`): admits association / CSA
     /// onto a passive-only primary only after a Beacon heard in its latest
@@ -311,6 +314,7 @@ impl State {
             vht: None,
             wide: false,
             bfee: None,
+            mu_group: super::bf::MuGroup::default(),
             switch: None,
             switch_wait_beacon: false,
             witness: BeaconWitness::new(),
@@ -632,9 +636,10 @@ impl State {
         self.vht = None;
         // `rtw_bf_disassoc`: best effort, the owner is already closed and a
         // fresh association reprograms the entry.
-        if self.bfee.take().is_some() {
-            let _ = super::bf::remove_su(io);
+        if let Some(b) = self.bfee.take() {
+            let _ = super::bf::remove(io, b);
         }
+        self.mu_group = super::bf::MuGroup::default();
         self.witness.clear();
         self.witness_scan = None;
         let _ = io.station_passive_tx(None);
@@ -905,6 +910,9 @@ impl State {
                 }
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
+                }
+                if self.gid_management(io, frame.bytes())? {
+                    continue;
                 }
                 if self.receive_open() && self.tx_ba_grant.is_some() {
                     let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
@@ -2348,9 +2356,14 @@ impl State {
             self.environment.pause().await;
         }
     }
-    /// `mac80211.c` `BSS_CHANGED_ASSOC` -> `bf.c::rtw_bf_assoc`: SU
-    /// beamformee only on the bound N2xV association when both the local
-    /// advertisement and the AP's SU beamformer bit agree.
+    /// `mac80211.c` `BSS_CHANGED_ASSOC` -> `bf.c::rtw_bf_assoc` on the bound
+    /// N2xV association: MU beamformee when the local MU advertisement and
+    /// the AP's MU beamformer bit agree (`bfer_mu_max_num` 1, this single
+    /// station), else SU when the AP is an SU beamformer. The shared
+    /// negotiation only keeps MU beamformee alongside SU beamformee (the
+    /// association request drops both without the AP's SU beamformer bit,
+    /// `mlme.c::ieee80211_add_vht_ie`), so MU is bound exactly when it was
+    /// advertised (`mu_mimo_owner`).
     fn bf_assoc(&mut self, io: &mut impl Io, bssid: [u8; 6]) -> Result<(), Error> {
         if self.vht.is_none() || self.bfee.is_some() {
             return Ok(());
@@ -2365,19 +2378,48 @@ impl State {
             return Ok(());
         };
         let did = io.station_gate()?.did();
-        let Some(b) = vht
-            .peer_sounding_dimensions()
-            .and_then(|s| super::bf::Bfee::su(did, bssid, s))
-        else {
+        let b = if vht.mu_beamformee() {
+            self.associated_aid
+                .and_then(|aid| super::bf::Bfee::mu(did, bssid, aid))
+        } else {
+            vht.peer_sounding_dimensions()
+                .and_then(|s| super::bf::Bfee::su(did, bssid, s))
+        };
+        let Some(b) = b else {
             return Ok(());
         };
         self.admission.run(|| {
             io.station_allowed()?;
             super::bf::phy_init(io)?;
-            super::bf::enable_su(io, did, b)
+            if b.is_mu() {
+                super::bf::enable_mu(io, did, b)
+            } else {
+                super::bf::enable_su(io, did, b)
+            }
         })?;
+        self.mu_group = super::bf::MuGroup::default();
         self.bfee = Some(b);
         Ok(())
+    }
+    /// `vht.c::ieee80211_process_mu_groups` -> `BSS_CHANGED_MU_GROUPS` ->
+    /// `rtw_bf_set_gid_table`: a VHT Group ID Management frame from the AP
+    /// reprograms the MU STA tables only while the bound role is MU, and only
+    /// when membership or position changed. `true` when the frame was one.
+    fn gid_management(&mut self, io: &mut impl Io, bytes: &[u8]) -> Result<bool, Error> {
+        let (Some(b), Some(ap)) = (self.bfee, self.peer.as_ref().map(|p| p.bss.bssid)) else {
+            return Ok(false);
+        };
+        if !b.is_mu() {
+            return Ok(false);
+        }
+        let Some(g) = super::bf::gid_management(bytes, self.own, ap) else {
+            return Ok(false);
+        };
+        if g != self.mu_group {
+            super::bf::set_gid(io, &g)?;
+            self.mu_group = g;
+        }
+        Ok(true)
     }
     pub(super) fn send(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         let admission = self.admission.clone();
