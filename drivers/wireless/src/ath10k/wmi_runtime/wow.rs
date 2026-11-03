@@ -424,7 +424,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.station_link().is_none() {
             return Err(Error::Failed);
         }
-        let vdev = u32::from(self.peer.as_ref().ok_or(Error::Failed)?.vdev);
+        let vdev = u32::from(self.station.peer.as_ref().ok_or(Error::Failed)?.vdev);
         // All commands are encoded before the first publication.
         let mut commands = Vec::new();
         let count = (EVENT_MAX + PATTERNS) as usize + program.patterns.len() + EVENT_MAX as usize;

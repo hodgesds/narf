@@ -111,14 +111,42 @@ pub struct ScanReady {
     pub mac: [u8; 6],
     pub channels: u8,
 }
+/// One station owner (Linux `struct ath10k_vif` station state for one
+/// `arvif->vdev_id`): its BSS peer, data path, power save, protection,
+/// 20/40 coexistence and PMF offload. `Radio` keeps the home slot on the
+/// managed vdev; a P2P client role owns a second slot on its own vdev.
+#[derive(Debug)]
+pub(super) struct StationSlot {
+    peer: Option<station::Peer>,
+    data: Option<data::State>,
+    /// The current PEER_ASSOC carried `peer_flags->pmf`: firmware decrypts
+    /// this peer's robust management (`hw_keys::management_offload`).
+    peer_pmf_offload: bool,
+    power_save: Option<bool>,
+    protection: Option<StationProtection>,
+    coexistence: Option<alloc::boxed::Box<coexistence::State>>,
+}
+impl StationSlot {
+    const fn new() -> Self {
+        Self {
+            peer: None,
+            data: None,
+            peer_pmf_offload: false,
+            power_save: None,
+            protection: None,
+            coexistence: None,
+        }
+    }
+}
 #[derive(Debug)]
 pub(super) struct Radio<T> {
     scan_cache: Vec<ScanBss>,
     beacon_hints: beacon_hints::Owner,
     hint_scan: Option<beacon_hints::Scan>,
     management_done: VecDeque<ManagementCompletion>,
-    peer: Option<station::Peer>,
-    data: Option<data::State>,
+    /// The managed netdev's station owner on `primary` (Linux's home
+    /// `arvif`); the P2P client slot is a second, independent owner.
+    station: StationSlot,
     ap: Option<alloc::boxed::Box<ap::Session>>,
     ap_staging: Option<alloc::boxed::Box<ap::Staging>>,
     ap_history: Option<alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<ap_key::History>>>,
@@ -142,9 +170,6 @@ pub(super) struct Radio<T> {
     /// Linux `cryptmode=0` beside the RAW decap: station PTK/GTK go to the
     /// firmware key cache (`hw_keys`), software CCMP stays the fallback.
     hardware_keys: bool,
-    /// The current PEER_ASSOC carried `peer_flags->pmf`: firmware decrypts
-    /// this peer's robust management (`hw_keys::management_offload`).
-    peer_pmf_offload: bool,
     pub ready: Option<ScanReady>,
     channels: Vec<u16>,
     sequence: u16,
@@ -157,15 +182,12 @@ pub(super) struct Radio<T> {
     roc: Option<alloc::boxed::Box<offchannel::Work>>,
     pending: VecDeque<htt::Event>,
     failed: bool,
-    power_save: Option<bool>,
     /// WOW_ENABLE was acknowledged; only `wow::wow_resume` may follow.
     wow_armed: bool,
-    protection: Option<StationProtection>,
     chains: Option<chains::Chains>,
     management_subscriptions: Option<alloc::sync::Arc<offchannel::Subscriptions>>,
     management_received: VecDeque<offchannel::Captured>,
     management_completed: Option<offchannel::Completed>,
-    coexistence: Option<alloc::boxed::Box<coexistence::State>>,
     coexistence_epoch: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
@@ -180,6 +202,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub fn new(htt: htt::Runtime<T>, dialect: Dialect, features: u64) -> Self {
         Self {
+            station: StationSlot::new(),
             ap: None,
             ap_staging: None,
             ap_history: None,
@@ -193,14 +216,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             p2p_device_mac: [0; 6],
             features,
             hardware_keys: false,
-            peer_pmf_offload: false,
             ready: None,
             scan_cache: Vec::new(),
             beacon_hints: beacon_hints::Owner::new(),
             hint_scan: None,
             management_done: VecDeque::new(),
-            peer: None,
-            data: None,
             channels: Vec::new(),
             sequence: 0,
             scan_pending: None,
@@ -209,14 +229,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             roc: None,
             pending: VecDeque::new(),
             failed: false,
-            power_save: None,
             wow_armed: false,
-            protection: None,
             chains: None,
             management_subscriptions: None,
             management_received: VecDeque::new(),
             management_completed: None,
-            coexistence: None,
             coexistence_epoch: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -356,7 +373,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         restore: Option<&[u8]>,
         validate: impl Fn() -> Result<(), Error>,
     ) -> Result<ScanReport, Error> {
-        if self.failed || self.ready.is_none() || self.peer.is_some() || self.scan_pending.is_some()
+        if self.failed
+            || self.ready.is_none()
+            || self.station.peer.is_some()
+            || self.scan_pending.is_some()
         {
             return Err(Error::Failed);
         }

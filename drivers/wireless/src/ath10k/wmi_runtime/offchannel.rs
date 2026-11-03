@@ -93,7 +93,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         receive_permission(domain, &[receipt.frequency])?;
-        if self.data.as_ref().is_some_and(|data| !data.roc_quiescent()) {
+        if self
+            .station
+            .data
+            .as_ref()
+            .is_some_and(|data| !data.roc_quiescent())
+        {
             return Err(Error::Unsupported);
         }
         let binding = self.scan_binding()?;
@@ -181,7 +186,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             // strictly passive. An action request supplies separate authority.
             plan.ssids.clear();
             plan
-        } else if self.peer.is_some() {
+        } else if self.station.peer.is_some() {
             self.prepare_associated_passive_scan(&[receipt.frequency], &domain)?
         } else {
             let restore = self.scan_restore(None)?;
@@ -220,7 +225,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 |epoch| epoch.checked_add(1),
             )
             .map_err(|_| Error::Exhausted)?;
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.retire_roc_receive();
         }
         self.close_roc_capture()?;
@@ -499,7 +504,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !still_healthy {
             self.scan_pending = None;
             self.roc = None;
-            if self.peer.is_some() {
+            if self.station.peer.is_some() {
                 self.disconnect_after_failed_scan().await?;
             }
             return Ok(None);

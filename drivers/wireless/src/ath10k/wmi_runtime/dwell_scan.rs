@@ -59,10 +59,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Peer is removed only after the exact DELETE/UNMAP/VDEV_STOPPED chain.
     /// Retained packet state distinguishes that receipt from an unused radio.
     pub(in crate::ath10k) fn station_retired(&self) -> bool {
-        self.failed && self.peer.is_none() && self.data.is_some()
+        self.failed && self.station.peer.is_none() && self.station.data.is_some()
     }
     pub(in crate::ath10k) fn failed_station_pending(&self) -> bool {
-        self.failed && self.peer.is_some()
+        self.failed && self.station.peer.is_some()
     }
 
     pub(in crate::ath10k) fn prepare_associated_passive_scan(

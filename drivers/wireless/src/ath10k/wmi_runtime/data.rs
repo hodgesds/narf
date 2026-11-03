@@ -324,8 +324,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// CCMP-protected with the PTK before the keys are retired.
     pub(super) fn pmf_deauthentication(&mut self) -> Result<Option<Vec<u8>>, Error> {
         let own = self.ready.ok_or(Error::Failed)?.mac;
-        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         let Some(security) = self
+            .station
             .data
             .as_mut()
             .filter(|d| !d.failed)
@@ -339,7 +340,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         frame.extend_from_slice(&own);
         frame.extend_from_slice(&bssid);
         frame.extend_from_slice(&[0, 0, 3, 0]);
-        protect_management(security, &frame, self.peer_pmf_offload).map(Some)
+        protect_management(security, &frame, self.station.peer_pmf_offload).map(Some)
     }
     /// Program committed keys one at a time (Linux mac.c
     /// `ath10k_install_key` under `conf_mutex`): `WMI_VDEV_INSTALL_KEY`, then
@@ -348,12 +349,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// mac80211 keeps a key in software when `drv_set_key` fails.
     async fn send_station_keys(&mut self) -> Result<bool, Error> {
         let (vdev, bssid) = self
+            .station
             .peer
             .as_ref()
             .map(|p| (p.vdev, p.bssid))
             .ok_or(Error::Failed)?;
         let dialect = self.wire.dialect;
-        let Some(data) = self.data.as_mut() else {
+        let Some(data) = self.station.data.as_mut() else {
             return Ok(false);
         };
         if let Some(flight) = data.key_in_flight {
@@ -386,11 +388,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Publish a queued protected SA Query Response on the native
     /// management path (the synchronous receive drain cannot await WMI).
     async fn send_station_management(&mut self) -> Result<bool, Error> {
-        let Some(frame) = self.data.as_mut().and_then(|d| d.management.take()) else {
+        let Some(frame) = self.station.data.as_mut().and_then(|d| d.management.take()) else {
             return Ok(false);
         };
         let own = self.ready.ok_or(Error::Failed)?.mac;
-        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         super::management::validate(&frame, own, bssid)?;
         self.send_management_frame(&frame).await?;
         Ok(true)
@@ -401,13 +403,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<bool, Error> {
-        let Some(update) = self.data.as_mut().and_then(|d| d.wmm_update.take()) else {
+        let Some(update) = self.station.data.as_mut().and_then(|d| d.wmm_update.take()) else {
             return Ok(false);
         };
         let command = super::wmm::command(self.wire.dialect, update)?;
         self.send_station_command(&command, validate).await?;
-        self.peer.as_mut().ok_or(Error::Failed)?.wmm = Some(update);
-        self.data.as_mut().ok_or(Error::Failed)?.acm = tx_qos::admission(&update);
+        self.station.peer.as_mut().ok_or(Error::Failed)?.wmm = Some(update);
+        self.station.data.as_mut().ok_or(Error::Failed)?.acm = tx_qos::admission(&update);
         Ok(true)
     }
     /// The Device service worker's await point for queued robust
@@ -424,7 +426,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let coexistence = self.service_coexistence(domain).await?;
         if self.failed
             || self.station_link().is_none()
-            || self.data.as_ref().is_none_or(|d| {
+            || self.station.data.as_ref().is_none_or(|d| {
                 d.management.is_none() && d.wmm_update.is_none() && d.protection_update.is_none()
             })
         {
@@ -435,18 +437,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // and set use_cts_prot, keeping the configured RTS threshold. It waits
         // for an open, reply-free data path rather than failing the owner.
         if let Some(cts_protection) = self
+            .station
             .data
             .as_ref()
             .filter(|d| d.protection_allowed())
             .and_then(|d| d.protection_update)
         {
             let request = super::protection::Request {
-                rts_threshold: self.protection.and_then(|r| r.rts_threshold),
+                rts_threshold: self.station.protection.and_then(|r| r.rts_threshold),
                 cts_protection,
             };
             self.set_station_protection(request, || Ok(domain.clone()))
                 .await?;
-            if let Some(data) = self.data.as_mut() {
+            if let Some(data) = self.station.data.as_mut() {
                 data.protection_update = None;
             }
         }
@@ -457,17 +460,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Ok(coexistence || sent || wmm)
     }
     pub fn has_station_data(&self) -> bool {
-        self.data.is_some()
+        self.station.data.is_some()
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::ath10k) fn expire_data_for_test(&mut self) {
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.last_peer = narf_time::Deadline::after_ms(0);
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::ath10k) fn receive_time_for_test(&mut self, now: u64) {
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.receive_time = Some(now);
         }
     }
@@ -476,7 +479,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &self,
         tid: u8,
     ) -> Option<(u16, u8, usize, Option<u16>)> {
-        self.data.as_ref()?.rx_ba.state(tid)
+        self.station.data.as_ref()?.rx_ba.state(tid)
     }
     /// Native WiFi has no software-crypto data path (core.c: `cryptmode=1`
     /// requires RAW), so it needs the hardware-key profile.
@@ -494,7 +497,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !self.data_supported() {
             return Err(Error::Unsupported);
         }
-        if self.failed || self.peer.is_some() || self.data.is_some() {
+        if self.failed || self.station.peer.is_some() || self.station.data.is_some() {
             return Err(Error::Failed);
         }
         Ok(self.ready.ok_or(Error::Failed)?.mac)
@@ -502,14 +505,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn fail_station_data(&mut self) {
         self.beacon_hints.retire();
         self.failed = true;
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.fail();
         }
     }
     /// Host closure retires receive ownership without failing a still-owned
     /// native TX operation or preventing the subsequent DOWN/DELETE sequence.
     pub(in crate::ath10k) fn retire_station_receive(&mut self) {
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.incoming.clear();
             data.received.clear();
             data.rx_ba.clear();
@@ -519,7 +522,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.coexistence_blocked() {
             return None;
         }
-        if !self.data.as_ref()?.open() {
+        if !self.station.data.as_ref()?.open() {
             return None;
         }
         let associated = self.associated_station()?;
@@ -531,27 +534,31 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     /// Native HTT data/reply IDs awaiting their terminal TX indication.
     pub fn tx_in_flight(&self) -> usize {
-        self.data.as_ref().map_or(0, |d| d.pending.len())
+        self.station.data.as_ref().map_or(0, |d| d.pending.len())
     }
     /// Terminal HTT TX outcomes for one TID (16 = non-QoS).
     pub fn tx_counters(&self, tid: u8) -> TidCounters {
-        self.data
+        self.station
+            .data
             .as_ref()
             .map_or(TidCounters::default(), |d| d.pending.counters(tid))
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::ath10k) fn tx_in_flight_ids(&self) -> Vec<u16> {
-        self.data.as_ref().map_or(Vec::new(), |d| d.pending.ids())
+        self.station
+            .data
+            .as_ref()
+            .map_or(Vec::new(), |d| d.pending.ids())
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::ath10k) fn expire_pending_tx_for_test(&mut self) {
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.pending.expire_for_test();
         }
     }
     pub(in crate::ath10k) fn data_permission(&self) -> Option<Permission> {
         self.station_link()?;
-        Some(self.peer.as_ref()?.permission.clone())
+        Some(self.station.peer.as_ref()?.permission.clone())
     }
     pub(in crate::ath10k) fn check_data_policy(
         &self,
@@ -568,7 +575,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .check_current()
             .map_err(crate::ath10k::control::Error::from)
             .map_err(htt::Error::from)?;
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         peer.permission.check(domain)
     }
     /// Start the packet owner only after native association. Software CCMP is
@@ -605,11 +612,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<Link, Error> {
         validate()?;
         let associated = self.associated_station().ok_or(Error::Failed)?;
-        if self.data.is_some() || !self.data_supported() {
+        if self.station.data.is_some() || !self.data_supported() {
             return Err(Error::Unsupported);
         }
         let native_wifi = !self.htt.wmi.raw_mode();
-        let rsn = self.peer.as_ref().and_then(|p| p.rsn.as_deref());
+        let rsn = self.station.peer.as_ref().and_then(|p| p.rsn.as_deref());
         let sae = rsn.is_some_and(|r| r.sae_pmk.is_some());
         // SAE derives its own PMK; a caller PMK is then refused.
         if associated.protected != (pmk.is_some() || sae) || sae && pmk.is_some() {
@@ -617,6 +624,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         self.check_data_policy(domain)?;
         if self
+            .station
             .peer
             .as_ref()
             .and_then(|p| p.ht)
@@ -638,6 +646,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             // The station RSNE/RSNXE are the association's own (plan
             // `rsn_body`, SAE `station_rsnxe`): WPA2, WPA2-PMF or SAE.
             let rsn = self
+                .station
                 .peer
                 .as_ref()
                 .and_then(|p| p.rsn.as_deref())
@@ -678,7 +687,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // An AP may send M1 before PEER_ASSOC/UP's receive drain ends. Retain
         // only exact descriptor-bound, unprotected unicast EAPOL for the new
         // supplicant. Association-era IP can never become authorized later.
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         let mut rx_ba = rx_ba::Owner::new(peer.ht)?;
         let addresses = Addresses {
             own,
@@ -738,7 +747,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         while self.htt.take_tx_receipt().is_some() {}
-        self.data = Some(State {
+        self.station.data = Some(State {
             security,
             pending: Pipeline::new()?,
             incoming,
@@ -747,8 +756,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             receive_time: None,
             received: VecDeque::new(),
             sequence: [2; 8],
-            qos: self.peer.as_ref().ok_or(Error::Failed)?.wmm.is_some(),
+            qos: self
+                .station
+                .peer
+                .as_ref()
+                .ok_or(Error::Failed)?
+                .wmm
+                .is_some(),
             acm: self
+                .station
                 .peer
                 .as_ref()
                 .ok_or(Error::Failed)?
@@ -773,7 +789,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let idle = self.data_step(&mut nonce, validate).await?;
-            if idle && self.data.as_ref().is_some_and(State::open) {
+            if idle && self.station.data.as_ref().is_some_and(State::open) {
                 self.failed = false;
                 return self.station_link().ok_or(Error::Failed);
             }
@@ -806,7 +822,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let link = self.station_link().ok_or(Error::Failed)?;
         self.check_data_policy(domain)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
-        let data = self.data.as_mut().ok_or(Error::Failed)?;
+        let data = self.station.data.as_mut().ok_or(Error::Failed)?;
         if !data.pending.data_admissible() || data.security.as_ref().is_some_and(|s| !s.port_open())
         {
             return Err(Error::Htt(htt::Error::Busy));
@@ -904,13 +920,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let (frame, parameters) = self.ethernet_frame(domain, bytes)?;
         self.failed = true;
         let id = self.htt.begin_transmit(parameters, &frame)?;
-        self.data.as_mut().ok_or(Error::Failed)?.pending.push(
-            id,
-            Role::Data {
-                tid: parameters.tid,
-            },
-            frame.len(),
-        )?;
+        self.station
+            .data
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .pending
+            .push(
+                id,
+                Role::Data {
+                    tid: parameters.tid,
+                },
+                frame.len(),
+            )?;
         self.failed = false;
         Ok(id)
     }
@@ -918,7 +939,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        if self.failed || self.associated_station().is_none() || self.data.is_none() {
+        if self.failed || self.associated_station().is_none() || self.station.data.is_none() {
             return Err(Error::Failed);
         }
         self.check_data_policy(domain)?;
@@ -938,10 +959,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         && self.management_received.is_empty()
                         && self.management_completed.is_none()
                         && self
+                            .station
                             .coexistence
                             .as_ref()
                             .is_none_or(|state| !state.blocked())
-                        && self.data.as_ref().is_some_and(State::host_idle);
+                        && self.station.data.as_ref().is_some_and(State::host_idle);
                     self.htt.wmi.htc.transport.runtime_idle(eligible);
                     let event = self.htt.poll_now()?;
                     if self.htt.take_idle_deferred() {
@@ -963,17 +985,24 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 if self.htt.source_ready()? {
                     let parameters = self.reply_parameters(&reply)?;
                     let id = self.htt.begin_transmit(parameters, &reply)?;
-                    self.data.as_mut().ok_or(Error::Failed)?.pending.push(
-                        id,
-                        Role::Reply,
-                        reply.len(),
-                    )?;
+                    self.station
+                        .data
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .pending
+                        .push(id, Role::Reply, reply.len())?;
                 }
             }
             self.service_station_pfc()?;
             if idle {
-                let data = self.data.as_mut().ok_or(Error::Failed)?;
-                if !data.open() || self.coexistence.as_ref().is_some_and(|s| s.blocked()) {
+                let data = self.station.data.as_mut().ok_or(Error::Failed)?;
+                if !data.open()
+                    || self
+                        .station
+                        .coexistence
+                        .as_ref()
+                        .is_some_and(|s| s.blocked())
+                {
                     data.received.clear();
                 }
                 let frames = data.received.drain(..).collect();
@@ -1003,7 +1032,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 tid: parameters.tid,
             }
         };
-        self.data
+        self.station
+            .data
             .as_mut()
             .ok_or(Error::Failed)?
             .pending
@@ -1015,7 +1045,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// `pending_frame_device`, firmware-encrypted exactly when Protected
     /// (`ath10k_tx_h_use_hwcrypto`).
     fn reply_parameters(&self, reply: &[u8]) -> Result<htt::tx::Parameters, Error> {
-        let native_wifi = self.data.as_ref().ok_or(Error::Failed)?.native_wifi;
+        let native_wifi = self.station.data.as_ref().ok_or(Error::Failed)?.native_wifi;
         Ok(htt::tx::Parameters {
             kind: if native_wifi {
                 htt::tx::Kind::Native
@@ -1033,7 +1063,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        if self.failed || self.associated_station().is_none() || self.data.is_none() {
+        if self.failed || self.associated_station().is_none() || self.station.data.is_none() {
             return Err(Error::Failed);
         }
         self.check_data_policy(domain)?;
@@ -1051,7 +1081,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 )
                 .await?;
             if idle {
-                let data = self.data.as_mut().ok_or(Error::Failed)?;
+                let data = self.station.data.as_mut().ok_or(Error::Failed)?;
                 if !data.open() {
                     data.received.clear();
                 }
@@ -1091,7 +1121,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Ok(());
         }
         self.data_check()?;
-        let data = self.data.as_ref().ok_or(Error::Failed)?;
+        let data = self.station.data.as_ref().ok_or(Error::Failed)?;
         if data.failed {
             return Err(Error::Failed);
         }
@@ -1101,27 +1131,47 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !data.open() && !data.pending.reply_in_flight() {
             return Ok(());
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         self.htt.service_pfc(peer.bssid, peer.pfc_ids())?;
         Ok(())
     }
     fn data_check(&mut self) -> Result<(), Error> {
-        if self.peer.as_ref().and_then(|p| p.associated).is_none()
-            || self.peer.as_ref().and_then(station::Peer::mapped).is_none()
+        if self
+            .station
+            .peer
+            .as_ref()
+            .and_then(|p| p.associated)
+            .is_none()
+            || self
+                .station
+                .peer
+                .as_ref()
+                .and_then(station::Peer::mapped)
+                .is_none()
         {
-            if let Some(data) = &mut self.data {
+            if let Some(data) = &mut self.station.data {
                 data.fail();
             }
             return Err(Error::Failed);
         }
-        if self.data.as_ref().is_some_and(|d| d.pending.expired()) {
-            if let Some(data) = &mut self.data {
+        if self
+            .station
+            .data
+            .as_ref()
+            .is_some_and(|d| d.pending.expired())
+        {
+            if let Some(data) = &mut self.station.data {
                 data.fail();
             }
             return Err(Error::Timeout);
         }
-        if self.data.as_ref().is_some_and(|d| d.last_peer.expired()) {
-            if let Some(data) = &mut self.data {
+        if self
+            .station
+            .data
+            .as_ref()
+            .is_some_and(|d| d.last_peer.expired())
+        {
+            if let Some(data) = &mut self.station.data {
                 data.fail();
             }
             return Err(Error::Timeout);
@@ -1140,7 +1190,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         .map_err(|_| Error::Failed)
         .and_then(core::convert::identity);
         if result.is_err() {
-            if let Some(data) = &mut self.data {
+            if let Some(data) = &mut self.station.data {
                 data.fail();
             }
         }
@@ -1153,22 +1203,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<(bool, Option<Vec<u8>>), Error> {
         let idle = matches!(event, htt::Event::Idle);
         if self
+            .station
             .peer
             .as_ref()
             .is_none_or(|peer| peer.associated.is_none() || peer.mapped().is_none())
         {
-            if let Some(data) = &mut self.data {
+            if let Some(data) = &mut self.station.data {
                 data.fail();
             }
             return Err(Error::Failed);
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         if peer.associated.is_none() || peer.mapped().is_none() {
             return Err(Error::Failed);
         }
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let bssid = peer.bssid;
-        let data = self.data.as_mut().ok_or(Error::Failed)?;
+        let data = self.station.data.as_mut().ok_or(Error::Failed)?;
         let addresses = Addresses { own, bssid };
         let now = data.now();
         data.rx_ba.retain(|id| peer.owns(id));
@@ -1226,7 +1277,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             .iter()
                             .any(|b| b.bssid == bssid && b.ssid == beacon.ssid)
                     {
-                        if !self.coexistence.as_ref().is_some_and(|s| s.blocked())
+                        if !self
+                            .station
+                            .coexistence
+                            .as_ref()
+                            .is_some_and(|s| s.blocked())
                             && peer
                                 .ht
                                 .is_some_and(|h| !h.matches_beacon(&beacon.information_elements))
@@ -1240,7 +1295,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         if peer.permission.frequency < 3000 {
                             let erp = element(&beacon.information_elements, 42)?;
                             let wanted = erp.and_then(|b| b.first()).is_some_and(|v| v & 2 != 0);
-                            let programmed = self.protection.is_some_and(|r| r.cts_protection);
+                            let programmed =
+                                self.station.protection.is_some_and(|r| r.cts_protection);
                             data.protection_update = (wanted != programmed).then_some(wanted);
                         }
                         // mac80211 ieee80211_sta_wmm_params: a changed
@@ -1269,7 +1325,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         // and the MIC, which mac80211 trims before its PN
                         // check. Before that PTK is confirmed (or without
                         // the flag) the host keeps full software CCMP.
-                        let offloaded = self.peer_pmf_offload
+                        let offloaded = self.station.peer_pmf_offload
                             && security.pairwise_offloaded()
                             && f[1] & 0x40 != 0
                             && f[4] & 1 == 0
@@ -1291,7 +1347,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                                     data.management = Some(protect_management(
                                         security,
                                         &response,
-                                        self.peer_pmf_offload,
+                                        self.station.peer_pmf_offload,
                                     )?);
                                 }
                             }
@@ -1668,16 +1724,21 @@ fn bar(frame: &[u8], addresses: Addresses) -> Option<(u8, u16)> {
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(super) fn coexistence_ready(&self) -> bool {
-        self.data.as_ref().is_some_and(State::protection_allowed) && !self.scan_in_progress()
+        self.station
+            .data
+            .as_ref()
+            .is_some_and(State::protection_allowed)
+            && !self.scan_in_progress()
     }
     pub(super) fn coexistence_receipt(&mut self, receipt: htt::TxReceipt) -> Result<(), Error> {
-        self.data
+        self.station
+            .data
             .as_mut()
             .ok_or(Error::Failed)?
             .protection_receipt(receipt)
     }
     pub(super) fn narrow_coexistence_receive(&mut self, primary: u16) -> Result<(), Error> {
-        let data = self.data.as_mut().ok_or(Error::Failed)?;
+        let data = self.station.data.as_mut().ok_or(Error::Failed)?;
         if !data.protection_allowed() {
             return Err(Error::Failed);
         }
@@ -1687,7 +1748,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         data.rx_ba.narrow_coexistence(primary)
     }
     pub(super) fn discard_coexistence_receive(&mut self) -> Result<(), Error> {
-        let data = self.data.as_mut().ok_or(Error::Failed)?;
+        let data = self.station.data.as_mut().ok_or(Error::Failed)?;
         if !data.protection_allowed() {
             return Err(Error::Failed);
         }

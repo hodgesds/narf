@@ -221,6 +221,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let path = management::path(self.wire.dialect, self.features, caps)?;
         let existing = vdev == self.primary.id()
             && self
+                .station
                 .peer
                 .as_ref()
                 .is_some_and(|p| p.bssid == destination && p.mapped().is_some());
@@ -410,7 +411,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
                 return Ok(false);
             }
-            if self.peer.as_ref().is_some_and(|p| p.owns(id)) || a.delete_sent {
+            if self.station.peer.as_ref().is_some_and(|p| p.owns(id)) || a.delete_sent {
                 return Err(Error::Malformed);
             }
             *word |= bit;

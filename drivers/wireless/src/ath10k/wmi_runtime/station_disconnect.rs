@@ -37,7 +37,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .wire
             .sync_delete_required(self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?);
         // `mac.c::ath10k_bss_disassoc`/`ath10k_vdev_stop` on the peer's vdev.
-        let vdev = self.peer.as_ref().ok_or(Error::Failed)?.vdev;
+        let vdev = self.station.peer.as_ref().ok_or(Error::Failed)?.vdev;
         let down = self.wire.down_station(vdev)?;
         let delete = self.wire.delete_peer(vdev, prepared.bssid)?;
         let stop = self.wire.stop_station(vdev)?;
@@ -50,10 +50,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // This happens before any await, including receive quiescence. A
         // cancelled waiter can never restore association or replay DELETE.
         self.failed = true;
-        if let Some(data) = &mut self.data {
+        if let Some(data) = &mut self.station.data {
             data.fail();
         }
-        self.peer.as_mut().ok_or(Error::Failed)?.associated = None;
+        self.station.peer.as_mut().ok_or(Error::Failed)?.associated = None;
         if let Some(frame) = deauthentication {
             // Best effort, as mac80211 proceeds with teardown regardless; the
             // frame is already encrypted, so no key outlives `fail()`.
@@ -81,7 +81,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .await
             .map_err(htt::Error::from)?;
         self.wait_vdev_stopped(vdev, prepared.bssid).await?;
-        self.peer = None;
+        self.station.peer = None;
         // Keep failed/closed set even after success: neither peer retirement
         // nor vdev STOP is the whole-device reset/DMA reclamation proof.
         Ok(Disconnected {
@@ -99,7 +99,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let event = self.station_progress().await?;
-            if self.peer.as_ref().and_then(Peer::mapped).is_none() {
+            if self.station.peer.as_ref().and_then(Peer::mapped).is_none() {
                 return Err(Error::Failed);
             }
             match event {
@@ -134,7 +134,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = self.station_progress().await?;
             match event {
                 htt::Event::Idle
-                    if acknowledged && self.peer.as_ref().and_then(Peer::mapped).is_none() =>
+                    if acknowledged
+                        && self.station.peer.as_ref().and_then(Peer::mapped).is_none() =>
                 {
                     return Ok(())
                 }
@@ -167,7 +168,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = self.station_progress().await?;
             // A late matching MAP after DELETE completion invalidates the
             // retirement proof, even when STOPPED is in the same receive batch.
-            if self.peer.as_ref().and_then(Peer::mapped).is_some() {
+            if self.station.peer.as_ref().and_then(Peer::mapped).is_some() {
                 return Err(Error::Malformed);
             }
             match event {

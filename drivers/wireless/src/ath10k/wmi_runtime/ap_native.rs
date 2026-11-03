@@ -362,8 +362,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             || !self.ap_supported()
             || self.failed
             || self.ap.is_some()
-            || self.peer.is_some()
-            || self.data.is_some()
+            || self.station.peer.is_some()
+            || self.station.data.is_some()
             || self.roc.is_some()
             || self.scan_pending.is_some()
             || !emission.current()

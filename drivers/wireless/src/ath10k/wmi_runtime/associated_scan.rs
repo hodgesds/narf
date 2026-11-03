@@ -54,7 +54,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         channels: &[u16],
         current: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
-        if self.peer.is_some() {
+        if self.station.peer.is_some() {
             return Err(Error::Failed);
         }
         let validate = || {
@@ -138,7 +138,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         self.scan_pending = None;
         self.scan_dwell = None;
-        if self.peer.is_some() {
+        if self.station.peer.is_some() {
             active_scan::checked(self.disconnect_after_failed_scan(), validate).await?;
         }
         // Failed remains set even with a confirmed STOP; only a separately
@@ -148,10 +148,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Preflight only. A partially prepared peer or an initially closed
     /// controlled port is not an associated scan owner.
     pub(super) fn scan_binding(&self) -> Result<Option<Binding>, Error> {
-        let Some(peer) = &self.peer else {
+        let Some(peer) = &self.station.peer else {
             return Ok(None);
         };
-        if self.station_link().is_none() || self.data.is_none() {
+        if self.station_link().is_none() || self.station.data.is_none() {
             return Err(Error::Failed);
         }
         Ok(Some(Binding {
@@ -166,13 +166,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// across awaits. Internal station progression may complete a rekey, so
     /// do not require a continuously open controlled port here.
     pub(super) fn check_scan_binding(&self, expected: Option<&Binding>) -> Result<(), Error> {
-        match (expected, self.peer.as_ref()) {
+        match (expected, self.station.peer.as_ref()) {
             (None, None) => Ok(()),
             (Some(expected), Some(peer))
                 if peer.bssid == expected.bssid
                     && peer.permission == expected.permission
                     && peer.associated.is_some()
-                    && self.data.is_some() =>
+                    && self.station.data.is_some() =>
             {
                 Ok(())
             }

@@ -85,7 +85,8 @@ pub(super) mod pmf;
 pub use disconnect::Disconnected;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn retained_station_permission(&self) -> Result<Permission, Error> {
-        self.peer
+        self.station
+            .peer
             .as_ref()
             .map(|p| p.permission.clone())
             .ok_or(Error::Failed)
@@ -277,7 +278,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed {
             return None;
         }
-        let peer = self.peer.as_ref()?;
+        let peer = self.station.peer.as_ref()?;
         peer.mapped()?;
         peer.associated
     }
@@ -347,7 +348,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(htt::Error::from)?;
         use narf_wireless::association::{channel, Bss, JoinPlan, SecurityMode};
         let peer = self.prepared_peer().ok_or(Error::Failed)?;
-        if self.peer.as_ref().ok_or(Error::Failed)?.exchange_stage != 0 {
+        if self
+            .station
+            .peer
+            .as_ref()
+            .ok_or(Error::Failed)?
+            .exchange_stage
+            != 0
+        {
             return Err(Error::Failed);
         }
         let cached = self
@@ -368,8 +376,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
-        let offered_ht = self.peer.as_ref().ok_or(Error::Failed)?.ht;
-        let vdev = self.peer.as_ref().ok_or(Error::Failed)?.vdev;
+        let offered_ht = self.station.peer.as_ref().ok_or(Error::Failed)?.ht;
+        let vdev = self.station.peer.as_ref().ok_or(Error::Failed)?.vdev;
         let mut plan = JoinPlan::prepare_with_options(
             &bss,
             own,
@@ -454,7 +462,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let Some(flag) = pmf_offload {
             super::hw_keys::mark_peer_pmf(self.wire.dialect, &mut command, flag)?;
         }
-        self.peer_pmf_offload = pmf_offload.is_some();
+        self.station.peer_pmf_offload = pmf_offload.is_some();
         let up = mlme::up(self.wire.dialect, vdev, peer.bssid, aid)?;
         let contention = wmm
             .or_else(|| {
@@ -479,15 +487,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let event = checked_policy(self.station_progress(), validate).await?;
-            if self.peer.as_ref().and_then(Peer::mapped).is_none() {
+            if self.station.peer.as_ref().and_then(Peer::mapped).is_none() {
                 return Err(Error::Failed);
             }
             match event {
                 htt::Event::Idle => {
-                    self.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
-                    self.peer.as_mut().ok_or(Error::Failed)?.wmm = wmm;
-                    self.peer.as_mut().ok_or(Error::Failed)?.ht = ht;
-                    self.peer.as_mut().ok_or(Error::Failed)?.rsn = rsn;
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.wmm = wmm;
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.ht = ht;
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.rsn = rsn;
                     self.failed = false;
                     return Ok(associated);
                 }
@@ -505,7 +513,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.prepared_peer_snapshot()
     }
     pub(super) fn prepared_peer_snapshot(&self) -> Option<PeerPrepared> {
-        let peer = self.peer.as_ref()?;
+        let peer = self.station.peer.as_ref()?;
         Some(PeerPrepared {
             bssid: peer.bssid,
             frequency: peer.permission.frequency,
@@ -535,7 +543,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<PeerPrepared, Error> {
         validate()?;
-        if self.failed || self.ready.is_none() || self.peer.is_some() || self.scan_pending.is_some()
+        if self.failed
+            || self.ready.is_none()
+            || self.station.peer.is_some()
+            || self.scan_pending.is_some()
         {
             return Err(Error::Failed);
         }
@@ -593,7 +604,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             None
         };
         let create = self.wire.peer(vdev, bssid)?;
-        self.peer = Some(Peer {
+        self.station.peer = Some(Peer {
             vdev,
             permission: permission.clone(),
             bssid,
@@ -652,7 +663,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = checked_policy(self.station_progress(), validate).await?;
             match event {
                 htt::Event::Idle => {
-                    if let Some(id) = self.peer.as_ref().and_then(Peer::mapped) {
+                    if let Some(id) = self.station.peer.as_ref().and_then(Peer::mapped) {
                         self.failed = false;
                         return Ok(PeerPrepared {
                             bssid,
@@ -682,7 +693,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.prepared_peer().is_none() {
             return Err(Error::Failed);
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         let permission = peer.permission.clone();
         permission.check(domain)?;
         management::validate(frame, self.ready.ok_or(Error::Failed)?.mac, peer.bssid)?;
@@ -790,7 +801,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.prepared_peer().is_none() {
             return Err(Error::Failed);
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         let expected = match (
             peer.exchange_stage,
             frame.map_or(Some(0xb0), |f| f.first().copied()),
@@ -819,7 +830,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let event = self.station_progress().await?;
-            if self.peer.as_ref().and_then(Peer::mapped).is_none() {
+            if self.station.peer.as_ref().and_then(Peer::mapped).is_none() {
                 return Err(Error::Failed);
             }
             match event {
@@ -860,7 +871,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     if status != 0 {
                         return Err(Error::Firmware(u32::from(status)));
                     }
-                    self.peer.as_mut().ok_or(Error::Failed)?.exchange_stage += 1;
+                    self.station
+                        .peer
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .exchange_stage += 1;
                     self.failed = false;
                     return Ok(rx.frame);
                 }
@@ -907,7 +922,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if self.observe_roc_peer(bytes)? {
                 return Ok(htt::Event::Progress);
             }
-            if let Some(peer) = &mut self.peer {
+            if let Some(peer) = &mut self.station.peer {
                 if peer.record(bytes)? {
                     return Ok(htt::Event::Progress);
                 }
@@ -918,7 +933,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// The future station worker must drive this same retained event path.
     /// No peer-map event authenticates an association or opens a data port.
     pub async fn poll_station(&mut self) -> Result<htt::Event, Error> {
-        if self.failed || self.peer.is_none() {
+        if self.failed || self.station.peer.is_none() {
             return Err(Error::Failed);
         }
         self.failed = true;

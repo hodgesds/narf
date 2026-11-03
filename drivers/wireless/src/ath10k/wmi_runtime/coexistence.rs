@@ -215,6 +215,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Ok(());
         }
         if self
+            .station
             .coexistence
             .as_ref()
             .is_some_and(|state| state.bssid == bssid && state.primary == frequency)
@@ -264,19 +265,22 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Unsupported);
         }
-        self.coexistence = Some(Box::new(state));
+        self.station.coexistence = Some(Box::new(state));
         Ok(())
     }
     pub(super) fn coexistence_wide(&self, bssid: [u8; 6], frequency: u16) -> bool {
-        self.coexistence.as_ref().is_some_and(|s| {
+        self.station.coexistence.as_ref().is_some_and(|s| {
             s.bssid == bssid && s.primary == frequency && s.allow_wide && !s.trigger && !s.narrowed
         })
     }
     pub(super) fn coexistence_blocked(&self) -> bool {
-        self.coexistence.as_ref().is_some_and(|s| s.blocked())
+        self.station
+            .coexistence
+            .as_ref()
+            .is_some_and(|s| s.blocked())
     }
     pub(super) fn observe_coexistence(&mut self, event: &htt::Event) -> Result<(), Error> {
-        let Some(state) = self.coexistence.as_mut() else {
+        let Some(state) = self.station.coexistence.as_mut() else {
             return Ok(());
         };
         let htt::Event::Wmi(bytes) = event else {
@@ -326,6 +330,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> bool {
         self.coexistence_wide(bssid, frequency)
             && self
+                .station
                 .coexistence
                 .as_ref()
                 .is_some_and(|s| Some(s.secondary) == secondary)
@@ -338,7 +343,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if permission.frequency >= 3000 {
             return Ok(());
         }
-        if let Some(state) = &mut self.coexistence {
+        if let Some(state) = &mut self.station.coexistence {
             if state.bssid != bssid || state.primary != permission.frequency {
                 return Err(Error::Failed);
             }
@@ -363,13 +368,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<bool, Error> {
         if self.failed
             || self
+                .station
                 .peer
                 .as_ref()
                 .is_none_or(|p| p.associated.is_none() || p.mapped().is_none())
         {
             return Ok(false);
         }
-        let Some(state) = self.coexistence.as_ref() else {
+        let Some(state) = self.station.coexistence.as_ref() else {
             return Ok(false);
         };
         if state.scan_owned {
@@ -377,11 +383,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Ok(false);
             }
             let report = self.finish_associated_scan(|| Ok(domain.clone())).await?;
-            let state = self.coexistence.as_mut().ok_or(Error::Failed)?;
+            let state = self.station.coexistence.as_mut().ok_or(Error::Failed)?;
             state.scan_owned = false;
             state.report(&report)?;
         }
-        let state = self.coexistence.as_ref().ok_or(Error::Failed)?;
+        let state = self.station.coexistence.as_ref().ok_or(Error::Failed)?;
         let report = state.report_pending;
         let blocked = self.coexistence_blocked();
         if blocked && !self.coexistence_ready() {
@@ -396,7 +402,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.failed = true;
             self.send_management_frame(&frame).await?;
             self.check_data_policy(domain)?;
-            self.coexistence
+            self.station
+                .coexistence
                 .as_mut()
                 .ok_or(Error::Failed)?
                 .report_pending = false;
@@ -406,19 +413,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.narrow_coexistence(domain).await?;
             return Ok(true);
         }
-        let state = self.coexistence.as_ref().ok_or(Error::Failed)?;
+        let state = self.station.coexistence.as_ref().ok_or(Error::Failed)?;
         if !self.scan_in_progress() && (state.force_scan || state.deadline.expired()) {
             let channels = state.channels.clone();
             let plan = self.prepare_associated_passive_scan(&channels, domain)?;
             self.begin_associated_scan(plan, || Ok(domain.clone()))
                 .await?;
-            self.coexistence.as_mut().ok_or(Error::Failed)?.scan_owned = true;
+            self.station
+                .coexistence
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .scan_owned = true;
             return Ok(true);
         }
         Ok(report)
     }
     async fn narrow_coexistence(&mut self, domain: &RegulatoryDomain) -> Result<(), Error> {
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         let old = peer.permission.clone();
         let bssid = peer.bssid;
         let profile = peer
@@ -446,7 +457,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         } else {
             1
         };
-        let vdev = self.peer.as_ref().ok_or(Error::Failed)?.vdev;
+        let vdev = self.station.peer.as_ref().ok_or(Error::Failed)?.vdev;
         let restart =
             self.wire
                 .coexistence_restart(vdev, &permission, cached.beacon_interval, dtim)?;
@@ -455,7 +466,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .wire
             .coexistence_channels(&permission, &self.channels)?;
         let power = self.wire.power(&permission)?;
-        let state = self.coexistence.as_mut().ok_or(Error::Failed)?;
+        let state = self.station.coexistence.as_mut().ok_or(Error::Failed)?;
         if state.restart_started || state.narrowed || !state.allow_wide {
             return Err(Error::Failed);
         }
@@ -479,6 +490,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 self.coexistence_receipt(receipt)?;
             }
             if self
+                .station
                 .peer
                 .as_ref()
                 .is_none_or(|p| p.bssid != bssid || p.mapped().is_none() || p.associated.is_none())
@@ -525,6 +537,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             let event = checked_policy(self.station_progress(), &validate).await?;
             if self
+                .station
                 .peer
                 .as_ref()
                 .is_none_or(|p| p.bssid != bssid || p.mapped().is_none() || p.associated.is_none())
@@ -554,6 +567,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             let event = checked_policy(self.station_progress(), &validate).await?;
             if self
+                .station
                 .peer
                 .as_ref()
                 .is_none_or(|p| p.bssid != bssid || p.mapped().is_none() || p.associated.is_none())
@@ -574,10 +588,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let source = self.htt.wmi.htc.transport.current_sources();
         crate::ath10k::firmware_source::invoke(source.as_ref(), || {
             self.narrow_coexistence_receive(permission.frequency)?;
-            let peer = self.peer.as_mut().ok_or(Error::Failed)?;
+            let peer = self.station.peer.as_mut().ok_or(Error::Failed)?;
             peer.permission = permission;
             peer.ht = Some(profile);
-            let state = self.coexistence.as_mut().ok_or(Error::Failed)?;
+            let state = self.station.coexistence.as_mut().ok_or(Error::Failed)?;
             state.narrowed = true;
             self.failed = false;
             Ok::<(), Error>(())
@@ -701,7 +715,7 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn expire_coexistence_for_test(&mut self) {
-        if let Some(state) = &mut self.coexistence {
+        if let Some(state) = &mut self.station.coexistence {
             state.deadline = narf_time::Deadline::after_ms(0);
         }
     }

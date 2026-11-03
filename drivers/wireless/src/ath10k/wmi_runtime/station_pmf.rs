@@ -101,7 +101,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         use narf_wireless::sae::SaeSession;
         let join = plan.sae().ok_or(Error::Unsupported)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
-        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         let session = if join.h2e() {
             SaeSession::new_h2e_bytes(ssid, password, own, bssid)
         } else {
@@ -136,7 +136,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 SaeStep::Associate(request) => {
                     let request = wire::owned(request)?;
                     let pmk = Zeroizing::new(*session.pmk().ok_or(Error::Malformed)?);
-                    self.peer.as_mut().ok_or(Error::Failed)?.exchange_stage = 1;
+                    self.station
+                        .peer
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .exchange_stage = 1;
                     self.failed = false;
                     return Ok((request, pmk));
                 }

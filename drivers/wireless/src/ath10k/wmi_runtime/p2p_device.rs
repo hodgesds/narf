@@ -141,7 +141,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         current: impl Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         let vdev = self.p2p_device_vdev().ok_or(Error::Unsupported)?;
-        if self.roc.is_some() || self.peer.is_some() || self.ap.is_some() {
+        if self.roc.is_some() || self.station.peer.is_some() || self.ap.is_some() {
             return Err(Error::Unsupported);
         }
         if let Some(mut plan) = plan {

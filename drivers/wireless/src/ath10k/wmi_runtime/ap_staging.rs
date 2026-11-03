@@ -19,7 +19,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     fn ap_stage_owner(&mut self) -> Result<&mut ap::Staging, Error> {
         if !self.ap_supported()
             || self.ap_exists()
-            || self.peer.is_some()
+            || self.station.peer.is_some()
             || self.roc.is_some()
             || self.scan_pending.is_some()
             || self.failed

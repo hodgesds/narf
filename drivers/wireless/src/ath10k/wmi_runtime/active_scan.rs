@@ -175,7 +175,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<ScanReport, Error> {
         // Raw PCI diagnostics keep their original exclusive unassociated
         // owner. Registered associated scans use retained stepwise dwell.
-        if plan.station.is_some() || self.peer.is_some() {
+        if plan.station.is_some() || self.station.peer.is_some() {
             return Err(Error::Failed);
         }
         // Plans carry requested geometry, not authority for another physical

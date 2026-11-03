@@ -13,8 +13,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let eligible = !self.failed
             && self.ready.is_some()
             && self.ap.is_none()
-            && self.peer.is_none()
-            && self.data.is_none()
+            && self.station.peer.is_none()
+            && self.station.data.is_none()
             && self.scan_pending.is_none()
             && self.scan_dwell.is_none()
             && self.roc.is_none()
@@ -22,7 +22,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             && self.management_done.is_empty()
             && self.management_received.is_empty()
             && self.management_completed.is_none()
-            && self.coexistence.is_none();
+            && self.station.coexistence.is_none();
         self.htt.wmi.htc.transport.runtime_idle(eligible);
         if !eligible {
             return Ok(());
