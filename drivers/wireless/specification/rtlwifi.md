@@ -1432,12 +1432,13 @@ static restore, copied-source loss and held M4. Compilation and native
 execution remain pending. Physical antenna mapping, full-program per-path
 measurements, trusted signing and silicon/RF acceptance remain external.
 
-### RTL8821AE retained-runtime foundation (groundwork, not admitted)
+### RTL8821AE retained runtime (implemented, pending validation)
 
 `rtl8821ae/` holds the exact Linux-derived pieces the RTL8821AE retained owner
-is built from. None is reachable from probe as a WLAN capability; the matched
-`0x8821` function stays diagnostic and returns `NotSupported` until the whole
-chain below is composed.
+is built from. Probe retains the matched `0x8821` function as a native device
+(`pci.rs`, alongside RTL8188EE) and admits it under its signed NAPC envelope;
+an unprovisioned board stays unadmitted. The composed station, VHT, recovery
+and WoWLAN paths are described below.
 
 - `pwrseq` — PCI rows of every `rtl8821A_*_flow` (enable, disable, suspend,
   resume, radio-off, LPS enter/leave), generated from `pwrseq.h` with masks
