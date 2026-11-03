@@ -10,6 +10,7 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod calibration;
+mod chips;
 mod channel_width;
 mod channels;
 mod descriptor;
@@ -18,6 +19,7 @@ mod ht40;
 mod identity;
 mod idle;
 mod initvals;
+mod initvals_ar9287;
 mod interface;
 mod irq;
 mod mac;

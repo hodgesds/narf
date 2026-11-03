@@ -1191,7 +1191,8 @@ descriptor/runtime variants before they can be claimed supported. The Linux
   ath10k currently rejects this ID as wrong-driver.
 - `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI).
 
-Every chip row shares these tree blockers: `identity.rs::identify` rejects
+Every chip row shares these tree blockers (partly lifted for AR9287 by the
+profile foundation below): `identity.rs::identify` rejects
 any `AR_SREV` macro version other than 0xC0 (AR9285) before the first write;
 `decode_identity` accepts only the 376-byte `ar5416_eeprom_4k` map with chain
 masks 1/1; `initvals.rs` carries only the AR9285_1_2 tables; `phy/` and
@@ -1206,6 +1207,62 @@ AR9287 calibration branches and two-chain masks; AR9280 `eeprom_def.c`,
 AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
 `eeprom_9003.c`, per-chip `ar9003_*_initvals.h`, `ar9003_calib.c`, plus MCI
 for AR9462/AR9565.
+
+**Per-chip profile foundation (`ar9287_enablement`, in progress — not
+admitted).** `chips.rs` decodes `AR_SREV` exactly as
+`hw.c::ath9k_hw_read_revisions` (new `0xff` format: `(srev & 0xfffc0000) >> 12`
+plus `AR_SREV_REVISION2`; legacy format: `MS(AR_SREV_VERSION)` plus
+`AR_SREV_REVISION`) into `Chip::{Ar5416, Ar9160, Ar9280, Ar9285, Ar9287}`,
+maps the `hw.h` PCI IDs `0x0023/24/27/29/2a/2b/2c/2d/2e` to those profiles
+and names each family's factory map (`EepromMap`): `ar5416_eeprom_4k` at
+word 64 (188 words, one chain), `ar9287_eeprom` at `AR9287_EEP_START_LOC`
+128 (`SIZE_EEPROM_AR9287` = 363 words of the 727 packed bytes, two chains)
+and `ar5416_eeprom_def` at word 64 (1628 words, three chains). AR9285's
+`identify` now uses that decode but its register trace, 256-word window
+bound, strict even/≤376-byte length rule and 1/1 chain-mask rule are
+unchanged. `identity::decode_map` is the shared
+`ath9k_hw_nvram_swap_data`/`_validate_checksum`/`_check_version` path for the
+other maps: magic-driven word swap, EEPMISC byte order, checksum over
+`min(length / 2, SIZE_EEPROM)` words (headers shorter than 32 bytes are
+refused), version 14 with minor ≥ `AR5416_EEP_NO_BACK_VER`, unicast MAC and
+nonzero RX/TX masks within `min(map chains, silicon chains)` (AR9287/AR9280:
+up to `0x3`). `identity::identify_chip` refuses a silicon/device mismatch
+before any write, then runs the same AR5008/AR9002 PCI power-on + warm reset
+(`ath9k_hw_set_reset` has no branch for these parts) and reads the map
+through the 2048-word `AR5416_EEPROM_OFFSET` window.
+
+`initvals_ar9287.rs` carries the literal `ar9002_initvals.h` AR9287 1.1+
+modes, common, CCK FIR (normal and channel-14 Japan), TX-gain and RX-gain
+tables. `phy/ar9287.rs::prepare` requires `AR_SREV_9287_11_OR_LATER` and the
+exact map length, then writes, with PHY/interrupts/RX left disabled: the
+AR9002 PLL/analog-shift preamble, `ar5008_hw_process_ini` modes → RX gain →
+TX gain (column 4, 2 GHz HT20) → common, the shared AR9002 channel
+preparation (`phy/channel.rs::prepare_chip`, which AR9285 now calls with its
+unchanged constants) with HWWAR2 additionally cleared, the factory two-chain
+RX/CAL/SELFGEN masks, the CCK FIR rows instead of the `AR_PHY_CCK_TX_CTRL`
+Japan bit and the AR9287 spur list offset, and finally
+`eeprom_9287.c::ath9k_hw_ar9287_set_board_values` (both chains' switch,
+IQ, attenuation/margin, settling, xPA timing, thresh62, the two
+`AR9287_AN_RF2G3` analog banks and `AR9287_AN_TOP2` xPA bias, each analog
+write followed by 100 µs). Kernel smokes (written, not executed):
+`smoke_ath9k_chip_revisions_follow_read_revisions`,
+`smoke_ath9k_ar9287_map_decode_two_chain_masks`,
+`smoke_ath9k_ar9287_identify_reads_map_at_word_128`,
+`smoke_ath9k_ar9287_ini_follows_linux_mode_gain_common_order` (FNV-1a
+oracle over the 711 Linux INI rows), 
+`smoke_ath9k_ar9287_two_chain_masks_hwwar2_and_cck_fir`,
+`smoke_ath9k_ar9287_board_values_follow_eeprom_9287` and
+`smoke_ath9k_ar9287_preparation_refuses_wrong_inputs`.
+
+Still missing before `0x002d`/`0x002e` can be matched: AR9287 transmit power
+(`ath9k_hw_ar9287_set_txpower` with its open-loop `ath9k_olc_init`/
+`ar9287_eeprom_olpc_set_pdadcs` and closed-loop PDADC paths, per-rate targets
+and two-chain CTL limits), AR9287 calibration (`ar9002_calib.c` non-AR9285
+AGC/NF/IQ/ADC path and `ar9002_hw_olc_temp_compensation_9287`), the
+`AR_SREV_9287_13_OR_LATER` async-FIFO MAC settings (117 MHz clock,
+`AR_USEC_ASYNC_FIFO`, AHB custom burst, AGGWEP), two-chain TX descriptor
+chain selection in the packet owner, signed board records naming the AR9287
+devices, and the probe/station wiring. No AR9287 device is matched.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

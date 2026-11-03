@@ -256,6 +256,7 @@ pub(super) fn program_live_power_at(
     }
 }
 
+mod ar9287;
 mod channel;
 mod modal;
 mod power;

@@ -5,6 +5,8 @@
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Write};
 
+use super::chips::{Chip, EepromMap, Revision, MAP_4K};
+
 const AR_RC: u64 = 0x4000;
 const AR_STA_ID1: u64 = 0x8004;
 const AR_STA_ID1_PWR_SAV: u32 = 0x0004_0000;
@@ -146,8 +148,8 @@ impl RegisterIo for Registers {
 /// Read a multibyte EEPROM field from the raw, checksum-verified image.
 /// Magic-driven word normalization and the EEPMISC field-byte order are
 /// separate facts. Never rewrite the retained raw image or its source hash.
-/// All callers use statically bounded offsets in the complete376-byte map.
-pub(in crate::ath9k) fn eeprom_word(image: &[u8; EEPROM_4K_BYTES], offset: usize) -> u16 {
+/// All callers use statically bounded offsets inside their chip's map.
+pub(in crate::ath9k) fn eeprom_word(image: &[u8], offset: usize) -> u16 {
     let bytes = [image[offset], image[offset + 1]];
     if image[7] & 1 != 0 {
         u16::from_be_bytes(bytes)
@@ -155,7 +157,7 @@ pub(in crate::ath9k) fn eeprom_word(image: &[u8; EEPROM_4K_BYTES], offset: usize
         u16::from_le_bytes(bytes)
     }
 }
-pub(in crate::ath9k) fn eeprom_dword(image: &[u8; EEPROM_4K_BYTES], offset: usize) -> u32 {
+pub(in crate::ath9k) fn eeprom_dword(image: &[u8], offset: usize) -> u32 {
     let bytes = [
         image[offset],
         image[offset + 1],
@@ -170,7 +172,20 @@ pub(in crate::ath9k) fn eeprom_dword(image: &[u8; EEPROM_4K_BYTES], offset: usiz
 }
 
 fn read_eeprom(io: &mut impl RegisterIo, word: usize) -> Result<u16, BringUpError> {
-    if word >= 256 {
+    read_eeprom_word(io, word, 256)
+}
+
+/// Words addressable through the 8 KiB `AR5416_EEPROM_OFFSET` window
+/// (`ath_pci_eeprom_read`: `0x2000 + (off << AR5416_EEPROM_S)`); the largest
+/// map (`eeprom_def.c`) ends at word 1692.
+const EEPROM_WINDOW_WORDS: usize = 2048;
+
+fn read_eeprom_word(
+    io: &mut impl RegisterIo,
+    word: usize,
+    limit: usize,
+) -> Result<u16, BringUpError> {
+    if word >= limit {
         return Err(BringUpError::BadLength);
     }
     // The *read* at EEPROM_WINDOW triggers the requested EEPROM word.
@@ -252,6 +267,25 @@ fn decode_identity(
     magic: u16,
     image: &mut [u8; EEPROM_4K_BYTES],
 ) -> Result<Identity, BringUpError> {
+    decode_map(&MAP_4K, 1, revision, magic, image)
+}
+
+/// `eeprom.c::ath9k_hw_nvram_swap_data`, `ath9k_hw_nvram_validate_checksum`
+/// and `ath9k_hw_nvram_check_version` over one family's map. The base
+/// header layout (length, checksum, version, opCapFlags, eepMisc, regDmn,
+/// macAddr, rxMask, txMask) is shared by `ar5416_eeprom_4k`, `ar9287_eeprom`
+/// and `ar5416_eeprom_def`. Chain masks must be nonzero subsets of the
+/// chip's `chains`.
+pub(super) fn decode_map(
+    map: &EepromMap,
+    chains: u8,
+    revision: u8,
+    magic: u16,
+    image: &mut [u8],
+) -> Result<Identity, BringUpError> {
+    if image.len() != map.bytes() {
+        return Err(BringUpError::BadLength);
+    }
     match magic {
         0xa55a => {}
         0x5aa5 => {
@@ -270,11 +304,10 @@ fn decode_identity(
             u16::from_le_bytes(bytes)
         }
     };
-    let length = word(0) as usize;
-    if !(32..=EEPROM_4K_BYTES).contains(&length) || length & 1 != 0 {
-        return Err(BringUpError::BadLength);
-    }
-    let sum = image[..length].chunks_exact(2).fold(0u16, |sum, bytes| {
+    let words = map
+        .checksum_words(word(0) as usize)
+        .ok_or(BringUpError::BadLength)?;
+    let sum = image[..words * 2].chunks_exact(2).fold(0u16, |sum, bytes| {
         sum ^ u16::from_le_bytes([bytes[0], bytes[1]])
     });
     if sum != 0xffff {
@@ -286,7 +319,15 @@ fn decode_identity(
     }
     let mut mac = [0; 6];
     mac.copy_from_slice(&image[12..18]);
-    if mac == [0; 6] || mac[0] & 1 != 0 || image[18] != 1 || image[19] != 1 {
+    let chains = EepromMap {
+        chains: chains.min(map.chains),
+        ..*map
+    };
+    if mac == [0; 6]
+        || mac[0] & 1 != 0
+        || !chains.chainmask_valid(image[18])
+        || !chains.chainmask_valid(image[19])
+    {
         return Err(BringUpError::BadIdentity);
     }
     Ok(Identity {
@@ -300,6 +341,44 @@ fn decode_identity(
     })
 }
 
+/// Identify a non-AR9285 family through its own revision and map, after the
+/// same AR5008/AR9002 PCI power-on + warm reset (`hw.c::ath9k_hw_set_reset`
+/// takes no AR9003/AR9100 branch for these parts). The returned image is
+/// the normalized, checksum-verified map; no device is admitted by this.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+pub(in crate::ath9k) fn identify_chip(
+    io: &mut impl RegisterIo,
+    expected: Chip,
+) -> Result<(Revision, Identity, alloc::boxed::Box<[u8]>), BringUpError> {
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    let srev = io.read32(AR_SREV);
+    if srev == u32::MAX {
+        return Err(BringUpError::DeviceGone);
+    }
+    let revision = match Revision::decode(srev) {
+        Some(revision) if revision.chip == expected => revision,
+        _ => return Err(BringUpError::UnsupportedRevision),
+    };
+    reset(io)?;
+    let map = expected.eeprom_map();
+    let magic = read_eeprom_word(io, 0, EEPROM_WINDOW_WORDS)?;
+    let mut image = alloc::vec![0u8; map.bytes()].into_boxed_slice();
+    for (i, bytes) in image.chunks_exact_mut(2).enumerate() {
+        let value = read_eeprom_word(io, map.start_word + i, EEPROM_WINDOW_WORDS)?;
+        bytes.copy_from_slice(&value.to_le_bytes());
+    }
+    let identity = decode_map(
+        map,
+        expected.max_chains(),
+        revision.mac_rev,
+        magic,
+        &mut image,
+    )?;
+    Ok((revision, identity, image))
+}
+
 pub(in crate::ath9k) fn identify(
     io: &mut impl RegisterIo,
 ) -> Result<(Identity, [u8; EEPROM_4K_BYTES]), BringUpError> {
@@ -311,10 +390,12 @@ pub(in crate::ath9k) fn identify(
     if srev == u32::MAX {
         return Err(BringUpError::DeviceGone);
     }
-    if srev & 0xff != 0xff || (srev & 0xfffc0000) >> 12 != 0xc0 {
-        return Err(BringUpError::UnsupportedRevision);
-    }
-    let revision = ((srev >> 8) & 0xf) as u8;
+    // `Chip::Ar9285` implies the `AR_SREV_ID == 0xff` format with macVersion
+    // 0xc0; its macRev is `AR_SREV_REVISION2`.
+    let revision = match Revision::decode(srev) {
+        Some(revision) if revision.chip == Chip::Ar9285 => revision.mac_rev,
+        _ => return Err(BringUpError::UnsupportedRevision),
+    };
     reset(io)?;
     let magic = read_eeprom(io, 0)?;
     let mut image = [0; EEPROM_4K_BYTES];

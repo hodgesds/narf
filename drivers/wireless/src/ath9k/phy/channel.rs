@@ -158,14 +158,15 @@ fn masks(io: &mut impl RegisterIo, bin: i32) -> Result<(), BringUpError> {
 }
 fn spur(
     io: &mut impl RegisterIo,
-    image: &[u8; EEPROM_4K_BYTES],
+    image: &[u8],
+    spur_chans: usize,
     frequency: u16,
     wide: bool,
 ) -> Result<(), BringUpError> {
     let mut selected = None;
-    // offsetof(ar5416_eeprom_4k, modalHeader.spurChans)=100; 5x4 bytes.
+    // modalHeader.spurChans: 5x4 bytes at the chip map's offset.
     for index in 0..5 {
-        let value = crate::ath9k::identity::eeprom_word(image, 100 + index * 4);
+        let value = crate::ath9k::identity::eeprom_word(image, spur_chans + index * 4);
         if value == 0x8000 {
             break;
         }
@@ -212,14 +213,52 @@ pub(in crate::ath9k) fn prepare_geometry(
     image: &[u8; EEPROM_4K_BYTES],
     geometry: Geometry,
 ) -> Result<(), BringUpError> {
+    prepare_chip(io, image, geometry, &AR9285)
+}
+
+/// Selects the `[register, value]` CCK FIR INI rows for a frequency.
+pub(in crate::ath9k) type CckFir = fn(u16) -> &'static [[u32; 2]];
+
+/// The per-chip differences inside the shared AR9002 channel preparation
+/// (`ar5008_hw_override_ini`, `ar5008_hw_init_chain_masks`,
+/// `ar9002_hw_set_channel`, `ar9002_hw_spur_mitigate`).
+pub(in crate::ath9k) struct ChipChannel {
+    /// `AR_PCU_MISC_MODE2` bits cleared: always ADHOC_MCAST_KEYID_ENABLE and
+    /// HWWAR1, plus HWWAR2 on `AR_SREV_9287_11_OR_LATER`.
+    pub misc_mode2_clear: u32,
+    /// Verified factory RX / TX chain masks (`ar5008_hw_init_chain_masks`).
+    pub rx_chainmask: u8,
+    pub tx_chainmask: u8,
+    /// `AR_SREV_9287_11_OR_LATER` writes the CCK FIR INI arrays instead of
+    /// toggling `AR_PHY_CCK_TX_CTRL_JAPAN`.
+    pub cck_fir: Option<CckFir>,
+    /// Byte offset of `modalHeader.spurChans` in the chip's map.
+    pub spur_chans: usize,
+}
+
+/// AR9285: one chain; `offsetof(ar5416_eeprom_4k, modalHeader.spurChans)`.
+const AR9285: ChipChannel = ChipChannel {
+    misc_mode2_clear: 0x40 | 0x100000,
+    rx_chainmask: 1,
+    tx_chainmask: 1,
+    cck_fir: None,
+    spur_chans: 100,
+};
+
+pub(in crate::ath9k) fn prepare_chip(
+    io: &mut impl RegisterIo,
+    image: &[u8],
+    geometry: Geometry,
+    chip: &ChipChannel,
+) -> Result<(), BringUpError> {
     let frequency = geometry.center();
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
     // Linux override_ini: keep receive aborted, disable unused multicast
-    // key-ID matching and AR9285's HWWAR1, and ignore CFP restrictions.
+    // key-ID matching and the chip's HWWAR bits, and ignore CFP restrictions.
     rmw(io, 0x8048, 0, 0x02000020)?;
-    rmw(io, 0x8344, 0x40 | 0x100000, 0x80)?;
+    rmw(io, 0x8344, chip.misc_mode2_clear, 0x80)?;
     let turbo = io.read32(0x9804);
     if turbo == u32::MAX {
         return Err(BringUpError::DeviceGone);
@@ -228,12 +267,20 @@ pub(in crate::ath9k) fn prepare_geometry(
     write(io, 0x8318, u32::from(geometry.is_wide()))?;
     write(io, 0x64, 25 << 16)?;
     write(io, 0x6c, 15 << 16)?;
-    // The independently identified AR9285 is strictly one RX/TX chain.
-    write(io, 0x99a4, 1)?;
-    write(io, 0xa39c, 1)?;
-    write(io, 0x832c, 1)?;
+    // ar5008_hw_init_chain_masks: RX/CAL chain masks then SELFGEN_MASK; the
+    // AR_PHY_SWAP_ALT_CHAIN mask 0x5 cannot pass the two-chain identity.
+    write(io, 0x99a4, u32::from(chip.rx_chainmask))?;
+    write(io, 0xa39c, u32::from(chip.rx_chainmask))?;
+    write(io, 0x832c, u32::from(chip.tx_chainmask))?;
     write(io, 0xa200, 4)?;
-    rmw(io, 0xa204, 0x10, 0)?;
+    match chip.cck_fir {
+        None => rmw(io, 0xa204, 0x10, 0)?,
+        Some(select) => {
+            for row in select(frequency) {
+                write(io, u64::from(row[0]), row[1])?;
+            }
+        }
+    }
     let synth = io.read32(0x9874);
     if synth == u32::MAX {
         return Err(BringUpError::DeviceGone);
@@ -250,7 +297,7 @@ pub(in crate::ath9k) fn prepare_geometry(
     let (mantissa, exponent) = slope(9 * coefficient / 10);
     field(io, 0x99d0, 0x7fff0, 4, mantissa)?;
     field(io, 0x99d0, 15, 0, exponent)?;
-    spur(io, image, frequency, geometry.is_wide())?;
+    spur(io, image, chip.spur_chans, frequency, geometry.is_wide())?;
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }

@@ -1,3 +1,4 @@
+use super::super::chips::{MAP_9287, MAP_DEF};
 use super::*;
 use alloc::{collections::BTreeMap, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -11,7 +12,7 @@ enum Op {
 
 #[derive(Debug)]
 struct Fake {
-    words: [u16; 256],
+    words: Vec<u16>,
     registers: BTreeMap<u64, u32>,
     selected: usize,
     busy: bool,
@@ -52,7 +53,7 @@ fn image(big: bool) -> [u8; EEPROM_4K_BYTES] {
 
 impl Fake {
     fn new() -> Self {
-        let mut words = [0xffff; 256];
+        let mut words = alloc::vec![0xffff; EEPROM_WINDOW_WORDS];
         words[0] = 0xa55a;
         for (index, bytes) in image(false).chunks_exact(2).enumerate() {
             words[EEPROM_BASE_WORD + index] = u16::from_le_bytes([bytes[0], bytes[1]]);
@@ -74,7 +75,7 @@ impl Fake {
 impl RegisterIo for Fake {
     fn read32(&mut self, offset: u64) -> u32 {
         self.ops.push(Op::Read(offset));
-        if (EEPROM_WINDOW..EEPROM_WINDOW + 1024).contains(&offset) {
+        if (EEPROM_WINDOW..EEPROM_WINDOW + 4 * EEPROM_WINDOW_WORDS as u64).contains(&offset) {
             self.selected = ((offset - EEPROM_WINDOW) / 4) as usize;
             self.busy = true;
             return 0;
@@ -391,4 +392,160 @@ fn smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/identity",
     smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep
+);
+
+/// A synthetic map image: base header only (never real board values).
+fn chip_image(map: &EepromMap, length: u16, rx: u8, tx: u8) -> alloc::boxed::Box<[u8]> {
+    let mut bytes = alloc::vec![0u8; map.bytes()].into_boxed_slice();
+    bytes[..2].copy_from_slice(&length.to_le_bytes());
+    bytes[4..6].copy_from_slice(&0xe003u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&0x64u16.to_le_bytes());
+    bytes[12..18].copy_from_slice(&[2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+    bytes[18] = rx;
+    bytes[19] = tx;
+    let words = map.checksum_words(length as usize).unwrap_or(0);
+    let sum = bytes[..words * 2]
+        .chunks_exact(2)
+        .fold(0u16, |sum, b| sum ^ u16::from_le_bytes([b[0], b[1]]));
+    bytes[2..4].copy_from_slice(&(sum ^ 0xffff).to_le_bytes());
+    bytes
+}
+
+fn smoke_ath9k_chip_revisions_follow_read_revisions() -> TestResult {
+    let cases = [
+        (0x000c_02ff, Some((Chip::Ar9285, 0xc0, 2))),
+        (0x0018_03ff, Some((Chip::Ar9287, 0x180, 3))),
+        (0x0018_01ff, Some((Chip::Ar9287, 0x180, 1))),
+        (0x0008_02ff, Some((Chip::Ar9280, 0x80, 2))),
+        (0x0004_01ff, Some((Chip::Ar9160, 0x40, 1))),
+        (0x0000_00d2, Some((Chip::Ar5416, 0xd, 2))),
+        (0x0000_00c1, Some((Chip::Ar5416, 0xc, 1))),
+        // AR9300 (AR9003 EDMA) and AR9271 (USB) are not these PCI parts.
+        (0x001c_02ff, None),
+        (0x0014_01ff, None),
+        (u32::MAX, None),
+    ];
+    for (srev, expected) in cases {
+        let got = Revision::decode(srev).map(|r| (r.chip, r.mac_version, r.mac_rev));
+        if got != expected {
+            return TestResult::Fail("AR_SREV decode differs from ath9k_hw_read_revisions");
+        }
+    }
+    let async_fifo = |srev| Revision::decode(srev).is_some_and(|r| r.ar9287_async_fifo());
+    if !async_fifo(0x0018_03ff) || async_fifo(0x0018_02ff) || async_fifo(0x000c_03ff) {
+        return TestResult::Fail("AR9287 1.3 async-FIFO gate wrong");
+    }
+    for (device, chip) in [
+        (0x0023, Chip::Ar5416),
+        (0x0024, Chip::Ar5416),
+        (0x0027, Chip::Ar9160),
+        (0x0029, Chip::Ar9280),
+        (0x002a, Chip::Ar9280),
+        (0x002b, Chip::Ar9285),
+        (0x002c, Chip::Ar9285),
+        (0x002d, Chip::Ar9287),
+        (0x002e, Chip::Ar9287),
+    ] {
+        if Chip::for_device(device) != Some(chip) {
+            return TestResult::Fail("PCI device inventory differs from hw.h");
+        }
+    }
+    if Chip::for_device(0x0030).is_some() || Chip::for_device(0x0032).is_some() {
+        return TestResult::Fail("AR9003 device mapped to an AR9002 profile");
+    }
+    if MAP_9287.bytes() != 726 || MAP_DEF.bytes() != 3256 || MAP_4K.bytes() != EEPROM_4K_BYTES {
+        return TestResult::Fail("EEPROM map sizes differ from eeprom.h");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_chip_revisions_follow_read_revisions
+);
+
+fn smoke_ath9k_ar9287_map_decode_two_chain_masks() -> TestResult {
+    // sizeof(struct ar9287_eeprom) = 727: Linux checksums min(727/2, 363).
+    for (rx, tx) in [(1, 1), (3, 3), (2, 1), (3, 1)] {
+        let mut image = chip_image(&MAP_9287, 727, rx, tx);
+        match decode_map(&MAP_9287, 2, 3, 0xa55a, &mut image) {
+            Ok(id) if id.rx_chainmask == rx && id.tx_chainmask == tx => {}
+            _ => return TestResult::Fail("valid AR9287 map refused"),
+        }
+    }
+    for (rx, tx) in [(0, 3), (4, 1), (3, 7)] {
+        let mut image = chip_image(&MAP_9287, 727, rx, tx);
+        if decode_map(&MAP_9287, 2, 3, 0xa55a, &mut image) != Err(BringUpError::BadIdentity) {
+            return TestResult::Fail("AR9287 chain mask beyond two chains accepted");
+        }
+    }
+    let mut short = chip_image(&MAP_9287, 727, 3, 3);
+    short[0..2].copy_from_slice(&30u16.to_le_bytes());
+    if decode_map(&MAP_9287, 2, 3, 0xa55a, &mut short) != Err(BringUpError::BadLength) {
+        return TestResult::Fail("truncated AR9287 header accepted");
+    }
+    let mut bad = chip_image(&MAP_9287, 727, 3, 3);
+    bad[700] ^= 1;
+    if decode_map(&MAP_9287, 2, 3, 0xa55a, &mut bad) != Err(BringUpError::BadChecksum) {
+        return TestResult::Fail("AR9287 checksum over full map ignored");
+    }
+    // The def map allows three chains, but AR9280 silicon has two.
+    let mut def = chip_image(&MAP_DEF, 3256, 7, 7);
+    if decode_map(&MAP_DEF, 3, 0, 0xa55a, &mut def.clone()).is_err()
+        || decode_map(&MAP_DEF, 2, 0, 0xa55a, &mut def) != Err(BringUpError::BadIdentity)
+    {
+        return TestResult::Fail("def-map chain bound not per chip");
+    }
+    // AR9285 4k map keeps its strict even-length rule and single chain.
+    let mut four = image(false);
+    four[18] = 3;
+    checksum(&mut four);
+    if decode_identity(2, 0xa55a, &mut four) != Err(BringUpError::BadIdentity) {
+        return TestResult::Fail("AR9285 accepted a two-chain mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_ar9287_map_decode_two_chain_masks
+);
+
+fn smoke_ath9k_ar9287_identify_reads_map_at_word_128() -> TestResult {
+    let mut io = Fake::new();
+    io.registers.insert(AR_SREV, 0x0018_03ff);
+    let image = chip_image(&MAP_9287, 727, 3, 3);
+    io.words.fill(0xffff);
+    io.words[0] = 0xa55a;
+    for (index, bytes) in image.chunks_exact(2).enumerate() {
+        io.words[MAP_9287.start_word + index] = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    let (revision, identity, read) = match identify_chip(&mut io, Chip::Ar9287) {
+        Ok(result) => result,
+        Err(_) => return TestResult::Fail("AR9287 identification failed"),
+    };
+    if revision.chip != Chip::Ar9287
+        || revision.mac_rev != 3
+        || identity.rx_chainmask != 3
+        || *read != *image
+    {
+        return TestResult::Fail("AR9287 identity/map corrupted");
+    }
+    let last = EEPROM_WINDOW + 4 * (MAP_9287.start_word + MAP_9287.words - 1) as u64;
+    if !io.ops.contains(&Op::Read(last))
+        || io.ops.contains(&Op::Read(last + 4))
+        || io.ops.contains(&Op::Read(EEPROM_WINDOW + 4 * 64))
+    {
+        return TestResult::Fail("AR9287 map not read at AR9287_EEP_START_LOC");
+    }
+    // Device/silicon mismatch is refused before any write.
+    let mut wrong = Fake::new();
+    if identify_chip(&mut wrong, Chip::Ar9287) != Err(BringUpError::UnsupportedRevision)
+        || wrong.ops.iter().any(|op| matches!(op, Op::Write(..)))
+    {
+        return TestResult::Fail("AR9285 silicon accepted as AR9287");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_ar9287_identify_reads_map_at_word_128
 );
