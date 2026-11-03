@@ -86,6 +86,14 @@ pub(super) fn service(w: &Window, memory: &Words, control_fence: u16, request: &
                     assert_eq!((request[2], request[3]), expected);
                     d.slpc_dcc.push((request[2], request[3]));
                 }
+                // SLPC_OPTIMIZED_STRATEGY_COMPUTE: the media GuC's start only.
+                26 if w.0.borrow().media_tlb.is_some() => {
+                    assert_eq!(request[3], 1);
+                    if mode == 11 {
+                        failure_response(memory, control_fence);
+                        return;
+                    }
+                }
                 27 | 28 => assert!(request[3] <= 1),
                 _ => panic!("unknown SLPC parameter"),
             }

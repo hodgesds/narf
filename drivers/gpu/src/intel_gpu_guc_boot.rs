@@ -1506,6 +1506,9 @@ mod tests {
         smallbar_reject: Option<u64>,
         smallbar_hold_flr: bool,
         slpc_dcc: Vec<(u32, u32)>,
+        // Every PC_SLPC_REQUEST (0x3003) and SETUP_PC_GUCRC (0x3004) the
+        // model's CT consumed, action word first, in order.
+        slpc_h2g: Vec<Vec<u32>>,
         profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,
@@ -3162,6 +3165,11 @@ mod tests {
             device.regs.insert(0x380dfc, 0);
             device.regs.insert(0x38a188, 0);
             device.regs.insert(0x1900e8, 0x8000_0000);
+            // GT1's MTL_MEDIAP_STATE_CAP (RPn 100, RP0 1150 MHz) and
+            // MTL_MPE_FREQUENCY (RPe 500 MHz). GT0's frequency fuses stay
+            // unset, so a media SLPC that read them would fail.
+            device.regs.insert(0x138020, (6 << 16) | 69);
+            device.regs.insert(0x13802c, 30);
         }
         (window, arena)
     }

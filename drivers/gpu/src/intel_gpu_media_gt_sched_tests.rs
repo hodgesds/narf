@@ -43,7 +43,7 @@ pub(super) struct Hw {
 /// GuC/GT resets self-clear with MIA held in reset and DMA idle, firmware
 /// DMA completes and authenticates, and the media MMIO mailbox answers the
 /// CT registration (1) and enable (0) requests.
-fn media_hw(w: &Window, hw: &Hw) {
+pub(super) fn media_hw(w: &Window, hw: &Hw) {
     let mut d = w.0.borrow_mut();
     let gt = d.regs.get(&0x38a188).copied().unwrap_or(0) & 1;
     d.regs.insert(0x380dfc, gt);

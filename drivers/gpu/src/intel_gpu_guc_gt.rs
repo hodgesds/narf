@@ -126,6 +126,9 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     /// bits) whose kernel wake the enclosing media owner holds while engines
     /// are programmed and scheduled. Every wake proof also checks them.
     media_wells: u16,
+    /// Standalone media GT power management started (`begin_media_power`):
+    /// the next reset first returns RC6 and powergating to the host.
+    media_power: bool,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -184,8 +187,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
 
     /// Finish HuC through the existing single scheduler/CT owner before public
     /// epoch admission. Optional PC failure never pretends HuC is available.
-    /// The media GuC runs no SLPC (xe_guc_pc_start is not modelled on GT1),
-    /// so its HuC authenticates once scheduling and default LRCs are ready.
+    /// `MediaGuc` reaches this only after GT1's SLPC is Running (a failed
+    /// media xe_guc_pc_start stops GT1 instead), so the media HuC
+    /// authenticates at once, after the default LRCs, as xe_uc_load_hw does.
     pub(crate) fn prepare_huc(&mut self, now: u64) -> Result<bool, GtError> {
         let Some(image) = self.parts.boot.huc_upload() else {
             return Ok(true);
@@ -286,6 +290,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             smallbar_busy_deadline: None,
             gen12_reset: None,
             media_wells: 0,
+            media_power: false,
         }
     }
 
@@ -1139,6 +1144,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn start_reset(&mut self, now: u64) -> Result<(), GtError> {
+        // Every caller holds a proven GT wake. A no-op unless the media GT's
+        // power management was started on this owner.
+        self.media_power_down();
         // Stop observation first; a busy MCR semaphore is retried by poll,
         // with all DMA owners retained and wake still held.
         if self.parts.eu_stall.is_some() && self.parts.boot.state() != BootState::Stopping {
@@ -1327,13 +1335,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     /// Start GuC SLPC/GUCRC. Optional: errors leave scheduling untouched.
+    /// The media GuC reads GT1's own fuses (xe_guc_pc.c per GT).
     pub fn begin_slpc(&mut self, now: u64) -> Result<(), GtError> {
         self.admit_scheduling()?;
-        let limits = crate::intel_gpu_slpc::Limits::read(
-            self.parts.boot.window(),
-            self.parts.boot.platform(),
-            self.parts.boot.device_id(),
-        )
+        let limits = match self.parts.boot.role() {
+            crate::intel_gpu_guc_boot::GuCRole::Primary => crate::intel_gpu_slpc::Limits::read(
+                self.parts.boot.window(),
+                self.parts.boot.platform(),
+                self.parts.boot.device_id(),
+            ),
+            crate::intel_gpu_guc_boot::GuCRole::Media(_) => {
+                crate::intel_gpu_slpc::Limits::read_media(self.parts.boot.window())
+            }
+        }
         .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
         self.admit_scheduling()?;
         let parts = &mut *self.parts;
@@ -2382,6 +2396,28 @@ impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi
         }
         reference_clock(rpm).ok_or(GtError::Unavailable)
     }
+
+    /// GT1 power management, as Linux runs it for the media GT: powergating
+    /// (xe_gt_idle.c::xe_gt_idle_enable_pg through GT1's window, without the
+    /// skip_guc_pc hysteresis writes) and then xe_guc_pc_start on the media
+    /// GuC, whose SETUP_PC_GUCRC(GUCRC_FIRMWARE_CONTROL) hands media C6 to
+    /// firmware. Only once per owner, with scheduling ready and GT1's wake
+    /// proven. From here every stop first returns C6 and powergating to the
+    /// host (`media_power_down`).
+    pub(crate) fn begin_media_power(&mut self, now: u64) -> Result<(), GtError> {
+        if self.media_power {
+            return Err(GtError::State);
+        }
+        self.admit_scheduling()?;
+        let engines = self.engines().ok_or(GtError::State)?;
+        self.media_power = true;
+        self.parts.boot.window().write32(
+            crate::intel_gpu_gt::media::POWERGATE_ENABLE,
+            crate::intel_gpu_gt::media::powergate_enable(engines),
+        );
+        // begin_slpc re-proves wake and access after the write.
+        self.begin_slpc(now)
+    }
 }
 
 /// xe_gt_clock.c::read_crystal_clock + xe_gt_clock_init: crystal selector
@@ -2412,6 +2448,28 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
     pub(crate) fn guc_role(&self) -> crate::intel_gpu_guc_boot::GuCRole {
         self.parts.boot.role()
+    }
+
+    /// Before the GuC reset of a GT whose media power management started,
+    /// with its wake held: xe_uc.c::xe_uc_gucrc_disable ->
+    /// xe_guc_pc_gucrc_disable (SETUP_PC_GUCRC(GUCRC_HOST_CONTROL), then
+    /// xe_gt_idle_disable_c6: RC_CONTROL = 0, RC_STATE = 0), as
+    /// gt_reset_worker does before xe_uc_stop, and xe_gt_idle_disable_pg
+    /// (POWERGATE_ENABLE = 0), as xe_gt_suspend does. NARF uses one verified
+    /// stop for media recovery, park and suspend, so each runs the whole
+    /// teardown; the next owner enables both again.
+    fn media_power_down(&mut self) {
+        if !core::mem::take(&mut self.media_power) {
+            return;
+        }
+        let parts = &mut *self.parts;
+        if let (Some(scheduler), Some(ct)) = (parts.scheduler.as_mut(), parts.ct.as_mut()) {
+            scheduler.release_gucrc(ct);
+        }
+        let window = parts.boot.window();
+        window.write32(crate::intel_gpu_gt::media::RC_CONTROL, 0);
+        window.write32(crate::intel_gpu_gt::media::RC_STATE, 0);
+        window.write32(crate::intel_gpu_gt::media::POWERGATE_ENABLE, 0);
     }
 }
 

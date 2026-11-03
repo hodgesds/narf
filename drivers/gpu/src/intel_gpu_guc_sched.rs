@@ -739,9 +739,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         r.slpc = Some(shared);
         self.slpc
-            .start(limits, now, self.platform)
+            .start(limits, now, self.platform, self.media_gt)
             .map_err(SchedulingError::Slpc)?;
         Ok(())
+    }
+
+    /// Hand RC6 back to the host before a stop (xe_guc_pc_gucrc_disable's
+    /// H2G); true when SETUP_PC_GUCRC(GUCRC_HOST_CONTROL) was queued.
+    pub(crate) fn release_gucrc<M: MmioWindow>(&mut self, ct: &mut XeLpgTransport<M, A>) -> bool {
+        self.slpc.release_gucrc(ct)
     }
 
     fn progress_slpc<M: MmioWindow>(

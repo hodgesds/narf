@@ -48,6 +48,12 @@
 //!   through the media CT (xe_guc_tlb_inval.c::send_tlb_inval_ggtt).
 //! - Every engine executes and retires a private PPGTT job before
 //!   `MediaGuc::publication` exposes GT1.
+//! - Power follows Linux per GT: xe_gt_idle_enable_pg (`powergate_enable`)
+//!   and xe_guc_pc_start on the media GuC (GT1's MTL_MEDIAP_STATE_CAP /
+//!   MTL_MPE_FREQUENCY limits, bounds, GUCRC firmware control, strategy,
+//!   profile) before publication. Every stop first runs
+//!   xe_guc_pc_gucrc_disable, xe_gt_idle_disable_c6 and
+//!   xe_gt_idle_disable_pg through GT1's window.
 //! - xe_gt_topology.c::xe_gt_topology_init also runs on GT1, so probe reads
 //!   GT1's own GSI-translated fuse mirrors (`MediaTopology`) for
 //!   xe_query.c::query_gt_topology; query_engine_cycles samples a published
@@ -115,6 +121,42 @@ const KERNEL_SLEEP: u32 = 0x0001_0000;
 const WAKE_NS: u64 = 50_000_000;
 const RESET_NS: u64 = 5_000_000;
 const GSC_PREPARE_NS: u64 = 200_000_000;
+
+/// regs/xe_gt_regs.h RC_CONTROL, RC_STATE and POWERGATE_ENABLE. All lie below
+/// MEDIA_GT_GSI_LENGTH, so GT1's copies are at its GSI base (`gsi`).
+pub(crate) const RC_CONTROL: u64 = 0xa090;
+pub(crate) const RC_STATE: u64 = 0xa094;
+pub(crate) const POWERGATE_ENABLE: u64 = 0xa210;
+const MEDIA_POWERGATE_ENABLE: u32 = 1 << 1;
+
+/// xe_gt_idle.c::xe_gt_idle_enable_pg for this GT1 profile (media 13.00):
+/// MEDIA_POWERGATE_ENABLE with any VCS/VECS, plus VDN_HCP_POWERGATE_ENABLE(n)
+/// (bit 3 + 2n) and VDN_MFXVDENC_POWERGATE_ENABLE(n) (bit 4 + 2n) for each
+/// present VCSn. A media GT gets no RENDER_POWERGATE_ENABLE
+/// (xe_gt_is_main_type), media 13.00 is outside the 11.00..12.55 sampler
+/// range, and Wa_14020316580 is MEDIA_VERSION(1301) only.
+pub(crate) fn powergate_enable(engines: EngineSet) -> u32 {
+    const VCS: [Engine; 8] = [
+        Engine::Vcs0,
+        Engine::Vcs1,
+        Engine::Vcs2,
+        Engine::Vcs3,
+        Engine::Vcs4,
+        Engine::Vcs5,
+        Engine::Vcs6,
+        Engine::Vcs7,
+    ];
+    let mut value = 0;
+    if engines.iter().any(Engine::is_media) {
+        value |= MEDIA_POWERGATE_ENABLE;
+    }
+    for (n, engine) in VCS.into_iter().enumerate() {
+        if engines.contains(engine) {
+            value |= 0b11 << (3 + 2 * n);
+        }
+    }
+    value
+}
 
 /// `xelpg_pat_table`: WB, WT, UC, WB 1-way coherent, WB 2-way coherent.
 pub(crate) const XELPG_PAT: [u32; 5] = [0x0, 0x4, 0xc, 0x2, 0x3];
@@ -946,6 +988,10 @@ pub enum MediaGucError {
     Wells(MediaError),
     /// A default-LRC capture or private PPGTT probe did not retire cleanly.
     Probe,
+    /// The media GuC's SLPC did not reach RUNNING with acknowledged bounds.
+    /// xe_uc.c::xe_uc_load_hw fails the uC load on a xe_guc_pc_start error,
+    /// so GT1 stops instead of publishing without power management.
+    Slpc,
     Unavailable,
     /// Stop could not be proven; firmware memory and the TLB hook stay held.
     Retained,
@@ -980,6 +1026,8 @@ enum Step {
     Priming,
     /// One private PPGTT job per engine.
     Probing,
+    /// Powergating enabled; the media GuC's SLPC start must reach RUNNING.
+    Power,
     /// A staged HuC reaches RUNNING or unavailable before publication.
     Huc,
     Published,
@@ -999,9 +1047,12 @@ pub(crate) struct MediaPublication {
 /// `GuCGt` owner over the media GSI window and shared GGTT arena. It
 /// registers as the arena's second GGTT TLB before firmware DMA, keeps its
 /// GuC-to-host interrupt half masked (its CT is polled), then schedules the
-/// fused VCS/VECS engines. No SLPC is admitted. With a staged HuC it
-/// authenticates the HuC after the default LRCs, as xe_uc_load_hw does after
-/// xe_gt_record_default_lrcs; a HuC failure never fails GT1.
+/// fused VCS/VECS engines. After the default LRCs and engine probes it enables
+/// GT1 powergating and starts the media GuC's SLPC, which hands media C6 to
+/// firmware; GT1 publishes only once SLPC is RUNNING, since xe_uc_load_hw
+/// fails on a xe_guc_pc_start error. With a staged HuC it then authenticates
+/// the HuC, as xe_uc_load_hw does after xe_guc_pc_start; a HuC failure never
+/// fails GT1.
 pub(crate) struct MediaGuc<
     M: MmioWindow + Clone,
     A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
@@ -1133,6 +1184,14 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     /// `Some(false)` unavailable, `None` while pending or without a HuC.
     pub(crate) fn huc_outcome(&self) -> Option<bool> {
         self.gt.huc_outcome()
+    }
+
+    /// GT1's confirmed SLPC limits, frequency range and power profile while
+    /// published, without MMIO. Absent during an update or after a later
+    /// SLPC failure, which, as on GT0, leaves the published engines running.
+    pub(crate) fn slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
+        self.publication()?;
+        self.gt.slpc_status()
     }
 
     /// Advance start, scheduling or stop by one bounded step.
@@ -1283,8 +1342,21 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
                     return Err(MediaGucError::Probe);
                 }
                 self.probes.clear();
-                self.step = Step::Huc;
-                self.huc_then_publish(now)
+                // xe_uc_load_hw: xe_guc_pc_start follows the default LRCs.
+                self.gt.begin_media_power(now).map_err(MediaGucError::Gt)?;
+                self.step = Step::Power;
+                Ok(false)
+            }
+            (Step::Power, GtState::SchedulingReady) => {
+                use crate::intel_gpu_slpc::SlpcState;
+                match self.gt.slpc() {
+                    SlpcState::Running => {
+                        self.step = Step::Huc;
+                        self.huc_then_publish(now)
+                    }
+                    SlpcState::Off | SlpcState::Unavailable => Err(MediaGucError::Slpc),
+                    SlpcState::Resetting { .. } | SlpcState::Updating => Ok(false),
+                }
             }
             (Step::Huc, GtState::SchedulingReady) => self.huc_then_publish(now),
             (Step::Published, GtState::SchedulingReady) => Ok(true),

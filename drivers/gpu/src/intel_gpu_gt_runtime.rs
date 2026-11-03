@@ -2476,6 +2476,18 @@ impl Owner {
                         self.pending.index,
                         "media GT1 published to native Xe; every VCS/VECS retired a private PPGTT job",
                     );
+                    if let Some(slpc) = guc.slpc_status() {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "intel-gt card{}: media GT1 SLPC running (RPn {} RPe {} RP0 {} MHz, range {}-{} MHz); GuC controls media C6",
+                            self.pending.index,
+                            slpc.limits.rpn_mhz,
+                            slpc.limits.rpe_mhz,
+                            slpc.limits.rp0_mhz,
+                            slpc.range.min_mhz,
+                            slpc.range.max_mhz,
+                        );
+                    }
                 }
             }
             core::task::Poll::Ready(Ok(MediaGucState::Stopped)) if guc.reclaimable() => {

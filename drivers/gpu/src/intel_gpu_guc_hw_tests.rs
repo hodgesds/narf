@@ -1334,7 +1334,8 @@ fn event(memory: &Words, action: u32, payload: &[u32]) {
     words[513] = (tail + 2 + payload.len() as u32) & 4095;
 }
 /// GuC SLPC model: 0 publishes RUNNING, 1 ERROR, 2 a RESPONSE_FAILURE to
-/// the reset request, 3 never answers.
+/// the reset request, 3 never answers. 11 refuses only the media GuC's
+/// SLPC_PARAM_STRATEGIES.
 static SLPC_FIXTURE_MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn failure_response(memory: &Words, fence: u16) {
@@ -1378,6 +1379,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
     for (control_fence, request) in requests {
         let action = request[0] as u16;
         actions.push(action);
+        if matches!(action, 0x3003 | 0x3004) {
+            w.0.borrow_mut().slpc_h2g.push(request.clone());
+        }
         match action {
             0x7000 => {
                 assert_eq!(request.len(), 3);
@@ -1719,7 +1723,12 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x40 | 0x302 | 0x30 => bcs8::stream_hw::service(w, &memory, control_fence, &request),
             0x4000 => huc_native::service_auth(w, &memory, control_fence, &request),
             0x3003 => service_slpc(w, &memory, control_fence, &request),
-            0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
+            // GUCRC_FIRMWARE_CONTROL; only the media GuC's stop hands RC6
+            // back with GUCRC_HOST_CONTROL (xe_guc_pc_gucrc_disable).
+            0x3004 if w.0.borrow().media_tlb.is_some() => {
+                assert!(matches!(&request[1..], [0] | [1]))
+            }
+            0x3004 => assert_eq!(&request[1..], &[1]),
             _ => panic!("unexpected action {action:x}"),
         }
     }
@@ -3516,6 +3525,10 @@ mod media_gt_sched {
 
 mod media_huc {
     include!("intel_gpu_media_huc_tests.rs");
+}
+
+mod media_gt_power {
+    include!("intel_gpu_media_gt_power_tests.rs");
 }
 
 mod coredump_exec {
