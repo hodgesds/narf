@@ -2187,18 +2187,39 @@ after owned scanout takeover. DG2/BMG register GT-only devices and start only
 when all inherited display planes are disabled; they do not gain display
 support (BMG VRAM is described above). The runtime-PM probe/forbid references
 hold this function and its upstream bridge active until a published GT allows
-autosuspend. Only discrete functions without a bound display are eligible; an
-owned iGPU scanout stays forbidden, as Linux's display wakeref keeps the
-device active. Eligible owners set a 1000 ms autosuspend delay, allow runtime
-PM and drop the probe reference. User submissions and engine-cycle reads hold
+autosuspend. `display_rpm::profile` decides eligibility: display-less
+discrete functions outside the small-BAR takeover (`DisplayLess`) and
+integrated MTL/Arrow or Gen12 functions with an owned display (`Display`).
+LNL/PTL headless takeover, small-BAR BMG, a discrete function with a display
+and an integrated function without one are refused with typed reasons.
+Eligible owners set a 1000 ms autosuspend delay, allow runtime PM and drop the
+probe reference. A `Display` owner first binds the function's runtime-PM
+device to `display_rpm`: every pipe reported lit holds one usage reference,
+the Linux display wakeref, so an owned lit panel keeps the function active.
+`intel_gpu_dc_states::pipe_lit_for_bar` takes it before a pipe's enable and
+`pipe_dark_for_bar` puts it with autosuspend after the disable. On display 14,
+every `DcRef` and the deferred DC re-entry task also hold a wakeref; it is
+taken only while the function is runtime-active, so a display conversation
+started while the function suspends fails closed (`DcError::Unavailable`)
+before any register access. Gen12 has no `DC_off` service and no dark report,
+so its owned Pipe A holds its wakeref for the card's lifetime. User submissions and engine-cycle reads hold
 a runtime-PM usage reference (`resume_and_get`); a submission keeps it until
 its fence is terminal. `runtime_suspend` refuses (Busy) unless the GT is
 running and `GuCGt::idle` (no registered, running or retiring context), no
-VRAM object exists (CPU BAR mappings cannot be revoked) and no system sleep
-is in progress. It then masks IRQs, proves the same full stop used for reset,
-reclaims the stopped GT and parks with the user epoch still published; the
-PCI layer saves configuration and enters D3hot. `runtime_resume` (after D0 and
-configuration restore) restarts the verified cold bring-up. Callers wait while
+VRAM object exists (CPU BAR mappings cannot be revoked), no display hold
+exists (`display_rpm::park_refusal`: lit pipes, `DC_off` references, a
+pending DC re-entry, a live external route or KMS work) and no system sleep
+is in progress. CPU mappings of system-memory objects are never an input.
+It then masks IRQs, proves the same full stop used for reset,
+reclaims the stopped GT and parks with the user epoch still published; a
+`Display` owner marks the retained DMC program for re-verification. The PCI
+layer saves configuration and enters D3hot; `d3cold::evaluate` names why
+D3cold is not used. `runtime_resume` (after D0 and
+configuration restore) restarts the verified cold bring-up. While a `Display`
+owner is runtime-suspended its worker runs no hotplug pass; one polled detect
+per 10 s takes a runtime-PM reference, which resumes the function, and holds
+it until the restarted GT settles. System-sleep preparation of a `Display`
+owner resumes the function first and holds that reference until resume. Callers wait while
 it runs. At publication `GuCGt::adopt_user_epoch` continues the parked epoch,
 which the scheduler refuses once it has run user work. Saved contexts then
 restore rather than ban. A failed resume clears the epoch like any loss, and
@@ -2645,7 +2666,8 @@ opt-in below). On TGL the retained main-GT worker
 acquires the authorized immutable canonical `i915/tgl_huc.bin` before WOPCM
 planning, retains its real upload/RSA backing through both boot passes and full
 shutdown, and uploads HuC before each GuC upload. Other platforms add no
-HuC firmware/DMA or positive query. TGL runtime autosuspend remains refused.
+HuC firmware/DMA or positive query. TGL runtime autosuspend is armed but its
+owned panel's display wakeref keeps the function active.
 Existing system-sleep/reset hooks close publication before stop and require a
 fresh source upload/auth/status sequence on restart; no live enable transition
 or hot-installed image adoption is exposed.
@@ -2865,8 +2887,8 @@ PCI parent kobject. Current initial-namespace CAP_SYS_ADMIN and the live epoch
 gate each store. A bounded one-request actor reports queued/applying/applied/
 failed request IDs; accepting bytes is not hardware completion. `on` resumes
 and retains the core PM forbid reference. `auto` and signed-i32 delay changes
-require the existing display-less dGPU eligibility and completed autosuspend
-setup. Negative delay holds a reference; nonnegative delay releases it.
+require an eligible runtime-PM profile (`DisplayLess` or `Display`) and
+completed autosuspend setup. Negative delay holds a reference; nonnegative delay releases it.
 The actor executes outside the GT mutex with current PCI authority and a
 bounded deadline. Loss/reset/S3 discards pending requests without replaying
 them. Confirmed card-lifetime core PM policy persists. Status/time reads sample
@@ -2925,7 +2947,8 @@ transforms.
 - `arm_if_due` re-enters the sanitized target, or returns a typed `ArmBlock`.
 - `pipe_lit`, `pipe_dark` and `enable_lit_pipes` tie pipe DMC enables to pipe
   lifetimes. The service hooks `pipe_lit_for_bar` / `pipe_dark_for_bar`
-  (public, inert without a display-14 service) are for every owner that
+  (public; the pipe DMC part is inert without a display-14 service, the
+  pipe's display wakeref is recorded on every IP) are for every owner that
   lights or darkens a pipe. Owners report through the `PipeDmc` trait
   (`enable_pipe` first in a crtc enable, `disable_pipe` last in a crtc
   disable); `ServicePipeDmc` calls the hooks with the service's BAR and
@@ -2933,6 +2956,13 @@ transforms.
   B–D owner each external pipe.
 - `begin_load`, `finish_load`, `release_held` and the
   `suspend_begin`/`commit`/`abort` methods manage the DMC lifecycle.
+- `runtime_suspend` (writes nothing) marks a loaded program before runtime
+  D3hot; `recheck_pending` reports the mark. `runtime_resume_verify` runs
+  first in `publication_step`: under a Load reference it verifies the main
+  program and marks a failed one `Lost`, so `begin_load` reloads it before
+  any re-entry. A failed DC exit keeps the mark. `runtime_suspend_for_bar`
+  and `busy_for_bar` (references held, re-entry pending) are the
+  crate-internal hooks the GT owner's park uses.
 
 `publication_step`, `arm_step`, `load_and_verify`, `open_firmware`,
 `write_dc_state_sticky` and `sanitize_target` are the composable steps that

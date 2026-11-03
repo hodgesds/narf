@@ -1119,9 +1119,13 @@ likewise a wiring step: the PM core owns the `Rc6`
 lifecycle (snapshotted posture, park, re-enable), and
 today nothing enables RC6 at probe, so in production the
 snapshot's RC6 bit is currently always off. D3cold is not
-used (the bus layer supports D3hot only; the link stays
-up and config survives). PSR/DC-state runtime policy and
-S0ix are out of scope.
+used. The PCI runtime layer has a `PciPlatformPm` seam, but no
+provider exists: there is no `_PR3` evaluation and no
+root-port PM read authority. `d3cold::evaluate` names the
+missing piece (§20, GT runtime power), and the link stays up
+and config survives. Runtime D3hot of the GuC owners, including
+integrated functions whose panel is dark, is described in §20.
+PSR/DC-state runtime policy and S0ix are out of scope.
 
 ## 14. External DisplayPort, full single-stream (lane Q4 — `intel_gpu_dp`, #1092)
 
@@ -2446,7 +2450,7 @@ production feature. Unsupported functionality remains unadvertised.
 | BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; native fixtures pass |
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
-| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; a lit iGPU panel keeps PCI autosuspend refused (Linux display wakeref) and idles through MTL/Arrow DC5/DC6 (§12.1); D3cold, mapping revocation, flush consumers and media power remain |
+| GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel would park with the DMC retained and re-verified and with 10 s polled hotplug, but no panel-off producer exists. System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
 The first four workstreams form the initial integration checkpoint. They do
@@ -5400,3 +5404,130 @@ Review against Linux b90c984d agreed on the following:
   `DP_FEC_STATUS` AUX write refuses the route. Linux only logs it.
 
 The debug group pass is deferred to the end of the campaign.
+
+### GT runtime power: display wakerefs, integrated autosuspend and D3cold — native fixtures added
+
+The sources are Linux b90c984d: `xe_pm.c` (`xe_pm_runtime_init`,
+`xe_pm_runtime_suspend`, `xe_pm_runtime_resume`,
+`xe_pm_pci_d3cold_capable`, `xe_pm_d3cold_allowed_toggle`,
+`vram_threshold_value`), `xe_pci.c` (the runtime suspend, resume and idle
+callbacks), `display/xe_display.c` (the runtime display PM hooks),
+`display/xe_display_rpm.c`, `intel_display_power.c`
+(`intel_display_power_get`, `__intel_display_power_put_async`),
+`intel_hotplug.c::i915_hpd_poll_init_work`, `drm_probe_helper.c`
+(`DRM_OUTPUT_POLL_PERIOD`), `xe_bo.c` (`mem_type_is_vram`,
+`__xe_bo_cpu_fault`, `xe_bo_cpu_fault`,
+`xe_bo_runtime_pm_release_mmap_offset`) and `pci.c` (`pci_pme_capable`,
+`pci_pr3_present`).
+
+**Which owners take part.** Linux allows runtime PM on every non-VF
+function and lets wakerefs decide. `display_rpm::profile` now admits
+integrated MTL/Arrow and Gen12 owners with an owned display, beside the
+display-less discrete functions. Those owners arm the same 1000 ms
+autosuspend and accept the sysfs `auto` and delay requests. LNL/PTL stay
+refused: every cold start needs a client-free driver FLR, so no parked user
+epoch could continue. Small-BAR BMG stays D0-only.
+
+**Display wakerefs.** In Linux each held display power domain is a runtime-PM
+reference, and a lit pipe holds its crtc domains from before its enable to
+after its disable. Here, every pipe reported lit holds one usage reference on
+the function's runtime-PM device. The reports come from
+`pipe_lit_for_bar` and `pipe_dark_for_bar`: KMS install reports the owned
+Pipe A, the MTL modeset reports Pipe A around its own disable and enable, and
+the Pipe B–D owner reports each external pipe. A lit panel therefore keeps
+the function active, matching Linux, and the RPM core never even calls the
+park. On display 14 every `DC_off` reference and the 17 ms DC re-entry task
+also hold a reference, as Linux's async put does. They are taken only while
+the function is runtime-active. A display conversation that starts while the
+function is suspending or suspended fails closed before any register access.
+Gen12 has no `DC_off` service and no dark report, so its Pipe A wakeref lasts
+for the card's lifetime.
+
+**Park and resume.** `display_rpm::park_refusal` re-reads every display hold
+under the GT mutex: lit pipes, `DC_off` references, a pending DC re-entry, a
+live external route and in-flight KMS work. CPU mappings of system-memory
+objects are never an input. Linux revokes CPU mmaps only for VRAM objects,
+on its `vram_userfault` list, and system pages stay valid across D3hot. So
+an integrated function needs no revocation, and none is done. The display
+side follows the Linux D3hot path:
+
+- Linux keeps the DMC program and the DC target across D3hot. The park marks
+  the loaded program, and the first publication after the resume verifies
+  it under a Load reference before DC5/DC6 is trusted again. A lost program
+  is reloaded in that same pass, and the lit pipes' DMC is re-enabled.
+- `intel_hpd_poll_enable` becomes the card worker's hotplug policy. While
+  the function is runtime-suspended, no per-iteration pass runs. Every 10 s
+  one polled detect takes a runtime-PM reference, which resumes the
+  function. The reference is held until the restarted GT settles, so the
+  following autosuspend sees a running GT.
+- The GT restart reloads GuC, re-establishes SLPC and GuC-controlled RC6,
+  and replays the confirmed SLPC policy. NARF has no display interrupt, so
+  there is no HPD interrupt to re-arm. The KMS owner re-proves its retained
+  resource image, including IPC, on its next use.
+
+System-sleep preparation of these owners first takes a runtime-PM reference,
+as `pci_pm_suspend` resumes a runtime-suspended function. It holds that
+reference until resume.
+
+**Live VRAM mappings: blocked on the memory layer.** Discrete owners still
+refuse the park while any VRAM is allocated. Linux zaps the user PTEs of
+CPU-faulted VRAM objects (`drm_vma_node_unmap`) and refaults them through
+`xe_bo_cpu_fault` under a runtime-PM reference. NARF's Intel mmap installs
+eager device-frame backings. The only revocation primitive,
+`narf_filesystem::mmap_relocation::relocate`, freezes and swaps frames
+synchronously. `unmap_mapping_range` only zaps suffixes of fault-backed file
+mappings. Two APIs are needed in `userspace/src/mapped_file.rs` and
+`narf_memory::address_space`, which are TCB:
+
+- a revoke operation over a device-frame set that invalidates every user PTE
+  and fork alias, keeps the VMAs, and completes the TLB shootdown before it
+  returns;
+- a per-mapping refault hook that may await the driver's runtime resume and
+  then re-installs the same frame.
+
+They were not added here.
+
+**D3cold.** `d3cold::evaluate` gives a typed refusal, and every park logs
+it with the `xe_pm_d3cold_allowed_toggle` result. An integrated endpoint has
+no root port. A discrete function lacks three things:
+
+- read authority over its root port's PM capability, for PME from D3cold;
+- an ACPI companion lookup that evaluates `_PR3`;
+- a `PciPlatformPm` provider that turns those power resources off and on.
+
+The runtime-PM node is therefore still registered without a platform
+provider, and the PCI layer stops at D3hot. The VRAM threshold (300 MiB,
+rounded up per MiB) is implemented and tested, but no production function
+reaches it.
+
+**What remains.** No producer turns the internal panel off. Atomic
+`ACTIVE=0` and `SETCRTC` without a framebuffer restore the console by
+design. `FBIOBLANK` is a no-op in `fb/`, and there is no connector DPMS
+property. A panel-off transition is a full crtc disable: PSR, backlight,
+transcoder, DDI, PHY, PPS, pipe DMC, then the PM demand, DBUF and CDCLK
+lowering. That belongs to the display-14 and Gen12 modeset owners. Once a
+producer reports the pipe dark, the hooks above park the function. A Gen12
+producer must first give its display conversations wakerefs, and must park
+the PWM backlight. VRAM revocation, D3cold with eviction and the full
+restore path, additional flush consumers and media-GT power management
+remain open. Linux's DMI quirk for BMG on NUC13RNG is not modelled, since
+D3cold is never capable here.
+
+Native fixtures, new and unexecuted in this slice:
+
+- `drivers/gpu/intel_gpu_power`:
+  `smoke_display_rpm_lit_panel_keeps_d0_and_dark_panel_autosuspends`,
+  `smoke_display_rpm_wakeref_races_with_suspend_fail_closed`,
+  `smoke_display_rpm_bind_counts_lit_pipes_and_rebind_returns_refs`,
+  `smoke_display_rpm_park_admission_holds_and_system_memory_mappings`,
+  `smoke_display_rpm_profiles_admit_integrated_displays_only`,
+  `smoke_display_rpm_hpd_poll_waits_one_period_per_detect`,
+  `smoke_d3cold_capability_refusals_follow_xe_pm_order` and
+  `smoke_d3cold_vram_threshold_rounds_up_and_refuses_at_limit`.
+- `drivers/gpu/intel_gpu_dc_states`:
+  `smoke_dc_states_runtime_d3hot_keeps_program_and_reverifies_on_resume`.
+
+The fixtures drive the real runtime-PM core and PCI layer over a model
+config space and a fake clock. The GT owner's own park and unpark, the
+polled detect and the system-sleep reference are wired but run only on
+hardware.
