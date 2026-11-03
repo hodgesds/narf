@@ -93,6 +93,10 @@ struct State {
     smallbar_takeover: Option<crate::intel_gpu_gt::smallbar::Takeover>,
     smallbar_authority: Option<Arc<crate::intel_gpu_gt::smallbar::Authority>>,
     smallbar_grant_deadline: Option<u64>,
+    /// MTL/Arrow standalone media GT owner of this running GT0 incarnation.
+    /// Its refusal is terminal for the incarnation and never reaches GT0.
+    media: Option<crate::intel_gpu_gt::media::MediaGt>,
+    media_reported: bool,
 }
 
 struct Pending {
@@ -1091,6 +1095,8 @@ pub(crate) fn start_pending() {
                 smallbar_takeover: None,
                 smallbar_authority: None,
                 smallbar_grant_deadline: None,
+                media: None,
+                media_reported: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -1498,6 +1504,9 @@ impl Owner {
     }
 
     fn step(&self, state: &mut State, reconfiguration_power: bool) -> Result<(), RuntimeError> {
+        if state.phase != Phase::Running {
+            self.retire_media(state);
+        }
         if let Some(session) = crate::intel_gpu_guc_log::stream::take_requested(self.pending.index)
         {
             let admitted = if state.phase == Phase::Running
@@ -1786,6 +1795,7 @@ impl Owner {
                     }
                     _ => {}
                 }
+                self.service_media(state, now);
             }
             (Phase::Cleaning, GtState::Stopped) => {
                 state.phase = if state.recovery.after_stop(gt).map_err(RuntimeError::Gt)? {
@@ -1963,6 +1973,7 @@ impl Owner {
                         error
                     );
                     state.phase = Phase::Failed;
+                    self.retire_media(&mut state);
                     // All owner-specific diagnostics/IRQ/admission/display
                     // ordering above precedes the shared hardware cleanup.
                     let State { recovery, gt, .. } = &mut *state;
@@ -2117,6 +2128,72 @@ impl Owner {
     }
 }
 
+impl Owner {
+    /// Start or advance the MTL/Arrow standalone media GT (GT1) beside a
+    /// running GT0. One attempt per GT0 incarnation; any refusal is logged
+    /// once, its wake requests are released and GT0 is never affected.
+    /// The media GuC stays in reset and GT1 is not published to userspace.
+    fn service_media(&self, state: &mut State, now: u64) {
+        let Some(platform) =
+            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device)
+                .filter(|platform| crate::intel_gpu_gt::media::profile_eligible(*platform))
+        else {
+            return;
+        };
+        if self.suspended.load(Ordering::Acquire) {
+            return;
+        }
+        if state.media.is_none() {
+            let Some(facts) = *self.user_facts.lock() else {
+                return;
+            };
+            state.media_reported = false;
+            state.media = Some(crate::intel_gpu_gt::media::MediaGt::new(
+                platform,
+                facts.graphics_version,
+            ));
+        }
+        let media = state.media.as_mut().expect("media owner");
+        let core::task::Poll::Ready(result) = media.poll(&self.pending.window, now, || {
+            narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                == Ok(Some(narf_bus::pci::PciPowerState::D0))
+        }) else {
+            return;
+        };
+        if core::mem::replace(&mut state.media_reported, true) {
+            return;
+        }
+        use core::fmt::Write as _;
+        let _ = match result {
+            Ok(facts) => writeln!(
+                narf_console::Writer,
+                "intel-gt card{}: media GT {}.{:02} step {} initialized (fuse {:#x}, engines {:#x}); media GuC held in reset, GT1 unpublished",
+                self.pending.index,
+                facts.ip.version / 100,
+                facts.ip.version % 100,
+                facts.ip.step,
+                facts.fuse,
+                facts.engines.bits(),
+            ),
+            Err(error) => writeln!(
+                narf_console::Writer,
+                "intel-gt card{}: media GT not started ({:?}); GT0 unaffected",
+                self.pending.index,
+                error
+            ),
+        };
+    }
+
+    /// Release this incarnation's media GT wake requests before any GT0
+    /// stop, park, suspend or fault cleanup. Writes only media registers.
+    fn retire_media(&self, state: &mut State) {
+        if let Some(mut media) = state.media.take() {
+            media.abandon(&self.pending.window);
+        }
+        state.media_reported = false;
+    }
+}
+
 pub(crate) fn autosuspend_profile_eligible(platform: Option<GtPlatform>, has_mode: bool) -> bool {
     platform.is_some_and(GtPlatform::is_discrete) && !has_mode
 }
@@ -2182,6 +2259,7 @@ impl Owner {
                 })?
         };
         state.irq.take(); // mask and synchronize while still in D0
+        self.retire_media(&mut state);
         self.close_controls();
         // Runtime park preserves user_epoch but retires this firmware upload.
         // A queued diagnostic open must never migrate to the resumed image.
@@ -2319,6 +2397,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             self.suspended.store(true, Ordering::Release);
             self.close_user_epoch();
             state.irq.take(); // mask/synchronize while the function is in D0
+            self.retire_media(&mut state);
             state.saved = None;
             // System sleep loses context state: no runtime epoch survives it.
             state.parked_epoch = None;
