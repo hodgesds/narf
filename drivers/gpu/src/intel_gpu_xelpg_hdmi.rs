@@ -576,6 +576,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         &probe.mode,
         &fb,
         probe.pll.port_clock_khz,
+        None,
     ) {
         Ok(ext) => ext,
         Err(e) => return Err((Err(probe), e.into())),

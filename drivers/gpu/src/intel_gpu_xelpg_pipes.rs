@@ -116,6 +116,8 @@ pub(crate) struct ExternalPipe {
     pub(crate) port_clock_khz: u32,
     /// Non-Type-C PHY index, `None` for Type-C.
     pub(crate) combo_phy: Option<u8>,
+    /// The route's VDSC term when it compresses (DP DSC).
+    pub(crate) dsc: Option<crate::intel_gpu_xelpg_dsc::DscTerm>,
 }
 
 /// Typed pipe-owner failures.
@@ -191,7 +193,7 @@ fn request(ext: &ExternalPipe) -> PipeRequest {
         cursor_visible: false,
         port_clock_khz: ext.port_clock_khz,
         combo_phy: ext.combo_phy,
-        dsc: None,
+        dsc: ext.dsc,
     }
 }
 

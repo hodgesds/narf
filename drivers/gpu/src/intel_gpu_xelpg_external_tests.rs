@@ -40,6 +40,16 @@ pub struct Sink {
     pub max_good_lanes: u8,
     pub nack_all: bool,
     pub power_log: Vec<u8>,
+    /// DSC capabilities at DPCD 0x060..=0x06F.
+    pub dsc: [u8; 16],
+    /// `DP_FEC_CAPABILITY`.
+    pub fec_cap: u8,
+    /// `DP_FEC_CONFIGURATION`, `DP_DSC_ENABLE` and `DP_FEC_STATUS`.
+    pub fec_config: u8,
+    pub dsc_enable: u8,
+    pub fec_status: u8,
+    /// Native writes to the DSC/FEC registers, in order.
+    pub dsc_log: Vec<(u32, u8)>,
 }
 
 impl Sink {
@@ -61,6 +71,12 @@ impl Sink {
             max_good_lanes: 0,
             nack_all: false,
             power_log: Vec::new(),
+            dsc: [0; 16],
+            fec_cap: 0,
+            fec_config: 0,
+            dsc_enable: 0,
+            fec_status: 0,
+            dsc_log: Vec::new(),
         }
     }
     pub fn drop_lock(&mut self) {
@@ -95,6 +111,19 @@ impl Sink {
             }
             0x203 => self.status_byte(),
             0x204 => self.eq_locked as u8,
+            0x060..=0x06F => self.dsc[(addr - 0x060) as usize],
+            0x090 => self.fec_cap,
+            0x120 => self.fec_config,
+            0x160 => self.dsc_enable,
+            // The decoder reports FEC once the source sends it (ready, and
+            // the link trained).
+            0x280 => {
+                if self.fec_config & 1 != 0 && self.eq_locked {
+                    self.fec_status | 1
+                } else {
+                    self.fec_status
+                }
+            }
             _ => 0,
         }
     }
@@ -111,6 +140,14 @@ impl Sink {
             0x102 => {
                 self.pattern = value & 0x7;
                 self.polls = 0;
+            }
+            0x120 | 0x160 | 0x280 => {
+                self.dsc_log.push((addr, value));
+                match addr {
+                    0x120 => self.fec_config = value,
+                    0x160 => self.dsc_enable = value,
+                    _ => self.fec_status &= !value,
+                }
             }
             0x600 => {
                 self.power_log.push(value);
@@ -2434,6 +2471,191 @@ fn smoke_mtl_external_pm_demand_at_route_port_clock() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_pm_demand_at_route_port_clock
+);
+
+/// A DP 1.4 monitor's DSC 1.2 capabilities: 1/2/4 slices, 9-bit line
+/// buffer, block prediction, no maximum bpp, 1/16 bpp increments and an
+/// 850/340 MP/s per-slice throughput.
+const MONITOR_DSC: [u8; 16] = [
+    0x01, 0x21, 0x00, 0x0f, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x01, 0x06, 0x0b, 0x08, 0x00, 0x00, 0x00,
+];
+
+/// 3840x2160@60 (CTA VIC 97 timing) on a one-lane HBR3 DSC sink.
+fn dsc_monitor(fec: bool) -> Sink {
+    let mut sink = Sink::new(0x1e, edid_for(594_000, 3840, 560, 176, 88, 2160, 90, 8, 10));
+    sink.caps[2] = 1 | 0x40 | 0x80;
+    sink.dsc = MONITOR_DSC;
+    sink.fec_cap = u8::from(fec);
+    sink
+}
+
+fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
+    use crate::intel_gpu_xelpg_dsc::{
+        decide_dp, DpDscSink, DscDpcd, DscSink, LinkLimits, DP_TP_CTL_FEC_ENABLE,
+        DP_TP_STATUS_FEC_ENABLE_LIVE,
+    };
+    // 594 MHz needs 1782000 kBps at 24 bpp and 1336500 at 18; one HBR3
+    // lane carries 810000. Linux compresses with FEC: 169/16 bpp, two
+    // slices on two engines, HBR3 x1.
+    let io = ExtFake::new(XeLpgPort::B, dsc_monitor(true));
+    io.phy.write32(0x6_1544, DP_TP_STATUS_FEC_ENABLE_LIVE);
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the DSC monitor must probe"),
+    };
+    let sink = DpDscSink {
+        dsc: DscSink {
+            dpcd: DscDpcd(MONITOR_DSC),
+            is_edp: false,
+            fec_capable: true,
+        },
+        branch: false,
+    };
+    let Ok(Some(plan)) = decide_dp(&sink, &LinkLimits::standard(810_000, 1), &probe.mode) else {
+        return TestResult::Fail("the monitor must need DSC");
+    };
+    if probe.dsc != Some(plan)
+        || (
+            plan.link_rate,
+            plan.lanes,
+            plan.compressed_bpp_x16,
+            plan.slice_count,
+        ) != (810_000, 1, 169, 2)
+        || probe.negotiated.rate != TrainRate::Hbr3
+        || probe.negotiated.lanes != 1
+        || probe.negotiated.over_budget
+    {
+        return TestResult::Fail("the probe must carry Linux's DSC plan and its link");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the compressed route must light"),
+    };
+    let writes = io.writes.borrow().clone();
+    // Pipe B's engines, transcoder B's PPS SDP and compressed M/N.
+    let engines: Vec<(u64, u32)> = writes
+        .iter()
+        .copied()
+        .filter(|&(r, _)| (0x7_8200..0x7_8400).contains(&r))
+        .collect();
+    let sdp = plan.pps_sdp();
+    let mn = plan.m_n(&route.probe.mode);
+    if engines != plan.engine_writes(Pipe::B)
+        || (0..33).any(|i| io.writes_to(0x6_1350 + 4 * i as u64) != [sdp[i]])
+        || io.read32(0x6_1200) & (1 << 24) == 0
+        || io.writes_to(0x6_1030) != [mn[0]]
+        || io.writes_to(0x6_1044) != [mn[3]]
+        || io.read32(DP_TP_CTL_B) & DP_TP_CTL_FEC_ENABLE == 0
+    {
+        return TestResult::Fail("Pipe B must compress with the plan's engines, SDP and M/N");
+    }
+    // The sink: D0, decompression and FEC ready before training; FEC
+    // decode detected after the transcoder enable.
+    let sink = io.sink.borrow();
+    if sink.dsc_log[..3] != [(0x160, 1), (0x120, 1), (0x280, 3)] || !sink.powered {
+        return TestResult::Fail("DSC and FEC ready must reach the sink before training");
+    }
+    drop(sink);
+    let pos = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(o, v)| f(o, v));
+    let fec = pos(&|o, v| o == DP_TP_CTL_B && v & DP_TP_CTL_FEC_ENABLE != 0);
+    let normal = pos(&|o, v| o == DP_TP_CTL_B && v & (7 << 8) == 3 << 8);
+    let pps = pos(&|o, _| o == 0x6_1350);
+    let ctl2 = pos(&|o, _| o == 0x7_8204);
+    let enable = pos(&|o, v| o == PIPECONF_B && v & ENABLE != 0);
+    match (normal, fec, pps, ctl2, enable) {
+        (Some(n), Some(f), Some(p), Some(c), Some(e)) if n < f && f < p && p < c && c < e => {}
+        _ => return TestResult::Fail("FEC, the PPS SDP and the engines precede TRANSCONF"),
+    }
+    // PM demand takes the plan's HBR3 port clock.
+    let demand = crate::intel_gpu_pmdemand::Params::decode(
+        io.read32(0x4_5230),
+        io.read32(PMDEMAND_REQUEST1),
+    );
+    if demand.ddiclk_max != 810 {
+        return TestResult::Fail("PM demand must run at the compressed link's HBR3");
+    }
+    // Stop: sink decompression off before TRANSCONF, engines and the SDP
+    // after the function deselect, FEC after DP_TP_CTL, then FEC ready.
+    io.writes.borrow_mut().clear();
+    io.sink.borrow_mut().dsc_log.clear();
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped {
+        return TestResult::Fail("the compressed route must stop");
+    }
+    let writes = io.writes.borrow().clone();
+    let pos = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(o, v)| f(o, v));
+    let off = pos(&|o, v| o == PIPECONF_B && v & ENABLE == 0);
+    let func = pos(&|o, v| o == TRANS_DDI_FUNC_CTL_B && v & TRANS_DDI_FUNC_ENABLE == 0);
+    let ctl2 = pos(&|o, v| o == 0x7_8204 && v == 0);
+    let dip = pos(&|o, v| o == 0x6_1200 && v & (1 << 24) == 0);
+    let tp_off = pos(&|o, v| o == DP_TP_CTL_B && v & DP_TP_CTL_ENABLE == 0);
+    let fec_off =
+        pos(&|o, v| o == DP_TP_CTL_B && v & (DP_TP_CTL_ENABLE | DP_TP_CTL_FEC_ENABLE) == 0);
+    let sink = io.sink.borrow();
+    if sink.dsc_log != [(0x160, 0), (0x120, 0)] || sink.dsc_enable != 0 || sink.fec_config != 0 {
+        return TestResult::Fail("the sink's decompression and FEC ready must go off");
+    }
+    drop(sink);
+    match (off, func, ctl2, dip, tp_off, fec_off) {
+        (Some(o), Some(f), Some(c), Some(d), Some(t), Some(x))
+            if o < f && f < c && c < d && d < t && t < x => {}
+        _ => return TestResult::Fail("the DSC stop must follow intel_ddi_post_disable"),
+    }
+    if io.read32(0x7_8204) != 0 || io.read32(DP_TP_CTL_B) & DP_TP_CTL_FEC_ENABLE != 0 {
+        return TestResult::Fail("the engines and FEC must end off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_dsc_with_fec_lights_and_stops
+);
+
+fn smoke_mtl_external_dp_dsc_refusals_precede_programming() -> TestResult {
+    use crate::intel_gpu_xelpg_dsc::DscRefusal;
+    // Without FEC a DP sink cannot take DSC; 4K60 on one HBR3 lane has no
+    // uncompressed fit either. Refused at probe, before any pipe write.
+    let io = ExtFake::new(XeLpgPort::B, dsc_monitor(false));
+    if probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false).err()
+        != Some(ExternalError::Dsc(DscRefusal::FecUnsupported))
+        || !io.writes_to(PIPECONF_B).is_empty()
+        || io.aux_power.get()
+    {
+        return TestResult::Fail("a sink without FEC must refuse DSC at probe");
+    }
+    // Two HBR3 lanes carry 18 bpp: Linux's 6 bpc, not this pipe's.
+    let mut sink = dsc_monitor(true);
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    if probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false).err()
+        != Some(ExternalError::Dsc(DscRefusal::SixBpcUnqualified))
+    {
+        return TestResult::Fail("an 18 bpp fit must refuse as unqualified");
+    }
+    // A sink that does not decompress keeps the uncompressed refusal.
+    let mut sink = dsc_monitor(true);
+    sink.dsc = [0; 16];
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    if !matches!(
+        probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false),
+        Err(ExternalError::OverBudget { .. })
+    ) {
+        return TestResult::Fail("a sink without DSC keeps OverBudget");
+    }
+    // A DSC sink whose link carries 24 bpp is not compressed.
+    let mut sink = Sink::new(0x14, edid_1080());
+    sink.dsc = MONITOR_DSC;
+    sink.fec_cap = 1;
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    match probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+        Ok(probe) if probe.dsc.is_none() => {}
+        _ => return TestResult::Fail("an uncompressed fit must not compress"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_dsc_refusals_precede_programming
 );
 
 fn smoke_mtl_external_route_arm_runs_inside_irq_masked_evasion() -> TestResult {

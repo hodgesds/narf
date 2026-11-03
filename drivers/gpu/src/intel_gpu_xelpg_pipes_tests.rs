@@ -49,6 +49,7 @@ fn external(pipe: Pipe) -> ExternalPipe {
         stride_bytes: 5120,
         port_clock_khz: 270_000,
         combo_phy: Some(1),
+        dsc: None,
     }
 }
 

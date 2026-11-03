@@ -73,9 +73,29 @@
 //! (the KMS fixed profile requires it). 8 bpc RGB,
 //! DP 1.4 rates RBR–HBR3 with the C10/C20 tables in
 //! [`crate::intel_gpu_xelpg`]; a stream whose demand exceeds the
-//! negotiated ceiling refuses (no DSC). UHBR (128b/132b, C20 MPLLA),
-//! MST, FEC/DSC, TBT-alt tunnels, audio and lane reversal are refused or
-//! unadvertised (HDMI is the separate route described below). Per-iteration source pattern/level updates
+//! negotiated ceiling refuses unless the sink decompresses DSC (below).
+//! UHBR (128b/132b, C20 MPLLA), MST, TBT-alt tunnels, audio and lane
+//! reversal are refused or unadvertised (HDMI is the separate route
+//! described below).
+//!
+//! ## DSC with FEC
+//!
+//! A DPCD 1.4+ sink reports its DSC and FEC capabilities at probe
+//! (`intel_dp_get_dsc_sink_cap`). For a sink that decompresses,
+//! `intel_dp_compute_link_config` decides with the 8 bpc pipe
+//! ([`crate::intel_gpu_xelpg_dsc::decide_dp`]): 24 bpp that fits keeps the
+//! uncompressed negotiation; otherwise the route compresses at Linux's
+//! highest fitting bpp, rate and lane count with FEC, or refuses typed
+//! ([`ExternalError::Dsc`]). A compressed route follows
+//! `mtl_ddi_pre_enable_dp`: `DP_SET_POWER` D0, `DP_DSC_ENABLE` and
+//! `DP_FEC_CONFIGURATION` before training, `DP_TP_CTL` FEC enable and the
+//! PPS SDP after the normal pattern; then `hsw_crtc_enable`'s
+//! `intel_dsc_enable` on the route's pipe, the compressed M/N, and after the
+//! transcoder enable `intel_ddi_wait_for_fec_status` (best effort, as Linux
+//! only logs it). The stop reverses it: sink decompression off before the
+//! transcoder, `intel_dsc_disable` and the PPS SDP enable after the function
+//! deselect, FEC off after `DP_TP_CTL`, then the sink's FEC ready. The
+//! Pipes owner already sets display 14's `DP_FEC_BS_JITTER_WA`. Per-iteration source pattern/level updates
 //! inside the shared training loop keep the existing MTL simplification:
 //! TPS1 and zero levels are staged before training, the trained levels
 //! after.
@@ -109,6 +129,7 @@ use crate::intel_gpu_xelpg::{
     program_port_buf_ctl, set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
     Cx0Phy, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
+use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
     activate_hdmi, probe_hdmi, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
 };
@@ -230,6 +251,9 @@ pub enum ExternalError {
     Quarantined,
     /// Display DC states could not be exited; nothing was touched.
     DisplayPower,
+    /// The stream needs a DSC configuration Linux would not choose or this
+    /// driver does not qualify (nothing was programmed).
+    Dsc(DscRefusal),
 }
 
 impl From<TcError> for ExternalError {
@@ -454,6 +478,7 @@ pub(crate) fn external_pipe(
     mode: &Mode,
     fb: &Framebuffer,
     port_clock_khz: u32,
+    dsc: Option<dsc::DscTerm>,
 ) -> Result<ExternalPipe, ExternalError> {
     let surface = u32::try_from(fb.phys_addr)
         .map_err(|_| ExternalError::Modeset(ModesetError::InvalidFramebuffer))?;
@@ -464,6 +489,7 @@ pub(crate) fn external_pipe(
         stride_bytes: fb.stride_bytes,
         port_clock_khz,
         combo_phy: port.tc_index().is_none().then_some(port.phy_index() as u8),
+        dsc,
     })
 }
 
@@ -521,6 +547,9 @@ pub struct MtlSinkProbe {
     pub edid: [u8; EDID_CAPACITY],
     /// Valid EDID length.
     pub edid_len: usize,
+    /// The DSC configuration when the stream needs compression; the
+    /// negotiated link is then the plan's.
+    pub dsc: Option<DscPlan>,
 }
 
 impl MtlSinkProbe {
@@ -600,7 +629,45 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         max_rate: TrainRate::Hbr3,
         max_lanes: tc.map_or(4, |conn| conn.max_lanes),
     };
-    let negotiated = negotiate(&source, &caps, stream_demand_kbps(mode.pixel_clock_khz, 24));
+    let mut negotiated = negotiate(&source, &caps, stream_demand_kbps(mode.pixel_clock_khz, 24));
+    // intel_dp_get_dsc_sink_cap, then intel_dp_compute_link_config for a
+    // sink that decompresses.
+    let sink = dsc::read_dp_sink(&mut aux, &raw)
+        .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
+    let mut plan = None;
+    if sink.dsc.dpcd.supports_dsc() {
+        let ceiling = if source.max_rate.rate_kbps() <= caps.max_rate.rate_kbps() {
+            source.max_rate
+        } else {
+            caps.max_rate
+        };
+        let limits = dsc::LinkLimits::standard(
+            link_clock_khz(ceiling),
+            source.max_lanes.min(caps.max_lanes),
+        );
+        match dsc::decide_dp(&sink, &limits, &mode) {
+            Ok(None) => {}
+            Ok(Some(p)) => {
+                let rate = train_rate_for(p.link_rate)
+                    .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
+                negotiated = NegotiatedLink {
+                    rate,
+                    lanes: p.lanes,
+                    demand_kbps: dsc::link_required(
+                        u32::from(p.lanes),
+                        mode.pixel_clock_khz,
+                        u32::from(mode.h_active),
+                        u32::from(p.compressed_bpp_x16),
+                        p.fec,
+                    ) * 8,
+                    payload_kbps: rate.payload_kbps(p.lanes),
+                    over_budget: false,
+                };
+                plan = Some(p);
+            }
+            Err(refusal) => return Err(rollback(ExternalError::Dsc(refusal))),
+        }
+    }
     if negotiated.over_budget {
         return Err(rollback(ExternalError::OverBudget {
             demand_kbps: negotiated.demand_kbps,
@@ -620,7 +687,19 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         ssc: dp_ssc_enabled(true, max_downspread),
         edid,
         edid_len,
+        dsc: plan,
     })
+}
+
+/// The training rate of a Linux link rate (RBR..HBR3).
+fn train_rate_for(link_rate: u32) -> Option<TrainRate> {
+    match link_rate {
+        162_000 => Some(TrainRate::Rbr),
+        270_000 => Some(TrainRate::Hbr),
+        540_000 => Some(TrainRate::Hbr2),
+        810_000 => Some(TrainRate::Hbr3),
+        _ => None,
+    }
 }
 
 /// Route lifecycle.
@@ -762,6 +841,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
         &probe.mode,
         &fb,
         link_clock_khz(negotiated.rate),
+        probe.dsc.map(|plan| plan.term(&probe.mode)),
     ) {
         Ok(ext) => ext,
         Err(e) => return Err(ActivateError::Refused(probe, e)),
@@ -810,6 +890,10 @@ fn program<M: MmioWindow + ?Sized>(
     route.reservation = Some(reserve_pipe(io, choice, ext, dmc)?);
     let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
     let mut trained = enable_port(io, route, rate, lanes)?;
+    if route.probe.dsc.is_some() && (trained.rate != rate || trained.lanes != lanes) {
+        // The DSC configuration was computed for this link.
+        return Err(ExternalError::Dsc(DscRefusal::TrainingFallback));
+    }
     if trained.rate != rate || trained.lanes != lanes {
         // The fallback link must still carry the stream (no DSC).
         let demand_kbps = stream_demand_kbps(route.probe.mode.pixel_clock_khz, 24);
@@ -876,6 +960,18 @@ fn enable_port<M: MmioWindow + ?Sized>(
     // 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
     let func = dp_func(port, lanes);
     write(io, trans_ddi_func_ctl(trans), func & !TRANS_DDI_FUNC_ENABLE)?;
+    // intel_dp_set_power(D0), intel_dp_sink_enable_decompression and
+    // intel_dp_sink_set_fec_ready, before training.
+    if let Some(plan) = route.probe.dsc {
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let link = |e| ExternalError::Link(LinkError::AuxFailure(e));
+        aux.dpcd_write(dsc::DP_SET_POWER, &[dsc::DP_SET_POWER_D0])
+            .map_err(link)?;
+        dsc::set_sink_decompression(&mut aux, true).map_err(link)?;
+        if plan.fec {
+            dsc::set_sink_fec_ready(&mut aux, true).map_err(link)?;
+        }
+    }
     // mtl_ddi_prepare_link_retrain: 6.d DP_TP_CTL TPS1 (SST), 6.f D2D,
     // 6.g levels, 6.h PORT_BUF_CTL1, 6.i DDI_CTL_DE + buffer active.
     let enhanced = if route.probe.caps.enhanced_framing {
@@ -969,15 +1065,40 @@ fn finish<M: MmioWindow + ?Sized>(
         dp_tp_ctl(trans),
         (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | DP_TP_CTL_LINK_TRAIN_NORMAL,
     )?;
+    let lost = |_| ExternalError::AccessLost;
+    let plan = route.probe.dsc;
+    if let Some(plan) = &plan {
+        // intel_ddi_enable_fec, then intel_dsc_dp_pps_write; then
+        // hsw_crtc_enable's intel_dsc_enable on the route's pipe.
+        if plan.fec {
+            dsc::enable_fec(io, trans).map_err(lost)?;
+        }
+        dsc::write_pps_sdp(io, trans, plan).map_err(lost)?;
+        dsc::enable_engines(io, pipe, plan).map_err(lost)?;
+    }
     // hsw_configure_cpu_transcoder: M/N with the timings; the transcoder
     // is off, so nothing here latches before its enable.
-    program_mn(io, trans, &mode, pll_rate, lanes)?;
+    match &plan {
+        Some(plan) => dsc::write_m_n(io, trans, &plan.m_n(&mode)).map_err(lost)?,
+        None => program_mn(io, trans, &mode, pll_rate, lanes)?,
+    }
     rp.pipes.program_timings(io, pipe)?;
     // intel_ddi_enable: function, then the transcoder.
     let func = dp_func(port, lanes);
     write(io, trans_ddi_func_ctl(trans), func)?;
     let start = read(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
+    // intel_ddi_wait_for_fec_status(true): Linux only logs a timeout.
+    if plan.is_some_and(|p| p.fec) {
+        let _ = dsc::wait_fec_live(io, trans, true);
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let _ = dsc::wait_fec_detected(&mut aux, |us| {
+            let _ = narf_scheduler::responsive_spin_until(
+                || false,
+                narf_time::Deadline::after_ns(u64::from(us) * 1_000),
+            );
+        });
+    }
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)
 }
@@ -1053,6 +1174,11 @@ fn stop_port<M: MmioWindow + ?Sized>(
         trans_ddi_func_ctl(trans),
         func & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE),
     )?;
+    // intel_dsc_disable, then intel_dp_set_infoframes(false)'s PPS SDP.
+    let pipe = route_pipe(route)?.pipe;
+    dsc::disable_engines(io, pipe).map_err(|_| ExternalError::AccessLost)?;
+    dsc::disable_pps_sdp(io, trans).map_err(|_| ExternalError::AccessLost)?;
+    let fec = route.probe.dsc.is_some_and(|p| p.fec);
     // Sink to D3 before the port goes down (a NACK never replaces the
     // local idle proof).
     if route.probe.caps.dpcd_rev >= 0x11 {
@@ -1067,6 +1193,14 @@ fn stop_port<M: MmioWindow + ?Sized>(
     disable_d2d(io, port).map_err(|_| stop_failed)?;
     let tp = read(io, dp_tp_ctl(trans))?;
     write(io, dp_tp_ctl(trans), tp & !DP_TP_CTL_ENABLE)?;
+    // intel_ddi_disable_fec and intel_ddi_wait_for_fec_status(false) (a
+    // logged timeout in Linux), then intel_dp_sink_set_fec_ready(false).
+    if fec {
+        dsc::disable_fec(io, trans).map_err(|_| ExternalError::AccessLost)?;
+        let _ = dsc::wait_fec_live(io, trans, false);
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let _ = dsc::set_sink_fec_ready(&mut aux, false);
+    }
     // TRANS_CLK_SEL: no clock to the transcoder.
     write(io, trans_clk_sel(trans), 0)?;
     // intel_cx0pll_disable, then deselect Thunderbolt IO.
@@ -1099,6 +1233,16 @@ fn stop_local<M: MmioWindow + ?Sized>(
     };
     let pipe = rp.pipe;
     rp.pipes.disable_primary(io, pipe)?;
+    // intel_ddi_disable_dp: the sink's decompression off before the
+    // transcoder (best effort, as in Linux).
+    if route.probe.dsc.is_some() {
+        let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), false);
+        let _ = dsc::set_sink_decompression(&mut aux, false);
+    }
+    let rp = route
+        .reservation
+        .as_mut()
+        .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
     rp.pipes.disable(io, pipe).map_err(|e| match e {
         PipeEnableError::Timeout => stop_failed,
         e => e.into(),
