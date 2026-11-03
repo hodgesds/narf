@@ -1071,7 +1071,6 @@ impl GgttArena {
     /// function's for its lifetime: the arena never allocates, clears or
     /// retires them, and each GT0 incarnation rewrites the same entries. Every
     /// entry is read back.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     fn map_gsc_stolen(&self, dsm_offset: u64, pages: u32) -> Result<u32, SubmitError> {
         let platform = self.gt_platform.ok_or(SubmitError::NoEngine)?;
         let policy = self.policy.ok_or(SubmitError::NoEngine)?;
@@ -1494,7 +1493,6 @@ impl SharedArena {
 
     /// Map the GSC private object's claimed DSM range at the fixed GSC GGTT
     /// window (`GgttArena::map_gsc_stolen`); returns the window's GGTT base.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn map_gsc_stolen(&self, dsm_offset: u64, pages: u32) -> Result<u32, SubmitError> {
         self.inner.lock().map_gsc_stolen(dsm_offset, pages)
     }

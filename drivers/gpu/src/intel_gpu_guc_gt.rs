@@ -254,6 +254,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .version(self.parts.boot.window())
     }
 
+    /// The staged HuC object (GGTT address, object size), if any.
+    pub(crate) fn huc_object(&self) -> Option<(u64, u32)> {
+        self.parts.boot.huc_object()
+    }
+
+    /// xe_huc_auth(XE_HUC_AUTH_VIA_GSC) failed after the GuC authenticated
+    /// the HuC: huc->fw is LOAD_FAIL, so the HuC is no longer RUNNING and
+    /// query_uc_fw_version answers ENODEV.
+    pub(crate) fn invalidate_huc(&mut self) {
+        if let Some(scheduler) = self.parts.scheduler.as_mut() {
+            scheduler.huc.invalidate();
+        }
+    }
+
     /// The staged HuC's terminal outcome on this owner, without MMIO:
     /// `Some(true)` RUNNING, `Some(false)` unavailable, `None` while pending
     /// or when no HuC is staged.
@@ -2462,7 +2476,6 @@ impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi
 
     /// One GSC kernel job on GSCCS0 (`GuCScheduler::submit_gsc`), under the
     /// same wake, region and register-policy proof as every submission.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn submit_gsc(
         &mut self,
         now: u64,

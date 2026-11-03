@@ -17,7 +17,6 @@ pub(crate) enum Kind {
     Gt,
     /// The media GT's GSC private object: DM PTEs written once per GT0
     /// incarnation and never cleared (the GSC owns the memory until an FLR).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     Gsc,
 }
 #[derive(Debug)]

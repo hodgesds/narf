@@ -317,3 +317,530 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gt_gsccs_schedules_primes_and_executes_gsc_jobs
 );
+
+// ---- The production GSC owner on the media GuC model -----------------------
+
+use crate::intel_gpu_gt::media::gsc::load::Status;
+use crate::intel_gpu_gt::media::gsc::owner::{DsmPort, GscOwner};
+use crate::intel_gpu_stolen::{self as dsm, Layout, DSM_GSM_OFFSET, GSC_GGTT};
+
+const MIB: u64 = 1 << 20;
+const FWSTS1: u64 = 0x116c40;
+const FWSTS5: u64 = 0x116c68;
+const HECI2_CSR: u64 = 0x117004;
+const MARKER: u32 = 0xa578_875a;
+
+fn put16(bytes: &mut [u8], at: usize, value: u16) {
+    bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn put32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// A parse_gsc_layout-shaped `i915/mtl_gsc_1.bin`: boot1 BPDT whose RBE
+/// entry's CPD names RBEP.man (release 102.0.10.1499, SVN 3), recognizable
+/// bytes after the headers and an odd length.
+fn gsc_image() -> Vec<u8> {
+    let mut image = alloc::vec![0u8; 0x1003];
+    put32(&mut image, 32, 0x100);
+    put32(&mut image, 36, 0x400);
+    put32(&mut image, 0x100, 0x55aa);
+    put16(&mut image, 0x104, 1);
+    put32(&mut image, 0x100 + 24, 0x0001);
+    put32(&mut image, 0x100 + 28, 0x80);
+    put32(&mut image, 0x180, 0x4450_4324);
+    put32(&mut image, 0x184, 1);
+    image[0x188] = 2;
+    image[0x189] = 1;
+    image[0x18a] = 20;
+    image[0x180 + 20..0x180 + 28].copy_from_slice(b"RBEP.man");
+    put32(&mut image, 0x180 + 20 + 12, 0x100);
+    for (field, value) in [102u16, 0, 10, 1499].into_iter().enumerate() {
+        put16(&mut image, 0x280 + 36 + field * 2, value);
+    }
+    put32(&mut image, 0x280 + 44, 3);
+    for (index, byte) in image[0x400..].iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(7) | 1;
+    }
+    image
+}
+
+/// BAR2 over the 4 MiB the GSC object occupies at DSM 4 MiB (above the boot
+/// framebuffer): io_base (8 MiB) + 4 MiB.
+#[derive(Clone)]
+struct Cpu(alloc::rc::Rc<RefCell<Vec<u32>>>);
+const CPU_AT: u64 = DSM_GSM_OFFSET + 4 * MIB;
+impl crate::intel_gpu_aux::MmioWindow for Cpu {
+    fn read32(&self, offset: u64) -> u32 {
+        offset
+            .checked_sub(CPU_AT)
+            .and_then(|at| self.0.borrow().get(at as usize / 4).copied())
+            .unwrap_or(u32::MAX)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        if let Some(at) = offset.checked_sub(CPU_AT) {
+            if let Some(word) = self.0.borrow_mut().get_mut(at as usize / 4) {
+                *word = value;
+            }
+        }
+    }
+}
+
+/// 64 MiB DSM, 4 MiB WOPCM, no GSC carve; the boot framebuffer in DSM
+/// 0..4 MiB is mapped in the aperture. `dw1` keeps the claim registry's key
+/// unique to the fixture.
+struct Port {
+    layout: Layout,
+    ptes: Vec<u64>,
+    cpu: Cpu,
+}
+impl Port {
+    fn new(dw1: u32) -> Self {
+        let layout = dsm::layout(dsm::Facts {
+            ggc: (0x02 << dsm::GMS_SHIFT) | dsm::GGMS_MASK,
+            stolen_reserved_lo: 2 << dsm::WOPCM_SIZE_SHIFT,
+            media_gmd_id: MEDIA_GMD,
+            gscpsmi_base: 0,
+            gmadr_base: 0x40_0000_0000,
+            gmadr_len: 256 * MIB,
+            bsm_dw0: 0x6C00_0000,
+            bsm_dw1: dw1,
+        })
+        .unwrap();
+        let mut ptes: Vec<u64> = (0..2048u64)
+            .map(|i| (0x8000_0000 + i * 4096) | dsm::GGTT_PTE_PRESENT)
+            .collect();
+        for i in 0..1024u64 {
+            ptes[512 + i as usize] =
+                (DSM_GSM_OFFSET + i * 4096) | dsm::GGTT_PTE_DM | dsm::GGTT_PTE_PRESENT;
+        }
+        Self {
+            layout,
+            ptes,
+            cpu: Cpu(alloc::rc::Rc::new(RefCell::new(alloc::vec![0; 1 << 20]))),
+        }
+    }
+}
+impl DsmPort for Port {
+    type Cpu = Cpu;
+    fn layout(&self) -> Option<(Layout, u64)> {
+        Some((self.layout, self.ptes.len() as u64))
+    }
+    fn pte(&self, index: u64) -> u64 {
+        self.ptes[index as usize]
+    }
+    fn system_ram(&self, _: u64) -> bool {
+        false
+    }
+    fn cpu(&self) -> Cpu {
+        self.cpu.clone()
+    }
+}
+
+/// GSC firmware behind GSCCS0 on the model: GSC_FW_LOAD (after checking
+/// memcpy_fw's copy in DSM) sets INIT_COMPLETE; MKHI, PXP and proxy packets
+/// get replies in their output halves. Every recorded job is served once.
+#[derive(Default)]
+struct Firmware {
+    served: usize,
+    image: Vec<u8>,
+    /// Hold GSC_FW_LOAD forever (no INIT_COMPLETE).
+    hang_load: bool,
+}
+
+fn memory_at(w: &Window, address: u32) -> (Words, usize) {
+    let d = w.0.borrow();
+    let (base, words) = d
+        .memory
+        .iter()
+        .rev()
+        .find(|(base, words)| {
+            **base <= address && address - **base < words.borrow().len() as u32 * 4
+        })
+        .expect("GGTT address of an owned object");
+    (words.clone(), (address - base) as usize)
+}
+
+fn read_bytes(words: &Words, at: usize, len: usize) -> Vec<u8> {
+    let words = words.borrow();
+    let mut out = Vec::new();
+    for word in &words[at / 4..(at + len).div_ceil(4)] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+fn write_bytes(words: &Words, at: usize, bytes: &[u8]) {
+    let mut words = words.borrow_mut();
+    for (index, chunk) in bytes.chunks(4).enumerate() {
+        let mut word = words[at / 4 + index].to_le_bytes();
+        word[..chunk.len()].copy_from_slice(chunk);
+        words[at / 4 + index] = u32::from_le_bytes(word);
+    }
+}
+
+fn reply(client: u8, payload: &[u8]) -> Vec<u8> {
+    let mut header = alloc::vec![0u8; 36];
+    put32(&mut header, 0, MARKER);
+    header[4] = client;
+    put16(&mut header, 6, 1);
+    put32(&mut header, 24, (36 + payload.len()) as u32);
+    header.extend_from_slice(payload);
+    header
+}
+
+impl Firmware {
+    fn serve(&mut self, w: &Window, hw: &Hw, port: &Port) {
+        while self.served < hw.gsc_jobs.len() {
+            let job = hw.gsc_jobs[self.served].clone();
+            self.served += 1;
+            let set = |reg: u64, bits: u32| {
+                let mut d = w.0.borrow_mut();
+                let value = d.regs.get(&reg).copied().unwrap_or(0) | bits;
+                d.regs.insert(reg, value);
+            };
+            if job[0] == 0x4040_0002 {
+                assert_eq!(job, [0x4040_0002, GSC_GGTT as u32, 0, 1024 | 1 << 31]);
+                // memcpy_fw: the image, then zeroes, in DSM through BAR2.
+                let cpu = port.cpu.0.borrow();
+                let copied: Vec<u8> = cpu[..self.image.len().div_ceil(4)]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .take(self.image.len())
+                    .collect();
+                assert_eq!(copied, self.image);
+                assert_eq!(cpu[(1 << 20) - 1], 0);
+                drop(cpu);
+                if !self.hang_load {
+                    set(FWSTS1, 1 << 9);
+                }
+                continue;
+            }
+            assert_eq!(job[0], 0x4000_0006);
+            let (input, at) = memory_at(w, job[1]);
+            let message = read_bytes(&input, at, job[3] as usize);
+            assert_eq!(
+                u32::from_le_bytes(message[..4].try_into().unwrap()),
+                MARKER
+            );
+            let (output, out_at) = memory_at(w, job[4]);
+            let answer = match message[4] {
+                // MKHI GET_HOST_COMPATIBILITY_VERSION: 102.1.0.
+                7 => {
+                    let mut payload = alloc::vec![0u8; 20];
+                    payload[..2].copy_from_slice(&[0x30, 0xc2]);
+                    put16(&mut payload, 4, 102);
+                    put16(&mut payload, 6, 1);
+                    reply(7, &payload)
+                }
+                // PXP 4.3 NEW_HUC_AUTH of the whole HuC object.
+                17 => {
+                    set(FWSTS5, 1 << 19);
+                    let mut payload = alloc::vec![0u8; 16];
+                    put32(&mut payload, 0, 0x0004_0003);
+                    reply(17, &payload)
+                }
+                // Proxy QUERY from the KMD: END at once, proxy state NORMAL.
+                10 => {
+                    set(FWSTS1, 5);
+                    let mut payload = alloc::vec![0u8; 16];
+                    put32(&mut payload, 0, 3);
+                    put32(&mut payload, 4, 0x20000);
+                    put32(&mut payload, 8, 0x10000);
+                    reply(10, &payload)
+                }
+                client => panic!("unexpected HECI client {client}"),
+            };
+            write_bytes(&output, out_at, &answer);
+        }
+    }
+}
+
+type Owner = GscOwner<Arena, Cpu>;
+
+/// Ticks of the model with the owner beside the media GuC until `done`.
+#[allow(clippy::too_many_arguments)]
+fn gsc_until(
+    owner: &mut Owner,
+    guc: &mut crate::intel_gpu_gt::media::MediaGuc<Window, Arena>,
+    w: &Window,
+    hw: &mut Hw,
+    port: &Port,
+    fw: &mut Firmware,
+    headers: bool,
+    from: u64,
+    done: impl Fn(&Owner, &Hw) -> bool,
+) -> u64 {
+    for tick in 0..4000 {
+        let now = from + tick * 1_000_000;
+        let polled = media_tick(guc, w, hw, now);
+        assert!(!matches!(polled, Poll::Ready(Err(_))), "{polled:?}");
+        let _ = owner.poll(now, guc, w, port, headers, 0);
+        fw.serve(w, hw, port);
+        if done(owner, hw) {
+            return now;
+        }
+    }
+    panic!("GSC made no progress");
+}
+
+fn media_guc_with_huc(
+    w: &Window,
+    arena: &Arena,
+    huc: &crate::intel_gpu_huc::Firmware,
+    adopt: bool,
+) -> crate::intel_gpu_gt::media::MediaGuc<Window, Arena> {
+    let mut guc = super::media_huc::start(w, arena, Some((huc, adopt)));
+    guc.honour_gsc_reset_workaround().unwrap();
+    guc.schedule_gsccs().unwrap();
+    guc
+}
+
+fn stop_and_end(
+    owner: &mut Owner,
+    mut guc: crate::intel_gpu_gt::media::MediaGuc<Window, Arena>,
+    w: &Window,
+    arena: &Arena,
+    hw: &mut Hw,
+    from: u64,
+) -> u64 {
+    // xe_gsc_stop_prepare: nothing runs once the owner is idle.
+    assert!(owner.quiesce(from, Some(&mut guc), w));
+    guc.begin_stop(from);
+    let (now, polled) = media_until(&mut guc, w, hw, from + 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Stopped)));
+    assert!(guc.reclaimable());
+    owner.end_session(w, true);
+    drop(guc);
+    super::media_huc::reclaimed(w, arena);
+    now
+}
+
+/// Linux without CONFIG_INTEL_MEI_GSC_PROXY, end to end through the
+/// production owner: the claimed DSM object is DM-mapped and receives the
+/// firmware, GSC_FW_LOAD reaches INIT_COMPLETE, the compatibility query
+/// answers 102, the HuC the media GuC authenticated is authenticated via
+/// the GSC too, then xe_gsc_proxy_start fails with ENODEV after toggling the
+/// proxy interrupt and the GSC is LOAD_FAIL. A GT reset (a new media GuC)
+/// rewrites the same DM window, never reloads the failed GSC, and every
+/// arena object is freed after each verified stop.
+fn smoke_media_gsc_owner_without_mei_loads_auths_huc_and_ends_load_fail() -> TestResult {
+    let (w, arena) = media_model();
+    let huc =
+        crate::intel_gpu_huc::Firmware::from_fixture(MTL, &super::media_huc::huc_gsc()).unwrap();
+    let mut guc = media_guc_with_huc(&w, &arena, &huc, false);
+    let mut hw = Hw::default();
+    let (now, polled) = media_until(&mut guc, &w, &mut hw, 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+    assert_eq!(guc.huc_outcome(), Some(true));
+    let image = gsc_image();
+    let mut owner = Owner::new(Some(&image));
+    assert!(owner.available());
+    assert_eq!(owner.status(), Status::Available);
+    let port = Port::new(0x61);
+    let mut fw = Firmware {
+        image: image.clone(),
+        ..Firmware::default()
+    };
+    let now = gsc_until(
+        &mut owner,
+        &mut guc,
+        &w,
+        &mut hw,
+        &port,
+        &mut fw,
+        true,
+        now + 1,
+        |o, _| o.idle() && o.status() != Status::Available && o.status() != Status::Loadable,
+    );
+    assert_eq!(owner.status(), Status::LoadFail(LoadError::NoDevice));
+    assert_eq!(
+        owner.compatibility(),
+        Some(crate::intel_gpu_gt::media::gsc::Version::new(102, 1, 0, 0))
+    );
+    assert_eq!(owner.huc(), Some(true));
+    assert!(!owner.wedged());
+    // GSC_FW_LOAD, the MKHI query, then NEW_HUC_AUTH; no proxy packet.
+    assert_eq!(hw.gsc_jobs.len(), 3);
+    assert_eq!(hw.gsc_jobs[0][0], 0x4040_0002);
+    assert!(hw.gsc_jobs[1..].iter().all(|job| job[0] == 0x4000_0006));
+    {
+        let d = w.0.borrow();
+        assert_eq!(d.gsc_maps, [(4 * MIB, 1024)]);
+        assert_eq!(dsm::gsc_claim(port.layout), Some((4 * MIB, dsm::GSC_BYTES)));
+        // Proxy start enabled the HECI2 interrupt, then disabled it again.
+        let csr: Vec<u32> = d
+            .writes
+            .iter()
+            .filter(|(reg, _)| *reg == HECI2_CSR)
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(csr, [1, 0]);
+        assert_eq!(d.regs[&FWSTS5] & 1 << 19, 1 << 19);
+        // XE_FW_GSC stayed the media GuC's: the worker wrote no request.
+        assert_eq!(
+            d.writes
+                .iter()
+                .filter(|(reg, _)| *reg == GSI_OFFSET + 0xa618)
+                .count(),
+            1
+        );
+    }
+    // The HuC stays RUNNING for query7 (its GSC authentication succeeded).
+    assert!(guc.huc_version(|| true).is_some());
+
+    // GT reset: a new media GuC adopts the HuC; the failed GSC never reloads.
+    let now = stop_and_end(&mut owner, guc, &w, &arena, &mut hw, now + 1);
+    assert_eq!(arena.live_allocations(), 0);
+    let mut guc = media_guc_with_huc(&w, &arena, &huc, true);
+    let (now, polled) = media_until(&mut guc, &w, &mut hw, now + 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+    let jobs = hw.gsc_jobs.len();
+    let now = gsc_until(
+        &mut owner,
+        &mut guc,
+        &w,
+        &mut hw,
+        &port,
+        &mut fw,
+        true,
+        now + 1,
+        |o, _| o.huc().is_some(),
+    );
+    assert!(owner.idle());
+    assert_eq!(owner.status(), Status::LoadFail(LoadError::NoDevice));
+    assert_eq!(hw.gsc_jobs.len(), jobs);
+    assert_eq!(w.0.borrow().gsc_maps, [(4 * MIB, 1024), (4 * MIB, 1024)]);
+    stop_and_end(&mut owner, guc, &w, &arena, &mut hw, now + 1);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gsc_owner_without_mei_loads_auths_huc_and_ends_load_fail
+);
+
+/// A CSME end that the GSC never needs (its first proxy reply is END).
+struct Unused;
+impl crate::intel_gpu_gt::CsmeProxy for Unused {
+    fn send(&mut self, _: &[u8]) -> Result<usize, i32> {
+        panic!("no CSME message in this conversation")
+    }
+    fn recv(&mut self, _: &mut [u8]) -> Result<usize, i32> {
+        panic!("no CSME message in this conversation")
+    }
+}
+
+/// GSC_FW_LOAD was submitted and executed.
+fn fw_served(hw: &Hw) -> bool {
+    hw.gsc_jobs
+        .first()
+        .is_some_and(|job| job[0] == 0x4040_0002)
+}
+
+/// With a bound CSME component the proxy channel exists and the GSC reaches
+/// RUNNING (PROXY_STATE_NORMAL). Resume after D3hot re-classifies the GSC
+/// with no job; after the GSC lost its state (D3cold) it reloads in full.
+/// A load interrupted by a stop that cannot wait is LOAD_FAIL, and an
+/// unavailable image leaves GSCCS0 out.
+fn smoke_media_gsc_owner_proxy_resume_reload_and_interrupted_load() -> TestResult {
+    use crate::intel_gpu_gt::{register_csme_proxy, unregister_csme_proxy};
+    assert!(unregister_csme_proxy().is_none());
+    assert!(register_csme_proxy(alloc::boxed::Box::new(Unused)).is_ok());
+    assert!(register_csme_proxy(alloc::boxed::Box::new(Unused)).is_err());
+    let (w, arena) = media_model();
+    let image = gsc_image();
+    let mut owner = Owner::new(Some(&image));
+    let port = Port::new(0x62);
+    let mut fw = Firmware {
+        image: image.clone(),
+        ..Firmware::default()
+    };
+    let mut hw = Hw::default();
+    let run = |owner: &mut Owner, hw: &mut Hw, fw: &mut Firmware, from: u64| {
+        let mut guc = start_media(&w, &arena);
+        guc.honour_gsc_reset_workaround().unwrap();
+        guc.schedule_gsccs().unwrap();
+        let (now, polled) = media_until(&mut guc, &w, hw, from, |p| p.is_ready());
+        assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+        let now = gsc_until(owner, &mut guc, &w, hw, &port, fw, false, now + 1, |o, _| {
+            o.idle() && matches!(o.status(), Status::Running | Status::LoadFail(_))
+        });
+        // The proxy channel (16 pages) lives beside the version packet.
+        assert!(w
+            .0
+            .borrow()
+            .memory
+            .values()
+            .any(|words| words.borrow().len() == 16 * 1024));
+        stop_and_end(owner, guc, &w, &arena, hw, now + 1)
+    };
+    let now = run(&mut owner, &mut hw, &mut fw, 1);
+    assert_eq!(owner.status(), Status::Running);
+    assert_eq!(hw.gsc_jobs.len(), 3, "load, MKHI, proxy QUERY");
+    assert_eq!(arena.live_allocations(), 0);
+    // D3hot: the GSC kept its firmware and proxy state.
+    let now = run(&mut owner, &mut hw, &mut fw, now + 1);
+    assert_eq!(owner.status(), Status::Running);
+    assert_eq!(hw.gsc_jobs.len(), 3);
+    // D3cold: the GSC lost everything; the same DSM object reloads.
+    w.0.borrow_mut().regs.insert(FWSTS1, 0);
+    run(&mut owner, &mut hw, &mut fw, now + 1);
+    assert_eq!(owner.status(), Status::Running);
+    assert_eq!(hw.gsc_jobs.len(), 6);
+    assert_eq!(hw.gsc_jobs[3], hw.gsc_jobs[0]);
+    assert!(w
+        .0
+        .borrow()
+        .gsc_maps
+        .iter()
+        .all(|map| *map == (4 * MIB, 1024)));
+    assert!(unregister_csme_proxy().is_some());
+
+    // A fault stop that cannot wait interrupts a load: LOAD_FAIL, objects
+    // freed after the verified stop.
+    let (w, arena) = media_model();
+    let mut owner = Owner::new(Some(&image));
+    let port = Port::new(0x63);
+    let mut fw = Firmware {
+        image: image.clone(),
+        hang_load: true,
+        ..Firmware::default()
+    };
+    let mut hw = Hw::default();
+    let mut guc = start_media(&w, &arena);
+    guc.schedule_gsccs().unwrap();
+    let (now, polled) = media_until(&mut guc, &w, &mut hw, 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+    let now = gsc_until(
+        &mut owner,
+        &mut guc,
+        &w,
+        &mut hw,
+        &port,
+        &mut fw,
+        false,
+        now + 1,
+        |_, hw| fw_served(hw),
+    );
+    assert!(!owner.idle());
+    guc.begin_stop(now + 1);
+    let (_, polled) = media_until(&mut guc, &w, &mut hw, now + 2, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Stopped)));
+    owner.end_session(&w, true);
+    assert_eq!(owner.status(), Status::LoadFail(LoadError::Io));
+    assert!(owner.idle());
+    drop(guc);
+    assert_eq!(arena.live_allocations(), 0);
+
+    // No image, or a malformed one: GSC unavailable, so GSCCS0 stays out.
+    assert!(!Owner::new(None).available());
+    assert_eq!(Owner::new(None).status(), Status::Missing);
+    assert!(!Owner::new(Some(&image[..0x200])).available());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gsc_owner_proxy_resume_reload_and_interrupted_load
+);

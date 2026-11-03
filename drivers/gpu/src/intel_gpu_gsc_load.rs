@@ -18,8 +18,11 @@
 //! The owner is generic over the three things only the platform can supply:
 //! the GSC kernel queue on GSCCS0 (`Gsccs`), the 4 MiB GSC private object
 //! (Linux: XE_BO_FLAG_STOLEN | XE_BO_FLAG_GGTT, `P`) and the CSME side of the
-//! GSC proxy (`CsmeProxy`, the MEI GSC proxy component's send/recv). NARF has
-//! none of them yet, so this owner is exercised only by native models.
+//! GSC proxy (`CsmeProxy`, the MEI GSC proxy component's send/recv). In
+//! production `gsc::owner` supplies the media GuC's GSCCS0 queue and the DSM
+//! object at its fixed GGTT DM window; a CSME component is whatever was
+//! registered through `register_csme_proxy` (nothing, until NARF's MEI GSC
+//! proxy client registers one).
 //!
 //! Without a CSME component Linux behaves exactly as a kernel built without
 //! CONFIG_INTEL_MEI_GSC_PROXY: xe_gsc_proxy_init returns -ENODEV (tolerated),
@@ -42,8 +45,10 @@ use super::heci::{
 use super::{huc_authenticated, GscError, HucAuth, Version, AUTH_WAIT_NS};
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_rcs::GpuBacking;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::task::Poll;
+use narf_lib::sync::IrqSafeSpinLock;
 
 /// regs/xe_gsc_regs.h at the absolute MTL_GSC_HECI1/2 bases.
 const HECI1_FWSTS1: u64 = 0x116000 + 0xc40;
@@ -202,6 +207,7 @@ impl Status {
         self.rank() >= Status::Loadable.rank()
     }
     /// xe_uc_fw_is_loaded.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn loaded(self) -> bool {
         self.rank() >= Status::Transferred.rank()
     }
@@ -223,6 +229,7 @@ impl Status {
 pub(crate) enum HucStatus {
     /// No HuC image is staged (below XE_UC_FIRMWARE_LOADABLE).
     NotLoadable,
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     Loadable,
     LoadFail,
     /// Authenticated (via the media GuC, or now via the GSC).
@@ -259,15 +266,75 @@ pub(crate) trait Gsccs {
 /// (include/drm/intel/i915_gsc_proxy_mei_interface.h): the MEI GSC proxy
 /// client (drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c, MEI client UUID
 /// f73db04-97ab-4125-b893-e904ad0d5464) bound to the built-in display device.
-pub(crate) trait CsmeProxy {
+/// Both calls block, as mei_cldev_send/recv do; the GSC worker calls them
+/// from its own task context and never under a spin lock.
+pub trait CsmeProxy {
     /// ops->send (mei_cldev_send): bytes sent or a negative errno.
     fn send(&mut self, message: &[u8]) -> Result<usize, i32>;
-    /// ops->recv (mei_cldev_recv) into `buffer`: bytes or a negative errno.
+    /// ops->recv (mei_cldev_recv) into `buffer` (32 KiB): bytes or a
+    /// negative errno.
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, i32>;
 }
 
-/// No CSME component: NARF has no MEI client interface.
+/// The bound CSME component (Linux: `gsc->proxy.component`, set by
+/// gsc_proxy_component_bind). Empty until a MEI GSC proxy client registers.
+static CSME: IrqSafeSpinLock<(Option<Box<dyn CsmeProxy + Send>>, u64)> =
+    IrqSafeSpinLock::new((None, 0));
+
+/// gsc_proxy_component_bind: hand the GSC proxy its CSME end. A component
+/// already bound is replaced only after `unregister_csme_proxy`. The next
+/// GT1 start allocates the proxy channel and xe_gsc_proxy_start runs over
+/// this component; a GSC already in LOAD_FAIL stays there (only an FLR
+/// recovers it, which NARF never performs).
+pub fn register_csme_proxy(
+    component: Box<dyn CsmeProxy + Send>,
+) -> Result<(), Box<dyn CsmeProxy + Send>> {
+    let mut slot = CSME.lock();
+    if slot.0.is_some() {
+        return Err(component);
+    }
+    slot.0 = Some(component);
+    slot.1 += 1;
+    Ok(())
+}
+
+/// gsc_proxy_component_unbind.
+pub fn unregister_csme_proxy() -> Option<Box<dyn CsmeProxy + Send>> {
+    let mut slot = CSME.lock();
+    slot.1 += 1;
+    slot.0.take()
+}
+
+/// A component is bound (xe_gsc_proxy_irq_handler drops requests otherwise).
+pub(crate) fn csme_bound() -> bool {
+    CSME.lock().0.is_some()
+}
+
+/// Run `f` with the bound component taken out of its slot, so the blocking
+/// send/recv never run under the slot's lock. It is put back afterwards
+/// unless it was unbound (or another bound) meanwhile; an unbound component
+/// is dropped here.
+pub(crate) fn with_csme<R>(
+    f: impl FnOnce(Option<&mut (dyn CsmeProxy + Send + 'static)>) -> R,
+) -> R {
+    let (mut taken, generation) = {
+        let mut slot = CSME.lock();
+        (slot.0.take(), slot.1)
+    };
+    let result = f(taken.as_deref_mut());
+    if let Some(component) = taken {
+        let mut slot = CSME.lock();
+        if slot.1 == generation && slot.0.is_none() {
+            slot.0 = Some(component);
+        }
+    }
+    result
+}
+
+/// No CSME component (native models without a MEI client).
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) enum NoCsme {}
+#[cfg(any(test, feature = "kernel-test"))]
 impl CsmeProxy for NoCsme {
     fn send(&mut self, _: &[u8]) -> Result<usize, i32> {
         match *self {}
@@ -448,6 +515,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
     }
 
     /// An empty `gsc_firmware_path` (`narf.intel.gsc` off).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn disabled() -> Self {
         Self::with_status(Status::Disabled, None)
     }
@@ -549,6 +617,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
     }
 
     /// The RBEP.man release and security version of the parsed image.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn release(&self) -> Option<(Version, u32)> {
         self.image
             .as_ref()
@@ -558,13 +627,53 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
     /// The GSC was handed its private object (xe->needs_flr_on_fini): it may
     /// use that memory until an FLR, so neither the object nor its GGTT
     /// range may ever be released or reused.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn private_retained(&self) -> bool {
         self.retained
     }
 
     /// gsc->proxy.started.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn proxy_started(&self) -> bool {
         self.started
+    }
+
+    /// xe_gsc_init_post_hwconfig ran: the private object is attached for
+    /// the device's lifetime.
+    pub(crate) fn private_attached(&self) -> bool {
+        self.private.is_some()
+    }
+
+    /// The end of a GT0 incarnation: hand back the objects that live in its
+    /// GGTT arena (the version-query packet and the proxy channel) so they
+    /// can be freed after the media GT's verified stop. Only while no work
+    /// runs; the private object, the status and the compatibility version
+    /// stay (struct xe_gsc lives for the device).
+    pub(crate) fn detach(&mut self) -> Result<Vec<B>, LoadError> {
+        if !self.idle() {
+            return Err(LoadError::Busy);
+        }
+        let mut objects = Vec::new();
+        objects.extend(self.packet.take());
+        objects.extend(self.proxy.take().map(|proxy| proxy.channel));
+        Ok(objects)
+    }
+
+    /// A later GT0 incarnation's packet object and, with a CSME component,
+    /// proxy channel. The first incarnation uses `init_post_hwconfig` and
+    /// `add_proxy` instead.
+    pub(crate) fn attach(&mut self, packet: B, channel: Option<B>) -> Result<(), LoadError> {
+        if !self.private_attached() || self.packet.is_some() || !self.idle() {
+            return Err(LoadError::Busy);
+        }
+        if packet.size_pages() * 4096 < 2 * PACKET_HALF {
+            return Err(LoadError::NoMemory);
+        }
+        self.packet = Some(packet);
+        match channel {
+            Some(channel) => self.add_proxy(Some(channel)),
+            None => Ok(()),
+        }
     }
 
     /// gsc_er_complete found the GSC ER timer expired: the device is
@@ -599,6 +708,21 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
         Ok(())
     }
 
+    /// The GT stops without waiting for this run (NARF fault cleanup, where
+    /// xe_gsc_stop_prepare would wait): a load in progress fails as
+    /// LOAD_FAIL ("If the GSC FW load or the proxy init are interrupted, the
+    /// only way to recover it is to do an FLR") and the worker's own GSC wake
+    /// is released. Queued actions that never ran are dropped; the next
+    /// xe_gsc_load_start queues the load again.
+    pub(crate) fn abort(&mut self, mmio: &impl MmioWindow) {
+        self.actions = 0;
+        if self.step == Step::Idle {
+            return;
+        }
+        self.input.clear();
+        self.fail_work(LoadError::Io, mmio);
+    }
+
     /// xe_gsc_hwe_irq_handler: GSCCS reported GSC_ER_COMPLETE.
     pub(crate) fn er_complete_irq(&mut self) {
         self.actions |= ER_COMPLETE;
@@ -613,7 +737,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
     }
 
     /// Drive gsc_work by bounded steps. `Ready` once no work is queued.
-    pub(crate) fn poll<M: MmioWindow, Q: Gsccs, C: CsmeProxy>(
+    pub(crate) fn poll<M: MmioWindow, Q: Gsccs, C: CsmeProxy + ?Sized>(
         &mut self,
         now: u64,
         mmio: &M,
@@ -1056,7 +1180,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
 
     /// One proxy_query iteration after the GSC replied: `Ok(true)` for an
     /// END message, `Ok(false)` once the CSME reply is staged for the GSC.
-    fn proxy_replied(&mut self, csme: &mut impl CsmeProxy) -> Result<bool, LoadError> {
+    fn proxy_replied<C: CsmeProxy + ?Sized>(&mut self, csme: &mut C) -> Result<bool, LoadError> {
         let proxy = self.proxy.as_mut().ok_or(LoadError::NoDevice)?;
         let reply = get_words(
             &proxy.channel,

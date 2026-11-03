@@ -118,6 +118,69 @@ struct State {
     media_huc_established: bool,
     /// The current media GuC's HuC outcome has been logged.
     media_huc_reported: bool,
+    /// `narf.intel.gsc=1` beside the media GT: the GSC (struct xe_gsc) for
+    /// the device's lifetime. Its private object is never released.
+    gsc: Option<GscOwner>,
+    /// The GSC status last logged.
+    gsc_reported: Option<crate::intel_gpu_gt::media::gsc::load::Status>,
+    /// Routing the GSC sources onto GT0's delivery failed; the GSC is polled.
+    gsc_irq_failed: bool,
+}
+
+type GscOwner = crate::intel_gpu_gt::media::gsc::owner::GscOwner<
+    SharedArena,
+    crate::intel_gpu_stolen::Bar2Window,
+>;
+
+/// The DSM access of the GSC private object: the function's BAR2 (when it is
+/// this function's controller), PCI BSM, GGTT PTE reads through the
+/// authorized window, and the page allocator's RAM proof.
+struct GscDsm<'a> {
+    pending: &'a Pending,
+    gmadr: Option<narf_bus::bar::MmioRegion>,
+}
+
+impl<'a> GscDsm<'a> {
+    fn new(pending: &'a Pending) -> Self {
+        let gmadr = crate::intel_gpu::with_controller(|gpu| {
+            (gpu.gtt_mmadr.phys == pending.bar.phys).then_some(gpu.gmadr)
+        })
+        .flatten();
+        Self { pending, gmadr }
+    }
+}
+
+impl crate::intel_gpu_gt::media::gsc::owner::DsmPort for GscDsm<'_> {
+    type Cpu = crate::intel_gpu_stolen::Bar2Window;
+    fn layout(&self) -> Option<(crate::intel_gpu_stolen::Layout, u64)> {
+        use crate::intel_gpu_stolen as dsm;
+        let gmadr = self.gmadr?;
+        let config = |offset| {
+            narf_bus::pci::read_config32(&self.pending.cap, &self.pending.device, offset).ok()
+        };
+        dsm::discover(
+            &self.pending.window,
+            (gmadr.phys.raw(), gmadr.len),
+            (config(dsm::PCI_BSM_DW0)?, config(dsm::PCI_BSM_DW1)?),
+            self.pending.bar.len,
+        )
+    }
+    fn pte(&self, index: u64) -> u64 {
+        let at = crate::intel_gpu_gtt::GGTT_ARRAY_BASE + 8 * index;
+        u64::from(self.pending.window.read32(at))
+            | u64::from(self.pending.window.read32(at + 4)) << 32
+    }
+    fn system_ram(&self, phys: u64) -> bool {
+        narf_memory::frame::is_system_ram(narf_memory::PhysAddr::new(phys))
+    }
+    fn cpu(&self) -> Self::Cpu {
+        // `layout` refuses without BAR2, so no object is placed then; an
+        // empty window refuses every access regardless.
+        crate::intel_gpu_stolen::Bar2Window(self.gmadr.unwrap_or(narf_bus::bar::MmioRegion {
+            len: 0,
+            ..self.pending.bar
+        }))
+    }
 }
 
 use crate::intel_gpu_gt::media::Retire as MediaRetire;
@@ -1215,6 +1278,9 @@ pub(crate) fn start_pending() {
                 media_irq_failed: false,
                 media_huc_established: false,
                 media_huc_reported: false,
+                gsc: None,
+                gsc_reported: None,
+                gsc_irq_failed: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -2455,6 +2521,19 @@ impl Owner {
                     if crate::intel_gpu_gt::media::gsc::admitted(platform, narf_boot::args()) {
                         // A fresh owner has no scheduler: this cannot refuse.
                         let _ = guc.honour_gsc_reset_workaround();
+                        // xe_gsc_init fetches the firmware once per device;
+                        // check_gsc_availability keeps GSCCS0 only with it.
+                        let gsc = state.gsc.get_or_insert_with(|| {
+                            let image = crate::intel_gpu_gt::media::gsc::owner::fetch_firmware();
+                            GscOwner::new(image.as_deref())
+                        });
+                        if gsc.available() {
+                            let _ = guc.schedule_gsccs();
+                        } else {
+                            crate::intel_gpu_gt::media::gsc::disable_unavailable_interrupts(
+                                &self.pending.window,
+                            );
+                        }
                     }
                     state.media_guc_reported = false;
                     state.media_huc_reported = false;
@@ -2497,6 +2576,7 @@ impl Owner {
             *self.user_media.lock() = None;
             if let Some(irq) = state.irq.as_ref() {
                 irq.unroute_media();
+                irq.unroute_gsc();
             }
         } else if let Some(publication) = guc.publication() {
             // Every engine executed and retired its private PPGTT job.
@@ -2544,10 +2624,15 @@ impl Owner {
                         );
                     }
                 }
+                self.service_gsc(state, now);
             }
             core::task::Poll::Ready(Ok(MediaGucState::Stopped)) if guc.reclaimable() => {
                 let faulted = guc.error().is_some();
                 state.media_guc = None;
+                // The verified stop reset GSCCS0: this GuC's GSC objects go.
+                if let Some(gsc) = state.gsc.as_mut() {
+                    gsc.end_session(&self.pending.window, true);
+                }
                 // A faulted media GuC gets one media-GT reset and restart per GT0
                 // incarnation, as xe_gt.c::gt_reset_worker (do_gt_reset then
                 // do_gt_restart). Probe never performs that full GT reset.
@@ -2581,17 +2666,94 @@ impl Owner {
         }
     }
 
+    /// `narf.intel.gsc=1` beside a running GT1 that schedules GSCCS0: route
+    /// the GSC sources once, then advance the GSC (session setup,
+    /// xe_gsc_load_start, gsc_work) and log each status it reaches.
+    fn service_gsc(&self, state: &mut State, now: u64) {
+        let State {
+            gsc,
+            media_guc,
+            huc,
+            irq,
+            gsc_reported,
+            gsc_irq_failed,
+            ..
+        } = state;
+        let (Some(gsc), Some(guc)) = (gsc.as_mut(), media_guc.as_mut()) else {
+            return;
+        };
+        if !guc.gsccs_scheduled() {
+            return;
+        }
+        if let Some(irq) = irq.as_ref() {
+            if !irq.gsc_routed() && !*gsc_irq_failed {
+                if let Err(error) = irq.route_gsc() {
+                    *gsc_irq_failed = true;
+                    irq.unroute_gsc();
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: GSC IRQ routing refused ({:?}); GSC polled",
+                        self.pending.index,
+                        error
+                    );
+                }
+            }
+        }
+        let events = irq.as_ref().map_or(0, |irq| irq.take_gsc_events());
+        // xe_huc_init allocates huc->gsc_pkt only for a GSC-headered image.
+        let headers = huc.as_ref().is_some_and(|huc| {
+            crate::intel_gpu_gt::media::gsc::HucImage::parse(huc.load().object)
+                .is_ok_and(|image| image.gsc_headers)
+        });
+        let port = GscDsm::new(&self.pending);
+        let _ = gsc.poll(now, guc, &self.pending.window, &port, headers, events);
+        let status = gsc.status();
+        if gsc_reported.replace(status) != Some(status) {
+            use crate::intel_gpu_gt::media::gsc::load::Status;
+            let errno = match status {
+                Status::LoadFail(error) | Status::InitFail(error) => error.errno(),
+                Status::Error(error) => error.errno(),
+                _ => 0,
+            };
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "intel-gt card{}: GSC {:?} ({}; compatibility {:?}, HuC via GSC {:?}{})",
+                self.pending.index,
+                status,
+                errno,
+                gsc.compatibility(),
+                gsc.huc(),
+                if gsc.wedged() { ", wedged" } else { "" }
+            );
+        }
+    }
+
     /// Release the media GT owner's wake requests and advance a verified
     /// media GuC stop before any GT0 stop, park, suspend or fault cleanup.
     fn retire_media(&self, state: &mut State, now: u64) -> MediaRetire {
         *self.user_media.lock() = None;
         if let Some(irq) = state.irq.as_ref() {
             irq.unroute_media();
+            irq.unroute_gsc();
         }
         state.media_irq_failed = false;
+        state.gsc_irq_failed = false;
         state.media_reported = false;
         state.media_guc_tried = false;
         state.media_recovered = false;
+        // xe_uc_stop_prepare -> xe_gsc_stop_prepare: a running GSC load
+        // finishes (each step is bounded) before the media GuC stops. Fault
+        // cleanup cannot wait: the interrupted load is LOAD_FAIL.
+        if let Some(gsc) = state.gsc.as_mut() {
+            if !gsc.quiesce(now, state.media_guc.as_mut(), &self.pending.window) {
+                if !matches!(state.phase, Phase::Failed | Phase::Cleaning) {
+                    return MediaRetire::Pending;
+                }
+                gsc.interrupt(&self.pending.window);
+            }
+        }
         let retired = crate::intel_gpu_gt::media::retire(
             &mut state.media,
             &mut state.media_guc,
@@ -2604,6 +2766,9 @@ impl Owner {
         );
         if retired == MediaRetire::Done {
             state.media_guc_reported = false;
+            if let Some(gsc) = state.gsc.as_mut() {
+                gsc.end_session(&self.pending.window, true);
+            }
         }
         retired
     }
@@ -2611,6 +2776,20 @@ impl Owner {
     /// Await a proven media stop before GT0 leaves D0. False leaves the media
     /// GuC retained; the caller must not power down or rebuild the arena.
     async fn stop_media(&self, state: &mut State) -> bool {
+        // xe_gsc_stop_prepare: wait for a running GSC load (bounded by its
+        // own step deadlines) before the media GuC stops.
+        loop {
+            let now = narf_time::monotonic_ns();
+            let State { gsc, media_guc, .. } = &mut *state;
+            let Some(gsc) = gsc.as_mut() else {
+                break;
+            };
+            if gsc.quiesce(now, media_guc.as_mut(), &self.pending.window) {
+                break;
+            }
+            narf_scheduler::yield_now().await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(1000).as_instant()).await;
+        }
         if self.retire_media(state, narf_time::monotonic_ns()) == MediaRetire::Done {
             return true;
         }
@@ -2626,6 +2805,9 @@ impl Owner {
         if stopped == crate::intel_gpu_gt::media::MediaGucState::Stopped && guc.reclaimable() {
             state.media_guc = None;
             state.media_guc_reported = false;
+            if let Some(gsc) = state.gsc.as_mut() {
+                gsc.end_session(&self.pending.window, true);
+            }
             return true;
         }
         false

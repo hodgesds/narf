@@ -1,8 +1,7 @@
 //! GSC-only formats of the MTL/Arrow media GT: the GSC firmware image and its
 //! GSC_FW_LOAD batch, and the GSC HECI packet protocol (MKHI compatibility
 //! query, PXP 4.3 HuC authentication). Sources are listed in the parent
-//! module. Nothing uses these until NARF loads GSC firmware, so the parent
-//! mounts this module with a dead-code allowance outside native tests.
+//! module. The GSC worker (`load`) uses them in production.
 
 use super::{parse_cpd, u16_at, u32_at, GscError, Version};
 

@@ -91,6 +91,12 @@ pub trait BootAllocator: GpuAllocator {
     fn media_guc_submission(&mut self, _enabled: bool) -> Result<(), BootError> {
         Err(BootError::Cache)
     }
+    /// Map the media GT's GSC private object (`pages` of DSM at
+    /// `dsm_offset`) at this GGTT's fixed GSC window with DM PTEs; returns
+    /// the window's GGTT base. Allocators without such a window refuse.
+    fn map_gsc_stolen(&mut self, _dsm_offset: u64, _pages: u32) -> Result<u32, BootError> {
+        Err(BootError::Cache)
+    }
 
     /// Shared-GGTT GuC TLB protocol (`crate::intel_gpu_ggtt_tlb`). An
     /// allocator with no GGTT shared with a GuC has no TLB to invalidate.
@@ -144,6 +150,10 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
     }
     fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
         self.set_media_guc_submission(enabled)
+            .map_err(BootError::Allocation)
+    }
+    fn map_gsc_stolen(&mut self, dsm_offset: u64, pages: u32) -> Result<u32, BootError> {
+        crate::intel_gpu_rcs::SharedArena::map_gsc_stolen(self, dsm_offset, pages)
             .map_err(BootError::Allocation)
     }
     fn ggtt_tlb_ct(
@@ -1387,6 +1397,16 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.resources.allocator.retire_ggtt()
     }
 
+    /// The staged HuC object as xe_huc.c::huc_auth_via_gsccs names it:
+    /// xe_bo_ggtt_addr(huc->fw.bo) and xe_bo_size(huc->fw.bo).
+    pub(crate) fn huc_object(&self) -> Option<(u64, u32)> {
+        let h = self.resources.huc.as_ref()?;
+        Some((
+            u64::from(h.backing.ggtt_offset()),
+            h.backing.size_pages().checked_mul(PAGE)?,
+        ))
+    }
+
     pub(crate) fn huc_upload(&self) -> Option<crate::intel_gpu_huc::Upload> {
         let h = self.resources.huc.as_ref()?;
         Some(crate::intel_gpu_huc::Upload {
@@ -1553,6 +1573,8 @@ mod tests {
         media_tlb_at: Option<usize>,
         // Media GuC GGTT invalidation mode: CT (submission enabled) or MMIO.
         media_ct: Option<bool>,
+        // GSC private-object DM mappings: (DSM offset, pages).
+        gsc_maps: Vec<(u64, u32)>,
         // Opt-in shared-GGTT GuC TLB bookkeeping: the production Tracker over
         // model backings, keyed by base. `None` keeps earlier fixtures exact.
         ggtt_tlb: Option<crate::intel_gpu_ggtt_tlb::Tracker<u32>>,
@@ -1937,6 +1959,16 @@ mod tests {
             }
             device.synced.insert(backing.base);
             Ok(())
+        }
+
+        /// The model GGTT has no PTE array: record each GSC mapping.
+        fn map_gsc_stolen(&mut self, dsm_offset: u64, pages: u32) -> Result<u32, BootError> {
+            let mut device = self.0.borrow_mut();
+            if device.fail_sync {
+                return Err(BootError::Cache);
+            }
+            device.gsc_maps.push((dsm_offset, pages));
+            Ok(crate::intel_gpu_stolen::GSC_GGTT as u32)
         }
 
         fn sync_for_cpu(&mut self, backing: &Backing) -> Result<(), BootError> {

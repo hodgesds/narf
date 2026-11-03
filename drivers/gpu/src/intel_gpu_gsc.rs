@@ -26,30 +26,29 @@
 //! xe_gsc_proxy_start: huc_auth_via_gsccs only needs a GSCCS HECI packet to
 //! HECI_MEADDRESS_PXP, never the MEI proxy component.
 //!
-//! The HuC parts below are production: `intel_gpu_huc` acquires
-//! `HUC_FIRMWARE`, stages its `HucImage` CSS window on the media GuC and reads
-//! `huc_authenticated(_, HucAuth::Guc)` through GT1's view. So are the
-//! `narf.intel.gsc` opt-in and the Wa_14015076503 helpers the media GuC's stop
-//! uses around GRDOM_FULL. The GSC-only parts (`heci`: the GSC image, its load
-//! batch and the HECI protocol; `load`: the GSC worker that loads the
-//! firmware, authenticates the HuC through the GSC and starts the proxy) run
-//! only on native models: no platform owner supplies GSCCS0, the stolen
-//! private object or a CSME component yet.
+//! Everything below is production. `intel_gpu_huc` acquires `HUC_FIRMWARE`,
+//! stages its `HucImage` CSS window on the media GuC and reads
+//! `huc_authenticated(_, HucAuth::Guc)` through GT1's view. The
+//! `narf.intel.gsc` opt-in adds the Wa_14015076503 helpers the media GuC's
+//! stop uses around GRDOM_FULL and the GSC itself: `heci` (the GSC image, its
+//! load batch and the HECI protocol), `load` (the GSC worker that loads the
+//! firmware, authenticates the HuC through the GSC and starts the proxy) and
+//! `owner` (the device-lifetime production owner over GSCCS0, the stolen
+//! private object and an optional CSME component).
 
 use crate::intel_gpu_aux::MmioWindow;
 
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
 #[path = "intel_gpu_gsc_heci.rs"]
 mod heci;
-#[cfg_attr(not(feature = "kernel-test"), allow(unused_imports))]
 pub(crate) use heci::*;
 
-/// The GSC worker (load, HuC authentication via the GSC, proxy start). No
-/// platform owner supplies its GSCCS queue, stolen private object or CSME
-/// component yet, so only native models drive it.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+/// The GSC worker (load, HuC authentication via the GSC, proxy start).
 #[path = "intel_gpu_gsc_load.rs"]
 pub(crate) mod load;
+
+/// The production GSC owner: GSCCS0 queue, DSM private object, worker.
+#[path = "intel_gpu_gsc_owner.rs"]
+pub(crate) mod owner;
 
 /// Default-off opt-in for GSC handling on the MTL/Arrow media GT, with the
 /// shared pre-`--` grammar of `narf.intel.media_gt=1` and `narf.intel.huc=1`.
@@ -115,7 +114,6 @@ pub(crate) fn wa_14015076503_clear(mmio: &impl MmioWindow) -> Option<()> {
 /// GSC interrupts an earlier owner may have enabled are turned off
 /// (GUNIT_GSC_INTR_ENABLE 0, GUNIT_GSC_INTR_MASK all ones). Both registers
 /// lie above MEDIA_GT_GSI_LENGTH and are reached at their absolute offsets.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
 pub(crate) fn disable_unavailable_interrupts(mmio: &impl MmioWindow) {
     mmio.write32(crate::intel_gpu_gt_irq::GSC_ENABLE, 0);
     mmio.write32(crate::intel_gpu_gt_irq::GSC_MASK, u32::MAX);
@@ -142,14 +140,11 @@ pub enum GscError {
     /// other than the wanted one.
     NoExec,
     /// -ENOMEM: the output buffer cannot hold a GSC header.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     NoMemory,
     /// -EIO: the GSC rejected HuC authentication.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     Io,
     /// The GSC image does not fit its 4 MiB private object (Linux copies it
     /// there unchecked).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     TooLarge,
 }
 
@@ -252,9 +247,7 @@ fn entry_offset(cpd: &[u8], name: &str) -> u32 {
 pub(crate) struct Cpd {
     /// Manifest fw_version (major, minor, hotfix, build). The HuC release
     /// is the CSS's instead; only the GSC image reports this one.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) manifest: Version,
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) security_version: u32,
     /// The CSS entry's offset and header, when one was requested.
     pub(crate) css: Option<(usize, Css)>,
@@ -323,7 +316,6 @@ pub(crate) struct HucImage {
     #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) rsa_size: usize,
     /// uc_fw->has_gsc_headers: only then may the GSC authenticate it.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) gsc_headers: bool,
     #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) size: usize,
@@ -367,8 +359,7 @@ pub(crate) enum HucAuth {
     /// HUC_KERNEL_LOAD_INFO & HUC_LOAD_SUCCESSFUL (GSI-adjusted on GT1).
     Guc,
     /// HECI_FWSTS5(MTL_GSC_HECI1_BASE) & HECI1_FWSTS5_HUC_AUTH_DONE
-    /// (absolute). Unused until NARF authenticates HuC via the GSC.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    /// (absolute): the GSC worker's xe_huc_auth(XE_HUC_AUTH_VIA_GSC).
     Gsc,
 }
 

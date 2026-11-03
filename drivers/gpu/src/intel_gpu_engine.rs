@@ -540,7 +540,6 @@ pub(crate) fn gen12_media(fuse: u32) -> EngineSet {
 /// GSC_HECI_CMD_PKT, both buffers carrying at least a GSC header, or
 /// emit_gsc_upload's GSC_FW_LOAD with GSC_FW_LOAD_LIMIT_VALID. Every GGTT
 /// address fits the 4 GiB GGTT, so the upper dwords are zero.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
 pub(crate) fn gsc_job_valid(words: &[u32]) -> bool {
     use crate::intel_gpu_gt::media::gsc::{GSC_FW_LOAD, GSC_HECI_CMD_PKT, HEADER};
     match *words {

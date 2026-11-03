@@ -48,7 +48,7 @@ fn put(bytes: &mut [u8], at: usize, value: u32) {
 
 /// An `i915/mtl_huc_gsc.bin`-shaped image: a CPD with HUCP.man (release
 /// 9.9.9.9, never reported) and huc_fw (CSS sw_version 8.5.4, reported).
-fn huc_gsc() -> Vec<u8> {
+pub(super) fn huc_gsc() -> Vec<u8> {
     let mut bytes = alloc::vec![0u8; FILE];
     put(&mut bytes, 0, CPD_MARKER);
     put(&mut bytes, 4, 2);
@@ -119,7 +119,7 @@ fn guc_firmware() -> GuCFirmware {
     GuCFirmware::from_fixture(MTL, &image()).unwrap()
 }
 
-fn start(
+pub(super) fn start(
     w: &Window,
     arena: &Arena,
     huc: Option<(&huc::Firmware, bool)>,
@@ -192,7 +192,7 @@ fn stop(guc: &mut MediaGuc<Window, Arena>, w: &Window, hw: &mut Hw, from: u64) {
 
 /// After a verified stop reclaimed every allocation: restart GGTT placement
 /// so the next incarnation's ADS lands where the CT model expects it.
-fn reclaimed(w: &Window, arena: &Arena) {
+pub(super) fn reclaimed(w: &Window, arena: &Arena) {
     assert_eq!(arena.live_allocations(), 0);
     let mut d = w.0.borrow_mut();
     d.next = 0x2000_0000;

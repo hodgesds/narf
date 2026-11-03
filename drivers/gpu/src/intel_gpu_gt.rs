@@ -20,6 +20,10 @@ pub(crate) mod smallbar;
 #[path = "intel_gpu_media_gt.rs"]
 pub(crate) mod media;
 
+/// The MTL/Arrow GSC proxy's CSME end (`i915_gsc_proxy_component_ops`): a
+/// MEI GSC proxy client binds here (gsc_proxy_component_bind/unbind).
+pub use media::gsc::load::{register_csme_proxy, unregister_csme_proxy, CsmeProxy};
+
 /// The default-off pre-separator Intel opt-in grammar shared by
 /// `narf.intel.huc`, `narf.intel.bmg_smallbar` and `narf.intel.media_gt`:
 /// exactly one `name=1` before the first `--`. A bare, malformed or

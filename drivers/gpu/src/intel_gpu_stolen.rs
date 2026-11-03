@@ -233,6 +233,42 @@ pub fn layout(facts: Facts) -> Result<Layout, StolenError> {
     })
 }
 
+/// `detect_bar2_integrated` through a GT register window (graphics >=
+/// 12.70): the layout, and the number of CPU-aperture GGTT entries a
+/// [`Carve`] surveys (`[0, BAR2 length)`, bounded by the GGTT the BAR0 of
+/// length `bar0_len` holds). `gmadr` is BAR2's bus base and length, `bsm`
+/// PCI config `INTEL_GEN11_BSM_DW0/1`. `None` without usable DSM.
+pub(crate) fn discover(
+    mmio: &impl crate::intel_gpu_aux::MmioWindow,
+    gmadr: (u64, u64),
+    bsm: (u32, u32),
+    bar0_len: u64,
+) -> Option<(Layout, u64)> {
+    let read64 = |offset| u64::from(mmio.read32(offset)) | u64::from(mmio.read32(offset + 4)) << 32;
+    let media_gmd_id = mmio.read32(MEDIA_GMD_ID);
+    // detect_bar2_integrated reads GSCPSMI_BASE only for a media GT that
+    // takes Wa_14019821291.
+    let gscpsmi_base = if wa_14019821291(media_gmd_id) == Ok(true) {
+        read64(MEDIA_GSCPSMI_BASE)
+    } else {
+        0
+    };
+    let layout = layout(Facts {
+        ggc: mmio.read32(GGC),
+        stolen_reserved_lo: mmio.read32(STOLEN_RESERVED),
+        media_gmd_id,
+        gscpsmi_base,
+        gmadr_base: gmadr.0,
+        gmadr_len: gmadr.1,
+        bsm_dw0: bsm.0,
+        bsm_dw1: bsm.1,
+    })
+    .ok()?;
+    let entries =
+        (gmadr.1 / PAGE).min(bar0_len.saturating_sub(crate::intel_gpu_gtt::GGTT_ARRAY_BASE) / 8);
+    Some((layout, entries))
+}
+
 /// The DSM-relative page offset a present DM PTE maps, if `pte` is one.
 fn dm_page(pte: u64) -> Option<u64> {
     if pte & (GGTT_PTE_PRESENT | GGTT_PTE_DM) != GGTT_PTE_PRESENT | GGTT_PTE_DM {
@@ -385,6 +421,11 @@ impl Carve {
         }
         self.next = end;
         self.done()
+    }
+
+    /// The layout this survey places in.
+    pub fn layout(&self) -> Layout {
+        self.layout
     }
 
     /// Every entry has been read.
@@ -626,7 +667,6 @@ impl CarveSlot {
 /// `io_base`). Accesses outside the BAR or unaligned read as all ones and
 /// write nothing.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
 pub(crate) struct Bar2Window(pub(crate) narf_bus::MmioRegion);
 
 impl crate::intel_gpu_aux::MmioWindow for Bar2Window {
@@ -653,7 +693,6 @@ impl crate::intel_gpu_aux::MmioWindow for Bar2Window {
 /// fixed GGTT DM window. Dropping it releases nothing: the claim and the
 /// GGTT window stay the function's for its lifetime.
 #[derive(Debug)]
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
 pub(crate) struct StolenObject<W> {
     cpu: W,
     offset: u64,
@@ -663,7 +702,6 @@ pub(crate) struct StolenObject<W> {
 impl<W: crate::intel_gpu_aux::MmioWindow> StolenObject<W> {
     /// The claimed `GSC_BYTES` range at `claim` within usable DSM of
     /// `layout`, mapped at the GGTT window base `ggtt`.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn gsc(cpu: W, layout: Layout, claim: (u64, u64), ggtt: u32) -> Option<Self> {
         let (offset, len) = claim;
         (len == GSC_BYTES

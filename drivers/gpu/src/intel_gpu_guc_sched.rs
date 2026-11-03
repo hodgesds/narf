@@ -888,7 +888,6 @@ impl<A: BootAllocator> GuCScheduler<A> {
     /// GSC_FW_LOAD. As NARF does for every owned kernel job, the commands run
     /// inline in the context ring ahead of the MI_FLUSH_DW breadcrumb, where
     /// Linux places them in an xe_bb behind MI_BATCH_BUFFER_START (GGTT).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn submit_gsc(
         &mut self,
         now: u64,

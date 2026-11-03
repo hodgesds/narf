@@ -458,7 +458,6 @@ impl<M: MmioWindow> Controller<M> {
     /// GSCCS events | HECI2 GSC_IRQ_INTF(1), GUNIT_GSC_INTR_MASK = ~GSCCS
     /// events, HECI2_RSVD_INTR_MASK = ~(GSC_IRQ_INTF(1) << 16). Decoded causes
     /// only latch `take_gsc_events`; GSC job completion stays fence-polled.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn route_gsc(&self) -> Result<(), IrqError> {
         let mut s = self.0.lock();
         if !s.active || !s.tiled || s.gsc_routed {
@@ -488,7 +487,6 @@ impl<M: MmioWindow> Controller<M> {
     /// xe_irq.c::gt_irq_reset for a media GT with GSCCS0: GUNIT_GSC_INTR_ENABLE
     /// 0, GUNIT_GSC_INTR_MASK and HECI2_RSVD_INTR_MASK all ones. Decoding
     /// ownership stays, so an identity already latched is acknowledged.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn unroute_gsc(&self) {
         let mut s = self.0.lock();
         if !s.gsc_routed {
@@ -499,7 +497,6 @@ impl<M: MmioWindow> Controller<M> {
     }
 
     /// The GSC causes decoded since the last call (`GSC_EVENT_*`).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn take_gsc_events(&self) -> u32 {
         core::mem::take(&mut self.0.lock().gsc_events)
     }
@@ -809,25 +806,21 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
     }
 
     /// See `Controller::route_gsc`.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn route_gsc(&self) -> Result<(), IrqError> {
         self.controller.route_gsc()
     }
 
     /// See `Controller::unroute_gsc`.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn unroute_gsc(&self) {
         self.controller.unroute_gsc()
     }
 
     /// Whether the GSC sources are currently enabled on this delivery graph.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn gsc_routed(&self) -> bool {
         self.controller.0.lock().gsc_routed
     }
 
     /// See `Controller::take_gsc_events`.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn take_gsc_events(&self) -> u32 {
         self.controller.take_gsc_events()
     }

@@ -15,7 +15,8 @@
 //!   acknowledgement bound and an all-ones ack treated as lost MMIO.
 //! - xe_hw_engine.c::read_media_fuses: GT_VEBOX_VDBOX_DISABLE with positive
 //!   (present) polarity at graphics >= 12.50. check_gsc_availability drops
-//!   GSCCS0 without loaded GSC firmware, which this owner never loads.
+//!   GSCCS0 without available GSC firmware; with `narf.intel.gsc=1` and an
+//!   available image `MediaGuc::schedule_gsccs` adds it to the scheduler.
 //! - Probe resets only the GuC: xe_uc.c::xe_uc_sanitize_reset (from
 //!   xe_uc_init_post_hwconfig/xe_uc_load_hw) -> xe_guc.c::xe_guc_reset
 //!   (GRDOM_GUC, 5 ms, GS_MIA_IN_RESET). xe_gt.c::do_gt_reset (GRDOM_FULL,
@@ -365,7 +366,8 @@ pub(crate) fn qualify(
 }
 
 /// xe_hw_engine.c::read_media_fuses with present polarity, limited to the
-/// media_xelpmp VCS/VECS mask. GSCCS0 is never a scheduled engine here.
+/// media_xelpmp VCS/VECS mask. GSCCS0 is not part of this published
+/// inventory; the media GuC schedules it separately (`schedule_gsccs`).
 pub(crate) fn inventory(fuse: u32) -> EngineSet {
     let vdbox = fuse & 0xff; // GT_VDBOX_DISABLE_MASK 7:0
     let vebox = (fuse >> 16) & 0xf; // GT_VEBOX_DISABLE_MASK 19:16
@@ -1194,7 +1196,6 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     /// mask only then; it takes the XE_FW_GSC domain (xe_force_wake_init_engines),
     /// joins the ADS, records its default LRC, and stays out of every
     /// publication, query and placement (xe_hw_engine_is_reserved).
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn schedule_gsccs(&mut self) -> Result<(), MediaGucError> {
         if self.state != MediaGucState::Starting || self.step != Step::Boot {
             return Err(MediaGucError::State);
@@ -1204,7 +1205,6 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     }
 
     /// GSCCS0 is part of this owner's scheduler.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn gsccs_scheduled(&self) -> bool {
         self.gsc
     }
@@ -1222,7 +1222,6 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     /// One GSC kernel job on GSCCS0 while GT1 runs (`gsc->q`). The worker
     /// polls its fence; it retires only after deregistration, as every NARF
     /// kernel job does.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn submit_gsc(
         &mut self,
         now: u64,
@@ -1246,6 +1245,22 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             self.begin_stop(now);
         }
         result.map(|(_, fence)| fence)
+    }
+
+    /// The media HuC object (`huc->fw.bo`) for GSC authentication.
+    pub(crate) fn huc_object(&self) -> Option<(u64, u32)> {
+        self.gt.huc_object()
+    }
+
+    /// The GSC rejected the HuC the media GuC authenticated: huc->fw becomes
+    /// LOAD_FAIL (xe_huc_auth), so query7 type1 answers ENODEV.
+    pub(crate) fn huc_gsc_failed(&mut self) {
+        self.gt.invalidate_huc();
+    }
+
+    /// A handle to the shared GGTT arena this media GuC lives in.
+    pub(crate) fn allocator(&self) -> A {
+        self.allocator.clone()
     }
 
     /// The first refusal of this owner, if any.
@@ -1647,7 +1662,6 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
 
 /// The production `gsc::load::Gsccs`: the GSC worker's kernel jobs on the
 /// media GuC's GSCCS0 (`gsc->q`), one outstanding at a time.
-#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
 pub(crate) struct GscQueue<
     'a,
     M: MmioWindow + Clone,
@@ -1660,7 +1674,6 @@ pub(crate) struct GscQueue<
 impl<'a, M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     GscQueue<'a, M, A>
 {
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))] // GSC runtime wiring follows.
     pub(crate) fn new(guc: &'a mut MediaGuc<M, A>, now: u64) -> Self {
         Self { guc, now }
     }
@@ -1777,7 +1790,8 @@ where
 }
 
 /// GSC firmware, GSC-headered HuC images and the GSC HECI protocol of this
-/// media GT. The media GuC loads the HuC through it; no owner loads the GSC.
+/// media GT. The media GuC loads the HuC through it; with `narf.intel.gsc=1`
+/// its `owner` loads the GSC over GSCCS0.
 #[path = "intel_gpu_gsc.rs"]
 pub(crate) mod gsc;
 
