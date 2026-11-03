@@ -3156,7 +3156,7 @@ registry/physical PCI power callbacks or S3 executions. Physical Intel, Mesa,
 codec and performance acceptance remain unrun. No silicon or full physical
 owner result is claimed; OA and all ten broad workstreams remain open.
 
-### MTL legacy modeset failure correction — validation pending
+### MTL legacy modeset failure correction — debug checkpoint; release gates pending
 
 This corrects false success in the existing MTL/Arrow legacy modeset path; it
 adds no feature row. The ledger remains at 65 rows with all ten broad workstreams
@@ -3178,7 +3178,7 @@ retains 1,086 names unchanged plus the replacement. All prior 152 cumulative new
 labels remain; four additions and one replacement make 157 new-or-replacement
 labels, not five added tests. Group 3 grows to 189; group 5 stays at 197.
 
-Four new fixture bodies and the exact replacement are registered. Debug/release native execution, production/btrfs, cross-target/host lint/build and format/source gates remain pending. Source review is not native acceptance.
+All seven debug groups pass 1,912 unique tests with zero failures or duplicates, no Intel skips and the one existing shared RNG-registration skip. The four additions, exact TC replacement, preserved baseline/cumulative inventories and 31 backlight regressions pass. Release native, production/btrfs and remaining cross-target/host/format gates are pending.
 
 The fixtures use actual dispatch and an actual scheduler task over modeled
 hardware. Full physical RuntimeOwner, positive firmware registry, PCI power
