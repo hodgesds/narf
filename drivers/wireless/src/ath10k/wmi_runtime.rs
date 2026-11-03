@@ -36,11 +36,11 @@ pub(in crate::ath10k) mod beacon_hints;
 mod chains;
 mod coexistence;
 mod data;
-mod nwifi;
 mod host_power;
 mod ht;
 mod hw_keys;
 mod mlme;
+mod nwifi;
 pub(in crate::ath10k) mod offchannel;
 // Role owners (P2P device/client/GO) bind these codecs in later steps.
 #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
