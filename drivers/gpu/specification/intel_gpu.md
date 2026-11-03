@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.39** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.40** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -31,9 +31,10 @@
 > pass debug and release native model gates; BMG opt-in GPU-only VRAM,
 > bounded i915 capture/protection and automatic-reset discovery
 > pass debug and release native/integration gates; the unpublished
-> MTL/Arrow standalone media GT lifecycle owner and display-14 DMC,
-> DC_off and lit-panel DC5/DC6 services pass release native model
-> gates — see §20).
+> MTL/Arrow standalone media GT lifecycle owner, display-14 DMC,
+> DC_off and lit-panel DC5/DC6 services, and display14 resource
+> transactions with live repartitioning and SAGV pass release native
+> model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3468,7 +3469,7 @@ also selects `drivers/gpu/intel_gpu_dc_states`. The release production boot and
 both btrfs postflights pass. The debug group pass is deferred to the end of the
 current integration wave.
 
-### Display14 resource transactions — software slice
+### Display14 resource transactions — release gates recorded
 
 Qualified display14.00 (Meteor/Arrow Lake) modesets now compute and own
 their display resources instead of reusing a fixed profile. The computation
@@ -3488,8 +3489,11 @@ follows the source order: PM demand at max(old, new), the final CDCLK
 relock when the firmware clock is unknown), DBUF slice power, MBUS join with
 DBOX credits and trackers, every plane/cursor WM and DDB register, then the
 new PM demand. Each step is checked by readback or acknowledgement. Any
-failure restores the touched registers in reverse order, the original clock
-before its PM demand; if restoration fails, the raised PM demand stays. The
+failure restores the touched registers in reverse order. Once the pre-plane
+request was acknowledged, the restore first re-raises PM demand to
+max(original, new), so the demand covers every clock it restores, and programs
+the original demand only after the original clock is back. A failed re-raise
+stops the restore before any clock change, and the raised PM demand stays. The
 pipe stays off either way. The owned modeset uses a single Pipe-A request
 (primary plus budgeted hidden cursor) and reserves the HBR3 port clock it
 may enable before training, which also sets voltage level 1. CDCLK may now
@@ -3497,9 +3501,7 @@ fall below a faster firmware clock. The multi-pipe
 computation is real, but a modeset that enables several pipes is not yet
 wired. Nothing is advertised beyond the existing single-pipe profile.
 
-Refused or not implemented: repartitioning with any pipe live (Linux's
-vblank-ordered DDB updates), enabling SAGV (QGV peak bandwidth stays 0xffff,
-so DRAM QGV derating is not modelled), scalers, planar formats, async-flip
+Refused or not implemented: scalers, planar formats, async-flip
 minimum watermarks, bigjoiner, DSC, VRR and Xe2+ clock/MDCLK changes.
 Requests outside the qualified bounds are refused before any write and keep the
 inherited path. Thirteen new native fixtures cover latency decoding, levels
@@ -3523,6 +3525,8 @@ demand come last. A changed lit pipe, an unknown firmware CDCLK, live FBC or
 DSB, a foreign lit pipe, divergence from the programmed state and an
 unorderable DDB move are refused before any write. A later failure undoes the
 executed steps in reverse, rejoining before a formerly joined pipe regrows.
+When the post-plane PM demand request was attempted, the undo re-raises
+max(old, new) before anything else, as the forward pre-plane request did.
 
 `intel_gpu_xelpg_pipes::Pipes` exposes the Pipe B-D entry described in
 spec.md §3: reserve resources, program timings, let the port owner train,
@@ -3530,6 +3534,9 @@ enable the transcoder and arm the primary, then disable and release. The
 fixed Pipe-A path is unchanged. Its KMS services still require the
 single-pipe layout and refuse while another pipe is lit. No production port
 caller exists yet, so these entries are reached only by native fixtures.
+Until the port owner calls them, the live and pipe modules, four
+`ResourceError` variants and `State::requests` carry a temporary
+`allow(dead_code)` outside native-test builds. Remove it with that join.
 Seven more fixtures cover DDB ordering and cycle refusal, MBUS join and
 unjoin sequencing, adding and removing a pipe beside a lit panel, write-free
 refusals, reverse undo and the pipe owner's enable/release and refusals.
@@ -3541,7 +3548,9 @@ derated and peak bandwidth per plane-count group, and `mtl_find_qgv_points`
 selects the point with the least headroom that still carries the summed data
 rate. PM demand `QCLK_GV_BW` then carries that point's peak bandwidth in
 100 MB/s units. SAGV stays masked (0xffff) whenever SAGV is not controllable
-(unsupported DRAM type, fewer than two QGV points), in which case the SAGV
+(unsupported DRAM type, fewer than two QGV points; Linux's
+`tgl_get_bw_info` marks exactly one point as not controlled and keeps the
+block time for a malformed zero-point report), in which case the SAGV
 block time, and so the SAGV watermarks, are zero as in `intel_sagv_init`. It
 also stays masked when any active pipe has an enabled plane, or visible
 cursor, whose post-DDB SAGV watermark is disabled (`tgl_crtc_can_enable_sagv`,
@@ -3555,3 +3564,11 @@ QCLK_GV_BW rather than a constant 0xffff. Three fixtures cover QGV decode
 and bandwidth math, enable/mask/refusal decisions, and all-pipes-off, live
 and failure transitions. One existing latency fixture now expects the zero
 block time without SAGV control. Pipe scalers remain open.
+
+All seven release groups pass 1,973 unique tests with no failures and no Intel
+skips; the only skip is the existing shared RNG-registration skip. That
+includes the two restore-order fixtures that fail the post-plane PM demand
+request after a clock decrease. Group 6 now also selects `drivers/gpu/intel_gpu_xelpg_resources`,
+`drivers/gpu/intel_gpu_display_resources`, `drivers/gpu/intel_gpu_xelpg_live`,
+`drivers/gpu/intel_gpu_xelpg_pipes` and `drivers/gpu/intel_gpu_xelpg_bw`. The
+debug group pass is deferred to the end of the current integration wave.

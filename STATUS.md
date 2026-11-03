@@ -1929,6 +1929,31 @@ DC9 and display-core uninit at suspend, and FBC, which needs a stolen-memory
 owner and a console frontbuffer flush. None of this has run on physical Intel
 hardware.
 
+### Display-14 resource transactions — release gates recorded
+
+Meteor Lake and Arrow Lake modesets now compute their own display resources
+instead of using a fixed profile: watermarks, DBUF slices and MBUS joining,
+CDCLK and PM demand, following Linux. A commit with every pipe off can raise or
+lower CDCLK. It restores everything it touched if any step fails, and the PM
+demand always covers the clock during the restore. A live repartition moves
+resources between pipes while others stay lit. A new Pipe B-D owner reserves
+resources and turns extra pipes on and off for external outputs. SAGV is enabled
+when the memory reports controllable QGV points, with the PM demand bandwidth
+taken from the chosen point.
+
+Twenty-five new tests run in group 6 under `intel_gpu_xelpg_resources`,
+`intel_gpu_display_resources`, `intel_gpu_xelpg_live`, `intel_gpu_xelpg_pipes`
+and `intel_gpu_xelpg_bw`. All seven release groups pass 1,973 unique tests, with
+no failures and only the existing shared RNG-registration skip. The release
+production boot and both btrfs postflights also pass. The debug group pass is
+deferred to the end of this integration wave.
+
+The live and Pipe B-D modules have no production caller yet. Until the external
+route calls them, they and a few related items carry a temporary
+`allow(dead_code)` outside test builds. Remove it with that join. Pipe scalers,
+planar formats, bigjoiner, DSC and VRR remain open. None of this has run on
+physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
