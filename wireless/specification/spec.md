@@ -285,6 +285,39 @@ SAE's password/PMK computation uses the MLD address pair; the physical link
 MACs remain separate throughout packet protection and native key binding.
 These validators create no association, RF, terminal-completion or key grant.
 
+**Multiple-link association request/response (`mlo`, software only).**
+`JoinPlan::prepare_mld_links(assoc, extra, ssid, security, options, local)`
+takes `MldLinkRequest { bss, own_link, phy: MldLinkPhy::{Phy, SixGhz} }`
+for the assoc link and1..14 further links. Each link is prepared from its own
+actual BSS by the single-link MLD rules and must name the same AP MLD with a
+distinct Link ID and distinct own/peer link MACs; AKM, PMF and RSNE must
+negotiate identically. The request then carries one Basic MLE (mac80211
+`ieee80211_assoc_add_ml_elem`): MLD MAC, EML Capabilities only when
+`Local::with_capabilities(mld_capa_ops, eml)` supplied EMLSR/EMLMR, MLD
+Capabilities, and per link a COMPLETE per-STA profile (STA MAC present,
+capability field, that link's rates and HT/VHT/HE/HE6/EHT/UHR capabilities)
+followed by Non-Inheritance for every tracked outer element the link lacks;
+over-long (sub)elements are fragmented as `ieee80211_fragment_element`.
+`single_link` requests are byte-for-byte unchanged and still place the MLE
+last; unlike Linux the multiple-link MLE also stays after EHT Capabilities.
+
+`Context::multi_link_response(ies, requested)` (`ieee80211_assoc_success`/
+`ieee80211_assoc_config_link`) requires the exact AP MLD, a matching present
+Link ID and the common BSS Parameters Change Count; each requested link
+needs a COMPLETE profile with capability/status; a successful one also needs
+its own change count, may not nest a Basic MLE and, when STA MAC is present,
+must name that link's AP. A missing requested link fails the association;
+unrequested profiles are ignored. `mlo::link_elements(outer, profile)`
+builds the per-link view as `ieee802_11_parse_elems_full` does: outer
+elements are inherited unless listed in Non-Inheritance or repeated in the
+profile, and the outer MLE is never inherited. Each accepted link's view is
+negotiated by that link's own plan (rates, 6GHz, RSN, PHY) before anything
+commits; a non-zero per-STA status drops only that link.
+`JoinPlan::mld_links() -> &[MldLink]` exposes `context()`, `link_id()`,
+`channel()`, `status()`, `accepted()`, offered/negotiated PHY, 6GHz plan and
+legacy rates. Response MLE/profile fragmentation is still refused, and no
+native driver requests or activates an additional link yet.
+
 **UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
 `UhrCapability::parse(body, from_ap)` / `UhrOperation::parse` implement the
 draft UHR Capabilities/Operation (extension 152/151) layouts exactly as Linux

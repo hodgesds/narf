@@ -135,6 +135,65 @@ pub struct JoinPlan {
     /// for the 2.4/5 GHz callers' stacks).
     six_ghz: Option<Box<six_ghz::SixGhzPlan>>,
     mld: Option<Box<mlo::Context>>,
+    /// Additional requested MLD links (empty for every single-link plan).
+    links: Vec<MldLink>,
+}
+
+/// One link of a multiple-link MLD request: the actual BSS of that
+/// affiliated AP, this station's physical link MAC and its local PHY.
+#[derive(Clone, Copy, Debug)]
+pub struct MldLinkRequest<'a> {
+    pub bss: &'a Bss,
+    pub own_link: [u8; 6],
+    pub phy: MldLinkPhy<'a>,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum MldLinkPhy<'a> {
+    /// 2.4/5GHz HT/VHT/HE/EHT profile.
+    Phy(phy::LocalPhy),
+    /// 6GHz HE/EHT profile.
+    SixGhz(&'a six_ghz::SixGhzLocal),
+}
+
+/// An additional requested link (mlme.c `assoc_data->link[link_id]`). Its
+/// per-link plan owns the offer and, after association, that link's own
+/// status and negotiated rates/PHY. A rejected link grants nothing.
+#[derive(Debug)]
+pub struct MldLink {
+    context: mlo::Context,
+    plan: JoinPlan,
+    status: Option<u16>,
+}
+impl MldLink {
+    /// The per-link identity: same MLD addresses, this link's MACs and id.
+    pub fn context(&self) -> &mlo::Context {
+        &self.context
+    }
+    pub fn link_id(&self) -> u8 {
+        self.context().link_id()
+    }
+    pub fn channel(&self) -> u8 {
+        self.plan.channel
+    }
+    /// The per-STA status from the association response; `None` before it.
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+    pub fn accepted(&self) -> bool {
+        self.status == Some(0)
+    }
+    pub fn offered_phy(&self) -> Option<&phy::Offer> {
+        self.plan.offered_phy.as_ref()
+    }
+    pub fn negotiated_phy(&self) -> Option<&phy::Negotiated> {
+        self.plan.negotiated_phy.as_ref()
+    }
+    pub fn six_ghz(&self) -> Option<&six_ghz::SixGhzPlan> {
+        self.plan.six_ghz.as_deref()
+    }
+    pub fn legacy_rates(&self) -> (u16, u16) {
+        self.plan.legacy_rates()
+    }
 }
 
 #[derive(Default)]
@@ -845,6 +904,129 @@ impl JoinPlan {
             },
         )
     }
+    /// Request further affiliated links of the same AP MLD in one association
+    /// (mlme.c ieee80211_mgd_assoc / ieee80211_assoc_add_ml_elem). `assoc`
+    /// is the link the frames are exchanged on. Every other link is prepared
+    /// from its own actual BSS with the same SSID/security rules and must
+    /// carry a Basic MLE naming the same AP MLD with a distinct Link ID; its
+    /// rates and PHY capabilities form one COMPLETE per-STA profile with
+    /// Non-Inheritance against the assoc link. RSN/RSNXE are inherited and
+    /// must negotiate identically. Requesting a link creates no native owner.
+    pub fn prepare_mld_links(
+        assoc: MldLinkRequest<'_>,
+        extra: &[MldLinkRequest<'_>],
+        ssid: &[u8],
+        security: SecurityMode,
+        options: JoinOptions,
+        mld: mlo::Local,
+    ) -> Result<Self, Error> {
+        if extra.is_empty() || extra.len() >= 15 {
+            return Err(Error::InvalidBss);
+        }
+        let mut plan = Self::prepare_link(assoc, ssid, security, options, mld)?;
+        let context = *plan.mld.as_deref().ok_or(Error::InvalidBss)?;
+        let mut seen = 1u16 << context.link_id();
+        let mut macs = vec![context.own_link(), context.peer_link()];
+        for request in extra {
+            let link = Self::prepare_link(*request, ssid, security, options, mld)?;
+            let other = *link.mld.as_deref().ok_or(Error::InvalidBss)?;
+            if other.peer_mld() != context.peer_mld()
+                || seen & (1 << other.link_id()) != 0
+                || macs.contains(&other.own_link())
+                || macs.contains(&other.peer_link())
+            {
+                return Err(Error::InvalidBss);
+            }
+            if link.akm() != plan.akm()
+                || link.pmf() != plan.pmf()
+                || link.rsn_body() != plan.rsn_body()
+            {
+                return Err(Error::UnsupportedSecurity);
+            }
+            seen |= 1 << other.link_id();
+            macs.extend_from_slice(&[other.own_link(), other.peer_link()]);
+            plan.links.push(MldLink {
+                context: other,
+                plan: link,
+                status: None,
+            });
+        }
+        // Replace the trailing one-link request MLE with the profiles form.
+        let single = mld.request_element();
+        let start = plan
+            .assoc
+            .len()
+            .checked_sub(single.len())
+            .filter(|at| plan.assoc[*at..] == single[..])
+            .ok_or(Error::InvalidBss)?;
+        plan.assoc.truncate(start);
+        let outer = mlo::present_elements(&plan.assoc[28..])?;
+        let mut profiles = Vec::new();
+        for link in &plan.links {
+            let (capability, elements) = link.plan.profile_elements()?;
+            mlo::push_request_profile(
+                &mut profiles,
+                link.link_id(),
+                link.context().own_link(),
+                capability,
+                &elements,
+                &outer,
+            )?;
+        }
+        plan.assoc
+            .extend_from_slice(&mld.request_element_with_profiles(&profiles));
+        Ok(plan)
+    }
+    fn prepare_link(
+        request: MldLinkRequest<'_>,
+        ssid: &[u8],
+        security: SecurityMode,
+        options: JoinOptions,
+        mld: mlo::Local,
+    ) -> Result<Self, Error> {
+        match request.phy {
+            MldLinkPhy::Phy(phy) => Self::prepare_mld(
+                request.bss,
+                request.own_link,
+                ssid,
+                security,
+                phy,
+                options,
+                mld,
+            ),
+            MldLinkPhy::SixGhz(six) => Self::prepare_mld_6ghz(
+                request.bss,
+                request.own_link,
+                ssid,
+                security,
+                six,
+                options,
+                mld,
+            ),
+        }
+    }
+    /// The per-link capability field and the elements ieee80211_add_link_elems
+    /// writes for a non-assoc link: rates and PHY capabilities only. SSID,
+    /// RSN, RSNXE and the MLE stay in the outer frame and are inherited.
+    fn profile_elements(&self) -> Result<(u16, Vec<u8>), Error> {
+        let capability = u16::from_le_bytes([self.assoc[24], self.assoc[25]]);
+        let mut elements = Vec::new();
+        ies(&self.assoc[28..], |id, body| {
+            let outer_only = matches!(id, 0 | 48 | 244)
+                || id == 255 && body.first() == Some(&mlo::EXT_MULTI_LINK);
+            if !outer_only {
+                elements.extend_from_slice(&[id, body.len() as u8]);
+                elements.extend_from_slice(body);
+            }
+            Ok(())
+        })?;
+        Ok((capability, elements))
+    }
+    /// Additional requested MLD links, in request order. Before association
+    /// these are offers; afterwards each carries its per-STA status.
+    pub fn mld_links(&self) -> &[MldLink] {
+        &self.links
+    }
     /// Selected immutable candidate identity; successful association and a
     /// current native RF/key grant are separate requirements.
     pub fn mld(&self) -> Option<&mlo::Context> {
@@ -1151,6 +1333,7 @@ impl JoinPlan {
             wpa2,
             six_ghz,
             mld,
+            links: Vec::new(),
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -1224,10 +1407,7 @@ impl JoinPlan {
             return Err(Error::Rejected(status));
         }
         let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1
-            || (capability & 0x10 != 0) != self.security.is_rsn()
-            || self.epd && capability & CAP_EPD == 0
-        {
+        if !self.response_capability(capability) {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
@@ -1237,12 +1417,105 @@ impl JoinPlan {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
-        if let Some(mld) = self.mld.as_ref() {
-            if mld.response(&bytes[30..]).is_err() {
+        let elements = &bytes[30..];
+        let profiles = match self.mld.as_deref() {
+            Some(mld) if !self.links.is_empty() => {
+                let requested = self
+                    .links
+                    .iter()
+                    .fold(0u16, |mask, link| mask | 1 << link.link_id());
+                match mld.multi_link_response(elements, requested) {
+                    Ok(profiles) => profiles,
+                    Err(_) => {
+                        self.phase = Phase::Failed;
+                        return Err(Error::Protocol);
+                    }
+                }
+            }
+            Some(mld) => {
+                if mld.response(elements).is_err() {
+                    self.phase = Phase::Failed;
+                    return Err(Error::Protocol);
+                }
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let (rates, basic, negotiated_phy) = match self.negotiate_response(elements) {
+            Ok(value) => value,
+            Err(error) => {
+                self.phase = Phase::Failed;
+                return Err(error);
+            }
+        };
+        // mlme.c ieee80211_assoc_config_link per affiliated link: a non-zero
+        // per-STA status drops only that link; any invalid accepted link
+        // fails the whole association before anything is committed.
+        let mut outcomes = Vec::with_capacity(profiles.len());
+        for response in &profiles {
+            let Some(link) = self
+                .links
+                .iter()
+                .find(|link| link.link_id() == response.link_id())
+            else {
                 self.phase = Phase::Failed;
                 return Err(Error::Protocol);
+            };
+            if response.status() != 0 {
+                outcomes.push((response.link_id(), response.status(), None));
+                continue;
+            }
+            let result = (|| {
+                if response
+                    .address()
+                    .is_some_and(|address| address != link.context().peer_link())
+                    || !link.plan.response_capability(response.capability())
+                {
+                    return Err(Error::Protocol);
+                }
+                let view = mlo::link_elements(elements, response.elements())?;
+                link.plan.negotiate_response(&view)
+            })();
+            match result {
+                Ok(value) => outcomes.push((response.link_id(), 0, Some(value))),
+                Err(error) => {
+                    self.phase = Phase::Failed;
+                    return Err(error);
+                }
             }
         }
+        // Commit only after all frame, IE and rate checks have passed.
+        self.rates = rates;
+        self.basic = basic;
+        self.negotiated_phy = negotiated_phy;
+        self.phase = Phase::Associated { aid };
+        for (link_id, status, value) in outcomes {
+            if let Some(link) = self.links.iter_mut().find(|link| link.link_id() == link_id) {
+                link.status = Some(status);
+                match value {
+                    Some((rates, basic, negotiated)) => {
+                        link.plan.rates = rates;
+                        link.plan.basic = basic;
+                        link.plan.negotiated_phy = negotiated;
+                        link.plan.phase = Phase::Associated { aid };
+                    }
+                    None => link.plan.phase = Phase::Failed,
+                }
+            }
+        }
+        Ok(Some(aid))
+    }
+    fn response_capability(&self, capability: u16) -> bool {
+        capability & 3 == 1
+            && (capability & 0x10 != 0) == self.security.is_rsn()
+            && (!self.epd || capability & CAP_EPD != 0)
+    }
+    /// Rate, 6GHz, RSN and PHY negotiation of one link's response elements,
+    /// without committing anything.
+    fn negotiate_response(
+        &self,
+        elements: &[u8],
+    ) -> Result<(u16, u16, Option<phy::Negotiated>), Error> {
         let mut response = RateElements {
             allowed: if self.offered_phy.is_some() {
                 SEL_PHY
@@ -1260,13 +1533,12 @@ impl JoinPlan {
                 },
             ..Default::default()
         };
-        if let Err(error) = ies(&bytes[30..], |id, body| {
+        if let Err(error) = ies(elements, |id, body| {
             if self.cck14 && forbidden_cck14_phy(id, body) {
                 return Err(Error::UnsupportedRates);
             }
             response.observe(id, body)
         }) {
-            self.phase = Phase::Failed;
             return Err(if error == Error::InvalidBss {
                 Error::Protocol
             } else {
@@ -1280,21 +1552,17 @@ impl JoinPlan {
             || basic & !rates != 0
             || self.cck14 && response.rates & !15 != 0
         {
-            self.phase = Phase::Failed;
             return Err(Error::UnsupportedRates);
         }
         if self.six_ghz.is_some() {
-            if let Err(error) = self.six_ghz_response(&bytes[30..]) {
-                self.phase = Phase::Failed;
-                return Err(error);
-            }
+            self.six_ghz_response(elements)?;
         }
         let negotiated_phy = if self.phy_enabled {
             // Validate every relevant element before committing any AID/rate/PHY.
             let result = (|| {
-                phy::ApElements::parse(&bytes[30..])?;
+                phy::ApElements::parse(elements)?;
                 let mut rsn_seen = false;
-                ies(&bytes[30..], |id, body| {
+                ies(elements, |id, body| {
                     if id == 48 {
                         if rsn_seen || !self.response_rsne_matches(body) {
                             return Err(Error::UnsupportedSecurity);
@@ -1305,25 +1573,14 @@ impl JoinPlan {
                 })?;
                 self.offered_phy
                     .as_ref()
-                    .map(|offer| offer.response(&bytes[30..], response.selectors))
+                    .map(|offer| offer.response(elements, response.selectors))
                     .transpose()
             })();
-            match result {
-                Ok(value) => value,
-                Err(error) => {
-                    self.phase = Phase::Failed;
-                    return Err(error);
-                }
-            }
+            result?
         } else {
             None
         };
-        // Commit only after all frame, IE and rate checks have passed.
-        self.rates = rates;
-        self.basic = basic;
-        self.negotiated_phy = negotiated_phy;
-        self.phase = Phase::Associated { aid };
-        Ok(Some(aid))
+        Ok((rates, basic, negotiated_phy))
     }
     /// 6 GHz response checks (mac80211 `ieee80211_assoc_config_link`): no
     /// HT/VHT element, exactly one HE Capabilities and HE Operation (an HE
@@ -1368,6 +1625,10 @@ impl JoinPlan {
         self.negotiated_phy = None;
         if let Some(sae) = self.sae.as_mut() {
             sae.cancel();
+        }
+        for link in &mut self.links {
+            link.plan.cancel();
+            link.status = None;
         }
     }
 

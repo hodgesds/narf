@@ -1,39 +1,104 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Single-link non-AP MLD identity and Basic Multi-Link negotiation.
+//! Non-AP MLD identity and Basic Multi-Link negotiation (one associated link,
+//! optionally with affiliated per-STA profiles for further links).
 //! Layout: pinned Linux7.2 ieee80211-eht.h (MLE size/common/profile checks),
-//! mlme.c::ieee80211_assoc_add_ml_elem. These facts confer no radio/key grant.
+//! mlme.c::ieee80211_assoc_add_ml_elem, parse.c::ieee80211_prep_mle_link_parse.
+//! These facts confer no radio/key grant.
 use super::{ies, unicast, Error};
 use alloc::{vec, vec::Vec};
 
 pub const EXT_MULTI_LINK: u8 = 107;
 const LINK_ID: u16 = 0x0010;
+const BSS_CHANGE: u16 = 0x0020;
+const EML_CAPA: u16 = 0x0080;
 const MLD_CAPA: u16 = 0x0100;
+// IEEE80211_MLE_STA_CONTROL_{COMPLETE_PROFILE,STA_MAC_ADDR_PRESENT,
+// BSS_PARAM_CHANGE_CNT_PRESENT}.
+const STA_COMPLETE: u16 = 0x0010;
+const STA_MAC: u16 = 0x0020;
+const STA_BSS_CHANGE: u16 = 0x0800;
+// IEEE80211_MLE_SUBELEM_{PER_STA_PROFILE,FRAGMENT}, WLAN_EID_FRAGMENT.
+const SUBELEM_PROFILE: u8 = 0;
+const SUBELEM_FRAGMENT: u8 = 254;
+const ELEMENT_FRAGMENT: u8 = 242;
+/// WLAN_EID_EXT_NON_INHERITANCE.
+pub const EXT_NON_INHERITANCE: u8 = 56;
 const BASIC_FIELDS: u16 = 0x07f0;
 // Linux ieee80211-eht.h::IEEE80211_MLD_MAX_NUM_LINKS; Link ID15 is reserved.
 const MAX_LINKS: u8 = 15;
 
-/// Only one associated link is requested. Max Simultaneous Links=0 encodes
-/// one; EML, TID-to-link mapping and additional link profiles are not offered.
+/// The local non-AP MLD. `single_link` keeps the canonical one-link request
+/// (Max Simultaneous Links0, no EML). `with_capabilities` supplies the
+/// driver's `wiphy_iftype_ext_capab` MLD capabilities/operations and EML
+/// capabilities, which Linux copies verbatim into every request; a driver
+/// supplies them only once every multiple-active-link owner exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Local {
     address: [u8; 6],
+    mld_capabilities: u16,
+    eml: EmlCapabilities,
 }
 impl Local {
     pub fn single_link(address: [u8; 6]) -> Result<Self, Error> {
         if !unicast(address) {
             return Err(Error::InvalidBss);
         }
-        Ok(Self { address })
+        Ok(Self {
+            address,
+            mld_capabilities: 0,
+            eml: EmlCapabilities(0),
+        })
+    }
+    pub fn with_capabilities(self, mld_capabilities: u16, eml: EmlCapabilities) -> Self {
+        Self {
+            mld_capabilities,
+            eml,
+            ..self
+        }
+    }
+    fn bare(address: [u8; 6]) -> Self {
+        Self {
+            address,
+            mld_capabilities: 0,
+            eml: EmlCapabilities(0),
+        }
     }
     pub fn address(self) -> [u8; 6] {
         self.address
     }
+    pub fn mld_capabilities(self) -> u16 {
+        self.mld_capabilities
+    }
+    pub fn eml_capabilities(self) -> EmlCapabilities {
+        self.eml
+    }
     pub fn request_element(self) -> Vec<u8> {
-        let mut bytes = vec![255, 12, EXT_MULTI_LINK];
-        bytes.extend_from_slice(&MLD_CAPA.to_le_bytes());
-        bytes.push(9);
-        bytes.extend_from_slice(&self.address);
-        bytes.extend_from_slice(&0u16.to_le_bytes());
+        self.request_element_with_profiles(&[])
+    }
+    /// mlme.c::ieee80211_assoc_add_ml_elem: Basic MLE with MLD MAC, EML
+    /// Capabilities only when EMLSR/EMLMR is supported, MLD capabilities,
+    /// then the already encoded per-STA profile subelements; an element
+    /// over255 bytes is split as ieee80211_fragment_element does.
+    pub(super) fn request_element_with_profiles(self, profiles: &[u8]) -> Vec<u8> {
+        let mut control = MLD_CAPA;
+        let mut common = 9u8;
+        let eml =
+            self.eml.0 & (EmlCapabilities::EMLSR_SUPPORT | EmlCapabilities::EMLMR_SUPPORT) != 0;
+        if eml {
+            control |= EML_CAPA;
+            common += 2;
+        }
+        let mut body = vec![EXT_MULTI_LINK];
+        body.extend_from_slice(&control.to_le_bytes());
+        body.push(common);
+        body.extend_from_slice(&self.address);
+        if eml {
+            body.extend_from_slice(&self.eml.0.to_le_bytes());
+        }
+        body.extend_from_slice(&self.mld_capabilities.to_le_bytes());
+        body.extend_from_slice(profiles);
+        let mut bytes = Vec::with_capacity(body.len() + 4);
+        push_fragmented(&mut bytes, 255, &body, ELEMENT_FRAGMENT);
         bytes
     }
     /// Linux util.c::ieee80211_send_auth uses Basic common-info length7
@@ -155,25 +220,77 @@ impl Context {
         }
         Ok(())
     }
+    /// Multiple-link association response (mlme.c::ieee80211_assoc_success
+    /// and ieee80211_assoc_config_link). The common info must name the exact
+    /// AP MLD, any present Link ID must be the selected one and the BSS
+    /// Parameters Change Count must be present. Every link in `requested`
+    /// (excluding this one) needs a COMPLETE per-STA profile with the
+    /// capability/status fixed fields; a successful one also needs its own
+    /// change count, and a nested Basic MLE is refused. A missing requested
+    /// link fails the association as in Linux; profiles for links that were
+    /// not requested are ignored. The result grants no native link owner.
+    pub fn multi_link_response<'a>(
+        self,
+        bytes: &'a [u8],
+        requested: u16,
+    ) -> Result<Vec<LinkResponse<'a>>, Error> {
+        let ap = BasicMultiLink::from_ies(bytes)?;
+        if ap.address != self.peer_mld
+            || ap.link_id.is_some_and(|id| id != self.link_id)
+            || ap.bss_change.is_none()
+        {
+            return Err(Error::Protocol);
+        }
+        let body = basic_body(bytes).ok_or(Error::Protocol)?;
+        let mut links = Vec::new();
+        for link_id in 0..MAX_LINKS {
+            if requested & (1 << link_id) == 0 || link_id == self.link_id {
+                continue;
+            }
+            let (control, info, content) = sta_profile(body, link_id).ok_or(Error::Protocol)?;
+            if control & STA_COMPLETE == 0 || content.len() < 4 {
+                return Err(Error::Protocol);
+            }
+            let capability = u16::from_le_bytes([content[0], content[1]]);
+            let status = u16::from_le_bytes([content[2], content[3]]);
+            let elements = &content[4..];
+            let mut nested = false;
+            ies(elements, |id, element| {
+                nested |= id == 255 && element.first() == Some(&EXT_MULTI_LINK);
+                Ok(())
+            })
+            .map_err(|_| Error::Protocol)?;
+            if nested || status == 0 && control & STA_BSS_CHANGE == 0 {
+                return Err(Error::Protocol);
+            }
+            let address = if control & STA_MAC != 0 {
+                info.get(1..7).and_then(|mac| mac.try_into().ok())
+            } else {
+                None
+            };
+            links.push(LinkResponse {
+                link_id,
+                address,
+                capability,
+                status,
+                elements,
+            });
+        }
+        Ok(links)
+    }
     /// SAE crypto bytes exclude the driver's appended canonical auth MLE.
     /// The fixed trailer is parsed separately so opaque scalars/tokens cannot
     /// masquerade as an IE stream or choose a different logical peer.
     pub fn authentication_body(self, bytes: &[u8]) -> Result<&[u8], Error> {
         let at = bytes.len().checked_sub(12).ok_or(Error::Protocol)?;
-        let expected = Local {
-            address: self.peer_mld,
-        }
-        .authentication_element();
+        let expected = Local::bare(self.peer_mld).authentication_element();
         if bytes[at..] != expected {
             return Err(Error::Protocol);
         }
         Ok(&bytes[..at])
     }
     pub(super) fn own_auth_element(self) -> Vec<u8> {
-        Local {
-            address: self.own_mld,
-        }
-        .authentication_element()
+        Local::bare(self.own_mld).authentication_element()
     }
 }
 
@@ -184,6 +301,7 @@ impl Context {
 pub struct BasicMultiLink {
     address: [u8; 6],
     link_id: Option<u8>,
+    bss_change: Option<u8>,
     profiles: u16,
     medium_sync: Option<u16>,
     eml: Option<EmlCapabilities>,
@@ -196,6 +314,11 @@ impl BasicMultiLink {
     }
     pub fn link_id(self) -> Option<u8> {
         self.link_id
+    }
+    /// Common-info BSS Parameters Change Count
+    /// (ieee80211_mle_get_bss_param_ch_cnt).
+    pub fn bss_parameters_change_count(self) -> Option<u8> {
+        self.bss_change
     }
     /// Common-info Medium Synchronization Delay, as retained by Linux
     /// mlme.c into `vif->cfg.eml_med_sync_delay`.
@@ -274,7 +397,7 @@ impl BasicMultiLink {
             }
             None => None,
         };
-        take(0x20, 1);
+        let bss_change = take(BSS_CHANGE, 1).map(|at| body[at]);
         let medium_sync = take(0x40, 2).map(word);
         let eml = take(0x80, 2).map(|at| EmlCapabilities(word(at)));
         let mld_capabilities = take(MLD_CAPA, 2).map(word);
@@ -330,6 +453,7 @@ impl BasicMultiLink {
         Ok(Self {
             address,
             link_id,
+            bss_change,
             profiles,
             medium_sync,
             eml,
@@ -427,4 +551,223 @@ impl EmlCapabilities {
 /// IEEE80211_MLD_CAP_OP_MAX_SIMUL_LINKS: encoded value plus one links.
 pub fn max_simultaneous_links(mld_capabilities: u16) -> u8 {
     (mld_capabilities & 0x000f) as u8 + 1
+}
+
+/// One requested affiliated link's per-STA profile in an association
+/// response: the fixed capability/status fields and the profile elements
+/// (which still need `link_elements` inheritance before validation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkResponse<'a> {
+    link_id: u8,
+    address: Option<[u8; 6]>,
+    capability: u16,
+    status: u16,
+    elements: &'a [u8],
+}
+impl<'a> LinkResponse<'a> {
+    pub fn link_id(self) -> u8 {
+        self.link_id
+    }
+    /// The AP's affiliated link address from STA Info, when present.
+    pub fn address(self) -> Option<[u8; 6]> {
+        self.address
+    }
+    pub fn capability(self) -> u16 {
+        self.capability
+    }
+    /// Per-link status; non-zero rejects only this link (mlme.c
+    /// ieee80211_assoc_success removes it from the valid links).
+    pub fn status(self) -> u16 {
+        self.status
+    }
+    pub fn elements(self) -> &'a [u8] {
+        self.elements
+    }
+}
+
+/// The single unfragmented Basic MLE body (after the extension id) in an
+/// element stream already validated by `BasicMultiLink::from_ies`.
+fn basic_body(mut bytes: &[u8]) -> Option<&[u8]> {
+    while let [id, length, rest @ ..] = bytes {
+        let body = rest.get(..usize::from(*length))?;
+        if *id == 255 && body.first() == Some(&EXT_MULTI_LINK) {
+            return Some(&body[1..]);
+        }
+        bytes = &rest[usize::from(*length)..];
+    }
+    None
+}
+
+/// parse.c::ieee80211_mle_get_sta_prof over a validated Basic MLE body:
+/// (STA control, STA info including its length octet, profile content).
+fn sta_profile(body: &[u8], link_id: u8) -> Option<(u16, &[u8], &[u8])> {
+    let mut at = 2 + usize::from(*body.get(2)?);
+    while at < body.len() {
+        let length = usize::from(*body.get(at + 1)?);
+        let profile = body.get(at + 2..at + 2 + length)?;
+        at += 2 + length;
+        let control = u16::from_le_bytes([profile[0], profile[1]]);
+        if control & 15 != u16::from(link_id) {
+            continue;
+        }
+        let info_len = usize::from(profile[2]);
+        let info = profile.get(2..2 + info_len)?;
+        return Some((control, info, &profile[2 + info_len..]));
+    }
+    None
+}
+
+/// Element identity used by Linux's PRESENT_ELEM lists and the
+/// Non-Inheritance element: extension elements are offset by0x100.
+fn element_key(id: u8, body: &[u8]) -> u16 {
+    match (id, body.first()) {
+        (255, Some(&ext)) => 0x100 | u16::from(ext),
+        _ => u16::from(id),
+    }
+}
+
+/// Elements whose absence in a per-STA profile must be signalled through
+/// Non-Inheritance: the ADD_PRESENT_ELEM set of
+/// mlme.c::ieee80211_add_link_elems (power capability and supported channels
+/// are never emitted here because no spectrum-management capability is set).
+fn tracked(key: u16) -> bool {
+    matches!(
+        key,
+        33 | 36 | 45 | 191 | 0x123 /* HE */ | 0x16c /* EHT */ | 0x198 /* UHR */
+    )
+}
+
+/// The ordered tracked element keys present in an element stream.
+pub(super) fn present_elements(bytes: &[u8]) -> Result<Vec<u16>, Error> {
+    let mut present = Vec::new();
+    ies(bytes, |id, body| {
+        let key = element_key(id, body);
+        if tracked(key) {
+            present.push(key);
+        }
+        Ok(())
+    })?;
+    Ok(present)
+}
+
+/// mlme.c::ieee80211_add_non_inheritance_elem: list every outer present
+/// element missing from the profile, normal ids then extension ids; nothing
+/// is emitted when the profile repeats every outer element.
+fn push_non_inheritance(out: &mut Vec<u8>, outer: &[u16], inner: &[u16]) {
+    let missing = |extension: bool| -> Vec<u8> {
+        outer
+            .iter()
+            .filter(|key| (**key >= 0x100) == extension && !inner.contains(key))
+            .map(|key| *key as u8)
+            .collect()
+    };
+    let (normal, extension) = (missing(false), missing(true));
+    if normal.is_empty() && extension.is_empty() {
+        return;
+    }
+    out.extend_from_slice(&[
+        255,
+        (3 + normal.len() + extension.len()) as u8,
+        EXT_NON_INHERITANCE,
+        normal.len() as u8,
+    ]);
+    out.extend_from_slice(&normal);
+    out.push(extension.len() as u8);
+    out.extend_from_slice(&extension);
+}
+
+/// One per-STA profile subelement for an additional requested link, as the
+/// ieee80211_assoc_add_ml_elem loop writes it: Link ID with COMPLETE and STA
+/// MAC present, STA Info (length7, own link MAC), the capability field and
+/// the link's own elements, then Non-Inheritance against `outer`.
+pub(super) fn push_request_profile(
+    out: &mut Vec<u8>,
+    link_id: u8,
+    own_link: [u8; 6],
+    capability: u16,
+    elements: &[u8],
+    outer: &[u16],
+) -> Result<(), Error> {
+    if link_id >= MAX_LINKS || !unicast(own_link) {
+        return Err(Error::InvalidBss);
+    }
+    let inner = present_elements(elements)?;
+    let mut body = Vec::with_capacity(elements.len() + 24);
+    body.extend_from_slice(&(u16::from(link_id) | STA_COMPLETE | STA_MAC).to_le_bytes());
+    body.push(7);
+    body.extend_from_slice(&own_link);
+    body.extend_from_slice(&capability.to_le_bytes());
+    body.extend_from_slice(elements);
+    push_non_inheritance(&mut body, outer, &inner);
+    push_fragmented(out, SUBELEM_PROFILE, &body, SUBELEM_FRAGMENT);
+    Ok(())
+}
+
+/// ieee80211_fragment_element: a first (sub)element of at most255 octets
+/// followed by `fragment` (sub)elements carrying the remainder.
+fn push_fragmented(out: &mut Vec<u8>, id: u8, body: &[u8], fragment: u8) {
+    let mut chunks = body.chunks(255);
+    let first = chunks.next().unwrap_or(&[]);
+    out.extend_from_slice(&[id, first.len() as u8]);
+    out.extend_from_slice(first);
+    for chunk in chunks {
+        out.extend_from_slice(&[fragment, chunk.len() as u8]);
+        out.extend_from_slice(chunk);
+    }
+}
+
+/// Per-link element view for an affiliated link (parse.c
+/// ieee802_11_parse_elems_full with a link id): outer elements are inherited
+/// unless named by the profile's Non-Inheritance element or repeated in the
+/// profile (whose instance overrides, including all vendor elements); the
+/// outer Multi-Link and Non-Inheritance elements are never inherited.
+pub fn link_elements(outer: &[u8], profile: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut overridden = Vec::new();
+    let mut excluded = Vec::new();
+    let mut non_inheritance = false;
+    ies(profile, |id, body| {
+        let key = element_key(id, body);
+        if key == 0x100 | u16::from(EXT_NON_INHERITANCE) {
+            if non_inheritance {
+                return Err(Error::Protocol);
+            }
+            non_inheritance = true;
+            let normal_len = usize::from(*body.get(1).ok_or(Error::Protocol)?);
+            let normal = body.get(2..2 + normal_len).ok_or(Error::Protocol)?;
+            let rest = &body[2 + normal_len..];
+            let extension_len = usize::from(*rest.first().ok_or(Error::Protocol)?);
+            let extension = rest.get(1..1 + extension_len).ok_or(Error::Protocol)?;
+            if rest.len() != 1 + extension_len {
+                return Err(Error::Protocol);
+            }
+            excluded.extend(normal.iter().map(|id| u16::from(*id)));
+            excluded.extend(extension.iter().map(|id| 0x100 | u16::from(*id)));
+        } else {
+            overridden.push(key);
+        }
+        Ok(())
+    })
+    .map_err(|_| Error::Protocol)?;
+    let mut view = Vec::with_capacity(outer.len() + profile.len());
+    ies(outer, |id, body| {
+        let key = element_key(id, body);
+        if key != 0x100 | u16::from(EXT_MULTI_LINK)
+            && key != 0x100 | u16::from(EXT_NON_INHERITANCE)
+            && !excluded.contains(&key)
+            && !overridden.contains(&key)
+        {
+            view.extend_from_slice(&[id, body.len() as u8]);
+            view.extend_from_slice(body);
+        }
+        Ok(())
+    })
+    .map_err(|_| Error::Protocol)?;
+    ies(profile, |id, body| {
+        if element_key(id, body) != 0x100 | u16::from(EXT_NON_INHERITANCE) {
+            view.extend_from_slice(&[id, body.len() as u8]);
+            view.extend_from_slice(body);
+        }
+        Ok(())
+    })?;
+    Ok(view)
 }

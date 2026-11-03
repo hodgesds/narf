@@ -1,6 +1,6 @@
 //! Real JoinPlan/EHT/RSN transitions with distinct MLD and physical link MACs.
 use super::*;
-use crate::association::{mlo, JoinOptions, Phase, Pmf, SaePwe};
+use crate::association::{mlo, JoinOptions, MldLinkPhy, MldLinkRequest, Phase, Pmf, SaePwe};
 use crate::rsn::{RsnIe, Suite};
 const OWN_MLD: [u8; 6] = [2, 0, 0, 0, 0, 0x11];
 const AP_MLD: [u8; 6] = [2, 0, 0, 0, 0, 0x12];
@@ -431,3 +431,274 @@ smoke!(
     smoke_mld_basic_eml_capabilities_and_affiliated_profiles,
     eml_and_affiliated
 );
+
+const OWN2: [u8; 6] = [2, 0, 0, 0, 0, 0x21];
+const AP2: [u8; 6] = [2, 0, 0, 0, 0, 0x22];
+/// The same AP MLD's affiliated link `link_id` on 5GHz channel149 (VHT80
+/// segment155), with its own Basic MLE.
+fn second_link(link_id: u8) -> Bss {
+    let mut ap = protected(2);
+    ap.bssid = AP2;
+    ap.channel = 149;
+    let mut rewritten = Vec::new();
+    let mut rest = &ap.information_elements[..];
+    while let [id, len, tail @ ..] = rest {
+        let mut body = tail[..usize::from(*len)].to_vec();
+        match *id {
+            61 => body[0] = 149,
+            192 => body[1] = 155,
+            255 if body[0] == 107 => body[10] = link_id,
+            _ => {}
+        }
+        element(&mut rewritten, *id, &body);
+        rest = &tail[usize::from(*len)..];
+    }
+    ap.information_elements = rewritten;
+    ap
+}
+fn multi(first: &Bss, second: &Bss) -> Result<JoinPlan, Error> {
+    let phy = MldLinkPhy::Phy(local(Some(local_eht())));
+    JoinPlan::prepare_mld_links(
+        MldLinkRequest {
+            bss: first,
+            own_link: OWN,
+            phy,
+        },
+        &[MldLinkRequest {
+            bss: second,
+            own_link: OWN2,
+            phy,
+        }],
+        b"narf",
+        SecurityMode::Wpa2Psk,
+        JoinOptions::default().with_pmf(Pmf::Required),
+        mlo::Local::single_link(OWN_MLD).unwrap(),
+    )
+}
+/// Elements of `ap` an AP repeats inside a per-STA profile (no SSID, RSN or
+/// Multi-Link element).
+fn link_only(ap: &Bss) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = &ap.information_elements[..];
+    while let [id, len, tail @ ..] = rest {
+        let body = &tail[..usize::from(*len)];
+        if !(matches!(*id, 0 | 48) || *id == 255 && body[0] == 107) {
+            element(&mut out, *id, body);
+        }
+        rest = &tail[usize::from(*len)..];
+    }
+    out
+}
+/// Association response on link3 with a link5 per-STA profile.
+fn multi_reply(ap: &Bss, second: &Bss, status: u16, outer_change: bool, peer: [u8; 6]) -> Vec<u8> {
+    let mut frame = reply(ap);
+    let original = mle();
+    let at = frame
+        .windows(original.len())
+        .position(|w| w == original)
+        .unwrap();
+    let control: u16 = 0x0110 | if outer_change { 0x20 } else { 0 };
+    let mut body = vec![107];
+    body.extend_from_slice(&control.to_le_bytes());
+    body.push(if outer_change { 11 } else { 10 });
+    body.extend_from_slice(&AP_MLD);
+    body.push(3);
+    if outer_change {
+        body.push(0);
+    }
+    body.extend_from_slice(&[0, 0]);
+    let mut profile = 0x0835u16.to_le_bytes().to_vec();
+    profile.push(8);
+    profile.extend_from_slice(&peer);
+    profile.push(0);
+    profile.extend_from_slice(&0x11u16.to_le_bytes());
+    profile.extend_from_slice(&status.to_le_bytes());
+    if status == 0 {
+        profile.extend_from_slice(&link_only(second));
+    }
+    element(&mut body, 0, &profile);
+    let mut replacement = Vec::new();
+    element(&mut replacement, 255, &body);
+    frame.splice(at - 2..at + original.len(), replacement);
+    frame
+}
+fn associate(plan: &mut JoinPlan) -> Result<Vec<u8>, &'static str> {
+    plan.start_authentication()
+        .map_err(|_| "multi-link open authentication")?;
+    Ok(plan
+        .authentication_response(&auth())
+        .map_err(|_| "multi-link auth response")?
+        .ok_or("multi-link auth ignored")?
+        .to_vec())
+}
+fn multiple_links() -> Result<(), &'static str> {
+    let (first, second) = (protected(2), second_link(5));
+    let mut plan = multi(&first, &second).map_err(|_| "two-link MLD request refused")?;
+    check!(
+        plan.mld_links().len() == 1
+            && plan.mld_links()[0].link_id() == 5
+            && plan.mld_links()[0].context().own_link() == OWN2
+            && plan.mld_links()[0].context().peer_link() == AP2
+            && plan.mld_links()[0].context().peer_mld() == AP_MLD
+            && plan.mld_links()[0].status().is_none(),
+        "affiliated link offer lost its per-link identity"
+    );
+    let request = associate(&mut plan)?;
+    let parsed = mlo::BasicMultiLink::from_ies(&request[28..])
+        .map_err(|_| "multi-link request MLE unparsable")?;
+    let profile = parsed
+        .affiliated(5)
+        .ok_or("link5 per-STA profile missing")?;
+    check!(
+        parsed.address() == OWN_MLD
+            && parsed.link_id().is_none()
+            && parsed.eml_capabilities().is_none()
+            && parsed.mld_capabilities() == Some(0)
+            && parsed.profile_links() == 1 << 5
+            && profile.complete()
+            && profile.address() == Some(OWN2),
+        "request per-STA profile header differs from ieee80211_assoc_add_ml_elem"
+    );
+    // Control (link5|COMPLETE|STA MAC), STA info length7, link MAC, then the
+    // ESS|privacy capability and the link's own rates before HT/VHT/HE/EHT.
+    let mut head = vec![0x35, 0x00, 7];
+    head.extend_from_slice(&OWN2);
+    head.extend_from_slice(&[0x11, 0x00, 1]);
+    check!(
+        request.windows(head.len()).any(|w| w == head),
+        "per-STA profile STA info/capability layout"
+    );
+    check!(
+        !request
+            .windows(3)
+            .any(|w| w[0] == 255 && w[2] == mlo::EXT_NON_INHERITANCE),
+        "identical link element sets emitted a Non-Inheritance element"
+    );
+    // Accepted link: both links commit with their own negotiated PHY.
+    check!(
+        plan.association_response(&multi_reply(&first, &second, 0, true, AP2)) == Ok(Some(7)),
+        "valid two-link association response refused"
+    );
+    let link = &plan.mld_links()[0];
+    check!(
+        link.accepted()
+            && link.status() == Some(0)
+            && link.negotiated_phy().is_some()
+            && link.channel() == 149
+            && plan.negotiated_phy().is_some(),
+        "accepted affiliated link did not commit its own negotiation"
+    );
+    // A per-STA rejection drops only that link.
+    let mut rejected = multi(&first, &second).unwrap();
+    associate(&mut rejected)?;
+    check!(
+        rejected.association_response(&multi_reply(&first, &second, 1, true, AP2)) == Ok(Some(7))
+            && rejected.mld_links()[0].status() == Some(1)
+            && !rejected.mld_links()[0].accepted()
+            && rejected.mld_links()[0].negotiated_phy().is_none(),
+        "per-STA status rejection was not link-local"
+    );
+    // Missing outer change count, a wrong affiliated AP address and a missing
+    // requested profile each fail the whole association.
+    for (frame, message) in [
+        (
+            multi_reply(&first, &second, 0, false, AP2),
+            "missing BSS parameter change count admitted",
+        ),
+        (
+            multi_reply(&first, &second, 0, true, [2, 0, 0, 0, 0, 0x44]),
+            "profile for a different affiliated AP admitted",
+        ),
+        (
+            reply(&first),
+            "requested link missing from response admitted",
+        ),
+    ] {
+        let mut failed = multi(&first, &second).unwrap();
+        associate(&mut failed)?;
+        if failed.association_response(&frame).is_ok() || failed.phase() != Phase::Failed {
+            return Err(message);
+        }
+    }
+    // Same link id, own MAC reuse and a different AP MLD are refused.
+    check!(
+        multi(&first, &second_link(3)).is_err()
+            && JoinPlan::prepare_mld_links(
+                MldLinkRequest {
+                    bss: &first,
+                    own_link: OWN,
+                    phy: MldLinkPhy::Phy(local(Some(local_eht()))),
+                },
+                &[MldLinkRequest {
+                    bss: &second,
+                    own_link: OWN,
+                    phy: MldLinkPhy::Phy(local(Some(local_eht()))),
+                }],
+                b"narf",
+                SecurityMode::Wpa2Psk,
+                JoinOptions::default().with_pmf(Pmf::Required),
+                mlo::Local::single_link(OWN_MLD).unwrap(),
+            )
+            .is_err(),
+        "conflicting affiliated link identities admitted"
+    );
+    let mut other_mld = second_link(5);
+    let mle_at = other_mld
+        .information_elements
+        .windows(3)
+        .position(|w| w[0] == 255 && w[2] == 107)
+        .unwrap();
+    other_mld.information_elements[mle_at + 9] ^= 0x40;
+    check!(
+        multi(&first, &other_mld).is_err(),
+        "link of a different AP MLD admitted"
+    );
+    Ok(())
+}
+smoke!(smoke_mld_multiple_link_association, multiple_links);
+
+fn inheritance() -> Result<(), &'static str> {
+    let mut outer = Vec::new();
+    element(&mut outer, 0, b"narf");
+    element(&mut outer, 1, &[0x8c]);
+    element(&mut outer, 45, &[1, 2]);
+    element(&mut outer, 191, &[3, 4]);
+    element(&mut outer, 255, &[35, 5]);
+    element(&mut outer, 255, &[107, 0, 0]);
+    let mut profile = Vec::new();
+    element(&mut profile, 1, &[0x98]);
+    element(&mut profile, 255, &[35, 6]);
+    element(&mut profile, 255, &[mlo::EXT_NON_INHERITANCE, 1, 191, 0]);
+    let mut expected = Vec::new();
+    element(&mut expected, 0, b"narf");
+    element(&mut expected, 45, &[1, 2]);
+    element(&mut expected, 1, &[0x98]);
+    element(&mut expected, 255, &[35, 6]);
+    check!(
+        mlo::link_elements(&outer, &profile).as_deref() == Ok(&expected[..]),
+        "per-link view differs from parse.c inheritance/override rules"
+    );
+    let mut malformed = Vec::new();
+    element(&mut malformed, 255, &[mlo::EXT_NON_INHERITANCE, 2, 191]);
+    check!(
+        mlo::link_elements(&outer, &malformed).is_err(),
+        "truncated Non-Inheritance element admitted"
+    );
+    // EML is only placed in a request when EMLSR/EMLMR is supported.
+    let local = mlo::Local::single_link(OWN_MLD).unwrap();
+    let eml = local
+        .with_capabilities(1, mlo::EmlCapabilities::INTEL_MLD_LOCAL)
+        .request_element();
+    let parsed = mlo::BasicMultiLink::from_ies(&eml).map_err(|_| "EML request unparsable")?;
+    check!(
+        parsed.eml_capabilities() == Some(mlo::EmlCapabilities::INTEL_MLD_LOCAL)
+            && parsed.mld_capabilities() == Some(1)
+            && local
+                .with_capabilities(0, mlo::EmlCapabilities(0x0e))
+                .request_element()
+                == local.request_element(),
+        "request EML presence differs from ieee80211_assoc_add_ml_elem"
+    );
+    Ok(())
+}
+smoke!(smoke_mld_per_link_element_inheritance, inheritance);
