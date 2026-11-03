@@ -16,6 +16,7 @@ fn composition_prefixed(prefix: u32, secured: bool, keys_first: bool) -> Result<
             wide: None,
             vht: None,
             prefix,
+            chip: None,
         },
     )?;
     let native = h.bus.clone();

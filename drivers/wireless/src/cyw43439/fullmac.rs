@@ -317,6 +317,14 @@ pub trait Fullmac: Send {
     fn transport_failed(&self) -> bool {
         false
     }
+    /// The transport's chip profile is neither the retained 3x3/80 MHz
+    /// BCM43602 nor CYW43439, so the capability probe may admit up to four
+    /// chains/streams and, from the firmware's own `bw_cap` 160 bit plus a
+    /// reported 160 MHz chanspec, the 160 MHz VHT capability bits
+    /// (Linux `brcmf_update_ht_cap`/`brcmf_update_vht_cap`).
+    fn wide_phy(&self) -> bool {
+        false
+    }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
     fn ap_enter(&mut self, original: crate::brcmfmac::ap_scope::Capture) -> Result<(), Error> {

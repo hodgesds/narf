@@ -1578,7 +1578,17 @@ impl Handle {
     }
 }
 pub(crate) fn create(version: u32, secured: bool) -> Result<(TestAdapter, Handle), runtime::Error> {
-    create_inner(version, secured, None, 0)
+    create_inner(version, secured, None, 0, None)
+}
+/// The same CR4 model discovered as another covered `chip_profile` chip
+/// (ChipCommon identity word, chip id, PCI device id), booted through an
+/// explicit board profile for that chip. Synthetic identities only.
+pub(crate) fn create_chip(
+    version: u32,
+    secured: bool,
+    chip: (u32, u16, u16),
+) -> Result<(TestAdapter, Handle), runtime::Error> {
+    create_inner(version, secured, None, 0, Some(chip))
 }
 pub(crate) fn create_selected(
     version: u32,
@@ -1590,13 +1600,13 @@ pub(crate) fn create_selected(
         .proof
         .validate()
         .map_err(|_| runtime::Error::Access)?;
-    create_inner(version, secured, Some((selection, assets)), 0)
+    create_inner(version, secured, Some((selection, assets)), 0, None)
 }
 pub(crate) fn create_prefixed(
     secured: bool,
     prefix: u32,
 ) -> Result<(TestAdapter, Handle), runtime::Error> {
-    create_inner(7, secured, None, prefix)
+    create_inner(7, secured, None, prefix, None)
 }
 fn create_inner(
     version: u32,
@@ -1606,11 +1616,15 @@ fn create_inner(
         &crate::brcmfmac::provision::Assets,
     )>,
     prefix: u32,
+    chip: Option<(u32, u16, u16)>,
 ) -> Result<(TestAdapter, Handle), runtime::Error> {
     assert!(matches!(version, 5..=7));
     let (bus, state) = model();
     {
         let mut s = state.lock();
+        if let Some((identity, _, _)) = chip {
+            s.registers.insert(chip::ENUM_BASE, identity);
+        }
         put(&mut s, SHARED, &version.to_le_bytes());
         put(&mut s, SHARED + 36, &prefix.to_le_bytes());
         if version == 5 {
@@ -1627,6 +1641,18 @@ fn create_inner(
         let nvram = boot::pack_nvram(&assets.nvram)?;
         boot::Cr4::claim_selected(bus, pci(), selection)
             .and_then(|cr4| cr4.boot(&assets.firmware, &nvram))
+            .map_err(|refused| refused.error)?
+    } else if let Some((identity, id, device)) = chip {
+        let pci = boot::PciIdentity { device, ..pci() };
+        let profile = boot::BoardProfile {
+            chip: id,
+            revision_mask: 1 << ((identity >> 16) & 15),
+            pci,
+            ..profile()
+        };
+        let nvram = boot::pack_nvram(b"boardrev=1\n")?;
+        boot::Cr4::claim(bus, pci, profile)
+            .and_then(|cr4| cr4.boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram))
             .map_err(|refused| refused.error)?
     } else {
         boot_fixture(bus).map_err(|refused| refused.error)?

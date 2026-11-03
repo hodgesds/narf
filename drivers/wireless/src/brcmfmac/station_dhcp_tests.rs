@@ -18,6 +18,8 @@ use narf_wifi_fixtures::udp_ipv4;
 mod ap_native_tests;
 #[path = "channel_station_tests.rs"]
 mod channel_station_tests;
+#[path = "chip_station_tests.rs"]
+mod chip_station_tests;
 #[path = "ht40_tests.rs"]
 mod ht40_tests;
 #[path = "ht_tests.rs"]
@@ -70,6 +72,8 @@ struct Configuration {
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
     vht: Option<crate::cyw43439::phy_fixture::Vht80>,
     prefix: u32,
+    /// Another covered chip identity (`station_model::create_chip`).
+    chip: Option<(u32, u16, u16)>,
 }
 /// The station shell the harness and the generation publisher build.
 fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
@@ -212,6 +216,7 @@ impl Harness {
                 wide: None,
                 vht: None,
                 prefix: 0,
+                chip: None,
             },
         )
     }
@@ -236,6 +241,7 @@ impl Harness {
                 wide: Some(wide),
                 vht: None,
                 prefix: 0,
+                chip: None,
             },
         )
     }
@@ -261,6 +267,32 @@ impl Harness {
                 wide: None,
                 vht: Some(vht),
                 prefix: 0,
+                chip: None,
+            },
+        )
+    }
+    /// `new_vht` over the CR4 model discovered as another covered chip.
+    fn new_vht_chip(
+        version: u32,
+        channel: u8,
+        chains: u32,
+        vht: crate::cyw43439::phy_fixture::Vht80,
+        chip: (u32, u16, u16),
+    ) -> Result<Self, &'static str> {
+        Self::new_details(
+            version,
+            false,
+            false,
+            false,
+            channel,
+            None,
+            Configuration {
+                mfp: None,
+                phy: Some((chains, 0)),
+                wide: None,
+                vht: Some(vht),
+                prefix: 0,
+                chip: Some(chip),
             },
         )
     }
@@ -273,7 +305,12 @@ impl Harness {
         database: Option<Arc<narf_wireless::reg::db::Database>>,
         features: Configuration,
     ) -> Result<Self, &'static str> {
-        let (adapter, bus) = if features.prefix != 0 {
+        let (adapter, bus) = if let Some(chip) = features.chip {
+            if selected || features.prefix != 0 {
+                return Err("chip fixture uses an explicit board profile");
+            }
+            firmware::create_chip(version, secured, chip)
+        } else if features.prefix != 0 {
             if selected || version != 7 {
                 return Err("prefix fixture requires explicit v7 native geometry");
             }

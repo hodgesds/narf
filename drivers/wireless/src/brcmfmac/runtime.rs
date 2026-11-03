@@ -254,6 +254,8 @@ pub struct Runtime<B: Bus> {
     /// Discovered AI cores of the booted chip (ChipCommon watchdog, PCIe2
     /// config shadow and ARM CR4 halt for `brcmf_pcie_reset_device`).
     cores: Vec<super::chip::Core>,
+    /// Discovered ChipCommon chip id of the booted dongle.
+    chip_id: u16,
 }
 impl<B: Bus> core::fmt::Debug for Runtime<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -425,6 +427,7 @@ impl<B: Bus> Runtime<B> {
             iommu_blocked: false,
             hostrdy_db1: shared.hostrdy_db1(),
             cores: chip.cores,
+            chip_id: chip.id,
         };
         if let Some(reg) = runtime.bus.mailbox() {
             for address in [shared.htod_mb_data_addr, shared.dtoh_mb_data_addr] {
@@ -528,6 +531,10 @@ impl<B: Bus> Runtime<B> {
     }
     pub fn is_failed(&self) -> bool {
         self.failed
+    }
+    /// Discovered ChipCommon chip id (`chip_profile`).
+    pub fn chip_id(&self) -> u16 {
+        self.chip_id
     }
     pub(crate) fn ap_source(&self) -> Option<super::ap_source::Source> {
         if self.failed || self.down {

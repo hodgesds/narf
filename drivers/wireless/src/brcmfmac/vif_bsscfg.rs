@@ -364,6 +364,9 @@ impl<R: Fullmac> Fullmac for Bsscfg<'_, R> {
     fn transport_failed(&self) -> bool {
         self.link.failed || self.runtime.transport_failed()
     }
+    fn wide_phy(&self) -> bool {
+        self.runtime.wide_phy()
+    }
 }
 
 /// Inert runtime a persistent secondary role is held over between

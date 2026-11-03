@@ -668,6 +668,11 @@ where
     fn transport_failed(&self) -> bool {
         self.failed || self.inner.as_ref().is_none_or(|inner| inner.is_failed())
     }
+    fn wide_phy(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.chip_id() != super::chip_profile::BRCM_CC_43602)
+    }
     fn release_transport(&mut self) -> bool {
         self.failed = true;
         self.peer = None;

@@ -421,8 +421,9 @@ Remaining VHT options are not host features of this FullMAC family:
   only decodes `BRCMU_CHAN_BW_80P80` chanspecs in reports.
 - 160 MHz: Linux advertises it only from a firmware `bw_cap` 160 bit. The
   retained BCM43602 is an 802.11ac Wave-1 3x3 80 MHz part, so this profile
-  ignores that bit; 160 MHz belongs to enabling a 160-capable chip under the
-  remaining additional-chip-profile work.
+  ignores that bit. Other covered chips report the capability bits only from
+  firmware facts ("Additional PCIe chip profiles" below); 160 MHz operation
+  is not implemented.
 
 The actual selected BSS's complete original HT/VHT/WMM/rate IEs pass shared
 `Offer::from_elements`; complete known basic/legacy rates, membership
@@ -523,6 +524,81 @@ exercise queued-TX closure and replacement during actual join/PS receipts, with
 no uncertain DMA freed. This does not automatically follow revocation of a cached
 policy firmware capability or establish firmware RF quiescence; reset/reload and
 DMA reclamation remain separate gates. See `cyw43439.md` §3 and `wireless/` §3.5.
+
+### Additional PCIe chip profiles
+
+`chip_profile.rs` transcribes the Linux 7.3-rc4 tables, not board facts:
+`chip.c::brcmf_chip_tcm_rambase` (complete), `pcie.c::brcmf_pcie_fwnames`
+with `firmware.c::brcmf_fw_alloc_request`'s first chip-id + `BIT(chiprev)`
+match (revision >= 32 invalid), `brcmf_pcie_devid_table` with its `drvdata`
+(firmware vendor WCC/BCA/CYW, random-seed flag, PCI class
+`PCI_CLASS_NETWORK_OTHER << 8` under mask 0xffff00, the two `_SUB` rows) and
+the `brcmf_pcie_read_otp` chip set. Covered chips: BCM43602 (retained), CR4
+BCM4350 (4350c2 below rev 8), 4356, 43567/43569/43570, 4358, 4359
+(rev-dependent base), 4371 at their Linux RAM bases, and CA7 BCM4365, 4366,
+43664, 43666, 43465, 43525 at 0x200000. Left out: BCM4354 (Linux binds raw
+PCI id 0x4354 but has no PCIe firmware row, so Linux itself stops at
+"Unknown chip"), 4355/4364/4377/4378/4387 (Linux OTP Apple board selection;
+their PCI ids also take the random-seed footer), 43752 (random seed),
+CYW-vendor 43596/54591 (CYW fwvid ops) and chips without a PCIe row. Linux
+reads no OTP for any covered chip, so none is read here.
+
+The retained loader (`boot::Cr4`, CR4 or CA7) takes the RAM base from the
+table. CR4 sizes RAM from its TCM bank registers
+(`brcmf_chip_tcm_ramsize`) and disables every D11 core
+(`brcmf_chip_cr4_set_passive`); CA7 keeps HALT across its reset, resets the
+first 80211 core with PHYRESET|PHYCLOCKEN / PHYCLOCKEN / PHYCLOCKEN
+(`brcmf_chip_ca7_set_passive`) and sizes RAM from SYS_MEM (0x849):
+SYS_MEM is reset when `brcmf_chip_ai_iscoreup` fails, then `SRCI_SRNB` banks
+of `(bankinfo & 0x7f) + 1` x 8 KiB via `bankidx` 0x10 / `bankinfo` 0x40
+(`brcmf_chip_sysmem_ramsize`). One ARM of the profile's kind is required
+(CR4 is dispatched first, as Linux); CA7 also requires SYS_MEM and D11.
+`BRCMF_CHIP_MAX_MEMSIZE` and the BAR2 extent still bound RAM. The bank5/7
+PDA clear and SOCRAM reset stay BCM43602-only, as in
+`brcmf_pcie_{enter,exit}_download_state`; the reset vector goes to TCM0 and
+the ARM is released with HALT (`brcmf_chip_{cr4,ca7}_set_active`). The
+dead-firmware reset halts CA7 the same way. BCM43602's register/TCM order
+is unchanged.
+
+Signed selection adds NBSP family 3 (`Family::PcieFullmac`) for covered
+non-43602 chips; BCM43602 stays family 1 and family 3 refuses chip 43602.
+The record's full PCI identity must bind a Linux table row with an
+implemented vendor (WCC/BCA, no seed); every revision in its mask must select
+the same firmware row (so 4350c2 and 4350 need separate records); the
+executable and NVRAM keys must be that row's `brcm/<base>.bin` / `.txt` or
+board-type `brcm/<base>.<board>.bin` / `.txt`; function, card and the third
+(CLM) slot are zero. Linux requests a `BRCMF_FW_CLM_DEF` chip's
+`.clm_blob` as optional and the firmware otherwise uses its embedded CLM;
+external CLM download over msgbuf is not ported, so a CLM asset is refused.
+Claim re-checks the Linux admission against the discovered chip/revision.
+Probe maps BAR2 for those PCI ids; trusted explicit registration admits
+covered chips whose PCI id row has an implemented vendor. Without a signed
+record or registration a covered chip stays parked, unadmitted.
+
+The station, AP and monitor paths are the shared BCM43602 adapter with its
+runtime firmware-capability probes. `Fullmac::wide_phy` is true only for a
+non-43602 PCIe runtime: the PHY probe then admits `rxchain` up to four
+chains and `txstreams` up to four, and adds `SUPP_CHAN_WIDTH_160` and
+`SHORT_GI_160` (`brcmf_update_vht_cap`) only when the original 5 GHz
+`bw_cap` has the 160 bit and the firmware's `chanspecs` list reports a valid
+5 GHz D11AC 160 MHz chanspec. That is capability only: negotiation stays the
+VHT80 profile and joins remain <= 80 MHz (the firmware's own request may now
+carry the 160 bits, which the exact request comparison then expects). BCA
+firmware's 212 event codes (`bca/core.c`) need the same 27-byte event mask
+as WCC's 213. Remaining: 160 MHz join geometry/occupied-span policy, 4-stream
+fixture coverage, OTP/seed chips, CYW-vendor chips and the
+`wifi-fixtures board-manifest` encoder (still families 1/2).
+
+Written, unexecuted: `drivers/wireless/brcmfmac/chips`
+`smoke_brcmf_chip_profile_linux_rambase_and_firmware_rows`,
+`..._admission_and_asset_names`, `..._cr4_and_ca7_boot_transcripts`
+(BCM4350 CR4 / BCM4366 CA7 loader transcripts and refusals),
+`..._station_vht160_capability_from_firmware` (BCM4356 identity over the
+shared CR4/msgbuf station model: 160 capability only from both firmware
+facts, VHT80 join/teardown, BCM43602 unchanged) and
+`drivers/wireless/brcmfmac/provision`
+`smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables`. No physical
+chip, firmware or board qualification is claimed.
 
 ### PCIe mailbox interrupt service
 
