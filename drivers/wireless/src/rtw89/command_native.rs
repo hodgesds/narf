@@ -858,10 +858,8 @@ impl Native {
             if self.dma_idle.is_none() && !self.dma_reclaimed {
                 self.dma_idle = super::dma_stop::stop_with(&mut self.stop_port(), layout).ok();
             }
-            if self.chip == ChipId::Rtl8852C {
-                // No RF/clock teardown owner for C yet; DMA proof only.
-                return;
-            }
+            // C shares the AX BB engine/clock closure registers (cr_base
+            // 0x10000; rtw8852c_mac_disable_bb_rf is exactly `clocks`).
             if self.radio_started {
                 let _ = super::radio_stop::engines(&mut self.io);
             }
@@ -917,18 +915,24 @@ impl Native {
     pub(super) async fn finish_radio_shutdown(&mut self) -> Result<(), super::power::Error> {
         if self.sleep_reset.is_some()
             || self.state != State::Terminal
-            || self.chip != ChipId::Rtl8852B
+            || !matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
         {
             return Err(super::power::Error::Terminal);
         }
         self.fail();
-        // SAFETY: same retained exclusively owned exact B function, closed
+        // SAFETY: same retained exclusively owned exact B/C function, closed
         // producers and uncertain DMA kept alive; NativeIo invokes current
         // device authority for every actual shutdown register transaction.
         unsafe {
-            self.radio_shutdown
-                .finish(&mut self.io, self.radio_started)
-                .await
+            if self.chip == ChipId::Rtl8852C {
+                self.radio_shutdown
+                    .finish_c(&mut self.io, self.radio_started)
+                    .await
+            } else {
+                self.radio_shutdown
+                    .finish(&mut self.io, self.radio_started)
+                    .await
+            }
         }
     }
     fn command(&self) -> Result<u16, Error> {

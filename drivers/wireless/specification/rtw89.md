@@ -3442,14 +3442,28 @@ and no DFS/NO_IR rule over the span), and station retune/CSA go through
 Known gaps for the `rtl8852c` row: native execution on hardware (no C
 board record exists, so actual admission needs a provisioned board);
 HT/VHT/HE, A-MPDU/BA (C `bacam_num` 8 dynamic BA CAM), firmware RA, WMM,
-LPS, WoW, monitor, AP and C DIG/CFO track work are not implemented for C;
-the C terminal analog shutdown (`finish_radio_shutdown`) stays B-only, so a
-retired C generation earns the C DMA-stop proof but no RF00S/XTAL
-shutdown. The C station uses 20MHz only (wide C profiles are reachable
+LPS, WoW, monitor, AP and C DIG/CFO track work are not implemented for C.
+The C station uses 20MHz only (wide C profiles are reachable
 only through `retune_channel_c`, not from the station). Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
 `smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.
+
+**C terminal analog shutdown (`radio_shutdown::Shutdown::finish_c`).**
+Immediate C terminal closure now runs the same AX BB engine closure
+(`radio_stop::engines`, when the radio started) and `radio_stop::clocks`
+after the C DMA-stop proof: rtw8852c.c `rtw8852c_mac_disable_bb_rf` is
+exactly the `R_AX_WLRF_CTRL` AFC_AFEDIG and `R_AX_SYS_FUNC_EN`
+BBRSTB/BB_GLB_RSTN clear (no XTAL step, unlike B). The retained
+`finish_radio_shutdown` dispatches C to `finish_c`, which repeats those and
+then performs the RF00/RF10 disable of rtw8852c.c `rtw8852c_pwr_off_func`:
+masked XTAL-SI writes `XTAL_SI_WL_RFC_S0` (0x80) / `S1` (0x81) value 0,
+mask `XTAL_SI_RF00`/`XTAL_SI_RF10` (BIT 0), address echo checked, then both
+bytes read back with BIT 0 clear as the disable proof; the rest of
+`rtw8852c_pwr_off_func` stays with `Power::power_off`. As for B, the
+receipt is not RF/DMA idle or reset authority. B bytes are unchanged.
+Unexecuted case:
+`smoke_rtw8852c_terminal_shutdown_is_disable_bb_rf_then_rf00_rf10_masked_off`.
 
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 
