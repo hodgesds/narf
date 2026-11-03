@@ -121,6 +121,27 @@ impl core::fmt::Debug for SuspendKeys {
             .finish_non_exhaustive()
     }
 }
+/// Packet-number state matching a [`SuspendKeys`] snapshot (Linux
+/// `rtw89/wow.c::rtw89_wow_get_key_info_iter`: `ptk_tx_iv`, `ptk_rx_iv`,
+/// `gtk_rx_iv[keyidx]`). Each receive floor is the highest data PN the
+/// host accepted under that key; the device must accept only larger PNs.
+/// PNs are not secret; the struct is wiped on drop with the keys anyway.
+#[derive(Debug)]
+pub struct SuspendFloors {
+    pub pairwise_tx: u64,
+    pub pairwise_rx: u64,
+    pub groups: Vec<(u8, u64)>,
+}
+impl Drop for SuspendFloors {
+    fn drop(&mut self) {
+        self.pairwise_tx.zeroize();
+        self.pairwise_rx.zeroize();
+        for (id, pn) in self.groups.iter_mut() {
+            id.zeroize();
+            pn.zeroize();
+        }
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hardware {
     Absent,
@@ -602,6 +623,29 @@ impl Security {
             .collect();
         Some(SuspendKeys {
             pairwise: Zeroizing::new(*pair.material),
+            groups,
+        })
+    }
+    /// Replay floors and transmit PN for the same settled-port window as
+    /// [`Self::suspend_keys`] (same preconditions, same key set). Reading
+    /// them changes no PN or replay state.
+    pub fn suspend_floors(&self) -> Option<SuspendFloors> {
+        if !self.port_open() || self.handshake_active() || self.mld.is_some() {
+            return None;
+        }
+        let pair = self.pair.as_ref()?;
+        let groups = self
+            .group
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                slot.as_ref()
+                    .map(|slot| (id as u8, slot.key.data_replay_floor()))
+            })
+            .collect();
+        Some(SuspendFloors {
+            pairwise_tx: pair.key.transmit_pn(),
+            pairwise_rx: pair.key.data_replay_floor(),
             groups,
         })
     }

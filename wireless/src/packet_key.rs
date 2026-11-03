@@ -243,6 +243,20 @@ impl Key {
             .map(|context| context.data_crypto_header(physical).map_err(|_| Error::Key))
             .transpose()
     }
+    /// Highest PN accepted on any data receive counter (TIDs and non-QoS;
+    /// management excluded). A peer transmits one PN sequence per key, so
+    /// this is a floor every later data frame of that key must exceed.
+    pub fn data_replay_floor(&self) -> u64 {
+        self.receive[..=NON_QOS]
+            .iter()
+            .map(|window| window.last_seen_pn)
+            .max()
+            .unwrap_or(0)
+    }
+    /// The last transmit PN this key used (0 before the first frame).
+    pub fn transmit_pn(&self) -> u64 {
+        self.tx_pn
+    }
     pub fn spp_amsdu(&self) -> bool {
         self.spp_amsdu
     }

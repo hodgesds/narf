@@ -2237,6 +2237,20 @@ after keys exist). The owner stays the RSNA, PN and replay authority:
 `protect_management_header`, `accept_decrypted`,
 `accept_decrypted_management` and `accept_decrypted_amsdu_with` (non-MLD).
 
+WoWLAN suspend snapshot (Interface addition; first users rtw88 and rtw89
+WoW): `Security::suspend_keys() -> Option<SuspendKeys { pairwise, groups }>`
+returns the zeroizing CCMP-128 PTK and live GTKs (never IGTK) of a settled
+open, non-MLD port with no handshake in flight. `Security::suspend_floors()
+-> Option<SuspendFloors { pairwise_tx, pairwise_rx, groups: Vec<(id, pn)> }>`
+returns, under the same preconditions and key set, the PTK's last transmit
+PN and each key's data replay floor (`packet_key::Key::data_replay_floor`,
+the highest PN accepted on any TID/non-QoS counter; `Key::transmit_pn`), for
+device firmware that checks replay itself while the host sleeps (Linux
+`rtw89/wow.c::rtw89_wow_get_key_info_iter` `ptk_tx_iv`/`ptk_rx_iv`/
+`gtk_rx_iv`, which reads TID 0 only; the maximum is the stricter floor of a
+single per-key peer PN sequence). Both are read-only: no PN, replay or key
+state changes, and the floors are wiped on drop.
+
 `Security::with_mld(context)` is an additive pre-handshake opt-in. Its
 constructor MACs must equal the context's physical link pair and PMF must be
 negotiated. `RawFrame::mld_context()` defaults to None; an MLD native adapter

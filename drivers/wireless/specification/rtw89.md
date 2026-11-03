@@ -1945,8 +1945,8 @@ order (`rtw89_wow_suspend`/`resume`):
    through the addr-CAM `SEC_ENT*` fields with `WOL_MAGIC`/`WOL_PATTERN`,
    enable the engine with `rtw89_mac_hw_mgnt_sec`, and clear/disable and
    re-prove host crypto before RX is restarted on resume. The `KeyInfo` RX
-   IVs need the host replay floors, which `station_security` does not
-   expose yet (shared-surface addition).
+   IVs come from `station_security::Security::suspend_floors` (added;
+   wireless spec section 3.4.2); the CAM writes are not wired yet.
 4. Keep-alive as an unprotected NULL data general packet (Linux uses an
    ARP-response packet that is protected under `ptk_alg`; protected
    firmware transmissions would need the AOAC `ptk_tx_iv` written back into
