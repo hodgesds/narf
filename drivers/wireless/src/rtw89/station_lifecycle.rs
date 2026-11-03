@@ -220,16 +220,17 @@ impl<I: Io> Owner<I> {
             .disconnect(&mut self.io)
             .await
     }
-    pub(super) async fn station_scan(
+    pub(super) async fn station_scan_channels(
         &mut self,
+        channels: &[u8],
         dwell_ms: u64,
-        probe: Option<super::station::Probe>,
+        probe: impl Fn() -> Option<super::station::Probe>,
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .scan_with(&mut self.io, dwell_ms, probe)
+            .scan_channels(&mut self.io, channels, dwell_ms, probe)
             .await
     }
     pub(super) async fn station_associate(

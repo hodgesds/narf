@@ -3,7 +3,8 @@
 //! Native. No generic packet adapter can manufacture its ordinary receipt.
 use super::*;
 use crate::rtw89::{
-    power, radio_assets, radio_full, radio_init, radio_policy, radio_power, rfk, tssi,
+    operating_channel, power, radio_assets, radio_full, radio_init, radio_policy, radio_power, rfk,
+    tssi,
 };
 use alloc::sync::Arc;
 pub(in crate::rtw89) struct RadioPreflight {
@@ -60,6 +61,18 @@ impl QualificationRequest {
 }
 fn denied(_: impl core::fmt::Debug) -> power::Error {
     power::Error::Access
+}
+/// Typed 2.4GHz/20MHz primary and its Linux per-channel power plan.
+fn channel_plan(
+    assets: &radio_assets::Assets,
+    rfe: u8,
+    primary: u8,
+) -> Result<(operating_channel::Profile, radio_power::Plan), power::Error> {
+    let profile =
+        operating_channel::Profile::new(narf_wireless::association::channel::Band::Ghz2, primary)
+            .ok_or(power::Error::Unsupported)?;
+    let plan = radio_power::Plan::from_assets_for_channel(assets, rfe, profile).map_err(denied)?;
+    Ok((profile, plan))
 }
 impl Native {
     /// Derive the exact required signed-artifact identity without opening any
@@ -319,6 +332,23 @@ impl Native {
             let mut qualification = radio_policy::Qualification::load(board).map_err(denied)?;
             qualification.load_sleep(assets).map_err(denied)?;
             qualification.load_fragments().map_err(denied)?;
+            // Optional signed N52C per-channel full programs, loaded last so
+            // each binds every installed companion. Absent records leave
+            // that primary unadmitted; channel14 is never loaded.
+            for primary in 2..=13 {
+                let (profile, plan) =
+                    channel_plan(assets, identity.calibration().rfe_type, primary)?;
+                let board = radio_policy::Board::new_noninitial(
+                    self.lifecycle,
+                    factory,
+                    self.device.id,
+                    assets,
+                    &plan,
+                    self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+                )
+                .map_err(denied)?;
+                qualification.load_channel(profile, board).map_err(denied)?;
+            }
             qualification.current().map_err(denied)?;
             Ok(RadioPreflight {
                 board,
@@ -407,11 +437,7 @@ impl Native {
         }?;
         // Source B RF_GET_MCCCH format (no V0 feature for B): first fresh table has
         // channel1 in slot0 and zero slot1. Consumption is not an execution receipt.
-        let mut mcc = [0u8; 20];
-        for at in [0, 4, 16] {
-            mcc[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
-        }
-        self.runtime_command(2, 0x0a, 2, &mcc, false, super::station::Permit::Legacy)
+        self.runtime_command(2, 0x0a, 2, &mccch(1), false, super::station::Permit::Legacy)
             .await?;
         self.phy_profile_current()?;
         if owner.state() != radio_full::State::Ready {
@@ -427,8 +453,206 @@ impl Native {
             let input = owner.tracking_inputs().ok_or(power::Error::Terminal)?;
             self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
         }
+        self.channel = Some((1, owner.epoch()));
         self.ordinary = Some(OrdinaryGrant { qualification });
         Ok(())
+    }
+}
+
+/// Source B RF_GET_MCCCH body (no V0 feature for B): `rtw89_fw_h2c_rf_ntfy_mcc`
+/// with `rtw89_rfk_chan_lookup` replacing slot0 for the single entity, so
+/// ch_0_0 = ch_0_1 = current = primary and slot1 stays zero.
+fn mccch(primary: u8) -> [u8; 20] {
+    let mut mcc = [0u8; 20];
+    for at in [0, 4, 16] {
+        mcc[at..at + 4].copy_from_slice(&u32::from(primary).to_le_bytes());
+    }
+    mcc
+}
+impl Native {
+    /// Mask of primaries (bit n) with a current signed full program.
+    pub(in crate::rtw89) fn admitted_channels(&self) -> Result<u16, power::Error> {
+        let qualification = self.full_radio_scope().ok_or(power::Error::Unsupported)?;
+        let mut mask = 0;
+        for primary in 1..=13 {
+            let profile = operating_channel::Profile::new(
+                narf_wireless::association::channel::Band::Ghz2,
+                primary,
+            )
+            .ok_or(power::Error::Unsupported)?;
+            if qualification.channel_allowed(profile).map_err(denied)? {
+                mask |= 1 << primary;
+            }
+        }
+        Ok(mask)
+    }
+    /// Typed primary and retune epoch of the last completed full program.
+    pub(in crate::rtw89) fn operating_channel(&self) -> Option<(u8, u32)> {
+        self.ordinary.as_ref()?;
+        self.channel
+    }
+    /// Native retune owner for one noninitial (or back to the initial)
+    /// 2.4GHz/20MHz primary on the Ready radio.
+    ///
+    /// Mirrors mac80211 `ieee80211_offchannel_stop_vifs` + `drv_flush`
+    /// (rtw89_ops_flush: leave LPS, flush HCI/MAC queues) then
+    /// `rtw89_ops_config` (`rtw89_leave_ps_mode`, `rtw89_config_entity_chandef`,
+    /// core.c `rtw89_set_channel`) and `rtw89_chip_rfk_channel` (rtw8852b.c
+    /// `rtw8852b_rfk_channel` ending in `rtw89_fw_h2c_rf_ntfy_mcc`), then
+    /// `ieee80211_offchannel_return` reopening queues. Refused (with nothing
+    /// published) unless ordinary TX, the H2C queue and RX backlog are drained,
+    /// the radio is awake, and no peer, monitor or sleep owner exists, so no
+    /// LPS/monitor/station consumer holds results of the previous primary.
+    /// The ordinary grant is withheld for the whole program: the channel
+    /// transition bracket (`rtw8852bx_set_channel_help` enter: stop all CMAC
+    /// scheduler TX, PPDU status off, ADC off, BB reset) closes CMAC TX and
+    /// every autonomous response until `finish`.
+    ///
+    /// # Safety
+    /// Same retained Startup owner/tables/assets that prepared `owner`. A
+    /// failed or dropped future leaves the radio non-Ready; the caller's
+    /// Attempt terminalizes this Native.
+    pub(in crate::rtw89) async unsafe fn retune_full_radio(
+        &mut self,
+        owner: &mut radio_full::Radio,
+        tables: &radio_init::Init,
+        basic: &rfk::Rfk,
+        assets: &radio_assets::Assets,
+        primary: u8,
+    ) -> Result<u32, power::Error> {
+        self.phy_profile_current()?;
+        self.operating_current()?;
+        self.ordinary_current()?;
+        if owner.state() != radio_full::State::Ready
+            || self.full_qualification.is_some()
+            || !self.coex_ready
+            || !self.nctl_ready
+        {
+            return Err(power::Error::Terminal);
+        }
+        let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
+        let identity = factory.identity().ok_or(power::Error::Unsupported)?;
+        let rfe = identity.calibration().rfe_type;
+        let (profile, plan) = channel_plan(assets, rfe, primary)?;
+        if owner.channel() == Some(profile) {
+            return Ok(owner.epoch());
+        }
+        let qualification = self
+            .ordinary
+            .as_ref()
+            .ok_or(power::Error::Terminal)?
+            .qualification
+            .clone();
+        if !qualification.channel_allowed(profile).map_err(denied)? {
+            return Err(power::Error::Unsupported);
+        }
+        // Rebind the signed identity to this exact factory/assets/plan.
+        let phycap = self.firmware_phycap().ok_or(power::Error::Unsupported)?;
+        let fresh = if profile == operating_channel::Profile::INITIAL {
+            radio_policy::Board::new_for(
+                self.lifecycle,
+                factory,
+                self.device.id,
+                assets,
+                &plan,
+                phycap,
+            )
+            .is_ok_and(|board| qualification.matches(board))
+        } else {
+            radio_policy::Board::new_noninitial(
+                self.lifecycle,
+                factory,
+                self.device.id,
+                assets,
+                &plan,
+                phycap,
+            )
+            .is_ok_and(|board| qualification.channel_matches(profile, board))
+        };
+        let tracking = tssi::Tracking::from_assets(assets).map_err(denied)?;
+        if !fresh {
+            return Err(power::Error::Access);
+        }
+        let gain = tables.gain().ok_or(power::Error::Unsupported)?.clone();
+        let calibration = *tables.calibration().ok_or(power::Error::Unsupported)?;
+        if crate::rtw89::factory_b::Calibration::from_factory(factory) != Some(calibration) {
+            return Err(power::Error::Access);
+        }
+        let bases = self.gain_bases.ok_or(power::Error::Unsupported)?;
+        let dpd_gain = basic.results().ok_or(power::Error::Unsupported)?.dpd_gain;
+        let cut = identity.cut();
+        // Drain: rtw89_ops_flush / ieee80211_offchannel_stop_vifs. Busy is a
+        // proven-unpublished refusal; the caller retries after draining.
+        self.poll().map_err(|_| power::Error::Access)?;
+        if self.sleep_blocked
+            || self.sleep_reset.is_some()
+            || self.station_runtime.peer.is_some()
+            || self.station_runtime.monitor.is_some()
+            || self.queue.pending() != 0
+            || !self.station_runtime.backlog.is_empty()
+            || self
+                .station_runtime
+                .core
+                .as_ref()
+                .is_some_and(|core| !core.ready())
+        {
+            return Err(power::Error::Busy);
+        }
+        // rtw89_leave_ps_mode precondition: actual CPWM/MACID0 awake.
+        crate::rtw89::station_control::awake(&mut self.io)?;
+        // Close ordinary publication; RFK/PMAC run in the full scope whose
+        // envelope is the target primary's signed record and host span.
+        let grant = self.ordinary.take().ok_or(power::Error::Terminal)?;
+        self.channel = None;
+        self.station_runtime.rf_tracking = None;
+        qualification.select(profile).map_err(denied)?;
+        self.full_qualification = Some(qualification.clone());
+        // SAFETY: caller contract; queues drained and grant withheld above.
+        unsafe {
+            owner
+                .retune(
+                    self,
+                    radio_full::Inputs {
+                        gain: &gain,
+                        calibration: &calibration,
+                        gain_bases: bases,
+                        cut,
+                        dpd_gain,
+                        power: &plan,
+                        tracking: &tracking,
+                    },
+                )
+                .await
+        }?;
+        self.runtime_command(
+            2,
+            0x0a,
+            2,
+            &mccch(primary),
+            false,
+            super::station::Permit::Legacy,
+        )
+        .await?;
+        self.phy_profile_current()?;
+        if owner.state() != radio_full::State::Ready || owner.channel() != Some(profile) {
+            return Err(power::Error::Terminal);
+        }
+        let qualification = self.full_qualification.take().ok_or(power::Error::Access)?;
+        qualification.current().map_err(denied)?;
+        // Republish: periodic DPK restarts from this program's fresh DPK
+        // baseline; no earlier-channel thermal average survives.
+        if qualification
+            .rf_tracking_window()
+            .map_err(denied)?
+            .is_some()
+        {
+            let input = owner.tracking_inputs().ok_or(power::Error::Terminal)?;
+            self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
+        }
+        self.channel = Some((primary, owner.epoch()));
+        // ieee80211_offchannel_return: queues reopen only on the new grant.
+        self.ordinary = Some(grant);
+        Ok(owner.epoch())
     }
 }
 

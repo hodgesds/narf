@@ -255,6 +255,45 @@ impl Startup {
         attempt.committed = result.is_ok();
         result
     }
+    /// Retune the Ready radio to one signed-admitted 2.4GHz/20MHz primary
+    /// (`Native::retune_full_radio`). A refusal that withheld nothing (the
+    /// ordinary grant is still installed) is retryable; any failure after the
+    /// grant was withheld terminalizes this owner like the initial program.
+    pub(super) async fn retune_channel(&mut self, primary: u8) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady || self.monitor.is_some() {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: the same retained Startup prepared `full_radio` with these
+            // exact tables/basic RFK/assets; the Attempt terminalizes on loss.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_full_radio(
+                        &mut owner.full_radio,
+                        &owner.radio,
+                        &owner.rfk,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        primary,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
+        result
+    }
     pub async fn prepare_radio_tables(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Receiving {
             return Err(Error::Terminal);

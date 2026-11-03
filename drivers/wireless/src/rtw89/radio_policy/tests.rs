@@ -1063,3 +1063,185 @@ kernel_test_in!(
     "drivers/wireless/rtw89/fragmentation",
     smoke_rtw8852b_fragment_full_joint_companion_preserves_prior_records_and_current_grants
 );
+
+/// Explicit inert N52C boundary: authenticated test records only; no
+/// production attach, measured envelope or physical receipt is minted.
+pub(in crate::rtw89) fn channel_model(
+    primary: u8,
+    peak_qdbm: i16,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+    Board,
+) {
+    let (mut base, base_cap) = revocable_model();
+    let profile = super::super::operating_channel::Profile::new(
+        narf_wireless::association::channel::Band::Ghz2,
+        primary,
+    )
+    .unwrap();
+    let mut board = board();
+    board.identity = [primary; 32];
+    let request = channel::Request::new(&base, profile, board.with_programs(base.flags)).unwrap();
+    let record = channel_record(&base, &request, primary, peak_qdbm);
+    let cap = authority();
+    let channel = channel::Channel::from_verified(
+        &base,
+        &request,
+        profile,
+        board.with_programs(base.flags),
+        &record,
+        Some([3; 32]),
+        cap,
+    )
+    .unwrap();
+    base.channels.push(channel);
+    (base, base_cap, cap, board)
+}
+fn channel_record(
+    base: &Qualification,
+    request: &channel::Request,
+    primary: u8,
+    peak_qdbm: i16,
+) -> [u8; 128] {
+    let mut record = expanded_record(base, b"N52C", request.binding);
+    record[54..58].copy_from_slice(&[1, 20, primary, base.flags]);
+    record[58..60].copy_from_slice(&4i16.to_le_bytes());
+    record[60..62].copy_from_slice(&76i16.to_le_bytes());
+    for at in [62, 64, 66] {
+        record[at..at + 2].copy_from_slice(&peak_qdbm.to_le_bytes());
+    }
+    record
+}
+pub(in crate::rtw89) fn band_domain() -> narf_wireless::reg::RegulatoryDomain {
+    let mut domain = domain();
+    domain.rules[0].freq_end_mhz = 2472;
+    domain
+}
+fn smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span() -> TestResult {
+    use super::super::operating_channel::Profile;
+    use narf_wireless::association::channel::Band;
+    let six = Profile::new(Band::Ghz2, 6).unwrap();
+    let (mut base, base_cap, record_cap, board) = channel_model(6, 40);
+    // Channel1/14 never get a noninitial record; v2 is not reinterpreted.
+    for primary in [1, 14] {
+        let profile = Profile::new(Band::Ghz2, primary).unwrap();
+        if channel::Request::new(&base, profile, board.with_programs(base.flags)).is_ok() {
+            return TestResult::Fail("N52C admitted the initial or CCK-only primary");
+        }
+    }
+    let request = channel::Request::new(&base, six, board.with_programs(base.flags)).unwrap();
+    let good = channel_record(&base, &request, 6, 40);
+    for (signer, bytes, profile, label) in [
+        (Some([4; 32]), good, six, "foreign signer"),
+        (None, good, six, "unsigned record"),
+        (
+            Some([3; 32]),
+            channel_record(&base, &request, 7, 40),
+            six,
+            "wrong primary byte",
+        ),
+        (
+            Some([3; 32]),
+            good,
+            Profile::new(Band::Ghz2, 7).unwrap(),
+            "record reused for another primary",
+        ),
+    ] {
+        let rebuilt = channel::Request::new(&base, profile, board.with_programs(base.flags));
+        if rebuilt.is_ok_and(|request| {
+            channel::Channel::from_verified(
+                &base,
+                &request,
+                profile,
+                board.with_programs(base.flags),
+                &bytes,
+                signer,
+                authority(),
+            )
+            .is_ok()
+        }) {
+            return TestResult::Fail(label);
+        }
+    }
+    let mut other = board;
+    other.identity = [0x55; 32];
+    if channel::Channel::from_verified(
+        &base,
+        &request,
+        six,
+        other.with_programs(base.flags),
+        &good,
+        Some([3; 32]),
+        authority(),
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("N52C accepted another per-channel identity");
+    }
+    if !base.channel_matches(six, board)
+        || base.channel_matches(six, other)
+        || base.channel_allowed(six) != Ok(true)
+        || base.channel_allowed(Profile::new(Band::Ghz2, 7).unwrap()) != Ok(false)
+        || base.channel_allowed(Profile::INITIAL) != Ok(true)
+    {
+        return TestResult::Fail("N52C admission did not follow the signed record");
+    }
+    // Host rule covers only channel1: selecting 6 fails and leaves 1 active.
+    if base.select(six).is_ok() || base.active() != 1 || base.with_current(|| Ok(1)) != Ok(1) {
+        return TestResult::Fail("channel6 selected outside its occupied span");
+    }
+    base.model_domain = Some(band_domain());
+    if base.select(six).is_err() || base.active() != 6 || base.with_current(|| Ok(6)) != Ok(6) {
+        return TestResult::Fail("current channel6 record did not gate publication");
+    }
+    // A record whose peaks exceed the current ceiling is refused at select.
+    let (mut hot, _, _, _) = channel_model(9, 80);
+    hot.model_domain = Some(band_domain());
+    if hot.select(Profile::new(Band::Ghz2, 9).unwrap()).is_ok() || hot.active() != 1 {
+        return TestResult::Fail("channel9 peaks exceeded the host ceiling");
+    }
+    // A later companion change retires the old joint binding.
+    let (mut joint, _, _) = fragment_model(None);
+    let flags = joint.flags;
+    let request = channel::Request::new(&joint, six, board.with_programs(flags)).unwrap();
+    let record = channel_record(&joint, &request, 6, 40);
+    let channel = channel::Channel::from_verified(
+        &joint,
+        &request,
+        six,
+        board.with_programs(flags),
+        &record,
+        Some([3; 32]),
+        authority(),
+    )
+    .unwrap();
+    joint.channels.push(channel);
+    joint.model_domain = Some(band_domain());
+    if joint.channel_allowed(six) != Ok(true)
+        || request.binding
+            == channel::Request::new(&base, six, board.with_programs(base.flags))
+                .unwrap()
+                .binding
+    {
+        return TestResult::Fail("N52C joint binding ignored installed companions");
+    }
+    joint.fragments = None;
+    if joint.channel_allowed(six).is_ok() || joint.select(six).is_ok() {
+        return TestResult::Fail("N52C survived a changed companion set");
+    }
+    record_cap.revoke();
+    if base.with_current(|| Ok(6)).is_ok() || base.select(Profile::INITIAL).is_err() {
+        return TestResult::Fail("revoked N52C kept emitting or blocked channel1 return");
+    }
+    if base.select(six).is_ok() {
+        return TestResult::Fail("revoked N52C reselected");
+    }
+    base_cap.revoke();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span
+);

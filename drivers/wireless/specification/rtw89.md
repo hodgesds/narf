@@ -2170,6 +2170,66 @@ cases are written and unexecuted:
 `smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary`,
 `smoke_rtw89_b_full_radio_retunes_ready_owner_to_actual_primary_and_advances_epoch`.
 
+#### Signed per-channel program, native retune owner and multi-channel station
+
+**Per-channel qualification (N52C).** `radio_policy::Board::new_noninitial`
+composes a noninitial identity exactly like the v2 channel1 `Board` (same
+factory, firmware PHY_CAP, recipe list, `Plan::bind`, lifecycle) but over
+`Plan::from_assets_for_channel` for primaries 2..=13 (Linux rtw8852b_table.c
+WW0/RU rows, rtw8852b_common.c SCO/FIR, rtw8852b_rfk.c TSSI groups), under a
+distinct domain string; channel1 and channel14 are refused. The optional
+signed record `rtw89/rtw8852b-chan-v1-chNN-<mac>.bin` (`channel_policy.rs`,
+magic `N52C`, 128 bytes, `[54..58] = [1,20,primary,base flags]`) binds that
+identity extended by the base program flags (so per-channel WMM/QoS/RA/HT/HE/
+A-MPDU program identities), the exact base record digest/signer, and every
+installed companion (N52A/N52T digests, N52P/N52F canonical bindings). Its
+signer must equal the base signer; it carries its own antenna/ceiling/peaks.
+`Qualification::select` switches the envelope gating every publication
+(`current`/`with_current`) to the target record, checked against the current
+host rule over the primary's whole occupied span (`Profile::occupied`); a
+failed select restores the previous primary. A changed companion set or a
+revoked record retires the channel (`channel_allowed`). Records are loaded
+last in `preflight_full_radio`; absent records leave a primary unadmitted. No
+hardware receipt or measurement is invented: without provisioned signed
+records only channel1 is admitted, exactly as before.
+
+**Native retune owner.** `Native::retune_full_radio` (via
+`Startup::retune_channel` and `station::Io::station_retune`) mirrors mac80211
+`ieee80211_offchannel_stop_vifs` + `drv_flush` (rtw89_ops_flush), then
+`rtw89_ops_config` (`rtw89_leave_ps_mode`, `rtw89_set_channel`) and
+`rtw89_chip_rfk_channel` (`rtw8852b_rfk_channel` ending in
+`rtw89_fw_h2c_rf_ntfy_mcc`), then `ieee80211_offchannel_return`. It rebuilds
+plan/identity from the actual factory/assets and requires the signed record
+to match; refuses (`Busy`/`Unsupported`, grant still installed, owner not
+terminalized) unless the H2C queue, RX backlog and ordinary TX are drained,
+the radio is awake, and no peer, monitor or sleep owner exists, so no LPS/
+monitor/station consumer holds previous-channel results. It then withholds
+the ordinary grant, selects the target envelope, runs `Radio::retune` (whose
+`rtw8852bx_set_channel_help` bracket stops CMAC scheduler TX, PPDU status
+and ADC, closing autonomous responses), sends RF_GET_MCCCH for the new
+primary (slot0 replaced per `rtw89_rfk_chan_lookup`), rebuilds the periodic
+DPK tracker from the fresh DPK baseline, republishes `(primary, epoch)` and
+reinstalls the grant. Any failure after the grant is withheld terminalizes.
+
+**Station and interface.** `station::State` tracks the retained primary and
+epoch: observation, WMM refresh and probe DS Parameter Set use it;
+`scan_channels` mirrors the mac80211 software scan (set channel, probe,
+dwell per primary); `associate` retunes to the BSS's own primary (1..=13)
+before joining and track statistics reset on retune. The interface samples
+the admitted mask (`station_channels`) at activation, advertises only those
+primaries, maps nl80211 channels/frequencies (empty = all admitted), refuses
+unadmitted primaries before any retune or probe, reports the BSS's actual
+channel/frequency and accepts association on an admitted primary.
+
+Remaining (no row credit claimed): provisioning tooling for N52C records
+(the binding is derivable from the loaded base, but no native request API
+exposes it yet), retune while associated (channel switch / CSA) and monitor
+on noninitial primaries (both refused), firmware hw_scan offload, and all
+native two-arch execution and physical validation. Newly written,
+unexecuted cases:
+`smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span`,
+`smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -2293,7 +2353,7 @@ triage above remains separate from implementation.
 
 | Row | Concrete blocker |
 |---|---|
-| `additional_operating_channels` | The retained native radio, scan/association owner and signed N52B/HT/HE operating programs bind channel1/2412MHz. Noninitial operation needs a current per-channel occupied-power qualification and a drain/retune owner for the actual MAC/BB/RF program before queues resume. |
+| `additional_operating_channels` | Source implemented for RTL8852B 2.4GHz/20MHz primaries 2..=13 (N52C per-channel signed record, native drain/retune owner, multi-channel scan and noninitial association; §3 "Signed per-channel program"). Native execution, N52C provisioning and physical validation remain; channel14, CSA and noninitial monitor stay refused. |
 | `five_ghz_operation` | RTL8852B supports5GHz, but the retained radio/power recipe and station admission select the channel1 2.4GHz program. Native5GHz RF/BB/power setup, permitted scan/retune and exact signed operating programs remain missing; discovery of the band alone grants no station profile. |
 | `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
 | `fragmentation` | The admitted RTL8852B native/host/public owner is now implemented in §3 above, including the separate signed full-joint emitter, per-fragment PN and actual terminal ownership, bounded original-source RX cache and threshold control. Source review, release compilation and native/physical acceptance are pending. Other chip/width profiles remain their explicit separate rows. |

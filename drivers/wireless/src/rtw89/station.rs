@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Retained RTL8852B channel1 host station state. The exact firmware Owner
+//! Retained RTL8852B 2.4GHz/20MHz host station state (channel1 initially;
+//! signed noninitial primaries 2..=13 through the native retune owner). The exact firmware Owner
 //! keeps its native backend; this state never owns or reconstructs hardware.
 use super::{
     packet_core::{self as packet, Frame as Mpdu, Receipt},
@@ -158,6 +159,17 @@ pub(super) unsafe trait Io: Send {
     /// Signed HE20 program (`Program::He`).
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
+    }
+    /// Retune the Ready radio to `primary` (2.4GHz/20MHz, signed N52C record
+    /// required for 2..=13) and return the new retune epoch. `Busy` is a
+    /// proven-unpublished refusal while TX/RX work is still pending.
+    async fn station_retune(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Bit n set: primary n has a current signed full program (channel1 is
+    /// the base record). Default: channel1 only.
+    fn station_channels(&mut self) -> Result<u16, power::Error> {
+        Ok(1 << 1)
     }
     /// `rtw89_core_scan_start`/`_complete` address CAM update: a random scan
     /// SMA, or `None` to restore the own address.
@@ -388,10 +400,11 @@ pub(super) struct Probe {
     /// (`IEEE80211_TX_CTRL_NO_SEQNO`).
     pub(super) random_sn: bool,
 }
-/// mac80211 `ieee80211_build_probe_req` for this 2.4GHz channel1 profile:
+/// mac80211 `ieee80211_build_probe_req` for this 2.4GHz/20MHz profile:
 /// SSID, Supported Rates (1,2,5.5,11,6,9,12,18), Extended Supported Rates
-/// (24,36,48,54), DS Parameter Set, then the caller's extra IEs.
-pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8]) -> Vec<u8> {
+/// (24,36,48,54), DS Parameter Set (the retained radio's actual primary,
+/// `ieee80211_put_ds_params`), then the caller's extra IEs.
+pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8], channel: u8) -> Vec<u8> {
     let mut frame = vec![0x40, 0, 0, 0];
     frame.extend_from_slice(&[0xff; 6]);
     frame.extend_from_slice(&own);
@@ -401,7 +414,7 @@ pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(ssid);
     frame.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
     frame.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
-    frame.extend_from_slice(&[3, 1, 1]);
+    frame.extend_from_slice(&[3, 1, channel]);
     frame.extend_from_slice(ies);
     frame
 }
@@ -502,6 +515,10 @@ pub(super) struct State {
     /// `rtw89_track_work` RSSI statistics and dynamic EDCCA.
     track: super::track::Tracker,
     scanning: bool,
+    /// Actual primary of the retained radio (native retune epoch below).
+    channel: u8,
+    /// Native retune epoch this state's channel-bound work was built for.
+    epoch: Option<u32>,
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -564,6 +581,8 @@ impl State {
             last_now: 0,
             track: super::track::Tracker::default(),
             scanning: false,
+            channel: 1,
+            epoch: None,
         }
     }
     pub(super) fn admission(&self) -> Admission {
@@ -894,7 +913,7 @@ impl State {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
         let own = self.scan.unwrap_or(self.own);
-        let Ok(candidate) = association::observe(frame, 1, own, signal) else {
+        let Ok(candidate) = association::observe(frame, self.channel, own, signal) else {
             return;
         };
         if candidate.basic_rates & 1 == 0 {
@@ -955,7 +974,7 @@ impl State {
         let (Some(current), Some(peer)) = (self.wmm, &self.peer) else {
             return Ok(());
         };
-        let Some(candidate) = association::observe(frame, 1, self.own, None)
+        let Some(candidate) = association::observe(frame, self.channel, self.own, None)
             .ok()
             .filter(|candidate| candidate.bss.bssid == peer.bss.bssid)
         else {
@@ -1735,7 +1754,7 @@ impl State {
     ) -> Result<Vec<ObservedBss>, Error> {
         self.scan_with(io, dwell_ms, None).await
     }
-    /// Scan channel 1 for `dwell_ms`. An active scan first transmits one
+    /// Scan the current primary for `dwell_ms`. An active scan first transmits one
     /// probe request per SSID (wildcard when none) like mac80211's software
     /// scan, then listens for the dwell.
     pub(super) async fn scan_with(
@@ -1800,6 +1819,70 @@ impl State {
         }
         result
     }
+    /// Actual primary of the retained radio.
+    pub(super) fn channel(&self) -> u8 {
+        self.channel
+    }
+    /// Retune the unassociated station to `primary` through the native
+    /// owner (`Io::station_retune`). Like mac80211 `ieee80211_offchannel_stop_vifs`
+    /// plus `drv_flush`, every pending TX retires first; a `Busy` native
+    /// refusal (RX/H2C backlog) is retried after polling, bounded. Cached
+    /// candidates keep their own observed channel.
+    pub(super) async fn retune(&mut self, io: &mut impl Io, primary: u8) -> Result<(), Error> {
+        if !(1..=13).contains(&primary) {
+            return Err(Error::Profile);
+        }
+        if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
+            return Err(Error::State);
+        }
+        if primary == self.channel {
+            return Ok(());
+        }
+        let deadline = self.now()?.saturating_add(1000);
+        loop {
+            self.poll(io)?;
+            if self.pending.is_empty() {
+                match io.station_retune(primary, &self.admission).await {
+                    Ok(epoch) => {
+                        self.channel = primary;
+                        self.epoch = Some(epoch);
+                        // rtw89_track_work statistics belong to the old primary.
+                        self.track = super::track::Tracker::default();
+                        return Ok(());
+                    }
+                    Err(power::Error::Busy) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if self.now()? >= deadline {
+                return Err(Error::State);
+            }
+            self.environment.pause().await;
+        }
+    }
+    /// mac80211 software scan (`ieee80211_scan_state_set_channel`,
+    /// `ieee80211_scan_state_send_probe`, then the dwell) over each listed
+    /// 2.4GHz primary in order, each retuned by the native owner. Results
+    /// from every channel accumulate in the shared candidate cache.
+    pub(super) async fn scan_channels(
+        &mut self,
+        io: &mut impl Io,
+        channels: &[u8],
+        dwell_ms: u64,
+        probe: impl Fn() -> Option<Probe>,
+    ) -> Result<Vec<ObservedBss>, Error> {
+        if channels.is_empty()
+            || channels.len() > 13
+            || channels.iter().any(|channel| !(1..=13).contains(channel))
+        {
+            return Err(Error::Profile);
+        }
+        for &channel in channels {
+            self.retune(io, channel).await?;
+            self.scan_with(io, dwell_ms, probe()).await?;
+        }
+        Ok(self.candidates())
+    }
     async fn scan_dwell(
         &mut self,
         io: &mut impl Io,
@@ -1825,7 +1908,7 @@ impl State {
                     }
                     self.environment.pause().await;
                 }
-                let mut frame = probe_request(source, &ssid, &probe.ies);
+                let mut frame = probe_request(source, &ssid, &probe.ies, self.channel);
                 let assign = match random_sn {
                     Some(random) => {
                         // IEEE80211_SN_TO_SEQ(get_random_u16()).
@@ -1864,9 +1947,12 @@ impl State {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if candidate.bss.channel != 1 || candidate.basic_rates & 1 == 0 {
+        if !(1..=13).contains(&candidate.bss.channel) || candidate.basic_rates & 1 == 0 {
             return Err(Error::Profile);
         }
+        // mac80211 ieee80211_prep_channel: the station joins on the BSS's
+        // own primary; the native owner retunes (signed record required).
+        self.retune(io, candidate.bss.channel).await?;
         // rtw89 sets MFP_CAPABLE: WPA2 offers MFPC (`ieee80211w=1`, PMF and
         // PSK-SHA256 admitted) to an AP that advertises MFPC; otherwise the
         // legacy RSNE is kept. WPA3 is SAE with PMF required.

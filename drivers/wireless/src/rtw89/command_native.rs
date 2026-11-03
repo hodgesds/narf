@@ -114,6 +114,9 @@ pub struct Native {
     dma_reclaimed: bool,
     /// Observed-FLR lifecycle that selects the signed radio identity.
     lifecycle: super::radio_policy::Lifecycle,
+    /// Primary and retune epoch of the completed full program; cleared while
+    /// a retune runs. Consumers compare the epoch they were built against.
+    channel: Option<(u8, u32)>,
 }
 /// Current-authority BAR/config adapter for the DMA-stop proof.
 struct StopPort<'a> {
@@ -279,6 +282,7 @@ impl Native {
             dma_idle: None,
             dma_reclaimed: false,
             lifecycle: super::radio_policy::Lifecycle::Initial,
+            channel: None,
             gain_bases: None,
             radio_started: false,
             radio_shutdown: super::radio_shutdown::Shutdown::default(),

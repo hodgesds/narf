@@ -119,6 +119,9 @@ pub(super) struct Device<I: Io> {
     sleep_enabled: AtomicBool,
     sleep_identity: IrqSafeSpinLock<Option<narf_net::native_emission::Lifetime>>,
     monitor_capable: AtomicBool,
+    /// Bit n set: 2.4GHz/20MHz primary n has a current signed full program
+    /// (channel1 = base N52B; 2..=13 = N52C). Sampled at activation.
+    channels: core::sync::atomic::AtomicU16,
     fragments_capable: AtomicBool,
     desired: Arc<super::monitor::Desired>,
     selection: super::monitor::Selection,
@@ -218,6 +221,7 @@ impl<I: Io + 'static> Device<I> {
         flags: narf_wireless::scan::ScanFlags,
     ) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;
+        let channels = scan_channels(&request, self.channels.load(Ordering::Acquire))?;
         self.control_ready()?;
         let mut attempt = Attempt {
             device: self,
@@ -234,13 +238,15 @@ impl<I: Io + 'static> Device<I> {
             (Some(random), true) => Some(random_scan_address(random)?),
             _ => None,
         };
-        let probe = request.active.then(|| station::Probe {
-            ssids: request.ssids.clone(),
-            ies: request.extra_ies.clone(),
-            address,
-            random_sn: flags.random_sn,
-        });
-        let result = owner.station_scan(dwell, probe).await;
+        let probe = || {
+            request.active.then(|| station::Probe {
+                ssids: request.ssids.clone(),
+                ies: request.extra_ies.clone(),
+                address,
+                random_sn: flags.random_sn,
+            })
+        };
+        let result = owner.station_scan_channels(&channels, dwell, probe).await;
         attempt.armed = false;
         if result.is_err() {
             self.close();
@@ -265,8 +271,8 @@ impl<I: Io + 'static> Device<I> {
             .map(|c| BssInfo {
                 bssid: c.bss.bssid,
                 ssid: c.bss.ssid,
-                channel: 1,
-                frequency_mhz: 2412,
+                channel: u32::from(c.bss.channel),
+                frequency_mhz: 2407 + 5 * u32::from(c.bss.channel),
                 rssi: i8::MIN,
                 security: if c.ap_rsne.is_some() {
                     narf_wireless::scan::BssSecurity::Wpa2
@@ -338,6 +344,7 @@ impl<I: Io + 'static> Device<I> {
             sleep_enabled: AtomicBool::new(false),
             sleep_identity: IrqSafeSpinLock::new(None),
             monitor_capable: AtomicBool::new(false),
+            channels: core::sync::atomic::AtomicU16::new(CHANNEL1),
             fragments_capable: AtomicBool::new(false),
             desired: super::monitor::Desired::new(),
             selection: super::monitor::Selection {
@@ -485,6 +492,18 @@ impl<I: Io + 'static> Device<I> {
             .monitor_capable()?;
         self.monitor_capable
             .store(monitor_capable, Ordering::Release);
+        // Admitted primaries; a failed sample keeps only channel1.
+        let channels = self
+            .lifecycle
+            .retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .io
+            .station_channels()
+            .unwrap_or(CHANNEL1);
+        self.channels.store(channels | CHANNEL1, Ordering::Release);
         if self.monitor_selected() {
             if !monitor_capable {
                 return Err(Error::State);
@@ -955,7 +974,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             base_mac: self.local,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![1],
+                channels: (1..=13u32)
+                    .filter(|channel| self.channels.load(Ordering::Acquire) & (1 << channel) != 0)
+                    .collect(),
             }],
             modes: WirelessModes::STATION
                 | if self.monitor_capable.load(Ordering::Acquire) {
@@ -997,7 +1018,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
-        if request.channel != 1 || request.frequency_mhz != 2412 {
+        if !(1..=13).contains(&request.channel)
+            || self.channels.load(Ordering::Acquire) & (1 << request.channel) == 0
+            || request.frequency_mhz != 2407 + 5 * request.channel
+        {
             return Err(WirelessError::NotSupported);
         }
         let credential = match request.security {
@@ -1102,6 +1126,35 @@ fn random_scan_address(
     }
     Ok(bytes)
 }
+const CHANNEL1: u16 = 1 << 1;
+/// Requested 2.4GHz/20MHz primaries (channels plus frequencies, ascending,
+/// deduplicated); empty means every admitted primary like cfg80211's
+/// all-channels default. Every one must have a current signed program, so
+/// an unadmitted channel is refused before any retune or transmission.
+fn scan_channels(request: &ScanRequest, admitted: u16) -> Result<Vec<u8>, WirelessError> {
+    let mut mask = 0u16;
+    for &channel in &request.channels {
+        if !(1..=13).contains(&channel) {
+            return Err(WirelessError::NotSupported);
+        }
+        mask |= 1 << channel;
+    }
+    for &frequency in &request.frequencies_mhz {
+        if !(2412..=2472).contains(&frequency) || (frequency - 2407) % 5 != 0 {
+            return Err(WirelessError::NotSupported);
+        }
+        mask |= 1 << ((frequency - 2407) / 5);
+    }
+    if mask == 0 {
+        mask = admitted | CHANNEL1;
+    }
+    if mask & !(admitted | CHANNEL1) != 0 {
+        return Err(WirelessError::NotSupported);
+    }
+    Ok((1..=13u8)
+        .filter(|channel| mask & (1 << channel) != 0)
+        .collect())
+}
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
     // cfg80211 `nl80211_parse_random_mac`: the mask must keep the group bit
     // from a unicast base address.
@@ -1113,8 +1166,6 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
         || (!request.active && !request.extra_ies.is_empty())
         || !probe_ies_valid(&request.extra_ies)
         || request.active && request.ssids.len() > 8
-        || request.frequencies_mhz.iter().any(|f| *f != 2412)
-        || request.channels.iter().any(|ch| *ch != 1)
         || request.ssids.len() > 32
         || request.ssids.iter().any(|s| s.len() > 32)
     {

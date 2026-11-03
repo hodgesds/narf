@@ -382,6 +382,8 @@ impl Peer {
 }
 
 static NEXT_SLEEP: AtomicBool = AtomicBool::new(false);
+/// Signed-admitted primaries for the next DriverModel (0: channel1 only).
+static NEXT_CHANNELS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 struct DriverModel {
     controller: crate::rtw89::station_control::Controller,
     control: crate::rtw89::station_control::tests::Model,
@@ -406,6 +408,9 @@ struct DriverModel {
         crate::rtw89::lps::Manager,
         crate::rtw89::lps::tests::Firmware,
     )>,
+    /// Admitted primaries mask and every native retune actually requested.
+    channels: u16,
+    retunes: Vec<u8>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
 /// `irq::Mask` programs the native binding runs.
@@ -461,6 +466,8 @@ impl DriverModel {
             irq: None,
             dma: crate::rtw89::dma_stop::tests::Model::new(),
             reclaimed: None,
+            channels: NEXT_CHANNELS.swap(0, Ordering::AcqRel) | (1 << 1),
+            retunes: Vec::new(),
             sleep: NEXT_SLEEP.swap(false, Ordering::AcqRel).then(|| {
                 (
                     crate::rtw89::lps::Manager::after_firmware(
@@ -497,6 +504,26 @@ impl DriverModel {
 // Native OrdinaryGrant remains unconstructible by this fixture. Both adapters
 // invoke their actual typed fixture capability around published operations.
 unsafe impl crate::rtw89::station::Io for DriverModel {
+    fn station_channels(&mut self) -> Result<u16, crate::rtw89::power::Error> {
+        Ok(self.channels)
+    }
+    /// Native retune owner model: refused (nothing published) unless the
+    /// primary is admitted and ordinary TX is drained, as `retune_full_radio`.
+    async fn station_retune(
+        &mut self,
+        primary: u8,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if self.channels & (1 << primary) == 0 {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_some_and(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        self.retunes.push(primary);
+        Ok(self.retunes.len() as u32 + 1)
+    }
     fn station_sleep_capable(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         Ok(self.sleep.is_some())
     }
@@ -2996,3 +3023,80 @@ kernel_test_in!(
 
 #[path = "station_lps_tests.rs"]
 mod lps_tests;
+
+/// Scan over channels 1 and 6 with an AP on channel 6, then associate there.
+/// Exercises the station/interface retune order; the native register program
+/// is covered by radio_full and the N52C policy cases.
+fn smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial() -> TestResult {
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    NEXT_CHANNELS.store(1 << 6, Ordering::Release);
+    let h = Harness::new(false);
+    let advertised = h.device.get_wireless_info().bands[0].channels.clone();
+    if advertised != vec![1, 6] {
+        return TestResult::Fail("advertised channels differ from signed admission");
+    }
+    let request = |channels: Vec<u32>| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz: Vec::new(),
+        channels,
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    // An unadmitted primary is refused before any retune or probe.
+    if complete(h.device.scan(request(vec![1, 11]))).is_ok()
+        || !h.peer.lock().probes.is_empty()
+        || h.model(|io| io.retunes.clone()) != Vec::<u8>::new()
+    {
+        return TestResult::Fail("unadmitted channel scanned or retuned");
+    }
+    let Ok(seen) = complete(h.device.scan(request(vec![6, 1]))) else {
+        return TestResult::Fail("two-channel scan failed");
+    };
+    let ds: Vec<u8> = h
+        .peer
+        .lock()
+        .probes
+        .iter()
+        .map(|probe| probe[probe.len() - 1])
+        .collect();
+    if h.model(|io| io.retunes.clone()) != vec![6]
+        || ds != vec![1, 6]
+        || seen.len() != 1
+        || seen[0].bssid != AP
+        || seen[0].channel != 6
+        || seen[0].frequency_mhz != 2437
+    {
+        return TestResult::Fail("scan order, DS parameter or channel-6 result differs");
+    }
+    // Association on the BSS's channel6 joins without another retune.
+    let mut join = h.request();
+    join.channel = 6;
+    join.frequency_mhz = 2437;
+    if complete(h.device.associate(join)).is_err() {
+        return TestResult::Fail("channel6 association refused");
+    }
+    if h.model(|io| io.retunes.clone()) != vec![6] || h.device.connected_bssid() != Some(AP) {
+        return TestResult::Fail("association retuned again or did not join on channel6");
+    }
+    // Retune is refused while associated (no peer channel switch here).
+    if complete(h.device.scan(request(vec![1]))).is_ok()
+        || h.model(|io| io.retunes.clone()) != vec![6]
+    {
+        return TestResult::Fail("associated station retuned away");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial
+);

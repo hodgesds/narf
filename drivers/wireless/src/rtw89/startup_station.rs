@@ -156,6 +156,21 @@ unsafe impl Io for Startup {
             .scan_address(&mut native.station_access(), address, admission)
             .await
     }
+    fn station_channels(&mut self) -> Result<u16, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.admitted_channels()
+    }
+    async fn station_retune(
+        &mut self,
+        primary: u8,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        self.station_allowed()?;
+        admission.check()?;
+        let epoch = self.retune_channel(primary).await?;
+        admission.check()?;
+        Ok(epoch)
+    }
     fn station_sleep_capable(&mut self) -> Result<bool, power::Error> {
         self.sleep_prepare()
     }

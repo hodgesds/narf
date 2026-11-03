@@ -7,6 +7,8 @@ use narf_firmware::{FirmwareBlob, FirmwareError};
 const LENGTH: usize = 128;
 #[path = "amsdu_policy.rs"]
 mod amsdu;
+#[path = "channel_policy.rs"]
+mod channel;
 #[path = "fragment_policy.rs"]
 mod fragment;
 #[path = "lps_policy.rs"]
@@ -159,11 +161,53 @@ impl Board {
         if power.channel() != super::operating_channel::Profile::INITIAL {
             return Err(Error::Identity);
         }
+        Self::compose(
+            factory,
+            device,
+            assets,
+            power,
+            phycap,
+            b"NARF RTL8852B initial full RF ch1 legacy20 awake WLAN-only v2;TX-A1M,RX-AB;all automatic CCK/OFDM response paths;no hardwarecrypto;onefreshPCI lifecycle",
+        )
+    }
+    /// Identity of the same full program retuned to one noninitial primary
+    /// (2..=13): the identical factory/PHY_CAP/recipe composition over the
+    /// plan's per-channel Linux power rows and typed SCO/FIR/TSSI profile,
+    /// domain-separated from v2. Only a signed N52C record admits it.
+    pub(super) fn new_noninitial(
+        lifecycle: Lifecycle,
+        factory: &Factory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+        power: &Plan,
+        phycap: &super::firmware_phycap::Receipt,
+    ) -> Result<Self, Error> {
+        if !channel::admissible(power.channel()) {
+            return Err(Error::Identity);
+        }
+        Self::compose(
+            factory,
+            device,
+            assets,
+            power,
+            phycap,
+            b"NARF RTL8852B noninitial full RF 2.4GHz20 legacy20 awake WLAN-only v1;TX-A1M,RX-AB;all automatic CCK/OFDM response paths;no hardwarecrypto;retuned from Ready ch1 program",
+        )
+        .map(|board| board.lifecycle(lifecycle))
+    }
+    fn compose(
+        factory: &Factory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+        power: &Plan,
+        phycap: &super::firmware_phycap::Receipt,
+        domain: &[u8],
+    ) -> Result<Self, Error> {
         let base = super::calibration_policy::Board::new(factory, device, assets)
             .map_err(|_| Error::Identity)?;
         let identity = factory.identity().ok_or(Error::Identity)?;
         let mut h = narf_crypto::sha256::Sha256::new();
-        h.update(b"NARF RTL8852B initial full RF ch1 legacy20 awake WLAN-only v2;TX-A1M,RX-AB;all automatic CCK/OFDM response paths;no hardwarecrypto;onefreshPCI lifecycle");
+        h.update(domain);
         phycap.initial_profile().map_err(|_| Error::Identity)?;
         h.update(&base.identity());
         h.update(&phycap.fingerprint());
@@ -230,6 +274,14 @@ impl Board {
         self
     }
 }
+/// Signed power envelope gating publications on one occupied span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Envelope {
+    span: (u32, u32),
+    antenna_qdb: i16,
+    ceiling_qdbm: i16,
+    peaks_qdbm: [i16; 3],
+}
 struct Current;
 impl CapOp<FirmwareBlob, Read> for Current {
     type Output = ();
@@ -251,6 +303,10 @@ pub(super) struct Qualification {
     rf_tracking: Option<rf_tracking::Tracking>,
     lps: Option<lps::Sleep>,
     fragments: Option<fragment::Fragments>,
+    /// Signed noninitial per-channel full-program records (N52C).
+    channels: alloc::vec::Vec<channel::Channel>,
+    /// Primary whose envelope gates every publication (1 = base N52B).
+    active: core::sync::atomic::AtomicU8,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -337,6 +393,8 @@ impl Qualification {
             rf_tracking: None,
             lps: None,
             fragments: None,
+            channels: alloc::vec::Vec::new(),
+            active: core::sync::atomic::AtomicU8::new(1),
             antenna_qdb,
             ceiling_qdbm,
             peaks_qdbm,
@@ -395,9 +453,16 @@ impl Qualification {
             Some(program) => program.invoke(operation),
             None => operation(),
         };
-        match &self.amsdu {
+        let operation = || match &self.amsdu {
             Some(program) => program.invoke(operation),
             None => operation(),
+        };
+        match self.active() {
+            1 => operation(),
+            primary => match self.channel(primary) {
+                Some(record) => record.invoke(operation),
+                None => Err(super::power::Error::Access),
+            },
         }
     }
     pub(super) fn rf_tracking_window(&self) -> Result<Option<super::rf_tracking::Window>, Error> {
@@ -489,17 +554,105 @@ impl Qualification {
             })
             .map_err(|_| super::power::Error::Access)?
     }
+    /// Envelope of the active primary: base N52B over 2402..2422 for channel1,
+    /// otherwise the current signed N52C record over its occupied span.
+    fn envelope(&self) -> Result<Envelope, Error> {
+        let active = self.active.load(core::sync::atomic::Ordering::Acquire);
+        if active == 1 {
+            return Ok(Envelope {
+                span: (2402, 2422),
+                antenna_qdb: self.antenna_qdb,
+                ceiling_qdbm: self.ceiling_qdbm,
+                peaks_qdbm: self.peaks_qdbm,
+            });
+        }
+        let record = self.channel(active).ok_or(Error::Policy)?;
+        record.current()?;
+        Ok(record.envelope())
+    }
+    fn channel(&self, primary: u8) -> Option<&channel::Channel> {
+        self.channels
+            .iter()
+            .find(|record| record.profile().primary() == primary)
+    }
+    /// Load the optional N52C record for one noninitial primary. `board` is
+    /// [`Board::new_noninitial`] for the same lifecycle; the base program
+    /// flags are applied here. Call after every other companion is loaded.
+    pub(super) fn load_channel(
+        &mut self,
+        profile: super::operating_channel::Profile,
+        board: Board,
+    ) -> Result<bool, Error> {
+        let board = board.with_programs(self.flags);
+        let record = channel::Channel::optional(self, profile, board)?;
+        self.channels
+            .retain(|existing| existing.profile() != profile);
+        let loaded = record.is_some();
+        if let Some(record) = record {
+            self.channels.push(record);
+        }
+        Ok(loaded)
+    }
+    /// Current signed admission of `profile` (channel1 is the base record).
+    pub(super) fn channel_allowed(
+        &self,
+        profile: super::operating_channel::Profile,
+    ) -> Result<bool, Error> {
+        self.current()?;
+        if profile == super::operating_channel::Profile::INITIAL {
+            return Ok(true);
+        }
+        match self.channel(profile.primary()) {
+            Some(record) => record.bound(self).map(|()| true),
+            None => Ok(false),
+        }
+    }
+    /// The signed noninitial record was measured for exactly this freshly
+    /// rebuilt identity (before program extension).
+    pub(super) fn channel_matches(
+        &self,
+        profile: super::operating_channel::Profile,
+        board: Board,
+    ) -> bool {
+        self.channel(profile.primary())
+            .is_some_and(|record| record.board() == board.with_programs(self.flags))
+    }
+    /// Switch the envelope gating every later publication to `profile`. The
+    /// native retune owner selects the target before its first emission on
+    /// the new primary, so the whole occupied span is under the current host
+    /// rule. No register access happens here.
+    pub(super) fn select(&self, profile: super::operating_channel::Profile) -> Result<(), Error> {
+        if profile != super::operating_channel::Profile::INITIAL {
+            self.channel(profile.primary())
+                .ok_or(Error::Policy)?
+                .bound(self)?;
+        }
+        let previous = self
+            .active
+            .swap(profile.primary(), core::sync::atomic::Ordering::AcqRel);
+        let result = self.current();
+        if result.is_err() {
+            self.active
+                .store(previous, core::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+    pub(super) fn active(&self) -> u8 {
+        self.active.load(core::sync::atomic::Ordering::Acquire)
+    }
     fn check(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(Error::Policy);
         }
+        let envelope = self.envelope()?;
+        let (low, high) = envelope.span;
         let mut ceiling = None;
         for rule in &domain.rules {
-            if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
+            if rule.freq_start_mhz >= high || rule.freq_end_mhz <= low {
                 continue;
             }
-            if rule.freq_start_mhz > 2402
-                || rule.freq_end_mhz < 2422
+            if rule.freq_start_mhz > low
+                || rule.freq_end_mhz < high
                 || rule.max_bandwidth_mhz < 20
                 || rule.flags.bits() & !narf_wireless::reg::RegFlags::NO_P2P.bits() != 0
             {
@@ -508,11 +661,11 @@ impl Qualification {
             let p = i16::from(rule.max_power_dbm) * 4;
             ceiling = Some(ceiling.map_or(p, |old: i16| old.min(p)));
         }
-        let ceiling = ceiling.ok_or(Error::Policy)?.min(self.ceiling_qdbm);
-        if self
+        let ceiling = ceiling.ok_or(Error::Policy)?.min(envelope.ceiling_qdbm);
+        if envelope
             .peaks_qdbm
             .iter()
-            .any(|p| i32::from(*p) + i32::from(self.antenna_qdb) > i32::from(ceiling))
+            .any(|p| i32::from(*p) + i32::from(envelope.antenna_qdb) > i32::from(ceiling))
         {
             return Err(Error::Policy);
         }
