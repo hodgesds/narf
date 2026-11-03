@@ -364,3 +364,37 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_rf_synth_tunes_wide_center_and_bandwidth_bits
 );
+/// rtw8851b_rfk.c `rtw8851b_set_channel_rf`: path A only (both RR_CFGCH
+/// words and RXBB LB), path B never touched.
+fn smoke_rtw89_n51_rf_channel_programs_path_a_only() -> TestResult {
+    let Some(profile) = Profile::new_5ghz(36, Width::Mhz80) else {
+        return TestResult::Fail("5GHz 80MHz profile refused");
+    };
+    let mut io = Model::new(0x5a, 0, 0);
+    let untouched = io.rf[1];
+    let mut owner = Channel::default();
+    // SAFETY: owned inert RF model only.
+    if ready(unsafe { owner.prepare_for_channel_51(&mut io, profile) }) != Some(Ok(()))
+        || owner.state() != State::SynthConfigured
+    {
+        return TestResult::Fail("RTL8851B RF channel failed on a ready model");
+    }
+    if io.rf[1] != untouched {
+        return TestResult::Fail("RTL8851B RF channel wrote RF path B");
+    }
+    let bw = (CFGCH_BW_80M << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW;
+    for a in [RR_CFGCH, RR_CFGCH_V1] {
+        let word = io.rf[0][Model::slot(a)];
+        if word & RR_CFGCH_CH != 42 || word & RR_CFGCH_BW != bw || word & RR_CFGCH_BW2 == 0 {
+            return TestResult::Fail("RTL8851B path-A RF word differs from _ch/_bw_setting");
+        }
+    }
+    if io.rf[0][Model::slot(RR_LUTWD0)] & RR_LUTWD0_LB != 0xb {
+        return TestResult::Fail("RTL8851B RXBB 80MHz LB differs from _set_rxbb_bw");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_n51_rf_channel_programs_path_a_only
+);

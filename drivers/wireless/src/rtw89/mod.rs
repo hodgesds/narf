@@ -59,6 +59,7 @@ pub mod btc;
 mod calibration_policy;
 pub mod chan;
 mod channel_bb;
+mod channel_51;
 mod channel_c;
 mod channel_rf;
 mod channel_transition;

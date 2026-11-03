@@ -205,6 +205,31 @@ impl Channel {
         io: &mut impl Interface,
         channel: Profile,
     ) -> Result<(), Error> {
+        // SAFETY: same contract; RTL8852B programs RF paths A and B.
+        unsafe { self.prepare_paths(io, channel, 2).await }
+    }
+    /// rtw8851b_rfk.c `rtw8851b_set_channel_rf`: the same `_ctrl_ch`
+    /// (`_set_s0_arfc18` + `_lck_check` on the path-A RR_CFGCH word),
+    /// `_ctrl_bw` and `_rxbb_bw` source order on RF path A only
+    /// (`RF_PATH_NUM_8851B` = 1, `_kpath` = RF_A).
+    ///
+    /// # Safety
+    /// Same as [`Self::prepare_for_channel`] on an actual RTL8851B with
+    /// completed RTL8851B RFK init.
+    pub async unsafe fn prepare_for_channel_51(
+        &mut self,
+        io: &mut impl Interface,
+        channel: Profile,
+    ) -> Result<(), Error> {
+        // SAFETY: forwarded; one RF path.
+        unsafe { self.prepare_paths(io, channel, 1).await }
+    }
+    async unsafe fn prepare_paths(
+        &mut self,
+        io: &mut impl Interface,
+        channel: Profile,
+        paths: u8,
+    ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
@@ -216,16 +241,16 @@ impl Channel {
         self.state = State::Preparing;
         let mut a = Access(io);
         for direct in [false, true] {
-            for p in 0..2 {
+            for p in 0..paths {
                 a.channel(p, direct, channel).await?;
             }
         }
         for direct in [false, true] {
-            for p in 0..2 {
+            for p in 0..paths {
                 a.bandwidth(p, direct, channel).await?;
             }
         }
-        for p in 0..2 {
+        for p in 0..paths {
             a.write(p, RR_LUTWE2, RR_LUTWE2_RTXBW, 1).await?;
             a.write(p, RR_LUTWA, RR_LUTWA_M2, 0x12).await?;
             a.write(p, RR_LUTWD0, RR_LUTWD0_LB, lb).await?;
@@ -245,7 +270,7 @@ impl Channel {
             | bw
             | RR_CFGCH_BW2;
         for direct in [false, true] {
-            for p in 0..2 {
+            for p in 0..paths {
                 if a.read(p, if direct { RR_CFGCH_V1 } else { RR_CFGCH }, RFREG_MASK)
                     .await?
                     & mask

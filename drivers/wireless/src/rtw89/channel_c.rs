@@ -62,7 +62,7 @@ const PCOEFF: [u32; 8] = [
 ];
 
 /// One BB/MAC field write: (absolute address, mask, value).
-type Field = (u32, u32, u32);
+pub(super) type Field = (u32, u32, u32);
 
 /// Inputs the C channel control consumes, all retained from completed owners.
 #[derive(Clone, Copy)]
@@ -75,7 +75,12 @@ pub(super) struct Inputs<'a> {
     pub offset_base: i8,
 }
 
-fn modify(io: &mut impl Io, address: u32, mask: u32, value: u32) -> Result<(), power::Error> {
+pub(super) fn modify(
+    io: &mut impl Io,
+    address: u32,
+    mask: u32,
+    value: u32,
+) -> Result<(), power::Error> {
     let old = io.read32(address)?;
     if old == u32::MAX {
         return Err(power::Error::Gone);
@@ -85,7 +90,7 @@ fn modify(io: &mut impl Io, address: u32, mask: u32, value: u32) -> Result<(), p
         (old & !mask) | ((value << mask.trailing_zeros()) & mask),
     )
 }
-fn apply(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
+pub(super) fn apply(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
     for &(address, mask, value) in fields {
         modify(io, address, mask, value)?;
     }
@@ -94,7 +99,7 @@ fn apply(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
 /// Read back the final state of every written bit: the fields are folded in
 /// order per address (later and overlapping writes win, as on hardware) and
 /// each address is read once.
-fn verify(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
+pub(super) fn verify(io: &mut impl Io, fields: &[Field]) -> Result<(), power::Error> {
     let mut known: alloc::vec::Vec<(u32, u32, u32)> = alloc::vec::Vec::new();
     for &(address, mask, value) in fields {
         let bits = (value << mask.trailing_zeros()) & mask;
@@ -271,7 +276,7 @@ pub(super) fn spur_freq(profile: Profile) -> u32 {
 }
 
 /// util.h `s32_div_u32_round_down`: (floor quotient, non-negative remainder).
-fn div_round_down(dividend: i32, divisor: i32) -> (i32, i32) {
+pub(super) fn div_round_down(dividend: i32, divisor: i32) -> (i32, i32) {
     let (mut q, mut r) = (dividend / divisor, dividend % divisor);
     if r < 0 {
         q -= 1;
@@ -280,11 +285,11 @@ fn div_round_down(dividend: i32, divisor: i32) -> (i32, i32) {
     (q, r)
 }
 /// util.h `s32_div_u32_round_closest`.
-fn div_round_closest(dividend: i32, divisor: i32) -> i32 {
+pub(super) fn div_round_closest(dividend: i32, divisor: i32) -> i32 {
     div_round_down(dividend + divisor / 2, divisor).0
 }
 /// Linux `(spur_freq - fc) * 1000000` in u32 assigned to s32.
-fn freq_diff(spur: u32, fc: u32) -> i32 {
+pub(super) fn freq_diff(spur: u32, fc: u32) -> i32 {
     spur.wrapping_sub(fc).wrapping_mul(1_000_000) as i32
 }
 

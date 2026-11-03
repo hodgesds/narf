@@ -3944,10 +3944,36 @@ are textually identical to rtw8852b_common.c / rtw8852b_rfk.c, and
 the B constructors, so the RTL8851B channel program reuses
 `operating_channel::Profile` (160MHz stays refused by the B constructors).
 
-**Remaining for the row.** Channel MAC/BB/RF programming
-(`rtw8851b_set_channel_{mac,bb,rf}`, `rtw8851b_ctrl_bw` with `adc_td`),
-RFK (`rtw8851b_rfk_init` LCK/AACK/RCK/DACK/RX DCK; channel RX DCK/IQK/TSSI/
-DPK), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+**Channel programming (`channel_51`, `channel_rf`).** `channel_51::program`
+is `rtw8851b_set_channel_mac(MAC_0)` (RFMOD 0/1/2, `rtw89_phy_get_txsc`
+sub-carrier word, TXRATE_CHK BAND_MODE on 2.4GHz or CHECK_CCK_EN |
+RTS_LIMIT_IN_OFDM6 on 5GHz) followed by the whole
+`rtw8851b_set_channel_bb(chan, PHY_0)`: `rtw8851b_ctrl_sco_cck`,
+`rtw8851b_ctrl_ch` (path-A band select, `rtw8851b_sco_mapping` FC0, the CCK
+TXFIR literals, `rtw8851b_set_gain_error` path-A LNA/TIA only,
+`rtw8851b_set_gain_offset` with the `comp[subband]` R_P0_AGC_RSVD write,
+R_PATH0_G_TIA1 offset, R_P0_RPL1 bias from `offset_base`, R_P1_RPL1 bias
+from `rssi_base` and the 2.4GHz CCK RPL offset, then
+`rtw8851b_set_rxsc_rpl_comp` from path-A RPL values into both P0/P1
+words), `rtw8851b_ctrl_bw` (FC0 BW_SET, CHBW SBW/PRICH, 40MHz R_RXSC) with
+`rtw8851b_bw_setting` (`adc_td` 0x11 -> 5, 0x9 -> 3, else 4, then the
+CFCH/DCIM/WDADC/ADDCK/RXCK fields), `rtw8851b_ctrl_cck_en`, the 5280/5760MHz
+`rtw8851b_set_nbi_tone_idx` (notch 0x46e4/0x47a4) and
+`rtw8851b_set_csi_tone_idx`, the 5GHz path-0 BT-share release,
+`B_CH_IDX_SEG0`, `rtw8851b_5m_mask` (path 0, threshold 5),
+`rtw8851b_set_cfr` (channel 1/13 20MHz edge values) and the S0-only
+`rtw8851b_bb_reset_all`; every final bit is read back and 160MHz is
+refused before any write. `channel_rf::Channel::prepare_for_channel_51` is
+rtw8851b_rfk.c `rtw8851b_set_channel_rf` (`_ctrl_ch` with
+`_set_s0_arfc18`/`_lck_check`, `_ctrl_bw`, `_rxbb_bw`) on RF path A only
+through the same B synth source order (`prepare_for_channel` keeps two
+paths; B bytes unchanged). Unexecuted cases:
+`smoke_rtw89_n51_channel_mac_ctrl_ch_and_bw_follow_rtw8851b`,
+`smoke_rtw89_n51_set_channel_bb_tail_follows_rtw8851b`,
+`smoke_rtw89_n51_rf_channel_programs_path_a_only`.
+
+**Remaining for the row.** RFK (`rtw8851b_rfk_init` LCK/AACK/RCK/DACK/RX
+DCK; channel RX DCK/IQK/TSSI/DPK), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)
