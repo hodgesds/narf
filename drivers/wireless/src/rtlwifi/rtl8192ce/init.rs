@@ -67,6 +67,9 @@ pub struct Radio {
     pub chnlval: [u32; 2],
     pub iqk: iqk::Report,
     pub efuse_0x1fa: u8,
+    /// `rtlpci->receive_config` after the `rtl92c_phy_mac_config` trim
+    /// (`HW_VAR_RCR` get/set read and update this cache).
+    pub receive_config: u32,
 }
 
 /// The `rtl92ce_hw_init` steps after the firmware download, for one
@@ -78,7 +81,7 @@ pub async fn configure(io: &impl Io, adapter: &Adapter) -> Result<Radio, Error> 
     }
     let version = adapter.version;
     let power = Efuse::from_hwinfo(&adapter.hwinfo)?;
-    let (report, chnlval) = phy::configure(io, version).await?;
+    let (report, chnlval, receive_config) = phy::configure(io, version).await?;
     super::mac::hw_configure(io)?;
     io.write32(REG_CAMCMD, (1 << 31) | (1 << 30))?;
     super::mac::station_identity(io, &adapter.mac)?;
@@ -105,5 +108,6 @@ pub async fn configure(io: &impl Io, adapter: &Adapter) -> Result<Radio, Error> 
         chnlval,
         iqk,
         efuse_0x1fa: flags,
+        receive_config,
     })
 }

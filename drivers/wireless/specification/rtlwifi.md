@@ -2758,6 +2758,34 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   `rtl92ce_interrupt_recognized` (HISR `0x124` under mask, W1C). Probe's
   `pci::bring_up` now masks through `irq::disable_interrupts_for(did)`
   (`irq::imr_pair`: `0x120/0x128` for the CE IDs, `0xb0/0xb8` otherwise).
+- `envelope` — signed per-board `N92C` power envelope
+  (`rtlwifi/rtl8192ce-cal-v1-<mac>.bin`; `rtl8192ce/envelope.rs`). Same
+  96-byte header shape as `N92E` with its own magic, the probed
+  `rtl92ce_pci_ids` device and an RF-type byte (1 = `RF_1T1R`, 2 =
+  `RF_2T2R`, must equal the measured chip version) in place of the zero
+  pad; rows in the `N92E` 2.4 GHz 20/40 MHz plan carry per family (CCK,
+  OFDM, MCS0-7, and MCS8-15 on 2T2R only) path A (and path B on 2T2R
+  only) 64-entry measured curves — 3 per row for 1T1R, 8 for 2T2R. The
+  upper bound is `txpower::linux_indices` (the exact bytes
+  `rtl92c_phy_set_txpower_level` would write at the wide channel/width,
+  incl. Linux's `0xff00ffff` mask zeroing path A CCK 11M). Admission per
+  transmitting path: highest measured index not above the Linux byte whose
+  output + antenna gain (+ the 13 qdBm two-chain bound on 2T2R only) fits
+  the whole-span ceiling (`rtl8192ee::envelope::span_ceiling`, capped by
+  the qualified EIRP); every CCK/OFDM rate must be admitted; the admitted
+  set is CCK/OFDM/MCS0-7 (1T1R) or up to MCS0-15 (2T2R). 1T1R path B
+  TXAGC bytes are written 0. Format only: no board values are supplied.
+  `channel::configure_admitted` / `txpower::set_indices` program the
+  admitted indices in Linux's register order (the `0xc90`/`0xc98` tail
+  follows the written MCS15 / MCS7 byte), then `sw_chnl_rf` and
+  `set_bw_mode`. `Prepared::configure_rtl8192ce_channel(Permission)`
+  (RadioConfigured/ChannelConfigured → ChannelConfigured;
+  MacConfigured/Running retune keeps the phase) checks identity and RF
+  type; `configure_rtl8192ce_mac` (ChannelConfigured → MacConfigured)
+  requires the same identity on owner and permission. `init::Radio`
+  retains `receive_config` (the `rtl92c_phy_mac_config` RCR trim) for
+  `HW_VAR_RCR`. Test (written, unexecuted):
+  `smoke_rtl8192ce_n92c_envelope_permission_and_admission`.
 - `packet owner` — `rtl8192ce/packet_owner.rs`, mounted as
   `prepare::packet::ce92` and dispatched from `packet.rs` for
   `Chip::Rtl8192ce` (start, submit, receive, IRQ enable/disable/recognize,

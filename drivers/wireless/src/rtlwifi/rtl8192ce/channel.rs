@@ -82,3 +82,22 @@ pub async fn configure(
     phy::sw_chnl_rf(io, version, op.wide, op.bw40, chnlval).await?;
     phy::set_bw_mode(io, op.bw40, op.prime_sc, chnlval).await
 }
+
+/// [`configure`] for an admitted envelope operating point: the
+/// `rtl92c_phy_sw_chnl` step at the wide channel with the permission's
+/// per-path TXAGC indices ([`txpower::set_indices`]) in place of the Linux
+/// bytes, then `set_bw_mode`.
+pub async fn configure_admitted(
+    io: &impl Io,
+    version: Version,
+    permission: &super::envelope::Permission,
+    chnlval: &mut [u32; 2],
+) -> Result<(), Error> {
+    if permission.rf_type() != version.rf_type() {
+        return Err(Error::State);
+    }
+    let op = super::envelope::channel_of(permission.operating()).ok_or(Error::State)?;
+    txpower::set_indices(io, version.rf_type(), permission.indices())?;
+    phy::sw_chnl_rf(io, version, op.wide, op.bw40, chnlval).await?;
+    phy::set_bw_mode(io, op.bw40, op.prime_sc, chnlval).await
+}

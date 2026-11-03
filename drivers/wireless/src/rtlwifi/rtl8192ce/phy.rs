@@ -456,12 +456,12 @@ pub async fn umc_fixups(io: &impl Io, version: Version) -> Result<(), Error> {
 
 /// `rtl92ce_hw_init` from `rtl92c_phy_mac_config` through the CCK/OFDM
 /// enable and `RFPGA0_ANALOGPARAMETER2[10]` writes. `receive_config` is the
-/// trimmed RCR (`mac::trim_receive_config`). Returns the report and
+/// trimmed RCR (`mac::trim_receive_config`). Returns the report,
 /// `rtlphy->rfreg_chnlval` (read from both paths, also on an 88C part, as
-/// Linux).
-pub async fn configure(io: &impl Io, version: Version) -> Result<(Report, [u32; 2]), Error> {
+/// Linux) and `rtlpci->receive_config`.
+pub async fn configure(io: &impl Io, version: Version) -> Result<(Report, [u32; 2], u32), Error> {
     mac_config(io, version)?;
-    super::mac::trim_receive_config(io)?;
+    let receive_config = super::mac::trim_receive_config(io)?;
     let report = bb_config(io, version).await?;
     rf_config(io, version).await?;
     umc_fixups(io, version).await?;
@@ -472,7 +472,7 @@ pub async fn configure(io: &impl Io, version: Version) -> Result<(Report, [u32; 
     set_bb(io, RFPGA0_RFMOD, BCCKEN, 0x1)?;
     set_bb(io, RFPGA0_RFMOD, BOFDMEN, 0x1)?;
     set_bb(io, RFPGA0_ANALOGPARAMETER2, 1 << 10, 1)?;
-    Ok((report, chnlval))
+    Ok((report, chnlval, receive_config))
 }
 
 // ── Bandwidth / channel ──────────────────────────────────────────────────

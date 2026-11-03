@@ -167,6 +167,8 @@ pub struct Prepared<I: Io, M: Memory> {
     /// RTL8192CE / RTL8188CE factory identity and configured radio
     /// (`rtl8192ce/init.rs`).
     rtl8192ce: Option<alloc::boxed::Box<([u8; 32], super::rtl8192ce::init::Radio)>>,
+    /// Admitted `N92C` operating point (`rtl8192ce/envelope.rs`).
+    rtl8192ce_power: Option<super::rtl8192ce::envelope::Permission>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -273,6 +275,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8192ee: None,
             rtl8192ee_power: None,
             rtl8192ce: None,
+            rtl8192ce_power: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),

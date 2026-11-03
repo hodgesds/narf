@@ -437,7 +437,7 @@ impl Calibration {
 /// overlapping rule to cover the full span, allow 40 MHz and carry no flag
 /// (DFS / NO_IR / indoor refused), capped by `regd.c` `RTL819x_2GHZ_CH01_11`
 /// (2402-2472 MHz, 20 dBm).
-fn span_ceiling(
+pub(crate) fn span_ceiling(
     domain: &narf_wireless::reg::RegulatoryDomain,
     op: Operating,
 ) -> Result<i16, Error> {

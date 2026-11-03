@@ -211,8 +211,8 @@ fn clamp_bytes(v: u32) -> u32 {
     u32::from_le_bytes(b)
 }
 
-/// `rtl92ce_phy_rf6052_set_cck_txpower` (`scanning` = `mac->act_scanning`).
-pub fn set_cck(io: &impl Io, efuse: &Efuse, level: [u8; 2], scanning: bool) -> Result<(), Error> {
+/// The clamped `tx_agc[path]` words of `rtl92ce_phy_rf6052_set_cck_txpower`.
+fn cck_agc(efuse: &Efuse, level: [u8; 2], scanning: bool) -> [u32; 2] {
     let mut agc = [0u32; 2];
     if scanning {
         agc = [0x3f3f_3f3f; 2];
@@ -230,7 +230,12 @@ pub fn set_cck(io: &impl Io, efuse: &Efuse, level: [u8; 2], scanning: bool) -> R
             agc[1] = agc[1].wrapping_add(MCS_OFFSET[0][14].wrapping_add(MCS_OFFSET[0][15] << 24));
         }
     }
-    let agc = agc.map(clamp_bytes);
+    agc.map(clamp_bytes)
+}
+
+/// `rtl92ce_phy_rf6052_set_cck_txpower` (`scanning` = `mac->act_scanning`).
+pub fn set_cck(io: &impl Io, efuse: &Efuse, level: [u8; 2], scanning: bool) -> Result<(), Error> {
+    let agc = cck_agc(efuse, level, scanning);
     set_bb(io, phy::RTXAGC_A_CCK1_MCS32, 0xff00, agc[0] & 0xff)?;
     set_bb(
         io,
@@ -338,6 +343,11 @@ const REG_B: [u16; 6] = [
     phy::RTXAGC_B_MCS15_MCS12,
 ];
 
+/// `_rtl92c_write_ofdm_power_reg`'s per-byte `0x7f` mask and clamp.
+fn ofdm_bytes(v: u32) -> [u8; 4] {
+    core::array::from_fn(|i| (((v & (0x7f << (i * 8))) >> (i * 8)) as u8).min(MAX_TX_PWR))
+}
+
 /// `_rtl92c_write_ofdm_power_reg`.
 pub fn write_ofdm(
     io: &impl Io,
@@ -346,27 +356,36 @@ pub fn write_ofdm(
     value: [u32; 2],
 ) -> Result<(), Error> {
     for (rf, v) in value.into_iter().enumerate() {
-        let mut pwr = [0u8; 4];
-        for (i, p) in pwr.iter_mut().enumerate() {
-            *p = (((v & (0x7f << (i * 8))) >> (i * 8)) as u8).min(MAX_TX_PWR);
+        write_ofdm_bytes(io, rf_type, index, rf, ofdm_bytes(v))?;
+    }
+    Ok(())
+}
+
+/// One path's `_rtl92c_write_ofdm_power_reg` dword and, after the RF
+/// type's last MCS register, the three `-6` tail bytes.
+fn write_ofdm_bytes(
+    io: &impl Io,
+    rf_type: RfType,
+    index: usize,
+    rf: usize,
+    pwr: [u8; 4],
+) -> Result<(), Error> {
+    let regoffset = if rf == 0 { REG_A[index] } else { REG_B[index] };
+    set_bb(io, regoffset, MASKDWORD, u32::from_le_bytes(pwr))?;
+    let tail = match rf_type {
+        RfType::T2R2 => {
+            regoffset == phy::RTXAGC_A_MCS15_MCS12 || regoffset == phy::RTXAGC_B_MCS15_MCS12
         }
-        let regoffset = if rf == 0 { REG_A[index] } else { REG_B[index] };
-        set_bb(io, regoffset, MASKDWORD, u32::from_le_bytes(pwr))?;
-        let tail = match rf_type {
-            RfType::T2R2 => {
-                regoffset == phy::RTXAGC_A_MCS15_MCS12 || regoffset == phy::RTXAGC_B_MCS15_MCS12
-            }
-            RfType::T1R1 => {
-                regoffset == phy::RTXAGC_A_MCS07_MCS04 || regoffset == phy::RTXAGC_B_MCS07_MCS04
-            }
-        };
-        if tail {
-            let base = if rf == 0 { 0x0c90 } else { 0x0c98 };
-            let mut w = pwr[3];
-            for i in 0..3 {
-                w = w.saturating_sub(6);
-                io.write8(base + i, w)?;
-            }
+        RfType::T1R1 => {
+            regoffset == phy::RTXAGC_A_MCS07_MCS04 || regoffset == phy::RTXAGC_B_MCS07_MCS04
+        }
+    };
+    if tail {
+        let base = if rf == 0 { 0x0c90 } else { 0x0c98 };
+        let mut w = pwr[3];
+        for i in 0..3 {
+            w = w.saturating_sub(6);
+            io.write8(base + i, w)?;
         }
     }
     Ok(())
@@ -411,4 +430,81 @@ pub fn set_level(
     };
     set_cck(io, efuse, cck, scanning)?;
     set_ofdm(io, efuse, rf_type, pwrgroup_cnt, ofdm, channel, bw40)
+}
+
+/// Station rates in full order: CCK 0..=3, OFDM 4..=11, MCS0-15 12..=27.
+pub const RATES: usize = 28;
+
+/// The station rates of `rf_type` (full order): CCK, OFDM and MCS0-7 on
+/// `RF_1T1R`, plus MCS8-15 on `RF_2T2R`.
+pub fn rates(rf_type: RfType) -> core::ops::Range<u8> {
+    match rf_type {
+        RfType::T1R1 => 0..20,
+        RfType::T2R2 => 0..28,
+    }
+}
+
+/// The per-path, per-rate TXAGC bytes `rtl92c_phy_set_txpower_level` writes
+/// on the station path (`act_scanning` false) at the wide `channel` and
+/// width: `[path][full-order rate]`. Path A CCK 11M is 0 because
+/// `rtl92ce_phy_rf6052_set_cck_txpower` masks its byte with `0xff00ffff`.
+/// The upper bound the per-board envelope lowers (`rtl8192ce/envelope.rs`).
+pub fn linux_indices(
+    efuse: &Efuse,
+    rf_type: RfType,
+    pwrgroup_cnt: u8,
+    channel: u8,
+    bw40: bool,
+) -> Result<[[u8; RATES]; 2], Error> {
+    if !(1..=14).contains(&channel) {
+        return Err(Error::State);
+    }
+    let c = usize::from(channel - 1);
+    let cck = cck_agc(efuse, [efuse.cck[0][c], efuse.cck[1][c]], false);
+    let level = match rf_type {
+        RfType::T1R1 => [efuse.ht40_1s[0][c], efuse.ht40_1s[1][c]],
+        RfType::T2R2 => [efuse.ht40_2s[0][c], efuse.ht40_2s[1][c]],
+    };
+    let mut out = [[0u8; RATES]; 2];
+    let a = cck[0].to_le_bytes();
+    out[0][..4].copy_from_slice(&[a[0], a[1], a[2], 0]);
+    out[1][..4].copy_from_slice(&cck[1].to_le_bytes());
+    let base = power_base(efuse, level, channel, bw40);
+    for index in 0..6 {
+        let v = writeval(efuse, pwrgroup_cnt, channel, bw40, index, base);
+        for (rf, word) in v.into_iter().enumerate() {
+            let at = 4 + index * 4;
+            out[rf][at..at + 4].copy_from_slice(&ofdm_bytes(word));
+        }
+    }
+    Ok(out)
+}
+
+/// `rtl92c_phy_set_txpower_level`'s registers and write order with the
+/// envelope-admitted per-path indices instead of the Linux bytes (each
+/// clamped to `RF6052_MAX_TX_PWR`; unadmitted rates are written 0). The
+/// `0xc90`/`0xc98` tail follows the written MCS15 (2T2R) / MCS7 (1T1R) byte.
+pub fn set_indices(io: &impl Io, rf_type: RfType, indices: &[[u8; RATES]; 2]) -> Result<(), Error> {
+    let p = |path: usize, rate: usize| u32::from(indices[path][rate].min(MAX_TX_PWR));
+    set_bb(io, phy::RTXAGC_A_CCK1_MCS32, 0xff00, p(0, 0))?;
+    set_bb(
+        io,
+        phy::RTXAGC_B_CCK11_A_CCK2_11,
+        0xffff_ff00,
+        p(0, 1) | p(0, 2) << 8 | p(0, 3) << 16,
+    )?;
+    set_bb(io, phy::RTXAGC_B_CCK11_A_CCK2_11, 0xff, p(1, 3))?;
+    set_bb(
+        io,
+        phy::RTXAGC_B_CCK1_55_MCS32,
+        0xffff_ff00,
+        p(1, 0) | p(1, 1) << 8 | p(1, 2) << 16,
+    )?;
+    for index in 0..6 {
+        for rf in 0..2 {
+            let pwr = core::array::from_fn(|i| p(rf, 4 + index * 4 + i) as u8);
+            write_ofdm_bytes(io, rf_type, index, rf, pwr)?;
+        }
+    }
+    Ok(())
 }

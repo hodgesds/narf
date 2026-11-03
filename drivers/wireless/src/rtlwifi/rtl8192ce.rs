@@ -55,6 +55,7 @@
 
 pub mod adapter;
 pub mod channel;
+pub mod envelope;
 pub mod fw;
 pub mod h2c;
 pub mod init;
