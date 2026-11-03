@@ -1151,9 +1151,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Poll::Ready(Err(BootError::Poisoned));
         }
         self.awake()?;
-        if now >= self.deadline {
-            return Poll::Ready(Err(BootError::Timeout));
+        // xe_mmio_wait32 and guc_wait_ucode's poll_timeout_us: the GDRST,
+        // DMA_CTRL and GUC_STATUS reads below precede the deadline. A late
+        // poll that finds the awaited state progresses; only a still
+        // unsatisfied wait fails. Every transition re-arms the deadline.
+        match self.advance(now) {
+            Poll::Pending if now >= self.deadline => Poll::Ready(Err(BootError::Timeout)),
+            result => result,
         }
+    }
+
+    fn advance(&mut self, now: u64) -> Poll<Result<BootState, BootError>> {
         match self.state {
             BootState::Resetting | BootState::Stopping => {
                 let reset = self.mmio.read32(GDRST);
@@ -2413,6 +2421,42 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_boot",
         smoke_boot_failure_and_stop_proof
+    );
+
+    fn smoke_boot_late_polls_observe_completed_reset_dma_and_auth() -> TestResult {
+        // xe_mmio_wait32's final read: each of GuC reset (5 ms), firmware
+        // DMA (100 ms), authentication (10 s) and the stop proof (5 ms)
+        // completes before a poll delayed past its bound. Each is success.
+        let (window, arena) = model();
+        let mut boot = stage(window.clone(), arena.clone(), GtPlatform::Alchemist);
+        boot.begin(0).unwrap();
+        reset_done(&window);
+        let mut now = 5_000_000 + 1;
+        assert!(boot.poll(now).is_pending());
+        assert_eq!(boot.state(), BootState::Dma);
+        window.0.borrow_mut().regs.insert(0xc314, 0x10);
+        now += 100_000_000 + 1;
+        assert!(boot.poll(now).is_pending());
+        assert_eq!(boot.state(), BootState::Authenticating);
+        window.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+        now += 10_000_000_000 + 1;
+        assert_eq!(boot.poll(now), Poll::Ready(Ok(BootState::Ready)));
+        now += 1;
+        boot.begin_stop(now).unwrap();
+        reset_done(&window);
+        assert_eq!(
+            boot.poll(now + 5_000_000 + 1),
+            Poll::Ready(Ok(BootState::Stopped))
+        );
+        drop(boot);
+        if arena.live_allocations() != 0 {
+            return TestResult::Fail("late stop proof retained firmware resources");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_boot_late_polls_observe_completed_reset_dma_and_auth
     );
 
     fn smoke_boot_prepublication_and_allocation_rollback() -> TestResult {

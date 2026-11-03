@@ -170,12 +170,15 @@ impl<M: MmioWindow> Mailbox<M> {
             self.deadline = None;
             return Poll::Ready(Err(TransportError::Unavailable));
         }
-        if now >= deadline {
-            self.poisoned = true;
-            self.deadline = None;
-            return Poll::Ready(Err(TransportError::Timeout));
-        }
         if header & (1 << 31) == 0 || (header >> 28) & 7 == 3 {
+            // xe_guc_mmio_send_recv's xe_mmio_wait32 reads the reply once
+            // more after its deadline: a reply already posted when a late
+            // poll arrives is consumed, not reported as a timeout.
+            if now >= deadline {
+                self.poisoned = true;
+                self.deadline = None;
+                return Poll::Ready(Err(TransportError::Timeout));
+            }
             return Poll::Pending;
         }
         fence(Ordering::Acquire);
@@ -734,6 +737,43 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_transport",
         smoke_transport_timeout_quarantines
+    );
+
+    fn smoke_transport_late_poll_consumes_posted_reply() -> TestResult {
+        // xe_guc_mmio_send_recv: xe_mmio_wait32 reads the reply register
+        // once more after its 50 ms bound. A reply already posted when a
+        // poll arrives past the 10 ms bound completes the request.
+        let (model, arena) = Model::new();
+        let mut transport = model.allocate(arena);
+        model.ready();
+        transport.begin_enable(0).unwrap();
+        model.reply(0xf000_0001);
+        if transport.poll_transition(10_000_005).is_ready() {
+            return TestResult::Fail("late poll discarded an already posted reply");
+        }
+        for i in 1..6 {
+            model.reply(0xf000_0001);
+            assert!(transport.poll_transition(10_000_005 + i).is_pending());
+        }
+        model.reply(0xf000_0000);
+        if transport.poll_transition(30_000_000) != Poll::Ready(Ok(TransportState::Enabled)) {
+            return TestResult::Fail("late CONTROL_CTB reply not consumed");
+        }
+        transport.begin_disable(30_000_001).unwrap();
+        model.reply(0xf000_0000);
+        assert_eq!(
+            transport.poll_transition(30_000_002),
+            Poll::Ready(Ok(TransportState::Disabled))
+        );
+        transport.release().unwrap();
+        if model.live.get() != 0 {
+            return TestResult::Fail("disabled CT memory leaked");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_transport",
+        smoke_transport_late_poll_consumes_posted_reply
     );
 
     fn smoke_transport_rejected_key_and_retry_bound() -> TestResult {
