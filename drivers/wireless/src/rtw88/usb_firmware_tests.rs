@@ -522,3 +522,35 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_power_tracking_preconditions
 );
+
+/// USB LPS PS H2C (`ps_mailbox_submit` over EP0 HMEBOX): refused before
+/// packets run and, once the owner is open, without the signed station
+/// gate; neither refusal writes HMEBOX_EXT/HMEBOX nor leaves the mailbox
+/// pending, and the scope is never entered.
+fn smoke_rtw88_usb_lps_mailbox_preconditions() -> TestResult {
+    let fake = Fake::default();
+    let mut b = backend(&fake);
+    let mut entered = false;
+    let mut scope = |_: &mut dyn FnMut() -> Result<bool, Error>| {
+        entered = true;
+        Ok(true)
+    };
+    if complete(b.ps_mailbox_submit([0x20, 1, 0, 0, 0, 0, 0, 0], &mut scope)) != Err(Error::State) {
+        return TestResult::Fail("PS H2C before packets");
+    }
+    if b.opened_for_test([0x02, 0, 0, 0, 0, 1]).is_err() {
+        return TestResult::Fail("fixture");
+    }
+    fake.0.lock().writes.clear();
+    if complete(b.ps_mailbox_submit([0x20, 1, 0, 0, 0, 0, 0, 0], &mut scope)).is_ok() {
+        return TestResult::Fail("PS H2C without the station gate");
+    }
+    if entered || b.mailbox_pending() || !fake.0.lock().writes.is_empty() {
+        return TestResult::Fail("refused PS H2C touched the mailbox");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_lps_mailbox_preconditions
+);

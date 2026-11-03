@@ -3540,8 +3540,31 @@ Former blockers, verified against the tree:
    (that would be EP0 I/O in a synchronous call); the W phase in
    `Gate::current` and the readbacks at bind/begin/finish and in
    `station_profile_readback` stand in for it. Written, unexecuted:
-   `smoke_rtw88_usb_power_tracking_preconditions`. Still `Unsupported` on
-   USB: `station_ps_rx_quiet` (LPS page).
+   `smoke_rtw88_usb_power_tracking_preconditions`. Nondeep LPS (landed;
+   `ps.c::rtw_enter_lps_core`/`rtw_leave_lps_core` as on PCI):
+   `runtime_lps::lps_usb(slot_id, ms)` / `lps_request_usb` are
+   `lps_function`/`lps_request_function` keyed by the claimed USB slot
+   (`usb_driver::station`), running the unchanged generic
+   `Owner::lps_window`. The USB backend supplies `station_reserved_page`
+   as a bulk BEACON-queue uploader (`fw.c::rtw_fw_write_data_rsvd_page`
+   over `usb.c::rtw_usb_write_data_rsvd_page`, `usb::reserved_page_packet`;
+   no BCNQ_DL toggle, no beacon descriptor ring), instead of
+   `runtime_ps_page.rs`'s PCI-DMA shape: the same 464-byte source page at
+   the station boundary (460), an RX-quiet proof (open idle owner, no
+   retune/W continuation/H2C/mailbox, no RX backlog, `transmit_quiet`),
+   BCN_FUNCTION off and the boundary unchanged, then poison, BCN_VALID
+   clear, ENSWBCN, the bulk page, a fresh BCN_VALID (1000 x 10 us) and the
+   REG_FIFOPAGE_CTRL_2/BCN_CTRL/CR+1 restore with readback; every EP0 step
+   and the bulk submission run inside the original PS source and station
+   admission (`firmware_transport::enclosed`). `ps_mailbox_submit` stages
+   HMEBOX_EXT and re-reads HMETFR over EP0, then inside the PS scope runs
+   the host-side quiet and gate checks and begins the publishing HMEBOX EP0
+   write in its first poll (PCI re-reads HMETFR inside the scope; on USB
+   that read is the EP0 step just before it). `Unissued` leaves the mailbox
+   free; a begun low word that fails is terminal. Written, unexecuted:
+   `smoke_rtw88_usb_lps_mailbox_preconditions`. No RTL8821CU LPS (N2xZ)
+   record exists; an unprovisioned station returns `Unsupported` from
+   `station_continuation` and never sleeps.
    Written, unexecuted: `smoke_rtw88_usb_station_retune_preconditions`. Written, unexecuted:
    `smoke_rtw88_usb_firmware_reserved_page_sequence`,
    `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`,
@@ -3554,7 +3577,7 @@ Former blockers, verified against the tree:
    `Factory8821c::on_usb` (MAC at 0x107). Each poll is an EP0 transfer, so
    nothing spins; the PCI `EfuseIo` path is unchanged. Written, unexecuted:
    `smoke_rtw88_usb_efuse_factory_async`.
-   Remaining: the LPS page quiet proof (above).
+   Remaining: none in the transport (above).
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,

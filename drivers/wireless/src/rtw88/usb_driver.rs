@@ -143,6 +143,15 @@ fn unbind(slot_id: u8) -> Result<(), ()> {
     Ok(())
 }
 
+/// The published RTL8821CU station shell claimed on USB `slot_id`.
+pub(super) fn station(slot_id: u8) -> Option<Arc<Station>> {
+    BOUND
+        .lock()
+        .iter()
+        .find(|b| b.device.slot_id() == slot_id)
+        .and_then(|b| b.station.clone())
+}
+
 fn current(device: &Arc<USBDevice>) -> bool {
     BOUND.lock().iter().any(|b| Arc::ptr_eq(&b.device, device))
 }

@@ -76,6 +76,44 @@ pub async fn lps_function(address: BusAddr, milliseconds: u32) -> Result<(), Err
         .await
 }
 
+/// [`lps_request_function`] for the RTL8821CU claimed on USB `slot_id`.
+pub async fn lps_request_usb(slot_id: u8) -> Result<crate::rtw88::ContinuationRequest, Error> {
+    let station = crate::rtw88::usb_driver::station(slot_id).ok_or(Error::Generation)?;
+    let mut retained = station.lifecycle.retained.lock().await;
+    let owner = retained.as_mut().ok_or(Error::Busy)?;
+    owner.lps_request().map_err(Error::Native)
+}
+/// [`lps_function`] for the RTL8821CU claimed on USB `slot_id`: the same
+/// bounded nondeep LPS window over the USB backend (station TXBUF upload on
+/// the bulk BEACON queue, PS H2C through EP0 HMEBOX). The claimed function
+/// and the UP interface must stay the same across the whole window.
+pub async fn lps_usb(slot_id: u8, milliseconds: u32) -> Result<(), Error> {
+    if !(1..=100).contains(&milliseconds) {
+        return Err(Error::Unsupported);
+    }
+    let station = crate::rtw88::usb_driver::station(slot_id).ok_or(Error::Generation)?;
+    let snapshot = narf_net::iface::lookup(station.name()).ok_or(Error::Generation)?;
+    if snapshot.mac != station.mac() {
+        return Err(Error::Generation);
+    }
+    let up = narf_net::iface::OpenStopEvent::observe(&snapshot)
+        .filter(|e| e.up())
+        .ok_or(Error::Generation)?;
+    let host = up.native_identity().ok_or(Error::Generation)?;
+    let mut retained = station.lifecycle.retained.lock().await;
+    if !up.current()
+        || !crate::rtw88::usb_driver::station(slot_id)
+            .is_some_and(|current| alloc::sync::Arc::ptr_eq(&current, &station))
+    {
+        return Err(Error::Generation);
+    }
+    retained
+        .as_mut()
+        .ok_or(Error::Busy)?
+        .lps_window(host, milliseconds)
+        .await
+}
+
 type Peer = ([u8; 6], [u8; 6], u16);
 
 /// One PS H2C under the exact original source, Linux fw.c

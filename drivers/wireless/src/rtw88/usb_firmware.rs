@@ -445,6 +445,137 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
         }
         self.transmit_quiet().await
     }
+    /// `pci_firmware.rs::station_ps_rx_quiet` over EP0: an open, idle
+    /// station (no retune, power-tracking continuation, H2C or mailbox
+    /// command) with no undelivered RX backlog and [`Self::transmit_quiet`].
+    async fn ps_rx_quiet(&mut self) -> Result<bool, Error> {
+        if self.state != State::Packets
+            || !self.opened()
+            || self.retune.is_some()
+            || self.tracking
+            || self.mailbox_pending
+        {
+            return Ok(false);
+        }
+        self.transmit_quiet().await
+    }
+    /// Host-side LPS publication checks run inside the original PS source
+    /// immediately before the publishing EP0 write: open, idle owner, no
+    /// RX backlog, no outstanding H2C and the current signed gate.
+    fn ps_publish_allowed(&self) -> Result<bool, Error> {
+        if self.state != State::Packets
+            || !self.opened()
+            || self.outstanding.is_some()
+            || self.retune.is_some()
+            || self.tracking
+        {
+            return Err(Error::State);
+        }
+        if !self.backlog.is_empty() || !self.packets.as_ref().is_some_and(usb_packet::Owner::ready)
+        {
+            return Ok(false);
+        }
+        self.gate_current()?;
+        self.passive_tx_allowed()?;
+        Ok(true)
+    }
+    /// The LPS station TXBUF upload (`runtime_ps_page.rs` shape) over the
+    /// bulk BEACON queue: Linux `fw.c::rtw_fw_write_data_rsvd_page` with
+    /// `usb.c::rtw_usb_write_data_rsvd_page` (no BCNQ_DL toggle on USB).
+    /// Every register access and the bulk submission run inside the
+    /// original PS source and station admission.
+    async fn ps_page(
+        &mut self,
+        data: &[u8],
+        boundary: u16,
+        source: &super::runtime_ps_scope::Bound,
+        admission: &super::station_control::Admission,
+    ) -> Result<(), Error> {
+        use firmware_transport::enclosed;
+        if source.did() != 0xc821 {
+            return Err(Error::Unsupported);
+        }
+        if boundary != self.boundary || data.len() != 464 || data[..80].iter().any(|b| *b != 0) {
+            return Err(Error::Image);
+        }
+        // Each EP0 step runs its first poll inside the original PS source and
+        // station admission; both are re-checked when it completes.
+        macro_rules! scoped {
+            ($f:expr) => {
+                enclosed(|op| admission.run(|| source.invoke(op)), $f).await
+            };
+        }
+        if !source.matches(self.gate_ref()?) {
+            return Err(Error::Access);
+        }
+        if !scoped!(self.ps_rx_quiet())? {
+            return Err(Error::State);
+        }
+        let packet = usb::reserved_page_packet(data).map_err(usb_error)?;
+        let r = &self.registers;
+        let beacon = scoped!(async { r.read8(0x550).await.map_err(usb_error) })?;
+        let head = scoped!(async { r.read16(0x204).await.map_err(usb_error) })?;
+        if beacon & 8 != 0 || head & 0xfff != boundary {
+            return Err(Error::Prerequisite);
+        }
+        // Poison before any mutation (the publication's open flag stays set
+        // so the source can still enclose this upload); only the exact fresh
+        // BCN_VALID and the full restore reopen the station.
+        self.state = State::Terminal;
+        let result = async {
+            let r = &self.registers;
+            let cr = scoped!(async {
+                r.write16(0x204, boundary | 1 << 15)
+                    .await
+                    .map_err(usb_error)?;
+                if r.read16(0x204).await.map_err(usb_error)? & 1 << 15 != 0 {
+                    return Err(Error::Prerequisite);
+                }
+                let cr = r.read8(0x101).await.map_err(usb_error)?;
+                r.write8(0x101, cr | 1).await.map_err(usb_error)?;
+                r.write8(0x550, beacon & !8 | 16).await.map_err(usb_error)?;
+                Ok(cr)
+            })?;
+            admission.run(|| source.invoke(|| self.begin_out(usb::QSEL_BEACON, &packet)))?;
+            self.finish_out().await?;
+            let r = &self.registers;
+            let mut valid = false;
+            for _ in 0..BEACON_POLLS {
+                let value = scoped!(async { r.read32(0x204).await.map_err(usb_error) })?;
+                if value == u32::MAX {
+                    return Err(Error::Gone);
+                }
+                if value & 1 << 15 != 0 {
+                    valid = true;
+                    break;
+                }
+                r.control().delay_us(10).await;
+            }
+            if !valid {
+                return Err(Error::Timeout);
+            }
+            scoped!(async {
+                r.write16(0x204, boundary | 1 << 15)
+                    .await
+                    .map_err(usb_error)?;
+                r.write8(0x550, beacon).await.map_err(usb_error)?;
+                r.write8(0x101, cr).await.map_err(usb_error)?;
+                if r.read8(0x550).await.map_err(usb_error)? != beacon
+                    || r.read8(0x101).await.map_err(usb_error)? != cr
+                {
+                    return Err(Error::Prerequisite);
+                }
+                Ok(())
+            })
+        }
+        .await;
+        if result.is_err() {
+            self.set_open(false);
+            return result;
+        }
+        self.state = State::Packets;
+        Ok(())
+    }
     pub(super) fn speed(&self) -> Speed {
         self.speed
     }
@@ -533,6 +664,15 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     }
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error> {
         self.page(data).await
+    }
+    async fn station_reserved_page(
+        &mut self,
+        data: &[u8],
+        boundary: u16,
+        source: &super::runtime_ps_scope::Bound,
+        admission: &super::station_control::Admission,
+    ) -> Result<(), Error> {
+        self.ps_page(data, boundary, source, admission).await
     }
     async fn lte_backup(&mut self) -> Result<u32, Error> {
         // `rtw_coex_read_indirect_reg(0x38)` through REG_WL_LTECOEX_CTRL.
@@ -1309,6 +1449,101 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     }
     fn mailbox_pending(&self) -> bool {
         self.mailbox_pending
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn ps_mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+        scope: &mut firmware_transport::PsScope<'_>,
+    ) -> impl core::future::Future<Output = Result<firmware_transport::PsSubmit, Error>> + Send
+    {
+        use firmware_transport::PsSubmit;
+        // `pci_firmware.rs::ps_mailbox_submit` over EP0 (Linux fw.c
+        // `rtw_fw_send_h2c_command`): HMETFR free, HMEBOX_EXT, then the
+        // HMEBOX low word that publishes the command. The HMETFR recheck is
+        // an EP0 read before the scope; inside it the host-side quiet and
+        // gate checks run and the publishing EP0 write is begun (first poll),
+        // so the source encloses the actual publication.
+        async move {
+            if self.state != State::Packets || self.retune.is_some() || self.tracking {
+                return Err(Error::State);
+            }
+            if !self.mailbox_ready().await? {
+                return Err(Error::State);
+            }
+            self.gate_current()?;
+            let cursor = u16::from(self.mailbox_cursor);
+            let bit = 1u8 << self.mailbox_cursor;
+            let ext = u32::from_le_bytes([words[4], words[5], words[6], words[7]]);
+            let body = u32::from_le_bytes([words[0], words[1], words[2], words[3]]);
+            self.mailbox_pending = true;
+            let staged = async {
+                let r = &self.registers;
+                r.write32(0x1f0 + cursor * 4, ext)
+                    .await
+                    .map_err(usb_error)?;
+                let state = r.read8(0x1cc).await.map_err(usb_error)?;
+                if state == 255 {
+                    return Err(Error::Gone);
+                }
+                if state & bit != 0 {
+                    return Err(Error::State);
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = staged {
+                self.mailbox_pending = false;
+                return Err(e);
+            }
+            let (result, published, written) = {
+                let this = &*self;
+                let mut write = core::pin::pin!(async {
+                    this.registers
+                        .write32(0x1d0 + cursor * 4, body)
+                        .await
+                        .map_err(usb_error)
+                });
+                let mut published = false;
+                let mut written = None;
+                let result = scope(&mut || {
+                    if !this.ps_publish_allowed()? {
+                        return Ok(false);
+                    }
+                    published = true;
+                    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                    if let core::task::Poll::Ready(r) =
+                        core::future::Future::poll(write.as_mut(), &mut cx)
+                    {
+                        written = Some(r);
+                    }
+                    Ok(true)
+                });
+                let written = match (published, written) {
+                    (true, Some(r)) => r,
+                    (true, None) => write.await,
+                    (false, _) => Ok(()),
+                };
+                (result, published, written)
+            };
+            match (result, written) {
+                (Ok(true), Ok(())) if published => Ok(PsSubmit::Issued),
+                (Ok(false), _) if !published => {
+                    self.mailbox_pending = false;
+                    Ok(PsSubmit::Unissued)
+                }
+                (Err(e), _) if !published => {
+                    self.mailbox_pending = false;
+                    Err(e)
+                }
+                // Low word begun: mailbox ownership is ambiguous; never retry.
+                _ => {
+                    self.state = State::Terminal;
+                    self.set_open(false);
+                    Err(Error::State)
+                }
+            }
+        }
     }
     fn packet_prepare(&mut self, own: [u8; 6], mac_id: u8) -> Result<(), packet_core::Error> {
         if self.state != State::Calibrated || self.packets.is_some() {
