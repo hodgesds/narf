@@ -39,6 +39,55 @@ pub fn alloc_dma<T>(n: usize, dev: &BusDevice) -> DmaBuffer<T>;
 pub fn alloc_coherent_masked(len: usize, domain: DomainId, dma_mask: u64)
     -> Result<DmaBuffer, IoError>;
 
+/// Device DMA coherence (Linux `dev_is_dma_coherent`) and reserved coherent
+/// pools (Linux `kernel/dma/coherent.c`, `struct dma_coherent_mem`).
+/// Module `coherent_pool`; see "Non-coherent devices" below.
+pub enum DmaCoherence { Coherent, NonCoherent }
+pub struct CoherentPool { /* reserved range + WC mapping + page bitmap */ }
+impl CoherentPool {
+    /// `rmem_dma_device_init` → `dma_init_coherent_memory`: map a no-map
+    /// `shared-dma-pool` once, write-combining (aarch64 Normal-NC), shared
+    /// by later callers, permanent. `PoolRejected` for empty/unaligned,
+    /// overlapping or System-RAM ranges.
+    pub unsafe fn reserved(phys: u64, size: u64) -> Result<Arc<Self>, IoError>;
+    /// Pool over an existing caller-owned mapping (tests; not registered).
+    pub unsafe fn from_mapping(phys: u64, virt: usize, size: u64)
+        -> Result<Arc<Self>, IoError>;
+    pub fn phys(&self) -> PhysAddr;
+    pub fn virt(&self) -> usize;
+    pub fn pages(&self) -> usize;
+    pub fn free_pages(&self) -> usize;
+}
+/// `struct device` DMA facts, built by `narf_bus::dma::configure`.
+pub struct DmaDevice { /* coherence + selected pool */ }
+impl DmaDevice {
+    pub const fn coherent() -> Self;
+    /// Device pool wins; else a NonCoherent device takes the default
+    /// (`linux,dma-default`) pool; a Coherent device never does.
+    pub fn new(c: DmaCoherence, device_pool: Option<Arc<CoherentPool>>,
+               default_pool: Option<Arc<CoherentPool>>) -> Self;
+    pub fn coherence(&self) -> DmaCoherence;
+    pub fn pool(&self) -> Option<&Arc<CoherentPool>>;
+}
+/// `dma_alloc_coherent(dev, …)`: pool → `__dma_alloc_from_coherent`
+/// (zeroed, naturally aligned power-of-two page run, `<= dma_mask`);
+/// Coherent without pool → exactly `alloc_coherent_masked`; NonCoherent
+/// without pool → `Err(NoCoherentPool)`.
+pub fn alloc_coherent_for(dev: &DmaDevice, len: usize, domain: DomainId,
+                          dma_mask: u64) -> Result<DmaBuffer, IoError>;
+impl DmaBuffer {
+    /// Pool buffers resolve `cpu_ptr*`/`as_slice` through the pool mapping.
+    pub fn is_pool_backed(&self) -> bool;
+    /// Streaming maintenance, Linux `arch_sync_dma_for_device` (clean,
+    /// direction ignored) / `arch_sync_dma_for_cpu` (nothing for ToDevice,
+    /// else `dcache_inval_poc`: civac partial edge lines, ivac whole lines).
+    /// x86_64 flushes (CLFLUSH) in both. `sync` stays clean+invalidate.
+    pub fn sync_for_device(&self, offset: usize, len: usize, dir: DmaDirection);
+    pub fn sync_for_cpu(&self, offset: usize, len: usize, dir: DmaDirection);
+}
+pub enum DmaDirection { Bidirectional, ToDevice, FromDevice }
+pub enum IoError { /* … */ NoCoherentPool, PoolRejected }
+
 /// Bounded recycler for one hardware RX or TX queue. Construct, `prepare`,
 /// and `prefill` it before the queue is made live. `try_acquire` and
 /// `release` are the packet/completion-path API: neither may allocate.
@@ -88,6 +137,22 @@ pub fn register_fault_handler(dev: &BusDevice, h: IoFaultHandler);
 
 IOMMU: each driver gets its own IOMMU context so a malicious device
 cannot DMA outside the buffers its driver explicitly mapped.
+
+**Non-coherent devices.** `alloc_coherent*` returns write-back RAM through
+the direct map; that is coherent only on a snooping interconnect (all
+x86_64, QEMU `virt`). Linux arm64 remaps RAM Normal-NC for a non-snooping
+device (`DMA_DIRECT_REMAP`); NARF never aliases System RAM non-write-back
+(`memory/src/memtype.rs`), so such a device allocates from a firmware
+reserved `no-map` `shared-dma-pool` instead (its own `memory-region`, else
+`linux,dma-default`), mapped through `narf_memory::ioremap` with
+`MmioAttrs::WriteCombining`. No pool → `NoCoherentPool` (fail closed).
+Pools are permanent (the ioremap cache shares identical mappings, so
+tearing one down would revoke it from every user). On aarch64 the boot
+linear window still maps the low RAM GiB write-back in 2 MiB blocks; a pool
+inside it keeps that cacheable alias (the same residual Linux accepts for
+`DMA_DIRECT_REMAP`), so pool creation cleans+invalidates the range by VA
+(`arch_dma_prep_coherent`), and nothing in the kernel touches the alias.
+Removing `no-map` ranges from the linear map is a `memory/` change.
 
 `DmaPool` is deliberately per queue, rather than a global allocator cache:
 that maintains NUMA/device affinity and prevents unrelated RX/TX completion
@@ -152,7 +217,9 @@ the allocating APIs.
   devicetree `iommus` property; `bus/` exposes a StreamID lookup by
   BDF. NARF does not synthesize StreamIDs — they are device-tree
   facts.
-- DMA coherency: check `dma-coherent` in devicetree; non-coherent
+- DMA coherency: `narf_bus::dma::configure` reads `dma-coherent` /
+  `dma-noncoherent` (host bridge node for PCI); non-coherent devices use
+  `alloc_coherent_for` and a reserved Normal-NC pool (§3). Non-coherent
   paths require cache maintenance around buffer use. **Ownership of
   these `DC CIVAC` operations belongs to `DmaBuffer<T>` lifecycle
   methods** (one before device handoff, one after device completion).

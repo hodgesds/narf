@@ -162,6 +162,28 @@ pub fn intx_route(blob: &[u8], domain: u16, bus: u8, devfn: u8, pin: u8) -> Opti
 /// GIC 3-cell specifier -> (INTID, level): SPI type 0 only, INTID 32+n,
 /// flags 1 = edge rising, 4 = level high; other senses refuse.
 pub fn gic_spi(route: &IntxRoute) -> Option<(u32, bool)>;
+
+/// `of_dma_is_coherent` before the arch default: the nearest node on the
+/// parent chain with `dma-coherent` (tested first) or `dma-noncoherent`
+/// wins; `Default` when none does; `Unresolved` when a node names an
+/// `interconnects` "dma-mem" DMA parent (not followed; callers treat it as
+/// non-coherent).
+pub enum DmaCoherenceProp { Coherent, NonCoherent, Default, Unresolved }
+pub fn node_dma_coherence(blob: &[u8], path: &[&str]) -> Option<DmaCoherenceProp>;
+/// The PCI host bridge of `domain` (rules of `for_pci_function`); PCI
+/// functions inherit it (`pci_dma_configure`). `None` without a unique one.
+pub fn pci_host_bridge_dma_coherence(blob: &[u8], domain: u16) -> Option<DmaCoherenceProp>;
+
+/// `rmem_dma_setup`: an enabled `/reserved-memory` child, compatible
+/// `shared-dma-pool`, static first `reg`, `no-map` (the `CONFIG_ARM` rule,
+/// applied everywhere) and not `reusable`.
+pub struct SharedDmaPool { pub addr: u64, pub size: u64, pub phandle: Option<u32>, pub default: bool }
+pub fn shared_dma_pool(blob: &[u8], phandle: u32) -> Option<SharedDmaPool>;
+/// `linux,dma-default`; a redefinition replaces the earlier one.
+pub fn default_shared_dma_pool(blob: &[u8]) -> Option<SharedDmaPool>;
+/// `of_reserved_mem_device_init` for a PCI function: `memory-region[0]` of
+/// its node, if that is a usable `shared-dma-pool`.
+pub fn pci_function_dma_pool(blob: &[u8], domain: u16, devfns: &[u8]) -> Option<SharedDmaPool>;
 ```
 
 ## 5. Test surface
@@ -178,6 +200,9 @@ pub fn gic_spi(route: &IntxRoute) -> Option<(u32, bool)>;
 | `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
 | `smoke_fdt_interrupts_extended_multiple_domains` | mixed interrupt domains decoded |
 | `smoke_fdt_pci_intx_interrupt_map_matches_linux` | QEMU virt slot/pin rotation, mask wrap, domain/pin refusal, nested nexus and level-low refusal |
+| `smoke_fdt_dma_coherent_inheritance` | nearest `dma-coherent`/`dma-noncoherent` wins, default, dma-mem unresolved |
+| `smoke_fdt_pci_host_bridge_dma_coherence` | PCI inherits the host bridge, domain/ambiguity rules |
+| `smoke_fdt_shared_dma_pool_and_memory_region` | pool acceptance, `linux,dma-default` last-wins, function `memory-region` |
 
 ## 6. Out of scope (v0.1)
 

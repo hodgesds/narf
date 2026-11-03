@@ -38,6 +38,7 @@ pub mod addr;
 pub mod bar;
 pub mod cxl;
 pub mod device;
+pub mod dma;
 pub mod driver_match;
 pub mod dt_match;
 pub mod ecam;

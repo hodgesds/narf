@@ -1,5 +1,11 @@
-//! Coherent PCI backend for x86_64 and aarch64.
+//! PCI backend for x86_64 and aarch64.
 //! Linux reference: ecd997b0189a mt792x_dma.c.
+//!
+//! Descriptor rings and frame buffers are allocated with
+//! `narf_io::alloc_coherent_for` against the function's firmware DMA
+//! configuration (`narf_bus::dma::configure`, Linux `dma_alloc_coherent`):
+//! write-back RAM on a snooping interconnect, the device's reserved
+//! non-cacheable pool on a non-coherent one, and refusal otherwise.
 use super::{
     Backend, CapturedData, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME,
 };
@@ -62,8 +68,17 @@ struct Ring {
     base: u32,
 }
 impl Ring {
+    /// [`Self::allocate_for`] on a coherent device.
     fn allocate(base: u32, rx: bool) -> Result<Self, Error> {
-        let descriptors = narf_io::alloc_coherent_masked(
+        Self::allocate_for(&narf_io::DmaDevice::coherent(), base, rx)
+    }
+    /// Linux `mt76_dma_alloc_queue`: descriptors and per-slot frame buffers
+    /// from `dma_alloc_coherent(dev, …)`. The device writes DONE bits into
+    /// 16-byte descriptors that share cache lines, so a non-coherent device
+    /// must get its reserved non-cacheable pool; without one this fails.
+    fn allocate_for(dma: &narf_io::DmaDevice, base: u32, rx: bool) -> Result<Self, Error> {
+        let descriptors = narf_io::alloc_coherent_for(
+            dma,
             DEPTH * 16,
             narf_lib::id::DomainId::DRIVER_0,
             u64::from(u32::MAX),
@@ -86,7 +101,7 @@ impl Ring {
                 (1u64 << 36) - 1
             };
             let buffer =
-                narf_io::alloc_coherent_masked(MAX_FRAME, narf_lib::id::DomainId::DRIVER_0, mask)
+                narf_io::alloc_coherent_for(dma, MAX_FRAME, narf_lib::id::DomainId::DRIVER_0, mask)
                     .map_err(|_| Error::Allocation)?;
             if buffer
                 .dma_addr()
@@ -1463,8 +1478,9 @@ impl Transport {
     /// # Safety
     /// Caller exclusively owns this posted CONNAC2 device, its BAR0/L1 latch,
     /// DMA/reset/power controls and permanent mappings. No other client may
-    /// access them until verified shutdown. The PCI function must be in a
-    /// coherent identity DMA domain (or have no IOMMU). This is not VF/reset
+    /// access them until verified shutdown. The PCI function must be in an
+    /// identity DMA domain (or have no IOMMU); a non-coherent function needs
+    /// a reserved `shared-dma-pool` (see `narf_bus::dma::configure`). This is not VF/reset
     /// recovery. Firmware must be prepared for this exact chip. Initially
     /// PCI bus mastering must be disabled by the caller.
     pub unsafe fn new(
@@ -1496,10 +1512,11 @@ impl Transport {
                     return Err(Error::Bounds);
                 }
             }
+            let dma = narf_bus::dma::configure(&device).map_err(|_| Error::Allocation)?;
             let storage = Storage {
-                wm: Ring::allocate(TX_WM, false)?,
-                fwdl: Ring::allocate(TX_FWDL, false)?,
-                data: Ring::allocate(TX_DATA, false)?,
+                wm: Ring::allocate_for(&dma, TX_WM, false)?,
+                fwdl: Ring::allocate_for(&dma, TX_FWDL, false)?,
+                data: Ring::allocate_for(&dma, TX_DATA, false)?,
                 data_dma: 0,
                 tokens: packet_tx::Tokens::new(),
                 tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
@@ -1509,9 +1526,9 @@ impl Transport {
                 receive_open: false,
                 p2p_capture: super::p2p_management_capture::Queue::new(),
                 rx: [
-                    Ring::allocate(RX_PRE, true)?,
-                    Ring::allocate(RX_POST, true)?,
-                    Ring::allocate(RX_DATA, true)?,
+                    Ring::allocate_for(&dma, RX_PRE, true)?,
+                    Ring::allocate_for(&dma, RX_POST, true)?,
+                    Ring::allocate_for(&dma, RX_DATA, true)?,
                 ],
             };
             Ok(Self {

@@ -512,6 +512,29 @@ through its own probe grant. This query never detaches an existing binding.
 The permanent native host's discovery bypasses that preference check, while
 still refusing to alias an already bound radio.
 
+### 3.13 DMA configuration
+
+```rust
+/// Linux `of_dma_configure` + `of_reserved_mem_device_init`.
+pub fn dma::configure(device: &BusDevice) -> Result<narf_io::DmaDevice, IoError>;
+/// Devicetree half for a PCI function (`default_coherent` = arch
+/// `dma_default_coherent`; arm64 false).
+pub unsafe fn dma::pci_from_dt(blob: &[u8], domain: u16, devfns: Option<&[u8]>,
+                               default_coherent: bool) -> Result<DmaDevice, IoError>;
+```
+
+x86_64 is always coherent with no pools (Linux x86 `dev_is_dma_coherent`
+is constant true). aarch64 PCI functions take their host bridge node's
+`of_dma_is_coherent` (non-coherent by default and for an unresolved
+`dma-mem` interconnect parent), the function node's `memory-region[0]`
+`shared-dma-pool` as device pool, and — non-coherent without one — the
+`linux,dma-default` pool; both are mapped by `narf_io::CoherentPool::reserved`.
+Linux leaves `of_reserved_mem_device_init` to drivers; NARF calls it here
+because it cannot remap RAM non-cacheable, so a pool is the only
+non-coherent backing. A DTB-less aarch64 boot (QEMU `virt` fallback) stays
+coherent; aarch64 boots carry no ACPI, so `_CCA` has no source. Non-PCI
+devices on a Devicetree boot return `NotMapped` (no node association yet).
+
 ## 4. Invariants & safety properties
 
 - The device registry is read-mostly and uses RCU for lookups.

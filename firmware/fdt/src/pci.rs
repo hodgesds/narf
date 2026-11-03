@@ -21,7 +21,7 @@ fn reg_devfn(props: PropIter<'_>) -> Option<u8> {
     None
 }
 
-fn is_pci(props: PropIter<'_>) -> bool {
+pub(crate) fn is_pci(props: PropIter<'_>) -> bool {
     props.into_iter().any(|(name, value)| {
         name == "device_type" && value.split(|b| *b == 0).next() == Some(b"pci")
     })
@@ -69,7 +69,7 @@ where
 }
 
 /// Count host bridges (PCI nodes without a PCI ancestor).
-fn host_bridges(blob: &[u8]) -> usize {
+pub(crate) fn host_bridges(blob: &[u8]) -> usize {
     let mut pci_anc = [false; MAX_PATH_DEPTH + 1];
     let mut count = 0;
     crate::walk_nodes(blob, |path, props| {
@@ -142,7 +142,7 @@ pub fn reserved_memory_region(blob: &[u8], phandle: u32) -> Option<(u64, u64)> {
 }
 
 #[path = "pci_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// A PCI function's legacy INTx resolved through its host bridge's
 /// `interrupt-map`: the interrupt controller's phandle and its specifier.
