@@ -102,6 +102,7 @@ mod mld_power;
 mod mld_regulatory;
 pub mod mlme;
 mod mvm_boot;
+mod mvm_d3;
 mod mvm_device;
 mod mvm_publication;
 mod native_band;
