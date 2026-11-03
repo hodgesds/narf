@@ -635,3 +635,73 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "packet_owner_tests.rs"]
 pub(crate) mod tests;
+
+/// Radio/channel steps of the retained 8192EE owner (`rtl8192ee/init.rs`,
+/// `rtl8192ee/channel.rs`). Packet DMA, CR gates and IRQs stay closed.
+impl<I: Io, M: Memory> Prepared<I, M> {
+    /// The configured RTL8192EE radio facts, if any.
+    pub fn rtl8192ee_radio(&self) -> Option<&super::super::super::rtl8192ee::init::Radio> {
+        self.rtl8192ee.as_deref().map(|(_, radio)| radio)
+    }
+
+    /// Prepared → RadioConfigured: the `rtl92ee_hw_init` steps after the
+    /// firmware download over the retained factory map. Adapter facts are
+    /// re-derived from live `REG_SYS_CFG1`/`REG_9346CR`; test chips,
+    /// unprovisioned maps, BT-coexist boards and maps without TX power
+    /// are refused before the first table write.
+    pub async fn configure_rtl8192ee(
+        &mut self,
+        factory: &super::super::super::efuse::Factory,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8192ee::{adapter, init, txpower};
+        if self.phase != Phase::Prepared || self.chip != super::super::Chip::Rtl8192ee {
+            return Err(Error::State);
+        }
+        let facts = adapter::Adapter::from_hardware(
+            self.io.read32(adapter::REG_SYS_CFG1)?,
+            self.io.read8(adapter::REG_9346CR)?,
+            &factory.logical,
+        )
+        .map_err(|_| Error::State)?;
+        if facts.bt_coexist || facts.mac != factory.mac {
+            return Err(Error::State);
+        }
+        txpower::Efuse::from_logical(&factory.logical)?;
+        self.phase = Phase::Failed;
+        let radio = init::configure(&self.io, &facts, &factory.logical).await?;
+        let identity = super::super::super::radio::factory_identity(factory);
+        self.rtl8192ee = Some(alloc::boxed::Box::new((identity, radio)));
+        self.phase = Phase::RadioConfigured;
+        Ok(())
+    }
+
+    /// RadioConfigured/ChannelConfigured → ChannelConfigured: `rtl_op_config`
+    /// channel switch and 20/40 MHz bandwidth with the factory TX power.
+    pub async fn configure_rtl8192ee_channel(
+        &mut self,
+        op: super::super::super::rtl8192ee::channel::Operating,
+    ) -> Result<(), Error> {
+        if !matches!(
+            self.phase,
+            Phase::RadioConfigured | Phase::ChannelConfigured
+        ) || self.chip != super::super::Chip::Rtl8192ee
+        {
+            return Err(Error::State);
+        }
+        let mut state = self.rtl8192ee.take().ok_or(Error::State)?;
+        self.phase = Phase::Failed;
+        let radio = &mut state.1;
+        let (power, by_rate) = (radio.power, radio.phy.by_rate);
+        super::super::super::rtl8192ee::channel::configure(
+            &self.io,
+            &power,
+            &by_rate,
+            &op,
+            &mut radio.chnlval,
+        )
+        .await?;
+        self.rtl8192ee = Some(state);
+        self.phase = Phase::ChannelConfigured;
+        Ok(())
+    }
+}

@@ -32,6 +32,9 @@
 //! - [`iqk`] — `rtl92ee_phy_iq_calibrate` (paths A and B, three-run
 //!   similarity selection, matrix fill, result-register recovery) and
 //!   `_rtl92ee_phy_lc_calibrate`.
+//! - [`init`] — the `rtl92ee_hw_init` tail after the firmware download
+//!   (`_rtl92ee_hw_configure`, CAM reset, station address, IQK, PA bias,
+//!   NAV, LDPC fix), run by `Prepared::configure_rtl8192ee`.
 //! - `packet_owner.rs` — the BD-ring profile of the retained owner, mounted
 //!   as `prepare::packet::ee92` (allocation, publication, TXBD_IDX
 //!   doorbells, RXQ_TXBD_IDX consumption and the deferred DMA releases).
@@ -42,6 +45,7 @@ pub mod adapter;
 pub mod channel;
 pub mod fw;
 pub mod headerfile;
+pub mod init;
 pub mod iqk;
 pub mod mac;
 pub mod phy;

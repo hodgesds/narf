@@ -401,3 +401,53 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_iqk_full_run_restores_backups
 );
+
+/// `rtl92ee_hw_init` tail on the model: tables, RF tail, MAC defaults,
+/// station address, IQK, PA bias from a timed-out `0x1FA` read (`0xff`:
+/// no bias write), NAV upper, LDPC fix; BT boards refused before any write.
+fn smoke_rtl8192ee_hw_init_tail_on_model() -> TestResult {
+    use super::adapter::Adapter;
+    let mut map = power_map();
+    map[0] = 0x29;
+    map[1] = 0x81;
+    map[0xd0..0xd6].copy_from_slice(&[0x00, 0xe0, 0x4c, 0x12, 0x34, 0x56]);
+    let adapter = match Adapter::from_hardware(0, 0x20, &map) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("provisioned adapter refused"),
+    };
+    let io = RfFake::new();
+    let radio = match narf_scheduler::block_on(super::init::configure(&io, &adapter, &map)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("hw_init tail failed on the model"),
+    };
+    if radio.pa_bias_flags != 0xff || radio.chnlval[0] & 0xc00 != 0xc00 {
+        return TestResult::Fail("PA-bias timeout / 20 MHz chnlval");
+    }
+    let g = io.0.lock();
+    if g.rf[0][0xb1] != 0x54418
+        || g.regs[0x610..0x616] != [0x00, 0xe0, 0x4c, 0x12, 0x34, 0x56]
+        || g.regs[0x652] != 235
+        || g.regs[0x14] != 0x75
+        || g.regs[0x51b] != 0x09
+    {
+        return TestResult::Fail("RF 0xB1 / MACID / NAV / SWR / slot");
+    }
+    drop(g);
+    let mut bt = map.clone();
+    bt[0xc1] = 0x20; // board type 1: ODM_BOARD_BT
+    let bt_adapter = match Adapter::from_hardware(0, 0x20, &bt) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("BT adapter decode failed"),
+    };
+    let io = RfFake::new();
+    if narf_scheduler::block_on(super::init::configure(&io, &bt_adapter, &bt)).is_ok()
+        || !io.0.lock().w32.is_empty()
+    {
+        return TestResult::Fail("BT-coexist board configured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_hw_init_tail_on_model
+);

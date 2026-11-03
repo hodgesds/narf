@@ -2186,6 +2186,24 @@ diagnostic (`pci::bring_up` does not retain it).
   the nine result registers (`recover` = `b_recovery`).
   `_rtl92ee_phy_lc_calibrate(false)` is implemented but, as in Linux
   (no caller on 8192EE), not run.
+- `init` — the `rtl92ee_hw_init` tail after the firmware download, run by
+  `Prepared::configure_rtl8192ee` (Prepared → RadioConfigured; adapter
+  facts re-derived from live `REG_SYS_CFG1`/`REG_9346CR`, the efuse MAC
+  must match, BT-coexist boards and power maps without TX power refused
+  before any write): `phy::configure`, `_rtl92ee_hw_configure` (RRSR, ARFR
+  0/1, slot, CF-End, retry, BAR, DARFRC/RARFRC, beacon, PIFS/aggr break,
+  NAV/protection, EDCA, ACKTO, SIFS, `0x4c7`, RX packet limit, max aggr,
+  MAR), `rtl_cam_reset_all_entry`, `HW_VAR_ETHER_ADDR`, the IQK, the PA
+  bias from physical EFUSE `0x1FA` (`efuse_one_byte_read`, 100-poll
+  timeout ⇒ `0xff`), `REG_NAV_UPPER = 235`, the LDPC RX-hang SWR fix and
+  `0x4fc = 0`. Not issued: HW security config (software crypto, Linux's
+  `sw_crypto` return), the ASPM back door / `enable_aspm` (ASPM stays
+  disabled), `rtl92ee_bt_hw_init`; `rtl92ee_dm_init` is software state for
+  the DM owner. `Prepared::configure_rtl8192ee_channel(Operating)`
+  (RadioConfigured/ChannelConfigured → ChannelConfigured) runs `channel::
+  configure` with the factory TX power and the retained `rfreg_chnlval`.
+  The owner still cannot reach `MacConfigured` (no H2C/RA/media status,
+  no IRQ profile, no envelope); probe keeps `0x818b` diagnostic.
   Test `smoke_rtl8192ee_tables_and_check_condition_walk` (written,
   unexecuted).
 
