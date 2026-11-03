@@ -2386,12 +2386,12 @@ production feature. Unsupported functionality remains unadvertised.
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GSC HECI packets are modelled but unwired; GSCCS, GSC load, GSC HuC authentication and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
-| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm) and SAGV with QGV derating; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; TBT, HDMI FRL, UHBR, a second concurrent external route, KMS flips/cursor on Pipe A while an external is lit, PSR while an external is lit, PSR2 selective fetch and Panel Replay open |
+| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; pipe scalers, bigjoiner, DSC and VRR remain |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR1 wins over FBC while enabled (Wa_14016291713, no stepping readout); color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR1 wins over FBC while enabled (Wa_14016291713, no stepping readout); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); color, HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -4920,3 +4920,145 @@ Review against Linux b90c984d agreed on the following:
 
 The `guc_role` dead-code allowance survives the merge. The debug group pass
 is deferred to the end of the current integration wave.
+
+### The panel's KMS services beside a lit external — native fixtures added
+
+This slice closes the five follow-ups of the Pipes B–D join. The sources
+are Linux b90c984d: `intel_display.c` (`intel_atomic_commit_tail`,
+`hsw_crtc_enable`, `hsw_configure_cpu_transcoder`,
+`intel_set_transcoder_timings`, `hsw_set_frame_start_delay`,
+`hsw_set_transconf`, `hsw_set_linetime_wm`, `skl_linetime_wm`,
+`icl_set_pipe_chicken`, `bdw_set_pipe_misc`, `intel_enable_transcoder`),
+`intel_vrr.c::intel_vrr_set_transcoder_timings`, `skl_watermark.c`
+(`skl_wm_check_vblank`, `skl_ddb_add_affected_pipes`), `intel_psr.c`
+(`intel_psr_pre_plane_update`, `intel_psr_post_plane_update`),
+`intel_fbc.c` (`intel_fbc_pre_update`, `__intel_fbc_pre_update`,
+`intel_fbc_post_update`), `intel_cdclk.c::bxt_modeset_calc_cdclk`,
+`intel_pmdemand.c::intel_pmdemand_atomic_check`, and the register headers
+`intel_display_regs.h`.
+
+**Panel KMS with an external lit.** The Pipe B–D owner publishes what it
+programmed while any Pipe B–D belongs to it: the state, plus each reserved
+pipe's scanout surface. The panel's resource profile first tries the owned
+single-pipe layout. Otherwise it proves Pipe A's share of the published
+layout against the hardware:
+
+- the panel request of the mode, with every pipe outside the layout off;
+- PM demand covering the layout, with the exact QGV value;
+- MBUS join and hashing as computed, with the select NONE or an active pipe;
+- each active pipe's DBOX, IPC and the DBUF slices;
+- every pipe's plane and cursor DDB at exactly its entry.
+
+The published layout only names what to expect. A foreign lit pipe, a moved
+DDB entry, a grown panel allocation, a select of an inactive pipe or no
+published layout all refuse, and the failed proof publishes an unknown
+`wm_level_disabled`. The retained primary owner derives its linear/X and
+Tile4 images from whichever layout is proved at each use. Cursor, primary,
+Tile4 and XR30 therefore use Pipe A's actual allocation. The KMS takeover
+inventory admits exactly the route's own Pipe B–D primary surface (outside
+the GEM arena) and nothing else. A KMS tiling change is modeled as
+`State::retile`: only the primary watermarks change, and a tiling that
+would move a DDB entry is refused. The Pipe B–D owner computes Pipe A from
+the linear baseline the KMS owner programs and retiles it to the scanned-out
+tiling, and it retiles before each transition. A panel flipped to Tile4
+therefore no longer looks diverged to the live repartition. A lit pipe whose
+cursor watermarks are programmed while the cursor sits off screen keeps them.
+
+**The external pass.** The runtime MTL pass used `legacy_drain`. That
+disabled PSR and FBC on every pass and left the KMS owner blocked, so the
+desktop lost flips after the first pass. Probe-time MTL events also
+suspended the owner. `Device::external_pass` now holds the owner without
+blocking it. Linux adds Pipe A to a commit that moves its DDB
+(`skl_ddb_add_affected_pipes`), so the two are serialized; the pass does the
+same. It never waits on another task: a busy owner or an unlatched primary
+flip skips the pass before its hotplug poll. A panel DSB stream left in
+flight by a dropped cursor or color future is retired first, bounded, as a
+Linux commit waits for the previous commit's DSB; the owner's next call
+completes its bookkeeping. Around each event:
+
+- `pre_update` deactivates FBC (`intel_fbc_pre_update`, then Display WA
+  #1198's vblank when FBC was active). NARF always takes the deactivate
+  branch because the live transaction requires FBC off; Linux would flip-nuke
+  an unchanged plane. For Pipe A without a modeset,
+  `intel_psr_pre_plane_update` keeps PSR enabled and sets Wa_14015648006
+  when Pipe A's `wm_level_disabled` is true. PSR then exits and waits for
+  idle, as the pipe update does.
+- `post_update` waits for a Pipe-A frame boundary, because Linux runs its
+  post-plane updates after flip_done. It then re-proves Pipe A's share of
+  whatever layout now holds. Only a proved layout clears Wa_14015648006 when
+  `wm_level_disabled` is false and re-activates the FBC it deactivated, on
+  the same CFB. PSR re-arms from idle when the pass ends. An unproved layout
+  disables PSR (its next qualification re-proves the watermarks) and leaves
+  FBC off until the next latch.
+
+The suspend and reset retirement of a live route uses the same bracket,
+except after a GT reset, where the owner's loss-tolerant recovery disables
+FBC and PSR. `wm_level_disabled` depends only on Pipe A's planes and timing,
+as `skl_wm_check_vblank` computes it per crtc, so the multi-pipe proof
+publishes the same value. PSR therefore enables beside a lit external.
+
+**Pipes B–D crtc registers.** `Pipes::program_timings` now follows
+`hsw_crtc_enable` for display 14, with the pipe off:
+
+- `PIPE_MISC` = `BPC_8 | PIXEL_ROUNDING_TRUNC` after the source size;
+- then `TRANS_SET_CONTEXT_LATENCY` 0 and `TRANS_VSYNCSHIFT` 0, the timings,
+  `TRANS_VRR_CTL` 0 without VRR, `TRANS_MULT` 0, the display-14
+  `CHICKEN_TRANS` frame-start delay field 0, and `TRANSCONF` configured
+  progressive and still disabled;
+- after the RGB bypass, `WM_LINETIME` = `skl_linetime_wm` (`DIV_ROUND_UP`
+  of htotal × 8000 by the pixel rate, capped at 0x1ff; no IPS line time on
+  display 14);
+- `PIPE_CHICKEN` |= alpha bypass, pixel rounding passthrough and underrun
+  recovery disable.
+
+`Pipes::enable` sets `DP_FEC_BS_JITTER_WA` and clears
+`DP_DSC_INSERT_SF_AT_EOL_WA` in `CHICKEN_TRANS` before `TRANSCONF` enables,
+as `intel_enable_transcoder` does. Chicken registers are read-modify-written.
+Audited and not applicable: DSC and the uncompressed joiner (refused), the
+pipe scaler (`skl_pfit_enable` only with a panel fitter), M2/N2 (not on
+display 14), the IPS line time and HSW-only workarounds. One divergence
+remains: `TRANS_VBLANK` keeps its start field at vactive−1, while Linux
+writes 0 on display 13+ because the hardware ignores the field.
+
+**After the last release.** Releasing the last Pipe B–D with no lit panel
+now runs the post-plane half of the all-off commit (`settle_all_off`). With
+every pipe, plane, cursor, DSB and FBC proved off, it clears every plane and
+cursor WM/DDB and powers the DBUF down to S1. It lowers CDCLK to
+`bxt_calc_cdclk(force_min_cdclk)` (172.8 MHz), then lowers the PM demand to
+the no-pipe request: S1, no pipe, port clock or PHY, the clock's voltage
+level, and the QGV point chosen for no plane. A lit pipe refuses before any
+write. A failure re-requests the original demand, so the demand never
+under-covers the clock. The step is best effort.
+
+Remaining: one external route at a time. The pass skips while a cancelled
+panel flip is unlatched, until the owner's next call completes it. The MBUS
+join is left as it was after the last release; the next all-off commit
+rewrites it. Physical Intel acceptance is open.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `drivers/gpu/intel_gpu_xelpg_external`:
+  `smoke_mtl_panel_profile_proves_its_share_beside_external`.
+- `drivers/gpu/intel_gpu_xelpg_pipes`:
+  `smoke_xelpg_pipes_publish_layout_and_follow_a_tile4_panel_flip`,
+  `smoke_xelpg_pipes_crtc_enable_programs_linetime_chicken_and_frame_start`
+  and `smoke_xelpg_pipes_last_release_lowers_cdclk_and_pm_demand`.
+- `drivers/gpu/intel_gpu_kms` (x86_64):
+  `smoke_kms_mtl_panel_flip_cursor_and_color_beside_lit_external`,
+  `smoke_kms_mtl_cursor_refuses_diverged_multi_pipe_layout`,
+  `smoke_kms_mtl_psr_enables_beside_external_and_brackets_repartitions`,
+  `smoke_kms_mtl_external_pass_deactivates_and_reevaluates_fbc` and
+  `smoke_kms_mtl_external_pass_idles_in_flight_dsb_before_repartition`.
+
+Changed fixtures:
+
+- `smoke_mtl_external_dp_on_pipe_b_beside_lit_panel` asserted that the panel
+  profile refused beside the external. It now asserts that the profile holds
+  Pipe A's half of the DBUF.
+- `smoke_xelpg_pipes_release_of_last_pipe_forgets_state` asserted that the
+  release wrote nothing. It now asserts that the release writes only the
+  all-off settle.
+- The hook-pass smoke also counts the new post-event hook.
+
+The KMS mock gained a register-read tick for synchronous waiters, and the
+PSR KMS fixture helpers are shared with the new module.

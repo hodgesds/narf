@@ -2963,6 +2963,15 @@ registers it; display-14 KMS install calls it.
 profile capture and `Primary` check, complete, rollback, stage and restore
 publishes the programmed value or "unknown", and `Primary` exposes
 `wm_level_disabled`, `pending_tile4` and `current_wm_level_disabled`.
+`Profile::capture` proves either the owned single-pipe layout or Pipe A's
+share of the published multi-pipe layout
+(`intel_gpu_xelpg_pipes::published_layout`); `Primary` derives its images
+from the layout proved at each use. `intel_gpu_kms::Device::external_pass`
+holds the KMS owner for one MTL external pass without blocking it (`Busy`
+while a primary flip is unlatched; an in-flight panel DSB is retired first);
+`ExternalPass::pre_update` deactivates FBC and exits PSR,
+`post_update` waits for a Pipe-A frame, re-proves the layout and only then
+re-activates FBC (PSR re-arms when the pass ends).
 - KMS install creates the service. The GT publication hook acquires, loads
   and releases. `quiesce_for_legacy` brackets system-suspend preparation.
 
@@ -8623,21 +8632,32 @@ image (with the primary's current tiling) and whether it is lit; `adopt(None,
 4 KiB-aligned linear XRGB8888 GGTT surface, stride, the port clock the route
 runs at, combo PHY or Type-C) computes and commits DBUF/DDB/WM/CDCLK/PM demand
 while lit pipes stay lit, then reports `intel_dmc_enable_pipe`.
-`program_timings` writes source size, transcoder timings, the per-pipe RGB
-bypass and the no-DPT plane chicken with the pipe off. The caller owns port
+`program_timings` writes, with the pipe off and in `hsw_crtc_enable` order,
+source size, `PIPE_MISC`, `TRANS_SET_CONTEXT_LATENCY` and `TRANS_VSYNCSHIFT`
+(0), the transcoder timings, `TRANS_VRR_CTL` and `TRANS_MULT` (0), the
+display-14 `CHICKEN_TRANS` frame-start delay (0), a configured disabled
+`TRANSCONF`, the per-pipe RGB bypass, `WM_LINETIME` (`skl_linetime_wm`),
+`PIPE_CHICKEN` and the no-DPT plane chicken. The caller owns port
 clock, PHY, `TRANS_CLK_SEL`, `TRANS_DDI_FUNC_CTL`, `DP_TP_CTL`, M/N, infoframes
-and link training. `enable` sets `TRANSCONF` with its STATE acknowledgement;
+and link training. `enable` sets the `CHICKEN_TRANS` FEC/DSC workaround bits,
+then `TRANSCONF` with its STATE acknowledgement;
 `arm_primary` writes the noarm plane registers and then `PLANE_CTL` +
 `PLANE_SURF` inside vblank evasion with local interrupts masked, proved by a
 fresh frame and `PLANE_SURFLIVE`. `disable_primary` and `disable` turn the
 plane and transcoder off. After the caller stops its port, `release(pipe,
 &dyn PipeDmc)` reports `intel_dmc_disable_pipe` and repartitions without the
-pipe (the last pipe forgets the state instead). Pipe A, scaled/tiled/
+pipe. The last pipe forgets the state instead and, with every pipe off,
+`intel_gpu_xelpg_resources::settle_all_off` clears WM/DDB, powers DBUF down
+to S1 and lowers CDCLK and PM demand to the no-pipe minimum
+(`all_off_pmdemand`), best effort. Pipe A, scaled/tiled/
 other-format primaries, changed lit pipes, an unknown firmware CDCLK, live
 FBC/DSB, foreign lit pipes and unorderable DDB moves are typed refusals
-before any write; later failures undo executed steps in reverse. While
-another pipe is lit, the fixed Pipe-A KMS services keep refusing their
-single-pipe resource proof.
+before any write; later failures undo executed steps in reverse. Before each
+transition a lit Pipe A is retiled to the tiling it scans out
+(`State::retile`: only its primary watermarks change). While any Pipe B–D is
+reserved, `published_layout()` returns the programmed `Layout` (state and
+reserved scanout surfaces); it is a description the fixed Pipe-A KMS owner
+proves its share against, never a proof.
 
 One retained private WC32 KiB BO supplies two cursor slots through an exclusive
 GGTT lease. After exposure its BO/address are never rebound; ambiguous drop
