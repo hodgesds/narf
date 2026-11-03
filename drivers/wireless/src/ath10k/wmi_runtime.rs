@@ -267,7 +267,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let chains =
             chains::Chains::new(self.htt.wmi.initialized_chain_mask.ok_or(Error::Failed)?)?;
         let chain_commands = chains.commands(self.wire.dialect)?;
-        let vdev_nss = chains.vdev_nss(self.wire.dialect)?;
+        let vdev_nss = chains.vdev_nss_for(self.wire.dialect, primary.id())?;
         self.channels
             .try_reserve_exact(channels.len())
             .map_err(|_| Error::NoMemory)?;

@@ -18,7 +18,13 @@ pub(super) struct Wire {
     pub management_event: u32,
 }
 impl Wire {
-    pub fn protection(self, request: super::StationProtection) -> Result<[Vec<u8>; 3], Error> {
+    /// `WMI_VDEV_SET_PARAM` RTS/CTS on the station `vdev`
+    /// (`mac.c::ath10k_recalc_rtscts_prot`, `ath10k_bss_info_changed`).
+    pub fn protection(
+        self,
+        vdev: u8,
+        request: super::StationProtection,
+    ) -> Result<[Vec<u8>; 3], Error> {
         let (id, cts, enable) = match self.dialect {
             Dialect::Main | Dialect::Tlv => (0x5008, 26, 44),
             Dialect::TenOne => (0x901a, 24, 43),
@@ -34,6 +40,7 @@ impl Wire {
             } else {
                 4
             };
+            put(&mut out, at, u32::from(vdev));
             put(&mut out, at + 4, parameter);
             put(&mut out, at + 8, value);
             Ok::<_, Error>(out)
@@ -55,7 +62,8 @@ impl Wire {
             Dialect::TenFour => (0x9039, 0x903a),
         }
     }
-    pub fn station_ps_mode(self, enabled: bool) -> Result<Vec<u8>, Error> {
+    /// `WMI_STA_POWERSAVE_MODE` of the station `vdev`.
+    pub fn station_ps_mode(self, vdev: u8, enabled: bool) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.ps_ids().0, if tlv { 12 } else { 8 })?;
         let at = if tlv {
@@ -64,10 +72,17 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         put(&mut out, at + 4, u32::from(enabled));
         Ok(out)
     }
-    pub fn station_ps_parameter(self, parameter: u32, value: u32) -> Result<Vec<u8>, Error> {
+    /// `WMI_STA_POWERSAVE_PARAM` of the station `vdev`.
+    pub fn station_ps_parameter(
+        self,
+        vdev: u8,
+        parameter: u32,
+        value: u32,
+    ) -> Result<Vec<u8>, Error> {
         if !matches!(
             (parameter, value),
             (0, 0) | (1, 1) | (2, 0) | (4, 0) | (3, 1..=1000)
@@ -82,6 +97,7 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         put(&mut out, at + 4, parameter);
         put(&mut out, at + 8, value);
         Ok(out)

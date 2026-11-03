@@ -369,6 +369,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
         let offered_ht = self.peer.as_ref().ok_or(Error::Failed)?.ht;
+        let vdev = self.peer.as_ref().ok_or(Error::Failed)?.vdev;
         let mut plan = JoinPlan::prepare_with_options(
             &bss,
             own,
@@ -435,6 +436,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let mut command = mlme::peer_phy(
             self.wire.dialect,
+            vdev,
             associated,
             capability,
             plan.legacy_rates().0,
@@ -453,7 +455,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             super::hw_keys::mark_peer_pmf(self.wire.dialect, &mut command, flag)?;
         }
         self.peer_pmf_offload = pmf_offload.is_some();
-        let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
+        let up = mlme::up(self.wire.dialect, vdev, peer.bssid, aid)?;
         let contention = wmm
             .or_else(|| {
                 self.ap_dirty_wmm
@@ -565,9 +567,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.bind_coexistence_width(bssid, &permission)?;
         let rd = self.wire.domain(&permission)?;
         let power = self.wire.power(&permission)?;
+        // A station BSS lives on the managed vdev; a P2P client passes its own.
+        let vdev = self.primary.id();
         let mut start = self
             .wire
-            .start_station(&permission, beacon_interval, dtim)?;
+            .start_station(vdev, &permission, beacon_interval, dtim)?;
         if let Some(ht) = ht {
             let channel = if self.wire.dialect == Dialect::Tlv {
                 84
@@ -588,9 +592,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         } else {
             None
         };
-        let create = self.wire.peer(bssid)?;
+        let create = self.wire.peer(vdev, bssid)?;
         self.peer = Some(Peer {
-            vdev: self.primary.id(),
+            vdev,
             permission: permission.clone(),
             bssid,
             ids: [0; 32],
@@ -624,7 +628,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Wmi(bytes)
                     if wire::word(&bytes, 0)? & 0xffffff == self.wire.start_response_id() =>
                 {
-                    if self.wire.start_response(&bytes[4..])?.is_some() {
+                    if self.wire.start_response(vdev, &bytes[4..])?.is_some() {
                         started = true;
                         break;
                     }

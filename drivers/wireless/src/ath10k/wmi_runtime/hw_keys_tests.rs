@@ -30,7 +30,7 @@ fn smoke_ath10k_hw_keys_install_struct_dialects() -> TestResult {
         (Dialect::TenFour, 0x901d),
     ] {
         for (pairwise, idx) in [(true, 0u8), (false, 1), (false, 2)] {
-            let Ok(c) = install(dialect, BSSID, &key(pairwise, idx)) else {
+            let Ok(c) = install(dialect, 0, BSSID, &key(pairwise, idx)) else {
                 return TestResult::Fail("install refused");
             };
             if c.len() != 4 + 92 + 16
@@ -50,9 +50,9 @@ fn smoke_ath10k_hw_keys_install_struct_dialects() -> TestResult {
             }
         }
     }
-    if install(Dialect::Main, BSSID, &key(true, 1)).is_ok()
-        || install(Dialect::Main, [0xff; 6], &key(false, 1)).is_ok()
-        || install(Dialect::Main, BSSID, &key(false, 4)).is_ok()
+    if install(Dialect::Main, 0, BSSID, &key(true, 1)).is_ok()
+        || install(Dialect::Main, 0, [0xff; 6], &key(false, 1)).is_ok()
+        || install(Dialect::Main, 0, BSSID, &key(false, 4)).is_ok()
     {
         return TestResult::Fail("invalid key index or peer accepted");
     }
@@ -66,7 +66,7 @@ kernel_test_in!(
 /// wmi-tlv.c `ath10k_wmi_tlv_op_gen_vdev_install_key`: tag 96 around the
 /// same struct, then an ARRAY_BYTE (17) TLV of the 4-aligned key.
 fn smoke_ath10k_hw_keys_install_tlv() -> TestResult {
-    let Ok(c) = install(Dialect::Tlv, BSSID, &key(false, 2)) else {
+    let Ok(c) = install(Dialect::Tlv, 0, BSSID, &key(false, 2)) else {
         return TestResult::Fail("TLV install refused");
     };
     if c.len() != 4 + 4 + 92 + 4 + 16

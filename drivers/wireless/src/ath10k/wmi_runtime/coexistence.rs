@@ -446,10 +446,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         } else {
             1
         };
-        let restart = self
-            .wire
-            .coexistence_restart(&permission, cached.beacon_interval, dtim)?;
-        let parameters = self.wire.coexistence_peer(bssid)?;
+        let vdev = self.peer.as_ref().ok_or(Error::Failed)?.vdev;
+        let restart =
+            self.wire
+                .coexistence_restart(vdev, &permission, cached.beacon_interval, dtim)?;
+        let parameters = self.wire.coexistence_peer(vdev, bssid)?;
         let inventory = self
             .wire
             .coexistence_channels(&permission, &self.channels)?;
@@ -532,7 +533,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             if let htt::Event::Wmi(bytes) = event {
                 if wire::word(&bytes, 0)? & 0xffffff == self.wire.start_response_id()
-                    && self.wire.coexistence_response(&bytes[4..])?.is_some()
+                    && self.wire.coexistence_response(vdev, &bytes[4..])?.is_some()
                 {
                     restarted = true;
                     break;
@@ -589,11 +590,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
 impl wire::Wire {
     fn coexistence_restart(
         self,
+        vdev: u8,
         permission: &crate::ath10k::regulatory::Permission,
         beacon: u16,
         dtim: u8,
     ) -> Result<Vec<u8>, Error> {
-        let mut command = self.start_station(permission, beacon, dtim)?;
+        let mut command = self.start_station(vdev, permission, beacon, dtim)?;
         // Every native dialect places RESTART immediately after START.
         let id = wire::word(&command, 0)?;
         wire::put(&mut command, 0, id + 1);
@@ -601,7 +603,8 @@ impl wire::Wire {
         wire::put(&mut command, at + 12, 5 | (1 << 11)); //11NG_HT20, real center=primary.
         Ok(command)
     }
-    fn coexistence_peer(self, bssid: [u8; 6]) -> Result<[Vec<u8>; 2], Error> {
+    /// `WMI_PEER_SET_PARAM` on the BSS peer of the station `vdev`.
+    fn coexistence_peer(self, vdev: u8, bssid: [u8; 6]) -> Result<[Vec<u8>; 2], Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let id = match self.dialect {
             Dialect::Main | Dialect::Tlv => 0x6004,
@@ -616,6 +619,7 @@ impl wire::Wire {
             } else {
                 4
             };
+            wire::put(&mut out, at, u32::from(vdev));
             out[at + 4..at + 10].copy_from_slice(&bssid);
             wire::put(&mut out, at + 12, parameter);
             wire::put(&mut out, at + 16, value);
@@ -625,7 +629,7 @@ impl wire::Wire {
         // flags relabeled in host memory. These commands have no FW ACK.
         Ok([command(13, 5)?, command(4, 0)?])
     }
-    fn coexistence_response(self, body: &[u8]) -> Result<Option<()>, Error> {
+    fn coexistence_response(self, vdev: u8, body: &[u8]) -> Result<Option<()>, Error> {
         let b = if self.dialect == Dialect::Tlv {
             wire::tag(body, 40)?
         } else {
@@ -634,7 +638,8 @@ impl wire::Wire {
         if b.len() != 16 {
             return Err(Error::Malformed);
         }
-        if wire::word(b, 0)? != 0 || wire::word(b, 4)? != 0 || wire::word(b, 8)? != 1 {
+        if wire::word(b, 0)? != u32::from(vdev) || wire::word(b, 4)? != 0 || wire::word(b, 8)? != 1
+        {
             return Ok(None);
         }
         let status = wire::word(b, 12)?;

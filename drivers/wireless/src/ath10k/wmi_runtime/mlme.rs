@@ -24,6 +24,7 @@ pub(super) fn peer(
 ) -> Result<Vec<u8>, Error> {
     peer_on(
         dialect,
+        0,
         Associated {
             bssid,
             aid,
@@ -38,15 +39,19 @@ pub(super) fn peer(
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn peer_on(
     dialect: Dialect,
+    vdev: u8,
     associated: Associated,
     capabilities: u16,
     rates: u16,
     qos: bool,
 ) -> Result<Vec<u8>, Error> {
-    peer_phy(dialect, associated, capabilities, rates, qos, None)
+    peer_phy(dialect, vdev, associated, capabilities, rates, qos, None)
 }
+/// `WMI_PEER_ASSOC` for the BSS peer of the station on `vdev`
+/// (`mac.c::ath10k_peer_assoc_prepare`: `arg->vdev_id = arvif->vdev_id`).
 pub(super) fn peer_phy(
     dialect: Dialect,
+    vdev: u8,
     associated: Associated,
     capabilities: u16,
     rates: u16,
@@ -101,7 +106,8 @@ pub(super) fn peer_phy(
         4
     };
     out[at..at + 6].copy_from_slice(&bssid);
-    wire::put(&mut out, at + 12, 1); // new association, vdev0
+    wire::put(&mut out, at + 8, u32::from(vdev));
+    wire::put(&mut out, at + 12, 1); // new association
     wire::put(&mut out, at + 16, u32::from(aid));
     // AUTH is Linux's association flag, independent of controlled-port state.
     wire::put(
@@ -192,7 +198,8 @@ fn vht_rates(out: &mut [u8], at: usize, v: super::ht::Vht) {
     }
 }
 
-pub(super) fn up(dialect: Dialect, bssid: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
+/// `WMI_VDEV_UP` of the station `vdev` (`mac.c::ath10k_bss_assoc`).
+pub(super) fn up(dialect: Dialect, vdev: u8, bssid: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
     if !(1..=2007).contains(&aid) || bssid == [0; 6] || bssid[0] & 1 != 0 {
         return Err(Error::Malformed);
     }
@@ -210,6 +217,7 @@ pub(super) fn up(dialect: Dialect, bssid: [u8; 6], aid: u16) -> Result<Vec<u8>, 
     } else {
         4
     };
+    wire::put(&mut out, at, u32::from(vdev));
     wire::put(&mut out, at + 4, u32::from(aid));
     out[at + 8..at + 14].copy_from_slice(&bssid);
     Ok(out)

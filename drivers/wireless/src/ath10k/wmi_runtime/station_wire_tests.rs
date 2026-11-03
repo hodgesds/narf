@@ -25,8 +25,8 @@ fn smoke_ath10k_wmi_station_prepare_all_native_dialects() -> TestResult {
         let w = Wire::new(dialect);
         if w.domain(&p).as_deref() != Ok(rd)
             || w.power(&p).as_deref() != Ok(power)
-            || w.start_station(&p, 100, 1).as_deref() != Ok(start)
-            || w.peer([2, 8, 9, 10, 11, 12]).as_deref() != Ok(peer)
+            || w.start_station(0, &p, 100, 1).as_deref() != Ok(start)
+            || w.peer(0, [2, 8, 9, 10, 11, 12]).as_deref() != Ok(peer)
         {
             return TestResult::Fail(
                 "native regulatory/power/STA-start/peer differs from independent Linux generator",
@@ -36,21 +36,21 @@ fn smoke_ath10k_wmi_station_prepare_all_native_dialects() -> TestResult {
         if dialect == Dialect::Tlv {
             ack.splice(..0, ((40u32 << 16) | 16).to_le_bytes());
         }
-        if w.start_response(&ack) != Ok(Some(())) {
+        if w.start_response(0, &ack) != Ok(Some(())) {
             return TestResult::Fail("valid native VDEV_START_RESPONSE refused");
         }
         let at = usize::from(dialect == Dialect::Tlv) * 4;
         put(&mut ack, at, 1);
-        if w.start_response(&ack) != Ok(None) {
+        if w.start_response(0, &ack) != Ok(None) {
             return TestResult::Fail("another vdev START satisfied owner");
         }
         put(&mut ack, at, 0);
         put(&mut ack, at + 12, 3);
-        if w.start_response(&ack) != Err(Error::Firmware(3)) {
+        if w.start_response(0, &ack) != Err(Error::Firmware(3)) {
             return TestResult::Fail("failed START opened vdev owner");
         }
         ack.pop();
-        if w.start_response(&ack).is_ok() {
+        if w.start_response(0, &ack).is_ok() {
             return TestResult::Fail("short START status accepted");
         }
     }
@@ -103,7 +103,7 @@ fn smoke_ath10k_vht160_station_start_channel_centers_and_dfs_cfreq2() -> TestRes
     ] {
         let chan = if dialect == Dialect::Tlv { 84 } else { 4 };
         for (p, cfreq1, cfreq2, dfs) in &cases {
-            let Ok(start) = Wire::new(dialect).start_station(p, 100, 1) else {
+            let Ok(start) = Wire::new(dialect).start_station(0, p, 100, 1) else {
                 return TestResult::Fail("VHT160 station START refused");
             };
             let at =

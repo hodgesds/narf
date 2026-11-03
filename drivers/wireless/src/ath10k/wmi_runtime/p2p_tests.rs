@@ -555,3 +555,126 @@ kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_device_scan_admits_listen_probe_response
 );
+
+/// Station WMI builders take the station's vdev (`arvif->vdev_id` in
+/// `mac.c::ath10k_vdev_start`/`ath10k_peer_create`/`ath10k_peer_assoc_prepare`/
+/// `ath10k_bss_assoc`/`ath10k_install_key`/`ath10k_bss_disassoc` and the
+/// STA power-save/RTS helpers): `vdev_id` sits at the Linux offset in every
+/// dialect, and re-zeroing it reproduces the vdev0 encoding byte for byte.
+/// Start/stopped/delete responses only match their own vdev.
+fn smoke_ath10k_p2p_station_builders_carry_vdev() -> TestResult {
+    use crate::ath10k::regulatory::{Factory, Permission};
+    const BSSID: [u8; 6] = [2, 8, 9, 10, 11, 12];
+    let Ok(factory) = Factory::from_eeprom(0x64) else {
+        return TestResult::Fail("factory");
+    };
+    let p = Permission {
+        center: 2412,
+        secondary: None,
+        width80: false,
+        center2: None,
+        factory,
+        country: *b"US",
+        frequency: 2412,
+        half_dbm: 34,
+        radar: 0,
+        hint: None,
+    };
+    let key = narf_wireless::station_security::KeyInstall {
+        pairwise: true,
+        key_id: 0,
+        material: zeroize::Zeroizing::new([0xa5; 16]),
+        token: 1,
+    };
+    let protection = super::super::StationProtection {
+        rts_threshold: Some(2346),
+        cts_protection: true,
+    };
+    let associated = super::super::mlme::Associated {
+        bssid: BSSID,
+        frequency: 2412,
+        aid: 7,
+        protected: false,
+    };
+    // `vdev_id` equals `at` (after any TLV struct header) except where the
+    // struct leads with another field.
+    fn same(zero: &[u8], three: &[u8], at: usize) -> bool {
+        let mut patched = three.to_vec();
+        patched[at] = 0;
+        wire::word(three, at) == Ok(3) && wire::word(zero, at) == Ok(0) && patched == zero
+    }
+    for dialect in [
+        Dialect::Main,
+        Dialect::TenOne,
+        Dialect::TenTwo,
+        Dialect::TenTwoFour,
+        Dialect::TenFour,
+        Dialect::Tlv,
+    ] {
+        let w = Wire::new(dialect);
+        let tlv = dialect == Dialect::Tlv;
+        let at = if tlv { 8 } else { 4 };
+        // `wmi_vdev_start_request_cmd` puts the channel before vdev_id.
+        let start = if tlv { 8 } else { 28 };
+        let built = |vdev: u8| -> Result<Vec<Vec<u8>>, Error> {
+            let mut out = vec![
+                w.start_station(vdev, &p, 100, 1)?,
+                w.peer(vdev, BSSID)?,
+                w.down_station(vdev)?,
+                w.delete_peer(vdev, BSSID)?,
+                w.stop_station(vdev)?,
+                w.station_ps_mode(vdev, true)?,
+                w.station_ps_parameter(vdev, 3, 100)?,
+                super::super::mlme::up(dialect, vdev, BSSID, 7)?,
+                super::super::mlme::peer_phy(dialect, vdev, associated, 0x421, 0xfff, false, None)?,
+                super::super::hw_keys::install(dialect, vdev, BSSID, &key)?,
+            ];
+            out.extend(w.protection(vdev, protection)?);
+            Ok(out)
+        };
+        let (Ok(zero), Ok(three)) = (built(0), built(3)) else {
+            return TestResult::Fail("station builder refused");
+        };
+        let offsets = [start, at, at, at, at, at, at, at, at + 8, at, at, at, at];
+        for ((z, t), offset) in zero.iter().zip(three.iter()).zip(offsets) {
+            if !same(z, t, offset) {
+                return TestResult::Fail("station builder vdev layout");
+            }
+        }
+        // `wmi_vdev_start_response_event` / `wmi_vdev_stopped_event`.
+        let mut response = vec![0u8; 16];
+        response[0] = 3;
+        let stopped = [3u8, 0, 0, 0];
+        let (response, stopped) = if tlv {
+            let mut r = vec![16, 0, 40, 0];
+            r.extend_from_slice(&response);
+            let mut s = vec![4, 0, 41, 0];
+            s.extend_from_slice(&stopped);
+            (r, s)
+        } else {
+            (response, stopped.to_vec())
+        };
+        if w.start_response(3, &response) != Ok(Some(()))
+            || w.start_response(0, &response) != Ok(None)
+            || w.stopped_response(3, &stopped) != Ok(true)
+            || w.stopped_response(0, &stopped) != Ok(false)
+        {
+            return TestResult::Fail("vdev response correlation");
+        }
+        if tlv {
+            let mut delete = vec![12u8, 0, 0xc3, 1, 3, 0, 0, 0];
+            delete.extend_from_slice(&BSSID);
+            delete.extend_from_slice(&[0, 0]);
+            if w.delete_response(3, &delete, BSSID) != Ok(true)
+                || w.delete_response(0, &delete, BSSID) != Ok(false)
+            {
+                return TestResult::Fail("peer delete correlation");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_station_builders_carry_vdev
+);

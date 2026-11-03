@@ -49,7 +49,7 @@ fn install_command(dialect: Dialect) -> u32 {
     }
 }
 
-/// `WMI_VDEV_INSTALL_KEY` for one CCMP-128 key of the station vdev 0 peer
+/// `WMI_VDEV_INSTALL_KEY` for one CCMP-128 key of the station `vdev` peer
 /// (Linux mac.c `ath10k_send_key`: `key_idx`, `WMI_KEY_PAIRWISE` or
 /// `WMI_KEY_GROUP`, `WMI_CIPHER_AES_CCM`, the BSSID as peer address for both
 /// in station mode). Like Linux, the RSC/TSC counters stay zero: the host
@@ -59,6 +59,7 @@ fn install_command(dialect: Dialect) -> u32 {
 /// `ARRAY_BYTE` TLV (wmi-tlv.c `ath10k_wmi_tlv_op_gen_vdev_install_key`).
 pub(super) fn install(
     dialect: Dialect,
+    vdev: u8,
     bssid: [u8; 6],
     key: &KeyInstall,
 ) -> Result<Vec<u8>, Error> {
@@ -79,7 +80,7 @@ pub(super) fn install(
     } else {
         4
     };
-    // vdev_id 0 at `at`.
+    wire::put(&mut out, at, u32::from(vdev));
     out[at + 4..at + 10].copy_from_slice(&bssid);
     wire::put(&mut out, at + 12, u32::from(key.key_id));
     wire::put(

@@ -347,7 +347,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// indication within Linux's 3 s leaves that slot software-only, as
     /// mac80211 keeps a key in software when `drv_set_key` fails.
     async fn send_station_keys(&mut self) -> Result<bool, Error> {
-        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let (vdev, bssid) = self
+            .peer
+            .as_ref()
+            .map(|p| (p.vdev, p.bssid))
+            .ok_or(Error::Failed)?;
         let dialect = self.wire.dialect;
         let Some(data) = self.data.as_mut() else {
             return Ok(false);
@@ -364,7 +368,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let Some(key) = data.keys.pop_front() else {
             return Ok(false);
         };
-        let command = zeroize::Zeroizing::new(hw_keys::install(dialect, bssid, &key)?);
+        let command = zeroize::Zeroizing::new(hw_keys::install(dialect, vdev, bssid, &key)?);
         data.key_in_flight = Some(hw_keys::InFlight {
             token: key.token,
             pairwise: key.pairwise,

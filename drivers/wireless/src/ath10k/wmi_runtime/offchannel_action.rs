@@ -551,9 +551,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = self.htt.poll().await?;
             if let htt::Event::Wmi(bytes) = &event {
                 if Some(wire::word(bytes, 0)? & 0xffffff) == self.wire.delete_event_id()
-                    && self
-                        .wire
-                        .delete_response(&bytes[4..], self.roc_action()?.destination)?
+                    && self.wire.delete_response(
+                        self.roc_action()?.vdev,
+                        &bytes[4..],
+                        self.roc_action()?.destination,
+                    )?
                 {
                     self.roc
                         .as_mut()

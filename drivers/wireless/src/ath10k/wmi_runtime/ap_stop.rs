@@ -77,7 +77,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if matches!(phase, Vdev::Up | Vdev::Started | Vdev::StopSent) {
             // Autonomous beaconing is silenced before waiting on old DATA.
             // DOWN transport receipt alone is not a STOPPED/DMA-idle proof.
-            self.ap_command(&self.wire.down_station()?, validate)
+            self.ap_command(&self.wire.down_station(self.primary.id())?, validate)
                 .await?;
             self.ap_barrier(validate).await?;
         }
@@ -107,7 +107,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             if matches!(phase, Vdev::Up | Vdev::Started | Vdev::StopSent) {
                 self.ap_publish(
-                    &self.wire.stop_station()?,
+                    &self.wire.stop_station(self.primary.id())?,
                     Publication::Vdev(Vdev::StopSent),
                     validate,
                 )
@@ -138,7 +138,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let nss = self
             .chains
             .ok_or(Error::Failed)?
-            .vdev_nss(self.wire.dialect)?;
+            .vdev_nss_for(self.wire.dialect, self.primary.id())?;
         self.ap_command(&nss, validate).await?;
         let plan = &self.ap.as_ref().unwrap().plan;
         let defaults = super::wmm::legacy_defaults(plan.config.frequency_mhz as u16, plan.rates);

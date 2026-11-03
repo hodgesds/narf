@@ -12,7 +12,7 @@ pub struct Disconnected {
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Close this retained owner permanently, then retire its peer and stop
-    /// vdev0. No command receipt is a firmware ACK. Success requires every
+    /// its vdev. No command receipt is a firmware ACK. Success requires every
     /// owned HTT peer ID to unmap, the advertised TLV delete ACK, and the
     /// matching VDEV_STOPPED event. DMA remains retained through full reset.
     /// Unversioned firmware events do not fence another join on this owner.
@@ -36,9 +36,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let synchronous_delete = self
             .wire
             .sync_delete_required(self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?);
-        let down = self.wire.down_station()?;
-        let delete = self.wire.delete_peer(prepared.bssid)?;
-        let stop = self.wire.stop_station()?;
+        // `mac.c::ath10k_bss_disassoc`/`ath10k_vdev_stop` on the peer's vdev.
+        let vdev = self.peer.as_ref().ok_or(Error::Failed)?.vdev;
+        let down = self.wire.down_station(vdev)?;
+        let delete = self.wire.delete_peer(vdev, prepared.bssid)?;
+        let stop = self.wire.stop_station(vdev)?;
         // Protected with the still-installed PTK before the owner fails.
         let deauthentication = if failed_scan {
             None
@@ -70,7 +72,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .await
                 .map_err(htt::Error::from)?;
         }
-        self.wait_peer_deleted(prepared.bssid, synchronous_delete)
+        self.wait_peer_deleted(vdev, prepared.bssid, synchronous_delete)
             .await?;
         self.htt
             .wmi
@@ -78,7 +80,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .send_wmi(&stop)
             .await
             .map_err(htt::Error::from)?;
-        self.wait_vdev_stopped(prepared.bssid).await?;
+        self.wait_vdev_stopped(vdev, prepared.bssid).await?;
         self.peer = None;
         // Keep failed/closed set even after success: neither peer retirement
         // nor vdev STOP is the whole-device reset/DMA reclamation proof.
@@ -116,7 +118,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Err(Error::Timeout)
     }
 
-    async fn wait_peer_deleted(&mut self, bssid: [u8; 6], sync: bool) -> Result<(), Error> {
+    async fn wait_peer_deleted(
+        &mut self,
+        vdev: u8,
+        bssid: [u8; 6],
+        sync: bool,
+    ) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(5000);
         let mut acknowledged = !sync;
         for _ in 0..65536 {
@@ -135,7 +142,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Wmi(bytes) => {
                     let id = wire::word(&bytes, 0)? & 0xffffff;
                     if Some(id) == self.wire.delete_event_id() {
-                        acknowledged |= self.wire.delete_response(&bytes[4..], bssid)?;
+                        acknowledged |= self.wire.delete_response(vdev, &bytes[4..], bssid)?;
                     } else if id == self.wire.stopped_event_id() {
                         // STOP has not been sent; discard unsolicited/stale
                         // STOPPED instead of caching an apparent completion.
@@ -149,7 +156,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Err(Error::Timeout)
     }
 
-    async fn wait_vdev_stopped(&mut self, bssid: [u8; 6]) -> Result<(), Error> {
+    async fn wait_vdev_stopped(&mut self, vdev: u8, bssid: [u8; 6]) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(5000);
         let mut stopped = false;
         for _ in 0..65536 {
@@ -169,11 +176,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Wmi(bytes) => {
                     let id = wire::word(&bytes, 0)? & 0xffffff;
                     if id == self.wire.stopped_event_id() {
-                        stopped |= self.wire.stopped_response(&bytes[4..])?;
+                        stopped |= self.wire.stopped_response(vdev, &bytes[4..])?;
                     } else if Some(id) == self.wire.delete_event_id() {
                         // Validate repeated delete envelopes; they confer no
                         // additional ownership or ability to restart this vdev.
-                        let _ = self.wire.delete_response(&bytes[4..], bssid)?;
+                        let _ = self.wire.delete_response(vdev, &bytes[4..], bssid)?;
                     } else {
                         self.queue(htt::Event::Wmi(bytes))?;
                     }

@@ -129,7 +129,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .as_ref()
                     .is_some_and(|ap| ap.vdev == Vdev::StartSent)
             {
-                if self.wire.start_response(&bytes[4..])? == Some(()) {
+                if self.wire.start_response(self.primary.id(), &bytes[4..])? == Some(()) {
                     self.ap.as_mut().unwrap().vdev = Vdev::Started;
                 }
             } else {
@@ -456,6 +456,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         .await?;
         let plan = &self.ap.as_ref().unwrap().plan;
         let mut start = self.wire.start_station(
+            self.primary.id(),
             &permission,
             plan.config.beacon_interval as u16,
             plan.config.dtim_period as u8,

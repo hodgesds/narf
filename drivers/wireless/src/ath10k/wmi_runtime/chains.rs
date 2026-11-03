@@ -49,6 +49,7 @@ impl Chains {
         };
         Ok([command(1)?, command(2)?])
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn vdev_nss(self, dialect: Dialect) -> Result<Vec<u8>, Error> {
         self.vdev_nss_for(dialect, 0)
     }

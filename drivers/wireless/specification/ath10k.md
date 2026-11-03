@@ -2100,10 +2100,20 @@ will bind; none of them grants RF, peer, key or data authority.
   the former literal command). `Vdev::delete` is `WMI_VDEV_DELETE_CMDID`
   (CREATE+1 in every dialect, TLV tag 87). The ROC scan writes the owning
   vdev at `wmi_start_scan_common.vdev_id` (`mac.c::ath10k_remain_on_channel`
-  uses `arvif->vdev_id`). Station/AP WMI builders whose `vdev_id` field is
-  still the implicit zero (peer, start/up/down, params) remain valid only
-  because the primary role always holds id 0; a second vdev may not use
-  them.
+  uses `arvif->vdev_id`).
+- **Station builders take a vdev.** Every station WMI builder writes the
+  owning `arvif->vdev_id` at its Linux offset: VDEV_START
+  (`ath10k_vdev_start`; after the channel in the legacy struct), BSS
+  PEER_CREATE/PEER_DELETE, PEER_ASSOC (`ath10k_peer_assoc_prepare`,
+  after the peer address), VDEV_UP/DOWN/STOP (`ath10k_bss_assoc`,
+  `ath10k_bss_disassoc`, `ath10k_vdev_stop`), VDEV_INSTALL_KEY
+  (`ath10k_install_key`), the RTS/CTS VDEV_SET_PARAMs, STA_POWERSAVE
+  mode/params, the HT40 coexistence restart and PEER_SET_PARAMs, and the
+  WoW wake event/pattern commands. VDEV_START response, VDEV_STOPPED and
+  TLV PEER_DELETE_RESP only match the owning vdev. The station owner
+  passes the vdev recorded in its `Peer` (the managed vdev for the home
+  station); the AP owner passes the managed vdev it replaced. vdev0
+  encodings are byte-identical to the former implicit builders.
 - **GO beacon P2P IE.** `go_beacon_ie` follows
   `mac.c::ath10k_mac_setup_bcn_p2p_ie` + `ath10k_mac_remove_vendor_ie`:
   for a GO vdev the first WFA P2P vendor IE after the beacon fixed fields
@@ -2208,6 +2218,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_vdev_delete_and_roc_vdev`,
 `smoke_ath10k_p2p_device_vdev_nss_on_own_id`,
 `smoke_ath10k_p2p_offchannel_builders_carry_vdev`,
+`smoke_ath10k_p2p_station_builders_carry_vdev`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`.
 

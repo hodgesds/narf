@@ -130,7 +130,7 @@ fn smoke_ath10k_coexistence_native_peer_restart_and_response_types_six_dialects(
         (Dialect::Tlv, 0x5004, 0x6004),
     ] {
         let wire = wire::Wire::new(d);
-        let restart = wire.coexistence_restart(&permission, 100, 3).unwrap();
+        let restart = wire.coexistence_restart(0, &permission, 100, 3).unwrap();
         let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let channel = if d == Dialect::Tlv { 84 } else { 4 };
         let owner = if d == Dialect::Tlv { 8 } else { 28 };
@@ -142,7 +142,7 @@ fn smoke_ath10k_coexistence_native_peer_restart_and_response_types_six_dialects(
         {
             return TestResult::Fail("real20 restart native geometry/DTIM");
         }
-        for (i, packet) in wire.coexistence_peer([2; 6]).unwrap().iter().enumerate() {
+        for (i, packet) in wire.coexistence_peer(0, [2; 6]).unwrap().iter().enumerate() {
             let at = if d == Dialect::Tlv { 8 } else { 4 };
             if word(packet, 0) != peer_id
                 || word(packet, at) != 0
@@ -158,20 +158,20 @@ fn smoke_ath10k_coexistence_native_peer_restart_and_response_types_six_dialects(
             response.splice(..0, ((40u32 << 16) | 16).to_le_bytes());
         }
         let at = usize::from(d == Dialect::Tlv) * 4;
-        if wire.coexistence_response(&response) != Ok(None) {
+        if wire.coexistence_response(0, &response) != Ok(None) {
             return TestResult::Fail("old START satisfied RESTART");
         }
         wire::put(&mut response, at + 8, 1);
-        if wire.coexistence_response(&response) != Ok(Some(())) {
+        if wire.coexistence_response(0, &response) != Ok(Some(())) {
             return TestResult::Fail("actual successful RESTART rejected");
         }
         wire::put(&mut response, at, 1);
-        if wire.coexistence_response(&response) != Ok(None) {
+        if wire.coexistence_response(0, &response) != Ok(None) {
             return TestResult::Fail("foreign VDEV RESTART accepted");
         }
         wire::put(&mut response, at, 0);
         wire::put(&mut response, at + 12, 7);
-        if wire.coexistence_response(&response) != Err(Error::Firmware(7)) {
+        if wire.coexistence_response(0, &response) != Err(Error::Firmware(7)) {
             return TestResult::Fail("failed RESTART reopened DATA");
         }
     }

@@ -52,7 +52,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .check_current()
             .map_err(crate::ath10k::control::Error::from)
             .map_err(htt::Error::from)?;
-        let commands = self.wire.protection(request)?;
+        let commands = self.wire.protection(peer.vdev, request)?;
         // Reserve before any native wait. Cancellation cannot return the
         // still-programmed owner to ordinary packet admission.
         self.failed = true;

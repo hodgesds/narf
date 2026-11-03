@@ -408,7 +408,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         Ok(())
     }
-    /// `ath10k_wow_op_suspend` for the associated station vdev0. Any error
+    /// `ath10k_wow_op_suspend` for the associated station's vdev
+    /// (`ath10k_wow_vif_cleanup`/`ath10k_vif_wow_set_wakeups` use
+    /// `arvif->vdev_id`). Any error
     /// leaves this owner failed; the caller falls back to the ordinary
     /// non-WoWLAN suspend exactly as Linux returns 1 to mac80211.
     pub(in crate::ath10k) async fn wow_suspend(
@@ -422,6 +424,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.station_link().is_none() {
             return Err(Error::Failed);
         }
+        let vdev = u32::from(self.peer.as_ref().ok_or(Error::Failed)?.vdev);
         // All commands are encoded before the first publication.
         let mut commands = Vec::new();
         let count = (EVENT_MAX + PATTERNS) as usize + program.patterns.len() + EVENT_MAX as usize;
@@ -430,16 +433,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(|_| Error::NoMemory)?;
         // ath10k_wow_vif_cleanup: disable every event, delete every slot.
         for event in 0..EVENT_MAX {
-            commands.push(wakeup_event(0, event, false)?);
+            commands.push(wakeup_event(vdev, event, false)?);
         }
         for id in 0..PATTERNS {
-            commands.push(del_pattern(0, id)?);
+            commands.push(del_pattern(vdev, id)?);
         }
         for (id, pattern) in program.patterns.iter().enumerate() {
-            commands.push(add_pattern(0, id as u32, pattern)?);
+            commands.push(add_pattern(vdev, id as u32, pattern)?);
         }
         for event in (0..EVENT_MAX).filter(|e| program.events & (1 << e) != 0) {
-            commands.push(wakeup_event(0, event, true)?);
+            commands.push(wakeup_event(vdev, event, true)?);
         }
         let enable = enable()?;
         self.failed = true;

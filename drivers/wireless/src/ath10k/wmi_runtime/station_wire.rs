@@ -60,8 +60,11 @@ impl Wire {
         put(&mut out, at + 4, u32::from(permission.half_dbm));
         Ok(out)
     }
+    /// `WMI_VDEV_START_REQUEST` for the station `vdev`
+    /// (`mac.c::ath10k_vdev_start` uses `arvif->vdev_id`).
     pub fn start_station(
         self,
+        vdev: u8,
         permission: &Permission,
         beacon: u16,
         dtim: u8,
@@ -79,6 +82,7 @@ impl Wire {
         } else {
             (28, 4)
         };
+        put(&mut out, at, u32::from(vdev));
         put(&mut out, at + 8, u32::from(beacon));
         put(&mut out, at + 12, u32::from(dtim));
         // Legacy 11G, no IBSS/HT/VHT flags, no AP SSID/rate/power or NOA.
@@ -97,11 +101,12 @@ impl Wire {
         out[chan + 21] = permission.half_dbm;
         Ok(out)
     }
-    pub fn peer(self, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
+    /// The BSS peer (`WMI_PEER_TYPE_BSS`) of the station on `vdev`.
+    pub fn peer(self, vdev: u8, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
         if bssid == [0; 6] || bssid[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        self.peer_record(0, bssid, 1)
+        self.peer_record(vdev, bssid, 1)
     }
     /// A `WMI_PEER_TYPE_DEFAULT` peer on `vdev` (`struct wmi_peer_create_cmd`
     /// vdev_id; `mac.c::ath10k_mac_tx_wmi_mgmt`/offchannel and AP stations
@@ -129,7 +134,8 @@ impl Wire {
     pub fn start_response_id(self) -> u32 {
         self.station_ids().4
     }
-    pub fn start_response(self, body: &[u8]) -> Result<Option<()>, Error> {
+    /// A start response for `vdev`; another vdev's response is `None`.
+    pub fn start_response(self, vdev: u8, body: &[u8]) -> Result<Option<()>, Error> {
         let b = if self.dialect == Dialect::Tlv {
             tag(body, 40)?
         } else {
@@ -140,7 +146,7 @@ impl Wire {
         }
         // The native Linux generator leaves requestor_id zero. This owner
         // submits exactly one START and never retries an ambiguous result.
-        if word(b, 0)? != 0 || word(b, 4)? != 0 {
+        if word(b, 0)? != u32::from(vdev) || word(b, 4)? != 0 {
             return Ok(None);
         }
         if word(b, 8)? != 0 {
