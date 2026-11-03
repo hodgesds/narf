@@ -191,10 +191,23 @@ publishes one sound card per enumerated codec through the registry,
 using the generic codec profile (DP1 sink + DP1 source, stereo S16LE
 48 kHz). A bus with no answering codec publishes nothing. The card
 implements the PCM lifecycle against the bus (configure/prepare/enable/
-disable/deprepare); moving PCM payload between host memory and the
-wire is the ACP SDW DMA engine's job, a separate hardware block whose
-register model is not in-tree yet, so payload reads/writes report
-BadState until that engine lands (follow-up to #780).
+disable/deprepare) and moves PCM payload through the ACP SDW DMA engine
+(`acp63_sdw_dma::SdwDma`, installed on each card at probe): one ring
+per lease, ATU/window programming at prepare mirroring the PDM path,
+counter/pointer accounting in frames, wrap/xrun discipline, and
+failed-stop retention. A full stop invalidates prepare on both layers
+(restart needs a fresh prepare); pause/resume preserves queued samples
+and position. One DMA channel serves the whole function, so a second
+stream's start fails `DeviceBusy` while the first runs — concurrent
+bidirectional streaming is out of scope. Cards without an engine
+(generic transports) still report `BadState` for payload reads/writes.
+UNVERIFIED HARDWARE ASSUMPTION: the engine programs the ACP DMA
+channel block the PDM path uses, on the premise that the SDW binding
+owns the function exclusively when it binds. Linux's `ps-sdw-dma.c`
+register map was not verified from source in the #870 lane (no
+`sound/` tree on the build machine; the patch text was unreachable),
+so the channel programming must be validated on silicon before it is
+treated as proven; a correction belongs in `AcpDmaRegs` alone.
 
 Intel SoundWire links are not bound here: in the tree's platform model
 they are owned by the audio DSP (SOF), whose in-tree surface is a
@@ -271,13 +284,21 @@ Implementation checked against local /usr/src/linux:
 - sound/hda/codecs/generic.c (routing, amps and jack handling);
 - sound/soc/amd/ps/pci-ps.c, ps-common.c, ps-pdm-dma.c, acp63.h;
 - include/sound/acp63_chip_offset_byte.h.
+The SDW DMA channel programming mirrors the in-tree PDM path; Linux
+`sound/soc/amd/ps/ps-sdw-dma.c` was not available to the #870 lane
+(no `sound/` tree on the build machine, patch text unreachable), so
+the channel-block reuse is an explicitly flagged assumption (§3.2),
+not a checked reference.
 
 ## 7. Stage assignment and verification
 
 Stage 5 native analog output/input and digital-microphone foundations.
 Targeted tests cover full fake-HDA initialization and command/PCM paths,
 unsolicited replies interleaved with commands, selector cycles, capture,
-ACP address translation/counter rollover/overrun and failed-stop retention.
+ACP address translation/counter rollover/overrun and failed-stop retention,
+and ACP SDW DMA ring layout, counter/pointer accounting, capture wrap,
+failed-stop retention, single-channel arbitration, and lease-level
+playback/capture movement through the engine.
 QEMU intel-hda with hda-duplex exercises playback across ring wrap, capture
 DMA progress and capture-capability revocation. These are software/emulator
 proofs, not evidence of audible playback or microphone quality on Lenovo 50ee.
@@ -287,9 +308,11 @@ proofs, not evidence of audible playback or microphone quality on Lenovo 50ee.
 Physical validation must establish the actual HDA codec, BIOS route quality,
 jack behavior and whether speaker amplifiers need a model-specific quirk.
 HDMI/DP and system power-transition reinitialization remain separate
-implementation work. SoundWire follow-ups to #780 remain: the ACP SDW DMA
-payload engine, PDM+SoundWire coexisting ACP pin configurations, Intel
-DSP/SOF-owned SoundWire links, and vendor codec profiles (jack/amp
-sequences) beyond the generic conversation. PCM pause/resume preserves DMA buffers and position.
+implementation work. SoundWire follow-ups to #780 remain: PDM+SoundWire coexisting ACP pin
+configurations, Intel DSP/SOF-owned SoundWire links, and vendor codec
+profiles (jack/amp sequences) beyond the generic conversation. The ACP
+SDW DMA payload engine has landed (#870), but its channel programming
+still needs validation on silicon against the Linux `ps-sdw-dma.c`
+register map (see §3.2). PCM pause/resume preserves DMA buffers and position.
 The shared sound bridge supplies Linux ALSA ioctl/mmap/poll for the registered
 native endpoints, subject to its documented feature limits.

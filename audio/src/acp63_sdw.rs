@@ -21,9 +21,10 @@
 //!   both on one function is a follow-up to #780.
 //! - Enumerated codecs are published as sound cards with the generic
 //!   codec conversation; the ACP SDW DMA engine that moves PCM
-//!   payload between host memory and the manager is a separate
-//!   hardware block and is likewise a follow-up to #780.
+//!   payload between host memory and the manager lives in
+//!   [`crate::acp63_sdw_dma`] and is installed on each card at probe.
 
+use crate::acp63_sdw_dma::AcpSdwDmaFactory;
 use crate::soundwire::{
     Bus, CodecCard, SdwError, StreamConfig, Transport, BROADCAST_DEV_NUM, GENERIC_CODEC_PROFILE,
 };
@@ -344,7 +345,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     .map_err(|_| ProbeError::BadDevice)?;
     // SAFETY: Bus probing has exclusively claimed this function and its BAR.
     let mmio = unsafe { narf_bus::bar::map_bar(&device, 0) }.map_err(|_| ProbeError::BadDevice)?;
-    if mmio.len < regs::MANAGER_OFFSET + regs::SW_ERROR_INTR_MASK + 4 {
+    // The DMA engine programs the ATU scratch window as well as the
+    // manager block; a BAR covering one but not the other binds a
+    // card whose streams could never move samples, so fail closed.
+    if mmio.len < regs::MANAGER_OFFSET + regs::SW_ERROR_INTR_MASK + 4
+        || mmio.len < crate::acp63::SCRATCH + 64
+    {
         return Err(ProbeError::BadDevice);
     }
     power_up(mmio)?;
@@ -392,12 +398,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let mut cards = Vec::new();
     let mut capture_card = None;
     for dev_num in enumerated {
-        let card = Arc::new(CodecCard::new(
-            shared.clone(),
-            dev_num,
-            GENERIC_CODEC_PROFILE,
-            stream,
-        ));
+        let mut card = CodecCard::new(shared.clone(), dev_num, GENERIC_CODEC_PROFILE, stream);
+        card.set_payload_engine(Arc::new(AcpSdwDmaFactory::new(mmio)));
+        let card = Arc::new(card);
         let info = narf_drivers_sound::CardInfo {
             index: 0,
             driver: "acp63-sdw",
