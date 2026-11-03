@@ -500,9 +500,10 @@ pub unsafe fn bring_up(
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<RtlwifiDevice, ProbeError> {
     let did = device.id.device;
-    // Retained native station profiles: RTL8188EE and (2.4 GHz, no BT
-    // coexistence) RTL8821AE. Every other matched chip stays diagnostic.
-    let retained = matches!(did, RTL_DEV_8188EE | RTL_DEV_8821AE);
+    // Retained native station profiles: RTL8188EE, (no BT coexistence)
+    // RTL8821AE and (2.4 GHz, no BT coexistence, EFUSE TX power present)
+    // RTL8192EE. Every other matched chip stays diagnostic.
+    let retained = matches!(did, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE);
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
             .map_err(|_| ProbeError::RegisterBarMapFailed)?;
@@ -510,6 +511,8 @@ pub unsafe fn bring_up(
             || (device.id.device == RTL_DEV_8188EE && registers.len < 0x2000)
             || (device.id.device == RTL_DEV_8821AE
                 && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
+            || (device.id.device == RTL_DEV_8192EE
+                && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
         {
             return Err(ProbeError::RegisterBarMapFailed);
         }
@@ -543,9 +546,30 @@ pub unsafe fn bring_up(
         let factory =
             unsafe { efuse::read_factory(&registers, did, function) }.map_err(ProbeError::Efuse)?;
 
-        Ok((registers, factory))
+        // RTL8192EE: the facts `configure_rtl8192ee` re-derives, checked
+        // before the function is retained. A test chip, an unprovisioned
+        // map, a BT-coexist board (`rtl92ee_read_bt_coexist_info_from_hwpg`
+        // board type 1) or a map without TX power (`0x11 == 0xff`, Linux's
+        // autoload-fail TX power branch) stays diagnostic.
+        let admissible = did != RTL_DEV_8192EE || {
+            use super::rtl8192ee::{adapter, txpower};
+            // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+            let (sys_cfg1, cr9346) = unsafe {
+                (
+                    registers.read32(u64::from(adapter::REG_SYS_CFG1)),
+                    registers.read8(u64::from(adapter::REG_9346CR)),
+                )
+            };
+            adapter::Adapter::from_hardware(sys_cfg1, cr9346, &factory.logical)
+                .is_ok_and(|facts| !facts.bt_coexist && facts.mac == factory.mac)
+                && txpower::Efuse::from_logical(&factory.logical).is_ok()
+        };
+
+        Ok((registers, (factory, admissible)))
     })
     .map_err(|_| ProbeError::PciAccess)??;
+    let (factory, admissible) = factory;
+    let retained = retained && admissible;
     let mac = factory.mac;
     let factory = retained.then(|| Arc::new(factory));
 

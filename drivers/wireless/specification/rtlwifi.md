@@ -2070,12 +2070,13 @@ Tests in `rtl8821ae/tests.rs` and `packet_ae_tests.rs` are written and
 unexecuted. Physical-board qualification (signed `NAPC` envelope
 measurements, silicon association) remains external.
 
-### RTL8192EE retained-runtime foundation (groundwork, not admitted)
+### RTL8192EE retained runtime (implemented, pending validation)
 
-`rtl8192ee/` holds the Linux-derived pieces a third native rtlwifi chip
+`rtl8192ee/` holds the Linux-derived pieces the third native rtlwifi chip
 (`0x818b`, 2T2R 2.4 GHz) is built from, following the RTL8821AE pattern.
-None is reachable from probe as a WLAN capability: `0x818b` stays
-diagnostic (`pci::bring_up` does not retain it).
+Probe retains an admissible `0x818b` function as a native device and
+admits it under its signed `N92E` envelope (probe admission below); an
+unprovisioned board stays unadmitted.
 
 - `pwrseq` — PCI rows of every `rtl8192E_*_flow` (card enable/disable,
   suspend/resume, radio-off, LPS enter/leave), generated from `pwrseq.h`
@@ -2163,14 +2164,16 @@ diagnostic (`pci::bring_up` does not retain it).
   = 0x8000`. TX (`rtl_pci_tx`): the device write point must equal
   `cur_tx_wp` with `calc_fifo_space` room; descriptor (forced legacy
   rate, fallback disabled, `RATR_INX_WIRELESS_MC` — no
-  `RTL_SPEC_NEW_RATEID`), BD naming it and the frame, then the
+  `RTL_SPEC_NEW_RATEID`; RA-adapted DATA is described under HT below),
+  BD naming it and the frame, then the
   `REG_*_TXBD_IDX` doorbell (`rtl92ee_set_desc(HW_DESC_OWN)`). Completion
   is `rtl92ee_is_tx_desc_closed` over the `[27:16]` read point with the BD
   and stable descriptor words intact. RX (`_rtl_pci_rx_interrupt`): the
   `rtl92ee_rx_desc_buff_remained_cnt` count (`start_rx` per owner), the
   `rtl92ee_rx_check_dma_ok` reads, the 24-byte status, legacy non-A-MPDU
   frames delivered, C2H/HT/error frames consumed and dropped, the BD
-  re-prepared and the advanced `next_rx_rp` written to `0x3b4`.
+  re-prepared and the advanced `next_rx_rp` written to `0x3b4` (HT
+  frames on an HT link: see HT below).
   Deliberate: an RX BD never showing completion is not consumed; the BD is
   re-prepared before the `0x3b4` acknowledgement; host/device pointer
   disagreement fails the owner. Interrupts use the 8192EE profile
@@ -2359,9 +2362,8 @@ diagnostic (`pci::bring_up` does not retain it).
   (`rtl_is_tx_report_skb`, shared with 8821AE). Power-down:
   `rebuild_native` `power_down` dispatches `0x818b` to
   `power_runtime::disable_rtl8192ee` and keeps ASPM disabled; the
-  rebuild's re-enable still refuses `0x818b` (no 8192EE provisioning
-  path yet). The station loop's smoothed PWDB feed and the per-board
-  admitted set are composed by the station branch (below). Tests
+  rebuild's re-enable is `enable_rtl8192ee` (probe admission below).
+  The station loop's smoothed PWDB feed and the per-board admitted set are composed by the station branch (below). Tests
   `smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce`,
   `smoke_rtl8192ee_poweroff_adapter_order` (written, unexecuted);
   `smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack` now expects the
@@ -2403,11 +2405,8 @@ diagnostic (`pci::bring_up` does not retain it).
   retained `cck_high_power`). `retune_rtl8192ee` (join and Configuring)
   re-derives the `N92E` permission for the offered width on the
   provisioned primary and runs `configure_rtl8192ee_channel` inside it
-  (no frame outstanding, receive epoch retired). Still legacy-only at this
-  step: the join plan offers no HT (`rtl8192ee/ht.rs` holds the 2T2R
-  capability, `admitted`/`two_stream` and the `HW_VAR_AMPDU_FACTOR`
-  timing, not yet composed), DATA keeps the forced legacy rate and
-  `0x818b` is not admitted at probe. Test
+  (no frame outstanding, receive epoch retired). HT and probe admission
+  are composed (below). Test
   `smoke_rtl8192ee_station_peer_join_lps_and_leave`
   (`packet_owner_tests.rs`, written, unexecuted).
 - `rsvd_page` — `fw.c::reserved_page_packet` verbatim (1024 bytes, eight
@@ -2447,6 +2446,80 @@ diagnostic (`pci::bring_up` does not retain it).
   `smoke_rtl8192ee_dm_ra_state_and_pwdb`.
   Test `smoke_rtl8192ee_tables_and_check_condition_walk` (written,
   unexecuted).
+- HT20/40 station (`rtl8192ee/ht.rs`, `ht_width.rs`, `station.rs`,
+  `packet_owner.rs`). The join plan offers `ht::local(forty, two_stream)`
+  only when the AP has WMM and the current `N92E` permission admits
+  MCS0-7 on both paths (`rtl8192ee_ht`). Capability:
+  `_rtl_init_hw_ht_capab` for `RF_2T2R` (SGI20, MAX_AMSDU 7935-byte RX,
+  A-MPDU factor 3, density 7, RX MCS0-15 `TX_DEFINED`, no STBC/LDPC, no
+  MCS32/`rx_highest`); the 20/40 bit with SGI40/DSSSCCK40 only when
+  `rtl8192ee_wide` finds a `permission_for(domain, 40 MHz above/below)`
+  for the AP's offered geometry on the provisioned primary that admits
+  MCS0-7; the local TX MCS8-15 selection only when the 20 MHz permission
+  on the primary and (if offered) the 40 MHz one both admit every
+  two-stream rate (`rtl8192ee_two_stream`; Configuring may narrow to 20
+  MHz). `retune_rtl8192ee` runs before authentication and at
+  Configuring for the negotiated width. At Configuring
+  (`BSS_CHANGED_HT`) only `HW_VAR_AMPDU_FACTOR` (`ht::timing`,
+  `REG_AGGLEN_LMT` nibbles lowered to `1 << (min(peer, 3) + 2)`) is
+  written — `rtl92ee_set_hw_reg` has no SHORTGI_DENSITY/AMPDU_MIN_SPACE
+  case — inside the station publication, `packet.ht` is set, and the 88EE
+  `ht_timing` branch is skipped; an AP with HT protection mode ≠ 0 is
+  refused (as 88EE/8821AE). `Candidate::receive` observes beacons with
+  the 8192EE HT20 PHY. Host capability (`ht::host_capabilities` /
+  `host_phy` → `interface.rs` `rtl8192ee_caps`): 2.4 GHz HT on an
+  `admitted` 20 MHz point, the 20/40 form on an `admitted` 40 MHz point,
+  TX MCS8-15 only when every HT-admitting point admits it. RA mask: the
+  association `install_rtl8192ee_station_rate_mask` (mac80211
+  intersection, `bw_40` = programmed width). TX (`ee92_submit`,
+  `rtl_get_tcb_desc` + `rtl92ee_tx_fill_desc`): ordinary unicast DATA
+  with an installed mask (`queue_station`'s fallback arm, as 8821AE: no
+  protection, mask present) clears USE_RATE/DISFB, starts at
+  `_rtl_get_highest_n_rate` (MCS15 for a peer naming `rx_mask[1]`, else
+  MCS7; 11M B / 54M G) and names RATE_ID from `mac->mode`
+  (`_rtl_txrate_selectmode` with `dm.useramask`, no NEW_RATEID: NGB 0 /
+  GB 4 / B 6), MACID 0; every other frame keeps the forced rate with
+  USE_RATE + DISFB and `RATR_INX_WIRELESS_MC` (deliberate: Linux also
+  hands Null/EAPOL DATA to the firmware). The forced/initial rate must be
+  in the permission's `admitted_rates`. `bw_40`: a unicast packet above
+  54M on an HT link is 40 MHz (`data_bw` 1, SC 3), every other packet
+  names `cur_40_prime_sc`. AGG_EN + `max_agg_num 0x14` for an
+  operational BA TID with the peer's density (QoS DATA only). Linux
+  writes no data SGI bit on 8192EE (SGI comes from the RA mask's SGI
+  flag), so `short_gi` is only validated against the HT link. RX
+  (`ee92_receive_step`): on an HT link MCS0-15 and A-MPDU members (BA
+  owner gates them) up to the 7935-byte A-MSDU MPDU; `Mpdu.ht` from the
+  MCS rate, `aggregated` from PAGGR; `rtl92ee_rx_query_desc` never sets
+  `is_ht`/`rx_is40mhzpacket`/`is_short_gi`, so width40/short_gi stay
+  false and nothing is gated on them. Test
+  `smoke_rtl8192ee_ht_ra_adaptive_aggregate_tx` (`packet_owner_tests.rs`,
+  written, unexecuted); the existing doorbell/rate-mask tests now hold a
+  channel-1 `N92E` permission (`permission20`).
+- Probe admission (`pci.rs`, `prepare_native.rs`, `interface.rs`,
+  `rebuild_native.rs`, `power_runtime.rs`). `bring_up` retains `0x818b`
+  (BAR2 at least `rtl8192ee::MMIO_SIZE`) only when the facts
+  `configure_rtl8192ee` re-derives already hold at probe: not a test
+  chip, provisioned map (`adapter::Adapter::from_hardware` over live
+  `REG_SYS_CFG1`/`REG_9346CR`), not a BT-coexist board
+  (`rtl92ee_read_bt_coexist_info_from_hwpg` board type 1), EFUSE MAC
+  equal, TX power present (`0x11 != 0xff`); otherwise it stays
+  diagnostic. `prepare_native::prepare_rtl8192ee` (dispatched from
+  `initialize_registered_on_channel`, channels 1-11): registry firmware,
+  `allocate_rtl8192ee`, `prepare` (DMA-hang check, `init_mac`),
+  `configure_rtl8192ee`, then `admit_rtl8192ee` (`N92E` 20 MHz
+  permission on the channel, `configure_rtl8192ee_channel`,
+  `configure_rtl8192ee_mac`, `stage_rtl8192ee_calibration`), shared with
+  the interface readiness path (`ready`, which no longer falls back to
+  the 88EE `NEPC` for this chip). `prepare_bus_power` keeps ASPM disabled
+  (8192EE `enable_aspm` not composed); `allow_channel` is the `N92E` 20
+  MHz permission. Rebuild: after `power_down`
+  (`disable_rtl8192ee`), `power_runtime::enable_rtl8192ee` runs the
+  `_rtl92ee_init_mac` prefix and `RTL8192E_NIC_ENABLE_FLOW` (the probe's
+  `power_on_with` entry, asynchronously), re-verifies the factory
+  identity and re-provisions a fresh `Owner(0x818b)`. As 8821AE, a
+  failed first provisioning is not retried (`provisioning` retries only
+  88EE). Not composed: BT coexistence, ASPM, WoWLAN, protection
+  (ERP/RTS stay refused without the 88EE grant), LDPC/STBC.
 
 Tests (`rtl8192ee/tests.rs`, written, unexecuted):
 `smoke_rtl8192ee_tx_buffer_descriptor_segments_and_psb`,

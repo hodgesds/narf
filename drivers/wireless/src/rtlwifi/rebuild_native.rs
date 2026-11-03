@@ -79,13 +79,14 @@ impl
         use super::super::{
             firmware_transport::Owner,
             prepare,
-            regs::{RTL_DEV_8188EE, RTL_DEV_8821AE},
+            regs::{RTL_DEV_8188EE, RTL_DEV_8192EE, RTL_DEV_8821AE},
         };
         // The fresh-generation rebuild is the card-disable/enable flow:
         // 88EE `_rtl88ee_poweroff_adapter` + NIC enable, 8821AE
-        // `_rtl8821ae_poweroff_adapter` + `_rtl8821ae_init_mac`'s enable.
+        // `_rtl8821ae_poweroff_adapter` + `_rtl8821ae_init_mac`'s enable,
+        // 8192EE `_rtl92ee_poweroff_adapter` + `_rtl92ee_init_mac`'s enable.
         let device = self.firmware().device_id();
-        if !matches!(device, RTL_DEV_8188EE | RTL_DEV_8821AE) {
+        if !matches!(device, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE) {
             return Err(Error::State);
         }
         self.power_down().await?;
@@ -98,6 +99,8 @@ impl
         self.power_state.store(2, Ordering::Release);
         let enabled = if device == RTL_DEV_8821AE {
             super::super::power_runtime::enable_rtl8821ae(&io).await
+        } else if device == RTL_DEV_8192EE {
+            super::super::power_runtime::enable_rtl8192ee(&io).await
         } else {
             super::super::power_runtime::enable(&io).await
         };

@@ -1,5 +1,5 @@
-//! Private retained RTL8188EE/RTL8821AE LLT/descriptor continuation, with
-//! PCI BME off.
+//! Private retained RTL8188EE/RTL8821AE/RTL8192EE LLT/descriptor
+//! continuation, with PCI BME off.
 use super::{
     firmware_native::PciIo,
     firmware_transport::{Owner, PacketIo},
@@ -250,6 +250,82 @@ pub(super) async fn admit_rtl8821ae<I: super::firmware_transport::Io, M: Memory>
         .stage_rtl8821ae_calibration(calibration, domain)
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))
 }
+/// RTL8192EE retained continuation to an admitted 2.4 GHz station owner,
+/// as [`prepare_rtl8821ae`]: registry firmware (`rtl8192eefw.bin`), the
+/// one-shot packet claim, the 8192EE BD/descriptor rings with
+/// `_rtl92ee_init_mac` (DMA-hang check, LLT, ring bases), the parked
+/// `rtl92ee_hw_init` radio (`configure_rtl8192ee`: BT-coexist boards and
+/// maps without TX power refused before any table write), then the channel
+/// from the signed per-board `N92E` envelope under current host policy,
+/// the operational MAC and the staged envelope the station re-proves at
+/// every publication. Packet DMA, CR gates and IRQs stay closed until the
+/// station service starts.
+pub(super) async fn prepare_rtl8192ee(
+    firmware: Arc<Owner<PciIo>>,
+    retained: Arc<Retained>,
+    factory: Arc<super::efuse::Factory>,
+    channel: u8,
+) -> Result<(), Error> {
+    if !(1..=11).contains(&channel) || firmware.device_id() != super::regs::RTL_DEV_8192EE {
+        return Err(Error::State);
+    }
+    if firmware.status().stage == super::firmware_transport::Stage::Detected {
+        firmware.initialize_registered().await?;
+        let prepared = allocate(firmware, 128)?;
+        prepare_retained(&retained, prepared).await?;
+        let mut storage = retained.lock().await;
+        storage
+            .as_mut()
+            .ok_or(Error::State)?
+            .configure_rtl8192ee(&factory)
+            .await?;
+    } else if firmware.status().stage != super::firmware_transport::Stage::Ready {
+        return Err(Error::State);
+    }
+    let mut storage = retained.lock().await;
+    let prepared = storage.as_mut().ok_or(Error::State)?;
+    if prepared.phase() == super::prepare::Phase::MacConfigured && prepared.station_transmit_ready()
+    {
+        return Ok(());
+    }
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+    admit_rtl8192ee(prepared, &factory, &domain, channel).await
+}
+
+/// RadioConfigured/ChannelConfigured → MacConfigured with a staged `N92E`
+/// envelope (20 MHz permission on `channel`); a MacConfigured owner
+/// without one only stages it. Shared by native provisioning and the
+/// interface's readiness path.
+pub(super) async fn admit_rtl8192ee<I: super::firmware_transport::Io, M: Memory>(
+    prepared: &mut Prepared<I, M>,
+    factory: &super::efuse::Factory,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+) -> Result<(), Error> {
+    use super::prepare::Phase;
+    let calibration =
+        super::rtl8192ee::envelope::Calibration::load_registered(factory).map_err(Error::Power)?;
+    if matches!(
+        prepared.phase(),
+        Phase::RadioConfigured | Phase::ChannelConfigured
+    ) {
+        let permission = calibration
+            .permission(domain, channel)
+            .map_err(Error::Power)?;
+        prepared.configure_rtl8192ee_channel(permission).await?;
+        prepared.configure_rtl8192ee_mac(factory)?;
+    }
+    if prepared.phase() != Phase::MacConfigured {
+        return Err(Error::State);
+    }
+    if prepared.station_calibration_present() {
+        return Ok(());
+    }
+    prepared
+        .stage_rtl8192ee_calibration(calibration, domain)
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))
+}
 pub(super) async fn initialize_registered(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
@@ -270,6 +346,9 @@ pub(super) async fn initialize_registered_on_channel(
     }
     if !(1..=11).contains(&channel) {
         return Err(Error::State);
+    }
+    if firmware.device_id() == super::regs::RTL_DEV_8192EE {
+        return prepare_rtl8192ee(firmware, retained, factory, channel).await;
     }
     if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);

@@ -263,6 +263,7 @@ pub(crate) fn smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack() -> TestResul
     owner.phase = Phase::MacConfigured;
     owner.packet.local = Some(local);
     owner.packet.ee92.channel = Some(1);
+    owner.rtl8192ee_power = Some(permission20());
     let started = owner.start_packets();
     let master = bus.0.lock().master;
     if started.is_err()
@@ -361,6 +362,40 @@ kernel_test_in!(
     smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack
 );
 
+/// A signed-format `N92E` envelope with every curve measured (rows: 20 MHz
+/// and 40 MHz above on channel 1) under a 20 dBm 2402-2472 MHz rule.
+fn envelope() -> (
+    super::super::super::super::rtl8192ee::envelope::Calibration,
+    narf_wireless::reg::RegulatoryDomain,
+) {
+    use super::super::super::super::rtl8192ee::{
+        envelope::Calibration,
+        phy_tests::{envelope_factory, n92e},
+    };
+    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    let factory = envelope_factory();
+    let file = n92e(&factory, &[(1, 20, 0), (1, 40, 1)], 4, &[]);
+    let cal = Calibration::from_verified(&file, Some([1; 32]), &factory).unwrap();
+    let domain = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 40,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    };
+    (cal, domain)
+}
+
+/// The channel-1 20 MHz permission of [`envelope`] (every rate admitted),
+/// which `ee92_submit` checks every on-air rate against.
+fn permission20() -> super::super::super::super::rtl8192ee::envelope::Permission {
+    let (cal, domain) = envelope();
+    cal.permission(&domain, 1).unwrap()
+}
+
 fn running(bus: &Bus, local: [u8; 6]) -> Prepared<Bus, Block> {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut owner = allocated(bus, &drops).unwrap();
@@ -368,6 +403,7 @@ fn running(bus: &Bus, local: [u8; 6]) -> Prepared<Bus, Block> {
     owner.phase = Phase::MacConfigured;
     owner.packet.local = Some(local);
     owner.packet.ee92.channel = Some(1);
+    owner.rtl8192ee_power = Some(permission20());
     owner.start_packets().unwrap();
     owner
 }
@@ -553,6 +589,83 @@ pub(crate) fn smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce() -> Test
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192ee_tx_report_rate_mask_watchdog_and_quiesce
+);
+
+/// HT TX on the 8192EE owner: adaptive DATA needs the installed RA mask;
+/// with it the descriptor leaves USE_RATE/DISFB clear, starts at
+/// `_rtl_get_highest_n_rate` (MCS15 for a 2T2R peer), names RATE_ID NGB
+/// (`_rtl_txrate_selectmode`, no NEW_RATEID) and carries AGG_EN, the peer
+/// density and `max_agg_num 0x14`; multicast adaptive frames and legacy
+/// links' aggregation are refused.
+pub(crate) fn smoke_rtl8192ee_ht_ra_adaptive_aggregate_tx() -> TestResult {
+    use super::super::super::super::rtl8192ee::h2c;
+    let bus = Bus::new();
+    let local = [2, 0, 0, 0, 0, 1];
+    let ap = [2, 0, 0, 0, 0, 9];
+    let mut owner = running(&bus, local);
+    owner.packet.qos = true;
+    let mut frame = vec![0u8; 40];
+    frame[0] = 0x88;
+    frame[1] = 0x01;
+    frame[4..10].copy_from_slice(&ap);
+    frame[10..16].copy_from_slice(&local);
+    frame[16..22].copy_from_slice(&ap);
+    if owner.submit_aggregate(
+        &frame,
+        trx::DESC_RATEMCS0 + 7,
+        Some((5, true)),
+        false,
+        false,
+    ) != Err(Error::Packet)
+    {
+        return TestResult::Fail("aggregation on a legacy link");
+    }
+    owner.packet.ht = true;
+    if owner.submit_aggregate(&frame, trx::DESC_RATEMCS0 + 7, None, true, false)
+        != Err(Error::State)
+    {
+        return TestResult::Fail("adaptive DATA without an RA mask");
+    }
+    let peer = h2c::Peer {
+        legacy: 0xfff,
+        ht: Some([0xff, 0xff]),
+        sgi20: true,
+        sgi40: false,
+    };
+    let admitted = permission20().admitted_rates() as u32;
+    if narf_scheduler::block_on(owner.ee92_install_rate_mask(peer, false, 0, admitted)).is_err() {
+        return TestResult::Fail("RA mask install");
+    }
+    let mut group = frame.clone();
+    group[4] = 0xff;
+    if owner.submit_aggregate(&group, trx::DESC_RATEMCS0 + 7, None, true, false)
+        != Err(Error::Packet)
+    {
+        return TestResult::Fail("adaptive multicast DATA");
+    }
+    if owner
+        .submit_aggregate(&frame, trx::DESC_RATEMCS0 + 7, Some((5, true)), true, true)
+        .is_err()
+    {
+        return TestResult::Fail("adaptive HT DATA submit");
+    }
+    let desc = &owner.tx[11];
+    let (dw1, dw2, dw3, dw4) = (word(desc, 4), word(desc, 8), word(desc, 12), word(desc, 16));
+    if dw4 & 0x7f != u32::from(trx::DESC_RATEMCS15)
+        || dw3 & (1 << 8 | 1 << 10) != 0
+        || (dw1 >> 16) & 0x1f != 0
+        || dw2 & 1 << 12 == 0
+        || (dw2 >> 20) & 7 != 5
+        || (dw3 >> 17) & 0x1f != 0x14
+        || (dw4 >> 5) & 3 != 0
+    {
+        return TestResult::Fail("RA-adapted HT descriptor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_ht_ra_adaptive_aggregate_tx
 );
 
 /// Station branch of the 8192EE owner: `rtl_op_add_interface` network type

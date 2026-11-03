@@ -98,3 +98,53 @@ pub fn timing(io: &impl Io, peer_factor: u8) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// Host-capability bits ([`host_capabilities`]).
+pub const HOST_HT_2G: u8 = 1 << 0;
+pub const HOST_HT40_2G: u8 = 1 << 1;
+/// Every HT-admitting operating point also admits MCS8-15 on both paths.
+pub const HOST_TX_2SS: u8 = 1 << 2;
+
+/// The 2.4 GHz capability the host API (nl80211 `GET_WIPHY`) publishes.
+/// Linux `base.c::_rtl_init_mac80211` runs `_rtl_init_hw_ht_capab` on the
+/// sband unconditionally; here it carries HT only while the signed `N92E`
+/// envelope admits it under `domain` at some operating point the
+/// association path can select: HT on an [`admitted`] 20 MHz point, the
+/// 20/40 form on an [`admitted`] 40 MHz point. The TX MCS8-15 selection is
+/// published only when every such point admits it ([`two_stream`]), so the
+/// host never sees a wider TX set than an association could send.
+pub fn host_capabilities(
+    base: &super::envelope::Calibration,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+) -> u8 {
+    use super::envelope::Width;
+    let mut caps = 0;
+    let mut two = true;
+    for op in base.operating_points() {
+        let Ok(permission) = base.permission_for(domain, op) else {
+            continue;
+        };
+        if !admitted(&permission) {
+            continue;
+        }
+        two &= two_stream(&permission);
+        caps |= match op.width {
+            Width::W20 => HOST_HT_2G,
+            Width::W40Above | Width::W40Below => HOST_HT_2G | HOST_HT40_2G,
+        };
+    }
+    if caps != 0 && two {
+        caps |= HOST_TX_2SS;
+    }
+    caps
+}
+
+/// The `PhyCapabilities` of `band` for the [`host_capabilities`] bits: the
+/// same HT body ([`capability`]) the association path sends; `None` off
+/// 2.4 GHz or without HT.
+pub fn host_phy(caps: u8, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+    (band == 2400 && caps & HOST_HT_2G != 0).then(|| narf_wireless::iface::PhyCapabilities {
+        ht: capability(caps & HOST_HT40_2G != 0, caps & HOST_TX_2SS != 0).capability_body(),
+        vht: None,
+    })
+}

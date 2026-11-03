@@ -1075,6 +1075,15 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .rtl8821ae_power
                 .is_some_and(|p| super::super::rtl8821ae::ht::admitted(&p))
     }
+    /// RTL8192EE: the current `N92E` permission admits the HT station
+    /// (every MCS0-7 rate holds a measured index on both paths, so the
+    /// `rtl92ee_update_hal_rate_mask` one-stream rows stay admitted).
+    pub(crate) fn rtl8192ee_ht(&self) -> bool {
+        self.chip == super::Chip::Rtl8192ee
+            && self
+                .rtl8192ee_power
+                .is_some_and(|p| super::super::rtl8192ee::ht::admitted(&p))
+    }
     /// RTL8821AE: the host-API capability bits
     /// (`rtl8821ae::vht::host_capabilities`) of the staged calibration
     /// envelope under current host policy; 0 for every other chip, without
@@ -1093,6 +1102,26 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         };
         environment.domain().map_or(0, |domain| {
             super::super::rtl8821ae::vht::host_capabilities(base, &domain)
+        })
+    }
+    /// RTL8192EE: the host-API capability bits
+    /// (`rtl8192ee::ht::host_capabilities`) of the staged `N92E` envelope
+    /// under current host policy; 0 for every other chip, without an
+    /// envelope or without a regulatory domain.
+    pub(crate) fn station_rtl8192ee_host_caps(&self, environment: &impl Environment) -> u8 {
+        if self.chip != super::Chip::Rtl8192ee {
+            return 0;
+        }
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ee())
+        else {
+            return 0;
+        };
+        environment.domain().map_or(0, |domain| {
+            super::super::rtl8192ee::ht::host_capabilities(base, &domain)
         })
     }
     /// The RTL8821AE owner holds a 5 GHz channel grant.
@@ -1657,12 +1686,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // Ordinary DATA may clear DISFB only under a current NEFB grant;
         // without it the base programs' fixed USE_RATE + DISFB applies.
         // `_rtl_query_shortgi`: SGI80 at 80 MHz, SGI40 at 40 MHz (8821AE
-        // only), else SGI20.
+        // and 8192EE only), else SGI20.
         let sgi_profile = self.station.ht_profile.is_some_and(|p| {
             if self.packet.eighty {
                 self.station.vht_profile.is_some_and(|v| v.tx_sgi80())
             } else if self.packet.width.is_some() {
-                self.chip == super::Chip::Rtl8821ae && p.tx_sgi40()
+                matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee) && p.tx_sgi40()
             } else {
                 p.tx_sgi20()
             }
@@ -1693,7 +1722,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // mask advertises SGI. NEFB v1 did not qualify that firmware mode.
         // RTL8821AE: rtl_get_tcb_desc firmware RA for ordinary DATA once the
         // mask is installed; the NAPC permission admits every station rate.
-        let fallback = if self.chip == super::Chip::Rtl8821ae {
+        // RTL8192EE: the same, inside the installed `rtl92ee_update_hal_
+        // rate_mask` (a subset of the `N92E` admitted rates).
+        let fallback = if matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee) {
             matches!(kind, Kind::Data)
                 && protection == super::super::protection::Mode::None
                 && self.rate_mask().is_some()
@@ -1837,8 +1868,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let has_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
             .map_err(|_| Error::Profile)?
             .is_some();
-        let mut plan = if (self.station.ht.is_some() || self.rtl8821ae_ht()) && has_wmm {
-            let phy = if self.chip == super::Chip::Rtl8821ae {
+        let mut plan = if (self.station.ht.is_some() || self.rtl8821ae_ht() || self.rtl8192ee_ht())
+            && has_wmm
+        {
+            let phy = if self.chip == super::Chip::Rtl8192ee {
+                let wide = self.rtl8192ee_wide(&candidate, environment)?;
+                let two = self.rtl8192ee_two_stream(wide.as_ref().map(|(_, p)| p), environment)?;
+                super::super::rtl8192ee::ht::local(wide.is_some(), two)
+            } else if self.chip == super::Chip::Rtl8821ae {
                 if self.rtl8821ae_vht80(&candidate, environment)?.is_some() {
                     super::super::rtl8821ae::vht::local()
                 } else {
@@ -2051,9 +2088,27 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                     ),
                                 )
                             });
+                        } else if self.chip == super::Chip::Rtl8192ee {
+                            // `rtl_op_bss_info_changed(BSS_CHANGED_HT)`:
+                            // only `HW_VAR_AMPDU_FACTOR` has an 8192EE case;
+                            // `mac->mode = WIRELESS_MODE_N_24G` already gave
+                            // the HT SIFS in `prepare_station_peer`.
+                            if !self.rtl8192ee_ht() {
+                                return Err(Error::Profile);
+                            }
+                            self.station_publication(environment, || {
+                                super::super::rtl8192ee::ht::timing(
+                                    &self.io,
+                                    profile.peer_ampdu_factor(),
+                                )
+                            })?;
+                            self.check_station_policy(environment)?;
+                            self.packet.ht = true;
                         }
                     }
-                    if self.station.ht_profile.is_some() && self.chip != super::Chip::Rtl8821ae {
+                    if self.station.ht_profile.is_some()
+                        && !matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee)
+                    {
                         let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
                         let timing = || super::super::station_control::ht_timing(&self.io);
                         if let Some(antenna) = &self.station.antenna {
@@ -2300,6 +2355,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 Some(super::super::ht::local())
             } else if self.rtl8821ae_ht() {
                 Some(super::super::rtl8821ae::ht::local(false))
+            } else if self.rtl8192ee_ht() {
+                Some(super::super::rtl8192ee::ht::local(
+                    false,
+                    self.rtl8192ee_power
+                        .is_some_and(|p| super::super::rtl8192ee::ht::two_stream(&p)),
+                ))
             } else {
                 None
             };

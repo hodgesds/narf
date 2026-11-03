@@ -1039,10 +1039,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ae_submit(frame, rate, aggregate, adaptive, short_gi);
         }
         if self.rtl8192ee() {
-            if aggregate.is_some() || adaptive || short_gi {
-                return Err(Error::Packet);
-            }
-            return self.ee92_submit(frame, rate);
+            return self.ee92_submit(frame, rate, aggregate, adaptive, short_gi);
         }
         if self.rtl8192ce() {
             if aggregate.is_some() || adaptive || short_gi {

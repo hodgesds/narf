@@ -147,6 +147,29 @@ pub(super) async fn enable_rtl8821ae(io: &impl Io) -> Result<(), Error> {
     .await
 }
 
+/// RTL8192EE CardDisabled→Active before the fresh firmware download: the
+/// `rtl8192ee/hw.c::_rtl92ee_init_mac` prefix (REG_RSV_CTRL = 0,
+/// `REG_SYS_CFG1[24]` ⇒ `0x7c = 0xc3` else `0x16 |= BIT4|BIT6` and `0x7c =
+/// 0x83`, `REG_AFE_CTRL2 &= 0xfb`, `REG_AFE_CTRL4 &= 0xfffffc7f`,
+/// `REG_AFE_CTRL2 &= 0xbf`, `REG_AFE_CTRL4 &= 0xffdfffff` as byte RMWs),
+/// then `RTL8192E_NIC_ENABLE_FLOW` — the same entry the initial probe runs
+/// synchronously through `power::power_on_with`.
+pub(super) async fn enable_rtl8192ee(io: &impl Io) -> Result<(), Error> {
+    io.write8(0x1c, 0)?;
+    if io.read8(0xf0 + 3)? & 1 != 0 {
+        io.write8(0x7c, 0xc3)?;
+    } else {
+        update(io, 0x16, 0, (1 << 4) | (1 << 6)).await?;
+        io.write8(0x7c, 0x83)?;
+    }
+    update(io, 0x28, 0x04, 0).await?;
+    update(io, 0x78, 0x80, 0).await?;
+    update(io, 0x79, 0x03, 0).await?;
+    update(io, 0x28, 0x40, 0).await?;
+    update(io, 0x7a, 0x20, 0).await?;
+    flow(io, PWR_CUT_ALL_MSK, RTL8192EE_PWR_ON).await
+}
+
 /// RTL8821AE `_rtl8821ae_poweroff_adapter` (the `rtl8821ae_card_disable`
 /// normal power-off branch), in source order, after the independent
 /// old-DMA retirement proof:

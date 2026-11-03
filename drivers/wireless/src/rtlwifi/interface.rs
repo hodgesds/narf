@@ -77,6 +77,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     ht40: AtomicBool,
     /// RTL8821AE per-band host capability (`rtl8821ae::vht::HOST_*`).
     rtl8821ae_caps: AtomicU8,
+    /// RTL8192EE `rtl8192ee::ht::host_capabilities` bits (0 otherwise).
+    rtl8192ee_caps: AtomicU8,
     rts_threshold: AtomicU32,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
@@ -203,6 +205,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         use super::rtl8821ae::vht::{HOST_HT_2G, HOST_HT_5G};
         self.rtl8821ae_caps.load(Ordering::Acquire) & (HOST_HT_2G | HOST_HT_5G) != 0
     }
+    /// The RTL8192EE envelope publishes 2.4 GHz HT.
+    fn rtl8192ee_host_ht(&self) -> bool {
+        self.rtl8192ee_caps.load(Ordering::Acquire) & super::rtl8192ee::ht::HOST_HT_2G != 0
+    }
     pub(crate) fn configured_rts_threshold(&self) -> Option<u16> {
         u16::try_from(self.rts_threshold.load(Ordering::Acquire)).ok()
     }
@@ -211,6 +217,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         self.ht.store(false, Ordering::Release);
         self.ht40.store(false, Ordering::Release);
         self.rtl8821ae_caps.store(0, Ordering::Release);
+        self.rtl8192ee_caps.store(0, Ordering::Release);
         *self.rx.lock() = None;
         self.update_link(None);
     }
@@ -245,6 +252,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             ht: AtomicBool::new(false),
             ht40: AtomicBool::new(false),
             rtl8821ae_caps: AtomicU8::new(0),
+            rtl8192ee_caps: AtomicU8::new(0),
             rts_threshold: AtomicU32::new(u32::MAX),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
@@ -296,6 +304,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 )
                 .await?;
             }
+        } else if owner.chip() == super::prepare::Chip::Rtl8192ee {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8192ee(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
         } else if matches!(
             owner.phase(),
             Phase::RadioConfigured | Phase::ChannelConfigured
@@ -311,7 +333,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             owner.stage_station_calibration(calibration, &domain)?;
         }
         if owner.phase() == Phase::MacConfigured && !owner.station_calibration_present() {
-            if owner.chip() == super::prepare::Chip::Rtl8821ae {
+            if matches!(
+                owner.chip(),
+                super::prepare::Chip::Rtl8821ae | super::prepare::Chip::Rtl8192ee
+            ) {
                 return Err(Error::Profile);
             }
             let calibration = super::channel_power::Calibration::load_registered(&self.factory)
@@ -343,6 +368,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .store(owner.station_ht40_supported(), Ordering::Release);
             self.rtl8821ae_caps.store(
                 owner.station_rtl8821ae_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ee_caps.store(
+                owner.station_rtl8192ee_host_caps(&self.environment),
                 Ordering::Release,
             );
             owner.start_station_service(&self.environment).await?;
@@ -1002,7 +1031,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             bands,
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: self.ht.load(Ordering::Acquire) || self.rtl8821ae_host_ht(),
+                ht_supported: self.ht.load(Ordering::Acquire)
+                    || self.rtl8821ae_host_ht()
+                    || self.rtl8192ee_host_ht(),
                 vht_supported,
                 he_supported: false,
                 eht_supported: false,
@@ -1021,6 +1052,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if band_listed && self.rtl8821ae_host_ht() {
             return super::rtl8821ae::vht::host_phy(
                 self.rtl8821ae_caps.load(Ordering::Acquire),
+                band,
+            );
+        }
+        // RTL8192EE: 2.4 GHz HT from the `N92E` envelope's admitted points.
+        if band_listed && self.rtl8192ee_host_ht() {
+            return super::rtl8192ee::ht::host_phy(
+                self.rtl8192ee_caps.load(Ordering::Acquire),
                 band,
             );
         }
@@ -1150,6 +1188,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .store(owner.station_ht40_supported(), Ordering::Release);
             self.rtl8821ae_caps.store(
                 owner.station_rtl8821ae_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ee_caps.store(
+                owner.station_rtl8192ee_host_caps(&self.environment),
                 Ordering::Release,
             );
         }
@@ -1402,9 +1444,13 @@ impl NativeEnvironment {
 }
 impl Environment for NativeEnvironment {
     async fn prepare_bus_power(&self) -> Result<(), Error> {
-        if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
-            // `_rtl8821ae_enable_aspm_back_door` / ASPM are not composed for
-            // this profile: probe's ASPM-disabled link state is kept.
+        if matches!(
+            self.firmware().device_id(),
+            super::regs::RTL_DEV_8821AE | super::regs::RTL_DEV_8192EE
+        ) {
+            // `_rtl8821ae_enable_aspm_back_door` / ASPM and the 8192EE
+            // `enable_aspm` are not composed for these profiles: probe's
+            // ASPM-disabled link state is kept.
             return Ok(());
         }
         self.firmware()
@@ -1422,6 +1468,16 @@ impl Environment for NativeEnvironment {
             // (2.4 GHz or 5 GHz) the fresh owner's `prepare_rtl8821ae`
             // re-derives.
             return super::rtl8821ae::envelope::Calibration::load_registered(factory)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
+        }
+        if self.firmware().device_id() == super::regs::RTL_DEV_8192EE {
+            // Retuning rebuilds through the 8192EE card-disable/enable flow
+            // (`rebuild_native`); admission is the `N92E` 20 MHz permission
+            // on 2.4 GHz channels 1-11 that `prepare_rtl8192ee` re-derives.
+            return super::rtl8192ee::envelope::Calibration::load_registered(factory)
                 .map_err(|_| Error::Profile)?
                 .permission(&self.domain()?, channel)
                 .map(|_| ())

@@ -61,6 +61,10 @@ pub(crate) const DEPTH: usize = trx::TX_DESC_NUM as usize;
 const REG_BACKDOOR_DBI_DATA: u16 = 0x03f0;
 /// `RATR_INX_WIRELESS_MC` (`_rtl_txrate_selectmode` without a station).
 const RATR_INX_WIRELESS_MC: u8 = 7;
+/// `RATR_INX_WIRELESS_NGB` / `_GB` / `_B` (`wifi.h`).
+const RATR_INX_WIRELESS_NGB: u8 = 0;
+const RATR_INX_WIRELESS_GB: u8 = 4;
+const RATR_INX_WIRELESS_B: u8 = 6;
 /// `rtl92ee_rx_check_dma_ok`: the first read plus up to 21 re-reads.
 const DMA_OK_READS: usize = 22;
 /// `TX_BASES`-order `get_desc_addr_fr_q_idx` doorbells (beacon: none, it
@@ -560,17 +564,90 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         hw::set_bssid(&self.io, [0; 6])
     }
 
-    /// `rtl_pci_tx` for one forced-rate legacy frame: descriptor, BD, then
-    /// the `TXBD_IDX` doorbell (`rtl92ee_set_desc(HW_DESC_OWN)`).
-    pub(super) fn ee92_submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
+    /// `rtl_pci_tx` for one frame: descriptor, BD, then the `TXBD_IDX`
+    /// doorbell (`rtl92ee_set_desc(HW_DESC_OWN)`).
+    ///
+    /// `rtl_get_tcb_desc` + `rtl92ee_tx_fill_desc`: `adaptive` ordinary
+    /// unicast DATA with an installed RA mask leaves USE_RATE and DISFB
+    /// clear (`use_driver_rate = false` for every non-management frame,
+    /// `disable_ratefallback` clear for a non-zero rix), so the firmware RA
+    /// owns the rate inside the mask, from the initial `hw_rate` of
+    /// `_rtl_get_highest_n_rate` (MCS15 for a 2T2R peer naming `rx_mask[1]`,
+    /// else MCS7) or 11M (B) / 54M. Its RATE_ID is `_rtl_txrate_selectmode`
+    /// with `dm.useramask` (`rtl92ee_dm_init_rate_adaptive_mask`, BYDRIVER)
+    /// and no `RTL_SPEC_NEW_RATEID`: from `mac->mode` NGB (HT) / GB (G) / B
+    /// (B), MACID 0. Every other frame keeps the forced `rate` with USE_RATE,
+    /// DISFB and `RATR_INX_WIRELESS_MC` (deliberate: Linux also clears
+    /// USE_RATE for Null/EAPOL DATA; here only the caller-selected adaptive
+    /// frames leave the driver rate). On a `bw_40` link a packet
+    /// above 54M to a unicast HT peer is a 40 MHz packet (`data_bw` 1, SC 3,
+    /// `_rtl_query_bandwidth_mode`); every other packet names
+    /// `cur_40_prime_sc`. `aggregate = (ampdu_density, operational)` sets
+    /// the peer's density and, for an operational BA TID, AGG_EN with
+    /// `max_agg_num 0x14`. `rtl92ee_tx_fill_desc` has no data SGI write
+    /// (the RA mask's SGI bit selects it), so `short_gi` is only checked
+    /// against the HT link. Every rate the descriptor can put on air (the
+    /// forced/initial `hw_rate` and, via `ee92_install_rate_mask`, the RA
+    /// mask) must be admitted by the current `N92E` permission.
+    pub(super) fn ee92_submit(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        aggregate: Option<(u8, bool)>,
+        adaptive: bool,
+        short_gi: bool,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
-        if rate > trx::DESC_RATE54M
+        let ht = self.packet.ht;
+        let highest = if ht {
+            trx::DESC_RATEMCS15
+        } else {
+            trx::DESC_RATE54M
+        };
+        if !ht && (aggregate.is_some() || short_gi)
+            || aggregate.is_some_and(|(density, _)| density > 7)
+            || aggregate.is_some() && frame.first() != Some(&0x88)
+            || rate > highest
             || self.packet.protection != super::super::super::protection::Mode::None
         {
             return Err(Error::Packet);
         }
+        let multicast_ra = frame.get(4).is_none_or(|b| b & 1 != 0);
+        let link = match self.packet.ee92.link {
+            Some((peer, _, _)) if adaptive => {
+                if multicast_ra || frame[0] & 0x0c != 0x08 || frame[0] & 0x40 != 0 {
+                    return Err(Error::Packet);
+                }
+                Some(peer)
+            }
+            None if adaptive => return Err(Error::State),
+            _ => None,
+        };
+        let hw_rate = match link {
+            Some(peer) => match peer.ht {
+                Some([_, two]) if two != 0 => trx::DESC_RATEMCS15,
+                Some(_) => trx::DESC_RATEMCS0 + 7,
+                None if peer.legacy <= 0xf => trx::DESC_RATE11M,
+                None => trx::DESC_RATE54M,
+            },
+            None => rate,
+        };
+        let permission = self.rtl8192ee_power.ok_or(Error::State)?;
+        if permission.admitted_rates() & (1u64 << hw_rate) == 0 {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Policy,
+            ));
+        }
+        let rate_id = match link {
+            Some(peer) if peer.ht.is_some() => RATR_INX_WIRELESS_NGB,
+            Some(peer) if peer.legacy <= 0xf => RATR_INX_WIRELESS_B,
+            Some(_) => RATR_INX_WIRELESS_GB,
+            None => RATR_INX_WIRELESS_MC,
+        };
+        let bw40 = self.packet.width.is_some();
+        let prime_sc = permission.operating().channel().map_or(0, |c| c.prime_sc);
         let (queue, _, selector) = queue(
             frame,
             self.packet.local.ok_or(Error::State)?,
@@ -614,21 +691,27 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // rtl_get_tcb_desc `use_spe_rpt` for EAPOL and (QoS) Null frames:
         // rtl_set_tx_report's SPE_RPT + SW_DEFINE (`rtl_get_tx_report_sn`).
         let tx_report = super::ae::wants_report(frame).then(|| self.packet.ee92.reports.next_sn());
+        let multicast = destination[0] & 1 != 0;
+        let wide = bw40 && ht && !multicast && hw_rate > trx::DESC_RATE54M;
         let descriptor = trx::TxDesc::fill(&trx::TxParams {
             pkt_size: frame.len() as u16,
             queue_sel: selector,
             macid: 0,
-            rate_id: RATR_INX_WIRELESS_MC,
-            hw_rate: rate,
-            use_driver_rate: true,
-            disable_fallback: true,
-            data_bw: 0,
-            sub_carrier: 0,
-            ampdu: false,
-            ampdu_density: 0,
+            rate_id,
+            hw_rate,
+            use_driver_rate: link.is_none(),
+            disable_fallback: link.is_none(),
+            data_bw: u8::from(wide),
+            sub_carrier: match (bw40, wide) {
+                (true, true) => 3,
+                (true, false) => prime_sc,
+                _ => 0,
+            },
+            ampdu: aggregate.is_some_and(|(_, operational)| operational),
+            ampdu_density: aggregate.map_or(0, |(density, _)| density),
             sec_type: 0,
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
-            multicast: destination[0] & 1 != 0,
+            multicast,
             protection: 0,
             rts_rate: 0,
             tx_report,
@@ -771,6 +854,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .rtl8192ee
             .as_ref()
             .is_some_and(|state| state.1.phy.cck_high_power);
+        // HT link (`packet.ht`, set at Configuring): MCS0-15 (2T2R RX) and
+        // A-MPDU members (the station BA owner gates them) up to a
+        // 7935-byte A-MSDU MPDU.
+        let ht = self.packet.ht;
+        let longest = if ht {
+            26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
+        } else {
+            2304 + 4
+        };
         let ring = self.receive.as_mut().ok_or(Error::State)?;
         let buffer = &self.buffers[slot];
         let buffer_addr = extent(buffer, RX_BUFFER, 4)?;
@@ -810,12 +902,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 buffer.read_bytes(start, &mut bytes[..take])?;
                 report = Some((bytes, take));
             }
+            let is_ht = (trx::DESC_RATEMCS0..=trx::DESC_RATEMCS15).contains(&status.rate);
             if !status.c2h
                 && !status.crc
                 && !status.icv
-                && !status.ampdu
-                && status.rate <= trx::DESC_RATE54M
-                && (24..=2304 + 4).contains(&length)
+                && (!status.ampdu || ht)
+                && (status.rate <= trx::DESC_RATE54M || ht && is_ht)
+                && (24..=longest).contains(&length)
             {
                 let mut bytes = Vec::new();
                 bytes
@@ -837,13 +930,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     } else {
                         None
                     };
+                    // `rtl92ee_rx_query_desc` never sets `is_ht`,
+                    // `rx_is40mhzpacket` or `is_short_gi` (the 8192EE RX
+                    // status has no BW/SGI field; the PHY-status `sgi_en`/
+                    // `rxsc` are not read by Linux): HT is the MCS rate, and
+                    // nothing is gated on the width or GI.
                     packet = Some(Mpdu {
                         bytes,
                         channel,
-                        ht: false,
+                        ht: is_ht,
                         short_gi: false,
                         width40: false,
-                        aggregated: false,
+                        aggregated: status.ampdu,
                         pwdb,
                         antenna_mux: None,
                     });

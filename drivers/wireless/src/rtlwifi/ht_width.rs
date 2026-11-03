@@ -166,6 +166,87 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .filter(super::super::super::rtl8821ae::ht::admitted)
             .map(|p| (g, p)))
     }
+    /// RTL8192EE: the AP's offered HT40 geometry with its `N92E` 40 MHz
+    /// permission, when the envelope measures it, current host policy
+    /// admits it and it admits HT (MCS0-7). `None` keeps the HT20 form.
+    pub(super) fn rtl8192ee_wide(
+        &self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<
+        Option<(
+            super::super::super::ht::Geometry,
+            super::super::super::rtl8192ee::envelope::Permission,
+        )>,
+        Error,
+    > {
+        use super::super::super::rtl8192ee::envelope::{Operating, Width};
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ee())
+        else {
+            return Ok(None);
+        };
+        let two = self
+            .rtl8192ee_power
+            .is_some_and(|p| super::super::super::rtl8192ee::ht::two_stream(&p));
+        let offer = association::phy::Offer::from_elements(
+            super::super::super::rtl8192ee::ht::local(true, two),
+            &candidate.bss.information_elements,
+            candidate.bss.channel,
+        )
+        .map_err(Error::Management)?;
+        let Some(offer) = offer else {
+            return Ok(None);
+        };
+        let Ok(Some(g)) = Self::offered_width(offer.width(), offer.ht().operation()) else {
+            return Ok(None);
+        };
+        if g.primary() >= 36 {
+            return Ok(None);
+        }
+        let op = Operating {
+            width: if g.prime() == 1 {
+                Width::W40Above
+            } else {
+                Width::W40Below
+            },
+            channel: g.primary(),
+        };
+        Ok(base
+            .permission_for(&environment.domain()?, op)
+            .ok()
+            .filter(super::super::super::rtl8192ee::ht::admitted)
+            .map(|p| (g, p)))
+    }
+    /// RTL8192EE local TX MCS selection (`rtl8192ee::ht::capability`):
+    /// MCS8-15 only when the `N92E` permission at 20 MHz on the provisioned
+    /// primary and, when a 40 MHz one is offered, that one too admit every
+    /// two-stream rate on both paths (Configuring may narrow the
+    /// negotiated width to 20 MHz), so mac80211's intersected `rx_mask[1]`
+    /// can only name rates the RA mask may install.
+    pub(super) fn rtl8192ee_two_stream(
+        &self,
+        wide: Option<&super::super::super::rtl8192ee::envelope::Permission>,
+        environment: &impl Environment,
+    ) -> Result<bool, Error> {
+        use super::super::super::rtl8192ee::{envelope::Operating, ht::two_stream};
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8192ee())
+        else {
+            return Ok(false);
+        };
+        let channel = self.rtl8192ee_power.ok_or(Error::State)?.channel();
+        let narrow = base
+            .permission_for(&environment.domain()?, Operating::twenty(channel))
+            .ok();
+        Ok(narrow.as_ref().is_some_and(two_stream) && wide.is_none_or(two_stream))
+    }
     /// RTL8821AE `rtl_op_config` channel/width change on the running owner
     /// (mac80211 sets the BSS chandef before authentication and narrows it
     /// if the association response does): the permission for the target

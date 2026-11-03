@@ -9,10 +9,13 @@
 //! - `rtlwifi/rtl8192ee/reg.h`  — register offsets
 //! - `rtlwifi/rtl8192ee/def.h`  — chip-version, rate, qsel constants
 //!
-//! ## Retained-runtime foundation (`rtl8192ee/`)
+//! ## Retained runtime (`rtl8192ee/`)
 //!
-//! Exact Linux-derived pieces a retained RTL8192EE owner is built from. None
-//! is reachable from probe as a WLAN capability: `0x818b` stays diagnostic.
+//! Exact Linux-derived pieces the retained RTL8192EE owner is built from.
+//! Probe retains an admissible `0x818b` function (no BT coexistence, EFUSE
+//! TX power present) and admits it under its signed `N92E` envelope
+//! (`prepare_native::prepare_rtl8192ee`); the HT20/40 station is in
+//! [`ht`].
 //!
 //! - [`pwrseq`] — PCI rows of every `rtl8192E_*_flow` (`pwrseq.{c,h}`).
 //! - [`fw`] — `rtl8192eefw.bin` header validation and the
@@ -68,7 +71,7 @@ pub mod txpower;
 #[cfg(any(test, feature = "kernel-test"))]
 mod h2c_tests;
 #[cfg(any(test, feature = "kernel-test"))]
-mod phy_tests;
+pub(crate) mod phy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
 
