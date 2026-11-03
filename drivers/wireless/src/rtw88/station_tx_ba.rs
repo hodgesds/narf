@@ -8,31 +8,32 @@ impl State {
             .filter(|_| self.data_profile.rates & (1 << 8) != 0)
             .map(|g| g.threshold())
     }
-    pub(in crate::rtw88) fn set_rts_threshold(
+    pub(in crate::rtw88) async fn set_rts_threshold(
         &mut self,
         io: &mut impl Io,
         value: u32,
     ) -> Result<(), Error> {
         let admission = self.admission.clone();
-        let result = admission
-            .run(|| {
-                io.station_allowed()?;
-                Ok((|| {
-                    let g = self.protection.as_ref().ok_or(Error::Profile)?;
-                    if !self.ready() || !io.packet_ready() {
-                        return Err(Error::Busy);
-                    }
-                    let c21 = self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2 == 0xc821;
-                    if !self.tx_fifo_empty(io, c21)? {
-                        return Err(Error::Busy);
-                    }
-                    io.station_profile_readback()?;
-                    g.set(value, self.data_profile.rates)?;
-                    Ok(())
-                })())
-            })
-            .map_err(Error::Native)
-            .and_then(|r| r);
+        let result = crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+            io.station_allowed()?;
+            Ok(async {
+                let g = self.protection.as_ref().ok_or(Error::Profile)?;
+                if !self.ready() || !io.packet_ready() {
+                    return Err(Error::Busy);
+                }
+                let c21 = self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2 == 0xc821;
+                if !self.tx_fifo_empty(io, c21).await? {
+                    return Err(Error::Busy);
+                }
+                io.station_profile_readback()?;
+                g.set(value, self.data_profile.rates)?;
+                Ok(())
+            }
+            .await)
+        })
+        .await
+        .map_err(Error::Native)
+        .and_then(|r| r);
         if result.as_ref().is_err_and(|e| {
             !matches!(
                 e,
@@ -60,7 +61,7 @@ impl State {
             None => Ok(self.qos_sequence[usize::from(tid)]),
         }
     }
-    fn tx_fifo_empty(
+    async fn tx_fifo_empty(
         &self,
         io: &mut impl Io,
         c21: bool,
@@ -70,6 +71,7 @@ impl State {
             c21,
             self.tx_ba_grant.as_ref().map_or(1, |g| g.tids()),
         )
+        .await
     }
     fn aggregate_config(&self, tid: u8) -> Result<super::super::packet_format::Aggregation, Error> {
         let g = self.tx_ba_grant.as_ref().ok_or(Error::State)?;
@@ -87,7 +89,7 @@ impl State {
             airtime,
         })
     }
-    pub(super) fn service_tx_ba(
+    pub(super) async fn service_tx_ba(
         &mut self,
         io: &mut impl Io,
         now: u64,
@@ -105,7 +107,7 @@ impl State {
         let quiet = self.pending.is_none()
             && self.delivered_reply.is_none()
             && self.data_pending.is_empty()
-            && self.tx_fifo_empty(io, c21)?;
+            && self.tx_fifo_empty(io, c21).await?;
         if let Some((start, tid)) = self.data_drain {
             if quiet {
                 self.data_drain = None;
@@ -133,7 +135,7 @@ impl State {
             return Ok(());
         }
         g.check()?;
-        super::super::tx_ba::readback(io)?;
+        super::super::tx_ba::readback(io).await?;
         for tid in 0..6 {
             if g.tids() & (1 << tid) == 0 {
                 continue;
@@ -176,16 +178,18 @@ impl State {
     /// Produce exact headers/PNs only after reserving native batch capacity.
     /// A failed publication consumes those values and terminally closes; no
     /// protected header or immutable ciphertext is rewritten for a retry.
-    pub(in crate::rtw88) fn send_batch(
+    pub(in crate::rtw88) async fn send_batch(
         &mut self,
         io: &mut impl Io,
         frames: &[&[u8]],
     ) -> Result<usize, Error> {
         let admission = self.admission.clone();
-        let result = admission
-            .run(|| Ok(self.send_batch_inner(io, frames)))
-            .map_err(Error::Native)
-            .and_then(|r| r);
+        let result = crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+            Ok(self.send_batch_inner(io, frames).await)
+        })
+        .await
+        .map_err(Error::Native)
+        .and_then(|r| r);
         if result.as_ref().is_err_and(|e| {
             !matches!(
                 e,
@@ -196,7 +200,7 @@ impl State {
         }
         result
     }
-    pub(super) fn send_batch_inner(
+    pub(super) async fn send_batch_inner(
         &mut self,
         io: &mut impl Io,
         frames: &[&[u8]],
@@ -217,7 +221,7 @@ impl State {
             }
             // Consume only the original FIFO head. A different TID/VO/EAPOL
             // cannot be relabelled into an already active TID0 agreement.
-            self.send_inner(io, first)?;
+            self.send_inner(io, first).await?;
             return Ok(1);
         }
         let cfg = self.aggregate_config(tid)?;
@@ -225,7 +229,7 @@ impl State {
             return Err(Error::Busy);
         }
         let c21 = self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2 == 0xc821;
-        if !self.tx_fifo_empty(io, c21)? {
+        if !self.tx_fifo_empty(io, c21).await? {
             return Err(Error::Busy);
         }
         io.packet_aggregation(Some(cfg))?;

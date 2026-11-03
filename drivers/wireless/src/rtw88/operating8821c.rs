@@ -398,50 +398,55 @@ impl Envelope {
         io: &mut impl Io,
         policy: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<Info, Error> {
-        self.invoke(&policy, || {
+        crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
             io.begin_operating8821c()?;
-            let old = io.read32(0x2908)?;
+            let old = io.read32(0x2908).await?;
             if old == u32::MAX {
                 return Err(Error::Gone);
             }
             io.write32(0xc90, (0x42 << 20) | (old & 0xcffff) | 0x30000)
-        })?;
+                .await
+        })
+        .await?;
         io.delay_us(13).await;
         io.delay_us(2_000_000).await;
-        let thermal = self.invoke(&policy, || {
-            let value = io.read32(0x2908)?;
-            if value == u32::MAX {
-                return Err(Error::Gone);
-            }
-            let thermal = ((value >> 10) & 63) as u8;
-            self.calibration.temperature(thermal).map_err(denied)?;
-            if !(self.thermal[0]..=self.thermal[1]).contains(&thermal)
-                || io.read32(0x2820)? & 0xfffff != 0
-                || io.read32(0x1bf0)? & 0x100ff != 0
-            {
-                return Err(denied(QError::Thermal));
-            }
-            Ok(thermal)
-        })?;
+        let thermal =
+            crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
+                let value = io.read32(0x2908).await?;
+                if value == u32::MAX {
+                    return Err(Error::Gone);
+                }
+                let thermal = ((value >> 10) & 63) as u8;
+                self.calibration.temperature(thermal).map_err(denied)?;
+                if !(self.thermal[0]..=self.thermal[1]).contains(&thermal)
+                    || io.read32(0x2820).await? & 0xfffff != 0
+                    || io.read32(0x1bf0).await? & 0x100ff != 0
+                {
+                    return Err(denied(QError::Thermal));
+                }
+                Ok(thermal)
+            })
+            .await?;
         for (i, reg) in REGISTERS.into_iter().enumerate() {
             let value = if i < 3 {
                 u32::from_le_bytes(self.indices[i * 4..i * 4 + 4].try_into().unwrap())
             } else {
                 0
             };
-            self.invoke(&policy, || {
-                io.write32(reg, value)?;
-                if io.read32(reg)? != value {
+            crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
+                io.write32(reg, value).await?;
+                if io.read32(reg).await? != value {
                     return Err(Error::Prerequisite);
                 }
                 Ok(())
-            })?;
+            })
+            .await?;
             // Cooperative ownership boundary, not an invented radio settle/done bit.
             narf_scheduler::yield_now().await;
         }
-        self.invoke(&policy, || {
-            io.write32(0x440, 0x15f)?;
-            if io.read32(0x440)? != 0x15f {
+        crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
+            io.write32(0x440, 0x15f).await?;
+            if io.read32(0x440).await? != 0x15f {
                 return Err(Error::Prerequisite);
             }
             io.finish_operating8821c()?;
@@ -452,5 +457,6 @@ impl Envelope {
                 identity: self.request.identity,
             })
         })
+        .await
     }
 }

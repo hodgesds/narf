@@ -110,23 +110,47 @@ unsafe impl Io for Model {
         self.regs[0x1a0] = 0xfd;
         Ok(())
     }
-    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
-        self.read(8, reg).map(|v| v as u8)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { self.read(8, reg).map(|v| v as u8) }
     }
-    fn read16(&mut self, reg: u16) -> Result<u16, Error> {
-        self.read(16, reg).map(|v| v as u16)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move { self.read(16, reg).map(|v| v as u16) }
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
-        self.read(32, reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { self.read(32, reg) }
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
-        self.write(8, reg, u32::from(value))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(8, reg, u32::from(value)) }
     }
-    fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error> {
-        self.write(16, reg, u32::from(value))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        reg: u16,
+        value: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(16, reg, u32::from(value)) }
     }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
-        self.write(32, reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(32, reg, value) }
     }
     async fn reserved_page(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.access((3, 0, 0, bytes.len() as u32))
@@ -332,7 +356,9 @@ fn smoke_rtw8822ce_inactive_mac_matches_frozen_fifo_and_chip_setup() -> TestResu
         io.regs[0x1a0] = 0x19;
         io.regs[0x1a2..0x1af].fill(0);
         io.regs[0x1a6..0x1aa].copy_from_slice(&word.to_le_bytes());
-        let report = match crate::rtw88::hardware::Features::read(&mut io) {
+        let report = match crate::rtw88::firmware_transport::now(
+            crate::rtw88::hardware::Features::read(&mut io),
+        ) {
             Ok(r) => r,
             Err(_) => return TestResult::Fail("literal hardware feature report rejected"),
         };

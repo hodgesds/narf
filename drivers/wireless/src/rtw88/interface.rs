@@ -561,7 +561,7 @@ impl<I: Io + 'static> Device<I> {
             return Vec::new();
         }
         let result = (|| -> Result<Vec<(Vec<u8>, super::publication::Publication)>, Error> {
-            let frames = owner.station_poll()?;
+            let frames = super::firmware_transport::ready_now(owner.station_poll())?;
             self.publish_link(owner)?;
             if self.closed() {
                 rings.clear();
@@ -612,7 +612,7 @@ impl<I: Io + 'static> Device<I> {
                             .take(capacity.saturating_sub(1))
                             .map(Frame::payload),
                     );
-                    match owner.station_send_batch(&frames) {
+                    match super::firmware_transport::ready_now(owner.station_send_batch(&frames)) {
                         Ok(count) => {
                             if count == 0 || count > frames.len() {
                                 return Err(Error::State);
@@ -627,7 +627,8 @@ impl<I: Io + 'static> Device<I> {
                         Err(error) => return Err(error),
                     }
                 } else if let Some(frame) = rings.pending.as_ref() {
-                    match owner.station_send(frame.payload()) {
+                    match super::firmware_transport::ready_now(owner.station_send(frame.payload()))
+                    {
                         Ok(()) => rings.pending = None,
                         Err(Error::Busy)
                         | Err(Error::Transport(super::packet_core::Error::Busy)) => {}
@@ -788,7 +789,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         }
         let mut storage = self.lifecycle.retained.try_lock().ok_or(EBUSY)?;
         let owner = storage.as_mut().ok_or(EBUSY)?;
-        let result = owner.station_set_rts_threshold(value);
+        let result = super::firmware_transport::ready_now(owner.station_set_rts_threshold(value));
         match result {
             Ok(()) => {
                 let current = owner.station_rts_threshold();

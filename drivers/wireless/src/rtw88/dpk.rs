@@ -187,44 +187,55 @@ struct Hw<'a, I, A> {
     auth: &'a A,
 }
 impl<I: Io, A: Authority> Hw<'_, I, A> {
-    fn r32(&mut self, reg: u16) -> Result<u32, Error> {
+    async fn r32(&mut self, reg: u16) -> Result<u32, Error> {
         let io = &mut *self.io;
-        self.auth.run(|| super::radio::read(io, reg))
+        crate::rtw88::firmware_transport::enclosed(
+            |op| self.auth.run(op),
+            super::radio::read(io, reg),
+        )
+        .await
     }
-    fn get(&mut self, reg: u16, bits: u32) -> Result<u32, Error> {
-        Ok((self.r32(reg)? & bits) >> bits.trailing_zeros())
+    async fn get(&mut self, reg: u16, bits: u32) -> Result<u32, Error> {
+        Ok((self.r32(reg).await? & bits) >> bits.trailing_zeros())
     }
-    fn r8(&mut self, reg: u16) -> Result<u8, Error> {
+    async fn r8(&mut self, reg: u16) -> Result<u8, Error> {
         let io = &mut *self.io;
-        self.auth.run(|| io.read8(reg))
+        crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), io.read8(reg)).await
     }
-    fn w32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
+    async fn w32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
         let io = &mut *self.io;
-        self.auth.run(|| io.write32(reg, value))
+        crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), io.write32(reg, value))
+            .await
     }
-    fn w8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
+    async fn w8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
         let io = &mut *self.io;
-        self.auth.run(|| io.write8(reg, value))
+        crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), io.write8(reg, value))
+            .await
     }
     /// `rtw_write32_mask`: the value is truncated to the mask like Linux.
-    fn mask(&mut self, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
+    async fn mask(&mut self, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
         let shift = bits.trailing_zeros();
         let field = value.wrapping_shl(shift) & bits;
         let io = &mut *self.io;
-        self.auth.run(|| {
-            let old = super::radio::read(io, reg)?;
-            io.write32(reg, old & !bits | field)
+        crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), async {
+            let old = super::radio::read(io, reg).await?;
+            io.write32(reg, old & !bits | field).await
         })
+        .await
     }
-    fn subpage(&mut self, value: u32) -> Result<(), Error> {
-        self.mask(REG_NCTL0, BIT_SUBPAGE, value)
+    async fn subpage(&mut self, value: u32) -> Result<(), Error> {
+        self.mask(REG_NCTL0, BIT_SUBPAGE, value).await
     }
-    fn path_page(&mut self, path: u8) -> Result<(), Error> {
-        self.subpage(0x8 | (u32::from(path) << 1))
+    async fn path_page(&mut self, path: u8) -> Result<(), Error> {
+        self.subpage(0x8 | (u32::from(path) << 1)).await
     }
-    fn rf_get(&mut self, path: u8, address: u8, bits: u32) -> Result<u32, Error> {
+    async fn rf_get(&mut self, path: u8, address: u8, bits: u32) -> Result<u32, Error> {
         let io = &mut *self.io;
-        let v = self.auth.run(|| super::radio::rf_read(io, path, address))?;
+        let v = crate::rtw88::firmware_transport::enclosed(
+            |op| self.auth.run(op),
+            super::radio::rf_read(io, path, address),
+        )
+        .await?;
         Ok((v & bits) >> bits.trailing_zeros())
     }
     /// `rtw_phy_write_rf_reg_mix`: RF0 through SIPI, others direct.
@@ -236,21 +247,24 @@ impl<I: Io, A: Authority> Hw<'_, I, A> {
         let field = value.wrapping_shl(shift) & bits;
         let io = &mut *self.io;
         if address == 0 {
-            self.auth.run(|| {
+            crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), async {
                 let data = if bits == RFREG_MASK {
                     value & RFREG_MASK
                 } else {
-                    super::radio::rf_read(io, path, 0)? & !bits | field
+                    super::radio::rf_read(io, path, 0).await? & !bits | field
                 };
                 io.write32(if path == 0 { 0x1808 } else { 0x4108 }, data)
-            })?;
+                    .await
+            })
+            .await?;
             self.io.delay_us(13).await;
         } else {
             let reg = (if path == 0 { 0x3c00 } else { 0x4c00 }) + u16::from(address) * 4;
-            self.auth.run(|| {
-                let old = super::radio::read(io, reg)?;
-                io.write32(reg, old & !bits | field)
-            })?;
+            crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), async {
+                let old = super::radio::read(io, reg).await?;
+                io.write32(reg, old & !bits | field).await
+            })
+            .await?;
             self.io.delay_us(1).await;
         }
         Ok(())
@@ -261,7 +275,7 @@ impl<I: Io, A: Authority> Hw<'_, I, A> {
     /// `util.c::check_hw_ready`: 1000 reads, 10us apart.
     async fn ready(&mut self, reg: u16, bits: u32, target: u32) -> Result<bool, Error> {
         for _ in 0..1000 {
-            if self.get(reg, bits)? == target {
+            if self.get(reg, bits).await? == target {
                 return Ok(true);
             }
             self.delay(10).await;
@@ -274,10 +288,11 @@ impl<I: Io, A: Authority> Hw<'_, I, A> {
             return Err(Error::Timeout);
         }
         let io = &mut *self.io;
-        self.auth.run(|| {
-            io.write32(0x1700, 0x800f_0000 | u32::from(offset))?;
-            io.read32(0x1708)
+        crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), async {
+            io.write32(0x1700, 0x800f_0000 | u32::from(offset)).await?;
+            io.read32(0x1708).await
         })
+        .await
     }
     /// `util.c::ltecoex_reg_write` (wdata 0x1704).
     async fn lte_write(&mut self, offset: u16, value: u32) -> Result<(), Error> {
@@ -285,10 +300,11 @@ impl<I: Io, A: Authority> Hw<'_, I, A> {
             return Err(Error::Timeout);
         }
         let io = &mut *self.io;
-        self.auth.run(|| {
-            io.write32(0x1704, value)?;
-            io.write32(0x1700, 0xc00f_0000 | u32::from(offset))
+        crate::rtw88::firmware_transport::enclosed(|op| self.auth.run(op), async {
+            io.write32(0x1704, value).await?;
+            io.write32(0x1700, 0xc00f_0000 | u32::from(offset)).await
         })
+        .await
     }
 }
 
@@ -347,17 +363,17 @@ impl Dpk {
         auth: &impl Authority,
     ) -> Result<(), Error> {
         let mut hw = Hw { io, auth };
-        let channel = (hw.rf_get(0, 0x18, RFREG_MASK)? & 0xff) as u8;
+        let channel = (hw.rf_get(0, 0x18, RFREG_MASK).await? & 0xff) as u8;
         if !self.active || channel != self.ch {
             // rtw8822c_phy_calibration: rfk_power_save(false) .. (true).
             for path in 0..2 {
-                hw.mask(REG_NCTL0, BIT_SEL_PATH, path)?;
-                hw.mask(REG_DPD_CTL1_S0, BIT_PS_EN, 1)?;
+                hw.mask(REG_NCTL0, BIT_SEL_PATH, path).await?;
+                hw.mask(REG_DPD_CTL1_S0, BIT_PS_EN, 1).await?;
             }
             self.do_dpk(&mut hw).await?;
             for path in 0..2 {
-                hw.mask(REG_NCTL0, BIT_SEL_PATH, path)?;
-                hw.mask(REG_DPD_CTL1_S0, BIT_PS_EN, 0)?;
+                hw.mask(REG_NCTL0, BIT_SEL_PATH, path).await?;
+                hw.mask(REG_DPD_CTL1_S0, BIT_PS_EN, 0).await?;
             }
             self.active = true;
             return Ok(());
@@ -373,7 +389,7 @@ impl Dpk {
             hw.rf(path, RF_T_METER, 1 << 19, v).await?;
         }
         hw.delay(15).await;
-        Ok(hw.rf_get(path, RF_T_METER, 0x7e)? as u8)
+        Ok(hw.rf_get(path, RF_T_METER, 0x7e).await? as u8)
     }
     /// Thermal read bounded by the measured envelope.
     async fn thermal<I: Io, A: Authority>(
@@ -403,8 +419,8 @@ impl Dpk {
                 .clamp(-i16::from(self.window), i16::from(self.window));
             let offset = (offset as u8) & 0x7f;
             if offset != self.pre_pwsf[p] {
-                hw.path_page(path)?;
-                hw.mask(0x1b58, 0x7f, u32::from(offset))?;
+                hw.path_page(path).await?;
+                hw.mask(0x1b58, 0x7f, u32::from(offset)).await?;
                 self.pre_pwsf[p] = offset;
             }
         }
@@ -422,34 +438,34 @@ impl Dpk {
         action: Action,
     ) -> Result<bool, Error> {
         // rtw8822c_dpk_set_gnt_wl(true)
-        let gnt_control = hw.r32(0x70)?;
+        let gnt_control = hw.r32(0x70).await?;
         let gnt_value = hw.lte_read(0x38).await?;
-        hw.mask(0x70, 1 << 26, 1)?;
+        hw.mask(0x70, 1 << 26, 1).await?;
         let cur = hw.lte_read(0x38).await?;
         hw.lte_write(0x38, Self::set_gnt_wl_mask(cur)).await?;
         let fail;
         if action == Action::CalPwr {
-            hw.mask(REG_DPD_CTL0, 1 << 12, 1)?;
-            hw.mask(REG_DPD_CTL0, 1 << 12, 0)?;
-            hw.mask(REG_RXSRAM_CTL, BIT_RPT_SEL, 0)?;
+            hw.mask(REG_DPD_CTL0, 1 << 12, 1).await?;
+            hw.mask(REG_DPD_CTL0, 1 << 12, 0).await?;
+            hw.mask(REG_RXSRAM_CTL, BIT_RPT_SEL, 0).await?;
             hw.delay(10000).await;
             fail = !hw.ready(REG_STAT_RPT, 1 << 31, 1).await?;
         } else {
-            hw.path_page(path)?;
-            hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0x9)?;
+            hw.path_page(path).await?;
+            hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0x9).await?;
             let cmd = self.cmd(action, path);
-            hw.w32(REG_NCTL0, u32::from(cmd))?;
-            hw.w32(REG_NCTL0, u32::from(cmd) + 1)?;
+            hw.w32(REG_NCTL0, u32::from(cmd)).await?;
+            hw.w32(REG_NCTL0, u32::from(cmd) + 1).await?;
             hw.delay(10000).await;
             fail = !hw.ready(0x2d9c, 0xff, 0x55).await?;
-            hw.path_page(path)?;
-            hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0)?;
+            hw.path_page(path).await?;
+            hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0).await?;
         }
         // rtw8822c_dpk_set_gnt_wl(false)
         hw.lte_read(0x38).await?;
         hw.lte_write(0x38, gnt_value).await?;
-        hw.w32(0x70, gnt_control)?;
-        hw.w8(0x1b10, 0)?;
+        hw.w32(0x70, gnt_control).await?;
+        hw.w8(0x1b10, 0).await?;
         Ok(fail)
     }
     /// `rtw8822c_dpk_get_cmd`.
@@ -476,41 +492,41 @@ impl Dpk {
         hw.delay(600).await;
         hw.rf(path, 0x92, RFREG_MASK, 0x84800).await
     }
-    fn dc_corr_check<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<bool, Error> {
-        hw.w32(REG_RXSRAM_CTL, 0x000900f0)?;
-        let mut dc_i = hw.get(REG_STAT_RPT, 0x0fff_0000)? as u16;
-        let mut dc_q = hw.get(REG_STAT_RPT, 0xfff)? as u16;
+    async fn dc_corr_check<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<bool, Error> {
+        hw.w32(REG_RXSRAM_CTL, 0x000900f0).await?;
+        let mut dc_i = hw.get(REG_STAT_RPT, 0x0fff_0000).await? as u16;
+        let mut dc_q = hw.get(REG_STAT_RPT, 0xfff).await? as u16;
         if dc_i & (1 << 11) != 0 {
             dc_i = 0x1000 - dc_i;
         }
         if dc_q & (1 << 11) != 0 {
             dc_q = 0x1000 - dc_q;
         }
-        hw.w32(REG_RXSRAM_CTL, 0x000000f0)?;
-        let corr = hw.get(REG_STAT_RPT, 0xff)? as u8;
-        hw.get(REG_STAT_RPT, 0xff00)?;
+        hw.w32(REG_RXSRAM_CTL, 0x000000f0).await?;
+        let corr = hw.get(REG_STAT_RPT, 0xff).await? as u8;
+        hw.get(REG_STAT_RPT, 0xff00).await?;
         Ok(dc_i > 200 || dc_q > 200 || !(40..=65).contains(&corr))
     }
-    fn dgain_read<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<u16, Error> {
-        hw.subpage(0xc)?;
-        hw.mask(REG_RXSRAM_CTL, 0x00ff_0000, 0)?;
-        Ok(hw.get(REG_STAT_RPT, 0x0fff_0000)? as u16)
+    async fn dgain_read<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<u16, Error> {
+        hw.subpage(0xc).await?;
+        hw.mask(REG_RXSRAM_CTL, 0x00ff_0000, 0).await?;
+        Ok(hw.get(REG_STAT_RPT, 0x0fff_0000).await? as u16)
     }
     async fn pas_read<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>, path: u8) -> Result<u32, Error> {
-        hw.w32(REG_NCTL0, 0x8 | (u32::from(path) << 1))?;
-        hw.mask(0x1b48, 1 << 14, 0)?;
-        hw.w32(REG_RXSRAM_CTL, 0x00060001)?;
-        hw.w32(0x1b4c, 0)?;
-        hw.w32(0x1b4c, 0x00080000)?;
-        let mut q = hw.get(REG_STAT_RPT, MASKHWORD)?;
-        let mut i = hw.get(REG_STAT_RPT, MASKLWORD)?;
+        hw.w32(REG_NCTL0, 0x8 | (u32::from(path) << 1)).await?;
+        hw.mask(0x1b48, 1 << 14, 0).await?;
+        hw.w32(REG_RXSRAM_CTL, 0x00060001).await?;
+        hw.w32(0x1b4c, 0).await?;
+        hw.w32(0x1b4c, 0x00080000).await?;
+        let mut q = hw.get(REG_STAT_RPT, MASKHWORD).await?;
+        let mut i = hw.get(REG_STAT_RPT, MASKLWORD).await?;
         if i & (1 << 15) != 0 {
             i = 0x10000 - i;
         }
         if q & (1 << 15) != 0 {
             q = 0x10000 - q;
         }
-        hw.w32(0x1b4c, 0)?;
+        hw.w32(0x1b4c, 0).await?;
         Ok(i.wrapping_mul(i).wrapping_add(q.wrapping_mul(q)))
     }
     /// `rtw8822c_psd_log2base`.
@@ -527,12 +543,15 @@ impl Dpk {
         let index = ((tmp / 5) as usize).min(FRACTION.len() - 1);
         integer * 100 - FRACTION[index]
     }
-    fn gainloss_result<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>, path: u8) -> Result<u8, Error> {
-        hw.path_page(path)?;
-        hw.mask(0x1b48, 1 << 14, 1)?;
-        hw.w32(REG_RXSRAM_CTL, 0x00060000)?;
-        let result = hw.get(REG_STAT_RPT, 0xf0)? as u8;
-        hw.mask(0x1b48, 1 << 14, 0)?;
+    async fn gainloss_result<I: Io, A: Authority>(
+        hw: &mut Hw<'_, I, A>,
+        path: u8,
+    ) -> Result<u8, Error> {
+        hw.path_page(path).await?;
+        hw.mask(0x1b48, 1 << 14, 1).await?;
+        hw.w32(REG_RXSRAM_CTL, 0x00060000).await?;
+        let result = hw.get(REG_STAT_RPT, 0xf0).await? as u8;
+        hw.mask(0x1b48, 1 << 14, 0).await?;
         Ok(result)
     }
     async fn agc_gain_chk<I: Io, A: Authority>(
@@ -542,7 +561,7 @@ impl Dpk {
         limited_pga: bool,
     ) -> Result<State, Error> {
         self.one_shot(hw, path, Action::Dagc).await?;
-        let dgain = Self::dgain_read(hw)?;
+        let dgain = Self::dgain_read(hw).await?;
         Ok(if dgain > 1535 && !limited_pga {
             State::GainLess
         } else if dgain < 768 && !limited_pga {
@@ -584,8 +603,8 @@ impl Dpk {
         loop {
             state = match state {
                 State::GainCheck => {
-                    txbb = hw.rf_get(path, RF_TX_GAIN, BIT_GAIN_TXBB)? as u8;
-                    pga = hw.rf_get(path, RF_MODE_TRXAGC, BIT_RXAGC)? as u8;
+                    txbb = hw.rf_get(path, RF_TX_GAIN, BIT_GAIN_TXBB).await? as u8;
+                    pga = hw.rf_get(path, RF_MODE_TRXAGC, BIT_RXAGC).await? as u8;
                     let mut next = if loss_only {
                         State::LossCheck
                     } else {
@@ -657,7 +676,7 @@ impl Dpk {
         path: u8,
     ) -> Result<u8, Error> {
         hw.rf(path, RF_MODE_TRXAGC, RFREG_MASK, 0x50017).await?;
-        let ori = hw.rf_get(path, RF_TX_GAIN, RFREG_MASK)?;
+        let ori = hw.rf_get(path, RF_TX_GAIN, RFREG_MASK).await?;
         hw.rf(path, RF_DEBUG, BIT_DE_TX_GAIN, 1).await?;
         hw.rf(path, RF_DEBUG, BIT_DE_PWR_TRIM, 1).await?;
         hw.rf(path, RF_TX_GAIN_OFFSET, BIT_BB_GAIN, 0).await?;
@@ -688,18 +707,18 @@ impl Dpk {
         path: u8,
     ) -> Result<u8, Error> {
         let ori_txbb = self.rf_setting(hw, path).await?;
-        let ori_txagc = hw.rf_get(path, RF_MODE_TRXAGC, BIT_TXAGC)? as u8;
+        let ori_txagc = hw.rf_get(path, RF_MODE_TRXAGC, BIT_TXAGC).await? as u8;
         Self::rxbb_dc_cal(hw, path).await?;
         self.one_shot(hw, path, Action::Dagc).await?;
-        Self::dgain_read(hw)?;
-        if Self::dc_corr_check(hw)? {
+        Self::dgain_read(hw).await?;
+        if Self::dc_corr_check(hw).await? {
             Self::rxbb_dc_cal(hw, path).await?;
             self.one_shot(hw, path, Action::Dagc).await?;
-            Self::dc_corr_check(hw)?;
+            Self::dc_corr_check(hw).await?;
         }
         let t1 = self.thermal(hw, path).await?;
         let mut tx_bb = self.pas_agc(hw, path, false, true).await?;
-        let search = Self::gainloss_result(hw, path)?;
+        let search = Self::gainloss_result(hw, path).await?;
         tx_bb = tx_bb.saturating_sub(search);
         hw.rf(path, RF_TX_GAIN, BIT_GAIN_TXBB, u32::from(tx_bb))
             .await?;
@@ -710,10 +729,10 @@ impl Dpk {
     }
 
     /// `rtw8822c_dpk_coef_transfer`.
-    fn coef_transfer<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<u32, Error> {
-        hw.r32(REG_STAT_RPT)?;
-        let i = hw.get(REG_STAT_RPT, MASKHWORD)? & 0x1fff;
-        let q = hw.get(REG_STAT_RPT, MASKLWORD)? & 0x1fff;
+    async fn coef_transfer<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<u32, Error> {
+        hw.r32(REG_STAT_RPT).await?;
+        let i = hw.get(REG_STAT_RPT, MASKHWORD).await? & 0x1fff;
+        let q = hw.get(REG_STAT_RPT, MASKLWORD).await? & 0x1fff;
         let q = ((0x2000 - q) & 0x1fff).wrapping_sub(1) & 0xffff;
         Ok((i << 16) | q)
     }
@@ -724,20 +743,20 @@ impl Dpk {
         path: u8,
     ) -> Result<bool, Error> {
         let mut fail = self.one_shot(hw, path, Action::DoDpk).await?;
-        hw.path_page(path)?;
-        fail |= hw.get(REG_DPD_CTL1_S0, 1 << 26)? != 0;
+        hw.path_page(path).await?;
+        fail |= hw.get(REG_DPD_CTL1_S0, 1 << 26).await? != 0;
         hw.rf(path, RF_MODE_TRXAGC, RFREG_MASK, 0x33e14).await?;
-        hw.w32(REG_NCTL0, 0xc)?;
+        hw.w32(REG_NCTL0, 0xc).await?;
         if path == 0 {
-            hw.mask(REG_DPD_CTL0, 1 << 24, 0)?;
-            hw.w32(REG_DPD_CTL0_S0, 0x30000080)?;
+            hw.mask(REG_DPD_CTL0, 1 << 24, 0).await?;
+            hw.w32(REG_DPD_CTL0_S0, 0x30000080).await?;
         } else {
-            hw.mask(REG_DPD_CTL0, 1 << 24, 1)?;
-            hw.w32(REG_DPD_CTL0_S1, 0x30000080)?;
+            hw.mask(REG_DPD_CTL0, 1 << 24, 1).await?;
+            hw.w32(REG_DPD_CTL0_S1, 0x30000080).await?;
         }
         for (i, &sel) in GET_COEF.iter().enumerate() {
-            hw.w32(REG_RXSRAM_CTL, sel)?;
-            self.coef[usize::from(path)][i] = Self::coef_transfer(hw)?;
+            hw.w32(REG_RXSRAM_CTL, sel).await?;
+            self.coef[usize::from(path)][i] = Self::coef_transfer(hw).await?;
         }
         Ok(fail)
     }
@@ -750,15 +769,15 @@ impl Dpk {
         })
     }
     /// `rtw8822c_dpk_coef_write`.
-    fn coef_write<I: Io, A: Authority>(
+    async fn coef_write<I: Io, A: Authority>(
         &self,
         hw: &mut Hw<'_, I, A>,
         path: u8,
         ok: bool,
     ) -> Result<(), Error> {
         let base: u16 = if path == 0 { 0x1b0c } else { 0x1b64 };
-        hw.w32(REG_NCTL0, 0xc)?;
-        hw.w32(REG_RXSRAM_CTL, 0xf0)?;
+        hw.w32(REG_NCTL0, 0xc).await?;
+        hw.w32(REG_RXSRAM_CTL, 0xf0).await?;
         for addr in 0..20u16 {
             let coef = if !ok {
                 if addr == 3 {
@@ -769,12 +788,12 @@ impl Dpk {
             } else {
                 self.coef[usize::from(path)][usize::from(addr)]
             };
-            hw.w32(base + addr * 4, coef)?;
+            hw.w32(base + addr * 4, coef).await?;
         }
         Ok(())
     }
     /// `rtw8822c_dpk_check_pass` + `rtw8822c_dpk_fill_result`.
-    fn fill_result<I: Io, A: Authority>(
+    async fn fill_result<I: Io, A: Authority>(
         &mut self,
         hw: &mut Hw<'_, I, A>,
         fail: bool,
@@ -783,11 +802,12 @@ impl Dpk {
     ) -> Result<bool, Error> {
         let p = usize::from(path);
         let ok = !fail && self.coef_ok(p);
-        hw.path_page(path)?;
-        hw.w8(REG_DPD_AGC, if ok { txagc.wrapping_sub(6) } else { 0 })?;
+        hw.path_page(path).await?;
+        hw.w8(REG_DPD_AGC, if ok { txagc.wrapping_sub(6) } else { 0 })
+            .await?;
         self.result[p] = ok;
-        self.txagc[p] = hw.r8(REG_DPD_AGC)?;
-        self.coef_write(hw, path, ok)?;
+        self.txagc[p] = hw.r8(REG_DPD_AGC).await?;
+        self.coef_write(hw, path, ok).await?;
         Ok(ok)
     }
     /// `rtw8822c_dpk_cal_gs`.
@@ -801,66 +821,67 @@ impl Dpk {
         } else {
             (REG_DPD_CTL0_S1, REG_DPD_CTL1_S1)
         };
-        hw.path_page(path)?;
-        hw.mask(REG_IQK_CTL1, BIT_BYPASS_DPD, 0)?;
-        hw.mask(REG_IQK_CTL1, BIT_TX_CFIR, 0)?;
-        hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0x9)?;
-        hw.mask(REG_R_CONFIG, BIT_INNER_LB, 1)?;
-        hw.subpage(0xc)?;
-        hw.mask(REG_RXSRAM_CTL, BIT_DPD_CLK, 0xf)?;
-        hw.mask(ctl0, BIT_GS_PWSF, 0x1066680)?;
-        hw.mask(ctl1, BIT_DPD_EN, 1)?;
+        hw.path_page(path).await?;
+        hw.mask(REG_IQK_CTL1, BIT_BYPASS_DPD, 0).await?;
+        hw.mask(REG_IQK_CTL1, BIT_TX_CFIR, 0).await?;
+        hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0x9).await?;
+        hw.mask(REG_R_CONFIG, BIT_INNER_LB, 1).await?;
+        hw.subpage(0xc).await?;
+        hw.mask(REG_RXSRAM_CTL, BIT_DPD_CLK, 0xf).await?;
+        hw.mask(ctl0, BIT_GS_PWSF, 0x1066680).await?;
+        hw.mask(ctl1, BIT_DPD_EN, 1).await?;
         let sel = 1u32 << path;
         if self.bw == WIDTH_80 {
             for v in [0x80001310, 0x00001310, 0x810000db, 0x010000db, 0x0000b428] {
-                hw.w32(REG_DPD_CTL16, v)?;
+                hw.w32(REG_DPD_CTL16, v).await?;
             }
-            hw.w32(REG_DPD_CTL15, 0x05020000 | (sel << 28))?;
+            hw.w32(REG_DPD_CTL15, 0x05020000 | (sel << 28)).await?;
         } else {
             for v in [0x8200190c, 0x0200190c, 0x8301ee14, 0x0301ee14, 0x0000b428] {
-                hw.w32(REG_DPD_CTL16, v)?;
+                hw.w32(REG_DPD_CTL16, v).await?;
             }
-            hw.w32(REG_DPD_CTL15, 0x05020008 | (sel << 28))?;
+            hw.w32(REG_DPD_CTL15, 0x05020008 | (sel << 28)).await?;
         }
-        hw.mask(REG_DPD_CTL0, MASKBYTE3, 0x8 | u32::from(path))?;
+        hw.mask(REG_DPD_CTL0, MASKBYTE3, 0x8 | u32::from(path))
+            .await?;
         self.one_shot(hw, path, Action::CalPwr).await?;
-        hw.mask(REG_DPD_CTL15, MASKBYTE3, 0)?;
-        hw.path_page(path)?;
-        hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0)?;
-        hw.mask(REG_R_CONFIG, BIT_INNER_LB, 0)?;
-        hw.subpage(0xc)?;
-        hw.mask(ctl0, BIT_GS_PWSF, 0x5b)?;
-        hw.mask(REG_RXSRAM_CTL, BIT_RPT_SEL, 0)?;
-        let mut gs = hw.get(REG_STAT_RPT, BIT_RPT_DGAIN)? as u16 as u32;
+        hw.mask(REG_DPD_CTL15, MASKBYTE3, 0).await?;
+        hw.path_page(path).await?;
+        hw.mask(REG_R_CONFIG, BIT_IQ_SWITCH, 0).await?;
+        hw.mask(REG_R_CONFIG, BIT_INNER_LB, 0).await?;
+        hw.subpage(0xc).await?;
+        hw.mask(ctl0, BIT_GS_PWSF, 0x5b).await?;
+        hw.mask(REG_RXSRAM_CTL, BIT_RPT_SEL, 0).await?;
+        let mut gs = hw.get(REG_STAT_RPT, BIT_RPT_DGAIN).await? as u16 as u32;
         gs = (gs * 910) >> 10;
         // DIV_ROUND_CLOSEST(gs, 10)
         gs = (gs + 5) / 10;
-        hw.mask(ctl0, BIT_GS_PWSF, gs)?;
+        hw.mask(ctl0, BIT_GS_PWSF, gs).await?;
         self.gs[usize::from(path)] = gs as u16;
         Ok(())
     }
     /// `rtw8822c_dpk_cal_coef1`. A zero GS would divide by zero in Linux;
     /// this port refuses it instead.
     async fn cal_coef1<I: Io, A: Authority>(&self, hw: &mut Hw<'_, I, A>) -> Result<(), Error> {
-        hw.subpage(0xc)?;
-        hw.w32(REG_RXSRAM_CTL, 0xf0)?;
-        hw.w32(REG_NCTL0, 0x1148)?;
-        hw.w32(REG_NCTL0, 0x1149)?;
+        hw.subpage(0xc).await?;
+        hw.w32(REG_RXSRAM_CTL, 0xf0).await?;
+        hw.w32(REG_NCTL0, 0x1148).await?;
+        hw.w32(REG_NCTL0, 0x1149).await?;
         // Linux only warns on a stuck DPK here ("performance may be suboptimal").
         let _ = hw.ready(0x2d9c, 0xff, 0x55).await?;
-        hw.w8(0x1b10, 0)?;
-        hw.subpage(0xc)?;
+        hw.w8(0x1b10, 0).await?;
+        hw.subpage(0xc).await?;
         for path in 0..2u16 {
             let gs = u32::from(self.gs[usize::from(path)]);
             if gs == 0 {
                 return Err(Error::Prerequisite);
             }
             let offset = path * 0x58;
-            hw.mask(0x1b18 + offset, MASKHWORD, 0x16c00 / gs)?;
+            hw.mask(0x1b18 + offset, MASKHWORD, 0x16c00 / gs).await?;
             for v in [0x9, 0x1, 0x0] {
-                hw.mask(REG_DPD_CTL0_S0 + offset, 0xf000_0000, v)?;
+                hw.mask(REG_DPD_CTL0_S0 + offset, 0xf000_0000, v).await?;
             }
-            hw.mask(REG_DPD_CTL1_S0 + offset, 1 << 14, 0)?;
+            hw.mask(REG_DPD_CTL1_S0 + offset, 1 << 14, 0).await?;
         }
         Ok(())
     }
@@ -871,8 +892,8 @@ impl Dpk {
         path: u8,
     ) -> Result<(), Error> {
         self.one_shot(hw, path, Action::DpkOn).await?;
-        hw.path_page(path)?;
-        hw.mask(REG_IQK_CTL1, BIT_TX_CFIR, 0)?;
+        hw.path_page(path).await?;
+        hw.mask(REG_IQK_CTL1, BIT_TX_CFIR, 0).await?;
         if self.path_ok[usize::from(path)] {
             self.cal_gs(hw, path).await?;
         }
@@ -880,44 +901,44 @@ impl Dpk {
     }
     /// `rtw8822c_dpk_tx_pause` + `rtw8822c_dpk_mac_bb` table.
     async fn mac_bb<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>) -> Result<(), Error> {
-        hw.w8(0x522, 0xff)?;
-        hw.mask(0x1e70, 0xf, 2)?;
+        hw.w8(0x522, 0xff).await?;
+        hw.mask(0x1e70, 0xf, 2).await?;
         for _ in 0..2500 {
-            let a = hw.rf_get(0, 0, 0xf0000)?;
-            let b = hw.rf_get(1, 0, 0xf0000)?;
+            let a = hw.rf_get(0, 0, 0xf0000).await?;
+            let b = hw.rf_get(1, 0, 0xf0000).await?;
             hw.delay(2).await;
             if a != 2 && b != 2 {
                 break;
             }
         }
         for (reg, bits, value) in MAC_BB {
-            hw.mask(reg, bits, value)?;
+            hw.mask(reg, bits, value).await?;
         }
         Ok(())
     }
     /// `rtw8822c_dpk_afe_setting`.
-    fn afe<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>, is_dpk: bool) -> Result<(), Error> {
+    async fn afe<I: Io, A: Authority>(hw: &mut Hw<'_, I, A>, is_dpk: bool) -> Result<(), Error> {
         if is_dpk {
-            hw.w32(0x1c38, 0xffff_ffff)?;
+            hw.w32(0x1c38, 0xffff_ffff).await?;
             for reg in [0x1830, 0x4130] {
                 for v in AFE_IS_DPK {
-                    hw.w32(reg, v)?;
+                    hw.w32(reg, v).await?;
                 }
             }
-            hw.mask(0x18a4, 1 << 7, 1)?;
-            hw.mask(0x41a4, 1 << 7, 1)?;
+            hw.mask(0x18a4, 1 << 7, 1).await?;
+            hw.mask(0x41a4, 1 << 7, 1).await?;
         } else {
-            hw.mask(0x18a4, 1 << 7, 0)?;
-            hw.mask(0x41a4, 1 << 7, 0)?;
-            hw.w32(0x1c38, 0xffa1005e)?;
+            hw.mask(0x18a4, 1 << 7, 0).await?;
+            hw.mask(0x41a4, 1 << 7, 0).await?;
+            hw.w32(0x1c38, 0xffa1005e).await?;
             for reg in [0x1830, 0x4130] {
                 for v in AFE_NO_DPK_A {
-                    hw.w32(reg, v)?;
+                    hw.w32(reg, v).await?;
                 }
             }
             for reg in [0x1830, 0x4130] {
                 for v in AFE_NO_DPK_B {
-                    hw.w32(reg, v)?;
+                    hw.w32(reg, v).await?;
                 }
             }
         }
@@ -927,7 +948,7 @@ impl Dpk {
     async fn pre_setting<I: Io, A: Authority>(&self, hw: &mut Hw<'_, I, A>) -> Result<(), Error> {
         for path in 0..2u8 {
             hw.rf(path, RF_RXAGC_OFFSET, RFREG_MASK, 0).await?;
-            hw.w32(REG_NCTL0, 0x8 | (u32::from(path) << 1))?;
+            hw.w32(REG_NCTL0, 0x8 | (u32::from(path) << 1)).await?;
             hw.w32(
                 REG_DPD_CTL1_S1,
                 if self.band == BAND_2G {
@@ -935,13 +956,14 @@ impl Dpk {
                 } else {
                     0x1f0d0000
                 },
-            )?;
-            hw.mask(REG_DPD_LUT0, BIT_GLOSS_DB, 0x4)?;
-            hw.mask(REG_IQK_CTL1, BIT_TX_CFIR, 0x3)?;
+            )
+            .await?;
+            hw.mask(REG_DPD_LUT0, BIT_GLOSS_DB, 0x4).await?;
+            hw.mask(REG_IQK_CTL1, BIT_TX_CFIR, 0x3).await?;
         }
-        hw.subpage(0xc)?;
-        hw.w32(REG_DPD_CTL11, 0x3b23170b)?;
-        hw.w32(REG_DPD_CTL12, 0x775f5347)
+        hw.subpage(0xc).await?;
+        hw.w32(REG_DPD_CTL11, 0x3b23170b).await?;
+        hw.w32(REG_DPD_CTL12, 0x775f5347).await
     }
     /// `rtw8822c_dpk_result_reset`.
     async fn result_reset<I: Io, A: Authority>(
@@ -951,8 +973,8 @@ impl Dpk {
         for path in 0..2u8 {
             let p = usize::from(path);
             self.path_ok[p] = false;
-            hw.path_page(path)?;
-            hw.mask(0x1b58, 0x7f, 0)?;
+            hw.path_page(path).await?;
+            hw.mask(0x1b58, 0x7f, 0).await?;
             self.txagc[p] = 0;
             self.result[p] = false;
             self.gs[p] = 0x5b;
@@ -962,10 +984,10 @@ impl Dpk {
         Ok(())
     }
     /// `rtw8822c_dpk_enable_disable` (`is_dpk_pwr_on` holds).
-    fn enable<I: Io, A: Authority>(&self, hw: &mut Hw<'_, I, A>) -> Result<(), Error> {
-        hw.subpage(0xc)?;
-        hw.mask(REG_DPD_CTL1_S0, BIT_DPD_EN, 1)?;
-        hw.mask(REG_DPD_CTL1_S1, BIT_DPD_EN, 1)?;
+    async fn enable<I: Io, A: Authority>(&self, hw: &mut Hw<'_, I, A>) -> Result<(), Error> {
+        hw.subpage(0xc).await?;
+        hw.mask(REG_DPD_CTL1_S0, BIT_DPD_EN, 1).await?;
+        hw.mask(REG_DPD_CTL1_S1, BIT_DPD_EN, 1).await?;
         for (path, (ctl0, ctl1)) in [
             (REG_DPD_CTL0_S0, REG_DPD_CTL1_S0),
             (REG_DPD_CTL0_S1, REG_DPD_CTL1_S1),
@@ -974,8 +996,8 @@ impl Dpk {
         .enumerate()
         {
             if self.path_ok[path] {
-                hw.mask(ctl1, 0xc000, 0)?;
-                hw.w8(ctl0, self.gs[path] as u8)?;
+                hw.mask(ctl1, 0xc000, 0).await?;
+                hw.w8(ctl0, self.gs[path] as u8).await?;
             }
         }
         Ok(())
@@ -987,7 +1009,7 @@ impl Dpk {
         // starts a fresh tracker, so it always recalibrates.
         self.avg_thermal = [Ewma::default(); 2];
         // rtw8822c_dpk_information
-        let reg = hw.rf_get(0, 0x18, RFREG_MASK)?;
+        let reg = hw.rf_get(0, 0x18, RFREG_MASK).await?;
         self.band = 1 << ((reg >> 16) & 1);
         self.ch = (reg & 0xff) as u8;
         self.bw = ((reg & 0x3000) >> 12) as u8;
@@ -997,12 +1019,12 @@ impl Dpk {
             rf: [[0; 2]; 7],
         };
         for (slot, &reg) in backup.bb.iter_mut().zip(BB_REG.iter()) {
-            *slot = hw.r32(reg)?;
+            *slot = hw.r32(reg).await?;
         }
         for (slot, &reg) in backup.rf.iter_mut().zip(RF_REG.iter()) {
             *slot = [
-                hw.rf_get(0, reg, RFREG_MASK)?,
-                hw.rf_get(1, reg, RFREG_MASK)?,
+                hw.rf_get(0, reg, RFREG_MASK).await?,
+                hw.rf_get(1, reg, RFREG_MASK).await?,
             ];
         }
         self.backup = Some(backup);
@@ -1010,22 +1032,22 @@ impl Dpk {
         let ch = self.ch;
         self.ch = 0;
         Self::mac_bb(hw).await?;
-        Self::afe(hw, true)?;
+        Self::afe(hw, true).await?;
         self.pre_setting(hw).await?;
         self.result_reset(hw).await?;
         // rtw8822c_dpk_path_select
         for path in 0..2u8 {
             let txagc = self.gainloss(hw, path).await?;
             let fail = self.by_path(hw, path).await?;
-            let ok = self.fill_result(hw, fail, txagc, path)?;
+            let ok = self.fill_result(hw, fail, txagc, path).await?;
             self.path_ok[usize::from(path)] = ok;
         }
         for path in 0..2u8 {
             self.on(hw, path).await?;
         }
         self.cal_coef1(hw).await?;
-        Self::afe(hw, false)?;
-        self.enable(hw)?;
+        Self::afe(hw, false).await?;
+        self.enable(hw).await?;
         Self::restore_backup(hw, &backup).await?;
         self.backup = None;
         self.ch = ch;
@@ -1045,10 +1067,10 @@ impl Dpk {
             Self::rxbb_dc_cal(hw, path).await?;
         }
         for (&reg, &v) in BB_REG.iter().zip(b.bb.iter()) {
-            hw.w32(reg, v)?;
+            hw.w32(reg, v).await?;
         }
-        hw.subpage(0xc)?;
-        hw.mask(REG_RXSRAM_CTL, BIT_DPD_CLK, 0x4)
+        hw.subpage(0xc).await?;
+        hw.mask(REG_RXSRAM_CTL, BIT_DPD_CLK, 0x4).await
     }
 
     /// Return to the base no-DPD program under `base`: finish a pending
@@ -1065,15 +1087,15 @@ impl Dpk {
             Self::restore_backup(&mut hw, &b).await?;
         }
         for path in 0..2u8 {
-            hw.path_page(path)?;
-            hw.mask(0x1b58, 0x7f, 0)?;
-            hw.mask(REG_NCTL0, BIT_SEL_PATH, u32::from(path))?;
-            hw.mask(REG_DPD_CTL1_S0, BIT_DPD_EN, 0)?;
-            hw.mask(REG_DPD_CTL1_S0, BIT_PS_EN, 0)?;
+            hw.path_page(path).await?;
+            hw.mask(0x1b58, 0x7f, 0).await?;
+            hw.mask(REG_NCTL0, BIT_SEL_PATH, u32::from(path)).await?;
+            hw.mask(REG_DPD_CTL1_S0, BIT_DPD_EN, 0).await?;
+            hw.mask(REG_DPD_CTL1_S0, BIT_PS_EN, 0).await?;
         }
-        hw.subpage(0xc)?;
-        hw.mask(REG_DPD_CTL1_S0, BIT_DPD_EN, 0)?;
-        hw.mask(REG_DPD_CTL1_S1, BIT_DPD_EN, 0)?;
+        hw.subpage(0xc).await?;
+        hw.mask(REG_DPD_CTL1_S0, BIT_DPD_EN, 0).await?;
+        hw.mask(REG_DPD_CTL1_S1, BIT_DPD_EN, 0).await?;
         self.pre_pwsf = [0; 2];
         self.path_ok = [false; 2];
         self.thermal_dpk = [0; 2];

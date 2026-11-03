@@ -131,29 +131,29 @@ impl Bfee {
     }
 }
 
-fn mask8(io: &mut impl Io, reg: u16, bits: u8, value: u8) -> Result<(), Error> {
-    let old = io.read8(reg)?;
-    io.write8(reg, old & !bits | value & bits)
+async fn mask8(io: &mut impl Io, reg: u16, bits: u8, value: u8) -> Result<(), Error> {
+    let old = io.read8(reg).await?;
+    io.write8(reg, old & !bits | value & bits).await
 }
 
 /// `rtw_bf_phy_init`.
-pub(super) fn phy_init(io: &mut impl Io) -> Result<(), Error> {
-    let mut mu = io.read32(REG_MU_TX_CTL)?;
+pub(super) async fn phy_init(io: &mut impl Io) -> Result<(), Error> {
+    let mut mu = io.read32(REG_MU_TX_CTL).await?;
     mu |= 1 << 16;
     mu = mu & !(0xf << 12) | 0xa << 12;
     mu &= !(1 << 7);
     mu &= !0x3f;
-    io.write32(REG_MU_TX_CTL, mu)?;
-    io.write8(REG_WMAC_MU_BF_OPTION, 3 << 4 | 1 << 6)?;
-    io.write16(REG_WMAC_MU_BF_CTL, 0)?;
-    let txbf = io.read32(REG_TXBF_CTRL)?;
-    io.write32(REG_TXBF_CTRL, txbf | 1 << 30)?;
-    io.write8(REG_NDPA_OPT_CTRL, 0x10)?;
-    super::radio::mask(io, REG_BBPSF_CTRL, 0x3f << 24, DESC_RATE6M)?;
-    if io.read32(REG_MU_TX_CTL)? != mu
-        || io.read8(REG_WMAC_MU_BF_OPTION)? != 0x70
-        || io.read8(REG_NDPA_OPT_CTRL)? != 0x10
-        || io.read32(REG_BBPSF_CTRL)? >> 24 & 0x3f != DESC_RATE6M
+    io.write32(REG_MU_TX_CTL, mu).await?;
+    io.write8(REG_WMAC_MU_BF_OPTION, 3 << 4 | 1 << 6).await?;
+    io.write16(REG_WMAC_MU_BF_CTL, 0).await?;
+    let txbf = io.read32(REG_TXBF_CTRL).await?;
+    io.write32(REG_TXBF_CTRL, txbf | 1 << 30).await?;
+    io.write8(REG_NDPA_OPT_CTRL, 0x10).await?;
+    super::radio::mask(io, REG_BBPSF_CTRL, 0x3f << 24, DESC_RATE6M).await?;
+    if io.read32(REG_MU_TX_CTL).await? != mu
+        || io.read8(REG_WMAC_MU_BF_OPTION).await? != 0x70
+        || io.read8(REG_NDPA_OPT_CTRL).await? != 0x10
+        || io.read32(REG_BBPSF_CTRL).await? >> 24 & 0x3f != DESC_RATE6M
     {
         return Err(Error::Prerequisite);
     }
@@ -161,45 +161,48 @@ pub(super) fn phy_init(io: &mut impl Io) -> Result<(), Error> {
 }
 
 /// `rtw_chip_config_bfee(.., true)` for an SU entry at register index 0.
-pub(super) fn enable_su(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
+pub(super) async fn enable_su(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
     mask8(
         io,
         REG_SND_PTCL_CTRL,
         BIT_MASK_BEAMFORM,
         RTW_SND_CTRL_SOUNDING,
-    )?;
+    )
+    .await?;
     for (i, byte) in b.mac.into_iter().enumerate() {
-        io.write8(REG_ASSOCIATED_BFMER0_INFO + i as u16, byte)?;
+        io.write8(REG_ASSOCIATED_BFMER0_INFO + i as u16, byte)
+            .await?;
     }
-    io.write16(REG_TX_CSI_RPT_PARAM_BW20, b.csi_param())?;
-    io.write8(REG_SND_PTCL_CTRL + 3, RTW_NDP_RX_STANDBY_TIME)?;
+    io.write16(REG_TX_CSI_RPT_PARAM_BW20, b.csi_param()).await?;
+    io.write8(REG_SND_PTCL_CTRL + 3, RTW_NDP_RX_STANDBY_TIME)
+        .await?;
     if did == 0xc822 {
         // Station net type: AP-mode bit12 clear; CSI_RSC 0 is ORed in
         // (`csi_rsc << 13`), leaving bits 13..14 as they were.
-        let psf = io.read32(REG_BBPSF_CTRL)? | BIT_WMAC_USE_NDPARATE;
-        io.write32(REG_BBPSF_CTRL, psf & !(1 << 12))?;
-        io.write32(REG_CSI_RRSR, 0x550)?;
+        let psf = io.read32(REG_BBPSF_CTRL).await? | BIT_WMAC_USE_NDPARATE;
+        io.write32(REG_BBPSF_CTRL, psf & !(1 << 12)).await?;
+        io.write32(REG_CSI_RRSR, 0x550).await?;
     }
-    readback(io, did, b)
+    readback(io, did, b).await
 }
 
 /// The enabled entry is still programmed (SU or MU per `b.role`).
-pub(super) fn readback(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
+pub(super) async fn readback(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
     if b.is_mu() {
-        return readback_mu(io, did, b);
+        return readback_mu(io, did, b).await;
     }
     let mut mac = [0; 6];
     for (i, byte) in mac.iter_mut().enumerate() {
-        *byte = io.read8(REG_ASSOCIATED_BFMER0_INFO + i as u16)?;
+        *byte = io.read8(REG_ASSOCIATED_BFMER0_INFO + i as u16).await?;
     }
-    if io.read8(REG_SND_PTCL_CTRL)? & BIT_MASK_BEAMFORM != RTW_SND_CTRL_SOUNDING
+    if io.read8(REG_SND_PTCL_CTRL).await? & BIT_MASK_BEAMFORM != RTW_SND_CTRL_SOUNDING
         || mac != b.mac
-        || io.read16(REG_TX_CSI_RPT_PARAM_BW20)? != b.csi_param()
-        || io.read8(REG_SND_PTCL_CTRL + 3)? != RTW_NDP_RX_STANDBY_TIME
+        || io.read16(REG_TX_CSI_RPT_PARAM_BW20).await? != b.csi_param()
+        || io.read8(REG_SND_PTCL_CTRL + 3).await? != RTW_NDP_RX_STANDBY_TIME
         || did == 0xc822
-            && (io.read32(REG_BBPSF_CTRL)? & (BIT_WMAC_USE_NDPARATE | 1 << 12)
+            && (io.read32(REG_BBPSF_CTRL).await? & (BIT_WMAC_USE_NDPARATE | 1 << 12)
                 != BIT_WMAC_USE_NDPARATE
-                || io.read32(REG_CSI_RRSR)? != 0x550)
+                || io.read32(REG_CSI_RRSR).await? != 0x550)
     {
         return Err(Error::Prerequisite);
     }
@@ -207,25 +210,26 @@ pub(super) fn readback(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error>
 }
 
 /// `rtw_bf_disassoc` -> `rtw_chip_config_bfee(.., false)` for `b.role`.
-pub(super) fn remove(io: &mut impl Io, b: Bfee) -> Result<(), Error> {
+pub(super) async fn remove(io: &mut impl Io, b: Bfee) -> Result<(), Error> {
     if b.is_mu() {
-        remove_mu(io)
+        remove_mu(io).await
     } else {
-        remove_su(io)
+        remove_su(io).await
     }
 }
 
 /// `rtw_bf_remove_bfee_su` for register index 0 (`rtw_bf_disassoc`).
-pub(super) fn remove_su(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn remove_su(io: &mut impl Io) -> Result<(), Error> {
     mask8(
         io,
         REG_SND_PTCL_CTRL,
         BIT_MASK_BEAMFORM,
         RTW_SND_CTRL_REMOVE,
-    )?;
-    io.write32(REG_ASSOCIATED_BFMER0_INFO, 0)?;
-    io.write16(REG_ASSOCIATED_BFMER0_INFO + 4, 0)?;
-    io.write16(REG_TX_CSI_RPT_PARAM_BW20, 0)
+    )
+    .await?;
+    io.write32(REG_ASSOCIATED_BFMER0_INFO, 0).await?;
+    io.write16(REG_ASSOCIATED_BFMER0_INFO + 4, 0).await?;
+    io.write16(REG_TX_CSI_RPT_PARAM_BW20, 0).await
 }
 
 /// `rtw_chip_config_bfee(.., true)` for the MU entry:
@@ -238,62 +242,67 @@ pub(super) fn remove_su(io: &mut impl Io) -> Result<(), Error> {
 /// the Linux shadow is stale. The shadow here is the retained register, so
 /// both chips end with the source result `shadow | BIT_RXFLTMAP1_BF` and the
 /// upper control-subtype bits stay as the init left them.
-pub(super) fn enable_mu(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
+pub(super) async fn enable_mu(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
     let Role::Mu { p_aid, aid } = b.role else {
         return Err(Error::State);
     };
     // rtw_bf_init_bfer_entry_mu
     for (i, byte) in b.mac.into_iter().enumerate() {
-        io.write8(REG_ASSOCIATED_BFMER0_INFO + i as u16, byte)?;
+        io.write8(REG_ASSOCIATED_BFMER0_INFO + i as u16, byte)
+            .await?;
     }
-    io.write16(REG_ASSOCIATED_BFMER0_INFO + 6, p_aid)?;
-    io.write16(REG_TX_CSI_RPT_PARAM_BW20, b.csi_param())?;
+    io.write16(REG_ASSOCIATED_BFMER0_INFO + 6, p_aid).await?;
+    io.write16(REG_TX_CSI_RPT_PARAM_BW20, b.csi_param()).await?;
     // csi_length_sel HAL_CSI_SEG_4K (0) at bits 13:12; bits 15:14 kept.
-    let ctl = io.read16(REG_WMAC_MU_BF_CTL)? & 0xc000 | aid;
-    io.write16(REG_WMAC_MU_BF_CTL, ctl)?;
+    let ctl = io.read16(REG_WMAC_MU_BF_CTL).await? & 0xc000 | aid;
+    io.write16(REG_WMAC_MU_BF_CTL, ctl).await?;
     // rtw_bf_cfg_sounding(DESC_RATE6M): CSI_RSC_PRIMARY_20M_BW (0) on C22,
     // CSI_RSC_FOLLOW_RX_PACKET_BW (1) otherwise; station net type.
     let csi_rsc = u32::from(did != 0xc822);
-    let psf = io.read32(REG_BBPSF_CTRL)? | BIT_WMAC_USE_NDPARATE | csi_rsc << 13;
+    let psf = io.read32(REG_BBPSF_CTRL).await? | BIT_WMAC_USE_NDPARATE | csi_rsc << 13;
     mask8(
         io,
         REG_SND_PTCL_CTRL,
         BIT_MASK_BEAMFORM,
         RTW_SND_CTRL_SOUNDING,
-    )?;
-    io.write8(REG_SND_PTCL_CTRL + 3, MU_NDP_RX_STANDBY_TIME)?;
-    let shadow = io.read16(REG_RXFLTMAP1)? & !BIT_RXFLTMAP1_BF_REPORT_POLL;
-    io.write16(REG_RXFLTMAP1, shadow)?;
-    let flt4 = io.read8(REG_RXFLTMAP4)?;
-    io.write8(REG_RXFLTMAP4, flt4 & !BIT_RXFLTMAP4_BF_REPORT_POLL)?;
-    io.write32(REG_BBPSF_CTRL, psf & !(1 << 12))?;
+    )
+    .await?;
+    io.write8(REG_SND_PTCL_CTRL + 3, MU_NDP_RX_STANDBY_TIME)
+        .await?;
+    let shadow = io.read16(REG_RXFLTMAP1).await? & !BIT_RXFLTMAP1_BF_REPORT_POLL;
+    io.write16(REG_RXFLTMAP1, shadow).await?;
+    let flt4 = io.read8(REG_RXFLTMAP4).await?;
+    io.write8(REG_RXFLTMAP4, flt4 & !BIT_RXFLTMAP4_BF_REPORT_POLL)
+        .await?;
+    io.write32(REG_BBPSF_CTRL, psf & !(1 << 12)).await?;
     // Accept action_no_ack; accept NDPA and BF report poll.
-    let flt0 = io.read16(REG_RXFLTMAP0)?;
-    io.write16(REG_RXFLTMAP0, flt0 | BIT_RXFLTMAP0_ACTIONNOACK)?;
-    io.write16(REG_RXFLTMAP1, shadow | BIT_RXFLTMAP1_BF)?;
-    readback_mu(io, did, b)
+    let flt0 = io.read16(REG_RXFLTMAP0).await?;
+    io.write16(REG_RXFLTMAP0, flt0 | BIT_RXFLTMAP0_ACTIONNOACK)
+        .await?;
+    io.write16(REG_RXFLTMAP1, shadow | BIT_RXFLTMAP1_BF).await?;
+    readback_mu(io, did, b).await
 }
 
-fn readback_mu(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
+async fn readback_mu(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
     let Role::Mu { p_aid, aid } = b.role else {
         return Err(Error::State);
     };
     let mut mac = [0; 6];
     for (i, byte) in mac.iter_mut().enumerate() {
-        *byte = io.read8(REG_ASSOCIATED_BFMER0_INFO + i as u16)?;
+        *byte = io.read8(REG_ASSOCIATED_BFMER0_INFO + i as u16).await?;
     }
     let rsc = if did == 0xc822 { 0 } else { 1 << 13 };
-    let psf = io.read32(REG_BBPSF_CTRL)?;
+    let psf = io.read32(REG_BBPSF_CTRL).await?;
     if mac != b.mac
-        || io.read16(REG_ASSOCIATED_BFMER0_INFO + 6)? != p_aid
-        || io.read16(REG_TX_CSI_RPT_PARAM_BW20)? != b.csi_param()
-        || io.read16(REG_WMAC_MU_BF_CTL)? & 0x3fff != aid
-        || io.read8(REG_SND_PTCL_CTRL)? & BIT_MASK_BEAMFORM != RTW_SND_CTRL_SOUNDING
-        || io.read8(REG_SND_PTCL_CTRL + 3)? != MU_NDP_RX_STANDBY_TIME
+        || io.read16(REG_ASSOCIATED_BFMER0_INFO + 6).await? != p_aid
+        || io.read16(REG_TX_CSI_RPT_PARAM_BW20).await? != b.csi_param()
+        || io.read16(REG_WMAC_MU_BF_CTL).await? & 0x3fff != aid
+        || io.read8(REG_SND_PTCL_CTRL).await? & BIT_MASK_BEAMFORM != RTW_SND_CTRL_SOUNDING
+        || io.read8(REG_SND_PTCL_CTRL + 3).await? != MU_NDP_RX_STANDBY_TIME
         || psf & (BIT_WMAC_USE_NDPARATE | 1 << 12 | rsc) != BIT_WMAC_USE_NDPARATE | rsc
-        || io.read8(REG_RXFLTMAP4)? & BIT_RXFLTMAP4_BF_REPORT_POLL != 0
-        || io.read16(REG_RXFLTMAP0)? & BIT_RXFLTMAP0_ACTIONNOACK == 0
-        || io.read16(REG_RXFLTMAP1)? & BIT_RXFLTMAP1_BF != BIT_RXFLTMAP1_BF
+        || io.read8(REG_RXFLTMAP4).await? & BIT_RXFLTMAP4_BF_REPORT_POLL != 0
+        || io.read16(REG_RXFLTMAP0).await? & BIT_RXFLTMAP0_ACTIONNOACK == 0
+        || io.read16(REG_RXFLTMAP1).await? & BIT_RXFLTMAP1_BF != BIT_RXFLTMAP1_BF
     {
         return Err(Error::Prerequisite);
     }
@@ -304,18 +313,19 @@ fn readback_mu(io: &mut impl Io, did: u16, b: Bfee) -> Result<(), Error> {
 /// `rtw_bf_del_sounding` (the disassociating vif was the only SU/MU count).
 /// The CSI parameter word, `REG_BBPSF_CTRL` and the RX filter maps keep
 /// their values, as in Linux.
-pub(super) fn remove_mu(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn remove_mu(io: &mut impl Io) -> Result<(), Error> {
     mask8(
         io,
         REG_SND_PTCL_CTRL,
         BIT_MASK_BEAMFORM,
         RTW_SND_CTRL_REMOVE,
-    )?;
-    io.write32(REG_ASSOCIATED_BFMER0_INFO, 0)?;
-    io.write32(REG_ASSOCIATED_BFMER0_INFO_HI, 0)?;
-    io.write16(REG_WMAC_MU_BF_CTL, 0)?;
-    io.write8(REG_MU_TX_CTL, 0)?;
-    mask8(io, REG_SND_PTCL_CTRL, BIT_MASK_BEAMFORM, 0)
+    )
+    .await?;
+    io.write32(REG_ASSOCIATED_BFMER0_INFO, 0).await?;
+    io.write32(REG_ASSOCIATED_BFMER0_INFO_HI, 0).await?;
+    io.write16(REG_WMAC_MU_BF_CTL, 0).await?;
+    io.write8(REG_MU_TX_CTL, 0).await?;
+    mask8(io, REG_SND_PTCL_CTRL, BIT_MASK_BEAMFORM, 0).await
 }
 
 /// `struct ieee80211_mu_group_data`: 64-bit membership and 2-bit user
@@ -364,27 +374,30 @@ fn le32(b: &[u8]) -> u32 {
 /// table 0 gets membership[0..4] and positions[0..8], table 1
 /// membership[4..8] and positions[8..16] (the `memcpy` into
 /// `given_gid_tab[2]` / `given_user_pos[4]`, little-endian words).
-pub(super) fn set_gid(io: &mut impl Io, g: &MuGroup) -> Result<(), Error> {
-    let valid = io.read8(REG_MU_TX_CTL)? & !BIT_MASK_R_MU_TABLE_VALID;
+pub(super) async fn set_gid(io: &mut impl Io, g: &MuGroup) -> Result<(), Error> {
+    let valid = io.read8(REG_MU_TX_CTL).await? & !BIT_MASK_R_MU_TABLE_VALID;
     let ctl = (valid | 1 | 2) & !BIT_EN_MU_MIMO;
-    io.write8(REG_MU_TX_CTL, ctl)?;
-    let sel = io.read8(REG_MU_TX_CTL + 1)? & 0xf8;
+    io.write8(REG_MU_TX_CTL, ctl).await?;
+    let sel = io.read8(REG_MU_TX_CTL + 1).await? & 0xf8;
     for table in 0..2 {
-        io.write8(REG_MU_TX_CTL + 1, sel | table as u8)?;
-        io.write32(REG_MU_STA_GID_VLD, le32(&g.membership[table * 4..]))?;
-        io.write32(REG_MU_STA_USER_POS_INFO, le32(&g.position[table * 8..]))?;
+        io.write8(REG_MU_TX_CTL + 1, sel | table as u8).await?;
+        io.write32(REG_MU_STA_GID_VLD, le32(&g.membership[table * 4..]))
+            .await?;
+        io.write32(REG_MU_STA_USER_POS_INFO, le32(&g.position[table * 8..]))
+            .await?;
         io.write32(
             REG_MU_STA_USER_POS_INFO + 4,
             le32(&g.position[table * 8 + 4..]),
-        )?;
+        )
+        .await?;
     }
     // Readback of the control byte and the last-selected table (1); table 0
     // is not reselected for readback, which Linux never does.
-    if io.read8(REG_MU_TX_CTL)? != ctl
-        || io.read8(REG_MU_TX_CTL + 1)? != sel | 1
-        || io.read32(REG_MU_STA_GID_VLD)? != le32(&g.membership[4..])
-        || io.read32(REG_MU_STA_USER_POS_INFO)? != le32(&g.position[8..])
-        || io.read32(REG_MU_STA_USER_POS_INFO + 4)? != le32(&g.position[12..])
+    if io.read8(REG_MU_TX_CTL).await? != ctl
+        || io.read8(REG_MU_TX_CTL + 1).await? != sel | 1
+        || io.read32(REG_MU_STA_GID_VLD).await? != le32(&g.membership[4..])
+        || io.read32(REG_MU_STA_USER_POS_INFO).await? != le32(&g.position[8..])
+        || io.read32(REG_MU_STA_USER_POS_INFO + 4).await? != le32(&g.position[12..])
     {
         return Err(Error::Prerequisite);
     }

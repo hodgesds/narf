@@ -198,7 +198,11 @@ impl<I: Io> Owner<I> {
         }
         let mut sleeping = false;
         for i in 0..=100 {
-            let tcr = admission.run(|| source.invoke(|| self.io.read32(wire::TCR)))?;
+            let tcr = crate::rtw88::firmware_transport::enclosed(
+                |op| admission.run(|| source.invoke(op)),
+                self.io.read32(wire::TCR),
+            )
+            .await?;
             if tcr == u32::MAX {
                 return Err(NativeError::Gone.into());
             }
@@ -246,7 +250,11 @@ impl<I: Io> Owner<I> {
                 .lps_collect(&mut self.io, &source)
                 .map_err(|_| Error::Generation)?;
             wake |= event;
-            let tcr = admission.run(|| source.invoke(|| self.io.read32(wire::TCR)))?;
+            let tcr = crate::rtw88::firmware_transport::enclosed(
+                |op| admission.run(|| source.invoke(op)),
+                self.io.read32(wire::TCR),
+            )
+            .await?;
             if idle && wire::register_awake(tcr) && (!profile.c2h_wake || wake) {
                 awake = true;
                 break;

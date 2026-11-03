@@ -227,6 +227,110 @@ fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
         sections,
     })
 }
+/// Asynchronous register work enclosed by a synchronous authority invoke.
+///
+/// `Io` register access is asynchronous so a USB backend can issue real EP0
+/// vendor requests (`rtw88/usb.c::rtw_usb_read`/`rtw_usb_write`) while the
+/// PCI backend completes in its first poll. `wrap` is the existing
+/// synchronous enclosure (a capability `invoke`, `Admission::run`, ...).
+/// The operation's first poll runs inside it: an immediately-ready PCI
+/// operation therefore executes wholly inside the enclosure, exactly as the
+/// synchronous form did. An operation still in flight after that poll (a USB
+/// transfer) continues outside, and completion re-enters the enclosure, so a
+/// revocation or close while a transfer is in flight voids the result.
+pub(super) async fn enclosed<T, E, W>(
+    wrap: W,
+    operation: impl core::future::Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    W: Fn(&mut dyn FnMut() -> Result<Option<T>, E>) -> Result<Option<T>, E>,
+{
+    let mut operation = core::pin::pin!(operation);
+    let first = wrap(&mut || {
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        match core::future::Future::poll(operation.as_mut(), &mut cx) {
+            core::task::Poll::Ready(result) => result.map(Some),
+            core::task::Poll::Pending => Ok(None),
+        }
+    })?;
+    if let Some(value) = first {
+        return Ok(value);
+    }
+    let value = operation.await?;
+    wrap(&mut || Ok(None))?;
+    Ok(value)
+}
+
+/// Complete an operation whose every register access is a synchronous PCI
+/// MMIO access, from a synchronous PCI backend method. Such an operation is
+/// ready in its first poll; one that is not (it would need a real transfer)
+/// is refused rather than spun on.
+pub(super) fn ready_now<T, E: From<Error>>(
+    operation: impl core::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let operation = core::pin::pin!(operation);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match core::future::Future::poll(operation, &mut cx) {
+        core::task::Poll::Ready(result) => result,
+        core::task::Poll::Pending => Err(Error::State.into()),
+    }
+}
+
+/// Test bridge: drive a register-model future (whose `Io` completes in its
+/// first poll) from a synchronous kernel test body.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) fn now<F: core::future::Future>(future: F) -> F::Output {
+    narf_scheduler::block_on(future)
+}
+
+/// One 32-bit register sample for a programmed-state readback. Readbacks
+/// run over the native asynchronous `Io` (PCI or USB) or over a synchronous
+/// sampler of the retained PCI backend, without a borrowing async closure.
+pub(super) trait Read32: Send {
+    fn read32(&mut self, reg: u16)
+        -> impl core::future::Future<Output = Result<u32, Error>> + Send;
+}
+impl<R: Read32> Read32 for &mut R {
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        (**self).read32(reg)
+    }
+}
+/// Readback through the owner's own 32-bit register read.
+pub(super) struct IoRead32<'a, I>(pub &'a mut I);
+impl<I: Io> Read32 for IoRead32<'_, I> {
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        self.0.read32(reg)
+    }
+}
+/// Readback through `radio::read`, which also maps an all-ones sample to
+/// `Gone`.
+pub(super) struct RadioRead32<'a, I>(pub &'a mut I);
+impl<I: Io> Read32 for RadioRead32<'_, I> {
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        super::radio::read(self.0, reg)
+    }
+}
+/// Readback through an immediately-completing sampler (PCI MMIO, models).
+#[derive(Clone, Copy)]
+pub(super) struct Sampled<F>(pub F);
+impl<F: FnMut(u16) -> Result<u32, Error> + Send> Read32 for Sampled<F> {
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        core::future::ready((self.0)(reg))
+    }
+}
+
 /// # Safety
 /// Claim proves this backend owns every published host DMA mapping and the
 /// exact powered PCI device exclusively. Reserved-page submissions retain
@@ -239,12 +343,26 @@ fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
 #[async_trait::async_trait]
 pub(super) unsafe trait Io: Send {
     fn claim_pristine(&mut self) -> Result<(), Error>;
-    fn read8(&mut self, reg: u16) -> Result<u8, Error>;
-    fn read16(&mut self, reg: u16) -> Result<u16, Error>;
-    fn read32(&mut self, reg: u16) -> Result<u32, Error>;
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error>;
-    fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error>;
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error>;
+    fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send;
+    fn read16(&mut self, reg: u16)
+        -> impl core::future::Future<Output = Result<u16, Error>> + Send;
+    fn read32(&mut self, reg: u16)
+        -> impl core::future::Future<Output = Result<u32, Error>> + Send;
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send;
+    fn write16(
+        &mut self,
+        reg: u16,
+        value: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send;
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send;
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error>;
     /// Native station continuation only; a separate exact original PS source
     /// must enclose CPU mapping writes and each actual DMA publication.
@@ -791,19 +909,21 @@ impl<I: Io> Owner<I> {
     ) -> Option<alloc::vec::Vec<u8>> {
         self.station.as_deref()?.information_elements(peer)
     }
-    pub(super) fn station_poll(
+    pub(super) async fn station_poll(
         &mut self,
     ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
         self.station
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .poll(&mut self.io)
+            .await
     }
-    pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
+    pub(super) async fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
         self.station
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .send(&mut self.io, frame)
+            .await
     }
     pub(super) fn station_batch_capacity(&self) -> usize {
         self.station
@@ -815,7 +935,7 @@ impl<I: Io> Owner<I> {
             .as_deref()
             .is_some_and(super::station::State::batch_active)
     }
-    pub(super) fn station_send_batch(
+    pub(super) async fn station_send_batch(
         &mut self,
         frames: &[&[u8]],
     ) -> Result<usize, super::station::Error> {
@@ -823,6 +943,7 @@ impl<I: Io> Owner<I> {
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .send_batch(&mut self.io, frames)
+            .await
     }
     pub(super) fn station_stop(&mut self) -> Result<(), super::station::Error> {
         self.station
@@ -949,7 +1070,7 @@ impl<I: Io> Owner<I> {
         // or queue setup over an ambiguous current hardware state.
         self.phase = Phase::Failed;
         self.io.begin_mac()?;
-        let hardware = super::hardware::Features::read(&mut self.io)?;
+        let hardware = super::hardware::Features::read(&mut self.io).await?;
         let info = super::mac::prepare_for(&mut self.io, self.did).await?;
         self.io.finish_mac()?;
         self.mac = Some(info);
@@ -1221,7 +1342,7 @@ impl<I: Io> Owner<I> {
             .as_deref()
             .and_then(super::station::State::rts_threshold)
     }
-    pub(super) fn station_set_rts_threshold(
+    pub(super) async fn station_set_rts_threshold(
         &mut self,
         value: u32,
     ) -> Result<(), super::station::Error> {
@@ -1229,6 +1350,7 @@ impl<I: Io> Owner<I> {
             .as_deref_mut()
             .ok_or(super::station::Error::State)?
             .set_rts_threshold(&mut self.io, value)
+            .await
     }
     pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
         matches!(
@@ -1499,7 +1621,7 @@ impl<I: Io> Owner<I> {
         // The firmware antenna report can narrow a physical two-path chip in
         // Linux. This continuation admits only genuine one-path C21 silicon,
         // with the same current cut used by the original conditional parser.
-        let cfg = self.io.read32(0xf0)?;
+        let cfg = self.io.read32(0xf0).await?;
         if cfg == u32::MAX {
             return Err(Error::Gone);
         }
@@ -1610,13 +1732,13 @@ impl<I: Io> Owner<I> {
         self.phase = Phase::Station;
         Ok(parsed.info)
     }
-    fn update8(&mut self, reg: u16, clear: u8, set: u8) -> Result<(), Error> {
-        let value = self.io.read8(reg)?;
-        self.io.write8(reg, value & !clear | set)
+    async fn update8(&mut self, reg: u16, clear: u8, set: u8) -> Result<(), Error> {
+        let value = self.io.read8(reg).await?;
+        self.io.write8(reg, value & !clear | set).await
     }
     async fn poll(&mut self, reg: u16, mask: u32, target: u32) -> Result<(), Error> {
         for _ in 0..1000 {
-            let value = self.io.read32(reg)?;
+            let value = self.io.read32(reg).await?;
             if value == u32::MAX {
                 return Err(Error::Gone);
             }
@@ -1627,27 +1749,27 @@ impl<I: Io> Owner<I> {
         }
         Err(Error::Timeout)
     }
-    fn cpu(&mut self, enable: bool) -> Result<(), Error> {
+    async fn cpu(&mut self, enable: bool) -> Result<(), Error> {
         if enable {
-            self.update8(0x1d, 0, 1)?;
-            self.update8(3, 0, 4)
+            self.update8(0x1d, 0, 1).await?;
+            self.update8(3, 0, 4).await
         } else {
-            self.update8(3, 4, 0)?;
-            self.update8(0x1d, 1, 0)
+            self.update8(3, 4, 0).await?;
+            self.update8(0x1d, 1, 0).await
         }
     }
-    fn backup(&mut self) -> Result<Backup, Error> {
-        let map = self.io.read8(0x10d)?;
-        self.io.write8(0x10d, 0xc0)?;
-        let cr = self.io.read8(0x100)?;
-        self.io.write8(0x100, 5)?;
-        self.io.write32(0x1330, 1 << 31)?;
-        let pages = self.io.read16(0x230)?;
-        let rqpn = self.io.read32(0x22c)? | 1 << 31;
-        self.io.write16(0x230, 0x200)?;
-        self.io.write32(0x22c, rqpn)?;
-        let beacon = self.io.read8(0x550)?;
-        self.io.write8(0x550, beacon & !8 | 16)?;
+    async fn backup(&mut self) -> Result<Backup, Error> {
+        let map = self.io.read8(0x10d).await?;
+        self.io.write8(0x10d, 0xc0).await?;
+        let cr = self.io.read8(0x100).await?;
+        self.io.write8(0x100, 5).await?;
+        self.io.write32(0x1330, 1 << 31).await?;
+        let pages = self.io.read16(0x230).await?;
+        let rqpn = self.io.read32(0x22c).await? | 1 << 31;
+        self.io.write16(0x230, 0x200).await?;
+        self.io.write32(0x22c, rqpn).await?;
+        let beacon = self.io.read8(0x550).await?;
+        self.io.write8(0x550, beacon & !8 | 16).await?;
         Ok(Backup {
             map,
             cr,
@@ -1656,20 +1778,20 @@ impl<I: Io> Owner<I> {
             beacon,
         })
     }
-    fn restore(&mut self, b: &Backup) -> Result<(), Error> {
-        self.io.write8(0x10d, b.map)?;
-        self.io.write8(0x100, b.cr)?;
-        self.io.write32(0x1330, 1 << 31)?;
-        self.io.write16(0x230, b.pages)?;
-        self.io.write32(0x22c, b.rqpn)?;
-        self.io.write8(0x550, b.beacon)
+    async fn restore(&mut self, b: &Backup) -> Result<(), Error> {
+        self.io.write8(0x10d, b.map).await?;
+        self.io.write8(0x100, b.cr).await?;
+        self.io.write32(0x1330, 1 << 31).await?;
+        self.io.write16(0x230, b.pages).await?;
+        self.io.write32(0x22c, b.rqpn).await?;
+        self.io.write8(0x550, b.beacon).await
     }
     async fn section(&mut self, section: &Section<'_>) -> Result<(), Error> {
-        let control = self.io.read32(0x1208)?;
+        let control = self.io.read32(0x1208).await?;
         if control == u32::MAX {
             return Err(Error::Gone);
         }
-        self.io.write32(0x1208, control | 1 << 25)?;
+        self.io.write32(0x1208, control | 1 << 25).await?;
         for (part, bytes) in section.bytes.chunks(4096).enumerate() {
             // Native transport mirrors fw.c's beacon-page validity and exact
             // TD completion; only then may IDDMA consume the device TXBUF.
@@ -1677,47 +1799,50 @@ impl<I: Io> Owner<I> {
             self.poll(0x1208, 1 << 31, 0).await?;
             let control =
                 1 << 31 | 1 << 29 | if part != 0 { 1 << 24 } else { 0 } | bytes.len() as u32;
-            self.io.write32(0x1200, 0x18780000 + 48)?;
+            self.io.write32(0x1200, 0x18780000 + 48).await?;
             self.io
-                .write32(0x1204, section.address + part as u32 * 4096)?;
-            self.io.write32(0x1208, control)?;
+                .write32(0x1204, section.address + part as u32 * 4096)
+                .await?;
+            self.io.write32(0x1208, control).await?;
             self.poll(0x1208, 1 << 31, 0).await?;
         }
-        let control = self.io.read8(0x80)?;
-        if self.io.read32(0x1208)? & 1 << 27 != 0 {
+        let control = self.io.read8(0x80).await?;
+        if self.io.read32(0x1208).await? & 1 << 27 != 0 {
             return Err(Error::Checksum);
         }
-        self.io.write8(
-            0x80,
-            control
-                | if section.address < 0x200000 {
-                    0x18
-                } else {
-                    0x60
-                },
-        )
+        self.io
+            .write8(
+                0x80,
+                control
+                    | if section.address < 0x200000 {
+                        0x18
+                    } else {
+                        0x60
+                    },
+            )
+            .await
     }
     async fn run(&mut self, image: &Image<'_>) -> Result<(), Error> {
         let lte = self.io.lte_backup().await?;
-        self.cpu(false)?;
-        let backup = self.backup()?;
-        self.update8(0x1082, 1, 0)?;
-        self.update8(9, 0x40, 0)?;
-        self.update8(0x1082, 0, 1)?;
-        self.update8(9, 0, 0x40)?;
-        let control = self.io.read16(0x80)? & 0x3800 | 1;
-        self.io.write16(0x80, control)?;
+        self.cpu(false).await?;
+        let backup = self.backup().await?;
+        self.update8(0x1082, 1, 0).await?;
+        self.update8(9, 0x40, 0).await?;
+        self.update8(0x1082, 0, 1).await?;
+        self.update8(9, 0, 0x40).await?;
+        let control = self.io.read16(0x80).await? & 0x3800 | 1;
+        self.io.write16(0x80, control).await?;
         for section in image.sections.iter().flatten() {
             self.section(section).await?;
         }
-        self.restore(&backup)?;
-        self.io.write32(0x210, 4)?;
-        let control = self.io.read16(0x80)?;
+        self.restore(&backup).await?;
+        self.io.write32(0x210, 4).await?;
+        let control = self.io.read16(0x80).await?;
         if control & 0x50 != 0x50 {
             return Err(Error::Checksum);
         }
-        self.io.write16(0x80, (control | 1 << 14) & !1)?;
-        self.cpu(true)?;
+        self.io.write16(0x80, (control | 1 << 14) & !1).await?;
+        self.cpu(true).await?;
         self.io.lte_restore(lte).await?;
         self.poll(0x80, 0xffff & !0x3000, 0xc078)
             .await

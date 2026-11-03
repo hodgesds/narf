@@ -25,29 +25,59 @@ unsafe impl Io for Model {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    fn read8(&mut self, _: u16) -> Result<u8, Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(0)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, _: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
     }
-    fn read16(&mut self, _: u16) -> Result<u16, Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(0)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, _: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
     }
-    fn read32(&mut self, _: u16) -> Result<u32, Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(0)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, _: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
     }
-    fn write8(&mut self, _: u16, _: u8) -> Result<(), Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        _: u16,
+        _: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
-    fn write16(&mut self, _: u16, _: u16) -> Result<(), Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        _: u16,
+        _: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
-    fn write32(&mut self, _: u16, _: u32) -> Result<(), Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        _: u16,
+        _: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);

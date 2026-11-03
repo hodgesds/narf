@@ -661,31 +661,31 @@ pub(super) async fn program(io: &mut impl Io, gate: &Gate, rfk: bool) -> Result<
         0xc822 => {
             let gains = gate.cck_gains().ok_or(Error::State)?;
             super::radio::channel_to(io, channel).await?;
-            super::radio::gains(io, gains)?;
+            super::radio::gains(io, gains).await?;
             if rfk {
                 iqk8822c(io, gains).await?;
             }
-            verify8822c(io, channel, gains)
+            verify8822c(io, channel, gains).await
         }
         0xc821 => {
             let indices = gate.c21_indices().ok_or(Error::State)?;
             // `rtw_set_channel_mac` sets CCK_CHECK bit7 only on 5GHz: coming
             // back from a 5GHz primary needs the full cross-band program and
             // the 2.4GHz RRSR; within 2.4GHz only `_rf` changes.
-            let cross = io.read8(0x454)? & 0x80 != 0;
+            let cross = io.read8(0x454).await? & 0x80 != 0;
             if cross {
                 let facts = gate.band_facts().ok_or(Error::State)?;
                 super::radio8821c::set_channel20(io, channel, &facts).await?;
-                super::radio8821c::verify_channel20(io, channel, &facts)?;
-                io.write32(0x440, 0x1f)?;
+                super::radio8821c::verify_channel20(io, channel, &facts).await?;
+                io.write32(0x440, 0x1f).await?;
             } else {
                 super::radio8821c::retune_channel(io, channel).await?;
             }
-            super::radio8821c::write_txagc(io, indices)?;
+            super::radio8821c::write_txagc(io, indices).await?;
             if rfk {
                 iqk8821c(io).await?;
             }
-            super::radio8821c::verify_retune(io, channel, indices)
+            super::radio8821c::verify_retune(io, channel, indices).await
         }
         _ => Err(Error::Unsupported),
     }
@@ -702,13 +702,13 @@ async fn program5(io: &mut impl Io, gate: &Gate, channel: u8, rfk: bool) -> Resu
         0xc822 => {
             let (ofdm, diffs) = gate.ofdm5().ok_or(Error::State)?;
             super::radio::channel5_to(io, channel).await?;
-            super::radio::ofdm5(io, ofdm, diffs)?;
+            super::radio::ofdm5(io, ofdm, diffs).await?;
             if rfk {
                 iqk8822c_run(io).await?;
-                super::radio::ofdm5(io, ofdm, diffs)?;
+                super::radio::ofdm5(io, ofdm, diffs).await?;
             }
-            super::radio::verify_channel5(io, channel)?;
-            super::radio::verify_ofdm5(io, ofdm, diffs)
+            super::radio::verify_channel5(io, channel).await?;
+            super::radio::verify_ofdm5(io, ofdm, diffs).await
         }
         0xc821 => {
             let facts = gate.band_facts().ok_or(Error::State)?;
@@ -717,24 +717,24 @@ async fn program5(io: &mut impl Io, gate: &Gate, channel: u8, rfk: bool) -> Resu
                 return Err(Error::State);
             }
             super::radio8821c::set_channel20(io, channel, &facts).await?;
-            super::radio8821c::write_txagc(io, indices)?;
-            io.write32(0x440, super::radio::RRSR_OFDM6_5G)?;
+            super::radio8821c::write_txagc(io, indices).await?;
+            io.write32(0x440, super::radio::RRSR_OFDM6_5G).await?;
             if rfk {
                 iqk8821c(io).await?;
             }
-            super::radio8821c::verify_channel20(io, channel, &facts)?;
-            super::radio8821c::verify_txagc(io, indices, super::radio::RRSR_OFDM6_5G)
+            super::radio8821c::verify_channel20(io, channel, &facts).await?;
+            super::radio8821c::verify_txagc(io, indices, super::radio::RRSR_OFDM6_5G).await
         }
         _ => Err(Error::Unsupported),
     }
 }
 
-fn dpd_off(io: &mut impl Io) -> Result<(), Error> {
+async fn dpd_off(io: &mut impl Io) -> Result<(), Error> {
     for path in 0..2 {
-        super::radio::mask(io, 0x1b00, 6, path)?;
-        super::radio::mask(io, 0x1b08, 1 << 31, 0)?;
+        super::radio::mask(io, 0x1b00, 6, path).await?;
+        super::radio::mask(io, 0x1b08, 1 << 31, 0).await?;
     }
-    super::radio::mask(io, 0xa70, 0x3ff, 0x3ff)
+    super::radio::mask(io, 0xa70, 0x3ff, 0x3ff).await
 }
 
 /// `rtw8822c_do_iqk` (clear=1) on the retained channel, matching Linux:
@@ -748,19 +748,19 @@ fn dpd_off(io: &mut impl Io) -> Result<(), Error> {
 /// RF18/SCOTRK/TXDFIR/gain/RRSR readbacks that follow.
 pub(super) async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
     iqk8822c_run(io).await?;
-    super::radio::gains(io, gains)
+    super::radio::gains(io, gains).await
 }
 
 /// [`iqk8822c`] without the TX power restore; the caller reprograms its
 /// band's references.
 pub(super) async fn iqk8822c_run(io: &mut impl Io) -> Result<(), Error> {
-    dpd_off(io)?;
-    super::radio::rfk_power(io, true)?;
+    dpd_off(io).await?;
+    super::radio::rfk_power(io, true).await?;
     io.station_retune_iqk()?;
     wait_h2c(io).await?;
     let mut complete = false;
     for attempt in 0..=15 {
-        let value = io.read8(0x2d9c)?;
+        let value = io.read8(0x2d9c).await?;
         if value == 255 {
             return Err(Error::Gone);
         }
@@ -775,23 +775,24 @@ pub(super) async fn iqk8822c_run(io: &mut impl Io) -> Result<(), Error> {
     if !complete {
         return Err(Error::Timeout);
     }
-    io.write8(0x1b10, 0)?;
-    super::radio::rfk_power(io, false)?;
-    dpd_off(io)
+    io.write8(0x1b10, 0).await?;
+    super::radio::rfk_power(io, false).await?;
+    dpd_off(io).await
 }
 
-fn verify8822c(io: &mut impl Io, channel: u8, gains: [u8; 2]) -> Result<(), Error> {
+async fn verify8822c(io: &mut impl Io, channel: u8, gains: [u8; 2]) -> Result<(), Error> {
     for (path, gain) in gains.into_iter().enumerate() {
-        if super::radio::rf_read(io, path as u8, 0x18)? & 0x733ff != 0x3000 | u32::from(channel)
-            || (super::radio::read(io, if path == 0 { 0x18a0 } else { 0x41a0 })? >> 16) & 127
+        if super::radio::rf_read(io, path as u8, 0x18).await? & 0x733ff
+            != 0x3000 | u32::from(channel)
+            || (super::radio::read(io, if path == 0 { 0x18a0 } else { 0x41a0 }).await? >> 16) & 127
                 != u32::from(gain)
         {
             return Err(Error::Prerequisite);
         }
     }
-    if super::radio::read(io, 0xc30)? & 0xfff != scotrk(channel)
-        || (super::radio::read(io, 0x808)? >> 4) & 7 != txdfir(channel)
-        || super::radio::read(io, 0x440)? != 0x1f
+    if super::radio::read(io, 0xc30).await? & 0xfff != scotrk(channel)
+        || (super::radio::read(io, 0x808).await? >> 4) & 7 != txdfir(channel)
+        || super::radio::read(io, 0x440).await? != 0x1f
     {
         return Err(Error::Prerequisite);
     }
@@ -801,14 +802,14 @@ fn verify8822c(io: &mut impl Io, channel: u8, gains: [u8; 2]) -> Result<(), Erro
 /// `rtw8821c_do_iqk` before association (clear=0, segment=0). RF_DTXLOK is
 /// host-cleared after each run, so a stale done marker is refused.
 pub(super) async fn iqk8821c(io: &mut impl Io) -> Result<(), Error> {
-    if super::radio8821c::rf_read(io, 8)? == 0xabcde {
+    if super::radio8821c::rf_read(io, 8).await? == 0xabcde {
         return Err(Error::Prerequisite);
     }
     io.station_retune_iqk()?;
     wait_h2c(io).await?;
     let mut complete = false;
     for attempt in 0..300 {
-        if super::radio8821c::rf_read(io, 8)? == 0xabcde {
+        if super::radio8821c::rf_read(io, 8).await? == 0xabcde {
             complete = true;
             break;
         }
@@ -820,7 +821,7 @@ pub(super) async fn iqk8821c(io: &mut impl Io) -> Result<(), Error> {
         return Err(Error::Timeout);
     }
     super::radio8821c::rf(io, 8, 0xfffff, 0).await?;
-    if super::radio::read(io, 0x1bf0)? & 0x100ff != 0 {
+    if super::radio::read(io, 0x1bf0).await? & 0x100ff != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())

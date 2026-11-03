@@ -7,26 +7,26 @@ use super::{
     station_control::Admission,
 };
 use narf_wireless::wmm::Parameters;
-pub(super) fn readback(
-    mut read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn readback(
+    mut read: impl super::firmware_transport::Read32,
     gains: [u8; 2],
 ) -> Result<(), Error> {
     for (reg, gain) in [0x18a0, 0x41a0].into_iter().zip(gains) {
-        if (read(reg)? >> 16) & 127 != u32::from(gain) {
+        if (read.read32(reg).await? >> 16) & 127 != u32::from(gain) {
             return Err(Error::Prerequisite);
         }
     }
     for reg in [0x18e8, 0x41e8] {
-        if read(reg)? & 0x1fc00 != 0 {
+        if read.read32(reg).await? & 0x1fc00 != 0 {
             return Err(Error::Prerequisite);
         }
     }
     for reg in [0x3a00, 0x3a04, 0x3a08] {
-        if read(reg)? != 0 {
+        if read.read32(reg).await? != 0 {
             return Err(Error::Prerequisite);
         }
     }
-    if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+    if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())
@@ -35,20 +35,25 @@ pub(super) fn readback(
 /// CCK references zero, the N2xO per-path OFDM references and the
 /// 0x3a04/0x3a08 differences. REG_RRSR is the profile's, checked by
 /// [`commit`] itself.
-pub(super) fn readback5(
-    mut read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn readback5(
+    mut read: impl super::firmware_transport::Read32,
     ofdm: [u8; 2],
     diffs: [u32; 2],
 ) -> Result<(), Error> {
     for ((cck, reg), reference) in [(0x18a0, 0x18e8), (0x41a0, 0x41e8)].into_iter().zip(ofdm) {
-        if read(cck)? & 0x7f_0000 != 0 || read(reg)? & 0x1fc00 != u32::from(reference) << 10 {
+        if read.read32(cck).await? & 0x7f_0000 != 0
+            || read.read32(reg).await? & 0x1fc00 != u32::from(reference) << 10
+        {
             return Err(Error::Prerequisite);
         }
     }
-    if read(0x3a00)? != 0 || read(0x3a04)? != diffs[0] || read(0x3a08)? != diffs[1] {
+    if read.read32(0x3a00).await? != 0
+        || read.read32(0x3a04).await? != diffs[0]
+        || read.read32(0x3a08).await? != diffs[1]
+    {
         return Err(Error::Prerequisite);
     }
-    if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+    if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())
@@ -101,28 +106,30 @@ pub(super) async fn commit(
         let words = words(p, short, profile.band5)?;
         // Canonical ACI BE/BK/VI/VO maps to source BE/BK/VI/VO registers.
         for (reg, value) in [0x508, 0x50c, 0x504, 0x500].into_iter().zip(words) {
-            admission.run(|| {
+            crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
                 io.station_allowed()?;
-                super::radio::mask(io, reg, 0x07ff_ffff, value)?;
-                if io.read32(reg)? & 0x07ff_ffff != value {
+                super::radio::mask(io, reg, 0x07ff_ffff, value).await?;
+                if io.read32(reg).await? & 0x07ff_ffff != value {
                     return Err(Error::Prerequisite);
                 }
                 Ok(())
-            })?;
+            })
+            .await?;
             narf_scheduler::yield_now().await;
         }
     }
     ra_info(io, profile, admission).await?;
-    admission.run(|| {
+    crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
         io.station_allowed()?;
         let mask = profile.response_mask();
-        io.write32(0x440, mask)?;
-        if io.read32(0x440)? != mask {
+        io.write32(0x440, mask).await?;
+        if io.read32(0x440).await? != mask {
             return Err(Error::Prerequisite);
         }
         io.station_profile_readback()?;
         io.packet_profile(profile)
     })
+    .await
 }
 /// Source `fw.c::rtw_fw_send_ra_info`: RATE_ID 20:16, INIT_RA_LVL1, SGI_EN
 /// bit23, BW_MODE 25:24 (N2xB 40MHz, N2xV 80MHz), LDPC bit26, VHT_EN 29:28

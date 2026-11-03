@@ -913,7 +913,9 @@ unsafe impl Registers for Native {
             .as_ref()
             .and_then(super::power_policy::Gate::power_tracking)
         {
-            w.readback(|r| self.read32(r))?;
+            super::firmware_transport::ready_now(
+                w.readback(super::firmware_transport::Sampled(|r| self.read32(r))),
+            )?;
             w.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
         }
         if let Some(g) = self
@@ -922,28 +924,42 @@ unsafe impl Registers for Native {
             .and_then(super::power_policy::Gate::ht_grant)
         {
             let wide = self.committed_wide()?;
-            return g.readback_at(|r| self.read32(r), wide.as_ref());
+            return super::firmware_transport::ready_now(g.readback_at(
+                super::firmware_transport::Sampled(|r| self.read32(r)),
+                wide.as_ref(),
+            ));
         }
         if let Some((indices, channel)) = self
             .packet_gate
             .as_ref()
             .and_then(|g| Some((g.c21_indices()?, g.channel())))
         {
-            return super::radio8821c::operating_readback(|r| self.read32(r), indices, channel);
+            return super::firmware_transport::ready_now(super::radio8821c::operating_readback(
+                super::firmware_transport::Sampled(|r| self.read32(r)),
+                indices,
+                channel,
+            ));
         }
         if let Some((ofdm, diffs)) = self
             .packet_gate
             .as_ref()
             .and_then(super::power_policy::Gate::ofdm5)
         {
-            return super::wmm::readback5(|r| self.read32(r), ofdm, diffs);
+            return super::firmware_transport::ready_now(super::wmm::readback5(
+                super::firmware_transport::Sampled(|r| self.read32(r)),
+                ofdm,
+                diffs,
+            ));
         }
         let gains = self
             .packet_gate
             .as_ref()
             .and_then(super::power_policy::Gate::cck_gains)
             .ok_or(Error::Unsupported)?;
-        super::wmm::readback(|r| self.read32(r), gains)
+        super::firmware_transport::ready_now(super::wmm::readback(
+            super::firmware_transport::Sampled(|r| self.read32(r)),
+            gains,
+        ))
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         if !matches!(self.state, State::Calibrated | State::Packets | State::Swap)
@@ -1046,7 +1062,9 @@ unsafe impl Registers for Native {
         g: alloc::sync::Arc<super::tracking8821c::Grant>,
     ) -> Result<(), Error> {
         self.station_allowed()?;
-        g.readback(|r| self.read32(r))?;
+        super::firmware_transport::ready_now(
+            g.readback(super::firmware_transport::Sampled(|r| self.read32(r))),
+        )?;
         self.packet_gate = Some(
             self.packet_gate
                 .as_ref()
@@ -1081,7 +1099,9 @@ unsafe impl Registers for Native {
                 .as_ref()
                 .ok_or(Error::State)?
                 .invoke_base(|| Ok(()))?;
-            g.readback(|r| self.read32(r))?;
+            super::firmware_transport::ready_now(
+                g.readback(super::firmware_transport::Sampled(|r| self.read32(r))),
+            )?;
             if !self.station_power_tracking_quiet()? {
                 return Ok(false);
             }
@@ -1161,10 +1181,14 @@ unsafe impl Registers for Native {
         let gate = self.packet_gate.clone().ok_or(Error::State)?;
         let g = gate.power_tracking().ok_or(Error::State)?;
         let actual = p.unwrap_or_else(|| g.initial_program());
-        super::tracking8821c::Grant::read_program(actual, &mut |r| self.read32(r))?;
-        gate.ht_grant()
-            .ok_or(Error::State)?
-            .readback(|r| self.read32(r))?;
+        super::firmware_transport::ready_now(super::tracking8821c::Grant::read_program(
+            actual,
+            &mut super::firmware_transport::Sampled(|r| self.read32(r)),
+        ))?;
+        let ht = gate.ht_grant().ok_or(Error::State)?;
+        super::firmware_transport::ready_now(
+            ht.readback(super::firmware_transport::Sampled(|r| self.read32(r))),
+        )?;
         if p.is_some() {
             g.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
         }
@@ -1912,7 +1936,9 @@ impl Native {
             .as_ref()
             .and_then(super::power_policy::Gate::power_tracking)
         {
-            g.readback(|r| self.read32(r))?;
+            super::firmware_transport::ready_now(
+                g.readback(super::firmware_transport::Sampled(|r| self.read32(r))),
+            )?;
             g.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
         }
         self.packet_gate

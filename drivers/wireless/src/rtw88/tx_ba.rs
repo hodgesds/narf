@@ -512,11 +512,11 @@ impl Originators {
     }
 }
 /// Source16-bit prioq counters, not a PCI-consumption or radio-ACK inference.
-pub(super) fn fifo_empty(io: &mut impl Io, c21: bool) -> Result<bool, Error> {
-    fifo_empty_tids(io, c21, 1)
+pub(super) async fn fifo_empty(io: &mut impl Io, c21: bool) -> Result<bool, Error> {
+    fifo_empty_tids(io, c21, 1).await
 }
-pub(super) fn fifo_empty_tids(io: &mut impl Io, c21: bool, tids: u8) -> Result<bool, Error> {
-    let map = io.read16(0x10c)?;
+pub(super) async fn fifo_empty_tids(io: &mut impl Io, c21: bool, tids: u8) -> Result<bool, Error> {
+    let map = io.read16(0x10c).await?;
     if map != 0xc5a0 {
         return Err(Error::Prerequisite);
     }
@@ -528,7 +528,7 @@ pub(super) fn fifo_empty_tids(io: &mut impl Io, c21: bool, tids: u8) -> Result<b
     };
     for &shift in shifts {
         let reg = [0x23c, 0x234, 0x238, 0x230][usize::from((map >> shift) & 3)];
-        let reserved = io.read16(reg)?;
+        let reserved = io.read16(reg).await?;
         let expected = if c21 {
             if reg == 0x23c {
                 14
@@ -538,25 +538,28 @@ pub(super) fn fifo_empty_tids(io: &mut impl Io, c21: bool, tids: u8) -> Result<b
         } else {
             64
         };
-        let available = io.read16(reg + 2)?;
-        if reserved != expected || available > reserved || io.read16(reg)? != reserved {
+        let available = io.read16(reg + 2).await?;
+        if reserved != expected || available > reserved || io.read16(reg).await? != reserved {
             return Err(Error::Prerequisite);
         }
         empty &= available == reserved;
     }
     Ok(empty)
 }
-pub(super) fn program(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn program(io: &mut impl Io) -> Result<(), Error> {
     io.station_allowed()?;
     // Exact controls used by source rtw_coex_limited_tx. Fixed-rate fallback
     // remains disabled; this static program is separately measured by T.
-    io.write16(0x42a, 0x0808)?;
-    io.write8(0x455, 0x20)?;
-    readback(io)
+    io.write16(0x42a, 0x0808).await?;
+    io.write8(0x455, 0x20).await?;
+    readback(io).await
 }
-pub(super) fn readback(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn readback(io: &mut impl Io) -> Result<(), Error> {
     io.station_profile_readback()?;
-    if io.read16(0x42a)? != 0x0808 || io.read8(0x455)? != 0x20 || io.read16(0x4ce)? != 0x0801 {
+    if io.read16(0x42a).await? != 0x0808
+        || io.read8(0x455).await? != 0x20
+        || io.read16(0x4ce).await? != 0x0801
+    {
         return Err(Error::Prerequisite);
     }
     Ok(())

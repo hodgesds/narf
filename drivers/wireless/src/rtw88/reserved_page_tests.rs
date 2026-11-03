@@ -391,7 +391,9 @@ unsafe impl Registers for Port {
         g: Arc<crate::rtw88::tracking8821c::Grant>,
     ) -> Result<(), Error> {
         self.station_allowed()?;
-        g.readback(|r| self.read32(r))?;
+        crate::rtw88::firmware_transport::ready_now(g.readback(
+            crate::rtw88::firmware_transport::Sampled(|r| self.read32(r)),
+        ))?;
         let gate = self
             .0
             .lock()
@@ -431,7 +433,9 @@ unsafe impl Registers for Port {
         }
         let result = (|| {
             self.access()?;
-            g.readback(|r| self.read32(r))?;
+            crate::rtw88::firmware_transport::ready_now(g.readback(
+                crate::rtw88::firmware_transport::Sampled(|r| self.read32(r)),
+            ))?;
             if !self.station_power_tracking_quiet()? {
                 return Ok(false);
             }
@@ -521,12 +525,14 @@ unsafe impl Registers for Port {
         }
         let gate = self.0.lock().station_gate.clone().ok_or(Error::State)?;
         let g = gate.power_tracking().ok_or(Error::State)?;
-        Grant::read_program(p.unwrap_or_else(|| g.initial_program()), &mut |r| {
-            self.read32(r)
-        })?;
-        gate.ht_grant()
-            .ok_or(Error::State)?
-            .readback(|r| self.read32(r))?;
+        crate::rtw88::firmware_transport::ready_now(Grant::read_program(
+            p.unwrap_or_else(|| g.initial_program()),
+            &mut crate::rtw88::firmware_transport::Sampled(|r| self.read32(r)),
+        ))?;
+        let ht = gate.ht_grant().ok_or(Error::State)?;
+        crate::rtw88::firmware_transport::ready_now(ht.readback(
+            crate::rtw88::firmware_transport::Sampled(|r| self.read32(r)),
+        ))?;
         if p.is_some() {
             g.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
         }
@@ -1195,7 +1201,9 @@ unsafe impl Registers for Port {
             .as_ref()
             .and_then(crate::rtw88::power_policy::Gate::ht_grant);
         if let Some(g) = ht {
-            return g.readback(|r| self.read32(r));
+            return crate::rtw88::firmware_transport::ready_now(g.readback(
+                crate::rtw88::firmware_transport::Sampled(|r| self.read32(r)),
+            ));
         }
         let (indices, channel) = self
             .0
@@ -1204,7 +1212,11 @@ unsafe impl Registers for Port {
             .as_ref()
             .and_then(|g| Some((g.c21_indices()?, g.channel())))
             .ok_or(Error::Unsupported)?;
-        crate::rtw88::radio8821c::operating_readback(|r| self.read32(r), indices, channel)
+        crate::rtw88::firmware_transport::ready_now(crate::rtw88::radio8821c::operating_readback(
+            crate::rtw88::firmware_transport::Sampled(|r| self.read32(r)),
+            indices,
+            channel,
+        ))
     }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.station_allowed()?;

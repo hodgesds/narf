@@ -43,31 +43,57 @@ unsafe impl Io for Regs {
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Ok(())
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        Ok(self.mem[usize::from(r)])
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { Ok(self.mem[usize::from(r)]) }
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        let r = usize::from(r);
-        Ok(u16::from_le_bytes([self.mem[r], self.mem[r + 1]]))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move {
+            let r = usize::from(r);
+            Ok(u16::from_le_bytes([self.mem[r], self.mem[r + 1]]))
+        }
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        Ok(self.get(r))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { Ok(self.get(r)) }
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.mem[usize::from(r)] = v;
-        self.writes.push((r, u32::from(v)));
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.mem[usize::from(r)] = v;
+            self.writes.push((r, u32::from(v)));
+            Ok(())
+        }
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        let a = usize::from(r);
-        self.mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
-        self.writes.push((r, u32::from(v)));
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            let a = usize::from(r);
+            self.mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+            self.writes.push((r, u32::from(v)));
+            Ok(())
+        }
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.set(r, v);
-        self.writes.push((r, v));
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.set(r, v);
+            self.writes.push((r, v));
+            Ok(())
+        }
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::Unsupported)

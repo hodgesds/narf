@@ -85,18 +85,19 @@ fn select(g: &Grant, delta: i8) -> Result<Program, Error> {
     }
     Ok(p)
 }
-fn read(io: &mut impl Io, r: u16) -> Result<u32, Error> {
-    match io.read32(r)? {
+async fn read(io: &mut impl Io, r: u16) -> Result<u32, Error> {
+    match io.read32(r).await? {
         u32::MAX => Err(Error::Gone),
         v => Ok(v),
     }
 }
-fn mask(io: &mut impl Io, r: u16, bits: u32, value: u32) -> Result<(), Error> {
-    let old = read(io, r)?;
+async fn mask(io: &mut impl Io, r: u16, bits: u32, value: u32) -> Result<(), Error> {
+    let old = read(io, r).await?;
     io.write32(r, (old & !bits) | (value << bits.trailing_zeros()))
+        .await
 }
-fn rf_read(io: &mut impl Io, r: u8) -> Result<u32, Error> {
-    Ok(read(io, 0x2800 + u16::from(r) * 4)? & 0xfffff)
+async fn rf_read(io: &mut impl Io, r: u8) -> Result<u32, Error> {
+    Ok(read(io, 0x2800 + u16::from(r) * 4).await? & 0xfffff)
 }
 struct Attempt {
     admission: Admission,
@@ -159,12 +160,15 @@ impl Tracker {
             return Ok(false);
         }
         if self.triggered.is_none() {
-            a.run(|| {
-                g.authority(|| {
-                    let old = rf_read(io, 0x42)?;
+            crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+                crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                    let old = rf_read(io, 0x42).await?;
                     io.write32(0xc90, 0x42 << 20 | (old & !0x30000) | 0x30000)
+                        .await
                 })
-            })?;
+                .await
+            })
+            .await?;
             io.delay_us(13).await;
             a.check()?;
             self.triggered = Some(now);
@@ -174,7 +178,11 @@ impl Tracker {
         if now.saturating_sub(self.triggered.ok_or(Error::State)?) < 2000 {
             return Ok(false);
         }
-        let raw = a.run(|| g.authority(|| Ok(((rf_read(io, 0x42)? >> 10) & 63) as u8)))?;
+        let raw =
+            crate::rtw88::firmware_transport::enclosed(|op| a.run(|| g.authority(op)), async {
+                Ok(((rf_read(io, 0x42).await? >> 10) & 63) as u8)
+            })
+            .await?;
         if g.temperature(raw).is_err() {
             return self.restore(io, a).await;
         }
@@ -234,18 +242,21 @@ impl Tracker {
         };
         a.retire_receive()?;
         Self::park(io, &g, a).await?;
-        a.run(|| {
-            g.authority(|| {
-                mask(io, 0xc94, 0x7e, u32::from(p.agc as u8 & 63))?;
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                mask(io, 0xc94, 0x7e, u32::from(p.agc as u8 & 63)).await?;
                 mask(
                     io,
                     0xc1c,
                     0xffe00000,
                     u32::from(SCALE[usize::from(p.swing)]),
-                )?;
-                Grant::read_program(p, &mut |r| read(io, r))
+                )
+                .await?;
+                Grant::read_program(p, &mut super::super::firmware_transport::RadioRead32(io)).await
             })
-        })?;
+            .await
+        })
+        .await?;
         if iqk {
             Self::iqk(io, &g, a).await?;
             self.iqk_changed = true;
@@ -263,22 +274,29 @@ impl Tracker {
         Ok(true)
     }
     async fn park(io: &mut impl Io, g: &Grant, a: &Admission) -> Result<(), Error> {
-        a.run(|| {
-            g.authority(|| {
-                if read(io, dma_stop::RXPKT_NUM)? & dma_stop::RW_RELEASE != 0
-                    || io.read8(0x522)? != 0
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                if read(io, dma_stop::RXPKT_NUM).await? & dma_stop::RW_RELEASE != 0
+                    || io.read8(0x522).await? != 0
                 {
                     return Err(Error::Prerequisite);
                 }
-                io.write8(0x522, 255)?;
-                let rx = read(io, dma_stop::RXPKT_NUM)?;
+                io.write8(0x522, 255).await?;
+                let rx = read(io, dma_stop::RXPKT_NUM).await?;
                 io.write32(dma_stop::RXPKT_NUM, rx | dma_stop::RW_RELEASE)
+                    .await
             })
-        })?;
+            .await
+        })
+        .await?;
         for _ in 0..1000 {
-            let idle = a.run(|| {
-                g.authority(|| Ok(read(io, dma_stop::RXPKT_NUM)? & dma_stop::RXDMA_IDLE != 0))
-            })?;
+            let idle = crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+                crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                    Ok(read(io, dma_stop::RXPKT_NUM).await? & dma_stop::RXDMA_IDLE != 0)
+                })
+                .await
+            })
+            .await?;
             if idle {
                 if !a.run(|| g.authority(|| io.station_power_tracking_quiet()))? {
                     return Err(Error::Prerequisite);
@@ -291,14 +309,16 @@ impl Tracker {
     }
     async fn iqk(io: &mut impl Io, g: &Grant, a: &Admission) -> Result<(), Error> {
         // A stale completion cannot acknowledge this new command.
-        a.run(|| {
-            g.authority(|| {
-                if rf_read(io, 8)? != 0 {
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                if rf_read(io, 8).await? != 0 {
                     return Err(Error::Prerequisite);
                 }
                 io.station_power_tracking_iqk()
             })
-        })?;
+            .await
+        })
+        .await?;
         let mut consumed = false;
         for _ in 0..1000 {
             if a.run(|| g.authority(|| io.poll_h2c()))? {
@@ -312,7 +332,11 @@ impl Tracker {
         }
         let mut applied = false;
         for _ in 0..300 {
-            if a.run(|| g.authority(|| Ok(rf_read(io, 8)? == 0xabcde)))? {
+            if crate::rtw88::firmware_transport::enclosed(|op| a.run(|| g.authority(op)), async {
+                Ok(rf_read(io, 8).await? == 0xabcde)
+            })
+            .await?
+            {
                 applied = true;
                 break;
             }
@@ -321,28 +345,36 @@ impl Tracker {
         if !applied {
             return Err(Error::Timeout);
         }
-        a.run(|| {
-            g.authority(|| {
-                if read(io, 0x1bf0)? & 0x100ff == 0 {
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                if read(io, 0x1bf0).await? & 0x100ff == 0 {
                     Ok(())
                 } else {
                     Err(Error::Prerequisite)
                 }
             })
-        })?;
+            .await
+        })
+        .await?;
         // Reset the actual source completion only after its failure/reload
         // bits were checked. Any cancelled/failed IQK remains terminal.
-        a.run(|| g.authority(|| io.write32(0xc90, 8 << 20)))?;
+        crate::rtw88::firmware_transport::enclosed(
+            |op| a.run(|| g.authority(op)),
+            io.write32(0xc90, 8 << 20),
+        )
+        .await?;
         io.delay_us(13).await;
-        a.run(|| {
-            g.authority(|| {
-                if rf_read(io, 8)? == 0 {
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| g.authority(op), async {
+                if rf_read(io, 8).await? == 0 {
                     Ok(())
                 } else {
                     Err(Error::Prerequisite)
                 }
             })
+            .await
         })
+        .await
     }
     async fn restore(&mut self, io: &mut impl Io, a: &Admission) -> Result<bool, Error> {
         // Firmware owns the periodic-IQK coefficient image. No source receipt
@@ -362,18 +394,26 @@ impl Tracker {
         // Original measured static gate, never the revoked W, authorizes
         // restoration. No command has been sent in this continuation.
         let base = g.base.clone();
-        a.run(|| {
-            base.invoke_base(|| {
-                io.write8(0x522, 255)?;
-                let rx = read(io, dma_stop::RXPKT_NUM)?;
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| base.invoke_base(op), async {
+                io.write8(0x522, 255).await?;
+                let rx = read(io, dma_stop::RXPKT_NUM).await?;
                 io.write32(dma_stop::RXPKT_NUM, rx | dma_stop::RW_RELEASE)
+                    .await
             })
-        })?;
+            .await
+        })
+        .await?;
         let mut idle = false;
         for _ in 0..1000 {
-            if a.run(|| {
-                base.invoke_base(|| Ok(read(io, dma_stop::RXPKT_NUM)? & dma_stop::RXDMA_IDLE != 0))
-            })? {
+            if crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+                crate::rtw88::firmware_transport::enclosed(|op| base.invoke_base(op), async {
+                    Ok(read(io, dma_stop::RXPKT_NUM).await? & dma_stop::RXDMA_IDLE != 0)
+                })
+                .await
+            })
+            .await?
+            {
                 idle = true;
                 break;
             }
@@ -382,18 +422,21 @@ impl Tracker {
         if !idle || !a.run(|| base.invoke_base(|| io.station_power_tracking_quiet()))? {
             return Err(Error::Timeout);
         }
-        a.run(|| {
-            base.invoke_base(|| {
-                mask(io, 0xc94, 0x7e, 0)?;
+        crate::rtw88::firmware_transport::enclosed(|op| a.run(op), async {
+            crate::rtw88::firmware_transport::enclosed(|op| base.invoke_base(op), async {
+                mask(io, 0xc94, 0x7e, 0).await?;
                 mask(
                     io,
                     0xc1c,
                     0xffe00000,
                     u32::from(SCALE[usize::from(g.initial)]),
-                )?;
+                )
+                .await?;
                 io.station_power_tracking_finish(None)
             })
-        })?;
+            .await
+        })
+        .await?;
         a.retire_receive()?;
         attempt.armed = false;
         Ok(true)

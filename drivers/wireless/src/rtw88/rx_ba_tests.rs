@@ -363,11 +363,13 @@ pub(super) fn original_amsdu<F: Fixture>() -> Result<(), &'static str> {
             .try_lock()
             .ok_or("short-subframe owner lock")?;
         output.extend(
-            retained
-                .as_mut()
-                .ok_or("short-subframe native owner")?
-                .station_poll()
-                .map_err(|_| "short-subframe native receive")?,
+            crate::rtw88::firmware_transport::now(
+                retained
+                    .as_mut()
+                    .ok_or("short-subframe native owner")?
+                    .station_poll(),
+            )
+            .map_err(|_| "short-subframe native receive")?,
         );
     }
     if output != tiny {

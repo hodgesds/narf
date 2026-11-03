@@ -215,32 +215,47 @@ fn smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs() -> TestResult {
     // rtw8822c_set_channel(center 4, BW40, SC_20_UPPER) for primary 6.
     let mut io = RadioIo::reference();
     if narf_scheduler::block_on(radio::width40(&mut io, 4, 1)).is_err()
-        || radio::gains(&mut io, [36, 32]).is_err()
-        || io.write32(0x440, 0x1f).is_err()
+        || crate::rtw88::firmware_transport::now(radio::gains(&mut io, [36, 32])).is_err()
+        || crate::rtw88::firmware_transport::now(io.write32(0x440, 0x1f)).is_err()
     {
         return TestResult::Fail("C22 BW40 program rejected an admitted pair");
     }
     let ok = (|| -> Result<bool, crate::rtw88::firmware_transport::Error> {
-        Ok(radio::rf_read(&mut io, 0, 0x18)? & 0x733ff == 0x2004
-            && radio::rf_read(&mut io, 1, 0x18)? & 0x733ff == 0x2004
-            && radio::read(&mut io, 0x9b0)? & 0xffcf == 0x1105
-            && radio::read(&mut io, 0x18ac)? & 0xf1f0 == 0x4000
-            && io.read8(0x483)? == 1
-            && radio::read(&mut io, 0x668)? & 0x180 == 0x80)
+        Ok(
+            crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 0, 0x18))? & 0x733ff
+                == 0x2004
+                && crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 1, 0x18))?
+                    & 0x733ff
+                    == 0x2004
+                && crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x9b0))? & 0xffcf
+                    == 0x1105
+                && crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x18ac))? & 0xf1f0
+                    == 0x4000
+                && crate::rtw88::firmware_transport::now(io.read8(0x483))? == 1
+                && crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x668))? & 0x180
+                    == 0x80,
+        )
     })();
-    if ok != Ok(true) || radio::verify_width40(&mut io, 4, 1, [36, 32]).is_err() {
+    if ok != Ok(true)
+        || crate::rtw88::firmware_transport::now(radio::verify_width40(&mut io, 4, 1, [36, 32]))
+            .is_err()
+    {
         return TestResult::Fail("C22 BW40 BB/MAC/RF readback differs from Linux");
     }
-    if radio::verify_width40(&mut io, 4, 2, [36, 32]).is_ok()
-        || radio::verify_width40(&mut io, 5, 1, [36, 32]).is_ok()
+    if crate::rtw88::firmware_transport::now(radio::verify_width40(&mut io, 4, 2, [36, 32])).is_ok()
+        || crate::rtw88::firmware_transport::now(radio::verify_width40(&mut io, 5, 1, [36, 32]))
+            .is_ok()
     {
         return TestResult::Fail("C22 BW40 readback accepted another sideband/center");
     }
     // The 20MHz program restores every BW40 field it owns.
     if narf_scheduler::block_on(radio::channel_to(&mut io, 6)).is_err()
-        || radio::rf_read(&mut io, 0, 0x18).map(|v| v & 0x733ff) != Ok(0x3006)
-        || io.read8(0x483) != Ok(0)
-        || radio::read(&mut io, 0x668).map(|v| v & 0x180) != Ok(0)
+        || crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 0, 0x18))
+            .map(|v| v & 0x733ff)
+            != Ok(0x3006)
+        || crate::rtw88::firmware_transport::now(io.read8(0x483)) != Ok(0)
+        || crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x668)).map(|v| v & 0x180)
+            != Ok(0)
     {
         return TestResult::Fail("BW20 retune left BW40 state behind");
     }
@@ -253,7 +268,7 @@ fn smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs() -> TestResult {
     // rtw8821c_set_channel(center 8, BW40, SC_20_LOWER) for primary 6: the
     // retained state its readback requires (RF18 via the 0x2860 window).
     let mut io = RadioIo::new();
-    let setup = (|| {
+    let setup = crate::rtw88::firmware_transport::now(async {
         for (reg, value) in [
             (0x2860, 0x808),
             (0xa00, 0),
@@ -267,15 +282,17 @@ fn smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs() -> TestResult {
             (0x440, 0x1f),
             (0x1bf0, 0),
         ] {
-            io.write32(reg, value)?;
+            io.write32(reg, value).await?;
         }
-        io.write8(0x483, 2)
-    })();
-    if setup.is_err() || radio8821c::verify_width40(&mut io, 8, 2).is_err() {
+        io.write8(0x483, 2).await
+    });
+    if setup.is_err()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_width40(&mut io, 8, 2)).is_err()
+    {
         return TestResult::Fail("C21 BW40 readback refused the rtw8821c_set_channel state");
     }
-    if radio8821c::verify_width40(&mut io, 8, 1).is_ok()
-        || radio8821c::verify_width40(&mut io, 4, 2).is_ok()
+    if crate::rtw88::firmware_transport::now(radio8821c::verify_width40(&mut io, 8, 1)).is_ok()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_width40(&mut io, 4, 2)).is_ok()
     {
         return TestResult::Fail("C21 BW40 readback accepted another sideband/center");
     }
@@ -358,19 +375,27 @@ fn smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span() -> TestResult {
         return TestResult::Fail("C22 5GHz BW40 program rejected an admitted center");
     }
     let rf18 = 1 << 16 | 1 << 8 | 2 << 12 | 38;
-    if radio::rf_read(&mut io, 0, 0x18).map(|v| v & 0x733ff) != Ok(rf18)
-        || radio::rf_read(&mut io, 1, 0x18).map(|v| v & 0x733ff) != Ok(rf18)
-        || radio::read(&mut io, 0x9b0).map(|v| v & 0xffcf) != Ok(0x2205)
-        || radio::read(&mut io, 0x18ac).map(|v| v & 0x1f0) != Ok(0x10)
-        || io.read8(0x483) != Ok(2)
-        || io.read8(0x454).map(|v| v & 0x80) != Ok(0x80)
-        || radio::verify_wide5(&mut io, 38, Width::Forty(2)).is_err()
+    if crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 0, 0x18)).map(|v| v & 0x733ff)
+        != Ok(rf18)
+        || crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 1, 0x18))
+            .map(|v| v & 0x733ff)
+            != Ok(rf18)
+        || crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x9b0)).map(|v| v & 0xffcf)
+            != Ok(0x2205)
+        || crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x18ac)).map(|v| v & 0x1f0)
+            != Ok(0x10)
+        || crate::rtw88::firmware_transport::now(io.read8(0x483)) != Ok(2)
+        || crate::rtw88::firmware_transport::now(io.read8(0x454)).map(|v| v & 0x80) != Ok(0x80)
+        || crate::rtw88::firmware_transport::now(radio::verify_wide5(&mut io, 38, Width::Forty(2)))
+            .is_err()
     {
         return TestResult::Fail("C22 5GHz BW40 BB/MAC/RF differs from Linux");
     }
-    if radio::verify_wide5(&mut io, 38, Width::Forty(1)).is_ok()
-        || radio::verify_wide5(&mut io, 46, Width::Forty(2)).is_ok()
-        || radio::verify_channel5(&mut io, 36).is_ok()
+    if crate::rtw88::firmware_transport::now(radio::verify_wide5(&mut io, 38, Width::Forty(1)))
+        .is_ok()
+        || crate::rtw88::firmware_transport::now(radio::verify_wide5(&mut io, 46, Width::Forty(2)))
+            .is_ok()
+        || crate::rtw88::firmware_transport::now(radio::verify_channel5(&mut io, 36)).is_ok()
     {
         return TestResult::Fail("C22 5GHz BW40 readback accepted another state");
     }
@@ -392,7 +417,7 @@ fn smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span() -> TestResult {
         swing_5g: 4,
     };
     let mut io = RadioIo::new();
-    let setup = (|| {
+    let setup = crate::rtw88::firmware_transport::now(async {
         for (reg, value) in [
             (0x2860, radio8821c::rf18_for(46, 40)),
             (0x2800 + 0xdf * 4, 0),
@@ -410,16 +435,36 @@ fn smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span() -> TestResult {
             (0xc20, 0),
             (0x8f0, 0),
         ] {
-            io.write32(reg, value)?;
+            io.write32(reg, value).await?;
         }
-        io.write8(0x454, 0x80)?;
-        io.write8(0x483, 1)
-    })();
-    if setup.is_err() || radio8821c::verify_wide5(&mut io, 46, Width::Forty(1), &facts).is_err() {
+        io.write8(0x454, 0x80).await?;
+        io.write8(0x483, 1).await
+    });
+    if setup.is_err()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_wide5(
+            &mut io,
+            46,
+            Width::Forty(1),
+            &facts,
+        ))
+        .is_err()
+    {
         return TestResult::Fail("C21 5GHz BW40 readback refused the rtw8821c_set_channel state");
     }
-    if radio8821c::verify_wide5(&mut io, 46, Width::Forty(2), &facts).is_ok()
-        || radio8821c::verify_wide5(&mut io, 38, Width::Forty(1), &facts).is_ok()
+    if crate::rtw88::firmware_transport::now(radio8821c::verify_wide5(
+        &mut io,
+        46,
+        Width::Forty(2),
+        &facts,
+    ))
+    .is_ok()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_wide5(
+            &mut io,
+            38,
+            Width::Forty(1),
+            &facts,
+        ))
+        .is_ok()
     {
         return TestResult::Fail("C21 5GHz BW40 readback accepted another sideband/center");
     }
@@ -493,13 +538,18 @@ fn smoke_rtw88_vht80_record_span_and_bw80_program() -> TestResult {
     // rtw8822c_set_channel(42, BW80, SC_20_UPPER).
     let mut io = RadioIo::reference();
     if narf_scheduler::block_on(radio::wide5_to(&mut io, 42, Width::Eighty(1))).is_err()
-        || radio::rf_read(&mut io, 0, 0x18).map(|v| v & 0x733ff)
+        || crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 0, 0x18))
+            .map(|v| v & 0x733ff)
             != Ok(1 << 16 | 1 << 8 | 1 << 12 | 42)
-        || radio::read(&mut io, 0x9b0).map(|v| v & 0xffcf) != Ok(0x110a)
-        || io.read8(0x483) != Ok(1 | 9 << 4)
-        || radio::read(&mut io, 0x668).map(|v| v & 0x180) != Ok(0x100)
-        || radio::verify_wide5(&mut io, 42, Width::Eighty(1)).is_err()
-        || radio::verify_wide5(&mut io, 42, Width::Eighty(4)).is_ok()
+        || crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x9b0)).map(|v| v & 0xffcf)
+            != Ok(0x110a)
+        || crate::rtw88::firmware_transport::now(io.read8(0x483)) != Ok(1 | 9 << 4)
+        || crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x668)).map(|v| v & 0x180)
+            != Ok(0x100)
+        || crate::rtw88::firmware_transport::now(radio::verify_wide5(&mut io, 42, Width::Eighty(1)))
+            .is_err()
+        || crate::rtw88::firmware_transport::now(radio::verify_wide5(&mut io, 42, Width::Eighty(4)))
+            .is_ok()
     {
         return TestResult::Fail("C22 BW80 BB/MAC/RF differs from Linux");
     }
@@ -512,17 +562,30 @@ fn smoke_rtw88_vht80_record_span_and_bw80_program() -> TestResult {
     let ofdm = [40, 40, 40, 40, 38, 38, 36, 36];
     let mut regs = alloc::collections::BTreeMap::new();
     let mut cio = RadioIo::reference();
-    if vht::write_power(&mut cio, 0xc822, &r, Some(ofdm)).is_err() {
+    if crate::rtw88::firmware_transport::now(vht::write_power(&mut cio, 0xc822, &r, Some(ofdm)))
+        .is_err()
+    {
         return TestResult::Fail("C22 VHT80 power write failed");
     }
     for reg in (0x3a00u16..0x3a40).step_by(4).chain([0x18e8, 0x41e8]) {
-        regs.insert(reg, radio::read(&mut cio, reg).unwrap_or(0));
+        regs.insert(
+            reg,
+            crate::rtw88::firmware_transport::now(radio::read(&mut cio, reg)).unwrap_or(0),
+        );
     }
-    let mut read = |r: u16| Ok(regs.get(&r).copied().unwrap_or(0));
-    if vht::check_power(&mut read, 0xc822, &r, Some(ofdm)).is_err()
+    let mut read =
+        crate::rtw88::firmware_transport::Sampled(|r: u16| Ok(regs.get(&r).copied().unwrap_or(0)));
+    if crate::rtw88::firmware_transport::now(vht::check_power(&mut read, 0xc822, &r, Some(ofdm)))
+        .is_err()
         || regs.get(&0x3a2c) != Some(&0x0404_0404)
         || regs.get(&0x3a3c) != Some(&0x0202_0202)
-        || vht::check_power(&mut read, 0xc822, &r, Some([0; 8])).is_ok()
+        || crate::rtw88::firmware_transport::now(vht::check_power(
+            &mut read,
+            0xc822,
+            &r,
+            Some([0; 8]),
+        ))
+        .is_ok()
     {
         return TestResult::Fail(
             "C22 VHT80 difference words differ from rtw8822c_set_tx_power_diff",
@@ -692,10 +755,20 @@ fn smoke_rtw88_vht80_station_profile_descriptor_rx_and_readback() -> TestResult 
         );
     }
     regs.insert(0x2860, radio8821c::rf18_for(42, 80));
-    let read = |r: u16| Ok(regs.get(&r).copied().unwrap_or(0));
-    if radio8821c::operating_readback_vht(read, legacy, mcs, vwords, 42).is_err()
-        || radio8821c::operating_readback_wide(read, legacy, mcs, 42).is_ok()
-        || radio8821c::operating_readback_vht(read, legacy, mcs, [0; 12], 42).is_ok()
+    let read =
+        crate::rtw88::firmware_transport::Sampled(|r: u16| Ok(regs.get(&r).copied().unwrap_or(0)));
+    if crate::rtw88::firmware_transport::now(radio8821c::operating_readback_vht(
+        read, legacy, mcs, vwords, 42,
+    ))
+    .is_err()
+        || crate::rtw88::firmware_transport::now(radio8821c::operating_readback_wide(
+            read, legacy, mcs, 42,
+        ))
+        .is_ok()
+        || crate::rtw88::firmware_transport::now(radio8821c::operating_readback_vht(
+            read, legacy, mcs, [0; 12], 42,
+        ))
+        .is_ok()
     {
         return TestResult::Fail("C21 VHT80 readback differs from the 80MHz program");
     }

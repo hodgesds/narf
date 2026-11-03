@@ -527,7 +527,7 @@ fn smoke_rtw8822ce_wmm_wrong_response_lost_edca_or_gain_never_opens_port() -> Te
                 _ => {
                     e.h.model(|io| {
                         use crate::rtw88::firmware_transport::Io;
-                        io.write32(0x18e8, 0x400)
+                        crate::rtw88::firmware_transport::now(io.write32(0x18e8, 0x400))
                     })
                     .map_err(|_| "C22 lost-gain fixture native mutation failed")?
                 }

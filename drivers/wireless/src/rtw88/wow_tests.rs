@@ -85,39 +85,61 @@ impl Model {
 }
 #[async_trait::async_trait]
 impl Io for Model {
-    fn read8(&mut self, reg: u16) -> Result<u8, NativeError> {
-        Ok(self.mem[reg as usize])
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u8, NativeError>> + Send {
+        async move { Ok(self.mem[reg as usize]) }
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, NativeError> {
-        Ok(self.get32(reg))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, NativeError>> + Send {
+        async move { Ok(self.get32(reg)) }
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), NativeError> {
-        self.events.push(Event::Write8(reg, value));
-        self.mem[reg as usize] = value;
-        Ok(())
-    }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), NativeError> {
-        self.events.push(Event::Write32(reg, value));
-        let mut v = value;
-        if reg == REG_WKFMCAM_CMD {
-            v &= !BIT_WKFCAM_POLLING_V1; // hardware completes immediately
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), NativeError>> + Send {
+        async move {
+            self.events.push(Event::Write8(reg, value));
+            self.mem[reg as usize] = value;
+            Ok(())
         }
-        if reg == SEC_CMD {
-            v &= !CMD_POLLING;
-            if value & CMD_WRITE_ENABLE != 0 {
-                let addr = (value & 0xff) as usize;
-                self.sec_cam[addr] = self.get32(SEC_WRITE);
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), NativeError>> + Send {
+        async move {
+            self.events.push(Event::Write32(reg, value));
+            let mut v = value;
+            if reg == REG_WKFMCAM_CMD {
+                v &= !BIT_WKFCAM_POLLING_V1; // hardware completes immediately
             }
+            if reg == SEC_CMD {
+                v &= !CMD_POLLING;
+                if value & CMD_WRITE_ENABLE != 0 {
+                    let addr = (value & 0xff) as usize;
+                    self.sec_cam[addr] = self.get32(SEC_WRITE);
+                }
+            }
+            if reg == REG_RXPKT_NUM {
+                v = if v & BIT_RW_RELEASE != 0 {
+                    v | BIT_RXDMA_IDLE
+                } else {
+                    v & !BIT_RXDMA_IDLE
+                };
+            }
+            self.set32(reg, v);
+            Ok(())
         }
-        if reg == REG_RXPKT_NUM {
-            v = if v & BIT_RW_RELEASE != 0 {
-                v | BIT_RXDMA_IDLE
-            } else {
-                v & !BIT_RXDMA_IDLE
-            };
-        }
-        self.set32(reg, v);
-        Ok(())
     }
     async fn delay_us(&mut self, _: u64) {}
     async fn download(&mut self, image: &PreparedImage) -> Result<(), NativeError> {

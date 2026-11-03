@@ -417,10 +417,24 @@ impl Plan {
 /// sequence.
 #[async_trait::async_trait]
 pub(super) trait Io: Send {
-    fn read8(&mut self, reg: u16) -> Result<u8, NativeError>;
-    fn read32(&mut self, reg: u16) -> Result<u32, NativeError>;
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), NativeError>;
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), NativeError>;
+    fn read8(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u8, NativeError>> + Send;
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, NativeError>> + Send;
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), NativeError>> + Send;
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), NativeError>> + Send;
     async fn delay_us(&mut self, us: u64);
     async fn download(&mut self, image: &PreparedImage) -> Result<(), NativeError>;
     async fn reserved_page(&mut self, pages: &[u8]) -> Result<(), NativeError>;
@@ -442,7 +456,7 @@ async fn poll32<I: Io>(
     tries: u32,
 ) -> Result<(), Error> {
     for _ in 0..tries {
-        let v = io.read32(reg)?;
+        let v = io.read32(reg).await?;
         if v == u32::MAX {
             return Err(Error::Native(NativeError::Gone));
         }
@@ -453,14 +467,14 @@ async fn poll32<I: Io>(
     }
     Err(Error::Timeout)
 }
-fn update8<I: Io>(io: &mut I, reg: u16, clear: u8, set: u8) -> Result<(), Error> {
-    let v = io.read8(reg)?;
-    io.write8(reg, v & !clear | set)?;
+async fn update8<I: Io>(io: &mut I, reg: u16, clear: u8, set: u8) -> Result<(), Error> {
+    let v = io.read8(reg).await?;
+    io.write8(reg, v & !clear | set).await?;
     Ok(())
 }
-fn update32<I: Io>(io: &mut I, reg: u16, clear: u32, set: u32) -> Result<(), Error> {
-    let v = io.read32(reg)?;
-    io.write32(reg, v & !clear | set)?;
+async fn update32<I: Io>(io: &mut I, reg: u16, clear: u32, set: u32) -> Result<(), Error> {
+    let v = io.read32(reg).await?;
+    io.write32(reg, v & !clear | set).await?;
     Ok(())
 }
 
@@ -468,44 +482,46 @@ fn update32<I: Io>(io: &mut I, reg: u16, clear: u32, set: u32) -> Result<(), Err
 async fn bb_stop<I: Io>(io: &mut I) -> Result<u8, Error> {
     io.delay_us(100_000).await;
     // Linux only warns on a non-empty MGQ; the read is kept for parity.
-    let _mgq_empty = io.read32(REG_BCNQ_INFO)? & BIT_MGQ_CPU_EMPTY != 0;
-    let txpause = io.read8(REG_TXPAUSE)?;
-    io.write8(REG_TXPAUSE, 0xff)?;
-    update8(io, REG_SYS_FUNC_EN, BIT_FEN_BB_RSTB, 0)?;
+    let _mgq_empty = io.read32(REG_BCNQ_INFO).await? & BIT_MGQ_CPU_EMPTY != 0;
+    let txpause = io.read8(REG_TXPAUSE).await?;
+    io.write8(REG_TXPAUSE, 0xff).await?;
+    update8(io, REG_SYS_FUNC_EN, BIT_FEN_BB_RSTB, 0).await?;
     Ok(txpause)
 }
 /// `rtw_wow_bb_start`.
-fn bb_start<I: Io>(io: &mut I, txpause: u8) -> Result<(), Error> {
-    update8(io, REG_SYS_FUNC_EN, 0, BIT_FEN_BB_RSTB)?;
-    io.write8(REG_TXPAUSE, txpause)?;
+async fn bb_start<I: Io>(io: &mut I, txpause: u8) -> Result<(), Error> {
+    update8(io, REG_SYS_FUNC_EN, 0, BIT_FEN_BB_RSTB).await?;
+    io.write8(REG_TXPAUSE, txpause).await?;
     Ok(())
 }
 /// `rtw_wow_rx_dma_stop`. Linux logs a non-idle RX DMA and proceeds; NARF
 /// refuses to swap firmware under an active RX DMA engine.
 async fn rx_dma_stop<I: Io>(io: &mut I) -> Result<(), Error> {
     io.delay_us(100_000).await;
-    update32(io, REG_RXPKT_NUM, 0, BIT_RW_RELEASE)?;
+    update32(io, REG_RXPKT_NUM, 0, BIT_RW_RELEASE).await?;
     poll32(io, REG_RXPKT_NUM, BIT_RXDMA_IDLE, BIT_RXDMA_IDLE, 100).await
 }
 /// `rtw_wow_pattern_write_cam`: one word, then poll the busy bit.
 async fn cam_write<I: Io>(io: &mut I, addr: u8, data: u32) -> Result<(), Error> {
-    io.write32(REG_WKFMCAM_RWD, data)?;
+    io.write32(REG_WKFMCAM_RWD, data).await?;
     io.write32(
         REG_WKFMCAM_CMD,
         BIT_WKFCAM_POLLING_V1 | BIT_WKFCAM_WE | u32::from(addr) << 8,
-    )?;
+    )
+    .await?;
     poll32(io, REG_WKFMCAM_CMD, BIT_WKFCAM_POLLING_V1, 0, 100).await
 }
 /// `rtw_wow_pattern_clear_cam`.
 async fn cam_clear<I: Io>(io: &mut I) -> Result<(), Error> {
-    io.write32(REG_WKFMCAM_CMD, BIT_WKFCAM_POLLING_V1 | BIT_WKFCAM_CLR_V1)?;
+    io.write32(REG_WKFMCAM_CMD, BIT_WKFCAM_POLLING_V1 | BIT_WKFCAM_CLR_V1)
+        .await?;
     poll32(io, REG_WKFMCAM_CMD, BIT_WKFCAM_POLLING_V1, 0, 100).await
 }
 /// `rtw_wow_check_fw_status`: 1 ms step, 100 ms budget.
 async fn check_fw_status<I: Io>(io: &mut I, enable: bool) -> Result<(), Error> {
     if enable {
         for _ in 0..100 {
-            if io.read8(REG_WOWLAN_WAKE_REASON)? == 0 {
+            if io.read8(REG_WOWLAN_WAKE_REASON).await? == 0 {
                 return Ok(());
             }
             io.delay_us(1000).await;
@@ -561,10 +577,11 @@ pub(super) async fn suspend<I: Io>(
     check_fw_status(io, true).await?;
     // rtw_wow_start tail
     io.hci_stop()?;
-    bb_start(io, txpause)?;
+    bb_start(io, txpause).await?;
     // rtw_wow_avoid_reset_mac (PCIe)
-    io.write8(REG_RSV_CTRL, BIT_WLOCK_1C_B6)?;
-    io.write8(REG_RSV_CTRL, BIT_WLOCK_1C_B6 | BIT_R_DIS_PRST)?;
+    io.write8(REG_RSV_CTRL, BIT_WLOCK_1C_B6).await?;
+    io.write8(REG_RSV_CTRL, BIT_WLOCK_1C_B6 | BIT_R_DIS_PRST)
+        .await?;
     Ok(Armed {
         flags: plan.flags,
         mac_id: plan.mac_id,
@@ -581,7 +598,7 @@ pub(super) async fn resume<I: Io>(
     armed: Armed,
     normal_image: &PreparedImage,
 ) -> (Option<WakeReport>, Result<(), Error>) {
-    let report = match io.read8(REG_WOWLAN_WAKE_REASON) {
+    let report = match io.read8(REG_WOWLAN_WAKE_REASON).await {
         Ok(reason) => decode(reason),
         Err(e) => return (None, Err(e.into())),
     };
@@ -613,8 +630,8 @@ async fn resume_inner<I: Io>(
     // rtw_wow_config_normal_fw_rsvd_page (linked)
     io.reserved_page(&armed.pages).await?;
     // rtw_wow_resume_trx
-    update32(io, REG_RXPKT_NUM, BIT_RW_RELEASE, 0)?;
-    bb_start(io, txpause)?;
+    update32(io, REG_RXPKT_NUM, BIT_RW_RELEASE, 0).await?;
+    bb_start(io, txpause).await?;
     io.end_swap()?;
     Ok(())
 }

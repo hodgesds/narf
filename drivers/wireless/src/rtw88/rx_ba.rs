@@ -4,21 +4,21 @@ use super::{packet_core::Frame, station::Error};
 use alloc::{collections::VecDeque, vec, vec::Vec};
 use narf_wireless::{reorder::Reorder, station_security::RawFrame};
 
-pub(super) fn readback(
+pub(super) async fn readback(
     io: &mut impl super::firmware_transport::Io,
     c21: bool,
 ) -> Result<(), super::firmware_transport::Error> {
     use super::firmware_transport::Error;
-    let rcr = io.read32(0x608)?;
+    let rcr = io.read32(0x608).await?;
     let required = (1 << 31) | (1 << 28) | (1 << 26) | (1 << 10);
     let forbidden = (1 << 30) | (1 << 29) | (1 << 27) | (1 << 25);
     if rcr & required != required
         || rcr & forbidden != 0
         // C21 mac.c starts at0fff, but its later original MAC table writes
         // both6a2/6a3=ff. This checks the retained post-table native owner.
-        || io.read16(0x6a2)? != 0xffff
-        || io.read16(0x4ce)? != 0x0801
-        || !c21 && (io.read8(0x426)? & 32 != 0 || io.read8(0x66e)? != 5)
+        || io.read16(0x6a2).await? != 0xffff
+        || io.read16(0x4ce).await? != 0x0801
+        || !c21 && (io.read8(0x426).await? & 32 != 0 || io.read8(0x66e).await? != 5)
     {
         return Err(Error::Prerequisite);
     }

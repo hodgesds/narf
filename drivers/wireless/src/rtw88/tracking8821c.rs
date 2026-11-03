@@ -359,23 +359,23 @@ impl Grant {
             Err(Error::Prerequisite)
         }
     }
-    pub(super) fn readback(
+    pub(super) async fn readback(
         &self,
-        mut read: impl FnMut(u16) -> Result<u32, Error>,
+        mut read: impl super::firmware_transport::Read32,
     ) -> Result<(), Error> {
         let p = match *self.phase.lock() {
             Phase::Stable(p) => p,
             _ => return Err(Error::State),
         };
-        Self::read_program(p, &mut read)
+        Self::read_program(p, &mut read).await
     }
-    pub(super) fn read_program(
+    pub(super) async fn read_program(
         p: Program,
-        read: &mut impl FnMut(u16) -> Result<u32, Error>,
+        read: &mut impl super::firmware_transport::Read32,
     ) -> Result<(), Error> {
         let scale = SCALE.get(usize::from(p.swing)).ok_or(Error::Prerequisite)?;
-        if read(0xc94)? & 0x7e != u32::from((p.agc as u8) & 63) << 1
-            || read(0xc1c)? >> 21 != u32::from(*scale)
+        if read.read32(0xc94).await? & 0x7e != u32::from((p.agc as u8) & 63) << 1
+            || read.read32(0xc1c).await? >> 21 != u32::from(*scale)
         {
             return Err(Error::Prerequisite);
         }

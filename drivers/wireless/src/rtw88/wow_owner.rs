@@ -88,6 +88,7 @@ impl<I: Io> Owner<I> {
                 let report = self
                     .io
                     .read8(super::super::wow::REG_WOWLAN_WAKE_REASON)
+                    .await
                     .ok()
                     .map(super::super::wow::decode);
                 drop(armed);
@@ -108,21 +109,44 @@ impl<I: Io> Owner<I> {
 
 #[async_trait::async_trait]
 impl<I: Io> super::super::wow::Io for Owner<I> {
-    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
-        self.wow_live()?;
-        self.io.read8(reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move {
+            self.wow_live()?;
+            self.io.read8(reg).await
+        }
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
-        self.wow_live()?;
-        self.io.read32(reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move {
+            self.wow_live()?;
+            self.io.read32(reg).await
+        }
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
-        self.wow_live()?;
-        self.io.write8(reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.wow_live()?;
+            self.io.write8(reg, value).await
+        }
     }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
-        self.wow_live()?;
-        self.io.write32(reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.wow_live()?;
+            self.io.write32(reg, value).await
+        }
     }
     async fn delay_us(&mut self, us: u64) {
         self.io.delay_us(us).await;

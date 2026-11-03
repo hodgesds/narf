@@ -123,13 +123,13 @@ pub(super) fn words(entry: &Entry) -> [(u32, u32); 8] {
 /// engine's polling bit like `radio::software_crypto` (10 us x 1000).
 async fn command<I: Io>(io: &mut I, cmd: u32, content: u32) -> Result<(), Error> {
     idle(io).await?;
-    io.write32(SEC_WRITE, content)?;
-    io.write32(SEC_CMD, cmd)?;
+    io.write32(SEC_WRITE, content).await?;
+    io.write32(SEC_CMD, cmd).await?;
     idle(io).await
 }
 async fn idle<I: Io>(io: &mut I) -> Result<(), Error> {
     for _ in 0..1000 {
-        let v = io.read32(SEC_CMD)?;
+        let v = io.read32(SEC_CMD).await?;
         if v == u32::MAX {
             return Err(Error::Native(NativeError::Gone));
         }
@@ -142,8 +142,8 @@ async fn idle<I: Io>(io: &mut I) -> Result<(), Error> {
 }
 /// The awake software-crypto state `radio::software_crypto` established and
 /// `ht.rs`/`radio8821c.rs` re-check: engine off, `RTW_SEC_CONFIG` clear.
-fn software<I: Io>(io: &mut I) -> Result<bool, Error> {
-    Ok(io.read8(CR_HIGH)? & ENGINE_EN == 0 && io.read8(SEC_CONFIG)? & CONFIG_WOW == 0)
+async fn software<I: Io>(io: &mut I) -> Result<bool, Error> {
+    Ok(io.read8(CR_HIGH).await? & ENGINE_EN == 0 && io.read8(SEC_CONFIG).await? & CONFIG_WOW == 0)
 }
 
 /// Proof that CAM entries are live; only [`clear`] consumes it. Dropping it
@@ -166,7 +166,7 @@ impl Installed {
 /// software-crypto state, so no host-visible RX was ever device-decrypted.
 /// An empty set (open BSS) programs nothing and leaves the engine off.
 pub(super) async fn install<I: Io>(io: &mut I, entries: &[Entry]) -> Result<Installed, Error> {
-    if !software(io)? {
+    if !software(io).await? {
         return Err(Error::Native(NativeError::Prerequisite));
     }
     if entries.is_empty() {
@@ -180,11 +180,13 @@ pub(super) async fn install<I: Io>(io: &mut I, entries: &[Entry]) -> Result<Inst
             command(io, cmd, content).await?;
         }
     }
-    let cr = io.read8(CR_HIGH)?;
-    io.write8(CR_HIGH, cr | ENGINE_EN)?;
-    let config = io.read8(SEC_CONFIG)?;
-    io.write8(SEC_CONFIG, config | CONFIG_WOW)?;
-    if io.read8(CR_HIGH)? & ENGINE_EN == 0 || io.read8(SEC_CONFIG)? & CONFIG_WOW != CONFIG_WOW {
+    let cr = io.read8(CR_HIGH).await?;
+    io.write8(CR_HIGH, cr | ENGINE_EN).await?;
+    let config = io.read8(SEC_CONFIG).await?;
+    io.write8(SEC_CONFIG, config | CONFIG_WOW).await?;
+    if io.read8(CR_HIGH).await? & ENGINE_EN == 0
+        || io.read8(SEC_CONFIG).await? & CONFIG_WOW != CONFIG_WOW
+    {
         return Err(Error::Native(NativeError::Prerequisite));
     }
     Ok(Installed {
@@ -198,21 +200,21 @@ pub(super) async fn install<I: Io>(io: &mut I, entries: &[Entry]) -> Result<Inst
 /// software CCMP with its own PN/replay windows, which never changed.
 pub(super) async fn clear<I: Io>(io: &mut I, installed: Installed) -> Result<(), Error> {
     if installed.indices.is_empty() {
-        return if software(io)? {
+        return if software(io).await? {
             Ok(())
         } else {
             Err(Error::Native(NativeError::Prerequisite))
         };
     }
-    let config = io.read8(SEC_CONFIG)?;
-    io.write8(SEC_CONFIG, config & !CONFIG_WOW)?;
-    let cr = io.read8(CR_HIGH)?;
-    io.write8(CR_HIGH, cr & !ENGINE_EN)?;
+    let config = io.read8(SEC_CONFIG).await?;
+    io.write8(SEC_CONFIG, config & !CONFIG_WOW).await?;
+    let cr = io.read8(CR_HIGH).await?;
+    io.write8(CR_HIGH, cr & !ENGINE_EN).await?;
     for index in &installed.indices {
         let cmd = CMD_WRITE_ENABLE | CMD_POLLING | u32::from(*index) << ENTRY_SHIFT;
         command(io, cmd, 0).await?;
     }
-    if !software(io)? {
+    if !software(io).await? {
         return Err(Error::Native(NativeError::Prerequisite));
     }
     Ok(())

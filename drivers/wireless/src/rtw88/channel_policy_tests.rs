@@ -66,9 +66,15 @@ fn smoke_rtw88_channel_policy_linux_groups_bb_rf_and_probe_ds() -> TestResult {
             return TestResult::Fail("channel program rejected an admitted primary");
         }
         let ok = (|| -> Result<bool, crate::rtw88::firmware_transport::Error> {
-            Ok(radio::read(&mut io, 0xc30)? & 0xfff == sco
-                && (radio::read(&mut io, 0x808)? >> 4) & 7 == dfir
-                && radio::rf_read(&mut io, 1, 0x18)? & 0x733ff == 0x3000 | u32::from(ch))
+            Ok(
+                crate::rtw88::firmware_transport::now(radio::read(&mut io, 0xc30))? & 0xfff == sco
+                    && (crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x808))? >> 4)
+                        & 7
+                        == dfir
+                    && crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 1, 0x18))?
+                        & 0x733ff
+                        == 0x3000 | u32::from(ch),
+            )
         })();
         if ok != Ok(true) {
             return TestResult::Fail("BB/RF readback is not the requested primary");
@@ -162,22 +168,25 @@ kernel_test_in!(
 fn smoke_rtw8821ce_retune_txagc_and_rf18_readback() -> TestResult {
     let indices = [30, 30, 30, 30, 28, 28, 28, 28, 26, 26, 26, 26];
     let mut io = RadioIo::new();
-    let setup = (|| {
-        io.write32(0x2860, 0xc06)?;
-        io.write32(0x440, 0x1f)?;
-        io.write32(0x1bf0, 0)?;
-        radio8821c::write_txagc(&mut io, indices)
-    })();
+    let setup = crate::rtw88::firmware_transport::now(async {
+        io.write32(0x2860, 0xc06).await?;
+        io.write32(0x440, 0x1f).await?;
+        io.write32(0x1bf0, 0).await?;
+        radio8821c::write_txagc(&mut io, indices).await
+    });
     if setup.is_err() {
         return TestResult::Fail("C21 TXAGC write rejected");
     }
-    if radio8821c::verify_retune(&mut io, 6, indices).is_err() {
+    if crate::rtw88::firmware_transport::now(radio8821c::verify_retune(&mut io, 6, indices))
+        .is_err()
+    {
         return TestResult::Fail("C21 retune readback refused the programmed primary");
     }
     let mut other = indices;
     other[0] = 31;
-    if radio8821c::verify_retune(&mut io, 7, indices).is_ok()
-        || radio8821c::verify_retune(&mut io, 6, other).is_ok()
+    if crate::rtw88::firmware_transport::now(radio8821c::verify_retune(&mut io, 7, indices)).is_ok()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_retune(&mut io, 6, other))
+            .is_ok()
     {
         return TestResult::Fail("C21 retune readback accepted another channel or power");
     }
@@ -203,20 +212,28 @@ fn smoke_rtw8821ce_operating_readback_rf18_tracks_primary() -> TestResult {
     let indices = [30, 30, 30, 30, 28, 28, 28, 28, 26, 26, 26, 26];
     let mcs = [24; 8];
     let mut io = RadioIo::new();
-    let setup = (|| {
-        io.write32(0x2860, 0xc06)?;
-        radio8821c::write_txagc(&mut io, indices)?;
-        io.write32(0x1d0c, u32::from_le_bytes([24; 4]))?;
-        io.write32(0x1d10, u32::from_le_bytes([24; 4]))
-    })();
+    let setup = crate::rtw88::firmware_transport::now(async {
+        io.write32(0x2860, 0xc06).await?;
+        radio8821c::write_txagc(&mut io, indices).await?;
+        io.write32(0x1d0c, u32::from_le_bytes([24; 4])).await?;
+        io.write32(0x1d10, u32::from_le_bytes([24; 4])).await
+    });
     if setup.is_err() {
         return TestResult::Fail("C21 operating fixture rejected");
     }
-    let mut read = |r: u16| io.read32(r);
-    if radio8821c::operating_readback_ht(&mut read, indices, mcs, 6).is_err() {
+    let mut read = crate::rtw88::firmware_transport::IoRead32(&mut io);
+    if crate::rtw88::firmware_transport::now(radio8821c::operating_readback_ht(
+        &mut read, indices, mcs, 6,
+    ))
+    .is_err()
+    {
         return TestResult::Fail("C21 HT20 readback refused the committed noninitial primary");
     }
-    if radio8821c::operating_readback_ht(&mut read, indices, mcs, 1).is_ok() {
+    if crate::rtw88::firmware_transport::now(radio8821c::operating_readback_ht(
+        &mut read, indices, mcs, 1,
+    ))
+    .is_ok()
+    {
         return TestResult::Fail("C21 HT20 readback accepted channel 1 RF18 on channel 6");
     }
     TestResult::Pass
@@ -408,16 +425,25 @@ fn smoke_rtw8822ce_channel5_bb_mac_rf_program() -> TestResult {
         }
         let mut io = RadioIo::reference();
         if narf_scheduler::block_on(radio::channel5_to(&mut io, ch)).is_err()
-            || radio::verify_channel5(&mut io, ch).is_err()
+            || crate::rtw88::firmware_transport::now(radio::verify_channel5(&mut io, ch)).is_err()
         {
             return TestResult::Fail("C22 5GHz program or readback failed");
         }
         let check = (|| -> Result<bool, crate::rtw88::firmware_transport::Error> {
-            Ok(io.read8(0x454)? & 0x80 != 0
-                && radio::rf_read(&mut io, 0, 0x18)? & 0x733ff == rf18
-                && radio::rf_read(&mut io, 1, 0x18)? & 0x733ff == rf18)
+            Ok(
+                crate::rtw88::firmware_transport::now(io.read8(0x454))? & 0x80 != 0
+                    && crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 0, 0x18))?
+                        & 0x733ff
+                        == rf18
+                    && crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 1, 0x18))?
+                        & 0x733ff
+                        == rf18,
+            )
         })();
-        if check != Ok(true) || radio::verify_channel5(&mut io, ch + 4).is_ok() {
+        if check != Ok(true)
+            || crate::rtw88::firmware_transport::now(radio::verify_channel5(&mut io, ch + 4))
+                .is_ok()
+        {
             return TestResult::Fail("C22 5GHz readback accepted another primary");
         }
         // Back to 2.4GHz rewrites every 5GHz field.
@@ -425,11 +451,20 @@ fn smoke_rtw8822ce_channel5_bb_mac_rf_program() -> TestResult {
             return TestResult::Fail("C22 2.4GHz program after 5GHz failed");
         }
         let back = (|| -> Result<bool, crate::rtw88::firmware_transport::Error> {
-            Ok(io.read8(0x454)? & 0x80 == 0
-                && radio::read(&mut io, 0x1c80)? & 0x3f000000 == 15 << 24
-                && radio::read(&mut io, 0x1a80)? & (1 << 18) == 0
-                && radio::read(&mut io, 0x1a14)? & 0x300 == 0
-                && radio::rf_read(&mut io, 0, 0x18)? & 0x733ff == 0x3006)
+            Ok(
+                crate::rtw88::firmware_transport::now(io.read8(0x454))? & 0x80 == 0
+                    && crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x1c80))?
+                        & 0x3f000000
+                        == 15 << 24
+                    && crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x1a80))?
+                        & (1 << 18)
+                        == 0
+                    && crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x1a14))? & 0x300
+                        == 0
+                    && crate::rtw88::firmware_transport::now(radio::rf_read(&mut io, 0, 0x18))?
+                        & 0x733ff
+                        == 0x3006,
+            )
         })();
         if back != Ok(true) {
             return TestResult::Fail("C22 2.4GHz program left 5GHz state");
@@ -467,22 +502,28 @@ fn smoke_rtw8821ce_channel20_cross_band_readback() -> TestResult {
         return TestResult::Fail("C21 swing differs from rtw8821c_get_bb_swing or erased accepted");
     }
     let mut io = RadioIo::new();
-    let setup = (|| {
-        io.write32(0x2800 + 0x18 * 4, radio8821c::rf18_for(36, 20))?;
-        io.write32(0x2800 + 0xdf * 4, 0)?;
-        io.write32(0xc1c, 0x16a << 21 | 1 << 8)?;
-        io.write32(0x860, 0x494 << 17)?;
-        io.write32(0xa80, 1 << 18)?;
-        io.write32(0x808, 0)?;
-        io.write8(0x454, 0x80)?;
-        io.write32(0x8ac, 0x10010000)?;
-        io.write32(0xcb8, 0xd00000)
-    })();
-    if setup.is_err() || radio8821c::verify_channel20(&mut io, 36, &facts).is_err() {
+    let setup = crate::rtw88::firmware_transport::now(async {
+        io.write32(0x2800 + 0x18 * 4, radio8821c::rf18_for(36, 20))
+            .await?;
+        io.write32(0x2800 + 0xdf * 4, 0).await?;
+        io.write32(0xc1c, 0x16a << 21 | 1 << 8).await?;
+        io.write32(0x860, 0x494 << 17).await?;
+        io.write32(0xa80, 1 << 18).await?;
+        io.write32(0x808, 0).await?;
+        io.write8(0x454, 0x80).await?;
+        io.write32(0x8ac, 0x10010000).await?;
+        io.write32(0xcb8, 0xd00000).await
+    });
+    if setup.is_err()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_channel20(&mut io, 36, &facts))
+            .is_err()
+    {
         return TestResult::Fail("C21 5GHz readback refused the programmed primary");
     }
-    if radio8821c::verify_channel20(&mut io, 40, &facts).is_ok()
-        || radio8821c::verify_channel20(&mut io, 6, &facts).is_ok()
+    if crate::rtw88::firmware_transport::now(radio8821c::verify_channel20(&mut io, 40, &facts))
+        .is_ok()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_channel20(&mut io, 6, &facts))
+            .is_ok()
     {
         return TestResult::Fail("C21 5GHz readback accepted another channel or band");
     }
@@ -644,10 +685,11 @@ fn smoke_rtw88_band5_base_rate_rrsr_and_ofdm_reference() -> TestResult {
     // rtw8822c_set_write_tx_power_ref / _set_tx_power_diff on 5GHz.
     let mut io = RadioIo::reference();
     let (ofdm, diffs) = ([40, 38], [0x7d00_7f02, 0x7c7c_7c7c]);
-    if radio::ofdm5(&mut io, ofdm, diffs).is_err()
-        || radio::verify_ofdm5(&mut io, ofdm, diffs).is_err()
-        || radio::verify_ofdm5(&mut io, [40, 37], diffs).is_ok()
-        || radio::read(&mut io, 0x440) != Ok(0x10)
+    if crate::rtw88::firmware_transport::now(radio::ofdm5(&mut io, ofdm, diffs)).is_err()
+        || crate::rtw88::firmware_transport::now(radio::verify_ofdm5(&mut io, ofdm, diffs)).is_err()
+        || crate::rtw88::firmware_transport::now(radio::verify_ofdm5(&mut io, [40, 37], diffs))
+            .is_ok()
+        || crate::rtw88::firmware_transport::now(radio::read(&mut io, 0x440)) != Ok(0x10)
     {
         return TestResult::Fail("C22 5GHz OFDM reference/difference program not read back");
     }
@@ -662,21 +704,24 @@ fn smoke_rtw8821ce_channel5_ofdm_txagc_and_rrsr() -> TestResult {
     // C21 5GHz retune tail: OFDM TXAGC with CCK zero, RRSR_INIT_5G & mask(6M).
     let indices = [0, 0, 0, 0, 28, 28, 28, 28, 26, 26, 26, 26];
     let mut io = RadioIo::new();
-    let run = (|| {
-        radio8821c::write_txagc(&mut io, indices)?;
-        io.write32(0x440, radio::RRSR_OFDM6_5G)?;
-        io.write32(0x1bf0, 0)
-    })();
+    let run = crate::rtw88::firmware_transport::now(async {
+        radio8821c::write_txagc(&mut io, indices).await?;
+        io.write32(0x440, radio::RRSR_OFDM6_5G).await?;
+        io.write32(0x1bf0, 0).await
+    });
     if radio::RRSR_OFDM6_5G != 0x10
         || run.is_err()
-        || radio8821c::verify_txagc(&mut io, indices, 0x10).is_err()
-        || radio8821c::verify_txagc(&mut io, indices, 0x1f).is_ok()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_txagc(&mut io, indices, 0x10))
+            .is_err()
+        || crate::rtw88::firmware_transport::now(radio8821c::verify_txagc(&mut io, indices, 0x1f))
+            .is_ok()
     {
         return TestResult::Fail("C21 5GHz TXAGC/RRSR readback differs");
     }
     let mut other = indices;
     other[4] = 27;
-    if radio8821c::verify_txagc(&mut io, other, 0x10).is_ok() {
+    if crate::rtw88::firmware_transport::now(radio8821c::verify_txagc(&mut io, other, 0x10)).is_ok()
+    {
         return TestResult::Fail("C21 TXAGC readback accepted another selection");
     }
     TestResult::Pass

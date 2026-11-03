@@ -637,15 +637,15 @@ impl Grant {
     /// [`Self::readback`] at the committed width: with the N2xB pair
     /// programmed, the HT TXAGC is the record's HT40 selection and (C21) RF18
     /// carries the 40MHz center.
-    pub(super) fn readback_at(
+    pub(super) async fn readback_at(
         &self,
-        mut read: impl FnMut(u16) -> Result<u32, Error>,
+        mut read: impl super::firmware_transport::Read32,
         wide: Option<&Wide>,
     ) -> Result<(), Error> {
         let r = match wide {
-            None => return self.readback(read),
+            None => return self.readback(read).await,
             Some(Wide::Forty(r)) => r,
-            Some(Wide::Eighty(v)) => return self.readback_vht(read, v),
+            Some(Wide::Eighty(v)) => return self.readback_vht(read, v).await,
         };
         if self.base.did() == 0xc821 {
             let mcs: [u8; 8] = r.indices[..8].try_into().expect("one-stream HT40 indices");
@@ -654,22 +654,23 @@ impl Grant {
                 self.facts.legacy,
                 mcs,
                 r.center(),
-            );
+            )
+            .await;
         }
         if self.two_streams()
-            && (read(0x820)? & 255 != 0x31
-                || read(0x1e2c)? & 0xffff != 0x400
-                || read(0x1a04)? & 0xf0000000 != 0x80000000)
+            && (read.read32(0x820).await? & 255 != 0x31
+                || read.read32(0x1e2c).await? & 0xffff != 0x400
+                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
         {
             return Err(Error::Prerequisite);
         }
         for (reg, v) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
-            if read(reg)? >> 16 & 127 != u32::from(v) {
+            if read.read32(reg).await? >> 16 & 127 != u32::from(v) {
                 return Err(Error::Prerequisite);
             }
         }
-        super::ht40::check_power(&mut read, 0xc822, r, self.base.ofdm5_indices())?;
-        if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+        super::ht40::check_power(&mut read, 0xc822, r, self.base.ofdm5_indices()).await?;
+        if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }
         Ok(())
@@ -677,9 +678,9 @@ impl Grant {
     /// [`Self::readback`] at the N2xV 80MHz block: C22 difference words
     /// are the VHT selection (`vht::check_power`), C21 keeps the HT20 words
     /// and carries the VHT words with RF18 BW80 on the center.
-    fn readback_vht(
+    async fn readback_vht(
         &self,
-        mut read: impl FnMut(u16) -> Result<u32, Error>,
+        mut read: impl super::firmware_transport::Read32,
         v: &super::vht::Record,
     ) -> Result<(), Error> {
         if self.base.did() == 0xc821 {
@@ -691,29 +692,30 @@ impl Grant {
                 self.tracking_indices(),
                 vht,
                 v.center,
-            );
+            )
+            .await;
         }
         if self.two_streams()
-            && (read(0x820)? & 255 != 0x31
-                || read(0x1e2c)? & 0xffff != 0x400
-                || read(0x1a04)? & 0xf0000000 != 0x80000000)
+            && (read.read32(0x820).await? & 255 != 0x31
+                || read.read32(0x1e2c).await? & 0xffff != 0x400
+                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
         {
             return Err(Error::Prerequisite);
         }
         for (reg, c) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
-            if read(reg)? >> 16 & 127 != u32::from(c) {
+            if read.read32(reg).await? >> 16 & 127 != u32::from(c) {
                 return Err(Error::Prerequisite);
             }
         }
-        super::vht::check_power(&mut read, 0xc822, v, self.base.ofdm5_indices())?;
-        if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+        super::vht::check_power(&mut read, 0xc822, v, self.base.ofdm5_indices()).await?;
+        if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }
         Ok(())
     }
-    pub(super) fn readback(
+    pub(super) async fn readback(
         &self,
-        mut read: impl FnMut(u16) -> Result<u32, Error>,
+        mut read: impl super::firmware_transport::Read32,
     ) -> Result<(), Error> {
         if self.base.did() == 0xc821 {
             return super::radio8821c::operating_readback_ht(
@@ -721,47 +723,42 @@ impl Grant {
                 self.facts.legacy,
                 self.tracking_indices(),
                 self.channel(),
-            );
+            )
+            .await;
         }
         if self.two_streams()
-            && (read(0x820)? & 255 != 0x31
-                || read(0x1e2c)? & 0xffff != 0x400
-                || read(0x1a04)? & 0xf0000000 != 0x80000000)
+            && (read.read32(0x820).await? & 255 != 0x31
+                || read.read32(0x1e2c).await? & 0xffff != 0x400
+                || read.read32(0x1a04).await? & 0xf0000000 != 0x80000000)
         {
             return Err(Error::Prerequisite);
         }
         for (r, v) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
-            if read(r)? >> 16 & 127 != u32::from(v) {
+            if read.read32(r).await? >> 16 & 127 != u32::from(v) {
                 return Err(Error::Prerequisite);
             }
         }
         for r in [0x18e8, 0x41e8] {
-            if read(r)? & 0x1fc00 != u32::from(self.indices[7]) << 10 {
+            if read.read32(r).await? & 0x1fc00 != u32::from(self.indices[7]) << 10 {
                 return Err(Error::Prerequisite);
             }
         }
         for (i, v) in self.words().into_iter().enumerate() {
-            if read(0x3a00 + i as u16 * 4)? != v {
+            if read.read32(0x3a00 + i as u16 * 4).await? != v {
                 return Err(Error::Prerequisite);
             }
         }
-        if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+        if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }
         Ok(())
     }
-    fn guarded<I: Io, T>(
+    async fn guarded<T>(
         &self,
-        io: &mut I,
         admission: &Admission,
-        op: impl FnOnce(&mut I) -> Result<T, Error>,
+        op: impl core::future::Future<Output = Result<T, Error>>,
     ) -> Result<T, Error> {
-        self.invoke(|| {
-            admission.run(|| {
-                io.station_allowed()?;
-                op(io)
-            })
-        })
+        super::firmware_transport::enclosed(|inner| self.invoke(|| admission.run(inner)), op).await
     }
     pub(super) async fn program(
         &self,
@@ -770,49 +767,56 @@ impl Grant {
     ) -> Result<(), Error> {
         self.check()?;
         let parked = if self.two_streams() {
-            Some(self.guarded(io, admission, |io| {
-                if !io.station_ht_program_quiet()? {
-                    return Err(Error::State);
-                }
-                let pause = io.read8(0x522)?;
-                let rx = io.read32(super::dma_stop::RXPKT_NUM)?;
-                if pause != 0 || rx == u32::MAX || rx & super::dma_stop::RW_RELEASE != 0 {
-                    return Err(Error::Prerequisite);
-                }
-                io.write8(0x522, 255)?;
-                io.write32(super::dma_stop::RXPKT_NUM, rx | super::dma_stop::RW_RELEASE)?;
-                if io.read8(0x522)? != 255 {
-                    return Err(Error::Prerequisite);
-                }
-                Ok(pause)
-            })?)
+            Some(
+                self.guarded(admission, async {
+                    io.station_allowed()?;
+                    if !io.station_ht_program_quiet()? {
+                        return Err(Error::State);
+                    }
+                    let pause = io.read8(0x522).await?;
+                    let rx = io.read32(super::dma_stop::RXPKT_NUM).await?;
+                    if pause != 0 || rx == u32::MAX || rx & super::dma_stop::RW_RELEASE != 0 {
+                        return Err(Error::Prerequisite);
+                    }
+                    io.write8(0x522, 255).await?;
+                    io.write32(super::dma_stop::RXPKT_NUM, rx | super::dma_stop::RW_RELEASE)
+                        .await?;
+                    if io.read8(0x522).await? != 255 {
+                        return Err(Error::Prerequisite);
+                    }
+                    Ok(pause)
+                })
+                .await?,
+            )
         } else {
             None
         };
         if parked.is_some() {
-            let mut error = None;
-            let idle = narf_scheduler::responsive_spin_until(
-                || match self.guarded(io, admission, |io| {
-                    let rx = io.read32(super::dma_stop::RXPKT_NUM)?;
-                    if rx == u32::MAX {
-                        return Err(Error::Gone);
-                    }
-                    if rx & super::dma_stop::RW_RELEASE == 0 {
-                        return Err(Error::Prerequisite);
-                    }
-                    Ok(rx & super::dma_stop::RXDMA_IDLE != 0)
-                }) {
-                    Ok(ready) => ready,
-                    Err(e) => {
-                        error = Some(e);
-                        true
-                    }
-                },
-                narf_time::Deadline::after_ms(10),
-            );
-            if let Some(error) = error {
-                return Err(error);
-            }
+            // Bounded by the same 10ms the synchronous spin used; each sample
+            // re-enters the gate, and the executor runs between samples.
+            let deadline = narf_time::Deadline::after_ms(10);
+            let idle = loop {
+                let idle = self
+                    .guarded(admission, async {
+                        io.station_allowed()?;
+                        let rx = io.read32(super::dma_stop::RXPKT_NUM).await?;
+                        if rx == u32::MAX {
+                            return Err(Error::Gone);
+                        }
+                        if rx & super::dma_stop::RW_RELEASE == 0 {
+                            return Err(Error::Prerequisite);
+                        }
+                        Ok(rx & super::dma_stop::RXDMA_IDLE != 0)
+                    })
+                    .await?;
+                if idle {
+                    break true;
+                }
+                if deadline.expired() {
+                    break false;
+                }
+                narf_scheduler::yield_now().await;
+            };
             if !idle {
                 return Err(Error::Timeout);
             }
@@ -820,74 +824,86 @@ impl Grant {
         // Call only after the retained gate encloses this NEW complete program.
         // C21's actual fresh RF42 conversion is required, never a factory byte.
         if self.base.did() == 0xc821 {
-            admission.run(|| {
+            crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
                 io.station_allowed()?;
-                let old = io.read32(0x2908)?;
+                let old = io.read32(0x2908).await?;
                 if old == u32::MAX {
                     return Err(Error::Gone);
                 }
                 io.write32(0xc90, (0x42 << 20) | (old & 0xfffff & !0x30000) | 0x30000)
-            })?;
+                    .await
+            })
+            .await?;
             io.delay_us(13).await;
             io.delay_us(2_000_000).await;
-            admission.run(|| {
+            crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
                 io.station_allowed()?;
-                let meter = io.read32(0x2908)?;
+                let meter = io.read32(0x2908).await?;
                 if meter == u32::MAX {
                     return Err(Error::Gone);
                 }
                 self.base.temperature(((meter >> 10) & 63) as u8)
-            })?;
+            })
+            .await?;
             for (i, chunk) in self.indices[..8].chunks_exact(4).enumerate() {
                 let v = u32::from_le_bytes(chunk.try_into().unwrap());
-                admission.run(|| {
+                crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
                     io.station_allowed()?;
-                    io.write32(0x1d0c + i as u16 * 4, v)
-                })?;
+                    io.write32(0x1d0c + i as u16 * 4, v).await
+                })
+                .await?;
                 narf_scheduler::yield_now().await;
             }
         } else {
             for r in [0x18e8, 0x41e8] {
-                self.guarded(io, admission, |io| {
-                    super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
-                    super::radio::mask(io, r, 0x1fc00, u32::from(self.indices[7]))
-                })?;
+                self.guarded(admission, async {
+                    io.station_allowed()?;
+                    super::radio::mask(io, 0x1c90, 1 << 15, 0).await?;
+                    super::radio::mask(io, r, 0x1fc00, u32::from(self.indices[7])).await
+                })
+                .await?;
                 narf_scheduler::yield_now().await;
             }
             for (i, v) in self.words().into_iter().enumerate() {
-                self.guarded(io, admission, |io| {
-                    super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
-                    io.write32(0x3a00 + i as u16 * 4, v)
-                })?;
+                self.guarded(admission, async {
+                    io.station_allowed()?;
+                    super::radio::mask(io, 0x1c90, 1 << 15, 0).await?;
+                    io.write32(0x3a00 + i as u16 * 4, v).await
+                })
+                .await?;
                 narf_scheduler::yield_now().await;
             }
             if self.two_streams() {
-                self.guarded(io, admission, |io| {
-                    super::radio::mask(io, 0x820, 255, 0x31)?;
-                    super::radio::mask(io, 0x1e2c, 0xffff, 0x400)?;
+                self.guarded(admission, async {
+                    io.station_allowed()?;
+                    super::radio::mask(io, 0x820, 255, 0x31).await?;
+                    super::radio::mask(io, 0x1e2c, 0xffff, 0x400).await?;
                     // rtw8822c_config_ofdm_tx_path + outer config_tx_path.
                     // Both reset BB_RSTB while preserving all other SYS bits.
                     for _ in 0..2 {
-                        let sys = io.read16(0x2)?;
+                        let sys = io.read16(0x2).await?;
                         if sys == u16::MAX {
                             return Err(Error::Gone);
                         }
-                        io.write16(0x2, sys | 1)?;
-                        io.write16(0x2, sys & !1)?;
-                        io.write16(0x2, sys | 1)?;
+                        io.write16(0x2, sys | 1).await?;
+                        io.write16(0x2, sys & !1).await?;
+                        io.write16(0x2, sys | 1).await?;
                     }
-                    if io.read16(0x2)? & 1 == 0 {
+                    if io.read16(0x2).await? & 1 == 0 {
                         return Err(Error::Prerequisite);
                     }
                     Ok(())
-                })?;
+                })
+                .await?;
             }
         }
-        self.guarded(io, admission, |io| {
-            self.readback(|r| io.read32(r))?;
+        self.guarded(admission, async {
+            io.station_allowed()?;
+            self.readback(super::firmware_transport::IoRead32(io))
+                .await?;
             if let Some(pause) = parked {
-                let rx = io.read32(super::dma_stop::RXPKT_NUM)?;
-                if io.read8(0x522)? != 255
+                let rx = io.read32(super::dma_stop::RXPKT_NUM).await?;
+                if io.read8(0x522).await? != 255
                     || rx == u32::MAX
                     || rx & (super::dma_stop::RW_RELEASE | super::dma_stop::RXDMA_IDLE)
                         != super::dma_stop::RW_RELEASE | super::dma_stop::RXDMA_IDLE
@@ -897,16 +913,19 @@ impl Grant {
                 io.write32(
                     super::dma_stop::RXPKT_NUM,
                     rx & !super::dma_stop::RW_RELEASE,
-                )?;
-                io.write8(0x522, pause)?;
-                if io.read8(0x522)? != pause
-                    || io.read32(super::dma_stop::RXPKT_NUM)? & super::dma_stop::RW_RELEASE != 0
+                )
+                .await?;
+                io.write8(0x522, pause).await?;
+                if io.read8(0x522).await? != pause
+                    || io.read32(super::dma_stop::RXPKT_NUM).await? & super::dma_stop::RW_RELEASE
+                        != 0
                 {
                     return Err(Error::Prerequisite);
                 }
             }
             Ok(())
         })
+        .await
     }
 }
 /// Bound normal-ACK immediate single-TID ADDBA request. No BA agreement is

@@ -251,23 +251,47 @@ unsafe impl Io for Model {
         self.claim = true;
         Ok(())
     }
-    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
-        Ok(self.read(8, reg)? as u8)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { Ok(self.read(8, reg)? as u8) }
     }
-    fn read16(&mut self, reg: u16) -> Result<u16, Error> {
-        Ok(self.read(16, reg)? as u16)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move { Ok(self.read(16, reg)? as u16) }
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
-        self.read(32, reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { self.read(32, reg) }
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
-        self.write(8, reg, u32::from(value))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(8, reg, u32::from(value)) }
     }
-    fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error> {
-        self.write(16, reg, u32::from(value))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        reg: u16,
+        value: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(16, reg, u32::from(value)) }
     }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
-        self.write(32, reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(32, reg, value) }
     }
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error> {
         self.access(Op::Packet(data.to_vec()))?;

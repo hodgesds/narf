@@ -343,7 +343,7 @@ fn words8821c(record: &Record) -> [u32; 3] {
 }
 
 /// Program the record's VHT80 TXAGC (`rtw_phy_set_tx_power_level` at BW80).
-pub(super) fn write_power(
+pub(super) async fn write_power(
     io: &mut impl Io,
     did: u16,
     record: &Record,
@@ -353,18 +353,18 @@ pub(super) fn write_power(
         0xc822 => {
             let ofdm = ofdm.ok_or(Error::State)?;
             for r in [0x18e8, 0x41e8] {
-                super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
-                super::radio::mask(io, r, 0x1fc00, u32::from(record.indices[7]))?;
+                super::radio::mask(io, 0x1c90, 1 << 15, 0).await?;
+                super::radio::mask(io, r, 0x1fc00, u32::from(record.indices[7])).await?;
             }
             for (i, v) in words(record, ofdm).into_iter().enumerate() {
-                super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
-                io.write32(0x3a00 + i as u16 * 4, v)?;
+                super::radio::mask(io, 0x1c90, 1 << 15, 0).await?;
+                io.write32(0x3a00 + i as u16 * 4, v).await?;
             }
             Ok(())
         }
         0xc821 => {
             for (i, v) in words8821c(record).into_iter().enumerate() {
-                io.write32(0x1d2c + i as u16 * 4, v)?;
+                io.write32(0x1d2c + i as u16 * 4, v).await?;
             }
             Ok(())
         }
@@ -373,8 +373,8 @@ pub(super) fn write_power(
 }
 
 /// Readback of [`write_power`] over any register view.
-pub(super) fn check_power(
-    read: &mut impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn check_power(
+    read: &mut impl super::firmware_transport::Read32,
     did: u16,
     record: &Record,
     ofdm: Option<[u8; 8]>,
@@ -383,12 +383,12 @@ pub(super) fn check_power(
         0xc822 => {
             let ofdm = ofdm.ok_or(Error::State)?;
             for r in [0x18e8, 0x41e8] {
-                if read(r)? & 0x1fc00 != u32::from(record.indices[7]) << 10 {
+                if read.read32(r).await? & 0x1fc00 != u32::from(record.indices[7]) << 10 {
                     return Err(Error::Prerequisite);
                 }
             }
             for (i, v) in words(record, ofdm).into_iter().enumerate() {
-                if read(0x3a00 + i as u16 * 4)? != v {
+                if read.read32(0x3a00 + i as u16 * 4).await? != v {
                     return Err(Error::Prerequisite);
                 }
             }
@@ -396,7 +396,7 @@ pub(super) fn check_power(
         }
         0xc821 => {
             for (i, v) in words8821c(record).into_iter().enumerate() {
-                if read(0x1d2c + i as u16 * 4)? != v {
+                if read.read32(0x1d2c + i as u16 * 4).await? != v {
                     return Err(Error::Prerequisite);
                 }
             }
@@ -416,29 +416,36 @@ pub(super) async fn program(io: &mut impl Io, gate: &Gate, record: &Record) -> R
             let (ofdm, diffs) = gate.ofdm5().ok_or(Error::State)?;
             let indices = gate.ofdm5_indices().ok_or(Error::State)?;
             super::radio::wide5_to(io, center, width).await?;
-            super::radio::ofdm5(io, ofdm, diffs)?;
+            super::radio::ofdm5(io, ofdm, diffs).await?;
             super::channel_policy::iqk8822c_run(io).await?;
-            super::radio::ofdm5(io, ofdm, diffs)?;
-            write_power(io, did, record, Some(indices))?;
-            super::radio::verify_wide5(io, center, width)?;
+            super::radio::ofdm5(io, ofdm, diffs).await?;
+            write_power(io, did, record, Some(indices)).await?;
+            super::radio::verify_wide5(io, center, width).await?;
             check_power(
-                &mut |r| super::radio::read(io, r),
+                &mut super::firmware_transport::RadioRead32(io),
                 did,
                 record,
                 Some(indices),
-            )?;
+            )
+            .await?;
         }
         0xc821 => {
             let facts = gate.band_facts().ok_or(Error::State)?;
             super::radio8821c::wide5(io, center, width, &facts).await?;
             super::channel_policy::iqk8821c(io).await?;
-            write_power(io, did, record, None)?;
-            super::radio8821c::verify_wide5(io, center, width, &facts)?;
-            check_power(&mut |r| super::radio::read(io, r), did, record, None)?;
+            write_power(io, did, record, None).await?;
+            super::radio8821c::verify_wide5(io, center, width, &facts).await?;
+            check_power(
+                &mut super::firmware_transport::RadioRead32(io),
+                did,
+                record,
+                None,
+            )
+            .await?;
         }
         _ => return Err(Error::Unsupported),
     }
-    if super::radio::read(io, 0x440)? != rrsr {
+    if super::radio::read(io, 0x440).await? != rrsr {
         return Err(Error::Prerequisite);
     }
     Ok(())

@@ -33,28 +33,54 @@ unsafe impl Io for Regs {
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Ok(())
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        Ok(self.mem[usize::from(r)])
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { Ok(self.mem[usize::from(r)]) }
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        let r = usize::from(r);
-        Ok(u16::from_le_bytes([self.mem[r], self.mem[r + 1]]))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move {
+            let r = usize::from(r);
+            Ok(u16::from_le_bytes([self.mem[r], self.mem[r + 1]]))
+        }
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        Ok(self.get(r))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { Ok(self.get(r)) }
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.mem[usize::from(r)] = v;
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.mem[usize::from(r)] = v;
+            Ok(())
+        }
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        let a = usize::from(r);
-        self.mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            let a = usize::from(r);
+            self.mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+            Ok(())
+        }
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.set(r, v);
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.set(r, v);
+            Ok(())
+        }
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::Unsupported)
@@ -78,7 +104,7 @@ fn smoke_rtw88_bf_phy_init_and_su_bfee_program() -> TestResult {
     // Prior MU state the source init must clear/replace.
     r.set(0x14c0, 0x0000_f0bf);
     r.set(0x6dc, 0x3f00_1000);
-    if phy_init(&mut r).is_err() {
+    if crate::rtw88::firmware_transport::now(phy_init(&mut r)).is_err() {
         return TestResult::Fail("rtw_bf_phy_init readback");
     }
     // P1 wait bit16, retry limit 0xa at 15:12, MU MIMO bit7 and table
@@ -104,7 +130,7 @@ fn smoke_rtw88_bf_phy_init_and_su_bfee_program() -> TestResult {
         return TestResult::Fail("csi_param (coef 3, codebook 1, nr, nc) or chip gate");
     }
     r.mem[0x718] = 0x40;
-    if enable_su(&mut r, 0xc822, c22).is_err() {
+    if crate::rtw88::firmware_transport::now(enable_su(&mut r, 0xc822, c22)).is_err() {
         return TestResult::Fail("C22 SU enable readback");
     }
     if r.mem[0x718] != 0xdb
@@ -116,16 +142,19 @@ fn smoke_rtw88_bf_phy_init_and_su_bfee_program() -> TestResult {
     {
         return TestResult::Fail("rtw8822c_bf_enable_bfee_su words");
     }
-    if remove_su(&mut r).is_err()
+    if crate::rtw88::firmware_transport::now(remove_su(&mut r)).is_err()
         || r.mem[0x718] != 0xd8
         || r.mem[0x6e4..0x6ea] != [0; 6]
         || r.get(0x6f4) & 0xffff != 0
-        || readback(&mut r, 0xc822, c22).is_ok()
+        || crate::rtw88::firmware_transport::now(readback(&mut r, 0xc822, c22)).is_ok()
     {
         return TestResult::Fail("rtw_bf_remove_bfee_su");
     }
     let mut r = Regs::new();
-    if enable_su(&mut r, 0xc821, c21).is_err() || r.get(0x1678) != 0 || r.get(0x6dc) != 0 {
+    if crate::rtw88::firmware_transport::now(enable_su(&mut r, 0xc821, c21)).is_err()
+        || r.get(0x1678) != 0
+        || r.get(0x6dc) != 0
+    {
         return TestResult::Fail("C21 uses the generic SU path only");
     }
     TestResult::Pass
@@ -162,11 +191,11 @@ fn smoke_rtw88_bf_mu_bfee_enable_and_remove() -> TestResult {
     r.mem[0x718] = 0x40;
     r.set(0x1680, 0xc000);
     r.set(0x6dc, 0x0400_7000);
-    if phy_init(&mut r).is_err() {
+    if crate::rtw88::firmware_transport::now(phy_init(&mut r)).is_err() {
         return TestResult::Fail("phy_init before MU enable");
     }
     r.set(0x1680, 0xc000);
-    if enable_mu(&mut r, 0xc822, c22).is_err() {
+    if crate::rtw88::firmware_transport::now(enable_mu(&mut r, 0xc822, c22)).is_err() {
         return TestResult::Fail("C22 MU enable readback");
     }
     if r.mem[0x6e4..0x6ea] != bssid
@@ -183,11 +212,11 @@ fn smoke_rtw88_bf_mu_bfee_enable_and_remove() -> TestResult {
     {
         return TestResult::Fail("rtw_bf_enable_bfee_mu words (C22)");
     }
-    if readback(&mut r, 0xc822, c22).is_err() {
+    if crate::rtw88::firmware_transport::now(readback(&mut r, 0xc822, c22)).is_err() {
         return TestResult::Fail("MU readback dispatch");
     }
     r.set(0x14c0, 0x0001_a0ff);
-    if remove(&mut r, c22).is_err()
+    if crate::rtw88::firmware_transport::now(remove(&mut r, c22)).is_err()
         || r.mem[0x718] != 0x40
         || r.mem[0x6e4..0x6ec] != [0; 8]
         || r.get(0x1680) & 0xffff != 0
@@ -195,7 +224,7 @@ fn smoke_rtw88_bf_mu_bfee_enable_and_remove() -> TestResult {
         // Not cleared by rtw_bf_remove_bfee_mu.
         || r.get(0x6f4) & 0xffff != 0x0109
         || r.get(0x6a0) != 0xffff_ffff
-        || readback(&mut r, 0xc822, c22).is_ok()
+        || crate::rtw88::firmware_transport::now(readback(&mut r, 0xc822, c22)).is_ok()
     {
         return TestResult::Fail("rtw_bf_remove_bfee_mu + rtw_bf_del_sounding");
     }
@@ -204,7 +233,7 @@ fn smoke_rtw88_bf_mu_bfee_enable_and_remove() -> TestResult {
     let mut r = Regs::new();
     retained(&mut r);
     r.set(0x6dc, 0x0400_1000);
-    if enable_mu(&mut r, 0xc821, c21).is_err()
+    if crate::rtw88::firmware_transport::now(enable_mu(&mut r, 0xc821, c21)).is_err()
         || r.get(0x6dc) != 0x4400_2000
         || r.get(0x6a0) != 0xffff_ffff
         || r.get(0x6f4) & 0xffff != 0x0108
@@ -216,7 +245,9 @@ fn smoke_rtw88_bf_mu_bfee_enable_and_remove() -> TestResult {
         return TestResult::Fail("SU bfee refused");
     };
     let mut r = Regs::new();
-    if enable_mu(&mut r, 0xc822, su).is_ok() || remove(&mut r, su).is_err() || r.mem[0x718] != 0x98
+    if crate::rtw88::firmware_transport::now(enable_mu(&mut r, 0xc822, su)).is_ok()
+        || crate::rtw88::firmware_transport::now(remove(&mut r, su)).is_err()
+        || r.mem[0x718] != 0x98
     {
         return TestResult::Fail("role dispatch");
     }
@@ -265,7 +296,7 @@ fn smoke_rtw88_bf_vht_group_id_management_table() -> TestResult {
     // table-select upper bits kept.
     r.mem[0x14c0] = 0xff;
     r.mem[0x14c1] = 0xfe;
-    if set_gid(&mut r, &g).is_err() {
+    if crate::rtw88::firmware_transport::now(set_gid(&mut r, &g)).is_err() {
         return TestResult::Fail("rtw_bf_cfg_mu_bfee readback");
     }
     // Model keeps only the last selected table (1).

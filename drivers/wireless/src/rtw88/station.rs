@@ -637,7 +637,7 @@ impl State {
         // `rtw_bf_disassoc`: best effort, the owner is already closed and a
         // fresh association reprograms the entry.
         if let Some(b) = self.bfee.take() {
-            let _ = super::bf::remove(io, b);
+            let _ = super::firmware_transport::ready_now(super::bf::remove(io, b));
         }
         self.mu_group = super::bf::MuGroup::default();
         self.witness.clear();
@@ -856,18 +856,20 @@ impl State {
         }
         Ok(())
     }
-    pub(super) fn poll(&mut self, io: &mut impl Io) -> Result<Vec<Vec<u8>>, Error> {
+    pub(super) async fn poll(&mut self, io: &mut impl Io) -> Result<Vec<Vec<u8>>, Error> {
         let admission = self.admission.clone();
-        let result = admission
-            .run(|| Ok(self.progress(io)))
-            .map_err(Error::Native)
-            .and_then(|result| result);
+        let result = crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+            Ok(self.progress(io).await)
+        })
+        .await
+        .map_err(Error::Native)
+        .and_then(|result| result);
         if result.is_err() && !self.admission.teardown_pending() {
             self.fail(io);
         }
         result
     }
-    fn progress(&mut self, io: &mut impl Io) -> Result<Vec<Vec<u8>>, Error> {
+    async fn progress(&mut self, io: &mut impl Io) -> Result<Vec<Vec<u8>>, Error> {
         if self.admission.closed()
             || matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped)
         {
@@ -911,7 +913,7 @@ impl State {
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
-                if self.gid_management(io, frame.bytes())? {
+                if self.gid_management(io, frame.bytes()).await? {
                     continue;
                 }
                 if self.receive_open() && self.tx_ba_grant.is_some() {
@@ -1253,7 +1255,7 @@ impl State {
                                     let c21 =
                                         self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2
                                             == 0xc821;
-                                    super::rx_ba::readback(io, c21)?;
+                                    super::rx_ba::readback(io, c21).await?;
                                     if self.rx_ba.propose(
                                         r,
                                         maximum,
@@ -1434,7 +1436,7 @@ impl State {
                 _ => {}
             }
         }
-        self.service_tx_ba(io, now, idle)?;
+        self.service_tx_ba(io, now, idle).await?;
         if self.pending.is_none()
             && self.delivered_reply.is_none()
             && self.data_pending.is_empty()
@@ -1540,7 +1542,7 @@ impl State {
             }
         }
         if let Some(a) = address {
-            station_control::port_address(io, a, &self.admission)?;
+            station_control::port_address(io, a, &self.admission).await?;
             let admission = self.admission.clone();
             admission.run(|| Ok(io.packet_scan_address(Some(a))))??;
             self.scan_address = Some(a);
@@ -1550,6 +1552,7 @@ impl State {
             // rtw_core_scan_complete: back to the own address on every exit.
             let own = self.own;
             let restored = station_control::port_address(io, own, &self.admission)
+                .await
                 .map_err(Error::Native)
                 .and_then(|()| io.packet_scan_address(None).map_err(Error::Transport));
             if result.is_ok() {
@@ -1659,7 +1662,7 @@ impl State {
                 quiet = true;
                 break;
             }
-            self.poll(io)?;
+            self.poll(io).await?;
             self.environment.pause().await;
         }
         if !quiet {
@@ -1698,7 +1701,7 @@ impl State {
                 quiet = true;
                 break;
             }
-            self.poll(io)?;
+            self.poll(io).await?;
             self.environment.pause().await;
         }
         if !quiet {
@@ -1928,7 +1931,7 @@ impl State {
             let admission = self.admission.clone();
             admission.run(|| Ok(self.transmit(io, probe.clone(), Kind::Probe)))??;
             while self.pending.is_some() {
-                self.poll(io)?;
+                self.poll(io).await?;
                 if self.pending.is_none() {
                     break;
                 }
@@ -1937,7 +1940,7 @@ impl State {
         }
         let until = self.now()?.saturating_add(dwell_ms);
         loop {
-            self.poll(io)?;
+            self.poll(io).await?;
             if self.now()? >= until {
                 return Ok(self.candidates());
             }
@@ -2277,7 +2280,7 @@ impl State {
             }
             if let Some(g) = io.station_tx_ba_extension()? {
                 self.admission.run(|| io.station_bind_tx_ba(g.clone()))?;
-                super::tx_ba::program(io)?;
+                super::tx_ba::program(io).await?;
                 // The ADDBA request offers A-MSDU only where the producer
                 // may run (`rtw_ops_can_aggregate_in_amsdu`: not 2.4GHz).
                 self.tx_ba
@@ -2333,12 +2336,12 @@ impl State {
         let admission = self.admission.clone();
         admission.run(|| Ok(self.transmit(io, auth, Kind::Authentication)))??;
         loop {
-            self.poll(io)?;
+            self.poll(io).await?;
             if let Some((aid, short)) = self.peer_commit {
                 let band5 = super::band5::primary(self.channel);
                 station_control::commit_peer(io, bssid, aid, short, band5, &self.admission).await?;
                 self.associated_aid = Some(aid);
-                self.bf_assoc(io, bssid)?;
+                self.bf_assoc(io, bssid).await?;
                 if self.extension.is_some() {
                     super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)
                         .await?;
@@ -2364,7 +2367,7 @@ impl State {
     /// association request drops both without the AP's SU beamformer bit,
     /// `mlme.c::ieee80211_add_vht_ie`), so MU is bound exactly when it was
     /// advertised (`mu_mimo_owner`).
-    fn bf_assoc(&mut self, io: &mut impl Io, bssid: [u8; 6]) -> Result<(), Error> {
+    async fn bf_assoc(&mut self, io: &mut impl Io, bssid: [u8; 6]) -> Result<(), Error> {
         if self.vht.is_none() || self.bfee.is_some() {
             return Ok(());
         }
@@ -2388,15 +2391,16 @@ impl State {
         let Some(b) = b else {
             return Ok(());
         };
-        self.admission.run(|| {
+        crate::rtw88::firmware_transport::enclosed(|op| self.admission.run(op), async {
             io.station_allowed()?;
-            super::bf::phy_init(io)?;
+            super::bf::phy_init(io).await?;
             if b.is_mu() {
-                super::bf::enable_mu(io, did, b)
+                super::bf::enable_mu(io, did, b).await
             } else {
-                super::bf::enable_su(io, did, b)
+                super::bf::enable_su(io, did, b).await
             }
-        })?;
+        })
+        .await?;
         self.mu_group = super::bf::MuGroup::default();
         self.bfee = Some(b);
         Ok(())
@@ -2405,7 +2409,7 @@ impl State {
     /// `rtw_bf_set_gid_table`: a VHT Group ID Management frame from the AP
     /// reprograms the MU STA tables only while the bound role is MU, and only
     /// when membership or position changed. `true` when the frame was one.
-    fn gid_management(&mut self, io: &mut impl Io, bytes: &[u8]) -> Result<bool, Error> {
+    async fn gid_management(&mut self, io: &mut impl Io, bytes: &[u8]) -> Result<bool, Error> {
         let (Some(b), Some(ap)) = (self.bfee, self.peer.as_ref().map(|p| p.bss.bssid)) else {
             return Ok(false);
         };
@@ -2416,17 +2420,19 @@ impl State {
             return Ok(false);
         };
         if g != self.mu_group {
-            super::bf::set_gid(io, &g)?;
+            super::bf::set_gid(io, &g).await?;
             self.mu_group = g;
         }
         Ok(true)
     }
-    pub(super) fn send(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
+    pub(super) async fn send(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         let admission = self.admission.clone();
-        let result = admission
-            .run(|| Ok(self.send_inner(io, frame)))
-            .map_err(Error::Native)
-            .and_then(|result| result);
+        let result = crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+            Ok(self.send_inner(io, frame).await)
+        })
+        .await
+        .map_err(Error::Native)
+        .and_then(|result| result);
         // Closure happens after run releases the publication lock; stopping
         // inside it would re-enter that lock. Fatal native/key errors cannot
         // leave established metadata visible until an unrelated later poll.
@@ -2510,7 +2516,7 @@ impl State {
         self.data_profile = p;
         Ok(())
     }
-    fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
+    async fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         self.coding_live(io)?;
         self.qos_live(io)?;
         self.fallback_live(io)?;
@@ -2524,7 +2530,7 @@ impl State {
             self.tx_ba.want(tid, g.tids());
         }
         if self.tx_ba.active(tid).is_some() {
-            self.send_batch_inner(io, &[frame])?;
+            alloc::boxed::Box::pin(self.send_batch_inner(io, &[frame])).await?;
             return Ok(());
         }
         if !self.ready() || !io.packet_ready() {

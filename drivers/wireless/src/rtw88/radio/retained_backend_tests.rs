@@ -75,16 +75,16 @@ unsafe impl Registers for Port {
         Io::claim_pristine(&mut self.radio)
     }
     fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        Io::read8(&mut self.radio, r)
+        crate::rtw88::firmware_transport::now(Io::read8(&mut self.radio, r))
     }
     fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        Io::read16(&mut self.radio, r)
+        crate::rtw88::firmware_transport::now(Io::read16(&mut self.radio, r))
     }
     fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        Io::read32(&mut self.radio, r)
+        crate::rtw88::firmware_transport::now(Io::read32(&mut self.radio, r))
     }
     fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        Io::write8(&mut self.radio, r, v)?;
+        crate::rtw88::firmware_transport::now(Io::write8(&mut self.radio, r, v))?;
         if r == 0x383 && v & 16 != 0 {
             let ring = self.ring.lock();
             let frame = self.frame.lock();
@@ -97,14 +97,14 @@ unsafe impl Registers for Port {
         Ok(())
     }
     fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        Io::write16(
+        crate::rtw88::firmware_transport::now(Io::write16(
             &mut self.radio,
             r,
             if r == 0x204 { v & !(1 << 15) } else { v },
-        )
+        ))
     }
     fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        Io::write32(&mut self.radio, r, v)
+        crate::rtw88::firmware_transport::now(Io::write32(&mut self.radio, r, v))
     }
     async fn delay_us(&mut self, us: u64) {
         Io::delay_us(&mut self.radio, us).await;

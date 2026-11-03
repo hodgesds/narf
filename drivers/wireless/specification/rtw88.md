@@ -2998,16 +2998,42 @@ Not admitted. No USB driver is registered for these IDs (rtl8xxxu's
 detection-only probe still claims 0bda:c811), and no station, band or TX
 grant is published. Remaining blockers, verified against the tree:
 
-1. Synchronous register contract. Every retained C21 stage (`mac.rs`,
-   `phy/rtl8821c.rs`, `calibration8821c.rs`, `radio8821c.rs`, `station*.rs`)
-   uses `firmware_transport::Io`, whose `read*`/`write*` are synchronous
-   (MMIO). NARF USB control transfers are async only
-   (`Xhci::control_{in,out}_generation`), and `block_on`/`block_on_spin`
-   panic inside an executor poll (AGENTS.md). Linux's `usb_control_msg`
-   sleeps synchronously. Running those stages over USB needs either an async
-   `Io` or a maintainer-approved synchronous polled EP0 primitive in
-   `drivers/usb`. Neither exists, and hand-rolling a noop-waker spin here is
-   not acceptable.
+1. Register contract (resolved: asynchronous `Io`). `firmware_transport::Io`
+   `read8/16/32` and `write8/16/32` return `impl Future + Send` (RPITIT, not
+   boxed), and every retained stage that touches them is async: `mac.rs`,
+   `phy.rs`/`phy/rtl8821c.rs`, `calibration8821c.rs`/`radio8821c.rs`,
+   `operating8821c.rs`, `radio.rs`, `dack.rs`, `dpk.rs`, `dm.rs`, `ht*.rs`,
+   `vht.rs`, `bf.rs`, `security_cam.rs`, `station*.rs`, `wmm.rs`,
+   `tx_ba.rs`/`rx_ba.rs`, `tracking8821c/program.rs`, `runtime_lps.rs` and
+   `wow.rs`/`wow_owner.rs` (`wow::Io` follows the same shape). C22 uses the
+   same converted stages. The PCI backend (`reserved_page::Backend` over the
+   synchronous `reserved_page::Registers`) returns futures that complete in
+   their first poll, so its MMIO byte stream and order are unchanged; a USB
+   backend implements the same trait with real EP0 transfers. No synchronous
+   polled EP0 primitive is added. Supporting rules:
+   - `firmware_transport::enclosed(wrap, operation)` replaces each
+     synchronous enclosure around register work (`Grant::invoke`,
+     `Envelope::invoke`, `Admission::run`, `dm::Authority::run`,
+     `tracking8821c::Grant::authority`, ...). The operation's first poll runs
+     inside `wrap`, so a PCI operation executes wholly inside the enclosure as
+     before; an operation still in flight (USB) continues outside and its
+     completion re-enters `wrap`, so revocation or `Admission::close` during a
+     transfer voids the result instead of returning it.
+   - Readbacks (`ht::Grant::readback*`, `radio8821c::operating_readback*`,
+     `ht40::check_power`, `vht::check_power`, `wmm::readback*`,
+     `tracking8821c::Grant::read_program`) take a `firmware_transport::Read32`
+     (`IoRead32`, `RadioRead32`, or `Sampled` for a synchronous PCI sampler)
+     rather than a borrowing closure.
+   - Synchronous PCI entry points that drive the converted station
+     (`pci_firmware.rs` `station_profile_readback` and peers,
+     `interface.rs` `progress`/`set_rts_threshold`, `station.rs::stop`'s
+     best-effort beamformee removal) use `firmware_transport::ready_now`,
+     which refuses (`Error::State`) a future that does not complete in one
+     poll instead of spinning. A USB owner must drive those paths from an
+     async worker; that is part of blocker 2.
+   - The HT path-switch RX-DMA idle wait (`ht.rs::program`) samples through
+     the gate every executor turn for the same 10 ms bound, instead of a
+     synchronous `responsive_spin_until`.
 2. Packet path. `packet_core::Port` is shaped around PCI TXBD/RXBD rings
    (`index`, `publish`, `tx_descriptor`, `rx_descriptor`, `rx_repost`). A USB
    port needs a queue/URB-shaped port built from `aggregate`/`split_rx`, with

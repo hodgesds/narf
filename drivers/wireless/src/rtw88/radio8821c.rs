@@ -49,45 +49,45 @@ pub(super) const fn rf18_for(channel: u8, bw_mhz: u8) -> u32 {
 }
 /// `channel` is the committed 20MHz primary whose RF18 the retune (or the
 /// channel-1 base program) left in place.
-pub(super) fn operating_readback(
-    read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn operating_readback(
+    read: impl super::firmware_transport::Read32,
     indices: [u8; 12],
     channel: u8,
 ) -> Result<(), Error> {
-    operating_readback_ht(read, indices, [0; 8], channel)
+    operating_readback_ht(read, indices, [0; 8], channel).await
 }
-pub(super) fn operating_readback_ht(
-    read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn operating_readback_ht(
+    read: impl super::firmware_transport::Read32,
     indices: [u8; 12],
     mcs: [u8; 8],
     channel: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, [0; 12], rf18_for(channel, 20))
+    operating_readback_rf18(read, indices, mcs, [0; 12], rf18_for(channel, 20)).await
 }
 /// [`operating_readback_ht`] at the N2xB 40MHz pair: HT words are the HT40
 /// selection and RF18 is BW40 (bit11) on the center channel.
-pub(super) fn operating_readback_wide(
-    read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn operating_readback_wide(
+    read: impl super::firmware_transport::Read32,
     indices: [u8; 12],
     mcs: [u8; 8],
     center: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, [0; 12], rf18_for(center, 40))
+    operating_readback_rf18(read, indices, mcs, [0; 12], rf18_for(center, 40)).await
 }
 /// [`operating_readback_ht`] at the N2xV 80MHz block: HT words keep the HT20
 /// selection, the VHT words 0x1d2c..0x1d34 carry the record's VHT1SS
 /// MCS0..9 (`vht::write_power`) and RF18 is BW80 (bit10) on the center.
-pub(super) fn operating_readback_vht(
-    read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn operating_readback_vht(
+    read: impl super::firmware_transport::Read32,
     indices: [u8; 12],
     mcs: [u8; 8],
     vht: [u8; 12],
     center: u8,
 ) -> Result<(), Error> {
-    operating_readback_rf18(read, indices, mcs, vht, rf18_for(center, 80))
+    operating_readback_rf18(read, indices, mcs, vht, rf18_for(center, 80)).await
 }
-fn operating_readback_rf18(
-    mut read: impl FnMut(u16) -> Result<u32, Error>,
+async fn operating_readback_rf18(
+    mut read: impl super::firmware_transport::Read32,
     indices: [u8; 12],
     mcs: [u8; 8],
     vht: [u8; 12],
@@ -113,15 +113,15 @@ fn operating_readback_rf18(
                     .map_err(|_| Error::State)?,
             )
         };
-        if read(reg)? != expected {
+        if read.read32(reg).await? != expected {
             return Err(Error::Prerequisite);
         }
     }
-    if read(0x2860)? & 0x70fff != rf18
-        || read(0x2820)? & 0xfffff != 0
-        || read(0x1bf0)? & 0x100ff != 0
-        || read(0x100)? & 0x200 != 0
-        || read(0x680)? & 0xcf != 0
+    if read.read32(0x2860).await? & 0x70fff != rf18
+        || read.read32(0x2820).await? & 0xfffff != 0
+        || read.read32(0x1bf0).await? & 0x100ff != 0
+        || read.read32(0x100).await? & 0x200 != 0
+        || read.read32(0x680).await? & 0xcf != 0
     {
         return Err(Error::Prerequisite);
     }
@@ -156,15 +156,15 @@ pub(super) fn bind_recipe(hash: &mut narf_crypto::sha256::Sha256) {
     hash.update(&[0, 3, 6, 9]); // raw factory swing bins; no erased fallback.
     hash.update(&[0x00, 0x02, 0x6a, 0x01, 0x01, 0x01, 0xb6, 0x00]); // 0x200,16a,101,b6
 }
-fn read(io: &mut impl Io, reg: u16) -> Result<u32, Error> {
-    let value = io.read32(reg)?;
+async fn read(io: &mut impl Io, reg: u16) -> Result<u32, Error> {
+    let value = io.read32(reg).await?;
     if value == u32::MAX {
         Err(Error::Gone)
     } else {
         Ok(value)
     }
 }
-fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
+async fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
     if bits == 0
         || value
             .checked_shl(bits.trailing_zeros())
@@ -172,11 +172,12 @@ fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> 
     {
         return Err(Error::Unsupported);
     }
-    let old = read(io, reg)?;
+    let old = read(io, reg).await?;
     io.write32(reg, (old & !bits) | (value << bits.trailing_zeros()))
+        .await
 }
-pub(super) fn rf_read(io: &mut impl Io, address: u8) -> Result<u32, Error> {
-    Ok(read(io, 0x2800 + u16::from(address) * 4)? & 0xfffff)
+pub(super) async fn rf_read(io: &mut impl Io, address: u8) -> Result<u32, Error> {
+    Ok(read(io, 0x2800 + u16::from(address) * 4).await? & 0xfffff)
 }
 pub(super) async fn rf(io: &mut impl Io, address: u8, bits: u32, value: u32) -> Result<(), Error> {
     if bits == 0
@@ -190,19 +191,19 @@ pub(super) async fn rf(io: &mut impl Io, address: u8, bits: u32, value: u32) -> 
     let data = if bits == 0xfffff {
         value
     } else {
-        (rf_read(io, address)? & !bits) | (value << bits.trailing_zeros())
+        (rf_read(io, address).await? & !bits) | (value << bits.trailing_zeros())
     };
-    io.write32(0xc90, (u32::from(address) << 20) | data)?;
+    io.write32(0xc90, (u32::from(address) << 20) | data).await?;
     io.delay_us(13).await;
     // These channel/XTAL/control registers have stable fields. SIPI issuance
     // alone cannot establish that the chosen channel/calibration setup stuck.
-    if rf_read(io, address)? & bits != data & bits {
+    if rf_read(io, address).await? & bits != data & bits {
         return Err(Error::Prerequisite);
     }
     Ok(())
 }
-fn temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8, Error> {
-    let value = ((rf_read(io, 0x42)? & 0xfc00) >> 10) as u8;
+async fn temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8, Error> {
+    let value = ((rf_read(io, 0x42).await? & 0xfc00) >> 10) as u8;
     envelope
         .temperature(value)
         .map_err(Error::Calibration8821c)?;
@@ -213,11 +214,12 @@ fn temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8, Error> {
 /// There is no documented conversion-done bit: preserve that source wait,
 /// then read the actual meter. A cached pre-trigger value is no fresh sample.
 async fn convert_temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8, Error> {
-    let old = rf_read(io, 0x42)?;
-    io.write32(0xc90, (0x42 << 20) | (old & !0x30000) | 0x30000)?;
+    let old = rf_read(io, 0x42).await?;
+    io.write32(0xc90, (0x42 << 20) | (old & !0x30000) | 0x30000)
+        .await?;
     io.delay_us(13).await;
     io.delay_us(2_000_000).await;
-    temperature(io, envelope)
+    temperature(io, envelope).await
 }
 async fn channel(
     io: &mut impl Io,
@@ -225,46 +227,46 @@ async fn channel(
     phy: phy8821c::Info,
 ) -> Result<u16, Error> {
     for (reg, bits, value) in BB_2G {
-        mask(io, reg, bits, value)?;
+        mask(io, reg, bits, value).await?;
     }
-    io.write32(0xa24, phy.channel_filters[0])?;
-    mask(io, 0xa28, 0xffff, phy.channel_filters[1] & 0xffff)?;
-    io.write32(0xaac, phy.channel_filters[2])?;
-    let adc = read(io, 0x8ac)?;
-    io.write32(0x8ac, (adc & 0xffcffc00) | 0x10010000)?;
-    mask(io, 0x8c4, 1 << 30, 1)?;
+    io.write32(0xa24, phy.channel_filters[0]).await?;
+    mask(io, 0xa28, 0xffff, phy.channel_filters[1] & 0xffff).await?;
+    io.write32(0xaac, phy.channel_filters[2]).await?;
+    let adc = read(io, 0x8ac).await?;
+    io.write32(0x8ac, (adc & 0xffcffc00) | 0x10010000).await?;
+    mask(io, 0x8c4, 1 << 30, 1).await?;
     let swing = [0x200u16, 0x16a, 0x101, 0xb6][usize::from(factory.swing_2g() / 3)];
-    mask(io, 0xc1c, 0xffe00000, u32::from(swing))?;
+    mask(io, 0xc1c, 0xffe00000, u32::from(swing)).await?;
     // rtw_set_channel_mac: no sideband for20MHz, source80MHz MAC clock.
-    io.write8(0x483, 0)?;
-    mask(io, 0x668, 0x180, 0)?;
-    mask(io, 0x24, 3 << 20, 0)?;
-    io.write8(0x55c, 80)?;
-    io.write8(0x638, 80)?;
-    let cck = io.read8(0x454)?;
+    io.write8(0x483, 0).await?;
+    mask(io, 0x668, 0x180, 0).await?;
+    mask(io, 0x24, 3 << 20, 0).await?;
+    io.write8(0x55c, 80).await?;
+    io.write8(0x638, 80).await?;
+    let cck = io.read8(0x454).await?;
     if cck == 255 {
         return Err(Error::Gone);
     }
-    io.write8(0x454, cck & !0x80)?;
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(1, 20);
-    mask(io, 0x1080, 1 << 16, 1)?;
-    mask(io, 0, 1 << 26, 1)?;
+    io.write8(0x454, cck & !0x80).await?;
+    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(1, 20);
+    mask(io, 0x1080, 1 << 16, 1).await?;
+    mask(io, 0, 1 << 26, 1).await?;
     let btg = matches!(phy.rfe, 2 | 4);
-    mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 })?;
-    mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 })?;
-    mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 })?;
+    mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 }).await?;
+    mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 }).await?;
+    mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 }).await?;
     rf(io, 0xdf, 1 << 6, 1).await?;
     rf(io, 0x64, 15, 15).await?;
     rf(io, 0x18, 0xfffff, rf18).await?;
     rf(io, 0xb8, 1 << 19, 0).await?;
     rf(io, 0xb8, 1 << 19, 1).await?;
     for (reg, bits, value) in DFIR {
-        mask(io, reg, bits, value)?;
+        mask(io, reg, bits, value).await?;
     }
     for reg in TXAGC {
-        io.write32(reg, 0)?;
+        io.write32(reg, 0).await?;
     }
-    verify_channel(io, swing, btg)?;
+    verify_channel(io, swing, btg).await?;
     Ok(swing)
 }
 /// Linux `rtw8821c_set_channel` retune between 2.4GHz/20MHz primaries on the
@@ -276,7 +278,7 @@ pub(super) async fn retune_channel(io: &mut impl Io, ch: u8) -> Result<(), Error
     if !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(ch, 20);
+    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(ch, 20);
     rf(io, 0xdf, 1 << 6, 1).await?;
     rf(io, 0x64, 15, 15).await?;
     rf(io, 0x18, 0xfffff, rf18).await?;
@@ -407,45 +409,46 @@ async fn set_channel(
             (0xc1c, 0xf00, txscale),
             (0x860, 0x1ffe0000, clktrk),
         ] {
-            mask(io, reg, bits, value)?;
+            mask(io, reg, bits, value).await?;
         }
     } else {
         for (reg, bits, value) in BB_2G {
-            mask(io, reg, bits, value)?;
+            mask(io, reg, bits, value).await?;
         }
-        io.write32(0xa24, facts.filters[0])?;
-        mask(io, 0xa28, 0xffff, facts.filters[1] & 0xffff)?;
-        io.write32(0xaac, facts.filters[2])?;
+        io.write32(0xa24, facts.filters[0]).await?;
+        mask(io, 0xa28, 0xffff, facts.filters[1] & 0xffff).await?;
+        io.write32(0xaac, facts.filters[2]).await?;
     }
     if let Width::Forty(sc) = width {
-        mask(io, 0xa00, 1 << 4, u32::from(sc == 1))?;
+        mask(io, 0xa00, 1 << 4, u32::from(sc == 1)).await?;
     }
-    let adc = read(io, 0x8ac)?;
-    io.write32(0x8ac, adcclk(adc, width))?;
-    mask(io, 0x8c4, 1 << 30, 1)?;
-    mask(io, 0xc1c, 0xffe00000, u32::from(swing))?;
-    io.write8(0x483, width.data_sc())?;
-    mask(io, 0x668, 0x180, width.rfmod())?;
-    mask(io, 0x24, 3 << 20, 0)?;
-    io.write8(0x55c, 80)?;
-    io.write8(0x638, 80)?;
-    let cck = io.read8(0x454)?;
+    let adc = read(io, 0x8ac).await?;
+    io.write32(0x8ac, adcclk(adc, width)).await?;
+    mask(io, 0x8c4, 1 << 30, 1).await?;
+    mask(io, 0xc1c, 0xffe00000, u32::from(swing)).await?;
+    io.write8(0x483, width.data_sc()).await?;
+    mask(io, 0x668, 0x180, width.rfmod()).await?;
+    mask(io, 0x24, 3 << 20, 0).await?;
+    io.write8(0x55c, 80).await?;
+    io.write8(0x638, 80).await?;
+    let cck = io.read8(0x454).await?;
     if cck == 255 {
         return Err(Error::Gone);
     }
-    io.write8(0x454, (cck & !0x80) | u8::from(five) << 7)?;
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(ch, width.mhz());
-    mask(io, 0x1080, 1 << 16, 1)?;
-    mask(io, 0, 1 << 26, 1)?;
+    io.write8(0x454, (cck & !0x80) | u8::from(five) << 7)
+        .await?;
+    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(ch, width.mhz());
+    mask(io, 0x1080, 1 << 16, 1).await?;
+    mask(io, 0, 1 << 26, 1).await?;
     if five {
         // SWITCH_TO_WLA: RFECTL WL|WLA, BTG/CTRL/WLG clear; CCA/LNA kept.
-        mask(io, 0xcb8, 0xf50000, 0xd0)?;
+        mask(io, 0xcb8, 0xf50000, 0xd0).await?;
         rf(io, 0xdf, 1 << 6, 0).await?;
     } else {
         let btg = facts.btg;
-        mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 })?;
-        mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 })?;
-        mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 })?;
+        mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 }).await?;
+        mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 }).await?;
+        mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 }).await?;
         rf(io, 0xdf, 1 << 6, 1).await?;
         rf(io, 0x64, 15, 15).await?;
     }
@@ -453,22 +456,26 @@ async fn set_channel(
     rf(io, 0xb8, 1 << 19, 0).await?;
     rf(io, 0xb8, 1 << 19, 1).await?;
     for (reg, bits, value) in rxdfir(width) {
-        mask(io, reg, bits, value)?;
+        mask(io, reg, bits, value).await?;
     }
     Ok(swing)
 }
 /// Readback of [`set_channel20`] (band-dependent fields, RF18, swing).
-pub(super) fn verify_channel20(io: &mut impl Io, ch: u8, facts: &BandFacts) -> Result<(), Error> {
+pub(super) async fn verify_channel20(
+    io: &mut impl Io,
+    ch: u8,
+    facts: &BandFacts,
+) -> Result<(), Error> {
     let swing = facts.swing(ch)?;
     if !super::band5::primary(ch) {
-        verify_geometry_at(io, ch, swing, facts.btg)?;
+        verify_geometry_at(io, ch, swing, facts.btg).await?;
         // Fields a preceding 5GHz program changed.
-        if read(io, 0x808)? & (1 << 28) == 0
-            || read(io, 0xa80)? & (1 << 18) != 0
-            || io.read8(0x454)? & 0x80 != 0
-            || (read(io, 0xc1c)? >> 8) & 15 != 0
-            || (read(io, 0x860)? >> 17) & 0xfff != 0x96a
-            || rf_read(io, 0xdf)? & (1 << 6) == 0
+        if read(io, 0x808).await? & (1 << 28) == 0
+            || read(io, 0xa80).await? & (1 << 18) != 0
+            || io.read8(0x454).await? & 0x80 != 0
+            || (read(io, 0xc1c).await? >> 8) & 15 != 0
+            || (read(io, 0x860).await? >> 17) & 0xfff != 0x96a
+            || rf_read(io, 0xdf).await? & (1 << 6) == 0
         {
             return Err(Error::Prerequisite);
         }
@@ -476,16 +483,16 @@ pub(super) fn verify_channel20(io: &mut impl Io, ch: u8, facts: &BandFacts) -> R
     }
     let txscale = super::band5::txscale8821c(ch).ok_or(Error::Unsupported)?;
     let clktrk = super::band5::clktrk8821c(ch).ok_or(Error::Unsupported)?;
-    if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20)
-        || rf_read(io, 0xdf)? & (1 << 6) != 0
-        || read(io, 0xc1c)? >> 21 != u32::from(swing)
-        || (read(io, 0xc1c)? >> 8) & 15 != txscale
-        || (read(io, 0x860)? >> 17) & 0xfff != clktrk
-        || read(io, 0xa80)? & (1 << 18) == 0
-        || read(io, 0x808)? & (1 << 28) != 0
-        || io.read8(0x454)? & 0x80 == 0
-        || read(io, 0x8ac)? & (!0xffcffc00 | 0x10010000) != 0x10010000
-        || read(io, 0xcb8)? & 0xf50000 != 0xd00000
+    if rf_read(io, 0x18).await? & 0x70fff != rf18_for(ch, 20)
+        || rf_read(io, 0xdf).await? & (1 << 6) != 0
+        || read(io, 0xc1c).await? >> 21 != u32::from(swing)
+        || (read(io, 0xc1c).await? >> 8) & 15 != txscale
+        || (read(io, 0x860).await? >> 17) & 0xfff != clktrk
+        || read(io, 0xa80).await? & (1 << 18) == 0
+        || read(io, 0x808).await? & (1 << 28) != 0
+        || io.read8(0x454).await? & 0x80 == 0
+        || read(io, 0x8ac).await? & (!0xffcffc00 | 0x10010000) != 0x10010000
+        || read(io, 0xcb8).await? & 0xf50000 != 0xd00000
     {
         return Err(Error::Prerequisite);
     }
@@ -494,7 +501,7 @@ pub(super) fn verify_channel20(io: &mut impl Io, ch: u8, facts: &BandFacts) -> R
 /// Readback of [`wide5`]: RF18 at the center and width, the center's
 /// 5GHz head, swing, `set_bw` ADCCLK/RXSB, MAC DATA_SC/RFMOD, WLA and
 /// `_rxdfir`.
-pub(super) fn verify_wide5(
+pub(super) async fn verify_wide5(
     io: &mut impl Io,
     center: u8,
     width: Width,
@@ -504,25 +511,25 @@ pub(super) fn verify_wide5(
     let txscale = super::band5::txscale8821c(center).ok_or(Error::Unsupported)?;
     let clktrk = super::band5::clktrk8821c(center).ok_or(Error::Unsupported)?;
     if width == Width::Twenty
-        || rf_read(io, 0x18)? & 0x70fff != rf18_for(center, width.mhz())
-        || rf_read(io, 0xdf)? & (1 << 6) != 0
-        || read(io, 0xc1c)? >> 21 != u32::from(swing)
-        || (read(io, 0xc1c)? >> 8) & 15 != txscale
-        || (read(io, 0x860)? >> 17) & 0xfff != clktrk
-        || read(io, 0xa80)? & (1 << 18) == 0
-        || read(io, 0x808)? & (1 << 28) != 0
-        || io.read8(0x454)? & 0x80 == 0
-        || read(io, 0x8ac)? & adcclk_mask(width) != adcclk(0, width) & adcclk_mask(width)
-        || read(io, 0x8c4)? & (1 << 30) == 0
-        || io.read8(0x483)? != width.data_sc()
-        || (read(io, 0x668)? >> 7) & 3 != width.rfmod()
-        || read(io, 0xcb8)? & 0xf50000 != 0xd00000
-        || matches!(width, Width::Forty(sc) if (read(io, 0xa00)? >> 4) & 1 != u32::from(sc == 1))
+        || rf_read(io, 0x18).await? & 0x70fff != rf18_for(center, width.mhz())
+        || rf_read(io, 0xdf).await? & (1 << 6) != 0
+        || read(io, 0xc1c).await? >> 21 != u32::from(swing)
+        || (read(io, 0xc1c).await? >> 8) & 15 != txscale
+        || (read(io, 0x860).await? >> 17) & 0xfff != clktrk
+        || read(io, 0xa80).await? & (1 << 18) == 0
+        || read(io, 0x808).await? & (1 << 28) != 0
+        || io.read8(0x454).await? & 0x80 == 0
+        || read(io, 0x8ac).await? & adcclk_mask(width) != adcclk(0, width) & adcclk_mask(width)
+        || read(io, 0x8c4).await? & (1 << 30) == 0
+        || io.read8(0x483).await? != width.data_sc()
+        || (read(io, 0x668).await? >> 7) & 3 != width.rfmod()
+        || read(io, 0xcb8).await? & 0xf50000 != 0xd00000
+        || matches!(width, Width::Forty(sc) if (read(io, 0xa00).await? >> 4) & 1 != u32::from(sc == 1))
     {
         return Err(Error::Prerequisite);
     }
     for (reg, bits, value) in rxdfir(width) {
-        if read(io, reg)? & bits != value << bits.trailing_zeros() {
+        if read(io, reg).await? & bits != value << bits.trailing_zeros() {
             return Err(Error::Prerequisite);
         }
     }
@@ -538,24 +545,25 @@ pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
     if !(3..=11).contains(&center) || !matches!(sc, 1 | 2) {
         return Err(Error::Unsupported);
     }
-    mask(io, 0xa00, 1 << 4, u32::from(sc == 1))?;
-    let adc = read(io, 0x8ac)?;
+    mask(io, 0xa00, 1 << 4, u32::from(sc == 1)).await?;
+    let adc = read(io, 0x8ac).await?;
     io.write32(
         0x8ac,
         (adc & 0xff3ff300) | 0x20020000 | u32::from(sc) << 2 | 1,
-    )?;
-    mask(io, 0x8c4, 1 << 30, 1)?;
-    io.write8(0x483, sc)?;
-    mask(io, 0x668, 0x180, 1)?;
-    mask(io, 0x24, 3 << 20, 0)?;
-    io.write8(0x55c, 80)?;
-    io.write8(0x638, 80)?;
-    let cck = io.read8(0x454)?;
+    )
+    .await?;
+    mask(io, 0x8c4, 1 << 30, 1).await?;
+    io.write8(0x483, sc).await?;
+    mask(io, 0x668, 0x180, 1).await?;
+    mask(io, 0x24, 3 << 20, 0).await?;
+    io.write8(0x55c, 80).await?;
+    io.write8(0x638, 80).await?;
+    let cck = io.read8(0x454).await?;
     if cck == 255 {
         return Err(Error::Gone);
     }
-    io.write8(0x454, cck & !0x80)?;
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(center, 40);
+    io.write8(0x454, cck & !0x80).await?;
+    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(center, 40);
     rf(io, 0xdf, 1 << 6, 1).await?;
     rf(io, 0x64, 15, 15).await?;
     rf(io, 0x18, 0xfffff, rf18).await?;
@@ -567,24 +575,25 @@ pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
         (0xc20, 1 << 31, 0),
         (0x8f0, 1 << 31, 0),
     ] {
-        mask(io, reg, bits, value)?;
+        mask(io, reg, bits, value).await?;
     }
     Ok(())
 }
 /// Readback of [`width40`].
-pub(super) fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != rf18_for(center, 40)
-        || (read(io, 0xa00)? >> 4) & 1 != u32::from(sc == 1)
-        || read(io, 0x8ac)? & (!0xff3ff300 | 0x20020000) != 0x20020000 | u32::from(sc) << 2 | 1
-        || read(io, 0x8c4)? & (1 << 30) == 0
-        || io.read8(0x483)? != sc
-        || read(io, 0x668)? & 0x180 != 0x80
-        || read(io, 0x948)? & (3 << 28) != 2 << 28
-        || read(io, 0x94c)? & (3 << 28) != 2 << 28
-        || read(io, 0xc20)? & (1 << 31) != 0
-        || read(io, 0x8f0)? & (1 << 31) != 0
-        || read(io, 0x440)? != 0x1f
-        || read(io, 0x1bf0)? & 0x100ff != 0
+pub(super) async fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
+    if rf_read(io, 0x18).await? & 0x70fff != rf18_for(center, 40)
+        || (read(io, 0xa00).await? >> 4) & 1 != u32::from(sc == 1)
+        || read(io, 0x8ac).await? & (!0xff3ff300 | 0x20020000)
+            != 0x20020000 | u32::from(sc) << 2 | 1
+        || read(io, 0x8c4).await? & (1 << 30) == 0
+        || io.read8(0x483).await? != sc
+        || read(io, 0x668).await? & 0x180 != 0x80
+        || read(io, 0x948).await? & (3 << 28) != 2 << 28
+        || read(io, 0x94c).await? & (3 << 28) != 2 << 28
+        || read(io, 0xc20).await? & (1 << 31) != 0
+        || read(io, 0x8f0).await? & (1 << 31) != 0
+        || read(io, 0x440).await? != 0x1f
+        || read(io, 0x1bf0).await? & 0x100ff != 0
     {
         return Err(Error::Prerequisite);
     }
@@ -592,7 +601,7 @@ pub(super) fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(),
 }
 /// `rtw8821c_set_tx_power_index_by_rate` for the retained CCK/OFDM words;
 /// HT/VHT words stay zero (no HT program on a noninitial channel).
-pub(super) fn write_txagc(io: &mut impl Io, indices: [u8; 12]) -> Result<(), Error> {
+pub(super) async fn write_txagc(io: &mut impl Io, indices: [u8; 12]) -> Result<(), Error> {
     for (slot, reg) in TXAGC.into_iter().enumerate() {
         let value = if slot < 3 {
             u32::from_le_bytes(
@@ -603,19 +612,27 @@ pub(super) fn write_txagc(io: &mut impl Io, indices: [u8; 12]) -> Result<(), Err
         } else {
             0
         };
-        io.write32(reg, value)?;
+        io.write32(reg, value).await?;
     }
     Ok(())
 }
-pub(super) fn verify_retune(io: &mut impl Io, ch: u8, indices: [u8; 12]) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20) {
+pub(super) async fn verify_retune(
+    io: &mut impl Io,
+    ch: u8,
+    indices: [u8; 12],
+) -> Result<(), Error> {
+    if rf_read(io, 0x18).await? & 0x70fff != rf18_for(ch, 20) {
         return Err(Error::Prerequisite);
     }
-    verify_txagc(io, indices, 0x1f)
+    verify_txagc(io, indices, 0x1f).await
 }
 /// TXAGC words of [`write_txagc`], REG_RRSR `rrsr` and the clean IQK
 /// report (0x1bf0).
-pub(super) fn verify_txagc(io: &mut impl Io, indices: [u8; 12], rrsr: u32) -> Result<(), Error> {
+pub(super) async fn verify_txagc(
+    io: &mut impl Io,
+    indices: [u8; 12],
+    rrsr: u32,
+) -> Result<(), Error> {
     for (slot, reg) in TXAGC.into_iter().enumerate() {
         let expected = if slot < 3 {
             u32::from_le_bytes(
@@ -626,37 +643,37 @@ pub(super) fn verify_txagc(io: &mut impl Io, indices: [u8; 12], rrsr: u32) -> Re
         } else {
             0
         };
-        if read(io, reg)? != expected {
+        if read(io, reg).await? != expected {
             return Err(Error::Prerequisite);
         }
     }
-    if read(io, 0x440)? != rrsr || read(io, 0x1bf0)? & 0x100ff != 0 {
+    if read(io, 0x440).await? != rrsr || read(io, 0x1bf0).await? & 0x100ff != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())
 }
-fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
-    verify_geometry(io, swing, btg)?;
+async fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
+    verify_geometry(io, swing, btg).await?;
     for reg in TXAGC {
-        if read(io, reg)? != 0 {
+        if read(io, reg).await? != 0 {
             return Err(Error::Prerequisite);
         }
     }
     Ok(())
 }
-fn verify_geometry(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
-    verify_geometry_at(io, 1, swing, btg)
+async fn verify_geometry(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
+    verify_geometry_at(io, 1, swing, btg).await
 }
 /// 2.4GHz/20MHz geometry on primary `ch`; TXPAUSE must still be 0xff.
-fn verify_geometry_at(io: &mut impl Io, ch: u8, swing: u16, btg: bool) -> Result<(), Error> {
-    if rf_read(io, 0x18)? & 0x70fff != rf18_for(ch, 20)
-        || read(io, 0xc1c)? >> 21 != u32::from(swing)
-        || read(io, 0x8ac)? & (!0xffcffc00 | 0x10010000) != 0x10010000
-        || read(io, 0xcb8)? & 0xf50000 != if btg { 0x10000 } else { 0x700000 }
-        || read(io, 0xa84)? & 0xff0000 != if btg { 0xe0000 } else { 0x120000 }
-        || read(io, 0xa80)? & 0xffff != if btg { 0xfc84 } else { 0x7532 }
-        || io.read8(0x100)? & 0xcc != 0
-        || io.read8(0x522)? != 255
+async fn verify_geometry_at(io: &mut impl Io, ch: u8, swing: u16, btg: bool) -> Result<(), Error> {
+    if rf_read(io, 0x18).await? & 0x70fff != rf18_for(ch, 20)
+        || read(io, 0xc1c).await? >> 21 != u32::from(swing)
+        || read(io, 0x8ac).await? & (!0xffcffc00 | 0x10010000) != 0x10010000
+        || read(io, 0xcb8).await? & 0xf50000 != if btg { 0x10000 } else { 0x700000 }
+        || read(io, 0xa84).await? & 0xff0000 != if btg { 0xe0000 } else { 0x120000 }
+        || read(io, 0xa80).await? & 0xffff != if btg { 0xfc84 } else { 0x7532 }
+        || io.read8(0x100).await? & 0xcc != 0
+        || io.read8(0x522).await? != 255
     {
         return Err(Error::Prerequisite);
     }
@@ -685,19 +702,20 @@ pub(super) async fn prepare_station(
     io.begin_station8821c()?;
     // C21's exact channel/RFE setup is retained from its completed IQK. Do
     // not replay the channel helper here: it deliberately zeros all TXAGC.
-    verify_geometry(&mut io, iqk.swing, matches!(phy.rfe, 2 | 4))?;
-    if read(&mut io, 0xf0)? >> 12 & 15 != u32::from(phy.cut)
-        || rf_read(&mut io, 8)? != 0
-        || read(&mut io, 0x1bf0)? & 0x100ff != 0
+    verify_geometry(&mut io, iqk.swing, matches!(phy.rfe, 2 | 4)).await?;
+    if read(&mut io, 0xf0).await? >> 12 & 15 != u32::from(phy.cut)
+        || rf_read(&mut io, 8).await? != 0
+        || read(&mut io, 0x1bf0).await? & 0x100ff != 0
         || factory.mac() != grant.own()
     {
         return Err(Error::Prerequisite);
     }
-    let old = rf_read(&mut io, 0x42)?;
-    io.write32(0xc90, (0x42 << 20) | (old & !0x30000) | 0x30000)?;
+    let old = rf_read(&mut io, 0x42).await?;
+    io.write32(0xc90, (0x42 << 20) | (old & !0x30000) | 0x30000)
+        .await?;
     io.delay_us(13).await;
     io.delay_us(2_000_000).await;
-    let thermal = ((rf_read(&mut io, 0x42)? >> 10) & 63) as u8;
+    let thermal = ((rf_read(&mut io, 0x42).await? >> 10) & 63) as u8;
     grant.temperature(thermal)?;
     for (slot, reg) in TXAGC.into_iter().enumerate() {
         let expected = if slot < 3 {
@@ -709,26 +727,26 @@ pub(super) async fn prepare_station(
         } else {
             0
         };
-        if read(&mut io, reg)? != expected {
+        if read(&mut io, reg).await? != expected {
             return Err(Error::Prerequisite);
         }
     }
     // Source rtw8821c band switch also admits OFDM response rates. This
     // initial station uses CCK1 data/management and the same conservative
     // response mask as the existing source rtw88 legacy station profile.
-    io.write32(0x440, 0x1f)?;
+    io.write32(0x440, 0x1f).await?;
     super::radio::software_crypto(&mut io).await?;
     super::radio::awake(&mut io).await?;
-    verify_geometry(&mut io, iqk.swing, matches!(phy.rfe, 2 | 4))?;
-    if read(&mut io, 0x440)? != 0x1f
-        || io.read8(0x303)? & 0xf7 != 0xf7
-        || [0xb0, 0xb8, 0x10b8]
-            .into_iter()
-            .any(|r| io.read32(r).ok() != Some(0))
+    verify_geometry(&mut io, iqk.swing, matches!(phy.rfe, 2 | 4)).await?;
+    if read(&mut io, 0x440).await? != 0x1f
+        || io.read8(0x303).await? & 0xf7 != 0xf7
+        || io.read32(0xb0).await.ok() != Some(0)
+        || io.read32(0xb8).await.ok() != Some(0)
+        || io.read32(0x10b8).await.ok() != Some(0)
     {
         return Err(Error::Prerequisite);
     }
-    grant.temperature(((rf_read(&mut io, 0x42)? >> 10) & 63) as u8)?;
+    grant.temperature(((rf_read(&mut io, 0x42).await? >> 10) & 63) as u8)?;
     io.finish_station8821c(super::power_policy::Gate::c21(grant.clone()))?;
     Ok(StationInfo {
         channel: 1,
@@ -749,23 +767,41 @@ unsafe impl<I: Io> Io for StationChecked<'_, I> {
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Err(Error::State)
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        self.grant.invoke(|| self.io.read8(r))
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        let grant = self.grant;
+        super::firmware_transport::enclosed(move |op| grant.invoke(op), self.io.read8(r))
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        self.grant.invoke(|| self.io.read16(r))
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        let grant = self.grant;
+        super::firmware_transport::enclosed(move |op| grant.invoke(op), self.io.read16(r))
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        self.grant.invoke(|| self.io.read32(r))
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        let grant = self.grant;
+        super::firmware_transport::enclosed(move |op| grant.invoke(op), self.io.read32(r))
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.grant.invoke(|| self.io.write8(r, v))
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let grant = self.grant;
+        super::firmware_transport::enclosed(move |op| grant.invoke(op), self.io.write8(r, v))
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        self.grant.invoke(|| self.io.write16(r, v))
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let grant = self.grant;
+        super::firmware_transport::enclosed(move |op| grant.invoke(op), self.io.write16(r, v))
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.grant.invoke(|| self.io.write32(r, v))
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let grant = self.grant;
+        super::firmware_transport::enclosed(move |op| grant.invoke(op), self.io.write32(r, v))
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::State)
@@ -797,7 +833,7 @@ pub(super) async fn prepare(
     envelope: &Envelope,
 ) -> Result<Info, Error> {
     io.begin_calibration8821c()?;
-    let cfg = read(io, 0xf0)?;
+    let cfg = read(io, 0xf0).await?;
     if cfg & (1 << 27) != 0 || (cfg >> 12) & 15 != u32::from(phy.cut) {
         return Err(Error::Unsupported);
     }
@@ -805,7 +841,7 @@ pub(super) async fn prepare(
     let swing = channel(io, factory, phy).await?;
     // A stale marker cannot establish this attempt's completion. Source C21
     // clear=0 is retained; do not clear a stale done receipt to make it fresh.
-    if rf_read(io, 8)? == 0xabcde {
+    if rf_read(io, 8).await? == 0xabcde {
         return Err(Error::Prerequisite);
     }
     io.begin_commands()?;
@@ -814,8 +850,8 @@ pub(super) async fn prepare(
     super::command::send(io, &super::command::iqk8821c(2)).await?;
     let mut completed = false;
     for attempt in 0..300 {
-        temperature(io, envelope)?;
-        if rf_read(io, 8)? == 0xabcde {
+        temperature(io, envelope).await?;
+        if rf_read(io, 8).await? == 0xabcde {
             completed = true;
             break;
         }
@@ -827,14 +863,14 @@ pub(super) async fn prepare(
         return Err(Error::Timeout);
     }
     rf(io, 8, 0xfffff, 0).await?;
-    let status = read(io, 0x1bf0)?;
+    let status = read(io, 0x1bf0).await?;
     // Linux reports these diagnostics; this initial hardware-testing profile
     // additionally refuses failed or reloaded results as a fresh IQK receipt.
     if status & 0x100ff != 0 {
         return Err(Error::Prerequisite);
     }
     let thermal_after = convert_temperature(io, envelope).await?;
-    verify_channel(io, swing, matches!(phy.rfe, 2 | 4))?;
+    verify_channel(io, swing, matches!(phy.rfe, 2 | 4)).await?;
     io.park_radio()?;
     io.finish_calibration8821c()?;
     Ok(Info {
@@ -862,23 +898,56 @@ where
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Err(Error::State)
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        self.envelope.invoke(&self.policy, || self.io.read8(r))
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(move |op| envelope.invoke(policy, op), self.io.read8(r))
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        self.envelope.invoke(&self.policy, || self.io.read16(r))
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.read16(r),
+        )
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        self.envelope.invoke(&self.policy, || self.io.read32(r))
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.read32(r),
+        )
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.envelope.invoke(&self.policy, || self.io.write8(r, v))
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.write8(r, v),
+        )
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        self.envelope.invoke(&self.policy, || self.io.write16(r, v))
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.write16(r, v),
+        )
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.envelope.invoke(&self.policy, || self.io.write32(r, v))
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        let (envelope, policy) = (self.envelope, &self.policy);
+        super::firmware_transport::enclosed(
+            move |op| envelope.invoke(policy, op),
+            self.io.write32(r, v),
+        )
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::State)
