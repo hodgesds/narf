@@ -712,6 +712,8 @@ pub mod intel_gpu_context;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_cursor;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_dc_states;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_display_resources;

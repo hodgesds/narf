@@ -204,6 +204,14 @@ pub(crate) trait Platform:
     /// A fresh, checked view used only after GT startup and outside its lock.
     fn recovery_platform(&self, owned_dsb: bool, owned_cursor: bool) -> Result<Self, FsError>;
     fn recovery_complete(&self);
+    /// Display power for one KMS hardware conversation: DC5/DC6 are
+    /// exited before `Ok` and stay off until the reference drops.
+    /// Inert by default (no display-14 DC service).
+    fn display_power(&self) -> Result<crate::intel_gpu_dc_states::DcRef, FsError> {
+        Ok(crate::intel_gpu_dc_states::DcRef::none(
+            crate::intel_gpu_dc_states::DcUser::Kms,
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -519,6 +527,13 @@ impl Platform for Physical {
     fn recovery_complete(&self) {
         self.reset_lost.store(false, Ordering::Release);
     }
+    fn display_power(&self) -> Result<crate::intel_gpu_dc_states::DcRef, FsError> {
+        crate::intel_gpu_dc_states::acquire_for_bar(
+            &self.bar,
+            crate::intel_gpu_dc_states::DcUser::Kms,
+        )
+        .map_err(|_| crate::intel_gpu_user::io_error())
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -668,6 +683,8 @@ impl Display {
 pub(crate) struct Guard<'a, M: Platform> {
     device: &'a Device<M>,
     state: MutexGuard<'a, State<M>>,
+    /// DC_off for the whole session; released after the mutex.
+    _power: crate::intel_gpu_dc_states::DcRef,
 }
 
 #[derive(Debug)]
@@ -675,6 +692,7 @@ pub(crate) struct LegacyGuard<'a, M: Platform = Physical> {
     state: MutexGuard<'a, State<M>>,
     platform: &'a M,
     geometry: &'a IrqSafeSpinLock<Geometry>,
+    _power: crate::intel_gpu_dc_states::DcRef,
 }
 impl<M: Platform> LegacyGuard<'_, M> {
     pub(crate) fn suspend(&mut self) {
@@ -726,6 +744,9 @@ pub(crate) fn install(
     }
     displays.push(display.clone());
     drop(displays);
+    // Display-14 DC service: DC states exited and held off (Init) until
+    // the card worker loads the DMC program. Inert for every other IP.
+    crate::intel_gpu_dc_states::install(generation, bar, cap);
     if let Some(card) = crate::drm_registry::mode_state(index) {
         let mut card = card.lock();
         card.native_atomic = true;
@@ -759,6 +780,9 @@ pub(crate) fn display_for_bar(bar: &narf_bus::MmioRegion) -> Option<Arc<Display>
 /// outside its state guard. Busy KMS is retried on a later service iteration;
 /// no await, resource transfer or new worker is introduced.
 pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoch: u64) -> bool {
+    // Display-14 DMC acquisition/(re)load and Init/Suspend release run on
+    // the same no-lock card-worker pass; idempotent across retries.
+    crate::intel_gpu_dc_states::service_after_publication(bar);
     let Some(display) = display_for_bar(bar) else {
         return true;
     };
@@ -780,9 +804,14 @@ pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoc
     {
         return false;
     }
+    // Format qualification reads live pipe/plane state: not inside DC5/DC6.
+    let Ok(power) = display.platform.display_power() else {
+        return false;
+    };
     display
         .platform
         .publish_console_formats(&state.console, Some(epoch));
+    drop(power);
     true
 }
 
@@ -839,18 +868,26 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
     }
 }
 pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
-    crate::intel_gpu::retire_external_sst(bar).await?;
-    if let Some(display) = display_for_bar(bar) {
-        display.quiesce().await?;
+    // Display-14 suspend: DC states exited and held off for the whole
+    // preparation; the DMC program is disabled only once it succeeded.
+    crate::intel_gpu_dc_states::suspend_begin_for_bar(bar).map_err(|_| FsError::Busy)?;
+    let result = async {
+        crate::intel_gpu::retire_external_sst(bar).await?;
+        if let Some(display) = display_for_bar(bar) {
+            display.quiesce().await?;
+        }
+        if let Err(error) = crate::intel_dpcd_bl::suspend_complete_for_bar(bar).await {
+            // A failed system-PM prepare hook is not resumed by the coordinator.
+            // Attempt a fully verified replay while the original video is live;
+            // failed replay keeps the AUX owner parked with its intent retained.
+            let _ = crate::intel_dpcd_bl::resume_for_bar(bar);
+            return Err(error);
+        }
+        Ok(())
     }
-    if let Err(error) = crate::intel_dpcd_bl::suspend_complete_for_bar(bar).await {
-        // A failed system-PM prepare hook is not resumed by the coordinator.
-        // Attempt a fully verified replay while the original video is live;
-        // failed replay keeps the AUX owner parked with its intent retained.
-        let _ = crate::intel_dpcd_bl::resume_for_bar(bar);
-        return Err(error);
-    }
-    Ok(())
+    .await;
+    crate::intel_gpu_dc_states::suspend_finish_for_bar(bar, result.is_ok());
+    result
 }
 
 pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
@@ -917,6 +954,7 @@ impl<M: Platform> Device<M> {
         if !self.platform.reset_lost() {
             return Ok(());
         }
+        let _power = self.platform.display_power()?;
         state.blocked = true;
         state.failed = true;
         state.paused = true;
@@ -1138,16 +1176,20 @@ impl<M: Platform> Device<M> {
         if state.blocked || state.failed || self.platform.reset_lost() {
             return Err(FsError::NoDevice);
         }
+        let _power = self.platform.display_power()?;
         Ok(Guard {
             device: self,
             state,
+            _power,
         })
     }
     pub(crate) async fn quiesce(&self) -> Result<(), FsError> {
         let state = self.state.lock().await;
+        let _power = self.platform.display_power()?;
         let mut guard = Guard {
             device: self,
             state,
+            _power,
         };
         guard.restore_console().await?;
         self.platform.color_restored();
@@ -1160,15 +1202,18 @@ impl<M: Platform> Device<M> {
     /// place. It cannot arm or adopt them; fresh authority is checked by its IO.
     pub(crate) fn legacy_drain(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let mut state = self.state.try_lock().ok_or(FsError::Busy)?;
+        let _power = self.platform.display_power()?;
         state.blocked = true;
         Ok(LegacyGuard {
             state,
             platform: &self.platform,
             geometry: &self.geometry,
+            _power,
         })
     }
     pub(crate) fn legacy(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let state = self.state.try_lock().ok_or(FsError::Busy)?;
+        let _power = self.platform.display_power()?;
         if self.platform.reset_lost()
             || state.presenter.is_some()
             || state.color.is_some()
@@ -1187,6 +1232,7 @@ impl<M: Platform> Device<M> {
             state,
             platform: &self.platform,
             geometry: &self.geometry,
+            _power,
         })
     }
 }

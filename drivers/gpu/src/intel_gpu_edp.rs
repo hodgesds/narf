@@ -1309,7 +1309,13 @@ pub fn notify_scanout_dirty<M: MmioWindow + ?Sized>(
     mmio: &M,
     region: Option<SuRegion>,
 ) -> Result<DirtyOutcome, PsrError> {
-    EDP_RUNTIME.lock().notify_dirty(mmio, region)
+    // Display 14: leave DC5/DC6 before any PSR register write; the
+    // reference is taken before, and released after, EDP_RUNTIME.
+    let power = crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Psr)
+        .map_err(|_| PsrError::Unavailable)?;
+    let outcome = EDP_RUNTIME.lock().notify_dirty(mmio, region);
+    drop(power);
+    outcome
 }
 
 /// Scanout-publish hook, called from `intel_gpu::publish_scanout`

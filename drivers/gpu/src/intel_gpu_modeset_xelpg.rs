@@ -420,6 +420,11 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // Step 0: validate inputs that don't require touching HW.
         validate_framebuffer(primary_fb)?;
         inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
+        // DC_off for the EDID AUX read and everything after (AUX_A and the
+        // CX0 message bus are DC_off domains); inert without a DC service.
+        let _power =
+            crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
+                .map_err(|_| ModesetError::PowerWellTimeout)?;
 
         // Step 1: pick the mode (EDID over this port's AUX, or
         // the caller's fallback).
@@ -442,6 +447,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     ) -> Result<Mode, ModesetError> {
         crate::intel_gpu_modeset::validate_framebuffer_mode(primary_fb, mode)?;
         inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
+        // Nested under `modeset`'s reference when reached from there.
+        let _power =
+            crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
+                .map_err(|_| ModesetError::PowerWellTimeout)?;
         let checked = CheckedWindow {
             raw: self.mmio,
             failed: Cell::new(false),
