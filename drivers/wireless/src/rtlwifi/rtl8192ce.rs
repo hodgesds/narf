@@ -35,18 +35,37 @@
 //! - [`mac`] — the `_rtl92ce_init_mac` remainder, `_rtl92ce_hw_configure`
 //!   and the station address, with `REG_CR` and ring bases left to the
 //!   packet owner.
+//! - [`phy`] — BB/RF serial access, `rtl92c_phy_mac/bb/rf_config` over the
+//!   tables, UMC-cut RF fixups, 20/40 MHz bandwidth, `RF_CHNLBW` channel
+//!   step, `_rtl92ce_phy_lc_calibrate` and the RF path switch.
+//! - [`txpower`] — `_rtl92ce_read_txpower_info_from_hwpg` and the RF6052
+//!   CCK/OFDM TXAGC writes of `rtl92c_phy_set_txpower_level`.
+//! - [`iqk`] — `rtl92c_phy_iq_calibrate` for 1T1R and 2T2R.
+//! - [`channel`] — the `rtl_op_config` channel + bandwidth order.
+//! - [`h2c`] — `rtl92c_fill_h2c_cmd`, SETPWRMODE / JOINBSSRPT / RA-mask
+//!   payloads, RPWM and the 92C interrupt profile.
+//! - [`init`] — the `rtl92ce_hw_init` tail after the firmware download
+//!   (run by `Prepared::configure_rtl8192ce`).
 
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod channel;
 pub mod fw;
+pub mod h2c;
+pub mod init;
+pub mod iqk;
 pub mod llt;
 pub mod mac;
+pub mod phy;
 pub mod power;
 pub mod tables;
 pub mod trx;
+pub mod txpower;
 pub mod version;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod phy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
 

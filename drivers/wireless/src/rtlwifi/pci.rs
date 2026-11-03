@@ -532,7 +532,7 @@ pub unsafe fn bring_up(
         // The diagnostic identity stage does not own packet DMA or an IRQ
         // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
         // SAFETY: BAR2 mapped and owned.
-        unsafe { irq::disable_interrupts(&registers) };
+        unsafe { irq::disable_interrupts_for(&registers, did) };
 
         let function = match device.addr {
             narf_bus::BusAddr::Pcie(addr) => addr.function,

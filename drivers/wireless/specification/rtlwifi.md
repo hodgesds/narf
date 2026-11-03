@@ -2499,8 +2499,123 @@ these IDs stay diagnostic (`pci::bring_up` does not retain them).
   88EE `REG_PCIE_CTRL_REG+1 = 0xff` DMA-stop write is not issued: on the
   92C Linux uses `REG_PCIE_CTRL_REG` only as the TX polling doorbell, so CR
   gates and parked BME hold its DMA closed. Probe's
-  `irq::disable_interrupts` writes the 88EE IMR offsets and must be made
-  chip-aware before these IDs are retained.
+  interrupt masking is chip-aware (`irq::disable_interrupts_for`, below).
+
+- `phy` — `rtl92c_phy_set/query_bb_reg` and `_rtl92c_phy_rf_serial_
+  write/read` (`offset &= 0x3f`; read: `0x824` edge low, the path's HSSI2
+  with address and edge, `0x824` edge high, `mdelay(1)` after each, PI/SI
+  read-back by the path's HSSI1 BIT(8)); `rtl92ce_phy_set_rf_reg` reads
+  first for every mask but `RFREG_OFFSET_MASK` (incl. `MASKDWORD`).
+  `configure` = `rtl92ce_hw_init` from `rtl92c_phy_mac_config` (MAC_2T
+  bytes, then `0x14 = 0x71` on 92C / `0x4ca = 0x0a` on 88C), the RCR trim,
+  `rtl92c_phy_bb_config` (SYS_FUNC_EN word `| BIT13|BIT1|BIT0`,
+  `AFE_PLL_CTRL = 0x83`/`+1 = 0xdb`, RF_CTRL 7, SYS_FUNC_EN `0xe3`,
+  `AFE_XTAL_CTRL+1 = 0x80`, LEDCFG0 BIT23, PHY_REG 1T/2T walk with
+  `rtl_addr_delay` + 1 us, PHY_REG_PG `_rtl92c_store_pwrindex_diffrate_
+  offset` (4 groups), AGC 1T/2T walk, `cck_high_power`; the `RF_1T2R`
+  `_rtl92c_phy_bb_config_1t` never runs), `_rtl92ce_phy_rf6052_config_
+  parafile` over `num_total_rfpath` (1 for 88C, 2 for 92C; RFENV
+  save/restore, `rtl_rfreg_delay` rows), the UMC fixups (88C A-cut RF A
+  `RF_RX_G1 = 0x30255`, `RF_RX_G2 = 0x50a00`; B-cut RF A `0x0c/0x0a/RF_IPA/
+  RF_SYN_G2/RF_RCK1/RF_RCK2`), `rfreg_chnlval` from both paths (also on
+  88C, as Linux), CCK/OFDM on and `0x884` BIT10. Bandwidth:
+  `rtl92ce_phy_set_bw_mode_callback` (BWOPMODE, RRSR+2 `(v & 0x90) | sc <<
+  5`, RFMOD 0x800/0x900, `0x884` BIT10 1 at 20 / 0 at 40, CCK sideband
+  `sc >> 1`, `0xd00[11:10]`, `0x818[27:26]`) and
+  `rtl92ce_phy_rf6052_set_bandwidth` (path A only, bit 10 at 20 MHz).
+  Channel: `sw_chnl_rf` = the `CMDID_RF_WRITEREG` step (`RF_CHNLBW[9:0]`
+  per RF path) plus `_rtl92c_phy_sw_rf_seting` (UMC B-cut RF A `RF_RX_G1`
+  `0x00255` on channel 6 at 20 MHz, else rewritten with itself) and 10 ms.
+  `lc_calibrate` = `_rtl92ce_phy_lc_calibrate(is2t)` (TXPAUSE or `0xd03`
+  continuous-TX save, `MASK12BITS` writes with Linux's unmasked values,
+  `0x18 | 0x08000`, 100 ms). `rfpath_switch_main` = `_rtl92c_phy_set_
+  rfpath_switch(1)` with `is_hal_stop` true (hw_init precedes
+  `set_hal_start`): LEDCFG0 BIT23, `0x878` BIT13, then 92C `0x864[6:5] = 1`
+  / 88C `0x860[9:8] = 2`.
+- `txpower` — `_rtl92ce_read_txpower_info_from_hwpg(autoload_fail =
+  false)`: CCK/HT40-1S areas (`0x5a`/`0x60`, stride 3, both bytes must be
+  non-`0xff` else `0x22`), HT40-2S diff nibbles (`0x66`), `ht40_2s =
+  max(1s - diff, 0)`, `rtl92c_get_chnl_group` (index `< 3` / `< 9` / else),
+  per-path power-limit nibbles (`0x6f`/`0x72`, `0xff` ⇒ 0), HT20 diff
+  (`0x69`, BIT3 ⇒ `| 0xF0`, default 2), legacy diff (`0x6c`, default 3),
+  regulatory `0x79[2:0]`, TSSI, thermal `[4:0]` (default `0x12`).
+  `set_level` = `rtl92c_phy_set_txpower_level`: CCK from `txpwrlevel_cck`,
+  OFDM from `ht40_1s` (1T1R) or `ht40_2s` (2T2R);
+  `rtl92ce_phy_rf6052_set_cck_txpower` (scan: `0x3f3f3f3f` unless
+  regulatory != 0; byte clamp `0x3f`; `0xe08[15:8]`, `0x86c[31:8]`,
+  `0x86c[7:0]`, `0x838[31:8]`) and `rtl92ce_phy_rf6052_set_ofdm_txpower`
+  (`rtl92c_phy_get_power_base` with u8-wrapping HT20 diff at 20 MHz;
+  `_rtl92c_get_txpower_writeval_by_regulatory` incl. the regulatory-1
+  channel groups and regulatory-3 customer limit; `_rtl92c_write_ofdm_
+  power_reg` with `0x7f` byte masks, clamp and the `0xc90`/`0xc98` three
+  `-6` bytes after MCS15_MCS12 (2T2R) or MCS07_MCS04 (otherwise)). Both
+  paths' TXAGC registers are written on 88C too, as Linux. Linux reads the
+  rate differences from `rtlphy->mcs_offset`, which nothing on this family
+  writes (the PG walk fills `mcs_txpwrlevel_origoffset`), so `MCS_OFFSET`
+  is zero and the write value is the power base; the BT1/BT2 high-power
+  subtractions never apply (no BT boards).
+- `iqk` — `rtl92c_phy_iq_calibrate(false)` for both RF types (`is2t =
+  IS_92C_SERIAL`): three `_rtl92c_phy_iq_calibrate(t)` runs (t = 0 backs up
+  16 ADDA dwords, `0x522/0x550/0x551` bytes + `0x040` dword, `0xc04/0xc08/
+  0x874`, and latches `rfpi_enable`); ADDA on (`0x0b1b25a0`/`0x0bdb25a0`
+  1T, `0x04db25a4`/`0x0b1b25a4` 2T), PI mode while SI, two tries of path A
+  (`0xe3c` `0x28160502` 1T / `0x28160202` 2T with the path-B tone
+  registers) and on 2T path-A standby + two tries of path B, Linux's
+  brace-less `result[t][1]`/`[5]` assignments kept; restores (PI, ADDA,
+  MAC reloads only for t != 0). `_rtl92c_phy_simularity_compare` (bound
+  8/4, MAX_TOLERANCE 5, zero-RX candidate rule copying only the TX pair),
+  candidate choice, path A / (2T) path B matrix fills (u32 `x`, `long y`),
+  save of the ten `iqk_bb_reg` (`recover` reloads them). No APK
+  (`_rtl92c_phy_ap_calibrate` is empty in Linux).
+- `channel` — `rtl_op_config` wide channel (HT40+ = primary + 2 / LOWER,
+  HT40- = primary - 2 / UPPER; pairs outside wide 3..=11 refused), TX power
+  at the new width, `sw_chnl_rf`, then `set_bw_mode` (`act_scanning`
+  false on the station path).
+- `init` — the `rtl92ce_hw_init` tail after the download, run by
+  `Prepared::configure_rtl8192ce` (`rtl8192ce/radio_owner.rs`, Prepared →
+  RadioConfigured; version re-qualified from live `REG_SYS_CFG` /
+  `REG_HPON_FSM`, adapter facts from `REG_9346CR`; BT boards, a MAC other
+  than the factory identity and undecodable maps refused before any write):
+  `phy::configure`, `mac::hw_configure`, `rtl_cam_reset_all_entry`,
+  `mac::station_identity`, the RF path switch, IQK, LCK (`rtl92c_dm_check_
+  txpower_tracking` is a no-op on a fresh owner: `dm.txpower_tracking` is
+  set only by the later `rtl92c_dm_init`), then `efuse_read_1byte(0x1FA)`
+  (up to 1000 polls, data read even on timeout, as Linux): BIT0 clear ⇒ RF
+  A `0x15[3:0] = 5`, BIT1 clear on 92C ⇒ RF B, BIT4 clear ⇒ `0x16 = (v &
+  0x0f) | 0x80`, 10 us, `| 0x90`. `Prepared::configure_rtl8192ce_channel`
+  (RadioConfigured/ChannelConfigured → ChannelConfigured) runs `channel::
+  configure` with the retained version, factory power and `rfreg_chnlval`.
+  Not issued: ASPM back door / `enable_aspm`, `rtl8192ce_bt_hw_init`;
+  `rtl92c_dm_init` is DM-owner software state.
+- `h2c` — `rtl92c_fill_h2c_cmd` / `_rtl92c_fill_h2c_command` (zeroed
+  8-byte copy; `_rtl92c_check_fw_read_last_h2c` = `REG_HMETFR` bit clear
+  and `REG_MCUTST_1 + box` zero, 99 re-checks 10 us apart each followed by
+  the `0x1BF` read; 1–3-byte commands id BIT(7) clear, 4–5-byte set with
+  the first two bytes into `REG_HMEBOX_EXT_n` (`0x88 + 2n`) first;
+  `last_hmeboxnum` rotation; no power-save gate on this family). Deliberate:
+  an undrained box or bad length poisons the mailbox (Linux logs and
+  drops). Payloads: `SETPWRMODE` (id 1: mode, smart PS 1, awake interval
+  5), `JOINBSSRPT` (id 2), `RA_MASK` (id 6) = `rtl92ce_update_hal_rate_mask`
+  for a 2.4 GHz station (`macid` 0; B/G/N masks per RSSI level, N rows by
+  RF type — 1T1R `0x000f0000/0x000ff000/0x000ff015|005`, 2T2R `0x0f0f0000/
+  0x0f0ff000/0x0f0ff015|005` — SGI for the width's SGI, `ratr_index << 28`,
+  byte 4 `0x80 | sgi << 5`); `HW_VAR_SET_RPWM` (`0x3dc` BIT7 toggle).
+  Interrupts: `rtl92ce_enable_interrupt` (HIMR `0x120` = `0x1b5f`, HIMRE
+  `0x128` = `0x300`), `rtl92ce_disable_interrupt` (both 0) and
+  `rtl92ce_interrupt_recognized` (HISR `0x124` under mask, W1C). Probe's
+  `pci::bring_up` now masks through `irq::disable_interrupts_for(did)`
+  (`irq::imr_pair`: `0x120/0x128` for the CE IDs, `0xb0/0xb8` otherwise).
+  Not composed yet: the LPS enter/leave sequence (with 88C
+  `rtl92c_dm_rf_saving`), the reserved-page download, the DM watchdog and
+  the `_rtl92ce_poweroff_adapter` card-disable proof.
+  Tests (`rtl8192ce/phy_tests.rs`, written, unexecuted):
+  `smoke_rtl8192ce_rf_serial_read_write_both_paths`,
+  `smoke_rtl8192ce_h2c_rate_mask_and_irq_profile`,
+  `smoke_rtl8192ce_bb_rf_config_per_rf_type`,
+  `smoke_rtl8192ce_txpower_efuse_and_txagc`,
+  `smoke_rtl8192ce_channel_bw40_and_umc_b_rx_g1`,
+  `smoke_rtl8192ce_iqk_both_rf_types`,
+  `smoke_rtl8192ce_lck_and_pa_bias_rule`.
 
 Tests (written, unexecuted): `smoke_rtl8192ce_chip_version_rf_type_and_firmware_name`,
 `smoke_rtl8192ce_firmware_header_geometry`,

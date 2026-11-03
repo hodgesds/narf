@@ -97,6 +97,34 @@ pub unsafe fn disable_interrupts(mmio: &MmioRegion) {
     }
 }
 
+/// Interrupt-mask register pair `(HIMR, HIMRE)` of the matched chip: the
+/// RTL8192CE family (`rtl8192ce/reg.h`) masks at `0x120` / `0x128`
+/// (`rtl92ce_disable_interrupt`), the others at the 88EE `0xb0` / `0xb8`.
+pub const fn imr_pair(did: u16) -> (u64, u64) {
+    if super::rtl8192ce::is_8192ce(did) {
+        (
+            super::rtl8192ce::mac::REG_HIMR as u64,
+            super::rtl8192ce::mac::REG_HIMRE as u64,
+        )
+    } else {
+        (REG_HIMR, REG_HIMRE)
+    }
+}
+
+/// [`disable_interrupts`] at the device's own IMR pair
+/// (`IMR8190_DISABLED` into both).
+///
+/// # Safety
+/// Caller must own BAR0 exclusively.
+pub unsafe fn disable_interrupts_for(mmio: &MmioRegion, did: u16) {
+    let (himr, himre) = imr_pair(did);
+    // SAFETY: caller-asserted.
+    unsafe {
+        mmio.write32(himr, 0);
+        mmio.write32(himre, 0);
+    }
+}
+
 // ── Per-IRQ accumulator ──────────────────────────────────────────────────
 
 /// One ISR pass result.  Drives the per-queue completion handlers.

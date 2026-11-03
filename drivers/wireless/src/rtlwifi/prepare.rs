@@ -164,6 +164,9 @@ pub struct Prepared<I: Io, M: Memory> {
     rtl8192ee: Option<alloc::boxed::Box<([u8; 32], super::rtl8192ee::init::Radio)>>,
     /// Admitted `N92E` operating point (`rtl8192ee/envelope.rs`).
     rtl8192ee_power: Option<super::rtl8192ee::envelope::Permission>,
+    /// RTL8192CE / RTL8188CE factory identity and configured radio
+    /// (`rtl8192ce/init.rs`).
+    rtl8192ce: Option<alloc::boxed::Box<([u8; 32], super::rtl8192ce::init::Radio)>>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -269,6 +272,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8821ae_power: None,
             rtl8192ee: None,
             rtl8192ee_power: None,
+            rtl8192ce: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
@@ -612,6 +616,8 @@ impl<I: Io, M: Memory> Drop for Prepared<I, M> {
     }
 }
 
+#[path = "rtl8192ce/radio_owner.rs"]
+mod ce92_radio;
 #[path = "packet.rs"]
 pub mod packet;
 #[path = "station.rs"]
