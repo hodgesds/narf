@@ -2177,11 +2177,14 @@ fn smoke_mtl_external_dp_on_pipe_b_beside_lit_panel() -> TestResult {
             if a < b && b < c && c < d && d < e && e < f => {}
         _ => return TestResult::Fail("resources, PLL, timings, function, pipe, arm order"),
     }
-    if io.read32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL) & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK
-        != 0
-        || crate::intel_gpu_display_resources::Profile::capture(&io, &panel).is_ok()
-    {
-        return TestResult::Fail("two lit pipes must leave the joined single-pipe profile");
+    // Two lit pipes leave the joined single-pipe profile: MBUS unjoins and
+    // the panel's proof now holds only Pipe A's half of the DBUF.
+    let unjoined = io.read32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL)
+        & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK
+        == 0;
+    match crate::intel_gpu_display_resources::Profile::capture(&io, &panel) {
+        Ok(profile) if unjoined && profile.cursor_start < 2048 => {}
+        _ => return TestResult::Fail("two lit pipes must leave the joined single-pipe profile"),
     }
     if dmc.events() != [(1, true)] {
         return TestResult::Fail("Pipe B's DMC must be enabled once for its crtc");
@@ -2544,4 +2547,165 @@ fn smoke_mtl_external_route_presence_has_no_transient_readers() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_route_presence_has_no_transient_readers
+);
+
+// ── The panel's KMS proofs beside a lit external (multi-pipe layout) ──────
+
+/// `PLANE_BUF_CFG` / `CUR_BUF_CFG` of `pipe`.
+fn ddb_regs(pipe: usize) -> [u64; 2] {
+    [
+        crate::intel_gpu_xelpg_resources::plane_buf_cfg(pipe, 0),
+        crate::intel_gpu_xelpg_resources::cursor_buf_cfg(pipe),
+    ]
+}
+
+/// The fixed timing of the owned panel `mode`.
+fn panel_timing(mode: &Mode) -> crate::intel_gpu_dsb::Timing {
+    crate::intel_gpu_dsb::Timing {
+        clock: mode.pixel_clock_khz,
+        width: mode.h_active,
+        height: mode.v_active,
+        htotal: mode.h_total,
+        vtotal: mode.v_total,
+        flags: 0,
+    }
+}
+
+fn smoke_mtl_panel_profile_proves_its_share_beside_external() -> TestResult {
+    use crate::intel_gpu_display_resources::{Primary, Profile};
+    use crate::intel_gpu_xelpg_pipes::{published_layout, reset_published_layout};
+    reset_published_layout();
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1080()));
+    let Some(panel) = io.light_panel() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    // The owned modeset's no-DPT chicken on the panel primary.
+    io.phy.write32(0x7_026C, 1 << 19);
+    let Ok(single) = Profile::capture(&io, &panel) else {
+        return TestResult::Fail("the owned single-pipe profile must hold first");
+    };
+    let dmc = DmcEvents::leak();
+    let Ok(probe) = probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+        return TestResult::Fail("probe must succeed");
+    };
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &beside(panel, dmc)) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("DP must light Pipe B next to the lit panel"),
+    };
+    // The Pipe B–D owner published what it programmed: the owned panel on
+    // Pipe A, the route on Pipe B, and the route's scanout surface.
+    let Some(layout) = published_layout() else {
+        return TestResult::Fail("the Pipe B–D owner must publish the multi-pipe layout");
+    };
+    let panel_request = crate::intel_gpu_display_resources::request(
+        &panel,
+        crate::intel_gpu_xelpg_wm::Tiling::Linear,
+        0,
+    )
+    .pipes[0];
+    if layout.state.requests[0] != panel_request
+        || layout.state.requests[1].is_none()
+        || layout.surfaces != [None, Some(0x100_0000), None, None]
+    {
+        return TestResult::Fail("the published layout must name the panel and Pipe B");
+    }
+    // The panel's profile is now its share of the two-pipe layout: half
+    // the DBUF, the multi-pipe cursor budget, the same wm_level_disabled.
+    crate::intel_gpu_xelpg_wm::publish_pipe_a(None);
+    let multi = match Profile::capture(&io, &panel) {
+        Ok(profile) => profile,
+        Err(_) => return TestResult::Fail("the panel profile must hold beside the external"),
+    };
+    let share = &layout.state.dbuf.pipes[0];
+    if multi.cursor_start != share.cursor.start
+        || multi.cursor_start >= 2048
+        || multi.cursor_start == single.cursor_start
+        || multi.primary != share.wm[0]
+        || multi.cursor != share.cursor_wm
+        || io.read32(ddb_regs(0)[1]) != share.cursor.reg()
+        || multi.cursor_registers(true).last() != Some(&(ddb_regs(0)[1], share.cursor.reg()))
+    {
+        return TestResult::Fail("the profile must use Pipe A's actual multi-pipe allocation");
+    }
+    if multi.wm_level_disabled != single.wm_level_disabled
+        || crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled() != Some(multi.wm_level_disabled)
+    {
+        return TestResult::Fail("the proof must publish Pipe A's wm_level_disabled");
+    }
+    // The retained primary owner stages the Tile4 image of this layout.
+    let Ok(mut primary) = Primary::capture(&io, panel_timing(&panel)) else {
+        return TestResult::Fail("the primary owner must capture beside the external");
+    };
+    let Ok(latency) = crate::intel_gpu_xelpg_wm::Latency::read(&io) else {
+        return TestResult::Fail("latencies must read");
+    };
+    let Ok(tile4) = layout
+        .state
+        .retile(0, crate::intel_gpu_xelpg_wm::Tiling::Tile4, &latency)
+    else {
+        return TestResult::Fail("Tile4 must retile within Pipe A's allocation");
+    };
+    let want = crate::intel_gpu_xelpg_resources::plane_wm_image(0, 0, &tile4.dbuf.pipes[0].wm[0])
+        .map(|image| image.to_vec());
+    match primary.stage(&io, true) {
+        Ok(image) if Some(&image) == want.as_ref() => {}
+        _ => return TestResult::Fail("Tile4 must take the multi-pipe Tile4 watermarks"),
+    }
+    primary.rollback();
+    // The KMS takeover inventory admits exactly the route's primary.
+    if crate::intel_gpu_kms::inherited_fetchers_idle(&io, Generation::MeteorLake).is_err() {
+        return TestResult::Fail("the route's own Pipe B primary is not an inherited fetcher");
+    }
+    io.phy.write32(PLANE_SURF_1_B, 0x0A00_0000);
+    let foreign_surface =
+        crate::intel_gpu_kms::inherited_fetchers_idle(&io, Generation::MeteorLake)
+            == Err(narf_filesystem::FsError::Unsupported);
+    io.phy.write32(PLANE_SURF_1_B, 0x100_0000);
+    // Diverged or foreign multi-pipe states still refuse.
+    io.set_conf(2, ENABLE);
+    let foreign_pipe = Profile::capture(&io, &panel).is_err();
+    io.set_conf(2, 0);
+    let [plane_b, _] = ddb_regs(1);
+    let held = io.read32(plane_b);
+    io.phy.write32(plane_b, held + 1);
+    let moved_ddb = Profile::capture(&io, &panel).is_err();
+    io.phy.write32(plane_b, held);
+    let [plane_a, _] = ddb_regs(0);
+    let held = io.read32(plane_a);
+    io.phy.write32(plane_a, 2047 << 16);
+    let grown_panel = Profile::capture(&io, &panel).is_err();
+    io.phy.write32(plane_a, held);
+    let mbus = io.read32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL);
+    io.phy.write32(
+        crate::intel_gpu_xelpg_dbuf::MBUS_CTL,
+        (mbus & !(7 << 26)) | (2 << 26),
+    );
+    let dark_select = Profile::capture(&io, &panel).is_err();
+    io.phy.write32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL, mbus);
+    reset_published_layout();
+    let unpublished = Profile::capture(&io, &panel).is_err();
+    let unknown = crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled().is_none();
+    crate::intel_gpu_xelpg_pipes::publish_layout_for_test(Some(layout));
+    if !foreign_surface || !foreign_pipe || !moved_ddb || !grown_panel || !dark_select {
+        return TestResult::Fail("a foreign or diverged multi-pipe state must refuse");
+    }
+    if !unpublished || !unknown {
+        return TestResult::Fail("an unpublished layout must refuse and publish unknown");
+    }
+    if Profile::capture(&io, &panel) != Ok(multi) {
+        return TestResult::Fail("the restored layout must prove again");
+    }
+    // Removal: the single-pipe profile holds again and nothing is published.
+    if route.stop(&io).is_err() || published_layout().is_some() {
+        return TestResult::Fail("the release must withdraw the published layout");
+    }
+    if Profile::capture(&io, &panel) != Ok(single) || route.release(&io).is_err() {
+        return TestResult::Fail("the panel must prove its single-pipe profile again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_panel_profile_proves_its_share_beside_external
 );

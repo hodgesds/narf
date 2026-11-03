@@ -812,6 +812,15 @@ fn fetchers_with_cursor(
         Generation::MeteorLake | Generation::AlderLake => 5,
         _ => 7,
     };
+    // Display 14: a Pipe B–D primary the MTL external route lit through the
+    // Pipe B–D owner scans its own allocation, outside this owner's GEM
+    // arena; it is neither this owner's fetcher nor one it could retire.
+    // Only that exact surface on that pipe's primary is admitted.
+    let external = if generation == Generation::MeteorLake {
+        crate::intel_gpu_xelpg_pipes::published_layout().map_or([None; 4], |l| l.surfaces)
+    } else {
+        [None; 4]
+    };
     for pipe in 0..4u64 {
         let cursor = mmio.read32(0x70080 + pipe * 0x1000);
         if cursor == u32::MAX {
@@ -840,7 +849,19 @@ fn fetchers_with_cursor(
                 return Err(FsError::NoDevice);
             }
             if ctl & (1 << 31) != 0 {
-                return Err(FsError::Unsupported);
+                let surface = mmio.read32(0x7019c + pipe * 0x1000);
+                let routed = plane == 1
+                    && external[pipe as usize].is_some_and(|owned| {
+                        owned == surface
+                            && !(GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END)
+                                .contains(&u64::from(owned))
+                    });
+                if surface == u32::MAX {
+                    return Err(FsError::NoDevice);
+                }
+                if !routed {
+                    return Err(FsError::Unsupported);
+                }
             }
         }
     }

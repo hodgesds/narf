@@ -182,6 +182,57 @@ fn wait_conf(io: &(impl MmioWindow + ?Sized), pipe: Pipe, on: bool) -> Result<()
     })
 }
 
+/// The multi-pipe display-14 layout the Pipe B–D owner programmed, as the
+/// fixed Pipe-A KMS owner proves its own share against it
+/// ([`crate::intel_gpu_display_resources::Profile`]). Present only while a
+/// Pipe B–D is reserved; absent means the owned single-pipe layout (or
+/// nothing) is programmed. It is a description, never a proof: every
+/// reader still verifies the hardware against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    /// The programmed state. Pipe A's primary watermarks are those of the
+    /// tiling it scanned out when the owner last transitioned; its cursor
+    /// watermarks, every DDB entry and the globals are the linear-baseline
+    /// computation, as the KMS owner programs them.
+    pub(crate) state: State,
+    /// The GGTT scanout surface of each reserved Pipe B–D primary.
+    pub(crate) surfaces: [Option<u32>; 4],
+}
+
+/// One integrated display per system, as the PSR watermark provider.
+static LAYOUT: narf_lib::sync::IrqSafeSpinLock<Option<Layout>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The layout the Pipe B–D owner last programmed (see [`Layout`]).
+pub(crate) fn published_layout() -> Option<Layout> {
+    *LAYOUT.lock()
+}
+
+/// Fixtures start from the single-pipe description.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn reset_published_layout() {
+    *LAYOUT.lock() = None;
+}
+
+/// Publish `layout` as programmed (fixtures that program a multi-pipe
+/// register image directly).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn publish_layout_for_test(layout: Option<Layout>) {
+    *LAYOUT.lock() = layout;
+}
+
+/// The owner's Pipe-A primary tiling read from `PLANE_CTL` (the KMS owner
+/// may have flipped it to X or Tile4 since the last transition).
+fn panel_tiling(io: &(impl MmioWindow + ?Sized)) -> Result<Tiling, PipeEnableError> {
+    match read(io, Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET)? & PLANE_CTL_TILED_MASK
+    {
+        0 => Ok(Tiling::Linear),
+        PLANE_CTL_TILED_X => Ok(Tiling::X),
+        PLANE_CTL_TILED_4 => Ok(Tiling::Tile4),
+        _ => Err(PipeEnableError::Resource(ResourceError::Diverged)),
+    }
+}
+
 /// Owner of the programmed display14 resource state across pipe adds and
 /// removals. `lit` tracks the pipes this owner treats as lit.
 #[derive(Clone, Debug)]
@@ -212,23 +263,51 @@ impl Pipes {
     ) -> Result<Self, PipeEnableError> {
         crate::intel_gpu_display_resources::Profile::capture(io, mode)
             .map_err(|_| PipeEnableError::Resource(ResourceError::Diverged))?;
-        let tiling = match read(io, Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET)?
-            & PLANE_CTL_TILED_MASK
-        {
-            0 => Tiling::Linear,
-            PLANE_CTL_TILED_X => Tiling::X,
-            PLANE_CTL_TILED_4 => Tiling::Tile4,
-            _ => return Err(PipeEnableError::Resource(ResourceError::Diverged)),
-        };
-        let latency =
-            crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
-        let state = res::compute(
+        // Only the owned single-pipe layout is adopted: one external route
+        // runs at a time, so a lit Pipe B–D here is not this owner's.
+        for pipe in [Pipe::B, Pipe::C, Pipe::D] {
+            if read(io, pipe.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE) != 0 {
+                return Err(PipeEnableError::Resource(ResourceError::Diverged));
+            }
+        }
+        let tiling = panel_tiling(io)?;
+        let state = Self::compute(
+            io,
             &crate::intel_gpu_display_resources::request(mode, tiling, 0),
-            &latency,
         )?;
         let lit = read(io, Pipe::A.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE)
             == PIPECONF_ENABLE | PIPECONF_STATE;
         Ok(Self::adopt(Some(state), u8::from(lit)))
+    }
+
+    /// Publish what this owner holds programmed for the Pipe-A KMS proofs:
+    /// the layout while any Pipe B–D is part of it, nothing otherwise.
+    fn publish(&self) {
+        let layout = self
+            .state
+            .filter(|s| s.requests[1..].iter().any(Option::is_some));
+        *LAYOUT.lock() = layout.map(|state| Layout {
+            state,
+            surfaces: core::array::from_fn(|p| self.reserved[p].map(|ext| ext.surface)),
+        });
+    }
+
+    /// Before computing a transition from the programmed state: a lit Pipe
+    /// A keeps the primary watermarks of whatever tiling the KMS owner
+    /// flipped it to, so the programmed state is retiled to that tiling
+    /// (only its primary watermarks change; see [`State::retile`]).
+    fn refresh_panel(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), PipeEnableError> {
+        let Some(state) = self.state else {
+            return Ok(());
+        };
+        if self.lit & 1 == 0 || state.requests[0].is_none() {
+            return Ok(());
+        }
+        let tiling = panel_tiling(io)?;
+        let latency =
+            crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
+        self.state = Some(state.retile(0, tiling, &latency)?);
+        Ok(())
     }
 
     /// The programmed state (`None`: nothing a lit pipe depends on).
@@ -261,13 +340,28 @@ impl Pipes {
         request
     }
 
+    /// `request` computed as the KMS owner programs Pipe A: everything from
+    /// the linear baseline of its primary (the owned modeset's layout),
+    /// then that primary retiled to the tiling it actually scans out.
     fn compute(
         io: &(impl MmioWindow + ?Sized),
         request: &res::Request,
     ) -> Result<State, PipeEnableError> {
         let latency =
             crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
-        Ok(res::compute(request, &latency)?)
+        let mut baseline = *request;
+        let primary = baseline.pipes[0]
+            .as_mut()
+            .and_then(|p| p.planes[0].as_mut());
+        let tiling = primary.as_ref().map(|p| p.tiling);
+        if let Some(plane) = primary {
+            plane.tiling = Tiling::Linear;
+        }
+        let state = res::compute(&baseline, &latency)?;
+        match tiling {
+            Some(tiling) => Ok(state.retile(0, tiling, &latency)?),
+            None => Ok(state),
+        }
     }
 
     /// [`Self::reserve`]'s refusals and computed state, without a write.
@@ -288,6 +382,8 @@ impl Pipes {
         if self.reserved[p].is_some() || self.state.is_some_and(|s| s.requests[p].is_some()) {
             return Err(PipeEnableError::NotReserved);
         }
+        let mut fresh = self.clone();
+        fresh.refresh_panel(io)?;
         if read(io, ext.pipe.base() + PIPECONF_OFFSET)? & (PIPECONF_ENABLE | PIPECONF_STATE) != 0 {
             return Err(PipeEnableError::Busy);
         }
@@ -298,7 +394,7 @@ impl Pipes {
         } else {
             res::require_idle(io)?;
         }
-        Self::compute(io, &self.request_with(|r| r.pipes[p] = Some(request(ext))))
+        Self::compute(io, &fresh.request_with(|r| r.pipes[p] = Some(request(ext))))
     }
 
     /// Step 0: admission. Every refusal [`Self::reserve`] can make from the
@@ -322,9 +418,11 @@ impl Pipes {
         dmc: &dyn PipeDmc,
     ) -> Result<(), PipeEnableError> {
         let new = self.check(io, ext)?;
+        self.refresh_panel(io)?;
         self.transition(io, new)?;
         let p = ext.pipe as usize;
         self.reserved[p] = Some(*ext);
+        self.publish();
         dmc.enable_pipe(p as u32);
         Ok(())
     }
@@ -493,6 +591,7 @@ impl Pipes {
         if self.lit & (1 << p) != 0 {
             return Err(PipeEnableError::Busy);
         }
+        self.refresh_panel(io)?;
         dmc.disable_pipe(p as u32);
         let request = self.request_with(|r| r.pipes[p] = None);
         if request.pipes.iter().all(Option::is_none) {
@@ -502,6 +601,7 @@ impl Pipes {
             self.transition(io, new)?;
         }
         self.reserved[p] = None;
+        self.publish();
         Ok(())
     }
 }

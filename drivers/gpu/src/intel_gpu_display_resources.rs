@@ -17,6 +17,7 @@
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
+    intel_gpu_xelpg_pipes::Layout,
     intel_gpu_xelpg_resources::{self as res, ResourceError},
     intel_gpu_xelpg_wm::{self as wm, Latency, PlaneWm, Tiling},
 };
@@ -106,45 +107,29 @@ pub(crate) fn request(mode: &Mode, tiling: Tiling, min_cdclk_khz: u32) -> res::R
         min_cdclk_khz,
     }
 }
+/// Pipe A's share of a programmed display-14 layout: the owned single-pipe
+/// layout of the MTL modeset, or the multi-pipe layout the Pipe B–D owner
+/// programmed around the lit panel ([`crate::intel_gpu_xelpg_pipes::Layout`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Profile {
     pub(crate) primary: PlaneWm,
     pub(crate) cursor: PlaneWm,
     pub(crate) cursor_start: u16,
     cursor_ddb: u32,
+    /// The primary's `PLANE_BUF_CFG` in this layout.
+    primary_ddb: u32,
     /// `skl_wm_check_vblank`'s `wm_level_disabled` for this layout: the
     /// same prefill the transaction's vblank check used (the primary and
     /// the always-budgeted cursor; level-0 lines survive the DDB stage).
+    /// It depends only on Pipe A's own planes and timing, so every layout
+    /// gives the same value for the same primary tiling.
     pub(crate) wm_level_disabled: bool,
 }
 impl Profile {
-    fn compute_for_layout(
-        io: &(impl MmioWindow + ?Sized),
-        mode: &Mode,
-        tiling: Tiling,
-    ) -> Result<Self, FsError> {
-        Ok(Self::compute_state(io, mode, tiling, 0)?.0)
-    }
-    /// The full transaction state for this mode; WM/DDB do not depend on
-    /// the CDCLK floor, only the clock/PM demand parts do.
-    fn compute_state(
-        io: &(impl MmioWindow + ?Sized),
-        mode: &Mode,
-        tiling: Tiling,
-        min_cdclk_khz: u32,
-    ) -> Result<(Self, res::State), FsError> {
-        if mode.pixel_clock_khz == 0
-            || mode.pixel_clock_khz > 1_305_600
-            || mode.h_active == 0
-            || mode.h_active >= mode.h_total
-            || mode.v_active == 0
-            || mode.v_active >= mode.v_total
-        {
-            return Err(FsError::Unsupported);
-        }
-        let latency = Latency::read(io)?;
-        let state = res::compute(&request(mode, tiling, min_cdclk_khz), &latency)
-            .map_err(|_| FsError::Unsupported)?;
+    /// Pipe A's share of `state` for `mode`: its primary ends where the
+    /// always-budgeted cursor starts, both keep their level-0 watermark and
+    /// both images are encodable.
+    fn share(mode: &Mode, latency: &Latency, state: &res::State) -> Result<Self, FsError> {
         let alloc = &state.dbuf.pipes[0];
         let timing = wm::Timing {
             pixel_rate_khz: mode.pixel_clock_khz,
@@ -160,20 +145,16 @@ impl Profile {
             cursor: alloc.cursor_wm,
             cursor_start: alloc.cursor.start,
             cursor_ddb: alloc.cursor.reg(),
-            wm_level_disabled: wm::wm_level_disabled(timing, &latency, wm0)
+            primary_ddb: alloc.planes[0].reg(),
+            wm_level_disabled: wm::wm_level_disabled(timing, latency, wm0)
                 .map_err(|_| FsError::Unsupported)?,
         };
-        // The fixed owner admits only the joined single-pipe layout whose
-        // primary and cursor both hold their level-0 watermark.
-        if !state.dbuf.joined
-            || alloc.absolute
-                != (crate::intel_gpu_xelpg_dbuf::Entry {
-                    start: 0,
-                    end: 4096,
-                })
-            || alloc.cursor.end != 4096
-            || alloc.planes[0].start != 0
+        if state.dbuf.active_pipes & 1 == 0
+            || alloc.planes[0].size() == 0
+            || alloc.planes[0].start != alloc.ddb.start
             || alloc.planes[0].end != alloc.cursor.start
+            || alloc.cursor.end != alloc.ddb.end
+            || alloc.planes[1..].iter().any(|p| p.size() != 0)
             || !profile.primary.levels[0].enable
             || !profile.cursor.levels[0].enable
             || res::cursor_wm_image(0, &profile.cursor).is_none()
@@ -181,7 +162,84 @@ impl Profile {
         {
             return Err(FsError::Unsupported);
         }
+        Ok(profile)
+    }
+    fn valid_mode(mode: &Mode) -> Result<(), FsError> {
+        if mode.pixel_clock_khz == 0
+            || mode.pixel_clock_khz > 1_305_600
+            || mode.h_active == 0
+            || mode.h_active >= mode.h_total
+            || mode.v_active == 0
+            || mode.v_active >= mode.v_total
+        {
+            return Err(FsError::Unsupported);
+        }
+        Ok(())
+    }
+    /// The full single-pipe transaction state for this mode; WM/DDB do not
+    /// depend on the CDCLK floor, only the clock/PM demand parts do.
+    fn compute_state(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        tiling: Tiling,
+        min_cdclk_khz: u32,
+    ) -> Result<(Self, res::State), FsError> {
+        Self::valid_mode(mode)?;
+        let latency = Latency::read(io)?;
+        let state = res::compute(&request(mode, tiling, min_cdclk_khz), &latency)
+            .map_err(|_| FsError::Unsupported)?;
+        let profile = Self::share(mode, &latency, &state)?;
+        // The fixed owner's single-pipe layout is the joined one, with the
+        // whole DBUF behind Pipe A.
+        if !state.dbuf.joined
+            || state.dbuf.pipes[0].absolute
+                != (crate::intel_gpu_xelpg_dbuf::Entry {
+                    start: 0,
+                    end: 4096,
+                })
+        {
+            return Err(FsError::Unsupported);
+        }
         Ok((profile, state))
+    }
+    /// The published multi-pipe layout retiled to Pipe A's `tiling`, after
+    /// proving its Pipe-A request is the owned panel profile of `mode`.
+    fn multi_state(
+        mode: &Mode,
+        tiling: Tiling,
+        layout: &Layout,
+        latency: &Latency,
+    ) -> Result<res::State, FsError> {
+        Self::valid_mode(mode)?;
+        let panel = request(mode, Tiling::Linear, 0).pipes[0];
+        let mut held = layout.state.requests[0];
+        if let Some(plane) = held.as_mut().and_then(|p| p.planes[0].as_mut()) {
+            plane.tiling = Tiling::Linear;
+        }
+        if held != panel || layout.state.requests[1..].iter().all(Option::is_none) {
+            return Err(FsError::Unsupported);
+        }
+        layout
+            .state
+            .retile(0, tiling, latency)
+            .map_err(|_| FsError::Unsupported)
+    }
+    /// Pipe A's share for `tiling` in the single (`None`) or multi-pipe
+    /// layout.
+    fn compute_for_layout(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        tiling: Tiling,
+        layout: Option<&Layout>,
+    ) -> Result<Self, FsError> {
+        match layout {
+            None => Ok(Self::compute_state(io, mode, tiling, 0)?.0),
+            Some(layout) => {
+                let latency = Latency::read(io)?;
+                let state = Self::multi_state(mode, tiling, layout, &latency)?;
+                Self::share(mode, &latency, &state)
+            }
+        }
     }
     pub(crate) fn cursor_registers(self, enabled: bool) -> alloc::vec::Vec<(u64, u32)> {
         let wm = if enabled {
@@ -241,19 +299,33 @@ impl Profile {
         }
         Ok(())
     }
-    fn capture_globals(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+    /// The globals of whichever layout holds, with Pipe A's linear/X
+    /// primary image: the owned single-pipe layout, else the published
+    /// multi-pipe one (`Some`). Every proof reads the hardware; the
+    /// published layout only names what to expect.
+    fn capture_globals(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+    ) -> Result<(Self, Option<Layout>), FsError> {
         if !display14(io)? {
             return Err(FsError::Unsupported);
         }
-        // The joined allocation and one-active-pipe PM demand belong to
-        // Pipe A alone. An enabled blank foreign pipe still consumes global
-        // display resources, even when none of its fetchers is enabled.
-        for pipe in 1..4 {
-            if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
-                return Err(FsError::Unsupported);
-            }
+        match Self::capture_single(io, mode) {
+            Ok(profile) => return Ok((profile, None)),
+            Err(FsError::Unsupported) => {}
+            Err(error) => return Err(error),
         }
-        let (profile, state) = Self::compute_state(io, mode, Tiling::Linear, 0)?;
+        let layout =
+            crate::intel_gpu_xelpg_pipes::published_layout().ok_or(FsError::Unsupported)?;
+        Ok((Self::capture_multi(io, mode, &layout)?, Some(layout)))
+    }
+    /// The PM demand, MBUS/DBOX, IPC and DBUF slice proof shared by both
+    /// layouts, against `state`.
+    fn check_shared_globals(
+        io: &(impl MmioWindow + ?Sized),
+        state: &res::State,
+        mbus_ok: impl Fn(u32) -> bool,
+    ) -> Result<(), FsError> {
         let req0 = read(io, REQUEST0)?;
         let req1 = read(io, REQUEST1)?;
         // Every acknowledged PM demand field covers the computed state, and
@@ -261,32 +333,100 @@ impl Profile {
         // (0xffff keeps SAGV masked).
         let held = crate::intel_gpu_pmdemand::Params::decode(req0, req1);
         let need = state.pmdemand;
-        // mbus_ctl_join_update selects the joined pipe when it stays lit
-        // without a modeset (intel_mbus_joined_pipe) and NONE otherwise: the
-        // owned modeset joins with NONE, while a live repartition that
-        // re-joins around a lit Pipe A selects Pipe A. Linux's MBUS readout
-        // takes only MBUS_JOIN, so either select is the joined profile.
         let mbus = read(io, crate::intel_gpu_xelpg_dbuf::MBUS_CTL)?
             & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK;
-        let mbus_joined =
-            mbus == state.dbuf.mbus_ctl() || mbus == state.dbuf.mbus_ctl_select(Some(0));
         if held.qclk_gv_bw != need.qclk_gv_bw
             || held.max(&need) != held
             || read(io, 0x44468)? & (1 << 27) != 0
             || read(io, REQUEST1)? & ENABLE != 0
             || read(io, INFLIGHT)? & (1 << 26) != 0
-            || !mbus_joined
-            || read(io, crate::intel_gpu_xelpg_dbuf::dbox_ctl(0))? != state.dbuf.dbox(0)
+            || !mbus_ok(mbus)
             || read(io, 0x45004)? & (1 << 3) == 0
-            || read(io, res::plane_buf_cfg(0, 0))? != state.dbuf.pipes[0].planes[0].reg()
-            || read(io, res::cursor_buf_cfg(0))? != profile.cursor_ddb
         {
             return Err(FsError::Unsupported);
+        }
+        for pipe in 0..res::PIPES {
+            if state.dbuf.active_pipes & (1 << pipe) != 0
+                && read(io, crate::intel_gpu_xelpg_dbuf::dbox_ctl(pipe))? != state.dbuf.dbox(pipe)
+            {
+                return Err(FsError::Unsupported);
+            }
         }
         for (slice, r) in DBUFS.into_iter().enumerate() {
             let want = state.dbuf.dbuf_ctl(slice, 0, state.dbuf.enabled_slices);
             let want = want | ((want >> 1) & (1 << 30));
             if read(io, r)? & 0xc0ff0000 != want & 0xc0ff0000 {
+                return Err(FsError::Unsupported);
+            }
+        }
+        Ok(())
+    }
+    /// The owned single-pipe layout: every other pipe off, the joined
+    /// allocation and one-active-pipe PM demand of Pipe A alone.
+    fn capture_single(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
+        // An enabled blank foreign pipe still consumes global display
+        // resources, even when none of its fetchers is enabled.
+        for pipe in 1..4 {
+            if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
+                return Err(FsError::Unsupported);
+            }
+        }
+        let (profile, state) = Self::compute_state(io, mode, Tiling::Linear, 0)?;
+        // mbus_ctl_join_update selects the joined pipe when it stays lit
+        // without a modeset (intel_mbus_joined_pipe) and NONE otherwise: the
+        // owned modeset joins with NONE, while a live repartition that
+        // re-joins around a lit Pipe A selects Pipe A. Linux's MBUS readout
+        // takes only MBUS_JOIN, so either select is the joined profile.
+        Self::check_shared_globals(io, &state, |mbus| {
+            mbus == state.dbuf.mbus_ctl() || mbus == state.dbuf.mbus_ctl_select(Some(0))
+        })?;
+        if read(io, res::plane_buf_cfg(0, 0))? != profile.primary_ddb
+            || read(io, res::cursor_buf_cfg(0))? != profile.cursor_ddb
+        {
+            return Err(FsError::Unsupported);
+        }
+        Ok(profile)
+    }
+    /// The multi-pipe layout the Pipe B–D owner published: its Pipe-A
+    /// request is the owned panel of `mode`, every pipe outside it is off,
+    /// the globals cover it, and every pipe's plane and cursor DDB is
+    /// exactly its entry (so no allocation, foreign or stale, overlaps
+    /// Pipe A's).
+    fn capture_multi(
+        io: &(impl MmioWindow + ?Sized),
+        mode: &Mode,
+        layout: &Layout,
+    ) -> Result<Self, FsError> {
+        let latency = Latency::read(io)?;
+        let state = Self::multi_state(mode, Tiling::Linear, layout, &latency)?;
+        let profile = Self::share(mode, &latency, &state)?;
+        for pipe in 1..res::PIPES {
+            if state.requests[pipe].is_none()
+                && read(io, 0x70008 + pipe as u64 * 0x1000)? & 0xc0000000 != 0
+            {
+                return Err(FsError::Unsupported);
+            }
+        }
+        // MBUS_JOIN and the hashing mode are the layout's; the select is
+        // NONE (an all-off commit) or the formerly joined pipe the live
+        // unjoin kept (mbus_ctl_join_update), which must be active here.
+        let base = state.dbuf.mbus_ctl() & !(7 << 26);
+        Self::check_shared_globals(io, &state, |mbus| {
+            let select = (mbus >> 26) & 7;
+            mbus & !(7 << 26) == base
+                && (select == 7 || state.dbuf.active_pipes & (1 << select) != 0)
+        })?;
+        for pipe in 0..res::PIPES {
+            let active = state.dbuf.active_pipes & (1 << pipe) != 0;
+            let alloc = &state.dbuf.pipes[pipe];
+            for plane in 0..res::PLANES {
+                let want = if active { alloc.planes[plane].reg() } else { 0 };
+                if read(io, res::plane_buf_cfg(pipe, plane))? != want {
+                    return Err(FsError::Unsupported);
+                }
+            }
+            let want = if active { alloc.cursor.reg() } else { 0 };
+            if read(io, res::cursor_buf_cfg(pipe))? != want {
                 return Err(FsError::Unsupported);
             }
         }
@@ -300,21 +440,18 @@ impl Profile {
         profile
     }
     fn capture_layout_inner(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
-        let mut profile = Self::capture_globals(io, mode)?;
+        let (mut profile, layout) = Self::capture_globals(io, mode)?;
         // X-tiled takes the linear watermark arithmetic on display >= 10.
-        match read(io, 0x70180)? & (7 << 10) {
-            0 => {}
-            0x400 => {
-                let layout = Self::compute_for_layout(io, mode, Tiling::X)?;
-                profile.primary = layout.primary;
-                profile.wm_level_disabled = layout.wm_level_disabled;
-            }
-            0x1400 => {
-                let layout = Self::compute_for_layout(io, mode, Tiling::Tile4)?;
-                profile.primary = layout.primary;
-                profile.wm_level_disabled = layout.wm_level_disabled;
-            }
+        let tiling = match read(io, 0x70180)? & (7 << 10) {
+            0 => None,
+            0x400 => Some(Tiling::X),
+            0x1400 => Some(Tiling::Tile4),
             _ => return Err(FsError::Unsupported),
+        };
+        if let Some(tiling) = tiling {
+            let share = Self::compute_for_layout(io, mode, tiling, layout.as_ref())?;
+            profile.primary = share.primary;
+            profile.wm_level_disabled = share.wm_level_disabled;
         }
         verify_primary(io, profile.primary)?;
         Ok(profile)
@@ -334,17 +471,19 @@ fn verify_primary(io: &(impl MmioWindow + ?Sized), wm: PlaneWm) -> Result<(), Fs
 }
 
 /// Retained primary watermark ownership. Only shadowed primary WM registers
-/// vary; the acknowledged PM demand, DBUF/MBUS and cursor partition never do.
-/// A pending image survives cancellation and partial writes until a verified
-/// original console latch. Neither GT reset nor command retirement alone
-/// authorizes forgetting it.
+/// vary under this owner; the acknowledged PM demand, DBUF/MBUS and cursor
+/// partition change only when the Pipe B–D owner repartitions around the
+/// panel (an external output added or removed), never under this owner. The
+/// images are therefore derived from whichever layout is proved programmed
+/// at each use. A pending image survives cancellation and partial writes
+/// until a verified original console latch. Neither GT reset nor command
+/// retirement alone authorizes forgetting it.
 #[derive(Debug)]
 pub(crate) struct Primary {
     mode: Mode,
-    original: Profile,
-    tile4: PlaneWm,
-    /// `wm_level_disabled` of the Tile4 image.
-    tile4_wm_level_disabled: bool,
+    /// `wm_level_disabled` of the linear/X and the Tile4 image. It depends
+    /// only on Pipe A's planes and timing, never on the layout.
+    wm_level_disabled: [bool; 2],
     current_tile4: bool,
     pending: Option<bool>,
 }
@@ -370,23 +509,30 @@ impl Primary {
             return Err(FsError::Unsupported);
         }
         let original = Profile::capture(io, &mode)?;
-        let tile4 = Profile::compute_for_layout(io, &mode, Tiling::Tile4)?;
-        Ok(Self {
+        let mut primary = Self {
             mode,
-            original,
-            tile4: tile4.primary,
-            tile4_wm_level_disabled: tile4.wm_level_disabled,
+            wm_level_disabled: [original.wm_level_disabled; 2],
             current_tile4: false,
             pending: None,
-        })
+        };
+        let [_, tile4] = primary.images(io)?;
+        primary.wm_level_disabled[1] = tile4.wm_level_disabled;
+        Ok(primary)
+    }
+    /// Pipe A's linear/X and Tile4 shares of the layout proved programmed
+    /// now (globals and CDCLK included).
+    fn images(&self, io: &(impl MmioWindow + ?Sized)) -> Result<[Profile; 2], FsError> {
+        let (linear, layout) = Profile::capture_globals(io, &self.mode)?;
+        Profile::check_cdclk(io, &self.mode)?;
+        if read(io, 0x7026c)? & (1 << 19) == 0 {
+            return Err(FsError::Unsupported);
+        }
+        let tile4 = Profile::compute_for_layout(io, &self.mode, Tiling::Tile4, layout.as_ref())?;
+        Ok([linear, tile4])
     }
     /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.
     pub(crate) fn wm_level_disabled(&self, tile4: bool) -> bool {
-        if tile4 {
-            self.tile4_wm_level_disabled
-        } else {
-            self.original.wm_level_disabled
-        }
+        self.wm_level_disabled[usize::from(tile4)]
     }
     /// The image a staged update moves to, if one is pending.
     pub(crate) fn pending_tile4(&self) -> Option<bool> {
@@ -399,21 +545,6 @@ impl Primary {
             .is_none()
             .then(|| self.wm_level_disabled(self.current_tile4))
     }
-    pub(crate) fn check_globals(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
-        let profile = Profile::capture_globals(io, &self.mode)?;
-        Profile::check_cdclk(io, &self.mode)?;
-        if profile != self.original || read(io, 0x7026c)? & (1 << 19) == 0 {
-            return Err(FsError::Unsupported);
-        }
-        Ok(())
-    }
-    fn image(&self, tile4: bool) -> PlaneWm {
-        if tile4 {
-            self.tile4
-        } else {
-            self.original.primary
-        }
-    }
     /// Prove the programmed image (globals always; the primary image when no
     /// update is pending) and publish its `wm_level_disabled` (unknown
     /// while pending or on failure).
@@ -423,7 +554,7 @@ impl Primary {
         result
     }
     fn check_current_inner(&self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
-        self.check_globals(io)?;
+        let images = self.images(io)?;
         if self.pending.is_none() {
             let tiling = read(io, 0x70180)? & (7 << 10);
             if if self.current_tile4 {
@@ -433,7 +564,7 @@ impl Primary {
             } {
                 return Err(FsError::Unsupported);
             }
-            verify_primary(io, self.image(self.current_tile4))?;
+            verify_primary(io, images[usize::from(self.current_tile4)].primary)?;
         }
         Ok(())
     }
@@ -446,7 +577,7 @@ impl Primary {
             return Err(FsError::Busy);
         }
         self.check_current(io)?;
-        let image = primary_registers(self.image(tile4))?;
+        let image = primary_registers(self.images(io)?[usize::from(tile4)].primary)?;
         self.pending = Some(tile4);
         wm::publish_pipe_a(None);
         Ok(image.to_vec())
@@ -460,9 +591,9 @@ impl Primary {
         self.pending.is_some()
     }
     pub(crate) fn complete(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
-        self.check_globals(io)?;
+        let images = self.images(io)?;
         let target = self.pending.ok_or(FsError::Busy)?;
-        verify_primary(io, self.image(target))?;
+        verify_primary(io, images[usize::from(target)].primary)?;
         self.current_tile4 = target;
         self.pending = None;
         wm::publish_pipe_a(self.current_wm_level_disabled());
@@ -472,14 +603,14 @@ impl Primary {
     /// exclusion. These are shadow writes; only the following original
     /// console SURF latch plus readback completes restoration.
     pub(crate) fn restore(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<Profile, FsError> {
-        self.check_globals(io)?;
-        let image = primary_registers(self.original.primary)?;
+        let [original, _] = self.images(io)?;
+        let image = primary_registers(original.primary)?;
         self.pending = Some(false); // retained before the first possible write
         wm::publish_pipe_a(None);
         for (r, value) in image {
             checked(io, r, value)?;
         }
-        Ok(self.original)
+        Ok(original)
     }
 }
 /// None is a strict, read-only refusal before writes: older boot modes may

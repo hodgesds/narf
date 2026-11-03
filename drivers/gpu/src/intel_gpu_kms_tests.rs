@@ -1885,5 +1885,8 @@ kernel_test_in!(
 #[path = "intel_gpu_color_kms_tests.rs"]
 mod color;
 #[cfg(target_arch = "x86_64")]
+#[path = "intel_gpu_kms_multipipe_tests.rs"]
+mod multipipe;
+#[cfg(target_arch = "x86_64")]
 #[path = "intel_gpu_psr_kms_tests.rs"]
 mod psr;

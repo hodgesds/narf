@@ -195,6 +195,8 @@ const FRMCOUNT: u64 = 0x70040;
 const CONF: u64 = 0x70008;
 const CURCNTR: u64 = 0x70080;
 const CURBASE: u64 = 0x70084;
+/// `CUR_WM(pipe, 0)`.
+const CUR_WM0: u64 = 0x70140;
 const PLANE_CTL: u64 = 0x70180;
 const PLANE_SURF: u64 = 0x7019c;
 const DSB_CTRL: u64 = 0x70b08;
@@ -208,6 +210,15 @@ fn lit(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<bool, ResourceErr
 
 fn cursor_on(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<bool, ResourceError> {
     Ok(read(io, pipe_reg(CURCNTR, pipe))? & 0x27 != 0)
+}
+
+/// Whether a lit pipe's cursor watermarks are programmed: its cursor is
+/// on, or its owner programmed them for a cursor it keeps enabled while
+/// positioned off screen (the KMS cursor owner follows its enable, not
+/// the visibility). `CUR_WM(pipe, 0)` is never zero for a programmed
+/// image: every admitted cursor keeps its level-0 watermark.
+fn cursor_wm_on(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<bool, ResourceError> {
+    Ok(cursor_on(io, pipe)? || read(io, pipe_reg(CUR_WM0, pipe))? != 0)
 }
 
 /// Lit pipes stay lit, every other pipe is completely off, and no DSB or
@@ -312,7 +323,7 @@ fn update_pipe(
         .as_ref()
         .ok_or(ResourceError::Unsupported)?;
     let image = state
-        .pipe_registers(pipe, cursor_on(io, pipe)?)
+        .pipe_registers(pipe, cursor_wm_on(io, pipe)?)
         .ok_or(ResourceError::Unsupported)?;
     let mut arms = Vec::new();
     for plane in 0..PLANES as u64 {
@@ -638,7 +649,7 @@ pub(crate) fn commit_live(
             continue;
         }
         let image = old
-            .pipe_registers(pipe, cursor_on(io, pipe)?)
+            .pipe_registers(pipe, cursor_wm_on(io, pipe)?)
             .ok_or(ResourceError::Unsupported)?;
         for (r, v) in image {
             if read(io, r)? != v {

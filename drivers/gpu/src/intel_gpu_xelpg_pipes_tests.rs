@@ -4,6 +4,7 @@ use super::*;
 use crate::intel_gpu_dc_states::NoPipeDmc;
 use crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK;
 use crate::intel_gpu_xelpg_live::tests::{latency, programmed, Live};
+use crate::intel_gpu_xelpg_pipes::published_layout;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -334,4 +335,69 @@ fn smoke_xelpg_pipes_release_of_last_pipe_forgets_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_pipes",
     smoke_xelpg_pipes_release_of_last_pipe_forgets_state
+);
+
+fn smoke_xelpg_pipes_publish_layout_and_follow_a_tile4_panel_flip() -> TestResult {
+    // The owner publishes what it programmed while Pipe B is part of it.
+    // The panel's KMS owner then flips Pipe A to Tile4 (its primary
+    // watermarks only, as Primary::stage does in this layout); the release
+    // retiles the programmed state first, so the live commit does not see
+    // a divergence, and Pipe A keeps its Tile4 primary image.
+    crate::intel_gpu_xelpg_pipes::reset_published_layout();
+    let hw = lit_panel();
+    let Ok(mut pipes) = Pipes::adopt_panel(&hw, &Mode::VESA_1024X768_60) else {
+        return TestResult::Fail("the owned panel must be adopted");
+    };
+    if published_layout().is_some() {
+        return TestResult::Fail("the panel alone publishes no multi-pipe layout");
+    }
+    let ok = pipes.reserve(&hw, &external(Pipe::B), &NoPipeDmc).is_ok()
+        && pipes.program_timings(&hw, Pipe::B).is_ok()
+        && pipes.enable(&hw, Pipe::B).is_ok()
+        && pipes.arm_primary(&hw, Pipe::B).is_ok();
+    if !ok {
+        return TestResult::Fail("Pipe B must light beside the panel");
+    }
+    let Some(layout) = published_layout() else {
+        return TestResult::Fail("the reservation must publish the layout");
+    };
+    if Some(&layout.state) != pipes.state()
+        || layout.surfaces != [None, Some(0x0200_0000), None, None]
+    {
+        return TestResult::Fail("the published layout must be the programmed one");
+    }
+    let Ok(tile4) = layout.state.retile(0, Tiling::Tile4, &latency()) else {
+        return TestResult::Fail("Tile4 must retile within Pipe A's allocation");
+    };
+    if tile4.dbuf.pipes[0].planes != layout.state.dbuf.pipes[0].planes
+        || tile4.dbuf.pipes[0].cursor_wm != layout.state.dbuf.pipes[0].cursor_wm
+        || tile4.pmdemand != layout.state.pmdemand
+        || tile4.dbuf.pipes[1] != layout.state.dbuf.pipes[1]
+    {
+        return TestResult::Fail("a retile must change only Pipe A's primary watermarks");
+    }
+    for (r, v) in res::plane_wm_image(0, 0, &tile4.dbuf.pipes[0].wm[0]).unwrap() {
+        hw.set(r, v);
+    }
+    hw.set(0x70180, hw.get(0x70180) | (5 << 10));
+    let ok = pipes.disable_primary(&hw, Pipe::B).is_ok() && pipes.disable(&hw, Pipe::B).is_ok();
+    if !ok || pipes.release(&hw, Pipe::B, &NoPipeDmc).is_err() {
+        return TestResult::Fail("the release must follow the panel's Tile4 flip");
+    }
+    let Ok(single) = panel_state().retile(0, Tiling::Tile4, &latency()) else {
+        return TestResult::Fail("the single-pipe Tile4 image must compute");
+    };
+    for (r, v) in single.pipe_registers(0, false).unwrap() {
+        if hw.get(r) != v {
+            return TestResult::Fail("Pipe A must hold its single-pipe Tile4 image");
+        }
+    }
+    if published_layout().is_some() || pipes.state() != Some(&single) {
+        return TestResult::Fail("the release must withdraw the multi-pipe layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_pipes",
+    smoke_xelpg_pipes_publish_layout_and_follow_a_tile4_panel_flip
 );

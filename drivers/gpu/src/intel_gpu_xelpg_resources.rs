@@ -378,6 +378,54 @@ pub(crate) fn cursor_buf_cfg(pipe: usize) -> u64 {
 }
 
 impl State {
+    /// The programmed state after an owner changed only `pipe`'s primary
+    /// tiling, as the KMS primary owner does
+    /// ([`crate::intel_gpu_display_resources::Primary::stage`]): that
+    /// primary takes the watermarks `compute` gives for `tiling`, while every
+    /// DDB entry, the cursor watermarks, the clock and the PM demand stay as
+    /// programmed. Pure. A tiling that would move any DDB entry or change
+    /// the slice/join layout is refused (`Diverged`); one universal plane
+    /// per pipe keeps its whole pipe allocation, so this never happens for
+    /// the owned layouts.
+    pub(crate) fn retile(
+        &self,
+        pipe: usize,
+        tiling: Tiling,
+        latency: &Latency,
+    ) -> Result<State, ResourceError> {
+        let mut request = Request {
+            pipes: self.requests,
+            min_cdclk_khz: 0,
+        };
+        let plane = request
+            .pipes
+            .get_mut(pipe)
+            .and_then(Option::as_mut)
+            .and_then(|p| p.planes[0].as_mut())
+            .ok_or(ResourceError::Unsupported)?;
+        if plane.tiling == tiling {
+            return Ok(*self);
+        }
+        plane.tiling = tiling;
+        let fresh = compute(&request, latency)?;
+        if fresh.dbuf.active_pipes != self.dbuf.active_pipes
+            || fresh.dbuf.joined != self.dbuf.joined
+            || fresh.dbuf.slices != self.dbuf.slices
+            || fresh.dbuf.pipes.iter().zip(&self.dbuf.pipes).any(|(a, b)| {
+                a.absolute != b.absolute || a.planes != b.planes || a.cursor != b.cursor
+            })
+        {
+            return Err(ResourceError::Diverged);
+        }
+        let mut out = *self;
+        out.requests = fresh.requests;
+        out.dbuf.pipes[pipe].wm[0] = fresh.dbuf.pipes[pipe].wm[0];
+        if out.plane_registers().is_none() {
+            return Err(ResourceError::Unsupported);
+        }
+        Ok(out)
+    }
+
     /// Every plane/cursor WM and DDB register of every pipe. Planes of
     /// inactive pipes and disabled planes are zero, matching Linux's zeroed
     /// state for disabled planes; a hidden cursor keeps only its DDB.
