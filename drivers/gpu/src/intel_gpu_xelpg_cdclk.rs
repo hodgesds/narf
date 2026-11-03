@@ -410,26 +410,24 @@ pub(crate) fn restore(
             program(io, &now, rung)?;
             io.write32(CDCLK_CTL, original.ctl);
         }
-    } else {
-        if now.pll != original.pll || now.squash != original.squash || now.ctl != original.ctl {
-            execute(io, Step::SquashOff)?;
-            execute(io, Step::PllDisable)?;
-            if original.pll & PLL_ENABLE != 0 {
-                execute(
-                    io,
-                    Step::PllEnable {
-                        ratio: original.pll & PLL_RATIO_MASK,
-                    },
-                )?;
-            } else {
-                io.write32(
-                    DE_PLL_ENABLE,
-                    original.pll & !(PLL_ENABLE | PLL_LOCK | PLL_FREQ_REQ_ACK),
-                );
-            }
-            io.write32(CDCLK_SQUASH_CTL, original.squash);
-            io.write32(CDCLK_CTL, original.ctl);
+    } else if now.pll != original.pll || now.squash != original.squash || now.ctl != original.ctl {
+        execute(io, Step::SquashOff)?;
+        execute(io, Step::PllDisable)?;
+        if original.pll & PLL_ENABLE != 0 {
+            execute(
+                io,
+                Step::PllEnable {
+                    ratio: original.pll & PLL_RATIO_MASK,
+                },
+            )?;
+        } else {
+            io.write32(
+                DE_PLL_ENABLE,
+                original.pll & !(PLL_ENABLE | PLL_LOCK | PLL_FREQ_REQ_ACK),
+            );
         }
+        io.write32(CDCLK_SQUASH_CTL, original.squash);
+        io.write32(CDCLK_CTL, original.ctl);
     }
     let after = Current::read(io)?;
     if after.pll & (PLL_ENABLE | PLL_RATIO_MASK) != original.pll & (PLL_ENABLE | PLL_RATIO_MASK)

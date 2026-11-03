@@ -237,9 +237,11 @@ fn level(timing: Timing, wp: &Params, latency: u32, prev: Level) -> Result<Level
     let method2 = (lat * rate).div_ceil(u64::from(timing.htotal) * 1000) * wp.blocks_per_line;
     let selected = if wp.y_tiled {
         method2.max(wp.y_tile_minimum)
-    } else if wp.cpp * u64::from(timing.htotal) / BLOCK < 1 && wp.bytes_per_line / BLOCK < 1 {
-        method2
-    } else if u64::from(latency) >= wp.linetime_us {
+    } else if (wp.cpp * u64::from(timing.htotal) / BLOCK < 1 && wp.bytes_per_line / BLOCK < 1)
+        || u64::from(latency) >= wp.linetime_us
+    {
+        // Linux keeps these as two branches; display 14 selects method2 in
+        // both (only display 9 takes min(method1, method2) on the second).
         method2
     } else {
         method1

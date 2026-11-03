@@ -307,7 +307,7 @@ fn smoke_mtl_owned_modeset_lowers_known_cdclk_with_pmdemand_bracket() -> TestRes
         let w = io.writes.borrow();
         let mut it = w.iter().enumerate().filter(|(_, (r, _))| *r == reg);
         if last {
-            it.last().unwrap().0
+            it.next_back().unwrap().0
         } else {
             it.next().unwrap().0
         }

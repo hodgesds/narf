@@ -363,6 +363,9 @@ pub fn compute_plane_watermarks(
 /// Uncompressed Tile4, XRGB8888 and display14: the `y_tiled` branch of
 /// Linux b90c984d skl_compute_wm_params/plane_wm/transition_wm. The caller
 /// owns the fixed no-SAGV DDB allocation and validates it before exposure.
+/// The display-14 resource transaction (`intel_gpu_xelpg_wm`) replaced its
+/// production caller; native fixtures still pin these equations.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn compute_tile4_watermarks(
     params: &WmParams,
     latencies: &[u16; NUM_WM_LEVELS],

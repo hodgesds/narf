@@ -362,10 +362,12 @@ kernel_test_in!(
     smoke_xelpg_live_removes_pipe_and_rejoins_before_growth
 );
 
+type RefusalCase<'a> = (&'a dyn Fn(&Live), ResourceError);
+
 fn smoke_xelpg_live_refuses_before_writes() -> TestResult {
     let a = state(&[(0, panel())]);
     let ab = state(&[(0, panel()), (1, external())]);
-    let cases: [(&dyn Fn(&Live), ResourceError); 6] = [
+    let cases: [RefusalCase<'_>; 6] = [
         // Unknown firmware clock: Linux relocks only with all pipes off.
         (&|hw| hw.set(0x46000, 0), ResourceError::RequiresPipesOff),
         (&|hw| hw.set(0x70008, 0), ResourceError::Busy),
