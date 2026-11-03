@@ -69,7 +69,7 @@ use crate::intel_gpu_modeset_xelpg::{
     acknowledged_cdclk, mtl_cdclk_for_pixel_clock, program_cdclk_floor, XeLpgModeset,
 };
 use crate::intel_gpu_xelpg::{
-    disable_d2d, disable_port_pll_complete, enable_d2d, enable_port_pll_owned,
+    disable_d2d, disable_port_pll_complete, dp_pll_request, enable_d2d, enable_port_pll_state,
     program_port_buf_ctl, set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
     Cx0Phy, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
@@ -207,6 +207,9 @@ impl MtlSinkProbe {
     fn dp_alt(&self) -> bool {
         self.tc.is_some_and(|tc| tc.mode == TcMode::DpAlt)
     }
+    fn legacy(&self) -> bool {
+        self.tc.is_some_and(|tc| tc.mode == TcMode::Legacy)
+    }
 }
 
 /// Release a probe's AUX power request and Type-C ownership.
@@ -326,7 +329,7 @@ pub enum ActivateError {
     Failed(MtlExternalRoute, ExternalError),
 }
 
-fn wait_bit<M: MmioWindow + ?Sized>(
+pub(crate) fn wait_bit<M: MmioWindow + ?Sized>(
     io: &M,
     off: u64,
     mask: u32,
@@ -364,7 +367,7 @@ fn read<M: MmioWindow + ?Sized>(io: &M, off: u64) -> Result<u32, ExternalError> 
     }
 }
 
-fn request_well<M: MmioWindow + ?Sized>(io: &M, idx: u32) -> Result<(), ExternalError> {
+pub(crate) fn request_well<M: MmioWindow + ?Sized>(io: &M, idx: u32) -> Result<(), ExternalError> {
     let cur = read(io, PWR_WELL_CTL2)?;
     write(io, PWR_WELL_CTL2, cur | pwr_well_req(idx))?;
     if wait_bit(
@@ -382,7 +385,10 @@ fn request_well<M: MmioWindow + ?Sized>(io: &M, idx: u32) -> Result<(), External
 
 /// No-write preflight: pipe A, its primary plane, transcoder A's DDI
 /// function and the target DDI/PLL must all be off.
-fn preflight_idle<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> Result<(), ExternalError> {
+pub(crate) fn preflight_idle<M: MmioWindow + ?Sized>(
+    io: &M,
+    port: XeLpgPort,
+) -> Result<(), ExternalError> {
     if !io.display_access_ok() {
         return Err(ExternalError::AccessLost);
     }
@@ -478,7 +484,17 @@ fn program<M: MmioWindow + ?Sized>(
         .map_err(|_| ExternalError::Modeset(ModesetError::DisplayResourceUnavailable))?;
     program_cdclk_floor(io, &mode)?;
     // 5. Port PLL (intel_cx0pll_enable) for the planned width.
-    enable_port_pll_owned(io, port, pll_rate, lanes, route.probe.dp_alt()).map_err(phy_err)?;
+    // A legacy-mode C20 port also clears the MPLLB CAL_DONE banks first
+    // (intel_c20_protocol_switch_valid).
+    let request = dp_pll_request(
+        port,
+        pll_rate,
+        lanes,
+        route.probe.dp_alt(),
+        route.probe.legacy(),
+    )
+    .map_err(phy_err)?;
+    enable_port_pll_state(io, port, &request).map_err(phy_err)?;
     // 6.a TRANS_CLK_SEL = TGL_TRANS_CLK_SEL_PORT(phy).
     write(io, TRANS_CLK_SEL_A, (port.phy_index() + 1) << 28)?;
     // Timings, then 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.

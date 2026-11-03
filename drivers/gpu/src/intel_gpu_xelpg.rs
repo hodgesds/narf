@@ -1046,11 +1046,74 @@ fn c20_pll_program<M: MmioWindow + ?Sized>(
     state: &C20PllState,
     port_clock_khz: u32,
 ) -> Result<(), Cx0Error> {
-    let rate_idx = c20_dp_rate_index(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
+    let vdr = C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
+    c20_pll_program_vdr(phy, state, &vdr, false)
+}
+
+/// C20 VDR protocol parameters (`intel_c20_calc_vdr_params`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct C20Vdr {
+    /// `PHY_C20_VDR_CUSTOM_WIDTH` value (0 = DP 1.4 / HDMI TMDS).
+    pub custom_width: u8,
+    /// Serdes-rate byte bits under `C20_SERDES_RATE_MASK`.
+    pub serdes_rate: u8,
+    /// `PHY_C20_VDR_HDMI_RATE` value; `None` for DP (not written).
+    pub hdmi_rate: Option<u8>,
+}
+
+impl C20Vdr {
+    /// DP 1.4: width 0, `IS_DP | DP_RATE(intel_c20_get_dp_rate)`.
+    pub fn dp(port_clock_khz: u32) -> Option<Self> {
+        let rate = c20_dp_rate_index(port_clock_khz)?;
+        Some(Self {
+            custom_width: 0,
+            serdes_rate: C20_SERDES_IS_DP | (rate << 1),
+            hdmi_rate: None,
+        })
+    }
+    /// HDMI TMDS (25.175–600 MHz, not an FRL rate): width 0, no
+    /// serdes bits, `intel_c20_get_hdmi_rate` = 0.
+    pub const fn hdmi_tmds() -> Self {
+        Self {
+            custom_width: 0,
+            serdes_rate: 0,
+            hdmi_rate: Some(0),
+        }
+    }
+}
+
+/// `PHY_C20_VDR_HDMI_RATE`.
+pub const C20_VDR_HDMI_RATE: u16 = 0xD01;
+/// `PHY_C20_HDMI_RATE_MASK`.
+pub const C20_HDMI_RATE_MASK: u8 = 0x3;
+/// `RAWLANEAONX_DIG_TX_MPLLB_CAL_DONE_BANK(idx)` = 0x303D + idx.
+pub const fn c20_mpllb_cal_done_bank(idx: u16) -> u16 {
+    0x303D + idx
+}
+
+/// `intel_c20_pll_program` with explicit VDR parameters. With
+/// `protocol_switch` (`intel_c20_protocol_switch_valid`: a Type-C port in
+/// legacy mode) step 2 clears the lane-0 MPLLB CAL_DONE banks and waits
+/// 4 ms before the context write.
+fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    state: &C20PllState,
+    vdr: &C20Vdr,
+    protocol_switch: bool,
+) -> Result<(), Cx0Error> {
     // Step 1: current context selection (toggle bit of the
     // serdes-rate byte, read on lane 0).
     let serdes = phy.read(LANE0, C20_VDR_CUSTOM_SERDES_RATE)?;
     let cntx = serdes & C20_CONTEXT_TOGGLE != 0;
+    if protocol_switch {
+        for i in 0..4u16 {
+            phy.sram_write(LANE0, c20_mpllb_cal_done_bank(i), 0)?;
+        }
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ns(4_000_000),
+        );
+    }
     // Step 3: write the context the toggle bit does *not*
     // currently select (i915 writes context A when the bit reads
     // set, context B when it reads clear), then flip the bit in
@@ -1069,22 +1132,31 @@ fn c20_pll_program<M: MmioWindow + ?Sized>(
     for (i, word) in state.mpllb.iter().enumerate() {
         phy.sram_write(LANE0, mpllb_base - i as u16, *word)?;
     }
-    // Steps 4-6: VDR parameters — custom width 0 (DP 1.4) and the
-    // serdes rate byte (IS_DP | rate index), both lanes.
+    // Steps 4-6: VDR parameters (`intel_c20_program_vdr_params`) —
+    // custom width, the serdes rate byte and, for HDMI, the HDMI rate.
     phy.rmw(
         BOTH_LANES,
         C20_VDR_CUSTOM_WIDTH,
         C20_CUSTOM_WIDTH_MASK,
-        0,
+        vdr.custom_width,
         true,
     )?;
     phy.rmw(
         BOTH_LANES,
         C20_VDR_CUSTOM_SERDES_RATE,
         C20_SERDES_RATE_MASK,
-        C20_SERDES_IS_DP | (rate_idx << 1),
+        vdr.serdes_rate,
         true,
     )?;
+    if let Some(rate) = vdr.hdmi_rate {
+        phy.rmw(
+            BOTH_LANES,
+            C20_VDR_HDMI_RATE,
+            C20_HDMI_RATE_MASK,
+            rate & C20_HDMI_RATE_MASK,
+            true,
+        )?;
+    }
     // Step 7: toggle the context selection to load the new state.
     phy.rmw(
         BOTH_LANES,
@@ -1379,6 +1451,188 @@ fn program_pll_state<M: MmioWindow + ?Sized>(
         }
     }
 }
+
+/// A complete Cx0 PLL state for one port enable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Cx0PllState {
+    /// C10 bytes (DDI A/B).
+    C10(C10PllState),
+    /// C20 SRAM context words plus VDR protocol parameters (TC ports).
+    C20(C20PllState, C20Vdr),
+}
+
+/// Everything `intel_cx0pll_enable` needs beyond the port.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PllRequest {
+    /// PLL state for the port's PHY kind.
+    pub state: Cx0PllState,
+    /// Port clock in kHz (`DDI_CLK_VALFREQ`).
+    pub port_clock_khz: u32,
+    /// Active TX lanes (1, 2 or 4).
+    pub lane_count: u8,
+    /// DP-alt one-lane TX pattern.
+    pub dp_alt: bool,
+    /// `pll_state->ssc_enabled` (PORT_CLOCK_CTL SSC on PLLB).
+    pub ssc: bool,
+    /// HDMI protocol: C10 Wa_13013502646 powerdown toggle after lock.
+    pub hdmi: bool,
+    /// C20 legacy-mode protocol-switch CAL_DONE bank clear.
+    pub protocol_switch: bool,
+}
+
+/// `intel_cx0pll_enable` for an explicit PLL state (DP or HDMI TMDS):
+/// PORT_CLOCK_CTL (forward ungate, maxPCLK — FRL's DIV18CLK is not
+/// admitted — SSC on PLLB only when requested), lane reset, P2 ready,
+/// message-bus timer, PLL state, TX enables, `DDI_CLK_VALFREQ`, PCLK PLL
+/// request/ACK and, for HDMI on C10, the Wa_13013502646 P0→P2 toggle.
+pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    req: &PllRequest,
+) -> Result<(), Cx0Error> {
+    if !matches!(req.lane_count, 1 | 2 | 4) {
+        return Err(Cx0Error::UnsupportedRate);
+    }
+    let c10 = match (&req.state, port.phy()) {
+        (Cx0PllState::C10(_), PhyKind::C10) => true,
+        (Cx0PllState::C20(..), PhyKind::C20) => false,
+        _ => return Err(Cx0Error::UnsupportedRate),
+    };
+    let phy = Cx0Phy::new(mmio, port);
+    rmw(mmio, port.buf_ctl1(), PORT_BUF_REVERSAL, 0);
+    rmw(
+        mmio,
+        port.port_clock_ctl(),
+        LANE1_PHY_CLOCK_SELECT
+            | FORWARD_CLOCK_UNGATE
+            | DDI_CLOCK_SELECT_MASK
+            | SSC_ENABLE_PLLA
+            | SSC_ENABLE_PLLB,
+        FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK | if req.ssc { SSC_ENABLE_PLLB } else { 0 },
+    );
+    phy_lane_reset(mmio, port)?;
+    powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
+    phy.program_msgbus_timer();
+    match &req.state {
+        Cx0PllState::C10(state) => c10_pll_program(&phy, state)?,
+        Cx0PllState::C20(state, vdr) => c20_pll_program_vdr(&phy, state, vdr, req.protocol_switch)?,
+    }
+    program_phy_lane(&phy, req.lane_count, req.dp_alt)?;
+    if let Some(off) = port.clk_valfreq() {
+        mmio.write32(off, req.port_clock_khz);
+        compiler_fence(Ordering::SeqCst);
+    }
+    set_pclk_pll_request(mmio, port, true)?;
+    if req.hdmi && c10 {
+        powerdown_change(mmio, port, BOTH_LANES, P0_STATE_ACTIVE)?;
+        powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
+    }
+    Ok(())
+}
+
+/// The DP 1.4 PLL request for `rate` on `port` (C10 DP/eDP table or C20
+/// MPLLB table with DP VDR parameters, SSC form as shipped).
+pub fn dp_pll_request(
+    port: XeLpgPort,
+    rate: LinkRate,
+    lane_count: u8,
+    dp_alt: bool,
+    protocol_switch: bool,
+) -> Result<PllRequest, Cx0Error> {
+    let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    let state = match port.phy() {
+        PhyKind::C10 => Cx0PllState::C10(
+            *c10_pll_state(port_clock_khz, port.is_edp()).ok_or(Cx0Error::UnsupportedRate)?,
+        ),
+        PhyKind::C20 => Cx0PllState::C20(
+            *c20_pll_state(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
+            C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
+        ),
+    };
+    Ok(PllRequest {
+        state,
+        port_clock_khz,
+        lane_count,
+        dp_alt,
+        ssc: true,
+        hdmi: false,
+        protocol_switch,
+    })
+}
+
+/// HDMI TX levels (`intel_cx0_phy_set_signal_levels` for an HDMI
+/// encoder): C10 stages TX vboost 5 / termination 6
+/// (`intel_c10_get_tx_vboost_lvl` / `_term_ctl`, HDMI branch); all four
+/// TX lanes take the HDMI default entry — the last `mtl_c10_trans_dp14`
+/// preset on C10, `mtl_c20_trans_hdmi` preset 0 on C20.
+pub fn set_signal_levels_hdmi<M: MmioWindow + ?Sized>(phy: &Cx0Phy<'_, M>) -> Result<(), Cx0Error> {
+    let entry = match phy.port.phy() {
+        PhyKind::C10 => C10_TRANS_DP14[9],
+        PhyKind::C20 => C20_TRANS_HDMI[0],
+    };
+    phy.program_msgbus_timer();
+    phy.msgbus_access_begin(BOTH_LANES)?;
+    if phy.port.phy() == PhyKind::C10 {
+        phy.rmw(
+            BOTH_LANES,
+            c10_vdr_cmn(3),
+            C10_CMN3_TXVBOOST_MASK,
+            5 << 5,
+            false,
+        )?;
+        phy.rmw(
+            BOTH_LANES,
+            c10_vdr_tx(1),
+            C10_TX1_TERMCTL_MASK,
+            6 << 5,
+            true,
+        )?;
+    }
+    for ln in 0..4u16 {
+        let lane = ln / 2;
+        let tx = ln % 2;
+        let lane_mask = 1u8 << lane;
+        phy.rmw(
+            lane_mask,
+            cx0_vdrovrd_ctl(lane, tx, 0),
+            CX0_OVRD_LEVEL_MASK,
+            entry.pre_cursor,
+            true,
+        )?;
+        phy.rmw(
+            lane_mask,
+            cx0_vdrovrd_ctl(lane, tx, 1),
+            CX0_OVRD_LEVEL_MASK,
+            entry.vswing,
+            true,
+        )?;
+        phy.rmw(
+            lane_mask,
+            cx0_vdrovrd_ctl(lane, tx, 2),
+            CX0_OVRD_LEVEL_MASK,
+            entry.post_cursor,
+            true,
+        )?;
+    }
+    phy.rmw(
+        BOTH_LANES,
+        C10_VDR_OVRD,
+        0,
+        C10_VDR_OVRD_TX1 | C10_VDR_OVRD_TX2,
+        true,
+    )?;
+    phy.msgbus_access_commit(BOTH_LANES, false)?;
+    Ok(())
+}
+
+/// `mtl_c20_trans_hdmi` (`intel_ddi_buf_trans.c`), five presets.
+pub const C20_TRANS_HDMI: [SnpsTrans; 5] = [
+    snps(48, 0, 0),
+    snps(38, 4, 6),
+    snps(36, 4, 8),
+    snps(34, 4, 10),
+    snps(32, 4, 12),
+];
 
 /// Re-program the port PLL for a new rate after link training
 /// settled below the rate the PLL was first enabled at: drop the
