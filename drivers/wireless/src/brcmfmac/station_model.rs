@@ -59,6 +59,12 @@ struct Vif {
     joined: bool,
     /// Plain values of the bsscfg iovars/dcmds this interface was set.
     sets: Vec<(u32, Vec<u8>)>,
+    /// `p2p_da_override`: the P2P Device Address of the discovery bsscfg.
+    p2p_device: Option<[u8; 6]>,
+    /// The discovery bsscfg (ifidx/bsscfg 1, NOIF) exists (`p2p_disc 1`).
+    p2p_discovery: bool,
+    /// `BRCMF_E_IF_ROLE_*` of the `p2p_ifadd` connection bsscfg.
+    p2p_role: u8,
 }
 pub(super) struct Firmware {
     ap: Option<ap_model::Profile>,
@@ -352,6 +358,42 @@ impl Firmware {
             }
             23 if self.vif.joined => AP.to_vec(),
             23 => vec![0; 6],
+            // brcmf_p2p_tx_action_frame: `actframe` on the discovery bsscfg
+            // completes on-channel (BRCMF_E_ACTION_FRAME_COMPLETE, status
+            // success = ACK) and off-channel
+            // (BRCMF_E_ACTION_FRAME_OFF_CHAN_COMPLETE).
+            263 if input.starts_with(b"actframe\0") => {
+                let da = crate::brcmfmac::p2p_wire::af_da(&input[9..]);
+                self.vif.sets.push((command, input.to_vec()));
+                for kind in [
+                    crate::brcmfmac::p2p_wire::E_ACTION_FRAME_COMPLETE,
+                    crate::brcmfmac::p2p_wire::E_ACTION_FRAME_OFF_CHAN_COMPLETE,
+                ] {
+                    self.event_on(kind, (1, 1), da, &[]);
+                }
+                Vec::new()
+            }
+            // brcmf_p2p_escan: bsscfg `p2p_scan` 'E' answers with one
+            // partial BRCMF_E_ESCAN_RESULT of the P2P sync_id from the
+            // discovery bsscfg and the final success record.
+            263 if input.starts_with(b"p2p_scan\0") => {
+                self.vif.sets.push((command, input.to_vec()));
+                let result = scan_result(
+                    crate::brcmfmac::p2p_wire::ESCAN_SYNC_ID,
+                    false,
+                    self.channel,
+                    (false, None),
+                    None,
+                    None,
+                    None,
+                );
+                self.event(69, 8, 0, &result);
+                let bytes = self.events.back_mut().unwrap();
+                bytes[70] = 1;
+                bytes[71] = 1;
+                self.event(69, 0, 0, &[]);
+                Vec::new()
+            }
             // Read-only queries share the device answers.
             262 => self.command(command, input, maximum),
             _ => {
@@ -405,10 +447,38 @@ impl Firmware {
             }
             // p2p.c brcmf_p2p_add_vif / brcmf_p2p_del_vif for the one
             // modeled connection bsscfg (ifidx 1, bsscfg 1, role P2P_GO 3).
+            // `struct brcmf_fil_p2p_if_le` type: CLIENT 0 -> role
+            // BRCMF_E_IF_ROLE_P2P_CLIENT 2, GO 1 -> BRCMF_E_IF_ROLE_P2P_GO 3.
             263 if input.starts_with(b"p2p_ifadd\0") => {
-                assert_eq!(input[10 + 6], 1, "only a GO connection is modeled");
-                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, 3]);
+                self.vif.p2p_role = match input[10 + 6] {
+                    0 => 2,
+                    1 => 3,
+                    kind => panic!("p2p_ifadd type {kind} is not modeled"),
+                };
+                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, self.vif.p2p_role]);
                 Vec::new()
+            }
+            // brcmf_p2p_create_p2pdev: `p2p_da_override`, then `p2p_disc 1`
+            // creates the NOIF discovery bsscfg (BRCMF_E_IF ADD, flags
+            // BRCMF_E_IF_FLAG_NOIF, role P2P device 4) on ifidx/bsscfg 1;
+            // `p2p_disc 0` deletes it again (brcmf_p2p_deinit_discovery).
+            263 if input.starts_with(b"p2p_da_override\0") => {
+                self.vif.p2p_device = Some(input[16..22].try_into().unwrap());
+                Vec::new()
+            }
+            263 if input.starts_with(b"p2p_disc\0") => {
+                let enable = input[9..13] == 1u32.to_le_bytes();
+                if enable != self.vif.p2p_discovery {
+                    self.vif.p2p_discovery = enable;
+                    let action = if enable { 1 } else { 2 };
+                    let device = self.vif.p2p_device.expect("p2p_da_override first");
+                    self.event_on(54, (1, 1), device, &[1, action, 1, 1, 4]);
+                }
+                Vec::new()
+            }
+            262 if input.starts_with(b"p2p_dev\0") => {
+                assert!(self.vif.p2p_discovery, "p2p_dev before p2p_disc 1");
+                1u32.to_le_bytes().to_vec()
             }
             // brcmf_notify_connect_status_ap: the GO bsscfg's BRCMF_E_LINK
             // with BRCMF_E_REASON_LINK_BSSCFG_DIS (4) completes vif_disabled.
@@ -420,7 +490,7 @@ impl Firmware {
             }
             263 if input.starts_with(b"p2p_ifdel\0") => {
                 assert_eq!(&input[10..16], &VIF);
-                self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, 3]);
+                self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, self.vif.p2p_role]);
                 Vec::new()
             }
             263 if input.starts_with(b"bsscfg:interface_remove\0") => {
@@ -1343,6 +1413,11 @@ impl Handle {
     }
     pub(crate) fn hold_wide_bandwidth(&self) {
         self.change(|f| f.bandwidth_stuck = true);
+    }
+    /// Secondary-interface event with an event body (e.g. a P2P action
+    /// frame's `wl_event_rx_frame_data` + body on the discovery bsscfg).
+    pub(crate) fn secondary_event_data(&self, kind: u32, source: [u8; 6], data: &[u8]) {
+        self.change(|f| f.event_on(kind, (1, 1), source, data));
     }
     /// Secondary-interface event from the firmware (`if_idx`/`bsscfg_idx`).
     pub(crate) fn secondary_event(&self, kind: u32, flags: u16, source: [u8; 6]) {

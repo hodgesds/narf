@@ -1608,10 +1608,33 @@ bsscfg, escan diversion) and
 `smoke_brcmf_msgbuf_p2p_go_start_client_stop_and_delete`
 (`drivers/wireless/brcmfmac/vif`, BCM43602 CR4/msgbuf model: GO shell via
 `p2p_ifadd`, `start_ap` P2P_GO program on ifidx 1, client association,
-`bss` disable, `p2p_ifdis`/`p2p_ifdel`/IF DEL). Not written: the CYW SDIO
-transport-model P2P cases, a msgbuf-model discovery/listen/action/escan
-case and a P2P_CLIENT join case; the discovery and client paths are
-covered only at the scripted seam (`p2p_tests.rs`).
+`bss` disable, `p2p_ifdis`/`p2p_ifdel`/IF DEL).
+
+Transport-model P2P cases (written, unexecuted;
+`brcmfmac/p2p_transport_cases.rs`, run unmodified host
+`Owner`/`p2p::Device`/`Station` code over each real transport). The
+shared firmware model (`station_model.rs`) answers `p2p_da_override`,
+`p2p_disc 1/0` (NOIF IF ADD/DEL of the discovery bsscfg on ifidx/bsscfg 1,
+role 4), `p2p_dev` (1), bsscfg `actframe` (ACTION_FRAME_COMPLETE +
+OFF_CHAN_COMPLETE from the DA), bsscfg `p2p_scan` (one partial
+`BRCMF_E_ESCAN_RESULT` with sync_id 0x1234 from bsscfg 1, then success)
+and `p2p_ifadd` CLIENT (role 2) as well as GO (role 3).
+`discovery`: create (primary `p2p_da_override`/`p2p_disc`/`p2p_dev`),
+START (SCAN state on bsscfg 1), LISTEN ch 6/300 ms, action-frame RX and
+listen expiry notices, GON request `actframe` with ACK, the `DIRECT-`
+social SEARCH escan with PRBREQ `vndr_ie`, delete (`p2p_disc 0`).
+`client_join`: `p2p_ifadd` CLIENT on the primary, the secondary join only
+on ifidx 1, `p2p_ifdel` without `p2p_ifdis`. BCM43602 CR4/msgbuf
+(`vif_msgbuf_tests.rs`): `smoke_brcmf_msgbuf_p2p_discovery_listen_action_and_escan`,
+`smoke_brcmf_msgbuf_p2p_client_joins_on_ifidx_one`. CYW43439
+SDHCI/F2/SDPCM/BCDC (`ap_native_sdio_tests.rs`):
+`smoke_cyw_p2p_discovery_listen_action_and_escan_on_actual_sdio`,
+`smoke_cyw_p2p_client_joins_on_actual_sdio_bcdc_ifidx_one` and
+`smoke_cyw_p2p_go_start_client_stop_and_delete_on_actual_sdio` (GO shell
+by `p2p_ifadd`, the `start_ap` P2P_GO program on BCDC ifidx 1 with
+`bsscfg:ssid` before `bss` enable, a client association, `bss` disable at
+STOP, `p2p_ifdis` + `p2p_ifdel` at DEL_INTERFACE; the primary stays an
+unassociated station here, unlike the msgbuf GO case).
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
 written for this foundation.
 

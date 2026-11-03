@@ -99,6 +99,12 @@ impl Firmware {
         self.0.event_on(kind, (1, 1), source, &[]);
         self.0.events.back_mut().unwrap()[26..28].copy_from_slice(&flags.to_be_bytes());
     }
+    pub(crate) fn secondary_event_data(&mut self, kind: u32, source: [u8; 6], data: &[u8]) {
+        self.0.event_on(kind, (1, 1), source, data);
+    }
+    pub(crate) fn vif_sets(&self) -> Vec<(u32, Vec<u8>)> {
+        self.0.vif.sets.clone()
+    }
     pub(crate) fn vif_profile(&mut self) -> &mut ap_model::Profile {
         self.0.vif.ap.as_mut().unwrap()
     }

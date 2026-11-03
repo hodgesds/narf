@@ -1135,3 +1135,211 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_cyw_vif_secondary_station_joins_on_actual_sdio_bcdc_ifidx_one
 );
+
+impl crate::brcmfmac::p2p_transport_cases::Model for sdio_ap_model::Handle {
+    fn event(&self, kind: u32, source: [u8; 6], data: &[u8]) {
+        self.secondary_event_data(kind, source, data);
+    }
+    fn sets(&self) -> Vec<(u32, Vec<u8>)> {
+        self.vif_sets()
+    }
+    fn commands(&self) -> Vec<(u8, Vec<u8>)> {
+        self.command_ifidx()
+            .into_iter()
+            .zip(self.commands())
+            .map(|(ifidx, (_, body))| (ifidx, body))
+            .collect()
+    }
+}
+
+/// P2P_DEVICE discovery bsscfg (create, listen + action RX, action TX,
+/// SEARCH escan, delete) over the actual SDHCI/F2/SDPCM/BCDC transport.
+fn p2p_discovery() -> Result<(), &'static str> {
+    let b = SdioBound::new_station(b"ap sta wme p2p mchan\0")?;
+    let mut state = b.device.state.try_lock().ok_or("state")?;
+    crate::brcmfmac::p2p_transport_cases::discovery(&mut state.station, &b.bus)
+}
+fn smoke_cyw_p2p_discovery_listen_action_and_escan_on_actual_sdio() -> TestResult {
+    match p2p_discovery() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_cyw_p2p_discovery_listen_action_and_escan_on_actual_sdio
+);
+
+/// P2P_CLIENT `p2p_ifadd` + join on BCDC ifidx 1 + `p2p_ifdel`.
+fn p2p_client() -> Result<(), &'static str> {
+    let b = SdioBound::new_station(b"ap sta wme p2p mchan\0")?;
+    let mut state = b.device.state.try_lock().ok_or("state")?;
+    crate::brcmfmac::p2p_transport_cases::client_join(&mut state.station, &b.bus)
+}
+fn smoke_cyw_p2p_client_joins_on_actual_sdio_bcdc_ifidx_one() -> TestResult {
+    match p2p_client() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_cyw_p2p_client_joins_on_actual_sdio_bcdc_ifidx_one
+);
+
+/// P2P_GO shell over the actual SDIO/BCDC transport: `p2p_ifadd` GO on
+/// the primary, the `brcmf_cfg80211_start_ap` P2P_GO branch on BCDC
+/// ifidx 1 (`bsscfg:ssid` then `bss` enable, no `SET_AP`/`apsta`/`mbss`),
+/// a client association on the GO, `bss` disable at STOP and
+/// `p2p_ifdis` + `p2p_ifdel` at DEL_INTERFACE.
+fn p2p_go() -> Result<(), &'static str> {
+    const NAME: &str = "wlsgo9";
+    let b = SdioBound::new_station(b"ap sta wme p2p mchan\0")?;
+    b.bus.enable_vif_ap();
+    let owner = {
+        let mut state = b.device.state.try_lock().ok_or("state")?;
+        let mac = state.station.mac;
+        ready(vif::discover(&mut state.station.runtime, mac))?
+            .map_err(|_| "SDIO cap discovery")?
+            .ok_or("SDIO firmware cap refused")?
+    };
+    if !owner.features().p2p {
+        return Err("SDIO p2p cap token not parsed");
+    }
+    b.device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    vif::register_primary(&b.device);
+    let result = (|| {
+        let before_add = b.bus.commands().len();
+        let go = b
+            .device
+            .vif_new(NAME, 9, None)
+            .map_err(|_| "SDIO P2P_GO shell admission")?;
+        ready(b.device.vif_worker())?;
+        let commands = b.bus.commands();
+        let ifidx = b.bus.command_ifidx();
+        let added: Vec<_> = commands[before_add..]
+            .iter()
+            .zip(&ifidx[before_add..])
+            .collect();
+        if go.current_iftype() != 9
+            || go.ap_sme_capabilities() != Some(0)
+            || !added.iter().any(|((command, body), index)| {
+                *command == 263 && **index == 0 && body.starts_with(b"p2p_ifadd\0")
+            })
+            || added
+                .iter()
+                .any(|((_, body), _)| body.starts_with(b"interface_create\0"))
+        {
+            return Err("SDIO GO shell not created by p2p_ifadd");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("SDIO GO netdev handle")?;
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "SDIO GO admin authority")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = go.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            admin,
+            &iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "SDIO GO authority bind")?
+        .reserve()
+        .map_err(|_| "SDIO GO control reservation")?;
+        let vif_mac = crate::brcmfmac::runtime_tests::station_model::VIF;
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[vif_mac, vif_mac].concat());
+        let before = b.bus.commands().len();
+        ready(go.start_ap_with_settings_async(&authority, ap_config, settings))?
+            .map_err(|_| "SDIO P2P GO START")?;
+        let commands = b.bus.commands();
+        let ifidx = b.bus.command_ifidx();
+        let program: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+        let mut ssid = b"bsscfg:ssid\0".to_vec();
+        ssid.extend_from_slice(&1u32.to_le_bytes());
+        let mut enable = b"bss\0".to_vec();
+        enable.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0]);
+        let position = |prefix: &[u8]| {
+            program
+                .iter()
+                .position(|((_, body), _)| body.starts_with(prefix))
+        };
+        if program.iter().any(|(_, index)| **index != 1)
+            || program.iter().any(|((command, body), _)| {
+                matches!(*command, 2 | 3 | 26 | 118)
+                    || body.starts_with(b"apsta\0")
+                    || body.starts_with(b"mbss\0")
+                    || body.starts_with(b"closednet\0")
+            })
+            || position(&ssid).is_none()
+            || position(&enable).is_none()
+            || position(&ssid) >= position(&enable)
+        {
+            return Err("SDIO GO Program not the start_ap P2P_GO branch on bsscfg 1");
+        }
+        if !b.bus.vif_change(|p| p.active && p.up && p.formed) || !go.link_up() {
+            return Err("SDIO GO BSS not formed");
+        }
+        b.bus
+            .vif_change(|p| p.associate(CLIENT, association(false)));
+        for _ in 0..4 {
+            ready(b.device.vif_worker())?;
+        }
+        if source.count(19) != 1 {
+            return Err("SDIO GO NEW_STATION not observed on its shell");
+        }
+        let before = b.bus.commands().len();
+        ready(go.stop_ap_async(&authority))?.map_err(|_| "SDIO P2P GO STOP")?;
+        let mut disable = b"bss\0".to_vec();
+        disable.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        if !b.bus.commands()[before..]
+            .iter()
+            .any(|(command, body)| *command == 263 && *body == disable)
+            || b.bus.vif_change(|p| p.active || !p.peers.is_empty())
+            || go.link_up()
+        {
+            return Err("SDIO GO STOP not bss disable");
+        }
+        let before = b.bus.commands().len();
+        go.delete_virtual_interface()
+            .map_err(|_| "SDIO GO DEL_INTERFACE")?;
+        for _ in 0..6 {
+            ready(b.device.vif_worker())?;
+        }
+        let commands = b.bus.commands();
+        let ifdis = commands[before..]
+            .iter()
+            .position(|(_, body)| body.starts_with(b"p2p_ifdis\0"));
+        let ifdel = commands[before..]
+            .iter()
+            .position(|(_, body)| body.starts_with(b"p2p_ifdel\0"));
+        if ifdis.is_none()
+            || ifdel.is_none()
+            || ifdis >= ifdel
+            || narf_net::iface::lookup(NAME).is_some()
+        {
+            return Err("SDIO GO DEL not p2p_ifdis + p2p_ifdel + IF DEL");
+        }
+        Ok(())
+    })();
+    vif::withdraw_family(crate::cyw43439::fullmac::Family::Sdio);
+    result
+}
+fn smoke_cyw_p2p_go_start_client_stop_and_delete_on_actual_sdio() -> TestResult {
+    match p2p_go() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_cyw_p2p_go_start_client_stop_and_delete_on_actual_sdio
+);

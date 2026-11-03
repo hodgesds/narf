@@ -571,3 +571,58 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_brcmf_msgbuf_p2p_go_start_client_stop_and_delete
 );
+
+impl crate::brcmfmac::p2p_transport_cases::Model for firmware::Handle {
+    fn event(&self, kind: u32, source: [u8; 6], data: &[u8]) {
+        self.secondary_event_data(kind, source, data);
+    }
+    fn sets(&self) -> Vec<(u32, Vec<u8>)> {
+        self.vif_sets()
+    }
+    fn commands(&self) -> Vec<(u8, Vec<u8>)> {
+        self.command_ifidx()
+            .into_iter()
+            .zip(self.commands())
+            .map(|(ifidx, (_, body, _))| (ifidx, body))
+            .collect()
+    }
+}
+
+/// P2P_DEVICE discovery bsscfg over the actual CR4/msgbuf rings
+/// (`p2p_transport_cases::discovery`).
+fn p2p_discovery() -> Result<(), &'static str> {
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
+        .map_err(|_| "primary station over msgbuf")?;
+    crate::brcmfmac::p2p_transport_cases::discovery(&mut station, &bus)
+}
+
+fn smoke_brcmf_msgbuf_p2p_discovery_listen_action_and_escan() -> TestResult {
+    match p2p_discovery() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_p2p_discovery_listen_action_and_escan
+);
+
+/// P2P_CLIENT connection bsscfg join over the actual CR4/msgbuf rings.
+fn p2p_client() -> Result<(), &'static str> {
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    let mut station = block(Station::initialize(adapter, &[], firmware::domain()))
+        .map_err(|_| "primary station over msgbuf")?;
+    crate::brcmfmac::p2p_transport_cases::client_join(&mut station, &bus)
+}
+
+fn smoke_brcmf_msgbuf_p2p_client_joins_on_ifidx_one() -> TestResult {
+    match p2p_client() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_p2p_client_joins_on_ifidx_one
+);

@@ -144,6 +144,16 @@ impl Handle {
         state.firmware.secondary_event(kind, flags, source);
         state.outputs();
     }
+    /// Raise one event of ifidx/bsscfg 1 carrying `data`.
+    pub(super) fn secondary_event_data(&self, kind: u32, source: [u8; 6], data: &[u8]) {
+        let mut state = self.0.lock();
+        state.firmware.secondary_event_data(kind, source, data);
+        state.outputs();
+    }
+    /// Plain values set on ifidx 1 (`bsscfg:` prefix and index removed).
+    pub(super) fn vif_sets(&self) -> Vec<(u32, Vec<u8>)> {
+        self.0.lock().firmware.vif_sets()
+    }
     /// Create ifidx 1 as a firmware-SME AP.
     pub(super) fn enable_vif_ap(&self) {
         self.0.lock().firmware.enable_vif_ap();

@@ -145,3 +145,6 @@ mod vif_bsscfg_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod p2p_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod p2p_transport_cases;
