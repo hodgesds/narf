@@ -4172,9 +4172,36 @@ unadmitted. Unexecuted cases:
 `smoke_rtw8851b_full_radio_base_record_is_n51b_v2_exact_and_revocable`,
 `smoke_rtw8851b_channel_records_admit_exactly_their_profile_and_span`.
 
-**Remaining for the row.** the native composition (chip dispatch in
-`command_native`, RTL8851B startup assets/bootstrap, post-WCPU MAC and
-ring-geometry branches), coex (`rtw8851b_btc_*`,
+**RTL8851B native MAC, RX and table wiring.** `mac_runtime::Mac::prepare`
+admits RTL8851B (with its `n51_phycap`) on B's download geometry and runs the
+B sequence with mac.c's RTL8851B branches: rtw8851b.c
+`rtw8851b_mac_enable_bb_rf` (B's without the `R_AX_SPS_DIG_ON_CTRL0` ZCDC
+write; `rtw8851b_mac_disable_bb_rf` is byte-identical to B's, so terminal
+closure takes B's `radio_stop` path), `dle_clk_en_ax` with
+`B_AX_AXIDMA_CLK_EN`, `rtw8851b_dle_mem_pcie[SCC]` (`wde_size6` 512 link
+pages, `wde_qt6` 448/48/0/16, B's `ple_size6`/`ple_qt18`/`ple_qt58`) and
+`rtw8851b_hfc_param_ini_pcie` (ACH0..3 {5,343}, B0MGQ/B0HIQ {4,344}, pub
+448/448, the shared `hfc_preccfg_pcie`). Everything else in
+`rtw89_mac_init` is B's (`rtw89_is_rtl885xb` OCP/preload/SIFS 52B, TX
+partial mode clear, identical `rtw8851b_imr_info`/`rrsr_cfgs`).
+`Native::prepare_receive` and `rx_dma::Rx::prepare_for` admit RTL8851B on B's
+geometry (rtw8851be.c `rtw89_8851be_info` is field-for-field rtw8852be.c's).
+The register mailbox stays on the B block (`rtw8851b_h2c_regs`) but decodes
+with `Receipt::decode_51`; `query_firmware_phycap` requires
+`initial_profile_51` and an RTL8851B receipt, and `radio_profile_current`
+dispatches RTL8851B to its own identity + receipt check. `radio_access` admits
+RTL8851B with its PHY-cap and window (`NativeIo::n51_phy_window`), and
+`prepare_radio_tables` selects `Qualified::from_factory_51`. `Startup::start`
+builds `radio_assets::Assets` for RTL8851B. The bootstrap `advance` refuses
+RTL8851B at `RadioTablesLoaded` (no B basic/full calibration ever runs on
+it) until the RTL8851B radio step composes `radio_51`. Unexecuted case:
+`smoke_rtw8851b_post_wcpu_mac_is_b_with_rtw8851b_branches`.
+
+**Remaining for the row.** the native radio composition
+(`Native::preflight_radio_51`/`prepare_radio_51` over the signed records, a
+`qualification_51` gate on every Port/calibration access, `Startup::
+prepare_radio_51` and its bootstrap arm; terminal RF shutdown `finish` for
+one path), coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)

@@ -381,14 +381,16 @@ impl Native {
         mac: &mut super::mac_runtime::Mac,
     ) -> Result<(), super::power::Error> {
         use super::power::Error as RegisterError;
-        // B or C, each with its own completed factory PHY-cap window; the
-        // chip-specific MAC branches live in `mac_runtime` (C: `mac_runtime/c.rs`).
+        // B, C or RTL8851B, each with its own completed factory PHY-cap
+        // window; the chip-specific MAC branches live in `mac_runtime` (C:
+        // `mac_runtime/c.rs`; RTL8851B: the B sequence's `n51` branches).
         let phycap = self
             .factory
             .as_ref()
             .is_some_and(|factory| match self.chip {
                 ChipId::Rtl8852B => factory.b_phycap().is_some(),
                 ChipId::Rtl8852C => factory.c_phycap().is_some(),
+                ChipId::Rtl8851B => factory.n51_phycap().is_some(),
                 _ => false,
             });
         if self.state != State::Active || !phycap {
@@ -474,7 +476,10 @@ impl Native {
     ) -> Result<(), super::rx_dma::Error> {
         use super::{power::Error as RegisterError, rx_dma::Error as ReceiveError};
         if self.state != State::Active
-            || !matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
+            || !matches!(
+                self.chip,
+                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
             || mac.state() != super::mac_runtime::State::Ready
             || self.identity().is_none()
         {
@@ -516,8 +521,13 @@ impl Native {
         result
     }
     fn radio_access(&mut self) -> Result<(), super::power::Error> {
-        // Chip dispatch: B or C with its own factory PHY-cap and window.
+        // Chip dispatch: B, C or RTL8851B with its own factory PHY-cap and
+        // window.
         let phycap = match self.chip {
+            ChipId::Rtl8851B => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.n51_phycap().is_some()),
             ChipId::Rtl8852B => self
                 .factory
                 .as_ref()
@@ -534,10 +544,10 @@ impl Native {
         {
             return Err(super::power::Error::Unsupported);
         }
-        if self.chip == ChipId::Rtl8852C {
-            self.io.c_phy_window()?;
-        } else {
-            self.io.b_phy_window()?;
+        match self.chip {
+            ChipId::Rtl8852C => self.io.c_phy_window()?,
+            ChipId::Rtl8851B => self.io.n51_phy_window()?,
+            _ => self.io.b_phy_window()?,
         }
         let functions = self.io.read32(0xc000)?;
         if functions == u32::MAX || functions & (1 << 29) != 0 {
@@ -717,11 +727,12 @@ impl Native {
             .factory
             .as_ref()
             .ok_or(super::radio_init::Error::Profile)?;
-        // Chip dispatch: B or C tables from the matching factory snapshot.
-        let qualified = if self.chip == ChipId::Rtl8852C {
-            super::radio_init::Qualified::from_factory_c(factory)
-        } else {
-            super::radio_init::Qualified::from_factory(factory)
+        // Chip dispatch: B, C or RTL8851B tables from the matching factory
+        // snapshot.
+        let qualified = match self.chip {
+            ChipId::Rtl8852C => super::radio_init::Qualified::from_factory_c(factory),
+            ChipId::Rtl8851B => super::radio_init::Qualified::from_factory_51(factory),
+            _ => super::radio_init::Qualified::from_factory(factory),
         }
         .ok_or(super::radio_init::Error::Profile)?;
         // Latch before the first possible BB/RF write; cancellation cannot
@@ -942,7 +953,10 @@ impl Native {
                 narf_bus::pci::cmd::BUS_MASTER,
             )
         });
-        if self.chip == ChipId::Rtl8852B {
+        // rtw8851b.c `rtw8851b_mac_disable_bb_rf` is byte-identical to
+        // `__rtw8852bx_mac_disable_bb_rf`, and RTL8851B shares the AX PMAC/
+        // MAC_SEL/NCTL/KIP closure registers, so it takes B's closure.
+        if matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8851B) {
             if self.radio_started {
                 let _ = super::radio_stop::engines(&mut self.io);
             }

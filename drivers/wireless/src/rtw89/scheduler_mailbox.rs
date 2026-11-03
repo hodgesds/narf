@@ -20,6 +20,9 @@ pub(super) struct Mailbox {
     /// DATA0..3 (+0x10) and H2CREG/C2HREG_CTRL (+0x20/+0x24) keep the same
     /// layout in both blocks (reg.h); the R_AX_UDM1 counters are shared.
     base: u32,
+    /// RTL8851B (rtw8851b.c `rtw8851b_h2c_regs` is the B block): the
+    /// receipt is decoded with the one-path RTL8851B rule.
+    n51: bool,
 }
 impl Default for Mailbox {
     fn default() -> Self {
@@ -33,6 +36,7 @@ impl Mailbox {
             h2c: 0,
             c2h: 0,
             base,
+            n51: false,
         }
     }
     /// rtw8852c.c `rtw8852c_h2c_regs`/`rtw8852c_c2h_regs` with
@@ -40,6 +44,11 @@ impl Mailbox {
     pub(super) fn for_chip(chip: super::mac::ChipId) -> Self {
         if chip == super::mac::ChipId::Rtl8852C {
             Self::with_base(0x7140)
+        } else if chip == super::mac::ChipId::Rtl8851B {
+            Self {
+                n51: true,
+                ..Self::default()
+            }
         } else {
             Self::default()
         }
@@ -85,7 +94,11 @@ impl Mailbox {
         // There is no H2CREG sequence echo contract in AX. A fresh response,
         // exact function/full length, exclusive producer and actual command
         // consumption bind this one-shot query; source counters are retained.
-        let receipt = super::firmware_phycap::Receipt::decode_for(self.base == 0x7140, words)?;
+        let receipt = if self.n51 {
+            super::firmware_phycap::Receipt::decode_51(words)?
+        } else {
+            super::firmware_phycap::Receipt::decode_for(self.base == 0x7140, words)?
+        };
         a.w8(a.1 + 0x24, 0)?;
         self.c2h = self.c2h.wrapping_add(1);
         a.counter(0xf0, self.c2h)?;

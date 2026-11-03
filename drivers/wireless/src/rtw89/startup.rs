@@ -665,10 +665,13 @@ impl Startup {
         // `fw_blacklist` policy (signature selection only; secure.rs).
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
-        // radio_assets admits the RTL8852B and RTL8852C element layouts.
+        // radio_assets admits the RTL8852B, RTL8852C and RTL8851B element
+        // layouts.
         let assets = if matches!(
             identity.chip(),
-            super::mac::ChipId::Rtl8852B | super::mac::ChipId::Rtl8852C
+            super::mac::ChipId::Rtl8852B
+                | super::mac::ChipId::Rtl8852C
+                | super::mac::ChipId::Rtl8851B
         ) {
             Some(super::radio_assets::Assets::from_prepared(&image).map_err(Error::Assets)?)
         } else {

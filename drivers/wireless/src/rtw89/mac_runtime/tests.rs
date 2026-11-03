@@ -110,7 +110,13 @@ impl Model {
                 v = 0;
             }
             if a == R_AX_PUB_PAGE_INFO2 {
-                v = field(B_AX_PUB_AVAL_PG_MASK, 446);
+                // rtw8851b_hfc_pubcfg_pcie pub max 448; B 446.
+                let public = if self.chip == ChipId::Rtl8851B {
+                    448
+                } else {
+                    446
+                };
+                v = field(B_AX_PUB_AVAL_PG_MASK, public);
             }
             // C V1 page block (never read on B).
             if self.chip == ChipId::Rtl8852C && a == c::R_AX_PUB_PAGE_INFO1_V1 {
@@ -227,7 +233,7 @@ impl Source for Model {
                     cursor += 4;
                 }
             }
-            (0x580, 128) if self.chip == ChipId::Rtl8852B => (),
+            (0x580, 128) if matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8851B) => (),
             (0x590, 0x60) if self.chip == ChipId::Rtl8852C => (),
             _ => return Err(Error::Access),
         }
@@ -658,4 +664,71 @@ fn smoke_rtw8852c_post_wcpu_mac_requires_c_geometry_and_readiness() -> TestResul
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_post_wcpu_mac_requires_c_geometry_and_readiness
+);
+
+fn smoke_rtw8851b_post_wcpu_mac_is_b_with_rtw8851b_branches() -> TestResult {
+    let (mut b, b_factory) = Model::setup(0, 0);
+    let (mut io, factory) = Model::setup_chip(0, 0, ChipId::Rtl8851B);
+    let mut b_mac = Mac::default();
+    let mut mac = Mac::default();
+    // SAFETY: inert single-owner register model (B download geometry) with
+    // WCPU7 and actual factory-source bytes; no native DMA.
+    let b_ready = ready(unsafe { b_mac.prepare(&mut b, &b_factory) });
+    // SAFETY: as above, on the RTL8851B model (it shares B's geometry).
+    let ready_51 = ready(unsafe { mac.prepare(&mut io, &factory) });
+    if b_ready != Some(Ok(())) || ready_51 != Some(Ok(())) || mac.state() != State::Ready {
+        return TestResult::Fail("RTL8851B post-WCPU MAC did not reach confirmed Ready");
+    }
+    // rtw8851b_mac_enable_bb_rf: no ZCDC write (only chip_func_en_ax OCP
+    // touches SPS_DIG_ON_CTRL0); the same RFC S0/S1 0xc7 and PHYREG_SET.
+    if c_writes(&io, R_AX_SPS_DIG_ON_CTRL0).len() + 1 != c_writes(&b, R_AX_SPS_DIG_ON_CTRL0).len()
+        || c_writes(&io, R_AX_WLAN_XTAL_SI_CTRL) != c_writes(&b, R_AX_WLAN_XTAL_SI_CTRL)
+        || c_writes(&io, R_AX_PHYREG_SET) != c_writes(&b, R_AX_PHYREG_SET)
+    {
+        return TestResult::Fail("RTL8851B enable_bb_rf differs from rtw8851b_mac_enable_bb_rf");
+    }
+    // dle_clk_en_ax adds AXIDMA clock on RTL8851B only.
+    let axidma = crate::rtw89::fifo_regs::B_AX_AXIDMA_CLK_EN;
+    if io.raw(R_AX_DMAC_CLK_EN, 4) & axidma == 0 || b.raw(R_AX_DMAC_CLK_EN, 4) & axidma != 0 {
+        return TestResult::Fail("RTL8851B DLE clock lacks B_AX_AXIDMA_CLK_EN");
+    }
+    // rtw8851b_dle_mem_pcie SCC (wde_size6/wde_qt6) and hfc_chcfg/pubcfg.
+    let get = |v: u32, m: u32| (v & m) >> m.trailing_zeros();
+    if get(io.raw(R_AX_WDE_PKTBUF_CFG, 4), B_AX_WDE_FREE_PAGE_NUM_MASK) != 512
+        || io.raw(R_AX_WDE_QTA0_CFG, 4) != 448 << 16 | 448
+        || io.raw(R_AX_PLE_PKTBUF_CFG, 4) != b.raw(R_AX_PLE_PKTBUF_CFG, 4)
+        || (0..11u32)
+            .any(|i| io.raw(R_AX_PLE_QTA0_CFG + 4 * i, 4) != b.raw(R_AX_PLE_QTA0_CFG + 4 * i, 4))
+    {
+        return TestResult::Fail("RTL8851B DLE quotas differ from rtw8851b_dle_mem_pcie");
+    }
+    for (channel, value) in [
+        (0u32, 343 << 16 | 5),
+        (3, 343 << 16 | 5),
+        (8, 344 << 16 | 4),
+        (9, 344 << 16 | 4),
+    ] {
+        if c_writes(&io, R_AX_ACH0_PAGE_CTRL + channel * 4) != [value] {
+            return TestResult::Fail(
+                "RTL8851B HFC channel config differs from rtw8851b_hfc_chcfg_pcie",
+            );
+        }
+    }
+    if get(io.raw(R_AX_PUB_PAGE_CTRL1, 4), B_AX_PUBPG_G0_MASK) != 448
+        || get(io.raw(R_AX_PUB_PAGE_CTRL2, 4), B_AX_PUBPG_ALL_MASK) != 448
+    {
+        return TestResult::Fail("RTL8851B HFC public pages differ from rtw8851b_hfc_pubcfg_pcie");
+    }
+    // Everything else (sec_eng TX partial clear, SIFS 52B, IMR) is B's.
+    if c_writes(&io, R_AX_SEC_ENG_CTRL) != c_writes(&b, R_AX_SEC_ENG_CTRL)
+        || io.raw(R_AX_CMAC_FUNC_EN, 4) & B_AX_CMAC_TXEN != 0
+        || io.raw(0x1010, 4) != 0xb0f00
+    {
+        return TestResult::Fail("RTL8851B MAC left B's shared branches or opened CMAC TX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_post_wcpu_mac_is_b_with_rtw8851b_branches
 );

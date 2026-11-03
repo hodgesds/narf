@@ -1579,6 +1579,9 @@ impl Native {
     /// actual C factory identity and the same firmware PHY-capability
     /// receipt topology (two-stream RX-AB; RTL8852C `rx_nss` = 2).
     pub(super) fn radio_profile_current(&self) -> Result<(), power::Error> {
+        if self.chip == ChipId::Rtl8851B {
+            return self.radio_profile_current_51();
+        }
         if self.chip != ChipId::Rtl8852C {
             return self.phy_profile_current();
         }
@@ -1598,6 +1601,26 @@ impl Native {
                 return Err(power::Error::Access);
             }
             phycap.initial_profile()
+        })
+        .map_err(|_| power::Error::Access)?
+    }
+    /// RTL8851B: the actual RTL8851B identity and an RTL8851B-decoded
+    /// firmware receipt (1T1R RF_A, `Receipt::initial_profile_51`).
+    fn radio_profile_current_51(&self) -> Result<(), power::Error> {
+        crate::rtw88::pci_park::invoke(&self.authority, || {
+            if self.state != State::Active
+                || self
+                    .factory
+                    .as_ref()
+                    .and_then(|factory| factory.identity())
+                    .is_none_or(|identity| identity.chip() != ChipId::Rtl8851B)
+            {
+                return Err(power::Error::Terminal);
+            }
+            self.phycap
+                .as_ref()
+                .ok_or(power::Error::Unsupported)?
+                .initial_profile_51()
         })
         .map_err(|_| power::Error::Access)?
     }

@@ -218,7 +218,10 @@ impl Rx {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
-        if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) {
+        // RTL8851B: rtw8851be.c `rtw89_8851be_info` is field-for-field
+        // rtw8852be.c's (DMA address set, LTR, RX ring/descriptor), so it
+        // takes B's geometry and prerequisite.
+        if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B) {
             return Err(power::Error::Unsupported.into());
         }
         self.state = State::Publishing;
