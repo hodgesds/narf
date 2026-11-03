@@ -46,6 +46,7 @@ pub mod kvm_pv;
 pub mod mempolicy;
 pub mod memtype;
 pub mod migrate;
+pub mod mmu_notifier;
 pub mod module_text;
 pub mod numa_tier;
 pub mod oom;
@@ -75,6 +76,7 @@ pub mod zpool;
 
 mod guard_tests;
 mod memtype_tests;
+mod mmu_notifier_tests;
 mod pageattr_tests;
 mod remote_access_tests;
 mod tests;

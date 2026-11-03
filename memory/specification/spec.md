@@ -439,6 +439,67 @@ impl UserPagePin {
 /// Physical migration to another node rejects pinned backing with
 /// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
 
+// ── Interval notifiers over user ranges (`mmu_notifier`) ─────────────────
+// Linux mm/mmu_notifier.c interval API for device mirrors of user memory.
+pub enum MmuNotifierEvent { Unmap, Clear, ProtectionVma, Migrate, Release }
+pub struct MmuNotifierRange {
+    pub address_space_id: u64, pub start: u64, pub end: u64,
+    pub event: MmuNotifierEvent,
+}
+impl MmuNotifierRange { pub const fn blockable(&self) -> bool; /* always false */ }
+pub trait MmuIntervalNotifierOps: Send + Sync {
+    /// Runs with the address space's IRQ-masked mapping lock held, after the
+    /// registry stored `cur_seq`. Must not block, await, fault on user
+    /// memory, allocate infallibly, take an address-space lock, pin, or
+    /// insert/remove/drop a notifier; it may take only its own leaf lock.
+    fn invalidate(&self, interval: &MmuInterval, range: &MmuNotifierRange, cur_seq: u64);
+}
+pub enum MmuNotifierError { InvalidRange, OutOfMemory }
+pub struct MmuInterval { /* address space, [start, end), seq, released */ }
+impl MmuInterval {
+    pub fn address_space_id(&self) -> u64;
+    pub fn start(&self) -> u64;
+    pub fn end(&self) -> u64;
+    pub fn read_begin(&self) -> u64;              // mmu_interval_read_begin
+    pub fn read_retry(&self, seq: u64) -> bool;   // mmu_interval_read_retry
+    pub fn check_retry(&self, seq: u64) -> bool;  // mmu_interval_check_retry
+    pub fn set_seq(&self, cur_seq: u64);          // mmu_interval_set_seq
+    pub fn is_released(&self) -> bool;            // address space torn down
+}
+/// Owning registration; Deref<Target = MmuInterval>. Drop removes it, and no
+/// callback for it runs after the drop returns.
+pub struct MmuIntervalNotifier { /* Arc<MmuInterval> */ }
+impl MmuIntervalNotifier {
+    /// Empty, overflowing or past USER_HALF_END ranges are InvalidRange.
+    pub fn insert(space: &AddressSpace, start: u64, length: u64,
+                  ops: Arc<dyn MmuIntervalNotifierOps>)
+        -> Result<Self, MmuNotifierError>;
+    pub fn interval(&self) -> &MmuInterval;
+}
+/// Registered intervals across every address space (test census).
+pub fn registered_intervals() -> usize;
+
+/// Firing operations, each called while the lock that serializes the change
+/// is held and before any frame it retires is released:
+///   Unmap         punch_fixed* (munmap, MAP_FIXED, brk shrink, mremap
+///                 target), unmap_region, unmap_huge_region, the mremap and
+///                 MREMAP_DONTUNMAP source (relocate_*, dontunmap_*), the
+///                 OOM reaper;
+///   Clear         zap_mapping_range* (truncate), madvise_dontneed,
+///                 madvise_guard_install, COW break (cow_split_mode),
+///                 swap-out, lazy-free discard;
+///   ProtectionVma mprotect_range* / change_perms_range removing READ or WRITE;
+///   Migrate       relocate_leaf (compaction, NUMA migration), huge-page
+///                 migration, multi-owner repoint_shared_page;
+///   Release       reclaim_unshared_on_exit and AddressSpace::drop, once per
+///                 interval, which is then removed and marked released.
+/// Fork, NUMA-hint protection, growth and new mappings do not fire: none
+/// changes the frame a pinned page translates to. Lock order:
+/// VMA transaction -> shared-mapping shard -> huge regions -> regions ->
+/// notifier registry shard -> consumer leaf lock. Consumers reach user
+/// memory only through UserPagePins collected after insert, inside
+/// read_begin/read_retry; mirrors without pins are not supported.
+
 /// Metadata only: cloning does not retain frames; dropping does not free them.
 /// A sorted 64-page-bucket directory provides logarithmic lookup and amortized
 /// sequential growth. Each bucket's slot vector is a materialized prefix, so a
@@ -1453,6 +1514,24 @@ x86_64 is rejected at runtime.
   domain id + PKRS snapshot in `CpuLocal` on entry and restore on
   exit; a re-entrant call from within the same domain context is a
   bug, caught by an assertion.
+- **Interval notifiers fire inside the change, before the release.** Every
+  operation listed in §3 that changes or removes the frame a user VA
+  translates to (or removes READ/WRITE from it) calls the notifier registry
+  in the same hold of the region lock (huge-region lock for huge pages) that
+  publishes the change, and before any frame it retires reaches
+  `free_frame`, the huge pool, or an external release hook. The registry
+  stores a fresh odd sequence in each overlapping interval before calling its
+  consumer, so a `read_begin`/`read_retry` section that spans the change
+  always retries, and a reader that observes the new sequence cannot pin
+  until the change is committed (pins take the same lock). Release fires
+  once per interval at exit or final drop, before any frame of the space is
+  freed. Callbacks are non-blocking and take no address-space lock; nothing
+  in the registry takes one either, so the order mapping locks -> registry
+  shard -> consumer leaf lock has no cycle. Device access is bounded by
+  pins, not by the callback: a consumer reaches memory only through
+  `UserPagePin`s collected inside a section, so a frame the device can reach
+  is never freed or reused before the consumer drops its pins. When no
+  interval is registered every site costs one atomic load.
 - A private fork preserves each VMA's logical POSIX WRITE bit and marks it
   COW. Hardware leaves remain read-only while their backing-frame refcount is
   greater than one. Pinned writable private pages are instead copied for the

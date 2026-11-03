@@ -227,6 +227,14 @@ fn guard_masked<'a>(
     alloc::borrow::Cow::Owned(masked)
 }
 
+/// True when `new` removes READ or WRITE that `old` grants: the protection
+/// changes interval notifiers report, because a device mirror may no longer
+/// read, or write through, pages it collected under the old protection.
+fn access_downgrade(old: RegionPerms, new: RegionPerms) -> bool {
+    (old.contains(RegionPerms::READ) && !new.contains(RegionPerms::READ))
+        || (old.contains(RegionPerms::WRITE) && !new.contains(RegionPerms::WRITE))
+}
+
 fn release_shared_phys(phys: PhysAddr) {
     if phys.raw() != 0 {
         // Not `if let Some(..) = *LOCK.lock()`: that guard would stay held,
@@ -2718,6 +2726,31 @@ impl AddressSpace {
         }
     }
 
+    /// Fire the interval notifiers registered on this address space over
+    /// `[start, end)` (see [`crate::mmu_notifier`]). Callers hold the mapping
+    /// lock that serializes the translation change they are making and fire
+    /// before releasing any frame that change retires.
+    #[inline]
+    fn notify_invalidate(
+        &self,
+        start: u64,
+        end: u64,
+        event: crate::mmu_notifier::MmuNotifierEvent,
+    ) {
+        if crate::mmu_notifier::active() {
+            crate::mmu_notifier::invalidate_range(self.identity(), start, end, event);
+        }
+    }
+
+    /// Fire `Release` on every interval notifier of this address space and
+    /// retire them; see [`crate::mmu_notifier`].
+    #[inline]
+    fn notify_release(&self) {
+        if crate::mmu_notifier::active() {
+            crate::mmu_notifier::release_address_space(self.identity());
+        }
+    }
+
     /// Register one scheduler task which may execute through this address
     /// space. The scheduler calls this before publishing the task.
     pub fn scheduler_attach_user_task(&self) {
@@ -4920,6 +4953,14 @@ impl AddressSpace {
                 .iter()
                 .position(|r| r.base == base)
                 .ok_or(AddressSpaceError::Unmapped)?;
+            // Huge pins are taken under this lock; fire before the leaves and
+            // backing are released below.
+            let lo = huge[idx].base.as_u64();
+            self.notify_invalidate(
+                lo,
+                lo.saturating_add(huge[idx].len),
+                crate::mmu_notifier::MmuNotifierEvent::Unmap,
+            );
             huge.swap_remove(idx)
         };
         let page_size = match region.size {
@@ -5643,6 +5684,11 @@ impl AddressSpace {
                 }
             }
         }
+        // The move is committed (the only fallible step, destination leaf
+        // installation, has succeeded). The source range stops translating
+        // here, in the same region-lock hold, before truncated backing is
+        // freed below (Linux move_page_tables' MMU_NOTIFY_UNMAP).
+        self.notify_invalidate(old_lo, old_hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         let _source = regions
             .remove(source_region_base)
             .expect("relocation source disappeared under region lock");
@@ -5965,6 +6011,9 @@ impl AddressSpace {
         // Retire the old VMA generation and publish its optional prefix. The
         // suffix and destination nodes were already published before the PTE
         // commit, so no operation returning a recoverable error follows.
+        // The source interval stops translating in this region-lock hold,
+        // before truncated shared backing is released below.
+        self.notify_invalidate(old_lo, old_hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         if head_pages == 0 {
             let _source = regions
                 .remove(source_region_base)
@@ -6348,6 +6397,9 @@ impl AddressSpace {
                 );
             }
         }
+        // Committed: the source keeps its VMA but no longer translates to the
+        // moved frames. Fire in the same region-lock hold.
+        self.notify_invalidate(old_lo, old_hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         let source = regions
             .get_mut(old_lo)
             .expect("DONTUNMAP source disappeared before publication");
@@ -7062,6 +7114,13 @@ impl AddressSpace {
             }
             entries
         };
+        if let Some(region) = regions.get(base.as_u64()) {
+            // Same region-lock hold as the removal below; before any frame
+            // of the region is released.
+            let lo = region.base.as_u64();
+            let hi = lo.saturating_add(region.len);
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
+        }
         let region = {
             let region = regions
                 .remove(base.as_u64())
@@ -7143,6 +7202,10 @@ impl AddressSpace {
         if self.root.as_u64() == 0 || self.is_vm_shared() {
             return 0;
         }
+
+        // Linux exit_mmap's mmu_notifier_release, before any frame below is
+        // released. Device mirrors of this address space are retired.
+        self.notify_release();
 
         // A deferred-unmap quarantine owns regions and detached table frames
         // which are absent from the live region tables. Drain it first so this
@@ -7319,6 +7382,9 @@ impl AddressSpace {
             re > lo && rb < hi
         }) && regions.get(lo).is_some_and(|region| region.len == len);
         if exact_regular {
+            // Interval notifiers learn of the removal in the same region-lock
+            // hold as the table change, before any frame below is released.
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
             let region = regions
                 .remove(lo)
                 .expect("exact VMA disappeared under region lock");
@@ -7499,6 +7565,10 @@ impl AddressSpace {
                 });
             }
         }
+        // Every fallible step is behind us. Interval notifiers learn of the
+        // punch while both table locks still exclude pins and before any
+        // reverse-map owner, leaf or frame of the window is retired.
+        self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         for &key in &overlap_keys {
             let old = regions
                 .get(key)
@@ -7866,6 +7936,9 @@ impl AddressSpace {
         // pass: a claimed page's slot is still zero here, so there is no
         // leaf to retire, and its lock-free fill may already have fetched
         // a pre-shrink frame it would otherwise publish past the new EOF.
+        // Both release batches are reserved; the commit below cannot fail.
+        // Fire in the same lock hold, before any leaf, slot or frame retires.
+        self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Clear);
         let mut retired = 0u64;
         regions.for_each_overlapping_mut(lo, hi, |region| {
             let rb = region.base.as_u64();
@@ -8336,6 +8409,14 @@ impl AddressSpace {
             if r.perms.contains(RegionPerms::SHARED) {
                 continue;
             }
+            // Linux __oom_reap_task_mm's non-blocking MMU_NOTIFY_UNMAP, in the
+            // same lock hold as the pass-2 frees below.
+            let lo = r.base.as_u64();
+            self.notify_invalidate(
+                lo,
+                lo.saturating_add(r.len),
+                crate::mmu_notifier::MmuNotifierEvent::Unmap,
+            );
             // SAFETY: identity-mapped root; the region was materialized through
             // it and the table lock pins its backing during the walk.
             unsafe { self.unmap_region_leaves_local(r) };
@@ -9510,6 +9591,23 @@ impl AddressSpace {
                 Some(self.translation_tag()),
                 |resolved| {
                     let mut table = self.regions.lock();
+                    // Before the slots are cleared below and before the swap
+                    // primitive frees any victim frame.
+                    let lo = resolved
+                        .iter()
+                        .map(|(victim, _)| victim.virt.as_u64())
+                        .min();
+                    let hi = resolved
+                        .iter()
+                        .map(|(victim, _)| victim.virt.as_u64())
+                        .max();
+                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                        self.notify_invalidate(
+                            lo,
+                            hi.saturating_add(4096),
+                            crate::mmu_notifier::MmuNotifierEvent::Clear,
+                        );
+                    }
                     for (victim, phys) in resolved {
                         let va = victim.virt.as_u64();
                         assert_eq!(
@@ -11157,6 +11255,7 @@ impl AddressSpace {
         // accounting primitives — replay each hit's flat contribution.
         let mut acct_delta = RegionAcct::default();
         let mut acct_sub = RegionAcct::default();
+        let mut downgrade = false;
         g.for_each_overlapping_mut(lo, hi, |r| {
             let rb = r.base.as_u64();
             let re = rb.saturating_add(r.len);
@@ -11164,6 +11263,7 @@ impl AddressSpace {
                 return;
             }
             acct_sub.add_flat(r.perms, r.len);
+            downgrade |= access_downgrade(r.perms, new_perms);
             r.perms = new_perms;
             acct_delta.add_flat(r.perms, r.len);
             hits.push(r.clone());
@@ -11190,6 +11290,11 @@ impl AddressSpace {
             .saturating_sub(acct_sub.wnx_bytes);
         if hits.is_empty() {
             return Err(AddressSpaceError::Unmapped);
+        }
+        if downgrade {
+            // Linux change_protection's MMU_NOTIFY_PROTECTION_VMA, limited to
+            // READ/WRITE removal: same region-lock hold as the new perms.
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::ProtectionVma);
         }
         // SAFETY: same identity-mapping precondition as
         // `materialize`. Each touched region's pages were
@@ -11400,6 +11505,22 @@ impl AddressSpace {
             )?);
         }
         g.try_reserve_nodes(additional_nodes)?;
+
+        // Linux change_protection's MMU_NOTIFY_PROTECTION_VMA, limited to
+        // READ/WRITE removal. Both table locks are held from here through
+        // the leaf rewrite. (A refused partial huge cut below makes this a
+        // spurious, harmless invalidation.)
+        if g.overlapping(lo, hi)
+            .any(|region| access_downgrade(region.perms, prot))
+            || huge.iter().any(|region| {
+                let rb = region.base.as_u64();
+                rb < hi
+                    && lo < rb.saturating_add(region.len)
+                    && access_downgrade(region.perms, prot)
+            })
+        {
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::ProtectionVma);
+        }
 
         let huge_touched = {
             if huge.iter().any(|region| {
@@ -11658,6 +11779,9 @@ impl AddressSpace {
                     g.swap_pages.remove(&va.as_u64());
                 }
             }
+            // Swap records are taken; nothing below fails. Fire in this
+            // region-lock hold, before any leaf or frame of the range retires.
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Clear);
             g.for_each_overlapping_mut(lo, hi, |r| {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
@@ -11897,6 +12021,9 @@ impl AddressSpace {
                 for page in (start..end).step_by(4096) {
                     g.guard_pages.insert(page);
                 }
+                // A marked page refuses pins from here on and loses its leaf
+                // below (Linux MADV_GUARD_INSTALL zaps the range).
+                self.notify_invalidate(start, end, crate::mmu_notifier::MmuNotifierEvent::Clear);
             }
             (spans, walk)
         };
@@ -12117,6 +12244,18 @@ impl AddressSpace {
                             |phys, va| taken.push((phys, va.as_u64())),
                         )
                     };
+                }
+                // The discarded pages leave this region's translation in the
+                // same lock hold that zeroes their slots; their frames are
+                // freed only after the lock drops.
+                let first = taken.iter().map(|&(_, va)| va).min();
+                let last = taken.iter().map(|&(_, va)| va).max();
+                if let (Some(first), Some(last)) = (first, last) {
+                    self.notify_invalidate(
+                        first,
+                        last.saturating_add(4096),
+                        crate::mmu_notifier::MmuNotifierEvent::Clear,
+                    );
                 }
                 // Every taken page must be retired — the helper walks whole
                 // regions, and leaving one unmapped but bookkept would strand
@@ -13452,6 +13591,10 @@ impl AddressSpace {
                 splittable(region.perms) && region.phys.get(page_idx).copied() == Some(old_phys)
             });
             if owns_ticket && current_matches {
+                // Linux wp_page_copy's MMU_NOTIFY_CLEAR: the page is about to
+                // translate to its private copy. Same region-lock hold as the
+                // backing update, before the old frame's references drop.
+                self.notify_invalidate(v, v + 4096, crate::mmu_notifier::MmuNotifierEvent::Clear);
                 let region = regions
                     .containing_backing_mut(v)
                     .expect("COW region disappeared under its lock");
@@ -13672,6 +13815,13 @@ impl AddressSpace {
             }
             return Err(());
         }
+        // Every caller holds the region lock and updates `Region.phys` to
+        // `new_phys` in the same hold, then frees `old_phys` after it drops.
+        self.notify_invalidate(
+            page_va.as_u64(),
+            page_va.as_u64() + 4096,
+            crate::mmu_notifier::MmuNotifierEvent::Migrate,
+        );
         Ok(())
     }
 
@@ -13878,6 +14028,9 @@ impl AddressSpace {
             }
             return Err(());
         }
+        // Same region-lock hold as the backing update; the caller drops the
+        // source's references only after every owner has been repointed.
+        self.notify_invalidate(v, v + 4096, crate::mmu_notifier::MmuNotifierEvent::Migrate);
         regions
             .containing_backing_mut(v)
             .expect("region vanished under its own lock")
@@ -14024,6 +14177,13 @@ impl AddressSpace {
                 Err(_) => Err(AddressSpaceError::NotImplemented),
             });
         }
+        // Same huge-lock hold as the backing update; before the old frame is
+        // returned to the pool.
+        self.notify_invalidate(
+            leaf_va.as_u64(),
+            leaf_va.as_u64().saturating_add(bytes),
+            crate::mmu_notifier::MmuNotifierEvent::Migrate,
+        );
         huge[region_idx].frames[frame_idx] = new;
         drop(huge);
 
@@ -14643,6 +14803,9 @@ impl Drop for AddressSpace {
     /// allocator slot can be reused; tag-0 switches flush on root changes.
     /// Kernel-half PML4 entries on x86_64 are never reclaimed.
     fn drop(&mut self) {
+        // Retire interval notifiers before any frame is released (Linux
+        // mmu_notifier_release). Idempotent after reclaim_unshared_on_exit.
+        self.notify_release();
         // Release any deferred-flush quarantine first: its regions own data
         // frames (and detached page tables) that the region-table walk below
         // will never see — without this drain they would leak at every

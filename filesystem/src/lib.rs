@@ -984,6 +984,27 @@ pub trait IoctlContext: Sync {
     ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
         Err(FsError::Unsupported)
     }
+    /// Linux `mmu_interval_notifier_insert(current->mm, ...)`: watch
+    /// `[address, address + length)` of the calling process's address space.
+    /// A driver that mirrors user memory into a device inserts before
+    /// pinning and brackets every [`Self::pin_user_pages`] with the
+    /// interval's `read_begin`/`read_retry`. A range that cannot be mapped is
+    /// `BadAddress`, as the pin over it would be. The default has no address
+    /// space.
+    fn mmu_interval_notifier(
+        &self,
+        _address: u64,
+        _length: u64,
+        _ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// [`narf_memory::AddressSpace::identity`] of the calling process's
+    /// address space, so a driver can tell whether the caller may re-collect
+    /// a range another process registered. `None` without one.
+    fn address_space_identity(&self) -> Option<u64> {
+        None
+    }
     /// Resolve a descriptor in the calling process without exposing its table
     /// to a driver. The retained open description also handles dup/fork.
     fn file(&self, _fd: i32) -> Result<Arc<dyn FileOps>, FsError> {

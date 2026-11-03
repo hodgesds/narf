@@ -89,6 +89,28 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
         Ok(pins)
     }
 
+    fn mmu_interval_notifier(
+        &self,
+        address: u64,
+        length: u64,
+        ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        use narf_memory::mmu_notifier::{MmuIntervalNotifier, MmuNotifierError};
+        let space = current_address_space().ok_or(FsError::BadAddress)?;
+        // LINUX-GAP: an address + length overflow is -EOVERFLOW from
+        // mmu_interval_notifier_insert; NARF has no such FsError and keeps the
+        // EFAULT the pin over that range has always returned.
+        MmuIntervalNotifier::insert(&space, address, length, ops).map_err(|error| match error {
+            MmuNotifierError::InvalidRange => FsError::BadAddress,
+            MmuNotifierError::OutOfMemory => FsError::OutOfMemory,
+        })
+    }
+
+    fn address_space_identity(&self) -> Option<u64> {
+        current_address_space().map(|space| space.identity())
+    }
+
     fn nonblocking(&self) -> bool {
         self.nonblocking
     }
