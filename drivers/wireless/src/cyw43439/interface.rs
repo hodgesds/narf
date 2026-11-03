@@ -37,6 +37,8 @@ struct State<R: Fullmac> {
     monitor: Option<Box<crate::brcmfmac::monitor::Session>>,
     /// Secondary interface owner (`None` without demux or `cap`).
     vif: Option<crate::brcmfmac::vif_owner::Owner>,
+    /// Per-bsscfg secondary station roles (`interface_vif.rs`).
+    secondaries: Vec<vif::Secondary<R>>,
 }
 struct PendingTx {
     frame: Frame,
@@ -353,6 +355,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             ap_epoch_changed: false,
             monitor: None,
             vif,
+            secondaries: Vec::new(),
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
@@ -389,6 +392,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             })?;
         *active = Some(device.clone());
     }
+    vif::register_primary(&device);
     let send = match R::FAMILY {
         Family::Sdio => send_sdio as fn(&[u8], narf_net::TxMeta) -> Result<(), ()>,
         Family::Pcie => send_pcie,
@@ -1649,6 +1653,7 @@ mod tests {
             ap_epoch_changed: false,
             monitor: None,
             vif: None,
+            secondaries: Vec::new(),
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);

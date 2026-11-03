@@ -43,6 +43,7 @@ fn sdio_shell(name: String, station: Station<SdioRuntime>) -> Arc<SdioDevice> {
             ap_epoch_changed: false,
             monitor: None,
             vif: None,
+            secondaries: Vec::new(),
         }),
         name: name.clone(),
         mac: OWN,

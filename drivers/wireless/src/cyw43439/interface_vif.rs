@@ -19,17 +19,29 @@
 //! provisional MAC, and a refused or timed-out create unpublishes it.
 //! `DEL_INTERFACE` hides the netdev at once (as for every other
 //! hide-now/firmware-later vdev in this tree); the worker then issues
-//! `interface_remove` and retires the ifidx's transport resources. No role
-//! raises the carrier yet, so no secondary data is exchanged until a
-//! per-bsscfg role owner is attached.
+//! `interface_remove` and retires the ifidx's transport resources.
+//!
+//! A STA shell owns a persistent secondary [`Station`] ([`Secondary`]),
+//! parked over `vif_bsscfg::Parked` and rebound to a
+//! `vif_bsscfg::Bsscfg` for each scan/join/disconnect (under the primary
+//! state mutex, through [`Roles`]) and for each worker pass (`poll`). Its
+//! correlated `set_link` peer is the shell carrier. An AP shell has no
+//! per-bsscfg AP owner yet and keeps refusing every role operation.
 
-use super::{Device, Fullmac, State};
+use super::{wireless_error, Device, Fullmac, State};
 use crate::brcmfmac::{
+    vif_bsscfg::{Bsscfg, Link, Parked},
     vif_owner::{Owner, Role},
     vif_wire::{self, Entry},
 };
+use crate::cyw43439::station::Station;
 use crate::cyw43439::{fullmac::Family, ioctl::Direction, runtime::Error};
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_ipc::{Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -57,6 +69,130 @@ const GONE: u8 = 4;
 /// Every published secondary shell, across both families.
 static SHELLS: IrqSafeSpinLock<Vec<Arc<VifDevice>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_COOKIE: AtomicU64 = AtomicU64::new(1);
+
+/// Persistent secondary station role of one live STA shell (`struct
+/// brcmf_cfg80211_vif` of a `NL80211_IFTYPE_STATION` additional interface).
+pub(super) struct Secondary<R: Fullmac> {
+    cookie: u64,
+    link: Link,
+    /// `None` only while an operation holds it rebound, or after such an
+    /// operation was cancelled mid-flight (the role is then retired).
+    station: Option<Station<Parked<R>>>,
+}
+
+/// Type-erased primary role entry points for the non-generic shell.
+#[async_trait::async_trait]
+pub(super) trait Roles: Send + Sync {
+    fn wiphy(&self) -> u64;
+    async fn vif_scan(
+        &self,
+        cookie: u64,
+        request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError>;
+    /// Returns the correlated link peer after the join.
+    async fn vif_associate(
+        &self,
+        cookie: u64,
+        request: AssociateRequest,
+    ) -> Result<Option<[u8; 6]>, WirelessError>;
+    async fn vif_disassociate(&self, cookie: u64) -> Result<(), WirelessError>;
+}
+
+/// Published primaries, for a shell to reach its wiphy's role owner.
+static PRIMARIES: IrqSafeSpinLock<Vec<Weak<dyn Roles>>> = IrqSafeSpinLock::new(Vec::new());
+
+pub(super) fn register_primary<R: Fullmac + 'static>(device: &Arc<Device<R>>) {
+    let weak: Weak<dyn Roles> = Arc::downgrade(device) as Weak<dyn Roles>;
+    let mut primaries = PRIMARIES.lock();
+    primaries.retain(|primary| primary.strong_count() > 0);
+    primaries.push(weak);
+}
+
+fn primary(wiphy: u64) -> Option<Arc<dyn Roles>> {
+    PRIMARIES
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|primary| primary.wiphy() == wiphy)
+}
+
+/// Rebind a parked secondary station onto its bsscfg adapter for `$body`
+/// (`|$station| ...`), then park it again. A missing owner, slot or parked
+/// station is `Error::Failed`.
+macro_rules! with_secondary {
+    ($state:expr, $cookie:expr, |$station:ident| $body:expr) => {{
+        let State {
+            station: primary,
+            vif,
+            secondaries,
+            ..
+        } = &mut *$state;
+        match (
+            vif.as_mut(),
+            secondaries.iter_mut().find(|slot| slot.cookie == $cookie),
+        ) {
+            (Some(owner), Some(slot)) => match slot.station.take() {
+                Some(parked) => {
+                    let adapter = Bsscfg::new(&mut primary.runtime, owner, &mut slot.link);
+                    let (mut $station, rest) = parked.rebind(adapter);
+                    let result = $body;
+                    let (parked, _) = $station.rebind(rest);
+                    slot.station = Some(parked);
+                    result
+                }
+                None => Err(Error::Failed),
+            },
+            _ => Err(Error::Failed),
+        }
+    }};
+}
+
+/// One worker pass of a secondary station: its link lifecycle (`poll`
+/// consumes only this bsscfg's events). Returns the correlated peer.
+fn secondary_poll<R: Fullmac>(
+    runtime: &mut R,
+    owner: &mut Owner,
+    slot: &mut Secondary<R>,
+) -> Option<[u8; 6]> {
+    let parked = slot.station.take()?;
+    let (mut bound, rest) = parked.rebind(Bsscfg::new(runtime, owner, &mut slot.link));
+    let _ = bound.poll();
+    let (parked, _) = bound.rebind(rest);
+    slot.station = Some(parked);
+    slot.link.peer()
+}
+
+/// `brcmf_cfg80211_add_iface` role attach after the IF ADD: a STA shell
+/// gets its secondary station with the per-interface dcmds issued on its
+/// own ifidx; an AP shell has no per-bsscfg owner (it stays refusing).
+async fn attach_role<R: Fullmac>(
+    runtime: &mut R,
+    owner: &mut Owner,
+    secondaries: &mut Vec<Secondary<R>>,
+    shell: &VifDevice,
+    entry: Entry,
+    template: Option<Station<Parked<R>>>,
+) -> bool {
+    if shell.role == Role::Ap {
+        return true;
+    }
+    let Some(mut parked) = template else {
+        return false;
+    };
+    parked.mac = entry.mac;
+    let mut link = Link::new(entry);
+    let (mut bound, rest) = parked.rebind(Bsscfg::new(runtime, owner, &mut link));
+    let configured = bound.configure_secondary().await.is_ok();
+    let (parked, _) = bound.rebind(rest);
+    if configured {
+        secondaries.push(Secondary {
+            cookie: shell.cookie,
+            link,
+            station: Some(parked),
+        });
+    }
+    configured
+}
 
 /// `brcmf_feat_attach`: the composition features of the booted firmware,
 /// from the actual `cap` token list. `None` when the transport has no
@@ -169,6 +305,33 @@ impl VifDevice {
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
         narf_net::iface::unregister(&self.name);
+    }
+    /// Carrier follows the secondary station's correlated link only.
+    fn set_carrier(&self, peer: Option<[u8; 6]>) {
+        let (was_up, up) = {
+            let _publication = self.publication.lock();
+            let up = peer.is_some() && !self.closing.load(Ordering::Acquire);
+            let was_up = self.up.swap(up, Ordering::AcqRel);
+            if was_up != up {
+                self.epoch.fetch_add(1, Ordering::AcqRel);
+                narf_net::iface::set_link_metadata(&self.name, up, None, None);
+            }
+            (was_up, up)
+        };
+        if was_up && !up {
+            self.drop_queued();
+            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+        }
+    }
+    /// A live STA shell (role operations are refused otherwise).
+    fn station_role(&self) -> Result<Arc<dyn Roles>, WirelessError> {
+        if self.role != Role::Station
+            || self.phase() != LIVE
+            || self.closing.load(Ordering::Acquire)
+        {
+            return Err(WirelessError::NotSupported);
+        }
+        primary(self.wiphy).ok_or(WirelessError::HardwareError)
     }
     fn finish(self: &Arc<Self>) {
         self.phase.store(GONE, Ordering::Release);
@@ -351,10 +514,22 @@ impl<R: Fullmac + 'static> Device<R> {
             let Some(mut state) = self.state.try_lock() else {
                 return;
             };
-            let State { station, vif, .. } = &mut *state;
+            let State {
+                station,
+                vif,
+                secondaries,
+                ..
+            } = &mut *state;
             let Some(owner) = vif.as_mut() else {
                 return;
             };
+            // Role state of a STA shell whose native create runs this pass
+            // (one create is in flight at a time).
+            let mut template = (station_mode
+                && pending
+                    .iter()
+                    .any(|shell| shell.phase() == CREATING && shell.role == Role::Station))
+            .then(|| station.secondary([0; 6]));
             let runtime = &mut station.runtime;
             if owner.service(runtime).is_err() {
                 // A bounded event queue overflowed: fail closed.
@@ -377,7 +552,17 @@ impl<R: Fullmac + 'static> Device<R> {
                                 // brcmf_add_if: ifp->mac_addr from the event.
                                 shell.mac.store(pack(entry.mac), Ordering::Release);
                                 narf_net::iface::set_mac(&shell.name, entry.mac);
-                                if runtime.vif_open(entry.ifidx).is_ok() {
+                                if runtime.vif_open(entry.ifidx).is_ok()
+                                    && attach_role(
+                                        runtime,
+                                        owner,
+                                        secondaries,
+                                        shell,
+                                        entry,
+                                        template.take(),
+                                    )
+                                    .await
+                                {
                                     shell.phase.store(LIVE, Ordering::Release);
                                 } else {
                                     shell.unpublish();
@@ -419,6 +604,27 @@ impl<R: Fullmac + 'static> Device<R> {
                         let Some(entry) = shell.entry() else {
                             continue;
                         };
+                        if shell.role == Role::Station {
+                            let slot = secondaries
+                                .iter_mut()
+                                .find(|slot| slot.cookie == shell.cookie);
+                            let (peer, lost) = match slot {
+                                Some(slot) => {
+                                    let peer = secondary_poll(runtime, owner, slot);
+                                    (peer, slot.link.failed() || slot.station.is_none())
+                                }
+                                None => (None, true),
+                            };
+                            shell.set_carrier(peer);
+                            if lost && owner.registry().by_bsscfgidx(entry.bsscfgidx) == Some(entry)
+                            {
+                                // A fail-stopped role retires its interface
+                                // (an IF DEL already retires it otherwise).
+                                shell.unpublish();
+                                shell.phase.store(REMOVING, Ordering::Release);
+                                continue;
+                            }
+                        }
                         let up = shell.up.load(Ordering::Acquire);
                         for _ in 0..PUMP_BUDGET {
                             let Some(frame) = runtime.pop_vif_data(entry.ifidx) else {
@@ -435,6 +641,12 @@ impl<R: Fullmac + 'static> Device<R> {
                     _ => {}
                 }
             }
+            // A role ends with its shell (`brcmf_remove_interface`).
+            secondaries.retain(|slot| {
+                pending
+                    .iter()
+                    .any(|shell| shell.cookie == slot.cookie && shell.phase() == LIVE)
+            });
         }
         // No state or ring guard survives the stack callback.
         for (shell, mut bytes) in delivered {
@@ -458,6 +670,52 @@ impl<R: Fullmac + 'static> Device<R> {
             }
             narf_net::iface::on_rx_frame_from(&shell.name, &mut bytes);
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: Fullmac + 'static> Roles for Device<R> {
+    fn wiphy(&self) -> u64 {
+        narf_wireless::WirelessNetIface::wiphy_id(self)
+    }
+    async fn vif_scan(
+        &self,
+        cookie: u64,
+        request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        let mut state = self.state.lock().await;
+        if self.withdrawn() || self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        with_secondary!(state, cookie, |station| station.scan(request).await)
+            .map_err(wireless_error)
+    }
+    async fn vif_associate(
+        &self,
+        cookie: u64,
+        request: AssociateRequest,
+    ) -> Result<Option<[u8; 6]>, WirelessError> {
+        let mut state = self.state.lock().await;
+        if self.withdrawn() || self.ap_mode() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        let result = with_secondary!(state, cookie, |station| {
+            if station.idle() {
+                station.associate(request).await
+            } else {
+                Err(Error::Busy)
+            }
+        });
+        result.map_err(wireless_error)?;
+        Ok(state
+            .secondaries
+            .iter()
+            .find(|slot| slot.cookie == cookie)
+            .and_then(|slot| slot.link.peer()))
+    }
+    async fn vif_disassociate(&self, cookie: u64) -> Result<(), WirelessError> {
+        let mut state = self.state.lock().await;
+        with_secondary!(state, cookie, |station| station.disconnect().await).map_err(wireless_error)
     }
 }
 
@@ -592,16 +850,24 @@ impl WirelessNetIface for VifDevice {
         shell.unpublish();
         Ok(())
     }
-    // No per-bsscfg role owner is attached yet: the shell refuses every
-    // station/AP operation rather than aliasing the primary bsscfg.
-    async fn scan(&self, _: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        Err(WirelessError::NotSupported)
+    // A STA shell drives its own secondary station (`Roles`); an AP shell
+    // has no per-bsscfg AP owner and refuses rather than aliasing the
+    // primary bsscfg.
+    async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        self.station_role()?.vif_scan(self.cookie, request).await
     }
-    async fn associate(&self, _: AssociateRequest) -> Result<(), WirelessError> {
-        Err(WirelessError::NotSupported)
+    async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        let peer = self
+            .station_role()?
+            .vif_associate(self.cookie, request)
+            .await?;
+        self.set_carrier(peer);
+        Ok(())
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
-        Err(WirelessError::NotSupported)
+        let roles = self.station_role()?;
+        self.set_carrier(None);
+        roles.vif_disassociate(self.cookie).await
     }
     async fn set_config(&self, _: WirelessConfig) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)

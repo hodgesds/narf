@@ -1090,9 +1090,10 @@ a reset does not recreate secondary interfaces; `Device::withdraw`
 are pumped by the primary worker (`pop_vif_data` into the shell RX ring
 and `on_rx_frame_from`, shell TX ring into `send_vif_data` with
 `cfg80211_classify8021d` priority, one credit-blocked frame retained),
-gated on the shell carrier. No per-bsscfg role owner raises that carrier
-yet, so the shell refuses scan/join/AP and `supports_virtual_interfaces`
-stays false (`VIF_ROLES`); nothing is advertised.
+gated on the shell carrier. Only a secondary station raises that carrier
+(below); an AP shell refuses every role operation, and
+`supports_virtual_interfaces` stays false (`VIF_ROLES`); nothing is
+advertised.
 
 #### Per-bsscfg Fullmac adapter
 
@@ -1119,6 +1120,33 @@ stop methods keep their refusing defaults. `Parked<R>` is the inert
 runtime a persistent secondary role is held over between operations.
 One written/unexecuted case in `drivers/wireless/brcmfmac/vif`:
 `smoke_brcmf_vif_bsscfg_adapter_addresses_its_own_interface`.
+
+#### Secondary station role
+
+A STA shell owns a persistent `interface_vif::Secondary`: a `Station`
+built by `Station::secondary` from the primary's device-wide state
+(channels, regulatory domain/policy, `sup_wpa`/MFP/SAE/`wlc_ver`
+capabilities, `roam_off`, PHY) with every per-interface record empty
+(no BSSID, cache, PMKSA list, keys or verified PHY), parked over
+`vif_bsscfg::Parked`. After the IF ADD and `vif_open` the worker rebinds
+it to a `Bsscfg` and issues the per-interface dcmds the primary issues at
+initialization on that ifidx (`BRCMF_C_SET_PM` 0, `BRCMF_C_SET_INFRA` 1,
+`BRCMF_C_SET_AUTH` 0); a refusal unpublishes and removes the interface.
+`scan`/`associate`/`disassociate` on the shell reach the primary through
+the type-erased `interface_vif::Roles` (registered per wiphy at
+publication) and run the unchanged station state machine rebound to the
+adapter under the primary state mutex, with the primary in station mode;
+a join requires the secondary to be idle. Each worker pass polls the
+secondary (its own bsscfg events only) and makes its correlated
+`set_link` peer the shell carrier (drop queued frames and
+`notify_disconnect` on loss). A fail-stopped secondary (adapter `fail`,
+cancelled operation) retires its interface via `interface_remove`; the
+role ends with its shell. The primary AP owner and secondary data stay
+mutually exclusive on both transports (PCIe `ap_enter` requires no flows
+at all; SDIO `send_data_on` refuses during an AP), so secondary stations
+are created and driven only while the primary is a station; with the
+`brcmf_setup_ifmodes` table that admits a second STA only for `p2p`
+firmware (`p2p`+`mchan` combo0, or the P2P combination).
 
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
 either family: per-bsscfg role

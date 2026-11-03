@@ -274,6 +274,7 @@ impl Harness {
                 ap_epoch_changed: false,
                 monitor: None,
                 vif: None,
+                secondaries: Vec::new(),
             }),
             name: name.clone(),
             mac: OWN,

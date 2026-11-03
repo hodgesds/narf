@@ -985,6 +985,8 @@ mod phy;
 pub mod pmksa;
 #[path = "station_roam.rs"]
 pub mod roam;
+#[path = "station_vif.rs"]
+pub(crate) mod vif;
 
 /// Firmware events consumed by the station (`brcmf_fweh` registrations):
 /// SET_SSID, AUTH, DEAUTH(_IND), DISASSOC(_IND), LINK, PSK_SUP,
