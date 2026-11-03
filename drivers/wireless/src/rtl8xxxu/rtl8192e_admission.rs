@@ -119,6 +119,48 @@ pub async fn wait_admit<I: ControlIo>(firmware: Arc<Firmware<I>>) -> Result<Admi
     }
 }
 
+impl<I: ControlIo> Firmware<I> {
+    /// `rtl8xxxu_config` `IEEE80211_CONF_CHANGE_CHANNEL`:
+    /// `rtl8192e_set_tx_power(primary, ht40)` then
+    /// `rtl8xxxu_gen2_config_channel`, only for the exact channel/width the
+    /// signed permission qualifies for this retained device. Returns the
+    /// admitted RA mask. A mismatch is refused before any transfer.
+    pub(super) async fn tune_8192e(
+        &self,
+        permission: &Permission,
+        primary: u8,
+        width: Width,
+    ) -> Result<u32, super::firmware_transport::Error> {
+        use super::firmware_transport::Error as FwError;
+        let factory = self.factory_8192e().ok_or(FwError::RuntimeState)?;
+        let (vid, pid) = self.usb_identity().ok_or(FwError::RuntimeState)?;
+        if self.status().stage != Stage::RadioReady {
+            return Err(FwError::RuntimeState);
+        }
+        let admitted = permission
+            .check(&factory, vid, pid, primary, width)
+            .map_err(|_| FwError::RuntimeState)?;
+        let ht40 = matches!(width, Width::Ht40Above | Width::Ht40Below);
+        super::rtl8192e_phy::set_tx_power(self, &factory, primary, ht40).await?;
+        super::rtl8192e_radio::config_channel(self, primary, width).await?;
+        Ok(admitted)
+    }
+
+    /// `rtl8xxxu_start` RF half: `rtl8192e_enable_rf`, then the admitted
+    /// initial channel. MAC TX/RX gates belong to the station owner.
+    pub(super) async fn start_8192e(
+        &self,
+        permission: &Permission,
+    ) -> Result<u32, super::firmware_transport::Error> {
+        if self.status().stage != Stage::RadioReady {
+            return Err(super::firmware_transport::Error::RuntimeState);
+        }
+        super::rtl8192e_power::enable_rf(self).await?;
+        self.tune_8192e(permission, permission.primary(), permission.width())
+            .await
+    }
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "rtl8192e_admission_tests.rs"]
 mod tests;

@@ -19,7 +19,8 @@ fn smoke_rtl8192eu_admission_requires_record_policy_and_radio() -> TestResult {
     {
         return TestResult::Fail("8192eu unprovisioned/invalid record classification");
     }
-    let owner = Owner::new(Fake::new(), ChipFamily::Rtl8192eu);
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
     // Not RadioReady: nothing is admitted.
     let f = policy::factory(true);
     let early = policy::parse(&policy::record(&f, 0x0fff_ffff, &[(1, 0, 40)]), &f).unwrap();
@@ -70,9 +71,30 @@ fn smoke_rtl8192eu_admission_requires_record_policy_and_radio() -> TestResult {
     if admit(&owner, policy::domain(30, 40), other).err() != Some(Error::Profile) {
         return TestResult::Fail("8192eu admitted without the initial channel row");
     }
+    // Start: enable_rf then the admitted channel; a different channel or
+    // width than the permission is refused before any transfer.
+    let ops = owner_ops(&io);
+    if narf_scheduler::block_on(owner.start_8192e(&admitted.permission)) != Ok(0x0fff_ffff) {
+        return TestResult::Fail("8192eu admitted start");
+    }
+    if owner_ops(&io) == ops {
+        return TestResult::Fail("8192eu start issued no RF/channel writes");
+    }
+    let ops = owner_ops(&io);
+    if narf_scheduler::block_on(owner.tune_8192e(&admitted.permission, 6, INITIAL_WIDTH)).is_ok()
+        || narf_scheduler::block_on(owner.tune_8192e(&admitted.permission, 1, Width::Ht40Above))
+            .is_ok()
+        || owner_ops(&io) != ops
+    {
+        return TestResult::Fail("8192eu retune outside the permission");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8192eu",
     smoke_rtl8192eu_admission_requires_record_policy_and_radio
 );
+
+fn owner_ops(io: &Fake) -> usize {
+    io.0.lock().ops.len()
+}

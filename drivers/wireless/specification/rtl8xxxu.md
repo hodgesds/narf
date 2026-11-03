@@ -1284,6 +1284,23 @@ mismatched-identity or unqualified-initial-channel records are terminal
 `Permission` (with the admitted RA mask); it does not by itself publish a
 netdev or open MAC TX/RX.
 
+`Owner::start_8192e(permission)` is the RF half of `rtl8xxxu_start`
+(`rtl8192e_enable_rf`) followed by the admitted initial channel;
+`Owner::tune_8192e(permission, primary, width)` is `rtl8xxxu_config`'s
+channel change (`rtl8192e_set_tx_power(primary, ht40)` then
+`rtl8xxxu_gen2_config_channel`). Both revalidate the permission against the
+retained factory/VID/PID and the exact primary/width before any transfer, and
+return the admitted RA mask. A retune therefore needs a separately granted
+permission for the new channel/width; there is no default.
+
+Remaining for a native RTL8192EU station (not implemented): the station
+composition (`receive_runtime`/`station_runtime`/`service_runtime` and the
+netdev are RTL8188EU-specific: host RA, rxdesc16 admission, N8PC gain
+tokens); routing C2H RA reports and `ra_connect_8192e`/`ra_watchdog_8192e`
+from a station owner; station PS over `submit_null_8192e`; and
+`restart_parked` (power-off then a fresh owner lifecycle) for RTL8192EU.
+No RTL8192EU netdev is published.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
