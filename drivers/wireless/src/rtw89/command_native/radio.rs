@@ -175,8 +175,18 @@ impl Native {
         })
         .map_err(denied)?
     }
-    /// RTL8852C with its current ordinary grant: every B companion program
-    /// (HT/HE/A-MPDU/RA/A-MSDU/QoS/WMM) is "no program" (`Ok(false)`).
+    /// A C operating program the signed C base record enables
+    /// (`radio_policy_c::PROGRAMS`: WMM BE/TID0 and firmware RA).
+    fn c_program(&self, program: radio_policy::Program) -> Result<bool, power::Error> {
+        self.qualification_c
+            .as_ref()
+            .ok_or(power::Error::Unsupported)?
+            .allows(program)
+            .map_err(|_| power::Error::Access)
+    }
+    /// RTL8852C with its current ordinary grant: the B companion programs
+    /// C has no path for (HT/HE/A-MPDU/A-MSDU/all-AC QoS) are "no program"
+    /// (`Ok(false)`); WMM and firmware RA follow `c_program`.
     /// B (or no grant) is `Ok(false)` here and keeps its own checks.
     fn c_ordinary(&self) -> Result<bool, power::Error> {
         if self.chip != ChipId::Rtl8852C {
@@ -342,7 +352,7 @@ impl Native {
     }
     pub(in crate::rtw89) fn station_firmware_ra_allowed(&self) -> Result<bool, power::Error> {
         if self.c_ordinary()? {
-            return Ok(false);
+            return self.c_program(radio_policy::Program::FirmwareRa);
         }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
@@ -369,7 +379,7 @@ impl Native {
     }
     pub(in crate::rtw89) fn station_wmm_allowed(&self) -> Result<bool, power::Error> {
         if self.c_ordinary()? {
-            return Ok(false);
+            return self.c_program(radio_policy::Program::Wmm);
         }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?

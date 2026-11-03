@@ -23,7 +23,7 @@
 //! base set exactly. These are formats only: NARF carries no C board value,
 //! and an unprovisioned board stays unadmitted.
 use super::operating_channel_c::{Band, Profile, Width};
-use super::radio_policy::Lifecycle;
+use super::radio_policy::{Lifecycle, Program};
 use super::{factory::Factory, radio_assets::Assets, radio_power_c::Plan};
 use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
@@ -32,6 +32,39 @@ use narf_wireless::reg::RegulatoryDomain;
 const LENGTH: usize = 128;
 /// Profile byte 57: the B base flags with no optional program bit.
 const BASE_FLAGS: u8 = 3;
+/// Optional operating programs a C base record may enable (byte 57, the
+/// B `radio_policy::Program` bit layout and dependencies). Only programs
+/// whose whole C path exists are admitted; the others stay refused.
+pub(super) const PROGRAMS: [Program; 2] = [Program::Wmm, Program::FirmwareRa];
+fn programs_valid(flags: u8) -> bool {
+    let known = PROGRAMS.iter().fold(BASE_FLAGS, |m, p| m | p.bit());
+    Program::valid(flags) && flags & !known == 0
+}
+/// Extend a C identity by one enabled program (domain-separated from B's
+/// `Program::extend`; the station H2C/TXWD programs are the common AX code
+/// the B fingerprints measure, sent through the C v1 TXWD path).
+fn extend(program: Program, identity: [u8; 32]) -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    match program {
+        Program::Wmm => {
+            hash.update(
+                b"NARF RTL8852C WMM BE/TID0 legacy12 optional operating recipe v1;txwd_body_v1",
+            );
+            hash.update(&identity);
+            hash.update(&super::station_control::wmm_fingerprint());
+        }
+        Program::FirmwareRa => {
+            hash.update(
+                b"NARF RTL8852C firmware RA legacy optional operating recipe v1;txwd_info0_v1",
+            );
+            hash.update(&identity);
+            hash.update(&super::station_control::firmware_ra_fingerprint());
+        }
+        // Not admitted by `programs_valid`; never part of a C identity.
+        _ => hash.update(b"NARF RTL8852C unadmitted program"),
+    }
+    hash.finalize()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -145,6 +178,16 @@ impl Board {
     }
     pub fn identity(&self) -> [u8; 32] {
         self.identity
+    }
+    /// Extend the identity by every C program enabled in `flags`, in the
+    /// fixed `PROGRAMS` order (as B's `Board::with_programs`).
+    pub(super) fn with_programs(mut self, flags: u8) -> Self {
+        for program in PROGRAMS {
+            if flags & program.bit() != 0 {
+                self.identity = extend(program, self.identity);
+            }
+        }
+        self
     }
     pub fn profile(&self) -> Profile {
         self.profile
@@ -313,6 +356,8 @@ pub(super) struct Qualification {
     envelope: Envelope,
     record_digest: [u8; 32],
     record_signer: [u8; 32],
+    /// Byte 57 of the base record: base flags plus enabled `PROGRAMS`.
+    flags: u8,
     channels: alloc::vec::Vec<Channel>,
     /// Profile whose envelope gates every publication.
     active: narf_lib::sync::IrqSafeSpinLock<Profile>,
@@ -359,31 +404,42 @@ impl Qualification {
             || bytes[8..12] != (LENGTH as u32).to_le_bytes()
             || bytes[12..14] != 0x10ecu16.to_le_bytes()
             || bytes[14..16] != board.device.to_le_bytes()
-            || bytes[54..58] != [1, 20, 1, BASE_FLAGS]
+            || bytes[54..57] != [1, 20, 1]
+            || !programs_valid(bytes[57])
             || bytes[68..] != [0; 60]
         {
             return Err(Error::Format);
         }
-        if bytes[16..48] != board.identity || bytes[48..54] != board.mac {
+        let flags = bytes[57];
+        let extended = board.with_programs(flags);
+        if bytes[16..48] != extended.identity || bytes[48..54] != board.mac {
             return Err(Error::Identity);
         }
         let envelope = envelope(bytes, Profile::INITIAL)?;
         let mut digest = narf_crypto::sha256::Sha256::new();
         digest.update(bytes);
         Ok(Self {
-            board,
+            board: extended,
             authority,
             envelope,
             record_digest: digest.finalize(),
             record_signer,
+            flags,
             channels: alloc::vec::Vec::new(),
             active: narf_lib::sync::IrqSafeSpinLock::new(Profile::INITIAL),
             #[cfg(any(test, feature = "kernel-test"))]
             model_domain: None,
         })
     }
+    /// `board` is the program-free identity [`Board::new`] rebinds; the
+    /// record measured it extended by its own enabled programs.
     pub fn matches(&self, board: Board) -> bool {
-        self.board == board
+        self.board == board.with_programs(self.flags)
+    }
+    /// Whether the base record enables `program` (current authority only).
+    pub(super) fn allows(&self, program: Program) -> Result<bool, Error> {
+        self.current()?;
+        Ok(self.flags & program.bit() != 0)
     }
     /// Load the optional `N5CC` record for `board.profile()` (a noninitial
     /// identity from [`Board::new`]). Absent: `Ok(false)`, unadmitted.

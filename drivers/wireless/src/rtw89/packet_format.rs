@@ -352,8 +352,10 @@ struct Tx<'a> {
     fragments: bool,
 }
 /// RTL8852C ordinary station TXWD (core.c `rtw89_core_fill_txdesc_v1`,
-/// pci.c `rtw89_pci_fill_txaddr_info_v1`): management and non-QoS data at
-/// a fixed rate or firmware RA, no aggregation, A-MSDU, +HTC or fragments.
+/// pci.c `rtw89_pci_fill_txaddr_info_v1`): management, non-QoS and (under
+/// the signed C WMM program) QoS data at a fixed rate or firmware RA, no
+/// aggregation, A-MSDU, +HTC or fragments. With `sec_en` false the v1
+/// body2 `TID_INDICATE`, info1 and info2 fields sit where v0 has them.
 /// The v1 body carries `ADDR_INFO_NUM`, moves USE_RATE/DATA_RATE into body
 /// dword7 and has no HW SSN fields (management keeps the host SW_SEQ).
 pub(super) fn transmit_c(
@@ -365,7 +367,7 @@ pub(super) fn transmit_c(
     report: bool,
     rate: u8,
 ) -> Result<(Vec<u8>, Queue), Error> {
-    if frame.first().is_some_and(|fc| fc & 0xfc == 0x88) || rate & DATA_ER != 0 {
+    if rate & DATA_ER != 0 || amsdu(frame) {
         return Err(Error::Frame);
     }
     transmit_profile_inner(Tx {

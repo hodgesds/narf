@@ -300,10 +300,27 @@ fn smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info() -> TestResult {
     {
         return TestResult::Fail("C firmware-RA data or two-entry address info differs");
     }
-    // QoS data, extended range and descriptor bounds.
+    // WMM QoS BE/TID0 data (rtw89_core_fill_txdesc_v1 with sec_en false):
+    // the v0 body2/info1 positions, no TID_INDICATE for TID0, no AGG_EN.
     let mut qos = frame(100, false);
     qos[0] = 0x88;
-    if transmit_c(&qos, OWN, 0, 1, 0x1000, false, FIRMWARE_RA).is_ok()
+    qos[24..26].fill(0);
+    let Ok((header, queue)) = transmit_c(&qos, OWN, 0, 1, 0x1000, false, FIRMWARE_RA | 4) else {
+        return TestResult::Fail("C WMM QoS TID0 TXWD refused");
+    };
+    if queue != Queue::Data
+        || word(&header, 8) & 1 << 23 != 0
+        || word(&header, 12) & 1 << 12 != 0
+        || word(&header, 28) != 0
+        || word(&header, 32) != 0
+        || word(&header, 36) != 4 << 16
+    {
+        return TestResult::Fail("C QoS TXWD differs from rtw89_core_fill_txdesc_v1");
+    }
+    // A-MSDU QoS, extended range and descriptor bounds.
+    let mut amsdu = qos.clone();
+    amsdu[24] = 0x80;
+    if transmit_c(&amsdu, OWN, 0, 1, 0x1000, false, FIRMWARE_RA).is_ok()
         || transmit_c(&data, OWN, 0, 1, 0x1000, false, FIRMWARE_RA | DATA_ER).is_ok()
         || descriptor_len(0xf_1234_5000, 70) != Ok([70, 0, 0xc0, 0x43, 0, 0x50, 0x34, 0x12])
         || descriptor_len(0x1000, C_HEADER_MAX + 1).is_ok()

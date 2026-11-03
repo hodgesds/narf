@@ -424,7 +424,8 @@ fn prepare_header_profile(
     }
     let header_length = if fc & 0xfc == 0x88 {
         // TID0..7, normal ack policy; EOSP belongs to the HE +HTC form.
-        if chip != ChipId::Rtl8852B
+        // RTL8852C carries QoS data only without A-MSDU (WMM program).
+        if !(chip == ChipId::Rtl8852B || chip == ChipId::Rtl8852C && !amsdu)
             || frame.get(24).is_none_or(|control| {
                 control & if amsdu { 0x68 } else { 0xe8 } != 0
                     || (control & 0x10 != 0) != (fc & 0x8000 != 0)

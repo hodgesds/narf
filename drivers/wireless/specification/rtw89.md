@@ -3275,8 +3275,8 @@ firmware PHY-cap receipt fingerprint, the `radio_c` recipe text, the exact
 `radio_power_c::Plan::bind` and the profile (band, primary, centre, width),
 domain-separated per band and per observed-FLR lifecycle. Its base record
 is `N5CB` v2 (`rtw89/rtw8852c-radio-v2-<mac>.bin`, 128 bytes, B's v2
-layout with profile `[1, 20, 1]` and flags exactly 3: C has no WMM/QoS/RA/
-HT/HE/A-MPDU programs and no N52A/N52T/N52P/N52F companions). Each
+layout with profile `[1, 20, 1]` and flags 3 plus the C programs below;
+no N52A/N52T/N52P/N52F companions). Each
 noninitial typed profile in `radio_policy_c::noninitial` (2.4GHz 20MHz
 2..=13, 2.4GHz HT40 either side, every 5GHz 20/40/80/160MHz block; never
 channel 14 or 6GHz) may carry `N5CC` v1
@@ -3488,6 +3488,32 @@ this; `station_rf_tracking` stays a no-op on C. B registers and bytes are
 unchanged. Unexecuted cases:
 `smoke_rtw8852c_track_uses_c_dig_edcca_dcfo_layout_and_5g_fa_thresholds`,
 `smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo`.
+
+**C WMM and firmware RA programs (`radio_policy_c::PROGRAMS`).** The C
+`N5CB` v2 base record's byte 57 now uses the B `radio_policy::Program`
+bit layout and dependencies, restricted to the programs whose whole C path
+exists: base 3, `Wmm` (bit 2) and `FirmwareRa` (bit 4, requires WMM).
+Each enabled program extends the C identity in that fixed order with a
+C-domain recipe (`radio_policy_c::extend`, the common AX station
+`wmm_fingerprint`/`firmware_ra_fingerprint`), so a record authorizes
+exactly the programs it was measured with; `Qualification::matches`
+compares against the extended identity and `allows(program)` reports the
+signed flag under current authority. HT/HE/A-MPDU/all-AC QoS bits are
+refused on C, as are unknown bits and unmet dependencies; `N5CC` channel
+records keep flags 3 and bind to the (extended) base identity.
+`Native::station_{wmm,firmware_ra}_allowed` on C read these flags
+(`c_program`); HT/HE/A-MPDU/A-MSDU/all-AC QoS stay `Ok(false)`. The WMM
+station TX path on C is QoS BE/TID0 data: `tx_transport::prepare_header`
+admits QoS data on C without A-MSDU (no +HTC), and
+`packet_format::transmit_c` builds it with `rtw89_core_fill_txdesc_v1`
+(`sec_en` false: body2 `TID_INDICATE`, info1 `DATA_RTY_LOWEST_RATE` at the
+v0 positions; no aggregation). EDCA (`H2C_FUNC_USR_EDCA`) and the RA H2C
+(`rtw89_fw_h2c_ra`, `chip_gen` AX) are the same AX formats as B. An
+unprovisioned board, or a C record without the bits, keeps the legacy
+station. Unexecuted case:
+`smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only`
+(plus the extended `smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info`
+and `smoke_rtw89_native_rejects_unsupported_extents`).
 
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 

@@ -259,3 +259,57 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans
 );
+fn smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only() -> TestResult {
+    let exact = board(Profile::INITIAL, 7);
+    let cap = authority();
+    let flags = Program::FirmwareRa.flags();
+    let mut bytes = base_image(exact);
+    bytes[57] = flags;
+    // The record measures the program-extended identity.
+    if Qualification::from_verified(&bytes, Some([3; 32]), exact, cap).is_ok() {
+        return TestResult::Fail("program flags accepted on the program-free identity");
+    }
+    bytes[16..48].copy_from_slice(&exact.with_programs(flags).identity);
+    let Ok(mut q) = Qualification::from_verified(&bytes, Some([3; 32]), exact, cap) else {
+        return TestResult::Fail("signed C WMM + firmware RA record refused");
+    };
+    q.model_domain = base(cap).model_domain;
+    if !q.matches(exact)
+        || q.allows(Program::Wmm) != Ok(true)
+        || q.allows(Program::FirmwareRa) != Ok(true)
+        || q.allows(Program::Ht) != Ok(false)
+        || q.allows(Program::QosAll) != Ok(false)
+    {
+        return TestResult::Fail("C program allowances differ from the signed flags");
+    }
+    // Programs without a C path, unknown bits or unmet dependencies.
+    for flags in [
+        Program::Ht.flags(),
+        Program::QosAll.flags(),
+        Program::Ampdu.flags(),
+        BASE_FLAGS | Program::FirmwareRa.bit(),
+        0x7,
+        0x6,
+    ] {
+        let mut bad = base_image(exact);
+        bad[57] = flags;
+        bad[16..48].copy_from_slice(&exact.with_programs(flags).identity);
+        let accepted = Qualification::from_verified(&bad, Some([3; 32]), exact, cap).is_ok();
+        if accepted != (flags == Program::Wmm.flags()) {
+            return TestResult::Fail("C program flag admission differs");
+        }
+    }
+    let plain = base(cap);
+    if plain.allows(Program::Wmm) != Ok(false) {
+        return TestResult::Fail("program-free C record allows WMM");
+    }
+    cap.revoke();
+    if q.allows(Program::Wmm).is_ok() {
+        return TestResult::Fail("revoked C record still allows a program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_base_record_programs_are_wmm_and_firmware_ra_only
+);
