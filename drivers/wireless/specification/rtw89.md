@@ -3495,8 +3495,8 @@ board record exists, so actual admission needs a provisioned board);
 VHT, widths above 20MHz, A-MSDU,
 LPS, WoW, monitor and AP are not implemented for C (WMM, all-AC QoS,
 firmware RA, HT20/HE20 and A-MPDU/BA: see below) (C track work covers
-DIG/CFO/EDCCA/IFS-CLM, not `rtw8852c_rfk_track`). The C station uses 20MHz only (wide C profiles are reachable
-only through `retune_channel_c`, not from the station). Unexecuted new cases:
+DIG/CFO/EDCCA/IFS-CLM, not `rtw8852c_rfk_track`). The C station widens to admitted 40/80MHz profiles through the
+shared wide path (below); 160MHz is station-unreachable. Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
 `smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.
@@ -3606,13 +3606,31 @@ fragments stay refused), `tx_transport::prepare_header` admits the HE
 `DATA_ER`: `rtw89_core_fill_txdesc_v1` keeps body3 `AGG_EN`/`BK`, info1
 `MAX_AGGNUM`/`A_CTRL_BSR`/`DATA_RTY_LOWEST_RATE` and info2 `AMPDU_DENSITY`
 (`rtw89_build_txwd_info2_v1`) at the v0 positions and info0_v1 carries
-`DATA_ER`. Widths stay 20MHz: the C station does not widen (HT40/VHT80 on
-C waits for the shared B wide-channel station path and the `N5CC` 40/80
-profiles; no C VHT program exists). B bytes are unchanged. Unexecuted
+`DATA_ER`. Widths: 40/80MHz follow the shared wide path (below). B bytes are unchanged. Unexecuted
 cases: `smoke_rtw8852c_base_record_programs_follow_b_program_layout`,
 `smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info` (A-MPDU/ER),
 `smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs`,
 `smoke_rtw89_native_rejects_unsupported_extents` (C +HTC).
+
+**C 40/80MHz station on the shared wide path.** The RTL8852C station
+uses the B wide-channel station code (`station_control::wide_phy`, local
+HT40/VHT80/HE-wide capability, `configure_ra_wide`) unchanged:
+`Native::admitted_wide` on C maps every shared `wide_profiles` chandef to
+its C typed profile (`command_native::c_profile`: same primary, center and
+width) and lists it when a loaded signed `N5CC` record is
+`channel_active` over the whole span; `Startup::retune_wide` dispatches C
+to `retune_channel_c` (unassociated), and `retune_radio_c` then sets the
+packet owner's RX bound (`set_operating_width`, VHT only on a 5GHz 40/80MHz
+channel), as the B retune does. `rx_packet` admits bandwidth up to
+`RTW89_CHANNEL_WIDTH_80` and VHT NSS1/NSS2 MCS0..9 on the v1 descriptor too
+(`AX_RXD_BW_v1_MASK`). A C 40/80MHz record identity (`radio_policy_c::
+Board::new`) now also binds `station_control::wide_fingerprint`, exactly as
+B's `new_noninitial` does. The capability is offered only for the bands with
+an admitted wide profile (`interface.rs`), so an unprovisioned C board stays
+20MHz. 160MHz is not part of this step. B bytes are unchanged. Unexecuted
+cases: `smoke_rtw8852c_wide_station_profiles_map_to_c_profiles`,
+`smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner` (C v1
+part).
 
 **C BA CAM (`RTW89_BACAM_V0_EXT`, `station_control::Controller`).** On C,
 `Controller::initialize` first sends core.c `rtw89_core_start`'s

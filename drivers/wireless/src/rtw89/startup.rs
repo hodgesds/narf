@@ -395,12 +395,20 @@ impl Startup {
     }
     /// RTL8852B retune of the Ready unassociated radio to one signed-admitted
     /// 40/80MHz `profile` (`Native::retune_full_radio_to`), with
-    /// `retune_channel`'s retry/terminal split. RTL8852C wide profiles are
-    /// `retune_channel_c`'s.
+    /// `retune_channel`'s retry/terminal split. RTL8852C takes the same
+    /// chandef as its typed profile through `retune_channel_c`.
     pub(super) async fn retune_wide(
         &mut self,
         profile: super::operating_channel::Profile,
     ) -> Result<u32, power::Error> {
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C)
+        {
+            // The same chandef as the C typed profile (unassociated retune).
+            let c = super::command_native::c_profile(profile).ok_or(power::Error::Unsupported)?;
+            return self.retune_channel_c(c, false).await;
+        }
         if self.phase != Phase::RadioReady
             || self.monitor.is_some()
             || self

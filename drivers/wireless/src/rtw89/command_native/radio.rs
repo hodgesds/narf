@@ -97,6 +97,28 @@ pub(in crate::rtw89) fn wide_profiles() -> impl Iterator<Item = operating_channe
     });
     ghz2.chain(ghz5)
 }
+/// The RTL8852C typed profile of a shared station profile (`wide_profiles`
+/// or a 20MHz narrowing): same primary, center and width.
+pub(in crate::rtw89) fn c_profile(
+    profile: operating_channel::Profile,
+) -> Option<operating_channel_c::Profile> {
+    use operating_channel::Width;
+    use operating_channel_c::{Band, Profile, Width as WidthC};
+    let band = if profile.is_5ghz() {
+        Band::Ghz5
+    } else {
+        Band::Ghz2
+    };
+    let c = match profile.width() {
+        Width::Mhz20 => Profile::new20(band, profile.primary()),
+        Width::Mhz40 if band == Band::Ghz2 => {
+            Profile::new_2ghz_40(profile.primary(), profile.secondary_above())
+        }
+        Width::Mhz40 => Profile::new_wide(band, profile.primary(), WidthC::Mhz40),
+        Width::Mhz80 => Profile::new_wide(band, profile.primary(), WidthC::Mhz80),
+    }?;
+    (c.center() == profile.center()).then_some(c)
+}
 impl Native {
     /// Derive the exact required signed-artifact identity without opening any
     /// artifact, touching registers, advancing state or granting transmission.
@@ -645,6 +667,24 @@ impl Native {
     pub(in crate::rtw89) fn admitted_wide(
         &self,
     ) -> Result<alloc::vec::Vec<operating_channel::Profile>, power::Error> {
+        if self.c_ordinary()? {
+            // RTL8852C: the same 40/80MHz chandefs, each with a loaded signed
+            // `N5CC` record wholly active under the host rule.
+            let qualification = self
+                .qualification_c
+                .as_ref()
+                .ok_or(power::Error::Terminal)?;
+            let mut admitted = alloc::vec::Vec::new();
+            for profile in wide_profiles() {
+                let Some(c) = c_profile(profile) else {
+                    continue;
+                };
+                if qualification.channel_active(c).map_err(denied)? {
+                    admitted.push(profile);
+                }
+            }
+            return Ok(admitted);
+        }
         // RTL8852C wide operating channels belong to its own C records.
         if self.c_ordinary()? {
             return Ok(alloc::vec::Vec::new());
@@ -1363,6 +1403,15 @@ impl Native {
         }
         qualification.current().map_err(denied)?;
         self.channel = Some((profile.primary(), owner.epoch()));
+        // RX admission follows the programmed width (as the B retune): up to
+        // this channel's bandwidth, VHT rates only on a 5GHz 40/80MHz channel.
+        if let Some(core) = self.station_runtime.core.as_mut() {
+            let width = profile.width() as u8;
+            core.set_operating_width(
+                width,
+                width != 0 && profile.band() == operating_channel_c::Band::Ghz5,
+            );
+        }
         // ieee80211_offchannel_return: queues reopen only on the same grant.
         self.ordinary = Some(grant);
         Ok(owner.epoch())

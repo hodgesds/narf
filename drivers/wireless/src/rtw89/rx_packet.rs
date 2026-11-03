@@ -362,17 +362,17 @@ impl Assembler {
                     || descriptor.icv_error
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
-                    // RTL8852B: up to RTW89_CHANNEL_WIDTH_80 (its
-                    // `support_bandwidths`); the packet owner bounds it by the
-                    // programmed width. RTL8852C keeps 20MHz only here.
-                    || descriptor.bandwidth > if self.bw_v1 { 0 } else { 2 }
+                    // Up to RTW89_CHANNEL_WIDTH_80 (B `support_bandwidths`;
+                    // C's station widths); the packet owner bounds it by the
+                    // programmed width.
+                    || descriptor.bandwidth > 2
                     // Legacy CCK1..OFDM54, HT MCS0..15 (RTW89_HW_RATE_MCS0),
-                    // VHT NSS1/NSS2 MCS0..9 (8852B; RTW89_HW_RATE_VHT_NSS1_MCS0)
+                    // VHT NSS1/NSS2 MCS0..9 (RTW89_HW_RATE_VHT_NSS1_MCS0)
                     // or HE NSS1/NSS2 MCS0..11 with a defined GI/LTF
                     // (RTW89_HW_RATE_HE_NSS1_MCS0, RTW89_GILTF_1XHE08 = 5).
                     || !(descriptor.rate <= 11
                         || (0x80..=0x8f).contains(&descriptor.rate)
-                        || !self.bw_v1 && vht_rate(descriptor.rate)
+                        || vht_rate(descriptor.rate)
                         || he_rate(descriptor.rate) && descriptor.gi_ltf <= 5)
                 {
                     Event::Dropped

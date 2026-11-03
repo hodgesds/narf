@@ -19,6 +19,9 @@ const DEVICE_DMA_MASK: u64 = (1u64 << 36) - 1;
 mod phycap;
 #[path = "command_native/radio.rs"]
 mod radio;
+pub(in crate::rtw89) use radio::c_profile;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(in crate::rtw89) use radio::wide_profiles;
 #[path = "command_native/rf_tracking.rs"]
 mod rf_tracking;
 pub(super) use radio::{QualificationRequest, RadioPreflight};

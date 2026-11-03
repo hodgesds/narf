@@ -353,3 +353,37 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_base_record_programs_follow_b_program_layout
 );
+
+/// The shared station 40/80MHz chandefs map onto the C typed profiles with
+/// the same primary/center/width (`command_native::c_profile`); every one is
+/// a profile a C record may admit.
+fn smoke_rtw8852c_wide_station_profiles_map_to_c_profiles() -> TestResult {
+    use crate::rtw89::command_native::{c_profile, wide_profiles};
+    let mut count = 0;
+    for profile in wide_profiles() {
+        let Some(c) = c_profile(profile) else {
+            return TestResult::Fail("shared wide profile without a C typed profile");
+        };
+        if c.primary() != profile.primary()
+            || c.center() != profile.center()
+            || c.width() as u8 != profile.width() as u8
+            || (c.band() == Band::Ghz5) != profile.is_5ghz()
+            || !admissible(c)
+        {
+            return TestResult::Fail("C typed profile differs from the shared chandef");
+        }
+        let narrow = c_profile(profile.narrowed());
+        if narrow != Profile::new20(c.band(), profile.primary()) {
+            return TestResult::Fail("20MHz narrowing does not map to the C 20MHz profile");
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return TestResult::Fail("no shared wide profiles");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_wide_station_profiles_map_to_c_profiles
+);

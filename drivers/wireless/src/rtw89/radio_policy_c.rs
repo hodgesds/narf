@@ -186,6 +186,11 @@ impl Board {
         h.update(&base.identity());
         h.update(&phycap.fingerprint());
         h.update(RECIPE);
+        // A 40/80MHz record also binds the shared wide station capability
+        // its channel lets the station offer (`station_control::wide_phy`).
+        if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {
+            h.update(&super::station_control::wide_fingerprint());
+        }
         power.bind(&mut h);
         h.update(&[
             profile.band() as u8,
