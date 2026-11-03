@@ -665,8 +665,30 @@ async fn verify_station_geometry(io: &mut impl Io) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Retune readback of a 20MHz `rtw8822b_set_channel(ch)`: RF18 band/channel/
+/// BW on both paths, RF-A 0xbe[17:15] (`rtw8822b_set_channel_rf`), 0x8ac
+/// 20MHz (`_bb`) and CCK_CHECK 0x454 bit7 on 5GHz only
+/// (`rtw_set_channel_mac`).
+pub(super) async fn verify_channel20(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    let expect = rf18(0, ch, Width::Twenty) & 0x70fff;
+    for path in 0..2 {
+        if rf_read(io, path, 0x18).await? & 0x70fff != expect {
+            return Err(Error::Prerequisite);
+        }
+    }
+    let be = rf_be(ch).filter(|&v| v != 0xff).ok_or(Error::Unsupported)?;
+    let cck = io.read8(0x454).await?;
+    if (rf_read(io, 0, 0xbe).await? >> 15) & 7 != u32::from(be)
+        || read(io, 0x8ac).await? & !0xffcffc00 != 0
+        || cck == 255
+        || (cck & 0x80 != 0) != (ch > 14)
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
 /// Both paths' measured `N2BP` TXAGC words (`rtw8822b_set_tx_power_index_by_rate`).
-async fn verify_txagc(io: &mut impl Io, tables: [[u8; 64]; 2]) -> Result<(), Error> {
+pub(super) async fn verify_txagc(io: &mut impl Io, tables: [[u8; 64]; 2]) -> Result<(), Error> {
     for (path, table) in tables.iter().enumerate() {
         let base = if path == 0 { 0x1d00 } else { 0x1d80 };
         for (word, rates) in table.chunks_exact(4).enumerate() {
@@ -737,7 +759,7 @@ where
         return Err(Error::Prerequisite);
     }
     grant.temperature(((rf_read(&mut io, 0, 0x42).await? & 0xfc00) >> 10) as u8)?;
-    io.finish_station8821c(super::power_policy::Gate::b22(grant.clone()))?;
+    io.finish_station8821c(super::power_policy::Gate::b22(grant.clone(), phy))?;
     Ok(super::radio8821c::StationInfo {
         channel: 1,
         bandwidth_mhz: 20,

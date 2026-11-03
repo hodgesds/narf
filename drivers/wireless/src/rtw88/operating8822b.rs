@@ -87,15 +87,29 @@ fn policy_limit(domain: &RegulatoryDomain, ceiling: i16) -> Result<i16, Error> {
 /// `bw40_base[0] + ofdm_diff` (signed low nibble of byte 11), `txgi_factor`
 /// 1, capped at `max_power_index` 0x3f. Erased or wrapped cells fail.
 pub(super) fn factory_limits(raw: &[u8]) -> Result<[u8; 2], QError> {
-    if raw.len() < 12 || raw[0] > 63 || raw[6] > 63 || raw[11] == 255 {
+    group_limits(raw, 0)
+}
+/// [`factory_limits`] for any 2.4GHz `phy.c::rtw_get_channel_group` group
+/// 0..=4: CCK `cck_base[group]` (bytes 0..6) and 1S OFDM `bw40_base[group]`
+/// (bytes 6..11) + `ht_1s_diff.ofdm`.
+pub(super) fn group_limits(raw: &[u8], group: usize) -> Result<[u8; 2], QError> {
+    if group > 4 || raw.len() < 12 || raw[group] > 63 || raw[6 + group] > 63 || raw[11] == 255 {
         return Err(QError::Factory);
     }
     let nibble = i16::from(raw[11] & 15);
-    let ofdm = i16::from(raw[6]) + if nibble & 8 != 0 { nibble - 16 } else { nibble };
+    let ofdm = i16::from(raw[6 + group]) + if nibble & 8 != 0 { nibble - 16 } else { nibble };
     if ofdm < 0 {
         return Err(QError::Factory);
     }
-    Ok([raw[0], ofdm.min(63) as u8])
+    Ok([raw[group], ofdm.min(63) as u8])
+}
+/// `phy.c::rtw_phy_get_5g_tx_power_index` OFDM for one 5GHz channel group
+/// (`band5::Power5g::ofdm`, `txgi_factor` 1) over a raw path record, refused
+/// above `max_power_index` 0x3f.
+pub(super) fn band5_limit(raw: &[u8], group: usize) -> Option<u8> {
+    super::band5::Power5g::parse(raw)?
+        .ofdm(group, 1)
+        .filter(|v| *v <= 63)
 }
 /// Both B22 RF paths (`txpwr_idx_table[0]`/`[1]`, `rtw8822b_read_efuse`).
 pub(super) fn board_limits(factory: &Factory8822b) -> Result<[[u8; 2]; 2], QError> {
@@ -168,6 +182,9 @@ pub(super) struct Envelope {
     peaks: [i16; 14],
     thermal: [u8; 2],
     limits: [[u8; 2]; 2],
+    /// Raw `txpwr_idx_table[0]`/`[1]` retained for the per-channel `N2BO`
+    /// factory ceilings of the other channel groups.
+    paths: [[u8; super::efuse8822b::POWER_PATH_LEN]; 2],
 }
 impl core::fmt::Debug for Envelope {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -184,10 +201,19 @@ impl Source {
         calibration: Arc<calibration8822b::Envelope>,
     ) -> Result<Envelope, Error> {
         let limits = board_limits(factory).map_err(denied)?;
+        let mut paths = [[0; super::efuse8822b::POWER_PATH_LEN]; 2];
+        for (p, out) in paths.iter_mut().enumerate() {
+            out.copy_from_slice(
+                factory
+                    .power_path(p as u8)
+                    .ok_or_else(|| denied(QError::Factory))?,
+            );
+        }
         struct Decode {
             request: Request,
             calibration: Arc<calibration8822b::Envelope>,
             limits: [[u8; 2]; 2],
+            paths: [[u8; super::efuse8822b::POWER_PATH_LEN]; 2],
         }
         impl CapOp<FirmwareBlob, Read> for Decode {
             type Output = Result<Envelope, Error>;
@@ -201,6 +227,7 @@ impl Source {
                         self.request,
                         self.calibration,
                         self.limits,
+                        self.paths,
                     )
                 })())
             }
@@ -211,11 +238,12 @@ impl Source {
                     request,
                     calibration,
                     limits,
+                    paths,
                 })
                 .map_err(|_| denied(QError::Authority))?,
             #[cfg(any(test, feature = "kernel-test"))]
             Self::Verified { bytes, signer, cap } => {
-                Envelope::decode(&bytes, signer, cap, request, calibration, limits)
+                Envelope::decode(&bytes, signer, cap, request, calibration, limits, paths)
             }
         }
     }
@@ -234,6 +262,7 @@ impl Envelope {
         request: Request,
         calibration: Arc<calibration8822b::Envelope>,
         limits: [[u8; 2]; 2],
+        paths: [[u8; super::efuse8822b::POWER_PATH_LEN]; 2],
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| denied(QError::Authority))?;
         signer.ok_or_else(|| denied(QError::Unsigned))?;
@@ -281,6 +310,7 @@ impl Envelope {
             peaks,
             thermal,
             limits,
+            paths,
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {
@@ -291,6 +321,21 @@ impl Envelope {
     }
     pub(super) fn factory_limits(&self) -> [[u8; 2]; 2] {
         self.limits
+    }
+    /// Per-path `[CCK, OFDM]` factory ceilings of one 2.4GHz channel group
+    /// (`group_limits`); None when either path's cells are erased/wrapped.
+    pub(super) fn group_limits(&self, group: usize) -> Option<[[u8; 2]; 2]> {
+        Some([
+            group_limits(&self.paths[0], group).ok()?,
+            group_limits(&self.paths[1], group).ok()?,
+        ])
+    }
+    /// Per-path factory OFDM ceilings of one 5GHz channel group.
+    pub(super) fn band5_limits(&self, group: usize) -> Option<[u8; 2]> {
+        Some([
+            band5_limit(&self.paths[0], group)?,
+            band5_limit(&self.paths[1], group)?,
+        ])
     }
     pub(super) fn calibration(&self) -> &calibration8822b::Envelope {
         &self.calibration
@@ -551,6 +596,11 @@ impl Grant {
     }
     pub(super) fn identity(&self) -> [u8; 32] {
         self.request.identity
+    }
+    /// The exact `N2BS` request: the base every B22 continuation record
+    /// (`N2BO` channel records first) binds.
+    pub(super) fn request(&self) -> &StationRequest {
+        &self.request
     }
     /// Both `N2BP` thermal windows (`N2BS` itself must cover 0..63).
     pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {

@@ -720,8 +720,12 @@ fn b22_station_fixture() -> Option<(
     let mut map = *b22_board_factory(3, 25).logical();
     for (path, cck, bw40, diff) in [(0usize, 32u8, 30u8, 0x02u8), (1, 31, 29, 0x0f)] {
         let at = 0x10 + path * 42;
-        map[at] = cck;
-        map[at + 6] = bw40;
+        // Group 0 carries the N2BP facts; groups 1..4 (the `N2BO` cases)
+        // step the base down by one index per group.
+        for group in 0..5 {
+            map[at + group] = cck - group as u8;
+            map[at + 6 + group] = bw40 - group as u8;
+        }
         map[at + 11] = diff;
     }
     let factory = super::super::efuse8822b::Factory8822b::for_test(map).ok()?;
@@ -809,7 +813,7 @@ fn smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm() -> Test
     let Some((factory, phy, grant, us)) = b22_station_fixture() else {
         return TestResult::Fail("8822B station fixture rejected");
     };
-    let gate = Gate::b22(grant.clone());
+    let gate = Gate::b22(grant.clone(), phy);
     if gate.did() != 0xb822
         || gate.host() != Host::PCI_B22
         || Host::PCI_B22.family() != "rtw8822be"
@@ -840,4 +844,153 @@ fn smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm() -> Test
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm
+);
+
+/// One signed 128-byte `N2BO` channel record for `channel` over `gate`.
+fn b22_channel_record(
+    gate: &super::super::power_policy::Gate,
+    channel: u8,
+    a: [u8; 12],
+    b: [u8; 12],
+) -> Option<alloc::vec::Vec<u8>> {
+    let kind = super::super::channel_policy::kind(channel)?;
+    let req = super::super::qualification::request(kind, gate).ok()?;
+    let mut r = alloc::vec![0u8; 128];
+    r[..4].copy_from_slice(b"N2BO");
+    r[4..8].copy_from_slice(&[1, 0, 128, 0]);
+    r[8..12].copy_from_slice(&128u32.to_le_bytes());
+    r[12..16].copy_from_slice(&req.host.header());
+    r[16..48].copy_from_slice(&req.identity);
+    r[48..54].copy_from_slice(&req.mac);
+    r[54..56].copy_from_slice(&[b'O', 1]);
+    r[56] = channel;
+    r[57] = 20;
+    for (at, value) in [(58, 4i16), (60, 76), (62, 50), (64, 40), (66, 60)] {
+        r[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    r[70..82].copy_from_slice(&a);
+    r[92..104].copy_from_slice(&b);
+    Some(r)
+}
+
+/// `N2BO` binds the exact `N2BS` base with the B22 channel contract, carries
+/// both paths' indices bounded by that primary's own factory group, scopes
+/// continuation identities per channel, and the retune program replays
+/// `rtw8822b_set_channel` + both paths' TXAGC with readback. Written; not
+/// yet executed natively.
+fn smoke_rtw8822be_n2bo_channel_record_binds_base_and_retunes() -> TestResult {
+    use super::super::{channel_policy, power_policy::Gate, qualification};
+    use narf_capabilities::Cap;
+    let Some((factory, phy, grant, _)) = b22_station_fixture() else {
+        return TestResult::Fail("8822B station fixture rejected");
+    };
+    let base = Gate::b22(grant, phy);
+    let Some(request) = base.base_request() else {
+        return TestResult::Fail("8822B base request missing for N2BO");
+    };
+    let m = factory.mac();
+    if request.filename
+        != alloc::format!(
+            "rtw88/rtw8822be-station-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
+        )
+    {
+        return TestResult::Fail("8822B N2BO base is not the exact N2BS request");
+    }
+    let Some(six) = channel_policy::kind(6) else {
+        return TestResult::Fail("channel 6 kind missing");
+    };
+    match qualification::request(six, &base) {
+        Ok(req) if req.filename.starts_with("rtw88/rtw8822be-channel06-v1-") => {}
+        _ => return TestResult::Fail("8822B N2BO request/filename differs"),
+    }
+    // Group 2 (channel 6) factory: A CCK 30 / OFDM 28+2, B CCK 29 / OFDM 27-1.
+    let a = [30, 30, 30, 30, 30, 30, 30, 30, 29, 29, 28, 28];
+    let b = [29, 29, 29, 29, 26, 26, 26, 26, 26, 25, 25, 24];
+    let load = |bytes| {
+        qualification::Source::Verified {
+            bytes,
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(six, &base)
+    };
+    let (Some(good), Some(over)) = (
+        b22_channel_record(&base, 6, a, b),
+        // Over the path-B group-2 OFDM ceiling (26) by one.
+        b22_channel_record(
+            &base,
+            6,
+            a,
+            [29, 29, 29, 29, 27, 26, 26, 26, 26, 25, 25, 24],
+        ),
+    ) else {
+        return TestResult::Fail("8822B N2BO fixture");
+    };
+    let mut tail = good.clone();
+    tail[56 + 48] = 1;
+    let mut magic = good.clone();
+    magic[2] = b'2';
+    if load(tail).is_ok() || load(magic).is_ok() {
+        return TestResult::Fail("8822B N2BO admitted a nonzero tail or C22 magic");
+    }
+    narf_wireless::reg::db::set_domain(narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: alloc::vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 20,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    });
+    let result = (|| {
+        if load(over).is_ok_and(|g| base.with_channel(g).is_ok()) {
+            return TestResult::Fail("8822B N2BO admitted an index over its group ceiling");
+        }
+        let Ok(g) = load(good) else {
+            return TestResult::Fail("8822B N2BO record rejected");
+        };
+        let Ok(gate) = base.with_channel(g) else {
+            return TestResult::Fail("8822B N2BO did not bind over the base");
+        };
+        if gate.channel() != 6
+            || gate.b22_indices() != Some([a, b])
+            || gate.extension_request().is_none_or(|r| {
+                !r.filename.starts_with("rtw88/rtw8822be-ch06-station-v1-")
+                    || r.identity == request.identity
+            })
+            || gate.without_channel().b22_indices() == Some([a, b])
+            || gate.current().is_err()
+        {
+            return TestResult::Fail("8822B N2BO gate facts differ");
+        }
+        let mut io = super::mac_tests::Model::new(3, 2);
+        io.sipi8822b = true;
+        if narf_scheduler::block_on(channel_policy::program(&mut io, &gate, false)).is_err() {
+            return TestResult::Fail("8822B N2BO retune program failed");
+        }
+        let r32 = |reg: usize| u32::from_le_bytes(io.regs[reg..reg + 4].try_into().unwrap());
+        if r32(0x2800 + 0x18 * 4) & 0x70fff != 0x0c06
+            || r32(0x2c00 + 0x18 * 4) & 0x70fff != 0x0c06
+            || r32(0x1d00) != u32::from_le_bytes([30; 4])
+            || r32(0x1d88) != u32::from_le_bytes([26, 25, 25, 24])
+            || r32(0x1d0c) != 0
+            || r32(0x440) != 0x1f
+        {
+            return TestResult::Fail("8822B N2BO retune differs from rtw8822b_set_channel + TXAGC");
+        }
+        TestResult::Pass
+    })();
+    narf_wireless::reg::db::clear_domain();
+    result
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bo_channel_record_binds_base_and_retunes
 );

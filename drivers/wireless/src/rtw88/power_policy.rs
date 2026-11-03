@@ -533,11 +533,15 @@ enum Scope {
         own: [u8; 6],
     },
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
-    /// RTL8822BE `N2BS` awake-station grant (nesting `N2BQ` + `N2BP`). No
-    /// N2xO/N2xL/HT/BA/protection continuation record family exists for B22
-    /// yet, so every extension accessor returns None and the base program is
-    /// the only admitted one.
-    B22(alloc::sync::Arc<super::operating8822b::Grant>),
+    /// RTL8822BE `N2BS` awake-station grant (nesting `N2BQ` + `N2BP`) and
+    /// the retained `rtw8822b_phy_set_param` facts `rtw8822b_set_channel`
+    /// needs on a retune. Per-channel `N2BO` records bind over it
+    /// ([`Gate::with_channel`]); no N2xL/HT/BA/protection family exists for
+    /// B22 yet, so those extension accessors return None.
+    B22(
+        alloc::sync::Arc<super::operating8822b::Grant>,
+        super::phy8822b::Info,
+    ),
 }
 /// Current policy for the B22 grant invoker (`operating8822b::Grant::invoke`).
 fn b22_policy() -> Result<narf_wireless::reg::RegulatoryDomain, super::firmware_transport::Error> {
@@ -589,7 +593,7 @@ impl Gate {
                 own: *own,
             }),
             Scope::C21(b) => ExtensionChip::C21(b.clone()),
-            Scope::B22(_) => return None,
+            Scope::B22(..) => return None,
         };
         Some(ExtensionBase {
             chip,
@@ -610,7 +614,7 @@ impl Gate {
                 permission: *permission,
                 own: *own,
             }),
-            Scope::C21(_) | Scope::B22(_) => None,
+            Scope::C21(_) | Scope::B22(..) => None,
         }
     }
     pub(super) fn new(
@@ -640,10 +644,13 @@ impl Gate {
         }
     }
     /// The B22 base gate over its `N2BS` grant (`radio8822b::prepare_station`).
-    pub(super) fn b22(grant: alloc::sync::Arc<super::operating8822b::Grant>) -> Self {
+    pub(super) fn b22(
+        grant: alloc::sync::Arc<super::operating8822b::Grant>,
+        phy: super::phy8822b::Info,
+    ) -> Self {
         Self {
             host: None,
-            scope: Scope::B22(grant),
+            scope: Scope::B22(grant, phy),
             tracking: None,
             extension: None,
             ht: None,
@@ -735,14 +742,41 @@ impl Gate {
                 calibration.board.groups.get(group).copied().flatten()
             }
             Scope::C21(g) => g.group_limits(group),
-            Scope::B22(_) => None,
+            Scope::B22(..) => None,
+        }
+    }
+    /// B22 per-path `[CCK, OFDM]` factory ceilings of one 2.4GHz group
+    /// (`operating8822b::group_limits`).
+    pub(super) fn b22_group_limits(&self, group: usize) -> Option<[[u8; 2]; 2]> {
+        match &self.scope {
+            Scope::B22(grant, _) => grant.power().group_limits(group),
+            _ => None,
+        }
+    }
+    /// The retained B22 PHY facts (`rtw8822b_set_channel` RFE/cut).
+    pub(super) fn b22_phy(&self) -> Option<super::phy8822b::Info> {
+        match &self.scope {
+            Scope::B22(_, phy) => Some(*phy),
+            _ => None,
+        }
+    }
+    /// B22 per-path coded TXAGC indices (DESC_RATE 0..11) of the committed
+    /// primary: the bound `N2BO` record's, else the `N2BP` channel-1 ones.
+    pub(super) fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+        let Scope::B22(grant, _) = &self.scope else {
+            return None;
+        };
+        match &self.channel {
+            Some(g) => super::channel_policy::Record::decode(0xb822, g.payload())
+                .map(|r| [r.indices, r.indices_b]),
+            None => Some(grant.power().indices()),
         }
     }
     /// C21 cross-band `rtw8821c_set_channel` facts (None on C22).
     pub(super) fn band_facts(&self) -> Option<super::radio8821c::BandFacts> {
         match &self.scope {
             Scope::C21(g) => Some(g.band_facts()),
-            Scope::B22(_) => None,
+            Scope::B22(..) => None,
             Scope::C22 { .. } => None,
         }
     }
@@ -762,7 +796,7 @@ impl Gate {
                 calibration.board.band5_groups.get(group).copied().flatten()
             }
             Scope::C21(g) => g.band5_group(group).map(|l| [l; 2]),
-            Scope::B22(_) => None,
+            Scope::B22(grant, _) => grant.power().band5_limits(group),
         }
     }
     /// Factory HT40 `(1S, 2S)` index ceilings for the group of a 40MHz
@@ -775,7 +809,7 @@ impl Gate {
                     calibration.board.ht40_groups.get(group).copied().flatten()
                 }
                 Scope::C21(g) => g.ht40_group(group).map(|m| (m, None)),
-                Scope::B22(_) => None,
+                Scope::B22(..) => None,
             };
         }
         let group = super::band5::group(center)?;
@@ -787,7 +821,7 @@ impl Gate {
                 .copied()
                 .flatten(),
             Scope::C21(g) => g.ht40_5_group(group).map(|m| (m, None)),
-            Scope::B22(_) => None,
+            Scope::B22(..) => None,
         }
     }
     /// Factory VHT80 `(1S, 2S)` index ceilings for an 80MHz `center`
@@ -803,7 +837,7 @@ impl Gate {
                 calibration.board.vht80_groups.get(group).copied().flatten()
             }
             Scope::C21(g) => g.vht80_group(group).map(|m| (m, None)),
-            Scope::B22(_) => None,
+            Scope::B22(..) => None,
         }
     }
     /// C22 5GHz OFDM6..54 both-path selection of the bound 5GHz N2xO
@@ -819,7 +853,7 @@ impl Gate {
         match &self.scope {
             Scope::C22 { .. } => 0xc822,
             Scope::C21(_) => 0xc821,
-            Scope::B22(_) => 0xb822,
+            Scope::B22(..) => 0xb822,
         }
     }
     /// Host identity keying this board's records (`phy8821c::Host`).
@@ -827,14 +861,14 @@ impl Gate {
         match &self.scope {
             Scope::C22 { .. } => super::phy8821c::Host::PCI_C22,
             Scope::C21(grant) => grant.host(),
-            Scope::B22(_) => super::phy8821c::Host::PCI_B22,
+            Scope::B22(..) => super::phy8821c::Host::PCI_B22,
         }
     }
     pub(super) fn own(&self) -> [u8; 6] {
         match &self.scope {
             Scope::C22 { own, .. } => *own,
             Scope::C21(grant) => grant.own(),
-            Scope::B22(grant) => grant.own(),
+            Scope::B22(grant, _) => grant.own(),
         }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
@@ -881,7 +915,7 @@ impl Gate {
                 ) => Error::Authority,
                 _ => Error::Policy,
             }),
-            Scope::B22(grant) => grant.invoke(&b22_policy, || Ok(())).map_err(b22_error),
+            Scope::B22(grant, _) => grant.invoke(&b22_policy, || Ok(())).map_err(b22_error),
         }
     }
     pub(super) fn invoke<T>(
@@ -945,7 +979,7 @@ impl Gate {
                 ..
             } => calibration.validate(*permission, domain),
             Scope::C21(_) => self.current(),
-            Scope::B22(grant) => grant
+            Scope::B22(grant, _) => grant
                 .invoke(&|| Ok(domain.clone()), || Ok(()))
                 .map_err(b22_error),
         }
@@ -984,13 +1018,20 @@ impl Gate {
                 *own,
             )),
             Scope::C21(g) => Some(g.extension_request()),
-            Scope::B22(_) => None,
+            Scope::B22(grant, _) => {
+                let r = grant.request();
+                Some(super::station_profile::Request {
+                    identity: r.identity,
+                    mac: r.mac,
+                    filename: r.filename.clone(),
+                })
+            }
         }
     }
     pub(super) fn eirp(&self) -> Option<i16> {
         match &self.scope {
             Scope::C22 { permission, .. } => Some(permission.eirp),
-            Scope::C21(_) | Scope::B22(_) => None,
+            Scope::C21(_) | Scope::B22(..) => None,
         }
     }
     pub(super) fn cck_gains(&self) -> Option<[u8; 2]> {
@@ -1001,7 +1042,7 @@ impl Gate {
         }
         match &self.scope {
             Scope::C22 { permission, .. } => Some(permission.gains),
-            Scope::C21(_) | Scope::B22(_) => None,
+            Scope::C21(_) | Scope::B22(..) => None,
         }
     }
     pub(super) fn allows_profile(&self, p: super::packet_format::DataProfile) -> bool {
@@ -1103,7 +1144,7 @@ impl Gate {
     }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         let facts = match &self.scope {
-            Scope::B22(_) => return None,
+            Scope::B22(..) => return None,
             Scope::C21(b) => b.ht_facts(),
             Scope::C22 {
                 calibration,
@@ -1119,7 +1160,7 @@ impl Gate {
             Scope::C21(b) => b.ht_group(g).map(|m| (m, None)),
             Scope::C22 { calibration, .. } if five => calibration.board.ht5_groups[g],
             Scope::C22 { calibration, .. } => calibration.board.ht_groups[g],
-            Scope::B22(_) => None,
+            Scope::B22(..) => None,
         };
         overlay(self.did(), facts, self.channel.as_deref(), group)
     }
@@ -1433,7 +1474,7 @@ impl Gate {
         }
         match &self.scope {
             Scope::C21(g) => Some(g.indices()),
-            Scope::C22 { .. } | Scope::B22(_) => None,
+            Scope::C22 { .. } | Scope::B22(..) => None,
         }
     }
     pub(super) fn invoke_with_domain<T>(
@@ -1470,10 +1511,23 @@ impl Gate {
             .map_err(super::firmware_transport::Error::Power)?;
         match &self.scope {
             Scope::C21(grant) => grant.invoke(operation),
-            Scope::B22(grant) => match domain {
-                Some(d) => grant.invoke(&|| Ok(d.clone()), operation),
-                None => grant.invoke(&b22_policy, operation),
-            },
+            Scope::B22(grant, _) => {
+                // The bound `N2BO` record and its span re-enter inside the
+                // nested `N2BQ` + `N2BP` + `N2BS` invocation.
+                let operation = || {
+                    if let Some(g) = &self.channel {
+                        match domain {
+                            Some(d) => super::channel_policy::current_in(g, 0xb822, d)?,
+                            None => super::channel_policy::current(g, 0xb822)?,
+                        }
+                    }
+                    operation()
+                };
+                match domain {
+                    Some(d) => grant.invoke(&|| Ok(d.clone()), operation),
+                    None => grant.invoke(&b22_policy, operation),
+                }
+            }
             Scope::C22 { calibration, .. } => {
                 struct Invoke<'a, F> {
                     gate: &'a Gate,
@@ -1538,7 +1592,7 @@ impl Gate {
                 ..
             } => calibration.validate(*permission, domain),
             Scope::C21(_) => self.current(),
-            Scope::B22(grant) => grant
+            Scope::B22(grant, _) => grant
                 .invoke(&|| Ok(domain.clone()), || Ok(()))
                 .map_err(b22_error),
         }

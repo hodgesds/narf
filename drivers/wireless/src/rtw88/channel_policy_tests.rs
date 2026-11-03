@@ -395,6 +395,7 @@ fn smoke_rtw88_band5_linux_groups_and_factory_power() -> TestResult {
         peaks: [0; 3],
         gains: [0; 2],
         indices: [0; 12],
+        indices_b: [0; 12],
         ofdm: [40, 38],
         // 6M +2, 9M -1, 12M 0, 18M +63; 24M -30, 36..54M 0.
         diffs: [0x3f00_7f02, 0x0000_0062],

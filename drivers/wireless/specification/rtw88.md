@@ -493,8 +493,10 @@ bits and zero HIMR 0xb0/0xb8/0x10b8; and hands the transport
 beacon functions only for AP/IBSS ports). The `N2BS` request identity hashes
 this literal recipe. `Gate::b22` (`Scope::B22`) is keyed by `10ec:b822`
 (`phy8821c::Host::PCI_B22`, family `rtw8822be`), binds the grant's MAC and
-re-invokes `N2BS` + current policy on every `current`/`invoke`; it has no
-N2xO/N2xL/HT/BA/protection base, so every extension accessor returns None.
+re-invokes `N2BS` + current policy on every `current`/`invoke`. It also
+retains the `rtw8822b_phy_set_param` facts (`phy8822b::Info`) a retune needs.
+Its only continuation family so far is `N2BO` (below); it has no
+N2xL/HT/BA/protection base, so those extension accessors return None.
 The reserved-page backend's `finish_station8821c` (firmware beacon-page
 disarm: 0x383 bit4, `BCN_CTRL` 0x550 bit3, as for C21) also admits the B22
 gate.
@@ -512,8 +514,9 @@ signed records current) `provision_owner` calls `interface.activate()`, i.e.
 (`pci_packet`: TXDESC48/TXBD16/RXDESC24/RXBD8). RX PHY status parses with the
 C21 page layout (`rtw8822b.h` `GET_PHY_STAT_P0/P1_*` page/RXSC/RF_MODE fields
 equal `rtw8821c.h`; no channel field). The admitted B22 station is the base
-profile only: channel 1 / 20 MHz legacy, host-only crypto. `Gate::b22`
-admits no N2xO channel, N2xL extension, HT/VHT, BA, protection, coding/QoS,
+profile only: channel 1 / 20 MHz legacy, host-only crypto, plus the
+per-channel `N2BO` primaries below. `Gate::b22`
+admits no N2xL extension, HT/VHT, BA, protection, coding/QoS,
 fallback, coex or N2xD tracking record, so retune/width/HT/BA/protection
 continuations refuse, `reserved_page::station_boundary(0xb822)` is None (no
 LPS/firmware swap), and no B22 dm watchdog runs `tracking8822b` or re-IQK:
@@ -522,6 +525,48 @@ own record") and no such B22 record family exists. No board's
 `N2BP`/`N2BS` asset is provisioned, so on real hardware the shell is
 published but stays unadmitted at `PhyTablesPrepared` until signed records
 exist.
+
+#### RTL8822BE per-channel operating records (`N2BO`) and retune
+
+B22 joins the shared N2xO family (`channel_policy.rs`, "C21/C22 noninitial
+2.4GHz/20MHz operating channels and retune" below) with its own layout and
+binding. A noninitial primary N (2.4GHz 2..=13 or a 5GHz `band5::primary`) is
+admitted only by `rtw88/rtw8822be-channelNN-v1-<mac>.bin`: the generic
+`qualification.rs` layout with magic `N2BO`, PCI header `10ec:b822`, the
+shared per-primary `Kind`, and a request that additionally hashes
+`channel_policy::SOURCE8822B` (the B22 program below). It binds
+`Gate::base_request`, which for B22 is the exact `N2BS` request (identity,
+MAC, `rtw8822be-station-v1` filename); continuation requests over a bound
+record are channel-scoped (`rtw8822be-chNN-station-...`) as for C21/C22.
+Payload: the N2xO header fields (primary, width 20, antenna gain, ceiling,
+three peaks), path-A TXAGC indices DESC_RATE 0..11 at 14..26 and path-B at
+36..48 (both ≤ 0x3f; CCK zero on 5GHz), gains/OFDM-reference/difference
+fields zero, zero 48..64. `channel_policy::within_factory` bounds every
+index by that primary's own factory group per path: 2.4GHz `cck_base[g]` /
+`bw40_base[g] + ht_1s_diff.ofdm` (`operating8822b::group_limits`, groups of
+`rtw_get_channel_group`), 5GHz `rtw_phy_get_5g_tx_power_index` OFDM
+(`band5::Power5g::ofdm`, txgi 1, ≤ 0x3f); the raw `txpwr_idx_table[0..1]`
+records are retained in the `N2BP` envelope for this. Erased/wrapped cells
+refuse. Regulatory admission is the shared N2xO span/peak check; the bound
+record re-enters inside the nested `N2BQ`+`N2BP`+`N2BS` invocation
+(`Gate::invoke_inner`).
+
+Retune (`channel_policy::program8822b`, under the shared native retune
+owner: TX refusal, TXPAUSE, drain, epoch): `rtw8822b_set_channel(N, 20MHz)`
+over the retained `phy8822b::Info` (`_bb`, `rtw_set_channel_mac`, `_rf` RF18
+A+B, `_rxdfir`, `toggle_igi`, `_cca`, `_rfe`), both paths'
+`rtw8822b_set_tx_power_index_by_rate` words (measured legacy words, every
+other written word zero), RRSR 0x440 = 0x1f (2.4GHz) or `RRSR_OFDM6_5G`
+(5GHz), then before association `rtw8822b_do_iqk` (`iqk8822b`: clear 0 /
+segment 0 H2C, RF-A RF08 0xabcde polled 300×20 ms, host clear, 0x1bf0
+fail/reload refused — Linux only logs it), then readback
+(`radio8822b::verify_channel20`: RF18 A+B, RF-A 0xbe[17:15], 0x8ac 20MHz,
+0x454 bit7 by band; `verify_txagc`; RRSR). Retuning back to channel 1
+replays the same program with the `N2BP` indices. Scan, association
+retune, CSA and safe rejoin are the shared station paths. HT40/VHT80
+widening needs B22 HT records (not yet). No `N2BO` record is provisioned
+for any board. Case written, unexecuted:
+`smoke_rtw8822be_n2bo_channel_record_binds_base_and_retunes`.
 
 `tracking8822b::Tracker::pass` ports `rtw8822b_pwr_track` (type 0):
 alternating RF42[17:16] trigger and RF-A meter sample, `DECLARE_EWMA(thermal,

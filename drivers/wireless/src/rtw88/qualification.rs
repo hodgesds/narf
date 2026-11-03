@@ -19,7 +19,7 @@
 //!
 //! | Bytes | Field |
 //! |---|---|
-//! | 0..4 | `N21<tag>` / `N22<tag>` |
+//! | 0..4 | `N21<tag>` / `N22<tag>` / `N2B<tag>` (RTL8822BE) |
 //! | 4..8 | `[1, 0, 128, 0]` (layout v1, length 128) |
 //! | 8..12 | length 128 LE |
 //! | 12..16 | `ec 10` + PCI device id LE |
@@ -84,6 +84,9 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
     hash.update(&mac);
     hash.update(&base);
     hash.update(kind.source);
+    if did == 0xb822 && kind.tag == b'O' {
+        hash.update(super::channel_policy::SOURCE8822B);
+    }
     Ok(Request {
         identity: hash.finalize(),
         mac,
@@ -219,6 +222,7 @@ impl Grant {
         let chip = match did {
             0xc821 => b'1',
             0xc822 => b'2',
+            0xb822 => b'B',
             _ => return Err(Error::Unsupported),
         };
         if signer.is_none()

@@ -152,7 +152,13 @@ pub(super) const fn txdfir(channel: u8) -> u32 {
 /// | 14..26 | C21 TXAGC indices CCK1..11, OFDM6..54 (C22: zero; 5GHz: CCK zero) |
 /// | 26..28 | C22 5GHz per-path OFDM references (REG_TX_PWR_REF_OFDM) |
 /// | 28..36 | C22 5GHz OFDM difference words 0x3a04 (6/9/12/18M), 0x3a08 (24..54M) |
-/// | 36..64 | zero |
+/// | 36..48 | B22 path-B TXAGC indices CCK1..11, OFDM6..54 (others: zero) |
+/// | 48..64 | zero |
+///
+/// B22 (`N2BO`, RTL8822BE 2T2R) carries both paths' coded indices for
+/// `rtw8822b_set_tx_power_index_by_rate` (0x1d00 path A at 14..26, 0x1d80
+/// path B at 36..48), like its `N2BP` channel-1 record; on 5GHz both paths'
+/// CCK indices are zero.
 ///
 /// The C22 5GHz selection mirrors `rtw8822c_set_tx_power_index`: a per-path
 /// OFDM reference plus one 7-bit signed difference per OFDM rate
@@ -168,6 +174,8 @@ pub(super) struct Record {
     pub(super) peaks: [i16; 3],
     pub(super) gains: [u8; 2],
     pub(super) indices: [u8; 12],
+    /// B22 path-B indices (zero on C21/C22).
+    pub(super) indices_b: [u8; 12],
     pub(super) ofdm: [u8; 2],
     pub(super) diffs: [u32; 2],
 }
@@ -182,6 +190,7 @@ impl Record {
             peaks: [signed(6), signed(8), signed(10)],
             gains: [p[12], p[13]],
             indices: p[14..26].try_into().ok()?,
+            indices_b: p[36..48].try_into().ok()?,
             ofdm: [p[26], p[27]],
             diffs: [
                 u32::from_le_bytes(p[28..32].try_into().ok()?),
@@ -209,16 +218,28 @@ impl Record {
                     && record.indices.iter().all(|i| *i <= 63)
                     && (!five || record.indices[..4] == [0; 4])
             }
+            0xb822 => {
+                record.gains == [0; 2]
+                    && record.ofdm == [0; 2]
+                    && record.diffs == [0; 2]
+                    && record
+                        .indices
+                        .iter()
+                        .chain(&record.indices_b)
+                        .all(|i| *i <= 63)
+                    && (!five || (record.indices[..4] == [0; 4] && record.indices_b[..4] == [0; 4]))
+            }
             _ => false,
         };
+        let tail = if did == 0xb822 { 48 } else { 36 };
         (chip
             && ((2..=LAST).contains(&record.channel) || five)
             && p[1] == 20
             && (0..=128).contains(&record.antenna)
             && (-512..=256).contains(&record.ceiling)
             && record.peaks.iter().all(|v| (-512..=256).contains(v))
-            && p[36..] == [0; PAYLOAD - 36])
-            .then_some(record)
+            && p[tail..].iter().all(|b| *b == 0))
+        .then_some(record)
     }
     /// A 5GHz primary record.
     pub(super) fn band5(&self) -> bool {
@@ -383,8 +404,24 @@ pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
                 })
             }),
             0xc821 => record.indices[4..].iter().all(|i| *i <= limits[0]),
+            0xb822 => {
+                record.indices[4..].iter().all(|i| *i <= limits[0])
+                    && record.indices_b[4..].iter().all(|i| *i <= limits[1])
+            }
             _ => false,
         };
+    }
+    if gate.did() == 0xb822 {
+        // `rtw_phy_get_2g_tx_power_index` of the primary's own group, per path.
+        let Some(limits) = group(record.channel).and_then(|g| gate.b22_group_limits(g)) else {
+            return false;
+        };
+        let within = |path: &[u8; 12], limit: [u8; 2]| {
+            path.iter()
+                .enumerate()
+                .all(|(i, index)| *index <= limit[usize::from(i >= 4)])
+        };
+        return within(&record.indices, limits[0]) && within(&record.indices_b, limits[1]);
     }
     let Some(limits) = group(record.channel).and_then(|g| gate.group_limits(g)) else {
         return false;
@@ -689,8 +726,79 @@ pub(super) async fn program(io: &mut impl Io, gate: &Gate, rfk: bool) -> Result<
             }
             super::radio8821c::verify_retune(io, channel, indices).await
         }
+        0xb822 => program8822b(io, gate, channel, rfk, 0x1f).await,
         _ => Err(Error::Unsupported),
     }
+}
+
+/// B22 `N2BO` channel source contract, hashed into every B22 `N2BO` request
+/// in addition to the shared kind source.
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BO: rtw8822b.c rtw8822b_set_channel(primary, 20MHz) = _bb/rtw_set_channel_mac/_rf RF18 A+B/_rxdfir/toggle_igi/_cca/_rfe; rtw8822b_set_tx_power_index_by_rate 1d00/1d80 both paths measured DESC_RATE 0..11, every other written word zero; RRSR 440 = 1f (2.4GHz) / 150&1f (5GHz); rtw8822b_do_iqk clear0 segment0 RF-A RF08 abcde 300x20ms then RF08 clear, 1bf0 low8/reload16 zero; readback RF18 A+B 8ac 454 TXAGC RRSR; per-path factory rtw_get_channel_group ceilings";
+
+/// B22 retune program: `main.c::rtw_set_channel` -> `rtw8822b_set_channel`
+/// at 20MHz over the retained `rtw8822b_phy_set_param` facts, then
+/// `rtw_phy_set_tx_power_level` as the `N2BO` record's measured per-path
+/// indices (`rtw8822b_set_tx_power_index_by_rate`), the band's response mask
+/// and, before association (`rtw_ops_mgd_prepare_tx`), `rtw8822b_do_iqk`.
+/// The B22 base channel 1 replays the same program with the `N2BP` indices.
+async fn program8822b(
+    io: &mut impl Io,
+    gate: &Gate,
+    channel: u8,
+    rfk: bool,
+    rrsr: u32,
+) -> Result<(), Error> {
+    let phy = gate.b22_phy().ok_or(Error::State)?;
+    let indices = gate.b22_indices().ok_or(Error::State)?;
+    let tables = indices.map(|path| {
+        let mut table = [0; 64];
+        table[..12].copy_from_slice(&path);
+        table
+    });
+    super::radio8822b::set_channel(io, phy, channel, super::band5::Width::Twenty).await?;
+    for (path, table) in tables.iter().enumerate() {
+        super::radio8822b::write_txagc(io, path as u8, table).await?;
+    }
+    io.write32(0x440, rrsr).await?;
+    if rfk {
+        iqk8822b(io).await?;
+    }
+    super::radio8822b::verify_channel20(io, channel).await?;
+    super::radio8822b::verify_txagc(io, tables).await?;
+    if super::radio::read(io, 0x440).await? != rrsr {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+
+/// `rtw8822b.c::rtw8822b_do_iqk` (clear=0, segment=0): firmware IQK H2C,
+/// RF-A RF_DTXLOK (RF08) 0xabcde polled 300x20ms, then host-cleared. Linux
+/// only logs the REG_IQKFAILMSK 0x1bf0 fail/reload bits; this owner refuses
+/// them (as the `N2BQ` IQK does), and refuses a stale done marker.
+pub(super) async fn iqk8822b(io: &mut impl Io) -> Result<(), Error> {
+    if super::radio8822b::rf_read(io, 0, 0x08).await? == 0xabcde {
+        return Err(Error::Prerequisite);
+    }
+    io.station_retune_iqk().await?;
+    wait_h2c(io).await?;
+    let mut complete = false;
+    for attempt in 0..300 {
+        if super::radio8822b::rf_read(io, 0, 0x08).await? == 0xabcde {
+            complete = true;
+            break;
+        }
+        if attempt < 299 {
+            io.delay_us(20000).await;
+        }
+    }
+    if !complete {
+        return Err(Error::Timeout);
+    }
+    super::radio8822b::rf(io, 0, 0x08, 0xfffff, 0).await?;
+    if super::radio::read(io, 0x1bf0).await? & 0x100ff != 0 {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 
 /// 5GHz/20MHz primary of a bound 5GHz N2xO record. C22:
@@ -726,6 +834,13 @@ async fn program5(io: &mut impl Io, gate: &Gate, channel: u8, rfk: bool) -> Resu
             }
             super::radio8821c::verify_channel20(io, channel, &facts).await?;
             super::radio8821c::verify_txagc(io, indices, super::radio::RRSR_OFDM6_5G).await
+        }
+        0xb822 => {
+            let indices = gate.b22_indices().ok_or(Error::State)?;
+            if indices.iter().any(|path| path[..4] != [0; 4]) {
+                return Err(Error::State);
+            }
+            program8822b(io, gate, channel, rfk, super::radio::RRSR_OFDM6_5G).await
         }
         _ => Err(Error::Unsupported),
     }
