@@ -17,6 +17,8 @@ pub(super) const MAX_PATTERN_LEN: usize = 128;
 /// `RTW89_MAX_PATTERN_MASK_SIZE` words (16 mask bytes, 128 bits).
 const MASK_WORDS: usize = 4;
 
+/// `H2C_CL_MAC_WOW` (`fw.h`).
+pub(super) const H2C_CL_MAC_WOW: u8 = 0x1;
 /// `H2C_CL_MAC_WOW` functions (`enum rtw89_wow_h2c_func`).
 pub(super) const H2C_FUNC_KEEP_ALIVE: u8 = 0x0;
 pub(super) const H2C_FUNC_DISCONNECT_DETECT: u8 = 0x1;

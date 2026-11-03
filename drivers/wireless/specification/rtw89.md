@@ -1972,7 +1972,9 @@ order (`rtw89_wow_suspend`/`resume`):
 4. Keep-alive as an unprotected NULL data general packet (Linux uses an
    ARP-response packet that is protected under `ptk_alg`; protected
    firmware transmissions would need the AOAC `ptk_tx_iv` written back into
-   the host TX PN). GTK/ARP offload stay off.
+   the host TX PN). GTK/ARP offload stay off. (Done:
+   `Startup::wow_keep_alive`, `H2C_FUNC_KEEP_ALIVE` DONE_ACK with the
+   window's NULL offload id, MAC id 0, period 5; disable sends id 0.)
 5. `bootstrap::SystemPm` branch: a WoW-configured, associated, settled
    station keeps D0 and its generation instead of retiring it; any failure
    falls back to the existing cold retirement/regeneration path. PCI PME

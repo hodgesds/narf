@@ -14,7 +14,11 @@ use crate::rtw89::{
     secure::Blacklist,
     station_control::Admission,
     wow_security::Keys,
+    wow_wire,
 };
+
+/// The station's firmware MAC id (`profile_fingerprint`: STA MACID0).
+const STATION_MAC_ID: u8 = 0;
 
 /// State that lives exactly as long as the WoW image runs.
 pub(super) struct Window {
@@ -215,5 +219,34 @@ impl Startup {
         Some(crate::rtw89::wow_security::wow_cam(
             &base, keys, pattern, magic,
         ))
+    }
+    /// `rtw89_fw_h2c_keep_alive` (DONE_ACK) on the WoW image with the
+    /// window's NULL data template (`lps_packets` NULL offload, installed by
+    /// `wow_general_packets`). Linux offloads an ARP response that the
+    /// firmware protects under `ptk_alg`; this profile keeps the firmware
+    /// free of protected transmissions, so host transmit PNs stay unique
+    /// without the AOAC `ptk_tx_iv` write-back (GTK/ARP offload stay off).
+    /// Disabling sends packet id 0, as Linux.
+    pub(in crate::rtw89) async fn wow_keep_alive(
+        &mut self,
+        enable: bool,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        let packet = self
+            .wow
+            .as_ref()
+            .ok_or(power::Error::Terminal)?
+            .packets
+            .null_id();
+        let body = wow_wire::keep_alive(enable, packet, STATION_MAC_ID);
+        self.station_native()?
+            .wow_command(
+                wow_wire::H2C_CL_MAC_WOW,
+                wow_wire::H2C_FUNC_KEEP_ALIVE,
+                &body,
+                true,
+                admission,
+            )
+            .await
     }
 }
