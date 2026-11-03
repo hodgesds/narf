@@ -263,6 +263,10 @@ impl<R: Registers> Card<R> {
             return Err(Error::Unsupported);
         }
         self.host = SdhciHost::new(0, version, caps, caps1);
+        // sdhci_setup_host: DMA admission (and the platform's bus-master
+        // grant) before the card is touched; failure keeps PIO.
+        self.host.dma = self.controller.setup_dma(version, caps);
+        let io = self.controller.registers();
         if !config.non_removable && io.read32(PRESENT_STATE) & PS_CARD_PRESENT == 0 {
             return Err(Error::NoCard);
         }
@@ -349,6 +353,7 @@ impl<R: Registers> Card<R> {
         let capability = self
             .direct(false, 0, CCCR_CARD_CAPABILITY, 0)
             .map_err(|_| Error::Response)?;
+        self.host.multi_block = capability & CARD_CAP_SMB != 0;
         let mut high_speed = false;
         if config.high_speed
             && self.host.can_do_hispeed()
@@ -703,6 +708,31 @@ impl<R: Registers> SdioFunction for Card<R> {
             addr,
             false,
             false,
+            Data::Read {
+                bytes: buf,
+                block_size: size,
+            },
+        )
+    }
+    fn multi_block(&self) -> bool {
+        self.host.multi_block
+    }
+    fn cmd53_block_read_fixed(
+        &mut self,
+        func: u8,
+        addr: u32,
+        size: u16,
+        count: u16,
+        buf: &mut [u8],
+    ) -> Result<(), SdioError> {
+        if usize::from(size) * usize::from(count) != buf.len() {
+            return Err(SdioError::LengthOverflow);
+        }
+        self.transfer(
+            func,
+            addr,
+            false,
+            true,
             Data::Read {
                 bytes: buf,
                 block_size: size,

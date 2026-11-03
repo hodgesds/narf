@@ -46,6 +46,7 @@ enum Native {
         device: BusDevice,
         live: Arc<Lifetime>,
         intx: Arc<AtomicBool>,
+        dma: Arc<AtomicBool>,
     },
     #[cfg(any(test, feature = "kernel-test"))]
     Fixture(Arc<Lifetime>),
@@ -77,6 +78,7 @@ impl Source {
         device: BusDevice,
         live: Arc<Lifetime>,
         intx: Arc<AtomicBool>,
+        dma: Arc<AtomicBool>,
     ) -> Self {
         Self {
             native: Native::Pci {
@@ -84,6 +86,7 @@ impl Source {
                 device,
                 live,
                 intx,
+                dma,
             },
             controller: None,
             card: None,
@@ -131,6 +134,7 @@ impl Source {
                 device,
                 live,
                 intx,
+                dma,
             } => {
                 let _native_scope = live.gate.lock();
                 struct Operation<F>(F);
@@ -152,11 +156,15 @@ impl Source {
                         let expected =
                             u32::from(device.id.vendor) | (u32::from(device.id.device) << 16);
                         use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
-                        let policy = if intx.load(Ordering::Acquire) {
+                        let mut policy = if intx.load(Ordering::Acquire) {
                             MEM_SPACE
                         } else {
                             MEM_SPACE | INTX_DISABLE
                         };
+                        // A granted host DMA engine owns bus mastering.
+                        if dma.load(Ordering::Acquire) {
+                            policy |= BUS_MASTER;
+                        }
                         if identity != expected
                             || command == u16::MAX
                             || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != policy

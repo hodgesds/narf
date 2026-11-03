@@ -37,6 +37,8 @@ struct Host {
     pm_caps: narf_drivers_sdio::PmFlags,
     pm_suspended: Option<narf_drivers_sdio::PmFlags>,
     pm_lost: bool,
+    /// Card reports CCCR SMB: block-mode CMD53 (host DMA path) accepted.
+    multi_block: bool,
 }
 struct Retirement(alloc::sync::Arc<core::sync::atomic::AtomicUsize>);
 impl Drop for Retirement {
@@ -209,6 +211,30 @@ impl SdioFunction for Host {
         }
         Ok(())
     }
+    fn multi_block(&self) -> bool {
+        self.multi_block
+    }
+    fn cmd53_block_read_fixed(
+        &mut self,
+        f: u8,
+        a: u32,
+        size: u16,
+        count: u16,
+        b: &mut [u8],
+    ) -> Result<(), SdioError> {
+        if !self.multi_block
+            || f != 2
+            || a != 0x8000
+            || b.len() != usize::from(size) * usize::from(count)
+        {
+            return Err(SdioError::Unsupported);
+        }
+        self.ops.push((61, f, a, b.len()));
+        for byte in b {
+            *byte = self.rx.pop_front().unwrap_or(0);
+        }
+        Ok(())
+    }
     fn cmd53_block_read(
         &mut self,
         _: u8,
@@ -221,13 +247,20 @@ impl SdioFunction for Host {
     }
     fn cmd53_block_write(
         &mut self,
-        _: u8,
-        _: u32,
-        _: u16,
-        _: u16,
-        _: &[u8],
+        f: u8,
+        a: u32,
+        size: u16,
+        count: u16,
+        b: &[u8],
     ) -> Result<(), SdioError> {
-        Err(SdioError::Unsupported)
+        if !self.multi_block || b.len() != usize::from(size) * usize::from(count) {
+            return Err(SdioError::Unsupported);
+        }
+        self.ops.push((60, f, a, b.len()));
+        if self.fail_write {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
     }
     fn enable_func(&mut self, f: u8) -> Result<(), SdioError> {
         self.enabled |= 1 << f;
@@ -357,6 +390,66 @@ fn smoke_cyw_sdio_fifo_readiness_padding_and_flow() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/sdio_bridge",
     smoke_cyw_sdio_fifo_readiness_padding_and_flow
+);
+
+/// Linux `sdio_io_rw_ext_helper` on a multi-block card: F2 RX tail and TX
+/// move whole 512-byte blocks in one block-mode CMD53 (the SDHCI host's
+/// ADMA2/SDMA path) and only the remainder in byte mode.
+fn smoke_cyw_sdio_f2_block_mode_extents_match_rw_ext_helper() -> TestResult {
+    let mut transport = SdioTransport::new(Host {
+        multi_block: true,
+        ..Host::default()
+    });
+    if transport.prepare().is_err() || transport.initialize_packets(CORE).is_err() {
+        return TestResult::Fail("packet init");
+    }
+    let mut frame = vec![0x6b; 1200];
+    frame[..4].copy_from_slice(&[0xb0, 0x04, 0x4f, 0xfb]);
+    transport.func.rx.extend(frame.iter().copied());
+    transport.func.words.insert(CORE + 0x20, 1 << 6);
+    let mut bytes = vec![0; super::super::runtime::MAX_PACKET];
+    if transport.receive_packet(&mut bytes) != Ok(1200) || bytes[..1200] != frame {
+        return TestResult::Fail("block-mode RX copied wrong bytes");
+    }
+    let rx = transport
+        .func
+        .ops
+        .iter()
+        .filter(|v| v.0 == 54 || v.0 == 61)
+        .copied()
+        .collect::<Vec<_>>();
+    if rx
+        != vec![
+            (54, 2, 0x8000, 64),
+            (61, 2, 0x8000, 1024),
+            (54, 2, 0x8000, 112),
+        ]
+    {
+        return TestResult::Fail("RX tail not split into fixed block + byte commands");
+    }
+    transport.func.words.insert(CORE + 0x20, 0);
+    if transport.transmit_packet(&frame).is_err() {
+        return TestResult::Fail("block-mode TX failed");
+    }
+    let tx = transport
+        .func
+        .ops
+        .iter()
+        .filter(|v| (v.0 == 53 || v.0 == 60) && v.1 == 2)
+        .copied()
+        .collect::<Vec<_>>();
+    if tx != vec![(60, 2, 0x8000, 1024), (53, 2, 0x8400, 176)] {
+        return TestResult::Fail("TX not split into incrementing block + byte commands");
+    }
+    transport.func.fail_write = true;
+    if transport.transmit_packet(&frame).is_ok() || !transport.failed {
+        return TestResult::Fail("failed block-mode TX permitted replay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/sdio_bridge",
+    smoke_cyw_sdio_f2_block_mode_extents_match_rw_ext_helper
 );
 
 fn smoke_cyw_sdio_claims_f1_f2_interrupts_and_rearms_after_service() -> TestResult {

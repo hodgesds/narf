@@ -42,6 +42,11 @@ pub struct SdhciHost {
     pub bus_width: u8,
     /// SDIO high-speed timing negotiated (CCCR EHS + host `CTRL_HISPD`).
     pub high_speed: bool,
+    /// Host data-path DMA mode admitted at initialization; `None` is PIO.
+    pub dma: Option<crate::sdhci::adma::Mode>,
+    /// Card supports multi-block CMD53 (CCCR card capability SMB, Linux
+    /// `card->cccr.multi_block`).
+    pub multi_block: bool,
 }
 
 impl SdhciHost {
@@ -63,6 +68,8 @@ impl SdhciHost {
             card_selected: false,
             bus_width: 1,
             high_speed: false,
+            dma: None,
+            multi_block: false,
         }
     }
 

@@ -1,6 +1,10 @@
 //! Owned SDHCI command/PIO execution. Linux reference: sdhci.c
 //! sdhci_send_command, sdhci_transfer_pio and the block PIO helpers.
 //! PIO keeps PCI bus mastering disabled and has no borrowed DMA lifetime.
+//! When the platform owner grants bus mastering ([`Registers::enable_dma`])
+//! and the host advertises ADMA2/SDMA, data commands instead run through
+//! the host DMA engine (`crate::dma`) with a host-owned bounce buffer;
+//! caller slices are still copied before return.
 
 use crate::sdhci::regs::*;
 use narf_time::Deadline;
@@ -26,6 +30,8 @@ pub enum Error {
     Controller(u32),
     Card(u8),
     ShortTransfer,
+    /// `SDHCI_INT_ADMA_ERROR` with the ADMA error-status register value.
+    Dma(u32),
 }
 
 /// Immutable identity captured by the exclusive host owner; no I/O authority.
@@ -64,6 +70,20 @@ pub trait Registers {
     fn pm_caps(&mut self) -> crate::sdio::function::PmFlags {
         crate::sdio::function::PmFlags::NONE
     }
+    /// Grant host DMA: Linux `sdhci_pci_enable_dma` -> `pci_set_master`.
+    /// The platform owner enables and reads back bus mastering and returns
+    /// the `narf_io` DMA facts of the host function (coherence, pool,
+    /// IOMMU domain), or `None` to keep PIO (no grant, a host needing DMA
+    /// quirks this crate does not carry, or a failed transition).
+    fn enable_dma(&mut self) -> Option<narf_io::DmaDevice> {
+        None
+    }
+    /// Revoke the DMA grant (clear bus mastering, with readback). `true`
+    /// once the host provably can no longer master; DMA buffers are only
+    /// freed then. Never-enabled hosts return `true`.
+    fn disable_dma(&mut self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,10 +119,18 @@ pub struct Controller<R: Registers> {
     io: R,
     failed: bool,
     live: alloc::sync::Arc<crate::source::Lifetime>,
+    /// Host DMA buffers once [`Controller::setup_dma`] admitted a mode.
+    dma: Option<crate::dma::Engine>,
+    /// A DMA transfer failed after COMMAND or DMA setup failed after the
+    /// grant: this owner is PIO-only for the rest of its life.
+    dma_fault: bool,
+    /// DMA prepared for the current command (reset needed on failure).
+    dma_armed: bool,
 }
 impl<R: Registers> Drop for Controller<R> {
     fn drop(&mut self) {
         self.live.retire();
+        self.release_dma();
     }
 }
 impl<R: Registers> core::fmt::Debug for Controller<R> {
@@ -121,7 +149,79 @@ impl<R: Registers> Controller<R> {
             io,
             failed: false,
             live: crate::source::Lifetime::new(),
+            dma: None,
+            dma_fault: false,
+            dma_armed: false,
         }
+    }
+    /// Linux `sdhci_setup_host` DMA admission for an exclusively owned,
+    /// reset host: select ADMA2 (32/64-bit) or SDMA from the capabilities
+    /// ([`crate::sdhci::adma::select`]), take the platform DMA grant and
+    /// allocate the coherent ADMA region and bounce buffer, falling back
+    /// ADMA -> SDMA -> PIO. Idempotent; a faulted or failed owner stays PIO.
+    pub fn setup_dma(&mut self, spec_version: u8, caps: u32) -> Option<crate::sdhci::adma::Mode> {
+        if let Some(engine) = self.dma.as_ref() {
+            return Some(engine.mode());
+        }
+        if self.failed || self.dma_fault {
+            return None;
+        }
+        let mut mode = crate::sdhci::adma::select(spec_version, caps)?;
+        let device = self.io.enable_dma()?;
+        loop {
+            match crate::dma::Engine::new(&device, mode) {
+                Ok(engine) => {
+                    self.dma = Some(engine);
+                    return Some(mode);
+                }
+                Err(()) => match mode.without_adma(caps) {
+                    Some(next) => mode = next,
+                    None => {
+                        // "No suitable DMA available - falling back to PIO".
+                        self.dma_fault = true;
+                        let _ = self.io.disable_dma();
+                        return None;
+                    }
+                },
+            }
+        }
+    }
+    /// The admitted DMA mode, `None` for PIO.
+    pub fn dma_mode(&self) -> Option<crate::sdhci::adma::Mode> {
+        self.dma.as_ref().map(crate::dma::Engine::mode)
+    }
+    /// Host DMA engine state (tests and diagnostics).
+    pub fn dma_engine(&self) -> Option<&crate::dma::Engine> {
+        self.dma.as_ref()
+    }
+    /// Stop host DMA for good: revoke the grant, then free the buffers
+    /// only if bus mastering is provably off; otherwise they are leaked
+    /// (quarantined) so a still-mastering device cannot hit freed frames.
+    fn release_dma(&mut self) {
+        if let Some(engine) = self.dma.take() {
+            if !self.io.disable_dma() {
+                core::mem::forget(engine);
+            }
+        }
+    }
+    /// Linux `sdhci_do_reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA)`
+    /// after a failed DMA command, then PIO-only for this owner.
+    fn abort_dma(&mut self) {
+        self.dma_armed = false;
+        self.dma_fault = true;
+        if let Some(engine) = self.dma.as_mut() {
+            engine.disarm();
+        }
+        self.io.write8(SOFTWARE_RESET, RESET_CMD | RESET_DATA);
+        let _ = Self::wait_on(&mut self.io, Deadline::after_us(COMMAND_TIMEOUT_US), |io| {
+            let value = io.read8(SOFTWARE_RESET);
+            if value == u8::MAX {
+                Err(Error::Gone)
+            } else {
+                Ok(value & (RESET_CMD | RESET_DATA) == 0)
+            }
+        });
+        self.release_dma();
     }
     pub(crate) fn source(&self) -> Option<crate::source::Source> {
         if self.failed {
@@ -142,11 +242,18 @@ impl<R: Registers> Controller<R> {
     pub(crate) fn wait(
         &mut self,
         deadline: Deadline,
+        condition: impl FnMut(&mut R) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        Self::wait_on(&mut self.io, deadline, condition)
+    }
+    fn wait_on(
+        io: &mut R,
+        deadline: Deadline,
         mut condition: impl FnMut(&mut R) -> Result<bool, Error>,
     ) -> Result<(), Error> {
         let mut failure = None;
         let complete = narf_scheduler::responsive_spin_until(
-            || match condition(&mut self.io) {
+            || match condition(io) {
                 Ok(ready) => ready,
                 Err(error) => {
                     failure = Some(error);
@@ -242,10 +349,21 @@ impl<R: Registers> Controller<R> {
             }
         }
         let result = self.execute_inner(command, argument, response, &mut data, shape, mode);
-        if result
+        let issued = result
             .as_ref()
-            .is_err_and(|error| !matches!(*error, Error::Denied | Error::Busy))
-        {
+            .is_err_and(|error| !matches!(*error, Error::Denied | Error::Busy));
+        if self.dma_armed {
+            if issued {
+                self.abort_dma();
+            } else {
+                // Refused before COMMAND: the engine never started.
+                self.dma_armed = false;
+                if let Some(engine) = self.dma.as_mut() {
+                    engine.disarm();
+                }
+            }
+        }
+        if issued {
             self.live.retire();
             self.failed = true;
         }
@@ -288,13 +406,37 @@ impl<R: Registers> Controller<R> {
             Response::Busy => CMD_RESP_SHORT_BUSY | CMD_CRC | CMD_INDEX,
         };
         let mut transfer_mode = 0;
+        // sdhci_prepare_dma: DMA for every data command once admitted; a
+        // preparation failure (never issued) latches PIO for this owner.
+        let mut dma = false;
+        if let (Some(engine), Some(data)) = (self.dma.as_mut(), data.as_ref()) {
+            if engine.prepare(&mut self.io, data).is_ok() {
+                dma = true;
+                self.dma_armed = true;
+            } else {
+                self.dma_fault = true;
+                self.release_dma();
+            }
+        }
         if let Some((len, block_size, read)) = shape {
             let blocks = len / block_size as usize;
-            self.io.write16(BLOCK_SIZE, block_size);
+            if dma {
+                // Linux sdhci_set_block_info: SDMA boundary + block size.
+                self.io
+                    .write16(BLOCK_SIZE, make_blksz(DEFAULT_BOUNDARY_ARG, block_size));
+            } else {
+                if self.dma_mode().is_some() || self.dma_fault {
+                    // sdhci_config_dma: always clear the DMA select for PIO.
+                    let control = self.io.read8(HOST_CONTROL);
+                    self.io.write8(HOST_CONTROL, control & !CTRL_DMA_MASK);
+                }
+                self.io.write16(BLOCK_SIZE, block_size);
+            }
             self.io.write16(BLOCK_COUNT, blocks as u16);
             transfer_mode = TRNS_BLK_CNT_EN
                 | if read { TRNS_READ } else { 0 }
-                | if blocks > 1 { TRNS_MULTI } else { 0 };
+                | if blocks > 1 { TRNS_MULTI } else { 0 }
+                | if dma { TRNS_DMA } else { 0 };
             flags |= CMD_DATA;
         }
         // SDIO CMD53 never uses the memory-card auto-CMD12/CMD23 paths.
@@ -317,6 +459,9 @@ impl<R: Registers> Controller<R> {
             return Err(Error::Card(flags));
         }
         let deadline = Deadline::after_us(TRANSFER_TIMEOUT_US);
+        if dma {
+            return self.finish_dma(deadline, data, result);
+        }
         if let Some((len, block_size, read)) = shape {
             let size = block_size as usize;
             for offset in (0..len).step_by(size) {
@@ -364,6 +509,43 @@ impl<R: Registers> Controller<R> {
             self.wait(deadline, |io| Ok(Self::status(io)? & INT_DATA_END != 0))?;
             self.io.write32(INT_STATUS, INT_DATA_END);
         }
+        Ok(result)
+    }
+
+    /// `sdhci_data_irq` for a DMA data command: wait for transfer complete,
+    /// restarting SDMA at buffer boundaries, with `SDHCI_INT_ADMA_ERROR`
+    /// reported as [`Error::Dma`]; then `sdhci_request_done` copy-out.
+    fn finish_dma(
+        &mut self,
+        deadline: Deadline,
+        data: &mut Option<Data<'_>>,
+        result: u32,
+    ) -> Result<u32, Error> {
+        let Some(engine) = self.dma.as_mut() else {
+            return Err(Error::Failed);
+        };
+        Self::wait_on(&mut self.io, deadline, |io| {
+            let status = io.read32(INT_STATUS);
+            if status == u32::MAX {
+                return Err(Error::Gone);
+            }
+            if status & INT_ADMA_ERROR != 0 {
+                return Err(Error::Dma(io.read32(ADMA_ERROR)));
+            }
+            if status & (INT_ERROR | 0xffff_0000) != 0 {
+                return Err(Error::Controller(status));
+            }
+            if status & INT_DMA_END != 0 {
+                engine.sdma_boundary(io);
+                io.write32(INT_STATUS, INT_DMA_END);
+            }
+            Ok(status & INT_DATA_END != 0)
+        })?;
+        self.io.write32(INT_STATUS, INT_DATA_END | INT_DMA_END);
+        if let Some(data) = data.as_mut() {
+            engine.complete(data);
+        }
+        self.dma_armed = false;
         Ok(result)
     }
 }

@@ -53,6 +53,8 @@ fn smoke_sdhci_native_mmio_publication_scope_preserves_actual_cap_and_terminal_l
             intx: false,
             source_live: crate::source::Lifetime::new(),
             source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            dma: false,
+            source_dma: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
         };
         let original = io
             .source()

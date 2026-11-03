@@ -63,6 +63,7 @@ pub const BUS_IFACE_ASYNC_INT: u8 = 0x20;
 pub const BUS_IFACE_CD_DISABLE: u8 = 0x80;
 
 // CCCR_CARD_CAPABILITY bits
+pub const CARD_CAP_SMB: u8 = 0x02; // supports multi-block CMD53
 pub const CARD_CAP_LSC: u8 = 0x40; // low-speed card
 pub const CARD_CAP_4BLS: u8 = 0x80; // 4-bit low-speed card
 

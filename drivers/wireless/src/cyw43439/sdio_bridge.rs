@@ -5,6 +5,12 @@
 //! Reference: Linux brcmfmac/{bcmsdh,sdio}.c. F1 words use CMD53 with
 //! the 32-bit backplane access flag. F2 RX uses fixed reads, TX follows
 //! incrementing writes; mailbox handling bounds readiness and flow control.
+//! Multi-byte F1/F2 extents follow Linux `sdio_io_rw_ext_helper` (the
+//! `sdio_memcpy_{from,to}io` / `sdio_readsb` path brcmfmac's
+//! `brcmf_sdiod_ramrw`, `brcmf_sdiod_recv_pkt` and `brcmf_sdiod_send_pkt`
+//! use): on a multi-block card, whole blocks go as block-mode CMD53, which
+//! the SDHCI host runs through ADMA2/SDMA when it admitted host DMA, and
+//! the remainder as byte-mode commands.
 
 #![allow(dead_code)]
 
@@ -56,6 +62,89 @@ pub fn bridge_cmd53_write_arg(function: Function, address: u32, len: u16) -> u32
 
 /// Map a `SdioError` onto a `TransportError` for the
 /// `Transport` trait surface.
+/// Linux `sdio_io_rw_ext_helper` blocks per command: 511 (CMD53 count
+/// field) bounded by the host's per-command transfer limit.
+fn max_blocks(block: usize) -> usize {
+    (narf_drivers_sdio::pio::MAX_TRANSFER / block).min(511)
+}
+
+/// Linux `sdio_io_rw_ext_helper` read side. `block` is the function's
+/// current block size, which is also its byte-mode maximum here
+/// (`sdio_max_byte_size`: F1 64, F2 512). `increment` false is
+/// `sdio_readsb` (fixed FIFO address).
+fn read_ext<F: SdioFunction>(
+    func: &mut F,
+    function: u8,
+    mut address: u32,
+    increment: bool,
+    block: usize,
+    buf: &mut [u8],
+) -> Result<(), SdioError> {
+    let mut done = 0;
+    if func.multi_block() && buf.len() > block {
+        while buf.len() - done >= block {
+            let blocks = ((buf.len() - done) / block).min(max_blocks(block));
+            let size = blocks * block;
+            let chunk = &mut buf[done..done + size];
+            if increment {
+                func.cmd53_block_read(function, address, block as u16, blocks as u16, chunk)?;
+            } else {
+                func.cmd53_block_read_fixed(function, address, block as u16, blocks as u16, chunk)?;
+            }
+            done += size;
+            if increment {
+                address += size as u32;
+            }
+        }
+    }
+    while done < buf.len() {
+        let size = (buf.len() - done).min(block);
+        let chunk = &mut buf[done..done + size];
+        if increment {
+            func.cmd53_read(function, address, chunk)?;
+            address += size as u32;
+        } else {
+            func.cmd53_read_fixed(function, address, chunk)?;
+        }
+        done += size;
+    }
+    Ok(())
+}
+
+/// Linux `sdio_io_rw_ext_helper` write side (incrementing, as
+/// `sdio_memcpy_toio`).
+fn write_ext<F: SdioFunction>(
+    func: &mut F,
+    function: u8,
+    mut address: u32,
+    block: usize,
+    buf: &[u8],
+) -> Result<(), SdioError> {
+    let mut done = 0;
+    if func.multi_block() && buf.len() > block {
+        while buf.len() - done >= block {
+            let blocks = ((buf.len() - done) / block).min(max_blocks(block));
+            let size = blocks * block;
+            func.cmd53_block_write(
+                function,
+                address,
+                block as u16,
+                blocks as u16,
+                &buf[done..done + size],
+            )?;
+            done += size;
+            address += size as u32;
+        }
+    }
+    while done < buf.len() {
+        let size = (buf.len() - done).min(block);
+        func.cmd53_write(function, address, &buf[done..done + size])?;
+        done += size;
+        address += size as u32;
+    }
+    Ok(())
+}
+
 fn map_err(e: SdioError) -> TransportError {
     match e {
         SdioError::ResponseError(_) => TransportError::BadFraming,
@@ -418,10 +507,16 @@ impl<F: SdioFunction> SdioTransport<F> {
         if physical > buffer.len() {
             return Err(TransportError::LengthOverflow);
         }
-        for chunk in buffer[64..physical].chunks_mut(512) {
-            self.func
-                .cmd53_read_fixed(2, 0x8000, chunk)
-                .map_err(map_err)?;
+        if physical > 64 {
+            read_ext(
+                &mut self.func,
+                2,
+                0x8000,
+                false,
+                usize::from(CYW43439_SDIO_BLOCK_SIZE),
+                &mut buffer[64..physical],
+            )
+            .map_err(map_err)?;
         }
         Ok(length)
     }
@@ -493,11 +588,8 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
             } else {
                 512
             };
-            for (i, chunk) in buf.chunks_mut(stride).enumerate() {
-                self.func
-                    .cmd53_read(function as u8, address + (i * stride) as u32, chunk)
-                    .map_err(map_err)?;
-            }
+            read_ext(&mut self.func, function as u8, address, true, stride, buf)
+                .map_err(map_err)?;
         }
         Ok(())
     }
@@ -532,11 +624,7 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
             } else {
                 512
             };
-            for (i, chunk) in buf.chunks(stride).enumerate() {
-                self.func
-                    .cmd53_write(function as u8, address + (i * stride) as u32, chunk)
-                    .map_err(map_err)?;
-            }
+            write_ext(&mut self.func, function as u8, address, stride, buf).map_err(map_err)?;
         }
         Ok(())
     }
@@ -650,16 +738,19 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
         }
         self.window(0x1800_0000)?;
         // Linux uses incrementing memcpy_toio for F2 TX and fixed readsb
-        // for F2 RX. Each byte-mode command is at most 512 bytes.
-        for (i, chunk) in packet.chunks(512).enumerate() {
-            if let Err(error) = self
-                .func
-                .cmd53_write(2, 0x8000 + (i * 512) as u32, chunk)
-                .map_err(map_err)
-            {
-                self.failed = true;
-                return Err(error);
-            }
+        // for F2 RX: whole blocks in block mode on a multi-block card, then
+        // byte-mode commands of at most 512 bytes.
+        if let Err(error) = write_ext(
+            &mut self.func,
+            2,
+            0x8000,
+            usize::from(CYW43439_SDIO_BLOCK_SIZE),
+            packet,
+        )
+        .map_err(map_err)
+        {
+            self.failed = true;
+            return Err(error);
         }
         Ok(())
     }

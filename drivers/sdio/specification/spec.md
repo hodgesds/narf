@@ -1,14 +1,16 @@
 # sdio — Specification
 
-> Status: owned standard SDHCI PIO/card lifecycle, PCI function dispatch,
-> and CYW43439 consumer integration. No physical controller has been tested.
+> Status: owned standard SDHCI PIO and ADMA2/SDMA data path, card
+> lifecycle, PCI function dispatch, and CYW43439 consumer integration. No
+> physical controller has been tested.
 
 ## 1. Purpose & scope
 
 Own standard SDHCI register access, bounded command/PIO execution, SDIO
-card enumeration, function enable/block sizing and exclusive handoff to a
-chip driver. SD storage, eMMC, ADMA/SDMA and vendor register quirks are out
-of the current implementation profile.
+card enumeration, function enable/block sizing, host DMA (ADMA2 with
+SDMA fallback) and exclusive handoff to a chip driver. SD storage, eMMC,
+ADMA3, v4 mode, external DMA and vendor register quirks are out of the
+current implementation profile.
 
 ## 2. Assumptions
 
@@ -17,7 +19,8 @@ least 256 bytes long. The profile uses 3.3 V and negotiates, as Linux
 `mmc_sdio_init_card` does on sdhci-pci, a 4-bit bus and SDIO high-speed
 timing (≤ 50 MHz) when card, host and board configuration allow; otherwise
 one data line, legacy timing and at most 25 MHz. PCI interfaces 0 (PIO) and 1 (standard registers
-with DMA capability) are supported using PIO. Vendor interface 2 and
+with DMA capability) are supported; like Linux `sdhci_pci_enable_dma`, the
+DMA decision follows the capability register, not the interface byte. Vendor interface 2 and
 multi-slot PCI functions are rejected. A platform supplies its own owned
 `pio::Registers` implementation and explicit soldered-card configuration;
 this does not configure platform clocks, pin muxes or power GPIOs.
@@ -36,7 +39,45 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   validates R5 before FIFO access and copies complete PIO buffers before
   return. Transfers are bounded by 32 KiB, blocks 1–512 bytes and 511
   blocks. Hardware/card/timeout errors terminally poison the owner.
-  The controller does not enable DMA or auto-CMD12/23.
+  The controller never enables auto-CMD12/23.
+- Host DMA (`sdhci/adma.rs`, `dma.rs`). `Registers::enable_dma() ->
+  Option<narf_io::DmaDevice>` (default None) is the platform bus-master
+  grant (Linux `sdhci_pci_enable_dma` -> `pci_set_master`);
+  `Registers::disable_dma() -> bool` (default true) revokes it with
+  readback. `Controller::setup_dma(spec_version, caps) -> Option<Mode>`
+  is the `sdhci_setup_host` DMA admission without v4 mode/external DMA:
+  `adma::select` picks ADMA2 for spec >= 2.00 with `SDHCI_CAN_DO_ADMA2`
+  (`Adma64`, 12-byte descriptors, when `SDHCI_CAN_64BIT`, else `Adma32`),
+  else SDMA for `SDHCI_CAN_DO_SDMA` without 64-bit; then it takes the grant
+  and allocates, with `narf_io::alloc_coherent_for` below the mode's mask
+  (32-bit, or 64-bit for `Adma64`), one coherent region holding the
+  512-byte align buffer then a 257-entry descriptor table (base 8-byte
+  aligned, else refused) and a 32 KiB bounce buffer. Failure falls back
+  ADMA -> SDMA (`Mode::without_adma`) -> PIO and revokes the grant.
+  `Card::initialize` calls it after the host reset and records the mode
+  in `SdhciHost::dma`; `Controller::dma_mode` reports it. Once admitted,
+  every data command (`sdhci_prepare_dma`) copies write payloads into the
+  bounce buffer (caller slices are not DMA memory), calls
+  `DmaBuffer::sync_for_device` with the request direction (`ToDevice` /
+  `FromDevice`), builds the table (`adma::table_pre`: TRAN descriptors,
+  segments over 64 KiB split into 32 KiB pieces, 65536 encoded as 0,
+  closing NOP/END/VALID; unaligned heads would use align-buffer slots,
+  never taken for the page-aligned bounce) or programs the SDMA address,
+  writes `ADMA_ADDRESS`(`_HI`), selects the mode in HOST_CONTROL
+  (`sdhci_config_dma`; PIO commands clear the select), programs
+  `make_blksz(7, size)` and sets `TRNS_DMA`. All of this precedes COMMAND
+  and any publication scope. Completion waits for DATA_END, restarting
+  SDMA at the next 512 KiB boundary on DMA_END; `SDHCI_INT_ADMA_ERROR`
+  returns `Error::Dma(ADMA_ERROR)`. Success calls `sync_for_cpu` with the
+  same direction and copies reads out (`sdhci_request_done`). A refused
+  publication scope or pending CARD_INT disarms without reset. Any failure
+  after a potential COMMAND (ADMA/data error, timeout, R5 rejection) is
+  `sdhci_do_reset(CMD|DATA)`, a revoked grant and a terminal owner as for
+  PIO (no retry after a partially accepted transfer; Linux returns -EIO);
+  a preparation failure before COMMAND moves that command to PIO. Both
+  latch the owner PIO-only. DMA buffers are freed only after
+  `disable_dma` confirms bus mastering off; otherwise they are leaked
+  (quarantined).
 - `card::Card::initialize(registers, Config)` consumes the controller,
   resets it, disables interrupt signalling, enables status latches, sets
   power and a representable clock at most 400 kHz, then executes CMD0,
@@ -50,7 +91,9 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   validated CIS identity/block limit metadata. CIS scanning is bounded to
   1024 bytes per function, checks 17-bit extents, and requires a valid
   FUNCE. Function MANFID may inherit common identity. After the CIS,
-  initialization reads CCCR card capability; with `Config::high_speed`, a
+  initialization reads CCCR card capability (SMB recorded as
+  `SdhciHost::multi_block`, reported by `SdioFunction::multi_block`, Linux
+  `cccr.multi_block`); with `Config::high_speed`, a
   `CAN_DO_HISPD` host and an SDIO ≥ 1.20 card advertising SHS, it sets EHS
   and host `CTRL_HISPD` (`mmc_sdio_switch_hs`) and allows 50 MHz; otherwise
   the clock is bounded by the common CIS maximum and 25 MHz. The caller's
@@ -62,7 +105,8 @@ this does not configure platform clocks, pin muxes or power GPIOs.
 - `SdioFunction` is implemented by `Card`. CMD52 checks function/address;
   CMD53 checks function enable, address extent, byte count, CIS per-function
   block limit in both byte/block modes, programmed block size and exact
-  buffer length. `cmd53_read_fixed` uses a fixed FIFO
+  buffer length. `cmd53_read_fixed` and `cmd53_block_read_fixed` (block
+  mode, Linux `sdio_readsb`; default `Unsupported`) use a fixed FIFO
   address. `set_block_size` writes both FBR bytes; `enable_func` preserves
   other enabled functions and waits for IO_READY using CIS timeout.
   Adapters without fixed-read/block-size operations return `Unsupported`.
@@ -200,7 +244,16 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   boot DTB host bridge `interrupt-map` (`narf_firmware_fdt::pci::intx_route`,
   level-high GIC SPI only) and binds `Line::bind_spi`. It clears INTx-disable
   only after the card initialized
-  (`Mmio::enable_intx` with readback), so a failed probe leaves it parked. Range/alignment failure, revoked authority or invalid
+  (`Mmio::enable_intx` with readback), so a failed probe leaves it parked.
+  `Mmio::enable_dma` sets and reads back BME after `narf_bus::dma::configure`
+  supplies the function's `DmaDevice`; from then the per-access and source
+  policy require BME set, and `disable_dma` clears it with readback. Hosts
+  of vendors with Linux `sdhci-pci-core.c` `pci_ids` fixes (Ricoh, ENE,
+  Marvell, JMicron, SysKonnect, VIA, Intel, O2, Arasan, Synopsys, GLI,
+  Realtek; `native::dma_quirk_vendor`) are refused the grant and stay PIO,
+  since their DMA quirks (`BROKEN_DMA`/`BROKEN_ADMA`, `32BIT_ADMA_SIZE`,
+  `NO_ENDATTR_IN_NOPDESC`, `BROKEN_64_BIT_DMA`, vendor DMA ops) are not
+  carried; AMD's class fixes leave DMA generic. Range/alignment failure, revoked authority or invalid
   decode permanently closes the adapter. The private handle cannot be cloned.
 - `native::register_function_driver(FunctionDriver)` registers up to 16
   exact `(function,vendor,device)` consumers. The matching callback receives
@@ -208,15 +261,20 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   locks are released before initialization and callbacks. Unclaimed cards
   are dropped and powered down; the host publishes no network interface.
 - Dropping a `Card`, including initialization failure, disables status and
-  signalling, stops the clock and removes card power. PIO has no retained
-  caller pointer, descriptor mapping or DMA lifetime.
+  signalling, stops the clock and removes card power; the controller then
+  revokes any DMA grant before its buffers are freed. No caller pointer is
+  retained; the descriptor table and bounce buffer are host-owned.
 
 ## 4. Invariants
 
 Every buffer transfer finishes synchronously or fails before its borrow
 ends. An R5 rejection cannot access BUFFER, even if readiness is asserted.
 No retries follow a partially accepted transfer under the same controller
-owner. PCI BME remains off throughout the PIO lifecycle. SDIO command
+owner. PCI BME remains off throughout the PIO lifecycle and is set only by
+an admitted DMA grant; a host DMA buffer is freed only after BME clear is
+read back. The device sees only `DmaAddr`s of host-owned `narf_io`
+buffers, each handed over with `sync_for_device` and returned with
+`sync_for_cpu` in the request direction. SDIO command
 execution does not clear card IRQ state as command completion. Bounds and
 function checks precede COMMAND writes. No IRQ spin lock spans hardware
 initialization, driver callback or async work.
@@ -226,8 +284,14 @@ initialization, driver callback or async work.
 PCI MMIO uses `map_bar_control` and bus exact-width accessors, including
 architecture device barriers. Divided clocks use powers of two on v1/v2
 and every even divisor on v3; a saturated divisor that would exceed the
-requested clock fails. No descriptor DMA ordering or IOMMU contract is
-claimed by this PIO profile.
+requested clock fails. Descriptor/bounce stores are fenced before the
+ADMA address and COMMAND MMIO writes; streaming maintenance is `narf_io`'s
+(x86_64 CLFLUSH; aarch64 DC CVAC/CIVAC on non-coherent paths, fenced per
+invariant #4). On aarch64 a non-coherent host without a reserved coherent
+pool fails `alloc_coherent_for` and stays PIO. With a per-domain IOMMU the
+buffers' IOVAs are programmed. DMA is a data-path mode only: it changes no
+bus clock, width, timing or signalling, so it adds no electrical/timing
+qualification requirement of its own.
 
 ## 6. Dependencies
 
@@ -246,13 +310,20 @@ A revoked real PCI cap with deliberately invalid ECAM/MMIO proves current
 authority rejection occurs before those accesses. An Arc/IRQ-safe standard
 register/CIS fixture exposes the same initialized Card to composed wireless
 provisioning tests, including controller-command failure after preflight.
+A DMA register model (`dma_tests.rs`) runs the selected engine against
+real `narf_io` buffers: ADMA2 bounce write/read, sync direction, ADMA error
+reset/PIO latch, R5 rejection under DMA, admission without caps/grant and
+SDMA boundary restart/ADMA64; `sdhci/adma_tests.rs` covers mode selection,
+32/64-bit descriptor layout, the 64 KiB split and align-buffer slots
+(written, not yet executed).
 They validate software contracts, not electrical/controller compatibility.
 
 ## 8. Open questions
 
 Platform ACPI/devicetree enumeration, regulators/pin mux/clock/reset GPIOs,
-vendor SDHCI quirks, multiple slots/card removal/reprobe, UHS-I,
-interrupt-driven command/data completion, INTx for bridged hosts and DMA
-remain software work.
+vendor SDHCI quirks (including DMA quirks for the refused vendors),
+zero-copy scatter-gather from caller DMA buffers, ADMA3/v4 mode, multiple
+slots/card removal/reprobe, UHS-I, interrupt-driven command/data
+completion and INTx for bridged hosts remain software work.
 Physical PCI/SDIO acceptance, real card timing and cancellation/power-down
 behavior require a target test after these software profiles are reviewed.

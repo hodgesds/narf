@@ -143,6 +143,25 @@ pub trait SdioFunction {
         buf: &mut [u8],
     ) -> Result<(), SdioError>;
 
+    /// Card supports multi-block CMD53 (CCCR SMB; Linux
+    /// `card->cccr.multi_block`). Default: unknown, byte mode only.
+    fn multi_block(&self) -> bool {
+        false
+    }
+
+    /// Block-mode CMD53 read at a fixed (FIFO) address — Linux
+    /// `sdio_readsb` block part (`incr_addr = 0`). Default `Unsupported`.
+    fn cmd53_block_read_fixed(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _block_size: u16,
+        _block_count: u16,
+        _buf: &mut [u8],
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
     /// Issue CMD53 in block mode — write `buf` as `block_count` blocks.
     fn cmd53_block_write(
         &mut self,
