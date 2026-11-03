@@ -994,3 +994,64 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_n2bo_channel_record_binds_base_and_retunes
 );
+
+/// `N2BD` admits only the 8822B mechanisms (DIG over 0xc50/0xe50, RA), uses
+/// the 8822B PHY-status PWDB layout and binds the B22 dm contract over the
+/// `N2BS` base. Written; not yet executed natively.
+fn smoke_rtw8822be_n2bd_dm_admission_and_phy_status() -> TestResult {
+    use super::super::{dm, power_policy::Gate, qualification};
+    let Some((factory, phy, grant, _)) = b22_station_fixture() else {
+        return TestResult::Fail("8822B station fixture rejected");
+    };
+    let payload = |enabled: u16| {
+        let mut p = [0u8; qualification::PAYLOAD];
+        p[..2].copy_from_slice(&enabled.to_le_bytes());
+        p[2] = 0x40;
+        p[8] = 63;
+        p
+    };
+    if dm::bounds(0xb822, &payload(dm::DIG | dm::RA)).is_none()
+        || dm::bounds(0xb822, &payload(dm::DIG | dm::CCK_PD)).is_some()
+        || dm::bounds(0xb822, &payload(dm::PWR_TRACK)).is_some()
+        || dm::bounds(0xb822, &payload(dm::EDCCA)).is_some()
+        || dm::bounds(0xb822, &payload(dm::PATH_DIV)).is_some()
+    {
+        return TestResult::Fail("8822B N2BD mechanism set differs from rtw8822b ops");
+    }
+    let facts = dm::Facts {
+        did: 0xb822,
+        rfe: phy.rfe,
+        crystal: phy.crystal,
+        thermal: [factory.thermal(), 0xff],
+        power_track_type: 0,
+        cck_gi: [0, 0],
+    };
+    let mut status = [0u8; 32];
+    status[1] = 70; // PWDB / PWDB_A: -40 dBm
+    status[2] = 60; // PWDB_B (page 1 only): -50 dBm
+    let (Some(cck), Some(ofdm)) = (
+        dm::sample(&facts, 0, &status),
+        dm::sample(&facts, 4, &{
+            let mut s = status;
+            s[0] = 1;
+            s
+        }),
+    ) else {
+        return TestResult::Fail("8822B PHY status page refused");
+    };
+    if cck.rssi != dm::rf_power_2_rssi(&[-40])
+        || ofdm.rssi != dm::rf_power_2_rssi(&[-40, -50])
+        || ofdm.rssi == cck.rssi
+    {
+        return TestResult::Fail("8822B PHY status RSSI differs from query_phy_status");
+    }
+    let gate = Gate::b22(grant, phy);
+    match qualification::request(&dm::KIND, &gate) {
+        Ok(r) if r.filename.starts_with("rtw88/rtw8822be-dm-v1-") => TestResult::Pass,
+        _ => TestResult::Fail("8822B N2BD request/filename differs"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_n2bd_dm_admission_and_phy_status
+);

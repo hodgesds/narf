@@ -84,8 +84,14 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
     hash.update(&mac);
     hash.update(&base);
     hash.update(kind.source);
-    if did == 0xb822 && kind.tag == b'O' {
-        hash.update(super::channel_policy::SOURCE8822B);
+    // RTL8822BE programs differ from the C21/C22 ones the shared kind
+    // sources describe; their B22 contracts are hashed in addition.
+    if did == 0xb822 {
+        match kind.tag {
+            b'O' => hash.update(super::channel_policy::SOURCE8822B),
+            b'D' => hash.update(super::dm::SOURCE8822B),
+            _ => {}
+        }
     }
     Ok(Request {
         identity: hash.finalize(),

@@ -2005,6 +2005,17 @@ impl<I: Io> Owner<I> {
         .await
         .map_err(|_| Error::Deadline)??;
         self.station_radio8821c = Some(result);
+        // dm watchdog facts (`dm::B22_MECHANISMS`: DIG/RA only; no
+        // `rtw8822b_pwr_track` under N2BD, so the power-track type is unused).
+        let p = self.phy8822b.ok_or(Error::State)?;
+        self.tracking_facts = Some(super::dm::Facts {
+            did: 0xb822,
+            rfe: p.rfe,
+            crystal: p.crystal,
+            thermal: [factory.thermal(), 0xff],
+            power_track_type: 0,
+            cck_gi: [0, 0],
+        });
         self.phase = Phase::Radio8821cPrepared;
         Ok(result)
     }

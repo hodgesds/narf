@@ -568,6 +568,26 @@ widening needs B22 HT records (not yet). No `N2BO` record is provisioned
 for any board. Case written, unexecuted:
 `smoke_rtw8822be_n2bo_channel_record_binds_base_and_retunes`.
 
+#### RTL8822BE dm watchdog (`N2BD`)
+
+B22 joins the shared dm watchdog (`dm.rs`, tag `D`, "Separately signed
+continuation contracts and the dm watchdog" below) as
+`rtw88/rtw8822be-dm-v1-<mac>.bin` (magic `N2BD`, bound to the channel-scoped
+`N2BS` base, request also hashing `dm::SOURCE8822B`). Admitted mechanisms
+are exactly those `rtw8822b.c` implements and this tree ports: DIG
+(`rtw8822b_dig` 0xc50/0xe50[6:0] both paths, `dig_min` 0x1c) over
+`rtw8822b_false_alarm_statistics` (register-identical to the 8821C one) and
+RA (H2C 0x42/0x58/0x40, RRSR). 8822B has no `cck_pd_set`, tx-path-diversity,
+CFO or DPK hooks, so those bits refuse; `rtw8822b_pwr_track` with
+`rtw_phy_pwrtrack_need_iqk` re-IQK and `rtw8822b_adaptivity` EDCCA are not
+yet admitted (bits 5/6 refuse). RSSI follows `rtw8822b.c::
+query_phy_status_page0` (PWDB word0[15:8] − 110, path A) and `_page1`
+(PWDB A/B word0[15:8]/[23:16] − 110, two-path `rtw_phy_rf_power_2_rssi`).
+`Lifecycle::prepare_station8822b` records the dm facts (RFE, crystal,
+path-A thermal). As for C21/C22 the dm grant binds at association on 2.4GHz
+only. Case written, unexecuted:
+`smoke_rtw8822be_n2bd_dm_admission_and_phy_status`.
+
 `tracking8822b::Tracker::pass` ports `rtw8822b_pwr_track` (type 0):
 alternating RF42[17:16] trigger and RF-A meter sample, `DECLARE_EWMA(thermal,
 10, 4)` average, `rtw_phy_pwrtrack_thermal_changed`/`_get_delta`/`_get_pwridx`

@@ -29,6 +29,11 @@ pub(super) const EDCCA: u16 = 1 << 6;
 pub(super) const DPK: u16 = 1 << 7;
 const C21_MECHANISMS: u16 = DIG | CCK_PD | RA;
 const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDCCA | DPK;
+/// RTL8822BE: `rtw8822b_dig` (0xc50/0xe50), the 8821C-identical
+/// `rtw8822b_false_alarm_statistics` and RA. 8822B has no `cck_pd_set`, no
+/// `config_tx_path`/CFO/DPK hooks; its `rtw8822b_pwr_track`/re-IQK and
+/// `rtw8822b_adaptivity` are not admitted here.
+const B22_MECHANISMS: u16 = DIG | RA;
 /// Linux `RTW_WATCH_DOG_DELAY_TIME`.
 pub(super) const PERIOD_MS: u64 = 2000;
 
@@ -53,6 +58,9 @@ gnt_wl 70 bit26 + ltecoex 38 byte1 77, one-shot 1b00 cmd 0x14/16/1a/1c +path (+2
 gainloss rxbb dc 92 84800/1, dc corr 200/40..65, pas_agc dgain 1535/768 loss 0x4000000 log2 db 250/1000 txbb -2/+3 cnt6, \
 coef 20x 1bd4 tbl, saturate 1000/0fff fallback 1fff/04001fff, txagc-6 1b67, gs dgain*910>>10 /10 rounded, coef1 0x16c00/gs 1b18, \
 enable 1b08/1b60 bit31 gs; dpk_track ewma thermal(10,4) delta-k_delta 1b58[6:0] bounded by payload window; restore dpd off";
+
+/// RTL8822BE dm contract (`N2BD`), hashed with [`SOURCE`] for B22 requests.
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track and rtw8822b_adaptivity not admitted";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     bounds(did, p).is_some()
@@ -81,6 +89,7 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
     let (allowed, dig_min) = match did {
         0xc821 => (C21_MECHANISMS, 0x1c),
         0xc822 => (C22_MECHANISMS, 0x20),
+        0xb822 => (B22_MECHANISMS, 0x1c),
         _ => return None,
     };
     let b = Bounds {
@@ -128,6 +137,9 @@ pub(super) struct Facts {
 impl Facts {
     fn c22(&self) -> bool {
         self.did == 0xc822
+    }
+    fn b22(&self) -> bool {
+        self.did == 0xb822
     }
     fn paths(&self) -> usize {
         if self.c22() {
@@ -347,6 +359,29 @@ pub(super) struct Sample {
 pub(super) fn sample(facts: &Facts, rate: u8, status: &[u8; 32]) -> Option<Sample> {
     let page = status[0] & 15;
     let word = |w: usize| u32::from_le_bytes(status[w * 4..w * 4 + 4].try_into().unwrap());
+    if facts.b22() {
+        // `rtw8822b.c::query_phy_status_page0/1`: PWDB word0[15:8] (page 1
+        // path B word0[23:16]) - 110; CCK uses path A only.
+        let pwdb = |shift: u32| ((((word(0) >> shift) & 0xff) as i16) - 110) as i8;
+        return match page {
+            0 => Some(Sample {
+                rssi: rf_power_2_rssi(&[pwdb(8)]),
+                path_rssi: [None, None],
+                cfo_tail: None,
+                rate,
+            }),
+            1 => {
+                let power = [pwdb(8), pwdb(16)];
+                Some(Sample {
+                    rssi: rf_power_2_rssi(&power),
+                    path_rssi: [None, None],
+                    cfo_tail: None,
+                    rate,
+                })
+            }
+            _ => None,
+        };
+    }
     if facts.c22() {
         match page {
             0 => {
@@ -619,6 +654,10 @@ impl Tracker {
         if self.facts.c22() {
             Self::mask(io, 0x1d70, 0x7f, u32::from(igi)).await?;
             Self::mask(io, 0x1d70, 0x7f00, u32::from(igi)).await
+        } else if self.facts.b22() {
+            // `rtw_phy_dig_write` over `rtw8822b_dig[]`, both paths.
+            Self::mask(io, 0xc50, 0x7f, u32::from(igi)).await?;
+            Self::mask(io, 0xe50, 0x7f, u32::from(igi)).await
         } else {
             Self::mask(io, 0xc50, 0x7f, u32::from(igi)).await
         }
@@ -657,7 +696,7 @@ impl Tracker {
             } else {
                 Self::get(io, 0xc50, 0x7f).await? as u8
             };
-            if !c22 {
+            if self.facts.did == 0xc821 {
                 let v = io.read8(0xaaa).await?;
                 if v == 255 {
                     return Err(Error::Gone);
