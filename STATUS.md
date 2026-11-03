@@ -2109,6 +2109,30 @@ this integration wave. Known limitation: PSR is refused while any external pipe
 is lit. The external-route pipe join must revisit that. None of this has run on
 physical Intel hardware.
 
+### MTL media GT engine cycles, topology and GSC/HuC formats — release gates recorded
+
+With the default-off media GT published, DRM_XE_DEVICE_QUERY_ENGINE_CYCLES now
+samples GT1's VCS/VECS engines. GT_TOPOLOGY also lists GT1's own fuse masks
+after GT0's. Engine-cycles errnos follow Linux:
+- An unknown or unpublished gt_id is EINVAL.
+- An engine absent from GT1 is EINVAL.
+- A lost GT1 wake is EIO. It also unpublishes GT1 and starts the media GuC's
+  verified stop.
+
+A new data-only module models the MTL GSC firmware, GSC-headered HuC images and
+GSC HECI packets; no owner loads them yet. Until a GSC/HuC owner uses it, the
+module carries a temporary dead-code allowance outside kernel-test builds. The
+production lint contexts are clean.
+
+Two topology gaps remain against Linux at this checkpoint:
+- GT1 omits the L3 bank entry; the HuC unit adds it.
+- GT0 has never reported an L3 bank entry. That predates this work.
+
+All eight release groups pass 2,100 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

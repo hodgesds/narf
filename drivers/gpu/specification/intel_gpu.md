@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.47** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.48** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -37,8 +37,9 @@
 > DP/HDMI outputs with Type-C ownership, owned hotplug, DC_off join,
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
-> VCS/VECS scheduling and native Xe gt_id 1, and display-14 PSR on
-> hardware inputs pass release native model gates — see §20).
+> VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
+> queries, and display-14 PSR on hardware inputs pass release native
+> model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3694,8 +3695,21 @@ New fixtures register under `intel_gpu_media_gt`:
   `smoke_media_gsc_heci_packets_follow_xe_gsc_submit` and
   `smoke_media_huc_auth_modes_read_gt1_registers` cover the formats.
 
-They were registered but not run in this checkpoint, and they are not physical
-Intel evidence.
+Integration: all eight release groups pass 2,100 unique tests with no failures
+and no Intel skips; the only skip is the existing shared RNG-registration skip.
+All seven new fixtures pass, but they are not physical Intel evidence. The
+gt_id 1 engine-cycles checks run in the same order with the same errnos as
+`query_engine_cycles`: clockid, then gt_id (beyond `max_gt_per_tile` or an
+unpublished GT1 is EINVAL), then the engine lookup (EINVAL). A lost GT1 wake is
+EIO, as Linux's forcewake failure is. It also unpublishes GT1 and begins the
+media GuC's verified stop. At this checkpoint GT1's topology omits the L3 bank
+entry, although `xe_gt_topology_report_l3` reports it for media versions below
+30; the HuC unit adds it. GT0's topology also has no L3 bank entry, which
+predates this work and still differs from Linux. `intel_gpu_gsc` is data
+formats only and carries a temporary module-level dead-code allowance outside
+kernel-test builds until a GSC/HuC owner consumes it. The production
+(no-kernel-test) clippy contexts are clean. The debug group pass is deferred to
+the end of the current integration wave.
 
 ### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 
