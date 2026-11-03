@@ -196,6 +196,11 @@ pub(super) struct Controller {
     ba_cam: [Option<u8>; 2],
     /// Random scan address currently in the address CAM SMA.
     scan: Option<[u8; 6]>,
+    /// Committed association identifier (firmware-swap restore input).
+    aid: Option<u16>,
+    /// Last accepted `H2C_FUNC_OUTSRC_RA_MACIDCFG` body, replayed by
+    /// `rtw89_wow_swap_fw` -> `rtw89_phy_ra_assoc`.
+    ra: Option<[u8; 16]>,
 }
 struct Attempt {
     admission: Admission,
@@ -226,6 +231,8 @@ impl Controller {
             admission: None,
             ba_cam: [None; 2],
             scan: None,
+            aid: None,
+            ra: None,
         })
     }
     pub(super) fn own(&self) -> [u8; 6] {
@@ -433,11 +440,71 @@ impl Controller {
             port(io, true)
         })?;
         admission.run(|| {
+            self.aid = Some(aid);
             self.phase = Phase::Associated;
             Ok(())
         })?;
         attempt.armed = false;
         Ok(())
+    }
+    /// Associated-station facts a firmware swap restores: peer, AID and
+    /// whether WMM (QoS NULL) is negotiated.
+    pub(super) fn restore_facts(&self) -> Option<(Peer, u16, bool)> {
+        if self.phase() != Phase::Associated {
+            return None;
+        }
+        let peer = self.peer()?;
+        let wmm = peer.qos_ready();
+        Some((peer, self.aid?, wmm))
+    }
+    /// The station half of `wow.c::rtw89_wow_swap_fw` on a freshly
+    /// downloaded image: `ROLE_MAINTAIN(FW_RESTORE)`, the assoc CMAC table
+    /// (`fixed_cctl`, as `commit_peer`), `JOIN_INFO` connected, the AX v0
+    /// address CAM (no `upd_mode` field) and, when firmware RA was handed
+    /// over, `rtw89_phy_ra_assoc` with the retained body. `cam` is the
+    /// address CAM body (security/WoL fields included by the caller).
+    /// BSS colour and the UL-TB power offset are BB/MAC registers that the
+    /// WCPU download does not reset; EDCA, BA CAM and WMM rows likewise.
+    pub(super) async fn restore(
+        &mut self,
+        io: &mut impl Interface,
+        cam: &[u8; 60],
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        command(io, 8, 4, &codec::role_restore(), true, Some(admission)).await?;
+        let ghz5 = io.ghz5();
+        command(io, 5, 2, &codec::fixed_cctl(ghz5), true, Some(admission)).await?;
+        command(io, 8, 0, &codec::join(true), true, Some(admission)).await?;
+        command(io, 6, 0, cam, true, Some(admission)).await?;
+        if let Some(ra) = self.ra {
+            admission.check()?;
+            io.command(2, 1, 0, &ra, false, Some(admission)).await?;
+        }
+        admission.run(|| {
+            peer.current()?;
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
+    /// The plain associated address CAM body `commit_peer` installed.
+    pub(super) fn associated_cam(&self) -> Option<[u8; 60]> {
+        let (peer, aid, _) = self.restore_facts()?;
+        Some(codec::cam(self.own, peer.peer, aid, true, true))
     }
     pub(super) async fn configure_wmm(
         &mut self,
@@ -566,6 +633,7 @@ impl Controller {
         io.command(2, 1, 0, &body, false, Some(admission)).await?;
         admission.run(|| {
             peer.current()?;
+            self.ra = Some(body);
             peer.he.store(he.is_some(), Ordering::Release);
             self.phase = Phase::Associated;
             Ok(())

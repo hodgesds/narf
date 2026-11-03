@@ -7,7 +7,9 @@
 //! existing closure earns the `dma_stop` proof for the cold path.
 use super::*;
 use crate::rtw89::{
-    power,
+    lps_packets::{Packets, Stage},
+    power, radio_init, rx_packet,
+    station_control::Admission,
     wow_trx::{self, CpuIoRx, Ring, Snapshot},
 };
 use alloc::vec::Vec;
@@ -206,5 +208,138 @@ impl Native {
             return self.wow_failed(wow_trx::Error::State);
         }
         Ok(())
+    }
+    /// A firmware image may replace the running one: RTL8852B with host TX
+    /// halted (`Quiesced`, the WoW image) or HCI restarted after the WoW
+    /// window (`Restarted`, the normal image), and every H2C consumed. AX
+    /// non-C chips keep interrupts enabled across the download
+    /// (`rtw89_wow_swap_fw` `disable_intr_for_dlfw = false`).
+    pub(in crate::rtw89) fn wow_swappable(&self) -> bool {
+        self.chip == ChipId::Rtl8852B
+            && self.state == State::Active
+            && matches!(self.wow_trx, Some(Trx::Quiesced(_) | Trx::Restarted(_)))
+            && self.queue.pending() == 0
+    }
+    /// After `Firmware::swap` returned: the fresh image counts H2C sequences
+    /// from zero again (`__rtw89_fw_download` clears `h2c_seq`/`rec_seq`),
+    /// and C2H already retained from the replaced image is dropped so no
+    /// stale ACK can satisfy a new command.
+    pub(in crate::rtw89) fn wow_firmware_loaded(&mut self) -> Result<(), power::Error> {
+        if !self.wow_swappable() {
+            self.fail();
+            return Err(power::Error::Terminal);
+        }
+        self.runtime_sequence = 0;
+        self.station_runtime
+            .backlog
+            .retain(|event| !matches!(event, rx_packet::Event::Firmware(_)));
+        Ok(())
+    }
+    /// `rtw89_phy_init_rf_reg(rtwdev, true)` on the fresh image: the RF
+    /// A/B firmware register pages of the retained signed tables, no RF I/O.
+    pub(in crate::rtw89) async fn wow_rf_pages(
+        &mut self,
+        assets: &crate::rtw89::radio_assets::Assets,
+    ) -> Result<(), power::Error> {
+        if !self.wow_swappable() {
+            return Err(power::Error::Terminal);
+        }
+        let qualified = self
+            .factory
+            .as_ref()
+            .and_then(radio_init::Qualified::from_factory)
+            .ok_or(power::Error::Terminal)?;
+        let pages =
+            radio_init::noio_pages(qualified, assets).map_err(|_| power::Error::Unsupported)?;
+        for (path, bytes) in pages.iter().enumerate() {
+            for (page, chunk) in bytes.chunks(2000).enumerate() {
+                if let Err(error) = self
+                    .transmit_radio_page(path as u8, page as u8, chunk)
+                    .await
+                {
+                    self.fail();
+                    return Err(match error {
+                        radio_init::Error::Register(error) => error,
+                        _ => power::Error::Access,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+    /// `rtw89_fw_h2c_general_pkt` on the fresh image: PS-Poll, NULL and QoS
+    /// NULL packet offloads (`H2C_FUNC_PACKET_OFLD` ADD + its C2H response)
+    /// then `GENERAL_PKT` with DONE_ACK, through station admission.
+    pub(in crate::rtw89) async fn wow_general_packets(
+        &mut self,
+        packets: &mut Packets,
+        admission: &Admission,
+    ) -> Result<(), power::Error> {
+        let permit = station::Permit::Station(admission);
+        while matches!(packets.stage(), Stage::Add(_)) {
+            let body = packets.begin_add().map_err(|_| power::Error::Terminal)?;
+            let (id, op) = packets.pending().ok_or(power::Error::Terminal)?;
+            // Drop only obsolete offload responses before the new request.
+            self.station_runtime.backlog.retain(|event| {
+                !matches!(event, rx_packet::Event::Firmware(m)
+                    if (m.category, m.class, m.function) == (1, 1, 2))
+            });
+            self.runtime_command(1, 9, 1, &body, true, permit).await?;
+            packets
+                .command_done(id, op)
+                .map_err(|_| power::Error::Terminal)?;
+            let response = self.wow_offload_response(id, op).await?;
+            if !packets
+                .response(&response)
+                .map_err(|_| power::Error::Terminal)?
+            {
+                return Err(power::Error::Access);
+            }
+        }
+        let body = packets.general().map_err(|_| power::Error::Terminal)?;
+        self.runtime_command(1, 0, 1, &body, true, permit).await?;
+        packets
+            .general_done(body)
+            .map_err(|_| power::Error::Terminal)
+    }
+    /// The copied C2H MAC1/OFLD1/function2 response for one offload request.
+    async fn wow_offload_response(&mut self, id: u8, op: u8) -> Result<Vec<u8>, power::Error> {
+        let start = self.io.now_us();
+        loop {
+            let mut found = None;
+            let mut index = 0;
+            while index < self.station_runtime.backlog.len() {
+                let matched = matches!(&self.station_runtime.backlog[index],
+                    rx_packet::Event::Firmware(m)
+                        if (m.category, m.class, m.function) == (1, 1, 2)
+                            && crate::rtw89::lps_wire::packet_response(&m.bytes, id, op));
+                if matched {
+                    if found.is_some() {
+                        return Err(power::Error::Access);
+                    }
+                    if let Some(rx_packet::Event::Firmware(m)) =
+                        self.station_runtime.backlog.remove(index)
+                    {
+                        found = Some(m.bytes);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if let Some(bytes) = found {
+                return Ok(bytes);
+            }
+            if self.io.now_us().saturating_sub(start) >= 400_000 {
+                return Err(power::Error::Timeout);
+            }
+            self.io.delay_us(50).await;
+            self.poll().map_err(|_| power::Error::Access)?;
+            let batch = self
+                .rx_hardware_step(32)
+                .map_err(|_| power::Error::Access)?;
+            for event in batch.events {
+                self.retain_event(event)?;
+            }
+        }
     }
 }

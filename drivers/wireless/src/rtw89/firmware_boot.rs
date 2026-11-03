@@ -50,6 +50,11 @@ pub trait Transport {
     type Registers: Io;
     fn chip(&self) -> ChipId;
     fn prepared(&self) -> bool;
+    /// A running owner whose host TX is halted and whose CH12 is drained
+    /// may receive a replacement image (`wow.c::rtw89_wow_swap_fw`).
+    fn swappable(&self) -> bool {
+        false
+    }
     fn registers(&mut self) -> &mut Self::Registers;
     fn send(
         &mut self,
@@ -80,6 +85,10 @@ impl<T: Transport> Firmware<T> {
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    /// Canonical file of the running image (the WoW image comes from it).
+    pub(super) fn image_name(&self) -> &'static str {
+        self.plan.name()
+    }
     pub(super) fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
@@ -104,10 +113,40 @@ impl<T: Transport> Firmware<T> {
         }
         result
     }
+    /// `fw.c::__rtw89_fw_download` of a replacement image on the running
+    /// WCPU (`rtw89_wow_swap_fw`): the same CPU disable/enable, path-ready,
+    /// header and section sequence as [`Self::start`], over the same CH12
+    /// transport. Returns the replaced plan. One attempt (Linux retries five
+    /// times); any error terminalizes this owner for the cold path.
+    pub async fn swap(&mut self, plan: DownloadPlan) -> Result<DownloadPlan, Error> {
+        if self.phase != Phase::Running || !self.transport.swappable() {
+            return Err(Error::Terminal);
+        }
+        if plan.chip() != self.plan.chip() {
+            return Err(Error::ChipMismatch);
+        }
+        self.phase = Phase::Starting;
+        let old = core::mem::replace(&mut self.plan, plan);
+        let result = async {
+            let header = self.plan.header_command(0)?;
+            self.download(&header).await
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(old),
+            Err(error) => {
+                self.phase = Phase::Terminal;
+                Err(error)
+            }
+        }
+    }
     async fn start_inner(&mut self, header: &[u8]) -> Result<(), Error> {
         if !self.transport.prepared() {
             return Err(Error::NotPrepared);
         }
+        self.download(header).await
+    }
+    async fn download(&mut self, header: &[u8]) -> Result<(), Error> {
         let chip = self.plan.chip();
         disable_cpu(self.transport.registers(), chip)?;
         enable_cpu(self.transport.registers(), chip)?;
@@ -236,6 +275,9 @@ impl Transport for super::command_native::Native {
     }
     fn prepared(&self) -> bool {
         self.firmware_prepared()
+    }
+    fn swappable(&self) -> bool {
+        self.wow_swappable()
     }
     fn registers(&mut self) -> &mut Self::Registers {
         self.io()

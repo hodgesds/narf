@@ -44,6 +44,11 @@ impl Namespace {
             counters: Arc::new(IrqSafeSpinLock::new(lps_wire::Counters::default())),
         })
     }
+    /// The namespace of the next verified image on the same WCPU (a WoW
+    /// firmware swap): ids restart, the epoch never repeats.
+    pub(super) fn next(&self) -> Option<Self> {
+        Self::after_firmware(self.epoch.checked_add(1)?)
+    }
     pub(super) fn reserve(
         &mut self,
         peer: Peer,
@@ -116,6 +121,10 @@ impl Packets {
     }
     pub(super) fn pending(&self) -> Option<(u8, u8)> {
         self.pending.map(|p| (p.id, p.operation))
+    }
+    /// The NULL data template id (keep-alive reuses it).
+    pub(super) fn null_id(&self) -> u8 {
+        self.ids[1]
     }
     pub(super) fn ready(&self) -> bool {
         self.stage == Stage::Ready && self.pending.is_none()

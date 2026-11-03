@@ -1883,6 +1883,42 @@ values instead of the init defaults, and no beacon filter exists to
 re-enable. Unexecuted cases: `smoke_rtw89_wow_trx_halt_restart_reversible`,
 `smoke_rtw89_wow_trx_refusals_fail_closed`.
 
+**Firmware swap (`startup_wow.rs`, `firmware_boot::Firmware::swap`) —
+implemented, unexecuted.** `Startup::wow_swap_in(cam, admission)` runs
+`wow.c::rtw89_wow_swap_fw(wow = true)` between `wow_trx_enter_pre` and
+`wow_trx_enter_post` on a `RadioReady`, non-monitor, associated station
+whose LPS owner is absent or awake (`lps::Manager::wow_ready`). It
+resolves the WoW plan first (`firmware_registry::load_wow` of the running
+image's file, `DownloadPlan::new` with the identity fuses and upstream
+blacklist), so a missing/unverifiable image leaves the station untouched.
+`Firmware::swap` then repeats `__rtw89_fw_download` (CPU disable/enable,
+path ready, header, sections, 5 ms, FREERTOS_DONE) over CH12 while the
+transport is `Native::wow_swappable` (8852B, `Trx::Quiesced` or
+`Trx::Restarted`, CH12 drained; interrupts stay enabled as Linux does for
+AX non-C). `wow_firmware_loaded` restarts the H2C sequence at 0
+(`h2c_seq = 0`) and drops C2H retained from the replaced image;
+`wow_rf_pages` is `rtw89_phy_init_rf_reg(noio = true)` (the RF A/B firmware
+pages rebuilt by `radio_init::noio_pages` from the retained signed tables);
+`station_control::Controller::restore` sends `ROLE_MAINTAIN(FW_RESTORE)`
+(`codec::role_restore`, upd_mode 6), the assoc CMAC table (`fixed_cctl`),
+`JOIN_INFO` connected, the caller's AX v0 address CAM body (AX has no
+`upd_mode` word) and the retained RA body (`rtw89_phy_ra_assoc`, recorded
+by `configure_ra`). On the WoW image `Native::wow_general_packets` installs
+PS-Poll/NULL/QoS-NULL offloads and `GENERAL_PKT` in a fresh
+`lps_packets::Namespace` (new epoch), retained in `startup_wow::Window`.
+`wow_swap_out(admission)` is the reverse (`wow = false`, between
+`wow_trx_leave_pre` and `wow_trx_leave_post`): a freshly loaded normal image
+(`firmware_registry::load`, never cached), the same restore with the plain
+associated CAM; the LPS manager moves to a new namespace epoch and
+reinstalls its templates/`GENERAL_PKT` on its next install, as before LPS
+first ran. While the window is open and HCI is on, `rx_hardware_step`
+returns firmware messages only (RX filters drop frames). BSS colour,
+UL-TB offset, EDCA/WMM rows and BA CAM are BB/MAC state the WCPU download
+leaves intact and are not replayed. Deliberate differences: one download
+attempt (Linux retries five times); any failure after resolving the plan
+terminalizes the Startup for the cold path. Unexecuted case:
+`smoke_rtw89_wcpu_wow_swap_requires_swappable_running_owner`.
+
 **Not wired (why `wow` stays open).** The whole row still needs, in Linux
 order (`rtw89_wow_suspend`/`resume`):
 1. (Done above: `wow_trx`/`command_native/wow.rs`.) Reversible TRX
@@ -1897,7 +1933,7 @@ order (`rtw89_wow_suspend`/`resume`):
    The existing `dma_stop` proof is terminal (BME off); WoW needs a
    reversible variant that keeps BME and every published mapping, like
    rtw88 `pci_swap.rs`.
-2. Firmware swap on a `Phase::Station` owner: WCPU re-download of the WoW
+2. (Done above: `startup_wow.rs`.) Firmware swap on a `Phase::Station` owner: WCPU re-download of the WoW
    image through the CH12 path (8852B keeps interrupts enabled during the
    download), `rtw89_phy_init_rf_reg(true)`, `ROLE_MAINTAIN(FW_RESTORE)`,
    assoc CMAC table, `JOIN_INFO`, addr CAM (`FW_RESTORE`), general packets,

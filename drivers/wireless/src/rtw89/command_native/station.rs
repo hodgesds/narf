@@ -72,12 +72,25 @@ impl Native {
             if self.state != State::Active {
                 return Err(rx_dma::Error::Terminal);
             }
-            if self.wow_trx_open() {
-                // WoW window: unreaped RX is dropped by the ring rewind.
+            if self.wow_parked() {
+                // HCI RX is off: unreaped RX is dropped by the ring rewind.
                 return Ok(rx_dma::Batch {
                     events: alloc::vec::Vec::new(),
                     consumed: false,
                 });
+            }
+            if self.wow_trx_open() {
+                // Halted or restarting WoW window: the RX filters drop every
+                // frame type, but the firmware swap still needs its C2H/ACK
+                // stream (`rtw89_wow_swap_fw` runs with RX alive). Anything
+                // but a firmware message is discarded here.
+                self.ordinary_current()?;
+                // SAFETY: as below; the same retained RXQ/RPQ owner.
+                let mut batch = unsafe { self.receive.poll_station_step(&mut self.io, budget) }?;
+                batch
+                    .events
+                    .retain(|event| matches!(event, rx_packet::Event::Firmware(_)));
+                return Ok(batch);
             }
             if self.station_runtime.started {
                 self.ordinary_current()?;

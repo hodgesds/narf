@@ -384,6 +384,25 @@ impl Manager {
         self.aid = Some(aid);
         Ok(())
     }
+    /// `rtw89_wow_leave_ps` precondition: no template owner, or one that
+    /// is awake (`Active`); Deep or transitional sleep refuses the swap.
+    pub(super) fn wow_ready(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_none_or(|owner| owner.phase() == Phase::Active)
+    }
+    /// The image this namespace belonged to was replaced (WoW swap): its
+    /// template ids are gone with it. The next image starts a new epoch;
+    /// the committed association/AID stay so LPS may reinstall later.
+    pub(super) fn wow_swapped(&mut self) -> Result<Namespace, power::Error> {
+        if !self.wow_ready() {
+            return Err(power::Error::Terminal);
+        }
+        self.owner = None;
+        let wow = self.namespace.next().ok_or(power::Error::Terminal)?;
+        self.namespace = wow.next().ok_or(power::Error::Terminal)?;
+        Ok(wow)
+    }
     pub(super) fn has_owner(&self) -> bool {
         self.owner.is_some()
     }

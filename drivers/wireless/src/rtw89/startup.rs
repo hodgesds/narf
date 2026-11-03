@@ -66,6 +66,8 @@ pub struct Startup {
     station_binding: Option<[u8; 6]>,
     sleep: Option<runtime_sleep::Runtime>,
     monitor: Option<super::monitor::Controller>,
+    /// Running WoW image state (`startup_wow.rs`).
+    wow: Option<wow::Window>,
     pub(super) lifecycle: super::radio_policy::Lifecycle,
 }
 impl core::fmt::Debug for Startup {
@@ -140,6 +142,7 @@ impl Startup {
             station_binding: None,
             sleep: None,
             monitor: None,
+            wow: None,
             lifecycle: super::radio_policy::Lifecycle::Initial,
         })
     }
@@ -527,6 +530,8 @@ impl Drop for Startup {
 mod runtime_sleep;
 #[path = "startup_station.rs"]
 mod station;
+#[path = "startup_wow.rs"]
+mod wow;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {

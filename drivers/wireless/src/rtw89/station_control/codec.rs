@@ -6,6 +6,11 @@ fn word(bytes: &mut [u8], index: usize, value: u32) {
 pub(super) fn role(remove: bool) -> [u8; 4] {
     ((1u32 << 13) | (u32::from(remove) << 10)).to_le_bytes()
 }
+/// `rtw89_fw_h2c_role_maintain(RTW89_ROLE_FW_RESTORE)` for the station
+/// role (`upd_mode` 6, W0[12:10]) after a firmware swap.
+pub(super) fn role_restore() -> [u8; 4] {
+    ((1u32 << 13) | (6 << 10)).to_le_bytes()
+}
 pub(super) fn join(connected: bool) -> [u8; 4] {
     ((1u32 << 26) | if connected { 2 << 24 } else { 1 << 8 }).to_le_bytes()
 }

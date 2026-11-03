@@ -137,6 +137,21 @@ impl Init {
         Ok(())
     }
 }
+/// `phy.c::rtw89_phy_init_rf_reg(noio = true)`: the RF path A/B
+/// firmware register pages only (no RF write), rebuilt from the same
+/// retained signed tables for a freshly downloaded image.
+pub(super) fn noio_pages(qualified: Qualified, assets: &Assets) -> Result<[Vec<u8>; 2], Error> {
+    let page = |index: usize| -> Result<Vec<u8>, Error> {
+        let program = radio_table::program(
+            assets.table(index).ok_or(Error::Profile)?,
+            qualified.rfe,
+            qualified.cut,
+        )
+        .map_err(Error::Table)?;
+        rf_pages(&program)
+    };
+    Ok([page(2)?, page(3)?])
+}
 fn validate_bb(program: &[Pair]) -> Result<(), Error> {
     for &Pair(address, data) in program {
         if (0xf9..=0xfe).contains(&address) || data == 0xbabecafe {
