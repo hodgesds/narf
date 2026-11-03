@@ -89,7 +89,7 @@
 //! `intel_display.c` (`intel_atomic_commit_tail`, `hsw_crtc_enable`,
 //! `hsw_crtc_disable`, `hsw_configure_cpu_transcoder`).
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU8, Ordering};
 
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
@@ -1540,6 +1540,59 @@ pub enum ServiceOutcome {
     Unchanged,
 }
 
+/// The route presence a service publishes for lock-free readers
+/// ([`routes_stopped`], [`route_live`]): absent, live, locally stopped, or
+/// retained without a proven stop. It changes only when a service pass
+/// ends, so a reader racing a pass sees the last completed pass's route,
+/// never a transient "not stopped" from the pass merely holding the lock.
+/// Passes that light or stop hardware are serialized against the display
+/// power-management readers by the display's legacy guard, and against
+/// DC5/DC6 re-entry by their `DcUser::External` reference and the
+/// contended-lock rule of [`external_route_blocks_dc`].
+#[derive(Debug)]
+pub struct RoutePresence(AtomicU8);
+
+const PRESENCE_ABSENT: u8 = 0;
+const PRESENCE_LIVE: u8 = 1;
+const PRESENCE_STOPPED: u8 = 2;
+const PRESENCE_RETAINED: u8 = 3;
+
+impl RoutePresence {
+    /// No route.
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(PRESENCE_ABSENT))
+    }
+
+    fn publish(&self, route: Option<&MtlRoute>) {
+        let code = match route {
+            None => PRESENCE_ABSENT,
+            Some(route) if route.live() => PRESENCE_LIVE,
+            Some(route) if route.stopped() => PRESENCE_STOPPED,
+            Some(_) => PRESENCE_RETAINED,
+        };
+        self.0.store(code, Ordering::Release);
+    }
+
+    /// No route, or a locally stopped one (its hardware is off).
+    pub fn stopped(&self) -> bool {
+        matches!(
+            self.0.load(Ordering::Acquire),
+            PRESENCE_ABSENT | PRESENCE_STOPPED
+        )
+    }
+
+    /// A route is scanning out.
+    pub fn live(&self) -> bool {
+        self.0.load(Ordering::Acquire) == PRESENCE_LIVE
+    }
+}
+
+impl Default for RoutePresence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Owner of at most one MTL external route, driven by hotplug events.
 #[derive(Debug)]
 pub struct MtlExternalService {
@@ -1549,6 +1602,8 @@ pub struct MtlExternalService {
     policy: MtlPortPolicy,
     /// What activations share the display with (panel, pipe-DMC sink).
     display: MtlDisplay,
+    /// Where this service publishes its route presence, if anywhere.
+    presence: Option<&'static RoutePresence>,
 }
 
 impl Default for MtlExternalService {
@@ -1570,7 +1625,16 @@ impl MtlExternalService {
             live: LiveMode::Native,
             policy,
             display: MtlDisplay::NONE,
+            presence: None,
         }
+    }
+
+    /// An empty service that publishes its route presence to `presence`
+    /// at the end of every pass.
+    pub const fn with_presence(presence: &'static RoutePresence) -> Self {
+        let mut service = Self::new();
+        service.presence = Some(presence);
+        service
     }
 
     /// What activations share the display with.
@@ -1583,6 +1647,12 @@ impl MtlExternalService {
     /// reported to.
     pub fn set_display(&mut self, display: MtlDisplay) {
         self.display = display;
+    }
+
+    fn publish(&self) {
+        if let Some(presence) = self.presence {
+            presence.publish(self.route.as_ref());
+        }
     }
 
     /// The port policy.
@@ -1783,8 +1853,20 @@ impl MtlExternalService {
     }
 
     /// Act on one hotplug event. `alloc` supplies a scanout framebuffer
-    /// for a newly probed mode (the caller owns its GGTT lifetime).
+    /// for a newly probed mode (the caller owns its GGTT lifetime). The
+    /// route presence is published when the pass ends.
     pub fn handle<M: MmioWindow + ?Sized>(
+        &mut self,
+        io: &M,
+        event: MtlHpdEvent,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+    ) -> ServiceOutcome {
+        let outcome = self.handle_event(io, event, alloc);
+        self.publish();
+        outcome
+    }
+
+    fn handle_event<M: MmioWindow + ?Sized>(
         &mut self,
         io: &M,
         event: MtlHpdEvent,
@@ -1885,15 +1967,20 @@ impl MtlExternalService {
     /// Reset/suspend: stop and release the route. Returns whether nothing
     /// external remains owned.
     pub fn teardown<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
-        matches!(
+        let done = matches!(
             self.withdraw(io),
             ServiceOutcome::Withdrawn { .. } | ServiceOutcome::Unchanged
-        )
+        );
+        self.publish();
+        done
     }
 }
 
+/// The process-wide service's published route presence.
+static PRESENCE: RoutePresence = RoutePresence::new();
+
 static SERVICE: narf_lib::mutex::Mutex<MtlExternalService> =
-    narf_lib::mutex::Mutex::new(MtlExternalService::new());
+    narf_lib::mutex::Mutex::new(MtlExternalService::with_presence(&PRESENCE));
 
 /// DC-off bracket for every hardware touch of the MTL external route:
 /// hotplug service, Type-C connect/disconnect, probe, activate, stop and
@@ -1925,10 +2012,11 @@ pub(crate) fn service_blocks_dc(service: &MtlExternalService) -> bool {
     service.route().is_some_and(|route| !route.stopped())
 }
 
-/// The process-wide predicate registered with the DC service
-/// (`route_live() || !routes_stopped()`): a live or quarantined route, or a
-/// service pass in progress, refuses DC5/DC6 re-entry. Never touches
-/// registers or blocks.
+/// The process-wide predicate registered with the DC service: a live or
+/// quarantined route, or a service pass in progress (the service is
+/// contended), refuses DC5/DC6 re-entry. Unlike [`routes_stopped`] it
+/// reads the service itself, so a pass lighting a route is covered before
+/// it publishes. Never touches registers or blocks.
 pub fn external_route_blocks_dc() -> bool {
     SERVICE
         .try_lock()
@@ -2011,20 +2099,19 @@ pub fn service_mtl_external<M: MmioWindow + ?Sized>(
 }
 
 /// Whether the process-wide MTL route is absent or locally stopped (its
-/// hardware is off). A live or quarantined route, or a service pass in
-/// progress, reports `false`. Never touches registers.
+/// hardware is off), as the last completed service pass published it
+/// ([`RoutePresence`]). A live or quarantined route reports `false`; a
+/// pass merely holding the service does not. Never touches registers or
+/// takes a lock.
 pub fn routes_stopped() -> bool {
-    SERVICE
-        .try_lock()
-        .is_some_and(|service| service.route().is_none_or(MtlRoute::stopped))
+    PRESENCE.stopped()
 }
 
-/// Whether the process-wide MTL route is currently live (scanning out).
-/// The DC-state owner must refuse DC entry while this is true.
+/// Whether the process-wide MTL route is live (scanning out), as the last
+/// completed service pass published it. DC5/DC6 re-entry is gated by
+/// [`external_route_blocks_dc`], which also refuses while a pass runs.
 pub fn route_live() -> bool {
-    SERVICE
-        .try_lock()
-        .is_none_or(|service| service.route().is_some_and(MtlRoute::live))
+    PRESENCE.live()
 }
 
 /// Process-wide reset/suspend teardown: stop/release the route, then

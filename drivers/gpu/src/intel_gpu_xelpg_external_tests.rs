@@ -2467,3 +2467,81 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_route_arm_runs_inside_irq_masked_evasion
 );
+
+fn smoke_mtl_external_route_presence_has_no_transient_readers() -> TestResult {
+    // Lock-free readers of a service's route presence see the last
+    // completed pass, never a "not stopped" because a pass merely holds
+    // the service. A live route reports live/not stopped until the pass
+    // that stops it completes; a quarantined one stays not stopped.
+    static PRESENCE_UNDER_TEST: RoutePresence = RoutePresence::new();
+    let presence = &PRESENCE_UNDER_TEST;
+    let io = ExtFake::new(XeLpgPort::Tc1, Sink::new(0x14, edid_1024()));
+    let mut service = MtlExternalService::with_presence(presence);
+    if !service.teardown(&io) || !presence.stopped() || presence.live() {
+        return TestResult::Fail("an empty service must publish stopped");
+    }
+    let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+    let Some(event) = monitor.poll(&io) else {
+        return TestResult::Fail("the DP-alt sink must be detected");
+    };
+    // Mid-pass (the service is held): still the previous pass's "absent".
+    let mut mid = Vec::new();
+    let mut alloc = |mode: &Mode| {
+        mid.push((presence.stopped(), presence.live()));
+        fb_for(mode)
+    };
+    let activated = matches!(
+        service.handle(&io, event, &mut alloc),
+        ServiceOutcome::Activated { .. }
+    );
+    if !activated || mid != [(true, false)] || presence.stopped() || !presence.live() {
+        return TestResult::Fail("activation must publish live only when the pass ends");
+    }
+    // A pass that changes nothing republishes the same state.
+    let idle = MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind: MtlHpdKind::Disconnected,
+    };
+    if !matches!(
+        service.handle(&io, idle, &mut fb_for),
+        ServiceOutcome::Unchanged
+    ) || presence.stopped()
+        || !presence.live()
+    {
+        return TestResult::Fail("an unrelated pass must keep the live presence");
+    }
+    // A quarantined stop publishes "not stopped, not live".
+    io.pipeconf_stuck.set(true);
+    let gone = MtlHpdEvent {
+        pin: MtlHpdPin::Tc1,
+        kind: MtlHpdKind::Disconnected,
+    };
+    if !matches!(
+        service.handle(&io, gone, &mut fb_for),
+        ServiceOutcome::Retained { .. }
+    ) || presence.stopped()
+        || presence.live()
+        || !service_blocks_dc(&service)
+    {
+        return TestResult::Fail("a quarantined route must publish not stopped");
+    }
+    // The process-wide readers: a held service (a pass in progress, here
+    // with nothing owned) reads stopped without a transient, while DC
+    // re-entry stays refused for the contended service.
+    let Some(held) = SERVICE.try_lock() else {
+        return TestResult::Fail("the process-wide service must be free");
+    };
+    let owned = held.route().is_some();
+    let stopped = routes_stopped();
+    let blocks = external_route_blocks_dc();
+    let live = route_live();
+    drop(held);
+    if owned || !stopped || live || !blocks {
+        return TestResult::Fail("a held idle service must read stopped and block DC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_route_presence_has_no_transient_readers
+);

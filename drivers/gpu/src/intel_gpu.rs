@@ -3196,9 +3196,17 @@ pub mod tests {
         }
         let mut events = 0u32;
         let sizes: core::cell::RefCell<Vec<u64>> = core::cell::RefCell::new(Vec::new());
+        // Lock-free readers sampled mid-pass (the service is held): no
+        // route yet, so "stopped" without a transient, while DC re-entry
+        // stays refused for the contended pass.
+        let mid_pass: core::cell::RefCell<Vec<(bool, bool)>> = core::cell::RefCell::new(Vec::new());
         let mut published: Vec<MtlPublication> = Vec::new();
         let mut alloc = |size: u64| {
             sizes.borrow_mut().push(size);
+            mid_pass.borrow_mut().push((
+                crate::intel_gpu_xelpg_external::routes_stopped(),
+                crate::intel_gpu_xelpg_external::external_route_blocks_dc(),
+            ));
             Some(ScanoutAllocation {
                 gtt_offset: 0x100_0000,
                 phys_base: 0x7_0000_0000,
@@ -3238,6 +3246,9 @@ pub mod tests {
             }
             _ => return TestResult::Fail("activation must publish exactly one Pipe B image"),
         };
+        if *mid_pass.borrow() != [(true, true)] {
+            return TestResult::Fail("mid-pass readers must see stopped and DC blocked");
+        }
         if !handled
             || events != 1
             || *sizes.borrow() != [scanout_size_bytes(1024, 768)]
