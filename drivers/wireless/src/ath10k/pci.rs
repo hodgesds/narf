@@ -453,6 +453,20 @@ pub async fn suspend() -> Result<(), super::pm::SuspendError> {
         return Ok(());
     }
     let owner = session.as_mut().ok_or(super::pm::SuspendError::Busy)?;
+    if let DriverSession::Radio(radio) = owner {
+        // mac80211 with a WoWLAN configuration calls `ath10k_wow_op_suspend`
+        // first; its failure ("return 1") falls back to the stop below.
+        if let Some(device) = super::interface::active_for(&radio.radio) {
+            if let Ok(Some((arming, holder))) = device.wow_suspend() {
+                narf_scheduler::spawn(holder);
+                if let Ok(armed) = arming.armed().await {
+                    *WOW.lock() = Some(armed);
+                    let _ = writeln!(narf_console::Writer, "  ath10k: suspended (WoWLAN armed)");
+                    return Ok(());
+                }
+            }
+        }
+    }
     let parked = retire_owner(owner)
         .await
         .map_err(super::pm::SuspendError::Failed)?;
@@ -469,12 +483,64 @@ pub async fn suspend() -> Result<(), super::pm::SuspendError> {
     Ok(())
 }
 
+type WowSuspended = super::interface::wowlan::Suspended<super::boot::PciBoot>;
+/// A WoW-armed generation (`wow.c`); exclusive with [`PARKED`].
+static WOW: IrqSafeSpinLock<Option<WowSuspended>> = IrqSafeSpinLock::new(None);
+static LAST_WAKE: IrqSafeSpinLock<Option<super::wmi_runtime::wow::WakeReport>> =
+    IrqSafeSpinLock::new(None);
+
+/// The firmware wake report of the last WoWLAN resume (`None` when that
+/// resume never received `WOW_WAKEUP_HOST`). The shared contract has no
+/// `ieee80211_report_wowlan_wakeup` event, so this is a driver accessor.
+pub fn last_wowlan_wakeup() -> Option<super::wmi_runtime::wow::WakeReport> {
+    LAST_WAKE.lock().clone()
+}
+
+/// System resume: `ath10k_wow_op_resume` for a WoW-armed generation, else
+/// the ordinary [`resume`]. A failed WoW resume, or a wake whose reason
+/// lost the association, retires that generation and boots a fresh one
+/// (Linux RESTARTING -> `ieee80211_reconfig`), outside the recovery budget.
+pub async fn resume_async() -> bool {
+    let Some(armed) = WOW.lock().take() else {
+        return resume();
+    };
+    let mut session = SESSION.lock().await;
+    let device = armed.device().clone();
+    let result = armed.resume().await;
+    *LAST_WAKE.lock() = device.wowlan_wakeup();
+    if result.is_ok() {
+        let _ = writeln!(narf_console::Writer, "  ath10k: resumed from WoWLAN");
+        return true;
+    }
+    let Some(owner) = session.as_mut() else {
+        return false;
+    };
+    let Ok(parked) = retire_owner(owner).await else {
+        return false;
+    };
+    *session = None;
+    if !parked.reclaimable {
+        *SUSPEND_PINNED.lock() += 1;
+    }
+    let Some(revision) = clear_generation() else {
+        return false;
+    };
+    drop(session);
+    restart_parked(parked, revision);
+    true
+}
+
 /// `ath10k_pci_resume` + `ath10k_start`: clear config 0x41 and schedule a
 /// fresh-ROM boot of the parked function. `false` when nothing was parked.
 pub fn resume() -> bool {
     let Some((parked, revision)) = PARKED.lock().take() else {
         return false;
     };
+    restart_parked(parked, revision);
+    true
+}
+
+fn restart_parked(parked: super::boot::Restart, revision: u32) {
     let (cap, device) = (parked.cap, parked.device);
     let read =
         crate::qualcomm_pci::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40));
@@ -492,7 +558,6 @@ pub fn resume() -> bool {
         parked.hardware,
         revision,
     ));
-    true
 }
 
 /// Clear per-generation controller facts; returns the chip revision.

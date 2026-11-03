@@ -45,6 +45,7 @@ mod power_save;
 mod protection;
 pub use protection::Request as StationProtection;
 mod wmm;
+pub mod wow;
 pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
 pub use station::Disconnected as StationDisconnected;
@@ -140,6 +141,8 @@ pub(super) struct Radio<T> {
     pending: VecDeque<htt::Event>,
     failed: bool,
     power_save: Option<bool>,
+    /// WOW_ENABLE was acknowledged; only `wow::wow_resume` may follow.
+    wow_armed: bool,
     protection: Option<StationProtection>,
     chains: Option<chains::Chains>,
     management_subscriptions: Option<alloc::sync::Arc<offchannel::Subscriptions>>,
@@ -186,6 +189,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             pending: VecDeque::new(),
             failed: false,
             power_save: None,
+            wow_armed: false,
             protection: None,
             chains: None,
             management_subscriptions: None,

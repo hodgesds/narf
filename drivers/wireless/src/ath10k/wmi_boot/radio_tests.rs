@@ -57,6 +57,7 @@ struct RadioModel {
     host_power: HostPowerFixture,
     beacon_hint: BeaconHintFixture,
     ap: Option<ap_native_tests::Fixture>,
+    wow: Option<wow_native::Fixture>,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BeaconHintFixture {
@@ -451,6 +452,9 @@ impl Hif for RadioModel {
         if self.ap.is_some() {
             return ap_native_tests::command(self, bytes);
         }
+        if wow_native::handles(self, &bytes[8..]) {
+            return wow_native::send(self, bytes);
+        }
         if let Some(stage) = chains_tests::stage(self.inner.inner.dialect, &bytes[8..]) {
             return chains_tests::send(self, bytes, stage).await;
         }
@@ -805,6 +809,7 @@ fn radio_boot_source_ap(
         data: None,
         active: None,
         ps: None,
+        wow: None,
         ps_default_off: false,
         frequency: 2412,
         chain_mask: (((1u32 << rf_chains.min(4)) - 1)
@@ -1099,3 +1104,5 @@ mod coexistence_native;
 mod offchannel_native;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "wow_native.rs"]
+mod wow_native;

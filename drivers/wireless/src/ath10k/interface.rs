@@ -23,6 +23,8 @@ mod ap;
 pub(in crate::ath10k) use ap::Operation as ApOperation;
 #[path = "interface_offchannel.rs"]
 mod offchannel;
+#[path = "interface_wow.rs"]
+pub(super) mod wowlan;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 enum Policy {
     Installed,
@@ -69,6 +71,8 @@ pub(super) struct RadioFeatures {
     ht40: Option<[u8; 26]>,
     vht: Option<[u8; 12]>,
     offchannel_tx: bool,
+    wowlan: Option<narf_wireless::WowlanSupport>,
+    decap: wmi_runtime::wow::Decap,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
@@ -80,6 +84,8 @@ impl RadioFeatures {
             ht: radio.ht_capabilities(),
             ht40: radio.ht40_capabilities(),
             vht: radio.vht_capabilities(),
+            wowlan: radio.wowlan_support(),
+            decap: radio.wow_decap(),
         }
     }
 }
@@ -105,6 +111,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     mode: AtomicU8,
     mode_generation: AtomicU64,
     ap_host: ap::Host,
+    wow: wowlan::Host,
 
     offchannel_tx: bool,
     radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
@@ -191,6 +198,8 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 ht: None,
                 ht40: None,
                 vht: None,
+                wowlan: None,
+                decap: wmi_runtime::wow::Decap::Raw,
             });
         let frequencies = radio
             .try_lock()
@@ -230,6 +239,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             mode: AtomicU8::new(2),
             mode_generation: AtomicU64::new(1),
             ap_host: ap::Host::new(),
+            wow: wowlan::Host::new(features.wowlan, features.decap),
 
             offchannel_tx: features.offchannel_tx,
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
@@ -1300,7 +1310,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Interface for Device<T> {
         &self.tx
     }
 }
-type Native = Device<super::boot::PciBoot>;
+pub(super) type Native = Device<super::boot::PciBoot>;
 /// ath10k's reconnect identity: the family and the radio's permanent MAC
 /// (firmware/OTP `SERVICE_READY` address), unchanged across recovery.
 fn reconnect_owner(mac: [u8; 6]) -> narf_wireless::reconnect::Owner {
@@ -1345,6 +1355,14 @@ pub(super) fn retire(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) {
     drop(active);
     device.retire_host();
     remember_rebind(device.name());
+}
+/// The published station of exactly this radio generation, if any.
+pub(super) fn active_for(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) -> Option<Arc<Native>> {
+    ACTIVE
+        .lock()
+        .as_ref()
+        .filter(|d| Arc::ptr_eq(&d.radio, radio))
+        .cloned()
 }
 fn drain() -> bool {
     let device = ACTIVE.lock().clone();
@@ -1812,6 +1830,15 @@ impl WirelessNetIface for Native {
     }
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         Device::phy_capabilities(self, band)
+    }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        Device::wowlan_support(self)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        Device::set_wowlan(self, config)
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        Device::wowlan_config(self)
     }
     fn power_save_default(&self) -> Option<bool> {
         (self.ps_supported && self.mode.load(Ordering::Acquire) == 2).then_some(false)

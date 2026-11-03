@@ -901,8 +901,9 @@ actual-device RF/power/interoperability acceptance remain separate.
   registration). Resume without a parked generation does nothing. As in
   Linux without WoWLAN, the association is not preserved, and rejoin goes
   through the new interface. Suspend does not use the recovery attempt
-  budget. WoWLAN (`wow.c`) and PCI runtime D3/platform wake routing are not
-  provided (`wake_offload`). The separate D0 host-vote/ASPM owner follows.
+  budget. With a retained WoWLAN configuration and an associated station,
+  §3.6 runs first and keeps the generation; PCI runtime D3 and platform
+  wake routing are not provided. The separate D0 host-vote/ASPM owner follows.
 - Host-bus PM (`boot/power.rs`). Pinned Linux7.2
   `pci.c::ath10k_pci_{wake,sleep,ps_timer}` and `ath10k_pci_hif_start` supply
   the QCA6174/6164 and QCA9377 `pci_ps` contract. Boot retains its explicit
@@ -1886,6 +1887,88 @@ DFS channel-state machine (USABLE/UNAVAILABLE/AVAILABLE, CAC, NOP) belongs to
 `narf_wireless::reg` when a driver whose upstream enables radar detection by
 default needs it; it is not an ath10k obligation.
 
+### 3.6 Station WoWLAN (implementation; validation pending)
+
+**Admission (`wow.c::ath10k_wow_init`).** Only `wmi-tlv.c` implements the
+`gen_wow_*` WMI ops, so MAIN/10.x/10.4 images never advertise WoWLAN.
+`wmi_runtime/wow.rs::Radio::wowlan_support` requires the TLV dialect,
+firmware feature `ATH10K_FW_FEATURE_WOWLAN_SUPPORT` (bit 6), TLV service
+`WMI_TLV_SERVICE_WOW` (13, Linux's 4-bits-per-word service map) and the
+retained station data owner. Of the installed images only QCA6174 hw3.0
+firmware-4/-6, QCA9377 firmware-6 and WCN3990 carry bit 6, and none of them
+carries `RAW_MODE_SUPPORT` (bit 10) that the NARF station requires, so no
+installed image currently reaches an advertised WoWLAN interface; a TLV image
+with both bits does. The interface advertises disconnect and magic packet
+(`ath10k_wowlan_support`); GTK rekey/failure, EAP/4-way triggers and
+net-detect are not advertised and `set_wowlan` re-validates every
+configuration (`-EOPNOTSUPP` without support, `-EINVAL` otherwise).
+Patterns: under native-WiFi decap Linux reduces length/offset by
+`WOW_MAX_REDUCE` (134/114, 22 slots = INIT `num_wow_filters`) and converts
+802.3 offsets (`ath10k_wow_convert_8023_to_80211`); `wow::Program`
+implements both. Under the RAW decap of every NARF station,
+`ath10k_vif_wow_set_wakeups` never copies the cfg80211 pattern into its
+zero-initialised `new_pattern` and programs zero-length patterns, so NARF
+advertises zero patterns there instead of that no-op. `WMI_SERVICE_NLO`
+net-detect (`ath10k_wmi_tlv_op_gen_config_pno_start`) is not implemented
+and stays unadvertised.
+
+**Wire (`wmi-tlv.c`).** GRP_WOW 0x13: ADD_WAKE_PATTERN 0x13001 (tag179
+command, ARRAY_STRUCT of the 148+148-byte bitmap tag180, empty IPv4/IPv6
+sync, magic and info-timeout arrays and a declared one-word ratelimit),
+DEL_WAKE_PATTERN 0x13002 (tag136, `WOW_BITMAP_PATTERN`),
+ENABLE_DISABLE_WAKE_EVENT 0x13003 (tag137, `1 << event`), WOW_ENABLE 0x13004
+(tag119, enable 1, PCI `link_can_suspend` pause 0) and
+HOSTWAKEUP_FROM_SLEEP 0x13005 (tag120). WOW_WAKEUP_HOST event 0x13001
+requires `WOW_EVENT_INFO` (tag49: vdev, flag, reason, data_len); the optional
+ARRAY_BYTE buffer is retained raw, bounded by `data_len`. Linux ath10k only
+logs the reason and never parses that buffer; neither does NARF.
+
+**Suspend (`ath10k_wow_op_suspend`).** `pci::suspend`, for the published
+station of the current Radio generation with a retained configuration, an
+open data port and station mode, spawns the interface holder
+(`interface_wow.rs`), which takes the Radio mutex and keeps it until resume:
+no worker, control, scan or recovery can reach BAR/CE/WMI while firmware is
+in WoW. Under it `Radio::wow_suspend` encodes everything first, then sends
+`ath10k_wow_vif_cleanup` (24 event disables, 22 pattern deletes), the
+patterns and the STA event set (disconnect: DEAUTH, DISASSOC, BMISS, CSA_IE;
+magic: MAGIC_PKT_RECVD; patterns: PATTERN_MATCH), waits up to 5 s for TX
+completion (`ath10k_mac_wait_tx_complete`; frames received during that flush
+are not delivered to the quiescing stack), clears and sends WOW_ENABLE and
+waits 3 s for HTC endpoint-0 `SEND_SUSPEND_COMPLETE` (`control.rs` now
+accepts exactly that endpoint-0 message after startup; any other remains
+fail-stop). Then `Hif::wow_suspend_hif` runs `ath10k_pci_suspend`'s
+`ath10k_pci_sleep_sync` (grace window dropped, host WAKE vote cleared with
+readback) while CE/DMA, MSI and firmware stay live. Any failure leaves the
+owner failed and `pci::suspend` falls back to the ordinary retirement above,
+as Linux's "return 1" makes mac80211 stop the device. An unassociated
+station takes the ordinary path (as iwlwifi without net-detect).
+
+**Resume (`ath10k_wow_op_resume`).** `pci::resume_async` (the async
+system-PM resume) signals the holder: `Hif::wow_resume_hif` performs
+`ath10k_pci_resume` (force wake with a fresh WAKE/RTC proof, then clear the
+D3-reset RETRY_TIMEOUT byte 0x41), `Radio::wow_resume` sends HOSTWAKEUP and
+waits 3 s for WOW_WAKEUP_HOST. The report is published as
+`pci::last_wowlan_wakeup()` (the shared contract has no
+`ieee80211_report_wowlan_wakeup`). A magic/pattern/other wake keeps the
+association: firmware keeps the §3.4 hardware keys installed as in Linux,
+and the retained station owner keeps host PTK/GTK PN and replay counters
+(nothing is reset; frames firmware consumed while asleep only advance the
+AP's counters). A disconnect-class reason (AP_ASSOC_LOST, DEAUTH, DISASSOC,
+CSA) or a firmware-observed GTK/EAP/4-way handshake, and any transport or
+timeout failure, retires the generation and boots a fresh one outside the
+recovery budget (Linux RESTARTING + `ieee80211_reconfig`); the rebound
+netdev then replays the retained credentials. PCI PME/wake-enable of the
+function belongs to the system-PM owner and is not claimed here.
+
+**Tests (written, unexecuted).** `wmi_runtime/wow_tests.rs` (fixed command
+layouts, ADD_WAKE_PATTERN layout, program/event mask and 802.3 conversion,
+wake-event decode) and `wmi_boot/wow_conversation_tests.rs` (composed WPA2
+station with hardware keys: magic suspend→wake→resume with exact Linux
+command order and a post-resume CCMP uplink accepted by the FakeAp's
+PN/replay check, deauth wake requesting restart, no advertisement without
+the firmware feature) under `drivers/wireless/ath10k/wow`. No physical WoW
+entry, wake latency, PME routing or power measurement is claimed.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -2105,7 +2188,8 @@ pending. This makes no additional per-chip physical RF or power claim.
 Across the reached rows, concrete remaining software packages are
 DFS qualification (VHT20/40/80, the bounded 80+80 owner and contiguous VHT160
 are implemented; contiguous VHT160 awaits release/native validation); physical acceptance of the §3.4 hardware key offload;
-P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
+P2P roles; wake offload is implemented in §3.6 (TLV + WOWLAN + RAW images;
+net-detect not implemented) and awaits release/native validation;
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented).
 Automatic credential replay after recovery is implemented (§ recovery, rebind)
 and awaits coordinated release/native acceptance.

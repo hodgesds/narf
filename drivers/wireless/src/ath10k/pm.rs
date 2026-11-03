@@ -13,8 +13,9 @@
 //! Here `prepare_suspend` retires the live generation with the same DMA-stop
 //! proof as recovery (every CE source masked, CE halted, bus mastering off,
 //! ordered flush), parks the function identity and resume clears config
-//! 0x41 then schedules the ordinary fresh-ROM boot. WoWLAN
-//! (`wow.c`, `wake_offload` row) and host-bus runtime PM are not provided.
+//! 0x41 then schedules the ordinary fresh-ROM boot. A WoWLAN-armed station
+//! (`wow.c`, specification §3.6) keeps its generation instead; host-bus
+//! runtime D3 is not provided.
 use super::bmi::BmiError;
 
 /// Why system suspend was refused; the live generation stays usable.

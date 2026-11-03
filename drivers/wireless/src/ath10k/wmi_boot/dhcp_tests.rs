@@ -42,6 +42,8 @@ mod vht_conversation_tests;
 mod vht_wide_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
+#[path = "wow_conversation_tests.rs"]
+mod wow_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
     let mut domain = station_tests::policy();
     for (low, high) in [(5150, 5350), (5725, 5850)] {
@@ -251,6 +253,13 @@ impl Harness {
             profile.radio,
         );
         let mut radio = radio.with_hardware_keys(profile.hardware_keys);
+        if profile.features & (1 << 6) != 0 {
+            // ATH10K_FW_FEATURE_WOWLAN_SUPPORT images advertise TLV service
+            // WMI_TLV_SERVICE_WOW (13): word 3, bit 1 (`ath10k_wow_init`).
+            if let Some(caps) = radio.htt.wmi.caps.as_mut() {
+                caps.bitmap[12] |= 2;
+            }
+        }
         radio.htt.wmi.htc.transport.frequency = frequency;
         if let Some(database) = &snapshot {
             radio.beacon_policy_for_test(database.clone());

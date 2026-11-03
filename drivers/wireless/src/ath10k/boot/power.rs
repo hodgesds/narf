@@ -276,6 +276,39 @@ impl Owner {
         self.enabled = false;
         Ok(())
     }
+    /// `pci.c::ath10k_pci_sleep_sync` for a WoW-suspended generation: drop
+    /// the pending grace window and the host WAKE vote now. Firmware keeps
+    /// running WoW; the next access needs a fresh WAKE/RTC proof.
+    fn sleep_sync(&mut self, raw: &mut impl Raw) -> Result<(), BmiError> {
+        if self.failed || self.terminal || self.references != 0 {
+            return Err(BmiError::BadResponse);
+        }
+        self.idle = None;
+        self.eligible = false;
+        if self.enabled && self.awake {
+            let local = self.local.ok_or(BmiError::Unsupported)?;
+            let result = raw.write(local + 4, 0).and_then(|_| {
+                if raw.read(local + 4)? & 1 != 0 {
+                    Err(BmiError::BadResponse)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result {
+                return self.fail(error);
+            }
+            self.awake = false;
+        }
+        Ok(())
+    }
+    /// `pci.c::ath10k_pci_force_wake`: an actual WAKE write + RTC poll.
+    fn force_wake(&mut self, raw: &mut impl Raw) -> Result<(), BmiError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.acquire(raw)?;
+        self.release()
+    }
     fn stop(&mut self, raw: &mut impl Raw) -> Result<(), BmiError> {
         if self.references != 0 || self.failed {
             return Err(BmiError::BadResponse);
@@ -393,6 +426,26 @@ impl<I: Ath10kMmio> Mmio<I> {
         }
         Ok(())
     }
+    fn with_power(
+        &mut self,
+        operation: impl FnOnce(&mut Owner, &mut Authorized<'_, I>) -> Result<(), BmiError>,
+    ) -> Result<(), BmiError> {
+        let Self {
+            cap,
+            io,
+            sources,
+            power,
+        } = self;
+        let mut raw = Authorized {
+            cap,
+            io,
+            sources: sources.as_ref(),
+        };
+        match power {
+            Some(owner) => operation(owner, &mut raw),
+            None => Ok(()),
+        }
+    }
     pub(super) fn stop_power(&mut self) -> Result<(), BmiError> {
         let Self {
             cap,
@@ -425,6 +478,43 @@ impl super::PciBoot {
     }
     pub(in crate::ath10k) fn take_host_idle_deferred(&mut self) -> bool {
         self.mmio.take_power_deferred()
+    }
+    /// `ath10k_hif_suspend` (no-op for PCI) + `pci.c::ath10k_pci_suspend`
+    /// after an acknowledged WOW_ENABLE. The generation, CE/DMA, MSI and
+    /// firmware stay live; PCI D3/PME belongs to the system-PM owner.
+    pub(in crate::ath10k) fn wow_sleep(&mut self) -> Result<(), BmiError> {
+        if self.retired || !self.hif_live {
+            return Err(BmiError::BadResponse);
+        }
+        self.mmio.with_power(|owner, raw| owner.sleep_sync(raw))
+    }
+    /// `pci.c::ath10k_pci_resume` before `ath10k_wow_op_resume`: force-wake
+    /// the target, then clear the D3-reset RETRY_TIMEOUT byte (config 0x41).
+    pub(in crate::ath10k) fn wow_wake(&mut self) -> Result<(), BmiError> {
+        if self.retired || !self.hif_live {
+            return Err(BmiError::BadResponse);
+        }
+        self.mmio.with_power(|owner, raw| owner.force_wake(raw))?;
+        let cap = self.mmio.cap;
+        let device = self.device;
+        let clear = || {
+            crate::qualcomm_pci::invoke(&cap, || {
+                let value =
+                    narf_bus::pci::read_config32(&cap, &device, 0x40).map_err(|_| BmiError::Pci)?;
+                if let Some(cleared) = crate::ath10k::pm::retry_timeout(value) {
+                    narf_bus::pci::write_config32(&cap, &device, 0x40, cleared)
+                        .map_err(|_| BmiError::Pci)?;
+                }
+                Ok(())
+            })
+            .map_err(|_| BmiError::Pci)?
+        };
+        match &self.mmio.sources {
+            Some(source) => source
+                .invoke_boot(clear)
+                .map_err(|_| BmiError::DeviceGone)?,
+            None => clear(),
+        }
     }
     pub(super) fn start_host_power(&mut self) -> Result<(), BmiError> {
         self.mmio.activate_power(self.msi.is_some())?;
