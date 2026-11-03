@@ -110,6 +110,9 @@ pub struct Station<C: ControlIo, B: packet_transport::Io> {
     last_now: u64,
     last_peer: u64,
     sequence: u16,
+    /// Associated-scan capture of home-channel BSS observations
+    /// `(candidate, seen, receive generation)`, bounded like the cache.
+    observed: Option<Vec<(Candidate, u64, u64)>>,
 }
 impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -149,6 +152,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             last_now: 0,
             last_peer: 0,
             sequence: 2,
+            observed: None,
         })
     }
     pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -274,6 +278,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 break;
             };
             if let Ok(beacon) = Candidate::from_receive(&frame, self.radio.channel(), own) {
+                if let Some(observed) = &mut self.observed {
+                    let generation = self.radio.generation();
+                    observed.retain(|(old, _, _)| old.bssid() != beacon.bssid());
+                    if observed.len() < 32 {
+                        observed.push((beacon.clone(), now, generation));
+                    }
+                }
                 if beacon.bssid() == self.peer() && beacon.ssid() == self.plan.candidate().ssid() {
                     self.last_peer = now;
                 }
@@ -533,6 +544,125 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             Err(error) => {
                 self.fail();
                 Err(Error::Radio(error))
+            }
+        }
+    }
+    /// mac80211 `ieee80211_scan_state_decision`/`offchannel` admission: an
+    /// authorized station with no outstanding TX, EAPOL reply or RSNA
+    /// handshake (a rekey refuses the scan).
+    pub(super) fn scan_admissible(&self) -> bool {
+        self.transmit_ready()
+            && self.delivered_reply.is_none()
+            && !self
+                .security
+                .as_ref()
+                .is_some_and(Security::handshake_active)
+    }
+    /// No host TX or EAPOL reply receipt outstanding.
+    pub(super) fn quiescent(&self) -> bool {
+        self.pending.is_none() && self.delivered_reply.is_none()
+    }
+    pub(super) fn radio(&self) -> &Radio<C, B> {
+        &self.radio
+    }
+    /// The away/probe radio during an associated scan visit (after `leave`,
+    /// before `rejoin`): only the scan candidate parser sees its MPDUs.
+    pub(super) fn radio_mut(&mut self) -> &mut Radio<C, B> {
+        &mut self.radio
+    }
+    /// Start/stop capturing home-channel observations; stopping returns them.
+    pub(super) fn observe(&mut self, on: bool) -> Vec<(Candidate, u64, u64)> {
+        let old = self.observed.take().unwrap_or_default();
+        if on {
+            self.observed = Some(Vec::new());
+        }
+        old
+    }
+    /// One SN from the shared non-QoS DATA/EAPOL space (Open: the station
+    /// counter; WPA2: `reserve_plain_control_sequence`), consuming no PN.
+    pub(super) fn reserve_sequence(&mut self) -> Result<u16, Error> {
+        if !self.scan_admissible() {
+            return Err(Error::State);
+        }
+        if let Some(security) = &mut self.security {
+            security
+                .reserve_plain_control_sequence()
+                .map_err(Error::Security)
+        } else {
+            let sequence = self.sequence;
+            self.sequence = (sequence + 1) & 4095;
+            Ok(sequence)
+        }
+    }
+    /// mac80211 `ieee80211_send_nullfunc` around an off-channel visit: the
+    /// plaintext ToDS non-QoS Null with PM1 (`asleep`) or PM0, best effort
+    /// (rtl8xxxu sets no `REPORTS_TX_ACK_STATUS`); the USB receipt is the
+    /// only completion tracked.
+    pub(super) fn send_null(&mut self, asleep: bool, now: u64) -> Result<(), Error> {
+        let sequence = self.reserve_sequence()?;
+        let null =
+            super::ps_null::Prepared::new(self.radio.local(), self.peer(), asleep, false, sequence)
+                .map_err(|_| Error::State)?;
+        if let Err(error) = self.radio.submit_null(&null) {
+            self.fail();
+            return Err(Error::Radio(error));
+        }
+        self.pending = Some(Pending {
+            kind: Tx::Data,
+            deadline: now.saturating_add(TX_MS),
+        });
+        Ok(())
+    }
+    /// Leave the home channel: `ra_disconnect_8192e` + `rtl8xxxu_stop` on a
+    /// quiescent station. The join plan, keys, PN/replay and sequence owners
+    /// stay with this station; `rejoin` restores the radio side.
+    pub(super) async fn leave(&mut self) -> Result<(), Error> {
+        if self.phase() != Phase::Open || !self.quiescent() {
+            return Err(Error::State);
+        }
+        self.batch.clear();
+        if let Err(error) = self.radio.stop().await {
+            self.fail();
+            return Err(Error::Radio(error));
+        }
+        Ok(())
+    }
+    /// Return to `home` through a cold restart, then the port-0 station,
+    /// BSSID/slot and `ra_connect_8192e` programming for the same AID and
+    /// negotiated rates. Monitoring restarts as `ieee80211_offchannel_return`
+    /// resets it; no BSS observation is refreshed.
+    pub(super) async fn rejoin(&mut self, home: gen2_radio::Grant, now: u64) -> Result<(), Error> {
+        let management_runtime::Phase::Associated { aid } = self.plan.phase() else {
+            return Err(Error::State);
+        };
+        if self.phase() != Phase::Open || self.radio.bound() {
+            return Err(Error::State);
+        }
+        let result = async {
+            self.radio.retune(home).await.map_err(Error::Radio)?;
+            let candidate = self.plan.candidate();
+            let (bssid, short_slot) = (candidate.bssid(), candidate.capability() & 0x400 != 0);
+            self.radio
+                .prepare_station(bssid, short_slot)
+                .await
+                .map_err(Error::Radio)?;
+            let (legacy, _, _) = self.plan.rate_mask_inputs();
+            self.radio
+                .associate(aid, legacy_peer(legacy), now)
+                .await
+                .map_err(Error::Radio)
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.batch.clear();
+                self.last_now = self.last_now.max(now);
+                self.last_peer = now;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail();
+                Err(error)
             }
         }
     }

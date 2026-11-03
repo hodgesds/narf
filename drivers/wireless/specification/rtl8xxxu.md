@@ -1568,25 +1568,84 @@ rate authority.
   rule and reply-delivery receipt as `station_runtime`) or the open port.
   TX DATA is non-QoS txdesc40 on the BE pipe with firmware RA rates.
 - Netdev (`gen2_interface`): `attach` after `wait_admit` publishes one
-  `wlan%d` per boot (shared singleton like RTL8188EU); `scan` is a passive
-  dwell on the admitted channel only (active probes and other channels are
-  `NotSupported`); `associate` is Open or WPA2-PSK on that channel against a
-  scanned candidate; a failed join is terminal for the owner (as
-  RTL8188EU). `disassociate` is station stop, park and `restart_parked`
-  before the radio returns idle.
+  `wlan%d` per boot (shared singleton like RTL8188EU); a failed join is
+  terminal for the owner (as RTL8188EU). `disassociate` is station stop,
+  park and `restart_parked` before the radio returns idle.
+
+#### Gen2 qualified channels and scans
+
+`gen2_radio::Authority` retains the admitted signed record (`N92P`/`N8BP`)
+and the authenticated regulatory domain; `Authority::grant(primary)` is
+`Calibration::permission(domain, primary, INITIAL_WIDTH)` (current firmware
+capability invoked, the occupied 20 MHz band intersected with every rule,
+missing measured rows and unsupported flags refused, never interpolated).
+It is the only source of a non-initial `Grant`; the advertised channel list
+is the set granted at attach, and every use mints its own grant again.
+
+`Radio::retune(grant)` is the gen2 cold channel change of an unbound radio:
+`rtl8xxxu_stop` (TXPAUSE, RX filter maps cleared, USB Stop/SetDeq of both
+host transfers, `disable_rf`), `rtl8192eu_power_off`/`rtl8723bu_power_off`,
+a fresh `rtl8xxxu_init_device` lifecycle with the gen2 identity check,
+`retarget_stopped` (channel label changes only with no transfer posted),
+then `rtl8xxxu_start` whose `tune_8192e`/`tune_8723b` revalidate the grant
+against the retained factory/USB identity before `set_tx_power` +
+`gen2_config_channel`. A never-started radio only relabels. Linux
+`rtl8xxxu_config` retunes live; the cold boundary is the RTL8188EU rule that
+no old-channel device-FIFO byte reaches a new receive stream. Each restart
+advances `Radio::generation`. Any failure is terminal.
+
+- `set_config(channel)`: idle cold retune under that channel's grant
+  (no TX power override; a station keeps its channel, other values `Busy`).
+- Idle scans: bounded channel/frequency lists (1..=13, empty = every granted
+  channel), at most one SSID for active requests and up to 2048 checked
+  extra probe IEs (`max_scan_ssids = 1`, `max_scan_ie_len = MAX_IE`), no
+  random address/6 GHz. All grants, the probe frame and its timing are
+  admitted before the first transition. Each visit cold-retunes (skipped for
+  the current receiving channel) and either dwells passively or emits one
+  `probe_runtime::Prepared` broadcast Probe Request (`Radio::submit_probe`:
+  unbound receiving radio, exact local TA/current DS channel, legacy rates,
+  txdesc40 MGNT pipe) after the source 31 ms pre-probe delay, awaits its
+  exact host USB receipt (not an ACK) and listens the response window
+  (`Prepared::timing`). Home is restored. The candidate cache keeps at most
+  32 entries (oldest evicted) for 10 s, each with its observation time and
+  receive generation; entries on a channel no longer granted are hidden.
+- Associated scans (passive and active), mac80211 `scan.c`/`offchannel.c`
+  timing: refused unless the station is authorized with no TX/EAPOL receipt
+  or RSNA handshake outstanding; mandatory dwell above 125 ms is refused,
+  others are capped at 125 ms. A passive visit to the home channel listens in
+  normal service (home observations captured). Every other visit, and every
+  active visit, serves home until quiescent, sends the plaintext ToDS PM1
+  non-QoS Null (`Station::send_null`: SN from the shared non-QoS
+  DATA/EAPOL space via `reserve_plain_control_sequence` or the open
+  counter, no PN; txdesc40 BE pipe, best effort as rtl8xxxu has no
+  `REPORTS_TX_ACK_STATUS`), serves home for the 100 ms no-flush grace,
+  `leave`s (`ra_disconnect_8192e` + `rtl8xxxu_stop`), cold-retunes the
+  unbound radio to the visited channel (away MPDUs reach only the candidate
+  parser; the probe reserves its SN from the same space), then `rejoin`s:
+  cold retune to home, `add_interface`/`set_bssid`/slot and
+  `ra_connect_8192e` for the same AID and negotiated rates, monitoring reset;
+  PM0 Null and a 200 ms home grace follow. Join plan, keys, PN/replay windows
+  and sequence owners survive the visit.
+- `associate`: Open or WPA2-PSK against a cached candidate on a granted
+  channel (pure Join/SME-IE admission first). If the candidate is on
+  another channel the idle radio cold-retunes; the join then requires a copy
+  of that BSS from the current receive generation (a hidden SSID found via a
+  probe response is probed again, directed), waiting at most 2 s, never an
+  old entry's age.
 
 Deviations / not implemented: no HT/WMM/A-MPDU/BA on gen2 (legacy rates
 only; HT needs the `wide`/HT RX admission the 8188EU chain proves per
-board); no retune or multi-channel scan (each needs a separately granted
-permission, and `tune_8192e`/`tune_8723b` require `RadioReady`); no
-administrative IFF_UP/DOWN park/wake hooks; no station power-save nullfunc
-(Linux rtl8xxxu does not set `SUPPORTS_PS`; mac80211's nullfunc PM frames
-only bracket off-channel scans, which this single-channel owner never
-runs); BT-info records are processed only while a station is being
+board); a scan or channel change costs a full cold firmware lifecycle per
+transition (Linux retunes live); the retained host TX/RX rings are not
+serviced on away visits (home grace services one Ethernet frame per step);
+no administrative IFF_UP/DOWN park/wake hooks; no station power-save
+nullfunc beyond the scan PM1/PM0 indications (Linux rtl8xxxu does not set
+`SUPPORTS_PS`); BT-info records are processed only while a station is being
 serviced; one gen2 netdev per boot. Regressions (written, unexecuted):
-`gen2_radio_tests.rs` (C2H routing, RSSI match, rxdesc24 → `Mpdu`) and
+`gen2_radio_tests.rs` (C2H routing, RSSI match, rxdesc24 → `Mpdu`),
 `gen2_station_tests.rs` (legacy RA peer and admission refusal, open DATA
-header) in `drivers/wireless/rtl8xxxu/gen2station`.
+header) and `gen2_interface_tests.rs` (scan request admission, candidate
+cache bound/replacement) in `drivers/wireless/rtl8xxxu/gen2station`.
 
 ## 4. Invariants
 

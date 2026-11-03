@@ -4,19 +4,22 @@
 //! device (signed `N92P`/`N8BP` record, signed regulatory policy, network
 //! authority). Unprovisioned devices never reach `attach`.
 //!
-//! One owner serves passive scans on the admitted initial channel, one
-//! station at a time, and the Linux-shaped teardown: `rtl8xxxu_stop`, the
-//! chip's power-off (`restart_parked` path) and a fresh `rtl8xxxu_init_device`
-//! lifecycle before the next join.
+//! One owner serves idle channel changes, passive and active scans over the
+//! channels the signed record and domain grant (each a cold retune), scans
+//! while associated (PM1 Null, cold away visit, cold return with the same
+//! station/key owners, PM0 Null), one station at a time, and the
+//! Linux-shaped teardown: `rtl8xxxu_stop`, the chip's power-off
+//! (`restart_parked` path) and a fresh `rtl8xxxu_init_device` lifecycle
+//! before the next join.
 use super::{
     firmware_transport::{ControlIo, Owner as Firmware, UsbControl},
-    gen2_radio::{self, Grant, Radio},
+    gen2_radio::{self, Authority, Grant, Radio},
     gen2_station::{self, Station},
     management_runtime::{Candidate, SecurityMode},
     packet_transport::{Io as PacketIo, UsbIo},
 };
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_ipc::{Consumer, Producer};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -28,6 +31,17 @@ use zeroize::Zeroizing;
 
 /// Bound on retained scan candidates.
 const CANDIDATES: usize = 32;
+/// Candidate lifetime (as the RTL8188EU service cache).
+const CANDIDATE_MS: u64 = 10_000;
+/// A connect after a cold transition waits this long for a fresh beacon.
+const FRESH_MS: u64 = 2_000;
+/// Host TX receipt bound for scan probes.
+const PROBE_TX_MS: u64 = 1_000;
+/// mac80211 `scan.c`: away dwell cap HZ/8 while associated, HZ/10 after the
+/// PM1 Null (rtl8xxxu has no `.flush`) and HZ/5 on home return.
+const AWAY_MS: u64 = 125;
+const PM1_GRACE_MS: u64 = 100;
+const HOME_GRACE_MS: u64 = 200;
 
 fn now_ms() -> u64 {
     narf_time::wall::monotonic_ns() / 1_000_000
@@ -47,13 +61,259 @@ enum Slot<C: ControlIo, B: PacketIo> {
     Failed,
 }
 
+/// A copied observation, with the physical receive generation that held it.
+#[derive(Clone)]
+struct Entry {
+    candidate: Candidate,
+    seen: u64,
+    generation: u64,
+}
+
+/// What an active visit emits: the one directed SSID (or wildcard) and the
+/// checked extra IEs (`max_scan_ssids = 1` in `rtl8xxxu_probe`).
+#[derive(Clone, Copy)]
+struct Probe<'a> {
+    ssid: &'a [u8],
+    extra: &'a [u8],
+    /// `(pre, post)` listening windows from `probe_runtime::Prepared::timing`.
+    timing: (u64, u64),
+}
+
 struct State<C: ControlIo, B: PacketIo> {
     slot: Slot<C, B>,
-    candidates: Vec<Candidate>,
+    authority: Authority,
+    cache: Vec<Entry>,
+    /// Software SN for idle-scan probes (no station owns a sequence space).
+    probe_sequence: u16,
     rx: Producer<Frame, RX_RING_N>,
     tx: Consumer<Frame, TX_RING_N>,
 }
+
+fn remember(cache: &mut Vec<Entry>, candidate: Candidate, seen: u64, generation: u64) {
+    let entry = Entry {
+        candidate,
+        seen,
+        generation,
+    };
+    if let Some(old) = cache
+        .iter_mut()
+        .find(|old| old.candidate.bssid() == entry.candidate.bssid())
+    {
+        *old = entry;
+        return;
+    }
+    if cache.len() == CANDIDATES {
+        if let Some(oldest) = cache
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, old)| old.seen)
+            .map(|(i, _)| i)
+        {
+            cache.swap_remove(oldest);
+        }
+    }
+    cache.push(entry);
+}
+
+/// Poll one receiving radio for `ms`: every admitted beacon/probe response
+/// becomes a cached observation of this physical stream. No MPDU reaches a
+/// station, key or replay owner from here.
+async fn listen<C: ControlIo, B: PacketIo>(
+    radio: &mut Radio<C, B>,
+    cache: &mut Vec<Entry>,
+    ms: u64,
+) -> Result<(), gen2_radio::Error> {
+    let deadline = now_ms().saturating_add(ms);
+    while now_ms() < deadline {
+        if radio.recovery_pending() {
+            radio.maintain(now_ms()).await?;
+        }
+        match radio.poll()? {
+            Some(frames) => {
+                for frame in frames {
+                    if let Ok(bss) = Candidate::from_receive(&frame, radio.channel(), radio.local())
+                    {
+                        remember(cache, bss, now_ms(), radio.generation());
+                    }
+                }
+            }
+            None => pause().await,
+        }
+    }
+    Ok(())
+}
+
+/// One active visit on the current (unbound, receiving) radio: the source
+/// pre-probe delay, the native broadcast Probe Request on the management
+/// pipe, its exact host USB receipt, then the response window.
+async fn probe_visit<C: ControlIo, B: PacketIo>(
+    radio: &mut Radio<C, B>,
+    cache: &mut Vec<Entry>,
+    probe: Probe<'_>,
+    sequence: u16,
+) -> Result<(), gen2_radio::Error> {
+    listen(radio, cache, probe.timing.0).await?;
+    let prepared = super::probe_runtime::Prepared::new(
+        radio.local(),
+        radio.channel(),
+        probe.ssid,
+        sequence,
+        false,
+        probe.extra,
+    )
+    .map_err(|_| gen2_radio::Error::Profile)?;
+    radio.submit_probe(&prepared)?;
+    let deadline = now_ms().saturating_add(PROBE_TX_MS);
+    loop {
+        if radio.poll_delivery()?.is_some() {
+            break;
+        }
+        if now_ms() >= deadline {
+            radio.fail_terminal();
+            return Err(gen2_radio::Error::State);
+        }
+        if let Some(frames) = radio.poll()? {
+            for frame in frames {
+                if let Ok(bss) = Candidate::from_receive(&frame, radio.channel(), radio.local()) {
+                    remember(cache, bss, now_ms(), radio.generation());
+                }
+            }
+        } else {
+            pause().await;
+        }
+    }
+    listen(radio, cache, probe.timing.1).await
+}
+
 impl<C: ControlIo, B: PacketIo> State<C, B> {
+    /// Cache entries younger than `CANDIDATE_MS` on a still-granted channel.
+    fn candidates(&self) -> Vec<Candidate> {
+        let now = now_ms();
+        self.cache
+            .iter()
+            .filter(|e| {
+                now >= e.seen
+                    && now - e.seen < CANDIDATE_MS
+                    && self.authority.grant(e.candidate.channel()).is_ok()
+            })
+            .map(|e| e.candidate.clone())
+            .collect()
+    }
+    fn next_probe_sequence(&mut self) -> u16 {
+        let sequence = self.probe_sequence;
+        self.probe_sequence = (sequence + 1) & 4095;
+        sequence
+    }
+    /// Idle scan: every channel's grant precedes the first transition; each
+    /// visit is a cold retune (skipped for the current receiving channel),
+    /// then passive dwell or one probe visit; the home channel is restored.
+    async fn idle_scan(
+        &mut self,
+        grants: &[Grant],
+        dwell: u64,
+        probe: Option<Probe<'_>>,
+    ) -> Result<(), gen2_radio::Error> {
+        let home = {
+            let radio = self
+                .idle_receiving()
+                .await
+                .map_err(|_| gen2_radio::Error::State)?;
+            radio.grant()
+        };
+        for grant in grants {
+            let sequence = self.next_probe_sequence();
+            let Slot::Idle(radio) = &mut self.slot else {
+                return Err(gen2_radio::Error::State);
+            };
+            if radio.grant() != *grant {
+                radio.retune(*grant).await?;
+            }
+            match probe {
+                Some(probe) => probe_visit(radio, &mut self.cache, probe, sequence).await?,
+                None => listen(radio, &mut self.cache, dwell).await?,
+            }
+        }
+        let Slot::Idle(radio) = &mut self.slot else {
+            return Err(gen2_radio::Error::State);
+        };
+        if radio.grant() != home {
+            radio.retune(home).await?;
+        }
+        Ok(())
+    }
+    fn station(&mut self) -> Result<&mut Station<C, B>, gen2_station::Error> {
+        match &mut self.slot {
+            Slot::Station(station) => Ok(station),
+            _ => Err(gen2_station::Error::State),
+        }
+    }
+    /// Normal home service for `ms` (station progress, one Ethernet frame
+    /// per step), until both the window elapsed and no receipt is pending.
+    async fn home_listen(&mut self, ms: u64) -> Result<(), gen2_station::Error> {
+        let deadline = now_ms().saturating_add(ms);
+        loop {
+            self.service().await?;
+            if now_ms() >= deadline && self.station()?.quiescent() {
+                return Ok(());
+            }
+            pause().await;
+        }
+    }
+    /// Associated scan (`ieee80211_scan_state_*` + `offchannel`): a passive
+    /// visit to the home channel listens there in normal service; every
+    /// other visit (and every active visit) sends PM1, waits the no-flush
+    /// grace, leaves through `rtl8xxxu_stop`, cold-retunes to the visited
+    /// channel, listens (or probes from the unbound radio), cold-returns to
+    /// home with the same AID/rates, sends PM0 and serves home for HZ/5.
+    async fn associated_scan(
+        &mut self,
+        grants: &[Grant],
+        dwell: u64,
+        probe: Option<Probe<'_>>,
+    ) -> Result<(), gen2_station::Error> {
+        let home = self.station()?.radio().grant();
+        self.station()?.observe(true);
+        for grant in grants {
+            if probe.is_none() && *grant == home {
+                self.home_listen(dwell).await?;
+                continue;
+            }
+            self.home_listen(0).await?;
+            self.station()?.send_null(true, now_ms())?;
+            self.home_listen(PM1_GRACE_MS).await?;
+            let sequence = match probe {
+                Some(_) => Some(self.station()?.reserve_sequence()?),
+                None => None,
+            };
+            let station = self.station()?;
+            station.leave().await?;
+            let Slot::Station(station) = &mut self.slot else {
+                return Err(gen2_station::Error::State);
+            };
+            let radio = station.radio_mut();
+            let visit = async {
+                radio.retune(*grant).await?;
+                match (probe, sequence) {
+                    (Some(probe), Some(sequence)) => {
+                        probe_visit(radio, &mut self.cache, probe, sequence).await
+                    }
+                    _ => listen(radio, &mut self.cache, dwell).await,
+                }
+            }
+            .await;
+            if let Err(error) = visit {
+                radio.fail_terminal();
+                return Err(gen2_station::Error::Radio(error));
+            }
+            station.rejoin(home, now_ms()).await?;
+            station.send_null(false, now_ms())?;
+            self.home_listen(HOME_GRACE_MS).await?;
+        }
+        for (candidate, seen, generation) in self.station()?.observe(false) {
+            remember(&mut self.cache, candidate, seen, generation);
+        }
+        Ok(())
+    }
     fn clear_transmit(&mut self) {
         for _ in 0..TX_RING_N {
             if !matches!(self.tx.try_recv(), Ok(Some(_))) {
@@ -116,7 +376,11 @@ pub struct Device<C: ControlIo, B: PacketIo> {
     state: Mutex<State<C, B>>,
     name: String,
     mac: [u8; 6],
-    channel: u8,
+    /// The current home channel (initial grant, `set_config` or a join).
+    channel: AtomicU8,
+    /// Channels the signed record and domain granted at attach (advertised;
+    /// every use mints and rechecks its own grant).
+    channels: Vec<u8>,
     up: AtomicBool,
     bssid: AtomicU64,
     failed: AtomicBool,
@@ -133,21 +397,25 @@ impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Device<C, B> {
 }
 
 impl<C: ControlIo, B: PacketIo> Device<C, B> {
-    pub(super) fn new(name: &str, radio: Radio<C, B>) -> Self {
+    pub(super) fn new(name: &str, radio: Radio<C, B>, authority: Authority) -> Self {
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
         let mac = radio.local();
         let channel = radio.channel();
+        let channels = authority.channels();
         Self {
             state: Mutex::new(State {
                 slot: Slot::Idle(Box::new(radio)),
-                candidates: Vec::new(),
+                authority,
+                cache: Vec::new(),
+                probe_sequence: 0,
                 rx,
                 tx,
             }),
             name: name.into(),
             mac,
-            channel,
+            channel: AtomicU8::new(channel),
+            channels,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
             failed: AtomicBool::new(false),
@@ -285,6 +553,7 @@ fn drain() -> bool {
 /// association starts it.
 pub async fn attach(
     firmware: Arc<Firmware<UsbControl>>,
+    channels: Authority,
     grant: Grant,
 ) -> Result<Arc<Device<UsbControl, UsbIo>>, gen2_radio::Error> {
     let authority = narf_net::trusted_net_authority()
@@ -296,7 +565,7 @@ pub async fn attach(
         .map_err(|_| gen2_radio::Error::State)?;
     let radio = Radio::new(firmware, UsbIo::new(usb), grant)?;
     let name = narf_net::iface::reserve_name("wlan%d");
-    let device = Arc::new(Device::new(name, radio));
+    let device = Arc::new(Device::new(name, radio, channels));
     narf_net::registry()
         .register(&authority, Registered(device.clone()))
         .map_err(|_| gen2_radio::Error::Profile)?;
@@ -355,11 +624,17 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
     fn cipher_suites(&self) -> &'static [u32] {
         &[0x000fac04]
     }
+    fn max_scan_ssids(&self) -> u8 {
+        1
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        super::probe_runtime::MAX_IE as u16
+    }
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
         self.state
             .try_lock()?
-            .candidates
-            .iter()
+            .candidates()
+            .into_iter()
             .find(|b| b.bssid() == bssid)
             .map(|b| b.information_elements().to_vec())
     }
@@ -370,7 +645,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
             base_mac: self.mac,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![u32::from(self.channel)],
+                channels: self.channels.iter().map(|c| u32::from(*c)).collect(),
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
@@ -381,57 +656,105 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
             },
         }
     }
-    /// Passive dwell on the admitted channel (the only signed permission
-    /// this owner holds); other channels and active probes are refused.
+    /// Passive or active scan over the requested (or every granted)
+    /// channel. All grants, the probe frame and its timing are admitted
+    /// before the first hardware transition; idle scans cold-retune per
+    /// channel and restore home, associated scans visit as `associated_scan`.
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = validate_scan(&request, self.channel)?;
+        let (mut channels, dwell) = validate_scan(&request)?;
         if self.failed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
         let mut state = self.state.lock().await;
-        let mut found: Vec<Candidate> = Vec::new();
-        let result = async {
-            let radio = state.idle_receiving().await?;
-            let deadline = now_ms().saturating_add(dwell);
-            while now_ms() < deadline {
-                if radio.recovery_pending() {
-                    radio.maintain(now_ms()).await.map_err(radio_error)?;
-                }
-                match radio.poll().map_err(radio_error)? {
-                    Some(frames) => {
-                        for frame in frames {
-                            let Ok(bss) =
-                                Candidate::from_receive(&frame, radio.channel(), radio.local())
-                            else {
-                                continue;
-                            };
-                            found.retain(|b| b.bssid() != bss.bssid());
-                            if found.len() < CANDIDATES {
-                                found.push(bss);
-                            }
-                        }
-                    }
-                    None => pause().await,
-                }
-            }
-            Ok(())
+        if channels.is_empty() {
+            channels = state.authority.channels();
         }
-        .await;
+        let mut grants = Vec::new();
+        for channel in &channels {
+            grants.push(
+                state
+                    .authority
+                    .grant(*channel)
+                    .map_err(|_| WirelessError::NotSupported)?,
+            );
+        }
+        if grants.is_empty() {
+            return Err(WirelessError::NotSupported);
+        }
+        let associated = matches!(state.slot, Slot::Station(_));
+        if associated {
+            let Slot::Station(station) = &state.slot else {
+                return Err(WirelessError::Busy);
+            };
+            if !station.scan_admissible() {
+                return Err(WirelessError::Busy);
+            }
+            if request.duration_mandatory && dwell > AWAY_MS {
+                return Err(WirelessError::InvalidArgs);
+            }
+        } else if !matches!(state.slot, Slot::Idle(_)) {
+            return Err(WirelessError::HardwareError);
+        }
+        let ssid = request.ssids.first().map_or(&[][..], Vec::as_slice);
+        let probe = if request.active {
+            // The longest frame any visit emits bounds the source timing.
+            let prepared = super::probe_runtime::Prepared::new(
+                self.mac,
+                1,
+                ssid,
+                0,
+                false,
+                &request.extra_ies,
+            )
+            .map_err(|_| WirelessError::InvalidArgs)?;
+            let timing = prepared
+                .timing(dwell, request.duration_mandatory)
+                .map_err(|_| WirelessError::InvalidArgs)?;
+            let timing = if associated {
+                if request.duration_mandatory && timing.0 + timing.1 > AWAY_MS {
+                    return Err(WirelessError::InvalidArgs);
+                }
+                (timing.0, timing.1.min(AWAY_MS - timing.0))
+            } else {
+                timing
+            };
+            Some(Probe {
+                ssid,
+                extra: &request.extra_ies,
+                timing,
+            })
+        } else {
+            None
+        };
+        let result = if associated {
+            state
+                .associated_scan(&grants, dwell.min(AWAY_MS), probe)
+                .await
+                .map_err(station_error)
+        } else {
+            state
+                .idle_scan(&grants, dwell, probe)
+                .await
+                .map_err(radio_error)
+        };
         if let Err(error) = result {
-            if error == WirelessError::HardwareError {
-                self.fail(&mut state);
-            }
-            return Err(error);
+            // Any failure after the first transition is terminal.
+            self.fail(&mut state);
+            return Err(match error {
+                WirelessError::Busy | WirelessError::InvalidArgs => WirelessError::HardwareError,
+                other => other,
+            });
         }
-        state.candidates = found.clone();
-        Ok(found
+        Ok(state
+            .candidates()
             .into_iter()
             .filter(|b| {
-                request.ssids.is_empty()
-                    || request
-                        .ssids
-                        .iter()
-                        .any(|ssid| ssid.is_empty() || ssid == b.ssid())
+                channels.contains(&b.channel())
+                    && (request.ssids.is_empty()
+                        || request
+                            .ssids
+                            .iter()
+                            .any(|ssid| ssid.is_empty() || ssid == b.ssid()))
             })
             .map(bss_info)
             .collect())
@@ -440,7 +763,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         if self.failed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        if request.channel != u32::from(self.channel)
+        if !(1..=13).contains(&request.channel)
             || request.frequency_mhz != 2407 + request.channel * 5
         {
             return Err(WirelessError::NotSupported);
@@ -451,17 +774,105 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
             _ => return Err(WirelessError::NotSupported),
         };
         let mut state = self.state.lock().await;
-        let Some(candidate) = state
-            .candidates
-            .iter()
-            .find(|b| b.bssid() == request.bssid && b.ssid() == request.ssid)
-            .cloned()
-        else {
+        let Some(mut candidate) = state.candidates().into_iter().find(|b| {
+            b.bssid() == request.bssid
+                && b.ssid() == request.ssid
+                && u32::from(b.channel()) == request.channel
+        }) else {
             return Err(WirelessError::InvalidArgs);
         };
         if !matches!(state.slot, Slot::Idle(_)) {
             return Err(WirelessError::Busy);
         }
+        // Pure request admission before any hardware transition.
+        let grant = state
+            .authority
+            .grant(candidate.channel())
+            .map_err(|_| WirelessError::NotSupported)?;
+        let mut preflight = super::management_runtime::Join::prepare(
+            candidate.clone(),
+            self.mac,
+            &request.ssid,
+            mode,
+        )
+        .map_err(|_| WirelessError::InvalidArgs)?;
+        preflight
+            .append_sme_ies(&request.ie)
+            .map_err(|_| WirelessError::InvalidArgs)?;
+        // A cold transition starts a new receive stream: CONNECT then needs a
+        // fresh copy of this BSS from it (a hidden SSID found by a directed
+        // response is probed again), never an old cache entry's age.
+        let fresh = async {
+            let sequence = state.next_probe_sequence();
+            let State { slot, cache, .. } = &mut *state;
+            let Slot::Idle(radio) = slot else {
+                return Err(gen2_radio::Error::State);
+            };
+            if radio.grant() != grant {
+                radio.retune(grant).await?;
+            }
+            if radio.phase() == gen2_radio::Phase::Prepared {
+                radio.start().await?;
+            }
+            let current = |cache: &Vec<Entry>, generation| {
+                cache
+                    .iter()
+                    .find(|e| {
+                        e.candidate.bssid() == request.bssid
+                            && e.candidate.ssid() == request.ssid
+                            && e.generation == generation
+                    })
+                    .map(|e| e.candidate.clone())
+            };
+            if let Some(entry) = current(cache, radio.generation()) {
+                return Ok(Some(entry));
+            }
+            if candidate.probe_response() {
+                let prepared = super::probe_runtime::Prepared::new(
+                    radio.local(),
+                    radio.channel(),
+                    &request.ssid,
+                    0,
+                    false,
+                    &[],
+                )
+                .map_err(|_| gen2_radio::Error::Profile)?;
+                let timing = prepared
+                    .timing(0, false)
+                    .map_err(|_| gen2_radio::Error::Profile)?;
+                let probe = Probe {
+                    ssid: &request.ssid,
+                    extra: &[],
+                    timing,
+                };
+                probe_visit(radio, cache, probe, sequence).await?;
+            }
+            let deadline = now_ms().saturating_add(FRESH_MS);
+            loop {
+                if let Some(entry) = current(cache, radio.generation()) {
+                    return Ok(Some(entry));
+                }
+                if now_ms() >= deadline {
+                    return Ok(None);
+                }
+                listen(radio, cache, 10).await?;
+            }
+        }
+        .await;
+        match fresh {
+            Ok(Some(entry)) => candidate = entry,
+            Ok(None) => return Err(WirelessError::Timeout),
+            Err(error) => {
+                self.fail(&mut state);
+                return Err(match radio_error(error) {
+                    WirelessError::Busy | WirelessError::InvalidArgs => {
+                        WirelessError::HardwareError
+                    }
+                    other => other,
+                });
+            }
+        }
+        self.channel.store(candidate.channel(), Ordering::Release);
         // Refuse an unsupported BSS before the radio is handed to a station.
         super::management_runtime::Join::prepare(candidate.clone(), self.mac, &request.ssid, mode)
             .map_err(|_| WirelessError::InvalidArgs)?;
@@ -543,36 +954,88 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
             }
         }
     }
+    /// Qualified idle channel change (`rtl8xxxu_config` CHANGE_CHANNEL as a
+    /// cold retune under the channel's own grant). No TX power override; a
+    /// station keeps its channel.
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError> {
-        // Only the admitted channel exists; no TX power override.
-        if cfg.tx_power_dbm.is_some() || cfg.channel != u32::from(self.channel) {
+        if cfg.tx_power_dbm.is_some() || !(1..=13).contains(&cfg.channel) {
             return Err(WirelessError::NotSupported);
         }
-        Ok(())
+        if self.failed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let channel = cfg.channel as u8;
+        let mut state = self.state.lock().await;
+        let grant = state
+            .authority
+            .grant(channel)
+            .map_err(|_| WirelessError::NotSupported)?;
+        let Slot::Idle(radio) = &mut state.slot else {
+            return if self.channel.load(Ordering::Acquire) == channel {
+                Ok(())
+            } else {
+                Err(WirelessError::Busy)
+            };
+        };
+        if radio.grant() == grant {
+            return Ok(());
+        }
+        match radio.retune(grant).await {
+            Ok(()) => {
+                self.channel.store(channel, Ordering::Release);
+                Ok(())
+            }
+            Err(_) => {
+                self.fail(&mut state);
+                Err(WirelessError::HardwareError)
+            }
+        }
     }
 }
 
-fn validate_scan(request: &ScanRequest, channel: u8) -> Result<u64, WirelessError> {
+/// Bounded explicit channel/frequency lists (1..=13; empty = every granted
+/// channel), at most one SSID for an active request, extra IEs only with
+/// probes, no random address or 6 GHz.
+fn validate_scan(request: &ScanRequest) -> Result<(Vec<u8>, u64), WirelessError> {
     if request.random_mac.is_some()
         || request.colocated_6ghz
-        || request.active
-        || !request.extra_ies.is_empty()
+        || !request.active && !request.extra_ies.is_empty()
+        || request.active && request.ssids.len() > 1
+        || request.extra_ies.len() > super::probe_runtime::MAX_IE
         || request.ssids.iter().any(|s| s.len() > 32)
         || request.ssids.len() > 32
-        || request.channels.iter().any(|c| *c != u32::from(channel))
-        || request
-            .frequencies_mhz
-            .iter()
-            .any(|f| *f != 2407 + u32::from(channel) * 5)
     {
         return Err(WirelessError::NotSupported);
     }
-    match request.duration_tu {
-        Some(duration @ 1..=1000) => Ok((u64::from(duration) * 1024).div_ceil(1000)),
-        Some(_) => Err(WirelessError::InvalidArgs),
-        None if request.duration_mandatory => Err(WirelessError::InvalidArgs),
-        None => Ok(200),
+    let mut channels = Vec::<u8>::new();
+    if request.frequencies_mhz.is_empty() {
+        for channel in &request.channels {
+            if !(1..=13).contains(channel) {
+                return Err(WirelessError::NotSupported);
+            }
+            let channel = *channel as u8;
+            if !channels.contains(&channel) {
+                channels.push(channel);
+            }
+        }
+    } else {
+        for frequency in &request.frequencies_mhz {
+            if !(2412..=2472).contains(frequency) || (*frequency - 2407) % 5 != 0 {
+                return Err(WirelessError::NotSupported);
+            }
+            let channel = ((*frequency - 2407) / 5) as u8;
+            if !channels.contains(&channel) {
+                channels.push(channel);
+            }
+        }
     }
+    let dwell = match request.duration_tu {
+        Some(duration @ 1..=1000) => (u64::from(duration) * 1024).div_ceil(1000),
+        Some(_) => return Err(WirelessError::InvalidArgs),
+        None if request.duration_mandatory => return Err(WirelessError::InvalidArgs),
+        None => 200,
+    };
+    Ok((channels, dwell))
 }
 fn bss_info(b: Candidate) -> BssInfo {
     let security = if b.ap_rsne().is_some() {
@@ -640,3 +1103,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> Interface for Registered<C, 
         self.0.tx_ring()
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "gen2_interface_tests.rs"]
+mod tests;

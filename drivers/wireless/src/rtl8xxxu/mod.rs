@@ -279,11 +279,8 @@ pub fn rtl8xxxu_probe(
                 return;
             };
             // Netdev publication only after admission (RTL8188EU order).
-            let device = gen2_interface::attach(
-                firmware.clone(),
-                gen2_radio::Grant::Rtl8192e(admitted.permission),
-            )
-            .await;
+            let (authority, grant) = gen2_radio::Authority::from_8192e(admitted);
+            let device = gen2_interface::attach(firmware.clone(), authority, grant).await;
             let _ = writeln!(
                 narf_console::Writer,
                 "  rtl8192eu: station {:?}",
@@ -323,11 +320,8 @@ pub fn rtl8xxxu_probe(
             let Ok(admitted) = admitted else {
                 return;
             };
-            let device = gen2_interface::attach(
-                firmware.clone(),
-                gen2_radio::Grant::Rtl8723b(admitted.permission),
-            )
-            .await;
+            let (authority, grant) = gen2_radio::Authority::from_8723b(admitted);
+            let device = gen2_interface::attach(firmware.clone(), authority, grant).await;
             let _ = writeln!(
                 narf_console::Writer,
                 "  rtl8723bu: station {:?}",

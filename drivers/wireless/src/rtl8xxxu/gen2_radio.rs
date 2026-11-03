@@ -8,9 +8,12 @@
 //! `rtl8xxxu_bss_info_changed` ASSOC (`ra_connect_8192e`), the 2 s
 //! `rtl8xxxu_ra_iter` watchdog and `rtl8xxxu_stop` (`disable_rf`). The
 //! admitted signed permission (`N92P`/`N8BP`) is the only channel/rate
-//! authority; nothing here widens it. The packet owner never sets QoS/HT,
-//! so this station is a legacy 20 MHz non-QoS station on the admitted
-//! initial channel.
+//! authority; nothing here widens it. Other channels are reached only with
+//! a grant minted from the same signed record and authenticated domain
+//! (`Authority::grant`), through a cold `retune` (`rtl8xxxu_stop`, the
+//! chip power-off and a fresh `rtl8xxxu_init_device` lifecycle, then
+//! `rtl8xxxu_start` on the new channel). The packet owner never sets
+//! QoS/HT, so this station is a legacy 20 MHz non-QoS station.
 use super::{
     btcoex::Coex,
     firmware_transport::{ControlIo, Error as ControlError, Owner as Firmware, Stage},
@@ -41,8 +44,8 @@ pub enum Phase {
     Failed,
 }
 
-/// The chip's signed admission for the initial operating channel.
-#[derive(Debug, Clone, Copy)]
+/// The chip's signed admission for one operating channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grant {
     Rtl8192e(super::rtl8192e_policy::Permission),
     Rtl8723b(super::rtl8723b_policy::Permission),
@@ -66,6 +69,70 @@ impl Grant {
             Self::Rtl8192e(_) => ChipFamily::Rtl8192eu,
             Self::Rtl8723b(_) => ChipFamily::Rtl8723bu,
         }
+    }
+}
+
+/// The admitted signed record and authenticated regulatory domain, the only
+/// source of further channel grants. Each `grant` re-invokes the record's
+/// current firmware capability and intersects that channel's occupied
+/// 20 MHz band with every rule (`Calibration::permission`); a missing
+/// measured row or unsupported rule flag refuses the channel.
+pub enum Authority {
+    Rtl8192e {
+        record: super::rtl8192e_policy::Calibration,
+        domain: narf_wireless::reg::RegulatoryDomain,
+    },
+    Rtl8723b {
+        record: super::rtl8723b_policy::Calibration,
+        domain: narf_wireless::reg::RegulatoryDomain,
+    },
+}
+impl core::fmt::Debug for Authority {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Rtl8192e { record, .. } => record.fmt(f),
+            Self::Rtl8723b { record, .. } => record.fmt(f),
+        }
+    }
+}
+impl Authority {
+    pub fn from_8192e(admitted: super::rtl8192e_admission::Admitted) -> (Self, Grant) {
+        let grant = Grant::Rtl8192e(admitted.permission);
+        (
+            Self::Rtl8192e {
+                record: admitted.record,
+                domain: admitted.domain,
+            },
+            grant,
+        )
+    }
+    pub fn from_8723b(admitted: super::rtl8723b_admission::Admitted) -> (Self, Grant) {
+        let grant = Grant::Rtl8723b(admitted.permission);
+        (
+            Self::Rtl8723b {
+                record: admitted.record,
+                domain: admitted.domain,
+            },
+            grant,
+        )
+    }
+    /// The legacy 20 MHz grant for `primary` (the width the initial
+    /// admission uses), or `Profile`.
+    pub fn grant(&self, primary: u8) -> Result<Grant, Error> {
+        match self {
+            Self::Rtl8192e { record, domain } => record
+                .permission(domain, primary, super::rtl8192e_admission::INITIAL_WIDTH)
+                .map(Grant::Rtl8192e)
+                .map_err(|_| Error::Profile),
+            Self::Rtl8723b { record, domain } => record
+                .permission(domain, primary, super::rtl8723b_admission::INITIAL_WIDTH)
+                .map(Grant::Rtl8723b)
+                .map_err(|_| Error::Profile),
+        }
+    }
+    /// Channels 1..=13 this record and domain currently grant.
+    pub fn channels(&self) -> Vec<u8> {
+        (1..=13).filter(|c| self.grant(*c).is_ok()).collect()
     }
 }
 
@@ -165,6 +232,9 @@ pub struct Radio<C: ControlIo, B: PacketIo> {
     /// `priv->bt_coex` (RTL8723BU only).
     coex: Option<Coex>,
     bt: VecDeque<C2h>,
+    /// Physical receive-stream generation: advanced by every completed cold
+    /// restart, so an observation names the stream that copied it.
+    generation: u64,
 }
 impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Radio<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -228,6 +298,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             next_watchdog: 0,
             coex,
             bt: VecDeque::new(),
+            generation: 1,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -248,6 +319,15 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
     }
     pub fn tx_paths(&self) -> u8 {
         self.tx_paths
+    }
+    pub fn grant(&self) -> Grant {
+        self.grant
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub(super) fn bound(&self) -> bool {
+        self.peer.is_some()
     }
     pub(super) fn ra(&self) -> Option<&Ra> {
         self.ra.as_ref()
@@ -647,6 +727,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
                 }
                 self.coex = self.coex.map(|_| Coex::default());
                 self.rssi = Rssi::default();
+                self.generation = self.generation.saturating_add(1);
                 self.phase = Phase::Prepared;
                 Ok(())
             }
@@ -655,6 +736,78 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
                 Err(Error::Control(error))
             }
         }
+    }
+    /// Cold channel change of an unbound radio: `stop` (MAC TX/RX and RX
+    /// filter maps closed, host transfers retired by USB Stop/SetDeq,
+    /// `disable_rf`), the chip power-off and a fresh `rtl8xxxu_init_device`
+    /// lifecycle, so no device-FIFO byte from the old channel survives into
+    /// the new stream; then the new grant's channel label and, when the radio
+    /// was receiving, `rtl8xxxu_start` (`tune_8192e`/`tune_8723b` revalidate
+    /// the grant against the retained identity before any channel write).
+    /// A never-started radio only relabels. Any failure is terminal.
+    pub async fn retune(&mut self, grant: Grant) -> Result<(), Error> {
+        self.current()?;
+        if grant.chip() != self.chip() || self.peer.is_some() || self.ra.is_some() {
+            return Err(Error::State);
+        }
+        let resume = match self.phase() {
+            Phase::Prepared => false,
+            Phase::Receiving | Phase::Stopped => true,
+            _ => return Err(Error::State),
+        };
+        if self.phase() == Phase::Receiving {
+            self.stop().await?;
+        }
+        if self.phase() == Phase::Stopped {
+            self.park().await?;
+            self.restart_parked().await?;
+        }
+        if let Err(error) = self.packets.retarget_stopped(grant.primary()) {
+            self.fail_terminal();
+            return Err(Error::Packet(error));
+        }
+        self.grant = grant;
+        if resume {
+            self.start().await?;
+        }
+        Ok(())
+    }
+    /// The prepared broadcast Probe Request on the management pipe of an
+    /// unbound receiving radio (`probe_runtime::Prepared` is the only
+    /// broadcast management constructor; ordinary submission stays unicast).
+    pub(super) fn submit_probe(
+        &mut self,
+        probe: &super::probe_runtime::Prepared,
+    ) -> Result<(), Error> {
+        self.current()?;
+        if self.phase() != Phase::Receiving
+            || self.peer.is_some()
+            || !probe.matches(self.local, self.grant.primary(), false, false)
+        {
+            return Err(Error::State);
+        }
+        self.packets.submit_probe_8192e(probe).map_err(|error| {
+            if self.packets.is_failed() {
+                self.fail_terminal();
+            }
+            Error::Packet(error)
+        })
+    }
+    /// The station's plaintext (QoS) Null to the bound AP.
+    pub(super) fn submit_null(&mut self, null: &super::ps_null::Prepared) -> Result<(), Error> {
+        self.current()?;
+        let Some(peer) = self.peer else {
+            return Err(Error::State);
+        };
+        if self.phase() != Phase::Receiving || !null.matches(self.local, peer, null.qos()) {
+            return Err(Error::State);
+        }
+        self.packets.submit_null_8192e(null).map_err(|error| {
+            if self.packets.is_failed() {
+                self.fail_terminal();
+            }
+            Error::Packet(error)
+        })
     }
 }
 impl<C: ControlIo, B: PacketIo> Drop for Radio<C, B> {
