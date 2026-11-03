@@ -1954,6 +1954,28 @@ route calls them, they and a few related items carry a temporary
 planar formats, bigjoiner, DSC and VRR remain open. None of this has run on
 physical Intel hardware.
 
+### MTL external outputs — release gates recorded
+
+Meteor Lake and Arrow Lake can now drive an external monitor over DP SST on
+DDI B and the four Type-C ports, and over HDMI TMDS up to 340 MHz using the
+Linux C10/C20 PLL tables. NARF owns the Type-C PHY handoff and the PICA and
+south hotplug interrupts. AUX power uses the display-14 per-channel request.
+The Type-C port map was corrected to match Linux. The runtime polls hotplug,
+brings a route up or down, and publishes or withdraws its scanout. Suspend and
+GT reset retire the route.
+
+Integration found one ordering bug, now fixed: the internal MTL modeset read
+the panel EDID before raising the AUX power request. All eight release groups
+pass 2,008 unique tests, with no failures and only the existing shared
+RNG-registration skip. A new eighth group holds the Type-C, hotplug, external
+and HDMI tests. The release production boot and both btrfs postflights also
+pass. The debug group pass is deferred to the end of this integration wave.
+
+Still open: the external route does not yet hold its own DC_off reference
+(the join with the DC-state service comes next). It also does not yet run on
+the Pipe B-D resource owner. HDMI above 340 MHz, Thunderbolt-alt and DP
+UHBR/MST remain. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

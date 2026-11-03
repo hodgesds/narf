@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.40** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.41** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -33,8 +33,9 @@
 > pass debug and release native/integration gates; the unpublished
 > MTL/Arrow standalone media GT lifecycle owner, display-14 DMC,
 > DC_off and lit-panel DC5/DC6 services, and display14 resource
-> transactions with live repartitioning and SAGV pass release native
-> model gates — see §20).
+> transactions with live repartitioning and SAGV, and MTL external
+> DP/HDMI outputs with Type-C ownership and owned hotplug pass release
+> native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3590,7 +3591,7 @@ request after a clock decrease. Group 6 now also selects `drivers/gpu/intel_gpu_
 `drivers/gpu/intel_gpu_xelpg_pipes` and `drivers/gpu/intel_gpu_xelpg_bw`. The
 debug group pass is deferred to the end of the current integration wave.
 
-### MTL external outputs: Type-C ownership, owned hotplug and DP SST admission
+### MTL external outputs: Type-C ownership, owned hotplug and DP SST admission — release gates recorded
 
 This slice advances the Output support row for display version 14 (Meteor/Arrow
 Lake). Sources are Linux b90c984d `intel_tc.c` (`xelpdp_tc_phy_ops`),
@@ -3708,3 +3709,23 @@ Follow-up in the same slice:
 New native tests: `drivers/gpu/intel_gpu`
 (`smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws`) and
 `drivers/gpu/intel_gpu_xelpg_hdmi` (6).
+
+Integration. The corrected `smoke_mtl_modeset_ddi_a_full_run` exposed that
+the internal MTL modeset read the panel EDID over AUX before raising the AUX
+power request. `XeLpgModeset::modeset` now raises it before the EDID read, as
+`intel_dp_aux_xfer` holds the AUX power domain across every transfer. All
+eight release groups pass 2,008 unique tests with no failures and no Intel
+skips; the only skip is the existing shared RNG-registration skip. A new
+eighth group selects `drivers/gpu/intel_gpu_xelpg_tc`,
+`drivers/gpu/intel_gpu_xelpg_hpd`, `drivers/gpu/intel_gpu_xelpg_external` and
+`drivers/gpu/intel_gpu_xelpg_hdmi`. The debug group pass is deferred to the
+end of the current integration wave.
+
+Open until the DC-state join lands: the DC-off bracket still runs its closure
+directly. The probe drain and the runtime pass enter through `legacy()` and
+`legacy_drain()`, which hold a KMS DC_off reference, and the DC service
+refuses re-entry while `external_routes_stopped` reports the MTL route. The
+suspend and GT-reset retirement (`retire_mtl_external`) runs without a
+reference. On Gen12, `routes_stopped()` can report a transient "not stopped"
+when two callers contend for the service's `try_lock`. The Gen12 hook paths
+otherwise return before any register access.
