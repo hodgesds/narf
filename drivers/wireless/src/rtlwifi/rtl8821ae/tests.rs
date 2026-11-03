@@ -1900,9 +1900,9 @@ fn smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore() -> TestResult {
             .filter(|w| w.1 == 0xc90 && (w.2 >> 20) & 0xff == 0x18 && w.2 & 0xc00 == value)
             .count()
     };
-    for (bw40, restores) in [(false, 0), (true, 10)] {
+    for (width, restores) in [(Width::W20, 0), (Width::W40Above, 10)] {
         let io = iqk_model(0x7f0 << 16);
-        if narf_scheduler::block_on(iqk::calibrate_at(&io, false, bw40)).is_err() {
+        if narf_scheduler::block_on(iqk::calibrate_at(&io, false, width)).is_err() {
             return TestResult::Fail("IQK failed on model");
         }
         if rf18(&io.0.lock().1, 0x400) != restores {
@@ -1914,6 +1914,67 @@ fn smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_ht40_regrant_and_iqk_bandwidth_restore
+);
+
+/// 80 MHz IQK (`_rtl8821ae_iqk_tx` with `vdf_enable`): three TX tones and
+/// three RX-mode TXK + RX IQK tones per round, the post-LOK RF 0x18[11:10]
+/// = 0 restore, the `tx_dt`/`rx_dt` arithmetic and the 0xce8 VDF bits.
+fn smoke_rtl8821ae_iqk_80mhz_vdf_branch() -> TestResult {
+    use envelope::Width;
+    // dt arithmetic: y1 - y0 = 1 → 2 * 16 * 10000 / 15708 = 20 → 10.
+    if iqk::vdf_dt(0, 1, iqk::TX_DT_DIV) != 10
+        || iqk::vdf_dt(0, 1, iqk::RX_DT_DIV) != 12
+        || iqk::vdf_dt(1, 0, iqk::TX_DT_DIV) != -10
+        || iqk::vdf_dt(5, 5, iqk::RX_DT_DIV) != 0
+    {
+        return TestResult::Fail("VDF tx_dt / rx_dt arithmetic");
+    }
+    let io = iqk_model(0x7f0 << 16);
+    let report = match narf_scheduler::block_on(iqk::calibrate_at(&io, true, Width::W80)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("80 MHz IQK failed on model"),
+    };
+    if report.tx_rounds != 10
+        || report.rx_rounds != 10
+        || report.tx != (iqk::Fill::Matched { x: -16, y: -16 })
+        || report.rx != (iqk::Fill::Matched { x: -16, y: -16 })
+    {
+        return TestResult::Fail("80 MHz IQK rounds/averages");
+    }
+    let g = io.0.lock();
+    let (r, trace) = (&g.0, &g.1);
+    // Per round: LOK + 3 TX tones + 3 x (RXK1 + RX) = 10 one-shots.
+    if trace.iter().filter(|w| w.1 == 0x980).count() != 10 * 10 * 2 {
+        return TestResult::Fail("80 MHz one-shot count");
+    }
+    let rf18_bw = trace
+        .iter()
+        .filter(|w| w.1 == 0xc90 && (w.2 >> 20) & 0xff == 0x18)
+        .map(|w| w.2 & 0xc00)
+        .collect::<Vec<_>>();
+    // LOK at 20 MHz (3) then the 80 MHz restore (0) each round.
+    if rf18_bw.len() != 20 || rf18_bw.chunks(2).any(|c| c != [0xc00, 0]) {
+        return TestResult::Fail("RF 0x18 80 MHz restore");
+    }
+    // Equal tone samples: dt = 0; TX VDF left enabled, RX VDF enabled.
+    let ce8 = u32::from_le_bytes(r[0xce8..0xcec].try_into().unwrap());
+    if ce8 & (1 << 31) == 0 || ce8 & (1 << 30) == 0 || ce8 & 0x3fff_3fff != 0 {
+        return TestResult::Fail("0xce8 VDF enables / delay terms");
+    }
+    for (at, value) in [
+        (0xc80, 0x1800_8c38),
+        (0xc80, 0x0800_8c38),
+        (0xc80, 0x1800_8c20),
+    ] {
+        if !trace.contains(&(4, at, value)) {
+            return TestResult::Fail("VDF tone programming");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_iqk_80mhz_vdf_branch
 );
 
 // ── recovery card disable / enable ───────────────────────────────────────

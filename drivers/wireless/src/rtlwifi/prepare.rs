@@ -428,7 +428,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.phase = Phase::MacConfigured;
         Ok(())
     }
-    /// `rtl8821ae_phy_iq_calibrate` at the admitted band and 20/40 MHz width of this
+    /// `rtl8821ae_phy_iq_calibrate` at the admitted band and 20/40/80 MHz width of this
     /// retained 8821AE owner (`rtl8821ae/iqk.rs`). The station owner calls it
     /// when [`super::rtl8821ae::iqk::LinkedInterval::tick`] fires, as Linux DM
     /// does. All backed-up MAC/BB/AFE/RF state is restored before return; an
@@ -445,19 +445,11 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         {
             return Err(Error::State);
         }
-        use super::rtl8821ae::envelope::{Band, Width};
+        use super::rtl8821ae::envelope::Band;
         let op = self.rtl8821ae_power.ok_or(Error::State)?.operating();
-        // The 80 MHz VDF branch of `_rtl8821ae_iqk_tx` is not implemented:
-        // refused before any I/O, the owner is left as it is.
-        if op.width == Width::W80 {
-            return Err(Error::State);
-        }
-        let report = super::rtl8821ae::iqk::calibrate_at(
-            &self.io,
-            op.band == Band::B5g,
-            op.width != Width::W20,
-        )
-        .await;
+        // 80 MHz runs `_rtl8821ae_iqk_tx`'s VDF branch.
+        let report =
+            super::rtl8821ae::iqk::calibrate_at(&self.io, op.band == Band::B5g, op.width).await;
         if report.is_err() {
             self.phase = Phase::Failed;
         }

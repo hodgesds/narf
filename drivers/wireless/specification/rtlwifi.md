@@ -1583,8 +1583,8 @@ chain below is composed.
   block (`channel::data_sc80`), `RRFMOD` `0x00300202` and `[5:2]`,
   `RADC_BUF_CLK[30] = 1`, `RCCAONSEC`, 1T1R `RL1PEAKTH` 7 (5 when
   `reg_837` BIT(2)), RF `0x18[11:10] = 0`. IQK runs at the permission's
-  band (`0xc8c` 5 GHz values); at 80 MHz it is refused before any I/O
-  (VDF branch not implemented). `rtl8821ae_phy_lc_calibrate` is empty in
+  band (`0xc8c` 5 GHz values); at 80 MHz it runs the VDF branch (`iqk`
+  below). `rtl8821ae_phy_lc_calibrate` is empty in
   Linux. Test `smoke_rtl8821ae_5ghz_band_channel_and_bw80` (written,
   unexecuted). The 5 GHz station (below) requests these permissions. The station owner requests a 40 MHz permission
   for an HT40 AP (HT20/40 station, below). No board values are supplied by the
@@ -1627,8 +1627,22 @@ chain below is composed.
   `rx_fail == 0` check is real; (4) Linux indexes RX samples by round but
   averages `0..rx_average`, reading uninitialised slots after a failed RX
   round — here only successful RX samples, in round order, are compared.
-  The 20 and 40 MHz branches exist (40 MHz: the RF `0x18` restore, see
-  HT40 below); the 80 MHz VDF branch is not implemented. Tests
+  All `current_chan_bw` branches exist (40 MHz: RF `0x18[11:10] = 1`
+  after LOK, see HT40 below; 80 MHz: `= 0`). At 80 MHz (`vdf_enable`) each
+  round runs Linux's VDF paths: TX IQK as three tones on page C1 (`0xc80/
+  0xc84` `0x18008c38`/`0x38008c38` with `0xce8[31] = 0`; BIT(28) cleared;
+  `0x18008c20`/`0x38008c20` with `0xce8[31] = 1` and `tx_dt` in
+  `0xce8[29:16]`), the third tone being `tx_x0[cal]`; then TX VDF off and
+  three tones of RX-mode TXK (`0xcb8[3:0] = 0xd`, `0xc88 = 0x821603e0`,
+  `0xc8c = 0x68163e96`; tone 1 `0x08008c38`/`0x28008c38`, tone 2 `rx_dt` in
+  `0xce8[13:0]`) + RX IQK (`0xcb8[3:0] = 0xe`, `0xc80[29] = 1`,
+  `0xc84[29] = 0`, RX VDF `0xce8[30] = 1` on tone 2), the third RX tone
+  being `rx_x0[cal]` and its pass/fail `rx0iqkok`; TX VDF back on.
+  `iqk::vdf_dt` is `tx_dt`/`rx_dt`: `(16 * 2(y1 - y0)) * 10000 / {15708,
+  13823}`, then `(dt >> 1) + (dt & 1)` (C int semantics). The `vdf_x/y`
+  scratch is shared between the TX and RX loops as in Linux, so a failed
+  RX tone leaves the TX sample in its slot for `rx_dt`. Tests
+  `smoke_rtl8821ae_iqk_80mhz_vdf_branch`,
   `smoke_rtl8821ae_iqk_fill_and_full_restore`,
   `smoke_rtl8821ae_iqk_rx_fail_retries_and_untouched`,
   `smoke_rtl8821ae_iqk_linked_interval_and_agreement` (written, unexecuted).
@@ -1907,7 +1921,7 @@ chain below is composed.
     `rtl8821ae_wide` and `retune_rtl8821ae` build the 5 GHz operating
     point (band of the held permission), and `channel::configure` runs the
     5 GHz band switch / `sw_chnl` / `set_bw_mode` above. 80 MHz is not
-    requested (IQK 80 MHz VDF branch and VHT not implemented). Test
+    requested yet (VHT not implemented; the IQK 80 MHz VDF branch is). Test
     `smoke_rtl8821ae_5ghz_station_plan_probe_ra_mask_and_rates`
     (`rtl8821ae/tests.rs`, written, unexecuted).
   - Fixed a shared native allocation: RX slots are now allocated with the
