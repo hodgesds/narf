@@ -451,6 +451,7 @@ impl Prefill {
 /// fits, so a latency table that ends early also reports true, exactly as
 /// Linux does. `wm0_lines` is the worst level-0 lines over the pipe's
 /// planes (`skl_max_wm0_lines`).
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn wm_level_disabled(
     timing: Timing,
     latency: &Latency,
@@ -459,7 +460,8 @@ pub(crate) fn wm_level_disabled(
     wm_level_disabled_dsc(timing, latency, wm0_lines, false)
 }
 
-/// [`wm_level_disabled`] for a pipe that compresses (`dsc`) or not.
+/// `skl_wm_check_vblank`'s `wm_level_disabled` (see `wm_level_disabled`)
+/// for a pipe that compresses (`dsc`) or not.
 pub(crate) fn wm_level_disabled_dsc(
     timing: Timing,
     latency: &Latency,
@@ -474,6 +476,7 @@ pub(crate) fn wm_level_disabled_dsc(
 /// blocks/lines, as Linux does); SAGV levels likewise when the block time
 /// does not fit. No fitting level is a typed refusal. Returns the pipe's
 /// `wm_level_disabled` (Wa_14015648006's input, see [`wm_level_disabled`]).
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn check_vblank(
     timing: Timing,
     latency: &Latency,
@@ -482,7 +485,8 @@ pub(crate) fn check_vblank(
     check_vblank_dsc(timing, latency, planes, false)
 }
 
-/// [`check_vblank`] for a pipe that compresses (`dsc`) or not.
+/// `skl_wm_check_vblank` (see `check_vblank`) for a pipe that compresses
+/// (`dsc`) or not.
 pub(crate) fn check_vblank_dsc(
     timing: Timing,
     latency: &Latency,

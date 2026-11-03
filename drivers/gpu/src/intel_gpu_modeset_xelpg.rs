@@ -289,6 +289,7 @@ pub(crate) fn acknowledged_cdclk<M: MmioWindow + ?Sized>(mmio: &M) -> Result<u32
 /// raises; a faster acknowledged firmware CDCLK is left alone.
 /// Refuse if no table rung can meet the required floor; a table miss
 /// cannot authorize later programming below that floor.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn program_cdclk_floor<M: MmioWindow + ?Sized>(
     mmio: &M,
     mode: &Mode,
@@ -296,7 +297,7 @@ pub(crate) fn program_cdclk_floor<M: MmioWindow + ?Sized>(
     program_cdclk_floor_khz(mmio, mode.pixel_clock_khz.div_ceil(2))
 }
 
-/// [`program_cdclk_floor`] for an explicit floor (a compressed panel adds
+/// `program_cdclk_floor` for an explicit floor (a compressed panel adds
 /// `intel_vdsc_min_cdclk` to the pixel-clock rule).
 pub(crate) fn program_cdclk_floor_khz<M: MmioWindow + ?Sized>(
     mmio: &M,

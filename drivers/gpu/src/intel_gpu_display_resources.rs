@@ -89,10 +89,12 @@ fn display14(io: &(impl MmioWindow + ?Sized)) -> Result<bool, FsError> {
 }
 /// The owned modeset's pipe-A configuration: one full-screen XRGB8888
 /// primary, the budgeted hidden cursor and the combo PHY of DDI A/B.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn request(mode: &Mode, tiling: Tiling, min_cdclk_khz: u32) -> res::Request {
     request_dsc(mode, tiling, min_cdclk_khz, None)
 }
-/// [`request`] for a panel compressing with `dsc`.
+/// The owned modeset's request (`request`) for a panel compressing with
+/// `dsc`.
 pub(crate) fn request_dsc(
     mode: &Mode,
     tiling: Tiling,
@@ -662,6 +664,7 @@ impl Primary {
 /// or publish a cursor on a failed baseline. `min_cdclk_khz` is a caller
 /// CDCLK floor (Linux `force_min_cdclk`); 0 lets the computed minimum both
 /// raise and lower the clock.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn initialize(
     io: &(impl MmioWindow + ?Sized),
     mode: &Mode,
@@ -670,7 +673,7 @@ pub(crate) fn initialize(
     initialize_dsc(io, mode, min_cdclk_khz, None)
 }
 
-/// [`initialize`] for a panel the modeset will compress with `dsc`: the
+/// `initialize` for a panel the modeset will compress with `dsc`: the
 /// transaction carries its VDSC CDCLK and prefill terms. Pipe A's engines
 /// are programmed later in the modeset, so the final proof takes the
 /// planned term instead of reading it back.
