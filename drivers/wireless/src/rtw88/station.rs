@@ -1774,6 +1774,33 @@ impl State {
         }
         Ok(Some((channel, policy)))
     }
+    /// A wide 5GHz span over the 20MHz `channels` may carry frame TX: under
+    /// the installed policy snapshot either no constituent is passive-only,
+    /// or every constituent is passive-only and heard in its latest
+    /// covering scan (`BeaconWitness::may_associate`, cfg80211
+    /// `beacon_found` per 20MHz channel). A span mixing plain and
+    /// passive-only constituents is refused (the primary's passive TX grant
+    /// would not cover the passive half). 2.4GHz spans are always plain.
+    fn wide_witnessed(&self, io: &mut impl Io, channels: &[u8]) -> Result<bool, Error> {
+        let Some(policy) = io.station_regulatory()? else {
+            return Ok(true);
+        };
+        let passive = channels
+            .iter()
+            .filter(|c| passive_only(Some(&policy), **c))
+            .count();
+        if passive == 0 {
+            return Ok(true);
+        }
+        if passive != channels.len() {
+            return Ok(false);
+        }
+        let mut centers = Vec::with_capacity(channels.len());
+        for c in channels {
+            centers.push(super::channel_policy::any_frequency(*c).ok_or(Error::Profile)?);
+        }
+        Ok(self.witness.may_associate(&policy, &centers))
+    }
     /// One dwell on the committed primary. Under a policy snapshot the dwell
     /// is a new witness scan generation for the primary (retracting its
     /// earlier witness until a Beacon is heard again, cfg80211
@@ -1849,10 +1876,13 @@ impl State {
         if passive.is_some() {
             self.admission.run(|| io.station_passive_tx(passive))?;
         }
-        // 2.4GHz HT40 (N2xB): the AP's HT Operation names a secondary whose
-        // 20MHz half is itself an admitted channel (channel 1 or a loadable
-        // N2xO record over the still base-only gate), and the firmware
-        // reports `hw_cap.bw` 40 (`rtw_init_ht_cap`).
+        // HT40 (N2xB): the AP's HT Operation names a secondary whose 20MHz
+        // half is itself an admitted channel (channel 1 or a loadable N2xO
+        // record over the still base-only gate), and the firmware reports
+        // `hw_cap.bw` 40 (`rtw_init_ht_cap`). On 5GHz a passive-only
+        // (RADAR / NO_IR) span needs both halves passive and both halves
+        // beacon-witnessed (`wide_witnessed`); otherwise the BSS is joined
+        // at 20MHz.
         let secondary = match super::ht40::ht_operation(&candidate.bss.information_elements) {
             Some((primary, Some(secondary)))
                 if primary == self.channel
@@ -1864,7 +1894,8 @@ impl State {
                         || self
                             .admission
                             .run(|| io.station_channel_grant(secondary))?
-                            .is_some()) =>
+                            .is_some())
+                    && self.wide_witnessed(io, &[primary, secondary])? =>
             {
                 Some(secondary)
             }
@@ -1917,8 +1948,9 @@ impl State {
         // N2xB HT40 needs the HT program (same MCS set), this primary and the
         // AP's admitted secondary. Identity only here, like N2xC.
         let ht40 = match (&proposed, secondary) {
-            (Some(h), Some(secondary)) => {
-                io.station_continuation(&super::ht40::KIND)?.and_then(|g| {
+            (Some(h), Some(secondary)) => io
+                .station_continuation(super::ht40::kind(self.channel))?
+                .and_then(|g| {
                     let gate = io.station_gate().ok()?;
                     let r = super::ht40::Record::decode(gate.did(), g.payload())?;
                     (g.matches(&gate)
@@ -1926,8 +1958,7 @@ impl State {
                         && r.secondary == secondary
                         && r.mcs == h.mcs())
                     .then_some((g, r))
-                })
-            }
+                }),
             _ => None,
         };
         let mut plan = match (&proposed, &ht40) {

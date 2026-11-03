@@ -92,6 +92,9 @@ pub(super) struct Envelope {
     /// HT20 1S factory ceilings per 5GHz group (`band5::Power5g::bw20`,
     /// path A, txgi factor 1, max index 0x3f).
     ht5_groups: [Option<u8>; 14],
+    /// HT40 1S factory ceilings per 5GHz group (`band5::Power5g::bw40`,
+    /// path A, txgi factor 1, max index 0x3f).
+    ht40_5_groups: [Option<u8>; 14],
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
     group_limits(factory, 0) // C21 factor1, channel1 group0, max_power_index0x3f.
@@ -193,6 +196,13 @@ impl Source {
                     .and_then(|p| p.bw20(g, false, 1))
                     .map(|v| v.min(63))
             });
+            e.ht40_5_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(0)
+                    .and_then(super::band5::Power5g::parse)
+                    .and_then(|p| p.bw40(g, false, 1))
+                    .map(|v| v.min(63))
+            });
             e
         })
     }
@@ -214,6 +224,10 @@ impl Envelope {
     /// Factory 5GHz HT20 1S index ceiling for one 5GHz channel group.
     pub(super) fn ht5_group(&self, group: usize) -> Option<u8> {
         self.ht5_groups.get(group).copied().flatten()
+    }
+    /// Factory 5GHz HT40 1S index ceiling for one 5GHz channel group.
+    pub(super) fn ht40_5_group(&self, group: usize) -> Option<u8> {
+        self.ht40_5_groups.get(group).copied().flatten()
     }
     /// Factory HT40 1S index ceiling (`bw40_base[group]`, txgi factor 1).
     pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
@@ -305,6 +319,7 @@ impl Envelope {
             ht40_groups: [None; 5],
             band5_groups: [None; 14],
             ht5_groups: [None; 14],
+            ht40_5_groups: [None; 14],
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {

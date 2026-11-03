@@ -629,7 +629,7 @@ impl Grant {
                 return Err(Error::Prerequisite);
             }
         }
-        super::ht40::check_power(&mut read, 0xc822, r)?;
+        super::ht40::check_power(&mut read, 0xc822, r, self.base.ofdm5_indices())?;
         if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }

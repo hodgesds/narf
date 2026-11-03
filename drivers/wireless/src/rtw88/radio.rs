@@ -2,6 +2,7 @@
 //! Fixed awake channel1/20MHz CCK1, TX-A/RX-AB radio continuation.
 //! Linux rtw8822c.c: TRX selection, channel, factory trim and RF calibration.
 use super::{
+    band5::Width,
     efuse::Factory,
     firmware_transport::{Error, Io},
     power_policy,
@@ -211,7 +212,7 @@ pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
     if !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
-    set_channel(io, ch, None).await
+    set_channel(io, ch, Width::Twenty).await
 }
 /// `rtw8822c_set_channel(center, RTW_CHANNEL_WIDTH_40, sc)` on 2.4GHz:
 /// `sc` is `RTW_SC_20_UPPER` (1) or `RTW_SC_20_LOWER` (2).
@@ -219,7 +220,7 @@ pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
     if !(3..=11).contains(&center) || !matches!(sc, 1 | 2) {
         return Err(Error::Unsupported);
     }
-    set_channel(io, center, Some(sc)).await
+    set_channel(io, center, Width::Forty(sc)).await
 }
 /// Linux `rtw8822c_set_channel(ch, RTW_CHANNEL_WIDTH_20, 0)` on a 5GHz
 /// primary: `_bb` 5GHz branch ([`BB_5G`]: CCK TX/RX checks on, RX IQ
@@ -232,7 +233,27 @@ pub(super) async fn channel5_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
     if !super::band5::primary(ch) {
         return Err(Error::Unsupported);
     }
-    set_channel(io, ch, None).await
+    set_channel(io, ch, Width::Twenty).await
+}
+/// `rtw8822c_set_channel(center, BW40|BW80, sc)` on 5GHz: the 5GHz `_bb`
+/// head of the *center* channel (OFDM RXAGC by band, SCOTRK of the center),
+/// the BW40 tail (CCKSB, TXBWCTL 5/sc, NBI on, SBD 1, PT_OPT 1) or BW80
+/// tail (TXBWCTL 0xa/sc, SBD 6, PT_OPT 1; CCKSB, NBI, DFIRBW and TXCLK
+/// untouched as in Linux), `rtw_set_channel_mac` (DATA_SC with TXSC_40M at
+/// 80MHz, RFMOD 40/80), `_rf` (RF18 BW40 bit13 / BW80 bit12 on the center,
+/// RXBB 0x10 / 0x8) and `rtw8822c_toggle_igi`. `center` must be the
+/// center of a 5GHz 40MHz pair ([`super::band5::center40`]) or 80MHz block
+/// ([`super::band5::center80`]).
+pub(super) async fn wide5_to(io: &mut impl Io, center: u8, width: Width) -> Result<(), Error> {
+    let ok = match width {
+        Width::Forty(_) => super::band5::is_center40(center),
+        Width::Eighty(_) => super::band5::is_center80(center),
+        Width::Twenty => false,
+    };
+    if !ok || !width.valid() {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, center, width).await
 }
 /// `rtw8822c_set_channel_bb` 5GHz head: (reg, mask, value).
 fn bb_5g(ch: u8) -> Option<[(u16, u32, u32); 9]> {
@@ -268,6 +289,39 @@ pub(super) fn verify_channel5(io: &mut impl Io, ch: u8) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Readback of [`wide5_to`]: RF18 of both paths, the center's 5GHz head,
+/// the width tail fields Linux writes and the MAC sideband/RFMOD.
+pub(super) fn verify_wide5(io: &mut impl Io, center: u8, width: Width) -> Result<(), Error> {
+    let bb = bb_5g(center).ok_or(Error::Unsupported)?;
+    for path in 0..2u8 {
+        if rf_read(io, path, 0x18)? & 0x733ff != rf18_8822c(center, width.mhz()) {
+            return Err(Error::Prerequisite);
+        }
+    }
+    for (reg, bits, value) in bb {
+        if read(io, reg)? & bits != value << bits.trailing_zeros() {
+            return Err(Error::Prerequisite);
+        }
+    }
+    let sc = u32::from(width.sc());
+    let (txbw, sbd) = match width {
+        Width::Forty(_) => (5, 1),
+        Width::Eighty(_) => (0xa, 6),
+        Width::Twenty => return Err(Error::Unsupported),
+    };
+    if read(io, 0x9b0)? & 0xffcf != txbw | (sc | sc << 4) << 8
+        || (read(io, 0x88c)? >> 12) & 15 != sbd
+        || read(io, 0xcbc)? & (1 << 21) == 0
+        || matches!(width, Width::Forty(_))
+            && ((read(io, 0x1a00)? >> 4) & 1 != u32::from(sc == 1)
+                || read(io, 0x1abc)? & (1 << 30) == 0)
+        || io.read8(0x483)? != width.data_sc()
+        || (read(io, 0x668)? >> 7) & 3 != width.rfmod()
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
 /// RF18 bits under mask 0x733ff that Linux `rtw8822c_set_channel_rf`
 /// programs: band (5GHz bits16|8), channel byte, RFSI (`IS_CH_5G_BAND_3`
 /// bit17, `_4` bit18) and BW (20MHz bits13:12 = 3, 40MHz bit13, 80MHz
@@ -286,25 +340,25 @@ pub(super) const fn rf18_8822c(ch: u8, bw_mhz: u8) -> u32 {
     };
     band | rfsi | bw | ch as u32
 }
-async fn set_channel(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
+async fn set_channel(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
     if let Some(bb) = bb_5g(ch) {
-        if wide.is_some() {
-            return Err(Error::Unsupported);
-        }
         for (reg, bits, value) in bb {
             mask(io, reg, bits, value)?;
         }
     } else {
-        bb_2g(io, ch, wide)?;
+        if matches!(width, Width::Eighty(_)) {
+            return Err(Error::Unsupported);
+        }
+        bb_2g(io, ch, width != Width::Twenty)?;
     }
-    set_channel_tail(io, ch, wide).await
+    set_channel_tail(io, ch, width).await
 }
-fn bb_2g(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
+fn bb_2g(io: &mut impl Io, ch: u8, wide: bool) -> Result<(), Error> {
     if !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
     // rtw8822c_set_channel_bb 2.4GHz: RXAGC CCK/OFDM 5/6 at BW20, 4/0 at BW40.
-    let (cck, ofdm) = if wide.is_some() { (4, 0) } else { (5, 6) };
+    let (cck, ofdm) = if wide { (4, 0) } else { (5, 6) };
     for (reg, bits, value) in [
         (0x1a14, 0x300, 0),
         (0x1a9c, 1 << 20, 1),
@@ -330,9 +384,9 @@ fn bb_2g(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn set_channel_tail(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
-    match wide {
-        None => {
+async fn set_channel_tail(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
+    match width {
+        Width::Twenty => {
             for (reg, bits, value) in [
                 (0x810, 0x3ff0, 0x19b),
                 (0x9b0, 15, 0),
@@ -346,7 +400,19 @@ async fn set_channel_tail(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<
                 mask(io, reg, bits, value)?;
             }
         }
-        Some(sc) => {
+        Width::Eighty(sc) => {
+            let sc = u32::from(sc);
+            for (reg, bits, value) in [
+                (0x9b0, 15, 0xa),
+                (0x9b0, 0xc0, 0),
+                (0x9b0, 0xff00, sc | sc << 4),
+                (0x88c, 0xf000, 6),
+                (0xcbc, 1 << 21, 1),
+            ] {
+                mask(io, reg, bits, value)?;
+            }
+        }
+        Width::Forty(sc) => {
             let sc = u32::from(sc);
             for (reg, bits, value) in [
                 (0x1a00, 1 << 4, u32::from(sc == 1)),
@@ -362,8 +428,8 @@ async fn set_channel_tail(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<
         }
     }
     // rtw_set_channel_mac: DATA_SC txsc20 (txsc40 only at 80MHz), RFMOD.
-    io.write8(0x483, wide.unwrap_or(0))?;
-    mask(io, 0x668, 0x180, u32::from(wide.is_some()))?;
+    io.write8(0x483, width.data_sc())?;
+    mask(io, 0x668, 0x180, width.rfmod())?;
     mask(io, 0x24, 3 << 20, 0)?;
     io.write8(0x55c, 80)?;
     io.write8(0x638, 80)?;
@@ -375,10 +441,11 @@ async fn set_channel_tail(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<
     let cck_check = u8::from(super::band5::band(ch).is_some()) << 7;
     io.write8(0x454, (check & !(1 << 7)) | cck_check)?;
     // rtw8822c_set_channel_rf: RF18 BW 20M=bits13:12 3, 40M=bit13; RXBB.
-    let (bw, rxbb) = if wide.is_some() {
-        (40, 0x10)
-    } else {
-        (20, 0x18)
+    // RF18 BW 80M=bit12, RXBB 0x8.
+    let (bw, rxbb) = match width {
+        Width::Twenty => (20, 0x18),
+        Width::Forty(_) => (40, 0x10),
+        Width::Eighty(_) => (80, 0x8),
     };
     let reg18 = (rf_read(io, 0, 0x18)?
         & !((1 << 16) | (1 << 9) | (1 << 8) | 255 | (3 << 17) | (3 << 12)))

@@ -190,3 +190,136 @@ impl Power5g {
         Self::add(avg, diffs, factor)
     }
 }
+
+/// Center channel of a 5GHz 40MHz pair: both halves 20MHz primaries of one
+/// IEEE 802.11 Annex E 40MHz block (36/40, 44/48, ..., 157/161; class
+/// 116/117, 119/120, 122/123, 126/127), the secondary exactly 4 channels
+/// from the primary. 165/169 and 173/177 are not admitted.
+pub(super) const fn center40(first: u8, secondary: u8) -> Option<u8> {
+    let low = if first < secondary { first } else { secondary };
+    let base = if low >= 149 { 149 } else { 36 };
+    if !primary(first)
+        || !primary(secondary)
+        || first.abs_diff(secondary) != 4
+        || low > 157
+        || (low - base) % 8 != 0
+    {
+        return None;
+    }
+    Some(low + 2)
+}
+
+/// Channel width of one `rtw_set_channel` program with the
+/// `rtw_update_channel` primary sub-channel index: 40MHz `RTW_SC_20_UPPER`
+/// (1) / `_LOWER` (2); 80MHz additionally `RTW_SC_20_UPMOST` (3) /
+/// `_LOWEST` (4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Width {
+    Twenty,
+    Forty(u8),
+    Eighty(u8),
+}
+
+impl Width {
+    pub(super) const fn mhz(self) -> u8 {
+        match self {
+            Self::Twenty => 20,
+            Self::Forty(_) => 40,
+            Self::Eighty(_) => 80,
+        }
+    }
+    /// `primary_ch_idx` (0 at 20MHz).
+    pub(super) const fn sc(self) -> u8 {
+        match self {
+            Self::Twenty => 0,
+            Self::Forty(sc) | Self::Eighty(sc) => sc,
+        }
+    }
+    /// Well-formed sub-channel index for the width.
+    pub(super) const fn valid(self) -> bool {
+        match self {
+            Self::Twenty => true,
+            Self::Forty(sc) => matches!(sc, 1 | 2),
+            Self::Eighty(sc) => matches!(sc, 1..=4),
+        }
+    }
+    /// `mac.c::rtw_set_channel_mac` REG_DATA_SC (0x483): `BIT_TXSC_20M`
+    /// = sc and, at 80MHz, `BIT_TXSC_40M` = `RTW_SC_40_UPPER` (9) for
+    /// sc 1/3 else `RTW_SC_40_LOWER` (10).
+    pub(super) const fn data_sc(self) -> u8 {
+        match self {
+            Self::Twenty => 0,
+            Self::Forty(sc) => sc,
+            Self::Eighty(sc) => {
+                let sc40: u8 = if matches!(sc, 1 | 3) { 9 } else { 10 };
+                sc | sc40 << 4
+            }
+        }
+    }
+    /// `rtw_set_channel_mac` REG_WMAC_TRXPTCL_CTL BIT_RFMOD field (0x668
+    /// bits 8:7): 40MHz bit7, 80MHz bit8.
+    pub(super) const fn rfmod(self) -> u32 {
+        match self {
+            Self::Twenty => 0,
+            Self::Forty(_) => 1,
+            Self::Eighty(_) => 2,
+        }
+    }
+}
+
+/// `main.c::rtw_update_channel` sub-channel index of `primary` inside the
+/// 40MHz pair centered at `center`.
+pub(super) const fn sc40(primary: u8, center: u8) -> u8 {
+    if primary > center {
+        1
+    } else {
+        2
+    }
+}
+
+/// `center` is the center channel of a [`center40`] pair.
+pub(super) const fn is_center40(center: u8) -> bool {
+    center >= 38 && center40(center - 2, center + 2).is_some()
+}
+
+/// Center channel of the 5GHz 80MHz block holding `primary`: IEEE 802.11
+/// Annex E class 128 centers 42, 58, 106, 122, 138 and 155 (blocks
+/// 36..=48, 52..=64, 100..=112, 116..=128, 132..=144, 149..=161).
+pub(super) const fn center80(channel: u8) -> Option<u8> {
+    if !primary(channel) {
+        return None;
+    }
+    let center = match channel {
+        36..=48 => 42,
+        52..=64 => 58,
+        100..=112 => 106,
+        116..=128 => 122,
+        132..=144 => 138,
+        149..=161 => 155,
+        _ => return None,
+    };
+    Some(center)
+}
+
+/// `center` is a [`center80`] block center.
+pub(super) const fn is_center80(center: u8) -> bool {
+    matches!(center, 42 | 58 | 106 | 122 | 138 | 155)
+}
+
+/// `rtw_update_channel` 80MHz sub-channel index of `primary` in the block
+/// centered at `center`: above the center by 10MHz `RTW_SC_20_UPPER` (1),
+/// by 30MHz `RTW_SC_20_UPMOST` (3); below by 10MHz `RTW_SC_20_LOWER` (2),
+/// by 30MHz `RTW_SC_20_LOWEST` (4).
+pub(super) const fn sc80(primary: u8, center: u8) -> u8 {
+    match (primary > center, primary.abs_diff(center) == 2) {
+        (true, true) => 1,
+        (true, false) => 3,
+        (false, true) => 2,
+        (false, false) => 4,
+    }
+}
+
+/// The four 20MHz primaries of the 80MHz block centered at `center`.
+pub(super) const fn constituents80(center: u8) -> [u8; 4] {
+    [center - 6, center - 2, center + 2, center + 6]
+}

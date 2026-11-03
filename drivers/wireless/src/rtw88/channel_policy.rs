@@ -753,7 +753,7 @@ pub(super) async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Err
 
 /// [`iqk8822c`] without the TX power restore; the caller reprograms its
 /// band's references.
-async fn iqk8822c_run(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn iqk8822c_run(io: &mut impl Io) -> Result<(), Error> {
     dpd_off(io)?;
     super::radio::rfk_power(io, true)?;
     io.station_retune_iqk()?;

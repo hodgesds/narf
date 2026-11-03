@@ -2,6 +2,7 @@
 //! C21 ch1/20 IQK and separately qualified awake radio continuations.
 //! Linux rtw8821c.c/fw.c/mac.c/ps.c; the IQK envelope alone grants no packets.
 use super::{
+    band5::Width,
     calibration8821c::Envelope,
     efuse::Factory8821c,
     firmware_transport::{Error, Io},
@@ -309,8 +310,76 @@ pub(super) async fn set_channel20(
     if !five && !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
+    set_channel(io, ch, Width::Twenty, facts).await
+}
+/// `rtw8821c_set_channel(center, BW40|BW80, sc)` non-SRRC on 5GHz, in
+/// Linux order: the 5GHz `_bb` head of the *center* channel (TXSCALE and
+/// CLKTRK by center), `set_bw` BW40 (RXSB 0xa00[4] for sc 1, ADCCLK
+/// `&0xff3ff300 | 0x20020000 | sc<<2 | 1`, ADC160[30]) or BW80 (ADCCLK
+/// `&0xfcffcf00 | 0x40040000 | sc<<2 | 2`, ADC160[30]), `_bb_swing` (5GHz
+/// factory swing), `rtw_set_channel_mac` (DATA_SC, RFMOD), `_rf` (WLA,
+/// LUTDBG 0, RF18 BW40 bit11 / BW80 bit10 on the center, XTALX2 toggle)
+/// and `_rxdfir` BW40 / BW80. Returns the programmed swing.
+pub(super) async fn wide5(
+    io: &mut impl Io,
+    center: u8,
+    width: Width,
+    facts: &BandFacts,
+) -> Result<u16, Error> {
+    let ok = match width {
+        Width::Forty(_) => super::band5::is_center40(center),
+        Width::Eighty(_) => super::band5::is_center80(center),
+        Width::Twenty => false,
+    };
+    if !ok || !width.valid() {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, center, width, facts).await
+}
+/// `_rxdfir` (ACBB0, ACBBRXFIR, TXDFIR, CHFIR) per width.
+const fn rxdfir(width: Width) -> [(u16, u32, u32); 4] {
+    let (acbbrx, txdfir, chfir) = match width {
+        Width::Twenty => (2, 1, 0),
+        Width::Forty(_) => (2, 0, 0),
+        Width::Eighty(_) => (1, 0, 1),
+    };
+    [
+        (0x948, 3 << 28, 2),
+        (0x94c, 3 << 28, acbbrx),
+        (0xc20, 1 << 31, txdfir),
+        (0x8f0, 1 << 31, chfir),
+    ]
+}
+/// `set_bw` ADCCLK (0x8ac) for `width` over the current value.
+const fn adcclk(old: u32, width: Width) -> u32 {
+    let sc = (width.sc() as u32 & 0xf) << 2;
+    match width {
+        Width::Twenty => (old & 0xffcffc00) | 0x10010000,
+        Width::Forty(_) => (old & 0xff3ff300) | 0x20020000 | sc | 1,
+        Width::Eighty(_) => (old & 0xfcffcf00) | 0x40040000 | sc | 2,
+    }
+}
+/// Bits of 0x8ac that [`adcclk`] sets or clears for `width`.
+const fn adcclk_mask(width: Width) -> u32 {
+    match width {
+        Width::Twenty => !0xffcffc00 | 0x10010000,
+        Width::Forty(_) => !0xff3ff300 | 0x20020000,
+        Width::Eighty(_) => !0xfcffcf00 | 0x40040000,
+    }
+}
+async fn set_channel(
+    io: &mut impl Io,
+    ch: u8,
+    width: Width,
+    facts: &BandFacts,
+) -> Result<u16, Error> {
+    let five = super::band5::band(ch).is_some();
+    if !five && width != Width::Twenty {
+        return Err(Error::Unsupported);
+    }
     let swing = facts.swing(ch)?;
     if five {
+        // Head of the RF center channel (`channel` is the center at 40/80).
         let txscale = super::band5::txscale8821c(ch).ok_or(Error::Unsupported)?;
         let clktrk = super::band5::clktrk8821c(ch).ok_or(Error::Unsupported)?;
         for (reg, bits, value) in [
@@ -331,12 +400,15 @@ pub(super) async fn set_channel20(
         mask(io, 0xa28, 0xffff, facts.filters[1] & 0xffff)?;
         io.write32(0xaac, facts.filters[2])?;
     }
+    if let Width::Forty(sc) = width {
+        mask(io, 0xa00, 1 << 4, u32::from(sc == 1))?;
+    }
     let adc = read(io, 0x8ac)?;
-    io.write32(0x8ac, (adc & 0xffcffc00) | 0x10010000)?;
+    io.write32(0x8ac, adcclk(adc, width))?;
     mask(io, 0x8c4, 1 << 30, 1)?;
     mask(io, 0xc1c, 0xffe00000, u32::from(swing))?;
-    io.write8(0x483, 0)?;
-    mask(io, 0x668, 0x180, 0)?;
+    io.write8(0x483, width.data_sc())?;
+    mask(io, 0x668, 0x180, width.rfmod())?;
     mask(io, 0x24, 3 << 20, 0)?;
     io.write8(0x55c, 80)?;
     io.write8(0x638, 80)?;
@@ -345,7 +417,7 @@ pub(super) async fn set_channel20(
         return Err(Error::Gone);
     }
     io.write8(0x454, (cck & !0x80) | u8::from(five) << 7)?;
-    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(ch, 20);
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | rf18_for(ch, width.mhz());
     mask(io, 0x1080, 1 << 16, 1)?;
     mask(io, 0, 1 << 26, 1)?;
     if five {
@@ -363,7 +435,7 @@ pub(super) async fn set_channel20(
     rf(io, 0x18, 0xfffff, rf18).await?;
     rf(io, 0xb8, 1 << 19, 0).await?;
     rf(io, 0xb8, 1 << 19, 1).await?;
-    for (reg, bits, value) in DFIR {
+    for (reg, bits, value) in rxdfir(width) {
         mask(io, reg, bits, value)?;
     }
     Ok(swing)
@@ -399,6 +471,43 @@ pub(super) fn verify_channel20(io: &mut impl Io, ch: u8, facts: &BandFacts) -> R
         || read(io, 0xcb8)? & 0xf50000 != 0xd00000
     {
         return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// Readback of [`wide5`]: RF18 at the center and width, the center's
+/// 5GHz head, swing, `set_bw` ADCCLK/RXSB, MAC DATA_SC/RFMOD, WLA and
+/// `_rxdfir`.
+pub(super) fn verify_wide5(
+    io: &mut impl Io,
+    center: u8,
+    width: Width,
+    facts: &BandFacts,
+) -> Result<(), Error> {
+    let swing = facts.swing(center)?;
+    let txscale = super::band5::txscale8821c(center).ok_or(Error::Unsupported)?;
+    let clktrk = super::band5::clktrk8821c(center).ok_or(Error::Unsupported)?;
+    if width == Width::Twenty
+        || rf_read(io, 0x18)? & 0x70fff != rf18_for(center, width.mhz())
+        || rf_read(io, 0xdf)? & (1 << 6) != 0
+        || read(io, 0xc1c)? >> 21 != u32::from(swing)
+        || (read(io, 0xc1c)? >> 8) & 15 != txscale
+        || (read(io, 0x860)? >> 17) & 0xfff != clktrk
+        || read(io, 0xa80)? & (1 << 18) == 0
+        || read(io, 0x808)? & (1 << 28) != 0
+        || io.read8(0x454)? & 0x80 == 0
+        || read(io, 0x8ac)? & adcclk_mask(width) != adcclk(0, width) & adcclk_mask(width)
+        || read(io, 0x8c4)? & (1 << 30) == 0
+        || io.read8(0x483)? != width.data_sc()
+        || (read(io, 0x668)? >> 7) & 3 != width.rfmod()
+        || read(io, 0xcb8)? & 0xf50000 != 0xd00000
+        || matches!(width, Width::Forty(sc) if (read(io, 0xa00)? >> 4) & 1 != u32::from(sc == 1))
+    {
+        return Err(Error::Prerequisite);
+    }
+    for (reg, bits, value) in rxdfir(width) {
+        if read(io, reg)? & bits != value << bits.trailing_zeros() {
+            return Err(Error::Prerequisite);
+        }
     }
     Ok(())
 }

@@ -285,3 +285,147 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs
 );
+
+fn smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span() -> TestResult {
+    use crate::rtw88::band5::{self, Width};
+    // IEEE 802.11 Annex E 40MHz blocks 36/40 .. 157/161 only.
+    for (p, s, c) in [
+        (36, 40, 38),
+        (40, 36, 38),
+        (44, 48, 46),
+        (64, 60, 62),
+        (140, 144, 142),
+        (149, 153, 151),
+        (161, 157, 159),
+    ] {
+        if band5::center40(p, s) != Some(c) || ht40::center(p, s) != Some(c) {
+            return TestResult::Fail("admitted 5GHz 40MHz pair has the wrong center");
+        }
+    }
+    for (p, s) in [
+        (40, 44),
+        (48, 52),
+        (64, 100),
+        (165, 169),
+        (36, 32),
+        (38, 42),
+    ] {
+        if ht40::center(p, s).is_some() {
+            return TestResult::Fail("non-Annex-E 5GHz pair admitted");
+        }
+    }
+    let Some(r) = Record::decode(0xc822, &payload(36, 40, true)) else {
+        return TestResult::Fail("valid C22 5GHz HT40 record refused");
+    };
+    if r.center() != 38 || r.sc() != 2 || !r.band5() {
+        return TestResult::Fail("5GHz sub-channel index differs from rtw_update_channel");
+    }
+    let upper = Record::decode(0xc821, &payload(48, 44, false));
+    if upper.map(|r| (r.center(), r.sc())) != Some((46, 1)) {
+        return TestResult::Fail("C21 5GHz upper primary not SC_20_UPPER");
+    }
+    // One kind per band: a 2.4GHz record never admits as 5GHz and back.
+    if (ht40::KIND.admit)(0xc822, &payload(36, 40, true))
+        || !(ht40::KIND5.admit)(0xc822, &payload(36, 40, true))
+        || (ht40::KIND5.admit)(0xc822, &payload(6, 2, true))
+        || !core::ptr::eq(ht40::kind(36), &ht40::KIND5)
+        || !core::ptr::eq(ht40::kind(6), &ht40::KIND)
+        || ht40::KIND.source == ht40::KIND5.source
+    {
+        return TestResult::Fail("N2xB band kinds are not disjoint");
+    }
+    // 40MHz span of center 38 is 5170..5210MHz; 52/56 (center 54) 5250..5290.
+    if ht40::admission(&r, &domain(5170, 5250, 80, RegFlags::empty())) != Ok((76, false)) {
+        return TestResult::Fail("plain 5GHz 40MHz span not admitted");
+    }
+    let Some(dfs) = Record::decode(0xc822, &payload(52, 56, true)) else {
+        return TestResult::Fail("valid DFS-band pair refused");
+    };
+    if ht40::admission(&dfs, &domain(5250, 5330, 80, RegFlags::DFS)) != Ok((76, true))
+        || ht40::admission(&dfs, &domain(5250, 5330, 80, RegFlags::NO_IR)) != Ok((76, true))
+    {
+        return TestResult::Fail("DFS/NO_IR 40MHz span not admitted as passive-only");
+    }
+    if ht40::admission(&dfs, &domain(5250, 5330, 20, RegFlags::DFS)).is_ok()
+        || ht40::admission(&dfs, &domain(5250, 5330, 80, RegFlags::INDOOR_ONLY)).is_ok()
+        || ht40::admission(&dfs, &domain(5260, 5330, 80, RegFlags::DFS)).is_ok()
+    {
+        return TestResult::Fail("narrow, indoor or partial 5GHz span admitted");
+    }
+    // rtw8822c_set_channel(38, BW40, SC_20_LOWER): 5GHz head of the center.
+    let mut io = RadioIo::reference();
+    if narf_scheduler::block_on(radio::wide5_to(&mut io, 38, Width::Forty(2))).is_err() {
+        return TestResult::Fail("C22 5GHz BW40 program rejected an admitted center");
+    }
+    let rf18 = 1 << 16 | 1 << 8 | 2 << 12 | 38;
+    if radio::rf_read(&mut io, 0, 0x18).map(|v| v & 0x733ff) != Ok(rf18)
+        || radio::rf_read(&mut io, 1, 0x18).map(|v| v & 0x733ff) != Ok(rf18)
+        || radio::read(&mut io, 0x9b0).map(|v| v & 0xffcf) != Ok(0x2205)
+        || radio::read(&mut io, 0x18ac).map(|v| v & 0x1f0) != Ok(0x10)
+        || io.read8(0x483) != Ok(2)
+        || io.read8(0x454).map(|v| v & 0x80) != Ok(0x80)
+        || radio::verify_wide5(&mut io, 38, Width::Forty(2)).is_err()
+    {
+        return TestResult::Fail("C22 5GHz BW40 BB/MAC/RF differs from Linux");
+    }
+    if radio::verify_wide5(&mut io, 38, Width::Forty(1)).is_ok()
+        || radio::verify_wide5(&mut io, 46, Width::Forty(2)).is_ok()
+        || radio::verify_channel5(&mut io, 36).is_ok()
+    {
+        return TestResult::Fail("C22 5GHz BW40 readback accepted another state");
+    }
+    for (center, width) in [
+        (40, Width::Forty(1)),
+        (38, Width::Forty(3)),
+        (4, Width::Forty(1)),
+    ] {
+        let mut io = RadioIo::reference();
+        if narf_scheduler::block_on(radio::wide5_to(&mut io, center, width)).is_ok() {
+            return TestResult::Fail("unadmitted 5GHz BW40 center/sub-channel programmed");
+        }
+    }
+    // rtw8821c_set_channel(46, BW40, SC_20_UPPER) readback state.
+    let facts = radio8821c::BandFacts {
+        filters: [0; 3],
+        btg: false,
+        swing_2g: 0,
+        swing_5g: 4,
+    };
+    let mut io = RadioIo::new();
+    let setup = (|| {
+        for (reg, value) in [
+            (0x2860, radio8821c::rf18_for(46, 40)),
+            (0x2800 + 0xdf * 4, 0),
+            (0xc1c, 0x16a << 21 | 1 << 8),
+            (0x860, 0x494 << 17),
+            (0xa80, 1 << 18),
+            (0x808, 0),
+            (0x8ac, 0x2002_0005),
+            (0x8c4, 1 << 30),
+            (0x668, 0x80),
+            (0xcb8, 0xd0_0000),
+            (0xa00, 1 << 4),
+            (0x948, 2 << 28),
+            (0x94c, 2 << 28),
+            (0xc20, 0),
+            (0x8f0, 0),
+        ] {
+            io.write32(reg, value)?;
+        }
+        io.write8(0x454, 0x80)?;
+        io.write8(0x483, 1)
+    })();
+    if setup.is_err() || radio8821c::verify_wide5(&mut io, 46, Width::Forty(1), &facts).is_err() {
+        return TestResult::Fail("C21 5GHz BW40 readback refused the rtw8821c_set_channel state");
+    }
+    if radio8821c::verify_wide5(&mut io, 46, Width::Forty(2), &facts).is_ok()
+        || radio8821c::verify_wide5(&mut io, 38, Width::Forty(1), &facts).is_ok()
+    {
+        return TestResult::Fail("C21 5GHz BW40 readback accepted another sideband/center");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span
+);

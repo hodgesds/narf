@@ -42,6 +42,9 @@ pub(super) struct Board {
     /// HT20 one-/two-stream factory ceilings per 5GHz channel group
     /// (`band5::Power5g::bw20`, txgi factor 2), min over both paths.
     ht5_groups: [Option<(u8, Option<u8>)>; 14],
+    /// HT40 one-/two-stream factory ceilings per 5GHz channel group
+    /// (`band5::Power5g::bw40`, txgi factor 2), min over both paths.
+    ht40_5_groups: [Option<(u8, Option<u8>)>; 14],
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -153,6 +156,16 @@ impl Board {
                     .map(|(a, b)| a.min(b)),
             ))
         });
+        let ht40_5_groups = core::array::from_fn(|group| {
+            let path = |path: u8| super::band5::Power5g::parse(factory.power_path(path)?);
+            let (a, b) = (path(0)?, path(1)?);
+            Some((
+                a.bw40(group, false, 2)?.min(b.bw40(group, false, 2)?),
+                a.bw40(group, true, 2)
+                    .zip(b.bw40(group, true, 2))
+                    .map(|(a, b)| a.min(b)),
+            ))
+        });
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
@@ -160,6 +173,7 @@ impl Board {
             groups,
             band5_groups,
             ht5_groups,
+            ht40_5_groups,
             ht_groups,
             ht40_groups,
             ht: factory
@@ -681,14 +695,37 @@ impl Gate {
             Scope::C21(g) => g.band5_group(group).map(|l| [l; 2]),
         }
     }
-    /// Factory HT40 `(1S, 2S)` index ceilings for one 2.4GHz group.
-    pub(super) fn ht40_limits(&self, group: usize) -> Option<(u8, Option<u8>)> {
-        match &self.scope {
-            Scope::C22 { calibration, .. } => {
-                calibration.board.ht40_groups.get(group).copied().flatten()
-            }
-            Scope::C21(g) => g.ht40_group(group).map(|m| (m, None)),
+    /// Factory HT40 `(1S, 2S)` index ceilings for the group of a 40MHz
+    /// `center` channel: 2.4GHz `rtw_get_channel_group` (`bw40_base`) or
+    /// the 5GHz group (`band5::Power5g::bw40`; C21 path A, factor 1).
+    pub(super) fn ht40_limits(&self, center: u8) -> Option<(u8, Option<u8>)> {
+        if let Some(group) = super::channel_policy::group(center) {
+            return match &self.scope {
+                Scope::C22 { calibration, .. } => {
+                    calibration.board.ht40_groups.get(group).copied().flatten()
+                }
+                Scope::C21(g) => g.ht40_group(group).map(|m| (m, None)),
+            };
         }
+        let group = super::band5::group(center)?;
+        match &self.scope {
+            Scope::C22 { calibration, .. } => calibration
+                .board
+                .ht40_5_groups
+                .get(group)
+                .copied()
+                .flatten(),
+            Scope::C21(g) => g.ht40_5_group(group).map(|m| (m, None)),
+        }
+    }
+    /// C22 5GHz OFDM6..54 both-path selection of the bound 5GHz N2xO
+    /// record (`channel_policy::Record::ofdm5_indices`).
+    pub(super) fn ofdm5_indices(&self) -> Option<[u8; 8]> {
+        if self.did() != 0xc822 {
+            return None;
+        }
+        super::channel_policy::Record::decode(self.did(), self.channel.as_ref()?.payload())?
+            .ofdm5_indices()
     }
     pub(super) fn did(&self) -> u16 {
         match &self.scope {
@@ -1050,7 +1087,7 @@ impl Gate {
             && super::fallback::bounds(g.payload());
         // N2xB HT40: over the bound HT program with its exact MCS set, on the
         // gate's own primary, within the center group's factory BW40 base.
-        let ht40 = g.is(&super::ht40::KIND)
+        let ht40 = g.is(super::ht40::kind(self.channel()))
             && self.ht40.is_none()
             && super::ht40::Record::decode(self.did(), g.payload()).is_some_and(|r| {
                 self.ht.as_ref().is_some_and(|h| h.mcs() == r.mcs)

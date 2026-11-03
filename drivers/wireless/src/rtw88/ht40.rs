@@ -63,6 +63,26 @@ pub(super) static KIND: Kind = Kind {
     admit,
 };
 
+/// 5GHz N2xB: the same tag, stem and payload layout over a band-5 N2xL
+/// (`channel_policy::scope_request` of a 5GHz primary), hashed with the
+/// 5GHz BW40 source contract so a 2.4GHz record never verifies as a 5GHz
+/// one and vice versa.
+pub(super) static KIND5: Kind = Kind {
+    tag: b'B',
+    stem: "ht40",
+    source: b"Linux 7.3-rc4 rtw88 5GHz HT40: main.c rtw_init_ht_cap SUP_WIDTH_20_40|SGI_40|DSSSCCK40 hw_cap.bw; rtw_update_channel center/RTW_SC_20_UPPER1/LOWER2; rtw8822c.c rtw8822c_set_channel_bb 5G head of the center (CCKTXONLY CCK_CHECK RX_IQ_WEIGHT TXF4[20]0 CCAMSK0x22 TXDFIR0 3 RXAGC_OFDM band1/2 1 band3 2 band4 3 SCOTRK(center)) BW40 CCKSB0x1a00[4] TXBWCTL0x9b0 5/c0=0/ff00=sc|sc<<4 NBI0x1abc[30]1 SBD0x88c 1 PT_OPT0xcbc[21]1, rtw8822c_set_channel_rf RF18 5G bits16|8 RFSI band3 bit17 band4 bit18 BW40 bit13 rxbb0x10, rtw8822c_toggle_igi; rtw8821c.c rtw8821c_set_channel_bb 5G head of the center (ENTXCCK[18]1 CCK_CHECK[7]1 RXPSEL[28]0 RXCCAMSK15 TXSCALE/CLKTRK(center)) BW40 RXSB0xa00[4] ADCCLK0x8ac ff3ff300|20020000|sc<<2|1 ADC160[30]1, _bb_swing 5G, _rf WLA LUTDBG0 RF18 BW40 bit11 RFSI GE100/GT140 XTALX2 toggle, _rxdfir BW40; mac.c rtw_set_channel_mac DATA_SC0x483 RFMOD_40M CCK_CHECK set; phy.c rtw_phy_get_5g_tx_power_index BW40 bw40_base[5g group(center)] + ht_2s_diff.bw40*factor; C22 OFDM kept at the N2xO 5GHz selection relative to MCS7; RRSR_INIT_5G OFDM6 0x10; rtw_update_sta_info bw_mode40 SGI_40 get_rate_id GN_N1SS5/N2SS4; fw.c RA_INFO_BW_MODE 25:24; tx.c W5_DATA_BW 6:5; both 20MHz halves admitted channels; DFS/NO_IR span passive on both halves with both halves beacon-witnessed; record 40MHz envelope; HT program MCS set unchanged",
+    admit: admit5,
+};
+
+/// The N2xB kind for a primary's band.
+pub(super) fn kind(primary: u8) -> &'static Kind {
+    if super::band5::primary(primary) {
+        &KIND5
+    } else {
+        &KIND
+    }
+}
+
 /// Decoded N2xB payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Record {
@@ -132,10 +152,25 @@ impl Record {
     fn two_streams(&self) -> bool {
         self.mcs & 0xff00 != 0
     }
+    /// A 5GHz pair.
+    pub(super) fn band5(&self) -> bool {
+        super::band5::primary(self.primary)
+    }
+    /// 20MHz center frequencies of both halves (primary, secondary).
+    pub(super) fn halves(&self) -> Option<[u16; 2]> {
+        Some([
+            super::channel_policy::any_frequency(self.primary)?,
+            super::channel_policy::any_frequency(self.secondary)?,
+        ])
+    }
 }
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
-    Record::decode(did, p).is_some()
+    Record::decode(did, p).is_some_and(|r| !r.band5())
+}
+
+fn admit5(did: u16, p: &[u8; PAYLOAD]) -> bool {
+    Record::decode(did, p).is_some_and(|r| r.band5())
 }
 
 /// `main.c::hw_bw_cap_to_bitamp`: `EFUSE_HW_CAP_IGNORE` (0),
@@ -144,9 +179,13 @@ pub(super) fn hardware_allows(bandwidth: u8) -> bool {
     matches!(bandwidth, 0 | 6 | 7)
 }
 
-/// Center channel of a 2.4GHz 40MHz pair: both halves in 1..=13 (channel
-/// 14 is CCK-only) and the secondary exactly 4 channels away.
+/// Center channel of a 40MHz pair: on 2.4GHz both halves in 1..=13
+/// (channel 14 is CCK-only) and the secondary exactly 4 channels away; on
+/// 5GHz an Annex E 40MHz block ([`super::band5::center40`]).
 pub(super) fn center(primary: u8, secondary: u8) -> Option<u8> {
+    if super::band5::primary(primary) {
+        return super::band5::center40(primary, secondary);
+    }
     ((1..=13).contains(&primary)
         && (1..=13).contains(&secondary)
         && primary.abs_diff(secondary) == 4)
@@ -154,13 +193,31 @@ pub(super) fn center(primary: u8, secondary: u8) -> Option<u8> {
 }
 
 /// Factory BW40 HT ceilings `(1S, 2S)` of the center channel's group must
-/// enclose every qualified index.
+/// enclose every qualified index (2.4GHz `rtw_phy_get_2g_tx_power_index`,
+/// 5GHz `rtw_phy_get_5g_tx_power_index` over the 5GHz group of the
+/// center). On a C22 5GHz pair the record must sit on the gate's 5GHz
+/// N2xO selection and each OFDM index must stay within the signed 7-bit
+/// difference of the record's MCS7 reference (the OFDM bytes of 0x3a04 /
+/// 0x3a08 are written relative to it, as for 5GHz HT20).
 pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
-    let Some((one, two)) =
-        super::channel_policy::group(record.center()).and_then(|g| gate.ht40_limits(g))
-    else {
+    let Some((one, two)) = gate.ht40_limits(record.center()) else {
         return false;
     };
+    if record.band5() != super::band5::primary(gate.channel()) {
+        return false;
+    }
+    if record.band5() && gate.did() == 0xc822 {
+        let Some(ofdm) = gate.ofdm5_indices() else {
+            return false;
+        };
+        let reference = i16::from(record.indices[7]);
+        if ofdm
+            .iter()
+            .any(|v| !(-64..=63).contains(&(i16::from(*v) - reference)))
+        {
+            return false;
+        }
+    }
     (0..16).all(|i| {
         let v = record.indices[i];
         if record.mcs & (1 << i) == 0 {
@@ -178,23 +235,52 @@ pub(super) fn within_factory(gate: &Gate, record: &Record) -> bool {
 /// and every measured peak plus antenna gain fits the minimum ceiling.
 /// Returns the admitted EIRP ceiling (quarter dBm).
 pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, Error> {
-    let center =
-        u32::from(super::channel_policy::frequency(record.center()).ok_or(Error::Unsupported)?);
+    admission(record, domain).map(|(limit, _)| limit)
+}
+
+/// [`policy`] plus whether the span is passive-only. On 5GHz a rule may
+/// also carry DFS / NO_IR (`channel_policy::passive_rule` at 40MHz); the
+/// span is then admitted only when *both* 20MHz halves are passive-only
+/// (`reg::witness::passive_only`), so frame TX on it stays under the
+/// primary's passive TX grant and the station's witness of both halves.
+/// A span mixing a plain half with a passive half is refused. 2.4GHz
+/// keeps the plain-rule check.
+pub(super) fn admission(record: &Record, domain: &RegulatoryDomain) -> Result<(i16, bool), Error> {
+    let center = record.center();
+    let center = u32::from(
+        super::channel_policy::frequency(center)
+            .or(super::band5::frequency(center))
+            .ok_or(Error::Unsupported)?,
+    );
     let (low, high) = (center - 20, center + 20);
     if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
         return Err(Error::Prerequisite);
     }
+    let five = record.band5();
     let mut limit = record.ceiling.min(80);
     let mut covering = false;
+    let mut passive = false;
     for (i, r) in domain.rules.iter().enumerate() {
         if r.freq_start_mhz >= high || r.freq_end_mhz <= low {
             continue;
         }
-        if !super::channel_policy::plain_rule(domain, i, 40) {
+        if five {
+            passive |=
+                super::channel_policy::passive_rule(domain, i, 40).ok_or(Error::Prerequisite)?;
+        } else if !super::channel_policy::plain_rule(domain, i, 40) {
             return Err(Error::Prerequisite);
         }
         covering |= r.freq_start_mhz <= low && r.freq_end_mhz >= high;
         limit = limit.min(i16::from(r.max_power_dbm) * 4);
+    }
+    if passive {
+        let halves = record.halves().ok_or(Error::Unsupported)?;
+        if !halves
+            .iter()
+            .all(|c| narf_wireless::reg::witness::passive_only(domain, *c))
+        {
+            return Err(Error::Prerequisite);
+        }
     }
     if !covering
         || record
@@ -204,7 +290,7 @@ pub(super) fn policy(record: &Record, domain: &RegulatoryDomain) -> Result<i16, 
     {
         return Err(Error::Prerequisite);
     }
-    Ok(limit)
+    Ok((limit, passive))
 }
 
 /// Live check of a bound N2xB record against the installed regulatory
@@ -221,7 +307,10 @@ pub(super) fn current_in(
 ) -> Result<(), Error> {
     g.invoke_source(|| {
         let record = Record::decode(gate.did(), g.payload()).ok_or(Error::State)?;
-        if !g.is(&KIND) || record.primary != gate.channel() || !within_factory(gate, &record) {
+        if !g.is(kind(record.primary))
+            || record.primary != gate.channel()
+            || !within_factory(gate, &record)
+        {
             return Err(Error::State);
         }
         policy(&record, domain).map(|_| ())
@@ -250,13 +339,18 @@ pub(super) fn ht_operation(ies: &[u8]) -> Option<(u8, Option<u8>)> {
     None
 }
 
-fn words(record: &Record) -> [u32; 16] {
+/// C22 difference words. `ofdm` is the gate's 5GHz N2xO OFDM selection
+/// on a 5GHz pair (OFDM kept for management/EAPOL at OFDM6, as the 5GHz
+/// HT20 program does); None writes OFDM at index 0 as on 2.4GHz.
+fn words(record: &Record, ofdm: Option<[u8; 8]>) -> [u32; 16] {
     let mut bytes = [0; 64];
     let reference = i16::from(record.indices[7]);
     let last = if record.two_streams() { 28 } else { 20 };
     for (rate, b) in bytes.iter_mut().enumerate() {
         let index = if (12..last).contains(&rate) {
             i16::from(record.indices[rate - 12])
+        } else if let (Some(o), 4..=11) = (ofdm, rate) {
+            i16::from(o[rate - 4])
         } else {
             0
         };
@@ -272,14 +366,19 @@ fn words(record: &Record) -> [u32; 16] {
 /// Program the record's HT40 TXAGC (`rtw_phy_set_tx_power_level` at BW40).
 /// C22: per-path OFDM reference (MCS7) and the per-rate difference words,
 /// laid out as the HT20 program does; C21: the HT MCS0..7 words.
-pub(super) fn write_power(io: &mut impl Io, did: u16, record: &Record) -> Result<(), Error> {
+pub(super) fn write_power(
+    io: &mut impl Io,
+    did: u16,
+    record: &Record,
+    ofdm: Option<[u8; 8]>,
+) -> Result<(), Error> {
     match did {
         0xc822 => {
             for r in [0x18e8, 0x41e8] {
                 super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
                 super::radio::mask(io, r, 0x1fc00, u32::from(record.indices[7]))?;
             }
-            for (i, v) in words(record).into_iter().enumerate() {
+            for (i, v) in words(record, ofdm).into_iter().enumerate() {
                 super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
                 io.write32(0x3a00 + i as u16 * 4, v)?;
             }
@@ -298,8 +397,13 @@ pub(super) fn write_power(io: &mut impl Io, did: u16, record: &Record) -> Result
     }
 }
 
-pub(super) fn verify_power(io: &mut impl Io, did: u16, record: &Record) -> Result<(), Error> {
-    check_power(&mut |r| super::radio::read(io, r), did, record)
+pub(super) fn verify_power(
+    io: &mut impl Io,
+    did: u16,
+    record: &Record,
+    ofdm: Option<[u8; 8]>,
+) -> Result<(), Error> {
+    check_power(&mut |r| super::radio::read(io, r), did, record, ofdm)
 }
 
 /// Readback of [`write_power`] over any register view.
@@ -307,6 +411,7 @@ pub(super) fn check_power(
     read: &mut impl FnMut(u16) -> Result<u32, Error>,
     did: u16,
     record: &Record,
+    ofdm: Option<[u8; 8]>,
 ) -> Result<(), Error> {
     match did {
         0xc822 => {
@@ -315,7 +420,7 @@ pub(super) fn check_power(
                     return Err(Error::Prerequisite);
                 }
             }
-            for (i, v) in words(record).into_iter().enumerate() {
+            for (i, v) in words(record, ofdm).into_iter().enumerate() {
                 if read(0x3a00 + i as u16 * 4)? != v {
                     return Err(Error::Prerequisite);
                 }
@@ -337,6 +442,9 @@ pub(super) fn check_power(
 /// `rtw_set_channel(center, BW40, sc)` + IQK + HT40 TX power after
 /// `station_width_begin` paused and drained TX on the HT-bound gate.
 pub(super) async fn program(io: &mut impl Io, gate: &Gate, record: &Record) -> Result<(), Error> {
+    if record.band5() {
+        return program5(io, gate, record).await;
+    }
     let (did, center, sc) = (gate.did(), record.center(), record.sc());
     match did {
         0xc822 => {
@@ -344,16 +452,55 @@ pub(super) async fn program(io: &mut impl Io, gate: &Gate, record: &Record) -> R
             super::radio::width40(io, center, sc).await?;
             super::radio::gains(io, gains)?;
             super::channel_policy::iqk8822c(io, gains).await?;
-            write_power(io, did, record)?;
+            write_power(io, did, record, None)?;
             super::radio::verify_width40(io, center, sc, gains)?;
         }
         0xc821 => {
             super::radio8821c::width40(io, center, sc).await?;
             super::channel_policy::iqk8821c(io).await?;
-            write_power(io, did, record)?;
+            write_power(io, did, record, None)?;
             super::radio8821c::verify_width40(io, center, sc)?;
         }
         _ => return Err(Error::Unsupported),
     }
-    verify_power(io, did, record)
+    verify_power(io, did, record, None)
+}
+
+/// 5GHz [`program`]: `rtw_set_channel(center, BW40, sc)` on the center's
+/// 5GHz head; C22 re-applies the N2xO 5GHz legacy power around IQK (per-path
+/// OFDM references and difference words, CCK zero, RRSR 0x10) like the
+/// 2.4GHz path re-applies the CCK gains; then the HT40 TX power (C22 with
+/// the OFDM bytes at the N2xO selection). RRSR must still be 0x10.
+async fn program5(io: &mut impl Io, gate: &Gate, record: &Record) -> Result<(), Error> {
+    let (did, center) = (gate.did(), record.center());
+    let width = super::band5::Width::Forty(record.sc());
+    let rrsr = super::radio::RRSR_OFDM6_5G;
+    match did {
+        0xc822 => {
+            let (ofdm, diffs) = gate.ofdm5().ok_or(Error::State)?;
+            let indices = gate.ofdm5_indices().ok_or(Error::State)?;
+            super::radio::wide5_to(io, center, width).await?;
+            super::radio::ofdm5(io, ofdm, diffs)?;
+            super::channel_policy::iqk8822c_run(io).await?;
+            super::radio::ofdm5(io, ofdm, diffs)?;
+            write_power(io, did, record, Some(indices))?;
+            super::radio::verify_wide5(io, center, width)?;
+            verify_power(io, did, record, Some(indices))?;
+        }
+        0xc821 => {
+            // The N2xO OFDM TXAGC and RRSR 0x10 of the 5GHz HT20 program
+            // stay as programmed (`_set_channel` does not touch them).
+            let facts = gate.band_facts().ok_or(Error::State)?;
+            super::radio8821c::wide5(io, center, width, &facts).await?;
+            super::channel_policy::iqk8821c(io).await?;
+            write_power(io, did, record, None)?;
+            super::radio8821c::verify_wide5(io, center, width, &facts)?;
+            verify_power(io, did, record, None)?;
+        }
+        _ => return Err(Error::Unsupported),
+    }
+    if super::radio::read(io, 0x440)? != rrsr {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }

@@ -2664,10 +2664,66 @@ over the N2xO OFDM TXAGC and reads back at the 5GHz RF18. The HT DATA
 profile carries `band5` (rate id GN 5/4). On 5GHz the station binds the
 extension, N2xF/N2xQ, HT, N2xC and the BA programs; the N2xR RTS program,
 the N2xD dynamic mechanism and N21W tracking stay off (qualified with a
-CCK RTS rate, CCK PD and 2.4GHz swing tables), and N2xB HT40 is refused by
-`ht40::center` (2.4GHz pairs only). Written, unexecuted: the OFDM-selection
+CCK RTS rate, CCK PD and 2.4GHz swing tables); 5GHz N2xB HT40 follows
+below. Written, unexecuted: the OFDM-selection
 rows of `smoke_rtw88_band5_linux_groups_and_factory_power`; no 5GHz HT
 station case is written.
+
+**5GHz HT40 (N2xB over a 5GHz N2xH).** Groundwork for VHT80. The N2xB
+payload, binding and association flow of the 2.4GHz HT40 section apply
+unchanged with these 5GHz differences:
+
+- Pairs (`band5::center40`, `ht40::center`): IEEE 802.11 Annex E 40MHz
+  blocks 36/40, 44/48, 52/56, 60/64, 100/104, ..., 140/144, 149/153,
+  157/161 (either half primary); 165/169 and 173/177 are not admitted.
+  `sc` is `rtw_update_channel`'s `RTW_SC_20_UPPER` (1) / `_LOWER` (2).
+- Kind: `ht40::KIND5` (same tag `B`, stem `ht40`, payload layout) hashes a
+  5GHz BW40 source contract; `ht40::kind(primary)` selects it for a 5GHz
+  primary, `KIND.admit` refuses 5GHz pairs and `KIND5.admit` 2.4GHz
+  pairs, so a record never verifies across bands. It is qualified over
+  the primary's band-5 N2xL scope.
+- Factory bound (`Gate::ht40_limits(center)`): `rtw_phy_get_5g_tx_power_index`
+  BW40 `bw40_base[5g group(center)] (+ ht_2s_diff.bw40)` via
+  `band5::Power5g::bw40` (C22 min over both paths, factor 2,
+  `Board::ht40_5_groups`; C21 path A, factor 1, max 0x3f,
+  `Envelope::ht40_5_groups`). C22 additionally requires every N2xO OFDM
+  index (`Gate::ofdm5_indices`) within -64..=63 of the record's MCS7
+  reference (`ht40::within_factory`).
+- Regulatory (`ht40::admission`): 5GHz rules over the 40MHz span may be
+  passive (`channel_policy::passive_rule` at 40MHz, DFS / NO_IR); a
+  passive span is admitted only when both 20MHz halves are passive-only
+  (`reg::witness::passive_only`), a mixed span is refused. This runs in
+  `Gate::current`/`invoke` like the 2.4GHz check. The station
+  (`Station::wide_witnessed`) offers 40MHz only when no half is
+  passive-only, or both are and both halves were heard in their latest
+  covering scan (`BeaconWitness::may_associate` over both centers); frame
+  TX stays under the primary's passive TX grant. Otherwise it joins at
+  20MHz.
+- Program (`ht40::program5`, Linux order): C22 `radio::wide5_to(center,
+  Forty(sc))` = `rtw8822c_set_channel_bb` 5GHz head of the *center*
+  (OFDM RXAGC by band, SCOTRK of the center) + BW40 tail (CCKSB, TXBWCTL
+  5/sc, NBI, SBD 1, PT_OPT 1), `rtw_set_channel_mac` (DATA_SC sc, RFMOD
+  40, CCK_CHECK set), `_rf` RF18 5GHz band/RFSI + BW40 bit13 at the
+  center with RXBB 0x10, `toggle_igi`; then the N2xO OFDM references /
+  differences (`radio::ofdm5`, CCK zero, RRSR 0x10) around
+  `iqk8822c_run`, then the HT40 words with the OFDM bytes at the N2xO
+  selection relative to MCS7 (`ht40::write_power(.., Some(ofdm))`);
+  readback `radio::verify_wide5` + `ht40::verify_power`. C21
+  `radio8821c::wide5(center, Forty(sc))` = `rtw8821c_set_channel` 5GHz
+  head of the center (TXSCALE/CLKTRK of the center), BW40 `set_bw` (RXSB,
+  ADCCLK `&0xff3ff300 | 0x20020000 | sc<<2 | 1`, ADC160), 5GHz swing,
+  MAC, `_rf` WLA + LUTDBG 0 + RF18 BW40 bit11 at the center + XTALX2
+  toggle, `_rxdfir` BW40; then `rtw8821c_do_iqk` and the HT words
+  0x1d0c/0x1d10 (the N2xO OFDM TXAGC and RRSR 0x10 stay as programmed);
+  readback `radio8821c::verify_wide5`. RRSR must still read 0x10.
+- Data path: `DataProfile::bw40` with no CCK rate gives `get_rate_id`
+  `RTW_RATEID_GN_N1SS` (5) / `GN_N2SS` (4) (WIRELESS_OFDM|HT has no 40MHz
+  variant), `W5_DATA_BW` 1 and RA_INFO `BW_MODE` 1 as on 2.4GHz.
+
+`radio::wide5_to`/`radio8821c::wide5` also carry the BW80 branch for
+`vht`. Written, unexecuted:
+`smoke_rtw88_ht40_5ghz_pairs_programs_and_passive_span`. No 5GHz N2xB
+record is provisioned for any board.
 
 Plain regulatory rules (`channel_policy::plain_rule`, used by every rtw88
 per-channel, HT40, C22 operating and C21 calibration/operating/station
