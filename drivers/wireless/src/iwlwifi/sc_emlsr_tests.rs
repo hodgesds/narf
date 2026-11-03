@@ -394,3 +394,178 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
     smoke_iwl_mld_stats_tpt_and_internal_mlo_scan_selection
 );
+
+/// A beacon's Basic MLE (link id, BSS Parameters Change Count, AP MLD ID)
+/// and one RNR TBTT entry (ieee80211_tbtt_info_ge_11) naming `rnr_link`.
+fn mld_beacon(link: u8, count: u8, mld_id: u8, rnr: (u8, u8, u8)) -> Vec<u8> {
+    let mut ies = alloc::vec![255, 13, 107, 0x30, 0x02, 10, 2, 0, 0, 0, 0, 0x20];
+    ies.extend_from_slice(&[link, count, mld_id]);
+    let (rnr_mld, rnr_link, rnr_count) = rnr;
+    let params = u16::from(rnr_link) | u16::from(rnr_count) << 4;
+    ies.extend_from_slice(&[201, 20, 0x00, 16, 115, 36]);
+    ies.extend_from_slice(&[0, 2, 0, 0, 0, 0, 0x21, 0, 0, 0, 0, 0, 0, rnr_mld]);
+    ies.extend_from_slice(&params.to_le_bytes());
+    ies
+}
+
+/// link.c iwl_mld_handle_missed_beacon_notif beacon-loss CQM, single-link
+/// rescan and the BSS-parameters-changed EMLSR exit, with mlme.c
+/// ieee80211_mgd_update_bss_param_ch_cnt reporter tracking.
+fn smoke_iwl_mld_missed_beacons_cqm_rescan_and_bss_param_changed() -> TestResult {
+    let spec = |fw: u32| match fw {
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    };
+    // Single active link: more than 8 missed since RX notifies CQM and
+    // requests the internal MLO scan; exactly 8 does neither.
+    let mut single = Emlsr::default();
+    single.links_activated(0b10, 0);
+    if single.missed_beacons(&missed(0, 8, 8, 0, 0), spec, 0) != Ok(MissedBeacons::Ignored)
+        || single.cqm_beacon_loss
+    {
+        return TestResult::Fail("beacon loss raised at the threshold");
+    }
+    if single.missed_beacons(&missed(0, 9, 9, u32::MAX, 0), spec, 0) != Ok(MissedBeacons::Rescan)
+        || !single.cqm_beacon_loss
+    {
+        return TestResult::Fail("single-link beacon loss did not rescan/notify");
+    }
+    // Reporter tracking: link 2's own beacon records itself; link 1's
+    // beacon reporting a changed count for link 2 makes link 1 its reporter;
+    // an unchanged count, another AP MLD or count 255 does not.
+    let mut emlsr = Emlsr {
+        selected: 0b110,
+        selected_primary: 1,
+        ..Emlsr::default()
+    };
+    emlsr.links_activated(0b110, 0);
+    emlsr.update_bss_param(2, &mld_beacon(2, 4, 0, (0, 1, 7)), 0b110);
+    if emlsr.bss_param_reporter(2) != 2 || emlsr.bss_param[1] != Some((7, 2)) {
+        return TestResult::Fail("own/RNR BSS parameter counts not recorded");
+    }
+    emlsr.update_bss_param(1, &mld_beacon(1, 7, 0, (0, 2, 4)), 0b110);
+    if emlsr.bss_param_reporter(2) != 2 {
+        return TestResult::Fail("unchanged count changed the reporter");
+    }
+    emlsr.update_bss_param(1, &mld_beacon(1, 7, 0, (3, 2, 5)), 0b110);
+    emlsr.update_bss_param(1, &mld_beacon(1, 7, 0, (0, 2, 255)), 0b110);
+    if emlsr.bss_param_reporter(2) != 2 {
+        return TestResult::Fail("another AP MLD or count 255 changed the reporter");
+    }
+    emlsr.update_bss_param(1, &mld_beacon(1, 7, 0, (0, 2, 5)), 0b110);
+    if emlsr.bss_param_reporter(2) != 1 || emlsr.bss_param[2] != Some((5, 1)) {
+        return TestResult::Fail("changed RNR count did not move the reporter");
+    }
+    // Link 2 (FW 1) misses 11 while its change was reported elsewhere:
+    // leave EMLSR keeping link 1. Link 1 (own reporter) needs 15.
+    if emlsr.missed_beacons(&missed(0, 0, 11, 1, 0), spec, 0) != Ok(MissedBeacons::Ignored) {
+        return TestResult::Fail("own-reported link left EMLSR below 15");
+    }
+    if emlsr.missed_beacons(&missed(1, 0, 11, 0, 0), spec, 0) != Ok(MissedBeacons::Keep(0b10)) {
+        return TestResult::Fail("BSS-parameters-changed threshold not applied");
+    }
+    // In EMLSR the CQM event fires without a rescan request.
+    let mut both = emlsr;
+    both.cqm_beacon_loss = false;
+    if both.missed_beacons(&missed(0, 9, 9, 1, 0), spec, 0) == Ok(MissedBeacons::Rescan)
+        || !both.cqm_beacon_loss
+    {
+        return TestResult::Fail("EMLSR beacon loss requested a single-link rescan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_missed_beacons_cqm_rescan_and_bss_param_changed
+);
+
+/// One advertised TTLM element (ext 109): both directions, a presence
+/// indicator for all TIDs and two-octet maps, optionally a switch time.
+fn ttlm(switch_time: Option<u16>, maps: [u16; 8]) -> Vec<u8> {
+    let mut body = alloc::vec![109, 2 | if switch_time.is_some() { 0x08 } else { 0 }, 0xff];
+    if let Some(at) = switch_time {
+        body.extend_from_slice(&at.to_le_bytes());
+    }
+    for map in maps {
+        body.extend_from_slice(&map.to_le_bytes());
+    }
+    let mut ies = alloc::vec![255, body.len() as u8];
+    ies.extend_from_slice(&body);
+    ies
+}
+
+/// mlme.c ieee80211_parse_adv_t2l, ieee80211_assoc_success's response
+/// mapping, ieee80211_process_adv_ttlm and ieee80211_tid_to_link_map_work.
+fn smoke_iwl_mld_advertised_ttlm_dormant_links_and_switch() -> TestResult {
+    // Valid links 1 and 2. A response mapping link 1 only: link 2 dormant.
+    let response = ttlm(None, [0b10; 8]);
+    if response_dormant(&response, 0b110)
+        != Ok((
+            0b100,
+            Some(AdvTtlm {
+                switch_time: 0,
+                duration: 0,
+                map: 0b10,
+            }),
+        ))
+    {
+        return TestResult::Fail("response TTLM dormant links wrong");
+    }
+    // A switch time, an unmapped valid set, uneven TIDs, a one-direction
+    // mapping or two elements are refused in a response.
+    let mut uneven = [0b10; 8];
+    uneven[7] = 0b110;
+    let mut one_way = ttlm(None, [0b10; 8]);
+    one_way[3] = 1;
+    let mut two = response.clone();
+    two.extend_from_slice(&response);
+    if response_dormant(&ttlm(Some(5), [0b10; 8]), 0b110).is_ok()
+        || response_dormant(&ttlm(None, [0b1000; 8]), 0b110).is_ok()
+        || response_dormant(&ttlm(None, uneven), 0b110).is_ok()
+        || response_dormant(&one_way, 0b110).is_ok()
+        || response_dormant(&two, 0b110).is_ok()
+        || response_dormant(&[], 0b110) != Ok((0, None))
+    {
+        return TestResult::Fail("invalid response TTLM accepted");
+    }
+    // A beacon announcing a switch at TSF TU 0x0100 seen at TU 0x0080:
+    // 128 TU = 131072us, minus the 100ms buffer -> due after 31ms.
+    let mut state = TtlmState::default();
+    state.associated(0, None);
+    let tsf = 0x80u64 << 10;
+    if state.process(&ttlm(Some(0x100), [0b100; 8]), tsf, 1000) != TtlmAction::None
+        || state.switch_at_ms != Some(1031)
+        || state.due(1030, 0b110).is_some()
+    {
+        return TestResult::Fail("TTLM switch time not scheduled");
+    }
+    if state.due(1031, 0b110) != Some((0b100, 0b010)) || !state.active || state.dormant != 0b010 {
+        return TestResult::Fail("TTLM switch did not make the unmapped link dormant");
+    }
+    // A switch time far in the future (underflow) is ignored.
+    let mut late = TtlmState::default();
+    if late.process(&ttlm(Some(0x10), [0b100; 8]), 0x20 << 10, 0) != TtlmAction::None
+        || late.switch_at_ms.is_some()
+    {
+        return TestResult::Fail("previous switch announcement scheduled");
+    }
+    // An active mapping withdrawn from the beacon returns to the default.
+    if state.process(&[], tsf, 2000) != TtlmAction::Default || state.dormant != 0 || state.active {
+        return TestResult::Fail("withdrawn TTLM kept dormant links");
+    }
+    // A planned switch cancelled by its element's removal never fires.
+    state.process(&ttlm(Some(0x100), [0b100; 8]), tsf, 3000);
+    if state.process(&[], tsf, 3001) != TtlmAction::None || state.due(9999, 0b110).is_some() {
+        return TestResult::Fail("cancelled TTLM switch still fired");
+    }
+    // An invalid advertised mapping disconnects.
+    if state.process(&ttlm(None, uneven), tsf, 4000) != TtlmAction::Disconnect {
+        return TestResult::Fail("invalid advertised TTLM kept the connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_advertised_ttlm_dormant_links_and_switch
+);

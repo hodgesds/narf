@@ -306,6 +306,7 @@ pub struct BasicMultiLink {
     medium_sync: Option<u16>,
     eml: Option<EmlCapabilities>,
     mld_capabilities: Option<u16>,
+    mld_id: Option<u8>,
     affiliated: [Option<AffiliatedLink>; MAX_LINKS as usize],
 }
 impl BasicMultiLink {
@@ -333,6 +334,10 @@ impl BasicMultiLink {
     /// Common-info MLD Capabilities and Operations, raw.
     pub fn mld_capabilities(self) -> Option<u16> {
         self.mld_capabilities
+    }
+    /// Common-info AP MLD ID, 0 when absent (ieee80211_mle_get_mld_id).
+    pub fn mld_id(self) -> u8 {
+        self.mld_id.unwrap_or(0)
     }
     /// Bitmap of affiliated per-STA profile link ids.
     pub fn profile_links(self) -> u16 {
@@ -401,6 +406,7 @@ impl BasicMultiLink {
         let medium_sync = take(0x40, 2).map(word);
         let eml = take(0x80, 2).map(|at| EmlCapabilities(word(at)));
         let mld_capabilities = take(MLD_CAPA, 2).map(word);
+        let mld_id = take(0x200, 1).map(|at| body[at]);
         let mut at = 2 + common;
         let mut profiles = 0u16;
         let mut affiliated = [None; MAX_LINKS as usize];
@@ -472,6 +478,7 @@ impl BasicMultiLink {
             medium_sync,
             eml,
             mld_capabilities,
+            mld_id,
             affiliated,
         })
     }

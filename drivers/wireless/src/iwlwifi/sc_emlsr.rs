@@ -207,6 +207,12 @@ pub(super) struct Emlsr {
     prevent_until_ms: Option<u64>,
     /// mlo.h `emlsr.last_entry_ts`: when EMLSR last became active.
     entered_ms: Option<u64>,
+    /// Per spec link (bss_conf) BSS Parameters Change Count and the link
+    /// whose beacon last reported it (`bss_param_ch_cnt`,
+    /// `bss_param_ch_cnt_link_id`).
+    pub bss_param: [Option<(u8, u8)>; 15],
+    /// Pending `ieee80211_cqm_beacon_loss_notify` events.
+    pub cqm_beacon_loss: bool,
 }
 
 impl Emlsr {
@@ -391,12 +397,60 @@ impl Emlsr {
 }
 
 impl Emlsr {
+    /// The link whose beacon last reported `link`'s BSS Parameters Change
+    /// Count; mlme.c sets it to the link itself at association.
+    pub fn bss_param_reporter(&self, link: u8) -> u8 {
+        self.bss_param
+            .get(usize::from(link))
+            .copied()
+            .flatten()
+            .map_or(link, |(_, reporter)| reporter)
+    }
+
+    /// mlme.c `ieee80211_mgd_update_bss_param_ch_cnt` for a beacon received
+    /// on `receiving` (a valid link of `valid`): RNR TBTT entries of the
+    /// same AP MLD (`ieee80211_sta_bss_param_ch_cnt_iter`) update another
+    /// valid link's count and reporter only on change; the beacon's own
+    /// Basic MLE count always re-records this link as its own reporter.
+    /// A count of 255 is ignored.
+    pub fn update_bss_param(&mut self, receiving: u8, ies: &[u8], valid: u16) {
+        let Ok(mle) = narf_wireless::association::mlo::BasicMultiLink::from_ies(ies) else {
+            return;
+        };
+        let mld_id = mle.mld_id();
+        let mut rest = ies;
+        while rest.len() >= 2 {
+            let len = usize::from(rest[1]);
+            let Some(body) = rest.get(2..2 + len) else {
+                break;
+            };
+            if rest[0] == 201 {
+                for (link, count) in rnr_mld_counts(body, mld_id) {
+                    if count != 255 && valid & (1 << link) != 0 {
+                        let slot = &mut self.bss_param[usize::from(link)];
+                        if slot.is_none_or(|(old, _)| old != count) {
+                            *slot = Some((count, receiving));
+                        }
+                    }
+                }
+            }
+            rest = &rest[2 + len..];
+        }
+        if let Some(count) = mle.bss_parameters_change_count().filter(|&c| c != 255) {
+            if let Some(slot) = self.bss_param.get_mut(usize::from(receiving)) {
+                *slot = Some((count, receiving));
+            }
+        }
+    }
+
     /// link.c iwl_mld_handle_missed_beacon_notif (v5). `spec_of_fw` maps
-    /// an owned firmware link id to its spec link id. The connection-quality
-    /// beacon-loss event and the single-link `iwl_mld_int_mlo_scan` switch
-    /// attempt have no counterpart here. The BSS-parameters-changed
-    /// threshold is not applied: the per-link `bss_param_ch_cnt_link_id`
-    /// tracking it depends on is not kept.
+    /// an owned firmware link id to its spec link id. More than
+    /// IWL_MLD_MISSED_BEACONS_THRESHOLD beacons missed since the last RX
+    /// raise `ieee80211_cqm_beacon_loss_notify` (`cqm_beacon_loss`) and,
+    /// outside EMLSR, request `iwl_mld_int_mlo_scan` (`Rescan`) to try a
+    /// better link. In EMLSR the current link is also left after the
+    /// BSS-parameters-changed threshold when another link's beacon last
+    /// reported this link's change count (`bss_param_reporter`).
     pub fn missed_beacons(
         &mut self,
         payload: &[u8],
@@ -416,6 +470,12 @@ impl Emlsr {
                 MissedBeacons::Ignored
             });
         }
+        if since_rx > MISSED_THRESHOLD {
+            self.cqm_beacon_loss = true;
+            if !self.emlsr_active() {
+                return Ok(MissedBeacons::Rescan);
+            }
+        }
         if self.active.count_ones() <= 1 || other_fw == FW_CTXT_ID_INVALID {
             return Ok(MissedBeacons::Ignored);
         }
@@ -425,7 +485,9 @@ impl Emlsr {
         let keep = if missed >= BCN_LOSS_EXIT_2_LINKS && other_missed >= BCN_LOSS_EXIT_2_LINKS {
             // Symmetric failure keeps the primary.
             self.primary_link()
-        } else if missed >= BCN_LOSS_EXIT {
+        } else if missed >= BCN_LOSS_EXIT
+            || self.bss_param_reporter(link) != link && missed >= BCN_LOSS_EXIT_BSS_PARAM_CHANGED
+        {
             // Only this link is sick: keep iwl_mld_get_other_link.
             let other = self.active & !(1u16 << link);
             if other == 0 {
@@ -474,6 +536,9 @@ const MISSED_SINCE_RX_THOLD: u32 = 6;
 const MISSED_THRESHOLD_LONG: u32 = 19;
 const BCN_LOSS_EXIT_2_LINKS: u32 = 5;
 const BCN_LOSS_EXIT: u32 = 15;
+const BCN_LOSS_EXIT_BSS_PARAM_CHANGED: u32 = 11;
+/// constants.h IWL_MLD_MISSED_BEACONS_THRESHOLD.
+const MISSED_THRESHOLD: u32 = 8;
 /// fw/api FW_CTXT_ID_INVALID.
 const FW_CTXT_ID_INVALID: u32 = 0xffff_ffff;
 
@@ -483,7 +548,36 @@ pub(super) enum MissedBeacons {
     Disconnect,
     /// Leave EMLSR keeping this single link set.
     Keep(u16),
+    /// Single active link not heard: try a better link
+    /// (`iwl_mld_int_mlo_scan`).
+    Rescan,
     Ignored,
+}
+
+/// cfg80211 `cfg80211_iter_rnr` over one Reduced Neighbor Report body,
+/// yielding (link id, BSS Parameters Change Count) from TBTT-type entries
+/// of at least `ieee80211_tbtt_info_ge_11` (16 octets) whose MLD
+/// parameters name `mld_id`. Iteration stops at a malformed entry.
+fn rnr_mld_counts(body: &[u8], mld_id: u8) -> Vec<(u8, u8)> {
+    let mut out = Vec::new();
+    let mut pos = body;
+    while pos.len() >= 4 {
+        let (header, len) = (pos[0], usize::from(pos[1]));
+        let count = usize::from(header >> 4) + 1;
+        let Some(entries) = pos.get(4..4 + count * len) else {
+            break;
+        };
+        if header & 3 == 0 && len >= 16 {
+            for info in entries.chunks_exact(len) {
+                let params = u16::from_le_bytes([info[14], info[15]]);
+                if info[13] == mld_id {
+                    out.push(((params & 0xf) as u8, ((params >> 4) & 0xff) as u8));
+                }
+            }
+        }
+        pos = &pos[4 + count * len..];
+    }
+    out
 }
 
 fn word(payload: &[u8], at: usize) -> Option<u32> {
@@ -1028,3 +1122,224 @@ impl Selector {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "sc_emlsr_tests.rs"]
 mod tests;
+
+/// Linux ieee80211-eht.h IEEE80211_TTLM_* and mlme.c IEEE80211_ADV_TTLM_*.
+const TTLM_EXT_ID: u8 = 109;
+const TTLM_MAX_CNT: usize = 2;
+const TTLM_DIRECTION_BOTH: u8 = 2;
+const TTLM_DEF_LINK_MAP: u8 = 0x04;
+const TTLM_SWITCH_TIME_PRESENT: u8 = 0x08;
+const TTLM_EXPECTED_DUR_PRESENT: u8 = 0x10;
+const TTLM_LINK_MAP_SIZE: u8 = 0x20;
+const ADV_TTLM_ST_UNDERFLOW: u16 = 0xff00;
+const ADV_TTLM_SAFETY_BUFFER_US: u64 = 100_000;
+
+/// mlme.c `struct ieee80211_adv_ttlm_info` (without the active flag).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct AdvTtlm {
+    pub switch_time: u16,
+    pub duration: u32,
+    pub map: u16,
+}
+
+/// ieee80211-eht.h `ieee80211_tid_to_link_map_size_ok` over the element
+/// body after the extension id.
+fn ttlm_size_ok(data: &[u8]) -> bool {
+    let Some(&control) = data.first() else {
+        return false;
+    };
+    let mut len = 0usize;
+    if control & TTLM_SWITCH_TIME_PRESENT != 0 {
+        len += 2;
+    }
+    if control & TTLM_EXPECTED_DUR_PRESENT != 0 {
+        len += 3;
+    }
+    if control & TTLM_DEF_LINK_MAP == 0 {
+        len += 1;
+        let Some(&presence) = data.get(1) else {
+            return false;
+        };
+        let size = if control & TTLM_LINK_MAP_SIZE != 0 {
+            1
+        } else {
+            2
+        };
+        len += presence.count_ones() as usize * size;
+    }
+    data.len() > len
+}
+
+/// mlme.c `ieee80211_parse_adv_t2l`: both directions, every TID mapped
+/// to the same non-empty link set (or the default mapping).
+pub(super) fn parse_adv_t2l(data: &[u8]) -> Result<AdvTtlm, ()> {
+    if !ttlm_size_ok(data) {
+        return Err(());
+    }
+    let control = data[0];
+    let mut pos = 1;
+    let mut info = AdvTtlm::default();
+    if control & 3 != TTLM_DIRECTION_BOTH {
+        return Err(());
+    }
+    let mut presence = 0;
+    if control & TTLM_DEF_LINK_MAP == 0 {
+        presence = data[pos];
+        pos += 1;
+    }
+    if control & TTLM_SWITCH_TIME_PRESENT != 0 {
+        info.switch_time = u16::from_le_bytes([data[pos], data[pos + 1]]).max(1);
+        pos += 2;
+    }
+    if control & TTLM_EXPECTED_DUR_PRESENT != 0 {
+        info.duration = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], 0]);
+        pos += 3;
+    }
+    if control & TTLM_DEF_LINK_MAP != 0 {
+        info.map = 0xffff;
+        return Ok(info);
+    }
+    let size = if control & TTLM_LINK_MAP_SIZE != 0 {
+        1
+    } else {
+        2
+    };
+    if presence != 0xff {
+        return Err(());
+    }
+    let map = |at: usize| {
+        if size == 1 {
+            u16::from(data[at])
+        } else {
+            u16::from_le_bytes([data[at], data[at + 1]])
+        }
+    };
+    info.map = map(pos);
+    if info.map == 0 || (1..8).any(|tid| map(pos + tid * size) != info.map) {
+        return Err(());
+    }
+    Ok(info)
+}
+
+/// parse.c: at most IEEE80211_TTLM_MAX_CNT size-valid TID-to-link mapping
+/// elements (ext id 109) of an EHT element stream.
+fn ttlm_elements(ies: &[u8]) -> Vec<&[u8]> {
+    let mut found = Vec::new();
+    let mut rest = ies;
+    while rest.len() >= 2 {
+        let len = usize::from(rest[1]);
+        let Some(body) = rest.get(2..2 + len) else {
+            break;
+        };
+        if rest[0] == 255
+            && body.first() == Some(&TTLM_EXT_ID)
+            && ttlm_size_ok(&body[1..])
+            && found.len() < TTLM_MAX_CNT
+        {
+            found.push(&body[1..]);
+        }
+        rest = &rest[2 + len..];
+    }
+    found
+}
+
+/// mlme.c `ieee80211_assoc_success`: an association response may carry
+/// one advertised TTLM, already in effect (no switch time) and mapping at
+/// least one valid link; the other valid links are dormant.
+pub(super) fn response_dormant(ies: &[u8], valid: u16) -> Result<(u16, Option<AdvTtlm>), ()> {
+    let elements = ttlm_elements(ies);
+    match elements.as_slice() {
+        [] => Ok((0, None)),
+        [one] => {
+            let info = parse_adv_t2l(one)?;
+            if info.switch_time != 0 || valid & info.map == 0 {
+                return Err(());
+            }
+            Ok((valid & !info.map, Some(info)))
+        }
+        _ => Err(()),
+    }
+}
+
+/// The advertised TTLM state (`ifmgd->ttlm_info`, its switch work and
+/// `vif->dormant_links`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TtlmState {
+    pub info: AdvTtlm,
+    pub active: bool,
+    pub switch_at_ms: Option<u64>,
+    pub dormant: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TtlmAction {
+    None,
+    /// `ieee80211_vif_set_links(valid, 0)`: back to the default mapping.
+    Default,
+    /// `__ieee80211_disconnect` on an invalid advertised mapping.
+    Disconnect,
+}
+
+impl TtlmState {
+    /// Adopt the association response's mapping.
+    pub fn associated(&mut self, dormant: u16, info: Option<AdvTtlm>) {
+        *self = Self {
+            info: info.unwrap_or_default(),
+            active: info.is_some(),
+            switch_at_ms: None,
+            dormant,
+        };
+    }
+
+    /// mlme.c `ieee80211_process_adv_ttlm` for one beacon of an MLD
+    /// association with its TSF `beacon_ts`.
+    pub fn process(&mut self, ies: &[u8], beacon_ts: u64, now_ms: u64) -> TtlmAction {
+        let elements = ttlm_elements(ies);
+        if elements.is_empty() {
+            let mut action = TtlmAction::None;
+            if self.info.switch_time != 0 {
+                // A planned mapping was cancelled.
+                self.switch_at_ms = None;
+            } else if self.active {
+                self.dormant = 0;
+                action = TtlmAction::Default;
+            }
+            self.info = AdvTtlm::default();
+            self.active = false;
+            return action;
+        }
+        for element in elements {
+            let Ok(info) = parse_adv_t2l(element) else {
+                return TtlmAction::Disconnect;
+            };
+            if info.switch_time != 0 {
+                // The switch time is TSF bits 10..25.
+                let beacon_tu = ((beacon_ts >> 10) & 0xffff) as u16;
+                let delay = info.switch_time.wrapping_sub(beacon_tu);
+                if delay > ADV_TTLM_ST_UNDERFLOW {
+                    return TtlmAction::None;
+                }
+                let delay_us = (u64::from(delay) * 1024).saturating_sub(ADV_TTLM_SAFETY_BUFFER_US);
+                self.info = info;
+                self.switch_at_ms = Some(now_ms + delay_us / 1000);
+                return TtlmAction::None;
+            }
+        }
+        TtlmAction::None
+    }
+
+    /// mlme.c `ieee80211_tid_to_link_map_work` when the switch is due:
+    /// the new (active, dormant) sets for `ieee80211_ttlm_set_links`.
+    pub fn due(&mut self, now_ms: u64, valid: u16) -> Option<(u16, u16)> {
+        if self.switch_at_ms.is_none_or(|at| now_ms < at) {
+            return None;
+        }
+        self.switch_at_ms = None;
+        let active = self.info.map & valid;
+        let dormant = !self.info.map & valid;
+        self.dormant = dormant;
+        self.active = true;
+        self.info.switch_time = 0;
+        Some((active, dormant))
+    }
+}

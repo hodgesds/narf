@@ -308,6 +308,40 @@ pub fn notify_cqm_packet_loss(name: &str, peer: [u8; 6], packets: u32) {
     );
 }
 
+/// `cfg80211_cqm_beacon_loss_notify`: the driver's beacon-loss threshold
+/// was crossed (`cfg80211_prepare_cqm` with no peer address, then the
+/// `NL80211_ATTR_CQM_BEACON_LOSS_EVENT` flag). Userspace owns any roam.
+pub fn notify_cqm_beacon_loss(name: &str) {
+    const NOTIFY_CQM: u8 = 64;
+    const ATTR_CQM: u16 = 94;
+    const CQM_BEACON_LOSS_EVENT: u16 = 8;
+    const NLA_F_NESTED: u16 = 1 << 15;
+    let Some(ifindex) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(net) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let Some(wiphy) = wiphy_for_name(name) else {
+        return;
+    };
+    let mut cqm = Vec::new();
+    push_attr(&mut cqm, CQM_BEACON_LOSS_EVENT, &[]);
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut attrs, ATTR_CQM | NLA_F_NESTED, &cqm);
+    narf_net::netlink_generic::publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        net.net_ns_id,
+        GenlReply {
+            command: NOTIFY_CQM,
+            attrs,
+        },
+    );
+}
+
 /// `cfg80211_cqm_rssi_notify` → `NL80211_CMD_NOTIFY_CQM` on the MLME
 /// multicast group. The level is the mac80211-style averaged beacon RSSI;
 /// `high = false` / `true` maps to the LOW / HIGH threshold event values.

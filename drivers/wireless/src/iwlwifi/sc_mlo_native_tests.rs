@@ -65,6 +65,18 @@ impl Model {
                 }),
             "native MLD translation outlived current MAC EHT setup",
         )?;
+        // mld/iface.c iwl_mld_mac_cmd_fill_sta: the FakeAp response Basic
+        // MLE (control 0x0110: link id + MLD capabilities) has neither EML
+        // capabilities nor a medium sync delay, so the associated MAC
+        // carries esr_transition_timeout 0 and the 0x10ac default delay.
+        require(
+            commands
+                .iter()
+                .rev()
+                .find(|(g, c, _)| (*g, *c) == (3, 8))
+                .is_some_and(|(_, _, b)| b[37] == 0 && b[38..40] == [0xac, 0x10]),
+            "native MLD associated MAC lacks the default esr fields",
+        )?;
         let link = commands
             .iter()
             .enumerate()

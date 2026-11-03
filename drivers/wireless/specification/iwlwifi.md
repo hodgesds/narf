@@ -4345,9 +4345,54 @@ association link's PHY/power facts (its MLE was proven per link). Group
 replay and BIP resolve the association link by its fixed spec id.
 Written, unexecuted: the extended `smoke_iwl_mld_further_link_owner_and_sta_mask`.
 
-Still open (`mlo` row not complete): the missed-beacon BSS-parameters-changed
-threshold and CQM beacon-loss/MLO-rescan path; advertised TID-to-link
-mapping (dormant links); 6GHz further links; and the public
+**Missed-beacon completeness (pass 8).** MISSED_BEACONS_NOTIF now follows
+all of link.c `iwl_mld_handle_missed_beacon_notif`: more than
+IWL_MLD_MISSED_BEACONS_THRESHOLD (8) beacons missed since the last RX raise
+`ieee80211_cqm_beacon_loss_notify`, emitted as nl80211 NOTIFY_CQM with the
+`NL80211_ATTR_CQM_BEACON_LOSS_EVENT` flag (`cfg80211_cqm_beacon_loss_notify`,
+no peer address), and outside EMLSR request the internal MLO scan to switch
+to a better link (the scan's selection may now switch the primary link).
+In EMLSR the current link is also left at 11 missed beacons when another
+link's beacon last reported its BSS Parameters Change Count
+(`bss_param_ch_cnt_link_id`, IWL_MLD_BCN_LOSS_EXIT_ESR_THRESH_BSS_PARAM_CHANGED).
+`Emlsr::update_bss_param` is mlme.c `ieee80211_mgd_update_bss_param_ch_cnt`
+for each beacon of an active link: RNR TBTT entries (>=16 octets) of the
+same AP MLD ID (shared `BasicMultiLink::mld_id`, 0 when absent) move a
+valid link's count/reporter only on change; the beacon's own Basic MLE
+count re-records its own link; 255 is ignored. The reporter defaults to the
+link itself, as mlme.c sets at association. The host's 10s beacon monitor
+remains as the fallback (mac80211's own monitor is off under iwl mld's
+CONNECTION_MONITOR). These paths run for MLD associations only.
+Written, unexecuted: `smoke_iwl_mld_missed_beacons_cqm_rescan_and_bss_param_changed`.
+
+**Advertised TID-to-link mapping (pass 8).** mlme.c's advertised TTLM is
+ported (`sc_emlsr::{parse_adv_t2l, response_dormant, TtlmState}`): elements
+(ext id 109, at most two, `ieee80211_tid_to_link_map_size_ok`) must map
+both directions with every TID on the same non-empty link set or the
+default mapping. An association response may carry one mapping already in
+effect that maps a valid link; the other valid links start dormant
+(`ieee80211_assoc_success`); an invalid one fails the association. Unlike
+mac80211, a response that makes the native association link itself dormant
+is refused rather than served by another link at once. Each beacon of an
+active link runs `ieee80211_process_adv_ttlm` with its TSF: a switch time
+(TSF bits 10..25, underflow 0xff00 ignored) schedules the switch 100ms
+early; at the due time links outside the map become dormant and active
+links keep only mapped ones, else the lowest usable link serves (which may
+switch the primary link); no mapped valid link disconnects
+(`ieee80211_ttlm_set_links`). A withdrawn active mapping returns to the
+default (no dormant link); a withdrawn planned one is cancelled; an invalid
+advertised element disconnects. Dormant links are not usable: they are
+never activated, graded or scanned (`ieee80211_vif_usable_links`).
+Negotiated TTLM is not implemented and no TTLM negotiation support is
+advertised (MLD Capabilities stay 0). The expected-duration field is
+parsed only, as in Linux.
+Written, unexecuted: `smoke_iwl_mld_advertised_ttlm_dormant_links_and_switch`.
+The single-link MLD FakeAp fixture (`sc_mlo_native_tests.rs`) now requires
+the associated MAC_CONFIG to carry esr_transition_timeout 0 and the
+0x10ac default medium sync delay, since its response Basic MLE (control
+0x0110) has no EML capabilities or medium sync delay.
+
+Still open (`mlo` row not complete): 6GHz further links; and the public
 narf_wireless/nl80211 multiple-link surface (WIPHY_FLAG_SUPPORTS_MLO,
 EHT MLD iftype capabilities, MLO link reporting). Nothing is advertised.
 

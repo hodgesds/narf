@@ -1023,6 +1023,12 @@ impl Device {
                     }
                 }
             }
+            // link.c iwl_mld_handle_missed_beacon_notif ->
+            // ieee80211_cqm_beacon_loss_notify (as set_link_locked emits
+            // its nl80211 event under the owner lock).
+            if connection.take_cqm_beacon_loss() && self.current_owner() {
+                narf_wireless::nl80211::notify_cqm_beacon_loss(self.name());
+            }
             match connection.reorder_tick() {
                 Ok(frames) => {
                     for bytes in frames {

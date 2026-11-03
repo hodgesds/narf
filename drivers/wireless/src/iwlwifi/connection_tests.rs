@@ -68,6 +68,7 @@ fn connection() -> Connection {
         mlo_select: super::super::sc_emlsr::Selector::default(),
         active_request: None,
         mld_association: None,
+        ttlm: Default::default(),
         client: None,
         mld_eapol: VecDeque::new(),
         tx_amsdu: super::super::sc_tx_amsdu::Limits::default(),

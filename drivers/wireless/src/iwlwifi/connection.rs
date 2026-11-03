@@ -90,6 +90,8 @@ pub struct Connection {
     /// The association link's final PHY/LINK/STA/TLC bodies, retained so a
     /// primary-link switch can deactivate and later restore it.
     mld_association: Option<super::sc_mlo_assoc::AssociationBodies>,
+    /// Advertised TID-to-link mapping and dormant links (mlme.c).
+    ttlm: super::sc_emlsr::TtlmState,
     client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
@@ -225,6 +227,7 @@ impl Connection {
             mlo_select: super::sc_emlsr::Selector::default(),
             active_request: None,
             mld_association: None,
+            ttlm: Default::default(),
             client: None,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -825,6 +828,7 @@ impl Connection {
             mlo_select: super::sc_emlsr::Selector::default(),
             active_request: None,
             mld_association: None,
+            ttlm: Default::default(),
             client,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -1016,6 +1020,20 @@ impl Connection {
                 .with_further_links(link_security)?;
         }
         this.mld_links = valid_links;
+        if let Some(mld) = &this.mld {
+            // mlme.c ieee80211_assoc_success: a response TTLM must already
+            // be in effect and map a valid link; the rest are dormant.
+            let association = mld.association().spec_link;
+            let valid = this.mld_valid_links() | 1 << association;
+            let (dormant, info) = super::sc_emlsr::response_dormant(&reply[6..], valid)
+                .map_err(|()| "invalid advertised TTLM in association response")?;
+            if dormant & (1 << association) != 0 {
+                // mac80211 would serve another link at once; the native
+                // association link cannot start dormant here.
+                return Err("advertised TTLM makes the association link dormant");
+            }
+            this.ttlm.associated(dormant, info);
+        }
         this.emlsr
             .links_activated(this.mld_active_links(), now_ms());
         if let Some(client) = &this.client {
@@ -2318,6 +2336,29 @@ impl Connection {
         };
         if let Some(mld) = &self.mld {
             mld.confirm_mpdu_beacon(mpdu)?;
+            // mlme.c ieee80211_mgd_update_bss_param_ch_cnt per receiving link.
+            if frame[0] == 0x80 && frame.len() >= 24 && frame[10..16] == peer {
+                if let (Some(link), Some(ies)) = (
+                    mld.receiving_link(mpdu),
+                    mpdu.body(24, 0).and_then(|body| body.get(12..)),
+                ) {
+                    let valid = self.mld_valid_links() | 1 << mld.association().spec_link;
+                    self.emlsr.update_bss_param(link, ies, valid);
+                    // mlme.c ieee80211_process_adv_ttlm with the beacon TSF.
+                    let tsf = u64::from_le_bytes(
+                        mpdu.body(24, 0)
+                            .and_then(|body| body.get(..8))
+                            .and_then(|tsf| tsf.try_into().ok())
+                            .unwrap_or([0; 8]),
+                    );
+                    if self.ttlm.process(ies, tsf, now_ms())
+                        == super::sc_emlsr::TtlmAction::Disconnect
+                    {
+                        self.authorized = false;
+                        return Err("invalid advertised TID-to-link mapping");
+                    }
+                }
+            }
         }
         if frame.len() >= 24 && frame[10..16] == peer && frame[16..22] == peer {
             if frame[0] == 0x80 && self.receiving_further(mpdu).is_some() {
@@ -2486,6 +2527,12 @@ impl Connection {
         self.mld.as_ref().map_or(1, |mld| mld.sta_mask())
     }
 
+    /// A pending `ieee80211_cqm_beacon_loss_notify` from the firmware's
+    /// missed-beacon report, consumed by the device's nl80211 event.
+    pub(super) fn take_cqm_beacon_loss(&mut self) -> bool {
+        core::mem::take(&mut self.emlsr.cqm_beacon_loss)
+    }
+
     /// The accepted further links' MLD Link IDs (valid links).
     pub fn mld_valid_links(&self) -> u16 {
         self.mld_links
@@ -2543,6 +2590,14 @@ impl Connection {
             match emlsr.missed_beacons(payload, |fw| self.spec_of_fw_link(fw), now_ms) {
                 Ok(MissedBeacons::Disconnect) => return Err("MLD beacon loss"),
                 Ok(MissedBeacons::Keep(set)) => Some(set),
+                Ok(MissedBeacons::Rescan) => {
+                    // link.c: not in EMLSR and the link is not heard:
+                    // try to switch to a better link.
+                    if self.multi_link() {
+                        self.mlo_select.scan_requested = true;
+                    }
+                    None
+                }
                 _ => None,
             }
         } else if key == sc_emlsr::ESR_MODE_NOTIF {
@@ -2675,6 +2730,9 @@ impl Connection {
         let active = self.mld_active_links();
         let mut candidates = Vec::new();
         for seen in &self.mlo_select.seen {
+            if self.ttlm.dormant & (1 << seen.spec_link) != 0 {
+                continue;
+            }
             let (channel, phy, phy_id) = if seen.spec_link == association.spec_link {
                 (association.channel, &self.phy, association_phy)
             } else if let Some(valid) = self
@@ -2796,11 +2854,22 @@ impl Connection {
             return Ok(());
         };
         let primary = *binding.primary();
-        let mut channels = alloc::vec![binding.association().channel];
+        // iwl_mld_int_mlo_scan scans the usable (non-dormant) links.
+        let mut channels = Vec::new();
+        if self.ttlm.dormant & (1 << binding.association().spec_link) == 0 {
+            channels.push(binding.association().channel);
+        }
         for link in &self.mld_links {
-            if link.keys.is_some() && !channels.contains(&link.channel()) {
+            if link.keys.is_some()
+                && self.ttlm.dormant & (1 << link.link_id()) == 0
+                && !channels.contains(&link.channel())
+            {
                 channels.push(link.channel());
             }
+        }
+        if channels.is_empty() {
+            self.mlo_select.scan_requested = false;
+            return Ok(());
         }
         let version = hw.version(1, 0xd).ok_or("scan command version absent")?.0;
         let body = sc_emlsr::Selector::scan_body(version, &channels, primary.fw_link)?;
@@ -2822,6 +2891,7 @@ impl Connection {
     /// facts. When adding would exceed two links, removal goes first.
     /// TX is drained around each change.
     async fn service_active_links(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        self.service_ttlm()?;
         let Some(target) = self.active_request.take() else {
             return Ok(());
         };
@@ -2829,13 +2899,15 @@ impl Connection {
             return Ok(());
         };
         let association = binding.association().spec_link;
+        // ieee80211_vif_usable_links: dormant links cannot be activated.
         let usable = self
             .mld_links
             .iter()
             .filter(|valid| valid.keys.is_some())
             .fold(1u16 << association, |mask, valid| {
                 mask | 1 << valid.link_id()
-            });
+            })
+            & !self.ttlm.dormant;
         let current = binding.active_links();
         if target == 0
             || target & !usable != 0
@@ -2862,6 +2934,33 @@ impl Connection {
         }
         if !remove_first {
             self.remove_links(hw, remove).await?;
+        }
+        Ok(())
+    }
+
+    /// mlme.c `ieee80211_tid_to_link_map_work`/`ieee80211_ttlm_set_links`
+    /// when an advertised mapping's switch time arrives: links outside the
+    /// map become dormant; active links keep only mapped ones, else the
+    /// lowest usable link serves. No mapped valid link disconnects.
+    fn service_ttlm(&mut self) -> Result<(), &'static str> {
+        let Some(mld) = &self.mld else {
+            return Ok(());
+        };
+        let valid = self.mld_valid_links() | 1 << mld.association().spec_link;
+        let Some((active, dormant)) = self.ttlm.due(now_ms(), valid) else {
+            return Ok(());
+        };
+        if active == 0 {
+            self.authorized = false;
+            return Err("advertised TID-to-link mapping maps no valid link");
+        }
+        let current = self.mld_active_links();
+        if current != active {
+            let mut keep = active & current;
+            if keep == 0 {
+                keep = 1 << (valid & !dormant).trailing_zeros();
+            }
+            self.active_request = Some(keep);
         }
         Ok(())
     }
