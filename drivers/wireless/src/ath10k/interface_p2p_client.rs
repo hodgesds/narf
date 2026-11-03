@@ -66,7 +66,7 @@ pub(super) fn retire(radio: &Arc<Mutex<Radio<super::super::boot::PciBoot>>>) {
         }
     };
     if let Some(client) = client {
-        client.retire_client_host();
+        client.retire_virtual_host();
     }
 }
 
@@ -81,7 +81,7 @@ fn forget(device: &Arc<Native>) {
 /// the netdev address and from the default P2P Device Address
 /// (`brcmfmac/p2p.c::brcmf_p2p_generate_bss_mac`: the device address with
 /// the locally administered bit, byte 4 XOR 0x80).
-fn interface_address(primary: [u8; 6]) -> [u8; 6] {
+pub(super) fn interface_address(primary: [u8; 6]) -> [u8; 6] {
     let mut address = primary;
     address[0] |= 0x02;
     address[4] ^= 0x80;
@@ -117,6 +117,7 @@ impl Native {
             || address[0] & 1 != 0
             || address == self.mac
             || Some(address) == device_mac
+            || Some(address) == p2p_go::of(&self.radio).map(|go| go.mac)
         {
             return Err(WirelessError::InvalidArgs);
         }
@@ -141,7 +142,9 @@ impl Native {
         }
         let (features, delivered) = {
             let radio = self.radio.try_lock().ok_or(WirelessError::Busy)?;
-            if radio.p2p_client_vdev().is_some() || radio.ap_exists() {
+            // A GO runs beside the station slots; the managed netdev's AP
+            // replaces the managed vdev and is not sibling-aware.
+            if radio.p2p_client_vdev().is_some() || radio.ap_exists() && !radio.ap_is_go() {
                 return Err(WirelessError::Busy);
             }
             (
@@ -203,18 +206,20 @@ impl Native {
         }
         narf_wireless::reconnect::forget(&self.name);
         self.close();
-        self.unpublish_client();
+        self.unpublish_virtual();
         self.kick();
         Ok(())
     }
 
-    fn unpublish_client(&self) {
+    /// Unpublish a virtual (P2P client or GO) netdev.
+    pub(super) fn unpublish_virtual(&self) {
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
         narf_net::iface::unregister(&self.name);
     }
 
-    fn retire_client_host(&self) {
+    /// Generation retirement of a virtual (P2P client or GO) netdev.
+    pub(super) fn retire_virtual_host(&self) {
         {
             let _publication = self.publication.lock();
             if self.retired.load(Ordering::Acquire) {
@@ -230,7 +235,7 @@ impl Native {
         }
         // A deleted netdev is already unpublished; its name may be reused.
         if !self.deleting.swap(true, Ordering::AcqRel) {
-            self.unpublish_client();
+            self.unpublish_virtual();
         }
     }
 
@@ -290,7 +295,7 @@ async fn serve(device: Arc<Native>, signal: Arc<super::super::irq::Signal>, deli
             // is gone (`nl80211_notify_iface(.., NL80211_CMD_DEL_INTERFACE)`)
             // before it is unpublished.
             narf_wireless::nl80211::notify_interface_removed(device.as_ref());
-            device.unpublish_client();
+            device.unpublish_virtual();
         }
         forget(&device);
         // A refusal publishes nothing; an ambiguous VDEV_CREATE leaves the

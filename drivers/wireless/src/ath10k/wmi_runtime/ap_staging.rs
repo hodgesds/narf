@@ -16,10 +16,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn ap_retire_staging(&mut self) {
         self.ap_staging = None;
     }
-    fn ap_stage_owner(&mut self) -> Result<&mut ap::Staging, Error> {
+    /// `go`: staging for a GO, which runs beside the station slots (the
+    /// managed netdev's AP replaces the station role, so its slot must be
+    /// idle).
+    fn ap_stage_owner(&mut self, go: bool) -> Result<&mut ap::Staging, Error> {
         if !self.ap_supported()
             || self.ap_exists()
-            || self.station.peer.is_some()
+            || !go && self.station.peer.is_some()
             || self.roc.is_some()
             || self.scan_pending.is_some()
             || self.failed
@@ -48,12 +51,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         key: OwnedKey,
         source: ApEmissionAuthority,
+        go: bool,
     ) -> Result<(), Error> {
         let checked = ap_key::Key::new(key.params())?;
         if checked.peer.is_some() || !source.current() {
             return Err(Error::Unsupported);
         }
-        let staging = self.ap_stage_owner()?;
+        let staging = self.ap_stage_owner(go)?;
         if let Some(index) = staging
             .keys
             .iter()
@@ -77,11 +81,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         index: u8,
         flags: (bool, bool, bool, bool),
         source: ApEmissionAuthority,
+        go: bool,
     ) -> Result<(), Error> {
         if flags != (false, true, false, false) || !source.current() {
             return Err(Error::Unsupported);
         }
-        let staging = self.ap_stage_owner()?;
+        let staging = self.ap_stage_owner(go)?;
         if !staging
             .keys
             .iter()
@@ -97,11 +102,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         index: u8,
         pairwise: bool,
         peer: Option<[u8; 6]>,
+        go: bool,
     ) -> Result<(), Error> {
         if index > 3 || pairwise || peer.is_some() {
             return Err(Error::Unsupported);
         }
-        let staging = self.ap_stage_owner()?;
+        let staging = self.ap_stage_owner(go)?;
         let index_in_list = staging
             .keys
             .iter()

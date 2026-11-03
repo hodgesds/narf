@@ -468,10 +468,10 @@ fn dispatched<F: Future>(future: F) -> Result<F::Output, narf_wireless::Wireless
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
     fn current_iftype(&self) -> u32 {
-        self.ap_mode()
+        self.ap_iftype()
     }
     fn set_iftype(&self, mode: u32) -> Result<(), narf_wireless::WirelessError> {
-        self.ap_set_mode(mode)
+        self.ap_set_iftype(mode)
     }
     fn supports_ap(&self) -> bool {
         self.ap_generation().is_some()
@@ -719,7 +719,7 @@ impl Bound {
         });
         device.ap_database_for_test(database.clone());
         assert!(device.supports_ap());
-        assert_eq!(device.set_iftype(3), Ok(()));
+        assert_eq!(device.set_iftype(if go { 9 } else { 3 }), Ok(()));
         let cap = narf_net::registry()
             .register(&narf_net::bootstrap_authority(), Adapter(device.clone()))
             .unwrap();
@@ -1855,4 +1855,53 @@ fn smoke_ath10k_p2p_go_ignores_other_vdev_peer_map() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath10k/p2p",
     smoke_ath10k_p2p_go_ignores_other_vdev_peer_map
+);
+/// The GO netdev is iftype 9 for its whole life (`set_iftype` accepts only
+/// 9) and owns the GO session alone: a home netdev of the same radio may
+/// still re-assert station mode while the GO runs, cannot become an AP
+/// (one AP session), sees none of the GO's stations and cannot stop it.
+fn smoke_ath10k_p2p_go_session_owned_by_go_netdev() -> TestResult {
+    let b = Bound::with(true);
+    if b.device.current_iftype() != 9
+        || b.device.set_iftype(3) != Err(narf_wireless::WirelessError::NotSupported)
+        || b.device.set_iftype(9) != Ok(())
+    {
+        return TestResult::Fail("GO netdev iftype is fixed at 9");
+    }
+    if b.start(false).is_err() {
+        return TestResult::Fail("GO start on its own vdev");
+    }
+    let home = Device::for_test(
+        "ath10kgohome0",
+        [2, 0, 0, 0, 0, 0x31],
+        b.device.radio.clone(),
+        || Some(station_tests::policy()),
+    );
+    if home.current_iftype() != 2
+        || home.set_iftype(2) != Ok(())
+        || home.set_iftype(3) != Err(narf_wireless::WirelessError::Busy)
+        || !home.ap_station_macs().is_empty()
+    {
+        return TestResult::Fail("home netdev beside a running GO");
+    }
+    if !b
+        .device
+        .radio
+        .try_lock()
+        .is_some_and(|radio| radio.ap_running())
+    {
+        return TestResult::Fail("GO still running");
+    }
+    let authority = b.authority();
+    if !matches!(
+        drive(b.device.stop_ap_async(&authority)),
+        Poll::Ready(Ok(()))
+    ) {
+        return TestResult::Fail("GO stop by its own netdev");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_go_session_owned_by_go_netdev
 );

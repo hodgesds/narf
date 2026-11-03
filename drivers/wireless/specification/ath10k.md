@@ -2181,6 +2181,40 @@ will bind; none of them grants RF, peer, key or data authority.
   its session, the rest to the station's bounded `management_done`). A GO
   teardown proves only its own TX quiet (the HTT pool may hold the
   slots' MSDUs); the ordinary AP keeps the whole-pool proof.
+- **P2P GO netdev** (`interface_p2p_go.rs`, iftype 9, gated by
+  `P2P_ADVERTISED`). `NEW_INTERFACE` (`new_virtual_interface` with
+  iftype 9; outside the async control mask) on the home netdev: TLV P2P
+  firmware with AP support, home netdev in station mode, no AP session
+  and no GO netdev yet (one AP session; `-EBUSY`), address = the requested
+  one, else the client's derivation (`brcmf_p2p_generate_bss_mac`); it
+  must differ from the netdev, P2P Device and present client addresses
+  (`-EINVAL`, userspace names one). A second `Device` is registered at
+  once with `go = true` and AP mode for its whole life: own rings, TX
+  generation (`send` also resolves the GO), wiphy of the home netdev,
+  `current_iftype` 9 (`ap_iftype`; `SET_INTERFACE` accepts only 9,
+  `ap_set_iftype`), its own service worker and AP waker. No vdev exists
+  until `START_AP`, whose AP controls run `Radio::go_start` on the GO
+  vdev (`ieee80211_start_ap` -> `ath10k_add_interface`). The GO netdev
+  has no station paths (mode 3), ROC, offchannel FRAME, WoW, power save
+  or P2P_DEVICE child. Ownership: the radio has one AP session and
+  `owns_ap` (`ap_is_go() == Device::go`) binds it to one netdev:
+  `ap_control` on the other netdev is `-EBUSY`, and `ap_drain`,
+  `ap_sequence` and `ap_station_macs` see only the owner's session. The
+  home worker's AP cleanup skips a GO session (the GO worker's
+  `go_cleanup_step` tears it down when closed or abandoned, then opens a
+  fresh control generation); the home worker kicks the GO worker on every
+  vector turn. The home netdev may still `SET_INTERFACE` station while a
+  GO runs but cannot become an AP (`ap_set_mode`); a P2P client netdev
+  and a P2P_DEVICE scan are no longer refused merely because a GO
+  session exists (the managed AP still refuses both). Group-key staging
+  before `START_AP` (`ap_stage_*` with `go`) is admitted beside an
+  associated station slot for a GO only. `DEL_INTERFACE`
+  (`delete_virtual_interface`) closes and unpublishes the netdev at once;
+  the worker stops a running GO (`ap_cleanup`: DOWN, client peer deletes,
+  self peer delete, STOP, `WMI_VDEV_DELETE`, as `ieee80211_if_remove` ->
+  `ieee80211_stop_ap` -> `ath10k_remove_interface`) and only then frees
+  the GO slot; a failed teardown ends in radio recovery, which retires
+  the GO netdev with the generation (not recreated).
 - **NoA / opportunistic PS.** Linux ath10k never programs CTWindow/OppPS or
   a NoA schedule from the host; firmware owns both and reports them.
   `Noa::tlv_event` decodes `WMI_TLV_P2P_NOA_EVENTID` (0xd002, tags 223
@@ -2397,6 +2431,7 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_ap_builders_carry_vdev`,
 `wmi_boot/ap_native_tests.rs` `smoke_ath10k_p2p_go_own_vdev_start_and_teardown`,
 `smoke_ath10k_p2p_go_ignores_other_vdev_peer_map`,
+`smoke_ath10k_p2p_go_session_owned_by_go_netdev`,
 `smoke_ath10k_p2p_device_scan_on_own_vdev_without_cck`,
 `smoke_ath10k_p2p_device_scan_admits_listen_probe_response`,
 `smoke_ath10k_p2p_client_scan_on_client_vdev`,

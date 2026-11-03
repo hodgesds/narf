@@ -25,6 +25,8 @@ pub(in crate::ath10k) use ap::Operation as ApOperation;
 mod offchannel;
 #[path = "interface_p2p_client.rs"]
 pub(super) mod p2p_client;
+#[path = "interface_p2p_go.rs"]
+pub(super) mod p2p_go;
 #[path = "interface_p2p.rs"]
 pub(super) mod p2p_wdev;
 #[path = "interface_wow.rs"]
@@ -221,6 +223,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn into_go_for_test(mut self) -> Self {
         self.go = true;
+        self.mode = AtomicU8::new(3);
         self
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -322,6 +325,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             deleting: AtomicBool::new(false),
         }
     }
+    /// The radio's AP session exists and belongs to this netdev: a GO
+    /// session to the GO netdev, the managed AP to the home netdev.
+    fn owns_ap(&self, radio: &Radio<T>) -> bool {
+        radio.ap_exists() && radio.ap_is_go() == self.go
+    }
     /// The radio with this netdev's station slot current (the P2P client's
     /// inside its scope), if this owner's slot exists.
     fn try_station(&self) -> Option<wmi_runtime::StationGuard<'_, T>> {
@@ -374,7 +382,8 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if !self.client {
             radio.ap_prune_staging();
         }
-        if !self.client && radio.ap_exists() {
+        // A GO session is the GO netdev's worker's to tear down.
+        if !self.client && radio.ap_exists() && !radio.ap_is_go() {
             if !self.closed.load(Ordering::Acquire) && !radio.ap_abandoned() {
                 return Ok(false);
             }
@@ -1442,7 +1451,10 @@ fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>
     let active = ACTIVE.lock().clone();
     let device = match active.filter(|d| d.generation == generation) {
         Some(device) => device,
-        None => p2p_client::current().ok_or(())?,
+        None => p2p_client::current()
+            .filter(|d| d.generation == generation)
+            .or_else(p2p_go::current)
+            .ok_or(())?,
     };
     device.enqueue_generation(generation, bytes, meta)
 }
@@ -1457,6 +1469,7 @@ pub(super) fn retire(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) {
     *active = None;
     drop(active);
     p2p_client::retire(radio);
+    p2p_go::retire(radio);
     device.retire_host();
     remember_rebind(device.name());
 }
@@ -1472,7 +1485,8 @@ fn drain() -> bool {
     let device = ACTIVE.lock().clone();
     let home = device.is_some_and(|d| d.drain());
     let client = p2p_client::current().is_some_and(|d| d.drain());
-    home || client
+    let go = p2p_go::current().is_some_and(|d| d.drain());
+    home || client || go
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Admission {
@@ -1572,6 +1586,7 @@ fn publish_with_mac(
                 // One vector serves both netdevs: events this drain parks in
                 // the P2P client slot are that netdev's worker's to deliver.
                 p2p_client::kick_for(&worker.radio);
+                p2p_go::kick_for(&worker.radio);
                 let progressed = worker.drain();
                 let _ = worker.flush_management().await;
                 let _ = worker.apply_power_save().await;
@@ -1674,6 +1689,9 @@ impl WirelessNetIface for Native {
         let Some(radio) = self.radio.try_lock() else {
             return Vec::new();
         };
+        if !self.owns_ap(&radio) {
+            return Vec::new();
+        }
         let source = radio.htt.wmi.htc.transport.current_sources();
         super::firmware_source::invoke(source.as_ref(), || radio.ap_clients())
             .ok()
@@ -1720,7 +1738,7 @@ impl WirelessNetIface for Native {
         if self.client {
             return p2p_client::IFTYPE;
         }
-        self.ap_mode()
+        self.ap_iftype()
     }
     fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
         if self.client {
@@ -1730,7 +1748,7 @@ impl WirelessNetIface for Native {
                 Err(WirelessError::NotSupported)
             };
         }
-        self.ap_set_mode(mode)
+        self.ap_set_iftype(mode)
     }
     fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
         self.ap_generation()
@@ -1903,9 +1921,9 @@ impl WirelessNetIface for Native {
         self.reserve_control()
     }
     /// ROC and offchannel FRAME run on the home netdev or the P2P_DEVICE
-    /// wdev; the P2P client netdev has no ROC owner.
+    /// wdev; the P2P client and GO netdevs have no ROC owner.
     fn async_roc_control(&self) -> bool {
-        !self.client
+        !self.client && !self.go
     }
     /// The control-only P2P_DEVICE wdev (async) and the P2P client netdev
     /// (`new_virtual_interface`) are this radio's virtual interfaces.
@@ -1918,9 +1936,15 @@ impl WirelessNetIface for Native {
         iftype: u32,
         mac: Option<[u8; 6]>,
     ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if iftype == p2p_go::IFTYPE {
+            return self.new_p2p_go(name, iftype, mac);
+        }
         self.new_p2p_client(name, iftype, mac)
     }
     fn delete_virtual_interface(&self) -> Result<(), WirelessError> {
+        if self.go {
+            return self.delete_p2p_go();
+        }
         self.delete_p2p_client()
     }
     fn async_control_interfaces(&self) -> bool {
@@ -1948,7 +1972,7 @@ impl WirelessNetIface for Native {
         self.offchannel_tx
     }
     fn async_radio_management_rx_control(&self) -> bool {
-        !self.client
+        !self.client && !self.go
     }
     async fn register_mgmt_frame_radio_async(
         &self,
@@ -1956,7 +1980,7 @@ impl WirelessNetIface for Native {
         frame_type: u16,
         prefix: &[u8],
     ) -> Result<(), i32> {
-        if self.client {
+        if self.client || self.go {
             return Err(-95);
         }
         self.register_offchannel_frame(authority, frame_type, prefix)
@@ -1969,7 +1993,7 @@ impl WirelessNetIface for Native {
         frequency: u32,
         duration: u32,
     ) -> Result<(), WirelessError> {
-        if self.client {
+        if self.client || self.go {
             return Err(WirelessError::NotSupported);
         }
         self.start_offchannel(authority, cookie, frequency, duration)
@@ -1980,7 +2004,7 @@ impl WirelessNetIface for Native {
         authority: &narf_wireless::ap_control::RadioControlAuthority,
         cookie: u64,
     ) -> Result<(), WirelessError> {
-        if self.client {
+        if self.client || self.go {
             return Err(WirelessError::NotSupported);
         }
         self.cancel_offchannel(authority, cookie).await
@@ -1991,7 +2015,7 @@ impl WirelessNetIface for Native {
         cookie: u64,
         request: narf_wireless::MgmtTxRequest,
     ) -> Result<bool, WirelessError> {
-        if self.client {
+        if self.client || self.go {
             return Err(WirelessError::NotSupported);
         }
         self.transmit_offchannel(authority, cookie, request).await

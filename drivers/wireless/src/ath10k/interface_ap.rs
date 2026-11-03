@@ -100,6 +100,28 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         NonZeroU64::new(self.mode_generation.load(Ordering::Acquire))
             .filter(|v| v.get() != u64::MAX)
     }
+    /// The nl80211 iftype of an AP-capable netdev: 9 for the GO netdev
+    /// (AP mode for its whole life), else the managed netdev's mode.
+    pub(in crate::ath10k) fn ap_iftype(&self) -> u32 {
+        if self.go {
+            9
+        } else {
+            self.ap_mode()
+        }
+    }
+    /// `SET_INTERFACE`: the GO netdev keeps iftype 9 (a change would be
+    /// `ieee80211_if_change_type`, not offered); the managed netdev switches
+    /// between station and AP.
+    pub(in crate::ath10k) fn ap_set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        if self.go {
+            return if mode == 9 {
+                Ok(())
+            } else {
+                Err(WirelessError::NotSupported)
+            };
+        }
+        self.ap_set_mode(mode)
+    }
     pub(in crate::ath10k) fn ap_set_mode(&self, mode: u32) -> Result<(), WirelessError> {
         if !matches!(mode, 2 | 3) || mode == 3 && !self.ap_capable {
             return Err(WirelessError::NotSupported);
@@ -115,12 +137,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         let mut radio = self.radio.try_lock().ok_or(WirelessError::Busy)?;
         // The AP replaces the managed station vdev and is not yet
-        // sibling-aware: no AP beside a P2P client vdev.
-        if radio.ap_exists()
+        // sibling-aware: no AP beside a P2P client vdev or a GO (the radio
+        // has one AP session). A running GO is its own netdev's and does
+        // not hold the managed netdev's role.
+        if radio.ap_exists() && !radio.ap_is_go()
             || radio.scan_in_progress()
             || radio.roc_active()
             || radio.prepared_peer().is_some()
-            || (mode == 3 && radio.p2p_client_vdev().is_some())
+            || (mode == 3 && (radio.p2p_client_vdev().is_some() || radio.ap_is_go()))
         {
             return Err(WirelessError::Busy);
         }
@@ -163,9 +187,10 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.closed.load(Ordering::Acquire)
             || self.retired.load(Ordering::Acquire)
             || self.mode.load(Ordering::Acquire) != 3
-            || !self
-                .ap_generation()
-                .is_some_and(|generation| emission.matches_role(self, 3, generation))
+            || !self.ap_generation().is_some_and(|generation| {
+                // The authority binds the nl80211 iftype: 9 on the GO.
+                emission.matches_role(self, if self.go { 9 } else { 3 }, generation)
+            })
         {
             return Err(Error::Failed);
         }
@@ -217,6 +242,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             None
         };
         let mut radio = self.radio.lock().await;
+        // One AP session: the GO's belongs to the GO netdev, the managed AP
+        // to the home netdev; neither controls the other's.
+        if radio.ap_exists() && radio.ap_is_go() != self.go {
+            return Err(WirelessError::Busy);
+        }
         if !radio.ap_exists()
             && matches!(
                 &operation,
@@ -224,12 +254,12 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             )
         {
             let result = match operation {
-                Operation::Key(key) => radio.ap_stage_key(key, emission.clone()),
+                Operation::Key(key) => radio.ap_stage_key(key, emission.clone(), self.go),
                 Operation::DeleteKey(index, pairwise, peer) => {
-                    radio.ap_stage_delete(index, pairwise, peer)
+                    radio.ap_stage_delete(index, pairwise, peer, self.go)
                 }
                 Operation::DefaultKey(index, flags) => {
-                    radio.ap_stage_default(index, flags, emission.clone())
+                    radio.ap_stage_default(index, flags, emission.clone(), self.go)
                 }
                 _ => unreachable!(),
             };
@@ -460,6 +490,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     {
         let emission = self.ap_authority(authority).map_err(|_| 1)?;
         let radio = self.radio.lock().await;
+        if !self.owns_ap(&radio) {
+            return Err(2);
+        }
         let policy = radio.ap_policy().ok_or(2)?;
         let (seq, capture) = radio
             .ap_key_sequence(index, pairwise, peer, policy.domain())
@@ -499,7 +532,8 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 .radio
                 .try_lock()
                 .ok_or(Error::Htt(super::super::htt_runtime::Error::Busy))?;
-            if !radio.ap_exists() {
+            // The other netdev's AP session (GO vs managed) is not drained.
+            if !self.owns_ap(&radio) {
                 return Ok(None);
             }
             if radio.ap_abandoned() {

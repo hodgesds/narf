@@ -216,7 +216,7 @@ impl Native {
         if radio.roc_active()
             || radio.prepared_peer().is_some()
             || radio.station_link().is_some()
-            || radio.ap_exists()
+            || radio.ap_exists() && !radio.ap_is_go()
         {
             return Err(WirelessError::Busy);
         }
