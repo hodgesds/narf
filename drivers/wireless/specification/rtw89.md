@@ -2843,6 +2843,27 @@ fields) and `rtw8852c_bb_reset_all(PHY_0)` (HW-SI trigger hold, no B TSSI
 tracking pause), each read back. RF tables follow `phy.c::rtw89_phy_init_rf_reg`
 order over `{radiob, radioa}`: path B is written and paged first, then path A.
 
+**Channel geometry (`operating_channel_c`).** A typed RTL8852C chandef
+(`Band` 2.4/5/6GHz, `Width` 20/40/80/160MHz = `support_bandwidths`) built
+only from Linux core.c channel lists (2.4GHz 1..14; the 28 `rtw89_channels_5ghz`
+incl. UNII-4; 6GHz 1..233 step 4) and the unique IEEE channelization block
+(5GHz blocks from 36/100/149, 6GHz from 1, every subchannel must exist; a
+block leaving the set is refused, never narrowed; 2.4GHz HT40 takes an
+explicit secondary side within 1..13). It derives chan.c `rtw89_chan_create`
+fields (center/primary MHz, `rtw89_get_subband_type` incl. 6G IDX0..7,
+`rtw89_get_tx_comp_band`, `rtw89_get_primary_chan_idx`,
+`rtw89_get_primary_sb_idx`, `rfsi_band`), phy.h BB-gain and OFDM gain-offset
+bands, phy.c `rtw89_encode_chan_idx(primary)`, rtw8852c.c
+`rtw8852c_ctrl_sco_cck` thresholds (40MHz element literally as Linux, incl.
+`primary_ch == 1`), `rtw8852c_ctrl_ch` FC0/`DIV_ROUND_CLOSEST(1<<18, fc)` and
+CCK pulse coefficients, and rtw8852c_rfk.c CCK/OFDM/trim and 6GHz OFDM/trim
+TSSI groups (golden tables generated from the Linux switch statements).
+`is_psc` is the 802.11ax PSC set (5 + 16k). `txsc`/`mac_program` are phy.c
+`rtw89_phy_get_txsc` and the `rtw8852c_set_channel_mac(MAC_0)` RFMOD/
+TX_SUB_CARRIER/TXRATE_CHK values. It is a geometry fact: no
+caller programs or admits a C channel from it yet. Unexecuted case:
+`smoke_rtw89_c_operating_channel_matches_linux_geometry_and_tssi_groups`.
+
 Remaining for the `rtl8852c` row (no row credit): C NCTL/`bb_sethw`/
 `rtw8852c_bb_gpio_init`/`rtw8852c_rfk_init` (DACK/RX DCK/IQK/DPK/TSSI from
 rtw8852c_rfk.c), C channel MAC/BB/RF (`rtw8852c_set_channel_{mac,bb}`,

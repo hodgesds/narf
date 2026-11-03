@@ -100,6 +100,7 @@ mod mac_runtime_regs;
 mod monitor;
 mod monitor_wire;
 mod operating_channel;
+mod operating_channel_c;
 mod packet_core;
 mod packet_format;
 pub mod pci;
