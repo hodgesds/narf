@@ -3,15 +3,19 @@
 //! `rtw8822b.c::rtw8822b_pwr_track` (`power_track_type` 0) over
 //! `rtw8822b_phy_pwrtrack`, `_pwrtrack_path`, `_pwrtrack_set`,
 //! `_pwrtrack_set_pwr` and `_txagc_swing_offset`, with the `phy.c`
-//! helpers `rtw_phy_config_swing_table` (2.4 GHz), `rtw_phy_pwrtrack_avg`
+//! helpers `rtw_phy_config_swing_table` (2.4 GHz and 5 GHz), `rtw_phy_pwrtrack_avg`
 //! (`DECLARE_EWMA(thermal, 10, 4)`), `_thermal_changed`, `_get_delta`,
 //! `_get_pwridx` and `_need_iqk` (`iqk_threshold` 8) and the
-//! `rtw8822b_pwr_track_type0_tbl` 2.4 GHz rows.
+//! `rtw8822b_pwr_track_type0_tbl` rows (2.4 GHz CCK/OFDM per path; 5 GHz
+//! `pwrtrk_5ga/5gb` for `RTW_PWR_TRK_5G_1..3`, which are all equal).
 //!
 //! `rtw_phy_get_tx_power_index` is replaced by the per-path, per-rate coded
-//! index the committed channel actually programmed (`N2BP`, or the bound
-//! `N2BO` record off channel 1); a rate outside the measured legacy set is
-//! refused rather than derived. The dm watchdog drives [`Tracker::pass`] when
+//! index the committed program actually wrote (`N2BP`, or the bound `N2BO`
+//! record off channel 1, plus the bound `N2BH`/`N2BB`/`N2BV` words). A
+//! current rate that program never wrote (beyond the covered DESC_RATE
+//! range, or zero on both paths) skips the pass ([`Pass::Skipped`], no
+//! register access) rather than deriving an index or failing the dm
+//! program. The dm watchdog drives [`Tracker::pass`] when
 //! the signed `N2BD` record enables `dm::PWR_TRACK`; every register access
 //! runs inside that record's authority (which nests `N2BS`, `N2BP`, `N2BQ`
 //! and current policy). A meter sample outside the `N2BD` thermal window or
@@ -98,6 +102,16 @@ const N: [u8; TABLE] = [
 /// `rtw8822b_pwrtrk_2g_cck_a_p` equals `_2ga_p`; `_2g_cck_b_p` equals `_2gb_p`.
 const CCK_A_P: [u8; TABLE] = OFDM_A_P;
 const CCK_B_P: [u8; TABLE] = OFDM_B_P;
+/// `rtw8822b_pwrtrk_5ga_p[0..3]` = `_5gb_p[0..3]` (every 5 GHz band row).
+const P5: [u8; TABLE] = [
+    0, 1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 15, 16, 17, 18, 19, 19, 20, 21,
+    22, 22, 23,
+];
+/// `rtw8822b_pwrtrk_5ga_n[0..3]` = `_5gb_n[0..3]`.
+const N5: [u8; TABLE] = [
+    0, 1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 17, 17, 18, 19, 20,
+    20, 21, 22,
+];
 /// `rtw8822b_hw_spec.iqk_threshold`.
 const IQK_THRESHOLD: u8 = 8;
 /// `rtw8822b_txagc_swing_offset` `max_tx_pwr_idx_offset`.
@@ -105,12 +119,17 @@ const MAX_OFFSET: u8 = 0xf;
 /// `rtw8822b_hw_spec.max_power_index`.
 const MAX_POWER_INDEX: u8 = 0x3f;
 
-/// `rtw_phy_config_swing_table` 2.4 GHz rows: (positive, negative) for one
-/// DESC_RATE 0x00..0x1b: legacy12, HT MCS0..15 (the rates a 2T2R B22
-/// TXAGC program qualifies; VHT is not tracked).
-pub(super) const RATES: usize = 28;
-/// path at one DESC_RATE (CCK rates 0..3 use the CCK tables).
-fn swing(rate: u8, path: usize) -> (&'static [u8; TABLE], &'static [u8; TABLE]) {
+/// DESC_RATE 0x00..0x3f (`__RTW_RATE_SECTION_2SS_MAX`): legacy12, HT
+/// MCS0..15, the unused HT3S/HT4S words and VHT1SS/2SS MCS0..9 a 2T2R B22
+/// TXAGC program can write.
+pub(super) const RATES: usize = 64;
+/// `rtw_phy_config_swing_table` (positive, negative) for one path at one
+/// DESC_RATE on the current channel: 5 GHz uses the `RTW_PWR_TRK_5G_*` rows
+/// (identical for every band), 2.4 GHz the CCK tables for DESC_RATE 0..3.
+fn swing(rate: u8, path: usize, band5: bool) -> (&'static [u8; TABLE], &'static [u8; TABLE]) {
+    if band5 {
+        return (&P5, &N5);
+    }
     match (rate <= 3, path) {
         (true, 0) => (&CCK_A_P, &N),
         (true, _) => (&CCK_B_P, &N),
@@ -144,6 +163,9 @@ pub(super) enum Pass {
     Triggered,
     /// Meter sampled; `iqk` reports `rtw_phy_pwrtrack_need_iqk`.
     Tracked { thermal: u8, iqk: bool },
+    /// The current rate was never written by the committed program; no
+    /// register access, no state change.
+    Skipped,
 }
 
 /// Per-owner `rtw_dm_info` power-tracking state.
@@ -177,11 +199,12 @@ impl Tracker {
     pub(super) fn delta_power(&self) -> [i8; 2] {
         self.delta
     }
-    /// `rtw8822b_pwr_track` for the current `dm_info->tx_rate` (DESC_RATE).
-    /// `indices` are the committed program's per-path coded TXAGC indices
-    /// for DESC_RATE 0..`indices.1` (legacy12, plus HT MCS0..7/0..15 under a
-    /// bound `N2BH`, [`super::power_policy::Gate::b22_rate_indices`]) and
-    /// `temperature` the `N2BP` thermal-window check.
+    /// `rtw8822b_pwr_track` for the current `dm_info->tx_rate` (DESC_RATE)
+    /// on the committed channel (`Authority::b22_channel`). `indices` are the committed program's
+    /// per-path coded TXAGC indices for DESC_RATE 0..`indices.1` (legacy12,
+    /// plus the bound HT20/HT40 MCS0..15 or VHT80 words,
+    /// [`super::power_policy::Gate::b22_rate_indices`]) and `temperature` the
+    /// `N2BP` thermal-window check.
     pub(super) async fn pass(
         &mut self,
         io: &mut impl Io,
@@ -194,9 +217,16 @@ impl Tracker {
         // rtw8822b_phy_pwrtrack: an erased thermal meter disables tracking;
         // refused here before any write.
         let (indices, count) = indices;
-        if self.efuse == 0xff || usize::from(tx_rate) >= count.min(RATES) {
+        if self.efuse == 0xff {
             return Err(Error::Unsupported);
         }
+        // A rate the committed program never wrote has no index to offset
+        // from: skip the pass (no RF42 trigger, no state change).
+        let rate = usize::from(tx_rate);
+        if rate >= count.min(RATES) || indices.iter().all(|path| path[rate] == 0) {
+            return Ok(Pass::Skipped);
+        }
+        let band5 = super::band5::primary(auth.b22_channel().ok_or(Error::State)?);
         if !self.triggered {
             enclosed(|op| auth.run(op), radio8822b::rf(io, 0, 0x42, 3 << 16, 3)).await?;
             self.triggered = true;
@@ -220,7 +250,7 @@ impl Tracker {
             // 8822B has one thermal meter (path A) for both paths.
             let delta = self.thermal_avg.abs_diff(self.efuse).min(TABLE as u8 - 1);
             for path in 0..2 {
-                let (p, n) = swing(tx_rate, path);
+                let (p, n) = swing(tx_rate, path, band5);
                 let current = if self.thermal_avg > self.efuse {
                     p[usize::from(delta)] as i8
                 } else {

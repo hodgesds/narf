@@ -1079,6 +1079,9 @@ fn smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission() -> TestResult {
         fn run<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
             op()
         }
+        fn b22_channel(&self) -> Option<u8> {
+            Some(1)
+        }
     }
     let mut payload = [0u8; qualification::PAYLOAD];
     payload[..32].copy_from_slice(&[5; 32]);
@@ -1114,6 +1117,15 @@ fn smoke_rtw8822be_n2bw_power_tracking_and_iqk_admission() -> TestResult {
     let pass = |io: &mut super::mac_tests::Model, t: &mut Tracker, limits: Limits| {
         narf_scheduler::block_on(t.pass(io, &Open, indices, |_| Ok(()), limits, 4))
     };
+    // A rate the committed program never wrote (VHT1SS MCS0 over a
+    // legacy12 table) skips without touching RF42.
+    let rf42 = io.regs[0x2800 + 0x42 * 4..0x2800 + 0x42 * 4 + 4].to_vec();
+    if narf_scheduler::block_on(tracker.pass(&mut io, &Open, indices, |_| Ok(()), limits, 0x2c))
+        != Ok(Pass::Skipped)
+        || io.regs[0x2800 + 0x42 * 4..0x2800 + 0x42 * 4 + 4] != rf42[..]
+    {
+        return TestResult::Fail("8822B power tracking failed or wrote on an unwritten rate");
+    }
     if pass(&mut io, &mut tracker, limits) != Ok(Pass::Triggered) {
         return TestResult::Fail("8822B power tracking did not trigger RF42 first");
     }
@@ -1432,7 +1444,7 @@ fn smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl() -> TestResult {
         let mut want = [0u8; super::super::tracking8822b::RATES];
         want[..12].copy_from_slice(&legacy[path]);
         want[12..20].copy_from_slice(&a[..8]);
-        want[20..].copy_from_slice(if path == 0 { &a[8..] } else { &b });
+        want[20..28].copy_from_slice(if path == 0 { &a[8..] } else { &b });
         if rates[path] != want {
             return TestResult::Fail("8822B HT tracking table differs from the programmed words");
         }

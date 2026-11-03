@@ -61,7 +61,7 @@ coef 20x 1bd4 tbl, saturate 1000/0fff fallback 1fff/04001fff, txagc-6 1b67, gs d
 enable 1b08/1b60 bit31 gs; dpk_track ewma thermal(10,4) delta-k_delta 1b58[6:0] bounded by payload window; restore dpd off";
 
 /// RTL8822BE dm contract (`N2BD`), hashed with [`SOURCE`] for B22 requests.
-pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track type0 bit5: RF42[17:16]=3 trigger, next pass RF-A 42[15:10] inside N2BD and N2BP windows, EWMA thermal(10,4), init_trigger or avg!=sample, delta=min(|avg-efuse A|,29) one meter both paths, rtw8822b_pwrtrk_2g{a,b}_{p,n}/2g_cck tables bounded by N2BD power_up/down, rtw8822b_pwrtrack_set with the committed channel TXAGC index offset 3f-index, txagc_swing_offset max 0xf upper default+10, c94/e94[29:25] c1c/e1c[31:21] rtw8822b_txscale_tbl, default_ofdm_index from c1c (rtw8822b_get_swing_index else 24), base fields restored; need_iqk threshold 8 only through N2BW; rtw8822b_adaptivity bit6: rtw_phy_adaptivity_set_mode ETSI l2h_th_ini_ad -14+50=36, JP l2h_th_ini_cs 10+50=60, else normal; normal l2h=max(igi+8,48) h2l=l2h-8, adaptivity l2h=min(igi,ini) h2l=l2h-7; rtw8822b_edcca_th 8a4 byte0 l2h byte1 h2l offset0; base 8a4[15:0] (rtw8822b_adaptivity_init 7f/7f) restored";
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track type0 bit5: RF42[17:16]=3 trigger, next pass RF-A 42[15:10] inside N2BD and N2BP windows, EWMA thermal(10,4), init_trigger or avg!=sample, delta=min(|avg-efuse A|,29) one meter both paths, rtw8822b_pwrtrk_2g{a,b}_{p,n}/2g_cck tables (2.4GHz) or 5g{a,b}_{p,n} RTW_PWR_TRK_5G_1..3 (5GHz) bounded by N2BD power_up/down, a current DESC_RATE the committed program never wrote (beyond legacy12/HT/VHT words or zero on both paths) skips the pass, rtw8822b_pwrtrack_set with the committed channel TXAGC index offset 3f-index, txagc_swing_offset max 0xf upper default+10, c94/e94[29:25] c1c/e1c[31:21] rtw8822b_txscale_tbl, default_ofdm_index from c1c (rtw8822b_get_swing_index else 24), base fields restored; need_iqk threshold 8 only through N2BW; rtw8822b_adaptivity bit6: rtw_phy_adaptivity_set_mode ETSI l2h_th_ini_ad -14+50=36, JP l2h_th_ini_cs 10+50=60, else normal; normal l2h=max(igi+8,48) h2l=l2h-8, adaptivity l2h=min(igi,ini) h2l=l2h-7; rtw8822b_edcca_th 8a4 byte0 l2h byte1 h2l offset0; base 8a4[15:0] (rtw8822b_adaptivity_init 7f/7f) restored";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     bounds(did, p).is_some()
@@ -170,6 +170,11 @@ pub(super) trait Authority {
     /// RTL8822BE `N2BP` measured thermal windows.
     fn b22_temperature(&self, _: u8) -> Result<(), Error> {
         Err(Error::Unsupported)
+    }
+    /// RTL8822BE committed primary channel (`hal.current_channel`), which
+    /// selects the `rtw_phy_config_swing_table` band rows.
+    fn b22_channel(&self) -> Option<u8> {
+        None
     }
 }
 

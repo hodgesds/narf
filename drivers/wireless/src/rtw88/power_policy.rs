@@ -798,8 +798,9 @@ impl Gate {
     /// 0..count: [`Self::b22_indices`], plus the bound `N2BH` HT words
     /// (`ht::Grant::b22_rates`; count 20 for 1SS, 28 for 2SS), or under a
     /// bound `N2BB` the HT40 words that replace them (`ht40::b22_words`).
-    /// Under a bound `N2BV` the program zeroes the HT words
-    /// (`vht::b22_words`), so only legacy12 is covered (VHT is not tracked).
+    /// Under a bound `N2BV` the whole DESC_RATE 0x00..0x3f tables
+    /// (`vht::b22_tables`: legacy12, HT zero, VHT1SS/2SS; count 64), with
+    /// path-B VHT1SS (programmed zero) taking path A's index.
     pub(super) fn b22_rate_indices(
         &self,
     ) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
@@ -817,9 +818,13 @@ impl Gate {
                 rates[1][12..20].copy_from_slice(&r.indices[..8]);
                 return Some((rates, if r.mcs & 0xff00 != 0 { 28 } else { 20 }));
             }
-            if self.vht.is_none() {
-                return g.b22_rates();
+            if let Some(v) = self.vht_record() {
+                let mut rates = super::vht::b22_tables(self.b22_indices()?, &v);
+                let one: [u8; 10] = rates[0][0x2c..0x36].try_into().ok()?;
+                rates[1][0x2c..0x36].copy_from_slice(&one);
+                return Some((rates, super::tracking8822b::RATES));
             }
+            return g.b22_rates();
         }
         let legacy = self.b22_indices()?;
         let mut rates = [[0; super::tracking8822b::RATES]; 2];

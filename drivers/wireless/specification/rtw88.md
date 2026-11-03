@@ -597,10 +597,11 @@ only. Case written, unexecuted:
 driven by the dm watchdog when the `N2BD` payload enables `dm::PWR_TRACK`:
 alternating RF42[17:16] trigger and RF-A meter sample, `DECLARE_EWMA(thermal,
 10, 4)` average, `rtw_phy_pwrtrack_thermal_changed`/`_get_delta`/`_get_pwridx`
-over the `rtw8822b_pwr_track_type0_tbl` 2.4 GHz rows (CCK tables for DESC_RATE
-≤ 11M), one meter (path A) for both paths, `rtw8822b_pwrtrack_set` with the
-committed channel's coded per-path per-rate index (`Gate::b22_indices`: the
-`N2BP` indices on channel 1, the bound `N2BO` record's elsewhere) in place of
+over the `rtw8822b_pwr_track_type0_tbl` rows of the committed band (2.4 GHz
+CCK tables for DESC_RATE ≤ 11M; 5 GHz `pwrtrk_5g{a,b}`), one meter (path A) for both paths, `rtw8822b_pwrtrack_set` with the
+committed program's coded per-path per-rate index (`Gate::b22_rate_indices`:
+the `N2BP` indices on channel 1, the bound `N2BO` record's elsewhere, plus
+the bound HT/VHT words) in place of
 `rtw_phy_get_tx_power_index` (`offset = 0x3f − index`),
 `rtw8822b_txagc_swing_offset` (max offset 0xf, `default_ofdm_index + 10`
 upper bound) and the 0xc94/0xe94[29:25] and 0xc1c/0xe1c[31:21]
@@ -609,8 +610,9 @@ upper bound) and the 0xc94/0xe94[29:25] and 0xc1c/0xe1c[31:21]
 `default_ofdm_index` from 0xc1c (`rtw8822b_get_swing_index`, else 24) and
 captures both paths' TXAGC-index/TX-scale fields; restore (authority loss,
 an out-of-envelope pass) writes them back under the base gate. An erased
-meter or a rate outside the measured legacy set is refused before any
-write, as is a sample outside the `N2BD` thermal window or the `N2BP`
+meter is refused before any write; a current rate the committed program
+never wrote skips the pass (`Pass::Skipped`, no register access); refused
+likewise is a sample outside the `N2BD` thermal window or the `N2BP`
 windows and a table delta beyond the `N2BD` `power_up`/`power_down` bounds
 (C22 clamps; B22 refuses and restores).
 
@@ -745,7 +747,14 @@ VHT1SS MCS0..9 at 0x2c..0x35, VHT2SS per path at 0x36..0x3f) and RRSR
 `readback_b22_at`) checks the 1SS-A/2SS-AB path selection, the committed
 width's words and host-only crypto. Under a bound `N2BB` the `N2BD` power
 tracker offsets against the HT40 words (`Gate::b22_rate_indices`); under
-`N2BV` only legacy12 (VHT is not tracked). RX bandwidth follows the 8821C
+`N2BV` against the whole DESC_RATE 0x00..0x3f VHT80 tables
+(`tracking8822b::RATES` 64; path-B VHT1SS headroom uses path A's index).
+`rtw_phy_config_swing_table` now selects the band rows from the committed
+channel (`dm::Authority::b22_channel`, read inside `Tracker::pass`): 2.4GHz CCK/OFDM per path, 5GHz the
+`rtw8822b_pwrtrk_5g{a,b}_{p,n}` rows (equal for `RTW_PWR_TRK_5G_1..3`).
+A current rate the committed program never wrote (beyond the covered range
+or zero on both paths) returns `Pass::Skipped` with no register access
+instead of failing the dm program. RX bandwidth follows the 8821C
 page-1 RXSC/RF_MODE layout (`pci_packet::receive_chip` C21 for B22,
 `rtw8822b.c::query_phy_status_page1`). No `N2BB`/`N2BV` asset is
 provisioned. Case written, unexecuted:

@@ -291,6 +291,9 @@ impl super::dm::Authority for Live<'_> {
     fn b22_temperature(&self, value: u8) -> Result<(), firmware_transport::Error> {
         self.gate.b22_temperature(value)
     }
+    fn b22_channel(&self) -> Option<u8> {
+        Some(self.gate.channel())
+    }
 }
 /// Base-gate-only authority used to restore the base program.
 struct Base<'a> {
