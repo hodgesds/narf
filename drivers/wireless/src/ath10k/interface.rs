@@ -23,6 +23,8 @@ mod ap;
 pub(in crate::ath10k) use ap::Operation as ApOperation;
 #[path = "interface_offchannel.rs"]
 mod offchannel;
+#[path = "interface_p2p.rs"]
+pub(super) mod p2p_wdev;
 #[path = "interface_wow.rs"]
 pub(super) mod wowlan;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -73,6 +75,7 @@ pub(super) struct RadioFeatures {
     offchannel_tx: bool,
     wowlan: Option<narf_wireless::WowlanSupport>,
     decap: wmi_runtime::wow::Decap,
+    p2p: bool,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
@@ -86,6 +89,7 @@ impl RadioFeatures {
             vht: radio.vht_capabilities(),
             wowlan: radio.wowlan_support(),
             decap: radio.wow_decap(),
+            p2p: radio.p2p_supported(),
         }
     }
 }
@@ -136,6 +140,14 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     /// Owner interrupt signal shared with the service worker.
     wake: IrqSafeSpinLock<Option<Arc<super::irq::Signal>>>,
+    /// TLV firmware without NO_P2P (`Radio::p2p_supported`).
+    p2p_capable: bool,
+    /// The netdev's registry Write cap: parent of control-only children.
+    net_registration: IrqSafeSpinLock<
+        Option<narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>>,
+    >,
+    /// The control-only P2P_DEVICE wdev (`interface_p2p.rs`).
+    p2p_wdev: IrqSafeSpinLock<Option<Arc<p2p_wdev::P2pWdev>>>,
 }
 impl<T: Hif + HostMemory + HttMemory> core::fmt::Debug for Device<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -162,6 +174,10 @@ impl Drop for Attempt<'_> {
 impl<T: Hif + HostMemory + HttMemory + Send + 'static> HostClose for Device<T> {
     fn close(&self) {
         self.management_subscriptions.invalidate();
+        let wdev = { self.p2p_wdev.lock().take() };
+        if let Some(wdev) = wdev {
+            wdev.withdraw();
+        }
         {
             let _publication = self.publication.lock();
             self.closed.store(true, Ordering::Release);
@@ -200,6 +216,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 vht: None,
                 wowlan: None,
                 decap: wmi_runtime::wow::Decap::Raw,
+                p2p: false,
             });
         let frequencies = radio
             .try_lock()
@@ -269,6 +286,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
             wake: IrqSafeSpinLock::new(None),
+            p2p_capable: features.p2p,
+            net_registration: IrqSafeSpinLock::new(None),
+            p2p_wdev: IrqSafeSpinLock::new(None),
         }
     }
     pub(super) fn reserve_control(
@@ -477,6 +497,10 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     }
     pub(super) fn retire_host(&self) {
         self.management_subscriptions.invalidate();
+        let wdev = { self.p2p_wdev.lock().take() };
+        if let Some(wdev) = wdev {
+            wdev.withdraw();
+        }
         {
             let _publication = self.publication.lock();
             if self.retired.load(Ordering::Acquire) {
@@ -1422,9 +1446,10 @@ fn publish_with_mac(
         }
         let (name, rebound) = generation_name();
         let device = Arc::new(Device::new(name, mac, radio, features, frequencies));
-        narf_net::registry()
+        let registration = narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|_| Error::Unsupported)?;
+        *device.net_registration.lock() = Some(registration);
         *active = Some(device.clone());
         narf_net::iface::register_with_context(name, mac, device.generation, send);
         if !rebound {
@@ -1781,6 +1806,25 @@ impl WirelessNetIface for Native {
     }
     fn async_roc_control(&self) -> bool {
         true
+    }
+    /// Only the control-only P2P_DEVICE wdev is a virtual interface.
+    fn supports_virtual_interfaces(&self) -> bool {
+        p2p_wdev::P2P_ADVERTISED && self.p2p_capable
+    }
+    fn async_control_interfaces(&self) -> bool {
+        self.supports_virtual_interfaces()
+    }
+    fn async_control_iftypes(&self) -> u32 {
+        p2p_wdev::CONTROL_IFTYPES
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        self.new_p2p_wdev(authority, name, iftype, mac).await
     }
     fn max_remain_on_channel_duration_ms(&self) -> u32 {
         wmi_runtime::offchannel::MAX_DURATION

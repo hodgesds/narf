@@ -210,7 +210,7 @@ fn implicit_wait() -> Result<(), &'static str> {
             }
             let domain = h.policy.lock().clone().ok_or("private admission domain")?;
             let r = h.device.radio.try_lock().unwrap();
-            if r.validate_private_frame(91, &request, &domain).is_ok() || r.scan_in_progress() {
+            if r.validate_private_frame(0, 91, &request, &domain).is_ok() || r.scan_in_progress() {
                 return Err("malformed private FRAME obtained RF ownership before validation");
             }
         }

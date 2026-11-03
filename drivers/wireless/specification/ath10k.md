@@ -2141,18 +2141,46 @@ will bind; none of them grants RF, peer, key or data authority.
   5 s for `WMI_TLV_VDEV_DELETE_RESP` (0x5006) as
   `ath10k_vdev_delete_sync` before returning the id. `begin_roc_on(vdev)`
   runs a discovery ROC on the P2P_DEVICE vdev (`ath10k_remain_on_channel`
-  uses `arvif->vdev_id`); ROC action TX is refused on it because the
-  temporary-peer and WMI MGMT_TX builders still encode vdev0. Nothing is
-  bound to an nl80211 WDEV yet.
+  uses `arvif->vdev_id`).
+- **Per-vdev offchannel builders.** The DEFAULT offchannel peer
+  create/delete (`wmi_peer_create_cmd`/`wmi_peer_delete_cmd` vdev_id), the
+  TLV by-reference MGMT_TX (`wmi-tlv.c::ath10k_wmi_tlv_op_gen_mgmt_tx_send`
+  vdev_id at byte 8) and the inline MGMT_TX (`wmi.c::ath10k_wmi_op_gen_mgmt_tx`
+  `hdr.vdev_id`) take the sending vdev; vdev0 encodings are byte-identical.
+  A ROC action and a private FRAME ROC run on the requesting vdev: its
+  temporary peer, HTT/WMI descriptor and PEER_MAP match (HTT byte 1) use
+  that id, and A2 (and Probe Response A3) must be that vdev's own address
+  (`Radio::vdev_address`: INIT address for the managed vdev, wdev address
+  for the P2P_DEVICE vdev). Directed ROC capture filters on the same address.
+- **P2P_DEVICE WDEV** (`interface_p2p.rs`, iftype 10, gated by
+  `P2P_ADVERTISED = false`). `NEW_INTERFACE` (async control mask `1 << 10`,
+  `supports_virtual_interfaces` only with `p2p_supported`) publishes a
+  control-only child under the netdev's registry Write cap (address: the
+  requested one, else the netdev address with the local bit); at most one
+  exists. `START_P2P_DEVICE` creates the P2P_DEV vdev
+  (`ieee80211_start_p2p_device` -> `ath10k_add_interface`),
+  `STOP_P2P_DEVICE`/`DEL_INTERFACE` cancel a ROC on it and delete the vdev
+  (`ath10k_remove_interface`, SYNC_DELETE wait) before the retirement
+  receipt. ROC, CANCEL_ROC and FRAME on the wdev reuse the netdev's ROC
+  owner through `Side` with a `native_control_emission_for` emission bound
+  to the wdev's child registration; the netdev worker services the ROC and
+  delivers captures/expiry to the wdev (a withdrawn wdev's ROC is forced
+  down without closing the netdev). Registrations are per wdev (Action
+  everywhere, Probe Request only on the wdev, as
+  `ieee80211_default_mgmt_stypes[P2P_DEVICE]`); the radio's bound set
+  follows the ROC owner, so registering on one wdev while the other holds
+  a ROC is `-EBUSY`. On the P2P_DEVICE vdev a ROC also captures broadcast
+  or directed Probe Requests and FRAME may send a directed Probe Response
+  whose BSSID is the device address (wpa_supplicant Listen). Netdev
+  close/retire withdraws the wdev metadata.
 
-Remaining before the row can be claimed: the nl80211 control-only
-P2P_DEVICE WDEV binding `start/stop_p2p_device` and ROC/FRAME
-(`async_p2p_device_control`, `async_p2p_management_{rx,tx}_control`),
-which needs per-vdev offchannel peer and MGMT_TX builders; a
-P2P client netdev role (iftype 8, STA vdev subtype P2P_CLI) reusing the
-station owner; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring
-`go_beacon_ie` into the beacon publication and `NoaOwner` into P2P_NOA
-event routing and probe-response TX; then advertisement through
+Remaining before the row can be claimed: WDEV-routed SCAN for P2P search
+(not wired; the wdev has no scan); a P2P client netdev role (iftype 8,
+STA vdev subtype P2P_CLI) reusing the station owner, with the remaining
+station WMI builders (peer, vdev start/up/down/stop, params, keys) taking a
+vdev; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
+into the beacon publication and `NoaOwner` into P2P_NOA event routing and
+probe-response TX; then advertisement through `P2P_ADVERTISED`,
 `p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
 Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_vdev_create_roles`,
@@ -2162,7 +2190,8 @@ Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_noa_owner_probe_response_only`,
 `smoke_ath10k_p2p_tlv_combinations`,
 `smoke_ath10k_p2p_vdev_delete_and_roc_vdev`,
-`smoke_ath10k_p2p_device_vdev_nss_on_own_id`.
+`smoke_ath10k_p2p_device_vdev_nss_on_own_id`,
+`smoke_ath10k_p2p_offchannel_builders_carry_vdev`.
 
 ## 4. Invariants
 

@@ -25,7 +25,28 @@ impl Action {
         self.response_until
     }
 }
-fn validate(frame: &[u8], own: [u8; 6]) -> Result<[u8; 6], Error> {
+/// A P2P_DEVICE answers P2P probe requests in Listen state with a directed
+/// Probe Response whose BSSID is its P2P Device Address (wpa_supplicant
+/// `p2p_reply_probe` through `NL80211_CMD_FRAME`; mac80211 transmits it on
+/// the ROC). Only that vdev may send one.
+fn validate_probe_response(frame: &[u8], own: [u8; 6]) -> Result<[u8; 6], Error> {
+    if !(36..=2304).contains(&frame.len())
+        || frame[0] != 0x50
+        || frame[1] != 0
+        || frame[22] & 15 != 0
+        || frame[10..16] != own
+        || frame[16..22] != own
+        || frame[4..10] == [0; 6]
+        || frame[4] & 1 != 0
+    {
+        return Err(Error::Unsupported);
+    }
+    Ok(frame[4..10].try_into().unwrap())
+}
+fn validate(frame: &[u8], own: [u8; 6], p2p_device: bool) -> Result<[u8; 6], Error> {
+    if p2p_device && frame.first() == Some(&0x50) {
+        return validate_probe_response(frame, own);
+    }
     if !(26..=2304).contains(&frame.len())
         || frame[0] != 0xd0
         || frame[1] != 0
@@ -80,10 +101,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !w.plan.permissions.contains(&permission) {
             return Err(Error::Unsupported);
         }
-        validate(&request.frame, self.vdev_address(w.vdev)?).map(|_| ())
+        validate(
+            &request.frame,
+            self.vdev_address(w.vdev)?,
+            self.p2p_device_vdev() == Some(w.vdev),
+        )
+        .map(|_| ())
     }
     pub(in crate::ath10k) fn validate_private_frame(
         &self,
+        vdev: u8,
         cookie: u64,
         request: &MgmtTxRequest,
         domain: &RegulatoryDomain,
@@ -108,7 +135,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         self.hinted_permission(domain, frequency, None, false)?;
-        validate(&request.frame, self.ready.ok_or(Error::Failed)?.mac).map(|_| ())
+        if !self.roc_vdev_owned(vdev) {
+            return Err(Error::Unsupported);
+        }
+        validate(
+            &request.frame,
+            self.vdev_address(vdev)?,
+            self.p2p_device_vdev() == Some(vdev),
+        )
+        .map(|_| ())
     }
     /// A FRAME outside any ROC gets its own bounded ROC on `vdev` (the
     /// managed role's or the P2P_DEVICE vdev; mac80211 `ieee80211_mgmt_tx`
@@ -121,7 +156,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         request: &MgmtTxRequest,
         current: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<(), Error> {
-        self.validate_private_frame(cookie, request, &current()?)?;
+        self.validate_private_frame(vdev, cookie, request, &current()?)?;
         let frequency = u16::try_from(request.frequency_mhz).map_err(|_| Error::Unsupported)?;
         // Native setup/peer/TX has a finite500ms budget. The response tail
         // begins only at its actual terminal and is clipped to this original
@@ -178,7 +213,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Peer, MGMT_TX and HTT descriptors all name the ROC's own vdev,
         // whose address the frame must carry (`ath10k_mac_tx_wmi_mgmt`).
         let vdev = w.vdev;
-        let destination = validate(&request.frame, self.vdev_address(vdev)?)?;
+        let destination = validate(
+            &request.frame,
+            self.vdev_address(vdev)?,
+            self.p2p_device_vdev() == Some(vdev),
+        )?;
         let path = management::path(self.wire.dialect, self.features, caps)?;
         let existing = vdev == self.primary.id()
             && self

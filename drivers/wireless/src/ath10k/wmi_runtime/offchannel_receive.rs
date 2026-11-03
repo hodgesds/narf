@@ -9,6 +9,7 @@ use narf_wireless::ap_control::{PreparedRadioManagementEvent, RadioReceiveFence}
 
 #[derive(Clone, Debug)]
 struct Filter {
+    frame_type: u16,
     prefix: Vec<u8>,
     emission: RadioEmissionAuthority,
     event: RadioEventAuthority,
@@ -21,6 +22,7 @@ struct Snapshot {
 #[derive(Debug)]
 pub(in crate::ath10k) struct Subscriptions {
     state: IrqSafeSpinLock<Snapshot>,
+    probe_request: bool,
     pub(super) epoch: Arc<AtomicU64>,
 }
 #[derive(Debug)]
@@ -35,11 +37,16 @@ pub(in crate::ath10k) struct RetiredSubscriptions {
 }
 impl Subscriptions {
     pub(in crate::ath10k) fn new() -> Self {
+        Self::with_probe_request(false)
+    }
+    /// The P2P_DEVICE wdev's set also admits Probe Request registrations.
+    pub(in crate::ath10k) fn with_probe_request(probe_request: bool) -> Self {
         Self {
             state: IrqSafeSpinLock::new(Snapshot {
                 generation: 0,
                 filters: Vec::new(),
             }),
+            probe_request,
             epoch: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -53,7 +60,11 @@ impl Subscriptions {
         frame_type: u16,
         prefix: &[u8],
     ) -> Result<Install, i32> {
-        if frame_type != 0xd0 || prefix.len() > 2280 {
+        // Action on every owner; Probe Request only on the P2P_DEVICE wdev
+        // (`ieee80211_default_mgmt_stypes[NL80211_IFTYPE_P2P_DEVICE].rx`),
+        // whose owner passes `probe_request`.
+        if !(frame_type == 0xd0 || frame_type == 0x40 && self.probe_request) || prefix.len() > 2280
+        {
             return Err(22);
         }
         event.current().map_err(|_| 1)?;
@@ -64,10 +75,15 @@ impl Subscriptions {
         let before = next.generation;
         next.filters
             .retain(|f| f.emission.current() && f.event.registration_current().is_ok());
-        if next.filters.iter().any(|f| {
-            let length = f.prefix.len().min(prefix.len());
-            f.prefix[..length] == prefix[..length]
-        }) {
+        if next
+            .filters
+            .iter()
+            .filter(|f| f.frame_type == frame_type)
+            .any(|f| {
+                let length = f.prefix.len().min(prefix.len());
+                f.prefix[..length] == prefix[..length]
+            })
+        {
             return Err(114);
         }
         if next.filters.len() == 16 {
@@ -76,6 +92,7 @@ impl Subscriptions {
         next.generation = before.checked_add(1).filter(|n| *n < u64::MAX).ok_or(75)?;
         next.filters.try_reserve(1).map_err(|_| 12)?;
         next.filters.push(Arc::new(Filter {
+            frame_type,
             prefix: prefix.to_vec(),
             emission,
             event,
@@ -302,10 +319,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let native = self.wire.management(&bytes[4..], self.features)?;
         let frame = &native.frame;
         let own = self.vdev_address(w.vdev)?;
+        // A P2P_DEVICE in Listen receives broadcast/wildcard Probe Requests
+        // (`ieee80211_rx_h_mgmt` for P2P_DEVICE, delivered to the registered
+        // socket); every other copy is a directed Public Action.
+        let probe = self.p2p_device_vdev() == Some(w.vdev)
+            && frame.first() == Some(&0x40)
+            && frame.len() >= 24
+            && (frame[4..10] == own || frame[4..10] == [255; 6]);
         if native.status & !0x40 != 0
             || wire::channel_to_frequency(native.channel) != Some(w.receipt.frequency)
-            || !(26..=2304).contains(&frame.len())
-            || frame[0] != 0xd0
+            || !(if probe { 24 } else { 26 }..=2304).contains(&frame.len())
+            || !(probe || frame[0] == 0xd0)
             || frame[1] & 0xc7 != 0
             || frame[22] & 15 != 0
             || frame[10..16] == [0; 6]
@@ -313,11 +337,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             || frame[10..16] == own
             // No RECEIVE_MULTICAST/monitor-vdev capability is advertised by
             // these profiles. Default registration is directed RX only.
-            || frame[4..10] != own
-            || frame[24] != 4
+            || !probe && frame[4..10] != own
+            || !probe && frame[24] != 4
         {
             return Ok(());
         }
+        let frame_type = u16::from(frame[0]);
         let Some(subscriptions) = &self.management_subscriptions else {
             return Ok(());
         };
@@ -328,7 +353,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let Some(source) = snapshot
             .filters
             .iter()
-            .find(|f| f.emission.current() && frame[24..].starts_with(&f.prefix))
+            .find(|f| {
+                f.frame_type == frame_type
+                    && f.emission.current()
+                    && frame[24..].starts_with(&f.prefix)
+            })
             .cloned()
         else {
             return Ok(());
