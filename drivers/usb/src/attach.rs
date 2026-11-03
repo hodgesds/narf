@@ -549,7 +549,7 @@ pub async fn try_attach_via_hub(
 /// a genuine unplug the device is gone either way, and a slot whose
 /// reclaim refuses (Disable Slot failed) stays retired rather than
 /// returning to the pool half-alive. Classes the supervisor does
-/// not pump (MSC / UAC / btusb / CCID) have no
+/// not pump (MSC / btusb / CCID) have no
 /// per-class binding removal yet — their slot is disabled and
 /// reclaimed here, but their class-level registries are a
 /// documented follow-up in #748. CDC-NCM + r8152 + CDC-ECM are
@@ -562,7 +562,11 @@ pub async fn try_attach_via_hub(
 /// unbind hook (`uvc::detach_uvc`, registered in
 /// `uvc::register_initcalls`) runs via `dispatch_unbind` in step 1
 /// above, dropping the slot's UVC binding and unregistering its
-/// `/dev/video<N>` node.
+/// `/dev/video<N>` node. UAC is not in that set either: its unbind
+/// hook (`uac::detach_uac_slot`, registered in
+/// `uac::register_initcalls`) runs via `dispatch_unbind` in step 1
+/// above, dropping the slot's UAC devices and unregistering their
+/// sound cards (#1318).
 pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     // 1. Class bindings.
     hid::detach_boot_keyboard(slot_id);

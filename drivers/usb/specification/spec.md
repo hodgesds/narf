@@ -438,13 +438,18 @@ also consult upstream Linux GPL sources.
   including WBDI-bridged sensors, is removed and unpublished
   (`fingerprint::unbind_all_fp`, #922).
   On the per-slot detach path, classes
-  the supervisor does not pump (MSC / UAC / btusb / CCID) get
+  the supervisor does not pump (MSC / btusb / CCID) get
   the slot disable + reclaim but no class-registry removal yet;
   the remaining non-pumped classes keep their registries across
   recovery as well. CDC-NCM and r8152 are not in that set: their
   unbind hooks run on the per-slot path via `dispatch_unbind`
   (see below). UVC is not in that set either: its unbind hook
   runs on the per-slot path via `dispatch_unbind` (see below).
+  UAC is not in that set either: its unbind hook
+  (`uac::detach_uac_slot`, registered in `uac::register_initcalls`)
+  runs on the per-slot path via `dispatch_unbind` (see below),
+  dropping the slot's UAC devices and unregistering their sound
+  cards (#1318).
 - Fingerprint lifecycle (#922): per-slot detach runs through the
   class-registry unbind dispatch — `fingerprint::detach_fp` removes
   every `FP_DEVICES` entry for the slot, and its outcome reports

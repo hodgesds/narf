@@ -8535,6 +8535,64 @@ kernel_test_in!(
     smoke_uac_detach_removes_registry_and_card
 );
 
+/// The class-registry unbind hook installed by
+/// `uac::register_initcalls` must reach `unbind_audio` through the
+/// supervisor's `dispatch_unbind` path — the wiring the hub-detach
+/// path actually uses, not just the unbind function in isolation
+/// (#1318: previously `register_initcalls` used plain
+/// `register_class_driver` with no hook, so cards leaked on unplug).
+/// A second device on another slot must survive the dispatch,
+/// proving the broadcast hook self-filters by slot.
+fn smoke_uac_dispatch_unbind_reaches_unbind() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    crate::uac::__reset_uac_for_test();
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(9, &topo, &choices, &BindOutcome::default());
+    let idx = match crate::uac_card::register_card(&state) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("register card for dispatch fixture"),
+    };
+    let (out_dci, in_dci) = crate::uac::find_audio_streaming_iso_eps(&cfg);
+    crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        slot_id: 9,
+        ac_iface: 0,
+        iso_out_dci: out_dci,
+        iso_in_dci: in_dci,
+        card: Some(state),
+        card_error: None,
+    });
+    crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        slot_id: 10,
+        ac_iface: 0,
+        iso_out_dci: 0,
+        iso_in_dci: 0,
+        card: None,
+        card_error: None,
+    });
+    if crate::uac::attached_uac_count() != 2 {
+        return TestResult::Fail("registry holds both bound devices");
+    }
+    crate::uac::register_initcalls();
+    let report = crate::class_registry::dispatch_unbind(9);
+    if report.invoked == 0 {
+        return TestResult::Fail("dispatch_unbind invoked no hooks");
+    }
+    if crate::uac::attached_uac_count() != 1 {
+        return TestResult::Fail("unbind hook must drop only the slot 9 device");
+    }
+    if narf_drivers_sound::default_hw_params(idx, false).is_ok() {
+        return TestResult::Fail("card unregistered after dispatch unbind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_dispatch_unbind_reaches_unbind);
+
 fn smoke_uac_pump_generation_stop_start() -> TestResult {
     use crate::uac::{BindOutcome, UacTopology};
     use narf_drivers_sound::hardware::PcmHardware;
