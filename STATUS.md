@@ -1881,6 +1881,29 @@ fixtures. Supported WC backing is required for positive DMA conversations;
 unsupported architectures retain conservative source/metadata/WB refusal.
 Native register/CT models are not physical Intel or ARM-native acceptance.
 
+### MTL/Arrow standalone media GT owner — release gates recorded
+
+Meteor Lake and Arrow Lake have a second GT for media: GT1, with Xe_LPM+ media
+IP 13.00. NARF now brings it up beside a running GT0. The new owner checks
+GT1's exact identity and reads which video engines are present. It holds GT1
+awake, resets the media GuC and then the whole media GT. If GSC firmware is
+already loaded, it applies Wa_14015076503 around the reset. It then programs
+GT1's PAT, MOCS and media 13.00 workarounds and releases every wake request.
+A refusal at any step releases what the owner took and never becomes a GT0
+error. Every GT0 stop, park, suspend or fault abandons the owner first. The
+media GuC stays in reset, and no GT1 engine, interrupt or UAPI GT is published.
+GT0's MTL MOCS values moved to shared constants unchanged.
+
+Twelve new tests under `drivers/gpu/intel_gpu_media_gt` run in group 6. All
+seven release groups pass 1,930 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave.
+
+Still to do: media GuC load with its ADS and CT channel, GGTT invalidation for
+both GuCs, VCS/VECS enablement and interrupts, gt_id 1 in the Xe UAPI, and
+GSC-loaded HuC. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

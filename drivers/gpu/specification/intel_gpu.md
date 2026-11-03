@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.37** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.38** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -30,7 +30,9 @@
 > private context publication and published-media SSEU defaults
 > pass debug and release native model gates; BMG opt-in GPU-only VRAM,
 > bounded i915 capture/protection and automatic-reset discovery
-> pass debug and release native/integration gates — see §20).
+> pass debug and release native/integration gates; the unpublished
+> MTL/Arrow standalone media GT lifecycle owner passes release native
+> model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3208,12 +3210,12 @@ fixtures. Supported WC backing is required for positive DMA conversations;
 unsupported architectures retain conservative source/metadata/WB refusal.
 Native register/CT models are not physical Intel or ARM-native acceptance.
 
-### MTL/Arrow standalone media GT lifecycle checkpoint
+### MTL/Arrow standalone media GT lifecycle checkpoint — release gates recorded
 
 Meteor Lake and Arrow Lake carry Xe_LPM+ (media IP 13.00) as a separate GT1
 behind the media GSI window. `intel_gpu_media_gt` (mounted as
-`intel_gpu_gt::media`) adds an exclusive per-incarnation owner that follows
-Linux xe's media GT bring-up for that one profile. Register offsets below
+`intel_gpu_gt::media`) adds an exclusive per-incarnation owner that applies
+Linux xe's media GT register definitions for that one profile. Register offsets below
 0x40000 translate by 0x380000 (`xe_mmio_adjusted_addr`); media engine bases
 and GSC HECI registers stay absolute. Admission requires an MTL-classified
 device whose published GT0 graphics IP is 12.70, 12.71 or 12.74 and two equal
@@ -3230,6 +3232,11 @@ multicast selector, media 13.00 GT workarounds 22016670082 and per-VDBOX
 16021867713, and the shared `mtl_mocs_desc` global/LNCF tables. It finally
 releases every wake request it made and reports the identity, fuse word and
 engine set.
+
+The full media GT reset follows NARF's GT0 sanitize policy: retire the
+inherited GuC, then reset the GT before programming cache policy. Linux xe's
+probe never full-resets the media GT. It reaches `do_gt_reset` and
+Wa_14015076503 only through GT reset recovery and shutdown.
 
 Inherited media wake requests or an in-flight GDRST refuse as busy; stale sleep
 acknowledgements from an earlier incarnation are settled within the source's
@@ -3266,5 +3273,11 @@ wake/reset/semaphore timeouts, GSC workaround ordering, current loss and
 teardown with next-incarnation settling. Each asserts that GT0 registers are
 untouched. One native Xe conversation on the MTL GuC model shows that the GT
 list and engine query stay GT0-only. It also shows that VCS/VECS or gt_id 1
-placements return EINVAL before any allocation. The fixtures are registered
-but were not run in this checkpoint, and they are not physical Intel evidence.
+placements return EINVAL before any allocation.
+
+All seven release groups pass 1,930 unique tests with no failures and no Intel
+skips. The only skip is the existing shared RNG-registration skip. The twelve
+new tests run in group 6, which now selects `drivers/gpu/intel_gpu_media_gt`.
+The release production boot and both btrfs postflights pass. The debug group
+pass is deferred to the end of the current integration wave. These are native
+register and CT models, not physical Intel evidence.
