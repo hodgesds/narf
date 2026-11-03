@@ -344,7 +344,7 @@ fn smoke_psr_enable_refuses_before_any_write() -> TestResult {
         Some(false),
     )
     .unwrap();
-    let cases: [(&dyn Fn(&Regs), Refusal); 6] = [
+    let cases: [(&dyn Fn(&Regs), Refusal); 7] = [
         (&|r| r.set(0x60800, 1 << 31), Refusal::Inherited),
         (&|r| r.set(0x60900, 1 << 31), Refusal::Inherited),
         (&|r| r.set(0x60800, u32::MAX), Refusal::Unavailable),
@@ -353,6 +353,8 @@ fn smoke_psr_enable_refuses_before_any_write() -> TestResult {
         // psr_interrupt_error_check: a latched TGL_PSR_ERROR.
         (&|r| r.set(0x60818, 1 << 2), Refusal::SinkNotReliable),
         (&|r| r.set(0x4446c, u32::MAX), Refusal::Unavailable),
+        // GEN8_CHICKEN_DCPR_1 is read before the sink is touched.
+        (&|r| r.set(0x46430, u32::MAX), Refusal::Unavailable),
     ];
     for (setup, refusal) in cases {
         let regs = Regs::default();

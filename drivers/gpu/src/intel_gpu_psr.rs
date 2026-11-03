@@ -528,6 +528,7 @@ impl Psr {
         if readable(regs, PSR_IIR)? & TGL_PSR_ERROR != 0 {
             return Err(Refusal::SinkNotReliable);
         }
+        let dcpr = readable(regs, CHICKEN_DCPR_1)?;
         // intel_psr_enable_sink → _psr_enable_sink, then DP_SET_POWER D0.
         let cfg = sink_cfg_psr1();
         let sink = write(aux, DP_PSR_EN_CFG, cfg)
@@ -541,7 +542,7 @@ impl Psr {
         regs.write32(PSR_DEBUG, PSR_DEBUG_MASK);
         let imr = regs.read32(PSR_IMR);
         regs.write32(PSR_IMR, (imr & !TGL_PSR_MASK) | !TGL_PSR_ERROR);
-        let dcpr = readable(regs, CHICKEN_DCPR_1)?;
+        // Wa_14015648006 (wm_optimization_wa).
         regs.write32(
             CHICKEN_DCPR_1,
             if config.wm_level_disabled {
