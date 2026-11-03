@@ -1237,8 +1237,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<(), Error> {
         if self.station.native_associated {
             self.check_station_policy(environment)?;
+            // RTL8821AE: NAPC admits OFDM24, the RTS/CTS control rate.
             if enabled
-                && (self.station.protection.is_none()
+                && (self.station.protection.is_none() && self.chip != super::Chip::Rtl8821ae
                     || self
                         .station
                         .plan
@@ -1535,7 +1536,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             super::super::protection::Mode::None
         };
         if protection != super::super::protection::Mode::None
-            && (self.station.protection.is_none()
+            && (self.station.protection.is_none() && self.chip != super::Chip::Rtl8821ae
                 || self
                     .station
                     .plan
@@ -1567,6 +1568,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && self.station.fallback_current()
         };
         let protection_source = self.station.protection.clone();
+        let protection_admitted =
+            protection_source.is_some() || !(self.chip != super::Chip::Rtl8821ae);
         let tracking_source = self.station.tracking.as_ref().map(|s| s.grant.clone());
         let antenna_source = self.station.antenna.as_ref().map(|s| s.grant.clone());
         let mut publish = || {
@@ -1584,7 +1587,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     super::super::protection::Mode::None
                 };
                 if current != super::super::protection::Mode::None
-                    && (protection_source.is_none()
+                    && (!protection_admitted
                         || self
                             .station
                             .plan
@@ -1767,7 +1770,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .information_elements,
             )?;
             if (self.station.erp || environment.rts_threshold().is_some())
-                && (protection.is_none() || rates & (1 << 8) == 0)
+                && (protection.is_none() && self.chip != super::Chip::Rtl8821ae
+                    || rates & (1 << 8) == 0)
             {
                 return Err(Error::Profile);
             }
@@ -2092,7 +2096,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.cache_candidate(candidate, now);
                 } else if Some(candidate.bss.bssid) == peer {
                     let erp = super::super::protection::erp(&candidate.bss.information_elements)?;
-                    if erp && self.station.protection.is_none() {
+                    if erp
+                        && self.station.protection.is_none()
+                        && self.chip != super::Chip::Rtl8821ae
+                    {
                         return Err(Error::Profile);
                     }
                     self.station.erp = erp;

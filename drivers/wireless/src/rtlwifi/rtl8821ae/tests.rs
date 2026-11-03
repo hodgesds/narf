@@ -521,6 +521,21 @@ fn smoke_rtl8821ae_tx_rx_descriptor_fields() -> TestResult {
     {
         return TestResult::Fail("TX descriptor field placement");
     }
+    if d.dw[3] & (3 << 11) != 0 || d.dw[4] >> 24 != 0 {
+        return TestResult::Fail("protection fields without protection");
+    }
+    // _rtl_query_protection_mode: RTS/CTS -> RTS_EN only; CTS-to-self ->
+    // CTS2SELF only; both at DESC_RATE24M, long preamble.
+    let rts = trx::TxDesc::fill(&trx::TxParams { protection: 1, ..p });
+    let cts = trx::TxDesc::fill(&trx::TxParams { protection: 2, ..p });
+    if rts.dw[3] & (3 << 11) != 1 << 12
+        || cts.dw[3] & (3 << 11) != 1 << 11
+        || (rts.dw[4] >> 24) & 0x1f != 0x08
+        || (cts.dw[4] >> 24) & 0x1f != 0x08
+        || rts.dw[5] & (1 << 12) != 0
+    {
+        return TestResult::Fail("RTS/CTS-to-self descriptor fields");
+    }
     d.set_own(true);
     if !d.own() {
         return TestResult::Fail("TX OWN");

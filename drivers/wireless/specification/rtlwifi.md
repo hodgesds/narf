@@ -1639,8 +1639,13 @@ chain below is composed.
     8821AE has no `RTL_SPEC_NEW_RATEID`). EAPOL (unprotected; software
     crypto has no `hw_key` IV to skip) and Null frames carry `SPE_RPT` +
     `SW_DEFINE` (`rtl_is_tx_report_skb`/`rtl_set_tx_report`, `(++sn &
-    0x3f) << 2`). Only legacy rates are admitted (no HT, A-MPDU, SGI or
-    RTS/CTS protection yet). The host receipt checks OWN clear with dwords
+    0x3f) << 2`). ERP Use_Protection and the RTS threshold select
+    protection as 88EE (`protection::select`, AP must offer 24M), filled as
+    `_rtl_query_protection_mode`: RTS/CTS sets `RTS_EN`, CTS-to-self
+    `CTS2SELF`, both `RTS_RATE = DESC_RATE24M`, long preamble. No NERT
+    continuation is needed: the `NAPC` permission already admits OFDM24's
+    measured power. Only legacy rates are admitted (no HT, A-MPDU or SGI
+    yet). The host receipt checks OWN clear with dwords
     0/1/7, the buffer in dword 10, dword 11/13 zero and the linked next
     pointer.
   - RX: `rtl8821ae_rx_query_desc` fields; anything outside the legacy
@@ -1700,6 +1705,9 @@ chain below is composed.
   - Station power base: the station re-derives the channel grant from the
     `NAPC` envelope (`station_power::Base`/`Grant`) at every publication and
     wait, as it does from `NEPC` for 88EE.
+  - ERP: an AP announcing Use_Protection is admitted on 8821AE (88EE
+    still needs the NERT grant); the beacon-tracked ERP flag drives the
+    per-frame protection mode.
   - Not composed for 8821AE: ASPM (kept disabled), channel retune and the
     fresh-generation recovery rebuild (both refused; the owner keeps its
     provisioned channel and a failed owner stays failed), WMM EDCA from the

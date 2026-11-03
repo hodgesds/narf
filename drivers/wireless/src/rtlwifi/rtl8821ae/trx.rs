@@ -28,6 +28,7 @@ pub const QSLT_MGNT: u8 = 0x12;
 pub const QSLT_CMD: u8 = 0x13;
 
 /// `DESC_RATE*` boundaries (`rtlwifi/wifi.h`).
+pub const DESC_RATE24M: u8 = 0x08;
 pub const DESC_RATE54M: u8 = 0x0b;
 pub const DESC_RATEMCS0: u8 = 0x0c;
 pub const DESC_RATEVHT1SS_MCS0: u8 = 0x2c;
@@ -87,6 +88,9 @@ pub struct TxParams {
     pub qos_data: bool,
     pub seq: u16,
     pub multicast: bool,
+    /// `_rtl_query_protection_mode`: 0 none, 1 RTS/CTS, 2 CTS-to-self;
+    /// both at `rts_rate = DESC_RATE24M` with long preamble.
+    pub protection: u8,
     /// `rtl_set_tx_report`: request a C2H TX report carrying `sw_define`.
     pub tx_report: Option<u16>,
     pub buffer_len: u16,
@@ -108,6 +112,12 @@ impl TxDesc {
             put(&mut dw[3], 0x1f, 17, 5);
         }
         put(&mut dw[9], u32::from(p.seq), 12, 12);
+        // set_tx_desc_rts_enable(rts && !cts), cts2self(cts), rts_rate.
+        if p.protection != 0 {
+            put(&mut dw[3], u32::from(p.protection == 1), 12, 1);
+            put(&mut dw[3], u32::from(p.protection == 2), 11, 1);
+            put(&mut dw[4], u32::from(DESC_RATE24M), 24, 5);
+        }
         put(&mut dw[5], u32::from(p.data_bw), 5, 2);
         put(&mut dw[5], u32::from(p.sub_carrier), 0, 4);
         put(&mut dw[0], u32::from(p.pkt_size), 0, 16);

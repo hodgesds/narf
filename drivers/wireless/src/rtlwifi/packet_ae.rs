@@ -19,7 +19,9 @@
 //! admits a measured TXAGC index for every station rate, so any rate the
 //! firmware picks inside the mask is power-admitted (unlike 88EE, whose
 //! fixed-rate NEPC needs the separate NEFB continuation). No HT, A-MPDU,
-//! short GI or protection is admitted on this profile.
+//! short GI is admitted on this profile. ERP / RTS-threshold protection
+//! follows `_rtl_query_protection_mode` (RTS/CTS or CTS-to-self at
+//! `DESC_RATE24M`, whose power the same `NAPC` permission admits).
 //!
 //! C2H packets (`rpt_sel`) are parsed as `rtl_c2h_content_parsing`: V1 TX
 //! reports complete the `SPE_RPT` request of the outstanding EAPOL/Null
@@ -565,7 +567,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// `rtl8821ae_tx_fill_desc` for one legacy first+last MPDU (no early
     /// mode): forced `hw_rate` with fallback disabled, or (`adaptive`,
     /// ordinary unicast DATA with an installed mask) firmware RA with
-    /// fallback; BW 20, no SGI/AGG/RTS, no hardware key, HWSEQ for non-QoS
+    /// fallback; BW 20, no SGI/AGG, RTS/CTS or CTS-to-self from the
+    /// selected protection mode, no hardware key, HWSEQ for non-QoS
     /// frames, MACID 0, RATE_ID the installed `ratr_index` for unicast (MC
     /// otherwise) and `SPE_RPT`/`SW_DEFINE` for EAPOL and Null frames.
     pub(super) fn ae_submit(
@@ -651,6 +654,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             qos_data: frame[0] == 0x88,
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
             multicast,
+            protection: match self.packet.protection {
+                super::super::super::protection::Mode::None => 0,
+                super::super::super::protection::Mode::RtsCts => 1,
+                super::super::super::protection::Mode::CtsToSelf => 2,
+            },
             tx_report,
             buffer_len: frame.len() as u16,
             buffer_addr: address,
