@@ -279,3 +279,127 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_c_set_txpwr_follows_rtw8852c_and_phy_ax
 );
+
+/// Six-GHz additions to [`base`]: LMT_6GHZ {bw, nt, rs, bf, regd, reg6,
+/// ch_idx, v}, LMT_RU_6GHZ {ru, nt, regd, reg6, ch_idx, v}, a 6GHz TX
+/// shape row and a REGD element {alpha2, rule_2g, rule_5g, rule_6g, fmap}.
+fn six_set(regd: bool) -> Vec<Element> {
+    let mut set = base(0, 10);
+    set.push(elm(
+        ID_BYRATE,
+        0,
+        9,
+        &[&byr(2, 0, RS_OFDM, 0, &[16, 18, 20, 22])],
+    ));
+    set.push(elm(
+        ID_LMT_6GHZ,
+        0,
+        8,
+        &[
+            // ch37 = 6G idx 17. FCC (2) LPI (1) OFDM: own value.
+            &[0, 0, RS_OFDM, 0, 2, 1, 17, 30],
+            // MCS: no FCC/LPI value, so [WW][DFLT] is read.
+            &[0, 0, RS_MCS, 0, WW, 0, 17, 24],
+            // ETSI (1) STD (2) OFDM for the GB/UK case.
+            &[0, 0, RS_OFDM, 0, 1, 2, 17, 40],
+            // reg6 3 is out of range: skipped.
+            &[0, 0, RS_OFDM, 0, 2, 3, 17, 2],
+        ],
+    ));
+    set.push(elm(
+        ID_LMT_RU_6GHZ,
+        0,
+        6,
+        &[&[0, 0, 2, 1, 17, 22], &[1, 0, WW, 0, 17, 20]],
+    ));
+    if regd {
+        set.push(elm(
+            ID_REGD,
+            0,
+            9,
+            &[
+                &[b'U', b'S', 2, 2, 2],
+                &[b'G', b'B', 14, 14, 14],
+                &[b'B', b'O', 2, 2, NA],
+            ],
+        ));
+    }
+    set
+}
+
+fn smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g() -> TestResult {
+    use narf_wireless::reg::PowerType6Ghz;
+    let set = six_set(true);
+    // regd.c 6GHz policy without the rtw89 ACPI DSM.
+    let us = SixGhzPower::new(&set, *b"US", Some(PowerType6Ghz::Lpi));
+    let gb = SixGhzPower::new(&set, *b"GB", Some(PowerType6Ghz::Sp));
+    if us.map(|p| (p.regd(), p.power())) != Ok((2, 1))
+        || gb.map(|p| (p.regd(), p.power())) != Ok((ETSI, 2))
+        || SixGhzPower::new(&set, *b"US", Some(PowerType6Ghz::Vlp)) != Err(Error::Policy)
+        || SixGhzPower::new(&set, *b"US", None).map(|p| p.power()) != Ok(0)
+        || SixGhzPower::new(&set, *b"BO", Some(PowerType6Ghz::Lpi)) != Err(Error::Policy)
+        || SixGhzPower::new(&set, *b"ZZ", Some(PowerType6Ghz::Lpi)) != Err(Error::Policy)
+        || SixGhzPower::new(&six_set(false), *b"US", Some(PowerType6Ghz::Lpi)) != Err(Error::Table)
+    {
+        return TestResult::Fail("C 6GHz regd/power-type policy differs from rtw89 regd.c");
+    }
+    let (Ok(us), Ok(gb)) = (us, gb) else {
+        return TestResult::Fail("C 6GHz power context refused");
+    };
+    let Some(ch37) = Profile::new20(Band::Ghz6, 37) else {
+        return TestResult::Fail("6GHz ch37 refused");
+    };
+    let Ok(plan) = Plan::from_elements_6ghz(&set, 5, ch37, us, None) else {
+        return TestResult::Fail("C 6GHz LPI power plan refused");
+    };
+    let (byrate, _, limit, ru, _) = plan.parts();
+    // byr[6G]: OFDM 16/18/20/22 rf -> 8/9/10/11 mac; CCK still from 2.4GHz.
+    if byrate[4..8] != [8, 9, 10, 11]
+        || byrate[0] != 5
+        || limit[0][4] != 15
+        || limit[0][6] != 12
+        || ru[0][0] != 11
+        || ru[0][8] != 10
+    {
+        return TestResult::Fail("C 6GHz limits differ from rtw89_phy_read_txpwr_limit(6G)");
+    }
+    let mut dfir = 0;
+    if plan
+        .visit(|a, _, _| {
+            dfir += usize::from((0x1_45bc..=0x1_45d8).contains(&a));
+            Ok(())
+        })
+        .is_err()
+        || dfir != 0
+    {
+        return TestResult::Fail("C 6GHz program wrote the 2.4GHz CCK DFIR");
+    }
+    // STD with a TPE: min3 with dbm_to_mac(5) = 10; the bound identity
+    // stays the TPE-free plan's; TPE is refused off STD or below -10dBm.
+    let (Ok(sp), Ok(bare)) = (
+        Plan::from_elements_6ghz(&set, 5, ch37, gb, Some(5)),
+        Plan::from_elements_6ghz(&set, 5, ch37, gb, None),
+    ) else {
+        return TestResult::Fail("C 6GHz SP power plan refused");
+    };
+    let digest = |p: &Plan| {
+        let mut h = narf_crypto::sha256::Sha256::new();
+        p.bind(&mut h);
+        h.finalize()
+    };
+    if sp.parts().2[0][4] != 10
+        || bare.parts().2[0][4] != 20
+        || digest(&sp) != digest(&bare)
+        || digest(&bare) == digest(&plan)
+        || Plan::from_elements_6ghz(&set, 5, ch37, us, Some(5)) != Err(Error::Policy)
+        || Plan::from_elements_6ghz(&set, 5, ch37, gb, Some(-11)) != Err(Error::Policy)
+        || Plan::from_elements(&set, 5, ch37) != Err(Error::Policy)
+    {
+        return TestResult::Fail("C 6GHz TPE constraint differs from rtw89_phy_get_tpe_constraint");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g
+);

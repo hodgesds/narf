@@ -20,8 +20,17 @@
 //! `RTW89_WW` (no country programmed), no SAR source
 //! (`RTW89_SAR_TXPWR_MAC_MAX`), no antenna-gain (DAG) tables, no 6GHz TPE.
 //! RTL8852C has no static `rtw8852c_table.c` copy in NARF, so a container
-//! without the needed elements is refused rather than defaulted. 6GHz
-//! (TXPWR_LMT_6GHZ / RU_6GHZ with `reg_6ghz_power`) is refused here.
+//! without the needed elements is refused rather than defaulted.
+//!
+//! 6GHz (`Plan::from_elements_6ghz`) is the same program for a typed 6GHz
+//! profile under an explicit regd.c 6GHz context (`SixGhzPower`): the
+//! country's `txpwr_regd[RTW89_BAND_6G]` from the container's REGD element
+//! (fw.c `rtw89_recognize_regd_from_elm`; NARF carries no static
+//! `rtw89_regd_map`, so a container without one admits no 6GHz), the
+//! `reg_6ghz_power` type of the BSS and, for Standard Power, the TPE
+//! constraint (`rtw89_phy_get_tpe_constraint`). TXPWR_LMT_6GHZ /
+//! LMT_RU_6GHZ are read as phy.c `rtw89_phy_read_txpwr_limit{,_ru}` for
+//! `RTW89_BAND_6G` (`[regd][reg6]`, falling back to `[WW][DFLT]` when 0).
 //!
 //! This is register configuration only: it makes no conducted-power,
 //! regulatory or SAR claim for any board.
@@ -33,9 +42,12 @@ use super::rfk::Error;
 const ID_BYRATE: u32 = 9;
 const ID_LMT_2GHZ: u32 = 10;
 const ID_LMT_5GHZ: u32 = 11;
+const ID_LMT_6GHZ: u32 = 12;
 const ID_LMT_RU_2GHZ: u32 = 13;
 const ID_LMT_RU_5GHZ: u32 = 14;
+const ID_LMT_RU_6GHZ: u32 = 15;
 const ID_TX_SHAPE_LMT: u32 = 16;
+const ID_REGD: u32 = 20;
 /// `RTW89_WW`.
 const WW: u8 = 0;
 /// `RTW89_REGD_NUM`, `RTW89_NTX_NUM`, `RTW89_BF_NUM`, `RTW89_RS_LMT_NUM`,
@@ -49,6 +61,16 @@ const RU_NUM: u8 = 8;
 const BAND_NUM: u8 = 3;
 const BYR_BW_NUM: u8 = 5;
 const REG_6GHZ_POWER_NUM: u8 = 3;
+/// `RTW89_6G_BW_NUM` (`RTW89_CHANNEL_WIDTH_320 + 1`), `RTW89_6G_CH_NUM`.
+const BW_6G_NUM: u8 = 5;
+const CH_6G_NUM: u8 = 120;
+/// `enum rtw89_regulation_type` members regd.c treats specially.
+const ETSI: u8 = 1;
+const UK: u8 = 14;
+/// `RTW89_REGD_MAX_COUNTRY_NUM` (U8_MAX).
+const MAX_COUNTRY_NUM: u32 = 255;
+/// `RTW89_MIN_VALID_POWER_CONSTRAINT` (dBm).
+const MIN_VALID_POWER_CONSTRAINT: i8 = -10;
 /// `enum rtw89_rate_section`.
 const RS_CCK: u8 = 0;
 const RS_OFDM: u8 = 1;
@@ -118,9 +140,22 @@ fn select(elements: &[Element], id: u32, rfe: u8) -> Result<Option<Conf<'_>>, Er
     Ok(conf)
 }
 
-/// phy.c `rtw89_channel_to_idx` (2.4/5GHz; unknown channels map to 0 as
-/// Linux after its warning).
-fn channel_to_idx(channel: u8) -> u8 {
+/// phy.c `rtw89_channel_to_idx` (unknown channels map to 0 as Linux
+/// after its warning); 6GHz is `rtw89_channel_6g_to_idx`.
+fn channel_to_idx(band: Band, channel: u8) -> u8 {
+    if band == Band::Ghz6 {
+        return match channel {
+            1..=29 => (channel - 1) / 2,
+            33..=61 => (channel - 3) / 2,
+            65..=93 => (channel - 5) / 2,
+            97..=125 => (channel - 7) / 2,
+            129..=157 => (channel - 9) / 2,
+            161..=189 => (channel - 11) / 2,
+            193..=221 => (channel - 13) / 2,
+            225..=253 => (channel - 15) / 2,
+            _ => 0,
+        };
+    }
     match channel {
         1..=14 => channel - 1,
         36..=64 => (channel - 36) / 2,
@@ -140,36 +175,167 @@ fn rf_to_mac(v: i8) -> i8 {
     v >> 1
 }
 
+/// The regd.c 6GHz power context of one 6GHz plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SixGhzPower {
+    /// `rtw89_regd_get(rtwdev, RTW89_BAND_6G)` (UK follows ETSI).
+    regd: u8,
+    /// `enum rtw89_reg_6ghz_power` (VLP 0 = DFLT, LPI 1, STD 2).
+    power: u8,
+}
+
+impl SixGhzPower {
+    /// regd.c 6GHz policy for `country` (the host regulatory alpha2) and
+    /// the AP power type (`None` = `IEEE80211_REG_UNSET_AP`), as Linux
+    /// applies it on a PCIe device without the rtw89 ACPI DSM functions
+    /// (every `rtw89_acpi_evaluate_dsm` fails): `rtw89_regd_setup_6ghz`
+    /// allows 6GHz, `block_6ghz`/`block_6ghz_sp` stay clear and
+    /// `rtw89_regd_setup_policy_6ghz_vlp` blocks VLP for US and CA.
+    ///
+    /// * The map is the last REGD element with at most
+    ///   `RTW89_REGD_MAX_COUNTRY_NUM` entries (`rtw89_regd_entcpy`: an
+    ///   out-of-range rule reads as `RTW89_NA`); without one, 6GHz is
+    ///   refused (`Table`), since NARF has no static `rtw89_regd_map`.
+    /// * `rtw89_regd_find_reg_by_name`: an unknown country is
+    ///   `rtw89_ww_regd`, whose index is `RTW89_REGD_MAX_COUNTRY_NUM`, so
+    ///   `regd_is_6ghz_blocked` disables every 6GHz channel (`Policy`);
+    ///   a 6GHz rule of `RTW89_NA` is `regd_is_6ghz_not_applicable`.
+    /// * `rtw89_reg_6ghz_power_recalc`: VLP/LPI/SP map to
+    ///   `RTW89_REG_6GHZ_POWER_{VLP,LPI,STD}`, an unset type to DFLT
+    ///   (never blocked); a blocked type is `-EINVAL` (`Policy`).
+    pub(super) fn new(
+        elements: &[Element],
+        country: [u8; 2],
+        ap: Option<narf_wireless::reg::PowerType6Ghz>,
+    ) -> Result<Self, Error> {
+        use narf_wireless::reg::PowerType6Ghz;
+        let mut map: Option<(usize, &[u8])> = None;
+        for elm in elements.iter().filter(|e| e.id == ID_REGD) {
+            let h = elm.bytes.get(..8).ok_or(Error::Table)?;
+            let size = usize::from(h[3]);
+            let n = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+            if n > MAX_COUNTRY_NUM {
+                // "regd element ignore and take another/common".
+                continue;
+            }
+            if size == 0
+                || (n as usize)
+                    .checked_mul(size)
+                    .and_then(|v| v.checked_add(8))
+                    .is_none_or(|v| v > elm.bytes.len())
+            {
+                return Err(Error::Table);
+            }
+            map = Some((size, &elm.bytes[8..8 + n as usize * size]));
+        }
+        let (size, entries) = map.ok_or(Error::Table)?;
+        let rule = entries
+            .chunks_exact(size)
+            .find(|e| e.len() >= 2 && e[..2] == country)
+            .ok_or(Error::Policy)?
+            // `rule_6ghz` defaults to RTW89_NA when the entry is shorter.
+            .get(4)
+            .copied()
+            .unwrap_or(NA);
+        if rule >= REGD_NUM || rule == NA {
+            return Err(Error::Policy);
+        }
+        let regd = if rule == UK { ETSI } else { rule };
+        let power = match ap {
+            Some(PowerType6Ghz::Vlp) if country == *b"US" || country == *b"CA" => {
+                return Err(Error::Policy);
+            }
+            Some(PowerType6Ghz::Vlp) | None => 0,
+            Some(PowerType6Ghz::Lpi) => 1,
+            Some(PowerType6Ghz::Sp) => 2,
+        };
+        Ok(Self { regd, power })
+    }
+    pub(super) fn regd(self) -> u8 {
+        self.regd
+    }
+    pub(super) fn power(self) -> u8 {
+        self.power
+    }
+}
+
+/// `RTW89_NA`.
+const NA: u8 = 4;
+
+/// phy.c `rtw89_phy_get_tpe_constraint` for a valid 6GHz TPE (regd.c
+/// constraint in dBm): `rtw89_phy_txpwr_dbm_without_tolerance` then
+/// `rtw89_phy_txpwr_dbm_to_mac` (factor 1, clamped to -64..63). Without
+/// a TPE it is `dbm_to_mac(S8_MAX)` = 63, the existing SAR-free bound.
+fn tpe_mac(constraint: Option<i8>) -> i8 {
+    let Some(dbm) = constraint else {
+        return SAR_MAC_MAX;
+    };
+    let dbm = if dbm <= 0 { dbm.saturating_sub(2) } else { dbm };
+    (i16::from(dbm) << 1).clamp(-64, 63) as i8
+}
+
 /// The selected per-band configurations.
 struct Rules<'a> {
     band: Band,
     lmt: Conf<'a>,
     ru: Conf<'a>,
+    /// 6GHz only: the regd.c power context.
+    six: Option<SixGhzPower>,
+    /// `rtw89_phy_get_tpe_constraint` in MAC units (63 without a TPE).
+    cstr: i8,
 }
 
 impl Rules<'_> {
     fn ch_num(&self) -> u8 {
-        if self.band == Band::Ghz2 {
-            14
-        } else {
-            53
+        match self.band {
+            Band::Ghz2 => 14,
+            Band::Ghz5 => 53,
+            Band::Ghz6 => CH_6G_NUM,
         }
     }
     fn bw_num(&self) -> u8 {
-        if self.band == Band::Ghz2 {
-            2
-        } else {
-            4
+        match self.band {
+            Band::Ghz2 => 2,
+            Band::Ghz5 => 4,
+            Band::Ghz6 => BW_6G_NUM,
         }
     }
-    /// phy.c `rtw89_phy_read_txpwr_limit` for regd WW without DAG, SAR or
-    /// TPE: `min3(rf_to_mac(lmt), 63, 63)`.
+    /// phy.c `rtw89_phy_read_txpwr_limit` without DAG or SAR:
+    /// `min3(rf_to_mac(lmt), 63, cstr)`; 2.4/5GHz read regd WW (no
+    /// country, no TPE), 6GHz `[regd][reg6]` else `[WW][DFLT]`.
     fn limit(&self, bw: u8, ntx: u8, rs: u8, bf: u8, ch: u8) -> i8 {
         if bw >= self.bw_num() {
             return 0;
         }
-        let idx = channel_to_idx(ch);
+        let idx = channel_to_idx(self.band, ch);
         let (ch_num, bw_num) = (self.ch_num(), self.bw_num());
+        if let Some(six) = self.six {
+            let (mut own, mut ww) = (0i8, 0i8);
+            for e in self.lmt.entries(8) {
+                // fw_txpwr_lmt_6ghz_entry_valid.
+                if e[0] >= bw_num
+                    || e[1] >= NTX_NUM
+                    || e[2] >= RS_LMT_NUM
+                    || e[3] >= BF_NUM
+                    || e[4] >= REGD_NUM
+                    || e[5] >= REG_6GHZ_POWER_NUM
+                    || e[6] >= ch_num
+                {
+                    continue;
+                }
+                if (e[0], e[1], e[2], e[3], e[6]) != (bw, ntx, rs, bf, idx) {
+                    continue;
+                }
+                if (e[4], e[5]) == (six.regd, six.power) {
+                    own = e[7] as i8;
+                }
+                if (e[4], e[5]) == (WW, 0) {
+                    ww = e[7] as i8;
+                }
+            }
+            let v = if own != 0 { own } else { ww };
+            return rf_to_mac(v).min(SAR_MAC_MAX).min(self.cstr);
+        }
         let mut v = 0i8;
         for e in self.lmt.entries(7) {
             // fw_txpwr_lmt_{2,5}ghz_entry_valid.
@@ -196,8 +362,33 @@ impl Rules<'_> {
     }
     /// phy.c `rtw89_phy_read_txpwr_limit_ru` (same default state).
     fn limit_ru(&self, ru: u8, ntx: u8, ch: u8) -> i8 {
-        let idx = channel_to_idx(ch);
+        let idx = channel_to_idx(self.band, ch);
         let ch_num = self.ch_num();
+        if let Some(six) = self.six {
+            let (mut own, mut ww) = (0i8, 0i8);
+            for e in self.ru.entries(6) {
+                // fw_txpwr_lmt_ru_6ghz_entry_valid.
+                if e[0] >= RU_NUM
+                    || e[1] >= NTX_NUM
+                    || e[2] >= REGD_NUM
+                    || e[3] >= REG_6GHZ_POWER_NUM
+                    || e[4] >= ch_num
+                {
+                    continue;
+                }
+                if (e[0], e[1], e[4]) != (ru, ntx, idx) {
+                    continue;
+                }
+                if (e[2], e[3]) == (six.regd, six.power) {
+                    own = e[5] as i8;
+                }
+                if (e[2], e[3]) == (WW, 0) {
+                    ww = e[5] as i8;
+                }
+            }
+            let v = if own != 0 { own } else { ww };
+            return rf_to_mac(v).min(SAR_MAC_MAX).min(self.cstr);
+        }
         let mut v = 0i8;
         for e in self.ru.entries(5) {
             // fw_txpwr_lmt_ru_{2,5}ghz_entry_valid.
@@ -377,6 +568,9 @@ pub(super) type Parts<'a> = (
     [u8; 2],
 );
 
+/// Limit and RU-limit pages per ntx.
+type Pages = ([[i8; 40]; 2], [[i8; 24]; 2]);
+
 /// One C TX power program for one typed channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
@@ -391,6 +585,11 @@ pub(super) struct Plan {
     ru: [[i8; 24]; 2],
     /// `rtw89_get_tx_shape_idx(band, RS_CCK / RS_OFDM)`.
     shape: [u8; 2],
+    /// 6GHz only: the regd.c power context and the TPE constraint (dBm).
+    six: Option<(SixGhzPower, Option<i8>)>,
+    /// 6GHz with a TPE only: the limit/RU pages without it, which the
+    /// signed record identity binds (a TPE only lowers `min3`).
+    untpe: Option<Pages>,
 }
 
 impl Plan {
@@ -410,10 +609,55 @@ impl Plan {
     pub(super) fn from_assets(assets: &Assets, rfe: u8, channel: Profile) -> Result<Self, Error> {
         Self::from_elements(assets.elements(), rfe, channel)
     }
+    /// 2.4/5GHz under regd WW; a 6GHz profile is refused here (it needs
+    /// [`Self::from_elements_6ghz`] and its regulatory context).
     pub(super) fn from_elements(
         elements: &[Element],
         rfe: u8,
         channel: Profile,
+    ) -> Result<Self, Error> {
+        if channel.band() == Band::Ghz6 {
+            return Err(Error::Policy);
+        }
+        Self::build(elements, rfe, channel, None)
+    }
+    pub(super) fn from_assets_6ghz(
+        assets: &Assets,
+        rfe: u8,
+        channel: Profile,
+        power: SixGhzPower,
+        tpe: Option<i8>,
+    ) -> Result<Self, Error> {
+        Self::from_elements_6ghz(assets.elements(), rfe, channel, power, tpe)
+    }
+    /// A typed 6GHz profile under `power`; `tpe` is the regd.c intersected
+    /// TPE constraint (dBm), valid only for `RTW89_REG_6GHZ_POWER_STD`
+    /// (`rtw89_reg_6ghz_tpe_recalc`; below -10 dBm is `-EINVAL`).
+    pub(super) fn from_elements_6ghz(
+        elements: &[Element],
+        rfe: u8,
+        channel: Profile,
+        power: SixGhzPower,
+        tpe: Option<i8>,
+    ) -> Result<Self, Error> {
+        if channel.band() != Band::Ghz6
+            || (tpe.is_some() && power.power != 2)
+            || tpe.is_some_and(|c| c < MIN_VALID_POWER_CONSTRAINT)
+        {
+            return Err(Error::Policy);
+        }
+        let mut plan = Self::build(elements, rfe, channel, Some((power, tpe)))?;
+        if tpe.is_some() {
+            let bare = Self::build(elements, rfe, channel, Some((power, None)))?;
+            plan.untpe = Some((bare.limit, bare.ru));
+        }
+        Ok(plan)
+    }
+    fn build(
+        elements: &[Element],
+        rfe: u8,
+        channel: Profile,
+        six: Option<(SixGhzPower, Option<i8>)>,
     ) -> Result<Self, Error> {
         if rfe == 255 {
             return Err(Error::Policy);
@@ -422,13 +666,15 @@ impl Plan {
         let (lmt_id, ru_id) = match band {
             Band::Ghz2 => (ID_LMT_2GHZ, ID_LMT_RU_2GHZ),
             Band::Ghz5 => (ID_LMT_5GHZ, ID_LMT_RU_5GHZ),
-            Band::Ghz6 => return Err(Error::Policy),
+            Band::Ghz6 => (ID_LMT_6GHZ, ID_LMT_RU_6GHZ),
         };
         let byrate = select(elements, ID_BYRATE, rfe)?.ok_or(Error::Table)?;
         let rules = Rules {
             band,
             lmt: select(elements, lmt_id, rfe)?.ok_or(Error::Table)?,
             ru: select(elements, ru_id, rfe)?.ok_or(Error::Table)?,
+            six: six.map(|(p, _)| p),
+            cstr: tpe_mac(six.and_then(|(_, t)| t)),
         };
         let shape_conf = select(elements, ID_TX_SHAPE_LMT, rfe)?.ok_or(Error::Table)?;
         let b = band as u8;
@@ -493,13 +739,15 @@ impl Plan {
         }
 
         // fw.c `rtw89_fw_load_tx_shape_lmt`; core.h `rtw89_get_tx_shape_idx`
-        // with `reg6_pwr` = `RTW89_REG_6GHZ_POWER_DFLT` off 6GHz.
+        // with `reg6_pwr` = `RTW89_REG_6GHZ_POWER_DFLT` off 6GHz (regd WW
+        // there); on 6GHz the 6GHz regd and `reg_6ghz_power`.
+        let (shape_regd, shape_reg6) = six.map_or((WW, 0), |(p, _)| (p.regd, p.power));
         let mut shape = [0u8; 2];
         for e in shape_conf.entries(5) {
             if e[0] >= BAND_NUM || e[1] >= 2 || e[2] >= REGD_NUM || e[4] >= REG_6GHZ_POWER_NUM {
                 continue;
             }
-            if e[0] == b && e[2] == WW && e[4] == 0 {
+            if e[0] == b && e[2] == shape_regd && e[4] == shape_reg6 {
                 shape[usize::from(e[1])] = e[3];
             }
         }
@@ -510,25 +758,43 @@ impl Plan {
             limit: [rules.page(channel, 0), rules.page(channel, 1)],
             ru: [rules.ru_page(channel, 0), rules.ru_page(channel, 1)],
             shape,
+            six,
+            untpe: None,
         })
+    }
+    /// 6GHz only: the regd.c context and TPE constraint of this plan.
+    pub(super) fn six_ghz(&self) -> Option<(SixGhzPower, Option<i8>)> {
+        self.six
     }
 
     /// Bind the exact power program into a signed-record digest.
     pub fn bind(&self, hash: &mut narf_crypto::sha256::Sha256) {
-        hash.update(b"C WW0 fw TXPWR elements;no SAR/DAG/TPE;rtw8852c_set_txpwr");
+        // 2.4/5GHz bytes are unchanged. A 6GHz plan binds its regd.c
+        // context and the pre-TPE pages (a TPE only lowers `min3`, so the
+        // record measured without it covers every TPE-constrained plan).
+        if let Some((six, _)) = self.six {
+            hash.update(b"C 6GHz fw TXPWR elements;regd6/reg_6ghz_power;no SAR/DAG;TPE excluded");
+            hash.update(&[six.regd, six.power]);
+        } else {
+            hash.update(b"C WW0 fw TXPWR elements;no SAR/DAG/TPE;rtw8852c_set_txpwr");
+        }
         hash.update(&[
             self.channel.band() as u8,
             self.channel.primary(),
             self.channel.center(),
             self.channel.width() as u8,
         ]);
+        let (limit, ru) = self
+            .untpe
+            .as_ref()
+            .map_or((&self.limit, &self.ru), |(l, r)| (l, r));
         for row in [
             &self.byrate[..],
             &self.offset[..],
-            &self.limit[0][..],
-            &self.limit[1][..],
-            &self.ru[0][..],
-            &self.ru[1][..],
+            &limit[0][..],
+            &limit[1][..],
+            &ru[0][..],
+            &ru[1][..],
         ] {
             for &v in row {
                 hash.update(&v.to_le_bytes());
