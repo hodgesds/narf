@@ -33,6 +33,13 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_local(&self) -> Option<[u8; 6]> {
         self.station.as_ref().map(super::station::State::local)
     }
+    /// Station primary and accepted CSA state (test observation only).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn station_channel_switch(&self) -> Option<(u8, Option<station::Switch>)> {
+        self.station
+            .as_ref()
+            .map(|station| (station.channel(), station.channel_switch()))
+    }
     pub(super) fn station_peer(&self) -> Option<[u8; 6]> {
         self.station.as_ref().and_then(super::station::State::peer)
     }

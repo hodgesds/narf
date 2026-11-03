@@ -167,7 +167,18 @@ unsafe impl Io for Startup {
     ) -> Result<u32, power::Error> {
         self.station_allowed()?;
         admission.check()?;
-        let epoch = self.retune_channel(primary).await?;
+        let epoch = self.retune_channel(primary, false).await?;
+        admission.check()?;
+        Ok(epoch)
+    }
+    async fn station_switch_channel(
+        &mut self,
+        primary: u8,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        self.station_allowed()?;
+        admission.check()?;
+        let epoch = self.retune_channel(primary, true).await?;
         admission.check()?;
         Ok(epoch)
     }

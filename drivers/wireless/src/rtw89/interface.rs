@@ -350,6 +350,7 @@ impl<I: Io + 'static> Device<I> {
             selection: super::monitor::Selection {
                 mode: 2,
                 generation: 1,
+                primary: 1,
             },
             registration: IrqSafeSpinLock::new(None),
             monitor_admin: IrqSafeSpinLock::new(None),
@@ -875,11 +876,23 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         {
             return Err(WirelessError::Busy);
         }
-        if super::monitor_wire::channel(channel) {
-            Ok(())
-        } else {
-            Err(WirelessError::NotSupported)
+        // Only a signed-admitted primary (the advertised set) is accepted;
+        // the fresh monitor generation retunes to it before any capture.
+        let primary = super::monitor_wire::channel(channel)
+            .filter(|primary| self.channels.load(Ordering::Acquire) & (1 << primary) != 0)
+            .ok_or(WirelessError::NotSupported)?;
+        let before = self.desired.snapshot();
+        let selected = self
+            .desired
+            .select_monitor_primary(primary)
+            .ok_or(WirelessError::Busy)?;
+        if selected != before {
+            // Like a role change: retire this shell's admission so the
+            // supervisor fences it and starts a generation on `primary`.
+            self.close();
+            self.line.raise();
         }
+        Ok(())
     }
 
     fn fragmentation_threshold(&self) -> Option<u32> {

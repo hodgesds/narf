@@ -159,7 +159,7 @@ impl<I: Io + 'static> Device<I> {
             let Ok(bytes) = narf_wireless::monitor::encode(
                 &frame,
                 narf_wireless::monitor::Metadata {
-                    frequency_mhz: wire::FREQUENCY,
+                    frequency_mhz: capture.source.frequency_mhz(),
                     signal_dbm: None,
                 },
             ) else {

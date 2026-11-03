@@ -494,6 +494,14 @@ impl Native {
     /// Native retune owner for one noninitial (or back to the initial)
     /// 2.4GHz/20MHz primary on the Ready radio.
     ///
+    /// `linked` is the associated-station channel switch (mac80211
+    /// `ieee80211_csa_switch_work` -> `ieee80211_link_use_reserved_context`
+    /// -> rtw89 `rtw89_ops_switch_vif_chanctx`/`rtw89_chanctx_ops_reassign_vif`
+    /// -> `rtw89_set_channel`): the installed peer (firmware role/join/CMAC/
+    /// RA/BA CAM, all channel-independent on 8852B 2.4GHz/20MHz) must exist
+    /// and stays installed; without it no peer may exist. Every other
+    /// precondition below is identical, so no ordinary TX/RX is in flight.
+    ///
     /// Mirrors mac80211 `ieee80211_offchannel_stop_vifs` + `drv_flush`
     /// (rtw89_ops_flush: leave LPS, flush HCI/MAC queues) then
     /// `rtw89_ops_config` (`rtw89_leave_ps_mode`, `rtw89_config_entity_chandef`,
@@ -519,6 +527,7 @@ impl Native {
         basic: &rfk::Rfk,
         assets: &radio_assets::Assets,
         primary: u8,
+        linked: bool,
     ) -> Result<u32, power::Error> {
         self.phy_profile_current()?;
         self.operating_current()?;
@@ -586,7 +595,7 @@ impl Native {
         self.poll().map_err(|_| power::Error::Access)?;
         if self.sleep_blocked
             || self.sleep_reset.is_some()
-            || self.station_runtime.peer.is_some()
+            || self.station_runtime.peer.is_some() != linked
             || self.station_runtime.monitor.is_some()
             || self.queue.pending() != 0
             || !self.station_runtime.backlog.is_empty()

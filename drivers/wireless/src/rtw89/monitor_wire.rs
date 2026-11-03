@@ -4,7 +4,6 @@
 //! Unreferenced draft until the same-native role/capture owner is complete.
 use narf_wireless::monitor::Channel;
 pub(super) const IFTYPE: u32 = 6;
-pub(super) const FREQUENCY: u32 = 2412;
 pub(super) const CMAC_TX: u32 = 1 << 29;
 pub(super) const SNIFFER: u32 = 1;
 pub(super) const RX_FILTER: u32 = 0xce20;
@@ -15,13 +14,23 @@ pub(super) const TO_HOST: u32 = 0x55555555;
 pub(super) fn flags(value: u32) -> bool {
     value & !((1 << 3) | (1 << 4)) == 0
 }
-/// The advertised admitted profile is ch1/20MHz. Wider channels/other
-/// bands have their separate native/qualification rows; never narrow a request.
-pub(super) fn channel(value: Channel) -> bool {
-    value.frequency_mhz == FREQUENCY
+/// 2.4GHz/20MHz primary (1..=13) of an exact NOHT/HT20 monitor chandef.
+/// Wider channels/other bands have their separate native/qualification
+/// rows; never narrow a request. The caller still requires the primary to
+/// be signed-admitted (`Native::admitted_channels`).
+pub(super) fn channel(value: Channel) -> Option<u8> {
+    let offset = value.frequency_mhz.checked_sub(2407)?;
+    let primary = u8::try_from(offset / 5).ok()?;
+    (offset % 5 == 0
+        && (1..=13).contains(&primary)
         && matches!(value.width, 0 | 1)
-        && value.center1_mhz == FREQUENCY
-        && value.center2_mhz == 0
+        && value.center1_mhz == value.frequency_mhz
+        && value.center2_mhz == 0)
+        .then_some(primary)
+}
+/// Center frequency of a 2.4GHz primary 1..=13.
+pub(super) const fn frequency(primary: u8) -> u32 {
+    2407 + 5 * primary as u32
 }
 /// Actual firmware role MONITOR7, SELF_ROLE_NONE0, MACID0/MAC0/port0.
 /// This is an exact payload; no enum can install a native role by itself.
@@ -80,8 +89,11 @@ pub(super) fn physts(page: u8, old: u32) -> Option<u32> {
 /// direct), not a requested/configured channel. A future opaque same-native
 /// receipt may be constructed only after these reads and current PHY/MAC
 /// source proof; this pure predicate itself grants no capture/retune/RF.
-pub(super) fn observed_channel(words: [u32; 4]) -> bool {
-    words
-        .into_iter()
-        .all(|word| word <= 0xfffff && word & 0x3ffff == 0x1c01)
+/// Expected value is rtw8852b_rfk.c `_ch_setting`/`_bw_setting` for this
+/// actual primary: CFGCH CH=primary, BW=20M(3), BW2, band 2.4GHz.
+pub(super) fn observed_channel(words: [u32; 4], primary: u8) -> bool {
+    (1..=13).contains(&primary)
+        && words
+            .into_iter()
+            .all(|word| word <= 0xfffff && word & 0x3ffff == 0x1c00 | u32::from(primary))
 }

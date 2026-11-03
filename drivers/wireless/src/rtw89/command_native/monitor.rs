@@ -192,7 +192,7 @@ unsafe impl monitor::Io for Port<'_> {
             words[index] = unsafe { self.0.read_rf(path, address, 0xfffff).await }?;
         }
         self.current(admission, selection)?;
-        if !wire::observed_channel(words) {
+        if !wire::observed_channel(words, selection.primary) {
             return Err(power::Error::Access);
         }
         self.0

@@ -166,6 +166,12 @@ pub(super) unsafe trait Io: Send {
     async fn station_retune(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Associated channel switch (CSA): retune the Ready radio to `primary`
+    /// keeping the installed peer, same admission/record rules as
+    /// [`Self::station_retune`]. `Busy` is a proven-unpublished refusal.
+    async fn station_switch_channel(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// Bit n set: primary n has a current signed full program (channel1 is
     /// the base record). Default: channel1 only.
     fn station_channels(&mut self) -> Result<u16, power::Error> {
@@ -519,6 +525,57 @@ pub(super) struct State {
     channel: u8,
     /// Native retune epoch this state's channel-bound work was built for.
     epoch: Option<u32>,
+    /// Accepted AP channel switch (mac80211 `link->csa`), if any.
+    csa: Option<Switch>,
+}
+/// mac80211 station CSA state for one link: target primary, switch time
+/// (`csa_time_tu` after the announcing beacon), `csa.blocked_tx` and
+/// `csa.waiting_bcn` once the radio is on the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Switch {
+    pub primary: u8,
+    pub at_ms: u64,
+    pub block_tx: bool,
+    pub switched: bool,
+}
+/// Parsed CSA/ECSA element of a beacon (`ieee80211_parse_ch_switch_ie`):
+/// ECSA (60) takes precedence over CSA (37). `None` primary is a target
+/// outside 2.4GHz (ECSA operating class not 81..=84) or channel 14/out of
+/// range, which this 2.4GHz/20MHz station cannot use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Announcement {
+    pub mode: bool,
+    pub primary: Option<u8>,
+    pub count: u8,
+}
+pub(super) fn channel_switch(ies: &[u8]) -> Option<Announcement> {
+    let mut csa = None;
+    let mut ecsa = None;
+    let mut rest = ies;
+    while let [id, len, tail @ ..] = rest {
+        let len = usize::from(*len);
+        let Some(body) = tail.get(..len) else {
+            break;
+        };
+        match (*id, body) {
+            (37, [mode, channel, count]) if csa.is_none() => {
+                csa = Some((*mode, None, *channel, *count))
+            }
+            (60, [mode, class, channel, count]) if ecsa.is_none() => {
+                ecsa = Some((*mode, Some(*class), *channel, *count))
+            }
+            _ => {}
+        }
+        rest = &tail[len..];
+    }
+    let (mode, class, channel, count) = ecsa.or(csa)?;
+    // ieee80211_operating_class_to_band: 81..=84 are the 2.4GHz classes.
+    let band2 = class.is_none_or(|class| (81..=84).contains(&class));
+    Some(Announcement {
+        mode: mode == 1,
+        primary: (band2 && (1..=13).contains(&channel)).then_some(channel),
+        count,
+    })
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -583,6 +640,7 @@ impl State {
             scanning: false,
             channel: 1,
             epoch: None,
+            csa: None,
         }
     }
     pub(super) fn admission(&self) -> Admission {
@@ -618,6 +676,7 @@ impl State {
             && self.mgmt_out.is_empty()
             && self.ba_ops.is_empty()
             && self.edca_pending.is_none()
+            && self.csa.is_none()
             && !self.scanning
             && self.scan.is_none()
             && self.rx_idle
@@ -636,6 +695,7 @@ impl State {
     }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
+            && !self.csa_blocks_tx()
             && self.fragment_tx.is_none()
             && self.fragment_wait.is_none()
             && self.pending.iter().all(|pending| pending.agg)
@@ -679,6 +739,7 @@ impl State {
         self.wmm = None;
 
         self.edca_pending = None;
+        self.csa = None;
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
@@ -724,6 +785,7 @@ impl State {
         self.established = false;
         self.wmm = None;
         self.edca_pending = None;
+        self.csa = None;
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
@@ -1002,6 +1064,132 @@ impl State {
         self.edca_pending = Some(offered);
         Ok(())
     }
+    /// mac80211 `ieee80211_sta_process_chanswitch` for a bound peer beacon
+    /// on the current primary (source BEACON). While a switch is active: the
+    /// first beacon after the switch ends it (`ieee80211_chswitch_post_beacon`,
+    /// TX unblocked) and is then treated as a fresh beacon; a beacon without
+    /// CSA before the switch aborts it (`ieee80211_sta_abort_chanswitch`);
+    /// otherwise it is disregarded. A new announcement to another band or an
+    /// unadmitted primary drops the connection ("switches to unsupported
+    /// channel"); one to the current primary is ignored. The 20MHz link
+    /// keeps 20MHz on the target (CSA chandef downgraded to the link's
+    /// connection mode), so secondary/wide-bandwidth elements are not used.
+    fn observe_csa(&mut self, io: &mut impl Io, frame: &Mpdu, now: u64) -> Result<(), Error> {
+        if self.phase != Phase::Open || frame.bytes().first() != Some(&0x80) {
+            return Ok(());
+        }
+        let Some(peer) = self.peer.as_ref().map(|peer| peer.bss.bssid) else {
+            return Ok(());
+        };
+        let Some(candidate) = association::observe(frame, self.channel, self.own, None)
+            .ok()
+            .filter(|candidate| candidate.bss.bssid == peer)
+        else {
+            return Ok(());
+        };
+        let announced = channel_switch(&candidate.bss.information_elements);
+        if let Some(active) = self.csa {
+            if active.switched {
+                self.csa = None;
+            } else {
+                if announced.is_none() {
+                    self.csa = None;
+                }
+                return Ok(());
+            }
+        }
+        let Some(announced) = announced else {
+            return Ok(());
+        };
+        let Some(primary) = announced.primary else {
+            return Err(Error::PeerLost);
+        };
+        if primary == self.channel {
+            return Ok(());
+        }
+        if io.station_channels()? & (1 << primary) == 0 {
+            return Err(Error::PeerLost);
+        }
+        // csa_time_tu = (max(count, 1) - 1) * beacon_int.
+        let tu = u64::from(announced.count.max(1) - 1) * u64::from(candidate.bss.beacon_interval);
+        self.csa = Some(Switch {
+            primary,
+            at_ms: now.saturating_add((tu * 1024).div_ceil(1000)),
+            block_tx: announced.mode,
+            switched: false,
+        });
+        Ok(())
+    }
+    /// `csa.blocked_tx`, or the switch time has come (queues stopped for
+    /// `ieee80211_csa_switch_work`'s flush/retune).
+    fn csa_blocks_tx(&self) -> bool {
+        self.csa.is_some_and(|csa| {
+            csa.block_tx || !csa.switched && self.environment.now_ms() >= csa.at_ms
+        })
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn channel_switch(&self) -> Option<Switch> {
+        self.csa
+    }
+    fn channel_switch_due(&self) -> bool {
+        self.phase == Phase::Open
+            && self
+                .csa
+                .is_some_and(|csa| !csa.switched && self.environment.now_ms() >= csa.at_ms)
+    }
+    /// `ieee80211_csa_switch_work` -> rtw89 chanctx switch (`Io::station_switch_channel`)
+    /// once every TX in flight retired; the installed peer stays. A `Busy`
+    /// native refusal or TX still in flight retries on a later worker pass
+    /// within one second of the switch time, then the link fails like a
+    /// mac80211 switch failure. Afterwards the beacon monitor restarts
+    /// (`ieee80211_sta_reset_beacon_monitor`) and TX stays blocked (if
+    /// requested) until the first beacon on the target.
+    pub(super) async fn switch_channel(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        let Some(csa) = self.csa.filter(|csa| !csa.switched) else {
+            return Ok(());
+        };
+        if self.phase != Phase::Open || !(1..=13).contains(&csa.primary) {
+            return Err(Error::State);
+        }
+        let now = self.now()?;
+        let quiet = self.pending.is_empty()
+            && self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && self.delivered_reply.is_none();
+        let result = if quiet {
+            io.station_switch_channel(csa.primary, &self.admission)
+                .await
+        } else {
+            Err(power::Error::Busy)
+        };
+        match result {
+            Ok(epoch) => {
+                self.channel = csa.primary;
+                self.epoch = Some(epoch);
+                if let Some(peer) = self.peer.as_mut() {
+                    peer.bss.channel = csa.primary;
+                }
+                // rtw89_track_work statistics belong to the old primary.
+                self.track = super::track::Tracker::default();
+                self.last_peer = now;
+                self.csa = Some(Switch {
+                    switched: true,
+                    ..csa
+                });
+                Ok(())
+            }
+            Err(power::Error::Busy) if now < csa.at_ms.saturating_add(1000) => Ok(()),
+            Err(error) => {
+                if !self.admission.teardown_pending() {
+                    self.fail(io);
+                }
+                Err(match error {
+                    power::Error::Busy => Error::State,
+                    error => Error::Native(error),
+                })
+            }
+        }
+    }
     /// After `Originator::stop`: `TX_STOP_*` reaches the driver (RA limit),
     /// and a locally requested stop (`AGG_STOP_LOCAL_REQUEST`) sends DELBA
     /// as initiator with `WLAN_REASON_QSTA_NOT_USE` (`ieee80211_stop_tx_ba_cb`).
@@ -1217,6 +1405,7 @@ impl State {
     }
     pub(super) fn async_pending(&self) -> bool {
         self.edca_pending()
+            || self.channel_switch_due()
             || self.sleep_timer_due()
             || self.phase == Phase::Open && !self.ba_ops.is_empty()
             || !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped)
@@ -1225,6 +1414,9 @@ impl State {
     pub(super) async fn apply_async(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.edca_pending() {
             self.apply_edca(io).await?;
+        }
+        if self.channel_switch_due() {
+            self.switch_channel(io).await?;
         }
         if !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped) {
             self.track(io).await?;
@@ -1428,6 +1620,7 @@ impl State {
                     }
                 }
                 self.observe_wmm(&frame)?;
+                self.observe_csa(io, &frame, now)?;
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
@@ -2067,6 +2260,7 @@ impl State {
         self.qos_all = self.wmm.is_some() && io.station_qos_all_allowed()?;
         self.firmware_ra = self.wmm.is_some() && io.station_firmware_ra_allowed()?;
         io.station_prepare_peer(bssid, &self.admission).await?;
+        self.csa = None;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
         self.last_peer = self.last_now;

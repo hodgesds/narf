@@ -15,6 +15,19 @@ impl Startup {
         {
             return Err(power::Error::Terminal);
         }
+        // mac80211 monitor chandef -> rtw89 chanctx `rtw89_set_channel`: the
+        // fresh generation retunes to the selected signed-admitted primary
+        // before any monitor role/filter/capture exists (the native owner
+        // refuses with a monitor installed). Channel1 needs no retune.
+        let primary = desired.snapshot().primary;
+        let current = self
+            .firmware
+            .as_ref()
+            .and_then(|firmware| firmware.transport().operating_channel())
+            .map(|(primary, _)| primary);
+        if current != Some(primary) {
+            self.retune_channel(primary, false).await?;
+        }
         let controller = monitor::Controller::prepare(desired.clone(), admission.clone())?;
         self.station_native()?.monitor_prepare(desired, admission)?;
         self.monitor = Some(controller); // retained before first native wait

@@ -259,8 +259,17 @@ impl Startup {
     /// (`Native::retune_full_radio`). A refusal that withheld nothing (the
     /// ordinary grant is still installed) is retryable; any failure after the
     /// grant was withheld terminalizes this owner like the initial program.
-    pub(super) async fn retune_channel(&mut self, primary: u8) -> Result<u32, power::Error> {
-        if self.phase != Phase::RadioReady || self.monitor.is_some() {
+    /// `linked` retunes the associated station in place (channel switch);
+    /// it requires the retained station controller.
+    pub(super) async fn retune_channel(
+        &mut self,
+        primary: u8,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || (linked && self.station_controller.is_none())
+        {
             return Err(power::Error::Terminal);
         }
         let mut attempt = Attempt::new(self);
@@ -281,6 +290,7 @@ impl Startup {
                         &owner.rfk,
                         owner.assets.as_ref().ok_or(power::Error::Terminal)?,
                         primary,
+                        linked,
                     )
                     .await
             }

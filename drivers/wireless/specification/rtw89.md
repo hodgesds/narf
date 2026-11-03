@@ -2221,14 +2221,74 @@ primaries, maps nl80211 channels/frequencies (empty = all admitted), refuses
 unadmitted primaries before any retune or probe, reports the BSS's actual
 channel/frequency and accepts association on an admitted primary.
 
-Remaining (no row credit claimed): provisioning tooling for N52C records
-(the binding is derivable from the loaded base, but no native request API
-exposes it yet), retune while associated (channel switch / CSA) and monitor
-on noninitial primaries (both refused), firmware hw_scan offload, and all
-native two-arch execution and physical validation. Newly written,
-unexecuted cases:
+Unexecuted cases of this step:
 `smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span`,
 `smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial`.
+
+#### Operating profile, associated channel switch and noninitial monitor
+
+**Operating programs per primary.** No operating program is a channel1
+identity on a noninitial primary: the N52C identity is
+`Board::new_noninitial(..).with_programs(base flags)`, i.e. the WMM, all-AC
+QoS, firmware RA, HT20, HE20 and originator BA/A-MPDU recipe chain
+(`Program::extend`) applied to that primary's own full-radio identity, and
+the record's byte57 must equal the base flags. `Qualification::allows`/
+`wmm_allowed`/`amsdu_allowed` sample `current()`, whose envelope is the
+active primary's N52C record, so every program publication on primary N is
+gated by N's signed measurement. The programs' wire contents (HT/HE
+capability IEs, H2C RA/CMAC/join, BA CAM, EDCA) are channel-independent at
+2.4GHz/20MHz on 8852B, as in Linux (rtw89_fw_h2c_ra, rtw89_fw_h2c_assoc_cmac_tbl,
+rtw89_fw_h2c_ba_cam carry no channel); 8852B LPS sends no channel H2C
+(`rtw89_fw_h2c_lps_ml_cmn_info` is BE-only, `LPS_CH_INFO` is 8922A-only),
+and N52C binds the installed N52P/N52F/N52A/N52T companions.
+
+**Associated channel switch (CSA).** `station::State::observe_csa` mirrors
+mac80211 `ieee80211_sta_process_chanswitch` for a bound peer beacon on the
+current primary: `channel_switch` parses ECSA(60) in preference to CSA(37)
+(`ieee80211_parse_ch_switch_ie`); an ECSA class outside 81..=84, channel14
+or an unadmitted primary drops the connection ("switches to unsupported
+channel"); the current primary is ignored; the switch time is
+`(max(count,1)-1) * beacon_int` TU; `mode` is `csa.blocked_tx`. The 20MHz
+link stays 20MHz on the target (CSA chandef downgraded to the connection
+mode), so secondary-offset/wide-bandwidth elements are unused. While active,
+a beacon without CSA aborts (`ieee80211_sta_abort_chanswitch`) and the first
+beacon after the switch ends it (`ieee80211_chswitch_post_beacon`,
+`waiting_bcn`), then is processed as a fresh beacon. TX is refused (`Busy`)
+while blocked or once the switch time passed, and LPS is not entered while
+a switch is pending. At the switch time the async worker
+(`State::switch_channel`, `ieee80211_csa_switch_work`) waits for every TX in
+flight to retire, then calls `Io::station_switch_channel` ->
+`Startup::retune_channel(primary, linked = true)` ->
+`Native::retune_full_radio(.., linked)`, the rtw89 chanctx path
+(`rtw89_ops_switch_vif_chanctx`/`rtw89_chanctx_ops_reassign_vif` ->
+`rtw89_set_channel` + `rtw89_chip_rfk_channel`). With `linked` the installed
+peer must exist and stays installed; every other native refusal (drained
+H2C/RX/TX, awake, no monitor/sleep owner, signed N52C match, grant
+withheld for the program) is unchanged. `Busy` retries on later worker
+passes for one second past the switch time, then the link fails. Success
+restarts the beacon monitor and track statistics and moves the peer's
+channel. No `NL80211_CMD_CH_SWITCH_STARTED/NOTIFY` is emitted: the shared
+`WirelessNetIface` has no station channel-switch event yet.
+
+**Monitor on a noninitial primary.** `monitor_wire::channel` maps an exact
+NOHT/HT20 2.4GHz chandef to its primary 1..=13 (wider/other bands refused,
+never narrowed); `set_monitor_channel` accepts only an advertised (signed
+admitted) primary and stores it in the monitor `Selection` (`primary`).
+A different primary bumps the selection generation and closes the shell,
+so the supervisor retires the old capture and starts a fresh generation
+(mac80211 monitor chandef -> rtw89 chanctx `rtw89_set_channel`).
+`Startup::start_monitor` retunes that fresh generation to the selected
+primary before any monitor role/filter exists (no peer, no monitor owner),
+then the RF observation requires all four CFGCH readbacks to equal
+`0x1c00 | primary` (`_ch_setting`/`_bw_setting` 20MHz) and capture metadata
+reports `monitor_wire::frequency(primary)` of the source's selection.
+
+Remaining for this row: provisioning tooling for N52C records (the binding
+is derivable from the loaded base via `channel_policy::Request`, but no
+native request API reports it), firmware hw_scan offload, and all native
+two-arch execution and physical validation. Unexecuted new cases:
+`smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon`,
+`smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux`.
 
 ## 4. Invariants
 

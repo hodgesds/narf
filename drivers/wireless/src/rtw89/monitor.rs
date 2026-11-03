@@ -9,6 +9,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub(super) struct Selection {
     pub mode: u32,
     pub generation: u64,
+    /// Requested 2.4GHz/20MHz monitor primary (mac80211 monitor chandef).
+    /// Part of the selection: a change invalidates every older role/source.
+    pub primary: u8,
 }
 /// Physical supervisor-owned selected role, retained across actual generation
 /// rebind. Selection is metadata; only native receipts can open capture.
@@ -19,6 +22,7 @@ impl Desired {
             IrqSafeSpinLock::new(Selection {
                 mode: 2,
                 generation: 1,
+                primary: 1,
             }),
             AtomicU32::new(super::fragment_wire::DISABLED),
         ))
@@ -53,7 +57,27 @@ impl Desired {
         *selected = Selection {
             mode,
             generation: selected.generation.checked_add(1)?,
+            primary: selected.primary,
         };
+        Some(*selected)
+    }
+    /// mac80211 monitor channel change (`ieee80211_set_monitor_channel` ->
+    /// chanctx -> rtw89 `rtw89_set_channel`) as metadata: only on the selected
+    /// monitor role, and a different primary starts a new generation so any
+    /// capture source/controller built on the previous primary retires and the
+    /// fresh generation retunes (`Startup::start_monitor`) before capture.
+    pub(super) fn select_monitor_primary(&self, primary: u8) -> Option<Selection> {
+        let mut selected = self.0.lock();
+        if selected.mode != monitor_wire::IFTYPE {
+            return None;
+        }
+        if selected.primary != primary {
+            *selected = Selection {
+                mode: selected.mode,
+                generation: selected.generation.checked_add(1)?,
+                primary,
+            };
+        }
         Some(*selected)
     }
     pub(super) fn current(&self, original: Selection) -> bool {
@@ -160,7 +184,7 @@ impl Controller {
         io.program(&self.admission, self.selection).await?;
         self.current(io)?;
         let observed = io.observed_channel(&self.admission, self.selection).await?;
-        if !monitor_wire::observed_channel(observed) {
+        if !monitor_wire::observed_channel(observed, self.selection.primary) {
             return Err(power::Error::Access);
         }
         self.current(io)?;
@@ -230,6 +254,10 @@ impl Source {
             admission,
             epoch,
         }
+    }
+    /// Center frequency of the primary this source observed (its selection).
+    pub(super) fn frequency_mhz(&self) -> u32 {
+        monitor_wire::frequency(self.selection.primary)
     }
     pub(super) fn with_current<T>(&self, publish: impl FnOnce() -> T) -> Result<T, power::Error> {
         self.admission.run(|| {

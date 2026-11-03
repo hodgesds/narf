@@ -411,6 +411,8 @@ struct DriverModel {
     /// Admitted primaries mask and every native retune actually requested.
     channels: u16,
     retunes: Vec<u8>,
+    /// Associated (CSA) channel switches requested of the native owner.
+    switches: Vec<u8>,
 }
 /// AX v0 interrupt registers with write-1-clear status, behind the same
 /// `irq::Mask` programs the native binding runs.
@@ -468,6 +470,7 @@ impl DriverModel {
             reclaimed: None,
             channels: NEXT_CHANNELS.swap(0, Ordering::AcqRel) | (1 << 1),
             retunes: Vec::new(),
+            switches: Vec::new(),
             sleep: NEXT_SLEEP.swap(false, Ordering::AcqRel).then(|| {
                 (
                     crate::rtw89::lps::Manager::after_firmware(
@@ -523,6 +526,23 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         }
         self.retunes.push(primary);
         Ok(self.retunes.len() as u32 + 1)
+    }
+    /// Associated channel switch model: same refusals as the native owner
+    /// (`retune_full_radio(.., linked = true)`), peer retained.
+    async fn station_switch_channel(
+        &mut self,
+        primary: u8,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if self.channels & (1 << primary) == 0 {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_none_or(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        self.switches.push(primary);
+        Ok(self.retunes.len() as u32 + self.switches.len() as u32 + 1)
     }
     fn station_sleep_capable(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         Ok(self.sleep.is_some())
@@ -3099,4 +3119,139 @@ fn smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial() 
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial
+);
+
+/// mac80211 station CSA on an open link: an AP on channel6 announces a
+/// switch to channel1 (count1, quiet mode). The switch runs through the
+/// associated native owner with the peer kept, the beacon monitor restarts,
+/// TX stays blocked until the first beacon on channel1, and a later
+/// announcement to an unadmitted primary drops the connection.
+fn smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon() -> TestResult {
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    NEXT_CHANNELS.store(1 << 6, Ordering::Release);
+    let h = Harness::new(false);
+    let scan = ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz: Vec::new(),
+        channels: vec![6],
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let mut join = h.request();
+    join.channel = 6;
+    join.frequency_mhz = 2437;
+    if complete(h.device.scan(scan)).is_err() || complete(h.device.associate(join)).is_err() {
+        return TestResult::Fail("channel6 association fixture");
+    }
+    let switch = || {
+        h.lifecycle
+            .retained
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .station_channel_switch()
+    };
+    let beacon = |ds: u8, extra: &[u8]| {
+        let mut frame = h.peer.lock().ap.beacon();
+        let at = frame
+            .windows(3)
+            .rposition(|w| w == [3, 1, 6])
+            .expect("DS parameter set");
+        frame[at + 2] = ds;
+        frame.extend_from_slice(extra);
+        frame
+    };
+    let inject = |frame: Vec<u8>| h.model(|io| io.packets.inject(&frame).unwrap());
+    // Same-channel announcement is ignored (no switch scheduled).
+    inject(beacon(6, &[37, 3, 1, 6, 1]));
+    h.pump();
+    if switch() != Some((6, None)) {
+        return TestResult::Fail("CSA to the current primary was not ignored");
+    }
+    inject(beacon(6, &[37, 3, 1, 1, 1]));
+    h.pump();
+    let pending = switch();
+    if !matches!(pending, Some((6, Some(s))) if s.primary == 1 && s.block_tx && !s.switched)
+        || !h.model(|io| io.switches.is_empty())
+    {
+        return TestResult::Fail("count1 quiet CSA not accepted before the switch work");
+    }
+    complete(h.device.apply_edca());
+    if h.model(|io| io.switches.clone()) != vec![1]
+        || !matches!(switch(), Some((1, Some(s))) if s.switched)
+        || h.device.connected_bssid() != Some(AP)
+        || h.model(|io| io.retunes.clone()) != vec![6]
+    {
+        return TestResult::Fail("CSA did not retune the associated owner keeping the peer");
+    }
+    // First beacon on the target ends the switch (TX unblocked).
+    inject(beacon(1, &[]));
+    h.pump();
+    if switch() != Some((1, None)) || h.device.connected_bssid() != Some(AP) {
+        return TestResult::Fail("first target beacon did not complete the channel switch");
+    }
+    // Announcement to unadmitted channel11 drops the connection.
+    inject(beacon(1, &[37, 3, 1, 11, 5]));
+    h.pump();
+    if h.device.connected_bssid().is_some() || h.model(|io| io.switches.clone()) != vec![1] {
+        return TestResult::Fail("CSA to an unadmitted primary kept the link or retuned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon
+);
+
+/// `ieee80211_parse_ch_switch_ie`: ECSA precedes CSA; only 2.4GHz classes
+/// 81..=84 and primaries 1..=13 are usable; monitor chandef/RF readback
+/// follow the actual primary (rtw8852b_rfk.c `_ch_setting`).
+fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
+    use crate::rtw89::{monitor_wire, station::channel_switch};
+    let csa = channel_switch(&[0, 1, b'x', 37, 3, 1, 11, 4]);
+    let ecsa = channel_switch(&[37, 3, 0, 11, 4, 60, 4, 0, 81, 6, 2]);
+    let five = channel_switch(&[60, 4, 1, 115, 36, 3]);
+    if csa.map(|a| (a.mode, a.primary, a.count)) != Some((true, Some(11), 4))
+        || ecsa.map(|a| (a.mode, a.primary, a.count)) != Some((false, Some(6), 2))
+        || five.map(|a| a.primary) != Some(None)
+        || channel_switch(&[37, 3, 0, 14, 1]).map(|a| a.primary) != Some(None)
+        || channel_switch(&[37, 2, 0, 6]).is_some()
+        || channel_switch(&[37, 9, 0, 6, 1]).is_some()
+    {
+        return TestResult::Fail("CSA/ECSA parse differs from mac80211");
+    }
+    let chandef = |mhz: u32, width: u32| narf_wireless::monitor::Channel {
+        frequency_mhz: mhz,
+        width,
+        center1_mhz: mhz,
+        center2_mhz: 0,
+    };
+    if monitor_wire::channel(chandef(2437, 1)) != Some(6)
+        || monitor_wire::channel(chandef(2472, 0)) != Some(13)
+        || monitor_wire::channel(chandef(2484, 1)).is_some()
+        || monitor_wire::channel(chandef(2437, 2)).is_some()
+        || monitor_wire::channel(chandef(5180, 1)).is_some()
+        || monitor_wire::frequency(6) != 2437
+        || !monitor_wire::observed_channel([0x1c06; 4], 6)
+        || monitor_wire::observed_channel([0x1c01; 4], 6)
+        || monitor_wire::observed_channel([0x1c06, 0x1c06, 0x1c06, 0x1c01], 6)
+    {
+        return TestResult::Fail("monitor chandef/frequency/RF readback not per actual primary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux
 );
