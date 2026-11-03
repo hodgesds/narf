@@ -768,6 +768,27 @@ them apart. No asset is provisioned. Cases updated, unexecuted:
 `smoke_rtw88_coding_payload_bounds_and_apply`,
 `smoke_rtw88_fallback_payload_bounds_and_descriptor_bits`.
 
+#### RTL8822BE recipient/originator BA (`N2BR`/`N2BT`) and RTS (`N2BX`)
+
+The exact-chip RX BA, TX BA and RTS-threshold records (`rx_ba_power.rs`,
+`tx_ba_power.rs`, `protection.rs`) replace the former B22 refusal with
+the B22 magics (`tx_ba_power::magic`: `N21x`/`N22x`/`N2Bx` by chip, every
+other chip refused) and unchanged layouts, header `10ec:b822`, over the
+bound B22 `N2BH` (and, for T/X, the bound R/T as on C21/C22). Each B22
+request also hashes `tx_ba_power::SOURCE8822B`. B22 program facts:
+`rtw8822b_mac_init` writes neither BIT_BA_PARSER_EN (0x426) nor the 0x66e
+ACK type, so `rx_ba::readback` now takes the chip id and checks those two
+only on C22 (C21 and B22 skip them); REG_BAR_MODE_CTRL+2 0x4ce is 0x0801
+(`WLAN_BAR_RETRY_LIMIT` 1, `WLAN_RA_TRY_RATE_AGG_LIMIT` 8); RXFLTMAP1
+0x6a2/0x6a3 = 0xff from the `rtw8822b_mac` table after `WLAN_RX_FILTER1`
+0x0fff (as on C21); the TX FIFO quiet check uses the B22 64/64/64/64
+pages (`tx_ba::fifo_empty_tids`, non-C21 arm); `ampdu_density` is
+`IEEE80211_HT_MPDU_DENSITY_2` as on C21/C22. The TX BA static program
+(0x42a 0x0808, 0x455 0x20) and the RTS descriptor fields are the shared
+`tx.c`/`rtw_coex_limited_tx` ones. No `N2BR`/`N2BT`/`N2BX` asset is
+provisioned. Case extended, unexecuted:
+`smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl` (N2BR binds; N21R/N22R refuse).
+
 #### RTL8822BE documented gaps: LPS and Bluetooth coexistence
 
 The `rtw88 | rtl8822be` row is scoped to the RTL8822CE chip-row station core.
@@ -3981,9 +4002,11 @@ Former blockers, verified against the tree:
    `smoke_rtw8821cu_phy_usb_interface_rows_match_linux_references` (USB
    replays the frozen Linux callback hashes).
 
-RTL8822BU needs the 8822B chip runtime (`rtw88 | rtl8822be` is open: no
-8822B firmware/MAC/PHY/RF tables are ported), so the RTL8822BU row stays
-blocked on the chip, not the transport. RTL8821CU alone would satisfy the
+RTL8822BU needs the 8822B chip runtime over USB. The PCI `rtw88 |
+rtl8822be` station core now exists (see "RTL8822BE retained native B22
+owner" onward), but its owner, calibration/power records and programs are
+bound to the PCI transport (`10ec:b822` headers, PCI packet gate), so the
+RTL8822BU row stays blocked on a USB B22 owner, not on the chip tables. RTL8821CU alone would satisfy the
 `rtl8xxxu` `five_ghz_operation`/`vht` rows only once the C21 5 GHz/VHT80
 programs (`band5.rs`, N2xV) run over this transport. Today they run only
 through the PCI owner.
@@ -4223,7 +4246,7 @@ changes. None is a physical blocker unless stated.
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
 | `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
-| `rtl8822be` | Base station path implemented, pending validation (unexecuted tests, no hardware run): B22 identity, factory map, authenticated `rtw8822b_fw.bin` loading into a retained native owner and the inactive `rtw8822b_mac_init`, the complete `rtw8822b_phy_set_param` (PCIe `rtw8822b_table.c` tables, TRX mode, `rtw_phy_init`, RFE/power-track/BF init), `rtw8822b_set_channel`, the signed `N2BQ` calibration-only ch1/20 firmware IQK, the signed `N2BP` parked 2T2R operating power, the signed `N2BS` awake-station radio program (`Stage::Radio8821cPrepared` with the B22 packet gate in the PCI transport) and `tracking8822b` (`rtw8822b_pwr_track`, not yet driven) are implemented (see "RTL8822BE retained native B22 owner", "RTL8822BE signed calibration-only IQK" and "RTL8822BE parked operating power (`N2BP`) and awake-station grant (`N2BS`)"); the shared station shell is published as `rtw8822be` and activated over the shared PCI packet path once all three records admit (base ch1/20 legacy profile only; no channel/HT/VHT/BA/protection/LPS records, no dm watchdog/pwr_track driver or re-IQK; no board asset provisioned, so unprovisioned boards stay unadmitted). |
+| `rtl8822be` | Station core source-complete, pending validation (unexecuted tests, no hardware run, no board asset provisioned): the retained native B22 owner (identity, factory map, authenticated `rtw8822b_fw.bin`, `rtw8822b_mac_init`, the complete `rtw8822b_phy_set_param`, `rtw8822b_set_channel`), the signed `N2BQ` calibration IQK, `N2BP` operating power and `N2BS` awake-station grant ("RTL8822BE retained native B22 owner" ... "parked operating power"), per-channel `N2BO` 2.4/5GHz records and retune (refused over any bound extension), the `N2BD` dm watchdog (DIG/RA/PWR_TRACK/EDCCA) with `N2BW` associated re-IQK, `N2BL` legacy12/WMM, `N2BH` HT20 1SS/2SS, `N2BB` HT40 and `N2BV` VHT80 widening via `rtw8822b_set_channel` at 40/80, `N2BC` LDPC-only TX coding, `N2BQ` all-AC QoS, `N2BF` fallback, `N2BR`/`N2BT` recipient/originator BA and `N2BX` RTS (see the "RTL8822BE ..." sections of §3 from "RTL8822BE per-channel operating records" to "recipient/originator BA"). LPS and Bluetooth coexistence are separate C22 feature rows and stay open for B22 ("RTL8822BE documented gaps: LPS and Bluetooth coexistence"). Unprovisioned boards stay unadmitted. |
 | `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Source-complete for C22 under N22K `MIMO_PS` (see "Coexistence-driven static SMPS"): `rtw_coex_mimo_ps` -> `config_trx_mode(A, A)` with exact field restore, dm path diversity held on A, 1SS RA mask / STBC off, SM Power Save static/disabled action. Three register-model cases written, unexecuted; no signed N22K MIMO_PS record or BT-active measurement. |

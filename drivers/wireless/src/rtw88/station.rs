@@ -1673,10 +1673,9 @@ impl State {
                                 if let Some(maximum) = g.window(r.tid()) {
                                     g.check()?;
                                     io.station_profile_readback().await?;
-                                    let c21 =
-                                        self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2
-                                            == 0xc821;
-                                    super::rx_ba::readback(io, c21).await?;
+                                    let did =
+                                        self.ht.as_ref().ok_or(Error::State)?.rx_ba_identity().2;
+                                    super::rx_ba::readback(io, did).await?;
                                     if self.rx_ba.propose(
                                         r,
                                         maximum,

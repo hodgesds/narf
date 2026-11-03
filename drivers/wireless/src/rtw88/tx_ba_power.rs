@@ -55,6 +55,28 @@ pub struct Request {
     pub all_tids_identity: [u8; 32],
     pub all_tids_filename: String,
 }
+/// Record magic `N2<chip><tag>` of the exact-chip BA / protection records
+/// (`N21x` RTL8821CE, `N22x` RTL8822CE, `N2Bx` RTL8822BE); other chips have
+/// no record.
+pub(super) fn magic(did: u16, tag: u8) -> Option<[u8; 4]> {
+    let chip = match did {
+        0xc821 => b'1',
+        0xc822 => b'2',
+        0xb822 => b'B',
+        _ => return None,
+    };
+    Some([b'N', b'2', chip, tag])
+}
+/// RTL8822BE program facts hashed into its `N2BR`/`N2BT`/`N2BX` requests
+/// (the shared contracts name C21/C22 readbacks): `rtw8822b_mac_init`
+/// writes neither BIT_BA_PARSER_EN (0x426) nor the 0x66e ACK type, so the
+/// recipient readback is the C21 one; REG_BAR_MODE_CTRL+2 0x4ce =
+/// WLAN_BAR_RETRY_LIMIT 1 | WLAN_RA_TRY_RATE_AGG_LIMIT 8 << 8; RXFLTMAP1
+/// 0x6a2/0x6a3 = 0xff from `rtw8822b_mac` after `WLAN_RX_FILTER1` 0x0fff;
+/// TX FIFO `__priority_queue_cfg` 64/64/64/64 (`mac::prepare_on`);
+/// `ampdu_density` IEEE80211_HT_MPDU_DENSITY_2; HT DATA on the 1SS path-A
+/// / 2SS path-AB `N2BH` program.
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE BA/RTS: rtw8822b_mac_init no BIT_BA_PARSER_EN 0x426 clear, no 0x66e ACK type (recipient readback as C21); REG_BAR_MODE_CTRL+2 0x4ce 0801; RXFLTMAP1 0x6a2/0x6a3 ff from rtw8822b_mac table after mac_init 0fff; TX FIFO pages 64/64/64/64; ampdu_density MPDU_DENSITY_2; HT DATA over N2BH 1SS-A/2SS-AB";
 pub(super) fn request(base: &Base) -> Result<Request, Error> {
     base.invoke(|| Ok(()))?;
     let h = base.ht();
@@ -65,6 +87,9 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
     hash.update(&did.to_le_bytes());
     hash.update(&recipe);
     hash.update(&digest);
+    if did == 0xb822 {
+        hash.update(SOURCE8822B);
+    }
     match base {
         Base::H(_) => hash.update(b"RX decline H alone"),
         Base::R(r) => {
@@ -200,9 +225,7 @@ impl Grant {
         };
         if signer.is_none()
             || b.len() != 192
-            // B22 binds no T record until its program is ported (fail closed).
-            || !matches!(did, 0xc821 | 0xc822)
-            || b[..4] != *if did == 0xc821 { b"N21T" } else { b"N22T" }
+            || b[..4] != magic(did, b'T').ok_or(Error::Prerequisite)?
             || !matches!(version, 1 | 2)
             || b[4..8] != [version, 0, 192, 0]
             || b[8..12] != 192u32.to_le_bytes()

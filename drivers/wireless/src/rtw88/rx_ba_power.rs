@@ -20,6 +20,9 @@ pub(super) fn request(base: &ht::Grant) -> Result<Request, Error> {
     h.update(b"NARF RTW88 exact-chip recipient RX BA v1");
     h.update(&did.to_le_bytes());
     h.update(&recipe);
+    if did == 0xb822 {
+        h.update(super::tx_ba_power::SOURCE8822B);
+    }
     h.update(&digest);
     h.update(b"native AP ADDBA success/raw33/CCX+RXidle; bounded opaque postpublication pending prefix tied exact proposal/peer/TID/SSN/capture key+receive epoch; no preproposal or closed capture; request+response AMSDU bit1 required; TID0..7 window<=64 actualSSN; host originalRAW reorder before CCMP/PN; BAR20 compressed; DELBA30;100ms holes/TU inactivity; whole original3839 AMSDUinAMPDU; standalone3839 retained; key/receive epochs; TX AGG0; no BA H2C or CAM ACK");
     h.update(b"unchanged exact-chip MAC/PHY/RCR RAW+PHYST+FCS+VHTDACK/softwarecrypto/noBASSN, chip RXFLTMAP1, BAR retry0801, C22 BAparseroff/ACKtype5 readbacks; measured success/DELBA/automatic compressedBA response and whole transition peaks; full thermal0..63 supply/antenna/BT envelope");
@@ -110,9 +113,7 @@ impl Grant {
         let did = base.rx_ba_identity().2;
         if signer.is_none()
             || b.len() != 128
-            // B22 binds no R record until its program is ported (fail closed).
-            || !matches!(did, 0xc821 | 0xc822)
-            || b[..4] != *if did == 0xc821 { b"N21R" } else { b"N22R" }
+            || b[..4] != super::tx_ba_power::magic(did, b'R').ok_or(Error::Prerequisite)?
             || b[4..8] != [1, 0, 128, 0]
             || b[8..12] != 128u32.to_le_bytes()
             || b[12..16] != base.host().header()

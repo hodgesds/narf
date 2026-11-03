@@ -1331,7 +1331,8 @@ fn b22_ht_record(r: &super::super::ht::Request, a: [u8; 16], b: [u8; 8]) -> allo
 /// both paths' `rtw_phy_get_2g_tx_power_index` HT20 ceilings (txgi 1), foreign
 /// magics / over-ceiling path-B indices / a dirty tail refuse, and the bound
 /// grant's tracking table is legacy12 + MCS0..15 per path (path-B HT1S takes
-/// path A's index). Written; not yet executed natively.
+/// path A's index); an `N2BR` recipient-BA record binds over it while
+/// C21/C22 magics refuse. Written; not yet executed natively.
 fn smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl() -> TestResult {
     use super::super::{ht, power_policy::Gate, station_profile};
     use narf_capabilities::Cap;
@@ -1421,7 +1422,7 @@ fn smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl() -> TestResult {
     if h.mcs() != 0xffff || !h.sgi() {
         return TestResult::Fail("8822B N2BH selection differs from its record");
     }
-    let Ok(gate) = gate.with_ht(h) else {
+    let Ok(gate) = gate.with_ht(h.clone()) else {
         return TestResult::Fail("8822B N2BH did not bind over N2BL");
     };
     let Some((rates, count)) = gate.b22_rate_indices() else {
@@ -1438,6 +1439,41 @@ fn smoke_rtw8822be_n2bh_ht20_2ss_binds_n2bl() -> TestResult {
     }
     if count != 28 {
         return TestResult::Fail("8822B 2SS tracking table does not cover MCS0..15");
+    }
+    // N2BR over the exact N2BH: B22 magic only, its own identity.
+    let Ok(rr) = super::super::rx_ba_power::request(&h) else {
+        return TestResult::Fail("8822B N2BR request refused over N2BH");
+    };
+    let rx_ba = |magic: &[u8; 4]| {
+        let mut b = alloc::vec![0u8; 128];
+        b[..4].copy_from_slice(magic);
+        b[4..8].copy_from_slice(&[1, 0, 128, 0]);
+        b[8..12].copy_from_slice(&128u32.to_le_bytes());
+        b[12..16].copy_from_slice(&[0xec, 0x10, 0x22, 0xb8]);
+        b[16..48].copy_from_slice(&rr.identity);
+        b[48..54].copy_from_slice(&rr.mac);
+        b[54..56].copy_from_slice(&[1, 20]);
+        for (at, v) in [(56, 4i16), (58, 76), (60, 60), (62, 40), (64, 40)] {
+            b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        b[66..68].copy_from_slice(&[0, 63]);
+        b[68] = 64;
+        b[69] = 1;
+        super::super::rx_ba_power::Source::Verified {
+            bytes: b,
+            signer: Some([7; 32]),
+            cap: Cap::bootstrap(),
+        }
+        .load(h.clone())
+    };
+    if !rr.filename.starts_with("rtw88/rtw8822be-rx-ba-v1-")
+        || rx_ba(b"N22R").is_ok()
+        || rx_ba(b"N21R").is_ok()
+        || rx_ba(b"N2BR").is_err()
+        || super::super::tx_ba_power::magic(0xb822, b'X') != Some(*b"N2BX")
+        || super::super::tx_ba_power::magic(0x8822, b'T').is_some()
+    {
+        return TestResult::Fail("8822B N2BR/N2xT/N2xX magic or binding differs");
     }
     TestResult::Pass
 }
