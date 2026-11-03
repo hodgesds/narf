@@ -116,6 +116,7 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8188EU_ID),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8188EU_ID_ALT),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID),
+        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID_ALT),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8723BU_ID),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8822BU_ID),
         // RTL8710BU / RTL8188GU
@@ -125,14 +126,19 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
         // Rebranded — TP-Link
         UsbClassMatch::vid_pid(0x2357, 0x0108),
         UsbClassMatch::vid_pid(0x2357, 0x0109),
-        UsbClassMatch::vid_pid(0x2357, 0x0135),
         UsbClassMatch::vid_pid(0x2357, 0x010C),
         UsbClassMatch::vid_pid(0x2357, 0x0111),
+        // Rebranded RTL8192EU (core.c dev_table `rtl8192eu_fops`).
+        UsbClassMatch::vid_pid(0x2357, 0x0107),
+        UsbClassMatch::vid_pid(0x2357, 0x0126),
+        UsbClassMatch::vid_pid(0x2019, 0xAB33),
+        UsbClassMatch::vid_pid(0x2001, 0x3312),
+        UsbClassMatch::vid_pid(0x2C4E, 0x0100),
+        UsbClassMatch::vid_pid(0x2C4E, 0x0104),
         // Rebranded — D-Link
         UsbClassMatch::vid_pid(0x2001, 0x3319),
         UsbClassMatch::vid_pid(0x2001, 0x3311),
         // Rebranded — Edimax
-        UsbClassMatch::vid_pid(0x7392, 0xB722),
         UsbClassMatch::vid_pid(0x7392, 0xB811),
         UsbClassMatch::vid_pid(0x7392, 0xA611),
         // Rebranded — ASUS

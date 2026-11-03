@@ -383,8 +383,13 @@ fn smoke_rtl8xxxu_chip_family_from_usb_id() -> TestResult {
         (RTL8XXXU_VENDOR, RTL8822BU_ID, ChipFamily::Rtl8822bu),
         // Rebranded: TP-Link TL-WN722N v2 → RTL8188EU.
         (0x2357, 0x010C, ChipFamily::Rtl8188eu),
-        // Edimax EW-7722UTn V3 → RTL8192EU.
-        (0x7392, 0xB722, ChipFamily::Rtl8192eu),
+        // 7392:B722 and 2357:0135 are RTL8192FU in Linux: no NARF owner.
+        (0x7392, 0xB722, ChipFamily::Unknown),
+        (0x2357, 0x0135, ChipFamily::Unknown),
+        // RTL8192EU alternate and rebranded IDs (core.c dev_table).
+        (RTL8XXXU_VENDOR, 0x818C, ChipFamily::Rtl8192eu),
+        (0x2357, 0x0107, ChipFamily::Rtl8192eu),
+        (0x2C4E, 0x0104, ChipFamily::Rtl8192eu),
         // 7392:A611 → RTL8723BU.
         (0x7392, 0xA611, ChipFamily::Rtl8723bu),
         // Unknown device.

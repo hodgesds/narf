@@ -1206,6 +1206,13 @@ EP0 transfer/executable-cap discipline; chip steps live in
   (`power_off_stopped`) dispatches RTL8192EU to this sequence. Station PS
   reuses the shared `ps_null` frames through `rtl8192e_packet::transmit_null`.
 
+- USB IDs: the bind/classification tables carry exactly the Linux
+  `core.c::dev_table` `rtl8192eu_fops` rows (0bda:818b, 0bda:818c,
+  2357:0107/0108/0109/0126, 2001:3319/3312, 2019:ab33, 2c4e:0100/0104).
+  2357:0135 and 7392:b722 are `rtl8192fu_fops` in Linux; they were
+  wrongly listed as RTL8192EU and are now unbound/Unknown (no RTL8192FU
+  owner exists).
+
 The owner reaches `RadioReady` for RTL8192EU after calibration. The production
 probe stays detection-only for this family; no table, calibration, packet
 or station capability is advertised.
