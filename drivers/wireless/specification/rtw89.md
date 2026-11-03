@@ -1794,6 +1794,88 @@ the suspend rows of
 and `smoke_rtw8852b_repeat_flr_lifecycle_requires_its_own_signed_identity`.
 WoW (`wow`) remains open.
 
+### RTL8852B Wake-on-WLAN source layer (`wow_wire.rs`) — not advertised
+
+Linux 7.3-rc4 `rtw8852b.c` declares `rtw_wowlan_stub_8852b` (magic packet,
+disconnect, 18 patterns of 1..=128 bytes; no GTK-rekey, no net-detect).
+`wow_wire::support` mirrors it exactly; `wow_wire::validate` re-checks a
+retained `WowlanConfig` and generates every pattern before any hardware is
+touched (`rtw89_wow_set_wakeups`).
+
+**Firmware.** RTL8852B needs a separate WoW image, but not a separate file:
+every canonical B file (`rtw8852b_fw{,-1,-2}.bin`) is a multi-firmware
+container with `RTW89_FW_WOWLAN` (type 3) entries for cuts 1 and 2 beside
+the normal/CE images (`fw.c::rtw89_fw_recognize`, `wow.c::rtw89_wow_swap_fw`
+-> `rtw89_fw_download(RTW89_FW_WOWLAN)`). `prepared::load_wow(name, chip,
+cut)` takes the name of the file the running normal image came from (only
+this chip's canonical names), loads it again through the same `Files`
+authority and selects the type-3 image for the physical cut with the
+existing bounded MFW selector; `firmware_registry::load_wow` binds it to
+the trusted, signature-verifying registry exactly as `load`. No other
+file or image type is tried and nothing is cached; restoring the normal
+image on resume must call `firmware_registry::load` again.
+
+**Codecs (`wow_wire.rs`).** Byte-exact Linux layouts, no transport:
+- pattern CAM: `rtw89_wow_pattern_get_type` (masked DA: broadcast,
+  multicast, own unicast under a full DA mask, or wildcard; anything else
+  `-EPERM`), `rtw89_wow_pattern_generate` (six-bit LLC mask shift, bits
+  0..5 cleared, Realtek CRC16 over masked bytes from offset 12) and
+  `rtw89_fw_h2c_wow_cam_update` (AX v0, the 8852B chip op) write/clear;
+- `H2C_CL_MAC_WOW` bodies: `KEEP_ALIVE` (period 5), `DISCONNECT_DETECT`
+  (period 100, 5 tries, only when disconnect wake is requested),
+  `WAKEUP_CTRL` (pattern/magic/deauth, MAC id), `WOW_GLOBAL` with the
+  packed `rtw89_wow_key_info` (CCMP `_pn_to_iv`/`_iv_to_pn`,
+  `RTW89_WOW_VALID_CHECK`), `AOAC_REPORT_REQ`;
+- `H2C_CL_MAC_SEC_CAM`/`SEC_UPD` CCMP-128 key body
+  (`rtw89_cam_get_sec_key_cmd`, zeroized buffer);
+- `R_AX_WOW_CTRL`/`B_AX_WOW_WOWEN` status poll constants (50us/50ms),
+  the B wake-reason register `R_AX_C2HREG_DATA3 + 3`, the reason decode
+  of `rtw89_wow_show_wakeup_reason` into the driver-accessor
+  `wow_wire::WakeReport` (iwlwifi.md section 3.80 pattern; pattern index
+  from the AOAC report) and the `rtw89_c2h_wow_aoac_report` decoder (C2H
+  class 3 function 0; GTK/IGTK material is not retained).
+
+**Not wired (why `wow` stays open).** No native owner sequences these yet.
+The whole row still needs, in Linux order (`rtw89_wow_suspend`/`resume`):
+1. Reversible TRX halt/restart on the retained station:
+   `rtw89_wow_enable_trx_pre` (`ctrl_txdma_ch(false)` with the CH12 FW
+   channel kept, `ptk_drop_by_band_and_wait`, `poll_txdma_ch_idle`, RX
+   filters to "don't care", PPDU status off) and `enable_trx_post`
+   (interrupts off, `ctrl_trxhci(false)`, idle poll, `wow_config_mac_ax`:
+   PLE RX quota, `B_AX_HDR_RX_STOP`, CPU IO RX, `R_BE_DBG_WOW_READY`, then
+   `rtw89_pci_ops_reset`); resume `disable_trx_pre` (`clr_idx_all`,
+   `rst_bdram`, `ctrl_trxhci(true)`, TX DMA on, `wow_config_mac(false)`).
+   The existing `dma_stop` proof is terminal (BME off); WoW needs a
+   reversible variant that keeps BME and every published mapping, like
+   rtw88 `pci_swap.rs`.
+2. Firmware swap on a `Phase::Station` owner: WCPU re-download of the WoW
+   image through the CH12 path (8852B keeps interrupts enabled during the
+   download), `rtw89_phy_init_rf_reg(true)`, `ROLE_MAINTAIN(FW_RESTORE)`,
+   assoc CMAC table, `JOIN_INFO`, addr CAM (`FW_RESTORE`), general packets,
+   RA assoc, BSS colour; and the reverse to the freshly loaded normal image.
+3. Hardware security CAM for the WoW window only: the awake station runs
+   host CCMP/BIP with `SEC_ENG_CTRL` off (section above). Like rtw88
+   `security_cam.rs`, take `station_security::Security::suspend_keys`
+   (PTK + live GTKs, never IGTK), write `sec_cam_ccmp` entries, attach them
+   through the addr-CAM `SEC_ENT*` fields with `WOL_MAGIC`/`WOL_PATTERN`,
+   enable the engine with `rtw89_mac_hw_mgnt_sec`, and clear/disable and
+   re-prove host crypto before RX is restarted on resume. The `KeyInfo` RX
+   IVs need the host replay floors, which `station_security` does not
+   expose yet (shared-surface addition).
+4. Keep-alive as an unprotected NULL data general packet (Linux uses an
+   ARP-response packet that is protected under `ptk_alg`; protected
+   firmware transmissions would need the AOAC `ptk_tx_iv` written back into
+   the host TX PN). GTK/ARP offload stay off.
+5. `bootstrap::SystemPm` branch: a WoW-configured, associated, settled
+   station keeps D0 and its generation instead of retiring it; any failure
+   falls back to the existing cold retirement/regeneration path. PCI PME
+   stays with the system-PM owner (iwlwifi.md section 3.80).
+6. `WirelessNetIface::wowlan_support`/`set_wowlan` only after 1..5 exist.
+
+Unexecuted cases: `smoke_rtw89_wow_support_patterns_and_cam`,
+`smoke_rtw89_wow_h2c_bodies_reason_and_aoac`,
+`smoke_rtw89_wow_image_same_file_same_authority`.
+
 ### RTL8852B runtime sleep/LPS (implemented; validation pending)
 
 The actual retained `Startup`/verified WCPU, source controller peer and
@@ -2578,7 +2660,7 @@ triage above remains separate from implementation.
 | `runtime_sleep` | The admitted RTL8852B clock-gated native/runtime/public path is implemented in §3 below, with separate signed joint qualification and seven new unexecuted cases. Source review, release compile, native two-arch and physical acceptance remain pending; other chip/firmware adapters remain their own chip rows. |
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only; there is no retained AP peer/queue/beacon/service-period owner. |
-| `wow` | No native WoW firmware/context/pattern/GTK/wake-source owner exists. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
+| `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
 | `rtl8852a` | AX identity, power and firmware scaffolds do not establish this chip's native station. The retained Controller and N52B qualification admit RTL8852B only; A still needs its exact security/firmware, BB/RF/calibration/power and packet/station composition. |
 | `rtl8851b` | Source identifies the1TX/1RX dual-band chip, but the retained B-only operating/qualification owner cannot be reused as its runtime. Complete chip-specific firmware/security, RF/power and packet/station ownership remain missing. |
 | `rtl8852c` | The advertised AX-v1/three-band hardware description is not a native station profile. C needs the exact generation-specific PCI/descriptor transport plus firmware/security, RF/calibration/power and station composition; the current retained Controller/N52B profile is B-only. |

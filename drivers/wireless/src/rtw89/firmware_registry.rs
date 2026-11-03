@@ -47,3 +47,12 @@ pub fn load(chip: ChipId, cut: u8) -> Result<PreparedFirmware, FwError> {
         .ok_or(FwError::Authority)?;
     prepared::load(&mut RegistryFiles { authority }, chip, cut)
 }
+/// The WoW image of `name` (the file the running normal image came from),
+/// opened through the same trusted, signature-verifying registry authority
+/// as [`load`]; see [`prepared::load_wow`].
+pub fn load_wow(name: &'static str, chip: ChipId, cut: u8) -> Result<PreparedFirmware, FwError> {
+    let authority = narf_firmware::trusted_loader_authority()
+        .and_then(|cap| cap.derive::<Read>().ok())
+        .ok_or(FwError::Authority)?;
+    prepared::load_wow(&mut RegistryFiles { authority }, name, chip, cut)
+}

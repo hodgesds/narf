@@ -438,3 +438,61 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_owned_firmware_and_fallback
 );
+
+/// `rtw89_wow_swap_fw`: the WoW image comes from the same MFW file and
+/// authority as the running normal image; no file fallback, no cache.
+fn smoke_rtw89_wow_image_same_file_same_authority() -> TestResult {
+    let wow = image(0, 1, 8);
+    let file = mfw(&[
+        (1, 5, false, image(0, 1, 0)),
+        (1, 3, false, wow.clone()),
+        (2, 3, false, image(0, 2, 0)),
+    ]);
+    let mut files = ModelFiles {
+        responses: vec![Ok(file.clone())],
+        names: Vec::new(),
+    };
+    let prepared =
+        match prepared::load_wow(&mut files, "rtw89/rtw8852b_fw-1.bin", ChipId::Rtl8852B, 1) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("WoW image selection"),
+        };
+    if files.names != ["rtw89/rtw8852b_fw-1.bin"]
+        || prepared.image() != wow
+        || prepared.name() != "rtw89/rtw8852b_fw-1.bin"
+    {
+        return TestResult::Fail("WoW image owner / file / cut");
+    }
+    let no_wow = mfw(&[(1, 5, false, image(0, 1, 0))]);
+    for (response, expected) in [
+        (Ok(no_wow), FwError::ImageMissing),
+        (Err(FwError::BlobMissing), FwError::BlobMissing),
+        (Err(FwError::Authority), FwError::Authority),
+    ] {
+        let mut files = ModelFiles {
+            responses: vec![response, Ok(file.clone())],
+            names: Vec::new(),
+        };
+        if !matches!(
+            prepared::load_wow(&mut files, "rtw89/rtw8852b_fw-2.bin", ChipId::Rtl8852B, 1),
+            Err(e) if e == expected
+        ) || files.names.len() != 1
+        {
+            return TestResult::Fail("WoW image fell back to another file or image type");
+        }
+    }
+    let mut files = ModelFiles {
+        responses: vec![Ok(file)],
+        names: Vec::new(),
+    };
+    if prepared::load_wow(&mut files, "rtw89/rtw8852c_fw.bin", ChipId::Rtl8852B, 1).is_ok()
+        || !files.names.is_empty()
+    {
+        return TestResult::Fail("WoW image accepted another chip's file name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_wow_image_same_file_same_authority
+);
