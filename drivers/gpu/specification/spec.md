@@ -239,17 +239,26 @@ training, visible pixels, a general resource/retirement receipt or permission to
 free scanout frames. Pre-stop fixed-window GGTT/cache bootstrap, inherited
 producer exclusion and a full retained async modeset owner remain unresolved.
 
-### Meteor/Arrow Lake display DSC and panel fitter
+### Meteor/Arrow Lake display DSC, pipe bpp and panel fitter
 
 `drm_dsc` (ungated) holds DRM's VESA DSC helpers: `Pps` (drm_dsc_config),
 `compute_rc_parameters`, `pack_pps`, `set_rc_buf_thresh` and
 `dp_pps_header`; `amdgpu_dsc` re-exports `Pps` and `pack_pps`.
-`intel_gpu_xelpg_dsc` is Linux's display-14 DSC: `DscDpcd` (the sink's
-0x060..0x06F capabilities), `EdpCaps::read`/`limits`, `read_dp_sink`
-(`DpDscSink`), `uncompressed_link`, `decide_edp(caps, &EdpVbt, mode)`
-(`EdpDecision::{NotCapable, Uncompressed, Dsc}`), `decide_dp(sink, limits,
-mode)` and `compute`, returning a `DscPlan` (link, compressed bpp, slices,
-engines, FEC, `Pps`) or a typed `DscRefusal`. `DscPlan` gives
+`intel_gpu_xelpg_dsc` is Linux's display-14 `intel_dp_compute_link_config`
+and DSC: `DscDpcd` (the sink's 0x060..0x06F capabilities),
+`EdpCaps::read`/`limits` (`LinkLimits::use_max` is `use_max_params`)/
+`sink_rates`/`has_rate_table`/`rate_select`, `read_dp_sink` (`DpDscSink`),
+`edid_display_bpc(edid)` (`display_info.bpc` with the EDID bpc quirks),
+`max_pipe_bpp(display_bpc, vbt_edp_bpp)`, `uncompressed_link(limits, mode,
+max_bpp)` (`UncompressedLink { pipe_bpp, link_rate, lanes }`, 24 then 18
+bpp), `decide_edp(caps, &EdpVbt, display_bpc, mode, use_max)` and
+`decide_dp(sink, limits, mode, max_bpp)` (both `LinkDecision::{Uncompressed,
+Dsc}`), and `compute(sink, limits, mode, max_bpp)`, returning a `DscPlan`
+(link, compressed bpp, slices, engines, FEC, `Pps`) or a typed `DscRefusal`
+(`SixBpcUnqualified` is gone). `pipe_misc`, `trans_ddi_bpc` and `msa_misc`
+are the `PIPE_MISC`, `TRANS_DDI_FUNC_CTL` BPC and `TRANS_MSA_MISC` values of
+a 24 or 18 bpp pipe. `fixup_vbt_bpp` is `intel_edp_fixup_vbt_bpp`.
+`EdpVbt::Panel` carries `edp.bpp` (`edp_bpp()`). `DscPlan` gives
 `engine_writes(pipe)`, `pps_values`, `pps_sdp`, `m_n(mode)`,
 `min_cdclk_khz(mode)` and `term(mode)` (`DscTerm`). `enable_engines`,
 `disable_engines`, `engines_enabled`, `read_term`, `write_pps_sdp`,
@@ -258,17 +267,31 @@ engines, FEC, `Pps`) or a typed `DscRefusal`. `DscPlan` gives
 `set_sink_fec_ready` and `wait_fec_detected` the sink.
 `install_edp_vbt`/`installed_edp_vbt` hold the VBT's eDP `dsc_disable` and
 `max_link_rate` (`EdpVbt`, installed by `intel_gpu_vbt::install_for_probe`).
-The MTL Pipe A modeset compresses when `decide_edp` says so and returns
-`ModesetError::Dsc(DscRefusal)` before any destructive write otherwise;
-`MtlSinkProbe::dsc` carries an external DP route's plan and
-`ExternalError::Dsc` its refusal. The display-14 resource request
+The MTL Pipe A modeset follows `decide_edp`: the existing 8 bpc sequence
+when 24 bpp fits a panel without a rate table, Linux's link (6 bpc, or
+`DP_LINK_RATE_SET` for a rate-table panel, with one retry at the panel's
+maximum parameters), or DSC; it returns `ModesetError::Dsc(DscRefusal)`
+before any destructive write otherwise. `intel_gpu_modeset_xelpg::
+panel_display_bpc`/`set_panel_display_bpc` cache the panel's EDID bpc from
+the modeset's EDID read. `MtlSinkProbe::dsc` carries an external DP route's
+plan, `MtlSinkProbe::pipe_bpp` its pipe bpp (18 for a 6 bpc route), and
+`ExternalError::Dsc` its refusal. `dp_link_training::RateSelect`
+(`LinkBw`, `Table`), `train_link_select`, `train_clock_recovery_select` and
+`train_channel_equalization_select` are the shared rate-select training
+path; `intel_gpu_xelpg::{enable_port_pll_khz, reprogram_pll_khz,
+set_signal_levels_khz}` take a kHz port clock (eDP intermediate rates).
+The Gen12 orchestrator writes `vblank_display13` on ADL-P/ADL-N, and
+`intel_gpu_dsb::Owner::reserve_gen12` takes a `display13` flag that drops
+`TRANS_VBLANK`'s start field from its timing proof (`Timing::check`'s
+`vblank_start`). The display-14 resource request
 (`intel_gpu_display_resources::request_dsc`, `initialize_dsc`) carries the
 pipe's `DscTerm`; `pipe_a_dsc` reads it back from Pipe A's engines.
 `intel_gpu_xelpg_scaler` models the panel fitter (`panel_fit`, `plan`,
 `PipeScaler::enable_writes`, `disable_writes`, `nearest_filter_writes`,
 `calc_phase`, `prefill_lines`; `ScalerRefusal`) without a production
 caller. `intel_gpu_pipes::TranscoderProgram::vblank_display13` is the
-display 13+ `TRANS_VBLANK` value both display-14 writers use.
+display 13+ `TRANS_VBLANK` value both display-14 writers and the display-13
+Gen12 orchestrator use.
 
 ### Fixed opaque XR30 primary input
 
