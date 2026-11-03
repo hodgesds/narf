@@ -2693,6 +2693,73 @@ cases: `smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span`
 `smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck`,
 `smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan`.
 
+### RTL8852B 40/80MHz operating channels (partial: radio/record layers; no station caller)
+
+Scope (`wide_channels`): rtw8852b.c `support_bandwidths` is 20/40/80MHz, so
+the admitted AX chip RTL8852B implements HT40/HE40 (2.4/5GHz) and VHT80/HE80
+(5GHz). RTL8852C 160MHz belongs to the RTL8852C lane (its `operating_channel_c`
+geometry and `radio_policy_c` records already carry 160MHz blocks).
+RTL8851B, RTL8852A and RTL8922A have no native station owner at all (their
+own open chip rows), so "all AX chips" narrows to RTL8852B here.
+
+**Geometry.** `operating_channel::Profile` now carries `(primary, center,
+Width)`: `new_2ghz_40(primary, secondary_above)` (both halves within 1..=13),
+`new_5ghz(primary, width)` (unique IEEE block from 36/100/149, every
+subchannel a core.c `rtw89_channels_5ghz` channel, never narrowed) and
+`new_wide`. It derives chan.c `rtw89_get_primary_chan_idx`, phy.c
+`rtw89_phy_get_txsc`, the whole occupied span, the 20MHz subchannels, the
+center-based subband/SCO compensation/gain bands and the rtw8852b_rfk.c
+`_tssi_get_ofdm_group` TSSI_EXTRA groups. 20MHz bindings are byte-identical;
+wide programs bind under a separate domain. Case:
+`smoke_rtw89_b_operating_profile_wide_matches_linux_chandef_geometry`.
+
+**Program (Linux 7.3-rc4).** MAC `__rtw8852bx_set_channel_mac`: RFMOD
+0/BIT(0)/BIT(1) and TX_SUB_CARRIER `txsc20 | txsc40 << 4`. BB
+`rtw8852bx_ctrl_bw`: FC0 BW_SET = width, PRICH = `pri_ch_idx`, 40MHz R_RXSC
+(CCK primary), `rtw8852bx_5m_mask` (40MHz always, 80MHz at UPMOST/LOWEST,
+SBD opt), readback of BW_SET/PRICH/chan_idx. RF `_ctrl_ch(chan->channel)` on
+the center, `_bw_setting` CFGCH_BW_40M/80M, `_set_rxbb_bw` 0x13/0xb, readback.
+IQK `iqk_bw`: TXK/RXK `((0x8|0xb) + bw) << 8`, R_IQKCH BW, 80MHz
+`_iqk_rxclk_setting`. TSSI `_tssi_get_ofdm_de` extra-group averaging. DPK:
+TXBB `bw + 1`, `_dpk_tpg_sel`, 80MHz AFE CFCH/BW_SEL EX set/restore, 80MHz
+AGC `_dpk_lbk_rxiqk` instead of the RXCFIR bypass, MDPD order 2 only for 5GHz
+below 80MHz. Power `rtw89_phy_fill_txpwr_limit_{40m,80m}_ax` and
+`_ru_{40m,80m}_ax`: the 40-byte limit page and RU sections from the center /
+primary / subchannels (`mcs_40m_0p5` = min), firmware LMT/LMT_RU elements or
+the frozen WW0 rows (`operating_power_defaults.rs` MCS40_2GHZ/MCS40_5GHZ/
+MCS80_5GHZ, same rtw8852b_table.c SHA256). RF_GET_MCCCH carries the center
+(`rfk_mcc->ch[] = chan->channel`). Cases:
+`smoke_rtw89_b_channel_bb_programs_wide_width_primary_and_5m_mask`,
+`smoke_rtw89_b_rf_synth_tunes_wide_center_and_bandwidth_bits`,
+`smoke_rtw89_b_power_plan_fills_wide_limit_and_ru_pages_like_linux`.
+
+**Signed record and admission.** Each 40/80MHz operating channel has its own
+N52C record `rtw89/rtw8852b-chan-v1-chNN-bwWW-cCCC-<mac>.bin`
+(`[54..57] = [1, width, primary]`, `[68] = center`, otherwise the unchanged
+N52C format) over a distinct wide recipe/identity (`Board::new_noninitial`
+wide domain); it never admits, nor is admitted by, the primary's 20MHz record
+or the other HT40 side. `Qualification` keys records and the active envelope
+by the full profile (`active_profile`), and `check_envelope` requires one
+host rule over the whole occupied span with cfg80211 `reg_get_max_bandwidth`
+>= the width. `preflight_full_radio` loads every typed wide profile
+(`wide_profiles`); `Native::admitted_wide` lists the currently admitted ones;
+`Native::retune_full_radio_to` programs an exact typed profile with the same
+drain/withhold/select/republish contract as the 20MHz owner. No board value
+is invented: without provisioned wide records nothing wide is admitted.
+Case: `smoke_rtw89_b_wide_channel_record_binds_width_center_and_whole_span`.
+
+Remaining before `wide_channels` is whole (no row credit): station HT40
+(SUP_WIDTH_20_40, SGI40, DSSSCCK40 as `rtw89_init_ht_cap`), VHT80 on 5GHz
+(`rtw89_init_vht_cap` restricted to this TX-A profile) and HE PHY cap0
+40/80 bits, offered only when the AP's chandef maps to an admitted wide
+profile; association retune to that profile before authentication (via
+`retune_full_radio_to`) and back to 20MHz on disconnect; RA H2C `bw_cap` /
+SGI40/80 and VHT mask per `rtw89_phy_ra_sta_update`; RX admission of
+`bandwidth <= operating width` and VHT rates (today `rx_packet`/`packet_core`
+drop any nonzero RX bandwidth). Data TXWD BW/SC stay 0 exactly as Linux
+(only injection sets `data_bw`; firmware RA chooses the bandwidth). Native
+two-arch and physical validation remain.
+
 ### RTL8852B AP groundwork: host PS/U-APSD owner and AP H2C wire (partial; no native caller)
 
 Linux rtw89 advertises `NL80211_IFTYPE_AP`, `WIPHY_FLAG_AP_UAPSD` and
@@ -3643,7 +3710,7 @@ triage above remains separate from implementation.
 |---|---|
 | `additional_operating_channels` | Source implemented for RTL8852B 2.4GHz/20MHz primaries 2..=13 (N52C per-channel signed record, native drain/retune owner, multi-channel scan and noninitial association; §3 "Signed per-channel program"). Native execution, N52C provisioning and physical validation remain; channel14, CSA and noninitial monitor stay refused. |
 | `five_ghz_operation` | RTL8852B supports5GHz, but the retained radio/power recipe and station admission select the channel1 2.4GHz program. Native5GHz RF/BB/power setup, permitted scan/retune and exact signed operating programs remain missing; discovery of the band alone grants no station profile. |
-| `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
+| `wide_channels` | RTL8852B (20/40/80MHz) MAC/BB/RF/RFK/power width programming, per-width signed N52C records and whole-span admission are implemented (§3 "RTL8852B 40/80MHz operating channels"). Station HT40/VHT80/HE-wide capabilities, association retune, RA bandwidth and wide RX admission remain. RTL8852C 160MHz is the RTL8852C lane; RTL8851B/8852A/8922A are their own chip rows. |
 | `fragmentation` | The admitted RTL8852B native/host/public owner is now implemented in §3 above, including the separate signed full-joint emitter, per-fragment PN and actual terminal ownership, bounded original-source RX cache and threshold control. Source review, release compilation and native/physical acceptance are pending. Other chip/width profiles remain their explicit separate rows. |
 | `monitor_mode` | The admitted RTL8852B receive-only role/native/raw-radiotap owner is implemented in §3 with original source/registration/role/capture epochs, actual RF channel/PHYSTS program and fresh physical transitions. Four source cases and software/native/physical acceptance are pending; no active/injection or other chip/channel/width profile is claimed. |
 | `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
