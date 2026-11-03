@@ -2149,10 +2149,13 @@ will bind; none of them grants RF, peer, key or data authority.
   `ath10k_tlv_qcs_if_limit` entry (STA≤2; P2P_CLIENT≤2; AP/P2P_GO≤1;
   P2P_DEVICE≤1), minus the IBSS combination, and nothing for non-TLV
   dialects or `ATH10K_FW_FEATURE_NO_P2P` (bit 3). It is not yet returned
-  from `interface_combinations`. Linux also sends
-  `ath10k_wmi_adaptive_qcs(ar, true)` at start with that service; this
-  driver does not, so only the one-channel entry may be advertised until it
-  does.
+  from `interface_combinations`. As `mac.c::ath10k_start`, `Radio::start`
+  sends `ath10k_wmi_adaptive_qcs(ar, true)` with that service before the
+  managed vdev is created (`p2p::adaptive_qcs`:
+  `WMI_TLV_RESMGR_ADAPTIVE_OCS_CMDID` 0x23001, TLV tag 207 `{enable}`;
+  TLV only, failure fails start) and records it, so the two-channel entry
+  matches what the firmware was told; with it the station slots'
+  one-channel rule is lifted (`sibling_channel_admits`).
 - **Per-vdev station slots.** The station owner (BSS `peer`, `data`,
   `power_save`, `protection`, `coexistence`, `peer_pmf_offload`) is a
   `StationSlot` (Linux per-`arvif` state). `Radio.station` is the home slot
@@ -2198,8 +2201,9 @@ will bind; none of them grants RF, peer, key or data authority.
   wait here, so at most one delete is outstanding. One-channel rule:
   while the sibling slot has a peer, a slot's BSS prepare is refused
   (`Unsupported`, before any coexistence scan) unless it is on the same
-  primary frequency. `vdev_address` answers the client vdev with its
-  address.
+  primary frequency, unless adaptive QCS was enabled at start
+  (`ath10k_tlv_qcs_if_limit` admits two channels). `vdev_address` answers
+  the client vdev with its address.
 
 - **P2P_DEVICE vdev (radio owner only).** `wmi_runtime/p2p_device.rs`
   `start_p2p_device` follows `mac.c::ath10k_add_interface` for

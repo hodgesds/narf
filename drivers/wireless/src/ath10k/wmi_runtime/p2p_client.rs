@@ -11,10 +11,10 @@
 //! association, key and data paths run on it inside a `ClientScope`, and
 //! HTT RX / TX completions are demultiplexed to it by vdev and peer id.
 //!
-//! Channel rule: the radio does not send
-//! `WMI_TLV_RESMGR_ADAPTIVE_OCS_ENABLE_DISABLE_CMDID` (Linux
-//! `ath10k_wmi_adaptive_qcs`, sent at start with
-//! `WMI_SERVICE_ADAPTIVE_OCS`), so only the one-channel
+//! Channel rule: `Radio::start` sends `WMI_TLV_RESMGR_ADAPTIVE_OCS_CMDID`
+//! (Linux `ath10k_wmi_adaptive_qcs(ar, true)` in `ath10k_start`) when the
+//! firmware has `WMI_SERVICE_ADAPTIVE_OCS`; then the two-channel
+//! `ath10k_tlv_qcs_if_limit` entry applies. Without it only the one-channel
 //! `ath10k_tlv_if_limit` combination applies: the client's BSS must share
 //! the home station's primary channel while both have a peer.
 use super::*;
@@ -116,11 +116,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     /// One-channel rule (`ath10k_tlv_if_limit`, `num_different_channels`
     /// 1): a station slot may bind a BSS only on the sibling slot's primary
-    /// channel while the sibling has a peer.
+    /// channel while the sibling has a peer. Once adaptive QCS was enabled
+    /// at start, `ath10k_tlv_qcs_if_limit` admits STA + P2P_CLIENT on two
+    /// channels and firmware schedules them.
     pub(super) fn sibling_channel_admits(&self, frequency: u16) -> bool {
-        self.p2p_client
-            .as_deref()
-            .and_then(|s| s.peer.as_ref())
-            .is_none_or(|peer| peer.permission.frequency == frequency)
+        self.adaptive_qcs
+            || self
+                .p2p_client
+                .as_deref()
+                .and_then(|s| s.peer.as_ref())
+                .is_none_or(|peer| peer.permission.frequency == frequency)
     }
 }

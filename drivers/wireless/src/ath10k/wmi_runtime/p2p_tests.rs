@@ -292,6 +292,15 @@ fn smoke_ath10k_p2p_tlv_combinations() -> TestResult {
     {
         return TestResult::Fail("P2P combination outside TLV");
     }
+    // wmi-tlv.c ath10k_wmi_tlv_op_gen_adaptive_qcs: cmd 0x23001, TLV
+    // {len 4, tag 207}, enable; no other dialect maps the command.
+    if adaptive_qcs(Dialect::Tlv, true) != Ok(vec![1, 0x30, 2, 0, 4, 0, 207, 0, 1, 0, 0, 0])
+        || adaptive_qcs(Dialect::Tlv, false).map(|c| c[8]) != Ok(0)
+        || adaptive_qcs(Dialect::Main, true) != Err(Error::Unsupported)
+        || SERVICE_ADAPTIVE_OCS != 39
+    {
+        return TestResult::Fail("adaptive QCS command");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

@@ -384,6 +384,24 @@ impl NoaOwner {
     }
 }
 
+/// `WMI_TLV_SERVICE_ADAPTIVE_OCS` (`wmi-tlv.h` enum `wmi_tlv_service`).
+pub(super) const SERVICE_ADAPTIVE_OCS: usize = 39;
+
+/// `wmi-tlv.c::ath10k_wmi_tlv_op_gen_adaptive_qcs`:
+/// `WMI_TLV_RESMGR_ADAPTIVE_OCS_CMDID` (`WMI_TLV_CMD(WMI_TLV_GRP_RESMGR)`,
+/// group 0x23, so 0x23001) carrying one
+/// `WMI_TLV_TAG_STRUCT_RESMGR_ADAPTIVE_OCS_CMD` (tag 207) `{ enable }`.
+/// No other dialect maps the command (`WMI_CMD_UNSUPPORTED`).
+pub(super) fn adaptive_qcs(dialect: Dialect, enable: bool) -> Result<Vec<u8>, Error> {
+    if dialect != Dialect::Tlv {
+        return Err(Error::Unsupported);
+    }
+    let mut out = packet(0x23001, 8)?;
+    put(&mut out, 4, (207 << 16) | 4);
+    put(&mut out, 8, u32::from(enable));
+    Ok(out)
+}
+
 /// `mac.c::ath10k_mac_register`: the TLV interface combinations
 /// (`ath10k_tlv_if_comb`, or `ath10k_tlv_qcs_if_comb` with
 /// `WMI_SERVICE_ADAPTIVE_OCS`, TLV service 39). The IBSS-only combination is

@@ -297,6 +297,9 @@ pub(super) struct Radio<T> {
     management_received: VecDeque<offchannel::Captured>,
     management_completed: Option<offchannel::Completed>,
     coexistence_epoch: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+    /// `ath10k_wmi_adaptive_qcs(ar, true)` was sent at start (TLV service
+    /// ADAPTIVE_OCS): firmware schedules two channels across vdevs.
+    adaptive_qcs: bool,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn configured_channels(&self) -> &[u16] {
@@ -345,6 +348,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             management_received: VecDeque::new(),
             management_completed: None,
             coexistence_epoch: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            adaptive_qcs: false,
         }
     }
     /// Select station hardware key offload (Linux `cryptmode=0`) before the
@@ -394,6 +398,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let chains =
             chains::Chains::new(self.htt.wmi.initialized_chain_mask.ok_or(Error::Failed)?)?;
         let chain_commands = chains.commands(self.wire.dialect)?;
+        // `mac.c::ath10k_start`: with `WMI_SERVICE_ADAPTIVE_OCS` enable
+        // adaptive QCS before any interface is added (failure aborts start).
+        let qcs = (self.wire.dialect == Dialect::Tlv
+            && caps.service(Dialect::Tlv, p2p::SERVICE_ADAPTIVE_OCS))
+        .then(|| p2p::adaptive_qcs(Dialect::Tlv, true))
+        .transpose()?;
         let vdev_nss = chains.vdev_nss_for(self.wire.dialect, primary.id())?;
         self.channels
             .try_reserve_exact(channels.len())
@@ -413,6 +423,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .wmi
                 .htc
                 .send_wmi(&command)
+                .await
+                .map_err(htt::Error::from)?;
+        }
+        if let Some(qcs) = &qcs {
+            self.htt
+                .wmi
+                .htc
+                .send_wmi(qcs)
                 .await
                 .map_err(htt::Error::from)?;
         }
@@ -449,6 +467,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.chains = Some(chains);
         self.vdev_map = Some(vdev_map);
         self.primary = primary;
+        self.adaptive_qcs = qcs.is_some();
         self.ready = Some(ready);
         self.failed = false;
         Ok(ready)
