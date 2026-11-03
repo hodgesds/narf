@@ -406,7 +406,7 @@ impl Native {
     ) -> Result<(), super::rx_dma::Error> {
         use super::{power::Error as RegisterError, rx_dma::Error as ReceiveError};
         if self.state != State::Active
-            || self.chip != ChipId::Rtl8852B
+            || !matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8852C)
             || mac.state() != super::mac_runtime::State::Ready
             || self.identity().is_none()
         {
@@ -427,7 +427,8 @@ impl Native {
         };
         // SAFETY: retained exact cold/MAC owner above; every RX allocation is
         // stored in self before publication and survives the outer attempt.
-        unsafe { self.receive.prepare(&mut access, 64).await }
+        // C uses its own HAXI/V1 RX geometry (rx_dma::Rx::prepare_for).
+        unsafe { self.receive.prepare_for(&mut access, self.chip, 64).await }
     }
     pub(super) fn poll_receive(
         &mut self,

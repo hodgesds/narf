@@ -53,6 +53,13 @@ pub(super) struct Descriptor {
     pub mac_id: u8,
 }
 impl Descriptor {
+    /// RTL8852C: core.c `rtw89_core_query_rxdesc` reads `AX_RXD_BW_v1_MASK`
+    /// (dword1 [31:29]); on the other AX chips bit 29 is `AX_RXD_INTER_PPDU`.
+    pub fn parse_v1(bytes: &[u8]) -> Result<Self, Error> {
+        let mut descriptor = Self::parse(bytes)?;
+        descriptor.bandwidth = ((word(bytes, 8)? >> 29) & 7) as u8;
+        Ok(descriptor)
+    }
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let d0 = word(bytes, 4)?;
         let d1 = word(bytes, 8)?;
@@ -243,8 +250,24 @@ struct Partial {
 #[derive(Default)]
 pub(super) struct Assembler {
     partial: Option<Partial>,
+    /// RTL8852C RX descriptor bandwidth layout (`AX_RXD_BW_v1_MASK`).
+    bw_v1: bool,
 }
 impl Assembler {
+    /// The RTL8852C assembler; `default()` is the AX baseline (8852B).
+    pub(super) fn for_chip(chip: super::mac::ChipId) -> Self {
+        Self {
+            partial: None,
+            bw_v1: chip == super::mac::ChipId::Rtl8852C,
+        }
+    }
+    fn descriptor(&self, bytes: &[u8]) -> Result<Descriptor, Error> {
+        if self.bw_v1 {
+            Descriptor::parse_v1(bytes)
+        } else {
+            Descriptor::parse(bytes)
+        }
+    }
     pub(super) fn assembling(&self) -> bool {
         self.partial.is_some()
     }
@@ -261,7 +284,7 @@ impl Assembler {
             if !fs || !ls || self.partial.is_some() {
                 return Err(Error::Segment);
             }
-            let descriptor = Descriptor::parse(bytes)?;
+            let descriptor = self.descriptor(bytes)?;
             if descriptor.kind != 7 {
                 return Err(Error::Report);
             }
@@ -282,7 +305,7 @@ impl Assembler {
             if self.partial.is_some() {
                 return Err(Error::Segment);
             }
-            let descriptor = Descriptor::parse(bytes)?;
+            let descriptor = self.descriptor(bytes)?;
             if descriptor.size == 0 {
                 return Err(Error::Extent);
             }

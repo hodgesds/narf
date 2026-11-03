@@ -3083,8 +3083,7 @@ signed current envelope (current calibration record, coexistence ready, then
 `rfk::Interface::admit`), checked before the first write; no C record format
 or C coexistence owner exists, so an actual RTL8852C stays unadmitted and no
 ordinary grant is installed. No Startup caller invokes it; the C native
-lifecycle is also refused upstream (`prepare_receive` is B-only; C
-`prepare_mac` exists, below). Unexecuted cases:
+MAC/RX lifecycle (`prepare_mac`, `prepare_receive`) now exists for C (below). Unexecuted cases:
 `smoke_rtw89_c_dm_init_txrx_path_and_power_trim_follow_rtw8852c`,
 `smoke_rtw89_c_radio_owner_starts_new`.
 
@@ -3158,10 +3157,32 @@ unchanged. Unexecuted cases:
 `smoke_rtw8852c_post_wcpu_mac_follows_linux_c_branches`,
 `smoke_rtw8852c_post_wcpu_mac_requires_c_geometry_and_readiness`.
 
+**C polling RX (`rx_dma::Rx::prepare_for`).** `Native::prepare_receive`
+admits B or C and passes the chip. C follows rtw8852ce.c
+`rtw8852c_pci_info`: the prerequisite (before allocation and again after
+publication) is the C download geometry (HAXI 0x1010 & `0xbff00` stopped,
+`B_AX_RXHCI_EN_V1` and `R_AX_HCI_FUNC_EN_V1` RX clear, CMAC TX parked);
+rings use `rtw89_pci_ch_dma_addr_set_v1` RXQ/RPQ (idx 0x1218/0x121c, desa
+0x1220/0x1228, num 0x1210/0x1212); LTR (only with DEVCTL2 LTR enabled, as on
+B) is pci.c `rtw89_pci_ltr_set_v1(true)` (0xeaeaeaea rejection on
+CTRL_0/CTRL_1/DEC_CTRL/IDX3/IDX0, `B_AX_LTR_WD_NOEMP_CHK_V1|B_AX_LTR_HW_EN`,
+3.2ms idle timer, RX0/RX1 0x28, DEC_CTRL `HW_DEC_EN` + 500us space index,
+IDX3 0x90039003, IDX0 0x880b880b, read back); the RX part of
+`rtw89_pci_clr_idx_all_ax` on `R_AX_RXBD_RWPTR_CLR_V1` 0x1200 precedes base
+publication. `rtw89_pci_ops_mac_post_init_ax` has no 8-byte address-info
+step on C; as on B, TX channels and WPDMA stay stopped and only RX HCI is
+released (`R_AX_HCI_FUNC_EN_V1` RXDMA, then `B_AX_RXHCI_EN_V1`; HAXI_DMA_STOP1
+has no RXQ/RPQ stop bits). `R_AX_HAXI_EXP_CTRL` max-tag is already set by
+the C `pcie` owner. The C assembler parses RX descriptor bandwidth with
+`AX_RXD_BW_v1_MASK` (dword1 [31:29], core.c `rtw89_core_query_rxdesc`), so
+a wide C PPDU is not mistaken for 20MHz; B keeps [31:30]. Unexecuted cases:
+`smoke_rtw8852c_rx_rings_follow_haxi_v1_geometry`,
+`smoke_rtw8852c_rx_refuses_open_rx_before_publication`.
+
 Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
 C `power::Calibration`/qualification records (N52x are B-bound), a
-Startup caller of `Native::prepare_radio_c` (which exists, unadmitted), the
-C native RX lifecycle (`prepare_receive` is B-only), `command_native`/
+Startup caller of `Native::prepare_radio_c` (which exists, unadmitted),
+C WoW/DMA-stop RX rewind (B registers only), `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:
