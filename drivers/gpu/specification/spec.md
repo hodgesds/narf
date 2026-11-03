@@ -844,6 +844,18 @@ acquires frames and an Arc retaining their owner. Close removes only the handle.
 Limits are 4096 handles / 256 MiB per open and at most min(512 MiB, half RAM)
 of live objects globally, including retained objects after handle close.
 Creation-copy failure publishes no handle and releases its pages/accounting.
+GEM_CREATE_EXT follows i915_gem_create_ext_ioctl: flags other than
+NEEDS_CPU_ACCESS are EINVAL before the chain; NEEDS_CPU_ACCESS is EINVAL after
+it (SYSTEM/0 is the only placement). MEMORY_REGIONS folds a nonzero pad, zero
+or more than seven regions into EINVAL, copies each region in turn (EFAULT)
+and refuses any region but SYSTEM/0, a duplicate, and a second
+MEMORY_REGIONS extension once its regions validate (EINVAL).
+PROTECTED_CONTENT is EINVAL for nonzero flags and otherwise ENODEV (no PXP).
+SET_PAT is ENODEV before IP 12.70 (Gen12, Alchemist) without a copy; later
+profiles copy it and refuse pat_index above 4 (MTL's max_pat_index; i915 has
+no later descriptor). An accepted index lets the chain and the object's size
+checks run and is then refused ENOSYS without a handle, a LINUX-GAP: NARF
+objects carry no per-object PAT.
 Same-card PRIME export/import shares the existing object and deduplicates
 reimports on an open. Globally unique stable fake mmap offsets avoid collisions
 with the importer's existing objects. Exported fd mappings retain the same

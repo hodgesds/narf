@@ -1127,13 +1127,28 @@ impl RenderFile {
             }
             abi::GEM_CREATE | abi::GEM_CREATE_EXT => {
                 let mut request = read(user, arg, if cmd == abi::GEM_CREATE { 16 } else { 24 })?;
+                let mut pat = false;
                 if cmd == abi::GEM_CREATE_EXT {
-                    if u32_at(&request, 12) != 0 {
+                    // i915_gem_create_ext_ioctl: unknown flags, then the
+                    // chain, then I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS,
+                    // which `n_placements == 1` refuses. SYSTEM is the only
+                    // region NARF reports, so every request has one.
+                    let flags = u32_at(&request, 12);
+                    if flags & !GEM_CREATE_EXT_NEEDS_CPU_ACCESS != 0 {
                         return Err(FsError::InvalidData);
                     }
-                    create_extensions(user, u64_at(&request, 16))?;
+                    pat = create_extensions(info, user, u64_at(&request, 16))?;
+                    if flags & GEM_CREATE_EXT_NEEDS_CPU_ACCESS != 0 {
+                        return Err(FsError::InvalidData);
+                    }
                 }
                 self.gem.create(u64_at(&request, 0), |handle, size| {
+                    // LINUX-GAP: Linux sets the object's PAT index here, after
+                    // __i915_gem_object_create_user_ext; NARF objects carry no
+                    // per-object PAT, so the object is not published.
+                    if pat {
+                        return Err(FsError::NotImplemented);
+                    }
                     put64(&mut request, 0, size);
                     put32(&mut request, 8, handle);
                     user.write(arg, &request)
@@ -1565,21 +1580,81 @@ fn read(user: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, F
     Ok(bytes)
 }
 
-fn create_extensions(user: &dyn IoctlContext, address: u64) -> Result<(), FsError> {
-    abi::user_extensions(user, address, |address, name| {
-        if name != 0 {
-            return Err(FsError::InvalidData);
+/// I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS.
+const GEM_CREATE_EXT_NEEDS_CPU_ACCESS: u32 = 1;
+/// ARRAY_SIZE(i915->mm.regions): INTEL_REGION_UNKNOWN.
+const REGION_IDS: u32 = 7;
+/// mtl_info.max_pat_index.
+const MAX_PAT_INDEX: u32 = 4;
+
+/// i915_gem_create.c's create_extensions[] table under i915_user_extensions.
+/// Returns whether SET_PAT asked for a PAT index.
+fn create_extensions(
+    info: &DeviceInfo,
+    user: &dyn IoctlContext,
+    address: u64,
+) -> Result<bool, FsError> {
+    let mut placements = false;
+    let mut pat = false;
+    abi::user_extensions(user, address, |address, name| match name {
+        // I915_GEM_CREATE_EXT_MEMORY_REGIONS: ext_set_placements copies the
+        // 48-byte drm_i915_gem_create_ext_memory_regions; set_placements
+        // folds a nonzero pad, zero regions and more than INTEL_REGION_UNKNOWN
+        // into one -EINVAL, then copies each region in turn. SYSTEM/0 is the
+        // only region NARF reports, so any other entry is missing and a
+        // second one a duplicate (-EINVAL). A second MEMORY_REGIONS
+        // extension is refused only after its regions validate.
+        0 => {
+            let extension = read(user, address, 48)?;
+            let count = u32_at(&extension, 36);
+            if u32_at(&extension, 32) != 0 || count == 0 || count > REGION_IDS {
+                return Err(FsError::InvalidData);
+            }
+            let regions = u64_at(&extension, 40);
+            for n in 0..u64::from(count) {
+                let at = regions.checked_add(n * 4).ok_or(FsError::BadAddress)?;
+                if read(user, at, 4)? != [0, 0, 0, 0] || n != 0 {
+                    return Err(FsError::InvalidData);
+                }
+            }
+            if placements {
+                return Err(FsError::InvalidData);
+            }
+            placements = true;
+            Ok(())
         }
-        let extension = read(user, address, 48)?;
-        if u32_at(&extension, 32) != 0 || u32_at(&extension, 36) != 1 {
-            return Err(FsError::InvalidData);
+        // I915_GEM_CREATE_EXT_PROTECTED_CONTENT: ext_set_protected copies the
+        // 36-byte extension and refuses nonzero flags; no NARF device enables
+        // PXP, so intel_pxp_is_enabled is false: -ENODEV.
+        1 => {
+            if u32_at(&read(user, address, 36)?, 32) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            Err(FsError::NoDevice)
         }
-        let region = read(user, u64_at(&extension, 40), 4)?;
-        if region != [0, 0, 0, 0] {
-            return Err(FsError::InvalidData);
+        // I915_GEM_CREATE_EXT_SET_PAT: ext_set_pat refuses
+        // `GRAPHICS_VER_FULL(i915) < IP_VER(12, 70)` before its copy, then
+        // checks pat_index against max_pat_index (rsvd is unchecked). Linux
+        // i915 has no descriptor past MTL; NARF's i915 ABI on later cards
+        // keeps MTL's.
+        2 => {
+            if matches!(
+                info.platform,
+                GtPlatform::Gen12(_)
+                    | GtPlatform::Alchemist
+                    | GtPlatform::Integrated(Generation::TigerLake | Generation::AlderLake)
+            ) {
+                return Err(FsError::NoDevice);
+            }
+            if u32_at(&read(user, address, 40)?, 32) > MAX_PAT_INDEX {
+                return Err(FsError::InvalidData);
+            }
+            pat = true;
+            Ok(())
         }
-        Ok(())
-    })
+        _ => Err(FsError::InvalidData),
+    })?;
+    Ok(pat)
 }
 
 /// Immutable observed facts stay queryable after an owned GT stop; no query
@@ -2559,6 +2634,162 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_extension_validation_is_transactional
+    );
+
+    /// MIT Linux b90c984d i915_gem_create.c::{i915_gem_create_ext_ioctl,
+    /// ext_set_placements,set_placements,ext_set_protected,ext_set_pat}.
+    fn smoke_intel_gem_create_ext_follows_linux_table() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+            let create = |info: &DeviceInfo, flags: u32, extensions: u64, size: u64| {
+                let mut request = [0; 24];
+                put64(&mut request, 0, size);
+                put32(&mut request, 12, flags);
+                put64(&mut request, 16, extensions);
+                user.store(64, &request);
+                file.dispatch(info, abi::GEM_CREATE_EXT, 64, &user)
+                    .expect("Intel command")
+                    .map(|_| u32_at(&user.load(64, 24), 8))
+            };
+            let mtl = info(Generation::MeteorLake);
+            let tgl = info(Generation::TigerLake);
+            // A link at `at` naming `name`, with `next` and its body words.
+            let link = |at: u64, next: u64, name: u32, words: &[(usize, u64)]| {
+                let mut extension = [0; 48];
+                put64(&mut extension, 0, next);
+                put32(&mut extension, 8, name);
+                for (offset, value) in words {
+                    extension[*offset..*offset + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                user.store(at, &extension);
+            };
+            // drm_i915_gem_memory_class_instance SYSTEM/0 at 4096.
+            user.store(4096, &[0; 8]);
+            let regions = |at: u64, next: u64, count: u64, array: u64| {
+                link(at, next, 0, &[(32, count << 32), (40, array)]);
+            };
+            let first = create(&mtl, 0, 0, 4096).map_err(|_| "plain create")?;
+
+            // Unknown flags precede the chain; NEEDS_CPU_ACCESS follows it
+            // and, with SYSTEM the only placement, is -EINVAL.
+            if create(&mtl, 2, 40000, 4096) != Err(FsError::InvalidData)
+                || create(&mtl, 1, 40000, 4096) != Err(FsError::BadAddress)
+            {
+                return Err("GEM_CREATE_EXT flag order");
+            }
+            regions(1024, 0, 1, 4096);
+            if create(&mtl, 1, 1024, 4096) != Err(FsError::InvalidData)
+                || create(&mtl, 1, 0, 4096) != Err(FsError::InvalidData)
+            {
+                return Err("NEEDS_CPU_ACCESS with one placement");
+            }
+
+            // MEMORY_REGIONS: pad, zero and more than INTEL_REGION_UNKNOWN
+            // regions are -EINVAL; each region is copied in turn, so a
+            // second region is -EFAULT when unreadable and otherwise a
+            // missing or duplicate SYSTEM/0 (-EINVAL).
+            for (count, pad, array) in [(0, 0, 4096), (8, 0, 4096), (1, 1, 4096)] {
+                link(1024, 0, 0, &[(32, count << 32 | pad), (40, array)]);
+                if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                    return Err("memory-regions header");
+                }
+            }
+            for (array, expected) in [(32764, FsError::BadAddress), (4096, FsError::InvalidData)] {
+                user.store(32764, &[0; 4]);
+                regions(1024, 0, 2, array);
+                if create(&mtl, 0, 1024, 4096) != Err(expected) {
+                    return Err("second region copy");
+                }
+            }
+            user.store(4100, &[1, 0, 0, 0]);
+            regions(1024, 0, 1, 4100);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("missing region");
+            }
+            // A second MEMORY_REGIONS extension validates its regions
+            // first, then finds the placements already set: -EINVAL, as
+            // is the same extension visited twice.
+            regions(1024, 1088, 1, 4096);
+            regions(1088, 0, 1, 32766);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::BadAddress) {
+                return Err("second extension's regions");
+            }
+            regions(1088, 0, 1, 4096);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("second placement extension");
+            }
+            regions(1024, 1024, 1, 4096);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("revisited placement extension");
+            }
+            regions(1024, 0, 1, 4096);
+            let placed = create(&mtl, 0, 1024, 4096).map_err(|_| "SYSTEM placement")?;
+            if placed != first + 1 {
+                return Err("a refused create consumed a handle");
+            }
+
+            // PROTECTED_CONTENT copies 36 bytes, refuses flags, then has no
+            // enabled PXP: -ENODEV.
+            for (at, flags, expected) in [
+                (1024, 1, FsError::InvalidData),
+                (1024, 0, FsError::NoDevice),
+                (32768 - 32, 0, FsError::BadAddress),
+            ] {
+                user.store(at, &[0; 32]);
+                user.store(at + 8, &1u32.to_le_bytes());
+                if at == 1024 {
+                    user.store(1056, &(flags as u32).to_le_bytes());
+                }
+                if create(&mtl, 0, at, 4096) != Err(expected) {
+                    return Err("protected content");
+                }
+            }
+
+            // SET_PAT: before IP 12.70 it is -ENODEV without a copy; on
+            // MTL the 40-byte body is copied (-EFAULT) and pat_index above
+            // max_pat_index (4) is -EINVAL. The chain goes on past an
+            // accepted index, and the object's own size check precedes the
+            // index's application.
+            user.store(32768 - 32, &[0; 32]);
+            user.store(32768 - 24, &2u32.to_le_bytes());
+            if create(&tgl, 0, 32768 - 32, 4096) != Err(FsError::NoDevice)
+                || create(&mtl, 0, 32768 - 32, 4096) != Err(FsError::BadAddress)
+            {
+                return Err("SET_PAT gate and copy");
+            }
+            link(1024, 0, 2, &[(32, 5)]);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("pat_index above max_pat_index");
+            }
+            link(1024, 1088, 2, &[(32, 4)]);
+            link(1088, 0, 1, &[]);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::NoDevice) {
+                return Err("link after SET_PAT");
+            }
+            link(1024, 0, 2, &[(32, 4)]);
+            if create(&mtl, 0, 1024, 0) != Err(FsError::InvalidData) {
+                return Err("object size before PAT");
+            }
+            // LINUX-GAP: Linux sets the index on the new object; NARF has
+            // no per-object PAT and publishes nothing.
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::NotImplemented) {
+                return Err("SET_PAT refusal");
+            }
+            // Names past SET_PAT have no table entry.
+            link(1024, 0, 3, &[]);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("unknown create extension");
+            }
+            if create(&mtl, 0, 0, 4096) != Ok(placed + 1) {
+                return Err("a refused create consumed a handle");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_intel_gem_create_ext_follows_linux_table
     );
 
     fn smoke_intel_generation_admission_is_independent_of_display() -> TestResult {
