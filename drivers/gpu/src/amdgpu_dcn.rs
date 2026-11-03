@@ -875,6 +875,24 @@ pub unsafe fn execute_modeset(regs: &MmioRegion, seq: &[DcnWrite]) {
     }
 }
 
+/// Execute a [`crate::amdgpu_modeset::ModesetPlan`]: the video
+/// writes first, then the plan's display-audio writes. The order
+/// is load-bearing — the video sequence ends with
+/// OTG_MASTER_EN, and audio starts only once scanout is live.
+/// Teardown is the mirror: execute the `plan_audio_disable`
+/// writes through [`execute_modeset`] BEFORE the OTG
+/// master-enable clear.
+///
+/// # Safety
+/// Same contract as [`execute_modeset`].
+pub unsafe fn execute_modeset_chained(regs: &MmioRegion, video: &[DcnWrite], audio: &[DcnWrite]) {
+    // SAFETY: caller-asserted BAR5 ownership, as above.
+    unsafe {
+        execute_modeset(regs, video);
+        execute_modeset(regs, audio);
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;

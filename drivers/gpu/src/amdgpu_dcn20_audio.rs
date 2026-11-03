@@ -52,12 +52,14 @@
 //!
 //! The stream programmed is the baseline every sink must accept:
 //! LPCM stereo at 48 kHz from the sink's speaker allocation byte.
-//! EDID SAD negotiation (`amdgpu_hdmi_audio::AudioEngine`) and the
-//! Azalia audio-descriptor words — which are the SADs re-encoded, so
-//! they belong with that negotiation — are the follow-up that feeds
-//! richer requests into these builders; the builders already take
-//! rate / speaker inputs. The HDA-side half of the endpoint (the
-//! Renoir function's bind and ELD path) is `audio::hda`.
+//! EDID SAD negotiation (`amdgpu_hdmi_audio::AudioEngine` /
+//! `parse_cea_audio_blocks`) feeds richer requests into these
+//! builders — the negotiated rate and speaker byte — and the SADs
+//! themselves are re-encoded as the Azalia audio-descriptor words
+//! (`descriptor_writes`), since the codec reports the sink's
+//! capabilities to the HDA side through them. The HDA-side half
+//! of the endpoint (the Renoir function's bind and ELD path) is
+//! `audio::hda`.
 
 extern crate alloc;
 
@@ -253,10 +255,68 @@ fn dto_writes(base1: u32, req: &Dcn20AudioRequest) -> Option<Vec<DcnWrite>> {
     ])
 }
 
+/// Azalia audio-descriptor words for the fed SADs, in the
+/// `dce_aud_az_configure` shape the DCN 3.0 / 4.0.1 owners
+/// already program: one word per format code at
+/// `IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + code - 1`, the SAD with
+/// the most channels winning per code (first on ties). One-bit
+/// audio (code 9) and DST (code 13) are never programmed.
+/// Word layout: channels - 1 in bits [2:0], the SAD rate byte
+/// in [15:8], the SAD byte 2 in [23:16], and for LPCM (code 1)
+/// the rate byte repeated in [31:24]
+/// (SUPPORTED_FREQUENCIES_STEREO).
+fn descriptor_writes(
+    base2: u32,
+    endpoint: u8,
+    sads: &[crate::amdgpu_hdmi_audio::ShortAudioDescriptor],
+) -> Vec<DcnWrite> {
+    use crate::amdgpu_hdmi_audio::AudioFormat;
+    let mut writes = Vec::new();
+    for code in 1u32..=14 {
+        if code == 9 || code == 13 {
+            continue;
+        }
+        let Some(best) = sads
+            .iter()
+            .filter(|s| u32::from(s.format.cea_code()) == code)
+            .fold(
+                None,
+                |best: Option<&crate::amdgpu_hdmi_audio::ShortAudioDescriptor>, s| match best {
+                    Some(b) if b.channel_count >= s.channel_count => Some(b),
+                    _ => Some(s),
+                },
+            )
+        else {
+            continue;
+        };
+        let rates = best.sample_rates.as_byte();
+        let mut word = u32::from(best.channel_count.saturating_sub(1)) & 7;
+        word |= u32::from(rates) << 8;
+        word |= u32::from(best.size_or_bitrate) << 16;
+        if best.format == AudioFormat::LinearPcm {
+            word |= u32::from(rates) << 24;
+        }
+        az_push(
+            &mut writes,
+            base2,
+            endpoint,
+            crate::amdgpu_hdmi_audio::IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + code - 1,
+            word,
+        );
+    }
+    writes
+}
+
 /// The Azalia endpoint configuration + enable, shared by both
 /// signals (`dce_aud_az_configure`'s EDID-free subset, then
-/// `dce_aud_az_enable`).
-fn az_enable_writes(base2: u32, req: &Dcn20AudioRequest) -> Vec<DcnWrite> {
+/// `dce_aud_az_enable`). Descriptor words for the fed SADs land
+/// between the speaker write and the hot-plug enable, matching
+/// `az_configure`'s order (speaker → descriptors → enable).
+fn az_enable_writes(
+    base2: u32,
+    req: &Dcn20AudioRequest,
+    sads: &[crate::amdgpu_hdmi_audio::ShortAudioDescriptor],
+) -> Vec<DcnWrite> {
     let mut writes = Vec::new();
     let connection = match req.signal {
         DisplayAudioSignal::Hdmi => AZ_HDMI_CONNECTION,
@@ -277,6 +337,7 @@ fn az_enable_writes(base2: u32, req: &Dcn20AudioRequest) -> Vec<DcnWrite> {
         IX_PIN_CONTROL_MULTICHANNEL_ENABLE,
         u32::from(channel_mask.count_ones() > 2),
     );
+    writes.extend(descriptor_writes(base2, req.endpoint, sads));
     // az_enable: set AUDIO_ENABLED with clock gating disabled, then
     // re-enable clock gating with the stream left enabled.
     az_push(
@@ -329,10 +390,14 @@ fn packets_per_line(req: &Dcn20AudioRequest) -> u32 {
 /// video writes: every write here assumes scanout is live (the last
 /// video write is OTG_MASTER_EN). Returns an empty list for an
 /// out-of-range request — the plan layer treats empty as no audio.
+/// `sads` are the sink's fed SADs; they program the Azalia
+/// descriptor words (empty keeps the previous baseline: no
+/// descriptor writes, speaker byte and rate from the request).
 pub fn dcn20_audio_enable_sequence(
     dcn_base: u32,
     dcn_base2: u32,
     req: &Dcn20AudioRequest,
+    sads: &[crate::amdgpu_hdmi_audio::ShortAudioDescriptor],
 ) -> Vec<DcnWrite> {
     if !valid(req) {
         return Vec::new();
@@ -438,7 +503,7 @@ pub fn dcn20_audio_enable_sequence(
         addr: dig(dcn_base2, d, AFMT_INFOFRAME_CONTROL0),
         value: AFMT_AUDIO_INFO_UPDATE,
     });
-    writes.extend(az_enable_writes(dcn_base2, req));
+    writes.extend(az_enable_writes(dcn_base2, req, sads));
     match req.signal {
         DisplayAudioSignal::Hdmi => {
             // Samples flow last (`dce110_se_audio_mute_control`
@@ -565,7 +630,7 @@ mod smoke_tests {
 
     fn dcn20_audio_hdmi_enable_sequence() -> TestResult {
         let req = hdmi_req();
-        let writes = dcn20_audio_enable_sequence(B1, B2, &req);
+        let writes = dcn20_audio_enable_sequence(B1, B2, &req, &[]);
         // DTO first: source select carries the OTG, then module, then
         // phase — the wall-DTO order.
         if writes.len() < 3
@@ -630,7 +695,7 @@ mod smoke_tests {
         req.signal = DisplayAudioSignal::Dp;
         req.dig = 1;
         req.endpoint = 1;
-        let writes = dcn20_audio_enable_sequence(B1, B2, &req);
+        let writes = dcn20_audio_enable_sequence(B1, B2, &req, &[]);
         let dig1 = |reg: u32| B2 + reg + DIG_STRIDE;
         if find(&writes, dig1(DP_SEC_AUD_N)) != Some(DP_SEC_AUD_N_DEFAULT)
             || find(&writes, dig1(DP_SEC_TIMESTAMP)) != Some(DP_SEC_TIMESTAMP_MODE_AUTO_CALC)
@@ -714,17 +779,136 @@ mod smoke_tests {
         // Out-of-range requests program nothing.
         let mut bad = req;
         bad.dig = 6;
-        if !dcn20_audio_enable_sequence(B1, B2, &bad).is_empty()
+        if !dcn20_audio_enable_sequence(B1, B2, &bad, &[]).is_empty()
             || !dcn20_audio_disable_sequence(B1, B2, &bad).is_empty()
         {
             return TestResult::Fail("DIG 6 must not program");
         }
         let mut bad = req;
         bad.pixel_clock_khz = 0;
-        if !dcn20_audio_enable_sequence(B1, B2, &bad).is_empty() {
+        if !dcn20_audio_enable_sequence(B1, B2, &bad, &[]).is_empty() {
             return TestResult::Fail("zero pixel clock must not program");
         }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", dcn20_audio_hdmi_disable_and_invalid);
+
+    fn dcn20_audio_descriptor_words() -> TestResult {
+        use crate::amdgpu_hdmi_audio::{
+            AudioFormat, SampleRates, ShortAudioDescriptor, IX_PIN_CONTROL_AUDIO_DESCRIPTOR0,
+        };
+        let req = hdmi_req();
+        // Pinned byte-for-byte: LPCM stereo, 48 kHz only, 16-bit.
+        // word = 1 | 0x04<<8 | 0x01<<16 | 0x04<<24 = 0x0401_0401.
+        let lpcm_stereo = ShortAudioDescriptor {
+            format: AudioFormat::LinearPcm,
+            channel_count: 2,
+            sample_rates: SampleRates {
+                r48k: true,
+                ..Default::default()
+            },
+            size_or_bitrate: 0x01,
+        };
+        let writes = dcn20_audio_enable_sequence(B1, B2, &req, &[lpcm_stereo]);
+        let az_index = B2 + AZF0ENDPOINT0_INDEX + 2 * AZ_ENDPOINT_STRIDE;
+        // Collect (index, value) pairs written through the endpoint window.
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < writes.len() {
+            if writes[i].addr == az_index {
+                pairs.push((writes[i].value, writes[i + 1].value));
+            }
+            i += 1;
+        }
+        if !pairs
+            .iter()
+            .any(|&(ix, v)| ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 && v == 0x0401_0401)
+        {
+            return TestResult::Fail("LPCM descriptor word must be 0x04010401");
+        }
+        // Configure before enable: the descriptor write precedes the
+        // hot-plug enable pair on the same endpoint.
+        let desc_pos = pairs
+            .iter()
+            .position(|&(ix, _)| ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0);
+        let enable_pos = pairs
+            .iter()
+            .position(|&(ix, v)| ix == IX_PIN_CONTROL_HOT_PLUG_CONTROL && v == AZ_AUDIO_ENABLED);
+        if desc_pos.is_none() || enable_pos.is_none() || desc_pos.unwrap() > enable_pos.unwrap() {
+            return TestResult::Fail("descriptors must precede the hot-plug enable");
+        }
+        // Masking-defeating: two LPCM SADs, 2ch and 6ch — the 6ch
+        // word wins (channels - 1 = 5), not the first SAD.
+        // Rates 48k + 96k (0x14), byte2 0x01:
+        // word = 5 | 0x14<<8 | 0x01<<16 | 0x14<<24 = 0x1401_1405.
+        let lpcm_6ch = ShortAudioDescriptor {
+            format: AudioFormat::LinearPcm,
+            channel_count: 6,
+            sample_rates: SampleRates {
+                r48k: true,
+                r96k: true,
+                ..Default::default()
+            },
+            size_or_bitrate: 0x01,
+        };
+        // AC-3 6ch, 48 kHz: word = 5 | 0x04<<8 = 0x0405 (no top byte).
+        let ac3 = ShortAudioDescriptor {
+            format: AudioFormat::Ac3,
+            channel_count: 6,
+            sample_rates: SampleRates {
+                r48k: true,
+                ..Default::default()
+            },
+            size_or_bitrate: 0x00,
+        };
+        // One-bit audio (code 9) and DST (code 13) must never program.
+        let one_bit = ShortAudioDescriptor {
+            format: AudioFormat::OneBitAudio,
+            channel_count: 2,
+            sample_rates: SampleRates {
+                r48k: true,
+                ..Default::default()
+            },
+            size_or_bitrate: 0x00,
+        };
+        let dst = ShortAudioDescriptor {
+            format: AudioFormat::Dst,
+            channel_count: 2,
+            sample_rates: SampleRates {
+                r48k: true,
+                ..Default::default()
+            },
+            size_or_bitrate: 0x00,
+        };
+        let writes =
+            dcn20_audio_enable_sequence(B1, B2, &req, &[lpcm_stereo, lpcm_6ch, ac3, one_bit, dst]);
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < writes.len() {
+            if writes[i].addr == az_index {
+                pairs.push((writes[i].value, writes[i + 1].value));
+            }
+            i += 1;
+        }
+        if !pairs
+            .iter()
+            .any(|&(ix, v)| ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 && v == 0x1401_1405)
+        {
+            return TestResult::Fail("6ch LPCM word must win over 2ch");
+        }
+        if !pairs
+            .iter()
+            .any(|&(ix, v)| ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + 1 && v == 0x0405)
+        {
+            return TestResult::Fail("AC-3 descriptor word must be 0x0405");
+        }
+        if pairs.iter().any(|&(ix, _)| {
+            ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + 8
+                || ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + 12
+        }) {
+            return TestResult::Fail("one-bit / DST descriptors must never program");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", dcn20_audio_descriptor_words);
 }

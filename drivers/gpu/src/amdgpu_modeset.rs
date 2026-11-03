@@ -42,7 +42,9 @@
 //!   ATOM table in (via [`crate::amdgpu_atom_displayobj`]) and
 //!   pulls a `KmsState` out. To actually program a mode, callers
 //!   pull a `ModesetPlan` and dispatch it through
-//!   `crate::amdgpu_dcn::execute_modeset`.
+//!   `crate::amdgpu_dcn::execute_modeset_chained` (video writes,
+//!   then the plan's audio writes — audio starts only once
+//!   scanout is live).
 //! - **One CRTC per connector** in this stage — multi-monitor
 //!   needs `pipe_ctx` arbitration that DC handles via the
 //!   resource pool; we punt to "first available CRTC".
@@ -72,6 +74,17 @@ pub enum ConnectorStatus {
     Unknown,
 }
 
+/// Sink audio capabilities for one connector, fed from the
+/// sink's EDID CEA block (see
+/// [`crate::amdgpu_hdmi_audio::parse_cea_audio_blocks`]).
+#[derive(Clone, Debug)]
+pub struct SinkAudioCaps {
+    /// The sink's SAD list, in CEA block order.
+    pub sads: Vec<crate::amdgpu_hdmi_audio::ShortAudioDescriptor>,
+    /// CEA speaker-allocation mask (0x01 = FL/FR).
+    pub speakers: u8,
+}
+
 /// One KMS connector. Index into [`KmsState::connectors`] doubles
 /// as the connector's stable ID for the duration of a probe.
 #[derive(Clone, Debug)]
@@ -88,6 +101,11 @@ pub struct Connector {
     pub bound_encoder: Option<u8>,
     /// ATOM `usDeviceTag` — the firmware's notion of this output.
     pub device_tag: u16,
+    /// Sink audio capabilities fed from EDID, if the sink's
+    /// audio side has been read. `None` means unknown — the plan
+    /// layer falls back to the baseline LPCM stereo 48 kHz stream
+    /// every HDMI sink must accept.
+    pub audio_caps: Option<SinkAudioCaps>,
 }
 
 impl Connector {
@@ -236,6 +254,7 @@ impl KmsState {
                 bound_crtc: None,
                 bound_encoder: None,
                 device_tag: path.device_tag,
+                audio_caps: None,
             });
         }
     }
@@ -399,12 +418,20 @@ pub fn plan_modeset(
     };
     // Display audio rides the same plan for the families the 2.0
     // sequence serves (DCN 2.0 and 3.1.4 share the audio register
-    // map). The baseline stream is LPCM stereo at 48 kHz; sink SAD
-    // negotiation feeding richer requests is follow-up work.
+    // map). The request is negotiated from the connector's fed
+    // caps when present, else the baseline LPCM stereo 48 kHz
+    // stream; the fed SADs program the Azalia descriptor words.
     let audio_writes = if dcn_base2 != 0 {
         display_audio_request(kms, conn, crtc_idx, &timing)
             .map(|req| {
-                crate::amdgpu_dcn20_audio::dcn20_audio_enable_sequence(dcn_base, dcn_base2, &req)
+                let sads = conn
+                    .audio_caps
+                    .as_ref()
+                    .map(|c| c.sads.as_slice())
+                    .unwrap_or(&[]);
+                crate::amdgpu_dcn20_audio::dcn20_audio_enable_sequence(
+                    dcn_base, dcn_base2, &req, sads,
+                )
             })
             .unwrap_or_default()
     } else {
@@ -419,11 +446,62 @@ pub fn plan_modeset(
     })
 }
 
+/// Feed a connector's sink audio capabilities, parsed from its
+/// EDID CEA block. Returns `false` when the connector index is
+/// out of range. The caps are stored regardless of connector
+/// kind — the plan layer only emits audio for external HDMI/DP
+/// outputs, so caps on an internal panel stay inert.
+pub fn feed_connector_audio_caps(
+    kms: &mut KmsState,
+    connector_idx: u8,
+    sads: Vec<crate::amdgpu_hdmi_audio::ShortAudioDescriptor>,
+    speakers: u8,
+) -> bool {
+    let Some(conn) = kms.connectors.get_mut(connector_idx as usize) else {
+        return false;
+    };
+    conn.audio_caps = Some(SinkAudioCaps { sads, speakers });
+    true
+}
+
+/// The sample rate a negotiated request programs: the best LPCM
+/// rate the sink's SADs admit among the rates the ACR tables
+/// cover (32 / 44.1 / 48 kHz), preferring 48 kHz; the baseline
+/// 48 kHz when no SAD admits one (every HDMI sink must accept
+/// basic LPCM stereo 48 kHz, so the fallback is always safe).
+/// Higher SAD rates (88.2 / 96 / 176.4 / 192 kHz) are not
+/// selected: the enable sequence's ACR pairs cover 32 / 44.1 /
+/// 48 kHz only.
+fn negotiated_rate(caps: &SinkAudioCaps) -> u32 {
+    use crate::amdgpu_hdmi_audio::AudioFormat;
+    let mut best = 0;
+    for sad in &caps.sads {
+        if sad.format != AudioFormat::LinearPcm {
+            continue;
+        }
+        if sad.sample_rates.r48k {
+            return 48_000;
+        }
+        if sad.sample_rates.r44k {
+            best = 44_100;
+        } else if sad.sample_rates.r32k && best == 0 {
+            best = 32_000;
+        }
+    }
+    if best == 0 {
+        48_000
+    } else {
+        best
+    }
+}
+
 /// The display-audio request for a connector being modeset, if the
 /// connector is an external HDMI/DP output. The DIG and the Azalia
 /// endpoint follow the bound encoder's ATOM instance (falling back
 /// to the connector's own instance); the DTO source is the bound
-/// CRTC's pipe.
+/// CRTC's pipe. Rate and speaker byte are negotiated from the
+/// connector's fed caps when present, else the baseline LPCM
+/// stereo 48 kHz / FL-FR.
 fn display_audio_request(
     kms: &KmsState,
     conn: &Connector,
@@ -441,6 +519,10 @@ fn display_audio_request(
         .and_then(|e| kms.encoders.get(e as usize))
         .map_or(conn.instance, |e| e.instance);
     let otg = kms.crtcs.get(crtc_idx as usize)?.pipe;
+    let (speakers, sample_rate_hz) = match &conn.audio_caps {
+        Some(caps) => (caps.speakers, negotiated_rate(caps)),
+        None => (0x01, 48_000),
+    };
     Some(Dcn20AudioRequest {
         otg,
         dig,
@@ -449,8 +531,8 @@ fn display_audio_request(
         pixel_clock_khz: timing.pixel_clock_khz,
         h_total: timing.h_total,
         h_active: timing.h_active,
-        speakers: 0x01,
-        sample_rate_hz: 48_000,
+        speakers,
+        sample_rate_hz,
     })
 }
 
@@ -496,9 +578,99 @@ pub fn plan_audio_disable(
     ))
 }
 
-/// Apply a modeset plan to a KMS state — bookkeeping only,
-/// **no MMIO**. Call after `execute_modeset` returns to record
-/// what's now live.
+/// What the display-audio layer needs on a connector hotplug
+/// transition. Compute this from the PRE-transition `KmsState`
+/// and apply the status change afterwards: disconnect drops
+/// the CRTC binding in `set_status`, so a disable computed
+/// after the transition would find nothing to tear down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HotplugAudioAction {
+    /// The connector now needs a modeset: the caller runs
+    /// `plan_modeset` + `execute_modeset_chained` for it. Audio
+    /// rides the plan when the connector is an external HDMI/DP
+    /// output.
+    ReprogramAudio { connector_idx: u8 },
+    /// Execute these writes BEFORE video teardown (the OTG
+    /// master-enable clear): they mute and disable the endpoint
+    /// while scanout is still live.
+    DisableAudio { writes: Vec<DcnWrite> },
+    /// No audio action (internal panel, unknown connector, or a
+    /// status that doesn't move audio).
+    None,
+}
+
+/// Map a hotplug transition to its display-audio action.
+/// `new_status` is the status the connector is moving TO;
+/// `kms` must still be in the pre-transition state (see
+/// [`HotplugAudioAction`]).
+pub fn hotplug_audio_action(
+    kms: &KmsState,
+    connector_idx: u8,
+    new_status: ConnectorStatus,
+    dcn_base: u32,
+    dcn_base2: u32,
+) -> HotplugAudioAction {
+    let Some(conn) = kms.connectors.get(connector_idx as usize) else {
+        return HotplugAudioAction::None;
+    };
+    match new_status {
+        ConnectorStatus::Connected => match conn.kind {
+            ConnectorKind::HdmiA | ConnectorKind::HdmiB | ConnectorKind::Dp => {
+                HotplugAudioAction::ReprogramAudio { connector_idx }
+            }
+            _ => HotplugAudioAction::None,
+        },
+        ConnectorStatus::Disconnected => {
+            match plan_audio_disable(kms, connector_idx, dcn_base, dcn_base2) {
+                Some(writes) if !writes.is_empty() => HotplugAudioAction::DisableAudio { writes },
+                _ => HotplugAudioAction::None,
+            }
+        }
+        ConnectorStatus::Unknown => HotplugAudioAction::None,
+    }
+}
+
+/// Display-audio enable writes to re-execute on PM resume, for
+/// every still-Connected external connector with a programmed
+/// mode. The resume handler runs these AFTER `set_mode`
+/// re-programs video (audio starts only once scanout is live),
+/// mirroring the plan layer's video-then-audio order.
+/// Connectors without a mode, without a timing-table entry, or
+/// without an audio endpoint contribute nothing.
+pub fn resume_display_audio_writes(kms: &KmsState, dcn_base: u32, dcn_base2: u32) -> Vec<DcnWrite> {
+    if dcn_base2 == 0 {
+        return Vec::new();
+    }
+    let mut writes = Vec::new();
+    for conn in kms.connectors.iter() {
+        if conn.status != ConnectorStatus::Connected {
+            continue;
+        }
+        let Some(crtc_idx) = conn.bound_crtc else {
+            continue;
+        };
+        let Some(crtc) = kms.crtcs.get(crtc_idx as usize) else {
+            continue;
+        };
+        let Some(mode) = crtc.mode else {
+            continue;
+        };
+        let Some(timing) = timing_for_mode(mode.width, mode.height, mode.refresh_hz) else {
+            continue;
+        };
+        if let Some(req) = display_audio_request(kms, conn, crtc_idx, &timing) {
+            let sads = conn
+                .audio_caps
+                .as_ref()
+                .map(|c| c.sads.as_slice())
+                .unwrap_or(&[]);
+            writes.extend(crate::amdgpu_dcn20_audio::dcn20_audio_enable_sequence(
+                dcn_base, dcn_base2, &req, sads,
+            ));
+        }
+    }
+    writes
+}
 pub fn commit_modeset(kms: &mut KmsState, plan: &ModesetPlan) {
     if let Some(crtc) = kms.crtcs.get_mut(plan.crtc_idx as usize) {
         crtc.state = CrtcState::Programmed;
@@ -855,6 +1027,7 @@ mod smoke_tests {
             bound_crtc: None,
             bound_encoder: Some(0),
             device_tag: 0x0080,
+            audio_caps: None,
         });
         s.encoders.push(Encoder {
             kind: EncoderKind::Hdmi,
@@ -971,4 +1144,278 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_kms_encoder_binding_validation);
+
+    fn hdmi_kms_with_crtc() -> KmsState {
+        let mut s = KmsState::new(4);
+        s.ingest_atom_paths(
+            [DisplayPath {
+                device_tag: 0x0080,
+                connector_kind: ConnectorKind::HdmiA,
+                connector_index: 0,
+                gpu_object_id: 0x2101,
+            }]
+            .iter()
+            .copied(),
+        );
+        s.set_status(0, ConnectorStatus::Connected);
+        s.push_encoder(EncoderKind::Hdmi, 1, 0b0001);
+        s.bind_encoder(0, 0).expect("bind encoder");
+        s.pick_crtc(0).expect("pick crtc");
+        s
+    }
+
+    fn smoke_kms_display_audio_negotiated_plan() -> TestResult {
+        use crate::amdgpu_dcn20_audio::{
+            AFMT_AUDIO_PACKET_CONTROL, AZF0ENDPOINT0_INDEX, AZ_ENDPOINT_STRIDE, AZ_HDMI_CONNECTION,
+            DCCG_AUDIO_DTO0_MODULE, DCCG_AUDIO_DTO0_PHASE, DCCG_AUDIO_DTO_SOURCE, DIG_STRIDE,
+        };
+        use crate::amdgpu_hdmi_audio::{
+            AudioFormat, SampleRates, ShortAudioDescriptor, IX_PIN_CONTROL_AUDIO_DESCRIPTOR0,
+        };
+        let mut s = hdmi_kms_with_crtc();
+        // Baseline first: no caps fed → LPCM stereo 48 kHz.
+        let plan = match plan_modeset(
+            &s,
+            Family::Renoir,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x5000,
+            0x9000,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("baseline plan failed"),
+        };
+        if plan.audio_writes.len() < 3
+            || plan.audio_writes[0]
+                != (DcnWrite {
+                    addr: 0x5000 + DCCG_AUDIO_DTO_SOURCE,
+                    value: 0,
+                })
+            || plan.audio_writes[1]
+                != (DcnWrite {
+                    addr: 0x5000 + DCCG_AUDIO_DTO0_MODULE,
+                    value: 148_500_000,
+                })
+            || plan.audio_writes[2]
+                != (DcnWrite {
+                    addr: 0x5000 + DCCG_AUDIO_DTO0_PHASE,
+                    value: 48_000,
+                })
+        {
+            return TestResult::Fail("baseline DTO must be 48 kHz");
+        }
+        // Feed caps: LPCM 44.1 kHz-only + AC-3, speakers FL/FR.
+        let sads = alloc::vec![
+            ShortAudioDescriptor {
+                format: AudioFormat::LinearPcm,
+                channel_count: 2,
+                sample_rates: SampleRates {
+                    r44k: true,
+                    ..Default::default()
+                },
+                size_or_bitrate: 0x01,
+            },
+            ShortAudioDescriptor {
+                format: AudioFormat::Ac3,
+                channel_count: 6,
+                sample_rates: SampleRates {
+                    r48k: true,
+                    ..Default::default()
+                },
+                size_or_bitrate: 0x00,
+            },
+        ];
+        if !feed_connector_audio_caps(&mut s, 0, sads, 0x01) {
+            return TestResult::Fail("feed caps failed");
+        }
+        if feed_connector_audio_caps(&mut s, 99, alloc::vec![], 0x01) {
+            return TestResult::Fail("feed caps must reject bad index");
+        }
+        let plan = match plan_modeset(
+            &s,
+            Family::Renoir,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x5000,
+            0x9000,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("negotiated plan failed"),
+        };
+        // Negotiated rate: 44.1 kHz is the only LPCM rate admitted.
+        if plan.audio_writes.len() < 3
+            || plan.audio_writes[2]
+                != (DcnWrite {
+                    addr: 0x5000 + DCCG_AUDIO_DTO0_PHASE,
+                    value: 44_100,
+                })
+        {
+            return TestResult::Fail("negotiated DTO phase must be 44100");
+        }
+        // Endpoint 1 (encoder instance): speaker byte + HDMI bit,
+        // descriptor words for both SADs, samples flowing last.
+        let az_index = 0x9000 + AZF0ENDPOINT0_INDEX + AZ_ENDPOINT_STRIDE;
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < plan.audio_writes.len() {
+            if plan.audio_writes[i].addr == az_index {
+                pairs.push((plan.audio_writes[i].value, plan.audio_writes[i + 1].value));
+            }
+            i += 1;
+        }
+        if !pairs
+            .iter()
+            .any(|&(ix, v)| ix == 0x25 && v == (0x01 | AZ_HDMI_CONNECTION))
+        {
+            return TestResult::Fail("speaker write must carry 0x01 + HDMI connection");
+        }
+        // LPCM 44.1k-only: 1 | 0x02<<8 | 0x01<<16 | 0x02<<24.
+        if !pairs
+            .iter()
+            .any(|&(ix, v)| ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 && v == 0x0201_0201)
+        {
+            return TestResult::Fail("LPCM descriptor word must be 0x02010201");
+        }
+        if !pairs
+            .iter()
+            .any(|&(ix, v)| ix == IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 + 1 && v == 0x0405)
+        {
+            return TestResult::Fail("AC-3 descriptor word must be 0x0405");
+        }
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + DIG_STRIDE;
+        if plan.audio_writes.last().copied()
+            != Some(DcnWrite {
+                addr: afmt,
+                value: 1,
+            })
+        {
+            return TestResult::Fail("samples must flow last");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_kms_display_audio_negotiated_plan);
+
+    fn smoke_kms_hotplug_audio_actions() -> TestResult {
+        use crate::amdgpu_dcn20_audio::{
+            AFMT_AUDIO_PACKET_CONTROL, DCCG_AUDIO_DTO_SOURCE, DIG_STRIDE,
+        };
+        let mut s = hdmi_kms_with_crtc();
+        // Connect on an external HDMI connector: reprogram.
+        if hotplug_audio_action(&s, 0, ConnectorStatus::Connected, 0x5000, 0x9000)
+            != (HotplugAudioAction::ReprogramAudio { connector_idx: 0 })
+        {
+            return TestResult::Fail("HDMI connect must reprogram audio");
+        }
+        // Disconnect, computed pre-transition (binding still held):
+        // disable writes that mute first and release the DTO last.
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + DIG_STRIDE;
+        match hotplug_audio_action(&s, 0, ConnectorStatus::Disconnected, 0x5000, 0x9000) {
+            HotplugAudioAction::DisableAudio { writes } => {
+                if writes.first().copied()
+                    != Some(DcnWrite {
+                        addr: afmt,
+                        value: 0,
+                    })
+                {
+                    return TestResult::Fail("disconnect disable must mute first");
+                }
+                if writes.last().copied()
+                    != Some(DcnWrite {
+                        addr: 0x5000 + DCCG_AUDIO_DTO_SOURCE,
+                        value: 0,
+                    })
+                {
+                    return TestResult::Fail("disconnect disable must release DTO last");
+                }
+            }
+            _ => return TestResult::Fail("HDMI disconnect must disable audio"),
+        }
+        // Unknown status / connector: no action.
+        if hotplug_audio_action(&s, 0, ConnectorStatus::Unknown, 0x5000, 0x9000)
+            != HotplugAudioAction::None
+        {
+            return TestResult::Fail("Unknown status must be no action");
+        }
+        if hotplug_audio_action(&s, 99, ConnectorStatus::Connected, 0x5000, 0x9000)
+            != HotplugAudioAction::None
+        {
+            return TestResult::Fail("unknown connector must be no action");
+        }
+        // Internal panel: connect needs no audio action.
+        s.ingest_atom_paths(
+            [DisplayPath {
+                device_tag: 0x0040,
+                connector_kind: ConnectorKind::Edp,
+                connector_index: 0,
+                gpu_object_id: 0x2100,
+            }]
+            .iter()
+            .copied(),
+        );
+        if hotplug_audio_action(&s, 1, ConnectorStatus::Connected, 0x5000, 0x9000)
+            != HotplugAudioAction::None
+        {
+            return TestResult::Fail("eDP connect must be no audio action");
+        }
+        // After the transition lands, the binding is gone, so a
+        // late disconnect action finds nothing to tear down.
+        s.set_status(0, ConnectorStatus::Disconnected);
+        if hotplug_audio_action(&s, 0, ConnectorStatus::Disconnected, 0x5000, 0x9000)
+            != HotplugAudioAction::None
+        {
+            return TestResult::Fail("post-transition disconnect must be no action");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_kms_hotplug_audio_actions);
+
+    fn smoke_kms_resume_display_audio_writes() -> TestResult {
+        use crate::amdgpu_dcn20_audio::DCCG_AUDIO_DTO_SOURCE;
+        let mut s = hdmi_kms_with_crtc();
+        let plan = match plan_modeset(
+            &s,
+            Family::Renoir,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x5000,
+            0x9000,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("resume plan failed"),
+        };
+        commit_modeset_full(&mut s, &plan, 1920, 0x8000_0000);
+        let writes = resume_display_audio_writes(&s, 0x5000, 0x9000);
+        if writes.is_empty()
+            || writes[0]
+                != (DcnWrite {
+                    addr: 0x5000 + DCCG_AUDIO_DTO_SOURCE,
+                    value: 0,
+                })
+        {
+            return TestResult::Fail("resume must re-emit the audio enable writes");
+        }
+        // Disconnected at resume: nothing to re-program.
+        s.set_status(0, ConnectorStatus::Disconnected);
+        if !resume_display_audio_writes(&s, 0x5000, 0x9000).is_empty() {
+            return TestResult::Fail("resume after disconnect must be empty");
+        }
+        // No BASE_IDX 2 segment: nothing to program.
+        if !resume_display_audio_writes(&s, 0x5000, 0).is_empty() {
+            return TestResult::Fail("resume without base2 must be empty");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_kms_resume_display_audio_writes);
 }
