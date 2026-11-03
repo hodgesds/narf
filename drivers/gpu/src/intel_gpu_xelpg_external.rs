@@ -29,8 +29,25 @@
 //!
 //! [`MtlExternalService`] composes this with the hotplug owner
 //! ([`crate::intel_gpu_xelpg_hpd`]): connect on `Connected`, withdraw on
-//! `Disconnected`, revalidate/retrain on `ShortPulse`, re-probe on
-//! `Redetect`; [`service_mtl_external`] is the process-wide entry.
+//! `Disconnected`, revalidate/retrain on `ShortPulse` (DP only), re-probe
+//! on `Redetect`; [`service_mtl_external`] is the process-wide entry.
+//!
+//! ## DP or HDMI
+//!
+//! The service owns one [`MtlRoute`]: this module's DP route or the HDMI
+//! TMDS route of [`crate::intel_gpu_xelpg_hdmi`]. Which one a port may
+//! carry is a board fact Linux reads from the VBT child device
+//! (`intel_ddi_init`: `init_dp`/`init_hdmi`, Type-C legacy = neither
+//! USB-C nor TBT). Without a VBT parser the facts are an explicit
+//! [`MtlPortPolicy`]; production uses [`MtlPortPolicy::NO_VBT`]: DDI B is
+//! DP + HDMI (`init_vbt_missing_defaults`), TC1..TC4 are USB-C DP-alt
+//! only (Linux creates no Type-C encoder without a VBT), so no legacy
+//! Type-C port and no Type-C HDMI exist until declared. Linux registers
+//! both connectors on a dual port and each detects on its own (DPCD for
+//! DP, a digital DDC EDID for HDMI); with one owned route the order is
+//! [`route_plan`]: DP first, HDMI only when the DPCD read failed
+//! ([`dpcd_absent`]). Any other DP failure (EDID, bandwidth, Type-C)
+//! refuses without touching DDC. HDMI never runs over DP-alt or TBT-alt.
 //!
 //! ## Qualified profile
 //!
@@ -41,8 +58,8 @@
 //! DP 1.4 rates RBR–HBR3 with the C10/C20 tables in
 //! [`crate::intel_gpu_xelpg`]; a stream whose demand exceeds the
 //! negotiated ceiling refuses (no DSC). UHBR (128b/132b, C20 MPLLA),
-//! MST, FEC/DSC, HDMI, TBT-alt tunnels, audio and lane reversal are
-//! refused or unadvertised. Per-iteration source pattern/level updates
+//! MST, FEC/DSC, TBT-alt tunnels, audio and lane reversal are refused or
+//! unadvertised (HDMI is the separate route described below). Per-iteration source pattern/level updates
 //! inside the shared training loop keep the existing MTL simplification:
 //! TPS1 and zero levels are staged before training, the trained levels
 //! after.
@@ -73,7 +90,10 @@ use crate::intel_gpu_xelpg::{
     program_port_buf_ctl, set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
     Cx0Phy, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
-use crate::intel_gpu_xelpg_hpd::{MtlHpdEvent, MtlHpdKind, MtlHpdPin};
+use crate::intel_gpu_xelpg_hdmi::{
+    activate_hdmi, probe_hdmi, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
+};
+use crate::intel_gpu_xelpg_hpd::{LiveMode, MtlHpdConfig, MtlHpdEvent, MtlHpdKind, MtlHpdPin};
 use crate::intel_gpu_xelpg_tc::{
     aux_power_disable, aux_power_enable, connect as tc_connect, connection_intact,
     disconnect as tc_disconnect, TcConnection, TcError, TcMode,
@@ -763,6 +783,231 @@ impl MtlExternalRoute {
     }
 }
 
+/// Board declaration for one external port: the facts a VBT child device
+/// carries (`intel_bios.c`): `intel_bios_encoder_supports_dp`
+/// (`DEVICE_TYPE_DISPLAYPORT_OUTPUT`), `intel_bios_encoder_supports_hdmi`
+/// (`DEVICE_TYPE_TMDS_DVI_SIGNALING` without `DEVICE_TYPE_NOT_HDMI_OUTPUT`)
+/// and, for Type-C, `intel_ddi_init`'s legacy test (neither
+/// `dp_usb_type_c` nor `tbt`). No VBT parser exists in this tree, so the
+/// declaration is supplied instead of parsed; see [`MtlPortPolicy::NO_VBT`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MtlPortDecl {
+    /// The port carries DisplayPort.
+    pub dp: bool,
+    /// The port carries native HDMI (TMDS).
+    pub hdmi: bool,
+    /// Type-C only: the PHY is wired to a fixed DP/HDMI connector.
+    pub legacy: bool,
+}
+
+impl MtlPortDecl {
+    /// No output on this port.
+    pub const NONE: Self = Self {
+        dp: false,
+        hdmi: false,
+        legacy: false,
+    };
+    /// `init_vbt_missing_defaults` for a non-TC port other than A and E:
+    /// `DEVICE_TYPE_TMDS_DVI_SIGNALING | DEVICE_TYPE_DISPLAYPORT_OUTPUT`.
+    pub const COMBO_DP_HDMI: Self = Self {
+        dp: true,
+        hdmi: true,
+        legacy: false,
+    };
+    /// A USB-C connector: DP-alt only.
+    pub const USB_C: Self = Self {
+        dp: true,
+        hdmi: false,
+        legacy: false,
+    };
+    /// A Type-C PHY wired to a native HDMI connector.
+    pub const LEGACY_HDMI: Self = Self {
+        dp: false,
+        hdmi: true,
+        legacy: true,
+    };
+
+    /// `intel_ddi_init`: a Type-C port declared non-legacy but with HDMI
+    /// and without DP is treated as legacy.
+    pub const fn legacy_effective(self) -> bool {
+        self.legacy || (self.hdmi && !self.dp)
+    }
+}
+
+/// Declarations for DDI B and TC1..TC4.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MtlPortPolicy {
+    /// DDI B (C10 combo PHY).
+    pub ddi_b: MtlPortDecl,
+    /// TC1..TC4.
+    pub tc: [MtlPortDecl; 4],
+}
+
+impl MtlPortPolicy {
+    /// The production policy without a VBT. DDI B follows Linux's
+    /// `init_vbt_missing_defaults` (DP + HDMI). Linux creates no Type-C
+    /// encoder without a VBT ("VBT has the TypeC mode ... we don't want to
+    /// detect it"); this tree keeps the USB-C DP-alt route it already
+    /// owns and declares no legacy or HDMI Type-C port, so the policy
+    /// matches [`MtlHpdConfig::TYPE_C`].
+    pub const NO_VBT: Self = Self {
+        ddi_b: MtlPortDecl::COMBO_DP_HDMI,
+        tc: [MtlPortDecl::USB_C; 4],
+    };
+
+    /// The declaration for `port` (DDI A is never external).
+    pub const fn decl(&self, port: XeLpgPort) -> MtlPortDecl {
+        match port {
+            XeLpgPort::A => MtlPortDecl::NONE,
+            XeLpgPort::B => self.ddi_b,
+            XeLpgPort::Tc1 => self.tc[0],
+            XeLpgPort::Tc2 => self.tc[1],
+            XeLpgPort::Tc3 => self.tc[2],
+            XeLpgPort::Tc4 => self.tc[3],
+        }
+    }
+
+    /// The hotplug configuration this policy implies: legacy SDE sources
+    /// exactly for the effectively legacy Type-C ports.
+    pub const fn hpd_config(&self) -> MtlHpdConfig {
+        MtlHpdConfig {
+            legacy_tc: [
+                self.tc[0].legacy_effective(),
+                self.tc[1].legacy_effective(),
+                self.tc[2].legacy_effective(),
+                self.tc[3].legacy_effective(),
+            ],
+        }
+    }
+}
+
+/// The protocols the service tries for a connected sink.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RoutePlan {
+    /// DisplayPort only.
+    Dp,
+    /// Native HDMI only.
+    Hdmi,
+    /// DisplayPort first; HDMI when no DPCD answers.
+    DpThenHdmi,
+    /// The declaration admits nothing in this live mode.
+    Refuse,
+}
+
+/// The DP-versus-HDMI decision for a sink attached in `live` mode. Linux
+/// registers both a DP and an HDMI connector on a port whose VBT child
+/// declares both (`intel_ddi_init`); the DP connector reports connected
+/// only when DPCD answers (`intel_dp_detect`), the HDMI one only when DDC
+/// returns a digital EDID (`intel_hdmi_set_edid`). With a single owned
+/// route this is ordered: DP first, HDMI only on a DPCD read failure.
+/// Native HDMI needs DDI B or a declared legacy Type-C port; DP-alt and
+/// TBT-alt never carry TMDS, and TBT-alt carries nothing owned here.
+pub const fn route_plan(port: XeLpgPort, decl: MtlPortDecl, live: LiveMode) -> RoutePlan {
+    let type_c = port.tc_index().is_some();
+    let mode_ok = match live {
+        LiveMode::Native => !type_c && !matches!(port, XeLpgPort::A),
+        LiveMode::Legacy => type_c && decl.legacy_effective(),
+        LiveMode::DpAlt => type_c,
+        LiveMode::TbtAlt => false,
+    };
+    if !mode_ok {
+        return RoutePlan::Refuse;
+    }
+    let dp = decl.dp;
+    let hdmi = decl.hdmi && !matches!(live, LiveMode::DpAlt);
+    match (dp, hdmi) {
+        (true, true) => RoutePlan::DpThenHdmi,
+        (true, false) => RoutePlan::Dp,
+        (false, true) => RoutePlan::Hdmi,
+        (false, false) => RoutePlan::Refuse,
+    }
+}
+
+/// Whether a DP probe failure means no DPCD answered (`intel_dp_detect`
+/// reports disconnected), the only DP failure that lets HDMI be tried.
+pub const fn dpcd_absent(error: &ExternalError) -> bool {
+    matches!(error, ExternalError::Link(LinkError::AuxFailure(_)))
+}
+
+/// Which protocol a route drives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MtlProtocol {
+    /// DisplayPort SST.
+    Dp,
+    /// HDMI TMDS.
+    Hdmi,
+}
+
+/// A refusal or failure from either route.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RouteError {
+    /// From the DP route (or a policy refusal).
+    Dp(ExternalError),
+    /// From the HDMI route.
+    Hdmi(HdmiError),
+}
+
+/// One owned external route of either protocol.
+#[derive(Clone, Debug)]
+pub enum MtlRoute {
+    /// DisplayPort SST.
+    Dp(MtlExternalRoute),
+    /// HDMI TMDS.
+    Hdmi(MtlHdmiRoute),
+}
+
+impl MtlRoute {
+    /// The external port.
+    pub fn port(&self) -> XeLpgPort {
+        match self {
+            MtlRoute::Dp(r) => r.port(),
+            MtlRoute::Hdmi(r) => r.port(),
+        }
+    }
+
+    /// The protocol.
+    pub fn protocol(&self) -> MtlProtocol {
+        match self {
+            MtlRoute::Dp(_) => MtlProtocol::Dp,
+            MtlRoute::Hdmi(_) => MtlProtocol::Hdmi,
+        }
+    }
+
+    /// Scanning out.
+    pub fn live(&self) -> bool {
+        match self {
+            MtlRoute::Dp(r) => r.state() == RouteState::Live,
+            MtlRoute::Hdmi(r) => r.state() == HdmiRouteState::Live,
+        }
+    }
+
+    /// Locally stopped (its hardware is off).
+    pub fn stopped(&self) -> bool {
+        match self {
+            MtlRoute::Dp(r) => r.state() == RouteState::Stopped,
+            MtlRoute::Hdmi(r) => r.state() == HdmiRouteState::Stopped,
+        }
+    }
+
+    fn stop<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Result<(), RouteError> {
+        match self {
+            MtlRoute::Dp(r) => r.stop(io).map_err(RouteError::Dp),
+            MtlRoute::Hdmi(r) => r.stop(io).map_err(RouteError::Hdmi),
+        }
+    }
+
+    fn release<M: MmioWindow + ?Sized>(self, io: &M) -> Result<(), (MtlRoute, RouteError)> {
+        match self {
+            MtlRoute::Dp(r) => r
+                .release(io)
+                .map_err(|(r, e)| (MtlRoute::Dp(r), RouteError::Dp(e))),
+            MtlRoute::Hdmi(r) => r
+                .release(io)
+                .map_err(|(r, e)| (MtlRoute::Hdmi(r), RouteError::Hdmi(e))),
+        }
+    }
+}
+
 /// What one service pass did.
 #[derive(Clone, Debug)]
 pub enum ServiceOutcome {
@@ -770,6 +1015,8 @@ pub enum ServiceOutcome {
     Activated {
         /// The external port.
         port: XeLpgPort,
+        /// The protocol driving it.
+        protocol: MtlProtocol,
         /// The scanned-out mode.
         mode: Mode,
         /// The scanned-out framebuffer.
@@ -779,8 +1026,8 @@ pub enum ServiceOutcome {
     Refused {
         /// The external port.
         port: XeLpgPort,
-        /// Why.
-        error: ExternalError,
+        /// Why (from the last protocol tried).
+        error: RouteError,
     },
     /// The route was stopped and released; the caller withdraws it.
     Withdrawn {
@@ -792,26 +1039,49 @@ pub enum ServiceOutcome {
         /// The external port.
         port: XeLpgPort,
         /// Why.
-        error: ExternalError,
+        error: RouteError,
     },
     /// The event needed no change (link still trained, other pin, …).
     Unchanged,
 }
 
 /// Owner of at most one MTL external route, driven by hotplug events.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MtlExternalService {
-    route: Option<MtlExternalRoute>,
+    route: Option<MtlRoute>,
+    /// The live mode the retained route was connected in (for `Redetect`).
+    live: LiveMode,
+    policy: MtlPortPolicy,
+}
+
+impl Default for MtlExternalService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MtlExternalService {
-    /// An empty service.
+    /// An empty service under the no-VBT policy.
     pub const fn new() -> Self {
-        Self { route: None }
+        Self::with_policy(MtlPortPolicy::NO_VBT)
+    }
+
+    /// An empty service under an explicit port policy.
+    pub const fn with_policy(policy: MtlPortPolicy) -> Self {
+        Self {
+            route: None,
+            live: LiveMode::Native,
+            policy,
+        }
+    }
+
+    /// The port policy.
+    pub fn policy(&self) -> MtlPortPolicy {
+        self.policy
     }
 
     /// The retained route, if any.
-    pub fn route(&self) -> Option<&MtlExternalRoute> {
+    pub fn route(&self) -> Option<&MtlRoute> {
         self.route.as_ref()
     }
 
@@ -819,19 +1089,53 @@ impl MtlExternalService {
         &mut self,
         io: &M,
         port: XeLpgPort,
+        live: LiveMode,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
-        let probe = match probe_sink(io, Generation::MeteorLake, port, false) {
-            Ok(probe) => probe,
-            Err(error) => return ServiceOutcome::Refused { port, error },
+        let legacy = live == LiveMode::Legacy;
+        let plan = route_plan(port, self.policy.decl(port), live);
+        let outcome = match plan {
+            RoutePlan::Refuse => ServiceOutcome::Refused {
+                port,
+                error: RouteError::Dp(match live {
+                    LiveMode::TbtAlt => ExternalError::Tc(TcError::TbtAltUnsupported),
+                    _ => ExternalError::UnsupportedPort,
+                }),
+            },
+            RoutePlan::Hdmi => self.connect_hdmi(io, port, legacy, alloc),
+            RoutePlan::Dp | RoutePlan::DpThenHdmi => {
+                match probe_sink(io, Generation::MeteorLake, port, legacy) {
+                    Ok(probe) => self.connect_dp(io, probe, alloc),
+                    Err(e) if plan == RoutePlan::DpThenHdmi && dpcd_absent(&e) => {
+                        self.connect_hdmi(io, port, legacy, alloc)
+                    }
+                    Err(error) => ServiceOutcome::Refused {
+                        port,
+                        error: RouteError::Dp(error),
+                    },
+                }
+            }
         };
+        if self.route.is_some() {
+            self.live = live;
+        }
+        outcome
+    }
+
+    fn connect_dp<M: MmioWindow + ?Sized>(
+        &mut self,
+        io: &M,
+        probe: MtlSinkProbe,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+    ) -> ServiceOutcome {
+        let port = probe.port;
         let fb = match alloc(&probe.mode) {
             Some(fb) => fb,
             None => {
                 let _ = release_probe(io, &probe);
                 return ServiceOutcome::Refused {
                     port,
-                    error: ExternalError::Modeset(ModesetError::InvalidFramebuffer),
+                    error: RouteError::Dp(ExternalError::Modeset(ModesetError::InvalidFramebuffer)),
                 };
             }
         };
@@ -839,29 +1143,96 @@ impl MtlExternalService {
             Ok(route) => {
                 let outcome = ServiceOutcome::Activated {
                     port,
+                    protocol: MtlProtocol::Dp,
                     mode: route.probe.mode,
                     fb,
                 };
-                self.route = Some(route);
+                self.route = Some(MtlRoute::Dp(route));
                 outcome
             }
             Err(ActivateError::Refused(probe, error)) => {
                 let _ = release_probe(io, &probe);
-                ServiceOutcome::Refused { port, error }
+                ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Dp(error),
+                }
             }
             Err(ActivateError::Failed(route, error)) => {
-                if route.state() == RouteState::Stopped {
-                    match route.release(io) {
-                        Ok(()) => ServiceOutcome::Refused { port, error },
-                        Err((route, e)) => {
-                            self.route = Some(route);
-                            ServiceOutcome::Retained { port, error: e }
-                        }
-                    }
-                } else {
-                    self.route = Some(route);
-                    ServiceOutcome::Retained { port, error }
+                self.settle_failed(io, MtlRoute::Dp(route), RouteError::Dp(error))
+            }
+        }
+    }
+
+    fn connect_hdmi<M: MmioWindow + ?Sized>(
+        &mut self,
+        io: &M,
+        port: XeLpgPort,
+        legacy: bool,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+    ) -> ServiceOutcome {
+        let probe = match probe_hdmi(io, Generation::MeteorLake, port, legacy) {
+            Ok(probe) => probe,
+            Err(e) => {
+                return ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Hdmi(e),
                 }
+            }
+        };
+        let fb = match alloc(&probe.mode) {
+            Some(fb) => fb,
+            None => {
+                let _ = release_hdmi_probe(io, &probe);
+                return ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Hdmi(HdmiError::Route(ExternalError::Modeset(
+                        ModesetError::InvalidFramebuffer,
+                    ))),
+                };
+            }
+        };
+        match activate_hdmi(io, probe, fb) {
+            Ok(route) => {
+                let outcome = ServiceOutcome::Activated {
+                    port,
+                    protocol: MtlProtocol::Hdmi,
+                    mode: route.probe.mode,
+                    fb,
+                };
+                self.route = Some(MtlRoute::Hdmi(route));
+                outcome
+            }
+            Err((Err(probe), error)) => {
+                let _ = release_hdmi_probe(io, &probe);
+                ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Hdmi(error),
+                }
+            }
+            Err((Ok(route), error)) => {
+                self.settle_failed(io, MtlRoute::Hdmi(route), RouteError::Hdmi(error))
+            }
+        }
+    }
+
+    /// A failed activation: release a locally stopped route, retain
+    /// anything else.
+    fn settle_failed<M: MmioWindow + ?Sized>(
+        &mut self,
+        io: &M,
+        route: MtlRoute,
+        error: RouteError,
+    ) -> ServiceOutcome {
+        let port = route.port();
+        if !route.stopped() {
+            self.route = Some(route);
+            return ServiceOutcome::Retained { port, error };
+        }
+        match route.release(io) {
+            Ok(()) => ServiceOutcome::Refused { port, error },
+            Err((route, e)) => {
+                self.route = Some(route);
+                ServiceOutcome::Retained { port, error: e }
             }
         }
     }
@@ -893,63 +1264,92 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let port = event.pin.port();
-        let owns = self.route.as_ref().map(MtlExternalRoute::port) == Some(port);
+        let owned = self.route.as_ref().map(|r| (r.port(), r.protocol()));
+        let owns = owned.map(|(p, _)| p) == Some(port);
         match event.kind {
-            MtlHpdKind::Connected(crate::intel_gpu_xelpg_hpd::LiveMode::TbtAlt) => {
-                ServiceOutcome::Refused {
-                    port,
-                    error: ExternalError::Tc(TcError::TbtAltUnsupported),
-                }
+            MtlHpdKind::Connected(LiveMode::TbtAlt) => ServiceOutcome::Refused {
+                port,
+                error: RouteError::Dp(ExternalError::Tc(TcError::TbtAltUnsupported)),
+            },
+            MtlHpdKind::Connected(live) if self.route.is_none() => {
+                self.connect(io, port, live, alloc)
             }
-            MtlHpdKind::Connected(_) if self.route.is_none() => self.connect(io, port, alloc),
             MtlHpdKind::Connected(_) => ServiceOutcome::Unchanged,
             MtlHpdKind::Disconnected if owns => self.withdraw(io),
-            MtlHpdKind::ShortPulse if owns => {
-                let healthy = self.route.as_ref().map(|route| route.link_ok(io));
+            // HDMI has no IRQ_HPD (`intel_hdmi` installs no hpd_pulse).
+            MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::Dp)) => {
+                let healthy = match self.route.as_ref() {
+                    Some(MtlRoute::Dp(route)) => Some(route.link_ok(io)),
+                    _ => None,
+                };
                 match healthy {
                     Some(Ok(true)) => ServiceOutcome::Unchanged,
                     _ => self.retrain(io),
                 }
             }
-            MtlHpdKind::Redetect if owns => match self.withdraw(io) {
-                ServiceOutcome::Withdrawn { .. } => self.connect(io, port, alloc),
-                other => other,
-            },
+            MtlHpdKind::Redetect if owns => {
+                let live = self.live;
+                match self.withdraw(io) {
+                    ServiceOutcome::Withdrawn { .. } => self.connect(io, port, live, alloc),
+                    other => other,
+                }
+            }
             _ => ServiceOutcome::Unchanged,
         }
     }
 
-    /// Lost link on a live route: local stop, then a fresh activation on
-    /// the same probe and framebuffer.
+    /// Lost link on a live DP route: local stop, then a fresh activation
+    /// on the same probe and framebuffer.
     fn retrain<M: MmioWindow + ?Sized>(&mut self, io: &M) -> ServiceOutcome {
-        let Some(mut route) = self.route.take() else {
-            return ServiceOutcome::Unchanged;
+        let mut route = match self.route.take() {
+            Some(MtlRoute::Dp(route)) => route,
+            other => {
+                self.route = other;
+                return ServiceOutcome::Unchanged;
+            }
         };
         let port = route.port();
         if let Err(error) = route.stop(io) {
-            self.route = Some(route);
-            return ServiceOutcome::Retained { port, error };
+            self.route = Some(MtlRoute::Dp(route));
+            return ServiceOutcome::Retained {
+                port,
+                error: RouteError::Dp(error),
+            };
         }
         let fb = route.fb;
         match activate(io, route.probe.clone(), fb) {
             Ok(live) => {
                 let mode = live.probe.mode;
-                self.route = Some(live);
-                ServiceOutcome::Activated { port, mode, fb }
+                self.route = Some(MtlRoute::Dp(live));
+                ServiceOutcome::Activated {
+                    port,
+                    protocol: MtlProtocol::Dp,
+                    mode,
+                    fb,
+                }
             }
             Err(ActivateError::Refused(_, error)) => {
                 // The stopped route still owns TC/AUX; release it.
                 match route.release(io) {
-                    Ok(()) => ServiceOutcome::Refused { port, error },
+                    Ok(()) => ServiceOutcome::Refused {
+                        port,
+                        error: RouteError::Dp(error),
+                    },
                     Err((route, e)) => {
-                        self.route = Some(route);
-                        ServiceOutcome::Retained { port, error: e }
+                        self.route = Some(MtlRoute::Dp(route));
+                        ServiceOutcome::Retained {
+                            port,
+                            error: RouteError::Dp(e),
+                        }
                     }
                 }
             }
             Err(ActivateError::Failed(failed, error)) => {
-                self.route = Some(failed);
-                ServiceOutcome::Retained { port, error }
+                self.route = Some(MtlRoute::Dp(failed));
+                ServiceOutcome::Retained {
+                    port,
+                    error: RouteError::Dp(error),
+                }
             }
         }
     }
@@ -994,9 +1394,7 @@ pub(crate) fn pass_bracket<G, E, R>(
 /// Whether `service`'s route keeps display DC5/DC6 refused between passes:
 /// any route that is not locally stopped (live or quarantined).
 pub(crate) fn service_blocks_dc(service: &MtlExternalService) -> bool {
-    service
-        .route()
-        .is_some_and(|route| route.state() != RouteState::Stopped)
+    service.route().is_some_and(|route| !route.stopped())
 }
 
 /// The process-wide predicate registered with the DC service
@@ -1018,9 +1416,15 @@ pub fn handle_mtl_event<M: MmioWindow + ?Sized>(
 ) -> Option<ServiceOutcome> {
     let mut service = SERVICE.try_lock()?;
     let port = event.pin.port();
+    // A refused DC exit is protocol-neutral; it is reported through the
+    // DP route error that carries ExternalError::DisplayPower.
     Some(
-        with_dc_off(|| service.handle(io, event, alloc))
-            .unwrap_or_else(|error| ServiceOutcome::Refused { port, error }),
+        with_dc_off(|| service.handle(io, event, alloc)).unwrap_or_else(|error| {
+            ServiceOutcome::Refused {
+                port,
+                error: RouteError::Dp(error),
+            }
+        }),
     )
 }
 
@@ -1055,21 +1459,17 @@ pub fn service_mtl_external<M: MmioWindow + ?Sized>(
 /// hardware is off). A live or quarantined route, or a service pass in
 /// progress, reports `false`. Never touches registers.
 pub fn routes_stopped() -> bool {
-    SERVICE.try_lock().is_some_and(|service| {
-        service
-            .route()
-            .is_none_or(|r| r.state() == RouteState::Stopped)
-    })
+    SERVICE
+        .try_lock()
+        .is_some_and(|service| service.route().is_none_or(MtlRoute::stopped))
 }
 
 /// Whether the process-wide MTL route is currently live (scanning out).
 /// The DC-state owner must refuse DC entry while this is true.
 pub fn route_live() -> bool {
-    SERVICE.try_lock().is_none_or(|service| {
-        service
-            .route()
-            .is_some_and(|r| r.state() == RouteState::Live)
-    })
+    SERVICE
+        .try_lock()
+        .is_none_or(|service| service.route().is_some_and(MtlRoute::live))
 }
 
 /// Process-wide reset/suspend teardown: stop/release the route, then

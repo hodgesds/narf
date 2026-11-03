@@ -977,6 +977,7 @@ pub mod tests {
         segment: usize,
         scdc: [u8; 256],
         scdc_present: bool,
+        answer_pin: Option<u32>,
         wedge: bool,
         stall: bool,
         writes: Vec<(u64, u32)>,
@@ -1000,6 +1001,7 @@ pub mod tests {
                 segment: 0,
                 scdc: [0u8; 256],
                 scdc_present: true,
+                answer_pin: None,
                 wedge: false,
                 stall: false,
                 writes: Vec::new(),
@@ -1078,12 +1080,14 @@ pub mod tests {
             // A data program.
             let addr = ((val >> 1) & 0x7F) as u8;
             let read = val & GMBUS1_DIR_READ != 0;
-            let present = match addr {
-                DDC_SLAVE_EDID => self.edid_present,
-                DDC_SLAVE_SEGMENT => true,
-                SCDC_ADDR => self.scdc_present,
-                _ => false,
-            };
+            let wired = self.answer_pin.is_none_or(|pin| self.gmbus0 & 0x3F == pin);
+            let present = wired
+                && match addr {
+                    DDC_SLAVE_EDID => self.edid_present,
+                    DDC_SLAVE_SEGMENT => true,
+                    SCDC_ADDR => self.scdc_present,
+                    _ => false,
+                };
             if !present {
                 self.sink.clear();
                 self.phase = Phase::Nak;
@@ -1211,16 +1215,56 @@ pub mod tests {
         state: RefCell<FakeState>,
     }
 
+    impl Default for FakeGmbus {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl FakeGmbus {
-        fn new() -> Self {
+        /// The default device image: EDID and SCDC slaves present.
+        pub fn new() -> Self {
             Self {
                 state: RefCell::new(FakeState::new()),
             }
         }
-        fn writes(&self) -> Vec<(u64, u32)> {
+        /// A bus whose EDID slave serves `edid` (zero-padded to 512).
+        pub fn with_edid(edid: &[u8]) -> Self {
+            let fake = Self::new();
+            {
+                let mut st = fake.state.borrow_mut();
+                st.edid = [0u8; 512];
+                let n = edid.len().min(512);
+                st.edid[..n].copy_from_slice(&edid[..n]);
+            }
+            fake
+        }
+        /// A bus with no slave behind any pin (every address NAKs).
+        pub fn absent() -> Self {
+            let fake = Self::new();
+            fake.set_edid_present(false);
+            fake.set_scdc_present(false);
+            fake
+        }
+        /// Only answer on this GMBUS0 pin number (the bits below
+        /// `GMBUS_BYTE_CNT_OVERRIDE`); any other pin NAKs.
+        pub fn set_pin(&self, pin: u32) {
+            self.state.borrow_mut().answer_pin = Some(pin);
+        }
+        /// Whether the SCDC slave (0x54) answers.
+        pub fn set_scdc_present(&self, present: bool) {
+            self.state.borrow_mut().scdc_present = present;
+        }
+        /// Preload one SCDC register.
+        pub fn set_scdc(&self, reg: u8, value: u8) {
+            self.state.borrow_mut().scdc[reg as usize] = value;
+        }
+        /// Every recorded GMBUS register write.
+        pub fn writes(&self) -> Vec<(u64, u32)> {
             self.state.borrow().writes.clone()
         }
-        fn writes_to(&self, off: u64) -> Vec<u32> {
+        /// Recorded writes to one GMBUS register.
+        pub fn writes_to(&self, off: u64) -> Vec<u32> {
             self.state
                 .borrow()
                 .writes
@@ -1232,10 +1276,12 @@ pub mod tests {
         fn gmbus3_reads(&self) -> usize {
             self.state.borrow().gmbus3_reads
         }
-        fn scdc_at(&self, reg: u8) -> u8 {
+        /// One SCDC register's current value.
+        pub fn scdc_at(&self, reg: u8) -> u8 {
             self.state.borrow().scdc[reg as usize]
         }
-        fn set_edid_present(&self, present: bool) {
+        /// Whether the EDID slave (0x50) answers.
+        pub fn set_edid_present(&self, present: bool) {
             self.state.borrow_mut().edid_present = present;
         }
         fn set_wedge(&self, wedge: bool) {

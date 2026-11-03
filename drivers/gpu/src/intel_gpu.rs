@@ -3255,4 +3255,76 @@ pub mod tests {
         "drivers/gpu/intel_gpu",
         smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws
     );
+
+    fn smoke_mtl_external_hook_pass_publishes_and_retires_hdmi_route() -> TestResult {
+        // The process-wide service under the no-VBT policy picks HDMI on
+        // DDI B when no DPCD answers; the hook publishes it like a DP
+        // route, and the suspend/reset teardown retires it.
+        extern crate alloc;
+        use crate::intel_gpu_aux::MmioWindow as _;
+        use crate::intel_gpu_xelpg_external::tests::{edid_for, hdmi_on_ddi_b};
+        use alloc::vec::Vec;
+        const BAR: u64 = 0xF00D_1000_0000;
+        let io = hdmi_on_ddi_b(edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6));
+        if !crate::intel_gpu_xelpg_external::teardown_mtl_external(&io, Generation::MeteorLake)
+            || MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("HDMI hook test needs fresh MTL owners");
+        }
+        let mut published: Vec<MtlPublication> = Vec::new();
+        let mut alloc = |size: u64| {
+            Some(ScanoutAllocation {
+                gtt_offset: 0x100_0000,
+                phys_base: 0x7_1000_0000,
+                order: 10,
+                size_bytes: size,
+            })
+        };
+        let handled = mtl_external_pass(
+            &io,
+            Generation::MeteorLake,
+            BAR,
+            &mut || {},
+            &mut alloc,
+            &mut |p| published.push(p),
+        );
+        let serial = match published.as_slice() {
+            [MtlPublication::Publish(fb, serial)]
+                if fb.addr == 0x7_1000_0000 && fb.width == 1024 && fb.height == 768 =>
+            {
+                *serial
+            }
+            _ => return TestResult::Fail("HDMI activation must publish exactly one image"),
+        };
+        if !handled
+            || !crate::intel_gpu_xelpg_external::route_live()
+            || MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) != serial
+        {
+            return TestResult::Fail("HDMI route must be live and published");
+        }
+        // Suspend/GT-reset retirement: the route stops and releases, so the
+        // publication the glue withdraws is exactly this serial.
+        let torn =
+            crate::intel_gpu_xelpg_external::teardown_mtl_external(&io, Generation::MeteorLake);
+        let withdrawn = !crate::intel_gpu_xelpg_external::route_live()
+            && MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel) == serial;
+        {
+            let mut slot = MTL_SCANOUT.lock();
+            if slot.is_some_and(|(owner, _)| owner == BAR) {
+                *slot = None;
+            }
+        }
+        if !torn
+            || !withdrawn
+            || !crate::intel_gpu_xelpg_external::routes_stopped()
+            || io.read32(crate::intel_gpu_xelpg::XeLpgPort::B.ddi_buf_ctl()) & (1 << 31) != 0
+        {
+            return TestResult::Fail("teardown must stop DDI B and leave the serial withdrawable");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_mtl_external_hook_pass_publishes_and_retires_hdmi_route
+    );
 }

@@ -6,13 +6,14 @@ use crate::intel_gpu_aux::{
     AUX_CTL_DONE, AUX_CTL_MSGSIZE_MASK, AUX_CTL_MSGSIZE_SHIFT, AUX_CTL_SEND_BUSY, AUX_CTL_TBT_IO,
     XELPDP_AUX_CH_CTL_POWER_REQUEST,
 };
+use crate::intel_gpu_gmbus::tests::FakeGmbus;
 use crate::intel_gpu_modeset::PixelFormat;
 use crate::intel_gpu_xelpg::tests::FakePhy;
 use crate::intel_gpu_xelpg::{TCSS_POWER_REQUEST, TC_PHY_OWNERSHIP};
 use crate::intel_gpu_xelpg_hpd::{
-    pica_dp_alt_hotplug, pica_tbt_hotplug, port_hotplug_ctl, LiveMode, MtlHpdConfig, MtlHpdMonitor,
-    DP_ALT_HPD_LONG_DETECT, PICA_IIR, PICA_ISR, SDE_IIR, SDE_ISR, SHOTPLUG_CTL_DDI,
-    SHOTPLUG_CTL_TC,
+    pica_dp_alt_hotplug, pica_tbt_hotplug, port_hotplug_ctl, shotplug_ddi_long, LiveMode,
+    MtlHpdConfig, MtlHpdMonitor, DP_ALT_HPD_LONG_DETECT, PICA_IIR, PICA_ISR, SDE_IIR, SDE_ISR,
+    SHOTPLUG_CTL_DDI, SHOTPLUG_CTL_TC,
 };
 use crate::intel_gpu_xelpg_tc::{
     pin_assignment_shift, port_tx_dflexpa1, tcss_ddi_status, PIN_ASSIGNMENT_C,
@@ -245,6 +246,13 @@ pub struct ExtFake {
     aux_power: Cell<bool>,
     pub aux_ctl_writes: RefCell<Vec<u32>>,
     pub writes: RefCell<Vec<(u64, u32)>>,
+    /// The DDC side (GMBUS controller + EDID/SCDC slaves); absent by default.
+    pub ddc: FakeGmbus,
+}
+
+/// Whether `off` is one of the GMBUS0..GMBUS5 registers.
+fn is_gmbus(off: u64) -> bool {
+    (crate::intel_gpu_gmbus::GMBUS0..=crate::intel_gpu_gmbus::GMBUS5).contains(&off)
 }
 
 impl ExtFake {
@@ -274,6 +282,7 @@ impl ExtFake {
             aux_power: Cell::new(false),
             aux_ctl_writes: RefCell::new(Vec::new()),
             writes: RefCell::new(Vec::new()),
+            ddc: FakeGmbus::absent(),
         }
     }
     pub fn writes_to(&self, off: u64) -> Vec<u32> {
@@ -350,6 +359,9 @@ impl MmioWindow for ExtFake {
                 0
             };
         }
+        if is_gmbus(off) {
+            return self.ddc.read32(off);
+        }
         if off == PICA_ISR {
             return self.pica_isr.get();
         }
@@ -394,6 +406,10 @@ impl MmioWindow for ExtFake {
             return;
         }
         self.writes.borrow_mut().push((off, value));
+        if is_gmbus(off) {
+            self.ddc.write32(off, value);
+            return;
+        }
         let mask = self.w1c(off);
         if mask != 0 {
             let old = self.phy.read32(off);
@@ -713,7 +729,7 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
     };
     match service.handle(&NoAccess, event, &mut fb_for) {
         ServiceOutcome::Refused {
-            error: ExternalError::Tc(TcError::TbtAltUnsupported),
+            error: RouteError::Dp(ExternalError::Tc(TcError::TbtAltUnsupported)),
             ..
         } => {}
         _ => return TestResult::Fail("TBT connect event must be refused without MMIO"),
@@ -849,7 +865,7 @@ fn smoke_mtl_external_service_hotplug_lifecycle() -> TestResult {
             if !matches!(
                 service.handle(&io, event, &mut fb_for),
                 ServiceOutcome::Activated { .. }
-            ) || service.route().map(MtlExternalRoute::state) != Some(RouteState::Live)
+            ) || service.route().map(MtlRoute::live) != Some(true)
             {
                 return TestResult::Fail("lost link must retrain to a live route");
             }
@@ -1069,7 +1085,9 @@ fn smoke_mtl_external_dc_off_join_brackets_passes_and_blocks_dc6_while_live() ->
     if !matches!(
         pass_bracket(pass(40 * MS), || service.handle(&io, event, &mut fb_for)),
         Ok(ServiceOutcome::Retained { .. })
-    ) || service.route().map(MtlExternalRoute::state) != Some(RouteState::Quarantined)
+    ) || !service
+        .route()
+        .is_some_and(|route| !route.live() && !route.stopped())
     {
         return TestResult::Fail("an unobserved stop must quarantine the route");
     }
@@ -1117,4 +1135,366 @@ fn smoke_mtl_external_dc_off_join_brackets_passes_and_blocks_dc6_while_live() ->
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dc_off_join_brackets_passes_and_blocks_dc6_while_live
+);
+
+// ── DP/HDMI selection (item: HDMI in the hotplug service) ───────────
+
+/// DDI B with no DPCD (every AUX request NACKs) and an HDMI sink on DDC
+/// pin 2 (`gmbus_pins_mtp` "dpb").
+pub fn hdmi_on_ddi_b(edid: Vec<u8>) -> ExtFake {
+    let mut sink = Sink::new(0x14, Vec::new());
+    sink.nack_all = true;
+    let mut io = ExtFake::new(XeLpgPort::B, sink);
+    io.ddc = FakeGmbus::with_edid(&edid);
+    io.ddc.set_pin(2);
+    io
+}
+
+fn ddi_b_event(kind: MtlHpdKind) -> MtlHpdEvent {
+    MtlHpdEvent {
+        pin: MtlHpdPin::DdiB,
+        kind,
+    }
+}
+
+fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
+    use LiveMode::{DpAlt, Legacy, Native, TbtAlt};
+    let p = MtlPortPolicy::NO_VBT;
+    let cases = [
+        (
+            XeLpgPort::B,
+            p.decl(XeLpgPort::B),
+            Native,
+            RoutePlan::DpThenHdmi,
+        ),
+        (XeLpgPort::Tc1, p.decl(XeLpgPort::Tc1), DpAlt, RoutePlan::Dp),
+        // No legacy Type-C port is declared without a VBT.
+        (
+            XeLpgPort::Tc2,
+            p.decl(XeLpgPort::Tc2),
+            Legacy,
+            RoutePlan::Refuse,
+        ),
+        (
+            XeLpgPort::Tc3,
+            p.decl(XeLpgPort::Tc3),
+            TbtAlt,
+            RoutePlan::Refuse,
+        ),
+        (
+            XeLpgPort::A,
+            p.decl(XeLpgPort::A),
+            Native,
+            RoutePlan::Refuse,
+        ),
+        // A declared legacy HDMI connector: HDMI only, never over DP-alt.
+        (
+            XeLpgPort::Tc4,
+            MtlPortDecl::LEGACY_HDMI,
+            Legacy,
+            RoutePlan::Hdmi,
+        ),
+        (
+            XeLpgPort::Tc4,
+            MtlPortDecl::LEGACY_HDMI,
+            DpAlt,
+            RoutePlan::Refuse,
+        ),
+        (
+            XeLpgPort::Tc1,
+            MtlPortDecl {
+                dp: true,
+                hdmi: true,
+                legacy: true,
+            },
+            Legacy,
+            RoutePlan::DpThenHdmi,
+        ),
+        // DP + HDMI declared on a USB-C port: DP-alt carries DP only.
+        (
+            XeLpgPort::Tc1,
+            MtlPortDecl::COMBO_DP_HDMI,
+            DpAlt,
+            RoutePlan::Dp,
+        ),
+        // A DP-only DDI B never tries HDMI.
+        (XeLpgPort::B, MtlPortDecl::USB_C, Native, RoutePlan::Dp),
+    ];
+    for (port, decl, live, want) in cases {
+        if route_plan(port, decl, live) != want {
+            return TestResult::Fail("route plan differs from the declared policy");
+        }
+    }
+    // intel_ddi_init: non-legacy + HDMI without DP is legacy.
+    let hdmi_only = MtlPortDecl {
+        dp: false,
+        hdmi: true,
+        legacy: false,
+    };
+    if !hdmi_only.legacy_effective() || MtlPortDecl::COMBO_DP_HDMI.legacy_effective() {
+        return TestResult::Fail("effective legacy flag must follow intel_ddi_init");
+    }
+    // The process-wide service and hotplug owner agree on legacy pins.
+    if MtlPortPolicy::NO_VBT.hpd_config() != MtlHpdConfig::TYPE_C
+        || MtlExternalService::new().policy() != MtlPortPolicy::NO_VBT
+    {
+        return TestResult::Fail("no-VBT policy must match the TYPE_C hotplug config");
+    }
+    let mut legacy = MtlPortPolicy::NO_VBT;
+    legacy.tc[2] = MtlPortDecl::LEGACY_HDMI;
+    if legacy.hpd_config().legacy_tc != [false, false, true, false] {
+        return TestResult::Fail("a legacy declaration must own its SDE TC source");
+    }
+    // Only a DPCD that never answered lets HDMI be tried.
+    if !dpcd_absent(&ExternalError::Link(LinkError::AuxFailure(
+        crate::dp_aux::AuxError::Nacked,
+    ))) || dpcd_absent(&ExternalError::Edid(EdidReadError::Aux(
+        crate::dp_aux::AuxError::Nacked,
+    ))) || dpcd_absent(&ExternalError::OverBudget {
+        demand_kbps: 2,
+        payload_kbps: 1,
+    }) || dpcd_absent(&ExternalError::Tc(TcError::PhyNotReady))
+    {
+        return TestResult::Fail("HDMI fallback must need an absent DPCD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_route_plan_policy_decisions
+);
+
+fn smoke_mtl_external_service_ddi_b_hdmi_lifecycle() -> TestResult {
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+    let mut service = MtlExternalService::new();
+    let event = match monitor.poll(&io) {
+        Some(event) if event == ddi_b_event(MtlHpdKind::Connected(LiveMode::Native)) => event,
+        _ => return TestResult::Fail("live DDI B sink must be detected"),
+    };
+    match service.handle(&io, event, &mut fb_for) {
+        ServiceOutcome::Activated {
+            port: XeLpgPort::B,
+            protocol: MtlProtocol::Hdmi,
+            mode,
+            ..
+        } if mode.h_active == 1024 => {}
+        _ => return TestResult::Fail("DDI B without DPCD must light the HDMI route"),
+    }
+    // The DP attempt released its AUX power; HDMI owns pipe A on DDI B.
+    let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false);
+    if io.aux_power.get()
+        || io.read32(TRANS_DDI_FUNC_CTL_A) != func
+        || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE == 0
+        || service.route().map(MtlRoute::protocol) != Some(MtlProtocol::Hdmi)
+        || service.route().map(MtlRoute::live) != Some(true)
+        || !io.writes_to(DP_TP_CTL_A).is_empty()
+    {
+        return TestResult::Fail("HDMI route must own DDI B in TMDS mode without DP state");
+    }
+    // HDMI has no IRQ_HPD; a short pulse changes nothing.
+    if !matches!(
+        service.handle(&io, ddi_b_event(MtlHpdKind::ShortPulse), &mut fb_for),
+        ServiceOutcome::Unchanged
+    ) || service.route().map(MtlRoute::live) != Some(true)
+    {
+        return TestResult::Fail("short pulse must not disturb an HDMI route");
+    }
+    // A long pulse that stays connected re-runs detection: stop, release,
+    // and the same HDMI decision again.
+    match service.handle(&io, ddi_b_event(MtlHpdKind::Redetect), &mut fb_for) {
+        ServiceOutcome::Activated {
+            protocol: MtlProtocol::Hdmi,
+            ..
+        } => {}
+        _ => return TestResult::Fail("redetect must re-light the HDMI route"),
+    }
+    // Unplug: long pulse with the level low withdraws the route.
+    io.sde_isr.set(0);
+    io.phy.write32(
+        SHOTPLUG_CTL_DDI,
+        io.phy.read32(SHOTPLUG_CTL_DDI) | shotplug_ddi_long(1),
+    );
+    match monitor.poll(&io) {
+        Some(event) if event.kind == MtlHpdKind::Disconnected => {
+            if !matches!(
+                service.handle(&io, event, &mut fb_for),
+                ServiceOutcome::Withdrawn { port: XeLpgPort::B }
+            ) {
+                return TestResult::Fail("disconnect must withdraw the HDMI route");
+            }
+        }
+        _ => return TestResult::Fail("DDI B unplug must be reported"),
+    }
+    if service.route().is_some()
+        || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+        || io.read32(PIPECONF_A) & (ENABLE | STATE) != 0
+        || io.read32(XeLpgPort::B.port_clock_ctl()) & 0xCC00_0000 != 0
+    {
+        return TestResult::Fail("withdrawn HDMI route must leave DDI, pipe and PLL off");
+    }
+    if !service.teardown(&io) || !monitor.teardown(&io) {
+        return TestResult::Fail("teardown after withdrawal must be complete");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_service_ddi_b_hdmi_lifecycle
+);
+
+fn smoke_mtl_external_service_dp_precedence_and_hdmi_refusals() -> TestResult {
+    let connect = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    // A DPCD that answers wins even when DDC would answer too.
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid_1024()));
+    io.ddc.set_edid_present(true);
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Activated {
+            protocol: MtlProtocol::Dp,
+            ..
+        }
+    ) || !io.ddc.writes().is_empty()
+    {
+        return TestResult::Fail("answering DPCD must take DP without touching DDC");
+    }
+    if !service.teardown(&io) {
+        return TestResult::Fail("DP route teardown must complete");
+    }
+    // DPCD answered but its EDID is unreadable: a DP refusal, no HDMI.
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, Vec::new()));
+    io.ddc.set_edid_present(true);
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Dp(ExternalError::Edid(_)),
+            ..
+        }
+    ) || !io.ddc.writes().is_empty()
+    {
+        return TestResult::Fail("a DP sink failure must not fall back to HDMI");
+    }
+    // No DPCD and no DDC slave: an HDMI DDC refusal, nothing owned.
+    let mut io = hdmi_on_ddi_b(edid_1024());
+    io.ddc = FakeGmbus::absent();
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Hdmi(HdmiError::Ddc(_)),
+            ..
+        }
+    ) || service.route().is_some()
+        || io.aux_power.get()
+        || !io.writes_to(XeLpgPort::B.ddi_buf_ctl()).is_empty()
+    {
+        return TestResult::Fail("silent DDC must refuse HDMI before programming");
+    }
+    // A DP-only declaration never reaches DDC.
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut dp_only = MtlPortPolicy::NO_VBT;
+    dp_only.ddi_b = MtlPortDecl::USB_C;
+    let mut service = MtlExternalService::with_policy(dp_only);
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Dp(ExternalError::Link(_)),
+            ..
+        }
+    ) || !io.ddc.writes().is_empty()
+    {
+        return TestResult::Fail("DP-only DDI B must refuse without DDC traffic");
+    }
+    // An HDMI clock without a source table refuses after the probe.
+    let io = hdmi_on_ddi_b(edid_for(123_450, 1024, 320, 24, 136, 768, 38, 3, 6));
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Refused {
+            error: RouteError::Hdmi(HdmiError::UnsupportedClock(123_450)),
+            ..
+        }
+    ) || service.route().is_some()
+    {
+        return TestResult::Fail("untabled TMDS clock must refuse with its clock");
+    }
+    // No scanout memory: refused, nothing owned.
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut service = MtlExternalService::new();
+    if !matches!(
+        service.handle(&io, connect, &mut |_| None),
+        ServiceOutcome::Refused {
+            error: RouteError::Hdmi(HdmiError::Route(ExternalError::Modeset(
+                ModesetError::InvalidFramebuffer
+            ))),
+            ..
+        }
+    ) || service.route().is_some()
+    {
+        return TestResult::Fail("missing scanout must refuse the HDMI route");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_service_dp_precedence_and_hdmi_refusals
+);
+
+fn smoke_mtl_external_service_hdmi_unplug_mid_redetect_and_failed_stop() -> TestResult {
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut service = MtlExternalService::new();
+    let connect = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Activated { .. }
+    ) {
+        return TestResult::Fail("HDMI route must light");
+    }
+    // The sink leaves between the long pulse and re-detection: the route
+    // is stopped and released, the reconnect finds neither DPCD nor DDC.
+    io.ddc.set_edid_present(false);
+    match service.handle(&io, ddi_b_event(MtlHpdKind::Redetect), &mut fb_for) {
+        ServiceOutcome::Refused {
+            port: XeLpgPort::B,
+            error: RouteError::Hdmi(HdmiError::Ddc(_)),
+        } => {}
+        _ => return TestResult::Fail("vanished sink must refuse after a clean withdrawal"),
+    }
+    if service.route().is_some() || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+    {
+        return TestResult::Fail("re-detection loss must leave nothing owned");
+    }
+    // A live HDMI route whose transcoder never stops: teardown reports the
+    // retention and the route stays quarantined (neither live nor stopped).
+    io.ddc.set_edid_present(true);
+    if !matches!(
+        service.handle(&io, connect, &mut fb_for),
+        ServiceOutcome::Activated { .. }
+    ) {
+        return TestResult::Fail("HDMI route must relight");
+    }
+    io.pipeconf_stuck.set(true);
+    if service.teardown(&io)
+        || service
+            .route()
+            .is_none_or(|r| r.live() || r.stopped() || r.protocol() != MtlProtocol::Hdmi)
+    {
+        return TestResult::Fail("unobserved HDMI stop must be retained, not released");
+    }
+    if !matches!(
+        service.handle(&io, ddi_b_event(MtlHpdKind::Disconnected), &mut fb_for),
+        ServiceOutcome::Retained {
+            error: RouteError::Hdmi(HdmiError::Route(ExternalError::Quarantined)),
+            ..
+        }
+    ) {
+        return TestResult::Fail("a quarantined HDMI route must stay retained on unplug");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_service_hdmi_unplug_mid_redetect_and_failed_stop
 );

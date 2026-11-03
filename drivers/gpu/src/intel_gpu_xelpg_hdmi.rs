@@ -22,6 +22,15 @@
 //!   `intel_ddi_buf_disable`, transcoder clock off, PLL off).
 //! - `intel_hdmi.c::icl_encoder_to_ddc_pin` / `intel_gmbus.c`
 //!   `gmbus_pins_mtp`: DDI B's DDC is GMBUS pin 2 ("dpb").
+//! - `drm_edid.c::drm_do_probe_ddc_edid` over `intel_gmbus.c::gmbus_xfer`:
+//!   each EDID block is an offset write + read at slave 0x50, an
+//!   INDEX-cycle transfer on the shared GMBUS transport
+//!   ([`crate::intel_gpu_gmbus::GmbusBus`]); see [`read_edid_ddc`].
+//!
+//! [`probe_hdmi`] owns a legacy Type-C PHY in legacy mode before its DDC
+//! is used (rolled back on any failure), and the hotplug service
+//! ([`crate::intel_gpu_xelpg_external::MtlExternalService`]) selects this
+//! route per its port policy.
 //!
 //! ## Qualified profile and refusals
 //!
@@ -44,7 +53,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_gmbus::PinPair;
+use crate::intel_gpu_gmbus::{GmbusBus, PinPair, DDC_SLAVE_EDID};
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_modeset_xelpg::{
     acknowledged_cdclk, mtl_cdclk_for_pixel_clock, program_cdclk_floor, XeLpgModeset,
@@ -203,6 +212,29 @@ pub struct MtlHdmiProbe {
     pub edid_len: usize,
 }
 
+/// Read the sink's EDID over DDC the way `drm_do_probe_ddc_edid` does:
+/// each 128-byte block is an offset write followed by a read at slave 0x50,
+/// which `intel_gmbus.c::gmbus_xfer` runs as one INDEX-cycle transfer
+/// ([`GmbusBus::read_indexed`]). Only E-DDC segment 0 (base block plus
+/// the first extension) is read: a segment-pointer write must reach the
+/// read across a repeated START, which the one-transfer-per-call GMBUS
+/// transport cannot express, so later extensions are not fetched.
+pub fn read_edid_ddc<M: MmioWindow + ?Sized>(
+    io: &M,
+    pin: PinPair,
+) -> Result<([u8; crate::intel_gpu_hdmi::EDID_CAPACITY], usize), HdmiError> {
+    let bus = GmbusBus::new(io, pin);
+    let mut edid = [0u8; crate::intel_gpu_hdmi::EDID_CAPACITY];
+    bus.read_indexed(DDC_SLAVE_EDID, 0, &mut edid[..128])
+        .map_err(|e| HdmiError::Ddc(e.into()))?;
+    let blocks = 1 + (edid[126] as usize).min(1);
+    if blocks == 2 {
+        bus.read_indexed(DDC_SLAVE_EDID, 128, &mut edid[128..256])
+            .map_err(|e| HdmiError::Ddc(e.into()))?;
+    }
+    Ok((edid, blocks * 128))
+}
+
 /// Probe an HDMI sink: Type-C legacy connect (TC only), DDC EDID,
 /// preferred mode and its TMDS PLL request. Refusals precede MMIO where
 /// possible; a Type-C connection is rolled back on failure.
@@ -218,25 +250,55 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     if port == XeLpgPort::A {
         return Err(ExternalError::UnsupportedPort.into());
     }
-    if port.tc_index().is_some() && !legacy_port {
+    let type_c = port.tc_index().is_some();
+    if type_c && !legacy_port {
         return Err(HdmiError::NotLegacy);
     }
     let pin = ddc_pin(port).ok_or(HdmiError::DdcUnavailable)?;
-    let (edid, edid_len) = crate::intel_gpu_hdmi::read_edid(io, pin).map_err(HdmiError::Ddc)?;
-    let mode =
-        crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len]).map_err(|_| HdmiError::Edid)?;
-    let pll = hdmi_pll_request(port, mode.pixel_clock_khz, false)?;
+    // A legacy Type-C port is owned in legacy mode before its DDC is used,
+    // as the DP probe owns the PHY before AUX.
+    let tc = if type_c {
+        let conn = tc_connect(io, port, true, HDMI_LANES)?;
+        if conn.mode != TcMode::Legacy {
+            let _ = tc_disconnect(io, &conn);
+            return Err(HdmiError::NotLegacy);
+        }
+        Some(conn)
+    } else {
+        None
+    };
+    let rollback = |e: HdmiError| {
+        if let Some(conn) = tc {
+            let _ = tc_disconnect(io, &conn);
+        }
+        e
+    };
+    let (edid, edid_len) = read_edid_ddc(io, pin).map_err(rollback)?;
+    let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
+        .map_err(|_| rollback(HdmiError::Edid))?;
+    let pll = hdmi_pll_request(port, mode.pixel_clock_khz, type_c).map_err(rollback)?;
     if !io.display_access_ok() {
-        return Err(ExternalError::AccessLost.into());
+        return Err(rollback(ExternalError::AccessLost.into()));
     }
     Ok(MtlHdmiProbe {
         port,
-        tc: None,
+        tc,
         mode,
         pll,
         edid,
         edid_len,
     })
+}
+
+/// Release a probe's Type-C ownership (DDI B owns nothing).
+pub fn release_hdmi_probe<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlHdmiProbe,
+) -> Result<(), HdmiError> {
+    match probe.tc {
+        Some(conn) => tc_disconnect(io, &conn).map_err(HdmiError::from),
+        None => Ok(()),
+    }
 }
 
 /// Connect a declared legacy Type-C port for HDMI and resolve its PLL
@@ -495,6 +557,11 @@ impl MtlHdmiRoute {
     /// Lifecycle state.
     pub fn state(&self) -> HdmiRouteState {
         self.state
+    }
+
+    /// The external port.
+    pub fn port(&self) -> XeLpgPort {
+        self.probe.port
     }
 
     /// Locally stop; a failed stop quarantines the route.
