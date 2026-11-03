@@ -15,7 +15,10 @@
 //! A lit pipe's plane registers are double buffered and armed by
 //! `PLANE_SURF` / `CURBASE` (`icl_plane_update_arm`,
 //! `i9xx_cursor_update_arm`); writes happen after
-//! `intel_vblank.c::intel_vblank_evade` (100 us before vblank start).
+//! `intel_vblank.c::intel_vblank_evade` (100 us before vblank start) with
+//! local interrupts masked from the last scanline sample through the arm
+//! writes (`intel_crtc.c::intel_pipe_update_start` / `_end`,
+//! [`evade_then`]).
 //!
 //! Refused with typed errors, before any write: a lit pipe whose
 //! configuration changes (Linux needs a modeset of that pipe), an unknown
@@ -209,8 +212,8 @@ fn cursor_on(io: &(impl MmioWindow + ?Sized), pipe: usize) -> Result<bool, Resou
 }
 
 /// Lit pipes stay lit, every other pipe is completely off, and no DSB or
-/// FBC can race the update.
-fn check_pipes(io: &(impl MmioWindow + ?Sized), live: u8) -> Result<(), ResourceError> {
+/// FBC can race the update. Read-only; also the Pipe B–D owner's admission.
+pub(crate) fn check_pipes(io: &(impl MmioWindow + ?Sized), live: u8) -> Result<(), ResourceError> {
     for pipe in 0..PIPES {
         let conf = read(io, pipe_reg(CONF, pipe))? & 0xc000_0000;
         if live & (1 << pipe) != 0 {
@@ -241,35 +244,60 @@ fn check_pipes(io: &(impl MmioWindow + ?Sized), live: u8) -> Result<(), Resource
     Ok(())
 }
 
-/// `intel_vblank_evade`: leave the window [vblank_start - 100 us,
+/// `intel_pipe_update_start` .. `intel_pipe_update_end` around `critical`
+/// (the arm writes) on `pipe`, whose timing is `req`.
+///
+/// `intel_vblank_evade` leaves the window [vblank_start - 100 us,
 /// vblank_start - 1]. The scanline is `PIPEDSL + 1` (DP); the window is
-/// widened by one line to cover HDMI's extra offset. Like Linux, a 1 ms
-/// timeout proceeds rather than failing.
-fn evade(
+/// widened by one line to cover HDMI's extra offset. Local interrupts are
+/// masked with [`narf_lib::sync::without_interrupts`] from the scanline
+/// sample that leaves the window through `critical`, as Linux holds
+/// `local_irq_disable()` from `intel_pipe_update_start` to
+/// `intel_pipe_update_end`; like `intel_vblank_evade` they are unmasked
+/// only while waiting inside the window. Like Linux, a 1 ms timeout
+/// proceeds (masked) rather than failing.
+pub(crate) fn evade_then<R>(
     io: &(impl MmioWindow + ?Sized),
     pipe: usize,
     req: &PipeRequest,
-) -> Result<(), ResourceError> {
+    critical: impl FnOnce() -> R,
+) -> Result<R, ResourceError> {
     let vtotal = u32::from(req.vtotal);
     let vblank_start = u32::from(req.vdisplay);
     let lines =
         (EVASION_US * u64::from(req.pixel_rate_khz)).div_ceil(1000 * u64::from(req.htotal)) as u32;
     let min = vblank_start.saturating_sub(lines + 1);
     let max = vblank_start - 1;
-    let mut lost = false;
-    narf_scheduler::responsive_spin_until(
-        || {
+    let outside = |dsl: u32| {
+        let line = ((dsl & PIPEDSL_LINE_MASK) + 1) % vtotal;
+        line < min || line > max
+    };
+    let deadline = narf_time::Deadline::after_ms(1);
+    let mut critical = Some(critical);
+    loop {
+        let sampled = narf_lib::sync::without_interrupts(|| {
             let dsl = io.read32(pipe_reg(PIPEDSL, pipe));
-            lost = dsl == u32::MAX || !io.display_access_ok();
-            let line = ((dsl & PIPEDSL_LINE_MASK) + 1) % vtotal;
-            lost || line < min || line > max
-        },
-        narf_time::Deadline::after_ms(1),
-    );
-    if lost {
-        Err(ResourceError::NoDevice)
-    } else {
-        Ok(())
+            if dsl == u32::MAX || !io.display_access_ok() {
+                return Err(ResourceError::NoDevice);
+            }
+            if outside(dsl) || deadline.expired() {
+                Ok(critical.take().map(|f| f()))
+            } else {
+                Ok(None)
+            }
+        })?;
+        if let Some(out) = sampled {
+            return Ok(out);
+        }
+        // Inside the window: wait unmasked (Linux's schedule_timeout with
+        // local interrupts enabled), then sample again, masked.
+        narf_scheduler::responsive_spin_until(
+            || {
+                let dsl = io.read32(pipe_reg(PIPEDSL, pipe));
+                dsl == u32::MAX || !io.display_access_ok() || outside(dsl)
+            },
+            deadline,
+        );
     }
 }
 
@@ -296,14 +324,16 @@ fn update_pipe(
     }
     let base = pipe_reg(CURBASE, pipe);
     arms.push((base, read(io, base)?));
-    evade(io, pipe, req)?;
-    let frame = read(io, pipe_reg(FRMCOUNT, pipe))?;
-    for &(r, v) in &image {
-        io.write32(r, v);
-    }
-    for &(r, v) in &arms {
-        io.write32(r, v);
-    }
+    let frame = evade_then(io, pipe, req, || {
+        let frame = read(io, pipe_reg(FRMCOUNT, pipe))?;
+        for &(r, v) in &image {
+            io.write32(r, v);
+        }
+        for &(r, v) in &arms {
+            io.write32(r, v);
+        }
+        Ok::<u32, ResourceError>(frame)
+    })??;
     for &(r, v) in &image {
         if read(io, r)? != v {
             return Err(ResourceError::Readback);

@@ -70,13 +70,16 @@
 //!
 //! Pipe DMC (`intel_dmc_enable_pipe` / `intel_dmc_disable_pipe`): every
 //! accepted pipe program is loaded with the main program, events
-//! disabled. A pipe owner reports its pipe lit ([`pipe_lit_for_bar`],
-//! after the pipe is enabled or adopted lit) and dark
-//! ([`pipe_dark_for_bar`], before it is disabled); the service enables
-//! `PIPEDMC_ENABLE_MTL(pipe)` for every lit pipe whose program is
-//! loaded, re-enables them after every (re)load, and clears its enables
-//! before the suspend-time program disable. KMS install reports the
-//! owned internal Pipe A lit.
+//! disabled. A pipe owner reports its pipe lit ([`pipe_lit_for_bar`])
+//! and dark ([`pipe_dark_for_bar`]) at Linux's crtc call sites through
+//! [`PipeDmc`]: lit as the first step of the pipe's enable (before its
+//! port PLL), dark as the last step of its disable (after the port PLL);
+//! the service enables `PIPEDMC_ENABLE_MTL(pipe)` for every lit pipe
+//! whose program is loaded, re-enables them after every (re)load, and
+//! clears its enables before the suspend-time program disable. KMS
+//! install reports the owned internal Pipe A lit when it adopts it; the
+//! MTL modeset reports Pipe A around its own disable/enable and the
+//! Pipe B–D owner reports each external pipe.
 //!
 //! Stricter than the pinned tree, and why: re-entry is refused (not
 //! merely warned about) with the utility pin in PWM mode, with a pipe
@@ -1082,6 +1085,52 @@ pub fn pipe_dark_for_bar(bar: &narf_bus::MmioRegion, pipe: u32) -> Result<(), Dc
     service.core.lock().pipe_dark(&service.window, pipe);
     drop(power);
     Ok(())
+}
+
+/// A pipe owner's per-pipe DMC lifetime, at Linux's call sites:
+/// [`PipeDmc::enable_pipe`] is the first step of a crtc enable
+/// (`hsw_crtc_enable` → `intel_dmc_enable_pipe`, before the port PLL) and
+/// [`PipeDmc::disable_pipe`] the last step of a crtc disable
+/// (`hsw_crtc_disable` → `intel_dmc_disable_pipe`, after the port PLL).
+/// Both are best effort: a refused DC exit never fails the pipe change.
+pub trait PipeDmc {
+    /// `intel_dmc_enable_pipe(pipe)`.
+    fn enable_pipe(&self, pipe: u32);
+    /// `intel_dmc_disable_pipe(pipe)`.
+    fn disable_pipe(&self, pipe: u32);
+}
+
+/// The production sink: the display-14 DC service of the probed display
+/// (one integrated display, so one service), through
+/// [`pipe_lit_for_bar`] / [`pipe_dark_for_bar`] with that service's BAR.
+/// Inert without a service, like [`acquire`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServicePipeDmc;
+
+impl PipeDmc for ServicePipeDmc {
+    fn enable_pipe(&self, pipe: u32) {
+        if let Some(service) = service() {
+            // Err: DC states could not be exited; the pipe is recorded
+            // and its DMC is enabled after the next program load.
+            let _ = pipe_lit_for_bar(&service.bar, pipe);
+        }
+    }
+    fn disable_pipe(&self, pipe: u32) {
+        if let Some(service) = service() {
+            // Err: the pipe is forgotten; a stale enable bit blocks DC
+            // re-entry as foreign until the hardware clears it.
+            let _ = pipe_dark_for_bar(&service.bar, pipe);
+        }
+    }
+}
+
+/// A sink that reports nowhere (no display-14 DC service is involved).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoPipeDmc;
+
+impl PipeDmc for NoPipeDmc {
+    fn enable_pipe(&self, _pipe: u32) {}
+    fn disable_pipe(&self, _pipe: u32) {}
 }
 
 fn schedule_arm(service: &Arc<DcService>) {

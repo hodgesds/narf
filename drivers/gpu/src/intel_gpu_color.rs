@@ -43,20 +43,33 @@ fn pipeline(io: &impl MmioWindow, primary_control: u32) -> bool {
 /// (skl_plane_check_fb/icl_plane_update_noarm), so no inherited Y-plane fetch.
 /// Every address belongs solely to Pipe A's primary or Pipe A color block.
 pub(crate) fn initialize_rgb_bypass<M: MmioWindow + ?Sized>(io: &M) -> Result<(), FsError> {
-    let plane = io.read32(0x70180);
-    let pipe = io.read32(0x70008);
-    if plane == u32::MAX || pipe == u32::MAX {
+    initialize_pipe_rgb_bypass(io, crate::intel_gpu_pipes::Pipe::A)
+}
+
+/// [`initialize_rgb_bypass`] for `pipe`'s primary and color block, at the
+/// per-pipe addresses (`intel_color_regs.h`: `SKL_BOTTOM_COLOR` and the
+/// plane registers stride 0x1000, `GAMMA_MODE` 0x800, `PIPE_CSC_MODE`
+/// 0x100). The external Pipe B–D owner uses it with that pipe off
+/// (`hsw_crtc_enable` → `intel_color_modeset`).
+pub(crate) fn initialize_pipe_rgb_bypass<M: MmioWindow + ?Sized>(
+    io: &M,
+    pipe: crate::intel_gpu_pipes::Pipe,
+) -> Result<(), FsError> {
+    let p = pipe as u64;
+    let plane = io.read32(0x70180 + p * 0x1000);
+    let conf = io.read32(0x70008 + p * 0x1000);
+    if plane == u32::MAX || conf == u32::MAX {
         return Err(FsError::NoDevice);
     }
-    if plane & (1 << 31) != 0 || pipe & (3 << 30) != 0 {
+    if plane & (1 << 31) != 0 || conf & (3 << 30) != 0 {
         return Err(FsError::Busy);
     }
     let registers = [
-        (0x70034, 0),
-        (GAMMA, 0),
-        (MODE, 0),
-        (0x701c8, 0),
-        (0x701cc, 1 << 13),
+        (0x70034 + p * 0x1000, 0),
+        (GAMMA + p * 0x800, 0),
+        (MODE + p * 0x100, 0),
+        (0x701c8 + p * 0x1000, 0),
+        (0x701cc + p * 0x1000, 1 << 13),
     ];
     for (register, value) in registers {
         io.write32(register, value);

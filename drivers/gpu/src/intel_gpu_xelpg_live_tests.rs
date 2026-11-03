@@ -17,6 +17,22 @@ pub(crate) struct Live {
     nth: Cell<(u64, u32)>,
     seen: Cell<u32>,
     uncovered: Cell<u32>,
+    /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
+    /// primary `PLANE_CTL` / `PLANE_SURF` / `CURBASE` write.
+    pub(crate) irq_log: RefCell<Vec<(u64, bool)>>,
+}
+
+/// Registers whose access the IRQ log records: `PIPEDSL` (read) and the
+/// primary `PLANE_CTL`, `PLANE_SURF` and `CURBASE` (written) of any pipe.
+fn irq_logged(r: u64, write: bool) -> bool {
+    (0..4u64).any(|p| {
+        let base = 0x70000 + p * 0x1000;
+        if write {
+            [0x180, 0x19c, 0x084].iter().any(|o| r == base + o)
+        } else {
+            r == base
+        }
+    })
 }
 
 impl Live {
@@ -84,6 +100,11 @@ impl Live {
 
 impl MmioWindow for Live {
     fn read32(&self, r: u64) -> u32 {
+        if irq_logged(r, false) {
+            self.irq_log
+                .borrow_mut()
+                .push((r, narf_arch::interrupts_enabled()));
+        }
         let v = self.get(r);
         if (0x70040..0x74000).contains(&r) && r & 0xfff == 0x040 {
             // PIPE_FRMCOUNT: every read observes a later frame.
@@ -104,6 +125,11 @@ impl MmioWindow for Live {
     }
     fn write32(&self, r: u64, v: u32) {
         self.writes.borrow_mut().push((r, v));
+        if irq_logged(r, true) {
+            self.irq_log
+                .borrow_mut()
+                .push((r, narf_arch::interrupts_enabled()));
+        }
         if r == self.drop_write.get() || self.dropped(r) {
             return;
         }
@@ -334,6 +360,37 @@ fn smoke_xelpg_live_adds_external_pipe_while_panel_stays_lit() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_live",
     smoke_xelpg_live_adds_external_pipe_while_panel_stays_lit
+);
+
+fn smoke_xelpg_live_panel_arm_runs_inside_irq_masked_evasion() -> TestResult {
+    // intel_pipe_update_start/_end around the lit panel's WM/DDB update:
+    // the scanline sample that leaves the evasion window, the image and
+    // the SURF/CURBASE arm writes all run with local interrupts masked,
+    // and the caller's interrupt state is restored afterwards.
+    let irqs = narf_arch::interrupts_enabled();
+    let a = state(&[(0, panel())]);
+    let ab = state(&[(0, panel()), (1, external())]);
+    let hw = programmed(&a, &[0]);
+    hw.irq_log.borrow_mut().clear();
+    if commit_live(&hw, &a, &ab, 0x1).is_err() {
+        return TestResult::Fail("the live add must commit");
+    }
+    let log = hw.irq_log.borrow();
+    let regs: Vec<u64> = log.iter().map(|(r, _)| *r).collect();
+    if regs != [0x70000, 0x7019c, 0x70084] {
+        return TestResult::Fail("one PIPEDSL(A) sample, then the SURF and CURBASE arms");
+    }
+    if irqs && log.iter().any(|(_, enabled)| *enabled) {
+        return TestResult::Fail("evasion and arm writes must run IRQ-masked");
+    }
+    if narf_arch::interrupts_enabled() != irqs {
+        return TestResult::Fail("the local interrupt state must be restored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_live",
+    smoke_xelpg_live_panel_arm_runs_inside_irq_masked_evasion
 );
 
 fn smoke_xelpg_live_removes_pipe_and_rejoins_before_growth() -> TestResult {
