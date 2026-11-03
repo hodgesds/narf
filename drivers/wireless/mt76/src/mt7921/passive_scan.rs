@@ -463,14 +463,37 @@ impl ActiveScan {
 /// Unassociated station `BSS_INFO_UPDATE` basic TLV. `active = false` is the
 /// first half of `mt76_connac_mcu_uni_add_dev(.., enable = false)`.
 pub(super) fn station_bss_record(active: bool) -> [u8; 36] {
+    station_bss_record_on(crate::mt7921::vif_slots::Vif::HOME, active)
+}
+/// `station_bss_record` for the station vif `vif`: Linux
+/// `mt76_connac_mcu_uni_add_dev` stamps `bss_idx = mvif->idx`,
+/// `omac_idx`/`hw_bss_idx = omac_idx`, `wmm_idx` and the vif's own BMC
+/// WCID (`mt7921_add_interface`: 19 - idx). HOME is the historical record.
+pub(super) fn station_bss_record_on(vif: crate::mt7921::vif_slots::Vif, active: bool) -> [u8; 36] {
     let mut bss = [0u8; 36];
+    bss[0] = vif.index();
     bss[6..8].copy_from_slice(&32u16.to_le_bytes());
     bss[8] = u8::from(active);
+    bss[9] = vif.omac();
+    bss[10] = vif.omac(); // hardware BSS (< EXT_BSSID_START)
     bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes()); // station/infra
     bss[16] = 1; // initial connection state
-    bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
-    bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+    bss[17] = vif.wmm();
+    bss[24..26].copy_from_slice(&u16::from(vif.bmc()).to_le_bytes()); // reserved BMC WCID
+    bss[30..32].copy_from_slice(&u16::from(vif.bmc()).to_le_bytes());
     bss
+}
+/// `mt76_connac_mcu_uni_add_dev` DEV_INFO for the station vif `vif`
+/// (`omac_idx`, band 0) with the vif's own address.
+pub(super) fn station_device_record_on(
+    vif: crate::mt7921::vif_slots::Vif,
+    own: [u8; 6],
+    active: bool,
+) -> Result<[u8; 16], Error> {
+    let mut dev = [0u8; 16];
+    super::super::cmd::encode_uni_dev_info_update(vif.omac(), 0, active, own, &mut dev)
+        .ok_or(Error::Bounds)?;
+    Ok(dev)
 }
 
 impl<B: Backend> Session<B> {
@@ -479,12 +502,12 @@ impl<B: Backend> Session<B> {
         self.send(false, &command.encode(self.seq, body)?).await
     }
     pub(super) async fn scan_setup(&mut self, info: RadioInfo) -> Result<(), Error> {
-        // Publish a single unassociated station VIF, not a host netdev.
-        let mut dev = [0u8; 16];
-        super::super::cmd::encode_uni_dev_info_update(0, 0, true, info.capabilities.mac, &mut dev)
-            .ok_or(Error::Bounds)?;
+        // Publish a single unassociated station VIF, not a host netdev: the
+        // station owner's own link (the physical interface's HOME vif).
+        let vif = self.station.link.vif();
+        let dev = station_device_record_on(vif, info.capabilities.mac, true)?;
         self.exchange(Command::Unified { id: 1 }, &dev).await?;
-        let bss = station_bss_record(true);
+        let bss = station_bss_record_on(vif, true);
         self.exchange(Command::Unified { id: 2 }, &bss).await?;
         // Every exposed band remains NO_IR during passive scan. Association
         // installs a separate authenticated host policy before transmission.

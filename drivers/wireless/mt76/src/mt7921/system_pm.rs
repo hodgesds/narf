@@ -116,17 +116,12 @@ impl<B: Backend> Session<B> {
     async fn suspend_inner(&mut self, info: RadioInfo, vif: bool) -> Result<(), Error> {
         self.stage(Stage::Suspend);
         if vif {
-            let bss = super::scan::station_bss_record(false);
+            // Retire the station owner's own vif (mt7921_remove_interface
+            // order: BSS then DEV_INFO).
+            let vif = self.station.link.vif();
+            let bss = super::scan::station_bss_record_on(vif, false);
             self.exchange(Command::Unified { id: 2 }, &bss).await?;
-            let mut dev = [0u8; 16];
-            super::super::cmd::encode_uni_dev_info_update(
-                0,
-                0,
-                false,
-                info.capabilities.mac,
-                &mut dev,
-            )
-            .ok_or(Error::Bounds)?;
+            let dev = super::scan::station_device_record_on(vif, info.capabilities.mac, false)?;
             self.exchange(Command::Unified { id: 1 }, &dev).await?;
             self.exchange(
                 Command::Extended {

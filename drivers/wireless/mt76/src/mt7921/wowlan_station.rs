@@ -198,9 +198,15 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
+    /// Every UNI_SUSPEND/UNI_OFFLOAD request opens with
+    /// `{ u8 bss_idx; u8 pad[3]; }` = the station vif's `mvif->idx`
+    /// (mt76_connac_mcu_set_suspend_mode, _set_wow_ctrl, _set_gtk_rekey,
+    /// _set_arp_filter); the station owner's link supplies it.
     async fn wow_exchange(&mut self, command: Command, body: &[u8]) -> Result<(), Error> {
         self.check_wow_tx()?;
-        self.exchange(command, body).await?;
+        let mut stamped = Zeroizing::new(body.to_vec());
+        *stamped.first_mut().ok_or(Error::Bounds)? = self.station.link.bss();
+        self.exchange(command, &stamped).await?;
         self.check_wow_tx()
     }
 

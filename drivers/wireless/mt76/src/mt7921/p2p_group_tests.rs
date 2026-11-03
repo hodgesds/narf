@@ -522,3 +522,51 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_p2p_backend_tx_carries_link
 );
+
+fn station_vif_records() -> Result<(), &'static str> {
+    use crate::mt7921::{firmware_transport::scan, vif_slots::Vif};
+    let own = [0x02, 0x66, 0x77, 0x88, 0x99, 0xaa];
+    // HOME: the historical unassociated station BSS / DEV_INFO bytes.
+    for active in [false, true] {
+        let mut legacy = [0u8; 36];
+        legacy[6..8].copy_from_slice(&32u16.to_le_bytes());
+        legacy[8] = u8::from(active);
+        legacy[12..16].copy_from_slice(&0x10001u32.to_le_bytes());
+        legacy[16] = 1;
+        legacy[24..26].copy_from_slice(&19u16.to_le_bytes());
+        legacy[30..32].copy_from_slice(&19u16.to_le_bytes());
+        if scan::station_bss_record_on(Vif::HOME, active) != legacy
+            || scan::station_bss_record(active) != legacy
+        {
+            return Err("HOME station BSS record changed bytes");
+        }
+        let mut dev = [0u8; 16];
+        crate::mt7921::cmd::encode_uni_dev_info_update(0, 0, active, own, &mut dev)
+            .ok_or("legacy DEV_INFO")?;
+        if scan::station_device_record_on(Vif::HOME, own, active) != Ok(dev) {
+            return Err("HOME station DEV_INFO changed bytes");
+        }
+    }
+    // A non-home station vif: the same mt76_connac_mcu_uni_add_dev identity
+    // as the independent vif geometry, with the infrastructure STA type.
+    for index in 1..4 {
+        let vif = Vif::new(index).map_err(|_| "vif")?;
+        let (dev, mut bss) = vif
+            .device_payloads(own, true, true)
+            .map_err(|_| "geometry")?;
+        bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes());
+        if scan::station_bss_record_on(vif, true) != bss
+            || scan::station_device_record_on(vif, own, true) != Ok(dev)
+        {
+            return Err("station vif BSS/DEV_INFO differ from mt76_connac_mcu_uni_add_dev");
+        }
+    }
+    Ok(())
+}
+fn mt76_p2p_station_vif_records_match_connac2() -> TestResult {
+    station_vif_records().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/p2p",
+    mt76_p2p_station_vif_records_match_connac2
+);
