@@ -35,7 +35,11 @@ pub(super) struct Permission {
     /// The occupied block is the 80 MHz segment containing the primary/
     /// secondary pair (VHT80, VDEV_START `band_center_freq1` = `center`).
     pub width80: bool,
-    /// A separately granted noncontiguous80 segment; never fills the gap.
+    /// The second granted 80 MHz segment. More than 80 MHz from `center`
+    /// it is a noncontiguous 80+80 segment that never fills the gap; exactly
+    /// 80 MHz away it is the other half of a contiguous VHT160 channel
+    /// (`center160`), whose whole 160 MHz block every overlapping host rule
+    /// must allow (`RegulatoryDomain::allows_bandwidth`, AUTO_BW runs).
     pub center2: Option<u16>,
     pub half_dbm: u8,
     /// Occupied 20 MHz constituents under a host DFS rule, as
@@ -87,6 +91,26 @@ impl Permission {
             5745..=5805 => Some(5775),
             _ => None,
         }
+    }
+    /// Contiguous VHT160 inside the station inventory: for a primary80
+    /// segment center, the 160 MHz center and the other 80 MHz half
+    /// (IEEE 802.11 VHT160 channels 50 = ch36-64 and 114 = ch100-128, as
+    /// `cfg80211_chandef_valid` admits them). Channel 163 (ch149-177) stays
+    /// out: ch165-177 are not in the factory/board inventory.
+    pub fn center160(center80: u16) -> Option<(u16, u16)> {
+        match center80 {
+            5210 => Some((5250, 5290)),
+            5290 => Some((5250, 5210)),
+            5530 => Some((5570, 5610)),
+            5610 => Some((5570, 5530)),
+            _ => None,
+        }
+    }
+    /// True when `center2` is the adjacent half of a contiguous VHT160
+    /// channel rather than a separate 80+80 segment.
+    pub fn contiguous160(&self) -> bool {
+        self.center2
+            .is_some_and(|c2| Self::center160(self.center).is_some_and(|(_, other)| other == c2))
     }
     pub fn occupied(
         caps: &super::wmi_boot::Capabilities,
@@ -281,14 +305,16 @@ impl Permission {
         let high = u32::from(center) + width / 2;
         let mut covering = false;
         let mut ceiling = None;
-        for r in &domain.rules {
+        for (index, r) in domain.rules.iter().enumerate() {
             if r.freq_end_mhz <= low || high <= r.freq_start_mhz {
                 continue;
             }
             // Any stricter overlapping rule remains restrictive. A second
             // permissive rule cannot erase DFS, narrow bandwidth or power.
+            // The usable bandwidth follows cfg80211 `reg_get_max_bandwidth`
+            // (AUTO_BW runs, NO_160MHZ), as `handle_channel` applies it.
             if r.freq_start_mhz >= r.freq_end_mhz
-                || r.max_bandwidth_mhz < width
+                || domain.max_bandwidth(index) < width
                 // An indoor-only rule additionally needs the current trusted
                 // deployment's explicit installation fact. Neither an AP nor
                 // a country hint supplies that fact. Every overlapping row
@@ -299,6 +325,8 @@ impl Permission {
                 || r.flags.contains(RegFlags::NO_IR) && !r.flags.contains(RegFlags::DFS)
                 || r.flags.bits()
                     & !(RegFlags::NO_P2P
+                        | RegFlags::AUTO_BW
+                        | RegFlags::NO_160MHZ
                         | RegFlags::INDOOR_ONLY
                         | RegFlags::DEPLOYMENT_INDOOR
                         | radar_flags)
@@ -345,8 +373,20 @@ impl Permission {
             self.hint.clone(),
         )?;
         if let Some(second) = self.center2 {
-            if !self.width80 || !matches!(second, 5210 | 5775) || second == self.center {
+            // 802.11 forbids adjacent 80+80 segments, so the distance alone
+            // separates a contiguous160 half from a discontiguous segment.
+            let contiguous = self.contiguous160();
+            if !self.width80
+                || !contiguous
+                    && (!matches!(second, 5210 | 5775) || second.abs_diff(self.center) <= 80)
+            {
                 return Err(Error::Unsupported);
+            }
+            if contiguous {
+                let full = u32::from(second.min(self.center)) + 40;
+                if !domain.allows_bandwidth(full - 80, full + 80, 160) {
+                    return Err(Error::Unsupported);
+                }
             }
             let other = Self::from_factory_width_with_hint(
                 self.factory,
@@ -383,7 +423,7 @@ impl Permission {
         center2: u16,
         hint: Option<Arc<Receipt>>,
     ) -> Result<Self, Error> {
-        let mut first = Self::occupied_width_with_hint(
+        let first = Self::occupied_width_with_hint(
             caps,
             domain,
             primary,
@@ -391,7 +431,7 @@ impl Permission {
             true,
             hint.clone(),
         )?;
-        if !matches!(center2, 5210 | 5775) || center2 == first.center {
+        if !matches!(center2, 5210 | 5775) || center2.abs_diff(first.center) <= 80 {
             return Err(Error::Unsupported);
         }
         let other = Self::occupied_width_with_hint(
@@ -402,12 +442,82 @@ impl Permission {
             true,
             hint,
         )?;
-        first.center2 = Some(center2);
-        first.half_dbm = first.half_dbm.min(other.half_dbm);
-        first.radar |= other.radar;
-        first.merge_hint(&other)?;
-        first.check(domain)?;
-        Ok(first)
+        first.join(other, domain)
+    }
+    /// Bind a second 80 MHz receipt as `center2`: the lower power ceiling,
+    /// both segments' radar constituents and witnesses, then the full
+    /// current-policy recheck (geometry and the 160 MHz block for VHT160).
+    fn join(
+        mut self,
+        other: Self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<Self, Error> {
+        self.center2 = Some(other.center);
+        self.half_dbm = self.half_dbm.min(other.half_dbm);
+        self.radar |= other.radar;
+        self.merge_hint(&other)?;
+        self.check(domain)?;
+        Ok(self)
+    }
+    /// Contiguous VHT160 receipt (cfg80211 `NL80211_CHAN_WIDTH_160`): the
+    /// primary80 segment (`primary`/`secondary` the HT40 pair inside it)
+    /// plus its adjacent half (`center160`), each an ordinary 80 MHz
+    /// receipt — so every radar 20 MHz constituent of either half needs the
+    /// client's `beacon_found` witness — and the whole 160 MHz block must
+    /// be allowed by every overlapping rule (`allows_bandwidth`).
+    pub(in crate::ath10k) fn contiguous160_with_hint(
+        caps: &super::wmi_boot::Capabilities,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        primary: u16,
+        secondary: u16,
+        hint: Option<Arc<Receipt>>,
+    ) -> Result<Self, Error> {
+        let first = Self::occupied_width_with_hint(
+            caps,
+            domain,
+            primary,
+            Some(secondary),
+            true,
+            hint.clone(),
+        )?;
+        let (_, center2) = Self::center160(first.center).ok_or(Error::Unsupported)?;
+        let other = Self::occupied_width_with_hint(
+            caps,
+            domain,
+            center2 - 30,
+            Some(center2 - 10),
+            true,
+            hint,
+        )?;
+        first.join(other, domain)
+    }
+    /// Factory-level contiguous VHT160 entry for native observation tests.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn contiguous160_for_test(
+        factory: Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        primary: u16,
+        secondary: u16,
+        hint: Option<Arc<Receipt>>,
+    ) -> Result<Self, Error> {
+        let first = Self::from_factory_width_with_hint(
+            factory,
+            domain,
+            primary,
+            Some(secondary),
+            true,
+            hint.clone(),
+        )?;
+        let (_, center2) = Self::center160(first.center).ok_or(Error::Unsupported)?;
+        let other = Self::from_factory_width_with_hint(
+            factory,
+            domain,
+            center2 - 30,
+            Some(center2 - 10),
+            true,
+            hint,
+        )?;
+        first.join(other, domain)
     }
     /// Factory-level entry for native observation tests that have no
     /// SERVICE_READY capability fixture.

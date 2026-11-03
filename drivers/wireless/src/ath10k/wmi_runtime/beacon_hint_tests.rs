@@ -319,3 +319,153 @@ kernel_test_in!(
     "drivers/wireless/ath10k/dfs",
     smoke_ath10k_dfs_client_needs_radar_beacon_in_current_scan
 );
+
+/// Contiguous VHT160 on ch36-64 (cfg80211 `NL80211_CHAN_WIDTH_160`, centre
+/// 5250): the 5250 MHz rule boundary is crossed only through an AUTO_BW run
+/// (reg.c `reg_get_max_bandwidth`), every radar 20 MHz constituent of the
+/// upper half needs the client's heard Beacon, and NO_160MHZ closes it.
+fn smoke_ath10k_vht160_contiguous_auto_bw_and_radar_constituents() -> TestResult {
+    use crate::ath10k::regulatory::Permission;
+    use narf_wireless::reg::RegFlags;
+    (|| {
+        let factory = Factory::from_eeprom(0x8348).map_err(|_| "factory")?;
+        let mut policy = radar_domain(RegFlags::empty());
+        let database = Arc::new(db::Database::new());
+        database.install(policy.clone());
+        let mut owner = Owner::scoped(database.clone());
+        let span = [5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320];
+        observe_with(&mut owner, factory, 1, &span)?;
+        let heard = owner.client_receipt(&policy).ok_or("client receipt")?;
+        // Two plain 80 MHz rules: the 160 MHz block crosses their boundary.
+        if Permission::contiguous160_for_test(factory, &policy, 5180, 5200, Some(heard.clone()))
+            .is_ok()
+        {
+            return Err("160 MHz admitted across a non-AUTO_BW rule boundary");
+        }
+        policy
+            .rules
+            .iter_mut()
+            .for_each(|r| r.flags |= RegFlags::AUTO_BW);
+        database.install(policy.clone());
+        let mut owner = Owner::scoped(database.clone());
+        // ch64 unheard: one radar constituent lacks its witness.
+        observe_with(&mut owner, factory, 1, &span[..7])?;
+        let partial = owner.client_receipt(&policy).ok_or("partial receipt")?;
+        if Permission::contiguous160_for_test(factory, &policy, 5180, 5200, Some(partial)).is_ok() {
+            return Err("unheard radar constituent admitted into VHT160");
+        }
+        if Permission::contiguous160_for_test(factory, &policy, 5180, 5200, None).is_ok() {
+            return Err("VHT160 over radar half admitted without a witness");
+        }
+        observe_with(&mut owner, factory, 2, &span)?;
+        let heard = owner.client_receipt(&policy).ok_or("full receipt")?;
+        let low =
+            Permission::contiguous160_for_test(factory, &policy, 5180, 5200, Some(heard.clone()))
+                .map_err(|_| "fully heard AUTO_BW VHT160 refused")?;
+        if low.center != 5210
+            || low.center2 != Some(5290)
+            || !low.contiguous160()
+            || low.radar.count_ones() != 4
+            || low.check(&policy).is_err()
+        {
+            return Err("lower-primary VHT160 geometry or radar mask");
+        }
+        // Primary in the radar half: primary80 5290, other half 5210.
+        let high =
+            Permission::contiguous160_for_test(factory, &policy, 5300, 5320, Some(heard.clone()))
+                .map_err(|_| "radar-primary VHT160 refused")?;
+        if high.center != 5290 || high.center2 != Some(5210) || !high.contiguous160() {
+            return Err("upper-primary VHT160 geometry");
+        }
+        // An adjacent half is never a discontiguous 80+80 segment, and a
+        // non-adjacent foreign half is never a contiguous one.
+        for foreign in [5370, 5530, 5130] {
+            let mut bad = low.clone();
+            bad.center2 = Some(foreign);
+            if bad.check(&policy).is_ok() {
+                return Err("foreign second segment survived the VHT160 recheck");
+            }
+        }
+        // NO_160MHZ on either rule caps the run at 80 MHz: refused even
+        // when freshly heard under that policy, while each half stays VHT80.
+        for at in 0..2 {
+            let mut capped = policy.clone();
+            capped.rules[at].flags |= RegFlags::NO_160MHZ;
+            if low.check(&capped).is_ok() {
+                return Err("NO_160MHZ rule kept a VHT160 receipt current");
+            }
+            database.install(capped.clone());
+            let mut owner = Owner::scoped(database.clone());
+            observe_with(&mut owner, factory, 1, &span)?;
+            let heard = owner.client_receipt(&capped).ok_or("capped receipt")?;
+            if Permission::contiguous160_for_test(factory, &capped, 5180, 5200, Some(heard.clone()))
+                .is_ok()
+            {
+                return Err("NO_160MHZ rule admitted VHT160");
+            }
+            if Permission::factory_with_hint_for_test(
+                factory,
+                &capped,
+                5260,
+                Some(5280),
+                true,
+                Some(heard),
+            )
+            .is_err()
+            {
+                return Err("NO_160MHZ also closed the radar VHT80 half");
+            }
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/vht160",
+    smoke_ath10k_vht160_contiguous_auto_bw_and_radar_constituents
+);
+
+/// ch100-128 (centre 5570) under one DFS rule wide enough for 160 MHz on its
+/// own: admitted directly, without AUTO_BW, once every constituent is heard.
+fn smoke_ath10k_vht160_direct_rule_upper_radar_span() -> TestResult {
+    use crate::ath10k::regulatory::Permission;
+    use narf_wireless::reg::{RegFlags, RegRule};
+    (|| {
+        let factory = Factory::from_eeprom(0x8348).map_err(|_| "factory")?;
+        let mut policy = RegulatoryDomain {
+            country_code: *b"US",
+            rules: vec![RegRule {
+                freq_start_mhz: 5490,
+                freq_end_mhz: 5730,
+                max_bandwidth_mhz: 160,
+                max_power_dbm: 23,
+                flags: RegFlags::DFS,
+            }],
+        };
+        let database = Arc::new(db::Database::new());
+        database.install(policy.clone());
+        let mut owner = Owner::scoped(database.clone());
+        let span = [5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640];
+        observe_with(&mut owner, factory, 1, &span)?;
+        let heard = owner.client_receipt(&policy).ok_or("client receipt")?;
+        let p = Permission::contiguous160_for_test(factory, &policy, 5580, 5600, Some(heard))
+            .map_err(|_| "direct 160 MHz DFS rule refused")?;
+        if p.center != 5610 || p.center2 != Some(5530) || p.radar.count_ones() != 8 {
+            return Err("ch100-128 VHT160 geometry or radar mask");
+        }
+        // ch132-144 has no VHT160 partner in the station inventory.
+        if Permission::center160(5690).is_some() || Permission::center160(5775).is_some() {
+            return Err("VHT160 offered outside ch36-64 / ch100-128");
+        }
+        policy.rules[0].max_bandwidth_mhz = 80;
+        if p.check(&policy).is_ok() {
+            return Err("80 MHz rule kept a VHT160 receipt current");
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/vht160",
+    smoke_ath10k_vht160_direct_rule_upper_radar_span
+);
