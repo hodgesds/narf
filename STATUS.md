@@ -2381,8 +2381,8 @@ absent:
   the result only after the argument, VM and allocation checks. It used to
   refuse every extension with EINVAL.
 
-One errno gap remains: more than 16 GEM_CREATE extensions is EINVAL, where
-Linux returns E2BIG, because `FsError` has no E2BIG.
+One errno gap remained: more than 16 GEM_CREATE extensions was EINVAL, where
+Linux returns E2BIG. The E2BIG unit below closes it.
 
 The integration combined this unit with the media-GT power unit's stop path:
 RC6 and powergating are returned first, then the GuC stops, then the
@@ -2422,6 +2422,31 @@ out. Linux re-checks the condition once after the timeout.
 One targeted release run passed 198 tests with no failures. It covered the
 media-GT, stolen, FBC, GT-IRQ, engine, RCS, GTT, GGTT-TLB, GuC-GT, Gen12,
 multi-CCS and HuC prefixes. None of this has run on physical Intel hardware.
+
+### FsError E2BIG and the Xe extension limits — targeted release gates recorded
+
+`FsError::ArgumentListTooLong` now carries Linux's E2BIG (7) through the errno
+mappers: sys_ioctl (direct and FUSE-relayed), unlink, bind, rmdir, rename,
+xattr, mount, umount, chown, metadata, quota and the ALSA errno.
+
+UAPI changes:
+- Xe GEM_CREATE and EXEC_QUEUE_CREATE return E2BIG past 16 extensions. The
+  check runs before the extension is copied, as in Linux; these used to
+  return EINVAL.
+- A self-referencing EXEC_QUEUE_CREATE extension chain now applies 16 times
+  and then returns E2BIG, as in Linux. It used to be refused at the first
+  revisit.
+- FUSE `-7` replies now surface as E2BIG.
+
+One targeted release run passed 754 tests with no failures. The only skip was
+the existing shared RNG-registration skip. The run covered `filesystem` (whose
+FUSE round-trip test registers at the top level), `syscall_abi/drm_prime`, and
+the media-GT, user and Xe GPU prefixes. No narrower `syscall_abi` groups exist
+for the unlink/rename/xattr/mount/chown/quota/ioctl errno paths; they live in
+the top-level ABI suite and were not run. The CI Clippy contexts for
+`narf-userspace` and `narf-drivers-sound` were added for this unit. A
+follow-up worker is aligning the remaining EXEC_QUEUE and i915 extension
+mismatches.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

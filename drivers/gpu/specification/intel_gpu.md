@@ -5735,8 +5735,9 @@ Review against Linux b90c984d agreed on the following:
 - Media scheduling beside loaded GSC firmware is admitted only with
   `narf.intel.gsc=1`.
 
-One errno gap remains (LINUX-GAP): more than `MAX_USER_EXTENSIONS` (16) GEM
-extensions is EINVAL here, where Linux returns E2BIG. `FsError` has no E2BIG.
+The E2BIG gap (more than `MAX_USER_EXTENSIONS` GEM extensions returning
+EINVAL instead of E2BIG) is closed by the follow-up E2BIG unit, which adds
+`FsError::ArgumentListTooLong`.
 `intel_gpu_gsc::load` carries a temporary module-level dead-code allowance
 outside kernel-test builds until a platform owner supplies its GSCCS queue,
 stolen object and CSME component.
