@@ -67,7 +67,7 @@ pub(super) async fn disable_rf<I: ControlIo>(owner: &Owner<I>) -> Result<(), Err
 }
 
 /// `rtl8xxxu_flush_fifo`.
-async fn flush_fifo<I: ControlIo>(owner: &Owner<I>) -> Result<(), Error> {
+pub(super) async fn flush_fifo<I: ControlIo>(owner: &Owner<I>) -> Result<(), Error> {
     owner.write8(REG_TXPAUSE, 0xff).await?;
     let rx = owner.read32(REG_RXPKT_NUM).await? | RXPKT_NUM_RW_RELEASE_EN;
     owner.write32(REG_RXPKT_NUM, rx).await?;
@@ -115,7 +115,7 @@ async fn active_to_lps<I: ControlIo>(owner: &Owner<I>) -> Result<(), Error> {
 
 /// `rtl8xxxu_firmware_self_reset`: ask the 8051 to reset, poll CPU-enable
 /// clear (100 × 50 µs), else force it clear like Linux.
-async fn firmware_self_reset<I: ControlIo>(owner: &Owner<I>) -> Result<(), Error> {
+pub(super) async fn firmware_self_reset<I: ControlIo>(owner: &Owner<I>) -> Result<(), Error> {
     owner.write8(REG_HMTFR + 3, 0x20).await?;
     for _ in 0..100 {
         if owner.read16(REG_SYS_FUNC).await? & SYS_FUNC_CPU_ENABLE == 0 {

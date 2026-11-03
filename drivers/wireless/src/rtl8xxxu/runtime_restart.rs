@@ -107,6 +107,10 @@ impl<I: ControlIo> Owner<I> {
             // 8192e.c::rtl8192eu_power_off; its own flush_fifo retires RX.
             return crate::rtl8xxxu::rtl8192e_power::power_off(self).await;
         }
+        if self.chip == ChipFamily::Rtl8723bu {
+            // 8723b.c::rtl8723bu_power_off; its own flush_fifo retires RX.
+            return crate::rtl8xxxu::rtl8723b_power::power_off(self).await;
+        }
         if self.read16(REG_CR).await? & 0xc0 != 0 {
             return Err(Error::RuntimeState);
         }

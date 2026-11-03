@@ -1400,9 +1400,31 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   `0xd2c[11]` retained. The outcome is `Owner::radio_8723b()` and the owner
   reaches `RadioReady` (not packet readiness).
 
-`rtl8723b_enable_rf`, power-off, channel configuration, packet codec, RA,
-BT coexistence, signed records and the station are not implemented, and
-the production probe does not start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
+- Channel (`rtl8723b_radio::config_channel`, `rtl8xxxu_gen2_config_channel`
+  with `rf_paths = 1`): RF_A only through the plain `write_rfreg`, the shared
+  2.4 GHz `channel_geometry` (HT20 1..=13, non-HT 1..=14, 40 MHz pairs inside
+  1..=13; anything else `RuntimeState` before any transfer), CCK sideband,
+  OFDM LSTF prime channel, `FPGA0_POWER_SAVE`, `WMAC_TRXPTCL_CTL`, SIFS
+  `0x0e`/`0x0a`, R2T/T2T, `MODE_AG` bandwidth bits.
+- RF enable (`rtl8723b_power::enable_rf`, `rtl8723b_enable_rf`): RX CCA
+  wait, `0x790 = 5`, `0x778 = 1`, GPIO mux[5], `RF_A IQADJ_G1 = 0x780`,
+  `rtl8723bu_write_btreg(0x3c, 0x15)` (two `BT_MP_OPER` H2Cs, request 0 data
+  / request 1 address), `BT_GRANT(0)`, `WLAN_ACT_CONTROL = 0x0c`, `0x67[5]`,
+  RFE control/`0x974 = 0xff`/buffer/antenna source, LEDCFG0 pins,
+  `PAD_CTRL1[0]` clear, `ANT_SEL_RSV(inverse 1, type 0)`, S0S1 `0x80`,
+  `rtl8723bu_set_ps_tdma(0x08, 0, 0, 0, 0)`, coex tables `0x55555555`/
+  `0x55555555`/`0x00ffffff`/`0x03`, `BT_INFO(1)`, `BT_IGNORE_WLANACT(0)`.
+  `disable_rf` is the shared `rtl8xxxu_gen2_disable_rf`.
+- Power-off (`rtl8723b_power::power_off`, `rtl8723bu_power_off`): flush
+  FIFO, TX report timer off, `REG_CR = 0`, the generic
+  `rtl8xxxu_active_to_lps` (low-byte `0x5f8` poll, byte CR writes), firmware
+  self reset when in RAM, MCU reset, `MCU_FW_DL = 0`,
+  `rtl8723bu_active_to_emu`, `APS_FSMCO` HW suspend, GPIO9 wake. Polls that
+  Linux only warns on are terminal `PowerTimeout`. The owner's park path
+  (`power_off_stopped`) dispatches RTL8723BU to this sequence.
+
+Packet codec, RA, BT coexistence, signed records and the station are not
+implemented, and the production probe does not start an RTL8723BU owner. USB IDs are exactly Linux `core.c::dev_table`
 `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
 Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
@@ -1410,8 +1432,10 @@ Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
 power + firmware + tables + calibration lifecycle against a register
 model, no-SIE fallback and test-silicon refusal, table/antenna/PHY-LCK/
 post-RF state, TX power indices, post-table burst/aggregation/DPDT/
-statistics, LCK/IQK H2C/BT-grant/RF sequence and candidate, and a failed
-IQK being terminal after Linux's restore tail.
+statistics, LCK/IQK H2C/BT-grant/RF sequence and candidate, a failed
+IQK being terminal after Linux's restore tail, the enable_rf H2C/BT
+sequence, 1T 20/40 MHz channel writes and geometry refusal, and power-off
+order plus a stuck-queue timeout.
 
 ## 4. Invariants
 

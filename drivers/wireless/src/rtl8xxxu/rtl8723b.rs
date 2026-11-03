@@ -94,17 +94,8 @@ pub const NUM_RF_PATHS: usize = 1;
 pub const CHANNEL_MIN: u8 = 1;
 pub const CHANNEL_MAX: u8 = 14;
 
-/// Build the gen2-style channel-set RF write — encodes channel into
-/// MODE_AG[7:0] via path-A LSSI.
-/// Source: `core.c::rtl8xxxu_gen2_config_channel` L1328+.
-pub fn channel_set_writes_8723b(channel: u8) -> [(u16, u32); 1] {
-    use super::phy::{lssi_encode, REG_FPGA0_LSSI_A};
-    [(
-        REG_FPGA0_LSSI_A,
-        lssi_encode(RF6052_REG_MODE_AG, channel as u32),
-    )]
-}
-
+/// 2.4 GHz channel bound; the admitted 20/40 MHz geometry and the
+/// `rtl8xxxu_gen2_config_channel` writes live in `rtl8723b_radio`.
 pub fn channel_valid(channel: u8) -> bool {
     (CHANNEL_MIN..=CHANNEL_MAX).contains(&channel)
 }

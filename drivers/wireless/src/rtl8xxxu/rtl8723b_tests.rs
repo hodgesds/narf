@@ -535,3 +535,176 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8723bu",
     smoke_rtl8723bu_iqk_failure_is_terminal
 );
+
+fn ready_owner() -> Option<(Fake, Owner<Fake>)> {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
+    if narf_scheduler::block_on(owner.initialize(&image(256))).is_err()
+        || owner.status().stage != Stage::RadioReady
+    {
+        return None;
+    }
+    io.0.lock().ops.clear();
+    Some((io, owner))
+}
+
+/// Every H2C mailbox word written, in order (mailboxes rotate over 4).
+fn h2c_words(io: &Fake) -> Vec<Vec<u8>> {
+    io.0.lock()
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Write(a, v) if (REG_HMBOX_0..REG_HMBOX_0 + 16).contains(a) => Some(v.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn smoke_rtl8723bu_enable_rf_bt_handover() -> TestResult {
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    if narf_scheduler::block_on(super::rtl8723b_power::enable_rf(&owner)).is_err() {
+        return TestResult::Fail("8723bu enable_rf failed");
+    }
+    let expected: Vec<Vec<u8>> = vec![
+        vec![0x67, 0x00, 0x0d, 0x15],
+        vec![0x67, 0x10, 0x0d, 0x00],
+        vec![0x6e, 0, 0, 0],
+        vec![0x65, 1, 0, 0],
+        vec![0x60, 0x08, 0, 0],
+        vec![0x61, 1, 0, 0],
+        vec![0x63, 0, 0, 0],
+    ];
+    if h2c_words(&io) != expected {
+        return TestResult::Fail("8723bu enable_rf H2C sequence");
+    }
+    // write_btreg's request 1 carries the BT address in the ext word; the
+    // 6-byte TDMA command uses the ext word too.
+    let ext_btreg = io.0.lock().ops.iter().any(|op| {
+        matches!(op, Op::Write(a, v) if (0x01f0..0x0200).contains(a) && *v == vec![0x3c, 0, 0, 0])
+    });
+    if !ext_btreg {
+        return TestResult::Fail("8723bu write_btreg address");
+    }
+    if io.writes(0x0790) != vec![vec![0x05]]
+        || io.writes(0x0778) != vec![vec![0x01]]
+        || io.writes(0x076e) != vec![vec![0x0c]]
+        || io.writes(0x0948) != vec![0x80u32.to_le_bytes().to_vec()]
+        || io.writes(0x06c0) != vec![0x5555_5555u32.to_le_bytes().to_vec()]
+        || io.writes(0x06c8) != vec![0x00ff_ffffu32.to_le_bytes().to_vec()]
+        || io.writes(0x06cc) != vec![vec![0x03]]
+        || io.writes(0x0974) != vec![vec![0xff]]
+        || io.writes(0x0840) != vec![(0x01u32 << 20 | 0x780).to_le_bytes().to_vec()]
+    {
+        return TestResult::Fail("8723bu enable_rf register state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_enable_rf_bt_handover
+);
+
+fn smoke_rtl8723bu_config_channel() -> TestResult {
+    use super::rtl8192e_radio::Width;
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    let run = |primary, width| {
+        narf_scheduler::block_on(super::rtl8723b_radio::config_channel(
+            &owner, primary, width,
+        ))
+    };
+    if run(14, Width::Ht20) != Err(Error::RuntimeState)
+        || run(11, Width::Ht40Above) != Err(Error::RuntimeState)
+        || run(3, Width::Ht40Below) != Err(Error::RuntimeState)
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("8723bu inadmissible geometry touched the device");
+    }
+    if run(6, Width::Ht40Above).is_err() {
+        return TestResult::Fail("8723bu HT40+ failed");
+    }
+    let lssi: Vec<u32> = io.writes(0x0840).iter().map(|v| word(v)).collect();
+    // RF_A only (1T1R): channel 8 then the 40 MHz bandwidth bits.
+    if lssi.len() != 2
+        || lssi[0] >> 20 != 0x18
+        || lssi[0] & 0x3ff != 8
+        || lssi[1] & 0xc00 != 0x400
+        || io.writes(0x0483) != vec![vec![2]]
+        || io.writes(0x0517) != vec![vec![0x0e]]
+        || io.writes(0x0668).last().map(|v| v[0] & 0x80) != Some(0x80)
+        || !io.writes(0x082c).is_empty()
+    {
+        return TestResult::Fail("8723bu HT40+ channel writes");
+    }
+    io.0.lock().ops.clear();
+    if run(14, Width::NoHt20).is_err()
+        || io.writes(0x0483) != vec![vec![0]]
+        || io.writes(0x0517) != vec![vec![0x0a]]
+        || io.writes(0x0840).last().map(|v| word(v) & 0xc00) != Some(0xc00)
+    {
+        return TestResult::Fail("8723bu channel 14 non-HT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_config_channel
+);
+
+fn smoke_rtl8723bu_power_off() -> TestResult {
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    {
+        let mut g = io.0.lock();
+        g.regs[0x0286] |= 1 << 1; // RXDMA idle
+        g.regs[0x0080] &= !MCU_FW_RAM_SEL; // running from ROM: no self reset
+    }
+    if narf_scheduler::block_on(super::rtl8723b_power::power_off(&owner)).is_err() {
+        return TestResult::Fail("8723bu power_off failed");
+    }
+    let order = [
+        Op::Write(0x0522, vec![0xff]),
+        Op::Write(REG_CR, vec![0x00]),
+        Op::Write(REG_CR, vec![0x03]),
+        Op::Write(REG_MCU_FW_DL, vec![0x00]),
+        Op::Write(0x001f, vec![0x00]),
+    ];
+    let mut last = 0;
+    for op in &order {
+        match io.position(op) {
+            Some(p) if p >= last => last = p,
+            _ => return TestResult::Fail("8723bu power_off order"),
+        }
+    }
+    let ok = {
+        let g = io.0.lock();
+        g.regs[0x04ec] & 2 == 0 && g.regs[0x0005] & (1 << 3) != 0 && g.regs[0x004a] & 1 != 0
+    };
+    if !ok {
+        return TestResult::Fail("8723bu power_off final state");
+    }
+    // Stuck scheduler queue: terminal before any MAC reset.
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    {
+        let mut g = io.0.lock();
+        g.regs[0x0286] |= 1 << 1;
+        g.regs[0x05f8] = 1;
+    }
+    if narf_scheduler::block_on(super::rtl8723b_power::power_off(&owner))
+        != Err(Error::PowerTimeout)
+        || io.position(&Op::Write(REG_MCU_FW_DL, vec![0x00])).is_some()
+    {
+        return TestResult::Fail("8723bu power_off stuck queue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_power_off
+);

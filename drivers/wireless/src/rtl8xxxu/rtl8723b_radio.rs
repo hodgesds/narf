@@ -1,9 +1,9 @@
-//! RTL8723BU post-table MAC stage of `rtl8xxxu_init_device` and the stage
-//! after LC/IQ calibration.
+//! RTL8723BU post-table MAC stage of `rtl8xxxu_init_device`, the stage
+//! after LC/IQ calibration and the 1T gen2 20/40 MHz channel configuration.
 //!
 //! Linux references (GPL-2.0-or-later, Linux 7.3-rc4):
 //! - `rtl8xxxu/core.c::{rtl8xxxu_init_device, rtl8xxxu_set_spec_sifs,
-//!   rtl8xxxu_set_retry, rtl8xxxu_init_burst}`
+//!   rtl8xxxu_set_retry, rtl8xxxu_init_burst, rtl8xxxu_gen2_config_channel}`
 //! - `rtl8xxxu/8723b.c::{rtl8723bu_fops, rtl8723bu_init_aggregation,
 //!   rtl8723bu_init_statistics}`
 //!
@@ -15,8 +15,11 @@
 //! left alone at this stage.
 
 use super::firmware_transport::{ControlIo, Error, Owner};
-use super::rtl8192e_radio::{retry_limit, spec_sifs, RCR_INIT};
+use super::rtl8192e_radio::{
+    channel_geometry, read_rfreg, retry_limit, spec_sifs, Width, RCR_INIT,
+};
 use super::rtl8723b_init::Factory;
+use super::rtl8723b_phy::write_rfreg;
 
 const REG_RSV_CTRL: u16 = 0x001c;
 const RSV_CTRL_WLOCK_1C: u8 = 1 << 5;
@@ -251,7 +254,7 @@ pub struct PostCalibration {
 /// thermal meter (`RF_A 0x42 = 0x37cf8`), the NAV upper bound, the
 /// management-frame ACK and the CCK-AGC/CFO state reads.
 pub(super) async fn post_calibration<I: ControlIo>(o: &Owner<I>) -> Result<PostCalibration, Error> {
-    super::rtl8723b_phy::write_rfreg(o, RF6052_REG_T_METER_8723B, 0x37cf8).await?;
+    write_rfreg(o, RF6052_REG_T_METER_8723B, 0x37cf8).await?;
     o.write8(REG_NAV_UPPER, 30000u32.div_ceil(NAV_UPPER_UNIT) as u8)
         .await?;
     rmw32(o, REG_FWHW_TXQ_CTRL, 0, FWHW_TXQ_CTRL_XMIT_MGMT_ACK).await?;
@@ -261,4 +264,98 @@ pub(super) async fn post_calibration<I: ControlIo>(o: &Owner<I>) -> Result<PostC
         cck_new_agc,
         cfo_atc_status,
     })
+}
+
+const REG_DATA_SUBCHANNEL: u16 = 0x0483;
+const REG_R2T_SIFS: u16 = 0x063c;
+const REG_T2T_SIFS: u16 = 0x063e;
+const REG_WMAC_TRXPTCL_CTL: u16 = 0x0668;
+const WMAC_TRXPTCL_CTL_BW_MASK: u16 = (1 << 7) | (1 << 8);
+const WMAC_TRXPTCL_CTL_BW_40: u16 = 1 << 7;
+const FPGA_RF_MODE: u32 = 1 << 0;
+const REG_FPGA0_POWER_SAVE: u16 = 0x0818;
+const FPGA0_PS_LOWER_CHANNEL: u32 = 1 << 26;
+const FPGA0_PS_UPPER_CHANNEL: u32 = 1 << 27;
+const REG_FPGA1_RF_MODE: u16 = 0x0900;
+const REG_CCK0_SYSTEM: u16 = 0x0a00;
+const CCK0_SIDEBAND: u32 = 1 << 4;
+const REG_OFDM0_TX_PSDO_NOISE_WEIGHT: u16 = 0x0ce4;
+const REG_OFDM1_LSTF: u16 = 0x0d00;
+const OFDM_LSTF_PRIME_CH_LOW: u32 = 1 << 10;
+const OFDM_LSTF_PRIME_CH_HIGH: u32 = 1 << 11;
+const RF6052_REG_MODE_AG: u8 = 0x18;
+const MODE_AG_CHANNEL_MASK: u32 = 0x3ff;
+const MODE_AG_BW_MASK: u32 = (1 << 10) | (1 << 11);
+const MODE_AG_BW_20MHZ_8723B: u32 = (1 << 10) | (1 << 11);
+const MODE_AG_BW_40MHZ_8723B: u32 = 1 << 10;
+
+/// `rtl8xxxu_gen2_config_channel` with `priv->rf_paths = 1` (RF_A only,
+/// plain `rtl8xxxu_write_rfreg`). The geometry is the shared 2.4 GHz
+/// `channel_geometry` (HT20 1..=13, non-HT 1..=14, 40 MHz pairs inside
+/// 1..=13); anything else is `RuntimeState` before any transfer.
+pub(super) async fn config_channel<I: ControlIo>(
+    o: &Owner<I>,
+    primary: u8,
+    width: Width,
+) -> Result<(), Error> {
+    let (channel, subchannel) = channel_geometry(primary, width).ok_or(Error::RuntimeState)?;
+    let forty = matches!(width, Width::Ht40Above | Width::Ht40Below);
+    let above = width == Width::Ht40Above;
+    let mut bw = o.read16(REG_WMAC_TRXPTCL_CTL).await? & !WMAC_TRXPTCL_CTL_BW_MASK;
+    if forty {
+        bw |= WMAC_TRXPTCL_CTL_BW_40;
+        rmw32(o, REG_FPGA0_RF_MODE, 0, FPGA_RF_MODE).await?;
+        rmw32(o, REG_FPGA1_RF_MODE, 0, FPGA_RF_MODE).await?;
+        let sideband = if above { 0 } else { CCK0_SIDEBAND };
+        rmw32(o, REG_CCK0_SYSTEM, CCK0_SIDEBAND, sideband).await?;
+        let prime = if above {
+            OFDM_LSTF_PRIME_CH_LOW
+        } else {
+            OFDM_LSTF_PRIME_CH_HIGH
+        };
+        rmw32(
+            o,
+            REG_OFDM1_LSTF,
+            OFDM_LSTF_PRIME_CH_LOW | OFDM_LSTF_PRIME_CH_HIGH,
+            prime,
+        )
+        .await?;
+        let ps = if above {
+            FPGA0_PS_UPPER_CHANNEL
+        } else {
+            FPGA0_PS_LOWER_CHANNEL
+        };
+        rmw32(
+            o,
+            REG_FPGA0_POWER_SAVE,
+            FPGA0_PS_LOWER_CHANNEL | FPGA0_PS_UPPER_CHANNEL,
+            ps,
+        )
+        .await?;
+    } else {
+        rmw32(o, REG_FPGA0_RF_MODE, FPGA_RF_MODE, 0).await?;
+        rmw32(o, REG_FPGA1_RF_MODE, FPGA_RF_MODE, 0).await?;
+        rmw32(o, REG_OFDM0_TX_PSDO_NOISE_WEIGHT, (1 << 30) | (1 << 31), 0).await?;
+    }
+    let mode = read_rfreg(o, false, RF6052_REG_MODE_AG).await?;
+    write_rfreg(
+        o,
+        RF6052_REG_MODE_AG,
+        (mode & !MODE_AG_CHANNEL_MASK) | channel as u32,
+    )
+    .await?;
+    o.write16(REG_WMAC_TRXPTCL_CTL, bw).await?;
+    o.write8(REG_DATA_SUBCHANNEL, subchannel).await?;
+    let sifs = if width == Width::NoHt20 { 0x0a } else { 0x0e };
+    o.write8(REG_SIFS_CCK + 1, sifs).await?;
+    o.write8(REG_SIFS_OFDM + 1, sifs).await?;
+    o.write16(REG_R2T_SIFS, 0x0808).await?;
+    o.write16(REG_T2T_SIFS, 0x0a0a).await?;
+    let bw_bits = if forty {
+        MODE_AG_BW_40MHZ_8723B
+    } else {
+        MODE_AG_BW_20MHZ_8723B
+    };
+    let mode = read_rfreg(o, false, RF6052_REG_MODE_AG).await?;
+    write_rfreg(o, RF6052_REG_MODE_AG, (mode & !MODE_AG_BW_MASK) | bw_bits).await
 }
