@@ -512,6 +512,9 @@ pub struct XeLpgModeset<'a, M: MmioWindow + ?Sized> {
     /// Where Pipe A's DMC lifetime is reported (`intel_dmc_enable_pipe` /
     /// `intel_dmc_disable_pipe` around this modeset's crtc enable/disable).
     pipe_dmc: &'a dyn crate::intel_gpu_dc_states::PipeDmc,
+    /// The display IP the sequence is dispatched on (14.00 unless a
+    /// per-device display-20 admission selected Xe2_LPD).
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for XeLpgModeset<'a, M> {
@@ -546,12 +549,20 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             mmio,
             port,
             pipe_dmc: &crate::intel_gpu_dc_states::ServicePipeDmc,
+            ip: crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
         }
     }
 
     /// Report Pipe A's DMC lifetime to `pipe_dmc` instead.
     pub fn with_pipe_dmc(mut self, pipe_dmc: &'a dyn crate::intel_gpu_dc_states::PipeDmc) -> Self {
         self.pipe_dmc = pipe_dmc;
+        self
+    }
+
+    /// Dispatch the sequence on `ip` (display 20 only through
+    /// [`crate::intel_gpu_xe2lpd`]'s admitted entry).
+    pub(crate) fn with_display_ip(mut self, ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
+        self.ip = ip;
         self
     }
 
@@ -609,6 +620,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         };
         let result = XeLpgModeset::new(&checked, self.port)
             .with_pipe_dmc(self.pipe_dmc)
+            .with_display_ip(self.ip)
             .modeset_checked(primary_fb, mode);
         if !checked.display_access_ok() {
             return Err(result
@@ -685,6 +697,19 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             EdpPlan::Link { link, .. } => link.pipe_bpp,
             _ => crate::intel_gpu_xelpg_dsc::PIPE_BPP,
         };
+        let xe2 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd;
+        // Display 20 drops DSC when XE2LPD_DE_CAP fuses it out
+        // (has_dsc = 0): a stream that needs compression has no config.
+        if xe2 && dsc.is_some() {
+            let cap = crate::intel_gpu_xe2lpd::DeCap::read(self.mmio)
+                .map_err(|_| ModesetError::PipelineStopUnavailable)?;
+            if cap.dsc_removed {
+                if let Some(pps) = pps.as_mut() {
+                    pps.vdd_off();
+                }
+                return Err(ModesetError::DisplayResourceUnavailable);
+            }
+        }
 
         if cold.is_none() {
             // This bounded correction preserves an already-enabled DDI. A
@@ -728,7 +753,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 .pixel_clock_khz
                 .div_ceil(2)
                 .max(dsc_term.map_or(0, |t| t.min_cdclk_khz));
-            program_cdclk_floor_khz(self.mmio, floor)?;
+            if xe2 {
+                crate::intel_gpu_xe2lpd::raise_cdclk_floor(self.mmio, floor)
+                    .map_err(|_| ModesetError::PllLockTimeout)?;
+            } else {
+                program_cdclk_floor_khz(self.mmio, floor)?;
+            }
         }
         // hsw_crtc_enable's first step, after the pre-plane update:
         // intel_dmc_enable_pipe. A later failure leaves it enabled until
@@ -783,7 +813,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
 
         // Step 10: link-retrain preamble — D2D link up, port
         // buffer width, initial (zero) signal levels.
-        enable_d2d(self.mmio, self.port).map_err(map_cx0_err)?;
+        if xe2 {
+            // mtl_ddi_enable_d2d, display >= 20: DDI_BUF_CTL bits 29/28.
+            crate::intel_gpu_xe2lpd::enable_d2d(self.mmio, self.ip, self.port)
+                .map_err(|_| ModesetError::PllLockTimeout)?;
+        } else {
+            enable_d2d(self.mmio, self.port).map_err(map_cx0_err)?;
+        }
         program_port_buf_ctl(self.mmio, self.port, lanes);
         let phy = Cx0Phy::new(self.mmio, self.port);
         set_signal_levels_khz(&phy, link_khz, lanes, &[(0, 0); 4]).map_err(map_cx0_err)?;
@@ -892,6 +928,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self.program_dp_tp_ctl(DP_TP_CTL_LINK_TRAIN_NORMAL);
         if let Some(plan) = &dsc {
             self.enable_dsc(plan, &mode)?;
+        } else if xe2 {
+            // intel_enable_transcoder, display >= 14, for every transcoder
+            // enable on display 20 (no DP_FEC_BS_JITTER_WA there).
+            self.chicken_trans()?;
         }
         let frame = self.mmio.read32(0x70040);
         if frame == u32::MAX || !self.mmio.display_access_ok() {
@@ -903,7 +943,26 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         }
         self.enable_transcoder()?;
         self.observe_plane(primary_fb, &mode, trained_lanes, pipe_bpp, frame)?;
-        if owned.is_some() || cold.is_some_and(|off| off.mode == Some(mode)) {
+        let panel_active = owned.is_some() || cold.is_some_and(|off| off.mode == Some(mode));
+        if xe2 && panel_active {
+            // intel_program_dpkgc_latency after commit_modeset_enables:
+            // Pipe A is the only active pipe of the owned layout.
+            let timing = crate::intel_gpu_xelpg_wm::Timing {
+                pixel_rate_khz: mode.pixel_clock_khz,
+                htotal: u32::from(mode.h_total),
+                vtotal: u32::from(mode.v_total),
+                vblank_start: u32::from(mode.v_active),
+            };
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
+                .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
+            let linetime = crate::intel_gpu_xelpg_wm::linetime(timing)
+                .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
+            let value = crate::intel_gpu_xe2lpd::pkgc_latency(&latency, &[linetime])
+                .ok_or(ModesetError::DisplayResourceUnavailable)?;
+            crate::intel_gpu_xe2lpd::program_pkgc_latency(self.mmio, value)
+                .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
+        }
+        if panel_active {
             *OWNED_PANEL.lock() = Some(mode);
         }
         if let Some(pps) = pps.as_mut() {
@@ -1125,15 +1184,25 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         write_pps_sdp(self.mmio, Transcoder::A, plan).map_err(lost)?;
         enable_engines(self.mmio, PipeIdx::A, plan).map_err(lost)?;
         write_m_n(self.mmio, Transcoder::A, &plan.m_n(mode)).map_err(lost)?;
+        self.chicken_trans()
+    }
+
+    /// `intel_enable_transcoder`'s `CHICKEN_TRANS` bits for this IP: clear
+    /// `DP_DSC_INSERT_SF_AT_EOL_WA`, set `DP_FEC_BS_JITTER_WA` on 14.00 only.
+    fn chicken_trans(&mut self) -> Result<(), ModesetError> {
+        use crate::intel_gpu_pipes::Transcoder;
         let chicken = Transcoder::A.base() + CHICKEN_TRANS_OFFSET;
         let v = self.mmio.read32(chicken);
         if v == u32::MAX || !self.mmio.display_access_ok() {
             return Err(ModesetError::PipelineEnableUnavailable);
         }
-        self.mmio.write32(
-            chicken,
-            (v & !DP_DSC_INSERT_SF_AT_EOL_WA) | DP_FEC_BS_JITTER_WA,
-        );
+        let (clear, set) = match self.ip {
+            crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp => {
+                (DP_DSC_INSERT_SF_AT_EOL_WA, DP_FEC_BS_JITTER_WA)
+            }
+            ip => ip.chicken_trans(),
+        };
+        self.mmio.write32(chicken, (v & !clear) | set);
         compiler_fence(Ordering::SeqCst);
         Ok(())
     }
@@ -1743,6 +1812,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         .map_err(|_| ModesetError::InvalidFramebuffer)?;
         let ddi_reg = inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
         let route = dp_sst_func_ctl(self.port, lanes, pipe_bpp);
+        // Display 20 keeps the D2D link in DDI_BUF_CTL (enable and state).
+        let d2d_up = crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+            | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_STATE;
         let mut refused = false;
         let done = narf_scheduler::responsive_spin_until(
             || {
@@ -1783,6 +1855,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                                 | DP_TP_CTL_LINK_TRAIN_NORMAL
                         && conf & (3 << 30) == 3 << 30
                         && ddi & (1 << 31) != 0
+                        && (self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp
+                            || ddi & d2d_up == d2d_up)
                         && buf & ((1 << 24) | (1 << 7)) == 1 << 24
                         && before != start
                         && before == after)

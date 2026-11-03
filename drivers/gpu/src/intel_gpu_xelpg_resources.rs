@@ -24,7 +24,12 @@
 //! lowering) before planes, with `TGL_CDCLK_CD2X_PIPE_NONE`, and PM demand
 //! is lowered to the new requirement before any pipe is enabled. Live-pipe
 //! repartitioning (vblank-ordered DDB updates) is not implemented and is
-//! refused. SAGV is never enabled: the QGV peak bandwidth is `U16_MAX`
+//! refused. Display 20 (Xe2_LPD) runs the same transaction through
+//! [`compute_ip`]: its CDCLK table, the MDCLK/CDCLK ratio programmed around
+//! the clock change (`bxt_set_cdclk`) into the MBUS throttle and DBUF
+//! minimum trackers, its DBOX credits and four FBC instances; the
+//! multi-pipe live/pipe owners stay display-14 only. SAGV is never
+//! enabled: the QGV peak bandwidth is `U16_MAX`
 //! (`mtl_find_qgv_points` with a SAGV-rejecting pipe), so no DRAM QGV
 //! bandwidth derating is required for admission.
 
@@ -32,6 +37,7 @@ use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_pmdemand::{self as pmdemand, Demand, Params};
+use crate::intel_gpu_xe2lpd::DisplayIp;
 use crate::intel_gpu_xelpg_cdclk::{self as cdclk, CdclkError, Rung};
 use crate::intel_gpu_xelpg_dbuf::{self as dbuf, Dbuf, DdbError, PipeInput, PlaneInput};
 use crate::intel_gpu_xelpg_wm::{self as wm, Latency, PlaneWm, Surface, Tiling, WmError};
@@ -90,6 +96,8 @@ pub(crate) struct State {
     /// keep exactly this configuration across a repartition. Read by the
     /// live/pipe owners.
     pub(crate) requests: [Option<PipeRequest>; PIPES],
+    /// The display IP the state was computed for (`compute` is 14.00).
+    pub(crate) ip: DisplayIp,
 }
 
 /// Typed refusals and failures.
@@ -177,6 +185,18 @@ fn timing(p: &PipeRequest) -> wm::Timing {
 
 /// Compute and check the complete state. Pure: no register access.
 pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, ResourceError> {
+    compute_ip(DisplayIp::Xelpdp, request, latency)
+}
+
+/// [`compute`] for `ip`. Display 20 shares the display-14 watermark,
+/// DDB, bandwidth and PM demand arithmetic (`DISPLAY_VER >= 14`
+/// branches, `mtl_sa_info`) and differs in its CDCLK table and in the
+/// MDCLK-ratio dependent DBUF/MBUS values ([`State::dbuf_ctl`]).
+pub(crate) fn compute_ip(
+    ip: DisplayIp,
+    request: &Request,
+    latency: &Latency,
+) -> Result<State, ResourceError> {
     let active = request
         .pipes
         .iter()
@@ -277,7 +297,7 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
     if min_cdclk > cdclk::MAX_CDCLK_KHZ {
         return Err(ResourceError::CdclkUnsatisfiable);
     }
-    let rung = cdclk::calc_cdclk(min_cdclk).ok_or(ResourceError::CdclkUnsatisfiable)?;
+    let rung = cdclk::calc_cdclk_ip(ip, min_cdclk).ok_or(ResourceError::CdclkUnsatisfiable)?;
     let qgv_peak_bw = sagv_peak_bw(request, latency, &dbuf, &inputs)?;
     let voltage_level = min_voltage.max(cdclk::voltage_level(rung.cdclk_khz));
     let pmdemand = Demand {
@@ -297,6 +317,7 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
         pmdemand,
         cursor_visible,
         requests: request.pipes,
+        ip,
     };
     // Every computed level must be representable in its register.
     if state.plane_registers().is_none() {
@@ -414,7 +435,7 @@ impl State {
             return Ok(*self);
         }
         plane.tiling = tiling;
-        let fresh = compute(&request, latency)?;
+        let fresh = compute_ip(self.ip, &request, latency)?;
         if fresh.dbuf.active_pipes != self.dbuf.active_pipes
             || fresh.dbuf.joined != self.dbuf.joined
             || fresh.dbuf.slices != self.dbuf.slices
@@ -431,6 +452,62 @@ impl State {
             return Err(ResourceError::Unsupported);
         }
         Ok(out)
+    }
+
+    /// `DBUF_CTL_S(slice)` over `old` for this state's IP: display 14 keeps
+    /// [`Dbuf::dbuf_ctl`]; display 20 takes its minimum tracker from the
+    /// MDCLK/CDCLK ratio of the state's clock and preserves the tracker
+    /// state service field.
+    pub(crate) fn dbuf_ctl(&self, slice: usize, old: u32, enabled: u8) -> u32 {
+        match self.ip {
+            DisplayIp::Xelpdp => self.dbuf.dbuf_ctl(slice, old, enabled),
+            DisplayIp::Xe2Lpd => crate::intel_gpu_xe2lpd::dbuf_ctl(
+                slice,
+                old,
+                enabled,
+                crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
+                self.dbuf.joined,
+            ),
+        }
+    }
+
+    /// The `DBUF_CTL` bits a proof compares: power request/state and both
+    /// tracker fields on display 14, only the minimum tracker on display 20.
+    pub(crate) fn dbuf_ctl_mask(&self) -> u32 {
+        match self.ip {
+            DisplayIp::Xelpdp => 0xc0ff_0000,
+            DisplayIp::Xe2Lpd => 0xc000_0000 | crate::intel_gpu_xe2lpd::DBUF_MIN_TRACKER_MASK,
+        }
+    }
+
+    /// `PIPE_MBUS_DBOX_CTL(pipe)` for this state's IP.
+    pub(crate) fn dbox(&self, pipe: usize) -> u32 {
+        match self.ip {
+            DisplayIp::Xelpdp => self.dbuf.dbox(pipe),
+            DisplayIp::Xe2Lpd => crate::intel_gpu_xe2lpd::dbox(self.dbuf.joined),
+        }
+    }
+
+    /// `MBUS_CTL` (join, hashing, select; display 20 adds the translation
+    /// throttle of the state's MDCLK ratio).
+    pub(crate) fn mbus_ctl_select(&self, pipe: Option<usize>) -> u32 {
+        let join = self.dbuf.mbus_ctl_select(pipe);
+        match self.ip {
+            DisplayIp::Xelpdp => join,
+            DisplayIp::Xe2Lpd => {
+                join | crate::intel_gpu_xe2lpd::mbus_throttle(
+                    crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
+                )
+            }
+        }
+    }
+
+    /// The `MBUS_CTL` bits this state owns.
+    pub(crate) fn mbus_ctl_mask(&self) -> u32 {
+        match self.ip {
+            DisplayIp::Xelpdp => dbuf::MBUS_CTL_MASK,
+            DisplayIp::Xe2Lpd => dbuf::MBUS_CTL_MASK | crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK,
+        }
     }
 
     /// Every plane/cursor WM and DDB register of every pipe. Planes of
@@ -526,6 +603,20 @@ pub(crate) fn wait(
 
 /// Every pipe, universal plane, cursor, DSB engine and FBC instance off.
 pub(crate) fn require_idle(io: &(impl MmioWindow + ?Sized)) -> Result<(), ResourceError> {
+    require_idle_ip(io, DisplayIp::Xelpdp)
+}
+
+/// [`require_idle`] over `ip`'s FBC instances (A–B on 14.00, A–D on
+/// display 20).
+pub(crate) fn require_idle_ip(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+) -> Result<(), ResourceError> {
+    for fbc in 2..ip.fbc_instances() {
+        if read(io, 0x43208 + fbc * 0x40)? & (1 << 31) != 0 {
+            return Err(ResourceError::Busy);
+        }
+    }
     for pipe in 0..PIPES as u64 {
         if read(io, 0x70008 + pipe * 0x1000)? & 0xc000_0000 != 0
             || read(io, 0x70080 + pipe * 0x1000)? & 0x27 != 0
@@ -568,7 +659,7 @@ impl Snapshot {
         state: &State,
     ) -> Result<Self, ResourceError> {
         let pmdemand = pmdemand::current(io)?;
-        let cdclk = cdclk::Current::read(io)?;
+        let cdclk = cdclk::Current::read_ip(io, state.ip)?;
         let mut dbuf_ctl = [0; dbuf::SLICES];
         for (v, r) in dbuf_ctl.iter_mut().zip(dbuf::DBUF_CTL) {
             *v = read(io, r)?;
@@ -619,7 +710,7 @@ fn program_slices(
     enabled: u8,
 ) -> Result<(), ResourceError> {
     for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
-        let value = state.dbuf.dbuf_ctl(slice, old[slice], enabled);
+        let value = state.dbuf_ctl(slice, old[slice], enabled);
         io.write32(r, value);
         let want = if enabled & (1 << slice) != 0 {
             dbuf::DBUF_POWER_STATE
@@ -629,6 +720,36 @@ fn program_slices(
         wait(io, r, dbuf::DBUF_POWER_STATE, want)?;
         let mask = dbuf::DBUF_POWER_REQUEST | dbuf::DBUF_TRACKER_MASK;
         if read(io, r)? & mask != value & mask {
+            return Err(ResourceError::Readback);
+        }
+    }
+    Ok(())
+}
+
+fn program_ratio(
+    io: &(impl MmioWindow + ?Sized),
+    target: Rung,
+    joined: bool,
+) -> Result<(), ResourceError> {
+    crate::intel_gpu_xe2lpd::program_mdclk_ratio(io, target, joined)
+        .map_err(|_| ResourceError::Readback)
+}
+
+/// Display 20: put the captured MBUS throttle and DBUF minimum trackers
+/// back (the ratio fields of the original clock).
+fn restore_ratio(io: &(impl MmioWindow + ?Sized), snap: &Snapshot) -> Result<(), ResourceError> {
+    use crate::intel_gpu_xe2lpd::{DBUF_MIN_TRACKER_MASK, MBUS_THROTTLE_MASK};
+    let mbus = read(io, dbuf::MBUS_CTL)?;
+    checked(
+        io,
+        dbuf::MBUS_CTL,
+        (mbus & !MBUS_THROTTLE_MASK) | (snap.mbus_ctl & MBUS_THROTTLE_MASK),
+    )?;
+    for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
+        let value = (read(io, r)? & !(DBUF_MIN_TRACKER_MASK | dbuf::DBUF_POWER_STATE))
+            | (snap.dbuf_ctl[slice] & DBUF_MIN_TRACKER_MASK);
+        io.write32(r, value);
+        if read(io, r)? & DBUF_MIN_TRACKER_MASK != value & DBUF_MIN_TRACKER_MASK {
             return Err(ResourceError::Readback);
         }
     }
@@ -646,7 +767,27 @@ fn apply(
     pmdemand::program(io, &state.pmdemand, Some(&snap.pmdemand))?;
     // intel_set_cdclk_pre_plane_update, disable_pipes: the final config.
     *stage = Stage::Cdclk;
-    cdclk::program(io, &snap.cdclk, state.cdclk)?;
+    match state.ip {
+        DisplayIp::Xelpdp => cdclk::program(io, &snap.cdclk, state.cdclk)?,
+        DisplayIp::Xe2Lpd => {
+            // bxt_set_cdclk, display >= 20: the MDCLK/CDCLK ratio goes in
+            // before a lowering and after a raising (an unknown clock is
+            // sanitized to 0, so it is raised), with the new MBUS join.
+            let lowering =
+                snap.cdclk.known.is_some() && state.cdclk.cdclk_khz < snap.cdclk.actual_khz;
+            let raising = snap
+                .cdclk
+                .known
+                .is_none_or(|_| state.cdclk.cdclk_khz > snap.cdclk.actual_khz);
+            if lowering {
+                program_ratio(io, state.cdclk, state.dbuf.joined)?;
+            }
+            cdclk::program_ip(io, state.ip, &snap.cdclk, state.cdclk)?;
+            if raising {
+                program_ratio(io, state.cdclk, state.dbuf.joined)?;
+            }
+        }
+    }
     // intel_dbuf_pre_plane_update: old | new slices.
     *stage = Stage::Dbuf;
     let old_slices = snap.enabled_slices();
@@ -658,11 +799,11 @@ fn apply(
     )?;
     // intel_dbuf_mbus_pre_ddb_update: join, DBOX, min tracker (above).
     *stage = Stage::Mbus;
-    let mbus = (snap.mbus_ctl & !dbuf::MBUS_CTL_MASK) | state.dbuf.mbus_ctl();
+    let mbus = (snap.mbus_ctl & !state.mbus_ctl_mask()) | state.mbus_ctl_select(None);
     checked(io, dbuf::MBUS_CTL, mbus)?;
     for pipe in 0..PIPES {
         if state.dbuf.active_pipes & (1 << pipe) != 0 {
-            checked(io, dbuf::dbox_ctl(pipe), state.dbuf.dbox(pipe))?;
+            checked(io, dbuf::dbox_ctl(pipe), state.dbox(pipe))?;
         }
     }
     // skl_write_plane_wm / skl_write_cursor_wm for every plane.
@@ -703,16 +844,36 @@ fn restore(
             checked(io, r, v)?;
         }
     }
+    // Display 20: the MDCLK ratio fields stay at the clock now running and
+    // follow the clock restore below (before it lowers, after it raises).
+    let ratio_fields = |r: u64, mask: u32| -> Result<u32, ResourceError> {
+        Ok(if state.ip == DisplayIp::Xe2Lpd {
+            read(io, r)? & mask
+        } else {
+            0
+        })
+    };
+    let ratio_mask = |mask: u32| {
+        if state.ip == DisplayIp::Xe2Lpd {
+            mask
+        } else {
+            0
+        }
+    };
     if stage >= Stage::Mbus {
-        checked(io, dbuf::MBUS_CTL, snap.mbus_ctl)?;
+        let mask = ratio_mask(crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK);
+        let kept = ratio_fields(dbuf::MBUS_CTL, mask)?;
+        checked(io, dbuf::MBUS_CTL, (snap.mbus_ctl & !mask) | kept)?;
         for (pipe, v) in snap.dbox.iter().enumerate() {
             checked(io, dbuf::dbox_ctl(pipe), *v)?;
         }
     }
     if stage >= Stage::Dbuf {
+        let mask = ratio_mask(crate::intel_gpu_xe2lpd::DBUF_MIN_TRACKER_MASK);
         for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
             let original = snap.dbuf_ctl[slice];
-            io.write32(r, original & !dbuf::DBUF_POWER_STATE);
+            let kept = ratio_fields(r, mask)?;
+            io.write32(r, (original & !(dbuf::DBUF_POWER_STATE | mask)) | kept);
             wait(
                 io,
                 r,
@@ -722,7 +883,20 @@ fn restore(
         }
     }
     if stage >= Stage::Cdclk {
-        cdclk::restore(io, &snap.cdclk)?;
+        match state.ip {
+            DisplayIp::Xelpdp => cdclk::restore(io, &snap.cdclk)?,
+            DisplayIp::Xe2Lpd => {
+                let now = cdclk::Current::read_ip(io, state.ip)?;
+                let lowering = snap.cdclk.actual_khz < now.actual_khz;
+                if lowering {
+                    restore_ratio(io, snap)?;
+                }
+                cdclk::restore_ip(io, state.ip, &snap.cdclk)?;
+                if !lowering {
+                    restore_ratio(io, snap)?;
+                }
+            }
+        }
     }
     if stage >= Stage::PmDemand {
         // Only once the original clock is back may its demand be restored.
@@ -736,7 +910,7 @@ fn restore(
 /// itself fails, the PM demand is left at the raised superset and the
 /// original error is returned (callers keep every pipe off either way).
 pub(crate) fn commit(io: &(impl MmioWindow + ?Sized), state: &State) -> Result<(), ResourceError> {
-    require_idle(io)?;
+    require_idle_ip(io, state.ip)?;
     let snap = Snapshot::capture(io, state)?;
     let mut stage = Stage::Nothing;
     match apply(io, state, &snap, &mut stage) {

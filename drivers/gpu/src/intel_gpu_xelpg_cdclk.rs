@@ -17,6 +17,12 @@
 //!   `dg2_cdclk_squash_program`, `pll_enable_wa_needed`
 //!   (wa_15010685871, display 14.00) and `bxt_cdclk_ctl`.
 //!
+//! Display 20 (Xe2_LPD) dispatches through the `_ip` variants: its
+//! `xe2lpd_cdclk_table` and `bxt_cdclk_ctl`'s MDCLK source select replace
+//! the 14.00 table and decimal field; the change sequence is shared
+//! (`pll_enable_wa_needed` covers 14.00 and 20.00; Wa_13012396614 is
+//! 30.00 only).
+//!
 //! The owned transaction changes CDCLK only with every pipe off
 //! (`disable_pipes`, `pipe = INVALID_PIPE`), so the CD2X pipe field is
 //! always `TGL_CDCLK_CD2X_PIPE_NONE` and both raising and lowering happen in
@@ -25,6 +31,7 @@
 use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_xe2lpd::DisplayIp;
 
 /// `CDCLK_CTL`.
 pub(crate) const CDCLK_CTL: u64 = 0x46000;
@@ -104,6 +111,27 @@ fn rung(cdclk_khz: u32) -> Option<Rung> {
     TABLE.iter().copied().find(|r| r.cdclk_khz == cdclk_khz)
 }
 
+/// `intel_init_cdclk_hooks`' table for `ip`: `mtl_cdclk_table` on 14.00,
+/// `xe2lpd_cdclk_table` on display 20 (both `rplu_cdclk_funcs`).
+pub(crate) fn table(ip: DisplayIp) -> &'static [Rung] {
+    match ip {
+        DisplayIp::Xelpdp => &TABLE,
+        DisplayIp::Xe2Lpd => &crate::intel_gpu_xe2lpd::CDCLK_TABLE,
+    }
+}
+
+/// [`calc_cdclk`] over `ip`'s table.
+pub(crate) fn calc_cdclk_ip(ip: DisplayIp, min_khz: u32) -> Option<Rung> {
+    table(ip).iter().copied().find(|r| r.cdclk_khz >= min_khz)
+}
+
+fn rung_ip(ip: DisplayIp, cdclk_khz: u32) -> Option<Rung> {
+    match ip {
+        DisplayIp::Xelpdp => rung(cdclk_khz),
+        DisplayIp::Xe2Lpd => table(ip).iter().copied().find(|r| r.cdclk_khz == cdclk_khz),
+    }
+}
+
 /// `rplu_calc_voltage_level` (`rplu_voltage_level_max_cdclk`).
 pub(crate) fn voltage_level(cdclk_khz: u32) -> u8 {
     match cdclk_khz {
@@ -133,6 +161,15 @@ fn decimal(cdclk_khz: u32) -> u32 {
 /// `bxt_cdclk_ctl(display, config, INVALID_PIPE)` for display 14.
 pub(crate) fn ctl_value(target: Rung) -> u32 {
     CD2X_PIPE_NONE | decimal(target.cdclk_khz)
+}
+
+/// `bxt_cdclk_ctl(display, config, INVALID_PIPE)` for `ip`: display >= 20
+/// selects the MDCLK source (the CDCLK PLL) instead of the decimal field.
+pub(crate) fn ctl_value_ip(ip: DisplayIp, target: Rung) -> u32 {
+    match ip {
+        DisplayIp::Xelpdp => ctl_value(target),
+        DisplayIp::Xe2Lpd => CD2X_PIPE_NONE | crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
+    }
 }
 
 /// `dg2_cdclk_squash_program`.
@@ -182,6 +219,14 @@ fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, CdclkError> {
 
 impl Current {
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, CdclkError> {
+        Self::read_ip(io, DisplayIp::Xelpdp)
+    }
+
+    /// [`Current::read`] sanitized against `ip`'s table and CTL encoding.
+    pub(crate) fn read_ip(
+        io: &(impl MmioWindow + ?Sized),
+        ip: DisplayIp,
+    ) -> Result<Self, CdclkError> {
         let pll = read(io, DE_PLL_ENABLE)?;
         let squash = read(io, CDCLK_SQUASH_CTL)?;
         let ctl = read(io, CDCLK_CTL)?;
@@ -195,10 +240,10 @@ impl Current {
         // bxt_sanitize_cdclk: PLL off, a rate outside the table, a VCO that
         // is not the table's, or a CTL other than bxt_cdclk_ctl (ignoring the
         // CD2X pipe field) are all "unknown".
-        let known = rung(actual_khz).filter(|r| {
+        let known = rung_ip(ip, actual_khz).filter(|r| {
             pll & PLL_ENABLE != 0
                 && pll & PLL_RATIO_MASK == r.ratio
-                && ctl & !CD2X_PIPE_MASK == ctl_value(*r) & !CD2X_PIPE_MASK
+                && ctl & !CD2X_PIPE_MASK == ctl_value_ip(ip, *r) & !CD2X_PIPE_MASK
                 && ctl & CD2X_DIV_SEL_MASK == 0
         });
         Ok(Self {
@@ -238,7 +283,7 @@ fn squash_divider(waveform: u16) -> u32 {
 }
 
 /// `_bxt_set_cdclk` for one configuration, from hardware state `hw`.
-fn set_steps(hw: Option<Rung>, cfg: Rung, steps: &mut Vec<Step>) {
+fn set_steps(ip: DisplayIp, hw: Option<Rung>, cfg: Rung, steps: &mut Vec<Step>) {
     match hw {
         // HAS_CDCLK_CRAWL && hw.vco > 0 && vco > 0 && !unknown.
         Some(old) => {
@@ -258,14 +303,20 @@ fn set_steps(hw: Option<Rung>, cfg: Rung, steps: &mut Vec<Step>) {
         waveform: cfg.waveform,
     });
     steps.push(Step::Ctl {
-        value: ctl_value(cfg),
+        value: ctl_value_ip(ip, cfg),
     });
 }
 
 /// `bxt_set_cdclk` plan from `old` to `target`, including the
 /// `cdclk_compute_crawl_and_squash_midpoint` intermediate. Empty when the
 /// known hardware configuration already equals the target.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn plan(old: &Current, target: Rung) -> Vec<Step> {
+    plan_ip(DisplayIp::Xelpdp, old, target)
+}
+
+/// [`plan`] over `ip`'s table and CTL encoding.
+pub(crate) fn plan_ip(ip: DisplayIp, old: &Current, target: Rung) -> Vec<Step> {
     let mut steps = Vec::new();
     match old.known {
         Some(hw) if hw == target => {}
@@ -289,15 +340,15 @@ pub(crate) fn plan(old: &Current, target: Rung) -> Vec<Step> {
                     ratio,
                     waveform,
                 };
-                if rung(mid_khz) == Some(mid) {
-                    set_steps(Some(hw), mid, &mut steps);
-                    set_steps(Some(mid), target, &mut steps);
+                if rung_ip(ip, mid_khz) == Some(mid) {
+                    set_steps(ip, Some(hw), mid, &mut steps);
+                    set_steps(ip, Some(mid), target, &mut steps);
                     return steps;
                 }
             }
-            set_steps(Some(hw), target, &mut steps);
+            set_steps(ip, Some(hw), target, &mut steps);
         }
-        None => set_steps(None, target, &mut steps),
+        None => set_steps(ip, None, target, &mut steps),
     }
     steps
 }
@@ -380,7 +431,17 @@ pub(crate) fn program(
     old: &Current,
     target: Rung,
 ) -> Result<(), CdclkError> {
-    for step in plan(old, target) {
+    program_ip(io, DisplayIp::Xelpdp, old, target)
+}
+
+/// [`program`] over `ip`'s table and CTL encoding.
+pub(crate) fn program_ip(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    old: &Current,
+    target: Rung,
+) -> Result<(), CdclkError> {
+    for step in plan_ip(ip, old, target) {
         execute(io, step)?;
     }
     let pll = read(io, DE_PLL_ENABLE)?;
@@ -388,7 +449,7 @@ pub(crate) fn program(
         != PLL_ENABLE | PLL_LOCK | target.ratio
         || read(io, CDCLK_SQUASH_CTL)? != squash_value(target.waveform)
         // An unchanged known clock keeps its firmware CD2X pipe field.
-        || read(io, CDCLK_CTL)? & !CD2X_PIPE_MASK != ctl_value(target) & !CD2X_PIPE_MASK
+        || read(io, CDCLK_CTL)? & !CD2X_PIPE_MASK != ctl_value_ip(ip, target) & !CD2X_PIPE_MASK
         || crate::intel_gpu_modeset_xelpg::cdclk_current_khz(io) != target.cdclk_khz
     {
         return Err(CdclkError::Readback);
@@ -404,10 +465,19 @@ pub(crate) fn restore(
     io: &(impl MmioWindow + ?Sized),
     original: &Current,
 ) -> Result<(), CdclkError> {
-    let now = Current::read(io)?;
+    restore_ip(io, DisplayIp::Xelpdp, original)
+}
+
+/// [`restore`] over `ip`'s table and CTL encoding.
+pub(crate) fn restore_ip(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    original: &Current,
+) -> Result<(), CdclkError> {
+    let now = Current::read_ip(io, ip)?;
     if let Some(rung) = original.known {
         if now.known != Some(rung) || now.ctl != original.ctl {
-            program(io, &now, rung)?;
+            program_ip(io, ip, &now, rung)?;
             io.write32(CDCLK_CTL, original.ctl);
         }
     } else if now.pll != original.pll || now.squash != original.squash || now.ctl != original.ctl {
@@ -429,7 +499,7 @@ pub(crate) fn restore(
         io.write32(CDCLK_SQUASH_CTL, original.squash);
         io.write32(CDCLK_CTL, original.ctl);
     }
-    let after = Current::read(io)?;
+    let after = Current::read_ip(io, ip)?;
     if after.pll & (PLL_ENABLE | PLL_RATIO_MASK) != original.pll & (PLL_ENABLE | PLL_RATIO_MASK)
         || after.squash != original.squash
         || after.ctl != original.ctl
