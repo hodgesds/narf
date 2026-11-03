@@ -130,7 +130,9 @@ and CI compiler-cache integration.
 - Wi-Fi firmware parser tests construct small, explicit wire inputs in Rust.
   No extracted metadata binaries, regeneration step or local vendor firmware
   installation is required. `cargo xtask wifi-fixtures board-manifest` encodes
-  explicit deployment facts as unsigned NBSP v1 data for the existing
+  explicit deployment facts (families `pcie43602`, `sdio43439` and
+  `pciefullmac` with its `chip` and optional `antenna_sku`) as unsigned NBSP
+  v1 data for the existing
   `pack-firmware` signing flow. It does not invent board calibration or grant
   device authority. The former metadata `check`, `write` and `extract` commands
   are removed.

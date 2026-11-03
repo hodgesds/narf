@@ -1628,8 +1628,14 @@ fn create_inner(
     let (bus, state) = model();
     {
         let mut s = state.lock();
-        if let Some((identity, _, _)) = chip {
+        if let Some((identity, id, _)) = chip {
             s.registers.insert(chip::ENUM_BASE, identity);
+            use crate::brcmfmac::chip_profile;
+            if chip_profile::covered(id) == Some(Some(chip_profile::Cpu::Ca7)) {
+                let rambase = chip_profile::tcm_rambase(id, (identity >> 16 & 15) as u8)
+                    .expect("CA7 Linux RAM base");
+                ca7_layout(&mut s, rambase);
+            }
         }
         put(&mut s, SHARED, &version.to_le_bytes());
         put(&mut s, SHARED + 36, &prefix.to_le_bytes());

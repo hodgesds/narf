@@ -541,8 +541,23 @@ Linux OTP chips 4355, 4364, 4377, 4378 and 4387 with no CPU table fact:
 the loader takes Linux's discovered-ARM dispatch (CR4 first, then CA7).
 Left out: BCM4354 (Linux binds raw
 PCI id 0x4354 but has no PCIe firmware row, so Linux itself stops at
-"Unknown chip"), CYW-vendor 43596/54591 (see below) and chips without a
+"Unknown chip"), CYW-vendor 43596/54591 (below) and chips without a
 PCIe row.
+
+CYW-vendor PCIe ids: Linux binds 0x4415 (BCM43596) with
+`BRCMF_FWVENDOR_CYW`, but `brcmf_pcie_fwnames` has no row for its chip, so
+Linux stops at "Unknown chip" too; it stays out with no NARF gap. 0x4417
+(CY 54591) does have a firmware row (chip 4355 rev 13,
+`brcmfmac54591-pcie`), but Linux runs it through `cyw/core.c`'s
+`brcmf_cyw_ops`: `activate_events` writes the `event_msgs_ext` iovar
+(`CYW_EVENTMSGS_SET_MASK`) instead of `event_msgs`, `alloc_fweh_info`
+remaps four event codes (EXT_AUTH_REQ/FRAME_RX, MGMT_FRAME_TXSTATUS /
+OFFCHAN_DONE) into the CYW numbering, and SAE/external auth use the CYW
+`sae_password` / `auth_status` paths. Every NARF msgbuf role owner
+(station, AP, monitor, P2P, secondary bsscfgs; `event_mask.rs`) writes the
+WCC/BCA `event_msgs` mask, so 54591 stays unadmitted (`implemented` refuses
+the CYW vendor; its id is not probed) until those owners grow the CYW
+event protocol. Linux also skips the OTP read for CYW, which NARF mirrors.
 
 OTP board identity (`brcmf_pcie_read_otp`, WCC/BCA vendors only, after
 chip attach and before the firmware request): `chip_profile::otp_source`
@@ -650,7 +665,30 @@ firmware roam to a 160 MHz chanspec is accepted only on `wide_phy`.
 BCM43602 and CYW43439 never form the VHT160 profile or a 160 inventory, so
 they stay <= 80 MHz. BCA
 firmware's 212 event codes (`bca/core.c`) need the same 27-byte event mask
-as WCC's 213. Remaining: 4-stream fixture coverage and CYW-vendor chips.
+as WCC's 213. Remaining: 4-stream fixture coverage and the CYW-vendor
+54591 (CYW event protocol, below).
+
+Signed-record tooling: `cargo xtask wifi-fixtures board-manifest` encodes
+family 3 as `"family": "pciefullmac"` with a required non-43602 `chip`, a
+PCI host with vendor 0x14e4, no card, two assets, and an optional
+`antenna_sku` (bytes 96..112; `board` and keys may then contain `,`). The
+encoder only bounds fields; the kernel parser enforces the Linux tables.
+
+Pass-2 CA7 station run: the shared msgbuf station model's CA7 layout
+(`runtime_tests::ca7_layout`: CA7 + SYS_MEM cores, RAM image at the Linux
+base 0x200000 with every firmware-published TCM pointer relocated) boots
+BCM4366 (BCA id 0x43c3) through `brcmf_chip_ca7_*` and joins/tears down
+VHT80 like the BCM4356 CR4 run.
+
+Written, unexecuted (pass 2): `drivers/wireless/brcmfmac/chips`
+`smoke_brcmf_chip_profile_random_seed_footer_below_nvram`,
+`..._otp_parse_and_board_types`, `..._chipcommon_otp_read`,
+`..._station_vht160_join_geometry`, `..._station_ca7_bcm4366_end_to_end`;
+`drivers/wireless/brcmfmac/provision`
+`smoke_brcm_signed_manifest_fullmac_otp_board_binding`;
+`drivers/wireless/brcmfmac/channel`
+`smoke_fullmac_occupied_vht160_literal_sidebands_and_exact_span`; xtask
+unit test `encodes_family_three_records_with_optional_antenna_sku`.
 
 Written, unexecuted: `drivers/wireless/brcmfmac/chips`
 `smoke_brcmf_chip_profile_linux_rambase_and_firmware_rows`,

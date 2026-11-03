@@ -26,6 +26,13 @@ pub(super) struct Args {
 struct Record {
     family: String,
     board: String,
+    /// Family 3 (`pciefullmac`): the ChipCommon chip id (not 43602).
+    #[serde(default)]
+    chip: Option<Value>,
+    /// Family 3 Linux OTP chips: Linux's antenna SKU (bytes 96..112);
+    /// `board` is then Linux's board type (`,` allowed).
+    #[serde(default)]
+    antenna_sku: Option<String>,
     revisions: Value,
     host: Host,
     #[serde(default)]
@@ -106,12 +113,19 @@ fn number(value: &Value, max: u64) -> Result<u64> {
     Ok(number)
 }
 fn text(value: &str, len: usize, key: bool) -> Result<Vec<u8>> {
+    text_with(value, len, key, false)
+}
+/// `comma`: Linux board types (`apple,<board>`) of family-3 OTP records.
+fn text_with(value: &str, len: usize, key: bool, comma: bool) -> Result<Vec<u8>> {
     ensure!(
         !value.is_empty()
             && value.len() < len
-            && value
-                .bytes()
-                .all(|x| x.is_ascii_alphanumeric() || b"_.-".contains(&x) || (key && x == b'/')),
+            && value.bytes().all(|x| {
+                x.is_ascii_alphanumeric()
+                    || b"_.-".contains(&x)
+                    || (key && x == b'/')
+                    || (comma && x == b',')
+            }),
         "invalid board name or asset key"
     );
     if key {
@@ -169,8 +183,29 @@ fn encode(records: &[Record], base: &Path, fixtures: bool) -> Result<Vec<u8>> {
         let family = match record.family.as_str() {
             "pcie43602" => 1,
             "sdio43439" => 2,
+            "pciefullmac" => 3,
             _ => bail!("unsupported NBSP family"),
         };
+        // The kernel parser checks family 3 against the Linux chip tables;
+        // this encoder only bounds the fields it writes.
+        let chip = match (family, &record.chip) {
+            (1, None) => 43602,
+            (2, None) => 43439,
+            (3, Some(chip)) => {
+                let chip = number(chip, 65535)?;
+                ensure!(
+                    chip != 0 && chip != 43602,
+                    "family 3 names a non-43602 chip"
+                );
+                chip
+            }
+            _ => bail!("chip id is required for and only for family 3"),
+        };
+        ensure!(
+            family == 3 || record.antenna_sku.is_none(),
+            "antenna SKU is family-3 only"
+        );
+        let comma = record.antenna_sku.is_some();
         let revisions = number(&record.revisions, u16::MAX.into())?;
         ensure!(revisions != 0, "empty revision mask");
         let card = if let Some(card) = &record.card {
@@ -217,6 +252,11 @@ fn encode(records: &[Record], base: &Path, fixtures: bool) -> Result<Vec<u8>> {
                 ids[0] == 0x14e4 && (0x43ba..=0x43bc).contains(&ids[1]) && card == [0; 3],
                 "invalid BCM43602 selector"
             );
+        } else if family == 3 {
+            ensure!(
+                kind == 1 && ids[0] == 0x14e4 && card == [0; 3],
+                "invalid PCIe FullMAC selector"
+            );
         } else {
             ensure!(
                 matches!(card, [1, 0x2d0, 0xa9af] | [1, 0x4b4, 0xbd3d])
@@ -231,7 +271,7 @@ fn encode(records: &[Record], base: &Path, fixtures: bool) -> Result<Vec<u8>> {
         let row = &mut output[16 + index * 616..16 + (index + 1) * 616];
         row[0] = family;
         row[1] = card[0] as u8;
-        put16(row, 2, if family == 1 { 43602 } else { 43439 });
+        put16(row, 2, chip);
         put16(row, 4, revisions);
         row[6] = kind;
         row[8..16].copy_from_slice(&address.to_le_bytes());
@@ -241,9 +281,12 @@ fn encode(records: &[Record], base: &Path, fixtures: bool) -> Result<Vec<u8>> {
         put32(row, 24, class);
         put16(row, 28, card[1]);
         put16(row, 30, card[2]);
-        row[32..96].copy_from_slice(&text(&record.board, 64, false)?);
+        row[32..96].copy_from_slice(&text_with(&record.board, 64, false, comma)?);
+        if let Some(sku) = &record.antenna_sku {
+            row[96..112].copy_from_slice(&text(sku, 16, false)?);
+        }
         ensure!(
-            record.assets.len() == if family == 1 { 2 } else { 3 },
+            record.assets.len() == if family == 2 { 3 } else { 2 },
             "incorrect asset count"
         );
         let mut keys = std::collections::BTreeSet::new();
@@ -261,7 +304,7 @@ fn encode(records: &[Record], base: &Path, fixtures: bool) -> Result<Vec<u8>> {
             );
             if role == 1 {
                 ensure!(
-                    if family == 1 {
+                    if family != 2 {
                         data.len() >= 4
                     } else {
                         data.len() <= 4 * 1024 * 1024
@@ -275,7 +318,7 @@ fn encode(records: &[Record], base: &Path, fixtures: bool) -> Result<Vec<u8>> {
             row[at + 1] = u8::from(signed);
             put32(row, at + 4, data.len() as u64);
             row[at + 8..at + 40].copy_from_slice(&Sha256::digest(&data));
-            row[at + 40..at + 168].copy_from_slice(&text(&asset.key, 128, true)?);
+            row[at + 40..at + 168].copy_from_slice(&text_with(&asset.key, 128, true, comma)?);
         }
     }
     Ok(output)
@@ -383,5 +426,42 @@ mod tests {
         assert!(encode(&records, Path::new("."), true).is_ok());
         records[1].assets[1].fixture = Some(vec![0; 64001]);
         assert!(encode(&records, Path::new("."), true).is_err());
+    }
+    #[test]
+    fn encodes_family_three_records_with_optional_antenna_sku() {
+        // Linux's own comment example board type; no board is claimed.
+        let records: Vec<Record> = serde_json::from_value(json!([
+            {"family":"pciefullmac","chip":17272,"board":"apple,shikoku","antenna_sku":"X3",
+             "revisions":8,
+             "host":{"kind":"pci","address":[0,1,0,0],"vendor":5348,"device":17445,
+                     "subsystem_vendor":0,"subsystem_device":0,"class":163840},
+             "assets":[{"key":"brcm/brcmfmac4378b1-pcie.apple,shikoku.bin","fixture":[68,51,34,17]},
+                       {"key":"brcm/brcmfmac4378b1-pcie.apple,shikoku-RASP-m-6.11-X3.txt",
+                        "fixture":[98,111,97,114,100,114,101,118,61,49,10]}]}
+        ]))
+        .unwrap();
+        let encoded = encode(&records, Path::new("."), true).unwrap();
+        let row = &encoded[16..];
+        assert_eq!(row[0], 3);
+        assert_eq!(u16::from_le_bytes([row[2], row[3]]), 0x4378);
+        assert_eq!(&row[32..45], b"apple,shikoku");
+        assert_eq!(&row[96..99], b"X3\0");
+        assert!(row[112 + 2 * 168..].iter().all(|b| *b == 0));
+        // Family 3 needs a non-43602 chip; a SKU is family-3 only.
+        let mut bad: Vec<Record> = serde_json::from_value(json!([
+            {"family":"pciefullmac","board":"x","revisions":8,
+             "host":{"kind":"pci","address":[0,1,0,0],"vendor":5348,"device":17388,
+                     "subsystem_vendor":0,"subsystem_device":0,"class":163840},
+             "assets":[{"key":"brcm/a.bin","fixture":[1,2,3,4]},{"key":"brcm/a.txt","fixture":[1]}]}
+        ]))
+        .unwrap();
+        assert!(encode(&bad, Path::new("."), true).is_err());
+        bad[0].chip = Some(json!(43602));
+        assert!(encode(&bad, Path::new("."), true).is_err());
+        bad[0].chip = Some(json!(0x4356));
+        assert!(encode(&bad, Path::new("."), true).is_ok());
+        let mut sku = synthetic().unwrap();
+        sku[0].antenna_sku = Some("X3".into());
+        assert!(encode(&sku, Path::new("."), true).is_err());
     }
 }

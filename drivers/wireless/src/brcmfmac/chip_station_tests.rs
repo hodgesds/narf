@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Covered non-BCM43602 chip profiles over the shared CR4/msgbuf station
+//! Covered non-BCM43602 chip profiles over the shared msgbuf station
 //! path. The model's identity word names a BCM4356 (Linux 0x180000 CR4 RAM
-//! base, so the retained model layout is unchanged); its firmware replies
-//! are synthetic and qualify no physical board.
+//! base, so the retained model layout is unchanged) or, in the model's CA7
+//! layout, a BCM4366 (RAM at 0x200000); its firmware replies are synthetic
+//! and qualify no physical board.
 use super::*;
 use crate::cyw43439::phy_fixture::{Vht80, VhtFault};
 
@@ -183,4 +184,41 @@ fn smoke_brcmf_chip_profile_station_vht160_join_geometry() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/brcmfmac/chips",
     smoke_brcmf_chip_profile_station_vht160_join_geometry
+);
+
+/// ChipCommon identity (AI, revision 4, chip 0x4366: Linux CA7, RAM base
+/// 0x200000, `brcmfmac4366c-pcie`), chip id, PCI id 0x43c3 (BCA).
+const BCM4366: (u32, u16, u16) = (0x1004_4366, 0x4366, 0x43c3);
+
+/// The CA7 counterpart of the BCM4356 CR4 run: the same shared msgbuf
+/// station model in its CA7 layout (CA7 + SYS_MEM cores, RAM at 0x200000)
+/// boots through `brcmf_chip_ca7_*`, joins VHT80, and tears down.
+fn station_ca7() -> Result<(), &'static str> {
+    for version in [5, 6] {
+        let h = Harness::new_vht_chip(version, 36, 3, native([3, 7], false, false), BCM4366)?;
+        h.associate(false)?;
+        let commands = h.bus.commands();
+        let join = commands
+            .iter()
+            .position(|(id, _, _)| *id == 26)
+            .ok_or("CA7 chip join missing")?;
+        if commands[join].1[48..50] != 0xe02au16.to_le_bytes()
+            || width(&h) != Some(80)
+            || !h.device.state.try_lock().unwrap().station.vht_connection()
+        {
+            return Err("CA7 chip did not join VHT80 through the shared path");
+        }
+        ready(h.device.disassociate())?.map_err(|_| "CA7 chip teardown")?;
+        if h.device.link_up() || h.bus.stats().5 != 0 {
+            return Err("CA7 chip teardown retained authority or freed live DMA");
+        }
+    }
+    Ok(())
+}
+fn smoke_brcmf_chip_profile_station_ca7_bcm4366_end_to_end() -> TestResult {
+    station_ca7().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/chips",
+    smoke_brcmf_chip_profile_station_ca7_bcm4366_end_to_end
 );

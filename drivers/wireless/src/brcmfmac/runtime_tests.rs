@@ -33,6 +33,8 @@ struct Firmware {
 }
 #[derive(Default)]
 struct State {
+    /// CA7 layout (`ca7_layout`): the bus sees the RAM image this far up.
+    relocate: u32,
     ap_authority: Option<Rc<core::sync::atomic::AtomicBool>>,
     ap_program_down_at_control_read: Option<narf_net::AdminHandle>,
     ap_program_fail_index_once: bool,
@@ -186,16 +188,18 @@ impl chip::Backplane for Model {
             && s.writes.iter().any(|&(a, v)| a == 0 && v == 0x11223344)
         {
             s.started = true;
-            put(&mut s, BASE + SIZE - 4, &SHARED.to_le_bytes());
+            let shared = SHARED + s.relocate;
+            put(&mut s, BASE + SIZE - 4, &shared.to_le_bytes());
         }
         Ok(())
     }
 }
 impl boot::Bus for Model {
     fn tcm_extent(&self) -> u32 {
-        BASE + SIZE
+        BASE + SIZE + self.0.lock().relocate
     }
     fn read_tcm(&mut self, at: u32, bytes: &mut [u8]) -> Result<(), boot::Error> {
+        let at = self.tcm_at(at);
         let down = {
             let mut s = self.0.lock();
             for (i, b) in bytes.iter_mut().enumerate() {
@@ -224,6 +228,7 @@ impl boot::Bus for Model {
         Ok(())
     }
     fn write_tcm(&mut self, at: u32, bytes: &[u8]) -> Result<(), boot::Error> {
+        let at = self.tcm_at(at);
         let mut s = self.0.lock();
         if (D2HR..D2HR + 12).contains(&at) && s.unreleased_read {
             return Err(boot::Error::State);
@@ -561,6 +566,43 @@ fn firmware_step(state: &mut State) {
         firmware.station = Some(station);
     }
     state.firmware = Some(firmware);
+}
+impl Model {
+    /// Bus TCM address to the model's internal (0x180000-based) address.
+    fn tcm_at(&self, at: u32) -> u32 {
+        let relocate = self.0.lock().relocate;
+        if relocate != 0 && at >= BASE + relocate {
+            at - relocate
+        } else {
+            at
+        }
+    }
+}
+/// The same model as a CA7 chip (`chip.c::brcmf_chip_ca7_*`): ARM CA7
+/// (0x847) and SYS_MEM (0x849) in the CR4/SOCRAM EROM slots, SYS_MEM
+/// banks summing to the CR4 TCM size, and the RAM image at `rambase`: the
+/// bus translates TCM addresses and every TCM pointer the firmware
+/// publishes (shared mailbox/ring-info pointers, ring-info table) moves too.
+fn ca7_layout(s: &mut State, rambase: u32) {
+    for (slot, from, to) in [(9u32, 0x4bf83e01, 0x4bf84701), (13, 0x4bf80e01, 0x4bf84901)] {
+        assert_eq!(s.registers.insert(0x18100000 + slot * 4, to), Some(from));
+    }
+    s.registers.insert(0x18004000, 2 << 4);
+    s.registers.insert(0x18004040, 15);
+    s.relocate = rambase - BASE;
+    for at in [
+        SHARED + 40,
+        SHARED + 44,
+        SHARED + 48,
+        INFO,
+        INFO + 4,
+        INFO + 8,
+        INFO + 12,
+        INFO + 16,
+    ] {
+        let value = word(s, at) + s.relocate;
+        put(s, at, &value.to_le_bytes());
+    }
 }
 fn put(s: &mut State, at: u32, bytes: &[u8]) {
     for (i, &b) in bytes.iter().enumerate() {
