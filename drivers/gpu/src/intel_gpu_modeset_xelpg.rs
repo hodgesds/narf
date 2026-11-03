@@ -13,10 +13,15 @@
 //! - **Power wells.** Xe-LPD splits the per-pipe wells out:
 //!   pipe A lives in `PW_A` (PWR_WELL_CTL2 index 5), not PG2.
 //!   `PW_1` (index 0) is still software-requested for transcoder
-//!   A + DDI A/B. Each port's AUX channel has its own well in
-//!   `PWR_WELL_CTL_AUX2` (AUX_A=0, AUX_USBC1=3), enabled before
-//!   any AUX/PHY traffic. (i915 `intel_display_power_map.c`,
-//!   `xelpd_power_wells`.)
+//!   A + DDI A/B. Each port's AUX channel is powered through its own
+//!   `XELPDP_DP_AUX_CH_CTL` power request (bit 19) before any
+//!   AUX/PHY traffic — `xelpdp_aux_power_well_enable`: no LT PHY on
+//!   MTL, so a fixed 600 µs wait follows the request and the status
+//!   bit is not a completion signal (i915 `intel_display_power_map.c`
+//!   `xelpdp_power_wells_aux`; the ICL `PWR_WELL_CTL_AUX2` wells do
+//!   not exist in the display-14 map). The AUX transport keeps the
+//!   request set on every transaction word (`intel_dp_aux.c`
+//!   `skl_get_aux_send_ctl`, DISPLAY_VER >= 14).
 //! - **CDCLK.** MTL's table runs on a fixed 38.4 MHz reference
 //!   with PLL ratios and *squash waveforms* for the two lowest
 //!   rungs; programming is PLL ratio (0x46070) + squash
@@ -111,13 +116,12 @@ impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
 
 // ── Power wells (Xe-LPD) ─────────────────────────────────────────
 //
-// Register pair from i915 `intel_display_regs.h`:
-// HSW_PWR_WELL_CTL2 = 0x45404 (main wells), ICL_PWR_WELL_CTL_AUX2
-// = 0x45444 (AUX wells). Both use the HSW request/state encoding
-// (REQ = 0x2 << idx*2, STATE = 0x1 << idx*2).
+// HSW_PWR_WELL_CTL2 = 0x45404 (main wells, `intel_display_regs.h`),
+// HSW request/state encoding (REQ = 0x2 << idx*2, STATE = 0x1 <<
+// idx*2). AUX power is the per-channel XELPDP_DP_AUX_CH_CTL request
+// (`intel_gpu_xelpg_tc::aux_power_enable`), not a PWR_WELL_CTL_AUX2 bit.
 
 const PWR_WELL_CTL2: u64 = 0x4_5404;
-const PWR_WELL_CTL_AUX2: u64 = 0x4_5444;
 /// `ICL_PW_CTL_IDX_PW_1` — transcoder A + DDI A/B on Xe-LPD.
 const PW_1_IDX: u32 = 0;
 /// `XELPD_PW_CTL_IDX_PW_A` — pipe A + panel fitter A.
@@ -478,11 +482,14 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let mode = *mode;
 
         // Step 2: power wells — PW_1 (transcoder A / DDI A-B),
-        // PW_A (pipe A), and this port's AUX well (the PHY
-        // message bus and AUX channel both hang off it).
+        // PW_A (pipe A), and this port's Xe-LPDP AUX power request
+        // (`xelpdp_aux_power_well_enable`: XELPDP_DP_AUX_CH_CTL bit 19,
+        // then a fixed 600 µs). Type-C routes never reach this inherited
+        // path, so no TC port reference is required here.
         self.enable_power_well(PWR_WELL_CTL2, PW_1_IDX)?;
         self.enable_power_well(PWR_WELL_CTL2, PW_A_IDX)?;
-        self.enable_power_well(PWR_WELL_CTL_AUX2, self.port.aux_well_index())?;
+        crate::intel_gpu_xelpg_tc::aux_power_enable(self.mmio, self.port)
+            .map_err(|_| ModesetError::PowerWellTimeout)?;
 
         // This bounded correction preserves an already-enabled DDI. The
         // existing PHY helper does not implement a complete DDI-off/on pair;
@@ -1064,6 +1071,8 @@ pub mod tests {
     }
 
     const PIPECONF_OFF: u64 = 0x7_0008;
+    /// The ICL AUX well register the display-14 path must never use.
+    const PWR_WELL_CTL_AUX2: u64 = 0x4_5444;
 
     impl MtlFake {
         pub fn new(port: XeLpgPort) -> Self {
@@ -1313,20 +1322,26 @@ pub mod tests {
         if fake.writes_to(0x6_4030) != [162_000u32, 540_000] {
             return TestResult::Fail("VALFREQ must show RBR then HBR2 after training fallback");
         }
-        // Power wells: PW_1 + PW_A requested in CTL2, AUX_A in
-        // AUX2.
+        // Power wells: PW_1 + PW_A requested in CTL2; AUX_A powered
+        // by its own XELPDP_DP_AUX_CH_CTL request (0x64010 bit 19,
+        // xelpdp_aux_power_well_enable), never the ICL AUX2 well.
         let ctl2 = fake.writes_to(PWR_WELL_CTL2);
         if !ctl2.iter().any(|v| v & pwr_well_req(PW_1_IDX) != 0)
             || !ctl2.iter().any(|v| v & pwr_well_req(PW_A_IDX) != 0)
         {
             return TestResult::Fail("PW_1 / PW_A not requested");
         }
-        if !fake
-            .writes_to(PWR_WELL_CTL_AUX2)
-            .iter()
-            .any(|v| v & pwr_well_req(0) != 0)
-        {
-            return TestResult::Fail("AUX_A well not requested");
+        let aux_ctl = fake.writes_to(0x6_4010);
+        if aux_ctl.first() != Some(&(1 << 19)) {
+            return TestResult::Fail("AUX_A power request must precede AUX traffic");
+        }
+        // Every later AUX control word preserves the request
+        // (skl_get_aux_send_ctl, DISPLAY_VER >= 14).
+        if aux_ctl.iter().any(|v| v & (1 << 19) == 0) {
+            return TestResult::Fail("AUX transaction dropped the AUX_A power request");
+        }
+        if !fake.writes_to(PWR_WELL_CTL_AUX2).is_empty() {
+            return TestResult::Fail("display 14 must not request the ICL AUX2 well");
         }
         // Pattern generator ends in NORMAL.
         let tp = fake.writes_to(0x6_0540);

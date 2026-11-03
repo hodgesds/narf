@@ -237,22 +237,10 @@ impl XeLpgPort {
     pub const fn func_ctl_index(self) -> u8 {
         self.port_enum() as u8
     }
-    /// Index of this port's legacy ICL/TGL AUX power well inside
-    /// `PWR_WELL_CTL_AUX2` (0x45444): AUX_A=0, AUX_B=1, AUX_USBC1..4
-    /// = 3..6 (TGL TC numbering). Only the retained internal DDI A
-    /// path still requests it; Xe-LPDP's own AUX wells are the
-    /// `XELPDP_DP_AUX_CH_CTL` power request
-    /// (`intel_gpu_xelpg_tc::aux_power_enable`).
-    pub const fn aux_well_index(self) -> u32 {
-        match self {
-            XeLpgPort::A => 0,
-            XeLpgPort::B => 1,
-            XeLpgPort::Tc1 => 3,
-            XeLpgPort::Tc2 => 4,
-            XeLpgPort::Tc3 => 5,
-            XeLpgPort::Tc4 => 6,
-        }
-    }
+    // There is no PWR_WELL_CTL_AUX2 index: every display-14 AUX well
+    // (A, B, USBC1-4) is the XELPDP_DP_AUX_CH_CTL power request at
+    // `aux_ctl()` (`intel_display_power_map.c::xelpdp_power_wells_aux`,
+    // `intel_gpu_xelpg_tc::aux_power_enable`).
     /// Whether this port can carry an eDP panel (DDI A only on
     /// MTL platforms this driver targets).
     pub const fn is_edp(self) -> bool {
@@ -2058,8 +2046,21 @@ pub mod tests {
         }
         // intel_port_to_phy: PORT_TC1 -> PHY_F (5) on display >= 13;
         // TGL_TRANS_DDI_SELECT_PORT keys on enum port (PORT_TC1 = 3).
-        if tc.phy_index() != 5 || tc.func_ctl_index() != 3 || tc.aux_well_index() != 3 {
+        if tc.phy_index() != 5 || tc.func_ctl_index() != 3 {
             return TestResult::Fail("TC1 indices wrong");
+        }
+        // _XELPDP_DP_AUX_CH_CTL: every AUX power well is the channel's
+        // own control register (A/B combo range, USBC range at 0x200).
+        let aux = [
+            (XeLpgPort::A, 0x6_4010u64),
+            (XeLpgPort::B, 0x6_4110),
+            (XeLpgPort::Tc1, 0x16_F210),
+            (XeLpgPort::Tc2, 0x16_F410),
+            (XeLpgPort::Tc3, 0x16_F610),
+            (XeLpgPort::Tc4, 0x16_F810),
+        ];
+        if aux.iter().any(|(port, off)| port.aux_ctl() != *off) {
+            return TestResult::Fail("XELPDP_DP_AUX_CH_CTL offsets wrong");
         }
         TestResult::Pass
     }

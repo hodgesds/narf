@@ -252,22 +252,20 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         }
     }
 
-    /// Create a transport over an explicit AUX register base.
+    /// Create a display-14 (Xe-LPG/MTL) transport over an explicit AUX
+    /// register base, non-TBT IO.
     ///
-    /// Xe-LPG (MTL) ports do not share the Gen12 DDI register
-    /// stride: their AUX blocks sit at per-port absolute offsets
-    /// (see `intel_gpu_xelpg::XeLpgPort::aux_base`). The AUX
-    /// transaction protocol itself — CTL/DATA fields, message
-    /// packing, timeout/poll discipline — is unchanged from
-    /// Gen12, so only the base differs. `ddi` is retained for
-    /// diagnostics only.
+    /// Xe-LPG ports do not share the Gen12 DDI register stride: their
+    /// AUX blocks sit at per-port absolute offsets (see
+    /// `intel_gpu_xelpg::XeLpgPort::aux_base`). Every caller of this
+    /// constructor is a display-14 port, so it writes the
+    /// [`AuxCtlProfile::XeLpdp`] control word: the channel's
+    /// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` (bit 19, raised by
+    /// `xelpdp_aux_power_well_enable`) is preserved on every write, as
+    /// `intel_dp_aux.c::skl_get_aux_send_ctl` does for DISPLAY_VER >= 14.
+    /// Gen12 callers use [`IntelAux::new`], whose word is unchanged.
     pub fn with_base(mmio: &'a M, base: u64) -> Self {
-        Self {
-            mmio,
-            ddi: Ddi::A,
-            base,
-            profile: AuxCtlProfile::Gen12,
-        }
+        Self::xelpdp(mmio, base, false)
     }
 
     /// Create an Xe-LPDP (MTL) transport over an explicit AUX base with
@@ -803,6 +801,13 @@ pub mod tests {
         let mut aux = IntelAux::new(&gen12, Ddi::A);
         if aux.profile() != AuxCtlProfile::Gen12 || aux.transact(&req, &mut reply).is_err() {
             return TestResult::Fail("Gen12 transport must keep its profile and succeed");
+        }
+        // Display-14 base transports (DDI A eDP, backlight owner) use the
+        // power-preserving Xe-LPDP word.
+        if IntelAux::with_base(&gen12, 0x6_4000).profile()
+            != (AuxCtlProfile::XeLpdp { tbt_io: false })
+        {
+            return TestResult::Fail("display-14 base transport must preserve AUX power");
         }
         let gen12_writes = gen12.writes_to(ctl_off());
         let historical = AUX_CTL_SEND_BUSY

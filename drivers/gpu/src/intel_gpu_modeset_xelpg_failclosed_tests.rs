@@ -450,9 +450,17 @@ fn smoke_mtl_failclosed_powered_ddi_current_and_allones_refusal() -> TestResult 
             .iter()
             .position(|a| matches!(*a, MtlAccess::Read(0x64000, _)))
             .unwrap();
-        for (r, required) in [(0x45404, 0xc03), (0x45444, 3)] {
-            assert!(trace[..port].iter().any(|a| matches!(*a, MtlAccess::Read(off, value) if off == r && value & required == required)));
-        }
+        assert!(trace[..port].iter().any(
+            |a| matches!(*a, MtlAccess::Read(0x45404, value) if value & 0xc03 == 0xc03)
+        ));
+        // xelpdp_aux_power_well_enable: AUX_A is the 0x64010 bit-19
+        // request; the ICL AUX2 well is never accessed on display 14.
+        assert!(trace[..port]
+            .iter()
+            .any(|a| matches!(*a, MtlAccess::Write(0x64010, value) if value & (1 << 19) != 0)));
+        assert!(!trace
+            .iter()
+            .any(|a| matches!(*a, MtlAccess::Read(0x45444, _) | MtlAccess::Write(0x45444, _))));
     }
     for off in [
         0x45404, 0x64000, 0x64004, 0x70180, 0x70008, 0x640e0, 0x510a0, 0x70040, 0x701ac,
