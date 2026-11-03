@@ -122,6 +122,10 @@ impl Grant {
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         self.power.ht_facts()
     }
+    /// Factory HT20 1S index ceiling for one 2.4GHz channel group.
+    pub(super) fn ht_group(&self, group: usize) -> Option<u8> {
+        self.power.ht_group(group)
+    }
     /// Factory CCK/OFDM index ceilings for one 2.4GHz channel group.
     pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
         self.power.group_limits(group)

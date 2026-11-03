@@ -428,10 +428,11 @@ impl State {
     }
     /// Actual completed association, unextended fixed CCK1 only. This new
     /// program does not borrow qualification for HT/BA/tracking combinations.
+    /// Off channel 1 its N2xZ record is that channel's own (channel-scoped
+    /// base), so a channel-1 LPS record never applies.
     pub(super) fn lps_peer(&self) -> Option<([u8; 6], [u8; 6], u16)> {
         if self.phase() != Phase::Open
             || !self.ready()
-            || self.channel != 1
             || self.extension.is_some()
             || self.ht.is_some()
             || self.rx_ba_grant.is_some()
@@ -1499,19 +1500,17 @@ impl State {
         // rtw_ops_mgd_prepare_tx: tune to the BSS primary and run RF
         // calibration there unless it is already current.
         self.retune(io, candidate.bss.channel, true).await?;
-        // Noninitial channels carry only the base legacy CCK1 profile.
-        let base_channel = self.channel == 1;
+        // Off channel 1 every program below loads only its own per-channel
+        // record over the channel-scoped base (`channel_policy::scope_request`);
+        // absent records leave the base legacy CCK1 profile.
         let mode = if pmk.is_some() {
             SecurityMode::Wpa2Psk
         } else {
             SecurityMode::Open
         };
-        let extension = if base_channel {
-            io.station_extension()?
-                .filter(|g| candidate.basic_rates & !g.rates() == 0)
-        } else {
-            None
-        };
+        let extension = io
+            .station_extension()?
+            .filter(|g| candidate.basic_rates & !g.rates() == 0 && g.channel() == self.channel);
         let proposed = match &extension {
             Some(g)
                 if g.wmm()
@@ -1655,10 +1654,7 @@ impl State {
             }
             self.ht = Some(h);
         }
-        if let Some(g) = io
-            .station_continuation(&super::dm::KIND)?
-            .filter(|_| base_channel)
-        {
+        if let Some(g) = io.station_continuation(&super::dm::KIND)? {
             let gate = io.station_gate()?;
             if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
                 self.tracking.grant = Some(g);

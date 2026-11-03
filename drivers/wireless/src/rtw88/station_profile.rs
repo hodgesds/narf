@@ -209,10 +209,7 @@ impl Grant {
         self.request.mac
     }
     pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
-        match &self.base {
-            power_policy::ExtensionBase::C21(b) => b.temperature(value),
-            power_policy::ExtensionBase::C22(_) => Ok(()),
-        }
+        self.base.temperature(value)
     }
     pub(super) fn ht_identity(&self) -> ([u8; 32], [u8; 32]) {
         (self.request.identity, self.digest)
@@ -226,6 +223,10 @@ impl Grant {
     }
     pub(super) fn did(&self) -> u16 {
         self.base.did()
+    }
+    /// Operating primary this extension was qualified for.
+    pub(super) fn channel(&self) -> u8 {
+        self.base.channel()
     }
     pub(super) fn wmm(&self) -> bool {
         self.wmm

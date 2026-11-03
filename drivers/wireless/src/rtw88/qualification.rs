@@ -57,15 +57,22 @@ pub struct Request {
     pub filename: String,
 }
 
-fn base_identity(gate: &Gate) -> Result<[u8; 32], Error> {
-    Ok(gate.extension_request().ok_or(Error::State)?.identity)
+/// N2xO channel records bind the unscoped base; every other kind binds the
+/// channel-scoped base (`channel_policy::scope_request`) of its channel.
+fn base_identity(kind: &Kind, gate: &Gate) -> Result<[u8; 32], Error> {
+    let request = if kind.tag == b'O' {
+        gate.base_request()
+    } else {
+        gate.extension_request()
+    };
+    Ok(request.ok_or(Error::State)?.identity)
 }
 
 /// Measurement metadata for `kind` over the exact current base. No grant.
 pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error> {
     let did = gate.did();
     let mac = gate.own();
-    let base = base_identity(gate)?;
+    let base = base_identity(kind, gate)?;
     let mut hash = narf_crypto::sha256::Sha256::new();
     hash.update(b"NARF RTW88 separately signed continuation contract v1");
     hash.update(&[kind.tag]);
@@ -77,16 +84,19 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
     Ok(Request {
         identity: hash.finalize(),
         mac,
-        filename: format!(
-            "rtw88/rtw882{}ce-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if did == 0xc821 { 1 } else { 2 },
-            kind.stem,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+        filename: super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/rtw882{}ce-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                if did == 0xc821 { 1 } else { 2 },
+                kind.stem,
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            ),
+            if kind.tag == b'O' { 1 } else { gate.channel() },
         ),
     })
 }
@@ -125,7 +135,7 @@ impl Source {
     pub(super) fn load(self, kind: &'static Kind, gate: &Gate) -> Result<Arc<Grant>, Error> {
         let request = request(kind, gate)?;
         let did = gate.did();
-        let base = base_identity(gate)?;
+        let base = base_identity(kind, gate)?;
         struct Decode {
             kind: &'static Kind,
             did: u16,
@@ -254,7 +264,7 @@ impl Grant {
     /// The grant applies only to the exact base it was qualified against.
     pub(super) fn matches(&self, gate: &Gate) -> bool {
         gate.did() == self.did
-            && base_identity(gate).is_ok_and(|b| b == self.base)
+            && base_identity(self.kind, gate).is_ok_and(|b| b == self.base)
             && request(self.kind, gate).as_ref() == Ok(&self.request)
     }
     /// Run `op` under the current continuation capability and the current

@@ -82,17 +82,21 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
     all.update(&identity);
     all.update(b"independent actual per-TID SSN/dialog/window/TU/key retirement; globally unique nonwrapping dialog; actual QSEL=TID and BE/BK/VI rings depths256/128/128; no VO or EAPOL aggregation; actual N2xQ current profile before each BD and final WP; same-TID FIFO prefix before PN; same four immutable originals, per-ring consumed prefix and each positive CCX; map0xc5a0 VI6 BE8 BK10 MGMT12 and exact prioq reserved/available; all queues remain one serial physical DMA/control/key owner; every existing transient/retry/LGI/SGI/automatic response peak now maximum across BE/BK/VI including mixed-TID transition duty, full thermal0..63/supply/antenna/coexistence");
     let all_tids_identity = all.finalize();
+    let channel = h.channel();
     let filename = |version| {
-        format!(
-            "rtw88/rtw882{}ce-tx-ba-v{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if did == 0xc821 { 1 } else { 2 },
-            version,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+        super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/rtw882{}ce-tx-ba-v{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                if did == 0xc821 { 1 } else { 2 },
+                version,
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            ),
+            channel,
         )
     };
     Ok(Request {

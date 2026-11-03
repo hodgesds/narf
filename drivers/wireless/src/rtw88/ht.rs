@@ -96,7 +96,16 @@ fn local(tx: u16, rx_mask: u16, sgi: bool, did: u16, coding: u8) -> Option<Local
     .and_then(|h| LocalPhy::ht20(h).ok())
 }
 pub(super) fn factory_limit(p: &[u8], factor: i16, max: u8) -> Option<u8> {
-    let base = *p.get(6)?;
+    factory_limit_group(p, 0, factor, max)
+}
+/// Linux `phy.c::rtw_phy_get_2g_tx_power_index` HT20 1S ceiling for the
+/// 2.4GHz `rtw_get_channel_group` `group`: `bw40_base[group]` plus the
+/// signed HT20 1S difference.
+pub(super) fn factory_limit_group(p: &[u8], group: usize, factor: i16, max: u8) -> Option<u8> {
+    if group > 4 {
+        return None;
+    }
+    let base = *p.get(6 + group)?;
     let diff = *p.get(11)?;
     if base > max || diff == 255 {
         return None;
@@ -108,7 +117,14 @@ pub(super) fn factory_limit(p: &[u8], factor: i16, max: u8) -> Option<u8> {
 /// Linux phy.c::rtw_phy_get_2g_tx_power_index: HT20's signed 1S
 /// difference plus the additional signed low-nibble 2S difference.
 pub(super) fn factory_limit_2ss(p: &[u8]) -> Option<u8> {
-    let base = *p.get(6)?;
+    factory_limit_2ss_group(p, 0)
+}
+/// [`factory_limit_2ss`] for `bw40_base[group]`.
+pub(super) fn factory_limit_2ss_group(p: &[u8], group: usize) -> Option<u8> {
+    if group > 4 {
+        return None;
+    }
+    let base = *p.get(6 + group)?;
     let one = *p.get(11)?;
     let two = *p.get(12)?;
     if base > 127 || one == 255 || two == 255 {
@@ -160,15 +176,18 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
     let mut proposal = Request {
         identity: h.finalize(),
         mac,
-        filename: format!(
-            "rtw88/rtw882{}ce-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if base.did() == 0xc821 { 1 } else { 2 },
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+        filename: super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/rtw882{}ce-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                if base.did() == 0xc821 { 1 } else { 2 },
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            ),
+            base.channel(),
         ),
         two_streams: None,
     };
@@ -429,6 +448,10 @@ impl Grant {
     }
     pub(super) fn sgi(&self) -> bool {
         self.sgi
+    }
+    /// Operating primary of the extension this HT program was qualified over.
+    pub(super) fn channel(&self) -> u8 {
+        self.base.channel()
     }
     pub(super) fn matches(&self, b: &station_profile::Grant) -> bool {
         request(b).ok().is_some_and(|proposal| {

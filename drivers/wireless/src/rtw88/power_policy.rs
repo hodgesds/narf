@@ -30,6 +30,9 @@ pub(super) struct Board {
     /// (Linux `rtw_get_channel_group`), None if erased or out of range.
     groups: [Option<[u8; 2]>; 5],
     ht: Option<super::ht::Facts>,
+    /// HT20 one-/two-stream factory ceilings per 2.4GHz channel group
+    /// (`bw40_base[group]` plus the HT20 differences), min over both paths.
+    ht_groups: [Option<(u8, Option<u8>)>; 5],
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -90,11 +93,28 @@ impl Board {
         hash.update(&firmware);
         hash.update(&maximum);
         phy::bind_tables(&mut hash, info).map_err(|_| Error::Identity)?;
+        let ht_groups = core::array::from_fn(|group| {
+            let one = |path: u8| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_group(p, group, 2, 127))
+            };
+            let two = |path: u8| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_2ss_group(p, group))
+            };
+            Some((
+                one(0)?.min(one(1)?),
+                two(0).zip(two(1)).map(|(a, b)| a.min(b)),
+            ))
+        });
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
             maximum,
             groups,
+            ht_groups,
             ht: factory
                 .power_path(0)
                 .and_then(|a| super::ht::factory_limit(a, 2, 127))
@@ -264,46 +284,78 @@ impl CalibratedBase {
 /// Extension bases never contain an extension-aware Gate. Both arms dispatch
 /// directly into their chip's retained qualification, keeping invocation
 /// statically acyclic and preventing C22 gain/measurement substitution.
-pub(super) enum ExtensionBase {
+pub(super) enum ExtensionChip {
     C22(CalibratedBase),
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
 }
+/// The chip base plus, off channel 1, the bound N2xO channel record. Every
+/// program loaded over a channel-scoped base is a distinct per-channel record
+/// (`channel_policy::scope_request`): its identity, filename, factory facts
+/// (`rtw_get_channel_group` of that primary) and live regulatory check all
+/// belong to that channel; nothing measured on channel 1 is reused.
+pub(super) struct ExtensionBase {
+    chip: ExtensionChip,
+    channel: Option<alloc::sync::Arc<super::qualification::Grant>>,
+}
 impl ExtensionBase {
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
-        match self {
-            Self::C21(b) => b.ht_facts(),
-            Self::C22(b) => b.calibration.board.ht.map(|mut f| {
+        let facts = match &self.chip {
+            ExtensionChip::C21(b) => b.ht_facts(),
+            ExtensionChip::C22(b) => b.calibration.board.ht.map(|mut f| {
                 f.cck = b.permission.gains;
                 f
             }),
-        }
+        };
+        let group = |g: usize| match &self.chip {
+            ExtensionChip::C21(b) => b.ht_group(g).map(|m| (m, None)),
+            ExtensionChip::C22(b) => b.calibration.board.ht_groups[g],
+        };
+        overlay(self.did(), facts, self.channel.as_deref(), group)
     }
     pub(super) fn did(&self) -> u16 {
-        match self {
-            Self::C22(_) => 0xc822,
-            Self::C21(_) => 0xc821,
+        match &self.chip {
+            ExtensionChip::C22(_) => 0xc822,
+            ExtensionChip::C21(_) => 0xc821,
+        }
+    }
+    /// Operating primary of this base: 1, or the bound N2xO record's.
+    pub(super) fn channel(&self) -> u8 {
+        self.channel
+            .as_ref()
+            .and_then(|g| super::channel_policy::Record::decode(self.did(), g.payload()))
+            .map_or(1, |r| r.channel)
+    }
+    pub(super) fn temperature(&self, value: u8) -> Result<(), super::firmware_transport::Error> {
+        match &self.chip {
+            ExtensionChip::C21(b) => b.temperature(value),
+            ExtensionChip::C22(_) => Ok(()),
         }
     }
     pub(super) fn request(&self) -> super::station_profile::Request {
-        match self {
-            Self::C22(b) => b.request(),
-            Self::C21(b) => b.extension_request(),
-        }
+        let base = match &self.chip {
+            ExtensionChip::C22(b) => b.request(),
+            ExtensionChip::C21(b) => b.extension_request(),
+        };
+        scoped(base, self.did(), self.channel.as_deref())
     }
     pub(super) fn current(
         &self,
         d: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<i16, super::firmware_transport::Error> {
-        match self {
-            Self::C22(b) => {
+        let limit = match &self.chip {
+            ExtensionChip::C22(b) => {
                 b.current(d)
                     .map_err(super::firmware_transport::Error::Power)?;
-                Ok(b.eirp())
+                b.eirp()
             }
-            Self::C21(b) => {
+            ExtensionChip::C21(b) => {
                 b.check()?;
-                b.extension_limit(d)
+                b.extension_limit(d)?
             }
+        };
+        match &self.channel {
+            Some(g) => Ok(limit.min(super::channel_policy::limit_in(g, self.did(), d)?)),
+            None => Ok(limit),
         }
     }
     pub(super) fn invoke<T>(
@@ -311,11 +363,57 @@ impl ExtensionBase {
         d: &narf_wireless::reg::RegulatoryDomain,
         op: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
-        match self {
-            Self::C22(b) => b.invoke(d, op),
-            Self::C21(b) => b.invoke(op),
+        // The channel record's own capability and span are re-checked inside
+        // the base invocation, immediately before the operation.
+        let did = self.did();
+        let op = || match &self.channel {
+            Some(g) => g.invoke_source(|| {
+                super::channel_policy::limit_in(g, did, d)?;
+                op()
+            }),
+            None => op(),
+        };
+        match &self.chip {
+            ExtensionChip::C22(b) => b.invoke(d, op),
+            ExtensionChip::C21(b) => b.invoke(op),
         }
     }
+}
+/// Channel-scope a base request: identity bound to the N2xO record and a
+/// per-channel filename. The unscoped channel-1 request is unchanged.
+fn scoped(
+    base: super::station_profile::Request,
+    did: u16,
+    channel: Option<&super::qualification::Grant>,
+) -> super::station_profile::Request {
+    match channel.and_then(|g| super::channel_policy::scope_request(&base, did, g)) {
+        Some(r) => r,
+        None => base,
+    }
+}
+/// HT factory facts for the bound primary: the channel's own
+/// `rtw_get_channel_group` HT20 ceilings and, as the reference/legacy gains,
+/// the N2xO record's C22 CCK references or C21 TXAGC indices.
+fn overlay(
+    did: u16,
+    facts: Option<super::ht::Facts>,
+    channel: Option<&super::qualification::Grant>,
+    group: impl Fn(usize) -> Option<(u8, Option<u8>)>,
+) -> Option<super::ht::Facts> {
+    let mut facts = facts?;
+    let Some(g) = channel else {
+        return Some(facts);
+    };
+    let record = super::channel_policy::Record::decode(did, g.payload())?;
+    let (maximum, maximum_2ss) = group(super::channel_policy::group(record.channel)?)?;
+    facts.maximum = maximum;
+    facts.maximum_2ss = maximum_2ss.filter(|_| facts.maximum_2ss.is_some());
+    match did {
+        0xc822 => facts.cck = record.gains,
+        0xc821 => facts.legacy = record.indices,
+        _ => return None,
+    }
+    Some(facts)
 }
 #[derive(Clone)]
 enum Scope {
@@ -345,22 +443,28 @@ impl Gate {
         gate.host = Some(host);
         Ok(gate)
     }
+    /// The base for a new N2xL extension: the chip base plus any bound
+    /// N2xO channel record, so the extension is that channel's own program.
     pub(super) fn extension_base(&self) -> Option<ExtensionBase> {
-        if self.extension.is_some() || self.channel.is_some() {
+        if self.extension.is_some() {
             return None;
         }
-        match &self.scope {
+        let chip = match &self.scope {
             Scope::C22 {
                 calibration,
                 permission,
                 own,
-            } => Some(ExtensionBase::C22(CalibratedBase {
+            } => ExtensionChip::C22(CalibratedBase {
                 calibration: calibration.clone(),
                 permission: *permission,
                 own: *own,
-            })),
-            Scope::C21(b) => Some(ExtensionBase::C21(b.clone())),
-        }
+            }),
+            Scope::C21(b) => ExtensionChip::C21(b.clone()),
+        };
+        Some(ExtensionBase {
+            chip,
+            channel: self.channel.clone(),
+        })
     }
     pub(super) fn calibrated_base(&self) -> Option<CalibratedBase> {
         if self.extension.is_some() || self.channel.is_some() {
@@ -581,7 +685,14 @@ impl Gate {
             Scope::C21(_) => self.current(),
         }
     }
+    /// Identity every continuation program is qualified over: the exact
+    /// base, channel-scoped by the bound N2xO record off channel 1.
     pub(super) fn extension_request(&self) -> Option<super::station_profile::Request> {
+        self.base_request()
+            .map(|b| scoped(b, self.did(), self.channel.as_deref()))
+    }
+    /// The unscoped base (N22Cv2/N21S) request, which N2xO records bind.
+    pub(super) fn base_request(&self) -> Option<super::station_profile::Request> {
         match &self.scope {
             Scope::C22 {
                 calibration,
@@ -660,11 +771,7 @@ impl Gate {
         &self,
         g: alloc::sync::Arc<super::station_profile::Grant>,
     ) -> Result<Self, super::firmware_transport::Error> {
-        if self.did() != g.did()
-            || self.extension.is_some()
-            || self.channel.is_some()
-            || !g.matches(self)
-        {
+        if self.did() != g.did() || self.extension.is_some() || !g.matches(self) {
             return Err(super::firmware_transport::Error::State);
         }
         g.check()?;
@@ -673,7 +780,7 @@ impl Gate {
         Ok(gate)
     }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
-        match &self.scope {
+        let facts = match &self.scope {
             Scope::C21(b) => b.ht_facts(),
             Scope::C22 {
                 calibration,
@@ -683,7 +790,12 @@ impl Gate {
                 f.cck = permission.gains;
                 f
             }),
-        }
+        };
+        let group = |g: usize| match &self.scope {
+            Scope::C21(b) => b.ht_group(g).map(|m| (m, None)),
+            Scope::C22 { calibration, .. } => calibration.board.ht_groups[g],
+        };
+        overlay(self.did(), facts, self.channel.as_deref(), group)
     }
     pub(super) fn ht_base(&self) -> Option<alloc::sync::Arc<super::station_profile::Grant>> {
         self.extension.clone().filter(|_| self.ht.is_none())
@@ -780,7 +892,7 @@ impl Gate {
             && self.extension.is_some()
             && self.fallback.is_none()
             && super::fallback::bounds(g.payload());
-        if !coding && !qos && !fallback || self.channel.is_some() {
+        if !coding && !qos && !fallback {
             return Err(super::firmware_transport::Error::State);
         }
         g.check(self)?;
@@ -852,7 +964,7 @@ impl Gate {
         &self,
         g: alloc::sync::Arc<super::tracking8821c::Grant>,
     ) -> Result<Self, super::firmware_transport::Error> {
-        if self.tracking.is_some() || self.channel.is_some() || !g.matches(self) {
+        if self.tracking.is_some() || !g.matches(self) {
             return Err(super::firmware_transport::Error::State);
         }
         g.invoke(|| Ok(()))?;
@@ -869,7 +981,11 @@ impl Gate {
         let Scope::C21(g) = &self.scope else {
             return None;
         };
-        let [cck, ofdm] = g.factory_limits();
+        // Off channel 1 the bound primary's own rtw_get_channel_group.
+        let [cck, ofdm] = match &self.channel {
+            None => g.factory_limits(),
+            Some(_) => g.group_limits(super::channel_policy::group(self.channel())?)?,
+        };
         Some([cck, ofdm, self.ht_facts()?.maximum])
     }
     /// Current ceiling of the exact H/R/T/RTS prefix, without W dispatch.

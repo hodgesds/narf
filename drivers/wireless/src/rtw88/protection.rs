@@ -88,15 +88,18 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
     Ok(Request {
         identity: hash.finalize(),
         mac,
-        filename: format!(
-            "rtw88/rtw882{}ce-rts-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if did == 0xc821 { 1 } else { 2 },
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+        filename: super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/rtw882{}ce-rts-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                if did == 0xc821 { 1 } else { 2 },
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            ),
+            h.channel(),
         ),
     })
 }

@@ -187,3 +187,43 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8821ce_retune_txagc_and_rf18_readback
 );
+
+fn smoke_rtw88_channel_scoped_filenames_and_group_ht_ceilings() -> TestResult {
+    // Channel-scoped continuation records never share a channel-1 name.
+    let base = "rtw88/rtw8822ce-ht20-v1-001122334455.bin";
+    if channel_policy::scoped_filename(base, 1) != base
+        || channel_policy::scoped_filename(base, 6)
+            != "rtw88/rtw8822ce-ch06-ht20-v1-001122334455.bin"
+        || channel_policy::scoped_filename("rtw88/rtw8821ce-legacy-wmm-v1-00.bin", 13)
+            != "rtw88/rtw8821ce-ch13-legacy-wmm-v1-00.bin"
+    {
+        return TestResult::Fail("channel-scoped filename is not distinct per primary");
+    }
+    // phy.c::rtw_phy_get_2g_tx_power_index HT20 1S/2S: bw40_base[group]
+    // (bytes 6..11) plus the signed differences at bytes 11/12.
+    let mut p = [0u8; 13];
+    p[6..11].copy_from_slice(&[40, 42, 44, 46, 48]);
+    p[11] = 0xe0; // HT20 1S diff -2 (high nibble), OFDM diff 0
+    p[12] = 0x0f; // HT20 2S diff -1 (low nibble)
+    use crate::rtw88::ht;
+    for group in 0..5 {
+        let base = 40 + 2 * group as i16;
+        if ht::factory_limit_group(&p, group, 2, 127) != Some((base - 4) as u8)
+            || ht::factory_limit_group(&p, group, 1, 63) != Some((base - 2) as u8)
+            || ht::factory_limit_2ss_group(&p, group) != Some((base - 6) as u8)
+        {
+            return TestResult::Fail("HT20 factory ceiling not taken from the channel's group");
+        }
+    }
+    if ht::factory_limit(&p, 2, 127) != ht::factory_limit_group(&p, 0, 2, 127)
+        || ht::factory_limit_group(&p, 5, 2, 127).is_some()
+        || ht::factory_limit_2ss_group(&p, 5).is_some()
+    {
+        return TestResult::Fail("group0 alias or out-of-range group differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_channel_scoped_filenames_and_group_ht_ceilings
+);

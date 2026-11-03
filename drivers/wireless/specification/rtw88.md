@@ -2084,11 +2084,32 @@ records the interface advertises and accepts channel 1 only, as before.
 protection/coding/QoS/fallback/tracking continuation) and its live check is part
 of `Gate::current`/`current_in`: the current record capability plus the
 installed regulatory domain, whose overlapping rules must be plain, cover the
-primary's 20MHz occupied span and admit every peak plus antenna gain. While a
-record is bound, `extension_base`, `with_extension`, `with_continuation` and
-`with_power_tracking` refuse, and the station skips the extension, HT and dm
-continuations, so noninitial primaries carry the base legacy CCK1 Open/WPA2
-profile only. LPS (`lps_peer`) is refused off channel 1.
+primary's 20MHz occupied span and admit every peak plus antenna gain.
+
+Per-channel operating records. Every continuation program on a noninitial
+primary is that channel's own record. With a record bound,
+`Gate::extension_request` (and `ExtensionBase::request`) return the
+channel-scoped base `channel_policy::scope_request`: SHA-256 over the base
+N22Cv2/N21S request identity, the N2xO request identity and file digest and
+the primary, with the per-channel filename `rtw882Xce-chNN-<stem>`
+(`scoped_filename`). N2xL (`extension_base` now carries the channel record),
+and transitively N2xH/R/T/X (their identities hash the parent identity; their
+filenames carry the same `chNN`), the generic N2xC/Q/F/D/Z kinds
+(`qualification::request`) and N21W therefore can only be signed for that
+channel; a channel-1 record never matches. N2xO itself binds the unscoped
+`Gate::base_request`. The channel-scoped base supplies that primary's factory
+facts: HT20 1S/2S ceilings from `bw40_base[rtw_get_channel_group]`
+(`ht::factory_limit_group`, `phy.c::rtw_phy_get_2g_tx_power_index`), the
+record's C22 CCK references or C21 TXAGC indices as `Facts::cck`/`legacy`,
+and N21W's CCK/OFDM ceilings from the channel group. `ExtensionBase::current`
+returns min(base EIRP, record EIRP ceiling under the installed domain) and
+`ExtensionBase::invoke` re-enters the record capability and span check
+immediately before each operation. `with_extension`, `with_continuation` and
+`with_power_tracking` accept a channel-bound gate; the station loads each
+program exactly as on channel 1 (an extension whose base channel is not the
+committed one is ignored). LPS (`lps_peer`) needs a channel-scoped N2xZ.
+Without any per-channel record the primary carries the base legacy CCK1
+Open/WPA2 profile only.
 
 Native retune owner (`station.rs::retune`, `pci_firmware.rs`
 `station_retune_{begin,iqk,finish}`), unassociated Passive station only:
@@ -2115,9 +2136,13 @@ rtw_ops_mgd_prepare_tx` -> `phy_calibration` does: C22 `rtw8822c_do_iqk`
 (clear=1, DPD kept off, gains reapplied) and C21 `rtw8821c_do_iqk`
 (clear=0/segment=0, stale RF_DTXLOK refused, host clear, IQK fail mask
 0x1bf0 must be clear). The IQK H2C is the only command admitted during a
-retune. REG_RPT_CIP has no host reset, so the C22 completion is accepted only
-after a post-submission transition into IQK_DONE (a non-0xaa value observed
-first); Linux polls the level only. Readbacks then check RF18 channel/band/BW,
+retune. The C22 completion matches `rtw8822c_do_iqk`: after the H2C is
+consumed, REG_RPT_CIP 0x2d9c is polled for the IQK_DONE level 0xaa every 20ms
+for at most 300ms, then REG_IQKSTAT 0x1b10 is cleared. Linux only warns on a
+timeout; this owner fails the retune. The earlier stricter rule (a non-0xaa
+value must be observed first) was dropped: RPT_CIP has no host reset and no
+source shows the firmware leaving IQK_DONE when an IQK starts, so that rule
+could time out on silicon. A stale level is bounded by the readbacks below. Readbacks then check RF18 channel/band/BW,
 SCOTRK/TXDFIR (C22), the programmed CCK references or TXAGC words, RRSR 0x1f
 and (C21) the IQK fail mask. `finish` requires an idle H2C ring, the paused and
 quiet hardware, the target gate current again, clears TXPAUSE, commits the
@@ -2136,10 +2161,9 @@ reports none.
 
 Remaining before physical acceptance (no row closure is claimed here): no
 signed N2xO record exists for any board, so on real hardware only channel 1
-is admitted until per-channel measurements are provisioned; channel switch
-while associated (CSA/roam) is not supported (Linux mac80211 would retune via
-`rtw_ops_config`); extension programs (WMM/HT/BA/RTS/coding/QoS/fallback/dm/
-N21W/LPS) remain channel-1 qualified. Three new cases are written and
+is admitted until per-channel measurements are provisioned. Extension
+programs are per-channel records over the channel-scoped base (above); none
+is provisioned for any channel. Three new cases are written and
 unexecuted at the time of writing:
 `smoke_rtw88_channel_policy_linux_groups_bb_rf_and_probe_ds`,
 `smoke_rtw88_channel_record_admission_and_regulatory_span`,

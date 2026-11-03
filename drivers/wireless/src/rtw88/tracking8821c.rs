@@ -102,9 +102,12 @@ pub(super) fn request(
     Ok(Request {
         identity: h.finalize(),
         mac,
-        filename: format!(
-            "rtw88/rtw8821ce-power-track-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        filename: super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/rtw8821ce-power-track-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ),
+            gate.channel(),
         ),
     })
 }

@@ -22,14 +22,17 @@
 //! indices. Selections are bounded by the factory `rtw_get_channel_group`
 //! base for that channel; nothing is derived from another channel's
 //! measurement. Without a provisioned record only channel 1 is admitted.
-//! Noninitial channels carry the base legacy CCK1 profile only: no WMM/HT,
-//! BA, protection, coding/QoS/fallback, dm or power-tracking continuation.
+//! Every continuation program (WMM/HT/BA/RTS/coding/QoS/fallback/dm/N21W/
+//! LPS) on a noninitial primary is a distinct record qualified over the
+//! channel-scoped base ([`scope_request`]); without one the channel carries
+//! the base legacy CCK1 profile only.
 //! Channel 14 (CCK-only, Japan) is not admitted.
 use super::{
     firmware_transport::{Error, Io},
     power_policy::Gate,
     qualification::{Grant, Kind, PAYLOAD},
 };
+use alloc::{format, string::String};
 use narf_wireless::reg::{RegFlags, RegulatoryDomain};
 
 /// Highest admitted noninitial primary.
@@ -229,12 +232,58 @@ pub(super) fn current(g: &Grant, did: u16) -> Result<(), Error> {
 }
 
 pub(super) fn current_in(g: &Grant, did: u16, domain: &RegulatoryDomain) -> Result<(), Error> {
+    limit_in(g, did, domain).map(|_| ())
+}
+
+/// [`current_in`] returning the record's admitted EIRP ceiling, which
+/// bounds every program qualified over the channel-scoped base.
+pub(super) fn limit_in(g: &Grant, did: u16, domain: &RegulatoryDomain) -> Result<i16, Error> {
     g.invoke_source(|| {
         let record = Record::decode(did, g.payload()).ok_or(Error::State)?;
         if kind(record.channel).is_none_or(|k| !g.is(k)) {
             return Err(Error::State);
         }
-        policy(&record, domain).map(|_| ())
+        policy(&record, domain)
+    })
+}
+
+/// Per-channel filename of a program qualified over a channel-scoped base:
+/// `rtw88/rtw882Xce-<stem>...` becomes `rtw88/rtw882Xce-chNN-<stem>...`.
+/// Channel 1 keeps the original name.
+pub(super) fn scoped_filename(name: &str, channel: u8) -> String {
+    match name.find("ce-") {
+        Some(at) if channel != 1 => {
+            format!("{}ce-ch{:02}-{}", &name[..at], channel, &name[at + 3..])
+        }
+        _ => name.into(),
+    }
+}
+
+/// Channel-scoped extension base: every WMM/HT/BA/RTS/coding/QoS/fallback/
+/// dm/N21W/LPS program on a noninitial primary binds this identity, so it is
+/// a distinct per-channel record measured on that channel, bounded by that
+/// channel's factory group and checked against that channel's regulatory
+/// span. A channel-1 record can never authorize channel N.
+pub(super) fn scope_request(
+    base: &super::station_profile::Request,
+    did: u16,
+    g: &Grant,
+) -> Option<super::station_profile::Request> {
+    let record = Record::decode(did, g.payload())?;
+    kind(record.channel).filter(|k| g.is(k))?;
+    let (identity, digest) = g.source_identity();
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(b"NARF RTW88 N2xO channel-scoped operating base v1");
+    h.update(&did.to_le_bytes());
+    h.update(&[record.channel, 20]);
+    h.update(&base.identity);
+    h.update(&identity);
+    h.update(&digest);
+    h.update(b"Linux 7.3-rc4 rtw_set_channel + rtw_phy_set_tx_power_level for this primary; rtw_get_channel_group factory ceilings of this primary only; N2xO CCK references (C22) / TXAGC indices (C21) as the program base; record regulatory span and EIRP ceiling enclose every continuation; no channel-1 measurement reused");
+    Some(super::station_profile::Request {
+        identity: h.finalize(),
+        mac: base.mac,
+        filename: scoped_filename(&base.filename, record.channel),
     })
 }
 
@@ -306,33 +355,33 @@ fn dpd_off(io: &mut impl Io) -> Result<(), Error> {
     super::radio::mask(io, 0xa70, 0x3ff, 0x3ff)
 }
 
-/// `rtw8822c_do_iqk` (clear=1) on the retained channel. REG_RPT_CIP has no
-/// host reset, so a completion is accepted only after a post-submission
-/// transition into IQK_DONE: a value other than 0xaa must be observed after
-/// the H2C is consumed (or before submission) and then 0xaa again.
+/// `rtw8822c_do_iqk` (clear=1) on the retained channel, matching Linux:
+/// after the H2C is consumed, poll REG_RPT_CIP (0x2d9c) for the IQK_DONE
+/// level 0xaa every 20ms for at most 300ms (`read_poll_timeout(...,
+/// iqk_chk == IQK_DONE_8822C, 20000, 300000, ...)`), then clear
+/// REG_IQKSTAT. Linux only warns on timeout; this owner fails the retune
+/// instead (TX stays closed). A stricter "observe non-0xaa first" rule was
+/// dropped: no source shows the firmware leaving IQK_DONE at IQK start, so
+/// it could time out on silicon. The stale-level risk is bounded by the
+/// RF18/SCOTRK/TXDFIR/gain/RRSR readbacks that follow.
 async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
     dpd_off(io)?;
-    let before = io.read8(0x2d9c)?;
-    if before == 255 {
-        return Err(Error::Gone);
-    }
     super::radio::rfk_power(io, true)?;
     io.station_retune_iqk()?;
     wait_h2c(io).await?;
-    let mut armed = before != 0xaa;
     let mut complete = false;
-    for _ in 0..300 {
+    for attempt in 0..=15 {
         let value = io.read8(0x2d9c)?;
         if value == 255 {
             return Err(Error::Gone);
         }
-        if value != 0xaa {
-            armed = true;
-        } else if armed {
+        if value == 0xaa {
             complete = true;
             break;
         }
-        io.delay_us(1000).await;
+        if attempt < 15 {
+            io.delay_us(20000).await;
+        }
     }
     if !complete {
         return Err(Error::Timeout);
