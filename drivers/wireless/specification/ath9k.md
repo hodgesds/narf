@@ -1900,6 +1900,68 @@ bind; ANI is not run; HT20/HT40 TX power and every HT owner are out of
 scope; open-loop maps stay refused; DFS, NO_IR and indoor-only channels are
 refused. No physical AR5416, AR5418 or AR9160 receipt exists.
 
+**AR9003 identity foundation (`ar9300_enablement`, in progress — not
+claimed).** `ar9003.rs` is a separate generation module, so `chips.rs`
+(`Revision::decode` still refuses macVersion 0x1c0) and every AR5008/AR9002
+trace are unchanged; the only shared edit is `identity::RegisterIo::wait_us`
+(`ath9k_hw_wait` with an explicit timeout; `wait` delegates to it with the
+unchanged 100 ms). `ar9003::Chip::Ar9300` is PCIe `0x0030`
+(`AR9300_DEVID_PCIE`, chip_chainmask 7). `Revision::decode` accepts only
+the `AR_SREV_ID == 0xff` format with macVersion `AR_SREV_VERSION_9300`
+(0x1c0), keeps `AR_SREV_REVISION2` (`ar9300_22()` is macRev 3) and records
+`AR_SREV_TYPE2_HOST_MODE` (`ath9k_hw_disablepcie` is a no-op for non-AR5416
+parts). `power_on_chip` follows `__ath9k_hw_init`: wrong silicon or device
+is refused before the first write; `AR_WA` is latched with
+`AR_WA_D3_L1_DISABLE | AR_WA_ASPM_TIMER_BASED_DISABLE`;
+`ath9k_hw_set_reset_power_on` (AR_WA + 10 µs, force wake EN|ON_INT, no
+`AR_RC_AHB`, RTC reset 0/1, `AR_RTC_STATUS_ON`) and the WARM
+`ath9k_hw_set_reset` (`AR_RC_HOSTIF` only after a local/RADM sync timeout,
+the AR9300 `AR_CFG_HALT_REQ`/`HALT_ACK` DMA halt with 20 × `AH_WAIT_TIMEOUT`,
+`AR_RTC_RC` WARM, 50 µs, release); `ath9k_hw_set_power_awake` (power-on only
+from SHUTDOWN, no PLL here, `POWER_UP_TIME / 50` poll, `PWR_SAV` clear);
+`AR_PHY_CHIP_ID`.
+
+`ar9003/eeprom.rs` is `ar9300_eeprom_restore_internal` over the 1088-byte
+`struct ar9300_eeprom`: EEPROM through the AR9300 `AR_EEPROM_STATUS_DATA`
+(0x4084) at `AR9300_BASE_ADDR` 0x3ff, 0xfff, 0x1ff, then OTP
+(`0x14000`/`0x15f18`/`0x15f1c`, 1 ms valid wait) at 0x3ff, 0x1ff; bytes are
+read downward exactly as `ar9300_read_eeprom`/`ar9300_read_otp`;
+`ar9300_comp_hdr_unpack`, the additive `ar9300_comp_cksum`, `_CompressNone`
+(whole map) and `_CompressBlock` (`ar9003_eeprom_struct_find_by_id`
+reference copy, then `ar9300_uncompress_block` runs), at most `MSTATE` 100
+blocks, length `< 1024` and `<= cptr`. `ar9003/templates.rs` holds the five
+`ar9300_eep_templates` (default 2, x112 5, h116 4, h112 3, x113 6) as bytes
+dumped from the compiled Linux initializers. Policy over Linux (never invent
+board values): a bad header, bad checksum, unknown code or reference, run
+outside the block or map, or a read below byte 0 is refused instead of
+skipped; an image no block was restored into is refused (Linux would use
+`ar9300_default` whole); a MAC the board did not write is refused; and
+template bytes are accepted only when the restored `templateVersion` names
+the template they came from (`ar9300_default` for board id 2, or the block's
+own reference). `Identity::decode` takes `ath9k_hw_ar9300_get_eeprom`'s MAC,
+`regDmn`, `opFlags` (one band required) and `txrxMask` nibbles, refusing an
+invalid MAC (Linux: random address) and an empty or out-of-chip mask (Linux:
+`fixup_chainmask`), plus the `txrxgain` nibbles. `ar9003/initvals.rs` is
+every table of `ar9003_2p2_initvals.h` (20 tables, 1638 rows, generated
+verbatim); `ar9003/ini.rs::Tables::ar9300` is `ar9003_hw_init_mode_regs`'
+AR9300 branch plus `ar9003_hw_init_mode_gain_regs` (TX gain modes 0–5 with
+type 5 only on `AR_SREV_9300_22`, modes 6/7/8+ and RX modes 2/3 keeping the
+lowest-ob/db and common defaults; `tx_gain_buffalo` is never set). Smokes
+(written, not executed): `smoke_ath9k_ar9300_identify_power_on_and_restore`,
+`smoke_ath9k_ar9300_eeprom_restores_referenced_template_block`,
+`smoke_ath9k_ar9300_eeprom_otp_and_base_fallback_order`,
+`smoke_ath9k_ar9300_eeprom_refuses_template_fallbacks`,
+`smoke_ath9k_ar9300_ini_selection_follows_txrxgain` (FNV-1a oracle over the
+886 default-selected 2 GHz HT20 rows).
+
+Still to port before `ar9300_enablement` can be claimed: `ar9003_phy.c`
+process_ini/set_channel/spur/chain masks and
+`ath9k_hw_ar9300_set_board_values`, `ath9k_hw_ar9300_set_txpower` (targets,
+CTL, PAPRD off), the EDMA TX status ring and RX FIFOs (`ar9003_mac.c`),
+`ar9003_calib.c`, signed AR9300 records and the
+probe/station/retune/reset/periodic/suspend owner. Nothing registers
+`0x0030`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

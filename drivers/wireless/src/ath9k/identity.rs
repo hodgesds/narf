@@ -77,13 +77,23 @@ pub(super) trait RegisterIo {
         narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(us));
     }
     fn wait(&mut self, offset: u64, mask: u32, expected: u32) -> Result<u32, BringUpError> {
+        self.wait_us(offset, mask, expected, 100_000)
+    }
+    /// `hw.c::ath9k_hw_wait` with an explicit timeout (µs).
+    fn wait_us(
+        &mut self,
+        offset: u64,
+        mask: u32,
+        expected: u32,
+        timeout_us: u64,
+    ) -> Result<u32, BringUpError> {
         let mut value = 0;
         let complete = narf_scheduler::responsive_spin_until(
             || {
                 value = self.read32(offset);
                 value == u32::MAX || value & mask == expected
             },
-            narf_time::Deadline::after_us(100_000),
+            narf_time::Deadline::after_us(timeout_us),
         );
         if value == u32::MAX {
             return Err(BringUpError::DeviceGone);

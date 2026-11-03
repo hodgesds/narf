@@ -11,6 +11,7 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod admission;
 mod ar5008_owner;
+mod ar9003;
 mod ar9280_owner;
 mod ar9287_owner;
 mod calibration;
