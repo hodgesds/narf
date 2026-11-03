@@ -4042,7 +4042,41 @@ not carried, so a container without TXPWR_TRK is refused. Thermal 0xff
 programs TMETER/RFCTM 32 and zero offsets, as Linux. Unexecuted case:
 `smoke_rtw89_n51_tssi_tmeter_de_and_enable_follow_rtw8851b`.
 
-**Remaining for the row.** Channel DPK with `dpk_track`/`lck_track` (rtw8851b_rfk.c), firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
+**Channel DPK and RF tracking (`rfk::n51_dpk`).** `n51_dpk::Dpk::run` is
+rtw8851b_rfk.c `rtw8851b_dpk(PHY_0)` on RF path A (`cur_idx` 0, no
+reload): `BTC_WRFKT_DPK` START, TX pause, `_wait_rx_mode`, the eight
+`dpk_kip_reg` / four `dpk_rf_reg` backups, `_dpk_information` (Linux
+stores `band_width` in `bp.ch` and `chan->channel` in `bp.bw`; NARF keeps
+that swap, so `_dpk_tpg_sel` and `RR_BTC_TXBB = bw + 1` follow the center
+channel number exactly as Linux programs them), the `is_tssi_mode[A]`
+TSSI pause, slope-K/RXAGC/DRF off, `_dpk_bb_afe_setting` (8851B
+`ck1920_8851b` RX clock, DCIM/ADCMOD/NRBW and the ANAPAR delays),
+`_dpk_main` (RR_BBDC 0x03ffd, `_dpk_rf_setting`, `_set_rx_dck(A, RF_DPK)`,
+KIP power/clock on, `_dpk_kip_preset`, TXAGC 17dBm, `_dpk_agc` with the
+5GHz `_dpk_lbk_rxiqk` / 2.4GHz RXIQC bypass and Linux's double
+`_dpk_pas_read` on the `gl_idx == 0` arm, `_dpk_idl_mpa` order select,
+`_dpk_para_query`, `_dpk_on` with `path_ok |= BIT(cur_k_set)` and the
+non-executing `_dpk_gain_normalize`), `_dpk_onoff`, `_dpk_kip_restore`,
+backup reload, AFE restore, TSSI resume and KIP clock off. One-shots are
+`(id << 8) | 0x19` with the 0xbff8 == 0x55 (10us/20ms) and
+`R_RPT_COM` == 0x8000 (1us/2ms) polls; Linux only logs their timeouts,
+NARF fails closed. A K-set outside `dpk_par_regs` takes Linux's
+substitution of index 2; a raw KSET of 0 (`BIT(0xff)` in `_dpk_on`) is
+refused. A sync failure ("need Check") completes with MDPD off.
+`n51_dpk::Track::step` is core.c `rtw89_track_work`'s
+`rtw89_phy_stat_thermal_update` (`rtw8851b_get_thermal`: TSSI-mode
+`R_TSSI_THER`, else the RR_TM 1/0/1 trigger, 200us, `RR_TM_VAL`; zero
+samples skipped; DECLARE_EWMA(thermal, 4, 4) shared with `rf_tracking`)
+then `rtw8851b_rfk_track`: `_dpk_track` (PWSF `0x78 - (cur_ther -
+ther_dpk) * 2 / 3` in `R_DPD_BND` [26:18] unless `B_IDL_DN` or TXAGC RF 0)
+and `rtw8851b_lck_track` (`rtw8851b_aack` + `rtw8851b_lck`, which reissues
+`_set_ch` = `channel_rf::set_ch_51`, when `|avg - lck.thermal| >= 8`).
+It requires a completed DPK and refuses while terminal; the caller must
+skip it during scans as Linux does. No native caller yet. Unexecuted
+cases: `smoke_rtw89_n51_dpk_agc_on_and_restore_follow_rtw8851b`,
+`smoke_rtw89_n51_rfk_track_dpk_pwsf_and_lck_follow_rtw8851b`.
+
+**Remaining for the row.** Firmware TX power, the signed record family, coex (`rtw8851b_btc_*`,
 single-antenna BT share), grant/retune/station admission, HT/HE + 40/80 and
 the one-path antenna-diversity tracker (`hal->ant_diversity` from
 `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`)

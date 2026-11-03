@@ -183,6 +183,19 @@ impl<I: Interface> Access<'_, I> {
         self.write(p, a, RFREG_MASK, v).await
     }
 }
+/// rtw8851b_rfk.c `_set_ch(val)` = `_set_s0_arfc18` then `_lck_check`, as
+/// `rtw8851b_lck` reissues it on the retained path-A RR_CFGCH word. Linux
+/// skips `_lck_check` after a logged ARFC18 timeout and only logs a final
+/// unlocked synth; NARF fails both closed.
+///
+/// # Safety
+/// Same retained RTL8851B PHY_0 owner as [`Channel::prepare_for_channel_51`]
+/// after a completed channel program; `value` is the read-back RR_CFGCH word.
+pub(super) async unsafe fn set_ch_51(io: &mut impl Interface, value: u32) -> Result<(), Error> {
+    let mut access = Access(io);
+    access.s0(value).await?;
+    access.lock().await
+}
 impl Channel {
     pub fn state(&self) -> State {
         self.state

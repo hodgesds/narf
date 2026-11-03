@@ -224,7 +224,7 @@ impl<I: Interface> Access<'_, I> {
         }
     }
     /// `rtw8851b_aack`.
-    async fn n51_aack(&mut self, results: &mut Results) -> Result<(), Error> {
+    pub(super) async fn n51_aack(&mut self, results: &mut Results) -> Result<(), Error> {
         let tmp05 = self.rr(0, RR_RSV1, RFREG_MASK).await?;
         let tmpd3 = self.rr(0, RR_LCK_TRG, RFREG_MASK).await?;
         self.wr(0, RR_MOD, RR_MOD_MASK, 0x3).await?;
@@ -394,8 +394,9 @@ impl<I: Interface> Access<'_, I> {
         self.n51_new_dadck(results).await?;
         self.wr(0, RR_RSV1, RR_RSV1_RST, 1).await
     }
-    /// `_set_rx_dck(A, RF_RX)` with `_rxbb_ofst_swap`.
-    async fn n51_set_rx_dck(&mut self) -> Result<(), Error> {
+    /// `_set_rx_dck(A, rf_mode)` with `_rxbb_ofst_swap(A, rf_mode)` (RF_RX
+    /// for RX DCK, RF_DPK from `_dpk_main`).
+    pub(super) async fn n51_set_rx_dck(&mut self, rf_mode: u32) -> Result<(), Error> {
         self.wr(0, RR_DCK, RR_DCK_LV, 0).await?;
         self.wr(0, RR_DCK, RR_DCK_LV, 1).await?;
         self.n51_rf_poll(RR_DCK, 1 << 8, 2, 2000).await?;
@@ -403,7 +404,7 @@ impl<I: Interface> Access<'_, I> {
         let val_i = self.rr(0, RR_DCK, RR_DCK_S1).await?;
         let val_q = self.rr(0, RR_DCK1, RR_DCK1_S1).await?;
         self.wr(0, RR_LUTWE2, RR_LUTWE2_DIS, 1).await?;
-        self.wr(0, RR_LUTWA, RFREG_MASK, RF_RX).await?;
+        self.wr(0, RR_LUTWA, RFREG_MASK, rf_mode).await?;
         self.wr(0, RR_LUTWD0, RFREG_MASK, (val_q << 4) | val_i)
             .await?;
         self.wr(0, RR_LUTWE2, RR_LUTWE2_DIS, 0).await
@@ -428,7 +429,7 @@ impl<I: Interface> Access<'_, I> {
         }
         self.wr(0, RR_RSV1, RR_RSV1_RST, 0).await?;
         self.wr(0, RR_MOD, RR_MOD_MASK, RF_RX).await?;
-        self.n51_set_rx_dck().await?;
+        self.n51_set_rx_dck(RF_RX).await?;
         self.wr(0, RR_RSV1, RFREG_MASK, rf_reg5).await?;
         if tssi_mode {
             self.wm(R_P0_TSSI_TRK, B_P0_TSSI_TRK_EN, 0)?;

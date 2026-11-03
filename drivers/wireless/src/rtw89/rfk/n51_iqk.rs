@@ -298,14 +298,14 @@ pub(in super::super) struct Iqk {
 
 impl<I: Interface> Access<'_, I> {
     /// `_txck_force(A, true, ck)`.
-    fn n51_txck_force(&mut self, ck: u32) -> Result<(), Error> {
+    pub(super) fn n51_txck_force(&mut self, ck: u32) -> Result<(), Error> {
         self.wm(R_P0_RXCK, B_P0_TXCK_ON, 0)?;
         self.wm(R_P0_RXCK, B_P0_TXCK_VAL, ck)?;
         self.wm(R_P0_RXCK, B_P0_TXCK_ON, 1)
     }
     /// `_rxck_force(A, true, ck)` with the 8851B `ck960_8851b` /
     /// `ck1920_8851b` rows.
-    fn n51_rxck_force(&mut self, ck: u32) -> Result<(), Error> {
+    pub(super) fn n51_rxck_force(&mut self, ck: u32) -> Result<(), Error> {
         let data: [u32; 7] = if ck == ADC_960M {
             [0x8, 0x2, 0x2, 0x4, 0xf, 0xa, 0x92]
         } else {
@@ -324,7 +324,7 @@ impl<I: Interface> Access<'_, I> {
     }
     /// `read_poll_timeout_atomic(rtw89_phy_read32_mask, val == want, step,
     /// budget)`.
-    async fn n51_poll_eq(
+    pub(super) async fn n51_poll_eq(
         &mut self,
         address: u32,
         mask: u32,

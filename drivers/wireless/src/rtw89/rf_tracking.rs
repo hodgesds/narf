@@ -83,9 +83,9 @@ impl Inputs {
 /// Linux DECLARE_EWMA(thermal,4,4): zero sensor samples are unavailable and
 /// never replace an already sampled mean; the mean persists across peers.
 #[derive(Clone, Copy, Debug, Default)]
-struct Thermal(u32);
+pub(super) struct Thermal(u32);
 impl Thermal {
-    fn add(&mut self, sample: u8) {
+    pub(super) fn add(&mut self, sample: u8) {
         if sample == 0 {
             return;
         }
@@ -96,7 +96,7 @@ impl Thermal {
             ((self.0 << 2) - self.0 + scaled) >> 2
         };
     }
-    fn read(self) -> u8 {
+    pub(super) fn read(self) -> u8 {
         (self.0 >> 4) as u8
     }
 }
