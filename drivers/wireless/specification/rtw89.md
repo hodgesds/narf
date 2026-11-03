@@ -3071,8 +3071,8 @@ default-chandef 2.4GHz `ctrl_btg_bt_rx`, then the `hal.rx_nss` HT/VHT/HE
 limits; every final bit read back), `Channel::set_channel` with the
 `radio_power_c::Plan` for the initial primary and `rfk_channel`, returning
 the 24-byte MCC V0 body. `retune` is `set_channel` + `rfk_channel` on a Ready
-radio. The phy.c DM sub-inits (PHYSTS/DIG/CFO/EDCCA) stay B-only
-(`phy_operating`). Native dispatch: `radio_access` admits B or C with the
+radio. Between `bb_sethw` and NCTL, `prepare_controls` runs the phy.c DM
+sub-inits as `phy_operating::Operating::prepare_c` (below). Native dispatch: `radio_access` admits B or C with the
 chip's own factory PHY-cap and PHY window (`NativeIo::c_phy_window`, same
 `rf_base_addr`), `radio_profile_current` dispatches the PHY-profile check
 (C: actual C identity + firmware receipt topology), `prepare_radio_tables`
@@ -3104,11 +3104,29 @@ B, the fetch is admitted only after RX polling (`radio_access`), so on C it
 is reachable only once the C `prepare_receive` exists. Unexecuted case:
 `smoke_rtw8852c_phycap_uses_v1_register_block_and_binds_c_receipt`.
 
+**C DM sub-inits (`phy_operating::Operating::prepare_c`).** phy.c
+`rtw89_phy_dm_init` between `rtw8852c_bb_sethw` and `rtw89_phy_init_rf_nctl`
+for PHY_0, non-DBCC, at the default unlinked 2.4GHz channel 1 / 20MHz
+chandef: `rtw89_physts_parsing_init` (AX PHYSTS, the same helper and bytes
+as B), `rtw89_phy_dig_init` with `rtw8852c_dig_regs` (core.c `support_igi`
+false, `support_cckpd` true on every C cut: `R_SEG0R_PD` 0x481c lower bound 0
+and spatial-reuse bit 29 clear, `R_BMODE_PDTH_EN_V1` limit off,
+`R_BMODE_PDTH_V1` [31:24] = -128, the `_V1` PAGCUGC enables 0x4c24/0x4c28/
+0x4ce8/0x4cec clear), `rtw89_phy_cfo_init` (XTAL SI SC_XO/SC_XI = efuse
+`xtal_k` & 0x7f, read back; `rtw89_dcfo_comp_init` with
+`rtw8852c_chip_info.cfo_hw_comp = false`: `R_DCFO` [7:0] = 1 and
+`R_AX_PWR_UL_CTRL2` CFO mask cleared) and `rtw89_phy_edcca_init`
+(`R_TX_COLLISION_T2R_ST` = 0x29). `bb_wrap`/`ch_info` are BE-only,
+`ul_tb_waveform_ctrl` is false and C has no antenna diversity or
+`rfe_gpio`. Native `phy_operating::Interface::admit` now dispatches through
+`radio_profile_current` (B unchanged). The env-monitor/NHM CCX setup is not
+part of this owner for either chip. Unexecuted case:
+`smoke_rtw8852c_dm_subinit_physts_dig_cfo_edcca_follow_rtw8852c_regs`.
+
 Remaining for the `rtl8852c` row (no row credit): C coexistence init, the
 C `power::Calibration`/qualification records (N52x are B-bound), a
 Startup caller of `Native::prepare_radio_c` (which exists, unadmitted), the
-C native MAC/RX lifecycle (`prepare_mac`, `prepare_receive` are B-only),
-the C phy.c DM sub-inits, `command_native`/
+C native MAC/RX lifecycle (`prepare_mac`, `prepare_receive` are B-only), `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:

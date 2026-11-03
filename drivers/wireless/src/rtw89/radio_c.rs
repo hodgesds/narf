@@ -13,8 +13,8 @@
 //! set_channel` (incl. `rtw8852c_set_txpwr` from `radio_power_c::Plan`) and
 //! `rtw8852c_rfk_channel`, which yields the `RF_GET_MCCCH` V0 body the
 //! native caller sends. The phy.c DM sub-inits between `bb_sethw` and NCTL
-//! (PHYSTS/DIG/CFO/EDCCA/env monitor) are B-only (`phy_operating`) and are
-//! not part of this owner.
+//! (PHYSTS/DIG/CFO/EDCCA) run inside [`Radio::prepare_controls`] through
+//! `phy_operating::Operating::prepare_c`.
 use super::{
     channel_c, factory_c,
     operating_channel_c::{Band, Profile},
@@ -195,7 +195,8 @@ impl Radio {
         &self.channel
     }
 
-    /// `rtw8852c_bb_sethw` (`radio_init::controls_c`) and
+    /// `rtw8852c_bb_sethw` (`radio_init::controls_c`), the phy.c DM
+    /// sub-inits (`phy_operating::Operating::prepare_c`) and
     /// `rtw89_phy_init_rf_nctl` (`radio_init::nctl_c` with the selected
     /// firmware NCTL table), before any RFK admission (as B's
     /// `prepare_basic_rfk` runs `controls` and `nctl` before the RFK owner).
@@ -207,7 +208,9 @@ impl Radio {
     /// enclosing native owner terminalizes it.
     pub async unsafe fn prepare_controls(
         &mut self,
-        io: &mut impl power::Io,
+        io: &mut impl super::phy_operating::Interface,
+        operating: &mut super::phy_operating::Operating,
+        identity: super::factory::Identity,
         nctl: &[Pair],
     ) -> Result<(), Error> {
         if self.state != State::New || self.offset_base.is_some() {
@@ -216,6 +219,8 @@ impl Radio {
         self.state = State::Preparing;
         let bases = radio_init::controls_c(io).map_err(radio_error)?;
         self.offset_base = Some(bases);
+        // SAFETY: caller contract; directly after the C bb_sethw above.
+        unsafe { operating.prepare_c(io, identity) }.await?;
         radio_init::nctl_c(io, nctl).await.map_err(radio_error)?;
         self.state = State::New;
         Ok(())

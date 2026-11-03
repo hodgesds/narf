@@ -430,3 +430,12 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout
 );
+
+/// Test-only identity of an actual RTL8852C factory snapshot (RFE 5, XTAL
+/// 0x33) decoded through `Factory::read` from the C sparse-map model.
+pub(in crate::rtw89) fn c_identity() -> Identity {
+    let mut source = SourceModel::new(ChipId::Rtl8852C);
+    let mut factory = Factory::default();
+    narf_scheduler::block_on(factory.read(&mut source)).unwrap();
+    factory.identity().unwrap()
+}

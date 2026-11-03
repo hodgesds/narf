@@ -743,7 +743,8 @@ impl crate::rtw89::channel_bb::Interface for Native {
 
 impl crate::rtw89::phy_operating::Interface for Native {
     fn admit(&mut self) -> Result<(), rfk::Error> {
-        self.phy_profile_current().map_err(rfk::Error::Register)?;
+        // B: phy_profile_current unchanged; C: its own identity + V1 receipt.
+        self.radio_profile_current().map_err(rfk::Error::Register)?;
         if !self.coex_ready || self.nctl_ready {
             return Err(rfk::Error::Policy);
         }
@@ -786,7 +787,8 @@ impl Native {
     }
     /// The C counterpart of `prepare_basic_rfk` + `prepare_full_radio` for
     /// the initial primary: `radio_c::Radio::prepare_controls` (bb_sethw,
-    /// NCTL), then `radio_c::Radio::prepare` (`rtw8852c_rfk_init`,
+    /// phy.c DM sub-inits via `phy_operating::Operating::prepare_c`, NCTL),
+    /// then `radio_c::Radio::prepare` (`rtw8852c_rfk_init`,
     /// set_txpwr_ctrl, power trim, cfg_txrx_path, `__rtw89_set_channel`,
     /// `rtw8852c_rfk_channel`) and the `RF_GET_MCCCH` V0 H2C (category 2,
     /// class 0x0a, function 2, 24-byte body; fw.c `RFK_NTFY_MCC_V0`).
@@ -854,9 +856,12 @@ impl Native {
             .rx_nss();
         self.radio_started = true;
         // SAFETY: caller contract; admission rechecked by every Port access.
-        unsafe { owner.prepare_controls(self, &nctl) }
-            .await
-            .map_err(radio_c::error)?;
+        let mut operating = self.operating.take().ok_or(power::Error::Terminal)?;
+        // SAFETY: caller contract; the C DM sub-inits run between bb_sethw
+        // and NCTL with phy_operating::Interface admission on every access.
+        let result = unsafe { owner.prepare_controls(self, &mut operating, identity, &nctl) }.await;
+        self.operating = Some(operating);
+        result.map_err(radio_c::error)?;
         self.nctl_ready = true;
         // SAFETY: same owner after bb_sethw/NCTL; rfk::Interface admits
         // every access against the retained envelope.

@@ -199,4 +199,4 @@ impl Source for super::power_native::NativeIo {
 }
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "factory/tests.rs"]
-mod tests;
+pub(super) mod tests;
