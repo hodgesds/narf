@@ -8881,6 +8881,7 @@ fn smoke_uac_dispatch_unbind_reaches_unbind() -> TestResult {
     };
     let (out_dci, in_dci) = crate::uac::find_audio_streaming_iso_eps(&cfg);
     crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        controller: 0,
         slot_id: 9,
         ac_iface: 0,
         iso_out_dci: out_dci,
@@ -8889,6 +8890,7 @@ fn smoke_uac_dispatch_unbind_reaches_unbind() -> TestResult {
         card_error: None,
     });
     crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        controller: 0,
         slot_id: 10,
         ac_iface: 0,
         iso_out_dci: 0,
@@ -8900,7 +8902,7 @@ fn smoke_uac_dispatch_unbind_reaches_unbind() -> TestResult {
         return TestResult::Fail("registry holds both bound devices");
     }
     crate::uac::register_initcalls();
-    let report = crate::class_registry::dispatch_unbind(9);
+    let report = crate::class_registry::dispatch_unbind(0, 9);
     if report.invoked == 0 {
         return TestResult::Fail("dispatch_unbind invoked no hooks");
     }

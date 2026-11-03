@@ -567,6 +567,7 @@ impl CdcAcmPort {
     /// Grab the bound CDC-ACM device on `slot_id`, if any.
     pub fn for_slot(xhci: Arc<Xhci>, slot_id: u8) -> Option<Self> {
         let dev = ACM_DEVICES
+            .of(xhci.id())
             .lock()
             .iter()
             .find(|d| d.slot_id == slot_id)
@@ -799,7 +800,7 @@ pub async fn try_bind_cdc_acm_already_addressed(
     // push is safe: an ioctl landing in between is answered
     // ENODEV, the honest state of a half-bound device.
     let tty_index = crate::cdc_acm_bridge::register_tty_acm(Arc::new(
-        crate::cdc_acm_bridge::XhciAcmTransport::new(slot_id, ifaces.capabilities),
+        crate::cdc_acm_bridge::XhciAcmTransport::new(xhci_dev.id(), slot_id, ifaces.capabilities),
     ));
 
     let dev = Arc::new(AcmDevice {
