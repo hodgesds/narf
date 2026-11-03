@@ -1327,13 +1327,57 @@ fn smoke_rtl8821ae_napc_v2_permission_bw40_and_5ghz() -> TestResult {
     {
         return TestResult::Fail("unmeasured 80 MHz primary admitted");
     }
-    // A permission for a wide point is not programmed by the 20 MHz path.
+    // 5 GHz is not programmed by the 2.4 GHz channel path.
     let p = cal
         .permission_for(&domain, op(Band::B5g, Width::W20, 36))
         .unwrap();
     let io = RegFake(IrqSafeSpinLock::new((vec![0u8; 0x1000], Vec::new())));
-    if narf_scheduler::block_on(channel::configure(&io, &p)).is_ok() {
+    if narf_scheduler::block_on(channel::configure(&io, &p, 0)).is_ok() {
         return TestResult::Fail("5 GHz permission programmed as 2.4 GHz 20 MHz");
+    }
+    // 2.4 GHz 40 MHz, primary 1 + secondary above: wide channel 3, primary
+    // is the lower 20 MHz (data SC 2), reg_837 BIT(2) => L1 peak 6.
+    let p = cal
+        .permission_for(&domain, op(Band::B2g, Width::W40Above, 1))
+        .unwrap();
+    let mut regs = vec![0u8; 0x1000];
+    regs[0x668] = 0x7f;
+    regs[0x669] = 0x01;
+    regs[0xa00] = 0x10;
+    let io = RegFake(IrqSafeSpinLock::new((regs, Vec::new())));
+    if narf_scheduler::block_on(channel::configure(&io, &p, 1 << 2)).is_err() {
+        return TestResult::Fail("2.4 GHz 40 MHz configure failed on model");
+    }
+    let g = io.0.lock();
+    let (r, trace) = (&g.0, &g.1);
+    let r32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+    let lssi: Vec<u32> = trace
+        .iter()
+        .filter(|w| w.1 == phy::RA_LSSIWRITE)
+        .map(|w| w.2)
+        .collect();
+    if lssi.len() != 3 || lssi[1] & 0xff != 3 || (lssi[2] >> 10) & 3 != 1 {
+        return TestResult::Fail("RF 0x18 wide channel 3 / BW40 bits (path A)");
+    }
+    if u16::from_le_bytes([r[0x668], r[0x669]]) != 0x00ff
+        || r[0x483] != 2
+        || r32(0x8ac) & 0x0030_03c3 != 0x0030_0201
+        || (r32(0x8ac) >> 2) & 0xf != 2
+        || r32(0x838) >> 28 != 2
+        || r32(0x8c4) & (1 << 30) != 0
+        || (r32(0x848) >> 22) & 0xf != 6
+        || r32(0xa00) & 0x10 != 0
+        || r[0xc2c] != 0x29
+    {
+        return TestResult::Fail("set_bw_mode(20/40 MHz) effects");
+    }
+    drop(g);
+    let below = cal.permission_for(&domain, op(Band::B2g, Width::W40Below, 9));
+    if below.is_ok() {
+        return TestResult::Fail("unmeasured 40 MHz row admitted");
+    }
+    if channel::data_sc(Width::W40Below) != 1 || channel::data_sc(Width::W20) != 0 {
+        return TestResult::Fail("secondary channel mapping");
     }
     TestResult::Pass
 }
@@ -1357,7 +1401,7 @@ fn smoke_rtl8821ae_band_channel_bw20_txagc_order() -> TestResult {
     regs[0x668] = 0xff;
     regs[0x669] = 0x01;
     let io = RegFake(IrqSafeSpinLock::new((regs, Vec::new())));
-    if narf_scheduler::block_on(channel::configure(&io, &p)).is_err() {
+    if narf_scheduler::block_on(channel::configure(&io, &p, 0)).is_err() {
         return TestResult::Fail("channel configure failed on model");
     }
     let g = io.0.lock();

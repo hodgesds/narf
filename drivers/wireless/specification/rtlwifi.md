@@ -1561,9 +1561,17 @@ chain below is composed.
   HT↔VHT fill-in at 5 GHz 20/40 MHz, 5 GHz section bases) are the Linux
   arithmetic (`ByRate::limit_at` / `by_rate_at`). The 5 GHz permission
   carries `phy_get_tx_swing_8812A(BAND_ON_5G)` (EFUSE `0xC7`, same decode).
-  Minting a wide/5 GHz permission does not program it: `channel::configure`
-  refuses any permission other than 2.4 GHz 20 MHz until the band switch
-  and BW40/80 programming exist. No board values are supplied by the
+  `channel::configure(io, permission, reg_837)` programs 2.4 GHz 20 and
+  40 MHz permissions: `sw_chnl_callback` and TXAGC at the wide channel,
+  then `set_bw_mode_callback(HT_CHANNEL_WIDTH_20_40)` — `_rtl8821ae_phy_set_reg_bw`
+  (`REG_TRXPTCL_CTL` BIT(7) set, BIT(8) clear), `_rtl8821ae_phy_get_secondary_chnl`
+  (secondary above ⇒ `VHT_DATA_SC_20_LOWER_OF_80MHZ` 2, below ⇒ upper 1)
+  into `0x483`, `RRFMOD` `0x00300201` and `[5:2]`, `RCCAONSEC[31:28]`,
+  1T1R `RL1PEAKTH` 8 (6 when `reg_837` BIT(2)), `RCCK_SYSTEM` BIT(4) for
+  an upper primary, RF `0x18[11:10] = 1` on paths A and B. 5 GHz and
+  80 MHz permissions are still refused (`State`) until the band switch and
+  BW80 programming exist. A 40 MHz permission is not yet requested by the
+  station owner (HT40 association is not wired). No board values are supplied by the
   format. Tests
   `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`,
   `smoke_rtl8821ae_txpower_index_bw40_and_5ghz`,

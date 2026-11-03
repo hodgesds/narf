@@ -354,9 +354,11 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.rtl8821ae_power
     }
     /// Continue the same retained 8821AE owner through the 2.4 GHz band
-    /// select, channel switch with the admitted per-board TXAGC indices, and
-    /// 20 MHz bandwidth (`rtl8821ae/channel.rs`). The permission must have
-    /// been minted from this owner's factory identity.
+    /// select, channel switch (at the 40 MHz wide channel when the
+    /// permission is 40 MHz) with the admitted per-board TXAGC indices, and
+    /// 20/40 MHz bandwidth (`rtl8821ae/channel.rs`, `reg_837` from the
+    /// committed BB report). The permission must have been minted from this
+    /// owner's factory identity; 5 GHz and 80 MHz permissions are refused.
     pub async fn configure_rtl8821ae_channel(
         &mut self,
         permission: super::rtl8821ae::envelope::Permission,
@@ -371,9 +373,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         if self.rtl8821ae_identity != Some(permission.identity()) {
             return Err(Error::Power(super::channel_power::Error::Identity));
         }
+        let reg_837 = self.rtl8821ae.ok_or(Error::State)?.reg_837;
         self.phase = Phase::Failed;
         self.rtl8821ae_power = None;
-        super::rtl8821ae::channel::configure(&self.io, &permission).await?;
+        super::rtl8821ae::channel::configure(&self.io, &permission, reg_837).await?;
         self.rtl8821ae_power = Some(permission);
         self.phase = Phase::ChannelConfigured;
         Ok(())

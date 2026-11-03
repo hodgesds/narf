@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8821AE 2.4 GHz band, channel, 20 MHz bandwidth and TXAGC programming.
+//! RTL8821AE 2.4 GHz band, channel, 20/40 MHz bandwidth and TXAGC programming.
 //!
 //! Exact register effects of, in the Linux order (`rtl8821ae_hw_init` band
 //! select, then `core.c::rtl_op_config` → `switch_channel` → `set_bw_mode`):
@@ -11,16 +11,20 @@
 //! - `rtl8821ae_phy_sw_chnl_callback` (2.4 GHz: `RFC_AREA` 0x96a, RF 0x18
 //!   band bits cleared, channel byte) and `rtl8821ae_phy_set_txpower_level`
 //!   (per-rate byte RMW of `RTXAGC_A_*`, then `RA_TXPWRTRAING`).
-//! - `rtl8821ae_phy_set_bw_mode_callback(HT_CHANNEL_WIDTH_20)` incl.
-//!   `_rtl8821ae_phy_set_reg_bw`, `0x483` sub-channel 0, `rtl8812ae_fixspur`
-//!   (no effect on 8821A) and `rtl8821ae_phy_rf6052_set_bandwidth` (paths A
-//!   and B, as Linux).
+//! - `rtl8821ae_phy_set_bw_mode_callback(HT_CHANNEL_WIDTH_20 / _20_40)` incl.
+//!   `_rtl8821ae_phy_set_reg_bw`, `_rtl8821ae_phy_get_secondary_chnl` into
+//!   `0x483` (and `RRFMOD[5:2]` / `RCCAONSEC[31:28]` at 40 MHz), the 1T1R
+//!   `RL1PEAKTH` value (`reg_837` BIT(2) ⇒ 6 at 40 MHz), `RCCK_SYSTEM`,
+//!   `rtl8812ae_fixspur` (no effect on 8821A) and
+//!   `rtl8821ae_phy_rf6052_set_bandwidth` (paths A and B, as Linux).
+//! - The channel switched and the TXAGC computed are at the wide channel
+//!   `core.c::rtl_op_config` stores (40 MHz: primary ± 2).
 //!
 //! TXAGC values come only from an admitted [`super::envelope::Permission`].
 //! Deviation: Linux computes the training levels in `u32` and lets
 //! `MCS7 - 24` wrap; here every level saturates at the Linux floor 2.
 
-use super::envelope::Permission;
+use super::envelope::{Band, Permission, Width};
 use super::phy::{get_bb, set_bb, RHSSIREAD};
 use super::txpower;
 use crate::rtlwifi::firmware_transport::Io;
@@ -43,6 +47,12 @@ pub const REG_DATA_SC: u16 = 0x0483;
 pub const RTXAGC_A_CCK11_CCK1: u16 = 0x0c20;
 pub const RA_TXPWRTRAING: u16 = 0x0c54;
 pub const RF_CHNLBW: u32 = 0x18;
+pub const RCCAONSEC: u16 = 0x0838;
+pub const RCCK_SYSTEM: u16 = 0x0a00;
+pub const BCCK_SYSTEM: u32 = 0x10;
+/// `VHT_DATA_SC_20_UPPER_OF_80MHZ` / `VHT_DATA_SC_20_LOWER_OF_80MHZ`.
+pub const DATA_SC_20_UPPER: u8 = 1;
+pub const DATA_SC_20_LOWER: u8 = 2;
 /// `RB_LSSIWRITE_8821A`, `RB_PIREAD_8821A`, `RB_SIREAD_8821A`.
 pub const RB_LSSIWRITE: u16 = 0x0e90;
 pub const RB_PIREAD: u16 = 0x0d44;
@@ -117,19 +127,59 @@ pub async fn set_bw20(io: &impl Io) -> Result<(), Error> {
     set_rf_b(io, RF_CHNLBW, (1 << 11) | (1 << 10), 3).await
 }
 
-/// Band select, channel switch with admitted TX power, then 20 MHz.
+/// `_rtl8821ae_phy_get_secondary_chnl` for a 20/40 MHz width: the primary
+/// 20 MHz is the lower half when the secondary is above (`HT40PLUS` ⇒
+/// `cur_40_prime_sc = PRIME_CHNL_OFFSET_LOWER`).
+pub fn data_sc(width: Width) -> u8 {
+    match width {
+        Width::W40Above => DATA_SC_20_LOWER,
+        Width::W40Below => DATA_SC_20_UPPER,
+        _ => 0,
+    }
+}
+
+/// `rtl8821ae_phy_set_bw_mode_callback` for `HT_CHANNEL_WIDTH_20_40`, 1T1R.
+pub async fn set_bw40(io: &impl Io, sc: u8, reg_837: u8) -> Result<(), Error> {
+    let bw = io.read32(REG_TRXPTCL_CTL)? as u16;
+    io.write16(REG_TRXPTCL_CTL, (bw | 0x0080) & 0xfeff)?;
+    io.write8(REG_DATA_SC, sc)?;
+    set_bb(io, RRFMOD, 0x0030_03c3, 0x0030_0201)?;
+    set_bb(io, RADC_BUF_CLK, 1 << 30, 0)?;
+    set_bb(io, RRFMOD, 0x3c, u32::from(sc))?;
+    set_bb(io, RCCAONSEC, 0xf000_0000, u32::from(sc))?;
+    let l1pk = if reg_837 & (1 << 2) != 0 { 6 } else { 8 };
+    set_bb(io, RL1PEAKTH, 0x03c0_0000, l1pk)?;
+    set_bb(
+        io,
+        RCCK_SYSTEM,
+        BCCK_SYSTEM,
+        u32::from(sc == DATA_SC_20_UPPER),
+    )?;
+    // rtl8812ae_fixspur: 8812A-only; no register effect on 8821A.
+    super::phy::set_rf(io, RF_CHNLBW, (1 << 11) | (1 << 10), 1).await?;
+    set_rf_b(io, RF_CHNLBW, (1 << 11) | (1 << 10), 1).await
+}
+
+/// Band select, channel switch at the wide channel with admitted TX power,
+/// then the bandwidth (`rtl_op_config`: `switch_channel`, `set_bw_mode`).
+/// `reg_837` is `rtlphy->reg_837` from BB configuration.
 ///
-/// Only the 2.4 GHz 20 MHz operating point is programmed here; a 40/80 MHz
-/// or 5 GHz permission (whose TXAGC is computed at its wide channel) is
-/// refused until its band switch and bandwidth programming exist.
-pub async fn configure(io: &impl Io, permission: &Permission) -> Result<(), Error> {
-    if permission.operating() != super::envelope::Operating::legacy20(permission.channel()) {
+/// Only 2.4 GHz 20/40 MHz operating points are programmed here; an 80 MHz
+/// or 5 GHz permission is refused until its band switch and bandwidth
+/// programming exist.
+pub async fn configure(io: &impl Io, permission: &Permission, reg_837: u8) -> Result<(), Error> {
+    let op = permission.operating();
+    if op.band != Band::B2g || op.width == Width::W80 {
         return Err(Error::State);
     }
+    let wide = op.wide_channel().ok_or(Error::State)?;
     switch_band_2g(io, permission.swing())?;
-    sw_chnl(io, permission.channel()).await?;
+    sw_chnl(io, wide).await?;
     set_txpower(io, permission)?;
-    set_bw20(io).await
+    match op.width {
+        Width::W20 => set_bw20(io).await,
+        width => set_bw40(io, data_sc(width), reg_837).await,
+    }
 }
 
 /// `rtl8821ae/dm.c` `txscaling_tbl` (`TXSCALE_TABLE_SIZE` 37, -12 dB to
