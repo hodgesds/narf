@@ -645,6 +645,12 @@ impl<M: ScanoutIo> Presenter<M> {
         if layout == Layout::Linear {
             return true;
         }
+        // intel_dpt_common.c::intel_dpt_configure sets the PLANE_CHICKEN
+        // no-DPT bit on display 14 only: a display-20 tiled primary needs a
+        // DPT this owner does not build.
+        if self.format == PteFormat::Xe2 {
+            return false;
+        }
         if self.format == PteFormat::Gen12 {
             if layout != Layout::X {
                 return false;
@@ -863,12 +869,13 @@ impl<M: ScanoutIo> Presenter<M> {
         // PIPEDMC fault is shared by TGL..MTL; MTL adds plane ATS and
         // PIPEDMC ATS faults in bits18/24 (old platforms use those bits for
         // other planes' flip-done and the DMC flip queue, respectively).
-        let ats = if self.format == PteFormat::XeLpg {
-            (1 << 18) | (1 << 24)
-        } else {
-            0
-        };
-        FIFO_UNDERRUN | PLANE_FAULT | (1 << 25) | ats
+        // Display 20 (gen8_de_pipe_fault_mask, DISPLAY_VER >= 20) keeps the
+        // plane ATS fault and drops both PIPEDMC faults.
+        match self.format {
+            PteFormat::Xe2 => FIFO_UNDERRUN | PLANE_FAULT | (1 << 18),
+            PteFormat::XeLpg => FIFO_UNDERRUN | PLANE_FAULT | (1 << 25) | (1 << 18) | (1 << 24),
+            PteFormat::Gen12 => FIFO_UNDERRUN | PLANE_FAULT | (1 << 25),
+        }
     }
 
     /// Arm only PLANE_SURF; leave timing, geometry, format and watermarks as

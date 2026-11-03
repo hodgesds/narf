@@ -447,6 +447,14 @@ impl MmioWindow for Physical {
         if self.reset_lost() && !self.recovering {
             u32::MAX
         } else {
+            // xe_mmio.c::mmio_flush_pending_writes, Wa_15015404425
+            // (xe_device_wa_oob.rules: PLATFORM(LUNARLAKE)): four dummy
+            // writes precede every read, display reads included.
+            if self.generation == Generation::LunarLake {
+                for _ in 0..4 {
+                    self.window.write32(0x130030, 0);
+                }
+            }
             self.window.read32(offset)
         }
     }
@@ -466,8 +474,15 @@ unsafe impl DisplayAccess for Physical {
     }
 
     fn access_ok(&self) -> bool {
+        // The GEM scanout PAT index (`display_pte`) must be the GT owner's
+        // programmed entry: MTL PAT1 = XELPG_PAT_1_WT, Xe2 PAT3 =
+        // XE2_PAT(0, 0, 0, 3, 3, 0).
         self.console_access_ok()
-            && (self.generation != Generation::MeteorLake || self.read32(0x4804) == 4)
+            && match self.generation {
+                Generation::MeteorLake => self.read32(0x4804) == 4,
+                Generation::LunarLake => self.read32(0x480c) == 0x3c,
+                _ => true,
+            }
     }
 }
 impl Physical {
@@ -939,10 +954,11 @@ fn fetchers_with_cursor(
     // MIT Linux intel_cursor_regs.h, intel_fbc.c and intel_display_device.c:
     // neither cursor DMA nor FBC compression tracking belongs to this owner.
     // Refuse them rather than treating a primary latch as their retirement.
-    let fbc_count = if generation == Generation::MeteorLake {
-        2
-    } else {
-        1
+    let fbc_count = match generation {
+        Generation::MeteorLake => 2,
+        // xe2_lpd_display.fbc_mask: FBC A–D.
+        Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd.fbc_instances(),
+        _ => 1,
     };
     for fbc in 0..fbc_count {
         let ctl = mmio.read32(0x43208 + fbc * 0x40);
@@ -954,9 +970,10 @@ fn fetchers_with_cursor(
         }
     }
     // All admitted ADL-S/P/N source families have four sprites; TGL has
-    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION.
+    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION. Display 13+
+    // (MTL's 14, LNL's 20) has four.
     let count = match generation {
-        Generation::MeteorLake | Generation::AlderLake => 5,
+        Generation::MeteorLake | Generation::AlderLake | Generation::LunarLake => 5,
         _ => 7,
     };
     // Display 14: a Pipe B–D primary the MTL external route lit through the
@@ -1155,7 +1172,7 @@ pub(crate) fn install(
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     console: ActiveScanout,
 ) {
-    if matches!(generation, Generation::LunarLake | Generation::PantherLake) {
+    if generation == Generation::PantherLake {
         return;
     }
     let platform = Physical {
@@ -1169,6 +1186,15 @@ pub(crate) fn install(
         recovering: false,
         fbc_carve: Arc::new(crate::intel_gpu_stolen::CarveSlot::new()),
     };
+    // Lunar Lake is owned only as display 20.00 (§17 10.5): linear primary
+    // flips on the console's Pipe A. Cursor, color, DSB, tiled/XR30, FBC
+    // and PSR stay unadvertised and refused on display 20.
+    if generation == Generation::LunarLake
+        && crate::intel_gpu_xe2lpd::DisplayIp::read(&platform)
+            != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd)
+    {
+        return;
+    }
     let display = Arc::new(Device::new(platform, generation, bar.len, console.clone()));
     let mut displays = DISPLAYS.lock();
     if displays
@@ -1572,11 +1598,8 @@ impl<M: Platform> Device<M> {
             }
         }
         let format = io.format();
-        let pat = if self.generation == Generation::MeteorLake {
-            1
-        } else {
-            0
-        };
+        let pat =
+            crate::intel_gpu_scanout_io::display_pte(self.generation).map_or(0, |(_, pat)| pat);
         // SAFETY: all old current/pending owners remain in state.presenter;
         // retained console pages are outside their arena. No pre-reset
         // completion is consumed by this independent fresh transaction.
@@ -2322,11 +2345,8 @@ impl<M: Platform> Guard<'_, M> {
             io.qualify_xr30().map_err(|_| FsError::NoDevice)?;
         }
         let format = io.format();
-        let pat = if self.device.generation == Generation::MeteorLake {
-            1
-        } else {
-            0
-        };
+        let pat = crate::intel_gpu_scanout_io::display_pte(self.device.generation)
+            .map_or(0, |(_, pat)| pat);
         // SAFETY: startup owns the empty display-only arena and the original
         // console allocation remains retained by the registered IntelGpu.
         let mut presenter = unsafe {

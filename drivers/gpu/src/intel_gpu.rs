@@ -1075,6 +1075,89 @@ fn log_probe(msg: &str, device: &BusDevice) {
     );
 }
 
+/// Lunar Lake display 20 console handoff (§17 10.5), the MTL probe pattern:
+/// allocate an owned console in the Pipe-A console window and point the
+/// route's lit primary at it. Its GGTT entries use the PAT index of the
+/// firmware's own lit surface, which must be 0
+/// (`intel_gpu_xe2lpd::console_pat`). A refusal before the allocation keeps
+/// the firmware surface and installs no KMS owner; a plane-build failure
+/// after it retains the allocation, as the MTL path does.
+fn lnl_console_handoff(dev: &mut IntelGpu, mode: &crate::intel_gpu_modeset::Mode) -> bool {
+    use crate::intel_gpu_aux::MmioWindow as _;
+    use crate::intel_gpu_pipes::{
+        Pipe, PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
+        PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+    };
+    let plane_base = Pipe::A.base() + PLANE_PRIMARY_OFFSET;
+    let pat = {
+        let window = dev.mode_window();
+        let io = crate::intel_gpu_xe2lpd::Flushed(&window);
+        let surf = io.read32(plane_base + PLANE_SURF_OFFSET);
+        if surf == u32::MAX {
+            return false;
+        }
+        let pte = crate::intel_gpu_gtt::GGTT_ARRAY_BASE + u64::from(surf >> 12) * 8;
+        let (low, high) = (io.read32(pte), io.read32(pte + 4));
+        crate::intel_gpu_xe2lpd::console_pat(crate::intel_gpu_xe2lpd::firmware_pte_pat(low, high))
+    };
+    let Some(pat) = pat else {
+        return false;
+    };
+    let width = u32::from(mode.h_active);
+    let height = u32::from(mode.v_active);
+    let stride_bytes = padded_stride_bytes(width);
+    let size_bytes = scanout_size_bytes(width, height);
+    let Ok(alloc) = crate::intel_gpu_gtt::alloc_contiguous_scanout_with_format(
+        &dev.gtt_mmadr,
+        crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A,
+        size_bytes,
+        crate::intel_gpu_gtt::PteFormat::Xe2,
+        pat,
+    ) else {
+        return false;
+    };
+    let phys_base = alloc.phys_base();
+    dev.scanout = Some(ScanoutAllocation {
+        gtt_offset: alloc.gtt_offset,
+        phys_base,
+        order: alloc.order,
+        size_bytes: alloc.size_bytes,
+    });
+    let Ok(prog) = crate::intel_gpu_pipes::build_primary_plane(
+        width as u16,
+        height as u16,
+        stride_bytes,
+        alloc.gtt_offset,
+        crate::intel_gpu_pipes::PixelFormat::Argb8888,
+    ) else {
+        return false;
+    };
+    // SAFETY: `dev.gtt_mmadr` is the BAR0 region mapped in `bring_up` and
+    // this probe owns the function; each offset is a Pipe A primary-plane
+    // register, written in the MTL probe's order with SURF last.
+    unsafe {
+        dev.gtt_mmadr
+            .write32(plane_base + PLANE_STRIDE_OFFSET, prog.plane_stride);
+        dev.gtt_mmadr
+            .write32(plane_base + PLANE_SIZE_OFFSET, prog.plane_size);
+        dev.gtt_mmadr
+            .write32(plane_base + PLANE_OFFSET_OFFSET, prog.plane_offset);
+        dev.gtt_mmadr
+            .write32(plane_base + PLANE_CTL_OFFSET, prog.plane_ctl);
+        dev.gtt_mmadr
+            .write32(plane_base + PLANE_SURF_OFFSET, prog.plane_surf);
+    }
+    compiler_fence(Ordering::SeqCst);
+    *dev.active_scanout.lock() = Some(ActiveScanout {
+        width,
+        height,
+        stride_bytes,
+        gtt_offset: alloc.gtt_offset,
+        phys_base,
+    });
+    true
+}
+
 static LNL_BOOT_SCANOUT_EXCLUSION: narf_lib::sync::IrqSafeSpinLock<Option<fn() -> bool>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -1338,11 +1421,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     } else if lnl_display {
         // Lunar Lake display 20 (Xe2_LPD), admitted per device: sequence
         // the eDP panel, then run the display-20 owned modeset on the
-        // firmware's Pipe-A surface. The scanout stays on that surface
-        // (the boot framebuffer console keeps drawing it): without a GT
-        // owner on this function no Xe2 GGTT/PAT policy for a new console
-        // allocation exists, so no KMS owner, GT runtime or PM owner is
-        // installed below (`current_mode` stays empty).
+        // firmware's Pipe-A surface. The console then moves to an owned
+        // surface mapped at the firmware surface's own PAT index (the MTL
+        // pattern; `lnl_console_handoff`), which installs the display-20
+        // KMS owner below. A refused handoff leaves the firmware surface
+        // and no KMS owner. No PM owner is installed: the GT owner, with
+        // the display-preserving profile, is D0-only.
         let window = crate::intel_gpu_edp::BarWindow(&dev.gtt_mmadr);
         let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&window);
         pps.init_registers();
@@ -1358,7 +1442,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 None
             }
         };
-        if mode.is_some() {
+        if let Some(mode) = mode.as_ref() {
             let _ = pps.backlight_on();
             let _ = crate::intel_gpu_multipipe::claim_pipe(
                 crate::intel_gpu_pipes::Pipe::A,
@@ -1369,6 +1453,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             );
             log_probe(
                 "display 20 (Xe2_LPD) owned eDP modeset complete on Pipe A",
+                &device,
+            );
+            log_probe(
+                if lnl_console_handoff(&mut dev, mode) {
+                    "display 20 console moved to an owned Pipe-A surface"
+                } else {
+                    "display 20 console handoff refused; firmware surface retained"
+                },
                 &device,
             );
         } else {

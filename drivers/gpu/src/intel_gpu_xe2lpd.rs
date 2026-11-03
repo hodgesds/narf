@@ -375,6 +375,51 @@ pub(crate) fn probe_route(
     route.is_ok()
 }
 
+/// `DUMMY_REG_OFFSET` of xe_mmio.c::mmio_flush_pending_writes.
+pub(crate) const MMIO_FLUSH_DUMMY: u64 = 0x130030;
+
+/// A display-20 view with Wa_15015404425 (xe_device_wa_oob.rules:
+/// `PLATFORM(LUNARLAKE)`): xe_mmio.c::mmio_flush_pending_writes issues four
+/// dummy writes before every MMIO read, display reads included.
+pub(crate) struct Flushed<'a, M: MmioWindow + ?Sized>(pub(crate) &'a M);
+
+impl<M: MmioWindow + ?Sized> MmioWindow for Flushed<'_, M> {
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+    fn read32(&self, off: u64) -> u32 {
+        for _ in 0..4 {
+            self.0.write32(MMIO_FLUSH_DUMMY, 0);
+        }
+        self.0.read32(off)
+    }
+    fn write32(&self, off: u64, val: u32) {
+        self.0.write32(off, val)
+    }
+}
+
+/// The GGTT PAT index of a present firmware scanout PTE (xe_ggtt.c
+/// `xelpg_ggtt_pte_flags`, used on Xe2: `XELPG_GGTT_PTE_PAT0` bit 52,
+/// `XELPG_GGTT_PTE_PAT1` bit 53). `None` for an absent or unreadable entry.
+pub(crate) const fn firmware_pte_pat(low: u32, high: u32) -> Option<u8> {
+    if low == u32::MAX || high == u32::MAX || low & 1 == 0 {
+        return None;
+    }
+    Some(((high >> 20) & 3) as u8)
+}
+
+/// The PAT index the display-20 console is mapped with: the firmware's own
+/// lit surface's, which must be 0. NARF's GT owner never redefines Xe2 PAT0
+/// (it programs PAT1–5 and PAT7), so the console keeps exactly the
+/// firmware's scanout cache policy; GEM flips use PAT3 only after the GT
+/// owner programmed it.
+pub(crate) const fn console_pat(firmware: Option<u8>) -> Option<u8> {
+    match firmware {
+        Some(0) => Some(0),
+        _ => None,
+    }
+}
+
 /// Whether the display route still holds Pipe A for its eDP panel (the claim
 /// probe records after a successful [`takeover`]). The display-preserving GT
 /// profile is admitted only beside that owner.

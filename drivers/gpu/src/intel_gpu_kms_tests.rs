@@ -1945,3 +1945,5 @@ mod multipipe;
 #[cfg(target_arch = "x86_64")]
 #[path = "intel_gpu_psr_kms_tests.rs"]
 mod psr;
+#[path = "intel_gpu_xe2lpd_kms_tests.rs"]
+mod xe2lpd;
