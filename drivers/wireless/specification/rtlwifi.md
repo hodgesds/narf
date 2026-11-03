@@ -1524,7 +1524,28 @@ chain below is composed.
   gets the highest measured index not above the Linux index whose output
   plus antenna gain fits min(host regulatory rule, qualification, `regd.c`
   ch1-11 EIRP) — the shared `channel_power::domain_ceiling` policy. Unsigned,
-  foreign, unprovisioned or unmeasured ⇒ not admitted. `channel` programs
+  foreign, unprovisioned or unmeasured ⇒ not admitted.
+  `NAPC` v2 (`rtl8821ae-cal-v2-<mac>.bin`, loaded first; v1 only on
+  `NotFound`; v1 parsing unchanged) keeps the v1 header with version 2,
+  header bandwidth 0 and up to `V2_ROWS` (98) rows of the same size, each
+  keyed by (band 0/1, bandwidth 20/40/80, secondary offset 0/1 above/2
+  below, primary channel) in strictly increasing order: 2.4 GHz ch1-11 at
+  20 MHz or 40 MHz (above 1-7, below 5-11); 5 GHz the 8821AE plan
+  (`CHANNELS_5G`, 36-165) at 20 MHz, 40 MHz with the fixed pairing, 80 MHz
+  inside a block (165 has neither); 5 GHz rows must leave the CCK curve
+  unmeasured. `envelope::Operating` gives the center frequency;
+  `permission_for(domain, op)` applies `span_ceiling` (every overlapping
+  host rule covers the whole span, allows the width and has no flag, so
+  DFS/NO_IR/indoor rules refuse; capped by `regd.c` 2402-2472 MHz 20 dBm,
+  5140-5360 / 5460-5860 MHz 30 dBm). A rate whose curve has no fitting
+  measured index is left unadmitted (TXAGC 0, outside `admitted_rates`)
+  instead of failing the whole permission; every legacy rate of the band
+  must be admitted. The Linux index exists only for 2.4 GHz 20 MHz so far,
+  so 40/80 MHz and 5 GHz rows parse but mint no permission
+  (`FactoryPower`) until their `_rtl8821ae_get_txpower_index` arithmetic
+  is composed. No board values are supplied by the format. Test
+  `smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission`
+  (written, unexecuted). `channel` programs
   `rtl8821ae_phy_switch_wirelessband(2.4G)` with `phy_get_tx_swing_8812A`
   (EFUSE `0xC6`, path-B decode wins as in Linux; RA/RB_TXSCALE), then
   `sw_chnl_callback` (RFC_AREA `0x96a`, RF `0x18`), the admitted per-rate

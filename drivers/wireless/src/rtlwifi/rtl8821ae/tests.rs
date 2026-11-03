@@ -1022,6 +1022,150 @@ kernel_test_in!(
     smoke_rtl8821ae_ra_mask_rates_within_napc_admission
 );
 
+/// `NAPC` v2 fixture: rows are (channel, band, bandwidth, offset); curves
+/// as [`napc`], with the CCK curve unmeasured on 5 GHz rows and the 1SS
+/// curve unmeasured when `ht_unmeasured`.
+pub(crate) fn napc_v2(
+    factory: &crate::rtlwifi::efuse::Factory,
+    rows: &[(u8, u8, u8, u8)],
+    output: i16,
+    ht_unmeasured: bool,
+) -> Vec<u8> {
+    let row = 4 + 3 * 64 * 2;
+    let mut b = napc(factory, &[], output);
+    b[4..6].copy_from_slice(&2u16.to_le_bytes());
+    b[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    b[62..64].copy_from_slice(&0u16.to_le_bytes());
+    for (ch, band, bw, offset) in rows {
+        let at = b.len();
+        b.resize(at + row, 0);
+        b[at..at + 4].copy_from_slice(&[*ch, *band, *bw, *offset]);
+        for i in 0..192 {
+            let unmeasured = (i < 64 && *band == 1) || (i >= 128 && ht_unmeasured);
+            let v = if unmeasured {
+                i16::MAX
+            } else {
+                output + (i % 64) as i16
+            };
+            b[at + 4 + i * 2..at + 6 + i * 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    let total = b.len() as u32;
+    b[8..12].copy_from_slice(&total.to_le_bytes());
+    b
+}
+
+fn smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission() -> TestResult {
+    use envelope::{Band, Operating, Width};
+    let factory = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x02],
+        logical: powered_logical(0xf2, 2),
+    };
+    let sign = Some([1; 32]);
+    let good = [
+        (6, 0, 20, 0),
+        (3, 0, 40, 1),
+        (9, 0, 40, 2),
+        (36, 1, 20, 0),
+        (40, 1, 40, 2),
+        (149, 1, 80, 0),
+    ];
+    let Ok(cal) =
+        envelope::Calibration::from_verified(&napc_v2(&factory, &good, 30, false), sign, &factory)
+    else {
+        return TestResult::Fail("valid v2 envelope rejected");
+    };
+    let op = |band, width, channel| Operating {
+        band,
+        width,
+        channel,
+    };
+    if !cal.measures(op(Band::B5g, Width::W80, 149))
+        || !cal.measures(op(Band::B2g, Width::W40Below, 9))
+        || cal.measures(op(Band::B5g, Width::W80, 36))
+        || cal.measures(op(Band::B2g, Width::W40Above, 9))
+    {
+        return TestResult::Fail("v2 rows not keyed by band/width/offset/channel");
+    }
+    // Center frequencies: 36/80 -> ch42, 144/80 -> ch138, 161/40 below -> 159.
+    if op(Band::B5g, Width::W80, 36).center_mhz() != Some(5210)
+        || op(Band::B5g, Width::W80, 144).center_mhz() != Some(5690)
+        || op(Band::B5g, Width::W40Below, 161).center_mhz() != Some(5795)
+        || op(Band::B5g, Width::W80, 165).center_mhz().is_some()
+        || op(Band::B5g, Width::W40Above, 40).center_mhz().is_some()
+        || op(Band::B2g, Width::W40Above, 8).center_mhz().is_some()
+    {
+        return TestResult::Fail("operating-point plan wrong");
+    }
+    let domain = crate::rtlwifi::channel_power::tests::domain(20);
+    let Ok(p) = cal.permission(&domain, 6) else {
+        return TestResult::Fail("v2 2.4 GHz 20 MHz row refused");
+    };
+    if p.operating() != Operating::legacy20(6) || p.index(0) == 0 {
+        return TestResult::Fail("v2 legacy20 permission wrong");
+    }
+    // 5 GHz is outside the host domain; 2.4 GHz 40 MHz has no Linux index yet.
+    if cal
+        .permission_for(&domain, op(Band::B5g, Width::W80, 149))
+        .is_ok()
+        || cal
+            .permission_for(&domain, op(Band::B2g, Width::W40Above, 3))
+            .is_ok()
+    {
+        return TestResult::Fail("unadmitted operating point minted a permission");
+    }
+    for bad in [
+        &[(36, 1, 20, 0), (6, 0, 20, 0)][..], // unordered
+        &[(6, 0, 80, 0)],                     // 2.4 GHz 80 MHz
+        &[(40, 1, 40, 1)],                    // wrong 5 GHz pairing
+        &[(165, 1, 80, 0)],                   // no 80 MHz block
+        &[(12, 0, 20, 0)],                    // outside ch1-11
+        &[(6, 0, 20, 0), (6, 0, 20, 0)],      // duplicate
+    ] {
+        if envelope::Calibration::from_verified(&napc_v2(&factory, bad, 30, false), sign, &factory)
+            .is_ok()
+        {
+            return TestResult::Fail("malformed v2 row accepted");
+        }
+    }
+    let mut cck5 = napc_v2(&factory, &[(36, 1, 20, 0)], 30, false);
+    cck5[96 + 4..96 + 6].copy_from_slice(&10i16.to_le_bytes());
+    let mut header_bw = napc_v2(&factory, &[(6, 0, 20, 0)], 30, false);
+    header_bw[62] = 20;
+    if envelope::Calibration::from_verified(&cck5, sign, &factory).is_ok()
+        || envelope::Calibration::from_verified(&header_bw, sign, &factory).is_ok()
+    {
+        return TestResult::Fail("5 GHz CCK measurement or v2 header bandwidth accepted");
+    }
+    // Unmeasured 1SS curve: legacy admitted, HT/VHT stay out of the set, so
+    // an HT RA mask is refused by the install check (mask must be a subset).
+    let Ok(partial) = envelope::Calibration::from_verified(
+        &napc_v2(&factory, &[(6, 0, 20, 0)], 30, true),
+        sign,
+        &factory,
+    ) else {
+        return TestResult::Fail("partial v2 envelope rejected");
+    };
+    let Ok(p) = partial.permission(&domain, 6) else {
+        return TestResult::Fail("legacy rates of a partial envelope refused");
+    };
+    let n = h2c::Peer {
+        legacy: 0xfff,
+        ht: Some([0xff, 0]),
+        sgi20: false,
+        sgi40: false,
+    };
+    let mask = h2c::mask_rates(&h2c::rate_mask(&n, false, 0, true)).unwrap_or(0);
+    if p.admitted_rates() != 0xfff || p.admits(12) || mask & !p.admitted_rates() == 0 {
+        return TestResult::Fail("unmeasured 1SS rates admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_napc_v2_rows_bands_widths_and_partial_admission
+);
+
 fn smoke_rtl8821ae_band_channel_bw20_txagc_order() -> TestResult {
     let factory = crate::rtlwifi::efuse::Factory {
         mac: [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x03],
