@@ -541,6 +541,16 @@ fn spawn_supervisor_task() {
                     }
                     AttachOutcome::UnknownClass => {
                         root_fail_count[pi] = root_fail_count[pi].saturating_add(1);
+                        if root_fail_count[pi] == MAX_PER_PORT_RETRIES {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  usb-supervisor: root port {} gave up after {} attempts (portsc={:?})",
+                                p,
+                                MAX_PER_PORT_RETRIES,
+                                c.portsc(p)
+                            );
+                        }
                     }
                 }
                 next_root_idx = idx + 1;

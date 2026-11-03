@@ -7113,15 +7113,12 @@ fn smoke_usb_hub_multi_tt_child_topology() -> TestResult {
     if topology.parent_hub_slot_id != 7 || topology.parent_hub_port != 1 {
         return TestResult::Fail("parent TT slot/port missing");
     }
-    if topology.tt_think_time != 3 {
-        return TestResult::Fail("hub TT think time not propagated");
+    if !topology.mtt {
+        return TestResult::Fail("multi-TT hub's full-speed child is missing MTT");
     }
 
     let high_speed = hub.child_topology(0, 0, 2, PortSpeed::High);
-    if high_speed.parent_hub_slot_id != 0
-        || high_speed.parent_hub_port != 0
-        || high_speed.tt_think_time != 0
-    {
+    if high_speed.parent_hub_slot_id != 0 || high_speed.parent_hub_port != 0 || high_speed.mtt {
         return TestResult::Fail("high-speed child incorrectly received TT metadata");
     }
 
@@ -7135,7 +7132,7 @@ fn smoke_usb_hub_multi_tt_child_topology() -> TestResult {
     let no_translator = full_speed_hub.child_topology(0, 0, 1, PortSpeed::Low);
     if no_translator.parent_hub_slot_id != 0
         || no_translator.parent_hub_port != 0
-        || no_translator.tt_think_time != 0
+        || no_translator.mtt
     {
         return TestResult::Fail("full-speed hub incorrectly supplied TT metadata");
     }

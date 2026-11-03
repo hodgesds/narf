@@ -444,24 +444,62 @@ pub(crate) async fn release_slot(
     xhci_dev.reclaim_slot(slot_id)
 }
 
+/// Bring-up visibility for enumeration failures, which otherwise collapse
+/// into a silent `UnknownClass`: one line per (root port, route, step),
+/// at most [`ATTACH_LOG_LIMIT`] per boot.
+const ATTACH_LOG_LIMIT: usize = 64;
+static ATTACH_LOGGED: IrqSafeSpinLock<alloc::collections::BTreeSet<(u8, u32, &'static str)>> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeSet::new());
+
+pub(crate) fn note_attach_failure(
+    root_port: u8,
+    route: u32,
+    step: &'static str,
+    detail: &dyn core::fmt::Debug,
+) {
+    {
+        let mut logged = ATTACH_LOGGED.lock();
+        if logged.len() >= ATTACH_LOG_LIMIT || !logged.insert((root_port, route, step)) {
+            return;
+        }
+    }
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  usb-attach: root_port={} route=0x{:05x} failed at {}: {:?}",
+        root_port,
+        route,
+        step,
+        detail
+    );
+}
+
 /// Drive enumeration for a device on root-hub `port`. Returns the
 /// outcome so the supervisor can update its claimed-bitmask state.
 /// Slot is freed on failure (UnknownClass / class-driver error).
 pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
     // port_reset → enable_slot → address_device (root-hub topology).
     // Each step runs against the controller's PORTSC register set.
-    if xhci_dev.port_reset(port).await.is_err() {
+    if let Err(e) = xhci_dev.port_reset(port).await {
+        note_attach_failure(port, 0, "port_reset", &(e, xhci_dev.portsc(port)));
         return AttachOutcome::UnknownClass;
     }
     let speed = match xhci_dev.port_speed(port) {
         Some(s) => s,
-        None => return AttachOutcome::UnknownClass,
+        None => {
+            note_attach_failure(port, 0, "port_speed", &xhci_dev.portsc(port));
+            return AttachOutcome::UnknownClass;
+        }
     };
     let slot_id = match xhci_dev.enable_slot().await {
         Ok(s) => s,
-        Err(_) => return AttachOutcome::UnknownClass,
+        Err(e) => {
+            note_attach_failure(port, 0, "enable_slot", &e);
+            return AttachOutcome::UnknownClass;
+        }
     };
-    if xhci_dev.address_device(slot_id, port, speed).await.is_err() {
+    if let Err(e) = xhci_dev.address_device(slot_id, port, speed).await {
+        note_attach_failure(port, 0, "address_device", &(e, speed, slot_id));
         let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
@@ -484,16 +522,25 @@ pub async fn try_attach_via_hub(
     parent_root_port: u8,
     hub_port: u8,
 ) -> AttachOutcome {
-    if parent.port_reset(xhci_dev, hub_port).await.is_err() {
+    let child_route =
+        xhci::Topology::for_downstream(parent_route, parent_tier, hub_port).route_string;
+    if let Err(e) = parent.port_reset(xhci_dev, hub_port).await {
+        note_attach_failure(parent_root_port, child_route, "hub_port_reset", &e);
         return AttachOutcome::UnknownClass;
     }
     let speed = match parent.port_speed(xhci_dev, hub_port).await {
         Ok(s) => s,
-        Err(_) => return AttachOutcome::UnknownClass,
+        Err(e) => {
+            note_attach_failure(parent_root_port, child_route, "hub_port_speed", &e);
+            return AttachOutcome::UnknownClass;
+        }
     };
     let slot_id = match xhci_dev.enable_slot().await {
         Ok(s) => s,
-        Err(_) => return AttachOutcome::UnknownClass,
+        Err(e) => {
+            note_attach_failure(parent_root_port, child_route, "enable_slot", &e);
+            return AttachOutcome::UnknownClass;
+        }
     };
     let topology = parent.child_topology(parent_route, parent_tier, hub_port, speed);
     // For an LS/FS device attached to a high-speed hub, the
@@ -503,11 +550,16 @@ pub async fn try_attach_via_hub(
     // devices leave these fields zero. UsbHub retains its negotiated
     // upstream speed, so child_topology only supplies TT metadata
     // when the parent is High and the child is Low/Full.
-    if xhci_dev
+    if let Err(e) = xhci_dev
         .address_device_with(slot_id, parent_root_port, speed, topology)
         .await
-        .is_err()
     {
+        note_attach_failure(
+            parent_root_port,
+            child_route,
+            "address_device",
+            &(e, speed, slot_id, topology),
+        );
         let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
@@ -688,9 +740,21 @@ async fn dispatch_after_address(
             Ok(d) => {
                 let vid = u16::from_le_bytes([d[8], d[9]]);
                 let pid = u16::from_le_bytes([d[10], d[11]]);
+                note_attach_failure(
+                    root_port,
+                    this_route,
+                    "addressed (not a failure)",
+                    &(slot_id, speed, vid, pid, d[4], d[7]),
+                );
                 (d[4], d[6], vid, pid)
             }
-            Err(_) => {
+            Err(e) => {
+                note_attach_failure(
+                    root_port,
+                    this_route,
+                    "device_descriptor",
+                    &(e, slot_id, speed),
+                );
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -703,6 +767,7 @@ async fn dispatch_after_address(
         let mut head = [0u8; 9];
         let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await;
         if n.is_err() || head.iter().take(2).all(|b| *b == 0) {
+            note_attach_failure(root_port, this_route, "hub_config_head", &(n, head));
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
@@ -715,7 +780,8 @@ async fn dispatch_after_address(
         let mut full = alloc::vec![0u8; total];
         let n2 = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await {
             Ok(n) => n,
-            Err(_) => {
+            Err(e) => {
+                note_attach_failure(root_port, this_route, "hub_config", &e);
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -726,6 +792,7 @@ async fn dispatch_after_address(
         let iface = match hub::find_hub_interface(&full) {
             Some(i) => i,
             None => {
+                note_attach_failure(root_port, this_route, "hub_interface", &full.len());
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -733,7 +800,7 @@ async fn dispatch_after_address(
         // SET_CONFIGURATION before any class request (USB 2.0
         // §9.4.7) — without it, `UsbHub::attach`'s
         // GET_DESCRIPTOR(Hub) would STALL.
-        if xhci_dev
+        if let Err(e) = xhci_dev
             .control_out(
                 slot_id,
                 0x00,
@@ -743,15 +810,16 @@ async fn dispatch_after_address(
                 &[],
             )
             .await
-            .is_err()
         {
+            note_attach_failure(root_port, this_route, "hub_set_configuration", &e);
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         let bound = match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed, &full).await
         {
             Ok(b) => b,
-            Err(_) => {
+            Err(e) => {
+                note_attach_failure(root_port, this_route, "hub_attach", &e);
                 let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
@@ -760,11 +828,16 @@ async fn dispatch_after_address(
         // controller sizes its TT-routing state for downstream
         // enumeration (xHCI 1.2 §6.2.2 dword0[26], dword1[31:24]).
         // Do not publish children against an unconfigured hub/TT context.
-        if xhci_dev
-            .mark_as_hub(slot_id, bound.descriptor.num_ports, bound.is_multi_tt())
+        if let Err(e) = xhci_dev
+            .mark_as_hub(
+                slot_id,
+                bound.descriptor.num_ports,
+                bound.is_multi_tt(),
+                bound.descriptor.tt_think_time(),
+            )
             .await
-            .is_err()
         {
+            note_attach_failure(root_port, this_route, "mark_as_hub", &e);
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }

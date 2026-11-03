@@ -290,10 +290,12 @@ pub struct Topology {
     /// Port number on the parent hub for an LS/FS device behind it
     /// (§6.2.2 dword2[15:8]). 0 if not applicable.
     pub parent_hub_port: u8,
-    /// TT Think Time (§6.2.2 dword2[17:16]) — 0/1/2/3 = 8/16/24/32
-    /// FS bit-times. Only meaningful for an LS/FS device behind a
-    /// high-speed hub.
-    pub tt_think_time: u8,
+    /// MTT (§6.2.2 dword0[25]) for an LS/FS device behind a high-speed
+    /// hub running multiple transaction translators (Linux
+    /// `xhci_setup_addressable_virt_dev`: `udev->tt->multi`). TT Think
+    /// Time belongs to the hub's own slot ([`Xhci::mark_as_hub`]), never
+    /// to the child's.
+    pub mtt: bool,
 }
 
 impl Topology {
@@ -302,7 +304,7 @@ impl Topology {
         route_string: 0,
         parent_hub_slot_id: 0,
         parent_hub_port: 0,
-        tt_think_time: 0,
+        mtt: false,
     };
 
     /// Compute the topology for a device reached via `parent_hub`
@@ -328,7 +330,7 @@ impl Topology {
             route_string: route & 0x000F_FFFF,
             parent_hub_slot_id: 0,
             parent_hub_port: 0,
-            tt_think_time: 0,
+            mtt: false,
         }
     }
 }
@@ -3108,11 +3110,11 @@ impl Xhci {
         //                 chain (§4.5.2). 0 for a root-hub device.
         //   dword0[23:20] Speed (Table 6-7: 1=FS, 2=LS, 3=HS,
         //                 4=SS, 5=SSP).
-        //   dword0[25]    MTT (multi-TT) — 0 unless this device
-        //                 itself is a multi-TT hub.
+        //   dword0[25]    MTT — set for an LS/FS device behind a
+        //                 multi-TT high-speed hub (`Topology::mtt`).
         //   dword0[26]    Hub — 1 if this device is a USB hub. Set
-        //                 separately via Evaluate Context after the
-        //                 hub descriptor is read.
+        //                 separately via Configure Endpoint after the
+        //                 hub descriptor is read (`mark_as_hub`).
         //   dword0[31:27] Context Entries — DCI of the highest
         //                 valid endpoint (1 here = EP0 only).
         //   dword1[15:0]  Max Exit Latency (0).
@@ -3124,16 +3126,15 @@ impl Xhci {
         //                 high-speed hub for an LS/FS device behind
         //                 it; 0 otherwise.
         //   dword2[15:8]  TT Port Number on the parent hub.
-        //   dword2[17:16] TT Think Time (0..3 = 8/16/24/32 FS bit
-        //                 times) — only meaningful if the parent is
-        //                 a high-speed hub.
+        //   dword2[17:16] TT Think Time — 0 here; it describes a
+        //                 high-speed hub's own TT (`mark_as_hub`).
         let slot_d0 = (1u32 << 27)              // Context Entries = 1
                     | ((speed as u32) << 20)    // Speed
+                    | (if topology.mtt { slot::SLOT_CTX_MTT_BIT } else { 0 })
                     | (topology.route_string & 0x000F_FFFF); // Route String
         let slot_d1 = (port as u32) << 16; // Root Hub Port Number
-        let slot_d2 = (topology.parent_hub_slot_id as u32)
-            | ((topology.parent_hub_port as u32) << 8)
-            | ((topology.tt_think_time as u32 & 0x3) << 16);
+        let slot_d2 =
+            (topology.parent_hub_slot_id as u32) | ((topology.parent_hub_port as u32) << 8);
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
@@ -3319,13 +3320,25 @@ impl Xhci {
         input: DmaBuffer,
         claim: &mut EndpointConfiguration<'_>,
     ) -> Result<(), XhciError> {
+        self.submit_input_context(input, claim, TRB_TYPE_EVAL_CONTEXT_CMD)
+            .await
+    }
+
+    /// Submit an Input Context command (`trb_type`: Evaluate Context or
+    /// Configure Endpoint) for the claimed slot and await its completion.
+    async fn submit_input_context(
+        &self,
+        input: DmaBuffer,
+        claim: &mut EndpointConfiguration<'_>,
+        trb_type: u32,
+    ) -> Result<(), XhciError> {
         let input_phys = input.dma_addr().raw();
         input.sync(0, input.len());
         device_dma_barrier();
         let mut retained = bulk_owner::CommandDma::new(input);
         retained.publish();
         claim.published = true;
-        let d3 = (TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT) | (u32::from(claim.slot) << 24);
+        let d3 = (trb_type << TRB_TYPE_SHIFT) | (u32::from(claim.slot) << 24);
         let command =
             self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, d3)?;
         let ev = self
@@ -3349,23 +3362,40 @@ impl Xhci {
         Ok(())
     }
 
+    /// `xhci_update_hub_device`: tell the controller `slot_id` is a hub —
+    /// Hub, MTT, Number of Ports and (for a high-speed hub) TT Think Time
+    /// in its slot context. Evaluate Context ignores these fields (it
+    /// evaluates only Interrupter Target and Max Exit Latency, xHCI 1.2
+    /// §4.6.7), so, as Linux does on every xHC newer than 0.96, copy the
+    /// current slot context, set the hub fields, zero the slot state and
+    /// issue Configure Endpoint with A0 alone.
     pub async fn mark_as_hub(
         &self,
         slot_id: u8,
         num_ports: u8,
         multi_tt: bool,
+        tt_think_time: u8,
     ) -> Result<(), XhciError> {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
         let mut claim = self.begin_context(slot_id)?;
-        let (speed, port, topology) = {
+        let (speed, current) = {
             let g = self.devices.lock();
             let d = g
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
-            (d.speed, d.port, d.topology)
+            d._device_ctx.sync(0, 16);
+            device_dma_barrier();
+            let mut words = [0u32; 4];
+            for (index, word) in words.iter_mut().enumerate() {
+                // SAFETY: the retained output context covers these four dwords.
+                *word = unsafe {
+                    core::ptr::read_volatile(d._device_ctx.cpu_ptr_at::<u32>((index * 4) as u64))
+                };
+            }
+            (d.speed, words)
         };
 
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
@@ -3374,46 +3404,35 @@ impl Xhci {
         unsafe {
             core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
         }
-        let cs = self.context_stride();
-        let input_ctrl = input_phys;
-        let slot_ctx = input_phys + cs;
+        let slot_ctx = input_phys + self.context_stride();
 
-        // Add Slot only (A0=1). Drop mask = 0.
-        // SAFETY: identity-mapped, in-page.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(input_ctrl + 4).kernel_mut_ptr::<u32>(),
-                1 << 0,
-            );
+        let mut slot_d0 = current[0] | slot::SLOT_CTX_HUB_BIT;
+        if multi_tt {
+            slot_d0 |= slot::SLOT_CTX_MTT_BIT;
+        } else {
+            slot_d0 &= !slot::SLOT_CTX_MTT_BIT;
         }
-
-        let slot_d0 =
-            slot::encode_slot_ctx_dword0(topology.route_string, speed as u8, multi_tt, true, 1);
-        let slot_d1 = slot::encode_slot_ctx_dword1(0, port, num_ports);
-        let slot_d2 = slot::encode_slot_ctx_dword2(
-            topology.parent_hub_slot_id,
-            topology.parent_hub_port,
-            topology.tt_think_time,
-        );
-        // SAFETY: same.
+        let slot_d1 = (current[1] & 0x00FF_FFFF) | (u32::from(num_ports) << 24);
+        let mut slot_d2 = current[2] & !(0x3 << 16);
+        if matches!(speed, PortSpeed::High) {
+            slot_d2 |= (u32::from(tt_think_time) & 0x3) << 16;
+        }
+        // Add Slot only (A0=1), drop mask 0, slot state zeroed
+        // (`slot_ctx->dev_state = 0`).
+        // SAFETY: identity-mapped DMA; all offsets are inside the page.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(slot_ctx).kernel_mut_ptr::<u32>(),
-                slot_d0,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
-                slot_d1,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(slot_ctx + 8).kernel_mut_ptr::<u32>(),
-                slot_d2,
-            );
+            core::ptr::write_volatile(input.cpu_mut_ptr_at::<u32>(4), 1 << 0);
+            for (index, value) in [slot_d0, slot_d1, slot_d2, 0].into_iter().enumerate() {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(slot_ctx + index as u64 * 4).kernel_mut_ptr::<u32>(),
+                    value,
+                );
+            }
         }
         compiler_fence(Ordering::SeqCst);
 
-        self.evaluate_input(input, &mut claim).await?;
-        Ok(())
+        self.submit_input_context(input, &mut claim, TRB_TYPE_CONFIGURE_ENDPOINT_CMD)
+            .await
     }
 
     pub async fn evaluate_context_ep0_mps(
@@ -3606,6 +3625,20 @@ impl Xhci {
             && (event_trb & !0xFu64) == trb_phys
     }
 
+    /// A control transfer that completed with a halting code (Babble 3,
+    /// USB Transaction Error 4, Stall 6) leaves EP0 Halted on the xHC and
+    /// its software claim busy, so every later request on the device
+    /// would fail `NotReady`. Linux recovers with Reset Endpoint + Set TR
+    /// Dequeue (`xhci_handle_halted_endpoint`); `reset_endpoint` does both
+    /// and releases the claim. Other failures leave EP0 running.
+    async fn recover_halted_control(&self, slot_id: u8, generation: u64, code: u8) {
+        if matches!(code, 3 | 4 | 6) {
+            let _ = self
+                .reset_endpoint(slot_id, generation, DCI_CONTROL_EP as u8)
+                .await;
+        }
+    }
+
     fn begin_control(&self, slot_id: u8, generation: u64) -> Result<(u64, u64, usize), XhciError> {
         let mut devices = self.devices.lock();
         let device = devices
@@ -3701,6 +3734,34 @@ impl Xhci {
 
     #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
     pub(crate) async fn control_in_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
+        let result = self
+            .control_in_transfer(
+                slot_id,
+                generation,
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                out,
+            )
+            .await;
+        if let Err(XhciError::CmdFailed(code)) = result {
+            self.recover_halted_control(slot_id, generation, code).await;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
+    async fn control_in_transfer(
         &self,
         slot_id: u8,
         generation: u64,
@@ -3864,6 +3925,34 @@ impl Xhci {
 
     #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
     pub(crate) async fn control_out_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, XhciError> {
+        let result = self
+            .control_out_transfer(
+                slot_id,
+                generation,
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                data,
+            )
+            .await;
+        if let Err(XhciError::CmdFailed(code)) = result {
+            self.recover_halted_control(slot_id, generation, code).await;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
+    async fn control_out_transfer(
         &self,
         slot_id: u8,
         generation: u64,
@@ -5291,6 +5380,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
+    // Every reset, recovery and timeout below is a `Deadline`/sleep in
+    // ns. This probe runs long before frame calibrates the TSC, when the
+    // scale is still the 1 cycle/ns fallback (4.7x short on a 4.7 GHz
+    // part): port resets, command waits and device recovery times all
+    // expire early, and the supervisor burns real ports out within that
+    // window. Establish the calibrated scale first, as amdgpu's
+    // `boot_clock_ready` does; it is a no-op once calibrated.
+    let _ = narf_time::calibrate_clocks();
     // The class-match backstop matches *every* device with PCI
     // base class 0x0C (Serial Bus) — that includes SMBus
     // (subclass 0x05, e.g. AMD FCH 1022:790b), CAN, GPIB, IPMI,

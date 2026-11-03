@@ -1373,3 +1373,34 @@ fn smoke_kernel_test_timebase_is_calibrated() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("time", smoke_kernel_test_timebase_is_calibrated);
+
+/// `sleep_ms` / `sleep_us` / `sleep_ns` / `sleep` target the same instant
+/// as the matching `Deadline` constructor (calibrated ns -> cycles), and
+/// `sleep_until` targets the deadline it is given.
+fn smoke_sleep_helpers_use_wall_time() -> TestResult {
+    let tolerance = crate::wall::ns_to_cycles(1_000_000).max(1_000_000);
+    let close =
+        |a: crate::Instant, b: crate::Instant| a.as_cycles().abs_diff(b.as_cycles()) <= tolerance;
+    let at = |d: crate::Deadline| d.0;
+    if !close(
+        crate::sleep_ms(20).deadline,
+        at(crate::Deadline::after_ms(20)),
+    ) || !close(
+        crate::sleep_us(20_000).deadline,
+        at(crate::Deadline::after_ms(20)),
+    ) || !close(
+        crate::sleep_ns(20_000_000).deadline,
+        at(crate::Deadline::after_ms(20)),
+    ) || !close(
+        crate::sleep(core::time::Duration::from_millis(20)).deadline,
+        at(crate::Deadline::after_ms(20)),
+    ) {
+        return TestResult::Fail("sleep helper deadline differs from Deadline::after_ms");
+    }
+    let target = crate::Deadline::after_ms(5);
+    if crate::sleep_until(target).deadline != target.0 {
+        return TestResult::Fail("sleep_until does not target its deadline");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_sleep_helpers_use_wall_time);
