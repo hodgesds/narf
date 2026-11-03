@@ -1457,12 +1457,61 @@ Three written/unexecuted cases in `drivers/wireless/brcmfmac/p2p`
 `smoke_brcmf_p2p_device_discovery_listen_and_action_frames` and
 `smoke_brcmf_p2p_connection_bsscfg_ifadd_and_ifdel`.
 
+#### P2P_DEVICE control WDEV (`cyw43439/interface_p2p.rs`)
+
+The primary routes only `NEW_INTERFACE` iftype 10 to the control-only
+async path (`async_control_iftypes` = `1 << 10`; STA/AP/P2P_CLIENT/P2P_GO
+keep `new_virtual_interface`). `new_control_interface_async` is
+`brcmf_cfg80211_add_iface` → `brcmf_p2p_add_vif` for P2P_DEVICE: the
+device address from `brcmf_p2p_generate_bss_mac` (requested, else the
+primary with the locally administered bit, else random for an LAA
+primary), the native `create_p2p_device` first (Linux creates the
+discovery bsscfg inside `add_virtual_intf`), then a `P2pWdev` registered
+with `register_control_child` under the primary's retained `narf_net`
+handle, `registry::register_control` and the creating source's
+`retain_control_child`; a failed publication deletes the discovery
+bsscfg again. The discovery owner (`brcmfmac::p2p::Device`) lives in the
+primary `State` beside `vif`/`secondaries`, so every command is
+serialized with the station/AP/secondary work; the WDEV reaches it
+through the type-erased `Roles::p2p_device`. Radio control shares the
+primary's AP serialization lease (`reserve_radio_control`).
+
+- START/STOP: `brcmf_p2p_start_device` (`Device::start`, the START
+  request's interface identity recorded as READY) /
+  `brcmf_p2p_stop_device` (discovery SCAN, READY cleared). A listen still
+  outstanding at STOP is cancelled and its expiry reported (Linux leaves
+  the cookie to cfg80211; the firmware SCAN state ends the listen without
+  `LISTEN_COMPLETE`).
+- ROC: requires READY and 1..=5000 ms (`max_remain_on_channel_duration`);
+  `NL80211_CMD_REMAIN_ON_CHANNEL` readiness goes to the exact source after
+  the firmware accepted LISTEN, expiry on `BRCMF_E_P2P_DISC_LISTEN_COMPLETE`
+  or `CANCEL_REMAIN_ON_CHANNEL`. A newer listen replaces the record (the
+  Linux cookie WAR).
+- FRAME: action frames only, through `brcmf_p2p_send_action_frame` with
+  the requested channel or `BRCMF_C_GET_CHANNEL` on the discovery ifidx
+  and `wait` as dwell; the returned ACK is the TX status. The
+  probe-response vendor-IE branch of `brcmf_cfg80211_mgmt_tx` is not
+  mirrored (refused), nor are other subtypes (Linux returns 0 without a
+  status).
+- REGISTER_FRAME: action (0xd0) and probe request (0x40) only
+  (`brcmf_txrx_stypes[P2P_DEVICE].rx`), overlapping prefixes `EALREADY`,
+  at most 16; the union of current subscriptions is the discovery vif's
+  `mgmt_rx_reg`. Worker-drained `Notice::Rx` frames go to the matching
+  current source only while READY.
+- DEL: `brcmf_p2p_del_vif` (`Device::delete`: cancel listen, deinit
+  discovery, IF DEL wait) before `retire_control`; metadata release is
+  `unregister_control` + `unregister_for_handle`. A failed IF DEL wait has
+  already dropped the host entry, so a repeated DEL retires the WDEV. A
+  primary withdrawal (`withdraw_family`) withdraws the WDEV metadata.
+
+The whole WDEV is behind `P2P_ADVERTISED = false` (the primary's
+`async_control_interfaces` and `radio_control_generation` stay off).
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: the nl80211 surface over these owners (P2P_DEVICE control
-WDEV with start/stop, ROC, management TX/RX registration; P2P_CLIENT and
-P2P_GO netdevs driving the secondary station/AP roles on the
-`create_p2p` bsscfg), the P2P escan, transport-model (msgbuf/SDIO)
-fixtures, and P2P iftype/combination advertisement, which stays off.
+either family: P2P_CLIENT and P2P_GO netdevs driving the secondary
+station/AP roles on the `create_p2p` bsscfg, the P2P escan,
+transport-model (msgbuf/SDIO) fixtures, and P2P iftype/combination
+advertisement, which stays off.
 Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
 written for this foundation.
 

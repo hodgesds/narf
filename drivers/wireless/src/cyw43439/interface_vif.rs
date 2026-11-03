@@ -72,8 +72,11 @@ const GONE: u8 = 4;
 static SHELLS: IrqSafeSpinLock<Vec<Arc<VifDevice>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_COOKIE: AtomicU64 = AtomicU64::new(1);
 
+#[path = "interface_p2p.rs"]
+mod p2p_device;
 #[path = "interface_vif_ap.rs"]
 mod vif_ap;
+pub(super) use p2p_device::create as p2p_device_create;
 
 /// Some secondary bsscfg runs a firmware-SME AP. The primary AP Program
 /// (device-wide DOWN/apsta/PHY modes) must not start beside it.
@@ -118,6 +121,18 @@ pub(super) trait Roles: Send + Sync {
         authority: &narf_wireless::ap_control::ApControlAuthority,
         operation: vif_ap::Operation,
     ) -> Result<bool, WirelessError>;
+    /// The P2P discovery bsscfg owner of the control-only P2P_DEVICE WDEV
+    /// (`interface_p2p.rs`), under the primary state mutex.
+    async fn p2p_device(
+        &self,
+        operation: p2p_device::Operation,
+    ) -> Result<p2p_device::Outcome, WirelessError>;
+    /// The AP serialization lease the P2P_DEVICE shares with its primary.
+    fn p2p_reserve(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>;
+    /// The primary is published and its transport generation current.
+    fn p2p_parent_live(&self) -> bool;
 }
 
 /// Published primaries, for a shell to reach its wiphy's role owner.
@@ -432,6 +447,7 @@ pub(super) fn withdraw_family(family: Family) {
         shell.unpublish();
         shell.finish();
     }
+    p2p_device::withdraw_family(family);
 }
 
 fn role_of(iftype: u32) -> Option<Role> {
@@ -602,6 +618,7 @@ impl<R: Fullmac + 'static> Device<R> {
         let pending = shells(R::FAMILY);
         let mut delivered: Vec<(Arc<VifDevice>, Vec<u8>)> = Vec::new();
         let mut ap_delivered: Vec<vif_ap::Delivery> = Vec::new();
+        let mut p2p_notices: Vec<crate::brcmfmac::p2p::Notice> = Vec::new();
         {
             let Some(mut state) = self.state.try_lock() else {
                 return;
@@ -610,6 +627,7 @@ impl<R: Fullmac + 'static> Device<R> {
                 station,
                 vif,
                 secondaries,
+                p2p,
                 ..
             } = &mut *state;
             let Some(owner) = vif.as_mut() else {
@@ -788,7 +806,13 @@ impl<R: Fullmac + 'static> Device<R> {
                     .iter()
                     .any(|shell| shell.cookie == slot.cookie && shell.phase() == LIVE)
             });
+            // The P2P discovery bsscfg's `fweh` handlers (listen complete,
+            // action-frame RX, P2P probe requests).
+            if let Some(device) = p2p.as_mut() {
+                p2p_device::service(runtime, owner, device, &mut p2p_notices).await;
+            }
         }
+        p2p_device::deliver(R::FAMILY, p2p_notices);
         // No state or ring guard survives the stack callback.
         self.secondary_ap_deliver(ap_delivered);
         for (shell, mut bytes) in delivered {
@@ -867,6 +891,21 @@ impl<R: Fullmac + 'static> Roles for Device<R> {
     ) -> Result<bool, WirelessError> {
         self.secondary_ap_control(&shell, authority, operation)
             .await
+    }
+    async fn p2p_device(
+        &self,
+        operation: p2p_device::Operation,
+    ) -> Result<p2p_device::Outcome, WirelessError> {
+        self.p2p_device_operation(operation).await
+    }
+    fn p2p_reserve(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        narf_wireless::WirelessNetIface::reserve_radio_control(self)
+    }
+    fn p2p_parent_live(&self) -> bool {
+        !self.withdrawn() && !self.closing.load(Ordering::Acquire) && self.p2p_device_enabled()
     }
 }
 

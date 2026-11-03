@@ -275,6 +275,7 @@ impl Harness {
                 monitor: None,
                 vif: None,
                 secondaries: Vec::new(),
+                p2p: None,
             }),
             name: name.clone(),
             mac: OWN,

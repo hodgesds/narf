@@ -39,6 +39,9 @@ struct State<R: Fullmac> {
     vif: Option<crate::brcmfmac::vif_owner::Owner>,
     /// Per-bsscfg secondary station roles (`interface_vif.rs`).
     secondaries: Vec<vif::Secondary<R>>,
+    /// P2P discovery bsscfg owner of the control-only P2P_DEVICE WDEV
+    /// (`interface_p2p.rs`), from `NEW_INTERFACE` until `DEL_INTERFACE`.
+    p2p: Option<crate::brcmfmac::p2p::Device>,
 }
 struct PendingTx {
     frame: Frame,
@@ -203,6 +206,13 @@ pub(crate) struct Lifecycle {
     request: IrqSafeSpinLock<Option<AssociateRequest>>,
     ap: ap::Host,
     monitor: monitor::Host,
+    /// The primary's own `narf_net` registration handle: the typed parent
+    /// of a control-only P2P_DEVICE child (`register_control_child`).
+    registration: IrqSafeSpinLock<
+        Option<narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>>,
+    >,
+    /// The booted firmware's `cap` lists `p2p` (`BRCMF_FEAT_P2P`).
+    p2p: AtomicBool,
 }
 impl Default for Lifecycle {
     fn default() -> Self {
@@ -211,6 +221,8 @@ impl Default for Lifecycle {
             request: IrqSafeSpinLock::new(None),
             ap: ap::Host::new(),
             monitor: monitor::Host::new(),
+            registration: IrqSafeSpinLock::new(None),
+            p2p: AtomicBool::new(false),
         }
     }
 }
@@ -370,6 +382,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             .is_some_and(|source| source.current().is_ok())
     };
     let vif = vif::discover(&mut station.runtime, station.mac).await?;
+    let p2p_firmware = vif.as_ref().is_some_and(|owner| owner.features().p2p);
     let telemetry = Arc::new(super::telemetry::Counters::default());
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
@@ -400,6 +413,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             monitor: None,
             vif,
             secondaries: Vec::new(),
+            p2p: None,
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
@@ -414,6 +428,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         tx: IrqSafeSpinLock::new(Some(tx_producer)),
         lifecycle: Lifecycle::default(),
     });
+    device.lifecycle.p2p.store(p2p_firmware, Ordering::Release);
     {
         let mut active = slot.lock();
         // Firmware setup awaited bus transactions. Another driver may have
@@ -428,12 +443,13 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         }
         // Registration may reject a revoked authority or duplicate name.
         // Fail before publishing ACTIVE, a kernel netdev, or any worker.
-        narf_net::registry()
+        let registration = narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|error| match error {
                 narf_net::RegisterError::DuplicateName => Error::Busy,
                 narf_net::RegisterError::AuthorityRevoked => Error::Unsupported,
             })?;
+        *device.lifecycle.registration.lock() = Some(registration);
         *active = Some(device.clone());
     }
     vif::register_primary(&device);
@@ -1185,6 +1201,47 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         }
         Ok(self.vif_new(name, iftype, mac)? as Arc<dyn WirelessNetIface>)
     }
+    /// Only P2P_DEVICE (10) is a control-only WDEV (`interface_p2p.rs`);
+    /// STA/AP/P2P_CLIENT/P2P_GO stay on `new_virtual_interface`.
+    fn async_control_interfaces(&self) -> bool {
+        self.p2p_device_enabled()
+    }
+    fn async_control_iftypes(&self) -> u32 {
+        1 << 10
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if iftype != 10 || !self.p2p_device_enabled() {
+            return Err(WirelessError::NotSupported);
+        }
+        vif::p2p_device_create(self, authority, name, mac).await
+    }
+    /// The P2P_DEVICE parent's radio control shares the AP serialization
+    /// lease: one firmware command owner serves both.
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        if !self.p2p_device_enabled() {
+            return None;
+        }
+        if self.ap_capable() {
+            self.ap_generation()
+        } else {
+            core::num::NonZeroU64::new(1).filter(|_| !self.withdrawn())
+        }
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        if !self.p2p_device_enabled() {
+            return Ok(None);
+        }
+        self.lifecycle.ap.control.try_reserve().map(Some)
+    }
     fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
         self.ap_set_mode(mode)
     }
@@ -1772,6 +1829,7 @@ mod tests {
             monitor: None,
             vif: None,
             secondaries: Vec::new(),
+            p2p: None,
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);

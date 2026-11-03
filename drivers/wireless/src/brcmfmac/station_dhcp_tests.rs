@@ -100,6 +100,7 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
             monitor: None,
             vif: None,
             secondaries: Vec::new(),
+            p2p: None,
         }),
         name: name.clone(),
         mac: OWN,
