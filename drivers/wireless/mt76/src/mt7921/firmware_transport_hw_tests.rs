@@ -23,8 +23,19 @@ mod tx_pipeline_hw_tests;
 mod tx_sequence_hw_tests;
 
 fn rig() -> Result<(Vec<u32>, Hardware), Error> {
+    rig_with(
+        &narf_io::DmaDevice::coherent(),
+        narf_bus::PcieAddr::new(0, 0, 0, 0),
+    )
+}
+
+/// [`rig`] for the function at `addr` with every ring allocated through
+/// `dma` (as `Transport::new` does after `narf_bus::dma::configure`).
+fn rig_with(
+    dma: &narf_io::DmaDevice,
+    addr: narf_bus::PcieAddr,
+) -> Result<(Vec<u32>, Hardware), Error> {
     let mut words = vec![0u32; 0x100000 / 4];
-    let addr = narf_bus::PcieAddr::new(0, 0, 0, 0);
     let device = BusDevice {
         addr: narf_bus::BusAddr::Pcie(addr),
         id: narf_bus::DeviceId {
@@ -48,9 +59,9 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         },
     };
     let storage = Storage {
-        wm: Ring::allocate(TX_WM, false)?,
-        fwdl: Ring::allocate(TX_FWDL, false)?,
-        data: Ring::allocate(TX_DATA, false)?,
+        wm: Ring::allocate_for(dma, TX_WM, false)?,
+        fwdl: Ring::allocate_for(dma, TX_FWDL, false)?,
+        data: Ring::allocate_for(dma, TX_DATA, false)?,
         data_dma: 0,
         tokens: packet_tx::Tokens::new(),
         tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
@@ -60,9 +71,9 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         receive_open: false,
         p2p_capture: super::super::p2p_management_capture::Queue::new(),
         rx: [
-            Ring::allocate(RX_PRE, true)?,
-            Ring::allocate(RX_POST, true)?,
-            Ring::allocate(RX_DATA, true)?,
+            Ring::allocate_for(dma, RX_PRE, true)?,
+            Ring::allocate_for(dma, RX_POST, true)?,
+            Ring::allocate_for(dma, RX_DATA, true)?,
         ],
     };
     Ok((

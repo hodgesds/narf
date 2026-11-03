@@ -95,7 +95,11 @@ impl Ring {
         }
         let mut buffers = Vec::with_capacity(DEPTH);
         for _ in 0..DEPTH {
-            let mask = if base == TX_DATA {
+            // Behind a per-domain IOMMU every mapping honours the function's
+            // streaming mask, `dma_set_mask(&pdev->dev, DMA_BIT_MASK(32))`
+            // (mt7921/pci.c:mt7921_pci_probe). Identity keeps the 36-bit
+            // descriptor address reach for non-data rings.
+            let mask = if base == TX_DATA || dma.iommu_domain().is_some() {
                 u64::from(u32::MAX)
             } else {
                 (1u64 << 36) - 1
@@ -204,6 +208,31 @@ impl Storage {
         dma_barrier();
     }
 }
+/// IOMMU requester ID of `device`; `narf_bus::dma::configure` attaches
+/// only PCI segment 0 functions to a default domain.
+fn iommu_bdf(device: &BusDevice) -> Option<narf_io::iommu::Bdf> {
+    match device.kind {
+        narf_bus::BusKind::Pcie { addr, .. } if addr.segment == 0 => Some(
+            narf_io::iommu::Bdf::new(addr.bus, addr.device, addr.function),
+        ),
+        _ => None,
+    }
+}
+/// Re-attach a function blocked by an earlier generation's stop/reset to
+/// its retained default domain before the first allocation (Linux
+/// `pci_dev_reset_iommu_done`). The caller holds the stop proof: bus
+/// mastering verified off and exclusive device ownership. A no-op outside
+/// `PerDomain` and for a function that is not blocked.
+fn restore_function_dma(device: &BusDevice) -> Result<(), Error> {
+    if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+        return Ok(());
+    }
+    let bdf = iommu_bdf(device).ok_or(Error::Allocation)?;
+    if !narf_io::iommu::device_dma_blocked(bdf) {
+        return Ok(());
+    }
+    narf_io::iommu::restore_device_dma(bdf).map_err(|_| Error::Authority)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SequenceReset {
     None,
@@ -222,7 +251,58 @@ struct Hardware {
     sequence_reset: SequenceReset,
     wake: wake::Wake,
 }
+impl Drop for Hardware {
+    /// An owner dropped while its rings are still published (dead firmware,
+    /// a failed stop or recovery, unproven removal) never proved the device
+    /// stopped. Behind a per-domain IOMMU the blocking detach is that proof
+    /// (Linux: the blocked release domain, then `iommu_dma_free`), so the
+    /// rings are freed with strict invalidation; otherwise
+    /// `Retained` keeps them forever, exactly as before.
+    fn drop(&mut self) {
+        let _ = self.block_for_reclaim();
+    }
+}
 impl Hardware {
+    /// Block the function's DMA at its IOMMU (Linux
+    /// `pci_dev_reset_iommu_prepare`). Deliberately ungated by the
+    /// firmware/BAR proof: a dead or revoked generation must still be
+    /// blockable. Outside `PerDomain` this is `Untranslated` and touches no
+    /// hardware; the device-side evidence is then the only proof.
+    fn block_dma(&self) -> Result<narf_io::iommu::DmaBlock, Error> {
+        if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+            return Ok(narf_io::iommu::DmaBlock::Untranslated);
+        }
+        let bdf = iommu_bdf(&self.device).ok_or(Error::Authority)?;
+        // A detach timeout means the device may still translate.
+        narf_io::iommu::block_device_dma(bdf).map_err(|_| Error::Timeout)
+    }
+    /// Re-attach the retained default domain before rings are published
+    /// again (Linux `pci_dev_reset_iommu_done`). Only the holder of the
+    /// stop/reset proof calls this: `initialize` after its idle proof.
+    fn restore_dma(&self) -> Result<(), Error> {
+        restore_function_dma(&self.device)
+    }
+    /// Unpublish after the device-side stop proof (DMA disabled and idle,
+    /// bus mastering off, ring bases cleared). Under `PerDomain` the
+    /// function is blocked first, so every later free of these rings
+    /// follows a completed blocking detach.
+    fn unpublish(&mut self) -> Result<(), Error> {
+        self.block_dma()?;
+        self.owner.published = false;
+        Ok(())
+    }
+    /// Drop path for a still-published owner: true when the IOMMU block
+    /// completed and the rings may be freed.
+    fn block_for_reclaim(&mut self) -> bool {
+        if !self.owner.published || self.owner.storage.is_none() {
+            return false;
+        }
+        if self.block_dma() != Ok(narf_io::iommu::DmaBlock::Blocked) {
+            return false;
+        }
+        self.owner.published = false;
+        true
+    }
     fn receive_ring(&mut self, which: usize) -> Result<Option<Vec<u8>>, Error> {
         self.check()?;
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
@@ -825,7 +905,11 @@ impl Backend for Hardware {
         self.initialize()
     }
     fn resume_dma(&mut self) -> Result<(), Error> {
-        if !self.owner.published {
+        // A blocked function lost its stop proof's rings; only a verified
+        // reinit/recovery (initialize) restores it.
+        if !self.owner.published
+            || iommu_bdf(&self.device).is_some_and(narf_io::iommu::device_dma_blocked)
+        {
             return Err(Error::Busy);
         }
         use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
@@ -844,7 +928,11 @@ impl Backend for Hardware {
         if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
         }
-        Ok(())
+        // Recovery parks before the WFSYS reset; block there too, so a
+        // reset or recovery that dies leaves the function blocked and its
+        // rings reclaimable (Linux `pci_dev_reset_iommu_prepare` precedes
+        // a function reset). Idempotent when already blocked.
+        self.block_dma().map(|_| ())
     }
     fn assert_reset(&mut self) -> Result<(), Error> {
         self.sequence_reset = SequenceReset::None;
@@ -917,6 +1005,10 @@ impl Backend for Hardware {
         self.update(MT_WFDMA0_RST, 0, 0x30)?;
         self.clear_rings()?;
         self.write(0xd420c, u32::MAX)?;
+        // Idle proven and bus mastering still off: a function blocked by
+        // stop/recovery gets its retained domain back before any ring
+        // base is programmed.
+        self.restore_dma()?;
         // Conservatively mark published BEFORE the first ring base write.
         self.owner.published = true;
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
@@ -1098,8 +1190,7 @@ impl Backend for Hardware {
         self.park_bus_master()?;
         self.clear_rings()?;
         let _ = self.read(GLOBAL)?;
-        self.owner.published = false;
-        Ok(())
+        self.unpublish()
     }
     fn submit_management(
         &mut self,
@@ -1563,6 +1654,9 @@ impl Transport {
                     return Err(Error::Bounds);
                 }
             }
+            // A function blocked by the previous generation's stop is
+            // re-attached before its first mapping (bus mastering off).
+            restore_function_dma(&device)?;
             let dma = narf_bus::dma::configure(&device).map_err(|_| Error::Allocation)?;
             let storage = Storage {
                 wm: Ring::allocate_for(&dma, TX_WM, false)?,

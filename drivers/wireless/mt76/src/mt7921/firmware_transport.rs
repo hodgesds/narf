@@ -192,7 +192,9 @@ fn admit_completed<T>(
 fn retire_transport(mut transport: Transport) {
     let generation = transport.generation();
     // Unproven retirement keeps the published rings forever (Retained), so
-    // a later generation's freshly programmed rings can never alias them.
+    // a later generation's freshly programmed rings can never alias them;
+    // behind a per-domain IOMMU they are freed only after a completed DMA
+    // block of the function (`Hardware` drop).
     let _ = transport.retire_removed();
     drop(transport);
     super::pci::release_transport_claim(generation);
