@@ -3158,6 +3158,51 @@ keeps the chip diagnostic until admission lands.
   outstanding. Tests `smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm`,
   `smoke_rtl8723be_ra_mask_dm_and_rx_pwdb`,
   `smoke_rtl8723be_c2h_irq_and_card_disable` (written, unexecuted).
+- BT coexistence, pass 1 (not wired, not admitted). `btcoex/btc.rs` is the
+  `halbtcoutsrc.c` / `rtl_btc.c` glue: `BtCoexist` (`struct btc_coexist`
+  state; `bind` = `exhalbtc_initlize_variables` +
+  `exhalbtc_bind_bt_coex_withadapter` from `HwPg::rtl8723be(&Adapter)`:
+  `ant_num` 2/1, `single_ant_path`, `BTC_CHIP_RTL8723B`, TFBGA unless
+  package 0/1, PCI, `btdm_ant_pos` main); the `btc_*` function pointers as
+  the `Hal` trait (byte/word/dword, RF, `fill_h2c_cmd`, the C2H `BT_MP`
+  wait, `rtl_lps_{leave,enter}`, `rtl_rx_ampdu_apply`); `Ctx` carries
+  `halbtc_bitmask_write_1byte`, `write_local_reg_1byte`, BB set/get,
+  `halbtc_send_bt_mp_operation` (H2C 0x67), `halbtc_set_bt_reg` (value
+  then address, 200 ms each), `halbtc_get_bt_patch_version`, the
+  `halbtc_get` queries over `WifiInfo` (HS / ext-switch / MP / IOT peer
+  constant as on rtlwifi), the `halbtc_set` actions (`halbtc_*_lps`,
+  `disable_low_power`, `halbtc_aggregation_check` with its 8 s gate),
+  `rtl_btc_btmpinfo_notify`, `record_pwr_mode`, `lps_ctrl` (the `BtLps`
+  inputs), `get_ampdu_cfg`, `is_disable_edca_turbo` and the `exhalbtc_*` /
+  `rtl_btc_*` entry points (power-on, pre-load, `rtl_btc_init_hw_config` =
+  `init_hw_config(!bt_exist)` + `init_coex_dm`, IPS with the `ERFON` scan
+  start/finish, LPS, scan, connect, media, special packet, BT info, halt
+  (unbind), PnP, periodical) over the `Algorithm` trait. Differences:
+  access errors propagate; the MP completion is the next accepted `BT_MP`
+  body (at most 8 per operation); debugfs display is not carried.
+  `rtl8723be/btc.rs::BtcHal` implements `Hal` over `Io` + `Mailbox` +
+  `fwlps_{leave,enter}` (`LpsGate` holds the `ps.c` conditions; word reads
+  come from the aligned dword); `BtMpSource` delivers C2H MP bodies (only
+  `NoBtMp` so far). `btcoex/b8723b1ant.rs` is `halbtc8723b1ant.c` (0x47):
+  coex dm/sta with the function statics as fields, limited TX/RX, BT-info
+  query, BT / Wi-Fi counter monitors, link info, auto report, low-penalty
+  RA, the 16 coex tables, ignore-WLAN-act, the full `ps_tdma` table
+  (`ps_tdma_bytes`, `wifi_duration_adjust`, `ap_tdma`), LPS/RPWM,
+  `set_ant_path`, `tdma_dur_adj_for_acl`, power-save state, every action,
+  `run_coexist_mechanism`, init coex dm / hw config and every `ex_`
+  handler (power-on, init hwconfig incl. `wifi_only`, init coex dm, IPS,
+  LPS, scan, connect, media status, special packet, BT info, RF status,
+  halt, PnP, periodical). Outstanding: `halbtc8723b2ant`, owner wiring
+  (C2H `BtInfo`/`BtMp` delivery, `BtLps` from `lps_ctrl`, notify call
+  sites, periodical timer) and admission. Tests
+  `smoke_rtlwifi_btc_bind_bitmask_and_wifi_queries`,
+  `smoke_rtlwifi_btc_mp_operation_and_bt_reg`,
+  `smoke_rtlwifi_btc_lps_actions_and_aggregation`,
+  `smoke_rtlwifi_btc8723b1ant_ps_tdma_tables`,
+  `smoke_rtlwifi_btc8723b1ant_power_on_and_init_hw_config`,
+  `smoke_rtlwifi_btc8723b1ant_bt_info_a2dp_connected`,
+  `smoke_rtlwifi_btc8723b1ant_periodical_bt_disable_and_ips` (written,
+  unexecuted).
 
 ## 4. Invariants
 
