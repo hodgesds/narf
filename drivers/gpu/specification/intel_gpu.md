@@ -1720,20 +1720,65 @@ xe_fb_pin.c encodes), admitted only while the GT owner's PAT3 reads back
 0x3c. Display-20 deltas the owner uses: the DE pipe status it owns drops
 both PIPEDMC faults and keeps the plane ATS fault
 (`gen8_de_pipe_fault_mask`, display >= 20); the fetcher inventory covers FBC
-A–D and five universal planes per pipe; a tiled primary needs a DPT this
-owner does not build (`intel_dpt_configure` sets the no-DPT chicken on
-display 14 only), so only the linear XRGB8888 primary flips; and every KMS
-register read is preceded by Wa_15015404425's four dummy writes
+A–D and five universal planes per pipe; and every KMS register read is
+preceded by Wa_15015404425's four dummy writes
 (xe_mmio.c::mmio_flush_pending_writes, `PLATFORM(LUNARLAKE)`). Fixed-mode
 flips, console restoration and GT-reset recovery run through the display-14
-owner unchanged. The cursor, CTM, LUTs, DSB transactions, panning, X/Tile4,
-XR30 and FBC are not offered on display 20 yet. The pinned tree has no
-display-20 register delta for the cursor (`intel_cursor.c`), the color
-pipeline before display 30 (`intel_color.c`) or DSB (`intel_dsb.c`), but
-the cursor and DSB owners still map their GGTT pages in the display-14
-format and PAT1, which they must take from `display_pte` before they can be
-admitted. `PLANE_AUX_DIST` is absent on display 20 (`HAS_AUX_DIST`); the
-presenter's read of it as zero is unchanged.
+owner unchanged. `PLANE_AUX_DIST` is absent on display 20 (`HAS_AUX_DIST`);
+the presenter's read of it as zero is unchanged.
+
+Cursor, color and DSB on display 20. At the pinned revision
+`intel_cursor.c`, `intel_dsb.c` and `intel_color.c` have no branch between
+displays 14 and 20: `MCURSOR_ARB_SLOTS` is display 13 only, `CUR_FBC_CTL`
+ends at 13 and `HAS_HW_SAGV_WM` covers both; the DSB's
+`DSB_ATS_FAULT_INT_*` start at 14 and `DSB_GOSUB_INT_*` at 30, and
+`mtl_read_wm_latency` serves >= 14; `tgl_color_funcs` serves every
+display >= 12, with 10-bit gamma and 131 degamma entries from 13,
+`mtl_degamma_lut` from 14 and the next branch at 30
+(`HAS_DOUBLE_BUFFERED_LUT`). `xe2_lpd_display` keeps `XE_LPDP_FEATURES`'
+LUT sizes. So the KMS owner admits the display-14 cursor, CTM, gamma and
+degamma LUTs and DSB transactions on display 20 (`card.intel_ctm`); the
+cursor still proves the display-20 resource layout first. The cursor and
+DSB owners take their page format from `display_pte` (`new_for`,
+`reserve_for`): Xe2 PTEs at PAT3, admitted only while
+`display_pat_programmed` reads 0x3c in `PAT_INDEX(3)`. PAT3 is the index
+xe_fb_pin.c maps a cursor framebuffer with. xe maps its own DSB buffer
+(xe_dsb_buffer.c, `XE_BO_FLAG_SCANOUT | XE_BO_FLAG_GGTT`) through the BO's
+GGTT node at `idx[XE_CACHE_WB]` (xe_ggtt.c::__xe_ggtt_insert_bo_at); the
+owner's command pages are CPU-WC and fenced before their PTEs are written,
+so the uncached display index reads the same bytes and both owners keep the
+one PAT entry their admission proves. The cursor's fault mask is the
+display >= 20 `gen8_de_pipe_fault_mask` (plane ATS kept, both PIPEDMC
+faults dropped).
+
+Tiled primaries. A display-20 X or Tile4 primary is always fetched through a
+display page table: `intel_dpt_configure` sets the `PLANE_CHICKEN` no-DPT
+bit on display 14 only, and `intel_fb_uses_dpt` holds for every non-linear
+modifier. The presenter builds it (`DptLayout`, `prepare_dpt`) the way
+display >= 14 remaps a DPT framebuffer to a power-of-two stride
+(`intel_fb_needs_pot_stride_remap`, `plane_view_dst_stride_tiles`): tile
+row `r` starts at entry `r * dst`, `dst = roundup_pow_of_two(max(width
+tiles, 8))`, each visible tile's entry is the framebuffer page's GGTT PTE at
+PAT3 (xe_fb_pin.c::write_dpt_remapped, `idx[XE_CACHE_NONE]`) and padding
+entries stay zero. Only a source stride no wider than `dst` is owned, so
+`PLANE_STRIDE` is the source stride (`plane_view_scanout_stride`) and the
+table equals Linux's for any framebuffer width up to the pitch. The table
+is a WC system object (xe's `__xe_pin_fb_vma_dpt` system fallback) mapped
+at PAT3 at a 2 MiB-aligned GGTT address (`tgl_plane_min_alignment`, 512 x
+4 KiB), and `PLANE_SURF` names it; panning a tiled display-20 primary is
+refused. Tile4 and X are advertised on display 20 through the display-14
+qualification without the chicken read (`tiled_profile` returns the proved
+IP, `Primary::capture_ip`), and their watermarks are the display-14 tiled
+images (skl_watermark.c has no DPT term). Compressed modifiers
+(`I915_FORMAT_MOD_4_TILED_LNL_CCS`) are not accepted: only plain X and
+Tile4 reach the presenter and its PLANE_CTL never sets decompression.
+
+Xe `SCANOUT` at creation. `DRM_XE_GEM_CREATE_FLAG_SCANOUT` is admitted on
+the display-preserving profile (`UserBackend::display_preserving`) as
+xe_bo.c::xe_gem_create_ioctl takes it: a WC system object marked for
+scanout, EINVAL with WB caching. Headless LNL and PTL keep refusing it, and
+`NO_COMPRESSION` stays refused; the bind layer never admits a compressed
+PAT on Xe2.
 
 DC service. KMS install creates the DC service for display 20
 (`intel_gpu_dc_states::service_profile`) under `DmcPlatform::Xe2Lpd`: after
@@ -1769,7 +1814,8 @@ Display-20 deltas, each with its pinned source branch:
 | PHY | DDI A/B are C10 as on MTL (shared PLL tables) | `intel_cx0_phy.c::intel_encoder_is_c10phy` |
 | DDI | D2D link enable/state in `DDI_BUF_CTL` bits 29/28 | `intel_ddi.c::mtl_ddi_enable_d2d` |
 | Transcoder | `CHICKEN_TRANS` clears `DP_DSC_INSERT_SF_AT_EOL_WA` only (no FEC jitter WA) | `intel_display.c::intel_enable_transcoder` |
-| Planes | No `PLANE_CHICKEN` no-DPT bit, so only the linear primary is owned; FBC on all four pipes | `intel_dpt_common.c::intel_dpt_configure`, `skl_universal_plane.c::skl_plane_has_fbc` |
+| Planes | No `PLANE_CHICKEN` no-DPT bit, so X/Tile4 primaries go through an owned power-of-two remapped DPT at a 2 MiB-aligned GGTT address; FBC on all four pipes | `intel_dpt_common.c::intel_dpt_configure`, `intel_fb.c::intel_fb_needs_pot_stride_remap`, `skl_universal_plane.c::{tgl_plane_min_alignment, skl_plane_has_fbc}` |
+| Cursor, color, DSB | No register delta from display 14; Xe2 PTEs at PAT3 for the cursor and DSB pages; cursor faults without the PIPEDMC bits | `intel_cursor.c`, `intel_color.c`, `intel_dsb.c::dsb_error_int_*`, `intel_display_irq.c::gen8_de_pipe_fault_mask` |
 | DSC | `XE2LPD_DE_CAP` may remove DSC; a stream that needs it is refused before any write | `intel_display_device.c::__intel_display_device_info_runtime_init` |
 | DMC | `xe2lpd_dmc.bin`, 0x8000 ceiling, no Wa_16015201720, no pipe-MMIO restore, `DMC_FQ_W2_PTS_CFG_SEL` after load, flip-queue reset and `PIPEDMC_INTERRUPT` around pipe enable/disable; DC6 cap (no DC3CO) | `intel_dmc.c`, `intel_display_power.c::get_allowed_dc_mask` |
 
@@ -1777,14 +1823,14 @@ The shipped `xe2lpd_dmc.bin` (v2.29) loads main and pipes A–C inside the
 display-14 program windows, so the display-14 window checks apply unchanged.
 
 Refused or not wired on display 20: PSR1 (above), PSR2 and panel replay,
-FBC, tiled and compressed primaries, the cursor, color and DSB
-transactions, system suspend and relight, external outputs (Type-C/PICA,
-TCSS pin assignment and HDMI), multi-pipe layouts, the VBT and backlight
-PWM. The display route's own probe-time modeset window does not yet apply
-Wa_15015404425; the KMS owner and the DC service do. The Xe GEM_CREATE
-`SCANOUT` flag stays refused on LNL, so userspace flips WC objects that a
-framebuffer creation marked scanout. Panther Lake (display 30.00) stays
-refused; its recorded deltas are in the `intel_gpu_xe2lpd` module header.
+FBC, compressed primaries, panning of a tiled primary, XR30, system suspend
+and relight, external outputs (Type-C/PICA, TCSS pin assignment and HDMI),
+multi-pipe layouts, the VBT and backlight PWM. The route's probe-time
+modeset window (`probe_window`: panel power sequencing, the takeover and the
+PPS backlight gate) applies Wa_15015404425 like the KMS owner and the DC
+service; only the read-only route decision ahead of it does not. Panther
+Lake (display 30.00) stays refused; its recorded deltas are in the
+`intel_gpu_xe2lpd` module header.
 ## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
 
 The Gen12 media engines brought to the §8 (RCS0) standard.
@@ -2601,7 +2647,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
-| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; opted-in LNL display 20 has an owned eDP Pipe-A modeset with display-20 resources, a display-preserving GT owner (no driver FLR; GT-only GuC/full reset; D0-only), an owned console with the KMS owner's linear Pipe-A flips at Xe2 PAT3, and the DC service loading `xe2lpd_dmc.bin` into DC6 (native fixtures added, unexecuted); LNL cursor/color/DSB, tiled primaries, PSR1 (refused), FBC, suspend, externals and all PTL display remain |
+| Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; opted-in LNL display 20 has an owned eDP Pipe-A modeset with display-20 resources, a display-preserving GT owner (no driver FLR; GT-only GuC/full reset; D0-only), an owned console with the KMS owner's Pipe-A flips at Xe2 PAT3 (linear, and X/Tile4 through an owned power-of-two DPT), the display-14 cursor, CTM/LUTs and DSB with Xe2 PTEs, the Xe `SCANOUT` create flag, Wa_15015404425 on the probe-time modeset window, and the DC service loading `xe2lpd_dmc.bin` into DC6 (native fixtures added, unexecuted); LNL PSR1 (refused), FBC, tiled panning, suspend/relight, externals and all PTL display remain |
 
 The first four workstreams form the initial integration checkpoint. They do
 not close the broader rows. Changes to memory/VM or other TCB members carry
@@ -6886,3 +6932,61 @@ then cursor, color and DSB on display 20; the Xe `SCANOUT` create flag on
 the display profile; Wa_15015404425 on the route's probe-time modeset
 window; display-20 relight and suspend; PSR1's display-20 deltas; FBC on the
 HDR planes; and Type-C/PICA externals.
+
+### Lunar Lake display 20: cursor, color, DSB, tiled primaries and SCANOUT — native fixtures added
+
+This slice continues the Lunar Lake display-20 route (§17, 10.5), still only
+behind `narf.intel.lnl_display=1`. It closes the first four items the
+previous slice left.
+
+The cursor and DSB owners now map their pages with the IP's display GGTT
+profile: Xe2 PTEs at PAT3, admitted only while the GT owner's
+`PAT_INDEX(3)` reads 0x3c. With that, the KMS owner offers the display-14
+cursor, CTM, gamma and degamma LUTs and DSB transactions on display 20.
+intel_cursor.c, intel_dsb.c and intel_color.c have no branch between
+displays 14 and 20 at the pinned revision, so the register conversations
+are unchanged. The cursor's fault mask is the display-20 one, without the
+PIPEDMC faults.
+
+X and Tile4 primaries are now owned on display 20. Display 20 has no
+no-DPT chicken, so the presenter builds a display page table for each
+tiled surface, laid out like Linux's power-of-two remap, and maps it at a
+2 MiB-aligned GGTT address that `PLANE_SURF` names. Only a source stride
+that fits the DPT stride is owned, and panning a tiled primary is refused.
+Tiled admission reads no new display-14 register. Display 14 still checks
+its chicken; display 20 skips it.
+
+The Xe `SCANOUT` create flag is admitted on the display-preserving
+profile as xe takes it, a WC system object marked for scanout. The
+route's probe-time modeset window, panel power sequencing through the
+backlight gate, now applies Wa_15015404425 like the rest of the display-20
+paths.
+
+Meteor Lake and Gen12 register conversations are unchanged. Two existing
+display-20 fixtures assert the new contract: the cursor is refused before
+any write without a proved display-20 layout, and an X-tiled display-20
+primary proves the linear watermark image.
+
+What a real Lunar Lake would do, opted in, beyond the previous slice:
+create scanout objects with the Xe flag, draw a hardware cursor, apply CTM
+and gamma/degamma LUTs (through the DSB when active), and flip X/Tile4
+framebuffers through the owned DPT. None of this has run on silicon.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `drivers/gpu/intel_gpu_xe2lpd_kms`:
+  `smoke_xe2lpd_kms_cursor_and_dsb_pages_map_xe2_pat3`,
+  `smoke_xe2lpd_kms_cursor_fault_mask_drops_pipedmc`,
+  `smoke_xe2lpd_kms_cursor_arms_through_dsb_on_display20`,
+  `smoke_xe2lpd_kms_ctm_and_gamma_owned_on_display20`,
+  `smoke_xe2lpd_kms_dpt_layout_pot_remap` and
+  `smoke_xe2lpd_kms_tile4_flips_through_owned_dpt`.
+- `drivers/gpu/intel_gpu_xe2lpd_gt`:
+  `smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile`.
+- `drivers/gpu/intel_gpu_xe2lpd_modeset`:
+  `smoke_xe2lpd_probe_window_flushes_every_read`.
+
+Remaining for the workstream, in order: display-20 suspend and relight
+(display power and DMC restore, the GT owner's resume without an FLR and
+the KMS restore); PSR1's display-20 deltas, recorded in §17; FBC on display
+20; panning of a tiled display-20 primary; and Type-C/PICA externals.

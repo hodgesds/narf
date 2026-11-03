@@ -368,8 +368,10 @@ behave exactly as before:
 - `intel_gpu_dmc`: `DmcPlatform::Xe2Lpd` and `parse_dmc_firmware_xe2lpd`.
 
 `intel_gpu::probe` sends an admitted Lunar Lake function to the
-integrated display path instead of `probe_discrete`. There it runs
-`takeover`, claims Pipe A (`route_owns_pipe_a` reports that claim) and
+integrated display path instead of `probe_discrete`. There
+`probe_window(pps, mode, light)` sequences the eDP panel, runs `light`
+(`takeover`) and opens the PPS backlight gate once lit, with both windows
+`Flushed`. Probe then claims Pipe A (`route_owns_pipe_a` reports that claim) and
 moves the console to an owned surface whose GGTT entries use the firmware
 surface's PAT index, which must be 0 (`firmware_pte_pat`, `console_pat`). A
 refused handoff installs no KMS owner. `Flushed` wraps a display-20 window
@@ -401,11 +403,37 @@ KMS and DC services on display 20:
   format and PAT index (Gen12/0, MTL `XeLpg`/1, LNL `Xe2`/3, PTL none), and
   `owned_status(generation)` the owned DE pipe status (display 20 drops the
   PIPEDMC faults). `PollIo::new` accepts Lunar Lake through them.
+  `display_pat_programmed(io, generation)` proves the GT owner's entry
+  behind that index (MTL `PAT_INDEX(1)` = 4, Xe2 `PAT_INDEX(3)` = 0x3c;
+  Gen12 reads nothing, PTL is refused).
 - `intel_gpu_kms::install` admits Lunar Lake only when `GMD_ID_DISPLAY`
-  reads 20.00. Its `access_ok` requires the GT owner's Xe2 PAT3 (0x3c). The
-  presenter refuses tiled layouts on `PteFormat::Xe2`. Cursor, color, DSB
-  transactions, panning, XR30, FBC and PSR stay unadvertised and return
-  `Unsupported` on display 20.
+  reads 20.00. Its `access_ok` requires the GT owner's Xe2 PAT3 (0x3c). It
+  advertises CTM/LUTs and the cursor (`card.intel_ctm`) on display 20, and
+  X/Tile4 after GT publication. XR30, panning of a tiled primary, FBC and
+  PSR return `Unsupported` on display 20.
+- `intel_gpu_cursor::Owner::new_for(io, bar_len, timing, generation)` and
+  `intel_gpu_dsb::Owner::reserve_for(io, bar_len, generation)` are the
+  non-Gen12 owners for Meteor Lake and Lunar Lake (anything else is
+  `Unsupported` before a read; a missing PAT entry is `NoDevice`). Their
+  pages take `display_pte`; the display-20 cursor's fault mask drops both
+  PIPEDMC faults. `reserve` (Meteor Lake) is test-only; the cursor's `new`
+  is removed. `intel_gpu_color::Owner::capture` admits `LunarLake` with
+  `Profile::Mtl`.
+- `intel_gpu_scanout::DptLayout::new(geometry, layout)` is the display-20
+  power-of-two remapped DPT of an X/Tile4 surface (`src`, `width`, `dst`,
+  `rows`, `bytes`, `source(index)`); `None` for linear, invalid or a source
+  stride wider than `dst`. On `PteFormat::Xe2`, `Presenter::prepare_layout`
+  builds that table for a tiled view, maps it at a 2 MiB-aligned GGTT
+  address and arms `PLANE_SURF` there; a non-zero origin is refused.
+- `intel_gpu_display_resources::Profile::ip` records the proved display
+  IP. `Primary::capture_ip(io, timing, ip)` reads the no-DPT chicken only
+  on display 14 and requires every later proof on `ip`; `capture` (display
+  14) is test-only. Display-20 X/Tile4 primaries prove the display-14
+  tiled watermark images.
+- `intel_gpu_user::UserBackend::display_preserving` (default false) is true
+  only for the Lunar Lake `DisplayPreserving` GT owner. With it, Xe
+  `GEM_CREATE` admits `DRM_XE_GEM_CREATE_FLAG_SCANOUT` on Lunar Lake (WC
+  only); headless LNL and PTL refuse it.
 - `intel_gpu_dc_states::service_profile(generation)` gives `(DmcPlatform,
   allowed DC mask, read flush)` for MTL and LNL; `XE2LPD_ALLOWED_DC_MASK`
   is DC6. `DcCore::new_for(platform, allowed)` and `DcCore::platform`
