@@ -504,7 +504,16 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let mut g = MICE.of(xhci_dev.id()).lock();
     let mut total = 0usize;
     for m in g.iter_mut() {
-        if let Ok(n) = m.pump_once(xhci_dev) {
+        let result = m.pump_once(xhci_dev);
+        let got = matches!(result, Ok(n) if n > 0);
+        super::note_pump(
+            "mouse",
+            xhci_dev.id(),
+            m.slot_id,
+            got,
+            result.as_ref().err().map(|e| e as &dyn core::fmt::Debug),
+        );
+        if let Ok(n) = result {
             total += n;
         }
     }

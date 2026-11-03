@@ -518,11 +518,13 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
         let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
-    dispatch_after_address(
+    let outcome = dispatch_after_address(
         xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port,
         /*parent_hub_slot*/ None,
     )
-    .await
+    .await;
+    note_attach_failure(xhci_dev.id(), port, 0, "outcome (not a failure)", &outcome);
+    outcome
 }
 
 /// Drive enumeration for a device on `hub_port` of an already-bound
@@ -597,7 +599,7 @@ pub async fn try_attach_via_hub(
         let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
-    dispatch_after_address(
+    let outcome = dispatch_after_address(
         xhci_dev,
         slot_id,
         hub_port,
@@ -606,7 +608,15 @@ pub async fn try_attach_via_hub(
         parent_root_port,
         Some(parent.slot_id),
     )
-    .await
+    .await;
+    note_attach_failure(
+        xhci_dev.id(),
+        parent_root_port,
+        topology.route_string,
+        "outcome (not a failure)",
+        &outcome,
+    );
+    outcome
 }
 
 /// Tear down whatever is bound to `slot_id` — the disconnect-side

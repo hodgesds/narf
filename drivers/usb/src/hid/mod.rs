@@ -821,11 +821,60 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let mut g = KEYBOARDS.of(xhci_dev.id()).lock();
     let mut total = 0usize;
     for kbd in g.iter_mut() {
-        if let Ok(n) = kbd.pump_once(xhci_dev) {
+        let before = REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
+        let result = kbd.pump_once(xhci_dev);
+        let got = REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed) != before;
+        note_pump(
+            "kbd",
+            xhci_dev.id(),
+            kbd.slot_id,
+            got,
+            result.as_ref().err().map(|e| e as &dyn core::fmt::Debug),
+        );
+        if let Ok(n) = result {
             total += n;
         }
     }
     total
+}
+
+/// Bring-up visibility for the input pumps, whose errors are otherwise
+/// dropped every cycle: log a binding's first report and its first error
+/// (once each per controller/slot/class), so a boot shows whether
+/// reports arrive, fail, or never come.
+pub(crate) fn note_pump(
+    class: &'static str,
+    controller: u8,
+    slot_id: u8,
+    got_report: bool,
+    error: Option<&dyn core::fmt::Debug>,
+) {
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<
+        alloc::collections::BTreeSet<(&'static str, u8, u8, bool)>,
+    > = narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeSet::new());
+    let event = match (got_report, error) {
+        (_, Some(_)) => false,
+        (true, None) => true,
+        (false, None) => return,
+    };
+    if !SEEN.lock().insert((class, controller, slot_id, event)) {
+        return;
+    }
+    use core::fmt::Write as _;
+    match error {
+        Some(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-hid: {class} xhci{controller} slot={slot_id} first pump error: {e:?}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-hid: {class} xhci{controller} slot={slot_id} first report received"
+            );
+        }
+    }
 }
 
 /// Snapshot the hub contexts of every live HID binding on `controller` across
