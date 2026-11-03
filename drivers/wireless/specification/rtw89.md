@@ -2703,8 +2703,9 @@ Scope (`wide_channels`): rtw8852b.c `support_bandwidths` is 20/40/80MHz, so
 the admitted AX chip RTL8852B implements HT40/HE40 (2.4/5GHz) and VHT80/HE80
 (5GHz). RTL8852C 160MHz belongs to the RTL8852C lane (its `operating_channel_c`
 geometry and `radio_policy_c` records already carry 160MHz blocks).
-RTL8851B, RTL8852A and RTL8922A have no native station owner at all (their
-own open chip rows), so "all AX chips" narrows to RTL8852B here.
+RTL8852A and RTL8922A have no native station owner at all (their own open
+chip rows), so "all AX chips" narrows to RTL8852B here; RTL8851B reuses
+this wide path one-stream (see the RTL8851B station section).
 
 **Geometry.** `operating_channel::Profile` now carries `(primary, center,
 Width)`: `new_2ghz_40(primary, secondary_above)` (both halves within 1..=13),
@@ -3870,13 +3871,13 @@ recipient path is reached under the signed C HT program (above).
 B bytes are unchanged. Unexecuted case:
 `smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c`.
 
-### RTL8851B retained runtime (partial; no native caller)
+### RTL8851B retained runtime (partial; composed through the station, antenna diversity open)
 
 Chip row `rtl8851b`. These owners are the chip-specific RTL8851B
 (`10ec:b851`, 1T1R AX, 2.4/5GHz, 20/40/80MHz) pieces under the retained
-B architecture, following the RTL8852C pattern above. No native caller
-composes them yet and no RTL8851B station is admitted; RTL8852B and RTL8852C
-bytes are unchanged.
+B architecture, following the RTL8852C pattern above. The radio,
+ordinary-grant and station composition sections below compose them; RTL8852B
+and RTL8852C bytes are unchanged.
 
 **Secure policy.** `Blacklist::upstream(Rtl8851B)` is Linux's exact policy:
 `rtw8851b_chip_info.fw_blacklist` is NULL, so fw.c
@@ -4238,13 +4239,68 @@ byte-identical to `__rtw8852bx_mac_disable_bb_rf`, clearing RF00S_EN at
 S0 and RF10S_EN at S1 even on the one-path chip). Unexecuted case:
 `smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg`.
 
-**Remaining for the row.** the RTL8851B ordinary grant
-(`OrdinaryGrant` arm), retune, tx_transport/packet_core chip checks,
-station admission, HT/HE + 40/80 on the shared wide path, RF tracking
-wiring of `radio_51::Radio::track`, and the one-path antenna-diversity
-tracker (`hal->ant_diversity` from `rtw89_mac_setup_phycap`
-`rfe_type % 3 == 2`, phy.c `rtw89_phy_antdiv_*`) remain; the row is not
-complete.
+**RTL8851B ordinary grant, retune and RF tracking
+(`command_native/radio_51.rs`).** On `Ready`, `prepare_radio_51` installs
+`OrdinaryGrant::N51` (the same retained `radio_policy_51::Qualification`,
+rechecked; `b()` is "no program", as on C). `c_ordinary` is true for C and
+RTL8851B; `c_program` dispatches RTL8851B to `qualification_51.allows`
+(A-MSDU stays "no program"). `admitted_channels_51` and the RTL8851B arm of
+`admitted_wide` list only `N51C` records `channel_active` under the current
+host rule (no DFS/NO_IR span: RTL8851B has no beacon-witness passive TX
+grant); `admitted_six_ghz`/`six_ghz_regulatory` stay empty (no 6GHz in
+`support_bands`). `Native::retune_radio_51` (via `Startup::retune_channel_51`,
+dispatched from `retune_channel` and `retune_wide`) mirrors
+`retune_radio_c`: drain, withhold the grant, rebind
+`radio_policy_51::Board::new` + `channel_matches`, `select`,
+`radio_51::Radio::retune` (core.c `rtw89_set_channel` ->
+`rtw8851b_set_channel`, then `rtw8851b_rfk_channel`; no RF_GET_MCCCH),
+update the RX width, reinstall the same grant. `track::Hw::rfk` and
+`station::Io::station_rf_tracking` are async; on RTL8851B
+`Startup::station_rf_tracking` runs `Native::track_radio_51`
+(`radio_51::Radio::track`, `rtw8851b_rfk_track` path-A DPK track) with the
+current N51 grant on a started, awake, non-calibrating station; `track.rs`
+`run` returns before any RF step while scanning (`rtw89_track_work`
+checks `rtwdev->scanning`), and a failed step terminalizes Native. The
+`N51B` recipe text names `rtw8851b_rfk_track`, so the signed identity
+measures the tracking emissions.
+
+**RTL8851B station admission and one-stream HT/HE wide path.**
+`startup_station::station_allowed` and `station_control::Controller::new`
+admit RTL8851B on B's station codec (rtw8851b.c `rtw8851b_chip_info` has
+RTL8852B's `h2c_cctl_func_id` CCTLINFO_UD, `bacam_num` 2 / `RTW89_BACAM_V0`,
+`addrcam_ver` 0). The station preflight takes `NativeIo::n51_station_window`
+and B's HCI check (rtw8851be.c `rtw8851b_pci_info` is byte-identical to
+rtw8852be.c's); `station_tx_current` uses `radio_policy_51::tx_current`.
+`packet_core::Core::prepare_with` admits RTL8851B on the ordinary station
+rings only (no AP); A-MPDU is allowed, A-MSDU and fragments are refused.
+`packet_format::transmit_51` is the AX v0 TXWD (`txwd_body_size` /
+`txwd_info_size` as RTL8852B, pci.c `rtw89_pci_fill_txaddr_info`) with no
+A-MSDU; `tx_transport` admits RTL8851B QoS data (no A-MSDU), HE +HTC, host
+CCMP and pci.c's 36-bit mask. Track work uses `track::LAYOUT_51` /
+`REGISTERS_51` (`rtw8851b_dig_regs`/`rtw8851b_edcca_regs` are RTL8852B's;
+`rtw8851b_dcfo_comp` R_DCFO_COMP_S0_V2 [13:0], `dcfo_comp_sft` 12) and the
+phy.c `rtw89_phy_cfo_set_crystal_cap` RTL8851B branch
+(`rtw8851b_xtal_info`: R_AX_XTAL_ON_CTRL3 SC_XO [14:8] then SC_XI [6:0],
+read back). `radio_policy_51::PROGRAMS` is WMM / all-AC QoS / firmware RA
+/ HT / HE / A-MPDU, each extending the identity in an RTL8851B domain over
+the common AX fingerprints (HE over `he_fingerprint_1ss`). The station is
+one-stream (`Io::station_single_stream`, `hal->rx_nss` = `tx_nss` = 1):
+`local_he_1ss`, `local_he_wide_1ss` and `local_vht80_1ss` carry NSS1-only
+MCS maps (0xfffe) in the 20MHz join, `wide_phy(one_stream)` (never a
+160MHz candidate) and the interface VHT advertisement; a 40/80MHz
+`N51C` record binds `wide_fingerprint_1ss`. RTL8852B/C bytes are
+unchanged. Unexecuted cases:
+`smoke_rtw8851b_station_offers_one_stream_he_vht`,
+`smoke_rtw8851b_track_layout_is_b_with_v2_dcfo_comp` and the program-record
+case in `smoke_rtw8851b_full_radio_base_record_is_n51b_v2_exact_and_revocable`.
+
+**Remaining for the row.** The one-path antenna-diversity tracker
+(`hal->ant_diversity` from `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`:
+phy.c `rtw89_phy_antdiv_init/_reg_init/_parse/_track/_set_ant`, core.c
+`antdiv_work` and per-PPDU parse) and the matching coexistence/antenna
+settings remain, so `calibration_policy::Board::new_51`,
+`radio_51::prepare_controls` and `Protocol51::init` still refuse
+rfe 3n+2 boards; the row is not complete.
 
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 
