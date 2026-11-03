@@ -76,6 +76,32 @@ impl ResetPolicy {
         })
     }
 
+    /// The MTL/Arrow standalone media GT (media 13.00). hwe->reg_sr of each
+    /// VCS/VECS holds RING_CMD_CCTL (hw_engine_setup_default_state) and the
+    /// oam_mmio_trg_vcs/vecs NONPRIV grants; no engine_was or engine_tunings
+    /// entry matches media 13.00 VCS/VECS (graphics rules never match a media
+    /// GT). guc_mmio_regset_write adds RING_MODE, HWS_PGA and IMR, and skips
+    /// RCU_MODE/CCS_MODE because the media GT has no render reset domain.
+    pub(crate) fn media(platform: GtPlatform, device: u16, engines: EngineSet) -> Option<Self> {
+        if GtPlatform::from_pci(0x8086, device) != Some(platform)
+            || !crate::intel_gpu_gt::media::profile_eligible(platform)
+            || engines.bits() == 0
+            || engines.iter().any(|engine| !engine.is_media())
+        {
+            return None;
+        }
+        Some(Self {
+            platform,
+            device,
+            graphics: 0,
+            step: 0,
+            dss_flags: 0,
+            compute: 0,
+            engines,
+            discontiguous: false,
+        })
+    }
+
     pub(crate) fn matches(self, platform: GtPlatform, engines: EngineSet) -> bool {
         self.platform == platform && self.engines == engines
     }

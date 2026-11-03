@@ -1073,3 +1073,73 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged
 );
+
+/// Once media GuC submission is enabled, xe_guc_tlb_inval.c sends GGTT TLB
+/// invalidation through the media CT (the scheduler's per-context
+/// TLB_INVALIDATION), so arena PTE writes stop writing GUC_TLB_INV_CR on
+/// GT1; disabling submission or unregistering returns to the MMIO path.
+fn smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable() -> TestResult {
+    use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, SharedArena};
+    use narf_capabilities::{Cap, Write};
+    const SENTINEL: u32 = 0x5a5a_5a5a;
+    const MEDIA_INV: u64 = 0x38cee8;
+    const GT0_INV: u64 = 0xcee8;
+    let mut words = alloc::vec![0u32; 4 * 1024 * 1024];
+    let bar = narf_bus::bar::MmioRegion {
+        // Fixture-unique GGTT ledger key; no real device sits here.
+        phys: narf_memory::PhysAddr::new(0x6_fa00_0000),
+        virt: words.as_mut_ptr() as u64,
+        len: 16 << 20,
+        kind: narf_bus::bar::BarKind::Mmio64 {
+            prefetchable: false,
+        },
+    };
+    let load = |reg: u64| {
+        // SAFETY: `words` backs the whole fixture BAR for this test; the
+        // aligned offset selects an in-bounds dword.
+        unsafe { core::ptr::read_volatile((bar.virt + reg) as *const u32) }
+    };
+    let store = |reg: u64, value: u32| {
+        // SAFETY: as above; no arena operation runs concurrently.
+        unsafe { core::ptr::write_volatile((bar.virt + reg) as *mut u32, value) }
+    };
+    store(MEDIA_INV, SENTINEL);
+    store(GT0_INV, SENTINEL);
+    let cap = Cap::<narf_bus::BusDeviceCap, Write>::bootstrap();
+    let arena = SharedArena::new(GgttArena::for_gt(bar, cap, MTL));
+    let mut alloc = arena.clone();
+    // CT mode needs a registered media GuC.
+    kt_assert!(arena.set_media_guc_submission(true).is_err());
+    kt_assert!(arena.set_media_guc_tlb(true).is_ok());
+    kt_assert!(arena.set_media_guc_submission(true).is_ok());
+    kt_assert!(arena.media_guc_tlb() && arena.media_guc_ct());
+    let Ok(first) = alloc.alloc(1) else {
+        return TestResult::Fail("fixture arena refused its first page");
+    };
+    alloc.free(first);
+    kt_assert_eq!(load(MEDIA_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    // Submission disabled again (stop begins): MMIO invalidation resumes.
+    kt_assert!(arena.set_media_guc_submission(false).is_ok());
+    let Ok(second) = alloc.alloc(1) else {
+        return TestResult::Fail("fixture arena refused a later page");
+    };
+    kt_assert_eq!(load(MEDIA_INV), 1);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    store(MEDIA_INV, SENTINEL);
+    // Unregistering also clears CT mode; GT0 flushes are unchanged.
+    kt_assert!(arena.set_media_guc_submission(true).is_ok());
+    kt_assert!(arena.set_media_guc_tlb(false).is_ok());
+    kt_assert!(!arena.media_guc_ct());
+    alloc.free(second);
+    kt_assert_eq!(load(MEDIA_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(arena.live_allocations(), 0);
+    drop((arena, alloc));
+    drop(words);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gt_shared_ggtt_ct_mode_after_submission_enable
+);

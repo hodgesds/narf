@@ -851,6 +851,11 @@ pub struct GgttArena {
     /// The MTL/Arrow media GuC (GT1) may cache translations of this shared
     /// GGTT. Set by its owner before firmware DMA, cleared after verified stop.
     media_guc: bool,
+    /// Media GuC submission is enabled: like xe_guc_tlb_inval.c::
+    /// send_tlb_inval_ggtt with CT and submission enabled, its GGTT TLB is
+    /// invalidated through the media CT (TLB_INVALIDATION, XE_GUC_TLB_INVAL_GUC)
+    /// before every context registration and after deregistration, not MMIO.
+    media_guc_ct: bool,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -914,6 +919,7 @@ impl GgttArena {
             ggtt_ledger: crate::intel_gpu_ggtt_ranges::Ledger::for_bar(bar.phys.raw(), bar.len)
                 .ok(),
             media_guc: false,
+            media_guc_ct: false,
         }
     }
 
@@ -1042,7 +1048,7 @@ impl GgttArena {
         if let Some(window) = &self.authority {
             let _ = window.read32(pte_byte);
             let _ = window.read32(0x1901f8);
-            if self.media_guc {
+            if self.media_guc && !self.media_guc_ct {
                 // xe_ggtt.c::xe_ggtt_invalidate: each GT of a tile has its own
                 // GGTT TLB. Without media GuC submission,
                 // xe_guc_tlb_inval.c::send_tlb_inval_ggtt writes the media
@@ -1253,12 +1259,33 @@ impl SharedArena {
             return Err(SubmitError::NoEngine);
         }
         arena.media_guc = live;
+        arena.media_guc_ct = false;
+        Ok(())
+    }
+
+    /// Switch the registered media GuC's GGTT invalidation between the MMIO
+    /// GUC_TLB_INV_CR (`false`) and its CT TLB_INVALIDATION action (`true`),
+    /// as xe_guc_tlb_inval.c::send_tlb_inval_ggtt selects on
+    /// `xe_guc_ct_enabled && submission_state.enabled`. The media scheduler
+    /// invalidates through its CT before registering and after deregistering
+    /// every context, so CT mode needs no arena-side MMIO write.
+    pub(crate) fn set_media_guc_submission(&self, enabled: bool) -> Result<(), SubmitError> {
+        let mut arena = self.inner.lock();
+        if arena.retired || arena.authority.is_none() || !arena.media_guc {
+            return Err(SubmitError::NoEngine);
+        }
+        arena.media_guc_ct = enabled;
         Ok(())
     }
 
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn media_guc_tlb(&self) -> bool {
         self.inner.lock().media_guc
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn media_guc_ct(&self) -> bool {
+        self.inner.lock().media_guc_ct
     }
 
     pub(crate) fn retire_ggtt(&self) -> Result<(), SubmitError> {

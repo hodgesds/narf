@@ -436,17 +436,46 @@ pub(crate) fn media_ring(
     image: u32,
     seq: u32,
 ) -> Vec<u32> {
+    media_ring_at(engine, 0, batch, user_fence, image, seq)
+}
+
+/// `media_ring` for a GT whose MMIO is adjusted by `adj_offset`:
+/// xe_ring_ops.c::emit_aux_table_inv writes `reg.addr + gt->mmio.adj_offset`,
+/// so the MTL/Arrow standalone media GT invalidates VD0/VE0_AUX_INV at the
+/// media GSI base. has_aux_ccs holds there: mtl_desc has no flat CCS and
+/// graphics is below 20.
+pub(crate) fn media_ring_at(
+    engine: Engine,
+    adj_offset: u32,
+    batch: Option<u64>,
+    user_fence: Option<(u64, u64)>,
+    image: u32,
+    seq: u32,
+) -> Vec<u32> {
     let mut words = copy_ring(batch, user_fence, image, seq);
     words.splice(
         2..2,
         [
             0x11020001, // MMIO_REMAP_EN bit17; ADD_CS_MMIO_START bit19 is absent.
-            if engine.is_decode() { 0x4218 } else { 0x4238 },
+            adj_offset + if engine.is_decode() { 0x4218 } else { 0x4238 },
             1,
             0,
         ],
     );
     words
+}
+
+/// Default media LRC seed (xe_gt.c::emit_wa_job over hwe->reg_lrc). Gen12's
+/// single GT matches graphics1200 lrc_was on its media engines. On the
+/// MTL/Arrow standalone media GT no lrc_was, lrc_tunings or default LRC state
+/// entry matches VCS/VECS (xe_rtp.c: graphics rules never match a media GT,
+/// and no media 13.00 LRC rule exists), so the WA job is empty.
+pub(crate) fn media_seed(platform: GtPlatform) -> Vec<u32> {
+    if platform.is_gen12() {
+        gen12_nonrender_seed()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Inverted pre-XeHP fuse polarity: bits0..7 VDBOX,16..19 VEBOX.
@@ -531,7 +560,9 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
     let mut first: Vec<u32> = alloc::vec![
         0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4,
     ];
-    if xe2 || engine.is_compute() {
+    // dg2_xcs_offsets (graphics >= 12.55) also serves VCS/VECS on the MTL
+    // media GT: xe_lrc.c::reg_offsets keys on the device graphics IP.
+    if xe2 || engine.is_compute() || (engine.is_media() && !platform.is_gen12()) {
         first.extend_from_slice(&[0x120, 0x124]);
     }
     let second: &[u32] = if xe2 {

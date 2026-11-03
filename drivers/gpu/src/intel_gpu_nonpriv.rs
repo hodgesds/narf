@@ -20,6 +20,21 @@ const ALLOWED: [u32; 3] = [0x1000_dafc, 0x1000_db01, 0x0000_db1c];
 // xe_reg_whitelist.c Wa14019159160, graphics2004 before B0.
 const PTL_RCS: [u32; 5] = [0x00006210, 0x000062a8, 0x1000dafc, 0x1000db01, 0x0000db1c];
 const LNL_A0: [u32; 4] = [0x0000_23fc, 0x1000_dafc, 0x1000_db01, 0x0000_db1c];
+/// oam_mmio_trg_vcs/vecs (media >= 13.00): WHITELIST_OAM_MMIO_TRG over
+/// XE_OAM_{SAG,SCMI_0,SCMI_1}_BASE_ADJ (MEDIA_GT_GSI_OFFSET + 0x13000/0x14000/
+/// 0x14800), each OAM_STATUS RD, OAM_HEAD_POINTER RD|RANGE_4 and OAM_MMIO_TRG
+/// RW, in the xarray's ascending address order.
+pub(crate) const MEDIA_OAM: [u32; 9] = [
+    0x1039_319c,
+    0x1039_31a1,
+    0x0039_31d0,
+    0x1039_419c,
+    0x1039_41a1,
+    0x0039_41d0,
+    0x1039_489c,
+    0x1039_48a1,
+    0x0039_48d0,
+];
 
 /// RING_FORCE_TO_NONPRIV(base, n) = base + 0x4d0 + 4n; RING_NOPID = base + 0x94.
 #[derive(Copy, Clone, Debug)]
@@ -52,6 +67,8 @@ pub(crate) struct EnginePolicy {
     gen12: bool,
     ptl: bool,
     lnl_pre_b0: bool,
+    /// MTL/Arrow standalone media GT: every VCS/VECS carries the OAM grants.
+    media_gt: bool,
 }
 
 impl EnginePolicy {
@@ -84,6 +101,7 @@ impl EnginePolicy {
                 gen12: true,
                 ptl: false,
                 lnl_pre_b0: false,
+                media_gt: false,
             }),
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
@@ -96,15 +114,40 @@ impl EnginePolicy {
                 gen12: false,
                 ptl: platform.is_ptl(),
                 lnl_pre_b0: platform.is_lnl() && step < 4,
+                media_gt: false,
             }),
             _ => Err(RegisterError::Identity),
         }
     }
 
+    /// VCS/VECS of the MTL/Arrow standalone media GT (xe_reg_whitelist.c
+    /// oam_mmio_trg_vcs/vecs, MEDIA_VERSION_RANGE(1300, ...)). Graphics-rule
+    /// whitelist entries never match a media GT.
+    pub(crate) fn media(
+        platform: GtPlatform,
+        engines: crate::intel_gpu_engine::EngineSet,
+    ) -> Result<Self, RegisterError> {
+        if !crate::intel_gpu_gt::media::profile_eligible(platform)
+            || engines.bits() == 0
+            || engines.iter().any(|engine| !engine.is_media())
+        {
+            return Err(RegisterError::Identity);
+        }
+        Ok(Self {
+            engines,
+            gen12: false,
+            ptl: false,
+            lnl_pre_b0: false,
+            media_gt: true,
+        })
+    }
+
     fn banks(self) -> impl Iterator<Item = Slots> {
         self.engines.iter().map(move |engine| Slots {
             base: engine.base(),
-            allowed: if self.gen12 {
+            allowed: if self.media_gt {
+                &MEDIA_OAM
+            } else if self.gen12 {
                 if engine.simple_ring() {
                     &[]
                 } else {

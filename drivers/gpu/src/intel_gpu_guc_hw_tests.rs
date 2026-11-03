@@ -3510,6 +3510,10 @@ mod bcs8 {
     include!("intel_gpu_bcs8_tests.rs");
 }
 
+mod media_gt_sched {
+    include!("intel_gpu_media_gt_sched_tests.rs");
+}
+
 mod coredump_exec {
     use super::*;
     include!("intel_gpu_coredump_exec_hw_tests.rs");

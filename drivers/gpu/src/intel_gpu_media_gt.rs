@@ -35,7 +35,19 @@
 //! workaround and GuC-sanitize state for one GT0 incarnation and then releases
 //! every wake request it made. The whole media GT path is default-off behind
 //! `narf.intel.media_gt=1` (`requested`). `MediaGuc` below runs the media GuC
-//! and its polled CT; no media engine or UAPI GT is published here.
+//! and its polled CT and schedules the fused VCS/VECS engines:
+//! - xe_hw_engine.c builds GT1's engine list from the media fuses; HWCONFIG is
+//!   GT0-only (xe_guc_hwconfig_init), so the ADS comes from that list
+//!   (xe_guc_ads.c mapping/enable masks, golden LRCs, hwe->reg_sr saves).
+//! - Engine setup holds every VDBOX/VEBOX well: oam_mmio_trg_vcs/vecs
+//!   NONPRIV grants (xe_reg_whitelist.c), xe_hw_engine_enable_ring.
+//! - Default LRCs follow xe_gt_record_default_lrcs with the empty media
+//!   13.00 WA job; video rings follow __emit_job_gen12_video with AUX_INV at
+//!   the media GSI offset (emit_aux_table_inv adds gt->mmio.adj_offset).
+//! - Once submission is enabled the shared GGTT invalidates GT1's TLB
+//!   through the media CT (xe_guc_tlb_inval.c::send_tlb_inval_ggtt).
+//! - Every engine executes and retires a private PPGTT job before
+//!   `MediaGuc::publication` exposes GT1.
 
 use crate::intel_gpu::Generation;
 use crate::intel_gpu_aux::MmioWindow;
@@ -260,6 +272,19 @@ pub(crate) fn engine_domains(engines: EngineSet) -> u16 {
         let first = if engine.is_decode() { 1 } else { 9 };
         domains | 1 << (first + engine.physical_instance())
     })
+}
+
+/// xe_gsc.c::xe_gsc_wa_14015076503 applies only while GSC firmware reports
+/// HECI1_FWSTS1_INIT_COMPLETE. The HECI1 block is absolute (above the GSI
+/// range), so either a BAR or a media GSI window reads the same register.
+pub(crate) fn gsc_firmware_loaded(
+    mmio: &impl MmioWindow,
+) -> Result<bool, crate::intel_gpu_guc_gt::GtError> {
+    let status = mmio.read32(HECI1_FWSTS1);
+    if status == u32::MAX {
+        return Err(crate::intel_gpu_guc_gt::GtError::Unavailable);
+    }
+    Ok(status & HECI1_FWSTS1_INIT_COMPLETE != 0)
 }
 
 /// FORCEWAKE request and acknowledgement registers (pre-GSI) of a domain.
@@ -832,11 +857,13 @@ impl MediaGt {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MediaGucError {
     Gt(crate::intel_gpu_guc_gt::GtError),
-    /// The shared GGTT refused the second-TLB registration.
+    /// The shared GGTT refused the second-TLB registration or its mode.
     Ggtt(crate::intel_gpu_guc_boot::BootError),
+    /// A VDBOX/VEBOX forcewake domain could not be taken for scheduling.
+    Wells(MediaError),
+    /// A default-LRC capture or private PPGTT probe did not retire cleanly.
+    Probe,
     Unavailable,
-    /// The idle media GuC sent an unsolicited CT message.
-    Protocol,
     /// Stop could not be proven; firmware memory and the TLB hook stay held.
     Retained,
     State,
@@ -845,28 +872,69 @@ pub enum MediaGucError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MediaGucState {
     Starting,
-    /// Firmware authenticated and CT enabled through the media mailbox.
+    /// Every published VCS/VECS executed and retired a private PPGTT job;
+    /// GT1 may be exposed to userspace.
     Running,
     Stopping,
-    /// GuC reset proven, CT/ADS/log memory freed, wake released.
+    /// GuC reset and (with a scheduler) media GRDOM_FULL proven, CT/ADS/
+    /// log/LRC memory freed, GT and engine wake released.
     Stopped,
     Retained,
 }
 
+/// Startup progress of the media GuC beneath `MediaGucState::Starting`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Step {
+    /// First firmware boot with the minimal ADS.
+    Boot,
+    /// An earlier owner's VDBOX/VEBOX sleep acknowledgement is settling.
+    SettleWells,
+    /// Engine wells requested; waiting for every acknowledgement.
+    WakeWells,
+    /// Engine policy, ring enable, populated-ADS reload and CT enable.
+    Scheduling,
+    /// Default LRC capture on every engine.
+    Priming,
+    /// One private PPGTT job per engine.
+    Probing,
+    Published,
+}
+
+/// What the media GuC publishes once every engine executed (UAPI gt_id 1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MediaPublication {
+    pub(crate) epoch: u64,
+    pub(crate) engines: EngineSet,
+    pub(crate) gmd: u32,
+    pub(crate) reference_clock: u32,
+}
+
 /// The standalone media GuC of one GT0 incarnation, run through the shared
-/// bare `GuCGt` owner over the media GSI window and shared GGTT arena.
-/// It registers as the arena's second GGTT TLB before firmware DMA and keeps
-/// its GuC-to-host interrupt half masked: its CT is polled. No engine,
-/// context, SLPC or HuC is admitted and no userspace GT is published.
+/// `GuCGt` owner over the media GSI window and shared GGTT arena. It
+/// registers as the arena's second GGTT TLB before firmware DMA, keeps its
+/// GuC-to-host interrupt half masked (its CT is polled), then schedules the
+/// fused VCS/VECS engines. No SLPC or HuC is admitted.
 pub(crate) struct MediaGuc<
     M: MmioWindow + Clone,
     A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
 > {
     gt: crate::intel_gpu_guc_gt::GuCGt<MediaGsi<M>, A>,
+    media: MediaGsi<M>,
     allocator: A,
     registered: bool,
+    /// GGTT invalidation runs through the media CT (submission enabled).
+    submission: bool,
     state: MediaGucState,
+    step: Step,
     error: Option<MediaGucError>,
+    engines: EngineSet,
+    gmd: u32,
+    /// VDBOX/VEBOX domains whose kernel wake request this owner wrote.
+    wells: u16,
+    deadline: u64,
+    defaults: Option<alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>>,
+    probes: alloc::vec::Vec<crate::intel_gpu_exec::PpgttProbeSubmission>,
+    published: Option<MediaPublication>,
 }
 
 impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone> core::fmt::Debug
@@ -875,6 +943,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MediaGuc")
             .field("state", &self.state)
+            .field("step", &self.step)
             .field("error", &self.error)
             .finish_non_exhaustive()
     }
@@ -923,10 +992,20 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         }
         Ok(Self {
             gt,
+            media: MediaGsi::new(bar),
             allocator: hook,
             registered: true,
+            submission: false,
             state: MediaGucState::Starting,
+            step: Step::Boot,
             error: None,
+            engines: facts.engines,
+            gmd: facts.ip.gmd,
+            wells: 0,
+            deadline: 0,
+            defaults: None,
+            probes: alloc::vec::Vec::new(),
+            published: None,
         })
     }
 
@@ -939,55 +1018,42 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         self.error
     }
 
-    /// Advance start, the idle CT drain or stop by one bounded step.
+    /// GT1 as userspace may see it: only while Running, after every engine
+    /// executed and retired its private PPGTT job.
+    pub(crate) fn publication(&self) -> Option<MediaPublication> {
+        (self.state == MediaGucState::Running)
+            .then_some(self.published)
+            .flatten()
+    }
+
+    /// Advance start, scheduling or stop by one bounded step.
     pub(crate) fn poll(
         &mut self,
         now: u64,
-        current: impl FnMut() -> bool,
+        mut current: impl FnMut() -> bool,
     ) -> Poll<Result<MediaGucState, MediaGucError>> {
         use crate::intel_gpu_guc_gt::GtState;
         match self.state {
             MediaGucState::Stopped | MediaGucState::Retained => {
                 return Poll::Ready(Ok(self.state));
             }
-            _ => {}
+            MediaGucState::Stopping => {
+                return match self.gt.poll_with_access(now, &mut current) {
+                    Poll::Pending | Poll::Ready(Ok(_)) if self.gt.state() != GtState::Stopped => {
+                        Poll::Pending
+                    }
+                    Poll::Ready(Err(_)) => {
+                        self.state = MediaGucState::Retained;
+                        Poll::Ready(Err(MediaGucError::Retained))
+                    }
+                    _ => self.finish_stop(),
+                };
+            }
+            MediaGucState::Starting | MediaGucState::Running => {}
         }
-        let polled = self.gt.poll_with_access(now, current);
-        let result = match (self.state, polled) {
-            (_, Poll::Pending) => return Poll::Pending,
-            (MediaGucState::Stopping, Poll::Ready(Ok(GtState::Stopped))) => {
-                if self.allocator.register_media_guc_tlb(false).is_err() {
-                    self.state = MediaGucState::Retained;
-                    return Poll::Ready(Err(MediaGucError::Retained));
-                }
-                self.registered = false;
-                self.state = MediaGucState::Stopped;
-                return Poll::Ready(Ok(self.state));
-            }
-            (MediaGucState::Stopping, Poll::Ready(Ok(_))) => return Poll::Pending,
-            (MediaGucState::Stopping, Poll::Ready(Err(_))) => {
-                self.state = MediaGucState::Retained;
-                return Poll::Ready(Err(MediaGucError::Retained));
-            }
-            (MediaGucState::Starting, Poll::Ready(Ok(GtState::Ready))) => {
-                // xe_guc_hwconfig_init skips non-GT0 GuCs: enable CT directly.
-                self.gt.begin_ct(now).map_err(MediaGucError::Gt)
-            }
-            (MediaGucState::Starting, Poll::Ready(Ok(GtState::CtReady)))
-            | (MediaGucState::Running, Poll::Ready(Ok(GtState::CtReady))) => {
-                self.state = MediaGucState::Running;
-                match self.gt.receive() {
-                    Ok(None) => return Poll::Ready(Ok(self.state)),
-                    Ok(Some(_)) => Err(MediaGucError::Protocol),
-                    Err(error) => Err(MediaGucError::Gt(error)),
-                }
-            }
-            (MediaGucState::Starting, Poll::Ready(Ok(_))) => return Poll::Pending,
-            (_, Poll::Ready(Ok(_))) => Err(MediaGucError::State),
-            (_, Poll::Ready(Err(error))) => Err(MediaGucError::Gt(error)),
-        };
-        match result {
-            Ok(()) => Poll::Pending,
+        match self.advance(now, &mut current) {
+            Ok(true) => Poll::Ready(Ok(self.state)),
+            Ok(false) => Poll::Pending,
             Err(error) => {
                 self.error.get_or_insert(error);
                 self.begin_stop(now);
@@ -996,14 +1062,234 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         }
     }
 
-    /// Begin a verified stop: GuC reset, DMA idle, CT/ADS/log release and
-    /// media wake release, as the shared GuCGt stop path proves for GT0.
+    /// GuCGt proved its stop and released GT wake: release the engine wells
+    /// (a later owner settles their acknowledgements), then the arena hook.
+    fn finish_stop(&mut self) -> Poll<Result<MediaGucState, MediaGucError>> {
+        for domain in domains_rev(self.wells) {
+            self.media.write32(domain_registers(domain).0, KERNEL_SLEEP);
+        }
+        self.wells = 0;
+        if self.allocator.register_media_guc_tlb(false).is_err() {
+            self.state = MediaGucState::Retained;
+            return Poll::Ready(Err(MediaGucError::Retained));
+        }
+        self.registered = false;
+        self.submission = false;
+        self.state = MediaGucState::Stopped;
+        Poll::Ready(Ok(self.state))
+    }
+
+    fn advance(
+        &mut self,
+        now: u64,
+        current: &mut impl FnMut() -> bool,
+    ) -> Result<bool, MediaGucError> {
+        use crate::intel_gpu_guc_gt::GtState;
+        let polled = match self.gt.poll_with_access(now, &mut *current) {
+            Poll::Pending => return Ok(false),
+            Poll::Ready(result) => result.map_err(MediaGucError::Gt)?,
+        };
+        match (self.step, polled) {
+            (Step::Boot, GtState::Ready) => {
+                // xe_guc_hwconfig_init skips non-GT0 GuCs: no HWCONFIG.
+                self.deadline = now.checked_add(WAKE_NS).ok_or(MediaGucError::State)?;
+                self.step = Step::SettleWells;
+                self.request_wells(now)
+            }
+            (Step::SettleWells, GtState::Ready) => self.request_wells(now),
+            (Step::WakeWells, GtState::Ready) => {
+                let mask = engine_domains(self.engines);
+                for domain in domains(mask) {
+                    if read(&self.media, domain_registers(domain).1)
+                        .map_err(MediaGucError::Wells)?
+                        & 1
+                        == 0
+                    {
+                        return if now >= self.deadline {
+                            Err(MediaGucError::Wells(MediaError::Timeout))
+                        } else {
+                            Ok(false)
+                        };
+                    }
+                }
+                self.gt
+                    .begin_media_scheduling(self.engines, mask)
+                    .map_err(MediaGucError::Gt)?;
+                self.step = Step::Scheduling;
+                Ok(false)
+            }
+            (Step::Scheduling, GtState::Ready) => {
+                self.gt.begin_ct(now).map_err(MediaGucError::Gt)?;
+                Ok(false)
+            }
+            (Step::Scheduling, GtState::SchedulingReady) => {
+                // Submission is enabled: GGTT invalidation now runs through
+                // this CT (xe_guc_tlb_inval.c::send_tlb_inval_ggtt).
+                self.allocator
+                    .media_guc_submission(true)
+                    .map_err(MediaGucError::Ggtt)?;
+                self.submission = true;
+                self.defaults = Some(
+                    self.gt
+                        .begin_media_context_defaults(now)
+                        .map_err(MediaGucError::Gt)?,
+                );
+                self.step = Step::Priming;
+                Ok(false)
+            }
+            (Step::Priming, GtState::SchedulingReady) => {
+                match self.defaults.as_ref().and_then(|fence| fence.result()) {
+                    None => return Ok(false),
+                    Some(Ok(())) => {}
+                    Some(Err(_)) => return Err(MediaGucError::Probe),
+                }
+                self.defaults = None;
+                for engine in self.engines.iter() {
+                    let probe = self
+                        .gt
+                        .submit_ppgtt_probe_on(now, engine)
+                        .map_err(MediaGucError::Gt)?;
+                    self.probes.push(probe);
+                }
+                self.step = Step::Probing;
+                Ok(false)
+            }
+            (Step::Probing, GtState::SchedulingReady) => {
+                for probe in &self.probes {
+                    match probe.completion.result() {
+                        None => return Ok(false),
+                        Some(Ok(())) => {}
+                        Some(Err(_)) => return Err(MediaGucError::Probe),
+                    }
+                }
+                // Every fence signals only after deregistration and the final
+                // TLB acknowledgement: each job fully retired. Its private
+                // store must also have landed through its own PPGTT.
+                if self
+                    .probes
+                    .iter()
+                    .any(|probe| probe.result.verify().is_err())
+                    || !self.gt.idle()
+                {
+                    return Err(MediaGucError::Probe);
+                }
+                self.probes.clear();
+                let epoch = self.gt.user_epoch().ok_or(MediaGucError::State)?;
+                let reference_clock = self.gt.media_reference_clock().map_err(MediaGucError::Gt)?;
+                self.published = Some(MediaPublication {
+                    epoch,
+                    engines: self.engines,
+                    gmd: self.gmd,
+                    reference_clock,
+                });
+                self.step = Step::Published;
+                self.state = MediaGucState::Running;
+                Ok(true)
+            }
+            (Step::Published, GtState::SchedulingReady) => Ok(true),
+            (
+                Step::Boot | Step::SettleWells | Step::WakeWells | Step::Scheduling,
+                GtState::Waking
+                | GtState::Booting
+                | GtState::PreparingScheduling
+                | GtState::StartingScheduling
+                | GtState::EnablingCt,
+            ) => Ok(false),
+            _ => Err(MediaGucError::State),
+        }
+    }
+
+    /// Take every present engine's VDBOX/VEBOX domain, after any sleep
+    /// acknowledgement of an earlier owner settled (xe_force_wake.c bounds).
+    fn request_wells(&mut self, now: u64) -> Result<bool, MediaGucError> {
+        let mask = engine_domains(self.engines);
+        for domain in domains(mask) {
+            let (request, ack) = domain_registers(domain);
+            if read(&self.media, request).map_err(MediaGucError::Wells)? & 1 != 0 {
+                return Err(MediaGucError::Wells(MediaError::Busy));
+            }
+            if read(&self.media, ack).map_err(MediaGucError::Wells)? & 1 != 0 {
+                return if now >= self.deadline {
+                    Err(MediaGucError::Wells(MediaError::Timeout))
+                } else {
+                    Ok(false)
+                };
+            }
+        }
+        for domain in domains(mask) {
+            self.media.write32(domain_registers(domain).0, KERNEL_WAKE);
+            self.wells |= 1 << domain;
+        }
+        for domain in domains(mask) {
+            let _ = self.media.read32(domain_registers(domain).0); // posting read
+        }
+        self.deadline = now.checked_add(WAKE_NS).ok_or(MediaGucError::State)?;
+        self.step = Step::WakeWells;
+        Ok(false)
+    }
+
+    /// Queue an untrusted user batch on a published VCS/VECS. The context's
+    /// epoch is GT1's; GT0's epoch never admits it.
+    pub(crate) fn submit_user(
+        &mut self,
+        now: u64,
+        context: alloc::sync::Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
+    ) -> Result<
+        (
+            u16,
+            alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>,
+        ),
+        crate::intel_gpu_guc_gt::GtError,
+    > {
+        let publication = self
+            .publication()
+            .ok_or(crate::intel_gpu_guc_gt::GtError::State)?;
+        if !context
+            .placements()
+            .iter()
+            .all(|engine| publication.engines.contains(engine))
+        {
+            return Err(crate::intel_gpu_guc_gt::GtError::State);
+        }
+        let result = match output {
+            Some(output) => self
+                .gt
+                .submit_user_batch_with_output(now, context, batch, output),
+            None => self.gt.submit_user_batch(now, context, batch),
+        };
+        if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Lost {
+            self.error.get_or_insert(MediaGucError::Gt(
+                result
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or(crate::intel_gpu_guc_gt::GtError::State),
+            ));
+            self.begin_stop(now);
+        }
+        result
+    }
+
+    /// Begin a verified stop: unpublish, return GGTT invalidation to MMIO,
+    /// then GuC reset, media GRDOM_FULL with a scheduler, DMA idle, CT/ADS/
+    /// log/LRC release and GT wake release, as the shared GuCGt proves for
+    /// GT0. Engine wells are released after that proof.
     pub(crate) fn begin_stop(&mut self, now: u64) {
         if matches!(
             self.state,
             MediaGucState::Stopping | MediaGucState::Stopped | MediaGucState::Retained
         ) {
             return;
+        }
+        self.published = None;
+        self.defaults = None;
+        if self.submission {
+            // Linux's GGTT invalidation reverts to MMIO once submission stops.
+            if self.allocator.media_guc_submission(false).is_ok() {
+                self.submission = false;
+            }
         }
         if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Stopped {
             self.state = MediaGucState::Stopping;

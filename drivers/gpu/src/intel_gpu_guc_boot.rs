@@ -93,6 +93,11 @@ pub trait BootAllocator: GpuAllocator {
     fn register_media_guc_tlb(&mut self, _live: bool) -> Result<(), BootError> {
         Err(BootError::Cache)
     }
+    /// Select CT (`true`) or MMIO GGTT TLB invalidation for the registered
+    /// media GuC once its submission is enabled or disabled again.
+    fn media_guc_submission(&mut self, _enabled: bool) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
 
     fn configure_cache(
         &mut self,
@@ -120,6 +125,10 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
     }
     fn register_media_guc_tlb(&mut self, live: bool) -> Result<(), BootError> {
         self.set_media_guc_tlb(live).map_err(BootError::Allocation)
+    }
+    fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
+        self.set_media_guc_submission(enabled)
+            .map_err(BootError::Allocation)
     }
 
     fn configure_cache(
@@ -570,17 +579,33 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         A: Clone,
     {
         if self.state != BootState::Ready
-            || (self.platform.has_hwconfig() && self.hwconfig.is_none())
+            || (self.needs_hwconfig() && self.hwconfig.is_none())
             || self.submission_version.0 != 1
         {
             return Err(BootError::Unsupported);
         }
-        crate::intel_gpu_guc_sched::GuCScheduler::allocate(
-            self.resources.allocator.clone(),
-            self.platform,
-            engines,
-        )
+        let allocator = self.resources.allocator.clone();
+        match self.role {
+            GuCRole::Primary => crate::intel_gpu_guc_sched::GuCScheduler::allocate(
+                allocator,
+                self.platform,
+                engines,
+            ),
+            // xe_hw_engine.c builds GT1's engines from the media fuses and
+            // xe_guc_ads.c its ADS from that list; HWCONFIG is GT0-only.
+            GuCRole::Media(_) => crate::intel_gpu_guc_sched::GuCScheduler::allocate_media(
+                allocator,
+                self.platform,
+                engines,
+            ),
+        }
         .map_err(BootError::Scheduling)
+    }
+
+    /// xe_guc_hwconfig_init skips every non-GT0 GuC: only the primary GuC of
+    /// a HWCONFIG platform must hold the table before scheduling.
+    fn needs_hwconfig(&self) -> bool {
+        self.role == GuCRole::Primary && self.platform.has_hwconfig()
     }
 
     pub(crate) fn begin_scheduling(
@@ -589,7 +614,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         now: u64,
     ) -> Result<(), BootError> {
         if self.state != BootState::Ready
-            || (self.platform.has_hwconfig() && self.hwconfig.is_none())
+            || (self.needs_hwconfig() && self.hwconfig.is_none())
             || self.scheduling.is_some()
         {
             return Err(BootError::State);
@@ -1372,6 +1397,8 @@ mod tests {
         // it was first registered (before any firmware address publication).
         media_tlb: Option<bool>,
         media_tlb_at: Option<usize>,
+        // Media GuC GGTT invalidation mode: CT (submission enabled) or MMIO.
+        media_ct: Option<bool>,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
@@ -1621,6 +1648,16 @@ mod tests {
                 device.media_tlb_at = Some(device.writes.len());
             }
             device.media_tlb = Some(live);
+            device.media_ct = None;
+            Ok(())
+        }
+
+        fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
+            let mut device = self.0.borrow_mut();
+            if device.media_tlb != Some(true) {
+                return Err(BootError::Cache);
+            }
+            device.media_ct = Some(enabled);
             Ok(())
         }
 
@@ -3142,22 +3179,18 @@ mod tests {
         window.0.borrow_mut().regs.insert(0x38c314, 0x10);
         assert!(guc.poll(4, || true).is_pending());
         window.0.borrow_mut().regs.insert(0x38c000, 0x8000f000);
-        // Ready -> CT enable through the media mailbox.
+        // Ready -> the fused VDBOX0 and VEBOX0 wells are requested for
+        // media scheduling; no CT is enabled before the scheduling reload
+        // and nothing is published while starting.
         assert!(guc.poll(5, || true).is_pending());
-        for i in 0..6 {
-            window.0.borrow_mut().regs.insert(0x190310, 0xf0000001);
-            assert!(guc.poll(6 + i, || true).is_pending());
+        {
+            let device = window.0.borrow();
+            assert_eq!(device.regs[&0x38a540], 0x0001_0001);
+            assert_eq!(device.regs[&0x38a560], 0x0001_0001);
+            assert!(!device.writes.iter().any(|(reg, _)| *reg == 0x190304));
         }
-        window.0.borrow_mut().regs.insert(0x190310, 0xf0000000);
-        assert_eq!(
-            guc.poll(12, || true),
-            Poll::Ready(Ok(MediaGucState::Running))
-        );
-        // An idle running GuC with an empty G2H ring stays running.
-        assert_eq!(
-            guc.poll(13, || true),
-            Poll::Ready(Ok(MediaGucState::Running))
-        );
+        assert_eq!(guc.state(), MediaGucState::Starting);
+        assert_eq!(guc.publication(), None);
         // Current loss is a GT error; the owner then proves its stop.
         assert!(matches!(
             guc.poll(14, || false),
@@ -3173,6 +3206,12 @@ mod tests {
             Poll::Ready(Ok(MediaGucState::Stopped))
         );
         assert!(guc.reclaimable());
+        // Engine wells are released only after the proven GuC stop.
+        {
+            let device = window.0.borrow();
+            assert_eq!(device.regs[&0x38a540], 0x0001_0000);
+            assert_eq!(device.regs[&0x38a560], 0x0001_0000);
+        }
         assert_eq!(window.0.borrow().media_tlb, Some(false));
         assert_eq!(guc.error(), Some(MediaGucError::Gt(GtError::Unavailable)));
         drop(guc);

@@ -302,11 +302,13 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     /// Captured only on an actual failure, before disable can provoke reset.
     pending_error: Option<Report>,
     reset_policy: Option<crate::intel_gpu_reset_policy::ResetPolicy>,
+    /// The MTL/Arrow standalone media GT (GT1): VCS/VECS only, no RCS0.
+    media_gt: bool,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
     pub(crate) fn allocate(
-        mut allocator: A,
+        allocator: A,
         platform: GtPlatform,
         engines: EngineSet,
     ) -> Result<Self, SchedulingError> {
@@ -316,6 +318,32 @@ impl<A: BootAllocator> GuCScheduler<A> {
         {
             return Err(SchedulingError::State);
         }
+        Self::allocate_engines(allocator, platform, engines, false)
+    }
+
+    /// Scheduler of the MTL/Arrow standalone media GuC. Linux builds its
+    /// engine list from the media fuses (xe_hw_engine.c::read_media_fuses) and
+    /// never reads HWCONFIG on GT1; every engine is a present VCS/VECS.
+    pub(crate) fn allocate_media(
+        allocator: A,
+        platform: GtPlatform,
+        engines: EngineSet,
+    ) -> Result<Self, SchedulingError> {
+        if !crate::intel_gpu_gt::media::profile_eligible(platform)
+            || engines.bits() == 0
+            || engines.iter().any(|engine| !engine.is_media())
+        {
+            return Err(SchedulingError::State);
+        }
+        Self::allocate_engines(allocator, platform, engines, true)
+    }
+
+    fn allocate_engines(
+        mut allocator: A,
+        platform: GtPlatform,
+        engines: EngineSet,
+        media_gt: bool,
+    ) -> Result<Self, SchedulingError> {
         let mut owned: Vec<A::Backing> = Vec::new();
         let release = |allocator: &mut A, owned: Vec<A::Backing>| {
             for backing in owned.into_iter().rev() {
@@ -390,6 +418,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             disable_wmtp: false,
             pending_error: None,
             reset_policy: None,
+            media_gt,
         })
     }
 
@@ -599,6 +628,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         now: u64,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         self.admit()?;
+        if !self.engines.contains(Engine::Rcs0) {
+            return Err(SchedulingError::State);
+        }
         self.submit(now, Engine::Rcs0, None, None)
     }
 
@@ -798,11 +830,37 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if !self.can_prime() {
             return Err(SchedulingError::Busy);
         }
+        if self.media_gt {
+            return Err(SchedulingError::State);
+        }
         self.disable_wmtp = seed.disable_wmtp;
         let (id, _) = self.submit(now, Engine::Rcs0, None, Some(seed.commands()))?;
         let completion = Arc::new(CompletionFence::new());
         self.resources.defaults_completion = Some(completion.clone());
         self.defaults = Defaults::Seed(Engine::Rcs0, id);
+        Ok(completion)
+    }
+
+    /// Record the media GT's default LRCs (xe_gt.c::xe_gt_record_default_lrcs
+    /// on GT1): each present VCS/VECS runs its WA job, a different context
+    /// then switches it out, and the retired image becomes the golden state,
+    /// in `Engine::ALL` order. The media 13.00 WA job is empty (`media_seed`).
+    pub(crate) fn begin_media_defaults(
+        &mut self,
+        now: u64,
+    ) -> Result<Arc<CompletionFence>, SchedulingError> {
+        if !self.media_gt {
+            return Err(SchedulingError::State);
+        }
+        if !self.can_prime() {
+            return Err(SchedulingError::Busy);
+        }
+        let first = self.engines.iter().next().ok_or(SchedulingError::State)?;
+        let seed = crate::intel_gpu_engine::media_seed(self.platform);
+        let (id, _) = self.submit(now, first, None, Some(seed))?;
+        let completion = Arc::new(CompletionFence::new());
+        self.resources.defaults_completion = Some(completion.clone());
+        self.defaults = Defaults::Seed(first, id);
         Ok(completion)
     }
 
@@ -976,8 +1034,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
             if engine.is_media() {
-                crate::intel_gpu_engine::media_ring(
+                // The standalone media GT's AUX_INV sits at its GSI base.
+                crate::intel_gpu_engine::media_ring_at(
                     engine,
+                    if self.media_gt {
+                        crate::intel_gpu_gt::media::GSI_OFFSET as u32
+                    } else {
+                        0
+                    },
                     (!batch.skip_batch()).then_some(batch.address()),
                     batch.user_fence().filter(|_| width == 1),
                     image.ggtt_offset(),
@@ -1203,7 +1267,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             let seed = if engine.is_copy() {
                 crate::intel_gpu_engine::copy_seed(engine, self.platform)
             } else if engine.is_media() {
-                crate::intel_gpu_engine::gen12_nonrender_seed()
+                crate::intel_gpu_engine::media_seed(self.platform)
             } else {
                 crate::intel_gpu_engine::compute_seed(engine, self.platform, self.disable_wmtp)
             };

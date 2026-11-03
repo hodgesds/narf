@@ -2286,7 +2286,7 @@ impl Owner {
                 if !core::mem::replace(&mut state.media_guc_reported, true) {
                     log(
                         self.pending.index,
-                        "media GuC running; CT polled via the media mailbox; no media engine published",
+                        "media GuC scheduling; every VCS/VECS retired a private PPGTT job",
                     );
                 }
             }
