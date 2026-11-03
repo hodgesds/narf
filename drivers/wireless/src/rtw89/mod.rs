@@ -47,6 +47,8 @@
 
 extern crate alloc;
 
+mod ap_ps;
+mod ap_wire;
 mod bdram;
 mod block_ack;
 mod bootstrap;
