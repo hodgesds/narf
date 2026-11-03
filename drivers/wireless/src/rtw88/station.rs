@@ -912,6 +912,12 @@ impl State {
             .run(|| Ok(io.packet_prepare(self.own, 0)))??;
         self.prepared = true;
         self.admission.run(|| Ok(io.packet_start()))??;
+        // USB opens CR/TXPAUSE over asynchronous EP0 (PCI: in packet_start).
+        let admission = self.admission.clone();
+        crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
+            Ok(io.packet_open().await)
+        })
+        .await??;
         self.last_now = self.environment.now_ms();
         self.phase = Phase::Passive;
         self.local_ht = io.station_ht_facts().and_then(super::ht::Facts::local);
@@ -966,6 +972,15 @@ impl State {
         }
         Ok(())
     }
+    /// Asynchronous counterpart run before [`State::stop`] where the caller
+    /// can await: `Io::packet_close` (USB TXPAUSE/CR over EP0 and bulk
+    /// receipt retirement; PCI closes inside `packet_stop`).
+    pub(super) async fn close_packets(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if self.prepared {
+            io.packet_close().await?;
+        }
+        Ok(())
+    }
     fn fail(&mut self, io: &mut impl Io) {
         let _ = self.stop(io);
         self.phase = Phase::Failed;
@@ -997,10 +1012,12 @@ impl State {
         } else {
             Ok(())
         };
+        let closed = self.close_packets(io).await;
         let stopped = self.stop(io);
         attempt.armed = false;
         drop(reservation);
         control?;
+        closed?;
         stopped
     }
     /// `rx.c::rtw_rx_addr_match_iter`: peer frames to us (or its beacons).

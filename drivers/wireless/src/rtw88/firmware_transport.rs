@@ -709,6 +709,26 @@ pub(super) unsafe trait Io: Send {
     fn packet_start(&mut self) -> Result<(), super::packet_core::Error> {
         Err(super::packet_core::Error::State)
     }
+    /// Asynchronous MAC open after [`Io::packet_start`], before any packet
+    /// is submitted. PCI opens CR/TXPAUSE inside its synchronous
+    /// `packet_start` (default: nothing left to do); USB writes CR = 0xff and
+    /// TXPAUSE = 0 over asynchronous EP0 here.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn packet_open(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), super::packet_core::Error>> + Send {
+        async move { Ok(()) }
+    }
+    /// Asynchronous MAC close before the synchronous [`Io::packet_stop`].
+    /// PCI closes inside `packet_stop` (default: nothing to do here); USB
+    /// pauses TX, closes CR's MAC/DMA gates over EP0 and retires every
+    /// retained bulk receipt, so its `packet_stop` need not fail closed.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn packet_close(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), super::packet_core::Error>> + Send {
+        async move { Ok(()) }
+    }
     fn packet_ready(&self) -> bool {
         false
     }
@@ -1011,6 +1031,7 @@ impl<I: Io> Owner<I> {
     /// Closes the station first; success lets Drop free every mapping.
     pub(super) async fn quiesce_dma(&mut self) -> Result<(), Error> {
         if let Some(station) = self.station.as_deref_mut() {
+            let _ = station.close_packets(&mut self.io).await;
             let _ = station.stop(&mut self.io);
         }
         self.phase = Phase::Failed;

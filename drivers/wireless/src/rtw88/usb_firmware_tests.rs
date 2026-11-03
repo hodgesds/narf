@@ -338,3 +338,52 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_efuse_factory_async
 );
+
+/// `packet_open`/`packet_close` (PCI `Port::start`/`Port::stop` MAC gates
+/// over EP0): open refuses without the station gate; close pauses TX,
+/// closes CR's MAC/DMA bits and retires the packet owner, after which
+/// `packet_stop` records the stop without failing the backend closed and
+/// no frame is admitted.
+fn smoke_rtw88_usb_packet_open_close_async() -> TestResult {
+    let fake = Fake::default();
+    let mut b = backend(&fake);
+    if complete(b.packet_open()).is_ok() {
+        return TestResult::Fail("open without packets");
+    }
+    if b.opened_for_test([0x02, 0, 0, 0, 0, 1]).is_err() {
+        return TestResult::Fail("fixture");
+    }
+    if complete(b.packet_open()).is_ok() {
+        return TestResult::Fail("reopen");
+    }
+    {
+        let mut m = fake.0.lock();
+        m.regs.insert(0x100, 0xff);
+        m.regs.insert(0x522, 0);
+    }
+    if complete(b.packet_close()).is_err() {
+        return TestResult::Fail("close");
+    }
+    {
+        let m = fake.0.lock();
+        if m.regs.get(&0x100).copied().unwrap_or(0xff) & 0xcf != 0
+            || m.regs.get(&0x522).copied() != Some(0xff)
+        {
+            return TestResult::Fail("MAC left open");
+        }
+    }
+    if b.packet_ready() || b.packet_submit(&[0; 24], false).is_ok() {
+        return TestResult::Fail("closed owner admits frames");
+    }
+    if b.packet_stop().is_err() || complete(b.packet_close()).is_err() {
+        return TestResult::Fail("stop after close");
+    }
+    if complete(b.quiesce_dma()).is_err() || !b.dma_reclaimable() {
+        return TestResult::Fail("quiesce after close");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_packet_open_close_async
+);

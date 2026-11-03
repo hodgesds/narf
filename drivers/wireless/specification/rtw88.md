@@ -3237,12 +3237,25 @@ grant is published. Remaining blockers, verified against the tree:
    block-descriptor count and TXDMA_OFFSET_CHK+1 BIT(1) before LLT init
    (`rtw_set_trx_fifo_info`) and ends with `rtw_usb_init_burst_pkt_len`
    (`rtw_mac_init` -> `rtw_hci_interface_cfg`); USB is refused for C22 and
-   the PCIe byte stream is unchanged. Not yet bound: `station_*` grant
-   hooks (trait `Unsupported` defaults), the asynchronous CR/TXPAUSE open
-   before `packet_start`, and `packet_stop` (synchronous, so it fails the
-   backend closed and leaves receipt retirement to `quiesce_dma`). Written,
-   unexecuted: `smoke_rtw88_usb_firmware_reserved_page_sequence`,
-   `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`.
+   the PCIe byte stream is unchanged. Packet open/close (landed):
+   `Io::packet_open`/`Io::packet_close` are asynchronous hooks (default
+   `Ok`, so PCI, which opens and closes inside its synchronous
+   `packet_start`/`packet_stop`, is unchanged). `station::State::start`
+   awaits `packet_open` right after `packet_start` inside the admission
+   (`enclosed`); `disconnect` and `Owner::quiesce_dma` await
+   `State::close_packets` before the synchronous `stop`. The USB backend's
+   `packet_open` is the PCI `Port::start` MAC open over EP0 (CR = 0xff,
+   TXPAUSE = 0, both read back; the station gate must be current), and
+   `packet_submit`/`packet_ready` require it. `packet_close` writes
+   TXPAUSE = 0xff, clears CR & 0xcf, verifies both, and retires every packet
+   bulk receipt (`rtw_usb_cancel_rx_bufs`/TX purge) even when the register
+   close failed; on success the backend is `Closed` and `packet_stop` only
+   records it (it fails the backend closed only when no asynchronous close
+   ran, leaving retirement to `quiesce_dma`). Not yet bound: `station_*`
+   grant hooks (trait `Unsupported` defaults). Written, unexecuted:
+   `smoke_rtw88_usb_firmware_reserved_page_sequence`,
+   `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`,
+   `smoke_rtw88_usb_packet_open_close_async`.
    USB EFUSE (landed): `efuse::read_factory8821c_usb` runs the
    `rtw_dump_physical_efuse_map` sequence of the synchronous PCI reader
    (bank 0, programming LDO off, per-byte REG_EFUSE_CTRL address write and

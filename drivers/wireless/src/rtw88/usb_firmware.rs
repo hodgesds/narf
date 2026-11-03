@@ -49,7 +49,11 @@ enum State {
     Calibration8821cPrepared,
     Operating8821cPrepared,
     Calibrated,
+    /// Bulk-IN receipt posted; `opened` once CR/TXPAUSE are open.
     Packets,
+    /// `packet_close` paused TX, closed CR's MAC/DMA gates and retired every
+    /// packet receipt; `packet_stop` and `quiesce_dma` only record it.
+    Closed,
     Terminal,
 }
 
@@ -102,6 +106,8 @@ pub(super) struct Backend<C: ControlIo, P: Bulk + Clone> {
     mailbox_pending: bool,
     packets: Option<usb_packet::Owner<P>>,
     backlog: Backlog,
+    /// `packet_open` wrote CR = 0xff / TXPAUSE = 0 and read them back.
+    opened: bool,
     reclaimable: bool,
 }
 impl<C: ControlIo, P: Bulk + Clone> core::fmt::Debug for Backend<C, P> {
@@ -135,6 +141,7 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             mailbox_pending: false,
             packets: None,
             backlog: Backlog::default(),
+            opened: false,
             reclaimable: false,
         })
     }
@@ -249,6 +256,21 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
     }
     fn now_us() -> u64 {
         narf_time::monotonic_ns() / 1000
+    }
+    /// Test fixture: an opened packet owner without the signed station
+    /// gate (no receipt posted), so the asynchronous close can be replayed.
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn opened_for_test(&mut self, own: [u8; 6]) -> Result<(), packet_core::Error> {
+        self.packets = Some(usb_packet::Owner::prepare(
+            self.bulk.clone(),
+            self.endpoints,
+            own,
+            0,
+            super::packet_phy::Chip::C21,
+        )?);
+        self.state = State::Packets;
+        self.opened = true;
+        Ok(())
     }
 }
 
@@ -550,8 +572,8 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         if self.state != State::Calibrated {
             return Err(packet_core::Error::State);
         }
-        // Posts the persistent bulk-IN receipt. Opening CR/TXPAUSE needs
-        // asynchronous EP0 and belongs to the USB station front-end.
+        // Posts the persistent bulk-IN receipt; CR/TXPAUSE open in the
+        // asynchronous `packet_open` that follows.
         self.packets
             .as_mut()
             .ok_or(packet_core::Error::State)?
@@ -559,13 +581,83 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         self.state = State::Packets;
         Ok(())
     }
+    /// The PCI `Port::start` MAC open (CR low byte 0xff enables HCI/packet
+    /// DMA and MAC, TXPAUSE 0) over EP0. Linux USB leaves CR at
+    /// `MAC_TRX_ENABLE` from `mac.c::rtw_mac_init`; this backend keeps it
+    /// closed through configuration and opens it only for the station.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn packet_open(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), packet_core::Error>> + Send {
+        async move {
+            if self.state != State::Packets || self.opened || self.outstanding.is_some() {
+                return Err(packet_core::Error::State);
+            }
+            self.gate_current()
+                .map_err(|_| packet_core::Error::Access)?;
+            self.state = State::Terminal;
+            let r = &self.registers;
+            let result = async {
+                r.write8(0x100, 0xff).await?;
+                r.write8(0x522, 0).await?;
+                Ok::<_, usb::Error>(r.read8(0x100).await? == 0xff && r.read8(0x522).await? == 0)
+            }
+            .await;
+            if result != Ok(true) {
+                return Err(packet_core::Error::Access);
+            }
+            self.state = State::Packets;
+            self.opened = true;
+            Ok(())
+        }
+    }
+    /// The PCI `Port::stop` MAC close (TXPAUSE 0xff, CR &= !0xcf) over EP0,
+    /// then `usb.c::rtw_usb_cancel_rx_bufs` and the TX purge: every packet
+    /// bulk receipt is stopped. A failure leaves the backend terminal with
+    /// any unretired receipt for `quiesce_dma`.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn packet_close(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), packet_core::Error>> + Send {
+        async move {
+            if self.packets.is_none() || self.state == State::Closed {
+                return Ok(());
+            }
+            let opened = core::mem::replace(&mut self.opened, false);
+            self.state = State::Terminal;
+            self.backlog = Backlog::default();
+            let r = &self.registers;
+            let closed = async {
+                r.write8(0x522, 0xff).await?;
+                let cr = r.read8(0x100).await?;
+                r.write8(0x100, cr & !0xcf).await?;
+                Ok::<_, usb::Error>(
+                    r.read8(0x100).await? & 0xcf == 0 && r.read8(0x522).await? == 0xff,
+                )
+            }
+            .await;
+            // Receipts are retired even when the register close failed.
+            let owner = self.packets.as_mut().ok_or(packet_core::Error::State)?;
+            owner.stop().await?;
+            if closed != Ok(true) {
+                return Err(if opened {
+                    packet_core::Error::Access
+                } else {
+                    packet_core::Error::State
+                });
+            }
+            self.state = State::Closed;
+            Ok(())
+        }
+    }
     fn packet_ready(&self) -> bool {
         self.state == State::Packets
+            && self.opened
             && self.backlog.is_empty()
             && self.packets.as_ref().is_some_and(usb_packet::Owner::ready)
     }
     fn packet_submit(&mut self, frame: &[u8], report: bool) -> Result<u64, packet_core::Error> {
-        if self.state != State::Packets {
+        if self.state != State::Packets || !self.opened {
             return Err(packet_core::Error::State);
         }
         self.packets
@@ -607,16 +699,22 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         Ok(self.backlog.take())
     }
     fn packet_stop(&mut self) -> Result<(), packet_core::Error> {
-        // Sync stop cannot retire bulk receipts: fail closed and leave them
-        // to `quiesce_dma` (`rtw_usb_cancel_rx_bufs` / tx purge).
         if self.packets.is_none() {
             return Err(packet_core::Error::State);
         }
         self.backlog = Backlog::default();
-        self.state = State::Terminal;
+        self.opened = false;
+        // After `packet_close` the MAC is closed and every receipt retired.
+        // Without it (synchronous failure path) a sync stop cannot retire
+        // bulk receipts: fail closed and leave them to `quiesce_dma`.
+        if self.state != State::Closed {
+            self.state = State::Terminal;
+        }
         Ok(())
     }
     async fn quiesce_dma(&mut self) -> Result<(), Error> {
+        // `Closed` already retired every packet receipt (`Owner::stop` is
+        // idempotent); the backend still ends terminal.
         self.state = State::Terminal;
         if let Some((receipt, _)) = self.outstanding.as_ref() {
             self.bulk.stop(receipt).await.map_err(|_| Error::Access)?;
