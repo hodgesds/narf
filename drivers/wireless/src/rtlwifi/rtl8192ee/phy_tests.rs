@@ -451,3 +451,196 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192ee",
     smoke_rtl8192ee_hw_init_tail_on_model
 );
+
+// ── N92E envelope ─────────────────────────────────────────────────────────
+
+pub(crate) fn envelope_factory() -> crate::rtlwifi::efuse::Factory {
+    let mut logical = [0u8; 512];
+    logical.copy_from_slice(&power_map());
+    crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x81, 0x92, 0x01],
+        logical,
+    }
+}
+
+/// A signed-format `N92E` file for `factory`: rows `(channel, bw, offset)`,
+/// every curve `2 * index - 20` qdBm except the curves `unmeasured`
+/// (`family * 2 + path`) names.
+pub(crate) fn n92e(
+    factory: &crate::rtlwifi::efuse::Factory,
+    rows: &[(u8, u8, u8)],
+    antenna: i16,
+    unmeasured: &[usize],
+) -> Vec<u8> {
+    let row_len = 4 + 8 * 64 * 2;
+    let total = 96 + rows.len() * row_len;
+    let mut b = vec![0u8; total];
+    b[..4].copy_from_slice(b"N92E");
+    b[4..6].copy_from_slice(&1u16.to_le_bytes());
+    b[6..8].copy_from_slice(&96u16.to_le_bytes());
+    b[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    b[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    b[14..16].copy_from_slice(&0x818bu16.to_le_bytes());
+    b[16..48].copy_from_slice(&crate::rtlwifi::radio::factory_identity(factory));
+    b[48..54].copy_from_slice(&factory.mac);
+    b[56..58].copy_from_slice(&antenna.to_le_bytes());
+    b[58..60].copy_from_slice(&100i16.to_le_bytes());
+    b[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    for (r, (channel, bw, offset)) in rows.iter().enumerate() {
+        let at = 96 + r * row_len;
+        b[at] = *channel;
+        b[at + 2] = *bw;
+        b[at + 3] = *offset;
+        for curve in 0..8 {
+            for i in 0..64 {
+                let v = if unmeasured.contains(&curve) {
+                    i16::MAX
+                } else {
+                    2 * i as i16 - 20
+                };
+                let o = at + 4 + (curve * 64 + i) * 2;
+                b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    b
+}
+
+/// `N92E` parse/refusals, per-path admission under the two-chain bound,
+/// partial (MCS8-15) admission, the 40 MHz whole-span ceiling and the
+/// admitted TXAGC writes.
+fn smoke_rtl8192ee_n92e_envelope_permission_and_admission() -> TestResult {
+    use super::envelope::{Calibration, Operating, Width as EnvWidth};
+    use crate::rtlwifi::channel_power::Error as PowerError;
+    use narf_wireless::reg::*;
+    let factory = envelope_factory();
+    let rows = [(6, 20, 0), (1, 40, 1), (11, 40, 2)];
+    // Path B of MCS8-15 (curve 7) unmeasured.
+    let file = n92e(&factory, &rows, 4, &[7]);
+    if Calibration::from_verified(&file, None, &factory).err() != Some(PowerError::Unsigned) {
+        return TestResult::Fail("unsigned envelope admitted");
+    }
+    let mut napc = file.clone();
+    napc[..4].copy_from_slice(b"NAPC");
+    if Calibration::from_verified(&napc, Some([1; 32]), &factory).err() != Some(PowerError::Format)
+    {
+        return TestResult::Fail("foreign magic admitted");
+    }
+    let mut other = envelope_factory();
+    other.mac[5] ^= 1;
+    if Calibration::from_verified(&file, Some([1; 32]), &other).err() != Some(PowerError::Identity)
+    {
+        return TestResult::Fail("foreign identity admitted");
+    }
+    let unordered = n92e(&factory, &[(1, 40, 1), (6, 20, 0)], 4, &[]);
+    if Calibration::from_verified(&unordered, Some([1; 32]), &factory).err()
+        != Some(PowerError::Format)
+    {
+        return TestResult::Fail("unordered rows admitted");
+    }
+    let out_of_plan = n92e(&factory, &[(9, 40, 1)], 4, &[]);
+    if Calibration::from_verified(&out_of_plan, Some([1; 32]), &factory).err()
+        != Some(PowerError::Format)
+    {
+        return TestResult::Fail("40 MHz above channel 9 (span past 2472) admitted");
+    }
+    let Ok(cal) = Calibration::from_verified(&file, Some([1; 32]), &factory) else {
+        return TestResult::Fail("envelope rejected");
+    };
+    let rule = |start, end, bw, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bw,
+        max_power_dbm: 20,
+        flags,
+    };
+    let domain = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 40, RegFlags::empty())],
+    };
+    let e = Efuse::from_logical(&factory.logical).unwrap();
+    let by = ByRate::from_pg(tables::PHY_REG_PG);
+    // EIRP 80 - antenna 4 - two chains 13 => output <= 63 => index <= 41.
+    for (op, wide, bw) in [
+        (Operating::twenty(6), 6, Width::W20),
+        (
+            Operating {
+                width: EnvWidth::W40Above,
+                channel: 1,
+            },
+            3,
+            Width::W40,
+        ),
+        (
+            Operating {
+                width: EnvWidth::W40Below,
+                channel: 11,
+            },
+            9,
+            Width::W40,
+        ),
+    ] {
+        let Ok(p) = cal.permission_for(&domain, op) else {
+            return TestResult::Fail("measured operating point refused");
+        };
+        for rate in 0..28u8 {
+            for path in 0..2 {
+                let want = if rate >= 0x14 {
+                    0
+                } else {
+                    txpower::index(&e, &by, path, rate, bw, wide).min(41)
+                };
+                if p.index(path, rate) != want {
+                    return TestResult::Fail("per-path admitted index");
+                }
+            }
+            if p.admits(rate) != (rate < 0x14) {
+                return TestResult::Fail("admitted set (MCS8-15 path B unmeasured)");
+            }
+        }
+        if p.eirp_limit_qdbm() != 80
+            || p.identity() != crate::rtlwifi::radio::factory_identity(&factory)
+        {
+            return TestResult::Fail("permission ceiling / identity");
+        }
+        let io = RfFake::new();
+        if txpower::set_indices(&io, p.indices()).is_err() {
+            return TestResult::Fail("admitted TXAGC writes");
+        }
+    }
+    if cal.permission(&domain, 3).err() != Some(PowerError::NoMeasuredGain) {
+        return TestResult::Fail("row-less channel admitted");
+    }
+    // A 20 MHz-only rule cannot carry a 40 MHz span; a NO_IR rule refuses.
+    let narrow = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 20, RegFlags::empty())],
+    };
+    let ht40 = Operating {
+        width: EnvWidth::W40Above,
+        channel: 1,
+    };
+    if cal.permission_for(&narrow, ht40).err() != Some(PowerError::Policy) {
+        return TestResult::Fail("40 MHz admitted under a 20 MHz rule");
+    }
+    let no_ir = RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![rule(2402, 2472, 40, RegFlags::NO_IR)],
+    };
+    if cal.permission_for(&no_ir, ht40).err() != Some(PowerError::Policy) {
+        return TestResult::Fail("NO_IR span admitted");
+    }
+    // An unmeasured OFDM path refuses the whole point.
+    let legacy_hole = n92e(&factory, &[(6, 20, 0)], 4, &[3]);
+    let Ok(cal) = Calibration::from_verified(&legacy_hole, Some([1; 32]), &factory) else {
+        return TestResult::Fail("legacy-hole envelope rejected at parse");
+    };
+    if cal.permission(&domain, 6).err() != Some(PowerError::NoMeasuredGain) {
+        return TestResult::Fail("unmeasured OFDM path admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ee",
+    smoke_rtl8192ee_n92e_envelope_permission_and_admission
+);

@@ -162,6 +162,8 @@ pub struct Prepared<I: Io, M: Memory> {
     rtl8821ae_power: Option<super::rtl8821ae::envelope::Permission>,
     /// RTL8192EE factory identity and configured radio (`rtl8192ee/init.rs`).
     rtl8192ee: Option<alloc::boxed::Box<([u8; 32], super::rtl8192ee::init::Radio)>>,
+    /// Admitted `N92E` operating point (`rtl8192ee/envelope.rs`).
+    rtl8192ee_power: Option<super::rtl8192ee::envelope::Permission>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -266,6 +268,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8821ae_identity: None,
             rtl8821ae_power: None,
             rtl8192ee: None,
+            rtl8192ee_power: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),

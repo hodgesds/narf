@@ -278,3 +278,17 @@ pub fn set_level(
     }
     Ok(())
 }
+
+/// `rtl92ee_phy_set_txpower_level`'s write order and registers with the
+/// envelope-admitted per-path indices instead of the Linux index
+/// (`rtl8192ee/envelope.rs`; unadmitted rates are written 0).
+pub fn set_indices(io: &impl Io, indices: &[[u8; 28]; 2]) -> Result<(), Error> {
+    for (path, row) in indices.iter().enumerate() {
+        for rate in rates() {
+            let (reg, lane) = txagc(path, rate).ok_or(Error::State)?;
+            let power = row[usize::from(rate)].min(MAX_POWER_INDEX);
+            set_bb(io, reg, 0xff << (lane * 8), u32::from(power))?;
+        }
+    }
+    Ok(())
+}

@@ -49,6 +49,7 @@ pub mod adapter;
 pub mod c2h;
 pub mod channel;
 pub mod dm;
+pub mod envelope;
 pub mod fw;
 pub mod h2c;
 pub mod headerfile;

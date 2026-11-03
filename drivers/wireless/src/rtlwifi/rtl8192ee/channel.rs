@@ -156,6 +156,36 @@ pub async fn set_bw_mode(
     rf_set_bandwidth(io, width, chnlval).await
 }
 
+/// `_rtl92ee_phy_sw_chnl_step_by_step` with the envelope-admitted TXAGC
+/// indices ([`txpower::set_indices`]) in place of the Linux index.
+pub async fn sw_chnl_admitted(
+    io: &impl Io,
+    indices: &[[u8; 28]; 2],
+    channel: u8,
+    chnlval: &mut [u32; 2],
+) -> Result<(), Error> {
+    txpower::set_indices(io, indices)?;
+    for path in PATHS {
+        let p = path as usize;
+        chnlval[p] = (chnlval[p] & 0x0fff_ff00) | u32::from(channel);
+        set_rf(io, path, RF_CHNLBW, 0x3ff, chnlval[p]).await?;
+    }
+    io.delay_us(10_000).await;
+    Ok(())
+}
+
+/// [`configure`] for an admitted envelope operating point: the switch at
+/// the wide channel with the permission's indices, then `set_bw_mode`.
+pub async fn configure_admitted(
+    io: &impl Io,
+    permission: &super::envelope::Permission,
+    chnlval: &mut [u32; 2],
+) -> Result<(), Error> {
+    let op = permission.operating().channel().ok_or(Error::State)?;
+    sw_chnl_admitted(io, permission.indices(), op.wide, chnlval).await?;
+    set_bw_mode(io, op.width, op.prime_sc, chnlval).await
+}
+
 /// `switch_channel` then `set_bw_mode` at the wide channel.
 pub async fn configure(
     io: &impl Io,

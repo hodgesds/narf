@@ -2265,11 +2265,41 @@ diagnostic (`pci::bring_up` does not retain it).
   `0x4fc = 0`. Not issued: HW security config (software crypto, Linux's
   `sw_crypto` return), the ASPM back door / `enable_aspm` (ASPM stays
   disabled), `rtl92ee_bt_hw_init`; `rtl92ee_dm_init` is software state for
-  the DM owner. `Prepared::configure_rtl8192ee_channel(Operating)`
-  (RadioConfigured/ChannelConfigured → ChannelConfigured) runs `channel::
-  configure` with the factory TX power and the retained `rfreg_chnlval`.
-  The owner still cannot reach `MacConfigured` (no envelope or station
-  branch yet); probe keeps `0x818b` diagnostic.
+  the DM owner. `Prepared::configure_rtl8192ee_channel(Permission)`
+  (RadioConfigured/ChannelConfigured → ChannelConfigured; MacConfigured/
+  Running keep their phase, the station retune) refuses a permission
+  minted for another factory identity, then runs `channel::
+  configure_admitted`: `_rtl92ee_phy_sw_chnl_step_by_step` at the wide
+  channel with the envelope's per-path indices (`txpower::set_indices`,
+  the `set_level` registers/order, unadmitted rates 0) and the retained
+  `rfreg_chnlval`, then `set_bw_mode`; it records the channel for the
+  packet owner. `configure_rtl8192ee_mac` (ChannelConfigured →
+  MacConfigured) requires the radio and permission of the same identity
+  and sets the station address.
+- `envelope` — signed per-board `N92E` v1 power envelope
+  (`rtlwifi/rtl8192ee-cal-v1-<mac>.bin`, device `0x818b`; layout in the
+  module header): factory identity, MAC, antenna gain (the combined
+  two-chain gain) and qualified EIRP, then up to 25 rows strictly ordered
+  by (bandwidth, offset, channel) — 2.4 GHz 20 MHz ch1-11, 40 MHz above
+  1-7 and below 5-11 (span inside 2402-2472 MHz) — each with eight
+  64-entry measured conducted-output curves: path A and path B for CCK,
+  OFDM, MCS0-7 and MCS8-15, indexed by that path's TXAGC value (`i16::MAX`
+  unmeasured). The format only carries measurements; no board value is
+  supplied. `permission_for(domain, op)` takes the ceiling as 8821AE (20
+  MHz `domain_ceiling`; 40 MHz: every overlapping host rule covers the
+  whole span, allows 40 MHz and has no flag, capped by `regd.c` 20 dBm)
+  and the qualification, and per rate and path lowers the Linux index
+  (`_rtl92ee_get_txpower_index` at the wide channel and width, as
+  `rtl92ee_phy_set_txpower_level` runs at `current_channel`) to the
+  highest measured index whose output + 13 qdBm (two equal incoherent
+  chains, `10 log10 2` rounded up; both chains are assumed to transmit
+  every rate) + antenna gain fits. A rate is admitted only when both paths
+  fit; every CCK/OFDM rate must be admitted, MCS rates may be left out
+  (`admitted_rates`, full order, the set `ee92_install_rate_mask` and
+  `ee92_dm_watchdog` bound the RA mask by). Unsigned, foreign, unordered,
+  out-of-plan or unmeasured ⇒ not admitted. Test
+  `smoke_rtl8192ee_n92e_envelope_permission_and_admission`
+  (`rtl8192ee/phy_tests.rs`, written, unexecuted).
 - `h2c` — `fw.c::_rtl92ee_fill_h2c_command` (`REG_CR == 0xEA` ⇒
   `REG_SYS_CFG1 (0xf0) + 3 = 0xff` side effect and `RadioOff`; HMETFR one
   plus 99 × 10 us checks, each re-check followed by Linux's `0x130` read;

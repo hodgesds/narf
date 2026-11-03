@@ -1102,33 +1102,78 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         Ok(())
     }
 
-    /// RadioConfigured/ChannelConfigured → ChannelConfigured: `rtl_op_config`
-    /// channel switch and 20/40 MHz bandwidth with the factory TX power.
+    /// Admitted 8192EE operating point committed by
+    /// [`Self::configure_rtl8192ee_channel`].
+    pub fn rtl8192ee_permission(
+        &self,
+    ) -> Option<super::super::super::rtl8192ee::envelope::Permission> {
+        self.rtl8192ee_power
+    }
+
+    /// RadioConfigured/ChannelConfigured/MacConfigured/Running →
+    /// the same phase (ChannelConfigured from RadioConfigured):
+    /// `rtl_op_config` channel switch at the wide channel with the
+    /// envelope-admitted per-path TXAGC indices, then the 20/40 MHz
+    /// bandwidth (`rtl8192ee/channel.rs::configure_admitted`). The
+    /// permission must have been minted for this owner's factory identity.
+    /// A station retune (MacConfigured/Running) keeps the packet phase; any
+    /// I/O failure fails the owner.
     pub async fn configure_rtl8192ee_channel(
         &mut self,
-        op: super::super::super::rtl8192ee::channel::Operating,
+        permission: super::super::super::rtl8192ee::envelope::Permission,
     ) -> Result<(), Error> {
-        if !matches!(
-            self.phase,
-            Phase::RadioConfigured | Phase::ChannelConfigured
-        ) || self.chip != super::super::Chip::Rtl8192ee
-        {
+        let resume = match self.phase {
+            Phase::RadioConfigured | Phase::ChannelConfigured => Phase::ChannelConfigured,
+            Phase::MacConfigured | Phase::Running => self.phase,
+            _ => return Err(Error::State),
+        };
+        if self.chip != super::super::Chip::Rtl8192ee {
             return Err(Error::State);
+        }
+        if self.rtl8192ee.as_ref().map(|state| state.0) != Some(permission.identity()) {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Identity,
+            ));
         }
         let mut state = self.rtl8192ee.take().ok_or(Error::State)?;
         self.phase = Phase::Failed;
-        let radio = &mut state.1;
-        let (power, by_rate) = (radio.power, radio.phy.by_rate);
-        super::super::super::rtl8192ee::channel::configure(
+        self.rtl8192ee_power = None;
+        super::super::super::rtl8192ee::channel::configure_admitted(
             &self.io,
-            &power,
-            &by_rate,
-            &op,
-            &mut radio.chnlval,
+            &permission,
+            &mut state.1.chnlval,
         )
         .await?;
         self.rtl8192ee = Some(state);
-        self.phase = Phase::ChannelConfigured;
+        self.rtl8192ee_power = Some(permission);
+        self.packet.ee92.channel = Some(permission.channel());
+        self.phase = resume;
+        Ok(())
+    }
+
+    /// ChannelConfigured → MacConfigured: the station address
+    /// (`configure_rtl8192ee` wrote `HW_VAR_ETHER_ADDR`) for the factory
+    /// identity the channel permission was minted for. BT-coexist boards were
+    /// refused by [`Self::configure_rtl8192ee`]. Packet DMA, CR gates and
+    /// IRQs stay closed.
+    pub fn configure_rtl8192ee_mac(
+        &mut self,
+        factory: &super::super::super::efuse::Factory,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::ChannelConfigured || self.chip != super::super::Chip::Rtl8192ee {
+            return Err(Error::State);
+        }
+        let identity = super::super::super::radio::factory_identity(factory);
+        if self.rtl8192ee.as_ref().map(|state| state.0) != Some(identity)
+            || self.rtl8192ee_power.map(|p| p.identity()) != Some(identity)
+            || self.rtl8192ee_radio().is_none()
+        {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Identity,
+            ));
+        }
+        self.packet.local = Some(factory.mac);
+        self.phase = Phase::MacConfigured;
         Ok(())
     }
 }
