@@ -101,6 +101,9 @@ pub(crate) enum ResourceError {
     DdbExhausted,
     /// Required CDCLK exceeds the 652.8 MHz maximum.
     CdclkUnsatisfiable,
+    /// SAGV is allowed but no QGV point carries the display data rate
+    /// (`mtl_find_qgv_points` -EINVAL).
+    BandwidthExceeded,
     /// A pipe, plane, cursor, DSB or FBC is live.
     Busy,
     /// Lost current access or an all-ones read.
@@ -277,9 +280,10 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
         return Err(ResourceError::CdclkUnsatisfiable);
     }
     let rung = cdclk::calc_cdclk(min_cdclk).ok_or(ResourceError::CdclkUnsatisfiable)?;
+    let qgv_peak_bw = sagv_peak_bw(request, latency, &dbuf, &inputs)?;
     let voltage_level = min_voltage.max(cdclk::voltage_level(rung.cdclk_khz));
     let pmdemand = Demand {
-        qgv_peak_bw: None,
+        qgv_peak_bw,
         enabled_slices: dbuf.enabled_slices,
         active_pipes: dbuf.active_pipes,
         voltage_level,
@@ -301,6 +305,45 @@ pub(crate) fn compute(request: &Request, latency: &Latency) -> Result<State, Res
         return Err(ResourceError::Unsupported);
     }
     Ok(state)
+}
+
+/// `intel_bw_atomic_check` for display 14: every active pipe must allow
+/// SAGV (`tgl_crtc_can_enable_sagv`: each enabled plane, including a
+/// visible cursor, keeps its post-DDB SAGV level-0 watermark) and SAGV must
+/// be controllable; otherwise QCLK_GV_BW stays `U16_MAX`. With SAGV allowed,
+/// `mtl_find_qgv_points` must find a point for the summed data rate.
+fn sagv_peak_bw(
+    request: &Request,
+    latency: &Latency,
+    dbuf: &Dbuf,
+    inputs: &[Option<PipeInput>; PIPES],
+) -> Result<Option<u16>, ResourceError> {
+    let Some(qgv) = latency.qgv.as_ref() else {
+        return Ok(None);
+    };
+    let mut data_rate = 0u64;
+    let mut planes = 0u32;
+    for (pipe, input) in inputs.iter().enumerate() {
+        let Some(input) = input else { continue };
+        let alloc = &dbuf.pipes[pipe];
+        for (wm, plane) in alloc.wm.iter().zip(&input.planes) {
+            if wm.levels[0].enable && !wm.sagv.enable {
+                return Ok(None);
+            }
+            if let Some(plane) = plane {
+                data_rate += u64::from(plane.data_rate);
+                planes += 1;
+            }
+        }
+        let cursor_visible = request.pipes[pipe].is_some_and(|p| p.cursor_visible);
+        if cursor_visible && alloc.cursor_wm.levels[0].enable && !alloc.cursor_wm.sagv.enable {
+            return Ok(None);
+        }
+    }
+    let mbps = data_rate.div_ceil(1000).min(u64::from(u32::MAX)) as u32;
+    crate::intel_gpu_xelpg_bw::qgv_peak_bw(qgv, mbps, planes)
+        .map(Some)
+        .ok_or(ResourceError::BandwidthExceeded)
 }
 
 const PLANE_BLOCKS: u32 = 0x1fff;

@@ -236,10 +236,11 @@ impl Profile {
         let req0 = read(io, REQUEST0)?;
         let req1 = read(io, REQUEST1)?;
         // Every acknowledged PM demand field covers the computed state, and
-        // the QGV peak bandwidth keeps SAGV disabled.
+        // the QGV peak bandwidth is exactly the computed SAGV decision
+        // (0xffff keeps SAGV masked).
         let held = crate::intel_gpu_pmdemand::Params::decode(req0, req1);
         let need = state.pmdemand;
-        if held.qclk_gv_bw != 0xffff
+        if held.qclk_gv_bw != need.qclk_gv_bw
             || held.max(&need) != held
             || read(io, 0x44468)? & (1 << 27) != 0
             || read(io, REQUEST1)? & ENABLE != 0

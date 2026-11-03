@@ -45,6 +45,8 @@ pub(crate) const CURSOR_ALLOC_WIDTH: u32 = 256;
 pub(crate) struct Latency {
     pub(crate) levels: [u16; LEVELS],
     pub(crate) sagv_block_us: u16,
+    /// QGV description when SAGV is controllable (`intel_has_sagv`).
+    pub(crate) qgv: Option<crate::intel_gpu_xelpg_bw::Qgv>,
 }
 
 impl Latency {
@@ -73,6 +75,7 @@ impl Latency {
         Self {
             levels: wm,
             sagv_block_us,
+            qgv: None,
         }
     }
 
@@ -90,7 +93,18 @@ impl Latency {
         if sagv == u32::MAX || !io.display_access_ok() {
             return Err(FsError::NoDevice);
         }
-        Ok(Self::adjust(raw, (sagv & LEVEL_MASK) as u16))
+        // intel_sagv_init: without SAGV control the block time is zero, so
+        // no SAGV watermark is computed or programmed.
+        let qgv = crate::intel_gpu_xelpg_bw::Qgv::read(io)?;
+        let block = if qgv.is_some() {
+            (sagv & LEVEL_MASK) as u16
+        } else {
+            0
+        };
+        Ok(Self {
+            qgv,
+            ..Self::adjust(raw, block)
+        })
     }
 }
 

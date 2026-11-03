@@ -170,9 +170,20 @@ fn smoke_xelpg_wm_latency_adjust_read_and_sagv_block() -> TestResult {
     hw.set(0x45784, 10 | (12 << 16));
     hw.set(0x45788, 14 | (16 << 16));
     hw.set(0x4578c, 0xffff_e000 | 20);
+    // intel_sagv_init: no SAGV control (no QGV points) zeroes the block
+    // time, so no SAGV watermark is computed.
     let l = Latency::read(&hw).unwrap();
     assert_eq!(l.levels, [6, 8, 10, 12, 14, 16]);
+    assert_eq!((l.sagv_block_us, l.qgv), (0, None));
+    // Two LPDDR5 QGV points on eight channels: SAGV is controllable.
+    hw.set(0x45700, (2 << 8) | (8 << 4) | 2);
+    hw.set(0x45710, (30 << 24) | (30 << 16) | 120);
+    hw.set(0x45714, (68 << 8) | 15);
+    hw.set(0x45718, (30 << 24) | (30 << 16) | 192);
+    hw.set(0x4571c, (68 << 8) | 15);
+    let l = Latency::read(&hw).unwrap();
     assert_eq!(l.sagv_block_us, 20);
+    assert_eq!(l.qgv.unwrap().points[1].dclk, 3200);
     hw.set(0x45784, u32::MAX);
     assert_eq!(Latency::read(&hw), Err(FsError::NoDevice));
     assert!(
@@ -199,6 +210,7 @@ fn smoke_xelpg_wm_display14_levels_tile4_sagv_and_255_lines() -> TestResult {
     let lat = Latency {
         levels: [15, 0, 0, 0, 0, 0],
         sagv_block_us: 0,
+        qgv: None,
     };
     let s = Surface {
         width: 64,
@@ -289,6 +301,7 @@ fn smoke_xelpg_wm_display14_levels_tile4_sagv_and_255_lines() -> TestResult {
     let huge = Latency {
         levels: [8000, 0, 0, 0, 0, 0],
         sagv_block_us: 0,
+        qgv: None,
     };
     let t = wm::Timing {
         pixel_rate_khz: 1_305_600,
