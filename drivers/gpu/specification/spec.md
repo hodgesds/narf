@@ -1456,13 +1456,16 @@ releasing DMA owners/reservations. GuC reset plus full-engine reset remains
 required before terminal reset fences or reclamation. The policy covers only
 the admitted Gen12, DG2, Xe-LPG12.70/12.71/12.74, BMG20.01/20.02 and exact
 headless LNL/PTL engine profiles. Qualified main-GuC Gen12 VIDEO/ENHANCE
-uses the source timestamp-only policy described below; legacy standalone
-execlists and separate media GTs require their own tables.
+uses the source timestamp-only policy described below. The opt-in MTL/Arrow
+standalone media GT uses its oam_mmio_trg_vcs/vecs table (see "Intel MTL/Arrow
+standalone media GT opt-in"); legacy standalone execlists and other separate
+media GTs require their own tables.
 Installing OA register access alone does not open an OA stream or userspace queue.
 
 This covers the graphics GT and its admitted RCS0, BCS0, BMG BCS8 and fused
 compute engines, plus the fuse-present Gen12 main-GuC VIDEO/ENHANCE profile
-described below. Separate media GTs remain refused. The
+described below. Separate media GTs remain refused except the opt-in MTL/Arrow
+GT1 profile, which has its own media-only ADS. The
 owner enables their rings under both wake holds and stops GuC before rewriting
 ADS. The reload enables RCS0 (GuC class 0), copy (class 3) and compute (class 4),
 installing their mapping/enable masks, per-engine HWS/register saves
@@ -2577,8 +2580,38 @@ with its own mailbox and polled CT and registers it as the arena's second GGTT
 TLB. A full media-GT reset with Wa_14015076503 runs only on the recovery path
 after a media GuC fault. An unproven media-GuC stop keeps its GGTT memory
 retained. It also refuses park, fails suspend preparation and leaves GT0
-failed rather than rebuilding the arena. No GT1, media engine or HuC is
-published to userspace.
+failed rather than rebuilding the arena.
+
+With the option, the media GuC then schedules the fused VCS/VECS engines
+without HWCONFIG. It holds every present VDBOX/VEBOX wake and installs the
+oam_mmio_trg_vcs/vecs NONPRIV grants with NOPID fill. It enables each ring,
+reloads the GuC with a media-only ADS and enables CT. It records one default
+LRC per engine from the empty media 13.00 WA job, then runs one private-PPGTT
+store job per engine. GGTT invalidation for GT1 moves to the media CT once
+submission is enabled. Published VCS/VECS user interrupts are routed onto GT0's
+tiled MSI and masked again before GT1 stops. Scheduling refuses while GSC
+firmware reports loaded, because NARF has no owner for Wa_14015076503.
+
+Native Xe publishes GT1 only after every engine's private job retired and
+verified, and only while GT0's user epoch is live:
+- `DRM_XE_DEVICE_QUERY_GT_LIST` adds a second entry: type MEDIA, tile 0,
+  gt_id 1, GT1's own reference clock (its RPM_CONFIG0), the iGPU near/far
+  regions and media GMD_ID arch/release/revid.
+- `DRM_XE_DEVICE_QUERY_ENGINES` lists VCS then VECS with gt_id 1 and dense GT1
+  logical instances, after GT0's engines.
+- `DRM_XE_EXEC_QUEUE_CREATE` resolves each placement on its own gt_id. An
+  unknown first gt_id is EINVAL before class, VM or extension handling, as is
+  a VM_BIND queue naming one. A class or logical instance absent from that GT
+  is EINVAL, and so are mixed gt_ids or classes. All of these precede the VM
+  lookup (ENOENT) and any allocation. Width > 1 stays limited to COPY/COMPUTE.
+- EXEC on a GT1 queue checks GT1's epoch and submits to the media GuC. A media
+  GuC fault or restart bans such queues (ECANCELED); an unpublished GT1 is
+  ENODEV.
+
+Without the option, or before publication, the GT list, engine query and queue
+creation are exactly GT0-only as before, and gt_id 1 is EINVAL. The engine
+cycles and topology queries remain GT0-only. HuC (GSC-loaded on MTL) stays
+unadvertised.
 
 ### Intel fixed Gen12 views and exact family selection
 

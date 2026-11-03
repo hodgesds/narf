@@ -108,24 +108,34 @@ fn query_wire(
     zero(&wire[24..40])?;
     let mut payload = match u32_at(wire, 8) {
         0 => {
-            // drm_xe_query_engines in xe_hw_engine id order: RCS0, BCS0, CCS0.
-            let present = info
+            // drm_xe_query_engines: for_each_gt, then xe_hw_engine id order
+            // (RCS0, BCS0, CCS0 on GT0; VCS, VECS on the media GT1), each
+            // with its GT's dense logical instance and gt_id.
+            let status = info
                 .backend
                 .as_ref()
                 .and_then(|b| b.status())
-                .filter(|status| status.platform == info.platform)
-                .map_or_else(Default::default, |status| status.engines);
-            let engines: alloc::vec::Vec<Engine> = present.iter().collect();
+                .filter(|status| status.platform == info.platform);
+            let present = status.map_or_else(Default::default, |status| status.engines);
+            let media = status
+                .and(info.backend.as_ref().and_then(|b| b.media_gt()))
+                .map_or_else(Default::default, |media| media.engines);
+            let engines: alloc::vec::Vec<(Engine, u16, u16)> = present
+                .iter()
+                .map(|engine| (engine, 0, present.logical_instance(engine)))
+                .chain(
+                    media
+                        .iter()
+                        .map(|engine| (engine, 1, media.logical_instance(engine))),
+                )
+                .map(|(engine, gt, logical)| (engine, gt, logical.expect("published engine")))
+                .collect();
             let mut reply = vec![0; 8 + engines.len() * 32];
             put32(&mut reply, 0, engines.len() as u32);
-            for (i, engine) in engines.iter().enumerate() {
+            for (i, (engine, gt, logical)) in engines.iter().enumerate() {
                 reply[8 + i * 32..10 + i * 32].copy_from_slice(&engine.xe_class().to_le_bytes());
-                reply[10 + i * 32..12 + i * 32].copy_from_slice(
-                    &present
-                        .logical_instance(*engine)
-                        .expect("published engine")
-                        .to_le_bytes(),
-                );
+                reply[10 + i * 32..12 + i * 32].copy_from_slice(&logical.to_le_bytes());
+                reply[12 + i * 32..14 + i * 32].copy_from_slice(&gt.to_le_bytes());
             }
             reply
         }
@@ -184,23 +194,39 @@ fn query_wire(
                 .as_ref()
                 .and_then(|b| b.device_facts())
                 .ok_or(FsError::NoDevice)?;
-            let mut reply = vec![0; 104];
-            put32(&mut reply, 0, 1);
-            put32(&mut reply, 20, facts.reference_clock);
-            // query_gt_list: near is the tile's VRAM bit on dGFX, far the rest.
-            if info.vram.is_some() {
-                put64(&mut reply, 24, 2);
-                put64(&mut reply, 32, 1);
-            } else {
-                put64(
-                    &mut reply,
-                    if info.platform.is_discrete() { 32 } else { 24 },
-                    1,
-                );
+            // query_gt_list: GT0 (type MAIN), then the published standalone
+            // media GT (type MEDIA, tile 0, gt_id 1) with its own clock and
+            // GMD_ID arch/release/revid.
+            let media = info.backend.as_ref().and_then(|b| b.media_gt());
+            let count = 1 + usize::from(media.is_some());
+            let mut reply = vec![0; 8 + 96 * count];
+            put32(&mut reply, 0, count as u32);
+            for gt in 0..count {
+                let at = 8 + gt * 96;
+                // near is the tile's VRAM bit on dGFX, far the rest.
+                if info.vram.is_some() {
+                    put64(&mut reply, at + 16, 2);
+                    put64(&mut reply, at + 24, 1);
+                } else {
+                    put64(
+                        &mut reply,
+                        at + if info.platform.is_discrete() { 24 } else { 16 },
+                        1,
+                    );
+                }
             }
+            put32(&mut reply, 20, facts.reference_clock);
             reply[40..42].copy_from_slice(&(facts.graphics_version / 100).to_le_bytes());
             reply[42..44].copy_from_slice(&(facts.graphics_version % 100).to_le_bytes());
             reply[44..46].copy_from_slice(&u16::from(facts.graphics_step).to_le_bytes());
+            if let Some(media) = media {
+                reply[104..106].copy_from_slice(&1u16.to_le_bytes()); // GT_TYPE_MEDIA
+                reply[108..110].copy_from_slice(&1u16.to_le_bytes()); // gt_id 1
+                put32(&mut reply, 116, media.reference_clock);
+                reply[136..138].copy_from_slice(&((media.gmd >> 22) as u16).to_le_bytes());
+                reply[138..140].copy_from_slice(&(((media.gmd >> 14) & 0xff) as u16).to_le_bytes());
+                reply[140..142].copy_from_slice(&((media.gmd & 0x3f) as u16).to_le_bytes());
+            }
             reply
         }
         // xe_query.c query_hwconfig: source-unsupported families negotiate

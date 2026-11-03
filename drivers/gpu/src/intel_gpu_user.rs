@@ -40,6 +40,21 @@ pub struct UserStatus {
     pub engines: crate::intel_gpu_engine::EngineSet,
 }
 
+/// The MTL/Arrow standalone media GT as native Xe gt_id 1 (type MEDIA).
+/// Published only with `narf.intel.media_gt=1`, after every engine executed
+/// and retired a private PPGTT job on the media GuC, and only while GT0 is
+/// live. Its engines are VCS/VECS with dense logical instances on GT1.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MediaGtStatus {
+    /// GT1's own scheduler epoch; contexts on its engines carry it.
+    pub epoch: u64,
+    pub engines: crate::intel_gpu_engine::EngineSet,
+    /// Raw media GMD_ID (query_gt_list ip_ver_major/minor/rev).
+    pub gmd: u32,
+    /// GT1's command-streamer timestamp clock (xe_gt_clock_init on GT1).
+    pub reference_clock: u32,
+}
+
 /// Observed PF/graphics-GT facts for the native Xe discovery ABI. Published
 /// before live admission; a PCI ID alone cannot supply the clock or GMD step.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -60,6 +75,11 @@ pub type VramPublish<'a> =
 
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
+    /// The published standalone media GT (native Xe gt_id 1). Default: none,
+    /// as on every backend without `narf.intel.media_gt=1`.
+    fn media_gt(&self) -> Option<MediaGtStatus> {
+        None
+    }
     /// Cached physical automatic global-reset availability for this live user
     /// epoch. Default refusal; discovery alone is not a recovery owner. No I/O.
     fn reset_availability_epoch(&self) -> Option<u64> {

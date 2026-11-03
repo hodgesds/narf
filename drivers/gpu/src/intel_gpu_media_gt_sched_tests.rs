@@ -27,7 +27,7 @@ fn gt1_owned(offset: u64) -> bool {
 }
 
 #[derive(Default)]
-struct Hw {
+pub(super) struct Hw {
     /// Contexts whose ring the modeled engines already executed.
     executed: BTreeSet<u32>,
     registered: BTreeMap<u32, u32>,
@@ -172,7 +172,7 @@ fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
 
 /// One model tick around a production poll: hardware first, then GuC CT
 /// service and execution of every newly submitted context.
-fn media_tick(
+pub(super) fn media_tick(
     guc: &mut MediaGuc<Window, Arena>,
     w: &Window,
     hw: &mut Hw,
@@ -206,7 +206,7 @@ fn media_tick(
     polled
 }
 
-fn media_until(
+pub(super) fn media_until(
     guc: &mut MediaGuc<Window, Arena>,
     w: &Window,
     hw: &mut Hw,
@@ -225,7 +225,14 @@ fn media_until(
     panic!("media GuC made no progress");
 }
 
-fn start_media(w: &Window, arena: &Arena) -> MediaGuc<Window, Arena> {
+impl Hw {
+    /// Engine bases whose private-PPGTT rings the model executed.
+    pub(super) fn ppgtt_engines(&self) -> &[u32] {
+        &self.ppgtt
+    }
+}
+
+pub(super) fn start_media(w: &Window, arena: &Arena) -> MediaGuc<Window, Arena> {
     let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
     let media = MediaGt::initialized_for_test(MTL, MEDIA_GMD, FUSE);
     w.0.borrow_mut().regs.insert(0x380d00, RPM_CONFIG0);

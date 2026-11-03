@@ -334,15 +334,26 @@ impl XeFile {
             usize::from(width) * usize::from(count) * 8,
         )?;
         let instance = &instances[..8];
-        zero(&instance[4..8])?; // GT0 plus MBZ pad, logical instance may be COPY1.
+        zero(&instance[6..8])?; // MBZ pad; the logical instance may be COPY1.
         let class = u16::from_le_bytes(instance[..2].try_into().unwrap());
         let logical = u16::from_le_bytes(instance[2..4].try_into().unwrap());
-        // Only the GT's published (fused-in) engines are addressable.
+        let gt_id = u16::from_le_bytes(instance[4..6].try_into().unwrap());
+        // Only a GT's published (fused-in) engines are addressable: GT0's,
+        // and GT1's VCS/VECS once the standalone media GT is published.
         let present = info
             .backend
             .as_ref()
             .and_then(|b| b.status())
             .map_or_else(Default::default, |status| status.engines);
+        let media = info.backend.as_ref().and_then(|b| b.media_gt());
+        let gt_engines = |gt: u16| match gt {
+            0 => Some(present),
+            1 => media.map(|media| media.engines),
+            _ => None,
+        };
+        // xe_exec_queue_create_ioctl: xe_device_get_gt(eci[0].gt_id) refuses
+        // an unknown GT before any class, VM or placement handling.
+        let gt_present = gt_engines(gt_id).ok_or(FsError::InvalidData)?;
         if class == 5 && (logical != 0 || count != 1 || width != 1) {
             return Err(FsError::InvalidData);
         }
@@ -356,17 +367,19 @@ impl XeFile {
         if class != 5 {
             let mut engines = alloc::vec::Vec::new();
             for instance in instances.chunks_exact(8) {
-                zero(&instance[4..8])?;
+                zero(&instance[6..8])?;
                 let candidate = u16::from_le_bytes(instance[..2].try_into().unwrap());
                 let logical = u16::from_le_bytes(instance[2..4].try_into().unwrap());
-                if candidate != class {
+                let candidate_gt = u16::from_le_bytes(instance[4..6].try_into().unwrap());
+                // calc_validate_logical_mask: xe_hw_engine_lookup on the
+                // entry's own GT, then the same-GT and same-class checks.
+                let engine = gt_engines(candidate_gt)
+                    .and_then(|set| set.from_class_instance(candidate, logical))
+                    .ok_or(FsError::InvalidData)?;
+                if candidate_gt != gt_id || candidate != class {
                     return Err(FsError::InvalidData);
                 }
-                engines.push(
-                    present
-                        .from_class_instance(class, logical)
-                        .ok_or(FsError::InvalidData)?,
-                );
+                engines.push(engine);
             }
             placements = crate::intel_gpu_engine::EngineSet::of(&engines);
         }
@@ -414,7 +427,7 @@ impl XeFile {
                     if first.checked_add(index as u16) != Some(next) {
                         return Err(FsError::InvalidData);
                     }
-                    let engine = present
+                    let engine = gt_present
                         .from_class_instance(class, next)
                         .ok_or(FsError::InvalidData)?;
                     lanes[index] = crate::intel_gpu_engine::EngineSet::from_bits(
@@ -764,7 +777,16 @@ impl XeFile {
                 .status()
                 .filter(|s| s.platform == info.platform)
                 .ok_or(FsError::NoDevice)?;
-            queue.context.check_epoch(status.epoch).map_err(canceled)?;
+            // A queue on the standalone media GT runs in GT1's own epoch;
+            // GT0's epoch never admits it (and vice versa).
+            let epoch = if crate::intel_gpu_gt::media::profile_eligible(status.platform)
+                && queue.context.engine().is_media()
+            {
+                backend.media_gt().ok_or(FsError::NoDevice)?.epoch
+            } else {
+                status.epoch
+            };
+            queue.context.check_epoch(epoch).map_err(canceled)?;
             let resident = if parallel.is_some() {
                 ResidentBatch::from_vm_parallel(
                     status.platform,

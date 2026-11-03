@@ -134,6 +134,8 @@ struct Owner {
     reset_publication: Arc<recovery::Publication>,
     user_version: Arc<AtomicU32>,
     user_engines: Arc<core::sync::atomic::AtomicU32>,
+    /// Published standalone media GT (native Xe gt_id 1), opt-in only.
+    user_media: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::MediaGtStatus>>>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     eu_info: IrqSafeSpinLock<Option<crate::intel_gpu_eu_stall::Info>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
@@ -147,6 +149,7 @@ struct Backend {
     epoch: Arc<AtomicU64>,
     version: Arc<AtomicU32>,
     engines: Arc<core::sync::atomic::AtomicU32>,
+    media: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::MediaGtStatus>>>,
     platform: GtPlatform,
     facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
@@ -808,6 +811,13 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             })
         })
     }
+    fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
+        // GT1 is only addressable beside a live GT0 user epoch.
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        *self.media.lock()
+    }
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
         let epoch = self.epoch.load(Ordering::Acquire);
         let version = self.version.load(Ordering::Relaxed);
@@ -883,22 +893,48 @@ impl Backend {
                 }
             }
         }
-        let gt = state
-            .gt
-            .as_mut()
-            .ok_or(narf_filesystem::FsError::NoDevice)?;
-        let epoch = gt.user_epoch().ok_or(narf_filesystem::FsError::NoDevice)?;
-        context.check_epoch(epoch)?;
-        let result = match output {
-            Some(output) => {
-                gt.submit_user_batch_with_output(narf_time::monotonic_ns(), context, batch, output)
+        let result = if crate::intel_gpu_gt::media::profile_eligible(self.platform)
+            && context.engine().is_media()
+        {
+            // VCS/VECS live on the standalone media GT (gt_id 1): submit to
+            // its GuC under GT1's epoch. An unpublished GT1 has no engine.
+            let guc = state
+                .media_guc
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let epoch = guc
+                .publication()
+                .ok_or(narf_filesystem::FsError::NoDevice)?
+                .epoch;
+            context.check_epoch(epoch)?;
+            let result = guc.submit_user(narf_time::monotonic_ns(), context, batch, output);
+            if guc.publication().is_none() {
+                // A lost media GuC unpublishes GT1 before its verified stop.
+                *owner.user_media.lock() = None;
             }
-            None => gt.submit_user_batch(narf_time::monotonic_ns(), context, batch),
+            result
+        } else {
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let epoch = gt.user_epoch().ok_or(narf_filesystem::FsError::NoDevice)?;
+            context.check_epoch(epoch)?;
+            let result = match output {
+                Some(output) => gt.submit_user_batch_with_output(
+                    narf_time::monotonic_ns(),
+                    context,
+                    batch,
+                    output,
+                ),
+                None => gt.submit_user_batch(narf_time::monotonic_ns(), context, batch),
+            };
+            if gt.state() == GtState::Lost {
+                owner.close_controls();
+                owner.close_user_epoch();
+            }
+            result
         };
-        if gt.state() == GtState::Lost {
-            owner.close_controls();
-            owner.close_user_epoch();
-        }
         if let Ok((_, fence)) = &result {
             awake.until(fence.clone());
         }
@@ -1120,6 +1156,7 @@ pub(crate) fn start_pending() {
             log_publication: Arc::new(crate::intel_gpu_guc_log::stream::Publication::new()),
             user_version: Arc::new(AtomicU32::new(0)),
             user_engines: Arc::new(core::sync::atomic::AtomicU32::new(0)),
+            user_media: Arc::new(IrqSafeSpinLock::new(None)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             eu_info: IrqSafeSpinLock::new(None),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
@@ -1132,6 +1169,7 @@ pub(crate) fn start_pending() {
             epoch: owner.user_epoch.clone(),
             version: owner.user_version.clone(),
             engines: owner.user_engines.clone(),
+            media: owner.user_media.clone(),
             platform: GtPlatform::from_pci(
                 owner.pending.device.id.vendor,
                 owner.pending.device.id.device,
@@ -2214,7 +2252,7 @@ impl Owner {
         let _ = match result {
             Ok(facts) => writeln!(
                 narf_console::Writer,
-                "intel-gt card{}: media GT {}.{:02} step {} initialized (fuse {:#x}, engines {:#x}); GT1 unpublished",
+                "intel-gt card{}: media GT {}.{:02} step {} initialized (fuse {:#x}, engines {:#x})",
                 self.pending.index,
                 facts.ip.version / 100,
                 facts.ip.version % 100,
@@ -2285,10 +2323,20 @@ impl Owner {
                 == Ok(Some(narf_bus::pci::PciPowerState::D0))
         });
         if !matches!(polled, core::task::Poll::Ready(Ok(MediaGucState::Running))) {
-            // Media sources are masked again before GT1 leaves Running.
+            // GT1 leaves native Xe and its sources are masked again before
+            // it leaves Running.
+            *self.user_media.lock() = None;
             if let Some(irq) = state.irq.as_ref() {
                 irq.unroute_media();
             }
+        } else if let Some(publication) = guc.publication() {
+            // Every engine executed and retired its private PPGTT job.
+            *self.user_media.lock() = Some(crate::intel_gpu_user::MediaGtStatus {
+                epoch: publication.epoch,
+                engines: publication.engines,
+                gmd: publication.gmd,
+                reference_clock: publication.reference_clock,
+            });
         }
         match polled {
             core::task::Poll::Ready(Ok(MediaGucState::Running)) => {
@@ -2311,7 +2359,7 @@ impl Owner {
                 if !core::mem::replace(&mut state.media_guc_reported, true) {
                     log(
                         self.pending.index,
-                        "media GuC scheduling; every VCS/VECS retired a private PPGTT job",
+                        "media GT1 published to native Xe; every VCS/VECS retired a private PPGTT job",
                     );
                 }
             }
@@ -2354,6 +2402,7 @@ impl Owner {
     /// Release the media GT owner's wake requests and advance a verified
     /// media GuC stop before any GT0 stop, park, suspend or fault cleanup.
     fn retire_media(&self, state: &mut State, now: u64) -> MediaRetire {
+        *self.user_media.lock() = None;
         if let Some(irq) = state.irq.as_ref() {
             irq.unroute_media();
         }

@@ -90,10 +90,15 @@ impl IoctlContext for Cpu {
 struct Native {
     mailbox: Arc<Mailbox>,
     facts: crate::intel_gpu_user::DeviceFacts,
+    /// A published standalone media GT (native Xe gt_id 1), if any.
+    media: Option<crate::intel_gpu_user::MediaGtStatus>,
 }
 impl UserBackend for Native {
     fn status(&self) -> Option<UserStatus> {
         self.mailbox.status()
+    }
+    fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
+        self.media
     }
     fn native_xe(&self) -> bool {
         true
@@ -135,6 +140,14 @@ fn setup<M: MmioWindow, A: BootAllocator>(
     w: &Window,
     platform: GtPlatform,
 ) -> (Arc<Mailbox>, DeviceInfo) {
+    setup_media(gt, w, platform, None)
+}
+fn setup_media<M: MmioWindow, A: BootAllocator>(
+    gt: &mut GuCGt<M, A>,
+    w: &Window,
+    platform: GtPlatform,
+    media: Option<crate::intel_gpu_user::MediaGtStatus>,
+) -> (Arc<Mailbox>, DeviceInfo) {
     w.0.borrow_mut().regs.insert(0xd00, 0x1e); // 25MHz crystal, timestamp /1
     let facts = gt.device_facts().unwrap();
     assert_eq!(facts.reference_clock, 25_000_000);
@@ -171,6 +184,7 @@ fn setup<M: MmioWindow, A: BootAllocator>(
         backend: Some(Arc::new(Native {
             mailbox: mailbox.clone(),
             facts,
+            media,
         })),
     };
     assert!(info.native_xe());
@@ -1903,15 +1917,17 @@ kernel_test_in!(
     smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
 );
 
-/// MTL/Arrow standalone media GT1 is initialized beside GT0 but not yet
-/// scheduled: the GT list and engine query stay GT0-only, and every media or
-/// gt_id 1 placement refuses with EINVAL before any queue, context or GGTT
-/// allocation (Linux xe_hw_engine_lookup returns no engine for it).
+/// Negative publication: without `narf.intel.media_gt=1` (or before its
+/// engines executed) the backend publishes no media GT. The GT list and
+/// engine query stay GT0-only, and every media or gt_id 1 placement refuses
+/// with EINVAL before any queue, context or GGTT allocation (Linux
+/// xe_device_get_gt/xe_hw_engine_lookup find no GT or engine for it).
 fn smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation() -> TestResult {
     let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
     let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
     prime(&mut gt, &w, 0xdfc);
     let (_, info) = setup(&mut gt, &w, platform);
+    assert_eq!(info.backend.as_ref().unwrap().media_gt(), None);
     let file = RenderFile::new();
     let user = Cpu::new();
     let gts = xe_query(&file, &info, &user, 3);
@@ -1928,7 +1944,7 @@ fn smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation() 
     }
     let vm = create_vm(&file, &info, &user);
     let before = arena.live_allocations();
-    for (class, gt_id) in [(2u8, 1u8), (3, 1), (2, 0), (3, 0), (0, 1), (1, 1), (4, 1)] {
+    for (class, gt_id) in [(2u8, 1u8), (3, 1), (2, 0), (3, 0), (0, 1), (1, 1), (4, 1), (5, 1)] {
         user.wire.store(512, &[class, 0, 0, 0, gt_id, 0, 0, 0]);
         let mut queue = [0; 48];
         put32(&mut queue, 8, 0x00010001);
@@ -1951,6 +1967,179 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation
 );
+
+/// Positive publication: once the media GuC scheduled GT1 and every engine
+/// retired its private PPGTT job, native Xe reports a media GT (type MEDIA,
+/// gt_id 1) with its own clock and GMD_ID, lists VCS/VECS with gt_id 1 and
+/// dense GT1 logical instances after GT0's engines, and an exec queue on
+/// gt_id 1 runs a real GuC submission in GT1's epoch. Unknown GT, wrong-GT
+/// class, absent instance, mixed GT, width and VM refusals keep Linux's
+/// xe_exec_queue_create_ioctl errnos and order, before any allocation.
+fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
+    use super::super::media_gt_sched::{media_until, start_media, Hw};
+    use crate::intel_gpu_engine::{Engine, EngineSet};
+    use crate::intel_gpu_gt::media::MediaGucState;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    // GT1 on its own media GuC model: VCS0, VCS2 and VECS0 fused in.
+    let (mw, marena) = media_model();
+    let mut guc = start_media(&mw, &marena);
+    let mut hw = Hw::default();
+    let (mut now, polled) = media_until(&mut guc, &mw, &mut hw, 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+    let publication = guc.publication().unwrap();
+    let status = crate::intel_gpu_user::MediaGtStatus {
+        epoch: publication.epoch,
+        engines: publication.engines,
+        gmd: publication.gmd,
+        reference_clock: publication.reference_clock,
+    };
+    assert_eq!(
+        status.engines,
+        EngineSet::of(&[Engine::Vcs0, Engine::Vcs2, Engine::Vecs0])
+    );
+    let (mailbox, info) = setup_media(&mut gt, &w, platform, Some(status));
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    // query_gt_list: GT0 MAIN, then GT1 MEDIA with its clock and IP 13.00.
+    let gts = xe_query(&file, &info, &user, 3);
+    assert_eq!(gts.len(), 8 + 2 * 96);
+    assert_eq!(u32_at(&gts, 0), 2);
+    assert_eq!(&gts[8..14], &[0u8; 6], "type MAIN, tile 0, gt_id 0");
+    assert_eq!(&gts[104..110], &[1, 0, 0, 0, 1, 0], "type MEDIA, tile 0, gt_id 1");
+    assert_eq!(u32_at(&gts, 116), 19_200_000);
+    assert_eq!(u64_at(&gts, 120), 1, "near: system memory");
+    assert_eq!(u64_at(&gts, 128), 0, "far: none on the iGPU");
+    assert_eq!(&gts[136..142], &[13, 0, 0, 0, 2, 0], "GMD_ID 13.00 revid 2");
+    // query_engines: GT0 engines on gt_id 0, then VCS/VECS on gt_id 1.
+    let engines = xe_query(&file, &info, &user, 0);
+    let count = u32_at(&engines, 0) as usize;
+    let gt0 = gt.engines().unwrap().iter().count();
+    assert_eq!(count, gt0 + 3);
+    for entry in engines[8..8 + gt0 * 32].chunks_exact(32) {
+        assert!(!matches!(entry[0], 2 | 3));
+        assert_eq!(&entry[4..6], &[0, 0]);
+    }
+    let media: Vec<_> = engines[8 + gt0 * 32..]
+        .chunks_exact(32)
+        .map(|entry| (entry[0], entry[2], entry[4]))
+        .collect();
+    assert_eq!(media, [(2, 0, 1), (2, 1, 1), (3, 0, 1)]);
+    let vm = create_vm(&file, &info, &user);
+    let before = (arena.live_allocations(), marena.live_allocations());
+    let try_queue = |instances: &[[u8; 8]], width: u32, vm: u32| {
+        user.wire.store(512, &instances.concat());
+        let mut queue = [0; 48];
+        put32(&mut queue, 8, width | (instances.len() as u32 / width) << 16);
+        put32(&mut queue, 12, vm);
+        put64(&mut queue, 24, 512);
+        user.wire.store(64, &queue);
+        let result = invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE);
+        (result, u32_at(&user.wire.load(64, 48), 20))
+    };
+    let eci = |class: u8, instance: u8, gt_id: u8| [class, 0, instance, 0, gt_id, 0, 0, 0];
+    for (instances, width, vm, errno) in [
+        (alloc::vec![eci(2, 0, 0)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(3, 0, 0)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(0, 0, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(1, 0, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(4, 0, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(2, 2, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(3, 1, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(2, 0, 2)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(5, 0, 2)], 1, vm, FsError::InvalidData),
+        (
+            alloc::vec![eci(2, 0, 1), eci(2, 1, 0)],
+            1,
+            vm,
+            FsError::InvalidData,
+        ),
+        (
+            alloc::vec![eci(2, 0, 1), eci(3, 0, 1)],
+            1,
+            vm,
+            FsError::InvalidData,
+        ),
+        (
+            alloc::vec![eci(2, 0, 1), eci(2, 1, 1)],
+            2,
+            vm,
+            FsError::InvalidData,
+        ),
+        // Unknown GT precedes the VM lookup; a valid GT1 engine reaches it.
+        (alloc::vec![eci(2, 0, 2)], 1, 999, FsError::InvalidData),
+        (alloc::vec![eci(2, 0, 1)], 1, 999, FsError::NotFound),
+    ] {
+        assert_eq!(try_queue(&instances, width, vm), (Err(errno), 0));
+    }
+    assert_eq!(
+        (arena.live_allocations(), marena.live_allocations()),
+        before
+    );
+    // A VM_BIND queue may name the published GT1, as in Linux.
+    let (bind, bind_id) = try_queue(&[eci(5, 0, 1)], 1, vm);
+    assert_eq!(bind, Ok(0));
+    assert_ne!(bind_id, 0);
+    // VCS logical 1 on GT1 is physical VCS2; it runs a real media GuC job.
+    let (result, queue) = try_queue(&[eci(2, 1, 1)], 1, vm);
+    assert_eq!(result, Ok(0));
+    assert_ne!(queue, 0);
+    let _buffers = buffers(&file, &info, &user, vm);
+    exec_wire(&user, queue, true, &[]);
+    let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+    assert!(call
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let pending = mailbox
+        .pending
+        .lock()
+        .pop()
+        .expect("userspace queued a media job");
+    assert_eq!(pending.context.engine(), Engine::Vcs2);
+    now += 1_000_000;
+    let (_, fence) = guc
+        .submit_user(now, pending.context.clone(), pending.batch, None)
+        .unwrap();
+    *pending.reply.result.lock() = Some(Ok(fence.clone()));
+    if let Some(waker) = pending.reply.waker.lock().take() {
+        waker.wake();
+    }
+    assert_eq!(
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Some(Ok(0)))
+    );
+    let (now, _) = media_until(&mut guc, &mw, &mut hw, now + 1, |_| {
+        fence.result().is_some()
+    });
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert!(hw_ran_on(&hw, 0x1d0000));
+    assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+    assert_eq!(pending.context.check_epoch(status.epoch), Ok(()));
+    user.mapping.lock().take();
+    for id in [queue, bind_id] {
+        assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, id), Ok(0));
+    }
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    guc.begin_stop(now + 1);
+    let (_, polled) = media_until(&mut guc, &mw, &mut hw, now + 2, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Stopped)));
+    drop(guc);
+    assert_eq!(marena.live_allocations(), 0);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_xe_mtl_media_gt1_published_queries_queues_and_exec
+);
+
+fn hw_ran_on(hw: &super::super::media_gt_sched::Hw, base: u32) -> bool {
+    hw.ppgtt_engines().contains(&base)
+}
 
 mod gen12_media {
     include!("intel_gpu_gen12_media_ioctl_tests.rs");
