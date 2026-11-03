@@ -703,3 +703,202 @@ kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar5008_admission_records_bind_chip_masks_and_channel
 );
+
+/// The AR5416/AR5418/AR9160 native owner binds the admitted device and
+/// chip, the primary and band (tune, report and the 40 MHz OFDM 5 GHz MAC
+/// clock), the effective three-chain masks, the generation's MFP branch and
+/// CB71 rule, and a `channels::bit` mask naming the primary; every access
+/// (including the AR5008 periodic calibration) stops at a revoked PCI
+/// capability.
+fn smoke_ath9k_ar5008_native_profile_binds_chip_band_and_masks() -> TestResult {
+    use crate::ath9k::{
+        calibration::ar5008::Report,
+        channels,
+        chips::Chip,
+        mac::{Clock, Profile},
+        packet::{Error as PacketError, Port},
+        packet_native::Native,
+        phy::Tune,
+    };
+    use narf_bus::{BarKind, BusAddr, BusDevice, BusDeviceCap, BusKind, MmioRegion, PcieAddr};
+    use narf_capabilities::Write;
+    let map = crate::ath9k::phy::ar9280::power::tests::image(3);
+    let mut identity = crate::ath9k::phy::ar9280::power::tests::identity(0x10);
+    identity.rx_chainmask = 7;
+    let tx = identity.tx_chainmask;
+    let with = |facts: &Facts, magic: &[u8; 4], channel: u8| {
+        let mut b = record(facts, 4, 30);
+        b[..4].copy_from_slice(magic);
+        b[54..58].copy_from_slice(&[channel, 20, 7, tx]);
+        b
+    };
+    let (Ok(f9160), Ok(f5418)) = (ar5008_facts(0x0027, 2412, 7), ar5008_facts(0x0024, 5180, 7))
+    else {
+        return TestResult::Fail("AR5008 native facts refused");
+    };
+    let (Ok(g9160), Ok(g5418)) = (
+        load(f9160.clone(), with(&f9160, b"N60A", 1), true),
+        load(f5418.clone(), with(&f5418, b"N54A", 36), true),
+    ) else {
+        return TestResult::Fail("signed AR5008 records refused");
+    };
+    let address = PcieAddr::new(0, 0, 9, 0);
+    let bus = |id: u16| BusDevice {
+        addr: BusAddr::Pcie(address),
+        id: device(id),
+        kind: BusKind::Pcie {
+            addr: address,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    let bar = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: crate::ath9k::phy::REQUIRED_BAR,
+        kind: BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let report = |chip, frequency_mhz, five_ghz| Report {
+        chip,
+        country: *b"US",
+        frequency_mhz,
+        five_ghz,
+        max_power_half_dbm: 30,
+        rx_chainmask: 7,
+        iq: [None; 3],
+        measured_noise_dbm: [Some(-95), Some(-95), Some(-95)],
+        noise_dbm: [Some(-95), Some(-95), Some(-95)],
+    };
+    let (Some(bit1), Some(bit36), Ok(two)) = (
+        channels::bit(2412),
+        channels::bit(5180),
+        Geometry::from_frequency(2412),
+    ) else {
+        return TestResult::Fail("AR5008 channel bits");
+    };
+    let two = Tune::Two(two);
+    let five = Tune::Five {
+        frequency: 5180,
+        frac_n: false,
+    };
+    let build = |id, grant: &Arc<Grant>, report: Report, profile, tune, mask: u64| {
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        cap.revoke();
+        // SAFETY: the revoked fixture capability makes every config, DMA and
+        // BAR path unreachable; no physical device is touched.
+        unsafe {
+            Native::new_ar5008(
+                bus(id),
+                cap,
+                bar,
+                report,
+                grant.clone(),
+                &identity,
+                &map,
+                profile,
+                tune,
+                0,
+                mask,
+            )
+        }
+    };
+    let p9160 = Profile::ar5008(7, tx, false, true, false);
+    let p5418 = Profile::ar5008(7, tx, true, false, false);
+    let r9160 = report(Chip::Ar9160, 2412, false);
+    let r5418 = report(Chip::Ar5416, 5180, true);
+    for (id, grant, report, profile, tune, mask) in [
+        // AR9280 device, or the AR9160 grant on another device.
+        (0x0029, &g9160, r9160, p9160, two, 1 << bit1),
+        (0x0024, &g9160, r9160, p9160, two, 1 << bit1),
+        // AR5416 calibration report on the AR9160.
+        (
+            0x0027,
+            &g9160,
+            report(Chip::Ar5416, 2412, false),
+            p9160,
+            two,
+            1 << bit1,
+        ),
+        // AR5416 MFP (none) on the AR9160, CB71 on a non-AR5416 part.
+        (
+            0x0027,
+            &g9160,
+            r9160,
+            Profile::ar5008(7, tx, false, false, false),
+            two,
+            1 << bit1,
+        ),
+        (
+            0x0027,
+            &g9160,
+            r9160,
+            Profile::ar5008(7, tx, false, true, true),
+            two,
+            1 << bit1,
+        ),
+        // Effective RX mask differing from the identity's.
+        (
+            0x0027,
+            &g9160,
+            r9160,
+            Profile::ar5008(5, tx, false, true, false),
+            two,
+            1 << bit1,
+        ),
+        // 5 GHz MAC clock on a 2.4 GHz primary; tune of another band.
+        (
+            0x0027,
+            &g9160,
+            r9160,
+            Profile::ar5008(7, tx, true, true, false),
+            two,
+            1 << bit1,
+        ),
+        (0x0024, &g5418, r5418, p5418, two, 1 << bit36),
+        // Mask without the primary or beyond CHANNEL_BITS.
+        (0x0027, &g9160, r9160, p9160, two, 1 << bit36),
+        (0x0027, &g9160, r9160, p9160, two, (1 << bit1) | (1 << 38)),
+    ] {
+        if build(id, grant, report, profile, tune, mask).is_ok() {
+            return TestResult::Fail("AR5008 owner accepted a foreign device/chip/profile/mask");
+        }
+    }
+    let Ok(native) = build(0x0027, &g9160, r9160, p9160, two, 1 << bit1) else {
+        return TestResult::Fail("admitted AR9160 owner refused");
+    };
+    if native.tx_chainmask() != tx
+        || native.mac_clock() != Clock::Ofdm2g
+        || native.channel_mask() != 1 << bit1
+        || native.frequency_mhz() != 2412
+        || native.ht_grant().is_some()
+    {
+        return TestResult::Fail("AR9160 native profile differs");
+    }
+    let mask = (1 << bit36) | (1 << bit1);
+    let Ok(native5) = build(0x0024, &g5418, r5418, p5418, five, mask) else {
+        return TestResult::Fail("admitted 5 GHz AR5418 owner refused");
+    };
+    let geometry = native5.geometry();
+    if native5.mac_clock() != Clock::Ofdm5g
+        || native5.channel_mask() != mask
+        || !geometry.is_5ghz()
+        || geometry.control() != 5180
+        || geometry.is_wide()
+    {
+        return TestResult::Fail("AR5418 5 GHz native profile differs");
+    }
+    for native in [&native, &native5] {
+        if native.long_calibration() != Err(PacketError::Access)
+            || native.read(0x4020) != Err(PacketError::Access)
+            || native.master(true) != Err(PacketError::Access)
+        {
+            return TestResult::Fail("revoked AR5008 authority reached the BAR");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar5008_native_profile_binds_chip_band_and_masks
+);

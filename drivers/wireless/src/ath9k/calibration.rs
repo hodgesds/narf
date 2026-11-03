@@ -100,6 +100,14 @@ impl Permission {
             && ceiling <= self.ceiling
             && ceiling >= report.max_power_half_dbm
     }
+    /// Current dual-band permission for an AR5416/AR9160 report whose
+    /// signed `N54A`/`N60A` grant lowered the host ceiling.
+    pub(super) fn allows_ar5008(self, report: &ar5008::Report, ceiling: u8) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == self.frequency
+            && ceiling <= self.ceiling
+            && ceiling >= report.max_power_half_dbm
+    }
     /// `current_in` under the dual-band (`from_domain_dual`) rule.
     pub(super) fn current_dual_in(self, domain: &RegulatoryDomain) -> bool {
         Self::from_domain_dual(domain, self.frequency)

@@ -50,6 +50,17 @@ pub(super) enum Calibrated {
         image: alloc::boxed::Box<[u8]>,
         periodic: narf_lib::mutex::Mutex<super::calibration::ar9287::Periodic>,
     },
+    /// AR5416/AR5418/AR9160 (either band the map enables): the signed
+    /// `N54A`/`N60A` per-channel record, the three-chain MAC profile and the
+    /// `ar9002_hw_calibrate` owner with the AR5008 NF limits (AR9160:
+    /// multi-sample IQ). The tune is bound to the report at construction;
+    /// there is no synthesizer readback (see `synth`).
+    Ar5008 {
+        report: super::calibration::ar5008::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        profile: super::mac::Profile,
+        periodic: narf_lib::mutex::Mutex<super::calibration::ar5008::Periodic>,
+    },
 }
 /// Raw BAR access for the AR9287 long calibration, only inside `access`.
 struct LongCal<'a> {
@@ -84,17 +95,23 @@ impl Calibrated {
             Self::Ar9285(report) => report.frequency_mhz,
             Self::Ar9287 { report, .. } => report.frequency_mhz,
             Self::Ar9280 { report, .. } => report.frequency_mhz,
+            Self::Ar5008 { report, .. } => report.frequency_mhz,
         }
     }
     /// `AR_PHY_SYNTH_CONTROL & 0x3fffffff` the channel preparation wrote
-    /// (`ar9002_hw_set_channel`).
-    fn synth(&self, center: u16) -> u32 {
+    /// (`ar9002_hw_set_channel`). `None` for the AR5008 PHY: it has no
+    /// `AR_PHY_SYNTH_CONTROL`; `ar5008_hw_set_channel` programs the external
+    /// AR2133/AR5133 through the `AR_PHY(0x37)` serial write port, which
+    /// Linux never reads back, so only the turbo and rate registers are
+    /// re-proved.
+    fn synth(&self, center: u16) -> Option<u32> {
         match self {
+            Self::Ar5008 { .. } => None,
             Self::Ar9280 {
                 tune: super::phy::Tune::Five { frequency, frac_n },
                 ..
-            } => super::phy::synth_5ghz(*frequency, *frac_n).0,
-            _ => 0x3000_0000 | (u32::from(center) * 0x10000 / 15),
+            } => Some(super::phy::synth_5ghz(*frequency, *frac_n).0),
+            _ => Some(0x3000_0000 | (u32::from(center) * 0x10000 / 15)),
         }
     }
     /// Current host permission for the calibrated program; AR9287 also
@@ -111,6 +128,16 @@ impl Calibrated {
                 .invoke(|| Ok(grant.ceiling(permission.budget())))
                 .is_ok_and(|ceiling| permission.allows_ar9280(report, ceiling));
         }
+        if let Self::Ar5008 { report, grant, .. } = self {
+            let Ok(permission) =
+                super::calibration::Permission::from_domain_dual(domain, report.frequency_mhz)
+            else {
+                return false;
+            };
+            return grant
+                .invoke(|| Ok(grant.ceiling(permission.budget())))
+                .is_ok_and(|ceiling| permission.allows_ar5008(report, ceiling));
+        }
         let Ok(permission) =
             super::calibration::Permission::from_domain_at(domain, self.frequency_mhz())
         else {
@@ -121,7 +148,7 @@ impl Calibrated {
             Self::Ar9287 { report, grant, .. } => grant
                 .invoke(|| Ok(grant.ceiling(permission.budget())))
                 .is_ok_and(|ceiling| permission.allows_ar9287(report, ceiling)),
-            Self::Ar9280 { .. } => false,
+            Self::Ar9280 { .. } | Self::Ar5008 { .. } => false,
         }
     }
 }
@@ -423,6 +450,99 @@ impl Native {
             rf_silent,
         ))
     }
+    /// # Safety
+    /// Caller retains the sole AR5416/AR5418/AR9160 function and exact
+    /// mapped BAR after `phy::ar5008::prepare` for `tune` and
+    /// `calibration::ar5008` ran under `grant`'s ceiling for `report`'s
+    /// primary; no packet DMA was published. `channel_mask`
+    /// (`channels::bit`) names the primaries of the bands the map enables
+    /// whose signed `N54A`/`N60A` record verified. `identity` carries the
+    /// effective (`fixup_chainmask`, CB71) masks the profile binds; the
+    /// retained map's masks are related to them by `mac::Masks::ThreeChain`
+    /// (re-proved against the live strap in `mac::prepare_chip`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn new_ar5008(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        report: super::calibration::ar5008::Report,
+        grant: alloc::sync::Arc<super::admission::Grant>,
+        identity: &super::identity::Identity,
+        image: &[u8],
+        profile: super::mac::Profile,
+        tune: super::phy::Tune,
+        overlap: u8,
+        channel_mask: u64,
+    ) -> Result<Self, Error> {
+        use super::phy::ar5008::{DEVID_AR5416_PCI, DEVID_AR5416_PCIE, DEVID_AR9160_PCI};
+        let request = grant.request();
+        let clock = if tune.is_5ghz() {
+            super::mac::Clock::Ofdm5g
+        } else {
+            super::mac::Clock::Ofdm2g
+        };
+        let (chip, mfp) = match device.id.device {
+            DEVID_AR5416_PCI | DEVID_AR5416_PCIE => {
+                (super::chips::Chip::Ar5416, super::mac::Mfp::None)
+            }
+            DEVID_AR9160_PCI => (super::chips::Chip::Ar9160, super::mac::Mfp::MiscMode2),
+            _ => return Err(Error::Packet),
+        };
+        let cb71 = device.id.device == DEVID_AR5416_PCI && image.get(6).is_some_and(|f| f & 1 == 0);
+        let primary = super::channels::bit(report.frequency_mhz).ok_or(Error::Packet)?;
+        if device.id.vendor != 0x168c
+            || request.device != device.id.device
+            || request.frequency_mhz != report.frequency_mhz
+            || report.chip != chip
+            || tune.is_wide()
+            || tune.center() != report.frequency_mhz
+            || tune.is_5ghz() != report.five_ghz
+            || image.len() != super::chips::MAP_DEF.bytes()
+            || identity.rx_chainmask != profile.rx_chainmask
+            || identity.tx_chainmask != profile.tx_chainmask
+            || report.rx_chainmask != profile.rx_chainmask
+            || !(1..=7).contains(&profile.rx_chainmask)
+            || !(1..=7).contains(&profile.tx_chainmask)
+            || profile.masks != (super::mac::Masks::ThreeChain { cb71 })
+            || profile.mfp != mfp
+            || profile.txbuf != 0x700
+            || profile.clock != clock
+            || channel_mask >> super::channels::CHANNEL_BITS != 0
+            || channel_mask & (1 << primary) == 0
+        {
+            return Err(Error::Packet);
+        }
+        let rf_silent = rf_silent(image)?;
+        // The exact three-chain closed-loop rate registers calibration
+        // programmed under the signed ceiling (`power::program_chip`).
+        let plan = super::phy::ar9280::power::plan_chip(
+            identity,
+            image,
+            tune,
+            report.max_power_half_dbm,
+            overlap,
+            chip,
+        )
+        .map_err(|_| Error::Packet)?;
+        let powers = plan.registers[..plan.register_count].to_vec();
+        Ok(Self::assemble(
+            device,
+            cap,
+            bar,
+            Calibrated::Ar5008 {
+                report,
+                grant,
+                profile,
+                periodic: narf_lib::mutex::Mutex::new(super::calibration::ar5008::Periodic::new(
+                    &report,
+                    narf_time::monotonic_ns() / 1_000_000,
+                )),
+            },
+            channel_mask,
+            Some(InstalledPower::Rates(powers)),
+            rf_silent,
+        ))
+    }
     /// Discover, program and install one MSI vector while delivery stays
     /// disabled. Any failure leaves the owner on scheduled polling; a vector
     /// whose source cannot be proven disabled stays quarantined.
@@ -537,9 +657,12 @@ impl Native {
                 Ok(unsafe { self.bar.read32(register) })
             };
             let geometry = self.geometry();
-            if read(0x9874)? & 0x3fff_ffff != self.calibrated.synth(geometry.center())
-                || read(0x9804)? & 0x7ff != geometry.turbo()
-            {
+            if let Some(synth) = self.calibrated.synth(geometry.center()) {
+                if read(0x9874)? & 0x3fff_ffff != synth {
+                    return Err(Error::Descriptor);
+                }
+            }
+            if read(0x9804)? & 0x7ff != geometry.turbo() {
                 return Err(Error::Descriptor);
             }
             for (register, value) in powers.registers() {
@@ -801,20 +924,40 @@ impl Port for Native {
     fn mac_clock(&self) -> super::mac::Clock {
         match &self.calibrated {
             Calibrated::Ar9285(_) => super::mac::Clock::Ofdm2g,
-            Calibrated::Ar9287 { profile, .. } | Calibrated::Ar9280 { profile, .. } => {
-                profile.clock
-            }
+            Calibrated::Ar9287 { profile, .. }
+            | Calibrated::Ar9280 { profile, .. }
+            | Calibrated::Ar5008 { profile, .. } => profile.clock,
         }
     }
     fn tx_chainmask(&self) -> u8 {
         match &self.calibrated {
             Calibrated::Ar9285(_) => 1,
-            Calibrated::Ar9287 { profile, .. } | Calibrated::Ar9280 { profile, .. } => {
-                profile.tx_chainmask
-            }
+            Calibrated::Ar9287 { profile, .. }
+            | Calibrated::Ar9280 { profile, .. }
+            | Calibrated::Ar5008 { profile, .. } => profile.tx_chainmask,
         }
     }
     fn long_calibration(&self) -> Result<Option<i32>, Error> {
+        if let Calibrated::Ar5008 { periodic, .. } = &self.calibrated {
+            let mut periodic = periodic.try_lock().ok_or(Error::Busy)?;
+            // Same access() re-proof as below; `ar9002_hw_calibrate` on the
+            // AR5008 PHY has no temperature step, so no delta is reported.
+            return self.access(self.active.load(Ordering::Acquire), || {
+                let mut io = LongCal {
+                    native: self,
+                    lost: false,
+                };
+                let tick = periodic.tick(&mut io, narf_time::monotonic_ns() / 1_000_000);
+                if io.lost {
+                    return Err(Error::Access);
+                }
+                match tick {
+                    Ok(_) => Ok(None),
+                    Err(super::identity::BringUpError::Timeout) => Err(Error::Timeout),
+                    Err(_) => Err(Error::Descriptor),
+                }
+            });
+        }
         let (Calibrated::Ar9287 {
             image, periodic, ..
         }

@@ -144,6 +144,11 @@ pub(super) fn request_geometry(
                 {
                     // The dual-band AR9280 owner (either band, 20 MHz).
                     Box::pin(reset)
+                } else if let Some(reset) =
+                    super::ar5008_owner::transition(geometry.control(), generation)
+                {
+                    // The AR5416/AR5418/AR9160 owner (bands its map enables).
+                    Box::pin(reset)
                 } else if !geometry.is_5ghz() {
                     // The chip-generic AR9287 owner (no HT40 owner exists).
                     Box::pin(

@@ -691,20 +691,41 @@ kernel_test_in!(
 
 fn smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset() -> TestResult {
     let mut io = Fake::new();
-    if sleep_ar5008_io(&mut io, Chip::Ar5416).is_err()
+    if sleep_ar5008_io(&mut io, Chip::Ar5416, false).is_err()
         || io.ops.iter().rev().find(|op| matches!(op, Op::Write(..)))
             != Some(&Op::Write(AR_RC, 0x101))
     {
         return TestResult::Fail("AR5416 FULL_SLEEP asserted the RTC reset");
     }
     let mut io = Fake::new();
-    if sleep_ar5008_io(&mut io, Chip::Ar9160).is_err()
+    if sleep_ar5008_io(&mut io, Chip::Ar9160, false).is_err()
         || !matches!(
             io.ops.iter().rev().find(|op| matches!(op, Op::Write(..))),
             Some(Op::Write(AR_RTC_RESET, _))
         )
     {
         return TestResult::Fail("AR9160 FULL_SLEEP left the RTC running");
+    }
+    // An ASPM AR5418 adds the D3 `configpcipowersave(ah, true)` word
+    // (AR_PCIE_PM_CTRL_ENA cleared at 0x4014, no SerDes rows) before
+    // FULL_SLEEP; without ASPM nothing touches the PCIe block.
+    let pcie = |io: &Fake, register: u64| {
+        io.ops
+            .iter()
+            .any(|op| matches!(op, Op::Write(r, _) if *r == register))
+    };
+    let mut io = Fake::new();
+    if sleep_ar5008_io(&mut io, Chip::Ar5416, true).is_err()
+        || !pcie(&io, 0x4014)
+        || pcie(&io, 0x4040)
+        || io.ops.iter().rev().find(|op| matches!(op, Op::Write(..)))
+            != Some(&Op::Write(AR_RC, 0x101))
+    {
+        return TestResult::Fail("ASPM AR5418 suspend lacks the D3 PCIe word");
+    }
+    let mut io = Fake::new();
+    if sleep_ar5008_io(&mut io, Chip::Ar5416, false).is_err() || pcie(&io, 0x4014) {
+        return TestResult::Fail("non-ASPM AR5416 suspend wrote the PCIe PM word");
     }
     TestResult::Pass
 }

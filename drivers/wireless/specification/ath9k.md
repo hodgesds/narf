@@ -1728,8 +1728,9 @@ the 534/538 selected Linux rows),
 
 AR5008 identification (`identity::identify_ar5008`) follows `ath9k_hw_init`:
 the `AR_SREV` decode must match the device ID's chip before any write; then
-power-on + WARM reset (`ath9k_hw_chip_reset` has no COLD branch below
-AR9280), `ath9k_hw_disablepcie` for the PCI AR5416 (macVersion 0xd; the
+power-on + WARM reset (below AR9280 `ath9k_hw_chip_reset` selects WARM
+unless the chip was in FULL_SLEEP or TX/RX ran, cases the preceding
+power-on reset subsumes), `ath9k_hw_disablepcie` for the PCI AR5416 (macVersion 0xd; the
 legacy format makes only 0xc `is_pciexpress`: nine `AR_PCIE_SERDES` words
 and `AR_PCIE_SERDES2 = 0`), `ar9002_hw_rf_claim` (`AR_PHY(0x36)` /
 `AR_PHY(0x20)` radio-revision strobe, `AR_PHY(256)` nibble swap + bit
@@ -1739,12 +1740,13 @@ others refused before the map is read), the def map at word 64, and the
 `AR5416_OPFLAGS_11A` (GPIO 0 in `AR_GPIO_IN_OUT` high: RX 0x5, else 0x7)
 and `fixup_chainmask` against the three chains. The retained map is not
 rewritten; `Identity` carries the effective masks. `ath9k_hw_chip_test` is
-not run (as for the other non-AR9285 parts). `identity::sleep_ar5008_io`
-(the MMIO wrapper lands with the owner) is `ath_pci_suspend` for these parts: WARM reset and FULL_SLEEP
-(the owner must still add `pcie_pm::configure_ar5008(.., true)` for an
-ASPM AR5418: `ath9k_hw_configpcipowersave` is gated by `aspm_enabled`, not
-by AR9280_20)
-that, on AR5416, leaves the RTC out of reset (`ath9k_set_power_sleep`).
+not run (as for the other non-AR9285 parts). `identity::sleep_ar5008`
+(the MMIO wrapper of `sleep_ar5008_io`) is `ath_pci_suspend` for these
+parts: the `hw.c::ath9k_hw_disable` COLD reset (unconditional on every
+chip), `pcie_pm::configure_ar5008(.., true)` (`ath9k_stop` →
+`ath9k_hw_configpcipowersave(ah, true)`, gated by `aspm_enabled`, so only an
+ASPM AR5418 writes the D3 word) and FULL_SLEEP that, on AR5416, leaves the
+RTC out of reset (`ath9k_set_power_sleep`).
 Smokes (written, not executed):
 `smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks`,
 `smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset`.
@@ -1825,6 +1827,78 @@ map and the chip's `plan_chip` closed-loop plan at 40 half-dB. Filename
 `ath9k/ar5416-admit-v1-ch<N>-<mac>.bin` / `ath9k/ar9160-admit-v1-...`. No
 record or board value is supplied. Smoke (written, not executed):
 `smoke_ath9k_ar5008_admission_records_bind_chip_masks_and_channel`.
+
+**AR5416/AR5418/AR9160 native station (`ar5416_enablement`,
+`ar9160_enablement`).** `ar5008_owner.rs` registers `0x0023`
+(`ath9k-ar5416`), `0x0024` (`ath9k-ar5418`) and `0x0027` (`ath9k-ar9160`)
+with the shared singleton address reservation and the `ath9k-ar5008`
+device-PM hooks. Probe: `aspm` = the PCIe AR5418 with upstream ASPM
+(`pcie_pm::enabled`, `ath_pci_aspm_init`) → `identity::identify_ar5008`
+(power-on + WARM, `ath9k_hw_disablepcie`, `ar9002_hw_rf_claim`, def map,
+effective fixup/CB71 masks) → `phy::ar5008::Addac::new` (the
+device-lifetime `iniAddac` copy) → `phy::ar5008::prepare` at the initial
+primary (channel 1 when the map has `AR5416_OPFLAGS_11G`, else channel 36)
+→ the live `AR_PHY_TPCRG5` overlap below minor 2 →
+`admission::Facts::new_ar5008` (radio revision, effective masks) →
+`Source::Registered.load`; a missing, unsigned or foreign `N54A`/`N60A`
+record parks the chip (`identity::sleep_ar5008`, no ASPM word) and refuses
+the bind. Bring-up (scheduled `Policy` retries): `calibration::ar5008`
+under `Permission::from_domain_dual(..).with_ceiling(Grant::ceiling(host))`
+with `current_dual_in` and `Grant::invoke` re-checked every poll; then
+`Native::new_ar5008` → `mac::prepare_chip` (profile `mac::Profile::ar5008(rx,
+tx, tune.is_5ghz(), chip == Ar9160, cb71)`, `cb71 = device == 0x0023 &&
+image[6] & AR5416_OPFLAGS_11A == 0`, so the live GPIO 0 strap is re-proved
+against the effective RX mask) → optional MSI → `Packet::prepare` →
+`station::Radio` → `interface::publish`.
+
+`packet_native::Calibrated::Ar5008` retains the report, the signed grant,
+the profile and `calibration::ar5008::Periodic`; `Native::new_ar5008` binds
+the PCI ID to the grant's device and primary and to the report's chip, the
+tune/band to the report, the identity's effective masks to the profile and
+the report, `Masks::ThreeChain { cb71 }`, the generation's `Mfp` (AR9160
+`MiscMode2`, AR5416 none), the band's MAC clock (`Ofdm5g` on 5 GHz), a mask
+inside `CHANNEL_BITS` that names the primary, and retains the three-chain
+closed-loop rate registers `power::plan_chip` derives at the calibrated
+ceiling and overlap. Every access re-proves the PCI capability,
+`Calibrated::permitted` (`from_domain_dual` + `Grant::invoke` +
+`Permission::allows_ar5008`), `AR_PHY_TURBO` and the rate registers. There
+is no synthesizer readback for these parts: the AR5008 PHY has no
+`AR_PHY_SYNTH_CONTROL` and `ar5008_hw_set_channel` programs the AR2133/AR5133
+through the `AR_PHY(0x37)` serial write port, which Linux never reads.
+`long_calibration` ticks `calibration::ar5008::Periodic` (no temperature
+delta). The mask (`admitted_mask`) is the primary plus every primary of the
+bands the map's `opCapFlags` enable (`phy::ar5008::tune`) whose record
+verifies; `channels::request_geometry` routes a 20 MHz request to
+`ar5008_owner::transition` after the AR9280 owner (HT40 fails closed).
+
+Retunes, recovery and resume (`ar5008_owner::reset`, under `CONTROL`, while
+the requesting generation is current) prove the dual-band permission at the
+target and load its own record before retiring the station; require the
+DMA-stop proof and bus mastering off; repeat `identify_ar5008` (power-on +
+the WARM reset `hw.c::ath9k_hw_chip_reset` selects below AR9280 with TX/RX
+stopped; its `chip_fullsleep` COLD branch after resume is subsumed by the
+power-on reset) with identical revision, radio, identity and map; run
+`phy::ar5008::prepare` at the target with the retained `iniAddac` (written
+back, as Linux edits it in place) and require the record's preparation and
+the probe's TPCRG5 overlap; then bump the generation and run the same
+`initialize`. No fast channel change is used (`ath9k_hw_reset` falls back
+to the same full reset). Supervisor and remove follow the AR9280 owner,
+with periodic calibration from `calibration::ar5008::Periodic` (AR9160
+multi-sample IQ per short tick, three-chain NF history every long tick;
+AR5416 NF only). Suspend retires the station, then `identity::sleep_ar5008`
+(COLD `ath9k_hw_disable`, the ASPM AR5418 D3 word, FULL_SLEEP with the
+AR5416 RTC kept out of reset); resume (`ath_pci_resume`) re-disables
+RETRY_TIMEOUT and spawns the reset. Smokes (written, not executed):
+`smoke_ath9k_ar5008_native_profile_binds_chip_band_and_masks`; the
+`smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset` smoke now covers the
+ASPM D3 word.
+
+Known AR5416/AR5418/AR9160 gaps: no such board has been measured, so no
+`N54A`/`N60A` record exists in-tree and every probe stays unadmitted until
+one is provisioned; a map whose initial primary record is absent cannot
+bind; ANI is not run; HT20/HT40 TX power and every HT owner are out of
+scope; open-loop maps stay refused; DFS, NO_IR and indoor-only channels are
+refused. No physical AR5416, AR5418 or AR9160 receipt exists.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

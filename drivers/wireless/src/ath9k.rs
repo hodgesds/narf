@@ -10,6 +10,7 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod admission;
+mod ar5008_owner;
 mod ar9280_owner;
 mod ar9287_owner;
 mod calibration;
@@ -1038,6 +1039,17 @@ pub fn register() {
         });
         narf_bus::register_pci_remove(name, ar9280_owner::remove);
     }
+    for (device, name) in ar5008_owner::DEVICES {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: ATHEROS_PCI_VENDOR,
+                device,
+            },
+            probe: ar5008_owner::probe,
+        });
+        narf_bus::register_pci_remove(name, ar5008_owner::remove);
+    }
     narf_power::device_pm::register_device_pm("ath9k", pm_suspend, pm_resume);
     narf_power::device_pm::register_device_pm(
         "ath9k-ar9287",
@@ -1048,5 +1060,10 @@ pub fn register() {
         "ath9k-ar9280",
         ar9280_owner::pm_suspend,
         ar9280_owner::pm_resume,
+    );
+    narf_power::device_pm::register_device_pm(
+        "ath9k-ar5008",
+        ar5008_owner::pm_suspend,
+        ar5008_owner::pm_resume,
     );
 }

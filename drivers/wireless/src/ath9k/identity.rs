@@ -276,13 +276,26 @@ fn disable_and_sleep_with<R: RegisterIo>(
     Ok(())
 }
 
-/// AR5416/AR5418/AR9160 `ath_pci_suspend`: WARM reset
-/// (`ath9k_hw_chip_reset` takes no COLD branch below AR9280), no
-/// `configpcipowersave` (AR9280_20_OR_LATER only) and FULL_SLEEP, which on
+/// AR5416/AR5418/AR9160 `ath_pci_suspend`: the `hw.c::ath9k_hw_disable`
+/// COLD reset (unconditional, every chip), `ath9k_stop` →
+/// `ath9k_hw_configpcipowersave(ah, true)`
+/// (`pcie_pm::configure_ar5008(.., true)`: gated by `aspm_enabled`, so only
+/// an ASPM PCIe AR5418 `0x0024` writes anything) and FULL_SLEEP, which on
 /// AR5416 leaves the RTC out of reset (`ath9k_set_power_sleep`).
-#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
-fn sleep_ar5008_io(io: &mut impl RegisterIo, chip: Chip) -> Result<(), BringUpError> {
-    disable_and_sleep_with(io, false, chip != Chip::Ar5416, |_| Ok(()))
+fn sleep_ar5008_io(io: &mut impl RegisterIo, chip: Chip, aspm: bool) -> Result<(), BringUpError> {
+    disable_and_sleep_with(io, true, chip != Chip::Ar5416, |io| {
+        super::pcie_pm::configure_ar5008(io, aspm, true)
+    })
+}
+
+/// [`sleep_ar5008_io`] on the owner's BAR (`ar5008_owner::pm_suspend`).
+pub(super) fn sleep_ar5008(
+    mmio: narf_bus::MmioRegion,
+    cap: Cap<BusDeviceCap, Write>,
+    chip: Chip,
+    aspm: bool,
+) -> Result<(), BringUpError> {
+    sleep_ar5008_io(&mut Registers::new(mmio, cap), chip, aspm)
 }
 
 pub(super) fn sleep(
