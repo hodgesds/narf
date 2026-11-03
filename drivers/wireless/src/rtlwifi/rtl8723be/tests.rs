@@ -1196,3 +1196,310 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_erfon_block_and_channel_grant
 );
+
+// ── H2C / C2H / LPS / RA mask / IRQ / DM / card disable ───────────────────
+
+struct RegLogModel {
+    regs: Vec<u8>,
+    writes: Vec<(u16, u32, u8)>,
+}
+struct RegLog(IrqSafeSpinLock<RegLogModel>);
+#[async_trait::async_trait]
+impl Io for RegLog {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        Ok(self.0.lock().regs[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        Ok(u32::from_le_bytes([
+            g.regs[r],
+            g.regs[r + 1],
+            g.regs[r + 2],
+            g.regs[r + 3],
+        ]))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.writes.push((reg, u32::from(value), 1));
+        // The modelled power FSM completes 0x05[1:0] requests immediately.
+        g.regs[usize::from(reg)] = if reg == 5 { value & !3 } else { value };
+        Ok(())
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.writes.push((reg, u32::from(value), 2));
+        let r = usize::from(reg);
+        g.regs[r..r + 2].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.writes.push((reg, value, 4));
+        let r = usize::from(reg);
+        g.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+fn reg_log() -> RegLog {
+    RegLog(IrqSafeSpinLock::new(RegLogModel {
+        regs: vec![0u8; 0x800],
+        writes: Vec::new(),
+    }))
+}
+
+/// `_rtl8723be_fill_h2c_command` box / extension-box writes and box
+/// rotation, the HMETFR timeout, `rtl8723be_set_fw_pwrmode_cmd` (no PS
+/// gate: the LPS-enter `SETPWRMODE(MAX)` is written; BT LPS control) and
+/// `HW_VAR_SET_RPWM` at 0x361.
+fn smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm() -> TestResult {
+    use crate::rtlwifi::prepare::Error as PrepError;
+    use h2c::*;
+    let io = reg_log();
+    let mut mb = Mailbox::default();
+    if narf_scheduler::block_on(mb.fill(&io, H2C_MSRRPT, &media_status(true))).is_err() {
+        return TestResult::Fail("8723BE short H2C refused");
+    }
+    let short: Vec<_> = io.0.lock().writes.clone();
+    if short
+        != [
+            (0x1d0, 0x01, 1),
+            (0x1d1, 0x01, 1),
+            (0x1d2, 0, 1),
+            (0x1d3, 0, 1),
+        ]
+        || mb.next_box() != 1
+    {
+        return TestResult::Fail("8723BE 3-byte box write");
+    }
+    io.0.lock().writes.clear();
+    let enter = narf_scheduler::block_on(fwlps_enter(&io, &mut mb, None));
+    // MAX mode: rlbm 1, smart_ps 2, awake 2, RF off, byte5 0x40.
+    if enter != Ok([1, 0x21, 2, 0, 0, 0x40, 0]) {
+        return TestResult::Fail("8723BE LPS-enter SETPWRMODE");
+    }
+    {
+        let g = io.0.lock();
+        let w: Vec<_> = g.writes.iter().map(|w| (w.0, w.1)).collect();
+        if w[..4] != [(0x1f4, 0), (0x1f5, 0x40), (0x1f6, 0), (0x1f7, 0)]
+            || w[4..8] != [(0x1d4, 0x20), (0x1d5, 1), (0x1d6, 0x21), (0x1d7, 2)]
+            || w[8] != (0x361, 0x80)
+            || w.len() != 9
+        {
+            return TestResult::Fail("8723BE ext-box order / RPWM toggle");
+        }
+    }
+    io.0.lock().regs[0x361] = 0x80;
+    io.0.lock().writes.clear();
+    let leave = narf_scheduler::block_on(fwlps_leave(&io, &mut mb, None));
+    if leave != Ok([0, 0x02, 4, 0, FW_PWR_STATE_ACTIVE, 0x40, 0])
+        || io.0.lock().writes[0] != (0x361, 0, 1)
+    {
+        return TestResult::Fail("8723BE LPS-leave RPWM then SETPWRMODE(ACTIVE)");
+    }
+    let bt = BtLps {
+        lps_on: true,
+        lps_val: 0x50,
+        rpwm_val: 0x04,
+    };
+    if pwrmode(PsMode::Max, 2, Some(bt)) != [1, 0x00, 2, 0, 0x04, 0x50, 0]
+        || pwrmode(
+            PsMode::Max,
+            2,
+            Some(BtLps {
+                lps_on: false,
+                ..bt
+            }),
+        ) != [0, 0x02, 4, 0, FW_PWR_STATE_ACTIVE, 0x40, 0]
+        || pwrmode(PsMode::Dtim, 2, None) != [1, 0x22, 2, 0, 0, 0x40, 0]
+    {
+        return TestResult::Fail("8723BE BT-controlled / DTIM pwrmode");
+    }
+    // Box 3 never read by the firmware: the command is refused and poisons.
+    io.0.lock().regs[0x1cc] = 1 << mb.next_box();
+    if narf_scheduler::block_on(mb.fill(&io, H2C_RA_MASK, &[0; 7]))
+        != Err(PrepError::CommandTimeout)
+        || !mb.failed
+        || narf_scheduler::block_on(mb.fill(&io, H2C_MSRRPT, &[0; 3])) != Err(PrepError::State)
+    {
+        return TestResult::Fail("8723BE HMETFR timeout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm
+);
+
+/// `rtl8723be_update_hal_rate_mask` (1T1R, `RATR_INX_WIRELESS_NGB` ⇒ ARFR 1
+/// at both widths, GB 6, B 8), `rtl8723be_dm_refresh_rate_adaptive_mask`
+/// thresholds (low `low2high_rssi_thresh_for_ra40m` = 0) and the
+/// `_rtl8723be_query_rxphystatus` PWDB.
+fn smoke_rtl8723be_ra_mask_dm_and_rx_pwdb() -> TestResult {
+    use crate::rtlwifi::rate_adaptive::{STA_HIGH, STA_INIT, STA_LOW, STA_MIDDLE};
+    use h2c::*;
+    let n = Peer {
+        legacy: 0xfff,
+        ht: Some([0xff, 0xff]),
+        sgi20: true,
+        sgi40: false,
+    };
+    if rate_mask(&n, false, 0, false) != [0, 0x81, 0x08, 0x05, 0xf0, 0x0f, 0]
+        || rate_mask(&n, true, 0, true) != [0, 0x01, 0x01, 0x15, 0xf0, 0x0f, 0]
+        || rate_mask(&n, true, 1, true)[3..] != [0, 0, 0x0f, 0]
+        || rate_mask(&n, false, 2, true)[3..] != [0, 0xf0, 0x0f, 0]
+    {
+        return TestResult::Fail("8723BE N rate mask");
+    }
+    let g = Peer {
+        legacy: 0xff5,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+    };
+    let b = Peer { legacy: 0xf, ..g };
+    if rate_mask(&g, false, 0, true) != [0, ARFR_GB, 0, 0xf5, 0x0f, 0, 0]
+        || rate_mask(&b, false, 0, true) != [0, ARFR_B, 0, 0x0d, 0, 0, 0]
+        || mask_rates(&rate_mask(&n, true, 0, true)) != Some(0x000f_f015)
+        || mask_rates(&[0, ARFR_GB, 0, 0, 0x10, 0, 0]).is_some()
+        || mask_rates(&[0, 5, 0, 1, 0, 0, 0]).is_some()
+        || mask_rates(&[0, ARFR_NGB, 0, 0, 0, 0x10, 0]).is_some()
+    {
+        return TestResult::Fail("8723BE legacy rate mask / mask_rates");
+    }
+    for (rssi, prev, expected) in [
+        (51, STA_INIT, Some(STA_HIGH)),
+        (1, STA_INIT, Some(STA_MIDDLE)),
+        (0, STA_INIT, Some(STA_LOW)),
+        (55, STA_MIDDLE, None),
+        (56, STA_MIDDLE, Some(STA_HIGH)),
+        (5, STA_LOW, None),
+        (6, STA_LOW, Some(STA_MIDDLE)),
+    ] {
+        if dm::ra_state(rssi, prev) != expected {
+            return TestResult::Fail("8723BE RA hysteresis");
+        }
+    }
+    let mut phy = [0u8; 8];
+    phy[4] = 0x50 << 1; // 0x50 - 110 = -30 dBm ⇒ 70
+    for (agc, cck, expected) in [
+        (0, false, Some(70)),
+        ((6 << 5) | 3, true, Some(60)),  // -34 - 6 = -40
+        ((4 << 5) | 10, true, Some(66)), // -14 - 20 = -34
+        ((1 << 5) | 2, true, Some(100)), // 6 - 4 = 2
+        (31, true, Some(54)),            // 16 - 62 = -46
+        (2 << 5, true, Some(100)),       // no case: rx_pwr_all stays 0
+    ] {
+        phy[5] = agc;
+        if dm::rx_pwdb(&phy, cck) != expected {
+            return TestResult::Fail("8723BE query_rxphystatus PWDB");
+        }
+    }
+    if dm::rx_pwdb(&phy[..5], false).is_some() {
+        return TestResult::Fail("8723BE short PHY status admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_ra_mask_dm_and_rx_pwdb
+);
+
+/// `rtl_c2h_content_parsing` for this chip (BT info / MP to coexistence,
+/// RA report ignored unread), the `rtl8723be_{enable,disable}_interrupt` /
+/// `interrupt_recognized` profile with the HSISR write, and
+/// `_rtl8723be_poweroff_adapter` order.
+fn smoke_rtl8723be_c2h_irq_and_card_disable() -> TestResult {
+    use c2h::*;
+    if parse(&[C2H_BT_INFO, 0, 1, 2]) != Ok(Event::BtInfo(&[1, 2]))
+        || parse(&[C2H_BT_MP, 0, 9]) != Ok(Event::BtMp(&[9]))
+        || parse(&[C2H_RA_RPT, 0]) != Ok(Event::Other(&[]))
+        || parse(&[C2H_TX_REPORT, 0, 0x40, 0, 3, 0, 0, 0, 7])
+            != Ok(Event::TxReport {
+                sn: 7,
+                st: 0x40,
+                retry: 3,
+            })
+        || parse(&[C2H_TX_REPORT, 0, 0]) != Err(Error::Truncated)
+        || parse(&[0x33]) != Err(Error::Truncated)
+    {
+        return TestResult::Fail("8723BE C2H dispatch");
+    }
+    let io = reg_log();
+    {
+        let mut g = io.0.lock();
+        g.regs[0xb4..0xb8].copy_from_slice(&0xffff_ffffu32.to_le_bytes()[..]);
+        g.regs[0xb4 + 3] = 0x7f;
+        g.regs[0xbc..0xc0].copy_from_slice(&0x0000_0f00u32.to_le_bytes());
+        g.regs[0x5c] = 0x05;
+    }
+    let got = h2c::service_interrupt(&io);
+    let mask0 = h2c::IRQ_MASK0;
+    let w: Vec<_> = io.0.lock().writes.clone();
+    if got != Ok((0x7fff_ffff & mask0, 0x100))
+        || w != [
+            (0xb0, 0, 4),
+            (0xb8, 0, 4),
+            (0xb4, 0x7fff_ffff & mask0, 4),
+            (0xbc, 0x100, 4),
+            (0x5c, 0xc5, 1),
+            (0xb0, mask0, 4),
+            (0xb8, 0x100, 4),
+            (0x58, 0xc0, 4),
+        ]
+        || mask0 != 0x2000_84ff
+    {
+        return TestResult::Fail("8723BE interrupt recognition / HSISR / HSIMR");
+    }
+    let model = |ready_bit: bool| {
+        let io = reg_log();
+        {
+            let mut g = io.0.lock();
+            g.regs[0x80] = if ready_bit { 0xc6 } else { 0x46 };
+            g.regs[0x1d] = 1;
+            g.regs[3] = 0xfc;
+        }
+        io
+    };
+    let io = model(true);
+    if narf_scheduler::block_on(crate::rtlwifi::power_runtime::disable_rtl8723be(&io, true))
+        .is_err()
+    {
+        return TestResult::Fail("8723BE poweroff failed on an idle model");
+    }
+    let g = io.0.lock();
+    let w: Vec<_> = g.writes.iter().map(|w| (w.0, w.1 as u8)).collect();
+    let at = |reg: u16, value: u8| w.iter().position(|&x| x == (reg, value));
+    let (Some(lps), Some(fw0), Some(fwdl), Some(rf)) =
+        (at(0x553, 0x20), at(0x1d, 0), at(0x80, 0), at(0x1f, 0))
+    else {
+        return TestResult::Fail("8723BE poweroff write missing");
+    };
+    if !(lps < fw0 && fw0 < fwdl && fwdl < rf)
+        || w.iter().filter(|&&x| x == (3, 0xf8)).count() != 2
+        || w.last() != Some(&(0x1c, 0x0e))
+        || w[w.len() - 2] != (0x1d, 1)
+        || w[w.len() - 3] != (0x1d, 0)
+    {
+        return TestResult::Fail("8723BE poweroff order / final state");
+    }
+    drop(g);
+    let cold = model(false);
+    if narf_scheduler::block_on(crate::rtlwifi::power_runtime::disable_rtl8723be(
+        &cold, true,
+    ))
+    .is_err()
+        || cold.0.lock().writes.iter().filter(|w| w.0 == 3).count() != 1
+    {
+        return TestResult::Fail("8723BE self-reset without MCUFWDL BIT7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_c2h_irq_and_card_disable
+);

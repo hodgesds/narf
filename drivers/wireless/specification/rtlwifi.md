@@ -3127,6 +3127,38 @@ keeps the chip diagnostic until admission lands.
   `smoke_rtl8723be_iqk_compare_and_full_run`,
   `smoke_rtl8723be_erfon_block_and_channel_grant` (written, unexecuted).
 
+- `h2c` / `c2h` / `dm` / card disable — `_rtl8723be_fill_h2c_command`
+  (the 92EE box / extension-box structure, 100 HMETFR checks with the
+  `0x130` read; **no** power-save gate and no `REG_CR == 0xEA` check, so
+  the LPS-enter `SETPWRMODE` is written; a full wait is an error that
+  poisons the mailbox where Linux drops silently), `rtl8723be_set_fw_pwrmode_cmd`
+  (`reg_fwctrl_lps = 2` ⇒ `FW_PS_MAX_MODE`, `smart_ps` 0 on leave / 2 on
+  enter, the BT-controlled form `h2c::BtLps` with `SMART_PS = 0`, MIN /
+  ACTIVE by `btc_is_bt_lps_on`, byte 5 / power state from coexistence and
+  the awake-interval-2 rule), `HW_VAR_SET_RPWM` at `0x361`,
+  `_rtl8723be_fwlps_{enter,leave}` (`low_power_enable` false),
+  `rtl8723be_update_hal_rate_mask` (RF_1T1R, every N station on
+  `RATR_INX_WIRELESS_NGB` ⇒ ARFR 1 at either width, GB 6, B 8),
+  `rtl8723be_{enable,disable}_interrupt` (HSIMR = `sys_irq_mask` on every
+  enable), `rtl8723be_interrupt_recognized` with `_rtl_pci_hs_interrupt`
+  (`IMR_HSISR_IND_ON_INT`); `rtl_c2h_content_parsing` with no
+  `c2h_ra_report_handler` (RA report unread) and BT info / MP bodies handed
+  to the coexistence owner; `_rtl8723be_query_rxphystatus` PWDB (four-entry
+  CCK LNA table, no `cck_highpwr` step) and
+  `rtl8723be_dm_refresh_rate_adaptive_mask` (low threshold
+  `low2high_rssi_thresh_for_ra40m` = 0, the 8821AE rule). Only the RA mask
+  refresh of `rtl8723be_dm_watchdog` is composed (DIG, false alarm, EDCCA,
+  CCK PD, EDCA turbo, ATC and TX-power tracking are not).
+  `power_runtime::disable_rtl8723be` = `_rtl8723be_poweroff_adapter`
+  (LPS-enter flow, self-reset on MCUFWDL BIT7 + ready, MCU reset,
+  MCUFWDL 0, card-disable flow, RSV_CTRL+1 pulse, RSV_CTRL 0x0e); the
+  rebuild owner composes it with admission. None of this is reachable from
+  probe yet: BT coexistence (`halbtc8723b1ant` / `2ant`, which Linux runs
+  on every 8723BE board, `bt_exist` or not) and the signed envelope are
+  outstanding. Tests `smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm`,
+  `smoke_rtl8723be_ra_mask_dm_and_rx_pwdb`,
+  `smoke_rtl8723be_c2h_irq_and_card_disable` (written, unexecuted).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE

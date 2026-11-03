@@ -234,6 +234,36 @@ pub(super) async fn disable_rtl8192ee(io: &impl Io, firmware_ready: bool) -> Res
     io.write8(0x1c, 0x0e)
 }
 
+/// RTL8723BE `rtl8723be_card_disable` → `_rtl8723be_poweroff_adapter`, in
+/// source order, after the independent old-DMA retirement proof:
+/// `RTL8723_NIC_LPS_ENTER_FLOW` (`rtl8723B_enter_lps_flow`); the `REG_RF_CTRL`
+/// write is commented out in Linux and not issued;
+/// `rtl8723be_firmware_selfreset` when MCUFWDL BIT(7) and the firmware is
+/// ready; SYS_FUNC_EN+1 BIT(2) off (MCU reset); MCUFWDL = 0;
+/// `RTL8723_NIC_DISABLE_FLOW` (`rtl8723B_card_disable_flow`); the
+/// REG_RSV_CTRL+1 BIT(0) MCU IO-wrapper reset pulse; REG_RSV_CTRL = 0x0e.
+/// Linux first calls `_rtl8723be_set_media_status(UNSPECIFIED)`; that MSR
+/// write is not issued (88EE/8821AE/8192EE precedent). `iqk_initialized`
+/// is kept: `get_btc_status()` is always true on this chip. LED control is
+/// not composed. The rebuild owner composes it with the chip's admission.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+pub(super) async fn disable_rtl8723be(io: &impl Io, firmware_ready: bool) -> Result<(), Error> {
+    use super::rtl8723be::{
+        fw,
+        pwrseq::{RTL8723B_CARD_DISABLE_FLOW, RTL8723B_ENTER_LPS_FLOW},
+    };
+    flow(io, PWR_CUT_ALL_MSK, RTL8723B_ENTER_LPS_FLOW).await?;
+    if io.read8(0x80)? & 0x80 != 0 && firmware_ready {
+        fw::selfreset(io).await?;
+    }
+    update(io, 3, 4, 0).await?;
+    io.write8(0x80, 0)?;
+    flow(io, PWR_CUT_ALL_MSK, RTL8723B_CARD_DISABLE_FLOW).await?;
+    update(io, 0x1d, 1, 0).await?;
+    update(io, 0x1d, 0, 1).await?;
+    io.write8(0x1c, 0x0e)
+}
+
 /// RTL8192CE / RTL8188CE `rtl92ce_card_disable` for the rebuild's power
 /// down. The retained owner's quiescence (`ce92_quiesce`) already ran
 /// `_rtl92ce_poweroff_adapter` after its descriptor retirement proof and

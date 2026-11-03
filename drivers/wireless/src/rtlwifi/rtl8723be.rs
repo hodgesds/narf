@@ -45,12 +45,22 @@
 //!   `rtl8723be_phy_set_txpower_level`.
 //! - [`init`] — the `rtl8723be_hw_init` tail through the `ERFON` block,
 //!   run by `Prepared::configure_rtl8723be`.
+//! - [`h2c`] — `_rtl8723be_fill_h2c_command` boxes, `SETPWRMODE` (with the
+//!   BT-controlled LPS form), RPWM, the 1T1R station RA mask and the PCI
+//!   interrupt profile with the HSISR write.
+//! - [`c2h`] — `rtl_c2h_content_parsing` for this chip (BT info / MP to
+//!   the coexistence owner, RA report ignored).
+//! - [`dm`] — `_rtl8723be_query_rxphystatus` PWDB and the
+//!   `rtl8723be_dm_refresh_rate_adaptive_mask` thresholds.
 
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod c2h;
 pub mod channel;
+pub mod dm;
 pub mod fw;
+pub mod h2c;
 pub mod init;
 pub mod iqk;
 pub mod llt;
