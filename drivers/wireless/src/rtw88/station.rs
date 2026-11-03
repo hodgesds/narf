@@ -2728,12 +2728,15 @@ impl State {
             // N21W tracks the HT20 TXAGC selection; it is not qualified for
             // the N2xB HT40 selection, so a 40MHz association runs without it.
             if self.ht.is_some() && self.ht40.is_none() && !super::band5::primary(self.channel) {
-                if let Some(g) = io.station_power_tracking_extension(
-                    facts.thermal[0],
-                    self.tracking.grant.clone(),
-                )? {
-                    self.admission
-                        .run(|| io.station_bind_power_tracking(g.clone()))?;
+                if let Some(g) = io
+                    .station_power_tracking_extension(facts.thermal[0], self.tracking.grant.clone())
+                    .await?
+                {
+                    firmware_transport::enclosed(
+                        |op| self.admission.run(op),
+                        io.station_bind_power_tracking(g.clone()),
+                    )
+                    .await?;
                     self.admission.retire_receive()?;
                     self.power_tracking = Some(Box::new(super::tracking8821c::Tracker::new(g)));
                 }

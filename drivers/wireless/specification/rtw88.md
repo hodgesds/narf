@@ -3515,10 +3515,33 @@ Former blockers, verified against the tree:
    (`Core::complete_batch` FIFO), which the station's FIFO DATA retirement
    needs. A refusal before queueing leaves the owner running; a failed URB
    begin fails it and the backend. Written, unexecuted:
-   `smoke_rtw88_usb_packet_ampdu_batch`. Still `Unsupported` on USB:
-   `station_power_tracking_*` (W continuation maintenance) and
-   `station_ps_rx_quiet` (LPS page); power tracking's W continuation is
-   likewise absent (`station_power_tracking_extension` default `None`).
+   `smoke_rtw88_usb_packet_ampdu_batch`. Power tracking (landed;
+   `phy.c::rtw_phy_pwr_track` -> `rtw8821c.c::rtw8821c_pwr_track`):
+   `Io::station_power_tracking_request`/`_extension`/
+   `station_bind_power_tracking`/`_begin`/`_quiet`/`_iqk`/`_finish` return
+   `impl Future + Send` (the PCI `reserved_page::Backend` runs the unchanged
+   synchronous `Registers` call in the first poll; `tracking8821c::program`
+   and `station.rs` enclose begin/bind/finish with
+   `firmware_transport::enclosed` instead of `Admission::run`). The USB
+   backend mirrors `pci_firmware.rs` over EP0: request/extension read
+   0xc94/0xc1c and load the host-keyed N21W record
+   (`rtw88/rtw8821cu-power-track-v1-*`, header = USB VID/PID) over an HT
+   gate; bind reads back the W program; begin requires the open,
+   non-retuning backend with no H2C/mailbox outstanding and the bound W,
+   flips it to Changing (so `Gate::current`, and with it `packet_submit` and
+   every publication, refuses TX) and reports `transmit_quiet`; the
+   continuation's only H2C is `command::iqk8821c_associated` at the running
+   sequence (`poll_h2c` admits it); finish re-proves quiet, TXPAUSE 0xff and
+   RXPKT_NUM RXDMA_IDLE|RW_RELEASE, reads back the program, the HT grant and
+   the thermal window, releases RW_RELEASE/TXPAUSE with readback and commits
+   or retires W. USB has no RX descriptor ring: the RX side is the
+   continuation's RXDMA_IDLE park plus the station's receive retirement.
+   Unlike PCI, USB `packet_submit` cannot replay the W readback per frame
+   (that would be EP0 I/O in a synchronous call); the W phase in
+   `Gate::current` and the readbacks at bind/begin/finish and in
+   `station_profile_readback` stand in for it. Written, unexecuted:
+   `smoke_rtw88_usb_power_tracking_preconditions`. Still `Unsupported` on
+   USB: `station_ps_rx_quiet` (LPS page).
    Written, unexecuted: `smoke_rtw88_usb_station_retune_preconditions`. Written, unexecuted:
    `smoke_rtw88_usb_firmware_reserved_page_sequence`,
    `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`,
@@ -3531,7 +3554,7 @@ Former blockers, verified against the tree:
    `Factory8821c::on_usb` (MAC at 0x107). Each poll is an EP0 transfer, so
    nothing spins; the PCI `EfuseIo` path is unchanged. Written, unexecuted:
    `smoke_rtw88_usb_efuse_factory_async`.
-   Remaining: USB power tracking and the LPS page quiet proof (above).
+   Remaining: the LPS page quiet proof (above).
 3. Identity and records (resolved: host-keyed records).
    `phy8821c::Interface::Usb { vendor, product }` carries the claimed
    VID/PID; `Interface::host()` yields `phy8821c::Host` (PCI 0x10ec:0xc821,

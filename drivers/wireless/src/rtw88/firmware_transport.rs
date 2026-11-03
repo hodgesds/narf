@@ -536,33 +536,42 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
-    /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    /// N21W measurement metadata for the bound C21 HT/T/Q program.
+    /// Power-tracking hooks return `impl Future + Send`: the PCI
+    /// `reserved_page::Backend` runs its unchanged synchronous `Registers`
+    /// call in the first poll; the USB backend runs them over EP0.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_request(
         &mut self,
         _: u8,
         _: Option<alloc::sync::Arc<super::qualification::Grant>>,
-    ) -> Result<super::PowerTrackingRequest, Error> {
-        Err(Error::Unsupported)
+    ) -> impl core::future::Future<Output = Result<super::PowerTrackingRequest, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_extension(
         &mut self,
         _: u8,
         _: Option<alloc::sync::Arc<super::qualification::Grant>>,
-    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
-        Ok(None)
+    ) -> impl core::future::Future<
+        Output = Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error>,
+    > + Send {
+        async move { Ok(None) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_bind_power_tracking(
         &mut self,
         _: alloc::sync::Arc<super::tracking8821c::Grant>,
-    ) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_begin(
         &mut self,
         _: &alloc::sync::Arc<super::tracking8821c::Grant>,
         _: bool,
-    ) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_quiet(
@@ -570,14 +579,18 @@ pub(super) unsafe trait Io: Send {
     ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
         async move { Err(Error::Unsupported) }
     }
-    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_finish(
         &mut self,
         _: Option<super::tracking8821c::Program>,
-    ) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn station_bind_continuation(
         &mut self,
@@ -1430,7 +1443,9 @@ impl<I: Io> Owner<I> {
         self.io.station_rts_request()
     }
     /// N2xD dynamic-mechanism measurement metadata. No grant.
-    pub(super) fn power_tracking_request(&mut self) -> Result<super::PowerTrackingRequest, Error> {
+    pub(super) async fn power_tracking_request(
+        &mut self,
+    ) -> Result<super::PowerTrackingRequest, Error> {
         let facts = self
             .tracking_facts
             .filter(|f| f.did == 0xc821 && f.power_track_type == 0 && f.thermal[0] <= 63)
@@ -1439,7 +1454,9 @@ impl<I: Io> Owner<I> {
             .station
             .as_deref()
             .and_then(super::station::State::dm_grant);
-        self.io.station_power_tracking_request(facts.thermal[0], dm)
+        self.io
+            .station_power_tracking_request(facts.thermal[0], dm)
+            .await
     }
     pub(super) fn tracking_request(&mut self) -> Result<super::ContinuationRequest, Error> {
         self.io.station_continuation_request(&super::dm::KIND)

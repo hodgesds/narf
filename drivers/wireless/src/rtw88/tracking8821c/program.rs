@@ -232,7 +232,11 @@ impl Tracker {
             Ok(p) => p,
             Err(_) => return self.restore(io, a).await,
         };
-        let entered = a.run(|| io.station_power_tracking_begin(&g, false))?;
+        let entered = crate::rtw88::firmware_transport::enclosed(
+            |op| a.run(op),
+            io.station_power_tracking_begin(&g, false),
+        )
+        .await?;
         if !entered {
             return Ok(false);
         }
@@ -261,7 +265,11 @@ impl Tracker {
             Self::iqk(io, &g, a).await?;
             self.iqk_changed = true;
         }
-        a.run(|| g.authority(|| io.station_power_tracking_finish(Some(p))))?;
+        crate::rtw88::firmware_transport::enclosed(
+            |op| a.run(|| g.authority(op)),
+            io.station_power_tracking_finish(Some(p)),
+        )
+        .await?;
         a.retire_receive()?;
         attempt.armed = false;
         self.ewma = ewma;
@@ -319,7 +327,7 @@ impl Tracker {
                 if rf_read(io, 8).await? != 0 {
                     return Err(Error::Prerequisite);
                 }
-                io.station_power_tracking_iqk()
+                io.station_power_tracking_iqk().await
             })
             .await
         })
@@ -393,7 +401,12 @@ impl Tracker {
             return Err(Error::Prerequisite);
         }
         let g = self.grant.clone();
-        if !a.run(|| io.station_power_tracking_begin(&g, true))? {
+        if !crate::rtw88::firmware_transport::enclosed(
+            |op| a.run(op),
+            io.station_power_tracking_begin(&g, true),
+        )
+        .await?
+        {
             return Ok(false);
         }
         let mut attempt = Attempt {
@@ -448,7 +461,7 @@ impl Tracker {
                     u32::from(SCALE[usize::from(g.initial)]),
                 )
                 .await?;
-                io.station_power_tracking_finish(None)
+                io.station_power_tracking_finish(None).await
             })
             .await
         })

@@ -560,33 +560,38 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_request(
         &mut self,
         t: u8,
         d: Option<alloc::sync::Arc<super::qualification::Grant>>,
-    ) -> Result<super::PowerTrackingRequest, Error> {
-        self.io.station_power_tracking_request(t, d)
+    ) -> impl core::future::Future<Output = Result<super::PowerTrackingRequest, Error>> + Send {
+        async move { self.io.station_power_tracking_request(t, d) }
     }
-
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_extension(
         &mut self,
         thermal: u8,
         dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
-    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
-        self.io.station_power_tracking_extension(thermal, dm)
+    ) -> impl core::future::Future<
+        Output = Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error>,
+    > + Send {
+        async move { self.io.station_power_tracking_extension(thermal, dm) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_bind_power_tracking(
         &mut self,
         g: alloc::sync::Arc<super::tracking8821c::Grant>,
-    ) -> Result<(), Error> {
-        self.io.station_bind_power_tracking(g)
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_bind_power_tracking(g) }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_begin(
         &mut self,
         g: &alloc::sync::Arc<super::tracking8821c::Grant>,
         restore: bool,
-    ) -> Result<bool, Error> {
-        self.io.station_power_tracking_begin(g, restore)
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_power_tracking_begin(g, restore) }
     }
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_quiet(
@@ -594,14 +599,18 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
         async move { self.io.station_power_tracking_quiet() }
     }
-    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
-        self.io.station_power_tracking_iqk()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_power_tracking_iqk() }
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_power_tracking_finish(
         &mut self,
         p: Option<super::tracking8821c::Program>,
-    ) -> Result<(), Error> {
-        self.io.station_power_tracking_finish(p)
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_power_tracking_finish(p) }
     }
 
     fn station_tx_ba_extension(

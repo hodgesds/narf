@@ -489,3 +489,36 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_station_retune_preconditions
 );
+
+/// USB N21W power tracking (`pci_firmware.rs` over EP0): without the
+/// signed station gate every hook is refused before any register or bulk
+/// access, no W continuation is offered, and the associated IQK H2C and its
+/// poll are refused outside a bound continuation.
+fn smoke_rtw88_usb_power_tracking_preconditions() -> TestResult {
+    let fake = Fake::default();
+    let mut b = backend(&fake);
+    if b.opened_for_test([0x02, 0, 0, 0, 0, 1]).is_err() {
+        return TestResult::Fail("fixture");
+    }
+    fake.0.lock().writes.clear();
+    if complete(b.station_power_tracking_request(30, None)).is_ok()
+        || complete(b.station_power_tracking_extension(30, None)).is_ok()
+    {
+        return TestResult::Fail("W request without the station gate");
+    }
+    if complete(b.station_power_tracking_quiet()) != Err(Error::State)
+        || complete(b.station_power_tracking_iqk()) != Err(Error::State)
+        || complete(b.station_power_tracking_finish(None)) != Err(Error::Prerequisite)
+        || complete(b.poll_h2c()).is_ok()
+    {
+        return TestResult::Fail("W maintenance outside a continuation");
+    }
+    if !fake.0.lock().writes.is_empty() || !fake.0.lock().sent.is_empty() {
+        return TestResult::Fail("refused W hook touched the device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_power_tracking_preconditions
+);

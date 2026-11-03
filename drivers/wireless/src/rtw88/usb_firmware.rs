@@ -134,6 +134,9 @@ pub(super) struct Backend<C: ControlIo, P: Bulk + Clone> {
     /// Linux's running `h2c.seq` for the in-station IQK H2C (the PCI
     /// backend's `tracking_sequence`).
     h2c_sequence: u16,
+    /// `pci_firmware.rs` `tracking_maintenance`: an N21W power-tracking
+    /// continuation owns TX quiet, TXPAUSE and the associated IQK H2C.
+    tracking: bool,
 }
 impl<C: ControlIo, P: Bulk + Clone> core::fmt::Debug for Backend<C, P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -175,6 +178,7 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             wide: false,
             passive_tx: None,
             h2c_sequence: 3,
+            tracking: false,
         })
     }
     pub(super) fn registers(&self) -> &Registers<C> {
@@ -401,11 +405,17 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
         }
         self.transmit_quiet().await
     }
-    /// The only H2C packet a retune may send: `rtw8821c_do_iqk`
-    /// (`command::iqk8821c`) at the running sequence, on the H2C pipe with
-    /// MAC TX/RX already open (no CR rewrite).
+    /// The only H2C packet a retune (`command::iqk8821c`) or a power-tracking
+    /// continuation (`command::iqk8821c_associated`) may send:
+    /// `rtw8821c_do_iqk` at the running sequence, on the H2C pipe with MAC
+    /// TX/RX already open (no CR rewrite).
     fn retune_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
-        if self.outstanding.is_some() || *packet != super::command::iqk8821c(self.h2c_sequence) {
+        let expected = if self.tracking {
+            super::command::iqk8821c_associated(self.h2c_sequence)
+        } else {
+            super::command::iqk8821c(self.h2c_sequence)
+        };
+        if self.outstanding.is_some() || *packet != expected {
             return Err(Error::State);
         }
         self.h2c_sequence = self.h2c_sequence.checked_add(1).ok_or(Error::State)?;
@@ -415,7 +425,25 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
         self.fail(result)
     }
     fn retune_blocked(&self) -> bool {
-        self.state != State::Packets || self.mailbox_pending || self.outstanding.is_some()
+        self.state != State::Packets
+            || self.mailbox_pending
+            || self.outstanding.is_some()
+            || self.tracking
+    }
+    /// A retune/widening or power-tracking continuation owns the H2C pipe.
+    fn mission(&self) -> bool {
+        self.state == State::Packets && (self.retune.is_some() || self.tracking)
+    }
+    /// `pci_firmware.rs::station_power_tracking_quiet` over EP0: the
+    /// continuation owns TX and no H2C or mailbox command is outstanding,
+    /// then [`Self::transmit_quiet`]. USB has no RX descriptor ring; the RX
+    /// side is the continuation's REG_RXPKT_NUM RXDMA_IDLE proof
+    /// (`tracking8821c::program` park) and the station's receive retirement.
+    async fn tracking_quiet(&mut self) -> Result<bool, Error> {
+        if !self.tracking || self.mailbox_pending || self.outstanding.is_some() {
+            return Err(Error::State);
+        }
+        self.transmit_quiet().await
     }
     pub(super) fn speed(&self) -> Speed {
         self.speed
@@ -599,7 +627,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
         let packet = *packet;
         async move {
-            if self.state == State::Packets && self.retune.is_some() {
+            if self.mission() {
                 return self.retune_h2c(&packet);
             }
             if self.state != State::Commands {
@@ -621,9 +649,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
         async move {
-            if self.state != State::Commands
-                && !(self.state == State::Packets && self.retune.is_some())
-            {
+            if self.state != State::Commands && !self.mission() {
                 return Err(Error::State);
             }
             let result = self.poll_out();
@@ -887,6 +913,182 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         }
         self.passive_tx = grant;
         Ok(())
+    }
+    // N21W power tracking: `pci_firmware.rs` over EP0 (`phy.c::
+    // rtw_phy_pwr_track` -> `rtw8821c_pwr_track`). The continuation flips
+    // the bound W grant to Changing, which makes `Gate::current` (and so
+    // `packet_submit` / `station_publication`) refuse TX until finish
+    // commits or retires it.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_request(
+        &mut self,
+        thermal: u8,
+        dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> impl core::future::Future<Output = Result<super::PowerTrackingRequest, Error>> + Send {
+        async move {
+            self.station_allowed()?;
+            let gate = self.gate_ref()?.clone();
+            if let Some(g) = gate.power_tracking() {
+                return Ok(g.request());
+            }
+            let r = &self.registers;
+            if r.read32(0xc94).await.map_err(usb_error)? & 0x7e != 0 {
+                return Err(Error::Prerequisite);
+            }
+            let scale = (r.read32(0xc1c).await.map_err(usb_error)? >> 21) as u16;
+            super::tracking8821c::request(&gate, thermal, scale, dm.as_ref())
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_extension(
+        &mut self,
+        thermal: u8,
+        dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> impl core::future::Future<
+        Output = Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error>,
+    > + Send {
+        async move {
+            self.station_allowed()?;
+            let gate = self.gate_ref()?.clone();
+            if gate.ht_grant().is_none() || gate.power_tracking().is_some() {
+                return Ok(None);
+            }
+            let r = &self.registers;
+            if r.read32(0xc94).await.map_err(usb_error)? & 0x7e != 0 {
+                return Ok(None);
+            }
+            let swing = (r.read32(0xc1c).await.map_err(usb_error)? >> 21) as u16;
+            // Host-keyed (`rtw8821cu-power-track-v1-*`, header = USB VID/PID):
+            // an absent or unqualified W keeps the static profile.
+            Ok(super::tracking8821c::Source::Registered
+                .load(gate, thermal, swing, dm)
+                .ok())
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_bind_power_tracking(
+        &mut self,
+        g: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.station_allowed()?;
+            g.readback(Read(&self.registers)).await?;
+            self.rebind(|gate| gate.with_power_tracking(g))
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_begin(
+        &mut self,
+        g: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        restore: bool,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        let g = g.clone();
+        async move {
+            if self.retune_blocked()
+                || self.retune.is_some()
+                || self
+                    .gate
+                    .as_ref()
+                    .and_then(super::power_policy::Gate::power_tracking)
+                    .as_ref()
+                    .is_none_or(|w| !alloc::sync::Arc::ptr_eq(w, &g))
+            {
+                return Err(Error::State);
+            }
+            // Only this exclusive owner may inspect/restore a revoked W.
+            self.tracking = true;
+            let result = async {
+                self.gate_ref()?.invoke_base(|| Ok(()))?;
+                g.readback(Read(&self.registers)).await?;
+                if !self.tracking_quiet().await? {
+                    return Ok(false);
+                }
+                if restore {
+                    g.begin_restore()?;
+                } else {
+                    g.begin()?;
+                }
+                Ok(true)
+            }
+            .await;
+            if !matches!(result, Ok(true)) {
+                self.tracking = false;
+            }
+            result
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        self.tracking_quiet()
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if !self.tracking || self.state != State::Packets {
+                return Err(Error::State);
+            }
+            let g = self
+                .gate
+                .as_ref()
+                .and_then(super::power_policy::Gate::power_tracking)
+                .ok_or(Error::State)?;
+            let packet = super::command::iqk8821c_associated(self.h2c_sequence);
+            g.authority(|| self.retune_h2c(&packet))
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_finish(
+        &mut self,
+        p: Option<super::tracking8821c::Program>,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        use super::dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM};
+        async move {
+            if !self.tracking || self.outstanding.is_some() || !self.tracking_quiet().await? {
+                return Err(Error::Prerequisite);
+            }
+            let r = &self.registers;
+            if r.read8(0x522).await.map_err(usb_error)? != 255
+                || r.read32(RXPKT_NUM).await.map_err(usb_error)? & (RXDMA_IDLE | RW_RELEASE)
+                    != (RXDMA_IDLE | RW_RELEASE)
+            {
+                return Err(Error::Prerequisite);
+            }
+            let gate = self.gate_ref()?.clone();
+            let g = gate.power_tracking().ok_or(Error::State)?;
+            let actual = p.unwrap_or_else(|| g.initial_program());
+            super::tracking8821c::Grant::read_program(actual, &mut Read(r)).await?;
+            gate.ht_grant()
+                .ok_or(Error::State)?
+                .readback(Read(r))
+                .await?;
+            if p.is_some() {
+                let thermal = r.read32(0x2908).await.map_err(usb_error)?;
+                g.temperature(((thermal >> 10) & 63) as u8)?;
+            }
+            let rx = r.read32(RXPKT_NUM).await.map_err(usb_error)?;
+            r.write32(RXPKT_NUM, rx & !RW_RELEASE)
+                .await
+                .map_err(usb_error)?;
+            r.write8(0x522, 0).await.map_err(usb_error)?;
+            if r.read32(RXPKT_NUM).await.map_err(usb_error)? & RW_RELEASE != 0
+                || r.read8(0x522).await.map_err(usb_error)? != 0
+            {
+                return Err(Error::Prerequisite);
+            }
+            match p {
+                Some(p) => g.commit(p)?,
+                None => {
+                    g.retire();
+                    self.gate = Some(gate.without_power_tracking());
+                }
+            }
+            self.tracking = false;
+            Ok(())
+        }
     }
     // Retune/widening: `pci_firmware.rs` over EP0. The target gate is
     // installed and TX publication refused before TXPAUSE; the C21 RF/BB

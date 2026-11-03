@@ -187,6 +187,7 @@ impl<I: Io> Lifecycle<I> {
             .as_mut()
             .ok_or(Error::State)?
             .power_tracking_request()
+            .await
     }
     pub(super) async fn tracking_request(&self) -> Result<super::ContinuationRequest, Error> {
         self.retained
