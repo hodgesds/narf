@@ -30,6 +30,8 @@ pub(super) struct Board {
 /// static rtw8852c_table.c copy: every table byte the recipe programs comes
 /// from the bound firmware container (`Assets::bind`) and the bound factory.
 const C_RECIPE: &[u8] = b"rtw89_mac_init(C) then phy.c rtw89_phy_dm_init: rtw89_phy_init_bb_reg, rtw8852c_init_txpwr_unit, rtw8852c_bb_reset_all, rtw89_phy_init_rf_reg {radiob,radioa}, rtw8852c_bb_sethw, physts/dig(V1 cckpd)/cfo/edcca init, rtw89_phy_init_rf_nctl (no second IOQ write), rtw8852c_rfk_init (dpk_init, _rck A/B, _dac_cal, _rx_dck recover), rtw8852c_set_txpwr_ctrl, rtw8852c_power_trim, rtw8852c_bb_cfg_txrx_path(RF_AB)";
+/// RTL8852C WLAN-only coexistence owner (`coex_native::Coex::prepare_c`).
+const C_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8852c_btc_set_rfe, rtw8852c_btc_init_cfg (rtw89_mac_coex_init_v1 RTK inner, wl_pri TX_RESP/BEACON, RR_WLSEL 0, trx mask, break 0xf0ffffff, BT cnt en|rst), scbd 0x4003, cxinit v0, cxctrl v1, txpwr ctrl off, _set_ant WONLY gnt_v1 0x57ddf + plt 0x111, OFF_BT policy";
 impl Board {
     pub fn new(
         factory: &Factory,
@@ -75,8 +77,8 @@ impl Board {
     /// RTL8852C cold channel-1 calibration identity (rtw8852ce.c
     /// `rtw89_8852ce_id_table`: 10ec:c852 only): the C factory logical map
     /// and 0x60-byte PHY-cap window, cut/RFE/XTAL, the bound C firmware
-    /// container tables and the C recipe. No coexistence protocol is bound
-    /// here; the C coexistence owner extends identities that need it.
+    /// container tables, the C recipe and the C coexistence owner with its
+    /// firmware BTC ABI row (`coex_native::ProtocolC`).
     pub fn new_c(
         factory: &Factory,
         device: narf_bus::DeviceId,
@@ -93,10 +95,15 @@ impl Board {
         {
             return Err(Error::Identity);
         }
+        // coex.c rtw89_btc_ver_defs: only a known C BTC ABI row.
+        let protocol = super::coex_native::ProtocolC::for_version(assets.firmware_version())
+            .ok_or(Error::Identity)?;
         let mut hash = narf_crypto::sha256::Sha256::new();
         hash.update(b"NARF RTL8852C cold ch1 20MHz awake WLAN-only calibration v1");
         hash.update(b"CMAC TXEN=0; NCTL RCK DACK RXDCK; no ordinary packet/response grant");
         hash.update(C_RECIPE);
+        hash.update(C_COEX_RECIPE);
+        hash.update(&[protocol.tag()]);
         hash.update(&device.vendor.to_le_bytes());
         hash.update(&device.device.to_le_bytes());
         hash.update(&device.subsystem_vendor.to_le_bytes());

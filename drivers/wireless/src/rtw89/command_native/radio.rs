@@ -866,9 +866,10 @@ impl Native {
     /// program whose base (`N5CB` v2) or `N5CC` record admits exactly
     /// `profile` under the current host rule; that profile is selected
     /// before the first write and every access then runs inside both
-    /// capability invocations (`Port`, `calibration_access`). Coexistence
-    /// must also be ready; no C coexistence owner exists yet, so an actual
-    /// RTL8852C still stops here. No ordinary grant is installed for C.
+    /// capability invocations (`Port`, `calibration_access`). The C
+    /// WLAN-only coexistence owner (`coex_native::Coex::prepare_c`) then
+    /// runs at core.c's `rtw89_btc_ntfy_init` point, before the DM init.
+    /// No ordinary grant is installed for C.
     ///
     /// # Safety
     /// Same retained Startup owner after C `prepare_radio_tables`; the outer
@@ -878,6 +879,7 @@ impl Native {
         owner: &mut radio_c::Radio,
         tables: &radio_init::Init,
         assets: &radio_assets::Assets,
+        coex: &mut crate::rtw89::coex_native::Coex,
         profile: operating_channel_c::Profile,
         preflight: RadioPreflightC,
     ) -> Result<(), power::Error> {
@@ -929,10 +931,25 @@ impl Native {
         qualification.select(profile).map_err(denied)?;
         self.calibration = Some(signed);
         self.qualification_c = Some(qualification);
-        if !self.coex_ready {
-            return Err(power::Error::Access);
+        if self.coex_ready || coex.state() != crate::rtw89::coex_native::State::New {
+            return Err(power::Error::Terminal);
         }
+        let protocol = crate::rtw89::coex_native::ProtocolC::for_version(assets.firmware_version())
+            .ok_or(power::Error::Unsupported)?;
         self.radio_access()?;
+        let cut = self
+            .factory
+            .as_ref()
+            .and_then(|factory| factory.identity())
+            .ok_or(power::Error::Unsupported)?
+            .cut();
+        // core.c rtw89_core_start: rtw89_btc_ntfy_init precedes
+        // rtw89_phy_dm_init. SAFETY: current signed C records installed
+        // above; same retained owner, CMAC TX closed, no BT/PTA producer.
+        unsafe { coex.prepare_c(self, rfe, cut, protocol) }
+            .await
+            .map_err(|_| power::Error::Access)?;
+        self.coex_ready = true;
         let factory = self.factory.as_ref().ok_or(power::Error::Unsupported)?;
         let identity = factory.identity().ok_or(power::Error::Unsupported)?;
         let calibration = *tables.calibration_c().ok_or(power::Error::Unsupported)?;

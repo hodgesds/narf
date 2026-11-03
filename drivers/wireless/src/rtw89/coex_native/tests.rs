@@ -252,3 +252,72 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_wlan_only_fault_cancel_and_ignored_grant_never_replay
 );
+fn smoke_rtw8852c_wlan_only_coex_init_follows_btc_init_cfg_and_gnt_v1() -> TestResult {
+    if ProtocolC::for_version([0, 27, 129, 4]) != Some(ProtocolC::Tdma4)
+        || ProtocolC::for_version([0, 27, 97, 0]) != Some(ProtocolC::Tdma4)
+        || ProtocolC::for_version([0, 27, 56, 14]) != Some(ProtocolC::Tdma3)
+        || [[0, 26, 255, 255], [0, 28, 0, 0], [0, 29, 29, 18]]
+            .iter()
+            .any(|v| ProtocolC::for_version(*v).is_some())
+    {
+        return TestResult::Fail("C BTC ABI rows differ from rtw89_btc_ver_defs");
+    }
+    let v4 = ProtocolC::Tdma4.off_policy();
+    if v4.len() != 23
+        || v4[..3] != [0, 4, 8]
+        || v4[11..15] != [1, 2, 9, 0]
+        || v4[15..17] != 100u16.to_le_bytes()
+        || v4[17..19] != [0, 0]
+        || v4[19..] != 0xe5555555u32.to_le_bytes()
+        || ProtocolC::Tdma3.off_policy() != Protocol.off_policy()
+        || ProtocolC::Tdma4.init(1, 2) != Protocol.init(1, 2)
+    {
+        return TestResult::Fail("C OFF_BT policy/init encoding differs");
+    }
+    for rfe in [1u8, 2] {
+        let mut io = Model::new(0);
+        let lte = io.lte;
+        let mut owner = Coex::default();
+        // SAFETY: inert owned bytes and explicit model qualification.
+        if ready(unsafe { owner.prepare_c(&mut io, rfe, 2, ProtocolC::Tdma4) }) != Some(Ok(()))
+            || owner.state() != State::WlanOnly
+        {
+            return TestResult::Fail("C coex owner did not reach WlanOnly");
+        }
+        let r32 = |a: usize| u32::from_le_bytes(io.bytes[a..a + 4].try_into().unwrap());
+        let r16 = |a: usize| u16::from_le_bytes(io.bytes[a..a + 2].try_into().unwrap());
+        if r32(0xda00) & 0x8301_0000 != 0x8001_0000
+            || r32(0xda04) & 0xff != 5
+            || r32(0xda10) & 3 != 3
+            || r16(0xc340) & 0x220 != 0x20
+            || r32(0xda24) & 0x40_0400 != 0x40_0400
+            || r32(0xda44) != 0xf0ff_ffff
+            || r32(0xda48) != 0x57ddf
+            || r16(0xc67c) != 0x111
+            || r32(0xd200) & 0x3ff != 0
+            || r32(0xd220) & 0xffa != 0
+            || r32(0xac) & 0x80ff_ffff != 0x8000_4003
+        {
+            return TestResult::Fail("C PTA/grant/break/power state differs from Linux");
+        }
+        // C has no LTE indirect grant path (cfg_gnt_v1, ctrl_path_v1 no-op).
+        if io.lte != lte {
+            return TestResult::Fail("C coex used the B LTE grant path");
+        }
+    }
+    // An injected access failure never publishes readiness.
+    let mut io = Model::new(0);
+    io.fail = Some(3);
+    let mut owner = Coex::default();
+    // SAFETY: same inert model.
+    if ready(unsafe { owner.prepare_c(&mut io, 1, 2, ProtocolC::Tdma4) }) == Some(Ok(()))
+        || owner.state() == State::WlanOnly
+    {
+        return TestResult::Fail("C coex failure published readiness");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_wlan_only_coex_init_follows_btc_init_cfg_and_gnt_v1
+);

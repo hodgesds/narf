@@ -266,7 +266,14 @@ impl Startup {
             unsafe {
                 firmware
                     .transport_mut()
-                    .prepare_radio_c(&mut owner.radio_c, &owner.radio, assets, profile, preflight)
+                    .prepare_radio_c(
+                        &mut owner.radio_c,
+                        &owner.radio,
+                        assets,
+                        &mut owner.coex,
+                        profile,
+                        preflight,
+                    )
                     .await
             }
             .map_err(Error::Register)?;

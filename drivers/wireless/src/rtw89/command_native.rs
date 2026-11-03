@@ -1274,6 +1274,17 @@ impl super::radio_init::Interface for Native {
     }
 }
 
+impl Native {
+    /// Chip dispatch of the WLAN-only `_set_ant(WONLY)` re-assertion: B
+    /// `coex_native::enforce` unchanged, C `coex_native::enforce_c`.
+    async fn coex_enforce(&mut self) -> Result<(), super::coex_native::Error> {
+        if self.chip == ChipId::Rtl8852C {
+            super::coex_native::enforce_c(self).await
+        } else {
+            super::coex_native::enforce(self).await
+        }
+    }
+}
 impl super::coex_native::Interface for Native {
     fn admit(&mut self) -> Result<(), super::coex_native::Error> {
         self.calibration_access().map_err(Into::into)
@@ -1342,7 +1353,7 @@ impl super::rfk::Interface for Native {
     /// without `wl_only`, which needs BT link state this owner never has.
     async fn coex_switch_band(&mut self) -> Result<(), super::rfk::Error> {
         super::rfk::Interface::admit(self)?;
-        super::coex_native::enforce(self)
+        self.coex_enforce()
             .await
             .map_err(|_| super::rfk::Error::Policy)
     }
@@ -1369,7 +1380,7 @@ impl super::rfk::Interface for Native {
         super::coex_native::scoreboard(self, 0x4803)
             .await
             .map_err(|_| super::rfk::Error::Policy)?;
-        super::coex_native::enforce(self)
+        self.coex_enforce()
             .await
             .map_err(|_| super::rfk::Error::Policy)
     }
@@ -1392,7 +1403,7 @@ impl super::rfk::Interface for Native {
         super::coex_native::scoreboard(self, 0x4003)
             .await
             .map_err(|_| super::rfk::Error::Policy)?;
-        super::coex_native::enforce(self)
+        self.coex_enforce()
             .await
             .map_err(|_| super::rfk::Error::Policy)?;
         self.calibrating = None;

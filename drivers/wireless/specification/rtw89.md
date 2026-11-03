@@ -3197,8 +3197,10 @@ The C record family mirrors B's with its own magics, names and identities;
 no B record admits C or vice versa. `Board::new_c` (10ec:c852 only,
 rtw8852ce.c `rtw89_8852ce_id_table`) hashes a C domain string and recipe
 text, the PCI IDs, the C logical map, the 0x60-byte C PHY-cap window,
-cut/RFE/XTAL and `Assets::bind` (container digest, firmware version, the
-five decoded C tables); no coexistence protocol is bound yet. Its record
+cut/RFE/XTAL, `Assets::bind` (container digest, firmware version, the
+five decoded C tables), the C coexistence recipe and its BTC ABI row
+(`coex_native::ProtocolC`; a firmware outside the known C rows has no
+identity). Its record
 is `N5CB` v1 (`rtw89/rtw8852c-cal-v1-<mac>.bin`, 96 bytes, B's v1 layout),
 admitting the cold channel-1/20MHz span 2402..2422 like B. The full program
 (`radio_policy_c::Board::new`) composes that identity with the C-bound
@@ -3231,9 +3233,37 @@ stays unadmitted. Unexecuted cases:
 `smoke_rtw8852c_full_radio_base_record_is_n5cb_v2_exact_and_revocable`,
 `smoke_rtw8852c_channel_records_admit_exactly_their_profile_and_span`.
 
-Remaining for the `rtl8852c` row (no row credit): C coexistence init (the
-Startup C radio step stops at `coex_ready` after record admission), a native
-C retune caller over the admitted `N5CC` profiles,
+**C WLAN-only coexistence (`coex_native::Coex::prepare_c`).** Run by
+`Native::prepare_radio_c` right after the C records are installed and before
+the DM init, at core.c `rtw89_core_start`'s `rtw89_btc_ntfy_init` point (as
+B, the owner is WLAN-only: BT is arbitrated low, not assumed absent). It is
+`rtw8852c_btc_set_rfe` (antenna 2/3 by RFE parity) and
+`rtw8852c_btc_init_cfg`: `rtw89_mac_coex_init_v1` (`R_AX_BTC_CFG` 0xda00
+BTC_EN|BTG_LNA1_GAIN_SEL and RTK mode 0, `R_AX_BT_CNT_CFG` 0xda10 CNT_EN,
+`R_AX_CCA_CFG_0` 0xc340 BTCCA_EN set / BRK_TXOP clear,
+`R_AX_RTK_MODE_CFG_V1` 0xda04 sample clock 5), `rtw8852c_btc_set_wl_pri`
+TX_RESP/BEACON (`R_BTC_COEX_WL_REQ` 0xda24 bits 10/22), RR_WLSEL 0 on both
+paths, `rtw8852c_set_trx_mask` (shared: A/B SS 0x5ff + A TX 0x5ff;
+dedicated: A/B SS 0x5df), `R_AX_BT_BREAK_TABLE` 0xda44 = 0xf0ffffff and BT
+counter EN|RST_V1; then `_write_scbd` 0x4003, `_set_init_info` CXDRVINFO
+INIT (`fcxinit` 0, B's 14 bytes) and CTRL (`fcxctrl` 1),
+`rtw8852c_btc_set_wl_txpwr_ctrl(0xffffffff)` (0xd200/0xd220 cleared, read
+back), `_action_wl_only`: `_set_ant(WONLY)` = `rtw89_mac_cfg_gnt_v1`
+`R_AX_GNT_SW_CTRL` 0xda48 = 0x57ddf (WL SW high, BT SW low both bands;
+para_ver 0x1 has no WLAN_ACT mux), `rtw89_mac_cfg_ctrl_path_v1(wl)` (no
+I/O; there is no LTE grant path on C), `_set_bt_plut` `R_AX_BT_PLT` 0xc67c
+= 0x111, each read back, and `_set_policy(BTC_CXP_OFF_BT)` with DONE_ACK.
+`ProtocolC` follows the C rows of coex.c `rtw89_btc_ver_defs`: 0.27.0..
+0.27.97 is `fcxtdma` 3/`fcxslots` 1 (B's 26-byte policy) and 0.27.97..0.28
+is `fcxtdma` 4/`fcxslots` 2 (`btf_tlv_v7` TDMA + `_append_slot_v7` slot0,
+23 bytes; the shipped rtw8852c_fw-{1,2}.bin are 0.27.122/0.27.129).
+RFK START/STOP and switch-band re-assert `_set_ant(WONLY)` through the
+chip-dispatched `Native::coex_enforce` (`enforce_c` on C, B unchanged).
+Unexecuted case:
+`smoke_rtw8852c_wlan_only_coex_init_follows_btc_init_cfg_and_gnt_v1`.
+
+Remaining for the `rtl8852c` row (no row credit): a native C retune caller
+over the admitted `N5CC` profiles,
 C WoW/DMA-stop RX rewind (B registers only), `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
