@@ -352,3 +352,82 @@ smoke!(
     smoke_mld_basic_response_and_sae_address_boundaries,
     boundaries
 );
+
+/// Linux ieee80211-eht.h common-info order and EML helpers; affiliated
+/// per-STA headers are retained but grant no link.
+fn eml_and_affiliated() -> Result<(), &'static str> {
+    // Link ID, medium sync, EML and MLD capabilities present.
+    let mut body = vec![0xd0, 1, 14];
+    body.extend_from_slice(&AP_MLD);
+    body.push(2);
+    body.extend_from_slice(&0x0a12u16.to_le_bytes());
+    // EMLSR, pad 64us (code2), transition 128us (code4), timeout 1TU (code4).
+    let eml = 1 | (2 << 1) | (4 << 4) | (4 << 11);
+    body.extend_from_slice(&(eml as u16).to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    // Complete profile for link 5 with STA MAC, STA info length 7.
+    body.extend_from_slice(&[0, 9, 0x35, 0, 7]);
+    body.extend_from_slice(&[2, 0x73, 2, 3, 4, 5]);
+    // Partial profile for link 9 without MAC.
+    body.extend_from_slice(&[0, 3, 9, 0, 1]);
+    let parsed = mlo::BasicMultiLink::parse(&body).map_err(|_| "EML Basic MLE refused")?;
+    let caps = parsed.eml_capabilities().ok_or("EML capabilities lost")?;
+    check!(
+        parsed.link_id() == Some(2)
+            && parsed.medium_sync_delay() == Some(0x0a12)
+            && caps.emlsr()
+            && caps.padding_delay_us() == 64
+            && caps.transition_delay_us() == 128
+            && caps.transition_timeout_us() == 1024
+            && caps.transition_timeout_code() == 4
+            && parsed.mld_capabilities().map(mlo::max_simultaneous_links) == Some(2),
+        "EML/MLD common-info fields decoded out of presence order"
+    );
+    let five = parsed
+        .affiliated(5)
+        .ok_or("complete affiliated link lost")?;
+    let nine = parsed.affiliated(9).ok_or("partial affiliated link lost")?;
+    check!(
+        five.complete()
+            && five.address() == Some([2, 0x73, 2, 3, 4, 5])
+            && !nine.complete()
+            && nine.address().is_none()
+            && parsed.affiliated(2).is_none()
+            && parsed.profile_links() == (1 << 5) | (1 << 9),
+        "affiliated per-STA headers misattributed"
+    );
+    let off = mlo::EmlCapabilities(eml as u16 & !1);
+    check!(
+        !off.emlsr() && off.padding_delay_us() == 0 && off.transition_delay_us() == 0,
+        "EMLSR delays reported without EMLSR support"
+    );
+    check!(
+        mlo::EmlCapabilities((7 << 1) | 1).padding_delay_us() == 0
+            && mlo::EmlCapabilities((7 << 4) | 1).transition_delay_us() == 0
+            && mlo::EmlCapabilities(15 << 11).transition_timeout_code() == 10
+            && mlo::EmlCapabilities(15 << 11).transition_timeout_us() == 0,
+        "reserved EML encodings not treated as Linux invalid values"
+    );
+    check!(
+        mlo::EmlCapabilities::INTEL_MLD_LOCAL.emlsr()
+            && mlo::EmlCapabilities::INTEL_MLD_LOCAL.padding_delay_us() == 32
+            && mlo::EmlCapabilities::INTEL_MLD_LOCAL.transition_delay_us() == 64,
+        "Intel MLD local EMLSR capability differs from IWL_MLD_EMLSR_CAPA"
+    );
+    // A selected single-link context still refuses any affiliated profile.
+    let context = mlo::Local::single_link(OWN_MLD)
+        .unwrap()
+        .context(OWN, AP, &parsed)
+        .map_err(|_| "context from EML MLE")?;
+    let mut response = vec![255, (body.len() + 1) as u8, 107];
+    response.extend_from_slice(&body);
+    check!(
+        context.response(&response).is_err(),
+        "single-link response admitted extra affiliated links"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_mld_basic_eml_capabilities_and_affiliated_profiles,
+    eml_and_affiliated
+);

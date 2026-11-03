@@ -185,6 +185,10 @@ pub struct BasicMultiLink {
     address: [u8; 6],
     link_id: Option<u8>,
     profiles: u16,
+    medium_sync: Option<u16>,
+    eml: Option<EmlCapabilities>,
+    mld_capabilities: Option<u16>,
+    affiliated: [Option<AffiliatedLink>; MAX_LINKS as usize],
 }
 impl BasicMultiLink {
     pub fn address(self) -> [u8; 6] {
@@ -192,6 +196,30 @@ impl BasicMultiLink {
     }
     pub fn link_id(self) -> Option<u8> {
         self.link_id
+    }
+    /// Common-info Medium Synchronization Delay, as retained by Linux
+    /// mlme.c into `vif->cfg.eml_med_sync_delay`.
+    pub fn medium_sync_delay(self) -> Option<u16> {
+        self.medium_sync
+    }
+    /// Common-info EML Capabilities (Linux `vif->cfg.eml_cap`). Absence
+    /// means the AP MLD advertises no EML mode at all.
+    pub fn eml_capabilities(self) -> Option<EmlCapabilities> {
+        self.eml
+    }
+    /// Common-info MLD Capabilities and Operations, raw.
+    pub fn mld_capabilities(self) -> Option<u16> {
+        self.mld_capabilities
+    }
+    /// Bitmap of affiliated per-STA profile link ids.
+    pub fn profile_links(self) -> u16 {
+        self.profiles
+    }
+    /// Retained per-STA profile header facts for one affiliated link. These
+    /// are AP-advertised identities only; they grant no channel, RSN, PHY or
+    /// native owner until a separately validated link setup admits them.
+    pub fn affiliated(self, link_id: u8) -> Option<AffiliatedLink> {
+        self.affiliated.get(usize::from(link_id)).copied().flatten()
     }
     /// `body` starts at ML Control, after extension ID107.
     pub fn parse(body: &[u8]) -> Result<Self, Error> {
@@ -223,17 +251,36 @@ impl BasicMultiLink {
         if !unicast(address) {
             return Err(Error::InvalidBss);
         }
-        let link_id = if control & LINK_ID != 0 {
-            let id = body[9];
-            if id >= MAX_LINKS {
-                return Err(Error::InvalidBss);
+        // Optional common fields in presence order (ieee80211-eht.h
+        // ieee80211_mle_basic_*): link id, BSS change count, medium sync,
+        // EML capabilities, MLD capabilities, AP MLD id, ext MLD capa.
+        let mut field = 9usize;
+        let mut take = |bit: u16, len: usize| -> Option<usize> {
+            if control & bit == 0 {
+                return None;
             }
-            Some(id)
-        } else {
-            None
+            let start = field;
+            field += len;
+            Some(start)
         };
+        let word = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
+        let link_id = match take(LINK_ID, 1) {
+            Some(at) => {
+                let id = body[at];
+                if id >= MAX_LINKS {
+                    return Err(Error::InvalidBss);
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        take(0x20, 1);
+        let medium_sync = take(0x40, 2).map(word);
+        let eml = take(0x80, 2).map(|at| EmlCapabilities(word(at)));
+        let mld_capabilities = take(MLD_CAPA, 2).map(word);
         let mut at = 2 + common;
         let mut profiles = 0u16;
+        let mut affiliated = [None; MAX_LINKS as usize];
         while at < body.len() {
             let header = body.get(at..at + 2).ok_or(Error::InvalidBss)?;
             let end = at + 2 + usize::from(header[1]);
@@ -260,6 +307,7 @@ impl BasicMultiLink {
             if usize::from(profile[2]) < needed || 2 + usize::from(profile[2]) > profile.len() {
                 return Err(Error::InvalidBss);
             }
+            let mut address = None;
             if flags & 0x20 != 0 {
                 let mac = profile
                     .get(3..9)
@@ -269,14 +317,24 @@ impl BasicMultiLink {
                 if !unicast(mac) {
                     return Err(Error::InvalidBss);
                 }
+                address = Some(mac);
             }
             profiles |= 1 << id;
+            affiliated[usize::from(id)] = Some(AffiliatedLink {
+                link_id: id as u8,
+                complete: flags & 0x10 != 0,
+                address,
+            });
             at = end;
         }
         Ok(Self {
             address,
             link_id,
             profiles,
+            medium_sync,
+            eml,
+            mld_capabilities,
+            affiliated,
         })
     }
     pub fn from_ies(bytes: &[u8]) -> Result<Self, Error> {
@@ -295,4 +353,78 @@ impl BasicMultiLink {
         })?;
         result.ok_or(Error::InvalidBss)
     }
+}
+
+/// One affiliated per-STA profile header (Linux ieee80211-eht.h
+/// IEEE80211_MLE_STA_CONTROL_*). Only bounded header facts are kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffiliatedLink {
+    link_id: u8,
+    complete: bool,
+    address: Option<[u8; 6]>,
+}
+impl AffiliatedLink {
+    pub fn link_id(self) -> u8 {
+        self.link_id
+    }
+    /// COMPLETE_PROFILE: only a complete profile can describe a link that
+    /// mac80211 mlme.c may request in an association.
+    pub fn complete(self) -> bool {
+        self.complete
+    }
+    pub fn address(self) -> Option<[u8; 6]> {
+        self.address
+    }
+}
+
+/// EML Capabilities subfield (Linux ieee80211-eht.h IEEE80211_EML_CAP_*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmlCapabilities(pub u16);
+impl EmlCapabilities {
+    pub const EMLSR_SUPPORT: u16 = 0x0001;
+    pub const PADDING_DELAY: u16 = 0x000e;
+    pub const TRANSITION_DELAY: u16 = 0x0070;
+    pub const EMLMR_SUPPORT: u16 = 0x0080;
+    pub const TRANSITION_TIMEOUT: u16 = 0x7800;
+    /// Linux mld/mac80211.c IWL_MLD_EMLSR_CAPA: EMLSR, padding32us,
+    /// transition64us. A non-AP MLD advertises it only once every
+    /// multiple-active-link owner exists.
+    pub const INTEL_MLD_LOCAL: Self = Self(Self::EMLSR_SUPPORT | (1 << 1) | (3 << 4));
+    pub fn emlsr(self) -> bool {
+        self.0 & Self::EMLSR_SUPPORT != 0
+    }
+    /// ieee80211_emlsr_pad_delay_in_us.
+    pub fn padding_delay_us(self) -> u32 {
+        let code = u32::from((self.0 & Self::PADDING_DELAY) >> 1);
+        if !self.emlsr() || code == 0 || code > 4 {
+            return 0;
+        }
+        32 << (code - 1)
+    }
+    /// ieee80211_emlsr_trans_delay_in_us.
+    pub fn transition_delay_us(self) -> u32 {
+        let code = u32::from((self.0 & Self::TRANSITION_DELAY) >> 4);
+        if !self.emlsr() || code == 0 || code > 5 {
+            return 0;
+        }
+        16 << (code - 1)
+    }
+    /// Raw Transition Timeout code, clamped as Linux mld/iface.c
+    /// iwl_mld_mac_cmd_fill_sta does for MAC client esr_transition_timeout.
+    pub fn transition_timeout_code(self) -> u8 {
+        (((self.0 & Self::TRANSITION_TIMEOUT) >> 11) as u8).min(10)
+    }
+    /// ieee80211_eml_trans_timeout_in_us.
+    pub fn transition_timeout_us(self) -> u32 {
+        let code = u32::from((self.0 & Self::TRANSITION_TIMEOUT) >> 11);
+        if code == 0 || code > 10 {
+            return 0;
+        }
+        128 << (code - 1)
+    }
+}
+
+/// IEEE80211_MLD_CAP_OP_MAX_SIMUL_LINKS: encoded value plus one links.
+pub fn max_simultaneous_links(mld_capabilities: u16) -> u8 {
+    (mld_capabilities & 0x000f) as u8 + 1
 }
