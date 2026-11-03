@@ -848,6 +848,9 @@ pub struct GgttArena {
     retired: bool,
     live_ranges: alloc::collections::BTreeMap<u32, u32>,
     ggtt_ledger: Option<alloc::sync::Arc<crate::intel_gpu_ggtt_ranges::Ledger>>,
+    /// The MTL/Arrow media GuC (GT1) may cache translations of this shared
+    /// GGTT. Set by its owner before firmware DMA, cleared after verified stop.
+    media_guc: bool,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -910,6 +913,7 @@ impl GgttArena {
             live_ranges: alloc::collections::BTreeMap::new(),
             ggtt_ledger: crate::intel_gpu_ggtt_ranges::Ledger::for_bar(bar.phys.raw(), bar.len)
                 .ok(),
+            media_guc: false,
         }
     }
 
@@ -1038,6 +1042,15 @@ impl GgttArena {
         if let Some(window) = &self.authority {
             let _ = window.read32(pte_byte);
             let _ = window.read32(0x1901f8);
+            if self.media_guc {
+                // xe_ggtt.c::xe_ggtt_invalidate: each GT of a tile has its own
+                // GGTT TLB. Without media GuC submission,
+                // xe_guc_tlb_inval.c::send_tlb_inval_ggtt writes the media
+                // GUC_TLB_INV_CR under the media GT wake its owner retains.
+                let media = crate::intel_gpu_gt::media::gsi(0xcee8);
+                window.write32(media, 1);
+                let _ = window.read32(media);
+            }
             return;
         }
         // SAFETY: same BAR ownership and in-arena argument as
@@ -1223,6 +1236,29 @@ impl SharedArena {
 
     pub(crate) fn lnl_takeover_ready(&self) -> bool {
         self.inner.lock().lnl_takeover_ready()
+    }
+
+    /// Register (`true`) the MTL/Arrow media GuC as a second GGTT TLB of this
+    /// arena before its firmware can translate, or unregister it after its
+    /// verified stop. Only an authorized MTL-classified arena qualifies; GT0
+    /// flushes are unchanged while no media GuC is registered.
+    pub(crate) fn set_media_guc_tlb(&self, live: bool) -> Result<(), SubmitError> {
+        let mut arena = self.inner.lock();
+        if arena.retired
+            || arena.authority.is_none()
+            || !arena
+                .gt_platform
+                .is_some_and(crate::intel_gpu_gt::media::profile_eligible)
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        arena.media_guc = live;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn media_guc_tlb(&self) -> bool {
+        self.inner.lock().media_guc
     }
 
     pub(crate) fn retire_ggtt(&self) -> Result<(), SubmitError> {

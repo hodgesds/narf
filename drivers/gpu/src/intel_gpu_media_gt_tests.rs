@@ -5,7 +5,7 @@
 use super::*;
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::cell::{Cell, RefCell};
-use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
+use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, kt_assert_ne, TestResult};
 
 const MTL: GtPlatform = GtPlatform::Integrated(Generation::MeteorLake);
 /// GMD_ID 13.00 step A0 (arch 13 in 31:22, release 0 in 21:14).
@@ -820,4 +820,95 @@ fn smoke_media_gt_current_loss_mid_start_retains_original_refusal() -> TestResul
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gt_current_loss_mid_start_retains_original_refusal
+);
+
+/// The real shared GGTT arena over a RAM-backed 16 MiB BAR0 with current
+/// capability authority: GT0 flushes are unchanged until the media GuC
+/// registers, then every PTE publication and clear also invalidates the
+/// media GuC's GGTT TLB (xe_ggtt.c::xe_ggtt_invalidate, both GTs).
+fn smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered() -> TestResult {
+    use crate::intel_gpu_rcs::{GgttArena, GpuAllocator, GpuBacking, SharedArena};
+    use narf_capabilities::{Cap, Write};
+    const SENTINEL: u32 = 0x5a5a_5a5a;
+    const MEDIA_INV: u64 = 0x38cee8;
+    const GT0_INV: u64 = 0xcee8;
+    let mut words = alloc::vec![0u32; 4 * 1024 * 1024];
+    let bar = narf_bus::bar::MmioRegion {
+        // Fixture-unique GGTT ledger key; no real device sits here.
+        phys: narf_memory::PhysAddr::new(0x6_f400_0000),
+        virt: words.as_mut_ptr() as u64,
+        len: 16 << 20,
+        kind: narf_bus::bar::BarKind::Mmio64 {
+            prefetchable: false,
+        },
+    };
+    let load = |reg: u64| {
+        // SAFETY: `words` backs the whole fixture BAR for this test; the
+        // aligned offset selects an in-bounds dword.
+        unsafe { core::ptr::read_volatile((bar.virt + reg) as *const u32) }
+    };
+    let store = |reg: u64, value: u32| {
+        // SAFETY: as above; no arena operation runs concurrently.
+        unsafe { core::ptr::write_volatile((bar.virt + reg) as *mut u32, value) }
+    };
+    store(MEDIA_INV, SENTINEL);
+    store(GT0_INV, SENTINEL);
+    let cap = Cap::<narf_bus::BusDeviceCap, Write>::bootstrap();
+    let arena = SharedArena::new(GgttArena::for_gt(bar, cap, MTL));
+    let mut alloc = arena.clone();
+    let policy = crate::intel_gpu_gt_hw::CachePolicy {
+        platform: MTL,
+        ggtt_pat: 3,
+        media: None,
+    };
+    let pte = |backing: &crate::intel_gpu_rcs::FrameBacking| {
+        crate::intel_gpu_gtt::GGTT_ARRAY_BASE + u64::from(backing.ggtt_offset()) / 4096 * 8
+    };
+    // No media GuC: GT0's publication path writes PTEs but never the media
+    // TLB, and the arena never writes either GuC's invalidation register.
+    let Ok(mut first) = alloc.alloc(1) else {
+        return TestResult::Fail("fixture arena refused its first page");
+    };
+    kt_assert!(arena.configure_cache(&mut first, policy).is_ok());
+    kt_assert_ne!(load(pte(&first)), 0);
+    kt_assert_eq!(load(MEDIA_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert!(!arena.media_guc_tlb());
+    // Registered media GuC: publication and clear both invalidate GT1 only.
+    kt_assert!(arena.set_media_guc_tlb(true).is_ok());
+    let Ok(second) = alloc.alloc(2) else {
+        return TestResult::Fail("fixture arena refused a mapped allocation");
+    };
+    kt_assert_ne!(load(pte(&second)), 0);
+    kt_assert_eq!(load(MEDIA_INV), 1);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    store(MEDIA_INV, SENTINEL);
+    let cleared = pte(&second);
+    alloc.free(second);
+    kt_assert_eq!(load(cleared), 0);
+    kt_assert_eq!(load(MEDIA_INV), 1);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    // Unregistered after the media GuC's proven stop: identical GT0 path.
+    kt_assert!(arena.set_media_guc_tlb(false).is_ok());
+    store(MEDIA_INV, SENTINEL);
+    let Ok(third) = alloc.alloc(1) else {
+        return TestResult::Fail("fixture arena refused a later allocation");
+    };
+    alloc.free(third);
+    alloc.free(first);
+    kt_assert_eq!(load(MEDIA_INV), SENTINEL);
+    kt_assert_eq!(load(GT0_INV), SENTINEL);
+    kt_assert_eq!(arena.live_allocations(), 0);
+    // Only an authorized MTL-classified arena can host a media GuC TLB.
+    let other = SharedArena::new(GgttArena::for_gt(bar, cap, GtPlatform::Battlemage));
+    kt_assert!(other.set_media_guc_tlb(true).is_err());
+    let bare = SharedArena::new(GgttArena::new(bar));
+    kt_assert!(bare.set_media_guc_tlb(true).is_err());
+    drop((arena, alloc, other, bare));
+    drop(words);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered
 );

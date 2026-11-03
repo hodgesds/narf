@@ -111,6 +111,31 @@ impl<M: MmioWindow + ?Sized> MmioWindow for MediaWindow<'_, M> {
     }
 }
 
+/// Owned media-GT register view for the long-lived media GuC and CT owners.
+/// This type is the role proof: `GuCBoot::stage_media` accepts only it, so
+/// GuC registers are GSI-translated while the absolute media mailbox,
+/// engine and interrupt registers pass through unchanged.
+#[derive(Clone, Debug)]
+pub(crate) struct MediaGsi<M>(M);
+
+impl<M: MmioWindow> MediaGsi<M> {
+    pub(crate) fn new(bar: M) -> Self {
+        Self(bar)
+    }
+}
+
+impl<M: MmioWindow> MmioWindow for MediaGsi<M> {
+    fn display_access_ok(&self) -> bool {
+        false
+    }
+    fn read32(&self, offset: u64) -> u32 {
+        self.0.read32(gsi(offset))
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        self.0.write32(gsi(offset), value)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MediaError {
     /// GMD_ID reports no media IP (fused off). Nothing was written.
@@ -309,6 +334,18 @@ impl MediaGt {
             fuse: self.fuse,
             engines: self.engines,
         })
+    }
+
+    /// Native-test fixture for owners layered above this lifecycle: an
+    /// initialized, released media GT with the given identity and fuses.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn initialized_for_test(platform: GtPlatform, gmd: u32, fuse: u32) -> Self {
+        let mut owner = Self::new(platform, 1274);
+        owner.ip = Some(MediaIp::decode(gmd));
+        owner.fuse = fuse;
+        owner.engines = inventory(fuse);
+        owner.phase = Phase::Initialized;
+        owner
     }
 
     /// Wake requests this owner still has outstanding.
@@ -718,6 +755,236 @@ impl MediaGt {
         }
         self.requested = 0;
         self.phase = Phase::Stopped;
+    }
+}
+
+/// xe_pat.c `xe->pat.idx[XE_CACHE_WB]` for METEORLAKE. GT0's MTL cache
+/// policy publishes the same GGTT index (`intel_gpu_gt_hw`).
+const XELPG_WB_INDEX: u8 = 3;
+/// regs/xe_irq_regs.h GUC_SG_INTR_MASK; xe_guc.c::guc_enable_irq puts the
+/// media GuC's GUC_INTR_GUC2HOST (bit 15) in the ENGINE0 half.
+const GUC_SG_INTR_MASK: u64 = 0x1900e8;
+const MEDIA_GUC2HOST: u32 = 1 << 15;
+
+impl MediaGt {
+    /// The cache proof for this incarnation: the xelpg PAT this owner wrote
+    /// gives the shared GGTT write-back index the same meaning on GT1.
+    pub(crate) fn cache_policy(&self) -> Option<crate::intel_gpu_gt_hw::CachePolicy> {
+        (self.phase == Phase::Initialized).then_some(crate::intel_gpu_gt_hw::CachePolicy {
+            platform: self.platform,
+            ggtt_pat: XELPG_WB_INDEX,
+            media: None,
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MediaGucError {
+    Gt(crate::intel_gpu_guc_gt::GtError),
+    /// The shared GGTT refused the second-TLB registration.
+    Ggtt(crate::intel_gpu_guc_boot::BootError),
+    Unavailable,
+    /// The idle media GuC sent an unsolicited CT message.
+    Protocol,
+    /// Stop could not be proven; firmware memory and the TLB hook stay held.
+    Retained,
+    State,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MediaGucState {
+    Starting,
+    /// Firmware authenticated and CT enabled through the media mailbox.
+    Running,
+    Stopping,
+    /// GuC reset proven, CT/ADS/log memory freed, wake released.
+    Stopped,
+    Retained,
+}
+
+/// The standalone media GuC of one GT0 incarnation, run through the shared
+/// bare `GuCGt` owner over the media GSI window and shared GGTT arena.
+/// It registers as the arena's second GGTT TLB before firmware DMA and keeps
+/// its GuC-to-host interrupt half masked: its CT is polled. No engine,
+/// context, SLPC or HuC is admitted and no userspace GT is published.
+pub(crate) struct MediaGuc<
+    M: MmioWindow + Clone,
+    A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
+> {
+    gt: crate::intel_gpu_guc_gt::GuCGt<MediaGsi<M>, A>,
+    allocator: A,
+    registered: bool,
+    state: MediaGucState,
+    error: Option<MediaGucError>,
+}
+
+impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone> core::fmt::Debug
+    for MediaGuc<M, A>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MediaGuc")
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone> MediaGuc<M, A> {
+    /// Stage and begin after `MediaGt` initialized this incarnation and
+    /// released its own wake. `firmware` is GT0's MTL GuC image (xe_uc_fw.c
+    /// GT_TYPE_ANY). On error nothing has been published: the staged owner
+    /// is dropped and the arena hook is withdrawn.
+    pub(crate) fn start(
+        bar: M,
+        allocator: A,
+        firmware: &crate::intel_gpu_guc_firmware::GuCFirmware,
+        config: crate::intel_gpu_guc_boot::BootConfig,
+        media: &MediaGt,
+        now: u64,
+    ) -> Result<Self, MediaGucError> {
+        let (Some(facts), Some(policy)) = (media.facts(), media.cache_policy()) else {
+            return Err(MediaGucError::State);
+        };
+        let mut gt = crate::intel_gpu_guc_gt::GuCGt::stage_media(
+            MediaGsi::new(bar.clone()),
+            allocator.clone(),
+            firmware,
+            config,
+            facts.ip,
+            policy,
+        )
+        .map_err(MediaGucError::Gt)?;
+        let mask = bar.read32(GUC_SG_INTR_MASK);
+        if mask == u32::MAX {
+            return Err(MediaGucError::Unavailable);
+        }
+        bar.write32(GUC_SG_INTR_MASK, mask | MEDIA_GUC2HOST);
+        if bar.read32(GUC_SG_INTR_MASK) & MEDIA_GUC2HOST == 0 {
+            return Err(MediaGucError::Unavailable);
+        }
+        let mut hook = allocator;
+        hook.register_media_guc_tlb(true)
+            .map_err(MediaGucError::Ggtt)?;
+        if let Err(error) = gt.begin(now) {
+            // Still Staged: no wake request or firmware address was written.
+            let _ = hook.register_media_guc_tlb(false);
+            return Err(MediaGucError::Gt(error));
+        }
+        Ok(Self {
+            gt,
+            allocator: hook,
+            registered: true,
+            state: MediaGucState::Starting,
+            error: None,
+        })
+    }
+
+    pub(crate) fn state(&self) -> MediaGucState {
+        self.state
+    }
+
+    /// The first refusal of this owner, if any.
+    pub(crate) fn error(&self) -> Option<MediaGucError> {
+        self.error
+    }
+
+    /// Advance start, the idle CT drain or stop by one bounded step.
+    pub(crate) fn poll(
+        &mut self,
+        now: u64,
+        current: impl FnMut() -> bool,
+    ) -> Poll<Result<MediaGucState, MediaGucError>> {
+        use crate::intel_gpu_guc_gt::GtState;
+        match self.state {
+            MediaGucState::Stopped | MediaGucState::Retained => {
+                return Poll::Ready(Ok(self.state));
+            }
+            _ => {}
+        }
+        let polled = self.gt.poll_with_access(now, current);
+        let result = match (self.state, polled) {
+            (_, Poll::Pending) => return Poll::Pending,
+            (MediaGucState::Stopping, Poll::Ready(Ok(GtState::Stopped))) => {
+                if self.allocator.register_media_guc_tlb(false).is_err() {
+                    self.state = MediaGucState::Retained;
+                    return Poll::Ready(Err(MediaGucError::Retained));
+                }
+                self.registered = false;
+                self.state = MediaGucState::Stopped;
+                return Poll::Ready(Ok(self.state));
+            }
+            (MediaGucState::Stopping, Poll::Ready(Ok(_))) => return Poll::Pending,
+            (MediaGucState::Stopping, Poll::Ready(Err(_))) => {
+                self.state = MediaGucState::Retained;
+                return Poll::Ready(Err(MediaGucError::Retained));
+            }
+            (MediaGucState::Starting, Poll::Ready(Ok(GtState::Ready))) => {
+                // xe_guc_hwconfig_init skips non-GT0 GuCs: enable CT directly.
+                self.gt.begin_ct(now).map_err(MediaGucError::Gt)
+            }
+            (MediaGucState::Starting, Poll::Ready(Ok(GtState::CtReady)))
+            | (MediaGucState::Running, Poll::Ready(Ok(GtState::CtReady))) => {
+                self.state = MediaGucState::Running;
+                match self.gt.receive() {
+                    Ok(None) => return Poll::Ready(Ok(self.state)),
+                    Ok(Some(_)) => Err(MediaGucError::Protocol),
+                    Err(error) => Err(MediaGucError::Gt(error)),
+                }
+            }
+            (MediaGucState::Starting, Poll::Ready(Ok(_))) => return Poll::Pending,
+            (_, Poll::Ready(Ok(_))) => Err(MediaGucError::State),
+            (_, Poll::Ready(Err(error))) => Err(MediaGucError::Gt(error)),
+        };
+        match result {
+            Ok(()) => Poll::Pending,
+            Err(error) => {
+                self.error.get_or_insert(error);
+                self.begin_stop(now);
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+
+    /// Begin a verified stop: GuC reset, DMA idle, CT/ADS/log release and
+    /// media wake release, as the shared GuCGt stop path proves for GT0.
+    pub(crate) fn begin_stop(&mut self, now: u64) {
+        if matches!(
+            self.state,
+            MediaGucState::Stopping | MediaGucState::Stopped | MediaGucState::Retained
+        ) {
+            return;
+        }
+        if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Stopped {
+            self.state = MediaGucState::Stopping;
+            return;
+        }
+        self.state = match self.gt.begin_stop(now) {
+            Ok(()) => MediaGucState::Stopping,
+            Err(error) => {
+                self.error.get_or_insert(MediaGucError::Gt(error));
+                MediaGucState::Retained
+            }
+        };
+    }
+
+    /// Stop and wait without holding any IRQ lock. Cancellation leaves the
+    /// owner, its memory and its TLB registration retained.
+    pub(crate) async fn stop(&mut self, mut current: impl FnMut() -> bool) -> MediaGucState {
+        self.begin_stop(narf_time::monotonic_ns());
+        loop {
+            match self.poll(narf_time::monotonic_ns(), &mut current) {
+                Poll::Ready(_) if self.state != MediaGucState::Stopping => return self.state,
+                _ => {}
+            }
+            narf_scheduler::yield_now().await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
+        }
+    }
+
+    /// Whether this owner may be dropped: only after a proven stop, or before
+    /// any wake/firmware publication (`start` never returns such an owner).
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.state == MediaGucState::Stopped && !self.registered
     }
 }
 

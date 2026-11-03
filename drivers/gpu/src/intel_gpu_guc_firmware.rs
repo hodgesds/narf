@@ -115,6 +115,19 @@ impl GuCFirmware {
         )
         .expect("immutable authorized GuC image")
     }
+
+    /// Native-test image from fixture bytes, with the registry path's exact
+    /// profile/version/signature validation. Not reachable in production.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn from_fixture(platform: GtPlatform, bytes: &[u8]) -> Result<Self, FirmwareError> {
+        validate(platform.guc().ok_or(FirmwareError::Unsupported)?, bytes)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            platform,
+            digest: [0; 32],
+            signer: None,
+        })
+    }
 }
 
 #[cfg(feature = "kernel-test")]

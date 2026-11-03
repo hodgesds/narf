@@ -97,6 +97,20 @@ struct State {
     /// Its refusal is terminal for the incarnation and never reaches GT0.
     media: Option<crate::intel_gpu_gt::media::MediaGt>,
     media_reported: bool,
+    /// Media GuC beside GT0. It holds firmware/CT memory in GT0's shared GGTT
+    /// arena, so no GT0 restart or D3 may proceed until its stop is proven.
+    media_guc: Option<crate::intel_gpu_gt::media::MediaGuc<AuthorizedWindow, SharedArena>>,
+    media_guc_tried: bool,
+    media_guc_reported: bool,
+}
+
+/// Outcome of retiring the media owners before a GT0 transition.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MediaRetire {
+    Done,
+    Pending,
+    /// The media GuC's stop is unproven; its shared-GGTT memory stays held.
+    Retained,
 }
 
 struct Pending {
@@ -1097,6 +1111,9 @@ pub(crate) fn start_pending() {
                 smallbar_grant_deadline: None,
                 media: None,
                 media_reported: false,
+                media_guc: None,
+                media_guc_tried: false,
+                media_guc_reported: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -1328,6 +1345,9 @@ impl Owner {
         {
             return Err(RuntimeError::State);
         }
+        if state.media_guc.is_some() {
+            return Err(RuntimeError::State);
+        }
         state.gt.take(); // only verified stopped owners can be replaced
         let p = &self.pending;
         let mmio = p.window.clone();
@@ -1505,7 +1525,21 @@ impl Owner {
 
     fn step(&self, state: &mut State, reconfiguration_power: bool) -> Result<(), RuntimeError> {
         if state.phase != Phase::Running {
-            self.retire_media(state);
+            let retired = self.retire_media(state, narf_time::monotonic_ns());
+            // A new GT0 incarnation builds a new GGTT arena over the same
+            // GGTT: never while the media GuC may still translate through it.
+            if retired != MediaRetire::Done
+                && matches!(state.phase, Phase::Cold | Phase::Powering | Phase::Takeover)
+            {
+                if retired == MediaRetire::Retained {
+                    log(
+                        self.pending.index,
+                        "media GuC stop unproven; shared GGTT retained, GT not restarted",
+                    );
+                    state.phase = Phase::Failed;
+                }
+                return Ok(());
+            }
         }
         if let Some(session) = crate::intel_gpu_guc_log::stream::take_requested(self.pending.index)
         {
@@ -1973,7 +2007,7 @@ impl Owner {
                         error
                     );
                     state.phase = Phase::Failed;
-                    self.retire_media(&mut state);
+                    let _ = self.retire_media(&mut state, narf_time::monotonic_ns());
                     // All owner-specific diagnostics/IRQ/admission/display
                     // ordering above precedes the shared hardware cleanup.
                     let State { recovery, gt, .. } = &mut *state;
@@ -2160,6 +2194,9 @@ impl Owner {
         }) else {
             return;
         };
+        if result.is_ok() {
+            self.service_media_guc(state, now);
+        }
         if core::mem::replace(&mut state.media_reported, true) {
             return;
         }
@@ -2167,7 +2204,7 @@ impl Owner {
         let _ = match result {
             Ok(facts) => writeln!(
                 narf_console::Writer,
-                "intel-gt card{}: media GT {}.{:02} step {} initialized (fuse {:#x}, engines {:#x}); media GuC held in reset, GT1 unpublished",
+                "intel-gt card{}: media GT {}.{:02} step {} initialized (fuse {:#x}, engines {:#x}); GT1 unpublished",
                 self.pending.index,
                 facts.ip.version / 100,
                 facts.ip.version % 100,
@@ -2184,13 +2221,132 @@ impl Owner {
         };
     }
 
-    /// Release this incarnation's media GT wake requests before any GT0
-    /// stop, park, suspend or fault cleanup. Writes only media registers.
-    fn retire_media(&self, state: &mut State) {
+    /// One media GuC attempt per media GT owner: boot the MTL GuC image on
+    /// GT1 and enable its polled CT. Every refusal stays on GT1.
+    fn service_media_guc(&self, state: &mut State, now: u64) {
+        use crate::intel_gpu_gt::media::{MediaGuc, MediaGucState};
+        use core::fmt::Write as _;
+        if state.media_guc.is_none() {
+            if core::mem::replace(&mut state.media_guc_tried, true) {
+                return;
+            }
+            let Some(facts) = *self.user_facts.lock() else {
+                return;
+            };
+            let (Some(gt), Some(firmware), Some(media)) = (
+                state.gt.as_ref(),
+                state.firmware.as_ref(),
+                state.media.as_ref(),
+            ) else {
+                return;
+            };
+            let config = BootConfig {
+                device_id: self.pending.device.id.device,
+                revision: facts.revision,
+                huc_upload_bytes: 0,
+                uncached_mocs: None,
+            };
+            match MediaGuc::start(
+                self.pending.window.clone(),
+                gt.shared_allocator(),
+                firmware,
+                config,
+                media,
+                now,
+            ) {
+                Ok(guc) => {
+                    state.media_guc_reported = false;
+                    state.media_guc = Some(guc);
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: media GuC not started ({:?}); GT0 unaffected",
+                        self.pending.index,
+                        error
+                    );
+                    return;
+                }
+            }
+        }
+        let guc = state.media_guc.as_mut().expect("media GuC owner");
+        let polled = guc.poll(now, || {
+            narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                == Ok(Some(narf_bus::pci::PciPowerState::D0))
+        });
+        match polled {
+            core::task::Poll::Ready(Ok(MediaGucState::Running)) => {
+                if !core::mem::replace(&mut state.media_guc_reported, true) {
+                    log(
+                        self.pending.index,
+                        "media GuC running; CT polled via the media mailbox; no media engine published",
+                    );
+                }
+            }
+            core::task::Poll::Ready(Ok(MediaGucState::Stopped)) if guc.reclaimable() => {
+                state.media_guc = None;
+            }
+            core::task::Poll::Ready(Err(error)) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gt card{}: media GuC stopping after {:?}; GT0 unaffected",
+                    self.pending.index,
+                    error
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Release the media GT owner's wake requests and advance a verified
+    /// media GuC stop before any GT0 stop, park, suspend or fault cleanup.
+    fn retire_media(&self, state: &mut State, now: u64) -> MediaRetire {
         if let Some(mut media) = state.media.take() {
             media.abandon(&self.pending.window);
         }
         state.media_reported = false;
+        state.media_guc_tried = false;
+        let Some(guc) = state.media_guc.as_mut() else {
+            return MediaRetire::Done;
+        };
+        guc.begin_stop(now);
+        let _ = guc.poll(now, || {
+            narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                == Ok(Some(narf_bus::pci::PciPowerState::D0))
+        });
+        use crate::intel_gpu_gt::media::MediaGucState;
+        match guc.state() {
+            MediaGucState::Stopped if guc.reclaimable() => {
+                state.media_guc = None;
+                state.media_guc_reported = false;
+                MediaRetire::Done
+            }
+            MediaGucState::Retained => MediaRetire::Retained,
+            _ => MediaRetire::Pending,
+        }
+    }
+
+    /// Await a proven media stop before GT0 leaves D0. False leaves the media
+    /// GuC retained; the caller must not power down or rebuild the arena.
+    async fn stop_media(&self, state: &mut State) -> bool {
+        if self.retire_media(state, narf_time::monotonic_ns()) == MediaRetire::Done {
+            return true;
+        }
+        let Some(guc) = state.media_guc.as_mut() else {
+            return true;
+        };
+        let stopped = guc
+            .stop(|| {
+                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+            })
+            .await;
+        if stopped == crate::intel_gpu_gt::media::MediaGucState::Stopped && guc.reclaimable() {
+            state.media_guc = None;
+            state.media_guc_reported = false;
+            return true;
+        }
+        false
     }
 }
 
@@ -2245,6 +2401,11 @@ impl Owner {
         {
             return Err(RpmError::Busy);
         }
+        // The media GuC shares GT0's GGTT: prove its stop before GT0 parks.
+        // A refusal leaves GT0 running; an unproven stop forbids D3.
+        if !self.stop_media(&mut state).await {
+            return Err(RpmError::Busy);
+        }
         let epoch = self.user_epoch.load(Ordering::Acquire);
         let (epoch, engines, compute) = {
             let State { recovery, gt, .. } = &mut *state;
@@ -2259,7 +2420,6 @@ impl Owner {
                 })?
         };
         state.irq.take(); // mask and synchronize while still in D0
-        self.retire_media(&mut state);
         self.close_controls();
         // Runtime park preserves user_epoch but retires this firmware upload.
         // A queued diagnostic open must never migrate to the resumed image.
@@ -2397,11 +2557,15 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             self.suspended.store(true, Ordering::Release);
             self.close_user_epoch();
             state.irq.take(); // mask/synchronize while the function is in D0
-            self.retire_media(&mut state);
             state.saved = None;
             // System sleep loses context state: no runtime epoch survives it.
             state.parked_epoch = None;
             let result = async {
+                // The media GuC shares GT0's GGTT and must be proven stopped
+                // before GT0 stops and the function leaves D0.
+                if !self.stop_media(&mut state).await {
+                    return Err(E::DriverError);
+                }
                 if let Some(gt) = &mut state.gt {
                     if !matches!(gt.state(), GtState::Staged | GtState::Stopped) {
                         gt.begin_stop(narf_time::monotonic_ns())

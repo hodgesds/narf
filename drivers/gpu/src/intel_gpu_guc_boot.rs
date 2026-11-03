@@ -9,7 +9,7 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gt::{GtPlatform, GUC_GGTT_MIN};
 use crate::intel_gpu_guc::CssImage;
 use crate::intel_gpu_guc_firmware::GuCFirmware;
-use crate::intel_gpu_guc_transport::{TransportError, XeLpgTransport};
+use crate::intel_gpu_guc_transport::{MailboxRegisters, TransportError, XeLpgTransport};
 use crate::intel_gpu_guc_wa::GuCWorkarounds;
 use crate::intel_gpu_hwconfig::{HardwareConfig, HwconfigError};
 use crate::intel_gpu_rcs::{GpuAllocator, GpuBacking, SubmitError};
@@ -88,6 +88,11 @@ pub trait BootAllocator: GpuAllocator {
     fn retire_ggtt(&mut self) -> Result<(), BootError> {
         Err(BootError::Cache)
     }
+    /// Register (`true`) or unregister the standalone media GuC as a second
+    /// TLB of this allocator's shared GGTT. Allocators without one refuse.
+    fn register_media_guc_tlb(&mut self, _live: bool) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
 
     fn configure_cache(
         &mut self,
@@ -112,6 +117,9 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
     }
     fn retire_ggtt(&mut self) -> Result<(), BootError> {
         crate::intel_gpu_rcs::SharedArena::retire_ggtt(self).map_err(BootError::Allocation)
+    }
+    fn register_media_guc_tlb(&mut self, live: bool) -> Result<(), BootError> {
+        self.set_media_guc_tlb(live).map_err(BootError::Allocation)
     }
 
     fn configure_cache(
@@ -226,10 +234,20 @@ impl<A: BootAllocator> Resources<A> {
     }
 }
 
+/// Which GuC of the tile this bootstrap owns. The media role is constructed
+/// only over a `MediaGsi` window (see `GuCBoot::stage_media`), so its
+/// GSI-translated GuC registers and its media mailbox cannot be mismatched.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GuCRole {
+    Primary,
+    Media(crate::intel_gpu_gt::media::MediaIp),
+}
+
 pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     mmio: M,
     resources: ManuallyDrop<Resources<A>>,
     platform: GtPlatform,
+    role: GuCRole,
     config: BootConfig,
     huc_exposed: bool,
     huc_dma_done: bool,
@@ -480,6 +498,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 huc,
             }),
             platform,
+            role: GuCRole::Primary,
             config,
             huc_exposed: false,
             huc_dma_done: false,
@@ -503,6 +522,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
     pub(crate) fn platform(&self) -> GtPlatform {
         self.platform
+    }
+
+    pub(crate) fn role(&self) -> GuCRole {
+        self.role
     }
 
     pub(crate) fn device_id(&self) -> u16 {
@@ -674,8 +697,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::State);
         }
         self.awake()?;
-        XeLpgTransport::allocate_for_platform(
+        XeLpgTransport::allocate_with_mailbox(
             self.platform,
+            match self.role {
+                GuCRole::Primary => MailboxRegisters::PRIMARY,
+                GuCRole::Media(_) => MailboxRegisters::MEDIA,
+            },
             self.mmio.clone(),
             self.resources.allocator.clone(),
         )
@@ -709,18 +736,36 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         if self.mmio.read32(GDRST) != 0 || self.mmio.read32(DMA_CTRL) & 1 != 0 {
             return Err(BootError::Busy);
         }
-        let ip = crate::intel_gpu_gt::GraphicsIp::read(&self.mmio, self.platform)
-            .map_err(BootError::Graphics)?;
-        let mut workarounds = GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
-        if self.platform.is_headless_integrated() {
-            let fuse = self.mmio.read32(0x9114);
-            if fuse == u32::MAX || fuse != self.mmio.read32(0x9114) {
-                return Err(BootError::Unavailable);
+        let workarounds = match self.role {
+            GuCRole::Primary => {
+                let ip = crate::intel_gpu_gt::GraphicsIp::read(&self.mmio, self.platform)
+                    .map_err(BootError::Graphics)?;
+                let mut workarounds =
+                    GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
+                if self.platform.is_headless_integrated() {
+                    let fuse = self.mmio.read32(0x9114);
+                    if fuse == u32::MAX || fuse != self.mmio.read32(0x9114) {
+                        return Err(BootError::Unavailable);
+                    }
+                    if fuse & 0x000f0000 != 0 {
+                        workarounds.flags |= 0x00400000;
+                    }
+                }
+                workarounds
             }
-            if fuse & 0x000f0000 != 0 {
-                workarounds.flags |= 0x00400000;
+            GuCRole::Media(ip) => {
+                // The staged GT1 identity must still be current under media
+                // wake. The GSI window reads GMD_ID at MEDIA_GT_GSI_OFFSET.
+                let gmd = self.mmio.read32(0xd8c);
+                if gmd == u32::MAX {
+                    return Err(BootError::Unavailable);
+                }
+                if gmd != ip.gmd || self.mmio.read32(0xd8c) != gmd {
+                    return Err(BootError::Device);
+                }
+                GuCWorkarounds::for_media(self.platform, ip).ok_or(BootError::Unsupported)?
             }
-        }
+        };
         if self.workarounds.is_some_and(|old| old != workarounds) {
             return Err(BootError::Device);
         }
@@ -1218,6 +1263,37 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 }
 
+impl<W: MmioWindow, A: BootAllocator> GuCBoot<crate::intel_gpu_gt::media::MediaGsi<W>, A> {
+    /// Stage the MTL/Arrow standalone media GuC with the same GuC firmware
+    /// family as GT0 (xe_uc_fw.c: METEORLAKE GT_TYPE_ANY mtl_guc_70). WOPCM,
+    /// reset, DMA, status and ADS registers go through the media GSI window;
+    /// HWCONFIG is never queried (xe_guc_hwconfig_init: GT0 only) and no HuC
+    /// image is reserved (MTL HuC is GSC-loaded).
+    pub(crate) fn stage_media(
+        mmio: crate::intel_gpu_gt::media::MediaGsi<W>,
+        allocator: A,
+        firmware: &GuCFirmware,
+        config: BootConfig,
+        ip: crate::intel_gpu_gt::media::MediaIp,
+    ) -> Result<Self, BootError> {
+        if !crate::intel_gpu_gt::media::profile_eligible(firmware.platform())
+            || config.huc_upload_bytes != 0
+            || GuCWorkarounds::for_media(firmware.platform(), ip).is_none()
+        {
+            return Err(BootError::Unsupported);
+        }
+        let mut boot = Self::stage_image(
+            mmio,
+            allocator,
+            firmware.platform(),
+            firmware.image(),
+            config,
+        )?;
+        boot.role = GuCRole::Media(ip);
+        Ok(boot)
+    }
+}
+
 impl<M: MmioWindow, A: BootAllocator> Drop for GuCBoot<M, A> {
     fn drop(&mut self) {
         if !self.huc_exposed && matches!(self.state, BootState::Staged | BootState::Stopped) {
@@ -1290,6 +1366,10 @@ mod tests {
         stream_drop: Option<(u16, u32)>,
         stream_overwrite: bool,
         mmio_reads: Cell<usize>,
+        // Media GuC second-TLB registration and the write index at which
+        // it was first registered (before any firmware address publication).
+        media_tlb: Option<bool>,
+        media_tlb_at: Option<usize>,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
@@ -1425,12 +1505,12 @@ mod tests {
                     value
                 }
                 0xd8c | 0x380d8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
-                0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 | 0xa188 | 0xa278 | 0x38a188 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c
-                | 0xe4f4 | 0xe5f0 | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4
-                | 0xe5f4 | 0x2050 | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050
-                | 0x1c0d4 | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804
-                | 0x20c4 | 0x220c4 | 0x3ee0c4 | 0x1a0c4 | 0x1c0c4 | 0x1e0c4 | 0x260c4 => {
+                0xc050 | 0xc340 | 0x38c050 | 0x38c340 if !device.reject_wopcm => value | 1,
+                0xc314 | 0x38c314 | 0xa188 | 0xa278 | 0x38a188 | 0x20ec | 0x83b4 | 0xe48c
+                | 0xe18c | 0xe4f4 | 0xe5f0 | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194
+                | 0xe4c4 | 0xe5f4 | 0x2050 | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4
+                | 0x1a050 | 0x1c0d4 | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800
+                | 0x14804 | 0x20c4 | 0x220c4 | 0x3ee0c4 | 0x1a0c4 | 0x1c0c4 | 0x1e0c4 | 0x260c4 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
@@ -1532,6 +1612,15 @@ mod tests {
         fn retire_ggtt(&mut self) -> Result<(), BootError> {
             Ok(())
         } // model has no GGTT PTE window
+
+        fn register_media_guc_tlb(&mut self, live: bool) -> Result<(), BootError> {
+            let mut device = self.0.borrow_mut();
+            if live && device.media_tlb_at.is_none() {
+                device.media_tlb_at = Some(device.writes.len());
+            }
+            device.media_tlb = Some(live);
+            Ok(())
+        }
 
         fn configure_cache(
             &mut self,
@@ -2761,6 +2850,374 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hwconfig",
         smoke_hwconfig_card_refuses_wake_loss
+    );
+
+    const MTL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    /// Media GMD_ID 13.00 step 2 behind the GSI base.
+    const MEDIA_GMD: u32 = (13 << 22) | 2;
+
+    fn media_model() -> (Window, Arena) {
+        let (window, arena) = model();
+        {
+            let mut device = window.0.borrow_mut();
+            device.profile = Some(MTL);
+            // GT0 owns its own wake/GMD; the media GuC must never touch them.
+            device.regs.insert(0xd8c, (12 << 22) | (70 << 14));
+            device.regs.insert(0xa188, 1);
+            device.regs.insert(0x380d8c, MEDIA_GMD);
+            device.regs.insert(0x380dfc, 0);
+            device.regs.insert(0x38a188, 0);
+            device.regs.insert(0x1900e8, 0x8000_0000);
+        }
+        (window, arena)
+    }
+
+    fn media_config() -> BootConfig {
+        BootConfig {
+            device_id: 0x7d55,
+            revision: 3,
+            huc_upload_bytes: 0,
+            uncached_mocs: None,
+        }
+    }
+
+    fn media_policy() -> crate::intel_gpu_gt_hw::CachePolicy {
+        crate::intel_gpu_gt_hw::CachePolicy {
+            platform: MTL,
+            ggtt_pat: 3,
+            media: None,
+        }
+    }
+
+    fn media_reset_done(window: &Window) {
+        let mut device = window.0.borrow_mut();
+        device.regs.insert(0x38941c, 0);
+        device.regs.insert(0x38c000, 1);
+        device.regs.insert(0x38c314, 0);
+    }
+
+    /// Offsets a media GuC owner may write: GSI-translated GT1 registers,
+    /// the absolute media mailbox/doorbell, the shared GT_PM_CONFIG doorbell
+    /// enable (xe_guc.c writes it through either GT's window) and the media
+    /// half of GUC_SG_INTR_MASK.
+    fn media_owned(offset: u64) -> bool {
+        (0x380000..0x3c0000).contains(&offset)
+            || (0x190304..=0x19031c).contains(&offset)
+            || matches!(offset, 0x13816c | 0x1900e8)
+    }
+
+    type MediaWindow = crate::intel_gpu_gt::media::MediaGsi<Window>;
+
+    fn media_ready(gt: &mut GuCGt<MediaWindow, Arena>, window: &Window) {
+        gt.begin(0).unwrap();
+        assert_eq!(window.0.borrow().regs[&0x38a188] & 1, 1);
+        assert!(gt.poll(1).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        assert!(gt.poll(2).is_pending());
+        media_reset_done(window);
+        assert!(gt.poll(3).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c314, 0x10);
+        assert!(gt.poll(4).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c000, 0x8000f000);
+        assert_eq!(gt.poll(5), Poll::Ready(Ok(GtState::Ready)));
+    }
+
+    fn media_ct(gt: &mut GuCGt<MediaWindow, Arena>, window: &Window) {
+        gt.begin_ct(6).unwrap();
+        for i in 0..6 {
+            window.0.borrow_mut().regs.insert(0x190310, 0xf0000001);
+            assert!(gt.poll(7 + i).is_pending());
+        }
+        window.0.borrow_mut().regs.insert(0x190310, 0xf0000000);
+        assert_eq!(gt.poll(13), Poll::Ready(Ok(GtState::CtReady)));
+    }
+
+    fn media_stop(gt: &mut GuCGt<MediaWindow, Arena>, window: &Window) {
+        gt.begin_stop(100).unwrap();
+        assert!(gt.poll(101).is_pending());
+        media_reset_done(window);
+        assert!(gt.poll(102).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        assert_eq!(window.0.borrow().regs[&0x38a188] & 1, 0);
+        assert!(gt.poll(103).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 0);
+        assert_eq!(gt.poll(104), Poll::Ready(Ok(GtState::Stopped)));
+    }
+
+    fn smoke_media_guc_boot_ct_and_stop_touch_only_gt1_registers() -> TestResult {
+        let (window, arena) = media_model();
+        let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
+        let ip = crate::intel_gpu_gt::media::MediaIp::decode(MEDIA_GMD);
+        let mut gt = GuCGt::stage_media(
+            crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
+            arena.clone(),
+            &firmware,
+            media_config(),
+            ip,
+            media_policy(),
+        )
+        .unwrap();
+        assert_eq!(gt.guc_role(), GuCRole::Media(ip));
+        media_ready(&mut gt, &window);
+        {
+            let device = window.0.borrow();
+            // Same firmware family and wire sequence as GT0, at the GSI base.
+            for pair in [
+                (0x38941c, 8),
+                (0x38c050, 0x3f3000),
+                (0x38c340, 0x4000),
+                (0x38c300, 0x20000000),
+                (0x38c310, 144),
+                (0x38c314, 0x00110011),
+                (0x38cee8, 1),
+            ] {
+                assert!(device.writes.contains(&pair), "media GuC wire sequence");
+            }
+            // Media 13.00 GuC flags and ADS WA KLVs (Wa_14018913170,
+            // Wa_16021333562, Wa_16026508708), scheduling still disabled.
+            assert_eq!(device.regs[&0x38c188], 0x0040_0000);
+            assert_eq!(device.regs[&0x38c18c], 0x4000);
+            assert_eq!(device.regs[&0x38c198] >> 16, 0x7d55);
+            let ads = device.memory[&0x20001000].borrow();
+            assert_eq!(&ads[0x11a4 / 4..0x11b0 / 4], &[0x20004000, 0, 8]);
+            assert_eq!(&ads[0x3000 / 4..0x3000 / 4 + 2], &[0x90020000, 0x900b0000]);
+            assert!(ads[0x3000 / 4 + 2..0x4000 / 4].iter().all(|v| *v == 0));
+            // Minimal ADS: no engine is enabled before media scheduling.
+            assert!(ads[0x123c / 4..0x143c / 4].iter().all(|v| *v == 0x20202020));
+            assert!(ads[0x143c / 4..0x147c / 4].iter().all(|v| *v == 0));
+            assert_eq!(device.gmd_reads, 0, "GT0 GMD_ID is not the media identity");
+        }
+        media_ct(&mut gt, &window);
+        {
+            let device = window.0.borrow();
+            assert!(device.writes.iter().any(|(reg, _)| *reg == 0x190304));
+            assert!(device.writes.iter().any(|(reg, _)| *reg == 0x190310));
+        }
+        media_stop(&mut gt, &window);
+        drop(gt);
+        let device = window.0.borrow();
+        assert!(
+            device.writes.iter().all(|(reg, _)| media_owned(*reg)),
+            "a media GuC owner wrote a GT0 register"
+        );
+        assert_eq!(device.regs[&0xa188], 1, "GT0 wake untouched");
+        drop(device);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media_gt",
+        smoke_media_guc_boot_ct_and_stop_touch_only_gt1_registers
+    );
+
+    fn smoke_media_guc_staging_and_identity_refusals_publish_nothing() -> TestResult {
+        let ip = crate::intel_gpu_gt::media::MediaIp::decode(MEDIA_GMD);
+        // Media workaround profile is exact to MTL/Arrow Xe_LPM+ 13.00.
+        let wa = GuCWorkarounds::for_media(MTL, ip).unwrap();
+        assert_eq!(
+            (wa.flags, wa.klvs),
+            (0x0040_0000, &[0x90020000, 0x900b0000][..])
+        );
+        assert!(GuCWorkarounds::for_media(
+            MTL,
+            crate::intel_gpu_gt::media::MediaIp::decode((13 << 22) | (1 << 14))
+        )
+        .is_none());
+        assert!(GuCWorkarounds::for_media(GtPlatform::Battlemage, ip).is_none());
+        // Non-MTL firmware or another media IP: refused before allocation.
+        for (platform, gmd) in [(GtPlatform::Battlemage, MEDIA_GMD), (MTL, 20 << 22)] {
+            let (window, arena) = media_model();
+            let firmware = GuCFirmware::from_fixture(platform, &image()).unwrap();
+            let staged = GuCGt::stage_media(
+                crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
+                arena.clone(),
+                &firmware,
+                media_config(),
+                crate::intel_gpu_gt::media::MediaIp::decode(gmd),
+                media_policy(),
+            );
+            assert!(matches!(
+                staged.err(),
+                Some(GtError::Boot(BootError::Unsupported))
+            ));
+            assert_eq!(arena.live_allocations(), 0);
+            assert!(window.0.borrow().writes.is_empty());
+        }
+        // The staged identity changed before GuC reset: no reset, no DMA.
+        let (window, arena) = media_model();
+        let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
+        let mut gt = GuCGt::stage_media(
+            crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
+            arena.clone(),
+            &firmware,
+            media_config(),
+            ip,
+            media_policy(),
+        )
+        .unwrap();
+        gt.begin(0).unwrap();
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        window.0.borrow_mut().regs.insert(0x380d8c, MEDIA_GMD + 1);
+        assert_eq!(
+            gt.poll(1),
+            Poll::Ready(Err(GtError::Boot(BootError::Device)))
+        );
+        assert!(!window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .any(|(reg, _)| matches!(reg, 0x38941c | 0x38c314 | 0x941c | 0xc314)));
+        // The lost owner still proves its stop before releasing memory.
+        gt.begin_stop(2).unwrap();
+        assert!(gt.poll(3).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 0);
+        assert_eq!(gt.poll(4), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        assert!(window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .all(|(reg, _)| media_owned(*reg)));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media_gt",
+        smoke_media_guc_staging_and_identity_refusals_publish_nothing
+    );
+
+    fn smoke_media_guc_owner_registers_tlb_masks_irq_and_retains_on_unproven_stop() -> TestResult {
+        use crate::intel_gpu_gt::media::{MediaGt, MediaGuc, MediaGucError, MediaGucState};
+        let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
+        let media = MediaGt::initialized_for_test(MTL, MEDIA_GMD, 0x0001_0005);
+        // An uninitialized media GT cannot start a GuC.
+        let (window, arena) = media_model();
+        let fresh = MediaGt::new(MTL, 1274);
+        assert!(matches!(
+            MediaGuc::start(
+                window.clone(),
+                arena.clone(),
+                &firmware,
+                media_config(),
+                &fresh,
+                0
+            )
+            .err(),
+            Some(MediaGucError::State)
+        ));
+        assert!(window.0.borrow().writes.is_empty());
+        assert_eq!(arena.live_allocations(), 0);
+        // Positive start: interrupt half masked and TLB registered before
+        // the media wake request, then boot and CT through the GT1 owner.
+        let mut guc = MediaGuc::start(
+            window.clone(),
+            arena.clone(),
+            &firmware,
+            media_config(),
+            &media,
+            0,
+        )
+        .unwrap();
+        {
+            let device = window.0.borrow();
+            assert_eq!(device.regs[&0x1900e8], 0x8000_8000, "GT0 half preserved");
+            assert_eq!(device.media_tlb, Some(true));
+            let wake = device
+                .writes
+                .iter()
+                .position(|pair| *pair == (0x38a188, 0x0001_0001))
+                .unwrap();
+            assert!(device.media_tlb_at.unwrap() <= wake);
+        }
+        assert_eq!(guc.state(), MediaGucState::Starting);
+        assert!(guc.poll(1, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        assert!(guc.poll(2, || true).is_pending());
+        media_reset_done(&window);
+        assert!(guc.poll(3, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c314, 0x10);
+        assert!(guc.poll(4, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c000, 0x8000f000);
+        // Ready -> CT enable through the media mailbox.
+        assert!(guc.poll(5, || true).is_pending());
+        for i in 0..6 {
+            window.0.borrow_mut().regs.insert(0x190310, 0xf0000001);
+            assert!(guc.poll(6 + i, || true).is_pending());
+        }
+        window.0.borrow_mut().regs.insert(0x190310, 0xf0000000);
+        assert_eq!(
+            guc.poll(12, || true),
+            Poll::Ready(Ok(MediaGucState::Running))
+        );
+        // An idle running GuC with an empty G2H ring stays running.
+        assert_eq!(
+            guc.poll(13, || true),
+            Poll::Ready(Ok(MediaGucState::Running))
+        );
+        // Current loss is a GT error; the owner then proves its stop.
+        assert!(matches!(
+            guc.poll(14, || false),
+            Poll::Ready(Err(MediaGucError::Gt(GtError::Unavailable)))
+        ));
+        assert_eq!(guc.state(), MediaGucState::Stopping);
+        assert!(guc.poll(15, || true).is_pending());
+        media_reset_done(&window);
+        assert!(guc.poll(16, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 0);
+        assert_eq!(
+            guc.poll(17, || true),
+            Poll::Ready(Ok(MediaGucState::Stopped))
+        );
+        assert!(guc.reclaimable());
+        assert_eq!(window.0.borrow().media_tlb, Some(false));
+        assert_eq!(guc.error(), Some(MediaGucError::Gt(GtError::Unavailable)));
+        drop(guc);
+        assert_eq!(arena.live_allocations(), 0);
+        assert!(window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .all(|(reg, _)| media_owned(*reg)));
+        // A GuC reset that never completes cannot prove stop: the owner,
+        // its firmware memory and the second-TLB registration stay retained.
+        let (window, arena) = media_model();
+        let mut guc = MediaGuc::start(
+            window.clone(),
+            arena.clone(),
+            &firmware,
+            media_config(),
+            &media,
+            0,
+        )
+        .unwrap();
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        assert!(guc.poll(1, || true).is_pending());
+        media_reset_done(&window);
+        assert!(guc.poll(2, || true).is_pending());
+        // Firmware DMA is armed; the stop's GuC reset never self-clears.
+        guc.begin_stop(3);
+        assert_eq!(guc.state(), MediaGucState::Stopping);
+        let mut outcome = Poll::Pending;
+        for now in 4..64 {
+            outcome = guc.poll(now * 1_000_000, || true);
+            if outcome.is_ready() {
+                break;
+            }
+        }
+        assert_eq!(outcome, Poll::Ready(Err(MediaGucError::Retained)));
+        assert_eq!(guc.state(), MediaGucState::Retained);
+        assert!(!guc.reclaimable());
+        assert_eq!(window.0.borrow().media_tlb, Some(true));
+        assert!(arena.live_allocations() > 0);
+        core::mem::forget(guc); // fixture: retained firmware memory is never freed
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media_gt",
+        smoke_media_guc_owner_registers_tlb_masks_irq_and_retains_on_unproven_stop
     );
 
     mod hardware_tests {

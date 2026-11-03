@@ -2213,6 +2213,43 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 }
 
+impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi<W>, A> {
+    /// MTL/Arrow standalone media GuC (GT1). This is the bare GuCGt path:
+    /// no render well, MCR, topology, HWCONFIG, MERT or scheduler. Its wake
+    /// request/ACK, GuC reset, WOPCM, DMA, ADS and CT all resolve through the
+    /// media GSI window and media mailbox. `policy` proves the media PAT that
+    /// gives the shared GGTT PTE index its meaning on this GT.
+    pub(crate) fn stage_media(
+        mmio: crate::intel_gpu_gt::media::MediaGsi<W>,
+        allocator: A,
+        firmware: &GuCFirmware,
+        config: BootConfig,
+        ip: crate::intel_gpu_gt::media::MediaIp,
+        policy: crate::intel_gpu_gt_hw::CachePolicy,
+    ) -> Result<Self, GtError> {
+        let mut boot =
+            GuCBoot::stage_media(mmio, allocator, firmware, config, ip).map_err(GtError::Boot)?;
+        boot.configure_cache(policy).map_err(GtError::Boot)?;
+        Ok(Self::from_staged(boot))
+    }
+}
+
+impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
+    /// A handle to this GT's GGTT allocator, for a second GuC of the same
+    /// tile whose firmware memory must come from the same shared GGTT.
+    pub(crate) fn shared_allocator(&self) -> A
+    where
+        A: Clone,
+    {
+        self.parts.boot.diagnostic_allocator()
+    }
+
+    /// Which GuC of the tile this owner boots.
+    pub(crate) fn guc_role(&self) -> crate::intel_gpu_guc_boot::GuCRole {
+        self.parts.boot.role()
+    }
+}
+
 impl<M: MmioWindow, A: BootAllocator> Drop for GuCGt<M, A> {
     fn drop(&mut self) {
         if !self.released && matches!(self.state, GtState::Staged | GtState::Stopped) {

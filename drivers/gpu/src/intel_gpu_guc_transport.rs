@@ -15,8 +15,6 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{fence, Ordering};
 use core::task::Poll;
 
-const SCRATCH: u64 = 0x190240;
-const NOTIFY: u64 = 0x1901f0;
 const GUC_STATUS: u64 = 0xc000;
 const MMIO_TIMEOUT_NS: u64 = 10_000_000;
 const PAGES: u32 = 6;
@@ -77,8 +75,33 @@ impl<B: GpuBacking> CtMemory for SharedCtb<B> {
     }
 }
 
+/// The MMIO mailbox of one GuC. Both register blocks sit above the media GSI
+/// range, so they are absolute offsets for either GT (xe_mmio_adjusted_addr).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MailboxRegisters {
+    scratch: u64,
+    notify: u64,
+}
+
+impl MailboxRegisters {
+    /// Primary GuC: VF_SW_FLAG(0..3) / GUC_HOST_INTERRUPT (i915
+    /// GEN11_SOFT_SCRATCH / GEN11_GUC_HOST_INTERRUPT).
+    pub(crate) const PRIMARY: Self = Self {
+        scratch: 0x190240,
+        notify: 0x1901f0,
+    };
+    /// Standalone media GuC: MED_VF_SW_FLAG(0..3) / MED_GUC_HOST_INTERRUPT
+    /// (xe_guc.c::{xe_guc_comm_init_early,xe_guc_mmio_send_recv}; i915
+    /// MEDIA_SOFT_SCRATCH / MEDIA_GUC_HOST_INTERRUPT with GUC_SEND_TRIGGER).
+    pub(crate) const MEDIA: Self = Self {
+        scratch: 0x190310,
+        notify: 0x190304,
+    };
+}
+
 pub(crate) struct Mailbox<M: MmioWindow> {
     mmio: M,
+    registers: MailboxRegisters,
     request: [u32; 4],
     length: usize,
     deadline: Option<u64>,
@@ -88,8 +111,13 @@ pub(crate) struct Mailbox<M: MmioWindow> {
 
 impl<M: MmioWindow> Mailbox<M> {
     pub(crate) fn new(mmio: M) -> Self {
+        Self::with_registers(mmio, MailboxRegisters::PRIMARY)
+    }
+
+    pub(crate) fn with_registers(mmio: M, registers: MailboxRegisters) -> Self {
         Self {
             mmio,
+            registers,
             request: [0; 4],
             length: 0,
             deadline: None,
@@ -117,17 +145,18 @@ impl<M: MmioWindow> Mailbox<M> {
     }
 
     fn publish(&self) {
+        let scratch = self.registers.scratch;
         for i in 0..self.length {
-            self.mmio.write32(SCRATCH + i as u64 * 4, self.request[i]);
+            self.mmio.write32(scratch + i as u64 * 4, self.request[i]);
         }
-        let _ = self.mmio.read32(SCRATCH + (self.length as u64 - 1) * 4);
+        let _ = self.mmio.read32(scratch + (self.length as u64 - 1) * 4);
         self.notify();
     }
 
     fn notify(&self) {
         fence(Ordering::Release);
-        self.mmio.write32(NOTIFY, 1);
-        let _ = self.mmio.read32(NOTIFY);
+        self.mmio.write32(self.registers.notify, 1);
+        let _ = self.mmio.read32(self.registers.notify);
     }
 
     /// One bounded sample per call. BUSY/RETRY never starts a new timeout.
@@ -135,7 +164,7 @@ impl<M: MmioWindow> Mailbox<M> {
         let Some(deadline) = self.deadline else {
             return Poll::Ready(Err(TransportError::State));
         };
-        let header = self.mmio.read32(SCRATCH);
+        let header = self.mmio.read32(self.registers.scratch);
         if header == u32::MAX {
             self.poisoned = true;
             self.deadline = None;
@@ -204,6 +233,17 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
     pub fn allocate_for_platform(
         platform: GtPlatform,
         mmio: M,
+        allocator: A,
+    ) -> Result<Self, TransportError> {
+        Self::allocate_with_mailbox(platform, MailboxRegisters::PRIMARY, mmio, allocator)
+    }
+
+    /// The CT's GuC is selected by its window and its MMIO mailbox. The
+    /// enclosing GT owner pairs a media GSI window only with the media mailbox.
+    pub(crate) fn allocate_with_mailbox(
+        platform: GtPlatform,
+        registers: MailboxRegisters,
+        mmio: M,
         mut allocator: A,
     ) -> Result<Self, TransportError> {
         if platform.guc().is_none() {
@@ -244,7 +284,7 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
         })
         .expect("fresh G2H CTB");
         Ok(Self {
-            mailbox: Mailbox::new(mmio),
+            mailbox: Mailbox::with_registers(mmio, registers),
             resources: ManuallyDrop::new(CtResources {
                 allocator,
                 blob,
