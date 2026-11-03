@@ -34,8 +34,8 @@ artifacts or their signing authority. Factory country hints supply no policy.
 
 The caller owns the PCI function and its BAR2 register aperture exclusively.
 `pci::bring_up` maps BAR2 with `map_bar_control` (Device memory attributes)
-and rejects windows smaller than `0x170c` for RTL8821CE/RTL8822CE (firmware
-LTE indirect data) or `0x1104` for RTL8822BE before MMIO. Chip/cut-filtered
+and rejects windows smaller than `0x170c` for RTL8821CE/RTL8822BE/RTL8822CE
+(firmware LTE indirect data) before MMIO. Chip/cut-filtered
 PCI power enable/disable tables and pre/system setup now follow Linux's
 actual flows. BAR2 is mandatory and is a control-register window. The
 device has no active firmware/packet DMA or IRQ handler during this reset.
@@ -312,8 +312,9 @@ registry authority and registers the shell in the frame, kernel IP and wireless
 registries before spawning the firmware worker or activating packet DMA. The
 controller view delegates control, carrier and frame rings to this same shell.
 Carrier stays down until actual peer association and security admission.
-The driver name follows the actual retained chip. RTL8822BE remains diagnostic,
-with wireless controls and packet TX unsupported. A C21 shell stays inactive
+The driver name follows the actual retained chip. RTL8822BE keeps its diagnostic
+static interface (wireless controls and packet TX unsupported) while its
+retained native B22 owner runs (see "RTL8822BE retained native B22 owner"). A C21 shell stays inactive
 until its complete separately qualified chain succeeds.
 `Rtw88Device::firmware_status()` returns its
 `FirmwareStatus { stage, info, error }`; `FirmwareStage` is `Detected`,
@@ -324,10 +325,38 @@ until its complete separately qualified chain succeeds.
 `StationPreparation`, `StationReady`, or `Failed`. `Ready` identifies firmware
 completion and parked host DMA, independently of station/radio readiness.
 `StationReady` identifies completed packet preparation, not an associated peer
-or authorized controlled port. RTL8822BE has no native firmware owner. The safe
+or authorized controlled port. RTL8822BE firmware runs in its own B22 owner. The safe
 `fw::download_firmware(registers, pci_device_id)` helper returns
 `FwError::Unsupported` before registry or MMIO access for every device:
 raw MMIO alone cannot prove exclusive DMA/ring/reset ownership.
+
+### RTL8822BE retained native B22 owner
+
+`10ec:b822` is the third native chip ("B22"), structured like C21/C22 and
+sharing none of their assets. Probe runs the 8822B card-disable→enable power
+tables, then one 1024-byte physical EFUSE read (96 protected bytes excluded)
+decoded into the distinct 768-byte `efuse8822b::Factory8822b`
+(`rtw8822b.c::rtw8822b_read_efuse` over `struct rtw8822b_efuse` /
+`rtw8822be_efuse`): PCIe MAC `0xd0`, whole-byte `rfe_option` `0xca`,
+`regd = rf_board_option(0xc1) & 7`, crystal `0xb9`, thermal `0xba`, PA `0xbc`,
+LNA `0xbd`/`0xbf`, channel plan `0xb8`, country `0xcb`, USB mode bit7 of
+`0x06`, and four raw 42-byte `txpwr_idx_table` records from `0x10`. Erased
+fields stay raw; country/power fields grant nothing.
+`Rtw88Device::rtl8822b_factory()` exposes it.
+
+`native8822b::Owner8822b` retains the exact cold function/cap/BAR, that
+factory map and a `Lifecycle` keyed by `0xb822`. Its scheduled continuation
+retries only while `Detected` (firmware registry not yet populated), then
+loads `rtw8822b_hw_spec.fw_name` = `rtw88/rtw8822b_fw.bin` through the
+authenticated registry and the shared beacon-DMA/IDDMA owner
+(`mac.c::__rtw_download_firmware`, WCPU 3081, LTE-coex 0x38 backup). RTL8822B
+and RTL8822C share the `0x8822` header signature; the PCI identity selects
+the layout. The installed B22 image places IMEM at OCP `0x0` (header
+`imem_addr` `0x80000000`, bit31 masked as in `start_download_firmware`), so
+B22 admits exactly DMEM `0x200000`/IMEM `0x0`/optional EMEM `0x100000`; the
+C22 IMEM `0x30000` profile rejects it and vice versa. The chain currently
+ends at `FirmwareStage::Ready`; MAC/PHY/calibration/station continuations are
+not yet ported, so no station shell is published.
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 
@@ -565,8 +594,8 @@ parses the actual 64-byte `0x8822` header, exact DMEM/IMEM/optional EMEM
 extents and each eight-byte checksum trailer. Only fixed Linux OCP bases
 DMEM `0x200000`, IMEM `0x30000`, and EMEM `0x100000` are admitted;
 relocated or trailing data fails. RTL8821C uses its separate exact image and
-inactive continuation above; RTL8822B and WoW filename selection remain
-unsupported. IDDMA consumes serial reserved pages of at
+inactive continuation above; RTL8822B uses its own B22 image/IMEM base
+(see "RTL8822BE retained native B22 owner"); WoW filename selection is C22-only. IDDMA consumes serial reserved pages of at
 most 4096 bytes, including section checksum tails, then validates section
 checksums and the exact final `0xc078` firmware-ready status.
 
@@ -3399,8 +3428,8 @@ station-security and packet-key owners supply bounded MLME, RSNA and CCMP;
 
 ## 8. Open questions and references
 
-RTL8821CE and RTL8822CE firmware have retained native owners; RTL8822BE
-firmware remains unsupported. BAR2 contains registers, so firmware travels through beacon
+RTL8821CE, RTL8822CE and RTL8822BE (B22) firmware have retained native owners;
+RTL8822BE stops at firmware Ready. BAR2 contains registers, so firmware travels through beacon
 host DMA and IDDMA rather than whole-blob BAR writes. The initial hardware
 target is exclusively RTL8822CE, awake channel1/20 MHz, host CCK1 data and
 qualified native legacy responses, Open or WPA2-PSK, software CCMP and bounded
@@ -3416,7 +3445,7 @@ Remaining software ledger:
 |---|---|
 | PCI BAR2, power/cut sequencing, factory identity | Implemented; register-model and QEMU regressions |
 | Beacon reserved-page DMA owner, descriptors, successful park | Implemented for RTL8821CE/RTL8822CE; terminal failures retain mappings |
-| Authenticated section loading, IDDMA validation | Implemented with separate exact RTL8821CE/RTL8822CE images; RTL8822BE and raw-MMIO helper reject |
+| Authenticated section loading, IDDMA validation | Implemented with separate exact RTL8821CE/RTL8822CE/RTL8822BE images; raw-MMIO helper rejects |
 | Inactive PCIe MAC/FIFO/LLT/internal H2C queue setup | Implemented in the same retained firmware owners with chip-specific FIFO/EDCA/SIFS and C22-only PCI quirk; packet DMA stays closed |
 | H2C packet ring and port0 command mailbox | Same retained native owner; bounded exact transport receipts and separate IQK completion |
 | Retained complete RTL8822CE factory map | Implemented from same probe EFUSE read; original Linux packed geometry checked |
@@ -3568,7 +3597,7 @@ changes. None is a physical blocker unless stated.
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
 | `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
-| `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
+| `rtl8822be` | In progress: B22 identity, factory map and authenticated `rtw8822b_fw.bin` loading into a retained native owner are implemented (see "RTL8822BE retained native B22 owner"); RTL8822B MAC/PHY/RF tables, calibration, signed records and station runtime are not yet ported. |
 | `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Source-complete for C22 under N22K `MIMO_PS` (see "Coexistence-driven static SMPS"): `rtw_coex_mimo_ps` -> `config_trx_mode(A, A)` with exact field restore, dm path diversity held on A, 1SS RA mask / STBC off, SM Power Save static/disabled action. Three register-model cases written, unexecuted; no signed N22K MIMO_PS record or BT-active measurement. |

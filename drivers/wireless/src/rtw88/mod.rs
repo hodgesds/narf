@@ -63,6 +63,7 @@ mod dpk;
 #[cfg(feature = "kernel-test")]
 mod dpk_tests;
 pub mod efuse;
+pub mod efuse8822b;
 mod endpoints;
 mod fallback;
 #[cfg(feature = "kernel-test")]
@@ -129,6 +130,7 @@ pub use protection::Request as RtsRequest;
 mod publication;
 mod qualification;
 pub use qualification::Request as ContinuationRequest;
+mod native8822b;
 mod radio;
 mod radio8821c;
 mod reserved_page;

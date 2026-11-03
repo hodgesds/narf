@@ -88,6 +88,8 @@ fn filename(did: u16) -> Result<&'static str, Error> {
     match did {
         0xc821 => Ok("rtw88/rtw8821c_fw.bin"),
         0xc822 => Ok("rtw88/rtw8822c_fw.bin"),
+        // rtw8822b.c::rtw8822b_hw_spec.fw_name.
+        0xb822 => Ok("rtw88/rtw8822b_fw.bin"),
         _ => Err(Error::Unsupported),
     }
 }
@@ -171,9 +173,17 @@ fn word(bytes: &[u8], offset: usize) -> u32 {
 fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
     let signature = match did {
         0xc821 => [0x21, 0x88],
-        0xc822 => [0x22, 0x88],
+        // RTL8822B and RTL8822C images share the 0x8822 header signature;
+        // the PCI identity (and the registered filename) selects the chip.
+        0xc822 | 0xb822 => [0x22, 0x88],
         _ => return Err(Error::Unsupported),
     };
+    // Installed rtw8822b_fw.bin places IMEM at OCP 0x0 (header imem_addr
+    // 0x80000000 masked by mac.c::start_download_firmware), below the
+    // OCPBASE_IMEM_88XX 0x30000 used by the C21/C22 images; both stay below
+    // OCPBASE_EMEM_88XX and download_firmware_to_mem selects the IMEM
+    // checksum bits for any address under OCPBASE_DMEM_88XX.
+    let imem_base = if did == 0xb822 { 0 } else { 0x30000 };
     if !(HEADER..=MAX_IMAGE).contains(&bytes.len()) || bytes[..2] != signature {
         return Err(Error::Image);
     }
@@ -182,7 +192,7 @@ fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
     let mut offset = HEADER;
     for (index, (kind, base, limit, address, size, enabled)) in [
         (Kind::Dmem, 0x200000u32, 0x300000u32, 0x20, 0x24, true),
-        (Kind::Imem, 0x30000, 0x100000, 0x3c, 0x30, true),
+        (Kind::Imem, imem_base, 0x100000, 0x3c, 0x30, true),
         (Kind::Emem, 0x100000, 0x200000, 0x38, 0x34, has_emem),
     ]
     .into_iter()
@@ -1967,3 +1977,7 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "phy/rtl8821c_tests.rs"]
 mod phy8821c_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "b22_tests.rs"]
+mod b22_tests;

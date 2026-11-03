@@ -44,6 +44,8 @@ pub struct Rtw88Device {
     /// The exact post-power native owner, shared by controller and interface.
     pub(super) firmware: Option<Arc<super::firmware_native::Firmware>>,
     pub(super) sibling: Option<Arc<super::sibling::Sibling>>,
+    /// Retained RTL8822BE native owner (firmware continuation; no station shell yet).
+    pub(super) b22: Option<Arc<super::native8822b::Owner8822b>>,
     pub(super) interface: Option<Arc<super::interface::Native>>,
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -181,6 +183,12 @@ impl Rtw88Device {
             .as_ref()
             .map(|owner| owner.status())
             .or_else(|| self.sibling.as_ref().map(|owner| owner.status()))
+            .or_else(|| self.b22.as_ref().map(|owner| owner.status()))
+    }
+    /// The same immutable factory map captured by the RTL8822BE probe.
+    /// Factory country/power fields grant no regulatory or transmit authority.
+    pub fn rtl8822b_factory(&self) -> Option<&super::efuse8822b::Factory8822b> {
+        self.b22.as_ref().map(|owner| owner.factory())
     }
     /// The same immutable factory map captured by the RTL8821CE probe.
     /// Factory country/power fields grant no regulatory or transmit authority.
@@ -420,7 +428,8 @@ pub(super) async fn remove_owner(owner: &Rtw88Device) -> bool {
         .firmware
         .as_ref()
         .map(|firmware| firmware.lifecycle())
-        .or_else(|| owner.sibling.as_ref().map(|sibling| sibling.lifecycle()));
+        .or_else(|| owner.sibling.as_ref().map(|sibling| sibling.lifecycle()))
+        .or_else(|| owner.b22.as_ref().map(|b22| b22.lifecycle()));
     match lifecycle {
         Some(lifecycle) => lifecycle.remove().await,
         None => true,
@@ -475,6 +484,31 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 }
 
 pub(super) fn schedule_owner(owner: Arc<Rtw88Device>) {
+    if owner.b22.is_some() {
+        // The diagnostic RTL8822BE shell has no station interface yet; only
+        // its retained firmware continuation runs. Retry while the trusted
+        // firmware registry has not yet supplied the authenticated image.
+        narf_scheduler::spawn(async move {
+            let result = drive_scheduled(
+                120,
+                || {
+                    owner.b22.as_ref().is_some_and(|b22| {
+                        b22.status().stage == super::firmware_lifecycle::Stage::Detected
+                    })
+                },
+                || {
+                    let owner = owner.clone();
+                    async move { provision_owner(&owner).await }
+                },
+                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+            )
+            .await;
+            if let Err(error) = result {
+                narf_console::klog!("rtw88 8822be provisioning: {:?}\n", error);
+            }
+        });
+        return;
+    }
     if (owner.firmware.is_none() && owner.sibling.is_none()) || owner.interface.is_none() {
         return;
     }
@@ -511,7 +545,7 @@ pub(super) fn map_registers_with(
 }
 
 pub(super) const fn register_window_min(did: u16) -> u64 {
-    if matches!(did, RTL_DEV_8821CE | RTL_DEV_8822CE) {
+    if matches!(did, RTL_DEV_8821CE | RTL_DEV_8822CE | RTL_DEV_8822BE) {
         // Firmware LTE coexistence indirect data at 0x1708 is a dword.
         0x170c
     } else {
@@ -575,7 +609,7 @@ unsafe fn bring_up_mode(
     mut reset: Option<Recovery<'_>>,
     name: Option<&'static str>,
 ) -> Result<Rtw88Device, ProbeError> {
-    let (registers, mac, factory, sibling_factory) =
+    let (registers, mac, factory, sibling_factory, b22_factory) =
         super::pci_park::invoke(cap, || -> Result<_, ProbeError> {
             let registers = map_registers_with(device, |device, index| {
                 super::pci_park::map_bar_control(device, cap, index)
@@ -632,9 +666,27 @@ unsafe fn bring_up_mode(
             } else {
                 None
             };
+            let b22_factory = if device.id.device == RTL_DEV_8822BE {
+                // SAFETY: same current exclusive powered BAR2 invocation. This one
+                // 1024-byte physical read captures the distinct B22 factory map.
+                Some(
+                    if let Some(io) = checked.as_mut() {
+                        super::efuse8822b::read_factory8822b_with(io, device.id.device)
+                    } else {
+                        // SAFETY: original cold-probe exclusive powered BAR invocation.
+                        unsafe {
+                            super::efuse8822b::read_factory8822b(&registers, device.id.device)
+                        }
+                    }
+                    .map_err(ProbeError::Efuse)?,
+                )
+            } else {
+                None
+            };
             let mac = match &factory {
                 Some(factory) => factory.mac(),
                 None if sibling_factory.is_some() => sibling_factory.as_ref().unwrap().mac(),
+                None if b22_factory.is_some() => b22_factory.as_ref().unwrap().mac(),
                 // SAFETY: same powered/exclusive BAR2 invocation, sibling geometry.
                 None => unsafe { efuse::read_mac(&registers, device.id.device) }
                     .map_err(ProbeError::Efuse)?,
@@ -647,7 +699,7 @@ unsafe fn bring_up_mode(
                 return Err(ProbeError::PowerOn(power::PowerError::Access));
             }
 
-            Ok((registers, mac, factory, sibling_factory))
+            Ok((registers, mac, factory, sibling_factory, b22_factory))
         })
         .map_err(|_| ProbeError::PciAccess)??;
 
@@ -672,6 +724,11 @@ unsafe fn bring_up_mode(
         Arc::new(unsafe { super::sibling::Sibling::new(*device, *cap, registers, factory) })
     });
 
+    let b22 = b22_factory.map(|factory| {
+        // SAFETY: exact current B22 post-cold-power/factory ownership above;
+        // BME/IRQs are parked and no native owner has been constructed yet.
+        Arc::new(unsafe { super::native8822b::Owner8822b::new(*device, *cap, registers, factory) })
+    });
     let station_lifecycle = firmware
         .as_ref()
         .map(|firmware| firmware.lifecycle())
@@ -700,6 +757,7 @@ unsafe fn bring_up_mode(
         device_id: device.id.device,
         firmware,
         sibling,
+        b22,
         interface,
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(rx_ring),
@@ -888,6 +946,10 @@ fn retryable(owner: &Rtw88Device) -> bool {
         .is_some_and(|iface| !iface.closed())
 }
 pub(super) async fn provision_owner(controller: &Rtw88Device) -> Result<(), super::FirmwareError> {
+    if let Some(owner) = &controller.b22 {
+        let _admission = controller.provisioning.lock().await;
+        return owner.provision().await;
+    }
     if let Some(owner) = &controller.sibling {
         let _admission = controller.provisioning.lock().await;
         let interface = controller
@@ -976,6 +1038,7 @@ mod provision_tests {
             device_id: RTL_DEV_8822CE,
             firmware: Some(firmware),
             sibling: None,
+            b22: None,
             interface: Some(interface),
             link_up: AtomicBool::new(false),
             rx_ring: IrqSafeSpinLock::new(None),

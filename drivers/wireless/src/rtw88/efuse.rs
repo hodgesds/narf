@@ -498,3 +498,23 @@ pub unsafe fn read_mac(mmio: &MmioRegion, did: u16) -> Result<[u8; MAC_ADDR_LEN]
 pub fn mac_is_valid(mac: [u8; MAC_ADDR_LEN]) -> bool {
     mac != [0; MAC_ADDR_LEN] && mac[0] & 1 == 0
 }
+
+/// RTL8822BE one-read logical map for the distinct B22 factory type
+/// (`efuse8822b`): the same sparse physical decode as every chip above.
+pub(super) fn read_logical8822b_with(
+    io: &mut impl EfuseIo,
+    did: u16,
+) -> Result<[u8; 768], EfuseError> {
+    if did != RTL_DEV_8822BE {
+        return Err(EfuseError::UnsupportedChip);
+    }
+    read_map_with(io, geometry(did)?)
+}
+/// # Safety
+/// Same powered, exclusive BAR2 ownership contract as `read_mac`.
+pub(super) unsafe fn read_logical8822b(
+    mmio: &MmioRegion,
+    did: u16,
+) -> Result<[u8; 768], EfuseError> {
+    read_logical8822b_with(&mut MmioEfuse(mmio), did)
+}

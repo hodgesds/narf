@@ -17,6 +17,7 @@ fn owner(function: u8) -> Arc<Rtw88Device> {
         device_id: 0xc822,
         firmware: None,
         sibling: None,
+        b22: None,
         interface: None,
         link_up: core::sync::atomic::AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(None),

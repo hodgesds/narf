@@ -19,7 +19,7 @@ All Linux paths below are relative to
 | Stored data | Source contract | Native Rust coverage retained |
 |---|---|---|
 | `factory/*golden.rs`, `factory/power_values.rs` | `rtw8821c.h`, `rtw8822c.h`, `main.h`, `efuse.h`; power groups and regulatory-limit records in `phy.c`/`rtw8822c_table.c` | Sparse EFUSE decoding, exact packed offsets, raw factory bytes, gain/power bounds and erased-data rejection |
-| `firmware/golden.rs`, `firmware/rtl8821c_metadata.rs` | `mac.c` firmware callbacks; the named installed NIC firmware header and its recorded digest | Header/section bounds, same-owner page/IDDMA flow, checksum/ready receipts, faults and cancellation |
+| `firmware/golden.rs`, `firmware/rtl8821c_metadata.rs`, `firmware/rtl8822b_metadata.rs` | `mac.c` firmware callbacks; the named installed NIC firmware header and its recorded digest | Header/section bounds, same-owner page/IDDMA flow, checksum/ready receipts, faults and cancellation |
 | `mac/*golden.rs`, `mac/*values.rs` | `mac.c`, `rtw8821c.c`, `rtw8822c.c`, `reg.h` | Chip-specific FIFO/LLT/H2C setup, inactive register traces, access failures, stale receipts and replay refusal |
 | `phy/*golden.rs`, `phy/*tables.rs` | `phy.c`, `rtw8821c_table.c`, `rtw8822c_table.c`, chip PHY callbacks | 56 C21 cut/package/RFE and 49 C22 cut/RFE profiles, table/callback digests, retained MAC/PHY ownership and closed gates |
 | `radio/golden.rs` | `rtw8822c.c` fresh DACK, channel/trim and IQK command paths | Bounded measurements, distinct-path restoration, signed/current power admission, native transport faults and cancellation |

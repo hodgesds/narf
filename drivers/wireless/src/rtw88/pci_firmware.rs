@@ -172,7 +172,7 @@ impl Native {
         mmio: MmioRegion,
     ) -> Result<Self, Error> {
         if device.id.vendor != 0x10ec
-            || !matches!(device.id.device, 0xc821 | 0xc822)
+            || !matches!(device.id.device, 0xc821 | 0xc822 | 0xb822)
             || mmio.len < 0x170c
             || narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
         {
