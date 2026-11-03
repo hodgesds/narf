@@ -8,7 +8,7 @@ use super::{checked, regs::*, Error, Hw, Io, Queue, FENCE, RING_DW, RPTR, VM_FEN
 // GC 10.3 offsets: CP/GRBM use the common gc_10_1_0 definitions included by
 // gfx_v10_0.c. GCVM must use gc_10_3_0: its fault registers moved from GC10.1.
 // linux-ctx: hdr=gc seg=0
-const REGISTERS: [(&str, Reg); 31] = [
+const REGISTERS: [(&str, Reg); 59] = [
     ("GRBM_STATUS", Reg(0, 0x0da4)),  // linux: mmGRBM_STATUS
     ("GRBM_STATUS2", Reg(0, 0x0da2)), // linux: mmGRBM_STATUS2
     ("GRBM_STATUS3", Reg(0, 0x0da7)), // linux: mmGRBM_STATUS3
@@ -41,6 +41,38 @@ const REGISTERS: [(&str, Reg); 31] = [
     ("CP_IB2_BASE_HI", Reg(1, 0x20d0)), // linux: mmCP_IB2_BASE_HI
     ("CP_IB2_BUFSZ", Reg(1, 0x20d1)),   // linux: mmCP_IB2_BUFSZ
     ("CP_IB2_OFFSET", Reg(1, 0x2093)),  // linux: mmCP_IB2_OFFSET
+    // CE/DE state (gc_reg_list_10_1 entries plus the CE/DE handshake
+    // counters and ROQ status), appended so the indices above stay fixed.
+    // linux-ctx: seg=0
+    ("GRBM_GFX_CNTL", Reg(0, 0x0dc2)),     // linux: mmGRBM_GFX_CNTL
+    ("CP_ME_CNTL", Reg(0, 0x0f56)),        // linux: mmCP_ME_CNTL
+    ("CP_CE_HEADER_DUMP", Reg(0, 0x0f44)), // linux: mmCP_CE_HEADER_DUMP
+    ("CP_CE_INSTR_PNTR", Reg(0, 0x0f47)),  // linux: mmCP_CE_INSTR_PNTR
+    ("CP_ROQ_RB_STAT", Reg(0, 0x0f80)),    // linux: mmCP_ROQ_RB_STAT
+    ("CP_CE_ROQ_RB_STAT", Reg(0, 0x0f88)), // linux: mmCP_CE_ROQ_RB_STAT
+    ("CP_CE_COMPARE_COUNT", Reg(0, 0x0e60)), // linux: mmCP_CE_COMPARE_COUNT
+    ("CP_CE_DE_COUNT", Reg(0, 0x0e61)),    // linux: mmCP_CE_DE_COUNT
+    ("CP_DE_CE_COUNT", Reg(0, 0x0e62)),    // linux: mmCP_DE_CE_COUNT
+    ("CP_DE_LAST_INVAL_COUNT", Reg(0, 0x0e63)), // linux: mmCP_DE_LAST_INVAL_COUNT
+    ("CP_DE_DE_COUNT", Reg(0, 0x0e64)),    // linux: mmCP_DE_DE_COUNT
+    ("CP_CPF_STATUS", Reg(0, 0x0e27)),     // linux: mmCP_CPF_STATUS
+    ("CP_CPF_BUSY_STAT", Reg(0, 0x0e28)),  // linux: mmCP_CPF_BUSY_STAT
+    ("CP_CPF_STALLED_STAT1", Reg(0, 0x0e29)), // linux: mmCP_CPF_STALLED_STAT1
+    ("CP_GFX_HPD_STATUS0", Reg(0, 0x1e72)), // linux: mmCP_GFX_HPD_STATUS0
+    ("CP_DEBUG", Reg(0, 0x1e1f)),          // linux: mmCP_DEBUG
+    ("CP_RB1_RPTR", Reg(0, 0x0f5f)),       // linux: mmCP_RB1_RPTR
+    ("CP_ROQ_IB1_STAT", Reg(0, 0x0f81)),   // linux: mmCP_ROQ_IB1_STAT
+    ("CP_CE_ROQ_IB1_STAT", Reg(0, 0x0f89)), // linux: mmCP_CE_ROQ_IB1_STAT
+    ("CP_MEQ_STAT", Reg(0, 0x0f85)),       // linux: mmCP_MEQ_STAT
+    // linux-ctx: seg=1
+    ("CP_IB1_CMD_BUFSZ", Reg(1, 0x20c0)), // linux: mmCP_IB1_CMD_BUFSZ
+    ("CP_CE_IB1_CMD_BUFSZ", Reg(1, 0x20be)), // linux: mmCP_CE_IB1_CMD_BUFSZ
+    ("CP_CE_IB1_BASE_LO", Reg(1, 0x20c6)), // linux: mmCP_CE_IB1_BASE_LO
+    ("CP_CE_IB1_BASE_HI", Reg(1, 0x20c7)), // linux: mmCP_CE_IB1_BASE_HI
+    ("CP_CE_IB1_BUFSZ", Reg(1, 0x20c8)),  // linux: mmCP_CE_IB1_BUFSZ
+    ("RLC_STAT", Reg(1, 0x4c04)),         // linux: mmRLC_STAT
+    ("CP_CE_COUNTER", Reg(1, 0x209a)),    // linux: mmCP_CE_COUNTER
+    ("CP_RB_OFFSET", Reg(1, 0x2091)),     // linux: mmCP_RB_OFFSET
 ];
 // linux-ctx: reset
 const WINDOW: usize = 48;
@@ -136,6 +168,7 @@ mod tests {
         hw.io.regs.insert(r(CP_STAT), 0x8000_0000);
         hw.io.regs.insert(r(CP_RB0_RPTR), 3);
         hw.io.regs.insert(r(Reg(0, 0x15c8)), 0xdead_beef);
+        hw.io.regs.insert(r(Reg(0, 0x0f47)), 0x0000_0123); // CP_CE_INSTR_PNTR
         let memory = hw.io.mem.clone();
         let registers = hw.io.regs.clone();
         hw.io.writes.clear();
@@ -149,6 +182,11 @@ mod tests {
             (0x71, 0x900)
         );
         assert_eq!(snapshot.registers[19], 0xdead_beef);
+        // Appended CE/DE state: the live pipe selection and CE pointer.
+        assert_eq!(REGISTERS[31].0, "GRBM_GFX_CNTL");
+        assert_eq!(snapshot.registers[31], 0x5020);
+        assert_eq!(REGISTERS[34].0, "CP_CE_INSTR_PNTR");
+        assert_eq!(snapshot.registers[34], 0x123);
         assert_eq!(snapshot.window_start, RING_DW - 13);
         for (i, word) in snapshot.words.iter().enumerate() {
             assert_eq!(
