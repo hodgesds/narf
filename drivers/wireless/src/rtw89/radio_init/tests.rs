@@ -486,3 +486,67 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c
 );
+fn smoke_rtw89_c_bb_sethw_gpio_and_nctl_follow_rtw8852c() -> TestResult {
+    let mut io = Model::new(0xa5, 1, 1);
+    io.words[0x14df0 / 4] = 0x1234_56f6;
+    io.words[0x16df0 / 4] = 0x0000_0007;
+    if controls_c(&mut io) != Ok([-10, 7]) {
+        return TestResult::Fail("C bb_sethw did not return R_RPL_BIAS_COMP{,1} [7:0]");
+    }
+    // 0xa5a5a5a5 seed: TRSW_A set, TRSW_X/SO_A2 clear, [31:16] = 0xa9a9,
+    // untouched [15:8]/bit 4/bit 3/bit 0 kept.
+    for base in [0x15800, 0x17800] {
+        if io.words[(base | 0x68) / 4] != 0xa9a9_a503
+            || io.words[(base | 0x80) / 4] != 0x7777_7777
+            || io.words[(base | 0x84) / 4] != 0x7777_7777
+            || io.words[(base | 0x94) / 4] != 0xa508_0400
+        {
+            return TestResult::Fail("C bb_gpio_init TRSW/RFM state differs from Linux");
+        }
+    }
+    if io.words[0x10a10 / 4] != 0xa5a5_a5a5
+        || io.words[0x12a10 / 4] != 0xa5a5_a5a5
+        || io.words[0x10334 / 4] != u32::MAX
+        || io.words[0x10338 / 4] != 0
+        || io.words[0xd36c / 4] != 0
+        || io.words[0xd568 / 4] != 0
+        || io.words[0xd56c / 4] != 0xa5a5_a5a5
+    {
+        return TestResult::Fail("C EVM report/RFE/MACID limit state differs from Linux");
+    }
+    // B-only bb_sethw registers are never touched.
+    if io
+        .operations
+        .iter()
+        .any(|(kind, a)| *kind == 4 && matches!(*a, 0x10d7c | 0x12d7c))
+    {
+        return TestResult::Fail("C bb_sethw wrote B-only registers");
+    }
+    for address in [0x10a10, 0x15868, 0x17894, 0x10340, 0xd400] {
+        let mut io = Model::new(0x5a, 1, 1);
+        io.ignore = Some(address);
+        if controls_c(&mut io).is_ok() {
+            return TestResult::Fail("ignored C bb_sethw write returned readiness");
+        }
+    }
+    // C NCTL pre-init skips the RTL8852B second IOQ write.
+    let mut io = Model::new(0, 1, 1);
+    io.words[0x18080 / 4] = 4;
+    if ready(nctl_c(&mut io, &[Pair(0x8040, 0x12345)])) != Some(Ok(()))
+        || io.words[0x10c60 / 4] != 3
+        || io.words[0x18040 / 4] != 0x12345
+        || io
+            .operations
+            .iter()
+            .filter(|(kind, a)| *kind == 4 && *a == 0x10c60)
+            .count()
+            != 1
+    {
+        return TestResult::Fail("C NCTL pre-init/table differs from rtw89_phy_preinit_rf_nctl_ax");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_c_bb_sethw_gpio_and_nctl_follow_rtw8852c
+);

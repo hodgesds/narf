@@ -444,17 +444,119 @@ pub(super) fn controls(io: &mut impl Io) -> Result<[i8; 2], Error> {
         read(io, 0x14a00)? as u8 as i8,
     ])
 }
+/// rtw8852c.c `rtw8852c_bb_sethw`: DBCC 80+80 EVM report enables,
+/// `rtw8852c_bb_macid_ctrl_init(PHY_0)` (MACID power-limit table zeroed),
+/// `rtw8852c_bb_gpio_init` and the post-table `R_RPL_BIAS_COMP{,1}`
+/// (0x4df0/0x6df0 [7:0]) `efuse_gain.offset_base` reads, each read back.
+pub(super) fn controls_c(io: &mut impl Io) -> Result<[i8; 2], Error> {
+    for address in [0x10a10, 0x12a10] {
+        modify(io, address, 1, 1)?;
+    }
+    for address in (0xd36c..=0xd568).step_by(4) {
+        io.write32(address, 0)?;
+    }
+    gpio_c(io)?;
+    for address in [0x10a10, 0x12a10] {
+        if read(io, address)? & 1 != 1 {
+            return Err(power::Error::Access.into());
+        }
+    }
+    for address in (0xd36c..=0xd568).step_by(4) {
+        if read(io, address)? != 0 {
+            return Err(power::Error::Access.into());
+        }
+    }
+    for (address, mask, value) in GPIO_C_STATE {
+        if read(io, address)? & mask != value {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok([
+        read(io, 0x14df0)? as u8 as i8,
+        read(io, 0x16df0)? as u8 as i8,
+    ])
+}
+/// The register state `rtw8852c_bb_gpio_init` leaves behind (per path base
+/// 0x5800/0x7800): TRSW_A set, TRSW_X/TRSW_SO_A2 clear, the eight
+/// `rtw8852c_bb_gpio_trsw` 2-bit fields at [31:16] = 0xa9a9, 0x80/0x84 =
+/// 0x77777777 and the PAPE/TRSW/LNAON `rtw8852c_bb_gpio_rfm` bytes 0/4/8.
+const GPIO_C_STATE: [(u32, u32, u32); 12] = [
+    (0x15868, 0xffff_00e6, 0xa9a9_0002),
+    (0x15880, u32::MAX, 0x7777_7777),
+    (0x15884, u32::MAX, 0x7777_7777),
+    (0x15894, 0x00ff_ffff, 0x0008_0400),
+    (0x17868, 0xffff_00e6, 0xa9a9_0002),
+    (0x17880, u32::MAX, 0x7777_7777),
+    (0x17884, u32::MAX, 0x7777_7777),
+    (0x17894, 0x00ff_ffff, 0x0008_0400),
+    (0x10334, u32::MAX, u32::MAX),
+    (0x10338, u32::MAX, 0),
+    (0x1033c, u32::MAX, 0),
+    (0x10340, u32::MAX, 0),
+];
+/// rtw8852c.c `rtw8852c_bb_gpio_init` in Linux write order.
+fn gpio_c(io: &mut impl Io) -> Result<(), Error> {
+    for base in [0x15800, 0x17800] {
+        let address = base | 0x68;
+        let value = read(io, address)?;
+        io.write32(address, value | 2)?;
+        let value = read(io, address)?;
+        io.write32(address, value & !4)?;
+        let value = read(io, address)?;
+        io.write32(address, value & !0xe0)?;
+        io.write32(base | 0x80, 0x7777_7777)?;
+        io.write32(base | 0x84, 0x7777_7777)?;
+    }
+    io.write32(0x10334, u32::MAX)?;
+    io.write32(0x10338, 0)?;
+    io.write32(0x1033c, 0)?;
+    io.write32(0x10340, 0)?;
+    // `rtw8852c_bb_gpio_trsw(path, tx_path_en, trsw_tx, trsw_rx, trsw, trsw_b)`.
+    const TRSW: [(u32, u32, u32, u32, u32); 8] = [
+        (0, 0, 0, 0, 1),
+        (0, 0, 1, 1, 0),
+        (0, 1, 0, 1, 0),
+        (0, 1, 1, 1, 0),
+        (1, 0, 0, 0, 1),
+        (1, 0, 1, 1, 0),
+        (1, 1, 0, 1, 0),
+        (1, 1, 1, 1, 0),
+    ];
+    for base in [0x15868, 0x17868] {
+        for (tx, trsw_tx, trsw_rx, trsw, trsw_b) in TRSW {
+            let shift = 16 + (tx * 4 + trsw_tx * 2 + trsw_rx) * 2;
+            modify(io, base, 3 << shift, (trsw << 1) | trsw_b)?;
+        }
+    }
+    // `rtw8852c_bb_gpio_rfm(path, PAPE/TRSW/LNAON_RFM, 0, 0, 0, out)`.
+    for base in [0x15894, 0x17894] {
+        for (shift, out) in [(0, 0), (8, 4), (16, 8)] {
+            modify(io, base, 0xff << shift, out)?;
+        }
+    }
+    Ok(())
+}
 /// Exact AX NCTL pre-init and selected real table. Full DM/coexistence and
 /// RFK orchestration must establish its correct startup position before use.
 pub(super) async fn nctl(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    nctl_for(io, program, false).await
+}
+/// RTL8852C NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` without the
+/// RTL8852B/BT-only second `R_IOQ_IQK_DPK |= 0x2`, then the selected
+/// firmware NCTL table (`rtw8852c_chip_info.nctl_post_table` is NULL).
+pub(super) async fn nctl_c(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    nctl_for(io, program, true).await
+}
+async fn nctl_for(io: &mut impl Io, program: &[Pair], c: bool) -> Result<(), Error> {
     validate_bb(program)?;
-    for (address, mask) in [
+    const PREINIT: [(u32, u32); 5] = [
         (0x10c60, 3),
         (0x10c6c, 1),
         (0x158ac, 0x08000000),
         (0x178ac, 0x08000000),
         (0x10c60, 2),
-    ] {
+    ];
+    for &(address, mask) in &PREINIT[..if c { 4 } else { 5 }] {
         let value = read(io, address)?;
         io.write32(address, value | mask)?;
     }

@@ -486,6 +486,10 @@ impl ChannelRxDck {
     }
 }
 
+/// RTL8852C `rtw8852c_rfk_init` (RCK/DACK/RX DCK).
+#[path = "rfk/c.rs"]
+pub(super) mod c;
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "rfk/tests.rs"]
 mod tests;

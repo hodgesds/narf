@@ -2864,9 +2864,36 @@ TX_SUB_CARRIER/TXRATE_CHK values. It is a geometry fact: no
 caller programs or admits a C channel from it yet. Unexecuted case:
 `smoke_rtw89_c_operating_channel_matches_linux_geometry_and_tssi_groups`.
 
-Remaining for the `rtl8852c` row (no row credit): C NCTL/`bb_sethw`/
-`rtw8852c_bb_gpio_init`/`rtw8852c_rfk_init` (DACK/RX DCK/IQK/DPK/TSSI from
-rtw8852c_rfk.c), C channel MAC/BB/RF (`rtw8852c_set_channel_{mac,bb}`,
+**DM hardware setup, NCTL and `rfk_init`.** `radio_init::controls_c` is
+rtw8852c.c `rtw8852c_bb_sethw`: DBCC 80+80 EVM report enables (0x0a10/0x2a10
+bit 0), `rtw8852c_bb_macid_ctrl_init(PHY_0)` (0xd36c..0xd568 zero),
+`rtw8852c_bb_gpio_init` (per path 0x5800/0x7800: TRSW_A set, TRSW_X/
+TRSW_SO_A2 clear, 0x80/0x84 = 0x77777777, RFE_E/O_SEL/SEL0/SEL32_A2, the
+sixteen `rtw8852c_bb_gpio_trsw` fields and six `rtw8852c_bb_gpio_rfm` bytes
+in Linux order), all read back, then the `R_RPL_BIAS_COMP{,1}`
+(0x4df0/0x6df0 [7:0]) `offset_base` reads. `radio_init::nctl_c` is phy.c
+`rtw89_phy_preinit_rf_nctl_ax` without the RTL8852B/BT-only second
+`R_IOQ_IQK_DPK |= 0x2`, the 0x8080 poll, then the firmware NCTL table
+(`nctl_post_table` is NULL for C). `rfk::c::Init::prepare` is
+`rtw8852c_rfk_init` for non-DBCC PHY_0 (`_kpath` = RF_AB): `is_tssi_mode`
+cleared, `rtw8852c_dpk_init` (DPK enabled, reload off), `_rck` A then B
+(20us poll), `_dac_cal` (`_drck` + `rtw8852c_drck_defs`, ADDCK S0/S1 with
+backup/reload into `R_ADDCK{0,1}_RL`, `_dack_s0`/`_dack_s1` with
+`rtw8852c_txck_force(DAC_160M)`, `rtw8852c_dack_defs_s{0,1}`, reset defs,
+all-four-OK `_check_dack_done`, MSBK/bias/DADCK backup and
+`_dack_reload_by_path` words 0xc200..0xc210 + offset) bracketed by
+`BTC_WRFKT_DACK` START/STOP (the inner ONESHOT notifications do no I/O for
+DACK), then the un-notified `_rx_dck(PHY_0, false, retry_limit 1)`, which
+always takes `_rx_dck_recover` (incl. the asymmetric `<`/`<=` threshold and
+`_rx_dck_value_rewrite`). LCK/RX-DCK thermal baselines are the fresh EWMA
+before any track sample and carry no register I/O. Where Linux only logs a
+poll timeout (RCK, DRCK, ADDCK, DACK, RX DCK toggle) NARF fails the attempt
+closed. No native caller runs these yet. Unexecuted cases:
+`smoke_rtw89_c_bb_sethw_gpio_and_nctl_follow_rtw8852c`,
+`smoke_rtw89_c_rfk_init_rck_dack_rxdck_follow_rtw8852c`.
+
+Remaining for the `rtl8852c` row (no row credit): C channel RFK
+(`rtw8852c_rfk_channel`: IQK/DPK/TSSI from rtw8852c_rfk.c), C channel MAC/BB/RF (`rtw8852c_set_channel_{mac,bb}`,
 `rtw8852c_ctrl_ch`/`_bw`, `_ch_setting` for 2.4/5/6GHz), C power-table
 composition (`rtw8852c_set_txpwr*`, firmware TXPWR_* elements incl. DA
 limits), C coexistence init, the C `power::Calibration`/qualification
