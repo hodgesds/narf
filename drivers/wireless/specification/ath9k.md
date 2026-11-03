@@ -1747,6 +1747,22 @@ Smokes (written, not executed):
 `smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks`,
 `smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset`.
 
+AR5008 TX power: `phy::ar9280::power::plan_chip`/`program_chip` are the
+shared `eeprom_def.c::ath9k_hw_def_set_txpower` (closed loop, 20 MHz) for
+`Chip::Ar9280` (unchanged through `plan`/`program`) and the AR5008-PHY
+`Chip::Ar5416`/`Chip::Ar9160`: up to three `txMask` chains
+(`calPierData*[i]`, `ctlEdges[ntxchains - 1]` up to index 2),
+`POWER_CORRECTION_FOR_THREE_CHAIN` (10) in `ath9k_hw_get_scaled_power` and
+the matching `INCREASE_MAXPOW_BY_THREE_CHAIN`, the first PD gain starting at
+0 (`ath9k_hw_get_gain_boundaries_pdadcs` below AR9280_20), no
+`ath9k_change_gain_boundary_setting` / `ath9k_adjust_pdadc_values` (the
+gain boundaries keep their computed values, the PDADC table is not
+realigned) and no `pwr_table_offset` removal from the rate registers.
+`program_chip` writes each chain's `AR_PHY_TPCRG5` + PDADC at
+`regChainOffset` (chains 1 and 2 swap to `+0x2000`/`+0x1000` when the
+effective RX or TX mask is 0x5). Smoke (written, not executed):
+`smoke_ath9k_ar5008_txpower_three_chain_closed_loop`.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

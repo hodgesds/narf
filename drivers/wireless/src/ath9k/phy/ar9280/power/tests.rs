@@ -250,3 +250,75 @@ kernel_test_in!(
     "drivers/wireless/ath9k/phy",
     smoke_ath9k_ar9280_txpower_refuses_before_writes
 );
+
+fn smoke_ath9k_ar5008_txpower_three_chain_closed_loop() -> TestResult {
+    // AR5416/AR9160: three TX chains (chain 2 mirrors chain 1's synthetic
+    // pier and ctlEdges[2] mirrors ctlEdges[1]), minor 21 with
+    // pwr_table_offset -3, which only AR9280_20_OR_LATER applies.
+    let mut map = image(7);
+    for (data, stride) in [(CAL_2G, 4), (CAL_5G, 8)] {
+        let one = data + stride * CAL_STRIDE;
+        let two = data + 2 * stride * CAL_STRIDE;
+        map.copy_within(one..one + stride * CAL_STRIDE, two);
+    }
+    for i in 0..5 {
+        let at = CTL_DATA + i * CTL_STRIDE;
+        map.copy_within(at + 16..at + 32, at + 32);
+    }
+    map[PWR_TABLE_OFFSET] = (-3i8) as u8;
+    let mut id = identity(0x15);
+    id.rx_chainmask = 5;
+    id.tx_chainmask = 7;
+    let mut io = Io::default();
+    let Ok(p) = program_chip(&mut io, &id, &map, two(2412), 40, Chip::Ar5416) else {
+        return TestResult::Fail("three-chain AR5416 def map refused");
+    };
+    // Scaled 40 - (4 + three-chain 10) = 26; CCK edge 24; no table shift.
+    let rates = [
+        (0x9934, 0x1a1a_1a1a),
+        (0x9938, 0x1a1a_1a1a),
+        (0xa234, 0x1818_1a18),
+        (0xa238, 0x1818_1818),
+        (0xa38c, 0x1a1a_1a1a),
+        (0xa390, 0x1a1a_1a1a),
+        (0xa3c8, (5 << 6) | 3),
+        (0x993c, 63),
+    ];
+    if p.registers != rates || p.max_power != 36 || p.chains.iter().flatten().count() != 3 {
+        return TestResult::Fail("AR5416 three-chain rate table differs from eeprom_def.c");
+    }
+    let pdadc = expected_pdadc(0);
+    let bounds = 6 | (20 << 4) | (20 << 10) | (20 << 16) | (20 << 22);
+    // RX mask 0x5 swaps chains 1 and 2: +0x2000 then +0x1000.
+    let tpcrg5: Vec<u64> = io
+        .writes
+        .iter()
+        .map(|w| w.0)
+        .filter(|r| r & 0xfff == 0x26c)
+        .collect();
+    if tpcrg5 != [0xa26c, 0xc26c, 0xb26c] {
+        return TestResult::Fail("AR5416 regChainOffset swap not applied");
+    }
+    for offset in [0u64, 0x1000, 0x2000] {
+        if io.regs.get(&(0xa26c + offset)) != Some(&bounds)
+            || (0..32).any(|j| io.regs.get(&(0xa280 + offset + 4 * j)) != Some(&pdadc[j as usize]))
+        {
+            return TestResult::Fail("AR5416 PDADC table shifted or wrong");
+        }
+    }
+    // The AR9280 plan of the same map still refuses three chains, and a
+    // non-def chip or a mask beyond three chains is refused.
+    if plan(&identity(0x15), &map, two(2412), 40, 0) != Err(BringUpError::BadIdentity)
+        || plan_chip(&id, &map, two(2412), 40, 0, Chip::Ar9285)
+            != Err(BringUpError::UnsupportedRevision)
+        || plan_chip(&id, &image(8), two(2412), 40, 0, Chip::Ar9160)
+            != Err(BringUpError::BadIdentity)
+    {
+        return TestResult::Fail("def power plan accepted a wrong chip or mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/phy",
+    smoke_ath9k_ar5008_txpower_three_chain_closed_loop
+);

@@ -31,7 +31,7 @@
 use super::{minor, open_loop, MODAL_2G, MODAL_5G};
 use crate::{
     ath9k::{
-        chips::MAP_DEF,
+        chips::{Chip, MAP_DEF},
         identity::{eeprom_word, BringUpError, Identity, RegisterIo},
         phy::{
             channel::Tune,
@@ -165,7 +165,8 @@ pub(in crate::ath9k) struct Plan {
     /// `xpdGainValues[0..3]` and `numXpdGain`.
     pub gains: [u16; 3],
     pub count: usize,
-    pub chains: [Option<Chain>; 2],
+    /// Per `txMask` chain (`AR5416_MAX_CHAINS`; AR9280 uses chains 0..1).
+    pub chains: [Option<Chain>; 3],
     /// `regulatory->max_power_level` after the chain correction.
     pub max_power: u8,
     /// RATE1, RATE2, [RATE3, RATE4 on 2 GHz], RATE5, RATE6, TX_SUB,
@@ -176,7 +177,11 @@ pub(in crate::ath9k) struct Plan {
 
 /// `ath9k_hw_get_gain_boundaries_pdadcs` for one chain's
 /// `cal_data_per_freq` rows, then `ath9k_change_gain_boundary_setting` and
-/// `ath9k_adjust_pdadc_values` (AR9280_20_OR_LATER).
+/// `ath9k_adjust_pdadc_values`. `ar9280` is `AR_SREV_9280_20_OR_LATER`:
+/// below it (AR5416/AR9160) the first gain starts at 0, the boundaries are
+/// neither shifted nor capped at `63 - overlap` and the table is never
+/// realigned (`diff` must be 0).
+#[allow(clippy::too_many_arguments)]
 fn detector(
     image: &[u8],
     data: usize,
@@ -185,6 +190,7 @@ fn detector(
     count: usize,
     overlap: u8,
     diff: i16,
+    ar9280: bool,
 ) -> Result<Chain, BringUpError> {
     let (left, right) = indices(bin, piers);
     let mut minimum = [0u8; 4];
@@ -230,8 +236,11 @@ fn detector(
             (u16::from(maximum[gain]) + u16::from(minimum[gain + 1])) / 4
         })
         .min(MAX_RATE_POWER);
-        // AR9280_20_OR_LATER starts the first gain at -minPwrT4 / 2.
-        let mut offset = if gain == 0 {
+        // AR9280_20_OR_LATER starts the first gain at -minPwrT4 / 2,
+        // older parts at 0.
+        let mut offset = if gain == 0 && !ar9280 {
+            0
+        } else if gain == 0 {
             -(i16::from(minimum[gain]) / 2)
         } else {
             bounds[gain - 1] as i16 - i16::from(minimum[gain]) / 2 - i16::from(overlap) + 1
@@ -277,11 +286,13 @@ fn detector(
     // ath9k_change_gain_boundary_setting: only the computed boundaries move
     // by `diff` half-dB steps (u16 arithmetic), then cap at 63 - overlap.
     let limit = MAX_RATE_POWER - u16::from(overlap);
-    for bound in bounds.iter_mut().take(count) {
-        *bound = bound.wrapping_sub(diff as u16).min(limit);
+    if ar9280 {
+        for bound in bounds.iter_mut().take(count) {
+            *bound = bound.wrapping_sub(diff as u16).min(limit);
+        }
     }
     // ath9k_adjust_pdadc_values: shift the table to start at the offset.
-    if diff != 0 {
+    if ar9280 && diff != 0 {
         let keep = 128 - diff as usize;
         for k in 0..keep {
             values[k] = values[k + diff as usize];
@@ -303,7 +314,7 @@ fn detector(
     })
 }
 
-/// The complete transmit-power plan at `ceiling` half-dBm
+/// The complete AR9280 transmit-power plan at `ceiling` half-dBm
 /// (`reg->power_limit`); `overlap_register` is the live `AR_PHY_TPCRG5`
 /// overlap used below minor 2.
 pub(in crate::ath9k) fn plan(
@@ -313,6 +324,32 @@ pub(in crate::ath9k) fn plan(
     ceiling: u8,
     overlap_register: u8,
 ) -> Result<Plan, BringUpError> {
+    plan_chip(
+        identity,
+        image,
+        tune,
+        ceiling,
+        overlap_register,
+        Chip::Ar9280,
+    )
+}
+
+/// [`plan`] for any `ar5416_eeprom_def` part: AR9280 (two chains) or the
+/// AR5008-PHY AR5416/AR9160 (three chains, `POWER_CORRECTION_FOR_THREE_CHAIN`,
+/// no `pwr_table_offset` rate shift or PDADC realignment).
+pub(in crate::ath9k) fn plan_chip(
+    identity: &Identity,
+    image: &[u8],
+    tune: Tune,
+    ceiling: u8,
+    overlap_register: u8,
+    chip: Chip,
+) -> Result<Plan, BringUpError> {
+    let ar9280 = match chip {
+        Chip::Ar9280 => true,
+        Chip::Ar5416 | Chip::Ar9160 => false,
+        _ => return Err(BringUpError::UnsupportedRevision),
+    };
     if image.len() != MAP_DEF.bytes() {
         return Err(BringUpError::BadLength);
     }
@@ -320,7 +357,7 @@ pub(in crate::ath9k) fn plan(
         return Err(BringUpError::BadCalibration);
     }
     let tx_mask = image[TX_MASK];
-    if tx_mask == 0 || tx_mask > 3 {
+    if tx_mask == 0 || tx_mask >= 1 << chip.max_chains() {
         return Err(BringUpError::BadIdentity);
     }
     let two = !tune.is_5ghz();
@@ -334,7 +371,13 @@ pub(in crate::ath9k) fn plan(
     let gain = image[modal + ANTENNA_GAIN]
         .max(image[modal + ANTENNA_GAIN + 1])
         .max(image[modal + ANTENNA_GAIN + 2]);
-    let correction = if chains == 2 { 6 } else { 0 };
+    // POWER_CORRECTION_FOR_TWO_CHAIN / _THREE_CHAIN (and the matching
+    // INCREASE_MAXPOW_BY_*_CHAIN of ath9k_hw_update_regulatory_maxpower).
+    let correction = match chains {
+        2 => 6,
+        3 => 10,
+        _ => 0,
+    };
     let scaled = u16::from(ceiling)
         .saturating_sub(u16::from(gain) + correction)
         .min(MAX_RATE_POWER) as u8;
@@ -411,7 +454,12 @@ pub(in crate::ath9k) fn plan(
     } else {
         DEFAULT_TABLE_OFFSET
     };
-    let diff = (table_offset - DEFAULT_TABLE_OFFSET) * 2;
+    // Only AR9280_20_OR_LATER applies `pwr_table_offset`.
+    let (table_offset, diff) = if ar9280 {
+        (table_offset, (table_offset - DEFAULT_TABLE_OFFSET) * 2)
+    } else {
+        (0, 0)
+    };
     if !(0..128).contains(&diff) {
         return Err(BringUpError::BadCalibration);
     }
@@ -431,11 +479,13 @@ pub(in crate::ath9k) fn plan(
     } else {
         ((frequency - 4800) / 5) as u8
     };
-    let mut table = [None; 2];
+    let mut table = [None; 3];
     for (chain, slot) in table.iter_mut().enumerate() {
         if tx_mask & (1 << chain) != 0 {
             let data = cal + chain * stride * CAL_STRIDE;
-            *slot = Some(detector(image, data, piers, bin, count, overlap, diff)?);
+            *slot = Some(detector(
+                image, data, piers, bin, count, overlap, diff, ar9280,
+            )?);
         }
     }
 
@@ -492,6 +542,19 @@ pub(in crate::ath9k) fn program(
     tune: Tune,
     ceiling: u8,
 ) -> Result<Plan, BringUpError> {
+    program_chip(io, identity, image, tune, ceiling, Chip::Ar9280)
+}
+
+/// [`program`] for any def-map chip. `regChainOffset` swaps chains 1 and 2
+/// (`+0x2000` / `+0x1000`) when the effective RX or TX mask is 0x5.
+pub(in crate::ath9k) fn program_chip(
+    io: &mut impl RegisterIo,
+    identity: &Identity,
+    image: &[u8],
+    tune: Tune,
+    ceiling: u8,
+    chip: Chip,
+) -> Result<Plan, BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -504,7 +567,8 @@ pub(in crate::ath9k) fn program(
     if live == u32::MAX {
         return Err(BringUpError::DeviceGone);
     }
-    let p = plan(identity, image, tune, ceiling, (live & 0xf) as u8)?;
+    let p = plan_chip(identity, image, tune, ceiling, (live & 0xf) as u8, chip)?;
+    let swap = identity.rx_chainmask == 5 || identity.tx_chainmask == 5;
     for (mask, shift, value) in [
         (0xc000, 14, (p.count - 1) as u16 & 3),
         (0x30000, 16, p.gains[0]),
@@ -515,7 +579,11 @@ pub(in crate::ath9k) fn program(
     }
     for (chain, table) in p.chains.iter().enumerate() {
         let Some(table) = table else { continue };
-        let offset = chain as u64 * 0x1000;
+        let offset = match chain {
+            1 if swap => 0x2000,
+            2 if swap => 0x1000,
+            _ => chain as u64 * 0x1000,
+        };
         io.write32(0xa26c + offset, table.tpcrg5);
         for (j, word) in table.pdadc.iter().enumerate() {
             io.write32(0xa280 + offset + j as u64 * 4, *word);
