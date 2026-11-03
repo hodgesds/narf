@@ -13,6 +13,7 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("golden.rs");
 struct Model {
+    chip: ChipId,
     words: Vec<u32>,
     rfe: u8,
     cut: u8,
@@ -29,6 +30,7 @@ struct Model {
 impl Model {
     fn new(seed: u8, rfe: u8, cut: u8) -> Self {
         Self {
+            chip: ChipId::Rtl8852B,
             words: vec![u32::from(seed) * 0x01010101; 0x20000 / 4],
             rfe,
             cut,
@@ -144,7 +146,7 @@ impl Io for Model {
 }
 impl Source for Model {
     fn profile(&self) -> (ChipId, u8) {
-        (ChipId::Rtl8852B, self.cut)
+        (self.chip, self.cut)
     }
     async fn physical(&mut self, start: u16, out: &mut [u8]) -> Result<(), power::Error> {
         out.fill(255);
@@ -166,6 +168,7 @@ impl Source for Model {
                 }
             }
             (0x580, 128) => {}
+            (0x590, 0x60) if self.chip == ChipId::Rtl8852C => {}
             _ => return Err(power::Error::Access),
         }
         Ok(())
@@ -378,4 +381,108 @@ fn smoke_rtw89_b_bb_hardware_controls_match_frozen_references_and_retain_bases()
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_bb_hardware_controls_match_frozen_references_and_retain_bases
+);
+/// Minimal MFW container carrying the shipped RTL8852C element order.
+fn c_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
+    let mut bytes = vec![0; 48];
+    bytes[0] = 255;
+    bytes[1] = 1;
+    bytes[20..24].copy_from_slice(&32u32.to_le_bytes());
+    bytes[24..28].copy_from_slice(&16u32.to_le_bytes());
+    for (id, idx, address, value) in [
+        (2u32, 0u8, 0x0704u32, 0x601e_0100u32),
+        (3, 0, 0x0000_0000, 0x0102_0304),
+        (4, 1, rf_a, 0x11),
+        (5, 0, rf_b, 0x22),
+        (8, 0, 0x0c60, 0),
+    ] {
+        let start = bytes.len();
+        bytes.resize(start + 32, 0);
+        bytes[start..start + 4].copy_from_slice(&id.to_le_bytes());
+        bytes[start + 4..start + 8].copy_from_slice(&8u32.to_le_bytes());
+        bytes[start + 24] = idx;
+        bytes.extend_from_slice(&address.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+fn smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c() -> TestResult {
+    let mut model = Model::new(0x5a, 1, 1);
+    model.chip = ChipId::Rtl8852C;
+    let mut factory = Factory::default();
+    if ready(factory.read(&mut model)) != Some(Ok(())) {
+        return TestResult::Fail("C factory snapshot failed");
+    }
+    if Qualified::from_factory(&factory).is_some() {
+        return TestResult::Fail("B qualification accepted a C factory");
+    }
+    let Some(qualified) = Qualified::from_factory_c(&factory) else {
+        return TestResult::Fail("C qualification refused an actual C factory");
+    };
+    let assets = Assets::parse_for(ChipId::Rtl8852C, &c_container(0x10005, 0x10006)).unwrap();
+    model.clear_trace();
+    let mut init = Init::default();
+    // SAFETY: private model Interface; no hardware.
+    if ready(unsafe { init.prepare(&mut model, qualified, &assets) }) != Some(Ok(()))
+        || init.state() != State::TablesLoaded
+        || init.calibration().is_some()
+        || init.calibration_c().is_none()
+    {
+        return TestResult::Fail("C table preparation failed or published B calibration");
+    }
+    // Linux `rf_table = {radiob, radioa}`: path B (1) is written and paged
+    // before path A (0), each with its own path.
+    let rf: Vec<(u8, u32)> = model
+        .operations
+        .iter()
+        .copied()
+        .filter(|(kind, _)| *kind == 16 || *kind == 32)
+        .collect();
+    if rf != [(16, 0x10006), (32, 4), (16, 0x10005), (32, 0)] {
+        return TestResult::Fail("C RF tables were not uploaded in rtw8852c rf_table order");
+    }
+    for (address, value) in [
+        (0x10704, 0x601e_0100 | 2),
+        (0xd248, 0x0776_3333),
+        (0xd220, 0x01eb_f000),
+        (0xd240, 0x0002_f8ff),
+        (0xd28c, 0),
+        (0xd290, 0xf4f4_f4f4),
+        (0xd908, 0),
+        (0xd938, 0x0001_0100),
+        (0xd93c, 0x0500_d500),
+        (0xd94c, 0x0022_0000),
+        (0xd950, 0x0003_0000),
+        (0xd95c, 0),
+    ] {
+        if model.words[address / 4] != value {
+            return TestResult::Fail(
+                "C txpwr unit / TSSI ctrl / BB reset state differs from Linux",
+            );
+        }
+    }
+    // C never touches B's TSSI-tracking pause or UL_TB enable bit.
+    if model
+        .operations
+        .iter()
+        .any(|(kind, a)| *kind == 4 && matches!(*a, 0x158dc | 0x15818 | 0x178dc | 0x17818 | 0xd288))
+    {
+        return TestResult::Fail("C reset used B-only registers");
+    }
+    // Chip mismatch between qualification and assets fails before any write.
+    let (mut b_model, _, b_assets) = Model::setup(0x5a, 1, 1);
+    b_model.clear_trace();
+    let mut init = Init::default();
+    // SAFETY: private model Interface; no hardware.
+    if ready(unsafe { init.prepare(&mut b_model, qualified, &b_assets) })
+        != Some(Err(Error::Profile))
+        || !b_model.operations.is_empty()
+    {
+        return TestResult::Fail("C qualification ran B assets");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c
 );

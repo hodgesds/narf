@@ -2804,6 +2804,58 @@ U-APSD capability is advertised. Four new cases are written, unexecuted:
 `smoke_rtw89_ap_control_peer_lifecycle_allocates_macid_and_cam`,
 `smoke_rtw89_ap_control_beacon_publication_and_fail_closed`.
 
+### RTL8852C retained-runtime groundwork (partial; no native caller)
+
+Chip row `rtl8852c`. These owners are the first chip-specific RTL8852C
+pieces under the retained B architecture; nothing here admits a C station,
+publishes a C radio grant or changes any B byte.
+
+**Factory inputs.** `Factory::read` on RTL8852C reads the complete Linux
+PHY-cap window (`rtw8852c_chip_info.phycap_addr` 0x590, `phycap_size` 0x60)
+once, after the 1216-byte map, and takes the power-k/ECV/secure bytes
+(0x5e9..0x5ee) from that same window; `c_phycap()` exposes it only after a
+completed read. `factory_c::Calibration::from_factory` mirrors rtw8852c.c
+`rtw8852c_efuse_parsing_tssi` (CCK 6, MCS 2G 5 + 5G 14, 6G 32 per path from
+0x210/0x23a and 0x300/0x32a), `rtw8852c_efuse_parsing_gain_offset` (13
+`RTW89_GAIN_OFFSET_*` bands incl. 6G L0..UH1 at 0x3a8..0x3b6, `_decode_efuse_gain`
+nibbles) and `rtw8852c_read_phycap` (TSSI trim 8 + 6G trim 16, thermal and
+PA-bias trim, Linux's erased-trim zeroing only after the whole read);
+`thermal_setting`/`pa_bias_setting` are the `__thm_setting` and
+TXG/TXA nibble values of `rtw8852c_{thermal,pa_bias}_trim`.
+
+**PHY tables.** `radio_assets::Assets` accepts RTL8852C containers only with
+all five BB/GAIN/RADIO_A/RADIO_B/NCTL elements. The shipped
+`rtw89/rtw8852c_fw-{1,2}.bin` carry RADIO_A at `reg2.idx` 1 and RADIO_B at
+idx 0, matching `rtw8852c_chip_info.rf_table = {radiob, radioa}`; that slot
+order is required (the B order is refused, and vice versa). NARF carries no
+static rtw8852c_table.c copy, so the legacy element-less `rtw8852c_fw.bin`
+yields no PHY tables (`Error::Element`) rather than a fabricated default.
+
+**Table/power/reset preparation.** `radio_init::Qualified::from_factory_c`
+qualifies an actual valid C factory (RFE != 255). `Init::prepare` refuses
+an assets/qualification chip mismatch before any write, decodes the gain
+table with the generation decoder (phy.c `rtw89_phy_config_bb_gain_ax`),
+writes BB, then `rtw8852c_init_txpwr_unit(PHY_0)` (UL/coex power CRs,
+`rtw8852c_set_txpwr_ul_tb_offset(0)` V1 byte masks giving 0xd28c=0 and
+0xd290=0xf4f4f4f4 without the B UL_TB enable bit, `rtw8852c_init_tssi_ctrl`
+with the all-zero FLAT `rtw89_8852c_tssi_dbw_table` band-edge and fast-mode
+fields) and `rtw8852c_bb_reset_all(PHY_0)` (HW-SI trigger hold, no B TSSI
+tracking pause), each read back. RF tables follow `phy.c::rtw89_phy_init_rf_reg`
+order over `{radiob, radioa}`: path B is written and paged first, then path A.
+
+Remaining for the `rtl8852c` row (no row credit): C NCTL/`bb_sethw`/
+`rtw8852c_bb_gpio_init`/`rtw8852c_rfk_init` (DACK/RX DCK/IQK/DPK/TSSI from
+rtw8852c_rfk.c), C channel MAC/BB/RF (`rtw8852c_set_channel_{mac,bb}`,
+`rtw8852c_ctrl_ch`/`_bw`, `_ch_setting` for 2.4/5/6GHz), C power-table
+composition (`rtw8852c_set_txpwr*`, firmware TXPWR_* elements incl. DA
+limits), C coexistence init, the C `power::Calibration`/qualification
+records (N52x are B-bound), `command_native`/`startup_station` admission
+(B-only at `Io::station_allowed`, `Startup::start` assets), and native
+execution. Unexecuted new cases:
+`smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
+`smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
+`smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before

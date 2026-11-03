@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! One retained actual B BB/gain/power/reset/RF-table preparation attempt.
+//! One retained actual B or C BB/gain/power/reset/RF-table preparation attempt.
 use super::{
     factory::Factory,
     factory_b::Calibration,
+    factory_c,
     mac::ChipId,
     power::{self, Io},
     radio_assets::Assets,
@@ -36,13 +37,40 @@ pub(super) trait Interface: Io {
     /// Success means native transport consumption, never execution receipt.
     async fn radio_page(&mut self, path: u8, page: u8, bytes: &[u8]) -> Result<(), Error>;
 }
+/// The chip-specific factory calibration that qualified this attempt.
+#[derive(Clone, Copy)]
+enum Inputs {
+    B(Calibration),
+    C(factory_c::Calibration),
+}
 #[derive(Clone, Copy)]
 pub(super) struct Qualified {
     rfe: u8,
     cut: u8,
-    calibration: Calibration,
+    inputs: Inputs,
 }
 impl Qualified {
+    pub fn chip(&self) -> ChipId {
+        match self.inputs {
+            Inputs::B(_) => ChipId::Rtl8852B,
+            Inputs::C(_) => ChipId::Rtl8852C,
+        }
+    }
+    /// RTL8852C: the same actual-factory qualification as B, from
+    /// `rtw8852c_read_efuse`/`rtw8852c_read_phycap` inputs.
+    pub fn from_factory_c(factory: &Factory) -> Option<Self> {
+        let identity = factory.identity()?;
+        let calibration = identity.calibration();
+        if identity.chip() != ChipId::Rtl8852C || !calibration.valid || calibration.rfe_type == 255
+        {
+            return None;
+        }
+        Some(Self {
+            rfe: calibration.rfe_type,
+            cut: identity.cut(),
+            inputs: Inputs::C(factory_c::Calibration::from_factory(factory)?),
+        })
+    }
     pub fn from_factory(factory: &Factory) -> Option<Self> {
         let identity = factory.identity()?;
         let calibration = identity.calibration();
@@ -53,7 +81,7 @@ impl Qualified {
         Some(Self {
             rfe: calibration.rfe_type,
             cut: identity.cut(),
-            calibration: Calibration::from_factory(factory)?,
+            inputs: Inputs::B(Calibration::from_factory(factory)?),
         })
     }
 }
@@ -69,6 +97,7 @@ pub(super) struct Init {
     state: State,
     gain: Option<Gain>,
     calibration: Option<Calibration>,
+    calibration_c: Option<factory_c::Calibration>,
 }
 impl Init {
     pub fn state(&self) -> State {
@@ -82,6 +111,11 @@ impl Init {
     pub fn calibration(&self) -> Option<&Calibration> {
         (self.state == State::TablesLoaded)
             .then_some(self.calibration.as_ref())
+            .flatten()
+    }
+    pub fn calibration_c(&self) -> Option<&factory_c::Calibration> {
+        (self.state == State::TablesLoaded)
+            .then_some(self.calibration_c.as_ref())
             .flatten()
     }
     /// # Safety
@@ -112,16 +146,32 @@ impl Init {
         for i in [0, 4] {
             validate_bb(&programs[i])?;
         }
+        if assets.chip() != qualified.chip() {
+            return Err(Error::Profile);
+        }
         let pages = [rf_pages(&programs[2])?, rf_pages(&programs[3])?];
+        let c = matches!(qualified.inputs, Inputs::C(_));
+        // phy.c `rtw89_phy_config_bb_gain_ax` is the generation decoder for
+        // both chips (8 gain bands cover C's 6GHz L/M/H/UH).
         self.gain = Some(Gain::decode(&programs[1], qualified.rfe).map_err(Error::Gain)?);
-        self.calibration = Some(qualified.calibration);
+        match qualified.inputs {
+            Inputs::B(calibration) => self.calibration = Some(calibration),
+            Inputs::C(calibration) => self.calibration_c = Some(calibration),
+        }
         bb(io, &programs[0]).await?;
-        power_units(io)?;
-        reset(io).await?;
-        for (path, program) in [programs[2].as_slice(), programs[3].as_slice()]
-            .into_iter()
-            .enumerate()
-        {
+        if c {
+            power_units_c(io)?;
+            reset_c(io).await?;
+        } else {
+            power_units(io)?;
+            reset(io).await?;
+        }
+        // phy.c `rtw89_phy_init_rf_reg` walks `chip->rf_table[]` in order:
+        // B `{radioa, radiob}`, C `{radiob, radioa}`; each table keeps its
+        // own RF path for writes and the H2C page `rf_path`.
+        let order: [usize; 2] = if c { [1, 0] } else { [0, 1] };
+        for path in order {
+            let program = programs[2 + path].as_slice();
             for &Pair(address, value) in program {
                 if address == 0xfe {
                     io.delay_us(50_000).await;
@@ -215,6 +265,108 @@ fn modify(io: &mut impl Io, address: u32, mask: u32, value: u32) -> Result<(), p
         address,
         (old & !mask) | ((value << mask.trailing_zeros()) & mask),
     )
+}
+/// rtw8852c.c `rtw8852c_init_txpwr_unit(RTW89_PHY_0)`: UL/coex power CRs,
+/// `rtw8852c_set_txpwr_ul_tb_offset(0, MAC_0)` (V1 byte masks, no UL_TB
+/// enable bit) and `rtw8852c_init_tssi_ctrl` with the flat band-edge/fast
+/// mode configuration (`rtw89_8852c_tssi_dbw_table` FLAT row is all zero).
+fn power_units_c(io: &mut impl Io) -> Result<(), Error> {
+    const CTRL_INI: [(u32, u32); 6] = [
+        (0xd938, 0x00010100),
+        (0xd93c, 0x0500d500),
+        (0xd940, 0x00000500),
+        (0xd944, 0x00000005),
+        (0xd94c, 0x00220000),
+        (0xd950, 0x00030000),
+    ];
+    const BANDEDGE_FLAT: [(u32, u32); 15] = [
+        (0xd91c, 0xff000000),
+        (0xd920, 0xff),
+        (0xd920, 0xff00),
+        (0xd920, 0xff0000),
+        (0xd920, 0xff000000),
+        (0xd924, 0xff),
+        (0xd924, 0xff00),
+        (0xd914, 0xff000000),
+        (0xd918, 0xff),
+        (0xd918, 0xff00),
+        (0xd918, 0xff0000),
+        (0xd918, 0xff000000),
+        (0xd91c, 0xff),
+        (0xd91c, 0xff00),
+        (0xd91c, 0xff0000),
+    ];
+    const FASTMODE_FLAT: [(u32, u32); 4] = [
+        (0xd934, 0xff0000),
+        (0xd934, 0xff000000),
+        (0xd938, 0xff),
+        (0xd934, 0xff00),
+    ];
+    io.write32(0xd248, 0x07763333)?;
+    io.write32(0xd220, 0x01ebf000)?;
+    io.write32(0xd240, 0x0002f8ff)?;
+    // val_1t = 0 << 2; val_2t = max(0 - 3, -32) << 2 = -12.
+    for i in 0..4 {
+        modify(io, 0xd28c, 0xff << (8 * i), 0)?;
+        modify(io, 0xd290, 0xff << (8 * i), 0xf4)?;
+    }
+    for address in (0xd908..=0xd95c).step_by(4) {
+        io.write32(address, 0)?;
+    }
+    for (address, value) in CTRL_INI {
+        io.write32(address, value)?;
+    }
+    for (address, mask) in BANDEDGE_FLAT {
+        modify(io, address, mask, 0)?;
+    }
+    modify(io, 0xd94c, 0xc000_0000, 0)?;
+    for (address, mask) in FASTMODE_FLAT {
+        modify(io, address, mask, 0)?;
+    }
+    for (address, value) in [
+        (0xd248, 0x07763333),
+        (0xd220, 0x01ebf000),
+        (0xd240, 0x0002f8ff),
+        (0xd28c, 0),
+        (0xd290, 0xf4f4_f4f4),
+    ] {
+        if read(io, address)? != value {
+            return Err(power::Error::Access.into());
+        }
+    }
+    for address in (0xd908..=0xd95c).step_by(4) {
+        let expected = CTRL_INI
+            .iter()
+            .find(|(a, _)| *a == address)
+            .map_or(0, |(_, v)| *v);
+        if read(io, address)? != expected {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
+}
+/// rtw8852c.c `rtw8852c_bb_reset_all(RTW89_PHY_0)` (via phy.c
+/// `rtw89_phy_bb_reset`): HW-SI trigger hold around the async BB reset,
+/// without B's TSSI-tracking pause.
+async fn reset_c(io: &mut impl Io) -> Result<(), Error> {
+    modify(io, 0x11200, 0x70000000, 7)?;
+    modify(io, 0x13200, 0x70000000, 7)?;
+    io.delay_us(1).await;
+    modify(io, 0x10704, 2, 1)?;
+    modify(io, 0x10704, 2, 0)?;
+    modify(io, 0x11200, 0x70000000, 0)?;
+    modify(io, 0x13200, 0x70000000, 0)?;
+    modify(io, 0x10704, 2, 1)?;
+    for (a, m, v) in [
+        (0x10704, 2, 2),
+        (0x11200, 0x70000000, 0),
+        (0x13200, 0x70000000, 0),
+    ] {
+        if read(io, a)? & m != v {
+            return Err(power::Error::Access.into());
+        }
+    }
+    Ok(())
 }
 fn power_units(io: &mut impl Io) -> Result<(), Error> {
     // Actual SCC MAC0 TX-power CRs, without the PHY aperture offset.

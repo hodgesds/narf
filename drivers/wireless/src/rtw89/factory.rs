@@ -69,7 +69,11 @@ pub struct Factory {
     identity: Option<Identity>,
     logical: Vec<u8>,
     b_phycap: Option<[u8; 128]>,
+    c_phycap: Option<[u8; C_PHYCAP_SIZE]>,
 }
+/// rtw8852c.c `rtw8852c_chip_info.{phycap_addr,phycap_size}`.
+pub(super) const C_PHYCAP_ADDR: u16 = 0x590;
+pub(super) const C_PHYCAP_SIZE: usize = 0x60;
 impl Default for Factory {
     fn default() -> Self {
         Self {
@@ -77,6 +81,7 @@ impl Default for Factory {
             identity: None,
             logical: Vec::new(),
             b_phycap: None,
+            c_phycap: None,
         }
     }
 }
@@ -93,6 +98,13 @@ impl Factory {
     pub(super) fn b_phycap(&self) -> Option<&[u8; 128]> {
         (self.state == State::Ready)
             .then_some(self.b_phycap.as_ref())
+            .flatten()
+    }
+    /// The complete RTL8852C PHY-cap window (`phycap_addr` 0x590, 0x60 bytes,
+    /// core.c `rtw89_parse_phycap_map`), present only after a completed read.
+    pub(super) fn c_phycap(&self) -> Option<&[u8; C_PHYCAP_SIZE]> {
+        (self.state == State::Ready)
+            .then_some(self.c_phycap.as_ref())
             .flatten()
     }
     /// A single completed native DDV lifecycle supplies every input. No erased
@@ -134,7 +146,20 @@ impl Factory {
             extra.copy_from_slice(&bytes[0x69..0x6e]);
             Some(bytes)
         } else {
-            io.physical(0x5e9, &mut extra).await?;
+            None
+        };
+        let c_phycap = if chip == ChipId::Rtl8852C {
+            // C's PHY-cap window 0x590..0x5f0 contains the same 0x5e9..0x5ee
+            // power-k/ECV/secure bytes; read it whole, exactly once.
+            let mut bytes = [0; C_PHYCAP_SIZE];
+            io.physical(C_PHYCAP_ADDR, &mut bytes).await?;
+            let start = 0x5e9 - usize::from(C_PHYCAP_ADDR);
+            extra.copy_from_slice(&bytes[start..start + 5]);
+            Some(bytes)
+        } else {
+            if chip != ChipId::Rtl8852B {
+                io.physical(0x5e9, &mut extra).await?;
+            }
             None
         };
         if chip == ChipId::Rtl8851B && extra[1] >> 4 != 15 && extra[1] >> 4 != cut {
@@ -158,6 +183,7 @@ impl Factory {
         };
         self.logical = logical;
         self.b_phycap = b_phycap;
+        self.c_phycap = c_phycap;
         self.identity = Some(identity);
         self.state = State::Ready;
         Ok(())
