@@ -67,6 +67,11 @@ pub(super) struct Native {
     /// publication is refused and hardware TX stays paused until finish;
     /// cancellation leaves it set (fail closed, non-Ready).
     retune: Option<u8>,
+    /// `station_width_begin` started the current retune (N2xB widening).
+    widening: bool,
+    /// The N2xB 40MHz program is committed (`station_retune_finish` after
+    /// widening); HT readbacks then expect the HT40 selection.
+    wide: bool,
     /// Committed operating primary and completed retune programs.
     channel: u8,
     channel_epoch: u64,
@@ -175,6 +180,8 @@ impl Native {
             tracking_maintenance: false,
             tracking_sequence: 3,
             retune: None,
+            widening: false,
+            wide: false,
             channel: 1,
             channel_epoch: 1,
         };
@@ -878,7 +885,8 @@ unsafe impl Registers for Native {
             .as_ref()
             .and_then(super::power_policy::Gate::ht_grant)
         {
-            return g.readback(|r| self.read32(r));
+            let wide = self.committed_ht40()?;
+            return g.readback_at(|r| self.read32(r), wide.as_ref());
         }
         if let Some(indices) = self
             .packet_gate
@@ -1200,6 +1208,7 @@ unsafe impl Registers for Native {
             || self.mailbox_pending
             || self.command_ring.pending()
             || self.retune.is_some_and(|c| c != channel)
+            || self.widening
             || (channel == 1) != grant.is_none()
         {
             return Err(Error::State);
@@ -1235,6 +1244,41 @@ unsafe impl Registers for Native {
         }
         self.retune_quiet()
     }
+    fn station_width_begin(&mut self) -> Result<bool, Error> {
+        if self.state != State::Packets
+            || self.tracking_maintenance
+            || self.mailbox_pending
+            || self.command_ring.pending()
+            || self.retune.is_some_and(|c| c != self.channel)
+        {
+            return Err(Error::State);
+        }
+        if self.retune.is_none() {
+            if self.wide {
+                return Err(Error::State);
+            }
+            let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+            let record = gate.ht40_record().ok_or(Error::State)?;
+            if record.primary != self.channel || gate.channel() != self.channel {
+                return Err(Error::State);
+            }
+            gate.current().map_err(Error::Power)?;
+            // From here no new TX is published (the retune owner), and RX PHY
+            // admission follows `query_phy_status_page1` at BW40.
+            self.retune = Some(self.channel);
+            self.widening = true;
+            self.with_packet(|core, _| {
+                core.set_operating_width(1);
+                Ok(())
+            })
+            .map_err(|_| Error::State)?;
+            self.write8(0x522, 0xff)?;
+        }
+        if self.read8(0x522)? != 0xff {
+            return Err(Error::Prerequisite);
+        }
+        self.retune_quiet()
+    }
     fn station_retune_iqk(&mut self) -> Result<(), Error> {
         if self.retune.is_none() {
             return Err(Error::State);
@@ -1262,6 +1306,9 @@ unsafe impl Registers for Native {
         self.channel = channel;
         self.channel_epoch = self.channel_epoch.checked_add(1).ok_or(Error::State)?;
         self.retune = None;
+        if core::mem::take(&mut self.widening) {
+            self.wide = true;
+        }
         Ok(self.channel_epoch)
     }
     fn station_rts_request(&mut self) -> Result<super::RtsRequest, Error> {
@@ -1727,6 +1774,14 @@ impl Native {
             }
         }
         Ok(true)
+    }
+    /// The N2xB record whose 40MHz program is committed in hardware, if any.
+    fn committed_ht40(&self) -> Result<Option<super::ht40::Record>, Error> {
+        if !self.wide {
+            return Ok(None);
+        }
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        gate.ht40_record().map(Some).ok_or(Error::State)
     }
     pub(super) fn retune_active(&self) -> bool {
         self.retune.is_some()

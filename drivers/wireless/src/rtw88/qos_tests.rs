@@ -175,6 +175,7 @@ fn profile(acs: u8) -> DataProfile {
         stbc: false,
         acs,
         fallback: false,
+        bw40: false,
     }
 }
 fn eth(tos: u8) -> Vec<u8> {

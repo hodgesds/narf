@@ -33,6 +33,9 @@ pub(super) struct Board {
     /// HT20 one-/two-stream factory ceilings per 2.4GHz channel group
     /// (`bw40_base[group]` plus the HT20 differences), min over both paths.
     ht_groups: [Option<(u8, Option<u8>)>; 5],
+    /// HT40 one-/two-stream factory ceilings per group (`bw40_base[group]`
+    /// plus `ht_2s_diff.bw40`), min over both paths.
+    ht40_groups: [Option<(u8, Option<u8>)>; 5],
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -109,12 +112,29 @@ impl Board {
                 two(0).zip(two(1)).map(|(a, b)| a.min(b)),
             ))
         });
+        let ht40_groups = core::array::from_fn(|group| {
+            let one = |path: u8| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_bw40(p, group, 127))
+            };
+            let two = |path: u8| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_bw40_2ss(p, group, 2))
+            };
+            Some((
+                one(0)?.min(one(1)?),
+                two(0).zip(two(1)).map(|(a, b)| a.min(b)),
+            ))
+        });
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
             maximum,
             groups,
             ht_groups,
+            ht40_groups,
             ht: factory
                 .power_path(0)
                 .and_then(|a| super::ht::factory_limit(a, 2, 127))
@@ -220,6 +240,11 @@ pub struct Gate {
     /// the exact base. Present only while retuned away from channel 1; its
     /// live regulatory/capability check is part of `current`.
     channel: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    /// Separately signed N2xB 2.4GHz HT40 program over the bound HT program.
+    /// Once the hardware runs at 40MHz there is no in-place downgrade, so its
+    /// live regulatory/capability/factory check is part of `current` and
+    /// every `invoke`.
+    ht40: Option<alloc::sync::Arc<super::qualification::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -500,6 +525,7 @@ impl Gate {
             qos: None,
             fallback: None,
             channel: None,
+            ht40: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -521,6 +547,7 @@ impl Gate {
             qos: None,
             fallback: None,
             channel: None,
+            ht40: None,
         }
     }
     /// Current operating 2.4GHz primary: 1 for the base, else the bound
@@ -546,6 +573,7 @@ impl Gate {
             && self.qos.is_none()
             && self.fallback.is_none()
             && self.tracking.is_none()
+            && self.ht40.is_none()
     }
     pub(super) fn without_channel(&self) -> Self {
         let mut gate = self.clone();
@@ -582,6 +610,15 @@ impl Gate {
             Scope::C21(g) => g.group_limits(group),
         }
     }
+    /// Factory HT40 `(1S, 2S)` index ceilings for one 2.4GHz group.
+    pub(super) fn ht40_limits(&self, group: usize) -> Option<(u8, Option<u8>)> {
+        match &self.scope {
+            Scope::C22 { calibration, .. } => {
+                calibration.board.ht40_groups.get(group).copied().flatten()
+            }
+            Scope::C21(g) => g.ht40_group(group).map(|m| (m, None)),
+        }
+    }
     pub(super) fn did(&self) -> u16 {
         match &self.scope {
             Scope::C22 { .. } => 0xc822,
@@ -598,6 +635,9 @@ impl Gate {
         self.host_current()?;
         if let Some(g) = &self.channel {
             super::channel_policy::current(g, self.did()).map_err(|_| Error::Policy)?;
+        }
+        if let Some(g) = &self.ht40 {
+            super::ht40::current(g, self).map_err(|_| Error::Policy)?;
         }
         if let Some(g) = &self.tracking {
             g.invoke(|| Ok(())).map_err(|_| Error::Authority)?;
@@ -651,6 +691,9 @@ impl Gate {
     ) -> Result<T, super::firmware_transport::Error> {
         self.host_current()
             .map_err(super::firmware_transport::Error::Power)?;
+        if let Some(g) = &self.ht40 {
+            super::ht40::current(g, self)?;
+        }
         if let Some(g) = &self.protection {
             return g.invoke(operation);
         }
@@ -675,6 +718,9 @@ impl Gate {
         self.host_current()?;
         if let Some(g) = &self.channel {
             super::channel_policy::current_in(g, self.did(), domain).map_err(|_| Error::Policy)?;
+        }
+        if let Some(g) = &self.ht40 {
+            super::ht40::current_in(g, self, domain).map_err(|_| Error::Policy)?;
         }
         match &self.scope {
             Scope::C22 {
@@ -750,9 +796,22 @@ impl Gate {
         {
             return false;
         }
+        if p.bw40
+            && !self.ht40.as_ref().is_some_and(|g| {
+                super::ht40::Record::decode(self.did(), g.payload())
+                    .is_some_and(|r| p.mcs != 0 && p.mcs & !r.mcs == 0 && (!p.sgi || r.sgi))
+                    && super::ht40::current(g, self).is_ok()
+            })
+        {
+            return false;
+        }
+        // At 40MHz the SGI bit is SGI40, admitted by N2xB above; the HT
+        // program admits the remaining HT20-qualified fields.
         let p = super::packet_format::DataProfile {
             acs: 0,
             fallback: false,
+            bw40: false,
+            sgi: p.sgi && !p.bw40,
             ..p.uncoded()
         };
         if let Some(g) = &self.ht {
@@ -892,19 +951,39 @@ impl Gate {
             && self.extension.is_some()
             && self.fallback.is_none()
             && super::fallback::bounds(g.payload());
-        if !coding && !qos && !fallback {
+        // N2xB HT40: over the bound HT program with its exact MCS set, on the
+        // gate's own primary, within the center group's factory BW40 base.
+        let ht40 = g.is(&super::ht40::KIND)
+            && self.ht40.is_none()
+            && super::ht40::Record::decode(self.did(), g.payload()).is_some_and(|r| {
+                self.ht.as_ref().is_some_and(|h| h.mcs() == r.mcs)
+                    && r.primary == self.channel()
+                    && super::ht40::within_factory(self, &r)
+            });
+        if !coding && !qos && !fallback && !ht40 {
             return Err(super::firmware_transport::Error::State);
         }
         g.check(self)?;
+        if ht40 {
+            super::ht40::current(&g, self)?;
+        }
         let mut gate = self.clone();
         if coding {
             gate.coding = Some(g);
         } else if qos {
             gate.qos = Some(g);
-        } else {
+        } else if fallback {
             gate.fallback = Some(g);
+        } else {
+            gate.ht40 = Some(g);
         }
         Ok(gate)
+    }
+    /// The bound N2xB HT40 record, if any.
+    pub(super) fn ht40_record(&self) -> Option<super::ht40::Record> {
+        self.ht40
+            .as_ref()
+            .and_then(|g| super::ht40::Record::decode(self.did(), g.payload()))
     }
     pub(super) fn coding_grant(&self) -> Option<alloc::sync::Arc<super::qualification::Grant>> {
         self.coding.clone()

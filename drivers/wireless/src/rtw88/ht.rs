@@ -66,6 +66,19 @@ impl Facts {
 /// `did`/`coding` select the RX/TX coding of `main.c::rtw_init_ht_cap`;
 /// did 0 (beacon observation only) advertises no coding.
 fn local(tx: u16, rx_mask: u16, sgi: bool, did: u16, coding: u8) -> Option<LocalPhy> {
+    local_width(tx, rx_mask, sgi, did, coding, None)
+}
+/// `wide` = Some(TX SGI40) advertises `SUP_WIDTH_20_40 | SGI_40` like
+/// `rtw_init_ht_cap` with `hw_cap.bw` 40 (N2xB bound); SGI40 TX needs the
+/// record's SGI40 qualification.
+fn local_width(
+    tx: u16,
+    rx_mask: u16,
+    sgi: bool,
+    did: u16,
+    coding: u8,
+    wide: Option<bool>,
+) -> Option<LocalPhy> {
     let mut rx = [0; 10];
     rx[..2].copy_from_slice(&rx_mask.to_le_bytes());
     let mut transmit = [0; 10];
@@ -73,12 +86,16 @@ fn local(tx: u16, rx_mask: u16, sgi: bool, did: u16, coding: u8) -> Option<Local
     LocalHt::new(
         rx,
         rx,
-        HtWidth::Twenty,
+        if wide.is_some() {
+            HtWidth::TwentyForty
+        } else {
+            HtWidth::Twenty
+        },
         HtGi {
             rx20: true,
             tx20: sgi,
-            rx40: false,
-            tx40: false,
+            rx40: wide.is_some(),
+            tx40: wide == Some(true),
         },
         0,
         4,
@@ -89,11 +106,19 @@ fn local(tx: u16, rx_mask: u16, sgi: bool, did: u16, coding: u8) -> Option<Local
             coding & super::coding::LDPC != 0 && tx & 0xff00 == 0,
         )
         .with_rx_stbc(did != 0)
+        // rtw_init_ht_cap: SUP_WIDTH_20_40 | DSSSCCK40 | SGI_40 together.
+        .with_dsss_cck40(wide.is_some())
         .with_tx_stbc(coding & super::coding::STBC != 0 && tx & 0xff00 == 0)
     })
     .and_then(|h| h.with_tx_selection(transmit))
     .ok()
-    .and_then(|h| LocalPhy::ht20(h).ok())
+    .and_then(|h| {
+        if wide.is_some() {
+            LocalPhy::ht40(h).ok()
+        } else {
+            LocalPhy::ht20(h).ok()
+        }
+    })
 }
 pub(super) fn factory_limit(p: &[u8], factor: i16, max: u8) -> Option<u8> {
     factory_limit_group(p, 0, factor, max)
@@ -139,6 +164,27 @@ pub(super) fn factory_limit_2ss_group(p: &[u8], group: usize) -> Option<u8> {
         }
     };
     let value = i16::from(base) + 2 * (signed(one >> 4) + signed(two));
+    (value >= 0).then_some(value.min(127) as u8)
+}
+/// Linux `phy.c::rtw_phy_get_2g_tx_power_index` at BW40: `bw40_base[group]`
+/// is the one-stream HT40 base (no HT difference is added).
+pub(super) fn factory_limit_bw40(p: &[u8], group: usize, max: u8) -> Option<u8> {
+    if group > 4 {
+        return None;
+    }
+    let base = *p.get(6 + group)?;
+    (base <= max).then_some(base)
+}
+/// Two-stream HT40: `bw40_base[group] + ht_2s_diff.bw40 * txgi_factor`
+/// (`ht_2s_diff` byte 12, signed high nibble).
+pub(super) fn factory_limit_bw40_2ss(p: &[u8], group: usize, factor: i16) -> Option<u8> {
+    let base = factory_limit_bw40(p, group, 127)?;
+    let two = *p.get(12)?;
+    if two == 255 {
+        return None;
+    }
+    let n = i16::from(two >> 4);
+    let value = i16::from(base) + (if n & 8 != 0 { n - 16 } else { n }) * factor;
     (value >= 0).then_some(value.min(127) as u8)
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,6 +460,18 @@ impl Grant {
         local(self.mcs, self.rx_mask(), self.sgi, self.base.did(), coding)
             .expect("validated native HT facts")
     }
+    /// [`Self::local_coded`] advertising 20/40MHz under a bound N2xB record.
+    pub(super) fn local_wide(&self, coding: u8, sgi40: bool) -> LocalPhy {
+        local_width(
+            self.mcs,
+            self.rx_mask(),
+            self.sgi,
+            self.base.did(),
+            coding,
+            Some(sgi40),
+        )
+        .expect("validated native HT facts")
+    }
     pub(super) fn profile(&self, rates: u16, mcs: u16, sgi: bool) -> Result<DataProfile, Error> {
         let p = DataProfile {
             rates,
@@ -425,6 +483,7 @@ impl Grant {
             stbc: false,
             acs: 0,
             fallback: false,
+            bw40: false,
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);
@@ -521,6 +580,44 @@ impl Grant {
             };
         }
         core::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
+    }
+    /// [`Self::readback`] at the committed width: with the N2xB pair
+    /// programmed, the HT TXAGC is the record's HT40 selection and (C21) RF18
+    /// carries the 40MHz center.
+    pub(super) fn readback_at(
+        &self,
+        mut read: impl FnMut(u16) -> Result<u32, Error>,
+        wide: Option<&super::ht40::Record>,
+    ) -> Result<(), Error> {
+        let Some(r) = wide else {
+            return self.readback(read);
+        };
+        if self.base.did() == 0xc821 {
+            let mcs: [u8; 8] = r.indices[..8].try_into().expect("one-stream HT40 indices");
+            return super::radio8821c::operating_readback_wide(
+                read,
+                self.facts.legacy,
+                mcs,
+                r.center(),
+            );
+        }
+        if self.two_streams()
+            && (read(0x820)? & 255 != 0x31
+                || read(0x1e2c)? & 0xffff != 0x400
+                || read(0x1a04)? & 0xf0000000 != 0x80000000)
+        {
+            return Err(Error::Prerequisite);
+        }
+        for (reg, v) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
+            if read(reg)? >> 16 & 127 != u32::from(v) {
+                return Err(Error::Prerequisite);
+            }
+        }
+        super::ht40::check_power(&mut read, 0xc822, r)?;
+        if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
     }
     pub(super) fn readback(
         &self,

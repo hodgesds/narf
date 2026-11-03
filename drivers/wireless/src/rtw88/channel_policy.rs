@@ -415,7 +415,7 @@ fn dpd_off(io: &mut impl Io) -> Result<(), Error> {
 /// dropped: no source shows the firmware leaving IQK_DONE at IQK start, so
 /// it could time out on silicon. The stale-level risk is bounded by the
 /// RF18/SCOTRK/TXDFIR/gain/RRSR readbacks that follow.
-async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
+pub(super) async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
     dpd_off(io)?;
     super::radio::rfk_power(io, true)?;
     io.station_retune_iqk()?;
@@ -463,7 +463,7 @@ fn verify8822c(io: &mut impl Io, channel: u8, gains: [u8; 2]) -> Result<(), Erro
 
 /// `rtw8821c_do_iqk` before association (clear=0, segment=0). RF_DTXLOK is
 /// host-cleared after each run, so a stale done marker is refused.
-async fn iqk8821c(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn iqk8821c(io: &mut impl Io) -> Result<(), Error> {
     if super::radio8821c::rf_read(io, 8)? == 0xabcde {
         return Err(Error::Prerequisite);
     }

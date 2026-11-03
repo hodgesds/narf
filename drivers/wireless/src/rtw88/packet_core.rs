@@ -143,6 +143,8 @@ pub(super) struct Core {
     receive_chip: super::packet_phy::Chip,
     /// Current operating primary; C22 PHY status must report it.
     operating_channel: u8,
+    /// RTW bandwidth code of the committed channel (0=20, 1=40 via N2xB).
+    operating_width: u8,
     tx_host: [u16; 5],
     tx_device: [u16; 5],
     rx: u16,
@@ -267,6 +269,7 @@ impl Core {
             data_profile: format::DataProfile::LEGACY,
             receive_chip,
             operating_channel: 1,
+            operating_width: 0,
             scan: None,
             tx_host: [0; 5],
             tx_device: [0; 5],
@@ -330,6 +333,9 @@ impl Core {
         self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
     }
     /// Admit broadcast Probe Requests from a unicast random scan address.
+    pub(super) fn set_operating_width(&mut self, width: u8) {
+        self.operating_width = width;
+    }
     pub(super) fn set_operating_channel(&mut self, channel: u8) {
         self.operating_channel = channel;
     }
@@ -497,10 +503,17 @@ impl Core {
                             status = <[u8; 32]>::try_from(bytes.as_slice())
                                 .ok()
                                 .map(alloc::boxed::Box::new);
-                            super::packet_phy::parse(self.receive_chip, metadata.rate, &bytes)
-                                .ok()
-                                .filter(|p| p.on_channel(self.operating_channel))
-                                .map(Some)
+                            super::packet_phy::parse_at(
+                                self.receive_chip,
+                                metadata.rate,
+                                &bytes,
+                                self.operating_width,
+                            )
+                            .ok()
+                            .filter(|p| {
+                                p.on_operating(self.operating_channel, self.operating_width)
+                            })
+                            .map(Some)
                         }
                         None => Some(None),
                     };

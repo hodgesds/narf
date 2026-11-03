@@ -2283,6 +2283,104 @@ unexecuted: `smoke_rtw88_wow_support_and_validation`,
 `smoke_rtw88_wow_resume_reason_and_firmware_restore`,
 `smoke_rtw88_wow_failure_requires_full_restart`.
 
+### C21/C22 2.4GHz HT40 (`N2xB`, `ht40.rs`)
+
+A 2.4GHz 40MHz association is admitted only by an optional separately signed
+continuation `rtw88/rtw882{1,2}ce[-chNN]-ht40-v1-<mac>.bin` (generic
+`qualification.rs` layout, tag `B`, stem `ht40`), qualified over the
+channel-scoped extension base of its primary (`channel_policy::scope_request`)
+and bound only over a bound HT program with the same TX MCS set
+(`Gate::with_continuation`). Payload: primary, secondary (primary +/- 4, both
+in 1..=13), width 40, flags (bit0 SGI40), antenna gain, qualified ceiling,
+three measured 40MHz peaks (calibration, response, data; quarter dBm), TX MCS
+mask, HT40 TXAGC index per MCS0..15 (zero outside the mask; C21 one stream;
+C22 within the signed 7-bit difference of the MCS7 reference), zero tail.
+Nothing is derived from the 20MHz programs or another channel.
+
+Admission, all of which must hold:
+
+- `main.c::rtw_init_ht_cap`: firmware `hw_cap.bw` includes 40MHz
+  (`hw_bw_cap_to_bitamp`: 0, 6 or 7).
+- The AP's Beacon/Probe Response HT Operation names the pair: secondary
+  channel offset 1/3 with the STA channel width bit, primary equal to the
+  committed primary.
+- Both 20MHz halves are admitted channels: channel 1 or a loadable N2xO
+  record for the secondary (checked over the still base-only gate right
+  after the association retune).
+- Factory bound: every qualified index is at most the BW40 base of the
+  center channel's `rtw_get_channel_group` (`phy.c::
+  rtw_phy_get_2g_tx_power_index`: one stream `bw40_base[group]`; C22 two
+  streams `+ ht_2s_diff.bw40 * 2`; C22 min over both paths, C21 RF-A with
+  txgi factor 1; `ht::factory_limit_bw40{,_2ss}`, `Gate::ht40_limits`).
+- Regulatory (`ht40::policy`, cfg80211 `NO_HT40*` semantics): every rule
+  overlapping the 40MHz span (center +/- 20MHz) is plain and allows 40MHz,
+  one rule covers the span, and every peak plus antenna gain fits the
+  minimum ceiling. This is part of `Gate::current`, `current_in` and every
+  `invoke` once bound, because a 40MHz program has no in-place downgrade.
+
+Association (`station.rs::associate`): with the record present the request
+advertises `SUP_WIDTH_20_40 | DSSSCCK40 | SGI_40` (RX SGI40 always, TX SGI40
+only with the record's SGI40 flag; `ht::Grant::local_wide`,
+`LocalHt::with_dsss_cck40`). An offered 40MHz selection must be exactly the
+record's pair, otherwise the association is refused; a 20MHz offer leaves the
+record unbound. After the HT program, the station binds N2xB and widens
+(`State::widen`) under the native retune owner (`station_width_begin` ->
+`station_retune_finish`): TX refusal, REG_TXPAUSE, drain, then in Linux order
+`rtw_set_channel(center, BW40, sc)` with `sc` `RTW_SC_20_UPPER` (1) when the
+primary is above the center else `RTW_SC_20_LOWER` (2):
+
+- C22 `rtw8822c_set_channel_bb` 2.4GHz BW40: RXAGC CCK 4/OFDM 0, SCOTRK/
+  TXDFIR of the center, CCKSB 0x1a00[4] (sc 1), TXBWCTL 0x9b0 0xf=5, 0xc0=0,
+  0xff00=sc|sc<<4, NBI 0x1abc[30]=1, SBD 1, PT_OPT 0xcbc[21]=1;
+  `rtw_set_channel_mac` DATA_SC 0x483=sc, RFMOD_40M 0x668[7], 80MHz MAC clock;
+  `rtw8822c_set_channel_rf` RF18 BW40 (bit13) on the center, RXBB 0x10 inside
+  the 3-wire reset; `rtw8822c_toggle_igi`; CCK references; `rtw8822c_do_iqk`.
+- C21 `rtw8821c_set_channel_bb` BW40 `set_bw` (RXSB 0xa00[4] for sc 1,
+  ADCCLK 0x8ac `&0xff3ff300 | 0x20020000 | sc<<2 | 1`, ADC160[30]); the 2.4GHz
+  head and `_bb_swing` are channel-independent and stay as programmed; MAC as
+  above; `_rf` RF18 BW40 (bit11) on the center plus the XTALX2 toggle;
+  `_rxdfir` BW40; `rtw8821c_do_iqk`.
+- HT40 TX power: C22 per-path MCS7 reference and per-rate difference words
+  0x3a00.. (layout as the HT20 program), C21 HT words 0x1d0c/0x1d10. Legacy
+  CCK/OFDM indices are unchanged (Linux uses `bw40_base` for OFDM at both
+  widths). Readbacks then check every field; failure is terminal.
+
+The 20MHz `radio::channel_to` writes every field the BW40 branch changes
+(Linux BW20 branch), so a later 20MHz program restores the full 20MHz state.
+After widening, `station_profile_readback` checks the HT40 selection
+(`ht::Grant::readback_at`; C21 RF18 at the center). C21 N21W power tracking
+tracks the HT20 selection and is not loaded at 40MHz.
+
+Data path at 40MHz (`rtw_update_sta_info` with `IEEE80211_STA_RX_BW_40`):
+the association response must negotiate the same pair (`Error::Profile`
+otherwise); `DataProfile::bw40` selects `get_rate_id` BGN_40M_1SS (1) /
+BGN_40M_2SS (0), TX descriptor `W5_DATA_BW` 1 (bits 6:5), SGI = SGI40 from
+the peer's `SGI_40` and the record, RA_INFO `BW_MODE` 1 (bits 25:24) in the
+association and dm RA refreshes; `Gate::allows_profile` admits `bw40` only
+under the live N2xB grant and its MCS/SGI40 set. RX PHY status follows
+`rtw8822c.c::query_phy_status_page1`: C22 RXSC 0 is the current width,
+9..=12 a 40MHz PPDU; packet-core admission accepts 20MHz and 40MHz PPDUs on
+the committed primary (`packet_phy::parse_at`, `Evidence::on_operating`).
+
+2.4GHz 20/40 coexistence: like mac80211 the station trusts the AP's HT
+Operation and does not run OBSS scans or send 20/40 BSS Coexistence frames
+(mac80211 implements neither for a client). If the associated AP's
+Beacon/Probe Response HT Operation stops naming the programmed pair (for
+example the AP fell back to 20MHz), the station drops the connection
+(`Error::PeerLost`) and the SME re-associates at the width the AP now
+operates; mac80211 instead narrows in place (`ieee80211_config_bw`), which
+this owner does not implement. A CSA cannot carry a bound N2xB record and
+drops the connection like the other per-channel programs.
+
+Remaining before physical acceptance: no N2xB record is provisioned for any
+board, so real hardware stays at 20MHz. The PHY-status channel byte at 40MHz
+is assumed to be the primary (Linux passes it to mac80211 as the RX
+frequency, which mac80211 compares with the primary). Four cases are written
+and unexecuted: `smoke_rtw88_ht40_record_pair_factory_and_regulatory_span`,
+`smoke_rtw88_ht40_operation_element_and_phy_status_width`,
+`smoke_rtw88_ht40_descriptor_rate_id_and_profile`,
+`smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs`.
+
 ## 4. Invariants
 
 - Physical reads select Wi-Fi EFUSE bank zero and disable the programming

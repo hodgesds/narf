@@ -508,6 +508,8 @@ fn smoke_rtw8822ce_native_packet_revocation_precedes_cpu_dma_config_and_mmio(
         tracking_maintenance: false,
         tracking_sequence: 3,
         retune: None,
+        widening: false,
+        wide: false,
         channel: 1,
         channel_epoch: 1,
     };

@@ -1181,7 +1181,8 @@ impl Tracker {
             0x40,
             0,
             profile.rate_id() | (u8::from(profile.sgi) << 7),
-            0x48,
+            // DIS_PT | NO_UPDATE | BW_MODE (`si->bw_mode`, N2xB 40MHz).
+            0x48 | u8::from(profile.bw40),
             m[0],
             m[1],
             m[2],

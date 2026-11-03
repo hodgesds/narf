@@ -262,6 +262,9 @@ pub(super) unsafe trait Registers: Send {
     ) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
+    fn station_width_begin(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_retune_iqk(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -578,6 +581,9 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         grant: Option<alloc::sync::Arc<super::qualification::Grant>>,
     ) -> Result<bool, Error> {
         self.io.station_retune_begin(channel, grant)
+    }
+    fn station_width_begin(&mut self) -> Result<bool, Error> {
+        self.io.station_width_begin()
     }
     fn station_retune_iqk(&mut self) -> Result<(), Error> {
         self.io.station_retune_iqk()

@@ -208,19 +208,32 @@ pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
 /// (SCOTRK/TXDFIR per channel, channel14 never admitted), `rtw_set_channel_mac`,
 /// `_rf` (RF18 channel byte) and `rtw8822c_toggle_igi`.
 pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    set_channel(io, ch, None).await
+}
+/// `rtw8822c_set_channel(center, RTW_CHANNEL_WIDTH_40, sc)` on 2.4GHz:
+/// `sc` is `RTW_SC_20_UPPER` (1) or `RTW_SC_20_LOWER` (2).
+pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
+    if !(3..=11).contains(&center) || !matches!(sc, 1 | 2) {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, center, Some(sc)).await
+}
+async fn set_channel(io: &mut impl Io, ch: u8, wide: Option<u8>) -> Result<(), Error> {
     if !(1..=13).contains(&ch) {
         return Err(Error::Unsupported);
     }
+    // rtw8822c_set_channel_bb 2.4GHz: RXAGC CCK/OFDM 5/6 at BW20, 4/0 at BW40.
+    let (cck, ofdm) = if wide.is_some() { (4, 0) } else { (5, 6) };
     for (reg, bits, value) in [
         (0x1a14, 0x300, 0),
         (0x1a9c, 1 << 20, 1),
         (0x454, 1 << 7, 0),
         (0x1a80, 1 << 18, 0),
         (0x1c80, 0x3f000000, 15),
-        (0x18ac, 0xf000, 5),
-        (0x41ac, 0xf000, 5),
-        (0x18ac, 0x1f0, 6),
-        (0x41ac, 0x1f0, 6),
+        (0x18ac, 0xf000, cck),
+        (0x41ac, 0xf000, cck),
+        (0x18ac, 0x1f0, ofdm),
+        (0x41ac, 0x1f0, ofdm),
         (0xc30, 0xfff, super::channel_policy::scotrk(ch)),
         (0x1a20, 0xffff0000, 0x5284),
         (0x1a24, u32::MAX, 0x3e18fec8),
@@ -231,19 +244,42 @@ pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
         (0x1aac, u32::MAX, 0x00122344),
         (0x1ab0, u32::MAX, 0x0fffffff),
         (0x808, 0x70, super::channel_policy::txdfir(ch)),
-        (0x810, 0x3ff0, 0x19b),
-        (0x9b0, 15, 0),
-        (0x9b0, 0xffc0, 0),
-        (0x9b4, 0x700, 7),
-        (0x9b4, 0x700000, 6),
-        (0x1abc, 1 << 30, 0),
-        (0x88c, 0xf000, 1),
-        (0xcbc, 1 << 21, 0),
     ] {
         mask(io, reg, bits, value)?;
     }
-    io.write8(0x483, 0)?;
-    mask(io, 0x668, 0x180, 0)?;
+    match wide {
+        None => {
+            for (reg, bits, value) in [
+                (0x810, 0x3ff0, 0x19b),
+                (0x9b0, 15, 0),
+                (0x9b0, 0xffc0, 0),
+                (0x9b4, 0x700, 7),
+                (0x9b4, 0x700000, 6),
+                (0x1abc, 1 << 30, 0),
+                (0x88c, 0xf000, 1),
+                (0xcbc, 1 << 21, 0),
+            ] {
+                mask(io, reg, bits, value)?;
+            }
+        }
+        Some(sc) => {
+            let sc = u32::from(sc);
+            for (reg, bits, value) in [
+                (0x1a00, 1 << 4, u32::from(sc == 1)),
+                (0x9b0, 15, 5),
+                (0x9b0, 0xc0, 0),
+                (0x9b0, 0xff00, sc | sc << 4),
+                (0x1abc, 1 << 30, 1),
+                (0x88c, 0xf000, 1),
+                (0xcbc, 1 << 21, 1),
+            ] {
+                mask(io, reg, bits, value)?;
+            }
+        }
+    }
+    // rtw_set_channel_mac: DATA_SC txsc20 (txsc40 only at 80MHz), RFMOD.
+    io.write8(0x483, wide.unwrap_or(0))?;
+    mask(io, 0x668, 0x180, u32::from(wide.is_some()))?;
     mask(io, 0x24, 3 << 20, 0)?;
     io.write8(0x55c, 80)?;
     io.write8(0x638, 80)?;
@@ -252,15 +288,17 @@ pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
         return Err(Error::Gone);
     }
     io.write8(0x454, check & !(1 << 7))?;
+    // rtw8822c_set_channel_rf: RF18 BW 20M=bits13:12 3, 40M=bit13; RXBB.
+    let (bw, rxbb) = if wide.is_some() { (2, 0x10) } else { (3, 0x18) };
     let reg18 = (rf_read(io, 0, 0x18)?
         & !((1 << 16) | (1 << 9) | (1 << 8) | 255 | (3 << 17) | (3 << 12)))
         | u32::from(ch)
-        | 3 << 12;
+        | bw << 12;
     mask(io, 0x1c90, 1 << 8, 0)?;
     for path in 0..2 {
         rf(io, path, 0xee, 4, 1).await?;
         rf(io, path, 0x33, 31, 0x12).await?;
-        rf(io, path, 0x3f, 0xfffff, 0x18).await?;
+        rf(io, path, 0x3f, 0xfffff, rxbb).await?;
         rf(io, path, 0xee, 4, 0).await?;
     }
     for path in 0..2 {
@@ -270,6 +308,37 @@ pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
     mask(io, 0x1830, 1 << 29, 1)?;
     mask(io, 0x4130, 1 << 29, 1)?;
     toggle_igi(io)
+}
+/// Readback of [`width40`] plus the per-path CCK references.
+pub(super) fn verify_width40(
+    io: &mut impl Io,
+    center: u8,
+    sc: u8,
+    gains: [u8; 2],
+) -> Result<(), Error> {
+    for (path, gain) in gains.into_iter().enumerate() {
+        if rf_read(io, path as u8, 0x18)? & 0x733ff != 0x2000 | u32::from(center)
+            || (read(io, if path == 0 { 0x18a0 } else { 0x41a0 })? >> 16) & 127 != u32::from(gain)
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    let sc = u32::from(sc);
+    if read(io, 0xc30)? & 0xfff != super::channel_policy::scotrk(center)
+        || (read(io, 0x808)? >> 4) & 7 != super::channel_policy::txdfir(center)
+        || read(io, 0x9b0)? & 0xffcf != 5 | (sc | sc << 4) << 8
+        || (read(io, 0x1a00)? >> 4) & 1 != u32::from(sc == 1)
+        || read(io, 0x1abc)? & (1 << 30) == 0
+        || read(io, 0xcbc)? & (1 << 21) == 0
+        || u32::from(io.read8(0x483)?) != sc
+        || read(io, 0x668)? & 0x180 != 0x80
+        || read(io, 0x18ac)? & 0xf1f0 != 0x4000
+        || read(io, 0x41ac)? & 0xf1f0 != 0x4000
+        || read(io, 0x440)? != 0x1f
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 pub(super) async fn trims(io: &mut impl Io, factory: &Factory) -> Result<(), Error> {
     let t = factory.trims();

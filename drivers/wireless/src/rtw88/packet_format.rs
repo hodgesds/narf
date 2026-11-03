@@ -162,6 +162,10 @@ pub(super) struct DataProfile {
     /// Separately qualified (N2xF) firmware RA fallback: DATA clears
     /// W3 USE_RATE/DISDATAFB.
     pub fallback: bool,
+    /// Separately qualified (N2xB) 40MHz HT DATA: `si->bw_mode` 40, TX
+    /// descriptor W5_DATA_BW 1, RA BW_MODE 1 and BGN_40M rate ids; `sgi`
+    /// then means SGI40.
+    pub bw40: bool,
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
@@ -174,6 +178,7 @@ impl DataProfile {
         stbc: false,
         acs: 0,
         fallback: false,
+        bw40: false,
     };
     pub(super) fn valid(self) -> bool {
         self.rates != 0
@@ -187,6 +192,7 @@ impl DataProfile {
             && (!self.stbc || self.mcs & 0xff00 == 0)
             && self.acs & !(ACS_BK | ACS_VI | ACS_VO) == 0
             && (self.acs == 0 || self.qos)
+            && (!self.bw40 || self.mcs != 0)
     }
     /// The QoS ring for `tid`, if this profile admits it.
     pub(super) fn tid_queue(self, tid: u8) -> Option<Queue> {
@@ -204,9 +210,13 @@ impl DataProfile {
             ..self
         }
     }
+    /// `main.c::get_rate_id`: BGN at BW40 uses BGN_40M_1SS (1) / 2SS (0);
+    /// GN (no CCK) does not depend on the bandwidth.
     pub(super) fn rate_id(self) -> u8 {
         if self.mcs != 0 {
             return match (self.rates & 15 == 0, self.mcs & 0xff00 != 0) {
+                (false, false) if self.bw40 => 1,
+                (false, true) if self.bw40 => 0,
                 (false, false) => 3,
                 (false, true) => 2,
                 (true, false) => 5,
@@ -435,11 +445,13 @@ pub(super) fn transmit_profile(
     );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));
     if ordinary && profile.mcs != 0 {
-        // Source W5_DATA_SHORT bit4, W5_DATA_LDPC bit7, W5_DATA_STBC bits9:8.
+        // Source W5_DATA_SHORT bit4, W5_DATA_BW bits6:5, W5_DATA_LDPC bit7,
+        // W5_DATA_STBC bits9:8.
         put(
             &mut bytes,
             20,
             u32::from(profile.sgi) << 4
+                | u32::from(profile.bw40) << 5
                 | u32::from(profile.ldpc) << 7
                 | u32::from(profile.stbc) << 8,
         );

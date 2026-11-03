@@ -69,6 +69,7 @@ mod functions;
 pub mod fw;
 mod hardware;
 mod ht;
+mod ht40;
 pub mod operating_reset;
 pub use operating_reset::{reset_function, Error as OperatingResetError};
 mod rejoin;

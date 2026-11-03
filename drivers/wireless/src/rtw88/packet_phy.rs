@@ -26,7 +26,12 @@ impl Evidence {
     }
     /// 20MHz CCK/OFDM page on `channel`; C21 reports no channel.
     pub(super) fn on_channel(self, channel: u8) -> bool {
-        self.page <= 1 && self.bandwidth == 0 && self.channel.is_none_or(|c| c == channel)
+        self.on_operating(channel, 0)
+    }
+    /// CCK/OFDM page on primary `channel` no wider than the committed
+    /// `width` (0=20MHz, 1=40MHz under N2xB); C21 reports no channel.
+    pub(super) fn on_operating(self, channel: u8, width: u8) -> bool {
+        self.page <= 1 && self.bandwidth <= width && self.channel.is_none_or(|c| c == channel)
     }
 }
 
@@ -131,6 +136,11 @@ mod tests {
 }
 
 pub(super) fn parse(chip: Chip, rate: u8, bytes: &[u8]) -> Result<Evidence, Error> {
+    parse_at(chip, rate, bytes, 0)
+}
+/// [`parse`] with the committed band width: `query_phy_status_page1` maps
+/// C22 RXSC 0 to `hal.current_band_width`.
+pub(super) fn parse_at(chip: Chip, rate: u8, bytes: &[u8], current: u8) -> Result<Evidence, Error> {
     if bytes.len() != 32 {
         return Err(Error::Length);
     }
@@ -153,8 +163,8 @@ pub(super) fn parse(chip: Chip, rate: u8, bytes: &[u8]) -> Result<Evidence, Erro
                         }
                         mode
                     }
-                    Chip::C22 => 0,
-                }, // retained native owner is fixed20MHz
+                    Chip::C22 => current,
+                },
                 1..=8 => 0,
                 9..=12 => 1,
                 _ => 2,

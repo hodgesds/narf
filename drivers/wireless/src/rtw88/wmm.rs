@@ -98,7 +98,7 @@ pub(super) async fn commit(
     })
 }
 /// Source `fw.c::rtw_fw_send_ra_info`: RATE_ID 20:16, INIT_RA_LVL1, SGI_EN
-/// bit23, LDPC bit26 (`si->ldpc_en`, separately qualified N2xC), DIS_PT bit30.
+/// bit23, BW_MODE 25:24 (N2xB 40MHz), LDPC bit26 (`si->ldpc_en`, separately qualified N2xC), DIS_PT bit30.
 pub(super) async fn ra_info(
     io: &mut impl Io,
     profile: DataProfile,
@@ -111,7 +111,7 @@ pub(super) async fn ra_info(
             0x40,
             0,
             profile.rate_id() | (1 << 5) | (u8::from(profile.sgi) << 7),
-            0x40 | (u8::from(profile.ldpc) << 2),
+            0x40 | (u8::from(profile.ldpc) << 2) | u8::from(profile.bw40),
             rates[0],
             rates[1],
             rates[2],

@@ -48,6 +48,7 @@ pub struct LocalHt {
     tx_greenfield: bool,
     tx_stbc: bool,
     rx_amsdu_7935: bool,
+    dsss_cck40: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -82,6 +83,7 @@ impl LocalHt {
             tx_greenfield: false,
             tx_stbc: false,
             rx_amsdu_7935: false,
+            dsss_cck40: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -105,6 +107,7 @@ impl LocalHt {
             tx_greenfield: false,
             tx_stbc: false,
             rx_amsdu_7935: false,
+            dsss_cck40: false,
         }
     }
     /// Advertised LDPC is a local RX promise. TX coding additionally needs
@@ -142,6 +145,13 @@ impl LocalHt {
         self.rx_amsdu_7935 = enabled;
         self
     }
+    /// Advertise HT Capability Information bit12 (DSSS/CCK Mode in 40MHz),
+    /// as Linux rtw88 `rtw_init_ht_cap` does with `SUP_WIDTH_20_40`. Only a
+    /// 20/40MHz capability may carry it.
+    pub fn with_dsss_cck40(mut self, enabled: bool) -> Self {
+        self.dsss_cck40 = enabled && self.width == HtWidth::TwentyForty;
+        self
+    }
     /// Bound TX rate selection to a subset of actual implemented TX support.
     /// This expresses policy facts only; native power/radio proofs remain
     /// mandatory at every enabling/publication boundary.
@@ -165,6 +175,7 @@ impl LocalHt {
             | (u16::from(self.tx_stbc) << 7)
             | (u16::from(self.rx_stbc) << 8)
             | (u16::from(self.rx_amsdu_7935) << 11)
+            | (u16::from(self.dsss_cck40) << 12)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
             | if self.gi.rx40 { 0x40 } else { 0 };

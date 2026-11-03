@@ -179,6 +179,11 @@ pub(super) struct State {
     /// Block-mode switch done: TX stays blocked until a peer beacon arrives on
     /// the new primary (`mlme.c::ieee80211_chswitch_post_beacon`).
     switch_wait_beacon: bool,
+    /// Bound N2xB HT40 record (identity loaded before the association
+    /// request, bound with the HT program).
+    ht40: Option<(Arc<super::qualification::Grant>, super::ht40::Record)>,
+    /// Hardware runs the N2xB 40MHz pair (`ht40::program` committed).
+    wide: bool,
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -281,6 +286,8 @@ impl State {
             channel: 1,
             rfk_channel: Some(1),
             retuning: false,
+            ht40: None,
+            wide: false,
             switch: None,
             switch_wait_beacon: false,
         }
@@ -571,6 +578,7 @@ impl State {
         self.coding_restore = false;
         self.fallback = None;
         self.qos = None;
+        self.ht40 = None;
         if self.prepared {
             io.packet_stop()?;
         }
@@ -1042,6 +1050,7 @@ impl State {
                                 stbc: false,
                                 acs: 0,
                                 fallback: false,
+                                bw40: false,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -1052,16 +1061,38 @@ impl State {
                                 // Linux rtw88 reads no ht_operation_mode and takes no
                                 // protection action (mac80211.c/tx.c); nonzero HT
                                 // protection modes are admitted unchanged.
-                                if negotiated.width() != association::phy::Width::Twenty {
+                                // The response must keep the programmed width:
+                                // 40MHz exactly on the bound N2xB pair.
+                                let wide = match (negotiated.width(), &self.ht40) {
+                                    (association::phy::Width::Twenty, _) => false,
+                                    (association::phy::Width::Forty, Some((_, r)))
+                                        if negotiated.occupied_channels()
+                                            == [
+                                                r.primary.min(r.secondary),
+                                                r.primary.max(r.secondary),
+                                            ] =>
+                                    {
+                                        true
+                                    }
+                                    _ => return Err(Error::Profile),
+                                };
+                                if wide != self.wide {
                                     return Err(Error::Profile);
                                 }
-                                self.data_profile = h.profile(
-                                    rates,
-                                    u16::from_le_bytes(
-                                        negotiated.ht().tx_mcs()[..2].try_into().unwrap(),
-                                    ),
-                                    negotiated.ht().tx_sgi20(),
-                                )?;
+                                let mcs = u16::from_le_bytes(
+                                    negotiated.ht().tx_mcs()[..2].try_into().unwrap(),
+                                );
+                                self.data_profile = if wide {
+                                    // rtw_update_sta_info: bw_mode 40, SGI from
+                                    // the peer's SGI_40 (and N2xB's SGI40).
+                                    super::packet_format::DataProfile {
+                                        bw40: true,
+                                        sgi: negotiated.ht().tx_sgi40(),
+                                        ..h.profile(rates, mcs, false)?
+                                    }
+                                } else {
+                                    h.profile(rates, mcs, negotiated.ht().tx_sgi20())?
+                                };
                                 if let Some((_, flags)) = &self.coding {
                                     self.data_profile = super::coding::apply(
                                         *flags,
@@ -1496,6 +1527,42 @@ impl State {
         self.retuning = false;
         Ok(())
     }
+    /// `rtw_set_channel(center, BW40, sc)` for the bound N2xB pair, then the
+    /// pre-association IQK and HT40 TX power (`rtw_ops_mgd_prepare_tx`), under
+    /// the retune owner: TX refused, TXPAUSE, drained, readbacks, epoch.
+    /// Failure is terminal like a retune failure.
+    async fn widen(&mut self, io: &mut impl Io, record: &super::ht40::Record) -> Result<(), Error> {
+        if self.phase() != Phase::Passive || record.primary != self.channel {
+            return Err(Error::State);
+        }
+        self.retuning = true;
+        let mut quiet = false;
+        for _ in 0..1000 {
+            if self.admission.run(|| io.station_width_begin())? {
+                quiet = true;
+                break;
+            }
+            self.poll(io)?;
+            self.environment.pause().await;
+        }
+        if !quiet {
+            return Err(Error::Timeout);
+        }
+        self.phase = Phase::Failed;
+        self.rfk_channel = None;
+        let gate = self.admission.run(|| io.station_gate())?;
+        if gate.ht40_record().as_ref() != Some(record) {
+            return Err(Error::State);
+        }
+        super::ht40::program(io, &gate, record).await?;
+        let channel = self.channel;
+        self.admission.run(|| io.station_retune_finish(channel))?;
+        self.rfk_channel = Some(channel);
+        self.wide = true;
+        self.phase = Phase::Passive;
+        self.retuning = false;
+        Ok(())
+    }
     /// mac80211 software CSA receipt (`mlme.c::ieee80211_sta_process_chanswitch`
     /// with emulated channel contexts, which set `CHANCTX_STA_CSA`) for the
     /// associated BSS's own Beacon/Probe Response. Same-channel announcements
@@ -1517,6 +1584,18 @@ impl State {
             // RX already requires the PHY report of the committed primary.
             self.switch_wait_beacon = false;
         }
+        // Associated at 40MHz: an AP HT Operation that no longer names the
+        // programmed pair (e.g. the AP fell back to 20MHz after 20/40 BSS
+        // coexistence) cannot be followed in place; drop the connection like
+        // mac80211 does for a bandwidth change it cannot apply, and the SME
+        // re-associates at the width the AP now operates.
+        if let Some((_, r)) = self.ht40.as_ref().filter(|_| self.wide) {
+            if super::ht40::ht_operation(&bytes[36..])
+                .is_some_and(|op| op != (r.primary, Some(r.secondary)))
+            {
+                return Err(Error::PeerLost);
+            }
+        }
         let Some(ie) = super::channel_policy::switch_ie(&bytes[36..]) else {
             return Ok(());
         };
@@ -1535,7 +1614,8 @@ impl State {
             && self.qos.is_none()
             && self.fallback.is_none()
             && self.tracking.grant.is_none()
-            && self.power_tracking.is_none();
+            && self.power_tracking.is_none()
+            && self.ht40.is_none();
         let channel = ie.channel.ok_or(Error::PeerLost)?;
         if !carried || super::channel_policy::group(channel).is_none() {
             return Err(Error::PeerLost);
@@ -1628,6 +1708,27 @@ impl State {
         // rtw_ops_mgd_prepare_tx: tune to the BSS primary and run RF
         // calibration there unless it is already current.
         self.retune(io, candidate.bss.channel, true).await?;
+        // 2.4GHz HT40 (N2xB): the AP's HT Operation names a secondary whose
+        // 20MHz half is itself an admitted channel (channel 1 or a loadable
+        // N2xO record over the still base-only gate), and the firmware
+        // reports `hw_cap.bw` 40 (`rtw_init_ht_cap`).
+        let secondary = match super::ht40::ht_operation(&candidate.bss.information_elements) {
+            Some((primary, Some(secondary)))
+                if primary == self.channel
+                    && super::ht40::center(primary, secondary).is_some()
+                    && io
+                        .station_ht_facts()
+                        .is_some_and(|f| super::ht40::hardware_allows(f.hardware.bandwidth))
+                    && (secondary == 1
+                        || self
+                            .admission
+                            .run(|| io.station_channel_grant(secondary))?
+                            .is_some()) =>
+            {
+                Some(secondary)
+            }
+            _ => None,
+        };
         // Off channel 1 every program below loads only its own per-channel
         // record over the channel-scoped base (`channel_policy::scope_request`);
         // absent records leave the base legacy CCK1 profile.
@@ -1666,24 +1767,59 @@ impl State {
             None => None,
         };
         let flags = coding.as_ref().map_or(0, |c| c.1);
-        let mut plan = match &proposed {
-            Some(h) => JoinPlan::prepare_with_phy(
+        // N2xB HT40 needs the HT program (same MCS set), this primary and the
+        // AP's admitted secondary. Identity only here, like N2xC.
+        let ht40 = match (&proposed, secondary) {
+            (Some(h), Some(secondary)) => {
+                io.station_continuation(&super::ht40::KIND)?.and_then(|g| {
+                    let gate = io.station_gate().ok()?;
+                    let r = super::ht40::Record::decode(gate.did(), g.payload())?;
+                    (g.matches(&gate)
+                        && r.primary == self.channel
+                        && r.secondary == secondary
+                        && r.mcs == h.mcs())
+                    .then_some((g, r))
+                })
+            }
+            _ => None,
+        };
+        let mut plan = match (&proposed, &ht40) {
+            (Some(h), Some((_, r))) => JoinPlan::prepare_with_phy(
+                &candidate.bss,
+                self.own,
+                ssid,
+                mode,
+                h.local_wide(flags, r.sgi),
+            )?,
+            (Some(h), None) => JoinPlan::prepare_with_phy(
                 &candidate.bss,
                 self.own,
                 ssid,
                 mode,
                 h.local_coded(flags),
             )?,
-            None => JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?,
+            (None, _) => JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?,
         };
         let ht = proposed.filter(|_| plan.offered_phy().is_some());
         // Upstream rtw88 takes no HT protection-mode action (ht_protection_modes).
-        if plan
+        // 40MHz only as the exact N2xB pair.
+        let wide = match plan
             .offered_phy()
-            .is_some_and(|p| p.width() != association::phy::Width::Twenty)
+            .map(|p| (p.width(), p.occupied_channels()))
         {
-            return Err(Error::Profile);
-        }
+            None | Some((association::phy::Width::Twenty, _)) => false,
+            Some((association::phy::Width::Forty, channels)) => match &ht40 {
+                Some((_, r))
+                    if ht.is_some()
+                        && channels == [r.primary.min(r.secondary), r.primary.max(r.secondary)] =>
+                {
+                    true
+                }
+                _ => return Err(Error::Profile),
+            },
+            Some(_) => return Err(Error::Profile),
+        };
+        let ht40 = ht40.filter(|_| wide);
         plan.append_sme_ies(ies)?;
         if let Some(pmk) = pmk {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
@@ -1756,6 +1892,12 @@ impl State {
                 }
             }
             h.program(io, &self.admission).await?;
+            if let Some((g, r)) = ht40 {
+                self.admission
+                    .run(|| io.station_bind_continuation(g.clone()))?;
+                self.widen(io, &r).await?;
+                self.ht40 = Some((g, r));
+            }
             // RX may arrive at negotiated HT rates immediately after the AP's
             // association response, before the awaited native peer commit.
             // The native RX bound is the locally advertised MCS0..7, whereas
@@ -1793,7 +1935,9 @@ impl State {
             .facts
             .filter(|f| f.did == 0xc821 && f.power_track_type == 0 && f.thermal[0] <= 63)
         {
-            if self.ht.is_some() {
+            // N21W tracks the HT20 TXAGC selection; it is not qualified for
+            // the N2xB HT40 selection, so a 40MHz association runs without it.
+            if self.ht.is_some() && self.ht40.is_none() {
                 if let Some(g) = io.station_power_tracking_extension(
                     facts.thermal[0],
                     self.tracking.grant.clone(),

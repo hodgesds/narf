@@ -85,6 +85,7 @@ pub(super) struct Envelope {
     group_limits: [Option<[u8; 2]>; 5],
     /// HT20 1S factory ceilings per channel group (`bw40_base[group]`).
     ht_groups: [Option<u8>; 5],
+    ht40_groups: [Option<u8>; 5],
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
     group_limits(factory, 0) // C21 factor1, channel1 group0, max_power_index0x3f.
@@ -165,6 +166,11 @@ impl Source {
                     .power_path(path)
                     .and_then(|p| super::ht::factory_limit_group(p, g, 1, 63))
             });
+            e.ht40_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_bw40(p, g, 63))
+            });
             e
         })
     }
@@ -178,6 +184,10 @@ impl Envelope {
     }
     pub(super) fn ht_group(&self, group: usize) -> Option<u8> {
         self.ht_groups.get(group).copied().flatten()
+    }
+    /// Factory HT40 1S index ceiling (`bw40_base[group]`, txgi factor 1).
+    pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
+        self.ht40_groups.get(group).copied().flatten()
     }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         Some(super::ht::Facts {
@@ -259,6 +269,7 @@ impl Envelope {
             factory_limits: limits,
             group_limits: [None; 5],
             ht_groups: [None; 5],
+            ht40_groups: [None; 5],
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {

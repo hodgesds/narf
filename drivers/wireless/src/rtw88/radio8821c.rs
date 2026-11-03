@@ -33,9 +33,27 @@ pub(super) fn operating_readback(
     operating_readback_ht(read, indices, [0; 8])
 }
 pub(super) fn operating_readback_ht(
+    read: impl FnMut(u16) -> Result<u32, Error>,
+    indices: [u8; 12],
+    mcs: [u8; 8],
+) -> Result<(), Error> {
+    operating_readback_rf18(read, indices, mcs, 0xc01)
+}
+/// [`operating_readback_ht`] at the N2xB 40MHz pair: HT words are the HT40
+/// selection and RF18 is BW40 (bit11) on the center channel.
+pub(super) fn operating_readback_wide(
+    read: impl FnMut(u16) -> Result<u32, Error>,
+    indices: [u8; 12],
+    mcs: [u8; 8],
+    center: u8,
+) -> Result<(), Error> {
+    operating_readback_rf18(read, indices, mcs, 0x800 | u32::from(center))
+}
+fn operating_readback_rf18(
     mut read: impl FnMut(u16) -> Result<u32, Error>,
     indices: [u8; 12],
     mcs: [u8; 8],
+    rf18: u32,
 ) -> Result<(), Error> {
     for (slot, reg) in TXAGC.into_iter().enumerate() {
         let expected = if slot < 3 {
@@ -57,7 +75,7 @@ pub(super) fn operating_readback_ht(
             return Err(Error::Prerequisite);
         }
     }
-    if read(0x2860)? & 0x70fff != 0xc01
+    if read(0x2860)? & 0x70fff != rf18
         || read(0x2820)? & 0xfffff != 0
         || read(0x1bf0)? & 0x100ff != 0
         || read(0x100)? & 0x200 != 0
@@ -222,6 +240,68 @@ pub(super) async fn retune_channel(io: &mut impl Io, ch: u8) -> Result<(), Error
     rf(io, 0x18, 0xfffff, rf18).await?;
     rf(io, 0xb8, 1 << 19, 0).await?;
     rf(io, 0xb8, 1 << 19, 1).await
+}
+/// `rtw8821c_set_channel(center, RTW_CHANNEL_WIDTH_40, sc)` on the retained
+/// non-SRRC C21. The 2.4GHz `_bb` head and `_bb_swing` are identical for
+/// every 2.4GHz channel (left as programmed); the BW40 `set_bw` branch
+/// (RXSB bit4 for `RTW_SC_20_UPPER`, ADCCLK, ADC160), `rtw_set_channel_mac`
+/// (DATA_SC, RFMOD_40M), `_rf` (RF18 BW40 bit11 + center, XTALX2 toggle)
+/// and `_rxdfir` BW40 run.
+pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
+    if !(3..=11).contains(&center) || !matches!(sc, 1 | 2) {
+        return Err(Error::Unsupported);
+    }
+    mask(io, 0xa00, 1 << 4, u32::from(sc == 1))?;
+    let adc = read(io, 0x8ac)?;
+    io.write32(
+        0x8ac,
+        (adc & 0xff3ff300) | 0x20020000 | u32::from(sc) << 2 | 1,
+    )?;
+    mask(io, 0x8c4, 1 << 30, 1)?;
+    io.write8(0x483, sc)?;
+    mask(io, 0x668, 0x180, 1)?;
+    mask(io, 0x24, 3 << 20, 0)?;
+    io.write8(0x55c, 80)?;
+    io.write8(0x638, 80)?;
+    let cck = io.read8(0x454)?;
+    if cck == 255 {
+        return Err(Error::Gone);
+    }
+    io.write8(0x454, cck & !0x80)?;
+    let rf18 = (rf_read(io, 0x18)? & !0x70fff) | 0x800 | u32::from(center);
+    rf(io, 0xdf, 1 << 6, 1).await?;
+    rf(io, 0x64, 15, 15).await?;
+    rf(io, 0x18, 0xfffff, rf18).await?;
+    rf(io, 0xb8, 1 << 19, 0).await?;
+    rf(io, 0xb8, 1 << 19, 1).await?;
+    for (reg, bits, value) in [
+        (0x948, 3 << 28, 2),
+        (0x94c, 3 << 28, 2),
+        (0xc20, 1 << 31, 0),
+        (0x8f0, 1 << 31, 0),
+    ] {
+        mask(io, reg, bits, value)?;
+    }
+    Ok(())
+}
+/// Readback of [`width40`].
+pub(super) fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
+    if rf_read(io, 0x18)? & 0x70fff != 0x800 | u32::from(center)
+        || (read(io, 0xa00)? >> 4) & 1 != u32::from(sc == 1)
+        || read(io, 0x8ac)? & (!0xff3ff300 | 0x20020000) != 0x20020000 | u32::from(sc) << 2 | 1
+        || read(io, 0x8c4)? & (1 << 30) == 0
+        || io.read8(0x483)? != sc
+        || read(io, 0x668)? & 0x180 != 0x80
+        || read(io, 0x948)? & (3 << 28) != 2 << 28
+        || read(io, 0x94c)? & (3 << 28) != 2 << 28
+        || read(io, 0xc20)? & (1 << 31) != 0
+        || read(io, 0x8f0)? & (1 << 31) != 0
+        || read(io, 0x440)? != 0x1f
+        || read(io, 0x1bf0)? & 0x100ff != 0
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 /// `rtw8821c_set_tx_power_index_by_rate` for the retained CCK/OFDM words;
 /// HT/VHT words stay zero (no HT program on a noninitial channel).
