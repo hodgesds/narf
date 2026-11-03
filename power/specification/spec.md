@@ -357,9 +357,13 @@ CPU never loses power — execution stays in the caller's frame), no TSC
 snapshot, no `\_PTS` / FACS / PM1 write. The platform step masks every IRQ
 vector except the wake allowlist (`wake_irq_allowlist()`: the vector the
 platform installed the ACPI SCI handler on, recorded in `narf_acpi` by the
-install path — not a FADT-derived value) and
+install path — not a FADT-derived value — plus every driver line armed with
+`narf_interrupts::wake::enable_irq_wake`, Linux's `IRQD_WAKEUP_ARMED` lines
+left enabled by `suspend_device_irqs`) and
 parks via `narf_arch::idle_halt_then_disable` until a wake source latches an
-event with `note_wake_event`. An unarmed request walks the phases and returns
+event with `note_wake_event`, or an armed driver line fires inside the
+`narf_interrupts::wake::set_suspend_window` the park holds open
+(`wake_event_pending()` also reads `narf_interrupts::wake::wakeup_pending()`). An unarmed request walks the phases and returns
 `NotImplemented`, exactly like unarmed S3.
 
 Platform scope: the s2idle park is x86_64-only today. No aarch64 wake source

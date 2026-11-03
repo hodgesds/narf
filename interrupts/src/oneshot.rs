@@ -22,7 +22,7 @@
 //! and is delivered on unmask.
 use crate::dispatch::{self, IrqStatus};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +47,10 @@ struct State {
     /// never race a delivery that has just masked the line.
     masked: IrqSafeSpinLock<bool>,
     fires: AtomicU64,
+    /// Dispatch vector, for the wake-delivery check.
+    vector: u8,
+    /// This owner armed the line for system wake ([`Line::set_wake`]).
+    wake: AtomicBool,
 }
 
 /// An exclusively owned oneshot INTx line. Dropping it masks the route,
@@ -98,6 +102,7 @@ fn handler(cookie: u64) -> IrqStatus {
         *masked = true;
     }
     state.fires.fetch_add(1, Ordering::AcqRel);
+    crate::wake::note_delivery(state.vector);
     (state.notify)();
     IrqStatus::Handled
 }
@@ -131,6 +136,8 @@ impl Line {
                 notify,
                 masked: IrqSafeSpinLock::new(true),
                 fires: AtomicU64::new(0),
+                vector,
+                wake: AtomicBool::new(false),
             });
             let cookie = Arc::as_ptr(&state) as u64;
             dispatch::install_handler_named(vector, name, cookie, handler);
@@ -179,6 +186,8 @@ impl Line {
                 notify,
                 masked: IrqSafeSpinLock::new(true),
                 fires: AtomicU64::new(0),
+                vector,
+                wake: AtomicBool::new(false),
             });
             // configure_spi enables the line; mask before the handler exists.
             if gic::configure_spi(intid, SpiTrigger::Level).is_err()
@@ -225,6 +234,25 @@ impl Line {
     pub fn vector(&self) -> u8 {
         self.vector
     }
+    /// Linux `enable_irq_wake`/`disable_irq_wake` for this line (one wake
+    /// user per owner; repeated calls are idempotent). An armed line stays
+    /// unmasked across the system-PM owner's suspend window and its
+    /// delivery there is a system wakeup (`crate::wake`).
+    pub fn set_wake(&self, on: bool) -> Result<(), crate::wake::WakeError> {
+        if self.state.wake.load(Ordering::Acquire) == on {
+            return Ok(());
+        }
+        if on {
+            crate::wake::enable_irq_wake(self.vector)?;
+        } else {
+            crate::wake::disable_irq_wake(self.vector)?;
+        }
+        self.state.wake.store(on, Ordering::Release);
+        Ok(())
+    }
+    pub fn wake_armed(&self) -> bool {
+        self.state.wake.load(Ordering::Acquire)
+    }
     /// Run the hard half exactly as dispatch would (tests and diagnostics).
     pub fn deliver_for_test(&self) -> IrqStatus {
         handler(Arc::as_ptr(&self.state) as u64)
@@ -232,6 +260,8 @@ impl Line {
 }
 impl Drop for Line {
     fn drop(&mut self) {
+        // A retired owner leaves no wake user behind on a reused vector.
+        let _ = self.set_wake(false);
         #[cfg(target_arch = "aarch64")]
         let _ = crate::aarch64::gic::mask_spi(self.state.source);
         #[cfg(target_arch = "x86_64")]

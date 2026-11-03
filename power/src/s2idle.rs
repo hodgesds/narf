@@ -228,7 +228,9 @@ pub fn note_wake_event(source: WakeSource) {
 
 /// Whether a wake event is latched and not yet consumed by a park.
 pub fn wake_event_pending() -> bool {
-    WAKE_LATCH.load(Ordering::Acquire) || crate::pci_wake::wake_event_pending()
+    WAKE_LATCH.load(Ordering::Acquire)
+        || crate::pci_wake::wake_event_pending()
+        || narf_interrupts::wake::wakeup_pending()
 }
 
 /// The most recent source passed to [`note_wake_event`], if any.
@@ -263,16 +265,17 @@ pub fn last_wake_source() -> Option<WakeSource> {
 /// guess; the park then relies on the latch alone, which a test or
 /// a future non-ACPI source can still set.
 pub fn wake_irq_allowlist() -> Vec<u8> {
+    // Driver lines armed with `enable_irq_wake` (Linux keeps
+    // `IRQD_WAKEUP_ARMED` lines enabled across `suspend_device_irqs`).
+    #[allow(unused_mut)]
+    let mut v = narf_interrupts::wake::armed_vectors();
     #[cfg(target_arch = "x86_64")]
-    {
-        let mut v = Vec::new();
-        if let Some(vector) = narf_acpi::sci_vector() {
+    if let Some(vector) = narf_acpi::sci_vector() {
+        if !v.contains(&vector) {
             v.push(vector);
         }
-        v
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    Vec::new()
+    v
 }
 
 // ── Park statistics ─────────────────────────────────────────────────
@@ -509,8 +512,12 @@ fn s2idle_after_claim(
     // wake owner's retained evidence, which wake_event_pending also checks
     // until terminal route cleanup; this clear cannot erase that event.
     WAKE_LATCH.store(false, Ordering::Release);
+    // Armed driver lines latch a wakeup only inside this window
+    // (Linux `suspend_device_irqs` .. `resume_device_irqs`).
+    narf_interrupts::wake::set_suspend_window(true);
     STAT_PARKS.fetch_add(1, Ordering::Relaxed);
     let exit = park(max_halts);
+    narf_interrupts::wake::set_suspend_window(false);
     STAT_LAST_EXIT.store(exit as u8, Ordering::Release);
     if exit == ParkExit::WakeEvent {
         STAT_WAKES.fetch_add(1, Ordering::Relaxed);
