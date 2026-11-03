@@ -10488,7 +10488,10 @@ paths; only the tables differ.
 - Submission (`amdgpu_cs`): a card registers a `Submitter`
   (`register_submitter`); on such a card the `/dev/dri` ioctl route
   (`dispatch_async`, for card and render nodes) queues a validated
-  `AMDGPU_CS` and returns the engine's sequence as the handle, and
+  `AMDGPU_CS` and returns the engine's sequence as the handle (an IB's
+  `Ib::va_start` is hole-stripped for VM lookups; every IB packet carries
+  `amdgpu_vm::sign_extend(va_start)`, as Linux emits `ib->gpu_addr`, since
+  the CP rejects an in-hole address with `CP_GFX_ERROR.SUA_ERROR`), and
   `AMDGPU_WAIT_CS` parks until it completes or the client's absolute
   monotonic deadline passes (status 0/1; a negative s64 deadline waits
   forever, `amdgpu_gem_timeout`). Every `drm_amdgpu_fence`-shaped handle

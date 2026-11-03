@@ -1454,3 +1454,78 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_kernel_sdma_fill_copy_and_validation
 );
+
+/// Mesa places IBs in the high half (`0xffff_8xxx_xxxx_xxxx`). VM lookups use
+/// the hole-stripped address, but the packet must carry the sign-extended
+/// one, as Linux emits `ib->gpu_addr = chunk_ib->va_start`: the CP raises
+/// `CP_GFX_ERROR.SUA_ERROR` on a stripped `0x0000_8xxx` (in-hole) address
+/// and never fetches the IB (RX 6750 XT, first client GFX job).
+fn navi22_high_half_ib_is_emitted_sign_extended() -> TestResult {
+    let l = crate::amdgpu_cp_navi22::tests::layout();
+    const CLIENT: u64 = 0xffff_8001_0021_8000;
+    let client = crate::amdgpu_cs::Ib {
+        va_start: crate::amdgpu_vm::strip_hole(CLIENT),
+        length_dw: 0xe0,
+        ip_type: 0,
+        ip_instance: 0,
+        ring: 0,
+        flags: 0,
+    };
+    let ib = Ib::from(&client);
+    if ib.va != 0x0000_8001_0021_8000 || ib.gpu_addr() != CLIENT {
+        return TestResult::Fail("stripped lookup address or sign-extended packet address wrong");
+    }
+    let low = Ib {
+        va: IB_VA,
+        dwords: 4,
+        flags: 0,
+    };
+    if low.gpu_addr() != IB_VA {
+        return TestResult::Fail("low-half address changed by sign extension");
+    }
+    let ibs = [ib];
+    let frame = Frame {
+        gfx: true,
+        engine: 0,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    let cp = encode_cp(l, &frame);
+    let Some(at) = cp
+        .iter()
+        .position(|&w| w == packet3(PACKET3_INDIRECT_BUFFER, 2))
+    else {
+        return TestResult::Fail("no INDIRECT_BUFFER");
+    };
+    if cp[at + 1] != 0x0021_8000 || cp[at + 2] != 0xffff_8001 {
+        return TestResult::Fail("gfx INDIRECT_BUFFER carries a stripped (in-hole) address");
+    }
+    let sdma = encode_sdma(
+        l,
+        &Frame {
+            gfx: false,
+            engine: 4,
+            ..frame
+        },
+    );
+    let Some(at) = sdma.iter().position(|&w| w == 4 | u32::from(VMID) << 16) else {
+        return TestResult::Fail("no SDMA INDIRECT");
+    };
+    if sdma[at + 1] != 0x0021_8000 || sdma[at + 2] != 0xffff_8001 {
+        return TestResult::Fail("SDMA INDIRECT carries a stripped (in-hole) address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_high_half_ib_is_emitted_sign_extended
+);

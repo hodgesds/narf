@@ -174,7 +174,7 @@ impl Submitter {
             }
             let mut addresses = [(0, 0); queues::MAX_JOB_IBS];
             for (slot, ib) in addresses.iter_mut().zip(ibs) {
-                *slot = (ib.va_start, ib.length_dw);
+                *slot = (crate::amdgpu_vm::sign_extend(ib.va_start), ib.length_dw);
             }
             queues::Job::new(0, pasid, pd_addr, &addresses[..ibs.len()]).ok_or(FsError::InvalidData)
         };

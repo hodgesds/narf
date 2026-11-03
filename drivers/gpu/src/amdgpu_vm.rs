@@ -449,6 +449,20 @@ pub const fn strip_hole(va: u64) -> u64 {
     va & GMC_HOLE_MASK
 }
 
+/// `amdgpu_gmc_sign_extend`: the canonical form of a [`strip_hole`]d
+/// address. Linux emits client IB addresses as the client gave them
+/// (`ib->gpu_addr = chunk_ib->va_start`), sign-extended above the hole; the
+/// CP treats a stripped high-half address (`0x0000_8xxx_xxxx_xxxx`, inside
+/// the hole) as outside the unified address space and raises
+/// `CP_GFX_ERROR.SUA_ERROR` without fetching it.
+pub const fn sign_extend(va: u64) -> u64 {
+    if va >= GMC_HOLE_START {
+        va | GMC_HOLE_END
+    } else {
+        va
+    }
+}
+
 // ── PTE composition ────────────────────────────────────────────────────
 
 /// Base flags for a mapping, before the per-request refinement.

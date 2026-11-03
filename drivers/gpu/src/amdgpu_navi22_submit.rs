@@ -122,6 +122,13 @@ pub struct Ib {
     /// Preserve the client's requests through the native queue adapter.
     pub flags: u32,
 }
+impl Ib {
+    /// The address an IB packet carries: [`Ib::va`] (hole stripped, for VM
+    /// lookups) sign-extended back, as Linux emits `ib->gpu_addr`.
+    pub fn gpu_addr(&self) -> u64 {
+        crate::amdgpu_vm::sign_extend(self.va)
+    }
+}
 impl From<&crate::amdgpu_cs::Ib> for Ib {
     fn from(ib: &crate::amdgpu_cs::Ib) -> Self {
         Self {
@@ -506,8 +513,8 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
         let control = ib.dwords | (u32::from(vmid) << 24) | if gfx { 0 } else { 1 << 23 };
         w.extend([
             packet3(PACKET3_INDIRECT_BUFFER, 2),
-            ib.va as u32,
-            (ib.va >> 32) as u32,
+            ib.gpu_addr() as u32,
+            (ib.gpu_addr() >> 32) as u32,
             control,
         ]);
     }
@@ -587,8 +594,8 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
         w.resize(w.len() + pad, pm4::SDMA_NOP);
         w.extend([
             4 | (u32::from(f.vmid & 0xf) << 16),
-            ib.va as u32 & !0x1f,
-            (ib.va >> 32) as u32,
+            ib.gpu_addr() as u32 & !0x1f,
+            (ib.gpu_addr() >> 32) as u32,
             ib.dwords,
             0,
             0,
@@ -967,7 +974,7 @@ pub(crate) fn encode_media(f: &MediaFrame<'_>) -> Vec<u32> {
     media_start(f.ring, &mut w);
     let vmid = u32::from(f.vmid);
     for ib in f.ibs {
-        let (low, high) = (ib.va as u32, (ib.va >> 32) as u32);
+        let (low, high) = (ib.gpu_addr() as u32, (ib.gpu_addr() >> 32) as u32);
         match f.ring {
             MediaRing::Dec => {
                 use crate::amdgpu_vcn_navi22::cmd::*;
