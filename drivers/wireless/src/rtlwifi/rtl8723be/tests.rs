@@ -62,6 +62,11 @@ fn provisioned() -> Vec<u8> {
     map[0xc1] = 0xf9;
     map[0xc3] = 0x41;
     map[0xc5] = 0x00;
+    // Synthetic path-A power area (not any board's values): six CCK
+    // bases, five BW40 bases, then bw20/ofdm diff 0xf2 (-1 / +2).
+    map[0x10..0x1c].copy_from_slice(&[
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0xf2,
+    ]);
     map
 }
 
@@ -779,12 +784,15 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
     else {
         return TestResult::Fail("adapter");
     };
+    let Ok(efuse) = txpower::Efuse::from_logical(&map) else {
+        return TestResult::Fail("power area");
+    };
     for hp in [false, true] {
         if hp {
             a.oem = adapter::Oem::Hp;
         }
         let io = fw_fake(true, true, false);
-        let radio = match narf_scheduler::block_on(init::configure(&io, &a)) {
+        let radio = match narf_scheduler::block_on(init::configure(&io, &a, efuse)) {
             Ok(r) => r,
             Err(_) => return TestResult::Fail("8723BE configure failed"),
         };
@@ -831,7 +839,7 @@ fn smoke_rtl8723be_mac_bb_rf_config() -> TestResult {
         return TestResult::Fail("adapter");
     };
     let io = fw_fake(true, true, false);
-    if narf_scheduler::block_on(init::configure(&io, &aux)).is_err()
+    if narf_scheduler::block_on(init::configure(&io, &aux, efuse)).is_err()
         || !io.0.lock().writes.contains(&(0x948, 0, 4))
     {
         return TestResult::Fail("8723BE ANT_AUX 0x948 write");
@@ -944,4 +952,247 @@ fn smoke_rtl8723be_rfpath_lck_bandwidth_and_channel() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_rfpath_lck_bandwidth_and_channel
+);
+
+/// `_rtl8723be_read_power_value_fromprom` path A (4-bit sign extension,
+/// `0xff` defaults, the `0x11 == 0xff` refusal), the PHY_REG_PG by-rate
+/// store with BCD bases and absolute relative values, the
+/// `_rtl8723be_get_txpower_index` sums / regulatory-2 / clamp, and the
+/// `_rtl8723be_phy_set_txpower_index` byte lanes.
+fn smoke_rtl8723be_txpower_efuse_by_rate_and_level() -> TestResult {
+    use txpower::*;
+    let mut map = provisioned();
+    let Ok(e) = Efuse::from_logical(&map) else {
+        return TestResult::Fail("power area refused");
+    };
+    if e.cck_base != [0x20, 0x21, 0x22, 0x23, 0x24, 0x25]
+        || e.bw40_base != [0x18, 0x19, 0x1a, 0x1b, 0x1c]
+        || e.ht20_diff != 0xff
+        || e.legacy_ht_diff != 0x02
+        || e.ht40_diff != 0
+        || e.cck(2) != 0x20
+        || e.cck(3) != 0x21
+        || e.ht40_1s(9) != 0x1a
+        || e.ht40_1s(14) != 0x1a
+    {
+        return TestResult::Fail("8723BE EFUSE power decode");
+    }
+    map[0x1b] = 0xff;
+    map[0x12] = 0xff;
+    match Efuse::from_logical(&map) {
+        Ok(d) if d.ht20_diff == 2 && d.legacy_ht_diff == 4 && d.cck_base[2] == 0x2d => {}
+        _ => return TestResult::Fail("8723BE 0xff power defaults"),
+    }
+    map[0x11] = 0xff;
+    if Efuse::from_logical(&map).is_ok() {
+        return TestResult::Fail("autoload-fail power branch admitted");
+    }
+    let b = ByRate::from_table();
+    if b.offset[0][..6]
+        != [
+            0x0c0e_1010,
+            0x0004_080a,
+            0x0000_0600,
+            0x0002_0400,
+            0x0c0e_1012,
+            0x0004_080a,
+        ]
+        || b.offset[1][6..8] != [0, 0]
+    {
+        return TestResult::Fail("8723BE by-rate store");
+    }
+    let diffs: Vec<u8> = RATES.iter().map(|r| b.diff(*r)).collect();
+    if diffs
+        != [
+            6, 4, 2, 0, 0x10, 0x10, 0x0e, 0x0c, 0x0a, 8, 4, 0, 0x12, 0x10, 0x0e, 0x0c, 0x0a, 8, 4,
+            0,
+        ]
+    {
+        return TestResult::Fail("8723BE by-rate diffs");
+    }
+    if index(&e, &b, 0, 0, false, 6) != 0x27
+        || index(&e, &b, 0, 3, false, 6) != 0x21
+        || index(&e, &b, 0, 4, false, 6) != 0x2b
+        || index(&e, &b, 0, 11, false, 6) != 0x1b
+        || index(&e, &b, 0, 12, false, 6) != 0x2a
+        || index(&e, &b, 0, 19, false, 6) != 0x18
+        || index(&e, &b, 0, 12, true, 6) != 0x2b
+        || index(&e, &b, 2, 12, false, 6) != 0x18
+    {
+        return TestResult::Fail("8723BE txpower index");
+    }
+    let mut hot = e;
+    hot.bw40_base = [0x3e; 5];
+    if index(&hot, &b, 0, 4, false, 6) != MAX_POWER_INDEX {
+        return TestResult::Fail("8723BE MAX_POWER_INDEX clamp");
+    }
+    let io = fw_fake(true, true, false);
+    if set_level(&io, &e, &b, 0, false, 6).is_err() {
+        return TestResult::Fail("set_level failed");
+    }
+    let g = io.0.lock();
+    let r32 =
+        |r: usize| u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]]);
+    if r32(0xe08) != 0x2700
+        || r32(0x86c) != 0x2123_2500
+        || r32(0xe00) != 0x2729_2b2b
+        || r32(0xe04) != 0x1b1f_2325
+        || r32(0xe10) != 0x2426_282a
+        || r32(0xe14) != 0x181c_2022
+        || g.writes.iter().any(|w| w.0 == 0xe18 || w.0 == 0xe1c)
+    {
+        return TestResult::Fail("8723BE TXAGC byte lanes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_txpower_efuse_by_rate_and_level
+);
+
+/// `_rtl8723be_phy_simularity_compare` (signed odd entries, tolerance 5,
+/// the zero-sum `i == 2` candidate copying entries 0..2, per-section
+/// `result[3]` copies) and a full `rtl8723be_phy_iq_calibrate` on the model:
+/// `0x948` restored, MAC/ADDA/BB backups reloaded from `t == 1`, tone resets,
+/// candidate 0 with an all-zero matrix and no fill.
+fn smoke_rtl8723be_iqk_compare_and_full_run() -> TestResult {
+    use iqk::*;
+    let mut r = [[0u32; 8]; 4];
+    r[0] = [0x100, 0x3fe, 0x0f0, 0x005, 0, 0, 0, 0];
+    r[1] = [0x102, 0x001, 0x0f3, 0x003, 0, 0, 0, 0];
+    if !simularity_compare(&mut r, 0, 1) || r[3] != [0; 8] {
+        return TestResult::Fail("similar runs");
+    }
+    r[1][0] = 0x110;
+    if simularity_compare(&mut r, 0, 1) || r[3][..4] != [0, 0, 0x0f0, 0x005] {
+        return TestResult::Fail("TX mismatch keeps RX of c1");
+    }
+    let mut z = [[0u32; 8]; 4];
+    z[0] = [0x100, 0x000, 0, 0, 0, 0, 0, 0];
+    z[1] = [0x101, 0x000, 0x0f0, 0x000, 0, 0, 0, 0];
+    if simularity_compare(&mut z, 0, 1) || z[3][..2] != [0x101, 0] {
+        return TestResult::Fail("zero-sum candidate copy");
+    }
+    let io = fw_fake(true, true, false);
+    {
+        let mut g = io.0.lock();
+        g.regs[0x948..0x94c].copy_from_slice(&0x280u32.to_le_bytes());
+        g.regs[0x522] = 0x5a;
+        g.regs[0x85c..0x860].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        g.regs[0xc50] = 0x20;
+    }
+    let report = match narf_scheduler::block_on(calibrate(&io)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IQK run failed"),
+    };
+    let g = io.0.lock();
+    let r32 =
+        |r: usize| u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]]);
+    if report.final_candidate != 0
+        || report.matrix != Some([0; 8])
+        || report.reg_e94 != 0
+        || r32(0x948) != 0x280
+        || g.regs[0x522] != 0x5a
+        || r32(0x85c) != 0x1234_5678
+        || g.regs[0xc50] != 0x20
+        || !g.writes.contains(&(0xc50, 0x50, 4))
+        || r32(0xe30) != 0x0100_8c00
+        || r32(0xe28) != 0
+        || !g.writes.contains(&(0x85c, 0x01c0_0014, 4))
+        || !g.writes.contains(&(0x948, 0x280, 4))
+        || g.writes.iter().any(|w| w.0 == 0xc80 || w.0 == 0xc88)
+    {
+        return TestResult::Fail("8723BE IQK run restore");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_iqk_compare_and_full_run
+);
+
+/// `rtl8723be_hw_init` `ERFON` block: rfpath main, IQK only on `ANT_X2`,
+/// LCK, `NAV_UPPER = 235`, the `RXDMA_CONTROL` BIT2 release; `PCIE_CTRL + 1`
+/// stays untouched. Then a [`channel::Grant`] bounded by the Linux index
+/// and `channel::configure` (TXAGC, RF channel, bandwidth).
+fn smoke_rtl8723be_erfon_block_and_channel_grant() -> TestResult {
+    let v = match Version::from_registers(version::CHIP_8723B, 0x1000) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("version"),
+    };
+    let mut map = provisioned();
+    let Ok(efuse) = txpower::Efuse::from_logical(&map) else {
+        return TestResult::Fail("power area");
+    };
+    for (c3, iqk) in [(0x00u8, true), (0x01, false)] {
+        map[0xc3] = c3;
+        let Ok(a) = adapter::Adapter::from_hardware(v, adapter::CR9346_AUTOLOAD_OK, 0, &map, 5)
+        else {
+            return TestResult::Fail("adapter");
+        };
+        let io = fw_fake(true, true, false);
+        io.0.lock().regs[usize::from(init::REG_RXDMA_CONTROL)] = 0x06;
+        let radio = match narf_scheduler::block_on(init::configure(&io, &a, efuse)) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("8723BE configure failed"),
+        };
+        let g = io.0.lock();
+        let w = |row: (u16, u32, u8)| g.writes.iter().position(|x| *x == row);
+        let (Some(mac), Some(path), Some(lck), Some(nav), Some(rx)) = (
+            w((0x0615, 0xbe, 1)),
+            w((channel::REG_RFPATH_SWITCH, 1, 4)),
+            w((0x840, (0xb0 << 20) | 0xdfbe0, 4)),
+            w((init::REG_NAV_UPPER, 235, 1)),
+            w((init::REG_RXDMA_CONTROL, 0x02, 1)),
+        ) else {
+            return TestResult::Fail("8723BE ERFON rows missing");
+        };
+        let iqk_at = w((iqk::RFPGA0_IQK, 0x8080_0000, 4));
+        if !(mac < path && path < lck && lck < nav && nav < rx)
+            || iqk_at.is_some() != iqk
+            || iqk_at.is_some_and(|i| !(path < i && i < lck))
+            || radio.iqk.is_some() != iqk
+            || g.writes.iter().any(|x| x.0 == 0x0301)
+        {
+            return TestResult::Fail("8723BE ERFON order");
+        }
+    }
+    let by_rate = txpower::ByRate::from_table();
+    let linux = txpower::linux_indices(&efuse, &by_rate, 0, false, 6);
+    let mut over = linux;
+    over[4] += 1;
+    let id = [7u8; 32];
+    if channel::Grant::bounded(id, &efuse, &by_rate, 0, 6, false, 0, over).is_ok()
+        || channel::Grant::bounded(id, &efuse, &by_rate, 0, 6, false, 1, linux).is_ok()
+        || channel::Grant::bounded(id, &efuse, &by_rate, 0, 2, true, 1, linux).is_ok()
+        || channel::Grant::bounded(id, &efuse, &by_rate, 0, 15, false, 0, linux).is_ok()
+    {
+        return TestResult::Fail("8723BE grant bound");
+    }
+    let mut low = linux;
+    low[4] -= 4;
+    let Ok(grant) = channel::Grant::bounded(id, &efuse, &by_rate, 0, 6, false, 0, low) else {
+        return TestResult::Fail("8723BE grant refused");
+    };
+    let io = fw_fake(true, true, false);
+    let mut chnlval = [0x0c01, 0];
+    if narf_scheduler::block_on(channel::configure(&io, &grant, &mut chnlval)).is_err()
+        || chnlval[0] != 0x0c06
+    {
+        return TestResult::Fail("8723BE channel configure");
+    }
+    let g = io.0.lock();
+    let w = |row: (u16, u32, u8)| g.writes.iter().position(|x| *x == row);
+    match (
+        w((0x0e00, u32::from(low[4]), 4)),
+        w((0x840, (0x18 << 20) | 0x0c06, 4)),
+    ) {
+        (Some(p), Some(c)) if p < c && g.regs[usize::from(channel::REG_BWOPMODE)] & 4 != 0 => {}
+        _ => return TestResult::Fail("8723BE grant TXAGC then channel then BW"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_erfon_block_and_channel_grant
 );

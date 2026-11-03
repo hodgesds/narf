@@ -38,8 +38,12 @@
 //! - [`phy`] — BB/RF access, `_rtl8723be_check_positive` table walks and
 //!   the MAC / BB / RF6052 configuration.
 //! - [`channel`] — `rtl8723be_phy_set_rfpath_switch`, LC calibration,
-//!   20/40 MHz bandwidth and the channel RF write.
-//! - [`init`] — the `rtl8723be_hw_init` tail through the station address,
+//!   20/40 MHz bandwidth, the channel RF write and the [`channel::Grant`]
+//!   operating point `Prepared::configure_rtl8723be_channel` programs.
+//! - [`iqk`] — `rtl8723be_phy_iq_calibrate` over S1 / S0.
+//! - [`txpower`] — EFUSE power areas, the PHY_REG_PG by-rate store and
+//!   `rtl8723be_phy_set_txpower_level`.
+//! - [`init`] — the `rtl8723be_hw_init` tail through the `ERFON` block,
 //!   run by `Prepared::configure_rtl8723be`.
 
 #![allow(dead_code)]
@@ -48,12 +52,14 @@ pub mod adapter;
 pub mod channel;
 pub mod fw;
 pub mod init;
+pub mod iqk;
 pub mod llt;
 pub mod mac;
 pub mod phy;
 pub mod pwrseq;
 pub mod tables;
 pub mod trx;
+pub mod txpower;
 pub mod version;
 
 #[cfg(any(test, feature = "kernel-test"))]

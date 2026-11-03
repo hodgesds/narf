@@ -126,3 +126,81 @@ pub async fn switch_channel_rf(
     io.delay_us(10_000).await;
     Ok(())
 }
+
+/// One permitted RTL8723BE operating point: the switched channel
+/// (`rtlphy->current_channel`, the wide channel at 40 MHz), the width, the
+/// 40 MHz `cur_40_prime_sc` and the path-A TXAGC indices for every
+/// [`super::txpower::RATES`] entry. Minted only through [`Grant::bounded`],
+/// which caps every index at the Linux `_rtl8723be_get_txpower_index` value
+/// for this board, width and channel; the caller (the signed per-board
+/// envelope) supplies the measured indices. The indices are computed at the
+/// operating width (Linux's `switch_channel` runs before `set_bw_mode` and
+/// therefore uses the previous width; the operating width is the one the
+/// envelope measures).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grant {
+    identity: [u8; 32],
+    channel: u8,
+    forty: bool,
+    prime_sc: u8,
+    indices: [u8; 20],
+}
+
+impl Grant {
+    /// `indices` must not exceed the Linux index of any rate. At 40 MHz the
+    /// channel is the wide channel 3..=12 with `prime_sc` 1 (lower) or 2
+    /// (upper); at 20 MHz any channel 1..=14 with `prime_sc` 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded(
+        identity: [u8; 32],
+        efuse: &super::txpower::Efuse,
+        by_rate: &super::txpower::ByRate,
+        regulatory: u8,
+        channel: u8,
+        forty: bool,
+        prime_sc: u8,
+        indices: [u8; 20],
+    ) -> Result<Self, Error> {
+        let shape = if forty {
+            (3..=12).contains(&channel) && matches!(prime_sc, 1 | 2)
+        } else {
+            (1..=14).contains(&channel) && prime_sc == 0
+        };
+        let linux = super::txpower::linux_indices(efuse, by_rate, regulatory, forty, channel);
+        if !shape || indices.iter().zip(linux).any(|(i, l)| *i > l) {
+            return Err(Error::State);
+        }
+        Ok(Self {
+            identity,
+            channel,
+            forty,
+            prime_sc,
+            indices,
+        })
+    }
+
+    pub const fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+    pub const fn channel(&self) -> u8 {
+        self.channel
+    }
+    pub const fn forty(&self) -> bool {
+        self.forty
+    }
+    pub const fn prime_sc(&self) -> u8 {
+        self.prime_sc
+    }
+    pub const fn indices(&self) -> &[u8; 20] {
+        &self.indices
+    }
+}
+
+/// `rtl_op_config` channel change for a [`Grant`]: `rtl8723be_phy_sw_chnl`
+/// (the granted TXAGC indices in place of `rtl8723be_phy_set_txpower_level`,
+/// then the RF channel step) and `rtl8723be_phy_set_bw_mode`.
+pub async fn configure(io: &impl Io, grant: &Grant, chnlval: &mut [u32; 2]) -> Result<(), Error> {
+    super::txpower::set_indices(io, grant.indices())?;
+    switch_channel_rf(io, grant.channel(), chnlval).await?;
+    set_bw_mode(io, grant.forty(), grant.prime_sc(), chnlval).await
+}

@@ -3085,13 +3085,47 @@ keeps the chip diagnostic until admission lands.
   read, `RF 0xb0` / `RF 0x18` writes around 50 ms),
   `rtl8723be_phy_set_bw_mode_callback` + `rtl8723be_phy_rf6052_set_bandwidth`
   over the retained `rfreg_chnlval[0]`, and the `CMDID_RF_WRITEREG`
-  channel step (`RF_CHNLBW[9:0]`, path A, 10 ms; channels 1..=14). Not yet
-  composed into the owner: the preceding `rtl8723be_phy_set_txpower_level`
-  step needs the signed per-board envelope, and IQK
-  (`rtl8723be_phy_iq_calibrate`, path A/B S0/S1 with the 1-antenna BT
-  exception) is not implemented. Test
+  channel step (`RF_CHNLBW[9:0]`, path A, 10 ms; channels 1..=14).
+  `channel::Grant` is the permitted operating point (switched channel,
+  width, `cur_40_prime_sc`, path-A TXAGC indices), minted only by
+  `Grant::bounded`, which caps every index at the Linux
+  `_rtl8723be_get_txpower_index` value; `channel::configure` writes the
+  indices, the RF channel step and `set_bw_mode` (the `rtl_op_config`
+  order; indices at the operating width). `Prepared::configure_rtl8723be_channel(grant)`
+  (RadioConfigured/ChannelConfigured → ChannelConfigured) requires the
+  grant's factory identity. No production path mints a grant yet: the
+  signed per-board envelope is a later step. Test
   `smoke_rtl8723be_rfpath_lck_bandwidth_and_channel` (written,
   unexecuted).
+- `iqk` — `rtl8723be_phy_iq_calibrate(hw, false)`: `0x948` save/restore,
+  up to three `_rtl8723be_phy_iq_calibrate(t, is2t)` runs (t == 0 ADDA / MAC
+  / BB backups, `rtl8723_phy_path_adda_on` `0x01c00014`,
+  `rtl8723_phy_mac_setting_calibration`, BB settings, two retries of S1
+  path A TX / RX and S0 path B TX / RX through RF path A with `0x948 = 0`
+  / `0x280`; reloads, `0xc50`/`0xc58` toggles and tone resets from t == 1),
+  `_rtl8723be_phy_simularity_compare` (12 → 0, 13 → 0, 23 → 1, else 3 when
+  `result[3]` is non-zero, else 0xff), the path A / B matrix fills (u32
+  wrapping; path B's RX-extension write is commented out in Linux and not
+  issued), the `iqk_matrix` row and the nine-register `iqk_bb_backup`
+  (`iqk::recover`). TX-path results: once the first check passes Linux
+  returns 0x01 whatever the second check says; the RX paths stop early
+  then. Skipped on `ANT_X1` boards (`get_btc_status()` is always true).
+- `txpower` — path A of `_rtl8723be_read_power_value_fromprom` (a map with
+  `0x11 == 0xff` is refused: Linux's autoload-fail branch leaves
+  `bw40_diff[0][0]` uninitialised), the PHY_REG_PG by-rate store with BCD
+  bases and `_phy_convert_txpower_dbm_to_relative_value`,
+  `_rtl8723be_get_txpower_index` (u8 wrapping, regulatory 2 drops the
+  by-rate diff, `0x3f` clamp) and the `_rtl8723be_phy_set_txpower_index`
+  byte lanes for CCK / OFDM / MCS0-7. `configure_rtl8723be` refuses a map
+  without the power area before the first table write.
+- `ERFON` — `init::configure` now ends with `rtl8723be_phy_set_rfpath_switch(1)`,
+  IQK (`ANT_X2` only), `rtl8723be_phy_lc_calibrate`, `REG_NAV_UPPER = 235`
+  and the `REG_RXDMA_CONTROL` BIT2 release. `rtl8723be_bt_hw_init` (before
+  this block) belongs to the coexistence owner; `rtl8723be_dm_check_txpower_tracking`
+  is a no-op on the first `hw_init`; `REG_PCIE_CTRL_REG + 1 = 0` is the
+  packet owner's. Tests `smoke_rtl8723be_txpower_efuse_by_rate_and_level`,
+  `smoke_rtl8723be_iqk_compare_and_full_run`,
+  `smoke_rtl8723be_erfon_block_and_channel_grant` (written, unexecuted).
 
 ## 4. Invariants
 
