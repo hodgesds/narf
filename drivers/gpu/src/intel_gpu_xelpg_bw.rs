@@ -11,8 +11,13 @@
 //! - `tgl_get_bw_info`: one QGV point means SAGV is not controlled, and
 //!   `intel_sagv_init` then zeroes the SAGV block time.
 //!
-//! Configurations Linux cannot describe (unsupported DRAM type, fewer
-//! than two QGV points, a zero row-cycle time) keep SAGV masked.
+//! Configurations Linux cannot describe (unsupported DRAM type, a zero
+//! row-cycle time) keep SAGV masked. Zero enabled QGV points is NARF
+//! policy: Linux's `tgl_get_bw_info` reports `I915_SAGV_ENABLED` for any
+//! count other than one, keeps the block time, and `mtl_find_qgv_points`
+//! then fails every SAGV-capable state with -EINVAL; this driver instead
+//! treats zero points as uncontrolled (no block time, SAGV masked), which
+//! can cost power but never refuses a display configuration.
 
 use crate::intel_gpu_aux::MmioWindow;
 use narf_filesystem::FsError;

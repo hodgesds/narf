@@ -201,10 +201,24 @@ fn smoke_xelpg_wm_latency_adjust_read_and_sagv_block() -> TestResult {
     hw.set(0x45784, 10 | (12 << 16));
     hw.set(0x45788, 14 | (16 << 16));
     hw.set(0x4578c, 0xffff_e000 | 20);
-    // intel_sagv_init: no SAGV control (no QGV points) zeroes the block
-    // time, so no SAGV watermark is computed.
+    // tgl_get_bw_info: exactly one QGV point (SAGV disabled in the BIOS)
+    // is I915_SAGV_NOT_CONTROLLED, and intel_sagv_init then zeroes the
+    // block time, so no SAGV watermark is computed. One LPDDR5 point on
+    // eight channels.
+    hw.set(0x45700, (1 << 8) | (8 << 4) | 2);
+    hw.set(0x45710, (30 << 24) | (30 << 16) | 192);
+    hw.set(0x45714, (68 << 8) | 15);
     let l = Latency::read(&hw).unwrap();
     assert_eq!(l.levels, [6, 8, 10, 12, 14, 16]);
+    assert_eq!((l.sagv_block_us, l.qgv), (0, None));
+    // Zero enabled QGV points is NARF policy, not Linux: tgl_get_bw_info
+    // sets I915_SAGV_ENABLED for any count other than one, so Linux keeps
+    // the 20 us block time and mtl_find_qgv_points returns -EINVAL for
+    // every state that can enable SAGV (no point carries its data rate).
+    // NARF treats it as uncontrolled: SAGV stays masked (QCLK_GV_BW
+    // 0xffff) with no SAGV watermark, costing power, never admission.
+    hw.set(0x45700, (8 << 4) | 2);
+    let l = Latency::read(&hw).unwrap();
     assert_eq!((l.sagv_block_us, l.qgv), (0, None));
     // Two LPDDR5 QGV points on eight channels: SAGV is controllable.
     hw.set(0x45700, (2 << 8) | (8 << 4) | 2);
