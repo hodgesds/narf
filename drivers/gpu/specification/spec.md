@@ -870,9 +870,14 @@ full-reset proofs. NARF limits:
 - OA syncs and OAR/OAC exec-queue streams are EOPNOTSUPP.
 - mmap follows `xe_oa_mmap`'s checks: EACCES without privilege, EINVAL
   unless the length is the whole buffer, and EINVAL for write, exec or
-  MAP_SHARED(_VALIDATE). A mapping that passes them is ENODEV, because the
-  syscall layer has no read-only private device-PFN mapping; the maximum
-  protection is read.
+  MAP_SHARED(_VALIDATE); the maximum protection is read. A mapping that
+  passes them is a `FileOps::mmap_private_pfn` mapping (`dont_copy`) of the
+  stream's first buffer-size reservation pages from the VMA start, whatever
+  the offset, write-back. `GpuBacking::host_frame` supplies the pages
+  (`FrameBacking` only); a backing without host pages, or a reservation the
+  unit already released, is ENODEV. Each mapping holds a lifetime token, and
+  a unit dropped or released after reset while a token lives never returns
+  the reservation to its allocator.
 - With the opt-in, `metrics/<uuid>/id` (the decimal id) appears under the
   card node with ADD_CONFIG and disappears with REMOVE_CONFIG.
 - `dev.xe.observation_paranoid` (0644, 0..=1, default 1) is registered with

@@ -716,6 +716,12 @@ pub trait GpuBacking {
     fn read32(&self, byte_off: u64) -> u32;
     /// Write the dword at byte offset `byte_off`.
     fn write32(&self, byte_off: u64, val: u32);
+    /// Physical address of page `page` when the allocation is host RAM a
+    /// user CPU mapping may alias, as `xe_oa_mmap` remaps the BO's TTM
+    /// pages. Device-local and model backings keep the `None` default.
+    fn host_frame(&self, _page: u32) -> Option<u64> {
+        None
+    }
     /// Zero the whole allocation.
     fn zero_fill(&self) {
         let bytes = self.size_pages() as u64 * GTT_PAGE_SIZE;
@@ -804,6 +810,11 @@ impl FrameBacking {
 impl GpuBacking for FrameBacking {
     fn coherent_for_device(&self) -> bool {
         self.coherent
+    }
+    fn host_frame(&self, page: u32) -> Option<u64> {
+        self.frames
+            .get(page as usize)
+            .map(|frame| frame.start_address().raw())
     }
     fn ggtt_offset(&self) -> u32 {
         self.ggtt

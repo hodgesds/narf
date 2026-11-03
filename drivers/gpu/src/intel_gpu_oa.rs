@@ -20,8 +20,8 @@ use crate::{
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
 use narf_filesystem::{
-    FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, ReadOptions, Stat, POLL_ERR,
-    POLL_HUP, POLL_IN,
+    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapBacking, MmapLifetime, Mode,
+    PrivatePfnMap, ReadOptions, Stat, POLL_ERR, POLL_HUP, POLL_IN,
 };
 use narf_lib::{mutex::Mutex, readiness::Readiness, sync::IrqSafeSpinLock};
 
@@ -923,6 +923,8 @@ pub struct Session {
     ready: Readiness,
     stop: AtomicBool,
     lock: Mutex<()>,
+    /// The attached unit's host pages, for xe_oa_mmap.
+    pages: IrqSafeSpinLock<Option<Arc<Pages>>>,
 }
 impl core::fmt::Debug for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -963,6 +965,7 @@ impl Session {
             ready: Readiness::new(0),
             stop: AtomicBool::new(false),
             lock: Mutex::new(()),
+            pages: IrqSafeSpinLock::new(None),
         })
     }
     pub(crate) fn device(&self) -> Device {
@@ -1032,6 +1035,72 @@ impl Session {
         }
         put64(&mut bytes, 8, value);
         bytes
+    }
+}
+
+/// The OA buffer's host pages, which xe_oa_mmap remap_pfn_range()s
+/// (bo->ttm.ttm->pages). In Linux the VMA's file keeps the stream and its
+/// BO alive until munmap; here each mapping holds a [`PageMapping`] token and
+/// the unit never returns the pages to its allocator while one is live.
+pub(crate) struct Pages {
+    /// Physical page addresses; empty when the backing has no host frames.
+    frames: Vec<u64>,
+    state: IrqSafeSpinLock<PageState>,
+}
+#[derive(Default)]
+struct PageState {
+    /// The unit gave the reservation up; no new mapping may alias it.
+    released: bool,
+    maps: usize,
+}
+impl Pages {
+    fn new(frames: Vec<u64>) -> Arc<Self> {
+        Arc::new(Self {
+            frames,
+            state: IrqSafeSpinLock::new(PageState::default()),
+        })
+    }
+    /// The first `pages` pages and a token that keeps them unreturned.
+    fn map(self: &Arc<Self>, pages: usize) -> Result<MmapBacking, FsError> {
+        let source = self
+            .frames
+            .get(..pages)
+            .filter(|source| !source.is_empty())
+            .ok_or(FsError::NoDevice)?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(source.len())
+            .map_err(|_| FsError::OutOfMemory)?;
+        frames.extend_from_slice(source);
+        let mut state = self.state.lock();
+        if state.released {
+            return Err(FsError::NoDevice);
+        }
+        state.maps += 1;
+        drop(state);
+        Ok(MmapBacking {
+            frames,
+            lifetime: Some(Arc::new(PageMapping(self.clone())) as Arc<dyn MmapLifetime>),
+            memory_type: narf_memory::MemoryType::WriteBack,
+        })
+    }
+    /// Close the reservation to new mappings. True while a user mapping
+    /// still aliases it: the caller must then not free the backing.
+    fn release(&self) -> bool {
+        let mut state = self.state.lock();
+        state.released = true;
+        state.maps != 0
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn live_maps(&self) -> usize {
+        self.state.lock().maps
+    }
+}
+/// One user mapping's hold on the OA buffer pages.
+struct PageMapping(Arc<Pages>);
+impl Drop for PageMapping {
+    fn drop(&mut self) {
+        self.0.state.lock().maps -= 1;
     }
 }
 
@@ -1166,10 +1235,8 @@ impl FileOps for File {
     /// xe_oa_mmap's checks in source order: paranoid && !perfmon_capable
     /// (EACCES), a length other than the whole OA buffer (EINVAL), then
     /// VM_WRITE/VM_EXEC/VM_SHARED/VM_MAYSHARE (EINVAL: read-only
-    /// MAP_PRIVATE only). The source then remap_pfn_range()s the buffer
-    /// pages; NARF's syscall layer has no read-only private device-PFN
-    /// mapping (it would fall back to read()-backed copies, which consume
-    /// reports), so a mapping that passes every check is ENODEV.
+    /// MAP_PRIVATE only). The pages are then remapped through
+    /// [`FileOps::mmap_private_pfn`] and [`FileOps::mmap_backing`].
     fn validate_mmap(
         &self,
         _offset: u64,
@@ -1190,7 +1257,22 @@ impl FileOps for File {
         if prot & (PROT_WRITE | PROT_EXEC) != 0 || flags & MAP_SHARED != 0 {
             return Err(FsError::InvalidData);
         }
-        Err(FsError::NoDevice)
+        Ok(prot)
+    }
+    /// vm_flags_mod(VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY,
+    /// ..): the mapping is not inherited across fork and cannot grow.
+    fn mmap_private_pfn(&self, _offset: u64) -> Option<PrivatePfnMap> {
+        Some(PrivatePfnMap { dont_copy: true })
+    }
+    /// remap_pfn_range of every buffer page from the VMA start; the source
+    /// ignores vm_pgoff. ENODEV once the unit released the reservation (GT
+    /// reset, suspend or teardown) or when its backing has no host pages.
+    fn mmap_backing(&self, _offset: u64, len: usize) -> Result<MmapBacking, FsError> {
+        if len as u64 != u64::from(self.session.buffer) {
+            return Err(FsError::InvalidData);
+        }
+        let pages = self.session.pages.lock().clone();
+        pages.ok_or(FsError::NoDevice)?.map(len / 4096)
     }
     /// vm_flags_mod(.., VM_MAYWRITE | VM_MAYEXEC): read is the ceiling.
     fn mmap_max_prot(&self, _offset: u64) -> u32 {
@@ -1258,6 +1340,7 @@ enum Quiesce {
 pub(crate) struct Unit<A: BootAllocator> {
     allocator: A,
     backing: Option<A::Backing>,
+    pages: Arc<Pages>,
     platform: GtPlatform,
     graphics: u16,
     session: Option<Arc<Session>>,
@@ -1291,6 +1374,22 @@ impl<A: BootAllocator> Unit<A> {
             allocator.free(backing);
             return Err(FsError::Unsupported);
         }
+        // The host pages a user mapping may alias; none for device-local or
+        // model backings, whose mappings are then ENODEV.
+        let mut frames = Vec::new();
+        if frames.try_reserve_exact(pages as usize).is_err() {
+            allocator.free(backing);
+            return Err(FsError::OutOfMemory);
+        }
+        for page in 0..pages {
+            match backing.host_frame(page) {
+                Some(frame) if frame != 0 => frames.push(frame),
+                _ => {
+                    frames.clear();
+                    break;
+                }
+            }
+        }
         // Counters off and the MMIO trigger disabled until there is a stream.
         let mut io = Io {
             io,
@@ -1307,6 +1406,7 @@ impl<A: BootAllocator> Unit<A> {
         Ok(Self {
             allocator,
             backing: Some(backing),
+            pages: Pages::new(frames),
             platform,
             graphics,
             session: None,
@@ -1475,6 +1575,7 @@ impl<A: BootAllocator> Unit<A> {
         if session.stop.load(Ordering::Acquire) {
             return Err(FsError::NoDevice);
         }
+        *session.pages.lock() = Some(self.pages.clone());
         self.session = Some(session.clone());
         Ok(())
     }
@@ -1866,7 +1967,10 @@ impl<A: BootAllocator> Drop for Unit<A> {
     fn drop(&mut self) {
         self.invalidate();
         if let Some(backing) = self.backing.take() {
-            if !self.exposed || self.retired {
+            // A user mapping still aliasing the pages keeps them: the
+            // reservation is never returned to the allocator.
+            let mapped = self.pages.release();
+            if (!self.exposed || self.retired) && !mapped {
                 self.allocator.free(backing);
             } else {
                 core::mem::forget(backing);
