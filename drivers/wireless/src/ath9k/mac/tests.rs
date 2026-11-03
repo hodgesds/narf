@@ -374,3 +374,82 @@ kernel_test_in!(
     "drivers/wireless/ath9k/mac",
     smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs
 );
+
+/// AR5416/AR5418/AR9160: the 40 MHz non-fast 5 GHz clock (SIFS 16, slot 9,
+/// slot + SIFS ACK/CTS, USEC 39), `ath9k_hw_init_mfp` per generation and
+/// the three-chain `fixup_chainmask` / CB71 mask binding.
+fn smoke_ath9k_ar5008_mac_profile_5ghz_clock_mfp_and_cb71_masks() -> TestResult {
+    let mut map = alloc::vec![0u8; crate::ath9k::chips::MAP_DEF.bytes()];
+    map[6] = 0x3; // AR5416_OPFLAGS_11A | 11G.
+    map[12..18].copy_from_slice(&LOCAL);
+    map[18..20].copy_from_slice(&[7, 7]);
+    let five = Model::new(0);
+    five.parked();
+    if prepare_chip(&five, &map, LOCAL, Profile::ar5008(7, 7, true, true, false)).is_err() {
+        return TestResult::Fail("AR9160 5 GHz three-chain MAC profile refused");
+    }
+    if five.raw(0x1030) != 14 * 40
+        || five.raw(0x1070) != 9 * 40
+        || five.raw(0x8014) & 0x3fff_3fff != 0x03e8_03e8
+        || five.raw(0x801c) & 0x7f != 39
+        || five.raw(0x8340) != 0x700
+    {
+        return TestResult::Fail("AR5008 5 GHz MAC timing is not the 40 MHz clock");
+    }
+    // AR9160 init_mfp: MISC_MODE2 bit 2 set, bit 1 clear, no AES mute.
+    if five.raw(0x8344) & 0x6 != 0x4 || five.trace.borrow().iter().any(|w| w.0 == 0x8060) {
+        return TestResult::Fail("AR9160 init_mfp differs from hw.c");
+    }
+    let two = Model::new(0);
+    two.parked();
+    if prepare_chip(
+        &two,
+        &map,
+        LOCAL,
+        Profile::ar5008(7, 7, false, false, false),
+    )
+    .is_err()
+        || two.raw(0x1070) != 20 * 44
+        || two
+            .trace
+            .borrow()
+            .iter()
+            .any(|w| w.0 == 0x8060 || w.0 == 0x8344)
+    {
+        return TestResult::Fail("AR5416 2.4 GHz profile or empty init_mfp differs");
+    }
+    // CB71: no 11a in the map; the GPIO 0 strap decides the RX mask.
+    map[6] = 0x2;
+    for (gpio, rx, ok) in [
+        (1u32 << 14, 5, true),
+        (1 << 14, 7, false),
+        (0, 7, true),
+        (0, 5, false),
+    ] {
+        let io = Model::new(0);
+        io.parked();
+        io.values.borrow_mut().insert(0x4048, gpio);
+        let result = prepare_chip(&io, &map, LOCAL, Profile::ar5008(rx, 7, false, false, true));
+        if result.is_ok() != ok {
+            return TestResult::Fail("CB71 effective RX mask not bound to the GPIO strap");
+        }
+    }
+    // CB71 is refused for a map that advertises 11a; a zero map mask
+    // fixes up to all three chains.
+    map[6] = 0x3;
+    map[18] = 0;
+    for (rx, cb71, ok) in [(5, true, false), (7, false, true), (3, false, false)] {
+        let io = Model::new(0);
+        io.parked();
+        io.values.borrow_mut().insert(0x4048, 1 << 14);
+        let result = prepare_chip(&io, &map, LOCAL, Profile::ar5008(rx, 7, false, false, cb71));
+        if result.is_ok() != ok {
+            return TestResult::Fail("AR5008 fixup_chainmask binding differs from hw.c");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar5008_mac_profile_5ghz_clock_mfp_and_cb71_masks
+);

@@ -473,7 +473,7 @@ fn encode_series(
     Ok(words)
 }
 
-/// `xmit.c::ath_buf_set_rate` chain selection for a multi-chain AR9002
+/// `xmit.c::ath_buf_set_rate` chain selection for a multi-chain AR9002 or AR5008
 /// part: on 2.4 GHz `ath_txchainmask_reduction` returns `ah->txchainmask`
 /// unchanged (its reductions are APM 5 GHz and AR9462 BT-coex CCK only), and
 /// `ar9002_set_txdesc` encodes it as `set11nChainSel` (ctl7 `AR_ChainSel0..3`)
@@ -481,7 +481,9 @@ fn encode_series(
 /// no series, are left untouched as `ar9002_set_txdesc` never writes their
 /// ctl7.
 pub(super) fn select_chains(words: &mut [u32; WORDS], tx_chainmask: u8) -> Result<(), Error> {
-    if !(1..=3).contains(&tx_chainmask) {
+    // Up to the three AR5416/AR9160 chains (`AR_ChainSel` is three bits);
+    // the APM reduction is AR9003-only.
+    if !(1..=7).contains(&tx_chainmask) {
         return Err(Error::Profile);
     }
     for slot in 0..4 {

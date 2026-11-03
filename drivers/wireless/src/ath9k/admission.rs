@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9287 (`0x002d`/`0x002e`) signed board admission record `N87A` v1 and
-//! the AR9280 (`0x0029`/`0x002a`) dual-band record `N80A` v1.
+//! AR9287 (`0x002d`/`0x002e`) signed board admission record `N87A` v1, the
+//! AR9280 (`0x0029`/`0x002a`) dual-band record `N80A` v1 and the AR5008-PHY
+//! three-chain records `N54A` v1 (AR5416 `0x0023` / AR5418 `0x0024`) and
+//! `N60A` v1 (AR9160 `0x0027`).
 //!
 //! The AR9287 software path (map decode, INI/board values, open-loop
 //! transmit power, two-chain calibration, async-FIFO MAC clock, descriptor
@@ -13,6 +15,11 @@
 //! The AR9280 record has the same layout with magic `N80A`; its channel
 //! byte is the IEEE channel number (2.4 GHz 1..13 or 5 GHz 36..165, the two
 //! sets are disjoint) and it binds the closed-loop def plan of that channel.
+//! The AR5416/AR5418 (`N54A`) and AR9160 (`N60A`) records keep that layout
+//! and channel byte; their chain-mask bytes are the effective
+//! (`fixup_chainmask`, CB71) masks up to 0x7 and their identity binds the
+//! AR5008 preparation, the radio revision and the three-chain closed-loop
+//! def plan.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{
@@ -236,6 +243,118 @@ impl Facts {
             channel,
         })
     }
+    /// AR5416/AR5418/AR9160 facts for one 20 MHz channel in either band:
+    /// the PCI function, `AR_SREV` and `ar9002_hw_rf_claim` radio revision,
+    /// the effective three-chain masks, the exact def map, the
+    /// `phy::ar5008::prepare` row count at `frequency` and the
+    /// `ath9k_hw_def_set_txpower` plan for the chip at the 40 half-dB
+    /// maximum (`overlap` as for [`Self::new_ar9280`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_ar5008(
+        id: &narf_bus::DeviceId,
+        revision: &Revision,
+        radio: u8,
+        identity: &Identity,
+        prepared: &super::phy::ar5008::Prepared,
+        image: &[u8],
+        frequency: u16,
+        overlap: u8,
+    ) -> Result<Self, BringUpError> {
+        use super::phy::ar5008::{DEVID_AR5416_PCI, DEVID_AR5416_PCIE, DEVID_AR9160_PCI};
+        let channel = if let Some(channel) = ar9280::channel_5ghz(frequency) {
+            channel
+        } else if (2412..=2472).contains(&frequency) && (frequency - 2412) % 5 == 0 {
+            ((frequency - 2407) / 5) as u8
+        } else {
+            return Err(BringUpError::BadIdentity);
+        };
+        let (chip, magic, name) = match id.device {
+            DEVID_AR5416_PCI | DEVID_AR5416_PCIE => (Chip::Ar5416, *b"N54A", "ar5416"),
+            DEVID_AR9160_PCI => (Chip::Ar9160, *b"N60A", "ar9160"),
+            _ => return Err(BringUpError::BadIdentity),
+        };
+        if id.vendor != 0x168c
+            || Chip::for_device(id.device) != Some(chip)
+            || revision.chip != chip
+            || image.len() != super::chips::MAP_DEF.bytes()
+            || prepared.tune.is_wide()
+            || prepared.tune.center() != frequency
+            || prepared.tune.is_5ghz() != (channel >= 36)
+            || !(1..=7).contains(&identity.rx_chainmask)
+            || !(1..=7).contains(&identity.tx_chainmask)
+        {
+            return Err(BringUpError::BadIdentity);
+        }
+        let plan = ar9280::power::plan_chip(identity, image, prepared.tune, 40, overlap, chip)?;
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(&magic);
+        h.update(
+            b"NARF AR5008-PHY three-chain closed-loop def legacy20 dual-band board admission v1",
+        );
+        h.update(b"eeprom_def map at word 64; ar5008/ar9001 INI modes column 1 (5G) / 4 (2G), ADDAC (def set_addac), common, BB_RfGain, analog banks with Bank 6 swizzle and AR5416 force bias; non-AR9280 set_board_values; three-chain closed-loop def set_txpower; ar9002 init_cal plain AGC, AR5008 NF, AR9160 multi-sample IQ; ChainSel = txchainmask");
+        for v in [
+            id.vendor,
+            id.device,
+            id.subsystem_vendor,
+            id.subsystem_id,
+            identity.eeprom_version,
+            prepared.ini_writes,
+            frequency,
+        ] {
+            h.update(&v.to_le_bytes());
+        }
+        h.update(&revision.mac_version.to_le_bytes());
+        h.update(&[
+            revision.mac_rev,
+            radio,
+            identity.rx_chainmask,
+            identity.tx_chainmask,
+            u8::from(prepared.tune.is_5ghz()),
+        ]);
+        h.update(&identity.mac);
+        h.update(image);
+        for gain in plan.gains {
+            h.update(&gain.to_le_bytes());
+        }
+        h.update(&[plan.count as u8, plan.max_power]);
+        for chain in plan.chains.iter().flatten() {
+            h.update(&chain.tpcrg5.to_le_bytes());
+            for word in chain.pdadc {
+                h.update(&word.to_le_bytes());
+            }
+        }
+        for (register, value) in &plan.registers[..plan.register_count] {
+            h.update(&register.to_le_bytes());
+            h.update(&value.to_le_bytes());
+        }
+        let modal = if prepared.tune.is_5ghz() {
+            ar9280::MODAL_5G
+        } else {
+            ar9280::MODAL_2G
+        };
+        let mac = identity.mac;
+        Ok(Self {
+            request: Request {
+                identity: h.finalize(),
+                mac,
+                device: id.device,
+                frequency_mhz: frequency,
+                filename: format!(
+                    "ath9k/{}-admit-v1-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    name, channel, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ),
+            },
+            factory_antenna: image[modal + 16..modal + 19]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0),
+            rx_chainmask: identity.rx_chainmask,
+            tx_chainmask: identity.tx_chainmask,
+            magic,
+            channel,
+        })
+    }
     pub(super) fn request(&self) -> Request {
         self.request.clone()
     }
@@ -255,8 +374,7 @@ pub(super) struct Grant {
 
 pub(super) enum Source {
     /// The trusted firmware loader's record for `Facts::request().filename`.
-    /// Only the AR9287 and AR9280 owners (`ar9287_owner`, `ar9280_owner`)
-    /// construct it.
+    /// Only the AR9287, AR9280 and AR5008 owners construct it.
     Registered,
     #[cfg(feature = "kernel-test")]
     Verified {

@@ -1740,8 +1740,10 @@ others refused before the map is read), the def map at word 64, and the
 and `fixup_chainmask` against the three chains. The retained map is not
 rewritten; `Identity` carries the effective masks. `ath9k_hw_chip_test` is
 not run (as for the other non-AR9285 parts). `identity::sleep_ar5008_io`
-(the MMIO wrapper lands with the owner) is `ath_pci_suspend` for these parts: WARM reset, no D3 PCIe word
-(`ath9k_hw_configpcipowersave` is AR9280_20_OR_LATER-only) and FULL_SLEEP
+(the MMIO wrapper lands with the owner) is `ath_pci_suspend` for these parts: WARM reset and FULL_SLEEP
+(the owner must still add `pcie_pm::configure_ar5008(.., true)` for an
+ASPM AR5418: `ath9k_hw_configpcipowersave` is gated by `aspm_enabled`, not
+by AR9280_20)
 that, on AR5416, leaves the RTC out of reset (`ath9k_set_power_sleep`).
 Smokes (written, not executed):
 `smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks`,
@@ -1790,6 +1792,39 @@ single-sample paths are unchanged. Smokes (written, not executed):
 `smoke_ath9k_ar9160_calibration_multi_sample_iq_numchains`,
 `smoke_ath9k_ar9160_periodic_iq_collects_sixty_four_samples`,
 `smoke_ath9k_ar5008_calibration_refuses_and_aspm_serdes`.
+
+AR5008 MAC profile: `mac::Profile::ar5008(rx, tx, five_ghz, ar9160,
+cb71)`. These parts lack `ATH9K_HW_CAP_FASTCLOCK` (AR9280_20+ only), so
+5 GHz is `mac::Clock::Ofdm5g`, `ATH9K_CLOCK_RATE_5GHZ_OFDM` (40 MHz: SIFS
+16, slot 9, ACK/CTS slot + SIFS, `AR_USEC_USEC` 39; USEC latencies and EIFS
+stay as the INI left them); 2.4 GHz is the 44 MHz OFDM clock;
+`AR_PCU_TXBUF_CTRL` 0x700. `ath9k_hw_init_mfp` is per generation
+(`mac::Mfp`): AR9280+ `AR_AES_MUTE_MASK1` 0xc7ff (unchanged), AR9160
+`AR_PCU_MISC_MODE2` clear `MGMT_CRYPTO_ENABLE` / set
+`NO_CRYPTO_FOR_NON_DATA_PKT`, AR5416 none. `mac::Masks::ThreeChain`
+binds the effective masks to the retained map as `ath9k_hw_fill_cap_info`
++ `fixup_chainmask` do: TX = fixup(map `txMask`), RX = fixup(map `rxMask`)
+or, for CB71 (`0x0023` without `AR5416_OPFLAGS_11A`; refused for a map
+with 11a), fixup of the live GPIO 0 strap (`AR_GPIO_IN_OUT` bit 14: 0x5,
+else 0x7) — so a CB71 effective 0x5 against a map `rxMask` of 0x7 is
+accepted and the map is never rewritten. The two-chain profiles keep
+`Masks::Factory` (map masks == effective, 1..=3) byte-identically.
+`descriptor::select_chains` accepts TX masks 1..=7 (`AR_ChainSel` is three
+bits; the APM reduction is AR9003-only). Smoke (written, not executed):
+`smoke_ath9k_ar5008_mac_profile_5ghz_clock_mfp_and_cb71_masks`; the
+descriptor smoke now covers mask 7.
+
+AR5008 admission records (format only): `admission::Facts::new_ar5008`
+keeps the 128-byte `N87A`/`N80A` layout with magic `N54A` (AR5416 `0x0023`
+/ AR5418 `0x0024`) or `N60A` (AR9160 `0x0027`), the IEEE channel byte of
+either band, and the effective (fixup / CB71) RX/TX masks (1..=7) in bytes
+56/57. The identity hashes the magic, PCI IDs, EEPROM version, the
+`phy::ar5008::prepare` row count, frequency, `AR_SREV` version/rev, the
+`ar9002_hw_rf_claim` radio revision, the masks, band, MAC, the whole def
+map and the chip's `plan_chip` closed-loop plan at 40 half-dB. Filename
+`ath9k/ar5416-admit-v1-ch<N>-<mac>.bin` / `ath9k/ar9160-admit-v1-...`. No
+record or board value is supplied. Smoke (written, not executed):
+`smoke_ath9k_ar5008_admission_records_bind_chip_masks_and_channel`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

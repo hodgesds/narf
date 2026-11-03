@@ -616,3 +616,90 @@ kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_dual_band_channel_bits_roundtrip
 );
+
+fn ar5008_facts(id: u16, frequency: u16, rx: u8) -> Result<Facts, BringUpError> {
+    use crate::ath9k::phy::{ar5008, ar9280, Tune};
+    let tune = match ar9280::channel_5ghz(frequency) {
+        Some(_) => Tune::Five {
+            frequency,
+            frac_n: false,
+        },
+        None => Tune::Two(Geometry::from_frequency(frequency)?),
+    };
+    // Marker row count; never a board value.
+    let prepared = ar5008::Prepared {
+        tune,
+        ini_writes: 534,
+    };
+    let srev = if id == 0x0027 {
+        0x0004_01ff
+    } else {
+        0x0000_00d1
+    };
+    let mut identity = crate::ath9k::phy::ar9280::power::tests::identity(0x10);
+    identity.rx_chainmask = rx;
+    Facts::new_ar5008(
+        &device(id),
+        &Revision::decode(srev).ok_or(BringUpError::UnsupportedRevision)?,
+        0x40,
+        &identity,
+        &prepared,
+        &crate::ath9k::phy::ar9280::power::tests::image(3),
+        frequency,
+        0,
+    )
+}
+
+fn smoke_ath9k_ar5008_admission_records_bind_chip_masks_and_channel() -> TestResult {
+    let (Ok(ar5416), Ok(ar9160), Ok(five), Ok(cb71)) = (
+        ar5008_facts(0x0023, 2412, 7),
+        ar5008_facts(0x0027, 2412, 7),
+        ar5008_facts(0x0024, 5180, 7),
+        ar5008_facts(0x0023, 2412, 5),
+    ) else {
+        return TestResult::Fail("AR5008 admission facts refused");
+    };
+    if ar5416.request().filename != "ath9k/ar5416-admit-v1-ch1-02aabbccddee.bin"
+        || ar9160.request().filename != "ath9k/ar9160-admit-v1-ch1-02aabbccddee.bin"
+        || five.request().filename != "ath9k/ar5416-admit-v1-ch36-02aabbccddee.bin"
+    {
+        return TestResult::Fail("AR5008 record filenames not keyed per chip and channel");
+    }
+    let ids = [&ar5416, &ar9160, &five, &cb71].map(|f| f.request().identity);
+    if (0..4).any(|i| (i + 1..4).any(|j| ids[i] == ids[j])) {
+        return TestResult::Fail("AR5008 identities do not bind chip, band and RX mask");
+    }
+    let with = |facts: &Facts, magic: &[u8; 4], rx: u8| {
+        let mut b = record(facts, 4, 30);
+        b[..4].copy_from_slice(magic);
+        b[54..58].copy_from_slice(&[1, 20, rx, 3]);
+        b
+    };
+    if load(ar5416.clone(), with(&ar5416, b"N54A", 7), true).is_err()
+        || load(ar9160.clone(), with(&ar9160, b"N60A", 7), true).is_err()
+        || load(cb71.clone(), with(&cb71, b"N54A", 5), true).is_err()
+    {
+        return TestResult::Fail("well-formed signed AR5008 record refused");
+    }
+    for (facts, bytes) in [
+        (&ar5416, with(&ar5416, b"N60A", 7)), // AR9160 magic on AR5416
+        (&ar9160, with(&ar9160, b"N54A", 7)), // AR5416 magic on AR9160
+        (&ar9160, with(&ar9160, b"N80A", 7)), // AR9280 magic
+        (&cb71, with(&cb71, b"N54A", 7)),     // map mask, not the CB71 mask
+    ] {
+        if load(facts.clone(), bytes, true).is_ok() {
+            return TestResult::Fail("foreign-chip or wrong-mask AR5008 record admitted");
+        }
+    }
+    if ar5008_facts(0x0029, 2412, 7).is_ok()
+        || ar5008_facts(0x0027, 2484, 7).is_ok()
+        || ar5008_facts(0x0027, 2412, 8).is_ok()
+    {
+        return TestResult::Fail("AR5008 facts accepted a foreign device, channel or mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar5008_admission_records_bind_chip_masks_and_channel
+);

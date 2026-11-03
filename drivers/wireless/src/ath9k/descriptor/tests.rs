@@ -340,7 +340,11 @@ fn smoke_ath9k_two_chain_descriptor_chain_selection() -> TestResult {
     {
         return TestResult::Fail("unpopulated series received a chain selection");
     }
-    for bad in [0, 4, 7] {
+    let mut three = single;
+    if select_chains(&mut three, 7).is_err() || three[9] & CHAINS != 0x1c {
+        return TestResult::Fail("three-chain AR5008 TX mask not selected");
+    }
+    for bad in [0, 8, 0xff] {
         if select_chains(&mut single.clone(), bad) != Err(Error::Profile) {
             return TestResult::Fail("invalid TX chain mask accepted");
         }
