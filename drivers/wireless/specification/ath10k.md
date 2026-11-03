@@ -2210,9 +2210,12 @@ will bind; none of them grants RF, peer, key or data authority.
   station is not supported: the associated dwell owner is vdev0-only).
 
 Remaining before the row can be claimed: a P2P client netdev role (iftype 8,
-STA vdev subtype P2P_CLI) reusing the station owner, with the remaining
-station WMI builders (peer, vdev start/up/down/stop, params, keys) taking a
-vdev; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
+STA vdev subtype P2P_CLI) on its own vdev beside the home station. The
+builders are ready; the blocker is that `Radio` holds exactly one station
+owner (`peer`, `data`, `power_save`, `protection`, `coexistence`,
+`peer_pmf_offload`, HTT RX admission by `peer.vdev`), so a concurrent
+second station needs those moved into a per-vdev station slot with HTT
+RX/TX-completion demux by vdev/peer and a second netdev data ring; a GO role (iftype 9, AP vdev subtype P2P_GO) wiring `go_beacon_ie`
 into the beacon publication and `NoaOwner` into P2P_NOA event routing and
 probe-response TX; then advertisement through `P2P_ADVERTISED`,
 `p2p_interface_types`/`interface_combinations` and `WirelessModes::P2P`.
