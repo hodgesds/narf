@@ -379,9 +379,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
 
-        let beacon = ap_wire::beacon(&plan)?;
-        let probe = ap_wire::probe(&plan)?;
-        if beacon.len().max(probe.len()) > self.htt.wmi.htc.wmi_max_payload() {
+        let templates = ap_wire::templates(&plan)?;
+        let max = self.htt.wmi.htc.wmi_max_payload();
+        if templates.iter().any(|command| command.len() > max) {
             return Err(Error::Unsupported);
         }
         let permission =
@@ -473,8 +473,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .await?;
         self.ap_wait(|ap| ap.vdev == Vdev::Started, &current)
             .await?;
-        self.ap_command(&beacon, &current).await?;
-        self.ap_command(&probe, &current).await?;
+        for command in &templates {
+            self.ap_command(command, &current).await?;
+        }
         let vdev = self.ap.as_ref().ok_or(Error::Failed)?.plan.vdev;
         let mut up = ap_wire::command(0x5005, 92, &[u32::from(vdev), 0, 0, 0])?;
         up[16..22].copy_from_slice(&own);

@@ -54,6 +54,10 @@ pub(super) struct Plan {
     /// The AP-type vdev every template, parameter, peer and VDEV_UP command
     /// of this plan addresses (`arvif->vdev_id` throughout mac.c).
     pub vdev: u8,
+    /// The vdev's role: `Ap`, or `P2pGo` for a GO's AP-type vdev with
+    /// subtype P2P_GO (`arvif->vdev_subtype`), whose beacon P2P IE moves
+    /// to firmware (`templates`).
+    pub role: super::p2p::Role,
 }
 impl Plan {
     pub fn new(
@@ -63,6 +67,23 @@ impl Plan {
         own: [u8; 6],
         uapsd: bool,
     ) -> Result<Self, Error> {
+        Self::new_role(vdev, super::p2p::Role::Ap, config, settings, own, uapsd)
+    }
+    /// A plan for an AP-type vdev of `role` (`Ap` or `P2pGo`). Only a GO's
+    /// templates may carry the WFA P2P IE (wpa_supplicant's GO beacon and
+    /// Probe Response); `templates` hands the beacon's to firmware.
+    pub fn new_role(
+        vdev: u8,
+        role: super::p2p::Role,
+        config: ApConfig,
+        settings: ApStartSettings,
+        own: [u8; 6],
+        uapsd: bool,
+    ) -> Result<Self, Error> {
+        if !matches!(role, super::p2p::Role::Ap | super::p2p::Role::P2pGo) {
+            return Err(Error::Unsupported);
+        }
+        let go = role == super::p2p::Role::P2pGo;
         let frequency = u16::try_from(config.frequency_mhz).map_err(|_| Error::Unsupported)?;
         if !crate::ath10k::regulatory::Permission::profile_frequency(frequency)
             || settings.p2p_go.is_some()
@@ -155,7 +176,7 @@ impl Plan {
                 5 | 7 | 37 | 45 | 61 | 191 | 192 | 244 | 255 => return Err(Error::Unsupported),
                 42 if body != [0] => return Err(Error::Unsupported),
                 221 if body.starts_with(&[0, 0x50, 0xf2, 1])
-                    || body.starts_with(&[0x50, 0x6f, 0x9a, 9]) =>
+                    || !go && body.starts_with(&[0x50, 0x6f, 0x9a, 9]) =>
                 {
                     return Err(Error::Unsupported)
                 }
@@ -251,7 +272,7 @@ impl Plan {
             candidate.beacon_head[0] = 0x80;
             candidate.beacon_head[4..10].fill(0xff);
             candidate.beacon_tail.clear();
-            let parsed = Self::new(vdev, candidate, settings.clone(), own, uapsd)?;
+            let parsed = Self::new_role(vdev, role, candidate, settings.clone(), own, uapsd)?;
             if parsed.rsn != rsn
                 || parsed.rates != supported
                 || parsed.basic != basic
@@ -289,6 +310,7 @@ impl Plan {
             return Err(Error::Unsupported);
         }
         Ok(Self {
+            role,
             config,
             settings,
             beacon,
@@ -402,21 +424,54 @@ pub(super) fn delete(vdev: super::p2p::Vdev) -> Result<Vec<u8>, Error> {
     vdev.delete(&wire::Wire::new(crate::ath10k::wmi_boot::Dialect::Tlv))
 }
 pub(super) fn beacon(plan: &Plan) -> Result<Vec<u8>, Error> {
+    beacon_template(plan.vdev, plan.tim, &plan.beacon)
+}
+fn beacon_template(vdev: u8, tim: usize, frame: &[u8]) -> Result<Vec<u8>, Error> {
     let mut out = command(
         0x7003,
         103,
-        &[
-            u32::from(plan.vdev),
-            plan.tim as u32,
-            plan.beacon.len() as u32,
-        ],
+        &[u32::from(vdev), tim as u32, frame.len() as u32],
     )?;
     out.extend_from_slice(&((105u32 << 16) | 8).to_le_bytes());
     out.extend_from_slice(&[0; 8]);
-    let padded = plan.beacon.len().next_multiple_of(4);
+    let padded = frame.len().next_multiple_of(4);
     out.extend_from_slice(&((17u32 << 16) | padded as u32).to_le_bytes());
-    out.extend_from_slice(&plan.beacon);
-    out.resize(out.len() + padded - plan.beacon.len(), 0);
+    out.extend_from_slice(frame);
+    out.resize(out.len() + padded - frame.len(), 0);
+    Ok(out)
+}
+/// The template commands one beacon publication sends, in
+/// `mac.c::ath10k_mac_setup_bcn_tmpl` order: for a GO the
+/// `WMI_TLV_P2P_GO_SET_BEACON_IE` (`ath10k_mac_setup_bcn_p2p_ie`) first,
+/// then the beacon template without that P2P IE
+/// (`ath10k_mac_remove_vendor_ie`), then the probe-response template
+/// (`ath10k_mac_setup_prb_tmpl`, unchanged: firmware adds no NoA there and
+/// neither does Linux).
+pub(super) fn templates(plan: &Plan) -> Result<Vec<Vec<u8>>, Error> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(3).map_err(|_| Error::NoMemory)?;
+    let vdev = super::p2p::Vdev::new(plan.vdev, plan.role);
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(plan.beacon.len())
+        .map_err(|_| Error::NoMemory)?;
+    frame.extend_from_slice(&plan.beacon);
+    let mut tim = plan.tim;
+    if let Some(ie) = super::p2p::go_beacon_ie(vdev, &mut frame)? {
+        // The TIM sits between head and tail; a P2P IE in the head precedes
+        // it and moves the offset firmware patches.
+        let elements = plan
+            .beacon
+            .get(super::p2p::BEACON_IES..)
+            .ok_or(Error::Malformed)?;
+        let range = super::p2p::find_p2p_ie(elements)?.ok_or(Error::Malformed)?;
+        if super::p2p::BEACON_IES + range.start < tim {
+            tim -= range.len();
+        }
+        out.push(ie);
+    }
+    out.push(beacon_template(plan.vdev, tim, &frame)?);
+    out.push(probe(plan)?);
     Ok(out)
 }
 pub(super) fn probe(plan: &Plan) -> Result<Vec<u8>, Error> {

@@ -821,6 +821,41 @@ fn smoke_ath10k_p2p_ap_builders_carry_vdev() -> TestResult {
             return TestResult::Fail("AP builder vdev layout");
         }
     }
+    // A GO (`mac.c::ath10k_mac_setup_bcn_tmpl`): P2P_GO_SET_BEACON_IE
+    // first, then the beacon without the P2P IE, then the probe template.
+    // An ordinary AP refuses the P2P IE and publishes beacon + probe only.
+    let p2p = [221, 8, 0x50, 0x6f, 0x9a, 9, 2, 2, 0, 0x21];
+    let mut go_config = config.clone();
+    go_config.beacon_tail = p2p.to_vec();
+    if ap_wire::Plan::new(2, go_config.clone(), settings.clone(), OWN, false).is_ok() {
+        return TestResult::Fail("ordinary AP accepted a P2P IE");
+    }
+    let (Ok(go), Ok(plain)) = (
+        ap_wire::Plan::new_role(2, Role::P2pGo, go_config, settings.clone(), OWN, false),
+        ap_wire::Plan::new(2, config.clone(), settings.clone(), OWN, false),
+    ) else {
+        return TestResult::Fail("GO plan refused");
+    };
+    let (Ok(go_templates), Ok(plain_templates)) =
+        (ap_wire::templates(&go), ap_wire::templates(&plain))
+    else {
+        return TestResult::Fail("templates refused");
+    };
+    if plain_templates.len() != 2
+        || ap_wire::beacon(&plain).ok().as_ref() != Some(&plain_templates[0])
+        || ap_wire::probe(&plain).ok().as_ref() != Some(&plain_templates[1])
+    {
+        return TestResult::Fail("ordinary AP templates changed");
+    }
+    if go_templates.len() != 3
+        || wire::word(&go_templates[0], 0) != Ok(0xd003)
+        || wire::word(&go_templates[0], 8) != Ok(2)
+        || go_templates[0][20..30] != p2p
+        || go_templates[1] != plain_templates[0]
+        || ap_wire::probe(&go).ok().as_ref() != Some(&go_templates[2])
+    {
+        return TestResult::Fail("GO beacon P2P IE not moved to firmware");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

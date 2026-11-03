@@ -239,6 +239,10 @@ pub(in crate::ath10k) struct Session {
     pub(super) data_epoch: Arc<AtomicU64>,
     pub(super) key_epoch: Arc<AtomicU64>,
     pub(super) vdev: Vdev,
+    /// A GO's firmware-reported NoA (`WMI_TLV_P2P_NOA_EVENTID` for this
+    /// vdev, `p2p.c::ath10k_p2p_noa_update_by_vdev_id`), appended to the
+    /// Probe Responses it transmits (`ath10k_tx_h_add_p2p_noa_ie`).
+    pub(super) noa: super::p2p::NoaOwner,
     pub(super) own: Record,
     pub(super) peers: Vec<Peer>,
     pub(super) groups: Vec<Group>,
@@ -283,6 +287,7 @@ impl Session {
             data_epoch: Arc::new(AtomicU64::new(1)),
             key_epoch: Arc::new(AtomicU64::new(1)),
             vdev: Vdev::Original,
+            noa: super::p2p::NoaOwner::default(),
             own: Record::new(own),
             peers: Vec::new(),
             groups: Vec::new(),
@@ -535,6 +540,17 @@ impl Session {
             // outstanding AP-vdev teardown plus drained native prefix
             // supplies correlation; no guessed body/status is decoded.
             0x5006 if self.vdev == Vdev::DeleteSent => self.vdev_deleted = true,
+            // `wmi-tlv.c::ath10k_wmi_tlv_event_p2p_noa` ->
+            // `ath10k_p2p_noa_update_by_vdev_id`: only a GO vdev's own
+            // report replaces its NoA; another vdev's is not ours.
+            0xd002 if self.plan.role == super::p2p::Role::P2pGo => {
+                let (vdev, noa) = super::p2p::Noa::tlv_event(&bytes[4..])?;
+                self.noa.update(
+                    super::p2p::Vdev::new(self.plan.vdev, self.plan.role),
+                    vdev,
+                    &noa,
+                )?;
+            }
             0x5002 if self.vdev == Vdev::StopSent => {
                 let body = wire::tag(&bytes[4..], 41)?;
                 if body.len() != 4 || wire::word(body, 0)? != u32::from(self.plan.vdev) {

@@ -193,8 +193,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             config.beacon_tail.clear();
             config.probe_resp = None;
             config.hidden_ssid = 0;
-            let offered = super::ap_wire::Plan::new(
+            let offered = super::ap_wire::Plan::new_role(
                 ap.plan.vdev,
+                ap.plan.role,
                 config,
                 ap.plan.settings.clone(),
                 ap.own.mac,
@@ -208,6 +209,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Unsupported);
             }
         }
+        // `mac.c::ath10k_tx_h_add_p2p_noa_ie`: a GO's Probe Response carries
+        // the firmware's current NoA (no-op for an AP or without one).
+        if frame[0] == 0x50 {
+            ap.noa.append_to_probe_response(&mut request.frame)?;
+            if request.frame.len() > 2048 {
+                return Err(Error::Unsupported);
+            }
+        }
+        let frame = &request.frame;
         if matches!(frame[0], 0xa0 | 0xc0) && frame.len() != 26 {
             return Err(Error::Malformed);
         }

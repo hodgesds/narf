@@ -34,8 +34,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let Some(probe) = probe {
             config.probe_resp = Some(probe);
         }
-        let next = ap_wire::Plan::new(
+        let next = ap_wire::Plan::new_role(
             ap.plan.vdev,
+            ap.plan.role,
             config,
             ap.plan.settings.clone(),
             ap.own.mac,
@@ -51,9 +52,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let wmm = next.wmm;
         let parameters = ap_wire::parameters(&next)?;
-        let beacon = ap_wire::beacon(&next)?;
-        let probe = ap_wire::probe(&next)?;
-        if beacon.len().max(probe.len()) > self.htt.wmi.htc.wmi_max_payload() {
+        let templates = ap_wire::templates(&next)?;
+        let max = self.htt.wmi.htc.wmi_max_payload();
+        if templates.iter().any(|command| command.len() > max) {
             return Err(Error::Unsupported);
         }
 
@@ -79,8 +80,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.ap_command(&super::wmm::command(self.wire.dialect, wmm)?, &current)
                 .await?;
         }
-        self.ap_command(&beacon, &current).await?;
-        self.ap_command(&probe, &current).await?;
+        for command in &templates {
+            self.ap_command(command, &current).await?;
+        }
         self.ap_barrier(&current).await?;
         self.ap_prefix(&current).await?;
         let ap = self.ap.as_mut().unwrap();

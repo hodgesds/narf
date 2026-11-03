@@ -194,7 +194,7 @@ pub(super) const BEACON_IES: usize = 36;
 /// The byte range of the first P2P vendor IE in an element stream,
 /// as `cfg80211_find_vendor_ie(WLAN_OUI_WFA, WLAN_OUI_TYPE_WFA_P2P, ..)`.
 /// A truncated element is malformed rather than silently ignored.
-fn find_p2p_ie(elements: &[u8]) -> Result<Option<core::ops::Range<usize>>, Error> {
+pub(super) fn find_p2p_ie(elements: &[u8]) -> Result<Option<core::ops::Range<usize>>, Error> {
     let mut at = 0;
     while at < elements.len() {
         let length = usize::from(*elements.get(at + 1).ok_or(Error::Malformed)?);

@@ -2128,6 +2128,18 @@ will bind; none of them grants RF, peer, key or data authority.
   becomes `WMI_TLV_P2P_GO_SET_BEACON_IE` (0xd003; tag 90 {vdev, ie_len},
   tag 17 padded bytes) and is removed from the template, because firmware
   inserts it with its own NoA. Ordinary AP beacons are unchanged.
+  `ap_wire::Plan` records its vdev role (`Plan::new_role`: `Ap`, or
+  `P2pGo` for the AP-type vdev with subtype P2P_GO); only a GO plan admits
+  the WFA P2P IE in its beacon and Probe Response (an ordinary AP still
+  refuses it). Every beacon publication (`ap_start`, the beacon update)
+  sends `ap_wire::templates` in `ath10k_mac_setup_bcn_tmpl` order: the GO's
+  0xd003 first, then BCN_TMPL with the P2P IE removed (TIM offset moved
+  only when the IE preceded it), then PRB_TMPL unchanged (Linux adds no
+  NoA to the firmware probe template). The AP session decodes 0xd002 into
+  its `NoaOwner` only for a GO plan's own vdev, and its host-transmitted
+  Probe Responses (`ap_tx_management`) carry that NoA
+  (`ath10k_tx_h_add_p2p_noa_ie`). No GO session is created yet: the GO
+  role on its own vdev beside the home station is the remaining step.
 - **NoA / opportunistic PS.** Linux ath10k never programs CTWindow/OppPS or
   a NoA schedule from the host; firmware owns both and reports them.
   `Noa::tlv_event` decodes `WMI_TLV_P2P_NOA_EVENTID` (0xd002, tags 223
