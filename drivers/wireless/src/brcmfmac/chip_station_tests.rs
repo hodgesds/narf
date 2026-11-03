@@ -41,7 +41,8 @@ fn native(caps: [u32; 2], with160: bool, request160: bool) -> Vht80 {
 fn station_160_capability() -> Result<(), &'static str> {
     for version in [5, 6] {
         // bw_cap 160 bit plus a reported 160 MHz chanspec: Linux
-        // brcmf_update_vht_cap's 160 bits; operation stays 80 MHz.
+        // brcmf_update_vht_cap's 160 bits; on this 80 MHz BSS the join
+        // stays 80 MHz (160 operation: ..._vht160_join_geometry).
         let h = Harness::new_vht_chip(version, 36, 3, native([3, 15], true, true), BCM4356)?;
         let vht = h
             .device
@@ -110,4 +111,76 @@ fn smoke_brcmf_chip_profile_station_vht160_capability_from_firmware() -> TestRes
 kernel_test_in!(
     "drivers/wireless/brcmfmac/chips",
     smoke_brcmf_chip_profile_station_vht160_capability_from_firmware
+);
+
+/// A contiguous 160 MHz BSS (center 50, primary 36) for a wide_phy chip:
+/// `inventory` holds the D11AC 80 MHz primary80 (0xe02a) and, when
+/// `with160`, the D11AC 160 MHz chanspec 0xe832 the firmware reports.
+fn native160(caps: [u32; 2], with160: bool, request160: bool) -> Vht80 {
+    let mut value = native(caps, with160, request160);
+    value.center = 50;
+    value
+}
+fn station_160_operation() -> Result<(), &'static str> {
+    let join_chanspec = |h: &Harness| -> Result<[u8; 2], &'static str> {
+        let commands = h.bus.commands();
+        let join = commands
+            .iter()
+            .position(|(id, _, _)| *id == 26)
+            .ok_or("160 MHz BSS join missing")?;
+        Ok(commands[join].1[48..50].try_into().unwrap())
+    };
+    for version in [5, 6] {
+        // brcmf_cfg80211 chanspec for NL80211_CHAN_WIDTH_160 primary 36:
+        // BW_160 | SB_LLL | center 50 = 0xe832; bw_cap WLC_BW_CAP_160MHZ.
+        let h = Harness::new_vht_chip(version, 36, 3, native160([3, 15], true, true), BCM4356)?;
+        h.associate(false)?;
+        let commands = h.bus.commands();
+        let cap160 = commands.iter().any(|(id, input, _)| {
+            *id == 263 && input.starts_with(b"bw_cap\0") && input[11..15] == 15u32.to_le_bytes()
+        });
+        let quarters = commands
+            .iter()
+            .filter(|(id, input, _)| *id == 262 && input.starts_with(b"per_chan_info\0"))
+            .count();
+        if join_chanspec(&h)? != 0xe832u16.to_le_bytes()
+            || width(&h) != Some(160)
+            || !cap160
+            || quarters < 8
+        {
+            return Err("wide_phy chip did not join the firmware-reported 160 MHz chanspec");
+        }
+        ready(h.device.disassociate())?.map_err(|_| "160 MHz teardown")?;
+        if h.device.link_up() || h.bus.stats().5 != 0 {
+            return Err("160 MHz teardown retained authority or freed live DMA");
+        }
+        // Without the 160 chanspec the station takes the primary80.
+        let h = Harness::new_vht_chip(version, 36, 3, native160([3, 15], false, false), BCM4356)?;
+        h.associate(false)?;
+        if join_chanspec(&h)? != 0xe02au16.to_le_bytes() || width(&h) != Some(80) {
+            return Err("160 MHz BSS without firmware 160 support did not use primary80");
+        }
+        // BCM43602 stays <= 80 MHz on the same 160 MHz BSS.
+        let h = Harness::new_vht(
+            version,
+            false,
+            36,
+            None,
+            false,
+            7,
+            native160([3, 15], true, false),
+        )?;
+        h.associate(false)?;
+        if join_chanspec(&h)? != 0xe02au16.to_le_bytes() || width(&h) != Some(80) {
+            return Err("BCM43602 joined wider than 80 MHz");
+        }
+    }
+    Ok(())
+}
+fn smoke_brcmf_chip_profile_station_vht160_join_geometry() -> TestResult {
+    station_160_operation().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/chips",
+    smoke_brcmf_chip_profile_station_vht160_join_geometry
 );

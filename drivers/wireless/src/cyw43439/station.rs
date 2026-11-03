@@ -631,7 +631,8 @@ impl<R: Fullmac> Station<R> {
             .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8, &self.channels))
             .transpose()?
             .flatten();
-        for _ in 0..2 {
+        // 160 -> primary80 -> 40 -> 20 (at most three narrowings).
+        for _ in 0..3 {
             if ht.is_some_and(|profile| {
                 profile.channel.width() > 20
                     && occupied_power(&self.domain, profile.channel).is_none()

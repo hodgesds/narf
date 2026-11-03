@@ -46,6 +46,7 @@ impl Capabilities {
             vht: None,
             offer: None,
             fallback: None,
+            fallback80: None,
             basic: 0,
         };
         profile.ap(ies)?;
@@ -82,18 +83,40 @@ impl Capabilities {
                     profile.offer = Some(offer);
                     profile.ht = self.body(true);
                     profile.basic = legacy_rates(ies)?.1;
+                    let usable = |occupied: &channel::Operating| {
+                        occupied
+                            .channels()
+                            .into_iter()
+                            .flatten()
+                            .all(|ch| valid.contains(&ch))
+                            && self.chanspecs.contains(&occupied.chanspec())
+                    };
                     if offer.width() == Width::Eighty {
                         if let Some(occupied) =
                             channel::Operating::eighty(channel, offer.center_channel())
                         {
-                            if occupied
-                                .constituents()
-                                .into_iter()
-                                .flatten()
-                                .all(|ch| valid.contains(&ch))
-                                && self.chanspecs.contains(&occupied.chanspec())
-                            {
+                            if usable(&occupied) {
                                 profile.channel = occupied;
+                            }
+                        }
+                    }
+                    // Only a wide_phy local VHT160 profile negotiates a
+                    // contiguous 160 MHz offer (never 80+80); the firmware
+                    // must report that exact D11AC 160 chanspec and every
+                    // quarter must be valid. Its primary80 is the first
+                    // fallback, else the 40/20 one.
+                    if offer.width() == Width::OneSixty && !offer.discontiguous() {
+                        let wide = channel::Operating::one_sixty(channel, offer.center_channel());
+                        let primary80 = wide.and_then(channel::Operating::primary80).filter(usable);
+                        match wide.filter(usable) {
+                            Some(occupied) => {
+                                profile.channel = occupied;
+                                profile.fallback80 = primary80;
+                            }
+                            None => {
+                                if let Some(occupied) = primary80 {
+                                    profile.channel = occupied;
+                                }
                             }
                         }
                     }
@@ -111,11 +134,17 @@ pub(super) struct Profile {
     vht: Option<[u8; 12]>,
     offer: Option<Offer>,
     fallback: Option<channel::Operating>,
+    /// A 160 MHz join's primary80, tried before the 40/20 fallback.
+    fallback80: Option<channel::Operating>,
     basic: u16,
 }
 impl Profile {
     pub(super) fn narrow(mut self) -> Self {
-        self.channel = if self.channel.width() == 80 {
+        if let Some(primary80) = self.fallback80.take() {
+            self.channel = primary80;
+            return self;
+        }
+        self.channel = if self.channel.width() >= 80 {
             self.fallback.unwrap_or_else(|| {
                 channel::Operating::twenty(self.channel.primary).expect("validated primary")
             })
@@ -409,6 +438,13 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
                         (R::VHT80 && vhtmode != 0)
                             .then(|| channel::Operating::decode80(value))
                             .flatten()
+                            .or_else(|| {
+                                // 160 MHz operation only on a wide_phy chip
+                                // whose original 5 GHz bw_cap has the 160 bit.
+                                (R::VHT80 && vhtmode != 0 && wide_phy && available[1] & 8 != 0)
+                                    .then(|| channel::Operating::decode160(value))
+                                    .flatten()
+                            })
                     }) {
                         if (occupied.primary <= 14 || R::BAND_5GHZ) && !chanspecs.contains(&value) {
                             chanspecs.push(value);
@@ -509,19 +545,24 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
                 let bfr = optional(runtime, "txbf_bfr_cap").await?.unwrap_or(0);
                 // brcmf_update_vht_cap: SUPP_CHAN_WIDTH_160 + SHORT_GI_160
                 // from the original 5 GHz bw_cap 160 bit. The negotiation
-                // profile below stays VHT80, so operation remains <= 80 MHz.
-                let mut body = if wide_phy && available[1] & 8 != 0 && reported160 {
-                    local_vht.with_160mhz(true, true).capability_body()
+                // profile is then VHT160, so a contiguous 160 MHz offer can
+                // select 160 MHz operation (prepare); 43602/CYW stay VHT80.
+                let with160 = wide_phy && available[1] & 8 != 0 && reported160;
+                let local_vht = if with160 {
+                    local_vht.with_160mhz(true, true)
                 } else {
-                    local_vht.capability_body()
+                    local_vht
                 };
+                let mut body = local_vht.capability_body();
                 let cap = u32::from_le_bytes(body[..4].try_into().unwrap())
                     | beamforming_capability(bfe, bfr, tx);
                 body[..4].copy_from_slice(&cap.to_le_bytes());
-                Some((
-                    body,
-                    LocalPhy::vht80(local_ht, local_vht).map_err(|_| Error::Unsupported)?,
-                ))
+                let local = if with160 {
+                    LocalPhy::vht160(local_ht, local_vht)
+                } else {
+                    LocalPhy::vht80(local_ht, local_vht)
+                };
+                Some((body, local.map_err(|_| Error::Unsupported)?))
             }
             None => None,
             Some(_) => return Err(Error::Unsupported),
@@ -590,7 +631,7 @@ impl<R: Fullmac> Station<R> {
             // cfg80211::brcmf_construct_chaninfo queries per_chan_info on
             // each20MHz constituent. Index0 uses the plain iovar (fwil.c).
             // Never discard a firmware-only passive/radar/invalid restriction.
-            for channel in occupied.constituents().into_iter().flatten() {
+            for channel in occupied.channels().into_iter().flatten() {
                 let mut query = b"per_chan_info\0".to_vec();
                 query.extend_from_slice(
                     &u32::from(channel::encode20(channel).ok_or(Error::Unsupported)?).to_le_bytes(),
@@ -604,7 +645,9 @@ impl<R: Fullmac> Station<R> {
             }
         }
         let band = if occupied.primary <= 14 { 2u32 } else { 1u32 };
+        // WLC_BW_CAP_160MHZ / _80MHZ / _40MHZ / _20MHZ.
         let width = match occupied.width() {
+            160 => 15u32,
             80 => 7u32,
             40 => 3,
             _ => 1,

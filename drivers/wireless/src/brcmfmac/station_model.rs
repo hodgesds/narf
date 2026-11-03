@@ -263,6 +263,7 @@ impl Firmware {
             ies.extend_from_slice(&vht.request(
                 self.phy_profile.map_or(0, |p| p.0),
                 match self.bandwidth[0] {
+                    15 => 160,
                     7 => 80,
                     3 => 40,
                     _ => 20,
@@ -643,12 +644,16 @@ impl Firmware {
                     let ch = u32::from_le_bytes(input[14..18].try_into().unwrap());
                     if let Some(vht) = &self.vht {
                         assert_eq!(ch & !255, 0xd000);
-                        let channels = [
-                            vht.center - 6,
-                            vht.center - 2,
-                            vht.center + 2,
-                            vht.center + 6,
-                        ];
+                        let channels: Vec<u8> = if vht.is160() {
+                            (0..8).map(|i| vht.center - 14 + i * 4).collect()
+                        } else {
+                            vec![
+                                vht.center - 6,
+                                vht.center - 2,
+                                vht.center + 2,
+                                vht.center + 6,
+                            ]
+                        };
                         assert!(channels.contains(&((ch & 255) as u8)));
                         let flags = 7u32
                             | if ch & 255 == u32::from(vht.center + 6)
@@ -778,6 +783,7 @@ impl Firmware {
                     vht.channel(
                         self.channel,
                         match self.bandwidth[0] {
+                            15 => 160,
                             7 => 80,
                             3 => 40,
                             _ => 20,

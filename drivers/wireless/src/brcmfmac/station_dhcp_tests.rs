@@ -334,7 +334,11 @@ impl Harness {
         }
         let mut domain = firmware::domain();
         let wide = features.wide.is_some() || features.vht.is_some();
-        let width = if features.vht.is_some() {
+        // A 160 MHz fixture BSS needs one 160 MHz rule over its span.
+        let wide160 = features.vht.as_ref().is_some_and(|v| v.is160());
+        let width = if wide160 {
+            160
+        } else if features.vht.is_some() {
             80
         } else if wide {
             40
@@ -350,11 +354,19 @@ impl Harness {
         }
         if channel > 14 {
             use narf_wireless::reg::{RegFlags, RegRule};
-            for (start, end, flags) in [
+            let rules160 = [
+                (5170, 5330, RegFlags::empty()),
+                (5735, 5835, RegFlags::empty()),
+            ];
+            let rules = [
                 (5170, 5250, RegFlags::empty()),
                 (5250, 5330, RegFlags::DFS),
                 (5735, 5835, RegFlags::empty()),
-            ] {
+            ];
+            for (start, end, flags) in if wide160 { &rules160[..] } else { &rules[..] }
+                .iter()
+                .copied()
+            {
                 domain.rules.push(RegRule {
                     freq_start_mhz: start,
                     freq_end_mhz: end,

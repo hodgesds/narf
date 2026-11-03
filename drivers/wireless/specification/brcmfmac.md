@@ -627,13 +627,30 @@ non-43602 PCIe runtime: the PHY probe then admits `rxchain` up to four
 chains and `txstreams` up to four, and adds `SUPP_CHAN_WIDTH_160` and
 `SHORT_GI_160` (`brcmf_update_vht_cap`) only when the original 5 GHz
 `bw_cap` has the 160 bit and the firmware's `chanspecs` list reports a valid
-5 GHz D11AC 160 MHz chanspec. That is capability only: negotiation stays the
-VHT80 profile and joins remain <= 80 MHz (the firmware's own request may now
-carry the 160 bits, which the exact request comparison then expects). BCA
+5 GHz D11AC 160 MHz chanspec. The firmware's own request then carries the
+160 bits, which the exact request comparison expects.
+
+160 MHz operation (pass 2, `wide_phy` only): with those two facts the
+negotiation profile is `LocalPhy::vht160`, and the probe keeps every
+firmware-reported D11AC 160 chanspec (`0xe800`, `channel::Operating::decode160`)
+in the native inventory. `Operating::one_sixty` is Linux's
+`NL80211_CHAN_WIDTH_160` geometry (`cfg80211.c` chandef-to-chanspec, sideband
+LLL..UUU = (primary offset + 70) / 20 at bit 8, `brcmu_d11.c`
+`BRCMU_CHSPEC_D11AC_BW_160` 0x2800): eight 20 MHz channels from
+`center - 14`, all in brcmfmac's 5 GHz set (centers 50 and 114; 163 would
+need 169..177), occupied span `center +/- 80 MHz`. A contiguous 160 MHz
+`Offer` (never 80+80) joins at 160 MHz only when that exact chanspec is in
+the firmware inventory and all eight channels are valid; the regulatory
+grant then needs one rule over the whole span with `max_bandwidth >= 160`.
+`configure_width` queries `per_chan_info` on all eight channels and sets
+`bw_cap` `WLC_BW_CAP_160MHZ` (0xf) with readback; the join chanspec and its
+`chanspec` readback are the 160 encoding. Narrowing goes 160 -> primary80
+-> 40 -> 20; an unusable 160 chanspec takes the primary80 directly. A
+firmware roam to a 160 MHz chanspec is accepted only on `wide_phy`.
+BCM43602 and CYW43439 never form the VHT160 profile or a 160 inventory, so
+they stay <= 80 MHz. BCA
 firmware's 212 event codes (`bca/core.c`) need the same 27-byte event mask
-as WCC's 213. Remaining: 160 MHz join geometry/occupied-span policy, 4-stream
-fixture coverage, OTP/seed chips, CYW-vendor chips and the
-`wifi-fixtures board-manifest` encoder (still families 1/2).
+as WCC's 213. Remaining: 4-stream fixture coverage and CYW-vendor chips.
 
 Written, unexecuted: `drivers/wireless/brcmfmac/chips`
 `smoke_brcmf_chip_profile_linux_rambase_and_firmware_rows`,
