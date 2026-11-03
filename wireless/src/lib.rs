@@ -528,6 +528,17 @@ pub trait WirelessNetIface: Interface {
     fn async_control_interfaces(&self) -> bool {
         false
     }
+    /// Bitmask (`1 << NL80211_IFTYPE_*`) of the `NEW_INTERFACE` iftypes
+    /// routed to [`Self::new_control_interface_async`] when
+    /// [`Self::async_control_interfaces`] is true; the remaining iftypes
+    /// keep the legacy [`Self::new_virtual_interface`] path. The same mask,
+    /// tested with the selected object's current iftype, picks the
+    /// `DEL_INTERFACE` path. The default routes every iftype async, so a
+    /// radio that opts into control-only interfaces without overriding this
+    /// behaves exactly as before the mask existed.
+    fn async_control_iftypes(&self) -> u32 {
+        u32::MAX
+    }
     async fn new_control_interface_async(
         &self,
         _authority: &ap_control::RadioControlAuthority,

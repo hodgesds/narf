@@ -181,3 +181,114 @@ kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_go_power_advertisement_requires_native_role_and_optin
 );
+
+/// A radio with the control-only opt-in and an optional iftype mask.
+struct Routed {
+    base: InterfaceStub,
+    optin: bool,
+    mask: Option<u32>,
+}
+impl Interface for Routed {
+    fn name(&self) -> &str {
+        self.base.name()
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.base.mac()
+    }
+    fn mtu(&self) -> u32 {
+        self.base.mtu()
+    }
+    fn link_up(&self) -> bool {
+        self.base.link_up()
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.base.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.base.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for Routed {
+    fn async_control_interfaces(&self) -> bool {
+        self.optin
+    }
+    fn async_control_iftypes(&self) -> u32 {
+        self.mask.unwrap_or(u32::MAX)
+    }
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        self.base.get_wireless_info()
+    }
+    async fn scan(
+        &self,
+        _: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+}
+
+fn smoke_nl80211_async_control_iftype_mask_preserves_default_dispatch() -> TestResult {
+    let stub = |name| InterfaceStub {
+        name,
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    };
+    // The trait defaults (no opt-in, full mask) keep every iftype legacy.
+    let legacy = stub("route-legacy");
+    if legacy.async_control_iftypes() != u32::MAX
+        || [2, 3, 8, 9, 10, 31, 32, u32::MAX]
+            .iter()
+            .any(|&iftype| super::super::routes_async_control(&legacy, iftype))
+    {
+        return TestResult::Fail("default radio left the legacy NEW/DEL_INTERFACE path");
+    }
+    // An opted-in radio without a mask (iwlwifi, mt76) routes every iftype
+    // async, exactly as `async_control_interfaces()` alone did.
+    let all = Routed {
+        base: stub("route-all"),
+        optin: true,
+        mask: None,
+    };
+    if [2, 3, 8, 9, 10, 31, 32, u32::MAX]
+        .iter()
+        .any(|&iftype| !super::super::routes_async_control(&all, iftype))
+    {
+        return TestResult::Fail("default iftype mask changed opted-in radios' dispatch");
+    }
+    // A DEVICE-only mask (brcmfmac) routes only iftype 10 async.
+    let device = Routed {
+        base: stub("route-device"),
+        optin: true,
+        mask: Some(1 << 10),
+    };
+    if !super::super::routes_async_control(&device, 10)
+        || [2, 3, 8, 9, 32, u32::MAX]
+            .iter()
+            .any(|&iftype| super::super::routes_async_control(&device, iftype))
+    {
+        return TestResult::Fail("P2P_DEVICE-only mask routed another iftype async");
+    }
+    // The mask never grants async routing without the opt-in.
+    let masked_off = Routed {
+        base: stub("route-off"),
+        optin: false,
+        mask: Some(1 << 10),
+    };
+    if super::super::routes_async_control(&masked_off, 10) {
+        return TestResult::Fail("iftype mask bypassed the async control opt-in");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_async_control_iftype_mask_preserves_default_dispatch
+);

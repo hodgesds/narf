@@ -959,6 +959,16 @@ calls `release_control_metadata` for only the unpublished idle child, outside
 all registry locks. That trusted callback is idempotent metadata cleanup and
 may neither wait for hardware nor retire an uncertain native owner.
 
+`async_control_iftypes` (bitmask of `1 << NL80211_IFTYPE_*`, default
+`u32::MAX`) narrows which `NEW_INTERFACE` iftypes an opted-in radio routes
+to that control-only path; the rest keep `new_virtual_interface`. DEL tests
+the selected object's `current_iftype` against its own mask. The default
+mask leaves the dispatch exactly `async_control_interfaces()` (iwlwifi and
+mt76 unchanged); brcmfmac returns only P2P_DEVICE (10) so its STA/AP/
+P2P_CLIENT/P2P_GO netdevs stay on the legacy callbacks.
+(`nl80211::control::routes_async_control`; written, unexecuted
+`smoke_nl80211_async_control_iftype_mask_preserves_default_dispatch`.)
+
 DEL accepts the actual control WDEV and its explicit current child grant
 (including the creating socket's retained grant). Its native owner must retain
 stop/cancellation through actual firmware/RF/packet retirement even if the API

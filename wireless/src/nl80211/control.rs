@@ -2346,7 +2346,7 @@ fn virtual_interface_handle(
                 .filter(|iface| super::in_namespace(iface.as_ref(), context.net_ns_id))
                 .ok_or(ENODEV)?;
             let admin = authority(&context, radio.as_ref())?;
-            if radio.async_control_interfaces() {
+            if routes_async_control(radio.as_ref(), iftype) {
                 return virtual_async::create(
                     radio,
                     admin,
@@ -2374,7 +2374,9 @@ fn virtual_interface_handle(
                 return Err(EOPNOTSUPP);
             }
             let (selected, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
-            if selected.control_namespace().is_some() && selected.async_control_interfaces() {
+            if selected.control_namespace().is_some()
+                && routes_async_control(selected.as_ref(), selected.current_iftype())
+            {
                 if index.is_some() {
                     return Err(EINVAL);
                 }
@@ -2395,6 +2397,18 @@ fn virtual_interface_handle(
         }
         _ => Err(EOPNOTSUPP),
     }
+}
+
+/// `NEW_INTERFACE`/`DEL_INTERFACE` routing: the async control path is taken
+/// only when the radio opts in and its `async_control_iftypes` mask holds
+/// `iftype`. With the default mask (`u32::MAX`) this is exactly
+/// `async_control_interfaces()`, preserving existing radios' dispatch.
+pub(crate) fn routes_async_control(radio: &dyn crate::WirelessNetIface, iftype: u32) -> bool {
+    if !radio.async_control_interfaces() {
+        return false;
+    }
+    let mask = radio.async_control_iftypes();
+    mask == u32::MAX || 1u32.checked_shl(iftype).is_some_and(|bit| mask & bit != 0)
 }
 
 fn virtual_interface_errno(error: crate::WirelessError) -> i32 {
