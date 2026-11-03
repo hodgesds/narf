@@ -45,16 +45,15 @@
 //!
 //! ## Named remainders (not programmed by this lane)
 //!
-//! - **Watermarks / DBUF allocation.** The Gen12 orchestrator's
-//!   pre-boot constants are TGL PRM values; no MTL counterpart
-//!   is published in the sources this lane grounds on, and i915
-//!   computes MTL allocations from pcode latency tables.
-//!   Firmware's allocation is left in place — the same posture
-//!   the Gen12 path takes toward DBUF_CTL power sequencing.
+//! - **Watermarks / DBUF allocation.** Qualified display14.00 with
+//!   every pipe off runs the computed resource transaction
+//!   ([`crate::intel_gpu_xelpg_resources`]); other cases keep
+//!   firmware's allocation and the raise-only CDCLK floor.
 //! - **HDMI / DP 2.0 UHBR / MST / multi-pipe** — out of scope,
 //!   matching the Gen12 orchestrator's DP-SST single-pipe shape.
-//! - **DVFS/pcode notifications** around CDCLK changes — the
-//!   Gen12 path omits them as well.
+//! - **DVFS/pcode notifications** around CDCLK changes — display
+//!   14 has no PCODE CDCLK mailbox; the owned transaction programs
+//!   PM demand instead, the inherited path still sends none.
 
 use core::cell::Cell;
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -495,17 +494,24 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         crate::intel_gpu_color::initialize_rgb_bypass(self.mmio)
             .map_err(|_| ModesetError::ColorPipelineUnavailable)?;
 
-        // A qualified display14.00 resource transaction owns no-SAGV,
-        // joined MBUS and a cursor DDB reservation before any plane enable.
-        // Unsupported preflight retains the historical inherited layout;
-        // every partial request/programming failure keeps this pipe off.
-        let current = acknowledged_cdclk(self.mmio)?;
-        let target = mtl_cdclk_for_pixel_clock(mode.pixel_clock_khz)
-            .map_or(current, |entry| current.max(entry.cdclk_khz));
-        crate::intel_gpu_display_resources::initialize(self.mmio, &mode, target)
-            .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
-        // Step 4: CDCLK floor for the mode's pixel clock.
-        program_cdclk_floor(self.mmio, &mode)?;
+        // A qualified display14.00 resource transaction owns PM demand,
+        // the computed CDCLK (raised or lowered), DBUF/MBUS, watermarks and
+        // the cursor DDB reservation before any plane enable. Unsupported
+        // preflight retains the historical inherited layout; a failed
+        // transaction restores what it touched and keeps this pipe off.
+        acknowledged_cdclk(self.mmio)?;
+        let owned = crate::intel_gpu_display_resources::initialize(self.mmio, &mode, 0).map_err(
+            |e| match e {
+                crate::intel_gpu_xelpg_resources::ResourceError::Clock(_) => {
+                    ModesetError::PllLockTimeout
+                }
+                _ => ModesetError::DisplayResourceUnavailable,
+            },
+        )?;
+        // Step 4: the inherited layout keeps the raise-only CDCLK floor.
+        if owned.is_none() {
+            program_cdclk_floor(self.mmio, &mode)?;
+        }
 
         // Step 5: enable the port PLL at the rate this pixel
         // clock needs (the same bandwidth rule the Gen12 path

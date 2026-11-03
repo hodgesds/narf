@@ -284,14 +284,24 @@ fn smoke_mtl_failclosed_actual_stop_and_pll_abort_later_programming() -> TestRes
             &test_fb(),
             Some(&short_window_mode),
         );
-        assert_eq!(io.written(0x46070), [0, 16, 0x80000010]);
+        // The owned display14 transaction classifies the non-table clock as
+        // unknown (bxt_sanitize_cdclk) and takes the full source path: the
+        // disable RMW keeps the ratio field, then lock at ratio16.
         if refuse_squash {
             assert_eq!(result, Err(ModesetError::PllLockTimeout));
+            // The refused squash fails readback; the original ratio34 PLL is
+            // restored through the same full disable/enable sequence.
+            assert_eq!(
+                io.written(0x46070),
+                [0x22, 16, 0x80000010, 0x10, 0x22, 0x80000022]
+            );
+            assert_eq!(io.mode.read32(0x46070) & 0x800000ff, 0x80000022);
             assert!(
                 io.written(0x64040).is_empty(),
                 "no PHY after refused squash"
             );
         } else {
+            assert_eq!(io.written(0x46070), [0x22, 16, 0x80000010]);
             assert_eq!(result, Ok(short_window_mode));
             assert_eq!(cdclk_current_khz(&io), 307_200);
             assert_eq!(io.mode.read32(0x46008), 0);
@@ -330,12 +340,17 @@ fn smoke_mtl_failclosed_actual_stop_and_pll_abort_later_programming() -> TestRes
     for r in [0x45230, 0x45234, 0x44300, 0x46070, 0x64040, 0x46140] {
         assert!(io.written(r).is_empty(), "missing source rung wrote {r:#x}");
     }
-    // Preserve an actually locked inherited high-clock fast path through
-    // the real dispatcher; no gratuitous clock rewrite is introduced.
+    // The owned display14 transaction no longer preserves a faster
+    // firmware clock: CDCLK_CTL 0 is not bxt_cdclk_ctl(652.8MHz), so the
+    // clock is unknown and the computed 172.8MHz rung is fully relocked
+    // (squash off first, PLL RMW-disable, ratio16 lock, waveform, CTL).
     let io = FailClosedMtl::new();
     io.mode.cdclk_pll.set((1 << 31) | 34);
     assert_eq!(io.run(), Ok(Mode::VESA_1024X768_60));
-    assert!(io.written(0x46070).is_empty());
+    assert_eq!(io.written(0x46070), [0x22, 16, 0x80000010]);
+    assert_eq!(io.written(0x46008), [0, 0x8f00ad5a]);
+    assert_eq!(io.written(0x46000), [(7 << 19) | 344]);
+    assert_eq!(cdclk_current_khz(&io), 172_800);
     // The clock helper also preserves acknowledged firmware current above
     // the local table; this is only the existing floor contract, not a new
     // complete display/link qualification for the synthetic high pixel rate.

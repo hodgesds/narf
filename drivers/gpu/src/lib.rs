@@ -808,6 +808,8 @@ pub mod intel_gpu_pll;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pm;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_pmdemand;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_power_controls;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
@@ -851,6 +853,14 @@ pub mod intel_gpu_xe_uapi;
 mod intel_gpu_xe_vm;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_xelpg_cdclk;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_xelpg_dbuf;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_xelpg_resources;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_xelpg_wm;
 pub mod nvidia_gpu;
 pub mod nvidia_gpu_disp;
 pub mod nvidia_gpu_falcon;
