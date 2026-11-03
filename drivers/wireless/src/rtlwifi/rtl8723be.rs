@@ -26,12 +26,22 @@
 //! - [`pwrseq`] — PCI rows of every `rtl8723B_*_flow` (`pwrseq.{c,h}`).
 //! - [`fw`] — header validation and `rtl8723_download_fw` with the
 //!   8723BE 8051 self-reset.
+//! - [`trx`] — 64-byte linked TX ring entries (40-byte descriptor, buffer at
+//!   dword 10, next link at dword 12), `rtl8723be_tx_fill_desc` /
+//!   `rtl8723be_tx_fill_cmddesc` and the `rtl8723be_rx_query_desc` status.
+//! - [`llt`] — `_rtl8723be_llt_table_init` (boundary 245).
+//! - [`mac`] — the `_rtl8723be_init_mac` remainder in its three segments
+//!   around the owner's `REG_CR` writes and LLT, `_rtl8723be_hw_configure`
+//!   and the station address.
 
 #![allow(dead_code)]
 
 pub mod adapter;
 pub mod fw;
+pub mod llt;
+pub mod mac;
 pub mod pwrseq;
+pub mod trx;
 pub mod version;
 
 #[cfg(any(test, feature = "kernel-test"))]

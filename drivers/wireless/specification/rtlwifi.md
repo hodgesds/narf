@@ -3022,6 +3022,31 @@ keeps the chip diagnostic until admission lands.
   `smoke_rtl8723be_retained_firmware_owner_profile`,
   `smoke_rtlwifi_8723be_enable_prefix_and_card_enable_flow` (written,
   unexecuted).
+- `trx` — `rtl8723be/trx.h` is the RTL8821AE layout bit for bit (no
+  `tx_ant`; RX `rxht` at dword 3 BIT6): 40-byte TX descriptor in a 64-byte
+  entry, buffer at dword 10, `next_desc_address` at dword 12 (byte 48),
+  32-byte RX status with the buffer at dword 6. `rtl8723be_tx_fill_desc`
+  single-buffer path (`max_agg_num 0x14`, TCB RTS rate/SC/short, short GI
+  only above `DESC92C_RATEMCS0`, 40 MHz SC 3 or `cur_40_prime_sc`,
+  `HWSEQ_EN` for non-QoS, BMC, tx report), `rtl8723be_tx_fill_cmddesc`
+  (OWN left to the publishing owner) and the `rtl8723be_rx_query_desc`
+  status fields.
+- `llt` — `_rtl8723be_llt_table_init`: boundary 245 in `TRXFF_BNDY`,
+  `TDECTRL+1`, BCNQ, MGQ, `0x45d`; PBP `0x31`, DRVINFO 4, 256 links, then
+  `RQPN = 0x80e40808` and `RQPN_NPQ = 0`.
+- `mac` — `_rtl8723be_init_mac` remainder in three segments around the
+  owner's `REG_CR = 0xff` / `0x2ff` and LLT (pre-CR `MULTI_FUNC_CTRL[3]`,
+  `APS_FSMCO[4]`; clocks `HWSEQ_CTRL |= 0x7f`, 2 ms, `0x7c[6]` when
+  `SYS_CFG[24]`, `SYS_CLKR[3]`, `GPIO_MUXCFG[12]` clear; post-LLT HISR/HISRE
+  W1C, `FWIMR[30]`, `TRXDMA_CTRL (old & 0xf) | 0xf5b1`, RCR `0xf0007a0e`,
+  `RXFLTMAP2`, TCR `0x03008200`, `PCIE_CTRL+3 |= 0x77`, INT_MIG/MCUTST_1,
+  `0x577 = 3`, the eight `rtl_set_bbreg` DPDT/fixed-board RMWs, RXDMA
+  release), the RCR `ACRC32|AICV` trim, `_rtl8723be_hw_configure` and the
+  station address (software crypto). `btc_power_on_setting` belongs to the
+  coexistence owner. Not yet wired: no `prepare::Chip` profile for
+  `0xb723`. Tests `smoke_rtl8723be_tx_rx_descriptor_layout`,
+  `smoke_rtl8723be_llt_table`, `smoke_rtl8723be_init_mac_and_hw_configure`
+  (written, unexecuted).
 
 ## 4. Invariants
 

@@ -415,3 +415,254 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_retained_firmware_owner_profile
 );
+
+// ── descriptors ───────────────────────────────────────────────────────────
+
+/// `rtl8723be_tx_fill_desc` field placement (single buffer, first+last),
+/// including the 8723BE-specific choices that differ from RTL8821AE.
+fn smoke_rtl8723be_tx_rx_descriptor_layout() -> TestResult {
+    use trx::*;
+    let p = TxParams {
+        pkt_size: 1500,
+        queue_sel: QSLT_BE,
+        macid: 1,
+        rate_id: 4,
+        hw_rate: DESC_RATEMCS7,
+        use_driver_rate: false,
+        use_shortgi: true,
+        use_shortpreamble: false,
+        bw_40: true,
+        packet_bw_40: true,
+        ampdu: true,
+        ampdu_density: 5,
+        qos_data: true,
+        seq: 0x123,
+        rts_enable: true,
+        rts_rate: 0x08,
+        rts_sc: 2,
+        rts_use_shortpreamble: true,
+        buffer_len: 1500,
+        buffer_addr: 0x1234_5678,
+        ..TxParams::default()
+    };
+    let d = TxDesc::fill(&p);
+    if d.pkt_size() != 1500
+        || d.queue_sel() != QSLT_BE
+        || d.macid() != 1
+        || d.tx_rate() != DESC_RATEMCS7
+        || d.data_bw() != 1
+        || d.sub_carrier() != 3
+        || d.own()
+        || d.dw[0] >> 16 & 0xff != HWDESC_HEADER_LEN
+        || d.dw[0] & (3 << 26) != 3 << 26
+        || (d.dw[3] >> 17) & 0x1f != 0x14
+        || d.dw[2] & (1 << 12) == 0
+        || (d.dw[2] >> 20) & 7 != 5
+        || d.dw[5] & (1 << 4) == 0
+        || d.dw[3] & (1 << 12) == 0
+        || (d.dw[4] >> 24) & 0x1f != 0x08
+        || (d.dw[5] >> 13) & 0xf != 2
+        || d.dw[5] & (1 << 12) == 0
+        || (d.dw[9] >> 12) & 0xfff != 0x123
+        || d.dw[10] != 0x1234_5678
+        || d.dw[7] & 0xffff != 1500
+        || (d.dw[1] >> 16) & 0x1f != 4
+        || d.dw[8] & (1 << 15) != 0
+    {
+        return TestResult::Fail("8723BE TX descriptor fields");
+    }
+    // Short GI only above MCS0; 20 MHz packet on a 40 MHz BSS uses
+    // cur_40_prime_sc; non-QoS sets HWSEQ_EN.
+    let legacy = TxDesc::fill(&TxParams {
+        hw_rate: DESC_RATEMCS0,
+        use_shortgi: true,
+        bw_40: true,
+        cur_40_prime_sc: 1,
+        ..TxParams::default()
+    });
+    if legacy.dw[5] & (1 << 4) != 0
+        || legacy.data_bw() != 0
+        || legacy.sub_carrier() != 1
+        || legacy.dw[8] & (1 << 15) == 0
+    {
+        return TestResult::Fail("short GI threshold / prime SC / HWSEQ_EN");
+    }
+    let cmd = TxDesc::fill_cmd(64, 0xabc0);
+    if cmd.queue_sel() != QSLT_BEACON
+        || cmd.tx_rate() != DESC_RATE1M
+        || cmd.pkt_size() != 64
+        || cmd.dw[3] & (1 << 8) == 0
+        || cmd.dw[10] != 0xabc0
+    {
+        return TestResult::Fail("rtl8723be_tx_fill_cmddesc");
+    }
+    let mut e = TxDesc::default();
+    e.set_next(0xdead_0000);
+    if e.dw[12] != 0xdead_0000 || NEXT_DESC_BYTE != 48 {
+        return TestResult::Fail("next_desc_address at dword 12");
+    }
+    let mut rx = [0u32; 8];
+    rx_arm(&mut rx, 0x4000, 0x2000, true);
+    if RxStatus::parse(&rx).is_some() || rx[6] != 0x4000 || rx[0] & (1 << 30) == 0 {
+        return TestResult::Fail("RX arm / OWN");
+    }
+    rx[0] = 100 | (1 << 16) | (2 << 24) | (1 << 26);
+    rx[1] = 3 | (1 << 15);
+    rx[2] = 1 << 28;
+    rx[3] = 0x0c | (1 << 6);
+    rx[4] = (1 << 4) | 1;
+    rx[5] = 0x55;
+    match RxStatus::parse(&rx) {
+        Some(s)
+            if s.length == 100
+                && s.drvinfo_size == 8
+                && s.shift == 2
+                && s.physt
+                && s.decrypted
+                && s.macid == 3
+                && s.ampdu
+                && s.c2h
+                && s.rate == 0x0c
+                && s.is_ht
+                && s.bw == 1
+                && s.short_preamble
+                && s.tsfl == 0x55
+                && s.payload_offset() == 32 + 8 + 2
+                && !s.is_cck() => {}
+        _ => return TestResult::Fail("rtl8723be_rx_query_desc fields"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_tx_rx_descriptor_layout
+);
+
+// ── LLT and MAC ───────────────────────────────────────────────────────────
+
+struct LltView<'a>(&'a FwFake);
+impl llt::Regs for LltView<'_> {
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        // The modelled LLT engine completes each write at once.
+        Ok(self.0.read32(reg)? & !(3 << 30))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        self.0.write8(reg, value)
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        self.0.write16(reg, value)
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        self.0.write32(reg, value)
+    }
+}
+
+/// `_rtl8723be_llt_table_init`: boundaries, PBP 0x31, 256 links, RQPN last.
+fn smoke_rtl8723be_llt_table() -> TestResult {
+    let io = fw_fake(true, true, false);
+    if llt::init(&LltView(&io)).is_err() {
+        return TestResult::Fail("8723BE LLT init failed");
+    }
+    let g = io.0.lock();
+    let links: Vec<u32> = g
+        .writes
+        .iter()
+        .filter(|w| w.0 == llt::REG_LLT_INIT)
+        .map(|w| w.1)
+        .collect();
+    let want: Vec<u32> = llt::links()
+        .map(|(a, n)| crate::rtlwifi::rtl8821ae::llt::llt_word(a, n))
+        .collect();
+    let head: Vec<(u16, u32, u8)> = g.writes.iter().copied().take(7).collect();
+    let tail: Vec<(u16, u32, u8)> = g.writes.iter().rev().take(2).copied().collect();
+    if links.len() != 256
+        || links != want
+        || want[243] != crate::rtlwifi::rtl8821ae::llt::llt_word(243, 244)
+        || want[244] != crate::rtlwifi::rtl8821ae::llt::llt_word(244, 0xff)
+        || want[255] != crate::rtlwifi::rtl8821ae::llt::llt_word(255, 245)
+        || head[..]
+            != [
+                (llt::REG_TRXFF_BNDY, 0x27ff_00f5, 4),
+                (llt::REG_TDECTRL + 1, 245, 1),
+                (llt::REG_TXPKTBUF_BCNQ_BDNY, 245, 1),
+                (llt::REG_TXPKTBUF_MGQ_BDNY, 245, 1),
+                (llt::REG_BCNQ1_BDNY, 245, 1),
+                (llt::REG_PBP, 0x31, 1),
+                (llt::REG_RX_DRVINFO_SZ, 4, 1),
+            ]
+        || tail[..] != [(llt::REG_RQPN_NPQ, 0, 1), (llt::REG_RQPN, 0x80e4_0808, 4)]
+    {
+        return TestResult::Fail("_rtl8723be_llt_table_init order / values");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_llt_table
+);
+
+/// `_rtl8723be_init_mac` segments, `_rtl8723be_hw_configure` and the RCR
+/// trim: the exact values and the `rtl_set_bbreg` board RMWs.
+fn smoke_rtl8723be_init_mac_and_hw_configure() -> TestResult {
+    let io = fw_fake(true, true, false);
+    {
+        let mut g = io.0.lock();
+        g.regs[usize::from(mac::REG_SYS_CFG) + 3] = 1;
+        g.regs[usize::from(mac::REG_GPIO_MUXCFG) + 1] = 0xff;
+        g.regs[usize::from(mac::REG_TRXDMA_CTRL)] = 0x0a;
+        g.regs[usize::from(mac::REG_RXDMA_CONTROL)] = 0x04;
+        g.regs[0x4c..0x50].copy_from_slice(&0x0180_0000u32.to_le_bytes());
+        g.regs[0x40] = 0x10;
+    }
+    let ok = mac::init_mac_pre_cr(&io).is_ok()
+        && narf_scheduler::block_on(mac::init_mac_clocks(&io)).is_ok()
+        && mac::init_mac_post_llt(&io).is_ok()
+        && mac::hw_configure(&io).is_ok();
+    if !ok {
+        return TestResult::Fail("8723BE MAC init failed");
+    }
+    let g = io.0.lock();
+    let r32 =
+        |r: usize| u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]]);
+    if g.regs[usize::from(mac::REG_MULTI_FUNC_CTRL)] & 8 == 0
+        || g.regs[usize::from(mac::REG_APS_FSMCO)] & 0x10 == 0
+        || g.regs[usize::from(mac::REG_HWSEQ_CTRL)] != 0x7f
+        || g.regs[0x7c] & 0x40 == 0
+        || g.regs[usize::from(mac::REG_SYS_CLKR)] & 8 == 0
+        || g.regs[usize::from(mac::REG_GPIO_MUXCFG) + 1] != 0xef
+        || r32(usize::from(mac::REG_HISR)) != u32::MAX
+        || g.regs[usize::from(mac::REG_FWIMR) + 3] & 0x40 == 0
+        || g.regs[usize::from(mac::REG_TRXDMA_CTRL)..usize::from(mac::REG_TRXDMA_CTRL) + 2]
+            != 0xf5bbu16.to_le_bytes()
+        || r32(usize::from(mac::REG_RCR)) != mac::RCR
+        || r32(usize::from(mac::REG_TCR)) != mac::TCR
+        || g.regs[usize::from(mac::REG_PCIE_CTRL_REG) + 3] != 0x77
+        || g.regs[usize::from(mac::REG_SECONDARY_CCA_CTRL)] != 3
+        || r32(0x4c) & (3 << 23) != 2 << 23
+        || g.regs[0x40] & 0x18 != 0x08
+        || g.regs[0x944] & 3 != 3
+        || g.regs[0x930] != 0x77
+        || r32(0x38) & (1 << 11) == 0
+        || g.regs[usize::from(mac::REG_RXDMA_CONTROL)] & 4 != 0
+        || g.regs[0x550] != 0x1d
+        || r32(0x460) != 0x0308_6666
+        || g.regs[0x4ca] != 0x1f
+        || r32(0x448) != 0xffff_f000
+    {
+        return TestResult::Fail("_rtl8723be_init_mac / hw_configure values");
+    }
+    // No REG_CR write: the owner keeps the packet gates.
+    if g.writes.iter().any(|w| w.0 == 0x100 || w.0 == 0x101) {
+        return TestResult::Fail("REG_CR written by the MAC segments");
+    }
+    drop(g);
+    match mac::trim_receive_config(&io) {
+        Ok(rcr) if rcr == mac::RCR & !mac::RCR_ACRC32_AICV => {}
+        _ => return TestResult::Fail("RCR ACRC32/AICV trim"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_init_mac_and_hw_configure
+);
