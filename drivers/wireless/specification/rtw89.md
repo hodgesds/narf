@@ -2911,6 +2911,26 @@ select 0xf/0xf/0xd/0xb for 20/40/80/160MHz, BW40 2xFFT/T2F GI combine,
 final field is read back.
 Unexecuted case: `smoke_rtw89_c_channel_mac_and_ctrl_ch_follow_rtw8852c`.
 
+**Channel IQK (`rfk::c_iqk`).** `Iqk::run(profile)` is rtw8852c_rfk.c
+`rtw8852c_iqk(PHY_0)` for any typed `operating_channel_c::Profile`:
+`BTC_WRFKT_IQK` START, `rtw89_chip_stop_sch_tx`, `_wait_rx_mode` (RF_AB),
+`_iqk_init` (R_IQKINF clear, wideband: `is_nbiqk = false`), then per path
+A, B between ONESHOT START/STOP `_doiqk`: `_iqk_get_ch_info` (band, bw,
+`chan->channel`, IQK 0x2a / NCTL 0xd, `syn1to2` = 1), the
+`rtw8852c_backup_{bb,rf}_regs` backup, `_iqk_macbb_setting`
+(`rtw8852c_txck_force(DAC_960M)`, `rtw8852c_rxck_force(ADC_1920M)` with
+the `_ck*` defs), `_iqk_preset` (RFK MCC table index 0: the first idle
+`rtw89_rfk_chan_lookup` slot), `_iqk_txk_setting`, `_iqk_lok` +
+`_lok_finetune_check`, `_txk_group_sel` (3 groups), `_iqk_rxk_setting`
+(ADC 480/960/1920M by width, `rtw8852c_iqk_rxk_cfg_defs`),
+`_rxk_group_sel` (4 groups), `_iqk_info_iqk` (persistent `iqk_times` /
+`iqk_fail_cnt`), `_iqk_restore` (0x1219 + path), the
+`rtw8852c_iqk_afebb_restore_defs_{a,b}` table and the backup restore.
+Linux `_iqk_check_cal` always reports success, so only the LOK range check
+can fail; NARF refuses a LOK failure (no results published) and fails any
+0xbff8/RX-mode poll timeout closed. Unexecuted case:
+`smoke_rtw89_c_iqk_channel_follows_rtw8852c_wideband_flow`.
+
 Remaining for the `rtl8852c` row (no row credit): the rest of
 `rtw8852c_set_channel_bb` (CCK/CCA enables, spur
 elimination, BTG BT RX, 5M mask, 160MHz P80 RU, CDD EVM, TXPW RSTB, MUIC,
