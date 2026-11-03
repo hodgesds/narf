@@ -474,7 +474,7 @@ pub fn observe(
     own: [u8; 6],
     signal_dbm: Option<i8>,
 ) -> Result<ObservedBss, Error> {
-    observe_inner(frame, channel, own, signal_dbm, None, false)
+    observe_inner(frame, channel, own, signal_dbm, None, false, false)
 }
 /// Opt into factual HT/VHT admission from the actual retained raw BSS.
 /// The local profile does not confer channel, transmit or association rights.
@@ -485,7 +485,7 @@ pub fn observe_with_phy(
     signal_dbm: Option<i8>,
     local: &phy::LocalPhy,
 ) -> Result<ObservedBss, Error> {
-    observe_inner(frame, channel, own, signal_dbm, Some(local), false)
+    observe_inner(frame, channel, own, signal_dbm, Some(local), false, false)
 }
 /// Explicit CCK-only channel14 observer. Native callers must prove actual
 /// typed2.4GHz2484MHz/CCK-only RX/source/CRC permission; this parser grants none.
@@ -495,7 +495,26 @@ pub fn observe_cck14(
     own: [u8; 6],
     signal_dbm: Option<i8>,
 ) -> Result<ObservedBss, Error> {
-    observe_inner(frame, 14, own, signal_dbm, None, true)
+    observe_inner(frame, 14, own, signal_dbm, None, true, false)
+}
+/// Explicit-band 6 GHz observer (cfg80211 `cfg80211_inform_bss_frame_data`
+/// on an `NL80211_BAND_6GHZ` channel): the observed Bss carries
+/// `band = Some(Ghz6)` so a 6 GHz primary is never read as a 2.4/5 GHz
+/// number. No DS Parameter Set is expected on 6 GHz; one naming another
+/// channel is refused as on the other bands. This grants no channel,
+/// transmit or association right.
+pub fn observe_6ghz(
+    frame: &impl crate::station_security::RawFrame,
+    channel: u8,
+    own: [u8; 6],
+    signal_dbm: Option<i8>,
+) -> Result<ObservedBss, Error> {
+    if channel::frequency_in(channel::Band::Ghz6, channel).is_none() {
+        return Err(Error::InvalidBss);
+    }
+    let mut observed = observe_inner(frame, channel, own, signal_dbm, None, false, true)?;
+    observed.bss.band = Some(channel::Band::Ghz6);
+    Ok(observed)
 }
 fn forbidden_cck14_phy(id: u8, body: &[u8]) -> bool {
     matches!(id, 45 | 61 | 191 | 192)
@@ -511,11 +530,14 @@ fn observe_inner(
     signal_dbm: Option<i8>,
     local: Option<&phy::LocalPhy>,
     cck14: bool,
+    six: bool,
 ) -> Result<ObservedBss, Error> {
     let bytes = frame.bytes();
     if !frame.unmodified()
         || if cck14 {
             channel != 14 || local.is_some()
+        } else if six {
+            local.is_some()
         } else {
             channel::band(channel).is_none()
         }
