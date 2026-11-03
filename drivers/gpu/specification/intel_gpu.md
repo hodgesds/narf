@@ -5983,7 +5983,18 @@ Fixtures, all new and unexecuted in this slice, are in
 - `smoke_oa_read_wrap_clear_enospc_status_eio_and_info`
 - `smoke_oa_descriptor_authority_blocking_config_and_reopen`
 - `smoke_oa_reset_suspend_loss_and_buffer_retention`
+- `smoke_oa_hardware_bmg_reservation_ring_job_read_and_reset_retirement`
 
-They drive real units, sessions and descriptors against a register and
-memory model. The GuC ring-job and runtime wiring has no GT-model fixture
-yet. Silicon and Mesa acceptance remain open.
+The first nine drive real units, sessions and descriptors against a
+register and memory model. The last drives the real BMG `GuCGt` through the
+existing GuC model:
+
+- the reservation before scheduling and the published facts;
+- the configuration's LRI job, registered, executed and retired through
+  the GuC scheduler;
+- programming, the tail service and a read;
+- stop and reset, where the buffer survives GuC stop until GRDOM_FULL.
+
+The model now recognises a render ring whose first LRI targets a source OA
+register as a configuration job. The asynchronous runtime backend has no
+fixture of its own. Silicon and Mesa acceptance remain open.

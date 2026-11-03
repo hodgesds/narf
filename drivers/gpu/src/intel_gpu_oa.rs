@@ -1797,6 +1797,33 @@ pub(crate) fn capable() -> bool {
     crate::intel_gpu_eu_stall::capable()
 }
 
+/// A sampling stream on `device` with a private configuration, for GT-model
+/// fixtures outside this module.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn test_session(
+    device: Device,
+    format: usize,
+    buffer: u32,
+    exponent: Option<u8>,
+    regs: &[(u32, u32)],
+) -> Arc<Session> {
+    Session::new(
+        device,
+        FORMATS[format],
+        true,
+        exponent,
+        1,
+        buffer,
+        device.oag_engines().next().expect("OAG engine"),
+        Permit::take(device.card).expect("free OA unit"),
+        Arc::new(Config {
+            id: 1,
+            uuid: [b'0'; 36],
+            regs: regs.to_vec(),
+        }),
+    )
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "intel_gpu_oa_tests.rs"]
 mod tests;

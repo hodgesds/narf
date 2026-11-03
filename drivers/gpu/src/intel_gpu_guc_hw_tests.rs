@@ -1780,7 +1780,17 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     } else if tail != 32 {
                         let (svg, used) =
                             crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
-                        if gen12 || ptl {
+                        // A privileged OA configuration job: LRI groups to
+                        // source OA/NOA registers, then the owned breadcrumb.
+                        let gmd = d.regs.get(&0xd8c).copied().unwrap_or(0);
+                        let oa = ring[1] & 0xff00_0000 == 0x1100_0000
+                            && crate::intel_gpu_oa::valid_register(
+                                ((gmd >> 22) * 100 + ((gmd >> 14) & 255)) as u16,
+                                ring[2],
+                            );
+                        if oa {
+                            assert!(svg.is_empty(), "OA jobs carry no state commands");
+                        } else if gen12 || ptl {
                             // Source Wa14019789679 ends at graphics20.04;
                             // neither Gen12 nor PTL uses this SVG seed.
                             assert!(svg.is_empty(), "Gen12/PTL seed has no XeHP SVG commands");
@@ -1811,7 +1821,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         }];
                         // Fixture-only opaque save area, not a claimed hardware
                         // SVG layout. Capture proves every header reaches clones.
-                        if !gen12 && !ptl {
+                        if !gen12 && !ptl && !oa {
                             image.borrow_mut()[0x2100 / 4..0x2100 / 4 + 50].copy_from_slice(&svg);
                         }
                     } else {
@@ -3698,6 +3708,10 @@ mod reset_policy {
 
 mod lnl_eu_stall {
     include!("intel_gpu_eu_stall_hw_tests.rs");
+}
+
+mod oa_native {
+    include!("intel_gpu_oa_hw_tests.rs");
 }
 
 mod ggtt_tlb_hw {
