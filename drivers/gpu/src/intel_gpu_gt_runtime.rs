@@ -193,7 +193,47 @@ struct Pending {
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
     smallbar: bool,
+    /// Installed by the opted-in Lunar Lake display-20 route after its owned
+    /// modeset (`narf.intel.lnl_display=1`): the display-preserving profile.
+    lnl_display: bool,
     window: AuthorizedWindow,
+}
+
+/// The integrated Xe2/Xe3 GT profile of one function (§17 10.5).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LnlProfile {
+    /// Headless main GT: client-free cold start through a driver FLR, which
+    /// also resets display and stolen memory. Unchanged by the display route.
+    Headless,
+    /// Lunar Lake display-20 function: the route's lit panel is preserved.
+    /// No driver FLR; `lnl::Receipt::admit_display`, then the GT-only reset
+    /// `HardwareInit` runs before the first PTE.
+    DisplayPreserving,
+}
+
+/// Select the integrated GT profile. `None` is either not an integrated
+/// Xe2/Xe3 profile or a refused combination (a display route on anything but
+/// Lunar Lake, or one without a lit panel mode).
+pub(crate) fn lnl_profile(
+    platform: GtPlatform,
+    lnl_display: bool,
+    has_mode: bool,
+) -> Option<LnlProfile> {
+    if !platform.is_headless_integrated() {
+        return None;
+    }
+    match (lnl_display, platform.is_lnl() && has_mode) {
+        (false, _) => Some(LnlProfile::Headless),
+        (true, true) => Some(LnlProfile::DisplayPreserving),
+        (true, false) => None,
+    }
+}
+
+/// The display-preserving profile is D0-only: system suspend would lose the
+/// panel's GGTT surface and display-20 relight is not owned, so suspend is
+/// refused (the BMG small-BAR profile's precedent).
+pub(crate) fn system_suspend_admitted(smallbar: bool, lnl_display: bool) -> bool {
+    !smallbar && !lnl_display
 }
 
 struct Owner {
@@ -1221,6 +1261,37 @@ pub(crate) fn install(
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
 ) -> bool {
+    install_profile(index, card, device, cap, bar, mode, false)
+}
+
+/// The Lunar Lake display-20 route's GT owner: the display-preserving
+/// profile beside the route's lit panel `mode`. Refused for anything that is
+/// not Lunar Lake with a lit mode.
+pub(crate) fn install_lnl_display(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+) -> bool {
+    let profile = GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(|platform| lnl_profile(platform, true, mode.is_some()));
+    if profile != Some(LnlProfile::DisplayPreserving) {
+        return false;
+    }
+    install_profile(index, card, device, cap, bar, mode, true)
+}
+
+fn install_profile(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+    lnl_display: bool,
+) -> bool {
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
         .is_none()
@@ -1250,6 +1321,7 @@ pub(crate) fn install(
         bar,
         mode,
         smallbar,
+        lnl_display,
         window,
     });
     true
@@ -1660,6 +1732,28 @@ impl Owner {
                 GgttArena::for_smallbar_gt(p.bar, mmio.clone(), authority)
                     .map_err(|_| RuntimeError::State)?,
             )
+        } else if lnl_profile(platform, p.lnl_display, p.mode.is_some())
+            == Some(LnlProfile::DisplayPreserving)
+        {
+            // §17 10.5: never the headless driver FLR, which would reset the
+            // route's lit panel. Each cold start re-admits from current
+            // hardware; HardwareInit's GT-only reset precedes every PTE. The
+            // boot framebuffer and any KMS display stay live, so neither the
+            // headless boot-scanout exclusion nor its client gate applies.
+            if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
+                return Err(RuntimeError::Configuration);
+            }
+            let receipt =
+                crate::intel_gpu_gt::lnl::Receipt::admit_display(p.device, p.bar, &mmio, || {
+                    validate_pci(p, &mmio).is_ok()
+                })
+                .map_err(RuntimeError::Takeover)?;
+            SharedArena::new(
+                GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
+                    .map_err(|_| RuntimeError::State)?,
+            )
+        } else if p.lnl_display {
+            return Err(RuntimeError::Configuration);
         } else if platform.is_headless_integrated() {
             if self.user_epoch.load(Ordering::Acquire) != 0
                 || p.mode.is_some()
@@ -3127,7 +3221,7 @@ impl Owner {
 impl narf_power::device_pm::DevicePmOps for Owner {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
         use narf_power::device_pm::DeviceSuspendError as E;
-        if self.pending.smallbar {
+        if !system_suspend_admitted(self.pending.smallbar, self.pending.lnl_display) {
             return Err(E::Busy);
         }
         let state = self.state.try_lock().ok_or(E::Busy)?;
@@ -3153,8 +3247,10 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
             // Initial opted-in whole-device incarnation is deliberately D0-only.
-            // No repeated driver-FLR may wipe retained BO/fd/VM state.
-            if self.pending.smallbar {
+            // No repeated driver-FLR may wipe retained BO/fd/VM state. The
+            // Lunar Lake display-20 profile is D0-only as well: display-20
+            // relight after S3 is not owned.
+            if !system_suspend_admitted(self.pending.smallbar, self.pending.lnl_display) {
                 return Err(E::Busy);
             }
             // pci_pm_suspend runtime-resumes a suspended function before the

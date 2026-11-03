@@ -375,6 +375,17 @@ pub(crate) fn probe_route(
     route.is_ok()
 }
 
+/// Whether the display route still holds Pipe A for its eDP panel (the claim
+/// probe records after a successful [`takeover`]). The display-preserving GT
+/// profile is admitted only beside that owner.
+pub(crate) fn route_owns_pipe_a() -> bool {
+    crate::intel_gpu_multipipe::pipe_owner(crate::intel_gpu_pipes::Pipe::A)
+        == Some(crate::intel_gpu_multipipe::PipeOwner {
+            ddi: crate::intel_gpu_ddi::Ddi::A,
+            used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+        })
+}
+
 /// The display-20 owned Pipe-A modeset, through the display-14
 /// orchestrator dispatched on Xe2_LPD. Refused read-only unless the
 /// hardware reports display 20.00: the generation alone never selects it
@@ -755,3 +766,7 @@ pub(crate) fn enable_d2d(
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xe2lpd_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_xe2lpd_gt_tests.rs"]
+mod gt_tests;

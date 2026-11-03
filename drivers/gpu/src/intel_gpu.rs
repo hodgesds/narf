@@ -1514,7 +1514,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
     // A retained firmware scanout has not granted us its GGTT reservation.
     // Start automatically only after this driver owns the integrated scanout.
-    let guc_owned = if owns_scanout {
+    // The Lunar Lake display-20 route is the exception: its GT owner takes
+    // the display-preserving profile (no driver FLR) beside the lit panel and
+    // maps only its own >=256 MiB GGTT arena, never the firmware surface.
+    let guc_owned = if lnl_display && panel_mode.is_some() {
+        crate::intel_gpu_gt_runtime::install_lnl_display(
+            card_index, gt_card, device, cap, gt_bar, panel_mode,
+        )
+    } else if owns_scanout {
         crate::intel_gpu_gt_runtime::install(card_index, gt_card, device, cap, gt_bar, panel_mode)
     } else {
         false
