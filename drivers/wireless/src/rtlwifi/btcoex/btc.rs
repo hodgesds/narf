@@ -98,9 +98,10 @@ pub enum ChipType {
     Rtl8723b = 5,
 }
 
-/// `enum btc_rssi_state`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `enum btc_rssi_state` (zero, the static-storage default, is `HIGH`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RssiState {
+    #[default]
     High = 0,
     Medium = 1,
     Low = 2,

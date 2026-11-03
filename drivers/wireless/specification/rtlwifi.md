@@ -3192,7 +3192,26 @@ keeps the chip diagnostic until admission lands.
   `run_coexist_mechanism`, init coex dm / hw config and every `ex_`
   handler (power-on, init hwconfig incl. `wifi_only`, init coex dm, IPS,
   LPS, scan, connect, media status, special packet, BT info, RF status,
-  halt, PnP, periodical). Outstanding: `halbtc8723b2ant`, owner wiring
+  halt, PnP, periodical). `btcoex/b8723b2ant.rs` is `halbtc8723b2ant.c`
+  (0x3f): coex dm/sta with the `is_wifi_status_changed` and
+  `tdma_duration_adjust` statics as fields, the 2/3-level BT and Wi-Fi
+  RSSI states, limited RX, BT / Wi-Fi counter monitors (`slave_role`),
+  `action_algorithm`, FW DAC swing / dec BT power / SW DAC swing (0x883),
+  low-penalty RA (0xf4..0xf6), the 16 coex tables, ignore-WLAN-act,
+  LPS/RPWM, the full `ps_tdma` table with the 1.5-antenna `+100` switch,
+  `wifi_duration_adjust` and the slave-role byte-4 bit, `set_ant_path`
+  (internal / external switch, 0x6e GNT_BT), power-save state, all-off,
+  init coex dm, BT inquiry, link / idle processing, `is_common_action`,
+  `tdma_duration_adjust` (the per-`max_interval` / `tx_pause` chains as
+  `ADJUST_ARMS`, applied in Linux order on the updated `cur_ps_tdma`,
+  plus the mismatch restore), every profile action, multi-port,
+  `run_coexist_mechanism`, `wifioff_hwcfg` and every `ex_` handler
+  (power-on, pre-load firmware, init hwconfig, init coex dm, IPS, LPS,
+  scan, connect, media status, special packet, BT info, halt, PnP,
+  periodical). `b8723b2ant::Rtl8723b` is the `exhalbtc_*` RTL8723B
+  dispatch: both algorithms keep state and each notify goes to the 2-ant
+  one when `btdm_ant_num == 2`, the 1-ant one when 1. Difference: the BT
+  info row copy is bounded to 10 bytes. Outstanding: owner wiring
   (C2H `BtInfo`/`BtMp` delivery, `BtLps` from `lps_ctrl`, notify call
   sites, periodical timer) and admission. Tests
   `smoke_rtlwifi_btc_bind_bitmask_and_wifi_queries`,
@@ -3201,7 +3220,10 @@ keeps the chip diagnostic until admission lands.
   `smoke_rtlwifi_btc8723b1ant_ps_tdma_tables`,
   `smoke_rtlwifi_btc8723b1ant_power_on_and_init_hw_config`,
   `smoke_rtlwifi_btc8723b1ant_bt_info_a2dp_connected`,
-  `smoke_rtlwifi_btc8723b1ant_periodical_bt_disable_and_ips` (written,
+  `smoke_rtlwifi_btc8723b1ant_periodical_bt_disable_and_ips`,
+  `smoke_rtlwifi_btc8723b2ant_tables_and_algorithm`,
+  `smoke_rtlwifi_btc8723b2ant_power_on_and_init_hw_config`,
+  `smoke_rtlwifi_btc8723b2ant_a2dp_tdma_adjust_and_ips` (written,
   unexecuted).
 
 ## 4. Invariants

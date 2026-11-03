@@ -534,3 +534,224 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/btcoex",
     smoke_rtlwifi_btc8723b1ant_periodical_bt_disable_and_ips
 );
+
+// ── halbtc8723b2ant ───────────────────────────────────────────────────────
+
+use super::b8723b2ant::{
+    action_algorithm, adjust_initial_type, ps_tdma_bytes as ps_tdma_bytes_2ant, rssi_state,
+    wifi_duration_adjust as wifi_duration_adjust_2ant, BtStatus as BtStatus2, CoexAlgo, Rtl8723b,
+};
+
+/// Connected, busy 8723BE station on a dual-antenna board with a
+/// Linux-era firmware (>= 0x180000) and a strong signal.
+fn coex_2ant() -> (BtCoexist, FakeHal, Rtl8723b) {
+    let mut btc = BtCoexist::bind(pg(2, true));
+    btc.wifi.fw_version = 0x24;
+    btc.wifi.station_linked = true;
+    btc.wifi.busy = true;
+    btc.wifi.current_channel = 6;
+    btc.wifi.undec_sm_pwdb = 60;
+    (btc, FakeHal::default(), Rtl8723b::default())
+}
+
+/// `btc8723b2ant_ps_tdma` bytes and `wifi_duration_adjust`,
+/// `tdma_duration_adjust`'s first type, `action_algorithm` and the
+/// 2/3-level RSSI state machines.
+fn smoke_rtlwifi_btc8723b2ant_tables_and_algorithm() -> TestResult {
+    if wifi_duration_adjust_2ant(3, 0) != 5
+        || wifi_duration_adjust_2ant(10, 0) != 0
+        || wifi_duration_adjust_2ant(30, 0) != -5
+        || wifi_duration_adjust_2ant(50, 0) != -10
+        || wifi_duration_adjust_2ant(3, 40) != -10
+        || wifi_duration_adjust_2ant(3, 48) != -15
+    {
+        return TestResult::Fail("wifi_duration_adjust");
+    }
+    if ps_tdma_bytes_2ant(true, 1, 0, 1) != [0xe3, 0x3c, 0x03, 0xf1, 0x91]
+        || ps_tdma_bytes_2ant(true, 9, -15, 0) != [0xe3, 0x2d, 0x03, 0xf1, 0x90]
+        || ps_tdma_bytes_2ant(true, 101, 5, 0) != [0xd3, 0x3f, 0x03, 0x70, 0x50]
+        || ps_tdma_bytes_2ant(true, 122, 0, 1) != [0xe3, 0x35, 0x03, 0x71, 0x11]
+        || ps_tdma_bytes_2ant(true, 16, 0, 0) != [0xe3, 0x10, 0x03, 0x70, 0x90]
+        || ps_tdma_bytes_2ant(true, 8, 0, 0) != [0xa3, 0x10, 0x03, 0x70, 0x90]
+        || ps_tdma_bytes_2ant(true, 99, 0, 0) != [0xe3, 0x3c, 0x03, 0xf1, 0x90]
+        || ps_tdma_bytes_2ant(false, 1, 0, 0) != [0, 0, 0, 0x48, 0]
+        || ps_tdma_bytes_2ant(false, 0, 0, 0) != [0, 0, 0, 0x40, 0]
+    {
+        return TestResult::Fail("ps_tdma bytes");
+    }
+    if adjust_initial_type(true, true, 1) != 13
+        || adjust_initial_type(true, false, 3) != 11
+        || adjust_initial_type(false, true, 2) != 6
+        || adjust_initial_type(false, false, 7) != 3
+    {
+        return TestResult::Fail("adjust initial type");
+    }
+    let mut l = BtLinkInfo {
+        bt_link_exist: true,
+        a2dp_exist: true,
+        ..BtLinkInfo::default()
+    };
+    if action_algorithm(&l, false) != CoexAlgo::A2dp {
+        return TestResult::Fail("A2DP");
+    }
+    l.pan_exist = true;
+    if action_algorithm(&l, false) != CoexAlgo::PanEdrA2dp {
+        return TestResult::Fail("PAN(EDR)+A2DP");
+    }
+    l.hid_exist = true;
+    if action_algorithm(&l, false) != CoexAlgo::HidA2dpPanEdr
+        || action_algorithm(&l, true) != CoexAlgo::HidA2dp
+    {
+        return TestResult::Fail("HID+A2DP+PAN");
+    }
+    l.sco_exist = true;
+    if action_algorithm(&l, false) != CoexAlgo::PanEdrHid
+        || action_algorithm(&l, true) != CoexAlgo::Undefined
+    {
+        return TestResult::Fail("all four");
+    }
+    if rssi_state(RssiState::High, 40, 2, 42, 0) != RssiState::Low
+        || rssi_state(RssiState::Low, 43, 2, 42, 0) != RssiState::StayLow
+        || rssi_state(RssiState::Low, 44, 2, 42, 0) != RssiState::High
+        || rssi_state(RssiState::StayLow, 50, 3, 46, 37) != RssiState::StayLow
+        || rssi_state(RssiState::Low, 30, 3, 20, 37) != RssiState::Medium
+        || rssi_state(RssiState::Medium, 39, 3, 20, 37) != RssiState::High
+    {
+        return TestResult::Fail("rssi state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b2ant_tables_and_algorithm
+);
+
+/// `exhalbtc_*` dispatch by `btdm_ant_num` and `ex_btc8723b2ant_power_on`
+/// / `init_hwconfig` / `init_coex_dm` on a PCI S0 board.
+fn smoke_rtlwifi_btc8723b2ant_power_on_and_init_hw_config() -> TestResult {
+    let (mut btc, mut hal, mut a) = coex_2ant();
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.pre_load_firmware(&mut a)).is_err()
+            || narf_scheduler::block_on(cx.power_on_setting(&mut a)).is_err()
+            || narf_scheduler::block_on(cx.init_hw_config(&mut a)).is_err()
+        {
+            return TestResult::Fail("power on / init");
+        }
+    }
+    if hal.last(0x384) != Some(0x5)
+        || hal.last(0x948) != Some(0x0)
+        || btc.board_info.btdm_ant_pos != BTC_ANTENNA_AT_AUX_PORT
+        || !btc.auto_report_2ant
+        || !btc.initialized
+    {
+        return TestResult::Fail("power on / pre-load");
+    }
+    if hal.last(0x790) != Some(0x5)
+        || hal.last(0x930) != Some(0x77)
+        || hal.last(0x4c).map(|v| v & (3 << 23)) != Some(1 << 23)
+        || hal.last(0x778) != Some(0x3)
+        || h2c_last(&hal, 0x6e) != Some(alloc::vec![1])
+        || h2c_last(&hal, 0x65) != Some(alloc::vec![1, 0])
+        || hal.last(0x6c0) != Some(0x5555_5555)
+        || hal.last(0x6c4) != Some(0x5555_5555)
+    {
+        return TestResult::Fail("init_hwconfig");
+    }
+    if h2c_last(&hal, 0x60) != Some(alloc::vec![0, 0, 0, 0x48, 0])
+        || h2c_last(&hal, 0x64) != Some(alloc::vec![6])
+        || h2c_last(&hal, 0x62) != Some(alloc::vec![0])
+        // Low-penalty RA off equals its zeroed previous state: not sent.
+        || h2c_last(&hal, 0x69).is_some()
+    {
+        return TestResult::Fail("init_coex_dm");
+    }
+    // The 1-antenna algorithm stays untouched on a 2-antenna board.
+    if a.one.dm.cur_ps_tdma != 0 || a.two.dm.cur_ps_tdma != 1 {
+        return TestResult::Fail("dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b2ant_power_on_and_init_hw_config
+);
+
+/// A BT-response A2DP-busy `bt_info` with a busy station: `action_a2dp`
+/// (native power save, coex table 7, `tdma_duration_adjust` from type 1),
+/// then three retry-free periodicals step the adjust up to type 71 with
+/// the bit-pool duration adjust; IPS enter turns the radio over to BT.
+fn smoke_rtlwifi_btc8723b2ant_a2dp_tdma_adjust_and_ips() -> TestResult {
+    let (mut btc, mut hal, mut a) = coex_2ant();
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        let _ = narf_scheduler::block_on(cx.power_on_setting(&mut a));
+        let _ = narf_scheduler::block_on(cx.init_hw_config(&mut a));
+    }
+    hal.h2c.clear();
+    // src BT_RSP; CONNECTION | ACL_BUSY | A2DP; no retries; RSSI 0x20
+    // (74); ext BIT4; bit pool 48.
+    let info = [0x01, 0x49, 0x00, 0x20, 0x10, 0x00, 0x30];
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.bt_info_notify(&mut a, &info)).is_err() {
+            return TestResult::Fail("bt_info notify");
+        }
+    }
+    let t = &a.two;
+    if !t.sta.a2dp_exist
+        || t.sta.bt_rssi != 74
+        || t.sta.a2dp_bit_pool != 0x30
+        || t.dm.bt_status != BtStatus2::AclBusy
+        || t.dm.cur_algorithm != CoexAlgo::A2dp
+        || !t.dm.auto_tdma_adjust
+        || t.dm.ps_tdma_du_adj_type != 1
+        || !btc.bt_info.bt_busy
+        || !btc.bt_info.limited_dig
+        || !btc.bt_link_info.a2dp_only
+        || hal.last(0x6c0) != Some(0x55dd_55dd)
+        || hal.last(0x6c4) != Some(0x5ada_5ada)
+        || h2c_last(&hal, 0x62) != Some(alloc::vec![2])
+        || h2c_last(&hal, 0x60) != Some(alloc::vec![0xe3, 0x3c, 0x03, 0xf1, 0x90])
+    {
+        return TestResult::Fail("A2DP action");
+    }
+    for _ in 0..3 {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.periodical(&mut a)).is_err() {
+            return TestResult::Fail("periodical");
+        }
+    }
+    let t = &a.two;
+    if t.dm.cur_ps_tdma != 71
+        || t.dm.ps_tdma_du_adj_type != 71
+        || t.st.n != 3
+        || t.st.up != 0
+        || h2c_last(&hal, 0x60) != Some(alloc::vec![0xe3, 0x2d, 0x03, 0xf1, 0x90])
+        || h2c_last(&hal, 0x6e) != Some(alloc::vec![0])
+        || hal.last(0x76e) != Some(0xc)
+        || h2c_last(&hal, 0x61).is_some()
+    {
+        return TestResult::Fail("duration adjust up");
+    }
+    {
+        let mut cx = Ctx::new(&mut btc, &mut hal);
+        if narf_scheduler::block_on(cx.ips_notify(&mut a, true)).is_err() {
+            return TestResult::Fail("ips enter");
+        }
+    }
+    if !a.two.sta.under_ips
+        || h2c_last(&hal, 0x63) != Some(alloc::vec![1])
+        || h2c_last(&hal, 0x6e) != Some(alloc::vec![1])
+        || h2c_last(&hal, 0x60) != Some(alloc::vec![0, 0, 0, 0x48, 0])
+        || hal.rf.last() != Some(&(BTC_RF_A, 0x1, 0xfffff, 0x0))
+        || hal.last(0x6c0) != Some(0x5555_5555)
+    {
+        return TestResult::Fail("IPS enter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/btcoex",
+    smoke_rtlwifi_btc8723b2ant_a2dp_tdma_adjust_and_ips
+);
