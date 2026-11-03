@@ -1186,6 +1186,7 @@ fn smoke_eu_stall_exact_lnl_source_profile_sparse_dss_and_cache_refusal() -> Tes
                 0x913c => 0x80000001,
                 0x9144 => 4,
                 0x9134 => 0x81,
+                0x9118 => 0x0001_00f0, // Xe2 L3: one node, four banks
                 _ => panic!("unqualified topology read {reg:x}"),
             }
         }

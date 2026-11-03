@@ -1713,6 +1713,10 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     (0x9148, 0x80000000),
                     (0x914c, 0),
                     (0x380d8c, 30 << 22 | step),
+                    // XE2_NODE_ENABLE_MASK nodes 0-1 over the harness's
+                    // MEML3 nibble; MIRROR_L3BANK_ENABLE without bank 1.
+                    (0x9118, 0x0003_0001),
+                    (0x9130, 0xfd),
                 ]);
             }
             hardware_discovery(&mut gt, &w, 0xdfc);
@@ -1840,8 +1844,10 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 Err(FsError::InvalidData)
             );
             let topo = xe_query(&query_file, &info, &query_user, 5);
-            // Independent Xe topology records: header8+mask12 twice, EU header8+mask2.
-            assert_eq!(topo.len(), 50);
+            // Independent Xe topology records: header8+mask12 twice, the
+            // L3 bank header8+mask8, then EU header8+mask2. The L3 entry is
+            // new: query_gt_topology always reports the primary GT's.
+            assert_eq!(topo.len(), 66);
             assert_eq!(
                 (&topo[..8], &topo[8..20]),
                 (
@@ -1855,6 +1861,14 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     &[0, 0, 2, 0, 12, 0, 0, 0][..],
                     &[0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0][..]
                 )
+            );
+            // load_l3_bank_mask's Xe3 branch: banks 0xfd on nodes 0 and 1.
+            assert_eq!(
+                &topo[40..],
+                &[
+                    0, 0, 3, 0, 8, 0, 0, 0, 0xfd, 0, 0, 0, 0xfd, 0, 0, 0, // L3_BANK
+                    0, 0, 5, 0, 2, 0, 0, 0, 5, 0, // SIMD16_EU_PER_DSS
+                ][..]
             );
             let file = RenderFile::new();
             let user = Cpu::new();

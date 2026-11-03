@@ -47,6 +47,9 @@ impl MmioWindow for FuseImage {
             0x913c => 0x8000_0101,
             0x9144 => 0x1002,
             0x9134 => 5,
+            // load_l3_bank_mask's MIRROR_FUSE3 and (graphics 12.70) XEHP_FUSE4.
+            0x9118 => 1,
+            0x9114 => 0x10,
             _ => panic!("discovery accessed unrelated register"),
         }
     }

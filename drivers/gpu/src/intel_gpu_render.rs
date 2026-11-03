@@ -2072,6 +2072,8 @@ pub(crate) mod tests {
                     0x913c => 5,
                     0x9144 => 6,
                     0x9134 => 5,
+                    0x9118 => 1,    // MEML3_EN node 0
+                    0x9114 => 0x10, // GT_L3_EXC_MASK pair 0
                     _ => panic!("topology register"),
                 }
             }

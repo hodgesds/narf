@@ -1282,8 +1282,9 @@ kernel_test_in!(
 /// graphics 20: GT_L3_EXC_MASK (XEHP_FUSE4 6:4) bits select two-bank pairs
 /// of one node's pattern and every MEML3_EN_MASK (MIRROR_FUSE3 3:0) node
 /// repeats it 4 bits further, ORing any overlap as gen_l3_mask_from_pattern.
+/// GT1 shares this computation with the MTL/Arrow main GT.
 fn smoke_media_gt_topology_l3_bank_mask_follows_xe_gt_topology() -> TestResult {
-    use crate::intel_gpu_gt::media::l3_bank_mask;
+    use crate::intel_gpu_topology::{xelpg_l3_bank_mask, L3Rule};
     for (fuse3, fuse4, mask) in [
         (0, 0x70, 0),
         (0xf, 0, 0),
@@ -1298,7 +1299,8 @@ fn smoke_media_gt_topology_l3_bank_mask_follows_xe_gt_topology() -> TestResult {
         // Bits outside MEML3_EN_MASK and GT_L3_EXC_MASK are ignored.
         (0xffff_fff1, 0xffff_ff9f, 0x3),
     ] {
-        kt_assert_eq!(l3_bank_mask(fuse3, fuse4), mask);
+        kt_assert_eq!(xelpg_l3_bank_mask(fuse3, fuse4), mask);
+        kt_assert_eq!(L3Rule::XeLpg.mask(fuse3, fuse4), Some(mask));
     }
     TestResult::Pass
 }

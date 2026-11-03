@@ -276,22 +276,28 @@ fn query_wire(
                     topology.geometry_dss().to_le_bytes()[..width].to_vec(),
                 ),
                 (0, 2, topology.compute_dss().to_le_bytes()[..width].to_vec()),
-                (
-                    0,
-                    if topology.eu_type() == EuType::Simd16 {
-                        5
-                    } else {
-                        4
-                    },
-                    topology.eu_mask_per_dss().to_le_bytes().to_vec(),
-                ),
             ];
+            // query_gt_topology: L3 bank sits between compute and EU, as
+            // xe_l3_bank_mask_t's 8 bytes, whenever xe_gt_topology_report_l3
+            // holds, which it always does for the primary GT. GtTopology
+            // omits it only where load_l3_bank_mask defines no mask.
+            if let Some(l3) = topology.l3_bank_mask() {
+                masks.push((0, 3, l3.to_le_bytes().to_vec()));
+            }
+            masks.push((
+                0,
+                if topology.eu_type() == EuType::Simd16 {
+                    5
+                } else {
+                    4
+                },
+                topology.eu_mask_per_dss().to_le_bytes().to_vec(),
+            ));
             // query_gt_topology walks for_each_gt: the published media GT
             // follows with its own GSI-read fuses in the same per-GT layout
-            // (geometry, compute, then SIMD8 EU per DSS at graphics 12.7x).
-            // xe_gt_topology_report_l3 keeps a media GT's L3 bank entry
-            // before media version 30, as xe_l3_bank_mask_t's 8 bytes. GT0's
-            // entries above remain NARF's existing ones (no L3 bank entry).
+            // (geometry, compute, L3 bank, then SIMD8 EU per DSS at graphics
+            // 12.7x). xe_gt_topology_report_l3 keeps a media GT's L3 bank
+            // entry before media version 30.
             if let Some(media) = info.backend.as_ref().and_then(|b| b.media_gt()) {
                 masks.extend([
                     (1, 1, media.topology.geometry.to_le_bytes().to_vec()),

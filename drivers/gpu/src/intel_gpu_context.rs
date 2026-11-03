@@ -349,8 +349,10 @@ pub(crate) mod tests {
         fn read32(&self, offset: u64) -> u32 {
             let reads = self.reads.get();
             self.reads.set(reads + 1);
+            // ContextSeed samples XEHP_FUSE4/MIRROR_FUSE3 twice; an unstable
+            // window changes MIRROR_FUSE3 in its second sample.
             self.regs.get(&offset).copied().unwrap_or(0)
-                ^ if self.unstable && reads >= 8 && offset == 0x9118 {
+                ^ if self.unstable && reads >= 2 && offset == 0x9118 {
                     1
                 } else {
                     0
@@ -606,9 +608,12 @@ pub(crate) mod tests {
                 error
             );
         }
+        // GtTopology now samples MIRROR_FUSE3 too (its L3 bank mask), so the
+        // fuses change only once the seed's own samples begin.
         let mut w = window();
-        w.unstable = true;
         let topo = GtTopology::read(&w, GtPlatform::Alchemist).unwrap();
+        w.unstable = true;
+        w.reads.set(0);
         assert_eq!(
             ContextSeed::read(&w, GtPlatform::Alchemist, &topo, &hwconfig()).unwrap_err(),
             ContextError::Unstable

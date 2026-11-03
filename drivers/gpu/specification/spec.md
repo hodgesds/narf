@@ -2210,8 +2210,32 @@ bounded identical samples include the eight-bit EU fuse register at 0x9134;
 unexpected upper EU bits, unstable samples and empty DSS/EU sets refuse startup.
 An all-ones DSS mask is valid for a fully populated 32-DSS GT. MTL/DG2 expand
 each enabled EU fuse bit to two SIMD8 EUs; BMG preserves individual SIMD16 EUs.
-Geometry/compute overlap counts once. Separate media GTs, L3 banks and future
+Geometry/compute overlap counts once. Separate media GTs and future
 multi-register/expanded EU formats are not inferred.
+
+The same two samples carry xe_gt_topology.c::load_l3_bank_mask's fuses after
+the EU register: MIRROR_FUSE3 (0x9118) on every profile, then XEHP_FUSE4
+(0x9114) on MTL/Arrow or MIRROR_L3BANK_ENABLE (0x9130) on PTL. A changed L3
+fuse makes the snapshot unstable. `L3Rule` selects the source branch by the
+device's graphics IP and yields xe_l3_bank_mask_t's 64 bits:
+- Gen12 (12.00): inverted MIRROR_FUSE3 7:0, one bit per bank.
+- DG2: eight banks per MEML3_EN_MASK (3:0) node.
+- MTL/Arrow (12.70-12.74): a two-bank pair per GT_L3_EXC_MASK (XEHP_FUSE4 6:4)
+  bit, repeated every four bits per MEML3_EN_MASK node, overlap ORed.
+- BMG/LNL (20.xx): the XE2_GT_L3_MODE_MASK (7:4) nibble per
+  XE2_NODE_ENABLE_MASK (31:16) node.
+- PTL (30.xx): MIRROR_L3BANK_ENABLE's 32 bits per XE2_NODE_ENABLE_MASK node.
+A PTL node above 1 would shift past bit 63, which Linux leaves undefined, so
+that snapshot has no L3 mask. Every other fuse value, all-ones included, is
+reported as computed. The MTL/Arrow media GT uses the same 12.70 computation.
+
+Native Xe `DRM_XE_DEVICE_QUERY_GT_TOPOLOGY` reports GT0 in
+xe_query.c::query_gt_topology order: geometry DSS, compute DSS, the 8-byte
+`DRM_XE_TOPO_L3_BANK` mask whenever the snapshot has one
+(xe_gt_topology_report_l3 always holds for the primary GT), then EU per DSS
+(SIMD8 or SIMD16). The size-only reply counts the L3 entry, and a data query
+of any other size is EINVAL. The i915 compatibility topology queries have no
+L3 counterpart in Linux and are unchanged.
 
 The physical owner reads fuses after initial quiescence/cache setup, rechecks
 both current wake holds, and accepts the snapshot before publishing staged
@@ -2684,8 +2708,9 @@ verified, and only while GT0's user epoch is live:
   mask (DRM_XE_TOPO_L3_BANK, load_l3_bank_mask's graphics 12.70 rule; Linux
   reports it for media GTs before media version 30) and a SIMD8 EU-per-DSS
   mask (graphics 12.7x), in that order, using GT0's existing 4-byte DSS and
-  2-byte EU wire widths. GT0's entries are unchanged and still carry no L3
-  bank entry. Reserved EU bits refuse the media GT as unavailable.
+  2-byte EU wire widths. GT0's entries, including its own L3 bank entry by the
+  same 12.70 computation, are unchanged by publication. Reserved EU bits
+  refuse the media GT as unavailable.
 
 Without the option, or before publication, the GT list, engine, engine-cycles
 and topology queries and queue creation are exactly GT0-only as before, and

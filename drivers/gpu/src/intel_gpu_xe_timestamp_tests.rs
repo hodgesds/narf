@@ -305,7 +305,13 @@ fn smoke_xe_mtl_media_gt1_engine_cycles_and_topology() -> TestResult {
         at += 8 + u32_at(&gt0_topology, at + 4) as usize;
         gt0_entries += 1;
     }
-    assert_eq!((at, gt0_entries), (gt0_topology.len(), 3));
+    // Geometry, compute, L3 bank and EU: query_gt_topology now reports GT0's
+    // L3 entry too (MEML3_EN node 0 with GT_L3_EXC_MASK pair 0 = banks 0-1).
+    assert_eq!((at, gt0_entries), (gt0_topology.len(), 4));
+    assert_eq!(
+        &gt0_topology[24..40],
+        &[0, 0, 3, 0, 8, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]
+    );
     for (class, logical) in [(2, 0), (3, 0), (0, 0)] {
         media_cycles_payload(&user, class, logical, 1, 1);
         let mut call = core::pin::pin!(file.dispatch_user(&off, xe::DEVICE_QUERY, 64, &user));
