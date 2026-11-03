@@ -93,6 +93,10 @@ struct Hardware {
     fbc_carve_pending: bool,
     /// `fbc_carve` polls (each is non-blocking and runs no survey).
     fbc_carve_polls: usize,
+    /// Reading this register first runs the next display tick, so
+    /// synchronous waiters (the live repartition, the external pass) see
+    /// frames, latches and DSB progress without an executor.
+    step_on_read: Option<u64>,
 }
 /// Sink AUX writes are logged in the MMIO write log at this pseudo offset
 /// plus the DPCD address, so register and sink order can be compared.
@@ -178,6 +182,7 @@ impl MockPlatform {
                 fbc_offset: None,
                 fbc_carve_pending: false,
                 fbc_carve_polls: 0,
+                step_on_read: None,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -511,6 +516,9 @@ impl MockPlatform {
     pub(crate) fn allow_frames(&self, enabled: bool) {
         self.0.lock().frames = enabled;
     }
+    pub(crate) fn step_on_read(&self, register: Option<u64>) {
+        self.0.lock().step_on_read = register;
+    }
     pub(crate) fn tear_visible_frame(&self, enabled: bool) {
         self.0.lock().tear_visible_frame = enabled;
     }
@@ -590,7 +598,24 @@ impl MockPlatform {
             .count()
     }
     pub(crate) fn step(&self) {
-        let mut hw = self.0.lock();
+        self.0.lock().step();
+    }
+    fn actions(&self) -> Vec<Action> {
+        self.0.lock().actions.clone()
+    }
+    fn mapping_count(&self) -> usize {
+        self.0
+            .lock()
+            .regs
+            .range(PTE_START..)
+            .filter(|(offset, value)| **offset % 8 == 0 && **value != 0)
+            .count()
+    }
+}
+impl Hardware {
+    /// The next display tick (see [`MockPlatform::step`]).
+    fn step(&mut self) {
+        let hw = self;
         hw.now = hw.now.saturating_add(hw.tick_ns);
         if !hw.allowed || !hw.powered {
             return;
@@ -620,17 +645,6 @@ impl MockPlatform {
         }
         hw.execute_dsb(0);
         hw.execute_dsb(1);
-    }
-    fn actions(&self) -> Vec<Action> {
-        self.0.lock().actions.clone()
-    }
-    fn mapping_count(&self) -> usize {
-        self.0
-            .lock()
-            .regs
-            .range(PTE_START..)
-            .filter(|(offset, value)| **offset % 8 == 0 && **value != 0)
-            .count()
     }
 }
 impl MmioWindow for MockPlatform {
@@ -705,6 +719,9 @@ impl MmioWindow for MockPlatform {
         }
         if offset == 0x4a404 {
             return hw.palette[(hw.regs.get(&0x4a400).copied().unwrap_or(0) & 1023) as usize];
+        }
+        if hw.step_on_read == Some(offset) {
+            hw.step();
         }
         if offset == 0x4a488 {
             return hw.pre_palette[(hw.regs.get(&0x4a484).copied().unwrap_or(0) & 255) as usize];

@@ -7,22 +7,22 @@
 //! present path needs WC GEM objects.
 use super::*;
 
-const PSR_CTL: u64 = 0x60800;
+pub(super) const PSR_CTL: u64 = 0x60800;
 const PSR_IIR: u64 = 0x60818;
 const DPFC_CONTROL: u64 = 0x43208;
 const PIPE_CLKGATE_DIS2: u64 = 0x60114;
-const EN_CFG: u64 = AUX_LOG | 0x170;
+pub(super) const EN_CFG: u64 = AUX_LOG | 0x170;
 const SET_POWER: u64 = AUX_LOG | 0x600;
 /// hsw_activate_psr1 for the fixture sink: EDP_PSR_ENABLE,
 /// MAX_SLEEP_TIME(0x1f), TP_TP1_TP3, CRC_ENABLE, TP2_TP3_TIME_2500us,
 /// TP4_TIME_0us, TP1_TIME_2500us, idle frames max(6, 2 + 1).
-const ARMED: u32 =
+pub(super) const ARMED: u32 =
     (1 << 31) | (0x1f << 20) | (1 << 11) | (1 << 10) | (2 << 8) | (3 << 6) | (2 << 4) | 6;
-const EXITED: u32 = ARMED & !(1 << 31);
+pub(super) const EXITED: u32 = ARMED & !(1 << 31);
 
 /// eDP 1.4 PSR1 sink: DPCD 1.4, TPS3 + 4 lanes, PSR version 1, 330 µs
 /// setup, SET_POWER_CAP, max resync 2 frames.
-fn sink() -> BTreeMap<u32, u8> {
+pub(super) fn sink() -> BTreeMap<u32, u8> {
     [
         (0x000, 0x14),
         (0x001, 0x1e),
@@ -42,7 +42,7 @@ fn sink() -> BTreeMap<u32, u8> {
 
 /// A VBT panel with PSR enabled (`psr.enable`), 2500 µs TP1 and TP2/TP3
 /// wake times and no idle-frame floor.
-fn vbt(idle_frames: u8, tp1: u32, tp23: u32) -> crate::intel_gpu_psr::VbtPsr {
+pub(super) fn vbt(idle_frames: u8, tp1: u32, tp23: u32) -> crate::intel_gpu_psr::VbtPsr {
     crate::intel_gpu_psr::VbtPsr::Panel(crate::intel_gpu_vbt::PsrPanel {
         enable: true,
         table: Some(crate::intel_gpu_vbt::PsrTable {
@@ -59,7 +59,11 @@ fn vbt(idle_frames: u8, tp1: u32, tp23: u32) -> crate::intel_gpu_psr::VbtPsr {
 /// The fixture's fixed timing (64x32, htotal 224, vtotal 77 at 1034 kHz:
 /// the 330 µs setup is 2 lines, well inside 44) with a PSR sink and a
 /// PSR-enabling VBT attached.
-fn attach(platform: &MockPlatform, timing: crate::intel_gpu_dsb::Timing, wm: Option<bool>) {
+pub(super) fn attach(
+    platform: &MockPlatform,
+    timing: crate::intel_gpu_dsb::Timing,
+    wm: Option<bool>,
+) {
     let mut hw = platform.0.lock();
     hw.psr_dpcd = Some(sink());
     hw.psr_timing = Some(timing);
@@ -74,11 +78,11 @@ fn psr_platform() -> MockPlatform {
     platform
 }
 
-fn psr(device: &Device<MockPlatform>) -> Option<crate::intel_gpu_psr::Psr> {
+pub(super) fn psr(device: &Device<MockPlatform>) -> Option<crate::intel_gpu_psr::Psr> {
     device.state.try_lock().unwrap().psr
 }
 
-fn sink_writes(writes: &[(u64, u32)]) -> Vec<(u64, u32)> {
+pub(super) fn sink_writes(writes: &[(u64, u32)]) -> Vec<(u64, u32)> {
     writes
         .iter()
         .filter(|(r, _)| r & AUX_LOG != 0)
@@ -86,7 +90,7 @@ fn sink_writes(writes: &[(u64, u32)]) -> Vec<(u64, u32)> {
         .collect()
 }
 
-fn present_once(device: &Device<MockPlatform>, object: Arc<GemObject>) {
+pub(super) fn present_once(device: &Device<MockPlatform>, object: Arc<GemObject>) {
     let mut session = complete(device.session()).unwrap();
     complete(session.present(object, geometry())).unwrap();
 }

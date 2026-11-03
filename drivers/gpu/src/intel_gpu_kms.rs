@@ -1587,6 +1587,226 @@ impl<M: Platform> Device<M> {
     }
 }
 
+/// `PIPE_FRMCOUNT_G4X(PIPE_A)`.
+const FRAME_A: u64 = 0x70040;
+/// One Pipe-A frame boundary after the sample `start`: the double-buffered
+/// registers armed before it have latched (`intel_crtc_wait_for_next_vblank`
+/// bounded at 100 ms, the live repartition's budget). `false` on timeout or
+/// lost access.
+fn wait_frame_after(platform: &impl Platform, start: u32) -> bool {
+    let mut lost = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            let now = platform.read32(FRAME_A);
+            lost = now == u32::MAX || !platform.access_ok();
+            lost || now != start
+        },
+        narf_time::Deadline::after_ms(100),
+    );
+    done && !lost
+}
+
+/// What the MTL external pass did around one hotplug event, for the
+/// post-update.
+#[derive(Debug)]
+struct Bracket {
+    /// FBC was deactivated by the pre-update (it was active).
+    fbc_was_active: bool,
+}
+
+/// The MTL external pass's hold on the panel's KMS owner (display 14).
+///
+/// An external output added or removed beside the lit panel repartitions
+/// the resources Pipe A runs on (its DDB and watermarks, MBUS, DBUF, CDCLK
+/// and PM demand). Linux adds Pipe A to that commit
+/// (`skl_ddb_add_affected_pipes`), so the commit is serialized with the
+/// panel's own updates and runs its pre/post plane updates for Pipe A. The
+/// pass does the same: it holds this owner's mutex (no flip, cursor, color
+/// or DSB arm can race the repartition) and, around the event,
+/// [`ExternalPass::pre_update`] / [`ExternalPass::post_update`] stand in for
+/// `intel_fbc_pre_update`, `intel_psr_pre_plane_update` with the pipe
+/// update's PSR exit, and `intel_fbc_post_update` /
+/// `intel_psr_post_plane_update`. Unlike [`Device::legacy_drain`] it never
+/// blocks the owner: the panel's proofs are multi-pipe aware
+/// ([`crate::intel_gpu_display_resources::Profile`]).
+#[derive(Debug)]
+pub(crate) struct ExternalPass<'a, M: Platform> {
+    guard: Guard<'a, M>,
+    bracket: Option<Bracket>,
+}
+
+impl<M: Platform> Device<M> {
+    /// Take the panel's KMS owner for one MTL external pass. Never waits
+    /// on another task: `Busy` while a KMS transaction holds the owner or a
+    /// primary frame change it began is still unlatched (the pass is then
+    /// retried later; its hotplug event stays queued). An in-flight DSB
+    /// stream on the panel (a cursor or color update whose future was
+    /// dropped) is waited for, bounded, before the pass may repartition:
+    /// Linux's commit waits for the previous commit's DSB
+    /// (`intel_atomic_dsb_wait_commit`) before a new one touches the pipe.
+    /// The cursor/color bookkeeping of that stream stays for the owner's
+    /// next call; the repartition preserves every register it verifies.
+    pub(crate) fn external_pass(&self) -> Result<ExternalPass<'_, M>, FsError> {
+        let state = self.state.try_lock().ok_or(FsError::Busy)?;
+        let _power = self.platform.display_power()?;
+        let mut guard = Guard {
+            device: self,
+            state,
+            _power,
+        };
+        guard.idle_dsb()?;
+        let state = &guard.state;
+        if state.pending.is_some()
+            || state.joint.is_some()
+            || state.presenter.as_ref().is_some_and(|p| p.pending())
+            || state
+                .primary_resources
+                .as_ref()
+                .is_some_and(|p| p.pending())
+        {
+            return Err(FsError::Busy);
+        }
+        Ok(ExternalPass {
+            guard,
+            bracket: None,
+        })
+    }
+}
+
+impl<M: Platform> Guard<'_, M> {
+    /// Retire an armed DSB stream synchronously (bounded at 100 ms; a
+    /// stream completes at the vblank after its arm). A DSB error or a
+    /// timeout fails the owner exactly as its own completion poll would.
+    fn idle_dsb(&mut self) -> Result<(), FsError> {
+        let platform = &self.device.platform;
+        let Some(dsb) = self.state.dsb.as_mut() else {
+            return Ok(());
+        };
+        if !dsb.armed() {
+            return Ok(());
+        }
+        let mut result = Ok(false);
+        narf_scheduler::responsive_spin_until(
+            || {
+                result = dsb.poll(platform.now());
+                !matches!(result, Ok(false))
+            },
+            narf_time::Deadline::after_ms(100),
+        );
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(FsError::Busy),
+            Err(error) => {
+                self.state.failed = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<M: Platform> ExternalPass<'_, M> {
+    /// Before a hotplug event may repartition Pipe A's resources.
+    ///
+    /// - `intel_fbc_pre_update`: FBC is deactivated ("update pending"). The
+    ///   live transaction requires FBC off, so this always takes the branch
+    ///   Linux takes when `intel_fbc_can_flip_nuke` fails; Display WA #1198
+    ///   then waits one Pipe-A vblank before the plane update when FBC was
+    ///   active.
+    /// - `intel_psr_pre_plane_update` for a Pipe A without a modeset: PSR
+    ///   stays enabled; Wa_14015648006 is set when Pipe A's
+    ///   `wm_level_disabled` is true (it is per crtc and the same in every
+    ///   layout). The pipe update's exit and idle wait
+    ///   (`intel_psr_wait_for_idle_locked`) follow, bounded at
+    ///   [`crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS`]; a latched error or a
+    ///   failed exit disables PSR.
+    pub(crate) fn pre_update(&mut self) {
+        if self.bracket.is_some() {
+            return;
+        }
+        let guard = &mut self.guard;
+        let platform = &guard.device.platform;
+        let fbc_was_active = guard.state.fbc.as_ref().is_some_and(|f| f.active());
+        if let Some(fbc) = guard.state.fbc.as_mut() {
+            fbc.deactivate(platform);
+        }
+        let start = platform.read32(FRAME_A);
+        if guard.state.psr.is_some() {
+            if crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled() == Some(true) {
+                guard.psr_wm_update(true);
+            }
+            let platform = &guard.device.platform;
+            let paused = guard.state.psr.as_mut().map(|psr| {
+                psr.pause(platform).and_then(|()| {
+                    crate::intel_gpu_psr::wait_idle(
+                        platform,
+                        crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS,
+                    )
+                })
+            });
+            if let Some(Err(refusal)) = paused {
+                psr_disable(&mut guard.state, platform, Some(refusal));
+            }
+        }
+        if fbc_was_active && start != u32::MAX {
+            let _ = wait_frame_after(&guard.device.platform, start);
+        }
+        self.bracket = Some(Bracket { fbc_was_active });
+    }
+
+    /// After the hotplug event (a repartition, a refusal or an undone
+    /// failure). Post-plane updates run after the commit's flip_done in
+    /// `intel_atomic_commit_tail`, so one Pipe-A frame boundary is waited
+    /// for first: whatever the repartition armed on Pipe A has latched.
+    /// Pipe A's resources are then proved in whatever layout now holds
+    /// (publishing its `wm_level_disabled`). Only a proved layout takes
+    /// FBC and PSR back: `intel_fbc_post_update` re-activates FBC on the
+    /// latched KMS framebuffer (re-evaluated; the CFB carve is unchanged),
+    /// and `intel_psr_post_plane_update` clears Wa_14015648006 when
+    /// `wm_level_disabled` is false while PSR re-arms from idle when the
+    /// pass ends. An unproved layout disables PSR (its next qualification
+    /// re-proves the watermarks) and leaves FBC off until the next latch,
+    /// so neither runs on stale DDB/WM.
+    pub(crate) fn post_update(&mut self) {
+        let Some(bracket) = self.bracket.take() else {
+            return;
+        };
+        let guard = &mut self.guard;
+        let platform = &guard.device.platform;
+        let start = platform.read32(FRAME_A);
+        let latched = start != u32::MAX && wait_frame_after(platform, start);
+        let proved = latched
+            && match (&guard.state.primary_resources, platform.psr_timing()) {
+                (Some(primary), _) => primary.check_current(platform).is_ok(),
+                (None, Some(timing)) => {
+                    crate::intel_gpu_display_resources::Profile::capture_timing(platform, timing)
+                        .is_ok()
+                }
+                (None, None) => false,
+            };
+        if !proved {
+            psr_disable(&mut guard.state, platform, None);
+            return;
+        }
+        if guard.state.psr.is_some()
+            && crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled() == Some(false)
+        {
+            guard.psr_wm_update(false);
+        }
+        if bracket.fbc_was_active && guard.state.current.is_some() {
+            let geometry = guard.console_geometry();
+            guard.fbc_after_latch(geometry);
+        }
+    }
+}
+
+impl<M: Platform> Drop for ExternalPass<'_, M> {
+    /// A pass that ran the pre-update always runs the post-update; the
+    /// guard's own drop then re-arms a paused PSR from idle.
+    fn drop(&mut self) {
+        self.post_update();
+    }
+}
+
 fn scanout_error(error: ScanoutError) -> FsError {
     match error {
         ScanoutError::Unsupported | ScanoutError::Bounds => FsError::Unsupported,

@@ -217,3 +217,279 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_kms_mtl_cursor_refuses_diverged_multi_pipe_layout
 );
+
+// ── The external pass around a repartition (PSR, FBC, DSB) ──────────────
+
+const DPFC_CONTROL: u64 = 0x43208;
+const DPFC_CB_BASE: u64 = 0x43200;
+const DSB0_CTRL: u64 = 0x70b08;
+
+/// The owned single-pipe state and the two-pipe state with the external
+/// on Pipe B, both at the fixture's 307.2 MHz CDCLK floor.
+fn layouts(
+    platform: &MockPlatform,
+    timing: crate::intel_gpu_dsb::Timing,
+) -> (res::State, res::State) {
+    let latency = Latency::read(platform).unwrap();
+    let mut request =
+        crate::intel_gpu_display_resources::request(&mode_of(timing), Tiling::Linear, 307_200);
+    let single = res::compute(&request, &latency).unwrap();
+    request.pipes[1] = Some(external());
+    (single, res::compute(&request, &latency).unwrap())
+}
+
+/// What the route does inside the pass to add the external beside the
+/// lit panel: the Pipe B–D owner's live pre-plane repartition, its
+/// published layout, then the lit pipe and primary.
+fn add_external(platform: &MockPlatform, single: &res::State, multi: &res::State) {
+    crate::intel_gpu_xelpg_live::commit_live(platform, single, multi, 1).unwrap();
+    publish_layout_for_test(Some(Layout {
+        state: *multi,
+        surfaces: [None, Some(EXT_SURFACE), None, None],
+    }));
+    for (r, v) in [
+        (0x71008, 3 << 30),
+        (0x71180, 0x8400_0000),
+        (0x7119c, EXT_SURFACE),
+    ] {
+        platform.set(r, v);
+    }
+}
+
+/// And to remove it: the pipe goes dark (the route's stop), then the
+/// post-plane repartition gives Pipe A its whole profile back.
+fn remove_external(platform: &MockPlatform, multi: &res::State, single: &res::State) {
+    for r in [0x71008, 0x71180] {
+        platform.set(r, 0);
+    }
+    crate::intel_gpu_xelpg_live::commit_live(platform, multi, single, 1).unwrap();
+    reset_published_layout();
+}
+
+/// The first and last write of the repartition in `writes`.
+fn repartition_span(writes: &[(u64, u32)]) -> (usize, usize) {
+    let touched = |r: u64| external_or_global(r) || (0x70140..0x70380).contains(&r);
+    (
+        writes.iter().position(|&(r, _)| touched(r)).unwrap(),
+        writes.iter().rposition(|&(r, _)| touched(r)).unwrap(),
+    )
+}
+
+fn smoke_kms_mtl_psr_enables_beside_external_and_brackets_repartitions() -> TestResult {
+    use super::psr::{attach, present_once, psr, sink_writes, ARMED, EN_CFG, EXITED, PSR_CTL};
+    {
+        let previous = crate::intel_gpu_psr::register_wm_level_disabled(None);
+        crate::intel_gpu_xelpg_wm::register_psr_provider();
+        crate::intel_gpu_xelpg_wm::publish_pipe_a(None);
+        let platform = MockPlatform::new();
+        let (timing, multi) = beside_external(&platform);
+        let (single, _) = layouts(&platform, timing);
+        attach(&platform, timing, None);
+        platform.0.lock().psr_wm_provider = true;
+        let device = platform.meteor();
+        // PSR enables on the first latch with the external lit: the
+        // qualification proves Pipe A's share of the two-pipe layout and
+        // reads its wm_level_disabled from that proof.
+        present_once(&device, object(true).unwrap());
+        assert_eq!(
+            crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled(),
+            Some(false)
+        );
+        assert!(psr(&device).is_some());
+        assert_eq!(platform.read32(PSR_CTL), ARMED);
+        assert_eq!(
+            sink_writes(&platform.all_writes())[..2],
+            [(EN_CFG, 0x04), (EN_CFG, 0x05)]
+        );
+        // Each repartition runs inside the pass's bracket: PSR exits and
+        // idles before the first write that touches Pipe A's resources and
+        // re-arms from idle only after the latch, when the pass ends.
+        platform.step_on_read(Some(FRAME));
+        for add in [false, true] {
+            let start = platform.all_writes().len();
+            {
+                let mut pass = device.external_pass().unwrap();
+                pass.pre_update();
+                assert_eq!(platform.read32(PSR_CTL), EXITED);
+                if add {
+                    add_external(&platform, &single, &multi);
+                } else {
+                    remove_external(&platform, &multi, &single);
+                }
+                pass.post_update();
+                assert_eq!(platform.read32(PSR_CTL), EXITED, "re-armed inside the pass");
+            }
+            assert_eq!(platform.read32(PSR_CTL), ARMED);
+            let writes = &platform.all_writes()[start..];
+            let exit = writes.iter().position(|&w| w == (PSR_CTL, EXITED)).unwrap();
+            let (first, last) = repartition_span(writes);
+            let rearm = writes.iter().rposition(|&w| w == (PSR_CTL, ARMED)).unwrap();
+            assert!(exit < first && last < rearm, "add {add}");
+            assert!(psr(&device).unwrap().active());
+            // The post-update re-proved Pipe A in the new layout.
+            assert_eq!(
+                crate::intel_gpu_xelpg_wm::pipe_a_wm_level_disabled(),
+                Some(false)
+            );
+        }
+        platform.step_on_read(None);
+        // A flip with the external lit again keeps PSR enabled.
+        present_once(&device, object(true).unwrap());
+        assert_eq!(platform.read32(PSR_CTL), ARMED);
+        assert_eq!(platform.read32(0x7119c), EXT_SURFACE);
+        reset_published_layout();
+        crate::intel_gpu_psr::register_wm_level_disabled(previous);
+        crate::intel_gpu_xelpg_wm::publish_pipe_a(None);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_mtl_psr_enables_beside_external_and_brackets_repartitions
+);
+
+fn smoke_kms_mtl_external_pass_deactivates_and_reevaluates_fbc() -> TestResult {
+    use super::psr::present_once;
+    {
+        reset_published_layout();
+        let platform = MockPlatform::new();
+        let timing = platform.cursor_resources();
+        let (single, multi) = layouts(&platform, timing);
+        // The panel mode is known; no PSR VBT, so FBC runs.
+        platform.0.lock().psr_timing = Some(timing);
+        platform.0.lock().fbc_offset = Some(0x10_0000);
+        let device = platform.meteor();
+        present_once(&device, object(true).unwrap());
+        assert_ne!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+        let cfb = platform.read32(DPFC_CB_BASE);
+        let carves = platform.0.lock().fbc_carve_polls;
+        // An active FBC is what the live transaction refuses (the former
+        // Busy of the external route), before any write.
+        let start = platform.all_writes().len();
+        assert_eq!(
+            crate::intel_gpu_xelpg_live::commit_live(&platform, &single, &multi, 1),
+            Err(res::ResourceError::Busy)
+        );
+        assert_eq!(platform.all_writes().len(), start);
+        platform.step_on_read(Some(FRAME));
+        for add in [true, false] {
+            let start = platform.all_writes().len();
+            {
+                let mut pass = device.external_pass().unwrap();
+                pass.pre_update();
+                // intel_fbc_pre_update: deactivated, then one vblank (WA
+                // #1198) before any plane update.
+                assert_eq!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+                if add {
+                    add_external(&platform, &single, &multi);
+                } else {
+                    remove_external(&platform, &multi, &single);
+                }
+                pass.post_update();
+                // intel_fbc_post_update on the proved layout.
+                assert_ne!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+            }
+            let writes = &platform.all_writes()[start..];
+            let off = writes
+                .iter()
+                .position(|&(r, v)| r == DPFC_CONTROL && v & (1 << 31) == 0)
+                .unwrap();
+            let (first, last) = repartition_span(writes);
+            let on = writes
+                .iter()
+                .rposition(|&(r, v)| r == DPFC_CONTROL && v & (1 << 31) != 0)
+                .unwrap();
+            assert!(off < first && last < on, "add {add}");
+            // The CFB carve stays valid: same base, no new carve.
+            assert_eq!(platform.read32(DPFC_CB_BASE), cfb);
+            assert_eq!(platform.0.lock().fbc_carve_polls, carves);
+        }
+        // Never on stale DDB/WM: a layout that does not prove after the
+        // event keeps FBC off (until the next latch re-evaluates it).
+        let held = platform.read32(res::plane_buf_cfg(0, 0));
+        {
+            let mut pass = device.external_pass().unwrap();
+            pass.pre_update();
+            platform.set(res::plane_buf_cfg(0, 0), held - 1);
+            pass.post_update();
+        }
+        platform.step_on_read(None);
+        assert_eq!(platform.read32(DPFC_CONTROL) & (1 << 31), 0);
+        platform.set(res::plane_buf_cfg(0, 0), held);
+        reset_published_layout();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_mtl_external_pass_deactivates_and_reevaluates_fbc
+);
+
+fn smoke_kms_mtl_external_pass_idles_in_flight_dsb_before_repartition() -> TestResult {
+    use super::psr::present_once;
+    {
+        reset_published_layout();
+        let platform = MockPlatform::new();
+        let timing = platform.cursor_resources();
+        let (single, multi) = layouts(&platform, timing);
+        let device = platform.meteor();
+        present_once(&device, object(true).unwrap());
+        let gem = crate::intel_gpu_gem::GemState::new();
+        let handle = gem.create(16384, |_, _| Ok(())).unwrap();
+        // A cursor update armed on DSB0 whose future is dropped before the
+        // stream ran: the stream is in flight on the panel.
+        {
+            let mut session = complete(device.session()).unwrap();
+            let mut update = Box::pin(session.cursor(
+                Some(gem.object(handle).unwrap()),
+                true,
+                Some((3, 4)),
+                timing,
+            ));
+            for _ in 0..64 {
+                if platform.read32(DSB0_CTRL) & (1 << 31) != 0 {
+                    break;
+                }
+                assert!(once(update.as_mut()).is_pending());
+            }
+        }
+        assert_ne!(platform.read32(DSB0_CTRL) & ((1 << 31) | 1), 0);
+        // The live transaction refuses an in-flight DSB.
+        assert_eq!(
+            crate::intel_gpu_xelpg_live::check_pipes(&platform, 1),
+            Err(res::ResourceError::Busy)
+        );
+        // The pass waits for the stream (its engine ticks on each control
+        // read here) and only then may repartition.
+        platform.step_on_read(Some(DSB0_CTRL));
+        let mut pass = device.external_pass().unwrap();
+        assert_eq!(platform.read32(DSB0_CTRL) & ((1 << 31) | 1), 0);
+        assert_eq!(
+            crate::intel_gpu_xelpg_live::check_pipes(&platform, 1),
+            Ok(())
+        );
+        platform.step_on_read(Some(FRAME));
+        pass.pre_update();
+        add_external(&platform, &single, &multi);
+        pass.post_update();
+        drop(pass);
+        platform.step_on_read(None);
+        // The owner completes the dropped cursor update on its next call,
+        // and moves the cursor beside the lit external.
+        {
+            let mut session = complete(device.session()).unwrap();
+            drive(session.cursor(None, false, Some((5, 6)), timing)).unwrap();
+        }
+        assert_eq!(platform.read32(0x70088), 5 | (6 << 16));
+        assert_eq!(
+            platform.read32(res::cursor_buf_cfg(0)),
+            multi.dbuf.pipes[0].cursor.reg()
+        );
+        reset_published_layout();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_mtl_external_pass_idles_in_flight_dsb_before_repartition
+);

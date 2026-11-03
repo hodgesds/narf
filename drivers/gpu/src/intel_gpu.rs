@@ -1804,13 +1804,12 @@ pub fn poll_dp_hpd_events() {
     };
     // Meteor Lake external outputs drain first; the Gen12 loop below never
     // reports an event on that generation, and this drain never runs on Gen12.
+    // The held legacy guard admits no KMS presenter, cursor or color, so FBC
+    // and PSR are off and nothing needs bracketing; the panel's KMS owner is
+    // not suspended either, since its display-14 proofs hold beside a lit
+    // Pipe B-D (they re-prove the layout on every use).
     for _ in 0..MTL_EVENTS_PER_DRAIN {
-        let suspended = &mut ownership;
-        if !service_mtl_display(&mut || {
-            if let Some(guard) = suspended.as_mut() {
-                guard.suspend();
-            }
-        }) {
+        if !service_mtl_display(&mut || {}, &mut || {}) {
             break;
         }
     }
@@ -2362,17 +2361,22 @@ enum MtlPublication {
 }
 
 /// One MTL external hotplug pass: poll the owned hotplug source; when an
-/// event arrives run `before_event` (the caller suspends fixed internal
-/// flips), let the route owner act on it next to `display` with a
-/// retained-or-new scanout allocation, then publish an activated image
-/// (with the pipe it scans out on) or withdraw the image of a route that is
-/// no longer live. Returns whether an event was handled.
+/// event arrives run `before_event` (the panel's KMS pre-update: FBC and
+/// PSR leave Pipe A before it may be repartitioned), let the route owner
+/// act on it next to `display` with a retained-or-new scanout allocation,
+/// run `after_event` (the panel's KMS post-update), then publish an
+/// activated image (with the pipe it scans out on) or withdraw the image of
+/// a route that is no longer live. Returns whether an event was handled.
+// The hooks and sinks are the pass's whole caller contract; grouping them
+// would only rename the parameters.
+#[allow(clippy::too_many_arguments)]
 fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
     bar: u64,
     display: &crate::intel_gpu_xelpg_external::MtlDisplay,
     before_event: &mut dyn FnMut(),
+    after_event: &mut dyn FnMut(),
     alloc: &mut dyn FnMut(u64) -> Option<ScanoutAllocation>,
     publication: &mut dyn FnMut(MtlPublication),
 ) -> bool {
@@ -2403,6 +2407,7 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     };
     let outcome =
         crate::intel_gpu_xelpg_external::handle_mtl_event(io, event, display, &mut alloc_fb);
+    after_event();
     if let Some(ServiceOutcome::Activated { mode, fb, pipe, .. }) = outcome {
         let phys = (*MTL_SCANOUT.lock())
             .filter(|(owner, retained)| {
@@ -2467,7 +2472,7 @@ fn mtl_publish(request: MtlPublication) {
 
 /// One production MTL pass for the probed display. Only Meteor Lake
 /// reaches registers; the window is current-authority checked per access.
-fn service_mtl_display(before_event: &mut dyn FnMut()) -> bool {
+fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnMut()) -> bool {
     with_display_info(|gpu| {
         if gpu.chip.generation != Generation::MeteorLake {
             return false;
@@ -2485,6 +2490,7 @@ fn service_mtl_display(before_event: &mut dyn FnMut()) -> bool {
             gtt.phys.raw(),
             &display,
             before_event,
+            after_event,
             &mut |size| {
                 let alloc = crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
                     &gtt,
@@ -2505,8 +2511,12 @@ fn service_mtl_display(before_event: &mut dyn FnMut()) -> bool {
     .unwrap_or(false)
 }
 
-/// Runtime-actor MTL pass for `bar`, under the display legacy drain guard
-/// (same discipline as the Gen12 SST service). No-op off Meteor Lake.
+/// Runtime-actor MTL pass for `bar`, holding the panel's KMS owner through
+/// [`crate::intel_gpu_kms::Device::external_pass`]: no panel frame change
+/// races the repartition, FBC and PSR are bracketed around the event, and
+/// the owner stays open (its proofs are multi-pipe aware). A busy owner, or
+/// a panel flip still in flight, skips the pass without polling; the event
+/// is taken on a later iteration. No-op off Meteor Lake.
 fn service_mtl_external_for_bar(bar: &MmioRegion) {
     let mtl = with_display_info(|gpu| {
         gpu.chip.generation == Generation::MeteorLake && gpu.gtt_mmadr.phys == bar.phys
@@ -2516,24 +2526,50 @@ fn service_mtl_external_for_bar(bar: &MmioRegion) {
         return;
     }
     let display = crate::intel_gpu_kms::display_for_bar(bar);
-    let mut guard = match display.as_ref() {
-        Some(display) => match display.legacy_drain() {
-            Ok(g) => Some(g),
+    let pass = match display.as_ref() {
+        Some(display) => match display.external_pass() {
+            Ok(pass) => Some(pass),
             Err(_) => return,
         },
         None => None,
     };
-    let _ = service_mtl_display(&mut || {
-        if let Some(guard) = guard.as_mut() {
-            guard.suspend();
-        }
-    });
+    let pass = core::cell::RefCell::new(pass);
+    let _ = service_mtl_display(
+        &mut || {
+            if let Some(pass) = pass.borrow_mut().as_mut() {
+                pass.pre_update();
+            }
+        },
+        &mut || {
+            if let Some(pass) = pass.borrow_mut().as_mut() {
+                pass.post_update();
+            }
+        },
+    );
 }
 
 /// Suspend/GT-reset retirement of the MTL route and its hotplug sources,
 /// then withdrawal of its publication once nothing is live. `Busy` when a
 /// route stays retained (quarantined or a service pass in progress).
 pub(crate) fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
+    // Stopping a live route repartitions Pipe A's resources: bracket it
+    // with the panel's KMS owner exactly as a hotplug pass does (FBC and PSR
+    // leave Pipe A first). A busy owner leaves the teardown unbracketed; the
+    // live transaction then refuses an active FBC and the retirement
+    // reports Busy, to be retried. After a GT reset the owner's own
+    // loss-tolerant recovery disables FBC and PSR instead.
+    let display = crate::intel_gpu_kms::display_for_bar(bar);
+    let mut pass = if crate::intel_gpu_xelpg_external::routes_stopped() {
+        None
+    } else {
+        display
+            .as_ref()
+            .filter(|display| !display.reset_lost())
+            .and_then(|display| display.external_pass().ok())
+    };
+    if let Some(pass) = pass.as_mut() {
+        pass.pre_update();
+    }
     let done = with_display_info(|gpu| {
         if gpu.gtt_mmadr.phys != bar.phys {
             return true;
@@ -2542,6 +2578,7 @@ pub(crate) fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_filesyste
         crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
     })
     .unwrap_or(true);
+    drop(pass);
     if !crate::intel_gpu_xelpg_external::route_live() {
         let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
         if serial != 0 {
@@ -3195,6 +3232,7 @@ pub mod tests {
             return TestResult::Fail("hook test needs fresh MTL owners");
         }
         let mut events = 0u32;
+        let mut afters = 0u32;
         let sizes: core::cell::RefCell<Vec<u64>> = core::cell::RefCell::new(Vec::new());
         // Lock-free readers sampled mid-pass (the service is held): no
         // route yet, so "stopped" without a transient, while DC re-entry
@@ -3221,6 +3259,7 @@ pub mod tests {
             BAR,
             &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
+            &mut || afters += 1,
             &mut alloc,
             &mut |p| published.push(p),
         ) || events != 0
@@ -3235,6 +3274,7 @@ pub mod tests {
             BAR,
             &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
+            &mut || afters += 1,
             &mut alloc,
             &mut |p| published.push(p),
         );
@@ -3251,6 +3291,7 @@ pub mod tests {
         }
         if !handled
             || events != 1
+            || afters != 1
             || *sizes.borrow() != [scanout_size_bytes(1024, 768)]
             || first.0.addr != 0x7_0000_0000
             || first.0.width != 1024
@@ -3268,9 +3309,11 @@ pub mod tests {
             BAR,
             &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
+            &mut || afters += 1,
             &mut alloc,
             &mut |p| published.push(p),
         ) || events != 1
+            || afters != 1
         {
             return TestResult::Fail("idle pass must not report work");
         }
@@ -3287,6 +3330,7 @@ pub mod tests {
             BAR,
             &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
+            &mut || afters += 1,
             &mut alloc,
             &mut |p| published.push(p),
         );
@@ -3311,6 +3355,7 @@ pub mod tests {
             BAR,
             &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
             &mut || events += 1,
+            &mut || afters += 1,
             &mut alloc,
             &mut |p| published.push(p),
         );
@@ -3366,6 +3411,7 @@ pub mod tests {
             Generation::MeteorLake,
             BAR,
             &crate::intel_gpu_xelpg_external::MtlDisplay::NONE,
+            &mut || {},
             &mut || {},
             &mut alloc,
             &mut |p| published.push(p),
