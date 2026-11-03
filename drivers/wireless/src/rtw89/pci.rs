@@ -117,7 +117,10 @@ pub unsafe fn attach_cold(
 
 /// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if device.id.vendor == 0x10ec && matches!(device.id.device, 0xb852 | 0xb85b) {
+    // RTL8852BE (b852/b85b) and RTL8852CE (c852, rtw8852ce.c
+    // `rtw89_8852ce_id_table`) run the retained reset/firmware/radio/
+    // station bootstrap; C station admission needs its signed C records.
+    if device.id.vendor == 0x10ec && matches!(device.id.device, 0xb852 | 0xb85b | 0xc852) {
         return super::bootstrap::probe(device, cap);
     }
     let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
@@ -505,7 +508,7 @@ pub fn register_pci_driver() {
             },
             probe,
         });
-        if matches!(did, 0xb852 | 0xb85b) {
+        if matches!(did, 0xb852 | 0xb85b | 0xc852) {
             narf_bus::register_pci_remove(name_for(did), super::bootstrap::remove);
         }
     }

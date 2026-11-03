@@ -46,7 +46,7 @@ impl Binding {
             }
             _ => return Err(Error::Unsupported),
         };
-        if device.id.vendor != 0x10ec || !matches!(device.id.device, 0xb852 | 0xb85b) {
+        if device.id.vendor != 0x10ec || !matches!(device.id.device, 0xb852 | 0xb85b | 0xc852) {
             return Err(Error::Unsupported);
         }
         Ok(Self {

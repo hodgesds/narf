@@ -3337,10 +3337,49 @@ else 5GHz); B is unchanged. Retry/terminal split matches B: the Attempt
 commits when the ordinary grant (hence `operating_channel`) survives.
 No new test case (the owner needs an actual Ready C radio).
 
-Remaining for the `rtl8852c` row (no row credit): `command_native`/
-`startup_station` admission (B-only at `Io::station_allowed`,
-`Startup::start` assets), and native execution.
-Unexecuted new cases:
+**C station admission (legacy 2.4/5GHz 20MHz station).** `pci::probe`,
+`register_pci_remove`, `bootstrap::attach_cold` and the FLR owner
+(`pci_reset::Binding`) admit 10ec:c852 (rtw8852ce.c
+`rtw89_8852ce_id_table`) next to b852/b85b, so the C function runs the
+same retained reset/firmware/radio/station bootstrap (the FLR itself still
+requires the function's own FLR capability). `Startup::station_allowed`
+admits RTL8852B and RTL8852C, in both cases only under a current ordinary
+grant (C: `OrdinaryGrant::C` from `prepare_radio_c`, i.e. only with the
+board's signed `N5CB` v1/v2 records; an unprovisioned C board stays
+unadmitted). WoW (`station_wow_capable`), the monitor and the AP owner stay
+B-only. The station `control::Interface::preflight` uses the C station
+window (`NativeIo::c_station_window`: the C PHY window plus the
+`R_AX_INDIR_ACCESS_ENTRY` words for the nonsecure mac.c
+`rtw89_mac_{d,c}mac_tbl_init`, common AX code). `station_control::Controller`
+records the chip and sends the CMAC control table with the chip's
+`h2c_cctl_func_id`: C uses `H2C_FUNC_MAC_CCTLINFO_UD_V1` (0x0a) with
+`codec::default_cctl_v1` (fw.c `rtw89_fw_h2c_default_cmac_tbl` under
+UD_V1: no TXPWR_MODE/TX-path/ANTSEL setters) and `codec::fixed_cctl_v1`
+(`rtw89_fw_h2c_assoc_cmac_tbl`: the `_V1` nominal-padding positions W7
+[7:0]); B keeps function 2 and its bytes. The remaining station H2Cs are
+common AX code (address CAM v0 since `addrcam_ver` 0, JOIN_INFO
+non-BE format, ROLE_MAINTAIN, EDCA, MACID_PAUSE without
+`MACID_PAUSE_SLEEP`), as are the port/security/CPWM registers
+(`R_AX_PORT_CFG_P0`, `R_AX_SEC_ENG_CTRL`/`SEC_MPDU_PROC`, `R_AX_LDM`,
+`R_AX_PPWRBIT_SETTING`). `ORDINARY_STOP`/`tx_stop_all` use HAXI_DMA_STOP1
+bits that match B (ACH0/CH8/WPDMA; the C `dma_stop` layout). Every B
+companion allowance (`station_{ht,he,ampdu,firmware_ra,amsdu,qos_all,wmm}_allowed`)
+is `Ok(false)` on C, RF tracking is a no-op and track work reports
+`Unsupported` (disabling it). `admitted_channels` on C is the 20MHz profile
+of every 2.4GHz 1..=13 and 5GHz primary with a loaded record that
+`radio_policy_c::Qualification::channel_active` admits (host rule passes
+and no DFS/NO_IR rule over the span), and station retune/CSA go through
+`retune_channel_c`. Unexecuted case:
+`smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1`.
+
+Known gaps for the `rtl8852c` row: native execution on hardware (no C
+board record exists, so actual admission needs a provisioned board);
+HT/VHT/HE, A-MPDU/BA (C `bacam_num` 8 dynamic BA CAM), firmware RA, WMM,
+LPS, WoW, monitor, AP and C DIG/CFO track work are not implemented for C;
+the C terminal analog shutdown (`finish_radio_shutdown`) stays B-only, so a
+retired C generation earns the C DMA-stop proof but no RF00S/XTAL
+shutdown. The C station uses 20MHz only (wide C profiles are reachable
+only through `retune_channel_c`, not from the station). Unexecuted new cases:
 `smoke_rtw89_c_phycap_and_efuse_match_linux_rtw8852c_layout`,
 `smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots`,
 `smoke_rtw89_c_table_power_reset_and_rf_order_follow_rtw8852c`.

@@ -187,6 +187,9 @@ pub(super) enum Phase {
     Failed,
 }
 pub(super) struct Controller {
+    /// RTL8852B or RTL8852C: selects the CMAC control-table H2C
+    /// (`h2c_cctl_func_id` `CCTLINFO_UD` / `CCTLINFO_UD_V1`).
+    chip: ChipId,
     own: [u8; 6],
     secure: bool,
     phase: Phase,
@@ -220,10 +223,12 @@ impl Drop for Attempt {
 impl Controller {
     pub(super) fn new(factory: &Factory) -> Result<Self, Error> {
         let identity = factory.identity().ok_or(Error::Terminal)?;
-        if identity.chip() != ChipId::Rtl8852B {
+        let chip = identity.chip();
+        if chip != ChipId::Rtl8852B && chip != ChipId::Rtl8852C {
             return Err(Error::Unsupported);
         }
         Ok(Self {
+            chip,
             own: identity.mac(),
             secure: identity.fuses().enabled(),
             phase: Phase::New,
@@ -237,6 +242,22 @@ impl Controller {
     }
     pub(super) fn own(&self) -> [u8; 6] {
         self.own
+    }
+    /// fw.c `rtw89_fw_h2c_default_cmac_tbl` (class 5, `h2c_cctl_func_id`).
+    fn default_cctl(&self) -> (u8, [u8; 68]) {
+        if self.chip == ChipId::Rtl8852C {
+            (codec::CCTL_V1, codec::default_cctl_v1())
+        } else {
+            (2, codec::default_cctl())
+        }
+    }
+    /// fw.c `rtw89_fw_h2c_assoc_cmac_tbl` (class 5, `h2c_cctl_func_id`).
+    fn fixed_cctl(&self, ghz5: bool) -> (u8, [u8; 68]) {
+        if self.chip == ChipId::Rtl8852C {
+            (codec::CCTL_V1, codec::fixed_cctl_v1(ghz5))
+        } else {
+            (2, codec::fixed_cctl(ghz5))
+        }
     }
     pub(super) fn phase(&self) -> Phase {
         if self.admission.as_ref().is_some_and(Admission::closed) && self.phase != Phase::Stopped {
@@ -295,9 +316,11 @@ impl Controller {
             Some(admission),
         )
         .await?;
-        command(io, 5, 2, &codec::default_cctl(), true, Some(admission)).await?;
+        let (function, body) = self.default_cctl();
+        command(io, 5, function, &body, true, Some(admission)).await?;
         let ghz5 = io.ghz5();
-        command(io, 5, 2, &codec::fixed_cctl(ghz5), true, Some(admission)).await?;
+        let (function, body) = self.fixed_cctl(ghz5);
+        command(io, 5, function, &body, true, Some(admission)).await?;
         edca(io, false, Some(admission)).await?;
         checked(io, Some(admission), awake)?;
         admission.run(|| {
@@ -422,7 +445,8 @@ impl Controller {
             armed: true,
         };
         let ghz5 = io.ghz5();
-        command(io, 5, 2, &codec::fixed_cctl(ghz5), true, Some(admission)).await?;
+        let (function, body) = self.fixed_cctl(ghz5);
+        command(io, 5, function, &body, true, Some(admission)).await?;
         command(io, 8, 0, &codec::join(true), true, Some(admission)).await?;
         command(
             io,
@@ -486,7 +510,8 @@ impl Controller {
         };
         command(io, 8, 4, &codec::role_restore(), true, Some(admission)).await?;
         let ghz5 = io.ghz5();
-        command(io, 5, 2, &codec::fixed_cctl(ghz5), true, Some(admission)).await?;
+        let (function, body) = self.fixed_cctl(ghz5);
+        command(io, 5, function, &body, true, Some(admission)).await?;
         command(io, 8, 0, &codec::join(true), true, Some(admission)).await?;
         command(io, 6, 0, cam, true, Some(admission)).await?;
         if let Some(ra) = self.ra {

@@ -442,6 +442,21 @@ impl Qualification {
         };
         Ok(check_envelope(&*self.policy()?, envelope).is_ok())
     }
+    /// `channel_allowed` restricted to spans the host rule leaves active
+    /// (no DFS/NO_IR rule), where frame TX (`tx_current`) is admitted.
+    pub(super) fn channel_active(&self, profile: Profile) -> Result<bool, Error> {
+        self.current()?;
+        let envelope = if profile == Profile::INITIAL {
+            self.envelope
+        } else {
+            let Some(record) = self.channel(profile) else {
+                return Ok(false);
+            };
+            record.bound(self)?;
+            record.envelope
+        };
+        Ok(check_envelope(&*self.policy()?, envelope) == Ok(false))
+    }
     /// Switch the gating envelope to `profile` before its first emission.
     /// No register access happens here.
     pub(super) fn select(&self, profile: Profile) -> Result<(), Error> {

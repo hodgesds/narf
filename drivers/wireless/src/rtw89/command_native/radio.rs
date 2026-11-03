@@ -151,13 +151,29 @@ impl Native {
         })
         .map_err(denied)?
     }
+    /// RTL8852C with its current ordinary grant: every B companion program
+    /// (HT/HE/A-MPDU/RA/A-MSDU/QoS/WMM) is "no program" (`Ok(false)`).
+    /// B (or no grant) is `Ok(false)` here and keeps its own checks.
+    fn c_ordinary(&self) -> Result<bool, power::Error> {
+        if self.chip != ChipId::Rtl8852C {
+            return Ok(false);
+        }
+        self.ordinary_current()?;
+        Ok(true)
+    }
     pub(in crate::rtw89) fn station_ht_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .allows(radio_policy::Program::Ht)
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_he_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .allows(radio_policy::Program::He)
@@ -167,6 +183,9 @@ impl Native {
     /// the listed CCX/DIG/EDCCA/PPDU-status registers, on the prepared
     /// operating PHY and current ordinary authority.
     fn track_port(&mut self, address: u32) -> Result<Port<'_>, power::Error> {
+        if self.chip == ChipId::Rtl8852C {
+            return Err(power::Error::Unsupported);
+        }
         if self.sleep_blocked {
             return Err(power::Error::Terminal);
         }
@@ -195,6 +214,10 @@ impl Native {
     pub(in crate::rtw89) fn station_track_profile(
         &self,
     ) -> Result<crate::rtw89::track::Profile, power::Error> {
+        // RTL8852C: no track-work owner; `Unsupported` disables track work.
+        if self.chip == ChipId::Rtl8852C {
+            return Err(power::Error::Unsupported);
+        }
         if self.sleep_blocked {
             return Err(power::Error::Terminal);
         }
@@ -238,30 +261,45 @@ impl Native {
         }
     }
     pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .allows(radio_policy::Program::Ampdu)
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_firmware_ra_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .allows(radio_policy::Program::FirmwareRa)
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_amsdu_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .amsdu_allowed()
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_qos_all_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .allows(radio_policy::Program::QosAll)
             .map_err(denied)
     }
     pub(in crate::rtw89) fn station_wmm_allowed(&self) -> Result<bool, power::Error> {
+        if self.c_ordinary()? {
+            return Ok(false);
+        }
         self.full_radio_scope()
             .ok_or(power::Error::Unsupported)?
             .wmm_allowed()
@@ -473,6 +511,9 @@ impl Native {
     /// 5GHz after) of primaries with a current signed full program whose
     /// host rule currently permits active emission.
     pub(in crate::rtw89) fn admitted_channels(&self) -> Result<u64, power::Error> {
+        if self.c_ordinary()? {
+            return self.admitted_channels_c();
+        }
         let qualification = self.full_radio_scope().ok_or(power::Error::Unsupported)?;
         let mut mask = 0;
         for primary in (1..=13).chain(operating_channel::GHZ5) {
@@ -480,6 +521,32 @@ impl Native {
                 .ok_or(power::Error::Unsupported)?;
             let bit = operating_channel::slot(primary).ok_or(power::Error::Unsupported)?;
             if qualification.channel_allowed(profile).map_err(denied)? {
+                mask |= 1u64 << bit;
+            }
+        }
+        Ok(mask)
+    }
+    /// RTL8852C station mask over the 20MHz profile of every 2.4GHz (1..=13)
+    /// and 5GHz primary: a loaded signed record whose host rule currently
+    /// permits active emission. Passive-only (DFS/NO_IR) spans are left out:
+    /// C has no beacon-witness passive TX grant, so no frame could follow.
+    fn admitted_channels_c(&self) -> Result<u64, power::Error> {
+        let qualification = self
+            .qualification_c
+            .as_ref()
+            .ok_or(power::Error::Terminal)?;
+        let mut mask = 0;
+        for primary in (1..=13).chain(operating_channel::GHZ5) {
+            let band = if primary <= 14 {
+                operating_channel_c::Band::Ghz2
+            } else {
+                operating_channel_c::Band::Ghz5
+            };
+            let Some(profile) = operating_channel_c::Profile::new20(band, primary) else {
+                continue;
+            };
+            let bit = operating_channel::slot(primary).ok_or(power::Error::Unsupported)?;
+            if qualification.channel_active(profile).map_err(denied)? {
                 mask |= 1u64 << bit;
             }
         }

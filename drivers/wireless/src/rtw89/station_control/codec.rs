@@ -177,6 +177,39 @@ pub(in crate::rtw89) fn default_cctl_at(macid: u8, ap: bool) -> [u8; 68] {
     }
     bytes
 }
+/// fw.h `H2C_FUNC_MAC_CCTLINFO_UD_V1`: RTL8852C `h2c_cctl_func_id`.
+pub(super) const CCTL_V1: u8 = 0x0a;
+/// RTL8852C fw.c `rtw89_fw_h2c_default_cmac_tbl` for MACID0: with
+/// `CCTLINFO_UD_V1` Linux sets no TXPWR_MODE / TX path / ANTSEL field, only
+/// MGQ_RPT_EN (0), DOPPLER_CTRL (0) and TXPWR_TOLERENCE (0).
+pub(super) fn default_cctl_v1() -> [u8; 68] {
+    let mut bytes = [0; 68];
+    word(&mut bytes, 0, 1 << 7); // MACID0, operation1
+    field(&mut bytes, 1, 1 << 21, 0); // no optional firmware MGQ report
+    field(&mut bytes, 7, 0x000c_0000, 0);
+    field(&mut bytes, 7, 0x0f00_0000, 0);
+    bytes
+}
+/// RTL8852C fw.c `rtw89_fw_h2c_assoc_cmac_tbl` for the MACID0 station on
+/// port 0: every setter equals [`fixed_cctl`] except the nominal packet
+/// padding, which `CCTLINFO_UD_V1` places at W7 [1:0]/[3:2]/[5:4]/[7:6]
+/// (`SET_CMC_TBL_NOMINAL_PKT_PADDING{,40,80,160}_V1`) instead of the
+/// `CCTLINFO_UD` W7 [21:20]/[23:22]/[31:30] and W8 [29:28].
+pub(super) fn fixed_cctl_v1(ghz5: bool) -> [u8; 68] {
+    let mut bytes = fixed_cctl(ghz5);
+    // Drop the CCTLINFO_UD padding setters (value and mask words).
+    for (index, mask) in [(7, 3 << 20), (7, 3 << 22), (7, 3 << 30), (8, 3 << 28)] {
+        for at in [index, index + 8] {
+            let p = at * 4;
+            let old = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            word(&mut bytes, at, old & !mask);
+        }
+    }
+    for mask in [3, 3 << 2, 3 << 4, 3 << 6] {
+        field(&mut bytes, 7, mask, 0);
+    }
+    bytes
+}
 /// `ghz5`: fw.c `rtw89_fw_h2c_assoc_cmac_tbl` lowest rate is OFDM6 off
 /// 2.4GHz (`RTS_RTY_LOWEST_RATE`), and the fixed legacy DATARATE follows
 /// core.c `rtw89_core_get_mgmt_rate` (OFDM6 on 5GHz).

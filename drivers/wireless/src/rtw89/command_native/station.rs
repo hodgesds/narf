@@ -513,10 +513,14 @@ impl control::Interface for Access<'_> {
             .is_some_and(|(primary, _)| primary > 14)
     }
     fn preflight(&mut self, indirect: bool) -> Result<(), power::Error> {
-        if self.native.state != State::Active || self.native.chip != ChipId::Rtl8852B {
+        if self.native.state != State::Active {
             return Err(power::Error::Terminal);
         }
-        self.native.io.b_station_window(indirect)?;
+        match self.native.chip {
+            ChipId::Rtl8852B => self.native.io.b_station_window(indirect)?,
+            ChipId::Rtl8852C => self.native.io.c_station_window(indirect)?,
+            _ => return Err(power::Error::Terminal),
+        }
         if self.cleanup {
             // Stop ordinary responses/queues while CH12/private RX remain
             // available for cleanup ACKs after power qualification is lost.

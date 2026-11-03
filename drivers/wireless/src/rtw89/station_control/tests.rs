@@ -1030,3 +1030,45 @@ kernel_test_in!(
     "drivers/wireless/rtw89/uapsd",
     smoke_rtw89_link_codec_macid_port_keeps_station_bytes
 );
+fn smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1() -> TestResult {
+    // fw.h H2C_FUNC_MAC_CCTLINFO_UD_V1 (rtw8852c `h2c_cctl_func_id`).
+    if codec::CCTL_V1 != 0x0a {
+        return TestResult::Fail("C CCTL function is not CCTLINFO_UD_V1");
+    }
+    // Default: no TXPWR_MODE / TX path / ANTSEL setter under UD_V1; only
+    // MGQ_RPT_EN (W1 bit21), DOPPLER (W7 [19:18]), TOLERENCE (W7 [27:24]).
+    let d = codec::default_cctl_v1();
+    let b = codec::default_cctl();
+    if word_at(&d, 0) != word_at(&b, 0)
+        || word_at(&d, 5) | word_at(&d, 13) != 0
+        || word_at(&d, 6) | word_at(&d, 14) != 0
+        || word_at(&d, 9) != 1 << 21
+        || word_at(&d, 15) != 0x0f0c_0000
+        || word_at(&d, 1) | word_at(&d, 7) != 0
+    {
+        return TestResult::Fail("C default CCTL body differs from Linux UD_V1");
+    }
+    for ghz5 in [false, true] {
+        let v1 = codec::fixed_cctl_v1(ghz5);
+        let ud = codec::fixed_cctl(ghz5);
+        // Padding masks move from W7 [21:20]/[23:22]/[31:30] + W8 [29:28]
+        // to W7 [7:0]; every other setter is byte-identical.
+        let ud_pad7 = 3 << 20 | 3 << 22 | 3 << 30;
+        if word_at(&v1, 15) != (word_at(&ud, 15) & !ud_pad7) | 0xff
+            || word_at(&v1, 16) != word_at(&ud, 16) & !(3 << 28)
+            || word_at(&v1, 7) & 0xff != 0
+        {
+            return TestResult::Fail("C assoc CCTL padding not at UD_V1 positions");
+        }
+        for index in (0..17).filter(|i| ![7, 8, 15, 16].contains(i)) {
+            if word_at(&v1, index) != word_at(&ud, index) {
+                return TestResult::Fail("C assoc CCTL changed a shared setter");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1
+);

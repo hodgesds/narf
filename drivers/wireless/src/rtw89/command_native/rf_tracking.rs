@@ -75,6 +75,10 @@ impl Native {
         }
         admission.check()?;
         self.ordinary_current()?;
+        if self.chip == ChipId::Rtl8852C {
+            // No signed C RF-tracking companion: the program does no RF work.
+            return Ok(());
+        }
         let Some(window) = self
             .full_radio_scope()
             .ok_or(power::Error::Access)?

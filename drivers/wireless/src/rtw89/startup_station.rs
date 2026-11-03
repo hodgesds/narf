@@ -87,16 +87,24 @@ unsafe impl Io for Startup {
         if self.monitor.is_some() {
             return Err(power::Error::Terminal);
         }
-        if self
-            .identity
-            .is_none_or(|identity| identity.chip() != super::super::mac::ChipId::Rtl8852B)
-        {
+        // RTL8852B, or RTL8852C once its signed C program installed the
+        // C ordinary grant (`Native::prepare_radio_c`): legacy 2.4/5GHz
+        // 20MHz station without B companion programs.
+        if self.identity.is_none_or(|identity| {
+            !matches!(
+                identity.chip(),
+                super::super::mac::ChipId::Rtl8852B | super::super::mac::ChipId::Rtl8852C
+            )
+        }) {
             return Err(power::Error::Unsupported);
         }
         self.station_native()?.ordinary_current()
     }
     fn station_wow_capable(&mut self) -> bool {
-        self.station_allowed().is_ok()
+        // The WoW owner is RTL8852B-only.
+        self.identity
+            .is_some_and(|identity| identity.chip() == super::super::mac::ChipId::Rtl8852B)
+            && self.station_allowed().is_ok()
             && self.assets.as_ref().is_some_and(|assets| {
                 crate::rtw89::wow_trx::CpuIoRx::for_8852b(assets.firmware_version())
                     == crate::rtw89::wow_trx::CpuIoRx::Absent
