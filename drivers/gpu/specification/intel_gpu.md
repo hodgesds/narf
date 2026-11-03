@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.53** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.54** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -38,11 +38,11 @@
 > HDMI 2.0 scrambling and VBT port policy, display-14 FBC, PSR1 under
 > KMS ownership and pipe DMC, and the default-off MTL media GuC with
 > VCS/VECS scheduling, native Xe gt_id 1 and GT1 engine-cycles/topology
-> queries and the media-GuC HuC, GT0's L3 bank topology entry,
-> shared-GGTT GuC TLB invalidation on both GTs, display-14 PSR on
-> hardware inputs, and MTL external outputs on Pipes B–D beside the lit
-> panel with the panel's KMS, PSR and FBC services pass release native
-> model gates — see §20).
+> queries, the media-GuC HuC and GT1 SLPC/RC6/powergating, GT0's L3
+> bank topology entry, shared-GGTT GuC TLB invalidation on both GTs,
+> display-14 PSR on hardware inputs, and MTL external outputs on Pipes
+> B–D beside the lit panel with the panel's KMS, PSR and FBC services
+> pass release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -5198,5 +5198,34 @@ New fixtures under `drivers/gpu/intel_gpu_media_gt`:
 The shared GuC model now records SLPC traffic. It accepts the strategy and
 HOST_CONTROL only from a registered media GuC, and the media model has GT1
 frequency fuses. Every existing GT1 fixture now runs the SLPC start before
-publication. These are native models, not physical Intel evidence; the
-integrated test run is pending.
+publication. These are native models, not physical Intel evidence.
+
+Integration: this unit applied on top of the L3, shared-GGTT and J3 units
+without a code conflict or a fix. All eight release groups pass 2,146 tests
+with no failures and no Intel skips; the only skip is the existing shared
+RNG-registration skip. Every existing `intel_gpu_media_gt` fixture passes
+with the SLPC start, and the 21 GT0 `intel_gpu_slpc` fixtures are unchanged
+and pass.
+
+Review against Linux b90c984d agreed on the following:
+- The start follows `xe_guc_pc_start`: RESET, then RUNNING within the reset
+  timeout, then `pc_adjust_freq_bounds` on the first task-state query (max
+  then min, lowered only above RP0), then `SETUP_PC_GUCRC(FIRMWARE_CONTROL)`,
+  the compute strategy and the cached power profile. A refused strategy is
+  overwritten by the profile's result, as there.
+- The media fuses match `mtl_init_fused_rp_values` and `mtl_get_rpe_freq`
+  for a media GT: RP0 is `MTL_MEDIAP_STATE_CAP` (0x138020) bits 8:0, RPn is
+  bits 24:16, and RPe is `MTL_MPE_FREQUENCY` (0x13802c) bits 8:0. Both are
+  absolute addresses above the GSI length.
+- `POWERGATE_ENABLE` (0x38a210) = 0x19a for VCS0/VCS2/VECS0 matches
+  `xe_gt_idle_enable_pg`: MEDIA plus VDN HCP/MFX for VCS0 and VCS2, no RENDER
+  on a media GT, and Wa_14020316580 is media 13.01 only.
+- The stop clears `RC_CONTROL` and `RC_STATE` as `xe_gt_idle_disable_c6`
+  does, after `GUCRC_HOST_CONTROL`.
+- Disabling powergating at every stop, where Linux does it only at suspend,
+  is harmless. It only keeps the wells powered until the next owner
+  re-enables gating, and every stop is followed by a GuC reset or a park.
+- A failed SLPC start stops GT1 unpublished, as `xe_uc_load_hw` fails the
+  uC load.
+
+The debug group pass is deferred to the end of the current integration wave.

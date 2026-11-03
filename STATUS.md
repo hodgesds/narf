@@ -2286,6 +2286,26 @@ existing shared RNG-registration skip. The release production boot and both
 btrfs postflights also pass. The debug group pass is deferred to the end of
 this integration wave. None of this has run on physical Intel hardware.
 
+### MTL media GT SLPC, RC6 and powergating — release gates recorded
+
+With `narf.intel.media_gt=1`, GT1 now gets power management the way Linux
+runs it for every GT:
+- Media powergating is enabled for VCS0, VCS2 and VECS0.
+- The media GuC starts SLPC with GT1's own frequency fuses, then hands RC6 to
+  firmware.
+- GT1 publishes only once SLPC is running. A failed SLPC start stops GT1
+  unpublished, as Linux fails the uC load.
+- Every stop returns RC6 and powergating to the host first.
+
+Linux disables powergating only at suspend. NARF does it at every stop, which
+is harmless because each stop ends in a GuC reset or a park. The GT0 SLPC path
+is unchanged, and its 21 fixtures pass as before.
+
+All eight release groups pass 2,146 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
