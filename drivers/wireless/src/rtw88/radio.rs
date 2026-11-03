@@ -513,6 +513,56 @@ pub(super) fn gains(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
     // separately in N22Cv2. Host RX rejection cannot suppress hardware ACKs.
     io.write32(0x440, 0x1f)
 }
+/// 5GHz counterpart of [`gains`] for one N2xO record
+/// (`rtw8822c_set_write_tx_power_ref` + `rtw8822c_set_tx_power_diff`): CCK
+/// references zero (`rtw_phy_set_tx_power_level_by_path` skips CCK on
+/// 5GHz), per-path OFDM references, CCK differences zero, the two OFDM
+/// difference words, and `RRSR_INIT_5G & phy_get_rrsr_mask(DESC_RATE6M)`
+/// = 0x10 (OFDM6 response only).
+pub(super) fn ofdm5(io: &mut impl Io, ofdm: [u8; 2], diffs: [u32; 2]) -> Result<(), Error> {
+    for path in 0..2 {
+        mask(io, 0x1c90, 1 << 15, 0)?;
+        mask(io, if path == 0 { 0x18a0 } else { 0x41a0 }, 0x7f0000, 0)?;
+    }
+    for (path, reference) in ofdm.into_iter().enumerate() {
+        mask(io, 0x1c90, 1 << 15, 0)?;
+        mask(
+            io,
+            if path == 0 { 0x18e8 } else { 0x41e8 },
+            0x1fc00,
+            u32::from(reference),
+        )?;
+    }
+    for (reg, value) in [(0x3a00, 0), (0x3a04, diffs[0]), (0x3a08, diffs[1])] {
+        mask(io, 0x1c90, 1 << 15, 0)?;
+        io.write32(reg, value)?;
+    }
+    io.write32(0x440, RRSR_OFDM6_5G)
+}
+/// `RRSR_INIT_5G` (0x150) masked to the OFDM6 response order.
+pub(super) const RRSR_OFDM6_5G: u32 = 0x150 & 0x1f;
+/// Readback of [`ofdm5`].
+pub(super) fn verify_ofdm5(io: &mut impl Io, ofdm: [u8; 2], diffs: [u32; 2]) -> Result<(), Error> {
+    for (path, reference) in ofdm.into_iter().enumerate() {
+        let (cck, ofdm) = if path == 0 {
+            (0x18a0, 0x18e8)
+        } else {
+            (0x41a0, 0x41e8)
+        };
+        if read(io, cck)? & 0x7f0000 != 0 || read(io, ofdm)? & 0x1fc00 != u32::from(reference) << 10
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x3a00)? != 0
+        || read(io, 0x3a04)? != diffs[0]
+        || read(io, 0x3a08)? != diffs[1]
+        || read(io, 0x440)? != RRSR_OFDM6_5G
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
 pub(super) fn rfk_power(io: &mut impl Io, active: bool) -> Result<(), Error> {
     for path in 0..2 {
         mask(io, 0x1b00, 6, path)?;

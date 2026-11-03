@@ -578,3 +578,58 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_channel5_record_ofdm_selection_and_kinds
 );
+
+fn smoke_rtw88_band5_base_rate_rrsr_and_ofdm_reference() -> TestResult {
+    use crate::rtw88::packet_format::{transmit_profile, DataProfile};
+    // tx.c rtw_tx_pkt_info_update_rate: 5GHz RTW_RATEID_G at DESC_RATE6M;
+    // get_rate_id WIRELESS_OFDM = RTW_RATEID_G; RRSR_INIT_5G & mask(6M).
+    let five = DataProfile::LEGACY5;
+    if !five.valid()
+        || five.rate_id() != 7
+        || five.rate() != 4
+        || five.response_mask() != 0x10
+        || DataProfile::LEGACY.response_mask() != 0x1f
+        || (DataProfile {
+            rates: 0x11,
+            ..five
+        })
+        .valid()
+    {
+        return TestResult::Fail("5GHz profile rate id, rate or RRSR differs from Linux");
+    }
+    let own = [2, 1, 2, 3, 4, 5];
+    let mut frame = vec![0x59; 40];
+    frame[..2].copy_from_slice(&[0xb0, 0]);
+    frame[4..10].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+    frame[10..16].copy_from_slice(&own);
+    frame[22..24].copy_from_slice(&[0xc0, 0xab]);
+    let word = |d: &[u8], at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+    let (Ok((m5, _)), Ok((m2, _))) = (
+        transmit_profile(&frame, own, 0, None, five),
+        transmit_profile(&frame, own, 0, None, DataProfile::LEGACY),
+    ) else {
+        return TestResult::Fail("management frame refused");
+    };
+    if (word(&m5, 4) >> 16) & 31 != 7
+        || word(&m5, 16) & 0x7f != 4
+        || (word(&m2, 4) >> 16) & 31 != 8
+        || word(&m2, 16) & 0x7f != 0
+    {
+        return TestResult::Fail("management rate id/rate not band-aware");
+    }
+    // rtw8822c_set_write_tx_power_ref / _set_tx_power_diff on 5GHz.
+    let mut io = RadioIo::reference();
+    let (ofdm, diffs) = ([40, 38], [0x7d00_7f02, 0x7c7c_7c7c]);
+    if radio::ofdm5(&mut io, ofdm, diffs).is_err()
+        || radio::verify_ofdm5(&mut io, ofdm, diffs).is_err()
+        || radio::verify_ofdm5(&mut io, [40, 37], diffs).is_ok()
+        || radio::read(&mut io, 0x440) != Ok(0x10)
+    {
+        return TestResult::Fail("C22 5GHz OFDM reference/difference program not read back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_band5_base_rate_rrsr_and_ofdm_reference
+);

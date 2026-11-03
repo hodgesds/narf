@@ -232,6 +232,7 @@ fn ht_profile(ldpc: bool, stbc: bool) -> DataProfile {
         acs: 0,
         fallback: false,
         bw40: false,
+        band5: false,
     }
 }
 

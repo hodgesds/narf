@@ -1071,6 +1071,7 @@ impl State {
                                 acs: 0,
                                 fallback: false,
                                 bw40: false,
+                                band5: false,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self

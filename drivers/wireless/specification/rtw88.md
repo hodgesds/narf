@@ -2542,8 +2542,19 @@ factor 1, max 0x3f, path A, since `rtw8821c_read_efuse` substitutes only
 the 2.4GHz record). Regulatory admission uses the 5GHz center frequency.
 Written, unexecuted: `smoke_rtw88_channel5_record_ofdm_selection_and_kinds`.
 
-Remaining for the row: band-aware base rate (`rtw_tx_pkt_info_update_rate` OFDM6 /
-`RTW_RATEID_G`, `RRSR_INIT_5G` 0x150, RA `WIRELESS_OFDM`), gate/retune/scan/
+Band-aware base rate (`packet_format::DataProfile::band5`): a 5GHz profile
+admits no CCK rate; `DataProfile::LEGACY5` is OFDM6 only, so DATA and the
+firmware RA_INFO use `get_rate_id` WIRELESS_OFDM = `RTW_RATEID_G` (7);
+management/EAPOL descriptors use `rtw_tx_pkt_info_update_rate`'s 5GHz
+`RTW_RATEID_G` at DESC_RATE6M (2.4GHz stays `RTW_RATEID_B_20M` at
+DESC_RATE1M); `response_mask` masks with `RRSR_INIT_5G` (0x150) instead of
+0x15f, so the OFDM6 base answers with 0x10. C22 `radio::ofdm5` /
+`verify_ofdm5` program the record's per-path OFDM references and the
+0x3a04/0x3a08 differences with CCK references/differences zero and
+REG_RRSR 0x10. Written, unexecuted:
+`smoke_rtw88_band5_base_rate_rrsr_and_ofdm_reference`.
+
+Remaining for the row: gate/retune/scan/
 CSA wiring, 5GHz HT, and regulatory admission (DFS rules stay refused: no
 shared beacon-hint/DFS owner has landed).
 

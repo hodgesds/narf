@@ -166,6 +166,11 @@ pub(super) struct DataProfile {
     /// descriptor W5_DATA_BW 1, RA BW_MODE 1 and BGN_40M rate ids; `sgi`
     /// then means SGI40.
     pub bw40: bool,
+    /// 5GHz operation (`hal.current_band_type == RTW_BAND_5G`): no CCK
+    /// rate is admitted, management uses OFDM6 with `RTW_RATEID_G`
+    /// (`tx.c::rtw_tx_pkt_info_update_rate`) and response rates come from
+    /// `RRSR_INIT_5G` (0x150) instead of `RRSR_INIT_2G` (0x15f).
+    pub band5: bool,
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
@@ -179,7 +184,34 @@ impl DataProfile {
         acs: 0,
         fallback: false,
         bw40: false,
+        band5: false,
     };
+    /// The 5GHz base profile: OFDM6 only (`get_rate_id` WIRELESS_OFDM =
+    /// `RTW_RATEID_G`).
+    pub(super) const LEGACY5: Self = Self {
+        rates: 1 << 4,
+        band5: true,
+        ..Self::LEGACY
+    };
+    /// Management/control rate id and descriptor rate:
+    /// `rtw_tx_pkt_info_update_rate` (2.4GHz `RTW_RATEID_B_20M` at
+    /// DESC_RATE1M, 5GHz `RTW_RATEID_G` at DESC_RATE6M), with the lowest
+    /// rate forced like `RTW_FLAG_FORCE_LOWEST_RATE`.
+    pub(super) const fn management(self) -> (u8, u8) {
+        if self.band5 {
+            (7, 4)
+        } else {
+            (8, 0)
+        }
+    }
+    /// `RRSR_INIT_5G` / `RRSR_INIT_2G` (`main.c::rtw_update_sta_info`).
+    pub(super) const fn rrsr_init(self) -> u32 {
+        if self.band5 {
+            0x150
+        } else {
+            0x15f
+        }
+    }
     pub(super) fn valid(self) -> bool {
         self.rates != 0
             && self.rates & !0xfff == 0
@@ -193,6 +225,7 @@ impl DataProfile {
             && self.acs & !(ACS_BK | ACS_VI | ACS_VO) == 0
             && (self.acs == 0 || self.qos)
             && (!self.bw40 || self.mcs != 0)
+            && (!self.band5 || self.rates & 15 == 0)
     }
     /// The QoS ring for `tid`, if this profile admits it.
     pub(super) fn tid_queue(self, tid: u8) -> Option<Queue> {
@@ -255,7 +288,7 @@ impl DataProfile {
             ];
             let kbps = DBPS[usize::from(rate - 20)] * 250;
             return KBPS.iter().enumerate().fold(0, |mask, (i, basic)| {
-                mask | if (0x15f & (1 << i)) != 0 && *basic <= kbps {
+                mask | if (self.rrsr_init() & (1 << i)) != 0 && *basic <= kbps {
                     1 << i
                 } else {
                     0
@@ -272,7 +305,7 @@ impl DataProfile {
         if rate >= 12 || order == 0 {
             order += 1;
         }
-        ((1u32 << (u32::from(order) + 4)) - 1) & 0x15f
+        ((1u32 << (u32::from(order) + 4)) - 1) & self.rrsr_init()
     }
 }
 fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<Queue, Error> {
@@ -420,8 +453,14 @@ pub(super) fn transmit_profile(
     if frame[0] == 0x88 && !ordinary {
         return Err(Error::Frame);
     }
-    let rate_id = if ordinary { profile.rate_id() } else { 8 };
-    // Source fixed-rate/no-fallback; management/EAPOL remain CCK1. QoS comes
+    let (management_id, management_rate) = profile.management();
+    let rate_id = if ordinary {
+        profile.rate_id()
+    } else {
+        management_id
+    };
+    // Source fixed-rate/no-fallback; management/EAPOL stay at the band's
+    // lowest rate (CCK1 / OFDM6). QoS comes
     // from the actual26-byte frame, with TID0 selecting the same BE queue.
     put(
         &mut bytes,
@@ -440,7 +479,7 @@ pub(super) fn transmit_profile(
         if ordinary {
             u32::from(profile.rate())
         } else {
-            0
+            u32::from(management_rate)
         },
     );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));

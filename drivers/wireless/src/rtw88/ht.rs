@@ -484,6 +484,7 @@ impl Grant {
             acs: 0,
             fallback: false,
             bw40: false,
+            band5: false,
         };
         if !self.allows(p) {
             return Err(Error::Unsupported);
