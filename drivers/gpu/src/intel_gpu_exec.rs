@@ -777,6 +777,21 @@ impl ResidentBatch {
             mappings: &self.space.dumpable,
         }
     }
+
+    /// Per-lane batch addresses (xe_sched_job_snapshot_capture), lane zero
+    /// first; none for a batchless submission.
+    pub(crate) fn diagnostic_batches(&self) -> impl Iterator<Item = u64> + '_ {
+        (!self.skip_batch)
+            .then_some(self.address)
+            .into_iter()
+            .chain(
+                self.parallel
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .filter(|_| !self.skip_batch),
+            )
+    }
 }
 
 /// Read-only ownership of the private kernel probe's code and result. Neither

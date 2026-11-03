@@ -1866,6 +1866,12 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 drop(d);
                 event(&memory, 0x4600, &[request[1] + lane]);
             }
+            // GuC error capture: LOG_BUFFER_FILE_FLUSH_COMPLETE(STATE_CAPTURE).
+            0x30 if request.get(1) == Some(&2) => {
+                w.0.borrow_mut()
+                    .stream_controls
+                    .push((0x30, control_fence, 2))
+            }
             0x40 | 0x302 | 0x30 => bcs8::stream_hw::service(w, &memory, control_fence, &request),
             0x4000 => huc_native::service_auth(w, &memory, control_fence, &request),
             0x3003 => service_slpc(w, &memory, control_fence, &request),

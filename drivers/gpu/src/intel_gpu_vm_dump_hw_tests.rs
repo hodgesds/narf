@@ -80,7 +80,7 @@ fn smoke_hardware_vm_dump_retains_closed_user_bo_through_capture_and_full_reset(
     assert_eq!(completion.result(), None);
     assert!(weak.upgrade().is_some() && context.busy());
     let captured = coredump::snapshot_bytes_for_test(59).unwrap();
-    assert_eq!((word(&captured, 8), word(&captured, 72)), (3, 31));
+    assert_eq!((word(&captured, 8), word(&captured, 72)), (4, 31));
     assert_eq!(
         (
             word(&captured, 160),

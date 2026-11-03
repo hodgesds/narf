@@ -6,6 +6,9 @@
 //! partial device coredump: retained LRC/ring/group scratch, owned VM tables
 //! and dumpable system BO prefixes are bounded. Raw bytes disclose addresses, commands
 //! and execution data and require current CAP_SYSLOG on every descriptor read.
+//! Version 4 appends a bounded text section in `__xe_devcoredump_read` order:
+//! device header, the guilty queue's policy, its batch addresses and one
+//! HW-engine register snapshot (GuC error capture or the manual fallback).
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
@@ -34,7 +37,18 @@ const VM_OFFSET: usize = EXEC_OFFSET + EXEC_BYTES;
 #[path = "intel_gpu_vm_dump.rs"]
 mod vm;
 pub(crate) use vm::VmCapture;
-pub(crate) const DUMP_BYTES: usize = VM_OFFSET + vm::BYTES;
+const XE_OFFSET: usize = VM_OFFSET + vm::BYTES;
+const XE_HEADER_BYTES: usize = 64;
+const XE_TEXT_BYTES: usize = 32 * 1024;
+const XE_BYTES: usize = XE_HEADER_BYTES + XE_TEXT_BYTES;
+pub(crate) const DUMP_BYTES: usize = XE_OFFSET + XE_BYTES;
+/// Xe text flags: truncated text, lost access, queue facts, GuC-captured
+/// engine registers, manually captured engine registers.
+pub(crate) const XE_TRUNCATED: u32 = 1;
+pub(crate) const XE_LOST: u32 = 2;
+pub(crate) const XE_QUEUE: u32 = 4;
+pub(crate) const XE_GUC: u32 = 8;
+pub(crate) const XE_MANUAL: u32 = 16;
 const CAP_SYSLOG: u32 = 34;
 const CAP_SYS_ADMIN: u32 = 21;
 static RETAINED: [AtomicU8; MAX_CARDS] = [const { AtomicU8::new(0) }; MAX_CARDS];
@@ -176,8 +190,34 @@ impl Armed {
         self.capture_with_vm(report, identity, log, ct, execution, |_, _| None, access);
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_with_vm(
+        self,
+        report: Report,
+        identity: Option<Identity>,
+        log: Option<&impl GpuBacking>,
+        ct: Option<&impl GpuBacking>,
+        execution: impl FnOnce(&mut ExecutionCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
+        vms: impl FnOnce(&mut VmCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
+        access: impl FnMut() -> bool,
+    ) {
+        self.capture_with_text(
+            report,
+            identity,
+            log,
+            ct,
+            execution,
+            vms,
+            |_, _, _| false,
+            access,
+        );
+    }
+
+    /// `text` writes the version-4 Xe text section and returns whether it
+    /// wrote one; it reads no register and allocates nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_with_text(
         mut self,
         mut report: Report,
         identity: Option<Identity>,
@@ -185,6 +225,7 @@ impl Armed {
         ct: Option<&impl GpuBacking>,
         execution: impl FnOnce(&mut ExecutionCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
         vms: impl FnOnce(&mut VmCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
+        text: impl FnOnce(&mut XeText<'_>, &Report, &mut dyn FnMut() -> bool) -> bool,
         mut access: impl FnMut() -> bool,
     ) {
         let dump = Arc::get_mut(&mut self.0).expect("unpublished crash destination");
@@ -251,7 +292,8 @@ impl Armed {
         if total.is_some() {
             sections |= 8;
         }
-        let mut destination = VmCapture::new(&mut bytes[VM_OFFSET..], report.capture.platform);
+        let mut destination =
+            VmCapture::new(&mut bytes[VM_OFFSET..XE_OFFSET], report.capture.platform);
         let total = vms(&mut destination, &mut checked_access);
         if denied.get() {
             destination.flags |= 2;
@@ -260,9 +302,27 @@ impl Armed {
         if total.is_some() {
             sections |= 16;
         }
+        let (xe_header, xe_text) = bytes[XE_OFFSET..].split_at_mut(XE_HEADER_BYTES);
+        let mut destination = XeText {
+            bytes: &mut *xe_text,
+            len: 0,
+            full: false,
+            flags: 0,
+        };
+        let written = text(&mut destination, &report, &mut checked_access);
+        let xe_flags = if written {
+            sections |= 32;
+            if denied.get() {
+                destination.flags |= XE_LOST;
+            }
+            destination.finish(xe_header)
+        } else {
+            xe_text.fill(0);
+            0
+        };
         bytes[..8].copy_from_slice(b"NARFCDMP");
         for (offset, value) in [
-            (8, 3),
+            (8, 4),
             (12, HEADER_BYTES as u32),
             (16, DUMP_BYTES as u32),
             (20, dump.permit.0),
@@ -285,6 +345,9 @@ impl Armed {
             (160, VM_OFFSET as u32),
             (164, vm::BYTES as u32),
             (168, vm_flags),
+            (172, XE_OFFSET as u32),
+            (176, XE_BYTES as u32),
+            (180, xe_flags),
         ] {
             put32(bytes, offset, value);
         }
@@ -292,6 +355,47 @@ impl Armed {
         put64(bytes, 40, report.capture.now_ns);
         put64(bytes, 24, dump.generation);
         publish(self.0);
+    }
+}
+
+/// The fixed version-4 Xe text region. Writes past its capacity end the text
+/// with a truncation marker; nothing is ever spliced past the bound.
+pub(crate) struct XeText<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+    full: bool,
+    pub(crate) flags: u32,
+}
+impl core::fmt::Write for XeText<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        if self.full || self.len + text.len() > self.bytes.len() - 32 {
+            self.full = true;
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.len..self.len + text.len()].copy_from_slice(text.as_bytes());
+        self.len += text.len();
+        Ok(())
+    }
+}
+impl XeText<'_> {
+    fn finish(mut self, header: &mut [u8]) -> u32 {
+        if self.full {
+            self.flags |= XE_TRUNCATED;
+            let marker = b"\noutput_truncated=1\n";
+            self.bytes[self.len..self.len + marker.len()].copy_from_slice(marker);
+            self.len += marker.len();
+        }
+        header[..8].copy_from_slice(b"NARFXETX");
+        for (offset, value) in [
+            (8, 1),
+            (12, XE_HEADER_BYTES as u32),
+            (16, XE_TEXT_BYTES as u32),
+            (20, self.len as u32),
+            (24, self.flags),
+        ] {
+            put32(header, offset, value);
+        }
+        self.flags
     }
 }
 

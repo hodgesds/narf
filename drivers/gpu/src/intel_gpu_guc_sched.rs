@@ -307,6 +307,37 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     /// Shared-GGTT TLB invalidation of this GuC over this CT
     /// (xe_guc_tlb_inval.c::send_tlb_inval_ggtt with submission enabled).
     ggtt: crate::intel_gpu_ggtt_tlb::Inval,
+    /// Opt-in GuC error capture: the preallocated manual node and the
+    /// pending STATE_CAPTURE_NOTIFICATION (xe_guc_capture.c).
+    error_capture: Option<ErrorCapture>,
+}
+
+struct ErrorCapture {
+    family: crate::intel_gpu_error::capture::Family,
+    node: crate::intel_gpu_error::capture::Node,
+    /// Context and engine of the last manual capture.
+    manual: Option<(u16, Engine)>,
+    notified: bool,
+    nospace: u32,
+}
+
+/// The one register read the timeout capture admits: current GT forcewake
+/// request, render wake and the GuC forcewake ACK, then the register itself.
+fn forcewake_read(mmio: &impl MmioWindow, platform: GtPlatform, offset: u64) -> Option<u32> {
+    let request = mmio.read32(0xa188);
+    let render = mmio.read32(0xd84);
+    let ack = mmio.read32(platform.guc_forcewake_ack()?);
+    if request == u32::MAX
+        || render == u32::MAX
+        || ack == u32::MAX
+        || request & 1 == 0
+        || render & 1 == 0
+        || ack & 1 == 0
+    {
+        return None;
+    }
+    let value = mmio.read32(offset);
+    (value != u32::MAX).then_some(value)
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -426,6 +457,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             reset_policy: None,
             media_gt,
             ggtt: crate::intel_gpu_ggtt_tlb::Inval::new(),
+            error_capture: None,
         })
     }
 
@@ -602,6 +634,121 @@ impl<A: BootAllocator> GuCScheduler<A> {
 
     pub(crate) fn take_error_report(&mut self) -> Option<Report> {
         self.pending_error.take()
+    }
+
+    /// Opt-in GuC error capture, before any context exists. Allocation is
+    /// fallible and optional: without it there is no manual fallback.
+    pub(crate) fn enable_error_capture(
+        &mut self,
+        family: crate::intel_gpu_error::capture::Family,
+        max_regs: usize,
+    ) -> Result<(), SchedulingError> {
+        if !self.pristine || !self.resources.contexts.is_empty() || self.error_capture.is_some() {
+            return Err(SchedulingError::State);
+        }
+        let node = crate::intel_gpu_error::capture::Node::new(max_regs)
+            .map_err(|_| SchedulingError::Allocation(SubmitError::OutOfMemory))?;
+        self.error_capture = Some(ErrorCapture {
+            family,
+            node,
+            manual: None,
+            notified: false,
+            nospace: 0,
+        });
+        Ok(())
+    }
+
+    /// A STATE_CAPTURE_NOTIFICATION arrived since the last call.
+    pub(crate) fn take_capture_notification(&mut self) -> bool {
+        self.error_capture
+            .as_mut()
+            .is_some_and(|capture| core::mem::take(&mut capture.notified))
+    }
+
+    /// G2H STATE_CAPTURE_NOTIFICATIONs that reported no space.
+    pub(crate) fn capture_nospace(&self) -> u32 {
+        self.error_capture
+            .as_ref()
+            .map_or(0, |capture| capture.nospace)
+    }
+
+    /// The manual node captured at `id`'s timeout, with its engine.
+    pub(crate) fn manual_capture(
+        &self,
+        id: u16,
+    ) -> Option<(&crate::intel_gpu_error::capture::Node, Engine)> {
+        let capture = self.error_capture.as_ref()?;
+        let (owner, engine) = capture.manual?;
+        (owner == id).then_some((&capture.node, engine))
+    }
+
+    /// xe_guc_exec_queue_snapshot_capture and xe_sched_job_snapshot_capture
+    /// facts of the first guilty context. All are host-owned except the
+    /// parallel workqueue, read only from coherent memory under `access`.
+    pub(crate) fn capture_queue(
+        &self,
+        access: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::intel_gpu_error::capture::Queue> {
+        use crate::intel_gpu_error::capture::{Queue, Wq, QUEUE_LANES, WQ_ENTRIES};
+        let context = self
+            .resources
+            .contexts
+            .iter()
+            .find(|context| context.timed_out || context.reset)?;
+        let (priority, timeslice_us, low_latency) = context
+            .user
+            .as_ref()
+            .map_or((3, 1000, false), |user| user.policy());
+        let mut batches = [0; QUEUE_LANES];
+        let mut batch_count = 0;
+        if let Some(batch) = &context.resident {
+            for address in batch.diagnostic_batches().take(QUEUE_LANES) {
+                batches[batch_count] = address;
+                batch_count += 1;
+            }
+        }
+        let wq = context.parallel.as_ref().and_then(|group| {
+            let scratch = &group.scratch;
+            if !scratch.coherent_for_device() || scratch.size_pages() != 1 || !access() {
+                return None;
+            }
+            fence(Ordering::Acquire);
+            let mut wq = Wq {
+                head: scratch.read32(0),
+                tail: scratch.read32(4),
+                status: scratch.read32(12),
+                internal_tail: (group.width() as u32 + 3) * 4,
+                entries: [0; WQ_ENTRIES],
+                count: 0,
+            };
+            // guc_exec_queue_wq_snapshot_capture over NARF's 1 KiB queue.
+            let mut at = wq.head;
+            while at != wq.tail && at < 1024 && usize::from(wq.count) < WQ_ENTRIES {
+                wq.entries[usize::from(wq.count)] = scratch.read32(1024 + u64::from(at & !3));
+                wq.count += 1;
+                at = (at + 4) % 1024;
+            }
+            access().then_some(wq)
+        });
+        Some(Queue {
+            id: context.id,
+            lrca: context.image.ggtt_offset(),
+            engine: context.engine,
+            placements: context.placements,
+            logical_mask: self.engines.logical_mask(context.placements).unwrap_or(0),
+            width: context.width() as u8,
+            stamp: context.stamp,
+            kernel: context.user.is_none(),
+            priority,
+            timeslice_us,
+            low_latency,
+            phase: context.software_diagnostic().phase,
+            timed_out: context.timed_out,
+            reset: context.reset,
+            batches,
+            batch_count: batch_count as u8,
+            wq,
+        })
     }
 
     pub(crate) fn enable_engine(&mut self, mmio: &impl MmioWindow) -> Result<(), SchedulingError> {
@@ -1538,23 +1685,22 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                 // GuCGt checked awake before this poll; its PCI
                                 // owner retains D0/reset ownership throughout. The
                                 // authorized window rechecks current cap per read.
-                                let mmio = ct.window();
-                                let request = mmio.read32(0xa188);
-                                let render = mmio.read32(0xd84);
-                                let ack = mmio.read32(self.platform.guc_forcewake_ack()?);
-                                if request == u32::MAX
-                                    || render == u32::MAX
-                                    || ack == u32::MAX
-                                    || request & 1 == 0
-                                    || render & 1 == 0
-                                    || ack & 1 == 0
-                                {
-                                    return None;
-                                }
-                                let value = mmio.read32(offset);
-                                (value != u32::MAX).then_some(value)
+                                forcewake_read(ct.window(), self.platform, offset)
                             },
                         ));
+                        // guc_exec_queue_timedout_job: with no GuC capture for
+                        // the queue, xe_engine_snapshot_capture_for_queue reads
+                        // the first engine of its class and logical mask before
+                        // scheduling is disabled.
+                        if let (Some(capture), Some(engine)) =
+                            (&mut self.error_capture, context.placements.iter().next())
+                        {
+                            let family = capture.family;
+                            capture.node.capture_manual(family, engine, |offset| {
+                                forcewake_read(ct.window(), self.platform, offset)
+                            });
+                            capture.manual = Some((context.id, engine));
+                        }
                     }
                     context.phase = Phase::Disable;
                 }
@@ -1784,6 +1930,22 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::Protocol);
         }
         let action = message.auxiliary as u16;
+        // xe_guc_error_capture_handler, only with registered capture lists:
+        // one status dword, NOSPACE = 1. The GT owner processes the output.
+        if action == crate::intel_gpu_error::capture::NOTIFICATION {
+            let capture = self
+                .error_capture
+                .as_mut()
+                .ok_or(SchedulingError::Protocol)?;
+            if message.payload.len() != 1 {
+                return Err(SchedulingError::Protocol);
+            }
+            if message.payload[0] & 0xff == 1 {
+                capture.nospace = capture.nospace.saturating_add(1);
+            }
+            capture.notified = true;
+            return Ok(());
+        }
         // ENGINE_FAILURE_NOTIFICATION (0x1009, GuC could not reset an engine)
         // stays a protocol loss: Linux answers it with a GT reset.
         if !matches!(action, 0x1002 | 0x1008 | 0x4600 | 0x7001) {

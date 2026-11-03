@@ -341,7 +341,7 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
     let dump = coredump::take_for_test(54);
     assert_eq!(&dump[..8], b"NARFCDMP");
     assert_eq!(u32::from_le_bytes(dump[8..12].try_into().unwrap()), 3);
-    assert_eq!(dump.len(), 0x275380);
+    assert_eq!(dump.len(), 0x27d3c0);
     assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 31);
     assert_eq!(
         u32::from_le_bytes(dump[144..148].try_into().unwrap()),

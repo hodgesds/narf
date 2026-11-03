@@ -1914,6 +1914,10 @@ impl Owner {
                     // The OA buffer is reserved under the same rule.
                     let _ = gt.prepare_oa();
                 }
+                if crate::intel_gpu_error::coredump::enabled() {
+                    // GuC error-capture lists join the submission ADS reload.
+                    let _ = gt.prepare_error_capture();
+                }
                 gt.begin_scheduling_with_ccs_mode(now, state.ccs_mode?)
                     .map_err(RuntimeError::Gt)?;
                 state.phase = Phase::Reloading;

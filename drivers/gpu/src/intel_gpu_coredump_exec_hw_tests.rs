@@ -53,7 +53,7 @@ fn smoke_hardware_coredump_execution_timeout_snapshot_survives_full_reset() -> T
         );
         assert_eq!(completion.result(), None);
         let captured = coredump::snapshot_bytes_for_test(index).unwrap();
-        assert_eq!(word(&captured, 8), 3);
+        assert_eq!(word(&captured, 8), 4);
         assert_eq!(word(&captured, 72) & 8, 8);
         let offset = word(&captured, 144) as usize;
         let exec = &captured[offset..offset + word(&captured, 148) as usize];

@@ -19,6 +19,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod vm_dump {
     include!("intel_gpu_vm_dump_hw_tests.rs");
 }
+mod guc_capture {
+    include!("intel_gpu_guc_capture_hw_tests.rs");
+}
 
 fn prime(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
     hardware_discovery(gt, w, ack);

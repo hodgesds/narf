@@ -130,7 +130,7 @@ fn smoke_coredump_wire_fixed_extents_and_immutable_reads() -> TestResult {
             word(&dump.bytes, 12),
             word(&dump.bytes, 16)
         ),
-        (3, 256, DUMP_BYTES as u32)
+        (4, 256, DUMP_BYTES as u32)
     );
     assert_eq!(word(&dump.bytes, 20), index);
     assert_eq!(word(&dump.bytes, 72), 7);
@@ -529,9 +529,9 @@ fn smoke_coredump_execution_wire_lrc_ring_scratch_and_immutable_reads() -> TestR
         || true,
     );
     let dump = snapshot(index).unwrap();
-    // Version3 preserves the earlier report/log/CT/execution offsets.
-    assert_eq!(word(&dump.bytes, 8), 3);
-    assert_eq!(dump.bytes.len(), 0x275380);
+    // Version4 preserves the earlier report/log/CT/execution offsets.
+    assert_eq!(word(&dump.bytes, 8), 4);
+    assert_eq!(dump.bytes.len(), 0x27d3c0);
     assert_eq!(word(&dump.bytes, 72), 9);
     assert_eq!(word(&dump.bytes, 144), 0x11c100);
     assert_eq!(word(&dump.bytes, 148), 64 + 8 * 0x13080);
@@ -754,4 +754,178 @@ fn smoke_coredump_execution_current_access_loss_zeros_partial_and_stops_later_re
 kernel_test_in!(
     "drivers/gpu/intel_gpu_error",
     smoke_coredump_execution_current_access_loss_zeros_partial_and_stops_later_reads
+);
+
+fn xe_capture(
+    index: u32,
+    text: impl FnOnce(&mut XeText<'_>, &Report, &mut dyn FnMut() -> bool) -> bool,
+    access: impl FnMut() -> bool,
+) -> Arc<Dump> {
+    let log = Backing::new(LOG_BYTES);
+    let ct = Backing::new(CT_BYTES);
+    Armed::reserve(index).unwrap().capture_with_text(
+        report(),
+        Some(identity()),
+        Some(&log),
+        Some(&ct),
+        |_, _| None,
+        |_, _| None,
+        text,
+        access,
+    );
+    snapshot(index).unwrap()
+}
+
+fn smoke_coredump_xe_text_section_queue_job_engine_and_bounds() -> TestResult {
+    use crate::intel_gpu_error::capture;
+    let lists = capture::Lists::new(capture::Family::XeHpg, true, 1, 1, 4).unwrap();
+    let mut node = capture::Node::new(lists.max_regs()).unwrap();
+    node.capture_manual(capture::Family::XeHpg, Engine::Rcs0, |offset| {
+        Some(offset as u32)
+    });
+    let device = capture::Device {
+        device_id: 0xe20b,
+        revision: 3,
+        gmd_id: 20 << 22 | 1 << 14 | 4,
+        reference_clock: Some(100_000_000),
+    };
+    let mut batches = [0; capture::QUEUE_LANES];
+    batches[0] = 0x1_0000;
+    let queue = capture::Queue {
+        id: 5,
+        lrca: 0x12_3000,
+        engine: Engine::Rcs0,
+        placements: EngineSet::of(&[Engine::Rcs0]),
+        logical_mask: 1,
+        width: 1,
+        stamp: 77,
+        kernel: false,
+        priority: 2,
+        timeslice_us: 1000,
+        low_latency: true,
+        phase: super::super::ContextPhase::Running,
+        timed_out: true,
+        reset: false,
+        batches,
+        batch_count: 1,
+        wq: None,
+    };
+    let index = free_slot();
+    let dump = xe_capture(
+        index,
+        |out, report, access| {
+            assert!(access());
+            out.flags |= XE_QUEUE | XE_MANUAL;
+            let facts = capture::Facts {
+                engine: Engine::Rcs0,
+                logical: 0,
+                wake_ref: 1,
+            };
+            capture::print_dump(
+                out,
+                &device,
+                report,
+                Some(&queue),
+                Some((facts, &node)),
+                &lists,
+                0,
+                0,
+            )
+            .is_ok()
+        },
+        || true,
+    );
+    assert_eq!(dump.bytes.len(), DUMP_BYTES);
+    assert_eq!(word(&dump.bytes, 8), 4);
+    assert_eq!(word(&dump.bytes, 72), 7 | 32);
+    assert_eq!(
+        (
+            word(&dump.bytes, 172),
+            word(&dump.bytes, 176),
+            word(&dump.bytes, 180)
+        ),
+        (XE_OFFSET as u32, XE_BYTES as u32, XE_QUEUE | XE_MANUAL)
+    );
+    // Earlier sections keep their version-3 offsets.
+    assert_eq!(word(&dump.bytes, 160) as usize, VM_OFFSET);
+    let xe = &dump.bytes[XE_OFFSET..];
+    assert_eq!(&xe[..8], b"NARFXETX");
+    assert_eq!(
+        (word(xe, 8), word(xe, 12), word(xe, 16), word(xe, 24)),
+        (1, 64, 32768, XE_QUEUE | XE_MANUAL)
+    );
+    let len = word(xe, 20) as usize;
+    assert!(xe[64 + len..].iter().all(|byte| *byte == 0));
+    let text = core::str::from_utf8(&xe[64..64 + len]).unwrap();
+    assert!(text.starts_with(
+        "**** Xe Device Coredump ****\nReason: Timedout job - seqno=77, lrc_seqno=77, guc_id=5, flags=0x20\nkernel: narf\nmodule: narf-drivers-gpu\nSnapshot time: unavailable\nUptime: 0.000000090\nProcess: unavailable\nPCI ID: 0xe20b\nPCI revision: 0x03\nGT id: 0\n\tTile: 0\n\tType: main\n\tIP ver: 20.1.4\n\tCS reference clock: 100000000\n"
+    ));
+    assert!(text.contains(
+        "GuC ID: 5\n\tName: rcs5\n\tClass: 0\n\tLogical mask: 0x1\n\tWidth: 1\n\tRef: unavailable\n\tTimeout: 5000 (ms)\n\tTimeslice: 1000 (us)\n\tPreempt timeout: 500000 (us)\n"
+    ));
+    // ENABLED|REGISTERED plus BANNED for the timed-out queue.
+    assert!(text.contains("\tSchedule State: 0x203\n\tFlags: 0x20\n"));
+    assert!(text.contains("\n**** Job ****\nbatch_addr[0]: 0x0000000000010000\n"));
+    assert!(text.contains(
+        "\n**** HW Engines ****\nrcs0 (physical), logical instance=0\n\tCapture_source: Manual\n"
+    ));
+    assert!(text.contains("\tRING_HEAD: 0x00002034\n"));
+    assert!(text.ends_with("\n**** VM state ****\nNARF: binary section at header 160/164\n"));
+    // Disclosure stays in the CAP_SYSLOG bundle: the public report has no
+    // engine snapshot registers.
+    let public = Snapshot {
+        report: report(),
+        suppressed: 0,
+    }
+    .text();
+    assert!(!public.contains("RING_START") && !public.contains("ACTHD"));
+    assert!(!public.contains("Capture_source"));
+    assert!(clear(index, dump.generation));
+
+    // Text past the fixed region truncates with a marker, never beyond it.
+    let index = free_slot();
+    let dump = xe_capture(
+        index,
+        |out, _, _| {
+            use core::fmt::Write as _;
+            for line in 0..4096 {
+                if writeln!(out, "line {line:08}").is_err() {
+                    break;
+                }
+            }
+            true
+        },
+        || true,
+    );
+    let xe = &dump.bytes[XE_OFFSET..];
+    let len = word(xe, 20) as usize;
+    assert!(len <= XE_TEXT_BYTES);
+    assert_eq!(word(xe, 24) & XE_TRUNCATED, XE_TRUNCATED);
+    assert!(xe[64..64 + len].ends_with(b"\noutput_truncated=1\n"));
+    assert_eq!(word(&dump.bytes, 180) & XE_TRUNCATED, XE_TRUNCATED);
+    assert!(clear(index, dump.generation));
+
+    // Lost authority latches into the section; no text leaves no section.
+    let index = free_slot();
+    let dump = xe_capture(
+        index,
+        |out, _, access| {
+            assert!(!access());
+            core::fmt::Write::write_str(out, "x\n").is_ok()
+        },
+        || false,
+    );
+    assert_eq!(word(&dump.bytes, 180) & XE_LOST, XE_LOST);
+    assert!(clear(index, dump.generation));
+    let index = free_slot();
+    let dump = xe_capture(index, |_, _, _| false, || true);
+    assert_eq!(word(&dump.bytes, 72) & 32, 0);
+    assert_eq!(word(&dump.bytes, 180), 0);
+    assert!(dump.bytes[XE_OFFSET..].iter().all(|byte| *byte == 0));
+    assert!(clear(index, dump.generation));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_coredump_xe_text_section_queue_job_engine_and_bounds
 );

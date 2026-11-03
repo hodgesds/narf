@@ -18,6 +18,8 @@ use crate::{
     intel_gpu_guc_gt::GtState,
 };
 
+#[path = "intel_gpu_guc_capture.rs"]
+pub(crate) mod capture;
 #[path = "intel_gpu_devcoredump.rs"]
 pub(crate) mod coredump;
 

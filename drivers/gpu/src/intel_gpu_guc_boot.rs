@@ -276,12 +276,18 @@ struct Resources<A: BootAllocator> {
     logs: A::Backing,
     hwconfig: Option<HwconfigDma<A::Backing>>,
     huc: Option<HucDma<A::Backing>>,
+    /// GuC error-capture register lists (xe_guc_ads.c capture lists), in a
+    /// separate GGTT allocation the ADS points at.
+    capture: Option<A::Backing>,
 }
 impl<A: BootAllocator> Resources<A> {
     fn free(mut self) {
         self.allocator.free(self.image);
         self.allocator.free(self.ads);
         self.allocator.free(self.logs);
+        if let Some(capture) = self.capture {
+            self.allocator.free(capture);
+        }
         if let Some(huc) = self.huc {
             self.allocator.free(huc.backing);
         }
@@ -331,6 +337,7 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     firmware_version: (u8, u8, u8),
     incarnation: u64,
     workarounds: Option<GuCWorkarounds>,
+    capture_lists: Option<Arc<crate::intel_gpu_error::capture::Lists>>,
 }
 
 pub(crate) struct LiveLog<'a, B> {
@@ -586,6 +593,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 logs,
                 hwconfig: None,
                 huc,
+                capture: None,
             }),
             platform,
             role: GuCRole::Primary,
@@ -604,6 +612,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             firmware_version: image.version,
             incarnation: 0,
             workarounds: None,
+            capture_lists: None,
         })
     }
 
@@ -788,6 +797,52 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.hwconfig = Some(HwconfigDma { backing, bytes });
         invalidate_guc_tlb(&self.mmio, self.platform);
         Ok(base)
+    }
+
+    /// Allocate the GuC error-capture list object while the GuC runs, before
+    /// the submission reload. The lists and the ADS capture pointers are
+    /// written only while the GuC is proven stopped (`poll`'s reload), as
+    /// xe_guc_ads_populate's guc_capture_prep_lists. Primary GuC only.
+    pub(crate) fn prepare_error_capture(
+        &mut self,
+        lists: Arc<crate::intel_gpu_error::capture::Lists>,
+    ) -> Result<(), BootError> {
+        if self.state != BootState::Ready
+            || self.role != GuCRole::Primary
+            || self.scheduling.is_some()
+            || self.resources.capture.is_some()
+        {
+            return Err(BootError::State);
+        }
+        self.awake()?;
+        let pages = u32::try_from(lists.bytes() / PAGE as usize).map_err(|_| BootError::Address)?;
+        let r = &mut *self.resources;
+        let backing = r.allocator.alloc(pages).map_err(BootError::Allocation)?;
+        let base = backing.ggtt_offset();
+        let checked = extent(&backing, pages).and_then(|()| {
+            if [&r.image, &r.ads, &r.logs]
+                .into_iter()
+                .chain(r.huc.as_ref().map(|h| &h.backing))
+                .chain(r.hwconfig.as_ref().map(|h| &h.backing))
+                .any(|old| {
+                    u64::from(base)
+                        < u64::from(old.ggtt_offset()) + u64::from(old.size_pages()) * 4096
+                        && u64::from(old.ggtt_offset()) < u64::from(base) + u64::from(pages) * 4096
+                })
+            {
+                Err(BootError::Address)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = checked {
+            r.allocator.free(backing);
+            return Err(error);
+        }
+        backing.zero_fill();
+        r.capture = Some(backing);
+        self.capture_lists = Some(lists);
+        Ok(())
     }
 
     pub(crate) fn finish_hwconfig(&mut self) -> Result<(), BootError> {
@@ -1072,6 +1127,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.sync_for_device(&r.image)?;
         r.allocator.sync_for_device(&r.ads)?;
         r.allocator.sync_for_device(&r.logs)?;
+        if let Some(capture) = &r.capture {
+            r.allocator.sync_for_device(capture)?;
+        }
         let mut params = [0u32; 14];
         params[0] = r.logs.ggtt_offset() | 0x3f5;
         if crate::intel_gpu_guc_log::stream::enabled() {
@@ -1225,6 +1283,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             Some(&self.resources.image),
                             Some(&self.resources.logs),
                             self.resources.huc.as_ref().map(|h| &h.backing),
+                            self.resources.capture.as_ref(),
                         ]
                         .map(|backing| {
                             backing.map(|backing| {
@@ -1328,6 +1387,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                                 ads.write32(entry + 8, register.flags);
                                 ads.write32(entry + 12, 0);
                             }
+                        }
+                        // guc_capture_prep_lists, from the published engines'
+                        // per-capture-class enabled masks.
+                        if let (Some(lists), Some(backing)) =
+                            (&self.capture_lists, &self.resources.capture)
+                        {
+                            let mut masks = [0; crate::intel_gpu_error::capture::CLASSES];
+                            for engine in engines.iter() {
+                                masks[crate::intel_gpu_error::capture::capture_class(engine)] |=
+                                    1 << engine.physical_instance();
+                            }
+                            lists.write_ads(ads, backing, masks);
                         }
                         self.state = BootState::Staged;
                         self.begin(now)?;

@@ -147,8 +147,8 @@ fn smoke_coredump_vm_wire_owned_tables_corruption_and_immutable_reads() -> TestR
     // SAFETY: restore that owned entry before the walker tears it down.
     unsafe { core::ptr::write_volatile(root, original) };
     assert_eq!(&dump.bytes[..8], b"NARFCDMP");
-    assert_eq!(word(&dump.bytes, 8), 3);
-    assert_eq!(dump.bytes.len(), 0x275380);
+    assert_eq!(word(&dump.bytes, 8), 4);
+    assert_eq!(dump.bytes.len(), 0x27d3c0);
     assert_eq!(word(&dump.bytes, 72), 17);
     assert_eq!(word(&dump.bytes, 160), 0x1b4540);
     assert_eq!(word(&dump.bytes, 164), 0xc0e40);

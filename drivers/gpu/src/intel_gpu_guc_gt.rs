@@ -99,6 +99,8 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
     eu_stall: Option<crate::intel_gpu_eu_stall::Collector<A>>,
     oa: Option<crate::intel_gpu_oa::Unit<A>>,
     mert: Option<crate::intel_gpu_slpc::mert::Mert>,
+    /// Opt-in GuC error capture (`narf.intel.devcoredump=1`).
+    capture: Option<crate::intel_gpu_error::capture::State>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -297,6 +299,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 eu_stall: None,
                 oa: None,
                 mert: None,
+                capture: None,
             }),
             state: GtState::Staged,
             deadline: 0,
@@ -454,7 +457,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             firmware_version: log.firmware_version,
             firmware_digest,
         });
-        buffer.capture_with_vm(
+        buffer.capture_with_text(
             report,
             identity,
             log.as_ref().map(|log| log.backing),
@@ -479,8 +482,86 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     })
                 })
             },
+            |out, report, access| self.coredump_text(out, report, access),
             || access() && self.awake().is_ok(),
         );
+    }
+
+    /// The version-4 Xe text: header facts, the guilty queue, its batch
+    /// addresses and one engine snapshot. A GuC capture node for the queue's
+    /// class, GuC id and LRCA wins over the manual node taken at its timeout
+    /// (xe_hw_engine_snapshot_capture); the consumed node is released later.
+    fn coredump_text(
+        &self,
+        out: &mut crate::intel_gpu_error::coredump::XeText<'_>,
+        report: &crate::intel_gpu_error::Report,
+        access: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        use crate::intel_gpu_error::{capture, coredump};
+        let Some(state) = self.parts.capture.as_ref() else {
+            return false;
+        };
+        let scheduler = self.parts.scheduler.as_ref();
+        let queue = scheduler.and_then(|scheduler| scheduler.capture_queue(access));
+        let engines = self.engines().unwrap_or_default();
+        let wake_ref = u32::from(access());
+        let facts = |engine| capture::Facts {
+            engine,
+            logical: engines.logical_instance(engine).unwrap_or(0),
+            wake_ref,
+        };
+        let matched = queue.as_ref().and_then(|queue| {
+            state.pool.find_match(
+                queue.engine.guc_class(),
+                |instance| {
+                    queue
+                        .placements
+                        .iter()
+                        .any(|engine| engine.physical_instance() == instance)
+                },
+                u32::from(queue.id),
+                queue.lrca,
+            )
+        });
+        let guc = matched.and_then(|index| {
+            let node = state.pool.node(index);
+            engines
+                .iter()
+                .find(|engine| {
+                    engine.guc_class() == node.class && engine.physical_instance() == node.instance
+                })
+                .map(|engine| (facts(engine), node))
+        });
+        let manual = queue
+            .as_ref()
+            .and_then(|queue| scheduler?.manual_capture(queue.id))
+            .map(|(node, engine)| (facts(engine), node));
+        if queue.is_some() {
+            out.flags |= coredump::XE_QUEUE;
+        }
+        let engine = if guc.is_some() {
+            out.flags |= coredump::XE_GUC;
+            guc
+        } else {
+            if manual.is_some() {
+                out.flags |= coredump::XE_MANUAL;
+            }
+            manual
+        };
+        let _ = capture::print_dump(
+            out,
+            &state.device,
+            report,
+            queue.as_ref(),
+            engine,
+            &state.lists,
+            scheduler.map_or(0, GuCScheduler::capture_nospace),
+            state.pool.errors,
+        );
+        if let (Some(index), true) = (matched, guc.is_some()) {
+            state.consumed(index);
+        }
+        true
     }
 
     /// Last validated firmware table. It describes hardware capabilities, not
@@ -822,6 +903,70 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.parts.oa = Some(unit);
         Ok(())
     }
+    /// Register the GuC error-capture lists (xe_guc_capture_init and the ADS
+    /// capture lists) before scheduling starts, on the primary GuC only. The
+    /// list object, parsed-node pool and manual node are preallocated here;
+    /// the device header facts are sampled once under the current wake.
+    pub(crate) fn prepare_error_capture(&mut self) -> Result<(), narf_filesystem::FsError> {
+        use crate::intel_gpu_error::capture::{Device, Family, Lists, State};
+        use narf_filesystem::FsError;
+        if self.state != GtState::Ready
+            || self.parts.scheduler.is_some()
+            || self.parts.capture.is_some()
+            || self.parts.boot.role() != crate::intel_gpu_guc_boot::GuCRole::Primary
+        {
+            return Err(FsError::Unsupported);
+        }
+        self.awake().map_err(|_| FsError::NoDevice)?;
+        let platform = self.parts.boot.platform();
+        let family = Family::for_platform(platform).ok_or(FsError::Unsupported)?;
+        let topology = self.topology().ok_or(FsError::NoDevice)?;
+        // xe_gt_mcr.c::dss_per_group: HWCONFIG max slices/subslices, else
+        // the typical layouts (4 from graphics 12.50, 6 before).
+        let per_group = self
+            .hwconfig()
+            .and_then(|config| {
+                let slices = config.lookup_u32(1).ok().flatten()?;
+                let dss = config.lookup_u32(70).ok().flatten()?;
+                (slices != 0 && dss != 0).then(|| dss.div_ceil(slices))
+            })
+            .unwrap_or(if platform.is_gen12() { 6 } else { 4 });
+        let lists = Arc::new(
+            Lists::new(
+                family,
+                topology.has_render(),
+                topology.geometry_dss(),
+                topology.compute_dss(),
+                per_group,
+            )
+            .map_err(|_| FsError::OutOfMemory)?,
+        );
+        let window = self.parts.boot.window();
+        let stable = |offset| {
+            let value = window.read32(offset);
+            (value != u32::MAX && value == window.read32(offset)).then_some(value)
+        };
+        // GMD_ID exists from graphics 12.70; gt->info.gmdid is 0 before it.
+        let gmd_id = if platform.is_gen12() || platform == GtPlatform::Alchemist {
+            0
+        } else {
+            stable(0xd8c).ok_or(FsError::NoDevice)?
+        };
+        let device = Device {
+            device_id: self.parts.boot.device_id(),
+            revision: self.parts.boot.revision(),
+            gmd_id,
+            reference_clock: stable(0xd00).and_then(reference_clock),
+        };
+        let state = State::new(lists.clone(), device).map_err(|_| FsError::OutOfMemory)?;
+        self.parts
+            .boot
+            .prepare_error_capture(lists)
+            .map_err(|_| FsError::OutOfMemory)?;
+        self.parts.capture = Some(state);
+        Ok(())
+    }
+
     /// Cached OAG facts for publication with the live user epoch.
     pub(crate) fn oa_device(
         &self,
@@ -1502,6 +1647,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         scheduler
             .set_reset_policy(registers.reset_policy().ok_or(GtError::State)?)
             .map_err(GtError::Scheduling)?;
+        if let Some(capture) = &self.parts.capture {
+            // Optional: an allocation failure only loses the manual fallback.
+            let _ =
+                scheduler.enable_error_capture(capture.lists.family(), capture.lists.max_regs());
+        }
         self.parts.scheduler = Some(scheduler);
         self.compute_configuration = Some(registers.compute_configuration());
         self.engine_policy = Some(registers.engine_policy().map_err(GtError::Registers)?);
@@ -2468,12 +2618,28 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             GtState::Ready | GtState::CtReady => {}
             GtState::SchedulingReady => {
                 let parts = &mut *self.parts;
-                parts
-                    .scheduler
-                    .as_mut()
-                    .expect("owned scheduler")
-                    .poll(parts.ct.as_mut().expect("owned CT"), now)
-                    .map_err(GtError::Scheduling)?;
+                let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
+                let ct = parts.ct.as_mut().expect("owned CT");
+                scheduler.poll(ct, now).map_err(GtError::Scheduling)?;
+                // xe_guc_error_capture_handler -> xe_guc_capture_process,
+                // then __guc_capture_flushlog_complete (retried while full).
+                if let Some(capture) = parts.capture.as_mut() {
+                    if scheduler.take_capture_notification() {
+                        if let Some(log) = parts.boot.live_log() {
+                            capture.notified(log.backing, &mut *current);
+                        }
+                    }
+                    if capture.ack_pending() {
+                        use crate::intel_gpu_error::capture::{
+                            FLUSH_COMPLETE, LOG_TYPE_STATE_CAPTURE,
+                        };
+                        match ct.send(0, FLUSH_COMPLETE, 0, &[LOG_TYPE_STATE_CAPTURE], true) {
+                            Ok(()) => capture.acknowledged(),
+                            Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+                            Err(error) => return Poll::Ready(Err(GtError::Transport(error))),
+                        }
+                    }
+                }
                 if let Some(mert) = &mut parts.mert {
                     mert.service_flush(parts.boot.window(), now, &mut *current)
                         .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
