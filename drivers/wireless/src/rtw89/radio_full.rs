@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Retained exact B radio composition: initial bring-up plus same-band
-//! 2.4GHz/20MHz retune of a Ready radio. The typed channel is always the one
+//! Retained exact B radio composition: initial bring-up plus 2.4/5GHz
+//! 20MHz retune of a Ready radio (band change runs the TSSI scan). The typed channel is always the one
 //! bound into the selected power plan. The native caller binds every input to
 //! actual factory/firmware and full measured current qualification.
 use super::{
@@ -95,10 +95,11 @@ impl Radio {
         // SAFETY: same exact initial RX-AB/NSS2 profile and actual gain bases.
         unsafe { tssi::configure_rx_ab(io, input.calibration, input.gain_bases) }.map_err(error)?;
         // SAFETY: caller contract; initial TSSI is still disabled.
-        unsafe { self.program(io, &input, false).await }
+        unsafe { self.program(io, &input, false, false).await }
     }
     /// Linux core.c `__rtw89_set_channel` (prepare, chip set_channel MAC/BB/RF,
-    /// set_txpwr, done; same 2.4GHz band so no band-change TSSI scan) followed by
+    /// set_txpwr, done; a 2.4<->5GHz band change then runs the
+    /// `rtw8852b_rfk_band_changed` TSSI scan) followed by
     /// rtw8852b.c `rtw8852b_rfk_channel` (RXDCK, IQK, 30ms, TSSI, 30ms, DPK).
     /// RTL8852B keeps DPK reload disabled and RFK MCC table index0, so every
     /// step is a fresh calibration on the new primary; earlier results retire.
@@ -121,7 +122,7 @@ impl Radio {
             return Err(power::Error::Terminal);
         }
         self.state = State::Preparing;
-        self.channel = None;
+        let previous = self.channel.take();
         self.transition = Default::default();
         self.bb = Default::default();
         self.rf = Default::default();
@@ -131,14 +132,18 @@ impl Radio {
         self.tssi = Default::default();
         self.dpk = Default::default();
         rfk::Interface::admit(io).map_err(error)?;
+        // core.c `__rtw89_set_channel`: `chan_rcd->band_changed` runs
+        // `rtw89_chip_rfk_band_changed` (TSSI scan) after set_channel_done.
+        let band_changed = previous.is_none_or(|old| old.band() != input.power.channel().band());
         // SAFETY: caller contract; the retired retained TSSI is still enabled.
-        unsafe { self.program(io, &input, true).await }
+        unsafe { self.program(io, &input, true, band_changed).await }
     }
     async unsafe fn program<I: rfk::Interface + channel_bb::Interface>(
         &mut self,
         io: &mut I,
         input: &Inputs<'_>,
         tssi_mode: bool,
+        band_changed: bool,
     ) -> Result<(), power::Error> {
         let channel = input.power.channel();
         // SAFETY: no live retune; hold source scheduler/ADC/reset bracket exclusively.
@@ -164,6 +169,13 @@ impl Radio {
         unsafe { self.power.prepare(io, input.power) }.map_err(error)?;
         // SAFETY: MAC/BB/RF/channel power all completed on this same owner/backend.
         unsafe { self.transition.finish(io).await }.map_err(error)?;
+        if band_changed {
+            // SAFETY: same owner after this channel's MAC/BB/RF/power; TSSI
+            // configuration only. (`rtw89_btc_ntfy_switch_band` has no
+            // counterpart: the one-shot WLAN-only PTA owner keeps BT low.)
+            unsafe { tssi::band_scan(io, input.calibration, input.tracking, channel).await }
+                .map_err(error)?;
+        }
         // SAFETY: fresh channel RXDCK precedes this attempt's TSSI, matching source;
         // a retune pauses the previous channel's still-enabled TSSI tracking.
         unsafe { self.rxdck.prepare_with_tssi(io, tssi_mode).await }.map_err(error)?;
@@ -193,7 +205,7 @@ impl Radio {
         // SAFETY: actual corrected cut/basic backoff decision, completed retainedTSSI.
         unsafe {
             self.dpk
-                .prepare(io, input.cut, input.dpd_gain, &self.tssi)
+                .prepare_for_channel(io, input.cut, input.dpd_gain, &self.tssi, channel)
                 .await
         }
         .map_err(error)?;

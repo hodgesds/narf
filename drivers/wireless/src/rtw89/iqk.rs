@@ -176,7 +176,21 @@ impl<I: Interface> Access<'_, I> {
         self.wm(R_UPD_CLK_ADC, B_UPD_CLK_ADC_ON, 1)?;
         self.wm(R_UPD_CLK_ADC, B_UPD_CLK_ADC_VAL, 0)
     }
-    async fn tx_setting(&mut self, path: u8) -> Result<(), Error> {
+    /// Linux `_iqk_txk_setting` (band branch on `iqk_band`).
+    async fn tx_setting(&mut self, path: u8, a_band: bool) -> Result<(), Error> {
+        if a_band {
+            for (address, mask, value) in [
+                (RR_XGLNA2, RR_XGLNA2_SW, 0),
+                (RR_BIASA, RR_BIASA_A, 1),
+                (RR_TXGA, RR_TXGA_LOK_EXT, 0),
+                (RR_LUTWE, RR_LUTWE_LOK, 1),
+                (RR_LUTWA, RR_LUTWA_M1, 0x80),
+                (RR_MOD, RR_MOD_IQK, 0x403e),
+            ] {
+                self.wr(path, address, mask, value).await?;
+            }
+            return self.delay(1).await;
+        }
         for (address, mask, value) in [
             (RR_XALNA2, RR_XALNA2_SW2, 0),
             (RR_TXG1, RR_TXG1_ATT2, 0),
@@ -191,10 +205,12 @@ impl<I: Interface> Access<'_, I> {
         }
         self.delay(1).await
     }
-    async fn lok(&mut self, path: u8, result: &mut Path) -> Result<(), Error> {
+    /// Linux `_iqk_lok`: GR1 is 6 on 2.4GHz and 4 on 5GHz; TG is band-equal.
+    async fn lok(&mut self, path: u8, result: &mut Path, a_band: bool) -> Result<(), Error> {
         self.wm(R_IQK_DIF4, B_IQK_DIF4_TXT, 0x21)?;
         self.wr(path, RR_TXIG, RR_TXIG_GR0, 0).await?;
-        self.wr(path, RR_TXIG, RR_TXIG_GR1, 6).await?;
+        self.wr(path, RR_TXIG, RR_TXIG_GR1, if a_band { 4 } else { 6 })
+            .await?;
         self.wr(path, RR_TXIG, RR_TXIG_TG, 0).await?;
         self.wm(R_KIP_IQP + (u32::from(path) << 8), u32::MAX, 9)?;
         result.coarse_failed = self.shot(path, 1).await?;
@@ -220,30 +236,50 @@ impl<I: Interface> Access<'_, I> {
         result.restore_failed |= vbuffer0 || vbuffer1;
         Ok(())
     }
-    async fn by_path(&mut self, path: u8, result: &mut Path) -> Result<(), Error> {
+    /// Linux `_iqk_by_path` with the `_g_*` (2.4GHz) or `_a_*` (5GHz) groups.
+    async fn by_path(&mut self, path: u8, result: &mut Path, a_band: bool) -> Result<(), Error> {
         let offset = u32::from(path) << 8;
+        let (track, itqt) = if a_band {
+            ([3, 3, 6, 6], [0x12, 0x12, 0x12, 0x1b])
+        } else {
+            ([4, 4, 6, 6], [9, 18, 27, 36])
+        };
+        let (rx_gain, attc2, attc1) = if a_band {
+            (
+                [0x190, 0x198, 0x350, 0x352],
+                [0x0f, 0x0f, 0x3f, 0x7f],
+                [3, 1, 0, 0],
+            )
+        } else {
+            (
+                [0x212, 0x21c, 0x350, 0x360],
+                [0, 0, 0x28, 0x5f],
+                [3, 3, 2, 1],
+            )
+        };
         self.tx_clock().await?;
         for bias in 1..=3 {
             result.attempts = bias;
+            // `_lok_res_table`: LUTWA 0 on 2.4GHz, 1 on 5GHz.
             self.wr(path, RR_LUTWE, RFREG_MASK, 2).await?;
-            self.wr(path, RR_LUTWA, RFREG_MASK, 0).await?;
+            self.wr(path, RR_LUTWA, RFREG_MASK, u32::from(a_band))
+                .await?;
             self.wr(path, RR_LUTWD0, RFREG_MASK, u32::from(bias))
                 .await?;
             self.wr(path, RR_LUTWE, RFREG_MASK, 0).await?;
             self.wr(path, RR_TXVBUF, RR_TXVBUF_DACEN, 1).await?;
-            self.tx_setting(path).await?;
-            self.lok(path, result).await?;
+            self.tx_setting(path, a_band).await?;
+            self.lok(path, result, a_band).await?;
             if !result.lok_failed {
                 break;
             }
         }
         for group in 0..4 {
             self.wr(path, RR_TXIG, RR_TXIG_GR0, 0).await?;
-            self.wr(path, RR_TXIG, RR_TXIG_GR1, [4, 4, 6, 6][group])
-                .await?;
+            self.wr(path, RR_TXIG, RR_TXIG_GR1, track[group]).await?;
             self.wr(path, RR_TXIG, RR_TXIG_TG, [8, 14, 6, 14][group])
                 .await?;
-            self.wm(R_KIP_IQP + offset, u32::MAX, [9, 18, 27, 36][group])?;
+            self.wm(R_KIP_IQP + offset, u32::MAX, itqt[group])?;
             self.wm(R_CFIR_LUT + offset, B_CFIR_LUT_SEL, 1)?;
             self.wm(R_CFIR_LUT + offset, B_CFIR_LUT_SET, 1)?;
             self.wm(R_CFIR_LUT + offset, B_CFIR_LUT_G2, 0)?;
@@ -268,22 +304,26 @@ impl<I: Interface> Access<'_, I> {
             if result.tx_failed { 0 } else { 5 },
         )?;
         self.rx_clock().await?;
+        // `_iqk_rxk_setting`.
         self.wr(path, RR_MOD, RR_MOD_MASK, 0xc).await?;
-        self.wr(path, RR_RXK, RR_RXK_SEL2G, 1).await?;
+        self.wr(
+            path,
+            RR_RXK,
+            if a_band { RR_RXK_SEL5G } else { RR_RXK_SEL2G },
+            1,
+        )
+        .await?;
         let channel = self.rr(path, RR_CFGCH, RFREG_MASK).await?;
         self.wr(path, RR_RSV4, RFREG_MASK, channel).await?;
         for group in 0..4 {
-            self.wr(
-                path,
-                RR_MOD,
-                RR_MOD_RGM,
-                [0x212, 0x21c, 0x350, 0x360][group],
-            )
-            .await?;
-            self.wr(path, RR_RXBB, RR_RXBB_C2G, [0, 0, 0x28, 0x5f][group])
-                .await?;
-            self.wr(path, RR_RXBB, RR_RXBB_C1G, [3, 3, 2, 1][group])
-                .await?;
+            self.wr(path, RR_MOD, RR_MOD_RGM, rx_gain[group]).await?;
+            if a_band {
+                self.wr(path, RR_RXA2, RR_RXA2_HATT, attc2[group]).await?;
+                self.wr(path, RR_RXA2, RR_RXA2_CC2, attc1[group]).await?;
+            } else {
+                self.wr(path, RR_RXBB, RR_RXBB_C2G, attc2[group]).await?;
+                self.wr(path, RR_RXBB, RR_RXBB_C1G, attc1[group]).await?;
+            }
             self.wm(R_CFIR_LUT + offset, B_CFIR_LUT_SEL, 1)?;
             self.wm(R_CFIR_LUT + offset, B_CFIR_LUT_SET, 0)?;
             self.wm(R_CFIR_LUT + offset, B_CFIR_LUT_GP_V1, group as u32)?;
@@ -408,12 +448,17 @@ impl Iqk {
             access.rr(path, RR_CFGCH, RFREG_MASK).await?;
             self.results.synth_1_to_2 = access.bb(R_CIRST, B_CIRST_SYN)? == 1;
             access.wm(R_IQKINF, B_IQKINF_VER, 0x2a)?;
-            access.wm(R_IQKCH, B_IQKCH_BAND << (path * 16), 0)?;
+            // `_iqk_get_ch_info`: 2GHz/5GHz = 0/1, `chan->channel`.
+            access.wm(
+                R_IQKCH,
+                B_IQKCH_BAND << (path * 16),
+                u32::from(channel.band_index()),
+            )?;
             access.wm(R_IQKCH, B_IQKCH_BW << (path * 16), 0)?;
             access.wm(
                 R_IQKCH,
                 B_IQKCH_CH << (path * 16),
-                u32::from(channel.primary()),
+                u32::from(channel.center()),
             )?;
             for (index, &register) in tables::BACKUP_BB.iter().enumerate() {
                 self.results.bb_backup[p][index] = access.bb(register, u32::MAX)?;
@@ -429,7 +474,9 @@ impl Iqk {
             access.wr(path, RR_BBDC, RR_BBDC_SEL, 0).await?;
             access.wm(R_NCTL_RPT, u32::MAX, 0x80)?;
             access.wm(R_KIP_SYSCFG, u32::MAX, 0x81ff010a)?;
-            access.by_path(path, &mut self.results.paths[p]).await?;
+            access
+                .by_path(path, &mut self.results.paths[p], channel.is_5ghz())
+                .await?;
             access.info(path, &mut self.results)?;
             access.restore(path, &mut self.results.paths[p]).await?;
             access.table(tables::RESTORE)?;

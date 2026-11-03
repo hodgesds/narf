@@ -335,3 +335,76 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_power_plan_selects_actual_primary_limits_fir_and_binding
 );
+/// Linux rtw8852b_table.c 5GHz: `rtw89_8852b_txpwr_lmt_5g[20MHz][ntx][rs][bf][WW]`
+/// and `_lmt_ru_5g` at `rtw89_channel_to_idx`, band-1 byrate without CCK, and
+/// `rtw8852bx_set_tx_shape` writing no CCK DFIR on 5GHz.
+fn smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let digest = |plan: &Plan| {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        plan.bind(&mut hash);
+        hash.finalize()
+    };
+    let mut seen = alloc::vec::Vec::new();
+    for (slot, primary) in super::super::operating_channel::GHZ5
+        .into_iter()
+        .enumerate()
+    {
+        let Some(profile) = Profile::new(Band::Ghz5, primary) else {
+            return TestResult::Fail("typed5GHz primary refused");
+        };
+        let Ok(plan) = Plan::fixture_defaults_for_channel(profile) else {
+            return TestResult::Fail("5GHz power fixture");
+        };
+        let source = channels::CHANNELS_5GHZ[slot];
+        if plan.limits_and_ru() != (source.limits, source.ru)
+            || plan.byrate[..4] != [0; 4]
+            || plan.byrate[4..] != defaults::DEFAULT.byrate[4..]
+            || source
+                .limits
+                .iter()
+                .any(|row| row[..4] != [0; 4] || row[4] == 0)
+        {
+            return TestResult::Fail("5GHz plan limits/RU/byrate differ from the Linux tables");
+        }
+        let mut fir = false;
+        if plan
+            .visit(|a, _, _| {
+                fir |= (0x12300..0x12320).contains(&a);
+                Ok(())
+            })
+            .is_err()
+            || fir
+        {
+            return TestResult::Fail("5GHz power program wrote the 2.4GHz CCK DFIR");
+        }
+        let hash = digest(&plan);
+        if seen.contains(&hash) {
+            return TestResult::Fail("distinct 5GHz primaries share one power binding");
+        }
+        seen.push(hash);
+    }
+    // Spot values from rtw89_8852b_txpwr_lmt_5g / _ru_5g (WW, 20MHz).
+    let at = |primary: u8| {
+        let slot = super::super::operating_channel::GHZ5
+            .iter()
+            .position(|&p| p == primary)
+            .unwrap();
+        channels::CHANNELS_5GHZ[slot]
+    };
+    if at(36).limits[0][4] != 42
+        || at(36).limits[1][7] != 14
+        || at(52).limits[0][6] != 52
+        || at(144).limits[0][4] != 68
+        || at(149).limits[1][4] != 16
+        || at(48).ru[0] != [12, 26, 38]
+        || at(177).ru[1] != [16, 30, 40]
+    {
+        return TestResult::Fail("frozen 5GHz limits differ from the Linux table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_power_plan_selects_5ghz_ww_limits_without_cck
+);

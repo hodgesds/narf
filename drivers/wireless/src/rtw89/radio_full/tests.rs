@@ -314,3 +314,82 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_full_radio_retunes_ready_owner_to_actual_primary_and_advances_epoch
 );
+/// Linux core.c `__rtw89_set_channel` across bands: a 2.4->5->2.4GHz retune
+/// runs `rtw8852b_rfk_band_changed` (TSSI scan, no RFK notify) between the
+/// channel program and `rtw8852b_rfk_channel`; IQK records band 1 and the
+/// center; 5GHz DPK is marked A-band; TSSI DE uses the 5GHz OFDM/trim group.
+fn smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan() -> TestResult {
+    use crate::rtw89::operating_channel::Profile;
+    use narf_wireless::association::channel::Band;
+    let gain = gain();
+    let mut calibration = calibration(false);
+    for path in 0..2 {
+        calibration.tssi_mcs[path][11] = [-5, 6][path];
+        calibration.tssi_trim[path][5] = [2, -3][path];
+    }
+    let initial = radio_power::Plan::fixture_defaults().unwrap();
+    let tracking = tracking(false);
+    let mut io = Model::new();
+    let mut radio = Radio::default();
+    let plan = |band, primary| {
+        Profile::new(band, primary)
+            .and_then(|profile| radio_power::Plan::fixture_defaults_for_channel(profile).ok())
+    };
+    let (Some(a120), Some(g6)) = (plan(Band::Ghz5, 120), plan(Band::Ghz2, 6)) else {
+        return TestResult::Fail("typed 5GHz/2.4GHz power fixtures");
+    };
+    // SAFETY: one inert exact initial-profile port with explicit fixtures.
+    if complete(unsafe { radio.prepare(&mut io, input(&gain, &calibration, &initial, &tracking)) })
+        != Some(Ok(()))
+    {
+        return TestResult::Fail("initial bring-up");
+    }
+    let iqkch = (0x10000 + 0x9fe4) / 4;
+    for (epoch, band, primary, power) in [(2, Band::Ghz5, 120u8, &a120), (3, Band::Ghz2, 6, &g6)] {
+        let starts = io.starts.len();
+        // SAFETY: same inert retained owner with caller-closed TX.
+        if complete(unsafe { radio.retune(&mut io, input(&gain, &calibration, power, &tracking)) })
+            != Some(Ok(()))
+            || radio.channel() != Profile::new(band, primary)
+            || radio.epoch() != epoch
+            || io.starts[starts..]
+                != [
+                    rfk::Kind::Rxdck,
+                    rfk::Kind::Iqk,
+                    rfk::Kind::IqkPath,
+                    rfk::Kind::IqkPath,
+                    rfk::Kind::Tssi,
+                    rfk::Kind::Dpk,
+                ]
+        {
+            return TestResult::Fail("cross-band retune did not complete every source step");
+        }
+        let a_band = band == Band::Ghz5;
+        let word = io.base.words[iqkch];
+        if (word >> 8) & 0xff != u32::from(primary)
+            || word & 0xf != u32::from(a_band)
+            || radio
+                .dpk
+                .results()
+                .is_none_or(|paths| paths.iter().any(|p| p.a_band != a_band))
+        {
+            return TestResult::Fail("IQK/DPK did not record the actual band/center");
+        }
+        if a_band {
+            let Some(results) = radio.tssi.results() else {
+                return TestResult::Fail("5GHz TSSI results");
+            };
+            for path in 0..2usize {
+                let t = i16::from(calibration.tssi_trim[path][5]);
+                if results.de[path][1] != i16::from(calibration.tssi_mcs[path][11]) + t {
+                    return TestResult::Fail("5GHz TSSI DE did not use OFDM group11/trim5");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan
+);

@@ -301,3 +301,90 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_channel_bb_programs_and_reads_back_each_actual_primary
 );
+
+/// Linux 7.3-rc4 rtw8852b_common.c `__rtw8852bx_set_channel_bb` on 5GHz:
+/// BAND_SEL 0, `rtw8852bx_sco_mapping`, `gain_a` LNA/TIA registers from the BB
+/// gain band, CCK disabled, the RTL8852B 5GHz BT-share releases and the
+/// phy.c `rtw89_encode_chan_idx` channel index (readback-gated); MAC
+/// `__rtw8852bx_set_channel_mac` clears BAND_MODE and sets CHECK_CCK/RTS6.
+fn smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    // (primary, chan_idx, sco compensation, bb gain band, gain-offset band)
+    const ROWS: [(u8, u32, u32, usize, usize); 7] = [
+        (36, 0x20, 51, 1, 2),
+        (64, 0x2e, 49, 1, 2),
+        (100, 0x30, 48, 2, 3),
+        (132, 0x40, 46, 2, 3),
+        (144, 0x46, 46, 2, 3),
+        (149, 0x50, 46, 3, 4),
+        (177, 0x5e, 45, 3, 4),
+    ];
+    let (mut g, mut c) = inputs(3);
+    for band in 1..4 {
+        for p in 0..2 {
+            for i in 0..7 {
+                g.lna[band][p][i] = (band as i8) * 16 + (p as i8) * 8 + i as i8;
+            }
+            for i in 0..2 {
+                g.tia[band][p][i] = -(band as i8) * 8 - i as i8;
+            }
+        }
+    }
+    for p in 0..2 {
+        for band in 0..5 {
+            c.gain_comp[p][band] = band as i8 + p as i8;
+            c.gain_offset[p][band] = band as i8 - 2 * p as i8;
+        }
+    }
+    for (primary, idx, comp, band, offset_band) in ROWS {
+        let Some(profile) = Profile::new(Band::Ghz5, primary) else {
+            return TestResult::Fail("typed5GHz primary refused");
+        };
+        let mut io = Model::new(0xa5, 3);
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned MAC/BB words; no native caller or grant.
+        let r = ready(unsafe { owner.prepare_for_channel(&mut io, &g, &c, [-91, 101], profile) });
+        if r != Some(Ok(())) || owner.state() != State::Configured {
+            return TestResult::Fail("5GHz primary failed BB programming/readback");
+        }
+        let lna0 = (g.lna[band][0][0] as u8) as u32;
+        let tia1 = (g.tia[band][1][1] as u8) as u32;
+        let comp0 = ((i32::from(c.gain_comp[0][usize::from(profile.subband())]) << 2) as u8) as u32;
+        let ofst =
+            ((-((-i32::from(c.gain_offset[0][offset_band]) << 2) + (-91 >> 2))) as u8) as u32;
+        if profile.gain_band() != band
+            || profile.gain_offset_band() != offset_band
+            || field(&io, R_MAC_PIN_SEL, B_CH_IDX_SEG0) != idx
+            || field(&io, R_FC0_BW_V1, B_FC0_BW_INV) != comp
+            || field(&io, R_PATH0_BAND_SEL_V1, B_PATH0_BAND_SEL_MSK_V1) != 0
+            || field(&io, R_PATH1_BAND_SEL_V1, B_PATH1_BAND_SEL_MSK_V1) != 0
+            || field(&io, R_UPD_CLK_ADC, B_ENABLE_CCK) != 0
+            || field(&io, R_RXCCA, B_RXCCA_DIS) != 1
+            || field(&io, R_PATH0_BT_SHARE_V1, B_PATH0_BT_SHARE_V1) != 0
+            || field(&io, R_PATH1_BTG_PATH_V1, B_PATH1_BTG_PATH_V1) != 0
+            || field(&io, R_GNT_BT_WGT_EN, B_GNT_BT_WGT_EN) != 0
+            || field(&io, 0x45dc, 0x00ff0000) != lna0
+            || field(&io, 0x4748, 0xff000000) != tia1
+            || field(&io, R_P0_AGC_RSVD, MASKBYTE0) != comp0
+            || field(&io, R_PATH0_G_TIA1_LNA6_OP1DB_V1, B_PATH0_R_G_OFST_MASK)
+                != ofst & (B_PATH0_R_G_OFST_MASK >> B_PATH0_R_G_OFST_MASK.trailing_zeros())
+        {
+            return TestResult::Fail(
+                "5GHz BB band/gain/CCK/chan_idx programming differs from Linux",
+            );
+        }
+        let mut io = Model::new(0xa5, 3);
+        io.ignore = true;
+        let mut owner = Channel::default();
+        // SAFETY: inert model that ignores writes; readback must refuse readiness.
+        let r = ready(unsafe { owner.prepare_for_channel(&mut io, &g, &c, [-91, 101], profile) });
+        if !matches!(r, Some(Err(_))) {
+            return TestResult::Fail("ignored 5GHz programming became ready");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx
+);

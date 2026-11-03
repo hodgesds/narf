@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact one-shot B PHY0/2.4GHz20MHz/RF_AB TSSI with real PMAC alignment.
+//! Exact one-shot B PHY0/2.4+5GHz 20MHz/RF_AB TSSI with real PMAC alignment.
+//! 5GHz selects the Linux `_5g` system/slope tables, `_5g{1,2,3}` alignment
+//! defaults, TXA RF setting and per-subband thermal rows.
 //! Initial channel1 and typed noninitial primaries differ only in Linux
 //! `_tssi_set_efuse_to_de` CCK/OFDM/trim groups; 2.4GHz system, thermal,
 //! slope and `_tssi_alignment_default` tables are channel-independent.
@@ -92,14 +94,24 @@ impl Tssi {
         let mut access = Access(io);
         disable(&mut access)?;
         let mut result = Results::default();
+        let a_band = channel.is_5ghz();
         for path in 0..2 {
-            access.wr(path, RR_TXPOW, RR_TXPOW_TXG, 1).await?;
+            // `_tssi_rf_setting`: TXG on 2.4GHz, TXA on 5GHz.
+            access
+                .wr(
+                    path,
+                    RR_TXPOW,
+                    if a_band { RR_TXPOW_TXA } else { RR_TXPOW_TXG },
+                    1,
+                )
+                .await?;
             access.table(recipe::TSSI_SYS_DEFS).await?;
             access
-                .table(if path == 0 {
-                    recipe::TSSI_SYS_A_DEFS_2G
-                } else {
-                    recipe::TSSI_SYS_B_DEFS_2G
+                .table(match (path, a_band) {
+                    (0, false) => recipe::TSSI_SYS_A_DEFS_2G,
+                    (0, true) => recipe::TSSI_SYS_A_DEFS_5G,
+                    (_, false) => recipe::TSSI_SYS_B_DEFS_2G,
+                    (_, true) => recipe::TSSI_SYS_B_DEFS_5G,
                 })
                 .await?;
             access
@@ -128,6 +140,7 @@ impl Tssi {
                 path,
                 calibration.thermal[path as usize],
                 tracking,
+                channel,
             )?;
             access
                 .table(if path == 0 {
@@ -137,19 +150,14 @@ impl Tssi {
                 })
                 .await?;
             access
-                .table(if path == 0 {
-                    recipe::TSSI_SLOPE_A_DEFS_2G
-                } else {
-                    recipe::TSSI_SLOPE_B_DEFS_2G
+                .table(match (path, a_band) {
+                    (0, false) => recipe::TSSI_SLOPE_A_DEFS_2G,
+                    (0, true) => recipe::TSSI_SLOPE_A_DEFS_5G,
+                    (_, false) => recipe::TSSI_SLOPE_B_DEFS_2G,
+                    (_, true) => recipe::TSSI_SLOPE_B_DEFS_5G,
                 })
                 .await?;
-            access
-                .table(if path == 0 {
-                    recipe::TSSI_ALIGN_A_2G_ALL_DEFS
-                } else {
-                    recipe::TSSI_ALIGN_B_2G_ALL_DEFS
-                })
-                .await?;
+            access.table(alignment_default(path, channel)).await?;
             access
                 .table(if path == 0 {
                     recipe::TSSI_SLOPE_DEFS_A
@@ -160,7 +168,7 @@ impl Tssi {
             access.0.admit()?;
             let saved = access.0.pause().await?;
             access.rx_idle().await?;
-            let measured = alignment(&mut access, path, calibration, gain_bases).await;
+            let measured = alignment(&mut access, path, calibration, gain_bases, channel).await;
             // A returned failure may close PMAC synchronously while authority
             // remains. Cancellation retains Calibrating; outer Native closes.
             if measured.is_err() {
@@ -180,6 +188,19 @@ impl Tssi {
         self.results = result;
         self.state = State::Calibrated;
         Ok(())
+    }
+}
+/// Linux `_tssi_alignment_default(.., all = true, chan)` by center channel.
+fn alignment_default(path: u8, channel: Profile) -> &'static [rfk::Entry] {
+    match (path, channel.center()) {
+        (0, 1..=14) => recipe::TSSI_ALIGN_A_2G_ALL_DEFS,
+        (0, 36..=64) => recipe::TSSI_ALIGN_A_5G1_ALL_DEFS,
+        (0, 100..=144) => recipe::TSSI_ALIGN_A_5G2_ALL_DEFS,
+        (0, _) => recipe::TSSI_ALIGN_A_5G3_ALL_DEFS,
+        (_, 1..=14) => recipe::TSSI_ALIGN_B_2G_ALL_DEFS,
+        (_, 36..=64) => recipe::TSSI_ALIGN_B_5G1_ALL_DEFS,
+        (_, 100..=144) => recipe::TSSI_ALIGN_B_5G2_ALL_DEFS,
+        (_, _) => recipe::TSSI_ALIGN_B_5G3_ALL_DEFS,
     }
 }
 fn disable<I: Interface>(a: &mut Access<'_, I>) -> Result<(), Error> {
@@ -212,6 +233,7 @@ fn thermal<I: Interface>(
     path: u8,
     value: u8,
     tracking: &Tracking,
+    channel: Profile,
 ) -> Result<[u32; 16], Error> {
     let (meter, dis, trk, mask, rfctm, rfmask, ready, base) = if path == 0 {
         (
@@ -241,11 +263,8 @@ fn thermal<I: Interface>(
     let current = if value == 255 { 32 } else { u32::from(value) };
     a.wm(meter, mask, current)?;
     a.wm(rfctm, rfmask, current)?;
-    let words = thermal_words(
-        value,
-        &tracking.up[path as usize],
-        &tracking.down[path as usize],
-    );
+    let (up, down) = tracking.rows(channel, path as usize);
+    let words = thermal_words(value, up, down);
     for (i, word) in words.iter().copied().enumerate() {
         a.write(base + i as u32 * 4, word)?;
     }
@@ -341,6 +360,7 @@ async fn alignment<I: Interface>(
     path: u8,
     calibration: &Calibration,
     bases: [i8; 2],
+    channel: Profile,
 ) -> Result<([u32; 2], [u32; 4]), Error> {
     let saved = pmac::backup(a)?;
     let regs = [
@@ -371,9 +391,11 @@ async fn alignment<I: Interface>(
             pmac::transmit(
                 a,
                 if index == 0 { path } else { 14 },
+                // `power_2g`/`power_5g` are both {48, 20, ..}.
                 [48, 20][index],
                 calibration,
                 bases,
+                channel,
             )
             .await?;
             a.bb(R_TX_COUNTER, 0xffff)?;
@@ -438,6 +460,57 @@ async fn alignment<I: Interface>(
     pmac::restore(a, saved)?;
     pmac::mode_tmac(a)?;
     measured
+}
+/// Linux rtw8852b_rfk.c `rtw8852b_tssi_scan` (`rtw8852b_rfk_band_changed`,
+/// run by core.c `__rtw89_set_channel` when the band changed): disable, per
+/// path RF setting/system/thermal tables and the default alignment of the new
+/// band (this owner never reloads another band's measured alignment), enable,
+/// efuse DE. The full TSSI calibration of `rtw8852b_rfk_channel` follows.
+///
+/// # Safety
+/// Same retained owner as [`Tssi::prepare_for_channel`], inside the retune
+/// after MAC/BB/RF/power of THIS typed channel and before its RXDCK. Writes
+/// only TSSI configuration; no PMAC transmission.
+pub(super) async unsafe fn band_scan(
+    io: &mut impl Interface,
+    calibration: &Calibration,
+    tracking: &Tracking,
+    channel: Profile,
+) -> Result<(), Error> {
+    io.admit()?;
+    let mut access = Access(io);
+    disable(&mut access)?;
+    let a_band = channel.is_5ghz();
+    for path in 0..2 {
+        access
+            .wr(
+                path,
+                RR_TXPOW,
+                if a_band { RR_TXPOW_TXA } else { RR_TXPOW_TXG },
+                1,
+            )
+            .await?;
+        access.table(recipe::TSSI_SYS_DEFS).await?;
+        access
+            .table(match (path, a_band) {
+                (0, false) => recipe::TSSI_SYS_A_DEFS_2G,
+                (0, true) => recipe::TSSI_SYS_A_DEFS_5G,
+                (_, false) => recipe::TSSI_SYS_B_DEFS_2G,
+                (_, true) => recipe::TSSI_SYS_B_DEFS_5G,
+            })
+            .await?;
+        thermal(
+            &mut access,
+            path,
+            calibration.thermal[path as usize],
+            tracking,
+            channel,
+        )?;
+        access.table(alignment_default(path, channel)).await?;
+    }
+    enable(&mut access).await?;
+    de(&mut access, calibration, channel)?;
+    access.0.admit()
 }
 pub(super) fn stop_pmac(io: &mut impl Interface) -> Result<(), Error> {
     let mut access = Access(io);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact B 2.4GHz/20MHz RF synth core (Linux rtw8852b_rfk.c
+//! Exact B 2.4/5GHz 20MHz RF synth core (Linux rtw8852b_rfk.c
 //! rtw8852b_set_channel_rf: _ctrl_ch, _ctrl_bw, _rxbb_bw). Initial channel1 and
 //! typed noninitial primaries share this one source order. This is not the
 //! complete BB, IQK/TSSI/DPK channel continuation.
@@ -40,6 +40,15 @@ pub(super) enum State {
 #[derive(Default)]
 pub(super) struct Channel {
     state: State,
+}
+/// Linux `_ch_setting`: 5GHz centers set `CFGCH_BAND1_5G`/`CFGCH_BAND0_5G`.
+fn band_bits(channel: Profile) -> u32 {
+    if channel.is_5ghz() {
+        ((CFGCH_BAND1_5G << RR_CFGCH_BAND1.trailing_zeros()) & RR_CFGCH_BAND1)
+            | ((CFGCH_BAND0_5G << RR_CFGCH_BAND0.trailing_zeros()) & RR_CFGCH_BAND0)
+    } else {
+        0
+    }
 }
 struct Access<'a, I>(&'a mut I);
 impl<I: Interface> Access<'_, I> {
@@ -122,7 +131,8 @@ impl<I: Interface> Access<'_, I> {
         Ok(())
     }
     /// Linux `_ch_setting`: `direct=false` is the DAV RR_CFGCH word.
-    async fn channel(&mut self, p: u8, direct: bool, primary: u8) -> Result<(), Error> {
+    async fn channel(&mut self, p: u8, direct: bool, channel: Profile) -> Result<(), Error> {
+        let primary = channel.center();
         let a = if direct { RR_CFGCH_V1 } else { RR_CFGCH };
         let mut v = self.read(p, a, RFREG_MASK).await?;
         v &= !(RR_CFGCH_BAND1
@@ -132,6 +142,7 @@ impl<I: Interface> Access<'_, I> {
             | RR_CFGCH_BAND0
             | RR_CFGCH_CH);
         v |= (u32::from(primary) << RR_CFGCH_CH.trailing_zeros()) & RR_CFGCH_CH;
+        v |= band_bits(channel);
         v &= !(RR_CFGCH_POW_LCK | RR_CFGCH_TRX_AH | RR_CFGCH_BCN | RR_CFGCH_BW2) & RFREG_MASK;
         v |= RR_CFGCH_BW2;
         if p == 0 && !direct {
@@ -181,7 +192,7 @@ impl Channel {
         let mut a = Access(io);
         for direct in [false, true] {
             for p in 0..2 {
-                a.channel(p, direct, channel.primary()).await?;
+                a.channel(p, direct, channel).await?;
             }
         }
         for direct in [false, true] {
@@ -203,8 +214,9 @@ impl Channel {
             | RR_CFGCH_POW_LCK
             | RR_CFGCH_TRX_AH
             | RR_CFGCH_BCN;
-        let expected = ((u32::from(channel.primary()) << RR_CFGCH_CH.trailing_zeros())
+        let expected = ((u32::from(channel.center()) << RR_CFGCH_CH.trailing_zeros())
             & RR_CFGCH_CH)
+            | band_bits(channel)
             | ((CFGCH_BW_20M << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW)
             | RR_CFGCH_BW2;
         for direct in [false, true] {

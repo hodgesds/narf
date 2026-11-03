@@ -1,5 +1,5 @@
 //! Exact B common PMAC helpers used only by source TSSI alignment.
-use super::{regs::*, tables, Access, Calibration, Error, Interface};
+use super::{regs::*, tables, Access, Calibration, Error, Interface, Profile};
 #[derive(Clone, Copy)]
 pub(super) struct Backup {
     tx: u32,
@@ -76,6 +76,7 @@ pub(super) async fn transmit<I: Interface>(
     power: i16,
     calibration: &Calibration,
     bases: [i8; 2],
+    channel: Profile,
 ) -> Result<(), Error> {
     if !matches!(path, 0 | 1 | 14) {
         return Err(Error::Table);
@@ -88,7 +89,7 @@ pub(super) async fn transmit<I: Interface>(
         a.wm(R_TXPATH_SEL, B_TXPATH_SEL_MSK, u32::from(path) + 1)?;
         a.wm(R_TXNSS_MAP, B_TXNSS_MAP_MSK, 0)?;
     }
-    rx_path(a, path, calibration, bases)?;
+    rx_path(a, path, calibration, bases, channel)?;
     a.wm(R_MAC_SEL, B_MAC_SEL_PWR_EN, 1)?;
     a.wm(R_TXPWR, B_TXPWR_MSK, power as u32)?;
     a.wm(R_PMAC_GNT, B_PMAC_GNT_TXEN, 1)?;
@@ -111,11 +112,13 @@ pub(super) async fn transmit<I: Interface>(
     a.wm(R_PMAC_TX_CTRL, B_PMAC_TXEN_DIS, 0)?;
     Ok(())
 }
+/// Linux `__rtw8852bx_bb_ctrl_rx_path`: subband gain offset; BTG only on 2.4GHz.
 fn rx_path<I: Interface>(
     a: &mut Access<'_, I>,
     path: u8,
     calibration: &Calibration,
     bases: [i8; 2],
+    channel: Profile,
 ) -> Result<(), Error> {
     // RF_PATH_ABCD(14) in the source second measurement leaves path selection
     // unchanged while still applying gain, BTG, power and reset controls.
@@ -131,8 +134,8 @@ fn rx_path<I: Interface>(
         a.wm(R_RXHE, B_RXHE_MAX_NSS, nss)?;
         a.wm(R_RXHE, B_RXHETB_MAX_NSS, nss)?;
     }
-    gain_offset(a, calibration, bases)?;
-    btg(a, path == 1 || path == 4)?;
+    gain_offset(a, calibration, bases, channel)?;
+    btg(a, !channel.is_5ghz() && (path == 1 || path == 4))?;
     let (address, mask) = if path == 0 {
         (R_P0_TXPW_RSTB, B_P0_TXPW_RSTB_MANON | B_P0_TXPW_RSTB_TSSI)
     } else {
@@ -146,7 +149,8 @@ pub(super) fn configure_ab<I: Interface>(
     calibration: &Calibration,
     bases: [i8; 2],
 ) -> Result<(), Error> {
-    rx_path(a, 4, calibration, bases)?;
+    // Init-only RF_AB profile on the initial channel1 owner.
+    rx_path(a, 4, calibration, bases, Profile::INITIAL)?;
     for (address, mask, value) in [
         (R_P0_RFMODE, B_P0_RFMODE_ORI_TXRX_FTM_TX, 0x1233312),
         (R_P0_RFMODE_FTM_RX, B_P0_RFMODE_FTM_RX, 0x333),
@@ -166,13 +170,16 @@ fn gain_offset<I: Interface>(
     a: &mut Access<'_, I>,
     c: &Calibration,
     bases: [i8; 2],
+    channel: Profile,
 ) -> Result<(), Error> {
+    let subband = usize::from(channel.subband());
+    let ofdm_band = channel.gain_offset_band();
     if c.comp_valid {
         for (path, address) in [R_P0_AGC_RSVD, R_P1_AGC_RSVD].into_iter().enumerate() {
             a.wm(
                 address,
                 255,
-                (i32::from(c.gain_comp[path][0]) * 4).clamp(-128, 127) as u32,
+                (i32::from(c.gain_comp[path][subband]) * 4).clamp(-128, 127) as u32,
             )?;
         }
     }
@@ -182,7 +189,7 @@ fn gain_offset<I: Interface>(
             .into_iter()
             .enumerate()
         {
-            let offset = -i32::from(c.gain_offset[path][1]);
+            let offset = -i32::from(c.gain_offset[path][ofdm_band]);
             a.wm(
                 address,
                 B_PATH0_R_G_OFST_MASK,
@@ -191,7 +198,7 @@ fn gain_offset<I: Interface>(
         }
         // Initial source hal.antenna_rx is RF_AB, so compensation chooses A;
         // temporary single-path PMAC selection does not rewrite that HAL fact.
-        let ofdm = -i32::from(c.gain_offset[0][1]);
+        let ofdm = -i32::from(c.gain_offset[0][ofdm_band]);
         let cck = -i32::from(c.gain_offset[0][0]);
         a.wm(
             R_P0_RPL1,
@@ -203,11 +210,13 @@ fn gain_offset<I: Interface>(
             B_P0_RPL1_BIAS_MASK,
             (ofdm * 16 + i32::from(bases[1])).clamp(-128, 127) as u32,
         )?;
-        a.wm(
-            R_RX_RPL_OFST,
-            B_RX_RPL_OFST_CCK_MASK,
-            (cck * 8 + (base >> 1)).clamp(-64, 63) as u32,
-        )?;
+        if !channel.is_5ghz() {
+            a.wm(
+                R_RX_RPL_OFST,
+                B_RX_RPL_OFST_CCK_MASK,
+                (cck * 8 + (base >> 1)).clamp(-64, 63) as u32,
+            )?;
+        }
     }
     Ok(())
 }

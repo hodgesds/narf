@@ -31,6 +31,8 @@ pub(super) struct Path {
     pub correlation_index: u8,
     pub correlation: u8,
     pub dc: [u16; 2],
+    /// Linux `dpk->bp[path][kidx].band == RTW89_BAND_5G` of this calibration.
+    pub a_band: bool,
 }
 #[derive(Default)]
 pub(super) struct Dpk {
@@ -55,6 +57,30 @@ impl Dpk {
         cut: u8,
         gain: u8,
         tssi: &tssi::Tssi,
+    ) -> Result<(), Error> {
+        // SAFETY: same contract; fixed original channel1 profile.
+        unsafe {
+            self.prepare_for_channel(
+                io,
+                cut,
+                gain,
+                tssi,
+                super::operating_channel::Profile::INITIAL,
+            )
+            .await
+        }
+    }
+    /// # Safety
+    /// Same as [`Self::prepare`], after THIS actual typed channel's completed
+    /// TSSI. 5GHz selects the Linux `_dpk_rf_setting` A-band RF words and the
+    /// `_dpk_idl_mpa` MDPD order 2 (20MHz < 80MHz).
+    pub(super) async unsafe fn prepare_for_channel(
+        &mut self,
+        io: &mut impl Interface,
+        cut: u8,
+        gain: u8,
+        tssi: &tssi::Tssi,
+        channel: super::operating_channel::Profile,
     ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
@@ -86,7 +112,7 @@ impl Dpk {
         a.table(tables::DPK_AFE_DEFS).await?;
         let mut results = [Path::default(); 2];
         for path in 0..2 {
-            results[path as usize] = calibrate(&mut a, path, gain).await?;
+            results[path as usize] = calibrate(&mut a, path, gain, channel.is_5ghz()).await?;
             on(&mut a, path)?;
         }
         a.table(tables::DPK_AFE_RESTORE_DEFS).await?;
@@ -296,9 +322,15 @@ async fn agc<I: Interface>(
     }
     Err(power::Error::Timeout.into())
 }
-async fn calibrate<I: Interface>(a: &mut Access<'_, I>, path: u8, gain: u8) -> Result<Path, Error> {
+async fn calibrate<I: Interface>(
+    a: &mut Access<'_, I>,
+    path: u8,
+    gain: u8,
+    a_band: bool,
+) -> Result<Path, Error> {
     let mut result = Path {
         gain,
+        a_band,
         ..Path::default()
     };
     a.wr(path, RR_RSV1, RR_RSV1_RST, 0).await?;
@@ -307,10 +339,20 @@ async fn calibrate<I: Interface>(a: &mut Access<'_, I>, path: u8, gain: u8) -> R
     a.wm(R_KIP_SYSCFG, u32::MAX, 0x807f030a)?;
     a.wm(R_CFIR_SYS + (u32::from(path) << 8), u32::MAX, 0xce000a08)?;
     txagc(a, path, 0x38).await?;
+    // Linux `_dpk_rf_setting` (band branch).
     a.wr(path, RR_MOD, 0xfffff, 0x50220).await?;
-    a.wr(path, RR_RXBB, RR_RXBB_FATT, 0xf2).await?;
+    if a_band {
+        a.wr(path, RR_RXA2, RR_RAA2_SWATT, 5).await?;
+    } else {
+        a.wr(path, RR_RXBB, RR_RXBB_FATT, 0xf2).await?;
+    }
     a.wr(path, RR_LUTDBG, RR_LUTDBG_TIA, 1).await?;
     a.wr(path, RR_TIA, RR_TIA_N6, 1).await?;
+    if a_band {
+        a.wr(path, RR_RXA_LNA, 0xfffff, 0x920fc).await?;
+        a.wr(path, RR_XALNA2, 0xfffff, 0x002c0).await?;
+        a.wr(path, RR_IQGEN, 0xfffff, 0x38800).await?;
+    }
     a.wr(path, RR_RCKD, RR_RCKD_BW, 1).await?;
     a.wr(path, RR_BTC, RR_BTC_TXBB, 1).await?;
     a.wr(path, RR_BTC, RR_BTC_RXBB, 0).await?;
@@ -334,9 +376,16 @@ async fn calibrate<I: Interface>(a: &mut Access<'_, I>, path: u8, gain: u8) -> R
     }
     a.delay(200).await?;
     result.thermal = a.rr(path, RR_TM, RR_TM_VAL).await? as u8;
-    a.wm(R_LDL_NORM, B_LDL_NORM_OP, 0)?;
-    a.wm(R_LDL_NORM, B_LDL_NORM_PN, 3)?;
-    a.wm(R_MDPK_SYNC, B_MDPK_SYNC_MAN, 1)?;
+    // `_dpk_idl_mpa`: MDPD order 2 for 5GHz below 80MHz, else order 0.
+    if a_band {
+        a.wm(R_LDL_NORM, B_LDL_NORM_OP, 2)?;
+        a.wm(R_LDL_NORM, B_LDL_NORM_PN, 0)?;
+        a.wm(R_MDPK_SYNC, B_MDPK_SYNC_MAN, 0)?;
+    } else {
+        a.wm(R_LDL_NORM, B_LDL_NORM_OP, 0)?;
+        a.wm(R_LDL_NORM, B_LDL_NORM_PN, 3)?;
+        a.wm(R_MDPK_SYNC, B_MDPK_SYNC_MAN, 1)?;
+    }
     one_shot(a, path, 0x11).await?;
     a.wr(path, RR_MOD, RR_MOD_MASK, RR_MOD_V_RX).await?;
     fill(a, path, &mut result)?;

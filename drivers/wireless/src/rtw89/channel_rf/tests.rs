@@ -284,3 +284,41 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary
 );
+/// Linux rtw8852b_rfk.c `_ch_setting` for every typed 5GHz 20MHz primary:
+/// CFGCH channel plus `CFGCH_BAND1_5G`/`CFGCH_BAND0_5G`, 20MHz BW and the
+/// critical all-path DAV/DDV readback.
+fn smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let Some(&(seed, lock, busy, count, _)) = CASES.first() else {
+        return TestResult::Fail("RF frozen reference cases");
+    };
+    for primary in super::super::operating_channel::GHZ5 {
+        let Some(profile) = Profile::new(Band::Ghz5, primary) else {
+            return TestResult::Fail("typed5GHz primary refused");
+        };
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned RF words; no native caller or grant.
+        let result = ready(unsafe { owner.prepare_for_channel(&mut io, profile) });
+        if result != Some(Ok(())) || owner.state() != State::SynthConfigured || io.count != count {
+            return TestResult::Fail("5GHz primary RF synth/readback failed");
+        }
+        for p in 0..2 {
+            for a in [RR_CFGCH, RR_CFGCH_V1] {
+                let word = io.rf[p][Model::slot(a)];
+                if word & RR_CFGCH_CH != u32::from(primary)
+                    || word & RR_CFGCH_BAND0 != 0x100
+                    || word & RR_CFGCH_BAND1 != 0x10000
+                    || word & RR_CFGCH_BW != 0xc00
+                {
+                    return TestResult::Fail("RF channel word lost the 5GHz band/primary bits");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary
+);

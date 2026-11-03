@@ -106,3 +106,11 @@ pub(super) const R_P1_RXCK: u32 = 0x32a0;
 pub(super) const R_RXIQC: u32 = 0x813c;
 pub(super) const R_TXIQC: u32 = 0x8138;
 pub(super) const R_UPD_CLK_ADC: u32 = 0x700;
+// Linux reg.h 5GHz IQK branch fields (rtw8852b_rfk.c `_iqk_txk_setting`/`_rxk_group_sel`).
+pub(super) const RR_XGLNA2: u32 = 0x85;
+pub(super) const RR_XGLNA2_SW: u32 = 0x3;
+pub(super) const RR_BIASA: u32 = 0x60;
+pub(super) const RR_BIASA_A: u32 = 0x7;
+pub(super) const RR_RXA2: u32 = 0x8c;
+pub(super) const RR_RXA2_CC2: u32 = 0x180;
+pub(super) const RR_RXA2_HATT: u32 = 0x7f;

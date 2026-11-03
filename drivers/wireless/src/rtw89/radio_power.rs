@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Exact B fixed WW/ch1/20 power *configuration*, never a dBm authorization.
+//! Exact B fixed WW 2.4/5GHz 20MHz power *configuration*, never a dBm authorization.
 //! Final measured peaks and current host policy independently gate emission.
 use super::operating_channel::Profile;
 use super::{
@@ -104,14 +104,32 @@ impl Plan {
         }
         let mut plan = defaults::DEFAULT;
         plan.channel = channel;
-        let captured = channels::CHANNELS[usize::from(channel.primary() - 1)];
+        let band = channel.band_index();
+        let index = channel.power_index();
+        let captured = if channel.is_5ghz() {
+            // rtw8852b_table.c `rtw89_8852b_txpwr_byrate` band 1 has no CCK row.
+            plan.byrate[..4].fill(0);
+            let slot = super::operating_channel::GHZ5
+                .iter()
+                .position(|&primary| primary == channel.primary())
+                .ok_or(Error::Policy)?;
+            channels::CHANNELS_5GHZ[slot]
+        } else {
+            channels::CHANNELS[usize::from(index)]
+        };
         plan.limits = captured.limits;
         plan.ru = captured.ru;
+        // Firmware element ids: TXPWR_LMT_{2,5}GHZ = 10/11, LMT_RU_{2,5}GHZ = 13/14.
+        let (limit_id, ru_id, channels) = if channel.is_5ghz() {
+            (11, 14, 53)
+        } else {
+            (10, 13, 14)
+        };
         if let Some(bytes) = selected(elements, 9, rfe)? {
             plan.byrate = [0; 44];
             plan.offset = [0; 5];
             for e in entries(bytes, 11, 9)? {
-                let (band, nss, rs, start, len, bw, ofdma) = (
+                let (entry, nss, rs, start, len, bw, ofdma) = (
                     e[0],
                     e[1],
                     e[2],
@@ -128,7 +146,7 @@ impl Plan {
                     4 => 8,
                     _ => return Err(Error::Table),
                 };
-                if band >= 3
+                if entry >= 3
                     || bw >= 5
                     || start + len > bound
                     || ((rs == 2 || rs == 3)
@@ -136,7 +154,7 @@ impl Plan {
                 {
                     return Err(Error::Table);
                 }
-                if band != 0 || bw != 0 || ((rs == 2 || rs == 3) && ofdma != 0) {
+                if entry != band || bw != 0 || ((rs == 2 || rs == 3) && ofdma != 0) {
                     continue;
                 }
                 let base = match (rs, nss) {
@@ -161,13 +179,20 @@ impl Plan {
                 }
             }
         }
-        if let Some(bytes) = selected(elements, 10, rfe)? {
+        if let Some(bytes) = selected(elements, limit_id, rfe)? {
             plan.limits = [[0; 8]; 2];
+            let widths = if channel.is_5ghz() { 4 } else { 2 };
             for e in entries(bytes, 7, 7)? {
-                if e[0] >= 2 || e[1] >= 2 || e[2] >= 3 || e[3] >= 2 || e[4] >= 16 || e[5] >= 14 {
+                if e[0] >= widths
+                    || e[1] >= 2
+                    || e[2] >= 3
+                    || e[3] >= 2
+                    || e[4] >= 16
+                    || e[5] >= channels
+                {
                     return Err(Error::Table);
                 }
-                if e[4] != 0 || e[5] != channel.primary() - 1 {
+                if e[4] != 0 || e[5] != index {
                     continue;
                 }
                 let base = match (e[0], e[2]) {
@@ -180,13 +205,13 @@ impl Plan {
                 plan.limits[e[1] as usize][base + e[3] as usize] = e[6] as i8;
             }
         }
-        if let Some(bytes) = selected(elements, 13, rfe)? {
+        if let Some(bytes) = selected(elements, ru_id, rfe)? {
             plan.ru = [[0; 3]; 2];
             for e in entries(bytes, 5, 5)? {
-                if e[0] >= 8 || e[1] >= 2 || e[2] >= 16 || e[3] >= 14 {
+                if e[0] >= 8 || e[1] >= 2 || e[2] >= 16 || e[3] >= channels {
                     return Err(Error::Table);
                 }
-                if e[0] < 3 && e[2] == 0 && e[3] == channel.primary() - 1 {
+                if e[0] < 3 && e[2] == 0 && e[3] == index {
                     plan.ru[e[1] as usize][e[0] as usize] = e[4] as i8;
                 }
             }
@@ -197,7 +222,7 @@ impl Plan {
                 if e[0] >= 8 || e[1] >= 2 || e[2] >= 16 || e[4] >= 3 {
                     return Err(Error::Table);
                 }
-                if e[0] == 0 && e[2] == 0 && e[4] == 0 {
+                if e[0] == band && e[2] == 0 && e[4] == 0 {
                     plan.shape[e[1] as usize] = e[3];
                 }
             }
@@ -209,6 +234,9 @@ impl Plan {
     pub fn bind(&self, hash: &mut narf_crypto::sha256::Sha256) {
         if self.channel == Profile::INITIAL {
             hash.update(b"B WW0 ch1 20 source RF2 MAC1 BB3;equal A/B ref0;CCK+OFDM autoresponse;no SAR/antenna offset curves");
+        } else if self.channel.is_5ghz() {
+            hash.update(b"B WW0 native5GHz20 source RF2 MAC1 BB3;equal A/B ref0;actual perchannel OFDM/MCS/RU limits, no CCK;OFDM shape only;no inferred dBm/SAR/antenna offset curves");
+            self.channel.bind(hash);
         } else {
             hash.update(b"B WW0 native noninitial2.4GHz20 source RF2 MAC1 BB3;equal A/B ref0;actual perchannel CCK/OFDM/MCS/RU limits;no inferred dBm/SAR/antenna offset curves");
             self.channel.bind(hash);
@@ -240,9 +268,12 @@ impl Plan {
             offset |= ((i32::from(*v >> 1) as u32) & 15) << (4 * i);
         }
         emit(0xd204, 0xfffff, offset)?;
-        let fir = self.channel.cck_fir(self.shape[0]);
-        for (i, v) in fir.into_iter().enumerate() {
-            emit(0x10000 + 0x2300 + i as u32 * 4, u32::MAX, v)?;
+        // `rtw8852bx_set_tx_shape`: the CCK DFIR is 2.4GHz only.
+        if !self.channel.is_5ghz() {
+            let fir = self.channel.cck_fir(self.shape[0]);
+            for (i, v) in fir.into_iter().enumerate() {
+                emit(0x10000 + 0x2300 + i as u32 * 4, u32::MAX, v)?;
+            }
         }
         emit(0x14494, 0x3000000, u32::from(self.shape[1]))?;
         for p in 0..2 {

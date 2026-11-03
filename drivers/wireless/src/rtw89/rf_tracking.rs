@@ -171,7 +171,13 @@ impl Tracker {
             let delta = if sample.thermal == 0 {
                 0
             } else {
-                (i16::from(original.thermal) - i16::from(sample.thermal)) * 3 / 2
+                // `_dpk_track`: 2.4GHz delta * 3 / 2, 5GHz delta * 5 / 2.
+                let delta = i16::from(original.thermal) - i16::from(sample.thermal);
+                if original.a_band {
+                    delta * 5 / 2
+                } else {
+                    delta * 3 / 2
+                }
             } as i8;
             let offset = if sample.hw_offset {
                 0
