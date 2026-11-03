@@ -537,6 +537,37 @@ kernel_test_in!(
     smoke_rtl8192ce_rx_descriptor_status_and_arm
 );
 
+/// `_rtl92ce_query_rxphystatus` `rx_pwdb_all`: OFDM `pwdb_all`, CCK
+/// `cck_agc_rpt` with and without `cck_highpwr`, the +6 cap and the four
+/// offset bands.
+fn smoke_rtl8192ce_rx_phy_status_pwdb() -> TestResult {
+    let phy = |b4: u8, b5: u8| [0, 0, 0, 0, b4, b5, 0, 0];
+    let cases: [(u8, u8, bool, bool, u8); 8] = [
+        // (pwdb_all, cck_agc_rpt, cck, highpwr, expected)
+        (0x80, 0, false, false, 54),
+        (0x80, 0xc4, true, false, 56),
+        (0, 0x60, true, false, 62),
+        (0, 0x00, true, false, 100),
+        (0, 0xfe, true, false, 2),
+        (0, 0xde, true, false, 24),
+        (0, 0x7f, true, true, 2),
+        (0, 0x25, true, true, 84),
+    ];
+    for (b4, b5, cck, high, want) in cases {
+        if trx::rx_pwdb(&phy(b4, b5), cck, high) != Some(want) {
+            return TestResult::Fail("92CE PHY-status rx_pwdb_all");
+        }
+    }
+    if trx::rx_pwdb(&[0; 5], false, false).is_some() {
+        return TestResult::Fail("short PHY status decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192ce",
+    smoke_rtl8192ce_rx_phy_status_pwdb
+);
+
 // ── LLT / MAC ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

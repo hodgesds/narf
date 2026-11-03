@@ -258,3 +258,54 @@ pub fn rx_arm(dw: &mut [u32; 8], buffer: u32, len: u16, last: bool) {
     put(&mut dw[0], last as u32, 30, 1);
     put(&mut dw[0], 1, 31, 1);
 }
+
+/// `rtl_query_rxpwrpercentage`.
+fn rx_power_percentage(power: i32) -> u8 {
+    if power <= -100 || power >= 20 {
+        0
+    } else if power >= 0 {
+        100
+    } else {
+        (100 + power) as u8
+    }
+}
+
+/// `_rtl92ce_query_rxphystatus` `rx_pwdb_all` (the `rtl_process_phyinfo`
+/// sample) from the driver-info PHY status at the start of the RX buffer
+/// (`p_drvinfo = skb->data + rx_bufshift`). OFDM/HT: `rx_fwinfo_92c`
+/// byte 4 `pwdb_all`, `((pwdb_all >> 1) & 0x7f) - 110`. CCK:
+/// `phy_sts_cck_8192s_t` byte 5 `cck_agc_rpt` (the same byte as
+/// `rx_fwinfo_92c::cfosho[0]`); without `cck_highpwr` the report is bits
+/// 7:6 and the gain `agc & 0x3e`, with it bits 6:5 and `(agc & 0x1f) << 1`;
+/// then `+6` capped at 100 and the four Linux offset bands. `cck_highpwr`
+/// is BB `RFPGA0_XA_HSSIPARAMETER2` (0x824) BIT(9) (`rtlphy`'s
+/// `cck_high_power`, the RF being on).
+pub fn rx_pwdb(phy: &[u8], cck: bool, cck_highpwr: bool) -> Option<u8> {
+    if phy.len() < 6 {
+        return None;
+    }
+    if !cck {
+        return Some(rx_power_percentage(i32::from((phy[4] >> 1) & 0x7f) - 110));
+    }
+    let agc = phy[5];
+    let (report, gain) = if cck_highpwr {
+        ((agc & 0x60) >> 5, i32::from(agc & 0x1f) << 1)
+    } else {
+        ((agc & 0xc0) >> 6, i32::from(agc & 0x3e))
+    };
+    let base = match report {
+        3 => -46,
+        2 => -26,
+        1 => -12,
+        _ => 16,
+    };
+    let mut pwdb = (rx_power_percentage(base - gain) + 6).min(100);
+    pwdb = match pwdb {
+        35..=42 => pwdb - 2,
+        27..=34 => pwdb - 6,
+        15..=26 => pwdb - 8,
+        5..=14 => pwdb - 4,
+        _ => pwdb,
+    };
+    Some(pwdb)
+}

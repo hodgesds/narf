@@ -123,12 +123,35 @@ pub fn ack_preamble(io: &impl Io, prime_sc: u8, short: bool) -> Result<(), Error
     Ok(())
 }
 
+/// `rtl_op_bss_info_changed` `BSS_CHANGED_ERP_SLOT` (`HW_VAR_SLOT_TIME`
+/// to `REG_SLOT`; its `HW_VAR_AC_PARAM` loop writes nothing) and
+/// `BSS_CHANGED_ERP_PREAMBLE` (`HW_VAR_ACK_PREAMBLE`) for the changed
+/// `(use_short_preamble, use_short_slot)` flags only
+/// (`rtl8192ee::station::erp_timing` is the shared mac80211
+/// `ieee80211_handle_bss_capability` derivation).
+pub fn erp_changed(
+    io: &impl Io,
+    old: (bool, bool),
+    new: (bool, bool),
+    prime_sc: u8,
+) -> Result<(), Error> {
+    if old.0 != new.0 {
+        ack_preamble(io, prime_sc, new.0)?;
+    }
+    if old.1 != new.1 {
+        io.write8(REG_SLOT, if new.1 { 9 } else { 20 })?;
+    }
+    Ok(())
+}
+
 /// Authentication-time `BSS_CHANGED_BASIC_RATES` / ERP and the `conf_tx`
 /// rows for a 2.4 GHz legacy-or-HT station (the BSSID is [`set_bssid`]): RRSR and
 /// `INIRTS_RATE_SEL` ([`basic_rate`] of `rates` — Linux passes
-/// `sta->supp_rates[0]`, the peer's supported set), slot (9 us with the
-/// short-slot capability bit 0x400, else 20), SIFS (`ht` = `ht_enable`),
-/// the fixed `set_qos` rows and the ACK preamble (capability 0x20) at the
+/// `sta->supp_rates[0]`, the peer's supported set), slot and ACK preamble
+/// from `ieee80211_handle_bss_capability` of `capability` and the BSS ERP
+/// octet `erp` (9 us slot with the short-slot bit 0x400, else 20; with an
+/// ERP element the preamble is short unless Barker bit 2, else capability
+/// 0x20), SIFS (`ht` = `ht_enable`), the fixed `set_qos` rows, at the
 /// programmed `prime_sc`. `basic` must name 1 Mb/s (the 2.4 GHz
 /// `rate_control_send_low` rate) and only rates the RRSR mask keeps.
 pub fn configure_rates(
@@ -136,6 +159,7 @@ pub fn configure_rates(
     rates: u16,
     basic: u16,
     capability: u16,
+    erp: Option<u8>,
     ht: bool,
     prime_sc: u8,
 ) -> Result<(), Error> {
@@ -147,8 +171,9 @@ pub fn configure_rates(
     io.write8(REG_RRSR, lo)?;
     io.write8(REG_RRSR + 1, hi)?;
     io.write8(REG_INIRTS_RATE_SEL, index)?;
-    let slot = if capability & 0x400 != 0 { 9 } else { 20 };
-    channel_access(io, slot, ht)?;
+    let (short_preamble, short_slot) =
+        crate::rtlwifi::rtl8192ee::station::erp_timing(capability, erp);
+    channel_access(io, if short_slot { 9 } else { 20 }, ht)?;
     set_qos_all(io)?;
-    ack_preamble(io, prime_sc, capability & 0x20 != 0)
+    ack_preamble(io, prime_sc, short_preamble)
 }

@@ -1083,10 +1083,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ee92_submit(frame, rate, aggregate, adaptive, short_gi);
         }
         if self.rtl8192ce() {
-            if aggregate.is_some() || adaptive || short_gi {
-                return Err(Error::Packet);
-            }
-            return self.ce92_submit(frame, rate);
+            return self.ce92_submit(frame, rate, aggregate, adaptive, short_gi);
         }
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);

@@ -177,7 +177,7 @@ fn smoke_rtl8192ce_station_registers() -> TestResult {
         return TestResult::Fail("HW_VAR_BASIC_RATE");
     }
     let io = Fake::new();
-    if hw::configure_rates(&io, 0x0fff, 0x0001, 0x0420, true, 1).is_err() {
+    if hw::configure_rates(&io, 0x0fff, 0x0001, 0x0420, None, true, 1).is_err() {
         return TestResult::Fail("configure_rates");
     }
     {
@@ -195,7 +195,7 @@ fn smoke_rtl8192ce_station_registers() -> TestResult {
             return TestResult::Fail("rate / SIFS / preamble / EDCA registers");
         }
     }
-    if hw::configure_rates(&io, 0x0ffe, 0x0001, 0, false, 0).is_ok() {
+    if hw::configure_rates(&io, 0x0ffe, 0x0001, 0, None, false, 0).is_ok() {
         return TestResult::Fail("basic set without 1M admitted");
     }
     let mut rcr = 0xf000_6a0e;

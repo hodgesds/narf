@@ -14,14 +14,16 @@
 //!   `REG_PCIE_CTRL_REG + 1` DMA stop (it is only the TX polling doorbell).
 //! - TX (`rtl_pci_tx`, `rtl92ce_tx_fill_desc`, `rtl92ce_tx_polling`): the
 //!   40-byte descriptor from [`trx::fill`] with OWN written last, then the
-//!   `REG_PCIE_CTRL_REG` `BIT(hw_queue)` doorbell. Station profile here: one
-//!   outstanding frame, forced legacy driver rate, `RATR_INX_WIRELESS_MC`,
-//!   macid 0 (`dm.useramask` is set on PCI by
-//!   `rtl92c_dm_init_rate_adaptive_mask`), no protection/aggregation/SGI.
+//!   `REG_PCIE_CTRL_REG` `BIT(hw_queue)` doorbell. One outstanding frame;
+//!   ordinary DATA under the installed RA mask leaves USE_RATE clear
+//!   (macid 0, `dm.useramask` set on PCI by
+//!   `rtl92c_dm_init_rate_adaptive_mask`), HT 40 MHz data BW, A-MPDU,
+//!   data SGI and RTS/CTS-to-self protection as `rtl92ce_tx_fill_desc`.
 //! - RX (`_rtl_pci_rx_interrupt`, `rtl92ce_rx_query_desc`): the 32-byte
 //!   in-ring descriptor ([`trx::RxStatus`]), the payload at `drvinfo +
-//!   shift`, re-armed by [`trx::rx_arm`]. HT/A-MPDU frames are consumed and
-//!   dropped (no HT station profile yet). PHY status is not decoded here.
+//!   shift`, re-armed by [`trx::rx_arm`]. On an HT link, MCS0-7 (1T1R) /
+//!   MCS0-15 (2T2R) and A-MPDU members up to the 7935-byte A-MSDU MPDU;
+//!   the PHY status yields `rx_pwdb_all` ([`trx::rx_pwdb`]).
 //! - Interrupts: [`h2c::enable_interrupt`] / [`h2c::disable_interrupt`] /
 //!   [`h2c::recognize`] (`0x120`/`0x124`/`0x128`).
 //! - Leisure PS: `HW_VAR_FW_LPS_ACTION` (enter: `fw_current_inpsmode`,
@@ -70,6 +72,9 @@ pub(in super::super) struct State {
     /// `rtlpci->receive_config` once `HW_VAR_RCR` changed it (else the
     /// configured radio's trimmed value).
     pub(in super::super) receive_config: Option<u32>,
+    /// `bss_conf->use_short_preamble` / `use_short_slot` as last programmed
+    /// at association, for beacon `BSS_CHANGED_ERP_*` updates.
+    pub(in super::super) erp_timing: Option<(bool, bool)>,
 }
 impl State {
     pub(in super::super) fn new() -> Self {
@@ -81,6 +86,7 @@ impl State {
             link: None,
             false_alarm: ps::FalseAlarm::default(),
             receive_config: None,
+            erp_timing: None,
         }
     }
 }
@@ -131,16 +137,99 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(())
     }
 
-    /// `rtl_pci_tx` for one forced-rate legacy frame.
-    pub(super) fn ce92_submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
+    /// `rtl_pci_tx` (`rtl_get_tcb_desc` + `rtl92ce_tx_fill_desc`) for one
+    /// frame. `adaptive` marks ordinary unicast DATA once the
+    /// `rtl92ce_update_hal_rate_mask` link is installed: USE_RATE clear
+    /// (the firmware RA of MACID 0 picks the rate), starting at
+    /// `_rtl_get_highest_n_rate` (MCS15 on `RF_2T2R` for a peer naming
+    /// `rx_mask[1]`, else MCS7; 11M for a B peer, 54M for G). With
+    /// `dm.useramask` every DATA frame of the link names RATE_ID from
+    /// `mac->mode` (`_rtl_txrate_selectmode`, no NEW_RATEID: NGB 0 / GB 4 /
+    /// B 6), MACID 0. `rtl_is_special_data` (EAPOL / ARP / DHCP) gets rix 0
+    /// from `_rtl_rc_get_rate`, i.e. `use_driver_rate` at `DESC_RATE1M`; a
+    /// (QoS) Null DATA frame keeps `use_driver_rate` at the caller's rate
+    /// (`rtl92ce_tx_fill_desc`, unlike 92EE, writes USE_RATE as given). The
+    /// 92CE descriptor never sets DISFB (`set_tx_desc_disable_fb(0)`).
+    /// `bw_40`: a unicast packet above 54M on an HT link is 40 MHz
+    /// (`data_bw` 1, SC 3), every other packet names `cur_40_prime_sc`.
+    /// `aggregate = (ampdu_density, operational)` gives the peer's density
+    /// and, for an operational BA TID, `agg_break` + `max_agg_num 0x14`.
+    /// `short_gi` is `_rtl_query_shortgi` (the data SGI bit). Protection is
+    /// `_rtl_query_protection_mode` at `DESC_RATE24M`. Every rate the
+    /// descriptor can put on air must be in the `N92C` admitted set.
+    pub(super) fn ce92_submit(
+        &mut self,
+        frame: &[u8],
+        rate: u8,
+        aggregate: Option<(u8, bool)>,
+        adaptive: bool,
+        short_gi: bool,
+    ) -> Result<u64, Error> {
+        use super::super::super::rtl8192ce::version::RfType;
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
-        if rate > trx::DESC_RATE54M
-            || self.packet.protection != super::super::super::protection::Mode::None
+        let rf_type = self.ce92_version()?.rf_type();
+        let ht = self.packet.ht;
+        let highest = match (ht, rf_type) {
+            (false, _) => trx::DESC_RATE54M,
+            (true, RfType::T1R1) => trx::DESC_RATEMCS0 + 7,
+            (true, RfType::T2R2) => trx::DESC_RATEMCS15,
+        };
+        if frame.len() < 24
+            || !ht && (aggregate.is_some() || short_gi)
+            || aggregate.is_some_and(|(density, _)| density > 7)
+            || aggregate.is_some() && frame[0] != 0x88
+            || rate > highest
         {
             return Err(Error::Packet);
         }
+        let multicast_ra = frame[4] & 1 != 0;
+        let data = frame[0] & 0x0c == 0x08;
+        let special = super::ee92::special_data(frame);
+        let nullfunc = data && matches!(frame[0] & 0xf0, 0x40 | 0xc0);
+        let adaptive = adaptive && !special && !nullfunc;
+        let link = match self.packet.ce92.link {
+            Some((peer, _, _)) if adaptive => {
+                if multicast_ra || !data {
+                    return Err(Error::Packet);
+                }
+                Some(peer)
+            }
+            None if adaptive => return Err(Error::State),
+            _ => None,
+        };
+        let hw_rate = match link {
+            Some(peer) => match peer.mode {
+                h2c::WirelessMode::N24 if rf_type == RfType::T2R2 && peer.rx_mask[1] != 0 => {
+                    trx::DESC_RATEMCS15
+                }
+                h2c::WirelessMode::N24 => trx::DESC_RATEMCS0 + 7,
+                h2c::WirelessMode::B => trx::DESC_RATE11M,
+                h2c::WirelessMode::G => trx::DESC_RATE54M,
+            },
+            None if special => trx::DESC_RATE1M,
+            None => rate,
+        };
+        let protection = match self.packet.protection {
+            super::super::super::protection::Mode::None => 0,
+            super::super::super::protection::Mode::RtsCts => 1,
+            super::super::super::protection::Mode::CtsToSelf => 2,
+        };
+        let permission = self.rtl8192ce_power.ok_or(Error::State)?;
+        if permission.admitted_rates() & (1u64 << hw_rate) == 0
+            || protection != 0 && permission.admitted_rates() & (1u64 << trx::DESC_RATE24M) == 0
+        {
+            return Err(Error::Power(
+                super::super::super::channel_power::Error::Policy,
+            ));
+        }
+        let rate_id = match self.packet.ce92.link {
+            Some((_, _, index)) if data => index,
+            _ => RATR_INX_WIRELESS_MC,
+        };
+        let bw40 = self.packet.width.is_some();
+        let prime_sc = self.rtl8192ce_prime_sc();
         let (queue, poll, selector) = queue(
             frame,
             self.packet.local.ok_or(Error::State)?,
@@ -166,16 +255,24 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         } else {
             &frame[4..10]
         };
+        let multicast = destination[0] & 1 != 0;
         let prefix = trx::fill(&trx::TxParams {
             pkt_size: frame.len() as u16,
             queue_sel: selector,
             macid: 0,
-            rate_id: RATR_INX_WIRELESS_MC,
-            hw_rate: rate,
-            use_driver_rate: true,
+            rate_id,
+            hw_rate,
+            use_driver_rate: link.is_none(),
+            short: short_gi,
+            bw_40: bw40,
+            packet_bw_40: bw40 && ht && !multicast && hw_rate > trx::DESC_RATE54M,
+            prime_sc,
+            ampdu: aggregate.is_some_and(|(_, operational)| operational),
+            ampdu_density: aggregate.map_or(0, |(density, _)| density),
             seq: u16::from_le_bytes([frame[22], frame[23]]) >> 4,
-            multicast: destination[0] & 1 != 0,
+            multicast,
             qos_data: frame[0] == 0x88,
+            protection,
             buffer_addr: address,
             ..Default::default()
         });
@@ -226,6 +323,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase = Phase::Failed;
         let channel = self.packet.ce92.channel.ok_or(Error::State)?;
+        let (rf_type, cck_highpwr) = self
+            .rtl8192ce
+            .as_deref()
+            .map(|(_, radio)| (radio.version.rf_type(), radio.phy.cck_high_power))
+            .ok_or(Error::State)?;
+        // HT link (`packet.ht`, set at Configuring): the MCS set this
+        // station advertised (MCS0-7 on RF_1T1R, MCS0-15 on RF_2T2R) and
+        // A-MPDU members (the station BA owner gates them) up to a
+        // 7935-byte A-MSDU MPDU.
+        let ht = self.packet.ht;
+        let highest_mcs = match rf_type {
+            super::super::super::rtl8192ce::version::RfType::T1R1 => trx::DESC_RATEMCS0 + 7,
+            super::super::super::rtl8192ce::version::RfType::T2R2 => trx::DESC_RATEMCS15,
+        };
+        let longest = if ht {
+            26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
+        } else {
+            2304 + 4
+        };
         let slot = self.packet.receive;
         let depth = self.depth;
         let ring = self.receive.as_mut().ok_or(Error::State)?;
@@ -248,11 +364,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 return Err(Error::Descriptor);
             }
             let mut packet = None;
+            let mcs = (trx::DESC_RATEMCS0..=highest_mcs).contains(&status.rate);
+            let rate_ok = if status.ht {
+                ht && mcs
+            } else {
+                status.rate <= trx::DESC_RATE54M
+            };
             if !status.hw_error()
-                && !status.ht
-                && !status.ampdu
-                && status.rate <= trx::DESC_RATE54M
-                && (24..=2304 + 4).contains(&length)
+                && (!status.ampdu || ht)
+                && rate_ok
+                && (24..=longest).contains(&length)
             {
                 buffer.sync();
                 let mut bytes = Vec::new();
@@ -265,14 +386,27 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // Software CCMP: protected frames keep IV/ciphertext/MIC.
                 if fc & 0x400 == 0 && bytes[22] & 15 == 0 && (fc & 0x4000 == 0 || !status.decrypted)
                 {
+                    // `_rtl92ce_translate_rx_signal_stuff` →
+                    // `_rtl92ce_query_rxphystatus` `rx_pwdb_all` from the
+                    // driver-info PHY status ahead of the frame.
+                    let pwdb = if status.physt && status.drvinfo_size >= 8 {
+                        let mut phy = [0u8; 8];
+                        buffer.read_bytes(status.shift, &mut phy)?;
+                        trx::rx_pwdb(&phy, status.is_cck(), cck_highpwr)
+                    } else {
+                        None
+                    };
+                    // `rtl92ce_rx_query_desc`: `is_ht` from RXHT and
+                    // `rx_is40mhzpacket` from the BW bit; no SGI flag is
+                    // reported on this chip.
                     packet = Some(Mpdu {
                         bytes,
                         channel,
-                        ht: false,
+                        ht: status.ht,
                         short_gi: false,
-                        width40: false,
-                        aggregated: false,
-                        pwdb: None,
+                        width40: status.ht && status.bw_40,
+                        aggregated: status.ampdu,
+                        pwdb,
                         antenna_mux: None,
                     });
                 }
@@ -687,7 +821,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let prime_sc = self.rtl8192ce_prime_sc();
         self.phase = Phase::Failed;
         hw::set_bssid(&self.io, peer)?;
-        hw::configure_rates(&self.io, rates, basic, capability, false, prime_sc)?;
+        hw::configure_rates(&self.io, rates, basic, capability, None, false, prime_sc)?;
         self.phase = Phase::Running;
         Ok(())
     }
@@ -758,6 +892,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .await?;
         }
         self.packet.ce92.link = None;
+        self.packet.ce92.erp_timing = None;
         self.ce92_network_type(false)?;
         self.packet
             .ce92

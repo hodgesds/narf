@@ -1073,11 +1073,15 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         )
     }
     /// ERP / RTS-threshold protection admitted by the chip's own envelope
-    /// rather than the 88EE `NERT` grant: 8821AE (`NAPC`) and 8192EE
-    /// (`N92E`), whose descriptor paths check the `DESC_RATE24M` control
-    /// rate against the current permission per frame.
+    /// rather than the 88EE `NERT` grant: 8821AE (`NAPC`), 8192EE
+    /// (`N92E`) and 8192CE / 8188CE (`N92C`), whose descriptor paths check
+    /// the `DESC_RATE24M` control rate against the current permission per
+    /// frame.
     pub(crate) fn native_protection(&self) -> bool {
-        matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee)
+        matches!(
+            self.chip,
+            super::Chip::Rtl8821ae | super::Chip::Rtl8192ee | super::Chip::Rtl8192ce
+        )
     }
     /// RTL8821AE: the current `NAPC` permission admits the HT station
     /// (every MCS0-7 rate the Linux RA mask names holds a measured index).
@@ -1373,7 +1377,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// SET_WIPHY changes policy, never authority. A live peer must already
     /// carry the exact current protection record and OFDM24 control support.
-    /// RTL8192EE beacon `ieee80211_handle_bss_capability`: a changed
+    /// RTL8192EE / 8192CE beacon `ieee80211_handle_bss_capability`: a changed
     /// short-preamble or short-slot flag (beacon capability and ERP
     /// element) is `BSS_CHANGED_ERP_PREAMBLE` / `_SLOT`, programmed inside
     /// the station publication (`rtl8192ee::station::erp_changed`).
@@ -1382,7 +1386,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         candidate: &Candidate,
         environment: &impl Environment,
     ) -> Result<(), Error> {
-        let Some(old) = self.packet.ee92.erp_timing else {
+        let ce = self.chip == super::Chip::Rtl8192ce;
+        let current = if ce {
+            self.packet.ce92.erp_timing
+        } else {
+            self.packet.ee92.erp_timing
+        };
+        let Some(old) = current else {
             return Ok(());
         };
         let erp = super::super::rtl8192ee::station::erp_octet(&candidate.bss.information_elements)?;
@@ -1390,12 +1400,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if new == old {
             return Ok(());
         }
-        let prime_sc = self.rtl8192ee_prime_sc();
-        self.station_publication(environment, || {
-            super::super::rtl8192ee::station::erp_changed(&self.io, old, new, prime_sc)
-                .map_err(|_| RadioError::State)
-        })?;
-        self.packet.ee92.erp_timing = Some(new);
+        if ce {
+            let prime_sc = self.rtl8192ce_prime_sc();
+            self.station_publication(environment, || {
+                super::super::rtl8192ce::station::erp_changed(&self.io, old, new, prime_sc)
+                    .map_err(|_| RadioError::State)
+            })?;
+            self.packet.ce92.erp_timing = Some(new);
+        } else {
+            let prime_sc = self.rtl8192ee_prime_sc();
+            self.station_publication(environment, || {
+                super::super::rtl8192ee::station::erp_changed(&self.io, old, new, prime_sc)
+                    .map_err(|_| RadioError::State)
+            })?;
+            self.packet.ee92.erp_timing = Some(new);
+        }
         Ok(())
     }
     pub(crate) fn admit_station_rts_threshold(
@@ -1741,12 +1760,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // Ordinary DATA may clear DISFB only under a current NEFB grant;
         // without it the base programs' fixed USE_RATE + DISFB applies.
         // `_rtl_query_shortgi`: SGI80 at 80 MHz, SGI40 at 40 MHz (8821AE
-        // and 8192EE only), else SGI20.
+        // 8192EE and 8192CE only), else SGI20.
         let sgi_profile = self.station.ht_profile.is_some_and(|p| {
             if self.packet.eighty {
                 self.station.vht_profile.is_some_and(|v| v.tx_sgi80())
             } else if self.packet.width.is_some() {
-                matches!(self.chip, super::Chip::Rtl8821ae | super::Chip::Rtl8192ee) && p.tx_sgi40()
+                matches!(
+                    self.chip,
+                    super::Chip::Rtl8821ae | super::Chip::Rtl8192ee | super::Chip::Rtl8192ce
+                ) && p.tx_sgi40()
             } else {
                 p.tx_sgi20()
             }
@@ -1782,8 +1804,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // `rtl_get_tcb_desc` fills protection and the firmware RA
         // independently (`rtl92ee_tx_fill_desc` clears USE_RATE for every
         // non-management frame), so a protected frame keeps the RA.
-        let protected_ra = self.chip == super::Chip::Rtl8192ee;
-        let fallback = if self.chip == super::Chip::Rtl8192ee {
+        // RTL8192CE: the same composition (`rtl92ce_tx_fill_desc` writes
+        // USE_RATE from `use_driver_rate`, which `rtl_get_tcb_desc` clears
+        // for ordinary DATA independent of protection), inside the
+        // installed `rtl92ce_update_hal_rate_mask` (a subset of the `N92C`
+        // admitted rates).
+        let protected_ra = matches!(self.chip, super::Chip::Rtl8192ee | super::Chip::Rtl8192ce);
+        let fallback = if protected_ra {
             matches!(kind, Kind::Data) && self.rate_mask().is_some()
         } else if self.chip == super::Chip::Rtl8821ae {
             matches!(kind, Kind::Data)
@@ -2085,21 +2112,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .as_ref()
                         .ok_or(Error::State)?
                         .legacy_rates();
-                    // RTL8192EE: mac80211 derives the ERP preamble from the
+                    // RTL8192EE / 8192CE: mac80211 derives the ERP preamble from the
                     // BSS ERP element (`ieee80211_handle_bss_capability`).
-                    let erp92 = if self.chip == super::Chip::Rtl8192ee {
-                        super::super::rtl8192ee::station::erp_octet(
-                            &self
-                                .station
-                                .candidate
-                                .as_ref()
-                                .ok_or(Error::State)?
-                                .bss
-                                .information_elements,
-                        )?
-                    } else {
-                        None
-                    };
+                    let erp92 =
+                        if matches!(self.chip, super::Chip::Rtl8192ee | super::Chip::Rtl8192ce) {
+                            super::super::rtl8192ee::station::erp_octet(
+                                &self
+                                    .station
+                                    .candidate
+                                    .as_ref()
+                                    .ok_or(Error::State)?
+                                    .bss
+                                    .information_elements,
+                            )?
+                        } else {
+                            None
+                        };
                     self.station_publication(environment, || {
                         if self.chip == super::Chip::Rtl8821ae {
                             return super::super::rtl8821ae::station::configure_rates(
@@ -2128,6 +2156,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                                 rates,
                                 basic,
                                 self.station.capability,
+                                erp92,
                                 self.station.ht_profile.is_some(),
                                 self.rtl8192ce_prime_sc(),
                             );
@@ -2139,12 +2168,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             self.station.capability,
                         )
                     })?;
+                    let timing = super::super::rtl8192ee::station::erp_timing(
+                        self.station.capability,
+                        erp92,
+                    );
                     if self.chip == super::Chip::Rtl8192ee {
-                        self.packet.ee92.erp_timing =
-                            Some(super::super::rtl8192ee::station::erp_timing(
-                                self.station.capability,
-                                erp92,
-                            ));
+                        self.packet.ee92.erp_timing = Some(timing);
+                    } else if self.chip == super::Chip::Rtl8192ce {
+                        self.packet.ce92.erp_timing = Some(timing);
                     }
                     if let Some(p) = self.station.wmm {
                         self.program_station_edca(p)?;
@@ -2466,7 +2497,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         return Err(Error::Profile);
                     }
                     self.station.erp = erp;
-                    if self.chip == super::Chip::Rtl8192ee {
+                    if matches!(self.chip, super::Chip::Rtl8192ee | super::Chip::Rtl8192ce) {
                         self.track_rtl8192ee_erp(&candidate, environment)?;
                     }
                     let old = self.station.candidate.as_ref().ok_or(Error::State)?;
