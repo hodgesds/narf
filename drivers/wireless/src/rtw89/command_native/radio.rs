@@ -857,6 +857,12 @@ impl Native {
             self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
         }
         self.channel = Some((primary, owner.epoch()));
+        // RX admission follows the programmed width: up to this channel's
+        // bandwidth, and VHT rates only on a 5GHz 40/80MHz channel.
+        if let Some(core) = self.station_runtime.core.as_mut() {
+            let width = profile.width() as u8;
+            core.set_operating_width(width, width != 0 && profile.is_5ghz());
+        }
         // ieee80211_offchannel_return: queues reopen only on the new grant.
         self.ordinary = Some(grant);
         Ok(owner.epoch())

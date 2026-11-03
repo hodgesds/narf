@@ -1149,3 +1149,41 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs
 );
+
+fn smoke_rtw89_b_packet_rx_width_follows_programmed_channel() -> TestResult {
+    let mut model = Model::new();
+    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("HT packet preparation");
+    };
+    if core.rx_width != 0 || core.admits_rate(0x105) || !core.admits_rate(0x87) {
+        return TestResult::Fail("20MHz owner admits wide/VHT RX");
+    }
+    // 5GHz 80MHz: bandwidth up to 80MHz and VHT rates.
+    core.set_operating_width(2, true);
+    if core.rx_width != 2 || !core.admits_rate(0x105) || !core.admits_rate(0x119) {
+        return TestResult::Fail("5GHz 80MHz owner refuses VHT RX");
+    }
+    // 2.4GHz HT40: 40MHz, no VHT; a later 20MHz retune clears both.
+    core.set_operating_width(1, false);
+    if core.rx_width != 1 || core.admits_rate(0x105) {
+        return TestResult::Fail("2.4GHz HT40 owner admits VHT RX");
+    }
+    core.set_operating_width(0, true);
+    if core.rx_width != 0 || core.admits_rate(0x105) {
+        return TestResult::Fail("20MHz retune kept wide RX admission");
+    }
+    // VHT needs the HT program.
+    let mut model = Model::new();
+    let Ok(mut legacy) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Legacy) else {
+        return TestResult::Fail("legacy packet preparation");
+    };
+    legacy.set_operating_width(2, true);
+    if legacy.admits_rate(0x105) {
+        return TestResult::Fail("VHT admitted without the HT program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_rx_width_follows_programmed_channel
+);

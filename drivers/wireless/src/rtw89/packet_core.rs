@@ -218,6 +218,11 @@ pub(super) struct Core {
     /// AP role (`prepare_ap`): multi-peer MACIDs, CH9 HIQ, unacknowledged
     /// RPQ releases are ordinary TX status rather than a failure.
     ap: bool,
+    /// RX bandwidth bound (`enum rtw89_bandwidth`) of the programmed
+    /// operating channel (`set_operating_width`); 0 = 20MHz.
+    rx_width: u8,
+    /// VHT PPDUs admitted (an HT-program owner on a 5GHz 40/80MHz channel).
+    rx_vht: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
 /// Receive PHY admission granted by the signed operating programs.
@@ -392,6 +397,8 @@ impl Core {
                 amsdu: None,
                 last_a_ctrl: false,
                 ap,
+                rx_width: 0,
+                rx_vht: false,
             };
             for ring in &mut owner.rings {
                 let regs = ring.kind.regs_for(chip);
@@ -878,6 +885,17 @@ impl Core {
         self.pending.remove(index);
         Ok(())
     }
+    /// The programmed operating channel's RX bound: `width` (0/1/2 =
+    /// 20/40/80MHz) and whether VHT rates are admitted (RTL8852B 5GHz wide
+    /// channel). Linux rtw89 reports every PPDU the tuned BB decodes; this
+    /// owner additionally never admits a bandwidth the radio was not tuned to.
+    pub(super) fn set_operating_width(&mut self, width: u8, vht: bool) {
+        self.rx_width = width.min(2);
+        self.rx_vht = vht && self.rx_width != 0;
+    }
+    fn admits_rate(&self, rate: u16) -> bool {
+        self.rx.admits(rate) || self.rx_vht && self.rx >= RxPhy::Ht && rx_packet::vht_rate(rate)
+    }
     fn receive(&mut self, port: &mut impl Port, step: &mut Step) -> Result<(), Error> {
         let received = port.receive()?;
         if received.event.is_some() && !received.consumed {
@@ -894,10 +912,13 @@ impl Core {
                 }
             }
             // A PPDU above the signed RX PHY program (HT without `Ht`, HE
-            // without `He`) is dropped exactly as the assembler dropped every
-            // non-legacy rate before, without closing the station.
+            // without `He`, VHT off a wide 5GHz channel) or wider than the
+            // programmed channel is dropped exactly as the assembler dropped
+            // every non-legacy rate before, without closing the station.
             Some(rx_packet::Event::Wifi(meta, _))
-                if !self.rx.admits(meta.rate) || meta.ampdu && self.rx < RxPhy::Ht => {}
+                if !self.admits_rate(meta.rate)
+                    || meta.bandwidth > self.rx_width
+                    || meta.ampdu && self.rx < RxPhy::Ht => {}
             // Linux forwards control frames to the host (RTW89_CTRL ->
             // RTW89_FWD_TO_HOST). Those shorter than an ordinary header are
             // surfaced from 16 bytes (PS-Poll/BAR); malformed ones are dropped.
@@ -908,7 +929,7 @@ impl Core {
                     && !meta.icv_error
                     && !meta.hardware_decrypted
                     && !meta.aggregate
-                    && meta.bandwidth == 0
+                    && meta.bandwidth <= self.rx_width
                     && (16..=format::MAX_MPDU).contains(&bytes.len())
                     && meta.size == bytes.len() + 4
                 {
@@ -923,8 +944,8 @@ impl Core {
                     || meta.icv_error
                     || meta.hardware_decrypted
                     || meta.aggregate
-                    || meta.bandwidth != 0
-                    || !self.rx.admits(meta.rate)
+                    || meta.bandwidth > self.rx_width
+                    || !self.admits_rate(meta.rate)
                     || bytes.len() < 24
                     || bytes.len()
                         > if super::fragment_rx::fragmented(&bytes) {

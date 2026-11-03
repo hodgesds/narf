@@ -26,6 +26,10 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32, Error> {
 }
 /// `RTW89_HW_RATE_HE_NSS1_MCS0..MCS11` or `RTW89_HW_RATE_HE_NSS2_MCS0..MCS11`:
 /// the HE rates this two-RX-path station can receive.
+/// `RTW89_HW_RATE_VHT_NSS1_MCS0..MCS9` / `VHT_NSS2_MCS0..MCS9`.
+pub(super) fn vht_rate(rate: u16) -> bool {
+    (0x100..=0x109).contains(&rate) || (0x110..=0x119).contains(&rate)
+}
 pub(super) fn he_rate(rate: u16) -> bool {
     (0x180..=0x18b).contains(&rate) || (0x190..=0x19b).contains(&rate)
 }
@@ -358,12 +362,17 @@ impl Assembler {
                     || descriptor.icv_error
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
-                    || descriptor.bandwidth != 0
-                    // Legacy CCK1..OFDM54, 20MHz HT MCS0..15 (RTW89_HW_RATE_MCS0)
+                    // RTL8852B: up to RTW89_CHANNEL_WIDTH_80 (its
+                    // `support_bandwidths`); the packet owner bounds it by the
+                    // programmed width. RTL8852C keeps 20MHz only here.
+                    || descriptor.bandwidth > if self.bw_v1 { 0 } else { 2 }
+                    // Legacy CCK1..OFDM54, HT MCS0..15 (RTW89_HW_RATE_MCS0),
+                    // VHT NSS1/NSS2 MCS0..9 (8852B; RTW89_HW_RATE_VHT_NSS1_MCS0)
                     // or HE NSS1/NSS2 MCS0..11 with a defined GI/LTF
                     // (RTW89_HW_RATE_HE_NSS1_MCS0, RTW89_GILTF_1XHE08 = 5).
                     || !(descriptor.rate <= 11
                         || (0x80..=0x8f).contains(&descriptor.rate)
+                        || !self.bw_v1 && vht_rate(descriptor.rate)
                         || he_rate(descriptor.rate) && descriptor.gi_ltf <= 5)
                 {
                     Event::Dropped

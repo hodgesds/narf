@@ -383,3 +383,39 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo
 );
+
+fn smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner() -> TestResult {
+    let payload = vec![0x5a; 40];
+    let with = |rate: u32, bw: u32| {
+        let mut bytes = packet(0, &payload, false, 0);
+        let d1 = rate << 16 | bw << 30;
+        bytes[8..12].copy_from_slice(&d1.to_le_bytes());
+        bytes
+    };
+    // RTL8852B: 40/80MHz and VHT NSS1/NSS2 MCS0..9 are surfaced (the packet
+    // owner bounds them by the programmed width).
+    for (rate, bw) in [(0x105, 2), (0x119, 1), (0x87, 1), (0x18b, 2), (4, 1)] {
+        if !matches!(
+            Assembler::default().segment(&with(rate, bw), false),
+            Ok(Some(Event::Wifi(meta, _))) if meta.bandwidth == bw as u8 && meta.rate == rate as u16
+        ) {
+            return TestResult::Fail("RTL8852B wide/VHT PPDU not surfaced with its bandwidth");
+        }
+    }
+    // 160MHz and undefined VHT rates stay dropped.
+    for (rate, bw) in [(0x105, 3), (0x10a, 0), (0x11a, 1)] {
+        if Assembler::default().segment(&with(rate, bw), false) != Ok(Some(Event::Dropped)) {
+            return TestResult::Fail("RTL8852B PPDU outside 20/40/80MHz VHT0..9 surfaced");
+        }
+    }
+    // RTL8852C keeps its 20MHz/no-VHT assembler rule.
+    let c = || Assembler::for_chip(crate::rtw89::mac::ChipId::Rtl8852C);
+    if c().segment(&with(0x105, 0), false) != Ok(Some(Event::Dropped)) {
+        return TestResult::Fail("RTL8852C assembler admitted VHT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner
+);
