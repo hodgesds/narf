@@ -692,7 +692,12 @@ impl MtlHpdMonitor {
         let legacy_en = self.legacy_tc_enables();
         let legacy_status = self.legacy_tc_status();
         let config = self.config;
+        // A fresh incarnation never touched a source: nothing to withdraw.
+        let touched = self.initialized || self.uncertain;
         *self = Self::new(config);
+        if !touched {
+            return true;
+        }
         if !io.display_access_ok() {
             return false;
         }

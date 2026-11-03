@@ -867,12 +867,31 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
         lost.store(true, Ordering::Release);
     }
 }
+/// Retire an owned Meteor Lake external route and its hotplug sources
+/// (`intel_gpu_xelpg_external::teardown_mtl_external`) for this BAR. The
+/// window is captured under the controller lock and programmed outside it;
+/// other generations return before any register access.
+fn retire_mtl_external(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
+    let Some((window, generation)) = crate::intel_gpu::with_controller(|gpu| {
+        (gpu.gtt_mmadr.phys == bar.phys).then(|| (gpu.mode_window(), gpu.chip.generation))
+    })
+    .flatten() else {
+        return Ok(());
+    };
+    if crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, generation) {
+        Ok(())
+    } else {
+        Err(FsError::Busy)
+    }
+}
+
 pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
     // Display-14 suspend: DC states exited and held off for the whole
     // preparation; the DMC program is disabled only once it succeeded.
     crate::intel_gpu_dc_states::suspend_begin_for_bar(bar).map_err(|_| FsError::Busy)?;
     let result = async {
         crate::intel_gpu::retire_external_sst(bar).await?;
+        retire_mtl_external(bar)?;
         if let Some(display) = display_for_bar(bar) {
             display.quiesce().await?;
         }
@@ -892,6 +911,7 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
 
 pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
     crate::intel_gpu::retire_external_sst(bar).await?;
+    retire_mtl_external(bar)?;
     if let Some(display) = display_for_bar(bar) {
         display.recover().await?;
     }

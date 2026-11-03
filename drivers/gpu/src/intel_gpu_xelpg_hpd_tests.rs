@@ -474,3 +474,33 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hpd",
     smoke_mtl_hpd_generation_gate_and_imr_refusal
 );
+
+fn smoke_mtl_hpd_fresh_teardown_touches_nothing() -> TestResult {
+    struct Panics;
+    impl MmioWindow for Panics {
+        fn read32(&self, _: u64) -> u32 {
+            panic!("fresh teardown read a register");
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("fresh teardown wrote a register");
+        }
+    }
+    // A monitor that never initialized owns no source: suspend/reset
+    // teardown completes without register access.
+    let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+    if !monitor.teardown(&Panics) || monitor.initialized() || monitor.uncertain() {
+        return TestResult::Fail("fresh teardown must be a complete no-op");
+    }
+    // After a real baseline the same call withdraws the sources.
+    let io = HpdFake::new();
+    let _ = drain(&mut monitor, &io);
+    let before = io.writes.borrow().len();
+    if !monitor.teardown(&io) || io.writes.borrow().len() == before {
+        return TestResult::Fail("initialized teardown must withdraw owned sources");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hpd",
+    smoke_mtl_hpd_fresh_teardown_touches_nothing
+);
