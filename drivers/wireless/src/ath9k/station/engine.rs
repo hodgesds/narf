@@ -9,7 +9,7 @@ use crate::ath9k::{
     packet::{Delivery, Error, Packet, PairDelivery, Phase, Port, ReceiveStep},
     ps, qos, rates, rx_ba, tx_ba,
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use narf_wireless::association::phy::Offer;
 
 /// Every packet-owner operation `station::Radio` uses.
@@ -244,5 +244,206 @@ impl<P: Port> Engine for Packet<P> {
     }
     fn periodic_deferred(&self) -> Result<bool, Error> {
         Packet::periodic_deferred(self)
+    }
+}
+
+/// The packet engine a native station owns: the AR5008/AR9002 descriptor
+/// owner or the AR9003 EDMA owner. Every operation delegates to the held
+/// engine unchanged, so each chip's behaviour and register stream is
+/// exactly its own engine's.
+pub(in crate::ath9k) enum Dispatch<P: Port> {
+    Ar9002(Box<Packet<P>>),
+    Ar9003(Box<crate::ath9k::ar9003::packet::Packet<P>>),
+}
+
+impl<P: Port> From<Packet<P>> for Dispatch<P> {
+    fn from(packet: Packet<P>) -> Self {
+        Self::Ar9002(Box::new(packet))
+    }
+}
+
+impl<P: Port> From<crate::ath9k::ar9003::packet::Packet<P>> for Dispatch<P> {
+    fn from(packet: crate::ath9k::ar9003::packet::Packet<P>) -> Self {
+        Self::Ar9003(Box::new(packet))
+    }
+}
+
+/// `Engine::$method` on whichever engine `$self` holds.
+macro_rules! dispatch {
+    ($self:ident.$method:ident($($arg:expr),*)) => {
+        match $self {
+            Dispatch::Ar9002(packet) => <Packet<P> as Engine>::$method(packet $(, $arg)*),
+            Dispatch::Ar9003(packet) => {
+                <crate::ath9k::ar9003::packet::Packet<P> as Engine>::$method(packet $(, $arg)*)
+            }
+        }
+    };
+}
+
+impl<P: Port> Engine for Dispatch<P> {
+    fn phase(&self) -> Phase {
+        dispatch!(self.phase())
+    }
+    fn reclaimed(&self) -> bool {
+        dispatch!(self.reclaimed())
+    }
+    fn idle_admissible(&self) -> bool {
+        dispatch!(self.idle_admissible())
+    }
+    fn check_transmit(&self) -> Result<(), Error> {
+        dispatch!(self.check_transmit())
+    }
+    fn geometry(&self) -> Geometry {
+        dispatch!(self.geometry())
+    }
+    fn frequency_mhz(&self) -> u16 {
+        dispatch!(self.frequency_mhz())
+    }
+    fn channel_mask(&self) -> u64 {
+        dispatch!(self.channel_mask())
+    }
+    fn channel(&self) -> u8 {
+        dispatch!(self.channel())
+    }
+    fn ht_grant(&self) -> Option<Arc<ht::Grant>> {
+        dispatch!(self.ht_grant())
+    }
+    fn rx_ba_grant(&self) -> Option<Arc<rx_ba::Grant>> {
+        dispatch!(self.rx_ba_grant())
+    }
+    fn ps_grant(&self) -> Option<Arc<ps::Grant>> {
+        dispatch!(self.ps_grant())
+    }
+    fn enable_ps(&mut self, source: &Arc<ps::Grant>) -> Result<(), Error> {
+        dispatch!(self.enable_ps(source))
+    }
+    fn ps_receive_on(&self) -> Result<(), Error> {
+        dispatch!(self.ps_receive_on())
+    }
+    fn ps_timers(&mut self, plan: ps::tim::Plan) -> Result<(), Error> {
+        dispatch!(self.ps_timers(plan))
+    }
+    fn ps_awake_mode(&mut self) -> Result<(), Error> {
+        dispatch!(self.ps_awake_mode())
+    }
+    fn ps_sleep(&mut self) -> Result<(), Error> {
+        dispatch!(self.ps_sleep())
+    }
+    fn ps_tsf(&self) -> Result<u64, Error> {
+        dispatch!(self.ps_tsf())
+    }
+    fn submit_ps(
+        &mut self,
+        frame: &[u8],
+        ap: [u8; 6],
+        aid: u16,
+        basic: usize,
+    ) -> Result<u64, Error> {
+        dispatch!(self.submit_ps(frame, ap, aid, basic))
+    }
+    fn tx_ba_grant(&self) -> Option<Arc<tx_ba::Grant>> {
+        dispatch!(self.tx_ba_grant())
+    }
+    fn enable_tx_ba(&mut self, grant: &Arc<tx_ba::Grant>) -> Result<(), Error> {
+        dispatch!(self.enable_tx_ba(grant))
+    }
+    fn qos_grant(&self) -> Option<Arc<qos::Grant>> {
+        dispatch!(self.qos_grant())
+    }
+    fn qos(&self) -> Option<qos::Profile> {
+        dispatch!(self.qos())
+    }
+    fn enable_qos(&mut self, grant: &Arc<qos::Grant>, profile: qos::Profile) -> Result<(), Error> {
+        dispatch!(self.enable_qos(grant, profile))
+    }
+    fn enable_rx_ba(&mut self, grant: &Arc<rx_ba::Grant>) -> Result<(), Error> {
+        dispatch!(self.enable_rx_ba(grant))
+    }
+    fn set_ht(&mut self, profile: ht::Profile) -> Result<(), Error> {
+        dispatch!(self.set_ht(profile))
+    }
+    fn ht_profile(&self) -> Option<ht::Profile> {
+        dispatch!(self.ht_profile())
+    }
+    fn observe_ht(&mut self, offer: &Offer, ies: &[u8], basic: usize) -> Result<(), Error> {
+        dispatch!(self.observe_ht(offer, ies, basic))
+    }
+    fn set_peer(&mut self, peer: Option<([u8; 6], u16)>, slot_us: u32) -> Result<(), Error> {
+        dispatch!(self.set_peer(peer, slot_us))
+    }
+    fn start(&mut self) -> Result<(), Error> {
+        dispatch!(self.start())
+    }
+    fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
+        dispatch!(self.submit(frame, rate))
+    }
+    fn submit_rates(&mut self, frame: &[u8], series: rates::Series) -> Result<u64, Error> {
+        dispatch!(self.submit_rates(frame, series))
+    }
+    fn submit_ba_response(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
+        dispatch!(self.submit_ba_response(frame, rate))
+    }
+    fn submit_delba(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
+        dispatch!(self.submit_delba(frame, rate))
+    }
+    fn submit_ht(&mut self, frame: &[u8], mcs: u8, basic: usize) -> Result<u64, Error> {
+        dispatch!(self.submit_ht(frame, mcs, basic))
+    }
+    fn submit_sender_action(&mut self, frame: &[u8], basic: usize) -> Result<u64, Error> {
+        dispatch!(self.submit_sender_action(frame, basic))
+    }
+    fn submit_bar(&mut self, frame: &[u8], basic: usize) -> Result<u64, Error> {
+        dispatch!(self.submit_bar(frame, basic))
+    }
+    fn submit_aggregate(
+        &mut self,
+        frames: &[Vec<u8>],
+        mcs: u8,
+        basic: usize,
+        permit: tx_ba::AggregatePermit,
+    ) -> Result<u64, Error> {
+        dispatch!(self.submit_aggregate(frames, mcs, basic, permit))
+    }
+    fn pair_delivery(&mut self) -> Result<Option<PairDelivery>, Error> {
+        dispatch!(self.pair_delivery())
+    }
+    fn delivery(&mut self) -> Result<Option<Delivery>, Error> {
+        dispatch!(self.delivery())
+    }
+    fn receive(&mut self) -> Result<ReceiveStep, Error> {
+        dispatch!(self.receive())
+    }
+    fn enable_interrupts(&mut self) -> Result<bool, Error> {
+        dispatch!(self.enable_interrupts())
+    }
+    fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
+        dispatch!(self.long_calibration())
+    }
+    fn interrupt(&self) -> Option<Arc<irq::Signal>> {
+        dispatch!(self.interrupt())
+    }
+    fn service_begin(&mut self) -> Result<Option<irq::Events>, Error> {
+        dispatch!(self.service_begin())
+    }
+    fn service_end(&mut self) -> Result<(), Error> {
+        dispatch!(self.service_end())
+    }
+    fn stop(&mut self) -> Result<(), Error> {
+        dispatch!(self.stop())
+    }
+    fn periodic_epoch(&mut self) {
+        dispatch!(self.periodic_epoch())
+    }
+    fn periodic_bound(&self) -> bool {
+        dispatch!(self.periodic_bound())
+    }
+    fn periodic_beacon(&mut self, rssi: i8) {
+        dispatch!(self.periodic_beacon(rssi))
+    }
+    fn periodic_service(&mut self, eligible: bool) -> Result<(), Error> {
+        dispatch!(self.periodic_service(eligible))
+    }
+    fn periodic_deferred(&self) -> Result<bool, Error> {
+        dispatch!(self.periodic_deferred())
     }
 }

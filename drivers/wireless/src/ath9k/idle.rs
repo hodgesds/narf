@@ -252,9 +252,9 @@ struct Work {
 }
 static WORK: Mutex<Option<Work>> = Mutex::new(None);
 
-fn admit<P: packet::Port, E: station::Environment>(
+fn admit<P: packet::Port, E: station::Environment, K: station::Engine>(
     owner: &Owner,
-    radio: &station::Radio<P, E>,
+    radio: &station::Radio<P, E, K>,
     expected_users: u32,
 ) -> Result<(), Error> {
     if !radio.idle_admissible() {
@@ -266,8 +266,8 @@ fn admit<P: packet::Port, E: station::Environment>(
 /// One terminal boundary shared by the retained physical controller and
 /// native fixtures. Keep the counted pin, all mappings and original owner
 /// on any missing stop proof; a host withdrawal alone never releases it.
-pub(super) async fn retire_station<P: packet::Port, E: station::Environment>(
-    station: &Arc<Mutex<station::Radio<P, E>>>,
+pub(super) async fn retire_station<P: packet::Port, E: station::Environment, K: station::Engine>(
+    station: &Arc<Mutex<station::Radio<P, E, K>>>,
     counted: &mut Option<WakeGuard>,
     withdraw: impl FnOnce(),
 ) -> bool {

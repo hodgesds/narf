@@ -339,7 +339,7 @@ fn compose(
     // `channels` routes this generation's retunes to `transition`; HT40
     // requests fail closed (no AR9287 HT owner).
     let station = Arc::new(Mutex::new(station::Radio::new(
-        packet,
+        packet.into(),
         mac,
         noise,
         station::NativeEnvironment {

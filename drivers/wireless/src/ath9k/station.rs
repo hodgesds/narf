@@ -2157,4 +2157,4 @@ fn plaintext_eapol(f: &[u8]) -> bool {
 pub(super) mod tests;
 
 mod engine;
-pub(in crate::ath9k) use engine::Engine;
+pub(in crate::ath9k) use engine::{Dispatch, Engine};

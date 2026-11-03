@@ -2,8 +2,8 @@
 //! One shared retained AR9285 station for async control and synchronous stack
 //! progress. The radio supplies the actual DMA/host-close publication gate.
 use super::{
-    packet::Port,
-    station::{self, Environment, Phase, Radio},
+    packet::{Packet, Port},
+    station::{self, Engine, Environment, Phase, Radio},
 };
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,8 +39,8 @@ impl State {
         }
     }
 }
-pub(super) struct Device<P: Port, E: Environment> {
-    pub(super) radio: Arc<Mutex<Radio<P, E>>>,
+pub(super) struct Device<P: Port, E: Environment, K: Engine = Packet<P>> {
+    pub(super) radio: Arc<Mutex<Radio<P, E, K>>>,
     state: Mutex<State>,
     /// Copied scan output only; never an association/key/calibration authority.
     scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
@@ -57,7 +57,7 @@ pub(super) struct Device<P: Port, E: Environment> {
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
 }
-impl<P: Port, E: Environment> core::fmt::Debug for Device<P, E> {
+impl<P: Port, E: Environment, K: Engine> core::fmt::Debug for Device<P, E, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ar9285Device")
             .field("name", &self.name)
@@ -79,7 +79,9 @@ impl Drop for Attempt<'_> {
         }
     }
 }
-impl<P: Port + Send + 'static, E: Environment + 'static> HostClose for Device<P, E> {
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static> HostClose
+    for Device<P, E, K>
+{
     fn close(&self) {
         let _publication = self.publication.lock();
         self.closed.store(true, Ordering::Release);
@@ -87,8 +89,10 @@ impl<P: Port + Send + 'static, E: Environment + 'static> HostClose for Device<P,
         self.clear_rx();
     }
 }
-impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
-    pub(super) fn new(name: &str, radio: Arc<Mutex<Radio<P, E>>>) -> Result<Self, Error> {
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static>
+    Device<P, E, K>
+{
+    pub(super) fn new(name: &str, radio: Arc<Mutex<Radio<P, E, K>>>) -> Result<Self, Error> {
         let (own, closed, publication) = {
             let owner = radio.try_lock().ok_or(Error::Busy)?;
             (owner.local(), owner.closed(), owner.publication())
@@ -138,7 +142,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
         let _publication = self.publication.lock();
         self.publish_link(peer.filter(|_| !self.closed.load(Ordering::Acquire)));
     }
-    fn start(&self, radio: &mut Radio<P, E>) -> Result<(), Error> {
+    fn start(&self, radio: &mut Radio<P, E, K>) -> Result<(), Error> {
         if !self.admitted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
             return Err(Error::State);
         }
@@ -586,7 +590,9 @@ fn wireless(error: Error) -> WirelessError {
         _ => WirelessError::HardwareError,
     }
 }
-impl<P: Port + Send + 'static, E: Environment + 'static> Interface for Device<P, E> {
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static> Interface
+    for Device<P, E, K>
+{
     fn name(&self) -> &str {
         &self.name
     }
@@ -607,7 +613,9 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Interface for Device<P,
     }
 }
 #[async_trait::async_trait]
-impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for Device<P, E> {
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static>
+    WirelessNetIface for Device<P, E, K>
+{
     fn power_save_default(&self) -> Option<bool> {
         if self.closed.load(Ordering::Acquire) {
             return None;
@@ -812,7 +820,9 @@ pub(super) trait ChannelIface: WirelessNetIface {
     fn retune_channel(&self, frequency: u16) -> Result<super::channels::Transition, Error>;
 }
 #[async_trait::async_trait]
-impl<P: Port + Send + 'static, E: Environment + 'static> ChannelIface for Device<P, E> {
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static> ChannelIface
+    for Device<P, E, K>
+{
     fn channel_geometry(&self) -> Option<super::channel_width::Geometry> {
         self.radio.try_lock().map(|radio| radio.geometry())
     }
@@ -946,12 +956,18 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
 }
 /// Housekeeping period while MSI delivery drives RX/TX completion.
 const HOUSEKEEPING_NS: u64 = 20_000_000;
-pub(super) type Native = Device<super::packet_native::Native, station::NativeEnvironment>;
+pub(super) type Native = Device<
+    super::packet_native::Native,
+    station::NativeEnvironment,
+    station::Dispatch<super::packet_native::Native>,
+>;
 trait Endpoint: Send + Sync {
     fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
     fn drain(&self) -> bool;
 }
-impl<P: Port + Send + 'static, E: Environment + 'static> Endpoint for Device<P, E> {
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static> Endpoint
+    for Device<P, E, K>
+{
     fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         Device::enqueue(self, bytes, meta)
     }

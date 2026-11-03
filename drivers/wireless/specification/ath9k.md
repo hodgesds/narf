@@ -2197,6 +2197,17 @@ chip reset off, `AR_PHY_WATCHDOG_CTL_1` 0xffff0085 with readback);
 `ar9003_hw_disable_phy_restart` is a no-op for a fresh generation (no
 `bb_watchdog_last_status`). AR5008/AR9002 variants, readbacks and
 register streams are unchanged.
+Step 5b-3 (engine dispatch): `station::Dispatch<P>` (`station/engine.rs`)
+holds either the AR9002 `packet::Packet<P>` or the AR9003
+`ar9003::packet::Packet<P>` (boxed) and implements `station::Engine` by
+delegating every operation to the held engine's own `Engine` impl. The
+native station is `NativeRadio = station::Radio<Native, NativeEnvironment,
+Dispatch<Native>>` and `interface::Native = Device<Native,
+NativeEnvironment, Dispatch<Native>>` (`interface::Device` and the
+`idle` station helpers are generic over the engine, defaulting to the
+AR9002 packet owner for fixtures). The AR9285/AR9287/AR9280/AR5008 owners
+pass `packet.into()` (the `Ar9002` arm): behaviour and register streams
+unchanged.
 Nothing registers `0x0030`.
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB

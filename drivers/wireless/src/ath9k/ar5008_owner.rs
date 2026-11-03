@@ -466,7 +466,7 @@ fn compose(
     // `channels` routes this generation's retunes (either band) to
     // `transition`; HT40 requests fail closed (no AR5008 HT owner).
     let station = Arc::new(Mutex::new(station::Radio::new(
-        packet,
+        packet.into(),
         mac,
         noise,
         station::NativeEnvironment {

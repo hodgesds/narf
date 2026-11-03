@@ -222,7 +222,11 @@ impl Ath9k {
     }
 }
 
-type NativeRadio = station::Radio<packet_native::Native, station::NativeEnvironment>;
+type NativeRadio = station::Radio<
+    packet_native::Native,
+    station::NativeEnvironment,
+    station::Dispatch<packet_native::Native>,
+>;
 type RetainedRadio = Arc<Mutex<NativeRadio>>;
 
 struct Retained {
@@ -521,7 +525,7 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
         .use_awake(true)
         .map_err(|_| packet::Error::State)?;
     let station = Arc::new(Mutex::new(station::Radio::new(
-        packet,
+        packet.into(),
         controller.identity.mac,
         report.noise_dbm,
         station::NativeEnvironment {
