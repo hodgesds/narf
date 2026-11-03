@@ -22,6 +22,8 @@ use narf_wireless::{
 mod ap;
 #[path = "interface_monitor.rs"]
 mod monitor;
+#[path = "interface_vif.rs"]
+mod vif;
 
 struct State<R: Fullmac> {
     station: Station<R>,
@@ -33,6 +35,8 @@ struct State<R: Fullmac> {
     ap_data_generation: u64,
     ap_epoch_changed: bool,
     monitor: Option<Box<crate::brcmfmac::monitor::Session>>,
+    /// Secondary interface owner (`None` without demux or `cap`).
+    vif: Option<crate::brcmfmac::vif_owner::Owner>,
 }
 struct PendingTx {
     frame: Frame,
@@ -322,6 +326,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             .ap_source()
             .is_some_and(|source| source.current().is_ok())
     };
+    let vif = vif::discover(&mut station.runtime, station.mac).await?;
     let telemetry = Arc::new(super::telemetry::Counters::default());
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
@@ -347,6 +352,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             ap_data_generation: 0,
             ap_epoch_changed: false,
             monitor: None,
+            vif,
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
@@ -452,6 +458,8 @@ impl<R: Fullmac + 'static> Device<R> {
                 *active = None;
             }
         }
+        // brcmf_detach removes every secondary interface first.
+        vif::withdraw_family(R::FAMILY);
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
         narf_net::iface::retire_for_rebind(&self.name);
@@ -884,12 +892,14 @@ impl<R: Fullmac + 'static> Device<R> {
             } else if self.ap_mode() == 3 {
                 self.ap_worker().await;
                 self.ap_drain();
+                self.vif_worker(false).await;
             } else {
                 self.deliver_received(self.step());
                 self.apply_roam().await;
                 self.apply_external().await;
                 self.apply_power_save().await;
                 self.apply_pmksa().await;
+                self.vif_worker(true).await;
             }
             match (&wake, seen) {
                 (Some((signal, delivered)), Some(seen)) => {
@@ -1065,6 +1075,22 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     }
     fn current_iftype(&self) -> u32 {
         self.ap_mode()
+    }
+    /// Advertised only with a per-bsscfg role owner for the new interface
+    /// (none yet) and a firmware `cap` set that admits one more interface.
+    fn supports_virtual_interfaces(&self) -> bool {
+        VIF_ROLES && self.vif_composable()
+    }
+    fn new_virtual_interface(
+        &self,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if !VIF_ROLES {
+            return Err(WirelessError::NotSupported);
+        }
+        Ok(self.vif_new(name, iftype, mac)? as Arc<dyn WirelessNetIface>)
     }
     fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
         self.ap_set_mode(mode)
@@ -1513,6 +1539,8 @@ fn wireless_error(error: Error) -> WirelessError {
         _ => WirelessError::HardwareError,
     }
 }
+/// Secondary STA/AP shells carry no role owner yet (`interface_vif.rs`).
+const VIF_ROLES: bool = false;
 struct Registered<R: Fullmac>(Arc<Device<R>>);
 fn receive_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
@@ -1620,6 +1648,7 @@ mod tests {
             ap_data_generation: 0,
             ap_epoch_changed: false,
             monitor: None,
+            vif: None,
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);

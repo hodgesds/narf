@@ -1059,9 +1059,39 @@ role is registered by this owner. Three written/unexecuted cases in
 `drivers/wireless/brcmfmac/vif` (`vif_owner_tests.rs`) run over the
 scripted `fullmac_fixture`, which now implements the secondary seam.
 
+#### Secondary netdev registration/removal owner
+
+`cyw43439/interface_vif.rs` (shared by SDIO CYW43439 and PCIe BCM43602)
+is the `core.c` `brcmf_add_if`/`brcmf_net_attach`/`brcmf_remove_interface`
+host owner. At attach the primary issues `cap` and, when the transport has
+the secondary demux and the firmware answers, keeps one `vif_owner::Owner`
+(features from the actual tokens; chip 43439 or 43602 for the MBSS
+exclusion) in its state. `Device::new_virtual_interface` (STA/AP iftypes)
+admits one create at a time against `Owner::can_add`, then publishes a
+`VifDevice` (`narf_net::Interface` + `WirelessNetIface`, same wiphy as the
+primary) through `narf_net::registry().register`,
+`iface::register_with_context` and the wireless registry, carrier down.
+nl80211 NEW_INTERFACE cannot wait on the bus, so, unlike Linux (which
+registers the netdev after the 1500 ms IF ADD wait), the primary receive
+worker then runs `Owner::create` under the state mutex; the IF ADD address
+replaces the provisional MAC (`ifp->mac_addr`), `vif_open` admits the
+ifidx, and a refused/timed-out create unpublishes the shell.
+`delete_virtual_interface` hides the netdev at once and the worker runs
+`Owner::remove`; an unanswered remove still closes the ifidx data via
+`vif_close` while the owner keeps counting the firmware bsscfg. An
+unsolicited IF DEL (`pop_retired`) unpublishes the shell and polls
+`vif_close`. Removal is `iface::unregister`, never `retire_for_rebind`:
+a reset does not recreate secondary interfaces; `Device::withdraw`
+(`brcmf_detach`) unpublishes every shell of its family first. Live shells
+are pumped by the primary worker (`pop_vif_data` into the shell RX ring
+and `on_rx_frame_from`, shell TX ring into `send_vif_data` with
+`cfg80211_classify8021d` priority, one credit-blocked frame retained),
+gated on the shell carrier. No per-bsscfg role owner raises that carrier
+yet, so the shell refuses scan/join/AP and `supports_virtual_interfaces`
+stays false (`VIF_ROLES`); nothing is advertised.
+
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
-either family: a secondary netdev/`WirelessNetIface`
-registration and removal owner, per-bsscfg role
+either family: per-bsscfg role
 owners (the AP `Session` and `Station` are primary-bsscfg only), and for
 P2P the `p2p.c` discovery bsscfg (`p2p_disc`, `p2p_ifadd`/`p2p_ifdel`,
 `bsscfg:p2p_da_override`), action-frame TX/RX and GO negotiation owners.
