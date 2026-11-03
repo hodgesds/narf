@@ -99,7 +99,7 @@ impl<R: Fullmac> Station<R> {
                     .command(ioctl::Direction::Set, SET_ROAM_DELTA, &delta, 4)
                     .await?;
             }
-            set_var(&mut self.runtime, "event_msgs", &event_mask(enabled)).await
+            super::write_events(&mut self.runtime, event_mask(enabled), true).await
         }
         .await;
         self.operation = false;

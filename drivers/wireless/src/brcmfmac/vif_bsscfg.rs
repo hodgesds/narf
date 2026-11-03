@@ -223,6 +223,27 @@ impl<R: Fullmac> Fullmac for Bsscfg<'_, R> {
     /// per-ifidx AP owner.
     const SECONDARY_AP: bool = R::SECONDARY_AP;
 
+    /// This bsscfg's role owner is its own `Need::Secondary(ifidx)`; the
+    /// union stays the transport's device-wide one.
+    fn events_compose(
+        &mut self,
+        need: super::event_mask::Need,
+        events: super::event_mask::Mask,
+    ) -> super::event_mask::Mask {
+        let need = match need {
+            super::event_mask::Need::Primary => {
+                super::event_mask::Need::Secondary(self.link.entry.ifidx)
+            }
+            other => other,
+        };
+        self.runtime.events_compose(need, events)
+    }
+    fn events_written(&mut self, mask: super::event_mask::Mask) {
+        self.runtime.events_written(mask)
+    }
+    fn events_current(&mut self) -> Option<super::event_mask::Mask> {
+        self.runtime.events_current()
+    }
     fn ap_source(&self) -> Option<super::ap_source::Source> {
         if self.link.failed {
             return None;

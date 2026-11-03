@@ -933,6 +933,19 @@ where
     fn vif_listen(&mut self, on: bool) {
         self.vif.listen(on);
     }
+    fn events_compose(
+        &mut self,
+        need: super::event_mask::Need,
+        events: super::event_mask::Mask,
+    ) -> super::event_mask::Mask {
+        self.vif.event_mask().compose(need, events)
+    }
+    fn events_written(&mut self, mask: super::event_mask::Mask) {
+        self.vif.event_mask().written(mask)
+    }
+    fn events_current(&mut self) -> Option<super::event_mask::Mask> {
+        self.vif.event_mask().current()
+    }
     fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
         // The primary AP owns only interface 0's flows; a secondary ifidx
         // has its own (Linux combo0: primary AP + secondary STA).

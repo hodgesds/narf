@@ -128,7 +128,7 @@ impl<R: Fullmac> Station<R> {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        set_var(&mut runtime, "event_msgs", &roam::event_mask(false)).await?;
+        write_events(&mut runtime, roam::event_mask(false), true).await?;
         let supplicant = match get_var(&mut runtime, "sup_wpa", 4).await {
             Ok(bytes) => bytes.len() == 4,
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
@@ -1069,6 +1069,24 @@ async fn set_int<R: Fullmac>(runtime: &mut R, command: u32, value: u32) -> Resul
         .await
         .map(|_| ())
 }
+/// Declare this role owner's firmware events (`event_mask::Need::Primary`,
+/// a bsscfg view's own need) and write the device-wide union to
+/// `event_msgs`; `always` false skips a write that changes nothing. No
+/// writer sends a private mask over another owner's bits.
+pub(super) async fn write_events<R: Fullmac>(
+    runtime: &mut R,
+    events: crate::brcmfmac::event_mask::Mask,
+    always: bool,
+) -> Result<(), Error> {
+    let mask = runtime.events_compose(crate::brcmfmac::event_mask::Need::Primary, events);
+    if !always && runtime.events_current() == Some(mask) {
+        return Ok(());
+    }
+    set_var(runtime, "event_msgs", &mask).await?;
+    runtime.events_written(mask);
+    Ok(())
+}
+
 pub(super) async fn set_var<R: Fullmac>(
     runtime: &mut R,
     name: &str,

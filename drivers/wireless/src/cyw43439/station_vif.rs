@@ -5,9 +5,10 @@
 //! addressed through `brcmfmac::vif_bsscfg::Bsscfg` (`struct brcmf_if` of
 //! its own ifidx/bsscfgidx). Device-wide state the primary established at
 //! `brcmf_config_dongle` time (CLM, country, regulatory policy, bus
-//! aggregation, `roam_off`, `event_msgs`, firmware capabilities) is shared,
-//! never re-issued; per-interface state starts empty, as a freshly created
-//! firmware bsscfg is.
+//! aggregation, `roam_off`, firmware capabilities) is shared, never
+//! re-issued; per-interface state starts empty, as a freshly created
+//! firmware bsscfg is. Its events join the composed `event_msgs` union
+//! (`brcmfmac::event_mask`).
 use super::*;
 use crate::brcmfmac::vif_bsscfg::Parked;
 
@@ -123,6 +124,15 @@ impl<R: Fullmac> Station<R> {
         set_int(&mut self.runtime, ioctl::WLC_SET_PM, 0).await?;
         set_int(&mut self.runtime, SET_INFRA, 1).await?;
         set_int(&mut self.runtime, SET_AUTH, 0).await?;
+        // This bsscfg's STA events join the device-wide union; written
+        // only when they add bits (beside a primary AP, which consumes
+        // only AP events). Removal clears the need (`vif_owner::remove`).
+        write_events(
+            &mut self.runtime,
+            roam::event_mask(self.firmware_roaming),
+            false,
+        )
+        .await?;
         self.power_save = false;
         Ok(())
     }

@@ -84,6 +84,8 @@ pub(crate) struct Firmware {
     pub vif_log: Vec<(u8, Command)>,
     pub vif_sent: Vec<(u8, Vec<u8>, u8)>,
     pub vif_data: VecDeque<(u8, Vec<u8>)>,
+    /// Transport `event_msgs` composition, as the real transports keep.
+    pub event_mask: crate::brcmfmac::event_mask::Composition,
 }
 impl Firmware {
     pub fn new() -> Self {
@@ -114,6 +116,7 @@ impl Firmware {
             vif_log: Vec::new(),
             vif_sent: Vec::new(),
             vif_data: VecDeque::new(),
+            event_mask: crate::brcmfmac::event_mask::Composition::new(),
         }
     }
     /// Native `BRCMF_E_IF` (`struct brcmf_if_event`) for the secondary
@@ -348,6 +351,19 @@ impl<const PCIE: bool> Fullmac for Mock<PCIE> {
         self.fw.vendor
     }
     const VIF_DEMUX: bool = true;
+    fn events_compose(
+        &mut self,
+        need: crate::brcmfmac::event_mask::Need,
+        events: crate::brcmfmac::event_mask::Mask,
+    ) -> crate::brcmfmac::event_mask::Mask {
+        self.fw.event_mask.compose(need, events)
+    }
+    fn events_written(&mut self, mask: crate::brcmfmac::event_mask::Mask) {
+        self.fw.event_mask.written(mask)
+    }
+    fn events_current(&mut self) -> Option<crate::brcmfmac::event_mask::Mask> {
+        self.fw.event_mask.current()
+    }
     fn vif_listen(&mut self, on: bool) {
         self.fw.vif_listening = on;
         if !on {

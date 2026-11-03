@@ -572,6 +572,9 @@ impl<T: PacketTransport> Runtime<T> {
     pub fn vif_listen(&mut self, on: bool) {
         self.vif.listen(on);
     }
+    pub fn event_composition(&mut self) -> &mut crate::brcmfmac::event_mask::Composition {
+        self.vif.event_mask()
+    }
     pub fn vif_open(&mut self, if_idx: u8) -> Result<(), Error> {
         if self.failed {
             return Err(Error::Failed);

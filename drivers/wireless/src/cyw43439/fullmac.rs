@@ -227,6 +227,23 @@ pub trait Fullmac: Send {
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
         core::future::ready(Err(Error::Unsupported))
     }
+    /// Record `need`'s firmware events and return the device-wide union
+    /// every `event_msgs` writer must send (`brcmfmac::event_mask`; Linux
+    /// `brcmf_fweh_activate_events` writes the union of all registered
+    /// handlers). Transports without a composition return `events`.
+    fn events_compose(
+        &mut self,
+        _need: crate::brcmfmac::event_mask::Need,
+        events: crate::brcmfmac::event_mask::Mask,
+    ) -> crate::brcmfmac::event_mask::Mask {
+        events
+    }
+    /// A successful `event_msgs` SET carried `mask`.
+    fn events_written(&mut self, _mask: crate::brcmfmac::event_mask::Mask) {}
+    /// The mask last written, when the transport tracks it.
+    fn events_current(&mut self) -> Option<crate::brcmfmac::event_mask::Mask> {
+        None
+    }
     /// Only a station's correlated link/key lifecycle calls this method.
     /// Transport completion alone must never call it or open a controlled port.
     fn set_link(&mut self, peer: Option<[u8; 6]>);
@@ -378,6 +395,19 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     const VIF_DEMUX: bool = true;
     fn vif_listen(&mut self, on: bool) {
         Runtime::vif_listen(self, on)
+    }
+    fn events_compose(
+        &mut self,
+        need: crate::brcmfmac::event_mask::Need,
+        events: crate::brcmfmac::event_mask::Mask,
+    ) -> crate::brcmfmac::event_mask::Mask {
+        self.event_composition().compose(need, events)
+    }
+    fn events_written(&mut self, mask: crate::brcmfmac::event_mask::Mask) {
+        self.event_composition().written(mask)
+    }
+    fn events_current(&mut self) -> Option<crate::brcmfmac::event_mask::Mask> {
+        self.event_composition().current()
     }
     fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
         Runtime::vif_open(self, ifidx)

@@ -19,6 +19,7 @@
 //!
 //! The owner grants no data authority: a created interface's transport
 //! data path stays closed until its role owner calls `Fullmac::vif_open`.
+use super::event_mask::{self, Need};
 use super::vif_wire::{
     self, classify, CreateKind, Disposition, Entry, Features, IfAction, IfEvent, Registry, E_IF,
     MAX_IFS,
@@ -268,6 +269,7 @@ impl Owner {
         self.armed = Some(IfAction::Add);
         self.observed = None;
         let result: Result<Entry, Error> = async {
+            listen_events(runtime).await?;
             self.request(runtime, role, mac).await?;
             match self.wait(runtime).await? {
                 Observed::Added(entry) if !entry.p2p_device && entry.bsscfgidx != 0 => Ok(entry),
@@ -285,6 +287,9 @@ impl Owner {
             Err(error) => {
                 if !self.live() {
                     runtime.vif_listen(false);
+                    // The firmware mask keeps BRCMF_E_IF until the next
+                    // writer; only the registry's need is withdrawn.
+                    runtime.events_compose(Need::Interfaces, [0; event_mask::LEN]);
                 }
                 Err(error)
             }
@@ -375,11 +380,31 @@ impl Owner {
             }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
+        // The removed interface's role owner no longer consumes events;
+        // the union drops its bits at the next `event_msgs` write.
+        runtime.events_compose(Need::Secondary(entry.ifidx), [0; event_mask::LEN]);
         if !self.live() {
             runtime.vif_listen(false);
+            runtime.events_compose(Need::Interfaces, [0; event_mask::LEN]);
         }
         Ok(())
     }
+}
+
+/// `brcmf_fweh_activate_events` always enables `BRCMF_E_IF`; here the
+/// registry declares it while it listens, and the union is written only
+/// when it adds the bit. Withdrawal records the need without a write.
+async fn listen_events<R: Fullmac>(runtime: &mut R) -> Result<(), Error> {
+    let mask = runtime.events_compose(Need::Interfaces, event_mask::mask(&[E_IF as usize]));
+    if runtime.events_current() == Some(mask) {
+        return Ok(());
+    }
+    let input = vif_wire::bsscfg_iovar(0, b"event_msgs", &mask)?;
+    runtime
+        .command(Direction::Set, SET_VAR, &input, input.len())
+        .await?;
+    runtime.events_written(mask);
+    Ok(())
 }
 
 /// `brcmf_fil_iovar_data_get` on the primary interface.

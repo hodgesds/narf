@@ -7,6 +7,7 @@ use super::{
     ap_scope::Capture,
     ap_source::Source,
     ap_wire,
+    event_mask::{self, Need},
 };
 use crate::cyw43439::{fullmac::Fullmac, ioctl::Direction, runtime::Error};
 use alloc::vec::Vec;
@@ -336,7 +337,13 @@ impl Saved {
         set(runtime, &guard, ap_wire::SET_BEACON, self.beacon).await?;
         set(runtime, &guard, ap_wire::SET_DTIM, self.dtim).await?;
         match self.scope {
-            Scope::Primary => set_var(runtime, &guard, "event_msgs", &self.events).await?,
+            // The saved firmware mask becomes the primary need again, and
+            // live secondary owners' bits stay in the written union.
+            Scope::Primary => {
+                let mask = runtime.events_compose(Need::Primary, self.events);
+                set_var(runtime, &guard, "event_msgs", &mask).await?;
+                runtime.events_written(mask);
+            }
             // brcmf_cfg80211_stop_ap: `mbss 0` with BRCMF_FEAT_MBSS. The
             // shared event mask stays (Linux keeps every handled event).
             Scope::Secondary { mbss, .. } => {
@@ -513,19 +520,13 @@ pub(super) async fn program<R: Fullmac>(
     .await?;
     // Actual AP SME association/removal plus radio/firmware loss. No P2P
     // or extra-bsscfg namespace is created by enabling these observations.
-    // A secondary only adds these bits to the shared mask the primary owns.
-    let mut mask: [u8; 16] = if scope.primary() {
-        [0; 16]
-    } else {
-        get_var(runtime, &guard, "event_msgs", &[], 16)
-            .await?
-            .try_into()
-            .map_err(|_| Error::Malformed)?
-    };
-    for event in AP_EVENTS {
-        mask[event / 8] |= 1 << (event % 8);
-    }
+    // This AP's events replace only its own owner's need (the primary
+    // role, or the secondary bsscfg's through its view); the firmware
+    // receives the union of every live owner (`event_mask`), so a live
+    // secondary STA/AP or the interface registry keeps its bits.
+    let mask = runtime.events_compose(Need::Primary, event_mask::mask(&AP_EVENTS));
     set_var(runtime, &guard, "event_msgs", &mask).await?;
+    runtime.events_written(mask);
     *phase = Phase::BssRequested;
     command(
         runtime,

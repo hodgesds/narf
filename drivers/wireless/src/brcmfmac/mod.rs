@@ -61,6 +61,7 @@ pub mod bus;
 pub mod cfg80211;
 pub mod chip;
 pub mod connect;
+pub mod event_mask;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;

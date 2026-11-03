@@ -1194,8 +1194,9 @@ treated as absent), `mbss 1` before `SET_AP` and `mbss 0` on stop with
 `BRCMF_FEAT_MBSS`, and no `nmode`, `vhtmode` or `qtxpower` writes;
 `wsec`/`wpa_auth`/`auth`/`mfp`/`wsec_key`/`vndr_ie`/`wme_bss_disable` go
 out as bsscfg iovars. Linux never writes `event_msgs` in `start_ap`
-(fweh enables every handled event device-wide); the secondary scope only
-ORs the AP SME events into the current mask and leaves it on stop.
+(fweh enables every handled event device-wide); the secondary scope
+declares the AP SME events as its bsscfg's need in the composed mask
+(below) and leaves the firmware mask unchanged on stop.
 `Session::prepare_secondary` builds such an AP; the primary Program is
 unchanged and refuses to run through a bsscfg view (`Scope::admits`).
 
@@ -1217,10 +1218,32 @@ stop fail-stops the bsscfg and the ifidx's AP owner retires its own
 flows/TX (`ap_leave_on`) before `vif_close`. Only one AP may run: a
 secondary START is refused beside the primary or another secondary AP
 (Linux `vif->mbss` path not implemented), and a primary START is refused
-while a secondary AP runs. Known gaps: a primary station roam-policy
-change rewrites the shared `event_msgs` without the secondary AP bits;
-channel agreement with a primary STA is left to the firmware (no mchan
-scheduling).
+while a secondary AP runs. Known gap: channel agreement with a primary
+STA is left to the firmware (no mchan scheduling).
+
+#### Composed event mask
+
+The firmware has one device-wide `event_msgs` mask. Linux registers
+handlers per event in `fweh` and `fweh.c` `brcmf_fweh_activate_events`
+writes their union plus `BRCMF_E_IF`; no role writes a private mask.
+`brcmfmac::event_mask::Composition` (held in each transport's
+`vif_demux::Demux`, so a PCIe generation reset starts empty like the
+rebooted firmware) records one need per owner — `Need::Primary`
+(interface-0 role), `Need::Interfaces` (the secondary registry:
+`BRCMF_E_IF` while it listens) and `Need::Secondary(ifidx)` — and every
+`event_msgs` writer sends the union through `Fullmac::events_compose`
+and records it with `events_written`. A `vif_bsscfg::Bsscfg` view maps
+`Need::Primary` to its own `Need::Secondary(ifidx)`. Writers: station
+initialization and `set_firmware_roaming` (`station::write_events`, the
+STA events ± `BRCMF_E_ROAM`), the AP start (`AP_EVENTS`) and primary AP
+restore (`ap_native`), `vif_owner::create` (`BRCMF_E_IF`, written only
+when it adds the bit) and `Station::configure_secondary` (the secondary
+STA's events, written only when they add bits — e.g. beside a primary
+AP, whose own need holds only AP events). `vif_owner::remove` withdraws
+the removed ifidx's need (and the registry's after the last interface)
+without a write; the next writer drops those bits. A primary AP stop
+restores the firmware mask it saved at start as the primary need, so
+bits that were live then stay set until the next station write.
 
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
 either family: secondary-ifidx fixtures and advertisement, and for

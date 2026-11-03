@@ -64,6 +64,8 @@ pub struct Demux {
     events: VecDeque<Event>,
     data: VecDeque<(u8, Vec<u8>)>,
     dropped: usize,
+    /// Device-wide `event_msgs` composition (per-owner needs).
+    event_mask: super::event_mask::Composition,
 }
 
 /// Secondary event queue overflowed while an owner was listening. The
@@ -79,7 +81,12 @@ impl Demux {
             events: VecDeque::new(),
             data: VecDeque::new(),
             dropped: 0,
+            event_mask: super::event_mask::Composition::new(),
         }
+    }
+    /// The transport's `event_msgs` composition (`Fullmac::events_*`).
+    pub fn event_mask(&mut self) -> &mut super::event_mask::Composition {
+        &mut self.event_mask
     }
     /// Enable/disable secondary event retention. Disabling purges every
     /// queued secondary event; a later listener never sees stale records.
