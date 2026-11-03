@@ -45,6 +45,12 @@ pub(super) trait Interface: Io {
     async fn end(&mut self, kind: Kind) -> Result<(), Error>;
     async fn pause(&mut self) -> Result<u32, Error>;
     async fn resume(&mut self, saved: u32) -> Result<(), Error>;
+    /// core.c `__rtw89_set_channel` band change ->
+    /// coex.c `rtw89_btc_ntfy_switch_band` (no DBCC) -> `_run_coex`
+    /// (`BTC_RSN_NTFY_SWBAND`). Default: no coexistence owner.
+    async fn coex_switch_band(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Results {

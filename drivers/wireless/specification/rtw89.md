@@ -2330,9 +2330,18 @@ DPK `_dpk_rf_setting` A-band RF words, `_dpk_idl_mpa` MDPD order 2 (<80MHz),
 `tssi::band_scan` (`rtw8852b_rfk_band_changed` -> `rtw8852b_tssi_scan`:
 disable, RF setting/system/thermal/default alignment per path, enable, DE)
 after set_channel_done and before `rtw8852b_rfk_channel`. The scan never
-reloads another band's measured alignment. `rtw89_btc_ntfy_switch_band` has
-no counterpart: the one-shot WLAN-only PTA owner keeps BT arbitrated low and
-does not reprogram coex for 5GHz (open gap). RF_GET_MCCCH (non-v0 layout)
+reloads another band's measured alignment. Before that scan the band change
+runs `rfk::Interface::coex_switch_band`, the coex.c
+`rtw89_btc_ntfy_switch_band` port (8852B has no DBCC, so only
+`_run_coex(BTC_RSN_NTFY_SWBAND)`): with the owner's `dm->wl_only`,
+`_run_coex` takes `_action_wl_only` before any band/link dispatch, i.e.
+`_set_ant(FC_EXEC, BTC_ANT_WONLY)` re-executed (`coex_native::enforce`:
+LTE 0x38, 0x73 bit2, 0xc67c, each read back) and `_set_policy(OFF_BT)`
+emitting nothing (`_append_tdma`/`_append_slot` skip the unchanged
+TDMA/slot). Linux's band-specific `_action_wl_5g` (`BTC_ANT_FDD`,
+`OFF_EQ0`) applies only without `wl_only`, which needs BT link/profile
+state (BT info C2H) this WLAN-only owner does not have; that remains part of
+the separate adaptive-coex work. RF_GET_MCCCH (non-v0 layout)
 carries channels only, so it is band-independent.
 
 **Admission.** `channel_policy::admissible` accepts every typed 5GHz primary;
@@ -2394,10 +2403,10 @@ signed-admitted, a 5000MHz band listing exactly those primaries (core.c
 Association requests are checked against the same mask and the cfg80211
 frequency of the primary.
 
-Remaining before `five_ghz_operation` is whole (no row credit): coex switch-band, DFS passive scanning, and all native
-two-arch plus physical validation. New unexecuted cases:
-`smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`,
-`smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted`. New unexecuted cases:
+Remaining before `five_ghz_operation` is whole (no row credit): DFS passive
+scanning, and all native two-arch plus physical validation. New unexecuted
+cases: `smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux`,
+`smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted`,
 `smoke_rtw89_b_operating_profile_5ghz_matches_linux_indices_and_groups`,
 `smoke_rtw89_b_channel_bb_programs_5ghz_subbands_and_reads_back_chan_idx`,
 `smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary`,

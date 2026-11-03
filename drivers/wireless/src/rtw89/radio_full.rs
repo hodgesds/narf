@@ -170,9 +170,12 @@ impl Radio {
         // SAFETY: MAC/BB/RF/channel power all completed on this same owner/backend.
         unsafe { self.transition.finish(io).await }.map_err(error)?;
         if band_changed {
+            // core.c order: rtw89_btc_ntfy_switch_band, then
+            // rtw89_chip_rfk_band_changed. WLAN-only coex re-executes its
+            // fixed WONLY grant (no policy H2C; see `coex_switch_band`).
+            io.coex_switch_band().await.map_err(error)?;
             // SAFETY: same owner after this channel's MAC/BB/RF/power; TSSI
-            // configuration only. (`rtw89_btc_ntfy_switch_band` has no
-            // counterpart: the one-shot WLAN-only PTA owner keeps BT low.)
+            // configuration only.
             unsafe { tssi::band_scan(io, input.calibration, input.tracking, channel).await }
                 .map_err(error)?;
         }

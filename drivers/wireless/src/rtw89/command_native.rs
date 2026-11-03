@@ -1283,6 +1283,20 @@ impl super::rfk::Interface for Native {
         // SAFETY: same actual serialized qualified B calibration attempt.
         unsafe { self.write_rf(path, address, mask, value).await }.map_err(Into::into)
     }
+    /// `_run_coex(BTC_RSN_NTFY_SWBAND)` with `dm->wl_only` set takes
+    /// `_action_wl_only` before any band/link-mode dispatch:
+    /// `_set_ant(FC_EXEC, BTC_ANT_WONLY)` is re-executed (actual grant
+    /// writes with readback, `coex_native::enforce`) and
+    /// `_set_policy(BTC_CXP_OFF_BT)` sends nothing because `_append_tdma`/
+    /// `_append_slot` skip an unchanged TDMA/slot (policy_len 0). The
+    /// band-specific `_action_wl_5g` (`BTC_ANT_FDD`, `OFF_EQ0`) is reached only
+    /// without `wl_only`, which needs BT link state this owner never has.
+    async fn coex_switch_band(&mut self) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        super::coex_native::enforce(self)
+            .await
+            .map_err(|_| super::rfk::Error::Policy)
+    }
     async fn begin(&mut self, kind: super::rfk::Kind) -> Result<(), super::rfk::Error> {
         super::rfk::Interface::admit(self)?;
         // Linux _ntfy_wl_rfk returns immediately for IQK one-shot events:

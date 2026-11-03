@@ -345,8 +345,13 @@ fn smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan() ->
         return TestResult::Fail("initial bring-up");
     }
     let iqkch = (0x10000 + 0x9fe4) / 4;
+    // The initial owner's coex prepare already ran `_set_ant(WONLY)`.
+    if io.band_switches != 0 {
+        return TestResult::Fail("initial bring-up notified a band switch");
+    }
     for (epoch, band, primary, power) in [(2, Band::Ghz5, 120u8, &a120), (3, Band::Ghz2, 6, &g6)] {
         let starts = io.starts.len();
+        let switches = io.band_switches;
         // SAFETY: same inert retained owner with caller-closed TX.
         if complete(unsafe { radio.retune(&mut io, input(&gain, &calibration, power, &tracking)) })
             != Some(Ok(()))
@@ -363,6 +368,10 @@ fn smoke_rtw89_b_full_radio_retunes_across_bands_with_band_change_tssi_scan() ->
                 ]
         {
             return TestResult::Fail("cross-band retune did not complete every source step");
+        }
+        // core.c: rtw89_btc_ntfy_switch_band once per band change.
+        if io.band_switches != switches + 1 {
+            return TestResult::Fail("band change did not notify coex exactly once");
         }
         let a_band = band == Band::Ghz5;
         let word = io.base.words[iqkch];
