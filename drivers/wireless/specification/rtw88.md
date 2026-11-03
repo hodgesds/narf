@@ -3307,7 +3307,9 @@ SET_CONFIGURATION and xHCI contexts for the bulk-IN and every bulk-OUT pipe
 `rtl8xxxu::packet_transport::UsbIo`, `usb::Registers::power_on` and
 REG_C2HEVT (0x1a0) = 0xfd (`rtw_chip_efuse_enable`), the asynchronous USB
 EFUSE read, `Lifecycle::new(0xc821).on(Interface::Usb { vendor, product })`,
-`interface::Device::new` and `interface::publish` (`rtw8821cu`), then the
+`interface::Device::new` and `interface::publish` (`rtw8821cu`), the
+`narf_drivers::record_bound` entry `rtw88-8821cu` (`BoundKind::Net`, no PCI
+IDs; `pci.rs::probe` records `rtw88-8821ce`), then the
 `sibling.rs::Sibling::provision` stage sequence (firmware download, MAC,
 PHY, C21 calibration/operating/station with `Source::Registered`) and
 `Device::activate`, retried as `pci.rs::schedule_owner` (120 x 500 ms) while
@@ -3315,7 +3317,10 @@ the firmware image or signed records are not registered. The backend stays
 unclaimed in the attach task until an attempt's image is available.
 `rtw_usb_phy_cfg` is a no-op for 8821C (empty `usb2/usb3_param_8821c`) and
 `rtw_usb_switch_mode` does not apply to it. The unbind hook withdraws the
-shell and spawns `Lifecycle::remove`. An unprovisioned RTL8821CU (no signed
+shell and spawns `Lifecycle::remove`. `rtl8xxxu::regs::REALTEK_USB_IDS`
+still lists 0bda:c811 as an identification table (chip-family naming and the
+rtl8xxxu tests); the bind table `RTL8XXXU_USB_IDS` excludes it. An
+unprovisioned RTL8821CU (no signed
 `rtw8821cu-*` N21Q record) stops at `PhyTablesPrepared` and is never
 admitted: no station, band or TX grant is published. Written, unexecuted:
 `smoke_rtw88_usb_driver_id_table_and_endpoint_contexts`.

@@ -74,6 +74,11 @@ pub const RTL8822BU_ID: u16 = 0xB82C;
 
 /// All USB IDs carried by the Realtek vendor. Rebranded dongles use
 /// third-party vendor IDs; those appear in `REBRANDED_IDS`.
+///
+/// This is an identification table only (chip-family naming and the
+/// `rtl8xxxu` tests). It is not the bind table: `RTL8XXXU_USB_IDS` omits
+/// RTL8821CU, which `rtw88::usb_driver` binds from
+/// `rtw8821cu.c::rtw_8821cu_id_table` as Linux does.
 pub const REALTEK_USB_IDS: &[(u16, u16)] = &[
     (RTL8XXXU_VENDOR, RTL8188EU_ID),
     (RTL8XXXU_VENDOR, RTL8188EU_ID_ALT),

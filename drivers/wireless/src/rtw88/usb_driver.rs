@@ -266,6 +266,14 @@ async fn attach(device: Arc<USBDevice>) -> Result<(), Error> {
         entry.lifecycle = Some(lifecycle.clone());
     }
     interface::publish(station.clone()).map_err(|_| Error::State)?;
+    // `pci.rs::probe`'s bound-driver record (no PCI IDs on USB).
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name: alloc::string::String::from("rtw88-8821cu"),
+        kind: narf_drivers::BoundKind::Net,
+        pci_vid: None,
+        pci_did: None,
+        domain: narf_drivers::BoundKind::Net.default_domain(),
+    });
     narf_console::klog!(
         "rtw8821cu {:04x}:{:04x} {} {:?} {} bulk-out\n",
         vendor,
