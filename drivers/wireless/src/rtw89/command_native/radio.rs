@@ -453,7 +453,7 @@ impl Native {
             self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
         }
         self.channel = Some((1, owner.epoch()));
-        self.ordinary = Some(OrdinaryGrant { qualification });
+        self.ordinary = Some(OrdinaryGrant::B(qualification));
         Ok(())
     }
 }
@@ -549,7 +549,8 @@ impl Native {
             .ordinary
             .as_ref()
             .ok_or(power::Error::Terminal)?
-            .qualification
+            .b()
+            .ok_or(power::Error::Unsupported)?
             .clone();
         if !qualification.channel_allowed(profile).map_err(denied)? {
             return Err(power::Error::Unsupported);
@@ -738,7 +739,7 @@ impl Native {
     pub(super) fn full_radio_scope(&self) -> Option<Arc<radio_policy::Qualification>> {
         self.full_qualification
             .clone()
-            .or_else(|| self.ordinary.as_ref().map(|g| g.qualification.clone()))
+            .or_else(|| self.ordinary.as_ref().and_then(|g| g.b().cloned()))
     }
     pub(super) fn radio_io(&mut self) -> Result<Port<'_>, power::Error> {
         self.register_access()?;
@@ -869,7 +870,10 @@ impl Native {
     /// capability invocations (`Port`, `calibration_access`). The C
     /// WLAN-only coexistence owner (`coex_native::Coex::prepare_c`) then
     /// runs at core.c's `rtw89_btc_ntfy_init` point, before the DM init.
-    /// No ordinary grant is installed for C.
+    /// On `Ready` the C ordinary grant (`OrdinaryGrant::C`, the same
+    /// retained signed program) is installed; it carries no B companion
+    /// program (WMM/QoS/RA/HT/HE/A-MPDU/sleep/fragments), so every B-only
+    /// program accessor reports "no program" on C.
     ///
     /// # Safety
     /// Same retained Startup owner after C `prepare_radio_tables`; the outer
@@ -1003,7 +1007,16 @@ impl Native {
         if owner.state() != radio_c::State::Ready {
             return Err(power::Error::Terminal);
         }
+        // The C ordinary grant: the same signed program that admitted the
+        // whole RFK/channel recipe, rechecked now, opens ordinary TX/ACK
+        // (core.c rtw89_core_start ends with the radio Ready for mac80211).
+        let qualification = self.qualification_c.clone().ok_or(power::Error::Access)?;
+        qualification.current().map_err(denied)?;
+        if qualification.active() != profile {
+            return Err(power::Error::Access);
+        }
         self.channel = Some((profile.primary(), owner.epoch()));
+        self.ordinary = Some(OrdinaryGrant::C(qualification));
         Ok(())
     }
 }

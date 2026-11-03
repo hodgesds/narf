@@ -214,10 +214,12 @@ impl Part {
 impl Native {
     pub(in crate::rtw89) fn station_fragments_allowed(&mut self) -> Result<bool, power::Error> {
         self.ordinary_current()?;
-        self.ordinary
-            .as_ref()
-            .ok_or(power::Error::Unsupported)?
-            .qualification
+        // RTL8852C has no signed fragment companion: "no program".
+        let Some(qualification) = self.ordinary.as_ref().ok_or(power::Error::Unsupported)?.b()
+        else {
+            return Ok(false);
+        };
+        qualification
             .fragments_allowed()
             .map_err(|_| power::Error::Access)
     }
@@ -240,7 +242,8 @@ impl Native {
                 .ordinary
                 .as_ref()
                 .ok_or(power::Error::Terminal)?
-                .qualification
+                .b()
+                .ok_or(power::Error::Unsupported)?
                 .clone();
             if !qualification
                 .fragments_allowed()
@@ -298,9 +301,13 @@ impl Native {
                         .peer
                         .as_ref()
                         .is_none_or(|peer| !peer.same(&binding.peer))
-                    || native.ordinary.as_ref().is_none_or(|grant| {
-                        !Arc::ptr_eq(&grant.qualification, &binding.qualification)
-                    })
+                    || native
+                        .ordinary
+                        .as_ref()
+                        .and_then(OrdinaryGrant::b)
+                        .is_none_or(|qualification| {
+                            !Arc::ptr_eq(qualification, &binding.qualification)
+                        })
                     || native.station_runtime.monitor.is_some()
                     || native.sleep_blocked
                     || native.sleep_reset.is_some()

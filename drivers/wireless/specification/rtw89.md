@@ -3297,9 +3297,29 @@ ACH4..7, `R_AX_TXBD_RWPTR_CLR2_V1` 0x11c4, `R_AX_RXBD_RWPTR_CLR_V1`
 `smoke_rtw8852c_dma_stop_follows_haxi_v1_pci_info`,
 `smoke_rtw8852c_wow_rewind_uses_v1_rwptr_clear_registers`.
 
+**C ordinary grant (`command_native::OrdinaryGrant`).** The sealed
+ordinary RF/response grant is an enum over the B `radio_policy::Qualification`
+and `radio_policy_c::Qualification`, sharing `current`/`with_current`
+(`Native::ordinary_current`/`with_ordinary_current` dispatch on it). Every
+B companion accessor goes through `OrdinaryGrant::b()` and sees "no
+program" on C: sleep profile `None`, fragments not allowed, monitor/AP
+owner and B retune refused (`Unsupported`), `full_radio_scope` `None` (so
+HT/HE/A-MPDU/RA/A-MSDU/QoS/WMM allowances are `Unsupported` and RF
+tracking has no window). `Native::prepare_radio_c` installs
+`OrdinaryGrant::C` with the same retained program only after
+`radio_c::State::Ready` and the `RF_GET_MCCCH` V0 H2C, rechecking
+`current()` and that the active profile is the prepared one; `Native::channel`
+then reports the C primary. `Native::station_tx_current` dispatches to
+`radio_policy_c::Qualification::tx_current`, which refuses every frame on a
+DFS/NO_IR active span (C has no beacon-witness passive TX grant, so
+`station_passive_tx(Some(..))` stays `Unsupported`); the signed tuning
+emissions the record covers are still admitted by `current`. The AP
+controller and the monitor owner refuse non-B chips. B's grant, accessors
+and bytes are unchanged. Unexecuted case:
+`smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans`.
+
 Remaining for the `rtl8852c` row (no row credit): a native C retune caller
-over the admitted `N5CC` profiles,
-the C ordinary grant, `command_native`/
+over the admitted `N5CC` profiles, `command_native`/
 `startup_station` admission (B-only at `Io::station_allowed`,
 `Startup::start` assets), and native execution.
 Unexecuted new cases:

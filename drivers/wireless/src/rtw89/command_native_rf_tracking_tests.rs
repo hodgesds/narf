@@ -40,9 +40,7 @@ fn smoke_rtw8852b_periodic_dpk_native_current_program_window_and_original_owner(
         };
         let (qualification, base, tracking) =
             crate::rtw89::radio_policy::tests::rf_tracking_model(window, failure == 0);
-        f.native.ordinary = Some(OrdinaryGrant {
-            qualification: Arc::new(qualification),
-        });
+        f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
         let admission = Admission::new();
         let before = pwsf(&f);
         match failure {
@@ -81,9 +79,7 @@ fn smoke_rtw8852b_periodic_dpk_native_current_program_window_and_original_owner(
     // RF operation or manufactured DPK input; optional absence means no-op.
     let mut f = setup();
     let (qualification, _) = crate::rtw89::radio_policy::tests::revocable_model();
-    f.native.ordinary = Some(OrdinaryGrant {
-        qualification: Arc::new(qualification),
-    });
+    f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
     f.native.station_runtime.rf_tracking = None;
     let before = pwsf(&f);
     if f.native.station_rf_tracking(&Admission::new()).is_err() || pwsf(&f) != before {

@@ -36,9 +36,7 @@ fn setup(
     let (admission, peer) = crate::rtw89::lps::tests::peer();
     f.native.station_runtime.peer = Some(peer.clone());
     let (qualification, base, sleep) = radio_policy::tests::lps_model(effect);
-    f.native.ordinary = Some(OrdinaryGrant {
-        qualification: Arc::new(qualification),
-    });
+    f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
     let source = ProviderLifetime::new();
     let binding = Binding::new(peer, admission.clone(), source.observe(), 1).unwrap();
     (LpsFixture(f), binding, source, admission, base, sleep)
@@ -94,9 +92,7 @@ pub(in crate::rtw89) fn run() -> Result<(), &'static str> {
         }
     });
     let (qualification, _, _) = radio_policy::tests::lps_model(Some(effect));
-    f.0.native.ordinary = Some(OrdinaryGrant {
-        qualification: Arc::new(qualification),
-    });
+    f.0.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
     f.0.native.sleep_block(true);
     let ring = f.0.native.ring.as_ref().unwrap().as_slice().to_vec();
     let before = f.0.words[doorbell / 4];

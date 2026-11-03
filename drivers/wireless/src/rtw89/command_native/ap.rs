@@ -57,6 +57,10 @@ impl Native {
     }
     /// A fresh AP control owner for the retained factory identity.
     pub(in crate::rtw89) fn ap_controller(&self) -> Result<ApController, power::Error> {
+        // The AP role (CH9 HIQ, AP TXWD, AP CAM) is RTL8852B-only.
+        if self.chip != ChipId::Rtl8852B {
+            return Err(power::Error::Unsupported);
+        }
         self.ordinary_current()?;
         ApController::new(self.factory.as_ref().ok_or(power::Error::Unsupported)?)
             .map_err(|_| power::Error::Unsupported)

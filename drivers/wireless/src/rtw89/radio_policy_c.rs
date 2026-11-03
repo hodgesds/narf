@@ -480,6 +480,20 @@ impl Qualification {
             .map_err(|_| Error::Authority)?;
         check_envelope(&*self.policy()?, self.active_envelope()?).map(|_| ())
     }
+    /// `current` plus the frame-TX rule. A passive-only (DFS / NO_IR) span
+    /// may carry the signed calibration/tuning emissions the record covers,
+    /// but no frame: mac80211 never probes there, and RTL8852C has no
+    /// station beacon-witness passive TX grant (B's `grant_passive_tx`), so
+    /// every frame on such an active span is refused.
+    pub(super) fn tx_current(&self) -> Result<(), Error> {
+        self.authority
+            .invoke(Current)
+            .map_err(|_| Error::Authority)?;
+        if check_envelope(&*self.policy()?, self.active_envelope()?)? {
+            return Err(Error::Policy);
+        }
+        Ok(())
+    }
     /// Keep actual publication inside this exact signed capability
     /// invocation (and the active channel record's).
     pub fn with_current<T>(

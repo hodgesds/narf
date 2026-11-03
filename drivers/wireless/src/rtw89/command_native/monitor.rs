@@ -17,6 +17,10 @@ impl Native {
         desired: Arc<monitor::Desired>,
         admission: control::Admission,
     ) -> Result<(), power::Error> {
+        // The monitor owner programs RTL8852B-only RX filter/PHY state.
+        if self.chip != ChipId::Rtl8852B {
+            return Err(power::Error::Unsupported);
+        }
         self.with_ordinary_current(|native| {
             let selection = desired.snapshot();
             if selection.mode != wire::IFTYPE
@@ -129,7 +133,8 @@ impl Native {
                 self.ordinary
                     .as_ref()
                     .ok_or(power::Error::Terminal)?
-                    .qualification
+                    .b()
+                    .ok_or(power::Error::Unsupported)?
                     .clone(),
                 mode.desired.clone(),
                 mode.selection,

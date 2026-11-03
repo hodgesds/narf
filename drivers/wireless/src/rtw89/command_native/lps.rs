@@ -11,10 +11,11 @@ impl Native {
         &self,
     ) -> Result<Option<lps_wire::Profile>, power::Error> {
         self.ordinary_current()?;
-        self.ordinary
-            .as_ref()
-            .ok_or(power::Error::Access)?
-            .qualification
+        // RTL8852C has no signed sleep companion: "no program".
+        let Some(qualification) = self.ordinary.as_ref().ok_or(power::Error::Access)?.b() else {
+            return Ok(None);
+        };
+        qualification
             .sleep_profile()
             .map_err(|_| power::Error::Access)
     }

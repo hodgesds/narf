@@ -31,9 +31,7 @@ fn setup() -> (
     let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x20000).unwrap();
     f.activate().unwrap();
     let (qualification, base, companion) = radio_policy::tests::fragment_model(None);
-    f.native.ordinary = Some(OrdinaryGrant {
-        qualification: Arc::new(qualification),
-    });
+    f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
     let (admission, peer) = crate::rtw89::lps::tests::peer();
     f.native.station_runtime.peer = Some(peer);
     f.native.receive = crate::rtw89::rx_dma::tests::native_fixture();
@@ -223,9 +221,7 @@ fn fences() -> Result<(), &'static str> {
         }
     });
     let (qualification, _, _) = radio_policy::tests::fragment_model(Some(effect));
-    f.0.native.ordinary = Some(OrdinaryGrant {
-        qualification: Arc::new(qualification),
-    });
+    f.0.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
     let train =
         f.0.native
             .fragment_binding(&admission)
@@ -297,9 +293,7 @@ fn fences() -> Result<(), &'static str> {
         }
     });
     let (qualification, _, _) = radio_policy::tests::fragment_model(Some(effect));
-    late.0.native.ordinary = Some(OrdinaryGrant {
-        qualification: Arc::new(qualification),
-    });
+    late.0.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
     let train = late
         .0
         .native

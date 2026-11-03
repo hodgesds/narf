@@ -221,3 +221,41 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_channel_records_admit_exactly_their_profile_and_span
 );
+fn smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans() -> TestResult {
+    let mut q = base(authority());
+    let ch6 = Profile::new20(Band::Ghz2, 6).unwrap();
+    let dfs = Profile::new20(Band::Ghz5, 52).unwrap();
+    for profile in [ch6, dfs] {
+        let b = board(profile, profile.primary());
+        let bytes = channel_image(&q, b);
+        match Channel::from_verified(&q, b, &bytes, Some([3; 32]), authority()) {
+            Ok(record) => q.install(record),
+            Err(_) => return TestResult::Fail("exact C channel record refused"),
+        }
+    }
+    // Plain 2.4GHz spans admit frames on the base and on a noninitial record.
+    if q.tx_current().is_err() || q.select(ch6).is_err() || q.tx_current().is_err() {
+        return TestResult::Fail("C frame TX refused on a plain span");
+    }
+    // The DFS span admits the signed emissions (select/current) but no frame.
+    if q.select(dfs).is_err()
+        || q.current().is_err()
+        || !matches!(q.tx_current(), Err(Error::Policy))
+    {
+        return TestResult::Fail("C frame TX admitted on a DFS span");
+    }
+    // Back on a plain span frames are admitted again; revocation refuses.
+    let cap = q.authority;
+    if q.select(Profile::INITIAL).is_err() || q.tx_current().is_err() {
+        return TestResult::Fail("C frame TX not restored after leaving the DFS span");
+    }
+    cap.revoke();
+    if !matches!(q.tx_current(), Err(Error::Authority)) {
+        return TestResult::Fail("revoked C record admitted frame TX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans
+);

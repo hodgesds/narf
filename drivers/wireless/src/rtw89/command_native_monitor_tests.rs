@@ -9,9 +9,7 @@ pub(super) fn run() -> Result<(), &'static str> {
             Fixture::aperture(ChipId::Rtl8852B, 0x20000).map_err(|_| "native monitor RAM")?;
         f.activate().map_err(|_| "native monitor CH12")?;
         let (qualification, base) = crate::rtw89::radio_policy::tests::revocable_model();
-        f.native.ordinary = Some(OrdinaryGrant {
-            qualification: Arc::new(qualification),
-        });
+        f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
         let desired = monitor::Desired::new();
         let selected = desired
             .select(desired.snapshot(), 6)

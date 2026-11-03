@@ -196,7 +196,12 @@ impl Native {
     /// passive-only (DFS / NO_IR) active primary only a station witness
     /// grant admits a frame. Without a full-radio scope only the base
     /// 2.4GHz channel can be active, which is never passive-admitted.
+    /// RTL8852C (`radio_policy_c::Qualification::tx_current`) refuses every
+    /// frame on a DFS/NO_IR active span: it has no witness grant.
     pub(super) fn station_tx_current(&self) -> Result<(), packet::Error> {
+        if let Some(c) = self.qualification_c.as_ref() {
+            return c.tx_current().map_err(|_| packet::Error::Access);
+        }
         match self.full_radio_scope() {
             Some(qualification) => qualification
                 .tx_current()
@@ -547,7 +552,6 @@ impl control::Interface for Access<'_> {
                 .ordinary
                 .as_ref()
                 .ok_or(power::Error::Unsupported)?
-                .qualification
                 .clone();
             // A successful earlier sample is not authority for later port,
             // crypto or table MMIO. Retain the exact signed grant through the
@@ -660,7 +664,6 @@ unsafe impl packet::Port for Access<'_> {
             .ordinary
             .as_ref()
             .ok_or(packet::Error::Access)?
-            .qualification
             .clone();
         // Preserve genuine unpublished Busy separately from cap-scope failures.
         crate::rtw88::pci_park::invoke(&authority, || {
@@ -921,7 +924,7 @@ impl Native {
                 Permit::Station(admission) => admission
                     .run(|| {
                         let grant = ordinary.as_ref().ok_or(power::Error::Unsupported)?;
-                        grant.qualification.with_current(|| Ok(publication()))
+                        grant.with_current(|| Ok(publication()))
                     })
                     .map_err(|_| Error::Access)?,
                 Permit::Legacy => {
@@ -941,7 +944,8 @@ impl Native {
                     .run(|| {
                         let grant = ordinary.as_ref().ok_or(power::Error::Access)?;
                         if grant
-                            .qualification
+                            .b()
+                            .ok_or(power::Error::Unsupported)?
                             .sleep_profile()
                             .map_err(|_| power::Error::Access)?
                             .is_none()
@@ -950,7 +954,7 @@ impl Native {
                         }
                         // Preserve the inner publication error separately from
                         // cap/source failure: an actual unpublished Busy defers.
-                        grant.qualification.with_current(|| Ok(publication()))
+                        grant.with_current(|| Ok(publication()))
                     })
                     .map_err(|_| Error::Access)?,
             }

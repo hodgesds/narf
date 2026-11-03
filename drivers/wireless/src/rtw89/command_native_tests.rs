@@ -216,9 +216,7 @@ fn smoke_rtw89_native_station_control_invokes_retained_rf_grant_and_keeps_cleanu
         // Explicit inert qualification boundary, not a fabricated physical
         // radio/attach receipt. Actual Native/Access/NativeIo and typed device
         // and signed-artifact capabilities execute the real MMIO transaction.
-        f.native.ordinary = Some(OrdinaryGrant {
-            qualification: Arc::new(qualification),
-        });
+        f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
         let pending = f.native.queue.pending();
         let ring = f.native.ring.as_ref().unwrap().dma_addr().raw();
         let packet = f.native.queue.model_resource(0).unwrap().dma_addr().raw();

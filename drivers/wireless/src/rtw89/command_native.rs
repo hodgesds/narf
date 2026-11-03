@@ -65,14 +65,39 @@ pub(super) struct BasicPreflight {
 /// Sealed ordinary RF/response receipt. No value can be constructed while
 /// full BB/channel/IQK/TSSI/DPK/source-power qualification is incomplete.
 /// Basic calibration and DMA receipts cannot be converted into this type.
-struct OrdinaryGrant {
-    qualification: alloc::sync::Arc<super::radio_policy::Qualification>,
+///
+/// Chip-dispatched: RTL8852B holds the signed `N52B` v2 full program (with
+/// its WMM/QoS/RA/HT/HE/A-MPDU/sleep/fragment companions); RTL8852C holds
+/// the signed `N5CB` v2 + `N5CC` program, which carries no such companion.
+/// B-only program accessors ([`Self::b`]) therefore see "no program" on C.
+#[derive(Clone)]
+enum OrdinaryGrant {
+    B(alloc::sync::Arc<super::radio_policy::Qualification>),
+    C(alloc::sync::Arc<super::radio_policy_c::Qualification>),
 }
 impl OrdinaryGrant {
     fn current(&self) -> Result<(), super::power::Error> {
-        self.qualification
-            .current()
-            .map_err(|_| super::power::Error::Access)
+        match self {
+            Self::B(q) => q.current().map_err(|_| super::power::Error::Access),
+            Self::C(q) => q.current().map_err(|_| super::power::Error::Access),
+        }
+    }
+    /// Keep actual publication inside the chip's exact signed invocation.
+    fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::power::Error>,
+    ) -> Result<T, super::power::Error> {
+        match self {
+            Self::B(q) => q.with_current(operation),
+            Self::C(q) => q.with_current(operation),
+        }
+    }
+    /// The RTL8852B program and its companions; `None` ("no program") on C.
+    fn b(&self) -> Option<&alloc::sync::Arc<super::radio_policy::Qualification>> {
+        match self {
+            Self::B(q) => Some(q),
+            Self::C(_) => None,
+        }
     }
 }
 pub struct Native {
@@ -521,7 +546,6 @@ impl Native {
             .ordinary
             .as_ref()
             .ok_or(super::power::Error::Unsupported)?
-            .qualification
             .clone();
         let authority = self.authority;
         crate::rtw88::pci_park::invoke(&authority, || {
