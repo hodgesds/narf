@@ -4,18 +4,7 @@
 use super::super::aspm;
 use super::*;
 use narf_capabilities::Read;
-impl aspm::Port for PciIo {
-    fn write16(&self, register: u16, value: u16) -> Result<(), Error> {
-        if register & 1 != 0 {
-            return Err(Error::Access);
-        }
-        // SAFETY: the exact complete aligned word is enclosed by the
-        // current function's native PCI capability operation.
-        self.access(register, 2, || unsafe {
-            self.registers.write16(u64::from(register), value)
-        })
-    }
-}
+impl aspm::Port for PciIo {}
 impl PciIo {
     fn aspm_policy(&self, enabled: bool) -> Result<Option<u16>, Error> {
         crate::rtw88::pci_park::invoke(&self.cap, || {

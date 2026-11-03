@@ -384,6 +384,64 @@ kernel_test_in!(
     smoke_rtl8821ae_firmware_paged_download_and_selfreset
 );
 
+/// The retained one-shot firmware owner admits the 8821AE profile with its
+/// own header rule, clears CR packet gates and `REG_SYS_CFG[7]` before the
+/// `rtl8821ae_download_fw` sequence, and refuses another family's image.
+fn smoke_rtl8821ae_retained_firmware_owner_profile() -> TestResult {
+    use crate::rtlwifi::firmware_transport::{parse, Owner, Stage};
+    let normal = image(&HDR_29, 28348);
+    let mut ee = normal.clone();
+    ee[..2].copy_from_slice(&[0xe1, 0x88]);
+    if parse(crate::rtlwifi::regs::RTL_DEV_8821AE, &normal).is_err()
+        || parse(crate::rtlwifi::regs::RTL_DEV_8821AE, &ee).is_ok()
+        || parse(crate::rtlwifi::regs::RTL_DEV_8188EE, &normal).is_ok()
+    {
+        return TestResult::Fail("per-profile header dispatch");
+    }
+    let io = fw_fake(true);
+    {
+        let mut g = io.0.lock();
+        g.regs[0x100] = 0xff;
+        g.regs[0xf0] = 0xff;
+    }
+    let owner = Owner::new(io.clone(), crate::rtlwifi::regs::RTL_DEV_8821AE);
+    let info = match narf_scheduler::block_on(owner.initialize(&normal)) {
+        Ok(info) => info,
+        Err(_) => return TestResult::Fail("8821AE owner download failed"),
+    };
+    let g = io.0.lock();
+    if info.version != 0x1d
+        || info.payload != 28348 - 32
+        || owner.status().stage != Stage::Ready
+        || owner.identity().is_none()
+        || g.regs[0x100] & 0xcf != 0
+        || g.regs[0x100] & 0x30 != 0x30
+        || g.regs[0xf0] != 0x7f
+        || g.resets != 2
+        || g.pages.len() != 7
+    {
+        return TestResult::Fail("8821AE owner gates / SYS_CFG / download");
+    }
+    drop(g);
+    if narf_scheduler::block_on(owner.initialize(&normal))
+        != Err(crate::rtlwifi::firmware_transport::Error::AlreadyStarted)
+    {
+        return TestResult::Fail("8821AE owner is not one-shot");
+    }
+    let rejected = Owner::new(fw_fake(true), crate::rtlwifi::regs::RTL_DEV_8821AE);
+    if narf_scheduler::block_on(rejected.initialize(&ee))
+        != Err(crate::rtlwifi::firmware_transport::Error::Image)
+        || rejected.status().stage != Stage::Failed
+    {
+        return TestResult::Fail("8188EE image accepted by 8821AE owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_retained_firmware_owner_profile
+);
+
 // ── LLT ───────────────────────────────────────────────────────────────────
 
 struct LltModel(IrqSafeSpinLock<Vec<(u16, u32, u8)>>);

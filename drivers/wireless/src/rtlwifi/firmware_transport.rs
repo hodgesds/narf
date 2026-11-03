@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8188EE paged MMIO firmware owner; Linux rtlwifi/rtl8188ee/fw.c and efuse.c.
+//! Retained rtlwifi paged MMIO firmware owner; Linux rtlwifi/rtl8188ee/fw.c
+//! and rtl8821ae/fw.c. Profiles: RTL8188EE and RTL8821AE (normal image).
 //! PCI bus mastering remains parked. This does not install native packet rings.
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +49,10 @@ pub struct Info {
 /// Exact PCI firmware header, authenticated by the profile-selected filename.
 /// 88E1 alone cannot distinguish an EE image from an EU image.
 pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
+    if did == super::regs::RTL_DEV_8821AE {
+        // IS_FW_HEADER_EXIST_8821 plus exact RAM-code length (rtl8821ae/fw.rs).
+        return super::rtl8821ae::fw::parse(bytes);
+    }
     if did != super::regs::RTL_DEV_8188EE {
         return Err(Error::Unsupported);
     }
@@ -76,6 +81,12 @@ pub trait Io: Send + Sync {
     fn write8(&self, reg: u16, value: u8) -> Result<(), Error>;
     fn write32(&self, reg: u16, value: u32) -> Result<(), Error>;
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error>;
+    /// Exact-width 16-bit MMIO write. Profiles whose Linux sequence uses
+    /// `rtl_write_word` (RTL8821AE LLT/MAC init) require it; adapters that
+    /// cannot issue one refuse rather than splitting it into bytes.
+    fn write16(&self, _reg: u16, _value: u16) -> Result<(), Error> {
+        Err(Error::Access)
+    }
     async fn delay_us(&self, micros: u64) {
         if micros == 0 {
             narf_scheduler::yield_now().await;
@@ -206,6 +217,9 @@ impl<I: Io> Io for PacketIo<I> {
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error> {
         self.with_io(|io| io.write_bytes(reg, bytes))
     }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), Error> {
+        self.with_io(|io| io.write16(reg, value))
+    }
     async fn delay_us(&self, micros: u64) {
         self.0.io.delay_us(micros).await;
     }
@@ -238,6 +252,10 @@ impl<I: Io> Owner<I> {
     }
     pub fn status(&self) -> Status {
         *self.status.lock()
+    }
+    /// PCI device id selecting the firmware/ring profile.
+    pub fn device_id(&self) -> u16 {
+        self.did
     }
     /// The retained native adapter, for vector binding only. Register
     /// access still flows through the gated `PacketIo` continuation.
@@ -286,6 +304,18 @@ impl<I: Io> Owner<I> {
         let authority = loader
             .derive()
             .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
+        if self.did == super::regs::RTL_DEV_8821AE {
+            // rtl8821ae/sw.c fw_name, then core.c rtl_fw_do_work's
+            // alt_fw_name retry only when the primary image is absent.
+            let mut result = Err(Error::Firmware(FirmwareError::NotFound));
+            for name in super::rtl8821ae::fw::Image::Normal.names() {
+                result = self.initialize_registered_from(&authority, name).await;
+                if result != Err(Error::Firmware(FirmwareError::NotFound)) {
+                    break;
+                }
+            }
+            return result;
+        }
         self.initialize_registered_from(&authority, super::fw::FW_8188EE)
             .await
     }
@@ -300,7 +330,14 @@ impl<I: Io> Owner<I> {
         if self.started.load(Ordering::Acquire) {
             return Err(Error::AlreadyStarted);
         }
-        if self.did != super::regs::RTL_DEV_8188EE {
+        if !matches!(
+            (self.did, name),
+            (super::regs::RTL_DEV_8188EE, super::fw::FW_8188EE)
+                | (
+                    super::regs::RTL_DEV_8821AE,
+                    super::rtl8821ae::fw::FW_NORMAL | super::rtl8821ae::fw::FW_NORMAL_ALT
+                )
+        ) {
             return Err(Error::Unsupported);
         }
         let asset = crate::firmware_asset::load(authority, name, HEADER + MAX_PAYLOAD, false)
@@ -347,6 +384,9 @@ impl<I: Io> Owner<I> {
     async fn run(&self, bytes: &[u8]) -> Result<Info, Error> {
         let (info, payload) = parse(self.did, bytes)?;
         self.set(Stage::Validated, None);
+        if self.did == super::regs::RTL_DEV_8821AE {
+            return self.run_8821ae(info, payload).await;
+        }
         narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
             // Linux _rtl88ee_init_mac sets the CPU clock before firmware.
@@ -408,6 +448,36 @@ impl<I: Io> Owner<I> {
             self.io.write32(MCU, (value | 2) & !0x40)?;
             self.reset().await?;
             self.poll(0x40, Error::Start).await?;
+            Ok(info)
+        })
+        .await
+        .unwrap_or(Err(Error::Deadline))
+    }
+    /// `rtl8821ae_hw_init` firmware step with packet engines still closed.
+    /// Linux runs `_rtl8821ae_init_mac` first; here the probe has already run
+    /// the exact enable flow and the retained ring owner later performs the
+    /// LLT/ring-base part, so CR DMA/MAC TX/RX gates are cleared exactly as
+    /// for RTL8188EE (preserving PROTOCOL/SCHEDULE). Then `REG_SYS_CFG &= 0x7f`
+    /// and `rtl8821ae_download_fw`. Probe does not run
+    /// `_rtl8821ae_poweroff_adapter`, so a still-running RAM image is handled
+    /// as Linux's `mac_func_enable` case (stop + 8051 self-reset).
+    async fn run_8821ae(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
+        // FW_8821AE_POLLING_TIMEOUT_COUNT x 5 us twice plus 1000 page chunks
+        // fits well inside the EE one-second bound.
+        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+            self.set(Stage::Preparing, None);
+            let control = self.read8(0x100).await?;
+            self.io.write8(0x100, control & !0xcf)?;
+            if self.read8(0x100).await? & 0xcf != 0 {
+                return Err(Error::Gate);
+            }
+            if self.io.read32(MCU)? == u32::MAX {
+                return Err(Error::Gone);
+            }
+            let sys_cfg = self.read8(0xf0).await?;
+            self.io.write8(0xf0, sys_cfg & 0x7f)?;
+            self.set(Stage::Downloading, None);
+            super::rtl8821ae::fw::download(&self.io, payload, true).await?;
             Ok(info)
         })
         .await

@@ -471,6 +471,15 @@ impl Io for PciIo {
             self.registers.write32(u64::from(reg), value)
         })
     }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), Error> {
+        if reg & 1 != 0 {
+            return Err(Error::Access);
+        }
+        // SAFETY: aligned word extent checked inside the live invocation.
+        self.access(reg, 2, || unsafe {
+            self.registers.write16(u64::from(reg), value)
+        })
+    }
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error> {
         self.access(reg, bytes.len(), || {
             for (i, byte) in bytes.iter().enumerate() {

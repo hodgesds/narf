@@ -1469,8 +1469,22 @@ chain below is composed.
   (`rtl_tx_report_handler`), RA reports with `rtl8821ae_hw_rate_to_mrate`, and
   the `rtl_get_tx_report_sn` SW_DEFINE sequence.
 
-Remaining for the `rtl8821ae` chip row: generalizing the one-shot firmware
-owner and DMA32 ring/LLT `Prepared` owner to the 8821AE profile; the rest of
+- Retained owners, 8821AE profile — `firmware_transport::Owner` admits
+  `0x8821`: `parse` dispatches to `rtl8821ae::fw::parse`,
+  `initialize_registered` loads `rtl8821aefw_29.bin` and retries
+  `rtl8821aefw.bin` only on `NotFound` (`core.c::rtl_fw_do_work`
+  `alt_fw_name`), and the run clears CR DMA/MAC gates, applies the
+  `rtl8821ae_hw_init` `REG_SYS_CFG &= 0x7f` and runs `rtl8821ae_download_fw`
+  (a still-running RAM image is stopped as Linux's `mac_func_enable` case,
+  since probe does not run `_rtl8821ae_poweroff_adapter`). `prepare::Chip`
+  selects the linked-ring profile: shared `REG_*_DESA` map, 64-byte TX slots
+  with `next_desc_address` at dword 12 (`rtl8821ae/trx.h`), and the exact
+  `_rtl8821ae_llt_table_init` over an exact-width `Io::write16`.
+  `prepare_native::prepare_rtl8821ae` composes firmware, the one-shot packet
+  claim, DMA32 rings and LLT; EE radio qualification refuses the 8821AE
+  profile. Probe does not call it.
+
+Remaining for the `rtl8821ae` chip row: the rest of
 `_rtl8821ae_init_mac`/`rtl8821ae_hw_init` (CR/TRXDMA/RCR/queue bases, BB/RF
 enable, `rtl8821ae_phy_mac_config`/`bb_config`/`rf_config` over `headerfile`,
 power-by-rate and limit-to-index conversion, LCK/IQK `rtl8821ae_phy_iq_calibrate`),

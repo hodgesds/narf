@@ -81,6 +81,16 @@ impl Io for Port {
     fn write_bytes(&self, _: u16, _: &[u8]) -> Result<(), AccessError> {
         unreachable!()
     }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
+        let mut m = self.0.lock();
+        access(&mut m)?;
+        m.trace.push((16, reg, u32::from(value)));
+        let at = usize::from(reg);
+        if m.ignore != Some(reg) {
+            m.regs[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
+    }
     async fn delay_us(&self, _: u64) {
         let pending = self.0.lock().pending;
         if pending {
@@ -512,4 +522,79 @@ fn smoke_rtl8188ee_drive_scheduled_retries_and_terminates() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_drive_scheduled_retries_and_terminates
+);
+
+/// RTL8821AE profile of the same retained owner: next descriptor at dword 12
+/// (`rtl8821ae/trx.h`), the 8821AE LLT (`_rtl8821ae_llt_table_init`) and the
+/// shared `REG_*_DESA` publication; radio qualification stays EE-only.
+pub(crate) fn smoke_rtl8821ae_retained_rings_dw12_and_exact_llt() -> TestResult {
+    let port = Port::new();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut address = 0x10000;
+    let mut owner = Prepared::allocate_for(Chip::Rtl8821ae, port.clone(), 4, |bytes| {
+        address = (address + 255) & !255;
+        let block = Block {
+            address,
+            bytes: vec![0xa5; bytes],
+            drops: drops.clone(),
+        };
+        address += bytes as u64;
+        Ok(block)
+    })
+    .unwrap();
+    for ring in &owner.tx {
+        let base = ring.address as u32;
+        for slot in 0..4 {
+            if word(ring, slot * 64 + 48) != base + (((slot + 1) % 4) * 64) as u32
+                || word(ring, slot * 64 + 40) != 0
+            {
+                return TestResult::Fail("8821AE next-descriptor dword / cleared buffer dword");
+            }
+        }
+    }
+    if owner.chip() != Chip::Rtl8821ae
+        || Chip::from_device(0x8821) != Some(Chip::Rtl8821ae)
+        || Chip::from_device(0x8178).is_some()
+    {
+        return TestResult::Fail("8821AE ring profile selection");
+    }
+    narf_scheduler::block_on(owner.prepare()).unwrap();
+    let m = port.0.lock();
+    let llt: Vec<_> = m.trace.iter().filter(|row| row.1 == 0x1e0).collect();
+    if llt.len() != 256
+        || *llt[0] != (32, 0x1e0, 0x4000_0001)
+        || *llt[0xf6] != (32, 0x1e0, 0x4000_f6ff)
+        || *llt[255] != (32, 0x1e0, 0x4000_fff7)
+        || !m.trace.contains(&(8, 0x114, 0xf7))
+        || !m.trace.contains(&(16, 0x116, 0x3e7f))
+        || !m.trace.contains(&(32, 0x200, 0x80e6_0808))
+        || m.trace.contains(&(32, 0x200, 0x8073_0d29))
+        || !m.trace.contains(&(8, 0x214, 0))
+    {
+        return TestResult::Fail("8821AE LLT/RQPN trace differs from Linux");
+    }
+    for (at, ring) in LINUX_TX_BASES.iter().zip(&owner.tx) {
+        if !m.trace.contains(&(32, *at, ring.address as u32)) {
+            return TestResult::Fail("8821AE queue base not published");
+        }
+    }
+    if m.regs[0x301] != 255 || m.regs[0x100] & 0xcf != 0 || owner.phase() != Phase::Prepared {
+        return TestResult::Fail("8821AE preparation opened DMA gates");
+    }
+    drop(m);
+    let profile_gate = narf_scheduler::block_on(
+        owner.configure_radio(super::super::radio::Profile::gate_fixture()),
+    );
+    if profile_gate != Err(Error::State) || owner.phase() != Phase::Prepared {
+        return TestResult::Fail("EE radio tables qualified an 8821AE owner");
+    }
+    drop(owner);
+    if drops.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("published 8821AE rings freed without quiescence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8821ae_retained_rings_dw12_and_exact_llt
 );

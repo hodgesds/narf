@@ -3,9 +3,9 @@
 //! Link Control remain owned by the exact native PCI function adapter.
 use super::firmware_transport::{Error, Io};
 use core::sync::atomic::{AtomicBool, Ordering};
-pub(super) trait Port: Io {
-    fn write16(&self, register: u16, value: u16) -> Result<(), Error>;
-}
+/// Exact-width word writes use [`Io::write16`]; an adapter keeping its
+/// refusing default cannot complete the back-door sequence.
+pub(super) trait Port: Io {}
 pub(super) const CONTROL_MASK: u16 = 3 | (1 << 8);
 /// Follow only an actual enabled parent policy and endpoint capabilities.
 /// Common-clock configuration and the shared bridge are not modified here.

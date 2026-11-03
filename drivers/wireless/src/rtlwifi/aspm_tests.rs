@@ -68,6 +68,17 @@ impl Model {
 }
 #[async_trait::async_trait]
 impl Io for Model {
+    fn write16(&self, reg: u16, value: u16) -> Result<(), Error> {
+        self.current()?;
+        let mut state = self.state.lock();
+        state.writes.push(Write::Word(reg, value));
+        state.registers[usize::from(reg)..usize::from(reg) + 2]
+            .copy_from_slice(&value.to_le_bytes());
+        if reg == 0x350 {
+            state.address = value;
+        }
+        Ok(())
+    }
     fn read8(&self, reg: u16) -> Result<u8, Error> {
         self.current()?;
         Ok(self.state.lock().registers[usize::from(reg)])
@@ -141,19 +152,7 @@ impl Io for Model {
         .await;
     }
 }
-impl Port for Model {
-    fn write16(&self, reg: u16, value: u16) -> Result<(), Error> {
-        self.current()?;
-        let mut state = self.state.lock();
-        state.writes.push(Write::Word(reg, value));
-        state.registers[usize::from(reg)..usize::from(reg) + 2]
-            .copy_from_slice(&value.to_le_bytes());
-        if reg == 0x350 {
-            state.address = value;
-        }
-        Ok(())
-    }
-}
+impl Port for Model {}
 fn complete<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
     for _ in 0..128 {

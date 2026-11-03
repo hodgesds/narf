@@ -29,6 +29,15 @@ pub struct Profile {
     identity: [u8; 32],
 }
 impl Profile {
+    /// Inert profile for owner-gating fixtures; never reaches radio I/O.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn gate_fixture() -> Self {
+        Self {
+            hp: false,
+            antenna: 0,
+            identity: [0; 32],
+        }
+    }
     pub(super) fn is_hp(self) -> bool {
         self.hp
     }

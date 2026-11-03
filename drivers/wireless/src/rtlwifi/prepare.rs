@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Exact RTL8188EE linked PCI descriptor/FIFO prerequisite. Linux hw.c/trx.h.
+//! Exact linked PCI descriptor/FIFO prerequisite for the retained rtlwifi
+//! profiles (RTL8188EE, RTL8821AE). Linux rtl8188ee/ and rtl8821ae/ hw.c/trx.h.
 //! Ordinary DMA/MAC remain closed; this is below RF and station admission.
 use super::firmware_transport::{Error as AccessError, Io};
 use alloc::vec::Vec;
@@ -77,6 +78,48 @@ const TX_BASES: [u16; 7] = [
     super::rtl8188ee::REG_HQ_DESA,
 ];
 const RX_BASE: u16 = super::rtl8188ee::REG_RX_DESA;
+/// Linked-ring/LLT profile of the retained owner. Both chips use the same
+/// `REG_*_DESA` map (`rtl8188ee/reg.h`, `rtl8821ae/reg.h` 0x308..0x340),
+/// 64-byte `rtl_tx_desc` slots and 32-byte RX descriptors with the buffer at
+/// dword 6; they differ in the next-descriptor dword and the LLT layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chip {
+    Rtl8188ee,
+    Rtl8821ae,
+}
+impl Chip {
+    pub const fn from_device(did: u16) -> Option<Self> {
+        match did {
+            super::regs::RTL_DEV_8188EE => Some(Self::Rtl8188ee),
+            super::regs::RTL_DEV_8821AE => Some(Self::Rtl8821ae),
+            _ => None,
+        }
+    }
+    /// Byte offset of `set_tx_desc_next_desc_address`: 88EE dword 10,
+    /// 8821AE dword 12 (`rtl8821ae/trx.h`; its dword 10 is the buffer).
+    pub const fn next_desc_offset(self) -> usize {
+        match self {
+            Self::Rtl8188ee => 40,
+            Self::Rtl8821ae => 48,
+        }
+    }
+}
+/// Exact-width adapter for the 8821AE LLT sequence over the retained Io.
+struct LltRegs<'a, I: Io>(&'a I);
+impl<I: Io> super::rtl8821ae::llt::Regs for LltRegs<'_, I> {
+    fn read32(&self, reg: u16) -> Result<u32, AccessError> {
+        self.0.read32(reg)
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), AccessError> {
+        self.0.write8(reg, value)
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
+        self.0.write16(reg, value)
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError> {
+        self.0.write32(reg, value)
+    }
+}
 fn extent(memory: &impl Memory, needed: usize, alignment: u64) -> Result<u32, Error> {
     let base = memory.address();
     if needed == 0
@@ -92,6 +135,7 @@ fn extent(memory: &impl Memory, needed: usize, alignment: u64) -> Result<u32, Er
 }
 pub struct Prepared<I: Io, M: Memory> {
     io: I,
+    chip: Chip,
     tx: Vec<M>,
     receive: Option<M>,
     buffers: Vec<M>,
@@ -115,6 +159,15 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     /// Allocation/validation and descriptor construction precede every BAR
     /// side effect. The caller retains exclusive PCI authority with BME off.
     pub fn allocate(
+        io: I,
+        depth: usize,
+        allocate: impl FnMut(usize) -> Result<M, Error>,
+    ) -> Result<Self, Error> {
+        Self::allocate_for(Chip::Rtl8188ee, io, depth, allocate)
+    }
+    /// As [`Self::allocate`] for an explicit linked-ring profile.
+    pub fn allocate_for(
+        chip: Chip,
         io: I,
         depth: usize,
         mut allocate: impl FnMut(usize) -> Result<M, Error>,
@@ -148,10 +201,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 for word in 0..TX_BYTES / 4 {
                     ring.write32(slot * TX_BYTES + word * 4, 0)?;
                 }
-                // Linux txdesc.next_desc_address at DW10; never alias queues
-                // or use another family's TXBD count-register convention.
+                // Linux txdesc.next_desc_address (88EE DW10, 8821AE DW12);
+                // never alias queues or use another family's TXBD convention.
                 let next = base + (((slot + 1) % depth) * TX_BYTES) as u32;
-                ring.write32(slot * TX_BYTES + 40, next)?;
+                ring.write32(slot * TX_BYTES + chip.next_desc_offset(), next)?;
             }
             ring.sync();
             tx.push(ring);
@@ -175,6 +228,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         receive.sync();
         Ok(Self {
             io,
+            chip,
             tx,
             receive: Some(receive),
             buffers,
@@ -189,6 +243,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    pub fn chip(&self) -> Chip {
+        self.chip
     }
     pub fn radio_report(&self) -> Option<&super::radio::Report> {
         self.radio.as_ref()
@@ -239,7 +296,8 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     /// tables and calibration. Cancellation is terminal before the first wait;
     /// published DMA remains owned even when no report can be committed.
     pub async fn configure_radio(&mut self, profile: super::radio::Profile) -> Result<(), Error> {
-        if self.phase != Phase::Prepared {
+        // The EE radio tables/calibration cannot qualify another profile.
+        if self.phase != Phase::Prepared || self.chip != Chip::Rtl8188ee {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
@@ -312,6 +370,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         Ok(())
     }
     async fn llt(&self) -> Result<(), Error> {
+        if self.chip == Chip::Rtl8821ae {
+            // Exact rtl8821ae/hw.c::_rtl8821ae_llt_table_init.
+            return super::rtl8821ae::llt::init(&LltRegs(&self.io)).map_err(|e| match e {
+                AccessError::Deadline => Error::LltTimeout,
+                e => Error::Access(e),
+            });
+        }
         // Exact _rtl88ee_llt_table_init: TX0..170 ends atff; 171..175
         // forms the reserved ring. This is 0xab/0xaf, not 0xe0/0xff.
         self.io.write8(0x214, 1)?;

@@ -1,4 +1,5 @@
-//! Private retained RTL8188EE LLT/descriptor continuation, with PCI BME off.
+//! Private retained RTL8188EE/RTL8821AE LLT/descriptor continuation, with
+//! PCI BME off.
 use super::{
     firmware_native::PciIo,
     firmware_transport::{Owner, PacketIo},
@@ -124,6 +125,7 @@ impl super::prepare::packet::Port for PacketIo<PciIo> {
 /// authority; no independently reconstructed BAR or device can be substituted.
 /// Dropping/failing this call never makes the claim available to another owner.
 pub(super) fn allocate(owner: Arc<Owner<PciIo>>, depth: usize) -> Result<NativePrepared, Error> {
+    let chip = super::prepare::Chip::from_device(owner.device_id()).ok_or(Error::State)?;
     let port = owner.claim_packet_io()?;
     let mut blocks = alloc::vec::Vec::new();
     // Collect the exact allocation shape before moving the unique port into
@@ -141,7 +143,7 @@ pub(super) fn allocate(owner: Arc<Owner<PciIo>>, depth: usize) -> Result<NativeP
         blocks.push(Coherent(port.with_io(|io| io.allocate_dma(bytes))?));
     }
     let mut blocks = blocks.into_iter();
-    Prepared::allocate(port, depth, |_| blocks.next().ok_or(Error::Memory))
+    Prepared::allocate_for(chip, port, depth, |_| blocks.next().ok_or(Error::Memory))
 }
 
 pub(super) type Retained = narf_lib::mutex::Mutex<Option<NativePrepared>>;
@@ -151,6 +153,23 @@ pub(super) type Retained = narf_lib::mutex::Mutex<Option<NativePrepared>>;
 /// cancellation releases the async guard while retaining the terminal owner.
 pub(super) use super::prepare::retain_and_prepare as prepare_retained;
 
+/// RTL8821AE retained continuation up to `Prepared`: registry firmware
+/// (`rtl8821aefw_29.bin`, then `rtl8821aefw.bin`), the one-shot packet claim,
+/// DMA32 rings and the exact 8821AE LLT. Radio/MAC/station admission are not
+/// reachable for this profile yet; probe does not call this.
+pub(super) async fn prepare_rtl8821ae(
+    firmware: Arc<Owner<PciIo>>,
+    retained: Arc<Retained>,
+) -> Result<(), Error> {
+    if firmware.device_id() != super::regs::RTL_DEV_8821AE
+        || firmware.status().stage != super::firmware_transport::Stage::Detected
+    {
+        return Err(Error::State);
+    }
+    firmware.initialize_registered().await?;
+    let prepared = allocate(firmware, 128)?;
+    prepare_retained(&retained, prepared).await
+}
 pub(super) async fn initialize_registered(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
@@ -165,6 +184,9 @@ pub(super) async fn initialize_registered_on_channel(
     channel: u8,
 ) -> Result<(), Error> {
     if !(1..=11).contains(&channel) {
+        return Err(Error::State);
+    }
+    if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);
     }
     let profile = super::radio::Profile::from_factory(&factory).map_err(Error::Radio)?;
