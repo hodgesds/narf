@@ -24,6 +24,20 @@ struct Hardware {
     control_reads: usize,
     fail_control_at: Option<usize>,
     now: u64,
+    /// Display-power holds currently outstanding, holds ever granted,
+    /// register accesses made with none outstanding, and a refusal knob.
+    held: u32,
+    holds: u32,
+    unpowered: u32,
+    refuse_power: bool,
+}
+/// The fixture's display-power hold: counted while alive.
+#[derive(Debug)]
+struct Hold(Arc<IrqSafeSpinLock<Hardware>>);
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.0.lock().held -= 1;
+    }
 }
 #[derive(Clone, Debug)]
 struct Panel(Arc<IrqSafeSpinLock<Hardware>>);
@@ -57,6 +71,10 @@ impl Panel {
             control_reads: 0,
             fail_control_at: None,
             now: 1000,
+            held: 0,
+            holds: 0,
+            unpowered: 0,
+            refuse_power: false,
         })))
     }
     fn set(&self, address: u32, value: u8) {
@@ -128,6 +146,9 @@ impl Panel {
 impl MmioWindow for Panel {
     fn read32(&self, reg: u64) -> u32 {
         let mut hw = self.0.lock();
+        if hw.held == 0 {
+            hw.unpowered += 1;
+        }
         if reg == crate::intel_gpu_edp::PP_CONTROL {
             hw.control_reads += 1;
             if hw.fail_control_at == Some(hw.control_reads) {
@@ -141,6 +162,9 @@ impl MmioWindow for Panel {
     }
     fn write32(&self, reg: u64, value: u32) {
         let mut hw = self.0.lock();
+        if hw.held == 0 {
+            hw.unpowered += 1;
+        }
         if !hw.authorized || !hw.d0 {
             return;
         }
@@ -160,6 +184,16 @@ impl MmioWindow for Panel {
     }
 }
 impl PanelAccess for Panel {
+    type Power = Hold;
+    fn power(&self) -> Result<Hold, AuxError> {
+        let mut hw = self.0.lock();
+        if hw.refuse_power {
+            return Err(AuxError::ShortReply);
+        }
+        hw.held += 1;
+        hw.holds += 1;
+        Ok(Hold(self.0.clone()))
+    }
     fn available(&self) -> bool {
         panel_live(self)
     }
@@ -590,4 +624,75 @@ fn smoke_intel_aux_backlight_deferred_worker_retry_and_interior_pps_loss() -> Te
 kernel_test_in!(
     "drivers/gpu/intel_gpu_aux",
     smoke_intel_aux_backlight_deferred_worker_retry_and_interior_pps_loss
+);
+
+fn smoke_intel_aux_backlight_every_register_access_holds_display_power() -> TestResult {
+    let _registry = Registry::save();
+    let panel = Panel::new(true, 12);
+    // Probe, registration replay, a level change, a readback, suspend
+    // through T9 and relight preparation: every AUX transaction, route
+    // probe and PPS access must sit inside a display-power hold (on
+    // display 14 a DC_off reference: AUX_A is a DC_off domain).
+    let owner = owner(&panel);
+    if owner.register() != Ownership::Owner {
+        return TestResult::Fail("the fixture panel must be elected");
+    }
+    owner.requested.store(876, Ordering::Release);
+    run(owner.process());
+    if owner.current_brightness() != 876 {
+        return TestResult::Fail("the level change must complete");
+    }
+    let mut suspend = Box::pin(owner.suspend_complete());
+    let _ = suspend
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
+    if run(suspend).is_err() {
+        return TestResult::Fail("suspend must complete through T9");
+    }
+    if owner.prepare_relight().is_err() {
+        return TestResult::Fail("relight preparation must succeed");
+    }
+    {
+        let hw = panel.0.lock();
+        if hw.unpowered != 0 {
+            return TestResult::Fail("a panel register was accessed without display power");
+        }
+        if hw.held != 0 {
+            return TestResult::Fail("a display-power hold outlived its conversation");
+        }
+        if hw.holds == 0 || hw.wires.is_empty() {
+            return TestResult::Fail("the conversation must have reached the panel");
+        }
+    }
+    // Admitted relight replay and PPS gate reopen, also under holds.
+    if owner.resume().is_err() {
+        return TestResult::Fail("resume must admit the prepared relight");
+    }
+    run(owner.process());
+    {
+        let hw = panel.0.lock();
+        if hw.unpowered != 0 {
+            return TestResult::Fail("relight touched a register without display power");
+        }
+        if hw.regs.get(&0xc7204).copied().unwrap_or(0) & 4 == 0 {
+            return TestResult::Fail("relight must reopen the PPS backlight gate");
+        }
+    }
+    narf_drivers_backlight::unregister_backlight(NAME);
+    // A refused hold (DC states could not be exited) is unavailability:
+    // probe refuses before any register, AUX wire or PPS access.
+    let panel = Panel::new(false, 8);
+    panel.0.lock().refuse_power = true;
+    if Vesa::probe(NAME, Channel(panel.clone())).is_ok() {
+        return TestResult::Fail("probe must refuse without display power");
+    }
+    let hw = panel.0.lock();
+    if hw.unpowered != 0 || !hw.writes.is_empty() || !hw.wires.is_empty() || hw.control_reads != 0 {
+        return TestResult::Fail("a refused hold must leave the panel untouched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_aux",
+    smoke_intel_aux_backlight_every_register_access_holds_display_power
 );

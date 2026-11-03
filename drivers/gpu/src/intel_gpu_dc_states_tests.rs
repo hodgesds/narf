@@ -628,26 +628,12 @@ fn smoke_dc_states_arm_gates_refuse() -> TestResult {
         return TestResult::Fail("an unowned enabled pipe DMC must refuse re-entry");
     }
     fake.set(MTL_PIPEDMC_CONTROL, 0);
-    for (gates, block) in [
-        (
-            ArmGates {
-                aux_owner_unreferenced: true,
-                external_route_active: false,
-            },
-            ArmBlock::AuxOwnerUnreferenced,
-        ),
-        (
-            ArmGates {
-                aux_owner_unreferenced: false,
-                external_route_active: true,
-            },
-            ArmBlock::ExternalRoute,
-        ),
-    ] {
-        let due = release(&core, &fake);
-        if core.lock().arm_if_due(&fake, due, gates) != Err(block) {
-            return TestResult::Fail("an external gate must refuse re-entry");
-        }
+    let due = release(&core, &fake);
+    let gates = ArmGates {
+        external_route_active: true,
+    };
+    if core.lock().arm_if_due(&fake, due, gates) != Err(ArmBlock::ExternalRoute) {
+        return TestResult::Fail("a live external route must refuse re-entry");
     }
     // Out of D0: refused, nothing written.
     let due = release(&core, &fake);

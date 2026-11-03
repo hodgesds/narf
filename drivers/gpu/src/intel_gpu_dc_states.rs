@@ -60,22 +60,21 @@
 //!   suspend reference. A firmware, parse or verification failure is
 //!   latched and the Init reference is kept: DC0, wells up.
 //! - KMS sessions (flips, cursor, color, DSB, console restore,
-//!   recovery), legacy PM guards, the MTL modeset and PSR scanout
-//!   notifications take a reference for their whole hardware
-//!   conversation.
+//!   recovery, format refresh), legacy PM guards, the MTL modeset, PSR
+//!   scanout notifications and every full-AUX panel-backlight
+//!   conversation (AUX transaction, PPS gate, relight step) take a
+//!   reference for their whole hardware conversation.
 //! - System suspend preparation takes a Suspend reference first, and
 //!   after the display has quiesced disables the DMC program; the
 //!   first publication after resume reloads it before releasing.
 //!
 //! Stricter than the pinned tree, and why: re-entry is refused (not
 //! merely warned about) with the utility pin in PWM mode, with a pipe
-//! DMC enabled that this driver did not load, while the full-AUX panel
-//! backlight owner is installed (its AUX transport takes no DC_off
-//! reference yet, and AUX_A is a DC_off domain), while an external
-//! route is live, after any `DC_STATE_EN` write failed to stick, and
-//! whenever the main program no longer verifies. DC3CO and DC9 are
-//! never targeted. Program loss found at re-entry is repaired by a
-//! reload before the next attempt.
+//! DMC enabled that this driver did not load, while an external route
+//! is live, after any `DC_STATE_EN` write failed to stick, and whenever
+//! the main program no longer verifies. DC3CO and DC9 are never
+//! targeted. Program loss found at re-entry is repaired by a reload
+//! before the next attempt.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -198,8 +197,11 @@ pub enum DcUser {
     Psr = 4,
     /// System suspend preparation through the post-resume reload.
     Suspend = 5,
+    /// One full-AUX panel-backlight conversation (AUX transaction, PPS
+    /// gate, relight step): AUX_A is a DC_off domain on display 14.
+    Aux = 6,
 }
-const USER_COUNT: usize = 6;
+const USER_COUNT: usize = 7;
 
 /// Why a DC transition could not be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,9 +254,6 @@ pub enum ProgramState {
 /// Inputs to the re-entry decision that live outside this module.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArmGates {
-    /// The full-AUX panel backlight owner is installed; its AUX
-    /// transport does not take DC_off references.
-    pub aux_owner_unreferenced: bool,
     /// An external display route is live on this function.
     pub external_route_active: bool,
 }
@@ -277,8 +276,6 @@ pub enum ArmBlock {
     ProgramLost,
     /// The allowed mask admits no target.
     NoTarget,
-    /// See [`ArmGates::aux_owner_unreferenced`].
-    AuxOwnerUnreferenced,
     /// See [`ArmGates::external_route_active`].
     ExternalRoute,
     /// A pipe DMC is enabled that this driver never loaded.
@@ -516,9 +513,6 @@ impl DcCore {
         }
         if self.target == DC_STATE_DISABLE {
             return Err(ArmBlock::NoTarget);
-        }
-        if gates.aux_owner_unreferenced {
-            return Err(ArmBlock::AuxOwnerUnreferenced);
         }
         if gates.external_route_active {
             return Err(ArmBlock::ExternalRoute);
@@ -784,7 +778,6 @@ static SERVICE: IrqSafeSpinLock<Option<Arc<DcService>>> = IrqSafeSpinLock::new(N
 impl DcService {
     fn gates(&self) -> ArmGates {
         ArmGates {
-            aux_owner_unreferenced: crate::intel_dpcd_bl::installed(&self.bar),
             external_route_active: !crate::intel_gpu::external_routes_stopped(&self.bar),
         }
     }

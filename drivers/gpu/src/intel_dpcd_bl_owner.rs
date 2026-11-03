@@ -30,6 +30,13 @@ const FREQUENCY: u32 = 0x728;
 /// The transport boundary retains current PCI authority, D0 and the owned
 /// live Pipe-A internal-panel route. Unavailable MMIO never resembles zero.
 trait PanelAccess: MmioWindow + Send {
+    /// Display power for one panel conversation. On display 14 this is a
+    /// DC_off reference: AUX_A is a DC_off domain (`xelpd_pwdoms_dc_off`)
+    /// and i915 holds the AUX power domain across every transfer
+    /// (`intel_dp_aux_xfer`). Held around each AUX transaction, PPS gate
+    /// access, availability probe and relight step; never across a wait.
+    type Power;
+    fn power(&self) -> Result<Self::Power, AuxError>;
     fn available(&self) -> bool;
     fn now(&self) -> u64 {
         narf_time::monotonic_ns()
@@ -76,6 +83,14 @@ fn panel_live(io: &impl MmioWindow) -> bool {
         && control & 1 != 0
 }
 impl PanelAccess for Physical {
+    type Power = crate::intel_gpu_dc_states::DcRef;
+    fn power(&self) -> Result<Self::Power, AuxError> {
+        crate::intel_gpu_dc_states::acquire_for_bar(
+            &self.bar,
+            crate::intel_gpu_dc_states::DcUser::Aux,
+        )
+        .map_err(|_| AuxError::ShortReply)
+    }
     fn available(&self) -> bool {
         self.bar.len >= 0xc7210
             && self.powered()
@@ -135,6 +150,8 @@ impl<M: PanelAccess> AuxChannel for Channel<M> {
         request: &AuxRequest<'_>,
         reply: &'a mut [u8],
     ) -> Result<AuxResponse<'a>, AuxError> {
+        // DC states exited before the first AUX/route read, held to the end.
+        let _power = self.0.power()?;
         if !self.0.available() {
             return Err(AuxError::ShortReply);
         }
@@ -157,8 +174,14 @@ trait ControlledChannel: AuxChannel + Send {
     fn prepare_relight(&self) -> Result<u64, AuxError>;
     fn finish_relight(&self, deadline: u64) -> Result<(), AuxError>;
 }
+// Every method that reaches registers holds the panel's display power for
+// exactly its own conversation; `now`/`wait` touch no hardware. A refused
+// hold reads as unavailable/not-closed: nothing is accessed.
 impl<M: PanelAccess> ControlledChannel for Channel<M> {
     fn available(&self) -> bool {
+        let Ok(_power) = self.0.power() else {
+            return false;
+        };
         self.0.available()
     }
     fn now(&self) -> u64 {
@@ -168,21 +191,30 @@ impl<M: PanelAccess> ControlledChannel for Channel<M> {
         self.0.wait(deadline)
     }
     fn close_gate(&self) -> Result<u64, AuxError> {
+        let _power = self.0.power()?;
         self.0.close_gate()
     }
     fn gate_open(&self) -> bool {
+        let Ok(_power) = self.0.power() else {
+            return false;
+        };
         let control = self.0.read32(crate::intel_gpu_edp::PP_CONTROL);
-        self.available() && control != u32::MAX && control & 4 != 0
+        self.0.available() && control != u32::MAX && control & 4 != 0
     }
     fn gate_closed(&self) -> bool {
+        let Ok(_power) = self.0.power() else {
+            return false;
+        };
         let control = self.0.read32(crate::intel_gpu_edp::PP_CONTROL);
         control != u32::MAX && control & 4 == 0
     }
     fn prepare_relight(&self) -> Result<u64, AuxError> {
+        let _power = self.0.power()?;
         self.0.prepare_relight()
     }
     fn finish_relight(&self, deadline: u64) -> Result<(), AuxError> {
-        if !self.available() {
+        let _power = self.0.power()?;
+        if !self.0.available() {
             return Err(AuxError::ShortReply);
         }
         crate::intel_gpu_edp::finish_aux_backlight_relight(&self.0, deadline, self.now())
