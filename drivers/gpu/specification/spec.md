@@ -2663,10 +2663,14 @@ inert elsewhere):
 - The full-AUX panel-backlight transport (`PanelAccess::power`) holds a
   reference for each AUX transaction, availability probe, PPS gate access and
   relight step; a refused reference reads as unavailable.
-- `acquire_for_bar(bar, DcUser::ExternalRoute)` is held by an external route
-  owner from activation until its stop is verified, which blocks DC
-  re-entry. `DcUser::Hotplug` covers each HPD pass and each connect-time
-  AUX/PHY probe.
+- External outputs join in two ways. Each hardware pass holds one
+  `acquire(DcUser::External)` reference: `Err` means DC states could not be
+  exited, so the pass runs nothing. `register_external_live(Some(pred))`
+  installs a liveness predicate, replacing (and returning) any previous one.
+  The predicate is evaluated only by the re-entry task and must not touch
+  registers. While it reports true, re-entry is refused with
+  `ArmBlock::ExternalRoute`. An owner may instead hold
+  `DcUser::ExternalRoute` for a route's lifetime.
 
 `intel_gpu_stolen` decodes display-14 DSM (`layout` from GGC,
 `STOLEN_RESERVED`, the media `GSCPSMI_BASE`, BAR2 and PCI BSM). It excludes

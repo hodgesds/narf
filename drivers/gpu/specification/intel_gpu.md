@@ -3422,7 +3422,7 @@ that state:
 | PSR enable / KMS inhibit / dirty notify | Enable runs at probe before the service exists, in firmware DC0. Inhibit runs inside a `Guard` takeover or recovery. Notify holds a reference. |
 | PWM backlight | Unreachable: `backlight_supported()` is Gen12-only. |
 | Full-AUX backlight | Fixed in this slice: reference per AUX transaction, availability probe, PPS gate access and relight step. The earlier "owner installed" re-entry gate is removed. |
-| HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. External admission is Gen12-only, and the bridge takes `legacy()`. Display-14 external routes and HPD (integrated from the outputs lane) must hold `DcUser::ExternalRoute` for the route lifetime and `DcUser::Hotplug` per HPD or probe pass. |
+| HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. External admission is Gen12-only, and the bridge takes `legacy()`. Display-14 external routes and HPD (integrated from the outputs lane) take one `DcUser::External` reference per hardware pass (their `with_dc_off` bracket) and register a liveness predicate with `register_external_live`, which refuses re-entry while a route is live or quarantined. |
 | Frame-counter, scanline and pipe-status reads | Under `Guard`, the modeset reference or the format-refresh reference. |
 | Format discovery (GETPLANE, IN_FORMATS) | `publish_console_formats` runs under Init at install, under `LegacyGuard` on console replacement, and under the publication-refresh reference. |
 | debugfs / sysfs readers | No debugfs. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
@@ -3478,12 +3478,12 @@ Refused and remaining work:
   DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
   at suspend, DC3CO, pipe DMC programs, and display stepping.
 
-Twenty-seven native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc`
+Twenty-eight native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc`
 there are four:
 `smoke_xelpdp_dmc_parse_skips_pipe_programs`,
 `smoke_xelpdp_dmc_parse_refusals`, `smoke_xelpdp_dmc_load_conversation` and
 `smoke_xelpdp_dmc_disable_and_geometry`. In
-`drivers/gpu/intel_gpu_dc_states` there are fourteen:
+`drivers/gpu/intel_gpu_dc_states` there are fifteen:
 `smoke_dc_states_register_facts_pinned`,
 `smoke_dc_states_write_stick_discipline`,
 `smoke_dc_states_init_held_until_program_loaded`,
@@ -3496,7 +3496,7 @@ there are four:
 `smoke_dc_states_arm_gates_refuse`,
 `smoke_dc_states_firmware_authority_refusal`,
 `smoke_dc_states_reference_inert_without_service`,
-`smoke_dc_states_audit_unreachable_display_paths_on_mtl` and `smoke_dc_states_external_route_guard_blocks_reentry`. In `drivers/gpu/intel_gpu_stolen` there are two: `smoke_stolen_discovery_decodes_pinned_fields` and `smoke_stolen_cfb_avoids_boot_fb_wopcm_and_gsc`. In `drivers/gpu/intel_gpu_fbc` there are six: `smoke_fbc_display14_eligibility_and_console_refusal`, `smoke_fbc_cfb_geometry_and_compression_limit`, `smoke_fbc_enable_activate_nuke_conversation`, `smoke_fbc_flush_nukes_on_flip_and_dirtyfb`, `smoke_fbc_disabled_before_console_reclaim_suspend_and_reset` and `smoke_fbc_inherited_enable_untouched_and_refused`. In
+`smoke_dc_states_audit_unreachable_display_paths_on_mtl`, `smoke_dc_states_external_route_guard_blocks_reentry` and `smoke_dc_states_external_pass_bracket_and_live_predicate`. In `drivers/gpu/intel_gpu_stolen` there are two: `smoke_stolen_discovery_decodes_pinned_fields` and `smoke_stolen_cfb_avoids_boot_fb_wopcm_and_gsc`. In `drivers/gpu/intel_gpu_fbc` there are six: `smoke_fbc_display14_eligibility_and_console_refusal`, `smoke_fbc_cfb_geometry_and_compression_limit`, `smoke_fbc_enable_activate_nuke_conversation`, `smoke_fbc_flush_nukes_on_flip_and_dirtyfb`, `smoke_fbc_disabled_before_console_reclaim_suspend_and_reset` and `smoke_fbc_inherited_enable_untouched_and_refused`. In
 `drivers/gpu/intel_gpu_aux` there is one:
 `smoke_intel_aux_backlight_every_register_access_holds_display_power`. These
 are register-model fixtures. The physical KMS, modeset, publication, suspend

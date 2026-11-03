@@ -743,12 +743,12 @@ fn smoke_dc_states_external_route_guard_blocks_reentry() -> TestResult {
     }
     // HPD passes inside a live route neither exit nor schedule anything.
     for t in 1..4 {
-        if c.get(&fake, DcUser::Hotplug) != Ok(()) || c.put(DcUser::Hotplug, t).is_some() {
+        if c.get(&fake, DcUser::External) != Ok(()) || c.put(DcUser::External, t).is_some() {
             return TestResult::Fail("a hotplug pass inside a live route must not schedule");
         }
     }
     // A stray hotplug release can never release the route.
-    if c.put(DcUser::Hotplug, 5).is_some() || c.refs(DcUser::ExternalRoute) != 1 {
+    if c.put(DcUser::External, 5).is_some() || c.refs(DcUser::ExternalRoute) != 1 {
         return TestResult::Fail("an unbalanced hotplug release must not end the route");
     }
     // The live route blocks re-entry regardless of the defensive gate.
@@ -768,11 +768,11 @@ fn smoke_dc_states_external_route_guard_blocks_reentry() -> TestResult {
     if c.arm_if_due(&fake, due, ArmGates::default()) != Ok(DC_STATE_EN_UPTO_DC6) {
         return TestResult::Fail("DC6 must re-enter after the route stopped");
     }
-    // Hotplug pass with no route: exit, then re-entry after the pass.
-    if c.get(&fake, DcUser::Hotplug) != Ok(()) || fake.get(DC_STATE_EN) & 3 != 0 {
+    // An external pass with no route: exit, then re-entry after the pass.
+    if c.get(&fake, DcUser::External) != Ok(()) || fake.get(DC_STATE_EN) & 3 != 0 {
         return TestResult::Fail("a hotplug pass must exit DC states first");
     }
-    if c.put(DcUser::Hotplug, 20 * MS) != Some(20 * MS + DC_REENABLE_DELAY_NS) {
+    if c.put(DcUser::External, 20 * MS) != Some(20 * MS + DC_REENABLE_DELAY_NS) {
         return TestResult::Fail("a hotplug pass must release like any user");
     }
     TestResult::Pass
@@ -780,6 +780,90 @@ fn smoke_dc_states_external_route_guard_blocks_reentry() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_dc_states",
     smoke_dc_states_external_route_guard_blocks_reentry
+);
+
+static FAKE_ROUTE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn fake_route_live() -> bool {
+    FAKE_ROUTE_LIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The shape of the outputs lane's `with_dc_off(f)` bracket: one
+/// `DcUser::External` reference per hardware pass; a refused DC exit runs
+/// nothing.
+fn fake_with_dc_off<R>(
+    core: &IrqSafeSpinLock<DcCore>,
+    regs: &Fake,
+    now: u64,
+    f: impl FnOnce() -> R,
+) -> Result<(R, Option<u64>), DcError> {
+    core.lock().get(regs, DcUser::External)?;
+    let result = f();
+    let due = core.lock().put(DcUser::External, now);
+    Ok((result, due))
+}
+
+fn smoke_dc_states_external_pass_bracket_and_live_predicate() -> TestResult {
+    use core::sync::atomic::Ordering;
+    const TC1_PHY: u64 = 0x16F200;
+    let previous = register_external_live(Some(fake_route_live));
+    let gates = || ArmGates {
+        external_route_active: external_live(),
+    };
+    let fake = Fake::default();
+    let core = armed(&fake);
+    // Activation pass: DC exit precedes the first PHY write; the route is
+    // live afterwards.
+    fake.clear_log();
+    let activated = fake_with_dc_off(&core, &fake, 10 * MS, || {
+        fake.write32(TC1_PHY, 1);
+        FAKE_ROUTE_LIVE.store(true, Ordering::Release);
+    });
+    let Ok(((), Some(due))) = activated else {
+        let _ = register_external_live(previous);
+        return TestResult::Fail("an activation pass must run and release");
+    };
+    if fake.log().first() != Some(&(DC_STATE_EN, 0)) || fake.log().last() != Some(&(TC1_PHY, 1)) {
+        let _ = register_external_live(previous);
+        return TestResult::Fail("DC exit must precede the pass's first register write");
+    }
+    // Between passes the live route refuses re-entry, writing nothing.
+    fake.clear_log();
+    if core.lock().arm_if_due(&fake, due, gates()) != Err(ArmBlock::ExternalRoute)
+        || !fake.log().is_empty()
+    {
+        let _ = register_external_live(previous);
+        return TestResult::Fail("a live external route must refuse DC re-entry");
+    }
+    // Stop pass: the route goes down inside the bracket; its release
+    // re-evaluates and DC6 re-enters.
+    let stopped = fake_with_dc_off(&core, &fake, 30 * MS, || {
+        FAKE_ROUTE_LIVE.store(false, Ordering::Release);
+    });
+    let Ok(((), Some(due))) = stopped else {
+        let _ = register_external_live(previous);
+        return TestResult::Fail("a stop pass must run and release");
+    };
+    if core.lock().arm_if_due(&fake, due, gates()) != Ok(DC_STATE_EN_UPTO_DC6) {
+        let _ = register_external_live(previous);
+        return TestResult::Fail("DC6 must re-enter once the route stopped");
+    }
+    // A refused DC exit runs nothing and reports a typed error.
+    fake.dc_never_stick.set(true);
+    let mut ran = false;
+    let refused = fake_with_dc_off(&core, &fake, 40 * MS, || ran = true);
+    fake.dc_never_stick.set(false);
+    let restored = register_external_live(previous);
+    if !matches!(refused, Err(DcError::DidNotStick { .. })) || ran {
+        return TestResult::Fail("a failed DC exit must refuse the pass before it runs");
+    }
+    if restored.is_none() || (previous.is_none() && external_live()) {
+        return TestResult::Fail("the predicate registry must replace and restore");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dc_states",
+    smoke_dc_states_external_pass_bracket_and_live_predicate
 );
 
 fn smoke_dc_states_audit_unreachable_display_paths_on_mtl() -> TestResult {

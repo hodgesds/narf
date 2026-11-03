@@ -206,9 +206,11 @@ pub enum DcUser {
     /// `POWER_DOMAIN_DC_OFF` around every PHY message-bus transaction:
     /// while this reference lives, DC5/DC6 are never re-entered.
     ExternalRoute = 7,
-    /// One hotplug/HPD service pass, or one external AUX or PHY
-    /// transaction outside a held route (probe, connect, disconnect).
-    Hotplug = 8,
+    /// One external-output hardware pass: HPD poll/handle, probe, Type-C
+    /// connect/disconnect, activate, stop, release, service pass or
+    /// teardown. A route that stays live between passes is reported by the
+    /// registered liveness predicate ([`register_external_live`]).
+    External = 8,
 }
 const USER_COUNT: usize = 9;
 
@@ -263,10 +265,9 @@ pub enum ProgramState {
 /// Inputs to the re-entry decision that live outside this module.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArmGates {
-    /// A pre-existing (Gen12-model) DP/HDMI/MST session is live on this
-    /// function. Defensive only: an external route owner must hold a
-    /// [`DcUser::ExternalRoute`] reference for its lifetime, which blocks
-    /// re-entry by itself (`ArmBlock::Busy`) whatever this reports.
+    /// An external route is live or quarantined: the predicate registered
+    /// with [`register_external_live`] reports it, or a pre-existing
+    /// (Gen12-model) DP/HDMI/MST session is not stopped.
     pub external_route_active: bool,
 }
 
@@ -790,9 +791,30 @@ static SERVICE: IrqSafeSpinLock<Option<Arc<DcService>>> = IrqSafeSpinLock::new(N
 impl DcService {
     fn gates(&self) -> ArmGates {
         ArmGates {
-            external_route_active: !crate::intel_gpu::external_routes_stopped(&self.bar),
+            external_route_active: !crate::intel_gpu::external_routes_stopped(&self.bar)
+                || external_live(),
         }
     }
+}
+
+/// The registered external-output liveness predicate (display 14).
+static EXTERNAL_LIVE: IrqSafeSpinLock<Option<fn() -> bool>> = IrqSafeSpinLock::new(None);
+
+/// Register (or, with `None`, clear) the predicate that reports an
+/// external route as live or quarantined; returns the previous one. It is
+/// evaluated only from the re-entry task, with no lock of this module
+/// held, and must not touch registers or block. The integrator registers
+/// the outputs lane's route state, e.g.
+/// `register_external_live(Some(|| route_live() || !routes_stopped()))`.
+pub fn register_external_live(predicate: Option<fn() -> bool>) -> Option<fn() -> bool> {
+    core::mem::replace(&mut *EXTERNAL_LIVE.lock(), predicate)
+}
+
+/// Whether the registered predicate reports a live external route.
+/// The predicate runs after the registry lock is released.
+pub fn external_live() -> bool {
+    let predicate = *EXTERNAL_LIVE.lock();
+    predicate.is_some_and(|live| live())
 }
 
 /// A held `DC_off` reference. Dropping it releases the reference and,
@@ -866,15 +888,21 @@ pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
 
 /// [`acquire`] for the service of exactly this BAR.
 ///
-/// External outputs and hotplug (display 14): a route owner calls this
-/// with [`DcUser::ExternalRoute`] before its first route register access
-/// (PHY message bus, DDI, transcoder, AUX) and keeps the returned
-/// reference in its session until the route's stop is verified; dropping
-/// it is the "route stopped" signal that lets DC5/DC6 re-enter 17 ms
-/// later. HPD service passes and connect-time AUX/PHY probes take a
-/// short [`DcUser::Hotplug`] reference around their register accesses.
-/// `Err` means DC states could not be exited: touch nothing and report
-/// the port unavailable.
+/// External outputs and hotplug (display 14) join through two hooks:
+///
+/// - Every external hardware pass takes one [`DcUser::External`]
+///   reference before its first register access (PHY message bus, DDI,
+///   transcoder, AUX, HPD) and drops it when the pass ends:
+///   `let _dc = acquire(DcUser::External).map_err(..)?; f()`.
+///   `Err` means DC states could not be exited: run nothing and report the
+///   port unavailable.
+/// - Liveness between passes is a predicate registered once with
+///   [`register_external_live`]; while it reports true, DC5/DC6 re-entry
+///   is refused (`ArmBlock::ExternalRoute`). The pass that stops a route
+///   releases its reference afterwards, which re-evaluates re-entry.
+///
+/// An owner that prefers a held reference instead may keep a
+/// [`DcUser::ExternalRoute`] reference for the route's lifetime.
 pub(crate) fn acquire_for_bar(bar: &narf_bus::MmioRegion, user: DcUser) -> Result<DcRef, DcError> {
     take(service_for(bar), user)
 }
