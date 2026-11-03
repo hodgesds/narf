@@ -676,3 +676,32 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8822b",
     smoke_rtw8822be_n2bp_n2bs_records_bind_board_and_factory_limits
 );
+
+/// `rtw8822b_txagc_swing_offset` arithmetic over `default_ofdm_index`.
+fn smoke_rtw8822be_pwr_track_swing_offset_follows_linux() -> TestResult {
+    use super::super::tracking8822b::{swing_offset, Tracker};
+    let cases = [
+        ((3i8, 10u8, 24u8), (3u8, 24u8)),
+        ((12, 5, 24), (5, 31)),
+        ((20, 0x20, 24), (15, 29)), // max_tx_pwr_idx_offset 0xf
+        ((30, 2, 24), (2, 34)),     // swing_upper_bound default + 10
+        ((-5, 10, 24), (0, 19)),
+        ((-30, 10, 24), (0, 0)), // swing_lower_bound 0
+        ((5, 0, 36), (0, 36)),   // RTW_TXSCALE_SIZE - 1
+    ];
+    for ((delta, offset, default), expected) in cases {
+        if swing_offset(delta, offset, default) != expected {
+            return TestResult::Fail(
+                "8822B txagc/swing offset differs from rtw8822b_txagc_swing_offset",
+            );
+        }
+    }
+    if Tracker::new(25, 24).delta_power() != [0, 0] {
+        return TestResult::Fail("8822B power tracker initial delta differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8822b",
+    smoke_rtw8822be_pwr_track_swing_offset_follows_linux
+);

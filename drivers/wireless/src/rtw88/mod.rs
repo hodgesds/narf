@@ -96,6 +96,7 @@ pub use rejoin::{rejoin_function, Error as RejoinError};
 mod rx_ba;
 mod rx_ba_power;
 mod tracking8821c;
+mod tracking8822b;
 pub use tracking8821c::Request as PowerTrackingRequest;
 mod tx_ba;
 mod tx_ba_power;

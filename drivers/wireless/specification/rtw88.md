@@ -471,9 +471,24 @@ is the 128-byte `N21S` layout with B22 magic/header (antenna 56, ceiling 58,
 ordinary/automatic-response/complete-program peaks 60/62/64, thermal 66/67 that
 must be exactly 0/63, `US` 68, zero 70..128); `Grant::invoke` nests the `N2BQ`,
 `N2BP` and `N2BS` source invocations and current policy. The decoder and
-preflight exist; the B22 awake station radio program, `rtw8822b_pwr_track`,
-the station shell and packet path are not ported yet, so the chain ends at
+preflight exist; the B22 awake station radio program, the station shell and
+packet path are not ported yet, so the chain ends at
 `Stage::Operating8821cPrepared`. No board's `N2BP`/`N2BS` asset is provisioned.
+
+`tracking8822b::Tracker::pass` ports `rtw8822b_pwr_track` (type 0):
+alternating RF42[17:16] trigger and RF-A meter sample, `DECLARE_EWMA(thermal,
+10, 4)` average, `rtw_phy_pwrtrack_thermal_changed`/`_get_delta`/`_get_pwridx`
+over the `rtw8822b_pwr_track_type0_tbl` 2.4 GHz rows (CCK tables for DESC_RATE
+≤ 11M), one meter (path A) for both paths, `rtw8822b_pwrtrack_set` with the
+signed `N2BP` per-path per-rate index in place of `rtw_phy_get_tx_power_index`
+(`offset = 0x3f − index`), `rtw8822b_txagc_swing_offset` (max offset 0xf,
+`default_ofdm_index + 10` upper bound) and the 0xc94/0xe94[29:25] and
+0xc1c/0xe1c[31:21] `rtw8822b_txscale_tbl` writes inside `N2BQ` + `N2BP` +
+policy. An erased meter or a rate outside the measured legacy set is refused
+before any write, as is a sample outside the measured windows;
+`rtw_phy_pwrtrack_need_iqk` (threshold 8) is reported to the caller, which
+must run `rtw8822b_do_iqk` under its own record. No B22 dm watchdog drives it
+yet (no station runtime).
 
 ### RTL8821CE retained firmware, PHY and qualified calibration continuation
 
