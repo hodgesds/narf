@@ -63,6 +63,10 @@ pub struct Device {
     /// control plane (bit 63 = associated, low 48 bits = BSSID LE). Lets a
     /// CONNECT to a different BSS of the same ESS be routed as a roam.
     bssid: AtomicU64,
+    /// The multi-link view of the current association when CONNECT
+    /// carried NL80211_ATTR_MLO_SUPPORT (`associate_mlo`); cleared by
+    /// every new association or roam attempt.
+    mlo_report: IrqSafeSpinLock<Option<narf_wireless::MloConnection>>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: [IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>; 4],
 }
@@ -339,6 +343,7 @@ impl Device {
             pnvm: parsed.api.pnvm.map(|bytes| bytes.to_vec()),
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
+            mlo_report: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(None),
             tx: core::array::from_fn(|_| IrqSafeSpinLock::new(None)),
         }))
@@ -1355,7 +1360,20 @@ impl Device {
         request: AssociateRequest,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), WirelessError> {
+        self.associate_links(request, domain, false).await
+    }
+
+    /// A fresh station association. `mlo` is cfg80211's
+    /// `CONNECT_REQ_MLO_SUPPORT`: only then are further affiliated links
+    /// of the AP MLD requested and the connection reported as MLO.
+    async fn associate_links(
+        &self,
+        request: AssociateRequest,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        mlo: bool,
+    ) -> Result<(), WirelessError> {
         use super::connection::AuthMethod;
+        *self.mlo_report.lock() = None;
         let client_role = (self.current_iftype() == 8).then(|| self.ap_host.role.lock().observe());
         let auth = match request.security {
             narf_wireless::SecurityConfig::Open => AuthMethod::Open,
@@ -1429,10 +1447,12 @@ impl Device {
                     .map_err(|_| WirelessError::HardwareError)?,
             ))
             .map_err(|_| WirelessError::HardwareError)?;
-        // A fresh station association requests every other affiliated
-        // link of the same AP MLD seen in the latest scan; the native owner
-        // then admits or drops each one (a P2P client never does MLO).
-        let further = if client.is_none() {
+        // An MLO-permitted station association requests every other
+        // affiliated link of the same AP MLD seen in the latest scan; the
+        // native owner then admits or drops each one (a P2P client never
+        // does MLO). Without CONNECT_REQ_MLO_SUPPORT the driver "shall
+        // disable MLO features": no further link is requested.
+        let further = if client.is_none() && mlo {
             super::sc_mlo_assoc::scan_candidates(
                 &beacon,
                 &state.beacons,
@@ -1466,6 +1486,9 @@ impl Device {
         .await
         {
             Ok(connection) => {
+                if mlo {
+                    *self.mlo_report.lock() = connection.mlo_report();
+                }
                 state.connection = Some(connection);
                 if self.install_station_policy(&mut state).is_err() {
                     self.stop_locked(&mut state).await;
@@ -1830,6 +1853,32 @@ impl WirelessNetIface for Device {
         // The driver runs the SAE exchange and the AKM-SAE 4-way handshake
         // in-kernel (WPA3-Personal), so nl80211 advertises SAE_OFFLOAD.
         true
+    }
+    /// mld/mac80211.c `iwl_mac_hw_set_wiphy`: WIPHY_FLAG_SUPPORTS_MLO when
+    /// the NVM enables 11be (here: the admitted native EHT PHY, which the
+    /// multiple-link request path requires).
+    fn supports_mlo(&self) -> bool {
+        self.phy.eht
+    }
+    /// mld/mac80211.c `iwl_mac_hw_set_wiphy` station `ext_capab[0]` on an
+    /// 11be NVM: IWL_MLD_EMLSR_CAPA as EML capabilities, exactly what the
+    /// native multiple-link request carries. NARF negotiates neither
+    /// TID-to-link mapping nor link reconfiguration and has no UHR ML power
+    /// management, so IWL_MLD_CAPA_OPS / EXT_MLD_CAPA bits are 0, and no
+    /// Extended Capabilities bit (ext_capa_base) is claimed because the
+    /// native request carries no Extended Capabilities element.
+    fn iftype_extended_capabilities(&self) -> Vec<narf_wireless::IftypeExtendedCapability> {
+        if !self.supports_mlo() {
+            return Vec::new();
+        }
+        alloc::vec![narf_wireless::IftypeExtendedCapability {
+            iftype: 2, // NL80211_IFTYPE_STATION
+            capabilities: Vec::new(),
+            mask: Vec::new(),
+            eml_capabilities: narf_wireless::association::mlo::EmlCapabilities::INTEL_MLD_LOCAL.0,
+            mld_capa_and_ops: 0,
+            ext_mld_capa_and_ops: 0,
+        }]
     }
     fn reports_disconnect_events(&self) -> bool {
         true
@@ -2284,6 +2333,26 @@ impl WirelessNetIface for Device {
         self.link_up().then(|| self.cached_bssid()).flatten()
     }
 
+    async fn associate_mlo(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        // A P2P client (iftype 8) never does MLO.
+        if self.current_iftype() != 2 {
+            return self.associate(request).await;
+        }
+        let domain =
+            narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::HardwareError)?;
+        self.associate_links(request, &domain, true).await
+    }
+
+    fn mlo_connection(&self) -> Option<narf_wireless::MloConnection> {
+        // Only while the association link it describes is the carrier.
+        let current = self.connected_bssid()?;
+        self.mlo_report.lock().clone().filter(|mlo| {
+            mlo.links
+                .iter()
+                .any(|link| link.link_id == mlo.assoc_link_id && link.bssid == current)
+        })
+    }
+
     async fn roam(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         if self.current_iftype() != 2 {
             return Err(WirelessError::Busy);
@@ -2305,6 +2374,8 @@ impl WirelessNetIface for Device {
             return Err(WirelessError::Busy);
         }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        // A roam reassociates over one link: no MLO view survives it.
+        *self.mlo_report.lock() = None;
         // Roaming requires an existing association to reassociate away from.
         let Some(old) = state.connection.take() else {
             return Err(WirelessError::InvalidArgs);

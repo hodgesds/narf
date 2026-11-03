@@ -70,6 +70,59 @@ pub struct IftypeExtendedCapability {
     pub iftype: u32,
     pub capabilities: Vec<u8>,
     pub mask: Vec<u8>,
+    /// `wiphy_iftype_ext_capab::eml_capabilities` (EML Capabilities
+    /// subfield of the Basic MLE this interface type requests with).
+    /// Emitted as `NL80211_ATTR_EML_CAPABILITY` only on a wiphy that
+    /// reports [`WirelessNetIface::supports_mlo`].
+    pub eml_capabilities: u16,
+    /// `mld_capa_and_ops` (`NL80211_ATTR_MLD_CAPA_AND_OPS`), likewise only
+    /// on an MLO wiphy.
+    pub mld_capa_and_ops: u16,
+    /// `ext_mld_capa_and_ops` (`NL80211_ATTR_EXT_MLD_CAPA_AND_OPS`), on an
+    /// MLO wiphy and only when non-zero.
+    pub ext_mld_capa_and_ops: u16,
+}
+
+/// The operating channel of one MLO link (`struct cfg80211_chan_def` as
+/// `nl80211_send_chandef` reports it). `width` is an
+/// `enum nl80211_chan_width` value (20_NOHT=0, 20=1, 40=2, 80=3, 160=5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkChannel {
+    pub frequency_mhz: u32,
+    pub width: u32,
+    pub center_freq1_mhz: u32,
+    /// Zero when the width has no second segment.
+    pub center_freq2_mhz: u32,
+}
+
+/// One requested link of a multi-link station connection
+/// (`cfg80211_connect_resp_params::links[]`, then `wdev->links[]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MloLink {
+    pub link_id: u8,
+    /// Our affiliated STA's link address (`links[id].addr`).
+    pub address: [u8; 6],
+    /// The affiliated AP's BSSID (`links[id].bssid`).
+    pub bssid: [u8; 6],
+    /// The association response's status for this link: 0 for an accepted
+    /// (valid) link, else the per-STA profile status code.
+    pub status: u16,
+    /// The negotiated operating channel of an accepted link.
+    pub channel: Option<LinkChannel>,
+}
+
+/// A connected multi-link (MLO) station: what cfg80211 learns from
+/// `cfg80211_connect_done` with `valid_links` (sme.c
+/// `__cfg80211_connect_result`). `links` names every requested link,
+/// association link included, in ascending link-id order; rejected links
+/// carry their non-zero status and are reported only by the CONNECT event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MloConnection {
+    /// The AP MLD MAC address (`ap_mld_addr`, the station's peer address).
+    pub ap_mld: [u8; 6],
+    /// The link the association exchange ran on (`sta->deflink.link_id`).
+    pub assoc_link_id: u8,
+    pub links: Vec<MloLink>,
 }
 
 /// Wiphy-wide Extended Capabilities (`NL80211_ATTR_EXT_CAPA` and its mask).
@@ -606,6 +659,28 @@ pub trait WirelessNetIface: Interface {
     /// driver may offload the PSK 4-way handshake without doing SAE.
     fn supports_sae_offload(&self) -> bool {
         false
+    }
+
+    /// `WIPHY_FLAG_SUPPORTS_MLO`: the station side can associate as a
+    /// non-AP MLD over several links (GET_WIPHY `NL80211_ATTR_MLO_SUPPORT`).
+    fn supports_mlo(&self) -> bool {
+        false
+    }
+
+    /// CONNECT carrying `NL80211_ATTR_MLO_SUPPORT` (`CONNECT_REQ_MLO_SUPPORT`):
+    /// userspace handles MLD links, so the driver may request further links
+    /// of the selected BSS's AP MLD. Without it the driver "shall disable
+    /// MLO features for the current association" and nl80211 calls
+    /// [`associate`](Self::associate). The default ignores the permission.
+    async fn associate_mlo(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        self.associate(req).await
+    }
+
+    /// The current multi-link connection made through
+    /// [`associate_mlo`](Self::associate_mlo), if any. `None` for every
+    /// non-MLO association, whose peer is [`connected_bssid`](Self::connected_bssid).
+    fn mlo_connection(&self) -> Option<MloConnection> {
+        None
     }
 
     /// Driver emits nl80211 link-loss notifications, including local teardown.

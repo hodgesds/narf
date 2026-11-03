@@ -77,6 +77,10 @@ pub struct Connection {
     mld: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
     /// Accepted further links (valid; at most one also active).
     mld_links: Vec<super::sc_mlo_assoc::ValidLink>,
+    /// Requested further links the AP refused: (link id, own link
+    /// address, AP link BSSID, per-STA profile status), reported by the
+    /// MLO CONNECT event (`cfg80211_connect_resp_params::links[].status`).
+    mld_rejected: Vec<(u8, [u8; 6], [u8; 6], u16)>,
     /// The AP MLD's EML capabilities and medium sync delay from the
     /// association response Basic MLE (mlme.c `vif->cfg.eml_cap`).
     ap_eml: Option<narf_wireless::association::mlo::EmlCapabilities>,
@@ -221,6 +225,7 @@ impl Connection {
             six: None,
             mld: None,
             mld_links: Vec::new(),
+            mld_rejected: Vec::new(),
             ap_eml: None,
             ap_med_sync: None,
             emlsr: super::sc_emlsr::Emlsr::default(),
@@ -822,6 +827,7 @@ impl Connection {
             six,
             mld,
             mld_links: Vec::new(),
+            mld_rejected: Vec::new(),
             ap_eml: None,
             ap_med_sync: None,
             emlsr: super::sc_emlsr::Emlsr::default(),
@@ -963,6 +969,7 @@ impl Connection {
             this.ap_med_sync = mle.and_then(|mle| mle.medium_sync_delay());
         }
         let mut valid_links = Vec::new();
+        let mut rejected = Vec::new();
         let mut link_security = Vec::new();
         let candidate_rsnxe: Vec<_> = further
             .iter()
@@ -998,6 +1005,13 @@ impl Connection {
                     accepted: link.accepted(),
                 });
                 if !link.accepted() {
+                    rejected.push((
+                        link.link_id(),
+                        link.context().own_link(),
+                        link.context().peer_link(),
+                        // WLAN_STATUS_UNSPECIFIED_FAILURE if no code.
+                        link.status().filter(|code| *code != 0).unwrap_or(1),
+                    ));
                     continue;
                 }
                 // mlme.c fails the association when an accepted link
@@ -1020,6 +1034,7 @@ impl Connection {
                 .with_further_links(link_security)?;
         }
         this.mld_links = valid_links;
+        this.mld_rejected = rejected;
         if let Some(mld) = &this.mld {
             // mlme.c ieee80211_assoc_success: a response TTLM must already
             // be in effect and map a valid link; the rest are dormant.
@@ -2533,6 +2548,55 @@ impl Connection {
         core::mem::take(&mut self.emlsr.cqm_beacon_loss)
     }
 
+    /// The public multi-link view of this association (sme.c
+    /// `__cfg80211_connect_result` with `valid_links`): the AP MLD, the
+    /// association link and every requested further link in link-id
+    /// order, accepted ones with their negotiated chandef and rejected
+    /// ones with their status. `None` for a non-MLD association.
+    pub fn mlo_report(&self) -> Option<narf_wireless::MloConnection> {
+        let mld = self.mld.as_ref()?;
+        let association = mld.association();
+        let mut links = alloc::vec![narf_wireless::MloLink {
+            link_id: association.spec_link,
+            address: association.own_link,
+            bssid: association.peer_link,
+            status: 0,
+            channel: Some(link_channel(
+                self.beacon.band,
+                self.beacon.channel,
+                &self.phy
+            )),
+        }];
+        for valid in &self.mld_links {
+            links.push(narf_wireless::MloLink {
+                link_id: valid.link_id(),
+                address: valid.context.own_link(),
+                bssid: valid.context.peer_link(),
+                status: 0,
+                channel: Some(link_channel(
+                    valid.beacon.band,
+                    valid.beacon.channel,
+                    valid.negotiated_phy(),
+                )),
+            });
+        }
+        for (link_id, address, bssid, status) in &self.mld_rejected {
+            links.push(narf_wireless::MloLink {
+                link_id: *link_id,
+                address: *address,
+                bssid: *bssid,
+                status: *status,
+                channel: None,
+            });
+        }
+        links.sort_unstable_by_key(|link| link.link_id);
+        Some(narf_wireless::MloConnection {
+            ap_mld: mld.context.peer_mld(),
+            assoc_link_id: association.spec_link,
+            links,
+        })
+    }
+
     /// The accepted further links' MLD Link IDs (valid links).
     pub fn mld_valid_links(&self) -> u16 {
         self.mld_links
@@ -3878,6 +3942,39 @@ pub(super) fn host_channel_power(
         power = Some(power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
     }
     covering.then_some(power).flatten()
+}
+
+/// `struct cfg80211_chan_def` of a link from its negotiated native PHY:
+/// legacy mode is 20_NOHT, else the TLC width (20/40/80/160 MHz) around
+/// the negotiated centre channel. No puncturing or 320 MHz is negotiated.
+fn link_channel(
+    band: super::native_band::Band,
+    primary: u8,
+    phy: &super::ht_vht::Negotiated,
+) -> narf_wireless::LinkChannel {
+    use super::native_band::Channel;
+    let frequency_mhz = Channel {
+        band,
+        number: primary,
+    }
+    .frequency();
+    let (width, center) = match phy.width {
+        _ if phy.mode == 0 => (0, primary),
+        0 => (1, primary),
+        1 => (2, phy.center),
+        2 => (3, phy.center),
+        _ => (5, phy.center),
+    };
+    narf_wireless::LinkChannel {
+        frequency_mhz,
+        width,
+        center_freq1_mhz: Channel {
+            band,
+            number: center,
+        }
+        .frequency(),
+        center_freq2_mhz: 0,
+    }
 }
 
 /// Every occupied 20 MHz subchannel and the full spectral span must be

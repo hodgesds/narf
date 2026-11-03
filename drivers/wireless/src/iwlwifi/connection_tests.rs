@@ -62,6 +62,7 @@ fn connection() -> Connection {
         six: None,
         mld: None,
         mld_links: Vec::new(),
+        mld_rejected: Vec::new(),
         ap_eml: None,
         ap_med_sync: None,
         emlsr: super::super::sc_emlsr::Emlsr::default(),
@@ -626,4 +627,41 @@ fn smoke_connection_native_addba_response_completion_precedes_reorder_admission(
 kernel_test_in!(
     "drivers/wireless/iwlwifi/connection",
     smoke_connection_native_addba_response_completion_precedes_reorder_admission
+);
+
+/// The public MLO view: a non-MLD association has none, and each link's
+/// chandef maps the negotiated native width as cfg80211 encodes it.
+fn smoke_iwl_mld_mlo_report_and_link_chandef() -> TestResult {
+    use super::super::native_band::Band;
+    if connection().mlo_report().is_some() {
+        return TestResult::Fail("non-MLD association reported MLO links");
+    }
+    let phy = |mode, width, center| super::super::ht_vht::Negotiated {
+        mode,
+        width,
+        center,
+        ..Default::default()
+    };
+    let cases = [
+        (Band::Two, 6, phy(0, 0, 6), (2437, 0, 2437)),
+        (Band::Two, 6, phy(1, 1, 8), (2437, 2, 2447)),
+        (Band::Five, 36, phy(2, 2, 42), (5180, 3, 5210)),
+        (Band::Five, 36, phy(3, 3, 50), (5180, 5, 5250)),
+        (Band::Six, 5, phy(3, 0, 5), (5975, 1, 5975)),
+    ];
+    for (band, primary, negotiated, (freq, width, center)) in cases {
+        let channel = link_channel(band, primary, &negotiated);
+        if channel.frequency_mhz != freq
+            || channel.width != width
+            || channel.center_freq1_mhz != center
+            || channel.center_freq2_mhz != 0
+        {
+            return TestResult::Fail("MLO link chandef mapping");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/connection",
+    smoke_iwl_mld_mlo_report_and_link_chandef
 );

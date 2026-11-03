@@ -408,6 +408,7 @@ fn smoke_nl80211_connect_publication_replacement_suppresses_old_port_authorized(
             cred: Credential::Psk(Zeroizing::new([0x11; 32])),
             ie: Vec::new(),
             owner: None,
+            mlo: false,
         }
     ));
     let mut cx = Context::from_waker(Waker::noop());

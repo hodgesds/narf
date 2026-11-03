@@ -2424,16 +2424,25 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
                 iftype: 0,
                 capabilities: common.clone(),
                 mask: common,
+                eml_capabilities: 0,
+                mld_capa_and_ops: 0,
+                ext_mld_capa_and_ops: 0,
             },
             IftypeExtendedCapability {
                 iftype: 2, // NL80211_IFTYPE_STATION
                 capabilities: station.clone(),
                 mask: station,
+                eml_capabilities: 0,
+                mld_capa_and_ops: 0,
+                ext_mld_capa_and_ops: 0,
             },
             IftypeExtendedCapability {
                 iftype: 3, // NL80211_IFTYPE_AP
                 capabilities: ap.clone(),
                 mask: ap,
+                eml_capabilities: 0,
+                mld_capa_and_ops: 0,
+                ext_mld_capa_and_ops: 0,
             },
         ]
     }

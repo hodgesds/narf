@@ -74,6 +74,14 @@ const NL80211_ATTR_MAX_AP_ASSOC_STA: u16 = 202;
 const NL80211_ATTR_EXT_CAPA: u16 = 169;
 const NL80211_ATTR_EXT_CAPA_MASK: u16 = 170;
 const NL80211_ATTR_IFTYPE_EXT_CAPA: u16 = 230;
+const NL80211_ATTR_BSSID: u16 = 245;
+const NL80211_ATTR_MLO_LINKS: u16 = 312;
+const NL80211_ATTR_MLO_LINK_ID: u16 = 313;
+const NL80211_ATTR_MLD_ADDR: u16 = 314;
+const NL80211_ATTR_MLO_SUPPORT: u16 = 315;
+const NL80211_ATTR_EML_CAPABILITY: u16 = 317;
+const NL80211_ATTR_MLD_CAPA_AND_OPS: u16 = 318;
+const NL80211_ATTR_EXT_MLD_CAPA_AND_OPS: u16 = 337;
 const NL80211_ATTR_MAC_ADDRS: u16 = 166;
 const NL80211_ATTR_OFFCHANNEL_TX_OK: u16 = 108;
 const NL80211_ATTR_MAX_CSA_COUNTERS: u16 = 206;
@@ -745,7 +753,99 @@ fn interface_attrs(wiphy: u32, iface: &dyn crate::WirelessNetIface, iftype: u32)
             &dbm.saturating_mul(100).to_ne_bytes(),
         );
     }
+    if let Some(mlo) = iface.mlo_connection() {
+        push_interface_mlo_links(&mut attrs, &mlo);
+    }
     attrs
+}
+
+/// `nl80211_send_chandef` for one MLO link's channel (no S1G, NPCA or
+/// fractional-MHz members: `WIPHY_FREQ_OFFSET` is always 0 here).
+fn push_link_chandef(out: &mut Vec<u8>, channel: &crate::LinkChannel) {
+    const ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
+    const ATTR_CHANNEL_WIDTH: u16 = 159;
+    const ATTR_CENTER_FREQ1: u16 = 160;
+    const ATTR_CENTER_FREQ2: u16 = 161;
+    const ATTR_WIPHY_FREQ_OFFSET: u16 = 290;
+    push_attr(
+        out,
+        NL80211_ATTR_WIPHY_FREQ,
+        &channel.frequency_mhz.to_ne_bytes(),
+    );
+    push_attr(out, ATTR_WIPHY_FREQ_OFFSET, &0u32.to_ne_bytes());
+    // cfg80211_get_chandef_type: NO_HT=0, HT20=1, HT40MINUS=2, HT40PLUS=3.
+    let channel_type = match channel.width {
+        0 => Some(0u32),
+        1 => Some(1),
+        2 if channel.center_freq1_mhz > channel.frequency_mhz => Some(3),
+        2 => Some(2),
+        _ => None,
+    };
+    if let Some(channel_type) = channel_type {
+        push_attr(out, ATTR_WIPHY_CHANNEL_TYPE, &channel_type.to_ne_bytes());
+    }
+    push_attr(out, ATTR_CHANNEL_WIDTH, &channel.width.to_ne_bytes());
+    push_attr(
+        out,
+        ATTR_CENTER_FREQ1,
+        &channel.center_freq1_mhz.to_ne_bytes(),
+    );
+    if channel.center_freq2_mhz != 0 {
+        push_attr(
+            out,
+            ATTR_CENTER_FREQ2,
+            &channel.center_freq2_mhz.to_ne_bytes(),
+        );
+    }
+}
+
+/// `nl80211_send_iface`'s `wdev->valid_links` block: one nested entry
+/// (`link_id + 1`) per valid link with its link id, our link address and
+/// its chandef. Rejected requested links are not valid links.
+fn push_interface_mlo_links(out: &mut Vec<u8>, mlo: &crate::MloConnection) {
+    let mut links = Vec::new();
+    for link in mlo.links.iter().filter(|link| link.status == 0) {
+        let mut entry = Vec::new();
+        push_attr(&mut entry, NL80211_ATTR_MLO_LINK_ID, &[link.link_id]);
+        push_attr(&mut entry, NL80211_ATTR_MAC, &link.address);
+        if let Some(channel) = &link.channel {
+            push_link_chandef(&mut entry, channel);
+        }
+        push_attr(
+            &mut links,
+            (u16::from(link.link_id) + 1) | NLA_F_NESTED,
+            &entry,
+        );
+    }
+    if !links.is_empty() {
+        push_attr(out, NL80211_ATTR_MLO_LINKS | NLA_F_NESTED, &links);
+    }
+}
+
+/// `nl80211_send_connect_result` / `nl80211_send_roamed` for
+/// `cr->valid_links`: entries numbered from 1 for every requested link
+/// (rejected ones too) with link id, the AP link BSSID, our link address
+/// and that link's status code.
+pub(crate) fn push_connect_mlo_links(out: &mut Vec<u8>, mlo: &crate::MloConnection) {
+    let mut links = Vec::new();
+    for (index, link) in mlo.links.iter().enumerate() {
+        let mut entry = Vec::new();
+        push_attr(&mut entry, NL80211_ATTR_MLO_LINK_ID, &[link.link_id]);
+        push_attr(&mut entry, NL80211_ATTR_BSSID, &link.bssid);
+        push_attr(&mut entry, NL80211_ATTR_MAC, &link.address);
+        push_attr(&mut entry, 72, &link.status.to_ne_bytes()); // STATUS_CODE
+        push_attr(&mut links, (index as u16 + 1) | NLA_F_NESTED, &entry);
+    }
+    push_attr(out, NL80211_ATTR_MLO_LINKS | NLA_F_NESTED, &links);
+}
+
+/// `nl80211_send_station`'s `sinfo->mlo_params_valid` tail: the
+/// association link id and the AP MLD address.
+pub(crate) fn push_station_mlo_params(out: &mut Vec<u8>, mlo: &crate::MloConnection) {
+    push_attr(out, NL80211_ATTR_MLO_LINK_ID, &[mlo.assoc_link_id]);
+    if mlo.ap_mld != [0; 6] {
+        push_attr(out, NL80211_ATTR_MLD_ADDR, &mlo.ap_mld);
+    }
 }
 
 fn wiphy_attrs(
@@ -971,6 +1071,28 @@ fn wiphy_attrs(
                 );
                 push_attr(&mut record, NL80211_ATTR_EXT_CAPA, &capability.capabilities);
                 push_attr(&mut record, NL80211_ATTR_EXT_CAPA_MASK, &capability.mask);
+                // nl80211_send_wiphy: the MLD capabilities of this type
+                // only on a WIPHY_FLAG_SUPPORTS_MLO wiphy, EXT_MLD_CAPA only
+                // when non-zero.
+                if iface.supports_mlo() {
+                    push_attr(
+                        &mut record,
+                        NL80211_ATTR_EML_CAPABILITY,
+                        &capability.eml_capabilities.to_ne_bytes(),
+                    );
+                    push_attr(
+                        &mut record,
+                        NL80211_ATTR_MLD_CAPA_AND_OPS,
+                        &capability.mld_capa_and_ops.to_ne_bytes(),
+                    );
+                    if capability.ext_mld_capa_and_ops != 0 {
+                        push_attr(
+                            &mut record,
+                            NL80211_ATTR_EXT_MLD_CAPA_AND_OPS,
+                            &capability.ext_mld_capa_and_ops.to_ne_bytes(),
+                        );
+                    }
+                }
                 push_attr(&mut records, index as u16, &record);
             }
             if !records.is_empty() {
@@ -1013,6 +1135,11 @@ fn wiphy_attrs(
             // NL80211_ATTR_INTERFACE_COMBINATIONS.
             push_attr(&mut attrs, 120 | NLA_F_NESTED, &records);
         }
+    }
+    // `if (rdev->wiphy.flags & WIPHY_FLAG_SUPPORTS_MLO)
+    // nla_put_flag(msg, NL80211_ATTR_MLO_SUPPORT)`.
+    if iface.is_some_and(|iface| iface.supports_mlo()) {
+        push_attr(&mut attrs, NL80211_ATTR_MLO_SUPPORT, &[]);
     }
     if iface.is_some_and(|iface| iface.supports_ap_uapsd()) {
         push_attr(&mut attrs, NL80211_ATTR_SUPPORT_AP_UAPSD, &[]);

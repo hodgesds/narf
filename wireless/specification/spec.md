@@ -1670,7 +1670,7 @@ HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
 `CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,
 `MLO_SUPPORT`, `CONTROL_PORT_OVER_NL80211`, `CONTROL_PORT_NO_PREAUTH`) with
 `nl80211_connect` / `nl80211_crypto_settings`' checks; hints and overrides
-steer nothing. `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2).
+steer nothing (`MLO_SUPPORT` permits MLO: see the public MLO station surface below). `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2).
 OPTIONAL requires explicit default-false `supports_optional_mfp()` plus PSK
 and required-PMF offload; a complete native owner advertises extended bit21.
 A PMK needs `4WAY_HANDSHAKE_STA_PSK` and a SAE
@@ -2069,6 +2069,40 @@ records are omitted.
 ath11k supplies Linux's default, station, and AP records for extended channel
 switching, MBSSID, operating-mode notification, TWT requester/responder, and
 EMA capability.
+
+**Public MLO station surface (`mlo`).** `supports_mlo()` (default false) is
+`WIPHY_FLAG_SUPPORTS_MLO`: GET_WIPHY then emits the `NL80211_ATTR_MLO_SUPPORT`
+flag, and each `IftypeExtendedCapability` record additionally carries its
+`eml_capabilities` (`NL80211_ATTR_EML_CAPABILITY`, u16) and
+`mld_capa_and_ops` (`NL80211_ATTR_MLD_CAPA_AND_OPS`, u16), plus
+`ext_mld_capa_and_ops` (`NL80211_ATTR_EXT_MLD_CAPA_AND_OPS`) only when
+non-zero (nl80211.c `nl80211_send_wiphy`); a non-MLO wiphy emits none of
+them. CONNECT's `NL80211_ATTR_MLO_SUPPORT` is an empty flag (a payload is
+-EINVAL) decoded as `CONNECT_REQ_MLO_SUPPORT`: on an MLO wiphy a fresh
+connect calls `associate_mlo(AssociateRequest)` (default: `associate`),
+otherwise `associate` — the driver "shall disable MLO features" then. A
+roam stays `roam`. As in Linux, CONNECT does not take `NL80211_ATTR_MLO_LINKS`
+(the SME-offload driver selects the links itself and applies
+`cfg80211_mlme_check_mlo`'s same-AP-MLD/EML/MLD-capability checks);
+`AUTHENTICATE`/`ASSOCIATE` keep rejecting `MLO_LINKS`/`MLO_LINK_ID`
+(-EINVAL), since no driver offers both userspace MLME and MLO.
+`mlo_connection() -> Option<MloConnection { ap_mld, assoc_link_id, links:
+Vec<MloLink { link_id, address, bssid, status, channel: Option<LinkChannel
+{ frequency_mhz, width, center_freq1_mhz, center_freq2_mhz }> }> }>` (default
+None) is the current MLO connection, every requested link in link-id order.
+It drives (sme.c `__cfg80211_connect_result`): the successful CONNECT event's
+`MAC` and the following PORT_AUTHORIZED peer become the AP MLD, and
+`NL80211_ATTR_MLO_LINKS` nests entries 1..n per requested link with
+`MLO_LINK_ID`, `BSSID` (AP link), `MAC` (own link) and `STATUS_CODE`
+(`nl80211_send_connect_result`); GET_INTERFACE nests entry `link_id + 1` per
+*valid* (status 0) link with `MLO_LINK_ID`, `MAC` and `nl80211_send_chandef`'s
+`WIPHY_FREQ`, `WIPHY_FREQ_OFFSET` (0), `WIPHY_CHANNEL_TYPE` (20_NOHT/20/40
+only), `CHANNEL_WIDTH`, `CENTER_FREQ1`, `CENTER_FREQ2` when non-zero
+(`nl80211_send_iface`); GET_STATION keys the AP station by the AP MLD address
+and appends `MLO_LINK_ID` (association link) and `MLD_ADDR`
+(`sinfo->mlo_params_valid`). Per-link station statistics
+(`NL80211_ATTR_STA_DUMP_LINK_STATS`), per-link TX power and MLO ROAM events
+are not provided.
 
 `wiphy_mac_addresses()` supplies a multi-vdev radio's preallocated address
 pool; a pool with more than one member is emitted as nested

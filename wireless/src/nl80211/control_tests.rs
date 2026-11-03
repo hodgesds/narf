@@ -24,6 +24,8 @@ struct InterfaceStub {
 }
 #[path = "lifetime_tests.rs"]
 mod lifetime_tests;
+#[path = "mlo_surface_tests.rs"]
+mod mlo_surface_tests;
 
 struct CacheNetdev(&'static str);
 impl Drop for CacheNetdev {
@@ -245,7 +247,8 @@ fn smoke_nl80211_retired_async_connect_cannot_touch_replacement_or_publish() -> 
                 frequency_mhz: Some(5180),
                 cred: Credential::Psk(Zeroizing::new([0x11; 32])),
                 ie: Vec::new(),
-                owner: None
+                owner: None,
+                mlo: false,
             }
         ));
         let mut cx = Context::from_waker(Waker::noop());
@@ -1053,6 +1056,7 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
             cred: Credential::Psk(Zeroizing::new([0x42u8; 32])),
             ie: Vec::new(),
             owner: None,
+            mlo: false,
         },
     ));
     if !INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
@@ -1164,6 +1168,7 @@ fn smoke_nl80211_wpa3_sae_connect() -> TestResult {
             cred: Credential::Sae(Zeroizing::new(b"correct horse battery".to_vec())),
             ie: Vec::new(),
             owner: None,
+            mlo: false,
         },
     ));
     if !INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
@@ -2132,6 +2137,7 @@ fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
             cred: Credential::Open,
             ie: Vec::new(),
             owner: None,
+            mlo: false,
         },
     ));
     let roamed = INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
@@ -2289,6 +2295,7 @@ fn smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery() -> TestRe
             cred: Credential::Open,
             ie: Vec::new(),
             owner: None,
+            mlo: false,
         },
     ));
     let connected = INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {

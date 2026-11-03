@@ -1968,6 +1968,7 @@ impl Guard {
             pnvm: None,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
+            mlo_report: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx,
         });

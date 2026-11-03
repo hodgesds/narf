@@ -75,6 +75,7 @@ impl Fixture {
             pnvm: None,
             up: AtomicBool::new(true),
             bssid: AtomicU64::new(0),
+            mlo_report: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(None),
             tx: core::array::from_fn(|_| IrqSafeSpinLock::new(None)),
         });

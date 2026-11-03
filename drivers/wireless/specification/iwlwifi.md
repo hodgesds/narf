@@ -4392,9 +4392,39 @@ the associated MAC_CONFIG to carry esr_transition_timeout 0 and the
 0x10ac default medium sync delay, since its response Basic MLE (control
 0x0110) has no EML capabilities or medium sync delay.
 
-Still open (`mlo` row not complete): 6GHz further links; and the public
-narf_wireless/nl80211 multiple-link surface (WIPHY_FLAG_SUPPORTS_MLO,
-EHT MLD iftype capabilities, MLO link reporting). Nothing is advertised.
+**Public multiple-link surface (pass 9).** The native MLD `Device` reports
+`supports_mlo()` exactly when its admitted PHY is EHT (mld/mac80211.c
+`iwl_mac_hw_set_wiphy` sets WIPHY_FLAG_SUPPORTS_MLO for an 11be NVM; the
+native EHT PHY already requires the NVM/TLV 11be facts). Its station
+`IftypeExtendedCapability` record then advertises IWL_MLD_EMLSR_CAPA
+(`EmlCapabilities::INTEL_MLD_LOCAL`, 0x0033: EMLSR, 32us padding, 64us
+transition delay) — exactly the EML Capabilities its multiple-link request
+carries. Linux's IWL_MLD_CAPA_OPS (TTLM negotiation, link reconfiguration)
+and the UHR ML power-management EXT_MLD bit are advertised as 0 because
+neither is implemented, and no `ext_capa_base` Extended Capabilities bit is
+claimed (the native request carries no Extended Capabilities element), so
+the record's EXT_CAPA/mask are empty. Further links are now requested only
+through `associate_mlo` (CONNECT with `NL80211_ATTR_MLO_SUPPORT`,
+`CONNECT_REQ_MLO_SUPPORT`; never for a P2P client); plain `associate` keeps
+the landed single-link MLD association with no further link. The
+connection's `Connection::mlo_report()` (AP MLD, association link id, the
+association link plus every requested further link: accepted ones with the
+chandef from their negotiated native PHY — legacy 20_NOHT, else
+20/40/80/160 around the negotiated centre, unpunctured — rejected ones with
+their per-STA status, UNSPECIFIED_FAILURE when absent) is captured on
+success and served by `mlo_connection()` only while the association link's
+BSSID is the published carrier; every association and roam attempt clears
+it. Roaming stays single-link and is reported without MLO links.
+Written, unexecuted: `smoke_nl80211_mlo_wiphy_connect_and_link_reporting`
+(wireless/src/nl80211/mlo_surface_tests.rs) and
+`smoke_iwl_mld_mlo_report_and_link_chandef` (connection_tests.rs).
+
+Documented gaps (not part of the `mlo` row's public surface): 6GHz further
+links, BT-coex, low-latency classification, CSA on links, negotiated TTLM,
+per-link station statistics (STA_DUMP_LINK_STATS), MLO roaming and
+userspace-MLME `ASSOCIATE` with `NL80211_ATTR_MLO_LINKS` (this device is
+SME-offload only, so it has no ASSOCIATE path; Linux's CONNECT likewise never
+takes MLO_LINKS).
 
 
 ### 3.67 Complete native6GHz discovery, refinement and live TPE (validation pending)

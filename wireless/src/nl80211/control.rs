@@ -226,6 +226,8 @@ enum Operation {
         ie: Vec<u8>,
         /// The sender, when NL80211_ATTR_SOCKET_OWNER was set.
         owner: Option<u32>,
+        /// NL80211_ATTR_MLO_SUPPORT (`CONNECT_REQ_MLO_SUPPORT`).
+        mlo: bool,
     },
     Disconnect,
 }
@@ -550,9 +552,10 @@ const CONNECT_ATTRS: &[u16] = &[
 
 /// `nl80211_connect`'s checks of the advisory attributes. The hints
 /// (MAC_HINT, WIPHY_FREQ_HINT, BG_SCAN_PERIOD, PREV_BSSID), the HT/VHT
-/// override masks and MLO_SUPPORT only steer driver BSS selection and are
-/// not acted on; CONTROL_PORT is what an offloading driver does anyway (no
-/// data before the 4-way handshake completes).
+/// override masks only steer driver BSS selection and are not acted on;
+/// CONTROL_PORT is what an offloading driver does anyway (no data before the
+/// 4-way handshake completes). MLO_SUPPORT (`CONNECT_REQ_MLO_SUPPORT`) lets
+/// an MLO wiphy request further links (`WirelessNetIface::associate_mlo`).
 fn connect_side_attrs(attrs: &[(u16, &[u8])]) -> Result<(), i32> {
     for kind in [200u16, 79] {
         if attr(attrs, kind).is_some_and(|b| b.len() != 6) {
@@ -561,6 +564,10 @@ fn connect_side_attrs(attrs: &[(u16, &[u8])]) -> Result<(), i32> {
     }
     if let Some(freq) = u32_attr(attrs, 201)? {
         channel(freq)?;
+    }
+    // NL80211_ATTR_MLO_SUPPORT is an NLA_FLAG (no payload).
+    if attr(attrs, 315).is_some_and(|flag| !flag.is_empty()) {
+        return Err(EINVAL);
     }
     // An HT/VHT capability override needs its mask (-EINVAL).
     if attr(attrs, 31).is_some() && attr(attrs, 148).is_none()
@@ -1060,6 +1067,7 @@ fn parse_operation_caps(
                 cred,
                 ie: attr(attrs, 42).unwrap_or(&[]).to_vec(),
                 owner: attr(attrs, 204).is_some().then_some(portid),
+                mlo: attr(attrs, 315).is_some(),
             })
         }
         DISCONNECT => {
@@ -2537,7 +2545,12 @@ fn interface_handle(
                     None => iface.ap_station_macs(),
                 }
             } else {
-                let peer = iface.connected_bssid();
+                // An MLO AP station is keyed by the AP MLD address
+                // (`sta->addr`), not by a link BSSID.
+                let peer = iface
+                    .mlo_connection()
+                    .map(|mlo| mlo.ap_mld)
+                    .or_else(|| iface.connected_bssid());
                 let Some(peer) = peer.filter(|peer| wanted.is_none_or(|w| w == *peer)) else {
                     return if dump { Ok(Vec::new()) } else { Err(ENOENT) };
                 };
@@ -2578,6 +2591,16 @@ fn interface_handle(
                 push_attr(&mut attrs, 6, &peer);
                 push_attr(&mut attrs, 46, &0u32.to_ne_bytes()); // NL80211_ATTR_GENERATION
                 push_attr(&mut attrs, 21 | NLA_F_NESTED, &info); // NL80211_ATTR_STA_INFO
+
+                // sta_set_sinfo: `sta->sta.valid_links` sets
+                // mlo_params_valid (association link id, AP MLD address).
+                if let Some(mlo) = (!ap)
+                    .then(|| iface.mlo_connection())
+                    .flatten()
+                    .filter(|mlo| mlo.ap_mld == peer)
+                {
+                    super::push_station_mlo_params(&mut attrs, &mlo);
+                }
                 replies.push(GenlReply {
                     command: NEW_STATION,
                     attrs,
@@ -4272,6 +4295,7 @@ async fn execute(
             cred,
             ie,
             owner: _,
+            mlo,
         } => {
             let akm = cred.akm();
             let mut selected = None;
@@ -4364,6 +4388,8 @@ async fn execute(
                     .is_some_and(|current| current != bss.bssid);
                 if roaming {
                     iface.roam(request).await
+                } else if mlo && iface.supports_mlo() {
+                    iface.associate_mlo(request).await
                 } else {
                     iface.associate(request).await
                 }
@@ -4377,7 +4403,16 @@ async fn execute(
             if let Some(index) = wiphy_index(iface.as_ref()) {
                 push_attr(&mut attrs, 1, &index.to_ne_bytes()); // NL80211_ATTR_WIPHY
             }
-            if let Some(address) = selected.map(|b| b.bssid).or(bssid) {
+            // __cfg80211_connect_result: an MLO connection's peer is the
+            // AP MLD (`connected_addr = cr->ap_mld_addr`) and the event
+            // names every requested link with its own status.
+            let multi_link = (status == 0).then(|| iface.mlo_connection()).flatten();
+            let peer = multi_link
+                .as_ref()
+                .map(|mlo| mlo.ap_mld)
+                .or(selected.map(|b| b.bssid))
+                .or(bssid);
+            if let Some(address) = peer {
                 push_attr(&mut attrs, 6, &address);
                 // The offloading driver completed the 4-way handshake (or
                 // SAE + 4-way) before associate() returned: the port is
@@ -4390,6 +4425,9 @@ async fn execute(
                 }
             }
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
+            if let Some(mlo) = &multi_link {
+                super::push_connect_mlo_links(&mut attrs, mlo);
+            }
             if status != 0 {
                 // __cfg80211_connect_result failure: owner cleared.
                 let _ = station::clear_owner_for_link(iface.name(), ns, index);
