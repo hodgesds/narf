@@ -17,7 +17,17 @@ const AP: [u8; 6] = [2, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1];
 fn smoke_nl80211_host_regulatory_flags_preserve_no_ir() -> TestResult {
     use crate::reg::RegFlags;
     // Literal NRGD -> nl80211.h flag values, without global policy mutation.
-    for (host, linux) in [(0, 0), (1, 0x10), (2, 8), (4, 0), (8, 0x80), (15, 0x98)] {
+    for (host, linux) in [
+        (0, 0),
+        (1, 0x10),
+        (2, 8),
+        (4, 0),
+        (8, 0x80),
+        (15, 0x98),
+        (0x100, 0x800),
+        (0x200, 0x1_0000),
+        (0x301, 0x1_0810),
+    ] {
         if station::regulatory_rule_flags(RegFlags::from_bits(host).unwrap()) != linux {
             return TestResult::Fail("host regulatory flag translation lost a restriction");
         }

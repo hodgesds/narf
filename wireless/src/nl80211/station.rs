@@ -1386,6 +1386,8 @@ pub(super) fn regulatory_rule_flags(flags: crate::reg::RegFlags) -> u32 {
     u32::from(flags.contains(crate::reg::RegFlags::DFS)) << 4
         | u32::from(flags.contains(crate::reg::RegFlags::INDOOR_ONLY)) << 3
         | u32::from(flags.contains(crate::reg::RegFlags::NO_IR)) << 7
+        | u32::from(flags.contains(crate::reg::RegFlags::AUTO_BW)) << 11
+        | u32::from(flags.contains(crate::reg::RegFlags::NO_160MHZ)) << 16
         | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_VLP_CLIENT)) << 22
         | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_AFC_CLIENT)) << 23
 }

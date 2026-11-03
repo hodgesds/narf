@@ -19,6 +19,52 @@ impl RegulatoryDomain {
     pub fn wmm_rule_for(&self, mhz: u32) -> Option<WmmRule> {
         self.rule_for(mhz).and_then(RegRule::wmm_rule)
     }
+    /// cfg80211 `reg_get_max_bandwidth` as `handle_channel` applies it
+    /// (net/wireless/reg.c): the usable bandwidth of `rules[index]` in MHz.
+    /// Under AUTO_BW it is the span of the run of rules adjacent to it in
+    /// policy order (`reg_get_max_bandwidth_from_range`: a neighbour joins
+    /// while its range touches or overlaps the run), otherwise the rule's
+    /// own maximum. NO_160MHZ caps either at 80 MHz. Zero for a bad index.
+    pub fn max_bandwidth(&self, index: usize) -> u32 {
+        let Some(rule) = self.rules.get(index) else {
+            return 0;
+        };
+        let mut bandwidth = if rule.flags.contains(RegFlags::AUTO_BW) {
+            let mut start = rule.freq_start_mhz;
+            for r in self.rules[..index].iter().rev() {
+                if r.freq_end_mhz < start {
+                    break;
+                }
+                start = r.freq_start_mhz;
+            }
+            let mut end = rule.freq_end_mhz;
+            for r in &self.rules[index + 1..] {
+                if r.freq_start_mhz > end {
+                    break;
+                }
+                end = r.freq_end_mhz;
+            }
+            end.saturating_sub(start)
+        } else {
+            rule.max_bandwidth_mhz
+        };
+        if rule.flags.contains(RegFlags::NO_160MHZ) {
+            bandwidth = bandwidth.min(80);
+        }
+        bandwidth
+    }
+    /// cfg80211 `cfg80211_chandef_usable` bandwidth test for a block of
+    /// `width` MHz occupying `low..high`: every rule overlapping the block
+    /// must allow `width` (`max_bandwidth`), so a 160 MHz channel crosses a
+    /// rule boundary only through AUTO_BW on both sides. Coverage and every
+    /// other restriction remain the caller's to check.
+    pub fn allows_bandwidth(&self, low: u32, high: u32, width: u32) -> bool {
+        self.rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.freq_start_mhz < high && low < r.freq_end_mhz)
+            .all(|(i, _)| self.max_bandwidth(i) >= width)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +99,16 @@ bitflags::bitflags! {
         /// authenticate the assertion. Drivers must retain current-policy
         /// checks and every other factory, power and bandwidth restriction.
         const DEPLOYMENT_INDOOR = 1 << 7;
+        /// cfg80211 `NL80211_RRF_AUTO_BW` (wireless-regdb `AUTO-BW`,
+        /// `FWDB_FLAG_AUTO_BW`): the rule's usable bandwidth is the span of
+        /// the run of adjacent rules it belongs to, so a wide channel may
+        /// cross a rule boundary (`RegulatoryDomain::max_bandwidth`).
+        /// NRGD second flag byte, bit0.
+        const AUTO_BW = 1 << 8;
+        /// cfg80211 `NL80211_RRF_NO_160MHZ`: no 160 MHz (or 80+80) channel
+        /// may occupy this rule, whatever its bandwidth or AUTO_BW run.
+        /// NRGD second flag byte, bit1.
+        const NO_160MHZ = 1 << 9;
     }
 }
 
@@ -181,7 +237,8 @@ impl RegRule {
 /// the enclosing blob before installing it; parsing does not establish trust.
 /// NRGD v1: magic[4], version:u16, country[2], count:u16, reserved:u16,
 /// followed by 16-byte rules (start/end/bandwidth:u32, power:i8,
-/// flags:u8, reserved:u16), all integers little-endian.
+/// flags:u8, flags2:u8, reserved:u8), all integers little-endian. flags2
+/// carries `RegFlags` bits 8.. (AUTO_BW, NO_160MHZ); unknown bits reject.
 pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
     if bytes.len() < 12
         || &bytes[..4] != b"NRGD"
@@ -200,7 +257,8 @@ pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
         let start = u32::from_le_bytes(raw[..4].try_into().unwrap());
         let end = u32::from_le_bytes(raw[4..8].try_into().unwrap());
         let bandwidth = u32::from_le_bytes(raw[8..12].try_into().unwrap());
-        let flags = RegFlags::from_bits(u32::from(raw[13])).ok_or("unknown regulatory flags")?;
+        let flags = RegFlags::from_bits(u32::from(raw[13]) | u32::from(raw[14]) << 8)
+            .ok_or("unknown regulatory flags")?;
         if flags.contains(RegFlags::DEPLOYMENT_INDOOR) && !flags.contains(RegFlags::INDOOR_ONLY) {
             return Err("indoor installation fact without indoor-only rule");
         }
@@ -209,7 +267,7 @@ pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
             || end <= start
             || bandwidth == 0
             || bandwidth > end - start
-            || raw[14..] != [0; 2]
+            || raw[15] != 0
         {
             return Err("invalid regulatory rule");
         }
@@ -379,6 +437,108 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("wireless/regulatory", smoke_regulatory_policy_boundaries);
+
+    fn rule(start: u32, end: u32, bandwidth: u32, flags: RegFlags) -> RegRule {
+        RegRule {
+            freq_start_mhz: start,
+            freq_end_mhz: end,
+            max_bandwidth_mhz: bandwidth,
+            max_power_dbm: 23,
+            flags,
+        }
+    }
+
+    /// wireless-regdb `US`: `(5170 - 5250 @ 80), (23), AUTO-BW` then
+    /// `(5250 - 5330 @ 80), (23), DFS, AUTO-BW` must join into 160 MHz.
+    fn smoke_regulatory_auto_bw_chain_admits_and_refuses_160() -> TestResult {
+        let auto = RegFlags::AUTO_BW;
+        let mut domain = RegulatoryDomain {
+            country_code: *b"US",
+            rules: alloc::vec![
+                rule(5170, 5250, 80, auto),
+                rule(5250, 5330, 80, auto | RegFlags::DFS),
+                rule(5490, 5730, 160, RegFlags::DFS),
+                rule(5735, 5835, 80, RegFlags::empty()),
+            ],
+        };
+        if domain.max_bandwidth(0) != 160
+            || domain.max_bandwidth(1) != 160
+            || !domain.allows_bandwidth(5170, 5330, 160)
+        {
+            return TestResult::Fail("AUTO_BW run did not join 5170-5330 into 160 MHz");
+        }
+        // A rule wide enough on its own admits 160 directly.
+        if domain.max_bandwidth(2) != 160 || !domain.allows_bandwidth(5490, 5650, 160) {
+            return TestResult::Fail("direct 160 MHz rule refused");
+        }
+        // No AUTO_BW: the rule's own maximum binds, and a gap ends a run.
+        if domain.max_bandwidth(3) != 80 || domain.allows_bandwidth(5735, 5835, 160) {
+            return TestResult::Fail("plain 80 MHz rule admitted 160");
+        }
+        // One side without AUTO_BW keeps its own 80 MHz: the crossing fails.
+        domain.rules[1].flags = RegFlags::DFS;
+        if domain.max_bandwidth(1) != 80 || domain.allows_bandwidth(5170, 5330, 160) {
+            return TestResult::Fail("one-sided AUTO_BW crossed a rule boundary");
+        }
+        domain.rules[1].flags = auto | RegFlags::DFS;
+        // NO_160MHZ on either constituent rule caps the run at 80 MHz.
+        domain.rules[0].flags = auto | RegFlags::NO_160MHZ;
+        if domain.max_bandwidth(0) != 80
+            || domain.allows_bandwidth(5170, 5330, 160)
+            || !domain.allows_bandwidth(5170, 5250, 80)
+        {
+            return TestResult::Fail("NO_160MHZ did not cap the AUTO_BW run");
+        }
+        domain.rules[0].flags = auto;
+        // A gap between rules ends the run (reg_get_max_bandwidth_from_range).
+        domain.rules[1].freq_start_mhz = 5260;
+        if domain.max_bandwidth(0) != 80 || domain.max_bandwidth(1) != 70 {
+            return TestResult::Fail("AUTO_BW run crossed a frequency gap");
+        }
+        if domain.max_bandwidth(9) != 0 {
+            return TestResult::Fail("out-of-range rule index had bandwidth");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/regulatory",
+        smoke_regulatory_auto_bw_chain_admits_and_refuses_160
+    );
+
+    /// NRGD flags2 (rule byte 14) carries AUTO_BW / NO_160MHZ; its unknown
+    /// bits and the last reserved byte stay rejected.
+    fn smoke_regulatory_policy_second_flag_byte() -> TestResult {
+        let mut bytes = alloc::vec![0; 28];
+        bytes[..4].copy_from_slice(b"NRGD");
+        bytes[4] = 1;
+        bytes[6..8].copy_from_slice(b"US");
+        bytes[8] = 1;
+        bytes[12..16].copy_from_slice(&5170u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&5250u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&80u32.to_le_bytes());
+        bytes[24] = 23;
+        bytes[25] = 1;
+        bytes[26] = 0b11;
+        if parse_policy(&bytes).ok().is_none_or(|d| {
+            d.rules[0].flags != RegFlags::DFS | RegFlags::AUTO_BW | RegFlags::NO_160MHZ
+        }) {
+            return TestResult::Fail("flags2 AUTO_BW/NO_160MHZ lost or rejected");
+        }
+        bytes[26] = 0b100;
+        if parse_policy(&bytes).is_ok() {
+            return TestResult::Fail("unknown flags2 bit accepted");
+        }
+        bytes[26] = 0;
+        bytes[27] = 1;
+        if parse_policy(&bytes).is_ok() {
+            return TestResult::Fail("reserved rule byte accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/regulatory",
+        smoke_regulatory_policy_second_flag_byte
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

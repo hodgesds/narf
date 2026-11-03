@@ -2500,7 +2500,8 @@ regulatory database or a country inferred from AP advertisements.
 The byte format is `NRGD[4]`, version `u16=1`, uppercase country `[u8;2]`,
 rule count `u16`, reserved `u16=0`, followed by 1–64 rules of 16 bytes:
 start MHz `u32`, end MHz `u32`, maximum bandwidth MHz `u32`, power dBm
-`i8`, `RegFlags` `u8`, reserved `u16=0`. Integers are little-endian;
+`i8`, `RegFlags` `u8`, second `RegFlags` byte `u8` (bits 8..15), reserved
+`u8=0`. Integers are little-endian;
 unknown flags, malformed ranges and length mismatches are rejected.
 `RegFlags` assigns DFS=bit0, INDOOR_ONLY=bit1, NO_P2P=bit2 and NO_IR=bit3.
 NO_IR permits passive reception but denies active probes and host-initiated
@@ -2527,6 +2528,22 @@ The installer must update policy when the installation changes. `GET_REG`
 continues reporting `INDOOR_ONLY` as Linux `NO_OUTDOOR`; this NARF deployment
 metadata is not mapped to a Linux restriction bit or an automatic netlink hint.
 Older NRGD readers reject bit7 rather than discard its installation semantics.
+
+The second flag byte (rule byte 14, formerly reserved and therefore rejected
+by older readers when nonzero) holds `RegFlags` bit8 `AUTO_BW` and bit9
+`NO_160MHZ`; its other bits are rejected. `AUTO_BW` is cfg80211
+`NL80211_RRF_AUTO_BW` (wireless-regdb `AUTO-BW`, `FWDB_FLAG_AUTO_BW`) and
+`NO_160MHZ` is `NL80211_RRF_NO_160MHZ`; GET_REG reports them as Linux bits 11
+and 16. `RegulatoryDomain::max_bandwidth(index) -> u32` is
+`reg_get_max_bandwidth` as `handle_channel` applies it (net/wireless/reg.c):
+under AUTO_BW the span of the run of rules adjacent in policy order
+(`reg_get_max_bandwidth_from_range`), else the rule's own maximum; NO_160MHZ
+caps either at 80. `RegulatoryDomain::allows_bandwidth(low, high, width)`
+holds when every rule overlapping `low..high` allows `width`, so a 160 MHz
+channel crosses a rule boundary (US 5170-5250 / 5250-5330) only when both
+rules carry AUTO_BW. Coverage, DFS, NO_IR, indoor and power checks are
+unchanged and stay per rule. A driver that does not use these helpers must
+still reject an AUTO_BW or NO_160MHZ rule it does not understand.
 
 **Regulatory WMM rule (`reg::{WmmRule, WmmAcRule}`).** `RegRule::wmm_rule()
 -> Option<WmmRule>` is cfg80211 `ieee80211_reg_rule.wmm_rule` with
