@@ -1147,6 +1147,13 @@ at all; SDIO `send_data_on` refuses during an AP), so secondary stations
 are created and driven only while the primary is a station; with the
 `brcmf_setup_ifmodes` table that admits a second STA only for `p2p`
 firmware (`p2p`+`mchan` combo0, or the P2P combination).
+One written/unexecuted case in `drivers/wireless/brcmfmac/vif`
+(`smoke_brcmf_vif_secondary_station_joins_on_its_own_bsscfg`, both the
+SDIO and PCIe seam families): create, per-interface dcmds, an Open join
+whose dcmds go to ifidx 2 with `bsscfg:wpa_auth` at bsscfg 3, link
+events from bsscfg 3 only, no primary link/event disturbance, and a
+secondary DEAUTH closing only the secondary port. No real PCIe msgbuf
+secondary-ifidx (flow create/delete, events, IOCTL) fixture exists yet.
 
 Still missing before `virtual_interfaces`/`p2p_mode` can be claimed on
 either family: per-bsscfg role

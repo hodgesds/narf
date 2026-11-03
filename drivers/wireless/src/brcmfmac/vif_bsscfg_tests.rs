@@ -135,3 +135,124 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/vif",
     smoke_brcmf_vif_bsscfg_adapter_addresses_its_own_interface
 );
+
+/// Secondary station role over the adapter: Linux 7.3-rc4
+/// `brcmf_cfg80211_connect` on an additional STA `brcmf_if` (dcmds on its
+/// ifidx, `brcmf_fil_bsscfg_*` security iovars, events of its bsscfg).
+fn secondary_station<const PCIE: bool>() -> Result<(), &'static str> {
+    use crate::cyw43439::fullmac_fixture::{cache, init_station, request, AP};
+    let mut fw = Firmware::new();
+    fw.join_events = false;
+    fw.hook = Some(Box::new(|fw, command| {
+        if command.direction == Direction::Get && command.iovar() == Some(b"interface_create") {
+            fw.if_event(1, 2, 3, 0, VIF);
+            return Some(Ok(Vec::new()));
+        }
+        // The join addressed to ifidx 2 completes on bsscfg 3 only.
+        if command.direction == Direction::Set
+            && command.command == 26
+            && fw
+                .vif_log
+                .last()
+                .is_some_and(|(ifidx, last)| *ifidx == 2 && last.command == 26)
+        {
+            fw.associated = true;
+            let peer = fw.bssid;
+            fw.secondary_event(16, 2, 3, peer, &[]);
+            if let Some(link) = fw.vif_events.back_mut() {
+                link.header.flags = 1;
+            }
+            fw.secondary_event(0, 2, 3, peer, &[]);
+            return Some(Ok(Vec::new()));
+        }
+        None
+    }));
+    let mut primary = init_station::<PCIE>(fw)?;
+    let features = Features {
+        p2p: true,
+        mchan: true,
+        ..Features::default()
+    };
+    let mut owner = Owner::new(primary.mac, features);
+    let entry = ready(owner.create(&mut primary.runtime, Role::Station, Some(VIF)))
+        .ok_or("create pended")?
+        .map_err(|_| "secondary STA create")?;
+    primary
+        .runtime
+        .vif_open(entry.ifidx)
+        .map_err(|_| "vif_open")?;
+    let parked = primary.secondary(entry.mac);
+    let mut link = Link::new(entry);
+    let before = primary.runtime.fw.vif_log.len();
+    let primary_log = primary.runtime.fw.events.len();
+    let parked = {
+        let adapter = Bsscfg::new(&mut primary.runtime, &mut owner, &mut link);
+        let (mut station, rest) = parked.rebind(adapter);
+        ready(station.configure_secondary())
+            .ok_or("configure pended")?
+            .map_err(|_| "per-interface dcmds")?;
+        cache(
+            &mut station,
+            AP,
+            6,
+            narf_wireless::scan::BssSecurity::Open,
+            &[],
+        );
+        ready(station.associate(request(
+            AP,
+            6,
+            narf_wireless::SecurityConfig::Open,
+            Vec::new(),
+        )))
+        .ok_or("join pended")?
+        .map_err(|_| "secondary join")?;
+        station.rebind(rest).0
+    };
+    let fw = &primary.runtime.fw;
+    let log = &fw.vif_log[before..];
+    let mut wpa_auth = b"bsscfg:wpa_auth\0".to_vec();
+    wpa_auth.extend_from_slice(&3u32.to_le_bytes());
+    if log.iter().any(|(ifidx, _)| *ifidx != 2)
+        || ![86u32, 20, 22, 134, 26]
+            .iter()
+            .all(|dcmd| log.iter().any(|(_, c)| c.command == *dcmd))
+        || !log.iter().any(|(_, c)| c.body.starts_with(&wpa_auth))
+        || log
+            .iter()
+            .any(|(_, c)| c.iovar() == Some(b"wsec") || c.iovar() == Some(b"wpa_auth"))
+    {
+        return Err("secondary commands not addressed to its ifidx/bsscfg");
+    }
+    if link.peer() != Some(AP)
+        || parked.bssid != Some(AP)
+        || primary.bssid.is_some()
+        || fw.link.is_some()
+        || fw.events.len() != primary_log
+    {
+        return Err("secondary link leaked into the primary interface");
+    }
+    // Deauthentication on the secondary bsscfg closes only its port.
+    let peer = primary.runtime.fw.bssid;
+    primary.runtime.fw.secondary_event(6, 2, 3, peer, &[]);
+    let adapter = Bsscfg::new(&mut primary.runtime, &mut owner, &mut link);
+    let (mut station, rest) = parked.rebind(adapter);
+    let _ = station.poll();
+    let (parked, _) = station.rebind(rest);
+    if parked.bssid.is_some() || link.peer().is_some() {
+        return Err("secondary deauthentication kept the port open");
+    }
+    Ok(())
+}
+
+fn smoke_brcmf_vif_secondary_station_joins_on_its_own_bsscfg() -> TestResult {
+    for result in [secondary_station::<true>(), secondary_station::<false>()] {
+        if let Err(reason) = result {
+            return TestResult::Fail(reason);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_vif_secondary_station_joins_on_its_own_bsscfg
+);
