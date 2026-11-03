@@ -155,7 +155,8 @@ fn smoke_rtw88_fallback_payload_bounds_and_descriptor_bits() -> TestResult {
     p[0] = 1;
     if !fallback::bounds(&p)
         || !(fallback::KIND.admit)(0xc821, &p)
-        || (fallback::KIND.admit)(0xb822, &p)
+        || !(fallback::KIND.admit)(0xb822, &p)
+        || (fallback::KIND.admit)(0x8822, &p)
     {
         return TestResult::Fail("N2xF chip/payload bounds differ");
     }

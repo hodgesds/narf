@@ -288,7 +288,9 @@ fn smoke_rtw88_coding_payload_bounds_and_apply() -> TestResult {
         || ok(0xc821, STBC, &mut p).is_some()
         || ok(0xc822, 0, &mut p).is_some()
         || ok(0xc822, 4, &mut p).is_some()
-        || ok(0xb822, LDPC, &mut p).is_some()
+        || ok(0xb822, LDPC, &mut p) != Some(1)
+        || ok(0xb822, STBC, &mut p).is_some()
+        || ok(0x8822, LDPC, &mut p).is_some()
     {
         return TestResult::Fail("rtw88 TX coding narrow check");
     }

@@ -26,7 +26,8 @@ pub(super) static KIND: Kind = Kind {
 };
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
-    matches!(did, 0xc821 | 0xc822) && bounds(p)
+    // RTL8822BE: the same `tx.c` descriptor bits and `fw.c` RA mask.
+    matches!(did, 0xc821 | 0xc822 | 0xb822) && bounds(p)
 }
 
 /// Whether the payload is the one admissible N2xF record body.

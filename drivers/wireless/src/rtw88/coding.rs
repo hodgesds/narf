@@ -16,7 +16,9 @@
 //! station. Emitting coded PPDUs changes the transmitted waveform, so it is
 //! a separate continuation over the exact base. Payload byte0 holds the
 //! requested TX coding (bit0 LDPC, bit1 STBC); every other byte is zero.
-//! TX STBC needs two transmit paths, so RTL8821CE may request LDPC only.
+//! TX STBC needs two transmit paths, so RTL8821CE may request LDPC only;
+//! RTL8822BE (`N2BC`) has two paths but no `chip->tx_stbc`, so it too may
+//! request LDPC only.
 use super::packet_format::DataProfile;
 use super::qualification::{Kind, PAYLOAD};
 
@@ -40,6 +42,9 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<u8> {
     let allowed = match did {
         0xc822 => LDPC | STBC,
         0xc821 => LDPC,
+        // `rtw8822b_hw_spec`: `rx_ldpc` true, no `tx_stbc` (false): the
+        // B22 HT TX coding is LDPC only, over its 1SS path-A program.
+        0xb822 => LDPC,
         _ => return None,
     };
     (flags != 0 && flags & !allowed == 0 && p[1..].iter().all(|b| *b == 0)).then_some(flags)

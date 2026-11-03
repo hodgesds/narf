@@ -751,6 +751,23 @@ page-1 RXSC/RF_MODE layout (`pci_packet::receive_chip` C21 for B22,
 provisioned. Case written, unexecuted:
 `smoke_rtw8822be_n2bb_n2bv_wide_records_limits_and_bw40_readback`.
 
+#### RTL8822BE TX coding (`N2BC`), all-AC QoS (`N2BQ`) and fallback (`N2BF`)
+
+The chip-independent N2xC/N2xQ/N2xF continuations (`coding.rs`, `qos.rs`,
+`fallback.rs`; generic layout, chip byte `B`) now admit `0xb822` over the
+bound B22 programs with the shared contracts and requirements (N2xC over the
+HT program, N2xQ over a WMM `N2BL`, N2xF over `N2BL`). Coding: per
+`rtw8822b_hw_spec` (`rx_ldpc` true, no `tx_stbc`), `coding::bounds` allows
+LDPC only, so `rtw_init_ht_cap` advertises no HT TX STBC and the one-stream
+LDPC DATA rides the 1SS path-A program (`tx.c` W5_DATA_LDPC, `fw.c`
+RA_INFO_LDPC). QoS uses the shared PCI BK/BE/VI/VO rings and `mac.c` EDCA
+registers; fallback the shared `tx.c` W3 bits and `fw.c` RA mask. The B22
+`N2BQ` QoS magic equals the `N2BQ` calibration magic (as `N21Q` does on
+C21); the kind tag at byte 54, the request identity and the filename keep
+them apart. No asset is provisioned. Cases updated, unexecuted:
+`smoke_rtw88_coding_payload_bounds_and_apply`,
+`smoke_rtw88_fallback_payload_bounds_and_descriptor_bits`.
+
 #### RTL8822BE documented gaps: LPS and Bluetooth coexistence
 
 The `rtw88 | rtl8822be` row is scoped to the RTL8822CE chip-row station core.
