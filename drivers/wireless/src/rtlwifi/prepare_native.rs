@@ -155,11 +155,13 @@ pub(super) use super::prepare::retain_and_prepare as prepare_retained;
 
 /// RTL8821AE retained continuation up to `Prepared`: registry firmware
 /// (`rtl8821aefw_29.bin`, then `rtl8821aefw.bin`), the one-shot packet claim,
-/// DMA32 rings and the exact 8821AE LLT. Radio/MAC/station admission are not
-/// reachable for this profile yet; probe does not call this.
+/// DMA32 rings, the exact 8821AE LLT and the parked MAC/BB/RF hardware init.
+/// Channel/power/station admission are not reachable for this profile yet;
+/// probe does not call this.
 pub(super) async fn prepare_rtl8821ae(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
+    factory: Arc<super::efuse::Factory>,
 ) -> Result<(), Error> {
     if firmware.device_id() != super::regs::RTL_DEV_8821AE
         || firmware.status().stage != super::firmware_transport::Stage::Detected
@@ -168,7 +170,14 @@ pub(super) async fn prepare_rtl8821ae(
     }
     firmware.initialize_registered().await?;
     let prepared = allocate(firmware, 128)?;
-    prepare_retained(&retained, prepared).await
+    prepare_retained(&retained, prepared).await?;
+    let mut storage = retained.lock().await;
+    storage
+        .as_mut()
+        .ok_or(Error::State)?
+        .configure_rtl8821ae(&factory)
+        .await
+        .map(|_| ())
 }
 pub(super) async fn initialize_registered(
     firmware: Arc<Owner<PciIo>>,

@@ -600,3 +600,184 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_c2h_tx_and_ra_reports
 );
+
+// ── Parked hw_init: init_mac remainder, MAC/BB/RF tables, hw_configure ────
+
+/// (registers, ordered writes as (width, reg, value))
+type RegState = (Vec<u8>, Vec<(u8, u16, u32)>);
+struct RegFake(IrqSafeSpinLock<RegState>);
+#[async_trait::async_trait]
+impl Io for RegFake {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        Ok(self.0.lock().0[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        Ok(u32::from_le_bytes(g.0[r..r + 4].try_into().unwrap()))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.0[usize::from(reg)] = value;
+        g.1.push((1, reg, value.into()));
+        Ok(())
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.0[r..r + 2].copy_from_slice(&value.to_le_bytes());
+        g.1.push((2, reg, value.into()));
+        Ok(())
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.0[r..r + 4].copy_from_slice(&value.to_le_bytes());
+        g.1.push((4, reg, value));
+        Ok(())
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+
+fn provisioned_logical() -> [u8; 512] {
+    let mut map = [0xffu8; 512];
+    map[0] = 0x29;
+    map[1] = 0x81;
+    map[phy::EEPROM_XTAL] = 0x25;
+    map[phy::EEPROM_RFE_OPTION] = 0x80;
+    map
+}
+
+fn smoke_rtl8821ae_parked_hw_init_mac_bb_rf_order() -> TestResult {
+    let logical = provisioned_logical();
+    let condition = match headerfile::Condition::from_hardware(0x0000_1000, 0, &logical) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("provisioned condition rejected"),
+    };
+    let mut regs = vec![0u8; 0x1000];
+    regs[0x10c] = 0x0a;
+    regs[0x286] = 0x04;
+    regs[0x002] = 0x01;
+    let io = RegFake(IrqSafeSpinLock::new((regs, Vec::new())));
+    let mac_addr = [0x00, 0xe0, 0x4c, 0x88, 0x21, 0x01];
+    let report =
+        match narf_scheduler::block_on(mac::configure(&io, &condition, &logical, &mac_addr)) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("parked 8821AE hw_init failed on model"),
+        };
+    let g = io.0.lock();
+    let (r, trace) = (&g.0, &g.1);
+    let r32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+    if r[0x004] & 0x10 == 0
+        || r[0x423] != 0xff
+        || r[0x041] & 0x10 != 0
+        || u16::from_le_bytes([r[0x10c], r[0x10d]]) != 0xf5ba
+        // The MAC table (written after init_mac) rewrites RCR bytes 0x608/9.
+        || !trace.contains(&(4, 0x608, mac::RCR))
+        || r[0x303] != 0x77
+        || r[0x577] != 3
+        || r[0x100] != 0
+        || r[0x301] != 0
+    {
+        return TestResult::Fail("init_mac remainder / CR or PCIe DMA touched");
+    }
+    let bb = trace
+        .iter()
+        .position(|w| *w == (1, 0x002, 0x41))
+        .unwrap_or(usize::MAX);
+    if bb == usize::MAX
+        || trace.get(bb + 1) != Some(&(1, 0x002, 0x43))
+        || trace.get(bb + 2) != Some(&(1, 0x01f, 7))
+        || trace.get(bb + 3) != Some(&(1, 0x076, 7))
+    {
+        return TestResult::Fail("BB enable order (FEN_PCIEA, BB resets, RF_CTRL, OPT_CTRL)");
+    }
+    let mac_rows = phy::selected(tables::MAC, &condition);
+    let first = mac_rows[0];
+    if trace
+        .iter()
+        .position(|w| *w == (1, first.0 as u16, first.1 & 0xff))
+        .is_none_or(|at| at > bb)
+    {
+        return TestResult::Fail("MAC table not written before BB config");
+    }
+    let rf_rows: Vec<_> = phy::selected(tables::RADIOA, &condition)
+        .into_iter()
+        .filter(|&(a, _)| a != 0xfe && a != 0xffe)
+        .collect();
+    let rf_writes: Vec<_> = trace.iter().filter(|w| w.1 == phy::RA_LSSIWRITE).collect();
+    if rf_rows.is_empty()
+        || rf_writes.len() != rf_rows.len()
+        || rf_writes[0].2 != ((rf_rows[0].0 & 0xff) << 20 | (rf_rows[0].1 & 0xfffff)) & 0x0fff_ffff
+    {
+        return TestResult::Fail("RF path A LSSI writes");
+    }
+    if (r32(0x2c) >> 12) & 0xfff != 0x25 | (0x25 << 6)
+        || report.crystal_cap != 0x25
+        || report.rfe_type != 4
+    {
+        return TestResult::Fail("crystal cap / RFE type");
+    }
+    if r32(0x440) != 0xfff
+        || u16::from_le_bytes([r[0x4ca], r[0x4cb]]) != 0x1f1f
+        || r[0x550] != 0x1d
+        || r[0x610..0x616] != mac_addr
+        || r[0x652] != mac::NAV_UPPER
+        || r[0x680] != 0
+        || r[0x286] & 4 != 0
+    {
+        return TestResult::Fail("hw_configure / station identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_parked_hw_init_mac_bb_rf_order
+);
+
+fn smoke_rtl8821ae_rfe_type_and_crystal_rules() -> TestResult {
+    let mut logical = provisioned_logical();
+    let base = headerfile::Condition {
+        cut: 1,
+        board_type: 0,
+        external_pa_2g: false,
+        external_lna_2g: false,
+        external_pa_5g: false,
+        external_lna_5g: false,
+    };
+    let ext = |pa5, lna2, pa2| headerfile::Condition {
+        external_lna_5g: true,
+        external_pa_5g: pa5,
+        external_lna_2g: lna2,
+        external_pa_2g: pa2,
+        ..base
+    };
+    let cases = [
+        (base, 4),
+        (ext(false, false, false), 2),
+        (ext(true, false, false), 0),
+        (ext(true, true, true), 3),
+    ];
+    for (condition, expected) in cases {
+        if phy::rfe_type(&logical, &condition) != Ok(expected) {
+            return TestResult::Fail("BIT7 RFE option decision tree");
+        }
+    }
+    logical[phy::EEPROM_RFE_OPTION] = 0x04;
+    // The 4 -> 2 external-amplifier override is RTL8812AE-only.
+    if phy::rfe_type(&logical, &ext(true, true, true)) != Ok(4) {
+        return TestResult::Fail("8812AE-only RFE override applied");
+    }
+    logical[phy::EEPROM_XTAL] = 0xff;
+    if phy::crystal_cap(&logical) != Ok(0x20) {
+        return TestResult::Fail("crystal cap 0xff default");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_rfe_type_and_crystal_rules
+);

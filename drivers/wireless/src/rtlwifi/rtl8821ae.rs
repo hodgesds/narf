@@ -24,6 +24,9 @@
 //!   page/self-reset sequence.
 //! - [`llt`] — `_rtl8821ae_llt_table_init` boundary/RQPN sequence.
 //! - [`trx`] — 40-byte TX / 24-byte RX status descriptors (`trx.h`).
+//! - [`mac`] / [`phy`] — parked `rtl8821ae_hw_init` hardware steps: the
+//!   `_rtl8821ae_init_mac` remainder, MAC/PHY_REG/AGC/RADIOA table walks, BB
+//!   enable, crystal cap, `_rtl8821ae_read_rfe_type`, `_rtl8821ae_hw_configure`.
 //! - [`c2h`] — C2H packet parsing (`rtl_c2h_content_parsing`): TX reports
 //!   (`rtl_tx_report_handler` V1) and RA reports
 //!   (`rtl8821ae_c2h_ra_report_handler`).
@@ -34,6 +37,8 @@ pub mod c2h;
 pub mod fw;
 pub mod headerfile;
 pub mod llt;
+pub mod mac;
+pub mod phy;
 pub mod power_limit;
 pub mod pwrseq;
 pub(crate) mod tables;

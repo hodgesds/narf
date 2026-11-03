@@ -143,6 +143,7 @@ pub struct Prepared<I: Io, M: Memory> {
     phase: Phase,
     published: bool,
     radio: Option<super::radio::Report>,
+    rtl8821ae: Option<super::rtl8821ae::phy::Report>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -236,6 +237,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             phase: Phase::Allocated,
             published: false,
             radio: None,
+            rtl8821ae: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
@@ -307,6 +309,37 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.radio = Some(report);
         self.phase = Phase::RadioConfigured;
         Ok(())
+    }
+    /// RTL8821AE BB/RF/MAC facts committed by [`Self::configure_rtl8821ae`].
+    pub fn rtl8821ae_report(&self) -> Option<super::rtl8821ae::phy::Report> {
+        self.rtl8821ae
+    }
+    /// Continue the same retained 8821AE owner through the parked
+    /// `rtl8821ae_hw_init` hardware steps. The table selector is qualified
+    /// from live `REG_SYS_CFG`/`REG_MULTI_FUNC_CTRL` and the retained factory
+    /// map; an unprovisioned or test-chip board selects nothing and fails.
+    /// Packet DMA, CR gates and IRQs stay closed; the channel is not set.
+    pub async fn configure_rtl8821ae(
+        &mut self,
+        factory: &super::efuse::Factory,
+    ) -> Result<super::rtl8821ae::phy::Report, Error> {
+        use super::rtl8821ae::headerfile;
+        if self.phase != Phase::Prepared || self.chip != Chip::Rtl8821ae {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let condition = headerfile::Condition::from_hardware(
+            self.io.read32(headerfile::REG_SYS_CFG)?,
+            self.io.read32(headerfile::REG_MULTI_FUNC_CTRL)?,
+            &factory.logical,
+        )
+        .map_err(|_| Error::State)?;
+        let report =
+            super::rtl8821ae::mac::configure(&self.io, &condition, &factory.logical, &factory.mac)
+                .await?;
+        self.rtl8821ae = Some(report);
+        self.phase = Phase::RadioConfigured;
+        Ok(report)
     }
     /// Prepare internal SRAM and masked, inactive native rings. The native
     /// Io validates current PCI authority/BME at each actual access. No helper

@@ -1484,10 +1484,28 @@ chain below is composed.
   claim, DMA32 rings and LLT; EE radio qualification refuses the 8821AE
   profile. Probe does not call it.
 
-Remaining for the `rtl8821ae` chip row: the rest of
-`_rtl8821ae_init_mac`/`rtl8821ae_hw_init` (CR/TRXDMA/RCR/queue bases, BB/RF
-enable, `rtl8821ae_phy_mac_config`/`bb_config`/`rf_config` over `headerfile`,
-power-by-rate and limit-to-index conversion, LCK/IQK `rtl8821ae_phy_iq_calibrate`),
+- `mac` / `phy` — parked `rtl8821ae_hw_init` hardware steps, reached by
+  `Prepared::configure_rtl8821ae` (Prepared → RadioConfigured; the EE
+  channel/MAC phases stay unreachable for this profile): the
+  `_rtl8821ae_init_mac` remainder (APS_FSMCO[4], HWSEQ, `0x7c[6]` by
+  SYS_CFG+3[0], GPIO_MUXCFG, HISR/HISRE W1C, FWIMR, TRXDMA `0xf5b1`, RCR
+  `0xf4007b0e`, RXFLTMAP2, PCIE_CTRL+3, INT_MIG, MCUTST_1, secondary CCA),
+  the MAC table (byte writes; it rewrites RCR bytes as in Linux), BB enable
+  (FEN_PCIEA then BB resets, RF_CTRL, OPT_CTRL+2), PHY_REG with per-row
+  delays, AGC dword rows, `cck_high_power`, crystal cap into
+  `REG_MAC_PHY_CTRL[23:12]` (EFUSE `0xb9`, `0xff` ⇒ `0x20`), `reg_837`, RADIOA
+  through `RA_LSSIWRITE_8821A` (`_rtl8821ae_phy_rf_serial_write`; serial
+  read with 20 us HSSI settle), `_rtl8821ae_hw_configure`, software crypto
+  (`SECR = 0`), MAC address, NAV upper 235 and the conditional RXDMA BIT2
+  release. `_rtl8821ae_read_rfe_type` follows the EFUSE `0xca` tree (the
+  4→2 override is 8812AE-only). The table condition comes from live SYS_CFG/
+  MULTI_FUNC_CTRL plus the factory map; unprovisioned or test chips fail.
+  Deferred to the packet owner as for EE: `REG_CR = 0x2ff`, PCIe DMA
+  release and IRQ masks (`IRQ_MASK`/`SYS_IRQ_MASK` recorded). Omitted: LED
+  refresh, ASPM back door (ASPM stays disabled) and hardware CAM crypto.
+
+Remaining for the `rtl8821ae` chip row: power-by-rate and limit-to-index
+conversion, LCK/IQK `rtl8821ae_phy_iq_calibrate`),
 channel/bandwidth switching (`rtl8821ae_phy_sw_chnl`, `set_bw_mode`), H2C
 (media status, RA mask, PS), interrupt delivery, the native packet/station
 owner and a signed per-board envelope. Tests in `rtl8821ae/tests.rs` are
