@@ -478,6 +478,9 @@ impl Hif for RadioModel {
         {
             return active_scan_tests::send(self, bytes).await;
         }
+        if data_tests::install_handles(self, &bytes[8..]) {
+            return data_tests::install_key(self, bytes);
+        }
         if data_tests::captures_management(self, &bytes[8..]) {
             return data_tests::capture_management(self, bytes);
         }

@@ -216,6 +216,7 @@ fn harness_version(
                     (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 }
                 },
             htt: firmware_version,
+            hardware_keys: false,
         },
     );
     *h.policy.lock() = Some(five_ghz_policy());

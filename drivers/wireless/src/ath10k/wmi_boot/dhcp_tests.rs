@@ -20,6 +20,8 @@ mod coexistence_conversation_tests;
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "hw_keys_conversation_tests.rs"]
+mod hw_keys_conversation_tests;
 #[path = "indoor_conversation_tests.rs"]
 mod indoor_conversation_tests;
 #[path = "offchannel_conversation_tests.rs"]
@@ -72,6 +74,8 @@ struct NativeFirmware {
     all_inventory: bool,
     features: u64,
     htt: (u8, u8),
+    /// Linux `cryptmode=0`: the radio offloads station keys (`pci.rs`).
+    hardware_keys: bool,
 }
 struct Harness {
     device: Arc<ModelDevice>,
@@ -200,6 +204,7 @@ impl Harness {
                 all_inventory: profile.2,
                 features: (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
                 htt: (3, 1),
+                hardware_keys: false,
             },
         )
     }
@@ -236,7 +241,7 @@ impl Harness {
     ) -> Self {
         let (profile, snapshot) = source;
         let hardware = profile.radio.hardware;
-        let mut radio = radio_boot_source_version(
+        let radio = radio_boot_source_version(
             version,
             dialect,
             profile.features,
@@ -245,6 +250,7 @@ impl Harness {
             profile.ht,
             profile.radio,
         );
+        let mut radio = radio.with_hardware_keys(profile.hardware_keys);
         radio.htt.wmi.htc.transport.frequency = frequency;
         if let Some(database) = &snapshot {
             radio.beacon_policy_for_test(database.clone());

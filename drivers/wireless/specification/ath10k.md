@@ -1712,11 +1712,26 @@ Native cases (written, unexecuted): `smoke_ath10k_hw_keys_install_struct_dialect
 `smoke_station_ccmp_offload_header_only_shares_tx_pn`,
 `smoke_station_ccmp_offload_decrypted_receive_keeps_replay`,
 `smoke_station_ccmp_offload_management_uses_management_counter` (shared
-crate). The composed RAW data tests still construct the software profile; a
-composed hardware-key conversation (model firmware decrypting/encrypting with
-installed keys) is not yet written. Coordinated release compilation, native
-execution and physical firmware/board acceptance are pending; no physical
-key-cache behaviour is claimed.
+crate). The composed RAW data tests construct the software profile; the
+production default is covered by the composed conversation
+`smoke_ath10k_hw_keys_composed_install_data_rekey_and_pmf`
+(`wmi_boot/hw_keys_conversation_tests.rs`, main, 10.2 and TLV over the
+actual CE/HTT/WMI/netdev path with MFP firmware and a WPA2-PMF FakeAp). Its
+model firmware (`data_tests.rs` `HwKeyCache`) holds only what
+`WMI_VDEV_INSTALL_KEY` programmed, validates the packed/TLV command from
+wmi.h, answers with `SEC_IND`, encrypts header-only RAW TX and PMF
+management at the host PN, and decrypts RAW RX and PMF unicast management
+with its keys; the FakeAp still opens every uplink with its own PTK and
+replay counter. Covered: PTK then GTK install (IGTK not programmed), TX
+through the firmware, a firmware-decrypted downlink admitted then its replay
+dropped, a firmware-decrypted SA Query answered header-only, a group rekey
+of slot 2 whose second install is held (a frame the firmware decrypts under
+the stale GTK is dropped, an undecrypted frame under the new GTK takes the
+software path, the released `SEC_IND` re-admits decrypted traffic), and a
+replayed then fresh firmware-decrypted protected deauthentication.
+Coordinated release compilation, native execution and physical
+firmware/board acceptance are pending; no physical key-cache behaviour is
+claimed.
 
 ## 4. Invariants
 

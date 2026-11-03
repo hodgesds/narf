@@ -127,6 +127,10 @@ pub(super) struct Fixture {
     wmm_fail: bool,
     wmm_policy: Option<TestPolicy>,
     qos_frames: usize,
+    /// Replay counter of the AP's next group-key handshake request.
+    group_replay: u64,
+    /// Firmware key cache of the hardware-key profile (Linux `cryptmode=0`).
+    pub(super) hw: Option<Box<HwKeyCache>>,
 }
 /// Source-derived VHT expectations: the exact association-request VHT
 /// Capabilities body and the native PEER_ASSOC/VDEV_START VHT words.
@@ -200,6 +204,8 @@ impl Fixture {
             wmm_fail: false,
             wmm_policy: None,
             qos_frames: 0,
+            group_replay: 3,
+            hw: None,
             group_replies: 0,
             pfc_responses: Vec::new(),
             server: DhcpServer::new(network()),
@@ -292,7 +298,7 @@ impl Fixture {
             let pdu = body.get(8..).ok_or(BmiError::BadResponse)?;
             let key = KeyFrame::decode(pdu.get(4..).ok_or(BmiError::BadResponse)?, 16)
                 .ok_or(BmiError::BadResponse)?;
-            if key.key_information != 0x302 || key.replay_counter != 3 {
+            if key.key_information != 0x302 || key.replay_counter != self.group_replay {
                 return Err(BmiError::BadResponse);
             }
             let mut checked = pdu.to_vec();
@@ -359,11 +365,16 @@ impl Fixture {
         frame
     }
     fn group_rekey(&mut self) -> Vec<u8> {
+        self.group_rekey_with(2, [0x66; 16])
+    }
+    /// A group-key handshake request delivering `gtk` under `key_id`, with
+    /// the current `group_replay` counter.
+    pub(super) fn group_rekey_with(&mut self, key_id: u8, gtk: [u8; 16]) -> Vec<u8> {
         let ptk = self.ptk.as_ref().unwrap();
         let mut clear = vec![48, 20];
         clear.extend_from_slice(&narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body());
-        clear.extend_from_slice(&[0xdd, 22, 0, 0x0f, 0xac, 1, 2, 0]);
-        clear.extend_from_slice(&[0x66; 16]);
+        clear.extend_from_slice(&[0xdd, 22, 0, 0x0f, 0xac, 1, key_id, 0]);
+        clear.extend_from_slice(&gtk);
         if clear.len() % 8 != 0 {
             clear.push(0xdd);
         }
@@ -373,7 +384,7 @@ impl Fixture {
         let mut key = KeyFrame::empty(16);
         key.key_information = 0x1382;
         key.key_length = 16;
-        key.replay_counter = 3;
+        key.replay_counter = self.group_replay;
         key.key_data =
             narf_crypto::aes_kw::aes_wrap(ptk.kek.as_slice().try_into().unwrap(), &clear).unwrap();
         let mut pdu = key.into_eapol();
@@ -553,6 +564,7 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || word(at + 16) != 7
             || word(at + 20)
                 != ((if secured { 5 } else { 1 })
+                    | f.hw.as_ref().map_or(0, |h| h.pmf_flag)
                     | if qos { 2 } else { 0 }
                     | if ht { 0x1000 } else { 0 }
                     | if f.ht_secondary.is_some() { 0x2000 } else { 0 }
@@ -806,7 +818,8 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         || bytes[5] != m.inner.sequence
         || bytes[2..4] != (bytes.len() as u16 - 8).to_le_bytes()
         || body.len() < 16
-        || body[..2] != [1, 5]
+        || body[0] != 1
+        || !matches!(body[1], 1 | 5)
         || body[12..16] != [0xff, 0xff, 0, 0]
     {
         return Err(BmiError::BadResponse);
@@ -832,6 +845,15 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         }
     }
     let fixture = m.data.as_mut().unwrap();
+    // flags0 without HTT_DATA_TX_DESC_FLAGS0_NO_ENCRYPT: the firmware
+    // encrypts the header-only MPDU with its installed pairwise key.
+    let encrypted;
+    let frame = if body[1] == 1 {
+        encrypted = fixture.firmware_encrypt(frame)?;
+        &encrypted[..]
+    } else {
+        frame
+    };
     let expected_tid = if frame[0] == 0x88 { 0 } else { 16 };
     if body[2..4] != (0x800u16 | (expected_tid << 6)).to_le_bytes() {
         return Err(BmiError::BadResponse);
@@ -930,6 +952,7 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         .take()
         .unwrap_or(if frame[0] == 0x88 { 0 } else { 16 });
     let protected = frame[1] & 0x40 != 0;
+    let decrypted = fixture.firmware_decrypt(&mut frame);
     let control = frame[0] == 0x84;
     let sequence = if control {
         0
@@ -945,7 +968,7 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         (1 << 31)
             | u32::from(per_frame.map_or(3, |d| d.0))
             | if control { 1 << 9 } else { 0 }
-            | if protected { 1 << 29 } else { 0 }
+            | if protected && !decrypted { 1 << 29 } else { 0 }
             | core::mem::take(&mut fixture.next_attention),
     );
     u32at(
@@ -1298,6 +1321,7 @@ pub(super) fn captures_management(m: &RadioModel, command: &[u8]) -> bool {
 pub(super) fn capture_management(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let command = &bytes[8..];
     let frame = mlme_tests::native_frame(m, command)?;
+    let frame = m.data.as_mut().unwrap().firmware_management_tx(frame)?;
     m.data.as_mut().unwrap().management_tx.push(frame);
     if m.inner.inner.dialect == Dialect::Tlv {
         let mut terminal = vec![16, 0, 0xa7, 1];
@@ -1410,4 +1434,289 @@ pub(super) async fn protection_send(m: &mut RadioModel, bytes: &[u8]) -> Result<
         core::future::pending::<()>().await;
     }
     Ok(())
+}
+
+/// Firmware key cache of the hardware-key profile: what Linux ath10k
+/// `cryptmode=0` firmware holds after `WMI_VDEV_INSTALL_KEY` (wmi.h
+/// `struct wmi_vdev_install_key_cmd`). The model encrypts header-only RAW
+/// MPDUs, decrypts received MPDUs and PMF unicast management with it, and
+/// answers each install with the HTT `SEC_IND` (htt.h
+/// `struct htt_security_indication`, htt_rx.c `install_key_done`).
+#[derive(Default)]
+pub(super) struct HwKeyCache {
+    /// (pairwise, key index, key) currently programmed.
+    pub(super) keys: Vec<(bool, u8, [u8; 16])>,
+    /// Every accepted install command.
+    pub(super) installs: usize,
+    /// PEER_ASSOC `peer_flags->pmf` this firmware expects (0: none).
+    pub(super) pmf_flag: u32,
+    /// Leave the next install unapplied (the stale key stays programmed and
+    /// no indication is sent) until `release_install`.
+    pub(super) hold: bool,
+    held: Option<(bool, u8, [u8; 16])>,
+    /// Header-only MPDUs the firmware encrypted.
+    pub(super) hardware_tx: usize,
+    /// Received MPDUs the firmware decrypted (no DECRYPT_ERR).
+    pub(super) decrypted_rx: usize,
+}
+impl HwKeyCache {
+    pub(super) fn key(&self, pairwise: bool, id: u8) -> Option<[u8; 16]> {
+        self.keys
+            .iter()
+            .find(|k| k.0 == pairwise && k.1 == id)
+            .map(|k| k.2)
+    }
+    pub(super) fn held(&self) -> bool {
+        self.held.is_some()
+    }
+}
+impl Fixture {
+    /// RAW TX without NO_ENCRYPT: `[header][CCMP header][plaintext][8 zero
+    /// MIC octets]` (mac80211 GENERATE_IV, htt_tx.c MIC tail). The firmware
+    /// encrypts with its pairwise key at the host's PN.
+    fn firmware_encrypt(&mut self, frame: &[u8]) -> Result<Vec<u8>, BmiError> {
+        let hw = self.hw.as_mut().ok_or(BmiError::BadResponse)?;
+        let key = hw.key(true, 0).ok_or(BmiError::BadResponse)?;
+        let header = if frame.first() == Some(&0x88) { 26 } else { 24 };
+        if frame.len() < header + 16 || frame[1] & 0x40 == 0 {
+            return Err(BmiError::BadResponse);
+        }
+        let (body, mic) = frame[header..].split_at(frame.len() - header - 8);
+        let (pn, key_id) = narf_wireless::ccmp::decode_ccmp_header(body[..8].try_into().unwrap())
+            .map_err(|_| BmiError::BadResponse)?;
+        if mic != [0; 8] || key_id != 0 {
+            return Err(BmiError::BadResponse);
+        }
+        let priority = if header == 26 { frame[24] & 15 } else { 0 };
+        let mut plain = body[8..].to_vec();
+        let mut out = frame[..header].to_vec();
+        out.extend_from_slice(
+            &narf_wireless::ccmp::protect(
+                &Ccm,
+                &frame[..header],
+                &key,
+                pn,
+                0,
+                priority,
+                false,
+                &mut plain,
+            )
+            .map_err(|_| BmiError::BadResponse)?,
+        );
+        hw.hardware_tx += 1;
+        Ok(out)
+    }
+    /// RX: an MPDU under a programmed key leaves the firmware decrypted with
+    /// Protected, CCMP header and MIC kept (htt_rx.c `is_decrypted`); any
+    /// other protected MPDU keeps its ciphertext and DECRYPT_ERR.
+    fn firmware_decrypt(&mut self, frame: &mut Vec<u8>) -> bool {
+        let Some(hw) = self.hw.as_mut() else {
+            return false;
+        };
+        if frame.len() < 24 || !matches!(frame[0], 8 | 0x88) || frame[1] & 0x40 == 0 {
+            return false;
+        }
+        let header = if frame[0] == 0x88 { 26 } else { 24 };
+        if frame.len() < header + 16 {
+            return false;
+        }
+        let key_id = frame[header + 3] >> 6;
+        let key = if frame[4] & 1 == 0 {
+            hw.key(true, 0).filter(|_| key_id == 0)
+        } else {
+            hw.key(false, key_id)
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        let priority = if header == 26 { frame[24] & 15 } else { 0 };
+        let mut wire = frame[header..].to_vec();
+        let mic = wire[wire.len() - 8..].to_vec();
+        let mut replay = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+        let Ok(plain) = narf_wireless::ccmp::unprotect(
+            &Ccm,
+            &frame[..header],
+            &key,
+            priority,
+            false,
+            &mut replay,
+            &mut wire,
+        ) else {
+            return false;
+        };
+        frame.truncate(header + 8);
+        frame.extend_from_slice(&plain);
+        frame.extend_from_slice(&mic);
+        hw.decrypted_rx += 1;
+        true
+    }
+    /// WMI management TX on a `peer_flags->pmf` peer: a protected unicast
+    /// robust frame carries only the CCMP header plus MIC space (wmi.c
+    /// `ath10k_wmi_op_gen_mgmt_tx`) and the firmware encrypts it with the
+    /// pairwise key (management nonce/AAD). Other frames pass unchanged.
+    fn firmware_management_tx(&mut self, frame: Vec<u8>) -> Result<Vec<u8>, BmiError> {
+        let Some(hw) = self.hw.as_mut() else {
+            return Ok(frame);
+        };
+        let Some(key) = hw.key(true, 0).filter(|_| hw.pmf_flag != 0) else {
+            return Ok(frame);
+        };
+        if frame.len() < 24 || frame[1] & 0x40 == 0 || frame[4] & 1 != 0 {
+            return Ok(frame);
+        }
+        if frame.len() < 24 + 16 || frame[frame.len() - 8..] != [0; 8] {
+            return Err(BmiError::BadResponse);
+        }
+        let (pn, key_id) =
+            narf_wireless::ccmp::decode_ccmp_header(frame[24..32].try_into().unwrap())
+                .map_err(|_| BmiError::BadResponse)?;
+        if key_id != 0 {
+            return Err(BmiError::BadResponse);
+        }
+        let mut plain = frame[32..frame.len() - 8].to_vec();
+        let mut out = frame[..24].to_vec();
+        out.extend_from_slice(
+            &narf_wireless::ccmp::protect(&Ccm, &frame[..24], &key, pn, 0, 0, true, &mut plain)
+                .map_err(|_| BmiError::BadResponse)?,
+        );
+        hw.hardware_tx += 1;
+        Ok(out)
+    }
+    /// WMI management RX on a `peer_flags->pmf` peer: the firmware decrypts
+    /// a protected unicast robust frame with the pairwise key and keeps
+    /// Protected, CCMP header and MIC (wmi.c `ath10k_wmi_rx_is_decrypted`).
+    pub(super) fn firmware_management_rx(&mut self, frame: Vec<u8>) -> Vec<u8> {
+        let Some(hw) = self.hw.as_mut() else {
+            return frame;
+        };
+        let Some(key) = hw.key(true, 0).filter(|_| hw.pmf_flag != 0) else {
+            return frame;
+        };
+        if frame.len() < 24 + 16 || frame[1] & 0x40 == 0 || frame[4] & 1 != 0 {
+            return frame;
+        }
+        let mut wire = frame[24..].to_vec();
+        let mic = wire[wire.len() - 8..].to_vec();
+        let mut replay = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+        let Ok(plain) = narf_wireless::ccmp::unprotect(
+            &Ccm,
+            &frame[..24],
+            &key,
+            0,
+            true,
+            &mut replay,
+            &mut wire,
+        ) else {
+            return frame;
+        };
+        let mut out = frame[..32].to_vec();
+        out.extend_from_slice(&plain);
+        out.extend_from_slice(&mic);
+        hw.decrypted_rx += 1;
+        out
+    }
+}
+/// `vdev_install_key_cmdid` (wmi.h main/TLV maps 0x5009; 10.1 0x901b;
+/// 10.2 0x901a; 10.4 0x901d).
+fn install_id(dialect: Dialect) -> u32 {
+    match dialect {
+        Dialect::Main | Dialect::Tlv => 0x5009,
+        Dialect::TenOne => 0x901b,
+        Dialect::TenTwo | Dialect::TenTwoFour => 0x901a,
+        Dialect::TenFour => 0x901d,
+    }
+}
+pub(super) fn install_handles(m: &RadioModel, command: &[u8]) -> bool {
+    m.data.as_ref().is_some_and(|d| d.hw.is_some())
+        && command.get(..4) == Some(&install_id(m.inner.inner.dialect).to_le_bytes()[..])
+}
+/// Firmware side of `WMI_VDEV_INSTALL_KEY`: vdev 0, the BSSID peer, a
+/// CCMP-128 (`WMI_CIPHER_AES_CCM` = 4) pairwise (key 0) or group key, zero
+/// RSC/TSC and MIC lengths; TLV wraps the struct in tag 96 and the key in an
+/// ARRAY_BYTE (17) TLV (wmi-tlv.c `ath10k_wmi_tlv_op_gen_vdev_install_key`).
+pub(super) fn install_key(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let tlv = m.inner.inner.dialect == Dialect::Tlv;
+    let c = &bytes[8..];
+    let at = if tlv { 8 } else { 4 };
+    let size = at + 92 + if tlv { 4 } else { 0 } + 16;
+    let word = |o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+    if c.len() != size
+        || tlv && word(4) != (96 << 16) | 92
+        || word(at) != 0
+        || c[at + 4..at + 10] != AP
+        || c[at + 10..at + 12] != [0, 0]
+        || word(at + 12) > 3
+        || word(at + 16) > 1
+        || word(at + 16) == 0 && word(at + 12) != 0
+        || word(at + 20) != 4
+        || c[at + 24..at + 80].iter().any(|b| *b != 0)
+        || word(at + 80) != 16
+        || word(at + 84) != 0
+        || word(at + 88) != 0
+        || tlv && word(at + 92) != (17 << 16) | 16
+    {
+        return Err(BmiError::BadResponse);
+    }
+    let key = (
+        word(at + 16) == 0,
+        word(at + 12) as u8,
+        c[size - 16..].try_into().unwrap(),
+    );
+    m.sent.push(bytes.to_vec());
+    m.inner.inner.rx.push_back((
+        2,
+        vec![
+            2,
+            2,
+            8,
+            0,
+            8,
+            0,
+            0,
+            0,
+            1,
+            4,
+            0,
+            0,
+            2,
+            bytes.len().div_ceil(256) as u8,
+            0,
+            0,
+        ],
+    ));
+    let hw = m.data.as_mut().unwrap().hw.as_mut().unwrap();
+    hw.installs += 1;
+    if hw.hold {
+        hw.hold = false;
+        hw.held = Some(key);
+    } else {
+        apply_install(m, key);
+    }
+    Ok(())
+}
+/// Program a held install and send its indication.
+pub(super) fn release_install(m: &mut RadioModel) {
+    if let Some(key) = m
+        .data
+        .as_mut()
+        .and_then(|d| d.hw.as_mut())
+        .and_then(|h| h.held.take())
+    {
+        apply_install(m, key);
+    }
+}
+fn apply_install(m: &mut RadioModel, key: (bool, u8, [u8; 16])) {
+    let hw = m.data.as_mut().unwrap().hw.as_mut().unwrap();
+    hw.keys.retain(|k| !(k.0 == key.0 && k.1 == key.1));
+    hw.keys.push(key);
+    let peer: u16 = if m.inner.config.pfc { 17 } else { 1800 };
+    // HTT_SECURITY_AES_CCMP (6) | HTT_SECURITY_IS_UNICAST, peer_id, then
+    // michael_key[8] and wapi_rsc[16].
+    let mut b = vec![0x0b, if key.0 { 0x86 } else { 6 }];
+    b.extend_from_slice(&peer.to_le_bytes());
+    b.extend_from_slice(&[0; 24]);
+    m.inner
+        .inner
+        .rx
+        .push_back((m.inner.receive_pipe, header(1, &b)));
 }
