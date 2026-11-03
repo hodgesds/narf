@@ -239,6 +239,37 @@ training, visible pixels, a general resource/retirement receipt or permission to
 free scanout frames. Pre-stop fixed-window GGTT/cache bootstrap, inherited
 producer exclusion and a full retained async modeset owner remain unresolved.
 
+### Meteor/Arrow Lake display DSC and panel fitter
+
+`drm_dsc` (ungated) holds DRM's VESA DSC helpers: `Pps` (drm_dsc_config),
+`compute_rc_parameters`, `pack_pps`, `set_rc_buf_thresh` and
+`dp_pps_header`; `amdgpu_dsc` re-exports `Pps` and `pack_pps`.
+`intel_gpu_xelpg_dsc` is Linux's display-14 DSC: `DscDpcd` (the sink's
+0x060..0x06F capabilities), `EdpCaps::read`/`limits`, `read_dp_sink`
+(`DpDscSink`), `uncompressed_link`, `decide_edp(caps, &EdpVbt, mode)`
+(`EdpDecision::{NotCapable, Uncompressed, Dsc}`), `decide_dp(sink, limits,
+mode)` and `compute`, returning a `DscPlan` (link, compressed bpp, slices,
+engines, FEC, `Pps`) or a typed `DscRefusal`. `DscPlan` gives
+`engine_writes(pipe)`, `pps_values`, `pps_sdp`, `m_n(mode)`,
+`min_cdclk_khz(mode)` and `term(mode)` (`DscTerm`). `enable_engines`,
+`disable_engines`, `engines_enabled`, `read_term`, `write_pps_sdp`,
+`disable_pps_sdp`, `write_m_n`, `enable_fec`, `disable_fec` and
+`wait_fec_live` program the source; `set_sink_decompression`,
+`set_sink_fec_ready` and `wait_fec_detected` the sink.
+`install_edp_vbt`/`installed_edp_vbt` hold the VBT's eDP `dsc_disable` and
+`max_link_rate` (`EdpVbt`, installed by `intel_gpu_vbt::install_for_probe`).
+The MTL Pipe A modeset compresses when `decide_edp` says so and returns
+`ModesetError::Dsc(DscRefusal)` before any destructive write otherwise;
+`MtlSinkProbe::dsc` carries an external DP route's plan and
+`ExternalError::Dsc` its refusal. The display-14 resource request
+(`intel_gpu_display_resources::request_dsc`, `initialize_dsc`) carries the
+pipe's `DscTerm`; `pipe_a_dsc` reads it back from Pipe A's engines.
+`intel_gpu_xelpg_scaler` models the panel fitter (`panel_fit`, `plan`,
+`PipeScaler::enable_writes`, `disable_writes`, `nearest_filter_writes`,
+`calc_phase`, `prefill_lines`; `ScalerRefusal`) without a production
+caller. `intel_gpu_pipes::TranscoderProgram::vblank_display13` is the
+display 13+ `TRANS_VBLANK` value both display-14 writers use.
+
 ### Fixed opaque XR30 primary input
 
 The owned fixed MTL/Arrow display14.00 internal Pipe-A/DDI-A profile accepts

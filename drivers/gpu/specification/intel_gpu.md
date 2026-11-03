@@ -1626,6 +1626,11 @@ trusted.
   `dp_link_training`; levels are staged before training and
   re-applied after, the same simplification class as Gen12's
   preloaded DDI_BUF_TRANS table).
+- DSC is owned by `intel_gpu_xelpg_dsc` (§20, "Display-14 DSC"): the
+  Pipe A eDP panel compresses when Linux would, and external DP routes
+  compress with FEC. Bigjoiner, the uncompressed joiner, more than four
+  slices, 6 bpc and UHBR stay refused. The pipe scaler for panel fitting
+  is modeled (`intel_gpu_xelpg_scaler`) but not wired into a modeset.
 - §5's device table is unchanged by this lane: the MTL DIDs
   were already in the census; only their display gate moved.
 ## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
@@ -2387,8 +2392,8 @@ production feature. Unsupported functionality remains unadvertised.
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; GSC HECI packets are modelled but unwired; GSCCS, GSC load, GSC HuC authentication, GT1 frequency/idle sysfs and silicon acceptance remain |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
-| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; pipe scalers, bigjoiner, DSC and VRR remain |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
+| Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); the pipe-scaler panel fitter is modeled but not wired; bigjoiner and VRR remain |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); TBT, HDMI FRL, UHBR, a second concurrent external route, PSR2 selective fetch and Panel Replay open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
@@ -5229,3 +5234,131 @@ Review against Linux b90c984d agreed on the following:
   uC load.
 
 The debug group pass is deferred to the end of the current integration wave.
+
+### Display-14 DSC, the panel-fitter model and TRANS_VBLANK — native fixtures added
+
+This slice adds Display Stream Compression to the Meteor Lake display,
+models the pipe scaler, and fixes one register value. Sources are Linux
+b90c984d: `intel_dp.c` (`intel_dp_compute_link_config`,
+`intel_dp_compute_link_config_wide`, `intel_dp_compute_config_limits`,
+`intel_dp_dsc_compute_config`, `intel_dp_dsc_get_slice_count`,
+`intel_dp_dsc_compute_params`, `intel_edp_init_dpcd`,
+`intel_dp_get_dsc_sink_cap`), `intel_vdsc.c`, `intel_vdsc_regs.h`,
+`intel_qp_tables.c`, `drm_dsc_helper.c`, `drm_dp_helper.c`, `intel_ddi.c`
+(`mtl_ddi_pre_enable_dp`, `intel_ddi_post_disable`, the FEC helpers),
+`intel_hdmi.c::hsw_write_infoframe`, `intel_display.c`
+(`hsw_crtc_enable`, `intel_link_compute_m_n`,
+`intel_set_transcoder_timings`), `intel_cdclk.c::intel_crtc_min_cdclk`,
+`skl_prefill.c`, `skl_scaler.c`, `intel_pfit.c` and `drm_rect.c`.
+
+**The decision.** NARF's pipe runs at 8 bpc, so the decision is Linux's
+with `max bpc` 8. When 24 bpp fits the link, the stream stays uncompressed.
+When only 18 bpp fits, Linux would drive 6 bpc, which this pipe does not
+offer, so the modeset refuses. Otherwise the stream is compressed when
+the sink decompresses. On eDP the plan takes the panel's maximum link and
+its maximum bpp and slice count. On DP it takes the highest compressed
+bpp that fits with FEC's overhead, then the lowest rate and lane count,
+and Linux's slice count for the sink's throughput and slice width. The
+rate-control parameters follow `calculate_rc_params` with the 8 bpc
+tables, then the shared `drm_dsc_compute_rc_parameters`. Refusals are
+typed `DscRefusal`s: no DSC or RGB, the VBT's `edp.dsc_disable`, a VBT
+that picks its panel by PnP ID, no FEC on DP, no bpp range, link or slice
+count, more than four slices (two engines, no joiner), invalid slice
+dimensions, line buffer or rate control, an intermediate maximum rate, a
+branch device, and an eDP stream its maximum link cannot carry (Linux
+does not check that case). The DRM helpers Intel shares with AMD moved
+into the ungated `drm_dsc` module; `amdgpu_dsc` re-exports them.
+
+**The eDP panel.** The Pipe A modeset reads the panel's receiver caps,
+eDP revision, eDP 1.4 rate table and DSC caps before it stops anything,
+so a refusal leaves the panel as it was. A panel that is not DSC capable
+keeps the existing sequence. A compressed modeset programs the PHY PLL
+and trains at the plan's link, writes `DP_SET_POWER` D0 and
+`DP_DSC_ENABLE` before training, and refuses a training fallback,
+because the configuration was computed for that link. After the normal
+pattern it writes the PPS SDP, Pipe A's VDSC engines (`ICL_DSC0/1` at
+0x78000, since every display 12+ pipe owns its engines), the compressed
+M/N with TU 64, and the display-14 `CHICKEN_TRANS` bits, then enables
+the transcoder. A panel firmware left compressing is torn down in Linux's
+order: sink decompression off, the transcoder off, then `DSS_CTL1/2` and
+the PPS SDP enable cleared.
+
+**External DP.** A DPCD 1.4 sink reports its DSC and FEC capabilities at
+probe. A compressed route writes `DP_DSC_ENABLE` and
+`DP_FEC_CONFIGURATION` before training, enables FEC in `DP_TP_CTL` and
+writes the PPS SDP after the normal pattern, then programs the route
+pipe's engines and the compressed M/N. After the transcoder enable it
+waits for the FEC status as Linux does, and like Linux only notes a
+timeout. The stop reverses the sequence. PM demand uses the plan's link
+rate. A sink that does not decompress keeps the `OverBudget` refusal.
+
+**Resources.** A compressing pipe adds `intel_vdsc_min_cdclk` to the
+CDCLK minimum and 1.5 lines of DSC prefill to the watermark vblank check.
+`PipeRequest` and `ExternalPipe` carry the term. The owned modeset passes
+the planned term. Every later proof of the panel layout (the KMS profile
+capture, the retained primary, the Pipe B–D adoption) reads the term back
+from Pipe A's engines, as `intel_dsc_get_config` does. The inherited
+layout raises CDCLK to the VDSC minimum too.
+
+**The panel fitter.** `intel_gpu_xelpg_scaler` models
+`pch_panel_fitting`'s window (centered, aspect and fullscreen), scaler
+admission with display 14's limits, `skl_pfit_enable`'s register image,
+the nearest-neighbour coefficient table, `skl_scaler_disable` and the
+scaler prefill lines. Downscaling is refused, because it raises the pipe
+pixel rate and with it CDCLK and the watermarks. The model has no
+production caller. A fitted Pipe A also needs the KMS owners to learn the
+pipe source size, since they size the primary from the transcoder timing.
+
+**TRANS_VBLANK.** Display 13+ writes 0 to the start field, because the
+hardware ignores it there. The Pipe A modeset and the Pipes B–D owner now
+do the same. The display-14 DSB timing proof compares only the end field;
+the Gen12 proof is unchanged.
+
+Remaining: 6 bpc output, the joiner, more than four slices, YCbCr DSC and
+fractional-bpp limits beyond the sink's increment, UHBR DSC, MST DSC,
+`DP_LINK_RATE_SET` training for eDP panels that publish a rate table,
+the VBT's `edp.bpp` clamp, the DSC throughput quirk of branch devices
+(branches refuse), and the panel fitter's wiring. The Gen12 orchestrator
+still writes the display-12 `TRANS_VBLANK` value on display-13 ADL.
+Physical Intel acceptance is open.
+
+Fixtures, all new and unexecuted in this slice:
+
+- `drivers/gpu/drm_dsc`: `smoke_drm_dsc_rc_buf_thresh_and_pps_sdp_header`.
+- `drivers/gpu/intel_gpu_xelpg_dsc`:
+  `smoke_xelpg_dsc_dpcd_accessors_follow_drm_dp_helper`,
+  `smoke_xelpg_dsc_edp_oled_config_matches_linux`,
+  `smoke_xelpg_dsc_edp_single_slice_dsc11_matches_linux`,
+  `smoke_xelpg_dsc_dp_fec_config_matches_linux`,
+  `smoke_xelpg_dsc_edp_decision_and_refusals`,
+  `smoke_xelpg_dsc_dp_decision_and_refusals`,
+  `smoke_xelpg_dsc_engine_registers_per_pipe`,
+  `smoke_xelpg_dsc_program_enable_disable_sdp_mn_and_fec` and
+  `smoke_xelpg_dsc_sink_caps_decompression_and_fec_ready`. Their
+  rate-control, register, SDP, M/N and CDCLK values were produced by
+  Linux's own helper code compiled outside the kernel.
+- `drivers/gpu/intel_gpu_modeset_xelpg`:
+  `smoke_mtl_edp_dsc_modeset_programs_vdsc_pps_and_sink`,
+  `smoke_mtl_edp_dsc_refusals_precede_every_write`,
+  `smoke_mtl_modeset_tears_down_firmware_dsc_in_linux_order` and
+  `smoke_mtl_modeset_trans_vblank_start_field_is_zero`.
+- `drivers/gpu/intel_gpu_xelpg_external`:
+  `smoke_mtl_external_dp_dsc_with_fec_lights_and_stops` and
+  `smoke_mtl_external_dp_dsc_refusals_precede_programming`.
+- `drivers/gpu/intel_gpu_xelpg_resources`:
+  `smoke_xelpg_resources_dsc_pipe_adds_vdsc_cdclk_and_prefill`;
+  `drivers/gpu/intel_gpu_xelpg_wm`:
+  `smoke_xelpg_wm_dsc_prefill_adds_one_and_a_half_lines`.
+- `drivers/gpu/intel_gpu_xelpg_scaler`:
+  `smoke_xelpg_scaler_panel_fit_windows_follow_pch_panel_fitting`,
+  `smoke_xelpg_scaler_admission_scales_and_refusals`,
+  `smoke_xelpg_scaler_pfit_registers_and_nearest_coefficients` and
+  `smoke_xelpg_scaler_prefill_lines`.
+- `drivers/gpu/intel_gpu_xelpg_pipes`:
+  `smoke_xelpg_pipes_trans_vblank_start_field_is_zero_on_display14`;
+  `drivers/gpu/intel_gpu_dsb`:
+  `smoke_dsb_display14_timing_proves_vblank_end_only`.
+
+Test fixtures that build `PipeRequest` or `ExternalPipe` literals gain
+`dsc: None`. `MtlFake` logs its native DPCD writes, and the `ExtFake` sink
+models the DSC and FEC DPCD registers.
