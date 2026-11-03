@@ -664,21 +664,32 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     ) -> Result<(), Error> {
         self.io.station_passive_tx(grant)
     }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_retune_begin(
         &mut self,
         channel: u8,
         grant: Option<alloc::sync::Arc<super::qualification::Grant>>,
-    ) -> Result<bool, Error> {
-        self.io.station_retune_begin(channel, grant)
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_retune_begin(channel, grant) }
     }
-    fn station_width_begin(&mut self) -> Result<bool, Error> {
-        self.io.station_width_begin()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_width_begin(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_width_begin() }
     }
-    fn station_retune_iqk(&mut self) -> Result<(), Error> {
-        self.io.station_retune_iqk()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_retune_iqk() }
     }
-    fn station_retune_finish(&mut self, channel: u8) -> Result<u64, Error> {
-        self.io.station_retune_finish(channel)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_finish(
+        &mut self,
+        channel: u8,
+    ) -> impl core::future::Future<Output = Result<u64, Error>> + Send {
+        async move { self.io.station_retune_finish(channel) }
     }
     fn station_bind_tx_ba(
         &mut self,

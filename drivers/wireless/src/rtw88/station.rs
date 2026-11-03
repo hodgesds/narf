@@ -2049,7 +2049,12 @@ impl State {
         let mut quiet = false;
         for _ in 0..1000 {
             let g = grant.clone();
-            if self.admission.run(|| io.station_retune_begin(channel, g))? {
+            if firmware_transport::enclosed(
+                |op| self.admission.run(op),
+                io.station_retune_begin(channel, g),
+            )
+            .await?
+            {
                 quiet = true;
                 break;
             }
@@ -2063,7 +2068,11 @@ impl State {
         self.rfk_channel = None;
         let gate = self.admission.run(|| io.station_gate())?;
         super::channel_policy::program(io, &gate, rfk).await?;
-        self.admission.run(|| io.station_retune_finish(channel))?;
+        firmware_transport::enclosed(
+            |op| self.admission.run(op),
+            io.station_retune_finish(channel),
+        )
+        .await?;
         self.channel = channel;
         if rfk {
             self.rfk_channel = Some(channel);
@@ -2088,7 +2097,9 @@ impl State {
         self.retuning = true;
         let mut quiet = false;
         for _ in 0..1000 {
-            if self.admission.run(|| io.station_width_begin())? {
+            if firmware_transport::enclosed(|op| self.admission.run(op), io.station_width_begin())
+                .await?
+            {
                 quiet = true;
                 break;
             }
@@ -2116,7 +2127,11 @@ impl State {
             }
         }
         let channel = self.channel;
-        self.admission.run(|| io.station_retune_finish(channel))?;
+        firmware_transport::enclosed(
+            |op| self.admission.run(op),
+            io.station_retune_finish(channel),
+        )
+        .await?;
         self.rfk_channel = Some(channel);
         self.wide = true;
         self.phase = Phase::Passive;

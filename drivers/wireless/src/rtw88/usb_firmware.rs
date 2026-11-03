@@ -23,8 +23,12 @@
 //! Station-grant hooks: the PCI backend's signed-gate operations
 //! (extensions, HT/BA/protection/continuation/channel records, host bind)
 //! and an EP0 profile readback; publications are `Publication::usb`.
-//! Register-driving retune, widening, power-tracking maintenance and the
-//! HT program/PS quiet proofs keep the trait's `Unsupported` defaults.
+//! Retune (2.4/5 GHz primaries under N2xO records), widening (N2xB 40 MHz /
+//! N2xV 80 MHz), the in-retune IQK H2C, passive-primary TX grants and the
+//! HT-program quiet proof follow `pci_firmware.rs` over EP0/bulk; the C21
+//! RF/BB stages run unchanged over the asynchronous register `Io`.
+//! Power-tracking maintenance, the PS RX quiet proof and TX A-MPDU
+//! aggregation keep the trait's `Unsupported` defaults.
 use super::firmware_transport::{self, Error};
 use super::packet_core::{self, Step};
 use super::usb::{self, Endpoints, Registers, Speed};
@@ -114,6 +118,20 @@ pub(super) struct Backend<C: ControlIo, P: Bulk + Clone> {
     /// on close, stop, packet failure and quiesce.
     open: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     reclaimable: bool,
+    /// Committed operating primary and its retune epoch (initial 1, 1).
+    channel: u8,
+    channel_epoch: u64,
+    /// Target primary of an in-progress retune or widening (TX refused,
+    /// TXPAUSE = 0xff); `widening` marks the latter.
+    retune: Option<u8>,
+    widening: bool,
+    /// A committed N2xB (40 MHz) / N2xV (80 MHz) program.
+    wide: bool,
+    /// `pci_firmware.rs` `passive_tx`: TX grant on a passive-only primary.
+    passive_tx: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    /// Linux's running `h2c.seq` for the in-station IQK H2C (the PCI
+    /// backend's `tracking_sequence`).
+    h2c_sequence: u16,
 }
 impl<C: ControlIo, P: Bulk + Clone> core::fmt::Debug for Backend<C, P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -148,6 +166,13 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             backlog: Backlog::default(),
             open: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             reclaimable: false,
+            channel: 1,
+            channel_epoch: 1,
+            retune: None,
+            widening: false,
+            wide: false,
+            passive_tx: None,
+            h2c_sequence: 3,
         })
     }
     pub(super) fn registers(&self) -> &Registers<C> {
@@ -291,6 +316,105 @@ impl<C: ControlIo, P: Bulk + Clone> Backend<C, P> {
             .map_err(Error::Power)
     }
     /// `usb.c::rtw_usb_interface_cfg` speed this backend was probed at.
+    /// `pci_firmware.rs::committed_wide`.
+    fn committed_wide(&self) -> Result<Option<super::ht::Wide>, Error> {
+        if !self.wide {
+            return Ok(None);
+        }
+        let gate = self.gate_ref()?;
+        match (gate.vht_record(), gate.ht40_record()) {
+            (Some(v), None) => Ok(Some(super::ht::Wide::Eighty(v))),
+            (None, Some(r)) => Ok(Some(super::ht::Wide::Forty(r))),
+            _ => Err(Error::State),
+        }
+    }
+    /// `pci_firmware.rs::passive_tx_allowed`: on a passive-only committed
+    /// primary a frame is published only under the station's passive TX
+    /// grant for this primary and policy snapshot.
+    fn passive_tx_allowed(&self) -> Result<(), Error> {
+        let gate = self.gate_ref()?;
+        let Some(policy) = narf_wireless::reg::db::snapshot() else {
+            return Ok(());
+        };
+        if !gate.passive_in(&policy).map_err(Error::Power)? {
+            return Ok(());
+        }
+        match &self.passive_tx {
+            Some((primary, granted))
+                if *primary == gate.channel()
+                    && *primary == self.channel
+                    && alloc::sync::Arc::ptr_eq(granted, &policy) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Power(super::power_policy::Error::Policy)),
+        }
+    }
+    /// The USB counterpart of `pci_firmware.rs::retune_quiet`: no frame is
+    /// queued, in a bulk-OUT URB or awaiting its CCX report, no H2C bulk
+    /// receipt is outstanding, REG_TXDMA_PQ_MAP still carries this pipe
+    /// count's `rqpn_table_8821c` mapping and each REG_FIFOPAGE_INFO_1..4
+    /// queue reports all of its `page_table_8821c` pages free. There are no
+    /// TXBD ring indices on USB.
+    async fn transmit_quiet(&mut self) -> Result<bool, Error> {
+        if !self.backlog.is_empty()
+            || self.outstanding.is_some()
+            || !self.packets.as_ref().is_some_and(usb_packet::Owner::ready)
+        {
+            return Ok(false);
+        }
+        let (rqpn, pages) =
+            usb::usb_tables(usize::from(self.endpoints.out_count)).map_err(usb_error)?;
+        let r = &self.registers;
+        let map = r.read16(0x10c).await.map_err(usb_error)?;
+        if map == u16::MAX {
+            return Err(Error::Gone);
+        }
+        if map & 0xfff0 != usb::txdma_pq_map(rqpn) {
+            return Err(Error::Prerequisite);
+        }
+        for (reg, n) in [
+            (0x230, pages.hq),
+            (0x234, pages.nq),
+            (0x238, pages.lq),
+            (0x23c, pages.exq),
+        ] {
+            if r.read16(reg).await.map_err(usb_error)? != n {
+                return Err(Error::Prerequisite);
+            }
+            if r.read16(reg + 2).await.map_err(usb_error)? != n {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// REG_TXPAUSE = 0xff (once per retune) and its readback, then quiet.
+    async fn pause_quiet(&mut self, first: bool) -> Result<bool, Error> {
+        let r = &self.registers;
+        if first {
+            r.write8(0x522, 0xff).await.map_err(usb_error)?;
+        }
+        if r.read8(0x522).await.map_err(usb_error)? != 0xff {
+            return Err(Error::Prerequisite);
+        }
+        self.transmit_quiet().await
+    }
+    /// The only H2C packet a retune may send: `rtw8821c_do_iqk`
+    /// (`command::iqk8821c`) at the running sequence, on the H2C pipe with
+    /// MAC TX/RX already open (no CR rewrite).
+    fn retune_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
+        if self.outstanding.is_some() || *packet != super::command::iqk8821c(self.h2c_sequence) {
+            return Err(Error::State);
+        }
+        self.h2c_sequence = self.h2c_sequence.checked_add(1).ok_or(Error::State)?;
+        let result = usb::h2c_packet(packet)
+            .map_err(usb_error)
+            .and_then(|bytes| self.begin_out(usb::QSEL_H2C, &bytes));
+        self.fail(result)
+    }
+    fn retune_blocked(&self) -> bool {
+        self.state != State::Packets || self.mailbox_pending || self.outstanding.is_some()
+    }
     pub(super) fn speed(&self) -> Speed {
         self.speed
     }
@@ -473,6 +597,9 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
         let packet = *packet;
         async move {
+            if self.state == State::Packets && self.retune.is_some() {
+                return self.retune_h2c(&packet);
+            }
             if self.state != State::Commands {
                 return Err(Error::State);
             }
@@ -492,7 +619,9 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
         async move {
-            if self.state != State::Commands {
+            if self.state != State::Commands
+                && !(self.state == State::Packets && self.retune.is_some())
+            {
                 return Err(Error::State);
             }
             let result = self.poll_out();
@@ -569,10 +698,10 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     fn station_profile_readback(
         &mut self,
     ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
-        // `pci_firmware.rs` readback over EP0. USB has no retune/widening,
-        // so the HT readback is always the 20 MHz committed profile.
+        // `pci_firmware.rs` readback over EP0, at the committed width.
         async move {
             let gate = self.gate_ref()?.clone();
+            let wide = self.committed_wide()?;
             let r = Read(&self.registers);
             if let Some(w) = gate.power_tracking() {
                 w.readback(Read(&self.registers)).await?;
@@ -580,7 +709,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
                 w.temperature(((thermal >> 10) & 63) as u8)?;
             }
             if let Some(g) = gate.ht_grant() {
-                return g.readback_at(r, None).await;
+                return g.readback_at(r, wide.as_ref()).await;
             }
             if let Some((indices, channel)) = gate.c21_indices().map(|i| (i, gate.channel())) {
                 return super::radio8821c::operating_readback(r, indices, channel).await;
@@ -649,8 +778,11 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         &mut self,
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
         self.station_allowed()?;
-        let base = self.gate_ref()?.tx_base().ok_or(Error::State)?;
-        Ok(super::tx_ba_power::Source::Registered.load(base).ok())
+        // TX A-MPDU (`packet_aggregation`/`packet_submit_batch`) is not
+        // ported to `usb_packet::Owner`: a provisioned N21T record stays
+        // unbound rather than admitting an originator BA the TX path cannot
+        // aggregate.
+        Ok(None)
     }
     fn station_bind_tx_ba(
         &mut self,
@@ -740,6 +872,165 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
     ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
         Ok(narf_wireless::reg::db::snapshot())
     }
+    fn station_channel(&self) -> (u8, u64) {
+        (self.channel, self.channel_epoch)
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        if let Some((primary, _)) = &grant {
+            if self.retune.is_some() || *primary != self.channel {
+                return Err(Error::State);
+            }
+        }
+        self.passive_tx = grant;
+        Ok(())
+    }
+    // Retune/widening: `pci_firmware.rs` over EP0. The target gate is
+    // installed and TX publication refused before TXPAUSE; the C21 RF/BB
+    // stages (`channel_policy::program`, `ht40::program`, `vht::program`)
+    // then run over this backend's asynchronous register `Io` unchanged.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_begin(
+        &mut self,
+        channel: u8,
+        grant: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if self.retune_blocked()
+                || self.retune.is_some_and(|c| c != channel)
+                || self.widening
+                || (channel == 1) != grant.is_none()
+            {
+                return Err(Error::State);
+            }
+            let first = self.retune.is_none();
+            if first {
+                if self.passive_tx.as_ref().is_some_and(|(p, _)| *p != channel) {
+                    self.passive_tx = None;
+                }
+                let current = self.gate_ref()?;
+                if !current.base_only() {
+                    return Err(Error::State);
+                }
+                let base = current.without_channel();
+                let target = match grant {
+                    Some(g) => base.with_channel(g)?,
+                    None => base,
+                };
+                if target.channel() != channel {
+                    return Err(Error::State);
+                }
+                target.current().map_err(Error::Power)?;
+                self.retune = Some(channel);
+                self.gate = Some(target);
+                self.packets
+                    .as_mut()
+                    .ok_or(Error::State)?
+                    .set_operating_channel(channel);
+            }
+            let result = self.pause_quiet(first).await;
+            self.fail(result)
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_width_begin(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if self.retune_blocked() || self.retune.is_some_and(|c| c != self.channel) {
+                return Err(Error::State);
+            }
+            let first = self.retune.is_none();
+            if first {
+                if self.wide {
+                    return Err(Error::State);
+                }
+                let gate = self.gate_ref()?;
+                // N2xV (80MHz, RTW bandwidth code 2) or N2xB (40MHz, code 1).
+                let (primary, width) = match (gate.vht_record(), gate.ht40_record()) {
+                    (Some(v), None) => (v.primary, 2),
+                    (None, Some(r)) => (r.primary, 1),
+                    _ => return Err(Error::State),
+                };
+                if primary != self.channel || gate.channel() != self.channel {
+                    return Err(Error::State);
+                }
+                gate.current().map_err(Error::Power)?;
+                self.retune = Some(self.channel);
+                self.widening = true;
+                self.packets
+                    .as_mut()
+                    .ok_or(Error::State)?
+                    .set_operating_width(width);
+            }
+            let result = self.pause_quiet(first).await;
+            self.fail(result)
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.state != State::Packets || self.retune.is_none() {
+                return Err(Error::State);
+            }
+            let packet = super::command::iqk8821c(self.h2c_sequence);
+            self.retune_h2c(&packet)
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_finish(
+        &mut self,
+        channel: u8,
+    ) -> impl core::future::Future<Output = Result<u64, Error>> + Send {
+        async move {
+            if self.retune != Some(channel) || self.retune_blocked() {
+                return Err(Error::State);
+            }
+            let result = async {
+                if !self.pause_quiet(false).await? {
+                    return Err(Error::State);
+                }
+                let gate = self.gate_ref()?;
+                if gate.channel() != channel {
+                    return Err(Error::State);
+                }
+                gate.current().map_err(Error::Power)?;
+                let r = &self.registers;
+                r.write8(0x522, 0).await.map_err(usb_error)?;
+                if r.read8(0x522).await.map_err(usb_error)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+                Ok(())
+            }
+            .await;
+            self.fail(result)?;
+            self.channel = channel;
+            self.channel_epoch = self.channel_epoch.checked_add(1).ok_or(Error::State)?;
+            self.retune = None;
+            if core::mem::take(&mut self.widening) {
+                self.wide = true;
+            }
+            Ok(self.channel_epoch)
+        }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_ht_program_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        // `pci_firmware.rs::station_ht_program_quiet` over EP0.
+        async move {
+            firmware_transport::Io::station_allowed(self)?;
+            if self.state != State::Packets || self.mailbox_pending {
+                return Ok(false);
+            }
+            let result = self.transmit_quiet().await;
+            self.fail(result)
+        }
+    }
     fn station_bind_host(
         &mut self,
         host: narf_net::native_emission::Lifetime,
@@ -770,7 +1061,7 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         words: [u8; 8],
     ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
         async move {
-            if !self.mailbox_ready().await? {
+            if self.retune.is_some() || !self.mailbox_ready().await? {
                 return Err(Error::State);
             }
             let cleanup = words == [1, 0, 0, 0, 0, 0, 0, 0];
@@ -944,8 +1235,12 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         if self.state != State::Packets || !self.opened() {
             return Err(packet_core::Error::State);
         }
-        // `Port::transmit_allowed`: the signed station gate is current.
-        if self.gate_current().is_err() {
+        if self.retune.is_some() {
+            return Err(packet_core::Error::State);
+        }
+        // `Port::transmit_allowed`: the signed station gate is current, and
+        // a passive-only primary needs the passive TX grant.
+        if self.gate_current().is_err() || self.passive_tx_allowed().is_err() {
             return Err(packet_core::Error::Access);
         }
         let result = self

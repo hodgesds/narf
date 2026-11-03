@@ -443,3 +443,49 @@ kernel_test_in!(
     "drivers/wireless/rtw88/usb",
     smoke_rtw88_usb_station_worker_dynamic_rx_agg
 );
+
+/// USB retune/widening owner preconditions (`pci_firmware.rs` over EP0):
+/// the initial committed primary is (1, 1); a retune or widening needs the
+/// open packet owner and the signed station gate, and touches no register
+/// before both; the in-retune IQK H2C and its poll are refused outside a
+/// retune; a passive TX grant names only the committed primary.
+fn smoke_rtw88_usb_station_retune_preconditions() -> TestResult {
+    let fake = Fake::default();
+    let mut b = backend(&fake);
+    if b.station_channel() != (1, 1) {
+        return TestResult::Fail("initial channel");
+    }
+    if complete(b.station_retune_begin(1, None)).is_ok()
+        || complete(b.station_width_begin()).is_ok()
+    {
+        return TestResult::Fail("retune before packets");
+    }
+    if b.opened_for_test([0x02, 0, 0, 0, 0, 1]).is_err() {
+        return TestResult::Fail("fixture");
+    }
+    fake.0.lock().writes.clear();
+    if complete(b.station_retune_begin(1, None)) != Err(Error::State)
+        || complete(b.station_width_begin()) != Err(Error::State)
+        || complete(b.station_retune_finish(1)).is_ok()
+    {
+        return TestResult::Fail("ungated retune");
+    }
+    if complete(b.station_retune_iqk()).is_ok() || complete(b.poll_h2c()).is_ok() {
+        return TestResult::Fail("IQK H2C outside a retune");
+    }
+    if !fake.0.lock().writes.is_empty() || !fake.0.lock().sent.is_empty() {
+        return TestResult::Fail("refused retune touched the device");
+    }
+    let policy = Arc::new(narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"00",
+        rules: Vec::new(),
+    });
+    if b.station_passive_tx(Some((36, policy))).is_ok() || b.station_passive_tx(None).is_err() {
+        return TestResult::Fail("passive grant off the committed primary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/usb",
+    smoke_rtw88_usb_station_retune_preconditions
+);

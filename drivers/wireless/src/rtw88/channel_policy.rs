@@ -758,7 +758,7 @@ pub(super) async fn iqk8822c(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Err
 pub(super) async fn iqk8822c_run(io: &mut impl Io) -> Result<(), Error> {
     dpd_off(io).await?;
     super::radio::rfk_power(io, true).await?;
-    io.station_retune_iqk()?;
+    io.station_retune_iqk().await?;
     wait_h2c(io).await?;
     let mut complete = false;
     for attempt in 0..=15 {
@@ -807,7 +807,7 @@ pub(super) async fn iqk8821c(io: &mut impl Io) -> Result<(), Error> {
     if super::radio8821c::rf_read(io, 8).await? == 0xabcde {
         return Err(Error::Prerequisite);
     }
-    io.station_retune_iqk()?;
+    io.station_retune_iqk().await?;
     wait_h2c(io).await?;
     let mut complete = false;
     for attempt in 0..300 {

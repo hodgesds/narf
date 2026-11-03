@@ -3335,13 +3335,39 @@ grant is published. Remaining blockers, verified against the tree:
    failure, the USB counterpart of the PCI bus-master check).
    `packet_submit` requires the current gate (`Port::transmit_allowed`),
    `packet_profile` the gate's `allows_profile`, and
-   `station_profile_readback` replays the PCI readback over EP0 (always the
-   20 MHz HT profile: USB has no retune/widening). Still `Unsupported` on
-   USB: `station_retune_*`, `station_width_begin`, `station_power_tracking_*`,
-   `station_ht_program_quiet`, `station_ps_rx_quiet`, `station_passive_tx`
-   grants and `packet_aggregation`/`packet_submit_batch`, so a USB station
-   stays on its initial channel-1 20 MHz profile without power-tracking
-   maintenance. Written, unexecuted:
+   `station_profile_readback` replays the PCI readback over EP0 at the
+   committed width (`committed_wide`). Retune and widening (landed):
+   `Io::station_retune_begin`/`_width_begin`/`_retune_iqk`/`_retune_finish`
+   return `impl Future + Send` (the PCI `reserved_page::Backend` runs the
+   unchanged synchronous `Registers` call in the first poll;
+   `station.rs::retune_to`/`widen` enclose them with
+   `firmware_transport::enclosed`). The USB backend mirrors
+   `pci_firmware.rs`: begin installs the target gate (base for channel 1,
+   else the N2xO record over the base) or, for widening, requires exactly
+   one bound N2xB/N2xV record on the committed primary, refuses new TX
+   (`packet_submit` -> `State`) and mailbox H2C, sets the
+   `usb_packet::Owner` RX admission channel/width (a band crossing resets
+   DATA to the band's base profile), writes TXPAUSE = 0xff and reports
+   quiet. USB quiet (`transmit_quiet`) has no TXBD indices: no frame queued,
+   in a URB or awaiting CCX, no outstanding H2C receipt, REG_TXDMA_PQ_MAP
+   & 0xfff0 = this pipe count's `rqpn_table_8821c` map, and each
+   REG_FIFOPAGE_INFO_1..4 reporting all of its `page_table_8821c` pages
+   free. The only in-retune H2C is `command::iqk8821c` at the running
+   sequence on the H2C pipe (`poll_h2c` admits it). Finish re-proves quiet
+   and the target gate, clears TXPAUSE with readback and advances the
+   epoch (`wide` after widening). The C21 RF/BB stages
+   (`channel_policy::program`/`program5`, `ht40::program`,
+   `vht::program`) then run over EP0 unchanged, so a USB station follows
+   the same signed host-keyed (`rtw8821cu-*`) 2.4/5 GHz N2xO and
+   N2xB/N2xV records as PCI. `station_passive_tx` and the passive-primary
+   TX rule (`passive_tx_allowed`) and `station_ht_program_quiet` follow
+   PCI too. Still `Unsupported` on USB: `station_power_tracking_*`
+   (W continuation maintenance), `station_ps_rx_quiet` (LPS page) and
+   `packet_aggregation`/`packet_submit_batch` (TX A-MPDU; the USB
+   `station_tx_ba_extension` therefore returns `None`, so a provisioned
+   N21T record is never bound); power tracking's W continuation is
+   likewise absent (`station_power_tracking_extension` default `None`).
+   Written, unexecuted: `smoke_rtw88_usb_station_retune_preconditions`. Written, unexecuted:
    `smoke_rtw88_usb_firmware_reserved_page_sequence`,
    `smoke_rtw88_usb_mac_fifo_rows`, `smoke_rtw88_usb_firmware_h2c_bulk`,
    `smoke_rtw88_usb_packet_open_close_async`.

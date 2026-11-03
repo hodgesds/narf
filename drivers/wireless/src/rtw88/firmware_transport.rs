@@ -639,27 +639,38 @@ pub(super) unsafe trait Io: Send {
     /// Install the target channel gate (base for channel 1), stop new TX
     /// publication and pause hardware TX. Re-entrant for the same target;
     /// returns whether every TX queue has drained.
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
     fn station_retune_begin(
         &mut self,
         _: u8,
         _: Option<alloc::sync::Arc<super::qualification::Grant>>,
-    ) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     /// Begin widening the committed primary to the bound N2xB 40MHz pair or
     /// N2xV 80MHz block: same TX refusal/TXPAUSE/drain as a retune, gate
     /// unchanged, packet-core RX admission set to 40MHz / 80MHz. Re-entrant; returns whether TX drained.
     /// Completed by [`Io::station_retune_finish`] on the same primary.
-    fn station_width_begin(&mut self) -> Result<bool, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_width_begin(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     /// Submit the chip's pre-association IQK H2C during a retune.
-    fn station_retune_iqk(&mut self) -> Result<(), Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     /// Commit the programmed target, reopen TX and return the new epoch.
-    fn station_retune_finish(&mut self, _: u8) -> Result<u64, Error> {
-        Err(Error::Unsupported)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_finish(
+        &mut self,
+        _: u8,
+    ) -> impl core::future::Future<Output = Result<u64, Error>> + Send {
+        async move { Err(Error::Unsupported) }
     }
     fn station_bind_host(&mut self, _: narf_net::native_emission::Lifetime) -> Result<(), Error> {
         Err(Error::Unsupported)
