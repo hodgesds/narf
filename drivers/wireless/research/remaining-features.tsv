@@ -24,7 +24,6 @@ rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rt
 rtlwifi	rtl8192ee	RTL8192EE retained runtime; blocked on porting the rtl8192ee runtime (new TRX flow buffer descriptors, 2T2R tables/IQK, C2H packets) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1476
 rtlwifi	rtl8723ae	RTL8723AE retained runtime; blocked on porting the rtl8723ae runtime (firmware event mailbox, BT coexistence) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
 rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be runtime (C2H packets, BT coexistence, antenna path) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
-rtlwifi	rtl8821ae	RTL8821AE retained runtime; blocked on porting the rtl8821ae/8812ae VHT dual-band runtime (C2H RA/TX reports, WoWLAN firmware) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1479
 rtw88	rtl8822be	RTL8822BE retained firmware/radio/packet/station runtime	chip	drivers/wireless/specification/rtw88.md	2196
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2198
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2257
