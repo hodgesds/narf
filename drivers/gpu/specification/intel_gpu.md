@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.38** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.39** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -31,8 +31,9 @@
 > pass debug and release native model gates; BMG opt-in GPU-only VRAM,
 > bounded i915 capture/protection and automatic-reset discovery
 > pass debug and release native/integration gates; the unpublished
-> MTL/Arrow standalone media GT lifecycle owner passes release native
-> model gates — see §20).
+> MTL/Arrow standalone media GT lifecycle owner and display-14 DMC,
+> DC_off and lit-panel DC5/DC6 services pass release native model
+> gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -3367,7 +3368,7 @@ The release production boot and both btrfs postflights pass. The debug group
 pass is deferred to the end of the current integration wave. These are native
 register and CT models, not physical Intel evidence.
 
-### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6
+### Display-14 power services: DMC, DC_off and lit-panel DC5/DC6 — release gates recorded
 
 This slice gives Meteor Lake and Arrow Lake a production display power path
 (§12.1). The MTL DMC container is acquired from the firmware registry,
@@ -3431,8 +3432,7 @@ Refused and remaining work:
   DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
   at suspend, DC3CO, pipe DMC programs, and display stepping.
 
-Eighteen native fixtures are registered but were not executed in this
-slice. In `drivers/gpu/intel_gpu_dmc` there are four:
+Eighteen native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc` there are four:
 `smoke_xelpdp_dmc_parse_skips_pipe_programs`,
 `smoke_xelpdp_dmc_parse_refusals`, `smoke_xelpdp_dmc_load_conversation` and
 `smoke_xelpdp_dmc_disable_and_geometry`. In
@@ -3455,3 +3455,9 @@ slice. In `drivers/gpu/intel_gpu_dmc` there are four:
 are register-model fixtures. The physical KMS, modeset, publication, suspend
 and backlight hooks are wired but are manually traced, not executed. MTL
 silicon DC residency and visible-pixel acceptance remain unrun.
+
+All seven release groups pass 1,948 unique tests with no failures and no Intel
+skips. The only skip is the existing shared RNG-registration skip. Group 6 now
+also selects `drivers/gpu/intel_gpu_dc_states`. The release production boot and
+both btrfs postflights pass. The debug group pass is deferred to the end of the
+current integration wave.

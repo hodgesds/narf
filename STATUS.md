@@ -1904,6 +1904,31 @@ Still to do: media GuC load with its ADS and CT channel, GGTT invalidation for
 both GuCs, VCS/VECS enablement and interrupts, gt_id 1 in the Xe UAPI, and
 GSC-loaded HuC. None of this has run on physical Intel hardware.
 
+### Display-14 DMC and DC states — release gates recorded
+
+Meteor Lake and Arrow Lake now load the display DMC (`i915/mtl_dmc.bin`) and
+can enter DC5/DC6 with a lit panel. The DMC container is checked against the
+display-14 rules, loaded, verified, and disabled and reloaded across system
+suspend. Pipe DMC programs are skipped. Display power is reference-counted
+through the `DC_off` well: KMS sessions, legacy guards, recovery, the MTL
+modeset, PSR notifications and every full-AUX backlight conversation leave
+DC5/DC6 before touching hardware. Re-entry happens 17 ms after the last user
+lets go. Any firmware, verification or `DC_STATE_EN` failure keeps the display
+in DC0. A path-by-path audit in the spec lists the reference or gate for every
+display register access that can run while DC6 is allowed. Gen12 is unchanged.
+
+Eighteen new tests run: four DMC tests, thirteen in
+`drivers/gpu/intel_gpu_dc_states` (now in group 6) and one AUX-backlight test.
+All seven release groups pass 1,948 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave.
+
+Still to do: pipe DMC programs, per-well references beyond `DC_off`, DC3CO,
+DC9 and display-core uninit at suspend, and FBC, which needs a stolen-memory
+owner and a console frontbuffer flush. None of this has run on physical Intel
+hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
