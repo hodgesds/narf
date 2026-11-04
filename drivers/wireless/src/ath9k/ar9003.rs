@@ -47,10 +47,6 @@ pub(super) const AR_SREV_REVISION_9462_21: u8 = 3;
 /// `reg.h::AR_SREV_VERSION_9565`: the AR9565 has its own macVersion, so
 /// no macRev split against the AR9300/AR9580 is needed.
 pub(super) const AR_SREV_VERSION_9565: u32 = 0x2c0;
-/// `reg.h::AR_SREV_REVISION_9565_10` (1.0 tables).
-pub(super) const AR_SREV_REVISION_9565_10: u8 = 0;
-/// `reg.h::AR_SREV_REVISION_9565_101` (1.0.1 tables).
-pub(super) const AR_SREV_REVISION_9565_101: u8 = 1;
 /// `reg.h::AR_SREV_REVISION_9565_11` (1.1 tables).
 pub(super) const AR_SREV_REVISION_9565_11: u8 = 2;
 /// `reg.h::AR_SREV_REVISION_9580_10`: `AR_SREV_9580` is macRev >= 4.
@@ -116,11 +112,9 @@ pub(super) enum Chip {
     /// (`hw.c::ath9k_hw_fill_cap_info` chip_chainmask 1, grouped with
     /// the AR9485/AR9285/AR9330). It has its own macVersion
     /// (`AR_SREV_VERSION_9565` 0x2c0), so no macRev split against the
-    /// AR9300 is needed; shipped silicon is 1.0
-    /// (`AR_SREV_REVISION_9565_10`), 1.0.1
-    /// (`AR_SREV_REVISION_9565_101`) and 1.1
-    /// (`AR_SREV_REVISION_9565_11`) — the 1.1 tables own only the radio
-    /// postamble, the rest aliases 1.0.
+    /// AR9300 is needed; shipped silicon is 1.0 (macRev 0), 1.0.1
+    /// (macRev 1) and 1.1 (macRev 2, `AR_SREV_REVISION_9565_11`) — the
+    /// 1.1 tables own only the radio postamble, the rest aliases 1.0.
     Ar9565,
 }
 

@@ -16,16 +16,18 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-// Every table of local Linux `ar9565_1p0_initvals.h` and
+// Every data table of local Linux `ar9565_1p0_initvals.h` and
 // `ar9565_1p1_initvals.h`, extracted verbatim by generator (comments
-// stripped, values reformatted as eight hex digits), in file order. The
-// 1p0 header's `#define` of `ar9565_1p0_mac_postamble` onto
-// `ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble` is the same source
-// array the `initvals_ar9462` module already transcribed, so it is an
-// alias of `AR9462_2P0_MAC_POSTAMBLE`; the other 1p0 `#define` aliases
-// onto 1p0 tables are aliases of the 1p0 constants, and every 1p1
-// `#define` alias is an alias of the 1p0 constant (1p1 owns only its
-// radio postamble). `ar9003_hw.c::ar9003_hw_init_mode_regs` selects the
+// stripped, values reformatted as eight hex digits), in file order.
+// `#define` aliases are transcribed only when `Tables` selects them:
+// the 1p0 mac-postamble `#define` (onto
+// `ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble`, the same source
+// array the `initvals_ar9462` module already transcribed) is an alias
+// of `AR9462_2P0_MAC_POSTAMBLE`, and the 1p0 Japan-2484 `#define` is an
+// alias of the 2p2 table; the 1p0 lowest-ob/db `#define` and every 1p1
+// `#define` alias are omitted — `Tables` selects the 1p0 constants for
+// both revisions, swapping only the radio postamble on 1.1 — because
+// unselected aliases are dead code under clippy `-D warnings`. `ar9003_hw.c::ar9003_hw_init_mode_regs` selects the
 // 1p0 set for `AR_SREV_9565` (macVersion 0x2c0, macRev 0/1) and the 1p1
 // set for `AR_SREV_9565_11_OR_LATER` (macRev >= 2). Five-column modes
 // tables are `[addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20]`; fast clock is
@@ -37,10 +39,6 @@ use super::initvals_ar9462::AR9462_2P0_MAC_POSTAMBLE;
 
 /// Linux `ar9565_1p0_initvals.h::ar9565_1p0_mac_postamble` (transcribed from `ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble`, the `#define` target, already transcribed as `AR9462_2P0_MAC_POSTAMBLE`).
 pub const AR9565_1P0_MAC_POSTAMBLE: &[[u32; 5]] = AR9462_2P0_MAC_POSTAMBLE;
-
-/// Linux `ar9565_1p0_initvals.h::ar9565_1p0_Modes_lowest_ob_db_tx_gain_table` (`#define` of ar9565_1p0_modes_low_ob_db_tx_gain_table).
-pub const AR9565_1P0_MODES_LOWEST_OB_DB_TX_GAIN_TABLE: &[[u32; 5]] =
-    AR9565_1P0_MODES_LOW_OB_DB_TX_GAIN_TABLE;
 
 /// Linux `ar9565_1p0_initvals.h::ar9565_1p0_baseband_core_txfir_coeff_japan_2484` (`#define` of ar9300_2p2_baseband_core_txfir_coeff_japan_2484).
 pub const AR9565_1P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484: &[[u32; 2]] =
@@ -1183,60 +1181,6 @@ pub const AR9565_1P0_MODES_HIGH_POWER_TX_GAIN_TABLE: &[[u32; 5]] = &[
     [0x00016048, 0x00000000, 0x00000000, 0x00000000, 0x00000000],
     [0x00016054, 0x00000000, 0x00000000, 0x00000000, 0x00000000],
 ];
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_mac_core` (`#define` of ar9565_1p0_mac_core).
-pub const AR9565_1P1_MAC_CORE: &[[u32; 2]] = AR9565_1P0_MAC_CORE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_mac_postamble` (`#define` of ar9565_1p0_mac_postamble).
-pub const AR9565_1P1_MAC_POSTAMBLE: &[[u32; 5]] = AR9565_1P0_MAC_POSTAMBLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_baseband_core` (`#define` of ar9565_1p0_baseband_core).
-pub const AR9565_1P1_BASEBAND_CORE: &[[u32; 2]] = AR9565_1P0_BASEBAND_CORE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_baseband_postamble` (`#define` of ar9565_1p0_baseband_postamble).
-pub const AR9565_1P1_BASEBAND_POSTAMBLE: &[[u32; 5]] = AR9565_1P0_BASEBAND_POSTAMBLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_radio_core` (`#define` of ar9565_1p0_radio_core).
-pub const AR9565_1P1_RADIO_CORE: &[[u32; 2]] = AR9565_1P0_RADIO_CORE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_soc_preamble` (`#define` of ar9565_1p0_soc_preamble).
-pub const AR9565_1P1_SOC_PREAMBLE: &[[u32; 2]] = AR9565_1P0_SOC_PREAMBLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_soc_postamble` (`#define` of ar9565_1p0_soc_postamble).
-pub const AR9565_1P1_SOC_POSTAMBLE: &[[u32; 5]] = AR9565_1P0_SOC_POSTAMBLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_Common_rx_gain_table` (`#define` of ar9565_1p0_Common_rx_gain_table).
-pub const AR9565_1P1_COMMON_RX_GAIN_TABLE: &[[u32; 2]] = AR9565_1P0_COMMON_RX_GAIN_TABLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_Modes_lowest_ob_db_tx_gain_table` (`#define` of ar9565_1p0_Modes_lowest_ob_db_tx_gain_table).
-pub const AR9565_1P1_MODES_LOWEST_OB_DB_TX_GAIN_TABLE: &[[u32; 5]] =
-    AR9565_1P0_MODES_LOWEST_OB_DB_TX_GAIN_TABLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_pciephy_clkreq_disable_L1` (`#define` of ar9565_1p0_pciephy_clkreq_disable_L1).
-pub const AR9565_1P1_PCIEPHY_CLKREQ_DISABLE_L1: &[[u32; 2]] = AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_modes_fast_clock` (`#define` of ar9565_1p0_modes_fast_clock).
-pub const AR9565_1P1_MODES_FAST_CLOCK: &[[u32; 3]] = AR9565_1P0_MODES_FAST_CLOCK;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_common_wo_xlna_rx_gain_table` (`#define` of ar9565_1p0_common_wo_xlna_rx_gain_table).
-pub const AR9565_1P1_COMMON_WO_XLNA_RX_GAIN_TABLE: &[[u32; 2]] =
-    AR9565_1P0_COMMON_WO_XLNA_RX_GAIN_TABLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_modes_low_ob_db_tx_gain_table` (`#define` of ar9565_1p0_modes_low_ob_db_tx_gain_table).
-pub const AR9565_1P1_MODES_LOW_OB_DB_TX_GAIN_TABLE: &[[u32; 5]] =
-    AR9565_1P0_MODES_LOW_OB_DB_TX_GAIN_TABLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_modes_high_ob_db_tx_gain_table` (`#define` of ar9565_1p0_modes_high_ob_db_tx_gain_table).
-pub const AR9565_1P1_MODES_HIGH_OB_DB_TX_GAIN_TABLE: &[[u32; 5]] =
-    AR9565_1P0_MODES_HIGH_OB_DB_TX_GAIN_TABLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_modes_high_power_tx_gain_table` (`#define` of ar9565_1p0_modes_high_power_tx_gain_table).
-pub const AR9565_1P1_MODES_HIGH_POWER_TX_GAIN_TABLE: &[[u32; 5]] =
-    AR9565_1P0_MODES_HIGH_POWER_TX_GAIN_TABLE;
-
-/// Linux `ar9565_1p1_initvals.h::ar9565_1p1_baseband_core_txfir_coeff_japan_2484` (`#define` of ar9565_1p0_baseband_core_txfir_coeff_japan_2484).
-pub const AR9565_1P1_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484: &[[u32; 2]] =
-    AR9565_1P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484;
 
 /// Linux `ar9565_1p1_initvals.h::ar9565_1p1_radio_postamble`.
 pub const AR9565_1P1_RADIO_POSTAMBLE: &[[u32; 5]] = &[

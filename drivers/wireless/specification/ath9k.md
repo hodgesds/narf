@@ -2345,18 +2345,18 @@ groups it with the AR9485/AR9285/AR9330 in
 is needed; `Revision::decode` accepts every macRev (Linux's 9565
 branches cover all of them — `AR_SREV_9565_11_OR_LATER` selects the
 1.1 set, anything else the 1.0 set), with shipped silicon 1.0
-(`AR_SREV_REVISION_9565_10`), 1.0.1
-(`AR_SREV_REVISION_9565_101`) and 1.1
-(`AR_SREV_REVISION_9565_11`). The EEPROM restore limits are the
-AR9300's. `ar9003/initvals_ar9565.rs` is every table of
-`ar9565_1p0_initvals.h` and `ar9565_1p1_initvals.h` (34 names: 15
-transcribed tables of 1088 rows — 14 from 1.0, 1 from 1.1 — and 19
-aliases, generated verbatim in file order; the 1.0 mac-postamble
-`#define` is the 9331 array already transcribed as
-`AR9462_2P0_MAC_POSTAMBLE`, the 1.0 lowest-ob/db `#define` is the 1.0
-low-ob/db table, the 1.0 Japan 2484 `#define` is the 2p2 table, and
-every 1.1 `#define` aliases its 1.0 table except the radio postamble,
-which 1.1 owns). `ini::Tables::for_revision` dispatches
+(macRev 0), 1.0.1 (macRev 1) and 1.1 (macRev 2,
+`AR_SREV_REVISION_9565_11`). The EEPROM restore limits are the
+AR9300's. `ar9003/initvals_ar9565.rs` transcribes every data table of
+`ar9565_1p0_initvals.h` and `ar9565_1p1_initvals.h` (17 names: 15
+tables of 1088 rows — 14 from 1.0, 1 from 1.1 — and 2 selected aliases,
+generated verbatim in file order; the 1.0 mac-postamble `#define` is the
+9331 array already transcribed as `AR9462_2P0_MAC_POSTAMBLE`, the 1.0
+Japan 2484 `#define` is the 2p2 table; the 1.0 lowest-ob/db `#define`
+and every 1.1 `#define` alias are omitted because `Tables::ar9565`
+selects the 1.0 constants for both revisions — unselected aliases are
+dead code under clippy `-D warnings` — and 1.1 owns only its radio
+postamble). `ini::Tables::for_revision` dispatches
 `ar9003_hw_init_mode_regs` on the 1.1/1.0 branches:
 `Tables::ar9565` is the 1.0 set (1.1 swaps only its radio postamble)
 plus `ar9003_tx_gain_table_apply` (modes 0/2 are the 9565 low-ob/db
