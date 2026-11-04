@@ -174,6 +174,7 @@ fn smoke_ixgbe_advrxdesc_layout() -> TestResult {
     let rp = (&r) as *const _ as *const u8;
     // SAFETY: structurally-sized reads in-bounds.
     let pkt = unsafe { *(rp as *const u64) };
+    // SAFETY: structurally-sized reads in-bounds.
     let hdr = unsafe { *(rp.add(8) as *const u64) };
     if pkt != 0x1122334455667788 || hdr != 0 {
         return TestResult::Fail("AdvRxDescRead field offsets wrong");
@@ -190,7 +191,9 @@ fn smoke_ixgbe_advrxdesc_layout() -> TestResult {
     let wp = (&w) as *const _ as *const u8;
     // SAFETY: structurally-sized reads in-bounds.
     let se = unsafe { *(wp.add(8) as *const u32) };
+    // SAFETY: structurally-sized reads in-bounds.
     let len = unsafe { *(wp.add(12) as *const u16) };
+    // SAFETY: structurally-sized reads in-bounds.
     let vlan = unsafe { *(wp.add(14) as *const u16) };
     if se != 0xDEADBEEF || len != 0x1234 || vlan != 0x5678 {
         return TestResult::Fail("AdvRxDescWb field offsets wrong");
@@ -230,7 +233,7 @@ fn smoke_ixgbe_advrxdesc_decode() -> TestResult {
         vlan: 0x0064,
         ..Default::default()
     };
-    if untagged.vlan_tag() != None {
+    if untagged.vlan_tag().is_some() {
         return TestResult::Fail("tag reported without VP");
     }
     // Checksum matrix: status bit AND absence of its error bit.
