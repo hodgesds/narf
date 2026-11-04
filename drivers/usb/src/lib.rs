@@ -35,6 +35,7 @@ pub mod hid;
 pub mod hub;
 pub mod intr;
 pub mod iso;
+pub mod lan95xx;
 pub mod msc;
 pub mod ohci;
 pub mod r8152;
@@ -115,6 +116,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "usb-ax88179", || {
         ax88179::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-lan95xx", || {
+        lan95xx::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-cdc-ncm", || {
@@ -244,6 +249,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "usb-ax88179", || {
         ax88179::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-lan95xx", || {
+        lan95xx::register();
         InitResult::Ok
     });
 }

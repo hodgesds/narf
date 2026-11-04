@@ -408,6 +408,26 @@ also consult upstream Linux GPL sources.
   within one pump turn. Version-specific FIFO tuning from
   Linux's `change_mtu` variants (`PLA_MTPS`, `PLA_TXFIFO_*`) is
   not programmed by this path.
+- `lan95xx` is the core driver for the SMSC/Microchip LAN95xx
+  USB 2.0 10/100 family (LAN9500 / 9500A / 9512 / 9514 / 9530 /
+  9730 / 89530, issue #788): vendor control transport (`0xA1` /
+  `0xA0`, `wValue = 0`, `wIndex = register`), lite reset in
+  Linux's order, internal-PHY autoneg via `MII_ADDR` / `MII_DATA`,
+  EEPROM station address (offset `0x01`), TX command-word
+  framing with checksum-preamble offload, RX status-header
+  framing with FCS stripping, publication as `usb-lan95xx{N}`,
+  and detach. Register values are Linux-driver-observed
+  (`smsc95xx.c` / `smsc95xx.h` @ cbbddb6); no public LAN95xx
+  datasheet copy exists in the workspace. Deliberate limits:
+  station address from EEPROM only (a device reporting no valid
+  address fails the bind; the EEPROM-less fallback is a
+  follow-up); external PHY fails the bind; link state is
+  published once from the bind-time PHY read (the
+  interrupt-endpoint link-change task is a follow-up);
+  multicast programming is not implemented (receive-own only);
+  RX checksum offload stays disabled (no RX verdict channel on
+  the USB RX path); no TSO, no VLAN insert/strip, no
+  suspend/WoL, no hub-combo verification yet.
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable
