@@ -19,13 +19,13 @@ use super::{
     IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR,
 };
 
-/// In-memory register bank for fixtures: 64 KiB of BAR0 window,
-/// covering every register this stream programs (highest native
-/// address is MRQC at 0x0EC80; the canonical 0x05xxx RSS block
-/// is covered too). Lives here (not in queues.rs) because this
-/// test module is x86_64-only while the driver builds for both
-/// arches — a test-only helper in the driver module would trip
-/// dead-code on aarch64.
+/// In-memory register bank for fixtures: 0x14000 bytes of BAR0
+/// window, covering every register this stream programs (highest is
+/// PFMBMEM for VF 62 at 0x13F80 + 16 words = 0x13FC0; the canonical
+/// 0x05xxx RSS block is covered too). Lives here (not in queues.rs)
+/// because this test module is x86_64-only while the driver builds
+/// for both arches — a test-only helper in the driver module would
+/// trip dead-code on aarch64.
 struct FakeBank {
     regs: alloc::vec::Vec<u32>,
 }
@@ -33,7 +33,7 @@ struct FakeBank {
 impl FakeBank {
     fn new() -> Self {
         Self {
-            regs: alloc::vec![0u32; 0x10000 / 4],
+            regs: alloc::vec![0u32; 0x14000 / 4],
         }
     }
 }
@@ -2379,3 +2379,537 @@ fn smoke_ixgbe_queue_vector_for() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_vector_for);
+
+// ── VMDq / SR-IOV fixtures (issue #1261) ───────────────────────────
+
+fn smoke_ixgbe_vmdq_pool_mapping() -> TestResult {
+    use super::vmdq::{
+        mtqc_vt_word, pool_for_vf, pool_queues, primary_rar, qde_word, vt_ctl_word,
+    };
+    if pool_for_vf(0) != Some(1) || pool_for_vf(62) != Some(63) || pool_for_vf(63).is_some() {
+        return TestResult::Fail("pool_for_vf mapping wrong (PF pool 0, VF i -> i+1)");
+    }
+    if pool_queues(0) != Some((0, 1))
+        || pool_queues(63) != Some((126, 127))
+        || pool_queues(64).is_some()
+    {
+        return TestResult::Fail("pool_queues mapping wrong");
+    }
+    if primary_rar(0) != 1 || primary_rar(62) != 63 {
+        return TestResult::Fail("primary_rar mapping wrong");
+    }
+    if qde_word(4, true, false) != 0x1_0401 || qde_word(5, false, true) != 0x1_0502 {
+        return TestResult::Fail("qde_word packing wrong");
+    }
+    if vt_ctl_word(3, true) != 0x4000_0180 || vt_ctl_word(0, false) != 0 {
+        return TestResult::Fail("vt_ctl_word packing wrong");
+    }
+    if mtqc_vt_word() != 0x6 {
+        return TestResult::Fail("mtqc_vt_word wrong (VT_ENA | 64VF)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_pool_mapping);
+
+fn smoke_ixgbe_vmdq_enable_conversation() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        enable_virtualization, VmdqConfig, REG_MRQC, REG_MTQC, REG_PFDTXGSWC, REG_RTTDCS,
+        REG_VT_CTL,
+    };
+    let mut bank = FakeBank::new();
+    bank.write32(REG_RTTDCS, 0x1234_0000);
+    bank.write32(REG_MRQC, 0xFFFF_0000);
+    bank.write32(REG_VT_CTL, 0x0000_1F80);
+    if enable_virtualization(&mut bank, &VmdqConfig::standard()).is_err() {
+        return TestResult::Fail("enable_virtualization failed on a valid config");
+    }
+    // Arbiter disabled for the MTQC write, then re-enabled with the
+    // other RTTDCS bits preserved.
+    if bank.read32(REG_RTTDCS) != 0x1234_0000 {
+        return TestResult::Fail("RTTDCS arbiter not restored after MTQC");
+    }
+    if bank.read32(REG_MTQC) != 0x6 {
+        return TestResult::Fail("MTQC VT word wrong");
+    }
+    // MRQE field replaced, upper bits preserved.
+    if bank.read32(REG_MRQC) != 0xFFFF_0008 {
+        return TestResult::Fail("MRQC VMDQEN word wrong");
+    }
+    // Pool field replaced (was pool 63), replication set.
+    if bank.read32(REG_VT_CTL) != 0x4000_0000 {
+        return TestResult::Fail("VT_CTL default-pool/replication word wrong");
+    }
+    if bank.read32(REG_PFDTXGSWC) != 0x1 {
+        return TestResult::Fail("PFDTXGSWC VEB bit not set");
+    }
+    if VmdqConfig::new(64, true).is_ok() {
+        return TestResult::Fail("VmdqConfig accepted pool 64");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_enable_conversation);
+
+fn smoke_ixgbe_vmdq_mpsar_rar() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        assign_rar_pool, clear_rar, clear_rar_pool, mpsar_hi, mpsar_lo, program_rar, rah, ral,
+        rar_enabled, rar_has_pool, read_rar, RAH_AV,
+    };
+    let mut bank = FakeBank::new();
+    if assign_rar_pool(&mut bank, 5, 40).is_err() || assign_rar_pool(&mut bank, 5, 3).is_err() {
+        return TestResult::Fail("assign_rar_pool failed");
+    }
+    if bank.read32(mpsar_hi(5)) != 0x100 || bank.read32(mpsar_lo(5)) != 0x8 {
+        return TestResult::Fail("MPSAR pool bits wrong (40 -> HI bit 8, 3 -> LO bit 3)");
+    }
+    if !rar_has_pool(&bank, 5, 40) || rar_has_pool(&bank, 5, 4) {
+        return TestResult::Fail("rar_has_pool wrong");
+    }
+    if clear_rar_pool(&mut bank, 5, 40).is_err() || bank.read32(mpsar_hi(5)) != 0 {
+        return TestResult::Fail("clear_rar_pool did not clear HI bit");
+    }
+    if bank.read32(mpsar_lo(5)) != 0x8 {
+        return TestResult::Fail("clear_rar_pool disturbed the LO word");
+    }
+    let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    if program_rar(&mut bank, 1, &mac, 1, true).is_err() {
+        return TestResult::Fail("program_rar failed");
+    }
+    if bank.read32(ral(1)) != 0x3322_1102 || bank.read32(rah(1)) != (RAH_AV | 0x5544) {
+        return TestResult::Fail("RAR words wrong (RAL LE bytes, RAH AV | MAC hi)");
+    }
+    if bank.read32(mpsar_lo(1)) != 0x2 {
+        return TestResult::Fail("program_rar did not select the pool first");
+    }
+    if !rar_enabled(&bank, 1) || read_rar(&bank, 1) != (mac, true) {
+        return TestResult::Fail("RAR read-back wrong");
+    }
+    if clear_rar(&mut bank, 1).is_err() || rar_enabled(&bank, 1) {
+        return TestResult::Fail("clear_rar did not drop AV");
+    }
+    if read_rar(&bank, 1) != (mac, false) {
+        return TestResult::Fail("clear_rar disturbed MAC bytes");
+    }
+    if assign_rar_pool(&mut bank, 128, 0).is_ok() || program_rar(&mut bank, 0, &mac, 64, true).is_ok()
+    {
+        return TestResult::Fail("out-of-range RAR/pool accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_mpsar_rar);
+
+fn smoke_ixgbe_vmdq_pool_vlan() -> TestResult {
+    use super::queues::RegBank;
+    use super::vlan::REG_VFTA_BASE;
+    use super::vmdq::{
+        clear_pool_vlan, find_vlvf_slot, set_pool_vlan, vlvfb, vlvf, VLVF_VIEN,
+    };
+    let mut bank = FakeBank::new();
+    if set_pool_vlan(&mut bank, 100, 5).is_err() {
+        return TestResult::Fail("set_pool_vlan failed");
+    }
+    // Highest empty slot wins (Linux scans 63..1).
+    if find_vlvf_slot(&bank, 100) != Some(63) || bank.read32(vlvf(63)) != (VLVF_VIEN | 100) {
+        return TestResult::Fail("VLVF slot allocation wrong");
+    }
+    if bank.read32(vlvfb(126)) != 0x20 {
+        return TestResult::Fail("VLVFB pool-5 bit wrong");
+    }
+    if bank.read32(REG_VFTA_BASE + 4 * 3) != 0x10 {
+        return TestResult::Fail("VFTA bit for VID 100 not set");
+    }
+    if set_pool_vlan(&mut bank, 100, 7).is_err() || bank.read32(vlvfb(126)) != 0xA0 {
+        return TestResult::Fail("second pool did not join the same VLVF slot");
+    }
+    if clear_pool_vlan(&mut bank, 100, 5).is_err() || bank.read32(vlvfb(126)) != 0x80 {
+        return TestResult::Fail("clear_pool_vlan did not drop pool 5");
+    }
+    if bank.read32(vlvf(63)) != (VLVF_VIEN | 100) {
+        return TestResult::Fail("VLVF slot disabled while pool 7 remains");
+    }
+    if clear_pool_vlan(&mut bank, 100, 7).is_err()
+        || bank.read32(vlvfb(126)) != 0
+        || bank.read32(vlvf(63)) != 0
+    {
+        return TestResult::Fail("last pool clear did not disable the slot");
+    }
+    // VFTA is deliberately untouched by clears (PF filter state).
+    if bank.read32(REG_VFTA_BASE + 4 * 3) != 0x10 {
+        return TestResult::Fail("clear_pool_vlan touched VFTA");
+    }
+    if clear_pool_vlan(&mut bank, 300, 5).is_ok() {
+        return TestResult::Fail("clear of an absent VLAN succeeded");
+    }
+    // VLAN 0 always maps to slot 0.
+    if set_pool_vlan(&mut bank, 0, 2).is_err()
+        || bank.read32(vlvf(0)) != VLVF_VIEN
+        || bank.read32(vlvfb(0)) != 0x4
+    {
+        return TestResult::Fail("VLAN 0 did not map to slot 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_pool_vlan);
+
+fn smoke_ixgbe_vmdq_vf_state_regs() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        clear_vmvir, clear_vf_reset_event, pvftdwbah, pvftdwbal, qde_word, reset_vf_tx_addrs,
+        set_pool_queue_drop, set_spoof_count, set_vf_rx_tx, set_vmvir, set_vmolr, vfre, vfte,
+        vf_reset_pending, vflrec, vflre, vmecm, vmolr, vmvir, REG_QDE, VMOLR_AUPE, VMOLR_BAM,
+    };
+    let mut bank = FakeBank::new();
+    if set_vmolr(&mut bank, 3, true).is_err() || bank.read32(vmolr(3)) != (VMOLR_BAM | VMOLR_AUPE) {
+        return TestResult::Fail("VMOLR BAM|AUPE wrong");
+    }
+    if set_vmolr(&mut bank, 3, false).is_err() || bank.read32(vmolr(3)) != VMOLR_BAM {
+        return TestResult::Fail("VMOLR AUPE clear wrong");
+    }
+    if set_vmvir(&mut bank, 2, 100, 5).is_err()
+        || bank.read32(vmvir(2)) != (100 | (5 << 13) | 0x4000_0000)
+    {
+        return TestResult::Fail("VMVIR word wrong");
+    }
+    if clear_vmvir(&mut bank, 2).is_err() || bank.read32(vmvir(2)) != 0 {
+        return TestResult::Fail("VMVIR clear wrong");
+    }
+    if set_vf_rx_tx(&mut bank, 40, true).is_err()
+        || bank.read32(vfre(1)) != 0x100
+        || bank.read32(vfte(1)) != 0x100
+    {
+        return TestResult::Fail("VFRE/VFTE enable wrong (VF 40 -> word 1 bit 8)");
+    }
+    if set_vf_rx_tx(&mut bank, 40, false).is_err()
+        || bank.read32(vfre(1)) != 0
+        || bank.read32(vfte(1)) != 0
+    {
+        return TestResult::Fail("VFRE/VFTE disable wrong");
+    }
+    // QDE is a single register: the pool call ends on the last queue.
+    if set_pool_queue_drop(&mut bank, 2, true, false).is_err()
+        || bank.read32(REG_QDE) != qde_word(5, true, false)
+    {
+        return TestResult::Fail("QDE pool programming wrong");
+    }
+    if set_spoof_count(&mut bank, 40, true).is_err() || bank.read32(vmecm(1)) != 0x100 {
+        return TestResult::Fail("VMECM spoof-count bit wrong");
+    }
+    bank.write32(pvftdwbal(4), 0xDEAD);
+    bank.write32(pvftdwbah(5), 0xBEEF);
+    if reset_vf_tx_addrs(&mut bank, 2).is_err()
+        || bank.read32(pvftdwbal(4)) != 0
+        || bank.read32(pvftdwbah(5)) != 0
+    {
+        return TestResult::Fail("TX write-back reset wrong");
+    }
+    bank.write32(vflre(40), 0x100);
+    if !vf_reset_pending(&bank, 40) {
+        return TestResult::Fail("VFLRE reset event not seen");
+    }
+    if clear_vf_reset_event(&mut bank, 40).is_err() || bank.read32(vflrec(40)) != 0x100 {
+        return TestResult::Fail("VFLREC clear word wrong");
+    }
+    if set_vmolr(&mut bank, 63, true).is_ok() || set_vf_rx_tx(&mut bank, 63, true).is_ok() {
+        return TestResult::Fail("VF 63 accepted (max is 62)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_vf_state_regs);
+
+fn smoke_ixgbe_vmdq_mailbox_transport() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        mailbox_clear, mailbox_has_ack, mailbox_has_msg, mailbox_lock, mailbox_read,
+        mailbox_write, mbvficr, pfmailbox, pfmbmem, MBVFICR_VFACK_VF1, MBVFICR_VFREQ_VF1,
+        PFMAILBOX_ACK, PFMAILBOX_PFU, PFMAILBOX_STS,
+    };
+    let mut bank = FakeBank::new();
+    // Lock: PFU written, echoed back, accepted.
+    if mailbox_lock(&mut bank, 1).is_err() || bank.read32(pfmailbox(1)) != PFMAILBOX_PFU {
+        return TestResult::Fail("mailbox_lock did not take PFU");
+    }
+    let msg = [0x01, 0x1122_3344, 0x5566_7788, 0x99AA_BBCC];
+    if mailbox_write(&mut bank, 1, &msg).is_err() {
+        return TestResult::Fail("mailbox_write failed");
+    }
+    if bank.read32(pfmbmem(1)) != 0x01
+        || bank.read32(pfmbmem(1) + 4) != 0x1122_3344
+        || bank.read32(pfmbmem(1) + 12) != 0x99AA_BBCC
+        || bank.read32(pfmailbox(1)) != PFMAILBOX_STS
+    {
+        return TestResult::Fail("mailbox_write words or STS wrong");
+    }
+    // Simulate the VF side: set request + ack bits in MBVFICR.
+    bank.write32(mbvficr(1), MBVFICR_VFREQ_VF1 << 1 | MBVFICR_VFACK_VF1 << 1);
+    if !mailbox_has_msg(&bank, 1) || !mailbox_has_ack(&bank, 1) {
+        return TestResult::Fail("MBVFICR request/ack bits not seen");
+    }
+    if mailbox_has_msg(&bank, 2) || mailbox_has_ack(&bank, 2) {
+        return TestResult::Fail("MBVFICR bits leaked to VF 2");
+    }
+    let mut out = [0u32; 4];
+    if mailbox_read(&mut bank, 1, &mut out).is_err() || out != msg {
+        return TestResult::Fail("mailbox_read words wrong");
+    }
+    if bank.read32(pfmailbox(1)) != PFMAILBOX_ACK {
+        return TestResult::Fail("mailbox_read did not leave ACK");
+    }
+    if mailbox_clear(&mut bank, 1).is_err() || bank.read32(pfmbmem(1) + 4) != 0 {
+        return TestResult::Fail("mailbox_clear did not zero memory");
+    }
+    if mailbox_lock(&mut bank, 63).is_ok() {
+        return TestResult::Fail("mailbox_lock accepted VF 63");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_mailbox_transport);
+
+fn vmdq_msg(word0: u32, word1: u32) -> [u32; 16] {
+    let mut m = [0u32; 16];
+    m[0] = word0;
+    m[1] = word1;
+    m
+}
+
+fn smoke_ixgbe_vmdq_dispatch_reset() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        dispatch_vf_message, pfmbmem, rah, ral, vmolr, DispatchOutcome, VfTable, VF_RESET,
+        VMOLR_AUPE, VMOLR_BAM, VT_MSGTYPE_ACK, VT_MSGTYPE_NACK,
+    };
+    let mut bank = FakeBank::new();
+    let mut table = VfTable::new();
+    // No MAC, no admin pin: NACK reply, defaults programmed.
+    let msg = vmdq_msg(VF_RESET, 0);
+    match dispatch_vf_message(&mut bank, &mut table, 0, &msg) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("RESET dispatch did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) != (VF_RESET | VT_MSGTYPE_NACK)
+        || bank.read32(pfmbmem(0) + 4) != 0
+        || bank.read32(pfmbmem(0) + 12) != 0
+    {
+        return TestResult::Fail("RESET NACK reply words wrong");
+    }
+    if bank.read32(vmolr(0)) != (VMOLR_BAM | VMOLR_AUPE) {
+        return TestResult::Fail("RESET VMOLR default wrong (BAM|AUPE, no PF VLAN)");
+    }
+    if !table.vfs[0].clear_to_send || table.vfs[0].api != 0 {
+        return TestResult::Fail("RESET did not set clear_to_send / API 1.0");
+    }
+    // Pinned MAC: ACK reply with the MAC, RAR slot programmed.
+    table.vfs[0].mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    table.vfs[0].mac_set = true;
+    table.vfs[0].pf_set_mac = true;
+    match dispatch_vf_message(&mut bank, &mut table, 0, &msg) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("RESET with pinned MAC did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) != (VF_RESET | VT_MSGTYPE_ACK)
+        || bank.read32(pfmbmem(0) + 4) != 0x02
+        || bank.read32(pfmbmem(0) + 8) != 0x0100
+    {
+        return TestResult::Fail("RESET ACK reply MAC words wrong");
+    }
+    if bank.read32(ral(1)) != 0x02 || bank.read32(rah(1)) != (0x8000_0000 | 0x0100) {
+        return TestResult::Fail("RESET did not program primary RAR slot 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_dispatch_reset);
+
+fn smoke_ixgbe_vmdq_dispatch_messages() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        dispatch_vf_message, pfmbmem, rah, ral, vlvf, vlvfb, DispatchOutcome, VfTable,
+        VF_API_NEGOTIATE, VF_GET_QUEUES, VF_SET_LPE, VF_SET_MACVLAN, VF_SET_MAC_ADDR,
+        VF_SET_MULTICAST, VF_SET_VLAN, REG_MAXFRS, VLVF_VIEN, VT_MSGTYPE_ACK, VT_MSGTYPE_CTS,
+        VT_MSGTYPE_NACK,
+    };
+    let mut bank = FakeBank::new();
+    let mut table = VfTable::new();
+    // SET_MAC, valid unicast: ACK|CTS, RAR programmed, state stored.
+    let mac_lo = 0x3322_1102u32;
+    let mac_hi = 0x5544u32;
+    let mut msg = vmdq_msg(VF_SET_MAC_ADDR, mac_lo);
+    msg[2] = mac_hi;
+    match dispatch_vf_message(&mut bank, &mut table, 0, &msg) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_MAC dispatch did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) != (VF_SET_MAC_ADDR | VT_MSGTYPE_ACK | VT_MSGTYPE_CTS) {
+        return TestResult::Fail("SET_MAC reply word0 wrong");
+    }
+    if bank.read32(ral(1)) != mac_lo || bank.read32(rah(1)) != (0x8000_0000 | mac_hi) {
+        return TestResult::Fail("SET_MAC did not program RAR slot 1");
+    }
+    if !table.vfs[0].mac_set || table.vfs[0].mac != [0x02, 0x11, 0x22, 0x33, 0x44, 0x55] {
+        return TestResult::Fail("SET_MAC state wrong");
+    }
+    // SET_MAC, multicast address: NACK, RAR untouched.
+    let mut bad = vmdq_msg(VF_SET_MAC_ADDR, 0x3322_1103);
+    bad[2] = mac_hi;
+    match dispatch_vf_message(&mut bank, &mut table, 1, &bad) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("bad SET_MAC dispatch did not reply"),
+    }
+    if bank.read32(pfmbmem(1)) != (VF_SET_MAC_ADDR | VT_MSGTYPE_NACK | VT_MSGTYPE_CTS) {
+        return TestResult::Fail("bad SET_MAC reply not NACK|CTS");
+    }
+    if bank.read32(rah(2)) & 0x8000_0000 != 0 {
+        return TestResult::Fail("bad SET_MAC programmed a RAR");
+    }
+    // API negotiate: 1.1 accepted, 1.5 refused (Linux excludes it).
+    let mut table2 = VfTable::new();
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &vmdq_msg(VF_API_NEGOTIATE, 2)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("API negotiate dispatch did not reply"),
+    }
+    if table2.vfs[0].api != 2 || bank.read32(pfmbmem(0)) & VT_MSGTYPE_ACK == 0 {
+        return TestResult::Fail("API 1.1 not accepted");
+    }
+    let mut table3 = VfTable::new();
+    match dispatch_vf_message(&mut bank, &mut table3, 0, &vmdq_msg(VF_API_NEGOTIATE, 6)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("API 1.5 dispatch did not reply"),
+    }
+    if table3.vfs[0].api != 0 || bank.read32(pfmbmem(0)) & VT_MSGTYPE_NACK == 0 {
+        return TestResult::Fail("API 1.5 not refused");
+    }
+    // GET_QUEUES: refused on API 1.0, accepted after 1.1 negotiate.
+    match dispatch_vf_message(&mut bank, &mut table3, 0, &vmdq_msg(VF_GET_QUEUES, 0)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("GET_QUEUES dispatch did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) & VT_MSGTYPE_NACK == 0 {
+        return TestResult::Fail("GET_QUEUES not refused on API 1.0");
+    }
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &vmdq_msg(VF_GET_QUEUES, 0)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("GET_QUEUES (1.1) dispatch did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) != (VF_GET_QUEUES | VT_MSGTYPE_ACK | VT_MSGTYPE_CTS)
+        || bank.read32(pfmbmem(0) + 4) != 2
+        || bank.read32(pfmbmem(0) + 8) != 2
+        || bank.read32(pfmbmem(0) + 12) != 0
+        || bank.read32(pfmbmem(0) + 16) != 0
+    {
+        return TestResult::Fail("GET_QUEUES reply words wrong (2, 2, 0, 0)");
+    }
+    // SET_VLAN add + remove, then remove-absent NACK.
+    let add = vmdq_msg(VF_SET_VLAN | (1 << 16), 200);
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &add) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_VLAN add did not reply"),
+    }
+    if bank.read32(vlvf(63)) != (VLVF_VIEN | 200) || bank.read32(vlvfb(126)) & 0x2 == 0 {
+        return TestResult::Fail("SET_VLAN add did not program pool 1");
+    }
+    let rem = vmdq_msg(VF_SET_VLAN, 200);
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &rem) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_VLAN remove did not reply"),
+    }
+    if bank.read32(vlvf(63)) != 0 || bank.read32(vlvfb(126)) != 0 {
+        return TestResult::Fail("SET_VLAN remove did not clear the slot");
+    }
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &vmdq_msg(VF_SET_VLAN, 300)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_VLAN absent-remove did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) & VT_MSGTYPE_NACK == 0 {
+        return TestResult::Fail("SET_VLAN absent-remove not NACKed");
+    }
+    // SET_LPE: in range bumps MAXFRS, out of range NACKs.
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &vmdq_msg(VF_SET_LPE, 9000)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_LPE did not reply"),
+    }
+    if bank.read32(REG_MAXFRS) != (9000 << 16) {
+        return TestResult::Fail("SET_LPE MAXFRS bump wrong");
+    }
+    match dispatch_vf_message(&mut bank, &mut table2, 0, &vmdq_msg(VF_SET_LPE, 20000)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_LPE range dispatch did not reply"),
+    }
+    if bank.read32(pfmbmem(0)) & VT_MSGTYPE_NACK == 0 || bank.read32(REG_MAXFRS) != (9000 << 16) {
+        return TestResult::Fail("SET_LPE out-of-range not NACKed or moved MAXFRS");
+    }
+    // SET_MACVLAN index 1 deletes the VF's extra filters, primary kept.
+    let mut bank2 = FakeBank::new();
+    let mut table4 = VfTable::new();
+    {
+        use super::vmdq::{mpsar_lo, program_rar};
+        let extra = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        if program_rar(&mut bank2, 10, &extra, 1, true).is_err() {
+            return TestResult::Fail("MACVLAN fixture setup failed");
+        }
+        if program_rar(&mut bank2, 1, &[0x02, 0, 0, 0, 0, 0x01], 1, true).is_err() {
+            return TestResult::Fail("MACVLAN primary fixture setup failed");
+        }
+        if bank2.read32(mpsar_lo(10)) != 0x2 {
+            return TestResult::Fail("MACVLAN fixture MPSAR wrong");
+        }
+    }
+    match dispatch_vf_message(
+        &mut bank2,
+        &mut table4,
+        0,
+        &vmdq_msg(VF_SET_MACVLAN | (1 << 16), 0),
+    ) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_MACVLAN delete did not reply"),
+    }
+    if bank2.read32(rah(10)) & 0x8000_0000 != 0 {
+        return TestResult::Fail("SET_MACVLAN delete kept the extra filter");
+    }
+    if bank2.read32(rah(1)) & 0x8000_0000 == 0 {
+        return TestResult::Fail("SET_MACVLAN delete removed the primary MAC");
+    }
+    // SET_MACVLAN index 5: success no-op (Linux add path commented out).
+    match dispatch_vf_message(
+        &mut bank2,
+        &mut table4,
+        0,
+        &vmdq_msg(VF_SET_MACVLAN | (5 << 16), 0),
+    ) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_MACVLAN add did not reply"),
+    }
+    if bank2.read32(pfmbmem(0)) & VT_MSGTYPE_ACK == 0 {
+        return TestResult::Fail("SET_MACVLAN add not ACKed");
+    }
+    // Already-ACKed message: ignored, mailbox untouched.
+    let mut bank3 = FakeBank::new();
+    let mut table5 = VfTable::new();
+    let acked = vmdq_msg(VF_SET_MAC_ADDR | VT_MSGTYPE_ACK, 0);
+    match dispatch_vf_message(&mut bank3, &mut table5, 0, &acked) {
+        Ok(DispatchOutcome::Ignored) => {}
+        _ => return TestResult::Fail("already-ACKed message not ignored"),
+    }
+    if bank3.read32(pfmbmem(0)) != 0 {
+        return TestResult::Fail("ignored message wrote to the mailbox");
+    }
+    // Unknown type + SET_MULTICAST: NACK|CTS.
+    match dispatch_vf_message(&mut bank3, &mut table5, 0, &vmdq_msg(0x77, 0)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("unknown message did not reply"),
+    }
+    if bank3.read32(pfmbmem(0)) != (0x77 | VT_MSGTYPE_NACK | VT_MSGTYPE_CTS) {
+        return TestResult::Fail("unknown message reply wrong");
+    }
+    match dispatch_vf_message(&mut bank3, &mut table5, 0, &vmdq_msg(VF_SET_MULTICAST, 0)) {
+        Ok(DispatchOutcome::Replied) => {}
+        _ => return TestResult::Fail("SET_MULTICAST did not reply"),
+    }
+    if bank3.read32(pfmbmem(0)) & VT_MSGTYPE_NACK == 0 {
+        return TestResult::Fail("SET_MULTICAST not NACKed");
+    }
+    // Out-of-range VF: error before any bank access.
+    if dispatch_vf_message(&mut bank3, &mut table5, 63, &vmdq_msg(VF_RESET, 0)).is_ok() {
+        return TestResult::Fail("VF 63 dispatch accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_dispatch_messages);

@@ -29,6 +29,7 @@ pub mod regs;
 pub mod rss;
 mod tests;
 pub mod vlan;
+pub mod vmdq;
 pub mod wol;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
@@ -558,6 +559,8 @@ pub struct Ixgbe {
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
     /// Programmed Flow Director config, if `configure_fdir` ran.
     pub fdir_cfg: IrqSafeSpinLock<Option<fdir::FdirConfig>>,
+    /// Programmed VMDq config, if `configure_vmdq` ran.
+    pub vmdq_cfg: IrqSafeSpinLock<Option<vmdq::VmdqConfig>>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Programmed EEE state, if `configure_eee` ran. Always `None`
@@ -885,6 +888,7 @@ impl Ixgbe {
             dcb_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
             fdir_cfg: IrqSafeSpinLock::new(None),
+            vmdq_cfg: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
             wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
@@ -1518,6 +1522,23 @@ impl Ixgbe {
     /// 0x2c via the EERD helper).
     pub fn set_wol_board_cap(&self, cap: wol::WolBoardCap) {
         *self.wol_board_cap.lock() = cap;
+    }
+
+    /// Enable SR-IOV / VMDq (VT mode, 64 pools x 2 queues). Opt-in
+    /// and orthogonal to bring-up: the PF keeps pool 0 (queues 0/1)
+    /// and VF `i` maps to pool `i+1`; the VF mailbox dispatcher in
+    /// `vmdq` is fixture-proven but awaits an interrupt pump, and
+    /// PCI SR-IOV config-space enablement is a separate follow-up.
+    /// Callers must have RX/TX quiesced while reprogramming the
+    /// queue layout.
+    pub fn configure_vmdq(&self, cfg: vmdq::VmdqConfig) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            vmdq::enable_virtualization(&mut bank, &cfg)
+                .map_err(|_| IxgbeError::Other("bad VMDq config"))?;
+        }
+        *self.vmdq_cfg.lock() = Some(cfg);
+        Ok(())
     }
 
     /// Arm Wake-on-LAN. 82599EB by its datasheet rule; X540 and

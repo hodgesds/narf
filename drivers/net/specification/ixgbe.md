@@ -19,7 +19,7 @@ RX layout for simplicity), MSI-X vectors per queue (or one shared
 misc vector for 1/1), and a `HwNic` adapter exposing the same
 surface the e1000/mlx5 drivers do.
 
-Does NOT own: FCoE, SR-IOV, RSS, VMDq.
+Does NOT own: FCoE, RSS.
 
 ## 2. PCI match
 
@@ -356,6 +356,37 @@ PAYLEN split, and the full `tx_plan` matrix (plain / TSO /
 VLAN-only / VLAN+TSO / VLAN+csum rejection / mss-0
 rejection).
 
+## 13b. SR-IOV / VMDq (issue #1261)
+
+`drivers/net/ixgbe/src/ixgbe/vmdq.rs` implements the PF side of
+SR-IOV / VMDq, grounded in Linux ixgbe @ cbbddb6 (no local
+datasheet copy; see the module header for the full grounding note
+and the deliberate deviations). VT mode is 64 pools x 2 queues
+(`MTQC` VT_ENA | 64VF, `MRQC` VMDQEN, `VT_CTL` default pool +
+replication, VEB switching via `PFDTXGSWC`). Pool 0 is the PF's
+(queues 0/1, the 1/1 default bring-up, untouched); VF `i` owns
+pool `i+1` (at most 63 VFs — a documented deviation from Linux,
+which numbers VF pools from 0 with the PF after them; pool
+numbers are invisible to VFs). Pool registers: MPSAR pool bitmaps,
+VLVF/VLVFB pool VLANs (VFTA bit set additively on add, never
+cleared on remove — VFTA stays owned by §11), VMOLR/VMVIR,
+VFRE/VFTE, QDE drop-enable, VMECM spoof counting, per-queue
+TX write-back reset, VFLRE/VFLREC reset events, and RAR
+programming (pool selected before RAH/RAL, per Linux). VF
+primary MACs pin to RAR `i+1` (a NARF simplification vs Linux's
+free-RAR scan). The VF mailbox (`PFMAILBOX` control +
+`PFMBMEM` memory + `MBVFICR` request/ack bits) carries the PF/VF
+message interface: RESET (full reset sequence, 4-word
+MAC-or-NACK reply), SET_MAC_ADDR, SET_VLAN, SET_LPE, SET_MACVLAN
+(delete-only for index <= 1; add is a success no-op because
+Linux's add path is commented out), API_NEGOTIATE, and
+GET_QUEUES (2 TX + 2 RX queues). All other message types
+(SET_MULTICAST, RETA, RSS key, XCAST, link state, IPSEC,
+features) are NACKed. `Ixgbe::configure_vmdq` enables VT mode
+opt-in; the dispatcher is fixture-proven but awaits an
+interrupt pump, and PCI SR-IOV config-space enablement is a
+separate follow-up (see §14).
+
 ## 13c. Flow Director (FDIR)
 
 Implemented surface (`drivers/net/ixgbe/src/ixgbe/fdir.rs`,
@@ -652,11 +683,13 @@ Remainders (not silently dropped):
 
 Per the v0.1 exclusion list, still open after this stream:
 
-- SR-IOV / VMDq (MRQC virtualization modes, PFVTCTL, VF
-  registers) — needs the virtualization programming model.
-  The #1397 address question is settled (datasheet dual-map;
-  `ixgbe/regs.rs` is the shared authority): what remains is
-  the MRQE 0xB + per-pool RETA composition on the VMDq path.
+- SR-IOV / VMDq remainders (see §13b): the mailbox interrupt
+  pump; PCI SR-IOV config-space enablement; SET_MULTICAST and
+  the other NACKed message types; 32-VF mode; spoof-check
+  enforcement; DCB+VT combinations. The #1397 address question
+  is settled (datasheet dual-map; `ixgbe/regs.rs` is the shared
+  authority): what remains is the MRQE 0xB + per-pool RETA
+  composition on the VMDq path.
 - FlowDirector remainders (see §13c): TX sampling hook for ATR
   (packet parser + sample-rate policy + queue binding), IPv6
   perfect filters, persistent filter list with restore on
