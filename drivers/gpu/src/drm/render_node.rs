@@ -294,6 +294,8 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // authenticated primary open (a compositor whose master logind
         // dropped can still release its framebuffers); not render nodes.
         0xAE | 0xAF | 0xB8 | 0xD0 => Some(IoctlFlags::auth_only()),
+        // GETFB / GETFB2 — drm_ioctl.c flags 0.
+        0xAD | 0xCE => Some(IoctlFlags::auth_only()),
         // PAGE_FLIP and SETPLANE — DRM_MASTER.
         0xB0 | 0xB7 => Some(IoctlFlags::master_only()),
         // ATOMIC commit — DRM_MASTER.

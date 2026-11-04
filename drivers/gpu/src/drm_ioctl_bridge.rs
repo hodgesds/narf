@@ -2367,6 +2367,8 @@ fn dispatch_card_for_file_inner(
         // RMFB of a framebuffer on screen turns its CRTC off; the native
         // display follows.
         IoctlCmd::ModeCloseFb => handle_closefb(&mode_state, arg, open_id),
+        IoctlCmd::ModeGetFb => handle_getfb(&mode_state, arg, false),
+        IoctlCmd::ModeGetFb2 => handle_getfb(&mode_state, arg, true),
         IoctlCmd::ModeRmFb => {
             // drm_mode_rmfb: a framebuffer not on this file's list is ENOENT.
             // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
@@ -4594,6 +4596,47 @@ fn handle_gamma(
     if let Some((display, request)) = _request {
         crate::amdgpu_native_kms::request_crtc_color(display, request);
     }
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_GETFB (`struct drm_mode_fb_cmd`, 28 bytes) and GETFB2
+/// (`struct drm_mode_fb_cmd2`, 104 bytes): drm_mode_getfb / getfb2_ioctl.
+/// An unknown id is ENOENT. GEM handles are reported as 0, as Linux does
+/// for a caller that is neither the framebuffer's owner nor CAP_SYS_ADMIN
+/// (LINUX-GAP: the owner would get a fresh handle).
+fn handle_getfb(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    v2: bool,
+) -> Result<u64, FsError> {
+    let len = if v2 { 104 } else { 28 };
+    // SAFETY: `arg` is the validated ioctl pointer of `len` bytes.
+    let mut b = unsafe { copy_in(arg, len)? };
+    let fb_id = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    {
+        let card = mode_state.lock();
+        let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
+        let put =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut b, 4, fb.width);
+        put(&mut b, 8, fb.height);
+        if v2 {
+            put(&mut b, 12, fb.format as u32);
+            // flags: DRM_MODE_FB_MODIFIERS when a modifier was given.
+            put(&mut b, 16, u32::from(fb.modifier != 0) * 2);
+            b[20..104].fill(0);
+            put(&mut b, 36, fb.pitch);
+            put(&mut b, 52, fb.offsets[0]);
+            b[72..80].copy_from_slice(&fb.modifier.to_le_bytes());
+        } else {
+            put(&mut b, 12, fb.pitch);
+            put(&mut b, 16, 32);
+            put(&mut b, 20, 24);
+            put(&mut b, 24, 0);
+        }
+    }
+    // SAFETY: as above.
+    unsafe { copy_out(arg, &b)? };
     Ok(0)
 }
 

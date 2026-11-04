@@ -5981,3 +5981,54 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_closefb_keeps_scanout_and_rmfb_detaches
 );
+
+/// drm_mode_getfb2_ioctl: size, format and pitch of the framebuffer, GEM
+/// handles 0 for a caller that may not receive them; unknown id ENOENT.
+fn smoke_drm_getfb2_reports_framebuffer() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let Ok(handle) = state.lock().gem.alloc(0x8000_0000, 8192) else {
+        return TestResult::Fail("gem alloc");
+    };
+    let mut b = [0u8; 32];
+    for (dst, value) in b[..28]
+        .chunks_exact_mut(4)
+        .zip([0, 64, 32, 256, 32, 24, handle])
+    {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    if dispatch_card(idx, 0xc01c_64ae, b.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("ADDFB failed");
+    }
+    let fb = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let mut q = [0xffu8; 104];
+    q[0..4].copy_from_slice(&fb.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xCE, 104),
+        q.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || u32::from_le_bytes(q[4..8].try_into().unwrap()) != 64
+        || u32::from_le_bytes(q[8..12].try_into().unwrap()) != 32
+        || u32::from_le_bytes(q[20..24].try_into().unwrap()) != 0
+        || u32::from_le_bytes(q[36..40].try_into().unwrap()) != 256
+    {
+        return TestResult::Fail("GETFB2 fields");
+    }
+    q[0..4].copy_from_slice(&9999u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xCE, 104),
+        q.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("GETFB2 unknown id is not ENOENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_getfb2_reports_framebuffer
+);
