@@ -586,6 +586,30 @@ impl Host {
         self.outbound.push_back(out);
         Ok(())
     }
+    /// PS decision for one AP-originated unicast MPDU, for the `mgmt_tx`
+    /// entry point, which otherwise bypasses `queue()` and sends
+    /// immediately (`ieee80211_tx_h_unicast_ps_buf`, which the data path
+    /// already honors here). Bufferable MMPDUs and data to a dozing peer
+    /// are held (TIM refresh via `beacon_dirty`); awake peers and
+    /// non-bufferable MMPDUs send now. Management frames carry no TID,
+    /// so they buffer under BE (tid 0). The caller sends a `Send` verdict
+    /// itself (so `mgmt_tx` keeps its waited-ack path) and reports a
+    /// `Buffered` verdict as not-acked: this synchronous API cannot wait
+    /// for the peer's wake, and delivery on PS-Poll/U-APSD trigger carries
+    /// no status back to this caller.
+    pub(in crate::rtw89) fn ps_decide(
+        &mut self,
+        mpdu: Vec<u8>,
+        aid: u16,
+        now_ms: u64,
+    ) -> Result<Transmit, Error> {
+        let session = self.session.as_mut().ok_or(Error::Busy)?;
+        let out = session.ps.transmit(aid, mpdu, 0, now_ms)?;
+        if let Transmit::Buffered { tim_changed } = &out {
+            session.beacon_dirty |= *tim_changed;
+        }
+        Ok(out)
+    }
     /// Ordinary netdev TX (the stack's own 802.3 frames). Unicast needs an
     /// authorized associated peer; group frames need one authorized peer.
     /// Control-port ethertypes never use this path.

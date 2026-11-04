@@ -301,3 +301,67 @@ kernel_test_in!(
     "drivers/wireless/rtw89/uapsd",
     smoke_rtw89_ap_host_dozing_peer_tim_and_pspoll_release
 );
+
+/// Sweep F3: `mgmt_tx` honors the PS decision (`ieee80211_tx_h_unicast_ps_buf`).
+/// Awake: a deauthentication sends now. Dozing: a probe response
+/// (non-bufferable MMPDU) still sends now, but a deauthentication
+/// (bufferable) is held with TIM set and released by PS-Poll.
+fn smoke_rtw89_ap_host_mgmt_tx_to_dozing_peer_buffers() -> TestResult {
+    let Some(mut host) = started(false) else {
+        return TestResult::Fail("fixture");
+    };
+    fn mgmt(subtype: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![subtype << 4, 0, 0, 0];
+        frame.extend_from_slice(&STA);
+        frame.extend_from_slice(&OWN);
+        frame.extend_from_slice(&OWN);
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(body);
+        frame
+    }
+    // Awake peer: deauthentication sends now.
+    if !matches!(
+        host.ps_decide(mgmt(0xc, &[7, 0]), 1, 0),
+        Ok(Transmit::Send(_))
+    ) {
+        return TestResult::Fail("awake peer deauthentication was buffered");
+    }
+    // Null data with PM: the peer dozes (rx.c sta_ps_start).
+    let mut null = uplink(OWN, 0, &[], None, true);
+    null[0] = 0x48;
+    null.truncate(24);
+    let _ = host.receive(Some(1), &null, 0);
+    // Non-bufferable MMPDU to a dozing peer still sends now.
+    if !matches!(
+        host.ps_decide(mgmt(0x5, &[0; 8]), 1, 1),
+        Ok(Transmit::Send(_))
+    ) {
+        return TestResult::Fail("probe response to dozing peer was buffered");
+    }
+    // Bufferable MMPDU to a dozing peer is held with TIM set.
+    if !matches!(
+        host.ps_decide(mgmt(0xc, &[7, 0]), 1, 2),
+        Ok(Transmit::Buffered { tim_changed: true })
+    ) || !host.beacon_dirty()
+    {
+        return TestResult::Fail("deauthentication to dozing peer not buffered with TIM");
+    }
+    // PS-Poll releases the held deauthentication, period-ending.
+    let mut pspoll = vec![0xa4, 0x10, 1, 0xc0];
+    pspoll.extend_from_slice(&OWN);
+    pspoll.extend_from_slice(&STA);
+    if !host.receive(Some(1), &pspoll, 1).is_empty() {
+        return TestResult::Fail("PS-Poll is consumed");
+    }
+    let Some(out) = host.next_outbound().cloned() else {
+        return TestResult::Fail("PS-Poll released nothing");
+    };
+    if out.mpdu[4..10] != STA || out.mpdu[0] != 0xc0 || out.release.is_none() {
+        return TestResult::Fail("PS-Poll did not release the buffered deauthentication");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/uapsd",
+    smoke_rtw89_ap_host_mgmt_tx_to_dozing_peer_buffers
+);

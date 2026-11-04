@@ -243,7 +243,7 @@ unsafe impl Io for Startup {
     ) -> Result<u32, power::Error> {
         self.station_allowed()?;
         admission.check()?;
-        let epoch = self.retune_wide(profile).await?;
+        let epoch = self.retune_wide(profile, false).await?;
         admission.check()?;
         Ok(epoch)
     }
@@ -255,6 +255,17 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         admission.check()?;
         let epoch = self.retune_channel(primary, true).await?;
+        admission.check()?;
+        Ok(epoch)
+    }
+    async fn station_switch_wide_channel(
+        &mut self,
+        profile: crate::rtw89::operating_channel::Profile,
+        admission: &control::Admission,
+    ) -> Result<u32, power::Error> {
+        self.station_allowed()?;
+        admission.check()?;
+        let epoch = self.retune_wide(profile, true).await?;
         admission.check()?;
         Ok(epoch)
     }

@@ -3709,13 +3709,15 @@ peer has `HE_SU_MU_PPDU_4XLTF_AND_08_US_GI`, else `RTW89_GILTF_2XHE08`
 on B and 160MHz on C, so a C owner admits a 160MHz PPDU only after
 `retune_radio_c` programmed a 160MHz profile. B bytes (20/40/80MHz
 bindings, `wide_fingerprint`, RA, capability bodies) are unchanged.
-Known gaps: 80+80 is never offered; a 160MHz link fails on CSA like every
-wide link; passive-only spans join at 20MHz. Unexecuted cases:
+Known gaps: 80+80 is never offered; a wide link follows CSA to the
+target chandef (194 element, else current width/center at the new primary); passive-only spans join at 20MHz. Unexecuted cases:
 `smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux`,
 `smoke_rtw8852c_wide_station_profiles_map_to_c_profiles` (160MHz part),
 `smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner` (C
 160MHz part), `smoke_rtw89_b_packet_rx_width_follows_programmed_channel`
-(C 160MHz part).
+(C 160MHz part), `smoke_rtw8852b_ht40_csa_follows_same_width_chandef`,
+`smoke_rtw8852b_ht40_csa_wide_failures_drop_instead_of_narrowing`,
+`smoke_rtw8852b_wide_csa_target_follows_194_and_admission`.
 
 **C 6GHz power, records and station (`six_ghz_operation`).** RTL8852C
 `support_bands` includes 6GHz; the C channel geometry, `channel_c` BB/MAC
@@ -3849,7 +3851,7 @@ wide link); a beacon TPE change after association is not re-applied
 (mac80211 `BSS_CHANGED_TPE` -> `rtw89_reg_6ghz_recalc`): the join-time TPE
 from the scanned beacon/probe response stays; the scan ignores
 `psc_no_listen`/unsolicited-probe target hints (every planned channel is
-dwelt); no TX A-MPDU on 6GHz (`self.ht` stays false). RTL8922A 6GHz
+dwelt); TX A-MPDU on 6GHz follows HE-only negotiation (`ampdu` admits `he` without `ht`, density 0 per Linux's zeroed 6GHz ht_cap). RTL8922A 6GHz
 belongs to the separate open RTL8922A chip row. Unexecuted cases:
 `smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g`,
 `smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`,
@@ -4408,7 +4410,7 @@ management (MFP) is not in this profile. `mgmt_tx_ap_async` and
 (refusing `no_cck` on 2.4 GHz) and report the actual RPQ TX status.
 
 AP power save (`ap_ps.rs`) is now wired: unicast frames to an associated
-peer pass `ApPs::transmit` (`ieee80211_tx_h_unicast_ps_buf`); a TIM change
+peer pass `ApPs::transmit` (`ieee80211_tx_h_unicast_ps_buf`), and `mgmt_tx` frames pass the same decision via `Host::ps_decide`; a TIM change
 from buffering, a PM transition, expiry (`ApPs::expire` each worker pass)
 or DEL_STATION marks the beacon dirty and the AP worker republishes it
 (`rtw89_ops_set_tim` -> `update_beacon_work`); PS-Poll and U-APSD trigger
@@ -4425,16 +4427,19 @@ Linux `WIPHY_FLAG_AP_UAPSD`) only when this generation is AP-capable.
 mac80211 station-side limit with no nl80211 attribute; the AP side honours
 each peer's own Max SP (0 = all) in `ApPs`.
 
-Known gaps (not claimed): management frames from `mgmt_tx_ap_async` to a
-dozing peer are sent immediately rather than PS-buffered; unicast data
+Known gaps (not claimed): unicast data
 uses the band floor rate (no firmware RA rate on AP TX); peers are
 legacy-rate only (no HT/HE peer programming); one AP vif on port 0; no
-MFP/BIP; no native or physical execution. New cases, written and
+MFP/BIP; no native or physical execution. Management frames from
+`mgmt_tx_ap_async` to a dozing peer are PS-buffered instead (`Host::ps_decide`,
+bufferable MMPDUs held with TIM set, reported not-acked until delivery).
+New cases, written and
 unexecuted:
 `smoke_rtw89_ap_host_plan_admits_only_the_20mhz_ccmp_profile`,
 `smoke_rtw89_ap_host_ccmp_fromds_tx_and_macid_bound_rx`,
 `smoke_rtw89_ap_host_control_port_and_unencrypted_drop`,
-`smoke_rtw89_ap_host_dozing_peer_tim_and_pspoll_release`.
+`smoke_rtw89_ap_host_dozing_peer_tim_and_pspoll_release`,
+`smoke_rtw89_ap_host_mgmt_tx_to_dozing_peer_buffers`.
 
 ## 4. Invariants
 

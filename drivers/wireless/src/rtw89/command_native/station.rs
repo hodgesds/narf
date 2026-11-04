@@ -125,7 +125,9 @@ impl Native {
         let ht = self.station_ht_allowed().unwrap_or(false);
         let he = self.station_he_allowed().unwrap_or(false);
         let rx = packet::RxPhy::from_programs(ht, he);
-        let ampdu = ht && self.station_ampdu_allowed().unwrap_or(false);
+        // HE-only (6GHz) also aggregates: the `Ampdu` program, not HT
+        // negotiation, is the grant — `from_programs` maps it to `He`.
+        let ampdu = (ht || he) && self.station_ampdu_allowed().unwrap_or(false);
         let amsdu = ampdu && self.station_amsdu_allowed()?;
         let core = packet::Core::prepare_with(&mut self.station_access(), own, macid, qos_all, rx)
             .and_then(|mut core| {
