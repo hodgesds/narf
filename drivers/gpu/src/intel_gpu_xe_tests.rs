@@ -1001,7 +1001,6 @@ fn smoke_xe_userptr_invalidation_repins_zaps_and_refuses() -> TestResult {
     );
     assert_eq!(registered_intervals(), baseline + 1);
 
-    drop(exec);
     drop(host_object);
     drop(fresh_object);
     user.mapping.lock().take();

@@ -181,6 +181,7 @@ pub(crate) fn hold(index: u32, bar: &narf_bus::MmioRegion) -> Option<Hold> {
 }
 
 /// Why a runtime park is refused.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkRefusal {
     /// A system sleep owns the function.
@@ -198,6 +199,7 @@ pub(crate) enum ParkRefusal {
 
 /// The runtime-park admission. CPU mappings of system-memory objects are
 /// never an input: they stay valid across D3hot (`xe_bo.c`, module header).
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(crate) fn park_refusal(
     system_suspended: bool,
     running: bool,
