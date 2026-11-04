@@ -30,6 +30,8 @@ pub mod rtl8125;
 pub mod rtl8126;
 #[cfg(feature = "builtin")]
 pub mod rtl8127;
+#[cfg(feature = "builtin")]
+pub mod rtl8168;
 
 #[cfg(feature = "module")]
 mod module_probe;
