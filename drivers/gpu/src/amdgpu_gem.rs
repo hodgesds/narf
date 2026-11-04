@@ -1890,6 +1890,15 @@ impl GemState {
     pub(crate) fn card(&self) -> Option<u32> {
         self.card
     }
+    /// `drm_gem_handle_create`: a new handle in this open for `object`, even
+    /// when the open already has one, so the caller may GEM_CLOSE it without
+    /// touching its other handles (GETFB/GETFB2 hand these out).
+    pub fn handle_create(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
+        if object.card.is_none() || object.card != self.card {
+            return Err(FsError::InvalidData);
+        }
+        self.insert_shared(Arc::clone(object))
+    }
     pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
         if object.card.is_none() || object.card != self.card {
             return Err(FsError::InvalidData);
@@ -1988,7 +1997,7 @@ impl GemState {
     /// Drop this open's reference. The frames are freed when the last
     /// reference goes, which is not necessarily here — a buffer still mapped
     /// into a process stays alive until the mapping is torn down.
-    fn remove(&self, handle: u32) -> bool {
+    pub(crate) fn remove(&self, handle: u32) -> bool {
         self.table().lock().remove(&handle).is_some()
     }
 

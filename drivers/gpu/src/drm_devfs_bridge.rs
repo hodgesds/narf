@@ -589,6 +589,16 @@ impl FileOps for DriCardFile {
                 ) {
                     return result;
                 }
+                // GETFB/GETFB2 with a handle in this open's GEM table.
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_getfb_bo(
+                    self.index,
+                    self.open_id,
+                    cmd,
+                    arg,
+                    &self.amdgpu_gem,
+                ) {
+                    return result;
+                }
                 // A framebuffer of one of this open's amdgpu GEM buffers.
                 if let Some(result) = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
                     self.index,

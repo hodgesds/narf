@@ -7467,6 +7467,63 @@ fn smoke_drm_atomic_modeset_gate() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_modeset_gate);
 
+/// update_connector_routing: moving a connector off (or onto) a CRTC is a
+/// routing change of that CRTC (connectors_changed), refused without
+/// ALLOW_MODESET even when the CRTC itself is not in the request; keeping
+/// the routing is not.
+fn smoke_drm_atomic_connector_reroute_needs_allow_modeset() -> TestResult {
+    use crate::drm::atomic::{
+        AtomicCheckPolicy, AtomicError, AtomicState, ConnectorState, CrtcState,
+    };
+    let card = make_test_card_for_atomic();
+    let policy = AtomicCheckPolicy::default();
+    let request = |allow_modeset: bool, crtc_id: Option<u32>, with_crtc: bool| {
+        let mut st = AtomicState {
+            allow_modeset,
+            ..Default::default()
+        };
+        st.connectors.push(ConnectorState { id: 1, crtc_id });
+        if with_crtc {
+            st.crtcs.push(CrtcState {
+                id: 1,
+                enable: crtc_id.is_some(),
+                ..Default::default()
+            });
+        }
+        st
+    };
+    let mut kept = request(false, Some(1), false);
+    if kept.core_check(&card, &policy).is_err() {
+        return TestResult::Fail("unchanged routing refused without ALLOW_MODESET");
+    }
+    let mut detached = request(false, None, false);
+    if !matches!(
+        detached.core_check(&card, &policy),
+        Err(AtomicError::ModesetNotAllowed)
+    ) {
+        return TestResult::Fail("reroute of an absent CRTC accepted without ALLOW_MODESET");
+    }
+    let mut detached = request(false, None, true);
+    if !matches!(
+        detached.core_check(&card, &policy),
+        Err(AtomicError::ModesetNotAllowed)
+    ) {
+        return TestResult::Fail("reroute of a requested CRTC accepted without ALLOW_MODESET");
+    }
+    let mut allowed = request(true, None, true);
+    if allowed.core_check(&card, &policy).is_err() {
+        return TestResult::Fail("reroute refused with ALLOW_MODESET");
+    }
+    if !allowed.crtcs[0].connectors_changed || !allowed.crtcs[0].needs_modeset() {
+        return TestResult::Fail("reroute did not mark connectors_changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_atomic_connector_reroute_needs_allow_modeset
+);
+
 fn smoke_drm_atomic_plane_fb_crtc_pair() -> TestResult {
     use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, PlaneState};
     let card = make_test_card_for_atomic();

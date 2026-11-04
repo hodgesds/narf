@@ -4387,6 +4387,61 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         return TestResult::Fail("ADDFB of the second native dumb handle");
     }
     let fb_b = u32::from_le_bytes(legacy[..4].try_into().unwrap());
+    // drm_mode_getfb2: the master gets a new handle of the framebuffer's BO
+    // in its own table (GEM_CLOSE of it leaves its ADDFB handle alone);
+    // another open gets 0.
+    let getfb = |open: u64, fb: u32, v2: bool| {
+        let mut arg = [0u8; 104];
+        arg[0..4].copy_from_slice(&fb.to_le_bytes());
+        let cmd = if v2 {
+            iowr(DRM_IOCTL_BASE, 0xCE, 104)
+        } else {
+            iowr(DRM_IOCTL_BASE, 0xAD, 28)
+        };
+        let r = crate::drm_ioctl_bridge::amdgpu_getfb_bo(
+            idx,
+            open,
+            cmd,
+            arg.as_mut_ptr() as usize,
+            &gem,
+        );
+        let at = if v2 { 20 } else { 24 };
+        (
+            r,
+            u32::from_le_bytes(arg[at..at + 4].try_into().unwrap()),
+            arg,
+        )
+    };
+    let (Some(Ok(0)), handle, arg) = getfb(OWNER, fa, true) else {
+        return TestResult::Fail("GETFB2 by the master");
+    };
+    if handle == 0
+        || handle == a.handle
+        || !gem
+            .object(handle)
+            .is_some_and(|o| alloc::sync::Arc::ptr_eq(&o, &object_a))
+        || u32::from_le_bytes(arg[4..8].try_into().unwrap()) != 200
+        || u32::from_le_bytes(arg[36..40].try_into().unwrap()) != 1024
+    {
+        return TestResult::Fail("GETFB2 handle is not a new handle of the framebuffer's BO");
+    }
+    if !gem.remove(handle) || gem.object(a.handle).is_none() {
+        return TestResult::Fail("closing the GETFB2 handle touched the ADDFB handle");
+    }
+    let (Some(Ok(0)), legacy_handle, _) = getfb(OWNER, fb_b, false) else {
+        return TestResult::Fail("GETFB by the master");
+    };
+    if legacy_handle == 0 || legacy_handle == b.handle || !gem.remove(legacy_handle) {
+        return TestResult::Fail("GETFB handle");
+    }
+    if !matches!(getfb(SMOKE_MASTER_ID, fa, true), (Some(Ok(0)), 0, _))
+        || !matches!(
+            getfb(OWNER, 0xdead, true),
+            (Some(Err(FsError::NotFound)), _, _)
+        )
+    {
+        return TestResult::Fail("GETFB2 handle for a non-master, or unknown fb");
+    }
     let show = |fb: u32| {
         let card = ms.lock();
         let fb = card.framebuffer(fb).ok()?;
@@ -5980,6 +6035,49 @@ fn smoke_drm_closefb_keeps_scanout_and_rmfb_detaches() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_closefb_keeps_scanout_and_rmfb_detaches
+);
+
+/// drm_mode_rmfb: a framebuffer another open created is not on the
+/// caller's fb list (ENOENT) and stays; its creator removes it.
+fn smoke_drm_rmfb_of_another_open_is_enoent() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let Ok(handle) = state.lock().gem.alloc(0x8000_0000, 8192) else {
+        return TestResult::Fail("gem alloc");
+    };
+    let mut b = [0u8; 32];
+    for (dst, value) in b[..28]
+        .chunks_exact_mut(4)
+        .zip([0, 64, 32, 256, 32, 24, handle])
+    {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    if dispatch_card(idx, 0xc01c_64ae, b.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("ADDFB failed");
+    }
+    let fb = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let mut rm = fb.to_le_bytes();
+    let other = crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID + 1,
+        0xc004_64af,
+        rm.as_mut_ptr() as usize,
+        false,
+    );
+    if other != Err(FsError::NotFound) || state.lock().framebuffer(fb).is_err() {
+        return TestResult::Fail("RMFB of another open's framebuffer was not ENOENT");
+    }
+    let mut rm = fb.to_le_bytes();
+    if dispatch_card(idx, 0xc004_64af, rm.as_mut_ptr() as usize, false) != Ok(0)
+        || state.lock().framebuffer(fb).is_ok()
+    {
+        return TestResult::Fail("RMFB by the creator failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_rmfb_of_another_open_is_enoent
 );
 
 /// drm_mode_getfb2_ioctl: size, format and pitch of the framebuffer, GEM

@@ -249,6 +249,11 @@ pub struct Framebuffer {
     /// or imported buffer): `drm_framebuffer.obj[0]`, which the
     /// framebuffer holds.
     pub bo: Option<FbBo>,
+    /// The open that made a framebuffer without a per-open GEM buffer (a
+    /// card-table dumb buffer or an import) through the generic ADDFB
+    /// path: drm_framebuffer's place on that file's fb list, which RMFB and
+    /// CLOSEFB check. `None` when made by the kernel.
+    pub creator: Option<u64>,
     /// The Intel GEM buffer behind a framebuffer made from one of an open's
     /// Intel GEM handles (`drm_framebuffer.obj[0]`).
     #[cfg(feature = "intel")]
@@ -265,6 +270,11 @@ impl Framebuffer {
             return Some(intel.owner);
         }
         self.bo.as_ref().map(|bo| bo.owner)
+    }
+    /// The open whose fb list holds this framebuffer: its GEM owner, or the
+    /// open that made it through the generic ADDFB path.
+    pub fn owner(&self) -> Option<u64> {
+        self.gem_owner().or(self.creator)
     }
 }
 
@@ -2352,6 +2362,7 @@ impl Card {
             chroma_pitch,
             modifier,
             bo: None,
+            creator: None,
             #[cfg(feature = "intel")]
             intel: None,
         });
@@ -2425,6 +2436,7 @@ impl Card {
             chroma_pitch: if two { cmd.pitches[1] } else { 0 },
             modifier,
             bo: Some(FbBo { object, owner }),
+            creator: None,
             #[cfg(feature = "intel")]
             intel: None,
         });
@@ -2572,6 +2584,7 @@ impl Card {
             chroma_pitch: 0,
             modifier,
             bo: None,
+            creator: None,
             intel: Some(IntelFb { object, owner }),
         });
         Ok(id)
@@ -2682,19 +2695,18 @@ impl Card {
             .iter()
             .find(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)?;
-        if fb.gem_owner().is_some_and(|o| o != owner) {
+        if fb.owner().is_some_and(|o| o != owner) {
             return Err(CardError::UnknownFb);
         }
         if !self.fb_shown(fb_id) {
             return self.rmfb(fb_id);
         }
-        if let Some(bo) = self
-            .framebuffers
-            .iter_mut()
-            .find(|fb| fb.id == fb_id)
-            .and_then(|fb| fb.bo.as_mut())
-        {
-            bo.owner = CLOSED_FB_OWNER;
+        if let Some(fb) = self.framebuffers.iter_mut().find(|fb| fb.id == fb_id) {
+            match fb.bo.as_mut() {
+                Some(bo) => bo.owner = CLOSED_FB_OWNER,
+                None if fb.creator.is_some() => fb.creator = Some(CLOSED_FB_OWNER),
+                None => {}
+            }
         }
         Ok(None)
     }
@@ -2751,6 +2763,7 @@ impl Card {
                     chroma_pitch: 0,
                     modifier: 0,
                     bo: None,
+                    creator: None,
                     #[cfg(feature = "intel")]
                     intel: None,
                 });
@@ -2820,6 +2833,12 @@ impl Card {
         Ok(freed)
     }
 
+    /// Record `open` as the maker of framebuffer `fb_id` (generic ADDFB).
+    pub fn set_fb_creator(&mut self, fb_id: u32, open: u64) {
+        if let Some(fb) = self.framebuffers.iter_mut().find(|fb| fb.id == fb_id) {
+            fb.creator = Some(open);
+        }
+    }
     /// Look up a framebuffer by id.
     pub fn framebuffer(&self, fb_id: u32) -> Result<&Framebuffer, CardError> {
         self.framebuffers

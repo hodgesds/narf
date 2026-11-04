@@ -2380,7 +2380,7 @@ fn dispatch_card_for_file_inner(
             if mode_state
                 .lock()
                 .framebuffer(rm_id)
-                .is_ok_and(|fb| fb.gem_owner().is_some_and(|o| o != open_id))
+                .is_ok_and(|fb| fb.owner().is_some_and(|o| o != open_id))
             {
                 return Err(FsError::NotFound);
             }
@@ -2411,7 +2411,7 @@ fn dispatch_card_for_file_inner(
                 .filter(|p| p.is_cursor() && p.fb_id == Some(fb_id))
                 .filter_map(|p| p.crtc_id)
                 .collect();
-            let result = handle_generic(&mode_state, cmd, arg, &ctx);
+            let result = handle_generic(&mode_state, cmd, arg, &ctx, open_id);
             #[cfg(feature = "amdgpu")]
             if result.is_ok() && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
                 for crtc_id in shown {
@@ -2444,7 +2444,7 @@ fn dispatch_card_for_file_inner(
         // generic dispatcher, copy results back. A few ioctls have
         // pure-output (no input bytes); those still funnel through the
         // generic path.
-        _ => handle_generic(&mode_state, cmd, arg, &ctx),
+        _ => handle_generic(&mode_state, cmd, arg, &ctx, open_id),
     }
 }
 
@@ -4632,6 +4632,12 @@ fn handle_getfb(
             put(&mut b, 36, fb.pitch);
             put(&mut b, 52, fb.offsets[0]);
             b[72..80].copy_from_slice(&fb.modifier.to_le_bytes());
+            // A two-plane format's CbCr plane, in the same BO.
+            if fb.chroma_pitch != 0 {
+                put(&mut b, 40, fb.chroma_pitch);
+                put(&mut b, 56, fb.offsets[1]);
+                b[80..88].copy_from_slice(&fb.modifier.to_le_bytes());
+            }
         } else {
             put(&mut b, 12, fb.pitch);
             put(&mut b, 16, 32);
@@ -4642,6 +4648,69 @@ fn handle_getfb(
     // SAFETY: as above.
     unsafe { copy_out(arg, &b)? };
     Ok(0)
+}
+
+/// DRM_IOCTL_MODE_GETFB / GETFB2 on the native amdgpu card, with the GEM
+/// handles drm_mode_getfb(2) creates: for the current master (Linux also
+/// for CAP_SYS_ADMIN, which NARF has no notion of) a new handle in the
+/// caller's own table for the framebuffer's BO (drm_gem_handle_create, one
+/// handle shared by both planes of a two-plane format); 0 for anyone else,
+/// and for a framebuffer without an amdgpu BO. `None` for other requests.
+pub fn amdgpu_getfb_bo(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::amdgpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    let v2 = match cmd {
+        c if c == drm_uapi::iowr(drm_uapi::DRM_IOCTL_BASE, 0xAD, drm_uapi::SZ_DRM_MODE_FB_CMD) => {
+            false
+        }
+        c if c
+            == drm_uapi::iowr(
+                drm_uapi::DRM_IOCTL_BASE,
+                0xCE,
+                drm_uapi::SZ_DRM_MODE_FB_CMD2,
+            ) =>
+        {
+            true
+        }
+        _ => return None,
+    };
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
+    Some((|| {
+        handle_getfb(&mode_state, arg, v2)?;
+        // SAFETY: `arg` is the ioctl pointer handle_getfb just validated.
+        let fb_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());
+        let object = {
+            let card = mode_state.lock();
+            if !card.is_master(open_id) {
+                return Ok(0);
+            }
+            match card.framebuffer(fb_id).ok().and_then(|fb| {
+                fb.bo
+                    .as_ref()
+                    .map(|bo| (Arc::clone(&bo.object), fb.chroma_pitch != 0))
+            }) {
+                Some(found) => found,
+                None => return Ok(0),
+            }
+        };
+        let (object, two) = object;
+        let handle = gem.handle_create(&object)?;
+        let at = if v2 { 20 } else { 24 };
+        let mut out = handle.to_le_bytes().to_vec();
+        if v2 && two {
+            out.extend_from_slice(&handle.to_le_bytes());
+        }
+        // SAFETY: `at + out.len()` lies inside the validated struct.
+        if let Err(error) = unsafe { copy_out(arg + at, &out) } {
+            gem.remove(handle);
+            return Err(error);
+        }
+        Ok(0)
+    })())
 }
 
 /// DRM_IOCTL_MODE_CLOSEFB — `struct drm_mode_closefb { u32 fb_id; u32
@@ -8392,6 +8461,7 @@ fn handle_generic(
     cmd: u32,
     arg: usize,
     ctx: &DrmFileCtx,
+    open_id: u64,
 ) -> Result<u64, FsError> {
     let nr = drm_uapi::ioc_nr(cmd);
     // For ioctls with a known struct size, copy the input through.
@@ -8422,6 +8492,8 @@ fn handle_generic(
         }
         // fb_id is the first __u32 of both drm_mode_fb_cmd and fb_cmd2.
         crate::drm::ioctl::DrmIoctlResult::AddFb2(fb_id) if arg != 0 => {
+            // On the caller's fb list (drm_framebuffer_init's filp_head).
+            mode_state.lock().set_fb_creator(fb_id, open_id);
             // SAFETY: `arg` is the validated user framebuffer request pointer.
             unsafe { copy_out(arg, &fb_id.to_le_bytes())? };
         }
