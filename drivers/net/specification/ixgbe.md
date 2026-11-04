@@ -122,20 +122,29 @@ Stage 3 cut: legacy descriptor isn't supported on 82599 — we use
 the advanced (DEXT=1) layout with `DTYP = 0x3` (Advanced Data
 Descriptor).
 
-## 6. RX descriptor format (legacy, §7.1.5)
+## 6. RX descriptor format (advanced one-buffer, §7.1.6)
 
-Same 16-byte legacy layout as e1000:
+The ring uses advanced descriptors (§13k), not the legacy layout.
+Software arms each slot with the read view; hardware overwrites
+the same 16 bytes with the write-back view on completion:
 
 ```
-struct RxDesc {
-    addr:    u64,
-    length:  u16,
-    csum:    u16,
-    status:  u8,
-    errors:  u8,
-    special: u16,
+struct AdvRxDescRead {  // arming
+    pkt_addr: u64,      // packet buffer address
+    hdr_addr: u64,      // header buffer address (0: one-buffer mode)
+}
+struct AdvRxDescWb {    // completion
+    lo:           u32,  // RSS hash / packet-type dwords (bytes 0..8)
+    hi:           u32,
+    status_error: u32,  // status (low 20 bits) + error (high 12 bits)
+    length:       u16,  // packet length (bytes 12..14)
+    vlan:         u16,  // stripped VLAN tag (bytes 14..16, VP-gated)
 }
 ```
+
+The legacy `RxDesc` (addr/length/csum/status/errors/special) and
+its coarse `csum_result` decoder were removed with the migration;
+their only consumer was the RX path itself.
 
 ## 7. MSI-X (Stage 5)
 
@@ -233,10 +242,10 @@ programs and records the filter (caps gain `VLAN_TAGGING`);
 `clear_vlan` restores the empty table + VFE off;
 `set_vlan_strip(q, enable)` toggles per-queue RXDCTL.VME
 (bit 30, strip the tag on that queue's 802.1Q frames).
-Untagged frames are unaffected by the table. NOTE: this
-driver still uses legacy RX descriptors, so a stripped tag's
-VLAN field is not yet surfaced to the stack — the advanced-
-descriptor migration that reports it is a follow-up (§14).
+Untagged frames are unaffected by the table. A stripped tag
+is surfaced to the stack via the advanced write-back
+descriptor's VLAN field (§13k): `RxMeta::vlan_tag` carries
+the full TCI when the VP status bit is set, `None` otherwise.
 
 ## 12. Wake-on-LAN
 
@@ -281,16 +290,16 @@ device stays quiesced and the caller may re-probe.
 Probe records `ETHTOOL_GDRVINFO` data via
 `narf_net::iface::set_driver_info` (driver "ixgbe", version
 "0.1.0", PCIe bus address per the igb pattern) and the honest
-offload set via `set_offloads` (TX checksum, TSO to the `tx()`
-bound, VLAN insertion). The
+offload set via `set_offloads` (TX checksum + RX checksum
+reporting, TSO to the `tx()` bound, VLAN insertion). The
 driver-side snapshot is `drivers/net/ixgbe/src/ixgbe/
 ethtool.rs`: `EthtoolInfo` (identity, MTU, link, queue counts,
 caps word, RSS/VLAN/WoL state) plus `read_stats`, which reads
 GPRC (0x04074) / GPTC (0x04080) — both RC, so snapshots are
 interval counters, not lifetime totals. `Ixgbe::ethtool_info`
 builds the snapshot on demand. Honest advertisement: RX
-checksum is NOT claimed (the decoder exists but is not plumbed
-into frame metadata); TSO claims the `tx()` bound (4096 bytes;
+checksum IS claimed (advanced write-back status/error bits
+decoded conservatively into `RxMeta`, §13k); TSO claims the `tx()` bound (4096 bytes;
 `tx_frame()` runs to 16384, see §13j); VLAN insertion IS
 claimed (`TxMeta::vlan_tag` rides the context descriptor +
 VLE). VLAN + checksum offload without TSO is rejected, not
@@ -386,6 +395,82 @@ features) are NACKed. `Ixgbe::configure_vmdq` enables VT mode
 opt-in; the dispatcher is fixture-proven but awaits an
 interrupt pump, and PCI SR-IOV config-space enablement is a
 separate follow-up (see §14).
+
+## 13k. Advanced RX descriptors + RX metadata (issue #1270)
+
+The RX ring migrated from legacy descriptors to advanced
+one-buffer descriptors, and completion metadata is plumbed
+into frame metadata. Implementation:
+`drivers/net/ixgbe/src/ixgbe/rxdesc.rs` (descriptor views +
+decode), `rx_recv` / `rx_recv_frame` / `rx_has_pending` in
+`ixgbe.rs`, `RxMeta::vlan_tag` in `net/src/lib.rs`.
+
+Program word: SRRCTL = `BSIZE_2K | DESCTYPE_ADV_ONEBUF`
+(2 | 1 << 25 = 0x02000002). DESCTYPE 001 is Linux's
+ADV_ONEBUF (`ixgbe_type.h:2462`); the datasheet (§7.1.6)
+requires DESCTYPE != 000 for the advanced format.
+
+Write-back decode (datasheet §7.1.6.2, Table 7.16; Linux
+`union ixgbe_adv_rx_desc` @ `cbbddb6`, `ixgbe_type.h:2903`):
+status_error u32 at offset 8 packs status (low 20 bits) and
+error (high 12 bits); length u16 at 12; VLAN tag u16 at 14.
+Status bits: DD 0x01, EOP 0x02, VP 0x08, UDPCS 0x10, L4CS
+0x20, IPCS 0x40 (`ixgbe_type.h:2380-2400`, VP/DD/EOP/PIF
+corroborated by datasheet Table 7.17). Error bits: TCPE
+0x40000000, IPE 0x80000000 (mask 0xfff00000,
+`ixgbe_type.h:2408-2426`).
+
+Checksum decode mirrors Linux's `ixgbe_rx_checksum`
+(`ixgbe_main.c:1676`) and the i40e conservative precedent:
+`csum_l3 = IPCS && !IPE`, `csum_l4 = L4CS && !TCPE`. A
+missing claim is fail-closed (the stack verifies in
+software); a false claim would accept a corrupt frame, so
+no claim is made on partial evidence. IPv6 never sets
+`csum_l3` — IPv6 has no header checksum, so hardware never
+sets IPCS for it.
+
+VLAN reporting mirrors Linux's VLAN-accel path
+(`ixgbe_main.c:1905-1909`): when the VP bit is set, the
+write-back `vlan` field holds the stripped tag's full TCI
+and `RxMeta::vlan_tag` carries it; when VP is clear,
+`vlan_tag` is `None` even if the field holds a stale value.
+No RX-VLAN capability flag exists in `OffloadCapabilities`
+— reporting rides on `RxMeta` alone.
+
+Composition notes. The decode helpers take a descriptor
+value only (queue-agnostic), so the per-queue RX pumps of
+the multi-queue stream can call them; this change assumes
+no queue topology. The copy path (`rx_recv`) returns bytes
+only and cannot carry metadata — `rx_recv_frame` is the
+plumbing path, and the pump's mirror fan-in copies
+`rx_meta` (see `drivers/net/core/src/publish.rs`), so no
+publish changes were needed. Advanced write-back
+overwrites the buffer address, so `rx_recv` reads the
+buffer from the driver's own slot pool. `rx_has_pending`
+reads the status_error u32 at descriptor offset 8 (the
+legacy layout's status byte at offset 12 is gone).
+
+Remainders (not silently dropped). (a) The 82599
+UDP-zero-checksum errata carve-out (Linux ignores a TCPE
+error on UDP frames with a zero checksum) is NOT
+implemented — it needs packet-type decode plus ring state;
+such frames report `csum_l4 = false`, which is
+fail-closed, not wrong. (b) RSS hash / flow-director ID
+(lo/hi dwords) are NOT surfaced; `RxMeta::rx_hash` stays 0
+for ixgbe until the RSS row wires it. (c) RSC coalescing
+counts are NOT surfaced; `gro_segs` stays 0. (d) The
+X540/X550 datasheet re-grounding of this register block
+rides on the #1266 remainders. (e) The 1/1 probe default
+and queue topology are untouched; the multi-queue union
+duty sits with whoever lands second. (f) The MRQC/RETA/
+RSSRK map is untouched (issue #1397, no side picked).
+
+Grounding status, stated honestly: the write-back layout
+and DD/EOP/VP/PIF status positions are corroborated by
+both Linux and the 82599 Datasheet; the IPCS/L4CS/TCPE/IPE
+bit values are Linux-sourced with only loose datasheet
+corroboration (the Table 7.17 "IPCS L4I UDPCS" ordering).
+Nothing in this section is invented.
 
 ## 13c. Flow Director (FDIR)
 

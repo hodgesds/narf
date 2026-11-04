@@ -185,6 +185,7 @@ pub(crate) fn rx_metadata(status: u32, hash: u32) -> RxMeta {
         timestamp_ns: None,
         csum_l3: checksum && status & 0x40 != 0 && status & 0x40000000 == 0,
         csum_l4: checksum && status & 0x30 != 0 && status & 0x20000000 == 0,
+        vlan_tag: None,
         gro_segs: 1,
         rx_hash: hash,
     }

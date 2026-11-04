@@ -18,6 +18,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 use crate::ixgbe::queues::RegBank;
+use crate::ixgbe::rxdesc::{AdvRxDescRead, AdvRxDescWb, ADV_RXD_STAT_DD};
 
 pub mod dcb;
 pub mod eee;
@@ -27,6 +28,7 @@ pub mod pm;
 pub mod queues;
 pub mod regs;
 pub mod rss;
+pub mod rxdesc;
 mod tests;
 pub mod vlan;
 pub mod vmdq;
@@ -118,9 +120,12 @@ pub(crate) const EERD_ADDR_SHIFT: u32 = 2;
 pub(crate) const RXDCTL_ENABLE: u32 = 1 << 25;
 pub(crate) const TXDCTL_ENABLE: u32 = 1 << 25;
 
-// SRRCTL — bsize selector (1 KiB units), legacy descriptor type.
+// SRRCTL — bsize selector (1 KiB units), advanced descriptor type.
+// DESCTYPE 001 (ADV_ONEBUF, Linux ixgbe_type.h:2462) selects advanced
+// one-buffer descriptors; 000 (legacy) cannot report stripped VLAN
+// tags (datasheet §7.1.6 requires DESCTYPE != 000 for advanced).
 pub(crate) const SRRCTL_BSIZE_2K: u32 = 2; // bits[4:0]
-pub(crate) const SRRCTL_DESCTYPE_LEGACY: u32 = 0 << 25;
+pub(crate) const SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 1 << 25;
 
 // Advanced TX descriptor cmd_type_len bits (§7.2.3.2.4).
 pub(crate) const ADVTXD_DTYP_DATA: u32 = 0x3 << 20;
@@ -166,17 +171,6 @@ pub(crate) const ADVTXD_L4LEN_SHIFT: u32 = 8;
 pub const ADVTXD_MSS_SHIFT: u32 = 16;
 pub(crate) const ADVTXD_MACLEN_SHIFT: u32 = 9;
 
-/// RX checksum verification result decoded from a legacy ixgbe RxDesc.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RxCsumResult {
-    /// Hardware did not compute a checksum for this frame.
-    None,
-    /// Hardware computed and verified the checksum — no errors.
-    Ok,
-    /// Hardware detected a checksum error.
-    Fail,
-}
-
 /// Advanced TX context descriptor — precedes the data descriptor for
 /// TSO and carries MSS / L4-len / TUCMD fields. Per ixgbe §7.2.3.2.2.
 #[repr(C, align(16))]
@@ -187,11 +181,6 @@ pub struct AdvTxCtxtDesc {
     pub type_tucmd_mlhl: u32,
     pub mss_l4len_idx: u32,
 }
-
-// Legacy RX descriptor status bits.
-pub(crate) const RXD_STAT_DD: u8 = 1 << 0;
-#[allow(dead_code)]
-pub(crate) const RXD_STAT_EOP: u8 = 1 << 1;
 
 // Ring lengths come from `QueueConfig::ring_len` (32 for the
 // single-queue config, matching the old Stage-3/4 constants).
@@ -222,18 +211,6 @@ impl AdvTxDesc {
             | ADVTXD_DCMD_EOP
     }
 }
-
-#[repr(C, align(16))]
-#[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct RxDesc {
-    pub addr: u64,
-    pub length: u16,
-    pub csum: u16,
-    pub status: u8,
-    pub errors: u8,
-    pub special: u16,
-}
-const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
 // ── Descriptor offload helpers ───────────────────────────────────────
 
@@ -434,22 +411,6 @@ fn tx_plan(
     Ok((ctxt, desc))
 }
 
-impl RxDesc {
-    /// Decode the RX checksum result from the legacy ixgbe RxDesc.
-    /// The `csum` field is non-zero when hardware computed a checksum;
-    /// `errors` being 0 means the check passed.
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
-    pub fn csum_result(&self) -> RxCsumResult {
-        if self.csum == 0 {
-            RxCsumResult::None
-        } else if self.errors == 0 {
-            RxCsumResult::Ok
-        } else {
-            RxCsumResult::Fail
-        }
-    }
-}
-
 // ── EEPROM decode helper (Stage 2) ─────────────────────────────────
 
 /// Decode the EEPROM "data" word out of an EERD register value.
@@ -612,7 +573,7 @@ fn program_tx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usiz
 }
 
 /// Program one RX queue's descriptor ring (base, length, head/tail,
-/// SRRCTL 2K legacy buffers, queue-enable) on any [`RegBank`].
+/// SRRCTL 2K advanced one-buffer descriptors, queue-enable) on any [`RegBank`].
 /// Same sharing note as [`program_tx_queue`].
 fn program_rx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usize) {
     let rxq = queues::rx_queue_regs(q).expect("validated queue count is in range");
@@ -621,7 +582,7 @@ fn program_rx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usiz
     bank.write32(rxq.rdlen, (ring_len * 16) as u32);
     bank.write32(rxq.rdh, 0);
     bank.write32(rxq.rdt, ring_len.saturating_sub(1) as u32);
-    bank.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
+    bank.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF);
     bank.set_bits(rxq.rxdctl, RXDCTL_ENABLE);
 }
 
@@ -817,19 +778,12 @@ impl Ixgbe {
                 let buf =
                     alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
                 let bp = buf.dma_addr().raw();
-                let desc = RxDesc {
-                    addr: bp,
-                    length: 0,
-                    csum: 0,
-                    status: 0,
-                    errors: 0,
-                    special: 0,
-                };
+                let desc = AdvRxDescRead::new(bp);
                 // SAFETY: identity-mapped DMA ring page.
                 unsafe {
                     core::ptr::write_volatile(
                         narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
-                            .kernel_mut_ptr::<RxDesc>(),
+                            .kernel_mut_ptr::<AdvRxDescRead>(),
                         desc,
                     );
                 }
@@ -1115,7 +1069,12 @@ impl Ixgbe {
     }
 
     /// Drain one RX frame from queue 0 into `out`. Returns 0 if
-    /// nothing pending. See [`Self::rx_recv_on_queue`].
+    /// nothing pending. Copy path: returns bytes only, so it cannot
+    /// carry completion metadata — the pump's `rx_recv_frame` is
+    /// the path that attaches `RxMeta`. Advanced write-back
+    /// overwrites the buffer address, so the buffer comes from the
+    /// driver's own slot pool (same lock order as `rx_recv_frame`:
+    /// head, then slots). See [`Self::rx_recv_on_queue`].
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
         self.rx_recv_on_queue(0, out)
     }
@@ -1137,13 +1096,15 @@ impl Ixgbe {
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let desc = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<AdvRxDescWb>(),
+            )
         };
-        if desc.status & RXD_STAT_DD == 0 {
+        if !desc.is_done() {
             return 0;
         }
         let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
-        let buf_phys = desc.addr;
+        let buf_phys = self.rx_slots.lock()[head].dma_addr().raw();
         for (i, b) in out[..len].iter_mut().enumerate() {
             // SAFETY: identity-mapped DMA buffer; `buf_phys` is the
             // descriptor-published frame address and `i < len <= RX_BUF_LEN`,
@@ -1155,18 +1116,11 @@ impl Ixgbe {
                 )
             };
         }
-        let new_desc = RxDesc {
-            addr: buf_phys,
-            length: 0,
-            csum: 0,
-            status: 0,
-            errors: 0,
-            special: 0,
-        };
+        let new_desc = AdvRxDescRead::new(buf_phys);
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvRxDescRead>(),
                 new_desc,
             );
         }
@@ -1178,7 +1132,6 @@ impl Ixgbe {
         }
         let new_head = ((head + 1) % ring_len) as u32;
         *head_g = new_head;
-        let _ = RXD_STAT_EOP;
         len
     }
 
@@ -1190,8 +1143,10 @@ impl Ixgbe {
     /// when no frame is pending, or when the refill allocation fails
     /// — in which case the received frame is left in its descriptor
     /// (head not advanced) to be retried, rather than dropped with
-    /// no buffer to replace it. See
-    /// [`Self::rx_recv_frame_on_queue`].
+    /// no buffer to replace it. Completion metadata (checksum
+    /// verdicts + stripped VLAN tag) is decoded from the advanced
+    /// write-back descriptor and attached via `set_rx_meta` (§13k).
+    /// See [`Self::rx_recv_frame_on_queue`].
     pub fn rx_recv_frame(&self) -> Option<Frame> {
         self.rx_recv_frame_on_queue(0)
     }
@@ -1211,12 +1166,15 @@ impl Ixgbe {
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let desc = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<AdvRxDescWb>(),
+            )
         };
-        if desc.status & RXD_STAT_DD == 0 {
+        if !desc.is_done() {
             return None;
         }
         let len = (desc.length as usize).min(RX_BUF_LEN);
+        let meta = desc.rx_meta();
         // Refill before handing the filled buffer up, so the device never sees
         // an empty slot. On allocation failure, bail without advancing — the
         // frame stays in the ring for the next poll.
@@ -1226,18 +1184,11 @@ impl Ixgbe {
             let mut slots = queue.rx_slots.lock();
             core::mem::replace(&mut slots[head], replacement)
         };
-        let new_desc = RxDesc {
-            addr: repl_phys,
-            length: 0,
-            csum: 0,
-            status: 0,
-            errors: 0,
-            special: 0,
-        };
+        let new_desc = AdvRxDescRead::new(repl_phys);
         // SAFETY: identity-mapped DMA ring.
         unsafe {
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvRxDescRead>(),
                 new_desc,
             );
         }
@@ -1248,7 +1199,9 @@ impl Ixgbe {
             self.mmio.write32(rxq.rdt, head as u32);
         }
         *head_g = ((head + 1) % ring_len) as u32;
-        Some(Frame::new(filled, len as u32))
+        let mut frame = Frame::new(filled, len as u32);
+        frame.set_rx_meta(meta);
+        Some(frame)
     }
 
     /// Whether queue 0 has a completed RX descriptor. See
@@ -1271,10 +1224,12 @@ impl Ixgbe {
         let ring_phys = queue.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>())
+        // Advanced write-back: status_error u32 at descriptor offset 8
+        // (the legacy layout had a status byte at offset 12).
+        let status_error = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 8).kernel_ptr::<u32>())
         };
-        status & RXD_STAT_DD != 0
+        status_error & ADV_RXD_STAT_DD != 0
     }
 
     /// Stage 5: enable MSI-X on this device. Allocates a single
@@ -2146,9 +2101,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
 
     // Ethtool surface (what ETHTOOL_GDRVINFO reports): driver,
-    // version, bus address, and the offloads the send path
-    // actually honors (TX checksum, TSO to the tx() copy-buffer
-    // bound, VLAN insertion — see ethtool.rs).
+    // version, bus address, and the offloads the paths actually
+    // honor (TX checksum + RX checksum reporting, TSO to the tx()
+    // copy-buffer bound, VLAN insertion — see ethtool.rs).
     // Runs before IXGBE_IFNAME.set moves `name`.
     let bus_info = match device.addr {
         narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
@@ -2159,6 +2114,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         &name,
         narf_net::OffloadCapabilities {
             tx_checksum: true,
+            rx_checksum: true,
             max_tso_bytes: TX_TSO_MAX_TX as u32,
             vlan_insert: true,
             ..Default::default()

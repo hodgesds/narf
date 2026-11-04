@@ -1207,6 +1207,13 @@ pub struct RxMeta {
     /// `true` if the hardware verified the L4 (TCP/UDP) checksum
     /// and found it valid.
     pub csum_l4: bool,
+    /// Stripped 802.1Q tag (TCI: PCP + CFI + VID, same meaning as
+    /// `TxMeta::vlan_tag`) when hardware stripped the tag and
+    /// reported it in the RX descriptor. `None` means no stripped
+    /// tag was reported — the frame is either untagged, the tag is
+    /// still inline in the payload, or the driver did not surface
+    /// it. Drivers that do not report tags leave this `None`.
+    pub vlan_tag: Option<u16>,
     /// Number of wire segments coalesced into this frame by GRO (software) or
     /// LRO (hardware). 0 or 1 means the frame was not coalesced.
     pub gro_segs: u16,
