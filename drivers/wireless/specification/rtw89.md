@@ -4408,7 +4408,7 @@ management (MFP) is not in this profile. `mgmt_tx_ap_async` and
 (refusing `no_cck` on 2.4 GHz) and report the actual RPQ TX status.
 
 AP power save (`ap_ps.rs`) is now wired: unicast frames to an associated
-peer pass `ApPs::transmit` (`ieee80211_tx_h_unicast_ps_buf`); a TIM change
+peer pass `ApPs::transmit` (`ieee80211_tx_h_unicast_ps_buf`), and `mgmt_tx` frames pass the same decision via `Host::ps_decide`; a TIM change
 from buffering, a PM transition, expiry (`ApPs::expire` each worker pass)
 or DEL_STATION marks the beacon dirty and the AP worker republishes it
 (`rtw89_ops_set_tim` -> `update_beacon_work`); PS-Poll and U-APSD trigger
@@ -4425,16 +4425,19 @@ Linux `WIPHY_FLAG_AP_UAPSD`) only when this generation is AP-capable.
 mac80211 station-side limit with no nl80211 attribute; the AP side honours
 each peer's own Max SP (0 = all) in `ApPs`.
 
-Known gaps (not claimed): management frames from `mgmt_tx_ap_async` to a
-dozing peer are sent immediately rather than PS-buffered; unicast data
+Known gaps (not claimed): unicast data
 uses the band floor rate (no firmware RA rate on AP TX); peers are
 legacy-rate only (no HT/HE peer programming); one AP vif on port 0; no
-MFP/BIP; no native or physical execution. New cases, written and
+MFP/BIP; no native or physical execution. Management frames from
+`mgmt_tx_ap_async` to a dozing peer are PS-buffered instead (`Host::ps_decide`,
+bufferable MMPDUs held with TIM set, reported not-acked until delivery).
+New cases, written and
 unexecuted:
 `smoke_rtw89_ap_host_plan_admits_only_the_20mhz_ccmp_profile`,
 `smoke_rtw89_ap_host_ccmp_fromds_tx_and_macid_bound_rx`,
 `smoke_rtw89_ap_host_control_port_and_unencrypted_drop`,
-`smoke_rtw89_ap_host_dozing_peer_tim_and_pspoll_release`.
+`smoke_rtw89_ap_host_dozing_peer_tim_and_pspoll_release`,
+`smoke_rtw89_ap_host_mgmt_tx_to_dozing_peer_buffers`.
 
 ## 4. Invariants
 

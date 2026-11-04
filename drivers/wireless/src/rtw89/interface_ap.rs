@@ -17,6 +17,7 @@ use crate::rtw89::{
     ap_control::PortConfig,
     ap_crypto::{self, Install},
     ap_host::{self, Inbound, Plan, Registration},
+    ap_ps,
     station_control::codec,
 };
 use core::num::NonZeroU64;
@@ -478,6 +479,31 @@ impl<I: Io + 'static> Device<I> {
             .lock()
             .management_frame(&request.frame)
             .map_err(map)?;
+        // Sweep F3: a bufferable MMPDU to a dozing peer is PS-buffered
+        // (TIM set) instead of sent immediately — `ieee80211_tx_h_unicast_ps_buf`.
+        // Group and unassociated destinations, awake peers, non-bufferable
+        // MMPDUs, and peers the PS table does not track all take the
+        // immediate path below. A buffered frame reports not-acked: this
+        // synchronous API cannot wait for the peer's wake.
+        let mut dest = [0u8; 6];
+        dest.copy_from_slice(&mpdu[4..10]);
+        let aid = self
+            .ap
+            .lock()
+            .peer(dest)
+            .and_then(|peer| (peer.aid != 0).then_some(peer.aid));
+        if let Some(aid) = aid {
+            match self
+                .ap
+                .lock()
+                .ps_decide(mpdu.clone(), aid, self.environment.now_ms())
+            {
+                Ok(ap_ps::Transmit::Buffered { .. }) => return Ok(false),
+                Ok(ap_ps::Transmit::Send(_)) => {}
+                Err(ap_host::Error::Ps(ap_ps::Error::Unknown)) => {}
+                Err(error) => return Err(map(error)),
+            }
+        }
         let ack = self.ap_send_waited(&emission, &mpdu, true).await?;
         authority.check_for(self)?;
         Ok(ack)
