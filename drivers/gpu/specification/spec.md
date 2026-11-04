@@ -13895,6 +13895,18 @@ separate-alpha processing and ROM degamma, and bypasses the color-management
 block. Scaling-444 bypass still initializes autocal/boundary mode and the
 opaque RGB line buffer (all three banks, 63 maximum partitions). These fields
 and constructor bounds are shared by the verified DCN30/DCN314 layouts.
+`Dpp::set_scaler(&amdgpu_dcn30_scl::ScalerData)` (DCN3.0 only, else
+`Unsupported`) is `dpp1_dscl_set_scaler_manual_scale` for an RGB primary at
+`dcn_3_0_0_offset.h`'s DSCL block: autocal and boundary mode cleared,
+RECOUT_START/SIZE, MPC_SIZE (the ODM slice), DSCL_MODE (444 bypass for
+identity ratios, else 444 RGB), the `use_max_lb` line buffer; then for a
+scaled plane the U3.19 ratios and U0.19 phases (`<< 5`, integer at bit 24,
+chroma copies equal), SCL_TAP_CONTROL, DSCL_2TAP_CONTROL and
+`dpp1_dscl_set_scl_filter`'s 64-phase luma filters (`dce_scl_filters.c`'s
+tables, upscale / 1.16 / 1.49 / 1.83 by ratio, 33 phases of tap pairs),
+written only when a filter changed, then SCL_COEF_RAM_SELECT flipped from
+the current bank. Like DC's cached `scl_data` an unchanged update writes
+nothing; `program` drops that cache (`dpp_reset`).
 `Mpc::mux_plane` bypasses any inherited output-gamma LUT, binds one combiner to
 one DPP and one OPP and points that
 OPP's output mux at it, with the bottom select parked so a stale value cannot
