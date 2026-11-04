@@ -408,11 +408,16 @@ frame itself and builds its descriptors from the shared builders.
   (16383), TX slots are 16 KiB, and MTPS is sized from the
   chip's jumbo tagged frame (with Linux's VER_31..33 override).
   Jumbo frames are therefore receivable and transmittable
-  through the driver API. The interface MTU stays 1500 with
-  offloads advertised: Linux's `rtl8169_fix_features` disables
-  CSUM + TSO when MTU > 1500 on MAC > VER_06, so a jumbo MTU
-  and TX offload cannot coexist on this family; a runtime MTU
-  switch is future work.
+  through the driver API. The runtime MTU switch (#1276) is
+  wired for the r8169 family: `try_set_mtu` validates
+  68..=version-max, programs the jumbo Config bits (+ MTPS
+  override on VER_31..33; RMS and rings already cover the
+  version max, so neither moves), and republishes the offload
+  advertisement exactly where Linux's `rtl8169_fix_features`
+  withdraws it (jumbo MTU on MAC > VER_06 drops CSUM + TSO;
+  MTU > 2047 drops TSO on every version), so advertised caps
+  always match the programmed hardware. The 8125/8126/8127
+  drivers share the transition logic but are not wired yet.
 - **WoL.** Each driver exposes `set_wol_opts` programming
   Linux's `__rtl8169_set_wol` shape: Config3 LinkUp/MagicPacket,
   Config5 UWF/BWF/MWF/LanWake, and the version-selected PME
