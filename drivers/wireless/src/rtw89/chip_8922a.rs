@@ -11,8 +11,9 @@
 //!
 //! Deliberate narrowings, all from the Linux struct itself:
 //! - `support_bandwidths` is 20/40/80/160 MHz. 320 MHz EHT operation is
-//!   NOT in this bitmask; claiming it here would be fabrication (the
-//!   `eht` row covers it, on top of this chip row).
+//!   NOT in this bitmask; claiming it here would be fabrication. The
+//!   320 MHz width programming lives in `eht.rs` (the `eht` row, on
+//!   top of this chip row); the mask itself is unchanged.
 //! - `bb_table`, `bb_gain_table`, `rf_table`, `dflt_parms`,
 //!   `rfe_parms_conf`, `dig_table`, `tssi_dbw_table` are NULL in Linux
 //!   ("load parm from fw") — there is nothing to transcribe, so this

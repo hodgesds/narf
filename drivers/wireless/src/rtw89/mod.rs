@@ -78,6 +78,7 @@ mod download_plan;
 mod dpk;
 pub mod efuse;
 mod efuse_be;
+mod eht;
 mod endpoints;
 mod factory;
 mod factory_51;
@@ -245,6 +246,9 @@ mod chip_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod efuse_be_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod eht_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod irq_be_tests;
