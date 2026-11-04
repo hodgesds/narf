@@ -227,19 +227,13 @@ fn setup_link(
     pause: PausePolicy,
     eee: bool,
 ) -> Result<(), IgcError> {
-    if r.read(0x5820) & 0x40000 != 0 {
-        return Err(IgcError::Other("firmware blocks PHY reset"));
+    // igc_setup_link: with MANC.BLK_PHY_RST_ON_IDE set, firmware owns the
+    // PHY and link is already configured; Linux leaves both alone.
+    if phy_reset_blocked(r) {
+        return Ok(());
     }
     phy_transaction(r, || {
-        let ctrl = r.read(0);
-        r.write(0, ctrl | (1 << 31));
-        r.flush();
-        r.delay(100);
-        r.write(0, ctrl & !(1 << 31));
-        r.flush();
-        r.delay(100);
-        poll(r, 0xe14, 0x100, 0x100)?;
-        r.delay(100);
+        phy_hw_reset(r);
         let id_high = mdio(r, 2, None)?;
         r.delay(200); // igc_get_phy_id: settle between PHY ID words.
         let id = (u32::from(id_high) << 16) | u32::from(mdio(r, 3, None)?);
@@ -311,6 +305,39 @@ fn setup_link(
         (r.read(0xe30) & !0x70000) | if eee { 0x70000 } else { 0 },
     );
     Ok(())
+}
+
+/// igc_check_reset_block: MANC.BLK_PHY_RST_ON_IDE.
+pub(crate) fn phy_reset_blocked(r: &impl Registers) -> bool {
+    r.read(0x5820) & 0x40000 != 0
+}
+
+/// PHPM.PHY_RST_COMP polling budget: igc_phy_hw_reset spins
+/// `timeout = 10000` iterations of `udelay(1)`.
+pub(crate) const PHY_RESET_COMPLETE_US: u64 = 10_000;
+
+/// igc_phy_hw_reset (igc_phy.c), called with the PHY semaphore held.
+///
+/// PHPM (0x0E14) bit 8 is IGC_PHY_RST_COMP. Linux bounds the wait at ~10 ms
+/// and only logs on expiry: on I225-V silicon the bit need not latch after a
+/// CTRL.PHY_RST pulse (observed PHPM 0x44080 on hardware), and the PHY ID
+/// read that follows is what actually validates the PHY. Treating the
+/// timeout as fatal rejected working NICs at probe.
+fn phy_hw_reset(r: &impl Registers) -> bool {
+    let ctrl = r.read(0);
+    r.write(0, ctrl | (1 << 31)); // CTRL.PHY_RST
+    r.flush();
+    r.delay(100); // phy->reset_delay_us
+    r.write(0, ctrl);
+    r.flush();
+    // SW should guarantee 100us for the completion of the PHY reset.
+    r.delay(100);
+    let completed = r.wait(PHY_RESET_COMPLETE_US, || {
+        let phpm = r.read(0xe14);
+        phpm != u32::MAX && phpm & 0x100 != 0
+    });
+    r.delay(100);
+    completed
 }
 
 pub(crate) fn valid_mac(mac: [u8; 6]) -> bool {
