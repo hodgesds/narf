@@ -1133,8 +1133,8 @@ async fn update_hdmi_metadata(boot: &mut boot::ColdBoot) {
                 crtc.shown.as_ref()?;
                 let n = crtc.route?;
                 let c = kms.connectors.get(n)?;
-                (c.port.signal == crate::amdgpu_navi22_display::Signal::Hdmi
-                    && !c.color_relight
+                // HDMI's DRM InfoFrame or DP's HDR metadata SDP, in place.
+                (!c.color_relight
                     && c.output != c.shown_output
                     && !c.output.needs_modeset(c.shown_output))
                 .then_some((d, n, c.port, c.output))

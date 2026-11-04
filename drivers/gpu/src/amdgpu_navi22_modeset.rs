@@ -615,6 +615,97 @@ fn dp_fits(timing: &Timing, link: DpLink) -> bool {
         Depth::Bpc8.bits_per_pixel(),
     )
 }
+/// The SDPs of a DP stream in `format` to a receiver with `caps`: the VSC
+/// SDP carrying colorimetry when the receiver takes it
+/// (`use_vsc_sdp_for_colorimetry`: DPCD 1.4 and DPRX_FEATURE_ENUMERATION_LIST
+/// VSC_SDP_COLORIMETRY_SUPPORTED), and the HDR static metadata SDP while
+/// HDR_OUTPUT_METADATA is set.
+pub(crate) fn dp_packets(
+    caps: dp_link::Caps,
+    format: DpFormat,
+) -> (Option<[u8; 36]>, Option<[u8; 36]>) {
+    // linux-lit: 0x14=DP_DPCD_REV_14
+    let vsc_colorimetry = caps.rev() >= 0x14 && caps.dprx_feature & 1 << 3 != 0;
+    (
+        vsc_colorimetry.then(|| dp::vsc_packet(format.depth, format.colorspace)),
+        format.hdr.as_ref().map(dp::hdr_sdp_packet),
+    )
+}
+
+/// A DP SST stream's output: its depth, the colour space its pixels are in
+/// (`amdgpu_dm_get_output_color_space` for RGB) and its HDR static
+/// metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DpFormat {
+    pub depth: Depth,
+    pub colorspace: crate::amdgpu_hdr::DcColorSpace,
+    pub hdr: Option<crate::amdgpu_hdr::HdrOutputMetadata>,
+}
+impl DpFormat {
+    pub const DEFAULT: Self = Self {
+        depth: Depth::Bpc8,
+        colorspace: crate::amdgpu_hdr::DcColorSpace::Srgb,
+        hdr: None,
+    };
+    /// The FMT/OCSC/DPG format of the pipe that carries it.
+    pub fn pipe_format(self) -> hdmi::Format {
+        hdmi::Format {
+            depth: match self.depth {
+                Depth::Bpc10 => hdmi::Depth::Bpc10,
+                Depth::Bpc12 => hdmi::Depth::Bpc12,
+                Depth::Bpc6 | Depth::Bpc8 => hdmi::Depth::Bpc8,
+            },
+            encoding: crate::amdgpu_hdr::PixelEncoding::Rgb,
+            colorspace: self.colorspace,
+        }
+    }
+}
+
+/// amdgpu_dm's DP SST output for the committed connector state: RGB full
+/// range in the colour space "Colorspace" selects, HDR_OUTPUT_METADATA as
+/// is, and for an uncompressed SST stream the deepest depth the DCN30
+/// encoder has (12, 10, 8) up to amdgpu_dm's request (min(EDID bpc,
+/// "max bpc") rounded down to even), stepping down by 2, that `link` carries (`dp_validate_mode_timing` at that bpp,
+/// create_validate_stream_for_sink's retry). A DSC or MST stream stays at
+/// 8 bpc.
+pub(crate) fn dp_format(
+    settings: hdmi::OutputSettings,
+    edid: &[u8],
+    link: Option<DpLink>,
+    timing: &Timing,
+    uncompressed_sst: bool,
+) -> DpFormat {
+    let depth = link
+        .filter(|_| uncompressed_sst)
+        .and_then(|link| {
+            let top = crate::amdgpu_navi48_boot::requested_depth_bpc(edid, settings.max_bpc);
+            [Depth::Bpc12, Depth::Bpc10, Depth::Bpc8]
+                .into_iter()
+                .filter(|d| d.bpc() <= top || *d == Depth::Bpc8)
+                .find(|d| {
+                    dp_link::mode_fits(
+                        link,
+                        timing.h_active,
+                        timing.v_active,
+                        timing.pixel_clock_khz,
+                        d.bits_per_pixel(),
+                    )
+                })
+        })
+        .unwrap_or(Depth::Bpc8);
+    DpFormat {
+        depth,
+        colorspace: crate::amdgpu_hdr::output_color_space(
+            settings.colorspace,
+            true,
+            false,
+            timing.pixel_clock_khz.saturating_mul(10),
+            false,
+        ),
+        hdr: settings.hdr,
+    }
+}
+
 /// The DP mode: exactly `want` when DRM asked for one `offered_on` admits,
 /// else the first (EDID order, so preferred first) the link and the DCN30
 /// mode math accept.
@@ -820,6 +911,9 @@ pub struct Pipeline {
     format: hdmi::Formatter,
     hdmi: Option<hdmi::Stream>,
     hdmi_settings: hdmi::OutputSettings,
+    /// The DP stream's depth, colour space and HDR metadata, chosen from
+    /// `hdmi_settings` when the pipe's output format is programmed.
+    dp_format: DpFormat,
     hdmi_vrr: Option<(Option<crate::amdgpu_freesync::AmdVsdb>, bool)>,
     /// ODM 2:1 ([`hdmi_plan`]): the secondary pipe's front end and the
     /// plane with both slices.
@@ -928,6 +1022,7 @@ impl Pipeline {
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
                 hdmi_settings: hdmi::OutputSettings::default(),
+                dp_format: DpFormat::DEFAULT,
                 hdmi_vrr: None,
                 slice: None,
                 odm: None,
@@ -1477,7 +1572,7 @@ impl Pipeline {
         let width = timing.h_active / opps;
         self.opp.program(Encoding::Rgb, width, timing.v_active)?;
         self.opp.set_blank(true)?;
-        self.output_format().await?;
+        self.output_format(&timing, true).await?;
         if let Some(mut slice) = self.slice.take() {
             let combined = self.combine_slice(&mut slice, width, timing.v_active).await;
             self.slice = Some(slice);
@@ -1746,13 +1841,26 @@ impl Pipeline {
     /// OPTC_DATA_FORMAT, opp_program_fmt, dcn20_program_pipe's
     /// program_output_csc): DisplayPort SST is full-range 8-bpc RGB, as its
     /// MSA says, rather than whatever an earlier stream left on the pipe.
-    async fn output_format(&mut self) -> Result<(), Error> {
+    pub(crate) async fn output_format(
+        &mut self,
+        timing: &Timing,
+        uncompressed_sst: bool,
+    ) -> Result<(), Error> {
         let format = match self.connector.signal {
             Signal::Hdmi => match self.hdmi {
                 Some(stream) => stream.format,
                 None => return Ok(()),
             },
-            Signal::DisplayPort => hdmi::Format::RGB8,
+            Signal::DisplayPort => {
+                self.dp_format = dp_format(
+                    self.hdmi_settings,
+                    &self.dp.edid,
+                    self.dp.verified,
+                    timing,
+                    uncompressed_sst,
+                );
+                self.dp_format.pipe_format()
+            }
         };
         self.format.program_otg(format)?;
         self.format.program_fmt(format)?;
@@ -1790,7 +1898,7 @@ impl Pipeline {
         let setting = dp_link::decide_link_settings(
             verified,
             timing.pixel_clock_khz,
-            Depth::Bpc8.bits_per_pixel(),
+            self.dp_format.depth.bits_per_pixel(),
         )
         .ok_or(Error::NoMode)?;
         self.link_dp_at(tables, timing, &caps, setting, aux, true)
@@ -1818,17 +1926,16 @@ impl Pipeline {
         // DPRX_FEATURE_ENUMERATION_LIST (retrieve_link_cap, extended caps
         // only): SST_SPLIT_SDP_CAP bit 1, VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
         let feature = caps.dprx_feature;
-        // amdgpu_dm's VSC colorimetry also needs a DPCD 1.4 receiver.
-        // linux-lit: 0x14=DP_DPCD_REV_14
-        let vsc_colorimetry = caps.rev() >= 0x14 && feature & 1 << 3 != 0;
-        let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
+        let (vsc, hdr) = dp_packets(*caps, self.dp_format);
         self.dp_stream.set_stream_attribute(
             timing,
-            Depth::Bpc8,
-            vsc_colorimetry,
+            self.dp_format.depth,
+            vsc.is_some(),
             feature & 1 << 1 != 0,
         )?;
-        self.dp_stream.update_info_packets(vsc.as_ref()).await?;
+        self.dp_stream
+            .update_info_packets(vsc.as_ref(), hdr.as_ref())
+            .await?;
         // enable_link_dp: the PHY clock (requested_sym_clk, through
         // dcn30_notify_link_rate_change), then the DIG backend connected.
         let phy_max = self
@@ -1869,7 +1976,9 @@ impl Pipeline {
         self.dig.setup(DigMode::DisplayPort)?;
         // dcn20_enable_stream, then dcn20_unblank_stream.
         self.dig.connect_be_to_fe(true)?;
-        self.dp_stream.update_info_packets(vsc.as_ref()).await?;
+        self.dp_stream
+            .update_info_packets(vsc.as_ref(), hdr.as_ref())
+            .await?;
         self.dp_stream
             .unblank(timing.pixel_clock_khz, trained.rate)
             .await
@@ -2365,6 +2474,21 @@ impl Pipeline {
             || settings.needs_modeset(self.hdmi_settings)
         {
             return Err(Error::Invalid);
+        }
+        if self.connector.signal == Signal::DisplayPort {
+            // A new HDR static metadata SDP on the running DP stream.
+            let caps = self.dp.caps.ok_or(Error::Invalid)?;
+            let format = DpFormat {
+                hdr: settings.hdr,
+                ..self.dp_format
+            };
+            let (vsc, hdr) = dp_packets(caps, format);
+            self.dp_stream
+                .update_info_packets(vsc.as_ref(), hdr.as_ref())
+                .await?;
+            self.dp_format = format;
+            self.hdmi_settings = settings;
+            return Ok(());
         }
         let mut stream = self.hdmi.ok_or(Error::Invalid)?;
         stream.hdr = settings.hdr.as_ref().map(|h| {

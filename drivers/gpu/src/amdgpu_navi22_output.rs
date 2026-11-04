@@ -19,10 +19,11 @@ impl Kms {
         let Some(index) = connector_of(self, request.connector) else {
             return false;
         };
+        // amdgpu_dm attaches Colorspace and HDR_OUTPUT_METADATA to HDMI and
+        // non-MST DP connectors (all of Navi22's) and accepts every listed
+        // value: HDMI sends them in the AVI and Dynamic Range and Mastering
+        // InfoFrames, DP in the VSC SDP and the HDR static metadata SDP.
         let connector = &mut self.connectors[index];
-        if !color_settable(connector.port.signal, request.colorspace, hdr.is_some()) {
-            return false;
-        }
         let next = OutputSettings {
             color_format: request.color_format,
             colorspace: request.colorspace,
@@ -80,8 +81,9 @@ impl Kms {
             let c = &self.connectors[index];
             let max_bpc = request.max_bpc.unwrap_or(c.output.max_bpc);
             if !c.lightable() || !(8..=16).contains(&max_bpc) { return false; }
-            // DP: 8 bpc RGB on the verified link (LINUX-GAP: no deeper
-            // color or YCbCr over DP yet), which any cap admits.
+            // DP: RGB at the deepest depth within the cap the verified link
+            // carries, down to 8 bpc, so any cap admits the stream
+            // (LINUX-GAP: no YCbCr over DP).
             if c.port.signal == Signal::DisplayPort {
                 return matches!(
                     request.color_format,
@@ -119,24 +121,10 @@ pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> 
     };
     let c = &kms.connectors[index];
     colorspace_valid(u64::from(colorspace))
-        && color_settable(c.port.signal, colorspace, hdr)
         && (c.port.signal != Signal::Hdmi
             || !c.present
             || crate::amdgpu_navi48_boot::hdmi_caps(&c.edid).hdmi
             || (colorspace == 0 && !hdr))
-}
-/// Which Colorspace / HDR_OUTPUT_METADATA values a connector of `signal`
-/// can carry. amdgpu_dm attaches both to HDMI and non-MST DP connectors.
-/// HDMI sends them in the AVI and DRM infoframes; DP would send them in
-/// the VSC SDP (colorimetry) and the HDR metadata SDP, which this DCN30
-/// path does not program yet (LINUX-GAP), so a DP connector takes only the
-/// defaults (Default colorimetry, no metadata) rather than accept values it
-/// would not put on the wire.
-fn color_settable(signal: Signal, colorspace: u32, hdr: bool) -> bool {
-    match signal {
-        Signal::Hdmi => true,
-        Signal::DisplayPort => colorspace == 0 && !hdr,
-    }
 }
 pub fn output_formats_supported(requests: &[OutputFormatRequest], routes: &[OutputRoute]) -> bool {
     KMS.lock().formats_supported(requests, routes)

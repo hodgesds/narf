@@ -784,8 +784,9 @@ kernel_test_in!(
 
 /// amdgpu_dm_connector_init_helper on DCN3.0: a non-MST DP connector has
 /// "max bpc", Colorspace and HDR_OUTPUT_METADATA too (not the HDMI-only
-/// color format). A DP cap is stored like HDMI's; until the VSC/HDR SDPs
-/// are programmed, DP takes only the default colorimetry and no metadata.
+/// color format), and takes every listed value as HDMI does: a new
+/// colorimetry or HDR on/off relights the stream, new metadata alone does
+/// not.
 fn navi22_kms_dp_connector_output_properties() -> TestResult {
     use crate::amdgpu_hdr::{ColorFormat, DRM_MODE_COLORIMETRY_BT2020_RGB};
     use crate::amdgpu_native_kms::ConnectorColorRequest;
@@ -814,20 +815,27 @@ fn navi22_kms_dp_connector_output_properties() -> TestResult {
     if !k.set_max_bpc(dp, 10) || k.connectors[0].output.max_bpc != 10 {
         return TestResult::Fail("DP max bpc not stored");
     }
-    let before = k.connectors[0].output;
     let mut color = ConnectorColorRequest {
         connector: dp,
         color_format: ColorFormat::Auto,
         colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
-        hdr_output_metadata: None,
+        hdr_output_metadata: Some(alloc::vec![0; 32]),
     };
-    if k.set_color(&color) {
-        return TestResult::Fail("DP accepted a colorimetry it cannot signal");
+    if !k.set_color(&color)
+        || k.connectors[0].output.colorspace != DRM_MODE_COLORIMETRY_BT2020_RGB
+        || k.connectors[0].output.hdr.is_none()
+    {
+        return TestResult::Fail("DP refused BT2020 colorimetry with HDR metadata");
     }
-    color.colorspace = 0;
-    color.hdr_output_metadata = Some(alloc::vec![0; 32]);
+    let applied = k.connectors[0].output;
+    color.hdr_output_metadata.as_mut().unwrap()[26] = 1;
+    if !k.set_color(&color) || k.connectors[0].output.needs_modeset(applied) {
+        return TestResult::Fail("DP metadata-only update needs a modeset");
+    }
+    color.hdr_output_metadata = Some(alloc::vec![0; 31]);
+    let before = k.connectors[0].output;
     if k.set_color(&color) || k.connectors[0].output != before {
-        return TestResult::Fail("DP accepted HDR metadata it cannot send");
+        return TestResult::Fail("DP accepted a malformed metadata blob");
     }
     TestResult::Pass
 }
