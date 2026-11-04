@@ -828,7 +828,6 @@ pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::Lifec
         let previous_owner = crate::symbols::swap_execution_context(module.id);
         // Same domain scope as init: the exit handler is module code and
         // runs under the module's own rights.
-        let previous_owner = crate::symbols::swap_execution_context(module.id);
         let domain_scope = crate::domain::enter(module.domain);
         // SAFETY: `exit` points at the module's relocated cleanup routine
         // (see above). The module is Live/Going with refcount zero, so no
