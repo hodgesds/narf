@@ -306,6 +306,20 @@ const VET_8021Q: u32 = 0x8100;
 const REG_VFTA_BASE: u64 = 0x5600; // VLAN Filter Table Array
 const VFTA_WORDS: usize = 128; // 4096 VIDs / 32 bits per word
 
+// Multicast filtering — 8254x SDM §3.2.1 + §13 register block.
+// MTA is the 4096-bit hash vector (128 words); RAL/RAH is the
+// 16-entry exact-match array (stride 8, RAH at +4, sharing the
+// REG_RAL0 base). The 0x5200 MTA base is the shared 8254x register
+// map (the 82580-family datasheet shows MTA at 0x5200 + 4n).
+const REG_MTA_BASE: u64 = 0x5200; // Multicast Table Array
+const MTA_WORDS: usize = 128; // 4096 hash bits / 32 bits per word
+const REG_RAL_STRIDE: u64 = 8; // RAL array entry stride (RAH at +4)
+const RAH_AV: u32 = 1 << 31; // Receive Address High: Address Valid
+// RCTL.MO lives in bits 13:12 (SDM §13.4.22). This driver leaves
+// MO = 0 (the reset value), selecting window [47:36]; the other
+// windows are implemented in `multicast_hash12` for completeness
+// and tested, but never programmed.
+
 // PCH (Lynx Point onward) — Management Engine PHY-ownership
 // handshake. The Intel ME shares the integrated PHY with the host
 // on I217/I218/I219 (`drivers/net/ethernet/intel/e1000e/ich8lan.c`
@@ -824,6 +838,121 @@ fn vlan_reinsert_tag(buf: &mut [u8], len: usize, tci: u16) -> Option<usize> {
     Some(len + 4)
 }
 
+// ── Multicast filtering ─────────────────────────────────────────────
+// 8254x SDM §3.2.1: exact match = the 16-entry RAL/RAH array; hash
+// match = the 4096-bit MTA vector indexed by 12 bits of the
+// destination address selected by RCTL.MO. Internal bit 0 is the
+// first bit on the wire, so window [47:36] (MO = 0) is
+// (mac[5] << 4) | (mac[4] >> 4) — mac[5] is the high byte of the
+// slice, mac[4] the low byte.
+
+/// 12-bit MTA index for `mac` under RCTL.MO window `mo` (0..=3):
+/// MO 0 → [47:36], MO 1 → [46:35], MO 2 → [45:34], MO 3 → [43:32]
+/// (SDM §3.2.1). Values above 3 fall through to the MO 3 window.
+fn multicast_hash12(mac: &[u8; 6], mo: u8) -> u16 {
+    let (hi, lo) = (mac[5] as u16, mac[4] as u16);
+    let hash = match mo {
+        0 => (hi << 4) | (lo >> 4),
+        1 => (hi << 5) | (lo >> 3),
+        2 => (hi << 6) | (lo >> 2),
+        _ => (hi << 8) | lo,
+    };
+    hash & 0xFFF
+}
+
+/// MTA word holding `hash`'s bit (hashes 0..=4095 map onto words
+/// 0..=127, 32 hashes per word).
+fn mta_word(hash: u16) -> usize {
+    hash as usize / 32
+}
+
+/// Bit within its MTA word for `hash`.
+fn mta_bit(hash: u16) -> u32 {
+    1u32 << (hash % 32)
+}
+
+/// Shadow of the hardware MTA plus the count of set hash bits.
+/// Same changed/duplicate contract as [`VlanFilter`]. NOTE: the
+/// count tracks set BITS, not addresses — two addresses hashing
+/// to the same bit share it, and removing one clears it for both.
+/// That is standard hash-filter semantics; an exact-match RAL slot
+/// is the answer when a collision must not drop a peer.
+#[derive(Clone, Debug, Default)]
+pub struct MulticastFilter {
+    words: [u32; MTA_WORDS],
+    count: usize,
+}
+
+impl MulticastFilter {
+    pub const fn new() -> Self {
+        Self {
+            words: [0; MTA_WORDS],
+            count: 0,
+        }
+    }
+
+    pub fn add(&mut self, mac: &[u8; 6]) -> bool {
+        let hash = multicast_hash12(mac, 0);
+        if self.words[mta_word(hash)] & mta_bit(hash) != 0 {
+            return false;
+        }
+        self.words[mta_word(hash)] |= mta_bit(hash);
+        self.count += 1;
+        true
+    }
+
+    pub fn remove(&mut self, mac: &[u8; 6]) -> bool {
+        let hash = multicast_hash12(mac, 0);
+        if self.words[mta_word(hash)] & mta_bit(hash) == 0 {
+            return false;
+        }
+        self.words[mta_word(hash)] &= !mta_bit(hash);
+        self.count -= 1;
+        true
+    }
+
+    pub fn contains(&self, mac: &[u8; 6]) -> bool {
+        let hash = multicast_hash12(mac, 0);
+        self.words[mta_word(hash)] & mta_bit(hash) != 0
+    }
+
+    pub fn clear(&mut self) {
+        self.words = [0; MTA_WORDS];
+        self.count = 0;
+    }
+
+    pub fn word(&self, word: usize) -> u32 {
+        self.words[word]
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Encode a MAC into an (RAL, RAH) pair for one RAL-array slot.
+/// Hardware expects little-endian byte order (RAL = bytes 0..3,
+/// RAH = bytes 4..5) with the Address Valid bit set in RAH.
+fn rar_encode(mac: &[u8; 6]) -> (u32, u32) {
+    let ral = mac[0] as u32
+        | ((mac[1] as u32) << 8)
+        | ((mac[2] as u32) << 16)
+        | ((mac[3] as u32) << 24);
+    let rah = mac[4] as u32 | ((mac[5] as u32) << 8) | RAH_AV;
+    (ral, rah)
+}
+
+/// Runtime-programmable RAL slots are 1..=15. Slot 0 is the station
+/// address, programmed once at bring-up from the value firmware
+/// left in RAL0/RAH0; runtime callers must not overwrite it.
+fn rar_slot_ok(slot: usize) -> bool {
+    (1..=15).contains(&slot)
+}
+
 impl TxContextDesc {
     /// Build the context for one Ethernet/IPv4/TCP TSO super-frame. `ip_hlen`
     /// and `tcp_hlen` include options; `payload_len` excludes every header.
@@ -1155,6 +1284,10 @@ pub struct E1000 {
     /// CTRL.VME; the last VID removed clears RCTL.VFE (CTRL.VME
     /// stays set — see `vlan_filter_remove`).
     vlan_filter: IrqSafeSpinLock<VlanFilter>,
+    /// Shadow of the hardware multicast hash table (MTA).
+    /// Filtering is the bring-up default (no UPE|MPE); the stack
+    /// adds addresses explicitly or requests promiscuous mode.
+    multicast_filter: IrqSafeSpinLock<MulticastFilter>,
     /// MAC address read from RAL/RAH at bring-up.
     pub mac: [u8; 6],
     /// True after CTRL_SLU has been set + STATUS reports link up.
@@ -1354,6 +1487,16 @@ impl E1000 {
             ((rah >> 8) & 0xFF) as u8,
         ];
 
+        // Re-program the station address into RAL0 with AV set:
+        // filtering mode (no UPE below) accepts self-unicast only
+        // via this exact-match slot, and firmware is not guaranteed
+        // to have left AV set.
+        // SAFETY: same as the RAL0/RAH0 reads above.
+        unsafe {
+            mmio.write32(REG_RAL0, ral);
+            mmio.write32(REG_RAH0, rah | RAH_AV);
+        }
+
         // 3. Mask all interrupt causes during bring-up. IMC is
         //    write-1-to-clear (8254x SDM §13.4.22); writing all-ones
         //    leaves IMS = 0 and prevents stale IRQs while we program
@@ -1445,11 +1588,26 @@ impl E1000 {
             // the last filled slot). With all slots filled, RDT =
             // RX_RING_LEN - 1.
             mmio.write32(REG_RDT, (RX_RING_LEN - 1) as u32);
-            // RCTL: enable, accept broadcast/unicast/multicast,
-            // strip CRC, 2K buffers.
+            // Filter tables start empty: default-deny for both
+            // VLAN (no VIDs) and multicast (no hash bits). The
+            // shadows are fresh (see the constructor), so zeroing
+            // here keeps hardware and shadow in sync even if this
+            // bring-up runs on an already-programmed device.
+            for word in 0..VFTA_WORDS {
+                mmio.write32(REG_VFTA_BASE + word as u64 * 4, 0);
+            }
+            for word in 0..MTA_WORDS {
+                mmio.write32(REG_MTA_BASE + word as u64 * 4, 0);
+            }
+            // RCTL: enable, accept broadcast + exact-match unicast
+            // (RAL0, re-programmed above) + hash multicast, strip
+            // CRC, 2K buffers. Unicast/multicast promiscuous are
+            // OFF by default — the old accept-all behavior is
+            // available explicitly via `set_promiscuous(true)`.
+            // RCTL.MO bits are 0 in this value (window [47:36]).
             mmio.write32(
                 REG_RCTL,
-                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+                RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K,
             );
         }
 
@@ -1555,6 +1713,7 @@ impl E1000 {
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
+            multicast_filter: IrqSafeSpinLock::new(MulticastFilter::new()),
             mac,
             link_up,
             _msix: msix,
@@ -1996,6 +2155,115 @@ impl E1000 {
             }
         }
         self.tx_enqueue(frame, true, Some(tci))
+    }
+
+    /// Add a multicast address to the hardware hash filter (MTA
+    /// shadow + the one MTA word). Returns `true` iff the address
+    /// is now accepted (duplicate adds — same hash bit — are
+    /// no-ops returning `true`). Filtering is already the
+    /// bring-up default, so no RCTL change is needed here.
+    pub fn multicast_add(&self, mac: &[u8; 6]) -> bool {
+        let mut filter = self.multicast_filter.lock();
+        let changed = filter.add(mac);
+        if !changed {
+            return filter.contains(mac);
+        }
+        let hash = multicast_hash12(mac, 0);
+        let word = mta_word(hash);
+        let value = filter.word(word);
+        drop(filter);
+        // SAFETY: mapped MMIO; MTA word `word` is within the
+        // 128-word table for any 12-bit hash.
+        unsafe {
+            self.mmio.write32(REG_MTA_BASE + word as u64 * 4, value);
+        }
+        true
+    }
+
+    /// Remove a multicast address from the hash filter. Returns
+    /// `true` iff its hash bit was set (and is now cleared). NOTE:
+    /// hash collisions share a bit — removing one of two colliding
+    /// addresses clears the bit for both (see `MulticastFilter`).
+    pub fn multicast_remove(&self, mac: &[u8; 6]) -> bool {
+        let mut filter = self.multicast_filter.lock();
+        if !filter.remove(mac) {
+            return false;
+        }
+        let hash = multicast_hash12(mac, 0);
+        let word = mta_word(hash);
+        let value = filter.word(word);
+        drop(filter);
+        // SAFETY: mapped MMIO; see `multicast_add`.
+        unsafe {
+            self.mmio.write32(REG_MTA_BASE + word as u64 * 4, value);
+        }
+        true
+    }
+
+    /// Clear the whole hash filter (all 128 MTA words to zero).
+    /// Used by detach/reset paths.
+    pub fn multicast_clear(&self) {
+        let mut filter = self.multicast_filter.lock();
+        filter.clear();
+        drop(filter);
+        // SAFETY: mapped MMIO; MTA spans 128 words from REG_MTA_BASE.
+        unsafe {
+            for word in 0..MTA_WORDS {
+                self.mmio.write32(REG_MTA_BASE + word as u64 * 4, 0);
+            }
+        }
+    }
+
+    /// Program an exact-match RAL slot (1..=15) with `mac`.
+    /// Returns `false` for slot 0 (station address, bring-up owned)
+    /// or slot > 15. Exact-match slots complement the hash filter:
+    /// they accept one address each, with no collision sharing.
+    pub fn rar_program(&self, slot: usize, mac: &[u8; 6]) -> bool {
+        if !rar_slot_ok(slot) {
+            return false;
+        }
+        let (ral, rah) = rar_encode(mac);
+        // SAFETY: mapped MMIO; slot 1..=15 maps to RAL offsets
+        // REG_RAL0 + 8*slot (+4 for RAH), within the 16-entry array.
+        unsafe {
+            self.mmio
+                .write32(REG_RAL0 + slot as u64 * REG_RAL_STRIDE, ral);
+            self.mmio
+                .write32(REG_RAL0 + slot as u64 * REG_RAL_STRIDE + 4, rah);
+        }
+        true
+    }
+
+    /// Clear an exact-match RAL slot (drops its AV bit). Same slot
+    /// validation as `rar_program`.
+    pub fn rar_clear(&self, slot: usize) -> bool {
+        if !rar_slot_ok(slot) {
+            return false;
+        }
+        // SAFETY: mapped MMIO; see `rar_program`.
+        unsafe {
+            self.mmio
+                .write32(REG_RAL0 + slot as u64 * REG_RAL_STRIDE, 0);
+            self.mmio
+                .write32(REG_RAL0 + slot as u64 * REG_RAL_STRIDE + 4, 0);
+        }
+        true
+    }
+
+    /// Explicit promiscuous fallback: `true` restores the old
+    /// UPE|MPE accept-all behavior; `false` returns to real
+    /// filtering (exact-match RAL + MTA hash + broadcast).
+    pub fn set_promiscuous(&self, enable: bool) {
+        // SAFETY: mapped MMIO; RCTL is a valid 32-bit register.
+        unsafe {
+            let rctl = self.mmio.read32(REG_RCTL);
+            let rctl = if enable {
+                rctl | RCTL_UPE | RCTL_MPE
+            } else {
+                rctl & !(RCTL_UPE | RCTL_MPE)
+            };
+            self.mmio.write32(REG_RCTL, rctl);
+        }
     }
 
     /// Zero-copy synchronous compatibility path. The caller retains the DMA
@@ -2801,7 +3069,10 @@ impl crate::HwNic for E1000Nic {
         crate::NicModel::IntelE1000
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM | crate::NicCaps::VLAN_TAGGING
+        crate::NicCaps::TX_CSUM
+            | crate::NicCaps::RX_CSUM
+            | crate::NicCaps::VLAN_TAGGING
+            | crate::NicCaps::MULTICAST_HASH
     }
     fn ring_capacity(&self) -> usize {
         RX_RING_LEN
@@ -2926,7 +3197,8 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        vlan_reinsert_tag, vlan_tci_parts, vfta_bit, vfta_word, TxDesc, TxQueueState, VlanFilter,
+        mta_bit, mta_word, multicast_hash12, rar_encode, rar_slot_ok, vlan_reinsert_tag,
+        vlan_tci_parts, vfta_bit, vfta_word, MulticastFilter, TxDesc, TxQueueState, VlanFilter,
         TXD_CMD_EOP, TXD_CMD_IFCS, TXD_CMD_RS, TXD_CMD_VLE, TX_RING_USABLE,
     };
 
@@ -3088,4 +3360,93 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_vlan_tx_descriptor);
+
+    fn smoke_multicast_hash_windows() -> TestResult {
+        // SDM §3.2.1 windows over the example address
+        // 01:AA:00:12:34:56 (mac[4] = 0x34, mac[5] = 0x56).
+        // Each value is derived from the window definition, not
+        // copied: MO 0 = (0x56 << 4) | (0x34 >> 4), etc.
+        let mac: [u8; 6] = [0x01, 0xAA, 0x00, 0x12, 0x34, 0x56];
+        if multicast_hash12(&mac, 0) != 0x563 {
+            return TestResult::Fail("e1000 multicast hash wrong for MO 0 [47:36]");
+        }
+        if multicast_hash12(&mac, 1) != 0xAC6 {
+            return TestResult::Fail("e1000 multicast hash wrong for MO 1 [46:35]");
+        }
+        if multicast_hash12(&mac, 2) != 0x58D {
+            return TestResult::Fail("e1000 multicast hash wrong for MO 2 [45:34]");
+        }
+        if multicast_hash12(&mac, 3) != 0x634 {
+            return TestResult::Fail("e1000 multicast hash wrong for MO 3 [43:32]");
+        }
+        // The hash is always 12 bits, even for all-ones bytes.
+        if multicast_hash12(&[0xFF; 6], 0) != 0xFFF {
+            return TestResult::Fail("e1000 multicast hash not masked to 12 bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_multicast_hash_windows);
+
+    fn smoke_multicast_mta_mapping() -> TestResult {
+        if mta_word(0x563) != 43 || mta_bit(0x563) != (1 << 3) {
+            return TestResult::Fail("e1000 MTA mapping wrong for hash 0x563");
+        }
+        if mta_word(0xFFF) != 127 || mta_bit(0xFFF) != (1 << 31) {
+            return TestResult::Fail("e1000 MTA mapping wrong for hash 0xFFF");
+        }
+        if mta_word(0) != 0 || mta_bit(0) != 1 {
+            return TestResult::Fail("e1000 MTA mapping wrong for hash 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_multicast_mta_mapping);
+
+    fn smoke_multicast_filter_shadow() -> TestResult {
+        let mut filter = MulticastFilter::new();
+        let a: [u8; 6] = [0x01, 0x00, 0x5E, 0x00, 0x00, 0xFB];
+        // `b` collides with `a` exactly: same mac[5], and mac[4]
+        // differs only in the low nibble, which the MO-0 window
+        // (mac[4] >> 4) discards.
+        let b: [u8; 6] = [0x01, 0x00, 0x5E, 0x00, 0x0F, 0xFB];
+        if multicast_hash12(&a, 0) != multicast_hash12(&b, 0) {
+            return TestResult::Fail("e1000 test collision pair does not collide");
+        }
+        if !filter.add(&a) || filter.count() != 1 || !filter.contains(&a) {
+            return TestResult::Fail("e1000 MulticastFilter rejected a new address");
+        }
+        // Colliding address: bit already set, no count change.
+        if filter.add(&b) || filter.count() != 1 {
+            return TestResult::Fail("e1000 MulticastFilter double-counted a hash collision");
+        }
+        // Removing one colliding address clears the shared bit.
+        if !filter.remove(&a) || filter.contains(&b) || !filter.is_empty() {
+            return TestResult::Fail("e1000 MulticastFilter collision removal wrong");
+        }
+        if filter.remove(&a) {
+            return TestResult::Fail("e1000 MulticastFilter remove of absent address succeeded");
+        }
+        if !filter.add(&a) || !filter.contains(&a) {
+            return TestResult::Fail("e1000 MulticastFilter re-add failed");
+        }
+        filter.clear();
+        if !filter.is_empty() || filter.count() != 0 || filter.word(0) != 0 {
+            return TestResult::Fail("e1000 MulticastFilter clear did not empty the shadow");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_multicast_filter_shadow);
+
+    fn smoke_multicast_rar_encoding() -> TestResult {
+        // Little-endian byte order + AV in RAH bit 31.
+        let (ral, rah) = rar_encode(&[0x01, 0xAA, 0x00, 0x12, 0x34, 0x56]);
+        if ral != 0x1200_AA01 || rah != 0x8000_5634 {
+            return TestResult::Fail("e1000 RAR encoding wrong (byte order or AV bit)");
+        }
+        // Slot validation: 0 is bring-up owned, 16 is out of range.
+        if rar_slot_ok(0) || !rar_slot_ok(1) || !rar_slot_ok(15) || rar_slot_ok(16) {
+            return TestResult::Fail("e1000 RAL slot validation wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_multicast_rar_encoding);
 }
