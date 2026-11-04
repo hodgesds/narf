@@ -1743,7 +1743,14 @@ mod tests {
         // wrote their command words to ERIAR on `plain`.
         let mut plain_misaligned = RegLog::new();
         // SAFETY: RegLog fixture — no hardware is touched.
-        unsafe { eri_write(&mut plain_misaligned, ERI_MAGIC_ADDR + 1, ERI_MASK_1111, 0x1234_5678) };
+        unsafe {
+            eri_write(
+                &mut plain_misaligned,
+                ERI_MAGIC_ADDR + 1,
+                ERI_MASK_1111,
+                0x1234_5678,
+            )
+        };
         if plain_misaligned.last_write_to(ERI_ADDR_REG).is_some() {
             return TestResult::Fail("ERI misaligned write touched ERIAR");
         }
