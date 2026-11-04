@@ -548,11 +548,15 @@ pub fn find_digital_output_paths(c: &Codec) -> Vec<AudioPath> {
         .collect()
 }
 
-/// Walk every input Pin Complex (Mic In, Line In, AUX), pick the
-/// first one reached by an Audio-Input converter's connection list.
-pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
+/// Walk every input Pin Complex (Mic In, Line In, AUX), return every
+/// pin whose connection list an Audio-Input converter reaches, in
+/// preference order (Mic In > Line In > AUX, discovery order within
+/// a class). The live path keeps the whole set so jack state can
+/// re-select the capture source without re-enumerating the codec.
+pub fn find_input_paths(c: &Codec) -> Vec<AudioPath> {
     // Preference: Mic In (0xA) > Line In (0x8) > AUX (0x9).
     const PREF: &[u8] = &[0xA, 0x8, 0x9];
+    let mut out = Vec::new();
     for &want in PREF {
         for w in c
             .widgets
@@ -579,16 +583,23 @@ pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
             {
                 let mut path = Vec::new();
                 if trace_to_pin(c, adc.nid, w.nid, &mut path) {
-                    return Some(AudioPath {
+                    out.push(AudioPath {
                         pin_nid: w.nid,
                         converter_nid: adc.nid,
                         chain: path,
                     });
+                    break;
                 }
             }
         }
     }
-    None
+    out
+}
+
+/// Walk every input Pin Complex (Mic In, Line In, AUX), pick the
+/// first one reached by an Audio-Input converter's connection list.
+pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
+    find_input_paths(c).into_iter().next()
 }
 
 /// Depth-limited DFS through connection lists to find a converter of

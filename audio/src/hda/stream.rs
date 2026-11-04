@@ -302,7 +302,7 @@ impl PcmDevice for Card {
     }
     fn open(&self, capture: bool, device: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
         if device != 0
-            || (capture && self.0.input.is_none())
+            || (capture && self.0.input.lock().is_none())
             || (!capture && self.0.outputs.is_empty())
         {
             return Err(SoundError::NoSuchDevice);

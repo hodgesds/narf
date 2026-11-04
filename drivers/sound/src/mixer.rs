@@ -42,8 +42,13 @@ pub enum ControlKind {
     MasterMute,
     /// Headphone Playback Volume.
     HeadphoneVolume,
+    /// Headphone Playback Switch — 1 = unmute, 0 = mute (same
+    /// convention as MasterMute; the route mute ANDs with the master).
+    HeadphoneMute,
     /// Speaker Playback Volume.
     SpeakerVolume,
+    /// Speaker Playback Switch — 1 = unmute, 0 = mute.
+    SpeakerMute,
     /// Mic Boost (Capture path).
     MicBoost,
     /// Capture Volume.
@@ -80,7 +85,9 @@ impl ControlKind {
             ControlKind::MasterVolume => "Master Playback Volume",
             ControlKind::MasterMute => "Master Playback Switch",
             ControlKind::HeadphoneVolume => "Headphone Playback Volume",
+            ControlKind::HeadphoneMute => "Headphone Playback Switch",
             ControlKind::SpeakerVolume => "Speaker Playback Volume",
+            ControlKind::SpeakerMute => "Speaker Playback Switch",
             ControlKind::MicBoost => "Mic Boost",
             ControlKind::CaptureVolume => "Capture Volume",
             ControlKind::JackSense => "Headphone Jack",
@@ -100,6 +107,8 @@ impl ControlKind {
         matches!(
             self,
             ControlKind::MasterMute
+                | ControlKind::HeadphoneMute
+                | ControlKind::SpeakerMute
                 | ControlKind::JackSense
                 | ControlKind::HdmiJack
                 | ControlKind::Iec958Switch
