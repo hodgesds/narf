@@ -4242,7 +4242,11 @@ A multiple-link request now carries Intel's `IWL_MLD_EMLSR_CAPA`
 (`EmlCapabilities::INTEL_MLD_LOCAL`) as mac80211 copies the station
 `wiphy_iftype_ext_capab`; MLD Capabilities/Operations stay 0 because
 TID-to-link mapping negotiation and link reconfiguration (Linux
-`IWL_MLD_CAPA_OPS`) are not implemented. A single-link MLD request is
+`IWL_MLD_CAPA_OPS`) are implemented in `sc_ttlm_neg` but not yet
+advertised: the Protected EHT Action field values and the MLD
+Capabilities bit positions are still unconfirmed (see the negotiated
+TTLM paragraph below), so no negotiation bit is claimed yet. A
+single-link MLD request is
 unchanged. The AP MLD's response Basic MLE EML capabilities and medium
 sync delay (mlme.c `vif->cfg.eml_cap`/`eml_med_sync_delay`, default
 0x10ac) fill MAC_CONFIG client `esr_transition_timeout` (clamped to
@@ -4383,9 +4387,20 @@ switch the primary link); no mapped valid link disconnects
 default (no dormant link); a withdrawn planned one is cancelled; an invalid
 advertised element disconnects. Dormant links are not usable: they are
 never activated, graded or scanned (`ieee80211_vif_usable_links`).
-Negotiated TTLM is not implemented and no TTLM negotiation support is
-advertised (MLD Capabilities stay 0). The expected-duration field is
-parsed only, as in Linux.
+Negotiated TTLM is implemented in `sc_ttlm_neg` (Protected EHT Action
+frames: TTLM Request/Response/Teardown and ML Reconfiguration
+Request/Response; per-TID maps, dialog-token matching, switch-time
+staging through the same safety-buffered TSF rule as the advertised
+path, teardown back to default; a staged mapping's switch is applied by
+`Connection::service_ttlm`, and an accepted mapping cancels any planned
+advertised switch). No TTLM negotiation support is advertised yet (MLD
+Capabilities stay 0): the Protected EHT Action field values (used in
+frame order 0..4 per Linux's `ieee80211_mgmt` action union) and the MLD
+Capabilities bit positions for TID-to-link-negotiation and
+link-reconfiguration support are NOT yet confirmed against IEEE
+802.11be or Linux `net/mac80211/ieee80211_i.h`, and the MLME
+action-frame receive/transmit transport that would drive the engine is
+still missing. The expected-duration field is parsed only, as in Linux.
 Written, unexecuted: `smoke_iwl_mld_advertised_ttlm_dormant_links_and_switch`.
 The single-link MLD FakeAp fixture (`sc_mlo_native_tests.rs`) now requires
 the associated MAC_CONFIG to carry esr_transition_timeout 0 and the
@@ -4400,8 +4415,10 @@ native EHT PHY already requires the NVM/TLV 11be facts). Its station
 (`EmlCapabilities::INTEL_MLD_LOCAL`, 0x0033: EMLSR, 32us padding, 64us
 transition delay) — exactly the EML Capabilities its multiple-link request
 carries. Linux's IWL_MLD_CAPA_OPS (TTLM negotiation, link reconfiguration)
-and the UHR ML power-management EXT_MLD bit are advertised as 0 because
-neither is implemented, and no `ext_capa_base` Extended Capabilities bit is
+and the UHR ML power-management EXT_MLD bit are advertised as 0: TTLM
+negotiation and link reconfiguration are implemented in `sc_ttlm_neg`
+but unadvertised pending wire-value confirmation (see above), and UHR
+ML power management is not implemented, and no `ext_capa_base` Extended Capabilities bit is
 claimed (the native request carries no Extended Capabilities element), so
 the record's EXT_CAPA/mask are empty. Further links are now requested only
 through `associate_mlo` (CONNECT with `NL80211_ATTR_MLO_SUPPORT`,

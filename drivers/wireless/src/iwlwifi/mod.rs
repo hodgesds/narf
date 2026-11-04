@@ -136,6 +136,7 @@ mod sc_mlo;
 mod sc_mlo_assoc;
 pub use sc_mlo_assoc::MldLinkCandidate;
 mod sc_security;
+mod sc_ttlm_neg;
 mod sc_tx_amsdu;
 pub mod scan_api;
 mod scheduled_epoch;
