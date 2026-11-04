@@ -480,140 +480,148 @@ impl FileOps for DriCardFile {
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
-        #[cfg(feature = "intel")]
-        if let Some(result) = self.intel.dispatch_card(
-            self.index,
-            cmd,
-            arg as u64,
-            &crate::intel_gpu_render::GuardedIoctl,
-        ) {
-            return result;
-        }
-        // A framebuffer of one of this open's Intel GEM buffers (primary node
-        // only: the render node refuses KMS).
-        #[cfg(feature = "intel")]
-        if let Some(result) = crate::drm_ioctl_bridge::intel_addfb2_bo(
-            self.index,
-            self.open_id,
-            cmd,
-            arg,
-            &self.intel.gem,
-        ) {
-            return result;
-        }
-        // Mesa's GBM/EGL compositor context is created on the PRIMARY (card)
-        // node and issues the VIRTGPU driver ioctls (GETPARAM/GET_CAPS/
-        // CONTEXT_INIT/RESOURCE_CREATE/EXECBUFFER/…) there — every one is
-        // `DRM_RENDER_ALLOW` in Linux, which the primary node serves for an
-        // authenticated client (`drivers/gpu/drm/virtio/virtgpu_ioctl.c`).
-        // Route them to this open's per-open virtio-gpu dispatcher FIRST,
-        // exactly as DriRenderFile does, then fall through to the card/KMS
-        // path for everything else (dispatch_virtgpu_render returns
-        // `Unsupported` for non-VIRTGPU cmds). Without this the card-node
-        // probe returned ENOTTY and Mesa dropped every GL client to llvmpipe.
-        if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
-            match crate::drm_ioctl_bridge::dispatch_virtgpu_render_for_card(
+        let result = (|| -> Result<u64, FsError> {
+            #[cfg(feature = "intel")]
+            if let Some(result) = self.intel.dispatch_card(
                 self.index,
                 cmd,
-                arg,
-                &self.virtgpu,
+                arg as u64,
+                &crate::intel_gpu_render::GuardedIoctl,
             ) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-        }
-        // The amdgpu private UAPI is answered on the card node too: a client
-        // that opened card0 rather than renderD128 asks `AMDGPU_INFO` there,
-        // and Linux serves it from both (the INFO ioctl carries neither
-        // DRM_AUTH nor DRM_MASTER in amdgpu's table).
-        #[cfg(feature = "amdgpu")]
-        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-            // DRM syncobjs, in this open's table (the one CS signals).
-            if let Some(result) =
-                crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu, true)
-            {
                 return result;
             }
-            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
-                return result;
-            }
-            if let Some(result) =
-                crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
-            {
-                return result;
-            }
-            // Dumb buffers in this open's GEM table (VRAM ones on Navi48).
-            if let Some(result) =
-                crate::drm_ioctl_bridge::amdgpu_dumb(self.index, cmd, arg, &self.amdgpu_gem)
-            {
-                return result;
-            }
-            // A legacy cursor of one of them.
-            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_cursor_bo(
+            // A framebuffer of one of this open's Intel GEM buffers (primary node
+            // only: the render node refuses KMS).
+            #[cfg(feature = "intel")]
+            if let Some(result) = crate::drm_ioctl_bridge::intel_addfb2_bo(
                 self.index,
                 self.open_id,
                 cmd,
                 arg,
-                &self.amdgpu_gem,
+                &self.intel.gem,
             ) {
                 return result;
             }
-            // A framebuffer of one of this open's amdgpu GEM buffers.
-            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
+            // Mesa's GBM/EGL compositor context is created on the PRIMARY (card)
+            // node and issues the VIRTGPU driver ioctls (GETPARAM/GET_CAPS/
+            // CONTEXT_INIT/RESOURCE_CREATE/EXECBUFFER/…) there — every one is
+            // `DRM_RENDER_ALLOW` in Linux, which the primary node serves for an
+            // authenticated client (`drivers/gpu/drm/virtio/virtgpu_ioctl.c`).
+            // Route them to this open's per-open virtio-gpu dispatcher FIRST,
+            // exactly as DriRenderFile does, then fall through to the card/KMS
+            // path for everything else (dispatch_virtgpu_render returns
+            // `Unsupported` for non-VIRTGPU cmds). Without this the card-node
+            // probe returned ENOTTY and Mesa dropped every GL client to llvmpipe.
+            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
+                match crate::drm_ioctl_bridge::dispatch_virtgpu_render_for_card(
+                    self.index,
+                    cmd,
+                    arg,
+                    &self.virtgpu,
+                ) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+            }
+            // The amdgpu private UAPI is answered on the card node too: a client
+            // that opened card0 rather than renderD128 asks `AMDGPU_INFO` there,
+            // and Linux serves it from both (the INFO ioctl carries neither
+            // DRM_AUTH nor DRM_MASTER in amdgpu's table).
+            #[cfg(feature = "amdgpu")]
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                // DRM syncobjs, in this open's table (the one CS signals).
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu, true)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
+                {
+                    return result;
+                }
+                // Dumb buffers in this open's GEM table (VRAM ones on Navi48).
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::amdgpu_dumb(self.index, cmd, arg, &self.amdgpu_gem)
+                {
+                    return result;
+                }
+                // A legacy cursor of one of them.
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_cursor_bo(
+                    self.index,
+                    self.open_id,
+                    cmd,
+                    arg,
+                    &self.amdgpu_gem,
+                ) {
+                    return result;
+                }
+                // A framebuffer of one of this open's amdgpu GEM buffers.
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_addfb2_bo(
+                    self.index,
+                    self.open_id,
+                    cmd,
+                    arg,
+                    &self.amdgpu_gem,
+                ) {
+                    return result;
+                }
+                match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_bo_list::dispatch(
+                    cmd,
+                    arg,
+                    &self.amdgpu_bo_lists,
+                    &self.amdgpu_gem,
+                ) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_ctx::dispatch(
+                    cmd,
+                    arg,
+                    &self.amdgpu_ctx,
+                    // `drm_is_current_master(filp)`: whether THIS open holds it.
+                    crate::drm_registry::mode_state(self.index)
+                        .is_some_and(|m| m.lock().is_master(self.open_id)),
+                ) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_info::dispatch_for(cmd, arg, Some(&self.amdgpu_vm)) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                if let Some(result) = crate::drm_ioctl_bridge::without_kms(self.index, cmd, arg) {
+                    return result;
+                }
+            }
+            crate::drm_ioctl_bridge::dispatch_card_for_file(
                 self.index,
                 self.open_id,
                 cmd,
                 arg,
-                &self.amdgpu_gem,
-            ) {
-                return result;
-            }
-            match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_bo_list::dispatch(cmd, arg, &self.amdgpu_bo_lists, &self.amdgpu_gem)
-            {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_ctx::dispatch(
-                cmd,
-                arg,
-                &self.amdgpu_ctx,
-                // `drm_is_current_master(filp)`: whether THIS open holds it.
-                crate::drm_registry::mode_state(self.index)
-                    .is_some_and(|m| m.lock().is_master(self.open_id)),
-            ) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_info::dispatch_for(cmd, arg, Some(&self.amdgpu_vm)) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            if let Some(result) = crate::drm_ioctl_bridge::without_kms(self.index, cmd, arg) {
-                return result;
-            }
-        }
-        crate::drm_ioctl_bridge::dispatch_card_for_file(
-            self.index,
-            self.open_id,
-            cmd,
-            arg,
-            /*render*/ false,
-            &self.client_caps,
-            Some(&self.events),
-            Some(&self.pending_out_fences),
-        )
+                /*render*/ false,
+                &self.client_caps,
+                Some(&self.events),
+                Some(&self.pending_out_fences),
+            )
+        })();
+        crate::drm_ioctl_bridge::note_drm_fd_einval(cmd, &result);
+        result
     }
 
     fn ioctl_user<'a>(
@@ -623,161 +631,171 @@ impl FileOps for DriCardFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
-            #[cfg(feature = "intel")]
-            if let Some(result) = self
-                .intel
-                .dispatch_card_user(self.index, cmd, arg, context)
+            let result = async move {
+                #[cfg(feature = "intel")]
+                if let Some(result) = self
+                    .intel
+                    .dispatch_card_user(self.index, cmd, arg, context)
+                    .await
+                {
+                    return result;
+                }
+                #[cfg(feature = "intel")]
+                if let Some(result) = crate::drm_ioctl_bridge::intel_kms_async(
+                    self.index,
+                    self.open_id,
+                    cmd,
+                    arg,
+                    context,
+                    Some(&self.events),
+                    Some(&self.pending_out_fences),
+                    &self.intel.gem,
+                )
                 .await
-            {
-                return result;
-            }
-            #[cfg(feature = "intel")]
-            if let Some(result) = crate::drm_ioctl_bridge::intel_kms_async(
-                self.index,
-                self.open_id,
-                cmd,
-                arg,
-                context,
-                Some(&self.events),
-                Some(&self.pending_out_fences),
-                &self.intel.gem,
-            )
-            .await
-            {
-                return result;
-            }
-            // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
-            #[cfg(feature = "amdgpu")]
-            #[cfg(feature = "amdgpu")]
-            let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
-            #[cfg(not(feature = "amdgpu"))]
-            let _rpm = ();
-            #[cfg(not(feature = "amdgpu"))]
-            let _rpm = ();
-            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
-                && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
-            {
-                return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
+                {
+                    return result;
+                }
+                // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
+                #[cfg(feature = "amdgpu")]
+                #[cfg(feature = "amdgpu")]
+                let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
+                #[cfg(not(feature = "amdgpu"))]
+                let _rpm = ();
+                #[cfg(not(feature = "amdgpu"))]
+                let _rpm = ();
+                if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
+                    && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
+                {
+                    return crate::drm_ioctl_bridge::wait_virtgpu_render(
+                        arg as usize,
+                        &self.virtgpu,
+                    )
                     .await;
-            }
-            // Atomic KMS commits consume their explicit sync_file dependency
-            // before taking the DRM mode-state lock. The helper either parks
-            // this syscall for a device-fence re-poll (with no side effect),
-            // or completes the bounded kernel-only fallback wait. This keeps
-            // a render submission from deadlocking behind the scanout path.
-            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
+                }
+                // Atomic KMS commits consume their explicit sync_file dependency
+                // before taking the DRM mode-state lock. The helper either parks
+                // this syscall for a device-fence re-poll (with no side effect),
+                // or completes the bounded kernel-only fallback wait. This keeps
+                // a render submission from deadlocking behind the scanout path.
+                if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
                 && cmd == crate::drm_uapi::DRM_IOCTL_MODE_ATOMIC
                 // Preserve DRM_MASTER errno precedence: an unprivileged
                 // primary open reaches the normal dispatcher, which returns
                 // EACCES without first importing user fence descriptors.
                 && crate::drm_registry::mode_state(self.index)
                     .is_some_and(|state| state.lock().is_master(self.open_id))
-            {
-                crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
-            }
-            // DRM syncobjs from a user open: fd export/import and waits
-            // that park this syscall. amdgpu has timelines, virtio-gpu not.
-            let driver = crate::drm_registry::driver_name(self.index);
-            if matches!(driver, Some("amdgpu") | Some("virtio_gpu")) {
-                if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj_user(
-                    cmd,
-                    arg as usize,
-                    &self.virtgpu,
-                    driver == Some("amdgpu"),
-                    context,
-                )
-                .await
                 {
-                    return result;
+                    crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
                 }
-            }
-            // drm_getclient, which libdrm's amdgpu_get_auth issues on every
-            // primary node before anything else.
-            if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
-                let authenticated = crate::drm_registry::mode_state(self.index)
-                    .is_some_and(|m| m.lock().is_master(self.open_id));
-                return crate::drm_ioctl_bridge::get_client(arg, context, authenticated);
-            }
-            // A blocking vblank wait sleeps until its vblank.
-            if crate::drm_ioctl_bridge::is_wait_vblank_ioctl(cmd) {
-                return crate::drm_ioctl_bridge::wait_vblank_for_file(
-                    self.index,
-                    arg as usize,
-                    &self.events,
-                )
-                .await;
-            }
-            #[cfg(feature = "amdgpu")]
-            #[cfg(feature = "amdgpu")]
-            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-                if let Some(result) =
-                    crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
+                // DRM syncobjs from a user open: fd export/import and waits
+                // that park this syscall. amdgpu has timelines, virtio-gpu not.
+                let driver = crate::drm_registry::driver_name(self.index);
+                if matches!(driver, Some("amdgpu") | Some("virtio_gpu")) {
+                    if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj_user(
+                        cmd,
+                        arg as usize,
+                        &self.virtgpu,
+                        driver == Some("amdgpu"),
+                        context,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                }
+                // drm_getclient, which libdrm's amdgpu_get_auth issues on every
+                // primary node before anything else.
+                if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
+                    let authenticated = crate::drm_registry::mode_state(self.index)
+                        .is_some_and(|m| m.lock().is_master(self.open_id));
+                    return crate::drm_ioctl_bridge::get_client(arg, context, authenticated);
+                }
+                // A blocking vblank wait sleeps until its vblank.
+                if crate::drm_ioctl_bridge::is_wait_vblank_ioctl(cmd) {
+                    return crate::drm_ioctl_bridge::wait_vblank_for_file(
+                        self.index,
+                        arg as usize,
+                        &self.events,
+                    )
+                    .await;
+                }
+                #[cfg(feature = "amdgpu")]
+                #[cfg(feature = "amdgpu")]
+                if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                    if let Some(result) =
+                        crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
+                    {
+                        return result;
+                    }
+                }
+                #[cfg(feature = "amdgpu")]
+                #[cfg(feature = "amdgpu")]
+                if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                    if let Some(result) =
+                        crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
+                    {
+                        return result;
+                    }
+                    if let Some(result) = crate::drm_ioctl_bridge::amdgpu_create_dumb_async(
+                        self.index,
+                        cmd,
+                        arg as usize,
+                        &self.amdgpu_gem,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                    if let Some(result) = crate::drm_ioctl_bridge::amdgpu_kms_async(
+                        self.index,
+                        self.open_id,
+                        cmd,
+                        arg as usize,
+                        &self.amdgpu_gem,
+                        Some(&self.events),
+                        Some(&self.pending_out_fences),
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                    if let Some(result) = crate::amdgpu_vm::dispatch_async(
+                        cmd,
+                        arg as usize,
+                        &self.amdgpu_vm,
+                        &self.amdgpu_gem,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                }
+                // amdgpu CS and WAIT_CS park on a card whose queue runs them.
+                #[cfg(feature = "amdgpu")]
+                #[cfg(feature = "amdgpu")]
+                if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
+                    && crate::amdgpu_cs::is_async_ioctl(cmd)
                 {
-                    return result;
+                    let open = crate::amdgpu_cs::CsOpen {
+                        vm: &self.amdgpu_vm,
+                        gem: &self.amdgpu_gem,
+                        ctx: &self.amdgpu_ctx,
+                        syncobjs: self.virtgpu.syncobjs(),
+                        bo_lists: &self.amdgpu_bo_lists,
+                        files: Some(context),
+                    };
+                    match crate::amdgpu_cs::dispatch_async(self.index, cmd, arg as usize, &open)
+                        .await
+                    {
+                        Err(FsError::Unsupported) => {}
+                        result => return result,
+                    }
                 }
+                self.ioctl(cmd, arg as usize)
             }
-            #[cfg(feature = "amdgpu")]
-            #[cfg(feature = "amdgpu")]
-            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-                if let Some(result) =
-                    crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
-                {
-                    return result;
-                }
-                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_create_dumb_async(
-                    self.index,
-                    cmd,
-                    arg as usize,
-                    &self.amdgpu_gem,
-                )
-                .await
-                {
-                    return result;
-                }
-                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_kms_async(
-                    self.index,
-                    self.open_id,
-                    cmd,
-                    arg as usize,
-                    &self.amdgpu_gem,
-                    Some(&self.events),
-                    Some(&self.pending_out_fences),
-                )
-                .await
-                {
-                    return result;
-                }
-                if let Some(result) = crate::amdgpu_vm::dispatch_async(
-                    cmd,
-                    arg as usize,
-                    &self.amdgpu_vm,
-                    &self.amdgpu_gem,
-                )
-                .await
-                {
-                    return result;
-                }
-            }
-            // amdgpu CS and WAIT_CS park on a card whose queue runs them.
-            #[cfg(feature = "amdgpu")]
-            #[cfg(feature = "amdgpu")]
-            if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
-                && crate::amdgpu_cs::is_async_ioctl(cmd)
-            {
-                let open = crate::amdgpu_cs::CsOpen {
-                    vm: &self.amdgpu_vm,
-                    gem: &self.amdgpu_gem,
-                    ctx: &self.amdgpu_ctx,
-                    syncobjs: self.virtgpu.syncobjs(),
-                    bo_lists: &self.amdgpu_bo_lists,
-                    files: Some(context),
-                };
-                match crate::amdgpu_cs::dispatch_async(self.index, cmd, arg as usize, &open).await {
-                    Err(FsError::Unsupported) => {}
-                    result => return result,
-                }
-            }
-            self.ioctl(cmd, arg as usize)
+            .await;
+            crate::drm_ioctl_bridge::note_drm_fd_einval(cmd, &result);
+            result
         })
     }
 
@@ -1612,88 +1630,96 @@ impl FileOps for DriRenderFile {
     /// modesetting ioctls with PermissionDenied (→ EACCES at the
     /// syscall layer).
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
-        #[cfg(feature = "intel")]
-        if let Some(result) = self.intel.dispatch_card(
-            self.index,
-            cmd,
-            arg as u64,
-            &crate::intel_gpu_render::GuardedIoctl,
-        ) {
-            return result;
-        }
-        if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
-            match crate::drm_ioctl_bridge::dispatch_virtgpu_render(cmd, arg, &self.virtgpu) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-        }
-        // The amdgpu private UAPI, on the render node. `AMDGPU_INFO` is what
-        // `libdrm_amdgpu`'s `amdgpu_device_initialize` calls first, and it
-        // calls it on whichever node it opened — Mesa uses the render node.
-        // Unimplemented commands return `Unsupported` and fall through to the
-        // generic DRM path, as the virtio-gpu dispatcher above does.
-        #[cfg(feature = "amdgpu")]
-        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-            // DRM syncobjs, in this open's table (the one CS signals).
-            if let Some(result) =
-                crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu, true)
-            {
+        let result = (|| -> Result<u64, FsError> {
+            #[cfg(feature = "intel")]
+            if let Some(result) = self.intel.dispatch_card(
+                self.index,
+                cmd,
+                arg as u64,
+                &crate::intel_gpu_render::GuardedIoctl,
+            ) {
                 return result;
             }
-            if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
-                return result;
+            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
+                match crate::drm_ioctl_bridge::dispatch_virtgpu_render(cmd, arg, &self.virtgpu) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
             }
-            if let Some(result) =
-                crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
-            {
-                return result;
+            // The amdgpu private UAPI, on the render node. `AMDGPU_INFO` is what
+            // `libdrm_amdgpu`'s `amdgpu_device_initialize` calls first, and it
+            // calls it on whichever node it opened — Mesa uses the render node.
+            // Unimplemented commands return `Unsupported` and fall through to the
+            // generic DRM path, as the virtio-gpu dispatcher above does.
+            #[cfg(feature = "amdgpu")]
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                // DRM syncobjs, in this open's table (the one CS signals).
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::dispatch_syncobj(cmd, arg, &self.virtgpu, true)
+                {
+                    return result;
+                }
+                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
+                    return result;
+                }
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::amdgpu_dumb_metadata(self.index, cmd, arg)
+                {
+                    return result;
+                }
+                match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_bo_list::dispatch(
+                    cmd,
+                    arg,
+                    &self.amdgpu_bo_lists,
+                    &self.amdgpu_gem,
+                ) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_ctx::dispatch(
+                    cmd,
+                    arg,
+                    &self.amdgpu_ctx,
+                    // A render node never holds DRM master, so a client here needs
+                    // CAP_SYS_NICE for an above-normal priority.
+                    false,
+                ) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                match crate::amdgpu_info::dispatch_for(cmd, arg, Some(&self.amdgpu_vm)) {
+                    Err(FsError::Unsupported) => {}
+                    result => return result,
+                }
+                if let Some(result) = crate::drm_ioctl_bridge::without_kms(self.index, cmd, arg) {
+                    return result;
+                }
             }
-            match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_bo_list::dispatch(cmd, arg, &self.amdgpu_bo_lists, &self.amdgpu_gem)
-            {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_ctx::dispatch(
+            crate::drm_ioctl_bridge::dispatch_card_for_file(
+                self.index,
+                NO_MASTER_OPEN_ID,
                 cmd,
                 arg,
-                &self.amdgpu_ctx,
-                // A render node never holds DRM master, so a client here needs
-                // CAP_SYS_NICE for an above-normal priority.
-                false,
-            ) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            match crate::amdgpu_info::dispatch_for(cmd, arg, Some(&self.amdgpu_vm)) {
-                Err(FsError::Unsupported) => {}
-                result => return result,
-            }
-            if let Some(result) = crate::drm_ioctl_bridge::without_kms(self.index, cmd, arg) {
-                return result;
-            }
-        }
-        crate::drm_ioctl_bridge::dispatch_card_for_file(
-            self.index,
-            NO_MASTER_OPEN_ID,
-            cmd,
-            arg,
-            /*render*/ true,
-            &self.client_caps,
-            None,
-            None,
-        )
+                /*render*/ true,
+                &self.client_caps,
+                None,
+                None,
+            )
+        })();
+        crate::drm_ioctl_bridge::note_drm_fd_einval(cmd, &result);
+        result
     }
 
     fn ioctl_user<'a>(
@@ -1703,88 +1729,98 @@ impl FileOps for DriRenderFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
-            #[cfg(feature = "intel")]
-            if let Some(result) = self
-                .intel
-                .dispatch_card_user(self.index, cmd, arg, context)
-                .await
-            {
-                return result;
-            }
-            // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
-            #[cfg(feature = "amdgpu")]
-            let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
-            // DRM syncobjs from a user open: fd export/import and waits
-            // that park this syscall. amdgpu has timelines, virtio-gpu not.
-            let driver = crate::drm_registry::driver_name(self.index);
-            if matches!(driver, Some("amdgpu") | Some("virtio_gpu")) {
-                if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj_user(
-                    cmd,
-                    arg as usize,
-                    &self.virtgpu,
-                    driver == Some("amdgpu"),
-                    context,
-                )
-                .await
+            let result = async move {
+                #[cfg(feature = "intel")]
+                if let Some(result) = self
+                    .intel
+                    .dispatch_card_user(self.index, cmd, arg, context)
+                    .await
                 {
                     return result;
                 }
-            }
-            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
-                && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
-            {
-                return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
+                // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
+                #[cfg(feature = "amdgpu")]
+                let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
+                // DRM syncobjs from a user open: fd export/import and waits
+                // that park this syscall. amdgpu has timelines, virtio-gpu not.
+                let driver = crate::drm_registry::driver_name(self.index);
+                if matches!(driver, Some("amdgpu") | Some("virtio_gpu")) {
+                    if let Some(result) = crate::drm_ioctl_bridge::dispatch_syncobj_user(
+                        cmd,
+                        arg as usize,
+                        &self.virtgpu,
+                        driver == Some("amdgpu"),
+                        context,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                }
+                if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
+                    && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
+                {
+                    return crate::drm_ioctl_bridge::wait_virtgpu_render(
+                        arg as usize,
+                        &self.virtgpu,
+                    )
                     .await;
-            }
-            #[cfg(feature = "amdgpu")]
-            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-                if let Some(result) =
-                    crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
+                }
+                #[cfg(feature = "amdgpu")]
+                if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                    if let Some(result) =
+                        crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
+                    {
+                        return result;
+                    }
+                }
+                #[cfg(feature = "amdgpu")]
+                if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                    if let Some(result) =
+                        crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
+                    {
+                        return result;
+                    }
+                    if let Some(result) = crate::amdgpu_vm::dispatch_async(
+                        cmd,
+                        arg as usize,
+                        &self.amdgpu_vm,
+                        &self.amdgpu_gem,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                }
+                // amdgpu CS and WAIT_CS park on a card whose queue runs them.
+                #[cfg(feature = "amdgpu")]
+                if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
+                    && crate::amdgpu_cs::is_async_ioctl(cmd)
                 {
-                    return result;
+                    let open = crate::amdgpu_cs::CsOpen {
+                        vm: &self.amdgpu_vm,
+                        gem: &self.amdgpu_gem,
+                        ctx: &self.amdgpu_ctx,
+                        syncobjs: self.virtgpu.syncobjs(),
+                        bo_lists: &self.amdgpu_bo_lists,
+                        files: Some(context),
+                    };
+                    match crate::amdgpu_cs::dispatch_async(self.index, cmd, arg as usize, &open)
+                        .await
+                    {
+                        Err(FsError::Unsupported) => {}
+                        result => return result,
+                    }
                 }
-            }
-            #[cfg(feature = "amdgpu")]
-            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-                if let Some(result) =
-                    crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
-                {
-                    return result;
+                // GET_CLIENT carries no DRM_RENDER_ALLOW (drm_ioctl_permit).
+                if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
+                    return Err(FsError::PermissionDenied);
                 }
-                if let Some(result) = crate::amdgpu_vm::dispatch_async(
-                    cmd,
-                    arg as usize,
-                    &self.amdgpu_vm,
-                    &self.amdgpu_gem,
-                )
-                .await
-                {
-                    return result;
-                }
+                self.ioctl(cmd, arg as usize)
             }
-            // amdgpu CS and WAIT_CS park on a card whose queue runs them.
-            #[cfg(feature = "amdgpu")]
-            if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
-                && crate::amdgpu_cs::is_async_ioctl(cmd)
-            {
-                let open = crate::amdgpu_cs::CsOpen {
-                    vm: &self.amdgpu_vm,
-                    gem: &self.amdgpu_gem,
-                    ctx: &self.amdgpu_ctx,
-                    syncobjs: self.virtgpu.syncobjs(),
-                    bo_lists: &self.amdgpu_bo_lists,
-                    files: Some(context),
-                };
-                match crate::amdgpu_cs::dispatch_async(self.index, cmd, arg as usize, &open).await {
-                    Err(FsError::Unsupported) => {}
-                    result => return result,
-                }
-            }
-            // GET_CLIENT carries no DRM_RENDER_ALLOW (drm_ioctl_permit).
-            if cmd == crate::drm_ioctl_bridge::DRM_IOCTL_GET_CLIENT {
-                return Err(FsError::PermissionDenied);
-            }
-            self.ioctl(cmd, arg as usize)
+            .await;
+            crate::drm_ioctl_bridge::note_drm_fd_einval(cmd, &result);
+            result
         })
     }
 

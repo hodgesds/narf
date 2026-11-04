@@ -2073,6 +2073,33 @@ pub fn dispatch_card(
     )
 }
 
+/// Bring-up visibility for every ioctl on a DRM card or render fd (KMS,
+/// amdgpu GEM/VM/CS/BO-list/info, syncobj): log an EINVAL once per ioctl
+/// command, with the line [`invalid_at`] last recorded in this file (0 when
+/// the error was built in another module). The driver dispatchers run
+/// before [`dispatch_card_for_file`], so its own trace misses them.
+pub(crate) fn note_drm_fd_einval(cmd: u32, result: &Result<u64, FsError>) {
+    if !matches!(result, Err(FsError::InvalidData)) {
+        return;
+    }
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u32>> =
+        narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+    {
+        let mut seen = SEEN.lock();
+        if seen.len() >= 48 || seen.contains(&cmd) {
+            return;
+        }
+        seen.push(cmd);
+    }
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  drm: fd ioctl {cmd:#010x} (nr {:#x}) EINVAL (last bridge line {})",
+        drm_uapi::ioc_nr(cmd),
+        LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed),
+    );
+}
+
 /// Stateful card dispatcher used by a real DRM open file.
 ///
 /// Bring-up visibility: an EINVAL from any card ioctl is logged once per
