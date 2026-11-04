@@ -5485,14 +5485,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if CONTROLLERS.lock().iter().any(|c| c.bus_addr == device.addr) {
         return Ok(());
     }
-    // Every reset, recovery and timeout below is a `Deadline`/sleep in
-    // ns. This probe runs long before frame calibrates the TSC, when the
-    // scale is still the 1 cycle/ns fallback (4.7x short on a 4.7 GHz
-    // part): port resets, command waits and device recovery times all
-    // expire early, and the supervisor burns real ports out within that
-    // window. Establish the calibrated scale first, as amdgpu's
-    // `boot_clock_ready` does; it is a no-op once calibrated.
-    let _ = narf_time::calibrate_clocks();
     // The class-match backstop matches *every* device with PCI
     // base class 0x0C (Serial Bus) — that includes SMBus
     // (subclass 0x05, e.g. AMD FCH 1022:790b), CAN, GPIB, IPMI,
