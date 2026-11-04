@@ -96,8 +96,8 @@ from physical acceptance of the enabled software profiles.
 > descriptions in §3.23 and earlier continuation notes, including §3.77.
 > Source review and coordinated release compilation precede integration;
 > native regression and physical/RF acceptance remain separate pending gates.
-> Unsupported GO CTWindow/OPPPS setters on MAC_CONFIG1/2/3, richer PHY and
-> concurrent data roles remain unadvertised as detailed in §3.79.
+> GO CTWindow/OPPPS setters are now supported through the beacon-template
+> NoA attribute (§3.79); richer PHY and concurrent data roles remain unadvertised.
 
 **Software acceptance at `6813a24c6`.** The admitted non-MLO EHT (`eht`),
 `width_320`, complete scoped `six_ghz` and ordinary legacy20 `ap`
@@ -5340,15 +5340,18 @@ invented. Legacy20/OFDM is the admitted GO/CLIENT PHY, with optional widths,
 six-GHz and richer modes unadvertised. DEVICE remains the actual off-channel
 negotiation owner before group formation.
 
-GO CTWindow/OPPPS public setters remain unadvertised because none of the
-admitted MAC_CONFIG1/2/3 producers has GO PS fields. The legacy `mac.h`
-MAC_CONTEXT GO union belongs to a different, unadmitted adapter; it cannot be
-transplanted into MAC_CONFIG. Client CTWindow uses the actual defined client
-field and GO NoA uses the actual firmware notification independently. There
-is no unfinished supported GO PS producer in this admitted baseline. Adding
-legacy MAC_CONTEXT hardware/firmware, optional concurrent roles or richer PHY
-would require new actual adapters/qualification and advertisement. The P2P
-row may be recorded as implemented pending validation after review/compilation
+GO CTWindow/OPPPS public setters are now supported through the beacon-template
+NoA attribute, not through any MAC_CONFIG producer: the legacy `mac.h`
+MAC_CONTEXT GO union still belongs to a different, unadmitted adapter and
+cannot be transplanted into MAC_CONFIG. At GO start the driver-owned NoA
+(index 0) replaces any SME-supplied NoA wholesale in the transmitted
+template; the live setter merges None-preserving updates, bumps the NoA
+index per update, and re-emits the template. Client CTWindow uses the
+actual defined client field. Probe responses still project GO NoA from
+firmware notifications only; driver-owned power-save values do not yet
+project there. Adding legacy MAC_CONTEXT hardware/firmware, optional
+concurrent roles or richer PHY would require new actual adapters/qualification
+and advertisement. The P2P row may be recorded as implemented pending validation after review/compilation
 of this complete graph; full native acceptance remains a separate gate.
 
 ### 3.80 Gen2/API77 WoWLAN (implementation; validation pending)

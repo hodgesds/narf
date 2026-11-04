@@ -1622,6 +1622,22 @@ impl WirelessNetIface for Device {
             .map(|_| ())
             .map_err(ap::error)
     }
+    fn supports_p2p_go_power_save(&self) -> bool {
+        true
+    }
+    async fn set_p2p_go_power_save_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        settings: narf_wireless::P2pGoPowerSave,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        authority.require_up()?;
+        settings.validate()?;
+        self.ap_control(authority, ap::Operation::SetGoPowerSave(settings))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
     async fn add_station_async(
         &self,
         authority: &narf_wireless::ap_control::ApControlAuthority,

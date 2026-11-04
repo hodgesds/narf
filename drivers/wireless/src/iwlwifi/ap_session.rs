@@ -7,7 +7,9 @@ use super::{
 };
 use alloc::{sync::Arc, vec, vec::Vec};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_wireless::{ApStartSettings, ControlPortTxRequest, KeyParams, StationConfig};
+use narf_wireless::{
+    ApStartSettings, ControlPortTxRequest, KeyParams, P2pGoPowerSave, StationConfig,
+};
 
 pub(super) struct Peer {
     pub id: u8,
@@ -34,6 +36,10 @@ pub(super) struct Session {
     pub proof: Arc<super::ap_owner::Owner>,
     pub program: super::mld_policy::Program,
     pub settings: ApStartSettings,
+    /// Version counter for the driver-owned GO NoA attribute: 0 at GO
+    /// start, +1 per live power-save update. Ordinary AP sessions
+    /// never use it (their plans refuse `p2p_go`).
+    pub go_noa_index: u8,
     pub peers: Vec<Peer>,
     pub epoch: u64,
     data_epoch: super::ap_owner::DataEpoch,
@@ -197,6 +203,7 @@ impl Session {
             proof,
             program,
             settings,
+            go_noa_index: 0,
             peers: Vec::new(),
             epoch,
             data_epoch: Default::default(),
@@ -250,10 +257,15 @@ impl Session {
             config.probe_resp = Some(probe);
         }
         let plan = if self.plan.go.is_some() {
-            Plan::new_go(config, &self.settings, self.own)?
+            Plan::new_go(config, &self.settings, self.own, self.go_noa_index)?
         } else {
             Plan::new(config, &self.settings, self.own)?
         };
+        self.install_plan(hw, plan).await
+    }
+    /// Shared beacon-template install tail: identity/security/channel/
+    /// basic-rate stability, template + link re-send, plan commit.
+    async fn install_plan(&mut self, hw: &mut Hardware, plan: Plan) -> Result<(), &'static str> {
         if plan.go != self.plan.go {
             return Err("GO device identity change needs a fresh native role owner");
         }
@@ -269,6 +281,46 @@ impl Session {
         command(hw, 3, 9, &plan.link(self.own, true)).await?;
         self.current()?;
         self.plan = plan;
+        Ok(())
+    }
+    /// Live GO CTWindow/OPPPS update (the
+    /// `set_p2p_go_power_save_ap_async` native contract). `None`
+    /// fields preserve the live value, per `P2pGoPowerSave` semantics;
+    /// `Some(0)`/`Some(false)` reset. Bumps the NoA index and
+    /// re-sends the beacon template through the same install path as
+    /// `beacon()`. Refuses non-GO sessions: the ordinary AP plan
+    /// refuses `p2p_go` outright. Settings/index commit only after
+    /// the template install succeeds, so a failed send leaves the
+    /// session advertising its previous schedule.
+    pub async fn set_go_power_save(
+        &mut self,
+        hw: &mut Hardware,
+        settings: P2pGoPowerSave,
+    ) -> Result<(), &'static str> {
+        self.current()?;
+        if self.plan.go.is_none() {
+            return Err("GO power save needs an actual GO session");
+        }
+        settings
+            .validate()
+            .map_err(|_| "GO power-save CTWindow exceeds 127")?;
+        let current = self.settings.p2p_go.unwrap_or_default();
+        let merged = P2pGoPowerSave {
+            ctwindow_tu: settings.ctwindow_tu.or(current.ctwindow_tu),
+            opportunistic: settings.opportunistic.or(current.opportunistic),
+        };
+        let mut next_settings = self.settings.clone();
+        next_settings.p2p_go = Some(merged);
+        let next_index = self.go_noa_index.wrapping_add(1);
+        let plan = Plan::new_go(
+            self.plan.config.clone(),
+            &next_settings,
+            self.own,
+            next_index,
+        )?;
+        self.install_plan(hw, plan).await?;
+        self.settings = next_settings;
+        self.go_noa_index = next_index;
         Ok(())
     }
     pub fn current(&self) -> Result<(), &'static str> {

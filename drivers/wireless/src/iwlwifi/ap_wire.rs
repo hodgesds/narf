@@ -237,12 +237,19 @@ impl Plan {
     }
     /// GO is an actual P2P beacon/probe/rate contract, distinct from the
     /// firmware GO8 value also used by ordinary AP3. This plan grants no RF.
+    /// `noa_index` versions the driver-owned NoA attribute: 0 at GO
+    /// start, +1 per live power-save update (tracked by the Session).
     pub fn new_go(
         config: ApConfig,
         settings: &ApStartSettings,
         own: [u8; 6],
+        noa_index: u8,
     ) -> Result<Self, &'static str> {
-        let mut plan = Self::new(config, settings, own)?;
+        // Ordinary APs refuse GO power-save fields; GO plans own them
+        // below, so strip them before the shared geometry validation.
+        let mut stripped = settings.clone();
+        stripped.p2p_go = None;
+        let mut plan = Self::new(config, &stripped, own)?;
         let identity = super::p2p_go::Identity::beacon(&plan.beacon[36..])?;
         if !plan.secure() {
             return Err("GO requires an actual protected group/key owner");
@@ -252,6 +259,42 @@ impl Plan {
         }
         if let Some(probe) = &plan.config.probe_resp {
             identity.probe(&probe[36..])?;
+        }
+        if let Some(ps) = settings.p2p_go {
+            ps.validate()
+                .map_err(|_| "GO power-save CTWindow exceeds 127")?;
+            // Linux MLD programs GO PS through no MAC_CONFIG field
+            // (the v3 union has client/p2p_dev only; mld-mac.c sets
+            // ctwin for the client only) — the GO advertises its
+            // schedule in the beacon's NoA attribute, which the
+            // firmware transmits from this template. The driver-owned
+            // attribute replaces any SME-supplied NoA wholesale.
+            let ctwindow = ps.ctwindow_tu.unwrap_or(0);
+            let opportunistic = ps.opportunistic.unwrap_or(false);
+            let elements = super::p2p_go::set_noa_in_elements(
+                &plan.beacon[36..],
+                noa_index,
+                ctwindow,
+                opportunistic,
+            )?;
+            let mut beacon = plan.beacon[..36].to_vec();
+            beacon.extend_from_slice(&elements);
+            if beacon.len() > 2048 {
+                return Err("GO native beacon exceeds bounded template");
+            }
+            // The rewrite may shift element offsets; re-derive TIM.
+            let tim = elements_iter(&beacon[36..])?
+                .iter()
+                .scan(36usize, |off, (id, body)| {
+                    let at = *off;
+                    *off += 2 + body.len();
+                    Some((at, *id))
+                })
+                .find(|(_, id)| *id == 5)
+                .map(|(at, _)| at)
+                .ok_or("GO native beacon lost TIM")?;
+            plan.beacon = beacon;
+            plan.tim = tim;
         }
         plan.go = Some(identity);
         Ok(plan)
