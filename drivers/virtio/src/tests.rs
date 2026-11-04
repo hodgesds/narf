@@ -905,6 +905,65 @@ fn smoke_virtio_net_rx_csum_verdict() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_rx_csum_verdict);
 
+/// Regression pin for the HASH_REPORT + GUEST_CSUM fail-open: the RX
+/// pump's csum check must slice the payload at the runtime header
+/// length (20 with HASH_REPORT), not a hardcoded 12. Under the old
+/// slicing, an unverified TCPv4 segment under a 20-byte header
+/// delivered (the shifted window misreads the ethertype as 0x0000
+/// from the dst-MAC bytes); under the fix it drops fail-closed, and
+/// the 12-byte (GUEST_CSUM-only) path behaves byte-identically.
+fn smoke_virtio_net_rx_csum_hash_report_header() -> TestResult {
+    use crate::net_pci::{
+        rx_csum_deliver, rx_csum_payload, rx_header_len, VIRTIO_NET_HDR_F_DATA_VALID,
+    };
+
+    if rx_header_len(true) != 20 || rx_header_len(false) != 12 {
+        return TestResult::Fail("rx_header_len mismatch");
+    }
+    // IPv4/TCP frame via the shared builder (eth 14 + ip 20 + tcp 20).
+    let mut tcp4 = [0u8; 54];
+    virtio_test_ipv4_tcp_frame(&mut tcp4);
+    // Full RX buffer: 20-byte HASH_REPORT header (zeroed but for the
+    // flags byte, which stays 0 = unverified) + payload.
+    let mut buf20 = [0u8; 74];
+    buf20[20..74].copy_from_slice(&tcp4);
+    let payload20 = rx_csum_payload(&buf20, 20, tcp4.len() as u32);
+    if payload20 != tcp4 {
+        return TestResult::Fail("20-byte-header csum slice is not the true payload");
+    }
+    // Unverified TCPv4 under HASH_REPORT must drop (fail-closed).
+    if rx_csum_deliver(0, payload20) {
+        return TestResult::Fail("unverified TCPv4 under HASH_REPORT delivered");
+    }
+    // Device-verified TCPv4 under HASH_REPORT delivers.
+    if !rx_csum_deliver(VIRTIO_NET_HDR_F_DATA_VALID, payload20) {
+        return TestResult::Fail("device-verified TCPv4 under HASH_REPORT dropped");
+    }
+    // Regression pin: the old hardcoded-12 slice of the same buffer
+    // delivers the unverified segment — the fail-open this fix closes.
+    // (Shifted window's ethertype read lands on dst-MAC bytes = 0x0000,
+    // which takes the deliver-by-default arm.)
+    let shifted = buf20.get(12..12 + tcp4.len()).unwrap_or(&[]);
+    if !rx_csum_deliver(0, shifted) {
+        return TestResult::Fail("shifted-slice pin does not reproduce the fail-open");
+    }
+    // GUEST_CSUM-only path (12-byte header): same slice, same verdicts.
+    let mut buf12 = [0u8; 66];
+    buf12[12..66].copy_from_slice(&tcp4);
+    let payload12 = rx_csum_payload(&buf12, 12, tcp4.len() as u32);
+    if payload12 != tcp4 {
+        return TestResult::Fail("12-byte-header csum slice changed");
+    }
+    if rx_csum_deliver(0, payload12) {
+        return TestResult::Fail("unverified TCPv4 without HASH_REPORT delivered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_rx_csum_hash_report_header
+);
+
 fn smoke_virtio_net_pci_tx() -> TestResult {
     use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;

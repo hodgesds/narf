@@ -2530,6 +2530,19 @@ impl VirtioNetPci {
 /// 3. A single 802.1Q tag is skipped (L3 starts at offset 18, inner
 ///    ethertype at [16..18]); double-tagged frames take the
 ///    unparseable path and deliver.
+/// Payload slice for the RX pump's GUEST_CSUM check.
+///
+/// The virtio-net RX header is `rx_hdr_len` bytes (12, or 20 with
+/// HASH_REPORT — see `rx_header_len`); the payload starts after it.
+/// A hardcoded 12 here is fail-open under HASH_REPORT: the verdict
+/// function would parse header-shifted bytes, misread the ethertype,
+/// and deliver checksummed segments unverified. With `rx_hdr_len == 12`
+/// this reproduces the pre-RSS slicing exactly.
+pub(crate) fn rx_csum_payload<'a>(buf: &'a [u8], rx_hdr_len: usize, payload_len: u32) -> &'a [u8] {
+    let end = (rx_hdr_len + payload_len as usize).min(buf.len());
+    buf.get(rx_hdr_len..end).unwrap_or(&[])
+}
+
 pub(crate) fn rx_csum_deliver(hdr_flags: u8, payload: &[u8]) -> bool {
     const ETH_IPV4: u16 = 0x0800;
     const ETH_IPV6: u16 = 0x86dd;
@@ -2984,16 +2997,20 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                         }
                         // GUEST_CSUM verdict (drop-on-error interim, see
                         // `rx_csum_deliver`): the header's flags byte sits
-                        // at buf[0], the payload at [12..end]. Only
-                        // enforced when negotiated — without GUEST_CSUM
-                        // the device never sets DATA_VALID, so enforcing
-                        // would drop all checksummed traffic. Drops count
-                        // via note_rx_drop like the ring-full path, and
-                        // the buffer recycles exactly like an empty frame.
-                        let end = (12 + payload_len as usize).min(buf.len());
+                        // at buf[0], the payload at [rx_hdr_len..end].
+                        // The header length is runtime: 20 with
+                        // HASH_REPORT, else 12 — a hardcoded 12 would
+                        // parse header-shifted bytes under HASH_REPORT
+                        // and deliver checksummed segments unverified
+                        // (see `rx_csum_payload`). Only enforced when
+                        // negotiated — without GUEST_CSUM the device
+                        // never sets DATA_VALID, so enforcing would drop
+                        // all checksummed traffic. Drops count via
+                        // note_rx_drop like the ring-full path, and the
+                        // buffer recycles exactly like an empty frame.
                         if rx_guest_csum {
                             let hdr_flags = buf.as_slice().first().copied().unwrap_or(0);
-                            let payload = buf.as_slice().get(12..end).unwrap_or(&[]);
+                            let payload = rx_csum_payload(buf.as_slice(), rx_hdr_len, payload_len);
                             if !rx_csum_deliver(hdr_flags, payload) {
                                 narf_net::iface::note_rx_drop(primary_iface_name(), 1);
                                 to_recycle = Some(buf);
