@@ -53,11 +53,17 @@ mod ap_crypto;
 mod ap_host;
 mod ap_ps;
 mod ap_wire;
+mod bacam_v1;
+#[cfg(any(test, feature = "kernel-test"))]
+mod bacam_v1_tests;
 mod bdram;
 mod block_ack;
 mod bootstrap;
 pub mod btc;
 mod calibration_policy;
+mod cctl_g7;
+#[cfg(any(test, feature = "kernel-test"))]
+mod cctl_g7_tests;
 pub mod chan;
 mod channel_51;
 mod channel_bb;
@@ -73,6 +79,9 @@ mod command_queue;
 pub mod datapath;
 mod ddv;
 pub mod dma;
+mod dma_be;
+#[cfg(any(test, feature = "kernel-test"))]
+mod dma_be_tests;
 mod dma_stop;
 mod download_dma;
 mod download_plan;
