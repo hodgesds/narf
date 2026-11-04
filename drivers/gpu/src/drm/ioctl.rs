@@ -705,3 +705,30 @@ pub(crate) fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
 pub fn connector_type_wire(ct: ConnectorType) -> u32 {
     ct as u32
 }
+
+/// Serialise one `drm_mode_modeinfo` (68 bytes), as GETCONNECTOR, GETCRTC
+/// and MODE_ID blobs lay it out.
+pub fn mode_info_bytes(m: &DrmModeModeInfo) -> [u8; 68] {
+    let mut b = [0u8; 68];
+    b[0..4].copy_from_slice(&m.clock.to_le_bytes());
+    let u16s = [
+        m.hdisplay,
+        m.hsync_start,
+        m.hsync_end,
+        m.htotal,
+        m.hskew,
+        m.vdisplay,
+        m.vsync_start,
+        m.vsync_end,
+        m.vtotal,
+        m.vscan,
+    ];
+    for (i, v) in u16s.iter().enumerate() {
+        b[4 + i * 2..6 + i * 2].copy_from_slice(&v.to_le_bytes());
+    }
+    b[24..28].copy_from_slice(&m.vrefresh.to_le_bytes());
+    b[28..32].copy_from_slice(&m.flags.to_le_bytes());
+    b[32..36].copy_from_slice(&m.r#type.to_le_bytes());
+    b[36..68].copy_from_slice(&m.name);
+    b
+}

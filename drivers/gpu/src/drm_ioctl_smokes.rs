@@ -5768,3 +5768,139 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_native_connector_without_edid_has_no_edid_blob
 );
+
+/// drm_mode_equal / drm_crtc_state::mode_blob: two 3840x2160@60 timings
+/// (CTA 594 MHz and reduced-blanking 533.25 MHz) are different modes; the
+/// committed one is what GETCRTC and MODE_ID read back, and MODE_ID names
+/// a blob GETPROPBLOB serves — a kernel blob when the mode was not set
+/// through an atomic MODE_ID — which survives garbage collection.
+fn smoke_drm_committed_mode_identity_and_mode_id_readback() -> TestResult {
+    use crate::drm::card::{mode_equal, NativeOutput};
+    use crate::drm::ioctl::DrmModeModeInfo;
+    let rb = DrmModeModeInfo {
+        clock: 533_250,
+        hdisplay: 3840,
+        hsync_start: 3888,
+        hsync_end: 3920,
+        htotal: 4000,
+        vdisplay: 2160,
+        vsync_start: 2163,
+        vsync_end: 2168,
+        vtotal: 2222,
+        vrefresh: 60,
+        flags: 1 | 8,
+        ..Default::default()
+    };
+    let cta = DrmModeModeInfo {
+        clock: 594_000,
+        hsync_start: 4016,
+        hsync_end: 4104,
+        htotal: 4400,
+        vsync_start: 2168,
+        vsync_end: 2178,
+        vtotal: 2250,
+        flags: 1 | 4,
+        ..rb
+    };
+    if mode_equal(&rb, &cta) || !mode_equal(&cta, &cta) {
+        return TestResult::Fail("drm_mode_equal semantics");
+    }
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx).unwrap();
+    {
+        let mut card = ms.lock();
+        card.native.push(NativeOutput {
+            connector: 31,
+            edid: None,
+            timings: vec![rb, cta],
+            color_format: None,
+            broadcast_rgb: None,
+            vrr_capable: None,
+            colorspace: None,
+            hdr_output_metadata: None,
+            max_bpc: None,
+        });
+        let crtc = card.crtcs.iter_mut().find(|c| c.id == 11).unwrap();
+        crtc.enabled = true;
+        crtc.mode = Some(crate::Mode {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+        card.set_committed_mode(11, Some((cta, None)));
+    }
+    // GETCRTC reports the committed CTA timing, not the first published
+    // timing of the same size and refresh (the RB one).
+    let mut gc = [0u8; 104];
+    gc[12..16].copy_from_slice(&11u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA1, 104),
+        gc.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETCRTC failed");
+    }
+    if u32::from_le_bytes(gc[36..40].try_into().unwrap()) != 594_000 {
+        return TestResult::Fail("GETCRTC did not report the committed timing");
+    }
+    // MODE_ID reads back a servable blob holding that timing.
+    let mut props = [0u32; 8];
+    let mut vals = [0u64; 8];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&8u32.to_le_bytes());
+    og[20..24].copy_from_slice(&11u32.to_le_bytes());
+    og[24..28].copy_from_slice(&0xcccc_ccccu32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("OBJ_GETPROPERTIES(crtc) failed");
+    }
+    let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+    let Some(blob) = props[..count.min(8)]
+        .iter()
+        .position(|&p| p == 0x53)
+        .map(|i| vals[i] as u32)
+        .filter(|&b| b != 0)
+    else {
+        return TestResult::Fail("MODE_ID read back 0 while a mode is lit");
+    };
+    ms.lock().collect_blobs();
+    let mut data = [0u8; 68];
+    let mut gb = [0u8; 16];
+    gb[0..4].copy_from_slice(&blob.to_le_bytes());
+    gb[4..8].copy_from_slice(&68u32.to_le_bytes());
+    gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        gb.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || u32::from_le_bytes(data[0..4].try_into().unwrap()) != 594_000
+    {
+        return TestResult::Fail("MODE_ID blob not served with the committed timing");
+    }
+    // A CRTC that loses its mode forgets its committed timing and blob.
+    {
+        let mut card = ms.lock();
+        card.crtcs.iter_mut().find(|c| c.id == 11).unwrap().mode = None;
+        card.set_committed_mode(11, None);
+        if card.mode_blob(11) != 0 || card.property_blob(blob).is_some() {
+            return TestResult::Fail("disabled CRTC kept its mode blob");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_committed_mode_identity_and_mode_id_readback
+);

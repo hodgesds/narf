@@ -902,6 +902,38 @@ pub fn flips(display: u8) -> &'static narf_lib::sync::IrqSafeSpinLock<FlipLog> {
     &FLIPS[usize::from(display).min(FLIPS.len() - 1)]
 }
 
+/// The full timing a CRTC was committed with, and the MODE_ID blob that
+/// names it (Linux's `drm_crtc_state::mode` / `mode_blob`). `crate::Mode`
+/// keeps only size and refresh, which cannot tell two timings of one
+/// resolution apart (CTA 4K60 594 MHz vs a reduced-blanking 533.25 MHz).
+#[derive(Clone, Copy, Debug)]
+pub struct CommittedMode {
+    pub crtc: u32,
+    pub timing: crate::drm::ioctl::DrmModeModeInfo,
+    /// The blob MODE_ID reads back; a kernel blob when the mode came from a
+    /// legacy SETCRTC or the hardware rather than an atomic MODE_ID.
+    pub blob: Option<u32>,
+}
+
+/// `drm_mode_equal`: the timings, hskew/vscan and the mode flags match
+/// (type, name and the derived refresh are not compared).
+pub fn mode_equal(
+    a: &crate::drm::ioctl::DrmModeModeInfo,
+    b: &crate::drm::ioctl::DrmModeModeInfo,
+) -> bool {
+    (
+        a.clock,
+        [a.hdisplay, a.hsync_start, a.hsync_end, a.htotal, a.hskew],
+        [a.vdisplay, a.vsync_start, a.vsync_end, a.vtotal, a.vscan],
+        a.flags,
+    ) == (
+        b.clock,
+        [b.hdisplay, b.hsync_start, b.hsync_end, b.htotal, b.hskew],
+        [b.vdisplay, b.vsync_start, b.vsync_end, b.vtotal, b.vscan],
+        b.flags,
+    )
+}
+
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
 ///
 /// Linux analogue: `struct drm_device` + `drm_mode_config`.
@@ -975,6 +1007,8 @@ pub struct Card {
     /// VirGL resources imported from a render-node dma-buf for KMS scanout.
     pub(crate) virtgpu_imports: Vec<VirtGpuImport>,
     /// KMS property blobs created through MODE_CREATEPROPBLOB.
+    /// Per-CRTC committed timing and MODE_ID blob ([`CommittedMode`]).
+    pub committed_modes: Vec<CommittedMode>,
     pub(crate) property_blobs: Vec<PropertyBlob>,
     /// Next non-zero property-blob id.
     pub(crate) next_property_blob_id: u32,
@@ -1267,6 +1301,7 @@ impl Card {
             dumb_backings: Vec::new(),
             virtgpu_imports: Vec::new(),
             property_blobs: Vec::new(),
+            committed_modes: Vec::new(),
             next_property_blob_id: 1,
             vblank_seq: 0,
             next_vblank_ns: 0,
@@ -1791,6 +1826,69 @@ impl Card {
         true
     }
 
+    /// The full timing CRTC `crtc` shows: its committed one, else the
+    /// published timing matching its size and refresh.
+    pub fn committed_timing(&self, crtc: u32) -> Option<crate::drm::ioctl::DrmModeModeInfo> {
+        let c = self.crtcs.iter().find(|c| c.id == crtc)?;
+        let mode = c.mode?;
+        Some(
+            self.committed_modes
+                .iter()
+                .find(|m| m.crtc == crtc)
+                .map(|m| m.timing)
+                .unwrap_or_else(|| self.mode_wire(&mode)),
+        )
+    }
+    /// Record CRTC `crtc`'s committed timing (and the MODE_ID blob naming
+    /// it, if any); `None` forgets it (the CRTC lost its mode).
+    pub fn set_committed_mode(
+        &mut self,
+        crtc: u32,
+        committed: Option<(crate::drm::ioctl::DrmModeModeInfo, Option<u32>)>,
+    ) {
+        self.committed_modes.retain(|m| m.crtc != crtc);
+        if let Some((timing, blob)) = committed {
+            self.committed_modes
+                .push(CommittedMode { crtc, timing, blob });
+        }
+        self.collect_blobs();
+    }
+    /// What CRTC `crtc`'s MODE_ID reads back (`drm_atomic_crtc_get_property`:
+    /// the state's mode blob, 0 without a mode). A mode set without an
+    /// atomic MODE_ID (legacy SETCRTC, the published hardware state) gets a
+    /// kernel blob, as drm_atomic_set_mode_for_crtc creates one.
+    pub fn mode_blob(&mut self, crtc: u32) -> u32 {
+        let Some(timing) = self.committed_timing(crtc) else {
+            return 0;
+        };
+        if let Some(blob) = self
+            .committed_modes
+            .iter()
+            .find(|m| m.crtc == crtc)
+            .and_then(|m| m.blob)
+            .filter(|&b| self.property_blob(b).is_some())
+        {
+            return blob;
+        }
+        let Ok(blob) =
+            self.create_property_blob(crate::drm::ioctl::mode_info_bytes(&timing).to_vec())
+        else {
+            return 0;
+        };
+        // A kernel blob: no file owns or can destroy it; the committed mode
+        // keeps it alive.
+        if let Some(b) = self.property_blobs.iter_mut().find(|b| b.id == blob) {
+            b.user = false;
+        }
+        self.committed_modes.retain(|m| m.crtc != crtc);
+        self.committed_modes.push(CommittedMode {
+            crtc,
+            timing,
+            blob: Some(blob),
+        });
+        blob
+    }
+
     /// Whether a committed color or HDR property names blob `id`.
     fn blob_referenced(&self, id: u32) -> bool {
         #[cfg(feature = "intel")]
@@ -1802,10 +1900,11 @@ impl Card {
             return true;
         }
         id != 0
-            && (self
-                .crtc_color
-                .iter()
-                .any(|c| c.ctm == id || c.gamma_lut == id || c.degamma_lut == id)
+            && (self.committed_modes.iter().any(|m| m.blob == Some(id))
+                || self
+                    .crtc_color
+                    .iter()
+                    .any(|c| c.ctm == id || c.gamma_lut == id || c.degamma_lut == id)
                 || self
                     .native
                     .iter()
@@ -2515,6 +2614,7 @@ impl Card {
             .position(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)?;
         let fb = self.framebuffers.swap_remove(pos);
+        let mut disabled = Vec::new();
         // drm_framebuffer_remove: a plane still scanning this framebuffer is
         // disabled, and with the primary plane its CRTC (atomic_remove_fb
         // also clears the CRTC's mode).
@@ -2526,6 +2626,10 @@ impl Card {
             crtc.primary_fb = None;
             crtc.enabled = false;
             crtc.mode = None;
+            disabled.push(crtc.id);
+        }
+        for crtc in disabled {
+            self.set_committed_mode(crtc, None);
         }
         for p in self
             .native_planes

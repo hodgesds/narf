@@ -2623,28 +2623,7 @@ fn handle_getresources(
 /// Layout: clock u32, {h,v}* u16×10, vrefresh u32, flags u32, type u32,
 /// name[32]. `DrmModeModeInfo` isn't repr(C), so we lay it out by hand.
 fn mode_to_bytes(m: &crate::drm::ioctl::DrmModeModeInfo) -> [u8; 68] {
-    let mut b = [0u8; 68];
-    b[0..4].copy_from_slice(&m.clock.to_le_bytes());
-    let u16s = [
-        m.hdisplay,
-        m.hsync_start,
-        m.hsync_end,
-        m.htotal,
-        m.hskew,
-        m.vdisplay,
-        m.vsync_start,
-        m.vsync_end,
-        m.vtotal,
-        m.vscan,
-    ];
-    for (i, v) in u16s.iter().enumerate() {
-        b[4 + i * 2..6 + i * 2].copy_from_slice(&v.to_le_bytes());
-    }
-    b[24..28].copy_from_slice(&m.vrefresh.to_le_bytes());
-    b[28..32].copy_from_slice(&m.flags.to_le_bytes());
-    b[32..36].copy_from_slice(&m.r#type.to_le_bytes());
-    b[36..68].copy_from_slice(&m.name);
-    b
+    crate::drm::ioctl::mode_info_bytes(m)
 }
 
 /// DRM_IOCTL_MODE_GETCONNECTOR — connector info + the libdrm two-pass
@@ -3021,11 +3000,10 @@ fn handle_getcrtc(
         out[28..32].copy_from_slice(&gamma_size.to_le_bytes());
         let mode_valid: u32 = crtc.mode.is_some() as u32;
         out[32..36].copy_from_slice(&mode_valid.to_le_bytes());
-        match &crtc.mode {
-            Some(m) => {
-                let wire = card.mode_wire(m);
-                out[36..104].copy_from_slice(&mode_to_bytes(&wire));
-            }
+        // The committed timing (drm_crtc_state::mode), not the first
+        // published timing of the same size and refresh.
+        match card.committed_timing(crtc_id) {
+            Some(wire) => out[36..104].copy_from_slice(&mode_to_bytes(&wire)),
             None => out[36..104].fill(0),
         }
     }
@@ -4782,7 +4760,7 @@ fn handle_obj_getproperties(
     let obj_type = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
 
     let (props, values): (Vec<u32>, Vec<u64>) = {
-        let card = mode_state.lock();
+        let mut card = mode_state.lock();
         // A native card's plane (primary or overlay): the core plane
         // properties from its state, then amdgpu_dm's.
         #[cfg(feature = "amdgpu")]
@@ -4921,6 +4899,9 @@ fn handle_obj_getproperties(
             }
             (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
+            // drm_atomic_crtc_get_property: MODE_ID reads back the state's
+            // mode blob (0 without a mode).
+            let mode_blob = card.mode_blob(obj_id);
             let crtc = card.crtc(obj_id).map_err(|_| invalid_at(line!()))?;
             let mut props = vec![
                 CRTC_ACTIVE_PROP_ID,
@@ -4929,7 +4910,7 @@ fn handle_obj_getproperties(
             ];
             // OUT_FENCE_PTR reads back as 0 (write-only request),
             // matching drm_atomic_crtc_get_property.
-            let mut values = vec![crtc.enabled as u64, 0, 0];
+            let mut values = vec![crtc.enabled as u64, u64::from(mode_blob), 0];
             if let Some(vrr) = crtc_vrr_enabled(&card, obj_id) {
                 props.push(CRTC_VRR_ENABLED_PROP_ID);
                 values.push(u64::from(vrr));
@@ -5486,6 +5467,9 @@ fn atomic_commit(
 
     // The exact timing an atomic MODE_ID set, for the native display.
     let mut native_modes: Vec<(u32, crate::drm::ioctl::DrmModeModeInfo)> = Vec::new();
+    // MODE_ID blob each CRTC names in this request (0: none), recorded as
+    // its committed mode blob (drm_crtc_state::mode_blob).
+    let mut mode_blob_ids: Vec<(u32, u32)> = Vec::new();
     let mut state = crate::drm::atomic::AtomicState {
         allow_modeset: req.flags & ALLOW_MODESET != 0,
         ..Default::default()
@@ -5694,6 +5678,11 @@ fn atomic_commit(
                             crtc_state.active = value != 0;
                         }
                         CRTC_MODE_ID_PROP_ID => {
+                            mode_blob_ids.retain(|(id, _)| *id != object_id);
+                            mode_blob_ids.push((object_id, value as u32));
+                            if value == 0 {
+                                native_modes.retain(|(id, _)| *id != object_id);
+                            }
                             crtc_state.mode = if value == 0 {
                                 None
                             } else {
@@ -5756,7 +5745,18 @@ fn atomic_commit(
                 // completed old/new CRTC states; merely including MODE_ID or
                 // ACTIVE in an atomic request does not require ALLOW_MODESET.
                 // KWin relies on this for its TEST_ONLY no-modeset probe.
-                crtc_state.mode_changed = crtc_state.mode != old_mode;
+                // drm_mode_equal: a new MODE_ID of the same size and refresh
+                // but another timing (CTA 594 MHz vs RB 533.25 MHz 4K60) is
+                // still a mode change.
+                let timing_changed = crtc_state.mode.is_some()
+                    && native_modes
+                        .iter()
+                        .find(|(id, _)| *id == object_id)
+                        .is_some_and(|(_, wire)| {
+                            card.committed_timing(object_id)
+                                .is_none_or(|old| !crate::drm::card::mode_equal(&old, wire))
+                        });
+                crtc_state.mode_changed = crtc_state.mode != old_mode || timing_changed;
                 crtc_state.active_changed = crtc_state.active != old_active;
                 if let Some(crtc_ids) = event_crtc_ids.as_mut() {
                     if !crtc_ids.contains(&crtc_state.id) {
@@ -6119,6 +6119,20 @@ fn atomic_commit(
                     "  drm: ATOMIC commit failed: {error:?}"
                 );
                 return Err(invalid_at(line!()));
+            }
+            // drm_crtc_state::mode / mode_blob: the full committed timing
+            // and the blob naming it; a CRTC without a mode forgets both.
+            for crtc in &state.crtcs {
+                if crtc.mode.is_none() {
+                    card.set_committed_mode(crtc.id, None);
+                } else if let Some((_, wire)) = native_modes.iter().find(|(id, _)| *id == crtc.id) {
+                    let blob = mode_blob_ids
+                        .iter()
+                        .find(|(id, _)| *id == crtc.id)
+                        .map(|&(_, b)| b)
+                        .filter(|&b| b != 0);
+                    card.set_committed_mode(crtc.id, Some((*wire, blob)));
+                }
             }
             #[cfg(feature = "amdgpu")]
             crate::drm_native_planes::commit(&mut card, &state);
