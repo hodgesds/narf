@@ -241,8 +241,19 @@ pub fn apply_routed_vrr(
         refresh_hz: w.vrefresh as u16,
         bpp: 32,
     };
+    // DRM state changes through commits only. While a client holds DRM
+    // master, its committed CRTC/encoder state stands whatever the
+    // hardware shows mid-convergence; the hardware state is published as
+    // the DRM state only at a topology rebuild or with no master (boot and
+    // the console after lastclose, where Linux's fbdev restore makes the
+    // CRTC state match the lit display).
+    let publish_routing = !same || !card.has_master();
     for (k, sink) in crtcs.iter().enumerate() {
+        if !publish_routing {
+            break;
+        }
         let mode = sink.map(|s| to_mode(&timing_wire(s.timing)));
+        let shown = sink.map(|s| timing_wire(s.timing));
         if let Ok(crtc) = card.crtc_mut(crtc_id(k)) {
             crtc.mode = mode;
             crtc.enabled = mode.is_some();
@@ -250,6 +261,7 @@ pub fn apply_routed_vrr(
                 crtc.primary_fb = None;
             }
         }
+        card.set_committed_mode(crtc_id(k), shown.map(|t| (t, None)));
     }
     card.vrr_enabled = match vrr_capable {
         Some(_) => (0..crtcs.len())
@@ -308,6 +320,7 @@ pub fn apply_routed_vrr(
             .encoders
             .iter_mut()
             .find(|e| e.id == encoder_id(c.index))
+            .filter(|_| publish_routing)
         {
             e.crtc_id = c.crtc.filter(|&k| k < crtcs.len()).map(crtc_id);
         }

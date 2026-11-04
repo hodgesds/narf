@@ -1382,15 +1382,15 @@ impl Card {
         }
     }
 
+    /// Whether any open currently holds DRM master.
+    pub fn has_master(&self) -> bool {
+        self.current_master.is_some()
+    }
+
     /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
     /// `is_master` for the per-ioctl permission gate.
     pub fn is_master(&self, open_id: u64) -> bool {
         self.current_master == Some(open_id)
-    }
-
-    #[cfg(feature = "intel")]
-    pub(crate) fn has_master(&self) -> bool {
-        self.current_master.is_some()
     }
 
     /// `DRM_IOCTL_SET_MASTER`. `Ok` if `open_id` already holds master or the

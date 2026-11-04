@@ -739,3 +739,56 @@ kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_publishes_connector_max_bpc
 );
+
+/// DRM state changes through commits only: while a client holds master,
+/// publishing the hardware's routing (mid-convergence, or after RMFB left
+/// the CRTC lit) leaves the committed CRTC and encoder state alone; with no
+/// master (boot, the console after lastclose) the hardware state is the
+/// DRM state, as fbdev's restore makes it on Linux.
+fn navi48_kms_publish_keeps_committed_state_under_a_master() -> TestResult {
+    let t = cea_1080p();
+    let edid = [0xe; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let connectors = [RoutedConnector {
+        index: 1,
+        kind: ConnectorType::HdmiA,
+        edid: Some(&edid),
+        offered: core::slice::from_ref(&t),
+        crtc: Some(0),
+        possible_crtcs: 0xf,
+    }];
+    let lit_crtcs = [lit(&edid, &t, &[]), None, None, None];
+    apply_routed(&mut card, &lit_crtcs, &connectors);
+    assert!(card.crtc(crtc_id(0)).unwrap().enabled);
+    // A client takes master and commits the CRTC off (as RMFB does).
+    card.master_open(7);
+    {
+        let crtc = card.crtc_mut(crtc_id(0)).unwrap();
+        crtc.enabled = false;
+        crtc.mode = None;
+    }
+    card.encoders[0].crtc_id = None;
+    // The hardware still shows the sink: publishing must not re-enable it.
+    apply_routed(&mut card, &lit_crtcs, &connectors);
+    if card.crtc(crtc_id(0)).unwrap().enabled || card.encoders[0].crtc_id.is_some() {
+        return TestResult::Fail("publication overwrote a master's committed state");
+    }
+    // Connector status/modes still refresh under a master.
+    if card.connector(connector_id(1)).unwrap().modes.is_empty() {
+        return TestResult::Fail("connector modes not refreshed");
+    }
+    // Master released: the lit hardware is published as the DRM state.
+    card.master_release(7);
+    apply_routed(&mut card, &lit_crtcs, &connectors);
+    if !card.crtc(crtc_id(0)).unwrap().enabled
+        || card.encoders[0].crtc_id != Some(crtc_id(0))
+        || card.committed_timing(crtc_id(0)).map(|m| m.clock) != Some(timing_wire(&t).clock)
+    {
+        return TestResult::Fail("masterless publication did not restore the lit state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_publish_keeps_committed_state_under_a_master
+);
