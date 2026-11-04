@@ -52,6 +52,23 @@
 //!   frames on unknown dynamic CIDs are dropped and counted, as is
 //!   initiating pairing (`smp::Initiator` needs an application policy
 //!   trigger that does not exist yet).
+//! - LE Advertising Report (while scanning) → the central peer table.
+//! - Command Complete / Command Status for the scan/connect opcodes
+//!   → the central phase machine: parameters accepted enables the
+//!   scan, disable accepted issues a deferred Create Connection, a
+//!   refused command drops the phase back to Idle.
+//!
+//! ## Central initiation (issue #1312)
+//!
+//! [`central_start_scan`] / [`central_stop_scan`] /
+//! [`central_connect`] issue the LE scan + Create Connection commands
+//! through the pump's own send path, sequenced on the controller's
+//! completions, never on host assumption. [`central_phase`] /
+//! [`central_peers`] expose the state for a future mgmt/userspace
+//! trigger lane. What this deliberately does NOT do: ATT/GATT client
+//! traffic after connect (#1313), pairing initiation (#888), or a
+//! host-initiated disconnect — the connection is tracked like any
+//! other pump connection and torn down on Disconnection Complete.
 //!
 //! ## Lifecycle
 //!
@@ -77,9 +94,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::att;
 use crate::controller::ControllerInfo;
 use crate::event::{
-    DisconnectionComplete, EventCode, LeConnectionComplete, LeLongTermKeyRequest,
-    NumberOfCompletedPackets,
+    parse_le_advertising_reports, CommandComplete, CommandStatus, DisconnectionComplete, EventCode,
+    LeConnectionComplete, LeLongTermKeyRequest, NumberOfCompletedPackets,
 };
+use crate::gap::{self, CentralPhase};
 use crate::gatt_server::GattServer;
 use crate::hci::{AclData, Command, Event};
 use crate::l2cap::{
@@ -359,6 +377,17 @@ pub struct PumpCore {
     servers: ServerRegistry,
     /// SDP record database, shared by all connections.
     sdp: SdpServer,
+    /// GAP central initiator state (issue #1312): scan discovery +
+    /// outbound connection setup. Driven by `dispatch_event` for
+    /// inbound reports/completions and by the `central_*` API for
+    /// outbound issuance.
+    central: gap::Central,
+    /// Connection parameters waiting on scan-disable completion:
+    /// `central_connect` from Scanning issues Set_Scan_Enable(0)
+    /// first and only issues LE_Create_Connection once the disable
+    /// completes, so the controller is never asked to initiate
+    /// while it is still scanning.
+    pending_connect: Option<gap::CreateConnection>,
     /// Encoded outbound ACL packets awaiting flow-control credits.
     pending_acl: VecDeque<Vec<u8>>,
     /// Controller-wide ACL packets currently with the controller.
@@ -372,6 +401,7 @@ impl fmt::Debug for PumpCore {
             .field("index", &self.index)
             .field("info", &self.info)
             .field("connections", &self.connections.len())
+            .field("central_phase", &self.central.phase)
             .field("pending_acl", &self.pending_acl.len())
             .field("acl_in_flight", &self.acl_in_flight)
             .finish_non_exhaustive()
@@ -401,6 +431,8 @@ impl PumpCore {
             gatt,
             servers: ServerRegistry::new(),
             sdp: SdpServer::new(),
+            central: gap::Central::new(),
+            pending_connect: None,
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
             stats: PumpStats::default(),
@@ -524,6 +556,160 @@ impl PumpCore {
     }
 }
 
+/// Errors from the GAP central initiator API (issue #1312).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CentralError {
+    /// No pump registered for this controller index.
+    NoPump,
+    /// A pump step currently owns the core; retry after the step.
+    Busy,
+    /// The central state machine is in a phase that forbids this call.
+    WrongPhase,
+    /// The transport rejected the HCI command.
+    Transport,
+}
+
+impl PumpCore {
+    /// Begin LE discovery: issue LE Set Scan Parameters (Vol 4 Part E
+    /// §7.8.10). The follow-up LE Set Scan Enable(1) is issued from
+    /// `dispatch_event` once the parameters complete successfully,
+    /// so the controller never receives Enable before its parameters
+    /// are accepted. Only from Idle.
+    pub fn central_start_scan(&mut self, params: gap::ScanParameters) -> Result<(), CentralError> {
+        if self.central.phase != CentralPhase::Idle {
+            return Err(CentralError::WrongPhase);
+        }
+        self.send_command(op::HCI_LE_SET_SCAN_PARAMETERS, &params.encode())
+            .map_err(|_| CentralError::Transport)?;
+        self.central.note_parameters_sent();
+        Ok(())
+    }
+
+    /// Stop LE discovery: issue LE Set Scan Enable(0) (§7.8.11).
+    /// Only from Scanning; completion returns the phase to Idle.
+    pub fn central_stop_scan(&mut self) -> Result<(), CentralError> {
+        if self.central.phase != CentralPhase::Scanning {
+            return Err(CentralError::WrongPhase);
+        }
+        self.send_command(
+            op::HCI_LE_SET_SCAN_ENABLE,
+            &gap::ScanEnable {
+                enable: false,
+                filter_duplicates: false,
+            }
+            .encode(),
+        )
+        .map_err(|_| CentralError::Transport)?;
+        self.central.note_scan_stopping();
+        self.pending_connect = None;
+        Ok(())
+    }
+
+    /// Connect to a peer (§7.8.12). From Scanning this first issues
+    /// Set_Scan_Enable(0) and defers LE_Create_Connection until the
+    /// disable completes; from Idle it issues LE_Create_Connection
+    /// directly. Forbidden while a setup is already in flight or a
+    /// central connection is established.
+    pub fn central_connect(
+        &mut self,
+        peer_address_type: gap::PeerAddressType,
+        peer_address: [u8; 6],
+    ) -> Result<(), CentralError> {
+        match self.central.phase {
+            CentralPhase::Scanning => {
+                self.send_command(
+                    op::HCI_LE_SET_SCAN_ENABLE,
+                    &gap::ScanEnable {
+                        enable: false,
+                        filter_duplicates: false,
+                    }
+                    .encode(),
+                )
+                .map_err(|_| CentralError::Transport)?;
+                self.pending_connect = Some(gap::CreateConnection::to_peer(
+                    peer_address_type,
+                    peer_address,
+                ));
+                self.central.note_scan_stopping();
+                Ok(())
+            }
+            CentralPhase::Idle => {
+                let cc = gap::CreateConnection::to_peer(peer_address_type, peer_address);
+                self.send_command(op::HCI_LE_CREATE_CONNECTION, &cc.encode())
+                    .map_err(|_| CentralError::Transport)?;
+                self.central.note_connecting();
+                Ok(())
+            }
+            _ => Err(CentralError::WrongPhase),
+        }
+    }
+
+    /// Advance the central state machine on a completed scan/connect
+    /// command. Shared by the Command Complete and Command Status
+    /// arms: scan commands return Complete, while Create Connection
+    /// returns Status first and completes later via LE Connection
+    /// Complete.
+    fn on_central_command_done(&mut self, opcode: u16, status: u8) {
+        match opcode {
+            op::HCI_LE_SET_SCAN_PARAMETERS => {
+                if self.central.phase == CentralPhase::ParametersSent {
+                    if status == 0 {
+                        // Parameters accepted: enable scanning now.
+                        if self
+                            .send_command(
+                                op::HCI_LE_SET_SCAN_ENABLE,
+                                &gap::ScanEnable {
+                                    enable: true,
+                                    filter_duplicates: false,
+                                }
+                                .encode(),
+                            )
+                            .is_ok()
+                        {
+                            self.central.note_scanning();
+                        } else {
+                            self.central.phase = CentralPhase::Idle;
+                        }
+                    } else {
+                        self.central.phase = CentralPhase::Idle;
+                    }
+                }
+            }
+            op::HCI_LE_SET_SCAN_ENABLE => {
+                if self.central.phase == CentralPhase::ScanStopping {
+                    if status == 0 {
+                        match self.pending_connect.take() {
+                            Some(cc) => {
+                                if self
+                                    .send_command(op::HCI_LE_CREATE_CONNECTION, &cc.encode())
+                                    .is_ok()
+                                {
+                                    self.central.note_connecting();
+                                } else {
+                                    self.central.phase = CentralPhase::Idle;
+                                }
+                            }
+                            None => self.central.phase = CentralPhase::Idle,
+                        }
+                    } else {
+                        // Disable refused: drop the deferred connect
+                        // rather than issue it against a controller
+                        // that may still be scanning.
+                        self.pending_connect = None;
+                        self.central.phase = CentralPhase::Idle;
+                    }
+                }
+            }
+            op::HCI_LE_CREATE_CONNECTION => {
+                if self.central.phase == CentralPhase::Connecting && status != 0 {
+                    self.central.phase = CentralPhase::Idle;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── Event dispatch ──────────────────────────────────────────────────
 
 impl PumpCore {
@@ -556,6 +742,12 @@ impl PumpCore {
         match event.code {
             code if code == EventCode::LeMeta as u8 => {
                 if let Some(cc) = LeConnectionComplete::parse(event) {
+                    // Initiator-role completions drive the central
+                    // state machine; inbound (peripheral-role)
+                    // connections while Idle leave it alone.
+                    if self.central.phase == CentralPhase::Connecting {
+                        self.central.note_connection_complete(cc.status, cc.handle);
+                    }
                     if cc.status == 0 {
                         let mut peer = [0u8; 7];
                         peer[0] = cc.peer_address_type;
@@ -574,6 +766,22 @@ impl PumpCore {
                         op::HCI_LE_LTK_REQUEST_NEGATIVE_REPLY,
                         &req.handle.to_le_bytes(),
                     );
+                }
+                // Discovery reports feed the central peer table while
+                // scanning (§7.7.65.2). Malformed reports parse to
+                // None and are dropped, never recorded.
+                if self.central.phase == CentralPhase::Scanning {
+                    if let Some(reports) = parse_le_advertising_reports(event) {
+                        for r in reports {
+                            self.central.report_advertisement(
+                                r.address_type,
+                                r.address,
+                                r.event_type,
+                                &r.data,
+                                r.rssi,
+                            );
+                        }
+                    }
                 }
             }
             code if code == EventCode::ConnectionComplete as u8 => {
@@ -594,6 +802,9 @@ impl PumpCore {
                 if let Some(dc) = DisconnectionComplete::parse(event) {
                     self.connections.retain(|c| c.handle != dc.handle);
                     self.sysfs_track_disconnect(dc.handle);
+                    if self.central.connected_handle == Some(dc.handle) {
+                        self.central.note_disconnected();
+                    }
                 }
             }
             code if code == EventCode::NumberOfCompletedPackets as u8 => {
@@ -601,6 +812,21 @@ impl PumpCore {
                     for (_handle, count) in nocp.entries {
                         self.acl_in_flight = self.acl_in_flight.saturating_sub(u32::from(count));
                     }
+                }
+            }
+            code if code == EventCode::CommandComplete as u8 => {
+                // Scan/connect sequencing lives here: the central
+                // state machine advances only on the controller's
+                // own completion, never on host assumption.
+                if let Some(cc) = CommandComplete::parse(event) {
+                    if let Some(status) = cc.status() {
+                        self.on_central_command_done(cc.opcode, status);
+                    }
+                }
+            }
+            code if code == EventCode::CommandStatus as u8 => {
+                if let Some(cs) = CommandStatus::parse(event) {
+                    self.on_central_command_done(cs.opcode, cs.status);
                 }
             }
             code if code == EventCode::EncryptionChange as u8 => {
@@ -1351,6 +1577,82 @@ pub fn stats(index: usize) -> Option<PumpStats> {
     Some(slot.stats)
 }
 
+// ── GAP central initiator API (issue #1312) ─────────────────────────
+
+/// Run `f` against controller `index`'s core with the slot lock
+/// released — the same take-out pattern as [`pump_once`], so no
+/// `IrqSafeSpinLock` is ever held across transport I/O. The core is
+/// restored even when `f` reports an error.
+fn with_pump_core<T>(index: usize, f: impl FnOnce(&mut PumpCore) -> T) -> Result<T, CentralError> {
+    let mut core = {
+        let mut pumps = PUMPS.lock();
+        let Some(slot) = find_slot_mut(&mut pumps, index) else {
+            return Err(CentralError::NoPump);
+        };
+        match slot.core.take() {
+            Some(core) => core,
+            None => return Err(CentralError::Busy),
+        }
+    };
+    let out = f(&mut core);
+    let mut pumps = PUMPS.lock();
+    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+        slot.core = Some(core);
+    }
+    Ok(out)
+}
+
+/// Begin LE discovery on controller `index`: issue LE Set Scan
+/// Parameters; Set Scan Enable(1) follows on completion. Only from
+/// Idle. This is the trigger surface a future mgmt/userspace lane
+/// will call; today it is fixture-driven.
+pub fn central_start_scan(index: usize, params: gap::ScanParameters) -> Result<(), CentralError> {
+    with_pump_core(index, |core| core.central_start_scan(params))?
+}
+
+/// Stop LE discovery on controller `index`. Only from Scanning.
+pub fn central_stop_scan(index: usize) -> Result<(), CentralError> {
+    with_pump_core(index, |core| core.central_stop_scan())?
+}
+
+/// Connect to a discovered peer from controller `index`. From
+/// Scanning the scan is disabled first and LE_Create_Connection
+/// follows on the disable completion; from Idle the connection is
+/// issued directly.
+pub fn central_connect(
+    index: usize,
+    peer_address_type: gap::PeerAddressType,
+    peer_address: [u8; 6],
+) -> Result<(), CentralError> {
+    with_pump_core(index, |core| {
+        core.central_connect(peer_address_type, peer_address)
+    })?
+}
+
+/// Current GAP central phase for controller `index`, if its core is
+/// not currently owned by a pump step.
+pub fn central_phase(index: usize) -> Option<CentralPhase> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.central.phase)
+}
+
+/// Peers discovered by controller `index`'s scan, if its core is not
+/// currently owned by a pump step.
+pub fn central_peers(index: usize) -> Option<Vec<gap::DiscoveredPeer>> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.central.peers.clone())
+}
+
 // ── The step ────────────────────────────────────────────────────────
 
 /// Run one bounded pump step for controller `index`: drain events
@@ -1483,6 +1785,13 @@ mod tests {
         }
         fn sent_opcodes(&self) -> Vec<u16> {
             self.sent_commands.lock().iter().map(|c| c.opcode).collect()
+        }
+        fn sent_command_params(&self) -> Vec<(u16, Vec<u8>)> {
+            self.sent_commands
+                .lock()
+                .iter()
+                .map(|c| (c.opcode, c.params.clone()))
+                .collect()
         }
         fn sent_acl_frames(&self) -> Vec<(u16, BFrame)> {
             self.sent_acl
@@ -3603,4 +3912,339 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_rfcomm_open_data_disconnect);
+
+    /// Command Status event for `opcode` with `status` (§7.7.15).
+    fn cs(opcode: u16, status: u8) -> Event {
+        Event {
+            code: EventCode::CommandStatus as u8,
+            params: alloc::vec![status, 1, (opcode & 0xFF) as u8, (opcode >> 8) as u8],
+        }
+    }
+
+    /// One LE Advertising Report subevent (§7.7.65.2): subevent,
+    /// Num_Reports=1, event type, address type, address, data, RSSI.
+    fn le_advertising_report(
+        event_type: u8,
+        address_type: u8,
+        address: [u8; 6],
+        data: &[u8],
+        rssi: i8,
+    ) -> Event {
+        let mut params = alloc::vec![0x02, 0x01, event_type, address_type];
+        params.extend_from_slice(&address);
+        params.push(data.len() as u8);
+        params.extend_from_slice(data);
+        params.push(rssi as u8);
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// LE Connection Complete as seen by the Central role (§7.7.65.1):
+    /// same layout as the peripheral helper, but role byte 0x00.
+    fn le_connection_complete_central(handle: u16, peer: [u8; 6]) -> Event {
+        let mut params = alloc::vec![0x01, 0x00];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(0x00); // role: Central (we initiated)
+        params.push(0x00); // peer address type: public
+        params.extend_from_slice(&peer);
+        params.extend_from_slice(&0x0028u16.to_le_bytes()); // interval 50 ms
+        params.extend_from_slice(&0u16.to_le_bytes()); // latency
+        params.extend_from_slice(&0x01F4u16.to_le_bytes()); // timeout 5 s
+        params.push(0x00); // central clock accuracy
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    fn central_bring_up(fake: Arc<ScriptedTransport>) -> Result<(), &'static str> {
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            return Err("bring-up against fake controller failed");
+        }
+        Ok(())
+    }
+
+    /// #1312: the full central sequence against a scripted
+    /// controller — scan parameters → enable → reports → disable →
+    /// create connection → complete → disconnect — with the outbound
+    /// command bytes pinned against the Core Specification field
+    /// order, not against the encoders under test.
+    fn smoke_pump_central_scan_connect_sequence() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // 1. Start scan: LE Set Scan Parameters, pinned byte-for-byte
+        // against Vol 4 Part E §7.8.10 (passive, 30 ms / 30 ms,
+        // public address, accept-all).
+        if central_start_scan(0, crate::gap::ScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("central_start_scan rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_params: [u8; 7] = [0x00, 0x30, 0x00, 0x30, 0x00, 0x00, 0x00];
+        if sent.len() != 6
+            || sent[5].0 != op::HCI_LE_SET_SCAN_PARAMETERS
+            || sent[5].1 != expect_params
+        {
+            reset_all();
+            return TestResult::Fail("Set Scan Parameters bytes mismatch");
+        }
+        if central_phase(0) != Some(crate::gap::CentralPhase::ParametersSent) {
+            reset_all();
+            return TestResult::Fail("phase not ParametersSent after start_scan");
+        }
+        // 2. Parameters complete -> Enable(1) issued by the pump.
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        if sent.len() != 7 || sent[6].0 != op::HCI_LE_SET_SCAN_ENABLE || sent[6].1 != [0x01, 0x00] {
+            reset_all();
+            return TestResult::Fail("Set Scan Enable(1) not issued on parameters complete");
+        }
+        if central_phase(0) != Some(crate::gap::CentralPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("phase not Scanning after enable");
+        }
+        // Enable complete itself changes nothing.
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("enable complete moved phase out of Scanning");
+        }
+        // 3. Advertising reports: peer recorded, refresh dedups.
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let ad: [u8; 3] = [0x02, 0x01, 0x06]; // Flags: LE General Discoverable + BR/EDR not supported
+        fake.enqueue_event(le_advertising_report(0x00, 0x00, peer, &ad, -60));
+        let _ = pump_once(0);
+        let peers = central_peers(0).unwrap_or_default();
+        if peers.len() != 1
+            || peers[0].address != peer
+            || peers[0].last_rssi != -60
+            || peers[0].ad_data != ad
+        {
+            reset_all();
+            return TestResult::Fail("advertising report not recorded as peer");
+        }
+        // Same peer, stronger signal: refresh, not duplicate. A
+        // count-only assertion would pass a duplicate bug, so the
+        // length check here is load-bearing.
+        fake.enqueue_event(le_advertising_report(0x00, 0x00, peer, &ad, -50));
+        let _ = pump_once(0);
+        let peers = central_peers(0).unwrap_or_default();
+        if peers.len() != 1 || peers[0].last_rssi != -50 {
+            reset_all();
+            return TestResult::Fail("peer refresh duplicated instead of updating RSSI");
+        }
+        // Same address, random address type: a distinct peer.
+        fake.enqueue_event(le_advertising_report(0x00, 0x01, peer, &ad, -70));
+        let _ = pump_once(0);
+        if central_peers(0).map(|p| p.len()) != Some(2) {
+            reset_all();
+            return TestResult::Fail("same address with random type not a distinct peer");
+        }
+        // 4. Connect: scan disabled first, create follows on completion.
+        if central_connect(0, crate::gap::PeerAddressType::Public, peer).is_err() {
+            reset_all();
+            return TestResult::Fail("central_connect rejected from Scanning");
+        }
+        let sent = fake.sent_command_params();
+        if sent.len() != 8 || sent[7].0 != op::HCI_LE_SET_SCAN_ENABLE || sent[7].1 != [0x00, 0x00] {
+            reset_all();
+            return TestResult::Fail("connect did not disable scan first");
+        }
+        if central_phase(0) != Some(crate::gap::CentralPhase::ScanStopping) {
+            reset_all();
+            return TestResult::Fail("phase not ScanStopping after connect");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        // LE Create Connection, pinned byte-for-byte against Vol 4
+        // Part E §7.8.12: scan interval/window 30 ms, peer-address
+        // policy, public peer, 30..50 ms interval, 4 s timeout.
+        let expect_create: [u8; 25] = [
+            0x30, 0x00, 0x30, 0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x00, 0x18,
+            0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        if sent.len() != 9
+            || sent[8].0 != op::HCI_LE_CREATE_CONNECTION
+            || sent[8].1 != expect_create
+        {
+            reset_all();
+            return TestResult::Fail("LE Create Connection bytes mismatch");
+        }
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connecting) {
+            reset_all();
+            return TestResult::Fail("phase not Connecting after create");
+        }
+        // 5. Command Status (accepted) keeps Connecting; Connection
+        // Complete lands the connection.
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connecting) {
+            reset_all();
+            return TestResult::Fail("accepted Command Status moved phase out of Connecting");
+        }
+        let handle = 0x0041;
+        fake.enqueue_event(le_connection_complete_central(handle, peer));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connected)
+            || connection_count(0) != Some(1)
+        {
+            reset_all();
+            return TestResult::Fail("connection complete did not land central connection");
+        }
+        // 6. Disconnect returns to Idle.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        let ok = connection_count(0) == Some(0)
+            && central_phase(0) == Some(crate::gap::CentralPhase::Idle);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("disconnect did not return central to Idle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_central_scan_connect_sequence);
+
+    /// #1312: failure paths fail closed — a refused scan command
+    /// returns to Idle without issuing Enable (and a retry works),
+    /// malformed reports record nothing, stop-then-connect from Idle
+    /// issues Create directly, and a rejected Create returns to
+    /// Idle with no connection.
+    fn smoke_pump_central_failure_and_malformed() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        if central_start_scan(0, crate::gap::ScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("central_start_scan rejected from Idle");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_PARAMETERS, &[0x0C]));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("refused scan parameters did not return to Idle");
+        }
+        if fake
+            .sent_command_params()
+            .iter()
+            .any(|(o, _)| *o == op::HCI_LE_SET_SCAN_ENABLE)
+        {
+            reset_all();
+            return TestResult::Fail("Enable issued after refused scan parameters");
+        }
+        // Retry works: no wedge from the failure.
+        if central_start_scan(0, crate::gap::ScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("retry start_scan rejected after failure");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("retry scan did not reach Scanning");
+        }
+        // Malformed report (claims 1 report, truncated) records
+        // nothing and panics nothing.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x02, 0x01, 0x00, 0x00],
+        });
+        let _ = pump_once(0);
+        if central_peers(0).map(|p| p.len()) != Some(0) {
+            reset_all();
+            return TestResult::Fail("malformed advertising report recorded a peer");
+        }
+        // Zero-report subevent likewise records nothing.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x02, 0x00],
+        });
+        let _ = pump_once(0);
+        if central_peers(0).map(|p| p.len()) != Some(0) {
+            reset_all();
+            return TestResult::Fail("zero-report subevent recorded a peer");
+        }
+        // Stop the scan, then connect from Idle: Create directly.
+        if central_stop_scan(0).is_err() {
+            reset_all();
+            return TestResult::Fail("central_stop_scan rejected from Scanning");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("scan disable did not return to Idle");
+        }
+        let peer = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5];
+        if central_connect(0, crate::gap::PeerAddressType::Public, peer).is_err() {
+            reset_all();
+            return TestResult::Fail("central_connect rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, _)| *o) != Some(op::HCI_LE_CREATE_CONNECTION)
+            || central_phase(0) != Some(crate::gap::CentralPhase::Connecting)
+        {
+            reset_all();
+            return TestResult::Fail("connect from Idle did not issue Create directly");
+        }
+        // Create rejected by Command Status: Idle, no connection.
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0x0C));
+        let _ = pump_once(0);
+        let ok = central_phase(0) == Some(crate::gap::CentralPhase::Idle)
+            && connection_count(0) == Some(0);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("rejected Create did not return to Idle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_central_failure_and_malformed);
+
+    /// #1312: phase guards reject out-of-order API calls instead of
+    /// issuing commands the controller cannot honour.
+    fn smoke_pump_central_wrong_phase() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let mut ok = central_stop_scan(0) == Err(CentralError::WrongPhase);
+        let peer = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5];
+        ok &= central_connect(0, crate::gap::PeerAddressType::Public, peer).is_ok();
+        ok &= central_phase(0) == Some(crate::gap::CentralPhase::Connecting);
+        ok &= central_start_scan(0, crate::gap::ScanParameters::default())
+            == Err(CentralError::WrongPhase);
+        ok &= central_connect(0, crate::gap::PeerAddressType::Public, peer)
+            == Err(CentralError::WrongPhase);
+        ok &= central_stop_scan(0) == Err(CentralError::WrongPhase);
+        ok &= central_phase(99).is_none() && central_peers(99).is_none();
+        // No extra commands beyond bring-up + the one direct Create.
+        ok &= fake.sent_command_params().len() == 6;
+        reset_all();
+        if !ok {
+            return TestResult::Fail("wrong-phase call issued a command or wrong error");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_central_wrong_phase);
 }

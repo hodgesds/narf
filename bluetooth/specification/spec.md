@@ -201,6 +201,18 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Connection tracking also mirrors into sysfs: connect gains the
   `hci<N>:<handle>` child, disconnect removes it (issue #891).
   `pump::stop_pump(index)` quiesces a controller's task ahead of detach.
+  GAP central initiation (issue #1312): `pump::central_start_scan(index,
+  params)` issues LE Set Scan Parameters (§7.8.10) with LE Set Scan
+  Enable(1) (§7.8.11) following on the parameters' Command Complete;
+  LE Advertising Reports received while scanning feed the
+  `gap::Central` peer table (`pump::central_peers`); `pump::central_connect`
+  disables the scan first and issues LE Create Connection (§7.8.12) on
+  the disable completion (or directly from Idle), and LE Connection
+  Complete lands the connection like any other pump connection.
+  `pump::central_phase` exposes the initiator phase. Out of scope
+  here: ATT/GATT client traffic after connect (#1313), pairing
+  initiation (#888), host-initiated disconnect, and any mgmt/userspace
+  trigger for these calls (future lane).
 
 ## Scope
 
