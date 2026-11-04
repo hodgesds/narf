@@ -3330,6 +3330,24 @@ chip diagnostic (no firmware owner is built for it yet).
   `smoke_rtl8723ae_init_mac_post_flow_ephy`,
   `smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow` (written,
   unexecuted).
+- `c2h` — the firmware-event mailbox (`rtl_8723e_c2h_command_handle`,
+  `hal_btc.c:1690`): header byte at `REG_C2HEVT_MSG_NORMAL` (`0x01A0`,
+  id low nibble / len high nibble, sequence at `0x01A1`, body from
+  `0x01A2`) with the `0x01AF` close-byte protocol (already
+  `C2H_EVT_HOST_CLOSE` `0x00` → nothing read or written; anything other
+  than `C2H_EVT_FW_CLOSE` `0xFF` → `0x00` written, body unread;
+  firmware-closed → body read, dispatched, closed with `0x00`).
+  `C2H_V0_BT_RSSI` (4) / `C2H_V0_BT_OP_MODE` (5) / unknown ids are
+  consumed without effect; `C2H_V0_BT_INFO` (12) parses via
+  `rtl8723e_dm_bt_parse_bt_info` (original byte 0, retry byte 1 when the
+  body is at least 2 bytes, inquiry page bit 2, connection bit 0) and
+  returns the four fields as `BtInfo` for the future coexistence owner
+  (the `btc_periodical` trigger and `bt_busy` / idle-state updates are
+  that owner's duty). No production caller yet: the future AE packet
+  owner schedules `c2h::drain` when `irq::IsrStatus::c2h_pending` is set,
+  mirroring the `pci.c` fwevt gate, which is 8723AE-only. Tests
+  `smoke_rtl8723ae_c2h_mailbox_close_protocol`,
+  `smoke_rtl8723ae_c2h_mailbox_bt_info` (written, unexecuted).
 
 ## 4. Invariants
 

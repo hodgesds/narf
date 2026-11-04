@@ -11,7 +11,7 @@ ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wirele
 cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	534
 rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes	feature	drivers/wireless/specification/rtlwifi.md	1586
 rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rtl8192de dual-MAC per-function runtime (shared MAC/PHY ownership, dual-band tables) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1477
-rtlwifi	rtl8723ae	RTL8723AE retained runtime; blocked on porting the rtl8723ae runtime (firmware event mailbox, BT coexistence) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
+rtlwifi	rtl8723ae	RTL8723AE retained runtime: firmware-event mailbox ported (c2h drain + BT info parse, implemented-not-wired); still open: BT coexistence mechanism, signed envelopes, packet-path admission	chip	drivers/wireless/specification/rtlwifi.md	3333
 rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be runtime (C2H packets, BT coexistence, antenna path) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
 rtw89	eht	EHT operation on RTL8922A (step 1 done: width programming + EHT PHY programs in eht.rs; still open: station owner, MCS/NSS maps, TXWD_INFO EHT fields)	feature	drivers/wireless/specification/rtw89.md	4514
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2257
