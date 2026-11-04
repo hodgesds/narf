@@ -2564,6 +2564,45 @@ no failures. It covered the OA, EU-stall, user, Xe, GuC-GT, GuC-boot, RCS, GT,
 media-GT and render prefixes. None of this has run on physical Intel
 hardware.
 
+### i915 context parameter errnos and execbuffer2 argument order — targeted release gates recorded
+
+i915 now follows Linux in these places:
+- **GEM_CONTEXT_GETPARAM/SETPARAM:** per-parameter errnos. The context lookup
+  comes first, then size, capability, range and `capable()`, each only where
+  Linux asks.
+- **SETPARAM VM on a finalized context:** EINVAL, as Linux's `ctx_setparam`
+  has no VM case. NARF's live VM rebinding is gone.
+- **execbuffer2:** its arguments are checked and copied before any fence is
+  touched. `rsvd2` is ignored without the fence flags.
+- **Fence arrays:** `access_ok` is bounded by Linux's per-arch `USER_PTR_MAX`.
+
+I915_SCHEDULER_CAP_PRIORITY stays unadvertised. HAS_SCHEDULER reports
+ENABLED only, so every in-size PRIORITY set is ENODEV, as on a Linux device
+without CAP_PRIORITY. Open items:
+- The i915 priority → GuC mapping is not wired, and CAP_PRIORITY stays
+  unadvertised until it is.
+- NARF's default i915 GuC priority (3) differs from Linux's
+  `map_i915_prio_to_guc_prio`, which maps I915_PRIORITY_NORMAL to
+  GUC_CLIENT_PRIORITY_KMD_NORMAL (2).
+
+The integration made three changes:
+- Restored ENABLED-only HAS_SCHEDULER, per the coordinator.
+- CAP_SYS_NICE is now asked only after the PRIORITY capability check, as in
+  `validate_priority`.
+- Two fixtures were fixed: a capability-record reset between the
+  context-param passes, and a Clippy type alias.
+
+Open `access_ok` findings, not changed by this unit:
+- `drm_ioctl_bridge.rs` `USER_VA_LIMIT = 1 << 47` is one page past
+  x86_64's `USER_PTR_MAX` and half of arm64's. It also refuses null, which
+  Linux's `access_ok` accepts.
+- `userspace/src/handlers/compat.inc.rs` has the same limit.
+
+One targeted release run passed 117 tests with no failures. It covered the
+render, user, i915-balance, UAPI, BCS8, i915-async and context prefixes.
+The `intel_gpu_i915_info` prefix holds no tests of its own; that file's tests
+register under render.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
