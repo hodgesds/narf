@@ -341,6 +341,50 @@ const REG_EXTCNF_CTRL: u64 = 0x0F00;
 /// `E1000_EXTCNF_CTRL_SWFLAG` — software-owns-the-PHY flag.
 const EXTCNF_CTRL_SWFLAG: u32 = 1 << 5;
 
+// MDIC (MDI Control) — PHY register access via MDIO. The 8254x SDM
+// §13.4.19 register (offset 0x0020) carries one MDIO transaction:
+// data in bits 15:0, register address in bits 20:16, PHY address in
+// bits 25:21, opcode in bits 27:26 (01 = write, 10 = read), READY in
+// bit 28, ERROR in bit 30. Values match Linux `e1000_hw.h`
+// (`E1000_MDIC_*`) and the igb crate's in-tree MDIC constants
+// (`drivers/net/igb/src/igb.rs`); the internal copper PHY lives at
+// PHY address 1 on every bound part (Linux classic e1000 uses
+// phy_addr 1 for all non-CE4100 parts; igb hardcodes the same).
+/// `E1000_MDIC` — MDI Control.
+const REG_MDIC: u64 = 0x0020;
+/// `E1000_MDIC_DATA_MASK` — data field of an MDIC word.
+const MDIC_DATA_MASK: u32 = 0x0000_FFFF;
+/// `E1000_MDIC_REG_SHIFT` — register-address field shift.
+const MDIC_REG_SHIFT: u32 = 16;
+/// `E1000_MDIC_PHY_SHIFT` — PHY-address field shift.
+const MDIC_PHY_SHIFT: u32 = 21;
+/// Internal-PHY address (1) placed in the MDIC PHY field.
+const MDIC_PHY_ADDR: u32 = 1 << MDIC_PHY_SHIFT;
+/// `E1000_MDIC_OP_WRITE` — MDIC write opcode.
+const MDIC_OP_WRITE: u32 = 0x0400_0000;
+/// `E1000_MDIC_OP_READ` — MDIC read opcode.
+const MDIC_OP_READ: u32 = 0x0800_0000;
+/// `E1000_MDIC_READY` — transaction-complete bit.
+const MDIC_READY: u32 = 1 << 28;
+/// `E1000_MDIC_ERROR` — transaction-error bit (read path only).
+const MDIC_ERROR: u32 = 1 << 30;
+
+// IEEE 802.3 Clause 22 PHY registers (standard, not vendor-specific):
+// 1 = BMSR (status), 2 = PHYSID1, 3 = PHYSID2. (BMCR, register 0, is
+// intentionally not defined here: autoneg programming is a follow-up
+// item, and an unused constant would trip the dead-code lint.)
+/// PHY basic-mode status register.
+const PHY_BMSR: u32 = 1;
+/// PHY identifier register 1 (OUI bits 3–18).
+const PHY_ID1: u32 = 2;
+/// PHY identifier register 2 (OUI bits 19–24, model, revision).
+const PHY_ID2: u32 = 3;
+/// BMSR link-status bit. Latch-low per IEEE 802.3 §22.2.4.2: once the
+/// link drops the bit sticks at 0 until read, so a single read can
+/// report a stale down — readers take two consecutive reads and
+/// trust the second.
+const BMSR_LINK: u16 = 1 << 2;
+
 // EEE (Energy Efficient Ethernet) — IEEE 802.3az. On I218/I219 the
 // MAC negotiates EEE LPI with its link partner; when the partner
 // (a dock or switch ASIC) pushes aggressive EEE during init while
@@ -1080,6 +1124,13 @@ pub enum E1000Error {
     /// Management Engine never released the PHY. Bring-up gives up
     /// rather than risk a wedged PHY register read.
     PhyOwnershipTimeout,
+    /// MDIC transaction never set READY within the poll budget.
+    PhyMdioTimeout,
+    /// MDIC transaction completed with the ERROR bit set (read path).
+    PhyMdioError,
+    /// No PHY answered the MDIC identification read (ID1/ID2 read
+    /// all-ones, the MDIO pull-up signature, or all-zeros).
+    PhyNotPresent,
     /// Catch-all.
     Other(&'static str),
 }
@@ -1239,6 +1290,97 @@ fn release_phy_swflag(mmio: &MmioRegion, owned: bool) {
         let v = mmio.read32(REG_EXTCNF_CTRL);
         mmio.write32(REG_EXTCNF_CTRL, v & !EXTCNF_CTRL_SWFLAG);
     }
+}
+
+/// Build an MDIC read command word for `reg` (internal PHY address 1).
+fn mdic_read_cmd(reg: u32) -> u32 {
+    ((reg & 0x1F) << MDIC_REG_SHIFT) | MDIC_PHY_ADDR | MDIC_OP_READ
+}
+
+/// Build an MDIC write command word for `reg` carrying `data`.
+fn mdic_write_cmd(reg: u32, data: u16) -> u32 {
+    (data as u32) | ((reg & 0x1F) << MDIC_REG_SHIFT) | MDIC_PHY_ADDR | MDIC_OP_WRITE
+}
+
+/// Extract the 16-bit data field from a completed MDIC word.
+fn mdic_data(word: u32) -> u16 {
+    (word & MDIC_DATA_MASK) as u16
+}
+
+/// Compose a 32-bit PHY identifier from the PHYSID1/PHYSID2 reads
+/// (Linux `e1000_get_phy_id` shape: ID1 in the high half).
+fn phy_id_from(id1: u16, id2: u16) -> u32 {
+    ((id1 as u32) << 16) | (id2 as u32)
+}
+
+/// `true` unless the ID read is the no-device signature: all-ones
+/// (MDIO pull-ups, nothing answering) or all-zeros.
+fn phy_id_valid(id: u32) -> bool {
+    id != 0 && id != 0xFFFF_FFFF
+}
+
+/// Decode the BMSR link-status bit (single-read value; callers that
+/// need latch-low-correct state use `E1000::phy_link_up`).
+fn bmsr_link(bmsr: u16) -> bool {
+    bmsr & BMSR_LINK != 0
+}
+
+/// Read a 16-bit register from the internal PHY via MDIC.
+///
+/// Linux: classic `e1000_read_phy_reg` MDIC branch
+/// (`e1000_hw.c`): write the OP_READ command word, poll READY
+/// (Linux: 64 × 50 µs ≈ 3.2 ms; we use the igb crate's 10 ms
+/// `responsive_spin_until` bound, strictly looser), then fail on
+/// the ERROR bit and return the low 16 bits. No SWFLAG scoping
+/// here — callers (`E1000::phy_read`) own the per-access handshake.
+fn mdic_read(mmio: &MmioRegion, reg: u32) -> Result<u16, E1000Error> {
+    // SAFETY: identity-mapped MMIO; MDIC is inside the e1000 BAR0
+    // register window on every bound part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        mmio.write32(REG_MDIC, mdic_read_cmd(reg));
+    }
+    let ready = narf_scheduler::responsive_spin_until(
+        // SAFETY: identity-mapped MMIO.
+        || unsafe { mmio.read32(REG_MDIC) } & MDIC_READY != 0,
+        narf_time::Deadline::after_ms(10),
+    );
+    if !ready {
+        return Err(E1000Error::PhyMdioTimeout);
+    }
+    // SAFETY: identity-mapped MMIO.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let word = unsafe { mmio.read32(REG_MDIC) };
+    if word & MDIC_ERROR != 0 {
+        return Err(E1000Error::PhyMdioError);
+    }
+    Ok(mdic_data(word))
+}
+
+/// Write a 16-bit value to an internal-PHY register via MDIC.
+///
+/// Linux: classic `e1000_write_phy_reg` MDIC branch: write the
+/// OP_WRITE command word carrying the data, poll READY (Linux:
+/// 641 × 5 µs ≈ 3.2 ms; we use the same 10 ms bound as the read
+/// path). The write path checks READY only — Linux does not test
+/// the ERROR bit here either. No SWFLAG scoping here — callers
+/// (`E1000::phy_write`) own the per-access handshake.
+fn mdic_write(mmio: &MmioRegion, reg: u32, data: u16) -> Result<(), E1000Error> {
+    // SAFETY: identity-mapped MMIO; MDIC is inside the e1000 BAR0
+    // register window on every bound part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        mmio.write32(REG_MDIC, mdic_write_cmd(reg, data));
+    }
+    let ready = narf_scheduler::responsive_spin_until(
+        // SAFETY: identity-mapped MMIO.
+        || unsafe { mmio.read32(REG_MDIC) } & MDIC_READY != 0,
+        narf_time::Deadline::after_ms(10),
+    );
+    if !ready {
+        return Err(E1000Error::PhyMdioTimeout);
+    }
+    Ok(())
 }
 
 /// Disable Energy Efficient Ethernet on PCH parts.
@@ -3434,6 +3576,73 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     Ok(())
 }
 
+impl E1000 {
+    /// Read a 16-bit register from the internal PHY via MDIC, with
+    /// the FWSM/SWFLAG handshake scoped per access (Linux
+    /// `e1000_get_swflag_ich8lan` discipline, and the audit gap-5
+    /// re-scope requirement): acquire, transact, release — even on
+    /// transaction error, so a failed read never leaves the ME
+    /// locked out. On non-PCH parts the handshake is skipped
+    /// entirely (no ME to coordinate with).
+    ///
+    /// Must NOT be called during `bring_up`: bring-up holds SWFLAG
+    /// across init, and this method's release would drop that hold
+    /// early. Post-bring-up only.
+    pub fn phy_read(&self, reg: u32) -> Result<u16, E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = mdic_read(&self.mmio, reg);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    /// Write a 16-bit value to an internal-PHY register via MDIC,
+    /// with the same per-access SWFLAG scoping as [`E1000::phy_read`]
+    /// (and the same do-not-call-during-bring-up constraint).
+    pub fn phy_write(&self, reg: u32, data: u16) -> Result<(), E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = mdic_write(&self.mmio, reg, data);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    /// Read the PHY identifier (PHYSID1/PHYSID2 composed per
+    /// `phy_id_from`). Fails closed with `PhyNotPresent` when the
+    /// read returns the no-device signature rather than inventing
+    /// an identity for an absent PHY.
+    pub fn phy_id(&self) -> Result<u32, E1000Error> {
+        let id1 = self.phy_read(PHY_ID1)?;
+        let id2 = self.phy_read(PHY_ID2)?;
+        let id = phy_id_from(id1, id2);
+        if !phy_id_valid(id) {
+            return Err(E1000Error::PhyNotPresent);
+        }
+        Ok(id)
+    }
+
+    /// Read PHY link status via BMSR. Two consecutive reads: the
+    /// first re-arms the latch-low link bit (IEEE 802.3 §22.2.4.2),
+    /// the second reports live state. This is the PHY-side signal;
+    /// the MAC-side `STATUS.LU` sample that `link_up` reports is a
+    /// separate, already-existing path.
+    pub fn phy_link_up(&self) -> Result<bool, E1000Error> {
+        let _ = self.phy_read(PHY_BMSR)?;
+        let bmsr = self.phy_read(PHY_BMSR)?;
+        Ok(bmsr_link(bmsr))
+    }
+}
+
 mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -3690,6 +3899,7 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_multicast_rar_encoding);
+
     fn smoke_datapath_allowed_gate_matrix() -> TestResult {
         // The gate every datapath entry point uses: only the
         // neither-detached-nor-suspended cell is open.
@@ -3752,4 +3962,51 @@ mod tests {
         "drivers/net/e1000",
         smoke_suspend_words_preserve_bringup_config
     );
+
+    fn smoke_mdic_command_words() -> TestResult {
+        // Read of PHYSID1 (reg 2): OP_READ | phy 1 | reg 2.
+        if super::mdic_read_cmd(super::PHY_ID1) != 0x0822_0000 {
+            return TestResult::Fail("e1000 MDIC read command word wrong");
+        }
+        // Write of 0x1140 to reg 0: OP_WRITE | phy 1 | data.
+        if super::mdic_write_cmd(0, 0x1140) != 0x0420_1140 {
+            return TestResult::Fail("e1000 MDIC write command word wrong");
+        }
+        // Register field is 5 bits: reg 0x3F masks to 0x1F.
+        if super::mdic_read_cmd(0x3F) != (super::MDIC_OP_READ | super::MDIC_PHY_ADDR | (0x1F << 16))
+        {
+            return TestResult::Fail("e1000 MDIC register field not masked to 5 bits");
+        }
+        // Data extraction masks off READY/ERROR/opcode bits.
+        if super::mdic_data(0x5000_1234) != 0x1234 {
+            return TestResult::Fail("e1000 MDIC data field not masked to 16 bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_mdic_command_words);
+
+    fn smoke_phy_id_composition_and_validity() -> TestResult {
+        if super::phy_id_from(0x0141, 0x0CC2) != 0x0141_0CC2 {
+            return TestResult::Fail("e1000 PHY ID composition wrong");
+        }
+        if !super::phy_id_valid(0x0141_0CC2) {
+            return TestResult::Fail("e1000 PHY ID validity rejected a real ID");
+        }
+        if super::phy_id_valid(0xFFFF_FFFF) || super::phy_id_valid(0) {
+            return TestResult::Fail("e1000 PHY ID validity accepted a no-device signature");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_phy_id_composition_and_validity);
+
+    fn smoke_bmsr_link_decode() -> TestResult {
+        if !super::bmsr_link(0x0004) {
+            return TestResult::Fail("e1000 BMSR link bit not decoded");
+        }
+        if super::bmsr_link(0xFFFB) || super::bmsr_link(0x0000) {
+            return TestResult::Fail("e1000 BMSR link bit decoded from a link-down value");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_bmsr_link_decode);
 }
