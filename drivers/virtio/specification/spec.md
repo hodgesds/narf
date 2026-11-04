@@ -55,8 +55,18 @@ memory-window ownership and do not use this control-register path.
 - The primary virtio-net interface advertises TX checksum offload only after
   negotiating `VIRTIO_NET_F_CSUM`, and IPv4/TCP TSO only after additionally
   negotiating `VIRTIO_NET_F_HOST_TSO4`. A requested offload that was not
-  negotiated, is malformed, needs VLAN insertion, or exceeds the bounded
-  64-KiB TX DMA frame is rejected before descriptor publication. The driver
+  negotiated, is malformed, or exceeds the bounded
+  64-KiB TX DMA frame is rejected before descriptor publication. A requested
+  VLAN insertion is performed in software at copy time instead: the tag bytes
+  are inserted after the MAC addresses (the virtio-net header has no VLAN
+  field), the zero-copy path falls back to a copy for tagged frames, and the
+  checksum/TSO header layout is VLAN-aware so tagged offloads compose. The
+  driver negotiates `VIRTIO_NET_F_CTRL_RX` and `VIRTIO_NET_F_CTRL_VLAN` when
+  offered and exposes `VIRTIO_NET_CTRL_MAC_TABLE_SET` plus
+  `VIRTIO_NET_CTRL_VLAN_ADD` / `VLAN_DEL` through the control queue; the
+  device filters incoming tagged frames to the programmed VLAN table, and
+  matching frames arrive with the tag intact for the stack to parse (RX
+  stripping stays OFF per the net spec). The driver
   honors the frame-ring `TxMeta::more` batching hint while checking for a notify
   at an exhausted TX buffer pool, a full TX ring, or an explicit flush boundary.
   Copy-path TX buffer acquisition reclaims completed descriptors before

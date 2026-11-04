@@ -126,6 +126,12 @@ const VIRTIO_NET_F_MAC: u64 = 5;
 const VIRTIO_NET_F_HOST_TSO4: u64 = 11;
 const VIRTIO_NET_F_STATUS: u64 = 16;
 const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
+/// VirtIO 1.2 §5.1.3 — VIRTIO_NET_F_CTRL_RX (bit 18). Required for
+/// `VIRTIO_NET_CTRL_MAC_TABLE_SET` (and the RX class) to succeed.
+const VIRTIO_NET_F_CTRL_RX: u64 = 18;
+/// VirtIO 1.2 §5.1.3 — VIRTIO_NET_F_CTRL_VLAN (bit 19). Required for
+/// `VIRTIO_NET_CTRL_VLAN_ADD` / `VIRTIO_NET_CTRL_VLAN_DEL` to succeed.
+const VIRTIO_NET_F_CTRL_VLAN: u64 = 19;
 /// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_CTRL_MAC_ADDR (bit 23).
 /// Required for `VIRTIO_NET_CTRL_MAC_ADDR_SET` to succeed.
 const VIRTIO_NET_F_CTRL_MAC_ADDR: u64 = 23;
@@ -150,11 +156,43 @@ const VIRTIO_NET_CTRL_RX_ALLMULTI: u8 = 1;
 
 /// VirtIO 1.2 §5.1.6.5.2 — VIRTIO_NET_CTRL_MAC class.
 const VIRTIO_NET_CTRL_MAC: u8 = 1;
+/// `VIRTIO_NET_CTRL_MAC_TABLE_SET` (§5.1.6.5.2). Payload is
+/// `[u32 LE unicast count][unicast MACs][u32 LE multicast count]
+/// [multicast MACs]`. Linux `virtnet_set_rx_mode` sends the same
+/// two tables as two scatterlist segments; one contiguous buffer
+/// is byte-identical on the wire. Only valid when the device
+/// negotiated `VIRTIO_NET_F_CTRL_RX` (bit 18).
+const VIRTIO_NET_CTRL_MAC_TABLE_SET: u8 = 0;
 /// `VIRTIO_NET_CTRL_MAC_ADDR_SET` (§5.1.6.5.2). 6-byte MAC
 /// payload. Only valid when the device negotiated
 /// `VIRTIO_NET_F_CTRL_MAC_ADDR` (bit 23) — otherwise the device
 /// will reject the command with `VIRTIO_NET_ERR`.
 const VIRTIO_NET_CTRL_MAC_ADDR_SET: u8 = 1;
+
+/// VirtIO 1.2 §5.1.6.5.3 — VIRTIO_NET_CTRL_VLAN class.
+const VIRTIO_NET_CTRL_VLAN: u8 = 2;
+/// `VIRTIO_NET_CTRL_VLAN_ADD` (§5.1.6.5.3). 2-byte LE VID payload.
+/// Only valid when the device negotiated `VIRTIO_NET_F_CTRL_VLAN`
+/// (bit 19). Programs the device's VLAN filter table: incoming
+/// frames whose tag VID is not in the table are dropped by the
+/// device. The device filters; it does not strip — matching frames
+/// arrive with the tag intact for the stack to parse (net spec:
+/// RX stripping stays OFF, `Frame::rx_meta` has no VLAN-tag field).
+const VIRTIO_NET_CTRL_VLAN_ADD: u8 = 0;
+/// `VIRTIO_NET_CTRL_VLAN_DEL` (§5.1.6.5.3). 2-byte LE VID payload.
+const VIRTIO_NET_CTRL_VLAN_DEL: u8 = 1;
+
+/// 802.1Q tag protocol identifier, big-endian on the wire.
+const ETHERTYPE_VLAN: u16 = 0x8100;
+/// Bytes an 802.1Q tag adds to an Ethernet frame (TPID + TCI).
+const VLAN_TAG_LEN: usize = 4;
+/// Largest valid VLAN ID (12-bit VID space).
+const MAX_VLAN_VID: u16 = 4095;
+/// Largest control payload `submit_control` accepts. The 4 KiB
+/// scratch page holds the 2-byte header at offset 0, the payload
+/// at offset 16, and the 1-byte ack immediately after the payload,
+/// so `16 + N + 1 <= 4096`.
+const MAX_CTRL_PAYLOAD: usize = 4096 - 16 - 1;
 
 /// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ class.
 const VIRTIO_NET_CTRL_MQ: u8 = 4;
@@ -378,6 +416,14 @@ pub struct VirtioNetPci {
     /// `set_mac` short-circuits with NoQueues when this is false
     /// rather than firing a doomed CTRL_VQ command.
     has_ctrl_mac_addr: bool,
+    /// True when `VIRTIO_NET_F_CTRL_RX` was negotiated.
+    /// `set_mac_table` short-circuits with NoQueues when this is
+    /// false rather than firing a doomed CTRL_VQ command.
+    has_ctrl_rx: bool,
+    /// True when `VIRTIO_NET_F_CTRL_VLAN` was negotiated.
+    /// `vlan_add` / `vlan_del` short-circuit with NoQueues when
+    /// this is false rather than firing a doomed CTRL_VQ command.
+    has_ctrl_vlan: bool,
     /// Last-read MTU from device-cfg (when `VIRTIO_NET_F_MTU`
     /// negotiated). Default 1500 otherwise.
     mtu: u32,
@@ -414,16 +460,16 @@ pub struct VirtioNetPci {
 
 /// Control-queue runtime state. `ctrl_buf` holds back-to-back
 /// (hdr, payload, ack) byte regions used by `submit_control`;
-/// 256 bytes is enough for a 2-byte hdr + ≤253 bytes of payload +
-/// 1 byte ack, covering every RX/MAC/VLAN command we care about
-/// today.
+/// the 4 KiB page fits a 2-byte hdr + up to `MAX_CTRL_PAYLOAD`
+/// bytes of payload + 1 byte ack, covering every RX/MAC/VLAN
+/// command including a large MAC table.
 #[derive(Debug)]
 struct CtrlQueue {
     q: Virtqueue,
     /// 4 KiB scratch page. The same page backs every submitted
     /// command (single-flight serialised by the outer lock); the
-    /// device sees an [hdr|payload|ack] layout at fixed offsets
-    /// 0 / 16 / 256 within the page.
+    /// device sees an [hdr|payload|ack] layout at offsets
+    /// 0 / 16 / (16 + payload length) within the page.
     buf: DmaBuffer,
     notify_off: u16,
     /// Layout-buffer DMA backing the descriptor / avail / used
@@ -485,7 +531,12 @@ impl TxOffloadProfile {
             } else {
                 0
             },
-            vlan_insert: false,
+            // Software insertion at copy time (the virtio-net header
+            // has no VLAN field), not a negotiated device feature:
+            // always available, and it composes with checksum/TSO
+            // through the VLAN-aware header layout. The zero-copy
+            // path falls back to a copy for tagged frames.
+            vlan_insert: true,
         }
     }
 }
@@ -518,17 +569,37 @@ fn malformed_tx() -> VirtioPciError {
 /// checksum fields are packet-relative, so accepting arbitrary offsets here
 /// would let a malformed `TxMeta` make the device write elsewhere in the DMA
 /// buffer.
+/// Locate the L4 header and its checksum field for one transmit.
+/// Returns `(l4_offset, csum_offset_within_l4)`. VLAN-aware: a
+/// frame carrying a single 802.1Q tag (TPID 0x8100 at bytes 12..14)
+/// shifts the IP header by `VLAN_TAG_LEN`, so checksum/TSO layout
+/// computed over an inserted tag stays correct. A second tag
+/// (Q-in-Q) falls through to the rejection arm — one tag only.
 fn l4_checksum_layout(
     frame: &[u8],
     kind: narf_net::L4CsumKind,
 ) -> Result<(usize, usize), VirtioPciError> {
-    if frame.len() < ETH_HDR_LEN + IPV4_MIN_HDR_LEN {
+    if frame.len() < ETH_HDR_LEN {
         return Err(malformed_tx());
     }
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let outer = u16::from_be_bytes([frame[12], frame[13]]);
+    let (l2, ethertype) = if outer == ETHERTYPE_VLAN {
+        if frame.len() < ETH_HDR_LEN + VLAN_TAG_LEN {
+            return Err(malformed_tx());
+        }
+        (
+            ETH_HDR_LEN + VLAN_TAG_LEN,
+            u16::from_be_bytes([frame[16], frame[17]]),
+        )
+    } else {
+        (ETH_HDR_LEN, outer)
+    };
+    if frame.len() < l2 + IPV4_MIN_HDR_LEN {
+        return Err(malformed_tx());
+    }
     match ethertype {
         0x0800 => {
-            let ip = ETH_HDR_LEN;
+            let ip = l2;
             if frame[ip] >> 4 != 4 {
                 return Err(malformed_tx());
             }
@@ -566,20 +637,17 @@ fn l4_checksum_layout(
         }
         0x86dd => {
             const IPV6_HDR_LEN: usize = 40;
-            if frame.len() < ETH_HDR_LEN + IPV6_HDR_LEN || frame[ETH_HDR_LEN] >> 4 != 6 {
+            if frame.len() < l2 + IPV6_HDR_LEN || frame[l2] >> 4 != 6 {
                 return Err(malformed_tx());
             }
-            let payload_len = usize::from(u16::from_be_bytes([
-                frame[ETH_HDR_LEN + 4],
-                frame[ETH_HDR_LEN + 5],
-            ]));
-            if ETH_HDR_LEN + IPV6_HDR_LEN + payload_len != frame.len() {
+            let payload_len = usize::from(u16::from_be_bytes([frame[l2 + 4], frame[l2 + 5]]));
+            if l2 + IPV6_HDR_LEN + payload_len != frame.len() {
                 return Err(malformed_tx());
             }
-            let l4 = ETH_HDR_LEN + IPV6_HDR_LEN;
+            let l4 = l2 + IPV6_HDR_LEN;
             match kind {
                 narf_net::L4CsumKind::Tcp
-                    if frame[ETH_HDR_LEN + 6] == IP_PROTO_TCP
+                    if frame[l2 + 6] == IP_PROTO_TCP
                         && payload_len >= TCP_MIN_HDR_LEN
                         && usize::from(frame[l4 + 12] >> 4) * 4 >= TCP_MIN_HDR_LEN
                         && l4 + usize::from(frame[l4 + 12] >> 4) * 4 <= frame.len() =>
@@ -587,7 +655,7 @@ fn l4_checksum_layout(
                     Ok((l4, TCP_CSUM_OFFSET))
                 }
                 narf_net::L4CsumKind::Udp
-                    if frame[ETH_HDR_LEN + 6] == 17
+                    if frame[l2 + 6] == 17
                         && payload_len >= 8
                         && usize::from(u16::from_be_bytes([frame[l4 + 4], frame[l4 + 5]]))
                             == payload_len =>
@@ -601,6 +669,47 @@ fn l4_checksum_layout(
     }
 }
 
+/// Build a `VIRTIO_NET_CTRL_MAC_TABLE_SET` payload: `[u32 LE unicast
+/// count][unicast MACs][u32 LE multicast count][multicast MACs]`.
+/// Counts are little-endian under `VIRTIO_F_VERSION_1`, matching
+/// Linux `virtnet_set_rx_mode`'s `cpu_to_virtio32` encoding.
+pub(crate) fn mac_table_payload(unicast: &[[u8; 6]], multicast: &[[u8; 6]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 6 * (unicast.len() + multicast.len()));
+    out.extend_from_slice(&(unicast.len() as u32).to_le_bytes());
+    for mac in unicast {
+        out.extend_from_slice(mac);
+    }
+    out.extend_from_slice(&(multicast.len() as u32).to_le_bytes());
+    for mac in multicast {
+        out.extend_from_slice(mac);
+    }
+    out
+}
+
+/// Copy `frame` into `dst` inserting an 802.1Q tag after the two
+/// MAC addresses: `[dst | src | 0x8100 | TCI | EtherType |
+/// payload]`. The tag is the full 16-bit TCI (PCP + CFI + VID) as
+/// carried by `TxMeta::vlan_tag`. Returns the tagged length, or
+/// `None` when the frame is too short to carry a tag (it needs
+/// dst + src MAC + EtherType) or `dst` cannot hold the tagged
+/// frame. The virtio-net header has no VLAN field, so software
+/// insertion at copy time is the only insertion path — the device
+/// just transmits the tagged bytes it is given.
+pub(crate) fn copy_frame_with_vlan(dst: &mut [u8], frame: &[u8], tag: u16) -> Option<usize> {
+    if frame.len() < ETH_HDR_LEN {
+        return None;
+    }
+    let new_len = frame.len() + VLAN_TAG_LEN;
+    if dst.len() < new_len {
+        return None;
+    }
+    dst[..12].copy_from_slice(&frame[..12]);
+    dst[12..14].copy_from_slice(&ETHERTYPE_VLAN.to_be_bytes());
+    dst[14..16].copy_from_slice(&tag.to_be_bytes());
+    dst[16..new_len].copy_from_slice(&frame[12..]);
+    Some(new_len)
+}
+
 /// Prepare the virtio-net header for one transmit. This is deliberately
 /// feature-gated: a frame carrying partial checksum data or GSO metadata must
 /// never reach a device that did not negotiate the matching virtio feature.
@@ -609,6 +718,13 @@ pub(crate) fn tx_header_for_frame(
     meta: narf_net::TxMeta,
     profile: TxOffloadProfile,
 ) -> Result<VirtioNetHdr, VirtioPciError> {
+    // A vlan_tag reaching this point is a caller error: insertion
+    // happens at copy time in the send fns (`vnet0_send_fn` /
+    // `vnet0_send_frame_zc`'s copy fallback), which clear the tag
+    // before submitting. By the time a frame is laid out here, any
+    // tag is already bytes in the frame, and the VLAN-aware layout
+    // below handles it. Rejecting here keeps a direct caller from
+    // silently dropping a tag it expected to be inserted.
     if frame.is_empty() || meta.vlan_tag.is_some() {
         return Err(malformed_tx());
     }
@@ -755,6 +871,10 @@ impl VirtioNetPci {
         // Same dependency as F_MQ: needs F_CTRL_VQ first.
         let want_ctrl_mac_addr =
             (feats & (1u64 << VIRTIO_NET_F_CTRL_MAC_ADDR) != 0) && want_ctrl_vq;
+        // F_CTRL_RX gates MAC_TABLE_SET; F_CTRL_VLAN gates VLAN_ADD /
+        // VLAN_DEL. Same F_CTRL_VQ dependency.
+        let want_ctrl_rx = (feats & (1u64 << VIRTIO_NET_F_CTRL_RX) != 0) && want_ctrl_vq;
+        let want_ctrl_vlan = (feats & (1u64 << VIRTIO_NET_F_CTRL_VLAN) != 0) && want_ctrl_vq;
         let want_event_idx = feats & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         // virtio-net F_* bits we care about live in the low 32
         // (max is F_CTRL_MAC_ADDR = 23; RING_F_EVENT_IDX = 29); only
@@ -768,6 +888,8 @@ impl VirtioNetPci {
             | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
             | ((1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32))
             | ((1u32 << VIRTIO_RING_F_EVENT_IDX) * (want_event_idx as u32))
+            | ((1u32 << VIRTIO_NET_F_CTRL_RX) * (want_ctrl_rx as u32))
+            | ((1u32 << VIRTIO_NET_F_CTRL_VLAN) * (want_ctrl_vlan as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32));
         let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
@@ -1054,6 +1176,8 @@ impl VirtioNetPci {
             ifname: IrqSafeSpinLock::new(None),
             mac: IrqSafeSpinLock::new(mac),
             has_ctrl_mac_addr: want_ctrl_mac_addr,
+            has_ctrl_rx: want_ctrl_rx,
+            has_ctrl_vlan: want_ctrl_vlan,
             mtu,
             has_status: want_status,
             tx_checksum: want_csum,
@@ -1730,16 +1854,19 @@ impl VirtioNetPci {
         let ctrl = self.ctrl.as_ref().ok_or(VirtioPciError::NoQueues)?;
         let mut g = ctrl.lock();
         // Layout within `buf`:
-        //   0..2     hdr  (class, cmd)         device-readable
-        //   16..16+N payload                    device-readable
-        //   256..257 ack                        device-writable
-        // The 256-byte stride leaves slack for ≤240 byte payloads
-        // — covers RX_MODE (1 byte) and MAC_ADDR_SET (6 bytes)
-        // trivially. Larger payloads (MAC_TABLE_SET with many
-        // entries) will need a per-call allocation later.
-        if payload.len() > 240 {
-            return Err(VirtioPciError::QueueTooSmall);
+        //   0..2         hdr  (class, cmd)         device-readable
+        //   16..16+N     payload                    device-readable
+        //   16+N..17+N   ack                        device-writable
+        // The ack sits immediately after the payload instead of at
+        // a fixed offset, so the 4 KiB scratch page holds payloads
+        // up to `MAX_CTRL_PAYLOAD` — a MAC table with hundreds of
+        // entries — with no per-call allocation. The device only
+        // ever sees the three descriptor addresses, so the moving
+        // ack offset is invisible to it.
+        if payload.len() > MAX_CTRL_PAYLOAD {
+            return Err(VirtioPciError::RequestTooLarge);
         }
+        let ack_off = 16 + payload.len() as u64;
         let phys = g.buf.dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; the offsets stay
         // within the 4 KiB page allocated above.
@@ -1752,7 +1879,7 @@ impl VirtioNetPci {
             }
             // Seed the ack byte with a sentinel so we can spot
             // "device didn't write anything".
-            core::ptr::write_volatile(g.buf.cpu_mut_ptr_at::<u8>(256), 0xFF);
+            core::ptr::write_volatile(g.buf.cpu_mut_ptr_at::<u8>(ack_off), 0xFF);
         }
         let descs = [
             VirtqDesc {
@@ -1768,7 +1895,7 @@ impl VirtioNetPci {
                 next: 0,
             },
             VirtqDesc {
-                addr: phys + 256,
+                addr: phys + ack_off,
                 len: 1,
                 flags: VIRTQ_DESC_F_WRITE,
                 next: 0,
@@ -1798,7 +1925,7 @@ impl VirtioNetPci {
         // SAFETY: device wrote the ack byte before publishing the
         // used-ring entry; identity-mapped read.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let ack = unsafe { core::ptr::read_volatile(g.buf.cpu_ptr_at::<u8>(256)) };
+        let ack = unsafe { core::ptr::read_volatile(g.buf.cpu_ptr_at::<u8>(ack_off)) };
         Ok(ack)
     }
 
@@ -1823,6 +1950,80 @@ impl VirtioNetPci {
     pub fn set_allmulti(&self, on: bool) -> Result<(), VirtioPciError> {
         let payload = [u8::from(on)];
         let ack = self.submit_control(VIRTIO_NET_CTRL_RX, VIRTIO_NET_CTRL_RX_ALLMULTI, &payload)?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Program one VLAN ID into the device's VLAN filter table
+    /// (`VIRTIO_NET_CTRL_VLAN_ADD`, VirtIO 1.2 §5.1.6.5.3).
+    /// Requires `VIRTIO_NET_F_CTRL_VLAN` negotiated; returns
+    /// `NoQueues` without touching the device otherwise. The VID
+    /// is validated before any device access, so an out-of-range
+    /// VID reports `InvalidArgument` even with no control queue.
+    /// The device drops incoming frames whose tag VID is not in
+    /// the table; matching frames arrive with the tag intact for
+    /// the stack to parse (the device filters, it does not strip).
+    pub fn vlan_add(&self, vid: u16) -> Result<(), VirtioPciError> {
+        if vid > MAX_VLAN_VID {
+            return Err(VirtioPciError::InvalidArgument);
+        }
+        if !self.has_ctrl_vlan {
+            return Err(VirtioPciError::NoQueues);
+        }
+        let payload = vid.to_le_bytes();
+        let ack = self.submit_control(VIRTIO_NET_CTRL_VLAN, VIRTIO_NET_CTRL_VLAN_ADD, &payload)?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Remove one VLAN ID from the device's VLAN filter table
+    /// (`VIRTIO_NET_CTRL_VLAN_DEL`, VirtIO 1.2 §5.1.6.5.3).
+    /// Same gating and validation as [`Self::vlan_add`].
+    pub fn vlan_del(&self, vid: u16) -> Result<(), VirtioPciError> {
+        if vid > MAX_VLAN_VID {
+            return Err(VirtioPciError::InvalidArgument);
+        }
+        if !self.has_ctrl_vlan {
+            return Err(VirtioPciError::NoQueues);
+        }
+        let payload = vid.to_le_bytes();
+        let ack = self.submit_control(VIRTIO_NET_CTRL_VLAN, VIRTIO_NET_CTRL_VLAN_DEL, &payload)?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Program the device's unicast + multicast filter tables
+    /// (`VIRTIO_NET_CTRL_MAC_TABLE_SET`, VirtIO 1.2 §5.1.6.5.2;
+    /// same shape as Linux `virtnet_set_rx_mode`). Requires
+    /// `VIRTIO_NET_F_CTRL_RX` negotiated; returns `NoQueues`
+    /// without touching the device otherwise. This is the
+    /// selective alternative to `set_allmulti`: with a programmed
+    /// table the device delivers only listed multicast groups
+    /// instead of all of them, and unlisted multicast stays
+    /// dropped (fail-closed — the table adds delivery, it never
+    /// floods). The payload is built and bound-checked before
+    /// any device access, so an over-large table reports
+    /// `RequestTooLarge` even with no control queue.
+    pub fn set_mac_table(
+        &self,
+        unicast: &[[u8; 6]],
+        multicast: &[[u8; 6]],
+    ) -> Result<(), VirtioPciError> {
+        let payload = mac_table_payload(unicast, multicast);
+        if payload.len() > MAX_CTRL_PAYLOAD {
+            return Err(VirtioPciError::RequestTooLarge);
+        }
+        if !self.has_ctrl_rx {
+            return Err(VirtioPciError::NoQueues);
+        }
+        let ack =
+            self.submit_control(VIRTIO_NET_CTRL_MAC, VIRTIO_NET_CTRL_MAC_TABLE_SET, &payload)?;
         if ack != VIRTIO_NET_OK {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
@@ -2717,6 +2918,23 @@ fn vnet0_send_fn(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_TX_TSO_FRAME {
         return Err(());
     }
+    // VLAN insertion happens here, at copy time: the tag goes into
+    // the frame bytes before any header computation, so the
+    // VLAN-aware checksum/TSO layout sees the tagged frame and
+    // tagged offloads compose. Pair selection runs on the untagged
+    // frame so the 4-tuple hash sees the untagged layout. A tagged
+    // frame at exactly MAX_TX_TSO_FRAME cannot grow by the tag
+    // inside the bounded TX pool buffer — fail closed rather than
+    // truncate.
+    let (out_len, tag) = match meta.vlan_tag {
+        Some(tag) => {
+            if frame.len() < ETH_HDR_LEN || frame.len() + VLAN_TAG_LEN > MAX_TX_TSO_FRAME {
+                return Err(());
+            }
+            (frame.len() + VLAN_TAG_LEN, Some(tag))
+        }
+        None => (frame.len(), None),
+    };
     // Take a prepared TX buffer. An empty pool is backpressure; the send fails
     // rather than allocating from the page allocator on the frame path.
     let (pair_idx, mut buf) = with_controller(|c| {
@@ -2727,15 +2945,27 @@ fn vnet0_send_fn(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     .ok_or(())?;
     {
         let slice = buf.as_mut_slice();
-        if slice.len() < VIRTIO_NET_HDR_LEN + frame.len() {
+        if slice.len() < VIRTIO_NET_HDR_LEN + out_len {
             return Err(());
         }
         // Frame body follows the virtio header, which tx_dma writes here.
-        slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + frame.len()].copy_from_slice(frame);
+        let dst = &mut slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + out_len];
+        match tag {
+            Some(tag) => {
+                copy_frame_with_vlan(dst, frame, tag).ok_or(())?;
+            }
+            None => dst.copy_from_slice(frame),
+        }
     }
+    // The tag is bytes in the frame now; clear it so the header
+    // computation does not see a tag it would have to insert.
+    let meta = narf_net::TxMeta {
+        vlan_tag: None,
+        ..meta
+    };
     // Move `buf` into its selected queue — it owns the buffer until the device
     // finishes DMAing the frame out of it.
-    let res = with_controller(|c| c.tx_dma_on_with_meta(pair_idx, buf, frame.len() as u32, meta));
+    let res = with_controller(|c| c.tx_dma_on_with_meta(pair_idx, buf, out_len as u32, meta));
     match res {
         Some(Ok(())) => Ok(()),
         // `tx_dma` consumed `buf` (the closure moved it in). On the
@@ -2760,8 +2990,72 @@ fn vnet0_send_frame_zc(frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result
     // `tx_acquire` built this with `VIRTIO_NET_HDR_LEN` bytes of headroom, so
     // the body follows the header space at the front of `buf`.
     // Discard the offset/len view and give `tx_dma` the whole buffer.
-    let (buf, _off, _len, queue) = frame.into_parts_with_offset_and_queue();
-    match with_controller(|c| c.tx_dma_on_with_meta(queue as usize, buf, len as u32, meta)) {
+    if meta.vlan_tag.is_none() {
+        let (buf, _off, _len, queue) = frame.into_parts_with_offset_and_queue();
+        return match with_controller(|c| {
+            c.tx_dma_on_with_meta(queue as usize, buf, len as u32, meta)
+        }) {
+            Some(Ok(())) => Ok(()),
+            _ => Err(()),
+        };
+    }
+    // Tagged zero-copy frame: the stack-owned buffer has no room
+    // to grow by the tag bytes in place, and mutating it would
+    // break the zero-copy contract — so copy into a driver pool
+    // buffer with the tag inserted (same shape as `vnet0_send_fn`)
+    // and return the original buffer to its own queue-local pool.
+    // The zc pools ARE the per-pair tx_pools (see registration),
+    // so this release is the same recycler the TX reaper uses and
+    // no pool accounting changes. There is no copy fallback in
+    // the stack's zc dispatch — an Err here would drop the frame —
+    // so the tagged path must succeed through this copy, not
+    // refuse.
+    let tag = meta.vlan_tag.expect("matched Some VLAN tag");
+    if len < ETH_HDR_LEN || len + VLAN_TAG_LEN > MAX_TX_TSO_FRAME {
+        return Err(());
+    }
+    let new_len = len + VLAN_TAG_LEN;
+    let (orig, off, _flen, queue) = frame.into_parts_with_offset_and_queue();
+    let queue = queue as usize;
+    let copy = with_controller(|c| {
+        let mut copy = c.tx_buf_acquire_on(queue)?;
+        let done = (|| {
+            let src = orig.as_slice().get(off..off + len)?;
+            let slice = copy.as_mut_slice();
+            if slice.len() < VIRTIO_NET_HDR_LEN + new_len {
+                return None;
+            }
+            copy_frame_with_vlan(
+                &mut slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + new_len],
+                src,
+                tag,
+            )
+        })();
+        match done {
+            Some(_) => Some(copy),
+            // Copy failed after acquisition: return the copy to its
+            // pool instead of leaking a recycler slot.
+            None => {
+                c.tx_buf_release_on(queue, copy);
+                None
+            }
+        }
+    })
+    .flatten();
+    let Some(copy) = copy else {
+        with_controller(|c| c.tx_buf_release_on(queue, orig));
+        return Err(());
+    };
+    let meta = narf_net::TxMeta {
+        vlan_tag: None,
+        ..meta
+    };
+    let res = with_controller(|c| c.tx_dma_on_with_meta(queue, copy, new_len as u32, meta));
+    // The original buffer is consumed here in every outcome: it is
+    // never submitted, so it must go back to its pool now rather
+    // than leak when the submit fails.
+    with_controller(|c| c.tx_buf_release_on(queue, orig));
+    match res {
         Some(Ok(())) => Ok(()),
         _ => Err(()),
     }
@@ -3027,6 +3321,8 @@ mod tx_tests {
                 ifname: IrqSafeSpinLock::new(None),
                 mac: IrqSafeSpinLock::new([0; 6]),
                 has_ctrl_mac_addr: false,
+                has_ctrl_rx: false,
+                has_ctrl_vlan: false,
                 mtu: 1500,
                 has_status: false,
                 tx_checksum: true,
@@ -3287,5 +3583,241 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_detach_device_teardown
+    );
+
+    fn smoke_virtio_net_vlan_insert_bytes() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let frame: [u8; 20] = [
+                0x02, 0, 0, 0, 0, 0x01, // dst
+                0x02, 0, 0, 0, 0, 0x02, // src
+                0x08, 0x00, // EtherType IPv4
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // payload
+            ];
+            let mut dst = [0u8; 64];
+            let len = copy_frame_with_vlan(&mut dst, &frame, 0x1234).ok_or("insert rejected")?;
+            if len != 24 {
+                return Err("inserted length wrong");
+            }
+            let expected: [u8; 24] = [
+                0x02, 0, 0, 0, 0, 0x01, // dst
+                0x02, 0, 0, 0, 0, 0x02, // src
+                0x81, 0x00, // TPID
+                0x12, 0x34, // TCI
+                0x08, 0x00, // EtherType IPv4
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // payload
+            ];
+            if &dst[..24] != &expected {
+                return Err("inserted bytes wrong");
+            }
+            // Too short to carry a tag (needs dst + src + EtherType).
+            if copy_frame_with_vlan(&mut dst, &frame[..13], 0x1234).is_some() {
+                return Err("short frame accepted");
+            }
+            // Destination too small for the tagged frame.
+            if copy_frame_with_vlan(&mut dst[..23], &frame, 0x1234).is_some() {
+                return Err("undersized destination accepted");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_vlan_insert_bytes);
+
+    fn smoke_virtio_net_mac_table_payload() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let uc: [[u8; 6]; 1] = [[1, 2, 3, 4, 5, 6]];
+            let mc: [[u8; 6]; 2] = [
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+                [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb],
+            ];
+            let payload = mac_table_payload(&uc, &mc);
+            let expected: [u8; 8 + 6 + 8 + 12] = [
+                1, 0, 0, 0, // unicast count LE
+                1, 2, 3, 4, 5, 6, // unicast MAC
+                2, 0, 0, 0, // multicast count LE
+                0xff, 0xff, 0xff, 0xff, 0xff, 0x01, // multicast MAC 1
+                0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb, // multicast MAC 2
+            ];
+            if payload.as_slice() != expected.as_slice() {
+                return Err("MAC table payload layout wrong");
+            }
+            let empty = mac_table_payload(&[], &[]);
+            if empty.as_slice() != [0u8; 8].as_slice() {
+                return Err("empty MAC table payload wrong");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mac_table_payload);
+
+    fn smoke_virtio_net_vlan_filter_gating() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            // Validation runs before any device access, so an
+            // out-of-range VID reports InvalidArgument even with
+            // no control queue at all.
+            if !matches!(
+                fixture.dev.vlan_add(4096),
+                Err(VirtioPciError::InvalidArgument)
+            ) {
+                return Err("vlan_add accepted VID 4096");
+            }
+            if !matches!(
+                fixture.dev.vlan_del(4096),
+                Err(VirtioPciError::InvalidArgument)
+            ) {
+                return Err("vlan_del accepted VID 4096");
+            }
+            // The fixture negotiates nothing and has no control
+            // queue: in-range commands short-circuit with NoQueues.
+            if !matches!(fixture.dev.vlan_add(100), Err(VirtioPciError::NoQueues)) {
+                return Err("vlan_add without F_CTRL_VLAN did not report NoQueues");
+            }
+            if !matches!(fixture.dev.vlan_del(100), Err(VirtioPciError::NoQueues)) {
+                return Err("vlan_del without F_CTRL_VLAN did not report NoQueues");
+            }
+            if !matches!(
+                fixture.dev.set_mac_table(&[[1; 6]], &[[2; 6]]),
+                Err(VirtioPciError::NoQueues)
+            ) {
+                return Err("set_mac_table without F_CTRL_RX did not report NoQueues");
+            }
+            // The payload is built and bound-checked before the
+            // gate, so an over-large table reports RequestTooLarge
+            // even with no control queue. 679 entries = 4082 bytes
+            // of payload, past MAX_CTRL_PAYLOAD (4079).
+            let big: Vec<[u8; 6]> = (0..679)
+                .map(|i| [(i >> 8) as u8, i as u8, 0, 0, 0, 0])
+                .collect();
+            if !matches!(
+                fixture.dev.set_mac_table(&big, &[]),
+                Err(VirtioPciError::RequestTooLarge)
+            ) {
+                return Err("oversize MAC table did not report RequestTooLarge");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_vlan_filter_gating
+    );
+
+    fn smoke_virtio_net_vlan_tagged_tso_layout() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            // Same minimal IPv4/TCP frame the burst tests submit.
+            let build_untagged = |dst: &mut [u8]| {
+                dst.fill(0);
+                dst[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+                dst[14] = 0x45;
+                dst[16..18].copy_from_slice(&((FRAME_LEN - 14) as u16).to_be_bytes());
+                dst[23] = 6;
+                dst[46] = 5 << 4;
+                dst[47] = 0x18;
+            };
+            // Untagged TSO submit: baseline header.
+            let mut buf = fixture.dev.tx_buf_acquire_on(0).ok_or("TX pool starved")?;
+            {
+                let slice = buf.as_mut_slice();
+                build_untagged(&mut slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + FRAME_LEN]);
+            }
+            fixture
+                .dev
+                .tx_dma_on_with_meta(0, buf, FRAME_LEN as u32, narf_net::TxMeta::with_tso(1024))
+                .map_err(|_| "untagged TSO submit rejected")?;
+            // Tagged TSO submit: same frame with a tag inserted.
+            let mut tagged = Vec::new();
+            tagged.resize(FRAME_LEN + VLAN_TAG_LEN, 0);
+            {
+                let mut plain = Vec::new();
+                plain.resize(FRAME_LEN, 0);
+                build_untagged(&mut plain);
+                let len =
+                    copy_frame_with_vlan(&mut tagged, &plain, 0x1234).ok_or("tag insert failed")?;
+                if len != FRAME_LEN + VLAN_TAG_LEN {
+                    return Err("tagged length wrong");
+                }
+            }
+            let mut buf = fixture.dev.tx_buf_acquire_on(0).ok_or("TX pool starved")?;
+            {
+                let slice = buf.as_mut_slice();
+                slice[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + tagged.len()]
+                    .copy_from_slice(&tagged);
+            }
+            fixture
+                .dev
+                .tx_dma_on_with_meta(
+                    0,
+                    buf,
+                    tagged.len() as u32,
+                    narf_net::TxMeta::with_tso(1024),
+                )
+                .map_err(|_| "tagged TSO submit rejected")?;
+            // Read back both submitted buffers and classify them by
+            // their EtherType bytes: the tag shifts every L4 offset
+            // by exactly VLAN_TAG_LEN, nothing else changes.
+            let bufs = fixture.dev.pairs[0].tx_buffers.lock();
+            let mut seen_untagged = false;
+            let mut seen_tagged = false;
+            for slot in bufs.iter().flatten() {
+                let bytes = slot.as_slice();
+                let hdr = &bytes[..VIRTIO_NET_HDR_LEN];
+                let frame = &bytes[VIRTIO_NET_HDR_LEN..];
+                let hdr_len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+                let csum_start = u16::from_le_bytes([hdr[6], hdr[7]]) as usize;
+                let csum_offset = u16::from_le_bytes([hdr[8], hdr[9]]) as usize;
+                if hdr[0] != 1 || hdr[1] != 1 || csum_offset != 16 {
+                    return Err("virtio header flags/type/offset wrong");
+                }
+                if &frame[12..14] == &[0x08, 0x00] {
+                    if hdr_len != 54 || csum_start != 34 {
+                        return Err("untagged TSO layout wrong");
+                    }
+                    seen_untagged = true;
+                } else if &frame[12..16] == &[0x81, 0x00, 0x12, 0x34] {
+                    if hdr_len != 58 || csum_start != 38 {
+                        return Err("tagged TSO layout not shifted by the tag");
+                    }
+                    if &frame[16..18] != &[0x08, 0x00] {
+                        return Err("inner EtherType wrong after tag");
+                    }
+                    seen_tagged = true;
+                } else {
+                    return Err("submitted frame has neither layout");
+                }
+            }
+            if !seen_untagged || !seen_tagged {
+                return Err("missing submitted buffer");
+            }
+            drop(bufs);
+            // Pool accounting: two buffers in flight on pair 0, pair
+            // 1 untouched — the tag path moves no buffers across pairs.
+            if fixture.dev.pairs[0].tx_pool.available() != TX_POOL_CAP - 2
+                || fixture.dev.pairs[1].tx_pool.available() != TX_POOL_CAP
+            {
+                return Err("tagged TX leaked buffers or crossed queue pools");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_vlan_tagged_tso_layout
     );
 }
