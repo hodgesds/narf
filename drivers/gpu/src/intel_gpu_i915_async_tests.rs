@@ -760,7 +760,7 @@ fn smoke_i915_object_async_publication_output_failure_and_exact_fence() -> TestR
     assert!(!exported.is_signalled());
     fds.files.lock().clear();
     let mut registered = BTreeMap::new();
-    finish_policy(&mut gt, &w, &fence, &mut registered, 601, 2);
+    finish_policy(&mut gt, &w, &fence, &mut registered, 601, 3);
     assert!(exported.is_signalled());
     assert_eq!(device_word(&object, 0x80), 0x18180004);
     assert_eq!(arena.live_allocations(), baseline);
