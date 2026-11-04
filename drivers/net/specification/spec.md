@@ -421,8 +421,9 @@ frame itself and builds its descriptors from the shared builders.
   additionally programs the MAC-OCP steps (0xe0c6 LinkUp,
   0xc0b6 magic bit) through the shared OCP accessor, so nothing
   is left pending there. On 8168evl (VER_34) the magic bit lives
-  in ERI space, which NARF has no accessor for yet; `set_wol_opts`
-  reports that step as pending instead of silently dropping it.
+  in ERI space and is programmed through the shared ERI accessor
+  (ERIDR 0x70 / ERIAR 0x74, `MagicPacket_v2` bit 16 at ERI 0x0dc),
+  so nothing is left pending there either.
 - **EEE.** Each driver exposes its LPI capabilities
   (`eee_caps`, Linux's `rtl8169_get_lpi_caps` shape: 100/1000FD
   everywhere EEE is supported, +2500FD from VER_63, +5000FD

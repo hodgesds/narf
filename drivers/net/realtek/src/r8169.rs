@@ -16,9 +16,9 @@
 //! and TX offload cannot coexist on this family — a runtime MTU
 //! switch is future work); RSS is not a gap here (Linux keeps
 //! one RX ring on 8168). Still missing: GMII auto-negotiation
-//! tuning, per-revision 8168 PHY tables, EEE PHY advertisement,
-//! and the 8168evl (VER_34) ERI step for WoL magic packets
-//! (reported by `set_wol_opts`, not silently dropped).
+//! tuning, per-revision 8168 PHY tables, and EEE PHY advertisement
+//! (the 8168evl VER_34 WoL magic step is programmed through the
+//! ERI accessor by `set_wol_opts`).
 //!
 //! ## Reference
 //!
@@ -868,11 +868,11 @@ impl RtlNic {
 
     /// Program Wake-on-LAN options (Linux's `__rtl8169_set_wol`
     /// shape, via `crate::features::apply_wol`). Config registers
-    /// are unlocked for the sequence and re-locked after. Returns
-    /// the out-of-band magic step the caller must still perform:
-    /// on 8168evl (VER_34) the magic bit lives in ERI space, which
-    /// NARF has no accessor for yet — that step is reported, not
-    /// silently dropped. All other versions program magic fully.
+    /// are unlocked for the sequence and re-locked after. On
+    /// 8168evl (VER_34) the magic step is performed through the
+    /// ERI accessor before the Config writes, matching Linux's
+    /// magic-first order, so the return is `None` (no pending
+    /// step) for every version.
     pub fn set_wol_opts(
         &self,
         opts: crate::features::WolOpts,
@@ -895,7 +895,34 @@ impl RtlNic {
         unsafe {
             self.mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
             let mut regs = crate::features::MmioRegs(&self.mmio);
+            // Linux programs the magic step first
+            // (`__rtl8169_set_wol`); the ERI half lands here, so
+            // `apply_wol`'s `Eri0dc` pending below is already
+            // performed and maps to `None`. The ERI and Config
+            // registers are independent, but matching Linux's
+            // order costs nothing.
+            if let crate::features::WolMagic::Eri0dc = magic {
+                if opts.contains(crate::features::WolOpts::MAGIC) {
+                    crate::features::eri_set_bits(
+                        &mut regs,
+                        crate::features::ERI_MAGIC_ADDR,
+                        crate::features::ERI_MAGIC_PACKET_V2,
+                    );
+                } else {
+                    crate::features::eri_clear_bits(
+                        &mut regs,
+                        crate::features::ERI_MAGIC_ADDR,
+                        crate::features::ERI_MAGIC_PACKET_V2,
+                    );
+                }
+            }
             let pending = crate::features::apply_wol(&mut regs, opts, magic, pme);
+            let pending = match pending {
+                crate::features::WolPendingMagic::Eri0dc(_) => {
+                    crate::features::WolPendingMagic::None
+                }
+                other => other,
+            };
             self.mmio.write8(REG_9346CR, EEM_NORMAL);
             *self.wol_opts.lock() = opts;
             Ok(pending)

@@ -54,8 +54,10 @@
 //! fixture and the driver cannot disagree about the sequence —
 //! except for the WoL magic step on the 8125 family and 8168evl,
 //! which lives on the OCP/ERI windows rather than the plain MMIO
-//! map and is therefore reported back to the caller as a
-//! [`WolMagic`] step instead of being written here.
+//! map: `apply_wol` reports it as a [`WolMagic`] step, and the
+//! owning driver drains it through the shared OCP accessor (8125)
+//! or the [`eri_set_bits`] / [`eri_clear_bits`] accessor (8168evl),
+//! so nothing is left pending.
 //!
 //! Where Linux and a datasheet disagree, the datasheet wins and the
 //! conflict is flagged in the PR body; no such conflict was found
@@ -398,8 +400,10 @@ pub enum WolMagic {
     /// OCP window is not a plain MMIO register.
     MacOcpC0b6,
     /// 8168evl: ERI register `0x0dc` bit 16 (`MagicPacket_v2`).
-    /// No NARF driver covers an evl-only path today, so this step is
-    /// reported, never silently skipped, when it applies.
+    /// Performed by the owning driver through [`eri_set_bits`] /
+    /// [`eri_clear_bits`]; `apply_wol` still reports it as pending
+    /// so the MMIO-only half stays honest about what it did not
+    /// write itself.
     Eri0dc,
 }
 
@@ -524,6 +528,126 @@ pub unsafe fn apply_wol<R: RegFile>(
         unsafe { regs.write8(reg, v) };
     }
     pending
+}
+
+// ── ERI (Extended Register Interface) ───────────────────────────────
+
+/// ERI data register (`ERIDR`, Linux's `ERIDR`).
+pub const ERI_DATA_REG: u64 = 0x70;
+/// ERI address/command register (`ERIAR`, Linux's `ERIAR`).
+pub const ERI_ADDR_REG: u64 = 0x74;
+/// ERIAR completion flag (`ERIAR_FLAG`): set by the device when a
+/// read has data ready; cleared when a write has completed.
+pub const ERI_FLAG: u32 = 0x8000_0000;
+/// ERIAR write command bit (`ERIAR_WRITE_CMD`).
+pub const ERI_WRITE_CMD: u32 = 0x8000_0000;
+/// ERIAR read command (no bit set, `ERIAR_READ_CMD`).
+pub const ERI_READ_CMD: u32 = 0x0000_0000;
+/// ERIAR register-type field shift (`ERIAR_TYPE_SHIFT`).
+pub const ERI_TYPE_SHIFT: u32 = 16;
+/// ERIAR EXGMAC register type (`ERIAR_EXGMAC`).
+pub const ERI_TYPE_EXGMAC: u32 = 0x00 << ERI_TYPE_SHIFT;
+/// ERIAR byte-mask field shift (`ERIAR_MASK_SHIFT`).
+pub const ERI_MASK_SHIFT: u32 = 12;
+/// ERIAR all-bytes mask (`ERIAR_MASK_1111`).
+pub const ERI_MASK_1111: u32 = 0xf << ERI_MASK_SHIFT;
+/// ERIAR single low-byte mask (`ERIAR_MASK_0001`).
+pub const ERI_MASK_0001: u32 = 0x1 << ERI_MASK_SHIFT;
+/// ERI register holding the 8168evl magic-packet bit.
+pub const ERI_MAGIC_ADDR: u32 = 0x0dc;
+/// 8168evl magic-packet wake bit (`MagicPacket_v2`).
+pub const ERI_MAGIC_PACKET_V2: u32 = 1 << 16;
+/// Bounded completion poll for an ERIAR command, in bare register
+/// reads. Linux waits 100 iterations of 100 µs (a 10 ms window);
+/// this spin covers the same window in spirit for a device that
+/// completes in microseconds, without a sleep primitive on this
+/// path. A stuck device therefore costs a bounded spin, never a
+/// hang; the read then reports all-ones, as Linux does (`~0`).
+pub const ERI_POLL_ITERS: usize = 100_000;
+
+/// Write an ERI register, in Linux's `_rtl_eri_write` shape
+/// (EXGMAC type): data to `ERIDR`, then the command word
+/// (`WRITE_CMD | type | mask | addr`) to `ERIAR`, then poll until
+/// the flag clears. The mask selects byte lanes, one bit per byte
+/// (bit `n` enables byte `n`), as Linux's `ERIAR_MASK_*`
+/// constants encode it.
+///
+/// Misaligned `addr` or an empty `mask` is a no-op, as Linux's
+/// `WARN` + return is.
+///
+/// # Safety
+///
+/// The caller must own the register window exclusively; the
+/// `RegFile` contract of `regs` applies.
+pub unsafe fn eri_write<R: RegFile>(regs: &mut R, addr: u32, mask: u32, val: u32) {
+    if addr & 3 != 0 || mask == 0 {
+        return;
+    }
+    // SAFETY: caller owns the register window (see above).
+    unsafe { regs.write32(ERI_DATA_REG, val) };
+    let cmd = ERI_WRITE_CMD | ERI_TYPE_EXGMAC | mask | addr;
+    // SAFETY: as above.
+    unsafe { regs.write32(ERI_ADDR_REG, cmd) };
+    for _ in 0..ERI_POLL_ITERS {
+        // SAFETY: as above.
+        if unsafe { regs.read32(ERI_ADDR_REG) } & ERI_FLAG == 0 {
+            return;
+        }
+    }
+}
+
+/// Read an ERI register, in Linux's `_rtl_eri_read` shape
+/// (EXGMAC type): the command word (`READ_CMD | type |
+/// `MASK_1111 | addr`) to `ERIAR`, then poll until the flag sets
+/// and return `ERIDR`. A stuck device (or a misaligned `addr`)
+/// yields `u32::MAX`, as Linux's `~0` on timeout.
+///
+/// # Safety
+///
+/// The caller must own the register window exclusively; the
+/// `RegFile` contract of `regs` applies.
+pub unsafe fn eri_read<R: RegFile>(regs: &mut R, addr: u32) -> u32 {
+    if addr & 3 != 0 {
+        return u32::MAX;
+    }
+    let cmd = ERI_READ_CMD | ERI_TYPE_EXGMAC | ERI_MASK_1111 | addr;
+    // SAFETY: caller owns the register window (see above).
+    unsafe { regs.write32(ERI_ADDR_REG, cmd) };
+    for _ in 0..ERI_POLL_ITERS {
+        // SAFETY: as above.
+        if unsafe { regs.read32(ERI_ADDR_REG) } & ERI_FLAG != 0 {
+            // SAFETY: as above.
+            return unsafe { regs.read32(ERI_DATA_REG) };
+        }
+    }
+    u32::MAX
+}
+
+/// Set ERI bits, in Linux's `rtl_eri_set_bits` shape: full-dword
+/// read-modify-write through [`eri_read`] / [`eri_write`].
+///
+/// # Safety
+///
+/// The caller must own the register window exclusively; the
+/// `RegFile` contract of `regs` applies.
+pub unsafe fn eri_set_bits<R: RegFile>(regs: &mut R, addr: u32, bits: u32) {
+    // SAFETY: caller owns the register window (see above).
+    let cur = unsafe { eri_read(regs, addr) };
+    // SAFETY: as above.
+    unsafe { eri_write(regs, addr, ERI_MASK_1111, cur | bits) };
+}
+
+/// Clear ERI bits, in Linux's `rtl_eri_clear_bits` shape.
+///
+/// # Safety
+///
+/// The caller must own the register window exclusively; the
+/// `RegFile` contract of `regs` applies.
+pub unsafe fn eri_clear_bits<R: RegFile>(regs: &mut R, addr: u32, bits: u32) {
+    // SAFETY: caller owns the register window (see above).
+    let cur = unsafe { eri_read(regs, addr) };
+    // SAFETY: as above.
+    unsafe { eri_write(regs, addr, ERI_MASK_1111, cur & !bits) };
 }
 
 // ── EEE (802.3az) ───────────────────────────────────────────────────
@@ -1416,6 +1540,263 @@ mod tests {
     kernel_test_in!(
         "drivers/net/realtek-features",
         smoke_features_wol_conversation
+    );
+
+    /// Fixture modelling the ERIAR flag dance, which a plain
+    /// last-write-wins store cannot express: an ERIAR write with
+    /// the flag bit set applies a masked write to the shadow store
+    /// and clears the flag (write complete); a write with the flag
+    /// clear loads `ERIDR` from the shadow store and sets the flag
+    /// (read data ready). The address field is decoded as the low
+    /// 12 bits and the mask as bits 15:12, the only decoding
+    /// consistent with Linux's command-word composition
+    /// (`WRITE_CMD | type | mask | addr`) for the sub-0x1000
+    /// addresses Linux uses. Sub-word accesses use plain cells;
+    /// the accessor only ever uses 32-bit ERI access.
+    struct EriRegs {
+        plain: Vec<(u64, u32)>,
+        shadow: Vec<(u32, u32)>,
+        eridr: u32,
+        flag_high: bool,
+        eriar_log: Vec<u32>,
+    }
+
+    impl EriRegs {
+        fn new() -> Self {
+            Self {
+                plain: Vec::new(),
+                shadow: Vec::new(),
+                eridr: 0,
+                flag_high: false,
+                eriar_log: Vec::new(),
+            }
+        }
+
+        fn shadow(&self, addr: u32) -> u32 {
+            for (a, v) in self.shadow.iter().rev() {
+                if *a == addr {
+                    return *v;
+                }
+            }
+            0
+        }
+
+        fn put_shadow(&mut self, addr: u32, val: u32) {
+            for (a, v) in self.shadow.iter_mut() {
+                if *a == addr {
+                    *v = val;
+                    return;
+                }
+            }
+            self.shadow.push((addr, val));
+        }
+
+        fn plain_get(&self, offset: u64) -> u32 {
+            for (o, v) in self.plain.iter().rev() {
+                if *o == offset {
+                    return *v;
+                }
+            }
+            0
+        }
+
+        fn plain_put(&mut self, offset: u64, val: u32) {
+            for (o, v) in self.plain.iter_mut() {
+                if *o == offset {
+                    *v = val;
+                    return;
+                }
+            }
+            self.plain.push((offset, val));
+        }
+    }
+
+    // SAFETY: EriRegs performs no hardware access; its methods only
+    // record into memory, so the register-window contract is vacuous.
+    unsafe impl RegFile for EriRegs {
+        unsafe fn read8(&self, offset: u64) -> u8 {
+            self.plain_get(offset) as u8
+        }
+
+        unsafe fn read16(&self, offset: u64) -> u16 {
+            self.plain_get(offset) as u16
+        }
+
+        unsafe fn read32(&self, offset: u64) -> u32 {
+            match offset {
+                ERI_ADDR_REG => {
+                    if self.flag_high {
+                        ERI_FLAG
+                    } else {
+                        0
+                    }
+                }
+                ERI_DATA_REG => self.eridr,
+                _ => self.plain_get(offset),
+            }
+        }
+
+        unsafe fn write8(&mut self, offset: u64, value: u8) {
+            self.plain_put(offset, value as u32);
+        }
+
+        unsafe fn write16(&mut self, offset: u64, value: u16) {
+            self.plain_put(offset, value as u32);
+        }
+
+        unsafe fn write32(&mut self, offset: u64, value: u32) {
+            match offset {
+                ERI_ADDR_REG => {
+                    self.eriar_log.push(value);
+                    let addr = value & 0xfff;
+                    let mask = (value >> ERI_MASK_SHIFT) & 0xf;
+                    if value & ERI_FLAG != 0 {
+                        let mut cur = self.shadow(addr);
+                        for lane in 0..4 {
+                            if mask & (1 << lane) != 0 {
+                                let byte = (self.eridr >> (lane * 8)) & 0xff;
+                                cur &= !(0xff << (lane * 8));
+                                cur |= byte << (lane * 8);
+                            }
+                        }
+                        self.put_shadow(addr, cur);
+                        self.flag_high = false;
+                    } else {
+                        self.eridr = self.shadow(addr);
+                        self.flag_high = true;
+                    }
+                }
+                ERI_DATA_REG => self.eridr = value,
+                _ => self.plain_put(offset, value),
+            }
+        }
+    }
+
+    fn smoke_features_eri_conversation() -> TestResult {
+        // Command-word pins first: a set_bits on a fresh fixture
+        // must issue exactly one read command then one write
+        // command, with Linux's exact words.
+        let mut regs = EriRegs::new();
+        // SAFETY: EriRegs fixture — no hardware is touched.
+        unsafe { eri_set_bits(&mut regs, ERI_MAGIC_ADDR, ERI_MAGIC_PACKET_V2) };
+        let expect_read = ERI_READ_CMD | ERI_TYPE_EXGMAC | ERI_MASK_1111 | ERI_MAGIC_ADDR;
+        let expect_write = ERI_WRITE_CMD | ERI_TYPE_EXGMAC | ERI_MASK_1111 | ERI_MAGIC_ADDR;
+        if regs.eriar_log != [expect_read, expect_write] {
+            return TestResult::Fail("ERI set_bits did not issue Linux's command words");
+        }
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, ERI_MAGIC_ADDR) } != ERI_MAGIC_PACKET_V2 {
+            return TestResult::Fail("ERI set_bits did not set MagicPacket_v2");
+        }
+
+        // Full write, masked write, set/clear round-trip.
+        let mut regs = EriRegs::new();
+        // SAFETY: EriRegs fixture — no hardware is touched.
+        unsafe { eri_write(&mut regs, ERI_MAGIC_ADDR, ERI_MASK_1111, 0x1234_5600) };
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, ERI_MAGIC_ADDR) } != 0x1234_5600 {
+            return TestResult::Fail("ERI full write did not round-trip");
+        }
+        // SAFETY: as above.
+        unsafe { eri_write(&mut regs, ERI_MAGIC_ADDR, ERI_MASK_0001, 0xFFFF_FF78) };
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, ERI_MAGIC_ADDR) } != 0x1234_5678 {
+            return TestResult::Fail("ERI low-byte mask wrote outside byte 0");
+        }
+        // SAFETY: as above.
+        unsafe { eri_set_bits(&mut regs, ERI_MAGIC_ADDR, ERI_MAGIC_PACKET_V2) };
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, ERI_MAGIC_ADDR) } != 0x1235_5678 {
+            return TestResult::Fail("ERI set_bits did not set bit 16 preserving the rest");
+        }
+        // SAFETY: as above.
+        unsafe { eri_clear_bits(&mut regs, ERI_MAGIC_ADDR, ERI_MAGIC_PACKET_V2) };
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, ERI_MAGIC_ADDR) } != 0x1234_5678 {
+            return TestResult::Fail("ERI clear_bits did not clear bit 16 preserving the rest");
+        }
+        // A second address is independent.
+        // SAFETY: as above.
+        unsafe { eri_write(&mut regs, 0x1bc, ERI_MASK_1111, 0x0BAD_F00D) };
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, 0x1bc) } != 0x0BAD_F00D {
+            return TestResult::Fail("ERI second address did not round-trip");
+        }
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut regs, ERI_MAGIC_ADDR) } != 0x1234_5678 {
+            return TestResult::Fail("ERI second address clobbered 0x0dc");
+        }
+
+        // Timeout and guard behavior, on a plain last-write store
+        // (whose flag never transitions, so every poll exhausts).
+        let mut plain = RegLog::new();
+        // SAFETY: RegLog fixture — no hardware is touched.
+        if unsafe { eri_read(&mut plain, ERI_MAGIC_ADDR) } != u32::MAX {
+            return TestResult::Fail("ERI read without flag rise did not time out to all-ones");
+        }
+        // SAFETY: as above.
+        if unsafe { eri_read(&mut plain, ERI_MAGIC_ADDR + 1) } != u32::MAX {
+            return TestResult::Fail("ERI misaligned read did not return all-ones");
+        }
+        // A misaligned write must issue no ERIAR command at all: check
+        // it on a fresh fixture, since the aligned reads above already
+        // wrote their command words to ERIAR on `plain`.
+        let mut plain_misaligned = RegLog::new();
+        // SAFETY: RegLog fixture — no hardware is touched.
+        unsafe {
+            eri_write(
+                &mut plain_misaligned,
+                ERI_MAGIC_ADDR + 1,
+                ERI_MASK_1111,
+                0x1234_5678,
+            )
+        };
+        if plain_misaligned.last_write_to(ERI_ADDR_REG).is_some() {
+            return TestResult::Fail("ERI misaligned write touched ERIAR");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-features",
+        smoke_features_eri_conversation
+    );
+
+    fn smoke_features_wol_eri0dc_pending_shape() -> TestResult {
+        // The MMIO-only half is unchanged: Eri0dc still reports the
+        // step (the owning driver drains it through the accessor).
+        let mut regs = RegLog::new();
+        let pending =
+        // SAFETY: RegLog fixture — no hardware is touched.
+            unsafe { apply_wol(&mut regs, WolOpts::PHY | WolOpts::MAGIC, WolMagic::Eri0dc, WolPmeReg::Config2) };
+        if pending != WolPendingMagic::Eri0dc(true) {
+            return TestResult::Fail("Eri0dc magic-on step was not reported");
+        }
+        // Config3 gets LinkUp only — no Config3 magic bit on evl.
+        match regs.last_write_to(REG_CONFIG3) {
+            Some(w) if w.value == CONFIG3_LINKUP as u32 => {}
+            _ => return TestResult::Fail("Eri0dc Config3 must carry LinkUp only"),
+        }
+        // Config2 PME still programmed.
+        match regs.last_write_to(REG_CONFIG2) {
+            Some(w) if w.value == CONFIG_PME_BIT as u32 => {}
+            _ => return TestResult::Fail("Eri0dc Config2 must get PME_SIGNAL"),
+        }
+        let mut regs2 = RegLog::new();
+        let pending2 =
+        // SAFETY: RegLog fixture — no hardware is touched.
+            unsafe { apply_wol(&mut regs2, WolOpts::default(), WolMagic::Eri0dc, WolPmeReg::Config2) };
+        if pending2 != WolPendingMagic::Eri0dc(false) {
+            return TestResult::Fail("Eri0dc magic-off step was not reported");
+        }
+        match regs2.last_write_to(REG_CONFIG3) {
+            Some(w) if w.value == 0 => {}
+            _ => return TestResult::Fail("Eri0dc empty opts must clear Config3"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-features",
+        smoke_features_wol_eri0dc_pending_shape
     );
 
     fn smoke_features_eee_caps() -> TestResult {
