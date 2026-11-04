@@ -743,20 +743,20 @@ mod tests {
         }
         // Paged address arithmetic: page << 4, register rebased
         // by 0x10 and doubled (two bytes per register).
-        if paged_addr(0x0a5d, 0x10) != Ok(0xa5d0) {
+        if PhyAccess::paged_addr(0x0a5d, 0x10) != Ok(0xa5d0) {
             return TestResult::Fail("7.60 emulation must land at OCP 0xa5d0");
         }
-        if paged_addr(0x0a6d, 0x12) != Ok(0xa6d4) {
+        if PhyAccess::paged_addr(0x0a6d, 0x12) != Ok(0xa6d4) {
             return TestResult::Fail("7.62 emulation must land at OCP 0xa6d4");
         }
         // Page 0 selects the standard base with no rebase — the
         // BMCR restart reads/writes OCP 0xA400.
-        if paged_addr(0, MII_BMCR_REG) != Ok(OCP_STD_PHY_BASE as u32) {
+        if PhyAccess::paged_addr(0, MII_BMCR_REG) != Ok(OCP_STD_PHY_BASE as u32) {
             return TestResult::Fail("BMCR must land at OCP_STD_PHY_BASE");
         }
         // A register below the paged window is rejected, not
         // silently wrapped.
-        if paged_addr(0x0a5d, 0x0f) != Err(PhyError::BadPagedRegister(0x0f)) {
+        if PhyAccess::paged_addr(0x0a5d, 0x0f) != Err(PhyError::BadPagedRegister(0x0f)) {
             return TestResult::Fail("paged_addr admitted a register below 0x10");
         }
         TestResult::Pass
@@ -786,5 +786,8 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/net/realtek-phy-access", smoke_phy_bmcr_restart_value);
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_bmcr_restart_value
+    );
 }

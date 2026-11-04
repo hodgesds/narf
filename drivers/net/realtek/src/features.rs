@@ -1509,11 +1509,17 @@ mod tests {
         // Each bit independently: a single-speed set maps to exactly
         // one bit, and an all-false set (EEE-off board, or the
         // Unknown chip's version 0) advertises nothing.
-        let only_100 = EeeCaps { fd_100: true, ..EeeCaps::default() };
+        let only_100 = EeeCaps {
+            fd_100: true,
+            ..EeeCaps::default()
+        };
         if eee_adv(only_100) != 0x0002 || eee_adv2(only_100) != 0 {
             return TestResult::Fail("100TX-only caps must map to 7.60 bit 1 alone");
         }
-        let only_5000 = EeeCaps { fd_5000: true, ..EeeCaps::default() };
+        let only_5000 = EeeCaps {
+            fd_5000: true,
+            ..EeeCaps::default()
+        };
         if eee_adv(only_5000) != 0 || eee_adv2(only_5000) != 0x0002 {
             return TestResult::Fail("5000T-only caps must map to 7.62 bit 1 alone");
         }
