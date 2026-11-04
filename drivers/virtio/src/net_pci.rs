@@ -337,8 +337,30 @@ pub struct VirtioNetPci {
     /// = caller hasn't called `enable_tx_msix` yet, TX uses polled
     /// used-ring drain.
     pub tx_irq_vector: Option<u8>,
-    msix: Option<narf_bus::MsixTable>,
+    /// MSI-X table handle, retained across suspend so resume can
+    /// re-enable the same programmed vectors without the probe-time
+    /// `Cap` + `BusDevice`. Lock-guarded (rather than plain) because
+    /// suspend/resume/detach run through `&self` accessors while the
+    /// probe-time `enable_*` methods run through `&mut self`.
+    msix: IrqSafeSpinLock<Option<narf_bus::MsixTable>>,
     pub ready: bool,
+    /// Datapath gate: set by `detach_device`, never cleared. While
+    /// set, every TX/RX entry point fails fast (TX → `NoQueues`,
+    /// RX take → `None`, arm → `false`, notify → no-op) so a parked
+    /// pump can no longer touch the device. See the power-management
+    /// section below.
+    detached: AtomicBool,
+    /// Datapath gate: set by `suspend`, cleared by `resume` (LAST,
+    /// after MSI-X is re-enabled). Same fail-fast shape as
+    /// `detached`, but the queues stay live so resume is a re-arm
+    /// rather than a rebuild — see the suspend doc comment for why
+    /// no device reset happens here (detach owns the reset).
+    suspended: AtomicBool,
+    /// Interface name this controller registered as (`eth%d`), stashed
+    /// at registration time so the detach path can publish link DOWN,
+    /// clear the RX-mirror note, and unregister both registries
+    /// without reaching back into the registry for the name.
+    ifname: IrqSafeSpinLock<Option<alloc::string::String>>,
     /// 48-bit hardware address. Initial value read from device-cfg
     /// at bring-up (zero when `VIRTIO_NET_F_MAC` wasn't advertised).
     /// Subsequent `set_mac` calls overwrite the cache so `mac()`
@@ -1007,8 +1029,11 @@ impl VirtioNetPci {
             rx_irq_vectors: alloc::vec::Vec::new(),
             flow_affine: false,
             tx_irq_vector: None,
-            msix: None,
+            msix: IrqSafeSpinLock::new(None),
             ready: true,
+            detached: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
+            ifname: IrqSafeSpinLock::new(None),
             mac: IrqSafeSpinLock::new(mac),
             has_ctrl_mac_addr: want_ctrl_mac_addr,
             mtu,
@@ -1077,7 +1102,7 @@ impl VirtioNetPci {
         // SAFETY: caller-owns the device.
         let (v, table) = unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 0) }?;
         self.irq_vector = Some(v);
-        self.msix = Some(table);
+        *self.msix.lock() = Some(table);
         Ok(v)
     }
 
@@ -1137,7 +1162,7 @@ impl VirtioNetPci {
             unsafe { crate::pci::enable_msix_rx_queues(&self.common, cap, device, &targets) }?;
         self.irq_vector = vectors.first().copied().flatten();
         self.rx_irq_vectors = vectors;
-        self.msix = Some(table);
+        *self.msix.lock() = Some(table);
         Ok(())
     }
 
@@ -1159,7 +1184,7 @@ impl VirtioNetPci {
         // (enable_msix_queue allocates a fresh slot in the
         // existing table; there's only one table per device,
         // and the new handle keeps both vectors live).
-        self.msix = Some(table);
+        *self.msix.lock() = Some(table);
         Ok(v)
     }
 
@@ -1218,6 +1243,9 @@ impl VirtioNetPci {
     /// `None` for backpressure. Pairs with `tx_buf_release_on`; never
     /// allocates in the packet path.
     fn tx_buf_acquire_on(&self, pair_idx: usize) -> Option<DmaBuffer> {
+        if self.datapath_gated() {
+            return None;
+        }
         let pair = self.pairs.get(pair_idx)?;
         pair.tx_pool.try_acquire().or_else(|| {
             // Reclaim before requiring another buffer: once the fixed pool
@@ -1316,6 +1344,14 @@ impl VirtioNetPci {
         frame_len: u32,
         meta: narf_net::TxMeta,
     ) -> Result<(), VirtioPciError> {
+        // Gate FIRST, before any header write or ring touch: a
+        // refused frame's caller-owned buffer goes back to its
+        // queue-local pool (mirroring the ring-full path below) so
+        // a gated device never drains the fixed TX pool.
+        if self.datapath_gated() {
+            self.tx_buf_release_on(pair_idx, buf);
+            return Err(VirtioPciError::NoQueues);
+        }
         let pair = self.pairs.get(pair_idx).ok_or(VirtioPciError::NoQueues)?;
         let frame_len = frame_len as usize;
         if frame_len == 0 || frame_len > MAX_TX_TSO_FRAME {
@@ -1478,8 +1514,12 @@ impl VirtioNetPci {
     /// Live link state. Reads the status word from device-cfg every
     /// call when `VIRTIO_NET_F_STATUS` was negotiated; returns
     /// `true` unconditionally otherwise (spec: absence of the
-    /// feature means assume link up).
+    /// feature means assume link up). Suspended or detached →
+    /// `false` (e1000 parity: probe-time link AND NOT suspended).
     pub fn link_up(&self) -> bool {
+        if self.datapath_gated() {
+            return false;
+        }
         if !self.has_status {
             return true;
         }
@@ -1492,6 +1532,148 @@ impl VirtioNetPci {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let s = unsafe { r.read16(CFG_STATUS) };
         s & VIRTIO_NET_S_LINK_UP != 0
+    }
+
+    // ── Power management and detach ──────────────────────────────────
+    //
+    // igb pattern (`drivers/net/igb/src/igb.rs`, power-management
+    // section) + the net spec §3 detach obligation (issue #789),
+    // adapted to virtio: there is no per-queue DMA-stop register
+    // (queue reset needs F_RING_RESET, which this driver does not
+    // negotiate), so the two operations split by what they must
+    // guarantee:
+    //
+    // - suspend() is LIGHT: gate the datapath, mask MSI-X at the
+    //   retained table, publish link DOWN. No device reset, no queue
+    //   teardown — the posted RX buffers stay valid DMA targets, so
+    //   a device RX during suspend lands in a still-owned buffer
+    //   and drains on resume instead of faulting. TX (the DMA this
+    //   driver initiates) stops completely via the gates. Resume is
+    //   therefore a re-arm (MSI-X re-enable + flag clear + link
+    //   republish), not a rebuild. This is the virtio analog of
+    //   igb's RCTL/TCTL suspend words: stop what the driver
+    //   controls, keep what the device already owns valid.
+    // - detach_device() is FULL: gate, mask MSI-X, DEVICE RESET
+    //   (status 0 clears DRIVER_OK and resets every queue
+    //   device-side — the real DMA stop), then take every queue
+    //   `Option` to `None` so no datapath method can touch a ring
+    //   again. The reset MUST precede the controller drop: after
+    //   detach the `Arc` is released and the DMA buffers are freed,
+    //   so any device still holding DRIVER_OK + posted buffers
+    //   would DMA into freed pages. Linux `virtnet_remove`
+    //   (virtio_net.c) does the same shape: unregister, then
+    //   `remove_vq_common` (reset + delete queues).
+    // The async pumps are NOT joined (igb parity): they hold no
+    // controller `Arc` — RX forwarders exit when `with_at(idx)`
+    // returns `None` after the tombstone, and the TX forwarder exits
+    // when the registry unregister drops the iface's TX producer
+    // (channel close). Every datapath entry point fails fast once
+    // the gate is set, so a parked pump can no longer touch the
+    // device in the meantime. The RX drain hook stays installed
+    // (no uninstall API exists) but fails closed: it returns
+    // `false` once the primary name is cleared.
+
+    /// Whether the datapath may run: false while suspended or detached.
+    /// Factored pure so the fixture pins the gate the live paths use.
+    pub const fn datapath_allowed(detached: bool, suspended: bool) -> bool {
+        !detached && !suspended
+    }
+
+    /// Current gate state (for the fixture + diagnostics).
+    fn datapath_gated(&self) -> bool {
+        !Self::datapath_allowed(
+            self.detached.load(Ordering::Acquire),
+            self.suspended.load(Ordering::Acquire),
+        )
+    }
+
+    /// Stash the interface name at registration time (see the
+    /// `ifname` field doc). Called once by `register_net_interface`.
+    pub fn set_ifname(&self, name: alloc::string::String) {
+        *self.ifname.lock() = Some(name);
+    }
+
+    /// Suspend the device (light contract, see the section header).
+    /// Detached → `Err`; already-suspended → `Ok` no-op; else set
+    /// the flag FIRST (datapath fails fast from here on), mask MSI-X
+    /// at the retained table, publish link DOWN. Queues and posted
+    /// RX buffers stay live and valid; `resume` re-arms them.
+    pub fn suspend(&self) -> Result<(), VirtioPciError> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // SAFETY: caller owns the device's config space; datapath
+        // sources are gated above, and the table entries + vectors
+        // are retained (not freed), so an in-flight IRQ wake just
+        // re-parks its forwarder.
+        if let Some(table) = self.msix.lock().as_mut() {
+            unsafe { table.disable() };
+        }
+        if let Some(name) = self.ifname.lock().as_deref() {
+            narf_net::iface::set_link_metadata(name, false, None, None);
+        }
+        Ok(())
+    }
+
+    /// Resume a suspended device: re-enable MSI-X from the retained
+    /// table, clear the flag LAST (datapath stays gated until the
+    /// interrupts are back), republish link from live STATUS.
+    /// Detached → `Err`; not-suspended → `Ok` no-op. No queue
+    /// rebuild: suspend never tore the queues down.
+    pub fn resume(&self) -> Result<(), VirtioPciError> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // SAFETY: same config-space ownership as suspend; the table
+        // entries were programmed at probe and retained, so
+        // re-enable restores delivery on the same vectors.
+        if let Some(table) = self.msix.lock().as_mut() {
+            unsafe { table.enable() }?;
+        }
+        self.suspended.store(false, Ordering::Release);
+        if let Some(name) = self.ifname.lock().as_deref() {
+            let link = self.link_up();
+            narf_net::iface::set_link_metadata(name, link, None, None);
+        }
+        Ok(())
+    }
+
+    /// Device half of detach (the registry half lives in
+    /// `virtio_net_detach`): set the gate, mask MSI-X, DEVICE RESET,
+    /// take every queue handle to `None`. Idempotent: a second call
+    /// finds the gate already set and does nothing. Safe to call
+    /// with the controller still in `CONTROLLERS` (the free fn
+    /// tombstones first); the reset precedes any `Arc` drop, so the
+    /// device can never DMA into freed buffers.
+    pub fn detach_device(&self) {
+        if self.detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // SAFETY: caller owns the device's config space; datapath
+        // sources are gated above, table entries retained.
+        if let Some(table) = self.msix.lock().as_mut() {
+            unsafe { table.disable() };
+        }
+        // Device reset: writing 0 to device status clears DRIVER_OK
+        // and resets every virtqueue device-side (VirtIO 1.2 §4.1).
+        // This is the DMA stop — without it the device would keep
+        // writing into RX buffers the controller drop is about to
+        // free. Queues are taken to `None` below so no software path
+        // can touch a ring after this point either.
+        // SAFETY: identity-mapped MMIO; caller owns the device.
+        unsafe {
+            self.common.write8(CC_DEVICE_STATUS, 0);
+        }
+        for pair in &self.pairs {
+            pair.rx_queue.lock().take();
+            pair.tx_queue.lock().take();
+        }
     }
 
     /// `true` iff this controller negotiated F_CTRL_VQ and has a
@@ -1512,6 +1694,13 @@ impl VirtioNetPci {
     /// fine but interleaving is sequential. Control commands are
     /// rare (PHY-driven events), so no contention concern.
     pub fn submit_control(&self, class: u8, cmd: u8, payload: &[u8]) -> Result<u8, VirtioPciError> {
+        // Fail fast while suspended or detached: no control commands
+        // against a quiesced device (the queue is dead after detach
+        // anyway — the device was reset — so a submit would only
+        // burn the 1 s completion timeout).
+        if self.datapath_gated() {
+            return Err(VirtioPciError::NoQueues);
+        }
         let ctrl = self.ctrl.as_ref().ok_or(VirtioPciError::NoQueues)?;
         let mut g = ctrl.lock();
         // Layout within `buf`:
@@ -1638,6 +1827,9 @@ impl VirtioNetPci {
     /// strand a frame in the ring until the poll backstop deadline. `false` for
     /// a missing pair/queue (nothing to wait on).
     pub fn rx_arm_and_pending(&self, pair_idx: usize) -> bool {
+        if self.datapath_gated() {
+            return false;
+        }
         let Some(pair) = self.pairs.get(pair_idx) else {
             return false;
         };
@@ -1660,6 +1852,9 @@ impl VirtioNetPci {
     }
 
     pub fn rx_take_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
+        if self.datapath_gated() {
+            return None;
+        }
         let pair = self.pairs.get(pair_idx)?;
         let elem = {
             let mut g = pair.rx_queue.lock();
@@ -1719,7 +1914,11 @@ impl VirtioNetPci {
     /// Notify the device that new RX buffers have been posted to the avail ring.
     /// This should be called *after* a batch of `rx_take`s to avoid kicking
     /// the device synchronously for every single frame (mimicking Linux NAPI).
+    /// No-op while suspended or detached: no kicks to a masked/reset device.
     pub fn rx_notify(&self, pair_idx: usize) {
+        if self.datapath_gated() {
+            return;
+        }
         if let Some(pair) = self.pairs.get(pair_idx) {
             let needs_kick = {
                 pair.rx_queue
@@ -1754,12 +1953,16 @@ impl VirtioNetPci {
 // forever with IRQs disabled on the single cooperative CPU (the lock
 // holder never resumes to release it). Cloning the Arc out first means the
 // closure — and any re-entrant net_pci call it makes via the sleep-pump
-// spin — runs with the lock released. Controllers are append-only after
-// probe, so a stale clone is never freed mid-use.
+// spin — runs with the lock released. A stale clone is never freed
+// mid-use: detach tombstones its slot (`None`) instead of removing it,
+// so forwarder tasks that captured an index keep addressing their own
+// (now-absent) controller rather than a shifted sibling, and a re-probe
+// pushes a NEW slot rather than reusing a detached one. All `with_*`
+// accessors skip tombstones.
 //
 // `pub(crate)` so the e2e re-entrancy regression test can assert the lock
 // is released while a `with_*` closure runs (`smoke_e2e_net_with_at_*`).
-pub(crate) static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
+pub(crate) static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Option<Arc<VirtioNetPci>>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 /// Symmetric per-flow hash of an Ethernet frame → TX pair index in
@@ -1816,7 +2019,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if dev_cfg != 0 {
         let already = {
             let g = CONTROLLERS.lock();
-            g.iter().any(|c| c.cfg_phys() == dev_cfg)
+            g.iter().flatten().any(|c| c.cfg_phys() == dev_cfg)
         };
         if already {
             return Ok(());
@@ -1845,7 +2048,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let idx = {
         let mut g = CONTROLLERS.lock();
         let i = g.len();
-        g.push(Arc::new(dev));
+        g.push(Some(Arc::new(dev)));
         i
     };
     let bound_name = alloc::format!("vnet{}", idx);
@@ -1947,6 +2150,11 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     } else {
         narf_net::iface::reserve_name("eth%d").into()
     };
+    // Stash the name on the controller BEFORE either registry call
+    // consumes it, so `virtio_net_detach` can publish link DOWN,
+    // clear the RX-mirror note, and unregister both registries even
+    // if registration below fails midway.
+    let _ = with_at(idx, |c| c.set_ifname(name.clone()));
     let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
     let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
     // Keep the legacy L3 registry -- which is what rtnetlink and
@@ -2396,6 +2604,13 @@ static DRAIN_PAIR_RR: AtomicU64 = AtomicU64::new(0);
 /// exactly the pair that supplied it and notify that pair after replenishing.
 /// Returns `true` iff a frame was actually processed.
 fn vnet0_drain_fn() -> bool {
+    // Fail closed after a primary detach: the hook stays installed
+    // (no uninstall API exists) and `with_controller` would otherwise
+    // resolve to the NEXT live controller after the primary slot is
+    // tombstoned, draining its frames into a cleared primary name.
+    if primary_iface_name().is_empty() {
+        return false;
+    }
     let taken = with_controller(|c| {
         let pairs = c.num_pairs();
         if pairs == 0 {
@@ -2439,19 +2654,20 @@ pub fn register_pci_driver() {
 }
 
 pub fn is_probed() -> bool {
-    !CONTROLLERS.lock().is_empty()
+    CONTROLLERS.lock().iter().any(|c| c.is_some())
 }
 
 /// Number of bound virtio-net devices.
 pub fn count() -> usize {
-    CONTROLLERS.lock().len()
+    CONTROLLERS.lock().iter().flatten().count()
 }
 
 /// Active virtio-net queue-pair count on the primary device (1 unless
 /// VIRTIO_NET_F_MQ was negotiated and `VQ_PAIRS_SET` accepted N>1).
 /// The interface name `iface::register` gave the primary controller
-/// (`eth%d`, Linux `dev_alloc_name`). Set once at probe and leaked: the
-/// device lives as long as the kernel.
+/// (`eth%d`, Linux `dev_alloc_name`). Set once at probe; cleared by
+/// `virtio_net_detach` for the primary slot (the drain hook reads it
+/// to fail closed after detach).
 static PRIMARY_IFNAME: narf_lib::sync::IrqSafeSpinLock<Option<&'static str>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -2463,7 +2679,9 @@ pub fn primary_iface_name() -> &'static str {
 pub fn primary_num_pairs() -> usize {
     CONTROLLERS
         .lock()
-        .first()
+        .iter()
+        .flatten()
+        .next()
         .map(|c| c.num_pairs())
         .unwrap_or(0)
 }
@@ -2475,7 +2693,7 @@ pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
     // Clone the Arc out, then DROP the lock before calling `f` (see the
     // CONTROLLERS doc comment: `f` may re-enter net_pci via tx_dma's
     // sleep-pump spin, which re-locks CONTROLLERS).
-    let ctrl = CONTROLLERS.lock().first().cloned();
+    let ctrl = CONTROLLERS.lock().iter().flatten().next().cloned();
     ctrl.as_deref().map(f)
 }
 
@@ -2483,7 +2701,8 @@ pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
 pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
     // Snapshot the Arc handles, drop the lock, then run `f` (see the
     // CONTROLLERS doc comment).
-    let ctrls: alloc::vec::Vec<Arc<VirtioNetPci>> = CONTROLLERS.lock().iter().cloned().collect();
+    let ctrls: alloc::vec::Vec<Arc<VirtioNetPci>> =
+        CONTROLLERS.lock().iter().flatten().cloned().collect();
     for c in &ctrls {
         f(c);
     }
@@ -2495,8 +2714,53 @@ pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
 pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
     // Clone the Arc out, then DROP the lock before calling `f` (see the
     // CONTROLLERS doc comment).
-    let ctrl = CONTROLLERS.lock().get(idx).cloned();
+    let ctrl = CONTROLLERS.lock().get(idx).and_then(|o| o.clone());
     ctrl.as_deref().map(f)
+}
+
+/// Detach the bound virtio-net device at `idx`, if any: tombstone
+/// the slot first (forwarders exit on their next tick — RX via
+/// `with_at` → `None`, TX via the registry unregister dropping the
+/// iface's TX producer — and no later probe reuses the index), then
+/// the device half (`detach_device`: gate, MSI-X mask, device
+/// reset, queue teardown), then the registry half the net spec §3
+/// obliges — publish link DOWN, clear the RX-mirror attach note
+/// for the interface name (`eth%d` names are lowest-free-allocated
+/// and reused), and unregister from BOTH registries (legacy
+/// `iface` + ring `registry`). Idempotent: a second call finds the
+/// tombstone and does nothing. The async pumps are not joined
+/// (they hold no controller `Arc`); every datapath entry point
+/// fails fast once the gate is set.
+/// The bound-driver diagnostic record (`record_bound` at probe) has
+/// no removal API, so the entry is left in place — a remainder, not
+/// a leak of device state.
+pub fn virtio_net_detach(idx: usize) {
+    let controller = CONTROLLERS.lock().get_mut(idx).and_then(Option::take);
+    let Some(device) = controller else {
+        return;
+    };
+    device.detach_device();
+    let name: Option<alloc::string::String> = device.ifname.lock().as_ref().map(|s| s.clone());
+    let Some(name) = name else {
+        // Controller never reached registration (probe pushed it
+        // but `register_net_interface` never stashed a name): the
+        // device half above is still the correct teardown, there is
+        // just no registry half to run.
+        return;
+    };
+    narf_net::iface::set_link_metadata(&name, false, None, None);
+    // virtio-net's `VirtioNet::rx_ring()` never calls
+    // `note_rx_mirror_attached` (unlike atheros/igc), so no note
+    // exists today — but the spec §3 obligation covers
+    // dual-published families, and a future pump change could add
+    // one, so clear unconditionally rather than reasoning about
+    // the current pump.
+    narf_drivers_net_core::publish::clear_rx_mirror_attached(&name);
+    let _ = narf_net::iface::unregister(&name);
+    let _ = narf_net::registry().unregister(&name);
+    if idx == 0 || name == primary_iface_name() {
+        *PRIMARY_IFNAME.lock() = None;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2577,8 +2841,11 @@ mod tx_tests {
                 rx_irq_vectors: Vec::new(),
                 flow_affine: false,
                 tx_irq_vector: None,
-                msix: None,
+                msix: IrqSafeSpinLock::new(None),
                 ready: true,
+                detached: AtomicBool::new(false),
+                suspended: AtomicBool::new(false),
+                ifname: IrqSafeSpinLock::new(None),
                 mac: IrqSafeSpinLock::new([0; 6]),
                 has_ctrl_mac_addr: false,
                 mtu: 1500,
@@ -2725,5 +2992,120 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_tso_more_flushes_at_pool_limit
+    );
+
+    fn smoke_virtio_net_datapath_gate_matrix() -> TestResult {
+        // Pure predicate the live TX/RX/control paths gate on.
+        let ok = VirtioNetPci::datapath_allowed(false, false)
+            && !VirtioNetPci::datapath_allowed(true, false)
+            && !VirtioNetPci::datapath_allowed(false, true)
+            && !VirtioNetPci::datapath_allowed(true, true);
+        if ok {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("datapath_allowed matrix wrong")
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_datapath_gate_matrix
+    );
+
+    fn smoke_virtio_net_suspend_resume_gates() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            let dev = &fixture.dev;
+            // Fixture has no F_STATUS, so live link reads true.
+            if !dev.link_up() {
+                return Err("fixture link_up not true pre-suspend");
+            }
+            // Acquire BEFORE suspending and hold the buffer, so the
+            // post-suspend acquire-None is the gate, not starvation,
+            // and the refused TX below has a buffer to return.
+            let buf = dev.tx_buf_acquire_on(0).ok_or("pool empty pre-suspend")?;
+            if dev.pairs[0].tx_pool.available() != TX_POOL_CAP - 1 {
+                return Err("pool count wrong after pre-suspend acquire");
+            }
+            dev.suspend().map_err(|_| "suspend failed")?;
+            // Second suspend is a no-op, not an error.
+            dev.suspend().map_err(|_| "second suspend failed")?;
+            if dev.link_up() {
+                return Err("link_up still true while suspended");
+            }
+            if dev.tx_buf_acquire_on(0).is_some() {
+                return Err("TX acquire succeeded while suspended");
+            }
+            // Gate fires before any header write or ring touch, and
+            // the refused frame's buffer goes back to its pool
+            // instead of draining the fixed recycler.
+            if dev.tx_dma_on(0, buf, 1).is_ok() {
+                return Err("TX accepted while suspended");
+            }
+            if dev.pairs[0].tx_pool.available() != TX_POOL_CAP {
+                return Err("refused TX did not return its buffer to the pool");
+            }
+            dev.resume().map_err(|_| "resume failed")?;
+            // Second resume is a no-op, not an error.
+            dev.resume().map_err(|_| "resume-after-resume failed")?;
+            if !dev.link_up() {
+                return Err("link_up not true post-resume");
+            }
+            if dev.tx_buf_acquire_on(0).is_none() {
+                return Err("TX acquire failed post-resume");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_suspend_resume_gates
+    );
+
+    fn smoke_virtio_net_detach_device_teardown() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            let dev = &fixture.dev;
+            // Seed a nonzero device status so the reset write below
+            // is pinned, not vacuous (coherent pages recycle).
+            // SAFETY: RAM-backed fixture region, owned by this fixture.
+            unsafe {
+                dev.common.write8(CC_DEVICE_STATUS, 0xFF);
+            }
+            dev.detach_device();
+            // SAFETY: same RAM-backed region.
+            if unsafe { dev.common.read8(CC_DEVICE_STATUS) } != 0 {
+                return Err("device status not reset by detach");
+            }
+            if dev.pairs[0].tx_queue.lock().is_some() {
+                return Err("TX queue handle not taken by detach");
+            }
+            if dev.link_up() {
+                return Err("link_up still true after detach");
+            }
+            if dev.tx_buf_acquire_on(0).is_some() {
+                return Err("TX acquire succeeded after detach");
+            }
+            if dev.suspend().is_ok() {
+                return Err("suspend accepted after detach");
+            }
+            if dev.resume().is_ok() {
+                return Err("resume accepted after detach");
+            }
+            // Second detach is a no-op, not a panic or double-reset.
+            dev.detach_device();
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_detach_device_teardown
     );
 }
