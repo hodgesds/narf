@@ -783,6 +783,7 @@ pub async fn dmub_notification() -> Result<Option<[u8; 64]>, boot::Error> {
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 type ScanError = crate::amdgpu_dcn_clk::Error;
+use crate::amdgpu_navi22_scanout::ArmedKind;
 
 /// Hardware cursor opt-in (`amdgpu.navi22_hw_cursor`): DML30 here does not
 /// budget a cursor yet (Linux always budgets a 256-wide ARGB cursor), so the
@@ -2073,17 +2074,7 @@ async fn presenter() {
                 // Rendering must finish before the HUBP fetches it; wait
                 // without OWNER (the producer may need it).
                 frame_copy::wait_rendered(pin).await?;
-                let mut owner = OWNER.lock().await;
-                let boot = owner.as_mut().ok_or(ScanError::Busy)?;
-                // SAFETY: OWNER serializes display/reset; the frame retains
-                // its pin, which `shown` keeps after the flip.
-                let Some(before) = unsafe { present_direct(boot, &frame, pin) }.await? else {
-                    // The mode changed under the frame: drop it, keep going.
-                    return Ok(None);
-                };
-                let latched = read_vblank(boot);
-                follow_external(before).await;
-                return Ok(latched);
+                return present_direct(&frame, pin).await;
             }
             // A client framebuffer the HUBP cannot fetch as programmed is
             // copied by the GPU into the owned back surface (amdgpu_dm never
@@ -2099,26 +2090,37 @@ async fn presenter() {
             // before taking OWNER: the producer/transfer also needs it.
             let source = frame_copy::source(&frame).await?;
             let mut owner = OWNER.lock().await;
-            match owner.as_mut() {
-                Some(boot) => {
-                    // SAFETY: OWNER serializes display/reset; the frame
-                    // retains its GEM pin or the trusted DRM dumb backing,
-                    // and source readback completed outside this lock.
-                    match unsafe { present_native(boot, &frame, source.as_deref()) }.await {
-                        Ok((before, after)) => {
-                            // An owned surface is shown: the client
-                            // framebuffer the pipe left is unfetched.
-                            let released = PRESENT.shown.lock().latched_owned();
-                            // Unpinned outside the IRQ-safe lock.
-                            drop(released);
-                            let latched = read_vblank(boot);
-                            follow_flip(before, after).await;
-                            Ok(latched)
-                        }
-                        Err(e) => Err(e),
-                    }
+            let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+            // Taken for the present: a failed copy or flip leaves both
+            // buffers unknown, so it is only put back after the latch.
+            let mut damage = core::mem::take(&mut *PRESENT.damage.lock());
+            // SAFETY: OWNER serializes display/reset; the frame retains its
+            // GEM pin or the trusted DRM dumb backing, and source readback
+            // completed outside this lock.
+            let copied =
+                unsafe { present_native(boot, &frame, source.as_deref(), &mut damage) }.await?;
+            match flip_unlocked(owner, ArmedKind::Back, 0).await? {
+                Latch::Done {
+                    before,
+                    after,
+                    latched,
+                } => {
+                    damage.presented(
+                        copied.tracked,
+                        frame.damage.as_ref(),
+                        Some(copied.address),
+                        0,
+                    );
+                    *PRESENT.damage.lock() = damage;
+                    // An owned surface is shown: the client framebuffer
+                    // the pipe left is unfetched.
+                    let released = PRESENT.shown.lock().latched_owned();
+                    // Unpinned outside the IRQ-safe lock.
+                    drop(released);
+                    follow_flip(before, after).await;
+                    Ok(latched)
                 }
-                None => Err(ScanError::Busy),
+                Latch::Dropped => Ok(None),
             }
         }
         .await;
@@ -2146,18 +2148,116 @@ async fn presenter() {
     }
 }
 
+/// What [`flip_unlocked`] observed.
+enum Latch {
+    /// The flip latched: the owned fronts before and after, and the latch.
+    Done {
+        before: GenericFb,
+        after: GenericFb,
+        latched: Option<crate::drm::card::VblankTime>,
+    },
+    /// The pipe was relit, recovered or stopped while the flip was armed:
+    /// nothing completed and the frame is dropped.
+    Dropped,
+}
+
+/// Arm a flip under `owner`, release OWNER, then poll the latch every
+/// `POLL_US`, retaking OWNER only for each non-blocking check (amdgpu_dm's
+/// commit worker waits for flip_done holding no display lock). Cursor,
+/// console and SDMA work can take OWNER meanwhile.
+async fn flip_unlocked(
+    mut owner: narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>>,
+    kind: ArmedKind,
+    external: u64,
+) -> Result<Latch, ScanError> {
+    let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+    let before = boot.display_scanout()?.front().fb;
+    let armed = boot.arm_display_flip(kind, external)?;
+    drop(owner);
+    loop {
+        narf_time::sleep_us(crate::amdgpu_dcn30_flip::POLL_US).await;
+        let mut owner = OWNER.lock().await;
+        let Some(boot) = owner.as_mut() else {
+            return Ok(Latch::Dropped);
+        };
+        match latch_step(boot.poll_display_flip(&armed))? {
+            LatchStep::Latched => {
+                let after = boot.display_scanout()?.front().fb;
+                let latched = read_vblank(boot);
+                return Ok(Latch::Done {
+                    before,
+                    after,
+                    latched,
+                });
+            }
+            LatchStep::Pending => {}
+            LatchStep::Dropped => return Ok(Latch::Dropped),
+        }
+    }
+}
+
+/// One poll's verdict in [`flip_unlocked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatchStep {
+    Latched,
+    Pending,
+    /// The pipe was relit, recovered, stopped or withdrawn while armed.
+    Dropped,
+}
+/// Timeout and device loss fail the present (quarantine, as a failed
+/// `flip` does); any other refusal means the armed pipe is gone, so the
+/// frame is dropped and its event completed without a latch.
+fn latch_step(
+    poll: Result<Option<crate::amdgpu_navi22_scanout::FlipDone>, ScanError>,
+) -> Result<LatchStep, ScanError> {
+    match poll {
+        Ok(Some(_)) => Ok(LatchStep::Latched),
+        Ok(None) => Ok(LatchStep::Pending),
+        Err(e @ (ScanError::Timeout | ScanError::DeviceGone)) => Err(e),
+        Err(_) => Ok(LatchStep::Dropped),
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+fn navi22_flip_latch_wait_outcomes() -> narf_kernel_test::TestResult {
+    use crate::amdgpu_navi22_scanout::FlipDone;
+    use narf_kernel_test::TestResult;
+    let done = FlipDone {
+        front: 0x100,
+        back: 0x200,
+        frame: 7,
+    };
+    if latch_step(Ok(Some(done))) != Ok(LatchStep::Latched)
+        || latch_step(Ok(None)) != Ok(LatchStep::Pending)
+    {
+        return TestResult::Fail("latched/pending flip misread");
+    }
+    // A withdraw/relight during the unlocked wait leaves the armed pipe
+    // gone (`poll_armed` → Busy): drop the frame, never complete a flip.
+    for gone in [ScanError::Busy, ScanError::Invalid, ScanError::Revoked] {
+        if latch_step(Err(gone)) != Ok(LatchStep::Dropped) {
+            return TestResult::Fail("replaced pipe did not drop the armed frame");
+        }
+    }
+    for fatal in [ScanError::Timeout, ScanError::DeviceGone] {
+        if latch_step(Err(fatal)) != Err(fatal) {
+            return TestResult::Fail("timeout/device loss did not fail the present");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_flip_latch_wait_outcomes);
+
 /// Flip the lit pipe to `frame`'s pinned client framebuffer in place and
-/// keep that pin until a later flip latches. Returns the owned front the
-/// console may be published on; None (nothing flipped) when the frame no
-/// longer matches the lit mode.
-/// # Safety
-/// The caller holds the owner lock; `pin` is `frame`'s and rendering into
-/// it completed.
-async unsafe fn present_direct(
-    boot: &mut boot::ColdBoot,
+/// keep that pin until a later flip latches. A frame that no longer matches
+/// the lit mode, or whose pipe changed while armed, is dropped.
+async fn present_direct(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
-) -> Result<Option<GenericFb>, ScanError> {
+) -> Result<Option<crate::drm::card::VblankTime>, ScanError> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ScanError::Busy)?;
     // A cancelled presenter may have left the old front's views draining.
     crate::scanout_access::wait_retired().await;
     let front = boot.display_scanout()?.front().fb;
@@ -2171,14 +2271,27 @@ async unsafe fn present_direct(
         .ok_or(ScanError::Busy)?
         .completed(0)
         .map_err(|_| ScanError::DeviceGone)?;
-    boot.flip_display_external(address).await?;
-    // The previous client framebuffer (if any) is no longer fetched.
-    let released = PRESENT.shown.lock().latched_external(pin.clone());
-    // Unpinned outside the IRQ-safe lock.
-    drop(released);
-    // Owned surfaces are both stale now; DIRTYFB damage restarts.
-    PRESENT.damage.lock().forget();
-    Ok(Some(front))
+    match flip_unlocked(owner, ArmedKind::External, address).await {
+        Ok(Latch::Done {
+            before, latched, ..
+        }) => {
+            // The previous client framebuffer (if any) is no longer fetched.
+            let released = PRESENT.shown.lock().latched_external(pin.clone());
+            // Unpinned outside the IRQ-safe lock.
+            drop(released);
+            // Owned surfaces are both stale now; DIRTYFB damage restarts.
+            PRESENT.damage.lock().forget();
+            follow_external(before).await;
+            Ok(latched)
+        }
+        Ok(Latch::Dropped) => Ok(None),
+        Err(e) => {
+            // The HUBP may still fetch either client buffer after a failed
+            // flip: keep this one alive (the previous stays in `shown`).
+            core::mem::forget(pin.clone());
+            Err(e)
+        }
+    }
 }
 
 /// Outcome of the SDMA fallback for a client framebuffer.
@@ -2238,16 +2351,19 @@ async fn present_blit(
     if boot.display_scanout()?.back().map(|b| b.address) != Some(back.address) {
         return Ok(Blitted::Dropped);
     }
-    let before = boot.display_scanout()?.front().fb;
-    boot.flip_display().await?;
-    let after = boot.display_scanout()?.front().fb;
+    let (before, after, latched) = match flip_unlocked(owner, ArmedKind::Back, 0).await? {
+        Latch::Done {
+            before,
+            after,
+            latched,
+        } => (before, after, latched),
+        Latch::Dropped => return Ok(Blitted::Dropped),
+    };
     // An owned surface is shown: the client framebuffer the pipe left is
     // unfetched, and DIRTYFB damage no longer describes either surface.
     let released = PRESENT.shown.lock().latched_owned();
     drop(released);
     PRESENT.damage.lock().forget();
-    let latched = read_vblank(boot);
-    drop(owner);
     static TRACED: AtomicBool = AtomicBool::new(false);
     if !TRACED.swap(true, Ordering::Relaxed) {
         use core::fmt::Write;
@@ -2273,15 +2389,23 @@ async fn follow_external(before: GenericFb) {
     crate::scanout_access::wait_retired().await;
 }
 
-/// Copy `frame` into the back buffer, then flip to it. Returns the front
-/// before and after.
+/// Where [`present_native`] copied a frame, for its damage bookkeeping
+/// once the flip latches.
+struct Copied {
+    tracked: Option<crate::amdgpu_present_damage::Source>,
+    address: u64,
+}
+
+/// Copy `frame` into the back buffer (the caller flips to it).
 /// # Safety
-/// The caller holds the owner lock; `frame` names a mapped dumb buffer.
+/// The caller holds the owner lock; `frame` names a mapped dumb buffer or
+/// a CPU-readable source.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
     frame: &Frame,
     source: Option<&crate::amdgpu_gem::GemPlacement>,
-) -> Result<(GenericFb, GenericFb), ScanError> {
+    damage: &mut crate::amdgpu_present_damage::Damage,
+) -> Result<Copied, ScanError> {
     // A cancelled presenter may have left the old front's views draining.
     crate::scanout_access::wait_retired().await;
     if frame.bo.is_some() {
@@ -2295,9 +2419,6 @@ async unsafe fn present_native(
     let scanout = boot.display_scanout()?;
     let surface = scanout.back().ok_or(ScanError::Invalid)?;
     let back = surface.fb;
-    // Taken for the present: a failed copy or flip leaves both buffers
-    // unknown.
-    let mut damage = core::mem::take(&mut *PRESENT.damage.lock());
     // Navi22 reallocates no buffer behind the presenter (a relight forgets
     // them), so one epoch serves.
     let tracked = frame_copy::damage_source(frame);
@@ -2323,12 +2444,10 @@ async unsafe fn present_native(
             narf_scheduler::yield_now().await;
         }
     }
-    let before = boot.display_scanout()?.front().fb;
-    boot.flip_display().await?;
-    let scanout = boot.display_scanout()?;
-    damage.presented(tracked, frame.damage.as_ref(), Some(surface.address), 0);
-    *PRESENT.damage.lock() = damage;
-    Ok((before, scanout.front().fb))
+    Ok(Copied {
+        tracked,
+        address: surface.address,
+    })
 }
 
 // ── Opt-in power saving (`amdgpu.navi22_pg`) ────────────────────────────

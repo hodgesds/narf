@@ -118,6 +118,36 @@ pub fn vblank_phase(p: Position, timing: &Timing) -> Option<crate::amdgpu_dcn401
     .phase()
 }
 
+/// Distinguishes successive `Scanout`s (relight, recovery), so a flip
+/// armed on one is never completed against its replacement.
+static EPOCHS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// What an armed flip shows once it latches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmedKind {
+    /// The owned back surface (`flip`).
+    Back,
+    /// A pinned client framebuffer (`flip_external`).
+    External,
+}
+
+/// A flip programmed by [`Scanout::arm`] and completed by
+/// [`Scanout::poll_armed`], so the presenter can wait for the latch
+/// without holding the platform owner (amdgpu_dm's commit worker waits for
+/// flip_done holding no display lock).
+#[derive(Clone, Copy, Debug)]
+pub struct Armed {
+    epoch: u64,
+    address: u64,
+    kind: ArmedKind,
+    deadline: narf_time::Deadline,
+}
+impl Armed {
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+}
+
 /// The pflip and vupdate subscriptions of the pipe.
 struct Irq {
     flip: Option<crate::amdgpu_ih_navi22::Subscription>,
@@ -139,6 +169,7 @@ pub struct Scanout {
     state: State,
     flips: u64,
     vrr: Option<crate::amdgpu_freesync::Drr>,
+    epoch: u64,
 }
 impl core::fmt::Debug for Scanout {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -203,6 +234,7 @@ impl Scanout {
             state: State::Running,
             flips: 0,
             vrr: None,
+            epoch: EPOCHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         })
     }
     pub fn state(&self) -> State {
@@ -415,6 +447,90 @@ impl Scanout {
         let frame = self.flip_to(front, flush).await?;
         let back = self.buffers.show_owned_front();
         Ok(Some(FlipDone { front, back, frame }))
+    }
+    /// Program a flip to the owned back surface (`ArmedKind::Back`) or to
+    /// the client framebuffer at `external` and return without waiting.
+    /// The pipe is `Flipping` until [`Scanout::poll_armed`] sees the latch.
+    pub fn arm(
+        &mut self,
+        kind: ArmedKind,
+        external: u64,
+        mut flush: impl FnMut() -> Result<(), Error>,
+    ) -> Result<Armed, Error> {
+        self.running()?;
+        let address = match kind {
+            ArmedKind::Back => self.buffers.back().ok_or(Error::Invalid)?.address,
+            ArmedKind::External => external,
+        };
+        let mut longest = self.timing;
+        if let Some(bounds) = self.vrr {
+            longest.v_total = bounds.v_total_max;
+        }
+        // The producer's CPU writes must reach VRAM before the latch.
+        flush()?;
+        self.flip.program(address)?;
+        self.state = State::Flipping;
+        if self.vrr.is_some() {
+            if let Err(error) = self.flip.manual_trigger() {
+                self.state = State::Failed(error);
+                return Err(error);
+            }
+        }
+        Ok(Armed {
+            epoch: self.epoch,
+            address,
+            kind,
+            deadline: narf_time::Deadline::after_us(flip_timeout_us(&longest)),
+        })
+    }
+    /// One non-blocking check of an armed flip: acknowledge pending
+    /// pflip/VUPDATE vectors, and once the HUBP no longer reports the flip
+    /// pending, complete it with the same bookkeeping as `flip` /
+    /// `flip_external`. `Ok(None)`: not latched yet. `Err(Busy)`: this
+    /// pipe was replaced or stopped since `arm` (nothing completed).
+    /// Timeout fails the owner as `flip` does.
+    pub fn poll_armed(&mut self, armed: &Armed) -> Result<Option<FlipDone>, Error> {
+        if armed.epoch != self.epoch || !matches!(self.state, State::Flipping) {
+            return Err(Error::Busy);
+        }
+        if let Some(sub) = self.irq.flip.as_mut() {
+            match sub.try_next() {
+                Ok(Some(_)) => self.flip.ack(Interrupt::Flip)?,
+                Ok(None) => {}
+                Err(_) => self.irq.flip = None,
+            }
+        }
+        if let Some(sub) = self.irq.vupdate.as_mut() {
+            match sub.try_next() {
+                Ok(Some(_)) => self.flip.ack(Interrupt::Vupdate)?,
+                Ok(None) => {}
+                Err(_) => self.irq.vupdate = None,
+            }
+        }
+        if self.flip.pending()? {
+            if armed.deadline.expired() {
+                self.state = State::Failed(Error::Timeout);
+                return Err(Error::Timeout);
+            }
+            return Ok(None);
+        }
+        let _ = self.flip.ack(Interrupt::Flip);
+        self.state = State::Running;
+        self.flips += 1;
+        let frame = self.flip.position().map(|p| p.frame).unwrap_or(0);
+        let back = match armed.kind {
+            ArmedKind::Back => {
+                let previous = self.buffers.shown();
+                self.buffers.swap()?;
+                previous
+            }
+            ArmedKind::External => self.buffers.show_external(armed.address),
+        };
+        Ok(Some(FlipDone {
+            front: armed.address,
+            back,
+            frame,
+        }))
     }
     /// The client framebuffer the pipe scans out, if any.
     pub fn external_front(&self) -> Option<u64> {

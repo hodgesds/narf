@@ -2606,6 +2606,23 @@ impl ColdBoot {
         let (scanout, _, flush) = self.presentation()?;
         scanout.flip(flush).await
     }
+    /// Arm a flip on the lit pipe without waiting for its latch (see
+    /// `Scanout::arm`); finish it with [`Self::poll_display_flip`].
+    pub fn arm_display_flip(
+        &mut self,
+        kind: crate::amdgpu_navi22_scanout::ArmedKind,
+        external: u64,
+    ) -> Result<crate::amdgpu_navi22_scanout::Armed, crate::amdgpu_dcn_clk::Error> {
+        let (scanout, _, flush) = self.presentation()?;
+        scanout.arm(kind, external, flush)
+    }
+    /// One non-blocking latch check of an armed flip (`Scanout::poll_armed`).
+    pub fn poll_display_flip(
+        &mut self,
+        armed: &crate::amdgpu_navi22_scanout::Armed,
+    ) -> Result<Option<crate::amdgpu_navi22_scanout::FlipDone>, crate::amdgpu_dcn_clk::Error> {
+        self.display_scanout()?.poll_armed(armed)
+    }
     /// Scan a pinned client framebuffer at `address` out in place.
     pub async fn flip_display_external(
         &mut self,
