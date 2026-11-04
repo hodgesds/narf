@@ -50,7 +50,7 @@ use super::dp_tests::{
 use super::hal::TransportError;
 use super::htc::{self, HtcHdr};
 use super::htt;
-use super::hw::{HwRev, MSI_CONFIG_ONE, MSI_CONFIG_QCA6390, RING_MASK_QCA6390};
+use super::hw::{HwRev, MSI_CONFIG_ONE, MSI_CONFIG_QCA6390, MSI_CONFIG_QCN9074, RING_MASK_QCA6390};
 use super::iface::{Ath11kNetdev, Sinks};
 use super::mac::{Mac, MacConfig};
 use super::mac_tests::{beacon, beacon_sec, FwCfg, World, BSSID, OWN, PMK, SSID};
