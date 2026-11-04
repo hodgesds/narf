@@ -297,6 +297,8 @@ pub(in crate::ath9k) fn expected(
     let modes_index = if five { 1 } else { 4 };
     let mut cl = None;
     last_cl(tables.soc_pre, modes_index, &mut cl);
+    // The BB pre array is AR9485-only; empty for the other chips.
+    last_cl(tables.bb_pre, modes_index, &mut cl);
     last_cl(tables.mac_core, modes_index, &mut cl);
     last_cl(tables.bb_core, modes_index, &mut cl);
     last_cl(tables.radio_core, modes_index, &mut cl);
@@ -304,6 +306,8 @@ pub(in crate::ath9k) fn expected(
     last_cl(tables.mac_post, modes_index, &mut cl);
     last_cl(tables.bb_post, modes_index, &mut cl);
     last_cl(tables.radio_post, modes_index, &mut cl);
+    // The allmodes radio postamble is AR9485-only; empty otherwise.
+    last_cl(tables.radio_post_allmodes, modes_index, &mut cl);
     last_cl(tables.rx_gain, 1, &mut cl);
     last_cl(tables.tx_gain, modes_index, &mut cl);
     let mut writes = (tables.rx_gain.len() as u16).wrapping_add(tables.tx_gain.len() as u16);
@@ -369,6 +373,8 @@ pub(in crate::ath9k) fn prepare(
     // ar9003_hw_process_ini.
     let modes_index = if five { 1 } else { 4 };
     prog_ini(io, tables.soc_pre, modes_index);
+    // The BB pre array is AR9485-only; empty for the other chips.
+    prog_ini(io, tables.bb_pre, modes_index);
     prog_ini(io, tables.mac_core, modes_index);
     prog_ini(io, tables.bb_core, modes_index);
     prog_ini(io, tables.radio_core, modes_index);
@@ -379,6 +385,8 @@ pub(in crate::ath9k) fn prepare(
     // `ar9003_phy.c` programs `ini_radio_post_sys2ant` here for
     // `AR_SREV_9462_20_OR_LATER`; empty for the AR9300/AR9580.
     prog_ini(io, tables.radio_post_sys2ant, modes_index);
+    // The allmodes radio postamble is AR9485-only; empty otherwise.
+    prog_ini(io, tables.radio_post_allmodes, modes_index);
     doubler_fix(io)?;
     let mut writes = 0;
     write_array(io, tables.rx_gain, 1, &mut writes);

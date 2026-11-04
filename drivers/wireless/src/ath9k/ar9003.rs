@@ -21,6 +21,7 @@ pub(super) mod ini;
 pub(super) mod initvals;
 pub(super) mod initvals_ar9462;
 pub(super) mod initvals_ar9565;
+pub(super) mod initvals_ar9485;
 pub(super) mod initvals_ar9580;
 pub(super) mod irq;
 pub(super) mod mac;
@@ -51,6 +52,11 @@ pub(super) const AR_SREV_VERSION_9565: u32 = 0x2c0;
 pub(super) const AR_SREV_REVISION_9565_11: u8 = 2;
 /// `reg.h::AR_SREV_REVISION_9580_10`: `AR_SREV_9580` is macRev >= 4.
 pub(super) const AR_SREV_REVISION_9580_10: u8 = 4;
+/// `reg.h::AR_SREV_VERSION_9485`.
+pub(super) const AR_SREV_VERSION_9485: u32 = 0x240;
+/// `reg.h::AR_SREV_REVISION_9485_11`: `AR_SREV_9485_11_OR_LATER` is
+/// macRev >= 1; no 1.0 tables exist anywhere in the Linux ath9k tree.
+pub(super) const AR_SREV_REVISION_9485_11: u8 = 1;
 
 const AR_CFG: u64 = 0x0014;
 const AR_CFG_HALT_REQ: u32 = 0x0800;
@@ -116,6 +122,12 @@ pub(super) enum Chip {
     /// (macRev 1) and 1.1 (macRev 2, `AR_SREV_REVISION_9565_11`) — the
     /// 1.1 tables own only the radio postamble, the rest aliases 1.0.
     Ar9565,
+    /// AR9485 PCIe (`0x0032`, `hw.h::AR9300_DEVID_AR9485_PCIE`) and
+    /// AR1111 (`0x0037`, `hw.h::AR9485_DEVID_AR1111`): one chain. Linux
+    /// keys everything off `AR_SREV_9485` (macVersion 0x240), so one
+    /// variant covers both device IDs; the `ar9485_1_1` INI set is the
+    /// `AR_SREV_9485_11_OR_LATER` branch's.
+    Ar9485,
 }
 
 impl Chip {
@@ -126,6 +138,7 @@ impl Chip {
             0x0033 => Some(Self::Ar9580),
             0x0034 => Some(Self::Ar9462),
             0x0036 => Some(Self::Ar9565),
+            0x0032 | 0x0037 => Some(Self::Ar9485),
             _ => None,
         }
     }
@@ -136,6 +149,7 @@ impl Chip {
             Self::Ar9580 => AR_SREV_VERSION_9580,
             Self::Ar9462 => AR_SREV_VERSION_9462,
             Self::Ar9565 => AR_SREV_VERSION_9565,
+            Self::Ar9485 => AR_SREV_VERSION_9485,
         }
     }
 
@@ -146,6 +160,7 @@ impl Chip {
             Self::Ar9580 => "AR9580",
             Self::Ar9462 => "AR9462",
             Self::Ar9565 => "AR9565",
+            Self::Ar9485 => "AR9485",
         }
     }
 
@@ -155,6 +170,7 @@ impl Chip {
             Self::Ar9300 | Self::Ar9580 => 0x7,
             Self::Ar9462 => 0x3,
             Self::Ar9565 => 0x1,
+            Self::Ar9485 => 0x1,
         }
     }
 }
@@ -183,6 +199,9 @@ impl Revision {
     /// (macRev >= 2) selects the 1.1 set, anything else the 1.0 set —
     /// so shipped 1.0 (macRev 0), 1.0.1 (macRev 1) and 1.1 (macRev 2)
     /// silicon is all accepted, with the 1.1 set from macRev 2 on.
+    /// macVersion 0x240 is an AR9485 only from macRev
+    /// `AR_SREV_REVISION_9485_11` on (`AR_SREV_9485_11_OR_LATER`); 1.0
+    /// has no Linux tables and is refused.
     pub fn decode(srev: u32, expected: Chip) -> Option<Self> {
         if srev == u32::MAX || srev & 0xff != 0xff {
             return None;
@@ -199,6 +218,9 @@ impl Revision {
         }
         let ar9580 = mac_rev >= AR_SREV_REVISION_9580_10;
         if ar9580 != (expected == Chip::Ar9580) {
+            return None;
+        }
+        if expected == Chip::Ar9485 && mac_rev < AR_SREV_REVISION_9485_11 {
             return None;
         }
         Some(Self {
@@ -226,6 +248,10 @@ impl Revision {
     /// `AR_SREV_9565_11_OR_LATER`.
     pub fn ar9565_11_or_later(&self) -> bool {
         self.chip == Chip::Ar9565 && self.mac_rev >= AR_SREV_REVISION_9565_11
+    }
+    /// `AR_SREV_9485_11_OR_LATER` (`decode` guarantees macRev >= 1).
+    pub fn ar9485_11(&self) -> bool {
+        self.chip == Chip::Ar9485
     }
 }
 

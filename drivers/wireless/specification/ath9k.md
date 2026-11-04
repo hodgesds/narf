@@ -2334,6 +2334,52 @@ from the local Linux headers) and
 Remainder, not in this step: MCI Bluetooth coexistence, WoW
 (`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
 deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
+**AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
+(identity and INI, plus owner probe and admission record):
+`ar9003::Chip::Ar9485` is PCIe `0x0032`
+(`hw.h::AR9300_DEVID_AR9485_PCIE`) and `0x0037`
+(`hw.h::AR9485_DEVID_AR1111`), chip_chainmask 1, single chain. It has
+its own macVersion `AR_SREV_VERSION_9485` 0x240;
+`Revision::decode` accepts only macRev >= `AR_SREV_REVISION_9485_11` 1
+(`AR_SREV_9485_11_OR_LATER`, the 1.1 tables) — no 1.0 tables exist in
+the Linux tree. The EEPROM restore limits are the 9485's:
+`EEPROM_DATA_LEN_9485` 1088 with the 4K base first.
+`ar9003/initvals_ar9485.rs` is every table of `ar9485_initvals.h` (19
+names: 17 transcribed tables of 1148 rows — 16 own tables plus the mac
+postamble from 9331 — generated verbatim in file order; the
+mac-postamble `#define` is transcribed from
+`ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble`, the lowest-ob/db
+`#define` is an alias of the in-file low-ob/db table, and the Japan
+2484 CCK FIR `#define` points at the `ar9003/initvals.rs` 2p2 table).
+`ini::Tables::for_revision` dispatches `ar9003_hw_init_mode_regs` on
+the `AR_SREV_9485_11_OR_LATER` branch: `Tables::ar9485` is the 1.1 set
+(BB pre array, allmodes radio postamble, no SoC postamble, no fast
+clock, no DFS; the `pcie_phy_clkreq_disable_L1` SerDes table in both
+slots — Linux gates the `pll_on_cdr_on` table on `pll_pwrsave`, not
+modeled here) plus `ar9003_tx_gain_table_apply` (modes 0/1/2/3 are the
+9485 lowest/high/low-ob/db/high-power tables; mode 4 falls through to
+the AR9300 2p2 mixed table; modes 5/6 are the green/green-spur tables;
+mode 7 sets nothing and keeps the mode-0 lowest-ob/db default; index
+>= 8 is mode 0) and `ar9003_rx_gain_table_apply` (mode 0 is the common
+table; modes 1/2/3 are the wo-XLNA table — 2/3 are AR9462-only in Linux
+and keep the wo-XLNA default; index >= 4 keeps the common default).
+`phy::prepare`/`expected` program the BB pre array and the allmodes
+radio postamble. The owner matches `0x0032` as `ath9k-ar9485` and
+`0x0037` as `ath9k-ar1111` and requires the BAR the 9485 radio core's
+last row (`0x16c44`) needs; the admission record is `N48A` v1
+(single-chain) under `ath9k/ar9485-admit-v1-ch<N>-<mac>.bin`, binding
+the 1.1 INI preparation. A 2.4 GHz-only board is already refused 5 GHz
+by the shared `channel_supported` gate on the map's `opFlags`.
+AR9300/AR9580 tables and streams are unchanged. Smokes (written, not
+executed):
+`smoke_ath9k_ar9485_revision_and_ini_selection` (FNV-1a oracle over
+the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
+computed from the local Linux headers) and
+`smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
+Remainder, not in this step: MCI Bluetooth coexistence, WoW, the
+AR9485 board-value deltas and per-chip calibration branches (including
+the 9485 antenna-diversity/LNA-diversity code), and the SerDes
+`pll_pwrsave` conditional programming.
 
 **AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):

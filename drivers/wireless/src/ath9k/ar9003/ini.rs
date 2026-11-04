@@ -9,10 +9,12 @@
 //! 2.0). The AR9565 (`AR_SREV_9565`) takes the `ar9565_1p0`/
 //! `ar9565_1p1` set (1.1 owns only its radio postamble; the rest aliases
 //! 1.0).
+//! AR9485 (`AR_SREV_9485_11_OR_LATER`) the `ar9485_1_1` set.
 
 use super::initvals::*;
 use super::initvals_ar9462::*;
 use super::initvals_ar9565::*;
+use super::initvals_ar9485::*;
 use super::initvals_ar9580::*;
 use super::{eeprom::Identity, Chip, Revision};
 
@@ -27,6 +29,10 @@ pub(in crate::ath9k) enum TxGain {
     Type5,
     /// `ar9580_1p0_type6_tx_gain_table` (AR9580 only).
     Type6,
+    /// `ar9485Modes_green_ob_db_tx_gain_1_1` (AR9485 only).
+    GreenObDb,
+    /// `ar9485Modes_green_spur_ob_db_tx_gain_1_1` (AR9485 only).
+    GreenSpurObDb,
 }
 
 /// Which `ar9003_rx_gain_table_mode*` table applied.
@@ -49,6 +55,8 @@ pub(in crate::ath9k) enum RxGain {
 pub(in crate::ath9k) struct Tables {
     pub mac_core: &'static [[u32; 2]],
     pub mac_post: &'static [[u32; 5]],
+    /// The BB pre array (`ar9485_1_1`): only the AR9485 programs one.
+    pub bb_pre: &'static [[u32; 2]],
     pub bb_core: &'static [[u32; 2]],
     pub bb_post: &'static [[u32; 5]],
     pub radio_core: &'static [[u32; 2]],
@@ -57,6 +65,10 @@ pub(in crate::ath9k) struct Tables {
     /// `AR_SREV_9462_20_OR_LATER` (`ini_radio_post_sys2ant`); empty for
     /// the AR9300/AR9580, which Linux does not program it for.
     pub radio_post_sys2ant: &'static [[u32; 5]],
+    /// The allmodes radio postamble (`ar9485_1_1_radio_postamble`): only
+    /// the AR9485 programs one; the five-column `radio_post` is empty
+    /// for it.
+    pub radio_post_allmodes: &'static [[u32; 2]],
     pub soc_pre: &'static [[u32; 2]],
     pub soc_post: &'static [[u32; 5]],
     pub rx_gain: &'static [[u32; 2]],
@@ -87,6 +99,7 @@ impl Tables {
             Chip::Ar9580 => Self::ar9580(identity),
             Chip::Ar9462 => Self::ar9462(revision, identity),
             Chip::Ar9565 => Self::ar9565(revision, identity),
+            Chip::Ar9485 => Self::ar9485(identity),
         }
     }
 
@@ -118,11 +131,13 @@ impl Tables {
         Self {
             mac_core: AR9300_2P2_MAC_CORE,
             mac_post: AR9300_2P2_MAC_POSTAMBLE,
+            bb_pre: &[],
             bb_core: AR9300_2P2_BASEBAND_CORE,
             bb_post: AR9300_2P2_BASEBAND_POSTAMBLE,
             radio_core: AR9300_2P2_RADIO_CORE,
             radio_post: AR9300_2P2_RADIO_POSTAMBLE,
             radio_post_sys2ant: &[],
+            radio_post_allmodes: &[],
             soc_pre: AR9300_2P2_SOC_PREAMBLE,
             soc_post: AR9300_2P2_SOC_POSTAMBLE,
             rx_gain,
@@ -167,11 +182,13 @@ impl Tables {
         Self {
             mac_core: AR9580_1P0_MAC_CORE,
             mac_post: AR9580_1P0_MAC_POSTAMBLE,
+            bb_pre: &[],
             bb_core: AR9580_1P0_BASEBAND_CORE,
             bb_post: AR9580_1P0_BASEBAND_POSTAMBLE,
             radio_core: AR9580_1P0_RADIO_CORE,
             radio_post: AR9580_1P0_RADIO_POSTAMBLE,
             radio_post_sys2ant: &[],
+            radio_post_allmodes: &[],
             soc_pre: AR9580_1P0_SOC_PREAMBLE,
             soc_post: AR9580_1P0_SOC_POSTAMBLE,
             rx_gain,
@@ -299,11 +316,13 @@ impl Tables {
         Self {
             mac_core,
             mac_post,
+            bb_pre: &[],
             bb_core,
             bb_post,
             radio_core,
             radio_post,
             radio_post_sys2ant,
+            radio_post_allmodes: &[],
             soc_pre,
             soc_post,
             rx_gain,
@@ -378,6 +397,65 @@ impl Tables {
             pcie_serdes_low_power: AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
             fast_clock: AR9565_1P0_MODES_FAST_CLOCK,
             cck_fir_japan_2484: AR9565_1P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
+            dfs: &[],
+            tx_gain_kind,
+            rx_gain_kind,
+        }
+    }
+
+    /// `ar9003_hw_init_mode_regs`' `AR_SREV_9485_11_OR_LATER` branch: the
+    /// 1.1 MAC/BB/radio/SoC arrays (BB pre, allmodes radio postamble, no
+    /// SoC postamble, no fast clock, no DFS), the Japan 2484 CCK FIR
+    /// alias of the AR9300 2p2 table, and the `pcie_phy_clkreq_disable_L1`
+    /// SerDes table in both slots (Linux gates the
+    /// `pll_on_cdr_on_clkreq_disable_L1` table on `pll_pwrsave`, not
+    /// modeled here). Then `ar9003_tx_gain_table_apply` (index `>= 8` is
+    /// mode 0; mode 4 has no 9485 arm and falls through to the AR9300 2p2
+    /// mixed table; mode 7 sets nothing for non-9340, so it keeps the
+    /// mode-0 lowest-ob/db default, which is the low-ob/db table) and
+    /// `ar9003_rx_gain_table_apply` (mode 1 is the wo-XLNA table; modes
+    /// 2/3 are AR9462-only and keep the wo-XLNA default; index `>= 4`
+    /// keeps the common default).
+    pub fn ar9485(identity: &Identity) -> Self {
+        let (tx_gain, tx_gain_kind) = match identity.tx_gain {
+            1 => (AR9485MODES_HIGH_OB_DB_TX_GAIN_1_1, TxGain::HighObDb),
+            2 => (AR9485MODES_LOW_OB_DB_TX_GAIN_1_1, TxGain::LowObDb),
+            3 => (AR9485MODES_HIGH_POWER_TX_GAIN_1_1, TxGain::HighPower),
+            4 => (
+                AR9300_MODES_MIXED_OB_DB_TX_GAIN_TABLE_2P2,
+                TxGain::MixedObDb,
+            ),
+            5 => (AR9485MODES_GREEN_OB_DB_TX_GAIN_1_1, TxGain::GreenObDb),
+            6 => (
+                AR9485MODES_GREEN_SPUR_OB_DB_TX_GAIN_1_1,
+                TxGain::GreenSpurObDb,
+            ),
+            _ => (AR9485MODES_LOW_OB_DB_TX_GAIN_1_1, TxGain::LowestObDb),
+        };
+        let (rx_gain, rx_gain_kind) = match identity.rx_gain {
+            1 | 2 | 3 => (AR9485COMMON_WO_XLNA_RX_GAIN_1_1, RxGain::WithoutXlna),
+            _ => (AR9485_COMMON_RX_GAIN_1_1, RxGain::Common),
+        };
+        Self {
+            mac_core: AR9485_1_1_MAC_CORE,
+            mac_post: AR9485_1_1_MAC_POSTAMBLE,
+            bb_pre: AR9485_1_1,
+            bb_core: AR9485_1_1_BASEBAND_CORE,
+            bb_post: AR9485_1_1_BASEBAND_POSTAMBLE,
+            radio_core: AR9485_1_1_RADIO_CORE,
+            radio_post: &[],
+            radio_post_allmodes: AR9485_1_1_RADIO_POSTAMBLE,
+            soc_pre: AR9485_1_1_SOC_PREAMBLE,
+            soc_post: &[],
+            rx_gain,
+            tx_gain,
+            rxgain_bb_core: &[],
+            rxgain_bb_postamble: &[],
+            rxgain_xlna: &[],
+            pcie_serdes: AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1,
+            pcie_serdes_low_power: AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1,
+            fast_clock: &[],
+            cck_fir_japan_2484: AR9300_2P2_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             dfs: &[],
             tx_gain_kind,
             rx_gain_kind,
