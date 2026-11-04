@@ -19,6 +19,7 @@ use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 use crate::ixgbe::queues::RegBank;
 
+pub mod eee;
 pub mod ethtool;
 pub mod pm;
 pub mod queues;
@@ -330,6 +331,12 @@ pub struct Ixgbe {
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
+    /// Programmed EEE state, if `configure_eee` ran. Always `None`
+    /// on in-tree device ids: Linux marks none of them
+    /// EEE-capable, so `configure_eee` returns
+    /// `UnsupportedDevice` before storing anything (see
+    /// `eee.rs`).
+    pub eee_state: IrqSafeSpinLock<Option<eee::EeeState>>,
     /// True while the datapath is quiesced (suspend/detach): tx/rx
     /// paths refuse work instead of feeding a stopped device.
     pub quiesced: IrqSafeSpinLock<bool>,
@@ -538,6 +545,7 @@ impl Ixgbe {
             rss_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
+            eee_state: IrqSafeSpinLock::new(None),
             quiesced: IrqSafeSpinLock::new(false),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
@@ -878,6 +886,43 @@ impl Ixgbe {
         }
         *self.wol_armed.lock() = Some(cfg);
         Ok(())
+    }
+
+    /// Whether this device is EEE-capable, exactly Linux's
+    /// `ixgbe_set_eee_capable` switch (see `eee.rs`). False for
+    /// every in-tree device id.
+    pub fn eee_capable(&self) -> bool {
+        eee::eee_capable(self.did)
+    }
+
+    /// Set EEE enabled/disabled, mirroring Linux `ixgbe_set_eee`:
+    /// enabled stores advertised = supported, disabled stores
+    /// advertised = empty. Returns `UnsupportedDevice` on every
+    /// in-tree device id (none is EEE-capable per Linux) — the
+    /// stored state only exists for the capable parts
+    /// (X550EM_A 1G_T, E610), whose FW-PHY/ACI transports are
+    /// follow-ups. Unlike Linux, this does NOT reset the link:
+    /// link re-application after a set is a follow-up (see
+    /// `eee.rs` header).
+    pub fn configure_eee(&self, enable: bool) -> Result<(), IxgbeError> {
+        let (supported, advertised) = if eee::is_e610(self.did) {
+            eee::e610_defaults(self.did == eee::DEV_E610_2_5G_T)
+        } else if self.did == eee::DEV_X550EM_A_1G_T || self.did == eee::DEV_X550EM_A_1G_T_L {
+            eee::x550em_a_defaults()
+        } else {
+            return Err(IxgbeError::UnsupportedDevice);
+        };
+        let mut state = eee::EeeState::new(supported, advertised);
+        state.set_enabled(enable);
+        *self.eee_state.lock() = Some(state);
+        Ok(())
+    }
+
+    /// The ethtool-visible EEE snapshot, if `configure_eee` ran.
+    /// `None` on in-tree device ids (never configured) and
+    /// before any configuration.
+    pub fn eee_status(&self) -> Option<eee::EeeStatus> {
+        self.eee_state.lock().map(eee::EeeStatus::from)
     }
 
     /// Suspend: quiesce the datapath (mask interrupts, RXEN off,
