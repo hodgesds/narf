@@ -1595,8 +1595,17 @@ any firmware mutation); a running P2P GO BSS is never an MBSS peer.
 Without `mbss`, a secondary START beside a running AP is still
 refused, and a primary START is refused while a secondary AP runs
 (the primary Program's device-wide setup must not run beside a
-secondary AP). Known gap: channel agreement with a primary STA is
-left to the firmware (no mchan scheduling).
+secondary AP). Channel agreement with an associated primary STA is
+enforced for secondary AP STARTs (F20): a plain secondary AP must
+share the STA's channel, and a P2P GO beside an associated STA may
+use its own channel only when the firmware advertises mchan (Linux
+`brcmf_setup_ifmodes` puts STA+AP on the single-channel p2p
+combination even with mchan; mchan's second channel licenses
+STA+STA and P2P, never STA+AP). An unassociated or mid-roam primary
+constrains nothing. No host multi-channel scheduler exists: the
+enforcement is admission only (refused before any firmware
+mutation), and agreement for a secondary STA joining beside a
+running AP is still left to the firmware.
 
 #### Composed event mask
 

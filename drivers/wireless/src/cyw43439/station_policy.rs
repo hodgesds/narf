@@ -37,6 +37,10 @@ impl TxGrant {
     pub(super) fn width(self) -> u32 {
         self.channel.width()
     }
+    /// Primary 20 MHz channel of the granted association.
+    pub(super) fn primary_channel(self) -> u8 {
+        self.channel.primary
+    }
 }
 
 impl<R: Fullmac> Station<R> {

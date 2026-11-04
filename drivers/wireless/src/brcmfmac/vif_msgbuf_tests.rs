@@ -380,6 +380,120 @@ kernel_test_in!(
     smoke_brcmf_msgbuf_primary_station_beside_secondary_ap
 );
 
+/// F20: a secondary AP START beside an associated primary STA on a
+/// different channel is refused (Linux 7.3-rc4 combo0/p2p-combination
+/// single-channel rule for STA+AP: mchan licenses STA+STA and P2P,
+/// never STA+AP), before any firmware mutation, leaving the primary
+/// joined and the secondary shell down. The positive control is
+/// `primary_station_secondary_ap` (same channel starts).
+fn primary_station_secondary_ap_channel_refusal() -> Result<(), &'static str> {
+    use super::ap_native_tests::{config, Source};
+    use narf_capabilities::{Cap, Invoke};
+    use narf_wireless::ap_control::ApControlAuthority;
+    const NAME: &str = "wlvap7";
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    bus.enable_vif_ap();
+    bus.set_caps(b"ap sta mchan");
+    let database = Arc::new(narf_wireless::reg::db::Database::new());
+    database.install(firmware::domain());
+    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
+        .map_err(|_| "primary station over msgbuf")?;
+    cache(
+        &mut station,
+        AP,
+        6,
+        narf_wireless::scan::BssSecurity::Open,
+        &[],
+    );
+    block(station.associate(request(
+        AP,
+        6,
+        narf_wireless::SecurityConfig::Open,
+        Vec::new(),
+    )))
+    .map_err(|_| "primary join")?;
+    let owner = block(super::vif::discover(&mut station.runtime, station.mac))
+        .map_err(|_| "cap discovery")?
+        .ok_or("firmware cap refused")?;
+    if !owner.features().mchan || owner.features().mbss {
+        return Err("cap tokens not parsed as brcmf_feat_attach");
+    }
+    let name = narf_net::iface::register("wlan%d", OWN, send);
+    let device = shell(name.clone(), station);
+    device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    device.ap_fixture_setup(database);
+    super::vif::register_primary(&device);
+    let result = (|| {
+        let vap = device
+            .vif_new(NAME, 3, None)
+            .map_err(|_| "secondary AP shell admission")?;
+        block(device.vif_worker());
+        if vap.ap_sme_capabilities() != Some(0) {
+            return Err("secondary AP shell not attached after IF ADD");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("secondary netdev handle")?;
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "secondary admin authority")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = vap.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            admin,
+            &iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "AP authority bind")?
+        .reserve()
+        .map_err(|_| "AP control reservation")?;
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[VIF, VIF].concat());
+        // Primary STA is on channel 6 (2437 MHz); channel 5 (2432 MHz)
+        // must be refused by the STA+AP single-channel rule.
+        ap_config.frequency_mhz = 2432;
+        let before = bus.commands().len();
+        match block(vap.start_ap_with_settings_async(&authority, ap_config, settings)) {
+            Err(narf_wireless::WirelessError::NotSupported) => {}
+            _ => return Err("off-channel secondary AP START not refused"),
+        }
+        if bus.commands().len() != before {
+            return Err("refused secondary AP START mutated firmware state");
+        }
+        if vap.link_up() {
+            return Err("refused secondary AP left its shell up");
+        }
+        if device.state.try_lock().ok_or("state")?.station.bssid != Some(AP) {
+            return Err("refused secondary AP disturbed the primary");
+        }
+        Ok(())
+    })();
+    super::vif::withdraw_family(crate::cyw43439::fullmac::Family::Pcie);
+    bus.d3_ack(true);
+    let _ = block(device.teardown());
+    *ACTIVE_TEST.lock() = None;
+    narf_net::registry().unregister(&name);
+    narf_net::iface::unregister(&name);
+    result
+}
+
+fn smoke_brcmf_msgbuf_primary_station_secondary_ap_channel_refusal() -> TestResult {
+    match primary_station_secondary_ap_channel_refusal() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_primary_station_secondary_ap_channel_refusal
+);
+
 /// Linux `vif->mbss` multi-AP over msgbuf: a secondary AP START beside
 /// a running primary AP on the same channel (firmware `mbss` cap),
 /// then secondary teardown that keeps `mbss 1` while the primary AP
