@@ -1136,6 +1136,7 @@ pub(crate) fn monitor_receive(dev: &NetIfaceSnapshot, frame: &[u8]) {
         protocol: ETH_P_802_2,
         pkt_type: PACKET_OTHERHOST,
         vlan: None,
+        hardware_ns: None,
     };
     for sock in hooks(dev.net_ns_id, dev.ifindex, |num| {
         num == ETH_P_ALL || num == ETH_P_802_2
