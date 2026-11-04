@@ -796,6 +796,7 @@ fn smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed() -> TestResu
             tso6: false,
             uso: false,
         },
+        1518,
     ) {
         Ok(hdr) => hdr,
         Err(_) => return TestResult::Fail("virtio-net rejected negotiated TCPv4 TSO"),
@@ -818,6 +819,7 @@ fn smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed() -> TestResu
         &mut frame,
         TxMeta::with_tso(1200),
         TxOffloadProfile::default(),
+        1518,
     )
     .is_ok()
     {
@@ -1007,6 +1009,7 @@ fn smoke_virtio_net_tx_checksum_header_is_feature_gated() -> TestResult {
             tso6: false,
             uso: false,
         },
+        1518,
     ) {
         Ok(hdr) => hdr,
         Err(_) => return TestResult::Fail("virtio-net rejected negotiated TCP checksum offload"),
@@ -1022,6 +1025,7 @@ fn smoke_virtio_net_tx_checksum_header_is_feature_gated() -> TestResult {
         &mut frame,
         TxMeta::with_csum(L4CsumKind::Tcp),
         TxOffloadProfile::default(),
+        1518,
     )
     .is_ok()
     {
