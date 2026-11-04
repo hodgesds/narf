@@ -1634,7 +1634,9 @@ impl VirtioNetPci {
         // entries were programmed at probe and retained, so
         // re-enable restores delivery on the same vectors.
         if let Some(table) = self.msix.lock().as_mut() {
-            unsafe { table.enable() }?;
+            // Same conversion as the probe-time table.enable() sites
+            // (pci.rs): MsixError folds into BarMapFailed.
+            unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
         }
         self.suspended.store(false, Ordering::Release);
         if let Some(name) = self.ifname.lock().as_deref() {
