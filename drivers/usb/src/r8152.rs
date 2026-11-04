@@ -2026,26 +2026,10 @@ pub mod tests {
     fn smoke_r8152_rx_csum_verdict() -> TestResult {
         let cases: &[(u32, u32, RxCsumResult)] = &[
             (0, 0, RxCsumResult::NotChecked),
-            (
-                RD_IPV4_CS | RD_TCP_CS,
-                0,
-                RxCsumResult::Good,
-            ),
-            (
-                RD_IPV4_CS | RD_UDP_CS,
-                0,
-                RxCsumResult::Good,
-            ),
-            (
-                RD_IPV6_CS | RD_UDP_CS,
-                0,
-                RxCsumResult::Good,
-            ),
-            (
-                RD_IPV6_CS | RD_TCP_CS,
-                0,
-                RxCsumResult::Good,
-            ),
+            (RD_IPV4_CS | RD_TCP_CS, 0, RxCsumResult::Good),
+            (RD_IPV4_CS | RD_UDP_CS, 0, RxCsumResult::Good),
+            (RD_IPV6_CS | RD_UDP_CS, 0, RxCsumResult::Good),
+            (RD_IPV6_CS | RD_TCP_CS, 0, RxCsumResult::Good),
             (
                 RD_IPV4_CS,
                 RX_IPF,
@@ -2074,17 +2058,9 @@ pub mod tests {
             (RD_IPV4_CS, 0, RxCsumResult::NotChecked),
             // Fail bits for protocols the device did not mark
             // checked are ignored.
-            (
-                0,
-                RX_IPF | RX_UDPF | RX_TCPF,
-                RxCsumResult::NotChecked,
-            ),
+            (0, RX_IPF | RX_UDPF | RX_TCPF, RxCsumResult::NotChecked),
             // Stray IPF on an IPv6 frame: IPF only applies to IPv4.
-            (
-                RD_IPV6_CS | RD_TCP_CS,
-                RX_IPF,
-                RxCsumResult::Good,
-            ),
+            (RD_IPV6_CS | RD_TCP_CS, RX_IPF, RxCsumResult::Good),
             // Contradictory descriptor (UDP failed, TCP passed):
             // fail-closed Bad, where Linux would optimistically
             // return CHECKSUM_UNNECESSARY via the TCP branch.
@@ -2163,10 +2139,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/usb/r8152",
-        smoke_r8152_rx_segment_deliverable
-    );
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_segment_deliverable);
 
     fn smoke_r8152_rx_aggregate_csum_carriage() -> TestResult {
         // One Good and one Bad segment: the walk must carry each
@@ -2184,12 +2157,7 @@ pub mod tests {
             buf.extend_from_slice(frame);
         };
         push_seg(&mut buf, &f_good, RD_IPV4_CS | RD_TCP_CS, 0);
-        push_seg(
-            &mut buf,
-            &f_bad,
-            RD_IPV4_CS | RD_TCP_CS,
-            RX_TCPF,
-        );
+        push_seg(&mut buf, &f_bad, RD_IPV4_CS | RD_TCP_CS, RX_TCPF);
         let segs = parse_rx_aggregate(&buf);
         if segs.len() != 2 {
             return TestResult::Fail("aggregate csum walk frame count wrong");
@@ -2207,10 +2175,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/usb/r8152",
-        smoke_r8152_rx_aggregate_csum_carriage
-    );
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_aggregate_csum_carriage);
 
     fn smoke_r8152_tx_segment_build() -> TestResult {
         let frame = datagram_frame(61, 0x5A);
