@@ -98,8 +98,11 @@ use crate::event::{
     LeConnectionComplete, LeLongTermKeyRequest, NumberOfCompletedPackets,
 };
 use crate::gap::{self, CentralPhase};
+use crate::gatt_client::{self, GattClientError};
 use crate::gatt_server::GattServer;
 use crate::hci::{AclData, Command, Event};
+use crate::hogp::HidInformation;
+use crate::hogp_client::{HogpClient, HogpHandles};
 use crate::l2cap::{
     self, BFrame, CidAllocator, CidClass, SignallingCode, CID_ATT, CID_LE_SIGNALLING,
     CID_SIGNALLING, CID_SMP,
@@ -327,6 +330,14 @@ struct Connection {
     peer_addr: [u8; 7],
     dispatcher: l2cap::Dispatcher,
     smp: Option<Responder<NarfSmpCrypto>>,
+    /// GATT client record, present only on central-role
+    /// connections (issue #1313). Peripheral-role connections
+    /// keep server-only dispatch.
+    client: Option<gatt_client::Client>,
+    /// HOGP client record, present only once a central-role
+    /// connection's peer has been attached as a HID device
+    /// (issue #1314, via `hogp_attach`).
+    hogp: Option<HogpClient>,
     /// LTK from a completed pairing (in-memory only; no bond store).
     ltk: Option<[u8; 16]>,
     encrypted: bool,
@@ -344,6 +355,8 @@ impl Connection {
             peer_addr,
             dispatcher: l2cap::Dispatcher::new(),
             smp: None,
+            client: None,
+            hogp: None,
             ltk: None,
             encrypted: false,
             cid_alloc: CidAllocator::new(),
@@ -423,6 +436,12 @@ impl PumpCore {
             },
         );
         services::mount_battery_service(&mut gatt.db, 100);
+        // HID service mount (#1314): always mounted like
+        // GAP/GATT/DIS/Battery. Mounting alone does not
+        // advertise, and the server cannot emit notifications
+        // yet — a central can read the map and flip Protocol
+        // Mode, but receives no input reports from this mount.
+        services::mount_hid_service(&mut gatt.db);
         Self {
             index,
             transport,
@@ -712,6 +731,111 @@ impl PumpCore {
 
 // ── Event dispatch ──────────────────────────────────────────────────
 
+/// GATT client issuance (issue #1313): ATT requests over a
+/// central-role connection's outbound ACL path. The pump owns the
+/// role check — a connection only has a client record when it was
+/// initiated by this host — so these methods fail with
+/// [`GattClientError::NotCentral`] on any other connection.
+impl PumpCore {
+    fn connection(&self, handle: u16) -> Option<&Connection> {
+        self.connections.iter().find(|c| c.handle == handle)
+    }
+
+    /// Issue one client PDU on a central-role connection: resolve
+    /// the connection, enforce the central role, run the client's
+    /// lock-step issue, and queue the request for the next flush.
+    /// The two lookups are sequential (never overlapping borrows);
+    /// the second cannot miss because nothing mutates the table
+    /// between them.
+    fn gatt_client_issue(
+        &mut self,
+        handle: u16,
+        f: impl FnOnce(&mut gatt_client::Client) -> Result<att::Pdu, GattClientError>,
+    ) -> Result<(), GattClientError> {
+        let Some(le) = self.connection(handle).map(|c| c.le) else {
+            return Err(GattClientError::NoConnection);
+        };
+        if self.central.connected_handle != Some(handle) {
+            return Err(GattClientError::NotCentral);
+        }
+        let pdu = {
+            let conn = self.connection_mut(handle).unwrap();
+            match conn.client.as_mut() {
+                Some(client) => f(client)?,
+                None => return Err(GattClientError::NotCentral),
+            }
+        };
+        self.queue_frame(handle, le, &BFrame::new(CID_ATT, pdu.encode()));
+        Ok(())
+    }
+
+    /// Discover all primary services in `[start, end]` on a
+    /// central-role connection.
+    pub fn gatt_client_discover_services(
+        &mut self,
+        handle: u16,
+        start: u16,
+        end: u16,
+    ) -> Result<(), GattClientError> {
+        self.gatt_client_issue(handle, |client| client.discover_services(start, end))
+    }
+
+    /// Discover all characteristics in `[start, end]` on a
+    /// central-role connection.
+    pub fn gatt_client_discover_characteristics(
+        &mut self,
+        handle: u16,
+        start: u16,
+        end: u16,
+    ) -> Result<(), GattClientError> {
+        self.gatt_client_issue(handle, |client| client.discover_characteristics(start, end))
+    }
+
+    /// Discover all descriptors in `[start, end]` on a
+    /// central-role connection.
+    pub fn gatt_client_discover_descriptors(
+        &mut self,
+        handle: u16,
+        start: u16,
+        end: u16,
+    ) -> Result<(), GattClientError> {
+        self.gatt_client_issue(handle, |client| client.discover_descriptors(start, end))
+    }
+
+    /// Read one characteristic value by handle on a central-role
+    /// connection.
+    pub fn gatt_client_read(
+        &mut self,
+        handle: u16,
+        value_handle: u16,
+    ) -> Result<(), GattClientError> {
+        self.gatt_client_issue(handle, |client| client.read(value_handle))
+    }
+
+    /// Write one characteristic value by handle (Write Request,
+    /// with response) on a central-role connection.
+    pub fn gatt_client_write(
+        &mut self,
+        handle: u16,
+        value_handle: u16,
+        value: &[u8],
+    ) -> Result<(), GattClientError> {
+        self.gatt_client_issue(handle, |client| client.write(value_handle, value))
+    }
+
+    /// Subscribe to notifications (`notify == true`) or indications
+    /// on a characteristic via its CCCD, on a central-role
+    /// connection.
+    pub fn gatt_client_subscribe(
+        &mut self,
+        handle: u16,
+        cccd_handle: u16,
+        notify: bool,
+    ) -> Result<(), GattClientError> {
+        self.gatt_client_issue(handle, |client| client.subscribe(cccd_handle, notify))
+    }
+}
+
 impl PumpCore {
     /// Mirror a new connection into sysfs under this controller's
     /// `hci<N>` node (Linux `hci_conn_add_sysfs`). No-op when no
@@ -744,8 +868,14 @@ impl PumpCore {
                 if let Some(cc) = LeConnectionComplete::parse(event) {
                     // Initiator-role completions drive the central
                     // state machine; inbound (peripheral-role)
-                    // connections while Idle leave it alone.
-                    if self.central.phase == CentralPhase::Connecting {
+                    // connections while Idle leave it alone. The
+                    // role is captured before the state machine
+                    // advances: it is the only sound test for
+                    // whether THIS completion is central-role
+                    // (connected_handle alone could match a stale
+                    // handle reused by a peripheral connection).
+                    let central_completed = self.central.phase == CentralPhase::Connecting;
+                    if central_completed {
                         self.central.note_connection_complete(cc.status, cc.handle);
                     }
                     if cc.status == 0 {
@@ -755,6 +885,14 @@ impl PumpCore {
                         self.connections.retain(|c| c.handle != cc.handle);
                         self.connections
                             .push(Connection::new(cc.handle, true, peer));
+                        // Central-role connections gain a GATT
+                        // client record (#1313); peripheral-role
+                        // connections keep server-only dispatch.
+                        if central_completed {
+                            if let Some(conn) = self.connections.last_mut() {
+                                conn.client = Some(gatt_client::Client::new());
+                            }
+                        }
                         self.sysfs_track_connect(cc.handle, true, &peer);
                     }
                     return;
@@ -865,11 +1003,29 @@ impl PumpCore {
         let le = self.connections[conn_idx].le;
         match l2cap::Dispatcher::classify_cid(frame.cid) {
             CidClass::Att => {
-                let Some(req) = att::Pdu::decode(&frame.payload) else {
+                let Some(pdu) = att::Pdu::decode(&frame.payload) else {
                     return;
                 };
-                if req.expects_response() {
-                    let rsp = self.gatt.handle_request(&req);
+                if self.central.connected_handle == Some(handle) {
+                    // Central-role connection: inbound ATT PDUs are
+                    // responses to this client's requests (or
+                    // server-initiated notifications/indications).
+                    // They must never reach the GATT server: a
+                    // response opcode like Read By Group Type Rsp
+                    // (0x11) has expects_response() == true, so the
+                    // server arm below would answer it with a bogus
+                    // response. A central connection without a
+                    // client record drops the PDU instead of
+                    // falling through to the server.
+                    let outs = match self.connections[conn_idx].client.as_mut() {
+                        Some(client) => client.feed(&pdu),
+                        None => Vec::new(),
+                    };
+                    for out in outs {
+                        self.queue_frame(handle, le, &BFrame::new(CID_ATT, out.encode()));
+                    }
+                } else if pdu.expects_response() {
+                    let rsp = self.gatt.handle_request(&pdu);
                     self.queue_frame(handle, le, &BFrame::new(CID_ATT, rsp.encode()));
                 }
             }
@@ -1654,6 +1810,343 @@ pub fn central_peers(index: usize) -> Option<Vec<gap::DiscoveredPeer>> {
 }
 
 // ── The step ────────────────────────────────────────────────────────
+
+/// Slot-level core access for the GATT client free API. Mirrors
+/// [`with_pump_core`] exactly, but reports
+/// [`GattClientError`] instead of [`CentralError`]; keep the two
+/// in sync.
+fn with_client_core<T>(
+    index: usize,
+    f: impl FnOnce(&mut PumpCore) -> T,
+) -> Result<T, GattClientError> {
+    let mut core = {
+        let mut pumps = PUMPS.lock();
+        let Some(slot) = find_slot_mut(&mut pumps, index) else {
+            return Err(GattClientError::NoPump);
+        };
+        match slot.core.take() {
+            Some(core) => core,
+            None => return Err(GattClientError::Busy),
+        }
+    };
+    let out = f(&mut core);
+    let mut pumps = PUMPS.lock();
+    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+        slot.core = Some(core);
+    }
+    Ok(out)
+}
+
+/// Discover all primary services in `[start, end]` on controller
+/// `index`'s central-role connection `handle`.
+pub fn gatt_client_discover_services(
+    index: usize,
+    handle: u16,
+    start: u16,
+    end: u16,
+) -> Result<(), GattClientError> {
+    with_client_core(index, |core| {
+        core.gatt_client_discover_services(handle, start, end)
+    })?
+}
+
+/// Discover all characteristics in `[start, end]` on controller
+/// `index`'s central-role connection `handle`.
+pub fn gatt_client_discover_characteristics(
+    index: usize,
+    handle: u16,
+    start: u16,
+    end: u16,
+) -> Result<(), GattClientError> {
+    with_client_core(index, |core| {
+        core.gatt_client_discover_characteristics(handle, start, end)
+    })?
+}
+
+/// Discover all descriptors in `[start, end]` on controller
+/// `index`'s central-role connection `handle`.
+pub fn gatt_client_discover_descriptors(
+    index: usize,
+    handle: u16,
+    start: u16,
+    end: u16,
+) -> Result<(), GattClientError> {
+    with_client_core(index, |core| {
+        core.gatt_client_discover_descriptors(handle, start, end)
+    })?
+}
+
+/// Read one characteristic value by handle on controller `index`'s
+/// central-role connection `handle`.
+pub fn gatt_client_read(
+    index: usize,
+    handle: u16,
+    value_handle: u16,
+) -> Result<(), GattClientError> {
+    with_client_core(index, |core| core.gatt_client_read(handle, value_handle))?
+}
+
+/// Write one characteristic value by handle (Write Request, with
+/// response) on controller `index`'s central-role connection
+/// `handle`.
+pub fn gatt_client_write(
+    index: usize,
+    handle: u16,
+    value_handle: u16,
+    value: &[u8],
+) -> Result<(), GattClientError> {
+    with_client_core(index, |core| {
+        core.gatt_client_write(handle, value_handle, value)
+    })?
+}
+
+/// Subscribe to notifications (`notify == true`) or indications
+/// on a characteristic via its CCCD, on controller `index`'s
+/// central-role connection `handle`.
+pub fn gatt_client_subscribe(
+    index: usize,
+    handle: u16,
+    cccd_handle: u16,
+    notify: bool,
+) -> Result<(), GattClientError> {
+    with_client_core(index, |core| {
+        core.gatt_client_subscribe(handle, cccd_handle, notify)
+    })?
+}
+
+fn gatt_client_records<T: Clone>(
+    index: usize,
+    handle: u16,
+    f: impl FnOnce(&gatt_client::Client) -> &[T],
+) -> Option<Vec<T>> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.client.as_ref())
+            .map(|client| f(client).to_vec())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Services from the last completed primary-service discovery on
+/// controller `index`'s central-role connection `handle`.
+pub fn gatt_client_services(index: usize, handle: u16) -> Option<Vec<crate::gatt::ServiceRecord>> {
+    gatt_client_records(index, handle, |client| client.services())
+}
+
+/// Characteristics accumulated across completed characteristic
+/// discoveries on controller `index`'s central-role connection
+/// `handle`.
+pub fn gatt_client_characteristics(
+    index: usize,
+    handle: u16,
+) -> Option<Vec<crate::gatt::CharacteristicRecord>> {
+    gatt_client_records(index, handle, |client| client.characteristics())
+}
+
+/// Descriptors accumulated across completed descriptor discoveries
+/// on controller `index`'s central-role connection `handle`.
+pub fn gatt_client_descriptors(
+    index: usize,
+    handle: u16,
+) -> Option<Vec<crate::gatt::DescriptorRecord>> {
+    gatt_client_records(index, handle, |client| client.descriptors())
+}
+
+/// CCCD handles with a live subscription from controller `index`'s
+/// central-role connection `handle`.
+pub fn gatt_client_subscribed(index: usize, handle: u16) -> Option<Vec<u16>> {
+    gatt_client_records(index, handle, |client| client.subscribed())
+}
+
+/// Value from the last completed read on controller `index`'s
+/// central-role connection `handle`, if any.
+pub fn gatt_client_last_read(index: usize, handle: u16) -> Option<(u16, Vec<u8>)> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.client.as_ref())
+            .and_then(|client| client.last_read())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Failure that terminated the last client operation on controller
+/// `index`'s central-role connection `handle`, if any.
+pub fn gatt_client_last_error(index: usize, handle: u16) -> Option<gatt_client::ClientFailure> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.client.as_ref())
+            .and_then(|client| client.last_error())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Drain queued notifications (handle, value) on controller
+/// `index`'s central-role connection `handle`.
+pub fn gatt_client_take_notifications(index: usize, handle: u16) -> Option<Vec<(u16, Vec<u8>)>> {
+    with_client_core(index, |core| {
+        core.connection_mut(handle)
+            .and_then(|c| c.client.as_mut())
+            .map(|client| client.take_notifications())
+    })
+    .ok()
+    .flatten()
+}
+
+// ── HOGP client free API (issue #1314) ─────────────────────────────
+//
+// Caller flow on a central-role connection, after GATT discovery:
+// 1. `hogp_attach` builds the client from discovery records.
+// 2. `gatt_client_read` the HID Information / Report Map / Report
+//    Reference handles, then `hogp_note_last_read` after each.
+// 3. `hogp_protocol_mode_write` + `gatt_client_write` to select
+//    boot protocol (when Protocol Mode exists), then
+//    `hogp_note_boot_mode` on the Write Response.
+// 4. One `gatt_client_subscribe` per `hogp_subscribe_targets` entry.
+// 5. `hogp_route_drained` whenever notifications arrive: it drains
+//    the client queue and routes each payload to the input rings.
+// 6. `hogp_take_undecoded` drains staged report-protocol payloads.
+// All return `None` when the pump, connection, client, or HOGP
+// record is absent; attach additionally returns `None` when the
+// peer exposes no usable HID service.
+
+/// Attach a HOGP client to controller `index`'s central-role
+/// connection `handle`, from the GATT client's discovery records.
+/// Returns the discovered handle layout.
+pub fn hogp_attach(index: usize, handle: u16) -> Option<HogpHandles> {
+    with_client_core(index, |core| {
+        let conn = core.connection_mut(handle)?;
+        let client = conn.client.as_ref()?;
+        let hogp = HogpClient::from_records(
+            client.services(),
+            client.characteristics(),
+            client.descriptors(),
+        )?;
+        conn.hogp = Some(hogp);
+        conn.hogp.as_ref().map(|h| h.handles().clone())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Discovered HOGP handle layout for an attached connection.
+pub fn hogp_handles(index: usize, handle: u16) -> Option<HogpHandles> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.hogp.as_ref())
+            .map(|h| h.handles().clone())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Feed the GATT client's last read into the HOGP record (HID
+/// Information, Report Map, or a Report Reference descriptor).
+/// Returns whether the value was consumed by the HOGP record.
+pub fn hogp_note_last_read(index: usize, handle: u16) -> Option<bool> {
+    with_client_core(index, |core| {
+        let conn = core.connection_mut(handle)?;
+        let (h, v) = conn.client.as_ref()?.last_read()?;
+        conn.hogp.as_mut().map(|hogp| hogp.note_read(h, &v))
+    })
+    .ok()
+    .flatten()
+}
+
+/// The Protocol Mode write selecting boot protocol, if the peer
+/// exposes Protocol Mode: (value handle, `[BOOT 0x00]`).
+pub fn hogp_protocol_mode_write(index: usize, handle: u16) -> Option<(u16, [u8; 1])> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.hogp.as_ref())
+            .and_then(|h| h.protocol_mode_write())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Record that the Protocol Mode write completed (boot protocol
+/// selected).
+pub fn hogp_note_boot_mode(index: usize, handle: u16) -> Option<()> {
+    with_client_core(index, |core| {
+        core.connection_mut(handle)
+            .and_then(|c| c.hogp.as_mut())
+            .map(|h| h.note_boot_mode())
+    })
+    .ok()
+    .flatten()
+}
+
+/// CCCD subscription targets: (cccd handle, notify?).
+pub fn hogp_subscribe_targets(index: usize, handle: u16) -> Option<Vec<(u16, bool)>> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.hogp.as_ref())
+            .map(|h| h.subscribe_targets().to_vec())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Drain the GATT client's notification queue and route each
+/// payload through the HOGP record into the input rings.
+/// Returns the number of input events pushed.
+pub fn hogp_route_drained(index: usize, handle: u16) -> Option<usize> {
+    with_client_core(index, |core| {
+        let conn = core.connection_mut(handle)?;
+        let notifs = conn.client.as_mut()?.take_notifications();
+        let hogp = conn.hogp.as_mut()?;
+        Some(notifs.iter().map(|(h, v)| hogp.route(*h, v)).sum())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Drain staged report-protocol input Reports: (report ID, raw value).
+pub fn hogp_take_undecoded(index: usize, handle: u16) -> Option<Vec<(u8, Vec<u8>)>> {
+    with_client_core(index, |core| {
+        core.connection_mut(handle)
+            .and_then(|c| c.hogp.as_mut())
+            .map(|h| h.take_undecoded())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Last Report Map bytes read from the peer, if attached.
+pub fn hogp_report_map(index: usize, handle: u16) -> Option<Vec<u8>> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.hogp.as_ref())
+            .map(|h| h.report_map().to_vec())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Last decoded HID Information value, once read.
+pub fn hogp_hid_info(index: usize, handle: u16) -> Option<HidInformation> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.hogp.as_ref())
+            .and_then(|h| h.hid_info())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Whether boot protocol was selected on this connection.
+pub fn hogp_boot_mode(index: usize, handle: u16) -> Option<bool> {
+    with_client_core(index, |core| {
+        core.connection(handle)
+            .and_then(|c| c.hogp.as_ref())
+            .map(|h| h.boot_mode())
+    })
+    .ok()
+    .flatten()
+}
 
 /// Run one bounded pump step for controller `index`: drain events
 /// (fanning them out to the raw-socket queue), dispatch them, drain
@@ -4247,4 +4740,833 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_central_wrong_phase);
+
+    /// #1313: bring up the fake controller and land a central-role
+    /// connection from Idle (Create issued directly, no scan
+    /// dance), returning its handle.
+    fn gatt_client_bring_up_connected(fake: Arc<ScriptedTransport>) -> Result<u16, &'static str> {
+        central_bring_up(fake.clone())?;
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        if central_connect(0, crate::gap::PeerAddressType::Public, peer).is_err() {
+            return Err("central_connect rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        let handle = 0x0041;
+        fake.enqueue_event(le_connection_complete_central(handle, peer));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connected)
+            || connection_count(0) != Some(1)
+        {
+            return Err("central connection did not land");
+        }
+        Ok(handle)
+    }
+
+    /// Outbound ATT payloads on `handle`, in send order, from the
+    /// fake's sent ACL frames.
+    fn sent_att_payloads(fake: &ScriptedTransport, handle: u16) -> Vec<Vec<u8>> {
+        fake.sent_acl_frames()
+            .into_iter()
+            .filter(|(h, f)| *h == handle && f.cid == CID_ATT)
+            .map(|(_, f)| f.payload)
+            .collect()
+    }
+
+    /// #1313: service discovery end-to-end — request bytes pinned
+    /// against Vol 3 Part F §3.4.4.10 / Part G §4.4, continuation
+    /// from the last end handle, Attribute Not Found termination,
+    /// and exactly the two outbound requests (a wrong-demux server
+    /// answer would add frames and fail the count).
+    fn smoke_pump_gatt_client_discovery() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let handle = match gatt_client_bring_up_connected(fake.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                reset_all();
+                return TestResult::Fail(e);
+            }
+        };
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_services rejected on central connection");
+        }
+        let _ = pump_once(0);
+        // Read By Group Type Request, pinned byte-for-byte: opcode
+        // 0x10, start 0x0001, end 0xFFFF, group type 0x2800.
+        let expect_req: [u8; 7] = [0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28];
+        let sent = sent_att_payloads(&fake, handle);
+        if sent.len() != 1 || sent[0] != expect_req {
+            reset_all();
+            return TestResult::Fail("discover services request bytes mismatch");
+        }
+        // Peer answers two services (GAP 0x1800, Battery 0x180F);
+        // the client must continue from the last end handle + 1.
+        let rsp: [u8; 14] = [
+            0x11, 0x06, // Read By Group Type Rsp, length 6
+            0x01, 0x00, 0x09, 0x00, 0x00, 0x18, // 0x0001-0x0009 GAP
+            0x0A, 0x00, 0x0F, 0x00, 0x0F, 0x18, // 0x000A-0x000F Battery
+        ];
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, rsp.to_vec())));
+        let _ = pump_once(0);
+        let expect_cont: [u8; 7] = [0x10, 0x10, 0x00, 0xFF, 0xFF, 0x00, 0x28];
+        let sent = sent_att_payloads(&fake, handle);
+        if sent.len() != 2 || sent[1] != expect_cont {
+            reset_all();
+            return TestResult::Fail("discovery continuation bytes mismatch");
+        }
+        // Attribute Not Found terminates discovery.
+        let err: [u8; 5] = [0x01, 0x10, 0x10, 0x00, 0x0A];
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, err.to_vec())));
+        let _ = pump_once(0);
+        let services = gatt_client_services(0, handle).unwrap_or_default();
+        let ok = services.len() == 2
+            && services[0].start_handle == 0x0001
+            && services[0].end_handle == 0x0009
+            && services[0].uuid == crate::gatt::Uuid::U16(0x1800)
+            && services[1].start_handle == 0x000A
+            && services[1].end_handle == 0x000F
+            && services[1].uuid == crate::gatt::Uuid::U16(0x180F)
+            && sent_att_payloads(&fake, handle).len() == 2;
+        reset_all();
+        if !ok {
+            return TestResult::Fail("discovered services mismatch or stray frames");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_gatt_client_discovery);
+
+    /// #1313: read, lock-step write, CCCD subscription, and
+    /// notification/indication intake (indications confirm).
+    fn smoke_pump_gatt_client_read_write_subscribe() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let handle = match gatt_client_bring_up_connected(fake.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                reset_all();
+                return TestResult::Fail(e);
+            }
+        };
+        // Read: request pinned, value returned verbatim.
+        if gatt_client_read(0, handle, 0x0003).is_err() {
+            reset_all();
+            return TestResult::Fail("read rejected on central connection");
+        }
+        let _ = pump_once(0);
+        let sent = sent_att_payloads(&fake, handle);
+        if sent.len() != 1 || sent[0] != [0x0A, 0x03, 0x00] {
+            reset_all();
+            return TestResult::Fail("read request bytes mismatch");
+        }
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x0B, 0x4E, 0x41, 0x52, 0x46]),
+        )); // "NARF"
+        let _ = pump_once(0);
+        if gatt_client_last_read(0, handle) != Some((0x0003, alloc::vec![0x4E, 0x41, 0x52, 0x46])) {
+            reset_all();
+            return TestResult::Fail("read value mismatch");
+        }
+        // Lock-step: a second request while the write is pending
+        // fails, and the write completes on its Write Response.
+        if gatt_client_write(0, handle, 0x0005, &[0x01, 0x02]).is_err() {
+            reset_all();
+            return TestResult::Fail("write rejected on central connection");
+        }
+        if gatt_client_read(0, handle, 0x0003) != Err(GattClientError::RequestPending) {
+            reset_all();
+            return TestResult::Fail("second request while pending did not fail lock-step");
+        }
+        let _ = pump_once(0);
+        let sent = sent_att_payloads(&fake, handle);
+        if sent.len() != 2 || sent[1] != [0x12, 0x05, 0x00, 0x01, 0x02] {
+            reset_all();
+            return TestResult::Fail("write request bytes mismatch");
+        }
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x13])));
+        let _ = pump_once(0);
+        // Subscribe: CCCD write 0x0001 (notifications).
+        if gatt_client_subscribe(0, handle, 0x0008, true).is_err() {
+            reset_all();
+            return TestResult::Fail("subscribe rejected on central connection");
+        }
+        let _ = pump_once(0);
+        let sent = sent_att_payloads(&fake, handle);
+        if sent.len() != 3 || sent[2] != [0x12, 0x08, 0x00, 0x01, 0x00] {
+            reset_all();
+            return TestResult::Fail("subscribe request bytes mismatch");
+        }
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x13])));
+        let _ = pump_once(0);
+        if gatt_client_subscribed(0, handle) != Some(alloc::vec![0x0008]) {
+            reset_all();
+            return TestResult::Fail("subscription not recorded");
+        }
+        // Notification queues with no outbound traffic; indication
+        // queues and confirms.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x1B, 0x05, 0x00, 0xAA]),
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x1D, 0x05, 0x00, 0xBB]),
+        ));
+        let _ = pump_once(0);
+        let sent = sent_att_payloads(&fake, handle);
+        let notes = gatt_client_take_notifications(0, handle).unwrap_or_default();
+        let ok = sent.len() == 4
+            && sent[3] == [0x1E]
+            && notes.len() == 2
+            && notes[0] == (0x0005, alloc::vec![0xAA])
+            && notes[1] == (0x0005, alloc::vec![0xBB]);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("notification/indication intake mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_gatt_client_read_write_subscribe
+    );
+
+    /// #1313: failure paths fail closed — non-terminator errors
+    /// and malformed/mismatched responses fail the operation
+    /// (pending cleared, retry works), client ops on a
+    /// peripheral-role connection are refused, and peripheral ATT
+    /// still reaches the GATT server.
+    fn smoke_pump_gatt_client_errors_and_roles() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let handle = match gatt_client_bring_up_connected(fake.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                reset_all();
+                return TestResult::Fail(e);
+            }
+        };
+        // Non-terminator error fails the operation and records it.
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("discover rejected on central connection");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x10, 0x01, 0x00, 0x01]),
+        ));
+        let _ = pump_once(0);
+        let err_ok = matches!(
+            gatt_client_last_error(0, handle),
+            Some(gatt_client::ClientFailure::ErrorResponse(e))
+                if e.request_opcode == 0x10 && e.attribute_handle == 0x0001 && e.error_code == 0x01
+        ) && gatt_client_services(0, handle) == Some(alloc::vec![]);
+        if !err_ok {
+            reset_all();
+            return TestResult::Fail("non-terminator error not recorded");
+        }
+        // Retry works after failure: an immediate terminator
+        // completes an empty discovery.
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("rediscover rejected after failure");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x10, 0x01, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        if gatt_client_services(0, handle) != Some(alloc::vec![]) {
+            reset_all();
+            return TestResult::Fail("terminator did not complete empty discovery");
+        }
+        // Malformed (truncated) and mismatched responses fail.
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("discover rejected for malformed case");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x11])));
+        let _ = pump_once(0);
+        if gatt_client_last_error(0, handle)
+            != Some(gatt_client::ClientFailure::Malformed { opcode: 0x11 })
+        {
+            reset_all();
+            return TestResult::Fail("truncated discovery response did not fail malformed");
+        }
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("discover rejected for mismatch case");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x0B, 0x00]),
+        ));
+        let _ = pump_once(0);
+        if gatt_client_last_error(0, handle)
+            != Some(gatt_client::ClientFailure::Malformed { opcode: 0x0B })
+        {
+            reset_all();
+            return TestResult::Fail("mismatched response did not fail malformed");
+        }
+        // Wrong role: disconnect the central link, then accept a
+        // peripheral connection on a fresh handle. Client ops on
+        // it are refused, and its ATT still reaches the server.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        let peri = 0x0042;
+        fake.enqueue_event(le_connection_complete(
+            peri,
+            [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5],
+        ));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1)
+            || gatt_client_read(0, peri, 0x0003) != Err(GattClientError::NotCentral)
+        {
+            reset_all();
+            return TestResult::Fail("peripheral connection accepted client traffic");
+        }
+        // A read of an unknown handle on the peripheral connection
+        // is answered by the server with Invalid Handle — proving
+        // the route_frame change did not break server dispatch.
+        let before = sent_att_payloads(&fake, peri).len();
+        fake.enqueue_acl(acl_packet(
+            peri,
+            &BFrame::new(CID_ATT, alloc::vec![0x0A, 0xFF, 0xFF]),
+        ));
+        let _ = pump_once(0);
+        let sent = sent_att_payloads(&fake, peri);
+        let ok = sent.len() == before + 1 && sent[before] == [0x01, 0x0A, 0xFF, 0xFF, 0x01];
+        reset_all();
+        if !ok {
+            return TestResult::Fail("peripheral ATT did not reach the server");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_gatt_client_errors_and_roles);
+
+    /// #1314: the pump's GATT server mounts the HID service as a
+    /// boot keyboard, and its stored values answer reads/writes
+    /// through the generic server path (Protocol Mode flips and
+    /// sticks; Control Point accepts writes).
+    fn smoke_pump_hogp_server_mount() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let probe = with_pump_core(0, |core| {
+            let attrs = core.gatt.db.attrs();
+            let find = |uuid: u16| {
+                attrs
+                    .iter()
+                    .find(|a| a.uuid == crate::gatt::Uuid::U16(uuid))
+            };
+            let svc = attrs.iter().find(|a| {
+                a.uuid == crate::gatt::Uuid::U16(0x2800) && a.value == alloc::vec![0x12, 0x18]
+            });
+            let info = find(0x2A4A).filter(|a| a.value == alloc::vec![0x11, 0x01, 0x00, 0x02]);
+            let map =
+                find(0x2A4B).filter(|a| a.value == crate::hogp::BOOT_KEYBOARD_REPORT_MAP.to_vec());
+            let pm = find(0x2A4E).filter(|a| a.value == alloc::vec![0x01]);
+            let kbd_in = find(0x2A22).map(|a| a.handle);
+            let cccd = attrs.iter().find(|a| {
+                a.uuid == crate::gatt::Uuid::U16(0x2902)
+                    && a.value == alloc::vec![0x00, 0x00]
+                    && kbd_in.map(|k| a.handle > k).unwrap_or(false)
+            });
+            let pm_handle = pm.map(|a| a.handle);
+            let cp_handle = find(0x2A4C).map(|a| a.handle);
+            (
+                svc.is_some(),
+                info.is_some(),
+                map.is_some(),
+                pm.is_some(),
+                cccd.is_some(),
+                pm_handle,
+                cp_handle,
+            )
+        });
+        let Ok((svc_ok, info_ok, map_ok, pm_ok, cccd_ok, pm_handle, cp_handle)) = probe else {
+            reset_all();
+            return TestResult::Fail("pump core unavailable for HID mount probe");
+        };
+        if !(svc_ok && info_ok && map_ok && pm_ok && cccd_ok) {
+            reset_all();
+            return TestResult::Fail("HID service mount mismatch");
+        }
+        let (Some(pm_h), Some(cp_h)) = (pm_handle, cp_handle) else {
+            reset_all();
+            return TestResult::Fail("HID mount handles missing");
+        };
+        // Protocol Mode reads back REPORT, flips to BOOT on write,
+        // and sticks; Control Point accepts a write.
+        let driven = with_pump_core(0, |core| {
+            let read = |core: &mut PumpCore, h: u16| {
+                core.gatt.handle_request(&att::Pdu {
+                    opcode: att::ATT_READ_REQ,
+                    params: h.to_le_bytes().to_vec(),
+                })
+            };
+            let write = |core: &mut PumpCore, h: u16, v: &[u8]| {
+                let mut params = h.to_le_bytes().to_vec();
+                params.extend_from_slice(v);
+                core.gatt.handle_request(&att::Pdu {
+                    opcode: att::ATT_WRITE_REQ,
+                    params,
+                })
+            };
+            let r0 = read(core, pm_h);
+            let w = write(core, pm_h, &[0x00]);
+            let r1 = read(core, pm_h);
+            let c = write(core, cp_h, &[0x01]);
+            (r0, w, r1, c)
+        });
+        let Ok((r0, w, r1, c)) = driven else {
+            reset_all();
+            return TestResult::Fail("pump core unavailable for HID drive");
+        };
+        let ok = r0.opcode == att::ATT_READ_RSP
+            && r0.params == alloc::vec![0x01]
+            && w.opcode == att::ATT_WRITE_RSP
+            && r1.opcode == att::ATT_READ_RSP
+            && r1.params == alloc::vec![0x00]
+            && c.opcode == att::ATT_WRITE_RSP;
+        reset_all();
+        if !ok {
+            return TestResult::Fail("HID Protocol Mode / Control Point drive mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_hogp_server_mount);
+
+    /// #1314: central HOGP flow for a boot keyboard — discover the
+    /// HID service, attach, read map + info, select boot protocol,
+    /// subscribe the boot input CCCD, then route notifications into
+    /// the input rings (press, release, rollover-suppressed,
+    /// truncated-ignored, valid-again).
+    fn smoke_pump_hogp_client_boot_keyboard() -> TestResult {
+        use narf_input::{__reset_modifiers_for_test, init_global_ring, pop_key, KeyCode};
+        reset_all();
+        init_global_ring(64);
+        __reset_modifiers_for_test();
+        let fake = Arc::new(ScriptedTransport::new());
+        let handle = match gatt_client_bring_up_connected(fake.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                reset_all();
+                return TestResult::Fail(e);
+            }
+        };
+        // Services: GAP + HID.
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_services rejected");
+        }
+        let _ = pump_once(0);
+        let rsp: [u8; 14] = [
+            0x11, 0x06, // Read By Group Type Rsp, length 6
+            0x01, 0x00, 0x09, 0x00, 0x00, 0x18, // 0x0001-0x0009 GAP
+            0x10, 0x00, 0x20, 0x00, 0x12, 0x18, // 0x0010-0x0020 HID
+        ];
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, rsp.to_vec())));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x10, 0x21, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        let services = gatt_client_services(0, handle).unwrap_or_default();
+        if services.len() != 2 || services[1].uuid != crate::gatt::Uuid::U16(0x1812) {
+            reset_all();
+            return TestResult::Fail("HID service discovery mismatch");
+        }
+        // Characteristics in the HID range, pinned as Read By Type
+        // Rsp tuples (decl, properties, value handle, UUID).
+        if gatt_client_discover_characteristics(0, handle, 0x0010, 0x0020).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_characteristics rejected");
+        }
+        let _ = pump_once(0);
+        let chars_rsp: [u8; 44] = [
+            0x09, 0x07, // Read By Type Rsp, unit 7
+            0x11, 0x00, 0x02, 0x12, 0x00, 0x4A, 0x2A, // info
+            0x13, 0x00, 0x02, 0x14, 0x00, 0x4B, 0x2A, // map
+            0x15, 0x00, 0x04, 0x16, 0x00, 0x4C, 0x2A, // control point
+            0x17, 0x00, 0x06, 0x18, 0x00, 0x4E, 0x2A, // protocol mode
+            0x19, 0x00, 0x12, 0x1A, 0x00, 0x22, 0x2A, // boot kbd in
+            0x1C, 0x00, 0x0E, 0x1D, 0x00, 0x32, 0x2A, // boot kbd out
+        ];
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, chars_rsp.to_vec()),
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x08, 0x1D, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        // Descriptors: CCCDs for the two boot characteristics.
+        if gatt_client_discover_descriptors(0, handle, 0x0010, 0x0020).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_descriptors rejected");
+        }
+        let _ = pump_once(0);
+        let desc_rsp: [u8; 10] = [
+            0x05, 0x01, // Find Information Rsp, 16-bit UUIDs
+            0x1B, 0x00, 0x02, 0x29, // boot kbd in CCCD
+            0x1E, 0x00, 0x02, 0x29, // boot kbd out CCCD
+        ];
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, desc_rsp.to_vec())));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x04, 0x1F, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        let handles = match hogp_attach(0, handle) {
+            Some(h) => h,
+            None => {
+                reset_all();
+                return TestResult::Fail("hogp_attach rejected HID peer");
+            }
+        };
+        if handles.boot_keyboard_input != Some(0x001A)
+            || handles.protocol_mode != Some(0x0018)
+            || handles.subscribe_targets != alloc::vec![(0x001B, true)]
+        {
+            reset_all();
+            return TestResult::Fail("hogp_attach handle layout mismatch");
+        }
+        // Read map + info, feeding each back through note_last_read.
+        if gatt_client_read(0, handle, 0x0014).is_err() {
+            reset_all();
+            return TestResult::Fail("report map read rejected");
+        }
+        let _ = pump_once(0);
+        let mut map_rsp = alloc::vec![0x0B];
+        map_rsp.extend_from_slice(&crate::hogp::BOOT_KEYBOARD_REPORT_MAP);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, map_rsp)));
+        let _ = pump_once(0);
+        if hogp_note_last_read(0, handle) != Some(true)
+            || hogp_report_map(0, handle) != Some(crate::hogp::BOOT_KEYBOARD_REPORT_MAP.to_vec())
+        {
+            reset_all();
+            return TestResult::Fail("report map readback mismatch");
+        }
+        if gatt_client_read(0, handle, 0x0012).is_err() {
+            reset_all();
+            return TestResult::Fail("hid info read rejected");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x0B, 0x11, 0x01, 0x00, 0x02]),
+        ));
+        let _ = pump_once(0);
+        if hogp_note_last_read(0, handle) != Some(true)
+            || hogp_hid_info(0, handle)
+                != Some(crate::hogp::HidInformation {
+                    bcd_hid: 0x0111,
+                    country_code: 0,
+                    flags: 0x02,
+                })
+        {
+            reset_all();
+            return TestResult::Fail("hid info readback mismatch");
+        }
+        // Boot protocol selection: write [0x00] to Protocol Mode.
+        if hogp_protocol_mode_write(0, handle) != Some((0x0018, [0x00])) {
+            reset_all();
+            return TestResult::Fail("protocol mode write target mismatch");
+        }
+        if gatt_client_write(0, handle, 0x0018, &[0x00]).is_err() {
+            reset_all();
+            return TestResult::Fail("protocol mode write rejected");
+        }
+        let _ = pump_once(0);
+        let sent = sent_att_payloads(&fake, handle);
+        if !sent
+            .iter()
+            .any(|p| *p == alloc::vec![0x12, 0x18, 0x00, 0x00])
+        {
+            reset_all();
+            return TestResult::Fail("protocol mode write bytes mismatch");
+        }
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x13])));
+        let _ = pump_once(0);
+        if hogp_note_boot_mode(0, handle) != Some(()) || hogp_boot_mode(0, handle) != Some(true) {
+            reset_all();
+            return TestResult::Fail("boot mode not recorded");
+        }
+        // Subscribe the boot input CCCD.
+        if gatt_client_subscribe(0, handle, 0x001B, true).is_err() {
+            reset_all();
+            return TestResult::Fail("subscribe rejected");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x13])));
+        let _ = pump_once(0);
+        // Press: LShift + A.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(
+                CID_ATT,
+                alloc::vec![0x1B, 0x1A, 0x00, 0x02, 0x00, 0x04, 0, 0, 0, 0, 0],
+            ),
+        ));
+        let _ = pump_once(0);
+        let n = hogp_route_drained(0, handle);
+        let k0 = pop_key();
+        let k1 = pop_key();
+        if n != Some(2)
+            || k0.map(|k| (k.code, k.pressed)) != Some((KeyCode::LeftShift, true))
+            || k1.map(|k| (k.code, k.pressed)) != Some((KeyCode::A, true))
+        {
+            reset_all();
+            return TestResult::Fail("boot keyboard press routing mismatch");
+        }
+        // Release: empty report.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(
+                CID_ATT,
+                alloc::vec![0x1B, 0x1A, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ));
+        let _ = pump_once(0);
+        let n = hogp_route_drained(0, handle);
+        let k0 = pop_key();
+        let k1 = pop_key();
+        if n != Some(2)
+            || k0.map(|k| (k.code, k.pressed)) != Some((KeyCode::LeftShift, false))
+            || k1.map(|k| (k.code, k.pressed)) != Some((KeyCode::A, false))
+        {
+            reset_all();
+            return TestResult::Fail("boot keyboard release routing mismatch");
+        }
+        // Rollover: all six slots 0x01 — phantom, no events.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(
+                CID_ATT,
+                alloc::vec![0x1B, 0x1A, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01],
+            ),
+        ));
+        let _ = pump_once(0);
+        if hogp_route_drained(0, handle) != Some(0) || pop_key().is_some() {
+            reset_all();
+            return TestResult::Fail("rollover report produced events");
+        }
+        // Truncated: 6 bytes, not 8 — ignored.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x1B, 0x1A, 0x00, 0x02, 0x00, 0x04]),
+        ));
+        let _ = pump_once(0);
+        if hogp_route_drained(0, handle) != Some(0) || pop_key().is_some() {
+            reset_all();
+            return TestResult::Fail("truncated report produced events");
+        }
+        // Valid again after rollover: B press only (rollover did
+        // not corrupt the previous-key state).
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(
+                CID_ATT,
+                alloc::vec![0x1B, 0x1A, 0x00, 0x00, 0x00, 0x05, 0, 0, 0, 0, 0],
+            ),
+        ));
+        let _ = pump_once(0);
+        let n = hogp_route_drained(0, handle);
+        let k0 = pop_key();
+        let ok = n == Some(1)
+            && k0.map(|k| (k.code, k.pressed)) == Some((KeyCode::B, true))
+            && pop_key().is_none();
+        reset_all();
+        if !ok {
+            return TestResult::Fail("post-rollover key routing mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_hogp_client_boot_keyboard);
+
+    /// #1314: central HOGP flow for a boot mouse + a report-protocol
+    /// input Report — mouse motion/buttons route to Pointer/Button
+    /// events, and the Report payload stages undecoded only once
+    /// its Report Reference has been read (unresolved payloads do
+    /// not stage).
+    fn smoke_pump_hogp_client_boot_mouse_and_undecoded() -> TestResult {
+        use narf_input::{init_global_ring, pop_button, pop_pointer, PointerButtons};
+        reset_all();
+        init_global_ring(64);
+        let fake = Arc::new(ScriptedTransport::new());
+        let handle = match gatt_client_bring_up_connected(fake.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                reset_all();
+                return TestResult::Fail(e);
+            }
+        };
+        // Services: GAP + HID (0x0010-0x0030).
+        if gatt_client_discover_services(0, handle, 0x0001, 0xFFFF).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_services rejected");
+        }
+        let _ = pump_once(0);
+        let rsp: [u8; 14] = [
+            0x11, 0x06, 0x01, 0x00, 0x09, 0x00, 0x00, 0x18, 0x10, 0x00, 0x30, 0x00, 0x12, 0x18,
+        ];
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, rsp.to_vec())));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x10, 0x31, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        // Characteristics: info, map, control, protocol, boot kbd
+        // in, boot mouse in, Report.
+        if gatt_client_discover_characteristics(0, handle, 0x0010, 0x0030).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_characteristics rejected");
+        }
+        let _ = pump_once(0);
+        let chars_rsp: [u8; 51] = [
+            0x09, 0x07, 0x11, 0x00, 0x02, 0x12, 0x00, 0x4A, 0x2A, 0x13, 0x00, 0x02, 0x14, 0x00,
+            0x4B, 0x2A, 0x15, 0x00, 0x04, 0x16, 0x00, 0x4C, 0x2A, 0x17, 0x00, 0x06, 0x18, 0x00,
+            0x4E, 0x2A, 0x19, 0x00, 0x12, 0x1A, 0x00, 0x22, 0x2A, 0x1C, 0x00, 0x12, 0x1D, 0x00,
+            0x33, 0x2A, 0x1F, 0x00, 0x12, 0x20, 0x00, 0x4D, 0x2A,
+        ];
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, chars_rsp.to_vec()),
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x08, 0x20, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        // Descriptors: CCCDs + the Report Reference.
+        if gatt_client_discover_descriptors(0, handle, 0x0010, 0x0030).is_err() {
+            reset_all();
+            return TestResult::Fail("discover_descriptors rejected");
+        }
+        let _ = pump_once(0);
+        let desc_rsp: [u8; 18] = [
+            0x05, 0x01, 0x1B, 0x00, 0x02, 0x29, 0x1E, 0x00, 0x02, 0x29, 0x21, 0x00, 0x02, 0x29,
+            0x22, 0x00, 0x08, 0x29,
+        ];
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, desc_rsp.to_vec())));
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x01, 0x04, 0x23, 0x00, 0x0A]),
+        ));
+        let _ = pump_once(0);
+        let handles = match hogp_attach(0, handle) {
+            Some(h) => h,
+            None => {
+                reset_all();
+                return TestResult::Fail("hogp_attach rejected HID peer");
+            }
+        };
+        if handles.boot_mouse_input != Some(0x001D)
+            || handles.reports.len() != 1
+            || handles.reports[0].value_handle != 0x0020
+            || handles.reports[0].report_reference_handle != Some(0x0022)
+            || handles.subscribe_targets
+                != alloc::vec![(0x001B, true), (0x001E, true), (0x0021, true)]
+        {
+            reset_all();
+            return TestResult::Fail("hogp_attach mouse/report layout mismatch");
+        }
+        // Unresolved Report payload does NOT stage.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x1B, 0x20, 0x00, 0xAA, 0xBB]),
+        ));
+        let _ = pump_once(0);
+        if hogp_route_drained(0, handle) != Some(0)
+            || hogp_take_undecoded(0, handle) != Some(alloc::vec![])
+        {
+            reset_all();
+            return TestResult::Fail("unresolved report payload staged");
+        }
+        // Resolve the reference: read 0x0022 -> [id 1, input].
+        if gatt_client_read(0, handle, 0x0022).is_err() {
+            reset_all();
+            return TestResult::Fail("report reference read rejected");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x0B, 0x01, 0x01]),
+        ));
+        let _ = pump_once(0);
+        if hogp_note_last_read(0, handle) != Some(true) {
+            reset_all();
+            return TestResult::Fail("report reference readback not consumed");
+        }
+        // Subscribe mouse + report CCCDs (lock-step: one at a time).
+        if gatt_client_subscribe(0, handle, 0x001E, true).is_err() {
+            reset_all();
+            return TestResult::Fail("mouse subscribe rejected");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x13])));
+        let _ = pump_once(0);
+        if gatt_client_subscribe(0, handle, 0x0021, true).is_err() {
+            reset_all();
+            return TestResult::Fail("report subscribe rejected");
+        }
+        let _ = pump_once(0);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_ATT, alloc::vec![0x13])));
+        let _ = pump_once(0);
+        // Mouse: left button down, dx +5, dy -3.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x1B, 0x1D, 0x00, 0x01, 0x05, 0xFD]),
+        ));
+        let _ = pump_once(0);
+        let n = hogp_route_drained(0, handle);
+        let btn = pop_button();
+        let ptr = pop_pointer();
+        if n != Some(2)
+            || btn.map(|b| (b.code, b.pressed)) != Some((narf_input::btn::BTN_LEFT, true))
+            || ptr.map(|p| (p.dx, p.dy, p.buttons)) != Some((5, -3, PointerButtons::LEFT))
+        {
+            reset_all();
+            return TestResult::Fail("boot mouse routing mismatch");
+        }
+        // Report payload now stages with its resolved ID.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(CID_ATT, alloc::vec![0x1B, 0x20, 0x00, 0xAA, 0xBB]),
+        ));
+        let _ = pump_once(0);
+        let n = hogp_route_drained(0, handle);
+        let staged = hogp_take_undecoded(0, handle);
+        let ok = n == Some(0) && staged == Some(alloc::vec![(1u8, alloc::vec![0xAA, 0xBB])]);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("resolved report payload staging mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_hogp_client_boot_mouse_and_undecoded
+    );
 }

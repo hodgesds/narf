@@ -210,9 +210,47 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   the disable completion (or directly from Idle), and LE Connection
   Complete lands the connection like any other pump connection.
   `pump::central_phase` exposes the initiator phase. Out of scope
-  here: ATT/GATT client traffic after connect (#1313), pairing
-  initiation (#888), host-initiated disconnect, and any mgmt/userspace
-  trigger for these calls (future lane).
+  here: pairing initiation (#888), host-initiated disconnect, and
+  any mgmt/userspace trigger for these calls (future lane).
+  GATT client (issue #1313): `pump::gatt_client_discover_services` /
+  `discover_characteristics` / `discover_descriptors` / `read` /
+  `write` / `subscribe` issue ATT requests over a central-role
+  connection's outbound ACL path, and `pump::gatt_client_services` /
+  `characteristics` / `descriptors` / `subscribed` / `last_read` /
+  `last_error` / `take_notifications` expose the discovered state.
+  Inbound ATT on a central-role connection is demultiplexed to the
+  per-connection `gatt_client::Client` (never to the GATT server);
+  ATT lock-step holds one outstanding request per connection, and
+  discovery loops from the last returned handle until the range end
+  or an Attribute Not Found terminator. Out of scope here: MTU
+  exchange (default ATT MTU 23 governs), Read Blob / long reads,
+  Prepare / Execute writes, and ATT over BR/EDR.
+  HOGP wiring (issue #1314): the pump's GATT server mounts the HID
+  service (0x1812) as a boot keyboard on every controller —
+  `services::mount_hid_service` publishes HID Information
+  (bcdHID 1.11, country 0, NORMALLY_CONNECTABLE only, no remote
+  wake claim), the HID 1.11 Appendix B.1 boot keyboard Report Map,
+  HID Control Point, Protocol Mode (default Report), and boot
+  keyboard input/output characteristics — always-mounted like
+  GAP/GATT/DIS/Battery, but mount alone does not advertise, and
+  the server cannot emit notifications yet, so a central can read
+  the map and flip Protocol Mode but receives no input reports
+  from this mount. The central half is `hogp_client::HogpClient`,
+  built by `pump::hogp_attach` from GATT discovery records:
+  `pump::hogp_note_last_read` feeds HID Information / Report Map /
+  Report Reference reads, `pump::hogp_protocol_mode_write` (+
+  `hogp_note_boot_mode`) selects boot protocol when Protocol Mode
+  exists, `pump::hogp_subscribe_targets` yields the CCCD targets
+  (NOTIFY wins over INDICATE), and `pump::hogp_route_drained`
+  drains the client notification queue into the `narf_input`
+  global rings — boot keyboard reports diffed (modifier byte, then
+  six-keycode array, rollover suppressed, usages 0x00–0x03 and
+  0xE0–0xE7 filtered) via `push_key`, boot mouse reports via
+  PointerEvent + ButtonEvent. Report-protocol input Reports are
+  staged undecoded (`pump::hogp_take_undecoded`); the Report Map is
+  not parsed, evdev DeviceNode registration is not done, and HID
+  Control Point / boot output reports are not driven — all
+  follow-up.
 
 ## Scope
 
@@ -225,7 +263,7 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 - **HCI pump** (`pump`): supervised per-controller event/ACL pump task
   composing the layers below into a running system — connection table,
   ACL flow control, raw-socket event fan-out, per-connection L2CAP
-  dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery
+  dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery/HID
   services, SMP → Just-Works responder, LE + BR/EDR signalling
   answers, dynamic CIDs → open channel servers). Production
   `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
@@ -250,6 +288,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   types + well-known UUIDs + discovery-request builders and
   response parsers (Read By Group Type for Primary Services, Read
   By Type for Characteristics, Find Information for Descriptors).
+  GATT client (`gatt_client` + `pump` wiring, #1313): discovery /
+  read / write / CCCD subscription over central-role connections,
+  with ATT lock-step, response demultiplexing away from the GATT
+  server, and notification/indication intake.
 - **SMP** (`smp`): Pairing PDU codec, IO-Capability + AuthReq
   bitfields, pairing-method selector (table 2.8), LE Secure
   Connections **Just Works** initiator + responder state machines

@@ -23,6 +23,9 @@ use crate::gatt::{
     UUID_SERVICE_BATTERY, UUID_SERVICE_DEVICE_INFORMATION, UUID_SERVICE_GAP, UUID_SERVICE_GATT,
 };
 use crate::gatt_server::{AttributeDatabase, Permissions};
+use crate::hogp::{
+    HidInformation, HidServiceBuilder, BOOT_KEYBOARD_REPORT_MAP, HID_INFO_FLAG_NORMALLY_CONNECTABLE,
+};
 
 // ── GAP service characteristics (Vol 3 Part C §12) ─────────────────
 
@@ -210,6 +213,42 @@ pub fn mount_battery_service(db: &mut AttributeDatabase, initial_level: u8) -> (
         alloc::vec![0x00, 0x00],
     );
     (svc_handle, level_handle, cccd_handle)
+}
+
+// ── HID Service (HOGP peripheral mount) ────────────────────────────
+
+/// Mount the HID Service (HID Service v1.0) as a boot keyboard,
+/// for the pump's peripheral role (#1314). HID Information claims
+/// bcdHID 1.11, country code 0 (not localised), and
+/// NORMALLY_CONNECTABLE only — REMOTE_WAKE is deliberately NOT
+/// claimed, since no wake machinery exists to honour it. The
+/// Report Map is the HID 1.11 Appendix B.1 boot keyboard
+/// descriptor (`crate::hogp::BOOT_KEYBOARD_REPORT_MAP`); no
+/// generic Report entries are added, because the map describes a
+/// boot keyboard only and a report-id-1 Report would be
+/// incoherent with it. Boot keyboard input/output plus Protocol
+/// Mode come from `with_boot_keyboard`.
+///
+/// This mount alone does not advertise: advertising data is a
+/// separate surface, and server-initiated notifications have no
+/// path yet (the GATT server stores characteristic values and
+/// answers reads/writes; it cannot emit notifications), so a
+/// central can read the map and flip Protocol Mode but receives
+/// no input reports from this mount today. Emitting boot reports
+/// on the peripheral side is follow-up.
+///
+/// Returns the service's handle layout.
+pub fn mount_hid_service(db: &mut AttributeDatabase) -> crate::hogp::HidServiceHandles {
+    HidServiceBuilder::new(
+        HidInformation {
+            bcd_hid: 0x0111,
+            country_code: 0,
+            flags: HID_INFO_FLAG_NORMALLY_CONNECTABLE,
+        },
+        BOOT_KEYBOARD_REPORT_MAP.to_vec(),
+    )
+    .with_boot_keyboard()
+    .build(db)
 }
 
 // ── Heart Rate Service ─────────────────────────────────────────────

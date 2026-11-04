@@ -923,6 +923,7 @@ dependencies = [
  "narf-filesystem",
  "narf-firmware",
  "narf-init",
+ "narf-input",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
