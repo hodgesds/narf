@@ -23,7 +23,11 @@ fn drain<R: Fullmac>(runtime: &mut R) -> Result<bool, Error> {
 }
 
 impl Session {
-    pub(crate) async fn stop<R: Fullmac>(&mut self, station: &mut Station<R>) -> Result<(), Error> {
+    pub(crate) async fn stop<R: Fullmac>(
+        &mut self,
+        station: &mut Station<R>,
+        clear_mbss: bool,
+    ) -> Result<(), Error> {
         // Revoke copied host data/keys/roles before the first native wait,
         // including when START's waiter was dropped or its source revoked.
         self.fail();
@@ -100,7 +104,13 @@ impl Session {
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
         self.native_entered = false;
-        saved.restore(&mut station.runtime, &native).await?;
+        // `clear_mbss` is false while another AP still runs: the
+        // device-wide MBSS mode must survive until the last MBSS AP
+        // stops. Primary and GO scopes ignore it (they never touch
+        // `mbss`).
+        saved
+            .restore(&mut station.runtime, &native, clear_mbss)
+            .await?;
         // Template deletion and saved known radio/offload state are native
         // transactions, not replay of retired credentials/defaults/ports.
         ap_native::vendor(

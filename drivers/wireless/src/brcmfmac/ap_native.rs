@@ -162,8 +162,10 @@ pub(crate) enum Scope {
         /// them for an AP vif only when `ifp->ifidx == 0` or the firmware
         /// has neither `BRCMF_FEAT_RSDB` nor `BRCMF_FEAT_MCHAN`.
         down_apsta: bool,
-        /// `BRCMF_FEAT_MBSS`: `mbss 1` before `SET_AP` (first AP, Linux
-        /// `!vif->mbss`) and `mbss 0` on stop.
+        /// `BRCMF_FEAT_MBSS`: `mbss 1` before `SET_AP` when this AP
+        /// first enables firmware MBSS mode (no other secondary AP
+        /// running), and `mbss 0` on stop only when it is the last
+        /// MBSS AP (see `Saved::restore`'s `clear_mbss`).
         mbss: bool,
     },
     /// A P2P GO connection bsscfg (`vif_owner::create_p2p`, `p2p_ifadd`
@@ -180,13 +182,22 @@ pub(crate) enum Scope {
     },
 }
 impl Scope {
-    /// Linux `brcmf_cfg80211_start_ap` rules for a secondary AP vif that
-    /// is the first AP (`vif->mbss` false). RSDB is not parsed by NARF
-    /// (`rsdb_mode`); it is treated as absent.
-    pub(crate) fn secondary(features: super::vif_wire::Features) -> Self {
+    /// Linux `brcmf_cfg80211_start_ap` rules for a secondary AP vif.
+    /// `other_ap` is true once another AP already exists: the shared
+    /// radio setup (DOWN/apsta) is skipped (Linux `vif->mbss` path).
+    /// `other_secondary_active` is true once another secondary AP is
+    /// actually running: firmware MBSS mode is then already enabled
+    /// (a running primary AP never enables it), so `mbss 1` is skipped;
+    /// otherwise the first secondary AP enables it. RSDB is not parsed
+    /// by NARF (`rsdb_mode`); it is treated as absent.
+    pub(crate) fn secondary(
+        features: super::vif_wire::Features,
+        other_ap: bool,
+        other_secondary_active: bool,
+    ) -> Self {
         Self::Secondary {
-            down_apsta: !features.mchan,
-            mbss: features.mbss,
+            down_apsta: !features.mchan && !other_ap,
+            mbss: features.mbss && !other_secondary_active,
         }
     }
     fn primary(self) -> bool {
@@ -313,6 +324,7 @@ impl Saved {
         &self,
         runtime: &mut R,
         native: &Source,
+        clear_mbss: bool,
     ) -> Result<(), Error> {
         let guard = Guard::Stop(native);
         let go = self.scope.go().is_some();
@@ -376,10 +388,13 @@ impl Saved {
                 set_var(runtime, &guard, "event_msgs", &mask).await?;
                 runtime.events_written(mask);
             }
-            // brcmf_cfg80211_stop_ap: `mbss 0` with BRCMF_FEAT_MBSS. The
-            // shared event mask stays (Linux keeps every handled event).
+            // brcmf_cfg80211_stop_ap: `mbss 0` with BRCMF_FEAT_MBSS,
+            // but only when this is the last MBSS AP: clearing the
+            // device-wide mode while another MBSS AP runs would
+            // strand its BSS. The shared event mask stays (Linux
+            // keeps every handled event).
             Scope::Secondary { mbss, .. } => {
-                if mbss {
+                if mbss && clear_mbss {
                     set_var(runtime, &guard, "mbss", &0u32.to_le_bytes()).await?;
                 }
             }

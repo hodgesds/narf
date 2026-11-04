@@ -530,7 +530,7 @@ impl<R: Fullmac + 'static> Device<R> {
                 state.clear_transmit();
                 let State { station, ap, .. } = &mut *state;
                 match ap.as_mut() {
-                    Some(session) => session.stop(station).await.map(|_| false),
+                    Some(session) => session.stop(station, true).await.map(|_| false),
                     None => Err(Error::Unsupported),
                 }
             }
@@ -682,7 +682,7 @@ impl<R: Fullmac + 'static> Device<R> {
             let State { station, ap, .. } = &mut *state;
             let session = ap.as_mut().unwrap();
             session.fail();
-            if session.stop(station).await.is_err() {
+            if session.stop(station, true).await.is_err() {
                 // Runtime retains all uncertain mappings. Only existing
                 // whole-device teardown/recovery may later reclaim them.
                 station.runtime.fail();

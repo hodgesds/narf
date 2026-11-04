@@ -254,6 +254,18 @@ impl Session {
     pub(crate) fn active(&self) -> bool {
         !self.failed && self.running.load(Ordering::Acquire) && self.current().is_ok()
     }
+    /// This session's BSS chanspec as prepared (before or after START).
+    pub(crate) fn chanspec(&self) -> u16 {
+        self.plan.chanspec
+    }
+    /// Live BSS chanspec, for MBSS channel agreement (None unless active).
+    pub(crate) fn running_chanspec(&self) -> Option<u16> {
+        self.active().then_some(self.plan.chanspec)
+    }
+    /// Whether this session is a P2P GO BSS (never an MBSS peer).
+    pub(crate) fn is_go(&self) -> bool {
+        self.scope.go().is_some()
+    }
     pub(crate) fn cleanup_required(&self) -> bool {
         self.failed || self.cancelled.load(Ordering::Acquire) || self.current().is_err()
     }

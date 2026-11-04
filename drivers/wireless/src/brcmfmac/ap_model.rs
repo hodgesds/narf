@@ -56,6 +56,7 @@ impl Default for Profile {
             ("apsta", 0),
             ("ap_isolate", 0),
             ("mpc", 1),
+            ("mbss", 0),
             ("arpoe", 0),
             ("arp_ol", 0),
             ("ndoe", 0),
