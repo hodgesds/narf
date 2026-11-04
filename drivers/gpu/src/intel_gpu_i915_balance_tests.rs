@@ -599,7 +599,7 @@ fn smoke_i915_xe_shared_wb_reservations_syncobjs_and_private_vm_lifetimes() -> T
     assert!(context.busy() && legacy.result().is_none());
     assert!(weak.iter().all(|object| object.upgrade().is_some()));
     let mut registered = BTreeMap::new();
-    finish_policy(&mut gt, &w, &legacy, &mut registered, 601, 3);
+    finish(&mut gt, &w, &legacy, &mut registered, 601);
     assert!(output.is_signalled());
     assert!(!context.busy());
     assert_eq!(context.reset_stats(), (0, 0));
