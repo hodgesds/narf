@@ -23,9 +23,11 @@
 //! A context's [`Health`] records whether one of its jobs hung on a ring (it
 //! is guilty) or was abandoned behind another's hang. Linux reads that from
 //! its entities' last errors (`drm_sched_entity_error`): `AMDGPU_CS` on such
-//! a context fails with the error, QUERY_STATE answers `UNKNOWN_RESET`, and
-//! QUERY_STATE2 reports RESET, plus GUILTY for a hang of its own. A ring
-//! reset loses no VRAM.
+//! a context fails with the error, QUERY_STATE answers `UNKNOWN_RESET` once
+//! (Linux's ring reset bumps `gpu_reset_counter`), and QUERY_STATE2 reports
+//! RESET, plus GUILTY for a hang of its own. A ring reset loses no VRAM.
+//! LINUX-GAP: Linux's counter also moves for other contexts' ring resets;
+//! here only a context's own hang and full recoveries are reported.
 //!
 //! LINUX-GAP: no hang count, no `RESET_IN_PROGRESS`, and no RAS CE/UE
 //! counters; a ring reset does not count as a device recovery, so a context
@@ -65,6 +67,10 @@ pub struct Context {
     pub reset_epoch: u64,
     /// Recoveries already reported by `QUERY_STATE` (`reset_counter_query`).
     pub reset_queried: u64,
+    /// The context's own failed job was reported by `QUERY_STATE`: Linux
+    /// resets that ring and bumps `gpu_reset_counter` (amdgpu_job.c,
+    /// amdgpu_ring.c), which QUERY_STATE reports once, as for a recovery.
+    pub hang_reported: bool,
 }
 
 /// GPU recoveries completed since boot (Navi22 and Navi48 owners).
@@ -181,6 +187,7 @@ impl CtxState {
                     stable_pstate: uapi::AMDGPU_CTX_STABLE_PSTATE_NONE,
                     reset_epoch: recoveries(),
                     reset_queried: recoveries(),
+                    hang_reported: false,
                 },
                 Arc::new(Health::default()),
             ),
@@ -197,7 +204,8 @@ impl CtxState {
                 self.jobs.forget(id);
                 Ok(())
             }
-            None => Err(FsError::NotFound),
+            // amdgpu_ctx_free: `return ctx ? 0 : -EINVAL`.
+            None => Err(FsError::InvalidData),
         }
     }
 
@@ -206,23 +214,29 @@ impl CtxState {
         let (ctx, health) = g
             .as_mut()
             .and_then(|m| m.get_mut(&id))
-            .ok_or(FsError::NotFound)?;
+            // amdgpu_ctx_query: an unknown id is -EINVAL.
+            .ok_or(FsError::InvalidData)?;
+        // amdgpu_ctx_query: UNKNOWN_RESET exactly once per move of the
+        // device reset counter since this context last asked, then
+        // NO_RESET. A hang of one of its jobs is such a move (Linux resets
+        // the ring and bumps gpu_reset_counter); it too reports once.
         let now = recoveries();
-        if ctx.reset_queried == now {
-            // A context whose job hung or was canceled stays reset.
-            return Ok(match health.error() {
-                Some(_) => uapi::AMDGPU_CTX_UNKNOWN_RESET,
-                None => uapi::AMDGPU_CTX_NO_RESET,
-            });
-        }
+        let hang = health.error().is_some() && !ctx.hang_reported;
+        let status = if ctx.reset_queried == now && !hang {
+            uapi::AMDGPU_CTX_NO_RESET
+        } else {
+            uapi::AMDGPU_CTX_UNKNOWN_RESET
+        };
         ctx.reset_queried = now;
-        Ok(uapi::AMDGPU_CTX_UNKNOWN_RESET)
+        ctx.hang_reported |= health.error().is_some();
+        Ok(status)
     }
 
     fn set_pstate(&self, id: u32, pstate: u32) -> Result<(), FsError> {
         let mut g = self.contexts.lock();
-        let map = g.as_mut().ok_or(FsError::NotFound)?;
-        let (ctx, _) = map.get_mut(&id).ok_or(FsError::NotFound)?;
+        // amdgpu_ctx_stable_pstate: an unknown id is -EINVAL.
+        let map = g.as_mut().ok_or(FsError::InvalidData)?;
+        let (ctx, _) = map.get_mut(&id).ok_or(FsError::InvalidData)?;
         ctx.stable_pstate = pstate;
         Ok(())
     }
@@ -318,8 +332,8 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
             if flags != 0 {
                 return Err(FsError::InvalidData);
             }
-            // amdgpu_ctx_query: UNKNOWN_RESET once per new reset, then NO_RESET
-            // unless one of its jobs hung or was canceled.
+            // amdgpu_ctx_query: UNKNOWN_RESET once per new reset (a
+            // recovery, or a hang of one of its jobs), then NO_RESET.
             let status = state.query_reset(ctx_id)?;
             // `out.state { flags u64, hangs u32, reset_status u32 }`.
             out[12..16].copy_from_slice(&status.to_le_bytes());
@@ -328,9 +342,9 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
             if flags != 0 {
                 return Err(FsError::InvalidData);
             }
-            // The context must exist — a query naming nothing is ENOENT, not
-            // a zeroed answer that reads as "healthy".
-            let ctx = state.get(ctx_id).ok_or(FsError::NotFound)?;
+            // The context must exist: amdgpu_ctx_query2 returns -EINVAL for
+            // an unknown id rather than a zeroed answer that reads healthy.
+            let ctx = state.get(ctx_id).ok_or(FsError::InvalidData)?;
             let error = state.health(ctx_id).and_then(|h| h.error());
             // amdgpu_ctx_query2: a recovery since creation reset the GPU and,
             // being a mode1 reset, lost VRAM; a hang of the context's own
@@ -353,7 +367,8 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
             if flags != 0 {
                 return Err(FsError::InvalidData);
             }
-            let ctx = state.get(ctx_id).ok_or(FsError::NotFound)?;
+            // amdgpu_ctx_stable_pstate: an unknown id is -EINVAL.
+            let ctx = state.get(ctx_id).ok_or(FsError::InvalidData)?;
             // `out.pstate.flags` is a u32 in the first word of the out arm.
             out[0..4].copy_from_slice(&ctx.stable_pstate.to_le_bytes());
         }
