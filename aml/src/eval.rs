@@ -1761,8 +1761,19 @@ fn write_target(
             //  - BufferField:  splice into the source Buffer
             //                  (audit #9 — _CRS template fill-in)
             //  - other:        update the Name node's value cache
+            // `read_name_string` roots every name at `\`; a relative
+            // target (no `\`/`^` prefix) must instead go through the
+            // ACPI 6.5 §5.3 upward scope search, so strip that root back
+            // off before resolving and store into the node actually found.
+            let relative = !matches!(b, ROOT_CHAR | PARENT_PREFIX);
             let name = read_name_string(buf, cur, "\\")?;
-            let resolved = resolve_name(&name, &state.scope);
+            let lookup = if relative {
+                name.strip_prefix('\\').unwrap_or(&name)
+            } else {
+                name.as_str()
+            };
+            let resolved = resolve_name(lookup, &state.scope);
+            let name = resolved.as_ref().map_or(name.clone(), |n| n.path.clone());
             match resolved.as_ref().map(|n| n.kind) {
                 Some(crate::NodeKind::Field) => {
                     let _ = crate::oregion::write_field(&name, value.as_integer());
