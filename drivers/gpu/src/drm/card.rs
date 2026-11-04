@@ -1213,8 +1213,9 @@ impl ColorFormat {
 pub struct NativeOutput {
     /// The connector (id) this describes.
     pub connector: u32,
-    /// The sink's base EDID block, reported verbatim; None when unplugged.
-    pub edid: Option<[u8; 128]>,
+    /// The sink's whole EDID (base block and every extension block, as
+    /// drm_edid_read reads it), reported verbatim; None when unplugged.
+    pub edid: Option<Vec<u8>>,
     /// Exact driver-admitted timings, authoritative for GETCONNECTOR.
     /// Several may share a size and rounded refresh represented by only
     /// one entry in the connector's simplified `modes` list.

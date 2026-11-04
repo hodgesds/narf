@@ -76,8 +76,8 @@ fn navi48_kms_discovery_keeps_disabled_connector_connected() -> TestResult {
     assert!(!card.crtcs[0].enabled && card.crtcs[0].mode.is_none());
     assert!(card.crtcs[0].primary_fb.is_none());
     assert_eq!(
-        card.native_output(CONNECTOR).and_then(|n| n.edid),
-        Some(edid)
+        card.native_output(CONNECTOR).and_then(|n| n.edid.clone()),
+        Some(edid.to_vec())
     );
     assert!(!card.accepts_mode(&timing_wire(&cea_1080p())));
     output.edid = None;
@@ -209,7 +209,7 @@ fn navi48_kms_publishes_connector_edid_and_refuses_other_modes() -> TestResult {
         || c.connector_type != ConnectorType::DisplayPort
         || c.modes != [mode]
         || card.crtcs[0].mode != Some(mode)
-        || card.native_output(CONNECTOR).and_then(|n| n.edid) != Some(edid)
+        || card.native_output(CONNECTOR).and_then(|n| n.edid.clone()) != Some(edid.to_vec())
         || geometry(&card.mode_wire(&mode)) != geometry(&wire)
     {
         return TestResult::Fail("lit connector");
@@ -460,8 +460,14 @@ fn navi48_kms_publishes_an_output_per_port() -> TestResult {
     if card.crtcs[0].mode.map(|m| m.width) != Some(1920)
         || card.crtcs[1].enabled
         || card.crtcs[2].mode.map(|m| m.width) != Some(1280)
-        || card.native_output(connector_id(0)).and_then(|n| n.edid) != Some(edid_a)
-        || card.native_output(connector_id(2)).and_then(|n| n.edid) != Some(edid_c)
+        || card
+            .native_output(connector_id(0))
+            .and_then(|n| n.edid.clone())
+            != Some(edid_a.to_vec())
+        || card
+            .native_output(connector_id(2))
+            .and_then(|n| n.edid.clone())
+            != Some(edid_c.to_vec())
         || card
             .native_output(connector_id(1))
             .is_none_or(|n| n.edid.is_some())
@@ -586,7 +592,10 @@ fn navi48_kms_routes_connectors_to_any_crtc() -> TestResult {
     let mst = card.connector(102).unwrap();
     assert_eq!(mst.status, ConnectorStatus::Connected);
     assert_eq!(mst.modes.len(), 1);
-    assert_eq!(card.native_output(102).and_then(|n| n.edid), Some(edid_m));
+    assert_eq!(
+        card.native_output(102).and_then(|n| n.edid.clone()),
+        Some(edid_m.to_vec())
+    );
     // Dark but discovered: connected with its admitted timing.
     let hdmi = card.connector(6).unwrap();
     assert_eq!(hdmi.status, ConnectorStatus::Connected);
@@ -612,6 +621,66 @@ fn navi48_kms_routes_connectors_to_any_crtc() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_routes_connectors_to_any_crtc
+);
+
+/// The EDID property carries the whole EDID, extension blocks included
+/// (drm_edid_connector_update with what drm_edid_read read): a lit
+/// connector reports its full EDID when its base block is the shown
+/// sink's, a dark one its discovered EDID, and a connector whose current
+/// EDID is not the shown sink's reports the sink's.
+fn navi48_kms_publishes_every_edid_block() -> TestResult {
+    let t = cea_1080p();
+    let mut full = alloc::vec![0x5au8; 256];
+    full[126] = 1;
+    let base: [u8; 128] = full[..128].try_into().unwrap();
+    let other = [0x11u8; 128];
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    let crtcs = [lit(&base, &t, &[]), lit(&other, &t, &[])];
+    let connectors = [
+        RoutedConnector {
+            index: 0,
+            kind: ConnectorType::HdmiA,
+            edid: Some(&full),
+            offered: &[],
+            crtc: Some(0),
+            possible_crtcs: 0x3,
+        },
+        RoutedConnector {
+            index: 1,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&full),
+            offered: &[],
+            crtc: Some(1),
+            possible_crtcs: 0x3,
+        },
+        RoutedConnector {
+            index: 2,
+            kind: ConnectorType::DisplayPort,
+            edid: Some(&full),
+            offered: core::slice::from_ref(&t),
+            crtc: None,
+            possible_crtcs: 0x3,
+        },
+    ];
+    apply_routed(&mut card, &crtcs, &connectors);
+    let edid = |i: usize| {
+        card.native_output(connector_id(i))
+            .and_then(|n| n.edid.clone())
+    };
+    if edid(0) != Some(full.clone()) {
+        return TestResult::Fail("lit connector lost its extension block");
+    }
+    if edid(1) != Some(other.to_vec()) {
+        return TestResult::Fail("lit connector reported an EDID that is not its sink's");
+    }
+    if edid(2) != Some(full.clone()) {
+        return TestResult::Fail("dark connector lost its extension block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_publishes_every_edid_block
 );
 
 /// amdgpu_dm's VRR properties on the native card: every connector carries

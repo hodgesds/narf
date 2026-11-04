@@ -89,7 +89,8 @@ pub fn crtc_display(crtc_id: u32) -> Option<u8> {
 /// timing it can be switched to.
 #[derive(Clone, Copy, Debug)]
 pub struct Sink<'a> {
-    pub edid: &'a [u8; 128],
+    /// The sink's whole EDID (base block and extensions).
+    pub edid: &'a [u8],
     pub timing: &'a Timing,
     pub offered: &'a [Timing],
 }
@@ -101,7 +102,7 @@ pub struct Output<'a> {
     pub kind: ConnectorType,
     pub sink: Option<Sink<'a>>,
     /// Discovered EDID, including a monitor with no lit stream.
-    pub edid: Option<&'a [u8; 128]>,
+    pub edid: Option<&'a [u8]>,
     /// Admitted connector timings when `sink` is None. Requires `edid`;
     /// publishing these does not set or enable a CRTC mode.
     pub offered: &'a [Timing],
@@ -145,7 +146,7 @@ pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
 pub struct RoutedConnector<'a> {
     pub index: usize,
     pub kind: ConnectorType,
-    pub edid: Option<&'a [u8; 128]>,
+    pub edid: Option<&'a [u8]>,
     pub offered: &'a [Timing],
     pub crtc: Option<usize>,
     pub possible_crtcs: u32,
@@ -284,7 +285,13 @@ pub fn apply_routed_vrr(
     let mut native = alloc::vec::Vec::with_capacity(connectors.len());
     for (n, c) in connectors.iter().enumerate() {
         let shown = c.crtc.and_then(|k| crtcs.get(k).copied().flatten());
-        let edid = shown.map(|s| s.edid).or(c.edid);
+        // The connector's whole EDID (extension blocks included) when it is
+        // the shown sink's; the sink's own otherwise.
+        let edid = match (shown, c.edid) {
+            (Some(s), Some(full)) if full.get(..s.edid.len()) == Some(s.edid) => Some(full),
+            (Some(s), _) => Some(s.edid),
+            (None, edid) => edid,
+        };
         let wire = shown.map(|s| timing_wire(s.timing));
         // The running timing first, so a mode that two timings round to the
         // same size and refresh reports the one being scanned out.
@@ -344,7 +351,7 @@ pub fn apply_routed_vrr(
         native.push(NativeOutput {
             color_format: None,
             connector: connector_id(c.index),
-            edid: edid.copied(),
+            edid: edid.map(<[u8]>::to_vec),
             timings,
             // amdgpu_dm attaches it to HDMI and SST DP connectors, which is
             // all these ever are.

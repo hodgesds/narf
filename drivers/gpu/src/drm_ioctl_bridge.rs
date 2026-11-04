@@ -3256,17 +3256,13 @@ fn connector_id_from_edid_blob(blob_id: u32) -> Option<u32> {
 
 /// Generate the EDID bytes for a connector from its preferred (first) mode.
 /// `None` if the connector has no id / no modes.
-fn connector_edid(card: &crate::drm::card::Card, connector_id: u32) -> Option<[u8; 128]> {
+fn connector_edid(card: &crate::drm::card::Card, connector_id: u32) -> Option<Vec<u8>> {
     let conn = card.connector(connector_id).ok()?;
     if let Some(native) = card.native_output(connector_id) {
-        return native.edid;
+        return native.edid.clone();
     }
     let m = conn.modes.first()?;
-    Some(crate::drm::edid_gen::synth_edid(
-        m.width,
-        m.height,
-        m.refresh_hz as u32,
-    ))
+    Some(crate::drm::edid_gen::synth_edid(m.width, m.height, m.refresh_hz as u32).to_vec())
 }
 /// DRM_FORMAT_XRGB8888 — the one scanout format the pixman path uses.
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;

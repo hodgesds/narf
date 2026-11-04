@@ -527,10 +527,11 @@ pub fn publish() {
         .map(|(n, c)| crate::amdgpu_navi48_kms::RoutedConnector {
             index: n,
             kind: c.kind,
+            // The whole EDID, extension blocks included (drm_edid_read).
             edid: c
                 .present
-                .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
-                .flatten(),
+                .then_some(c.edid.as_slice())
+                .filter(|e| e.len() >= 128),
             offered: if c.lightable() { &c.modes } else { &[] },
             crtc: routes[n],
             possible_crtcs: (1 << MAX_CRTCS) - 1,

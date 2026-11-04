@@ -3588,7 +3588,7 @@ fn publish_outputs() {
     struct Owned {
         index: usize,
         kind: ConnectorType,
-        edid: Option<[u8; 128]>,
+        edid: Option<Vec<u8>>,
         offered: Vec<Timing>,
         crtc: Option<usize>,
         vrr_capable: bool,
@@ -3612,10 +3612,8 @@ fn publish_outputs() {
             .map(|c| Owned {
                 index: c.index,
                 kind: c.kind,
-                edid: c
-                    .present
-                    .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
-                    .flatten(),
+                // The whole EDID, extension blocks included (drm_edid_read).
+                edid: c.present.then(|| c.edid.clone()).filter(|e| e.len() >= 128),
                 offered: if c.present {
                     c.modes.clone()
                 } else {
@@ -3651,7 +3649,7 @@ fn publish_outputs() {
         .map(|c| crate::amdgpu_navi48_kms::RoutedConnector {
             index: c.index,
             kind: c.kind,
-            edid: c.edid.as_ref(),
+            edid: c.edid.as_deref(),
             offered: &c.offered,
             crtc: c.crtc,
             // Any encoder drives any CRTC, of the pool's.
