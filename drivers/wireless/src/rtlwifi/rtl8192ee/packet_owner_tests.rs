@@ -16,6 +16,11 @@ struct Model {
     trace: Vec<(u8, u16, u32)>,
     master: bool,
     next: u64,
+    /// Test-only hardware model: when true, pausing RX DMA lets a
+    /// draining engine clear its backdoor hang report — the transient
+    /// hang a recovery is meant to admit. False (default) models a
+    /// truly wedged engine whose report persists.
+    hang_clears_on_pause: bool,
 }
 #[derive(Clone)]
 struct Bus(Arc<IrqSafeSpinLock<Model>>);
@@ -50,6 +55,14 @@ impl Io for Bus {
         let mut m = self.0.lock();
         m.trace.push((8, reg, u32::from(value)));
         m.regs[usize::from(reg)] = value;
+        // Transient-hang model (see `Model::hang_clears_on_pause`): the
+        // RX DMA pause lets a draining engine drop its hang report.
+        if reg == super::REG_RXDMA_CONTROL
+            && value & super::RXDMA_PAUSE != 0
+            && m.hang_clears_on_pause
+        {
+            m.regs[usize::from(super::REG_BACKDOOR_DBI_DATA + 3)] &= !0x03;
+        }
         Ok(())
     }
     fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
@@ -918,4 +931,41 @@ pub(crate) fn smoke_rtl8192ee_erp_protection_special_and_null_tx() -> TestResult
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192ee_erp_protection_special_and_null_tx
+);
+
+pub(crate) fn smoke_rtl8192ee_pcie_dma_hang_recovery_and_release() -> TestResult {
+    // Transient hang: the backdoor probe bit is set and the TX hang bit
+    // is reported, but the engine is only draining from a previous
+    // owner — pausing RX DMA clears the report, so recovery admits the
+    // board and releases the pause.
+    let bus = Bus::new();
+    bus.0.lock().hang_clears_on_pause = true;
+    bus.0.lock().regs[usize::from(super::REG_BACKDOOR_DBI_DATA + 3)] = 1 << 2 | 1;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut owner = allocated(&bus, &drops).unwrap();
+    if narf_scheduler::block_on(owner.prepare()).is_err() || owner.phase() != Phase::Prepared {
+        return TestResult::Fail("transient DMA hang not recovered");
+    }
+    if !bus.traced((8, super::REG_RXDMA_CONTROL, u32::from(super::RXDMA_PAUSE)))
+        || !bus.traced((8, super::REG_RXDMA_CONTROL, 0))
+    {
+        return TestResult::Fail("recovery RX DMA pause/release not traced");
+    }
+    {
+        let m = bus.0.lock();
+        if m.regs[usize::from(super::REG_RXDMA_CONTROL)] & super::RXDMA_PAUSE != 0
+            || m.regs[0x301] != 0xff
+            || m.regs[0x100] & 0xcf != 0
+        {
+            return TestResult::Fail("recovered board left DMA paused or gates open");
+        }
+    }
+    if !bus.traced((32, 0x328, owner.tx[4].address as u32)) {
+        return TestResult::Fail("recovered board published no BD bases");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192ee_pcie_dma_hang_recovery_and_release
 );

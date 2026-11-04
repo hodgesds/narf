@@ -168,6 +168,9 @@ pub struct Prepared<I: Io, M: Memory> {
     rtl8821ae: Option<super::rtl8821ae::phy::Report>,
     rtl8821ae_identity: Option<[u8; 32]>,
     rtl8821ae_power: Option<super::rtl8821ae::envelope::Permission>,
+    /// RTL8821AE coexistence owner (`rtl8821ae/coex.rs`), bound when a
+    /// BT-strapped board is admitted in [`Self::configure_rtl8821ae_mac`].
+    rtl8821ae_coex: Option<alloc::boxed::Box<super::rtl8821ae::coex::Owner>>,
     /// RTL8192EE factory identity and configured radio (`rtl8192ee/init.rs`).
     rtl8192ee: Option<alloc::boxed::Box<([u8; 32], super::rtl8192ee::init::Radio)>>,
     /// Admitted `N92E` operating point (`rtl8192ee/envelope.rs`).
@@ -285,6 +288,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8821ae: None,
             rtl8821ae_identity: None,
             rtl8821ae_power: None,
+            rtl8821ae_coex: None,
             rtl8192ee: None,
             rtl8192ee_power: None,
             rtl8192ce: None,
@@ -428,14 +432,19 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.phase = Phase::ChannelConfigured;
         Ok(())
     }
+    /// The admitted 8821AE board's coexistence owner, if it is BT-strapped.
+    pub fn rtl8821ae_coex(&self) -> Option<&super::rtl8821ae::coex::Owner> {
+        self.rtl8821ae_coex.as_deref()
+    }
     /// Continue the retained 8821AE owner from the admitted channel to the
     /// operational MAC (ChannelConfigured → MacConfigured). `configure_rtl8821ae`
     /// already wrote the station address (`HW_VAR_ETHER_ADDR`); the factory
     /// identity must be the one the channel permission was minted for.
     /// Boards with the Bluetooth function strapped on (`REG_MULTI_FUNC_CTRL`
     /// BIT(18), Linux `_rtl8821ae_read_bt_coexist_info_from_hwpg`) are
-    /// refused: BT coexistence would take LPS/antenna control and is not
-    /// implemented. Packet DMA, CR gates and IRQs stay closed.
+    /// admitted with a coexistence owner (`rtl8821ae/coex.rs`): coex takes
+    /// LPS/antenna control from here on. Packet DMA, CR gates and IRQs
+    /// stay closed until the packet owner starts.
     pub fn configure_rtl8821ae_mac(
         &mut self,
         factory: &super::efuse::Factory,
@@ -455,9 +464,13 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         if strap == u32::MAX {
             return Err(Error::Access(AccessError::Gone));
         }
-        if strap & RTL8821AE_BT_FUNCTION != 0 {
-            return Err(Error::State);
-        }
+        // The owner reflects the current strap: BT-strapped boards get a
+        // coexistence owner, WLAN-only boards get none.
+        self.rtl8821ae_coex = if strap & RTL8821AE_BT_FUNCTION != 0 {
+            Some(alloc::boxed::Box::new(super::rtl8821ae::coex::Owner::bind()))
+        } else {
+            None
+        };
         self.packet.local = Some(factory.mac);
         self.phase = Phase::MacConfigured;
         Ok(())

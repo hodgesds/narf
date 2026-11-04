@@ -1665,8 +1665,11 @@ and WoWLAN paths are described below.
   `set_rpwm` (`HW_VAR_SET_RPWM` toggle), `fwlps_enter`/`fwlps_leave`
   (`low_power_enable` false). These are the `bt_ctrl_lps == false` forms:
   Linux 8821AE reports `get_btc_status() == true`, but coex only takes LPS
-  control on boards with the BT function (`REG_MULTI_FUNC_CTRL[18]`); BT
-  coexistence is not implemented, so such boards must not be admitted.
+  control on boards with the BT function (`REG_MULTI_FUNC_CTRL[18]`);
+  BT-strapped boards are admitted with the pass-1 coexistence owner
+  (`rtl8821ae/coex.rs`: bound `btc_coexist` facts, the TDMA decision
+  matrix, and the LPS gate — BT-state notify and the per-traffic-class
+  8821A algorithm tables are outstanding).
   Interrupts: `enable_interrupt` with `int_clear` (HISR/HISRE/HSISR
   write-back, then HIMR/HIMRE/HSIMR; no `REG_C2HEVT_CLEAR` write on this
   chip), `disable_interrupt`, `service_interrupt` (disable → recognize W1C
@@ -1694,9 +1697,10 @@ and WoWLAN paths are described below.
   MacConfigured (`Prepared::configure_rtl8821ae_mac`) and stages the
   envelope for the station. The MSI vector binding is the shared native
   one (`interface::publish` → `arm_msi`), with the 8821AE interrupt profile.
-  - Admission refuses boards with the Bluetooth function strapped on
-    (`REG_MULTI_FUNC_CTRL` BIT(18)): Linux would run BT coexistence, which
-    takes LPS/antenna control; it is not implemented here.
+  - Admission binds the coexistence owner on boards with the Bluetooth
+    function strapped on (`REG_MULTI_FUNC_CTRL` BIT(18)): coex takes
+    LPS/antenna control (`rtl8821ae/coex.rs`, pass 1 — admission, the
+    LPS gate, and the TDMA decision matrix).
   - `start_packets`: proves `SECR = 0`, `TXPAUSE = 0` and clear IMRs, opens
     bus mastering, then the `rtl8821ae_hw_init` DMA release (`REG_CR` word
     `0x2ff`, `REG_PCIE_CTRL_REG + 1 = 0`) and `rtl8821ae_set_network_type
@@ -2152,8 +2156,10 @@ unprovisioned board stays unadmitted.
   RX BDs `HW_DESC_RX_PREPARE`d over 9100-byte buffers; DMA32, overlap
   checked before any BAR access. `prepare()` runs
   `_rtl8192ee_check_pcie_dma_hang` (`REG_BACKDOOR_DBI_DATA + 3` BIT(2)
-  then 100 ms; a TX/RX hang bit refuses the board — the
-  `_rtl8192ee_reset_pcie_interface_dma` recovery is not implemented), keeps
+  then 100 ms; a TX/RX hang bit runs the
+  `_rtl8192ee_reset_pcie_interface_dma` recovery — RX DMA pause, host
+  DMA stop, CR-gate and IRQ-mask close, re-probe, pause release — and
+  only a still-hung engine after recovery refuses the board), keeps
   host DMA stopped (`0x301 = 0xff`), CR DMA/MAC gates and HIMR/HIMRE
   closed, marks the owner retained and runs `mac::init_mac` with the BD
   bases, then reads back the eight bases and every `*_TXBD_NUM`/`RXBD_NUM`.

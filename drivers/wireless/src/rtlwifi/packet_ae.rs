@@ -581,6 +581,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
+        // Coexistence holds LPS off while BT owns the shared antenna
+        // outright (`rtl8821ae/coex.rs`): a held-off enter is a
+        // successful no-op, not an error — `leisure` stays false, so
+        // callers read the true power state and can retry once BT
+        // releases the antenna.
+        if let Some(coex) = self.rtl8821ae_coex.as_deref() {
+            if !coex.lps_allowed() {
+                return Ok(());
+            }
+        }
         self.phase = Phase::Failed;
         h2c::fwlps_enter(&self.io, &mut self.packet.ae.mailbox).await?;
         self.packet.leisure = true;

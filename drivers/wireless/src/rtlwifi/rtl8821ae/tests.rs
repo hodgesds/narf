@@ -2758,3 +2758,62 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
     smoke_rtl8821ae_wowlan_card_disable_register_order
 );
+
+// ── Bluetooth coexistence (pass 1) ──────────────────────────────────────
+
+fn smoke_rtl8821ae_coex_bind_facts_pattern_and_lps_gate() -> TestResult {
+    use crate::rtlwifi::btcoex::btc::{ChipInterface, ChipType, BTC_ANTENNA_AT_MAIN_PORT};
+    use crate::rtlwifi::btcoex::{encode_tdma, BtState, TdmaPattern, WifiState};
+    let mut coex = coex::Owner::bind();
+    let btc = &coex.btc;
+    if !btc.bt_exist
+        || btc.board_info.bt_chip_type != ChipType::Rtl8821
+        || btc.board_info.pg_ant_num != 1
+        || btc.board_info.btdm_ant_num != 1
+        || btc.board_info.btdm_ant_pos != BTC_ANTENNA_AT_MAIN_PORT
+        || btc.board_info.single_ant_path != 0
+        || btc.board_info.tfbga_package
+        || btc.board_info.rfe_type != 0
+        || btc.chip_interface != ChipInterface::Pci
+    {
+        return TestResult::Fail("8821AE coex bind facts");
+    }
+    // Default Idle/Idle yields Wi-Fi-only and allows LPS.
+    if coex.pattern() != TdmaPattern::WifiOnly || !coex.lps_allowed() {
+        return TestResult::Fail("8821AE coex default pattern/LPS");
+    }
+    // BT streaming while Wi-Fi is idle yields the antenna to BT and
+    // holds LPS off.
+    coex.notify_bt(BtState::Streaming);
+    if coex.pattern() != TdmaPattern::BtOnly || coex.lps_allowed() {
+        return TestResult::Fail("8821AE coex BtOnly holds LPS off");
+    }
+    // Connected Wi-Fi shares with streaming BT; LPS stays allowed.
+    coex.notify_wifi(WifiState::Connected);
+    if coex.pattern() != TdmaPattern::Shared || !coex.lps_allowed() {
+        return TestResult::Fail("8821AE coex Shared allows LPS");
+    }
+    // BT inquiry during a scan also shares.
+    coex.notify_wifi(WifiState::Scanning);
+    coex.notify_bt(BtState::Inquiry);
+    if coex.pattern() != TdmaPattern::Shared || !coex.lps_allowed() {
+        return TestResult::Fail("8821AE coex scan/inquiry shares");
+    }
+    // BT idle releases the antenna entirely.
+    coex.notify_bt(BtState::Idle);
+    if coex.pattern() != TdmaPattern::WifiOnly || !coex.lps_allowed() {
+        return TestResult::Fail("8821AE coex BT idle releases");
+    }
+    // The three coarse TDMA payloads.
+    if encode_tdma(TdmaPattern::WifiOnly) != [0, 0, 0, 0, 0]
+        || encode_tdma(TdmaPattern::BtOnly) != [0x61, 0, 0, 0, 0]
+        || encode_tdma(TdmaPattern::Shared) != [0xE3, 0x12, 0x03, 0x10, 0x90]
+    {
+        return TestResult::Fail("8821AE coex TDMA payloads");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_coex_bind_facts_pattern_and_lps_gate
+);
