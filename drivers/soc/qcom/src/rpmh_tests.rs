@@ -110,7 +110,7 @@ fn smoke_qcom_rpmh_tcs_write_v27() -> TestResult {
         .any(|w| w == [AMC_ENABLE, AMC_ENABLE | AMC_TRIGGER]));
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_rpmh_tcs_write_v27);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_rpmh_tcs_write_v27);
 
 fn smoke_qcom_rpmh_tcs_write_v30() -> TestResult {
     let d = FakeDelay::new();
@@ -127,7 +127,7 @@ fn smoke_qcom_rpmh_tcs_write_v30() -> TestResult {
     kt_assert_eq!(fake.get(TCS_BASE + 0x3c + 24), 0x2222);
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_rpmh_tcs_write_v30);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_rpmh_tcs_write_v30);
 
 fn smoke_qcom_rpmh_write_timeout_and_async() -> TestResult {
     let d = FakeDelay::new();
@@ -155,7 +155,7 @@ fn smoke_qcom_rpmh_write_timeout_and_async() -> TestResult {
     kt_assert_eq!(r, Some(Err(RscError::TooManyCmds)));
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_rpmh_write_timeout_and_async);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_rpmh_write_timeout_and_async);
 
 fn smoke_qcom_rpmh_votes() -> TestResult {
     let d = FakeDelay::new();
@@ -182,4 +182,4 @@ fn smoke_qcom_rpmh_votes() -> TestResult {
     );
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_rpmh_votes);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_rpmh_votes);

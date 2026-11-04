@@ -42,7 +42,7 @@ use crate::io::{poll_reg, write_bytes, Delay, RegIo};
 use crate::ipc::Kick;
 
 /// `QMP_MAGIC` (`0x4d41494c`, "MAIL" as a u32 constant).
-const QMP_MAGIC: u32 = 0x4d_4149_4c;
+const QMP_MAGIC: u32 = 0x4d41_494c;
 /// `QMP_VERSION`.
 const QMP_VERSION: u32 = 1;
 /// `QMP_MSG_LEN`: every message is a 64-byte zero-padded buffer.

@@ -107,7 +107,7 @@ fn smoke_qcom_aoss_open_handshake() -> TestResult {
     kt_assert_eq!(regs.get(DESC_UCORE_CH_STATE_ACK), STATE_UP);
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_aoss_open_handshake);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_aoss_open_handshake);
 
 fn smoke_qcom_aoss_open_rejects() -> TestResult {
     let d = FakeDelay::new();
@@ -138,7 +138,7 @@ fn smoke_qcom_aoss_open_rejects() -> TestResult {
     kt_assert_eq!(r.get(DESC_MCORE_LINK_STATE), STATE_DOWN);
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_aoss_open_rejects);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_aoss_open_rejects);
 
 fn smoke_qcom_aoss_send_and_load_state() -> TestResult {
     let d = FakeDelay::new();
@@ -167,7 +167,7 @@ fn smoke_qcom_aoss_send_and_load_state() -> TestResult {
     kt_assert_eq!(run(q.send(&d, long)), Some(Err(QmpError::TooLong)));
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_aoss_send_and_load_state);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_aoss_send_and_load_state);
 
 fn smoke_qcom_aoss_send_timeout() -> TestResult {
     let d = FakeDelay::new();
@@ -181,4 +181,4 @@ fn smoke_qcom_aoss_send_timeout() -> TestResult {
     kt_assert_eq!(regs.get(MBOX), 0);
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_aoss_send_timeout);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_aoss_send_timeout);

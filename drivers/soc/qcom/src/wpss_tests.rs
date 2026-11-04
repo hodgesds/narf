@@ -151,7 +151,7 @@ fn smoke_qcom_wpss_prepare_unprepare() -> TestResult {
     kt_assert_eq!(rsc_fake.writes_to(TCS_BASE + 0x34).len(), addr_writes);
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_wpss_prepare_unprepare);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_wpss_prepare_unprepare);
 
 fn smoke_qcom_wpss_prepare_vote_failure() -> TestResult {
     let d = FakeDelay::new();
@@ -180,4 +180,4 @@ fn smoke_qcom_wpss_prepare_vote_failure() -> TestResult {
     kt_assert!(regs.writes_to(MBOX).is_empty());
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_wpss_prepare_vote_failure);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_wpss_prepare_vote_failure);

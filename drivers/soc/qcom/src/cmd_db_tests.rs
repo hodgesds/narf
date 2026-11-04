@@ -47,7 +47,7 @@ fn smoke_qcom_cmddb_read_addr() -> TestResult {
     kt_assert_eq!(db.read_addr("cx"), None);
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_cmddb_read_addr);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_cmddb_read_addr);
 
 fn smoke_qcom_cmddb_bad_magic_and_truncated() -> TestResult {
     let mut t = table();
@@ -64,4 +64,4 @@ fn smoke_qcom_cmddb_bad_magic_and_truncated() -> TestResult {
     kt_assert_eq!(db.read_addr("xo.lvl"), Some(0x0033_0000));
     TestResult::Pass
 }
-kernel_test_in!(SUB, smoke_qcom_cmddb_bad_magic_and_truncated);
+kernel_test_in!("drivers/soc/qcom", smoke_qcom_cmddb_bad_magic_and_truncated);
