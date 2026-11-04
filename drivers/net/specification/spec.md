@@ -429,9 +429,15 @@ frame itself and builds its descriptors from the shared builders.
   everywhere EEE is supported, +2500FD from VER_63, +5000FD
   from VER_70, +10000FD on VER_80 only). The 8125 family
   programs the TX LPI idle timer register (0x6048 =
-  MTU + 14 + 0x20) at bring-up. EEE PHY advertisement through
-  the OCP window is future work; the PHY tables already contain
-  the EEE PHY clears.
+  MTU + 14 + 0x20) at bring-up. EEE PHY advertisement is
+  programmed from the `Stage::Late` PHY pass through the OCP
+  window: the emulated AN MMD advertisement registers
+  (7.60 → page 0xa5d reg 0x10, 7.62 → page 0xa6d reg 0x12)
+  carry the chip's LPI caps, written only when they differ
+  and read back for verification, and auto-negotiation
+  restarts when the advertisement changes so the link partner
+  negotiates EEE; the PHY tables already contain the EEE
+  PHY clears.
 - **PHY configuration.** The shared OCP accessor
   (`phy_access.rs`: paged C22 access, MMD VEND2 parameters,
   firmware interpreter) serves the whole family. RTL8125 has

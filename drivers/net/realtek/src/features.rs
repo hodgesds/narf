@@ -716,6 +716,38 @@ pub unsafe fn apply_eee_txidle<R: RegFile>(regs: &mut R, mtu: u32) {
     unsafe { regs.write16(REG_EEE_TXIDLE_TIMER_8125, eee_txidle_timer(mtu)) };
 }
 
+/// AN MMD EEE advertisement / link-partner ability (registers
+/// 7.60 / 7.61) bit 1: 100BASE-TX EEE (IEEE 802.3az Clause 45).
+pub const EEE_ADV_100TX: u16 = 0x0002;
+/// Registers 7.60 / 7.61 bit 2: 1000BASE-T EEE.
+pub const EEE_ADV_1000T: u16 = 0x0004;
+/// Registers 7.60 / 7.61 bit 3: 10GBASE-T EEE.
+pub const EEE_ADV_10GT: u16 = 0x0008;
+/// AN MMD EEE advertisement 2 / link-partner ability 2 (registers
+/// 7.62 / 7.63) bit 0: 2.5GBASE-T EEE (IEEE 802.3bz §45.2.7.14aa).
+pub const EEE_ADV2_2500T: u16 = 0x0001;
+/// Registers 7.62 / 7.63 bit 1: 5GBASE-T EEE.
+pub const EEE_ADV2_5000T: u16 = 0x0002;
+
+/// AN MMD EEE advertisement word (register 7.60) for a capability
+/// set. The capability (3.20), advertisement (7.60), and
+/// link-partner ability (7.61) registers share this bit layout,
+/// so the same word also decodes what a partner advertised.
+pub const fn eee_adv(caps: EeeCaps) -> u16 {
+    (if caps.fd_100 { EEE_ADV_100TX } else { 0 })
+        | (if caps.fd_1000 { EEE_ADV_1000T } else { 0 })
+        | (if caps.fd_10000 { EEE_ADV_10GT } else { 0 })
+}
+
+/// AN MMD EEE advertisement 2 word (register 7.62) for a
+/// capability set. 2.5G/5G EEE lives in this second register, not
+/// in 7.60 — advertising only 7.60 would leave the NBase-T speeds
+/// unnegotiated.
+pub const fn eee_adv2(caps: EeeCaps) -> u16 {
+    (if caps.fd_2500 { EEE_ADV2_2500T } else { 0 })
+        | (if caps.fd_5000 { EEE_ADV2_5000T } else { 0 })
+}
+
 // ── Jumbo frames ────────────────────────────────────────────────────
 
 /// Ethernet header + FCS overhead used by Linux's `JUMBO_*`
@@ -1838,6 +1870,49 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/realtek-features", smoke_features_eee_caps);
+
+    fn smoke_features_eee_adv_words() -> TestResult {
+        // Expectations come from the IEEE layouts, not from the
+        // helpers: 7.60 bits 1/2/3 = 100TX/1000T/10GT, 7.62 bits
+        // 0/1 = 2500T/5000T.
+        if eee_adv(eee_lpi_caps(61)) != 0x0006 || eee_adv2(eee_lpi_caps(61)) != 0x0000 {
+            return TestResult::Fail("VER_61 must advertise 100/1000 only (7.60=0x0006)");
+        }
+        if eee_adv(eee_lpi_caps(63)) != 0x0006 || eee_adv2(eee_lpi_caps(63)) != 0x0001 {
+            return TestResult::Fail("VER_63 must add 2500T (7.62=0x0001)");
+        }
+        if eee_adv(eee_lpi_caps(70)) != 0x0006 || eee_adv2(eee_lpi_caps(70)) != 0x0003 {
+            return TestResult::Fail("VER_70 must add 5000T (7.62=0x0003)");
+        }
+        if eee_adv(eee_lpi_caps(80)) != 0x000e || eee_adv2(eee_lpi_caps(80)) != 0x0003 {
+            return TestResult::Fail("VER_80 must add 10GT (7.60=0x000e)");
+        }
+        // Each bit independently: a single-speed set maps to exactly
+        // one bit, and an all-false set (EEE-off board, or the
+        // Unknown chip's version 0) advertises nothing.
+        let only_100 = EeeCaps {
+            fd_100: true,
+            ..EeeCaps::default()
+        };
+        if eee_adv(only_100) != 0x0002 || eee_adv2(only_100) != 0 {
+            return TestResult::Fail("100TX-only caps must map to 7.60 bit 1 alone");
+        }
+        let only_5000 = EeeCaps {
+            fd_5000: true,
+            ..EeeCaps::default()
+        };
+        if eee_adv(only_5000) != 0 || eee_adv2(only_5000) != 0x0002 {
+            return TestResult::Fail("5000T-only caps must map to 7.62 bit 1 alone");
+        }
+        if eee_adv(EeeCaps::default()) != 0 || eee_adv2(EeeCaps::default()) != 0 {
+            return TestResult::Fail("all-false caps must advertise nothing");
+        }
+        if eee_adv(eee_lpi_caps(0)) != 0 || eee_adv2(eee_lpi_caps(0)) != 0 {
+            return TestResult::Fail("unsupported version must advertise nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-features", smoke_features_eee_adv_words);
 
     fn smoke_features_jumbo() -> TestResult {
         if jumbo_max_mtu(17) != 4 * 1024 - 22 {
