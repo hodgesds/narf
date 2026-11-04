@@ -129,7 +129,10 @@ fn run(
     addac: Option<&mut Addac>,
 ) -> (Io, Result<Prepared, BringUpError>) {
     let revision = Revision::decode(srev).unwrap();
-    let mut own = Addac::new(&tables(&revision).unwrap());
+    // Wrong-silicon cases have no AR5008 tables; any ADDAC copy will do,
+    // since preparation must refuse before touching it.
+    let fallback = Revision::decode(srev_5416(2)).unwrap();
+    let mut own = Addac::new(&tables(&revision).or_else(|| tables(&fallback)).unwrap());
     let addac = addac.unwrap_or(&mut own);
     let mut io = Io::default();
     let result = prepare(&mut io, &revision, id, map, device, frequency, addac);

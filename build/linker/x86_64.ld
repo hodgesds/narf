@@ -31,7 +31,7 @@ KERNEL_IMAGE_SIZE = 0x40000000;   /* 1 GiB. LLD takes K/M, not G. */
  * needs ~1.6 MiB (399k sites x 4 bytes + header); 4 MiB leaves room to grow
  * before the reservation has to be revisited. `xtask relocs` errors out if a
  * table does not fit rather than writing a short one. */
-KASLR_RELOC_RESERVE = 4M;
+KASLR_RELOC_RESERVE = 8M;
 
 /* Largest slide the kernel window may take, as a mask of the low bits.
  *
