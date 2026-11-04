@@ -578,6 +578,10 @@ kernel_test_in!(
     smoke_explicit_fence_arrays_resolve_entry_by_entry
 );
 
+
+/// An execbuffer2 header mutation and what it must be refused for.
+type HeaderCase<'a> = (&'a dyn Fn(&mut [u8; 64]), &'a str);
+
 /// MIT Linux b90c984d i915_gem_execbuffer.c::i915_gem_execbuffer2_ioctl:3555
 /// runs check_buffer_count:3541 and i915_gem_check_execbuffer:2180, copies
 /// the exec-object array (-EFAULT), and only then calls
@@ -622,7 +626,7 @@ fn smoke_explicit_execbuffer_checks_and_copies_before_fences() -> TestResult {
     };
     assert_eq!(errno(&|_| {}), Err(FsError::NotFound), "the fence array");
     // check_buffer_count and i915_gem_check_execbuffer, before the fences.
-    let header: [(&dyn Fn(&mut [u8; 64]), &str); 8] = [
+    let header: [HeaderCase<'_>; 8] = [
         (&|r: &mut [u8; 64]| put32(r, 8, 0), "no buffers"),
         (&|r: &mut [u8; 64]| put32(r, 12, 4), "batch_start_offset & 7"),
         (&|r: &mut [u8; 64]| put32(r, 16, 12), "batch_len & 7"),
