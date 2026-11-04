@@ -24,6 +24,7 @@ pub mod ethtool;
 pub mod fdir;
 pub mod pm;
 pub mod queues;
+pub mod regs;
 pub mod rss;
 mod tests;
 pub mod vlan;

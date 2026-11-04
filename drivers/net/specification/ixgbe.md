@@ -72,9 +72,9 @@ All registers are 4-byte little-endian (host order). Offsets per
 | 0x06018+0x40*n | TDT[n]   | TX desc tail                         |
 | 0x06028+0x40*n | TXDCTL[n] | TX queue enable (bit 25) + thresholds |
 | 0x08120   | MTQC      | Multiple TX Queues Command (0 = non-DCB/non-VT, queues 0..63) |
-| 0x0EB00+4*n | RETA[n] | RSS redirection table (n=0..31, see §10) |
-| 0x0EB80+4*n | RSSRK[n] | RSS random key (n=0..9, see §10)    |
-| 0x0EC80   | MRQC      | Multiple RX Queues Command (see §10) |
+| 0x05C00+4*n | RETA[n] | RSS redirection table (n=0..31, see §10; native alias 0x0EB00+4*n) |
+| 0x05C80+4*n | RSSRK[n] | RSS random key (n=0..9, see §10; native alias 0x0EB80+4*n)    |
+| 0x05818   | MRQC      | Multiple RX Queues Command (see §10; native alias 0x0EC80) |
 | 0x04200   | LINKS     | LINK_UP = bit 30                     |
 | 0x04074   | GPRC      | Good Packets Received Count (RC, see §13) |
 | 0x04080   | GPTC      | Good Packets Transmitted Count (RC, see §13) |
@@ -160,11 +160,11 @@ fake bank plus IVAR sibling-preservation checks.
 ## 10. RSS
 
 `drivers/net/ixgbe/src/ixgbe/rss.rs` programs RSS-only mode
-(MRQC at 0x0EC80, MRQE = 0001b = single 16-queue set, all six
+(MRQC at 0x05818, MRQE = 0001b = single 16-queue set, all six
 hash-field enables: TcpIPv4/IPv4/IPv6/TcpIPv6/UdpIPv4/UdpIPv6),
-the 40-byte key into RSSRK[0..9] (0x0EB80 + 4*n, little-endian
+the 40-byte key into RSSRK[0..9] (0x05C80 + 4*n, little-endian
 words), and the 128-entry balanced indirection table into
-RETA[0..31] (0x0EB00 + 4*n, 4-bit entries). The key and table
+RETA[0..31] (0x05C00 + 4*n, 4-bit entries). The key and table
 come from `narf_net::rss` (standard conformance key + balanced
 table), so hardware steering equals `RssConfig::rx_queue` for
 the same frame — fixtures assert that agreement plus the
@@ -174,6 +174,22 @@ the state; `HwNic`/`Interface::rss()` expose it and `caps()`
 gains `RSS` once programmed. Bring-up leaves RSS off (queue 0
 only) until configured; reprogramming requires RX disabled.
 FlowDirector/ATR stays a follow-up (§14).
+
+Register-map authority (issue #1397, resolved): the 82599
+datasheet (rev. 2.6, 322429-007) dual-maps MRQC/RSSRK/RETA —
+§8.2.3.7.12 lists MRQC at 0x0EC80 / 0x05818, §8.2.3.7.14 RSSRK
+at 0x0EB80 / 0x05C80, §8.2.3.7.15 RETA at 0x0EB00 / 0x05C00,
+each "also mapped ... to maintain compatibility with the
+82598". Neither the old RSS path (0x0E block) nor the VMDq
+path (0x05 block, PR #1398) programmed a wrong register: both
+aliases are the same physical registers. `ixgbe/regs.rs` is the
+single authority both paths must import (canonical = 0x05
+block, following Linux's shipping map; native aliases kept
+as pinned constants, not programmed), and the alias-map
+fixture pins the pairing. The remaining VMDq+RSS composition
+work is the MRQE mode value (0xB = 64 pools + RSS per
+§8.2.3.7.12) + per-pool RETA, on the VMDq path — not an
+address question.
 
 ## 11. VLAN filtering
 
@@ -464,6 +480,9 @@ Per the v0.1 exclusion list, still open after this stream:
 
 - SR-IOV / VMDq (MRQC virtualization modes, PFVTCTL, VF
   registers) — needs the virtualization programming model.
+  The #1397 address question is settled (datasheet dual-map;
+  `ixgbe/regs.rs` is the shared authority): what remains is
+  the MRQE 0xB + per-pool RETA composition on the VMDq path.
 - FlowDirector remainders (see §13c): TX sampling hook for ATR
   (packet parser + sample-rate policy + queue binding), IPv6
   perfect filters, persistent filter list with restore on
