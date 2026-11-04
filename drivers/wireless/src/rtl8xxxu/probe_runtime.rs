@@ -19,12 +19,16 @@ pub(super) struct Prepared {
     bytes: Vec<u8>,
 }
 impl Prepared {
-    pub(super) fn new(
+    /// Shared broadcast active-scan probe build: the local-address +
+    /// broadcast RA + the SSID IE, plus the given HT Capabilities body
+    /// when present. Extra IEs ride last and never repeat an element
+    /// the frame already carries (0, 1, 3, 45, 50, 61, 191, 192, 255).
+    fn build(
         own: [u8; 6],
         channel: u8,
         ssid: &[u8],
         sequence: u16,
-        ht: bool,
+        ht_body: Option<&[u8; 26]>,
         extra: &[u8],
     ) -> Result<Self, Error> {
         if own == [0; 6]
@@ -32,7 +36,6 @@ impl Prepared {
             || !(1..=13).contains(&channel)
             || ssid.len() > 32
             || sequence > 4095
-            || ht && channel != 1
             || extra.len() > MAX_IE
         {
             return Err(Error::State);
@@ -60,20 +63,51 @@ impl Prepared {
         bytes.extend_from_slice(&[1, 8, 2, 4, 11, 22, 12, 18, 24, 36]);
         bytes.extend_from_slice(&[50, 4, 48, 72, 96, 108]);
         bytes.extend_from_slice(&[3, 1, channel]);
-        if ht {
+        if let Some(body) = ht_body {
             bytes.extend_from_slice(&[45, 26]);
-            bytes.extend_from_slice(
-                &narf_wireless::association::phy::LocalHt::siso20(false, false).capability_body(),
-            );
+            bytes.extend_from_slice(body);
         }
         bytes.extend_from_slice(extra);
         Ok(Self {
             own,
             channel,
-            ht,
+            ht: ht_body.is_some(),
             wide: false,
             bytes,
         })
+    }
+    pub(super) fn new(
+        own: [u8; 6],
+        channel: u8,
+        ssid: &[u8],
+        sequence: u16,
+        ht: bool,
+        extra: &[u8],
+    ) -> Result<Self, Error> {
+        if ht && channel != 1 {
+            return Err(Error::State);
+        }
+        let body = if ht {
+            Some(narf_wireless::association::phy::LocalHt::siso20(false, false).capability_body())
+        } else {
+            None
+        };
+        Self::build(own, channel, ssid, sequence, body.as_ref(), extra)
+    }
+    /// Broadcast active-scan probe carrying the board's own HT
+    /// Capabilities body (gen2 F10): the EU chain's SISO body is a
+    /// timing-path stand-in; a gen2 board advertises the caps its
+    /// signed record supports, on any channel. Same validation as
+    /// `new` except the channel-1 restriction does not apply.
+    pub(super) fn new_with_ht(
+        own: [u8; 6],
+        channel: u8,
+        ssid: &[u8],
+        sequence: u16,
+        caps: &[u8; 26],
+        extra: &[u8],
+    ) -> Result<Self, Error> {
+        Self::build(own, channel, ssid, sequence, Some(caps), extra)
     }
     pub(super) fn native(
         own: [u8; 6],
@@ -121,3 +155,7 @@ impl Prepared {
         Ok((PROBE_DELAY_MS, requested_ms.max(minimum) - PROBE_DELAY_MS))
     }
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "probe_runtime_tests.rs"]
+mod tests;

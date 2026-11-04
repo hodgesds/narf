@@ -310,3 +310,68 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/gen2station",
     smoke_rtl8xxxu_gen2_ht_local_capability
 );
+
+/// BlockAckReq admission (gen2 F9): a 20-byte BAR passes the descriptor
+/// layer while shorter control frames do not; a MoreFrag or PAGGR BAR
+/// still refuses; a BA passes admission here and is dropped by the
+/// station gate, never by the descriptor layer.
+fn smoke_rtl8xxxu_gen2_bar_admission() -> TestResult {
+    let mut bar = vec![0x84, 0, 0, 0];
+    bar.extend_from_slice(&LOCAL);
+    bar.extend_from_slice(&PEER);
+    bar.extend_from_slice(&0x3004u16.to_le_bytes());
+    bar.extend_from_slice(&1600u16.to_le_bytes());
+    if bar.len() != 20 || !admit(&frame(bar.clone(), 4, false, 0), false, 0, 1) {
+        return TestResult::Fail("20-byte BAR admitted");
+    }
+    let mut frag = bar.clone();
+    frag[1] = 4;
+    if admit(&frame(frag, 4, false, 0), false, 0, 1) {
+        return TestResult::Fail("fragmented BAR refused");
+    }
+    let mut paggr = frame(bar.clone(), 4, false, 0);
+    paggr.paggr = true;
+    if admit(&paggr, false, 0, 1) {
+        return TestResult::Fail("PAGGR BAR refused");
+    }
+    let rts = vec![0xb4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    if admit(&frame(rts, 4, false, 0), false, 0, 1) {
+        return TestResult::Fail("short control frame refused");
+    }
+    let mut ba = vec![0x94, 0, 0, 0];
+    ba.extend_from_slice(&LOCAL);
+    ba.extend_from_slice(&PEER);
+    ba.extend_from_slice(&0x3004u16.to_le_bytes());
+    ba.extend_from_slice(&1600u16.to_le_bytes());
+    ba.extend_from_slice(&[0; 8]);
+    if ba.len() != 28 || !admit(&frame(ba, 4, false, 0), false, 0, 1) {
+        return TestResult::Fail("BA admitted at descriptor layer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/gen2station",
+    smoke_rtl8xxxu_gen2_bar_admission
+);
+
+/// Live-retune dispatch (gen2 F7): a receiving radio retunes live, a
+/// stopped radio pays the cold lifecycle, a never-started radio only
+/// relabels; a bound radio or a failed/parked one refuses.
+fn smoke_rtl8xxxu_gen2_retune_path() -> TestResult {
+    use super::{retune_path, Phase, RetunePath};
+    if retune_path(Phase::Receiving, false) != Some(RetunePath::Live)
+        || retune_path(Phase::Stopped, false) != Some(RetunePath::Cold)
+        || retune_path(Phase::Prepared, false) != Some(RetunePath::Relabel)
+        || retune_path(Phase::Receiving, true).is_some()
+        || retune_path(Phase::Stopped, true).is_some()
+        || retune_path(Phase::Failed, false).is_some()
+        || retune_path(Phase::Parked, false).is_some()
+    {
+        return TestResult::Fail("retune dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/gen2station",
+    smoke_rtl8xxxu_gen2_retune_path
+);

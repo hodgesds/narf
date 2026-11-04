@@ -26,6 +26,9 @@ const STATUS_INVALID_QOS: u16 = 38;
 /// `WLAN_REASON_QSTA_TIMEOUT` / `WLAN_REASON_QSTA_NOT_USE`.
 const REASON_TIMEOUT: u16 = 39;
 const REASON_NOT_USE: u16 = 37;
+/// `WLAN_REASON_QSTA_REQUIRE_SETUP`: the recipient DELBA for a BlockAckReq
+/// on a TID with no recipient session.
+const REASON_REQUIRE_SETUP: u16 = 38;
 /// mac80211 `sta_info.h` originator retry policy and `ADDBA_RESP_INTERVAL`.
 const HT_AGG_MAX_RETRIES: u8 = 15;
 const HT_AGG_BURST_RETRIES: u8 = 3;
@@ -83,6 +86,9 @@ pub(super) struct Sessions<T> {
     tx_token: u8,
     addba_req_num: [u8; 8],
     last_addba_req: [u64; 8],
+    /// TIDs that already sent their one recipient DELBA for a BlockAckReq
+    /// without a session (mac80211 sends it once per TID, not per BAR).
+    unexpected_ba: u8,
 }
 
 impl<T> Default for Sessions<T> {
@@ -93,6 +99,7 @@ impl<T> Default for Sessions<T> {
             tx_token: 0,
             addba_req_num: [0; 8],
             last_addba_req: [0; 8],
+            unexpected_ba: 0,
         }
     }
 }
@@ -225,6 +232,9 @@ impl<T> Sessions<T> {
             timeout_tu: timeout,
             last_rx: now,
         });
+        // A session now exists: a later BAR for this TID advances it
+        // instead of repeating the no-session DELBA.
+        self.unexpected_ba &= !(1 << tid);
         (0, tid, buf)
     }
     /// Only the outstanding dialog token matches; success with a nonzero
@@ -274,13 +284,44 @@ impl<T> Sessions<T> {
             .push(sequence, now.saturating_mul(1_000_000), item)
             .unwrap_or_default())
     }
+    /// mac80211 `ieee80211_rx_h_ctrl` BlockAckReq on an already-validated
+    /// single-TID BAR (`tid`, `ssn` from the BAR Control / Starting
+    /// Sequence Control; the caller validates peer binding, HT
+    /// association and port state): a session releases buffered MPDUs up
+    /// to the SSN and refreshes its inactivity timer; a TID without a
+    /// session returns one recipient DELBA (QSTA_REQUIRE_SETUP) per TID,
+    /// never one per BAR. Returns (released items, DELBA bodies).
+    pub(super) fn bar(&mut self, tid: u8, ssn: u16, now: u64) -> (Vec<T>, Vec<Vec<u8>>) {
+        if tid >= 8 {
+            return (Vec::new(), Vec::new());
+        }
+        let i = usize::from(tid);
+        if let Some(session) = self.rx[i].as_mut() {
+            if session.timeout_tu != 0 {
+                session.last_rx = now;
+            }
+            let released = session
+                .reorder
+                .advance(ssn, now.saturating_mul(1_000_000))
+                .unwrap_or_default();
+            return (released, Vec::new());
+        }
+        if self.unexpected_ba & (1 << tid) != 0 {
+            return (Vec::new(), Vec::new());
+        }
+        self.unexpected_ba |= 1 << tid;
+        let mut body = vec![CATEGORY_BACK, DELBA];
+        body.extend_from_slice(&(u16::from(tid) << 12).to_le_bytes());
+        body.extend_from_slice(&REASON_REQUIRE_SETUP.to_le_bytes());
+        (Vec::new(), vec![body])
+    }
     /// Timers: `sta_addba_resp_timer_expired` and
     /// `sta_tx_agg_session_timer_expired` stop the originator as a local
     /// request (initiator DELBA); `sta_rx_agg_session_timer_expired` ends the
     /// recipient with a QSTA_TIMEOUT DELBA (returned body); reorder holes
-    /// release at `sta_rx_agg_reorder_timer_expired` (returned items). The
-    /// rtl8xxxu station RX filter passes no BlockAckReq, so holes advance only
-    /// by window or timeout.
+    /// release at `sta_rx_agg_reorder_timer_expired` (returned items).
+    /// BlockAckReq advance is `bar`, not here: holes also advance on a
+    /// peer BAR once the RX filter passes it (gen2 F9).
     pub(super) fn service(&mut self, now: u64) -> (Vec<T>, Vec<Vec<u8>>) {
         for slot in &mut self.tx {
             let expired = match *slot {
@@ -390,7 +431,8 @@ impl<T> Sessions<T> {
             body
         })
     }
-    /// Disconnect/failure: every session ends, buffered MPDUs are purged.
+    /// Disconnect/failure: every session ends, buffered MPDUs are purged,
+    /// and the no-session DELBA bits reset with them.
     pub(super) fn retire(&mut self) {
         for slot in &mut self.rx {
             if let Some(session) = slot.take() {
@@ -398,6 +440,7 @@ impl<T> Sessions<T> {
             }
         }
         self.tx = [None; 8];
+        self.unexpected_ba = 0;
     }
 }
 

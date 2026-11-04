@@ -3,7 +3,7 @@
 //! mac80211 `ieee80211_subif_start_xmit` header construction; nothing here
 //! is a hardware receipt.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -116,6 +116,77 @@ fn smoke_rtl8xxxu_gen2_wmm_qos_data_queues() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/gen2station",
     smoke_rtl8xxxu_gen2_wmm_qos_data_queues
+);
+
+/// Single-TID BlockAckReq parse (gen2 F9): a 20-byte BAR from the bound
+/// peer to this station, Multi-TID clear, Fragment Number zero, yields
+/// (TID, SSN); anything else yields `None`.
+fn bar(tid_control: u16, ssn: u16) -> crate::rtl8xxxu::packet_codec::Mpdu {
+    use crate::rtl8xxxu::packet_codec::Mpdu;
+    let mut bytes = vec![0x84, 0, 0, 0];
+    bytes.extend_from_slice(&OWN);
+    bytes.extend_from_slice(&BSSID);
+    bytes.extend_from_slice(&tid_control.to_le_bytes());
+    bytes.extend_from_slice(&ssn.to_le_bytes());
+    Mpdu {
+        native: None,
+        wide: None,
+        ba: false,
+        bytes,
+        phy: Vec::new(),
+        rate: 4,
+        ht: false,
+        bandwidth40: false,
+        tid: 0,
+        decrypted: false,
+        timestamp: 0,
+    }
+}
+
+fn smoke_rtl8xxxu_gen2_bar_requests() -> TestResult {
+    use super::bar_requests;
+    // TID 3, compressed bitmap, SSN 100.
+    if bar_requests(&bar(0x3004, 100 << 4), OWN, BSSID) != Some((3, 100)) {
+        return TestResult::Fail("valid single-TID BAR");
+    }
+    // Multi-TID bit set: consumed, never advanced.
+    if bar_requests(&bar(0x3006, 100 << 4), OWN, BSSID).is_some() {
+        return TestResult::Fail("multi-TID BAR refused");
+    }
+    // Fragment Number nonzero: malformed.
+    if bar_requests(&bar(0x3004, (100 << 4) | 1), OWN, BSSID).is_some() {
+        return TestResult::Fail("fragmented BAR refused");
+    }
+    // Wrong RA / TA: not this station's BAR.
+    let mut foreign = bar(0x3004, 100 << 4);
+    foreign.bytes[4] ^= 1;
+    if bar_requests(&foreign, OWN, BSSID).is_some() {
+        return TestResult::Fail("foreign RA refused");
+    }
+    let mut foreign = bar(0x3004, 100 << 4);
+    foreign.bytes[10] ^= 1;
+    if bar_requests(&foreign, OWN, BSSID).is_some() {
+        return TestResult::Fail("foreign TA refused");
+    }
+    // TSPEC TID, non-BAR type, short frame: all `None`.
+    if bar_requests(&bar(0x8004, 100 << 4), OWN, BSSID).is_some() {
+        return TestResult::Fail("TSPEC TID refused");
+    }
+    let mut action = bar(0x3004, 100 << 4);
+    action.bytes[0] = 0xd0;
+    if bar_requests(&action, OWN, BSSID).is_some() {
+        return TestResult::Fail("action frame is not a BAR");
+    }
+    let mut short = bar(0x3004, 100 << 4);
+    short.bytes.truncate(19);
+    if bar_requests(&short, OWN, BSSID).is_some() {
+        return TestResult::Fail("short BAR refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/gen2station",
+    smoke_rtl8xxxu_gen2_bar_requests
 );
 
 /// A widened Forty association programs firmware RA at 40 MHz for an HT

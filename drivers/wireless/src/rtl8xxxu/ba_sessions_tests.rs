@@ -149,3 +149,70 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/gen2station",
     smoke_rtl8xxxu_gen2_ba_originator
 );
+
+/// BlockAckReq (gen2 F9): a session releases buffered MPDUs up to the
+/// BAR SSN and refreshes its inactivity timer; a TID without a session
+/// earns exactly one recipient DELBA (`WLAN_REASON_QSTA_REQUIRE_SETUP`),
+/// never one per BAR; TIDs >= 8 are ignored; `retire` resets the
+/// once-per-TID DELBA bits.
+fn smoke_rtl8xxxu_gen2_ba_block_ack_req() -> TestResult {
+    let mut ba = Sessions::<u16>::default();
+    // TID 2, immediate policy, window 64, timeout 10 TU, SSN 100.
+    let Some(_) = ba.action(&addba_request(7, 2 | 2 << 2, 10, 100), 0) else {
+        return TestResult::Fail("ADDBA response");
+    };
+    if ba.reorder(2, 101, 1, 777) != Ok(vec![]) {
+        return TestResult::Fail("buffer out-of-order 101");
+    }
+    let (released, delba) = ba.bar(2, 102, 50);
+    if released != vec![777] || !delba.is_empty() {
+        return TestResult::Fail("BAR advance releases buffered 101");
+    }
+    // A stale BAR behind the advanced head releases nothing.
+    if ba.bar(2, 101, 60) != (vec![], vec![]) {
+        return TestResult::Fail("stale BAR ignored");
+    }
+    // Timer refresh: without it the session (last_rx 0, timeout 10 TU)
+    // would purge at now 15; the BAR at 50 moved last_rx to 50.
+    let (_, delba) = ba.service(15);
+    if !delba.is_empty() || ba.rx_tids() != 1 << 2 {
+        return TestResult::Fail("BAR refreshes inactivity timer");
+    }
+    let (_, delba) = ba.service(60);
+    if delba.len() != 1 || delba[0][..2] != [3, 2] || ba.rx_tids() != 0 {
+        return TestResult::Fail("inactivity purge after refresh");
+    }
+    // No session on TID 3: one DELBA, then silence for further BARs.
+    let mut expect = vec![3, 2];
+    expect.extend_from_slice(&(3u16 << 12).to_le_bytes());
+    expect.extend_from_slice(&38u16.to_le_bytes());
+    let (released, delba) = ba.bar(3, 100, 0);
+    if !released.is_empty() || delba != vec![expect] {
+        return TestResult::Fail("unexpected-TID DELBA once");
+    }
+    if ba.bar(3, 200, 0) != (vec![], vec![]) {
+        return TestResult::Fail("unexpected-TID DELBA not repeated");
+    }
+    if ba.bar(9, 100, 0) != (vec![], vec![]) {
+        return TestResult::Fail("TSPEC TID ignored");
+    }
+    // A session on TID 3 clears the bit: its BAR advances, no DELBA.
+    let Some(_) = ba.action(&addba_request(8, 2 | 3 << 2, 0, 50), 0) else {
+        return TestResult::Fail("ADDBA TID 3");
+    };
+    let (released, delba) = ba.bar(3, 50, 0);
+    if !released.is_empty() || !delba.is_empty() {
+        return TestResult::Fail("session BAR advances without DELBA");
+    }
+    // Retire resets the bits: a fresh unexpected BAR earns a DELBA again.
+    ba.retire();
+    let (released, delba) = ba.bar(3, 100, 0);
+    if !released.is_empty() || delba.len() != 1 {
+        return TestResult::Fail("retire resets DELBA bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/gen2station",
+    smoke_rtl8xxxu_gen2_ba_block_ack_req
+);
