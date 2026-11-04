@@ -745,16 +745,28 @@ impl Bound {
     }
     fn authority(&self) -> ApControlAuthority {
         let index = narf_net::iface::lookup(&self.name).unwrap().ifindex;
-        ApControlAuthority::bind(
+        // Diagnostic bind failure (CI jobs 126311582883 and 126465300433
+        // panic here with `NotSupported`, killing the boot): bind reports
+        // `NotSupported` only when the AP control generation is absent
+        // (device closed/retired) or the mode is not AP/GO, so record the
+        // device state that distinguishes those halves instead of a bare
+        // unwrap. `supports_ap` false means the generation is gone;
+        // `iftype` not 3/9 means the mode moved out from under the bind.
+        match ApControlAuthority::bind(
             self.admin.clone(),
             &self.iface,
             0,
             index,
             self.source.clone(),
-        )
-        .unwrap()
-        .reserve()
-        .unwrap()
+        ) {
+            Ok(authority) => authority.reserve().unwrap(),
+            Err(error) => panic!(
+                "AP authority bind failed: {error:?} (supports_ap={} iftype={} link_up={})",
+                self.device.supports_ap(),
+                self.device.current_iftype(),
+                self.device.link_up()
+            ),
+        }
     }
     fn model<R>(&self, f: impl FnOnce(&mut RadioModel) -> R) -> R {
         f(&mut self.device.radio.try_lock().unwrap().htt.wmi.htc.transport)
@@ -959,6 +971,15 @@ fn smoke_ath10k_ap_staged_group_is_not_installed_until_actual_start_and_pn_never
     if b.install(false).is_err() || b.sequence(false).is_ok() || b.device.link_up() {
         return TestResult::Fail("AP pre-START group staging claimed installed key/carrier");
     }
+    // Diagnostic probes for the CI bind panic (jobs 126311582883 and
+    // 126465300433): `drain` is the one staged-flow step whose failure is
+    // ignored, so a device closed there would surface only as a later
+    // bind panic. Each probe fails cleanly at its own stage instead, and
+    // `supports_ap` false means the AP control generation is gone
+    // (device closed), not merely that an operation returned an error.
+    if !b.device.supports_ap() {
+        return TestResult::Fail("AP staged pre-START closed the device before default-key bind");
+    }
     let authority = b.authority();
     if !matches!(
         drive(
@@ -977,6 +998,11 @@ fn smoke_ath10k_ap_staged_group_is_not_installed_until_actual_start_and_pn_never
     {
         return TestResult::Fail("AP actual secure start and zeroizing key owner");
     }
+    if !b.device.supports_ap() {
+        return TestResult::Fail(
+            "AP device closed before authorized-peer set in staged-group test",
+        );
+    }
     let authority = b.authority();
     let mut peer = station(true);
     peer.authorized = Some(true);
@@ -993,8 +1019,14 @@ fn smoke_ath10k_ap_staged_group_is_not_installed_until_actual_start_and_pn_never
     {
         return TestResult::Fail("AP protected Ethernet enqueue");
     }
+    if !b.device.supports_ap() {
+        return TestResult::Fail("AP device closed before drain in staged-group test");
+    }
     b.device.drain();
     b.device.drain();
+    if !b.device.supports_ap() {
+        return TestResult::Fail("AP drain closed the device before PN check");
+    }
     if b.sequence(true).ok().map(|s| s.seq) != Some([1, 0, 0, 0, 0, 0])
         || b.install(true).is_err()
         || b.sequence(true).ok().map(|s| s.seq) != Some([1, 0, 0, 0, 0, 0])
