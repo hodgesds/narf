@@ -249,7 +249,8 @@ device stays quiesced and the caller may re-probe.
 Probe records `ETHTOOL_GDRVINFO` data via
 `narf_net::iface::set_driver_info` (driver "ixgbe", version
 "0.1.0", PCIe bus address per the igb pattern) and the honest
-offload set via `set_offloads` (TX checksum only). The
+offload set via `set_offloads` (TX checksum, TSO to the `tx()`
+bound, VLAN insertion). The
 driver-side snapshot is `drivers/net/ixgbe/src/ixgbe/
 ethtool.rs`: `EthtoolInfo` (identity, MTU, link, queue counts,
 caps word, RSS/VLAN/WoL state) plus `read_stats`, which reads
@@ -257,9 +258,71 @@ GPRC (0x04074) / GPTC (0x04080) — both RC, so snapshots are
 interval counters, not lifetime totals. `Ixgbe::ethtool_info`
 builds the snapshot on demand. Honest advertisement: RX
 checksum is NOT claimed (the decoder exists but is not plumbed
-into frame metadata), TSO claims no bound (the send path caps
-frames at 1518 bytes), and VLAN insertion is NOT claimed (RX
-filtering only).
+into frame metadata); TSO claims the `tx()` bound (4096 bytes;
+`tx_frame()` runs to 16384, see §13j); VLAN insertion IS
+claimed (`TxMeta::vlan_tag` rides the context descriptor +
+VLE). VLAN + checksum offload without TSO is rejected, not
+advertised (see §13j).
+
+## 13j. TX VLAN insertion + TSO frame-cap fix (#1269)
+
+`tx()` and `tx_frame()` plan each transmit with `tx_plan`,
+which returns an optional context descriptor plus the data
+descriptor. When TSO and/or VLAN insertion is requested, the
+context goes in slot S and the data descriptor in slot S+1
+(the tail advances past both; DD is polled on the data
+descriptor only — context descriptors carry no DD
+write-back). Frames with neither keep the old 1-slot form.
+
+VLAN insertion: the context descriptor's `vlan_macip_lens`
+carries the full 16-bit TCI (VID + PCP + CFI) in bits 31:16,
+and the data descriptor sets DCMD.VLE (0x40000000). MACLEN
+stays 14 with insertion (the tag is hardware-added, not
+driver-supplied). The inserted TPID is the VLNCTRL.VET
+default 0x8100; the TX path does not program VLNCTRL.
+
+TSO: `parse_tso_headers` accepts IPv4/TCP only (untagged
+frames; a tagged frame is a distinct error — strip the tag
+or request `vlan_tag` insertion). The context carries
+MACLEN/IPLEN/L4LEN, TUCMD IPV4|L4T_TCP, and MSS; the data
+descriptor sets TSE. PAYLEN is the TCP payload size only
+(frame length minus headers) — the old `with_tso` full-frame
+PAYLEN was wrong for TSO. Single-send PAYLEN stays the full
+frame size.
+
+Bounds: non-TSO frames keep the 1518 cap. TSO frames run to
+4096 through `tx()` (the per-slot copy-buffer size) and to
+16384 through `tx_frame()` (Linux's per-descriptor data
+length, `IXGBE_MAX_DATA_PER_TXD`). The advertised
+`max_tso_bytes` is 4096 — the bound the registered send
+path (`ixgbe_send_frame` → `tx()`) honors. Larger TSO needs
+multi-descriptor scatter (see §14).
+
+Advertisement: `caps()` adds `NicCaps::TSO` unconditionally
+(the path now honors TSO); `VLAN_TAGGING` keeps its RX-filter
+meaning. Probe `set_offloads` is `tx_checksum: true`,
+`max_tso_bytes: 4096`, `vlan_insert: true`.
+
+Rejected, not silently mis-sent: TSO with mss 0; VLAN +
+checksum offload without TSO (the csum path programs no
+context, so a VLAN context with IPLEN 0 would misplace the
+hardware checksum computation); TSO on a tagged or non-IPv4
+frame; IPv6 TSO (v4-only context constructor).
+
+Grounding: Linux ixgbe @ cbbddb6 — VLE
+`ixgbe_type.h:2962`, tag bits `ixgbe.h:166,169` +
+`ixgbe_main.c` csum/TSO paths, per-descriptor cap
+`ixgbe.h:250-251` + split loop `ixgbe_main.c:9010`, PAYLEN
+`ixgbe_main.c:8916,8980`; datasheet rev. 2.0 §7.2.3.2.2
+(context layout, MACLEN table, "MSS is ignored when TSE is
+not set") and §7.2.3.2.4 (VLE, DTALEN 15.5 KB, PAYLEN
+single-send vs TSO, 256 KB TSO).
+
+Smokes: VLE bit + context packing (VLAN-only and TSO+VLAN),
+TSO header parsing incl. options and all rejections, TSO
+PAYLEN split, and the full `tx_plan` matrix (plain / TSO /
+VLAN-only / VLAN+TSO / VLAN+csum rejection / mss-0
+rejection).
 
 ## 13c. Flow Director (FDIR)
 
@@ -550,6 +613,23 @@ Per the v0.1 exclusion list, still open after this stream:
 - Per-queue statistics counters (QPRC/QPTC offsets ungrounded).
 - Resume full-reconfigure (RAR / RSS / VLAN / MSI-X restore)
   for suspends that lose non-DMA state — see §13l.
+- IPv6 TSO (the TSO context constructor is v4-only; the parser
+  rejects non-IPv4 frames — a v6 constructor + parser leg is a
+  separate change).
+- Multi-descriptor TSO scatter for frames above 16384 bytes, and
+  `tx()` copy-buffer growth for larger `tx()` TSO (the advertised
+  bound is the `tx()` one until then).
+- VLAN + checksum offload without TSO (the csum path needs
+  header parsing + a context descriptor before it can carry a
+  VLAN context).
+- Csum-path context stickiness: after a TSO/VLAN frame, a later
+  csum-only frame reuses the stale context. Harmless per the
+  datasheet (non-TSE frames ignore MSS/L4LEN; no VLE means no
+  insertion), but documented here until a csum-path context is
+  added.
+- X540/X550 descriptor-format re-grounding against their own
+  datasheets (this lane's descriptor grounding is 82599 rev.
+  2.0 + Linux, which programs the same format across parts).
 
 Per project rule, smokes live in `drivers/net/src/ixgbe/tests.rs`
 and register via `kernel_test_in!("drivers/net/ixgbe", …)`.

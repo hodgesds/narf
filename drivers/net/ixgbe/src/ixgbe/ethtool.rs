@@ -16,11 +16,15 @@
 //! honors today): TX checksum offload, yes (`tx()` builds
 //! `with_csum` from `TxMeta::csum_l4`); RX checksum, no (the
 //! `RxDesc::csum_result` decoder exists but is not plumbed into
-//! frame metadata); TSO, no advertised bound (`tx()` caps every
-//! frame at 1518 bytes, so a large TSO frame is rejected —
-//! advertising a bound would invite frames the driver drops);
-//! VLAN insertion, no (RX filtering only; TX insertion is a
-//! follow-up). The snapshot reports exactly this set.
+//! frame metadata); TSO, yes with a bound (`tx()` accepts TSO
+//! frames to `TX_TSO_MAX_TX` bytes, the per-slot copy-buffer
+//! size; `tx_frame()` runs to `TX_TSO_MAX_TX_FRAME`, the
+//! per-descriptor data length — the advertised bound is the
+//! conservative send-path one); VLAN insertion, yes (`TxMeta::
+//! vlan_tag` rides the context descriptor + VLE on the data
+//! descriptor). VLAN + checksum offload without TSO is rejected
+//! (the csum path programs no context — see spec §13j). The
+//! snapshot reports exactly this set.
 
 use super::queues::RegBank;
 

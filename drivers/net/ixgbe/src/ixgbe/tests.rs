@@ -12,8 +12,10 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    eeprom_decode, eerd_start, name_for, AdvTxDesc, RxDesc, ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP,
-    ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DTYP_DATA, EERD_START, IXGBE_DEV_82599EB,
+    eeprom_decode, eerd_start, name_for, parse_tso_headers, tx_plan, AdvTxCtxtDesc, AdvTxDesc,
+    RxDesc, ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP, ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DCMD_TSE,
+    ADVTXD_DCMD_VLE, ADVTXD_DTYP_CTXT, ADVTXD_DTYP_DATA, ADVTXD_PAYLEN_SHIFT, ADVTXD_POPTS_IXSM,
+    ADVTXD_POPTS_TXSM, ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP, EERD_START, IXGBE_DEV_82599EB,
     IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR,
 };
 
@@ -1886,3 +1888,215 @@ fn smoke_ixgbe_dcb_ieee_credits() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_dcb_ieee_credits);
+
+// ── TX VLAN insertion + TSO frame-cap fix (#1269) ─────────────────
+
+fn smoke_ixgbe_tx_vle_and_ctxt_vlan() -> TestResult {
+    if ADVTXD_DCMD_VLE != 0x4000_0000 {
+        return TestResult::Fail("VLE bit wrong");
+    }
+    let cw = AdvTxDesc::ctrl_word(0x40) | ADVTXD_DCMD_VLE;
+    if cw & ADVTXD_DCMD_VLE == 0 || cw & 0xFFFF != 0x40 {
+        return TestResult::Fail("VLE ctrl word wrong");
+    }
+    let v = AdvTxCtxtDesc::new_vlan(0x1234);
+    if v.vlan_macip_lens != (0x1234u32 << 16) | (14u32 << 9) {
+        return TestResult::Fail("vlan ctxt vlan_macip_lens wrong");
+    }
+    if v.type_tucmd_mlhl != ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT {
+        return TestResult::Fail("vlan ctxt type wrong");
+    }
+    if v.mss_l4len_idx != 0 || v.seqnum_seed != 0 {
+        return TestResult::Fail("vlan ctxt must zero the unused fields");
+    }
+    let t = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1460, Some(0x00AB));
+    if t.vlan_macip_lens != 20u32 | (14u32 << 9) | (0x00ABu32 << 16) {
+        return TestResult::Fail("tso+vlan ctxt vlan_macip_lens wrong");
+    }
+    if t.type_tucmd_mlhl
+        != ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT | ADVTXD_TUCMD_IPV4 | ADVTXD_TUCMD_L4T_TCP
+    {
+        return TestResult::Fail("tso ctxt type wrong");
+    }
+    if t.mss_l4len_idx != (20u32 << 8) | (1460u32 << 16) {
+        return TestResult::Fail("tso ctxt mss_l4len wrong");
+    }
+    let t0 = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1460, None);
+    if t0.vlan_macip_lens & 0xFFFF_0000 != 0 {
+        return TestResult::Fail("tso ctxt without vlan must clear tag bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_vle_and_ctxt_vlan);
+
+fn smoke_ixgbe_tx_tso_parse() -> TestResult {
+    // Crafted IPv4/TCP frame: 14 eth + 20 IP + 20 TCP + 46 payload.
+    let mut f = alloc::vec![0u8; 100];
+    f[12] = 0x08;
+    f[13] = 0x00;
+    f[14] = 0x45;
+    f[14 + 9] = 6;
+    f[14 + 20 + 12] = 0x50;
+    let h = match parse_tso_headers(&f, f.len()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("valid tso frame rejected"),
+    };
+    if h.mac_len != 14 || h.ip_len != 20 || h.l4_len != 20 {
+        return TestResult::Fail("tso header lengths wrong");
+    }
+    // IP options (IHL 6) + TCP options (doff 6).
+    let mut g = alloc::vec![0u8; 120];
+    g[12] = 0x08;
+    g[13] = 0x00;
+    g[14] = 0x46;
+    g[14 + 9] = 6;
+    g[14 + 24 + 12] = 0x60;
+    let h = match parse_tso_headers(&g, g.len()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("options tso frame rejected"),
+    };
+    if h.ip_len != 24 || h.l4_len != 24 {
+        return TestResult::Fail("options header lengths wrong");
+    }
+    // Rejections.
+    if parse_tso_headers(&f[..40], 40).is_ok() {
+        return TestResult::Fail("short frame accepted");
+    }
+    let mut t = f.clone();
+    t[12] = 0x81;
+    t[13] = 0x00;
+    if parse_tso_headers(&t, t.len()).is_ok() {
+        return TestResult::Fail("tagged frame accepted");
+    }
+    let mut a = f.clone();
+    a[13] = 0x06;
+    if parse_tso_headers(&a, a.len()).is_ok() {
+        return TestResult::Fail("ARP frame accepted as IPv4");
+    }
+    let mut b = f.clone();
+    b[14] = 0x44;
+    if parse_tso_headers(&b, b.len()).is_ok() {
+        return TestResult::Fail("bad IHL accepted");
+    }
+    let mut u = f.clone();
+    u[14 + 9] = 17;
+    if parse_tso_headers(&u, u.len()).is_ok() {
+        return TestResult::Fail("UDP accepted as TCP");
+    }
+    let mut d = f.clone();
+    d[14 + 20 + 12] = 0x40;
+    if parse_tso_headers(&d, d.len()).is_ok() {
+        return TestResult::Fail("bad doff accepted");
+    }
+    // Truncated: IHL 15 (60-byte IP header) but only 60 bytes total.
+    let mut tr = alloc::vec![0u8; 60];
+    tr[12] = 0x08;
+    tr[13] = 0x00;
+    tr[14] = 0x4F;
+    tr[14 + 9] = 6;
+    if parse_tso_headers(&tr, tr.len()).is_ok() {
+        return TestResult::Fail("truncated frame accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_tso_parse);
+
+fn smoke_ixgbe_tx_tso_paylen() -> TestResult {
+    let d = AdvTxDesc::with_tso(0x1000, 1500, 1460);
+    if d.addr != 0x1000 || d.cmd_type_len & ADVTXD_DCMD_TSE == 0 {
+        return TestResult::Fail("tso desc missing addr/TSE");
+    }
+    if d.cmd_type_len & 0xFFFF != 1500 {
+        return TestResult::Fail("tso desc DTALEN wrong");
+    }
+    let want = (1460u32 << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM;
+    if d.olinfo != want {
+        return TestResult::Fail("tso desc PAYLEN/POPTS wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_tso_paylen);
+
+fn smoke_ixgbe_tx_plan() -> TestResult {
+    use narf_net::{L4CsumKind, TxMeta};
+    // Plain frame: no context, no TSE/VLE, PAYLEN = full length.
+    let frame = [0u8; 100];
+    let (ctxt, desc) = match tx_plan(0x1000, frame.len(), &frame, &TxMeta::plain()) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("plain plan rejected"),
+    };
+    if ctxt.is_some()
+        || desc.addr != 0x1000
+        || desc.cmd_type_len & ADVTXD_DCMD_TSE != 0
+        || desc.cmd_type_len & ADVTXD_DCMD_VLE != 0
+        || desc.olinfo != (100u32 << 14)
+    {
+        return TestResult::Fail("plain plan wrong");
+    }
+    // TSO frame: 2000 bytes, headers 14+20+20, payload 1946.
+    let mut tso_frame = alloc::vec![0u8; 2000];
+    tso_frame[12] = 0x08;
+    tso_frame[13] = 0x00;
+    tso_frame[14] = 0x45;
+    tso_frame[14 + 9] = 6;
+    tso_frame[14 + 20 + 12] = 0x50;
+    let (ctxt, desc) = match tx_plan(0x2000, tso_frame.len(), &tso_frame, &TxMeta::with_tso(1460)) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("tso plan rejected"),
+    };
+    let c = match ctxt {
+        Some(c) => c,
+        None => return TestResult::Fail("tso plan missing context"),
+    };
+    if c.mss_l4len_idx != (20u32 << 8) | (1460u32 << 16) {
+        return TestResult::Fail("tso plan context mss/l4len wrong");
+    }
+    if desc.cmd_type_len & ADVTXD_DCMD_TSE == 0 {
+        return TestResult::Fail("tso plan desc missing TSE");
+    }
+    if desc.olinfo != (1946u32 << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM {
+        return TestResult::Fail("tso plan PAYLEN wrong");
+    }
+    // VLAN-only: context + VLE, no TSE.
+    let mut m = TxMeta::plain();
+    m.vlan_tag = Some(0x00AB);
+    let (ctxt, desc) = match tx_plan(0x3000, frame.len(), &frame, &m) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("vlan plan rejected"),
+    };
+    if ctxt.is_none()
+        || desc.cmd_type_len & ADVTXD_DCMD_VLE == 0
+        || desc.cmd_type_len & ADVTXD_DCMD_TSE != 0
+    {
+        return TestResult::Fail("vlan plan wrong");
+    }
+    // VLAN + TSO: context carries tag, desc carries TSE + VLE.
+    let mut mt = TxMeta::with_tso(1460);
+    mt.vlan_tag = Some(0x00AB);
+    let (ctxt, desc) = match tx_plan(0x4000, tso_frame.len(), &tso_frame, &mt) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("vlan+tso plan rejected"),
+    };
+    let c = match ctxt {
+        Some(c) => c,
+        None => return TestResult::Fail("vlan+tso plan missing context"),
+    };
+    if c.vlan_macip_lens & 0xFFFF_0000 != 0x00AB_0000 {
+        return TestResult::Fail("vlan+tso plan context tag wrong");
+    }
+    if desc.cmd_type_len & ADVTXD_DCMD_TSE == 0 || desc.cmd_type_len & ADVTXD_DCMD_VLE == 0 {
+        return TestResult::Fail("vlan+tso plan desc bits wrong");
+    }
+    // VLAN + csum without TSO: rejected.
+    let mut mc = TxMeta::with_csum(L4CsumKind::Tcp);
+    mc.vlan_tag = Some(1);
+    if tx_plan(0x5000, frame.len(), &frame, &mc).is_ok() {
+        return TestResult::Fail("vlan+csum plan accepted");
+    }
+    // TSO with mss 0: rejected.
+    if tx_plan(0x6000, tso_frame.len(), &tso_frame, &TxMeta::with_tso(0)).is_ok() {
+        return TestResult::Fail("tso mss 0 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_plan);
