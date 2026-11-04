@@ -245,10 +245,10 @@ fn smoke_i915_media_default_is_per_open_and_single_bsd_selectors_follow_source()
             if fuse != SPARSE {
                 assert_eq!(context.engine(), Engine::Vcs6);
             }
-            // i915 compatibility contexts retain the existing low3 policy;
-            // Xe native CREATE alone configures its default normal2 policy.
+            // i915 compatibility contexts register at default normal2 policy
+            // following Linux's map_i915_prio_to_guc_prio.
             let mut registered = BTreeMap::new();
-            finish_policy(&mut gt, &w, &fence, &mut registered, now + 1, 3);
+            finish_policy(&mut gt, &w, &fence, &mut registered, now + 1, 2);
         }
         hardware_stop(&mut gt, &w, 0x130044);
         drop(gt);
@@ -298,7 +298,7 @@ fn smoke_i915_media_bad_legacy_selectors_refuse_before_dma_and_explicit_map_igno
     let (context, fence) = submit(&file, card, &user, &mailbox, &mut gt, 40_000_000);
     assert_eq!(context.engine(), Engine::Vcs6);
     let mut registered = BTreeMap::new();
-    finish_policy(&mut gt, &w, &fence, &mut registered, 40_000_001, 3);
+    finish_policy(&mut gt, &w, &fence, &mut registered, 40_000_001, 2);
     *mailbox.status.lock() = None;
     legacy_exec(&user.wire, handles, id);
     set_ring(&user.wire, 2);
