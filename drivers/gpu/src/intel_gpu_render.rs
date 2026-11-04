@@ -76,13 +76,18 @@ impl ParamFacts {
     fn sample(info: &DeviceInfo, param: &[u8], set: bool, low_latency: bool) -> Self {
         let size = u32_at(param, 4);
         let value = u64_at(param, 16);
+        let scheduler = scheduler_caps(info);
         let (sys_admin, sys_nice) = match u64_at(param, 8) {
             _ if !set => (false, false),
             abi::CONTEXT_PARAM_BANNABLE if size == 0 => {
                 (narf_filesystem::caller_capable(CAP_SYS_ADMIN), false)
             }
+            // validate_priority asks CAP_SYS_NICE only after its size,
+            // capability and range checks have passed.
             abi::CONTEXT_PARAM_PRIORITY
-                if size == 0 && (1..=CONTEXT_MAX_USER_PRIORITY).contains(&(value as i64)) =>
+                if size == 0
+                    && scheduler & SCHEDULER_CAP_PRIORITY != 0
+                    && (1..=CONTEXT_MAX_USER_PRIORITY).contains(&(value as i64)) =>
             {
                 (false, narf_filesystem::caller_capable(CAP_SYS_NICE))
             }
@@ -90,7 +95,7 @@ impl ParamFacts {
         };
         Self {
             low_latency,
-            scheduler: scheduler_caps(info),
+            scheduler,
             sys_admin,
             sys_nice,
         }
