@@ -459,6 +459,11 @@ fn efuse_read(mmio: &MmioRegion, reg_addr: u16) -> u8 {
 
 // `rtl8168f_config_eee_phy`: extpage 0x20 reg 0x15 bit 8 set,
 // then `d_param` 0x8b85 bit 13 set.
+// Only referenced by the cfg(test) shared_helpers_pinned pin below; clippy-kernel
+// never compiles that helper, so the const reads as dead there. Kept (not deleted
+// or cfg-gated) so the documented rtl8168f_config_eee_phy subsequence stays
+// available to the test pin in every build.
+#[allow(dead_code)]
 const F_EEE: &[PhyStep] = &[ep(0x0020, 0x15, 0x0000, 0x0100), dp(0x8b85, 0x0000, 0x2000)];
 
 // `rtl8168g_config_eee_phy`: page 0x0a43 reg 0x11 bit 4 set.
