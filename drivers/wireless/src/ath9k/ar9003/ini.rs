@@ -3,9 +3,13 @@
 //! for the AR9300: the 2p2 MAC/BB/radio/SoC core and postamble arrays, the
 //! PCIe SerDes, fast clock, Japan 2484 CCK FIR and DFS tables, then the TX
 //! and RX gain tables the EEPROM `txrxgain` nibbles select. The AR9580
-//! (`AR_SREV_9580`) takes the `ar9580_1p0_initvals.h` set instead.
+//! (`AR_SREV_9580`) takes the `ar9580_1p0_initvals.h` set instead, and the
+//! AR9462 (`AR_SREV_9462`) the `ar9462_2p0`/`ar9462_2p1` set (2.1 owns only
+//! its MAC core, baseband postamble and SoC preamble; the rest aliases
+//! 2.0).
 
 use super::initvals::*;
+use super::initvals_ar9462::*;
 use super::initvals_ar9580::*;
 use super::{eeprom::Identity, Chip, Revision};
 
@@ -27,6 +31,13 @@ pub(in crate::ath9k) enum TxGain {
 pub(in crate::ath9k) enum RxGain {
     Common,
     WithoutXlna,
+    /// `ar9462_2p0_common_mixed_rx_gain` (AR9462 mode 2, CUS217 mix LNA),
+    /// plus the mix baseband core/postamble overrides and the 5G-XLNA
+    /// array below.
+    Mixed,
+    /// `ar9462_2p0_common_5g_xlna_only_rxgain` (AR9462 mode 3, an alias of
+    /// the mixed table) plus the 5G-XLNA array below.
+    FiveGXlnaOnly,
 }
 
 /// The arrays `ah->ini*` point at after `ar9003_hw_init_mode_regs` and
@@ -39,10 +50,21 @@ pub(in crate::ath9k) struct Tables {
     pub bb_post: &'static [[u32; 5]],
     pub radio_core: &'static [[u32; 2]],
     pub radio_post: &'static [[u32; 5]],
+    /// `ar9003_phy.c` programs this at `ATH_INI_POST` only for
+    /// `AR_SREV_9462_20_OR_LATER` (`ini_radio_post_sys2ant`); empty for
+    /// the AR9300/AR9580, which Linux does not program it for.
+    pub radio_post_sys2ant: &'static [[u32; 5]],
     pub soc_pre: &'static [[u32; 2]],
     pub soc_post: &'static [[u32; 5]],
     pub rx_gain: &'static [[u32; 2]],
     pub tx_gain: &'static [[u32; 5]],
+    /// `ar9003_phy.c` writes these RX-gain overrides after the main INI
+    /// arrays, only for AR9462 RX modes 2 (baseband core at column 1 and
+    /// postamble at the modes column) and 2/3 (XLNA array at the modes
+    /// column); empty for every other chip and mode.
+    pub rxgain_bb_core: &'static [[u32; 2]],
+    pub rxgain_bb_postamble: &'static [[u32; 5]],
+    pub rxgain_xlna: &'static [[u32; 5]],
     pub pcie_serdes: &'static [[u32; 2]],
     pub pcie_serdes_low_power: &'static [[u32; 2]],
     pub fast_clock: &'static [[u32; 3]],
@@ -60,6 +82,7 @@ impl Tables {
         match revision.chip {
             Chip::Ar9300 => Self::ar9300(revision, identity),
             Chip::Ar9580 => Self::ar9580(identity),
+            Chip::Ar9462 => Self::ar9462(revision, identity),
         }
     }
 
@@ -95,10 +118,14 @@ impl Tables {
             bb_post: AR9300_2P2_BASEBAND_POSTAMBLE,
             radio_core: AR9300_2P2_RADIO_CORE,
             radio_post: AR9300_2P2_RADIO_POSTAMBLE,
+            radio_post_sys2ant: &[],
             soc_pre: AR9300_2P2_SOC_PREAMBLE,
             soc_post: AR9300_2P2_SOC_POSTAMBLE,
             rx_gain,
             tx_gain,
+            rxgain_bb_core: &[],
+            rxgain_bb_postamble: &[],
+            rxgain_xlna: &[],
             pcie_serdes: AR9300_PCIE_PHY_PLL_ON_CLKREQ_DISABLE_L1_2P2,
             pcie_serdes_low_power: AR9300_PCIE_PHY_PLL_ON_CLKREQ_DISABLE_L1_2P2,
             fast_clock: AR9300_MODES_FAST_CLOCK_2P2,
@@ -140,15 +167,151 @@ impl Tables {
             bb_post: AR9580_1P0_BASEBAND_POSTAMBLE,
             radio_core: AR9580_1P0_RADIO_CORE,
             radio_post: AR9580_1P0_RADIO_POSTAMBLE,
+            radio_post_sys2ant: &[],
             soc_pre: AR9580_1P0_SOC_PREAMBLE,
             soc_post: AR9580_1P0_SOC_POSTAMBLE,
             rx_gain,
             tx_gain,
+            rxgain_bb_core: &[],
+            rxgain_bb_postamble: &[],
+            rxgain_xlna: &[],
             pcie_serdes: &[],
             pcie_serdes_low_power: &[],
             fast_clock: AR9580_1P0_MODES_FAST_CLOCK,
             cck_fir_japan_2484: AR9580_1P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             dfs: AR9580_1P0_BASEBAND_POSTAMBLE_DFS_CHANNEL,
+            tx_gain_kind,
+            rx_gain_kind,
+        }
+    }
+
+    /// `ar9003_hw_init_mode_regs`' `AR_SREV_9462_21` (2.1) and
+    /// `AR_SREV_9462_20` (2.0) branches, then `ar9003_tx_gain_table_apply`
+    /// (index `>= 8` is mode 0; modes 2 and 3 have no AR9462 table and
+    /// fall through to the AR9300 2p2 low-ob/db and high-power tables;
+    /// modes 5/6/7 have no table at all and keep the mode-0 low-ob/db
+    /// default) and `ar9003_rx_gain_table_apply` (mode 1 is the AR9300
+    /// 2p2 wo-XLNA table; mode 2 is the mixed table with the mix
+    /// baseband core/postamble overrides and the 5G-XLNA array; mode 3
+    /// is the 5G-XLNA-only table — an alias of the mixed table — with
+    /// the 5G-XLNA array; index `>= 4` keeps the common default).
+    /// Linux sets no `ini_dfs` for the AR9462, so `dfs` stays empty; the
+    /// PCIe SerDes arrays are the `pciephy_clkreq_disable_L1` table in
+    /// both slots (Linux gates them on `pll_pwrsave`, which this
+    /// preparation does not model yet, like the AR9300's).
+    pub fn ar9462(revision: &Revision, identity: &Identity) -> Self {
+        // 2.1 owns only its MAC core, baseband postamble and SoC
+        // preamble; every other 2.1 name aliases the 2.0 table. The
+        // branch names the 2.1 tables throughout, as the Linux 2.1
+        // branch does, so every `2P1` constant is used.
+        let (
+            mac_core,
+            mac_post,
+            bb_core,
+            bb_post,
+            radio_core,
+            radio_post,
+            radio_post_sys2ant,
+            soc_pre,
+            soc_post,
+            common_rx,
+            wo_rx,
+            mixed_rx,
+            xlna_only_rx,
+            low_tx,
+            high_tx,
+            mix_tx,
+            mix_core,
+            mix_post,
+            xlna,
+            serdes,
+            fast_clock,
+            txfir,
+        ) = if revision.ar9462_21() {
+            (
+                AR9462_2P1_MAC_CORE,
+                AR9462_2P1_MAC_POSTAMBLE,
+                AR9462_2P1_BASEBAND_CORE,
+                AR9462_2P1_BASEBAND_POSTAMBLE,
+                AR9462_2P1_RADIO_CORE,
+                AR9462_2P1_RADIO_POSTAMBLE,
+                AR9462_2P1_RADIO_POSTAMBLE_SYS2ANT,
+                AR9462_2P1_SOC_PREAMBLE,
+                AR9462_2P1_SOC_POSTAMBLE,
+                AR9462_2P1_COMMON_RX_GAIN,
+                AR9462_2P1_COMMON_WO_XLNA_RX_GAIN,
+                AR9462_2P1_COMMON_MIXED_RX_GAIN,
+                AR9462_2P1_COMMON_5G_XLNA_ONLY_RXGAIN,
+                AR9462_2P1_MODES_LOW_OB_DB_TX_GAIN,
+                AR9462_2P1_MODES_HIGH_OB_DB_TX_GAIN,
+                AR9462_2P1_MODES_MIX_OB_DB_TX_GAIN,
+                AR9462_2P1_BASEBAND_CORE_MIX_RXGAIN,
+                AR9462_2P1_BASEBAND_POSTAMBLE_MIX_RXGAIN,
+                AR9462_2P1_BASEBAND_POSTAMBLE_5G_XLNA,
+                AR9462_2P1_PCIEPHY_CLKREQ_DISABLE_L1,
+                AR9462_2P1_MODES_FAST_CLOCK,
+                AR9462_2P1_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
+            )
+        } else {
+            (
+                AR9462_2P0_MAC_CORE,
+                AR9462_2P0_MAC_POSTAMBLE,
+                AR9462_2P0_BASEBAND_CORE,
+                AR9462_2P0_BASEBAND_POSTAMBLE,
+                AR9462_2P0_RADIO_CORE,
+                AR9462_2P0_RADIO_POSTAMBLE,
+                AR9462_2P0_RADIO_POSTAMBLE_SYS2ANT,
+                AR9462_2P0_SOC_PREAMBLE,
+                AR9462_2P0_SOC_POSTAMBLE,
+                AR9462_2P0_COMMON_RX_GAIN,
+                AR9462_2P0_COMMON_WO_XLNA_RX_GAIN,
+                AR9462_2P0_COMMON_MIXED_RX_GAIN,
+                AR9462_2P0_COMMON_5G_XLNA_ONLY_RXGAIN,
+                AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+                AR9462_2P0_MODES_HIGH_OB_DB_TX_GAIN,
+                AR9462_2P0_MODES_MIX_OB_DB_TX_GAIN,
+                AR9462_2P0_BASEBAND_CORE_MIX_RXGAIN,
+                AR9462_2P0_BASEBAND_POSTAMBLE_MIX_RXGAIN,
+                AR9462_2P0_BASEBAND_POSTAMBLE_5G_XLNA,
+                AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1,
+                AR9462_2P0_MODES_FAST_CLOCK,
+                AR9462_2P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
+            )
+        };
+        let (tx_gain, tx_gain_kind) = match identity.tx_gain {
+            1 => (high_tx, TxGain::HighObDb),
+            2 => (AR9300_MODES_LOW_OB_DB_TX_GAIN_TABLE_2P2, TxGain::LowObDb),
+            3 => (AR9300_MODES_HIGH_POWER_TX_GAIN_TABLE_2P2, TxGain::HighPower),
+            4 => (mix_tx, TxGain::MixedObDb),
+            _ => (low_tx, TxGain::LowestObDb),
+        };
+        let (rx_gain, rx_gain_kind, rxgain_bb_core, rxgain_bb_postamble, rxgain_xlna) =
+            match identity.rx_gain {
+                1 => (wo_rx, RxGain::WithoutXlna, &[][..], &[][..], &[][..]),
+                2 => (mixed_rx, RxGain::Mixed, mix_core, mix_post, xlna),
+                3 => (xlna_only_rx, RxGain::FiveGXlnaOnly, &[][..], &[][..], xlna),
+                _ => (common_rx, RxGain::Common, &[][..], &[][..], &[][..]),
+            };
+        Self {
+            mac_core,
+            mac_post,
+            bb_core,
+            bb_post,
+            radio_core,
+            radio_post,
+            radio_post_sys2ant,
+            soc_pre,
+            soc_post,
+            rx_gain,
+            tx_gain,
+            rxgain_bb_core,
+            rxgain_bb_postamble,
+            rxgain_xlna,
+            pcie_serdes: serdes,
+            pcie_serdes_low_power: serdes,
+            fast_clock,
+            cck_fir_japan_2484: txfir,
+            dfs: &[],
             tx_gain_kind,
             rx_gain_kind,
         }
