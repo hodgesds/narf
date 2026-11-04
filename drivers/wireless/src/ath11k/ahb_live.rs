@@ -351,7 +351,7 @@ impl<E: AhbEnv> LiveAhb<E> {
     /// recovery can run it after a remote restart without rebuilding
     /// the core: a fresh WLFW client over the re-registered GLINK edge,
     /// run to FW_READY.
-    async fn wlfw_ready(&mut self, p: &AhbPlatform) -> Result<AhbWlfw<E>, AhbError> {
+    async fn wlfw_ready(&mut self, _p: &AhbPlatform) -> Result<AhbWlfw<E>, AhbError> {
         let qrtr = self.qrtr.take().ok_or(failed(EINVAL))?;
         let cfg = self.cfg.take().ok_or(failed(EINVAL))?;
         let fw = self.env.firmware().ok_or(failed(ENOENT))?;
@@ -986,9 +986,15 @@ async fn crash_monitor_task(
                 }
             }
             let r = shared
-                .recover_after_remote_restart(move |_old: &mut AhbWlfw<NarfAhbEnv>| async move {
-                    live.restart_transport(&p).await.map(Some).map_err(|e| {
-                        TransportError::new(super::runtime::step::RECOVERY_FW, 0, restart_errno(&e))
+                .recover_after_remote_restart(|_old: &mut AhbWlfw<NarfAhbEnv>| {
+                    alloc::boxed::Box::pin(async {
+                        live.restart_transport(&p).await.map(Some).map_err(|e| {
+                            TransportError::new(
+                                super::runtime::step::RECOVERY_FW,
+                                0,
+                                restart_errno(&e),
+                            )
+                        })
                     })
                 })
                 .await;

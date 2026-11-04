@@ -2686,6 +2686,16 @@ struct VdevBinding {
     mac: [u8; 6],
 }
 
+/// Boxed transport-restart future: the restart closure's future borrows
+/// the `&mut Q` it is passed, so it cannot name a single concrete future
+/// type — it is boxed with the borrow's lifetime (same idiom as the
+/// `VirtualRecover` fn type in `iface.rs`).
+type RestartFut<'a, Q> = core::pin::Pin<
+    alloc::boxed::Box<
+        dyn core::future::Future<Output = Result<Option<Q>, TransportError>> + Send + 'a,
+    >,
+>;
+
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
         let irq = rt.core.hif.irq.clone();
@@ -3306,13 +3316,15 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     ) -> Result<Recovered, TransportError> {
         let power_cycle = matches!(notice, FwNotice::Reset(_));
         self.rebuild_after_transport_reset(
-            move |qmi: &mut Q| async move {
-                qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
-                    TransportError::new(
-                        step::RECOVERY_FW,
-                        (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                        e.errno,
-                    )
+            move |qmi: &mut Q| {
+                alloc::boxed::Box::pin(async move {
+                    qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
+                        TransportError::new(
+                            step::RECOVERY_FW,
+                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                            e.errno,
+                        )
+                    })
                 })
             },
             true,
@@ -3328,13 +3340,15 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// throttling or be reported as a firmware failure.
     pub async fn resume_after_system_suspend(&self) -> Result<Recovered, TransportError> {
         self.rebuild_after_transport_reset(
-            move |qmi: &mut Q| async move {
-                qmi.recover(true).await.map(|()| None).map_err(|e| {
-                    TransportError::new(
-                        step::RECOVERY_FW,
-                        (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                        e.errno,
-                    )
+            move |qmi: &mut Q| {
+                alloc::boxed::Box::pin(async move {
+                    qmi.recover(true).await.map(|()| None).map_err(|e| {
+                        TransportError::new(
+                            step::RECOVERY_FW,
+                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                            e.errno,
+                        )
+                    })
                 })
             },
             false,
@@ -3350,13 +3364,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// reconstruction tail, failure throttling and park-on-failure are
     /// shared. A crash counts toward the reset throttle; no coredump is
     /// collected on this path (AHB coredump capture is not implemented).
-    pub async fn recover_after_remote_restart<F, Fut>(
+    pub async fn recover_after_remote_restart<F>(
         &self,
         restart: F,
     ) -> Result<Recovered, TransportError>
     where
-        F: FnOnce(&mut Q) -> Fut,
-        Fut: core::future::Future<Output = Result<Option<Q>, TransportError>> + Send,
+        F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
     {
         self.rebuild_after_transport_reset(restart, true, false, 0)
             .await
@@ -3371,7 +3384,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// The transport restart is caller-provided: the PCI path power-cycles MHI
     /// and keeps the QMI session (`Ok(None)`); the AHB path restarts the
     /// remote and supplies a fresh WLFW session (`Ok(Some(qmi))`).
-    async fn rebuild_after_transport_reset<F, Fut>
+    async fn rebuild_after_transport_reset<F>
         &self,
         restart: F,
         record_recovery_failure: bool,
@@ -3379,8 +3392,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         pdev_id: u32,
     ) -> Result<Recovered, TransportError>
     where
-        F: FnOnce(&mut Q) -> Fut,
-        Fut: core::future::Future<Output = Result<Option<Q>, TransportError>> + Send,
+        F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
     {
         // Firmware lost all pdev state. Recreated MAC instances must elect a
         // fresh first opener rather than inheriting the old open-vif count.
