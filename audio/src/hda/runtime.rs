@@ -735,6 +735,20 @@ impl IntelHda {
                 },
             );
         }
+        // The ring pointers above restarted at 0 (CORBWP=0, RIRBWP
+        // reset): the driver's shadow cursors must restart with
+        // them, exactly as `initialize` starts them at 0. Without
+        // this, the first post-reset response() reads RIRBWP's reset
+        // value (low byte 0) with a stale rp and walks pre-reset
+        // RIRB slots, accepting the first stale reply whose cad
+        // nibble matches as the new verb's response — the D0 verb
+        // then "succeeds" without ever reaching the codec, and every
+        // following verb validates against a stale value.
+        {
+            let mut state = self.commands.lock();
+            state.wp = 0;
+            state.rp = 0;
+        }
         // The rings are reset; a pre-suspend verb timeout no longer
         // describes the transport.
         self.irq.failed.store(false, Ordering::Release);

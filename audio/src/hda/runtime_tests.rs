@@ -43,6 +43,17 @@ impl Model {
         }
         // SAFETY: all MMIO and DMA addresses here belong to the fixture.
         unsafe {
+            // A controller reset (reinit) leaves RIRBWP's reset bit
+            // set in this plain-memory BAR until the model overwrites
+            // it: the hardware CORB/RIRB pointers restarted at 0, so
+            // the model's cursors must restart with them, or
+            // post-reset verbs replay stale CORB slots and stale RIRB
+            // replies. Real hardware resets its pointers on
+            // controller reset; the model must observe the same.
+            if self.mmio.read16(REG_RIRBWP) & (1 << 15) != 0 {
+                self.corb = 0;
+                self.rirb = 0;
+            }
             self.mmio.write8(REG_RIRBSTS, 0);
             self.mmio.write8(REG_CORBSTS, 0);
             let cp = (self.mmio.read32(REG_CORBUBASE) as u64) << 32
