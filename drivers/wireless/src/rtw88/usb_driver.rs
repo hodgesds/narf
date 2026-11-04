@@ -169,7 +169,10 @@ pub(super) fn register() {
 /// `rtw_8821cu_probe` / `rtw_8822bu_probe`: claim the function and start
 /// the asynchronous `rtw_usb_probe` body; a second probe of the same handle
 /// is a no-op.
-pub(super) fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
+pub(super) fn probe(
+    device: Arc<USBDevice>,
+    _hub_port: Option<(u8, u8)>,
+) -> Result<(), UsbProbeError> {
     let Some(did) = chip(device.vendor_id(), device.product_id()) else {
         return Err(UsbProbeError::UnsupportedVariant);
     };

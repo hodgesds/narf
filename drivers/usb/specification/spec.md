@@ -213,6 +213,59 @@ also consult upstream Linux GPL sources.
   opening a fresh idle window — a suspended port gates the very
   interrupt endpoint the pump polls, so the resume has to come
   from the supervisor side of the pump, not from report traffic.
+- NIC idle-suspend (#1256): the USB NIC drivers (r8152, CDC-NCM,
+  CDC-ECM) participate in hub idle-suspend through a class
+  suspend-hook registry (`class_registry::register_suspend_hook`,
+  `dispatch_suspend`) alongside the class-driver registry.
+  Registry probes and the NCM/ECM walk arms receive the same
+  hub context — (parent hub slot id, downstream port), `None`
+  on a root port — and each NIC record stores it as `hub_port`
+  plus a `suspended` park flag and a `wakeup_armed` flag. The
+  supervisor's `idle_suspend_pass` calls `dispatch_suspend`
+  for a candidate port BEFORE gating it (a gated port blocks
+  all transfers, including the arming transfer); if any hook
+  reports a failed park, gating is skipped that cycle and
+  retried next cycle. Hooks are async (a sync hook bridging
+  with `block_on` would panic inside the supervisor's executor
+  poll) and self-filter by hub context; they never hold their
+  record lock across an await. Per-family park shapes: all
+  three pumps park in place (yield without transfers, error
+  counts, or link sampling; `pump_running` stays true, so
+  resume needs no re-spawn) and detach dominates park. r8152
+  additionally reprograms its chip wake filter from the
+  bind-time snapshot via `apply_wol` — a failed filter program
+  is `ParkFailed`, because gating without the wake filter
+  would leave the device unable to wake on magic packet — and
+  then issues SET_FEATURE(DEVICE_REMOTE_WAKEUP) (USB 2.0
+  §9.4.2, feature selector 1, device recipient, `wIndex` 0);
+  a stall on that transfer only clears `wakeup_armed` and the
+  park still proceeds. NCM and ECM have no chip wake filter,
+  so their hooks arm remote wakeup only. NIC pumps mark port
+  activity only on delivered frames, never on empty polls, so
+  an idle NIC still becomes a suspend candidate after the 30 s
+  window; a TX-demand resume (send path resumes a parked port
+  first, fails fast if resume fails, and opens a fresh idle
+  window) wakes a parked device for traffic, following Linux
+  usbnet runtime-PM semantics. The supervisor's wake-watch
+  step (`wake_suspended_nic_ports`, after `resume_bound_ports`
+  and before the pumps) resumes a parked NIC port only on an
+  observed remote-wakeup edge — the `C_PORT_SUSPEND` change
+  bit (bit 2 of the high half, i.e. bit 18) of the hub port
+  status word — because an unconditional resume would defeat
+  autosuspend and WoL. r8152 link state restores via the
+  pump's existing 32-turn sampling once unparked; ECM link
+  state re-reports via its notification pump. Root-port NICs
+  never park (no hub to gate them). SuperSpeed/U3 is out of
+  scope: the hub layer is USB-2.0-centric, so this covers the
+  USB 2.0 port_suspend/port_resume path; an SS device whose
+  SET_FEATURE(DEVICE_REMOTE_WAKEUP) stalls parks unarmed.
+  Merge-order notes: the r8152 RX-checksum verdict (#1374) is
+  driver-local pure logic, unaffected by suspend; the pending
+  PLA_RMS MTU write (#1375) is applied by the RX pump on its
+  next turn — whoever lands second must verify the park check
+  sits before transfers but does not bypass a pending
+  application, so the first post-resume pump turn still
+  applies it.
 - Fingerprint matching has a single authority (issue #918):
   `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (31 entries: the
   scaffold table union the pre-#918 USB table). The USB binder owns

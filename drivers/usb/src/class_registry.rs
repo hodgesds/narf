@@ -21,19 +21,33 @@
 //! - Registry is a global `IrqSafeSpinLock<Vec<_>>` capped at
 //!   `MAX_DRIVERS` entries. Held only during registration and the
 //!   initial VID/PID scan, never across a `.await`.
-//! - `probe_fn` is a plain `fn(Arc<USBDevice>) -> Result<(), UsbProbeError>`.
-//!   The probe stores the device Arc and returns; any async work
-//!   (EFUSE reads, firmware upload) is launched as a background task
-//!   from inside the probe or deferred to the driver's own pump.
-//!   This keeps the registry itself sync so it can be called from
-//!   the sync part of the attach dispatcher.
+//! - `probe_fn` is a plain sync fn. The probe stores the device Arc
+//!   and returns; any async work (EFUSE reads, firmware upload) is
+//!   launched as a background task from inside the probe or
+//!   deferred to the driver's own pump. This keeps the registry
+//!   itself sync so it can be called from the sync part of the
+//!   attach dispatcher. Probes additionally receive the device's
+//!   hub context (`Some((parent hub slot, downstream port))` when
+//!   the device sits behind a hub, `None` on a root port) so
+//!   drivers that participate in hub idle-suspend can record it
+//!   and later resume their own port.
+//! - Suspend hooks (`UsbSuspendFn`) are the one async registry
+//!   entry. They run inside the supervisor's async
+//!   `idle_suspend_pass`, which is polled by the executor, so a
+//!   sync hook bridging with `block_on` would panic (executor
+//!   re-entry guard). Hooks therefore return a boxed future and
+//!   `dispatch_suspend` awaits them in registration order before
+//!   the pass gates the port.
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::device::USBDevice;
@@ -102,7 +116,62 @@ pub enum UsbProbeError {
 /// driver has claimed the device. Any async init work is spawned
 /// separately. `Err(UsbProbeError)` releases the device claim and
 /// the dispatcher continues to the next registered driver.
-pub type UsbProbeFn = fn(device: Arc<USBDevice>) -> Result<(), UsbProbeError>;
+///
+/// `hub_port` is the device's hub context: `Some((parent hub slot
+/// id, downstream port))` when the device sits behind a hub,
+/// `None` when it is on a root port. Drivers that participate in
+/// hub idle-suspend (currently the USB NICs) record it at bind;
+/// drivers that do not participate ignore it. The slot id is a
+/// hub slot id, never a `HUBS` index (see #892).
+pub type UsbProbeFn =
+    fn(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<(), UsbProbeError>;
+
+/// Outcome of a class suspend hook for one hub port, reported to
+/// [`dispatch_suspend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    /// This hook owns no live device on the port; nothing parked.
+    NotMine,
+    /// The hook parked its device (datapath parked, wakeup arming
+    /// attempted; see the driver's hook for its arming semantics).
+    /// The pass may gate the port.
+    Parked,
+    /// The hook owns a live device on the port but could not park
+    /// it (e.g. the wake-filter programming failed and gating
+    /// would leave the device unable to wake). The pass must NOT
+    /// gate the port this cycle; it retries next cycle.
+    ParkFailed,
+}
+
+/// Outcome of [`dispatch_suspend`]: how many hooks ran, how many
+/// parked a device, and how many failed to park. Gating proceeds
+/// only when `failed == 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuspendReport {
+    /// Hooks invoked for this port (including NotMine ones).
+    pub invoked: usize,
+    /// Hooks that parked a device on the port.
+    pub parked: usize,
+    /// Hooks that own a live device on the port but failed to park.
+    pub failed: usize,
+}
+
+/// Future returned by a suspend hook.
+pub type SuspendFuture = Pin<Box<dyn Future<Output = SuspendOutcome> + Send>>;
+
+/// Suspend hook signature — async, returning a boxed future (see
+/// the module docs: a sync hook could not bridge to transfers
+/// from inside the supervisor's executor poll). Called with the
+/// parent hub's slot id and the downstream port number, for a port
+/// the supervisor's idle-suspend pass is about to gate. The hook
+/// self-filters: it parks only a live (non-detached) device whose
+/// recorded hub context equals `(hub_slot, port)`, and returns
+/// [`SuspendOutcome::NotMine`] otherwise. It must be idempotent
+/// (an already-parked device returns `Parked` without re-arming)
+/// and panic-free (see the [`UsbUnbindFn`] contract: panic is
+/// fatal by policy). It must never hold its record lock across an
+/// `.await`: lock to find, release, transfer, lock to set flags.
+pub type UsbSuspendFn = fn(hub_slot: u8, port: u8) -> SuspendFuture;
 
 /// Unbind function signature — synchronous. Called with the controller
 /// index ([`crate::xhci::Xhci::id`]) and slot id of a device being
@@ -158,6 +227,17 @@ struct DriverEntry {
 /// The global USB class-driver registry.
 static REGISTRY: IrqSafeSpinLock<Vec<DriverEntry>> = IrqSafeSpinLock::new(Vec::new());
 
+struct SuspendEntry {
+    name: &'static str,
+    hook: UsbSuspendFn,
+}
+
+/// The global class suspend-hook registry. Separate from
+/// [`REGISTRY`]: suspend hooks are addressed by hub port, not by
+/// VID/PID match, and they run in the supervisor's idle-suspend
+/// pass rather than at attach time.
+static SUSPEND_HOOKS: IrqSafeSpinLock<Vec<SuspendEntry>> = IrqSafeSpinLock::new(Vec::new());
+
 // ── Public API ──────────────────────────────────────────────────────
 
 /// Register a USB class driver. Called at Stage::Subsys before any
@@ -209,6 +289,56 @@ fn register_class_driver_inner(
         unbind,
     });
     Ok(())
+}
+
+/// Register a class suspend hook. Called at Stage::Subsys
+/// alongside the driver's class registration. Registration
+/// tolerates duplicates (defensive test initcalls re-register),
+/// so hooks must be idempotent; a duplicate run for an
+/// already-parked device returns `Parked` without re-arming.
+/// Returns `Err(UsbProbeError::RegistryFull)` past `MAX_DRIVERS`
+/// hooks.
+pub fn register_suspend_hook(name: &'static str, hook: UsbSuspendFn) -> Result<(), UsbProbeError> {
+    let mut g = SUSPEND_HOOKS.lock();
+    if g.len() >= MAX_DRIVERS {
+        return Err(UsbProbeError::RegistryFull);
+    }
+    g.push(SuspendEntry { name, hook });
+    Ok(())
+}
+
+/// Invoke every registered suspend hook for one hub port, in
+/// registration order, awaiting each before running the next.
+/// Hooks self-filter by `(hub_slot, port)` against their own
+/// records. A `ParkFailed` outcome is counted and dispatch
+/// CONTINUES with the remaining hooks (same isolation rule as
+/// [`dispatch_unbind`]): one hook's failure must never skip
+/// another hook's park. The caller — the supervisor's
+/// idle-suspend pass — gates the port only when the report's
+/// `failed` count is zero; a failed park means some live device
+/// on the port is unparked, and gating would break its datapath
+/// with no resume path. Ports claimed by no hook gate exactly as
+/// before (the HID behavior: no hook, no park step, gate as
+/// today).
+pub async fn dispatch_suspend(hub_slot: u8, port: u8) -> SuspendReport {
+    let hooks: Vec<UsbSuspendFn> = {
+        let g = SUSPEND_HOOKS.lock();
+        g.iter().map(|entry| entry.hook).collect()
+    };
+    let mut report = SuspendReport {
+        invoked: 0,
+        parked: 0,
+        failed: 0,
+    };
+    for hook in hooks {
+        report.invoked += 1;
+        match hook(hub_slot, port).await {
+            SuspendOutcome::NotMine => {}
+            SuspendOutcome::Parked => report.parked += 1,
+            SuspendOutcome::ParkFailed => report.failed += 1,
+        }
+    }
+    report
 }
 
 /// Invoke every registered driver's unbind hook for `slot_id` on
@@ -287,7 +417,8 @@ pub(crate) fn match_entry(
 /// Walk all registered class drivers in registration order. For each
 /// driver, check every [`UsbClassMatch`] entry against the device's
 /// VID/PID and its Configuration Descriptor. The first driver whose
-/// table contains a matching entry has its `probe` function called.
+/// table contains a matching entry has its `probe` function called
+/// with the device and its hub context.
 ///
 /// Returns `true` if a driver claimed the device; `false` if no match
 /// was found across all registered drivers.
@@ -295,7 +426,7 @@ pub(crate) fn match_entry(
 /// Equivalent to Linux's per-device `usb_match_id` call within the
 /// driver core's `__usb_match_id` + `usb_probe_device` chain in
 /// `drivers/usb/core/driver.c` (~L141, L310).
-pub fn dispatch_probe(device: Arc<USBDevice>, config: &[u8]) -> bool {
+pub fn dispatch_probe(device: Arc<USBDevice>, config: &[u8], hub_port: Option<(u8, u8)>) -> bool {
     let vid = device.vendor_id();
     let pid = device.product_id();
 
@@ -318,7 +449,7 @@ pub fn dispatch_probe(device: Arc<USBDevice>, config: &[u8]) -> bool {
         // Device VID/PID is in this driver's table. Call probe.
         // Clone the Arc so that if probe returns Err we can try the
         // next driver (unusual; typically first match wins).
-        match probe(Arc::clone(&device)) {
+        match probe(Arc::clone(&device), hub_port) {
             Ok(()) => {
                 // Driver claimed the device. Log the match.
                 use core::fmt::Write as _;
@@ -375,7 +506,8 @@ pub fn would_match(vendor_id: u16, product_id: u16) -> bool {
 
 /// Reset the registry — used by smoke tests to avoid cross-test
 /// state pollution. Always compiled; callers should only invoke
-/// this from test code.
+/// this from test code. Clears the suspend-hook registry as well.
 pub fn reset_for_test() {
     REGISTRY.lock().clear();
+    SUSPEND_HOOKS.lock().clear();
 }

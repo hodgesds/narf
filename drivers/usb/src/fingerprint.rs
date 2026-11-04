@@ -603,6 +603,7 @@ pub fn register_pm() {
 /// can reach [`detach_fp`], mirroring MSC.
 fn fp_registry_probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     Err(crate::class_registry::UsbProbeError::BindFailed)
 }
