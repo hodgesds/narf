@@ -195,9 +195,13 @@ fn smoke_ath9k_ar9280_5ghz_synth_rfmode_and_spur_band() -> TestResult {
     if prepare(&mut io, &srev, &identity(0x16), &map, DEVID_PCIE, 5745).is_err() {
         return TestResult::Fail("AR9280 UNII-3 preparation refused");
     }
+    // The REFDIVA step is an RMW over the post-INI register, not the seed:
+    // the COMMON table writes (0x7868, 0xc0102850) during process_ini
+    // (initvals_ar9280.rs:407), so the RMW yields
+    // (0xc0102850 & !0xf8000000) | (1 << 27) = 0x08102850, not (1 << 27) | 7.
     let wrote = |reg: u64, value: u32| io.writes.contains(&(reg, value));
     if !wrote(0x9874, 0xc000_0000 | (1 << 28) | (5745 * 0x8000 / 15))
-        || !wrote(0x7868, (1 << 27) | 7)
+        || !wrote(0x7868, 0x0810_2850)
         || !wrote(0xa200, 0x104)
     {
         return TestResult::Fail("AR9280 5 GHz fast-clock tune wrong");
