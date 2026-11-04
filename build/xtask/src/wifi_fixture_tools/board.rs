@@ -129,7 +129,7 @@ fn text_with(value: &str, len: usize, key: bool, comma: bool) -> Result<Vec<u8>>
         "invalid board name or asset key"
     );
     if key {
-        safe_name(value)?;
+        safe_name(value, comma)?;
     }
     let mut data = vec![0; len];
     data[..value.len()].copy_from_slice(value.as_bytes());
