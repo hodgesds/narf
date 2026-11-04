@@ -8,6 +8,7 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::fusb302::{
@@ -402,4 +403,201 @@ fn smoke_tcpc_connector_published_to_both_registries() -> TestResult {
 kernel_test_in!(
     "drivers/usbpd/typec-publish",
     smoke_tcpc_connector_published_to_both_registries
+);
+
+// ── TcpmPort sink-swap routing (#1217) ─────────────────────────────
+
+#[derive(Debug)]
+struct PortFakeTcpc {
+    role: narf_lib::sync::IrqSafeSpinLock<narf_usbpd::tcpc::PortRole>,
+    cc: narf_lib::sync::IrqSafeSpinLock<narf_usbpd::tcpc::CcStatus>,
+    tx: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>>,
+    rx: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>>,
+}
+
+impl PortFakeTcpc {
+    fn new() -> Self {
+        Self {
+            role: narf_lib::sync::IrqSafeSpinLock::new(narf_usbpd::tcpc::PortRole::Drp),
+            cc: narf_lib::sync::IrqSafeSpinLock::new(narf_usbpd::tcpc::CcStatus {
+                cc1: narf_usbpd::tcpc::CcState::Open,
+                cc2: narf_usbpd::tcpc::CcState::Open,
+            }),
+            tx: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+            rx: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+        }
+    }
+
+    fn set_cc(&self, cc1: narf_usbpd::tcpc::CcState, cc2: narf_usbpd::tcpc::CcState) {
+        *self.cc.lock() = narf_usbpd::tcpc::CcStatus { cc1, cc2 };
+    }
+
+    fn enqueue_rx(&self, frame: Vec<u8>) {
+        self.rx.lock().push(frame);
+    }
+}
+
+impl narf_usbpd::tcpc::Tcpc for PortFakeTcpc {
+    fn name(&self) -> &'static str {
+        "port-fake-tcpc"
+    }
+
+    fn set_role(&self, r: narf_usbpd::tcpc::PortRole) -> Result<(), narf_usbpd::tcpc::TcpcError> {
+        *self.role.lock() = r;
+        Ok(())
+    }
+
+    fn cc_status(&self) -> Result<narf_usbpd::tcpc::CcStatus, narf_usbpd::tcpc::TcpcError> {
+        Ok(*self.cc.lock())
+    }
+
+    fn transmit(&self, msg: &[u8]) -> Result<(), narf_usbpd::tcpc::TcpcError> {
+        self.tx.lock().push(msg.to_vec());
+        Ok(())
+    }
+
+    fn receive(&self) -> Result<Vec<u8>, narf_usbpd::tcpc::TcpcError> {
+        let mut q = self.rx.lock();
+        if q.is_empty() {
+            return Err(narf_usbpd::tcpc::TcpcError::NoMessage);
+        }
+        Ok(q.remove(0))
+    }
+}
+
+fn port_ctrl_frame(msg: narf_usbpd::message::CtrlMsg, message_id: u8) -> Vec<u8> {
+    let h = narf_usbpd::message::Header::control(
+        msg,
+        narf_usbpd::message::DataRole::Dfp,
+        narf_usbpd::message::PowerRole::Source,
+        narf_usbpd::message::SpecRev::R3_0,
+        message_id,
+    );
+    narf_usbpd::message::encode_message(h, &[])
+}
+
+fn port_source_caps_frame(pdos: &[narf_usbpd::message::SourcePdo], message_id: u8) -> Vec<u8> {
+    let h = narf_usbpd::message::Header::data(
+        narf_usbpd::message::DataMsg::SourceCapabilities,
+        narf_usbpd::message::DataRole::Dfp,
+        narf_usbpd::message::PowerRole::Source,
+        narf_usbpd::message::SpecRev::R3_0,
+        message_id,
+        pdos.len() as u8,
+    );
+    let objs: Vec<u32> = pdos.iter().map(|p| p.encode()).collect();
+    narf_usbpd::message::encode_message(h, &objs)
+}
+
+/// #1217 routing: a sink port that completes a PR_Swap must move the
+/// port-level state to `AttachedSrc`, hand the source engine a fresh
+/// `Startup`, and carry the data role across (DR-swapped to DFP
+/// before the PR swap, the new source engine must already be DFP).
+fn smoke_tcpm_port_sink_pr_swap_routes_to_source() -> TestResult {
+    use crate::policy::{SinkPolicy, SourcePolicy};
+    use crate::tcpm::{PortState, PortStepOutcome, SourceState, TcpmPort};
+
+    let tcpc = Arc::new(PortFakeTcpc::new());
+    let port = Arc::new(TcpmPort::new(
+        tcpc.clone(),
+        SinkPolicy {
+            accept_pr_swap: true,
+            accept_dr_swap: true,
+            ..SinkPolicy::default()
+        },
+        SourcePolicy::default(),
+        "test".into(),
+    ));
+    let cap = narf_usbpd::bootstrap_usbpd_authority();
+    tcpc.set_cc(
+        narf_usbpd::tcpc::CcState::Rp3A0,
+        narf_usbpd::tcpc::CcState::Open,
+    );
+    // 1. Classify -> AttachedSnk, then walk the sink engine to Ready.
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("classify step");
+    }
+    if port.state() != PortState::AttachedSnk {
+        return TestResult::Fail("did not classify as AttachedSnk");
+    }
+    for _ in 0..5 {
+        if port.step(&cap).is_err() {
+            return TestResult::Fail("sink walk step");
+        }
+    }
+    if port.sink().state() != narf_usbpd::tcpm::SinkState::WaitCaps {
+        return TestResult::Fail("sink did not reach WaitCaps via port");
+    }
+    let pdos = [narf_usbpd::message::SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+        epr_mode_capable: false,
+    }];
+    tcpc.enqueue_rx(port_source_caps_frame(&pdos, 0));
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("wait-caps step");
+    }
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("evaluate step");
+    }
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("select step");
+    }
+    tcpc.enqueue_rx(port_ctrl_frame(narf_usbpd::message::CtrlMsg::Accept, 1));
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("transition accept step");
+    }
+    tcpc.enqueue_rx(port_ctrl_frame(narf_usbpd::message::CtrlMsg::PsRdy, 2));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("transition ps-rdy step"),
+    };
+    if !matches!(outcome, PortStepOutcome::SinkReady(_)) {
+        return TestResult::Fail("did not reach SinkReady via port");
+    }
+    // 2. DR swap first: sink becomes DFP while still a sink.
+    tcpc.enqueue_rx(port_ctrl_frame(narf_usbpd::message::CtrlMsg::DrSwap, 3));
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("dr swap step");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("dr change step"),
+    };
+    if outcome != (PortStepOutcome::DataRoleSwapped { now_dfp: true }) {
+        return TestResult::Fail("DR swap did not report DFP via port");
+    }
+    if !port.sink().is_dfp() {
+        return TestResult::Fail("sink data role did not flip");
+    }
+    // 3. PR swap: Accept, partner PS_RDY, port flips to AttachedSrc.
+    tcpc.enqueue_rx(port_ctrl_frame(narf_usbpd::message::CtrlMsg::PrSwap, 4));
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("pr swap step");
+    }
+    tcpc.enqueue_rx(port_ctrl_frame(narf_usbpd::message::CtrlMsg::PsRdy, 5));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("pr swap wait-off step"),
+    };
+    if outcome != PortStepOutcome::RoleSwapped(PortState::AttachedSrc) {
+        return TestResult::Fail("PR swap did not route to AttachedSrc");
+    }
+    if port.state() != PortState::AttachedSrc {
+        return TestResult::Fail("port state is not AttachedSrc after swap");
+    }
+    if port.source().state() != SourceState::Startup {
+        return TestResult::Fail("source engine did not start at Startup");
+    }
+    if !port.source().is_dfp() {
+        return TestResult::Fail("data role did not carry across the swap");
+    }
+    if port.sink().contract().is_some() {
+        return TestResult::Fail("old sink contract survived the swap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usbpd/tcpm",
+    smoke_tcpm_port_sink_pr_swap_routes_to_source
 );

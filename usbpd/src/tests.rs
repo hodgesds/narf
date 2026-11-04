@@ -17,7 +17,7 @@ use crate::message::{
     SpecRev,
 };
 use crate::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
-use crate::tcpm::{SinkPort, SinkState, StepOutcome};
+use crate::tcpm::{SinkPort, SinkState, SinkSwapPolicy, StepOutcome};
 
 // ── Header round-trip ──────────────────────────────────────────────
 
@@ -388,6 +388,10 @@ impl FakeTcpc {
     fn sent_frames(&self) -> Vec<Vec<u8>> {
         self.tx.lock().clone()
     }
+
+    fn role(&self) -> PortRole {
+        *self.role.lock()
+    }
 }
 
 impl Tcpc for FakeTcpc {
@@ -448,7 +452,6 @@ fn smoke_sink_state_machine_5v3a_contract() -> TestResult {
     let tcpc = Arc::new(FakeTcpc::new());
     let port = Arc::new(SinkPort::new(tcpc.clone()));
     let cap = bootstrap_usbpd_authority();
-
     // 1. Unattached → AttachWait when CC1 sees Rp@3A.
     tcpc.set_cc(CcState::Rp3A0, CcState::Open);
     let _ = port.step(&cap).expect("unattached step");
@@ -1201,3 +1204,389 @@ fn smoke_usb4_entry_driver_walk() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("usbpd/vdm", smoke_usb4_entry_driver_walk);
+
+// ── Sink-side role swaps (#1217) ───────────────────────────────────
+
+/// Drive a fresh sink port to `Ready` with a 5 V / 3 A contract, the
+/// same walk as `smoke_sink_state_machine_5v3a_contract` but as a
+/// reusable helper for the swap tests.
+fn drive_sink_to_ready(
+    tcpc: &Arc<FakeTcpc>,
+    port: &Arc<SinkPort>,
+    cap: &narf_capabilities::Cap<crate::UsbPd, narf_capabilities::Grant>,
+) -> Result<crate::tcpm::Contract, &'static str> {
+    tcpc.set_cc(CcState::Rp3A0, CcState::Open);
+    let _ = port.step(cap).map_err(|_| "unattached step")?;
+    let _ = port.step(cap).map_err(|_| "attach-wait step")?;
+    let _ = port.step(cap).map_err(|_| "attached step")?;
+    let _ = port.step(cap).map_err(|_| "startup step")?;
+    let _ = port.step(cap).map_err(|_| "discovery step")?;
+    if port.state() != SinkState::WaitCaps {
+        return Err("did not reach WaitCaps");
+    }
+    let pdos = [SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+        epr_mode_capable: false,
+    }];
+    tcpc.enqueue_rx(source_caps_frame(&pdos, 0));
+    let _ = port.step(cap).map_err(|_| "wait-caps step")?;
+    let _ = port.step(cap).map_err(|_| "evaluate-caps step")?;
+    let _ = port.step(cap).map_err(|_| "select-capability step")?;
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Accept, 1));
+    let _ = port.step(cap).map_err(|_| "transition accept step")?;
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PsRdy, 2));
+    match port.step(cap).map_err(|_| "transition ps-rdy step")? {
+        StepOutcome::Ready { contract } => Ok(contract),
+        _ => Err("PS_RDY did not produce a Ready outcome"),
+    }
+}
+
+/// Last sent control message type, decoded (masking-defeating: the
+/// test asserts on the decoded wire type, not on our own builder).
+fn last_sent_ctrl(tcpc: &FakeTcpc) -> Option<CtrlMsg> {
+    let sent = tcpc.sent_frames();
+    let (h, _) = decode_message(sent.last()?)?;
+    CtrlMsg::from_u8(h.msg_type)
+}
+
+fn last_sent_header(tcpc: &FakeTcpc) -> Option<Header> {
+    let sent = tcpc.sent_frames();
+    let (h, _) = decode_message(sent.last()?)?;
+    Some(h)
+}
+
+fn smoke_sink_pr_swap_responder_accepts_and_becomes_source() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+    if drive_sink_to_ready(&tcpc, &port, &cap).is_err() {
+        return TestResult::Fail("setup: did not reach Ready");
+    }
+    port.set_swap_policy(SinkSwapPolicy {
+        accept_pr_swap: true,
+        ..SinkSwapPolicy::default()
+    });
+    // Partner initiates PR_Swap; we Accept and wait for its PS_RDY.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PrSwap, 3));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PR_Swap step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::PrSwapWaitOff) {
+        return TestResult::Fail("PR_Swap did not advance to PrSwapWaitOff");
+    }
+    if last_sent_ctrl(&tcpc) != Some(CtrlMsg::Accept) {
+        return TestResult::Fail("expected Accept in reply to PR_Swap");
+    }
+    if last_sent_header(&tcpc).map(|h| h.power_role) != Some(PowerRole::Sink) {
+        return TestResult::Fail("Accept must still carry power role Sink");
+    }
+    // Partner turns its rail off and sends PS_RDY; we turn ours on
+    // (PS_RDY), flip CC role, drop the contract, and report the swap.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PsRdy, 4));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PrSwapWaitOff step errored"),
+    };
+    if outcome != StepOutcome::RoleSwappedToSource {
+        return TestResult::Fail("partner PS_RDY did not complete the swap");
+    }
+    // Wire order pins the sequence: Request, Accept, PS_RDY.
+    // The header's type field is namespace-dependent (PD §6.2.1.1):
+    // it indexes the control table only when the message carries
+    // zero data objects, and the data table otherwise — so a data
+    // Request (type 0x02) must NOT be read through CtrlMsg::from_u8,
+    // where it aliases to GotoMin. Split on num_data_objects first.
+    let mut ctrls: Vec<CtrlMsg> = Vec::new();
+    let mut datas: Vec<u8> = Vec::new();
+    for f in tcpc.sent_frames().iter() {
+        let Some((h, _)) = decode_message(f) else {
+            continue;
+        };
+        if h.num_data_objects == 0 {
+            if let Some(c) = CtrlMsg::from_u8(h.msg_type) {
+                ctrls.push(c);
+            }
+        } else {
+            datas.push(h.msg_type);
+        }
+    }
+    // The two control frames must be Accept then PsRdy, in that
+    // order, and the Request must be the only data frame on the wire.
+    if ctrls != [CtrlMsg::Accept, CtrlMsg::PsRdy] {
+        return TestResult::Fail("expected Accept then PS_RDY on the wire");
+    }
+    if datas != [DataMsg::Request as u8] {
+        return TestResult::Fail("expected only the Request data message on the wire");
+    }
+    if tcpc.role() != PortRole::Source {
+        return TestResult::Fail("CC role did not flip to Source");
+    }
+    if port.state() != SinkState::Unattached {
+        return TestResult::Fail("sink engine did not park in Unattached");
+    }
+    if port.contract().is_some() {
+        return TestResult::Fail("contract survived the role swap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "usbpd/tcpm",
+    smoke_sink_pr_swap_responder_accepts_and_becomes_source
+);
+
+fn smoke_sink_pr_swap_responder_rejects_by_policy() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+    if drive_sink_to_ready(&tcpc, &port, &cap).is_err() {
+        return TestResult::Fail("setup: did not reach Ready");
+    }
+    // Default policy rejects every swap.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PrSwap, 3));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PR_Swap step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::Ready) {
+        return TestResult::Fail("rejected PR_Swap did not return to Ready");
+    }
+    if last_sent_ctrl(&tcpc) != Some(CtrlMsg::Reject) {
+        return TestResult::Fail("expected Reject in reply to PR_Swap");
+    }
+    if port.state() != SinkState::Ready || port.contract().is_none() {
+        return TestResult::Fail("rejected swap disturbed Ready/contract");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpm", smoke_sink_pr_swap_responder_rejects_by_policy);
+
+fn smoke_sink_dr_swap_flips_data_role() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+    if drive_sink_to_ready(&tcpc, &port, &cap).is_err() {
+        return TestResult::Fail("setup: did not reach Ready");
+    }
+    port.set_swap_policy(SinkSwapPolicy {
+        accept_dr_swap: true,
+        ..SinkSwapPolicy::default()
+    });
+    if port.is_dfp() {
+        return TestResult::Fail("sink must start as UFP");
+    }
+    // First swap: UFP -> DFP.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::DrSwap, 3));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("DR_Swap step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::DrSwapChange) {
+        return TestResult::Fail("DR_Swap did not advance to DrSwapChange");
+    }
+    if last_sent_ctrl(&tcpc) != Some(CtrlMsg::Accept) {
+        return TestResult::Fail("expected Accept in reply to DR_Swap");
+    }
+    // The Accept still carries the pre-flip role (UFP); the flip
+    // happens in DrSwapChange.
+    if last_sent_header(&tcpc).map(|h| h.data_role) != Some(DataRole::Ufp) {
+        return TestResult::Fail("Accept must carry the pre-flip data role");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("DrSwapChange step errored"),
+    };
+    if outcome != (StepOutcome::DataRoleSwapped { now_dfp: true }) {
+        return TestResult::Fail("DR_Swap did not report DFP");
+    }
+    if !port.is_dfp() || port.state() != SinkState::Ready {
+        return TestResult::Fail("data role did not flip to DFP");
+    }
+    // Second swap: DFP -> UFP.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::DrSwap, 4));
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("second DR_Swap step");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("second DrSwapChange step errored"),
+    };
+    if outcome != (StepOutcome::DataRoleSwapped { now_dfp: false }) {
+        return TestResult::Fail("second DR_Swap did not report UFP");
+    }
+    if port.is_dfp() {
+        return TestResult::Fail("data role did not flip back to UFP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpm", smoke_sink_dr_swap_flips_data_role);
+
+fn smoke_sink_vconn_swap_start_and_turn_off() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+    if drive_sink_to_ready(&tcpc, &port, &cap).is_err() {
+        return TestResult::Fail("setup: did not reach Ready");
+    }
+    port.set_swap_policy(SinkSwapPolicy {
+        accept_vconn_swap: true,
+        ..SinkSwapPolicy::default()
+    });
+    if port.is_vconn_supplier() {
+        return TestResult::Fail("sink must start as VConn consumer");
+    }
+    // Become supplier: Accept -> Start -> PS_RDY + flag.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::VconnSwap, 3));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("VconnSwap step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::VconnSwapStart) {
+        return TestResult::Fail("VconnSwap did not advance to VconnSwapStart");
+    }
+    if last_sent_ctrl(&tcpc) != Some(CtrlMsg::Accept) {
+        return TestResult::Fail("expected Accept in reply to VconnSwap");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("VconnSwapStart step errored"),
+    };
+    if outcome
+        != (StepOutcome::VconnSwapped {
+            now_supplying: true,
+        })
+    {
+        return TestResult::Fail("VconnSwapStart did not report supplier");
+    }
+    if !port.is_vconn_supplier() || port.state() != SinkState::Ready {
+        return TestResult::Fail("VConn supplier flag did not set");
+    }
+    if last_sent_ctrl(&tcpc) != Some(CtrlMsg::PsRdy) {
+        return TestResult::Fail("expected PS_RDY after becoming supplier");
+    }
+    // Release: Accept -> TurnOff -> wait PS_RDY -> flag cleared.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::VconnSwap, 4));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("second VconnSwap step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::VconnSwapTurnOff) {
+        return TestResult::Fail("second VconnSwap did not advance to TurnOff");
+    }
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PsRdy, 5));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("VconnSwapTurnOff step errored"),
+    };
+    if outcome
+        != (StepOutcome::VconnSwapped {
+            now_supplying: false,
+        })
+    {
+        return TestResult::Fail("VconnSwapTurnOff did not report consumer");
+    }
+    if port.is_vconn_supplier() || port.state() != SinkState::Ready {
+        return TestResult::Fail("VConn supplier flag did not clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpm", smoke_sink_vconn_swap_start_and_turn_off);
+
+fn smoke_sink_swap_initiate_paths() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+    // Initiation is illegal before Ready.
+    if port.initiate_pr_swap() || port.initiate_dr_swap() || port.initiate_vconn_swap() {
+        return TestResult::Fail("initiation must fail outside Ready");
+    }
+    if drive_sink_to_ready(&tcpc, &port, &cap).is_err() {
+        return TestResult::Fail("setup: did not reach Ready");
+    }
+    // PR initiator, partner rejects: back to Ready, still a sink.
+    if !port.initiate_pr_swap() || port.state() != SinkState::PrSwapSend {
+        return TestResult::Fail("initiate_pr_swap did not enter PrSwapSend");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PrSwapSend step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::PrSwapWaitReply) {
+        return TestResult::Fail("PrSwapSend did not advance to WaitReply");
+    }
+    if last_sent_ctrl(&tcpc) != Some(CtrlMsg::PrSwap) {
+        return TestResult::Fail("expected PR_Swap on the wire");
+    }
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Reject, 3));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PrSwapWaitReply step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::Ready) {
+        return TestResult::Fail("rejected PR_Swap did not return to Ready");
+    }
+    if tcpc.role() != PortRole::Sink {
+        return TestResult::Fail("rejected swap changed the CC role");
+    }
+    // DR initiator, partner accepts: flip to DFP.
+    if !port.initiate_dr_swap() {
+        return TestResult::Fail("initiate_dr_swap failed in Ready");
+    }
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("DrSwapSend step");
+    }
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Accept, 4));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("DrSwapWaitReply step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::DrSwapChange) {
+        return TestResult::Fail("accepted DR_Swap did not reach DrSwapChange");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("DrSwapChange step errored"),
+    };
+    if outcome != (StepOutcome::DataRoleSwapped { now_dfp: true }) {
+        return TestResult::Fail("initiated DR_Swap did not report DFP");
+    }
+    // VConn initiator, partner accepts: become supplier.
+    if !port.initiate_vconn_swap() {
+        return TestResult::Fail("initiate_vconn_swap failed in Ready");
+    }
+    if port.step(&cap).is_err() {
+        return TestResult::Fail("VconnSwapSend step");
+    }
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Accept, 5));
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("VconnSwapWaitReply step errored"),
+    };
+    if outcome != StepOutcome::Advanced(SinkState::VconnSwapStart) {
+        return TestResult::Fail("accepted VconnSwap did not reach Start");
+    }
+    let outcome = match port.step(&cap) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("VconnSwapStart step errored"),
+    };
+    if outcome
+        != (StepOutcome::VconnSwapped {
+            now_supplying: true,
+        })
+    {
+        return TestResult::Fail("initiated VconnSwap did not report supplier");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpm", smoke_sink_swap_initiate_paths);
