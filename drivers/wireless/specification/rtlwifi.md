@@ -3266,6 +3266,65 @@ keeps the chip diagnostic until admission lands.
   and `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
   unexecuted).
 
+### RTL8723AE retained runtime (in progress, not admitted)
+
+`rtl8723ae/` + `rtl8723ae.rs` port Linux `rtl8723ae` and the `rtl8723com`
+pieces it uses (PCI `0x8723`, 1T1R 2.4 GHz HT with Bluetooth; the
+RTL8192C generation: 92CE-style descriptors, its own `pwrseq` flows and
+its own coexistence in `hal_btc.c` / `hal_bt_coexist.c`). Probe keeps the
+chip diagnostic (no firmware owner is built for it yet).
+
+- `version` — `_rtl8723e_read_chip_version`: `NORMAL_CHIP | CHIP_8723`,
+  `CHIP_VENDOR_UMC` from `REG_SYS_CFG[19]` with the `CHIP_VER_RTL_MASK` cut
+  (UMC only), ROM version `REG_GPIO_OUTSTS[31:28] >> 20` and
+  `polarity_ctl` from `REG_MULTI_FUNC_CTRL[1]`. `TRP_VAUX_EN` test chips and
+  parts without `BT_FUNC` (no Linux RF type) are refused. Firmware per
+  `rtl8723e_init_sw_vars`: `rtl8723fw.bin`, or `rtl8723fw_B.bin` for
+  `IS_81XXC_VENDOR_UMC_B_CUT`; no `alt_fw_name`. `fw::FW_8723AE` (the
+  diagnostic resolver) now names Linux's default `rtl8723fw.bin`.
+- `adapter` — `rtl8723e_read_eeprom_info` / `_rtl8723e_read_adapter_info`
+  over the 256-byte map with the 8723AE `params[]` (`0x8129`, VID `0x49`,
+  DID `0x4b`, SVID `0x4d`, SMID `0x4f`, MAC `0x67`, plan `0x28`, version
+  `0x30`, customer `0x31`); an EEPROM boot, autoload failure or bad ID is
+  unprovisioned (Linux's `rtl_get_hwinfo` return skips TX power and BT).
+  `rtl8723e_read_bt_coexist_info_from_hwpg` + `rtl8723e_bt_var_init`:
+  `bt_coexistence = REG_MULTI_FUNC_CTRL[18]`, type `BT_RTL8723A`, ant num /
+  isolation / radio-shared from `RF_OPTION4` (`0x2e`) bits 0/4/5; the
+  8723AE OEM switch (its Lenovo/Toshiba/ASUS lists differ from 8723BE).
+  Probe now issues the `REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SEL_0` selection
+  `rtl8723e_read_eeprom_info` makes before the map read. Divergence kept:
+  the 8723AE `rtl_hal_cfg` has no `maps[EFUSE_ACCESS]`, so Linux's
+  `efuse_power_switch` writes `0x69`/`0` to offset 0 (`REG_SYS_ISO_CTRL`);
+  the shared reader keeps using `REG_EFUSE_ACCESS` (`0xcf`) instead.
+- `pwrseq` — PCI rows of every `rtl8723A_*_flow`, generated from
+  `pwrseq.h` (sha256 in the file header). Probe's power table for `0x8723`
+  is now the exact `rtl8723A_card_enable_flow` after `REG_RSV_CTRL = 0`
+  (replacing the former diagnostic rows), parsed with `PWR_CUT_ALL_MSK`.
+- `power` — the rest of `_rtl8712e_init_mac`'s power segment, run by the
+  firmware owner before the download as in Linux: `REG_PCIE_CTRL_REG+2[4]`,
+  `0x369[7]` and the ePHY `0x1e[4]` MDIO loop (`0x358`/`0x356`/`0x354`
+  word writes, 100 us settles, readback `0xc290`, failure after 100
+  rounds exactly as Linux).
+- `fw` — `is_fw_header` (`signature & 0xfff0 == 0x2300`), exact RAM-code
+  length (linux-firmware `0x2d6e` / `0x59b4`), whole file at most
+  `max_fw_size = 0x6000`. `rtl8723_download_fw(hw, false, 1000)`: a
+  running image is stopped by `rtl8723ae_firmware_selfreset`
+  (`REG_HMETFR+3 = 0x20`, `SYS_FUNC_EN+1[2]` wait of 99 x 50 us, forced
+  clear) then `MCUFWDL = 0`; enable, pages with `rtl_fill_dummy`, close;
+  `FWDL_CHKSUM_RPT` within 999 undelayed reads, `MCUFWDL_RDY` /
+  `~WINTINI_RDY` with no 8051 reset, `WINTINI_RDY` over 1001 reads x 5 ms.
+  A failed `rtl8723_fw_free_to_go` is an error here (Linux returns 0).
+  `firmware_transport::Owner` admits `0x8723` (`run_8723ae`, 6 s bound):
+  identify before any write, `power::post_flow`, clear the CR DMA/MAC gates
+  (ring owner), download; only the image the measured version selects is
+  accepted. Tests `smoke_rtl8723ae_chip_version_and_firmware_names`,
+  `smoke_rtl8723ae_adapter_facts_bt_and_oem`,
+  `smoke_rtl8723ae_firmware_header_geometry`,
+  `smoke_rtl8723ae_firmware_paged_download`,
+  `smoke_rtl8723ae_init_mac_post_flow_ephy`,
+  `smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow` (written,
+  unexecuted).
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE

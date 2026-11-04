@@ -44,8 +44,10 @@ pub const FW_8192DE: &str = "rtlwifi/rtl8192defw.bin";
 pub const FW_8192EE: &str = "rtlwifi/rtl8192eefw.bin";
 
 /// Firmware blob for RTL8723AE.
-/// Linux `rtl8723ae/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8723aefw.bin")`.
-pub const FW_8723AE: &str = "rtlwifi/rtl8723aefw.bin";
+/// Linux `rtl8723ae/sw.c::rtl8723e_init_sw_vars` default `fw_name`
+/// (`MODULE_FIRMWARE("rtlwifi/rtl8723fw.bin")`; UMC B-cut parts load
+/// `rtl8723fw_B.bin`, `rtl8723ae::version::Version::firmware`).
+pub const FW_8723AE: &str = "rtlwifi/rtl8723fw.bin";
 
 /// Firmware blob for RTL8723BE.
 /// Linux `rtl8723be/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8723befw.bin")`.

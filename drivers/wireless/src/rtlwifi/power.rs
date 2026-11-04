@@ -335,18 +335,11 @@ pub static RTL8188EE_PWR_ON: &[WlanPwrCfg] = &[
     pci_end(),
 ];
 
-/// Diagnostic RTL8723AE Cardemu→Active power-on rows (the former shared
-/// 8723 table, unchanged; RTL8723AE has no retained owner).
-pub static RTL8723AE_PWR_ON: &[WlanPwrCfg] = &[
-    pci_w(0x0005, 1 << 7, 0),
-    pci_w(0x0005, 1 << 2, 0),
-    pci_w(0x0005, (1 << 4) | (1 << 3), 0),
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    pci_p(0x0005, 1 << 0, 0),
-    pci_end(),
-];
+/// Exact RTL8723AE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
+/// Linux `rtl8723ae/hw.c::_rtl8712e_init_mac` runs `RTL8723_NIC_ENABLE_FLOW`
+/// (`pwrseq.c::rtl8723A_card_enable_flow`) with all-cut/all-fab/PCI masks;
+/// SDIO-only rows are omitted.
+pub static RTL8723AE_PWR_ON: &[WlanPwrCfg] = super::rtl8723ae::pwrseq::RTL8723A_CARD_ENABLE_FLOW;
 
 /// Exact RTL8723BE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
 /// Linux `rtl8723be/hw.c::_rtl8723be_init_mac` runs `RTL8723_NIC_ENABLE_FLOW`
@@ -408,6 +401,11 @@ pub fn power_on_with(io: &impl Io, did: u16) -> Result<(), PwrSeqError> {
     // PWR_CUT_A_MSK, which skips the test-chip-only 0x7a BT-start row.
     if did == super::regs::RTL_DEV_8192EE {
         rtl8192ee_init_mac_prefix(io)?;
+    }
+    // rtl8723ae/hw.c::_rtl8712e_init_mac: unlock REG_RSV_CTRL before the
+    // enable flow (the post-flow segment runs in the firmware owner).
+    if did == super::regs::RTL_DEV_8723AE {
+        io.write8(0x1c, 0)?;
     }
     // rtl8723be/hw.c::_rtl8723be_init_mac: unlock REG_RSV_CTRL and clear
     // the auto-power-down bit (APS_FSMCO[15]) before the enable flow.

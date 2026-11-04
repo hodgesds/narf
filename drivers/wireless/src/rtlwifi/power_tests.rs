@@ -227,3 +227,29 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/power",
     smoke_rtlwifi_8723be_enable_prefix_and_card_enable_flow
 );
+
+/// RTL8723AE: `_rtl8712e_init_mac` unlocks `REG_RSV_CTRL` before the exact
+/// `rtl8723A_card_enable_flow` PCI rows (`RTL8723A_TRANS_CARDDIS_TO_CARDEMU`
+/// without its SDIO rows, then `RTL8723A_TRANS_CARDEMU_TO_ACT`), including
+/// the `0x301 = 0` row.
+fn smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow() -> TestResult {
+    let io = Fake::new();
+    io.0.lock().bytes.resize(0x400, 0xff);
+    if power_on_with(&io, super::super::regs::RTL_DEV_8723AE).is_err() {
+        return TestResult::Fail("8723AE profile enable failed");
+    }
+    let m = io.0.lock();
+    if m.trace[..3] != [Op::Write(0x1c, 0), Op::Read(5), Op::Write(5, 0xe6)]
+        || m.bytes[0x301] != 0
+        || m.bytes[5] != 0x62
+        || m.bytes[6] != 0xb3
+        || RTL8723AE_PWR_ON.len() != 10
+    {
+        return TestResult::Fail("8723AE init_mac prefix / card enable flow differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/power",
+    smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow
+);

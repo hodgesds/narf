@@ -545,6 +545,17 @@ pub unsafe fn bring_up(
             narf_bus::BusAddr::Pcie(addr) => addr.function,
             _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
         };
+        // rtl8723ae/hw.c::rtl8723e_read_eeprom_info selects the Wi-Fi EFUSE
+        // bank (REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SEL_0) before reading it.
+        if did == RTL_DEV_8723AE {
+            use super::rtl8723ae::adapter::{efuse_test_wifi_sel, REG_EFUSE_TEST};
+            // SAFETY: BAR2 mapped (length covers REG_EFUSE_ACCESS) and owned.
+            unsafe {
+                let value = registers.read32(u64::from(REG_EFUSE_TEST));
+                registers.write32(u64::from(REG_EFUSE_TEST), efuse_test_wifi_sel(value));
+            }
+        }
+
         // SAFETY: BAR2 mapped and owned, with EFUSE read clocks configured by
         // the helper. PCI function selects the dual-MAC 8192DE factory address.
         let factory =

@@ -203,7 +203,7 @@ fn smoke_rtlwifi_fw_blob_name_by_chip() -> TestResult {
         (RTL_DEV_8192CE_ALT, "rtlwifi/rtl8192cfw.bin"),
         (RTL_DEV_8192DE, "rtlwifi/rtl8192defw.bin"),
         (RTL_DEV_8192EE, "rtlwifi/rtl8192eefw.bin"),
-        (RTL_DEV_8723AE, "rtlwifi/rtl8723aefw.bin"),
+        (RTL_DEV_8723AE, "rtlwifi/rtl8723fw.bin"),
         (RTL_DEV_8723BE, "rtlwifi/rtl8723befw.bin"),
         (RTL_DEV_8821AE, "rtlwifi/rtl8821aefw.bin"),
     ];

@@ -98,6 +98,7 @@ pub(crate) mod wmm;
 pub mod rtl8188ee;
 pub mod rtl8192ce;
 pub mod rtl8192ee;
+pub mod rtl8723ae;
 pub mod rtl8723be;
 pub mod rtl8821ae;
 
