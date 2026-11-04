@@ -1754,14 +1754,27 @@ pub fn rx_vlan_enable(version: RtlVersion) -> (u16, u16) {
     }
 }
 
-/// Find the vendor-specific (class 0xFF) interface's bulk pair in
-/// a configuration-descriptor blob. Returns
-/// `(bulk_in_ep, bulk_out_ep)` as xHCI endpoint configs.
-pub fn find_rtl_endpoints(cfg: &[u8]) -> Option<(EndpointConfig, EndpointConfig)> {
+/// Walk the vendor-specific (class 0xFF) interface's endpoints
+/// in a configuration-descriptor blob. Returns
+/// `(bulk_in, bulk_out, interrupt_in)` as xHCI endpoint configs
+/// (each `None` when absent; last descriptor wins per slot).
+/// The interrupt entry carries the descriptor's own `bInterval`
+/// (byte 6) — the device's designed polling rate, not an
+/// invented one. Bulk entries keep interval 0 (irrelevant for
+/// bulk). One walk feeds both accessors below, so the bulk-pair
+/// result cannot drift from the interrupt result.
+fn walk_rtl_endpoints(
+    cfg: &[u8],
+) -> (
+    Option<EndpointConfig>,
+    Option<EndpointConfig>,
+    Option<EndpointConfig>,
+) {
     let mut i = 0usize;
     let mut in_vendor_iface = false;
     let mut bulk_in: Option<EndpointConfig> = None;
     let mut bulk_out: Option<EndpointConfig> = None;
+    let mut interrupt_in: Option<EndpointConfig> = None;
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
         if len < 2 || i + len > cfg.len() {
@@ -1775,32 +1788,61 @@ pub fn find_rtl_endpoints(cfg: &[u8]) -> Option<(EndpointConfig, EndpointConfig)
             let ep_addr = cfg[i + 2];
             let attrs = cfg[i + 3];
             let max_packet = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]) & 0x07FF;
-            if attrs & 0x03 == 2 {
-                // Bulk endpoint.
-                let is_in = ep_addr & 0x80 != 0;
-                let ep = EndpointConfig {
-                    ep_addr,
-                    max_packet,
-                    kind: if is_in {
-                        EndpointKind::BulkIn
+            let is_in = ep_addr & 0x80 != 0;
+            match attrs & 0x03 {
+                2 => {
+                    // Bulk endpoint.
+                    let ep = EndpointConfig {
+                        ep_addr,
+                        max_packet,
+                        kind: if is_in {
+                            EndpointKind::BulkIn
+                        } else {
+                            EndpointKind::BulkOut
+                        },
+                        interval: 0,
+                    };
+                    if is_in {
+                        bulk_in = Some(ep);
                     } else {
-                        EndpointKind::BulkOut
-                    },
-                    interval: 0,
-                };
-                if is_in {
-                    bulk_in = Some(ep);
-                } else {
-                    bulk_out = Some(ep);
+                        bulk_out = Some(ep);
+                    }
                 }
+                3 if is_in => {
+                    // Interrupt-IN endpoint (AX88179 link-status
+                    // channel; r8152 ignores it).
+                    interrupt_in = Some(EndpointConfig {
+                        ep_addr,
+                        max_packet,
+                        kind: EndpointKind::InterruptIn,
+                        interval: cfg[i + 6],
+                    });
+                }
+                _ => {}
             }
         }
         i += len;
     }
-    match (bulk_in, bulk_out) {
-        (Some(i), Some(o)) => Some((i, o)),
+    (bulk_in, bulk_out, interrupt_in)
+}
+
+/// Find the vendor-specific (class 0xFF) interface's bulk pair in
+/// a configuration-descriptor blob. Returns
+/// `(bulk_in_ep, bulk_out_ep)` as xHCI endpoint configs.
+pub fn find_rtl_endpoints(cfg: &[u8]) -> Option<(EndpointConfig, EndpointConfig)> {
+    match walk_rtl_endpoints(cfg) {
+        (Some(i), Some(o), _) => Some((i, o)),
         _ => None,
     }
+}
+
+/// Find the vendor-specific (class 0xFF) interface's
+/// interrupt-IN endpoint in a configuration-descriptor blob, if
+/// any. Same walk as [`find_rtl_endpoints`] — not a second
+/// finder — so a blob yielding a bulk pair yields its
+/// interrupt endpoint from the same pass.
+pub fn find_rtl_interrupt_endpoint(cfg: &[u8]) -> Option<EndpointConfig> {
+    walk_rtl_endpoints(cfg).2
 }
 
 // ── Device table + publication ───────────────────────────────────
