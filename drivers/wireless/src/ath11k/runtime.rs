@@ -4462,18 +4462,43 @@ pub fn tx_ring_selector(rev: super::hw::HwRev, flow_hash: impl FnOnce() -> u32) 
 /// `device_caps` failure).
 pub type AhbStart<Io, Irq, Q> = (Arc<Shared<Io, Irq, Q>>, Result<[u8; 6], TransportError>);
 
-/// The AHB counterpart of [`start_pci`]'s runtime half, after
+/// The AHB counterpart of [`start_pci`], after
 /// `ath11k_core_qmi_firmware_ready`: the runtime over the ready core and
-/// its DP ([`Rt`] + [`Shared`]) and the MAC `device_caps` reports
-/// (`ath11k_mac_register`'s input). The netdev registration
-/// ([`super::iface::register_pci`]) is PCI-typed and not done here.
-pub fn start_ahb<Io: RtIo, Irq: DpIrq, Q: RtQmi>(
+/// its DP ([`Rt`] + [`Shared`]), the MAC `device_caps` reports, and the
+/// initial netdev registered by [`super::iface::register_ahb`]
+/// (`ath11k_mac_register`'s output). On a `device_caps` failure the
+/// runtime is still returned unregistered — the caller keeps it alive
+/// (see `AHB_RUNTIME`) because the firmware owns the core's memory
+/// until the device is torn down — mirroring `start_pci`'s
+/// `STRANDED_RT` handling.
+pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     core: Ath11kCore<CeHif<Io, Irq>, Q>,
     dp: Dp,
 ) -> AhbStart<Io, Irq, Q> {
     let rt = Rt::new(core, dp);
-    let mac = rt.device_caps().map(|c| c.mac_addr);
-    (Shared::new(rt, secure_random), mac)
+    let caps = match rt.device_caps() {
+        Ok(c) => c,
+        Err(e) => {
+            e.report("ath11k mac register");
+            return (Shared::new(rt, secure_random), Err(e));
+        }
+    };
+    let initial_reg = rt.core.reg_info.clone();
+    let shared = Shared::new(rt, secure_random);
+    let mac = super::mac::Mac::new(
+        Port(shared.clone(), 0),
+        Port(shared.clone(), 0),
+        caps.clone(),
+        super::mac::MacConfig::wcn6855(),
+        initial_reg.as_deref(),
+    );
+    let m = caps.mac_addr;
+    let name = super::iface::register_ahb(shared.clone(), mac, m);
+    log(format_args!(
+        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
+        name, m[0], m[1], m[2], m[3], m[4], m[5]
+    ));
+    (shared, Ok(m))
 }
 
 fn secure_random(out: &mut [u8]) -> Result<(), i32> {

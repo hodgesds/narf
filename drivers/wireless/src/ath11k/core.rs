@@ -268,13 +268,18 @@ impl FirmwareCrashDump {
 /// The QMI half of firmware start/stop.
 pub trait QmiFw {
     /// `ath11k_qmi_firmware_start(ab, mode)`.
+    ///
+    /// The future is `Send`: the runtime awaits QMI futures inside
+    /// spawned tasks (`Ath11kNetdev::run`'s recovery path), so a
+    /// transport whose futures are not `Send` cannot back a runtime
+    /// that registers a netdev.
     fn firmware_start(
         &mut self,
         mode: u32,
         shadow_reg_v2: &[u32],
-    ) -> impl Future<Output = Result<(), WlfwError>>;
+    ) -> impl Future<Output = Result<(), WlfwError>> + Send;
     /// `ath11k_qmi_firmware_stop`: `wlan_mode OFF`, errors only logged.
-    fn firmware_stop(&mut self) -> impl Future<Output = ()>;
+    fn firmware_stop(&mut self) -> impl Future<Output = ()> + Send;
     /// Service the transport after bring-up (Linux keeps the MHI
     /// controller's interrupts, the QMI handle and its QRTR socket alive):
     /// MHI state changes / SYS_ERR / RDDM, QMI indications. Returns a
@@ -291,7 +296,7 @@ pub trait QmiFw {
     /// Preserve a transport-owned firmware crash dump, if one exists, before
     /// the radio reset destroys the source buffers. The default transport has
     /// no such dump and is deliberately a no-op.
-    fn collect_crash_dump(&mut self) -> impl Future<Output = ()> {
+    fn collect_crash_dump(&mut self) -> impl Future<Output = ()> + Send {
         async {}
     }
     /// Transfer a completed transport dump to the physical-radio diagnostic
@@ -304,16 +309,21 @@ pub trait QmiFw {
     /// `ath11k_hif_power_down` + `ath11k_hif_power_up` first; then the QMI
     /// event work until FW_INIT_DONE / FW_READY. The default cannot
     /// recover.
-    fn recover(&mut self, _power_cycle: bool) -> impl Future<Output = Result<(), WlfwError>> {
+    fn recover(
+        &mut self,
+        _power_cycle: bool,
+    ) -> impl Future<Output = Result<(), WlfwError>> + Send {
         async { Err(WlfwError::new(wlfw::step::UNSUPPORTED, 1, EOPNOTSUPP)) }
     }
 }
 
 impl<P, F, A> QmiFw for wlfw::Wlfw<P, F, A>
 where
-    P: super::qmi_client::QrtrPipe,
-    F: wlfw::FirmwareLoader,
-    A: wlfw::DmaAllocator,
+    P: super::qmi_client::QrtrPipe + Send,
+    F: wlfw::FirmwareLoader + Send,
+    A: wlfw::DmaAllocator + Send,
+    <F as wlfw::FirmwareLoader>::Blob: Send,
+    <A as wlfw::DmaAllocator>::Mem: Send,
 {
     async fn firmware_start(&mut self, mode: u32, shadow_reg_v2: &[u32]) -> Result<(), WlfwError> {
         wlfw::Wlfw::firmware_start(self, mode, shadow_reg_v2).await
