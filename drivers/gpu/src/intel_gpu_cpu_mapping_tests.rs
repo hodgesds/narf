@@ -406,6 +406,7 @@ fn smoke_intel_vram_runtime_suspend_revokes_bar_mappings_and_gates_copies() -> T
     object.read(0, &mut byte).unwrap();
     assert_eq!(byte, [0x5a]);
 
+    REVOCATION_SPACES.lock().clear();
     drop(spaces);
     gem.close(handle).unwrap();
     drop(mapping);
