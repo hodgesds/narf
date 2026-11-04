@@ -737,7 +737,7 @@ mod smokes {
             "backlight/brightness-keys",
             "backlight/sysfs",
         ] {
-            if !names.iter().any(|n| *n == want) {
+            if !names.contains(&want) {
                 return TestResult::Fail("backlight initcall missing from composed boot");
             }
         }
