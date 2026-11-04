@@ -38,6 +38,7 @@ narf-init         = { path = "../../init" }
 narf-power        = { path = "../../power" }
 narf-aml          = { path = "../../aml" }
 narf-drivers-sdio = { path = "../sdio" }
+narf-drivers-spi  = { path = "../spi" }
 narf-drivers-usb  = { path = "../usb" }
 # Per-driver crate (promoted from the former src/mt7921/ module). Built-in
 # here; the same crate also builds to a loadable `.ko` via `cargo xtask

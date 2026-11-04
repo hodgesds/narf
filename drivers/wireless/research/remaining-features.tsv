@@ -8,7 +8,7 @@ ath9k	ar9462_enablement	AR9462 (168c:0034) native enablement	chip	drivers/wirele
 ath9k	ar9485_enablement	AR9485/AR1111 (168c:0032/0037) native enablement	chip	drivers/wireless/specification/ath9k.md	1188
 ath9k	ar9565_enablement	AR9565 (168c:0036) native enablement	chip	drivers/wireless/specification/ath9k.md	1192
 ath9k	ar9580_enablement	AR9580 (168c:0033) native enablement	chip	drivers/wireless/specification/ath9k.md	1189
-cyw43439	additional_host_ports	Additional SDIO/gSPI platform or host ports	chip	drivers/wireless/specification/cyw43439.md	534
+cyw43439	additional_host_ports	Step 1: gSPI Transport port (register/RAM access + TEST_RO link probe) over a registered SPI bus, plus SPI port discovery; platform SDHCI described but blocked on a drivers/sdio platform aperture; gSPI packet service remaindered (SDPCM-over-gSPI exchange ungrounded); row stays open	chip	drivers/wireless/specification/cyw43439.md	1163
 rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes	feature	drivers/wireless/specification/rtlwifi.md	1586
 rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rtl8192de dual-MAC per-function runtime (shared MAC/PHY ownership, dual-band tables) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1477
 rtlwifi	rtl8723ae	RTL8723AE retained runtime: firmware-event mailbox ported (c2h drain + BT info parse, implemented-not-wired); still open: BT coexistence mechanism, signed envelopes, packet-path admission	chip	drivers/wireless/specification/rtlwifi.md	3333
