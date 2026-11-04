@@ -2800,9 +2800,13 @@ impl State {
             .facts
             .filter(|f| f.did == 0xc821 && f.power_track_type == 0 && f.thermal[0] <= 63)
         {
-            // N21W tracks the HT20 TXAGC selection; it is not qualified for
-            // the N2xB HT40 selection, so a 40MHz association runs without it.
-            if self.ht.is_some() && self.ht40.is_none() && !super::band5::primary(self.channel) {
+            // N21W tracks the committed TXAGC selection: the HT20 indices
+            // on a 20MHz association, the N2xB HT40 indices (one-stream
+            // MCS0..7, as `ht40::write_power` commits them to 0x1d0c) on a
+            // 40MHz association. The grant's request identity binds the
+            // bound N2xB record, so an HT20 record cannot authorize HT40
+            // tracking and vice versa.
+            if self.ht.is_some() && !super::band5::primary(self.channel) {
                 if let Some(g) = io
                     .station_power_tracking_extension(facts.thermal[0], self.tracking.grant.clone())
                     .await?

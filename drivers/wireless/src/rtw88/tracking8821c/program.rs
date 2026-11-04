@@ -51,12 +51,25 @@ pub(super) fn bind(h: &mut narf_crypto::sha256::Sha256) {
     }
 }
 
+/// The MCS indices the AGC split narrows across: the bound N2xB HT40
+/// record's one-stream MCS0..7 at BW40 when a 40MHz association is bound
+/// (the indices `ht40::write_power` commits to 0x1d0c for C21), else the
+/// HT grant's HT20 tracking indices. Pure over its inputs so the rule is
+/// unit-testable without a Gate.
+pub(super) fn mcs_indices(ht40: Option<&crate::rtw88::ht40::Record>, ht: &[u8; 8]) -> [u8; 8] {
+    match ht40 {
+        Some(r) => r.indices[..8].try_into().expect("HT40 one-stream MCS0..7"),
+        None => *ht,
+    }
+}
+
 /// Linux's AGC split, narrowed across every programmed native TX/response
 /// rate because the hardware offset is global. This never infers RF dBm.
 fn select(g: &Grant, delta: i8) -> Result<Program, Error> {
     let limits = g.base.tracking_factory_limits().ok_or(Error::State)?;
     let legacy = g.base.c21_indices().ok_or(Error::State)?;
-    let mcs = g.base.ht_grant().ok_or(Error::State)?.tracking_indices();
+    let ht = g.base.ht_grant().ok_or(Error::State)?;
+    let mcs = mcs_indices(g.base.ht40_record().as_ref(), &ht.tracking_indices());
     let mut upper = 15i16;
     let mut lower = -15i16;
     for (i, index) in legacy.into_iter().chain(mcs).enumerate() {

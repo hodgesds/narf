@@ -12,6 +12,7 @@ use narf_firmware::FirmwareBlob;
 use narf_lib::sync::IrqSafeSpinLock;
 #[path = "tracking8821c/program.rs"]
 mod program;
+pub(super) use program::mcs_indices;
 pub(super) use program::Tracker;
 
 pub(super) const LENGTH: usize = 192;
@@ -99,13 +100,23 @@ pub(super) fn request(
         h.update(&s.to_le_bytes());
     }
     let mac = gate.own();
+    // HT20 and HT40 associations on one channel need distinct provisioned
+    // records (their identities differ via the N2xB marker in
+    // `tracking_identity`), so the HT40 variant gets its own filename.
+    // The HT20 filename is byte-identical to before.
+    let variant = if gate.ht40_record().is_some() {
+        "-ht40"
+    } else {
+        ""
+    };
     Ok(Request {
         identity: h.finalize(),
         mac,
         filename: super::channel_policy::scoped_filename(
             &format!(
-                "rtw88/{}-power-track-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                "rtw88/{}-power-track-v1{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
                 gate.host().family(),
+                variant,
                 mac[0],
                 mac[1],
                 mac[2],

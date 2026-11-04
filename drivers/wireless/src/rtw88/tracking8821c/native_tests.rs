@@ -508,6 +508,31 @@ fn smoke_rtw8821ce_power_tracking_cancelled_applied_iqk_keeps_publication_closed
 fn smoke_rtw8821ce_power_tracking_coding_actual_c2h_fallback_and_dm_composition() -> TestResult {
     check(coding_fallback_dm)
 }
+fn smoke_rtw8821ce_power_tracking_ht40_selects_bw40_indices() -> TestResult {
+    // C21 N2xB payload, mirroring the ht40 record tests: primary 1,
+    // secondary 5, one-stream MCS0..7 at BW40 [30, 30, 30, 30, 28, 28, 26, 26].
+    let mut p = [0; crate::rtw88::qualification::PAYLOAD];
+    p[0] = 1;
+    p[1] = 5;
+    p[2] = 40;
+    p[3] = 1;
+    for (at, v) in [(4, 4i16), (6, 76), (8, 44), (10, 40), (12, 40)] {
+        p[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    p[14..16].copy_from_slice(&0xffu16.to_le_bytes());
+    p[16..24].copy_from_slice(&[30, 30, 30, 30, 28, 28, 26, 26]);
+    let Some(r) = crate::rtw88::ht40::Record::decode(0xc821, &p) else {
+        return TestResult::Fail("valid C21 HT40 record refused");
+    };
+    let ht = [20, 20, 20, 20, 18, 18, 16, 16];
+    if power::mcs_indices(Some(&r), &ht) != [30, 30, 30, 30, 28, 28, 26, 26] {
+        return TestResult::Fail("HT40-bound tracking kept the HT20 indices");
+    }
+    if power::mcs_indices(None, &ht) != ht {
+        return TestResult::Fail("unbound tracking dropped the HT20 indices");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtw88/power_tracking/rtl8821c",
     smoke_rtw8821ce_power_tracking_open_fresh_meter_native_iqk_and_dhcp
@@ -539,4 +564,8 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/rtw88/power_tracking/rtl8821c",
     smoke_rtw8821ce_power_tracking_coding_actual_c2h_fallback_and_dm_composition
+);
+kernel_test_in!(
+    "drivers/wireless/rtw88/power_tracking/rtl8821c",
+    smoke_rtw8821ce_power_tracking_ht40_selects_bw40_indices
 );
