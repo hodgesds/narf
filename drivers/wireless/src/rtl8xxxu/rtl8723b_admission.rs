@@ -128,6 +128,10 @@ impl<I: ControlIo> Firmware<I> {
     /// `rtl8xxxu_gen2_config_channel`, only for the exact channel/width the
     /// signed permission qualifies for this retained device. Returns the
     /// admitted RA mask. A mismatch is refused before any transfer.
+    /// Callable on a `RadioReady` owner (start path) and on a receiving
+    /// owner (live retune, Linux `rtl8xxxu_config` while running): the
+    /// writes are EP0 register/RF programming that assume RF up, which
+    /// both stages satisfy; no stage transition happens here.
     pub(super) async fn tune_8723b(
         &self,
         permission: &Permission,
@@ -137,7 +141,7 @@ impl<I: ControlIo> Firmware<I> {
         use super::firmware_transport::Error as FwError;
         let factory = self.factory_8723b().ok_or(FwError::RuntimeState)?;
         let (vid, pid) = self.usb_identity().ok_or(FwError::RuntimeState)?;
-        if self.status().stage != Stage::RadioReady {
+        if !matches!(self.status().stage, Stage::RadioReady | Stage::Receiving) {
             return Err(FwError::RuntimeState);
         }
         let admitted = permission

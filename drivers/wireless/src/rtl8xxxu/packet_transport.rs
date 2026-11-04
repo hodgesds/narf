@@ -230,6 +230,31 @@ impl<I: Io> Owner<I> {
         self.channel = channel;
         Ok(())
     }
+    /// Live channel relabel of a receiving owner (gen2 F7): the posted RX
+    /// transfer stays posted — the channel is RF state programmed via
+    /// EP0, not per-transfer content — while the association state
+    /// (qos/ht/ampdu/scratch) resets exactly as the cold path resets it,
+    /// so an unbound radio never carries stale association programming
+    /// across a channel change. No TX may be outstanding: a TX descriptor
+    /// built for the old channel must never go out on the new one, so
+    /// the radio refuses a live retune with a TX in flight instead of
+    /// relabeling under it. A halted pipe refuses too (recover first).
+    pub(super) fn retarget_live(&mut self, channel: u8) -> Result<(), Error> {
+        self.check_live()?;
+        if !(1..=13).contains(&channel) {
+            return Err(Error::Channel);
+        }
+        if self.transmit.is_some() || self.is_halted() {
+            return Err(Error::Busy);
+        }
+        self.qos = false;
+        self.ht = false;
+        self.wide = None;
+        self.ampdu = None;
+        self.scratch.fill(0);
+        self.channel = channel;
+        Ok(())
+    }
     pub fn is_failed(&self) -> bool {
         self.failed
     }
