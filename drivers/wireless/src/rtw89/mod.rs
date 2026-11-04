@@ -63,6 +63,7 @@ mod channel_bb;
 mod channel_c;
 mod channel_rf;
 mod channel_transition;
+mod chip_8922a;
 mod coex_native;
 mod cold;
 mod cold_native;
@@ -76,6 +77,7 @@ mod download_dma;
 mod download_plan;
 mod dpk;
 pub mod efuse;
+mod efuse_be;
 mod endpoints;
 mod factory;
 mod factory_51;
@@ -95,6 +97,7 @@ mod he_htc;
 mod interface;
 mod iqk;
 mod irq;
+mod irq_be;
 mod lps;
 mod lps_packets;
 mod lps_wire;
@@ -125,6 +128,7 @@ mod power_regs;
 mod power_tables;
 mod prepared;
 mod qos;
+mod ra_v1;
 mod radio_51;
 mod radio_assets;
 mod radio_c;
@@ -161,6 +165,7 @@ mod tssi;
 mod tx_amsdu;
 pub mod tx_transport;
 pub mod txrx;
+mod txrx_be;
 mod wow_security;
 mod wow_trx;
 mod wow_wire;
@@ -234,6 +239,21 @@ pub fn register() {
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod efuse_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod chip_8922a_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod efuse_be_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod irq_be_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod ra_v1_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod txrx_be_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
