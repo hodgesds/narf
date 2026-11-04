@@ -18,7 +18,7 @@ pub const RTL2832U_PID: u16 = 0x2832;
 pub static RTL2832U_MATCH: [UsbClassMatch; 1] =
     [UsbClassMatch::vid_pid(RTL2832U_VID, RTL2832U_PID)];
 
-pub fn probe(_device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
+pub fn probe(_device: Arc<USBDevice>, _hub_port: Option<(u8, u8)>) -> Result<(), UsbProbeError> {
     let _ = writeln!(
         Writer,
         "  media: RTL2832U SDR / DVB-T USB device driver bound!"

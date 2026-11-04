@@ -354,7 +354,6 @@ async fn wake_suspended_nic_ports(controller: &xhci::Xhci) {
 /// Loops pumping interrupt-IN reports onto the global input ring
 /// between wakes.
 fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
-
     // Stackful: USB HID supervisor's enumeration loop polls xHCI
     // MMIO + per-port reset state. Preemption-capped at the
     // default 10 ms slice so a stuck port can't starve init.
