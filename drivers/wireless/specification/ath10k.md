@@ -1938,8 +1938,14 @@ implements both. Under the RAW decap of every NARF station,
 `ath10k_vif_wow_set_wakeups` never copies the cfg80211 pattern into its
 zero-initialised `new_pattern` and programs zero-length patterns, so NARF
 advertises zero patterns there instead of that no-op. `WMI_SERVICE_NLO`
-net-detect (`ath10k_wmi_tlv_op_gen_config_pno_start`) is not implemented
-and stays unadvertised.
+net-detect is implemented (`ath10k_wmi_tlv_op_gen_config_pno_start`):
+the TLV NLO start command (tag 144, 112-byte fixed command plus
+76-byte network records, command 0x18001) is armed on the
+associated-station WoW path and stopped on resume, and is advertised
+only when the firmware reports the NLO service (16 match sets, random
+MAC). Disconnected net-detect remains open: the driver has no
+disconnected WoW suspend path, so an unassociated station suspends
+ordinarily.
 
 **Wire (`wmi-tlv.c`).** GRP_WOW 0x13: ADD_WAKE_PATTERN 0x13001 (tag179
 command, ARRAY_STRUCT of the 148+148-byte bitmap tag180, empty IPv4/IPv6
@@ -2354,9 +2360,17 @@ will bind; none of them grants RF, peer, key or data authority.
   client's station prepare binds; a netdev scan replaces the table it
   observed. Either scan keeps every station slot's associated BSS (home
   and P2P client) that it did not observe. An
-  unstarted wdev is `-EIO`; a ROC in flight, a station peer or an AP is
-  `-EBUSY` before publication (a P2P scan concurrent with an associated
-  station is not supported: the associated dwell owner is vdev0-only).
+  unstarted wdev is `-EIO`; a ROC in flight, a prepared-but-unassociated
+  station peer or an AP is `-EBUSY` before publication. A P2P scan
+  concurrent with an associated station is supported: Linux runs the
+  requesting vif's scan on its own vdev with no associated-state check
+  (`mac.c::ath10k_hw_scan`), and firmware owns dwell and the home
+  return; the plan's station binding is carried for setup/restore only,
+  and every restore packet is sent on completion. Home-station data
+  stalls for the scan duration (the host loop holds the radio; bounded
+  by the 25 s deadline), and a failed P2P scan while associated still
+  fails the radio, as a failed managed associated scan does. A P2P scan
+  beside a GO is still refused at the radio layer (remainder).
 
 - **P2P client netdev** (`interface_p2p_client.rs`, iftype 8, gated by
   `P2P_ADVERTISED`). `NEW_INTERFACE` reaches the legacy
@@ -2411,7 +2425,14 @@ will bind; none of them grants RF, peer, key or data authority.
   unpublished. WPS provisioning
   over the client netdev is not supported (no host EAP-WSC path), so a
   group is joined with WPA2-PSK credentials (persistent group or
-  pre-provisioned PSK).
+  pre-provisioned PSK). A host EAP-WSC path would be an in-kernel WSC
+  enrollee programme, not a small lane: EAP identity exchange plus the
+  M1–M8 state machine, the WSC TLV codec, KDK derivation, AES key-wrap
+  unwrap (RFC 3394) and a credential handoff to the existing PSK join
+  path, for PBC and PIN modes. Today EAP type-0 frames are dropped at
+  the port filter (EAPOL-Key only) and the shared supplicant handles
+  Key frames only, so admitting them without an enrollee would deliver
+  nothing.
 
 - **Advertisement.** `P2P_ADVERTISED = true`; each radio further needs
   the facts `mac.c::ath10k_mac_register` uses (`CombinationFacts`, read
@@ -2427,8 +2448,7 @@ will bind; none of them grants RF, peer, key or data authority.
   NEW_INTERFACE. Unsupported, explicitly: WPS provisioning on the client
   netdev, a second P2P client or GO (one slot each, one AP session),
   host-programmed CTWindow/OppPS (`supports_p2p_go_power_save` false,
-  as Linux ath10k), the MAIN-dialect P2P path, and a P2P_DEVICE scan
-  concurrent with an associated station.
+  as Linux ath10k) and the MAIN-dialect P2P path.
 Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_vdev_create_roles`,
 `smoke_ath10k_p2p_vdev_map_lowest_free`,
@@ -2677,7 +2697,8 @@ Across the reached rows, concrete remaining software packages are
 DFS qualification (VHT20/40/80, the bounded 80+80 owner and contiguous VHT160
 are implemented; contiguous VHT160 awaits release/native validation); physical acceptance of the §3.4 hardware key offload;
 P2P roles; wake offload is implemented in §3.6 (TLV + WOWLAN + RAW images;
-net-detect not implemented) and awaits release/native validation;
+net-detect implemented on the associated WoW path, disconnected
+net-detect open) and awaits release/native validation;
 DT/NVMEM calibration sources are implemented (nvmem-rmem provider only) and await native validation.
 Automatic credential replay after recovery is implemented (§ recovery, rebind)
 and awaits coordinated release/native acceptance.

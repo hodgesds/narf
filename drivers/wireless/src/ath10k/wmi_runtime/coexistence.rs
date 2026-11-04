@@ -251,7 +251,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         associated_scan::receive_permission(domain, &state.channels)?;
         let report = self
-            .scan_run(&state.channels, (&[], &[]), &[], None, || {
+            .scan_run(&state.channels, (&[], &[]), &[], &[], || {
                 validate()?;
                 associated_scan::receive_permission(domain, &state.channels)
             })

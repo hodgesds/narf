@@ -16,12 +16,55 @@
 //! Keys stay in the firmware key cache and host PN/replay counters stay in
 //! the retained station owner; neither is reset by this sequence.
 use super::*;
+use crate::ath11k::wmi::NloConfig;
 use narf_wireless::{WowlanConfig, WowlanSupport};
 
 /// `ATH10K_FW_FEATURE_WOWLAN_SUPPORT`.
 const FEATURE_WOWLAN: u64 = 1 << 6;
 /// `WMI_TLV_SERVICE_WOW` / `WMI_TLV_SERVICE_NLO`.
 const SERVICE_WOW: usize = 13;
+/// `WMI_TLV_SERVICE_NLO` (`wmi-tlv.h` service enum: BEACON_OFFLOAD 0 ..
+/// ARPNS_OFFLOAD 16, NLO 17).
+const SERVICE_NLO: usize = 17;
+/// `WMI_TLV_NETWORK_LIST_OFFLOAD_CONFIG_CMDID` =
+/// `WMI_TLV_CMD(WMI_TLV_GRP_NLO_OFL)` = (0x18 << 12) | 0x1. The NLO match
+/// event shares the value in the event space.
+const NLO_CONFIG: u32 = 0x18001;
+/// `WMI_TLV_TAG_STRUCT_NLO_CONFIG_CMD`.
+const TAG_NLO_CONFIG: u32 = 144;
+/// `WOW_NLO_DETECTED_EVENT` (`enum wmi_wow_wakeup_event`: BMISS 0 ..
+/// EAPOL 6, NLO 7, DISASSOC 8, PATTERN 9, CSA 10).
+const NLO_DETECTED: u32 = 7;
+/// `WMI_NLO_MAX_SSIDS` = `WMI_PNO_MAX_SUPP_NETWORKS` =
+/// `WLAN_SCAN_PARAMS_MAX_SSID`.
+const NLO_MAX_SSIDS: usize = 16;
+/// `WMI_PNO_MAX_NETW_CHANNELS_EX`.
+const NLO_MAX_CHANNELS: usize = 60;
+/// `WMI_ACTIVE_MAX_CHANNEL_TIME` / `WMI_PASSIVE_MAX_CHANNEL_TIME` (ms).
+/// NARF's `NloConfig` carries no dwell fields, so Linux's fixed pair is
+/// programmed exactly as ath11k does.
+const NLO_ACTIVE_DWELL_MS: u32 = 40;
+const NLO_PASSIVE_DWELL_MS: u32 = 110;
+/// `WMI_NLO_CONFIG_*` flags.
+const NLO_CONFIG_STOP: u32 = 1 << 0;
+const NLO_CONFIG_START: u32 = 1 << 1;
+const NLO_CONFIG_SSID_HIDE_EN: u32 = 1 << 6;
+const NLO_CONFIG_SCAN_PASSIVE: u32 = 1 << 8;
+const NLO_CONFIG_SPOOFED_MAC: u32 = 1 << 10;
+const NLO_CONFIG_RANDOM_SEQ: u32 = 1 << 11;
+/// Fixed `wmi_tlv_wow_nlo_config_cmd` body (`__packed`): 14 u32, two
+/// 8-byte `wmi_mac_addr` unions (6-byte address + 2 pad), 8 u32 IE bitmap,
+/// 2 u32. Matches ath11k's `WMI_NLO_FIXED_LEN` minus its TLV header.
+const NLO_CMD_LEN: usize = 112;
+/// One `nlo_configured_parameters` record (`__packed`): TLV header +
+/// ssid param (valid + len + 32) + enc (8) + auth (8) + rssi (8) +
+/// bcast (8). Matches ath11k's `WMI_NLO_NETWORK_LEN`.
+const NLO_NETWORK_LEN: usize = 76;
+/// `WMI_NLO_MAX_SCAN_PLANS` and the plan bounds ath11k enforces on the
+/// same shared `NloConfig`.
+const NLO_MAX_PLANS: usize = 2;
+const NLO_MAX_PLAN_INTERVAL_SECS: u32 = 7200;
+const NLO_MAX_PLAN_ITERATIONS: u32 = 100;
 // `wmi-tlv.h` WMI_TLV_GRP_WOW (0x13) command and event identities.
 const ADD_PATTERN: u32 = 0x13001;
 const DEL_PATTERN: u32 = 0x13002;
@@ -78,8 +121,10 @@ pub(in crate::ath10k) enum Decap {
 /// `ath10k_vif_wow_set_wakeups` never copies the cfg80211 pattern into the
 /// zero-initialised `new_pattern` and so programs zero-length patterns;
 /// NARF therefore advertises no patterns for RAW instead of that no-op.
-/// NET_DETECT (`WMI_SERVICE_NLO`) is not implemented and not advertised.
-pub(in crate::ath10k) fn support(decap: Decap) -> WowlanSupport {
+/// NET_DETECT is advertised only with `WMI_TLV_SERVICE_NLO` (Linux
+/// `ath10k_wow_init` sets `WIPHY_WOWLAN_NET_DETECT` + `max_nd_match_sets`
+/// exactly there); without it a net-detect configuration is refused.
+pub(in crate::ath10k) fn support(decap: Decap, nlo: bool) -> WowlanSupport {
     let (max_patterns, min, max, offset) = match decap {
         Decap::Raw => (0, 0, 0, 0),
         Decap::NativeWifi => (
@@ -98,8 +143,8 @@ pub(in crate::ath10k) fn support(decap: Decap) -> WowlanSupport {
         min_pattern_len: min,
         max_pattern_len: max,
         max_packet_offset: offset,
-        net_detect_max_match_sets: 0,
-        net_detect_random_mac: false,
+        net_detect_max_match_sets: if nlo { NLO_MAX_SSIDS as u8 } else { 0 },
+        net_detect_random_mac: nlo,
     }
 }
 
@@ -118,16 +163,24 @@ pub(in crate::ath10k) struct Program {
     /// Bit `n` enables `enum wmi_wow_wakeup_event` value `n`.
     pub events: u32,
     pub patterns: Vec<Pattern>,
+    /// Validated net-detect configuration, programmed by `wow_suspend`
+    /// before `WOW_ENABLE` and stopped by `wow_resume` (Linux
+    /// `ath10k_vif_wow_set_wakeups` + `ath10k_wow_nlo_cleanup`).
+    pub nlo: Option<NloConfig>,
 }
 
 impl Program {
     /// Re-validate a retained cfg80211 configuration against `support`.
-    pub(in crate::ath10k) fn new(config: &WowlanConfig, decap: Decap) -> Result<Self, Error> {
-        let limits = support(decap);
-        if config.gtk_rekey_failure
-            || config.net_detect.is_some()
-            || config.patterns.len() > usize::from(limits.max_patterns)
-        {
+    /// `nlo` is whether the firmware advertises `WMI_TLV_SERVICE_NLO`;
+    /// a net-detect configuration without it is refused, as Linux
+    /// refuses `nd_config` without the service.
+    pub(in crate::ath10k) fn new(
+        config: &WowlanConfig,
+        decap: Decap,
+        nlo: bool,
+    ) -> Result<Self, Error> {
+        let limits = support(decap, nlo);
+        if config.gtk_rekey_failure || config.patterns.len() > usize::from(limits.max_patterns) {
             return Err(Error::Unsupported);
         }
         let mut events = 0;
@@ -137,6 +190,15 @@ impl Program {
         if config.magic_packet {
             events |= 1 << MAGIC;
         }
+        let nlo_config = match &config.net_detect {
+            Some(nlo_config) if nlo => {
+                validate_nlo(nlo_config)?;
+                events |= 1 << NLO_DETECTED;
+                Some(nlo_config.clone())
+            }
+            Some(_) => return Err(Error::Unsupported),
+            None => None,
+        };
         let mut patterns = Vec::new();
         patterns
             .try_reserve_exact(config.patterns.len())
@@ -169,7 +231,59 @@ impl Program {
             patterns.push(converted);
             events |= 1 << PATTERN;
         }
-        Ok(Self { events, patterns })
+        Ok(Self {
+            events,
+            patterns,
+            nlo: nlo_config,
+        })
+    }
+}
+
+/// Bounds shared by `Program::new` validation and the NLO command
+/// builders (ath11k's `nlo_plan_params` on the same shared `NloConfig`):
+/// at least one network, at most `WMI_NLO_MAX_SSIDS` networks and probe
+/// SSIDs, at most `WMI_NLO_MAX_CHANNELS` channels, 512 retained probe-IE
+/// bytes, and 1–2 scan plans whose intervals are 1–7200 s and whose
+/// non-final iteration counts are 1–100. Returns
+/// (fast period ms, slow period ms, fast max cycles).
+fn validate_nlo(config: &NloConfig) -> Result<(u32, u32, u32), Error> {
+    if config.networks.is_empty()
+        || config.networks.len() > NLO_MAX_SSIDS
+        || config.probe_ssids.len() > NLO_MAX_SSIDS
+        || config.probe_ssids.iter().any(|ssid| ssid.len() > 32)
+        || config.channels_mhz.len() > NLO_MAX_CHANNELS
+        || config.probe_ies.len() > 512
+        || config
+            .networks
+            .iter()
+            .any(|network| network.ssid.is_empty() || network.ssid.len() > 32)
+    {
+        return Err(Error::Unsupported);
+    }
+    if config.plans.is_empty() || config.plans.len() > NLO_MAX_PLANS {
+        return Err(Error::Unsupported);
+    }
+    for (index, (interval, iterations)) in config.plans.iter().enumerate() {
+        if *interval == 0 || *interval > NLO_MAX_PLAN_INTERVAL_SECS {
+            return Err(Error::Unsupported);
+        }
+        if index + 1 == config.plans.len() {
+            if iterations.is_some() {
+                return Err(Error::Unsupported);
+            }
+        } else if !matches!(iterations, Some(1..=NLO_MAX_PLAN_ITERATIONS)) {
+            return Err(Error::Unsupported);
+        }
+    }
+    let millis = |seconds: u32| seconds * 1000;
+    if config.plans.len() == 1 {
+        Ok((millis(config.plans[0].0), millis(config.plans[0].0), 1))
+    } else {
+        Ok((
+            millis(config.plans[0].0),
+            millis(config.plans[1].0),
+            config.plans[0].1.unwrap_or(1),
+        ))
     }
 }
 
@@ -307,6 +421,88 @@ pub(in crate::ath10k) fn add_pattern(
     Ok(out)
 }
 
+/// `ath10k_wmi_tlv_op_gen_config_pno_start` (`wmi_tlv_wow_nlo_config_cmd`
+/// + ARRAY_STRUCT of ARRAY_BYTE-tagged 76-byte records + ARRAY_UINT32
+/// channels). Layout, all little-endian: WMI header (command 0x18001),
+/// TLV 144 len 112, then flags, vdev, fast max cycles, active/passive
+/// dwell, probe-bundle/rest/max-rest/backoff zeros, fast/slow periods,
+/// SSID count, channel count, start delay, two 8-byte MAC unions
+/// (6-byte address + 2 pad), 8-word zero IE bitmap, zero vendor-OUI and
+/// connected-NLO counts. Each record: TLV 17 len 72, ssid valid + length
+/// + 32-byte SSID, zero enc/auth params, rssi valid + value (only when
+/// the threshold is nonzero and above -300, as Linux), bcast valid +
+/// hidden 2 / ordinary 0. Channels are centre frequencies in MHz, as
+/// Linux copies `nd_config->channels[].center_freq`.
+/// The start delay is passed through raw: Linux copies
+/// `nd_config->delay` unchanged into the field the struct comment calls
+/// milliseconds, and NARF matches that wire behavior.
+pub(in crate::ath10k) fn nlo_config_start(vdev: u32, config: &NloConfig) -> Result<Vec<u8>, Error> {
+    let (fast_period, slow_period, fast_cycles) = validate_nlo(config)?;
+    let networks = config.networks.len();
+    let channels = config.channels_mhz.len();
+    let mut out = wire::packet(NLO_CONFIG, 124 + networks * NLO_NETWORK_LEN + channels * 4)?;
+    tlv(&mut out, 4, TAG_NLO_CONFIG, NLO_CMD_LEN);
+    let mut flags = NLO_CONFIG_START | NLO_CONFIG_SSID_HIDE_EN;
+    if config.probe_ssids.is_empty() {
+        flags |= NLO_CONFIG_SCAN_PASSIVE;
+    }
+    if config.random_mac.is_some() {
+        flags |= NLO_CONFIG_SPOOFED_MAC | NLO_CONFIG_RANDOM_SEQ;
+    }
+    wire::put(&mut out, 8, flags);
+    wire::put(&mut out, 12, vdev);
+    wire::put(&mut out, 16, fast_cycles);
+    wire::put(&mut out, 20, NLO_ACTIVE_DWELL_MS);
+    wire::put(&mut out, 24, NLO_PASSIVE_DWELL_MS);
+    wire::put(&mut out, 44, fast_period);
+    wire::put(&mut out, 48, slow_period);
+    wire::put(&mut out, 52, networks as u32);
+    wire::put(&mut out, 56, channels as u32);
+    wire::put(&mut out, 60, config.delay_secs);
+    if let Some(random_mac) = &config.random_mac {
+        out[64..70].copy_from_slice(&random_mac.addr);
+        out[72..78].copy_from_slice(&random_mac.mask);
+    }
+    let mut at = 120;
+    tlv(&mut out, at, TAG_ARRAY_STRUCT, networks * NLO_NETWORK_LEN);
+    at += 4;
+    for network in &config.networks {
+        tlv(&mut out, at, TAG_ARRAY_BYTE, NLO_NETWORK_LEN - 4);
+        wire::put(&mut out, at + 4, 1);
+        wire::put(&mut out, at + 8, network.ssid.len() as u32);
+        out[at + 12..at + 12 + network.ssid.len()].copy_from_slice(&network.ssid);
+        if let Some(rssi) = network
+            .rssi_threshold_dbm
+            .filter(|rssi| *rssi != 0 && *rssi > -300)
+        {
+            wire::put(&mut out, at + 60, 1);
+            wire::put(&mut out, at + 64, rssi as u32);
+        }
+        wire::put(&mut out, at + 68, 1);
+        wire::put(&mut out, at + 72, u32::from(network.hidden) * 2);
+        at += NLO_NETWORK_LEN;
+    }
+    tlv(&mut out, at, TAG_ARRAY_UINT32, channels * 4);
+    at += 4;
+    for channel in &config.channels_mhz {
+        wire::put(&mut out, at, *channel);
+        at += 4;
+    }
+    Ok(out)
+}
+
+/// `ath10k_wmi_tlv_op_gen_config_pno_stop`: the complete fixed NLO
+/// header with only the STOP bit and vdev id meaningful (ath11k's stop
+/// form). Sent by `wow_resume` after the wake report, as Linux's
+/// `ath10k_wow_nlo_cleanup` runs after `ath10k_wow_wakeup`.
+pub(in crate::ath10k) fn nlo_config_stop(vdev: u32) -> Result<Vec<u8>, Error> {
+    let mut out = wire::packet(NLO_CONFIG, 116)?;
+    tlv(&mut out, 4, TAG_NLO_CONFIG, NLO_CMD_LEN);
+    wire::put(&mut out, 8, NLO_CONFIG_STOP);
+    wire::put(&mut out, 12, vdev);
+    Ok(out)
+}
+
 /// `struct wmi_wow_ev_arg` plus the event's raw `wow_packet_buffer` (the
 /// shared contract has no `ieee80211_report_wowlan_wakeup`; Linux ath10k
 /// only logs the reason and never decodes the buffer, so neither does NARF).
@@ -385,14 +581,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// `ath10k_wow_init`: TLV dialect, firmware WOWLAN feature and service.
     /// The station data owner (RAW, or native WiFi with hardware keys on
     /// TLV firmware without `RAW_MODE_SUPPORT`) is also required before
-    /// anything is advertised.
+    /// anything is advertised. NET_DETECT is a separate service bit: its
+    /// absence only withholds the net-detect fields, never the whole
+    /// WoWLAN advertisement (Linux `ath10k_wow_init`).
     pub(in crate::ath10k) fn wowlan_support(&self) -> Option<WowlanSupport> {
         let caps = self.htt.wmi.caps.as_ref()?;
         (self.wire.dialect == Dialect::Tlv
             && self.features & FEATURE_WOWLAN != 0
             && caps.service(Dialect::Tlv, SERVICE_WOW)
             && self.data_supported())
-        .then(|| support(self.wow_decap()))
+        .then(|| support(self.wow_decap(), caps.service(Dialect::Tlv, SERVICE_NLO)))
     }
     pub(in crate::ath10k) fn wow_armed(&self) -> bool {
         self.wow_armed
@@ -427,7 +625,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let vdev = u32::from(self.station.peer.as_ref().ok_or(Error::Failed)?.vdev);
         // All commands are encoded before the first publication.
         let mut commands = Vec::new();
-        let count = (EVENT_MAX + PATTERNS) as usize + program.patterns.len() + EVENT_MAX as usize;
+        let count = (EVENT_MAX + PATTERNS) as usize
+            + program.patterns.len()
+            + EVENT_MAX as usize
+            + usize::from(program.nlo.is_some());
         commands
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
@@ -440,6 +641,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         for (id, pattern) in program.patterns.iter().enumerate() {
             commands.push(add_pattern(vdev, id as u32, pattern)?);
+        }
+        // `ath10k_vif_wow_set_wakeups` programs the PNO configuration as
+        // part of wakeup setup; the NLO_DETECTED event bit is already in
+        // `program.events`, so the loop below enables it like the rest.
+        if let Some(nlo) = &program.nlo {
+            commands.push(nlo_config_start(vdev, nlo)?);
         }
         for event in (0..EVENT_MAX).filter(|e| program.events & (1 << e) != 0) {
             commands.push(wakeup_event(vdev, event, true)?);
@@ -476,12 +683,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         self.wow_armed = true;
+        self.nlo_vdev = program.nlo.is_some().then_some(vdev);
         self.failed = false;
         Ok(())
     }
     /// `ath10k_wow_op_resume` after `ath10k_hif_resume`: HOSTWAKEUP, then the
-    /// firmware's WOW_WAKEUP_HOST within 3 s. Errors leave the owner failed;
-    /// Linux then marks the device RESTARTING for a full reconfiguration.
+    /// firmware's WOW_WAKEUP_HOST within 3 s, then the PNO stop for a
+    /// net-detect suspend (`ath10k_wow_nlo_cleanup` after
+    /// `ath10k_wow_wakeup`). Errors leave the owner failed; Linux then
+    /// marks the device RESTARTING for a full reconfiguration.
     pub(in crate::ath10k) async fn wow_resume(&mut self) -> Result<WakeReport, Error> {
         if self.failed || !self.wow_armed {
             return Err(Error::Failed);
@@ -489,6 +699,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let command = host_wakeup()?;
         self.failed = true;
         self.wow_armed = false;
+        // Taken up front so a timed-out resume leaves no stale vdev for a
+        // later suspend to inherit; only a wake report spends it.
+        let nlo_vdev = self.nlo_vdev.take();
         self.send_all(core::slice::from_ref(&command)).await?;
         let deadline = narf_time::Deadline::after_ms(WOW_MS);
         loop {
@@ -501,6 +714,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Idle | htt::Event::Progress => {}
                 htt::Event::Wmi(bytes) if wire::word(&bytes, 0)? & 0xffffff == WAKEUP_EVENT => {
                     let report = wake_event(&bytes[4..])?;
+                    if let Some(vdev) = nlo_vdev {
+                        let stop = nlo_config_stop(vdev)?;
+                        self.send_all(core::slice::from_ref(&stop)).await?;
+                    }
                     self.failed = false;
                     return Ok(report);
                 }
