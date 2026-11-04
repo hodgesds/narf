@@ -1336,6 +1336,15 @@ pub struct E1000 {
     /// `rx_ipc_ring`; the in-kernel TCP stack otherwise pays no copy/allocation.
     rx_mirror_enabled: AtomicBool,
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    /// Set by `detach_device`: every datapath entry point fails fast
+    /// once this is set (igb pattern, spec §3 / issue #789). The async
+    /// pumps are not torn down on detach — they hold `Arc<E1000>` —
+    /// but they can no longer touch the device through a gated entry.
+    detached: AtomicBool,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set, and the interface
+    /// publishes link down.
+    suspended: AtomicBool,
 }
 
 // SAFETY: `E1000` only auto-fails `Send` because `MmioRegion`/`DmaBuffer`
@@ -1739,6 +1748,8 @@ impl E1000 {
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             rx_mirror_enabled: AtomicBool::new(false),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            detached: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
         };
 
         // Pump tasks are spawned by the caller (probe) once it has
@@ -1997,6 +2008,9 @@ impl E1000 {
         kick: bool,
         vlan_tag: Option<u16>,
     ) -> Result<TxTicket, E1000Error> {
+        if let Some(e) = self.gate_error() {
+            return Err(e);
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(E1000Error::FrameTooLong);
         }
@@ -2050,6 +2064,12 @@ impl E1000 {
         mut owned: Option<DmaBuffer>,
         kick: bool,
     ) -> Result<TxTicket, E1000Error> {
+        if let Some(e) = self.gate_error() {
+            if let Some(buf) = owned.take() {
+                self.tx_zc_pool.release(buf);
+            }
+            return Err(e);
+        }
         if len == 0 || len > 1518 {
             if let Some(buf) = owned.take() {
                 self.tx_zc_pool.release(buf);
@@ -2317,6 +2337,10 @@ impl E1000 {
         context: TxContextDesc,
         kick: bool,
     ) -> Result<(), E1000Error> {
+        if let Some(e) = self.gate_error() {
+            self.tx_zc_pool.release(buf);
+            return Err(e);
+        }
         if len == 0 || len > MAX_TSO_FRAME || len > buf.len() {
             self.tx_zc_pool.release(buf);
             return Err(E1000Error::FrameTooLong);
@@ -2361,6 +2385,9 @@ impl E1000 {
     /// is rearmed and RDT is bumped so the device sees the freshly-
     /// available slot.
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
+        if !self.datapath_open() {
+            return 0;
+        }
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -2432,6 +2459,9 @@ impl E1000 {
     /// re-armed only after its callback returns, so processing cannot race a
     /// device write. A bounded batch also keeps the cooperative executor fair.
     fn rx_drain_in_place<F: FnMut(&mut [u8])>(&self, budget: usize, mut f: F) -> usize {
+        if !self.datapath_open() {
+            return 0;
+        }
         if budget == 0 {
             return 0;
         }
@@ -2536,8 +2566,13 @@ impl E1000 {
 
     /// `true` if at least one RX descriptor has its DD bit set.
     /// Cheaper than `rx_recv` when callers want to poll without
-    /// consuming.
+    /// consuming. Gated like the drains: a suspended or detached
+    /// device reports nothing pending so pollers idle instead of
+    /// spinning on a ring the gates will not drain.
     pub fn rx_has_pending(&self) -> bool {
+        if !self.datapath_open() {
+            return false;
+        }
         let head = (*self.rx_head.lock()) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
@@ -2575,11 +2610,186 @@ impl E1000 {
         // SAFETY: identity-mapped MMIO.
         unsafe { self.mmio.read32(REG_IMS) }
     }
+
+    // ── Power management and detach ─────────────────────────────────────
+    //
+    // The igb contract (`drivers/net/igb/src/igb.rs`, spec §3, issue
+    // #789), adapted to e1000's legacy rings: a detach path must
+    // publish link down, call `publish::clear_rx_mirror_attached` for
+    // the interface name (e1000 dual-publishes: stack dispatch +
+    // RX-mirror ring, and `eth%d` names are lowest-free-allocated
+    // and reused), and unregister the interface; suspend of a
+    // detached device fails, and every datapath entry point fails
+    // fast once `detached` or `suspended` is set, so a parked pump
+    // holding an `Arc<E1000>` can no longer touch the device.
+    //
+    // Linux order followed loosely (classic `e1000_suspend` →
+    // `__e1000_shutdown`, `e1000_resume` in `e1000_main.c`): suspend
+    // masks interrupts and stops the TX/RX DMA engines; resume
+    // restores the bring-up control words and unmasks. Deliberate
+    // NARF deltas, all documented here rather than silently
+    // differing: (1) no PCI power-state transition — the bus layer
+    // owns PCI config, this driver never power-gates the function;
+    // (2) no full reset/reinit on resume — the rings persist across
+    // suspend (only the EN bits gate DMA), so in-flight descriptor
+    // state survives and resume is a control-word restore, not a
+    // bring-up replay; (3) no PHY power-down on suspend and no PHY
+    // power-up on resume — e1000 has no MDIC access (audit gap 5),
+    // so the igb-style BMCR power-down is not expressible here;
+    // (4) no WoL arming on suspend — WoL (audit gap 6) needs this
+    // contract first and lands as its own item, so suspend is
+    // always unarmed (no WUC/WUFC programming exists to clear).
+    //
+    // Flag ordering matters: suspend sets `suspended` BEFORE the
+    // MMIO writes so a concurrent datapath entry fails at the gate
+    // even before the DMA engines stop; resume restores the MMIO
+    // words BEFORE clearing `suspended` so no datapath entry can
+    // post to a still-stopped engine.
+
+    /// Whether the datapath may run: false while suspended or
+    /// detached. Factored pure so the fixture pins the gate the live
+    /// paths use (igb's `datapath_allowed`, same shape).
+    pub const fn datapath_allowed(detached: bool, suspended: bool) -> bool {
+        !detached && !suspended
+    }
+
+    /// RCTL word for suspend/detach: the bring-up receive word with
+    /// EN cleared — receive DMA stopped, all filter/config bits kept
+    /// so resume restores exactly what bring-up programmed.
+    const RCTL_SUSPEND_OFF: u32 = RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K;
+
+    /// TCTL word for suspend/detach: the bring-up transmit word with
+    /// EN cleared — transmit DMA stopped, PSP/CT/COLD/RTLC kept.
+    const TCTL_SUSPEND_OFF: u32 = TCTL_PSP | TCTL_CT_15 | TCTL_COLD_63 | TCTL_RTLC;
+
+    /// The gate error for a TX entry point, or `None` when the
+    /// datapath is open. RX entry points use the same predicate and
+    /// return their own empty value (0 / false).
+    fn gate_error(&self) -> Option<E1000Error> {
+        if self.detached.load(Ordering::Acquire) {
+            Some(E1000Error::Other("e1000 device detached"))
+        } else if self.suspended.load(Ordering::Acquire) {
+            Some(E1000Error::Other("e1000 device suspended"))
+        } else {
+            None
+        }
+    }
+
+    /// Whether this controller's datapath entry points may run.
+    fn datapath_open(&self) -> bool {
+        Self::datapath_allowed(
+            self.detached.load(Ordering::Acquire),
+            self.suspended.load(Ordering::Acquire),
+        )
+    }
+
+    /// Suspend the device: mask interrupts, stop the TX/RX DMA
+    /// engines, and publish link down. A second suspend is a no-op
+    /// success; suspending a detached device fails. While suspended
+    /// the datapath gates refuse TX and RX and `Interface::link_up`
+    /// reports down. The LSC flag is cleared after masking so a
+    /// stale transition cannot republish link up over suspend's
+    /// DOWN sample (no new LSC can arrive once masked).
+    pub fn suspend(&self) -> Result<(), E1000Error> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(E1000Error::Other("e1000 device detached"));
+        }
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // SAFETY: identity-mapped MMIO; IMC is write-1-to-clear and
+        // the ICR read drains any cause bits already latched.
+        unsafe {
+            self.mmio.write32(REG_IMC, !0u32);
+            let _ = self.mmio.read32(REG_ICR);
+            self.mmio.write32(REG_TCTL, Self::TCTL_SUSPEND_OFF);
+            self.mmio.write32(REG_RCTL, Self::RCTL_SUSPEND_OFF);
+        }
+        LSC_PENDING.store(false, Ordering::Release);
+        crate::publish::publish_link(e1000_ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device: restore the bring-up RCTL/TCTL
+    /// words, re-arm the interrupt mask (only when a vector is
+    /// bound — polled devices keep the all-masked state bring-up
+    /// left them in), and republish link from live STATUS.
+    /// Resuming a running device is a no-op success; resuming a
+    /// detached device fails. The rings were never torn down, so no
+    /// descriptor re-priming is needed: RDT/RDH/TDT/TDH still point
+    /// where suspend left them and DMA continues from there.
+    pub fn resume(&self) -> Result<(), E1000Error> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(E1000Error::Other("e1000 device detached"));
+        }
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // SAFETY: identity-mapped MMIO; the words below are exactly
+        // the bring-up program (RCTL at bring-up step 7, TCTL at
+        // step 6), so resume cannot drift from bring-up.
+        unsafe {
+            self.mmio.write32(
+                REG_RCTL,
+                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+            );
+            self.mmio.write32(
+                REG_TCTL,
+                TCTL_EN | TCTL_PSP | TCTL_CT_15 | TCTL_COLD_63 | TCTL_RTLC,
+            );
+            if self.irq_vector.is_some() {
+                self.mmio.write32(REG_IMS, IMS_DEFAULT);
+            }
+        }
+        self.suspended.store(false, Ordering::Release);
+        let status = self.read_status();
+        crate::publish::publish_link(e1000_ifname(), link_sample_from_status(status));
+        Ok(())
+    }
+
+    /// Device half of detach: set the datapath gate and drop the
+    /// ISR's MMIO base first (so no new datapath work or late
+    /// interrupt can race the teardown), then mask interrupts and
+    /// stop the TX/RX units. There is no WoL arming to clear: this
+    /// driver never programs WUC/WUFC. The registry half lives in
+    /// [`e1000_detach`].
+    fn detach_device(&self) {
+        self.detached.store(true, Ordering::Release);
+        ISR_MMIO_BASE.store(0, Ordering::Release);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IMC, !0u32);
+            self.mmio.write32(REG_RCTL, Self::RCTL_SUSPEND_OFF);
+            self.mmio.write32(REG_TCTL, Self::TCTL_SUSPEND_OFF);
+        }
+    }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<E1000>>> = IrqSafeSpinLock::new(None);
+
+/// Detach the bound e1000 device, if any: device half (mask, stop
+/// DMA, drop the ISR base, set the datapath gate), then the
+/// registry half the net spec §3 obliges — publish link down, clear
+/// the RX-mirror attach note for the interface name (names are
+/// lowest-free-allocated and reused), and unregister the interface.
+/// Idempotent: a second call finds no controller and does nothing.
+/// The async pumps are not joined (they hold `Arc<E1000>` clones),
+/// but every datapath entry point fails fast once detached, so a
+/// parked pump can no longer touch the device.
+pub fn e1000_detach() {
+    let controller = CONTROLLER.lock().take();
+    let Some(device) = controller else {
+        return;
+    };
+    device.detach_device();
+    let name = e1000_ifname();
+    crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
+    crate::publish::clear_rx_mirror_attached(name);
+    let _ = narf_net::iface::unregister(name);
+    *E1000_IFNAME.lock() = None;
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -3050,7 +3260,10 @@ impl narf_net::Interface for E1000Nic {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        // Probe-time value, gated on suspend (detached reads as
+        // false via the `None` controller). Live transitions still
+        // arrive via `publish_link` / the LSC drain.
+        with_controller(|c| c.link_up && !c.suspended.load(Ordering::Acquire)).unwrap_or(false)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
@@ -3090,7 +3303,8 @@ impl crate::HwNic for E1000Nic {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        // Same suspend gate as the `Interface` impl above.
+        with_controller(|c| c.link_up && !c.suspended.load(Ordering::Acquire)).unwrap_or(false)
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelE1000
@@ -3476,4 +3690,66 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_multicast_rar_encoding);
+    fn smoke_datapath_allowed_gate_matrix() -> TestResult {
+        // The gate every datapath entry point uses: only the
+        // neither-detached-nor-suspended cell is open.
+        let open = super::E1000::datapath_allowed;
+        if !open(false, false) {
+            return TestResult::Fail("e1000 datapath gate closed a running device");
+        }
+        if open(true, false) {
+            return TestResult::Fail("e1000 datapath gate opened a detached device");
+        }
+        if open(false, true) {
+            return TestResult::Fail("e1000 datapath gate opened a suspended device");
+        }
+        if open(true, true) {
+            return TestResult::Fail("e1000 datapath gate opened a detached+suspended device");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_datapath_allowed_gate_matrix);
+
+    fn smoke_suspend_words_preserve_bringup_config() -> TestResult {
+        // Suspend/detach words are the bring-up words with EN
+        // cleared — literals written out, not composed from the
+        // module's own constants, so a mistranscribed bit cannot
+        // pass its own test. RCTL bring-up = EN|BAM|UPE|MPE|SECRC
+        // (BSIZE_2K is 0); TCTL bring-up = EN|PSP|CT_15|COLD_63|RTLC.
+        if super::E1000::RCTL_SUSPEND_OFF != 0x0400_8018 {
+            return TestResult::Fail("e1000 RCTL suspend word drifted from bring-up minus EN");
+        }
+        if super::E1000::TCTL_SUSPEND_OFF != 0x0103_F0F8 {
+            return TestResult::Fail("e1000 TCTL suspend word drifted from bring-up minus EN");
+        }
+        if super::E1000::RCTL_SUSPEND_OFF & super::RCTL_EN != 0
+            || super::E1000::TCTL_SUSPEND_OFF & super::TCTL_EN != 0
+        {
+            return TestResult::Fail("e1000 suspend word still has its EN bit set");
+        }
+        if super::E1000::RCTL_SUSPEND_OFF | super::RCTL_EN
+            != super::RCTL_EN
+                | super::RCTL_BAM
+                | super::RCTL_UPE
+                | super::RCTL_MPE
+                | super::RCTL_SECRC
+                | super::RCTL_BSIZE_2K
+        {
+            return TestResult::Fail("e1000 RCTL suspend word lost a bring-up config bit");
+        }
+        if super::E1000::TCTL_SUSPEND_OFF | super::TCTL_EN
+            != super::TCTL_EN
+                | super::TCTL_PSP
+                | super::TCTL_CT_15
+                | super::TCTL_COLD_63
+                | super::TCTL_RTLC
+        {
+            return TestResult::Fail("e1000 TCTL suspend word lost a bring-up config bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_suspend_words_preserve_bringup_config
+    );
 }
