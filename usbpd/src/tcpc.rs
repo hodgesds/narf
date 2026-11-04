@@ -76,6 +76,29 @@ pub enum PortRole {
     Drp,
 }
 
+/// SOP* message target (USB-PD §6.2.1.1.6 values; mirrors the
+/// `sop_prime` target constants).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SopTarget {
+    /// Port partner (DFP/UFP).
+    Sop = 0,
+    /// Cable plug nearer the VConn source.
+    SopPrime = 1,
+    /// Cable plug at the far end of the cable.
+    SopDoublePrime = 2,
+}
+
+impl SopTarget {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Sop),
+            1 => Some(Self::SopPrime),
+            2 => Some(Self::SopDoublePrime),
+            _ => None,
+        }
+    }
+}
+
 /// TCPC trait. Vendor drivers (FUSB302, TPS6598x, …) implement.
 pub trait Tcpc: Send + Sync + Debug {
     /// Stable name for diagnostics.
@@ -91,9 +114,33 @@ pub trait Tcpc: Send + Sync + Debug {
     /// little-endian-packed by `message::encode_message`).
     fn transmit(&self, sop_msg: &[u8]) -> Result<(), TcpcError>;
 
+    /// Transmit a PD message to a SOP* target. Default: `Sop`
+    /// delegates to [`transmit`]; any other target reports
+    /// `Unsupported` (the TCPC has no SOP* transmit path, e.g.
+    /// firmware-mediated chips). FUSB302 overrides this with its
+    /// SOP'/SOP'' ordered-set framing.
+    fn transmit_sop(&self, target: SopTarget, msg: &[u8]) -> Result<(), TcpcError> {
+        match target {
+            SopTarget::Sop => self.transmit(msg),
+            _ => Err(TcpcError::Unsupported),
+        }
+    }
+
     /// Pull the next pending PD message from the receive FIFO.
     /// Returns `Err(TcpcError::NoMessage)` when nothing is queued.
     fn receive(&self) -> Result<Vec<u8>, TcpcError>;
+
+    /// Pull the next pending PD message plus the SOP* target it
+    /// arrived on. Default: [`receive`] with target `Sop` (chips
+    /// whose RX path does not report the target). FUSB302 overrides
+    /// this from the RX FIFO token byte (datasheet Table 42: top
+    /// three bits 111 = SOP, 110 = SOP', 101 = SOP'').
+    /// SOP'/SOP'' reception additionally requires the chip-side
+    /// enable (FUSB302 CONTROL1 ENSOP1/ENSOP2); without it the
+    /// chip never queues cable-plug packets.
+    fn receive_sop(&self) -> Result<(SopTarget, Vec<u8>), TcpcError> {
+        Ok((SopTarget::Sop, self.receive()?))
+    }
 
     /// Issue a Hard Reset on the wire. Used by the TCPM when
     /// negotiation goes wrong (§8.3.3.6).
