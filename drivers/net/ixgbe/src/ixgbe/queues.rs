@@ -210,6 +210,29 @@ pub fn route_queue_vector(bank: &mut impl RegBank, q: usize, vector: u8) -> bool
     true
 }
 
+/// Route one direction of one queue's IVAR field to `vector`
+/// (read-modify-write, preserving the sibling queue AND the
+/// queue's other direction). Used for asymmetric configs, where
+/// [`route_queue_vector`] would program a direction whose queue
+/// does not exist.
+pub fn route_queue_vector_dir(bank: &mut impl RegBank, q: usize, vector: u8, is_tx: bool) -> bool {
+    let Some(reg) = ivar_reg(q) else {
+        return false;
+    };
+    let cur = bank.read32(reg);
+    let field = ivar_field(q, vector, is_tx);
+    // Single-field clear masks: value bits + valid bit of this
+    // queue's direction only.
+    let clear = match (q % 2, is_tx) {
+        (0, false) => 0x0000_00FFu32,
+        (0, true) => 0x0000_FF00u32,
+        (_, false) => 0x00FF_0000u32,
+        (_, true) => 0xFF00_0000u32,
+    };
+    bank.write32(reg, (cur & !clear) | field);
+    true
+}
+
 /// Route the OTHER (misc: link-state etc.) cause to `vector`
 /// (IVAR_MISC bits 14:8 + valid bit 15, §8.2.3.5.17).
 pub fn route_misc_vector(bank: &mut impl RegBank, vector: u8) -> u32 {
