@@ -1600,17 +1600,24 @@ fn smoke_ath10k_ap_userspace_rsn_exchange_uses_native_eapol_air_receipts_before_
     m1.replay_counter = 1;
     m1.key_nonce = anonce;
     let m1 = m1.into_eapol();
-    if !transmit_control(&b, m1.clone())
-        || !b.model(|m| {
-            m.ap.as_ref().unwrap().packets.last().is_some_and(|f| {
-                f[1] == 2
-                    && f.get(24..32) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
-                    && f.get(32..) == Some(m1.as_slice())
-            })
-        })
-    {
+    // Diagnostic split of the M1 check (CI job 126311582883 reports only the
+    // combined failure): a transmit failure and a packet-shape mismatch have
+    // different root causes, so they fail with distinct messages. Both halves
+    // keep the original expectations; neither is weakened.
+    if !transmit_control(&b, m1.clone()) {
         return TestResult::Fail(
-            "AP M1 did not traverse actual unprotected HTT control/DMA/air terminal",
+            "AP M1 control transmit did not complete (no HTT air-terminal ack)",
+        );
+    }
+    if !b.model(|m| {
+        m.ap.as_ref().unwrap().packets.last().is_some_and(|f| {
+            f[1] == 2
+                && f.get(24..32) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+                && f.get(32..) == Some(m1.as_slice())
+        })
+    }) {
+        return TestResult::Fail(
+            "AP M1 packet did not traverse actual unprotected HTT control/DMA/air terminal",
         );
     }
     let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
