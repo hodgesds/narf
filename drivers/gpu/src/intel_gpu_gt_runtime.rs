@@ -196,6 +196,10 @@ struct Pending {
     /// Installed by the opted-in Lunar Lake display-20 route after its owned
     /// modeset (`narf.intel.lnl_display=1`): the display-preserving profile.
     lnl_display: bool,
+    /// Installed by the opted-in Panther Lake display-30 route after its
+    /// owned modeset (`narf.intel.ptl_display=1`): the display-preserving
+    /// profile.
+    ptl_display: bool,
     window: AuthorizedWindow,
 }
 
@@ -223,6 +227,25 @@ pub(crate) fn lnl_profile(
         return None;
     }
     match (lnl_display, platform.is_lnl() && has_mode) {
+        (false, _) => Some(LnlProfile::Headless),
+        (true, true) => Some(LnlProfile::DisplayPreserving),
+        (true, false) => None,
+    }
+}
+
+/// [`lnl_profile`] for the Panther Lake display-30 route: the
+/// display-preserving profile only for Panther Lake with the route and a lit
+/// mode; `Headless` for every other LNL/PTL function. Lunar Lake's
+/// selection is [`lnl_profile`]'s, unchanged.
+pub(crate) fn ptl_profile(
+    platform: GtPlatform,
+    ptl_display: bool,
+    has_mode: bool,
+) -> Option<LnlProfile> {
+    if !platform.is_headless_integrated() {
+        return None;
+    }
+    match (ptl_display, platform.is_ptl() && has_mode) {
         (false, _) => Some(LnlProfile::Headless),
         (true, true) => Some(LnlProfile::DisplayPreserving),
         (true, false) => None,
@@ -979,6 +1002,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 owner.pending.lnl_display,
                 owner.pending.mode.is_some(),
             ) == Some(LnlProfile::DisplayPreserving)
+                || (owner.pending.ptl_display
+                    && ptl_profile(self.platform, true, owner.pending.mode.is_some())
+                        == Some(LnlProfile::DisplayPreserving))
         })
     }
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
@@ -1270,7 +1296,7 @@ pub(crate) fn install(
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
 ) -> bool {
-    install_profile(index, card, device, cap, bar, mode, false)
+    install_profile(index, card, device, cap, bar, mode, false, false)
 }
 
 /// The Lunar Lake display-20 route's GT owner: the display-preserving
@@ -1289,9 +1315,29 @@ pub(crate) fn install_lnl_display(
     if profile != Some(LnlProfile::DisplayPreserving) {
         return false;
     }
-    install_profile(index, card, device, cap, bar, mode, true)
+    install_profile(index, card, device, cap, bar, mode, true, false)
 }
 
+/// The Panther Lake display-30 route's GT owner: the display-preserving
+/// profile beside the route's lit panel `mode`. Refused for anything that is
+/// not Panther Lake with a lit mode.
+pub(crate) fn install_ptl_display(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+) -> bool {
+    let profile = GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(|platform| ptl_profile(platform, true, mode.is_some()));
+    if profile != Some(LnlProfile::DisplayPreserving) {
+        return false;
+    }
+    install_profile(index, card, device, cap, bar, mode, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn install_profile(
     index: u32,
     card: Arc<IntelGpuCard>,
@@ -1300,6 +1346,7 @@ fn install_profile(
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
     lnl_display: bool,
+    ptl_display: bool,
 ) -> bool {
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
@@ -1331,6 +1378,7 @@ fn install_profile(
         mode,
         smallbar,
         lnl_display,
+        ptl_display,
         window,
     });
     true
@@ -1761,7 +1809,26 @@ impl Owner {
                 GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
                     .map_err(|_| RuntimeError::State)?,
             )
-        } else if p.lnl_display {
+        } else if p.ptl_display
+            && ptl_profile(platform, true, p.mode.is_some()) == Some(LnlProfile::DisplayPreserving)
+        {
+            // The Panther Lake display-30 route: the same display-preserving
+            // cold start, admitted against display 30.00.
+            if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
+                return Err(RuntimeError::Configuration);
+            }
+            let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_ptl(
+                p.device,
+                p.bar,
+                &mmio,
+                || validate_pci(p, &mmio).is_ok(),
+            )
+            .map_err(RuntimeError::Takeover)?;
+            SharedArena::new(
+                GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
+                    .map_err(|_| RuntimeError::State)?,
+            )
+        } else if p.lnl_display || p.ptl_display {
             return Err(RuntimeError::Configuration);
         } else if platform.is_headless_integrated() {
             if self.user_epoch.load(Ordering::Acquire) != 0
@@ -3230,7 +3297,10 @@ impl Owner {
 impl narf_power::device_pm::DevicePmOps for Owner {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
         use narf_power::device_pm::DeviceSuspendError as E;
-        if !system_suspend_admitted(self.pending.smallbar, self.pending.lnl_display) {
+        if !system_suspend_admitted(
+            self.pending.smallbar,
+            self.pending.lnl_display || self.pending.ptl_display,
+        ) {
             return Err(E::Busy);
         }
         let state = self.state.try_lock().ok_or(E::Busy)?;
@@ -3258,8 +3328,11 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             // Initial opted-in whole-device incarnation is deliberately D0-only.
             // No repeated driver-FLR may wipe retained BO/fd/VM state. The
             // Lunar Lake display-20 profile is D0-only as well: display-20
-            // relight after S3 is not owned.
-            if !system_suspend_admitted(self.pending.smallbar, self.pending.lnl_display) {
+            // relight after S3 is not owned; neither is display-30 relight.
+            if !system_suspend_admitted(
+                self.pending.smallbar,
+                self.pending.lnl_display || self.pending.ptl_display,
+            ) {
                 return Err(E::Busy);
             }
             // pci_pm_suspend runtime-resumes a suspended function before the

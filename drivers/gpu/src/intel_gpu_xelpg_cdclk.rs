@@ -23,6 +23,15 @@
 //! (`pll_enable_wa_needed` covers 14.00 and 20.00; Wa_13012396614 is
 //! 30.00 only).
 //!
+//! Display 30.00 (Xe3_LPD) dispatches the same way on
+//! `xe3lpd_cdclk_table` (squashed rungs at ratio 16, crawl-only rungs up to
+//! 691.2 MHz, `xe3lpd_cdclk_funcs`): `bxt_cdclk_ctl` writes no CD2X pipe
+//! field and keeps `BXT_CDCLK_CD2X_DIV_SEL_1`, `xe3lpd_calc_voltage_level`
+//! is 0, `intel_update_max_cdclk` raises the ceiling to 691.2 MHz,
+//! wa_15010685871 (`pll_enable_wa_needed`) does not apply and
+//! Wa_13012396614 (`icl_cdclk_pll_disable`) selects CD2XCLK as the MDCLK
+//! source before the PLL is disabled.
+//!
 //! The owned transaction changes CDCLK only with every pipe off
 //! (`disable_pipes`, `pipe = INVALID_PIPE`), so the CD2X pipe field is
 //! always `TGL_CDCLK_CD2X_PIPE_NONE` and both raising and lowering happen in
@@ -117,7 +126,31 @@ pub(crate) fn table(ip: DisplayIp) -> &'static [Rung] {
     match ip {
         DisplayIp::Xelpdp => &TABLE,
         DisplayIp::Xe2Lpd => &crate::intel_gpu_xe2lpd::CDCLK_TABLE,
+        DisplayIp::Xe3Lpd => &crate::intel_gpu_xe3lpd::CDCLK_TABLE,
     }
+}
+
+/// `intel_update_max_cdclk` for `ip` at the 38.4 MHz reference.
+pub(crate) const fn max_cdclk_khz(ip: DisplayIp) -> u32 {
+    match ip {
+        DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => MAX_CDCLK_KHZ,
+        DisplayIp::Xe3Lpd => crate::intel_gpu_xe3lpd::MAX_CDCLK_KHZ,
+    }
+}
+
+/// `display->funcs.cdclk->calc_voltage_level` for `ip`:
+/// `rplu_calc_voltage_level` on 14.00 and 20.00,
+/// `xe3lpd_calc_voltage_level` (always 0) on 30.00.
+pub(crate) fn voltage_level_ip(ip: DisplayIp, cdclk_khz: u32) -> u8 {
+    match ip {
+        DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => voltage_level(cdclk_khz),
+        DisplayIp::Xe3Lpd => 0,
+    }
+}
+
+/// `pll_enable_wa_needed` (wa_15010685871): display 14.00, 20.00 and DG2.
+const fn pll_enable_wa_needed(ip: DisplayIp) -> bool {
+    matches!(ip, DisplayIp::Xelpdp | DisplayIp::Xe2Lpd)
 }
 
 /// [`calc_cdclk`] over `ip`'s table.
@@ -128,7 +161,9 @@ pub(crate) fn calc_cdclk_ip(ip: DisplayIp, min_khz: u32) -> Option<Rung> {
 fn rung_ip(ip: DisplayIp, cdclk_khz: u32) -> Option<Rung> {
     match ip {
         DisplayIp::Xelpdp => rung(cdclk_khz),
-        DisplayIp::Xe2Lpd => table(ip).iter().copied().find(|r| r.cdclk_khz == cdclk_khz),
+        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+            table(ip).iter().copied().find(|r| r.cdclk_khz == cdclk_khz)
+        }
     }
 }
 
@@ -164,11 +199,13 @@ pub(crate) fn ctl_value(target: Rung) -> u32 {
 }
 
 /// `bxt_cdclk_ctl(display, config, INVALID_PIPE)` for `ip`: display >= 20
-/// selects the MDCLK source (the CDCLK PLL) instead of the decimal field.
+/// selects the MDCLK source (the CDCLK PLL) instead of the decimal field;
+/// display >= 30 writes no CD2X pipe field.
 pub(crate) fn ctl_value_ip(ip: DisplayIp, target: Rung) -> u32 {
     match ip {
         DisplayIp::Xelpdp => ctl_value(target),
         DisplayIp::Xe2Lpd => CD2X_PIPE_NONE | crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
+        DisplayIp::Xe3Lpd => crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
     }
 }
 
@@ -263,6 +300,9 @@ pub(crate) enum Step {
     Crawl { ratio: u32 },
     /// wa_15010685871: squash off before the PLL is touched.
     SquashOff,
+    /// Wa_13012396614 (display 30.00): `CDCLK_CTL` MDCLK source to
+    /// CD2XCLK before the PLL is disabled.
+    MdclkCd2x,
     /// `icl_cdclk_pll_disable`.
     PllDisable,
     /// `icl_cdclk_pll_enable` at `ratio`.
@@ -293,8 +333,14 @@ fn set_steps(ip: DisplayIp, hw: Option<Rung>, cfg: Rung, steps: &mut Vec<Step>) 
         }
         None => {
             // pll_enable_wa_needed: display 14.00 && hw.vco > 0 (~0 counts).
-            steps.push(Step::SquashOff);
-            // icl_cdclk_pll_update: hw.vco (~0) != 0 && != vco.
+            if pll_enable_wa_needed(ip) {
+                steps.push(Step::SquashOff);
+            }
+            // icl_cdclk_pll_update: hw.vco (~0) != 0 && != vco;
+            // icl_cdclk_pll_disable takes Wa_13012396614 first.
+            if ip == DisplayIp::Xe3Lpd {
+                steps.push(Step::MdclkCd2x);
+            }
             steps.push(Step::PllDisable);
             steps.push(Step::PllEnable { ratio: cfg.ratio });
         }
@@ -398,6 +444,15 @@ fn execute(io: &(impl MmioWindow + ?Sized), step: Step) -> Result<(), CdclkError
             io.write32(DE_PLL_ENABLE, value);
         }
         Step::SquashOff => io.write32(CDCLK_SQUASH_CTL, 0),
+        Step::MdclkCd2x => {
+            // intel_de_rmw(CDCLK_CTL, MDCLK_SOURCE_SEL_MASK,
+            // MDCLK_SOURCE_SEL_CD2XCLK).
+            let ctl = read(io, CDCLK_CTL)?;
+            io.write32(
+                CDCLK_CTL,
+                ctl & !crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL,
+            );
+        }
         Step::PllDisable => {
             // intel_de_rmw(BXT_DE_PLL_ENABLE, PLL_ENABLE, 0); LOCK and
             // FREQ_REQ_ACK are read-only status and are not written back.
@@ -481,7 +536,12 @@ pub(crate) fn restore_ip(
             io.write32(CDCLK_CTL, original.ctl);
         }
     } else if now.pll != original.pll || now.squash != original.squash || now.ctl != original.ctl {
-        execute(io, Step::SquashOff)?;
+        if pll_enable_wa_needed(ip) {
+            execute(io, Step::SquashOff)?;
+        }
+        if ip == DisplayIp::Xe3Lpd {
+            execute(io, Step::MdclkCd2x)?;
+        }
         execute(io, Step::PllDisable)?;
         if original.pll & PLL_ENABLE != 0 {
             execute(

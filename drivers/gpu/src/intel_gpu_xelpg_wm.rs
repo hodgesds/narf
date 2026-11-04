@@ -23,6 +23,16 @@
 //!   Wa_14015648006. The Pipe-A value of the watermarks proved programmed
 //!   is published here and registered as PSR's provider.
 //!
+//! Display 30 (Xe3_LPD) runs the `_ip` entry points: `skl_compute_plane_wm`
+//! adds no block (`blocks++` is display < 30 only), a Tile4 surface adds a
+//! block per line only when panned (`interm_pbpl += (pan_x != 0)`), the
+//! prefill CDCLK adjustment takes the display-30 table and the vblank
+//! prefill budget is the VRR timing generator's guardband
+//! (`intel_crtc_vblank_length` after `intel_vrr_compute_guardband` moved
+//! `crtc_vblank_start`), which the caller passes as [`Timing::vblank_start`].
+//! The level-0 and SAGV auto minimum allocation and `PLANE_MIN_BUF_CFG`
+//! are register-image deltas ([`crate::intel_gpu_xe3lpd`]).
+//!
 //! Gen12 keeps its own transcription in [`crate::intel_gpu_wm`]; nothing
 //! here changes Gen12 results.
 
@@ -209,12 +219,64 @@ fn params(timing: Timing, surface: Surface) -> Result<Params, WmError> {
     {
         return Err(WmError::Unsupported);
     }
+    params_rules(timing, surface, Rules::Display14)
+}
+
+/// The `skl_watermark.c` branches a computation follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rules {
+    /// Display 14 and 20.
+    Display14,
+    /// Display >= 30, with `pan_x != 0` when the surface is panned.
+    Display30 { panned: bool },
+}
+
+impl Rules {
+    const fn for_ip(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
+        match ip {
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => Self::Display30 { panned: false },
+            _ => Self::Display14,
+        }
+    }
+}
+
+/// [`params`] for `ip`: display 30 also scans out up to twice its
+/// 691.2 MHz CDCLK.
+fn params_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    timing: Timing,
+    surface: Surface,
+) -> Result<Params, WmError> {
+    let max = crate::intel_gpu_xelpg_cdclk::max_cdclk_khz(ip);
+    if !matches!(surface.cpp, 1 | 2 | 4 | 8)
+        || surface.width == 0
+        || surface.width > 8192
+        || timing.htotal == 0
+        || timing.htotal > 16384
+        || !(1..=2 * max).contains(&timing.pixel_rate_khz)
+    {
+        return Err(WmError::Unsupported);
+    }
+    params_rules(timing, surface, Rules::for_ip(ip))
+}
+
+/// `skl_compute_wm_params` (unrotated, non-planar, 512-byte blocks) after
+/// the caller's bounds.
+fn params_rules(timing: Timing, surface: Surface, rules: Rules) -> Result<Params, WmError> {
+    if timing.htotal == 0 || timing.pixel_rate_khz == 0 {
+        return Err(WmError::Unsupported);
+    }
     let y_tiled = surface.tiling == Tiling::Tile4;
     let cpp = u64::from(surface.cpp);
     let bytes_per_line = u64::from(surface.width) * cpp;
-    // y_min_scanlines: 4 without 90/270 rotation.
+    // y_min_scanlines: 4 without 90/270 rotation. A Y-tiled surface adds a
+    // block on display 10..29, and on display >= 30 only when panned.
+    let y_extra = match rules {
+        Rules::Display14 => 1,
+        Rules::Display30 { panned } => u64::from(panned),
+    };
     let blocks_per_line = if y_tiled {
-        (((bytes_per_line * 4).div_ceil(BLOCK) + 1) * FX).div_ceil(4)
+        (((bytes_per_line * 4).div_ceil(BLOCK) + y_extra) * FX).div_ceil(4)
     } else {
         (bytes_per_line.div_ceil(BLOCK) + 1) * FX
     };
@@ -229,7 +291,19 @@ fn params(timing: Timing, surface: Surface) -> Result<Params, WmError> {
 }
 
 /// `skl_compute_plane_wm` (display 14).
+#[allow(dead_code)]
 fn level(timing: Timing, wp: &Params, latency: u32, prev: Level) -> Result<Level, WmError> {
+    level_rules(timing, wp, latency, prev, Rules::Display14)
+}
+
+/// `skl_compute_plane_wm` under `rules`.
+fn level_rules(
+    timing: Timing,
+    wp: &Params,
+    latency: u32,
+    prev: Level,
+    rules: Rules,
+) -> Result<Level, WmError> {
     if latency == 0 {
         return Ok(REJECTED);
     }
@@ -256,7 +330,8 @@ fn level(timing: Timing, wp: &Params, latency: u32, prev: Level) -> Result<Level
     if selected > u64::from(u32::MAX) {
         return Err(WmError::Unsupported);
     }
-    let mut blocks = selected.div_ceil(FX) + 1;
+    // blocks++ only below display 30.
+    let mut blocks = selected.div_ceil(FX) + u64::from(rules == Rules::Display14);
     blocks = blocks.max(wp.blocks_per_line.div_ceil(FX));
     let mut lines = selected.div_ceil(wp.blocks_per_line);
     blocks = blocks.max(u64::from(prev.blocks));
@@ -316,21 +391,85 @@ pub(crate) fn plane(
     latency: &Latency,
 ) -> Result<PlaneWm, WmError> {
     let wp = params(timing, surface)?;
+    plane_with(timing, &wp, latency, Rules::Display14)
+}
+
+/// [`plane`] on `ip` (display 30: no added block, unpanned Tile4).
+pub(crate) fn plane_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    timing: Timing,
+    surface: Surface,
+    latency: &Latency,
+) -> Result<PlaneWm, WmError> {
+    let wp = params_ip(ip, timing, surface)?;
+    plane_with(timing, &wp, latency, Rules::for_ip(ip))
+}
+
+fn plane_with(
+    timing: Timing,
+    wp: &Params,
+    latency: &Latency,
+    rules: Rules,
+) -> Result<PlaneWm, WmError> {
     let mut wm = PlaneWm::default();
     let mut prev = Level::default();
     for (slot, &lat) in wm.levels.iter_mut().zip(&latency.levels) {
-        *slot = level(timing, &wp, u32::from(lat), prev)?;
+        *slot = level_rules(timing, wp, u32::from(lat), prev, rules)?;
         prev = *slot;
     }
-    wm.trans = transition(&wp, wm.levels[0]);
+    wm.trans = transition(wp, wm.levels[0]);
     let sagv_latency = if latency.sagv_block_us == 0 {
         0
     } else {
         u32::from(latency.sagv_block_us) + u32::from(latency.levels[0])
     };
-    wm.sagv = level(timing, &wp, sagv_latency, wm.levels[0])?;
-    wm.sagv_trans = transition(&wp, wm.sagv);
+    wm.sagv = level_rules(timing, wp, sagv_latency, wm.levels[0], rules)?;
+    wm.sagv_trans = transition(wp, wm.sagv);
     Ok(wm)
+}
+
+/// `skl_wm0_prefill_lines_worst` on display 30 (.16 lines): the level-0
+/// lines of an `XBGR16161616F` (cpp 8) Tile4 primary of `width` pixels at
+/// `pixel_rate_khz`, panned (`pan_x` 1), on the pipe's `htotal`; a rejected
+/// level counts `skl_wm_max_lines()`. The caller supplies the scaled width
+/// and pixel rate (`skl_scaler_max_hscale`, `skl_scaler_max_total_scale`).
+/// Linux keeps the method intermediates in u32; a computation that would
+/// wrap them is refused.
+pub(crate) fn wm0_prefill_lines_worst_xe3(
+    pixel_rate_khz: u32,
+    htotal: u32,
+    width: u32,
+    latency: &Latency,
+) -> Result<u64, WmError> {
+    if width == 0 || htotal == 0 || htotal > 16384 || pixel_rate_khz == 0 {
+        return Err(WmError::Unsupported);
+    }
+    let timing = Timing {
+        pixel_rate_khz,
+        htotal,
+        vtotal: 0,
+        vblank_start: 0,
+    };
+    let surface = Surface {
+        width,
+        cpp: 8,
+        tiling: Tiling::Tile4,
+    };
+    let rules = Rules::Display30 { panned: true };
+    let wp = params_rules(timing, surface, rules)?;
+    let wm = level_rules(
+        timing,
+        &wp,
+        u32::from(latency.levels[0]),
+        Level::default(),
+        rules,
+    )?;
+    let lines = if wm.min_ddb_alloc == u16::MAX {
+        MAX_LINES
+    } else {
+        u64::from(wm.lines)
+    };
+    Ok(lines << 16)
 }
 
 /// `intel_display.c::skl_linetime_wm` for an enabled pipe on display 14:
@@ -360,12 +499,41 @@ pub(crate) fn cursor_allocation(
             tiling: Tiling::Linear,
         },
     )?;
+    cursor_allocation_with(timing, &wp, latency, num_active, Rules::Display14)
+}
+
+/// [`cursor_allocation`] on `ip`.
+pub(crate) fn cursor_allocation_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    timing: Timing,
+    latency: &Latency,
+    num_active: u32,
+) -> Result<u16, WmError> {
+    let wp = params_ip(
+        ip,
+        timing,
+        Surface {
+            width: CURSOR_ALLOC_WIDTH,
+            cpp: 4,
+            tiling: Tiling::Linear,
+        },
+    )?;
+    cursor_allocation_with(timing, &wp, latency, num_active, Rules::for_ip(ip))
+}
+
+fn cursor_allocation_with(
+    timing: Timing,
+    wp: &Params,
+    latency: &Latency,
+    num_active: u32,
+    rules: Rules,
+) -> Result<u16, WmError> {
     let mut wm = Level::default();
     let mut min_ddb_alloc = 0u16;
     for &lat in &latency.levels {
         // skl_compute_plane_wm(.., &wm, &wm): a rejected level only sets
         // min_ddb_alloc, keeping the prior blocks/lines.
-        let next = level(timing, &wp, u32::from(lat), wm)?;
+        let next = level_rules(timing, wp, u32::from(lat), wm, rules)?;
         if next.min_ddb_alloc == u16::MAX {
             break;
         }
@@ -396,6 +564,23 @@ impl Prefill {
     /// worst level-0 lines of the pipe's planes (`skl_max_wm0_lines`), and
     /// `prefill.dsc` = `intel_vdsc_prefill_lines` when the pipe compresses.
     fn new(timing: Timing, wm0_lines: u16, dsc: bool) -> Result<Self, WmError> {
+        Self::new_ip(
+            crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
+            timing,
+            wm0_lines,
+            dsc,
+        )
+    }
+
+    /// [`Prefill::new`] with `ip`'s CDCLK table (`calc_cdclk`). The
+    /// guardband is `timing.vtotal - timing.vblank_start`
+    /// (`intel_crtc_vblank_length` without VRR).
+    fn new_ip(
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+        timing: Timing,
+        wm0_lines: u16,
+        dsc: bool,
+    ) -> Result<Self, WmError> {
         if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
             return Err(WmError::Unsupported);
         }
@@ -411,7 +596,8 @@ impl Prefill {
         let wm0 = dsc + (u64::from(wm0_lines) << 16);
         // intel_cdclk_prefill_adjustment(_worst): calc_cdclk at the
         // pixel-rate minimum, ppc 2.
-        let cdclk = crate::intel_gpu_xelpg_cdclk::calc_cdclk(
+        let cdclk = crate::intel_gpu_xelpg_cdclk::calc_cdclk_ip(
+            ip,
             crate::intel_gpu_xelpg_cdclk::pixel_rate_to_cdclk(timing.pixel_rate_khz),
         )
         .ok_or(WmError::Unsupported)?
@@ -471,6 +657,17 @@ pub(crate) fn wm_level_disabled_dsc(
     Ok(Prefill::new(timing, wm0_lines, dsc)?.max_level(latency)? < LEVELS - 1)
 }
 
+/// [`wm_level_disabled_dsc`] on `ip`.
+pub(crate) fn wm_level_disabled_dsc_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    timing: Timing,
+    latency: &Latency,
+    wm0_lines: u16,
+    dsc: bool,
+) -> Result<bool, WmError> {
+    Ok(Prefill::new_ip(ip, timing, wm0_lines, dsc)?.max_level(latency)? < LEVELS - 1)
+}
+
 /// `skl_wm_check_vblank` for a pipe whose planes are `planes`. Levels that
 /// cannot complete prefill inside vblank lose their enable bit (keeping
 /// blocks/lines, as Linux does); SAGV levels likewise when the block time
@@ -493,8 +690,25 @@ pub(crate) fn check_vblank_dsc(
     planes: &mut [&mut PlaneWm],
     dsc: bool,
 ) -> Result<bool, WmError> {
+    check_vblank_dsc_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
+        timing,
+        latency,
+        planes,
+        dsc,
+    )
+}
+
+/// [`check_vblank_dsc`] on `ip`.
+pub(crate) fn check_vblank_dsc_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    timing: Timing,
+    latency: &Latency,
+    planes: &mut [&mut PlaneWm],
+    dsc: bool,
+) -> Result<bool, WmError> {
     let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
-    let prefill = Prefill::new(timing, wm0, dsc)?;
+    let prefill = Prefill::new_ip(ip, timing, wm0, dsc)?;
     let max_level = prefill.max_level(latency)?;
     for plane in planes.iter_mut() {
         for level in plane.levels.iter_mut().skip(max_level + 1) {

@@ -348,6 +348,9 @@ pub(crate) struct Physical {
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     window: crate::intel_gpu_gt_hw::AuthorizedWindow,
     generation: Generation,
+    /// Panther Lake only: the install proved display 30.00 behind the
+    /// opted-in route. `None` on every other generation.
+    display30: Option<Display30>,
     /// Shared by every retained PollIo clone. A GT reset invalidates all
     /// outstanding display/cache witnesses; reset alone never retires DMA.
     reset_lost: Arc<AtomicBool>,
@@ -355,6 +358,14 @@ pub(crate) struct Physical {
     /// The off-path FBC CFB carve, shared by every clone.
     fbc_carve: Arc<crate::intel_gpu_stolen::CarveSlot>,
 }
+/// What a Panther Lake KMS owner's install proved about display 30.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Display30 {
+    /// Wa_15015404425 still applies (`intel_gpu_xe3lpd::wa_15015404425`:
+    /// a media GT before B0).
+    flush: bool,
+}
+
 impl Physical {
     fn read64(&self, offset: u64) -> u64 {
         u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32)
@@ -468,7 +479,9 @@ impl MmioWindow for Physical {
             // xe_mmio.c::mmio_flush_pending_writes, Wa_15015404425
             // (xe_device_wa_oob.rules: PLATFORM(LUNARLAKE)): four dummy
             // writes precede every read, display reads included.
-            if self.generation == Generation::LunarLake {
+            if self.generation == Generation::LunarLake
+                || self.display30.is_some_and(|display| display.flush)
+            {
                 for _ in 0..4 {
                     self.window.write32(0x130030, 0);
                 }
@@ -494,13 +507,20 @@ unsafe impl DisplayAccess for Physical {
     fn access_ok(&self) -> bool {
         // The GEM scanout PAT index (`display_pte`) must be the GT owner's
         // programmed entry: MTL PAT1 = XELPG_PAT_1_WT, Xe2 PAT3 =
-        // XE2_PAT(0, 0, 0, 3, 3, 0).
+        // XE2_PAT(0, 0, 0, 3, 3, 0), and display 30's Xe3 PAT3 (the same
+        // entry in xe3_lpg_pat_table).
         self.console_access_ok()
             && match self.generation {
                 Generation::MeteorLake => self.read32(0x4804) == 4,
                 Generation::LunarLake => self.read32(0x480c) == 0x3c,
+                Generation::PantherLake => self.display30.is_some() && self.read32(0x480c) == 0x3c,
                 _ => true,
             }
+    }
+
+    fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        self.display30
+            .map(|_| crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
     }
 }
 impl Physical {
@@ -698,7 +718,7 @@ impl Platform for Physical {
         if !self.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
+        fetchers_with_cursor(self, fetcher_generation(self), false, owned_cursor)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
             return Err(FsError::NoDevice);
         }
@@ -716,7 +736,7 @@ impl Platform for Physical {
         if !self.console_access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
+        fetchers_with_cursor(self, fetcher_generation(self), false, owned_cursor)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
             return Err(FsError::NoDevice);
         }
@@ -966,6 +986,16 @@ fn fetchers_idle(
 ) -> Result<(), FsError> {
     fetchers_with_cursor(mmio, generation, owned_dsb, false)
 }
+/// The inventory a KMS owner's fetcher proofs read: a Panther Lake owner is
+/// display 30.00, whose `xe2_lpd_display` inventory (FBC A–D, five
+/// universal planes) is display 20's.
+fn fetcher_generation(platform: &Physical) -> Generation {
+    if platform.display30.is_some() {
+        Generation::LunarLake
+    } else {
+        platform.generation
+    }
+}
 fn fetchers_with_cursor(
     mmio: &impl MmioWindow,
     generation: Generation,
@@ -1193,9 +1223,26 @@ pub(crate) fn install(
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     console: ActiveScanout,
 ) {
-    if generation == Generation::PantherLake {
-        return;
-    }
+    // Panther Lake is owned only as display 30.00 behind the opted-in
+    // route, which holds Pipe A for its eDP panel: linear primary flips on
+    // the console's Pipe A. Cursor, CTM/LUTs (double-buffered on display
+    // >= 30), DSB, tiled primaries, XR30, FBC and PSR are not offered.
+    let display30 = if generation == Generation::PantherLake {
+        if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
+            return;
+        }
+        let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
+        let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
+        if crate::intel_gpu_xe2lpd::DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(
+            &window, flush,
+        )) != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
+        {
+            return;
+        }
+        Some(Display30 { flush })
+    } else {
+        None
+    };
     let platform = Physical {
         index,
         bar,
@@ -1203,6 +1250,7 @@ pub(crate) fn install(
         cap,
         window: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
         generation,
+        display30,
         reset_lost: Arc::new(AtomicBool::new(false)),
         recovering: false,
         fbc_carve: Arc::new(crate::intel_gpu_stolen::CarveSlot::new()),
@@ -1621,8 +1669,8 @@ impl<M: Platform> Device<M> {
             }
         }
         let format = io.format();
-        let pat =
-            crate::intel_gpu_scanout_io::display_pte(self.generation).map_or(0, |(_, pat)| pat);
+        let pat = crate::intel_gpu_scanout_io::display_pte_ip(self.generation, fresh.display_ip())
+            .map_or(0, |(_, pat)| pat);
         // SAFETY: all old current/pending owners remain in state.presenter;
         // retained console pages are outside their arena. No pre-reset
         // completion is consumed by this independent fresh transaction.
@@ -2368,8 +2416,11 @@ impl<M: Platform> Guard<'_, M> {
             io.qualify_xr30().map_err(|_| FsError::NoDevice)?;
         }
         let format = io.format();
-        let pat = crate::intel_gpu_scanout_io::display_pte(self.device.generation)
-            .map_or(0, |(_, pat)| pat);
+        let pat = crate::intel_gpu_scanout_io::display_pte_ip(
+            self.device.generation,
+            self.device.platform.display_ip(),
+        )
+        .map_or(0, |(_, pat)| pat);
         // SAFETY: startup owns the empty display-only arena and the original
         // console allocation remains retained by the registered IntelGpu.
         let mut presenter = unsafe {

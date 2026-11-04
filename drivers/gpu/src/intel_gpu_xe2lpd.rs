@@ -79,16 +79,12 @@
 //!   Wa_16025596647 DMC package-C blocking and the SRD_STATUS set-context
 //!   latency — none implemented, so PSR on display 20 stays refused.
 //!
-//! ## Panther Lake (display 30.00, Xe3_LPD) — refused, deltas recorded
+//! ## Panther Lake (display 30.00, Xe3_LPD)
 //!
-//! `xe3lpd_power_wells` (PW_B parented on PG1, new DC_off domains),
-//! `xe3lpd_cdclk_table` (crawl-only rungs to 691.2 MHz, CD2X divider
-//! fixed at 1, no CD2X pipe field, Wa_13012396614), PM demand without
-//! DBUF slices and a 4-bit pipe field, `xe3lpd_c20_dp_edp_tables`, eDP on
-//! Type-C (`PICA_PHY_CONFIG_CONTROL`), C10 only on PHY A (PHY A/B on WCL),
-//! no message-bus reset after reads/writes, P2PG disable for C20 eDP,
-//! `xe3lpd_dmc.bin`, pipe A/B DMC without PG0 save, double-buffered LUTs
-//! and FBC dirty rectangles.
+//! [`DisplayIp::Xe3Lpd`] is decoded only by [`DisplayIp::decode_all`]: the
+//! Meteor and Lunar Lake entries here keep refusing 30.00 through
+//! [`DisplayIp::decode`]. Its opted-in route, deltas and owned modeset entry
+//! live in [`crate::intel_gpu_xe3lpd`].
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_xelpg::XeLpgPort;
@@ -111,6 +107,10 @@ pub(crate) enum DisplayIp {
     Xelpdp,
     /// 20.00 (`xe2_lpd_display`): Lunar Lake.
     Xe2Lpd,
+    /// 30.00 (`xe2_lpd_display` again in `gmdid_display_map`): Panther
+    /// Lake, reached only through [`DisplayIp::decode_all`] and the
+    /// opted-in Panther Lake route ([`crate::intel_gpu_xe3lpd`]).
+    Xe3Lpd,
 }
 
 /// Why a display IP is not dispatched.
@@ -150,6 +150,30 @@ impl DisplayIp {
         Self::decode(a)
     }
 
+    /// [`DisplayIp::decode`] widened by display 30.00 (Xe3_LPD). Only the
+    /// display-30 route and the per-IP owners behind it use it; the Meteor
+    /// Lake and Lunar Lake entries keep [`DisplayIp::decode`], so 30.00
+    /// stays a typed refusal there. 30.02 (`wcl_display`: three pipes, C10
+    /// on PHY A and B, `xe3lpd_3002_dmc.bin`, a 480 MHz CDCLK ceiling and
+    /// `xe3lpd_3002_sa_info`) belongs to Wildcat Lake, whose PCI IDs
+    /// (`INTEL_WCL_IDS`) are not in the driver table, and is refused.
+    pub(crate) const fn decode_all(gmd: u32) -> Result<Self, IpError> {
+        match Self::decode(gmd) {
+            Err(IpError::Unqualified { ver: 30, rel: 0 }) => Ok(Self::Xe3Lpd),
+            other => other,
+        }
+    }
+
+    /// [`DisplayIp::read`] over [`DisplayIp::decode_all`].
+    pub(crate) fn read_all(io: &(impl MmioWindow + ?Sized)) -> Result<Self, IpError> {
+        let a = io.read32(GMD_ID_DISPLAY);
+        let b = io.read32(GMD_ID_DISPLAY);
+        if a == u32::MAX || a != b || !io.display_access_ok() {
+            return Err(IpError::NoDevice);
+        }
+        Self::decode_all(a)
+    }
+
     /// The IP a PCI generation's display is (only for the platforms whose
     /// descriptor maps to exactly one qualified IP).
     #[cfg(any(test, feature = "kernel-test"))]
@@ -166,14 +190,24 @@ impl DisplayIp {
         match self {
             Self::Xelpdp => 14,
             Self::Xe2Lpd => 20,
+            Self::Xe3Lpd => 30,
         }
     }
 
-    /// Number of FBC instances (`fbc_mask`): A–B on 14.00, A–D on 20.00.
+    /// `DISPLAY_VER >= 20`: the display-20 branches display 30 shares (the
+    /// MDCLK source and ratio, the D2D link in `DDI_BUF_CTL`, the DBOX
+    /// credits, `XE2LPD_DE_CAP`, the package-C latency and the pipe-DMC
+    /// flip queue).
+    pub(crate) const fn xe2_plus(self) -> bool {
+        !matches!(self, Self::Xelpdp)
+    }
+
+    /// Number of FBC instances (`fbc_mask`): A–B on 14.00, A–D on 20.00
+    /// and 30.00 (both `xe2_lpd_display`).
     pub(crate) const fn fbc_instances(self) -> u64 {
         match self {
             Self::Xelpdp => 2,
-            Self::Xe2Lpd => 4,
+            Self::Xe2Lpd | Self::Xe3Lpd => 4,
         }
     }
 
@@ -194,7 +228,7 @@ impl DisplayIp {
         };
         match self {
             Self::Xelpdp => DC_STATE_EN_DC9 | DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC6,
-            Self::Xe2Lpd => DC_STATE_EN_DC9 | DC_STATE_EN_UPTO_DC6,
+            Self::Xe2Lpd | Self::Xe3Lpd => DC_STATE_EN_DC9 | DC_STATE_EN_UPTO_DC6,
         }
     }
 
@@ -204,6 +238,10 @@ impl DisplayIp {
         match self {
             Self::Xelpdp => ("i915/mtl_dmc.bin", 0x7000),
             Self::Xe2Lpd => (XE2LPD_DMC_FIRMWARE, XE2LPD_DMC_MAX_FW_SIZE),
+            Self::Xe3Lpd => (
+                crate::intel_gpu_xe3lpd::XE3LPD_DMC_FIRMWARE,
+                XE2LPD_DMC_MAX_FW_SIZE,
+            ),
         }
     }
 
@@ -211,7 +249,7 @@ impl DisplayIp {
     pub(crate) const fn chicken_trans(self) -> (u32, u32) {
         match self {
             Self::Xelpdp => (DP_DSC_INSERT_SF_AT_EOL_WA, DP_FEC_BS_JITTER_WA),
-            Self::Xe2Lpd => (DP_DSC_INSERT_SF_AT_EOL_WA, 0),
+            Self::Xe2Lpd | Self::Xe3Lpd => (DP_DSC_INSERT_SF_AT_EOL_WA, 0),
         }
     }
 
@@ -224,7 +262,7 @@ impl DisplayIp {
                 crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_ENABLE,
                 crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_STATE,
             ),
-            Self::Xe2Lpd => (
+            Self::Xe2Lpd | Self::Xe3Lpd => (
                 ddi_buf_ctl(port),
                 DDI_BUF_D2D_LINK_ENABLE,
                 DDI_BUF_D2D_LINK_STATE,
@@ -386,6 +424,9 @@ pub(crate) struct Flushed<'a, M: MmioWindow + ?Sized>(pub(crate) &'a M);
 impl<M: MmioWindow + ?Sized> MmioWindow for Flushed<'_, M> {
     fn display_access_ok(&self) -> bool {
         self.0.display_access_ok()
+    }
+    fn cx0_xe3(&self) -> bool {
+        self.0.cx0_xe3()
     }
     fn read32(&self, off: u64) -> u32 {
         for _ in 0..4 {
@@ -630,18 +671,32 @@ pub(crate) fn program_mdclk_ratio(
 /// the current clock to the first `xe2lpd_cdclk_table` rung at or above
 /// `floor_khz`, followed by the MDCLK ratio (raising programs it after the
 /// clock) with the current MBUS join. A faster acknowledged clock is kept.
+#[allow(dead_code)]
 pub(crate) fn raise_cdclk_floor(
     io: &(impl MmioWindow + ?Sized),
     floor_khz: u32,
 ) -> Result<(), crate::intel_gpu_xelpg_cdclk::CdclkError> {
+    raise_cdclk_floor_ip(io, DisplayIp::Xe2Lpd, floor_khz)
+}
+
+/// [`raise_cdclk_floor`] on `ip` (display 20 or 30: both take the MDCLK
+/// ratio after a raise in `bxt_set_cdclk`).
+pub(crate) fn raise_cdclk_floor_ip(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    floor_khz: u32,
+) -> Result<(), crate::intel_gpu_xelpg_cdclk::CdclkError> {
     use crate::intel_gpu_xelpg_cdclk::{self as cdclk, CdclkError};
-    let current = cdclk::Current::read_ip(io, DisplayIp::Xe2Lpd)?;
+    if !ip.xe2_plus() {
+        return Err(CdclkError::Readback);
+    }
+    let current = cdclk::Current::read_ip(io, ip)?;
     if current.known.is_some() && floor_khz <= current.actual_khz {
         return Ok(());
     }
-    let target = cdclk::calc_cdclk_ip(DisplayIp::Xe2Lpd, floor_khz.max(current.actual_khz))
-        .ok_or(CdclkError::Readback)?;
-    cdclk::program_ip(io, DisplayIp::Xe2Lpd, &current, target)?;
+    let target =
+        cdclk::calc_cdclk_ip(ip, floor_khz.max(current.actual_khz)).ok_or(CdclkError::Readback)?;
+    cdclk::program_ip(io, ip, &current, target)?;
     let joined = io.read32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL);
     if joined == u32::MAX {
         return Err(CdclkError::NoDevice);

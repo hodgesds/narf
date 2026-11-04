@@ -147,13 +147,55 @@ impl Receipt {
         mmio: &impl MmioWindow,
         current: impl FnOnce() -> bool,
     ) -> Result<Self, Error> {
+        Self::admit_route(
+            device,
+            bar,
+            mmio,
+            current,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd,
+        )
+    }
+
+    /// [`Self::admit_display`] for the opted-in Panther Lake display-30
+    /// function: the same read-only proofs against display 30.00, whose
+    /// `xe2_lpd_display` inventory (four pipes, five universal planes, three
+    /// DSBs per pipe, FBC A–D, the pipe-DMC flip queues) is display 20's.
+    pub(crate) fn admit_display_ptl(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        mmio: &impl MmioWindow,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Self, Error> {
+        Self::admit_route(
+            device,
+            bar,
+            mmio,
+            current,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+        )
+    }
+
+    /// The display-preserving admission of `ip`'s route: Lunar Lake with
+    /// display 20.00, or Panther Lake with display 30.00.
+    fn admit_route(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        mmio: &impl MmioWindow,
+        current: impl FnOnce() -> bool,
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    ) -> Result<Self, Error> {
+        use crate::intel_gpu_xe2lpd::DisplayIp;
         if !current() {
             return Err(Error::Unavailable);
         }
         if device.id.vendor != 0x8086
             || !matches!(device.addr, narf_bus::BusAddr::Pcie(_))
             || !crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-                .is_some_and(|p| p.is_lnl())
+                .is_some_and(|p| match ip {
+                    DisplayIp::Xe2Lpd => p.is_lnl(),
+                    DisplayIp::Xe3Lpd => p.is_ptl(),
+                    DisplayIp::Xelpdp => false,
+                })
             || bar.phys.raw() == 0
             || bar.phys.raw() & 4095 != 0
             || bar.len < 16 * 1024 * 1024
@@ -168,8 +210,7 @@ impl Receipt {
         }
         let gmd = read(mmio, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY)?;
         if gmd != read(mmio, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY)?
-            || crate::intel_gpu_xe2lpd::DisplayIp::decode(gmd)
-                != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd)
+            || DisplayIp::decode_all(gmd) != Ok(ip)
         {
             return Err(Error::Unsupported);
         }

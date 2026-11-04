@@ -12,6 +12,13 @@
 //! the LNL path uses and additionally refuses a latched response timeout.
 //! `intel_bw.c::mtl_find_qgv_points` supplies `qclk_gv_bw`: `U16_MAX`
 //! whenever SAGV is not enabled.
+//!
+//! Display 30 (Xe3_LPD) uses the [`Layout::Xe3`] field set
+//! (`intel_pmdemand_update_params` / `intel_pmdemand_init_pmdemand_params`,
+//! `DISPLAY_VER >= 30`): a 4-bit `XE3_PMDEMAND_PIPES_MASK` (7:4) holding
+//! `min(active pipes, INTEL_NUM_PIPES)` replaces the 2-bit pipes field and
+//! the DBUF slice count, and the scaler count is not tracked; the `_for`
+//! entry points take it. Display 14 and 20 keep the pre-Xe3 entry points.
 
 use crate::intel_gpu_aux::MmioWindow;
 use narf_filesystem::FsError;
@@ -55,6 +62,37 @@ const FIELDS: [(bool, u32, u32); 10] = [
     (true, 0, 0x7),      // PLLS
 ];
 
+/// The PM demand field layout of a display IP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// Display 14 and 20: `XELPDP_PMDEMAND_PIPES_MASK` (7:6),
+    /// `XELPDP_PMDEMAND_DBUFS_MASK` (5:4) and `XELPDP_PMDEMAND_SCALERS_MASK`.
+    PreXe3,
+    /// Display >= 30: `XE3_PMDEMAND_PIPES_MASK` (7:4), no DBUFS or SCALERS.
+    Xe3,
+}
+
+impl Layout {
+    pub(crate) const fn for_ip(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
+        match ip {
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => Self::Xe3,
+            _ => Self::PreXe3,
+        }
+    }
+}
+
+// (index into Params::values, second register, shift, mask) per Xe3 field.
+const XE3_FIELDS: [(usize, bool, u32, u32); 8] = [
+    (0, false, 16, 0xffff), // QCLK_GV_BW
+    (1, false, 12, 0x7),    // VOLTAGE_INDEX
+    (2, false, 8, 0xf),     // QCLK_GV_INDEX
+    (3, false, 4, 0xf),     // XE3_PMDEMAND_PIPES
+    (5, false, 0, 0x7),     // PHYS
+    (6, true, 20, 0x7ff),   // CDCLK_FREQ
+    (7, true, 8, 0x7ff),    // DDICLK_FREQ
+    (9, true, 0, 0x7),      // PLLS
+];
+
 impl Params {
     fn values(&self) -> [u32; 10] {
         [
@@ -93,6 +131,38 @@ impl Params {
             v[i] = ((if second { reg1 } else { reg0 }) >> shift) & mask;
         }
         Self::from_values(v)
+    }
+
+    /// `intel_pmdemand_init_pmdemand_params` field extraction for `layout`
+    /// (fields a layout does not carry decode as zero).
+    pub(crate) fn decode_for(layout: Layout, reg0: u32, reg1: u32) -> Self {
+        match layout {
+            Layout::PreXe3 => Self::decode(reg0, reg1),
+            Layout::Xe3 => {
+                let mut v = [0; 10];
+                for (i, second, shift, mask) in XE3_FIELDS {
+                    v[i] = ((if second { reg1 } else { reg0 }) >> shift) & mask;
+                }
+                Self::from_values(v)
+            }
+        }
+    }
+
+    /// [`Params::apply`] for `layout`: only the layout's fields are
+    /// updated, every other bit of both registers is kept.
+    pub(crate) fn apply_for(&self, layout: Layout, reg0: u32, reg1: u32) -> (u32, u32) {
+        match layout {
+            Layout::PreXe3 => self.apply(reg0, reg1),
+            Layout::Xe3 => {
+                let (mut r0, mut r1) = (reg0, reg1);
+                let values = self.values();
+                for (i, second, shift, mask) in XE3_FIELDS {
+                    let reg = if second { &mut r1 } else { &mut r0 };
+                    *reg = (*reg & !(mask << shift)) | (values[i].min(mask) << shift);
+                }
+                (r0, r1)
+            }
+        }
     }
 
     /// Field-wise maximum (`max3(old, new, 0)` when serialized).
@@ -147,6 +217,23 @@ impl Demand {
             scalers: 7,
         }
     }
+
+    /// `intel_pmdemand_atomic_check` for `layout`. On display >= 30 the
+    /// pipe count is `min(active pipes, INTEL_NUM_PIPES)` (four pipes on
+    /// `xe2_lpd_display`) and neither the DBUF slices nor the scalers are
+    /// tracked: they stay zero, as [`Params::decode_for`] reads them.
+    pub(crate) fn params_for(&self, layout: Layout) -> Params {
+        let params = self.params();
+        match layout {
+            Layout::PreXe3 => params,
+            Layout::Xe3 => Params {
+                active_pipes: (self.active_pipes.count_ones() as u8).min(4),
+                active_dbufs: 0,
+                scalers: 0,
+                ..params
+            },
+        }
+    }
 }
 
 fn read(io: &(impl MmioWindow + ?Sized), r: u64) -> Result<u32, FsError> {
@@ -189,6 +276,19 @@ pub(crate) fn current(io: &(impl MmioWindow + ?Sized)) -> Result<Params, FsError
     Ok(Params::decode(read(io, REQUEST0)?, read(io, REQUEST1)?))
 }
 
+/// [`current`] decoded with `layout`.
+pub(crate) fn current_for(
+    io: &(impl MmioWindow + ?Sized),
+    layout: Layout,
+) -> Result<Params, FsError> {
+    wait_idle(io)?;
+    Ok(Params::decode_for(
+        layout,
+        read(io, REQUEST0)?,
+        read(io, REQUEST1)?,
+    ))
+}
+
 /// `intel_pmdemand_program_params(new, old, serialized = true)`: the
 /// pre-plane request uses `old = Some`, the post-plane one `None`. Returns
 /// whether a request was initiated. The resulting request is proved by
@@ -198,11 +298,24 @@ pub(crate) fn program(
     new: &Params,
     old: Option<&Params>,
 ) -> Result<bool, FsError> {
+    program_for(io, Layout::PreXe3, new, old)
+}
+
+/// [`program`] with `layout`'s fields. Display 30 waits for the request
+/// the same way (`intel_pmdemand_wait`: only display 20 polls in Linux,
+/// every other display waits for the response interrupt on the same
+/// `REQ_ENABLE` completion this owner polls).
+pub(crate) fn program_for(
+    io: &(impl MmioWindow + ?Sized),
+    layout: Layout,
+    new: &Params,
+    old: Option<&Params>,
+) -> Result<bool, FsError> {
     wait_idle(io)?;
     let reg0 = read(io, REQUEST0)?;
     let reg1 = read(io, REQUEST1)?;
     let target = old.map_or(*new, |old| old.max(new));
-    let (mod0, mod1) = target.apply(reg0, reg1);
+    let (mod0, mod1) = target.apply_for(layout, reg0, reg1);
     if mod0 == reg0 && mod1 == reg1 {
         return Ok(false);
     }

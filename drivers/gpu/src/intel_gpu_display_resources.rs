@@ -27,6 +27,13 @@
 //! Tile4 primaries are fetched through the presenter's display page table
 //! and take the same tiled watermark images (skl_watermark.c has no DPT
 //! term); the multi-pipe layout stays display 14.
+//!
+//! Display 30 (Xe3_LPD, [`crate::intel_gpu_xe3lpd`]) runs the single-pipe
+//! ownership too: its vblank prefill budget is the VRR timing generator's
+//! guardband ([`crate::intel_gpu_xe3lpd::vrr_guardband`]), its PM demand is
+//! proved in the Xe3 layout, its CDCLK against the display-30 ceiling and
+//! voltage level, and the primary image adds the level-0/SAGV auto minimum
+//! allocation bit and `PLANE_MIN_BUF_CFG`.
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
@@ -91,11 +98,12 @@ fn idle_ip(io: &(impl MmioWindow + ?Sized), ip: DisplayIp) -> Result<(), FsError
         _ => FsError::NoDevice,
     })
 }
-/// The display IP this owner programs: 14.00 or 20.00 (`None` for every
-/// other GMD, which keeps the inherited layout).
+/// The display IP this owner programs: 14.00, 20.00 or 30.00 (`None` for
+/// every other GMD, which keeps the inherited layout). Display 30 is only
+/// reached through the opted-in Panther Lake route.
 fn display_ip(io: &(impl MmioWindow + ?Sized)) -> Result<Option<DisplayIp>, FsError> {
     let gmd = read(io, 0x510a0)?;
-    Ok(DisplayIp::decode(gmd).ok())
+    Ok(DisplayIp::decode_all(gmd).ok())
 }
 /// The owned modeset's pipe-A configuration: one full-screen XRGB8888
 /// primary, the budgeted hidden cursor and the combo PHY of DDI A/B.
@@ -176,14 +184,30 @@ impl Profile {
         let wm0 = alloc.wm[0].levels[0]
             .lines
             .max(alloc.cursor_wm.levels[0].lines);
+        let wm_level_disabled = match state.ip {
+            // The VRR guardband is display 30's vblank prefill budget.
+            DisplayIp::Xe3Lpd => wm::wm_level_disabled_dsc_ip(
+                state.ip,
+                wm::Timing {
+                    vblank_start: u32::from(state.vblank_start[0].unwrap_or(mode.v_active)),
+                    ..timing
+                },
+                latency,
+                wm0,
+                dsc.is_some(),
+            ),
+            DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => {
+                wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
+            }
+        }
+        .map_err(|_| FsError::Unsupported)?;
         let profile = Self {
             primary: alloc.wm[0],
             cursor: alloc.cursor_wm,
             cursor_start: alloc.cursor.start,
             cursor_ddb: alloc.cursor.reg(),
             primary_ddb: alloc.planes[0].reg(),
-            wm_level_disabled: wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
-                .map_err(|_| FsError::Unsupported)?,
+            wm_level_disabled,
             ip: state.ip,
         };
         if state.dbuf.active_pipes & 1 == 0
@@ -225,8 +249,21 @@ impl Profile {
     ) -> Result<(Self, res::State), FsError> {
         Self::valid_mode(mode)?;
         let latency = Latency::read(io)?;
-        let state = res::compute_ip(ip, &request_dsc(mode, tiling, min_cdclk_khz, dsc), &latency)
-            .map_err(|_| FsError::Unsupported)?;
+        // Display 30 always scans out through the VRR timing generator:
+        // the vblank prefill budget is its guardband.
+        let mut vblank_start = [None; res::PIPES];
+        if ip == DisplayIp::Xe3Lpd {
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+                .map_err(|_| FsError::Unsupported)?;
+            vblank_start[0] = Some(mode.v_total - guardband);
+        }
+        let state = res::compute_ip_vblank(
+            ip,
+            &request_dsc(mode, tiling, min_cdclk_khz, dsc),
+            &latency,
+            vblank_start,
+        )
+        .map_err(|_| FsError::Unsupported)?;
         let profile = Self::share(mode, &latency, &state, dsc)?;
         // The fixed owner's single-pipe layout is the joined one, with the
         // whole DBUF behind Pipe A.
@@ -316,10 +353,18 @@ impl Profile {
     pub(crate) fn capture(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
         let dsc = pipe_a_dsc(io, mode)?;
         let profile = Self::capture_layout(io, mode, dsc)?;
-        Self::check_cdclk(io, mode)?;
+        Self::check_cdclk(io, profile.ip, mode)?;
         Ok(profile)
     }
-    fn check_cdclk(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<(), FsError> {
+    /// The running CDCLK covers `mode` and the acknowledged PM demand covers
+    /// the clock: `ip`'s ceiling (691.2 MHz on display 30) and voltage level
+    /// (`xe3lpd_calc_voltage_level` is 0); both PM demand layouts keep the
+    /// voltage and CDCLK fields in place.
+    fn check_cdclk(
+        io: &(impl MmioWindow + ?Sized),
+        ip: DisplayIp,
+        mode: &Mode,
+    ) -> Result<(), FsError> {
         let pll = read(io, 0x46070)?;
         let ctl = read(io, 0x46000)?;
         let squash = read(io, 0x46008)?;
@@ -330,10 +375,12 @@ impl Profile {
             return Err(FsError::Unsupported);
         }
         let actual = crate::intel_gpu_modeset_xelpg::cdclk_current_khz(io);
-        if !(1..=652800).contains(&actual) || mode.pixel_clock_khz > actual * 2 {
+        if !(1..=crate::intel_gpu_xelpg_cdclk::max_cdclk_khz(ip)).contains(&actual)
+            || mode.pixel_clock_khz > actual * 2
+        {
             return Err(FsError::Unsupported);
         }
-        let voltage = crate::intel_gpu_xelpg_cdclk::voltage_level(actual);
+        let voltage = crate::intel_gpu_xelpg_cdclk::voltage_level_ip(ip, actual);
         let req0 = read(io, REQUEST0)?;
         let req1 = read(io, REQUEST1)?;
         if ((req0 >> 12) & 7) < u32::from(voltage) || ((req1 >> 20) & 2047) < actual.div_ceil(1000)
@@ -377,7 +424,7 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         mut state: res::State,
     ) -> Result<res::State, FsError> {
-        if state.ip == DisplayIp::Xe2Lpd {
+        if state.ip.xe2_plus() {
             let current = crate::intel_gpu_xelpg_cdclk::Current::read_ip(io, state.ip)
                 .map_err(|_| FsError::NoDevice)?;
             let rung = current.known.ok_or(FsError::Unsupported)?;
@@ -400,7 +447,11 @@ impl Profile {
         // Every acknowledged PM demand field covers the computed state, and
         // the QGV peak bandwidth is exactly the computed SAGV decision
         // (0xffff keeps SAGV masked).
-        let held = crate::intel_gpu_pmdemand::Params::decode(req0, req1);
+        let held = crate::intel_gpu_pmdemand::Params::decode_for(
+            crate::intel_gpu_pmdemand::Layout::for_ip(state.ip),
+            req0,
+            req1,
+        );
         let need = state.pmdemand;
         let mbus = read(io, crate::intel_gpu_xelpg_dbuf::MBUS_CTL)? & state.mbus_ctl_mask();
         if held.qclk_gv_bw != need.qclk_gv_bw
@@ -540,16 +591,31 @@ impl Profile {
             profile.primary = share.primary;
             profile.wm_level_disabled = share.wm_level_disabled;
         }
-        verify_primary(io, profile.primary)?;
+        verify_primary(io, ip, profile.primary)?;
         Ok(profile)
     }
 }
 
-fn primary_registers(wm: PlaneWm) -> Result<[(u64, u32); 9], FsError> {
-    res::plane_wm_image(0, 0, &wm).ok_or(FsError::Unsupported)
+/// Pipe A primary's watermark image on `ip`; display 30 adds the auto
+/// minimum allocation bits and `PLANE_MIN_BUF_CFG` (`skl_write_plane_wm`).
+fn primary_registers(ip: DisplayIp, wm: PlaneWm) -> Result<alloc::vec::Vec<(u64, u32)>, FsError> {
+    let mut image = res::plane_wm_image_ip(ip, 0, 0, &wm)
+        .ok_or(FsError::Unsupported)?
+        .to_vec();
+    if ip == DisplayIp::Xe3Lpd {
+        image.push((
+            res::plane_min_buf_cfg(0, 0),
+            res::min_ddb_value(&wm).ok_or(FsError::Unsupported)?,
+        ));
+    }
+    Ok(image)
 }
-fn verify_primary(io: &(impl MmioWindow + ?Sized), wm: PlaneWm) -> Result<(), FsError> {
-    for (r, value) in primary_registers(wm)? {
+fn verify_primary(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    wm: PlaneWm,
+) -> Result<(), FsError> {
+    for (r, value) in primary_registers(ip, wm)? {
         if read(io, r)? != value {
             return Err(FsError::Unsupported);
         }
@@ -630,7 +696,7 @@ impl Primary {
     fn images(&self, io: &(impl MmioWindow + ?Sized)) -> Result<[Profile; 2], FsError> {
         let dsc = pipe_a_dsc(io, &self.mode)?;
         let (linear, layout, ip) = Profile::capture_globals(io, &self.mode, dsc)?;
-        Profile::check_cdclk(io, &self.mode)?;
+        Profile::check_cdclk(io, ip, &self.mode)?;
         if ip != self.ip {
             return Err(FsError::Unsupported);
         }
@@ -675,7 +741,7 @@ impl Primary {
             } {
                 return Err(FsError::Unsupported);
             }
-            verify_primary(io, images[usize::from(self.current_tile4)].primary)?;
+            verify_primary(io, self.ip, images[usize::from(self.current_tile4)].primary)?;
         }
         Ok(())
     }
@@ -688,10 +754,10 @@ impl Primary {
             return Err(FsError::Busy);
         }
         self.check_current(io)?;
-        let image = primary_registers(self.images(io)?[usize::from(tile4)].primary)?;
+        let image = primary_registers(self.ip, self.images(io)?[usize::from(tile4)].primary)?;
         self.pending = Some(tile4);
         wm::publish_pipe_a(None);
-        Ok(image.to_vec())
+        Ok(image)
     }
     /// A staged image was never armed: the current image stays programmed.
     pub(crate) fn rollback(&mut self) {
@@ -704,7 +770,7 @@ impl Primary {
     pub(crate) fn complete(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
         let images = self.images(io)?;
         let target = self.pending.ok_or(FsError::Busy)?;
-        verify_primary(io, images[usize::from(target)].primary)?;
+        verify_primary(io, self.ip, images[usize::from(target)].primary)?;
         self.current_tile4 = target;
         self.pending = None;
         wm::publish_pipe_a(self.current_wm_level_disabled());
@@ -715,7 +781,7 @@ impl Primary {
     /// console SURF latch plus readback completes restoration.
     pub(crate) fn restore(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<Profile, FsError> {
         let [original, _] = self.images(io)?;
-        let image = primary_registers(original.primary)?;
+        let image = primary_registers(self.ip, original.primary)?;
         self.pending = Some(false); // retained before the first possible write
         wm::publish_pipe_a(None);
         for (r, value) in image {

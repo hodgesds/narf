@@ -126,6 +126,21 @@ pub(crate) struct Group {
 
 /// `tgl_get_bw_info(.., &mtl_sa_info)`; `None` for a zero row-cycle time.
 pub(crate) fn bw_info(q: &Qgv) -> Option<[Group; GROUPS]> {
+    bw_info_limit(q, DEPROGBWLIMIT_GBPS)
+}
+
+/// `intel_bw_init_hw`'s `sa_info` for `ip`: display 30.00 takes
+/// `xe3lpd_sa_info`, whose only difference from `mtl_sa_info` is
+/// `deprogbwlimit` (65 GB/s instead of 38).
+const fn deprogbwlimit_gbps(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> i64 {
+    match ip {
+        crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => crate::intel_gpu_xe3lpd::DEPROGBWLIMIT_GBPS,
+        _ => DEPROGBWLIMIT_GBPS,
+    }
+}
+
+/// [`bw_info`] with an explicit `deprogbwlimit` (GB/s).
+fn bw_info_limit(q: &Qgv, deprogbwlimit_gbps: i64) -> Option<[Group; GROUPS]> {
     let mut num_channels = i64::from(q.num_channels.max(1));
     let mut deinterleave = i64::from(q.deinterleave);
     let max_channels = i64::from(q.max_numchannels);
@@ -137,7 +152,7 @@ pub(crate) fn bw_info(q: &Qgv) -> Option<[Group; GROUPS]> {
     let dclk_max = i64::from(points.iter().map(|p| p.dclk).max().unwrap_or(0));
     let width = i64::from(q.channel_width);
     let peakbw = num_channels * ((width + 7) / 8) * dclk_max;
-    let maxdebw = (DEPROGBWLIMIT_GBPS * 1000).min(peakbw * DEPROGBWPCLIMIT / 100);
+    let maxdebw = (deprogbwlimit_gbps * 1000).min(peakbw * DEPROGBWPCLIMIT / 100);
     let ipqdepth = 16.min(DISPLAYRTIDS / num_channels);
     let clperchgroup = 4 * ((8 + num_channels - 1) / num_channels) * deinterleave;
     let mut groups = [Group::default(); GROUPS];
@@ -195,7 +210,22 @@ pub(crate) fn max_bw_index(
 /// 100 MB/s units of the point with the least derated headroom that still
 /// carries `data_rate_mbps`; `None` when no point does.
 pub(crate) fn qgv_peak_bw(q: &Qgv, data_rate_mbps: u32, num_planes: u32) -> Option<u16> {
-    let groups = bw_info(q)?;
+    qgv_peak_bw_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
+        q,
+        data_rate_mbps,
+        num_planes,
+    )
+}
+
+/// [`qgv_peak_bw`] over `ip`'s `sa_info`.
+pub(crate) fn qgv_peak_bw_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    q: &Qgv,
+    data_rate_mbps: u32,
+    num_planes: u32,
+) -> Option<u16> {
+    let groups = bw_info_limit(q, deprogbwlimit_gbps(ip))?;
     let mut best = u32::MAX;
     let mut peak = 0u32;
     for point in 0..usize::from(q.num_points) {

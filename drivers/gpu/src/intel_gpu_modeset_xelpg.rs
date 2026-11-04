@@ -124,6 +124,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
     fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
         self.raw.gen12_hpd_profile()
     }
+    fn cx0_xe3(&self) -> bool {
+        self.raw.cx0_xe3()
+    }
     fn display_access_ok(&self) -> bool {
         if self.failed.get() || !self.raw.display_access_ok() {
             self.failed.set(true);
@@ -560,7 +563,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// Dispatch the sequence on `ip` (display 20 only through
-    /// [`crate::intel_gpu_xe2lpd`]'s admitted entry).
+    /// [`crate::intel_gpu_xe2lpd`]'s admitted entry, display 30 only through
+    /// [`crate::intel_gpu_xe3lpd`]'s, over its PICA register view).
     pub(crate) fn with_display_ip(mut self, ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
         self.ip = ip;
         self
@@ -697,7 +701,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             EdpPlan::Link { link, .. } => link.pipe_bpp,
             _ => crate::intel_gpu_xelpg_dsc::PIPE_BPP,
         };
-        let xe2 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd;
+        // Display 20 and 30 share the DISPLAY_VER >= 20 branches.
+        let xe2 = self.ip.xe2_plus();
         // Display 20 drops DSC when XE2LPD_DE_CAP fuses it out
         // (has_dsc = 0): a stream that needs compression has no config.
         if xe2 && dsc.is_some() {
@@ -710,6 +715,25 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 return Err(ModesetError::DisplayResourceUnavailable);
             }
         }
+        // Display 30 always scans out through the VRR timing generator
+        // (intel_vrr_always_use_vrr_tg): its fixed-refresh guardband
+        // (intel_vrr_compute_guardband) is known before the first
+        // destructive write, and a mode it cannot describe is refused.
+        let guardband = if self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd {
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
+                .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
+            Some(
+                crate::intel_gpu_xe3lpd::vrr_guardband_for(
+                    self.mmio,
+                    &mode,
+                    dsc.map(|plan| plan.term(&mode)),
+                    &latency,
+                )
+                .map_err(|_| ModesetError::DisplayResourceUnavailable)?,
+            )
+        } else {
+            None
+        };
 
         if cold.is_none() {
             // This bounded correction preserves an already-enabled DDI. A
@@ -754,7 +778,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 .div_ceil(2)
                 .max(dsc_term.map_or(0, |t| t.min_cdclk_khz));
             if xe2 {
-                crate::intel_gpu_xe2lpd::raise_cdclk_floor(self.mmio, floor)
+                crate::intel_gpu_xe2lpd::raise_cdclk_floor_ip(self.mmio, self.ip, floor)
                     .map_err(|_| ModesetError::PllLockTimeout)?;
             } else {
                 program_cdclk_floor_khz(self.mmio, floor)?;
@@ -796,6 +820,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // block shared with Gen12 — the shared codecs build them),
         // then bdw_set_pipe_misc.
         self.program_transcoder(&mode);
+        if guardband.is_some() {
+            // hsw_configure_cpu_transcoder: intel_vrr_set_transcoder_timings
+            // follows intel_set_transcoder_timings.
+            crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+        }
         self.program_pipe(&mode);
         let program_msa = self.program_pipe_misc(pipe_bpp, matches!(plan, EdpPlan::Link { .. }))?;
 
@@ -932,6 +962,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             // intel_enable_transcoder, display >= 14, for every transcoder
             // enable on display 20 (no DP_FEC_BS_JITTER_WA there).
             self.chicken_trans()?;
+        }
+        if let Some(guardband) = guardband {
+            // intel_ddi_enable_dp: intel_vrr_transcoder_enable between
+            // intel_ddi_enable_transcoder_func and intel_enable_transcoder.
+            crate::intel_gpu_xe3lpd::tg_enable(self.mmio, guardband)
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
         }
         let frame = self.mmio.read32(0x70040);
         if frame == u32::MAX || !self.mmio.display_access_ok() {
@@ -1591,6 +1627,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         ) {
             return Err(ModesetError::PipelineStopUnavailable);
         }
+        // intel_ddi_post_disable_hdmi_or_sst, display 30: the always-used
+        // VRR timing generator stops after the transcoder.
+        if self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd {
+            crate::intel_gpu_xe3lpd::tg_disable(self.mmio)
+                .map_err(|_| ModesetError::PipelineStopUnavailable)?;
+        }
         // intel_ddi_post_disable: intel_dsc_disable, then
         // intel_dp_set_infoframes(false) clears the PPS SDP enable.
         crate::intel_gpu_xelpg_dsc::disable_engines(self.mmio, PipeIdx::A)
@@ -1633,14 +1675,33 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             Err(_) => return,
         };
         let base = Transcoder::A.base();
+        let xe3 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd;
+        if xe3 {
+            // intel_set_transcoder_timings, display >= 13: the set-context
+            // latency first (0 without PSR), which the display-30 VRR
+            // guardband assumes.
+            self.mmio
+                .write32(crate::intel_gpu_xe3lpd::TRANS_SET_CONTEXT_LATENCY_A, 0);
+        }
         self.mmio.write32(base + TRANS_HTOTAL_OFFSET, prog.htotal);
         self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);
         self.mmio.write32(base + TRANS_HSYNC_OFFSET, prog.hsync);
-        self.mmio.write32(base + TRANS_VTOTAL_OFFSET, prog.vtotal);
+        let vtotal = if xe3 {
+            crate::intel_gpu_xe3lpd::trans_vtotal(mode)
+        } else {
+            prog.vtotal
+        };
+        self.mmio.write32(base + TRANS_VTOTAL_OFFSET, vtotal);
         // Display 13+ clears VBLANK_START (intel_set_transcoder_timings).
         self.mmio
             .write32(base + TRANS_VBLANK_OFFSET, prog.vblank_display13());
         self.mmio.write32(base + TRANS_VSYNC_OFFSET, prog.vsync);
+        if xe3 {
+            // DP_MIN_HBLANK_CTL = min_hblank: intel_dp_compute_min_hblank
+            // gives 0 for an 8b/10b SST stream.
+            self.mmio
+                .write32(crate::intel_gpu_xe3lpd::DP_MIN_HBLANK_CTL_A, 0);
+        }
         compiler_fence(Ordering::SeqCst);
     }
 
