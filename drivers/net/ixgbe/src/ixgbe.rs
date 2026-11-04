@@ -2242,23 +2242,21 @@ async fn ixgbe_tx_dispatch(
     }
     let mut next = 0usize;
     while let Ok(mut frame) = stack_cons.recv().await {
-        loop {
-            let mut placed = false;
+        // Labeled break, not a `placed` flag: the flag's value correlates
+        // with whether `frame` was moved, which the borrow checker cannot
+        // track across the retry loop (E0382). The moved path exits the
+        // loop outright, so every path that reaches the next retry still
+        // owns `frame` (recovered from Full/Closed).
+        'place: loop {
             for _ in 0..n {
                 let q = next;
                 next = (next + 1) % n;
                 match prods[q].try_send(frame) {
-                    Ok(()) => {
-                        placed = true;
-                        break;
-                    }
+                    Ok(()) => break 'place,
                     Err(TrySendError::Full(f)) | Err(TrySendError::Closed(f)) => {
                         frame = f;
                     }
                 }
-            }
-            if placed {
-                break;
             }
             narf_scheduler::yield_now().await;
         }
