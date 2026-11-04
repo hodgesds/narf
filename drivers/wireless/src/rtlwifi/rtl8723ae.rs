@@ -24,10 +24,16 @@
 //!   (PCIe/eMAC bits and the ePHY MDIO loop).
 //! - [`fw`] — header validation and `rtl8723_download_fw` with
 //!   `rtl8723ae_firmware_selfreset`.
+//! - [`c2h`] — the firmware-event mailbox (`rtl_8723e_c2h_command_handle`):
+//!   header/close-byte protocol over `REG_C2HEVT_MSG_NORMAL`, BT info
+//!   parse, RSSI / operation-mode / unknown ids consumed without effect.
+//!   No production caller yet: the future AE packet owner schedules
+//!   `c2h::drain` when `irq::IsrStatus::c2h_pending` is set.
 
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod c2h;
 pub mod fw;
 pub mod power;
 pub mod pwrseq;

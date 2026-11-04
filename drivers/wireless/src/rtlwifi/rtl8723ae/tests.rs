@@ -437,3 +437,108 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723ae",
     smoke_rtl8723ae_init_mac_post_flow_ephy
 );
+
+// ── firmware-event mailbox (`rtl8723ae/c2h.rs`) ──────────────────────────
+
+/// Mailbox fake preset: header byte, sequence byte, close byte, body bytes.
+fn c2h_fake(header: u8, seq: u8, close: u8, body: &[u8]) -> FwFake {
+    let io = fw_fake(false, false, false, false);
+    {
+        let mut g = io.0.lock();
+        g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL)] = header;
+        g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL) + 1] = seq;
+        g.regs[usize::from(c2h::REG_C2HEVT_CLOSE)] = close;
+        for (i, b) in body.iter().enumerate() {
+            g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL) + 2 + i] = *b;
+        }
+    }
+    io
+}
+
+/// `rtl_8723e_c2h_command_handle` close-byte protocol: already-closed
+/// issues no writes and reads no body; not-ready writes `0x00` and reads
+/// no body; firmware-closed reads the body, dispatches, and closes.
+fn smoke_rtl8723ae_c2h_mailbox_close_protocol() -> TestResult {
+    use c2h::*;
+    // Already closed: close byte HOST_CLOSE, body bytes present but unread.
+    let io = c2h_fake(0x2c, 7, C2H_EVT_HOST_CLOSE, &[0x05, 0x03]);
+    if c2h::drain(&io) != Ok(Outcome::AlreadyClosed)
+        || !io.0.lock().writes.is_empty()
+        || io.0.lock().regs[usize::from(REG_C2HEVT_CLOSE)] != C2H_EVT_HOST_CLOSE
+    {
+        return TestResult::Fail("8723AE mailbox already-closed branch");
+    }
+    // Not ready: close byte neither host- nor firmware-closed.
+    let io = c2h_fake(0x2c, 7, 0x55, &[0x05, 0x03]);
+    if c2h::drain(&io) != Ok(Outcome::NotReady)
+        || io.0.lock().writes != vec![(REG_C2HEVT_CLOSE, 0, 1)]
+    {
+        return TestResult::Fail("8723AE mailbox not-ready branch");
+    }
+    // Firmware-closed with an ignored id still issues the final close.
+    let io = c2h_fake(0x04, 9, C2H_EVT_FW_CLOSE, &[]);
+    if c2h::drain(&io) != Ok(Outcome::Dispatched(Event::Ignored { id: C2H_V0_BT_RSSI }))
+        || io.0.lock().writes != vec![(REG_C2HEVT_CLOSE, 0, 1)]
+    {
+        return TestResult::Fail("8723AE mailbox ignored-id close write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_c2h_mailbox_close_protocol
+);
+
+/// BT info dispatch: header nibbles (id low, len high), the
+/// `rtl8723e_dm_bt_parse_bt_info` bit decode, and the final close write.
+fn smoke_rtl8723ae_c2h_mailbox_bt_info() -> TestResult {
+    use c2h::*;
+    // Header 0x2c: id 12 (BT_INFO), len 2. Body [0x05, 0x03]: inquiry
+    // page (bit 2) + connected (bit 0), retry count 3.
+    let io = c2h_fake(0x2c, 7, C2H_EVT_FW_CLOSE, &[0x05, 0x03]);
+    match c2h::drain(&io) {
+        Ok(Outcome::Dispatched(Event::BtInfo(info)))
+            if info.original == 0x05
+                && info.retry_cnt == 3
+                && info.inquiry_page
+                && info.connected => {}
+        _ => return TestResult::Fail("8723AE mailbox BT info decode"),
+    }
+    if io.0.lock().writes != vec![(REG_C2HEVT_CLOSE, 0, 1)] {
+        return TestResult::Fail("8723AE mailbox BT info close write");
+    }
+    // Short body (len 1): retry count stays 0, inquiry set, not connected.
+    let io = c2h_fake(0x1c, 0, C2H_EVT_FW_CLOSE, &[0x04]);
+    match c2h::drain(&io) {
+        Ok(Outcome::Dispatched(Event::BtInfo(info)))
+            if info.original == 0x04
+                && info.retry_cnt == 0
+                && info.inquiry_page
+                && !info.connected => {}
+        _ => return TestResult::Fail("8723AE mailbox BT info short body"),
+    }
+    // Empty body (len 0): all-zero info, still closed.
+    let io = c2h_fake(0x0c, 0, C2H_EVT_FW_CLOSE, &[]);
+    match c2h::drain(&io) {
+        Ok(Outcome::Dispatched(Event::BtInfo(info)))
+            if info.original == 0
+                && info.retry_cnt == 0
+                && !info.inquiry_page
+                && !info.connected => {}
+        _ => return TestResult::Fail("8723AE mailbox BT info empty body"),
+    }
+    // Operation-mode and unknown ids are consumed without effect.
+    for id in [C2H_V0_BT_OP_MODE, 9] {
+        let io = c2h_fake(id, 0, C2H_EVT_FW_CLOSE, &[]);
+        if c2h::drain(&io) != Ok(Outcome::Dispatched(Event::Ignored { id }))
+            || io.0.lock().writes != vec![(REG_C2HEVT_CLOSE, 0, 1)]
+        {
+            return TestResult::Fail("8723AE mailbox ignored ids");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_c2h_mailbox_bt_info
+);
