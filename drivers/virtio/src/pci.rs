@@ -126,6 +126,9 @@ pub enum VirtioPciError {
     RequestTooLarge,
     /// A DMA buffer for the request could not be allocated.
     OutOfMemory,
+    /// A caller-supplied value is outside the protocol range (e.g. a
+    /// VLAN VID above the 12-bit maximum). The command was not sent.
+    InvalidArgument,
 }
 
 /// Walk the standard cap list looking for the four virtio caps and
