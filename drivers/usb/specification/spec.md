@@ -351,6 +351,24 @@ also consult upstream Linux GPL sources.
   (`MAGIC` / link-on-wake / unicast / broadcast / multicast);
   USB remote-wakeup arming is not yet wired (per-NIC suspend
   remainder).
+- `ax88179` binds the ASIX AX88179 (USB 3.0 GbE, reference PID
+  `0b95:1790` only in v1) over vendor control transfers (`bRequest`
+  is the access class: MAC `0x01`, PHY `0x02`, EEPROM `0x04`,
+  EFUS `0x05`): MAC access packs `wValue` = register,
+  `wIndex` = byte count; PHY access packs `wValue` = PHY id
+  (`0x03`), `wIndex` = register. Bind runs the reset sequence
+  (PHY power-up + IPRL, 500 ms, clock select, 200 ms, best-effort
+  auto-detach, station-address read from `AX_NODE_ID`, bulk-IN
+  queue config, pause watermarks, checksum controls, RX control,
+  monitor mode, giga medium mode, autoneg restart) and publishes
+  as `usb-ax{N}` with the same tombstone-detach and no-invented-
+  address rules as `r8152`. TX prepends an 8-byte header (length
+  + zero GSO size in v1 + padding flag when `(len + 8) %
+  maxpacket == 0`); RX parses concatenated-frame bulk buffers with
+  a trailing `rx_hdr` (`pkt_cnt`/`hdr_off`) and per-packet metadata
+  (CRC/DROP errors and runts dropped, dummy headers skipped).
+  Link-status interrupt, offload advertisement, multicast filter,
+  VLAN, and jumbo frames are follow-ups, not v1.
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable
