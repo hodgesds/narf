@@ -155,3 +155,54 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_signature_rank_dimensions_and_dsp_stride
 );
+
+fn smoke_rtw89_8852a_board_blacklist() -> TestResult {
+    // Upstream has no 8852A blacklist, and NARF must not fall back to
+    // the 8851B signature-only path for A.
+    if Blacklist::upstream(ChipId::Rtl8852A).is_some() {
+        return TestResult::Fail("8852A must have no upstream blacklist");
+    }
+    let enabled = Fuses::decode(ChipId::Rtl8852A, 255, 0x7f);
+    if enabled.map(|f| f.enabled()).unwrap_or(false) != true {
+        return TestResult::Fail("8852A legacy fuses must decode enabled");
+    }
+    let enabled = Fuses::decode(ChipId::Rtl8852A, 255, 0x7f).unwrap();
+    // Board policy v1 blacklists firmware bit 5 only.
+    let mut bits = [0u8; 32];
+    bits[0] = 1 << 5;
+    let policy = Blacklist::board_8852a(1, bits);
+    if !policy.has_chip_list() {
+        return TestResult::Fail("8852A board policy must carry a chip list");
+    }
+    let mut listed = [0u8; 40];
+    listed[32] = 5;
+    listed[33] = 1;
+    if enabled.check_blacklist(Some(policy), &listed) != Err(Error::Blacklisted) {
+        return TestResult::Fail("8852A board blacklist did not reject bit 5");
+    }
+    let mut newer = [0u8; 40];
+    newer[32] = 5;
+    newer[33] = 2;
+    if enabled.check_blacklist(Some(policy), &newer) != Err(Error::NewerBlacklist) {
+        return TestResult::Fail("8852A board blacklist did not reject newer version");
+    }
+    let mut clear = [0u8; 40];
+    clear[32] = 3;
+    clear[33] = 1;
+    if enabled.check_blacklist(Some(policy), &clear) != Ok(()) {
+        return TestResult::Fail("8852A board blacklist rejected a clear firmware");
+    }
+    if enabled.check_blacklist(Some(policy), &listed[..33]) != Err(Error::Bounds) {
+        return TestResult::Fail("8852A board blacklist accepted short content");
+    }
+    // Enabled fuses with no policy fail; disabled fuses pass regardless.
+    if enabled.check_blacklist(None, &clear) != Err(Error::UnknownBlacklist) {
+        return TestResult::Fail("8852A missing board policy passed silently");
+    }
+    let disabled = Fuses::decode(ChipId::Rtl8852A, 255, 255).unwrap();
+    if disabled.check_blacklist(None, &clear) != Ok(()) {
+        return TestResult::Fail("8852A disabled fuses must pass without a policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8852a_board_blacklist);

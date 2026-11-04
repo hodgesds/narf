@@ -46,8 +46,8 @@ impl Blacklist {
     /// `__parse_security_section` only `WARN_ONCE`s, so the hardware-verified
     /// MSS signature selection is the whole secure policy. That exact policy
     /// is returned here; the matching signature is still required. RTL8852A
-    /// (also NULL upstream) stays on the authenticated-board-policy path of its
-    /// own chip row.
+    /// (also NULL upstream) takes the authenticated-board-policy path via
+    /// [`Blacklist::board_8852a`] instead: no signature-only fallback.
     pub fn upstream(chip: ChipId) -> Option<Self> {
         match chip {
             ChipId::Rtl8852B | ChipId::Rtl8852C => Some(Self {
@@ -69,6 +69,16 @@ impl Blacklist {
             bits,
             chip_list: true,
         }
+    }
+    /// RTL8852A board policy. Upstream `rtw8852a_chip_info.fw_blacklist`
+    /// is NULL, exactly like RTL8851B — but NARF does NOT take the 8851B
+    /// signature-only path for A: the spec requires an authenticated
+    /// board policy, so callers must supply one here (version + 32-byte
+    /// list from the authenticated board policy owner). With enabled
+    /// fuses and no policy, `Fuses::check_blacklist` fails with
+    /// `UnknownBlacklist`; it never silently passes on the signature.
+    pub fn board_8852a(version: u8, bits: [u8; 32]) -> Self {
+        Self::authenticated(version, bits)
     }
     /// Whether a host chip list is enforced (false = Linux NULL `fw_blacklist`).
     pub fn has_chip_list(self) -> bool {
