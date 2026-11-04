@@ -1014,9 +1014,9 @@ fn smoke_rtl8xxxu_probe_stores_device_handle() -> TestResult {
     if !narf_drivers_usb::xhci::is_probed() {
         return TestResult::Skip("xhci not probed (no live controller)");
     }
-    let c = match narf_drivers_usb::xhci::controller() {
+    let c = match narf_drivers_usb::xhci::first_controller() {
         Some(c) => c,
-        None => return TestResult::Skip("xhci controller() returned None"),
+        None => return TestResult::Skip("xhci first_controller() returned None"),
     };
 
     // Build a fake USBDevice with RTL8188EU VID/PID.
@@ -1251,9 +1251,9 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     if !narf_drivers_usb::xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let c = match narf_drivers_usb::xhci::controller() {
+    let c = match narf_drivers_usb::xhci::first_controller() {
         Some(c) => c,
-        None => return TestResult::Skip("xhci controller() returned None"),
+        None => return TestResult::Skip("xhci first_controller() returned None"),
     };
 
     // First probe — uses sentinel slot 0xFE.

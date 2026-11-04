@@ -15,7 +15,9 @@ const DONE: u32 = 1 << 31;
 const LONG_TRAIN: u32 = 0x10_0000;
 const SHORT_TRAIN: u32 = 0x20_0000; // PSP_BL__DRAM_SHORT_TRAIN
 const ENCROACHED: usize = 32 << 20;
-const CHUNK: usize = 4096;
+/// Encroached-prefix backup/restore step between scheduler yields: 2 MiB
+/// (16 yields per direction instead of 8192).
+const BACKUP_CHUNK: usize = 2 << 20;
 const SIGNATURE: u32 = 0x5453_4942;
 const HDP_HOLE: u64 = 0x7f000;
 const RUNTIME_DB_OFFSET: u64 = 1 << 20;
@@ -115,22 +117,25 @@ impl Io for Mmio {
                 .map_err(|_| Error::Invalid)
         })
     }
+    // 64-bit accesses halve the bus transactions of Linux's
+    // memcpy_fromio/memcpy_toio backup of the same window (the BAR is
+    // write-combining, as Linux's ioremap_wc).
     fn read_prefix(&mut self, offset: usize, bytes: &mut [u8]) {
-        for (index, word) in bytes.chunks_exact_mut(4).enumerate() {
+        for (index, word) in bytes.chunks_exact_mut(8).enumerate() {
             // SAFETY: complete 32 MiB prefix bounded at construction; aligned
             // reads are internal to the bounded backup loop under live authority.
             word.copy_from_slice(
-                &unsafe { self.vram.read32((offset + index * 4) as u64) }.to_le_bytes(),
+                &unsafe { self.vram.read64((offset + index * 8) as u64) }.to_le_bytes(),
             );
         }
     }
     fn write_prefix(&mut self, offset: usize, bytes: &[u8]) {
-        for (index, word) in bytes.chunks_exact(4).enumerate() {
+        for (index, word) in bytes.chunks_exact(8).enumerate() {
             // SAFETY: same bounds; acknowledged completion ended PSP's writes.
             unsafe {
-                self.vram.write32(
-                    (offset + index * 4) as u64,
-                    u32::from_le_bytes(word.try_into().unwrap()),
+                self.vram.write64(
+                    (offset + index * 8) as u64,
+                    u64::from_le_bytes(word.try_into().unwrap()),
                 )
             };
         }
@@ -173,6 +178,8 @@ impl Io for Mmio {
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
+    /// Backup/restore step between yields ([`BACKUP_CHUNK`] in production).
+    backup_step: usize,
     authority: Cap<BusDeviceCap, Write>,
     exchange: Training,
     backup: Vec<u8>,
@@ -235,13 +242,16 @@ impl<I: Io> Engine<I> {
     }
     /// PSP_MEM_TRAIN_SEND_LONG_MSG with the encroached 32 MiB preserved.
     async fn long_train(&mut self) -> Result<(), Error> {
-        for (index, chunk) in self.backup.chunks_mut(CHUNK).enumerate() {
+        let started = narf_time::monotonic_ns();
+        let step = self.backup_step;
+        for (index, chunk) in self.backup.chunks_mut(self.backup_step).enumerate() {
             let io = &mut self.io;
             self.authority
-                .invoke(Op(|| io.read_prefix(index * CHUNK, chunk)))
+                .invoke(Op(|| io.read_prefix(index * step, chunk)))
                 .map_err(|_| Error::Revoked)?;
             narf_scheduler::yield_now().await;
         }
+        let backed_up = narf_time::monotonic_ns();
         self.state = State::Training;
         let address = (self.exchange.c2p >> 20) as u32;
         self.access(|io| {
@@ -249,17 +259,29 @@ impl<I: Io> Engine<I> {
             io.write(STATUS, LONG_TRAIN);
         })?;
         let response = self.response().await?;
+        let trained = narf_time::monotonic_ns();
         // Only a terminal reply permits restoring memory; timeout/removal/
         // revocation/cancellation must never race an uncompleted PSP writer.
         self.state = State::Restoring;
-        for (index, chunk) in self.backup.chunks(CHUNK).enumerate() {
+        for (index, chunk) in self.backup.chunks(self.backup_step).enumerate() {
             let io = &mut self.io;
             self.authority
-                .invoke(Op(|| io.write_prefix(index * CHUNK, chunk)))
+                .invoke(Op(|| io.write_prefix(index * step, chunk)))
                 .map_err(|_| Error::Revoked)?;
             narf_scheduler::yield_now().await;
         }
         self.access(|io| io.flush())?;
+        {
+            use core::fmt::Write;
+            let ms = |a: u64, b: u64| b.saturating_sub(a) / 1_000_000;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: gddr6 long training: backup {} ms, PSP {} ms, restore {} ms",
+                ms(started, backed_up),
+                ms(backed_up, trained),
+                ms(trained, narf_time::monotonic_ns()),
+            );
+        }
         // psp_v11_0_memory_training_send_msg waits on bit 31 alone and treats
         // it as success; the low status bits are only reported.
         if response & 0xffff != 0 {
@@ -531,6 +553,7 @@ impl Trainer {
                 },
                 authority,
                 exchange,
+                backup_step: BACKUP_CHUNK,
                 backup: buffer(ENCROACHED)?,
                 cache: buffer(4096)?,
                 state: State::Prepared,
@@ -567,6 +590,7 @@ impl Trainer {
                 },
                 authority,
                 exchange,
+                backup_step: BACKUP_CHUNK,
                 backup: buffer(ENCROACHED)?,
                 cache: buffer(4096)?,
                 state: State::Prepared,

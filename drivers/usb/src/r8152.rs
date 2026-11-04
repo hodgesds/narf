@@ -1958,9 +1958,13 @@ pub struct RtlDevice {
     /// retarget every later device's cookie at the wrong
     /// device (the ECM/NCM rule).
     pub detached: bool,
+    /// Index of the xHCI controller the device is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
-/// System-wide registry of bound RTL devices.
+/// System-wide registry of bound RTL devices (records carry their
+/// controller; indices are the net-registry TX cookies).
 pub static RTL_DEVICES: IrqSafeSpinLock<Vec<RtlDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Driver control hook installed on each bound r8152 iface
@@ -2024,8 +2028,8 @@ pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
 /// The net stack's send hook is sync; bridge to the async
 /// bulk_out via block_on (called from TX paths that are not
 /// inside an executor poll — same contract as CDC-NCM's send).
-fn rtl_send_segment(slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(), ()> {
-    let c = crate::xhci::controller().ok_or(())?;
+fn rtl_send_segment(controller: u8, slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(), ()> {
+    let c = crate::xhci::controller_by_id(controller).ok_or(())?;
     narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, seg).await })
         .map_err(|_| ())?;
     Ok(())
@@ -2042,9 +2046,10 @@ fn rtl_send_segment(slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(), ()>
 /// no shared TX-path code is touched.
 fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let (slot_id, bulk_out_dci) = tx_target(idx).ok_or(())?;
+    let controller = RTL_DEVICES.lock().get(idx).ok_or(())?.controller;
     let mut seg = Vec::new();
     if build_tx_segment_meta(frame, meta, &mut seg).is_ok() {
-        return rtl_send_segment(slot_id, bulk_out_dci, &seg);
+        return rtl_send_segment(controller, slot_id, bulk_out_dci, &seg);
     }
     // Hardware encode failed. Only TCP super-frames get the
     // software fallback; anything else is a rejected request.
@@ -2066,7 +2071,7 @@ fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<()
     for s in &segments {
         let mut seg = Vec::new();
         build_tx_segment_meta(s, seg_meta, &mut seg)?;
-        rtl_send_segment(slot_id, bulk_out_dci, &seg)?;
+        rtl_send_segment(controller, slot_id, bulk_out_dci, &seg)?;
     }
     Ok(())
 }
@@ -2238,6 +2243,7 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
             mtu: 1500,
             pending_rms: None,
             detached: false,
+            controller: device.controller().id(),
         });
         idx
     };
@@ -2480,11 +2486,14 @@ fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 /// Infallible bookkeeping, adapted to the [`UsbUnbindFn`]
 /// contract with an unconditional `Ok(())` (#893: a hook
 /// reports failure with `Err(())`, never by panicking).
-pub fn detach_r8152_slot(slot_id: u8) -> Result<(), ()> {
+pub fn detach_r8152_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
     let ifaces: Vec<String> = {
         let mut g = RTL_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && d.slot_id == slot_id && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());
@@ -2499,15 +2508,18 @@ pub fn detach_r8152_slot(slot_id: u8) -> Result<(), ()> {
 
 /// Wholesale variant of [`detach_r8152_slot`] for controller
 /// recovery (`attach::detach_all_bindings`): tombstone every
-/// RTL binding and unregister every net iface, regardless of
-/// slot. Infallible and idempotent, same pump-exit and
+/// RTL binding on `controller` and unregister its net iface,
+/// regardless of slot. Infallible and idempotent, same pump-exit and
 /// never-remove reasoning as [`detach_r8152_slot`], and the
 /// same #789 mirror verdict (no clear call owed).
-pub fn detach_all_r8152() {
+pub fn detach_all_r8152(controller: u8) {
     let ifaces: Vec<String> = {
         let mut g = RTL_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());
@@ -3023,6 +3035,7 @@ pub mod tests {
             mtu: 1500,
             pending_rms: None,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -3068,6 +3081,7 @@ pub mod tests {
             mtu: 1500,
             pending_rms: None,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -3105,7 +3119,7 @@ pub mod tests {
             let mut g = RTL_DEVICES.lock();
             g[0].pump_running = false;
         }
-        if detach_r8152_slot(7).is_err() {
+        if detach_r8152_slot(0, 7).is_err() {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("detach must be infallible");
         }
@@ -3118,13 +3132,13 @@ pub mod tests {
             return TestResult::Fail("detach must tombstone exactly one binding");
         }
         // Idempotent, and unknown slots are a silent no-op.
-        let _ = detach_r8152_slot(7);
-        let _ = detach_r8152_slot(99);
+        let _ = detach_r8152_slot(0, 7);
+        let _ = detach_r8152_slot(0, 99);
         if tx_target(1) != Some((9, 6)) {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("repeat/unknown detach must not change the registry");
         }
-        detach_all_r8152();
+        detach_all_r8152(0);
         if tx_target(1).is_some() || narf_net::iface::lookup(&name9).is_some() {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("wholesale detach must clear every binding");
@@ -3154,7 +3168,7 @@ pub mod tests {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("re-bind must not recycle the detached iface name");
         }
-        let _ = detach_r8152_slot(7);
+        let _ = detach_r8152_slot(0, 7);
         if tx_target(idx).is_some() {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("cleanup detach must leave no live binding");
@@ -3190,10 +3204,11 @@ pub mod tests {
                 mtu: 1500,
                 pending_rms: None,
                 detached: false,
+                controller: 0,
             });
         }
         register();
-        let report = crate::class_registry::dispatch_unbind(7);
+        let report = crate::class_registry::dispatch_unbind(0, 7);
         let live = tx_target(0);
         RTL_DEVICES.lock().clear();
         if report.invoked == 0 {
@@ -3232,6 +3247,7 @@ pub mod tests {
             mtu: 1500,
             pending_rms: None,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -3261,7 +3277,7 @@ pub mod tests {
             return TestResult::Fail("net ifaces must resolve before detach");
         }
         register();
-        let report = crate::class_registry::dispatch_unbind(7);
+        let report = crate::class_registry::dispatch_unbind(0, 7);
         if report.invoked == 0 {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("dispatch_unbind invoked no hooks");
@@ -3306,7 +3322,7 @@ pub mod tests {
             RTL_DEVICES.lock().clear();
             return TestResult::Fail("re-bind must publish fresh and keep the old cookie dead");
         }
-        let _ = detach_r8152_slot(7);
+        let _ = detach_r8152_slot(0, 7);
         RTL_DEVICES.lock().clear();
         TestResult::Pass
     }

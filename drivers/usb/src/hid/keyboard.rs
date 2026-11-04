@@ -40,7 +40,6 @@ use narf_input::{
     evdev::{dispatch_key_to_node, key, DeviceCaps, DeviceId, DeviceNode, InputId, ROUTER},
     push_key, update_modifiers, KeyCode, Modifiers,
 };
-use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::{
     identity::{apply_identity, resolve_usb_identity},
@@ -164,7 +163,7 @@ impl UsbKeyboard {
 }
 
 /// Global registry of bound USB keyboards.
-static USB_KEYBOARDS: IrqSafeSpinLock<Vec<UsbKeyboard>> = IrqSafeSpinLock::new(Vec::new());
+static USB_KEYBOARDS: crate::xhci::PerController<Vec<UsbKeyboard>> = crate::per_controller_vec!();
 
 /// Lock-free count of bound keyboards.
 pub static ATTACHED_USB_KBD_COUNT: core::sync::atomic::AtomicU32 =
@@ -500,9 +499,8 @@ pub async fn try_bind_keyboard_already_addressed(
         evdev_node,
     };
     {
-        let mut g = USB_KEYBOARDS.lock();
-        g.push(kbd);
-        ATTACHED_USB_KBD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        USB_KEYBOARDS.of(xhci_dev.id()).lock().push(kbd);
+        ATTACHED_USB_KBD_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     Ok(())
 }
@@ -510,29 +508,34 @@ pub async fn try_bind_keyboard_already_addressed(
 /// Unregister a USB keyboard's evdev DeviceNode from the ROUTER.
 /// Call when the device is detached/unplugged so `/dev/input/event<N>`
 /// disappears. Mirrors `input_unregister_device` in Linux.
-pub fn unregister_keyboard_evdev(slot_id: u8) {
-    let mut g = USB_KEYBOARDS.lock();
+pub fn unregister_keyboard_evdev(controller: u8, slot_id: u8) {
+    let mut g = USB_KEYBOARDS.of(controller).lock();
     if let Some(pos) = g.iter().position(|k| k.slot_id == slot_id) {
         let kbd = g.remove(pos);
         ROUTER.unregister_device(kbd.evdev_id);
-        ATTACHED_USB_KBD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        crate::hid::saturating_sub(&ATTACHED_USB_KBD_COUNT, 1);
     }
 }
 
-/// Unregister every bound report-protocol keyboard. Called on a
-/// controller recovery epoch change, where every slot is dead by
-/// construction.
-pub fn unregister_all_keyboards() {
-    let slots: alloc::vec::Vec<u8> = USB_KEYBOARDS.lock().iter().map(|k| k.slot_id).collect();
+/// Unregister every report-protocol keyboard bound on `controller`.
+/// Called on a controller recovery epoch change, where every slot is
+/// dead by construction.
+pub fn unregister_all_keyboards(controller: u8) {
+    let slots: alloc::vec::Vec<u8> = USB_KEYBOARDS
+        .of(controller)
+        .lock()
+        .iter()
+        .map(|k| k.slot_id)
+        .collect();
     for slot in slots {
-        unregister_keyboard_evdev(slot);
+        unregister_keyboard_evdev(controller, slot);
     }
 }
 
 /// Drain reports from all bound USB keyboards, push events. Returns
 /// total events across all keyboards.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
-    let len = USB_KEYBOARDS.lock().len();
+    let len = USB_KEYBOARDS.of(xhci_dev.id()).lock().len();
     let mut total = 0;
     for idx in 0..len {
         total += pump_one(xhci_dev, idx);
@@ -542,7 +545,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 
 fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     let (slot_id, dci) = {
-        let g = USB_KEYBOARDS.lock();
+        let g = USB_KEYBOARDS.of(xhci_dev.id()).lock();
         match g.get(idx) {
             Some(k) => (k.slot_id, k.interrupt_in_dci),
             None => return 0,
@@ -551,7 +554,7 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     let mut total = 0;
     let mut buf = [0u8; 8];
     while let Ok(Some(_)) = xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
-        let mut g = USB_KEYBOARDS.lock();
+        let mut g = USB_KEYBOARDS.of(xhci_dev.id()).lock();
         if let Some(kbd) = g.get_mut(idx) {
             total += process_boot_report(kbd, &buf);
         }
@@ -562,7 +565,9 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
 
 #[doc(hidden)]
 pub fn __reset_usb_keyboards_for_test() {
-    USB_KEYBOARDS.lock().clear();
+    for (_, keyboards) in USB_KEYBOARDS.each() {
+        keyboards.lock().clear();
+    }
     ATTACHED_USB_KBD_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 

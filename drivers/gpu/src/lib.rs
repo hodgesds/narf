@@ -211,6 +211,8 @@ pub mod amdgpu_dcn30_hubbub;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_mst;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dcn30_scl;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_takeover;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_watermarks;
@@ -444,6 +446,8 @@ pub mod amdgpu_rdna2_modeset;
 pub use amdgpu_rdna2_modeset as amdgpu_navi22_modeset;
 #[cfg(all(feature = "kernel-test", feature = "amdgpu"))]
 mod amdgpu_navi22_modeset_model;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi22_plane;
 #[path = "amdgpu_navi22_platform.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_platform;

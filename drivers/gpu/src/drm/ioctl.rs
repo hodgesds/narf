@@ -36,7 +36,9 @@ use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 #[repr(u32)]
 pub enum IoctlCmd {
     Version = 0x00,
+    GetUnique = 0x01,
     GetMagic = 0x02,
+    SetVersion = 0x07,
     AuthMagic = 0x11,
     GemClose = 0x09,
     GetCap = 0x0C,
@@ -58,6 +60,9 @@ pub enum IoctlCmd {
     ModeGetConnector = 0xA7,
     ModeAddFb = 0xAE,
     ModeRmFb = 0xAF,
+    ModeCloseFb = 0xD0,
+    ModeGetFb = 0xAD,
+    ModeGetFb2 = 0xCE,
     ModePageFlip = 0xB0,
     ModeDirtyFb = 0xB1,
     ModeCreateDumb = 0xB2,
@@ -90,7 +95,9 @@ impl IoctlCmd {
     pub fn from_raw(raw: u32) -> Self {
         match raw & 0xFF {
             0x00 => IoctlCmd::Version,
+            0x01 => IoctlCmd::GetUnique,
             0x02 => IoctlCmd::GetMagic,
+            0x07 => IoctlCmd::SetVersion,
             0x11 => IoctlCmd::AuthMagic,
             0x09 => IoctlCmd::GemClose,
             0x0C => IoctlCmd::GetCap,
@@ -112,6 +119,9 @@ impl IoctlCmd {
             0xA7 => IoctlCmd::ModeGetConnector,
             0xAE => IoctlCmd::ModeAddFb,
             0xAF => IoctlCmd::ModeRmFb,
+            0xD0 => IoctlCmd::ModeCloseFb,
+            0xAD => IoctlCmd::ModeGetFb,
+            0xCE => IoctlCmd::ModeGetFb2,
             0xB9 => IoctlCmd::ModeObjGetProperties,
             0xAA => IoctlCmd::ModeGetProperty,
             0xAB => IoctlCmd::ModeConnectorSetProperty,
@@ -153,6 +163,9 @@ pub enum DrmIoctlError {
     Card(CardError),
     /// Connector id not found.
     UnknownConnector,
+    /// An argument the ioctl does not accept (`-EINVAL`), e.g. an unknown
+    /// capability (drm_getcap's default case).
+    Invalid,
     /// Permission denied per render-node / DRM_AUTH / DRM_MASTER gate.
     ///
     /// Linux: `-EACCES` returned from `drm_ioctl_permit`
@@ -227,6 +240,7 @@ pub mod drm_cap {
     pub const CRTC_IN_VBLANK_EVENT: u64 = 0x12;
     pub const SYNCOBJ: u64 = 0x13;
     pub const SYNCOBJ_TIMELINE: u64 = 0x14;
+    pub const ATOMIC_ASYNC_PAGE_FLIP: u64 = 0x15;
 }
 
 /// `struct drm_mode_card_res` — DRM_IOCTL_MODE_GETRESOURCES.
@@ -411,6 +425,10 @@ pub fn dispatch(
         }
         IoctlCmd::ModeAddFb2 => handle_addfb2(card, arg),
         IoctlCmd::ModeRmFb => handle_rmfb(card, arg),
+        // CLOSEFB needs the caller's open (the bridge handles it).
+        IoctlCmd::ModeCloseFb | IoctlCmd::ModeGetFb | IoctlCmd::ModeGetFb2 => {
+            Err(DrmIoctlError::UnknownCmd)
+        }
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(card),
         // GemClose: handled in the bridge where we can free the backing.
         // Return Ok here so the permission gate fires correctly.
@@ -438,6 +456,8 @@ pub fn dispatch(
         // GET_MAGIC / AUTH_MAGIC are handled in the bridge (primary-node fd is
         // the authenticated master); they never reach this generic dispatcher.
         IoctlCmd::GetMagic
+        | IoctlCmd::GetUnique
+        | IoctlCmd::SetVersion
         | IoctlCmd::AuthMagic
         | IoctlCmd::ModeSetCrtc
         | IoctlCmd::ModeGetCrtc
@@ -495,15 +515,23 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
         return Err(DrmIoctlError::BadSize);
     }
     let capability = u64::from_le_bytes(arg[0..8].try_into().unwrap());
-    let value = cap_value(capability);
+    let value = cap_value(capability).ok_or(DrmIoctlError::Invalid)?;
     Ok(DrmIoctlResult::GetCap(DrmGetCap { capability, value }))
 }
 
 /// The `DRM_IOCTL_GET_CAP` answer for `capability`, as the card table and
 /// a card without KMS state (`drm_ioctl_bridge::without_kms`) report it.
-pub fn cap_value(capability: u64) -> u64 {
-    match capability {
+pub fn cap_value(capability: u64) -> Option<u64> {
+    // drm_getcap: the core answers; an unknown capability is -EINVAL.
+    Some(match capability {
         drm_cap::DUMB_BUFFER => 1u64, // dumb-buffer alloc supported
+        // Always 1 in drm_getcap: WAIT_VBLANK takes the high-CRTC index and
+        // vblank/flip events carry the CRTC id.
+        drm_cap::VBLANK_HIGH_CRTC => 1,
+        drm_cap::CRTC_IN_VBLANK_EVENT => 1,
+        // mode_config.preferred_depth / prefer_shadow: per driver (0 here;
+        // amdgpu answers 24 / 1, `drm_ioctl_bridge::amdgpu_cap_value`).
+        drm_cap::DUMB_PREFERRED_DEPTH | drm_cap::DUMB_PREFER_SHADOW => 0,
         // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
         // supported via drm/prime.rs PrimeTable.
         drm_cap::PRIME => 3,
@@ -514,10 +542,15 @@ pub fn cap_value(capability: u64) -> u64 {
         drm_cap::SYNCOBJ_TIMELINE => 0,
         drm_cap::TIMESTAMP_MONOTONIC => 1,
         drm_cap::ADDFB2_MODIFIERS => 0, // no format modifiers yet
+        // LINUX-GAP: async (immediate) flips and page-flip targets are not
+        // implemented; reported 0 until they are.
+        drm_cap::ASYNC_PAGE_FLIP | drm_cap::ATOMIC_ASYNC_PAGE_FLIP | drm_cap::PAGE_FLIP_TARGET => 0,
+        // LINUX-GAP: amdgpu DCN reports its 256x256 cursor once a native
+        // cursor plane is exposed.
         drm_cap::CURSOR_WIDTH => 64,
         drm_cap::CURSOR_HEIGHT => 64,
-        _ => 0,
-    }
+        _ => return None,
+    })
 }
 
 fn handle_getresources(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {
@@ -704,4 +737,31 @@ pub(crate) fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
 /// Kept public so `tests.rs` can assert the wire value independently.
 pub fn connector_type_wire(ct: ConnectorType) -> u32 {
     ct as u32
+}
+
+/// Serialise one `drm_mode_modeinfo` (68 bytes), as GETCONNECTOR, GETCRTC
+/// and MODE_ID blobs lay it out.
+pub fn mode_info_bytes(m: &DrmModeModeInfo) -> [u8; 68] {
+    let mut b = [0u8; 68];
+    b[0..4].copy_from_slice(&m.clock.to_le_bytes());
+    let u16s = [
+        m.hdisplay,
+        m.hsync_start,
+        m.hsync_end,
+        m.htotal,
+        m.hskew,
+        m.vdisplay,
+        m.vsync_start,
+        m.vsync_end,
+        m.vtotal,
+        m.vscan,
+    ];
+    for (i, v) in u16s.iter().enumerate() {
+        b[4 + i * 2..6 + i * 2].copy_from_slice(&v.to_le_bytes());
+    }
+    b[24..28].copy_from_slice(&m.vrefresh.to_le_bytes());
+    b[28..32].copy_from_slice(&m.flags.to_le_bytes());
+    b[32..36].copy_from_slice(&m.r#type.to_le_bytes());
+    b[36..68].copy_from_slice(&m.name);
+    b
 }

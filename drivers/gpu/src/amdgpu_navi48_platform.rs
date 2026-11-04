@@ -3588,7 +3588,7 @@ fn publish_outputs() {
     struct Owned {
         index: usize,
         kind: ConnectorType,
-        edid: Option<[u8; 128]>,
+        edid: Option<Vec<u8>>,
         offered: Vec<Timing>,
         crtc: Option<usize>,
         vrr_capable: bool,
@@ -3612,10 +3612,8 @@ fn publish_outputs() {
             .map(|c| Owned {
                 index: c.index,
                 kind: c.kind,
-                edid: c
-                    .present
-                    .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
-                    .flatten(),
+                // The whole EDID, extension blocks included (drm_edid_read).
+                edid: c.present.then(|| c.edid.clone()).filter(|e| e.len() >= 128),
                 offered: if c.present {
                     c.modes.clone()
                 } else {
@@ -3651,7 +3649,7 @@ fn publish_outputs() {
         .map(|c| crate::amdgpu_navi48_kms::RoutedConnector {
             index: c.index,
             kind: c.kind,
-            edid: c.edid.as_ref(),
+            edid: c.edid.as_deref(),
             offered: &c.offered,
             crtc: c.crtc,
             // Any encoder drives any CRTC, of the pool's.
@@ -5485,7 +5483,7 @@ pub struct GemCursor {
 }
 impl GemCursor {
     /// The rows as premultiplied ARGB8888 pixels.
-    fn read(&self) -> Option<CursorImage> {
+    pub(crate) fn read(&self) -> Option<CursorImage> {
         let row = self.width as usize * 4;
         let mut line = alloc::vec![0u8; row];
         let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
@@ -5504,14 +5502,14 @@ impl GemCursor {
         })
     }
     /// The same commit's content: the same pin.
-    fn same(&self, other: &Self) -> bool {
+    pub(crate) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.pin, &other.pin)
     }
 }
 /// How long the cursor task waits for a GEM cursor's writes before it
 /// copies the rows anyway (Linux waits without a bound; NARF bounds it at
 /// the GFX job timeout, as a hung writer would be reset by then).
-const CURSOR_FENCE_WAIT_MS: u64 = 10_000;
+pub(crate) const CURSOR_FENCE_WAIT_MS: u64 = 10_000;
 
 /// One display's DRM cursor plane as last committed.
 struct DrmCursor {

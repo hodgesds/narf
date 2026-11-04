@@ -1,5 +1,7 @@
 //! DCN 3.0 (Navi22) display mode math and HUBP register derivation for up to
-//! six unscaled planes, one per stream, planned jointly. Parameters are
+//! six planes, one per stream, planned jointly. A plane may be positioned and
+//! scaled: its DSCL ratios, taps and recout come in as
+//! `resource_build_scaling_params` produces them ([`Scale`]). Parameters are
 //! `dcn3_0_ip` / `dcn3_0_soc` from Linux `dml/dcn30/dcn30_fpu.c`; the
 //! algorithm follows `display_mode_vba_30.c` — the ODM choice of
 //! `dml30_ModeSupportAndSystemConfigurationFull` and
@@ -14,7 +16,8 @@
 //! physical MC addresses), no DCC, no dynamic metadata, no writeback, at most
 //! the one 256-wide 32-bpp cursor `dcn20_populate_dml_pipes_from_context`
 //! always budgets for a graphics plane (`number_of_cursors` = 1), progressive
-//! scan, packed linear RGB; ODM 2:1 where mode support needs it (never 4:1),
+//! scan, packed linear RGB, scaled through the 4:4:4 RGB DSCL path (one ratio
+//! and tap pair, no chroma); ODM 2:1 where mode support needs it (never 4:1),
 //! DSC as an input (slices and compressed bpp), no MPC combine (Linux's
 //! `MPC_SPLIT_AVOID`), and OTGs never synchronized (`disable_timing_sync`).
 //! Every plane shares one DISPCLK, one DPPCLK DFS step, the return bandwidth,
@@ -49,6 +52,12 @@ const LINE_BUFFER_SIZE_BITS: u64 = 789_504;
 const LB_BIT_PER_PIXEL: u64 = 48; // linux: n/a (display_mode_vba.c: dm_lb_16 lb_depth 48)
 const MAX_LINE_BUFFER_LINES: i64 = 12; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_line_buffer_lines)
 const MAX_SCL_TAPS: u32 = 8; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_hscl_taps / max_vscl_taps)
+/// `max_hscl_ratio` / `max_vscl_ratio`: the DSCL's 6:1 downscale limit.
+const MAX_SCL_RATIO: i64 = 6; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_hscl_ratio / max_vscl_ratio)
+/// `max_dchub_pscl_bw_pix_per_clk`: pixels per DPPCLK DCHUB feeds the PSCL.
+const MAX_DCHUB_TO_PSCL: i64 = 4; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_dchub_pscl_bw_pix_per_clk)
+/// `max_pscl_lb_bw_pix_per_clk`: pixels per DPPCLK the PSCL hands the LB.
+const MAX_PSCL_TO_LB: i64 = 2; // linux: n/a (dcn30_fpu.c dcn3_0_ip.max_pscl_lb_bw_pix_per_clk)
 /// `dpte_buffer_size_in_pte_reqs_luma`; DCN30 sets no chroma share, so a
 /// single-plane surface gets exactly this.
 // linux: n/a (dcn30_fpu.c dcn3_0_ip.dpte_buffer_size_in_pte_reqs_luma)
@@ -404,9 +413,23 @@ pub struct Dsc {
     pub bits_per_pixel_x16: u32,
 }
 
-/// One stream of a configuration: its single unscaled plane, its DSC, and
-/// the PHY clock its link needs (the TMDS character clock, or the DP symbol
-/// clock), which must fit `max_phyclk`.
+/// A plane's scaler as `resource_build_scaling_params` leaves it and
+/// `dcn20_populate_dml_pipes_from_context` hands it to DML: the U3.19 ratios
+/// (`scale_ratio_depth.hscl_ratio` / `vscl_ratio`, source over destination)
+/// and the whole plane's recout (`dest.full_recout_width`, `recout_height`).
+/// The taps are the plane's [`crate::amdgpu_dml::Plane::h_taps`] /
+/// `v_taps`. The DSCL is enabled (`scl_enable`) when either ratio is not 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scale {
+    pub h_ratio: Fx,
+    pub v_ratio: Fx,
+    pub recout_width: u32,
+    pub recout_height: u32,
+}
+
+/// One stream of a configuration: its single plane, its DSC, and the PHY
+/// clock its link needs (the TMDS character clock, or the DP symbol clock),
+/// which must fit `max_phyclk`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stream {
     pub config: Config,
@@ -415,6 +438,9 @@ pub struct Stream {
     /// The least ODM combine the caller drives this stream with. Mode
     /// support may still choose more, and still checks the result.
     pub odm: Odm,
+    /// The plane's scaler; None for an unscaled plane, whose recout is its
+    /// viewport.
+    pub scale: Option<Scale>,
 }
 impl Stream {
     /// An uncompressed 8-bpc TMDS stream: the PHY runs at the pixel clock.
@@ -424,6 +450,80 @@ impl Stream {
             config,
             dsc: None,
             odm: Odm::None,
+            scale: None,
+        }
+    }
+}
+
+/// The scaler terms DML reads for one plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scaler {
+    h_ratio: Fx,
+    v_ratio: Fx,
+    h_taps: u32,
+    v_taps: u32,
+    /// `full_recout_width`: the plane's recout across every ODM slice.
+    recout_width: u32,
+    /// `scl_enable`: either ratio differs from 1.
+    enabled: bool,
+}
+impl Scaler {
+    fn of(stream: &Stream) -> Self {
+        let p = &stream.config.plane;
+        let (h_ratio, v_ratio, recout_width) = match stream.scale {
+            Some(s) => (s.h_ratio, s.v_ratio, s.recout_width),
+            None => (Fx::ONE, Fx::ONE, p.viewport_width),
+        };
+        Self {
+            h_ratio,
+            v_ratio,
+            h_taps: p.h_taps,
+            v_taps: p.v_taps,
+            recout_width,
+            enabled: h_ratio != Fx::ONE || v_ratio != Fx::ONE,
+        }
+    }
+    /// `PSCL_THROUGHPUT_LUMA` / `PSCL_FACTOR`: pixels per DPPCLK the
+    /// scaler sustains.
+    fn pscl_throughput(&self) -> Fx {
+        let dchub = Fx::int(MAX_DCHUB_TO_PSCL);
+        let lb = Fx::int(MAX_PSCL_TO_LB);
+        if self.h_ratio > Fx::ONE {
+            let taps = Fx::ratio(self.h_taps as i64, 6).ceil().max(1);
+            dchub.min(lb.times(self.h_ratio).over(Fx::int(taps)))
+        } else {
+            dchub.min(lb)
+        }
+    }
+    /// `DPPCLKUsingSingleDPPLuma` / `MinDPPCLKUsingSingleDPP` for an RGB
+    /// plane: the DPPCLK one pipe needs for `pixel_clock`, in MHz.
+    fn single_dpp_clock(&self, pixel_clock: Fx) -> Fx {
+        let factor = Fx::ratio(self.v_taps as i64, 6)
+            .times(Fx::ONE.min(self.h_ratio))
+            .max(
+                self.h_ratio
+                    .times(self.v_ratio)
+                    .over(self.pscl_throughput())
+                    .max(Fx::ONE),
+            );
+        let clock = pixel_clock.times(factor);
+        let doubled = pixel_clock.times(Fx::int(2));
+        if (self.h_taps > 6 || self.v_taps > 6) && clock < doubled {
+            doubled
+        } else {
+            clock
+        }
+    }
+    /// `hscale_pixel_rate_l` of `dml_rq_dlg_get_dlg_params`: the DPPCLK
+    /// multiple the horizontal scaler delivers at.
+    fn hscale_factor(&self) -> Fx {
+        let four = Fx::int(4);
+        if self.h_ratio <= Fx::ONE {
+            Fx::int(2)
+        } else if self.h_taps <= 6 {
+            self.h_ratio.times(Fx::int(2)).min(four)
+        } else {
+            self.h_ratio.min(four)
         }
     }
 }
@@ -478,7 +578,8 @@ impl JointPlan {
     }
 }
 
-fn validate(config: &Config) -> Result<(), Error> {
+fn validate(stream: &Stream) -> Result<(), Error> {
+    let config = &stream.config;
     let t = &config.timing;
     let p = &config.plane;
     if t.pixel_clock_khz == 0
@@ -505,14 +606,35 @@ fn validate(config: &Config) -> Result<(), Error> {
     {
         return Err(Error::Invalid);
     }
+    // The recout lies in the active area (resource_build_scaling_params
+    // clips it to the stream); an unscaled plane's recout is its viewport.
+    let (recout_width, recout_height) = match stream.scale {
+        Some(s) => (s.recout_width, s.recout_height),
+        None => (p.viewport_width, p.viewport_height),
+    };
+    if recout_width == 0
+        || recout_height == 0
+        || recout_width > t.h_active
+        || recout_height > t.v_active
+    {
+        return Err(Error::Invalid);
+    }
     if p.h_taps == 0 || p.v_taps == 0 || p.h_taps > MAX_SCL_TAPS || p.v_taps > MAX_SCL_TAPS {
         return Err(Error::Unsupported);
     }
-    // This port drives the scaler in bypass only: one unscaled plane.
-    if p.viewport_width != t.h_active
-        || p.viewport_height != t.v_active
-        || p.h_taps != 1
-        || p.v_taps != 1
+    // ScaleRatioAndTapsSupport for a 4:4:4 plane: a bypassed scaler takes
+    // one tap each way; an enabled one an even horizontal tap count (or
+    // one), at most 6:1, and no ratio above its taps.
+    let s = Scaler::of(stream);
+    let max_ratio = Fx::int(MAX_SCL_RATIO);
+    if (!s.enabled && (s.h_taps != 1 || s.v_taps != 1))
+        || (s.h_taps > 1 && s.h_taps % 2 == 1)
+        || s.h_ratio > max_ratio
+        || s.v_ratio > max_ratio
+        || s.h_ratio > Fx::int(s.h_taps as i64)
+        || s.v_ratio > Fx::int(s.v_taps as i64)
+        || s.h_ratio <= Fx::ZERO
+        || s.v_ratio <= Fx::ZERO
         || config.cursors > MAX_CURSORS
     {
         return Err(Error::Unsupported);
@@ -522,8 +644,11 @@ fn validate(config: &Config) -> Result<(), Error> {
 
 /// `CalculateSwathWidth` + `CalculateSwathAndDETConfiguration` for one linear
 /// RGB plane on `odm`'s pipes: swath height is one line, the DET (one per
-/// pipe) holds only luma, and an ODM pipe's swath is half the active width.
-fn geometry(config: &Config, odm: Odm) -> Result<Geometry, Error> {
+/// pipe) holds only luma, and an ODM pipe's swath is its half of the active
+/// width in source pixels (`dml_round(HActive / 2.0 * HRatio)`). The line
+/// buffer bounds the swath by the scaler's taps and ratios
+/// (`MaximumSwathWidthInLineBufferLuma`).
+fn geometry(config: &Config, odm: Odm, s: &Scaler) -> Result<Geometry, Error> {
     let format = config.plane.format;
     let bytes_per_pixel = format.bytes_per_pixel();
     let block_height_256 = 1;
@@ -531,8 +656,10 @@ fn geometry(config: &Config, odm: Odm) -> Result<Geometry, Error> {
     let viewport = config.plane.viewport_width as u64;
     let swath_width = match odm {
         Odm::None => viewport,
-        // dml_round(HActive / 2.0 * HRatio)
-        Odm::TwoToOne => viewport.min((config.timing.h_active as u64).div_ceil(2)),
+        Odm::TwoToOne => {
+            let half = Fx::ratio(config.timing.h_active as i64, 2).times(s.h_ratio);
+            viewport.min(half.plus(Fx::ratio(1, 2)).floor().max(0) as u64)
+        }
     };
     let surface_width_ub = ceil_multiple(config.plane.surface_width as u64, block_width_256);
     let swath_width_ub =
@@ -543,9 +670,14 @@ fn geometry(config: &Config, odm: Odm) -> Result<Geometry, Error> {
     if swath_width_ub * bytes_per_pixel * swath_height > det_bytes / 2 {
         return Err(Error::ViewportTooLarge);
     }
-    // MaximumSwathWidthLuma: the linear limit and the line buffer.
-    let line_buffer = LINE_BUFFER_SIZE_BITS / LB_BIT_PER_PIXEL / config.plane.v_taps as u64;
-    if swath_width > MAX_SWATH_WIDTH_LINEAR.min(line_buffer) {
+    // MaximumSwathWidthLuma: the linear limit and the line buffer, which
+    // holds vtaps lines plus what a downscale past 2:1 consumes per line.
+    let lines = s.v_taps as i64 + (s.v_ratio.ceil() - 2).max(0);
+    let line_buffer = Fx::int(LINE_BUFFER_SIZE_BITS as i64)
+        .times(s.h_ratio.max(Fx::ONE))
+        .over(Fx::int(LB_BIT_PER_PIXEL as i64))
+        .over(Fx::int(lines));
+    if swath_width > MAX_SWATH_WIDTH_LINEAR || Fx::int(swath_width as i64) > line_buffer {
         return Err(Error::ViewportTooLarge);
     }
     Ok(Geometry {
@@ -556,8 +688,8 @@ fn geometry(config: &Config, odm: Odm) -> Result<Geometry, Error> {
         swath_width_ub,
         swath_height,
         det_buffer_bytes: det_bytes,
-        h_ratio: Fx::ONE,
-        v_ratio: Fx::ONE,
+        h_ratio: s.h_ratio,
+        v_ratio: s.v_ratio,
     })
 }
 
@@ -611,6 +743,7 @@ struct Global {
 /// One plane's DCN30 values the prefetch, watermark and register stages use.
 struct PlaneCalc {
     config: Config,
+    scaler: Scaler,
     odm: Odm,
     dpp: u32,
     geometry: Geometry,
@@ -620,7 +753,7 @@ struct PlaneCalc {
     dppclk: Fx,
     /// `ReadBandwidthPlaneLuma`, the whole plane.
     read_bandwidth: Fx,
-    /// `cursor_bw` at VRatio 1: cursors x 256 x 32 / 8 bytes per line.
+    /// `cursor_bw` per unit VRatio: cursors x 256 x 32 / 8 bytes per line.
     cursor_bandwidth: Fx,
     dst_x_after_scaler: Fx,
     dst_y_after_scaler: u32,
@@ -633,7 +766,7 @@ struct PlaneCalc {
     v_init_pre_fill: Fx,
     max_num_swath: u32,
     max_v_startup: u32,
-    /// `UrgentBurstFactorLuma/Cursor` at VRatio 1.
+    /// `UrgentBurstFactorLuma/Cursor` at the plane's VRatio.
     burst: Fx,
     cursor_burst: Fx,
 }
@@ -784,7 +917,13 @@ fn per_pipe(clock: Fx, pipes: u32) -> Fx {
 /// Mode support plus the performance calculation for one plane. Fails before
 /// any hardware is touched when the board cannot carry the mode.
 pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
-    let joint = plan_joint(&[Stream::tmds(*config)], soc)?;
+    plan_stream(&Stream::tmds(*config), soc)
+}
+
+/// [`plan`] for one stream whose plane may be positioned or scaled
+/// (`Stream::scale`), on one pipe.
+pub fn plan_stream(stream: &Stream, soc: &Soc) -> Result<Plan, Error> {
+    let joint = plan_joint(core::slice::from_ref(stream), soc)?;
     let plane = joint.planes.first().ok_or(Error::Invalid)?;
     let pipe = plane.pipes[0].ok_or(Error::Invalid)?;
     if plane.odm != Odm::None {
@@ -860,7 +999,7 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
     }
     let vco_khz = streams[0].config.dentist_vco_khz;
     for s in streams {
-        validate(&s.config)?;
+        validate(s)?;
         if s.config.dentist_vco_khz != vco_khz {
             return Err(Error::Invalid);
         }
@@ -914,9 +1053,11 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
         if pipes == 2 && h_active % 2 != 0 {
             return Err(Error::Unsupported);
         }
-        if required(pipes) > max_dispclk_down
-            || per_pipe(pixel_clock, pipes).times(downspread) > max_dppclk_down
-        {
+        // MinDPPCLKUsingSingleDPP over this plane's pipes. More pipes than
+        // ODM gives (MPC combine) are never used, so a scaler one pipe per
+        // slice cannot clock is refused.
+        let dpp_needed = per_pipe(Scaler::of(s).single_dpp_clock(pixel_clock), pipes);
+        if required(pipes) > max_dispclk_down || dpp_needed.times(downspread) > max_dppclk_down {
             return Err(Error::Unsupported);
         }
     }
@@ -969,12 +1110,12 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
     } else {
         with
     };
-    // DPPCLK: unscaled, so one pixel per clock per pipe whatever the PSCL
-    // throughput (min(max_dchub_pscl_bw 4, max_pscl_lb_bw 2)) is; one DFS
-    // step for every plane, then each plane's 1/255 DTO share of it.
+    // DPPCLK_calculated: each plane's DPPCLKUsingSingleDPP over its pipes;
+    // one DFS step for every plane, then each plane's 1/255 DTO share of it.
     let mut needed = [Fx::ZERO; MAX_PIPES];
     for ((n, s), o) in needed.iter_mut().zip(streams).zip(odm) {
-        *n = per_pipe(mhz(s.config.timing.pixel_clock_khz), o.pipes()).times(downspread);
+        let single = Scaler::of(s).single_dpp_clock(mhz(s.config.timing.pixel_clock_khz));
+        *n = per_pipe(single, o.pipes()).times(downspread);
     }
     let needed = &needed[..streams.len()];
     let global_dppclk = dfs_up(needed.iter().fold(Fx::ZERO, |a, b| a.max(*b)), vco);
@@ -991,8 +1132,9 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
     let mut deep_sleep = Fx::int(8);
     for ((s, o), dpp_needed) in streams.iter().zip(odm).zip(needed) {
         let config = s.config;
+        let scaler = Scaler::of(s);
         let t = &config.timing;
-        let geometry = geometry(&config, *o)?;
+        let geometry = geometry(&config, *o, &scaler)?;
         let pixel_clock = mhz(t.pixel_clock_khz);
         let line_time = Fx::int(t.h_total as i64).over(pixel_clock);
         let bytes_per_pixel = Fx::int(geometry.bytes_per_pixel as i64);
@@ -1000,19 +1142,26 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
         let dppclk = global_dppclk.over(Fx::int(255)).times(Fx::int(
             dpp_needed.times(Fx::int(255)).over(global_dppclk).ceil(),
         ));
-        // ReadBandwidthPlaneLuma, the whole viewport, bytes per microsecond.
+        // ReadBandwidthPlaneLuma, the whole viewport, bytes per microsecond:
+        // VRatio source lines per destination line.
         let read_bandwidth = Fx::int(config.plane.viewport_width as i64)
             .times(bytes_per_pixel)
-            .over(line_time);
+            .over(line_time)
+            .times(scaler.v_ratio);
         total_read = total_read.plus(read_bandwidth);
         // CalculateDCFCLKDeepSleep: delivery time cancels the swath width.
-        let per_plane = per_pipe(
-            Fx::ratio(11, 10)
-                .times(bytes_per_pixel)
-                .times(pixel_clock)
-                .over(Fx::int(64)),
-            o.pipes(),
-        )
+        // Up to VRatio 1 a line is delivered at the destination pixel rate
+        // (SwathWidthY x DPPPerPlane / HRatio / PixelClock), above it at the
+        // scaler's (SwathWidthY / PSCL_THROUGHPUT / DPPCLK).
+        let bytes_per_us = Fx::ratio(11, 10).times(bytes_per_pixel).over(Fx::int(64));
+        let per_plane = if scaler.v_ratio <= Fx::ONE {
+            per_pipe(
+                bytes_per_us.times(pixel_clock).times(scaler.h_ratio),
+                o.pipes(),
+            )
+        } else {
+            bytes_per_us.times(scaler.pscl_throughput()).times(dppclk)
+        }
         .max(pixel_clock.over(Fx::int(16)));
         deep_sleep = deep_sleep.max(per_plane);
         let dsc_delay = match &s.dsc {
@@ -1023,6 +1172,7 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
             Fx::int((config.cursors as u64 * CURSOR_WIDTH * CURSOR_BPP / 8) as i64).over(line_time);
         planes.push(PlaneCalc {
             config,
+            scaler,
             odm: *o,
             dpp: o.pipes(),
             geometry,
@@ -1114,8 +1264,8 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
             .over(pixel_clock);
 
         // DSTXAfterScaler / DSTYAfterScaler: DSC delay, ODM's 18 pixels and
-        // the other pipes' recout.
-        let scaler = p.config.plane.h_taps > 1 || p.config.plane.v_taps > 1;
+        // the other pipes' recout (DPP_RECOUT_WIDTH, SwathWidthY / HRatio).
+        let scaler = p.scaler.enabled;
         let dpp_cycles = DPPCLK_DELAY_SUBTOTAL
             + DPPCLK_DELAY_CNVC_FORMATTER
             + p.config.cursors as i64 * DPPCLK_DELAY_CNVC_CURSOR
@@ -1133,9 +1283,11 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
             after_scaler = after_scaler.plus(Fx::int(p.dsc_delay as i64));
         }
         if p.odm != Odm::None {
-            after_scaler = after_scaler.plus(Fx::int(
-                ODM_DST_X_PIXELS + (p.dpp as i64 - 1) * p.geometry.swath_width as i64,
-            ));
+            let recout = Fx::int(p.geometry.swath_width as i64)
+                .over(p.scaler.h_ratio)
+                .floor();
+            after_scaler =
+                after_scaler.plus(Fx::int(ODM_DST_X_PIXELS + (p.dpp as i64 - 1) * recout));
         }
         p.dst_y_after_scaler = after_scaler.over(h_total).floor().max(0) as u32;
         p.dst_x_after_scaler =
@@ -1144,7 +1296,9 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
             Fx::int(p.dst_y_after_scaler as i64).plus(p.dst_x_after_scaler.over(h_total));
 
         // CalculatePrefetchSourceLines, viewport positioning honoured.
-        let pre_fill = Fx::ONE
+        let pre_fill = p
+            .scaler
+            .v_ratio
             .plus(Fx::int(p.config.plane.v_taps as i64))
             .plus(Fx::ONE)
             .over(Fx::int(2))
@@ -1164,11 +1318,12 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
         // MaxVStartupLines: progressive, no writeback.
         p.max_v_startup = (t.v_total - t.v_active).saturating_sub(1);
 
-        // UrgentBurstFactorLuma/Cursor in active (VRatio 1): no VStartup can
-        // hide a latency the DET or cursor buffer cannot.
-        p.burst = urgent_burst(&p.geometry, p.line_time, urgent_latency, Fx::ONE)
+        // UrgentBurstFactorLuma/Cursor in active (the plane's VRatio): no
+        // VStartup can hide a latency the DET or cursor buffer cannot.
+        let v_ratio = p.scaler.v_ratio;
+        p.burst = urgent_burst(&p.geometry, p.line_time, urgent_latency, v_ratio)
             .ok_or(Error::NoTimeForPrefetch)?;
-        p.cursor_burst = cursor_burst(p.config.cursors, p.line_time, urgent_latency, Fx::ONE)
+        p.cursor_burst = cursor_burst(p.config.cursors, p.line_time, urgent_latency, v_ratio)
             .ok_or(Error::NoTimeForPrefetch)?;
     }
     let maximum_max_v_startup = planes.iter().map(|p| p.max_v_startup).max().unwrap_or(0);
@@ -1212,7 +1367,11 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
                 total = total.plus(
                     p.read_bandwidth
                         .times(p.burst)
-                        .plus(p.cursor_bandwidth.times(p.cursor_burst))
+                        .plus(
+                            p.cursor_bandwidth
+                                .times(p.scaler.v_ratio)
+                                .times(p.cursor_burst),
+                        )
                         .max(
                             Fx::int(p.dpp as i64)
                                 .times(s.required_bandwidth.times(pre))
@@ -1270,18 +1429,23 @@ fn finish(
     for (k, p) in planes.iter().enumerate() {
         let geometry = &p.geometry;
         let line_time = p.line_time;
+        let v_ratio = p.scaler.v_ratio;
         let lines_in_det =
             geometry.det_buffer_bytes / geometry.bytes_per_pixel / geometry.swath_width;
         let lines_rounded = lines_in_det / geometry.swath_height * geometry.swath_height;
-        let full_det_time = Fx::int(lines_rounded as i64).times(line_time);
+        let full_det_time = Fx::int(lines_rounded as i64).times(line_time).over(v_ratio);
         // ActiveDRAMClockChangeLatencyMargin, luma only, less the other
-        // planes' share of a swath when several are active.
-        let lb_lines = Fx::int(
-            MAX_LINE_BUFFER_LINES
-                .min((LINE_BUFFER_SIZE_BITS / LB_BIT_PER_PIXEL / geometry.swath_width) as i64)
-                - (p.config.plane.v_taps as i64 - 1),
-        );
+        // planes' share of a swath when several are active. The line buffer
+        // holds destination-width lines (SwathWidthY / max(HRatio, 1)) and
+        // drains VRatio source lines per line.
+        let lb_width = Fx::int(geometry.swath_width as i64).over(p.scaler.h_ratio.max(Fx::ONE));
+        let lb_fit = Fx::int((LINE_BUFFER_SIZE_BITS / LB_BIT_PER_PIXEL) as i64)
+            .over(lb_width)
+            .floor();
+        let lb_lines =
+            Fx::int(MAX_LINE_BUFFER_LINES.min(lb_fit) - (p.config.plane.v_taps as i64 - 1));
         let mut margin = lb_lines
+            .over(v_ratio)
             .times(line_time)
             .plus(full_det_time)
             .minus(urgent_wm)
@@ -1292,7 +1456,8 @@ fn finish(
                 Fx::ONE
                     .minus(Fx::ratio(1, n as i64))
                     .times(Fx::int(geometry.swath_height as i64))
-                    .times(line_time),
+                    .times(line_time)
+                    .over(v_ratio),
             );
         }
         margins[k] = margin;
@@ -1311,6 +1476,7 @@ fn finish(
                     .minus(Fx::int(lines_rounded as i64)),
                 )
                 .times(line_time)
+                .over(v_ratio)
                 .max(Fx::ZERO);
             critical = Some((full_det_time, finish_swath));
         }
@@ -1385,11 +1551,13 @@ fn finish(
         };
         // FractionOfUrgentBandwidth: MaxTotalRDBandwidthNoUrgentBurst.
         fraction = fraction.plus(
-            p.read_bandwidth.plus(p.cursor_bandwidth).max(
-                Fx::int(p.dpp as i64)
-                    .times(s.required_bandwidth)
-                    .plus(p.cursor_bandwidth.times(s.v_ratio_prefetch)),
-            ),
+            p.read_bandwidth
+                .plus(p.cursor_bandwidth.times(p.scaler.v_ratio))
+                .max(
+                    Fx::int(p.dpp as i64)
+                        .times(s.required_bandwidth)
+                        .plus(p.cursor_bandwidth.times(s.v_ratio_prefetch)),
+                ),
         );
         let mut pipes = [None; 2];
         let slice = p.config.timing.h_active / p.dpp;
@@ -1466,7 +1634,8 @@ fn finish(
 }
 
 /// `calculate_ttu_cursor` for one 256-wide 32-bpp cursor: 256-byte requests
-/// of 64 pixels, four per line, hscl_ratio 1. None without a cursor.
+/// of 64 pixels, four per line, paced over `cur_src_width / hscl_ratio`
+/// destination pixels. None without a cursor.
 fn cursor_ttu(
     p: &PlaneCalc,
     prefetch: &Prefetch,
@@ -1479,42 +1648,50 @@ fn cursor_ttu(
     let ref_to_pix = refclk.over(p.pixel_clock);
     let req_width = 256 / (CURSOR_BPP / 8);
     let req_per_width = CURSOR_WIDTH.div_ceil(req_width) as i64;
+    let hactive_cur = Fx::int(CURSOR_WIDTH as i64).over(p.scaler.h_ratio);
+    let hscale_pixel_rate = p.scaler.hscale_factor().times(p.dppclk);
     let delivery = |v_ratio: Fx| {
         if v_ratio <= Fx::ONE {
-            Fx::int(CURSOR_WIDTH as i64)
-                .times(ref_to_pix)
-                .over(Fx::int(req_per_width))
+            hactive_cur.times(ref_to_pix).over(Fx::int(req_per_width))
         } else {
             refclk
                 .times(Fx::int(CURSOR_WIDTH as i64))
-                .over(Fx::int(2).times(p.dppclk))
+                .over(hscale_pixel_rate)
                 .over(Fx::int(req_per_width))
         }
     };
     // linux: n/a (refcyc_per_req_delivery_cur0 * 2^10, display_rq_dlg_calc_30.c)
     Ok(Some(CursorTtu {
-        refcyc_per_req_delivery: field(delivery(Fx::ONE), 10, 23)?,
+        refcyc_per_req_delivery: field(delivery(p.scaler.v_ratio), 10, 23)?,
         refcyc_per_req_delivery_pre: field(delivery(prefetch.v_ratio_prefetch), 10, 23)?,
         qos_level_fixed: 8, // linux: n/a (qos_level_fixed_cur0 = 8, display_rq_dlg_calc_30.c)
         qos_ramp_disable: 0,
     }))
 }
 
-/// `get_refcyc_per_delivery`. With ODM combine Linux scales the full recout
-/// by the combine factor and caps it at the slice: for an even active width
-/// that is the same `refclk x recout / pclk` as without.
+/// `get_refcyc_per_delivery`. With ODM 2:1 Linux paces a pipe's slice of
+/// the full recout, `2 x min(recout, hactive / 2)` destination pixels.
+#[allow(clippy::too_many_arguments)]
 fn refcyc_per_delivery(
     refclk: Fx,
     pixel_clock: Fx,
+    odm: Odm,
     recout_width: u64,
+    h_active: u64,
     v_ratio: Fx,
     hscale_pixel_rate: Fx,
     delivery_width: u64,
     req_per_swath_ub: u64,
 ) -> Fx {
     if v_ratio <= Fx::ONE {
+        let width = match odm {
+            Odm::None => Fx::int(recout_width as i64),
+            Odm::TwoToOne => {
+                Fx::int(2).times(Fx::int(recout_width as i64).min(Fx::ratio(h_active as i64, 2)))
+            }
+        };
         refclk
-            .times(Fx::int(recout_width as i64))
+            .times(width)
             .over(pixel_clock)
             .over(Fx::int(req_per_swath_ub as i64))
     } else {
@@ -1546,11 +1723,24 @@ fn registers(
     let h_total = t.h_total as u64;
     let bytes_per_pixel = geometry.bytes_per_pixel;
     let pitch = config.plane.pitch as u64;
-    // get_meta_and_pte_attr: an ODM pipe's viewport is its slice of the
-    // active width; the swath upper bound is capped at the pitch.
+    // get_surf_rq_param: an ODM pipe's viewport is its slice of the active
+    // width in source pixels, min(hscl_ratio x full_recout_width,
+    // hscl_ratio x hactive / 2), each truncated; the swath upper bound
+    // (get_meta_and_pte_attr) is capped at the pitch.
+    let scaler = &p.scaler;
     let vp_width = match p.odm {
         Odm::None => config.plane.viewport_width as u64,
-        Odm::TwoToOne => (config.plane.viewport_width as u64).min(t.h_active as u64 / 2),
+        Odm::TwoToOne => {
+            let full = scaler
+                .h_ratio
+                .times(Fx::int(scaler.recout_width as i64))
+                .floor();
+            let half = scaler
+                .h_ratio
+                .times(Fx::int((t.h_active / 2) as i64))
+                .floor();
+            full.min(half).max(1) as u64
+        }
     };
     let mut swath_width_ub =
         ceil_multiple(vp_width - 1, geometry.block_width_256) + geometry.block_width_256;
@@ -1610,45 +1800,29 @@ fn registers(
     );
     // dlg_vblank_start = vtotal - front porch.
     let vblank_start = (t.v_total - t.v_front_porch) as u64;
-    let hscale_pixel_rate = Fx::int(2).times(p.dppclk);
-    let recout = t.h_active as u64;
-    let line_delivery = refcyc_per_delivery(
-        refclk,
-        p.pixel_clock,
-        recout,
-        Fx::ONE,
-        hscale_pixel_rate,
-        swath_width_ub,
-        1,
-    );
-    let line_delivery_pre = refcyc_per_delivery(
-        refclk,
-        p.pixel_clock,
-        recout,
-        prefetch.v_ratio_prefetch,
-        hscale_pixel_rate,
-        swath_width_ub,
-        1,
-    );
-    let req_delivery = refcyc_per_delivery(
-        refclk,
-        p.pixel_clock,
-        recout,
-        Fx::ONE,
-        hscale_pixel_rate,
-        vp_width,
-        req_per_swath_ub,
-    );
-    let req_delivery_pre = refcyc_per_delivery(
-        refclk,
-        p.pixel_clock,
-        recout,
-        prefetch.v_ratio_prefetch,
-        hscale_pixel_rate,
-        vp_width,
-        req_per_swath_ub,
-    );
-    let row_lines = Fx::int(dpte_row_height as i64);
+    let hscale_pixel_rate = scaler.hscale_factor().times(p.dppclk);
+    let recout = scaler.recout_width as u64;
+    let h_active = t.h_active as u64;
+    let delivery = |v_ratio: Fx, width: u64, requests: u64| {
+        refcyc_per_delivery(
+            refclk,
+            p.pixel_clock,
+            p.odm,
+            recout,
+            h_active,
+            v_ratio,
+            hscale_pixel_rate,
+            width,
+            requests,
+        )
+    };
+    let line_delivery = delivery(scaler.v_ratio, swath_width_ub, 1);
+    let line_delivery_pre = delivery(prefetch.v_ratio_prefetch, swath_width_ub, 1);
+    let req_delivery = delivery(scaler.v_ratio, vp_width, req_per_swath_ub);
+    let req_delivery_pre = delivery(prefetch.v_ratio_prefetch, vp_width, req_per_swath_ub);
+    // dst_y_per_pte_row_nom_l: a PTE row of source lines spans
+    // dpte_row_height / vratio destination lines.
+    let row_lines = Fx::int(dpte_row_height as i64).over(scaler.v_ratio);
     let groups = Fx::int(dpte_groups_per_row_ub as i64);
     let pte_group_nom = row_lines
         .times(Fx::int(h_total as i64))

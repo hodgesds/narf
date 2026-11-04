@@ -200,7 +200,7 @@ pub fn register_initcalls() {
         if !xhci::is_probed() {
             return InitResult::NotPresent;
         }
-        spawn_supervisor_task();
+        start_supervisors();
         InitResult::Ok
     });
     // CCID slot-change pump: services the readers' Interrupt-IN
@@ -305,19 +305,46 @@ async fn resume_bound_ports(controller: &xhci::Xhci) {
     serial::port::resume_suspended_hub_ports(controller).await;
 }
 
-/// Spawn the long-running USB HID supervisor task. Walks every
-/// xHCI root-hub port the controller reports as connected, then
-/// every downstream port of every bound USB hub, attempting to
-/// bind one of {HID Boot Keyboard, HID Boot Mouse, USB Hub} per
-/// device. Loops pumping interrupt-IN reports onto the global
-/// input ring between wakes.
-fn spawn_supervisor_task() {
+/// One boxed supervisor future.
+type Supervisor = core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>>;
+
+/// Start one supervisor per bound xHCI controller, and arrange for a
+/// controller bound later to get its own. Every supervisor owns its
+/// controller's ports, hubs and bindings; slot ids and port numbers are
+/// only unique within a controller.
+fn start_supervisors() {
+    let mut supervisors: alloc::vec::Vec<Supervisor> =
+        xhci::on_controller_bound(spawn_supervisor_for)
+            .into_iter()
+            .map(supervisor)
+            .collect();
+    // Root mounting runs before the executor. Prime these same futures
+    // when the requested root has not appeared yet (it may sit behind any
+    // controller), then retain them for hot-plug.
+    boot_root::prepare(&mut supervisors);
+    for supervisor in supervisors {
+        narf_scheduler::spawn_stackful(supervisor);
+    }
+}
+
+/// Spawn the supervisor of a controller bound after
+/// [`start_supervisors`].
+fn spawn_supervisor_for(controller: alloc::sync::Arc<xhci::Xhci>) {
+    narf_scheduler::spawn_stackful(supervisor(controller));
+}
+
+/// The long-running USB supervisor of one controller. Walks every
+/// root-hub port the controller reports as connected, then every
+/// downstream port of every hub bound on it, attempting to bind one
+/// of {HID Boot Keyboard, HID Boot Mouse, USB Hub, ...} per device.
+/// Loops pumping interrupt-IN reports onto the global input ring
+/// between wakes.
+fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
     // Stackful: USB HID supervisor's enumeration loop polls xHCI
     // MMIO + per-port reset state. Preemption-capped at the
     // default 10 ms slice so a stuck port can't starve init.
-    let mut supervisor = alloc::boxed::Box::pin(async {
+    alloc::boxed::Box::pin(async move {
         use crate::attach::{self, AttachOutcome, HUBS};
-        const PUMP_CYCLES: u64 = 16_000_000;
         // Cap per-port enumeration attempts. After this many
         // consecutive failures (typically all PortResetTimeout on a
         // dead USB3 port the rate-matching hub has internally
@@ -352,6 +379,10 @@ fn spawn_supervisor_task() {
         let mut claimed_root: u128 = 0;
         // Per-root-port consecutive-failure counter.
         let mut root_fail_count = [0u8; 128];
+        // Downstream hub ports get the same retry budget as root ports;
+        // keyed by (hub slot, port), forgotten when the port disconnects.
+        let mut hub_fail_count: alloc::collections::BTreeMap<(u8, u8), u8> =
+            alloc::collections::BTreeMap::new();
         // Per-root-port last-observed PLS encoding. Sentinel value
         // 0xFF means "not yet sampled" so the first sample doesn't
         // trip a spurious "PLS changed" reset.
@@ -377,19 +408,10 @@ fn spawn_supervisor_task() {
         loop {
             SUPERVISOR_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             SUPERVISOR_PHASE.store(1, core::sync::atomic::Ordering::Relaxed);
-            // Acquire the controller handle once per loop iteration.
-            // The Arc clone takes the registry lock for microseconds;
-            // the rest of the iteration runs against `&*c` with no
-            // outer lock held. Phase 1 / Phase 2 / pump_all calls all
-            // operate on the same `&Xhci` borrow.
-            let c = match xhci::controller() {
-                Some(c) => c,
-                None => {
-                    narf_time::sleep_cycles(PUMP_CYCLES).await;
-                    continue;
-                }
-            };
-            let c: &xhci::Xhci = &c;
+            // This supervisor's own controller; Phase 1 / Phase 2 /
+            // pump_all calls all operate on the same `&Xhci` borrow.
+            let c: &xhci::Xhci = &controller;
+            let hubs = HUBS.of(c.id());
             SUPERVISOR_PHASE.store(2, core::sync::atomic::Ordering::Relaxed);
             if irq_vector.is_none() {
                 irq_vector = c.irq_vector;
@@ -415,7 +437,7 @@ fn spawn_supervisor_task() {
                         last_epoch,
                         epoch
                     );
-                    attach::detach_all_bindings();
+                    attach::detach_all_bindings(c.id());
                     claimed_root = 0;
                     root_fail_count = [0u8; 128];
                     last_pls = [0xFFu8; 128];
@@ -550,6 +572,16 @@ fn spawn_supervisor_task() {
                     }
                     AttachOutcome::UnknownClass => {
                         root_fail_count[pi] = root_fail_count[pi].saturating_add(1);
+                        if root_fail_count[pi] == MAX_PER_PORT_RETRIES {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  usb-supervisor: root port {} gave up after {} attempts (portsc={:?})",
+                                p,
+                                MAX_PER_PORT_RETRIES,
+                                c.portsc(p)
+                            );
+                        }
                     }
                 }
                 next_root_idx = idx + 1;
@@ -570,7 +602,7 @@ fn spawn_supervisor_task() {
             // num_ports) tuples up front so the registry lock isn't
             // held across the per-port enumeration attempts.
             let walks: alloc::vec::Vec<(u32, u32, u8, u8, u8, u64)> = {
-                let g = HUBS.lock();
+                let g = hubs.lock();
                 g.iter()
                     .map(|h| {
                         (
@@ -596,7 +628,7 @@ fn spawn_supervisor_task() {
                 // without it, a shifted index would hand us the
                 // wrong hub for this (route, tier) pair.
                 let hub_copy: Option<crate::hub::UsbHub> = {
-                    let g = HUBS.lock();
+                    let g = hubs.lock();
                     g.get(idx)
                         .filter(|h| h.hub.slot_id == *hub_slot)
                         .map(|h| h.hub)
@@ -631,19 +663,26 @@ fn spawn_supervisor_task() {
                     }
                 }
                 if cleared_bits != 0 {
-                    let mut g = HUBS.lock();
+                    let mut g = hubs.lock();
                     if let Some(h) = g.get_mut(idx) {
                         h.bound_downstream &= !cleared_bits;
                         h.suspended_downstream &= !cleared_bits;
                     }
                 }
                 let mut new_bound_bits: u64 = 0;
+                hub_fail_count
+                    .retain(|&(slot, port), _| slot != *hub_slot || connected.contains(&port));
                 for &dp in &connected {
                     if (*num_ports != 0) && dp > *num_ports {
                         continue;
                     }
                     let dpb = 1u64 << (dp as u32 & 63);
                     if (bound_mask | new_bound_bits) & dpb != 0 {
+                        continue;
+                    }
+                    if hub_fail_count.get(&(*hub_slot, dp)).copied().unwrap_or(0)
+                        >= MAX_PER_PORT_RETRIES
+                    {
                         continue;
                     }
                     let outcome = enumeration_wait::run(
@@ -670,8 +709,23 @@ fn spawn_supervisor_task() {
                         | AttachOutcome::UsbClassDriver
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
+                            hub_fail_count.remove(&(*hub_slot, dp));
                         }
-                        AttachOutcome::UnknownClass => {}
+                        AttachOutcome::UnknownClass => {
+                            let fails = hub_fail_count.entry((*hub_slot, dp)).or_insert(0);
+                            *fails = fails.saturating_add(1);
+                            if *fails == MAX_PER_PORT_RETRIES {
+                                use core::fmt::Write as _;
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  usb-supervisor: xhci{} hub slot {} port {} gave up after {} attempts",
+                                    c.id(),
+                                    hub_slot,
+                                    dp,
+                                    MAX_PER_PORT_RETRIES
+                                );
+                            }
+                        }
                     }
                 }
                 if new_bound_bits != 0 {
@@ -679,7 +733,7 @@ fn spawn_supervisor_task() {
                     // bound port's activity tick — a port's idle
                     // window runs from bind, not from the boot
                     // epoch its tick initialised to (#840).
-                    attach::mark_ports_bound(*hub_slot, new_bound_bits);
+                    attach::mark_ports_bound(c.id(), *hub_slot, new_bound_bits);
                 }
             }
 
@@ -724,12 +778,7 @@ fn spawn_supervisor_task() {
             // sleep wakes this task on time AND lets the executor halt
             // between USB pump cycles.
             let _ = irq_vector;
-            let cyc = narf_time::ns_to_cycles(100_000_000);
-            narf_time::sleep_cycles(cyc).await;
+            narf_time::sleep_ms(100).await;
         }
-    });
-    // Root mounting runs before the executor. Prime this same future when
-    // the requested root has not appeared yet, then retain it for hot-plug.
-    boot_root::prepare(supervisor.as_mut());
-    narf_scheduler::spawn_stackful(supervisor);
+    })
 }

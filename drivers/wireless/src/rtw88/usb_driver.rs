@@ -175,7 +175,10 @@ pub(super) fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
     };
     {
         let mut bound = BOUND.lock();
-        if bound.iter().any(|b| b.device.slot_id() == device.slot_id()) {
+        if bound.iter().any(|b| {
+            b.device.controller().id() == device.controller().id()
+                && b.device.slot_id() == device.slot_id()
+        }) {
             return Ok(());
         }
         bound.push(Bound {
@@ -203,10 +206,13 @@ pub(super) fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 /// `rtw_usb_disconnect`: withdraw the published shell (`rtw_unregister_hw`)
 /// and retire the owner (`Lifecycle::remove` stops every retained bulk
 /// receipt). Idempotent; other slots are untouched.
-fn unbind(slot_id: u8) -> Result<(), ()> {
+fn unbind(controller: u8, slot_id: u8) -> Result<(), ()> {
     let bound = {
         let mut all = BOUND.lock();
-        let Some(index) = all.iter().position(|b| b.device.slot_id() == slot_id) else {
+        // Slot ids are per xHCI controller.
+        let Some(index) = all.iter().position(|b| {
+            b.device.controller().id() == controller && b.device.slot_id() == slot_id
+        }) else {
             return Ok(());
         };
         all.swap_remove(index)

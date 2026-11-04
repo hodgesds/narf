@@ -249,6 +249,11 @@ pub struct Framebuffer {
     /// or imported buffer): `drm_framebuffer.obj[0]`, which the
     /// framebuffer holds.
     pub bo: Option<FbBo>,
+    /// The open that made a framebuffer without a per-open GEM buffer (a
+    /// card-table dumb buffer or an import) through the generic ADDFB
+    /// path: drm_framebuffer's place on that file's fb list, which RMFB and
+    /// CLOSEFB check. `None` when made by the kernel.
+    pub creator: Option<u64>,
     /// The Intel GEM buffer behind a framebuffer made from one of an open's
     /// Intel GEM handles (`drm_framebuffer.obj[0]`).
     #[cfg(feature = "intel")]
@@ -266,6 +271,11 @@ impl Framebuffer {
         }
         self.bo.as_ref().map(|bo| bo.owner)
     }
+    /// The open whose fb list holds this framebuffer: its GEM owner, or the
+    /// open that made it through the generic ADDFB path.
+    pub fn owner(&self) -> Option<u64> {
+        self.gem_owner().or(self.creator)
+    }
 }
 
 /// An Intel GEM buffer a framebuffer holds, and the open that made it.
@@ -277,6 +287,10 @@ pub struct IntelFb {
 }
 
 /// An amdgpu GEM buffer a framebuffer holds, and the open that made it:
+/// [`FbBo::owner`] of a framebuffer CLOSEFB released while it was still
+/// shown: no file owns it; it goes when nothing scans it.
+pub const CLOSED_FB_OWNER: u64 = u64::MAX;
+
 /// drm_fb_release removes an open's framebuffers when it closes.
 #[derive(Clone, Debug)]
 pub struct FbBo {
@@ -329,6 +343,9 @@ pub struct PlaneFrame {
     /// The pin amdgpu_dm_plane_helper_prepare_fb took on the framebuffer's
     /// GEM buffer; it lasts until a flip latches past it.
     pub bo: Option<ScanoutPin>,
+    /// Where a primary that is not full-screen and unscaled shows: its
+    /// SRC and CRTC rectangles. None for the full-screen unscaled frame.
+    pub placement: Option<Placement>,
 }
 impl PlaneFrame {
     /// A linear single-plane framebuffer at `phys`.
@@ -343,8 +360,18 @@ impl PlaneFrame {
             chroma_pitch: 0,
             modifier: 0,
             bo: None,
+            placement: None,
         }
     }
+}
+
+/// A positioned or scaled plane: the framebuffer rectangle it shows
+/// (SRC_X/Y/W/H, whole pixels) and the CRTC rectangle it shows it in
+/// (CRTC_X/Y/W/H, which may reach past the CRTC; DC clips it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub src: (u32, u32, u32, u32),
+    pub dst: (i32, i32, u32, u32),
 }
 
 // ── Card ───────────────────────────────────────────────────────────────
@@ -422,6 +449,9 @@ pub(crate) struct VirtGpuImport {
 pub(crate) struct PropertyBlob {
     pub(crate) id: u32,
     pub(crate) data: Vec<u8>,
+    /// The open that created it with CREATEPROPBLOB (drm_property_blob's
+    /// file_priv); `None` for a kernel or fixture blob.
+    pub(crate) owner: Option<u64>,
     /// Still owned by its creator: DESTROYPROPBLOB not yet called. A blob a
     /// committed property still names outlives its creator's reference, as
     /// a refcounted `drm_property_blob` does (`Card::collect_blobs`).
@@ -902,6 +932,38 @@ pub fn flips(display: u8) -> &'static narf_lib::sync::IrqSafeSpinLock<FlipLog> {
     &FLIPS[usize::from(display).min(FLIPS.len() - 1)]
 }
 
+/// The full timing a CRTC was committed with, and the MODE_ID blob that
+/// names it (Linux's `drm_crtc_state::mode` / `mode_blob`). `crate::Mode`
+/// keeps only size and refresh, which cannot tell two timings of one
+/// resolution apart (CTA 4K60 594 MHz vs a reduced-blanking 533.25 MHz).
+#[derive(Clone, Copy, Debug)]
+pub struct CommittedMode {
+    pub crtc: u32,
+    pub timing: crate::drm::ioctl::DrmModeModeInfo,
+    /// The blob MODE_ID reads back; a kernel blob when the mode came from a
+    /// legacy SETCRTC or the hardware rather than an atomic MODE_ID.
+    pub blob: Option<u32>,
+}
+
+/// `drm_mode_equal`: the timings, hskew/vscan and the mode flags match
+/// (type, name and the derived refresh are not compared).
+pub fn mode_equal(
+    a: &crate::drm::ioctl::DrmModeModeInfo,
+    b: &crate::drm::ioctl::DrmModeModeInfo,
+) -> bool {
+    (
+        a.clock,
+        [a.hdisplay, a.hsync_start, a.hsync_end, a.htotal, a.hskew],
+        [a.vdisplay, a.vsync_start, a.vsync_end, a.vtotal, a.vscan],
+        a.flags,
+    ) == (
+        b.clock,
+        [b.hdisplay, b.hsync_start, b.hsync_end, b.htotal, b.hskew],
+        [b.vdisplay, b.vsync_start, b.vsync_end, b.vtotal, b.vscan],
+        b.flags,
+    )
+}
+
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
 ///
 /// Linux analogue: `struct drm_device` + `drm_mode_config`.
@@ -975,6 +1037,12 @@ pub struct Card {
     /// VirGL resources imported from a render-node dma-buf for KMS scanout.
     pub(crate) virtgpu_imports: Vec<VirtGpuImport>,
     /// KMS property blobs created through MODE_CREATEPROPBLOB.
+    /// Per-CRTC committed timing and MODE_ID blob ([`CommittedMode`]).
+    pub committed_modes: Vec<CommittedMode>,
+    /// The kernel console's framebuffer (drm_fb_helper's fbdev fb): the
+    /// primary of every CRTC the console lights while no client is master.
+    /// No file owns it; RMFB/CLOSEFB refuse it.
+    pub console_fb: Option<u32>,
     pub(crate) property_blobs: Vec<PropertyBlob>,
     /// Next non-zero property-blob id.
     pub(crate) next_property_blob_id: u32,
@@ -998,6 +1066,13 @@ pub struct Card {
     /// model, which let a greeter and a user-session compositor both drive the
     /// same scanout with no handoff.
     pub(crate) current_master: Option<u64>,
+    /// Opens whose master has its unique name (the bus id) filled in by
+    /// SET_VERSION 1.1+ (drm_set_busid). GET_UNIQUE answers an empty name
+    /// until then, which libdrm's drmOpenByName depends on.
+    pub(crate) unique_masters: Vec<u64>,
+    /// Dumb-buffer backings [`Card::release_file_framebuffers`] removed,
+    /// for the caller to free once the card lock is dropped.
+    released_backing: Vec<(u64, u8)>,
     /// Issued DRM magic tokens: `(magic, open_id, authenticated)`. One magic
     /// per open, allocated on its first `GET_MAGIC` and kept for the life of
     /// the fd (a repeat `GET_MAGIC` returns the same value). `AUTH_MAGIC`
@@ -1110,6 +1185,14 @@ pub struct NativePlane {
     /// cursor_x/cursor_y), which a CURSOR ioctl without MOVE keeps.
     pub legacy_position: (i32, i32),
 }
+impl Card {
+    /// Whether DRM's primary and overlay planes are native planes
+    /// (`drm_native_planes`). A card with cursor planes alone (Navi22)
+    /// keeps the synthesized primary path.
+    pub fn has_native_kms_planes(&self) -> bool {
+        self.native_planes.iter().any(|p| !p.is_cursor())
+    }
+}
 impl NativePlane {
     /// An overlay: neither a primary nor a cursor plane.
     pub fn is_overlay(&self) -> bool {
@@ -1154,8 +1237,9 @@ impl ColorFormat {
 pub struct NativeOutput {
     /// The connector (id) this describes.
     pub connector: u32,
-    /// The sink's base EDID block, reported verbatim; None when unplugged.
-    pub edid: Option<[u8; 128]>,
+    /// The sink's whole EDID (base block and every extension block, as
+    /// drm_edid_read reads it), reported verbatim; None when unplugged.
+    pub edid: Option<Vec<u8>>,
     /// Exact driver-admitted timings, authoritative for GETCONNECTOR.
     /// Several may share a size and rounded refresh represented by only
     /// one entry in the connector's simplified `modes` list.
@@ -1267,10 +1351,14 @@ impl Card {
             dumb_backings: Vec::new(),
             virtgpu_imports: Vec::new(),
             property_blobs: Vec::new(),
+            committed_modes: Vec::new(),
+            console_fb: None,
             next_property_blob_id: 1,
             vblank_seq: 0,
             next_vblank_ns: 0,
             current_master: None,
+            unique_masters: Vec::new(),
+            released_backing: Vec::new(),
             magics: Vec::new(),
             next_magic: 1,
             native: Vec::new(),
@@ -1347,15 +1435,34 @@ impl Card {
         }
     }
 
-    /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
-    /// `is_master` for the per-ioctl permission gate.
-    pub fn is_master(&self, open_id: u64) -> bool {
-        self.current_master == Some(open_id)
+    /// Whether any open currently holds DRM master.
+    pub fn has_master(&self) -> bool {
+        self.current_master.is_some()
     }
 
-    #[cfg(feature = "intel")]
-    pub(crate) fn has_master(&self) -> bool {
-        self.current_master.is_some()
+    /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
+    /// `is_master` for the per-ioctl permission gate.
+    /// drm_set_busid: fill in the unique name of `open_id`'s master.
+    pub fn set_unique(&mut self, open_id: u64) {
+        if !self.unique_masters.contains(&open_id) {
+            self.unique_masters.push(open_id);
+        }
+    }
+    /// Whether GET_UNIQUE from `open_id` reports the bus id: its master's
+    /// unique name was set (file_priv->master: the open's own master, or
+    /// the current one it was opened under).
+    pub fn has_unique(&self, open_id: u64) -> bool {
+        self.unique_masters.contains(&open_id)
+            || self
+                .current_master
+                .is_some_and(|m| self.unique_masters.contains(&m))
+    }
+    /// The master's unique name goes with its last open.
+    pub fn release_unique(&mut self, open_id: u64) {
+        self.unique_masters.retain(|&o| o != open_id);
+    }
+    pub fn is_master(&self, open_id: u64) -> bool {
+        self.current_master == Some(open_id)
     }
 
     /// `DRM_IOCTL_SET_MASTER`. `Ok` if `open_id` already holds master or the
@@ -1762,9 +1869,46 @@ impl Card {
         self.property_blobs.push(PropertyBlob {
             id,
             data,
+            owner: None,
             user: true,
         });
         Ok(id)
+    }
+
+    /// Record that open `owner` created blob `id` (CREATEPROPBLOB).
+    pub(crate) fn set_blob_owner(&mut self, id: u32, owner: u64) {
+        if let Some(b) = self.property_blobs.iter_mut().find(|b| b.id == id) {
+            b.owner = Some(owner);
+        }
+    }
+    /// DESTROYPROPBLOB by open `owner` (drm_mode_destroyblob_ioctl):
+    /// `Err(true)` → EPERM for another open's blob, `Err(false)` → ENOENT.
+    pub(crate) fn destroy_owned_blob(&mut self, id: u32, owner: u64) -> Result<(), bool> {
+        let blob = self
+            .property_blobs
+            .iter()
+            .find(|b| b.id == id && b.user)
+            .ok_or(false)?;
+        if blob.owner.is_some_and(|o| o != owner) {
+            return Err(true);
+        }
+        if self.destroy_property_blob(id) {
+            Ok(())
+        } else {
+            Err(false)
+        }
+    }
+    /// drm_property_destroy_user_blobs: a closing open's blobs go (those a
+    /// committed property still names stay until it lets them go).
+    pub fn release_file_blobs(&mut self, owner: u64) {
+        for b in self
+            .property_blobs
+            .iter_mut()
+            .filter(|b| b.owner == Some(owner))
+        {
+            b.user = false;
+        }
+        self.collect_blobs();
     }
 
     /// Look up a KMS property blob by id.
@@ -1791,6 +1935,69 @@ impl Card {
         true
     }
 
+    /// The full timing CRTC `crtc` shows: its committed one, else the
+    /// published timing matching its size and refresh.
+    pub fn committed_timing(&self, crtc: u32) -> Option<crate::drm::ioctl::DrmModeModeInfo> {
+        let c = self.crtcs.iter().find(|c| c.id == crtc)?;
+        let mode = c.mode?;
+        Some(
+            self.committed_modes
+                .iter()
+                .find(|m| m.crtc == crtc)
+                .map(|m| m.timing)
+                .unwrap_or_else(|| self.mode_wire(&mode)),
+        )
+    }
+    /// Record CRTC `crtc`'s committed timing (and the MODE_ID blob naming
+    /// it, if any); `None` forgets it (the CRTC lost its mode).
+    pub fn set_committed_mode(
+        &mut self,
+        crtc: u32,
+        committed: Option<(crate::drm::ioctl::DrmModeModeInfo, Option<u32>)>,
+    ) {
+        self.committed_modes.retain(|m| m.crtc != crtc);
+        if let Some((timing, blob)) = committed {
+            self.committed_modes
+                .push(CommittedMode { crtc, timing, blob });
+        }
+        self.collect_blobs();
+    }
+    /// What CRTC `crtc`'s MODE_ID reads back (`drm_atomic_crtc_get_property`:
+    /// the state's mode blob, 0 without a mode). A mode set without an
+    /// atomic MODE_ID (legacy SETCRTC, the published hardware state) gets a
+    /// kernel blob, as drm_atomic_set_mode_for_crtc creates one.
+    pub fn mode_blob(&mut self, crtc: u32) -> u32 {
+        let Some(timing) = self.committed_timing(crtc) else {
+            return 0;
+        };
+        if let Some(blob) = self
+            .committed_modes
+            .iter()
+            .find(|m| m.crtc == crtc)
+            .and_then(|m| m.blob)
+            .filter(|&b| self.property_blob(b).is_some())
+        {
+            return blob;
+        }
+        let Ok(blob) =
+            self.create_property_blob(crate::drm::ioctl::mode_info_bytes(&timing).to_vec())
+        else {
+            return 0;
+        };
+        // A kernel blob: no file owns or can destroy it; the committed mode
+        // keeps it alive.
+        if let Some(b) = self.property_blobs.iter_mut().find(|b| b.id == blob) {
+            b.user = false;
+        }
+        self.committed_modes.retain(|m| m.crtc != crtc);
+        self.committed_modes.push(CommittedMode {
+            crtc,
+            timing,
+            blob: Some(blob),
+        });
+        blob
+    }
+
     /// Whether a committed color or HDR property names blob `id`.
     fn blob_referenced(&self, id: u32) -> bool {
         #[cfg(feature = "intel")]
@@ -1802,10 +2009,11 @@ impl Card {
             return true;
         }
         id != 0
-            && (self
-                .crtc_color
-                .iter()
-                .any(|c| c.ctm == id || c.gamma_lut == id || c.degamma_lut == id)
+            && (self.committed_modes.iter().any(|m| m.blob == Some(id))
+                || self
+                    .crtc_color
+                    .iter()
+                    .any(|c| c.ctm == id || c.gamma_lut == id || c.degamma_lut == id)
                 || self
                     .native
                     .iter()
@@ -2098,8 +2306,16 @@ impl Card {
                     .find(|t| t.0 == gem_handle)
                     .map_or((0, false), |t| (t.1, t.2));
                 let formats = self.plane_formats.unwrap_or(&[]);
-                let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
-                    .map_err(|_| CardError::UnknownFormat)?;
+                let modifier = m::check_amdgpu_fb(
+                    cmd,
+                    &info,
+                    formats,
+                    tiling,
+                    dcc,
+                    bo_size,
+                    m::TilingFlags::Gfx12,
+                )
+                .map_err(|_| CardError::UnknownFormat)?;
                 let two = info.num_planes == 2;
                 (
                     [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
@@ -2196,6 +2412,7 @@ impl Card {
             chroma_pitch,
             modifier,
             bo: None,
+            creator: None,
             #[cfg(feature = "intel")]
             intel: None,
         });
@@ -2225,6 +2442,17 @@ impl Card {
         let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
         let dcc = object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_GFX12_DCC) != 0;
         let formats = self.plane_formats.unwrap_or(&[]);
+        // The linear-primary card is GFX10.3 (Navi22): its BOs carry the
+        // GFX9+ tiling-flag layout, not GFX12's.
+        let layout = if linear {
+            let config = crate::amdgpu_info::navi22_gb_addr_config().unwrap_or(0);
+            m::TilingFlags::Gfx10_3 {
+                pipes_log2: config & 0x7,
+                packers_log2: (config >> 8) & 0x7,
+            }
+        } else {
+            m::TilingFlags::Gfx12
+        };
         let modifier = m::check_amdgpu_fb(
             cmd,
             &info,
@@ -2232,6 +2460,7 @@ impl Card {
             object.tiling_flags(),
             dcc,
             object.byte_len,
+            layout,
         )
         .map_err(|_| CardError::UnknownFormat)?;
         if linear
@@ -2257,6 +2486,7 @@ impl Card {
             chroma_pitch: if two { cmd.pitches[1] } else { 0 },
             modifier,
             bo: Some(FbBo { object, owner }),
+            creator: None,
             #[cfg(feature = "intel")]
             intel: None,
         });
@@ -2404,14 +2634,29 @@ impl Card {
             chroma_pitch: 0,
             modifier,
             bo: None,
+            creator: None,
             intel: Some(IntelFb { object, owner }),
         });
         Ok(id)
     }
 
-    /// drm_fb_release for open `owner`: remove every framebuffer it made
-    /// from one of its GEM handles (as RMFB does, turning off what shows
-    /// it). Returns how many went.
+    /// CRTCs whose primary is a framebuffer open `owner` made.
+    pub fn crtcs_showing_owner(&self, owner: u64) -> Vec<u32> {
+        self.crtcs
+            .iter()
+            .filter(|c| {
+                c.primary_fb
+                    .and_then(|id| self.framebuffer(id).ok())
+                    .is_some_and(|fb| fb.owner() == Some(owner))
+            })
+            .map(|c| c.id)
+            .collect()
+    }
+    /// drm_fb_release for open `owner`: remove every framebuffer on its fb
+    /// list, made from one of its GEM handles or through the generic ADDFB
+    /// path, as RMFB does (turning off what shows it). A removed dumb
+    /// buffer's backing waits in [`Card::take_released_backing`]. Returns
+    /// how many went.
     pub fn release_file_framebuffers(&mut self, owner: u64) -> usize {
         #[cfg(feature = "intel")]
         if self.intel_transaction {
@@ -2423,13 +2668,19 @@ impl Card {
         let ids: Vec<u32> = self
             .framebuffers
             .iter()
-            .filter(|fb| fb.gem_owner() == Some(owner))
+            .filter(|fb| fb.owner() == Some(owner))
             .map(|fb| fb.id)
             .collect();
         for &id in &ids {
-            let _ = self.rmfb(id);
+            if let Ok(Some(backing)) = self.rmfb(id) {
+                self.released_backing.push(backing);
+            }
         }
         ids.len()
+    }
+    /// The `(phys, order)` backings released framebuffers left to free.
+    pub fn take_released_backing(&mut self) -> Vec<(u64, u8)> {
+        core::mem::take(&mut self.released_backing)
     }
 
     #[cfg(feature = "intel")]
@@ -2488,13 +2739,112 @@ impl Card {
     /// buffer's last reference.
     ///
     /// Linux equivalent: `drm_mode_rmfb`.
+    /// `DRM_IOCTL_MODE_CLOSEFB` for open `owner`: the framebuffer leaves
+    /// the file without disabling the planes that scan it (drm_mode_closefb).
+    /// One nothing shows is removed now; one still shown stays, owned by no
+    /// file, until [`Card::collect_closed_fbs`] finds it off screen.
+    /// `UnknownFb` (→ ENOENT) for an id this open does not own.
+    pub fn closefb(&mut self, fb_id: u32, owner: u64) -> Result<Option<(u64, u8)>, CardError> {
+        if self.console_fb == Some(fb_id) {
+            return Err(CardError::UnknownFb);
+        }
+        let fb = self
+            .framebuffers
+            .iter()
+            .find(|fb| fb.id == fb_id)
+            .ok_or(CardError::UnknownFb)?;
+        if fb.owner().is_some_and(|o| o != owner) {
+            return Err(CardError::UnknownFb);
+        }
+        if !self.fb_shown(fb_id) {
+            return self.rmfb(fb_id);
+        }
+        if let Some(fb) = self.framebuffers.iter_mut().find(|fb| fb.id == fb_id) {
+            match fb.bo.as_mut() {
+                Some(bo) => bo.owner = CLOSED_FB_OWNER,
+                None if fb.creator.is_some() => fb.creator = Some(CLOSED_FB_OWNER),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+    /// Whether a CRTC or native plane still scans framebuffer `fb_id`.
+    pub fn fb_shown(&self, fb_id: u32) -> bool {
+        self.crtcs.iter().any(|c| c.primary_fb == Some(fb_id))
+            || self.native_planes.iter().any(|p| p.fb_id == Some(fb_id))
+    }
+    /// Free closed framebuffers (CLOSEFB'd while shown) nothing scans any
+    /// more. Returns dumb backings to buddy-free.
+    pub fn collect_closed_fbs(&mut self) -> Vec<(u64, u8)> {
+        let closed: Vec<u32> = self
+            .framebuffers
+            .iter()
+            .filter(|fb| fb.bo.as_ref().is_some_and(|bo| bo.owner == CLOSED_FB_OWNER))
+            .map(|fb| fb.id)
+            .filter(|&id| !self.fb_shown(id))
+            .collect();
+        closed
+            .into_iter()
+            .filter_map(|id| self.rmfb(id).ok().flatten())
+            .collect()
+    }
+
+    /// drm_client_modeset_commit for the console (lastclose with no master):
+    /// CRTC `crtc` shows the kernel console framebuffer, created on first
+    /// use at the CRTC's size.
+    pub fn show_console(&mut self, crtc: u32) {
+        let Some(mode) = self
+            .crtcs
+            .iter()
+            .find(|c| c.id == crtc && c.primary_fb.is_none())
+            .and_then(|c| c.mode)
+        else {
+            return;
+        };
+        let fits = |fb: &Framebuffer| fb.width == mode.width && fb.height == mode.height;
+        let id = match self
+            .console_fb
+            .filter(|&id| self.framebuffer(id).is_ok_and(fits))
+        {
+            Some(id) => id,
+            None => {
+                let id = self.next_fb_id;
+                self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+                self.framebuffers.push(Framebuffer {
+                    id,
+                    width: mode.width,
+                    height: mode.height,
+                    format: PixelFormat::Xrgb8888,
+                    pitch: mode.width * 4,
+                    gem_handle: 0,
+                    offsets: [0; 2],
+                    chroma_pitch: 0,
+                    modifier: 0,
+                    bo: None,
+                    creator: None,
+                    #[cfg(feature = "intel")]
+                    intel: None,
+                });
+                self.console_fb = Some(id);
+                id
+            }
+        };
+        if let Ok(c) = self.crtc_mut(crtc) {
+            c.primary_fb = Some(id);
+        }
+    }
+
     pub fn rmfb(&mut self, fb_id: u32) -> Result<Option<(u64, u8)>, CardError> {
+        if self.console_fb == Some(fb_id) {
+            return Err(CardError::UnknownFb);
+        }
         let pos = self
             .framebuffers
             .iter()
             .position(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)?;
         let fb = self.framebuffers.swap_remove(pos);
+        let mut disabled = Vec::new();
         // drm_framebuffer_remove: a plane still scanning this framebuffer is
         // disabled, and with the primary plane its CRTC (atomic_remove_fb
         // also clears the CRTC's mode).
@@ -2506,6 +2856,19 @@ impl Card {
             crtc.primary_fb = None;
             crtc.enabled = false;
             crtc.mode = None;
+            disabled.push(crtc.id);
+        }
+        // atomic_remove_fb (amdgpu cannot keep an active CRTC without its
+        // primary): the CRTC is disabled and its connectors detached.
+        for e in self
+            .encoders
+            .iter_mut()
+            .filter(|e| e.crtc_id.is_some_and(|c| disabled.contains(&c)))
+        {
+            e.crtc_id = None;
+        }
+        for crtc in disabled {
+            self.set_committed_mode(crtc, None);
         }
         for p in self
             .native_planes
@@ -2528,6 +2891,12 @@ impl Card {
         Ok(freed)
     }
 
+    /// Record `open` as the maker of framebuffer `fb_id` (generic ADDFB).
+    pub fn set_fb_creator(&mut self, fb_id: u32, open: u64) {
+        if let Some(fb) = self.framebuffers.iter_mut().find(|fb| fb.id == fb_id) {
+            fb.creator = Some(open);
+        }
+    }
     /// Look up a framebuffer by id.
     pub fn framebuffer(&self, fb_id: u32) -> Result<&Framebuffer, CardError> {
         self.framebuffers

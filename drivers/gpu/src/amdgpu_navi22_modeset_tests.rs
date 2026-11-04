@@ -1768,3 +1768,173 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_takeover_keeps_dsc_on_single_segment_seg1
 );
+
+/// The RX 6750 XT desktop's HDMI-A-1 sink (LEN T27p-10, HF-VSDB 600 MHz,
+/// SCDC). Linux lists its CTA VIC 97 (3840x2160@60, 594 MHz) beside the
+/// preferred reduced-blanking 533.25 MHz DTD, and a KWin output config
+/// saved under Linux restores VIC 97. Navi22 must offer it too, or every
+/// atomic modeset that config asks for is refused.
+fn navi22_offers_cta_vic97_on_the_desktop_sink() -> TestResult {
+    let edid: Vec<u8> = vec![
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x30, 0xae, 0xda, 0x61, 0x01, 0x01, 0x01,
+        0x01, 0x1f, 0x1d, 0x01, 0x03, 0x80, 0x3c, 0x22, 0x78, 0x3e, 0x1c, 0x95, 0xa7, 0x55, 0x49,
+        0xa2, 0x26, 0x0f, 0x50, 0x54, 0xa1, 0x08, 0x00, 0xd1, 0xc0, 0x81, 0xc0, 0x81, 0x00, 0x81,
+        0x80, 0x95, 0x00, 0xa9, 0xc0, 0xb3, 0x00, 0xd1, 0x00, 0x4d, 0xd0, 0x00, 0xa0, 0xf0, 0x70,
+        0x3e, 0x80, 0x30, 0x20, 0x35, 0x00, 0x55, 0x50, 0x21, 0x00, 0x00, 0x1a, 0xa3, 0x66, 0x00,
+        0xa0, 0xf0, 0x70, 0x1f, 0x80, 0x30, 0x20, 0x35, 0x00, 0x55, 0x50, 0x21, 0x00, 0x00, 0x1a,
+        0x00, 0x00, 0x00, 0xfd, 0x00, 0x17, 0x50, 0x1e, 0xa0, 0x3c, 0x00, 0x0a, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4c, 0x45, 0x4e, 0x20, 0x54, 0x32, 0x37,
+        0x70, 0x2d, 0x31, 0x30, 0x0a, 0x20, 0x01, 0xcf, 0x02, 0x03, 0x33, 0xf1, 0x4e, 0x01, 0x02,
+        0x03, 0x12, 0x11, 0x13, 0x04, 0x14, 0x90, 0x61, 0x5f, 0x05, 0x1f, 0x5d, 0x23, 0x09, 0x07,
+        0x07, 0x83, 0x01, 0x00, 0x00, 0x6b, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x39, 0x44, 0x20, 0x00,
+        0x20, 0x01, 0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0x80, 0x03, 0xe3, 0x0f, 0x00, 0x02, 0x56,
+        0x5e, 0x00, 0xa0, 0xa0, 0xa0, 0x29, 0x50, 0x30, 0x20, 0x35, 0x00, 0x55, 0x50, 0x21, 0x00,
+        0x00, 0x1a, 0xe2, 0x68, 0x00, 0xa0, 0xa0, 0x40, 0x2e, 0x60, 0x30, 0x20, 0x36, 0x00, 0x55,
+        0x50, 0x21, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xde,
+    ];
+    let sink = Sink {
+        edid,
+        preferred: None,
+        hdmi: true,
+        dpcd: None,
+    };
+    let offered = offered_on(&sink, &soc(), 3_650_000, None);
+    let has = |khz: u32| {
+        offered
+            .iter()
+            .any(|t| t.h_active == 3840 && t.v_active == 2160 && t.pixel_clock_khz == khz)
+    };
+    if !has(533_250) {
+        return TestResult::Fail("preferred 533.25 MHz 4K60 not offered");
+    }
+    if !has(594_000) {
+        return TestResult::Fail("CTA VIC 97 (594 MHz 4K60) not offered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_offers_cta_vic97_on_the_desktop_sink
+);
+
+/// amdgpu_dm's DP SST output on DCN30: the deepest depth up to min(EDID
+/// bpc, "max bpc") rounded down to even that the verified link carries,
+/// 8 bpc for DSC/MST or no link; the colour space "Colorspace" selects;
+/// HDR metadata as committed.
+fn navi22_dp_format_follows_max_bpc_edid_and_link() -> TestResult {
+    use crate::amdgpu_hdr::{DcColorSpace, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    let edid = |bpc: u8| {
+        let mut e = [0u8; 128];
+        e[18] = 1;
+        e[19] = 4;
+        e[20] = 0x80 | (bpc / 2 - 2) << 4;
+        e
+    };
+    let t1080 = Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let t2160 = Timing {
+        pixel_clock_khz: 594_000,
+        h_active: 3840,
+        h_total: 4400,
+        h_front_porch: 176,
+        h_sync_width: 88,
+        v_active: 2160,
+        v_total: 2250,
+        v_front_porch: 8,
+        v_sync_width: 10,
+        ..t1080
+    };
+    let hbr2 = Some(DpLink { rate: 20, lanes: 4 });
+    let hbr3 = Some(DpLink { rate: 30, lanes: 4 });
+    let settings = |max_bpc: u8| hdmi::OutputSettings {
+        max_bpc,
+        ..hdmi::OutputSettings::default()
+    };
+    let depth = |s, e: &[u8], l, t: &Timing, sst| dp_format(s, e, l, t, sst).depth;
+    // Up to the EDID's depth within the cap.
+    if depth(settings(16), &edid(10), hbr2, &t1080, true) != Depth::Bpc10
+        || depth(settings(16), &edid(12), hbr2, &t1080, true) != Depth::Bpc12
+        || depth(settings(11), &edid(12), hbr2, &t1080, true) != Depth::Bpc10
+        || depth(settings(8), &edid(12), hbr2, &t1080, true) != Depth::Bpc8
+    {
+        return TestResult::Fail("DP depth not min(EDID bpc, max bpc) rounded to even");
+    }
+    // An undefined EDID depth is 8; 4K60 at 10 bpc needs more than HBR2 x4.
+    if depth(settings(16), &[0u8; 128], hbr3, &t1080, true) != Depth::Bpc8
+        || depth(settings(16), &edid(10), hbr2, &t2160, true) != Depth::Bpc8
+        || depth(settings(16), &edid(10), hbr3, &t2160, true) != Depth::Bpc10
+    {
+        return TestResult::Fail("DP depth ignores the EDID or the link bandwidth");
+    }
+    if depth(settings(16), &edid(10), hbr3, &t1080, false) != Depth::Bpc8
+        || depth(settings(16), &edid(10), None, &t1080, true) != Depth::Bpc8
+    {
+        return TestResult::Fail("DSC/MST or unverified DP stream is not 8 bpc");
+    }
+    let bt2020 = hdmi::OutputSettings {
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        ..settings(16)
+    };
+    let f = dp_format(bt2020, &edid(10), hbr3, &t1080, true);
+    if f.colorspace != DcColorSpace::Rgb2020Full
+        || f.pipe_format().depth != hdmi::Depth::Bpc10
+        || dp_format(settings(16), &edid(10), hbr3, &t1080, true).colorspace != DcColorSpace::Srgb
+    {
+        return TestResult::Fail("DP colour space or pipe format");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_dp_format_follows_max_bpc_edid_and_link
+);
+
+/// mod_build_vsc_infopacket (rev 5, RGB) and fill_hdr_info_packet (DP).
+fn navi22_dp_vsc_and_hdr_sdp_packets() -> TestResult {
+    use crate::amdgpu_hdr::DcColorSpace;
+    let vsc = dp::vsc_packet(Depth::Bpc10, DcColorSpace::Rgb2020Full);
+    if vsc[..4] != [0x00, 0x07, 0x05, 0x13] || vsc[4 + 16] != 6 || vsc[4 + 17] != 2 {
+        return TestResult::Fail("VSC SDP for BT.2020 RGB 10 bpc");
+    }
+    let vsc = dp::vsc_packet(Depth::Bpc8, DcColorSpace::SrgbLimited);
+    if vsc[4 + 16] != 0 || vsc[4 + 17] != 0x81 {
+        return TestResult::Fail("VSC SDP for limited sRGB");
+    }
+    if dp::vsc_packet(Depth::Bpc12, DcColorSpace::AdobeRgb)[4 + 16..4 + 18] != [3, 3] {
+        return TestResult::Fail("VSC SDP for AdobeRGB 12 bpc");
+    }
+    let mut blob = alloc::vec![0u8; 32];
+    blob[4] = 2; // SMPTE ST 2084
+    blob[26] = 0xe8; // max_cll low byte
+    let Ok(metadata) = crate::amdgpu_hdr::HdrOutputMetadata::from_blob(&blob) else {
+        return TestResult::Fail("metadata blob");
+    };
+    let hdr = dp::hdr_sdp_packet(&metadata);
+    let frame = crate::amdgpu_hdr::drm_infoframe(&metadata);
+    if hdr[..6] != [0x00, 0x87, 0x1d, 0x4c, 0x01, 0x1a]
+        || hdr[6..32] != frame[4..30]
+        || hdr[6] != 2
+        || hdr[32..] != [0; 4]
+    {
+        return TestResult::Fail("HDR static metadata SDP layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_dp_vsc_and_hdr_sdp_packets
+);

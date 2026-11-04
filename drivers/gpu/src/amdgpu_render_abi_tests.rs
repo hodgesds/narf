@@ -1167,9 +1167,30 @@ fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
     drop(preparation);
     assert!(!both.system() && pin.address() >= 0x8_0000_0000);
     drop(pin);
-    // One VRAM is not allowed for is refused.
+    // One VRAM is not allowed for sits in system memory: the pin finds it
+    // outside VRAM, and preparation moves it to visible VRAM anyway, as
+    // amdgpu_bo_pin places from the pin domain; its allowed domains stay
+    // GTT for every later move.
     let system_only = state.get(create(&state, 4096, gtt)).unwrap();
-    assert_eq!(system_only.pin_scanout().err(), Some(FsError::InvalidData));
+    assert!(system_only.system());
+    assert_eq!(system_only.pin_scanout().err(), Some(FsError::OutOfMemory));
+    let preparation =
+        narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![system_only.clone()]))
+            .unwrap();
+    let pin = system_only.pin_scanout().unwrap();
+    drop(preparation);
+    assert!(!system_only.system() && system_only.cpu_visible());
+    assert!((0x8_0000_0000..0x8_0000_8000).contains(&pin.address()));
+    assert_eq!(
+        system_only
+            .allowed_domains
+            .load(core::sync::atomic::Ordering::Acquire),
+        gtt
+    );
+    drop(pin);
+    // Unpinned, a move back to GTT follows its allowed domains again.
+    assert_eq!(system_only.relocate(false), Ok(()));
+    assert!(system_only.system());
     // Unpinned, evict_all moves them all again.
     let (touched, result) = narf_scheduler::block_on_spin(async {
         let gate = lock_placement(CARD).await;

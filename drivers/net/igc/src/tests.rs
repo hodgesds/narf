@@ -222,15 +222,84 @@ fn smoke_igc_phy_failures_release_ownership() -> TestResult {
         !m.writes.borrow().iter().any(|(r, _)| *r == 0x20),
         "MDIC written without semaphore"
     );
-    let m = Model::new();
-    m.regs.borrow_mut().insert(0x5820, 0x40000);
-    check!(
-        hardware::setup_phy(&m, false).is_err(),
-        "firmware reset block ignored"
-    );
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_phy_failures_release_ownership);
+
+/// igc_setup_link / igc_phy_hw_reset: MANC.BLK_PHY_RST_ON_IDE means firmware
+/// already owns a configured link, so probe proceeds without touching the PHY.
+fn smoke_igc_phy_reset_block_leaves_firmware_link() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0x5820, 0x40000);
+    check!(
+        hardware::setup_phy(&m, false).is_ok(),
+        "firmware reset block failed probe"
+    );
+    check!(
+        !m.writes
+            .borrow()
+            .iter()
+            .any(|(r, v)| *r == 0x20 || (*r == 0 && v & (1 << 31) != 0)),
+        "PHY reset or MDIC issued while firmware blocks PHY reset"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_phy_reset_block_leaves_firmware_link
+);
+
+/// Hardware regression: I225-V (8086:15f3) left PHPM at 0x44080 after the
+/// CTRL.PHY_RST pulse, and probe failed with RegisterTimeout on 0x0E14 mask
+/// 0x100. igc_phy_hw_reset only logs a PHY_RST_COMP timeout and continues to
+/// igc_get_phy_id, which is the real PHY presence check.
+fn smoke_igc_phy_reset_complete_timeout_is_not_fatal() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0xe14, 0x44080);
+    check!(hardware::reset(&m, 4).is_ok(), "MAC reset failed");
+    m.writes.borrow_mut().clear();
+    check!(
+        hardware::setup_phy(&m, false).is_ok(),
+        "PHY_RST_COMP timeout failed probe"
+    );
+    let writes = m.writes.borrow();
+    let ctrl: Vec<u32> = writes
+        .iter()
+        .filter(|(r, _)| *r == 0)
+        .map(|(_, v)| *v)
+        .collect();
+    check!(
+        ctrl.len() >= 2 && ctrl[0] & (1 << 31) != 0 && ctrl[1] & (1 << 31) == 0,
+        "CTRL.PHY_RST not pulsed"
+    );
+    let rst = writes
+        .iter()
+        .position(|(r, v)| *r == 0 && v & (1 << 31) != 0);
+    let swfw = writes.iter().position(|(r, v)| *r == 0x5b5c && v & 2 != 0);
+    let mdic = writes.iter().position(|(r, _)| *r == 0x20);
+    check!(
+        matches!((swfw, rst, mdic), (Some(a), Some(b), Some(c)) if a < b && b < c),
+        "PHY reset not inside SW_FW_SYNC or PHY ID read skipped"
+    );
+    check!(
+        m.value(0x5b5c) == 0 && m.value(0x5b50) == 0,
+        "PHY semaphore leaked"
+    );
+    drop(writes);
+    // A missing PHY is still rejected by the PHY ID read, as in Linux.
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0xe14, 0x44080);
+    m.phy.borrow_mut().extend([(2, 0), (3, 0)]);
+    check!(
+        hardware::setup_phy(&m, false).is_err(),
+        "absent PHY accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_phy_reset_complete_timeout_is_not_fatal
+);
 
 fn smoke_igc_gigabit_only_and_blank_nvm() -> TestResult {
     let m = Model::new();

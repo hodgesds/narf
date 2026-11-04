@@ -136,22 +136,47 @@ also consult upstream Linux GPL sources.
 
 ## 3. Public interface
 
+- Multiple xHCI controllers: every controller that probes is brought up and
+  retained as `xhci<N>` (`Xhci::id() == N`, probe order, at most
+  `xhci::MAX_CONTROLLERS`); a controller whose bring-up fails logs its error
+  and does not prevent the others. `xhci::controllers()` lists them,
+  `xhci::controller_by_id(id)` resolves one, and `xhci::first_controller()`
+  exists only for callers with no device context (diagnostics, fixtures).
+  Slot ids and root-port numbers are unique only within a controller, so
+  every binding carries its controller: slot/port-keyed registries are
+  `xhci::PerController` (one registry per controller: hubs, boot/report
+  keyboards, mice, touchpads, consumer, generic HID, ACM, vendor serial,
+  xpad), and index-keyed records (MSC, fingerprint, CDC-NCM/ECM, r8152, UVC,
+  UAC, CCID, CTAP, btusb) store a `controller` field. Per-slot detach and
+  recovery teardown take the controller (`attach::detach_all_bindings(id)`,
+  `class_registry::UsbUnbindFn = fn(controller, slot)`), and device paths
+  (devfs, block, net, sound, video) reach their own controller via
+  `controller_by_id`. One supervisor task runs per controller; a controller
+  bound after the supervisors start gets its own. The interrupt handler
+  services every controller. System PM halts/resumes every controller, and
+  class resume replays run per controller.
 - Before an installed `narf.disks=root-ro|root-rw` root is mounted, USB late
-  initialization primes its normal supervisor if the unique `root=UUID=` is
+  initialization primes the normal supervisors (one per controller; the
+  root may sit behind any of them) if the unique `root=UUID=` is
   valid but not registered. This wait is bounded to 30 seconds and uses the
   synchronous spin bridge outside the executor, without holding a lock.
-  The same pinned supervisor future is then spawned, preserving claimed
+  The same pinned supervisor futures are then spawned, preserving claimed
   ports, pending transfers and hub state; enumeration is not restarted.
   An already registered root incurs no wait. A missing or ambiguous root
   still fails through the normal root selector and disk-policy checks.
 
 - `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed, config)`
   binds an addressed, configured hub. A high-speed protocol-2 hub must expose
-  a multiple-TT alternate for that interface and acknowledge `SET_INTERFACE`
-  before attachment succeeds. `interface_alt` and `interface_protocol` retain
-  the selected mode; `is_multi_tt()` describes that active mode, rather than
-  the Device Descriptor capability. Failed selection or controller hub-context
-  setup prevents publication of the hub and downstream children.
+  a multiple-TT alternate for that interface; if it refuses `SET_INTERFACE`
+  the hub continues single-TT in alternate 0 (Linux `hub_configure`).
+  `interface_alt` and `interface_protocol` retain the selected mode;
+  `is_multi_tt()` describes that active mode, rather than the Device
+  Descriptor capability. `Xhci::mark_as_hub(slot, ports, multi_tt, ttt)`
+  programs Hub, MTT, Number of Ports and (high-speed hubs) TT Think Time with
+  Configure Endpoint on a copy of the slot context; its failure prevents
+  publication of the hub and downstream children. Hub port power-on waits
+  `bPwrOn2PwrGood` (at least 100 ms); a hub port reset waits 10 ms before the
+  first status read, allows 800 ms and then 50 ms of reset recovery.
 - `hid::BootKeyboard::attach(..., identity: InputId)` publishes an evdev
   keyboard only after protocol selection and interrupt-IN arming succeed.
   Its live report pump uses the shared evdev-aware keyboard decoder, sending
@@ -163,8 +188,9 @@ also consult upstream Linux GPL sources.
   subclass-zero compatibility matches; a declared boot mouse prevents its
   auxiliary non-boot keyboard interface from claiming the whole device.
 - `HubDescriptor::tt_think_time()` returns the USB 2.0
-  `wHubCharacteristics[6:5]` encoding used directly in a low/full-speed
-  child's xHCI Slot Context.
+  `wHubCharacteristics[6:5]` encoding programmed into the high-speed hub's
+  own xHCI Slot Context. A low/full-speed child's `Topology` carries the TT
+  hub slot and port plus `mtt` (set when the hub runs multiple TTs).
 - Hub downstream idle-suspend: the supervisor marks ports bound via
   `attach::mark_ports_bound`, which also stamps each port's
   last-activity tick (a port's idle window runs from bind). Class

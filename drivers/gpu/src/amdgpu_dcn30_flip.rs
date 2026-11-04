@@ -82,7 +82,7 @@ const COUNT_MASK: u32 = 0x7fff; // linux: OTG0_OTG_STATUS_POSITION__OTG_VERT_COU
 pub(crate) const FRAME_MASK: u32 = 0x00ff_ffff;
 /// HUBP surface addresses are 48-bit and start on a 256-byte request.
 const ADDRESS_BITS: u32 = 48; // linux: n/a (48-bit HUBP surface address space)
-const ADDRESS_ALIGN: u64 = 256; // linux: n/a (NARF validation: 256-byte request alignment)
+pub(crate) const ADDRESS_ALIGN: u64 = 256; // linux: n/a (NARF validation: 256-byte request alignment)
 
 pub(crate) trait Io: Send {
     fn read(&mut self, reg: u64) -> u32;
@@ -192,6 +192,25 @@ impl<I: Io> Engine<I> {
             result = result.and_then(|()| self.program_hubp(pipe, address));
         }
         result.and(self.otg_lock(false))
+    }
+    /// [`Engine::program_flip`] with the caller already holding the OTG's
+    /// pipe-control lock (`commit_planes_for_stream`'s
+    /// `pipe_control_lock` around a plane update and its address): every
+    /// slice's address, no lock of its own.
+    pub(crate) fn program_flip_locked(&mut self, address: u64) -> Result<(), Error> {
+        if address == 0 || address >= 1 << ADDRESS_BITS || address % ADDRESS_ALIGN != 0 {
+            return Err(Error::Invalid);
+        }
+        let pipes: [Option<u8>; 2] = [Some(self.pipe), self.odm];
+        for pipe in pipes.into_iter().flatten() {
+            self.program_hubp(pipe, address)?;
+        }
+        Ok(())
+    }
+    /// `optc1_lock` / `optc1_unlock` for a caller sequencing a plane
+    /// update inside the lock.
+    pub(crate) fn pipe_control_lock(&mut self, lock: bool) -> Result<(), Error> {
+        self.otg_lock(lock)
     }
     /// One HUBP's half of [`Engine::program_flip`].
     fn program_hubp(&mut self, pipe: u8, address: u64) -> Result<(), Error> {
@@ -443,6 +462,14 @@ impl Flip {
     /// Arm a VSYNC flip to `address`; `wait` observes it latch.
     pub fn program(&mut self, address: u64) -> Result<(), Error> {
         self.0.program_flip(address)
+    }
+    /// [`Flip::program`] inside a pipe-control lock the caller holds.
+    pub fn program_locked(&mut self, address: u64) -> Result<(), Error> {
+        self.0.program_flip_locked(address)
+    }
+    /// `optc1_lock` (true) / `optc1_unlock` (false) of this OTG.
+    pub fn pipe_control_lock(&mut self, lock: bool) -> Result<(), Error> {
+        self.0.pipe_control_lock(lock)
     }
     pub fn pending(&mut self) -> Result<bool, Error> {
         self.0.pending()

@@ -288,6 +288,28 @@ impl AtomicState {
                 }
             }
         }
+        // 2b. update_connector_routing: a connector moving between CRTCs
+        //     is a routing change of both its old and new CRTC
+        //     (connectors_changed), which needs ALLOW_MODESET even when the
+        //     CRTC itself is not part of the request.
+        for conn in &self.connectors {
+            let old = card
+                .connector(conn.id)
+                .ok()
+                .and_then(|c| c.encoder_id)
+                .and_then(|id| card.encoder(id).ok())
+                .and_then(|e| e.crtc_id);
+            if old == conn.crtc_id {
+                continue;
+            }
+            for crtc in [old, conn.crtc_id].into_iter().flatten() {
+                match self.crtcs.iter_mut().find(|c| c.id == crtc) {
+                    Some(state) => state.connectors_changed = true,
+                    None if !self.allow_modeset => return Err(AtomicError::ModesetNotAllowed),
+                    None => {}
+                }
+            }
+        }
         // 3. Mode-set vs allow_modeset gate — Linux refuses to modeset
         //    when the caller didn't ask for it.
         if !self.allow_modeset {

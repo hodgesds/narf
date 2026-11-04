@@ -4494,7 +4494,7 @@ pub use mst::{
 };
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
-pub(crate) use modeset::{admit_native_modes, hdmi_depths, hdmi_encodings};
+pub(crate) use modeset::{admit_native_modes, hdmi_depths, hdmi_encodings, requested_depth_bpc};
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{

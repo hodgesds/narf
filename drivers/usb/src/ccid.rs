@@ -364,6 +364,9 @@ pub struct CcidReader {
     /// Per-slot sequence number counter. Wraps at 255 per §6.1
     /// (bSeq must be unique per command within a slot).
     seq: IrqSafeSpinLock<[u8; 16]>,
+    /// Index of the xHCI controller the reader is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
 impl CcidReader {
@@ -1036,6 +1039,7 @@ pub async fn try_bind_ccid_already_addressed(
         bulk_out_ep: eps.bulk_out,
         intr_in_ep: eps.intr_in,
         seq: IrqSafeSpinLock::new([0u8; 16]),
+        controller: xhci_dev.id(),
     });
     let idx = {
         let mut g = CCID_READERS.lock();

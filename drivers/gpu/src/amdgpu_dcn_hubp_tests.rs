@@ -509,3 +509,59 @@ kernel_test_in!(
     "drivers/gpu/dcn-hubp",
     hubp_blank_waits_for_outstanding_requests
 );
+
+fn hubp_dcn30_viewport_and_pitch_follow_min_set_viewport() -> TestResult {
+    let mut hubp = engine(2);
+    hubp.profile = Profile::Navi22;
+    let at = |reg: u64| (reg + 2 * STRIDE) as usize;
+    // An inherited meta pitch must not survive a linear surface's pitch.
+    hubp.io.values[at(DCSURF_SURFACE_PITCH)] = 0x1234_0000;
+    // The left-clipped 2x upscale's viewport: x 48, 912 x 540.
+    if hubp.set_viewport(48, 0, 912, 540).is_err() || hubp.set_pitch(960).is_err() {
+        return TestResult::Fail("viewport refused");
+    }
+    let v = |hubp: &Engine<Fake>, reg: u64| hubp.io.values[at(reg)];
+    let start = 48;
+    let dimension = 912 | 540 << 16;
+    for (reg, want) in [
+        (DCSURF_PRI_VIEWPORT_START, start),
+        (DCSURF_PRI_VIEWPORT_DIMENSION, dimension),
+        (DCSURF_SEC_VIEWPORT_START, start),
+        (DCSURF_SEC_VIEWPORT_DIMENSION, dimension),
+        (DCSURF_PRI_VIEWPORT_START_C, start),
+        (DCSURF_PRI_VIEWPORT_DIMENSION_C, dimension),
+        (DCSURF_SEC_VIEWPORT_START_C, start),
+        (DCSURF_SEC_VIEWPORT_DIMENSION_C, dimension),
+        (DCSURF_SURFACE_PITCH, 959),
+    ] {
+        if v(&hubp, reg) != want {
+            return TestResult::Fail("viewport or pitch register");
+        }
+    }
+    // A y start lands in the upper field.
+    if hubp.set_viewport(0, 600, 55, 55).is_err()
+        || v(&hubp, DCSURF_PRI_VIEWPORT_START) != 600 << 16
+    {
+        return TestResult::Fail("viewport y start");
+    }
+    // Fields are 14 bits; nothing is written for a value that does not fit.
+    let count = hubp.io.writes.len();
+    if hubp.set_viewport(0x4000, 0, 16, 16) != Err(Error::Invalid)
+        || hubp.set_viewport(0, 0, 0, 16) != Err(Error::Invalid)
+        || hubp.set_pitch(0) != Err(Error::Invalid)
+        || hubp.set_pitch(0x4001) != Err(Error::Invalid)
+        || hubp.io.writes.len() != count
+    {
+        return TestResult::Fail("out-of-range viewport or pitch");
+    }
+    // DCN3.1.4 keeps its own viewport layout.
+    let mut other = engine(0);
+    if other.set_viewport(0, 0, 16, 16) != Err(Error::Unsupported) {
+        return TestResult::Fail("DCN3.1.4 viewport");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-hubp",
+    hubp_dcn30_viewport_and_pitch_follow_min_set_viewport
+);

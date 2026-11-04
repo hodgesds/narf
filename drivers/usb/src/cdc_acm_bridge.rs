@@ -334,20 +334,22 @@ pub trait AcmTransport: Send + Sync + core::fmt::Debug {
 /// [`CdcAcmPort`].
 #[derive(Debug)]
 pub struct XhciAcmTransport {
+    controller: u8,
     slot_id: u8,
     capabilities: AcmCapabilities,
 }
 
 impl XhciAcmTransport {
-    pub fn new(slot_id: u8, capabilities: AcmCapabilities) -> Self {
+    pub fn new(controller: u8, slot_id: u8, capabilities: AcmCapabilities) -> Self {
         Self {
+            controller,
             slot_id,
             capabilities,
         }
     }
 
     fn port(&self) -> Result<CdcAcmPort, AcmError> {
-        let xhci = crate::xhci::controller().ok_or(AcmError::NoDevice)?;
+        let xhci = crate::xhci::controller_by_id(self.controller).ok_or(AcmError::NoDevice)?;
         CdcAcmPort::for_slot(xhci, self.slot_id).ok_or(AcmError::NoDevice)
     }
 

@@ -94,8 +94,12 @@ counter reads and return unavailable for a stopped counter or invalid ratio.
 
 ```rust
 pub struct Deadline(Instant);
-pub fn sleep_until(d: Deadline) -> impl Future<Output=()>;
-pub fn sleep(dur: Duration)      -> impl Future<Output=()>;
+pub fn sleep_until(d: Deadline) -> SleepUntil;
+pub fn sleep(dur: Duration)      -> SleepUntil;
+pub fn sleep_ns(ns: u64)         -> SleepUntil;
+pub fn sleep_us(us: u64)         -> SleepUntil;
+pub fn sleep_ms(ms: u64)         -> SleepUntil;
+pub fn sleep_cycles(cycles: u64) -> SleepUntil; // raw TSC ticks
 
 pub struct Timer;
 pub fn timer_oneshot(d: Deadline, cb: TimerCb, cap: &Cap<Timer, Arm>) -> Timer;
@@ -110,6 +114,12 @@ pub fn timer_cancel(t: Timer);
 pub fn next_deadline() -> Option<Instant>;
 ```
 
+- `sleep*` return the `SleepUntil` future (timer wheel; self-wake
+  fallback when no arm callback is installed). Wall-time helpers convert
+  through the calibrated ns→cycles scale, which is 1 cycle/ns until
+  calibration; callers needing hardware-specified delays before frame's
+  calibration must call `calibrate_clocks()` first. A literal cycle count
+  passed to `sleep_cycles` is a different duration on every CPU.
 - hrtimer-grade precision (≤ 1 µs jitter target on a quiet CPU).
 - Timer wheel for bulk coarse-grained waits when the caller passes a
   `TimerHint::Coarse` flag — amortises priority-queue cost.

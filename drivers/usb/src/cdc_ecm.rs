@@ -529,10 +529,20 @@ pub struct CdcEcmDevice {
     /// record indices — removing a record would retarget every
     /// later device's cookie at the wrong device.
     pub detached: bool,
+    /// Index of the xHCI controller the device is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
-/// System-wide registry of bound CDC-ECM devices.
+/// System-wide registry of bound CDC-ECM devices (records carry their
+/// controller; indices are the net-registry TX cookies).
 pub static CDC_ECM_DEVICES: IrqSafeSpinLock<Vec<CdcEcmDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// The live controller of device record `idx`, if present.
+fn controller_of(idx: usize) -> Option<alloc::sync::Arc<crate::xhci::Xhci>> {
+    let controller = CDC_ECM_DEVICES.lock().get(idx)?.controller;
+    crate::xhci::controller_by_id(controller)
+}
 
 /// Number of live (non-detached) ECM devices.
 pub fn attached_ecm_count() -> usize {
@@ -691,6 +701,7 @@ pub async fn try_bind_ecm_already_addressed(
             downlink_bps: 0,
             uplink_bps: 0,
             detached: false,
+            controller: xhci_dev.id(),
         });
         idx
     };
@@ -750,7 +761,7 @@ async fn ecm_rx_pump(idx: usize) {
             ecm_rx_buf_len(dev.max_segment_size as u32),
         )
     };
-    let Some(c) = crate::xhci::controller() else {
+    let Some(c) = controller_of(idx) else {
         let mut g = CDC_ECM_DEVICES.lock();
         if let Some(dev) = g.get_mut(idx) {
             dev.pump_running = false;
@@ -809,7 +820,7 @@ async fn ecm_notif_pump(idx: usize) {
     if notif_dci == 0 {
         return;
     }
-    let Some(c) = crate::xhci::controller() else {
+    let Some(c) = controller_of(idx) else {
         let mut g = CDC_ECM_DEVICES.lock();
         if let Some(dev) = g.get_mut(idx) {
             dev.notif_running = false;
@@ -894,7 +905,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, EcmError> {
     // bulk_out via block_on. Safe here because the trampoline is
     // called from netstack TX paths that are not themselves inside
     // an executor poll.
-    let c = crate::xhci::controller().ok_or(EcmError::NoController)?;
+    let c = controller_of(idx).ok_or(EcmError::NoController)?;
     let outcome =
         narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, frame).await });
     match outcome {
@@ -922,7 +933,7 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, EcmEr
     // the future and stays usable for the return slice below —
     // the NCM `recv_frame` shape; `async move` would move the
     // `&mut` in and E0382 on the borrow after.
-    let c = crate::xhci::controller().ok_or(EcmError::NoController)?;
+    let c = controller_of(idx).ok_or(EcmError::NoController)?;
     let outcome =
         narf_scheduler::block_on(async { c.bulk_in(slot_id, bulk_in_dci, scratch).await });
     match outcome {
@@ -960,11 +971,14 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, EcmEr
 /// Infallible bookkeeping, adapted to the [`UsbUnbindFn`] contract
 /// with an unconditional `Ok(())` (#893: a hook reports failure with
 /// `Err(())`, never by panicking).
-pub fn detach_ecm_slot(slot_id: u8) -> Result<(), ()> {
+pub fn detach_ecm_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
     let ifaces: Vec<alloc::string::String> = {
         let mut g = CDC_ECM_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && d.slot_id == slot_id && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());
@@ -979,18 +993,21 @@ pub fn detach_ecm_slot(slot_id: u8) -> Result<(), ()> {
 
 /// Wholesale variant of [`detach_ecm_slot`] for controller
 /// recovery (`attach::detach_all_bindings`): tombstone every
-/// ECM binding and unregister every net iface, regardless of
-/// slot. Previously this function did not exist, so the
+/// ECM binding on `controller` and unregister its net iface,
+/// regardless of slot. Previously this function did not exist, so the
 /// recovery path left ECM bindings live and re-enumeration
 /// would have appended a second live iface for the same
 /// adapter. Infallible and idempotent, same pump-exit and
 /// never-remove reasoning as [`detach_ecm_slot`], and the
 /// same #789 mirror verdict (no clear call owed).
-pub fn detach_all_ecm() {
+pub fn detach_all_ecm(controller: u8) {
     let ifaces: Vec<alloc::string::String> = {
         let mut g = CDC_ECM_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());
@@ -1085,10 +1102,10 @@ pub fn register_initcalls() {
         "cdc-ecm",
         &CDC_ECM_MATCH,
         probe,
-        |slot| {
+        |controller, slot| {
             // detach_ecm_slot is infallible Ok(()) by construction (#1241);
             // the explicit discard keeps -D warnings clean.
-            let _ = detach_ecm_slot(slot);
+            let _ = detach_ecm_slot(controller, slot);
             Ok(())
         },
     );
@@ -1441,6 +1458,7 @@ pub mod tests {
             downlink_bps: 0,
             uplink_bps: 0,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = CDC_ECM_DEVICES.lock();
@@ -1455,7 +1473,7 @@ pub mod tests {
         // and must not shift 1's cookie.
         // detach_ecm_slot is infallible Ok(()) by construction (#1241);
         // the explicit discard keeps -D warnings clean.
-        let _ = detach_ecm_slot(3);
+        let _ = detach_ecm_slot(0, 3);
         let ok = tx_target(0).is_none() && tx_target(1) == Some((5, 6));
         __reset_ecm_for_test();
         if !ok {
@@ -1494,6 +1512,7 @@ pub mod tests {
             downlink_bps: 0,
             uplink_bps: 0,
             detached: false,
+            controller: 0,
         };
         {
             let mut g = CDC_ECM_DEVICES.lock();
@@ -1518,7 +1537,7 @@ pub mod tests {
         // Detach through the class-registry unbind hook, as the
         // supervisor's detach_slot does.
         register_initcalls();
-        let report = crate::class_registry::dispatch_unbind(3);
+        let report = crate::class_registry::dispatch_unbind(0, 3);
         if report.invoked == 0 {
             __reset_ecm_for_test();
             return TestResult::Fail("dispatch_unbind invoked no hooks");
@@ -1557,7 +1576,7 @@ pub mod tests {
         }
         // Wholesale detach (controller recovery) clears the
         // re-bound record and the survivor alike.
-        detach_all_ecm();
+        detach_all_ecm(0);
         if attached_ecm_count() != 0
             || tx_target(idx).is_some()
             || tx_target(1).is_some()
@@ -1568,7 +1587,7 @@ pub mod tests {
             return TestResult::Fail("wholesale detach must clear every ECM binding");
         }
         // Wholesale detach is idempotent.
-        detach_all_ecm();
+        detach_all_ecm(0);
         __reset_ecm_for_test();
         TestResult::Pass
     }

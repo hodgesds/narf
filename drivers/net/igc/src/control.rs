@@ -36,6 +36,13 @@ impl Igc {
             return Err(16);
         }
         let old = self.settings.lock().clone();
+        // igc_ethtool_set_link_ksettings: link characteristics cannot change
+        // while firmware blocks PHY reset (reset_and_start skips PHY setup).
+        if (old.link != settings.link || old.pause != settings.pause || old.eee != settings.eee)
+            && hardware::phy_reset_blocked(&self.hw)
+        {
+            return Err(22);
+        }
         let old_queues = self.queues();
         let resize = old.channels != settings.channels
             || old.rx_entries != settings.rx_entries

@@ -154,3 +154,24 @@ fn smoke_init_records_cycle_totals() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("init", smoke_init_records_cycle_totals);
+
+/// `run_stage` establishes the calibrated TSC scale before any initcall
+/// runs, so a driver's Deadline/sleep is wall time from the first stage on
+/// (it was the 1 cycle/ns fallback until frame calibrated late: 4.7x short
+/// on a 4.7 GHz part). Where a frequency source exists, a 1 s ns→cycles
+/// conversion must equal the calibrated frequency, not 1e9.
+fn smoke_init_stage_runner_calibrates_the_tsc_scale() -> TestResult {
+    // The boot already ran every stage through `run_stage`; re-running one
+    // here would repeat its initcalls' side effects.
+    let hz = narf_time::calibrate_clocks();
+    if hz == 0 {
+        // No CPUID/MSR/HPET frequency (bare KVM): nothing to establish.
+        return TestResult::Pass;
+    }
+    let cycles = narf_time::wall::ns_to_cycles(1_000_000_000);
+    if cycles.abs_diff(hz) > hz / 100 {
+        return TestResult::Fail("ns→cycles scale is not the calibrated TSC frequency");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("init", smoke_init_stage_runner_calibrates_the_tsc_scale);

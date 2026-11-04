@@ -1310,9 +1310,13 @@ pub struct UacDevice {
     /// published — and also `None` for AudioControl-only
     /// devices, which publish no card by design.
     pub card_error: Option<narf_drivers_sound::SoundError>,
+    /// Index of the xHCI controller the device is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
-/// System-wide registry of bound UAC devices.
+/// System-wide registry of bound UAC devices (records carry their
+/// controller).
 pub static UAC_DEVICES: IrqSafeSpinLock<Vec<UacDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// The negotiated shape of one direction, chosen at bind time.
@@ -1834,6 +1838,9 @@ pub async fn try_bind_audio_already_addressed(
         None
     } else {
         let state = crate::uac_card::UacCardState::from_bind(slot_id, &topo, &choices, &outcome);
+        state
+            .controller
+            .store(xhci_dev.id(), core::sync::atomic::Ordering::Release);
         match crate::uac_card::register_card(&state) {
             Ok(_) => Some(state),
             Err(e) => {
@@ -1862,11 +1869,12 @@ pub async fn try_bind_audio_already_addressed(
         iso_in_dci,
         card,
         card_error,
+        controller: xhci_dev.id(),
     });
     Ok(idx)
 }
 
-/// Unbind every UAC device on `slot_id`: unregister its sound
+/// Unbind every UAC device on `slot_id` of `controller`: unregister its sound
 /// card (outstanding leases keep the hardware alive until they
 /// stop, per the sound layer's contract) and drop the registry
 /// entries. Returns how many entries were removed.
@@ -1876,13 +1884,13 @@ pub async fn try_bind_audio_already_addressed(
 /// `detach_slot` reaches it via `class_registry::dispatch_unbind`
 /// on the per-slot detach path, so an unplugged device's card
 /// leaves the registry instead of leaking (#1318).
-pub fn unbind_audio(slot_id: u8) -> usize {
+pub fn unbind_audio(controller: u8, slot_id: u8) -> usize {
     let removed: Vec<UacDevice> = {
         let mut reg = UAC_DEVICES.lock();
         let mut taken = Vec::new();
         let mut i = 0;
         while i < reg.len() {
-            if reg[i].slot_id == slot_id {
+            if reg[i].controller == controller && reg[i].slot_id == slot_id {
                 taken.push(reg.remove(i));
             } else {
                 i += 1;
@@ -1903,8 +1911,8 @@ pub fn unbind_audio(slot_id: u8) -> usize {
 /// unconditional `Ok(())` (#893: a hook reports failure with
 /// `Err(())`, never by panicking). Idempotent: a second dispatch
 /// for the same slot simply removes zero entries.
-pub fn detach_uac_slot(slot_id: u8) -> Result<(), ()> {
-    let _ = unbind_audio(slot_id);
+pub fn detach_uac_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
+    let _ = unbind_audio(controller, slot_id);
     Ok(())
 }
 
@@ -1986,7 +1994,7 @@ pub fn playback_one_packet(idx: usize, data: &[u8]) -> Result<usize, UacError> {
     };
     // Sync entry-point on the UAC playback path; bridge to async
     // isoch_out via block_on. Called from non-executor contexts.
-    let c = match crate::xhci::controller() {
+    let c = match controller_of(idx) {
         Some(c) => c,
         None => return Err(UacError::SetConfigFailed),
     };
@@ -2010,7 +2018,7 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UacError>
     };
     // Sync entry-point on the UAC capture path; bridge to async
     // isoch_in via block_on.
-    let c = match crate::xhci::controller() {
+    let c = match controller_of(idx) {
         Some(c) => c,
         None => return Err(UacError::SetConfigFailed),
     };
@@ -2019,6 +2027,12 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UacError>
         Ok(n) => Ok(n),
         Err(_) => Err(UacError::SetConfigFailed),
     }
+}
+
+/// The live controller of the UAC device at registry index `idx`.
+fn controller_of(idx: usize) -> Option<alloc::sync::Arc<crate::xhci::Xhci>> {
+    let controller = UAC_DEVICES.lock().get(idx)?.controller;
+    crate::xhci::controller_by_id(controller)
 }
 
 /// Number of bound UAC devices.

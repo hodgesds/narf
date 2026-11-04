@@ -338,3 +338,174 @@ kernel_test_in!(
     "drivers/gpu/dcn-plane",
     plane_opp_blanks_with_the_pattern_generator
 );
+
+/// `resource_build_scaling_params`' DCN3.0 result for `src` shown at `dst`
+/// on a 1080p stream.
+fn scaler(src: (i32, i32, i32, i32), dst: (i32, i32, i32, i32)) -> ScalerData {
+    use crate::amdgpu_dcn30_scl::{build, Rect};
+    build(
+        1920,
+        1080,
+        (0, 1),
+        Rect::new(src.0, src.1, src.2, src.3),
+        Rect::new(dst.0, dst.1, dst.2, dst.3),
+    )
+    .expect("a placement DC accepts")
+}
+
+fn plane_dcn30_dscl_scales_like_dpp1_dscl_set_scaler_manual_scale() -> TestResult {
+    let mut dpp = block(1, DPP_LAST_REG);
+    dpp.profile = Profile::Navi22;
+    let at = |reg: u64| (reg + DPP_STRIDE) as usize;
+    let mut cache = DsclCache::default();
+    // Inherited state the update must replace: autocal on, a stale
+    // boundary mode and the coefficient RAM currently on bank 1.
+    dpp.io.values[at(DSCL_AUTOCAL)] = 0x3303;
+    dpp.io.values[at(DSCL_CONTROL)] = 1;
+    dpp.io.values[at(SCL_MODE)] = SCL_COEF_RAM_SELECT_CURRENT | SCL_COEF_RAM_SELECT;
+    // 2x up: 960x540 shown on the whole 1080p screen, 4 taps each way,
+    // ratio 0.5, initial phase 2.75.
+    let up = scaler((0, 0, 960, 540), (0, 0, 1920, 1080));
+    if dpp.dscl_set_scaler(&up, &mut cache).is_err() {
+        return TestResult::Fail("scaled plane refused");
+    }
+    let v = |dpp: &Block<Fake>, reg: u64| dpp.io.values[at(reg)];
+    // Ratio 0.5 is U3.19 0x40000, shifted into the field's top: 0x800000.
+    // Phase 2.75: 0.75 x 2^19 << 5 = 0xc00000 with 2 in the integer field.
+    if v(&dpp, DSCL_AUTOCAL) != 0
+        || v(&dpp, DSCL_CONTROL) != 0
+        || v(&dpp, RECOUT_START) != 0
+        || v(&dpp, RECOUT_SIZE) != 1920 | 1080 << 16
+        || v(&dpp, MPC_SIZE) != 1920 | 1080 << 16
+        || v(&dpp, SCL_MODE) & DSCL_MODE != SCALER_RGB
+        || v(&dpp, LB_MEMORY_CTRL) != 0x3f00
+        || v(&dpp, LB_DATA_FORMAT) != 0
+        || v(&dpp, SCL_HORZ_FILTER_SCALE_RATIO) != 0x80_0000
+        || v(&dpp, SCL_VERT_FILTER_SCALE_RATIO_C) != 0x80_0000
+        || v(&dpp, SCL_HORZ_FILTER_INIT) != 0x0200_0000 | 0xc0_0000
+        || v(&dpp, SCL_VERT_FILTER_INIT_C) != 0x0200_0000 | 0xc0_0000
+        || v(&dpp, SCL_TAP_CONTROL) != 0x3333
+        || v(&dpp, DSCL_2TAP_CONTROL) & DSCL_2TAP_FIELDS != 0
+    {
+        return TestResult::Fail("2x upscale registers");
+    }
+    // Both 4-tap upscale filters went to the RAM, horizontal (type 1) then
+    // vertical (type 0): 33 phases x 2 tap pairs each, then the select
+    // flipped from the current bank 1 to bank 0.
+    let data = DPP_STRIDE + SCL_COEF_RAM_TAP_DATA;
+    let select = DPP_STRIDE + SCL_COEF_RAM_TAP_SELECT;
+    let selects: Vec<u32> = dpp
+        .io
+        .writes
+        .iter()
+        .filter(|(r, _)| *r == select)
+        .map(|(_, v)| *v)
+        .collect();
+    let words: Vec<u32> = dpp
+        .io
+        .writes
+        .iter()
+        .filter(|(r, _)| *r == data)
+        .map(|(_, v)| *v)
+        .collect();
+    let table = &crate::amdgpu_dcn401_spl_filters::FILTER_4TAP_64P_UPSCALE;
+    let first = u32::from(table[0]) | 1 << 15 | u32::from(table[1]) << 16 | 1 << 31;
+    let last = u32::from(table[130]) | 1 << 15 | u32::from(table[131]) << 16 | 1 << 31;
+    if selects != vec![1 << 16, 0]
+        || words.len() != 2 * 33 * 2
+        || words[0] != first
+        || words[65] != last
+        || words[66] != first
+        || v(&dpp, SCL_MODE) & SCL_COEF_RAM_SELECT != 0
+        || v(&dpp, SCL_MODE) & SCL_CHROMA_COEF_MODE != 0
+    {
+        return TestResult::Fail("4-tap upscale coefficients");
+    }
+    // The same data again writes nothing (the scl_data memcmp).
+    let count = dpp.io.writes.len();
+    if dpp.dscl_set_scaler(&up, &mut cache).is_err() || dpp.io.writes.len() != count {
+        return TestResult::Fail("unchanged scaler reprogrammed");
+    }
+    // Moved but the same ratio and taps: geometry only, no coefficients.
+    let moved = scaler((0, 0, 960, 540), (-100, 0, 1920, 1080));
+    if dpp.dscl_set_scaler(&moved, &mut cache).is_err()
+        || v(&dpp, RECOUT_SIZE) != 1820 | 1080 << 16
+        || v(&dpp, SCL_HORZ_FILTER_INIT) != 0x0400_0000 | 0xc0_0000
+        || dpp.io.writes[count..].iter().any(|(r, _)| *r == data)
+    {
+        return TestResult::Fail("moved plane");
+    }
+    // 2:1 down picks the 1.83 set (ratio 2 >= 5/3) for both directions.
+    let down = scaler((0, 0, 3840, 2160), (0, 0, 1920, 1080));
+    let count = dpp.io.writes.len();
+    if dpp.dscl_set_scaler(&down, &mut cache).is_err() {
+        return TestResult::Fail("downscale refused");
+    }
+    let table = &crate::amdgpu_dcn401_spl_filters::FILTER_4TAP_64P_183;
+    let first = u32::from(table[0]) | 1 << 15 | u32::from(table[1]) << 16 | 1 << 31;
+    let words: Vec<u32> = dpp.io.writes[count..]
+        .iter()
+        .filter(|(r, _)| *r == data)
+        .map(|(_, v)| *v)
+        .collect();
+    if words.len() != 132 || words[0] != first || v(&dpp, SCL_HORZ_FILTER_SCALE_RATIO) != 0x200_0000
+    {
+        return TestResult::Fail("2:1 downscale coefficients");
+    }
+    // A positioned, unscaled plane: bypass, the recout at its place, and
+    // no ratio or coefficient writes.
+    let placed = scaler((0, 0, 55, 55), (912, 513, 55, 55));
+    let count = dpp.io.writes.len();
+    if dpp.dscl_set_scaler(&placed, &mut cache).is_err()
+        || v(&dpp, SCL_MODE) & DSCL_MODE != SCALER_BYPASS
+        || v(&dpp, RECOUT_START) != 912 | 513 << 16
+        || v(&dpp, RECOUT_SIZE) != 55 | 55 << 16
+        || v(&dpp, MPC_SIZE) != 1920 | 1080 << 16
+        || dpp.io.writes[count..]
+            .iter()
+            .any(|(r, _)| *r == data || *r == DPP_STRIDE + SCL_TAP_CONTROL)
+    {
+        return TestResult::Fail("positioned bypass");
+    }
+    // DCN3.1.4's DSCL block is not this one.
+    let mut other = block(1, DPP_LAST_REG);
+    if other.dscl_set_scaler(&up, &mut DsclCache::default()) != Err(Error::Unsupported) {
+        return TestResult::Fail("DCN3.1.4 scaler");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_dscl_scales_like_dpp1_dscl_set_scaler_manual_scale
+);
+
+fn plane_dcn30_mpcc_background_is_black() -> TestResult {
+    let mut mpc = block(3, 0x0680);
+    mpc.profile = Profile::Navi22;
+    // A firmware owner's grey background.
+    for reg in [MPCC_BG_R_CR, MPCC_BG_G_Y, MPCC_BG_B_CB] {
+        mpc.io.values[(reg + 3 * MPCC_STRIDE) as usize] = 0x800;
+    }
+    if mpc.mpc_set_bg_color([0; 3]).is_err() {
+        return TestResult::Fail("background refused");
+    }
+    if [MPCC_BG_R_CR, MPCC_BG_G_Y, MPCC_BG_B_CB]
+        .iter()
+        .any(|reg| mpc.io.values[(reg + 3 * MPCC_STRIDE) as usize] != 0)
+    {
+        return TestResult::Fail("background not black");
+    }
+    // 10-bit tg_color into the 12-bit MPC fields.
+    if mpc.mpc_set_bg_color([0x3ff, 0x200, 1]).is_err()
+        || mpc.io.values[(MPCC_BG_R_CR + 3 * MPCC_STRIDE) as usize] != 0xffc
+        || mpc.io.values[(MPCC_BG_G_Y + 3 * MPCC_STRIDE) as usize] != 0x800
+        || mpc.io.values[(MPCC_BG_B_CB + 3 * MPCC_STRIDE) as usize] != 4
+    {
+        return TestResult::Fail("12-bit background");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_mpcc_background_is_black
+);

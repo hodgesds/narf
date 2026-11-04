@@ -194,7 +194,9 @@ fn legacy_framebuffer_permissions_and_linux_request_numbers() -> TestResult {
     let mut card = Card::new("amdgpu", "legacy permissions fixture", (1, 0, 0));
     let h = card.gem.alloc(0x8000_0000, 8192).unwrap();
     let arg = request(h, 32, 24, 256);
-    for ctx in [DrmFileCtx::render_client(), DrmFileCtx::primary(false)] {
+    // drm_ioctl.c flags 0: denied on a render node; an authenticated
+    // non-master primary open may add and remove framebuffers.
+    for ctx in [DrmFileCtx::render_client()] {
         for cmd in [ADDFB, RMFB] {
             if !matches!(
                 dispatch(&mut card, cmd, &arg, &ctx),

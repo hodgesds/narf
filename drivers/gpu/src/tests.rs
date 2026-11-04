@@ -7019,7 +7019,7 @@ fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
     // A primary-node fd that is authenticated but NOT master must be
     // blocked from DRM_MASTER ioctls (ADDFB2).
     use crate::drm::ioctl::{dispatch, DrmIoctlError};
-    use crate::drm::render_node::{DrmFileCtx, MinorType, PermError};
+    use crate::drm::render_node::{DrmFileCtx, MinorType};
     let mut card = make_test_card_for_ioctl();
     let authed = DrmFileCtx {
         minor: MinorType::Primary,
@@ -7028,9 +7028,14 @@ fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
         sys_admin: false,
     };
     let arg = [0u8; 68];
+    // drm_ioctl.c gives ADDFB2 flags 0: an authenticated non-master
+    // primary open passes the permission gate (it may then fail on its
+    // arguments, never with a permission error).
     match dispatch(&mut card, 0xB8, &arg, &authed) {
-        Err(DrmIoctlError::PermissionDenied(PermError::NotMaster)) => TestResult::Pass,
-        _ => TestResult::Fail("authed non-master ADDFB2 should be NotMaster"),
+        Err(DrmIoctlError::PermissionDenied(_)) => {
+            TestResult::Fail("authed non-master ADDFB2 hit the permission gate")
+        }
+        _ => TestResult::Pass,
     }
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_perm_master_only_blocks_authed);
@@ -7461,6 +7466,63 @@ fn smoke_drm_atomic_modeset_gate() -> TestResult {
     }
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_modeset_gate);
+
+/// update_connector_routing: moving a connector off (or onto) a CRTC is a
+/// routing change of that CRTC (connectors_changed), refused without
+/// ALLOW_MODESET even when the CRTC itself is not in the request; keeping
+/// the routing is not.
+fn smoke_drm_atomic_connector_reroute_needs_allow_modeset() -> TestResult {
+    use crate::drm::atomic::{
+        AtomicCheckPolicy, AtomicError, AtomicState, ConnectorState, CrtcState,
+    };
+    let card = make_test_card_for_atomic();
+    let policy = AtomicCheckPolicy::default();
+    let request = |allow_modeset: bool, crtc_id: Option<u32>, with_crtc: bool| {
+        let mut st = AtomicState {
+            allow_modeset,
+            ..Default::default()
+        };
+        st.connectors.push(ConnectorState { id: 1, crtc_id });
+        if with_crtc {
+            st.crtcs.push(CrtcState {
+                id: 1,
+                enable: crtc_id.is_some(),
+                ..Default::default()
+            });
+        }
+        st
+    };
+    let mut kept = request(false, Some(1), false);
+    if kept.core_check(&card, &policy).is_err() {
+        return TestResult::Fail("unchanged routing refused without ALLOW_MODESET");
+    }
+    let mut detached = request(false, None, false);
+    if !matches!(
+        detached.core_check(&card, &policy),
+        Err(AtomicError::ModesetNotAllowed)
+    ) {
+        return TestResult::Fail("reroute of an absent CRTC accepted without ALLOW_MODESET");
+    }
+    let mut detached = request(false, None, true);
+    if !matches!(
+        detached.core_check(&card, &policy),
+        Err(AtomicError::ModesetNotAllowed)
+    ) {
+        return TestResult::Fail("reroute of a requested CRTC accepted without ALLOW_MODESET");
+    }
+    let mut allowed = request(true, None, true);
+    if allowed.core_check(&card, &policy).is_err() {
+        return TestResult::Fail("reroute refused with ALLOW_MODESET");
+    }
+    if !allowed.crtcs[0].connectors_changed || !allowed.crtcs[0].needs_modeset() {
+        return TestResult::Fail("reroute did not mark connectors_changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_atomic_connector_reroute_needs_allow_modeset
+);
 
 fn smoke_drm_atomic_plane_fb_crtc_pair() -> TestResult {
     use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, PlaneState};
@@ -11109,11 +11171,11 @@ fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     narf_filesystem::__test_swap_caller_capable_hook(saved);
 
     // ── query ──
-    // A query naming no context is ENOENT, not a zeroed answer that would
-    // read as "healthy".
+    // A query naming no context is EINVAL (amdgpu_ctx_query/query2), not a
+    // zeroed answer that would read as "healthy".
     for op in [u::AMDGPU_CTX_OP_QUERY_STATE, u::AMDGPU_CTX_OP_QUERY_STATE2] {
-        if !matches!(call(op, 0, 999_999, 0, false).0, Err(FsError::NotFound)) {
-            return TestResult::Fail("a query naming no context should be ENOENT");
+        if !matches!(call(op, 0, 999_999, 0, false).0, Err(FsError::InvalidData)) {
+            return TestResult::Fail("a query naming no context should be EINVAL");
         }
         if call(op, 0, id, 0, false).0.is_err() {
             return TestResult::Fail("a query on a live context failed");
@@ -11177,9 +11239,10 @@ fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     }
     if !matches!(
         call(u::AMDGPU_CTX_OP_FREE_CTX, 0, id, 0, false).0,
-        Err(FsError::NotFound)
+        Err(FsError::InvalidData)
     ) {
-        return TestResult::Fail("a double free should be ENOENT");
+        // amdgpu_ctx_free: `return ctx ? 0 : -EINVAL`.
+        return TestResult::Fail("a double free should be EINVAL");
     }
     // Every context this test allocated has been freed, including the ones
     // the refused-flags cases did NOT create.
@@ -12529,10 +12592,12 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         );
         let mut want = [0u32; u::AMDGPU_HW_IP_NUM as usize];
         want[u::AMDGPU_HW_IP_GFX as usize] = 1;
+        // An open whose card has no submitter still gets an answer:
+        // amdgpu_ring_max_ibs is reported unconditionally (0 for no ring).
         if ok.is_err()
             || max_ibs != want
             || crate::amdgpu_info::dispatch_for(info_cmd, info.as_mut_ptr() as usize, Some(&state))
-                != Err(FsError::InvalidData)
+                != Ok(0)
         {
             return Some("MAX_IBS from the card's submitter");
         }

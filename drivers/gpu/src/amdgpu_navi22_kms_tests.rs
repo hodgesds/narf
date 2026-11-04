@@ -187,8 +187,30 @@ fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResu
         possible_crtcs: 1,
     }];
     apply_card(&mut card, &crtcs, &connectors);
-    if card.gfx12_modifiers || !card.native_planes.is_empty() || card.overlay_formats.is_some() {
+    if card.gfx12_modifiers || card.has_native_kms_planes() || card.overlay_formats.is_some() {
         return TestResult::Fail("DCN30 advertised RDNA4-only KMS operations");
+    }
+    // amdgpu_dm_crtc_init: a DRM_PLANE_TYPE_CURSOR plane per CRTC, possible
+    // on its own CRTC, ARGB8888 with LINEAR only.
+    let cursors = crate::drm_native_planes::cursor_ids(&card);
+    if cursors.len() != card.crtcs.len()
+        || card.native_planes.len() != cursors.len()
+        || cursors.iter().enumerate().any(|(k, &id)| {
+            id != crate::drm_native_planes::CURSOR_PLANE_ID_BASE + k as u32
+                || card.native_plane(id).and_then(|p| p.cursor_of) != Some(card.crtcs[k].id)
+        })
+    {
+        return TestResult::Fail("DCN30 cursor planes not one per CRTC");
+    }
+    let Some(blob) = crate::drm_native_planes::in_formats_blob(
+        &card,
+        crate::drm_native_planes::in_formats_blob_id(cursors[0]),
+    ) else {
+        return TestResult::Fail("cursor plane has no IN_FORMATS");
+    };
+    let word = |i: usize| u32::from_le_bytes(blob[i..i + 4].try_into().unwrap());
+    if word(8) != 1 || word(16) != 1 || word(24) != 0x3432_5241 {
+        return TestResult::Fail("cursor plane formats are not ARGB8888 alone");
     }
     if !card.native_atomic
         || card.plane_formats != Some(&PLANE_FORMATS[..])
@@ -225,7 +247,7 @@ fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResu
     // Re-publishing keeps committed controls and excludes DCN401's planes.
     apply_card(&mut card, &crtcs, &connectors);
     if card.gfx12_modifiers
-        || !card.native_planes.is_empty()
+        || card.has_native_kms_planes()
         || card.native[0].max_bpc != Some(10)
         || card.native[0].colorspace != Some(crate::amdgpu_hdr::DRM_MODE_COLORIMETRY_BT2020_RGB)
         || card.native[0].color_format != Some(crate::amdgpu_hdr::ColorFormat::Ycbcr422)
@@ -410,6 +432,7 @@ fn navi22_display_admission_reports_only_what_dml30_proved() -> TestResult {
     let a = crate::amdgpu_navi22_modeset::Admitted {
         soc,
         refclk_khz: 50_000,
+        vco_khz: 3_650_000,
         plan,
         offered: vec![hd()],
     };
@@ -674,4 +697,172 @@ fn navi22_kms_hdmi_format_check_is_exact_and_side_effect_free() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_kms_hdmi_format_check_is_exact_and_side_effect_free
+);
+
+/// The RX 6750 XT desktop sink (LEN T27p-10).
+fn t27p10_edid() -> Vec<u8> {
+    vec![
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x30, 0xae, 0xda, 0x61, 0x01, 0x01, 0x01,
+        0x01, 0x1f, 0x1d, 0x01, 0x03, 0x80, 0x3c, 0x22, 0x78, 0x3e, 0x1c, 0x95, 0xa7, 0x55, 0x49,
+        0xa2, 0x26, 0x0f, 0x50, 0x54, 0xa1, 0x08, 0x00, 0xd1, 0xc0, 0x81, 0xc0, 0x81, 0x00, 0x81,
+        0x80, 0x95, 0x00, 0xa9, 0xc0, 0xb3, 0x00, 0xd1, 0x00, 0x4d, 0xd0, 0x00, 0xa0, 0xf0, 0x70,
+        0x3e, 0x80, 0x30, 0x20, 0x35, 0x00, 0x55, 0x50, 0x21, 0x00, 0x00, 0x1a, 0xa3, 0x66, 0x00,
+        0xa0, 0xf0, 0x70, 0x1f, 0x80, 0x30, 0x20, 0x35, 0x00, 0x55, 0x50, 0x21, 0x00, 0x00, 0x1a,
+        0x00, 0x00, 0x00, 0xfd, 0x00, 0x17, 0x50, 0x1e, 0xa0, 0x3c, 0x00, 0x0a, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4c, 0x45, 0x4e, 0x20, 0x54, 0x32, 0x37,
+        0x70, 0x2d, 0x31, 0x30, 0x0a, 0x20, 0x01, 0xcf, 0x02, 0x03, 0x33, 0xf1, 0x4e, 0x01, 0x02,
+        0x03, 0x12, 0x11, 0x13, 0x04, 0x14, 0x90, 0x61, 0x5f, 0x05, 0x1f, 0x5d, 0x23, 0x09, 0x07,
+        0x07, 0x83, 0x01, 0x00, 0x00, 0x6b, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x39, 0x44, 0x20, 0x00,
+        0x20, 0x01, 0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0x80, 0x03, 0xe3, 0x0f, 0x00, 0x02, 0x56,
+        0x5e, 0x00, 0xa0, 0xa0, 0xa0, 0x29, 0x50, 0x30, 0x20, 0x35, 0x00, 0x55, 0x50, 0x21, 0x00,
+        0x00, 0x1a, 0xe2, 0x68, 0x00, 0xa0, 0xa0, 0x40, 0x2e, 0x60, 0x30, 0x20, 0x36, 0x00, 0x55,
+        0x50, 0x21, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xde,
+    ]
+}
+fn probe_soc() -> crate::amdgpu_dml30::Soc {
+    crate::amdgpu_dml30::Soc {
+        dcn_revision: 0,
+        dcfclk_khz: 1_200_000,
+        fabric_khz: 1_200_000,
+        socclk_khz: 1_000_000,
+        dram_speed_mts: 16_000,
+        channels: 12,
+        channel_width_bytes: 2,
+        max_dispclk_khz: 1_330_000,
+        max_dppclk_khz: 1_330_000,
+        max_phyclk_khz: 810_000,
+        dentist_vco_khz: 3_650_000,
+        dchub_refclk_khz: 50_000,
+    }
+}
+/// KWin's saved Linux mode on the RX 6750 XT desktop is CTA VIC 97 (594 MHz
+/// 4K60, +H +V). Every DRM check-time predicate an atomic modeset to it
+/// reaches on Navi22 must admit it, as amdgpu_dm does: the offered list
+/// (MODE_ID decode, `display_offers`), and the exact HDMI format search
+/// (`formats_supported`) at the connector's default and any requested
+/// `max bpc`.
+fn navi22_atomic_modeset_to_offered_cta_4k60() -> TestResult {
+    use crate::amdgpu_hdr::ColorFormat;
+    use crate::amdgpu_native_kms::{OutputFormatRequest, OutputRoute};
+    let mut r = reports(true, 1);
+    let Detection::Connected(sink) = &mut r[3].detection else {
+        return TestResult::Fail("fixture");
+    };
+    sink.edid = t27p10_edid();
+    let soc = probe_soc();
+    let mut k = Kms::new();
+    k.reconcile_sinks(&r, |_, s| {
+        Some(crate::amdgpu_navi22_modeset::offered_on(
+            s,
+            &soc,
+            soc.dentist_vco_khz,
+            None,
+        ))
+    });
+    k.assign_route();
+    let Some(vic97) = k.connectors[3]
+        .modes
+        .iter()
+        .copied()
+        .find(|t| t.h_active == 3840 && t.pixel_clock_khz == 594_000 && t.h_total == 4400)
+    else {
+        return TestResult::Fail("CTA VIC 97 not offered on the HDMI connector");
+    };
+    if !(vic97.h_sync_positive && vic97.v_sync_positive) {
+        return TestResult::Fail("VIC 97 offered with the wrong sync polarity");
+    }
+    let wire = crate::amdgpu_navi48_kms::timing_wire(&vic97);
+    if k.find_mode_at(0, Some(3), &wire) != Some(vic97) {
+        return TestResult::Fail("VIC 97 MODE_ID not matched to the HDMI connector's offer");
+    }
+    let connector = crate::amdgpu_navi48_kms::connector_id(3);
+    for max_bpc in [None, Some(8u8), Some(10), Some(16)] {
+        let request = OutputFormatRequest {
+            display: 0,
+            connector,
+            color_format: ColorFormat::Auto,
+            mode: Some(wire),
+            max_bpc,
+            planes: None,
+        };
+        let route = OutputRoute {
+            display: 0,
+            connector,
+            mode: request.mode,
+            planes: None,
+        };
+        if !k.formats_supported(&[request], &[route]) {
+            return TestResult::Fail("VIC 97 refused by the HDMI format search");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_atomic_modeset_to_offered_cta_4k60
+);
+
+/// amdgpu_dm_connector_init_helper on DCN3.0: a non-MST DP connector has
+/// "max bpc", Colorspace and HDR_OUTPUT_METADATA too (not the HDMI-only
+/// color format), and takes every listed value as HDMI does: a new
+/// colorimetry or HDR on/off relights the stream, new metadata alone does
+/// not.
+fn navi22_kms_dp_connector_output_properties() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    use crate::amdgpu_native_kms::ConnectorColorRequest;
+    let mut card = Card::new("amdgpu", "DCN30 DP fixture", (3, 60, 0));
+    let crtcs: [Option<crate::amdgpu_navi48_kms::Sink>; 1] = [None];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 0,
+        kind: ConnectorType::DisplayPort,
+        edid: None,
+        offered: &[],
+        crtc: None,
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    let native = &card.native[0];
+    if native.colorspace != Some(0)
+        || native.hdr_output_metadata != Some(0)
+        || native.max_bpc.is_none()
+        || native.color_format.is_some()
+    {
+        return TestResult::Fail("DP connector output properties differ from amdgpu_dm's");
+    }
+    let mut k = Kms::new();
+    k.reconcile(&reports(true, 1), admitted);
+    let dp = crate::amdgpu_navi48_kms::connector_id(0);
+    if !k.set_max_bpc(dp, 10) || k.connectors[0].output.max_bpc != 10 {
+        return TestResult::Fail("DP max bpc not stored");
+    }
+    let mut color = ConnectorColorRequest {
+        connector: dp,
+        color_format: ColorFormat::Auto,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        hdr_output_metadata: Some(alloc::vec![0; 32]),
+    };
+    if !k.set_color(&color)
+        || k.connectors[0].output.colorspace != DRM_MODE_COLORIMETRY_BT2020_RGB
+        || k.connectors[0].output.hdr.is_none()
+    {
+        return TestResult::Fail("DP refused BT2020 colorimetry with HDR metadata");
+    }
+    let applied = k.connectors[0].output;
+    color.hdr_output_metadata.as_mut().unwrap()[26] = 1;
+    if !k.set_color(&color) || k.connectors[0].output.needs_modeset(applied) {
+        return TestResult::Fail("DP metadata-only update needs a modeset");
+    }
+    color.hdr_output_metadata = Some(alloc::vec![0; 31]);
+    let before = k.connectors[0].output;
+    if k.set_color(&color) || k.connectors[0].output != before {
+        return TestResult::Fail("DP accepted a malformed metadata blob");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_dp_connector_output_properties
 );

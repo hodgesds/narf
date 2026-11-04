@@ -288,6 +288,35 @@ pub fn sleep_cycles(cycles: u64) -> SleepUntil {
     SleepUntil::new(Instant::now().plus_cycles(cycles))
 }
 
+/// Sleep until `deadline` (spec §3.2).
+pub fn sleep_until(deadline: Deadline) -> SleepUntil {
+    SleepUntil::new(deadline.0)
+}
+
+/// Sleep for a wall-clock duration (spec §3.2). Like every ns-based
+/// constructor, this uses the calibrated scale; before calibration it is
+/// 1 cycle per ns and expires early on a >1 GHz TSC (see [`Deadline`]).
+pub fn sleep(duration: core::time::Duration) -> SleepUntil {
+    sleep_ns(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// Sleep for `ns` nanoseconds of wall-clock time. Prefer this (or
+/// [`sleep_us`] / [`sleep_ms`]) over [`sleep_cycles`] with a hand-converted
+/// count: a literal cycle count is a different duration on every CPU.
+pub fn sleep_ns(ns: u64) -> SleepUntil {
+    sleep_until(Deadline::after_ns(ns))
+}
+
+/// Sleep for `us` microseconds of wall-clock time.
+pub fn sleep_us(us: u64) -> SleepUntil {
+    sleep_until(Deadline::after_us(us))
+}
+
+/// Sleep for `ms` milliseconds of wall-clock time.
+pub fn sleep_ms(ms: u64) -> SleepUntil {
+    sleep_until(Deadline::after_ms(ms))
+}
+
 /// Wall-clock deadline anchored to a future TSC reading. Cheap to
 /// copy + check; use this instead of ad-hoc `for _ in 0..N` iter
 /// counts when the wait should be bounded by real wall time

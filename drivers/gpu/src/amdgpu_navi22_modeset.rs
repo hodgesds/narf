@@ -615,6 +615,97 @@ fn dp_fits(timing: &Timing, link: DpLink) -> bool {
         Depth::Bpc8.bits_per_pixel(),
     )
 }
+/// The SDPs of a DP stream in `format` to a receiver with `caps`: the VSC
+/// SDP carrying colorimetry when the receiver takes it
+/// (`use_vsc_sdp_for_colorimetry`: DPCD 1.4 and DPRX_FEATURE_ENUMERATION_LIST
+/// VSC_SDP_COLORIMETRY_SUPPORTED), and the HDR static metadata SDP while
+/// HDR_OUTPUT_METADATA is set.
+pub(crate) fn dp_packets(
+    caps: dp_link::Caps,
+    format: DpFormat,
+) -> (Option<[u8; 36]>, Option<[u8; 36]>) {
+    // linux-lit: 0x14=DP_DPCD_REV_14
+    let vsc_colorimetry = caps.rev() >= 0x14 && caps.dprx_feature & 1 << 3 != 0;
+    (
+        vsc_colorimetry.then(|| dp::vsc_packet(format.depth, format.colorspace)),
+        format.hdr.as_ref().map(dp::hdr_sdp_packet),
+    )
+}
+
+/// A DP SST stream's output: its depth, the colour space its pixels are in
+/// (`amdgpu_dm_get_output_color_space` for RGB) and its HDR static
+/// metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DpFormat {
+    pub depth: Depth,
+    pub colorspace: crate::amdgpu_hdr::DcColorSpace,
+    pub hdr: Option<crate::amdgpu_hdr::HdrOutputMetadata>,
+}
+impl DpFormat {
+    pub const DEFAULT: Self = Self {
+        depth: Depth::Bpc8,
+        colorspace: crate::amdgpu_hdr::DcColorSpace::Srgb,
+        hdr: None,
+    };
+    /// The FMT/OCSC/DPG format of the pipe that carries it.
+    pub fn pipe_format(self) -> hdmi::Format {
+        hdmi::Format {
+            depth: match self.depth {
+                Depth::Bpc10 => hdmi::Depth::Bpc10,
+                Depth::Bpc12 => hdmi::Depth::Bpc12,
+                Depth::Bpc6 | Depth::Bpc8 => hdmi::Depth::Bpc8,
+            },
+            encoding: crate::amdgpu_hdr::PixelEncoding::Rgb,
+            colorspace: self.colorspace,
+        }
+    }
+}
+
+/// amdgpu_dm's DP SST output for the committed connector state: RGB full
+/// range in the colour space "Colorspace" selects, HDR_OUTPUT_METADATA as
+/// is, and for an uncompressed SST stream the deepest depth the DCN30
+/// encoder has (12, 10, 8) up to amdgpu_dm's request (min(EDID bpc,
+/// "max bpc") rounded down to even), stepping down by 2, that `link` carries (`dp_validate_mode_timing` at that bpp,
+/// create_validate_stream_for_sink's retry). A DSC or MST stream stays at
+/// 8 bpc.
+pub(crate) fn dp_format(
+    settings: hdmi::OutputSettings,
+    edid: &[u8],
+    link: Option<DpLink>,
+    timing: &Timing,
+    uncompressed_sst: bool,
+) -> DpFormat {
+    let depth = link
+        .filter(|_| uncompressed_sst)
+        .and_then(|link| {
+            let top = crate::amdgpu_navi48_boot::requested_depth_bpc(edid, settings.max_bpc);
+            [Depth::Bpc12, Depth::Bpc10, Depth::Bpc8]
+                .into_iter()
+                .filter(|d| d.bpc() <= top || *d == Depth::Bpc8)
+                .find(|d| {
+                    dp_link::mode_fits(
+                        link,
+                        timing.h_active,
+                        timing.v_active,
+                        timing.pixel_clock_khz,
+                        d.bits_per_pixel(),
+                    )
+                })
+        })
+        .unwrap_or(Depth::Bpc8);
+    DpFormat {
+        depth,
+        colorspace: crate::amdgpu_hdr::output_color_space(
+            settings.colorspace,
+            true,
+            false,
+            timing.pixel_clock_khz.saturating_mul(10),
+            false,
+        ),
+        hdr: settings.hdr,
+    }
+}
+
 /// The DP mode: exactly `want` when DRM asked for one `offered_on` admits,
 /// else the first (EDID order, so preferred first) the link and the DCN30
 /// mode math accept.
@@ -655,6 +746,8 @@ pub(crate) fn dp_dto(pixel_khz: u32) -> (u32, u32) {
 pub struct Admitted {
     pub soc: dml30::Soc,
     pub refclk_khz: u32,
+    /// The DENTIST VCO the plan's DFS steps assume.
+    pub vco_khz: u32,
     pub plan: dml30::Plan,
     pub offered: Vec<Timing>,
 }
@@ -820,11 +913,21 @@ pub struct Pipeline {
     format: hdmi::Formatter,
     hdmi: Option<hdmi::Stream>,
     hdmi_settings: hdmi::OutputSettings,
+    /// The DP stream's depth, colour space and HDR metadata, chosen from
+    /// `hdmi_settings` when the pipe's output format is programmed.
+    dp_format: DpFormat,
     hdmi_vrr: Option<(Option<crate::amdgpu_freesync::AmdVsdb>, bool)>,
     /// ODM 2:1 ([`hdmi_plan`]): the secondary pipe's front end and the
     /// plane with both slices.
     slice: Option<Slice>,
     odm: Option<dml30::PlanePlan>,
+    /// The primary's placement programmed after the modeset (None: the
+    /// lit owned surface, full screen), the HUBBUB watermarks and the OTG
+    /// global sync now in effect (DC's cached `hubbub1->watermarks` and
+    /// `pipe_dlg_param`).
+    plane: Option<crate::amdgpu_navi22_plane::Update>,
+    live_watermarks: Option<dml30::WatermarkSet>,
+    live_sync: Option<GlobalSync>,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -928,9 +1031,13 @@ impl Pipeline {
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
                 hdmi_settings: hdmi::OutputSettings::default(),
+                dp_format: DpFormat::DEFAULT,
                 hdmi_vrr: None,
                 slice: None,
                 odm: None,
+                plane: None,
+                live_watermarks: None,
+                live_sync: None,
             })
         }
     }
@@ -1401,6 +1508,7 @@ impl Pipeline {
         self.admitted = Some(Admitted {
             soc,
             refclk_khz: refclk,
+            vco_khz: levels.vco_khz,
             plan,
             offered: offered_on(sink, &soc, levels.vco_khz, verified),
         });
@@ -1453,6 +1561,8 @@ impl Pipeline {
         self.at(Step::Watermarks);
         // SAFETY: no HUBP fetches yet.
         unsafe { self.hubbub.program(&plan.hubbub, refclk) }.map_err(Error::Hubbub)?;
+        self.plane = None;
+        self.live_watermarks = Some(plan.hubbub);
         // enable_stream_timing: OPTC clocks, then the pixel clock.
         self.at(Step::PixelClock);
         self.enable_optc_clock().await?;
@@ -1470,6 +1580,7 @@ impl Pipeline {
             Signal::Hdmi => self.otg.program_tmds_timing(&timing, &sync)?,
             Signal::DisplayPort => self.otg.program_timing(&timing, &sync)?,
         }
+        self.live_sync = Some(sync);
         // dcn20_enable_stream_timing -> mpc3_set_out_rate_control.
         // mpc3_mpc_init_single_inst only clears FLOW_CONTROL_COUNT;
         // the stream step also clears a previously selected rate mode.
@@ -1477,7 +1588,7 @@ impl Pipeline {
         let width = timing.h_active / opps;
         self.opp.program(Encoding::Rgb, width, timing.v_active)?;
         self.opp.set_blank(true)?;
-        self.output_format().await?;
+        self.output_format(&timing, true).await?;
         if let Some(mut slice) = self.slice.take() {
             let combined = self.combine_slice(&mut slice, width, timing.v_active).await;
             self.slice = Some(slice);
@@ -1746,13 +1857,26 @@ impl Pipeline {
     /// OPTC_DATA_FORMAT, opp_program_fmt, dcn20_program_pipe's
     /// program_output_csc): DisplayPort SST is full-range 8-bpc RGB, as its
     /// MSA says, rather than whatever an earlier stream left on the pipe.
-    async fn output_format(&mut self) -> Result<(), Error> {
+    pub(crate) async fn output_format(
+        &mut self,
+        timing: &Timing,
+        uncompressed_sst: bool,
+    ) -> Result<(), Error> {
         let format = match self.connector.signal {
             Signal::Hdmi => match self.hdmi {
                 Some(stream) => stream.format,
                 None => return Ok(()),
             },
-            Signal::DisplayPort => hdmi::Format::RGB8,
+            Signal::DisplayPort => {
+                self.dp_format = dp_format(
+                    self.hdmi_settings,
+                    &self.dp.edid,
+                    self.dp.verified,
+                    timing,
+                    uncompressed_sst,
+                );
+                self.dp_format.pipe_format()
+            }
         };
         self.format.program_otg(format)?;
         self.format.program_fmt(format)?;
@@ -1790,7 +1914,7 @@ impl Pipeline {
         let setting = dp_link::decide_link_settings(
             verified,
             timing.pixel_clock_khz,
-            Depth::Bpc8.bits_per_pixel(),
+            self.dp_format.depth.bits_per_pixel(),
         )
         .ok_or(Error::NoMode)?;
         self.link_dp_at(tables, timing, &caps, setting, aux, true)
@@ -1818,17 +1942,16 @@ impl Pipeline {
         // DPRX_FEATURE_ENUMERATION_LIST (retrieve_link_cap, extended caps
         // only): SST_SPLIT_SDP_CAP bit 1, VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
         let feature = caps.dprx_feature;
-        // amdgpu_dm's VSC colorimetry also needs a DPCD 1.4 receiver.
-        // linux-lit: 0x14=DP_DPCD_REV_14
-        let vsc_colorimetry = caps.rev() >= 0x14 && feature & 1 << 3 != 0;
-        let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
+        let (vsc, hdr) = dp_packets(*caps, self.dp_format);
         self.dp_stream.set_stream_attribute(
             timing,
-            Depth::Bpc8,
-            vsc_colorimetry,
+            self.dp_format.depth,
+            vsc.is_some(),
             feature & 1 << 1 != 0,
         )?;
-        self.dp_stream.update_info_packets(vsc.as_ref()).await?;
+        self.dp_stream
+            .update_info_packets(vsc.as_ref(), hdr.as_ref())
+            .await?;
         // enable_link_dp: the PHY clock (requested_sym_clk, through
         // dcn30_notify_link_rate_change), then the DIG backend connected.
         let phy_max = self
@@ -1869,7 +1992,9 @@ impl Pipeline {
         self.dig.setup(DigMode::DisplayPort)?;
         // dcn20_enable_stream, then dcn20_unblank_stream.
         self.dig.connect_be_to_fe(true)?;
-        self.dp_stream.update_info_packets(vsc.as_ref()).await?;
+        self.dp_stream
+            .update_info_packets(vsc.as_ref(), hdr.as_ref())
+            .await?;
         self.dp_stream
             .unblank(timing.pixel_clock_khz, trained.rate)
             .await
@@ -2366,6 +2491,21 @@ impl Pipeline {
         {
             return Err(Error::Invalid);
         }
+        if self.connector.signal == Signal::DisplayPort {
+            // A new HDR static metadata SDP on the running DP stream.
+            let caps = self.dp.caps.ok_or(Error::Invalid)?;
+            let format = DpFormat {
+                hdr: settings.hdr,
+                ..self.dp_format
+            };
+            let (vsc, hdr) = dp_packets(caps, format);
+            self.dp_stream
+                .update_info_packets(vsc.as_ref(), hdr.as_ref())
+                .await?;
+            self.dp_format = format;
+            self.hdmi_settings = settings;
+            return Ok(());
+        }
         let mut stream = self.hdmi.ok_or(Error::Invalid)?;
         stream.hdr = settings.hdr.as_ref().map(|h| {
             crate::amdgpu_hdr::hdr_info_packet(Some(h), crate::amdgpu_hdr::HdrConnector::Hdmi)
@@ -2464,6 +2604,134 @@ pub fn test_pattern(_line: u32, row: &mut [u32]) {
     let width = row.len().max(1);
     for (x, pixel) in row.iter_mut().enumerate() {
         *pixel = BARS[x * 8 / width];
+    }
+}
+
+/// Plane updates of the lit primary (positioned, scaled, another pitch or
+/// size): DC's `commit_planes_for_stream` for a full update of the one
+/// plane, split around the flip the presentation owner arms. Callers hold
+/// the display owner; `program_plane` runs under the OTG's pipe-control
+/// lock, which the flip owner takes and releases around it and the
+/// surface address.
+impl Pipeline {
+    /// The placement the pipe now shows (the lit owned surface when no
+    /// update was programmed since the modeset).
+    pub fn plane_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
+        if let Some(u) = self.plane {
+            return Some(u.request);
+        }
+        let timing = self.output?.timing;
+        Some(crate::amdgpu_navi22_plane::Request::full_screen(
+            pitch(&timing),
+            timing.h_active,
+            timing.v_active,
+            &timing,
+        ))
+    }
+    /// What [`crate::amdgpu_navi22_plane::plan`] needs of the lit stream,
+    /// for validating a placement without the display owner (the atomic
+    /// check).
+    pub fn plane_basis(&self) -> Option<crate::amdgpu_navi22_plane::Basis> {
+        let (output, admitted) = (self.output?, self.admitted.as_ref()?);
+        Some(crate::amdgpu_navi22_plane::Basis {
+            timing: output.timing,
+            vco_khz: admitted.vco_khz,
+            soc: admitted.soc,
+            lit: admitted.plan,
+            odm: self.odm.is_some() || self.slice.is_some(),
+        })
+    }
+    /// [`crate::amdgpu_navi22_plane::plan`] for `request` on the lit stream.
+    pub fn plan_plane(
+        &self,
+        request: &crate::amdgpu_navi22_plane::Request,
+    ) -> Result<crate::amdgpu_navi22_plane::Update, crate::amdgpu_navi22_plane::Refusal> {
+        self.plane_basis()
+            .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
+            .plan(request)
+    }
+    /// The DML30 plan the pipe runs under now: the placement's after a
+    /// plane update, else the modeset's.
+    pub fn plane_plan(&self) -> Option<dml30::Plan> {
+        self.plane
+            .map(|u| u.plan)
+            .or_else(|| self.admitted.as_ref().map(|a| a.plan))
+    }
+    /// `prepare_bandwidth` for an update: `dcn3_update_clocks` pins UCLK at
+    /// its top level when the new plan loses DRAM clock change support
+    /// (DISPCLK/DPPCLK stay: [`crate::amdgpu_navi22_plane::plan`] admits no
+    /// update that needs more), then the HUBBUB watermarks it raises
+    /// (`hubbub3_program_watermarks(safe_to_lower = false)`).
+    pub async fn prepare_plane(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<(), Error> {
+        use crate::amdgpu_dml30::DramClockChange::Unsupported;
+        let now = self.plane_plan().ok_or(Error::Invalid)?;
+        if u.plan.dram_clock_change == Unsupported && now.dram_clock_change != Unsupported {
+            let levels = self.clocks.levels().ok_or(Error::Invalid)?;
+            let top = levels.range(Clock::Memory).max_khz();
+            self.clocks
+                .hard_min(Clock::Memory, top)
+                .await
+                .map_err(Error::Block)?;
+        }
+        let refclk = self.admitted.as_ref().ok_or(Error::Invalid)?.refclk_khz;
+        let current = self.live_watermarks.as_mut().ok_or(Error::Invalid)?;
+        self.hubbub
+            .program_live(&u.plan.hubbub, current, refclk, false)
+            .map_err(Error::Hubbub)?;
+        Ok(())
+    }
+    /// `dcn20_program_pipe` for the update, under the pipe-control lock the
+    /// caller holds: the OTG global sync when the plan moved it
+    /// (`dcn20_program_tg`), then `dcn20_update_dchubp_dpp`'s HUBP request
+    /// and deadline registers with the cursor's, the DSCL scaler, the
+    /// MPCC background, the viewport and the surface pitch. The address
+    /// follows from the flip owner inside the same lock.
+    pub async fn program_plane(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) || self.odm.is_some() {
+            return Err(Error::Busy);
+        }
+        let p = &u.plan.prefetch;
+        let sync = GlobalSync {
+            v_startup_lines: p.v_startup,
+            v_update_offset_pix: p.v_update_offset_pix,
+            v_update_width_pix: p.v_update_width_pix,
+            v_ready_offset_pix: p.v_ready_offset_pix,
+        };
+        if self.live_sync != Some(sync) {
+            self.otg.update_global_sync(&sync).await?;
+            self.live_sync = Some(sync);
+        }
+        self.hubp.setup(&u.plan.registers)?;
+        self.program_cursor_ttu(u.plan.cursor)?;
+        self.dpp.set_scaler(&u.scaler)?;
+        // dcn20_update_mpcc -> update_visual_confirm_color: black.
+        self.mpc.set_bg_color([0; 3])?;
+        let vp = u.scaler.viewport;
+        self.hubp
+            .set_viewport(vp.x as u32, vp.y as u32, vp.width as u32, vp.height as u32)?;
+        self.hubp.set_pitch(u.request.pitch)?;
+        self.plane = Some(*u);
+        Ok(())
+    }
+    /// `optimize_bandwidth` once the update latched: the watermarks lowered
+    /// to its plan (`safe_to_lower`).
+    pub fn optimize_plane(&mut self) -> Result<(), Error> {
+        let refclk = self.admitted.as_ref().ok_or(Error::Invalid)?.refclk_khz;
+        let set = match self.plane {
+            Some(u) => u.plan.hubbub,
+            None => self.admitted.as_ref().ok_or(Error::Invalid)?.plan.hubbub,
+        };
+        let current = self.live_watermarks.as_mut().ok_or(Error::Invalid)?;
+        self.hubbub
+            .program_live(&set, current, refclk, true)
+            .map_err(Error::Hubbub)?;
+        Ok(())
     }
 }
 

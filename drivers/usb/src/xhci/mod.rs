@@ -62,6 +62,7 @@
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
@@ -290,10 +291,12 @@ pub struct Topology {
     /// Port number on the parent hub for an LS/FS device behind it
     /// (§6.2.2 dword2[15:8]). 0 if not applicable.
     pub parent_hub_port: u8,
-    /// TT Think Time (§6.2.2 dword2[17:16]) — 0/1/2/3 = 8/16/24/32
-    /// FS bit-times. Only meaningful for an LS/FS device behind a
-    /// high-speed hub.
-    pub tt_think_time: u8,
+    /// MTT (§6.2.2 dword0[25]) for an LS/FS device behind a high-speed
+    /// hub running multiple transaction translators (Linux
+    /// `xhci_setup_addressable_virt_dev`: `udev->tt->multi`). TT Think
+    /// Time belongs to the hub's own slot ([`Xhci::mark_as_hub`]), never
+    /// to the child's.
+    pub mtt: bool,
 }
 
 impl Topology {
@@ -302,7 +305,7 @@ impl Topology {
         route_string: 0,
         parent_hub_slot_id: 0,
         parent_hub_port: 0,
-        tt_think_time: 0,
+        mtt: false,
     };
 
     /// Compute the topology for a device reached via `parent_hub`
@@ -328,7 +331,7 @@ impl Topology {
             route_string: route & 0x000F_FFFF,
             parent_hub_slot_id: 0,
             parent_hub_port: 0,
-            tt_think_time: 0,
+            mtt: false,
         }
     }
 }
@@ -547,6 +550,17 @@ pub struct Xhci {
     /// IDT vector allocated for this controller's interrupter 0,
     /// or `None` if MSI-X wasn't enabled.
     pub irq_vector: Option<u8>,
+    /// Stable controller index (`xhci<N>`, probe order). Every class
+    /// binding records it, because slot IDs and root-port numbers are
+    /// only unique within one controller.
+    id: u8,
+    /// The PCI function this controller drives, so a second probe of
+    /// the same function (exact-ID and class matches both fire) does not
+    /// bring it up twice.
+    bus_addr: narf_bus::BusAddr,
+    /// Waker of this controller's USB supervisor, poked by the demux on a
+    /// Port Status Change Event.
+    supervisor_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
 }
 
 /// Per-slot device state held by the controller after a successful
@@ -1854,7 +1868,31 @@ impl Xhci {
             running: true,
             msix,
             irq_vector,
+            id: 0,
+            bus_addr: device.addr,
+            supervisor_waker: IrqSafeSpinLock::new(None),
         })
+    }
+
+    /// This controller's index (`xhci<N>`); see [`controller_by_id`].
+    pub fn id(&self) -> u8 {
+        self.id
+    }
+
+    /// Install this controller's supervisor waker so the demux can poke
+    /// it on a Port Status Change Event. Replaces any previous waker.
+    pub fn register_supervisor_waker(&self, w: core::task::Waker) {
+        *self.supervisor_waker.lock() = Some(w);
+    }
+
+    /// Wake this controller's supervisor if it registered a waker. The
+    /// lock is dropped before `wake_by_ref` to keep IRQ-context work
+    /// bounded.
+    fn wake_supervisor(&self) {
+        let w = self.supervisor_waker.lock().clone();
+        if let Some(w) = w {
+            w.wake_by_ref();
+        }
     }
 
     /// Walk the controller's MSI-X capability, allocate an IDT
@@ -2160,7 +2198,12 @@ impl Xhci {
                 // which W1Cs every change bit it observes set). PEC
                 // gets the same treatment in case the port toggled
                 // PED across the reset.
-                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_PRC | PORTSC_CSC | PORTSC_PEC;
+                //
+                // The writeback must not carry PED: it is RW1C and the
+                // reset just set it, so echoing it disables the port
+                // the controller enabled (`xhci_port_state_to_neutral`).
+                let ack =
+                    op::PortStatus::clear_changes_value(v, PORTSC_PRC | PORTSC_CSC | PORTSC_PEC);
                 // SAFETY: same.
                 unsafe {
                     self.mmio.write32(off, ack);
@@ -2416,7 +2459,7 @@ impl Xhci {
             // The counter publication is ordered already. Invoke arbitrary
             // registered wakers after releasing the demux reservation.
             drop(_publication);
-            wake_usb_supervisor();
+            self.wake_supervisor();
             return Some(ev);
         }
         let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
@@ -3108,11 +3151,11 @@ impl Xhci {
         //                 chain (§4.5.2). 0 for a root-hub device.
         //   dword0[23:20] Speed (Table 6-7: 1=FS, 2=LS, 3=HS,
         //                 4=SS, 5=SSP).
-        //   dword0[25]    MTT (multi-TT) — 0 unless this device
-        //                 itself is a multi-TT hub.
+        //   dword0[25]    MTT — set for an LS/FS device behind a
+        //                 multi-TT high-speed hub (`Topology::mtt`).
         //   dword0[26]    Hub — 1 if this device is a USB hub. Set
-        //                 separately via Evaluate Context after the
-        //                 hub descriptor is read.
+        //                 separately via Configure Endpoint after the
+        //                 hub descriptor is read (`mark_as_hub`).
         //   dword0[31:27] Context Entries — DCI of the highest
         //                 valid endpoint (1 here = EP0 only).
         //   dword1[15:0]  Max Exit Latency (0).
@@ -3124,16 +3167,15 @@ impl Xhci {
         //                 high-speed hub for an LS/FS device behind
         //                 it; 0 otherwise.
         //   dword2[15:8]  TT Port Number on the parent hub.
-        //   dword2[17:16] TT Think Time (0..3 = 8/16/24/32 FS bit
-        //                 times) — only meaningful if the parent is
-        //                 a high-speed hub.
+        //   dword2[17:16] TT Think Time — 0 here; it describes a
+        //                 high-speed hub's own TT (`mark_as_hub`).
         let slot_d0 = (1u32 << 27)              // Context Entries = 1
                     | ((speed as u32) << 20)    // Speed
+                    | (if topology.mtt { slot::SLOT_CTX_MTT_BIT } else { 0 })
                     | (topology.route_string & 0x000F_FFFF); // Route String
         let slot_d1 = (port as u32) << 16; // Root Hub Port Number
-        let slot_d2 = (topology.parent_hub_slot_id as u32)
-            | ((topology.parent_hub_port as u32) << 8)
-            | ((topology.tt_think_time as u32 & 0x3) << 16);
+        let slot_d2 =
+            (topology.parent_hub_slot_id as u32) | ((topology.parent_hub_port as u32) << 8);
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
@@ -3319,13 +3361,25 @@ impl Xhci {
         input: DmaBuffer,
         claim: &mut EndpointConfiguration<'_>,
     ) -> Result<(), XhciError> {
+        self.submit_input_context(input, claim, TRB_TYPE_EVAL_CONTEXT_CMD)
+            .await
+    }
+
+    /// Submit an Input Context command (`trb_type`: Evaluate Context or
+    /// Configure Endpoint) for the claimed slot and await its completion.
+    async fn submit_input_context(
+        &self,
+        input: DmaBuffer,
+        claim: &mut EndpointConfiguration<'_>,
+        trb_type: u32,
+    ) -> Result<(), XhciError> {
         let input_phys = input.dma_addr().raw();
         input.sync(0, input.len());
         device_dma_barrier();
         let mut retained = bulk_owner::CommandDma::new(input);
         retained.publish();
         claim.published = true;
-        let d3 = (TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT) | (u32::from(claim.slot) << 24);
+        let d3 = (trb_type << TRB_TYPE_SHIFT) | (u32::from(claim.slot) << 24);
         let command =
             self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, d3)?;
         let ev = self
@@ -3349,23 +3403,40 @@ impl Xhci {
         Ok(())
     }
 
+    /// `xhci_update_hub_device`: tell the controller `slot_id` is a hub —
+    /// Hub, MTT, Number of Ports and (for a high-speed hub) TT Think Time
+    /// in its slot context. Evaluate Context ignores these fields (it
+    /// evaluates only Interrupter Target and Max Exit Latency, xHCI 1.2
+    /// §4.6.7), so, as Linux does on every xHC newer than 0.96, copy the
+    /// current slot context, set the hub fields, zero the slot state and
+    /// issue Configure Endpoint with A0 alone.
     pub async fn mark_as_hub(
         &self,
         slot_id: u8,
         num_ports: u8,
         multi_tt: bool,
+        tt_think_time: u8,
     ) -> Result<(), XhciError> {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
         let mut claim = self.begin_context(slot_id)?;
-        let (speed, port, topology) = {
+        let (speed, current) = {
             let g = self.devices.lock();
             let d = g
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
-            (d.speed, d.port, d.topology)
+            d._device_ctx.sync(0, 16);
+            device_dma_barrier();
+            let mut words = [0u32; 4];
+            for (index, word) in words.iter_mut().enumerate() {
+                // SAFETY: the retained output context covers these four dwords.
+                *word = unsafe {
+                    core::ptr::read_volatile(d._device_ctx.cpu_ptr_at::<u32>((index * 4) as u64))
+                };
+            }
+            (d.speed, words)
         };
 
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
@@ -3374,46 +3445,35 @@ impl Xhci {
         unsafe {
             core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
         }
-        let cs = self.context_stride();
-        let input_ctrl = input_phys;
-        let slot_ctx = input_phys + cs;
+        let slot_ctx = input_phys + self.context_stride();
 
-        // Add Slot only (A0=1). Drop mask = 0.
-        // SAFETY: identity-mapped, in-page.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(input_ctrl + 4).kernel_mut_ptr::<u32>(),
-                1 << 0,
-            );
+        let mut slot_d0 = current[0] | slot::SLOT_CTX_HUB_BIT;
+        if multi_tt {
+            slot_d0 |= slot::SLOT_CTX_MTT_BIT;
+        } else {
+            slot_d0 &= !slot::SLOT_CTX_MTT_BIT;
         }
-
-        let slot_d0 =
-            slot::encode_slot_ctx_dword0(topology.route_string, speed as u8, multi_tt, true, 1);
-        let slot_d1 = slot::encode_slot_ctx_dword1(0, port, num_ports);
-        let slot_d2 = slot::encode_slot_ctx_dword2(
-            topology.parent_hub_slot_id,
-            topology.parent_hub_port,
-            topology.tt_think_time,
-        );
-        // SAFETY: same.
+        let slot_d1 = (current[1] & 0x00FF_FFFF) | (u32::from(num_ports) << 24);
+        let mut slot_d2 = current[2] & !(0x3 << 16);
+        if matches!(speed, PortSpeed::High) {
+            slot_d2 |= (u32::from(tt_think_time) & 0x3) << 16;
+        }
+        // Add Slot only (A0=1), drop mask 0, slot state zeroed
+        // (`slot_ctx->dev_state = 0`).
+        // SAFETY: identity-mapped DMA; all offsets are inside the page.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(slot_ctx).kernel_mut_ptr::<u32>(),
-                slot_d0,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
-                slot_d1,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(slot_ctx + 8).kernel_mut_ptr::<u32>(),
-                slot_d2,
-            );
+            core::ptr::write_volatile(input.cpu_mut_ptr_at::<u32>(4), 1 << 0);
+            for (index, value) in [slot_d0, slot_d1, slot_d2, 0].into_iter().enumerate() {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(slot_ctx + index as u64 * 4).kernel_mut_ptr::<u32>(),
+                    value,
+                );
+            }
         }
         compiler_fence(Ordering::SeqCst);
 
-        self.evaluate_input(input, &mut claim).await?;
-        Ok(())
+        self.submit_input_context(input, &mut claim, TRB_TYPE_CONFIGURE_ENDPOINT_CMD)
+            .await
     }
 
     pub async fn evaluate_context_ep0_mps(
@@ -3606,6 +3666,20 @@ impl Xhci {
             && (event_trb & !0xFu64) == trb_phys
     }
 
+    /// A control transfer that completed with a halting code (Babble 3,
+    /// USB Transaction Error 4, Stall 6) leaves EP0 Halted on the xHC and
+    /// its software claim busy, so every later request on the device
+    /// would fail `NotReady`. Linux recovers with Reset Endpoint + Set TR
+    /// Dequeue (`xhci_handle_halted_endpoint`); `reset_endpoint` does both
+    /// and releases the claim. Other failures leave EP0 running.
+    async fn recover_halted_control(&self, slot_id: u8, generation: u64, code: u8) {
+        if matches!(code, 3 | 4 | 6) {
+            let _ = self
+                .reset_endpoint(slot_id, generation, DCI_CONTROL_EP as u8)
+                .await;
+        }
+    }
+
     fn begin_control(&self, slot_id: u8, generation: u64) -> Result<(u64, u64, usize), XhciError> {
         let mut devices = self.devices.lock();
         let device = devices
@@ -3701,6 +3775,34 @@ impl Xhci {
 
     #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
     pub(crate) async fn control_in_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
+        let result = self
+            .control_in_transfer(
+                slot_id,
+                generation,
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                out,
+            )
+            .await;
+        if let Err(XhciError::CmdFailed(code)) = result {
+            self.recover_halted_control(slot_id, generation, code).await;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
+    async fn control_in_transfer(
         &self,
         slot_id: u8,
         generation: u64,
@@ -3864,6 +3966,34 @@ impl Xhci {
 
     #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
     pub(crate) async fn control_out_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, XhciError> {
+        let result = self
+            .control_out_transfer(
+                slot_id,
+                generation,
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                data,
+            )
+            .await;
+        if let Err(XhciError::CmdFailed(code)) = result {
+            self.recover_halted_control(slot_id, generation, code).await;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
+    async fn control_out_transfer(
         &self,
         slot_id: u8,
         generation: u64,
@@ -5285,10 +5415,74 @@ fn enqueue_normal_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, 
 /// at the per-resource inner locks the `Xhci` struct already owns
 /// (`cmd_enqueue`, `cmd_pcs`, `cmd_events`, `transfer_events`,
 /// `er_dequeue`, `er_ccs`).
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Xhci>>> = IrqSafeSpinLock::new(None);
+static CONTROLLERS: IrqSafeSpinLock<Vec<Arc<Xhci>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Most xHCI controllers one machine drives (`xhci0`..). Probe refuses
+/// controllers beyond it rather than aliasing their registries.
+pub const MAX_CONTROLLERS: usize = 8;
+
+/// One registry per controller, indexed by [`Xhci::id`]. Slot IDs and
+/// root-port numbers are only unique within a controller, so every
+/// slot- or port-keyed binding registry is split this way: a binding's
+/// controller is the registry it lives in.
+pub struct PerController<T>([IrqSafeSpinLock<T>; MAX_CONTROLLERS]);
+
+impl<T> core::fmt::Debug for PerController<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PerController")
+    }
+}
+
+impl<T> PerController<T> {
+    pub const fn new(locks: [IrqSafeSpinLock<T>; MAX_CONTROLLERS]) -> Self {
+        Self(locks)
+    }
+
+    /// The registry of controller `id`. An out-of-range id (never
+    /// produced by probe) maps to the last registry rather than
+    /// panicking.
+    pub fn of(&self, id: u8) -> &IrqSafeSpinLock<T> {
+        &self.0[usize::from(id).min(MAX_CONTROLLERS - 1)]
+    }
+
+    /// Every controller's registry with its id.
+    pub fn each(&self) -> impl Iterator<Item = (u8, &IrqSafeSpinLock<T>)> {
+        self.0.iter().enumerate().map(|(i, l)| (i as u8, l))
+    }
+}
+
+/// `PerController<Vec<T>>` with every registry empty.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! per_controller_vec {
+    () => {
+        $crate::xhci::PerController::new(
+            [const { narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()) };
+                $crate::xhci::MAX_CONTROLLERS],
+        )
+    };
+}
+
+/// Hook the USB supervisor installs once it starts, so a controller
+/// probed later still gets its own supervisor. Read and written only
+/// under the [`CONTROLLERS`] lock, so no controller is missed between
+/// the supervisor's snapshot and its hook installation.
+static ON_CONTROLLER_BOUND: IrqSafeSpinLock<Option<ControllerHook>> = IrqSafeSpinLock::new(None);
+
+/// Run once for each controller bound after the supervisor started.
+type ControllerHook = fn(Arc<Xhci>);
+
+/// Install the hook run for every controller bound from now on, and
+/// return the controllers already bound (which the caller starts
+/// itself). Called once by the supervisor initcall.
+pub(crate) fn on_controller_bound(hook: ControllerHook) -> Vec<Arc<Xhci>> {
+    let controllers = CONTROLLERS.lock();
+    *ON_CONTROLLER_BOUND.lock() = Some(hook);
+    controllers.clone()
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.bus_addr == device.addr) {
         return Ok(());
     }
     // The class-match backstop matches *every* device with PCI
@@ -5327,14 +5521,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
-    let dev = match unsafe { Xhci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { Xhci::bring_up(&device, &cap) } {
         Ok(d) => d,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+        Err(e) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: {:04x}:{:04x} at {:?} bring-up failed: {:?}",
+                device.id.vendor,
+                device.id.device,
+                device.addr,
+                e
+            );
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
     };
-    *CONTROLLER.lock() = Some(Arc::new(dev));
+    let (controller, name, hook) = {
+        let mut controllers = CONTROLLERS.lock();
+        if controllers.len() >= MAX_CONTROLLERS {
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+        let id = controllers.len() as u8;
+        dev.id = id;
+        let controller = Arc::new(dev);
+        controllers.push(controller.clone());
+        let hook = *ON_CONTROLLER_BOUND.lock();
+        (controller, alloc::format!("xhci{id}"), hook)
+    };
     IS_PROBED.store(true, core::sync::atomic::Ordering::Release);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("xhci0"),
+        name,
         kind: narf_drivers::BoundKind::UsbHost,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
@@ -5345,7 +5561,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Real D3 handling for xHCI also needs to save/restore the
     // Operational + Doorbell register windows, which the
     // current shape doesn't do — registered as best-effort.
-    narf_power::device_pm::register_device_pm("xhci0", xhci_suspend_handler, xhci_resume_handler);
+    // One registration covers every controller: the handlers walk the
+    // whole registry (the PM hooks are plain `fn`s with no context).
+    if controller.id() == 0 {
+        narf_power::device_pm::register_device_pm(
+            "xhci",
+            xhci_suspend_handler,
+            xhci_resume_handler,
+        );
+    }
+    if let Some(hook) = hook {
+        hook(controller);
+    }
     Ok(())
 }
 
@@ -5359,12 +5586,12 @@ fn xhci_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErro
     if !is_probed() {
         return Ok(());
     }
-    // Halt: clear USBCMD.R/S. Use with_controller to reach the regs.
-    let halted = with_controller(|c| {
-        // SAFETY: BAR5 mapped, exclusive owner.
-        unsafe { c.halt_for_suspend() }
-    })
-    .unwrap_or(false);
+    // Halt: clear USBCMD.R/S on every bound controller.
+    // Halt every controller even if one fails.
+    let halted = controllers().iter().fold(true, |ok, c| {
+        // SAFETY: BAR mapped, exclusive owner.
+        (unsafe { c.halt_for_suspend() }) && ok
+    });
     if halted {
         Ok(())
     } else {
@@ -5380,11 +5607,10 @@ fn xhci_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError
     if !is_probed() {
         return Ok(());
     }
-    let resumed = with_controller(|c| {
+    let resumed = controllers().iter().fold(true, |ok, c| {
         // SAFETY: same.
-        unsafe { c.run_for_resume() }
-    })
-    .unwrap_or(false);
+        (unsafe { c.run_for_resume() }) && ok
+    });
     if resumed {
         Ok(())
     } else {
@@ -5429,13 +5655,13 @@ pub fn register_pci_driver() {
     });
 }
 
-/// Lock-free probe-status flag. Mirrors `CONTROLLER.is_some()` —
+/// Lock-free probe-status flag: true once any controller is bound —
 /// set once when probe succeeds, never cleared in production
 /// (xhci doesn't unbind today). Diagnostics MUST read this rather
-/// than locking CONTROLLER, because the USB HID supervisor holds
-/// CONTROLLER for tens of ms during port attach on real silicon
+/// than locking the controller registry, because the USB HID supervisor
+/// holds controllers for tens of ms during port attach on real silicon
 /// and IrqSafeSpinLock disables IF on the waiter — a status-panel
-/// paint that locks CONTROLLER freezes the entire CPU until the
+/// paint that locks the registry freezes the entire CPU until the
 /// supervisor releases.
 pub static IS_PROBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -5457,63 +5683,24 @@ pub fn is_probed() -> bool {
 /// for an immediate re-poll.
 pub static USB_PSCE_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Optional supervisor waker. The USB supervisor registers its
-/// `core::task::Waker` via [`register_supervisor_waker`]; the xHCI
-/// ISR / demux calls `wake_by_ref` on it whenever a Port Status
-/// Change Event lands. Stored behind an `IrqSafeSpinLock` so the
-/// ISR (which preempts the supervisor) can install/observe it
-/// without racing.
-///
-/// Semantics: the slot holds at most one waker. A new
-/// `register_supervisor_waker` replaces the previous occupant —
-/// matches `core::task::Waker::will_wake` dedup behaviour but
-/// without the lookup, since we only ever have one supervisor.
-static USB_SUPERVISOR_WAKER: IrqSafeSpinLock<Option<core::task::Waker>> =
-    IrqSafeSpinLock::new(None);
-
-/// Install the USB supervisor's waker so the xHCI demux can poke
-/// it on a Port Status Change Event. Replaces any previously
-/// installed waker. Pass `cx.waker().clone()` from the supervisor's
-/// poll path; the slot caches it across yields.
-pub fn register_supervisor_waker(w: core::task::Waker) {
-    let mut g = USB_SUPERVISOR_WAKER.lock();
-    *g = Some(w);
+/// Every bound controller, in probe order (`xhci0`, `xhci1`, ...). The
+/// registry lock is held only for the clone.
+pub fn controllers() -> Vec<Arc<Xhci>> {
+    CONTROLLERS.lock().clone()
 }
 
-/// Internal: wake the supervisor if a waker is registered.
-/// Called from the ISR / demux path on PSCE. Drops the lock
-/// before invoking `wake_by_ref` to keep IRQ-context work bounded
-/// — the waker only flips the per-task awake flag, but doing it
-/// outside the lock keeps the lock-hold-time predictable.
-fn wake_usb_supervisor() {
-    let w = {
-        let g = USB_SUPERVISOR_WAKER.lock();
-        g.clone()
-    };
-    if let Some(w) = w {
-        w.wake_by_ref();
-    }
+/// The controller with index `id` ([`Xhci::id`]) — what every class
+/// binding uses to reach its own device. Slot IDs and port numbers are
+/// only unique within one controller.
+pub fn controller_by_id(id: u8) -> Option<Arc<Xhci>> {
+    CONTROLLERS.lock().get(usize::from(id)).cloned()
 }
 
-/// Get a cloned `Arc<Xhci>` handle to the bound controller, or
-/// `None` if no controller is bound. The registry lock is held
-/// ONLY for the Arc clone — never across the caller's work. Use
-/// this in preference to [`with_controller`] when the work spans
-/// multiple MMIO ops, command-completion waits, or any path that
-/// would benefit from releasing the lock between sub-steps.
-pub fn controller() -> Option<Arc<Xhci>> {
-    CONTROLLER.lock().clone()
-}
-
-/// Convenience wrapper: clone the Arc, drop the registry lock,
-/// then invoke `f`. Semantically identical to the previous
-/// closure-inside-the-lock shape from the caller's perspective,
-/// but the outer lock is no longer held during `f` — `f` can
-/// take seconds (port reset, command completion) without blocking
-/// every other caller / the ISR.
-pub fn with_controller<R>(f: impl FnOnce(&Xhci) -> R) -> Option<R> {
-    let c = controller()?;
-    Some(f(&c))
+/// The first bound controller. Only for callers with no device context
+/// (diagnostics, status counters); anything acting on a device must use
+/// its binding's controller via [`controller_by_id`].
+pub fn first_controller() -> Option<Arc<Xhci>> {
+    CONTROLLERS.lock().first().cloned()
 }
 
 /// xHCI ISR — runs in IRQ context.
@@ -5542,11 +5729,18 @@ fn xhci_isr() {
     // demux/poll/ack step takes its own per-resource inner lock
     // as needed; that's the right granularity for a shared
     // controller handle.
-    let xhci = match controller() {
-        Some(x) => x,
-        None => return,
-    };
-    let xhci = &*xhci;
+    // The vector may be shared (INTx) and the handler has no context,
+    // so service every controller; one with nothing pending returns
+    // from the demux at once, and the IMAN write only clears IP.
+    // Iterate under the registry lock rather than cloning the list:
+    // the ISR must not allocate.
+    let controllers = CONTROLLERS.lock();
+    for xhci in controllers.iter() {
+        service_interrupt(xhci);
+    }
+}
+
+fn service_interrupt(xhci: &Xhci) {
     // Demux up to N events into the per-class queues so any
     // waiter (await_event) sees its event regardless of
     // whether the ISR or the waiter dequeued it from the ring.

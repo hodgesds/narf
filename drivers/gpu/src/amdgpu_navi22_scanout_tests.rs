@@ -106,3 +106,37 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_cursor_digest_distinguishes_images
 );
+
+/// amdgpu_dm flips straight to the client BO: while a client framebuffer
+/// is shown, neither owned surface is fetched; a flip to the owned back
+/// (a copied frame) or back to the owned front (lastclose) leaves it.
+fn navi22_scanout_external_front_bookkeeping() -> TestResult {
+    let mut b = Buffers::new(surface(0x1000));
+    b.surfaces[1] = Some(surface(0x9000));
+    if b.shown() != 0x1000 || b.external.is_some() {
+        return TestResult::Fail("owned front not shown at start");
+    }
+    if b.show_external(0x40_0000) != 0x1000
+        || b.shown() != 0x40_0000
+        || b.front().address != 0x1000
+        || b.back().map(|s| s.address) != Some(0x9000)
+    {
+        return TestResult::Fail("client flip roles");
+    }
+    if b.show_external(0x80_0000) != 0x40_0000 || b.shown() != 0x80_0000 {
+        return TestResult::Fail("client to client flip must report the unfetched one");
+    }
+    // A copied frame lands in the owned back and flips to it.
+    if b.swap().is_err() || b.external.is_some() || b.shown() != 0x9000 {
+        return TestResult::Fail("owned flip after a client frame");
+    }
+    b.show_external(0x40_0000);
+    if b.show_owned_front() != 0x40_0000 || b.shown() != 0x9000 || b.external.is_some() {
+        return TestResult::Fail("return to the owned front");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_scanout_external_front_bookkeeping
+);

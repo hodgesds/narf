@@ -527,10 +527,11 @@ pub fn publish() {
         .map(|(n, c)| crate::amdgpu_navi48_kms::RoutedConnector {
             index: n,
             kind: c.kind,
+            // The whole EDID, extension blocks included (drm_edid_read).
             edid: c
                 .present
-                .then(|| c.edid.get(..128).and_then(|e| e.try_into().ok()))
-                .flatten(),
+                .then_some(c.edid.as_slice())
+                .filter(|e| e.len() >= 128),
             offered: if c.lightable() { &c.modes } else { &[] },
             crtc: routes[n],
             possible_crtcs: (1 << MAX_CRTCS) - 1,
@@ -582,14 +583,22 @@ fn apply_card_vrr(
     // connector controls must not import DCN401 CRTC/plane capabilities.
     let previous = card.native.clone();
     crate::amdgpu_navi48_kms::apply_routed_vrr(card, crtcs, connectors, vrr);
+    // amdgpu_dm_connector_init_helper: "max bpc" on every non-MST
+    // connector (Navi22 publishes no MST ones), Colorspace and
+    // HDR_OUTPUT_METADATA on HDMI and DP.
     for (native, connector) in card.native.iter_mut().zip(connectors) {
-        if connector.kind != ConnectorType::HdmiA {
-            continue;
-        }
         let kept = previous.iter().find(|n| n.connector == native.connector);
-        native.colorspace = Some(kept.and_then(|n| n.colorspace).unwrap_or(0));
-        native.hdr_output_metadata = Some(kept.and_then(|n| n.hdr_output_metadata).unwrap_or(0));
-        native.color_format = Some(kept.and_then(|n| n.color_format).unwrap_or_default());
+        if matches!(
+            connector.kind,
+            ConnectorType::HdmiA | ConnectorType::DisplayPort
+        ) {
+            native.colorspace = Some(kept.and_then(|n| n.colorspace).unwrap_or(0));
+            native.hdr_output_metadata =
+                Some(kept.and_then(|n| n.hdr_output_metadata).unwrap_or(0));
+        }
+        if connector.kind == ConnectorType::HdmiA {
+            native.color_format = Some(kept.and_then(|n| n.color_format).unwrap_or_default());
+        }
         native.max_bpc = Some(
             kept.and_then(|n| n.max_bpc)
                 .unwrap_or_else(crate::amdgpu_navi48_boot::max_bpc),
@@ -599,10 +608,11 @@ fn apply_card_vrr(
     card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
     // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
-    // This presenter copies one linear 8888 primary into its DCN30 back
-    // buffer; overlays, GFX12 tiling and native plane geometry have no
-    // implementation here. Keep the generic atomic primary/cursor ABI.
-    card.native_planes.clear();
+    // This presenter shows one linear 8888 primary per CRTC; overlays and
+    // GFX12 tiling have no implementation here, so the primaries stay the
+    // synthesized ones. Each CRTC has its DRM_PLANE_TYPE_CURSOR plane
+    // (amdgpu_dm_crtc_init), shown on the DCN30 hardware cursor.
+    card.native_planes.retain(|p| p.is_cursor());
     card.overlay_formats = None;
     card.gfx12_modifiers = false;
 }

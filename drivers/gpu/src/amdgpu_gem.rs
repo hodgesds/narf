@@ -759,8 +759,8 @@ impl GemObject {
     /// [`prepare_scanout`] (it may wait for jobs and copy the whole buffer,
     /// which never happens under the caller's KMS lock), so a buffer still
     /// outside VRAM here is refused with ttm_bo_validate's `-ENOMEM`
-    /// (`OutOfMemory`); a buffer VRAM is not allowed for or a foreign
-    /// dma-buf is `-EINVAL` (`InvalidData`), a userptr `-EPERM`
+    /// (`OutOfMemory`) whatever its allowed domains; a foreign dma-buf is
+    /// `-EINVAL` (`InvalidData`), a userptr `-EPERM`
     /// (`OperationNotPermitted`), as amdgpu_bo_pin answers them. Pinning
     /// forces a CPU-accessible buffer into visible VRAM
     /// (CPU_ACCESS_REQUIRED): NARF only ever places NO_CPU_ACCESS buffers
@@ -768,11 +768,8 @@ impl GemObject {
     /// there. A VRAM placement is one reservation, so it is contiguous. The
     /// pin keeps the buffer, and that placement, until it drops.
     pub fn pin_scanout(self: &Arc<Self>) -> Result<ScanoutPin, FsError> {
-        if self.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
-            == 0
-        {
-            return Err(FsError::InvalidData);
-        }
+        // amdgpu_bo_pin checks no allowed domains: a buffer resident in
+        // VRAM is pinned in place whatever it was created for.
         let placement = self.placement.lock();
         let address = match &placement.backing {
             Backing::Vram { _held } => _held.address(),
@@ -877,6 +874,10 @@ impl GemObject {
     }
     pub fn cpu_visible(&self) -> bool {
         self.placement().cpu_visible()
+    }
+    /// Imported from another device's dma-buf (drm_gem_is_imported).
+    pub fn is_foreign(&self) -> bool {
+        matches!(self.placement().backing, Backing::Foreign { .. })
     }
     /// Created by `GEM_USERPTR` (amdgpu_ttm_tt_get_usermm).
     pub fn is_userptr(&self) -> bool {
@@ -1722,41 +1723,77 @@ pub(crate) async fn prepare_scanout_locked(
         }
     }
     for object in &unique {
-        // Preserve amdgpu_bo_pin's domain/userptr/foreign validation before
-        // trying to move it; these objects cannot become display buffers.
-        if object.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
-            == 0
-        {
-            return Err(FsError::InvalidData);
-        }
+        // amdgpu_bo_pin's userptr refusal, and its refusal of an imported
+        // buffer for a VRAM-only (dGPU) display domain.
         if object.is_userptr() {
             return Err(FsError::OperationNotPermitted);
+        }
+        if object.is_foreign() {
+            return Err(FsError::InvalidData);
         }
         if !object.system() || object.pinned() {
             continue;
         }
-        match crate::amdgpu_vm::relocate(&gate, object, true).await {
-            Ok(()) => {}
-            Err(FsError::NoSpace | FsError::OutOfMemory) => {
-                let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
-                if !reclaim_vram_locked(
-                    &gate,
-                    &heap,
-                    object.byte_len,
-                    object.alignment,
-                    object.flags,
-                    &unique,
-                )
-                .await
-                {
-                    return Err(FsError::OutOfMemory);
-                }
-                crate::amdgpu_vm::relocate(&gate, object, true).await?;
-            }
-            Err(error) => return Err(error),
-        }
+        // amdgpu_bo_pin places the buffer from the pin domain
+        // (amdgpu_bo_placement_from_domain), not from its allowed domains:
+        // one created for GTT alone is still moved to VRAM (visible VRAM
+        // unless NO_CPU_ACCESS) for scanout. The allowed domains keep
+        // governing every other move, so they are widened for this move only.
+        pin_relocate(&gate, object, &unique).await?;
     }
     Ok(ScanoutPreparation { _gate: gate })
+}
+
+/// [`prepare_scanout_locked`]'s move of one buffer into VRAM, with VRAM
+/// added to its allowed domains for the move (as [`evict_all`] adds GTT).
+/// The original domains are restored unless `GEM_OP(SET_PLACEMENT)` replaced
+/// them meanwhile.
+async fn pin_relocate(
+    gate: &PlacementGuard,
+    object: &Arc<GemObject>,
+    unique: &[Arc<GemObject>],
+) -> Result<(), FsError> {
+    let vram = u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM);
+    let original = object.allowed_domains.fetch_or(vram, Ordering::AcqRel);
+    let result = relocate_for_scanout(gate, object, unique).await;
+    if original & vram == 0 {
+        let _ = object.allowed_domains.compare_exchange(
+            original | vram,
+            original,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+    result
+}
+
+async fn relocate_for_scanout(
+    gate: &PlacementGuard,
+    object: &Arc<GemObject>,
+    unique: &[Arc<GemObject>],
+) -> Result<(), FsError> {
+    let card = gate.card();
+    match crate::amdgpu_vm::relocate(gate, object, true).await {
+        Ok(()) => {}
+        Err(FsError::NoSpace | FsError::OutOfMemory) => {
+            let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
+            if !reclaim_vram_locked(
+                gate,
+                &heap,
+                object.byte_len,
+                object.alignment,
+                object.flags,
+                unique,
+            )
+            .await
+            {
+                return Err(FsError::OutOfMemory);
+            }
+            crate::amdgpu_vm::relocate(gate, object, true).await?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 /// Per-open GEM state. One of these per `/dev/dri/*` open on an amdgpu card.
@@ -1852,6 +1889,15 @@ impl GemState {
     /// The DRM card this open belongs to.
     pub(crate) fn card(&self) -> Option<u32> {
         self.card
+    }
+    /// `drm_gem_handle_create`: a new handle in this open for `object`, even
+    /// when the open already has one, so the caller may GEM_CLOSE it without
+    /// touching its other handles (GETFB/GETFB2 hand these out).
+    pub fn handle_create(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
+        if object.card.is_none() || object.card != self.card {
+            return Err(FsError::InvalidData);
+        }
+        self.insert_shared(Arc::clone(object))
     }
     pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
         if object.card.is_none() || object.card != self.card {
@@ -1951,7 +1997,7 @@ impl GemState {
     /// Drop this open's reference. The frames are freed when the last
     /// reference goes, which is not necessarily here — a buffer still mapped
     /// into a process stays alive until the mapping is torn down.
-    fn remove(&self, handle: u32) -> bool {
+    pub(crate) fn remove(&self, handle: u32) -> bool {
         self.table().lock().remove(&handle).is_some()
     }
 
@@ -2582,7 +2628,8 @@ fn op(state: &GemState, arg: usize) -> Result<u64, FsError> {
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let which = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     let value = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let object = state.get(handle).ok_or(FsError::InvalidData)?;
+    // amdgpu_gem_op_ioctl: drm_gem_object_lookup failing is -ENOENT.
+    let object = state.get(handle).ok_or(FsError::NotFound)?;
 
     match which {
         // Report the creation parameters back, into the user pointer `value`

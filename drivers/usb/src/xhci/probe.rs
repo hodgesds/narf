@@ -25,6 +25,8 @@ pub const fn is_xhci_class(class_triple: u32) -> bool {
 }
 
 // Re-export the PCI driver registration entry point + the
-// `is_probed` / `controller` accessors so callers can see the full
-// surface from `xhci::probe`.
-pub use super::{controller, is_probed, register_pci_driver, IS_PROBED};
+// `is_probed` / controller-registry accessors so callers can see the
+// full surface from `xhci::probe`.
+pub use super::{
+    controller_by_id, controllers, first_controller, is_probed, register_pci_driver, IS_PROBED,
+};

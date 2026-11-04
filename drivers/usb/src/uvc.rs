@@ -725,9 +725,13 @@ pub struct UvcDevice {
     /// Device clock frequency in Hz from the VC HEADER descriptor
     /// (0 when unknown). Offered as `dwClockFrequency` on 1.1+ PROBE.
     pub clock_frequency: u32,
+    /// Index of the xHCI controller the camera is on
+    /// ([`UvcTransport::controller_id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
-/// System-wide registry of bound UVC devices.
+/// System-wide registry of bound UVC devices (records carry their
+/// controller).
 pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// The slice of the xHCI surface the UVC streaming composition needs.
@@ -743,6 +747,11 @@ pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(V
 /// transfers), not a
 /// re-implementation of the composition itself.
 pub trait UvcTransport {
+    /// Index of the controller this transport drives
+    /// ([`crate::xhci::Xhci::id`]); fixtures are controller 0.
+    fn controller_id(&self) -> u8 {
+        0
+    }
     /// Host-to-device control transfer with an OUT data stage.
     fn control_out<'a>(
         &'a self,
@@ -792,6 +801,10 @@ pub trait UvcTransport {
 }
 
 impl UvcTransport for crate::xhci::Xhci {
+    fn controller_id(&self) -> u8 {
+        self.id()
+    }
+
     fn control_out<'a>(
         &'a self,
         slot_id: u8,
@@ -968,6 +981,7 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
         capture_stop_requested: false,
         uvc_version,
         clock_frequency,
+        controller: transport.controller_id(),
     });
     Ok(idx)
 }
@@ -1501,7 +1515,7 @@ fn start_video_capture_pump(idx: usize) {
 /// the corresponding V4L2-style devfs node. The task sleeps in xHCI's event
 /// future between packets; it does not poll the controller in a spin loop.
 async fn pump_video_frames(idx: usize, generation: u64) -> Result<(), UvcError> {
-    let controller = crate::xhci::controller().ok_or(UvcError::CaptureFailed)?;
+    let controller = controller_of(idx).ok_or(UvcError::CaptureFailed)?;
     pump_video_frames_with(idx, &*controller, generation).await
 }
 
@@ -1630,7 +1644,7 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError>
     };
     // Sync entry-point on the UVC capture path; bridge to the async
     // receive via block_on. Called from non-executor contexts.
-    let c = match crate::xhci::controller() {
+    let c = match controller_of(idx) {
         Some(c) => c,
         None => return Err(UvcError::SetConfigFailed),
     };
@@ -1673,11 +1687,12 @@ pub fn __reset_uvc_for_test() {
 /// class-registry unbind hook, so the supervisor's hub-detach path
 /// (`attach::detach_slot` → `dispatch_unbind`) reaches it; see also
 /// [`detach_all_uvc`] for the controller-recovery path.
-pub fn detach_uvc(slot_id: u8) {
+pub fn detach_uvc(controller: u8, slot_id: u8) {
+    let ours = |device: &UvcDevice| device.controller == controller && device.slot_id == slot_id;
     let video_nodes: Vec<usize> = {
         let mut devices = UVC_DEVICES.lock();
         for device in devices.iter_mut() {
-            if device.slot_id == slot_id {
+            if ours(device) {
                 device.capture_stop_requested = true;
             }
         }
@@ -1686,10 +1701,10 @@ pub fn detach_uvc(slot_id: u8) {
         // UVC registry lock is held.
         let nodes: Vec<usize> = devices
             .iter()
-            .filter(|device| device.slot_id == slot_id)
+            .filter(|device| ours(device))
             .map(|device| device.video_node)
             .collect();
-        devices.retain(|device| device.slot_id != slot_id);
+        devices.retain(|device| !ours(device));
         nodes
     };
     for node in video_nodes {
@@ -1698,17 +1713,21 @@ pub fn detach_uvc(slot_id: u8) {
 }
 
 /// Wholesale variant of [`detach_uvc`] for controller recovery
-/// (`attach::detach_all_bindings`): drop every UVC binding and
-/// unregister every video node, regardless of slot. Infallible and
+/// (`attach::detach_all_bindings`): drop every UVC binding on
+/// `controller` and unregister its video node, regardless of slot. Infallible and
 /// idempotent, same pump-exit reasoning as [`detach_uvc`].
-pub fn detach_all_uvc() {
+pub fn detach_all_uvc(controller: u8) {
     let video_nodes: Vec<usize> = {
         let mut devices = UVC_DEVICES.lock();
-        for device in devices.iter_mut() {
+        for device in devices.iter_mut().filter(|d| d.controller == controller) {
             device.capture_stop_requested = true;
         }
-        let nodes: Vec<usize> = devices.iter().map(|device| device.video_node).collect();
-        devices.clear();
+        let nodes: Vec<usize> = devices
+            .iter()
+            .filter(|d| d.controller == controller)
+            .map(|device| device.video_node)
+            .collect();
+        devices.retain(|d| d.controller != controller);
         nodes
     };
     for node in video_nodes {
@@ -1735,6 +1754,12 @@ fn uvc_errno(error: UvcError) -> i64 {
         UvcError::AlreadyStreaming => ERRNO_EBUSY,
         _ => ERRNO_EIO,
     }
+}
+
+/// The live controller of the UVC device at registry index `idx`.
+fn controller_of(idx: usize) -> Option<alloc::sync::Arc<crate::xhci::Xhci>> {
+    let controller = UVC_DEVICES.lock().get(idx)?.controller;
+    crate::xhci::controller_by_id(controller)
 }
 
 /// Registry index of the bound device owning `/dev/video<node>`.
@@ -1836,7 +1861,8 @@ fn video_stream_start(
     format: narf_drivers_video::v4l2_ioctl::PixFormat,
 ) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
     Box::pin(async move {
-        let controller = crate::xhci::controller().ok_or(ERRNO_ENODEV)?;
+        let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+        let controller = controller_of(idx).ok_or(ERRNO_ENODEV)?;
         stream_start_with(&*controller, node, format).await?;
         if let Some(idx) = uvc_index_for_video_node(node) {
             start_video_capture_pump(idx);
@@ -1847,7 +1873,7 @@ fn video_stream_start(
 
 fn video_stream_stop(node: usize) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
     Box::pin(async move {
-        match crate::xhci::controller() {
+        match uvc_index_for_video_node(node).and_then(controller_of) {
             Some(controller) => stream_stop_with(&*controller, node).await,
             None => {
                 // Controller is gone, so the device is too: only the
@@ -2297,8 +2323,8 @@ pub fn register_initcalls() {
         "uvcvideo",
         &UVC_MATCH,
         probe,
-        |slot| {
-            detach_uvc(slot);
+        |controller, slot| {
+            detach_uvc(controller, slot);
             Ok(())
         },
     );

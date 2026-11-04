@@ -219,7 +219,7 @@ fn enumerated_pci_addr_for_card(
 /// test-only fallback exists solely because isolated DRM sysfs tests register
 /// fake cards without running PCI enumeration; it deliberately has no
 /// `config` file and therefore cannot mask a missing live ECAM projection.
-fn pci_addr_for_card(
+pub(crate) fn pci_addr_for_card(
     card: &dyn crate::drm_registry::DrmCard,
     idx: u32,
 ) -> Option<narf_bus::PcieAddr> {

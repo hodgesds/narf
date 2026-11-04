@@ -8763,7 +8763,11 @@ framebuffer_check: handles, pitches, overflow, per-plane modifiers equal,
 unused planes zero), the BO lookup, then amdgpu_display_gem_fb_verify_and_init
 (`check_amdgpu_fb`: drm_any_plane_has_format with modifier[0], every plane
 in the same BO, without DRM_MODE_FB_MODIFIERS the BO's tiling flags through
-convert_tiling_flags_to_modifier_gfx12, amdgpu_display_verify_sizes: each
+convert_tiling_flags_to_modifier_gfx12, or on the GFX10.3 linear-primary card
+(`TilingFlags::Gfx10_3 { pipes_log2, packers_log2 }` from GB_ADDR_CONFIG)
+through `from_tiling_flags_gfx10_3` (convert_tiling_flags_to_modifier: 5-bit
+swizzle, block size, version, pipe-XOR/packers, DCC bits; Z swizzles refused);
+`check_amdgpu_fb(..., layout: TilingFlags)`, amdgpu_display_verify_sizes: each
 plane's pitch whole swizzle blocks and at least its width, block-aligned
 offsets, whole block rows within the BO, LINEAR in 256-byte units); a
 refusal is EINVAL (FsError has no ERANGE). `Framebuffer` records
@@ -11471,9 +11475,9 @@ DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
 ### Navi 22 DCN3.0 mode math
 
 `amdgpu_dml30::plan_joint(&[Stream], &Soc) -> Result<JointPlan, Error>` is the
-DCN3.0 admission of a whole context (one to six streams, one unscaled linear
-RGB plane each; GPUVM/HostVM, DCC, dynamic metadata, writeback and MPC combine
-off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
+DCN3.0 admission of a whole context (one to six streams, one linear RGB
+plane each, positioned and scaled through the 4:4:4 RGB DSCL; GPUVM/HostVM,
+DCC, dynamic metadata, writeback and MPC combine off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
 (`Odm::TwoToOne` when one pipe's DISPCLK exceeds the DFS-rounded ceiling or a
 DSC line is wider than 5184; 4:1, odd widths and more than six pipes are
 refused), ROB and vertical-active bandwidth support (60% SDP / 40% DRAM), then
@@ -11485,9 +11489,23 @@ multi-plane DRAM clock change margin (SynchronizedVBlank false: no OTG sync)
 and stutter critical plane, one watermark set, DSC delay (`dscceComputeDelay`)
 and ODM after-scaler allowance — and `display_rq_dlg_calc_30.c` per pipe (an
 ODM slice's viewport, swath and blank end). `Stream { config, dsc:
-Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz, odm }` (`Stream::tmds(config)`
-for 8-bpc TMDS; `odm` is the least ODM the caller drives, which mode support
-still checks); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
+Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz, odm, scale:
+Option<Scale { h_ratio, v_ratio, recout_width, recout_height }> }`
+(`Stream::tmds(config)` for 8-bpc TMDS, unscaled; `odm` is the least ODM the
+caller drives, which mode support still checks). `scale` is the plane's DSCL
+as `resource_build_scaling_params` leaves it (U3.19 source/destination
+ratios, the whole plane's recout; the taps are `Plane::{h_taps, v_taps}`);
+None is an unscaled plane whose recout is its viewport. Every DML30 term the
+scaler moves follows Linux: `ScaleRatioAndTapsSupport` (one tap each on an
+identity ratio, else even horizontal taps, at most 6:1 and no ratio above
+its taps — `Unsupported`), `PSCL_THROUGHPUT_LUMA` and
+`DPPCLKUsingSingleDPPLuma` (a plane one pipe per ODM slice cannot clock is
+refused: no MPC combine), the line-buffer swath limit, `ReadBandwidthPlaneLuma`
+and cursor bandwidth times VRatio, deep-sleep DCFCLK, the scaler's DPP delay
+(`scl_enable`), `CalculatePrefetchSourceLines`, the urgent burst factors,
+the p-state margin's line-buffer and DET hiding, and the DLG/TTU's
+`hscale_pixel_rate`, recout-paced delivery, PTE row per destination line and
+cursor pacing. A recout outside the active area is `Invalid`; `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
 dram_clock_change, urgent_bandwidth_thousandths, planes: Vec<PlanePlan { odm,
 geometry, prefetch, dppclk_khz, dsc_delay, pipes: [Option<PipePlan {
 viewport_x, viewport_width, registers, cursor }>; 2] }> }`. The prefetch-mode
@@ -11506,6 +11524,23 @@ pipe, 84 PTE requests, 191-cycle ping, 404 us p-state, 15.5/20 us self refresh,
 fabric-adjusted urgent latency) in `amdgpu_dml::Fx` fixed point. Register
 fields are Linux's `(unsigned int)` truncations and are refused (not wrapped)
 when they exceed the DCN3.0 mask; everything fails before hardware is touched.
+
+`amdgpu_dcn30_scl::build(h_active, v_active, (odm_index, odm_count), src:
+Rect, dst: Rect) -> Result<ScalerData, Error>` is `resource_build_scaling_params`
+as DCN3.0 runs it (`use_spl` off) for one pipe of an amdgpu_dm-placed linear
+RGB primary on a stream mapped 1:1 onto its timing: `calculate_recout` (the
+CRTC rectangle clipped to the stream and to the ODM slice of
+`odm_slice(h_active, v_active, (index, count))`, relative to it),
+`calculate_scaling_ratios` (`dc_fixpt` src/dst truncated to U3.19),
+`dpp3_get_optimal_number_of_taps` with zeroed scaling quality (first for a
+100x100 dummy viewport, then the real one; LB_MEMORY_CONFIG_0 partitions,
+`lb_partitions(viewport_w, recout_w)`, `max_downscale_src_width` 7680,
+identity ratios take one tap) and `calculate_init_and_vp` (initial phase
+`trunc19((ratio + taps + 1) / 2 + frac)`, the viewport backed off for the
+filter, clipped to the source), then the 12-pixel `MIN_VIEWPORT_SIZE`
+clamp. `ScalerData { h_active, v_active, recout, viewport, ratio_h, ratio_v,
+init_h, init_v, h_taps, v_taps }` (RGB: DC's chroma copies equal luma).
+`Error::{Invalid, Empty (nothing on this slice), Taps (DC's refusal)}`.
 
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
@@ -11532,6 +11567,10 @@ other revisions are refused.
 `unsafe amdgpu_dcn30_hubbub::Hubbub::new(gpu, pci_cap)` owns the DCN3.0
 arbiter. `dchub_refclk_khz(dccg_ref)` mirrors `hubbub2_get_dchub_ref_freq`
 but refuses a disabled global timer or a reference outside 40–60 MHz.
+`program_live(&WatermarkSet, &mut current, refclk, safe_to_lower)` is the
+live `hubbub3_program_watermarks` around a plane update: each watermark is
+written only when lowering is safe or it rises, `current` follows what was
+written, and it returns whether a lower value is pending.
 `unsafe program(&WatermarkSet, refclk)` (no HUBP fetching) writes sets A–D
 identically (data/VM-row urgency, trip to memory, SR enter/exit, DRAM clock
 change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
@@ -11867,17 +11906,86 @@ no placement and publishes no state. Atomic, SETCRTC and PAGE_FLIP preserve
 the pinned GEM source through the presentation handoff.
 
 The DCN30 presenter waits for implicit WRITE fences before taking the GPU
-owner. CPU-visible placements are copied by bounded rows, honoring pitch and
-offset; hidden VRAM uses the existing SDMA transfer into private system
-staging, also outside the owner. The frame retains its `ScanoutPin` through
-queueing, readback, copying and the completed native back-buffer flip.
-Unsupported format/extent checks precede queueing. GEM sources never fall
-through to a raw physical pointer. This is a copy presenter, not direct
-scanout of client buffers; secondary CRTCs still cannot present.
+owner (`frame_copy::wait_rendered`: woken by any Navi22 fence interrupt via
+`amdgpu_fence_navi22::wait_change`, re-sampled at least every millisecond,
+5 s bound). A pinned GEM framebuffer whose first pixel is 256-byte aligned
+and whose pitch fits the HUBP (`frame_copy::direct`, reasons
+`Ineligible::{NotGem, Pitch, Alignment}`) is scanned out in place at its own
+pitch, size and placement, as amdgpu_dm flips to the client BO address:
+`ColdBoot::flip_display_external(address)` → `Scanout::flip_external`
+programs it into the HUBP and completes when SURFACE_EARLIEST_INUSE names
+it. A frame whose placement (`amdgpu_navi22_plane::Request { pitch, width,
+height, src, dst }`: `frame_copy::direct_request`, or for a copy
+`frame_copy::copied_request`, its SRC unscaled at the owned back surface's
+origin) differs from what the pipe shows (`ColdBoot::display_plane_request`)
+is a DC full update: `amdgpu_navi22_plane::plan(timing, vco, soc, lit,
+&request) -> Result<Update { request, scaler, plan }, Refusal>` (also
+`Basis::plan`) runs `amdgpu_dcn30_scl::build` and `dml30::plan_stream` on
+the lit stream; `Refusal::{Invalid, Geometry, Mode, Clock, Odm}`
+(LINUX-GAP: an update needing more DPPCLK/DISPCLK than the lit stream, or a
+stream on two ODM pipes, is refused where DC would raise the clocks or
+place a viewport per slice). The lit owned surface is itself the
+full-screen request (`Request::full_screen`), whose plan is the modeset's.
+`ColdBoot::arm_display_plane(kind, external, &update)` →
+`Scanout::arm_plane(kind, external, &mut Pipeline, &update)` is
+`commit_planes_for_stream`: the HDP flush, `Pipeline::prepare_plane`
+(`prepare_bandwidth`: `Hubbub::program_live(.., safe_to_lower = false)`),
+then under `Flip::pipe_control_lock` `Pipeline::program_plane`
+(`dcn20_program_pipe`: `Otg::update_global_sync` when the plan moved
+VSTARTUP/VUPDATE/VREADY, `Hubp::setup`, the cursor TTU,
+`Dpp::set_scaler`, `Mpc::set_bg_color(black)`, `Hubp::set_viewport`,
+`Hubp::set_pitch`) and `Flip::program_locked(address)`, the lock always
+released (a failure inside it fails the owner). Once the flip latches the
+presenter calls `ColdBoot::optimize_display_plane` (`optimize_bandwidth`:
+the lowered watermarks). A frame the lit pipe cannot fetch in place
+(`Direct::Refused`) takes the copy path; a placement refused there too is
+dropped with its event completed (logged once per refusal). Lastclose
+(`return_display_to_owned`, also when only a placed copy is shown:
+`display_plane_is_owned`) flips back with the owned front's plane
+(`Scanout::return_to_owned_plane`). The atomic check refuses (EINVAL) a
+placement DC would (`amdgpu_native_kms::primary_placement_admitted` →
+`amdgpu_navi22_platform::placement_admitted` on the lit stream's
+`Pipeline::plane_basis()`, kept with the presentation geometry). The flip event completes at that latch. The pin is kept
+(`frame_copy::ShownPin`) until a later flip latches (client, copied frame,
+`return_to_owned`) or the pipe is stopped or relit; a failed flip keeps it.
+While a client framebuffer is shown (`Scanout::external_front`) the
+console's publication on the owned front is withdrawn; lastclose
+(`amdgpu_native_kms::restore_displays` →
+`amdgpu_navi22_platform::release_client_scanout_async`) flips back to the
+owned front (`ColdBoot::return_display_to_owned`), releases the pin and
+republishes the console. Every presenter flip is armed under the owner and
+its latch awaited without it, as amdgpu_dm's commit worker waits for
+flip_done holding no display lock: `ColdBoot::arm_display_flip(kind,
+external)` → `Scanout::arm(ArmedKind::{Back, External}, ..) -> Armed`
+programs the surface, then `ColdBoot::poll_display_flip(&armed)` →
+`Scanout::poll_armed` (one non-blocking pflip/VUPDATE acknowledge and
+pending check, retaking the owner every `POLL_US`) completes it. Each
+`Scanout` has an epoch: a relight, recovery, stop or withdraw while armed
+makes `poll_armed` refuse (`Busy`) and the frame is dropped with its event
+completed; timeout and device loss fail the present. A pinned GEM frame that
+cannot be scanned out in place has its SRC rectangle copied by the GPU, not
+the CPU, to the owned back surface's origin (the pipe scales and positions
+it):
+`amdgpu_rdna2_vram::blit_ops(src, src_pitch, dst, dst_pitch, row_bytes,
+rows)` (one whole-line copy for equal pitches, else one per row) run by
+`amdgpu_rdna2_vram::blit(ops, held)` on the kernel SDMA queue into the owned
+back surface, the owner held only to read that surface and to flip; it falls
+back to the CPU copy only without a kernel SDMA queue. Dumb frames are copied
+by bounded rows (a placed one's SRC rectangle), honoring pitch and offset,
+one streaming store per row into the write-combined back buffer. The
+frame retains its `ScanoutPin` through queueing, readback, copying and the
+completed native back-buffer flip. Unsupported format/extent checks precede
+queueing. GEM sources never fall through to a raw physical pointer. The
+console logs the first direct flip, the first copy per reason, and totals
+every 512 presents. Secondary CRTCs still cannot present.
 
 `ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
 display_scanout(), display_admitted(), display_output(),
-prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
+prepare_display_back_buffer(), flip_display(), flip_display_external(address),
+arm_display_flip(kind, external), arm_display_plane(kind, external, &update),
+optimize_display_plane(), display_plane_request(), plan_display_plane(&request),
+display_plane_basis(), display_plane_is_owned(), poll_display_flip(&armed),
+return_display_to_owned(), set_display_cursor()}` own
 these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.
 
@@ -13797,6 +13905,12 @@ line; `disable` parks every segment, drops the master enable, stops the timing
 generator and waits for the block to report idle rather than assuming it.
 Pixel blanking is deliberately absent: from DCN2 onwards a stream is blanked by
 the OPP's display pattern generator, not by the timing generator.
+`update_global_sync(&GlobalSync)` (DCN3.0, running generator, caller holding
+the pipe-control lock) is `dcn20_program_tg` for a plane update whose mode
+math moved the sync: `optc1_program_global_sync`, `optc1_wait_for_state
+(CRTC_STATE_VACTIVE)` (OTG_STATUS.OTG_V_ACTIVE_DISP, 100 ms, logged on
+timeout as REG_WAIT is), then `optc1_set_vtg_params(program_fp2)` (VTG0_FP2
+for the new VStartup, VCOUNT_INIT at the blank start).
 
 `amdgpu_dcn_hubp::Hubp::new` is unsafe: it claims one hub pixel pipe, whose
 scanout memory the caller must keep reserved until the pipe is blanked.
@@ -13815,7 +13929,12 @@ chroma request sizes are cleared rather than left behind, so a previous owner's
 chroma plane cannot keep fetching. `blank` waits up to 100 ms for the pipe's
 outstanding requests to retire; a power-gated pipe reads back zero and needs no
 wait. As `hubp2_set_blank_regs`' REG_WAIT, a pipe that never retires is logged,
-counted (`blank_stalls()`) and blanked anyway.
+counted (`blank_stalls()`) and blanked anyway. For a flip that changes the
+plane (DCN3.0): `setup(&Registers)` is `hubp3_setup`'s vready, requestor and
+deadline half; `set_viewport(x, y, w, h)` is `min_set_viewport` (primary,
+stereo-secondary and chroma viewports all the RGB luma rectangle, 14-bit
+fields checked before any write); `set_pitch(pitch)` is `hubp2_program_size`
+for linear RGB without DCC (pitch - 1, meta pitch 0).
 
 `amdgpu_dcn_plane` programs the rest of the plane path. The DPP and OPP banks are
 DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe
@@ -13826,11 +13945,27 @@ separate-alpha processing and ROM degamma, and bypasses the color-management
 block. Scaling-444 bypass still initializes autocal/boundary mode and the
 opaque RGB line buffer (all three banks, 63 maximum partitions). These fields
 and constructor bounds are shared by the verified DCN30/DCN314 layouts.
+`Dpp::set_scaler(&amdgpu_dcn30_scl::ScalerData)` (DCN3.0 only, else
+`Unsupported`) is `dpp1_dscl_set_scaler_manual_scale` for an RGB primary at
+`dcn_3_0_0_offset.h`'s DSCL block: autocal and boundary mode cleared,
+RECOUT_START/SIZE, MPC_SIZE (the ODM slice), DSCL_MODE (444 bypass for
+identity ratios, else 444 RGB), the `use_max_lb` line buffer; then for a
+scaled plane the U3.19 ratios and U0.19 phases (`<< 5`, integer at bit 24,
+chroma copies equal), SCL_TAP_CONTROL, DSCL_2TAP_CONTROL and
+`dpp1_dscl_set_scl_filter`'s 64-phase luma filters (`dce_scl_filters.c`'s
+tables, upscale / 1.16 / 1.49 / 1.83 by ratio, 33 phases of tap pairs),
+written only when a filter changed, then SCL_COEF_RAM_SELECT flipped from
+the current bank. Like DC's cached `scl_data` an unchanged update writes
+nothing; `program` drops that cache (`dpp_reset`).
 `Mpc::mux_plane` bypasses any inherited output-gamma LUT, binds one combiner to
 one DPP and one OPP and points that
 OPP's output mux at it, with the bottom select parked so a stale value cannot
 blend another pipe's output in, and opaque passthrough with no alpha;
-`release` unroutes both ends. `Opp::program` leaves truncation, spatial dither
+`release` unroutes both ends. `set_bg_color([r, g, b])` (DCN3.0) is
+`mpc1_set_bg_color` on the bottommost (only) MPCC: 10-bit `tg_color` shifted
+into the 12-bit MPCC_BG fields, the colour the OPP shows outside the plane's
+recout; `dcn20_update_mpcc` passes `visual_confirm_color`, black with visual
+confirm off. `Opp::program` leaves truncation, spatial dither
 and frame randomisation off so the plane's depth passes through, and sizes the
 pattern generator to the stream so a blanked stream covers the whole screen.
 `Opp::set_blank` is where a stream is blanked: painting the pattern generator

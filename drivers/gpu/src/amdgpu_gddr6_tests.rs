@@ -6,6 +6,9 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// Fixture backup step: two steps per backup so cancellation between them is observable.
+const CHUNK: usize = 4096;
+
 #[derive(Debug)]
 struct Fake {
     memory: Vec<u8>,
@@ -101,6 +104,7 @@ fn engine() -> Engine<Fake> {
             p2c: (12 << 30) - 0x8000,
             size: 4096,
         },
+        backup_step: CHUNK,
         backup: vec![0; CHUNK * 2],
         cache: vec![0; 4096],
         state: State::Prepared,

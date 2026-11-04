@@ -869,11 +869,14 @@ impl From<FrlPortError> for ModesetError {
 }
 
 /// Highest output depth modesets may pick, like DRM's max_requested_bpc,
-/// which amdgpu_dm initialises to 8. Raised by `amdgpu.max_bpc`.
-static MAX_BPC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(8);
-/// Set the highest output depth (8, 10 or 12; others leave it unchanged).
+/// which amdgpu_dm_connector_init_helper sets to 16 when it attaches "max
+/// bpc" (8..16; the 8 in amdgpu_dm_connector_funcs_reset is overwritten at
+/// init). The stream still takes the deepest depth the link carries.
+/// Lowered by `amdgpu.max_bpc`.
+static MAX_BPC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(16);
+/// Set the highest output depth (8, 10, 12 or 16; others leave it unchanged).
 pub fn set_max_bpc(bpc: u8) {
-    if matches!(bpc, 8 | 10 | 12) {
+    if matches!(bpc, 8 | 10 | 12 | 16) {
         MAX_BPC.store(bpc, core::sync::atomic::Ordering::Relaxed);
     }
 }

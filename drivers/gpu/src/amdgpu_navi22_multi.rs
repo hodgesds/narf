@@ -431,6 +431,7 @@ fn dml_stream(
         }),
         phy_khz,
         odm: dml30::Odm::None,
+        scale: None,
     }
 }
 
@@ -1082,6 +1083,7 @@ impl Group {
             member.admitted = Some(Admitted {
                 soc,
                 refclk_khz: refclk,
+                vco_khz: levels.vco_khz,
                 plan: single_plan(&joint, k)?,
                 offered: offered_on(
                     &self.requests[k].sink,
@@ -1315,7 +1317,8 @@ impl Group {
         m.mpc_rate_control_off(lease.route.pipe)?;
         m.opp.program(Encoding::Rgb, width, timing.v_active)?;
         m.opp.set_blank(true)?;
-        m.output_format().await?;
+        m.output_format(&timing, plan.dsc.is_none() && plan.mst.is_none())
+            .await?;
         if let Some(slice) = self.slices[k].as_mut() {
             m.combine_slice(slice, width, timing.v_active).await?;
         }
@@ -1371,17 +1374,18 @@ impl Group {
         m.dig.setup(DigMode::DisplayPort)?;
         m.dig.setup_stereo_sync(lease.route.pipe)?;
         let feature = caps.dprx_feature;
-        // amdgpu_dm's VSC colorimetry also needs a DPCD 1.4 receiver.
-        // linux-lit: 0x14=DP_DPCD_REV_14
-        let vsc_colorimetry = caps.rev() >= 0x14 && feature & 1 << 3 != 0;
-        let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
+        // A DSC stream is 8 bpc (dp_format); its colorimetry and HDR
+        // metadata go in the SDPs as for an uncompressed one.
+        let (vsc, hdr) = crate::amdgpu_navi22_modeset::dp_packets(caps, m.dp_format);
         m.dp_stream.set_stream_attribute(
             &timing,
             Depth::Bpc8,
-            vsc_colorimetry,
+            vsc.is_some(),
             feature & 1 << 1 != 0,
         )?;
-        m.dp_stream.update_info_packets(vsc.as_ref()).await?;
+        m.dp_stream
+            .update_info_packets(vsc.as_ref(), hdr.as_ref())
+            .await?;
         // link_set_dsc_on_stream(true).
         let dsc = self.dsc.as_mut().ok_or(Error::Invalid)?;
         for p in lease.pipes() {
@@ -1423,7 +1427,9 @@ impl Group {
         dsc.fec_enable(transmitter, true)?;
         m.dig.setup(DigMode::DisplayPort)?;
         m.dig.connect_be_to_fe(true)?;
-        m.dp_stream.update_info_packets(vsc.as_ref()).await?;
+        m.dp_stream
+            .update_info_packets(vsc.as_ref(), hdr.as_ref())
+            .await?;
         // dp_set_dsc_on_rx and link_set_dsc_pps_packet.
         port.write(dsc::DPCD_DSC_ENABLE, &[1]).await?;
         let packed = crate::amdgpu_dsc::pack_pps(&dsc_plan.picture.pps);
@@ -1462,7 +1468,7 @@ impl Group {
         m.dig.setup_stereo_sync(lease.route.pipe)?;
         m.dp_stream
             .set_stream_attribute(&timing, Depth::Bpc8, false, false)?;
-        m.dp_stream.update_info_packets(None).await?;
+        m.dp_stream.update_info_packets(None, None).await?;
         let trained = match self.mst_link {
             Some((l, t, trained)) if l == link && t == transmitter => trained,
             Some(_) => return Err(Error::Unsupported),
@@ -1495,7 +1501,7 @@ impl Group {
         let m = &mut self.members[k];
         m.dig.setup(DigMode::DpMst)?;
         m.dig.connect_be_to_fe(true)?;
-        m.dp_stream.update_info_packets(None).await?;
+        m.dp_stream.update_info_packets(None, None).await?;
         let source = self.mst_source.as_mut().ok_or(Error::Invalid)?;
         let session = self.mst.as_mut().ok_or(Error::Invalid)?;
         self.payload[k] = true;

@@ -19,10 +19,11 @@ impl Kms {
         let Some(index) = connector_of(self, request.connector) else {
             return false;
         };
+        // amdgpu_dm attaches Colorspace and HDR_OUTPUT_METADATA to HDMI and
+        // non-MST DP connectors (all of Navi22's) and accepts every listed
+        // value: HDMI sends them in the AVI and Dynamic Range and Mastering
+        // InfoFrames, DP in the VSC SDP and the HDR static metadata SDP.
         let connector = &mut self.connectors[index];
-        if connector.port.signal != Signal::Hdmi {
-            return false;
-        }
         let next = OutputSettings {
             color_format: request.color_format,
             colorspace: request.colorspace,
@@ -44,7 +45,9 @@ impl Kms {
             return false;
         };
         let c = &mut self.connectors[index];
-        if c.port.signal != Signal::Hdmi || c.output.max_bpc == bpc {
+        // amdgpu_dm attaches "max bpc" to every non-MST connector. A DP
+        // stream is 8 bpc RGB, within any cap from 8 to 16.
+        if c.output.max_bpc == bpc {
             return false;
         }
         c.output.max_bpc = bpc;
@@ -76,9 +79,17 @@ impl Kms {
             { return false; }
             let Some(index) = connector_of(self, request.connector) else { return false; };
             let c = &self.connectors[index];
-            if c.port.signal != Signal::Hdmi || !c.lightable() { return false; }
             let max_bpc = request.max_bpc.unwrap_or(c.output.max_bpc);
-            if !(8..=16).contains(&max_bpc) { return false; }
+            if !c.lightable() || !(8..=16).contains(&max_bpc) { return false; }
+            // DP: RGB at the deepest depth within the cap the verified link
+            // carries, down to 8 bpc, so any cap admits the stream
+            // (LINUX-GAP: no YCbCr over DP).
+            if c.port.signal == Signal::DisplayPort {
+                return matches!(
+                    request.color_format,
+                    crate::amdgpu_hdr::ColorFormat::Auto | crate::amdgpu_hdr::ColorFormat::Rgb
+                );
+            }
             let crtc = self.crtc_at(usize::from(request.display));
             let timing = match request.mode {
                 Some(mode) => self.find_mode_at(usize::from(request.display), Some(index), &mode),
@@ -110,8 +121,8 @@ pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> 
     };
     let c = &kms.connectors[index];
     colorspace_valid(u64::from(colorspace))
-        && c.port.signal == Signal::Hdmi
-        && (!c.present
+        && (c.port.signal != Signal::Hdmi
+            || !c.present
             || crate::amdgpu_navi48_boot::hdmi_caps(&c.edid).hdmi
             || (colorspace == 0 && !hdr))
 }

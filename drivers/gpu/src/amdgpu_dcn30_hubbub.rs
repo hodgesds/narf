@@ -149,6 +149,98 @@ impl<I: Io> Engine<I> {
         }
         Ok(khz)
     }
+    /// `hubbub3_program_watermarks` on a live arbiter, as
+    /// `prepare_bandwidth` (`safe_to_lower` false) and `optimize_bandwidth`
+    /// (true) call it around a plane update: each watermark of
+    /// `hubbub21_program_{urgent,stutter,pstate}_watermarks` is written only
+    /// when lowering is safe or it rises, and `current` (DC's cached
+    /// `hubbub1->watermarks`) follows what was written. Returns whether a
+    /// lower value is still pending. Stutter stays forced off.
+    pub(crate) fn program_live(
+        &mut self,
+        set: &WatermarkSet,
+        current: &mut WatermarkSet,
+        refclk_khz: u32,
+        safe_to_lower: bool,
+    ) -> Result<bool, Error> {
+        if set.urgent > URGENCY
+            || set.urgent_latency > TRIP
+            || set.sr_enter > SR
+            || set.sr_exit > SR
+            || set.dram_clock_change > SR
+            || set.frac_urg_bw_nom > FRAC
+            || set.frac_urg_bw_flip > FRAC
+            || refclk_khz < 1000
+        // linux: n/a (NARF: 1 MHz floor for refclk_mhz)
+        {
+            return Err(Error::Invalid);
+        }
+        let mut pending = false;
+        let mut take = |new: u32, cur: &mut u32| {
+            if safe_to_lower || new > *cur {
+                *cur = new;
+                true
+            } else {
+                pending |= new < *cur;
+                false
+            }
+        };
+        let urgent = take(set.urgent, &mut current.urgent);
+        let frac_flip = take(set.frac_urg_bw_flip, &mut current.frac_urg_bw_flip);
+        let frac_nom = take(set.frac_urg_bw_nom, &mut current.frac_urg_bw_nom);
+        let trip = take(set.urgent_latency, &mut current.urgent_latency);
+        let sr_enter = take(set.sr_enter, &mut current.sr_enter);
+        let sr_exit = take(set.sr_exit, &mut current.sr_exit);
+        let pstate = take(set.dram_clock_change, &mut current.dram_clock_change);
+        let both = |value: u32, shift: u32| value | value << shift;
+        for index in 0..4 {
+            // linux: n/a (watermark sets A..D)
+            let base = SET_A + index * SET_STRIDE;
+            if urgent {
+                // linux-lit: 16=DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A__DCHUBBUB_ARB_VM_ROW_URGENCY_WATERMARK_A__SHIFT
+                let mask = URGENCY | URGENCY << 16;
+                self.set(base, both(set.urgent, VM_ROW_URGENCY_SHIFT), mask)?;
+            }
+            if frac_flip {
+                // linux-lit: 2=mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_B - mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
+                // linux-lit: 1=mmDCHUBBUB_ARB_FRAC_URG_BW_FLIP_A - mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
+                self.set(FRAC_NOM_A + 2 * index + 1, set.frac_urg_bw_flip, FRAC)?;
+            }
+            if frac_nom {
+                // linux-lit: 2=mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_B - mmDCHUBBUB_ARB_FRAC_URG_BW_NOM_A
+                self.set(FRAC_NOM_A + 2 * index, set.frac_urg_bw_nom, FRAC)?;
+            }
+            if trip {
+                // linux-lit: 1=mmDCHUBBUB_ARB_REFCYC_PER_TRIP_TO_MEMORY_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+                self.set(base + 1, set.urgent_latency, TRIP)?;
+            }
+            if sr_enter {
+                // linux-lit: 2=mmDCHUBBUB_ARB_ALLOW_SR_ENTER_WATERMARK_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+                self.set(base + 2, both(set.sr_enter, VM_ROW_SR_SHIFT), u32::MAX)?;
+            }
+            if sr_exit {
+                // linux-lit: 3=mmDCHUBBUB_ARB_ALLOW_SR_EXIT_WATERMARK_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+                self.set(base + 3, both(set.sr_exit, VM_ROW_SR_SHIFT), u32::MAX)?;
+            }
+            if pstate {
+                // linux-lit: 4=mmDCHUBBUB_ARB_ALLOW_DRAM_CLK_CHANGE_WATERMARK_A - mmDCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A
+                let value = both(set.dram_clock_change, VM_ROW_SR_SHIFT);
+                self.set(base + 4, value, u32::MAX)?;
+            }
+        }
+        // linux: n/a (60 * refclk_mhz, literal in dcn30_hubbub.c:hubbub3_program_watermarks)
+        self.set(SAT_LEVEL, 60 * (refclk_khz / 1000), u32::MAX)?;
+        // linux: n/a (0x1FF, literal in dcn30_hubbub.c:hubbub3_program_watermarks)
+        // linux-lit: 12=DCHUBBUB_ARB_DF_REQ_OUTSTAND__DCHUBBUB_ARB_MIN_REQ_OUTSTAND__SHIFT
+        self.update(DF_REQ_OUTSTAND, MIN_REQ_OUTSTAND, 0x1ff << 12)?;
+        // hubbub1_allow_self_refresh_control(false): FORCE_ENABLE=1, VALUE=0.
+        self.update(
+            DRAM_STATE_CNTL,
+            SELF_REFRESH_FORCE_VALUE | SELF_REFRESH_FORCE_ENABLE,
+            SELF_REFRESH_FORCE_ENABLE,
+        )?;
+        Ok(pending)
+    }
     /// `hubbub3_program_watermarks(safe_to_lower = true)` with stutter off.
     pub(crate) fn program(&mut self, set: &WatermarkSet, refclk_khz: u32) -> Result<(), Error> {
         if set.urgent > URGENCY
@@ -239,6 +331,19 @@ impl Hubbub {
     /// underflow it (Linux only lowers with `safe_to_lower`).
     pub unsafe fn program(&mut self, set: &WatermarkSet, refclk_khz: u32) -> Result<(), Error> {
         self.0.program(set, refclk_khz)
+    }
+    /// Live `hubbub3_program_watermarks` around a plane update: raise-only
+    /// before it (`safe_to_lower` false), everything after it latched
+    /// (true). `current` is what the arbiter holds and is updated with what
+    /// was written; true when a lower value is still pending.
+    pub fn program_live(
+        &mut self,
+        set: &WatermarkSet,
+        current: &mut WatermarkSet,
+        refclk_khz: u32,
+        safe_to_lower: bool,
+    ) -> Result<bool, Error> {
+        self.0.program_live(set, current, refclk_khz, safe_to_lower)
     }
 }
 
@@ -345,5 +450,51 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/dcn30-hubbub",
         dcn30_hubbub_refuses_oversized_values_timer_and_readback
+    );
+
+    fn dcn30_hubbub_live_watermarks_raise_before_and_lower_after() -> TestResult {
+        let mut e = engine();
+        let lit = set();
+        let mut current = lit;
+        if e.program(&lit, 50_000).is_err() {
+            return TestResult::Fail("program");
+        }
+        // A plane whose stutter enter rises and whose urgency fraction and
+        // p-state watermark fall (p-state now unsupported: 0).
+        let next = WatermarkSet {
+            sr_enter: 1200,
+            frac_urg_bw_nom: 5,
+            dram_clock_change: 0,
+            ..lit
+        };
+        // prepare_bandwidth: only the rise is written; the falls wait.
+        e.io.writes.clear();
+        if e.program_live(&next, &mut current, 50_000, false) != Ok(true) {
+            return TestResult::Fail("raise pass");
+        }
+        let r = &e.io.regs;
+        if r[0x50b] != 1200 | 1200 << 16
+            || r[0x50d] != 20447 | 20447 << 16
+            || r[0x53f] != 11
+            || current.sr_enter != 1200
+            || current.dram_clock_change != 20447
+            || current.frac_urg_bw_nom != 11
+            || e.io.writes.iter().any(|(reg, _)| *reg == 0x509)
+        {
+            return TestResult::Fail("raise-only watermarks");
+        }
+        // optimize_bandwidth: the lower values follow.
+        if e.program_live(&next, &mut current, 50_000, true) != Ok(false) {
+            return TestResult::Fail("lower pass");
+        }
+        let r = &e.io.regs;
+        if r[0x50d] != 0 || r[0x51c] != 0 || r[0x53f] != 5 || r[0x545] != 5 || current != next {
+            return TestResult::Fail("lowered watermarks");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dcn30-hubbub",
+        dcn30_hubbub_live_watermarks_raise_before_and_lower_after
     );
 }

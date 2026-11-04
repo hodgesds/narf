@@ -656,8 +656,49 @@ pub fn query_with(
         uapi::AMDGPU_INFO_VIDEO_CAPS => video_caps(snap, payload[0]),
         uapi::AMDGPU_INFO_MAX_IBS => Ok(max_ibs(&snap.navi22, submission)),
         uapi::AMDGPU_INFO_VRAM_GTT => Ok(vram_gtt(snap)),
+        uapi::AMDGPU_INFO_CRTC_FROM_ID => crtc_from_id(payload[0]),
+        uapi::AMDGPU_INFO_GDS_CONFIG => Ok(gds_config()),
+        // swsmu parts have no VCE clock states: amdgpu_dpm_get_vce_clock_state
+        // returns NULL for every index, so the table is all zero with
+        // num_valid_entries = 0. drm_amdgpu_info_vce_clock_table is
+        // 16 entries of {sclk, mclk, eclk, pad} plus num_valid_entries, pad.
+        uapi::AMDGPU_INFO_VCE_CLOCK_TABLE => Ok(alloc::vec![0u8; 16 * 16 + 8]),
+        // amdgpu_ras_init always creates a context; on this consumer part
+        // ras_enabled and the feature mask are 0.
+        uapi::AMDGPU_INFO_RAS_ENABLED_FEATURES => Ok(0u64.to_le_bytes().to_vec()),
+        // No running DPM owner answered (see `amdgpu_info::dispatch_live`):
+        // amdgpu_info_ioctl's -ENOENT for sensors, and a clock counter
+        // nothing can read is the device being unavailable.
+        uapi::AMDGPU_INFO_SENSOR => Err(FsError::NotFound),
+        uapi::AMDGPU_INFO_TIMESTAMP => Err(FsError::NoDevice),
         _ => return None,
     })
+}
+
+/// `AMDGPU_INFO_CRTC_FROM_ID`: the DC CRTC index (`amdgpu_crtc->crtc_id`,
+/// `mode_info.crtcs[i]`) of the DRM CRTC object `id`; EINVAL when no
+/// published CRTC has that id.
+fn crtc_from_id(id: u32) -> Result<Vec<u8>, FsError> {
+    (0..crate::amdgpu_navi48_kms::crtc_count())
+        .find(|&i| crate::amdgpu_navi48_kms::crtc_id(i) == id)
+        .map(|i| (i as u32).to_le_bytes().to_vec())
+        .ok_or(FsError::InvalidData)
+}
+
+/// `AMDGPU_INFO_GDS_CONFIG` from gfx_v10_0_set_gds_init: 64 KiB of GDS,
+/// 64 GWS and 16 OA, all in the compute partition (the gfx partition
+/// fields stay 0, as amdgpu_info_ioctl leaves them).
+fn gds_config() -> Vec<u8> {
+    const GDS_SIZE: u32 = 0x10000; // linux: gfx_v10_0_set_gds_init gds_size
+    const GWS_SIZE: u32 = 64; // linux: gfx_v10_0_set_gds_init gws_size
+    const OA_SIZE: u32 = 16; // linux: gfx_v10_0_set_gds_init oa_size
+                             // drm_amdgpu_info_gds: gds_gfx_partition_size, compute_partition_size,
+                             // gds_total_size, gws_per_gfx_partition, gws_per_compute_partition,
+                             // oa_per_gfx_partition, oa_per_compute_partition, _pad.
+    [0, GDS_SIZE, GDS_SIZE, 0, GWS_SIZE, 0, OA_SIZE, 0]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect()
 }
 
 #[cfg(feature = "kernel-test")]

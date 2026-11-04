@@ -304,10 +304,10 @@ impl UsbHub {
         speed: PortSpeed,
         config: &[u8],
     ) -> Result<Self, HubError> {
-        let (interface_alt, interface_protocol) =
+        let (mut interface_alt, mut interface_protocol) =
             hub_interface_mode(config, iface_num, device_protocol, speed)?;
-        if interface_alt != 0 {
-            transport
+        if interface_alt != 0
+            && transport
                 .write(
                     slot_id,
                     HubRequest {
@@ -317,7 +317,13 @@ impl UsbHub {
                         index: iface_num as u16,
                     },
                 )
-                .await?;
+                .await
+                .is_err()
+        {
+            // hub_configure: "Using single TT (err ...)" — a hub that
+            // refuses its multi-TT alternate keeps working in alt 0.
+            interface_alt = 0;
+            interface_protocol = HUB_PROTOCOL_SINGLE_TT;
         }
         // GET_DESCRIPTOR(Hub) — bmRequestType 0xA0, value
         // (HUB_DESC_TYPE << 8), index 0.
@@ -353,6 +359,11 @@ impl UsbHub {
                 )
                 .await;
         }
+        // hub_power_on: wait bPwrOn2PwrGood (2 ms units) for power to be
+        // good on every port, and at least the 100 ms connect debounce
+        // (hub_port_debounce) before the first port status is trusted.
+        let settle_ms = (u64::from(descriptor.poweron_time_2ms) * 2).max(100);
+        narf_time::sleep_ms(settle_ms).await;
 
         Ok(UsbHub {
             slot_id,
@@ -371,7 +382,7 @@ impl UsbHub {
     }
 
     /// Build the xHCI route metadata for a child on this hub. Low- and
-    /// full-speed children need the parent slot/port and TT think time;
+    /// full-speed children need the parent slot/port and the hub's MTT;
     /// high-speed and faster children use only the route string.
     pub(crate) fn child_topology(
         &self,
@@ -386,7 +397,7 @@ impl UsbHub {
         {
             topology.parent_hub_slot_id = self.slot_id;
             topology.parent_hub_port = hub_port;
-            topology.tt_think_time = self.descriptor.tt_think_time();
+            topology.mtt = self.is_multi_tt();
         }
         topology
     }
@@ -421,10 +432,11 @@ impl UsbHub {
                 &[],
             )
             .await?;
-        // 100 ms wall-clock budget (USB 2.0 §11.5.1.5 TDRST max
-        // 50 ms + ~10 ms TDRSTR + headroom). Between status polls
-        // we sleep briefly so the executor isn't pinned to one task.
-        let deadline = narf_time::Deadline::after_ms(100);
+        // hub_port_wait_reset: sleep before the first status read so it
+        // cannot observe the pre-reset (still enabled) port, then poll
+        // within HUB_RESET_TIMEOUT (800 ms).
+        narf_time::sleep_ms(10).await;
+        let deadline = narf_time::Deadline::after_ms(800);
         let mut got_reset = false;
         loop {
             match self.port_status(xhci_dev, port).await {
@@ -440,10 +452,8 @@ impl UsbHub {
             if deadline.expired() {
                 break;
             }
-            // Park 1 ms between polls instead of burning CPU. Hub
-            // port reset is observed over a 50ms TDRST window; 1ms
-            // granularity gives ~50 polls inside the budget.
-            narf_time::sleep_cycles(1_000_000).await;
+            // HUB_SHORT_RESET_TIME between polls.
+            narf_time::sleep_ms(10).await;
         }
         if got_reset {
             // Clear the change bit so the next reset returns a
@@ -458,6 +468,10 @@ impl UsbHub {
                     &[],
                 )
                 .await;
+            // hub_port_reset: TRSTRCY (10 ms) plus Linux's extra 40 ms
+            // before the device is addressed; full-speed devices often
+            // ignore SET_ADDRESS inside the recovery window.
+            narf_time::sleep_ms(50).await;
             return Ok(());
         }
         Err(HubError::PortResetTimeout)

@@ -76,8 +76,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_lib::sync::IrqSafeSpinLock;
-
 use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 
 use super::devfs_bridge;
@@ -667,13 +665,16 @@ pub struct BoundPort {
     pub hub_port: Option<(u8, u8)>,
 }
 
-/// Global registry of bound vendor-serial ports, mirroring
-/// `cdc_acm::ACM_DEVICES`.
-static SERIAL_PORTS: IrqSafeSpinLock<Vec<BoundPort>> = IrqSafeSpinLock::new(Vec::new());
+/// Bound vendor-serial ports, one registry per xHCI controller,
+/// mirroring `cdc_acm::ACM_DEVICES`.
+static SERIAL_PORTS: crate::xhci::PerController<Vec<BoundPort>> = crate::per_controller_vec!();
 
 /// Number of currently bound vendor-serial ports.
 pub fn bound_count() -> usize {
-    SERIAL_PORTS.lock().len()
+    SERIAL_PORTS
+        .each()
+        .map(|(_, ports)| ports.lock().len())
+        .sum()
 }
 
 /// Transport seam for executing control plans: anything that can
@@ -807,7 +808,7 @@ pub async fn try_bind_serial_already_addressed(
     let tty_index = devfs_bridge::register_tty_usb(family);
     // No lock is held across any .await above; the registry lock
     // is taken only for this final synchronous push.
-    SERIAL_PORTS.lock().push(BoundPort {
+    SERIAL_PORTS.of(xhci_dev.id()).lock().push(BoundPort {
         slot_id,
         family,
         pid,
@@ -834,7 +835,7 @@ pub async fn set_line_settings(
     settings: LineSettings,
 ) -> Result<(), PortError> {
     let (family, pid, iface) = {
-        let g = SERIAL_PORTS.lock();
+        let g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let p = g
             .iter()
             .find(|p| p.slot_id == slot_id)
@@ -844,7 +845,7 @@ pub async fn set_line_settings(
     let plan = configure_plan(family, pid, iface, &settings)?;
     apply_plan(xhci_dev, slot_id, &plan).await?;
     let tty_index = {
-        let mut g = SERIAL_PORTS.lock();
+        let mut g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let mut found = None;
         if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
             p.settings = settings;
@@ -861,14 +862,18 @@ pub async fn set_line_settings(
 }
 
 /// Snapshot of the binding published as `ttyUSB<tty_index>`:
-/// `(slot_id, settings, modem)`, or `None` when no device is
+/// `(controller, slot_id, settings, modem)` (tty indices are global;
+/// slot ids are per controller), or `None` when no device is
 /// bound to that node. The devfs ioctl surface (#756) keys its
 /// actuation off this lookup.
-pub fn binding_for_tty(tty_index: usize) -> Option<(u8, LineSettings, ModemStatus)> {
-    let g = SERIAL_PORTS.lock();
-    g.iter()
-        .find(|p| p.tty_index == tty_index)
-        .map(|p| (p.slot_id, p.settings, p.modem))
+pub fn binding_for_tty(tty_index: usize) -> Option<(u8, u8, LineSettings, ModemStatus)> {
+    SERIAL_PORTS.each().find_map(|(controller, ports)| {
+        ports
+            .lock()
+            .iter()
+            .find(|p| p.tty_index == tty_index)
+            .map(|p| (controller, p.slot_id, p.settings, p.modem))
+    })
 }
 
 /// Drive only the DTR/RTS output lines of a bound port (the
@@ -882,7 +887,7 @@ pub async fn set_modem_lines(
     rts: bool,
 ) -> Result<(), PortError> {
     let (family, iface, tty_index) = {
-        let g = SERIAL_PORTS.lock();
+        let g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let p = g
             .iter()
             .find(|p| p.slot_id == slot_id)
@@ -892,7 +897,7 @@ pub async fn set_modem_lines(
     let plan = modem_plan(family, iface, dtr, rts);
     apply_plan(xhci_dev, slot_id, &plan).await?;
     let settings = {
-        let mut g = SERIAL_PORTS.lock();
+        let mut g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let mut found = None;
         if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
             p.settings.dtr = dtr;
@@ -913,7 +918,7 @@ pub async fn set_modem_lines(
 /// [`PortError::Unsupported`] from [`break_plan`].
 pub async fn set_break_state(xhci_dev: &Xhci, slot_id: u8, on: bool) -> Result<(), PortError> {
     let (family, iface, settings) = {
-        let g = SERIAL_PORTS.lock();
+        let g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let p = g
             .iter()
             .find(|p| p.slot_id == slot_id)
@@ -930,7 +935,7 @@ pub async fn set_break_state(xhci_dev: &Xhci, slot_id: u8, on: bool) -> Result<(
 /// interrupt-IN endpoint instead.
 pub async fn refresh_modem_status(xhci_dev: &Xhci, slot_id: u8) -> Option<ModemStatus> {
     let (family, iface) = {
-        let g = SERIAL_PORTS.lock();
+        let g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let p = g.iter().find(|p| p.slot_id == slot_id)?;
         (p.family, p.iface)
     };
@@ -945,7 +950,7 @@ pub async fn refresh_modem_status(xhci_dev: &Xhci, slot_id: u8) -> Option<ModemS
     }
     let status = decode_modem_byte(family, buf[0]);
     let tty_index = {
-        let mut g = SERIAL_PORTS.lock();
+        let mut g = SERIAL_PORTS.of(xhci_dev.id()).lock();
         let mut found = None;
         if let Some(p) = g.iter_mut().find(|p| p.slot_id == slot_id) {
             p.modem = status;
@@ -963,9 +968,9 @@ pub async fn refresh_modem_status(xhci_dev: &Xhci, slot_id: u8) -> Option<ModemS
 /// binding (so the pump stops polling the dead slot) and withdraw
 /// the `/dev/ttyUSB<N>` publication. Returns true when a binding
 /// was removed.
-pub fn detach_serial(slot_id: u8) -> bool {
+pub fn detach_serial(controller: u8, slot_id: u8) -> bool {
     let removed = {
-        let mut g = SERIAL_PORTS.lock();
+        let mut g = SERIAL_PORTS.of(controller).lock();
         let before = g.len();
         let mut indices = Vec::new();
         g.retain(|p| {
@@ -993,12 +998,12 @@ pub fn detach_serial(slot_id: u8) -> bool {
     }
 }
 
-/// Drop every vendor-serial binding and publication. Called on a
+/// Drop every vendor-serial binding and publication on `controller`. Called on a
 /// controller recovery epoch change, mirroring
 /// `cdc_acm::clear_acm`.
-pub fn clear_serial() {
+pub fn clear_serial(controller: u8) {
     let indices: Vec<usize> = {
-        let mut g = SERIAL_PORTS.lock();
+        let mut g = SERIAL_PORTS.of(controller).lock();
         let v: Vec<usize> = g.iter().map(|p| p.tty_index).collect();
         g.clear();
         v
@@ -1045,23 +1050,25 @@ fn pm_finish_resume() {
 /// sequence bind issued (family init prefix + configure plan,
 /// modem lines included), in registry order. Pure: built under
 /// the registry lock, executed after it is dropped.
-pub fn resume_snapshot() -> Vec<(u8, Result<Vec<ControlXfer>, PortError>)> {
-    let g = SERIAL_PORTS.lock();
+pub fn resume_snapshot(controller: u8) -> Vec<(u8, Result<Vec<ControlXfer>, PortError>)> {
+    let g = SERIAL_PORTS.of(controller).lock();
     g.iter()
         .map(|p| (p.slot_id, open_plan(p.family, p.pid, p.iface, &p.settings)))
         .collect()
 }
 
-/// Replay every bound port's saved state over `transport`. A
+/// Replay the saved state of every port bound on `controller` over
+/// `transport` (that controller). A
 /// port that detached while suspended is absent from the
 /// snapshot and gets no replay; a port whose slot refuses the
 /// transfers fails typed (`DriverError`) without stopping the
 /// remaining ports' replays.
 pub async fn resume_replay<T: ControlTransport + ?Sized>(
+    controller: u8,
     transport: &T,
 ) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     let mut failed = false;
-    for (slot_id, plan) in resume_snapshot() {
+    for (slot_id, plan) in resume_snapshot(controller) {
         match plan {
             Ok(plan) => {
                 if apply_plan(transport, slot_id, &plan).await.is_err() {
@@ -1090,16 +1097,21 @@ impl narf_power::system_pm::AsyncSystemPm for UsbSerialPm {
 
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         Box::pin(async {
-            let result = match crate::xhci::controller() {
-                Some(xhci) => resume_replay(xhci.as_ref()).await,
-                None => {
-                    if bound_count() == 0 {
-                        Ok(())
-                    } else {
-                        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
-                    }
+            // Every controller replays its own bindings; a binding whose
+            // controller is gone cannot be replayed.
+            let mut result = Ok(());
+            let controllers = crate::xhci::controllers();
+            for xhci in &controllers {
+                if let Err(e) = resume_replay(xhci.id(), xhci.as_ref()).await {
+                    result = Err(e);
                 }
-            };
+            }
+            let orphaned = SERIAL_PORTS.each().any(|(id, ports)| {
+                usize::from(id) >= controllers.len() && !ports.lock().is_empty()
+            });
+            if orphaned {
+                result = Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+            }
             pm_finish_resume();
             result
         })
@@ -1116,9 +1128,9 @@ pub fn register_pm() {
 /// (hub index, port) pairs with a live vendor-serial binding —
 /// the pure-filter input for the supervisor's hub-port wake
 /// step.
-pub fn hub_ports() -> Vec<(u8, u8)> {
+pub fn hub_ports(controller: u8) -> Vec<(u8, u8)> {
     let mut v: Vec<(u8, u8)> = {
-        let g = SERIAL_PORTS.lock();
+        let g = SERIAL_PORTS.of(controller).lock();
         g.iter().filter_map(|p| p.hub_port).collect()
     };
     v.sort_unstable();
@@ -1138,15 +1150,16 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
     // Collect binding contexts first, then snapshot the hub
     // registry — never hold HUBS across the serial registry lock
     // (the pumps nest the other way via `mark_port_activity`).
-    let ports = hub_ports();
+    let controller = xhci_dev.id();
+    let ports = hub_ports(controller);
     let targets = {
-        let g = crate::attach::HUBS.lock();
+        let g = crate::attach::HUBS.of(controller).lock();
         crate::attach::suspended_ports_among(&g[..], &ports)
     };
     for (hub_slot, port) in targets {
         crate::attach::resume_port(xhci_dev, hub_slot, port).await;
-        if !crate::attach::hub_port_is_suspended(hub_slot, port) {
-            crate::attach::mark_port_activity(hub_slot, port);
+        if !crate::attach::hub_port_is_suspended(controller, hub_slot, port) {
+            crate::attach::mark_port_activity(controller, hub_slot, port);
         }
     }
 }
@@ -1174,7 +1187,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         return 0;
     }
     let mut moved = 0usize;
-    let mut ports = SERIAL_PORTS.lock();
+    let mut ports = SERIAL_PORTS.of(xhci_dev.id()).lock();
     for port in ports.iter_mut() {
         let tty = match devfs_bridge::get_port(port.tty_index) {
             Some(t) => t,
@@ -1237,6 +1250,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
 
     // ── Descriptor blob builders (USB 2.0 §9.6 layouts) ──────
 
@@ -1593,7 +1607,7 @@ pub mod tests {
         // header stripped) into a published ttyUSB port's ring,
         // and reading the ring returns exactly the payload.
         devfs_bridge::__reset_for_test();
-        clear_serial();
+        clear_serial(0);
         let idx = devfs_bridge::register_tty_usb(family);
         let tty = match devfs_bridge::get_port(idx) {
             Some(t) => t,
@@ -1627,9 +1641,9 @@ pub mod tests {
 
     fn smoke_serial_detach_unregisters_publication() -> TestResult {
         devfs_bridge::__reset_for_test();
-        clear_serial();
+        clear_serial(0);
         let idx = devfs_bridge::register_tty_usb(ChipFamily::Cp210x);
-        SERIAL_PORTS.lock().push(BoundPort {
+        SERIAL_PORTS.of(0).lock().push(BoundPort {
             slot_id: 42,
             family: ChipFamily::Cp210x,
             pid: 0xEA60,
@@ -1644,13 +1658,13 @@ pub mod tests {
         if bound_count() != 1 || devfs_bridge::port_count() != 1 {
             return TestResult::Fail("bound port should be registered + published");
         }
-        if !detach_serial(42) {
+        if !detach_serial(0, 42) {
             return TestResult::Fail("detach should report a removal");
         }
         if bound_count() != 0 || devfs_bridge::port_count() != 0 {
             return TestResult::Fail("detach must drop binding and publication");
         }
-        if detach_serial(42) {
+        if detach_serial(0, 42) {
             return TestResult::Fail("second detach should report no removal");
         }
         TestResult::Pass
@@ -1742,7 +1756,7 @@ pub mod tests {
         hub_port: Option<(u8, u8)>,
     ) -> usize {
         let idx = devfs_bridge::register_tty_usb(family);
-        SERIAL_PORTS.lock().push(BoundPort {
+        SERIAL_PORTS.of(0).lock().push(BoundPort {
             slot_id,
             family,
             pid,
@@ -1759,7 +1773,7 @@ pub mod tests {
 
     fn smoke_serial_resume_snapshot_rebuilds_open_plan() -> TestResult {
         devfs_bridge::__reset_for_test();
-        clear_serial();
+        clear_serial(0);
         // Non-default retained state: 9600 baud, DTR only (RTS
         // dropped) — a replay that fell back to defaults or to
         // the bind-time DTR|RTS would be visible here.
@@ -1770,7 +1784,7 @@ pub mod tests {
             ..LineSettings::default()
         };
         fabricate_port(207, ChipFamily::Ftdi, 0x6001, settings, None);
-        let snapshot = resume_snapshot();
+        let snapshot = resume_snapshot(0);
         let expected = match open_plan(ChipFamily::Ftdi, 0x6001, 0, &settings) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("resume: open plan must build"),
@@ -1794,7 +1808,7 @@ pub mod tests {
         if modem_step.w_value != 0x0301 {
             return TestResult::Fail("resume: modem step lost the DTR-only state");
         }
-        clear_serial();
+        clear_serial(0);
         TestResult::Pass
     }
     kernel_test_in!(
@@ -1804,7 +1818,7 @@ pub mod tests {
 
     fn smoke_serial_resume_replay_fake_conversation() -> TestResult {
         devfs_bridge::__reset_for_test();
-        clear_serial();
+        clear_serial(0);
         fabricate_port(207, ChipFamily::Ftdi, 0x6001, LineSettings::default(), None);
         let cp_settings = LineSettings {
             baud: 9_600,
@@ -1812,7 +1826,7 @@ pub mod tests {
         };
         fabricate_port(208, ChipFamily::Cp210x, 0xEA60, cp_settings, None);
         let fake = FakeTransport::new(Vec::new());
-        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        let result = narf_scheduler::block_on_spin(resume_replay(0, &fake));
         if result.is_err() {
             return TestResult::Fail("resume: replay over a healthy fake must succeed");
         }
@@ -1841,7 +1855,7 @@ pub mod tests {
             return TestResult::Fail("resume: transcript is not the two open plans in order");
         }
         drop(log);
-        clear_serial();
+        clear_serial(0);
         TestResult::Pass
     }
     kernel_test_in!(
@@ -1851,7 +1865,7 @@ pub mod tests {
 
     fn smoke_serial_resume_replay_dead_slot_typed() -> TestResult {
         devfs_bridge::__reset_for_test();
-        clear_serial();
+        clear_serial(0);
         fabricate_port(207, ChipFamily::Ftdi, 0x6001, LineSettings::default(), None);
         fabricate_port(
             208,
@@ -1865,7 +1879,7 @@ pub mod tests {
         // DriverError, still deliver 207's full plan, and never
         // panic or half-program 208.
         let fake = FakeTransport::new(alloc::vec![208]);
-        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        let result = narf_scheduler::block_on_spin(resume_replay(0, &fake));
         match result {
             Err(narf_power::device_pm::DeviceSuspendError::DriverError) => {}
             _ => return TestResult::Fail("resume: dead slot must fail typed DriverError"),
@@ -1887,7 +1901,7 @@ pub mod tests {
             return TestResult::Fail("resume: surviving port's plan must replay in full");
         }
         drop(log);
-        clear_serial();
+        clear_serial(0);
         TestResult::Pass
     }
     kernel_test_in!(
@@ -1897,7 +1911,7 @@ pub mod tests {
 
     fn smoke_serial_hub_ports_filter_and_pm_latch() -> TestResult {
         devfs_bridge::__reset_for_test();
-        clear_serial();
+        clear_serial(0);
         fabricate_port(
             207,
             ChipFamily::Ftdi,
@@ -1919,10 +1933,10 @@ pub mod tests {
             LineSettings::default(),
             Some((1, 4)),
         );
-        if hub_ports() != alloc::vec![(1u8, 3u8), (1u8, 4u8)] {
+        if hub_ports(0) != alloc::vec![(1u8, 3u8), (1u8, 4u8)] {
             return TestResult::Fail("hub_ports must list only hub-bound ports, sorted");
         }
-        clear_serial();
+        clear_serial(0);
         // The PM latch the prepare/resume hooks drive: the pump
         // consults `pm_quiesced` before touching any endpoint.
         if pm_quiesced() {

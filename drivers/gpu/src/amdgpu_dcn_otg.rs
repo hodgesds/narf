@@ -30,7 +30,11 @@ const OTG_V_SYNC_A: u64 = 0x1b37; // linux: mmOTG0_OTG_V_SYNC_A
 const OTG_V_SYNC_A_CNTL: u64 = 0x1b38; // linux: mmOTG0_OTG_V_SYNC_A_CNTL
 const OTG_CONTROL: u64 = 0x1b41; // linux: mmOTG0_OTG_CONTROL
 const OTG_INTERLACE_CONTROL: u64 = 0x1b44; // linux: mmOTG0_OTG_INTERLACE_CONTROL
-                                           // DCN 3.1.4 offsets; otg() adds 1 on Navi22, giving the DCN30 registers.
+/// `OTG_STATUS`, DCN3.0 only (`dcn_3_0_0_offset.h`), for `optc1_wait_for_state`.
+const OTG_STATUS_DCN30: u64 = 0x1b49; // linux: mmOTG0_OTG_STATUS
+                                      // linux: OTG0_OTG_STATUS__OTG_V_ACTIVE_DISP_MASK
+const OTG_V_ACTIVE_DISP: u32 = 0x0000_0002;
+// DCN 3.1.4 offsets; otg() adds 1 on Navi22, giving the DCN30 registers.
 const OTG_CLOCK_CONTROL: u64 = 0x1b85; // linux: mmOTG0_OTG_CLOCK_CONTROL - 1
 const OTG_VSTARTUP_PARAM: u64 = 0x1b86; // linux: mmOTG0_OTG_VSTARTUP_PARAM - 1
 const OTG_VUPDATE_PARAM: u64 = 0x1b87; // linux: mmOTG0_OTG_VUPDATE_PARAM - 1
@@ -334,6 +338,65 @@ impl<I: Io> Engine<I> {
             fits(sync.v_ready_offset_pix, OFFSET_BITS)?,
         )
     }
+    /// `dcn20_program_tg` on a running DCN3.0 generator whose plane's mode
+    /// math moved the global sync: `optc1_program_global_sync`, then (once
+    /// `wait_vactive` has run) `optc1_set_vtg_params(program_fp2)` for the
+    /// new VStartup. The caller holds the OTG's pipe-control lock.
+    fn vtg_params(&mut self, sync: &GlobalSync) -> Result<(), Error> {
+        let timing = self.timing.ok_or(Error::Busy)?;
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let v_blank_start = fits(timing.v_total - timing.v_front_porch, COUNT_BITS)?;
+        let v_blank_end = fits(v_blank_start - timing.v_active, COUNT_BITS)?;
+        let fp2 = sync.v_startup_lines.saturating_sub(v_blank_end + 1);
+        self.update(
+            self.otg_vtg(),
+            // linux: VTG0_CONTROL__VTG0_FP2_MASK | VTG0_CONTROL__VTG0_VCOUNT_INIT_MASK
+            0x7fff_7fff,
+            // linux-lit: 16=VTG0_CONTROL__VTG0_VCOUNT_INIT__SHIFT
+            v_blank_start << 16 | fits(fp2, COUNT_BITS)?,
+        )
+    }
+    /// `optc1_wait_for_state(CRTC_STATE_VACTIVE)`: REG_WAIT on
+    /// OTG_V_ACTIVE_DISP for up to 100 ms, logged (not fatal) on timeout.
+    async fn wait_vactive(&mut self) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let reg = self.otg(OTG_STATUS_DCN30);
+        let deadline = narf_time::Deadline::after_ms(100);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
+        loop {
+            let value = self.access(|io| io.read(reg))?;
+            if value == u32::MAX {
+                return Err(Error::DeviceGone);
+            }
+            if value & OTG_V_ACTIVE_DISP != 0 {
+                return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Ok(());
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            if deadline.expired() {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: otg{} never reached vactive (100 ms)",
+                    self.instance
+                );
+                return Ok(());
+            }
+            narf_scheduler::yield_now().await;
+        }
+    }
     /// `optc31_enable_crtc`: the vertical timing generator goes first, then the
     /// master enable with the request disabled until the blank's first line.
     fn enable(&mut self) -> Result<(), Error> {
@@ -472,6 +535,18 @@ impl Otg {
     }
     pub fn program_global_sync(&mut self, sync: &GlobalSync) -> Result<(), Error> {
         self.0.program_global_sync(sync)
+    }
+    /// `dcn20_program_tg` on a running DCN3.0 generator: the new global
+    /// sync, a wait for active (`optc1_wait_for_state`), then the VTG's
+    /// FP2/VCOUNT_INIT for the new VStartup. The caller holds the
+    /// pipe-control lock, so the change latches with the plane it serves.
+    pub async fn update_global_sync(&mut self, sync: &GlobalSync) -> Result<(), Error> {
+        if self.0.state != State::Running {
+            return Err(Error::Busy);
+        }
+        self.0.program_global_sync(sync)?;
+        self.0.wait_vactive().await?;
+        self.0.vtg_params(sync)
     }
     pub fn enable(&mut self) -> Result<(), Error> {
         self.0.enable()

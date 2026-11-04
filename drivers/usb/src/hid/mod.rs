@@ -39,7 +39,6 @@
 use crate::xhci::{self, EndpointConfig, EndpointKind, Xhci};
 use narf_input::evdev::{bus, InputId, ROUTER};
 use narf_input::Modifiers;
-use narf_lib::sync::IrqSafeSpinLock;
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -350,7 +349,7 @@ impl BootKeyboard {
         // keyboards (`hub_port` is `None`).
         if reports > 0 {
             if let Some((hub_slot, port)) = self.hub_port {
-                crate::attach::mark_port_activity(hub_slot, port);
+                crate::attach::mark_port_activity(xhci_dev.id(), hub_slot, port);
             }
         }
         Ok(total)
@@ -406,9 +405,9 @@ pub fn modifier_byte_to_modifiers(byte: u8) -> Modifiers {
 
 // ── Hot-plug enumeration ──────────────────────────────────────────
 
-/// System-wide registry of attached HID boot keyboards. Populated
-/// by `enumerate_and_attach_keyboards`; consumed by `pump_all`.
-static KEYBOARDS: IrqSafeSpinLock<Vec<BootKeyboard>> = IrqSafeSpinLock::new(Vec::new());
+/// Attached HID boot keyboards, one registry per xHCI controller.
+/// Populated by `enumerate_and_attach_keyboards`; consumed by `pump_all`.
+static KEYBOARDS: crate::xhci::PerController<Vec<BootKeyboard>> = crate::per_controller_vec!();
 
 /// Walk every connected port on the supplied controller and try to
 /// bring up a HID Boot Keyboard on each one. The flow per port:
@@ -442,10 +441,15 @@ pub async fn enumerate_and_attach_keyboards(xhci_dev: &Xhci) -> usize {
 /// (port-1). 0 = no failure recorded. Used by `note_attach_step`
 /// to dedupe log lines so the supervisor's 16-ms retry cadence
 /// doesn't fill the klog ring with the same failure repeatedly.
-static LAST_KBD_FAIL_STEP: [core::sync::atomic::AtomicU8; 256] = {
+static LAST_KBD_FAIL_STEP: [core::sync::atomic::AtomicU8; 256 * crate::xhci::MAX_CONTROLLERS] = {
     use core::sync::atomic::AtomicU8;
-    [const { AtomicU8::new(0) }; 256]
+    [const { AtomicU8::new(0) }; 256 * crate::xhci::MAX_CONTROLLERS]
 };
+
+/// Index of `(controller, port)` in the per-port log-dedup arrays.
+fn port_log_index(controller: u8, port: u8) -> usize {
+    usize::from(controller).min(crate::xhci::MAX_CONTROLLERS - 1) * 256 + usize::from(port)
+}
 
 /// Counts consecutive same-step failures per port. Used by
 /// `note_attach_fail` to re-emit a log line every N cycles even if
@@ -453,9 +457,9 @@ static LAST_KBD_FAIL_STEP: [core::sync::atomic::AtomicU8; 256] = {
 /// genuinely stuck and a logfile reader needs the periodic signal
 /// to distinguish "still failing" from "logged once and forgotten".
 #[allow(dead_code)]
-static KBD_FAIL_REPEATS: [core::sync::atomic::AtomicU16; 256] = {
+static KBD_FAIL_REPEATS: [core::sync::atomic::AtomicU16; 256 * crate::xhci::MAX_CONTROLLERS] = {
     use core::sync::atomic::AtomicU16;
-    [const { AtomicU16::new(0) }; 256]
+    [const { AtomicU16::new(0) }; 256 * crate::xhci::MAX_CONTROLLERS]
 };
 
 /// Identifiers for each step in `try_attach_port` — used as the
@@ -495,7 +499,7 @@ impl AttachStep {
 /// stuck enumeration loop doesn't fill the ring. Resets the
 /// recorded step to 0 on every successful attach so a later
 /// re-failure on the same port re-emits.
-fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
+fn note_attach_fail(controller: u8, port: u8, step: AttachStep, err: &HidError) {
     use core::fmt::Write as _;
     use core::sync::atomic::Ordering;
     // Audit F-83: emit on first occurrence of a (port, step) pair,
@@ -504,12 +508,13 @@ fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
     // flooding klog. The supervisor cycles ~16 ms apart on real
     // hardware, so 64 ≈ once per second.
     const REPEAT_MASK: u16 = 63;
-    let prev = LAST_KBD_FAIL_STEP[port as usize].swap(step as u8, Ordering::AcqRel);
+    let index = port_log_index(controller, port);
+    let prev = LAST_KBD_FAIL_STEP[index].swap(step as u8, Ordering::AcqRel);
     let same_step = prev == step as u8;
     let n = if same_step {
-        KBD_FAIL_REPEATS[port as usize].fetch_add(1, Ordering::AcqRel)
+        KBD_FAIL_REPEATS[index].fetch_add(1, Ordering::AcqRel)
     } else {
-        KBD_FAIL_REPEATS[port as usize].store(0, Ordering::Release);
+        KBD_FAIL_REPEATS[index].store(0, Ordering::Release);
         0
     };
     if same_step && (n & REPEAT_MASK) != 0 {
@@ -517,28 +522,32 @@ fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
     }
     let _ = writeln!(
         narf_console::Writer,
-        "  usb-hid: kbd port={} step={} err={:?}",
+        "  usb-hid: kbd xhci{} port={} step={} err={:?}",
+        controller,
         port,
         step.name(),
         err
     );
 }
 
-fn note_attach_ok(port: u8) {
+fn note_attach_ok(controller: u8, port: u8) {
     use core::fmt::Write as _;
     use core::sync::atomic::{AtomicU64, Ordering};
-    let was_failing = LAST_KBD_FAIL_STEP[port as usize].swap(0, Ordering::AcqRel) != 0;
-    KBD_FAIL_REPEATS[port as usize].store(0, Ordering::Release);
+    let index = port_log_index(controller, port);
+    let was_failing = LAST_KBD_FAIL_STEP[index].swap(0, Ordering::AcqRel) != 0;
+    KBD_FAIL_REPEATS[index].store(0, Ordering::Release);
     // Log a one-line "attached" notification per port so a real-HW
     // boot makes it obvious that the kbd pipeline came up. Bitmask
     // dedupes against the supervisor's per-cycle re-call.
-    static ATTACHED_PORTS: AtomicU64 = AtomicU64::new(0);
+    static ATTACHED_PORTS: [AtomicU64; crate::xhci::MAX_CONTROLLERS] =
+        [const { AtomicU64::new(0) }; crate::xhci::MAX_CONTROLLERS];
     let bit = 1u64 << (port as u32 & 63);
-    let prev = ATTACHED_PORTS.fetch_or(bit, Ordering::AcqRel);
+    let prev = ATTACHED_PORTS[index / 256].fetch_or(bit, Ordering::AcqRel);
     if prev & bit == 0 || was_failing {
         let _ = writeln!(
             narf_console::Writer,
-            "  usb-hid: kbd attached on port {}",
+            "  usb-hid: kbd attached on xhci{} port {}",
+            controller,
             port
         );
     }
@@ -551,7 +560,7 @@ fn note_attach_ok(port: u8) {
 pub async fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     let r = try_attach_port(xhci_dev, port).await;
     if r.is_ok() {
-        note_attach_ok(port);
+        note_attach_ok(xhci_dev.id(), port);
     }
     r
 }
@@ -588,7 +597,7 @@ pub async fn try_bind_kbd_already_addressed(
 ) -> Result<(), HidError> {
     let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed, hub_port).await;
     if r.is_ok() {
-        note_attach_ok(port);
+        note_attach_ok(xhci_dev.id(), port);
     }
     r
 }
@@ -596,17 +605,17 @@ pub async fn try_bind_kbd_already_addressed(
 async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).await.map_err(|e| {
         let err = HidError::Xhci(e);
-        note_attach_fail(port, AttachStep::Reset, &err);
+        note_attach_fail(xhci_dev.id(), port, AttachStep::Reset, &err);
         err
     })?;
     let speed = xhci_dev.port_speed(port).ok_or_else(|| {
         let err = HidError::NoInterruptIn;
-        note_attach_fail(port, AttachStep::Speed, &err);
+        note_attach_fail(xhci_dev.id(), port, AttachStep::Speed, &err);
         err
     })?;
     let slot_id = xhci_dev.enable_slot().await.map_err(|e| {
         let err = HidError::Xhci(e);
-        note_attach_fail(port, AttachStep::EnableSlot, &err);
+        note_attach_fail(xhci_dev.id(), port, AttachStep::EnableSlot, &err);
         err
     })?;
     let res = async {
@@ -615,7 +624,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
             .await
             .map_err(|e| {
                 let err = HidError::Xhci(e);
-                note_attach_fail(port, AttachStep::AddressDevice, &err);
+                note_attach_fail(xhci_dev.id(), port, AttachStep::AddressDevice, &err);
                 err
             })?;
         bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed, None).await
@@ -679,18 +688,18 @@ async fn bind_kbd_addressed_slot(
         .await
         .map_err(|e| {
             let err = HidError::Xhci(e);
-            note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+            note_attach_fail(xhci_dev.id(), port, AttachStep::GetCfgHeader, &err);
             err
         })?;
     if n < 9 {
         let err = HidError::NotBootKeyboard;
-        note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+        note_attach_fail(xhci_dev.id(), port, AttachStep::GetCfgHeader, &err);
         return Err(err);
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
     if !(9..=4096).contains(&total) {
         let err = HidError::NotBootKeyboard;
-        note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+        note_attach_fail(xhci_dev.id(), port, AttachStep::GetCfgHeader, &err);
         return Err(err);
     }
     // bConfigurationValue lives at offset +5 of the cfg
@@ -705,7 +714,7 @@ async fn bind_kbd_addressed_slot(
         .await
         .map_err(|e| {
             let err = HidError::Xhci(e);
-            note_attach_fail(port, AttachStep::GetCfgFull, &err);
+            note_attach_fail(xhci_dev.id(), port, AttachStep::GetCfgFull, &err);
             err
         })?;
     if n2 < total {
@@ -713,7 +722,7 @@ async fn bind_kbd_addressed_slot(
     }
 
     let (iface, ep) = find_boot_keyboard(&full).inspect_err(|e| {
-        note_attach_fail(port, AttachStep::FindBootKbd, e);
+        note_attach_fail(xhci_dev.id(), port, AttachStep::FindBootKbd, e);
     })?;
 
     // Configure the controller-side endpoint context first
@@ -724,7 +733,7 @@ async fn bind_kbd_addressed_slot(
         .await
         .map_err(|e| {
             let err = HidError::Xhci(e);
-            note_attach_fail(port, AttachStep::ConfigureEndpoints, &err);
+            note_attach_fail(xhci_dev.id(), port, AttachStep::ConfigureEndpoints, &err);
             err
         })?;
 
@@ -746,7 +755,7 @@ async fn bind_kbd_addressed_slot(
         .await
         .map_err(|_| {
             let err = HidError::SetProtocolFailed;
-            note_attach_fail(port, AttachStep::SetConfiguration, &err);
+            note_attach_fail(xhci_dev.id(), port, AttachStep::SetConfiguration, &err);
             err
         })?;
 
@@ -763,14 +772,23 @@ async fn bind_kbd_addressed_slot(
     let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci, hub_port, identity)
         .await
         .inspect_err(|e| {
-            note_attach_fail(port, AttachStep::SetProtocol, e);
+            note_attach_fail(xhci_dev.id(), port, AttachStep::SetProtocol, e);
         })?;
     {
-        let mut g = KEYBOARDS.lock();
-        g.push(kbd);
-        ATTACHED_KEYBOARD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        KEYBOARDS.of(xhci_dev.id()).lock().push(kbd);
+        ATTACHED_KEYBOARD_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     Ok(())
+}
+
+/// Decrement a lock-free binding counter by `n`, saturating at zero
+/// (fixtures can push bindings without counting them).
+pub(crate) fn saturating_sub(counter: &core::sync::atomic::AtomicU32, n: u32) {
+    let _ = counter.fetch_update(
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+        |v| Some(v.saturating_sub(n)),
+    );
 }
 
 /// Lock-free atomic count of bound keyboards. Diagnostics
@@ -800,30 +818,80 @@ pub fn attached_keyboard_count() -> usize {
 /// kernel pump — the device buffers state-change reports.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     PUMP_ALL_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mut g = KEYBOARDS.lock();
+    let mut g = KEYBOARDS.of(xhci_dev.id()).lock();
     let mut total = 0usize;
     for kbd in g.iter_mut() {
-        if let Ok(n) = kbd.pump_once(xhci_dev) {
+        let before = REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
+        let result = kbd.pump_once(xhci_dev);
+        let got = REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed) != before;
+        note_pump(
+            "kbd",
+            xhci_dev.id(),
+            kbd.slot_id,
+            got,
+            result.as_ref().err().map(|e| e as &dyn core::fmt::Debug),
+        );
+        if let Ok(n) = result {
             total += n;
         }
     }
     total
 }
 
-/// Snapshot the hub contexts of every live HID binding across
+/// Bring-up visibility for the input pumps, whose errors are otherwise
+/// dropped every cycle: log a binding's first report and its first error
+/// (once each per controller/slot/class), so a boot shows whether
+/// reports arrive, fail, or never come.
+pub(crate) fn note_pump(
+    class: &'static str,
+    controller: u8,
+    slot_id: u8,
+    got_report: bool,
+    error: Option<&dyn core::fmt::Debug>,
+) {
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<
+        alloc::collections::BTreeSet<(&'static str, u8, u8, bool)>,
+    > = narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeSet::new());
+    let event = match (got_report, error) {
+        (_, Some(_)) => false,
+        (true, None) => true,
+        (false, None) => return,
+    };
+    if !SEEN.lock().insert((class, controller, slot_id, event)) {
+        return;
+    }
+    use core::fmt::Write as _;
+    match error {
+        Some(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-hid: {class} xhci{controller} slot={slot_id} first pump error: {e:?}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  usb-hid: {class} xhci{controller} slot={slot_id} first report received"
+            );
+        }
+    }
+}
+
+/// Snapshot the hub contexts of every live HID binding on `controller` across
 /// the pumped classes (boot keyboards here, plus mouse /
 /// touchpad / consumer), sorted and deduplicated — a composite
 /// device can bind two classes on the same hub port.
 /// Root-attached bindings (`hub_port` is `None`) are omitted:
 /// root ports are never idle-suspended.
-pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
+pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
     let mut v: alloc::vec::Vec<(u8, u8)> = {
-        let g = KEYBOARDS.lock();
+        let g = KEYBOARDS.of(controller).lock();
         g.iter().filter_map(|k| k.hub_port).collect()
     };
-    v.extend(mouse::hub_ports());
-    v.extend(touchpad::hub_ports());
-    v.extend(consumer::hub_ports());
+    v.extend(mouse::hub_ports(controller));
+    v.extend(touchpad::hub_ports(controller));
+    v.extend(consumer::hub_ports(controller));
+    v.extend(generic::hub_ports(controller));
     v.sort_unstable();
     v.dedup();
     v
@@ -851,15 +919,16 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
     // registry — never hold HUBS across the HID registry locks
     // (the pumps nest the other way: registry lock held while
     // `mark_port_activity` takes HUBS).
-    let ports = hub_ports();
+    let controller = xhci_dev.id();
+    let ports = hub_ports(controller);
     let targets = {
-        let g = crate::attach::HUBS.lock();
+        let g = crate::attach::HUBS.of(controller).lock();
         crate::attach::suspended_ports_among(&g[..], &ports)
     };
     for (hub_slot, port) in targets {
         crate::attach::resume_port(xhci_dev, hub_slot, port).await;
-        if !crate::attach::hub_port_is_suspended(hub_slot, port) {
-            crate::attach::mark_port_activity(hub_slot, port);
+        if !crate::attach::hub_port_is_suspended(controller, hub_slot, port) {
+            crate::attach::mark_port_activity(controller, hub_slot, port);
         }
     }
 }
@@ -884,40 +953,46 @@ pub static REPORTS_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 /// unplugged, its hub went away, or the supervisor is tearing the
 /// binding down before slot reclaim. Dropping the binding releases held
 /// keys and removes its evdev node. Returns true when a binding was removed.
-pub fn detach_boot_keyboard(slot_id: u8) -> bool {
-    let mut g = KEYBOARDS.lock();
+pub fn detach_boot_keyboard(controller: u8, slot_id: u8) -> bool {
+    let mut g = KEYBOARDS.of(controller).lock();
     let before = g.len();
     g.retain(|k| k.slot_id != slot_id);
-    let removed = g.len() != before;
-    if removed {
-        ATTACHED_KEYBOARD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
-    }
-    removed
+    let removed = before - g.len();
+    crate::hid::saturating_sub(&ATTACHED_KEYBOARD_COUNT, removed as u32);
+    removed != 0
 }
 
-/// Drop every boot-keyboard binding. Called on a controller
+/// Drop every boot-keyboard binding on `controller`. Called on a controller
 /// recovery epoch change, where every slot is dead by construction
 /// and no per-slot teardown applies.
-pub fn clear_boot_keyboards() {
-    KEYBOARDS.lock().clear();
-    ATTACHED_KEYBOARD_COUNT.store(0, core::sync::atomic::Ordering::Release);
+pub fn clear_boot_keyboards(controller: u8) {
+    let removed = {
+        let mut g = KEYBOARDS.of(controller).lock();
+        let n = g.len();
+        g.clear();
+        n
+    };
+    crate::hid::saturating_sub(&ATTACHED_KEYBOARD_COUNT, removed as u32);
 }
 
 #[doc(hidden)]
 pub fn __reset_keyboards_for_test() {
-    KEYBOARDS.lock().clear();
+    for (_, keyboards) in KEYBOARDS.each() {
+        keyboards.lock().clear();
+    }
     ATTACHED_KEYBOARD_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 
 #[doc(hidden)]
 pub fn __push_keyboard_for_test(kbd: BootKeyboard) {
-    KEYBOARDS.lock().push(kbd);
+    KEYBOARDS.of(0).lock().push(kbd);
 }
 
 #[doc(hidden)]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn feed_keyboard_report_for_test(slot: u8, report: [u8; 8]) -> usize {
     KEYBOARDS
+        .of(0)
         .lock()
         .iter_mut()
         .find(|kbd| kbd.slot_id == slot)

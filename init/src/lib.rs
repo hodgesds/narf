@@ -291,6 +291,15 @@ fn cycles_to_ms(cycles: u64) -> u64 {
 /// Run every initcall registered under `stage`. Each call's result
 /// is logged + counted. Returns the stage's stats post-run.
 pub fn run_stage(stage: Stage) -> StageStats {
+    // Every initcall's Deadline and sleep converts ns through the TSC scale,
+    // which is the 1 cycle/ns fallback until calibrated (4.7x short on a
+    // 4.7 GHz part): device resets, settle delays and timeouts expired early
+    // and drivers failed on real hardware (igc RegisterTimeout, i8042, mt76,
+    // the chipset xHCI). Establish the calibrated scale before the first
+    // stage runs. Cached after the first call; under KVM without a CPUID/MSR
+    // frequency it stays uncalibrated as before, and frame's later
+    // HPET-cross-checked calibration still runs.
+    let _ = narf_time::calibrate_clocks();
     let i = stage as usize;
     // Status-panel diag: advance the boot-phase marker so a
     // bare-metal operator sees forward progress across stages

@@ -1,13 +1,14 @@
-//! Prime the normal USB supervisor before an installed root is mounted.
+//! Prime the normal USB supervisors before an installed root is mounted.
 //!
-//! The future is retained and later spawned intact: claimed ports, pending
-//! transfers and timer wakers remain owned by the one supervisor.
+//! The futures (one per xHCI controller; the root may sit behind any of
+//! them) are retained and later spawned intact: claimed ports, pending
+//! transfers and timer wakers remain owned by each supervisor.
 
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-pub(super) fn prepare<F: Future<Output = ()>>(mut supervisor: Pin<&mut F>) {
+pub(super) fn prepare<F: Future<Output = ()> + Unpin>(supervisors: &mut [F]) {
     if !narf_block::disk_policy::policy().is_root_policy() {
         return;
     }
@@ -29,7 +30,7 @@ pub(super) fn prepare<F: Future<Output = ()>>(mut supervisor: Pin<&mut F>) {
     // event rings and the supervisor's delays are timer-driven; no other
     // scheduler task is needed to enumerate the disk. No lock is held here.
     let found = narf_scheduler::block_on_spin(core::future::poll_fn(|cx| {
-        poll_bootstrap(supervisor.as_mut(), cx, ready, || deadline.expired())
+        poll_bootstrap(supervisors, cx, ready, || deadline.expired())
     }));
     let _ = writeln!(
         narf_console::Writer,
@@ -42,8 +43,8 @@ pub(super) fn prepare<F: Future<Output = ()>>(mut supervisor: Pin<&mut F>) {
     );
 }
 
-fn poll_bootstrap<F: Future<Output = ()>>(
-    mut supervisor: Pin<&mut F>,
+fn poll_bootstrap<F: Future<Output = ()> + Unpin>(
+    supervisors: &mut [F],
     cx: &mut Context<'_>,
     ready: impl Fn() -> bool,
     expired: impl Fn() -> bool,
@@ -51,7 +52,16 @@ fn poll_bootstrap<F: Future<Output = ()>>(
     if ready() {
         return Poll::Ready(true);
     }
-    if expired() || supervisor.as_mut().poll(cx).is_ready() {
+    if expired() {
+        return Poll::Ready(false);
+    }
+    // Every supervisor gets a turn; the bootstrap ends unsuccessfully only
+    // if all of them have finished.
+    let mut live = false;
+    for supervisor in supervisors.iter_mut() {
+        live |= Pin::new(supervisor).poll(cx).is_pending();
+    }
+    if !live {
         return Poll::Ready(false);
     }
     if ready() {
@@ -93,7 +103,12 @@ mod tests {
         let mut supervisor = core::pin::pin!(Supervisor(&polls, &dropped));
         let waker = Arc::new(Noop).into();
         let mut cx = Context::from_waker(&waker);
-        let result = poll_bootstrap(supervisor.as_mut(), &mut cx, || polls.get() == 1, || false);
+        let result = poll_bootstrap(
+            &mut [supervisor.as_mut()],
+            &mut cx,
+            || polls.get() == 1,
+            || false,
+        );
         if result != Poll::Ready(true) || dropped.get() {
             return TestResult::Fail("root bootstrap dropped or failed to prime the supervisor");
         }
@@ -102,11 +117,11 @@ mod tests {
         if polls.get() != 2 || dropped.get() {
             return TestResult::Fail("supervisor did not resume after bootstrap");
         }
-        let result = poll_bootstrap(supervisor.as_mut(), &mut cx, || false, || true);
+        let result = poll_bootstrap(&mut [supervisor.as_mut()], &mut cx, || false, || true);
         if result != Poll::Ready(false) || polls.get() != 2 || dropped.get() {
             return TestResult::Fail("expired bootstrap polled or discarded the supervisor");
         }
-        let result = poll_bootstrap(supervisor.as_mut(), &mut cx, || true, || false);
+        let result = poll_bootstrap(&mut [supervisor.as_mut()], &mut cx, || true, || false);
         if result != Poll::Ready(true) || polls.get() != 2 {
             return TestResult::Fail("registered root unnecessarily polled the supervisor");
         }

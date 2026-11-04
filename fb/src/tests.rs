@@ -1623,3 +1623,21 @@ kernel_test_in!(
     "fb",
     smoke_fb_intel_kms_pause_drains_cached_views_and_blocks_pixels
 );
+
+/// Linux draws no pointer of its own while a DRM master owns the display:
+/// only a cursor the compositor shows through the legacy cursor ioctl
+/// appears; KWin, which never uses it, gets no second kernel pointer.
+fn smoke_fb_no_kernel_pointer_under_a_compositor() -> TestResult {
+    use crate::cursor::user_pointer;
+    if user_pointer((10, 20, false, false)).is_some() {
+        return TestResult::Fail("kernel pointer drawn for a compositor that never set a cursor");
+    }
+    if user_pointer((10, 20, true, true)) != Some((10, 20)) {
+        return TestResult::Fail("legacy cursor ioctl cursor not shown");
+    }
+    if user_pointer((10, 20, false, true)).is_some() {
+        return TestResult::Fail("hidden legacy cursor still shown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fb_no_kernel_pointer_under_a_compositor);

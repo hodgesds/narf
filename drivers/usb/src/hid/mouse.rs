@@ -39,7 +39,6 @@ use narf_input::{
     },
     push_global, InputEvent, PointerButtons, PointerEvent,
 };
-use narf_lib::sync::IrqSafeSpinLock;
 
 extern crate alloc;
 use alloc::sync::Arc;
@@ -226,7 +225,7 @@ impl BootMouse {
         // the device is in use). No-op when root-attached.
         if reports > 0 {
             if let Some((hub_slot, port)) = self.hub_port {
-                crate::attach::mark_port_activity(hub_slot, port);
+                crate::attach::mark_port_activity(xhci_dev.id(), hub_slot, port);
             }
         }
         Ok(total)
@@ -305,9 +304,9 @@ pub fn button_byte_to_buttons(byte: u8) -> PointerButtons {
 
 // ── Hot-plug enumeration ──────────────────────────────────────────
 
-/// System-wide registry of attached HID boot mice. Populated by
-/// `enumerate_and_attach_mice`; consumed by `pump_all`.
-static MICE: IrqSafeSpinLock<Vec<BootMouse>> = IrqSafeSpinLock::new(Vec::new());
+/// Attached HID boot mice, one registry per xHCI controller. Populated
+/// by `enumerate_and_attach_mice`; consumed by `pump_all`.
+static MICE: crate::xhci::PerController<Vec<BootMouse>> = crate::per_controller_vec!();
 
 /// Walk every connected port and try to bring up a HID Boot Mouse
 /// interface. Same flow as the keyboard counterpart in `hid::mod`.
@@ -328,13 +327,16 @@ pub async fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), H
     if r.is_ok() {
         use core::fmt::Write as _;
         use core::sync::atomic::{AtomicU64, Ordering};
-        static ATTACHED_PORTS: AtomicU64 = AtomicU64::new(0);
+        static ATTACHED_PORTS: [AtomicU64; crate::xhci::MAX_CONTROLLERS] =
+            [const { AtomicU64::new(0) }; crate::xhci::MAX_CONTROLLERS];
+        let controller = usize::from(xhci_dev.id()).min(crate::xhci::MAX_CONTROLLERS - 1);
         let bit = 1u64 << (port as u32 & 63);
-        let prev = ATTACHED_PORTS.fetch_or(bit, Ordering::AcqRel);
+        let prev = ATTACHED_PORTS[controller].fetch_or(bit, Ordering::AcqRel);
         if prev & bit == 0 {
             let _ = writeln!(
                 narf_console::Writer,
-                "  usb-hid: mouse attached on port {}",
+                "  usb-hid: mouse attached on xhci{} port {}",
+                controller,
                 port
             );
         }
@@ -470,9 +472,8 @@ async fn bind_mouse_addressed_slot(
     let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
     let m = BootMouse::attach(xhci_dev, slot_id, iface, dci, port, hub_port).await?;
     {
-        let mut g = MICE.lock();
-        g.push(m);
-        ATTACHED_MOUSE_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+        MICE.of(xhci_dev.id()).lock().push(m);
+        ATTACHED_MOUSE_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     Ok(())
 }
@@ -492,18 +493,27 @@ pub fn attached_mouse_count() -> usize {
 /// Hub contexts of all live mouse bindings (root-attached
 /// bindings omitted). Aggregated by `hid::hub_ports` for the
 /// supervisor's HID wake step.
-pub fn hub_ports() -> alloc::vec::Vec<(u8, u8)> {
-    let g = MICE.lock();
+pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
+    let g = MICE.of(controller).lock();
     g.iter().filter_map(|m| m.hub_port).collect()
 }
 
 /// Drain one report from each attached mouse. Returns total events
 /// emitted across all mice.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
-    let mut g = MICE.lock();
+    let mut g = MICE.of(xhci_dev.id()).lock();
     let mut total = 0usize;
     for m in g.iter_mut() {
-        if let Ok(n) = m.pump_once(xhci_dev) {
+        let result = m.pump_once(xhci_dev);
+        let got = matches!(result, Ok(n) if n > 0);
+        super::note_pump(
+            "mouse",
+            xhci_dev.id(),
+            m.slot_id,
+            got,
+            result.as_ref().err().map(|e| e as &dyn core::fmt::Debug),
+        );
+        if let Ok(n) = result {
             total += n;
         }
     }
@@ -514,26 +524,31 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 /// node (so `/dev/input/event<N>` disappears) and drop the binding
 /// so `pump_all` stops polling the dead slot. Returns true when a
 /// binding was removed.
-pub fn detach_mouse(slot_id: u8) -> bool {
-    let mut g = MICE.lock();
+pub fn detach_mouse(controller: u8, slot_id: u8) -> bool {
+    let mut g = MICE.of(controller).lock();
     if let Some(pos) = g.iter().position(|m| m.slot_id == slot_id) {
         let mouse = g.remove(pos);
         mouse.unregister_evdev();
+        crate::hid::saturating_sub(&ATTACHED_MOUSE_COUNT, 1);
         return true;
     }
     false
 }
 
-/// Drop every mouse binding, unregistering each evdev node.
-/// Called on a controller recovery epoch change.
-pub fn clear_mice() {
-    let mut g = MICE.lock();
+/// Drop every mouse binding on `controller`, unregistering each evdev
+/// node. Called on a controller recovery epoch change.
+pub fn clear_mice(controller: u8) {
+    let mut g = MICE.of(controller).lock();
     for mouse in g.drain(..) {
         mouse.unregister_evdev();
+        crate::hid::saturating_sub(&ATTACHED_MOUSE_COUNT, 1);
     }
 }
 
 #[doc(hidden)]
 pub fn __reset_mice_for_test() {
-    MICE.lock().clear();
+    for (_, mice) in MICE.each() {
+        mice.lock().clear();
+    }
+    ATTACHED_MOUSE_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }

@@ -279,6 +279,8 @@ pub fn __test_reset() {
 /// a kernel thread (not an executor task) can issue HCI commands
 /// once L2CAP / GATT pumps are wired up.
 pub struct UsbHciTransport {
+    /// Controller index ([`crate::xhci::Xhci::id`]) the slot belongs to.
+    controller: u8,
     slot_id: u8,
     interface: u8,
     event_dci: u8,
@@ -305,7 +307,7 @@ impl fmt::Debug for UsbHciTransport {
 
 impl UsbHciTransport {
     fn xhci(&self) -> Result<Arc<Xhci>, TransportError> {
-        crate::xhci::controller().ok_or(TransportError::Detached)
+        crate::xhci::controller_by_id(self.controller).ok_or(TransportError::Detached)
     }
 
     fn arm_event_in(&self, xhci: &Xhci) -> Result<(), TransportError> {
@@ -883,6 +885,7 @@ pub async fn try_bind_btusb_already_addressed(
     // pump, ACL data plane). Mandatory bring-up is done: every command
     // it issued used the async helper above.
     let transport: Arc<dyn HciTransport> = Arc::new(UsbHciTransport {
+        controller: xhci_dev.id(),
         slot_id,
         interface: eps.interface,
         event_dci,
@@ -897,9 +900,11 @@ pub async fn try_bind_btusb_already_addressed(
 
     {
         use core::fmt::Write as _;
-        static ATTACHED: AtomicU64 = AtomicU64::new(0);
+        static ATTACHED: [AtomicU64; crate::xhci::MAX_CONTROLLERS] =
+            [const { AtomicU64::new(0) }; crate::xhci::MAX_CONTROLLERS];
         let bit = 1u64 << (slot_id as u32 & 63);
-        let prev = ATTACHED.fetch_or(bit, Ordering::AcqRel);
+        let controller = usize::from(xhci_dev.id()).min(crate::xhci::MAX_CONTROLLERS - 1);
+        let prev = ATTACHED[controller].fetch_or(bit, Ordering::AcqRel);
         if prev & bit == 0 {
             let vendor = vendor_name(info.manufacturer);
             let bt_ver = bt_version_name(info.hci_version);

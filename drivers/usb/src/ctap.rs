@@ -85,6 +85,9 @@ pub struct CtapToken {
     pub iface_num: u8,
     pub in_ep: EndpointConfig,
     pub out_ep: EndpointConfig,
+    /// Index of the xHCI controller the token is on
+    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
+    pub controller: u8,
 }
 
 impl CtapToken {
@@ -343,7 +346,8 @@ impl HidPipe for XhciHidPipe {
 pub fn open_client(
     token: &Arc<CtapToken>,
 ) -> Result<Client<XhciHidPipe, CryptoRandom>, narf_ctap2::Error> {
-    let xhci = crate::xhci::controller().ok_or(narf_ctap2::Error::Transport)?;
+    let xhci =
+        crate::xhci::controller_by_id(token.controller).ok_or(narf_ctap2::Error::Transport)?;
     let pipe = XhciHidPipe::new(xhci, token);
     Client::connect(pipe, CryptoRandom)
 }
@@ -420,6 +424,7 @@ pub async fn try_bind_ctap_already_addressed(
             iface_num,
             in_ep,
             out_ep,
+            controller: xhci_dev.id(),
         });
         xhci_dev
             .arm_interrupt_in(slot_id, token.in_dci(), REPORT_LEN as u32)
@@ -624,6 +629,7 @@ mod tests {
                 kind: EndpointKind::InterruptOut,
                 interval: 1,
             },
+            controller: 0,
         });
         check_eq!(token.in_dci(), 3, "in DCI");
         check_eq!(token.out_dci(), 2, "out DCI");

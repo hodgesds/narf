@@ -285,7 +285,22 @@ impl Request {
         admission: Option<&CommitAdmission<'_>>,
     ) -> Result<u64, FsError> {
         match self {
-            Self::Atomic(a) => atomic_commit(card, mode, a.request(), events, out, admission),
+            Self::Atomic(a) => {
+                let result = atomic_commit(card, mode, a.request(), events, out, admission);
+                if let Err(error) = &result {
+                    let request = a.request();
+                    note_atomic_rejection(
+                        mode,
+                        request.flags,
+                        error,
+                        request.objects,
+                        request.prop_counts,
+                        request.props,
+                        request.values,
+                    );
+                }
+                result
+            }
             Self::SetCrtc(r, c) => handle_setcrtc_decoded(card, mode, *r, *c, admission, false),
             Self::PageFlip(r) => handle_page_flip_decoded(card, mode, *r, events, admission, false),
             Self::SetPlane(b) => handle_setplane_decoded(card, mode, b, admission, false),
@@ -425,6 +440,15 @@ impl Request {
                         object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_GFX12_DCC)
                             != 0,
                         object.byte_len,
+                        if crate::amdgpu_native_kms::linear_gem_card(&c) {
+                            let config = crate::amdgpu_info::navi22_gb_addr_config().unwrap_or(0);
+                            crate::amdgpu_dm_modifiers::TilingFlags::Gfx10_3 {
+                                pipes_log2: config & 0x7,
+                                packers_log2: (config >> 8) & 0x7,
+                            }
+                        } else {
+                            crate::amdgpu_dm_modifiers::TilingFlags::Gfx12
+                        },
                     )
                     .map_err(|_| FsError::InvalidData)?;
                     crate::drm_native_planes::check_cursor(
@@ -482,7 +506,7 @@ fn atomic_fbs(card: &crate::drm::card::Card, req: AtomicRequest<'_>) -> Result<V
             .filter(|n| *n <= req.props.len() && *n <= req.values.len())
             .ok_or(FsError::InvalidData)?;
         let primary = || {
-            if !card.native_planes.is_empty() {
+            if card.has_native_kms_planes() {
                 return None;
             }
             let index = object.checked_sub(crate::drm_native_planes::PRIMARY_PLANE_ID_BASE)?;
@@ -602,9 +626,11 @@ pub(crate) async fn dispatch(
             return Some(Err(FsError::PermissionDenied));
         }
     }
+    reset_invalid_line();
     let result = async {
-        crate::amdgpu_gem::ensure_placement_live(card)?;
-        let req = Request::copy(nr, arg, gem)?;
+        crate::amdgpu_gem::ensure_placement_live(card)
+            .map_err(|e| note_kms_step(nr, "placement", e))?;
+        let req = Request::copy(nr, arg, gem).map_err(|e| note_kms_step(nr, "copy", e))?;
         let ctx = DrmFileCtx::primary(true);
         if req.test_only() {
             // No placement admission or migration for a probe, but retain
@@ -616,25 +642,60 @@ pub(crate) async fn dispatch(
             };
             return req.commit(card, &mode, &ctx, events, out, Some(&admission));
         }
-        let gate = crate::amdgpu_gem::lock_placement_live(card).await?;
-        req.validate(card, &mode, open, events)?;
+        let gate = crate::amdgpu_gem::lock_placement_live(card)
+            .await
+            .map_err(|e| note_kms_step(nr, "placement-gate", e))?;
+        req.validate(card, &mode, open, events)
+            .map_err(|e| note_kms_step(nr, "validate", e))?;
         let targets = {
             let c = mode.lock();
             if !c.is_master(open) {
-                return Err(FsError::PermissionDenied);
+                return Err(note_kms_step(nr, "master", FsError::PermissionDenied));
             }
-            req.targets(&c)?
+            req.targets(&c)
+                .map_err(|e| note_kms_step(nr, "targets", e))?
         };
-        let _prepared = crate::amdgpu_gem::prepare_scanout_locked(gate, targets.objects()).await?;
+        let _prepared = crate::amdgpu_gem::prepare_scanout_locked(gate, targets.objects())
+            .await
+            .map_err(|e| note_kms_step(nr, "prepare-scanout", e))?;
         let admission = CommitAdmission {
             open,
             request: &req,
             targets: Some(&targets),
         };
         req.commit(card, &mode, &ctx, events, out, Some(&admission))
+            .map_err(|e| note_kms_step(nr, "commit", e))
     }
     .await;
     Some(result)
+}
+
+/// Bring-up visibility: name the step of an amdgpu KMS request (real
+/// commit, not a TEST_ONLY probe) that refused it, once per (ioctl, step,
+/// error), with the last [`invalid_at`] line. Returns the error unchanged.
+#[cfg(feature = "amdgpu")]
+fn note_kms_step(nr: u32, step: &'static str, error: FsError) -> FsError {
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<Vec<(u32, &'static str, alloc::string::String)>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    let text = alloc::format!("{error:?}");
+    {
+        let mut seen = SEEN.lock();
+        if seen.len() >= 32
+            || seen
+                .iter()
+                .any(|(n, s, t)| *n == nr && *s == step && *t == text)
+        {
+            return error;
+        }
+        seen.push((nr, step, text.clone()));
+    }
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  drm: amdgpu kms ioctl nr {nr:#x} refused at {step}: {text} (last bridge line {})",
+        last_invalid_line(),
+    );
+    error
 }
 
 #[cfg(all(feature = "kernel-test", feature = "amdgpu"))]

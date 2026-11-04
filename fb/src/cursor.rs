@@ -296,29 +296,31 @@ fn render_user_cursor(fb: &FbWriter) {
         USER_LAST_X.store(u32::MAX, Ordering::Release);
         USER_LAST_Y.store(u32::MAX, Ordering::Release);
     }
-    let (ux, uy, visible, managed) = narf_console::user_cursor_state();
-    // Treat the compositor as owning the pointer only once it has actually
-    // *shown* a real cursor. A compositor with no cursor theme (kwin on a
-    // rootfs with no Xcursor set) only ever *hides* the HW cursor — that
-    // flips `managed` but never `ever_shown`, so without this gate the
-    // `erase_cursor` branch would suppress the kernel pointer and the user
-    // would have no visible pointer at all despite live input.
-    if managed && narf_console::user_cursor_ever_shown() {
-        if visible {
-            render_cursor_at(fb, ux, uy);
-        } else {
-            erase_cursor(fb);
-        }
-    } else {
-        // Fall back to the kernel pointer position, driven by the input
-        // layer (virtio-tablet absolute position / global pointer ring).
-        // POS_X/POS_Y is u32::MAX until the first event / FB-attach centring.
-        let x = POS_X.load(Ordering::Relaxed);
-        let y = POS_Y.load(Ordering::Relaxed);
-        if x != u32::MAX {
+    match user_pointer(narf_console::user_cursor_state()) {
+        Some((x, y)) => {
+            USER_HIDDEN.store(false, Ordering::Release);
             render_cursor_at(fb, x, y);
         }
+        // Hide the console's pointer (or the last legacy cursor) once.
+        None if !USER_HIDDEN.swap(true, Ordering::AcqRel) => erase_cursor(fb),
+        None => {}
     }
+}
+
+/// The pointer is hidden on the compositor-owned scanout (set once
+/// [`erase_cursor`] ran for it, cleared when a cursor shows again).
+static USER_HIDDEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Where the pointer shows on a compositor-owned scanout, from the legacy
+/// DRM cursor ioctl state `(x, y, visible, managed)`: only where the
+/// compositor put a visible cursor through DRM_IOCTL_MODE_CURSOR. Linux
+/// draws no pointer of its own while a DRM master owns the display; a
+/// compositor that never uses the legacy cursor (KWin composites its
+/// pointer, or puts it on a cursor plane) gets none from the kernel, which
+/// would otherwise show a second pointer over its own.
+pub(crate) fn user_pointer(state: (u32, u32, bool, bool)) -> Option<(u32, u32)> {
+    let (x, y, visible, managed) = state;
+    (managed && visible).then_some((x, y))
 }
 
 /// The arrow as a premultiplied ARGB image for a hardware cursor: opaque

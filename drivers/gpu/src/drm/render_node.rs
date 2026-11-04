@@ -279,6 +279,14 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // VERSION + GET_CAP are RENDER_ALLOW per Linux.
         0x00 => Some(IoctlFlags::render_allow()),
         0x0C => Some(IoctlFlags::render_allow()),
+        // GET_UNIQUE — flags 0 (any primary open); SET_VERSION — DRM_MASTER.
+        0x01 => Some(IoctlFlags {
+            auth: false,
+            master: false,
+            root_only: false,
+            render_allow: false,
+        }),
+        0x07 => Some(IoctlFlags::master_only()),
         // GEM_CLOSE — RENDER_ALLOW (no display authority needed).
         // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
         0x09 => Some(IoctlFlags::render_allow()),
@@ -288,9 +296,14 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // are blocked but plain (non-master, authenticated) clients
         // can still enumerate.
         0xA0 | 0xA7 | 0xB5 => Some(IoctlFlags::auth_only()),
-        // SETCRTC / ADDFB / ADDFB2 / RMFB — retain NARF's existing
-        // DRM_MASTER display-authority policy for framebuffer operations.
-        0xA2 | 0xAE | 0xAF | 0xB8 => Some(IoctlFlags::master_only()),
+        // SETCRTC — DRM_MASTER.
+        0xA2 => Some(IoctlFlags::master_only()),
+        // ADDFB / RMFB / ADDFB2 / CLOSEFB — drm_ioctl.c flags 0: any
+        // authenticated primary open (a compositor whose master logind
+        // dropped can still release its framebuffers); not render nodes.
+        0xAE | 0xAF | 0xB8 | 0xD0 => Some(IoctlFlags::auth_only()),
+        // GETFB / GETFB2 — drm_ioctl.c flags 0.
+        0xAD | 0xCE => Some(IoctlFlags::auth_only()),
         // PAGE_FLIP and SETPLANE — DRM_MASTER.
         0xB0 | 0xB7 => Some(IoctlFlags::master_only()),
         // ATOMIC commit — DRM_MASTER.

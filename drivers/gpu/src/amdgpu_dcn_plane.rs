@@ -5,10 +5,14 @@
 //! `dcn10_dpp_dscl.c`, `dcn30_mpc.c::mpc1_mux_plane` and
 //! `dcn20_opp.c::opp2_set_disp_pattern_generator`.
 //!
-//! Scope is one plane with the scaler and every colour-management stage bypassed
-//! and no blending, which is what an unscaled linear RGB scanout needs. A
-//! stream is blanked here, by the OPP's pattern generator, rather than at the
-//! timing generator.
+//! Scope is one plane with every colour-management stage bypassed and no
+//! blending. On DCN3.0 the DSCL scales and positions it as
+//! `dpp1_dscl_set_scaler_manual_scale` does (`Dpp::set_scaler`, the
+//! `dcn_3_0_0_offset.h` DSCL block); the modeset itself programs the
+//! scaler in bypass. A stream is blanked here, by the OPP's pattern
+//! generator, rather than at the timing generator.
+use crate::amdgpu_dcn30_scl::{u0d19, u3d19, ScalerData};
+use crate::amdgpu_dcn_color::Fixed31_32;
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
 };
@@ -34,6 +38,23 @@ const RECOUT_SIZE: u64 = 0x0d12; // linux: mmDSCL0_RECOUT_SIZE
 const MPC_SIZE: u64 = 0x0d13; // linux: mmDSCL0_MPC_SIZE
 const LB_DATA_FORMAT: u64 = 0x0d14; // linux: mmDSCL0_LB_DATA_FORMAT
 const LB_MEMORY_CTRL: u64 = 0x0d15; // linux: mmDSCL0_LB_MEMORY_CTRL
+                                    // The DSCL scaler registers, DCN3.0 only (`dcn_3_0_0_offset.h`).
+const SCL_COEF_RAM_TAP_SELECT: u64 = 0x0cf9; // linux: mmDSCL0_SCL_COEF_RAM_TAP_SELECT
+const SCL_COEF_RAM_TAP_DATA: u64 = 0x0cfa; // linux: mmDSCL0_SCL_COEF_RAM_TAP_DATA
+const SCL_TAP_CONTROL: u64 = 0x0cfc; // linux: mmDSCL0_SCL_TAP_CONTROL
+const DSCL_2TAP_CONTROL: u64 = 0x0cfe; // linux: mmDSCL0_DSCL_2TAP_CONTROL
+                                       // linux: mmDSCL0_SCL_HORZ_FILTER_SCALE_RATIO
+const SCL_HORZ_FILTER_SCALE_RATIO: u64 = 0x0d00;
+const SCL_HORZ_FILTER_INIT: u64 = 0x0d01; // linux: mmDSCL0_SCL_HORZ_FILTER_INIT
+                                          // linux: mmDSCL0_SCL_HORZ_FILTER_SCALE_RATIO_C
+const SCL_HORZ_FILTER_SCALE_RATIO_C: u64 = 0x0d02;
+const SCL_HORZ_FILTER_INIT_C: u64 = 0x0d03; // linux: mmDSCL0_SCL_HORZ_FILTER_INIT_C
+                                            // linux: mmDSCL0_SCL_VERT_FILTER_SCALE_RATIO
+const SCL_VERT_FILTER_SCALE_RATIO: u64 = 0x0d04;
+const SCL_VERT_FILTER_INIT: u64 = 0x0d05; // linux: mmDSCL0_SCL_VERT_FILTER_INIT
+                                          // linux: mmDSCL0_SCL_VERT_FILTER_SCALE_RATIO_C
+const SCL_VERT_FILTER_SCALE_RATIO_C: u64 = 0x0d07;
+const SCL_VERT_FILTER_INIT_C: u64 = 0x0d08; // linux: mmDSCL0_SCL_VERT_FILTER_INIT_C
 const DPP_STRIDE: u64 = 0x16b; // linux: mmDPP_TOP1_DPP_CONTROL - mmDPP_TOP0_DPP_CONTROL
                                // OPP block (base index 2): FMT stride 0x5a, shared by DPG and OPP_PIPE.
 const FMT_CONTROL: u64 = 0x1840; // linux: mmFMT0_FMT_CONTROL
@@ -51,6 +72,9 @@ const MPCC_TOP_SEL: u64 = 0x0000; // linux: mmMPCC0_MPCC_TOP_SEL
 const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
 const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
 const MPCC_CONTROL: u64 = 0x0003; // linux: mmMPCC0_MPCC_CONTROL
+const MPCC_BG_R_CR: u64 = 0x0009; // linux: mmMPCC0_MPCC_BG_R_CR
+const MPCC_BG_G_Y: u64 = 0x000a; // linux: mmMPCC0_MPCC_BG_G_Y
+const MPCC_BG_B_CB: u64 = 0x000b; // linux: mmMPCC0_MPCC_BG_B_CB
 const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP_SEL
 const MPCC_OGAM_CONTROL: u64 = 0x0100; // linux: mmMPCC_OGAM0_MPCC_OGAM_CONTROL
 const MPCC_GAMUT_REMAP_MODE: u64 = 0x014b; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_MODE
@@ -95,6 +119,36 @@ const SCALER_BYPASS: u32 = 0;
 /// scaler in mode 4, 5 or 6, clearing only the low two bits would have left
 /// mode 4 (`SCALING_420_LUMA_BYPASS`) behind instead of reaching bypass.
 const DSCL_MODE: u32 = 0x0000_0007; // linux: DSCL0_SCL_MODE__DSCL_MODE_MASK
+/// `DSCL_MODE_SCALING_444_RGB_ENABLE`: a scaled RGB plane.
+// linux: n/a (enum dscl_mode_sel in dcn10_dpp_dscl.c: DSCL_MODE_SCALING_444_RGB_ENABLE = 1)
+const SCALER_RGB: u32 = 1;
+/// `DSCL0_SCL_MODE` fields `dpp1_dscl_set_scl_filter` reads and writes.
+const SCL_COEF_RAM_SELECT: u32 = 0x0000_0100; // linux: DSCL0_SCL_MODE__SCL_COEF_RAM_SELECT_MASK
+                                              // linux: DSCL0_SCL_MODE__SCL_COEF_RAM_SELECT_CURRENT_MASK
+const SCL_COEF_RAM_SELECT_CURRENT: u32 = 0x0000_1000;
+// linux: DSCL0_SCL_MODE__SCL_CHROMA_COEF_MODE_MASK
+const SCL_CHROMA_COEF_MODE: u32 = 0x0001_0000;
+/// `DSCL0_DSCL_2TAP_CONTROL`: the six fields `dpp1_dscl_set_scl_filter`
+/// updates (H/V hardcoded 2-tap coefficients, sharpening and its factor).
+// linux: DSCL0_DSCL_2TAP_CONTROL__SCL_H_2TAP_HARDCODE_COEF_EN_MASK | DSCL0_DSCL_2TAP_CONTROL__SCL_H_2TAP_SHARP_EN_MASK | DSCL0_DSCL_2TAP_CONTROL__SCL_H_2TAP_SHARP_FACTOR_MASK | DSCL0_DSCL_2TAP_CONTROL__SCL_V_2TAP_HARDCODE_COEF_EN_MASK | DSCL0_DSCL_2TAP_CONTROL__SCL_V_2TAP_SHARP_EN_MASK | DSCL0_DSCL_2TAP_CONTROL__SCL_V_2TAP_SHARP_FACTOR_MASK
+const DSCL_2TAP_FIELDS: u32 = 0x0711_0711;
+/// `SCL_COEF_RAM_TAP_DATA`'s coefficient fields (bits 1:0 of each are 0
+/// in the tables) and their write enables.
+// linux: DSCL0_SCL_COEF_RAM_TAP_DATA__SCL_COEF_RAM_EVEN_TAP_COEF_MASK
+const COEF_MASK: u32 = 0x0000_3fff;
+// linux: DSCL0_SCL_COEF_RAM_TAP_DATA__SCL_COEF_RAM_EVEN_TAP_COEF_EN_MASK
+const COEF_EVEN_EN: u32 = 0x0000_8000;
+// linux: DSCL0_SCL_COEF_RAM_TAP_DATA__SCL_COEF_RAM_ODD_TAP_COEF_EN_MASK
+const COEF_ODD_EN: u32 = 0x8000_0000;
+/// `SCL_COEF_LUMA_VERT_FILTER` / `SCL_COEF_LUMA_HORZ_FILTER`
+/// (`enum dcn10_coef_filter_type_sel`).
+// linux: n/a (enum dcn10_coef_filter_type_sel in dcn10_dpp_dscl.c)
+const COEF_LUMA_VERT: u32 = 0;
+// linux: n/a (enum dcn10_coef_filter_type_sel in dcn10_dpp_dscl.c)
+const COEF_LUMA_HORZ: u32 = 1;
+/// `NUM_PHASES / 2 + 1`: the 64-phase filters store 33 symmetric phases.
+// linux: n/a (NUM_PHASES 64 in dcn10_dpp_dscl.c)
+const COEF_PHASES: usize = 64 / 2 + 1;
 /// `MPCC_TOP_SEL`/`MPCC_BOT_SEL` park with all ones.
 const MPCC_UNSET: u32 = 0xf; // linux: n/a (literal 0xf in dcn10_mpc.c:mpc1_remove_mpcc)
 
@@ -186,6 +240,83 @@ fn cnvc_format(format: Format) -> u32 {
         Format::Rgb32 => 8,  // linux: n/a (literal in dcn30_dpp.c:dpp3_cnv_setup, ARGB8888)
         Format::Rgb64 => 26, // linux: n/a (literal in dcn30_dpp.c:dpp3_cnv_setup, ARGB16161616)
     }
+}
+
+/// `dpp1_dscl_get_filter_coeffs_64p` over `dce_scl_filters.c`'s tables
+/// (the same values `amdgpu_dcn401_spl_filters` carries from SPL's copy):
+/// upscale below ratio 1, then the 1.16, 1.49 and 1.83 sets at 4/3 and
+/// 5/3. One tap has no filter.
+fn filter_64p(taps: u32, ratio: Fixed31_32) -> Option<&'static [u16]> {
+    use crate::amdgpu_dcn401_spl_filters as f;
+    let pick = |up: &'static [u16], a: &'static [u16], b: &'static [u16], c: &'static [u16]| {
+        if ratio < Fixed31_32::ONE {
+            up
+        } else if ratio < Fixed31_32::from_fraction(4, 3) {
+            a
+        } else if ratio < Fixed31_32::from_fraction(5, 3) {
+            b
+        } else {
+            c
+        }
+    };
+    Some(match taps {
+        8 => pick(
+            &f::FILTER_8TAP_64P_UPSCALE,
+            &f::FILTER_8TAP_64P_116,
+            &f::FILTER_8TAP_64P_149,
+            &f::FILTER_8TAP_64P_183,
+        ),
+        7 => pick(
+            &f::FILTER_7TAP_64P_UPSCALE,
+            &f::FILTER_7TAP_64P_116,
+            &f::FILTER_7TAP_64P_149,
+            &f::FILTER_7TAP_64P_183,
+        ),
+        6 => pick(
+            &f::FILTER_6TAP_64P_UPSCALE,
+            &f::FILTER_6TAP_64P_116,
+            &f::FILTER_6TAP_64P_149,
+            &f::FILTER_6TAP_64P_183,
+        ),
+        5 => pick(
+            &f::FILTER_5TAP_64P_UPSCALE,
+            &f::FILTER_5TAP_64P_116,
+            &f::FILTER_5TAP_64P_149,
+            &f::FILTER_5TAP_64P_183,
+        ),
+        4 => pick(
+            &f::FILTER_4TAP_64P_UPSCALE,
+            &f::FILTER_4TAP_64P_116,
+            &f::FILTER_4TAP_64P_149,
+            &f::FILTER_4TAP_64P_183,
+        ),
+        3 => pick(
+            &f::FILTER_3TAP_64P_UPSCALE,
+            &f::FILTER_3TAP_64P_116,
+            &f::FILTER_3TAP_64P_149,
+            &f::FILTER_3TAP_64P_183,
+        ),
+        2 => &f::FILTER_2TAP_64P,
+        _ => return None,
+    })
+}
+fn same_filter(a: Option<&'static [u16]>, b: Option<&'static [u16]>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => core::ptr::eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// What `struct dcn10_dpp` remembers of its DSCL between updates: the last
+/// `scl_data` programmed (`dpp1_dscl_set_scaler_manual_scale` skips an
+/// identical one) and the luma filters in the coefficient RAM
+/// (`dpp->filter_h` / `filter_v`). `dpp_reset` clears both.
+#[derive(Clone, Copy, Debug, Default)]
+struct DsclCache {
+    data: Option<ScalerData>,
+    filter_h: Option<&'static [u16]>,
+    filter_v: Option<&'static [u16]>,
 }
 
 trait Io: Send {
@@ -313,6 +444,166 @@ impl<I: Io> Block<I> {
         let reg = self.dpp(MPC_SIZE);
         self.set(reg, width | height << 16) // linux-lit: 16=DSCL0_MPC_SIZE__MPC_HEIGHT__SHIFT
     }
+    /// `dpp1_dscl_set_scaler_manual_scale` on DCN3.0 for an RGB plane (no
+    /// chroma, no per-pixel alpha, `enable_mem_low_power` off, no
+    /// `always_scale`, float DSCL data so no black offset): autocal off,
+    /// recout, MPC size, mode, the line buffer (`use_max_lb`: config 0, 63
+    /// partitions), then for a scaled plane the U3.19 ratios and phases,
+    /// taps and the 64-phase filters (`dpp1_dscl_set_scl_filter`, writing
+    /// the RAM only when a filter changed and then flipping the RAM
+    /// select). An unchanged `ScalerData` writes nothing.
+    fn dscl_set_scaler(&mut self, d: &ScalerData, cache: &mut DsclCache) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let fits = |v: i32, bits: u32| v >= 0 && v < 1 << bits;
+        if !fits(d.recout.x, 13)
+            || !fits(d.recout.y, 13)
+            || !fits(d.recout.width, 14)
+            || !fits(d.recout.height, 14)
+            || !fits(d.h_active, 14)
+            || !fits(d.v_active, 14)
+            || !(1..=8).contains(&d.h_taps)
+            || !(1..=8).contains(&d.v_taps)
+            || d.init_h.floor() > 0xf
+            || d.init_v.floor() > 0xf
+        {
+            return Err(Error::Invalid);
+        }
+        if cache.data.as_ref() == Some(d) {
+            return Ok(());
+        }
+        let identity = d.ratio_h == Fixed31_32::ONE && d.ratio_v == Fixed31_32::ONE;
+        let mode = if identity { SCALER_BYPASS } else { SCALER_RGB };
+        // Autocal off, scaler boundary mode cleared (both whole writes).
+        self.set(self.dpp(DSCL_AUTOCAL), 0)?;
+        self.set(self.dpp(DSCL_CONTROL), 0)?;
+        let reg = self.dpp(RECOUT_START);
+        // linux-lit: 16=DSCL0_RECOUT_START__RECOUT_START_Y__SHIFT
+        self.set(reg, d.recout.x as u32 | (d.recout.y as u32) << 16)?;
+        let reg = self.dpp(RECOUT_SIZE);
+        // linux-lit: 16=DSCL0_RECOUT_SIZE__RECOUT_HEIGHT__SHIFT
+        self.set(reg, d.recout.width as u32 | (d.recout.height as u32) << 16)?;
+        let reg = self.dpp(MPC_SIZE);
+        // linux-lit: 16=DSCL0_MPC_SIZE__MPC_HEIGHT__SHIFT
+        self.set(reg, d.h_active as u32 | (d.v_active as u32) << 16)?;
+        self.update(self.dpp(SCL_MODE), DSCL_MODE, mode)?;
+        // dpp1_dscl_set_lb (float format): no interleave, no alpha.
+        self.set(self.dpp(LB_DATA_FORMAT), 0)?;
+        // linux-lit: 0x3f00=63 << DSCL0_LB_MEMORY_CTRL__LB_MAX_PARTITIONS__SHIFT
+        self.set(self.dpp(LB_MEMORY_CTRL), 0x3f00)?;
+        cache.data = Some(*d);
+        if mode == SCALER_BYPASS {
+            return Ok(());
+        }
+        // dpp1_dscl_set_manual_ratio_init: U3.19 ratios and U0.19 phase
+        // fractions, each shifted into the top of a 24-bit field.
+        let ratio = |r: Fixed31_32| u3d19(r) << 5;
+        // linux-lit: 24=DSCL0_SCL_HORZ_FILTER_INIT__SCL_H_INIT_INT__SHIFT
+        let init = |i: Fixed31_32| u0d19(i) << 5 | (i.floor() as u32) << 24;
+        for (reg, value) in [
+            (SCL_HORZ_FILTER_SCALE_RATIO, ratio(d.ratio_h)),
+            (SCL_VERT_FILTER_SCALE_RATIO, ratio(d.ratio_v)),
+            (SCL_HORZ_FILTER_SCALE_RATIO_C, ratio(d.ratio_h)),
+            (SCL_VERT_FILTER_SCALE_RATIO_C, ratio(d.ratio_v)),
+            (SCL_HORZ_FILTER_INIT, init(d.init_h)),
+            (SCL_HORZ_FILTER_INIT_C, init(d.init_h)),
+            (SCL_VERT_FILTER_INIT, init(d.init_v)),
+            (SCL_VERT_FILTER_INIT_C, init(d.init_v)),
+        ] {
+            self.set(self.dpp(reg), value)?;
+        }
+        let (h, v) = (d.h_taps - 1, d.v_taps - 1);
+        // linux-lit: 4=DSCL0_SCL_TAP_CONTROL__SCL_H_NUM_TAPS__SHIFT
+        // linux-lit: 8=DSCL0_SCL_TAP_CONTROL__SCL_V_NUM_TAPS_C__SHIFT
+        // linux-lit: 12=DSCL0_SCL_TAP_CONTROL__SCL_H_NUM_TAPS_C__SHIFT
+        self.set(self.dpp(SCL_TAP_CONTROL), v | h << 4 | v << 8 | h << 12)?;
+        self.dscl_set_filters(d, cache)
+    }
+    /// `dpp1_dscl_set_scl_filter` for luma only (RGB: `chroma_coef_mode`
+    /// false). Sharpness is zero, so no 2-tap sharpening.
+    fn dscl_set_filters(&mut self, d: &ScalerData, cache: &mut DsclCache) -> Result<(), Error> {
+        let h_2tap = d.h_taps == 2;
+        let v_2tap = d.v_taps == 2;
+        // linux-lit: 16=DSCL0_DSCL_2TAP_CONTROL__SCL_V_2TAP_HARDCODE_COEF_EN__SHIFT
+        let two_tap = u32::from(h_2tap) | u32::from(v_2tap) << 16;
+        self.update(self.dpp(DSCL_2TAP_CONTROL), DSCL_2TAP_FIELDS, two_tap)?;
+        if h_2tap && v_2tap {
+            return Ok(());
+        }
+        let filter_h = filter_64p(d.h_taps, d.ratio_h);
+        let filter_v = filter_64p(d.v_taps, d.ratio_v);
+        let updated = (filter_h.is_some() && !same_filter(filter_h, cache.filter_h))
+            || (filter_v.is_some() && !same_filter(filter_v, cache.filter_v));
+        if !updated {
+            return Ok(());
+        }
+        let reg = self.dpp(SCL_MODE);
+        let scl_mode = self.access(|io| io.read(reg))?;
+        if scl_mode == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        if let (false, Some(filter)) = (h_2tap, filter_h) {
+            self.dscl_write_filter(d.h_taps, COEF_LUMA_HORZ, filter)?;
+        }
+        cache.filter_h = filter_h;
+        if let (false, Some(filter)) = (v_2tap, filter_v) {
+            self.dscl_write_filter(d.v_taps, COEF_LUMA_VERT, filter)?;
+        }
+        cache.filter_v = filter_v;
+        // Swap to the RAM just written; luma-only coefficients.
+        let current = scl_mode & SCL_COEF_RAM_SELECT_CURRENT != 0;
+        let select = if current { 0 } else { SCL_COEF_RAM_SELECT };
+        let value = scl_mode & !(SCL_COEF_RAM_SELECT | SCL_CHROMA_COEF_MODE) | select;
+        self.set(reg, value)
+    }
+    /// `dpp1_dscl_set_scaler_filter`: select the filter type at tap pair 0,
+    /// phase 0, then stream 33 phases of tap pairs (the address advances).
+    fn dscl_write_filter(&mut self, taps: u32, kind: u32, filter: &[u16]) -> Result<(), Error> {
+        let taps = taps as usize;
+        if filter.len() < COEF_PHASES * taps {
+            return Err(Error::Invalid);
+        }
+        // linux-lit: 16=DSCL0_SCL_COEF_RAM_TAP_SELECT__SCL_COEF_RAM_FILTER_TYPE__SHIFT
+        self.set(self.dpp(SCL_COEF_RAM_TAP_SELECT), kind << 16)?;
+        let data = self.dpp(SCL_COEF_RAM_TAP_DATA);
+        let pairs = taps.div_ceil(2);
+        self.access(|io| {
+            for phase in 0..COEF_PHASES {
+                for pair in 0..pairs {
+                    let even = u32::from(filter[phase * taps + 2 * pair]);
+                    let odd = if 2 * pair + 1 < taps {
+                        u32::from(filter[phase * taps + 2 * pair + 1])
+                    } else {
+                        0
+                    };
+                    io.write(
+                        data,
+                        (even & COEF_MASK)
+                            | COEF_EVEN_EN
+                            // linux-lit: 16=DSCL0_SCL_COEF_RAM_TAP_DATA__SCL_COEF_RAM_ODD_TAP_COEF__SHIFT
+                            | (odd & COEF_MASK) << 16
+                            | COEF_ODD_EN,
+                    );
+                }
+            }
+        })
+    }
+    /// [`Mpc::set_bg_color`] (DCN3.0 only).
+    fn mpc_set_bg_color(&mut self, rgb: [u16; 3]) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        for (reg, value) in [MPCC_BG_R_CR, MPCC_BG_G_Y, MPCC_BG_B_CB]
+            .into_iter()
+            .zip(rgb)
+        {
+            let reg = self.mpcc(reg);
+            // linux-lit: 0xfff=MPCC0_MPCC_BG_R_CR__MPCC_BG_R_CR_MASK
+            self.set(reg, (u32::from(value) << 2) & 0xfff)?;
+        }
+        Ok(())
+    }
     /// `mpc1_mux_plane`: bind this MPCC to a DPP and an OPP and route the OPP's
     /// output mux to it. Opaque passthrough, no bottom layer.
     fn mpc_mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
@@ -436,9 +727,10 @@ impl<I: Io> Block<I> {
     }
 }
 
-/// One owned display pipe processor, with the scaler bypassed.
+/// One owned display pipe processor: the modeset programs its scaler in
+/// bypass, [`Dpp::set_scaler`] positions and scales the plane.
 #[derive(Debug)]
-pub struct Dpp(Block<Mmio>);
+pub struct Dpp(Block<Mmio>, DsclCache);
 impl Dpp {
     /// # Safety
     /// Caller exclusively owns this DPP instance for the object's lifetime and
@@ -452,22 +744,34 @@ impl Dpp {
         if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
-        Ok(Self(Block {
-            io: Mmio {
-                regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
-                base: profile.bank(
-                    gpu,
-                    2, // linux-lit: 2=mmDPP_TOP0_DPP_CONTROL_BASE_IDX
-                    (CM_CONTROL + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
-                )?,
+        Ok(Self(
+            Block {
+                io: Mmio {
+                    regs: crate::amdgpu_reg_window::Window::new(gpu.regs),
+                    base: profile.bank(
+                        gpu,
+                        2, // linux-lit: 2=mmDPP_TOP0_DPP_CONTROL_BASE_IDX
+                        (CM_CONTROL + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
+                    )?,
+                },
+                authority,
+                instance,
+                profile,
             },
-            authority,
-            instance,
-            profile,
-        }))
+            DsclCache::default(),
+        ))
     }
+    /// The modeset's format and full-screen bypass. The DSCL cache is
+    /// dropped as `dpp_reset` drops it: the pipe was just powered.
     pub fn program(&mut self, format: Format, width: u32, height: u32) -> Result<(), Error> {
+        self.1 = DsclCache::default();
         self.0.dpp_program(format, width, height)
+    }
+    /// `dpp1_dscl_set_scaler_manual_scale` with this pipe's
+    /// [`crate::amdgpu_dcn30_scl::build`] result (DCN3.0 only). The caller
+    /// holds the OTG's pipe-control lock so it latches with the surface.
+    pub fn set_scaler(&mut self, data: &ScalerData) -> Result<(), Error> {
+        self.0.dscl_set_scaler(data, &mut self.1)
     }
 }
 
@@ -508,6 +812,14 @@ impl Mpc {
     }
     pub fn mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
         self.0.mpc_mux_plane(dpp, opp)
+    }
+    /// `mpc1_set_bg_color` on this (bottommost) MPCC: the colour shown
+    /// wherever the plane's recout does not cover the OPP. `rgb` is DC's
+    /// 10-bit `tg_color`; MPC colour is 12-bit. `dcn20_update_mpcc` sets it
+    /// from `visual_confirm_color`, all zero (black) with visual confirm
+    /// off on DCN2+.
+    pub fn set_bg_color(&mut self, rgb: [u16; 3]) -> Result<(), Error> {
+        self.0.mpc_set_bg_color(rgb)
     }
     /// Park the combiner so neither the DPP nor the OPP is still routed.
     pub fn release(&mut self, opp: u8) -> Result<(), Error> {

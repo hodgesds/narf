@@ -151,9 +151,8 @@ fn smoke_drm_legacy_addfb_user_buffer_and_rmfb() -> TestResult {
     }
     let saved = bytes;
     let arg = bytes[4..].as_mut_ptr() as usize;
+    // ADDFB has drm_ioctl.c flags 0: denied on a render node only.
     if dispatch_card(idx, 0xc01c_64ae, arg, true) != Err(FsError::PermissionDenied)
-        || crate::drm_ioctl_bridge::dispatch_card(idx, SMOKE_MASTER_ID + 1, 0xc01c_64ae, arg, false)
-            != Err(FsError::PermissionDenied)
         || bytes != saved
         || !state.lock().framebuffers.is_empty()
     {
@@ -1149,11 +1148,19 @@ fn color_blob(idx: u32, data: &[u8]) -> u32 {
     );
     u32::from_le_bytes(b[12..16].try_into().unwrap())
 }
+/// libdrm's drmModeGetPropertyBlob: a length pass, then a copy pass with
+/// exactly that length (drm_mode_getblob_ioctl copies on no other).
 fn color_blob_bytes(idx: u32, id: u32) -> Option<alloc::vec::Vec<u8>> {
-    let mut data = alloc::vec![0u8; 0x8000];
     let mut b = [0u8; 16];
     b[0..4].copy_from_slice(&id.to_le_bytes());
-    b[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+    .ok()?;
+    let mut data = alloc::vec![0u8; u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize];
     b[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     dispatch_card(
         idx,
@@ -1162,8 +1169,7 @@ fn color_blob_bytes(idx: u32, id: u32) -> Option<alloc::vec::Vec<u8>> {
         false,
     )
     .ok()?;
-    data.truncate(u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize);
-    Some(data)
+    (u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize == data.len()).then_some(data)
 }
 /// A GAMMA_LUT / legacy ramp of `n` equal-channel entries.
 fn color_lut(n: usize) -> alloc::vec::Vec<u8> {
@@ -3724,7 +3730,8 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
     {
         return TestResult::Fail("PAGE_FLIP to a short framebuffer");
     }
-    // Atomic: only the unscaled full-screen plane passes.
+    // Atomic: the primary may be positioned and scaled within DCN3.0's
+    // limits (amdgpu_dm_plane_helper_check_state).
     let plane = |fb: u32, crtc_w: u32, src_x: u32| PlaneState {
         id: ids[0],
         crtc_id: Some(11),
@@ -3756,12 +3763,46 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
         refresh_hz: 60,
         bpp: 32,
     };
+    // Full-screen; downscaled 2:1 horizontally; SRC past the framebuffer
+    // (drm_atomic_plane_check's ENOSPC); not covering a wider mode (the
+    // MPC background shows beside it).
     if check(plane(full, 64, 0), None) != Ok(())
-        || check(plane(full, 32, 0), None) != Err(FsError::InvalidData)
-        || check(plane(full, 64, 8), None) != Err(FsError::InvalidData)
-        || check(plane(full, 64, 0), Some(wide)) != Err(FsError::InvalidData)
+        || check(plane(full, 32, 0), None) != Ok(())
+        || check(plane(full, 64, 8), None) != Err(FsError::NoSpace)
+        || check(plane(full, 64, 0), Some(wide)) != Ok(())
     {
         return TestResult::Fail("atomic native plane checks");
+    }
+    // KWin's TEST_ONLY primary on a 3840x2160 CRTC: a 55x55 framebuffer
+    // shown unscaled at (1912, 1073).
+    let Ok(kwin) = addfb(55, 55, XR24) else {
+        return TestResult::Fail("55x55 framebuffer refused");
+    };
+    let uhd = crate::Mode {
+        width: 3840,
+        height: 2160,
+        refresh_hz: 60,
+        bpp: 32,
+    };
+    let at = |x: i32, y: i32, w: u32, h: u32, src: (u32, u32)| PlaneState {
+        crtc_x: x,
+        crtc_y: y,
+        crtc_w: w,
+        crtc_h: h,
+        src_w: src.0,
+        src_h: src.1,
+        ..plane(kwin, 55, 0)
+    };
+    if check(at(1912, 1073, 55, 55, (55, 55)), Some(uhd)) != Ok(()) {
+        return TestResult::Fail("KWin's positioned 55x55 primary refused");
+    }
+    // Refused like Linux: more than 16x up, a visible part under
+    // MIN_VIEWPORT_SIZE (x2 wide), entirely off the CRTC.
+    if check(at(0, 0, 32, 32, (1, 1)), Some(uhd)) != Err(FsError::InvalidData)
+        || check(at(3830, 0, 55, 55, (55, 55)), Some(uhd)) != Err(FsError::InvalidData)
+        || check(at(-100, -100, 55, 55, (55, 55)), Some(uhd)) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("out-of-range primary placement accepted");
     }
     // RMFB of the framebuffer on screen turns the CRTC off.
     if dispatch_card(
@@ -4388,6 +4429,70 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         return TestResult::Fail("ADDFB of the second native dumb handle");
     }
     let fb_b = u32::from_le_bytes(legacy[..4].try_into().unwrap());
+    // drm_mode_getfb2: the master gets a new handle of the framebuffer's BO
+    // in its own table (GEM_CLOSE of it leaves its ADDFB handle alone);
+    // another open gets 0.
+    let getfb_as = |open: u64, fb: u32, v2: bool, sys_admin: bool| {
+        let mut arg = [0u8; 104];
+        arg[0..4].copy_from_slice(&fb.to_le_bytes());
+        let cmd = if v2 {
+            iowr(DRM_IOCTL_BASE, 0xCE, 104)
+        } else {
+            iowr(DRM_IOCTL_BASE, 0xAD, 28)
+        };
+        let r = crate::drm_ioctl_bridge::amdgpu_getfb_bo(
+            idx,
+            open,
+            cmd,
+            arg.as_mut_ptr() as usize,
+            &gem,
+            sys_admin,
+        );
+        let at = if v2 { 20 } else { 24 };
+        (
+            r,
+            u32::from_le_bytes(arg[at..at + 4].try_into().unwrap()),
+            arg,
+        )
+    };
+    let getfb = |open: u64, fb: u32, v2: bool| getfb_as(open, fb, v2, false);
+    let (Some(Ok(0)), handle, arg) = getfb(OWNER, fa, true) else {
+        return TestResult::Fail("GETFB2 by the master");
+    };
+    if handle == 0
+        || handle == a.handle
+        || !gem
+            .object(handle)
+            .is_some_and(|o| alloc::sync::Arc::ptr_eq(&o, &object_a))
+        || u32::from_le_bytes(arg[4..8].try_into().unwrap()) != 200
+        || u32::from_le_bytes(arg[36..40].try_into().unwrap()) != 1024
+    {
+        return TestResult::Fail("GETFB2 handle is not a new handle of the framebuffer's BO");
+    }
+    if !gem.remove(handle) || gem.object(a.handle).is_none() {
+        return TestResult::Fail("closing the GETFB2 handle touched the ADDFB handle");
+    }
+    let (Some(Ok(0)), legacy_handle, _) = getfb(OWNER, fb_b, false) else {
+        return TestResult::Fail("GETFB by the master");
+    };
+    if legacy_handle == 0 || legacy_handle == b.handle || !gem.remove(legacy_handle) {
+        return TestResult::Fail("GETFB handle");
+    }
+    if !matches!(getfb(SMOKE_MASTER_ID, fa, true), (Some(Ok(0)), 0, _))
+        || !matches!(
+            getfb(OWNER, 0xdead, true),
+            (Some(Err(FsError::NotFound)), _, _)
+        )
+    {
+        return TestResult::Fail("GETFB2 handle for a non-master, or unknown fb");
+    }
+    // CAP_SYS_ADMIN gets one without master, as drm_mode_getfb2_ioctl.
+    let (Some(Ok(0)), admin, _) = getfb_as(SMOKE_MASTER_ID, fa, true, true) else {
+        return TestResult::Fail("GETFB2 by CAP_SYS_ADMIN");
+    };
+    if admin == 0 || !gem.remove(admin) {
+        return TestResult::Fail("GETFB2 gave CAP_SYS_ADMIN no handle");
+    }
     let show = |fb: u32| {
         let card = ms.lock();
         let fb = card.framebuffer(fb).ok()?;
@@ -4796,10 +4901,13 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     }
     // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob
     // of the native formats and the 17 GFX12 modifiers.
-    let mut data = alloc::vec![0u8; 512];
+    let want =
+        (24 + crate::amdgpu_navi48_kms::PLANE_FORMATS.len() * 4).next_multiple_of(8) + 17 * 24;
+    let mut data = alloc::vec![0u8; want];
     let mut gb = [0u8; 16];
     gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
-    gb[4..8].copy_from_slice(&512u32.to_le_bytes());
+    // drm_mode_getblob_ioctl copies only into exactly the blob's length.
+    gb[4..8].copy_from_slice(&(want as u32).to_le_bytes());
     gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     let r = dispatch_card(
         idx,
@@ -5333,10 +5441,10 @@ fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
         return TestResult::Fail("cursor zpos property");
     }
     // IN_FORMATS: ARGB8888 under DRM_FORMAT_MOD_LINEAR alone.
-    let mut data = [0u8; 128];
+    let mut data = [0u8; 56];
     let mut gb = [0u8; 16];
     gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
-    gb[4..8].copy_from_slice(&128u32.to_le_bytes());
+    gb[4..8].copy_from_slice(&56u32.to_le_bytes());
     gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     let r = dispatch_card(
         idx,
@@ -5706,3 +5814,589 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_hdmi_color_format_property
 );
+
+/// A native connector with no EDID (a disconnected port) exposes an EDID
+/// property of 0, as drm_connector_update_edid_property leaves it, and an
+/// unknown blob id is ENOENT from GETPROPBLOB (drm_mode_getblob_ioctl).
+/// KWin read the advertised-but-missing blob and got EINVAL during modeset.
+fn smoke_drm_native_connector_without_edid_has_no_edid_blob() -> TestResult {
+    use crate::drm::card::NativeOutput;
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx).unwrap();
+    ms.lock().native.push(NativeOutput {
+        connector: 31,
+        edid: None,
+        timings: vec![],
+        color_format: None,
+        broadcast_rgb: None,
+        vrr_capable: None,
+        colorspace: None,
+        hdr_output_metadata: None,
+        max_bpc: None,
+    });
+    let mut props = [0u32; 8];
+    let mut vals = [0u64; 8];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&8u32.to_le_bytes());
+    og[20..24].copy_from_slice(&31u32.to_le_bytes());
+    og[24..28].copy_from_slice(&0xc0c0_c0c0u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("OBJ_GETPROPERTIES(connector) failed");
+    }
+    let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+    let edid = props[..count.min(8)]
+        .iter()
+        .position(|&p| p == 0x51) // EDID_PROP_ID
+        .map(|i| vals[i]);
+    if edid != Some(0) {
+        return TestResult::Fail("EDID property of a connector without EDID is not 0");
+    }
+    let mut blob = [0u8; 16];
+    blob[0..4].copy_from_slice(&(0x1000u32 | 31).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        blob.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("GETPROPBLOB of a missing EDID blob is not ENOENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_native_connector_without_edid_has_no_edid_blob
+);
+
+/// drm_mode_equal / drm_crtc_state::mode_blob: two 3840x2160@60 timings
+/// (CTA 594 MHz and reduced-blanking 533.25 MHz) are different modes; the
+/// committed one is what GETCRTC and MODE_ID read back, and MODE_ID names
+/// a blob GETPROPBLOB serves — a kernel blob when the mode was not set
+/// through an atomic MODE_ID — which survives garbage collection.
+fn smoke_drm_committed_mode_identity_and_mode_id_readback() -> TestResult {
+    use crate::drm::card::{mode_equal, NativeOutput};
+    use crate::drm::ioctl::DrmModeModeInfo;
+    let rb = DrmModeModeInfo {
+        clock: 533_250,
+        hdisplay: 3840,
+        hsync_start: 3888,
+        hsync_end: 3920,
+        htotal: 4000,
+        vdisplay: 2160,
+        vsync_start: 2163,
+        vsync_end: 2168,
+        vtotal: 2222,
+        vrefresh: 60,
+        flags: 1 | 8,
+        ..Default::default()
+    };
+    let cta = DrmModeModeInfo {
+        clock: 594_000,
+        hsync_start: 4016,
+        hsync_end: 4104,
+        htotal: 4400,
+        vsync_start: 2168,
+        vsync_end: 2178,
+        vtotal: 2250,
+        flags: 1 | 4,
+        ..rb
+    };
+    if mode_equal(&rb, &cta) || !mode_equal(&cta, &cta) {
+        return TestResult::Fail("drm_mode_equal semantics");
+    }
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx).unwrap();
+    {
+        let mut card = ms.lock();
+        card.native.push(NativeOutput {
+            connector: 31,
+            edid: None,
+            timings: vec![rb, cta],
+            color_format: None,
+            broadcast_rgb: None,
+            vrr_capable: None,
+            colorspace: None,
+            hdr_output_metadata: None,
+            max_bpc: None,
+        });
+        let crtc = card.crtcs.iter_mut().find(|c| c.id == 11).unwrap();
+        crtc.enabled = true;
+        crtc.mode = Some(crate::Mode {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 60,
+            bpp: 32,
+        });
+        card.set_committed_mode(11, Some((cta, None)));
+    }
+    // GETCRTC reports the committed CTA timing, not the first published
+    // timing of the same size and refresh (the RB one).
+    let mut gc = [0u8; 104];
+    gc[12..16].copy_from_slice(&11u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xA1, 104),
+        gc.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETCRTC failed");
+    }
+    if u32::from_le_bytes(gc[36..40].try_into().unwrap()) != 594_000 {
+        return TestResult::Fail("GETCRTC did not report the committed timing");
+    }
+    // MODE_ID reads back a servable blob holding that timing.
+    let mut props = [0u32; 8];
+    let mut vals = [0u64; 8];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&8u32.to_le_bytes());
+    og[20..24].copy_from_slice(&11u32.to_le_bytes());
+    og[24..28].copy_from_slice(&0xcccc_ccccu32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("OBJ_GETPROPERTIES(crtc) failed");
+    }
+    let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+    let Some(blob) = props[..count.min(8)]
+        .iter()
+        .position(|&p| p == 0x53)
+        .map(|i| vals[i] as u32)
+        .filter(|&b| b != 0)
+    else {
+        return TestResult::Fail("MODE_ID read back 0 while a mode is lit");
+    };
+    ms.lock().collect_blobs();
+    let mut data = [0u8; 68];
+    let mut gb = [0u8; 16];
+    gb[0..4].copy_from_slice(&blob.to_le_bytes());
+    gb[4..8].copy_from_slice(&68u32.to_le_bytes());
+    gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        gb.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || u32::from_le_bytes(data[0..4].try_into().unwrap()) != 594_000
+    {
+        return TestResult::Fail("MODE_ID blob not served with the committed timing");
+    }
+    // A CRTC that loses its mode forgets its committed timing and blob.
+    {
+        let mut card = ms.lock();
+        card.crtcs.iter_mut().find(|c| c.id == 11).unwrap().mode = None;
+        card.set_committed_mode(11, None);
+        if card.mode_blob(11) != 0 || card.property_blob(blob).is_some() {
+            return TestResult::Fail("disabled CRTC kept its mode blob");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_committed_mode_identity_and_mode_id_readback
+);
+
+/// drm_mode_closefb / atomic_remove_fb: CLOSEFB of a shown framebuffer
+/// leaves it (and its CRTC) lit for the next master and frees it once off
+/// screen; a nonzero pad is EINVAL and an unknown id ENOENT. RMFB of a
+/// shown framebuffer disables its CRTC and detaches the connector.
+fn smoke_drm_closefb_keeps_scanout_and_rmfb_detaches() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let addfb = || -> Option<u32> {
+        let handle = state.lock().gem.alloc(0x8000_0000, 8192).ok()?;
+        let mut b = [0u8; 32];
+        for (dst, value) in b[..28]
+            .chunks_exact_mut(4)
+            .zip([0, 64, 32, 256, 32, 24, handle])
+        {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        dispatch_card(idx, 0xc01c_64ae, b.as_mut_ptr() as usize, false).ok()?;
+        Some(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+    };
+    let show = |fb: u32| {
+        let mut card = state.lock();
+        let crtc = card.crtcs.iter_mut().find(|c| c.id == 11).unwrap();
+        crtc.primary_fb = Some(fb);
+        crtc.enabled = true;
+        card.encoders[0].crtc_id = Some(11);
+    };
+    let closefb = |fb: u32, pad: u32| {
+        let mut b = [0u8; 8];
+        b[0..4].copy_from_slice(&fb.to_le_bytes());
+        b[4..8].copy_from_slice(&pad.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xD0, 8),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    let Some(shown) = addfb() else {
+        return TestResult::Fail("ADDFB failed");
+    };
+    show(shown);
+    if closefb(shown, 1) != Err(FsError::InvalidData) || closefb(9999, 0) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("CLOSEFB pad/unknown errno");
+    }
+    if closefb(shown, 0) != Ok(0)
+        || state.lock().framebuffer(shown).is_err()
+        || !state.lock().crtc(11).unwrap().enabled
+    {
+        return TestResult::Fail("CLOSEFB of a shown framebuffer disabled it");
+    }
+    // An unshown framebuffer goes at once.
+    let Some(hidden) = addfb() else {
+        return TestResult::Fail("second ADDFB failed");
+    };
+    if closefb(hidden, 0) != Ok(0) || state.lock().framebuffer(hidden).is_ok() {
+        return TestResult::Fail("CLOSEFB of an unshown framebuffer kept it");
+    }
+    // RMFB of a shown framebuffer: atomic_remove_fb disables and detaches.
+    let Some(other) = addfb() else {
+        return TestResult::Fail("third ADDFB failed");
+    };
+    show(other);
+    let mut rm = other.to_le_bytes();
+    if dispatch_card(idx, 0xc004_64af, rm.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("RMFB failed");
+    }
+    let card = state.lock();
+    if card.crtc(11).unwrap().enabled || card.encoders[0].crtc_id.is_some() {
+        return TestResult::Fail("RMFB left the CRTC enabled or the connector routed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_closefb_keeps_scanout_and_rmfb_detaches
+);
+
+/// drm_mode_rmfb: a framebuffer another open created is not on the
+/// caller's fb list (ENOENT) and stays; its creator removes it.
+fn smoke_drm_rmfb_of_another_open_is_enoent() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let Ok(handle) = state.lock().gem.alloc(0x8000_0000, 8192) else {
+        return TestResult::Fail("gem alloc");
+    };
+    let mut b = [0u8; 32];
+    for (dst, value) in b[..28]
+        .chunks_exact_mut(4)
+        .zip([0, 64, 32, 256, 32, 24, handle])
+    {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    if dispatch_card(idx, 0xc01c_64ae, b.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("ADDFB failed");
+    }
+    let fb = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let mut rm = fb.to_le_bytes();
+    let other = crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        SMOKE_MASTER_ID + 1,
+        0xc004_64af,
+        rm.as_mut_ptr() as usize,
+        false,
+    );
+    if other != Err(FsError::NotFound) || state.lock().framebuffer(fb).is_err() {
+        return TestResult::Fail("RMFB of another open's framebuffer was not ENOENT");
+    }
+    let mut rm = fb.to_le_bytes();
+    if dispatch_card(idx, 0xc004_64af, rm.as_mut_ptr() as usize, false) != Ok(0)
+        || state.lock().framebuffer(fb).is_ok()
+    {
+        return TestResult::Fail("RMFB by the creator failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_rmfb_of_another_open_is_enoent
+);
+
+/// drm_mode_getfb2_ioctl: size, format and pitch of the framebuffer, GEM
+/// handles 0 for a caller that may not receive them; unknown id ENOENT.
+fn smoke_drm_getfb2_reports_framebuffer() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let Ok(handle) = state.lock().gem.alloc(0x8000_0000, 8192) else {
+        return TestResult::Fail("gem alloc");
+    };
+    let mut b = [0u8; 32];
+    for (dst, value) in b[..28]
+        .chunks_exact_mut(4)
+        .zip([0, 64, 32, 256, 32, 24, handle])
+    {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    if dispatch_card(idx, 0xc01c_64ae, b.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("ADDFB failed");
+    }
+    let fb = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let mut q = [0xffu8; 104];
+    q[0..4].copy_from_slice(&fb.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xCE, 104),
+        q.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+        || u32::from_le_bytes(q[4..8].try_into().unwrap()) != 64
+        || u32::from_le_bytes(q[8..12].try_into().unwrap()) != 32
+        || u32::from_le_bytes(q[20..24].try_into().unwrap()) != 0
+        || u32::from_le_bytes(q[36..40].try_into().unwrap()) != 256
+    {
+        return TestResult::Fail("GETFB2 fields");
+    }
+    q[0..4].copy_from_slice(&9999u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xCE, 104),
+        q.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("GETFB2 unknown id is not ENOENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_getfb2_reports_framebuffer
+);
+
+/// drm_setversion + drm_getunique (libdrm's drmSetInterfaceVersion and
+/// drmGetBusid): the unique name is empty until the master asks for
+/// interface 1.1+, then "pci:DDDD:BB:SS.F", copied only into a buffer at
+/// least that long, its length always written back. A bad interface is
+/// EINVAL, SET_VERSION from a non-master EACCES.
+fn smoke_drm_set_version_and_get_unique() -> TestResult {
+    let idx = register_test_card();
+    let get_unique = |open: u64, buf: &mut [u8]| {
+        let mut u = [0u8; 16];
+        u[0..8].copy_from_slice(&(buf.len() as u64).to_le_bytes());
+        u[8..16].copy_from_slice(&(buf.as_mut_ptr() as u64).to_le_bytes());
+        let r = crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open,
+            iowr(DRM_IOCTL_BASE, 0x01, 16),
+            u.as_mut_ptr() as usize,
+            false,
+        );
+        (r, u64::from_le_bytes(u[0..8].try_into().unwrap()))
+    };
+    let set_version = |open: u64, v: [i32; 4]| {
+        let mut b = [0u8; 16];
+        for (dst, value) in b.chunks_exact_mut(4).zip(v) {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        let r = crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open,
+            iowr(DRM_IOCTL_BASE, 0x07, 16),
+            b.as_mut_ptr() as usize,
+            false,
+        );
+        let out: alloc::vec::Vec<i32> = b
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        (r, out)
+    };
+    if get_unique(SMOKE_MASTER_ID, &mut []) != (Ok(0), 0) {
+        return TestResult::Fail("GET_UNIQUE before SET_VERSION is not empty");
+    }
+    if set_version(SMOKE_MASTER_ID + 1, [1, 4, -1, -1]).0 != Err(FsError::PermissionDenied) {
+        return TestResult::Fail("SET_VERSION from a non-master");
+    }
+    let (r, out) = set_version(SMOKE_MASTER_ID, [2, 0, -1, -1]);
+    if r != Err(FsError::InvalidData) || out[..2] != [1, 4] {
+        return TestResult::Fail("SET_VERSION of interface 2.0");
+    }
+    if get_unique(SMOKE_MASTER_ID, &mut []).1 != 0 {
+        return TestResult::Fail("a refused SET_VERSION set the unique name");
+    }
+    let (r, out) = set_version(SMOKE_MASTER_ID, [1, 4, -1, -1]);
+    if r != Ok(0) || out[..2] != [1, 4] || out[2] != 1 || out[3] != 0 {
+        return TestResult::Fail("SET_VERSION 1.4");
+    }
+    let (r, len) = get_unique(SMOKE_MASTER_ID, &mut []);
+    if r != Ok(0) || len != 16 {
+        return TestResult::Fail("GET_UNIQUE length pass");
+    }
+    let mut short = [0u8; 15];
+    if get_unique(SMOKE_MASTER_ID, &mut short) != (Ok(0), 16) || short != [0; 15] {
+        return TestResult::Fail("GET_UNIQUE copied into a short buffer");
+    }
+    let mut name = [0u8; 16];
+    // Another open under this master sees the master's name.
+    if get_unique(SMOKE_MASTER_ID + 1, &mut name) != (Ok(0), 16) {
+        return TestResult::Fail("GET_UNIQUE copy pass");
+    }
+    let Ok(name) = core::str::from_utf8(&name) else {
+        return TestResult::Fail("unique name is not text");
+    };
+    let b = name.as_bytes();
+    if !name.starts_with("pci:") || b[8] != b':' || b[11] != b':' || b[14] != b'.' {
+        return TestResult::Fail("unique name is not drm_pci_set_busid's format");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_set_version_and_get_unique
+);
+
+/// drm_fb_release: closing an open removes every framebuffer on its fb
+/// list, generic-ADDFB ones included, as RMFB does (a CRTC showing one goes
+/// off); another open's framebuffers stay.
+fn smoke_drm_file_close_releases_generic_framebuffers() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    const CLOSER: u64 = SMOKE_MASTER_ID + 7;
+    let addfb = |open: u64| -> Option<u32> {
+        let handle = state.lock().gem.alloc(0x8000_0000, 8192).ok()?;
+        let mut b = [0u8; 32];
+        for (dst, value) in b[..28]
+            .chunks_exact_mut(4)
+            .zip([0, 64, 32, 256, 32, 24, handle])
+        {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open,
+            0xc01c_64ae,
+            b.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        Some(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+    };
+    let (Some(closing), Some(kept)) = (addfb(CLOSER), addfb(SMOKE_MASTER_ID)) else {
+        return TestResult::Fail("ADDFB failed");
+    };
+    {
+        let mut card = state.lock();
+        let crtc = card.crtcs.iter_mut().find(|c| c.id == 11).unwrap();
+        crtc.primary_fb = Some(closing);
+        crtc.enabled = true;
+        card.encoders[0].crtc_id = Some(11);
+    }
+    let mut card = state.lock();
+    if card.crtcs_showing_owner(CLOSER) != [11] {
+        return TestResult::Fail("the closing open's shown framebuffer not found");
+    }
+    if card.release_file_framebuffers(CLOSER) != 1
+        || card.framebuffer(closing).is_ok()
+        || card.framebuffer(kept).is_err()
+    {
+        return TestResult::Fail("file close did not remove exactly its generic framebuffer");
+    }
+    if card.crtc(11).unwrap().enabled || card.encoders[0].crtc_id.is_some() {
+        return TestResult::Fail("the CRTC showing it stayed on");
+    }
+    // Its handle names no CREATE_DUMB buffer: nothing to free.
+    if !card.take_released_backing().is_empty() {
+        return TestResult::Fail("a non-dumb framebuffer left backing to free");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_file_close_releases_generic_framebuffers
+);
+
+/// A card with cursor planes alone (Navi22): amdgpu_dm's cursor checks
+/// apply to them, the synthesized primary keeps its own, and
+/// GET_CAP CURSOR_WIDTH/HEIGHT report DC's 256-pixel cursor.
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_cursor_only_native_planes() -> TestResult {
+    use crate::drm::atomic::{AtomicState, PlaneState};
+    use crate::drm::ioctl::drm_cap;
+    const AR24: u32 = 0x3432_5241;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let (cursor, fb, narrow) = {
+        let mut card = ms.lock();
+        let crtcs: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
+        card.native_planes = crate::drm_native_planes::cursor_planes_for(&[], &crtcs);
+        let handle = card.gem.alloc(0xBEE0_0000, 64 * 64 * 4).unwrap();
+        let fb = card.addfb2(64, 64, AR24, 256, handle).unwrap();
+        let narrow = card.addfb2(50, 50, AR24, 200, handle).unwrap();
+        (crate::drm_native_planes::cursor_ids(&card)[0], fb, narrow)
+    };
+    let card = ms.lock();
+    if card.has_native_kms_planes() {
+        return TestResult::Fail("cursor planes alone counted as native primaries");
+    }
+    let crtc = card.native_plane(cursor).and_then(|p| p.cursor_of);
+    let state = |fb: u32, w: u32| {
+        let mut s = AtomicState::default();
+        s.planes.push(PlaneState {
+            id: cursor,
+            crtc_id: crtc,
+            fb_id: Some(fb),
+            crtc_x: 100,
+            crtc_y: 50,
+            crtc_w: w,
+            crtc_h: w,
+            src_w: w,
+            src_h: w,
+            ..Default::default()
+        });
+        s
+    };
+    let mode_of = |c: u32| card.crtc(c).ok().and_then(|c| c.mode);
+    if crate::drm_native_planes::check(&card, &state(fb, 64), mode_of) != Ok(alloc::vec::Vec::new())
+        || crate::drm_ioctl_bridge::check_native_atomic(&card, &state(fb, 64)) != Ok(())
+    {
+        return TestResult::Fail("valid 64x64 cursor refused");
+    }
+    // dm_check_cursor_fb: the pitch must be 64, 128 or 256 pixels.
+    if crate::drm_native_planes::check(&card, &state(narrow, 50), mode_of)
+        != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("cursor with a 50-pixel pitch accepted");
+    }
+    if crate::drm_native_planes::cursor_size_cap(&card) != Some(256) {
+        return TestResult::Fail("DCN30 cursor caps are not 256");
+    }
+    drop(card);
+    let mut cap = [0u8; 16];
+    cap[0..8].copy_from_slice(&drm_cap::CURSOR_WIDTH.to_le_bytes());
+    if crate::drm_ioctl_bridge::amdgpu_get_cap_for(
+        Some(idx),
+        iowr(DRM_IOCTL_BASE, 0x0C, 16),
+        cap.as_mut_ptr() as usize,
+    ) != Some(Ok(0))
+        || u64::from_le_bytes(cap[8..16].try_into().unwrap()) != 256
+    {
+        return TestResult::Fail("GET_CAP CURSOR_WIDTH is not 256");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_cursor_only_native_planes);

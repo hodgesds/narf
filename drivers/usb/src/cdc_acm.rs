@@ -313,9 +313,9 @@ pub struct AcmDevice {
     pub hub_port: Option<(u8, u8)>,
 }
 
-/// Global registry of bound CDC-ACM devices. Populated by
-/// [`try_bind_acm_already_addressed`]; drained by [`pump_all`].
-static ACM_DEVICES: IrqSafeSpinLock<Vec<Arc<AcmDevice>>> = IrqSafeSpinLock::new(Vec::new());
+/// Bound CDC-ACM devices, one registry per xHCI controller. Populated
+/// by [`try_bind_acm_already_addressed`]; drained by [`pump_all`].
+static ACM_DEVICES: crate::xhci::PerController<Vec<Arc<AcmDevice>>> = crate::per_controller_vec!();
 
 /// The result of scanning a configuration blob for a CDC-ACM
 /// function: the Comm + Data interface pair, the bulk endpoints
@@ -558,15 +558,16 @@ pub struct CdcAcmPort {
 }
 
 impl CdcAcmPort {
-    /// Grab the first bound CDC-ACM device, if any.
+    /// Grab the first CDC-ACM device bound on `xhci`, if any.
     pub fn first(xhci: Arc<Xhci>) -> Option<Self> {
-        let dev = ACM_DEVICES.lock().first().cloned()?;
+        let dev = ACM_DEVICES.of(xhci.id()).lock().first().cloned()?;
         Some(Self { dev, xhci })
     }
 
     /// Grab the bound CDC-ACM device on `slot_id`, if any.
     pub fn for_slot(xhci: Arc<Xhci>, slot_id: u8) -> Option<Self> {
         let dev = ACM_DEVICES
+            .of(xhci.id())
             .lock()
             .iter()
             .find(|d| d.slot_id == slot_id)
@@ -799,7 +800,7 @@ pub async fn try_bind_cdc_acm_already_addressed(
     // push is safe: an ioctl landing in between is answered
     // ENODEV, the honest state of a half-bound device.
     let tty_index = crate::cdc_acm_bridge::register_tty_acm(Arc::new(
-        crate::cdc_acm_bridge::XhciAcmTransport::new(slot_id, ifaces.capabilities),
+        crate::cdc_acm_bridge::XhciAcmTransport::new(xhci_dev.id(), slot_id, ifaces.capabilities),
     ));
 
     let dev = Arc::new(AcmDevice {
@@ -815,7 +816,7 @@ pub async fn try_bind_cdc_acm_already_addressed(
         control_lines: AtomicU16::new(CTRL_DTR | CTRL_RTS),
         hub_port,
     });
-    if should_announce_attach(slot_id) {
+    if should_announce_attach(xhci_dev.id(), slot_id) {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -824,7 +825,7 @@ pub async fn try_bind_cdc_acm_already_addressed(
             coding.baud_rate
         );
     }
-    ACM_DEVICES.lock().push(dev);
+    ACM_DEVICES.of(xhci_dev.id()).lock().push(dev);
     Ok(())
 }
 
@@ -832,9 +833,9 @@ pub async fn try_bind_cdc_acm_already_addressed(
 /// down by the supervisor): drop the binding so `pump_all` stops
 /// polling the dead slot, and withdraw its `/dev/ttyACM<N>`
 /// publication. Returns true when a binding was removed.
-pub fn detach_acm(slot_id: u8) -> bool {
+pub fn detach_acm(controller: u8, slot_id: u8) -> bool {
     let (removed, indices) = {
-        let mut g = ACM_DEVICES.lock();
+        let mut g = ACM_DEVICES.of(controller).lock();
         let indices: Vec<usize> = g
             .iter()
             .filter(|d| d.slot_id == slot_id)
@@ -850,11 +851,11 @@ pub fn detach_acm(slot_id: u8) -> bool {
     removed
 }
 
-/// Drop every ACM binding and ttyACM publication. Called on a
-/// controller recovery epoch change.
-pub fn clear_acm() {
+/// Drop every ACM binding and ttyACM publication on `controller`.
+/// Called on a controller recovery epoch change.
+pub fn clear_acm(controller: u8) {
     let indices: Vec<usize> = {
-        let mut g = ACM_DEVICES.lock();
+        let mut g = ACM_DEVICES.of(controller).lock();
         let v: Vec<usize> = g.iter().filter_map(|d| d.tty_index).collect();
         g.clear();
         v
@@ -923,15 +924,17 @@ pub fn resume_plan(dev: &AcmDevice) -> Vec<ControlXfer> {
     ]
 }
 
-/// Replay every bound device's saved state over `transport`.
+/// Replay the saved state of every device bound on `controller` over
+/// `transport` (that controller).
 /// A device that detached while suspended is absent from the
 /// registry and gets no replay; a device whose slot refuses the
 /// transfers fails typed (`DriverError`) without stopping the
 /// remaining devices' replays.
 pub async fn resume_replay<T: ControlTransport + ?Sized>(
+    controller: u8,
     transport: &T,
 ) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
-    let devs: Vec<Arc<AcmDevice>> = ACM_DEVICES.lock().clone();
+    let devs: Vec<Arc<AcmDevice>> = ACM_DEVICES.of(controller).lock().clone();
     let mut failed = false;
     for dev in &devs {
         if apply_plan(transport, dev.slot_id, &resume_plan(dev))
@@ -960,16 +963,21 @@ impl narf_power::system_pm::AsyncSystemPm for AcmSystemPm {
 
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         Box::pin(async {
-            let result = match crate::xhci::controller() {
-                Some(xhci) => resume_replay(xhci.as_ref()).await,
-                None => {
-                    if attached_count() == 0 {
-                        Ok(())
-                    } else {
-                        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
-                    }
+            // Every controller replays its own bindings; a binding whose
+            // controller is gone cannot be replayed.
+            let mut result = Ok(());
+            let controllers = crate::xhci::controllers();
+            for xhci in &controllers {
+                if let Err(e) = resume_replay(xhci.id(), xhci.as_ref()).await {
+                    result = Err(e);
                 }
-            };
+            }
+            let orphaned = ACM_DEVICES
+                .each()
+                .any(|(id, devs)| usize::from(id) >= controllers.len() && !devs.lock().is_empty());
+            if orphaned {
+                result = Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+            }
             pm_finish_resume();
             result
         })
@@ -985,9 +993,9 @@ pub fn register_pm() {
 
 /// (hub index, port) pairs with a live ACM binding — the
 /// pure-filter input for the supervisor's hub-port wake step.
-pub fn hub_ports() -> Vec<(u8, u8)> {
+pub fn hub_ports(controller: u8) -> Vec<(u8, u8)> {
     let mut v: Vec<(u8, u8)> = {
-        let g = ACM_DEVICES.lock();
+        let g = ACM_DEVICES.of(controller).lock();
         g.iter().filter_map(|d| d.hub_port).collect()
     };
     v.sort_unstable();
@@ -1006,15 +1014,16 @@ pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
     // Collect binding contexts first, then snapshot the hub
     // registry — never hold HUBS across the ACM registry lock
     // (the pumps nest the other way via `mark_port_activity`).
-    let ports = hub_ports();
+    let controller = xhci_dev.id();
+    let ports = hub_ports(controller);
     let targets = {
-        let g = crate::attach::HUBS.lock();
+        let g = crate::attach::HUBS.of(controller).lock();
         crate::attach::suspended_ports_among(&g[..], &ports)
     };
     for (hub_slot, port) in targets {
         crate::attach::resume_port(xhci_dev, hub_slot, port).await;
-        if !crate::attach::hub_port_is_suspended(hub_slot, port) {
-            crate::attach::mark_port_activity(hub_slot, port);
+        if !crate::attach::hub_port_is_suspended(controller, hub_slot, port) {
+            crate::attach::mark_port_activity(controller, hub_slot, port);
         }
     }
 }
@@ -1037,7 +1046,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         return 0;
     }
     let devs: Vec<Arc<AcmDevice>> = {
-        let g = ACM_DEVICES.lock();
+        let g = ACM_DEVICES.of(xhci_dev.id()).lock();
         g.clone()
     };
     let mut total = 0usize;
@@ -1117,7 +1126,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 /// `/dev/ttyUSB0` namespace lands.
 pub async fn send(xhci_dev: &Xhci, data: &[u8]) -> Result<usize, XhciError> {
     let devs: Vec<Arc<AcmDevice>> = {
-        let g = ACM_DEVICES.lock();
+        let g = ACM_DEVICES.of(xhci_dev.id()).lock();
         g.clone()
     };
     let dev = devs.first().ok_or(XhciError::CmdFailed(0xFC))?;
@@ -1126,7 +1135,7 @@ pub async fn send(xhci_dev: &Xhci, data: &[u8]) -> Result<usize, XhciError> {
 
 /// Number of bound ACM devices. Test + diagnostics helper.
 pub fn attached_count() -> usize {
-    ACM_DEVICES.lock().len()
+    ACM_DEVICES.each().map(|(_, devs)| devs.lock().len()).sum()
 }
 
 /// Whether binding `slot_id` should print the "serial attached"
@@ -1136,8 +1145,12 @@ pub fn attached_count() -> usize {
 /// slot announces again. (This replaces a function-local `ATTACHED`
 /// bitmask in the bind path that was never cleared on detach and
 /// permanently suppressed the banner after the first bind.)
-fn should_announce_attach(slot_id: u8) -> bool {
-    !ACM_DEVICES.lock().iter().any(|d| d.slot_id == slot_id)
+fn should_announce_attach(controller: u8, slot_id: u8) -> bool {
+    !ACM_DEVICES
+        .of(controller)
+        .lock()
+        .iter()
+        .any(|d| d.slot_id == slot_id)
 }
 
 // ── SETUP-packet builders ────────────────────────────────────────
@@ -1348,10 +1361,10 @@ pub mod tests {
     fn smoke_acm_announce_latch_replug() -> TestResult {
         const SLOT: u8 = 201; // no real enumeration reaches this slot in tests
         let baseline = attached_count();
-        if !should_announce_attach(SLOT) {
+        if !should_announce_attach(0, SLOT) {
             return TestResult::Fail("announce should be armed with no binding");
         }
-        ACM_DEVICES.lock().push(Arc::new(AcmDevice {
+        ACM_DEVICES.of(0).lock().push(Arc::new(AcmDevice {
             slot_id: SLOT,
             data_iface: 1,
             comm_iface: 0,
@@ -1367,16 +1380,16 @@ pub mod tests {
         if attached_count() != baseline + 1 {
             return TestResult::Fail("fabricated binding not registered");
         }
-        if should_announce_attach(SLOT) {
+        if should_announce_attach(0, SLOT) {
             return TestResult::Fail("announce should be latched while bound");
         }
-        if !detach_acm(SLOT) {
+        if !detach_acm(0, SLOT) {
             return TestResult::Fail("detach_acm should report the removal");
         }
         if attached_count() != baseline {
             return TestResult::Fail("binding should be gone after detach_acm");
         }
-        if !should_announce_attach(SLOT) {
+        if !should_announce_attach(0, SLOT) {
             return TestResult::Fail("announce should re-arm after detach");
         }
         TestResult::Pass
@@ -1702,7 +1715,7 @@ pub mod tests {
             control_lines: AtomicU16::new(control_lines),
             hub_port: None,
         });
-        ACM_DEVICES.lock().push(dev.clone());
+        ACM_DEVICES.of(0).lock().push(dev.clone());
         dev
     }
 
@@ -1723,7 +1736,7 @@ pub mod tests {
             CTRL_DTR,
         );
         let plan = resume_plan(&dev);
-        detach_acm(231);
+        detach_acm(0, 231);
         if plan.len() != 2 {
             return TestResult::Fail("resume plan must be the two bind transfers");
         }
@@ -1769,8 +1782,8 @@ pub mod tests {
         );
         let pa = resume_plan(&a);
         let pb = resume_plan(&b);
-        detach_acm(231);
-        detach_acm(232);
+        detach_acm(0, 231);
+        detach_acm(0, 232);
         if pa[0].w_index != 0
             || pa[0].data != [0x00, 0xC2, 0x01, 0x00, 0, 0, 8]
             || pa[1].w_value != 3
@@ -1806,9 +1819,9 @@ pub mod tests {
         let plan_a = resume_plan(&a);
         let plan_b = resume_plan(&b);
         let fake = FakeTransport::new(Vec::new());
-        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
-        detach_acm(231);
-        detach_acm(232);
+        let result = narf_scheduler::block_on_spin(resume_replay(0, &fake));
+        detach_acm(0, 231);
+        detach_acm(0, 232);
         if result.is_err() {
             return TestResult::Fail("resume replay over a healthy fake must succeed");
         }
@@ -1847,7 +1860,7 @@ pub mod tests {
         // replay must fail typed, deliver 231's plan in full,
         // and put nothing on the dead slot.
         let fake = FakeTransport::new(alloc::vec![232]);
-        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        let result = narf_scheduler::block_on_spin(resume_replay(0, &fake));
         match result {
             Err(narf_power::device_pm::DeviceSuspendError::DriverError) => {}
             _ => return TestResult::Fail("dead slot must fail the replay typed DriverError"),
@@ -1869,10 +1882,10 @@ pub mod tests {
         // Detached while suspended: 232 leaves the registry, so
         // the next replay has nothing to replay into the void —
         // it succeeds with only 231's transfers.
-        detach_acm(232);
+        detach_acm(0, 232);
         let fake2 = FakeTransport::new(Vec::new());
-        let result2 = narf_scheduler::block_on_spin(resume_replay(&fake2));
-        detach_acm(231);
+        let result2 = narf_scheduler::block_on_spin(resume_replay(0, &fake2));
+        detach_acm(0, 231);
         if result2.is_err() {
             return TestResult::Fail("replay after detach must succeed");
         }

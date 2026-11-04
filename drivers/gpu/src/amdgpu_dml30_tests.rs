@@ -101,6 +101,7 @@ fn vector_inputs(fields: &[u32]) -> Option<(Soc, Vec<Stream>)> {
             // TMDS runs the PHY at the pixel clock, DP at its link rate.
             phy_khz: if f[12] != 0 { f[0] } else { s[6] },
             odm: Odm::None,
+            scale: None,
         });
     }
     Some((soc, streams))
@@ -280,16 +281,24 @@ kernel_test_in!("drivers/gpu/dml30", dml30_uses_dcn30_parameters_not_dcn314);
 
 fn dml30_refuses_unsupported_and_unschedulable_modes() -> TestResult {
     let base = config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4);
-    // Scaling, a second cursor, interlace-like shapes and taps are out of
-    // scope (DCN30's number_of_cursors is 1).
-    let mut scaled = base;
-    scaled.plane.viewport_width = 1280;
+    // Taps on a bypassed scaler and a second cursor (DCN30's
+    // number_of_cursors is 1) are refused.
+    let mut taps = base;
+    taps.plane.h_taps = 4;
     let mut cursor = base;
     cursor.cursors = 2;
-    if plan(&scaled, &soc()) != Err(Error::Unsupported)
+    if plan(&taps, &soc()) != Err(Error::Unsupported)
         || plan(&cursor, &soc()) != Err(Error::Unsupported)
     {
         return TestResult::Fail("out-of-scope plane admitted");
+    }
+    // A viewport larger than the active area with no scaler cannot be shown.
+    let mut wide = base;
+    wide.plane.viewport_width = 2560;
+    wide.plane.surface_width = 2560;
+    wide.plane.pitch = 2560;
+    if plan(&wide, &soc()) != Err(Error::Invalid) {
+        return TestResult::Fail("unscaled viewport past the active area");
     }
     // A pixel clock above the PHY or display clock ceiling.
     let mut fast = soc();
@@ -520,3 +529,199 @@ kernel_test_in!(
     "drivers/gpu/dml30",
     dml30_admits_at_the_lowest_supporting_uclk_state
 );
+
+/// `base`'s timing showing a `vp` viewport of a surface that size in a
+/// `recout` rectangle with `taps`, the U3.19 ratios `ratio_x19`, and the
+/// one cursor DCN30 budgets.
+fn scaled(
+    base: Config,
+    vp: (u32, u32),
+    recout: (u32, u32),
+    ratio_x19: (i64, i64),
+    taps: (u32, u32),
+) -> Stream {
+    let mut config = base;
+    config.cursors = 1;
+    config.plane.viewport_width = vp.0;
+    config.plane.viewport_height = vp.1;
+    config.plane.surface_width = vp.0;
+    config.plane.surface_height = vp.1;
+    config.plane.pitch = vp.0.next_multiple_of(64);
+    config.plane.h_taps = taps.0;
+    config.plane.v_taps = taps.1;
+    let scale = Scale {
+        h_ratio: Fx::ratio(ratio_x19.0, 1 << 19),
+        v_ratio: Fx::ratio(ratio_x19.1, 1 << 19),
+        recout_width: recout.0,
+        recout_height: recout.1,
+    };
+    Stream {
+        scale: Some(scale),
+        ..Stream::tmds(config)
+    }
+}
+
+/// `value` within one unit of `want` (fixed point against DML's doubles).
+fn near(value: u32, want: f64) -> bool {
+    (value as f64 - want).abs() <= 1.0
+}
+
+fn dml30_admits_positioned_and_scaled_planes_like_linux() -> TestResult {
+    let mut base = config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4);
+    base.cursors = 1;
+    let one = 1i64 << 19;
+    let Ok(full) = plan_joint(&[Stream::tmds(base)], &soc()) else {
+        return TestResult::Fail("1080p60 refused");
+    };
+    // Positioned, unscaled (no Scale: the recout is the viewport): a quarter
+    // of the screen. The DSCL stays in bypass (16-cycle LB-only delay), the
+    // fetch is the viewport's, and a line's delivery is paced over its 960
+    // recout pixels: refclk x 960 / pclk = 50 x 960 / 148.5.
+    let mut quarter = base;
+    quarter.plane.viewport_width = 960;
+    quarter.plane.viewport_height = 540;
+    let Ok(positioned) = plan_joint(&[Stream::tmds(quarter)], &soc()) else {
+        return TestResult::Fail("positioned plane refused");
+    };
+    let p = &positioned.planes[0];
+    let (Some(pipe), Some(full_pipe)) = (p.pipes[0], full.planes[0].pipes[0]) else {
+        return TestResult::Fail("no pipe");
+    };
+    // swath_width_ub = ceil(959, 64) + 64 = 1024: 16 requests per swath.
+    if p.geometry.swath_width != 960
+        || p.geometry.swath_width_ub != 1024
+        || pipe.registers.requests.req_per_swath_ub != 16
+        || !near(
+            pipe.registers.dlg.refcyc_per_line_delivery_l,
+            50.0 * 960.0 / 148.5,
+        )
+        || !near(
+            pipe.registers.ttu.refcyc_per_req_delivery_l,
+            50.0 * 960.0 / 148.5 / 16.0 * 1024.0,
+        )
+        || p.dppclk_khz != full.planes[0].dppclk_khz
+        || p.prefetch.dst_x_after_scaler != full.planes[0].prefetch.dst_x_after_scaler
+    {
+        return TestResult::Fail("positioned plane pacing");
+    }
+
+    // 2x upscale of 960x540 into the full screen: ratio 0.5, 4 taps each way
+    // (dpp3_get_optimal_number_of_taps' upscale default). DPPCLK stays at
+    // the pixel rate (max(4/6 x 0.5, 0.25 / 2, 1) = 1), the scaler adds its
+    // 50-cycle DPP delay, the prefetch fills floor((0.5 + 4 + 1) / 2) = 2
+    // lines (3 source lines), and a PTE row of 128 source lines lasts 256
+    // destination lines.
+    let up = scaled(base, (960, 540), (1920, 1080), (one / 2, one / 2), (4, 4));
+    let Ok(up) = plan_joint(&[up], &soc()) else {
+        return TestResult::Fail("2x upscale refused");
+    };
+    let u = &up.planes[0];
+    let Some(upipe) = u.pipes[0] else {
+        return TestResult::Fail("no pipe");
+    };
+    if u.dppclk_khz != full.planes[0].dppclk_khz
+        || u.prefetch.dst_x_after_scaler <= full.planes[0].prefetch.dst_x_after_scaler
+        || u.prefetch.v_init_pre_fill != Fx::int(2)
+        || u.prefetch.prefetch_source_lines != Fx::int(3)
+        || upipe.registers.dlg.dst_y_per_pte_row_nom_l != 256 * 4
+        || upipe.registers.dlg.dst_y_per_pte_row_nom_l
+            != 2 * full_pipe.registers.dlg.dst_y_per_pte_row_nom_l
+        || !near(
+            upipe.registers.dlg.refcyc_per_line_delivery_l,
+            50.0 * 1920.0 / 148.5,
+        )
+    {
+        return TestResult::Fail("2x upscale");
+    }
+    // The cursor is paced over 256 / 0.5 destination pixels.
+    let (Some(ucur), Some(fcur)) = (upipe.cursor, full_pipe.cursor) else {
+        return TestResult::Fail("cursor TTU");
+    };
+    if ucur
+        .refcyc_per_req_delivery
+        .abs_diff(2 * fcur.refcyc_per_req_delivery)
+        > 2
+    {
+        return TestResult::Fail("upscaled cursor pacing");
+    }
+
+    // 2:1 downscale of a 3840x2160 surface onto the 1080p screen: 4 taps
+    // each way (2 x ceil(2) and ceil(2 x 2)), PSCL throughput min(4, 2 x 2
+    // / 1) = 4, DPPCLK max(4/6, 4/4, 1) x pclk. Twice the source lines per
+    // line doubles the read bandwidth; above VRatio 1 a line is delivered
+    // at the scaler's rate, swath_width_ub / (min(2 x 2, 4) x DPPCLK).
+    let down = scaled(base, (3840, 2160), (1920, 1080), (2 * one, 2 * one), (4, 4));
+    let Ok(down) = plan_joint(&[down], &soc()) else {
+        return TestResult::Fail("2:1 downscale refused");
+    };
+    let d = &down.planes[0];
+    let Some(dpipe) = d.pipes[0] else {
+        return TestResult::Fail("no pipe");
+    };
+    let dppclk_mhz = d.dppclk_khz as f64 / 1000.0;
+    if d.dppclk_khz != full.planes[0].dppclk_khz
+        || d.geometry.swath_width != 3840
+        || d.geometry.swath_width_ub != 3840
+        || dpipe.registers.dlg.dst_y_per_pte_row_nom_l
+            != full_pipe.registers.dlg.dst_y_per_pte_row_nom_l / 2
+        || !near(
+            dpipe.registers.dlg.refcyc_per_line_delivery_l,
+            50.0 * 3840.0 / (4.0 * dppclk_mhz),
+        )
+        || !near(
+            dpipe.registers.ttu.refcyc_per_req_delivery_l,
+            50.0 * 3840.0 / (4.0 * dppclk_mhz) / 60.0 * 1024.0,
+        )
+        || d.prefetch.prefetch_source_lines != Fx::int(4)
+        || down.urgent_bandwidth_thousandths <= 2 * full.urgent_bandwidth_thousandths
+    {
+        return TestResult::Fail("2:1 downscale");
+    }
+    // 3:1 needs 6 taps and more than the pixel rate from the scaler:
+    // min(4, 2 x 3) = 4 pixels per clock for 9 source pixels per output
+    // pixel: 2.25 x 148.5 MHz x 1.005 before the DFS step.
+    let three = scaled(base, (5760, 3240), (1920, 1080), (3 * one, 3 * one), (6, 6));
+    let Ok(three) = plan_joint(&[three], &soc()) else {
+        return TestResult::Fail("3:1 downscale refused");
+    };
+    if (three.planes[0].dppclk_khz as f64) < 148_500.0 * 2.25 * 1.005 {
+        return TestResult::Fail("3:1 DPPCLK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml30",
+    dml30_admits_positioned_and_scaled_planes_like_linux
+);
+
+fn dml30_refuses_scaling_linux_refuses() -> TestResult {
+    let mut base = config(148_500, 1920, 2200, 88, 44, 1080, 1125, 4);
+    base.cursors = 1;
+    let one = 1i64 << 19;
+    let refused = |s: Stream| plan_joint(&[s], &soc()) == Err(Error::Unsupported);
+    // ScaleRatioAndTapsSupport: past the 6:1 limit, more ratio than taps,
+    // an odd horizontal tap count, and taps on an identity ratio.
+    let cases = [
+        scaled(base, (1920, 1080), (240, 135), (8 * one, 8 * one), (8, 8)),
+        scaled(base, (3840, 2160), (1920, 1080), (2 * one, 2 * one), (1, 4)),
+        scaled(base, (3840, 2160), (1920, 1080), (2 * one, 2 * one), (3, 4)),
+        scaled(base, (960, 540), (960, 540), (one, one), (4, 4)),
+    ];
+    if !cases.into_iter().all(refused) {
+        return TestResult::Fail("scale ratio and taps support");
+    }
+    // 6:1 at 2160p60 needs 594 MHz x 36 / 4 of DPPCLK: one pipe cannot,
+    // and this port never splits a plane across MPC pipes.
+    let uhd = config(594_000, 3840, 4400, 176, 88, 2160, 2250, 8);
+    let six = scaled(uhd, (7680, 4320), (1280, 720), (6 * one, 6 * one), (8, 8));
+    if !refused(six) {
+        return TestResult::Fail("DPPCLK past the ceiling");
+    }
+    // A recout outside the active area is malformed.
+    let outside = scaled(base, (960, 540), (2560, 1080), (one / 2, one / 2), (4, 4));
+    if plan_joint(&[outside], &soc()) != Err(Error::Invalid) {
+        return TestResult::Fail("recout past the active area");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dml30", dml30_refuses_scaling_linux_refuses);

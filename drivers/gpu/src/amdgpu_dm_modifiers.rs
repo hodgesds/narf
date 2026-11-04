@@ -331,6 +331,93 @@ pub const fn from_tiling_flags(tiling_flags: u64, gfx12_dcc: bool) -> u64 {
         | max_comp_block << DCC_MAX_COMPRESSED_BLOCK_SHIFT
 }
 
+/// Which family's GEM_METADATA tiling-flag layout a BO's flags use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TilingFlags {
+    /// GFX12 (`convert_tiling_flags_to_modifier_gfx12`).
+    Gfx12,
+    /// GFX10.3 (`convert_tiling_flags_to_modifier`): the 5-bit swizzle mode
+    /// and the GB_ADDR_CONFIG pipe/packer counts (log2).
+    Gfx10_3 { pipes_log2: u32, packers_log2: u32 },
+}
+
+const TILE_VER_GFX9: u64 = 1;
+const TILE_VER_GFX10_RBPLUS: u64 = 3;
+const PIPE_XOR_BITS_SHIFT: u32 = 21;
+const PACKERS_SHIFT: u32 = 27;
+const DCC_INDEPENDENT_64B_SHIFT: u32 = 16;
+const DCC_INDEPENDENT_128B_SHIFT: u32 = 17;
+const DCC_CONSTANT_ENCODE_SHIFT: u32 = 20;
+
+/// convert_tiling_flags_to_modifier for a GFX10.3 (RB+) part: SWIZZLE_MODE
+/// (5 bits), DCC_OFFSET_256B and DCC_INDEPENDENT_64B. `cpp` is the first
+/// plane's bytes per pixel. A Z-microtiled or reserved swizzle is refused.
+/// (The DCC plane offsets/pitches Linux also derives are not modelled: this
+/// card scans out only LINEAR, so any non-zero swizzle is refused there.)
+pub const fn from_tiling_flags_gfx10_3(
+    tiling_flags: u64,
+    cpp: u32,
+    pipes_log2: u32,
+    packers_log2: u32,
+) -> Result<u64, FbError> {
+    let swizzle = tiling_flags & 0x1f;
+    if swizzle == 0 {
+        return Ok(LINEAR);
+    }
+    let has_xor = swizzle >= 16;
+    let block_size_bits: u32 = match swizzle >> 2 {
+        0 => 8,
+        1 | 5 => 12,
+        2 | 4 | 6 => 16,
+        7 => 18,
+        _ => return Err(FbError::Invalid),
+    };
+    let mut version = TILE_VER_GFX10_RBPLUS;
+    match swizzle & 3 {
+        0 => return Err(FbError::Invalid),
+        1 if !has_xor => version = TILE_VER_GFX9,
+        2 if !has_xor && cpp != 4 => version = TILE_VER_GFX9,
+        _ => {}
+    }
+    let (mut pipe_xor_bits, mut packers) = (0u64, 0u64);
+    if has_xor {
+        // Only RB+ keeps XOR here (GFX9 is chosen only without XOR).
+        let room = block_size_bits - 8;
+        let pipe = if pipes_log2 < room { pipes_log2 } else { room };
+        let left = room - pipe;
+        pipe_xor_bits = pipe as u64;
+        packers = (if packers_log2 < left {
+            packers_log2
+        } else {
+            left
+        }) as u64;
+    }
+    let mut modifier = AMD_FMT_MOD
+        | version << TILE_VERSION_SHIFT
+        | swizzle << TILE_SHIFT
+        | pipe_xor_bits << PIPE_XOR_BITS_SHIFT
+        | packers << PACKERS_SHIFT;
+    if (tiling_flags >> 5) & 0xff_ffff != 0 {
+        let i64b = (tiling_flags >> 43) & 1;
+        let i128b = (version >= TILE_VER_GFX10_RBPLUS) as u64;
+        // AMD_FMT_MOD_DCC_BLOCK_64B / _128B / _256B.
+        let max_block = if i64b != 0 {
+            0
+        } else if i128b != 0 {
+            1
+        } else {
+            2
+        };
+        // Constant encode: every part after Raven and before GFX11.
+        modifier |= 1 << DCC_SHIFT
+            | 1 << DCC_CONSTANT_ENCODE_SHIFT
+            | i64b << DCC_INDEPENDENT_64B_SHIFT
+            | i128b << DCC_INDEPENDENT_128B_SHIFT
+            | max_block << DCC_MAX_COMPRESSED_BLOCK_SHIFT;
+    }
+    Ok(modifier)
+}
+
 /// Why a framebuffer is refused: `framebuffer_check` and amdgpu's checks
 /// return -EINVAL for all of them except the -ERANGE overflows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -516,6 +603,7 @@ pub fn check_amdgpu_fb(
     tiling_flags: u64,
     gfx12_dcc: bool,
     bo_size: u64,
+    layout: TilingFlags,
 ) -> Result<u64, FbError> {
     if !plane_formats.contains(&r.pixel_format)
         || !format_mod_supported(r.pixel_format, r.modifier[0])
@@ -530,7 +618,13 @@ pub fn check_amdgpu_fb(
     let modifier = if r.flags & FB_MODIFIERS != 0 {
         r.modifier[0]
     } else {
-        from_tiling_flags(tiling_flags, gfx12_dcc)
+        match layout {
+            TilingFlags::Gfx12 => from_tiling_flags(tiling_flags, gfx12_dcc),
+            TilingFlags::Gfx10_3 {
+                pipes_log2,
+                packers_log2,
+            } => from_tiling_flags_gfx10_3(tiling_flags, info.cpp[0], pipes_log2, packers_log2)?,
+        }
     };
     verify_sizes(info, r, modifier, bo_size)?;
     Ok(modifier)
@@ -661,8 +755,17 @@ mod tests {
     fn addfb_result(cmd: &FbCmd, tiling: u64, dcc: bool, bo: u64) -> String {
         use core::fmt::Write;
         let mut out = String::new();
-        let r = check_fb_cmd(cmd)
-            .and_then(|info| check_amdgpu_fb(cmd, &info, &DM_PLANE_FORMATS, tiling, dcc, bo));
+        let r = check_fb_cmd(cmd).and_then(|info| {
+            check_amdgpu_fb(
+                cmd,
+                &info,
+                &DM_PLANE_FORMATS,
+                tiling,
+                dcc,
+                bo,
+                TilingFlags::Gfx12,
+            )
+        });
         match r {
             Ok(m) => {
                 let _ = write!(out, "0 {m:x}");
@@ -717,4 +820,47 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/drm", amd_modifiers_gfx12_list_shape);
+
+    /// GFX10.3 GEM_METADATA tiling flags convert as Linux's
+    /// convert_tiling_flags_to_modifier, and a Z swizzle whose low three
+    /// bits are clear (8, 24) is refused instead of read as GFX12 LINEAR.
+    fn amd_modifiers_gfx10_3_tiling_flags() -> TestResult {
+        let f = |flags: u64, cpp: u32| from_tiling_flags_gfx10_3(flags, cpp, 3, 2);
+        if f(0, 4) != Ok(LINEAR) {
+            return TestResult::Fail("swizzle 0 is not LINEAR");
+        }
+        for z in [8u64, 24, 4] {
+            if f(z, 4).is_ok() {
+                return TestResult::Fail("Z-microtiled swizzle accepted");
+            }
+            if from_tiling_flags(z, false) == LINEAR && z & 7 != 0 {
+                return TestResult::Fail("fixture swizzle not a GFX12 aliasing case");
+            }
+        }
+        // 64K_R_X: 64 KiB blocks, XOR, RB+: pipe xor min(8, 3), packers
+        // min(8 - 3, 2).
+        let r_x = AMD_FMT_MOD | 3 | 27 << 8 | 3 << 21 | 2 << 27;
+        if f(27, 4) != Ok(r_x) {
+            return TestResult::Fail("64K_R_X modifier");
+        }
+        // 64K_S without XOR is GFX9 layout; 64K_D keeps RB+ only at 4 bpp.
+        if f(9, 4) != Ok(AMD_FMT_MOD | 1 | 9 << 8)
+            || f(10, 4) != Ok(AMD_FMT_MOD | 3 | 10 << 8)
+            || f(10, 2) != Ok(AMD_FMT_MOD | 1 | 10 << 8)
+        {
+            return TestResult::Fail("non-XOR version selection");
+        }
+        // DCC at offset 1 (×256): constant encode, independent 128B, max
+        // compressed block 128B.
+        let dcc = r_x | 1 << 13 | 1 << 20 | 1 << 17 | 1 << 18;
+        if f(27 | 1 << 5, 4) != Ok(dcc) {
+            return TestResult::Fail("RB+ DCC modifier bits");
+        }
+        let dcc64 = r_x | 1 << 13 | 1 << 20 | 1 << 16 | 1 << 17;
+        if f(27 | 1 << 5 | 1 << 43, 4) != Ok(dcc64) {
+            return TestResult::Fail("independent-64B DCC modifier bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/drm", amd_modifiers_gfx10_3_tiling_flags);
 }

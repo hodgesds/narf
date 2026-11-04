@@ -18,6 +18,7 @@
 //! Scope: 8b/10b SST, RGB, 6/8/10 bpc, no MST/DSC/FEC/PSR. The link policy
 //! (capabilities, LTTPR modes, training, fallback, link loss) lives in
 //! `amdgpu_dcn30_dp_link`, driving [`DioSource`].
+use crate::amdgpu_hdr::{DcColorSpace, HdrOutputMetadata};
 use crate::{
     amdgpu_dcn30_dp_link as link_layer,
     amdgpu_dcn30_takeover::Regs,
@@ -125,6 +126,8 @@ const DP_SEC_CNTL: u64 = 0x212b;
 const DP_SEC_STREAM_ENABLE: u32 = 1 << 0;
 // linux: DP0_DP_SEC_CNTL__DP_SEC_GSP0_ENABLE_MASK
 const DP_SEC_GSP0_ENABLE: u32 = 1 << 20;
+// linux: DP0_DP_SEC_CNTL__DP_SEC_GSP3_ENABLE_MASK
+const DP_SEC_GSP3_ENABLE: u32 = 1 << 23;
 // linux: mmDP0_DP_SEC_FRAMING4
 const DP_SEC_FRAMING4: u64 = 0x2130;
 // linux: DP0_DP_SEC_FRAMING4__DP_SST_SDP_SPLITTING_MASK
@@ -210,6 +213,7 @@ pub enum Depth {
     Bpc6,
     Bpc8,
     Bpc10,
+    Bpc12,
 }
 impl Depth {
     /// `DP_COMPONENT_PIXEL_DEPTH_*`, which is also MSA MISC0's bpc code.
@@ -221,6 +225,8 @@ impl Depth {
             Depth::Bpc8 => 1,
             // linux: n/a (DP_COMPONENT_PIXEL_DEPTH_10BPC = 2, dc/inc/hw/stream_encoder.h; not in checker sets)
             Depth::Bpc10 => 2,
+            // linux: n/a (DP_COMPONENT_PIXEL_DEPTH_12BPC = 3, dc/inc/hw/stream_encoder.h; not in checker sets)
+            Depth::Bpc12 => 3,
         }
     }
     pub fn bits_per_pixel(self) -> u8 {
@@ -228,20 +234,50 @@ impl Depth {
             Depth::Bpc6 => 18,
             Depth::Bpc8 => 24,
             Depth::Bpc10 => 30,
+            Depth::Bpc12 => 36,
         }
+    }
+    /// Bits per component.
+    pub fn bpc(self) -> u8 {
+        self.bits_per_pixel() / 3
     }
 }
 
-/// `mod_build_vsc_infopacket` revision 5 (`use_vsc_sdp_for_colorimetry`):
-/// HB 00 07 05 13; DB16 = pixel encoding << 4 | colorimetry (RGB, sRGB: 0),
-/// DB17 = bpc code (full range), DB18 = content type 0. Laid out as the
-/// 36-byte HB0..3 + SB0..31 packet the VPG takes.
-pub fn vsc_packet(depth: Depth) -> [u8; 36] {
+/// `mod_build_vsc_infopacket` revision 5 (`use_vsc_sdp_for_colorimetry`)
+/// for an RGB stream: HB 00 07 05 13; DB16 = pixel encoding (RGB 0) << 4 |
+/// colorimetry (sRGB 0, AdobeRGB 3, ITU-R BT.2020 RGB 6), DB17 = bpc code
+/// with bit 7 for a limited-range colour space, DB18 = content type 0.
+/// Laid out as the 36-byte HB0..3 + SB0..31 packet the VPG takes.
+pub fn vsc_packet(depth: Depth, colorspace: DcColorSpace) -> [u8; 36] {
     let mut p = [0u8; 36];
     // linux-lit: 0x07=DP_SDP_VSC
     p[..4].copy_from_slice(&[0x00, 0x07, 0x05, 0x13]);
+    // linux: n/a (ColorimetryRGB_DP_* in info_packet.c:mod_build_vsc_infopacket)
+    p[4 + 16] = match colorspace {
+        DcColorSpace::AdobeRgb => 3,
+        DcColorSpace::Rgb2020Full | DcColorSpace::Rgb2020Limited => 6,
+        _ => 0,
+    };
+    let limited = matches!(
+        colorspace,
+        DcColorSpace::SrgbLimited | DcColorSpace::Rgb2020Limited
+    );
     // linux: n/a (VSC SDP DB17 at SB17; info_packet.c:mod_build_vsc_infopacket)
-    p[4 + 17] = depth.code() as u8;
+    p[4 + 17] = depth.code() as u8 | if limited { 0x80 } else { 0 };
+    p
+}
+
+/// amdgpu_dm's fill_hdr_info_packet for a DP connector: the HDR static
+/// metadata SDP (HB 00 87 1D 4C, SB0 version 1, SB1 length 26, then the
+/// CTA-861 Dynamic Range and Mastering InfoFrame's 26 payload bytes).
+pub fn hdr_sdp_packet(metadata: &HdrOutputMetadata) -> [u8; 36] {
+    let frame = crate::amdgpu_hdr::drm_infoframe(metadata);
+    let mut p = [0u8; 36];
+    // linux: n/a (sdp id 0, type 0x87, payload len - 1 0x1D, version 0x13 << 2; amdgpu_dm.c:fill_hdr_info_packet)
+    p[..4].copy_from_slice(&[0x00, 0x87, 0x1d, 0x13 << 2]);
+    p[4] = 0x01;
+    p[5] = 0x1a;
+    p[6..32].copy_from_slice(&frame[4..30]);
     p
 }
 
@@ -484,18 +520,30 @@ impl Stream {
         }
         self.update(VPG_GSP_IMMEDIATE_UPDATE_CTRL, 1 << index, 1 << index)
     }
-    /// `enc3_stream_encoder_update_dp_info_packets` with only a VSC SDP
-    /// (or nothing): VPG generic 0 and 1, GSP0 enabled, the secondary
-    /// stream on while anything is.
-    pub async fn update_info_packets(&mut self, vsc: Option<&[u8; 36]>) -> Result<(), Error> {
+    /// `enc3_stream_encoder_update_dp_info_packets` with a VSC SDP (VPG
+    /// generic 0 and 1, GSP0) and the HDR static metadata SDP (generic 3,
+    /// GSP3), each when present; the secondary stream on while anything is.
+    pub async fn update_info_packets(
+        &mut self,
+        vsc: Option<&[u8; 36]>,
+        hdr: Option<&[u8; 36]>,
+    ) -> Result<(), Error> {
         if let Some(vsc) = vsc {
             self.vpg_packet(0, vsc).await?;
             self.vpg_packet(1, vsc).await?;
+        }
+        if let Some(hdr) = hdr {
+            self.vpg_packet(3, hdr).await?;
         }
         self.update(
             DP_SEC_CNTL,
             DP_SEC_GSP0_ENABLE,
             if vsc.is_some() { DP_SEC_GSP0_ENABLE } else { 0 },
+        )?;
+        self.update(
+            DP_SEC_CNTL,
+            DP_SEC_GSP3_ENABLE,
+            if hdr.is_some() { DP_SEC_GSP3_ENABLE } else { 0 },
         )?;
         if self.read(DP_SEC_CNTL)? != 0 {
             self.update(DP_SEC_CNTL, DP_SEC_STREAM_ENABLE, DP_SEC_STREAM_ENABLE)?;

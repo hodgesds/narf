@@ -70,6 +70,7 @@ pub fn request_broadcast_rgb(value: u8) {
 }
 pub fn restore_displays() {
     if navi22() {
+        crate::amdgpu_navi22_platform::release_client_scanout_async();
         crate::amdgpu_navi22_kms::restore_displays()
     } else {
         crate::amdgpu_navi48_platform::restore_displays()
@@ -162,6 +163,17 @@ pub fn display_admits_planes(
             display, connector, mode, fourcc, setup,
         )
         .is_ok()
+}
+/// DC's validation of a positioned or scaled primary of an `fb` (pitch in
+/// bytes, width, height) on a CRTC of `mode` (Navi22's lit stream; other
+/// cards validate their planes elsewhere).
+pub fn primary_placement_admitted(
+    fb: (u32, u32, u32),
+    mode: (u32, u32),
+    src: (u32, u32, u32, u32),
+    dst: (i32, i32, u32, u32),
+) -> bool {
+    !navi22() || crate::amdgpu_navi22_platform::placement_admitted(fb, mode, src, dst)
 }
 /// Present an atomic commit's planes on display `display` (Navi48).
 pub fn present_planes(
@@ -271,13 +283,15 @@ pub fn hdr_metadata_valid(blob: &[u8]) -> bool {
     crate::amdgpu_hdr::HdrOutputMetadata::from_blob(blob).is_ok()
 }
 /// A DRM cursor plane commit on display `display`: its image at CRTC_X/Y,
-/// or off (Navi48 only: Navi22 exposes no cursor plane, its cursor ioctls
-/// keep driving the console's pointer).
+/// or off, on the display's hardware cursor.
 pub fn request_display_cursor(
     display: u8,
     image: Option<crate::amdgpu_navi48_platform::CursorContent>,
     position: (i32, i32),
 ) -> bool {
-    !navi22()
-        && crate::amdgpu_navi48_platform::request_display_cursor_content(display, image, position)
+    if navi22() {
+        crate::amdgpu_navi22_platform::request_display_cursor(display, image, position)
+    } else {
+        crate::amdgpu_navi48_platform::request_display_cursor_content(display, image, position)
+    }
 }
