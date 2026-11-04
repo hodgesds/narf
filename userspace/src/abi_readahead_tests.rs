@@ -36,9 +36,27 @@ const MADV_WILLNEED: u64 = 3;
 const O_RDWR: u32 = 2;
 const PAGE: u64 = 4096;
 const SECTOR: u64 = 512;
-/// First sector of the fixture image's data area (boot + 2 FATs + root
-/// directory occupy sectors 0..4 in `fat12_image`).
-const DATA_LBA: u64 = 4;
+/// Sectors in one FAT copy of a fixture image holding `clusters`
+/// clusters. FAT12 packs each entry into 1.5 bytes, so one sector
+/// covers 341 entries — and the builder writes entries
+/// `0..=clusters + 1` (the reserved pair plus the chain), so a longer
+/// chain needs a wider FAT. The 512 KiB fixtures below hold 1024
+/// clusters and need four sectors; their original one-sector FAT sent
+/// `fat12_set` out of bounds (entry 341 writes byte 512 of 512) and
+/// panicked the kernel inside the per-open-state smoke.
+fn fat_sectors(clusters: u32) -> u32 {
+    // The highest entry written is `clusters + 1`; it touches bytes
+    // `idx + idx / 2` and `idx + idx / 2 + 1`, so a FAT copy needs
+    // `last + last / 2 + 2` bytes.
+    let last = clusters + 1;
+    (last + last / 2 + 2).div_ceil(SECTOR as u32)
+}
+
+/// First sector of the fixture image's data area (boot sector, two
+/// FAT copies and the root directory precede it in `fat12_image`).
+fn fat12_data_lba(clusters: u32) -> u64 {
+    2 + 2 * u64::from(fat_sectors(clusters))
+}
 
 type FatVolume = narf_drivers_fs_fat::volume::FatVolume<CountingBlockDevice>;
 
@@ -184,12 +202,13 @@ fn with_fat_file(
                     .ok_or("lookup of NARF.TXT failed")?;
             let fd = install_rdwr(&ops)?;
             let clusters = (data.len() as u64).div_ceil(SECTOR);
+            let data_lba = fat12_data_lba(clusters as u32);
             body(&Fixture {
                 aspace,
                 device,
                 volume,
                 fd,
-                data_span: (DATA_LBA, DATA_LBA + clusters),
+                data_span: (data_lba, data_lba + clusters),
             })
         })();
         crate::handlers::restore_address_space_lookup(None);
@@ -213,12 +232,18 @@ fn install_rdwr(ops: &Arc<dyn FileOps>) -> Result<u64, &'static str> {
 }
 
 /// Byte-built FAT12 image holding one file, `NARF.TXT`, whose content is
-/// `data` spread over a cluster chain (512-byte clusters, one-sector
-/// FATs). Same builder as `abi_truncate_unmap_tests`.
+/// `data` spread over a cluster chain (512-byte clusters). Same builder
+/// as `abi_truncate_unmap_tests`, sizing included: each FAT copy is
+/// `fat_sectors(clusters)` sectors wide so the chain always fits — for
+/// the small files that is one sector and the layout is the historical
+/// boot + FAT + FAT + root directory + data.
 fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
     use alloc::vec;
     const LBS: usize = 512;
     fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
+        // Contract: `fat` covers entry `idx` — bytes `idx + idx / 2`
+        // and `idx + idx / 2 + 1`. The caller passes a whole FAT copy
+        // sized by `fat_sectors`, which covers every entry written.
         let off = (idx + idx / 2) as usize;
         let v = val & 0x0FFF;
         if idx % 2 == 0 {
@@ -230,7 +255,9 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
         }
     }
     let clusters = (data.len() as u32).div_ceil(LBS as u32);
-    let total_sectors = 4 + clusters;
+    let fat_secs = fat_sectors(clusters);
+    let data_sec = 2 + 2 * fat_secs;
+    let total_sectors = data_sec + clusters;
     let mut img = vec![0u8; LBS * total_sectors as usize];
     img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
     img[3..11].copy_from_slice(b"NARFFAT ");
@@ -241,11 +268,12 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
     img[17..19].copy_from_slice(&16u16.to_le_bytes()); // root_ent_cnt
     img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
     img[21] = 0xF8; // media
-    img[22..24].copy_from_slice(&1u16.to_le_bytes()); // fat_sz_16
+    img[22..24].copy_from_slice(&(fat_secs as u16).to_le_bytes()); // fat_sz_16
     img[510] = 0x55;
     img[511] = 0xAA;
-    for lba in [1usize, 2] {
-        let fat = &mut img[lba * LBS..lba * LBS + LBS];
+    for copy in 0..2 {
+        let fat_start = (1 + copy * fat_secs) as usize;
+        let fat = &mut img[fat_start * LBS..fat_start * LBS + fat_secs as usize * LBS];
         fat12_set(fat, 0, 0xFF8);
         fat12_set(fat, 1, 0xFFF);
         for c in 0..clusters {
@@ -254,12 +282,12 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
             fat12_set(fat, idx, val as u16);
         }
     }
-    let entry = &mut img[3 * LBS..3 * LBS + 32];
+    let entry = &mut img[(data_sec as usize - 1) * LBS..(data_sec as usize - 1) * LBS + 32];
     entry[0..11].copy_from_slice(b"NARF    TXT");
     entry[11] = 0x20; // ARCHIVE
     entry[26..28].copy_from_slice(&2u16.to_le_bytes()); // fst_clus_lo
     entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    img[4 * LBS..4 * LBS + data.len()].copy_from_slice(data);
+    img[data_sec as usize * LBS..data_sec as usize * LBS + data.len()].copy_from_slice(data);
     img
 }
 
@@ -415,7 +443,7 @@ fn smoke_readahead_eof_clamp() -> TestResult {
         // design. The claim under test is narrower: the *populated*
         // page's own sectors are not read again, so count only page
         // 2's sector range (8 sectors per page in this fixture).
-        let page2_lo = DATA_LBA + 2 * (PAGE / SECTOR);
+        let page2_lo = fx.data_span.0 + 2 * (PAGE / SECTOR);
         let before = fx
             .device
             .blocks_read_between(page2_lo, page2_lo + PAGE / SECTOR);
@@ -569,4 +597,207 @@ fn smoke_readahead_write_coherence() -> TestResult {
 kernel_test_in!(
     "syscall_abi/readahead/write_coherence",
     smoke_readahead_write_coherence
+);
+
+// ── Read(2)-path readahead (#743) ──────────────────────────────────
+//
+// The tests above advise population explicitly (`readahead(2)`,
+// `MADV_WILLNEED`). These prove the implicit path: an ordinary
+// sequential `read(2)` stream populates ahead of itself through the
+// per-open-description pattern state, with the same counting device
+// as the witness. Sector arithmetic throughout: one page is 8 data
+// sectors in this fixture; the initial window is 128 KiB = 32 pages
+// = 256 sectors; the window doubles after each populated window.
+
+fn read_into(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    call(
+        Syscall::Read.raw(),
+        a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+    )
+}
+
+fn pread_into(fd: u64, buf: &mut [u8], offset: u64) -> Option<i64> {
+    call(
+        Syscall::Pread64.raw(),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, offset),
+    )
+}
+
+fn lseek_set(fd: u64, offset: u64) -> Option<i64> {
+    call(Syscall::Lseek.raw(), a2(fd, offset, 0))
+}
+
+/// Two sequential page reads open the initial window: the first only
+/// candidates the stream (no speculative I/O), the second confirms it
+/// and populates 128 KiB ahead of the consumed bytes. The served
+/// bytes still come from the ordinary read path and are unchanged.
+fn smoke_read_readahead_sequential_populates() -> TestResult {
+    let bytes = content(0x31, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        if fx.data_blocks_read() != 0 {
+            return Err("the fixture read file data before any read");
+        }
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("first sequential read did not return a full page");
+        }
+        if buf[..] != bytes[..PAGE as usize] {
+            return Err("first sequential read served the wrong bytes");
+        }
+        // Candidate only: exactly the requested page's 8 sectors moved.
+        if fx.data_blocks_read() != 8 {
+            return Err("the first read of a stream already speculated");
+        }
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("second sequential read did not return a full page");
+        }
+        if buf[..] != bytes[PAGE as usize..2 * PAGE as usize] {
+            return Err("second sequential read served the wrong bytes");
+        }
+        // 16 served sectors + the 256-sector initial window (pages
+        // 2..34) populated ahead of the consumption offset.
+        if fx.data_blocks_read() != 272 {
+            return Err("the confirmed stream did not populate the initial window");
+        }
+        let window_lo = fx.data_span.0 + 16;
+        if fx.device.blocks_read_between(window_lo, window_lo + 256) != 256 {
+            return Err("the populated window is not the span ahead of the stream");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/sequential_populates",
+    smoke_read_readahead_sequential_populates
+);
+
+/// Scattered positioned reads never confirm a stream, so they cause
+/// no speculative device reads at all; and a seek — even to the exact
+/// offset the stream would have continued at — resets the pattern,
+/// so the read after it only candidates afresh.
+fn smoke_read_readahead_random_and_seek_no_speculation() -> TestResult {
+    let bytes = content(0x52, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        for page in [0u64, 64, 32, 96] {
+            if pread_into(fx.fd, &mut buf, page * PAGE) != Some(PAGE as i64) {
+                return Err("a scattered pread did not return a full page");
+            }
+        }
+        // Four requested pages, 8 sectors each, and nothing else.
+        if fx.data_blocks_read() != 32 {
+            return Err("scattered reads caused speculative device reads");
+        }
+        let fd2 = fx.reopen()?;
+        if read_into(fd2, &mut buf) != Some(PAGE as i64) {
+            return Err("the seek-test stream's first read failed");
+        }
+        if lseek_set(fd2, PAGE) != Some(PAGE as i64) {
+            return Err("lseek to the continuation offset failed");
+        }
+        if read_into(fd2, &mut buf) != Some(PAGE as i64) {
+            return Err("the read after the seek failed");
+        }
+        // Two more served pages (16 sectors) and — because the seek
+        // reset the pattern — no 256-sector window behind the second.
+        if fx.data_blocks_read() != 48 {
+            return Err("a seek to the continuation offset did not reset the pattern");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/random_and_seek",
+    smoke_read_readahead_random_and_seek_no_speculation
+);
+
+/// A page populated by a sequential read stream is already in the
+/// shared cache when an mmap fault reaches it: the fault installs it
+/// (and its fault-around window, itself fully populated) with zero
+/// new device reads.
+fn smoke_read_readahead_populates_for_mmap() -> TestResult {
+    let bytes = content(0x74, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64)
+            || read_into(fx.fd, &mut buf) != Some(PAGE as i64)
+        {
+            return Err("the sequential reads that open the window failed");
+        }
+        if fx.data_blocks_read() != 272 {
+            return Err("the stream did not populate the initial window");
+        }
+        let base = map_shared(fx.fd, 512 * 1024)?;
+        let before = fx.data_blocks_read();
+        // Page 20 sits inside the populated window (pages 2..34); its
+        // fault-around window (pages 16..32) is populated too.
+        fault(&fx.aspace, base + 20 * PAGE)?;
+        if fx.data_blocks_read() != before {
+            return Err("faulting a read-ahead page re-read data sectors");
+        }
+        let want = &bytes[20 * PAGE as usize..21 * PAGE as usize];
+        if mapped_bytes(&fx.aspace, base + 20 * PAGE, PAGE as usize)? != want {
+            return Err("the faulted read-ahead page serves the wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/populates_for_mmap",
+    smoke_read_readahead_populates_for_mmap
+);
+
+/// Pattern state is per open description: two opens of the same file
+/// interleaved read-by-read keep independent streams. The exact total
+/// also pins window growth — the first stream's second window is the
+/// doubled 256 KiB, not another 128 KiB.
+fn smoke_read_readahead_per_open_state() -> TestResult {
+    let bytes = content(0x96, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        let fd_b = fx.reopen()?;
+        // A candidates (page 0); B candidates elsewhere (page 40).
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("A's first read failed");
+        }
+        if pread_into(fd_b, &mut buf, 40 * PAGE) != Some(PAGE as i64) {
+            return Err("B's first read failed");
+        }
+        if buf[..] != bytes[40 * PAGE as usize..41 * PAGE as usize] {
+            return Err("B's read served the wrong bytes");
+        }
+        // A confirms at page 1: 8 served + 256 populated (pages 2..34).
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("A's second read failed");
+        }
+        if fx.data_blocks_read() != 280 {
+            return Err("A's window did not open on its own stream");
+        }
+        // B jumps to page 100: a reset for B, no speculation, and A's
+        // state undisturbed.
+        if pread_into(fd_b, &mut buf, 100 * PAGE) != Some(PAGE as i64) {
+            return Err("B's scattered read failed");
+        }
+        if fx.data_blocks_read() != 288 {
+            return Err("B's scattered read speculated or disturbed A's state");
+        }
+        // A continues at page 2: 8 served, then the doubled window
+        // populates pages 34..67 (264 sectors).
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("A's third read failed");
+        }
+        // B reads page 41 — sequential for nobody (B expects 101):
+        // 8 served sectors and no window.
+        if pread_into(fd_b, &mut buf, 41 * PAGE) != Some(PAGE as i64) {
+            return Err("B's final read failed");
+        }
+        if fx.data_blocks_read() != 568 {
+            return Err("interleaved opens did not keep independent pattern state");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/per_open_state",
+    smoke_read_readahead_per_open_state
 );
