@@ -8929,6 +8929,7 @@ fn smoke_uac_pm_suspend_refuses_live_lease() -> TestResult {
         crate::uac_card::UacCardState::from_bind(9, &topo, &choices, &BindOutcome::default());
     let (out_dci, in_dci) = crate::uac::find_audio_streaming_iso_eps(&cfg);
     crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        controller: 0,
         slot_id: 9,
         ac_iface: 0,
         iso_out_dci: out_dci,
