@@ -474,6 +474,7 @@ impl Startup {
     pub(super) async fn retune_wide(
         &mut self,
         profile: super::operating_channel::Profile,
+        linked: bool,
     ) -> Result<u32, power::Error> {
         if self
             .identity
@@ -481,13 +482,13 @@ impl Startup {
         {
             // The same chandef as the C typed profile (unassociated retune).
             let c = super::command_native::c_profile(profile).ok_or(power::Error::Unsupported)?;
-            return self.retune_channel_c(c, None, false).await;
+            return self.retune_channel_c(c, None, linked).await;
         }
         if self
             .identity
             .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8851B)
         {
-            return self.retune_channel_51(profile, false).await;
+            return self.retune_channel_51(profile, linked).await;
         }
         if self.phase != Phase::RadioReady
             || self.monitor.is_some()
@@ -514,7 +515,7 @@ impl Startup {
                         &owner.rfk,
                         owner.assets.as_ref().ok_or(power::Error::Terminal)?,
                         profile,
-                        false,
+                        linked,
                     )
                     .await
             }

@@ -421,6 +421,8 @@ struct DriverModel {
     wide_retunes: Vec<crate::rtw89::operating_channel::Profile>,
     /// Associated (CSA) channel switches requested of the native owner.
     switches: Vec<u8>,
+    /// Associated wide (CSA) channel switches requested of the native owner.
+    wide_switches: Vec<crate::rtw89::operating_channel::Profile>,
     /// Host policy snapshot reported to the station (passive-only channels).
     regulatory: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
     /// Every passive-TX grant / withdrawal the station requested.
@@ -487,6 +489,7 @@ impl DriverModel {
             wide: core::mem::take(&mut *NEXT_WIDE.lock()),
             wide_retunes: Vec::new(),
             switches: Vec::new(),
+            wide_switches: Vec::new(),
             regulatory: NEXT_REGULATORY.lock().take(),
             passive_grants: Vec::new(),
             sleep: NEXT_SLEEP.swap(false, Ordering::AcqRel).then(|| {
@@ -598,6 +601,23 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         }
         self.switches.push(primary);
         Ok(self.retunes.len() as u32 + self.switches.len() as u32 + 1)
+    }
+    /// Associated wide channel switch model: same refusals as the
+    /// native owner (`retune_wide(.., linked = true)`), peer retained.
+    async fn station_switch_wide_channel(
+        &mut self,
+        profile: crate::rtw89::operating_channel::Profile,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if !self.wide.contains(&profile) {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_none_or(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        self.wide_switches.push(profile);
+        Ok(self.retunes.len() as u32 + self.wide_switches.len() as u32 + 1)
     }
     fn station_sleep_capable(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         Ok(self.sleep.is_some())
@@ -3408,12 +3428,178 @@ kernel_test_in!(
     smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon
 );
 
+/// Sweep F2: a wide link follows a CSA to the same width/center at a
+/// new in-span primary, keeping the peer; the first beacon on the
+/// target ends the switch.
+fn smoke_rtw8852b_ht40_csa_follows_same_width_chandef() -> TestResult {
+    let Some(h) = ht40_link(1 << 5) else {
+        return TestResult::Fail("HT40 fixture");
+    };
+    let Some(plus) = crate::rtw89::operating_channel::Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("HT40+ profile missing");
+    };
+    let Some(moved) = crate::rtw89::operating_channel::Profile::new_2ghz_40(5, false) else {
+        return TestResult::Fail("HT40 moved profile missing");
+    };
+    if h.model(|io| io.wide_retunes.clone()) != vec![plus] {
+        return TestResult::Fail("station did not retune to the admitted HT40+ chandef");
+    }
+    let switch = || {
+        h.lifecycle
+            .retained
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .station_channel_switch()
+    };
+    let beacon = |ds: u8, extra: &[u8]| {
+        let mut frame = h.peer.lock().ap.beacon();
+        let at = frame
+            .windows(3)
+            .rposition(|w| w == [3, 1, 1])
+            .expect("DS parameter set");
+        frame[at + 2] = ds;
+        frame.extend_from_slice(extra);
+        frame
+    };
+    let inject = |frame: Vec<u8>| h.model(|io| io.packets.inject(&frame).unwrap());
+    // CSA to primary 5, no Wide Bandwidth element: same width/center,
+    // new primary in-span of the HT40+ block.
+    inject(beacon(1, &[37, 3, 1, 5, 1]));
+    h.pump();
+    if !matches!(switch(), Some((1, Some(s))) if s.primary == 5 && s.wide == Some(moved) && !s.switched)
+        || !h.model(|io| io.wide_switches.is_empty())
+    {
+        return TestResult::Fail("same-width CSA not accepted before the switch work");
+    }
+    complete(h.device.apply_edca());
+    if h.model(|io| io.wide_switches.clone()) != vec![moved]
+        || !matches!(switch(), Some((5, Some(s))) if s.switched)
+        || h.device.connected_bssid() != Some(AP)
+    {
+        return TestResult::Fail("wide CSA did not retune keeping the peer");
+    }
+    // First beacon on the target ends the switch (TX unblocked).
+    inject(beacon(5, &[]));
+    h.pump();
+    if switch() != Some((5, None)) || h.device.connected_bssid() != Some(AP) {
+        return TestResult::Fail("first target beacon did not complete the wide switch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_ht40_csa_follows_same_width_chandef
+);
+
+/// Sweep F2: a wide link drops instead of narrowing when the CSA
+/// target is unusable — out-of-span same-width primary, 80+80 (194
+/// width 3), ambiguous 20/40 (194 width 0), and 80MHz announced on a
+/// 2.4GHz link. Each case needs a fresh link: a drop ends the harness.
+fn smoke_rtw8852b_ht40_csa_wide_failures_drop_instead_of_narrowing() -> TestResult {
+    let beacon = |h: &Harness, ds: u8, extra: &[u8]| {
+        let mut frame = h.peer.lock().ap.beacon();
+        let at = frame
+            .windows(3)
+            .rposition(|w| w == [3, 1, 1])
+            .expect("DS parameter set");
+        frame[at + 2] = ds;
+        frame.extend_from_slice(extra);
+        frame
+    };
+    let drop_case = |channels: u64, extra: &[u8]| -> Result<bool, &'static str> {
+        let Some(h) = ht40_link(channels) else {
+            return Err("HT40 fixture");
+        };
+        let frame = beacon(&h, 1, extra);
+        h.model(|io| io.packets.inject(&frame).unwrap());
+        h.pump();
+        let dropped =
+            h.device.connected_bssid().is_none() && h.model(|io| io.wide_switches.is_empty());
+        drop(h);
+        Ok(dropped)
+    };
+    // Out-of-span: primary 9 would center at 7, not the link's center 3.
+    // (Channel 9 admitted, so the drop is the span rule, not admission.)
+    if drop_case(1 << 9, &[37, 3, 1, 9, 1]) != Ok(true) {
+        return TestResult::Fail("out-of-span wide CSA kept the link or switched");
+    }
+    // 80+80 is never offered.
+    if drop_case(1 << 5, &[37, 3, 1, 5, 1, 194, 3, 3, 42, 42]) != Ok(true) {
+        return TestResult::Fail("80+80 wide CSA kept the link or switched");
+    }
+    // Width 0 (20/40) leaves the new secondary side unknowable.
+    if drop_case(1 << 5, &[37, 3, 1, 5, 1, 194, 3, 0, 3, 0]) != Ok(true) {
+        return TestResult::Fail("width-0 wide CSA kept the link or switched");
+    }
+    // 80MHz announced on a 2.4GHz link: no 80MHz constructor for primary 5.
+    if drop_case(1 << 5, &[37, 3, 1, 5, 1, 194, 3, 1, 3, 0]) != Ok(true) {
+        return TestResult::Fail("80MHz-on-2.4GHz wide CSA kept the link or switched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_ht40_csa_wide_failures_drop_instead_of_narrowing
+);
+
+/// Sweep F2 target computation: a 194-announced 80MHz move to a new
+/// block, segment mismatch, unadmitted target, and same-width moves
+/// with no 194 element (in-block follows, cross-block fails).
+fn smoke_rtw8852b_wide_csa_target_follows_194_and_admission() -> TestResult {
+    use crate::rtw89::operating_channel::Width;
+    use crate::rtw89::{operating_channel::Profile, station::wide_target};
+    let Some(current) = Profile::new_5ghz(36, Width::Mhz80) else {
+        return TestResult::Fail("80MHz profile missing");
+    };
+    let Some(moved) = Profile::new_5ghz(149, Width::Mhz80) else {
+        return TestResult::Fail("80MHz moved profile missing");
+    };
+    let Some(same) = Profile::new_5ghz(40, Width::Mhz80) else {
+        return TestResult::Fail("80MHz same-block profile missing");
+    };
+    let admitted = vec![current, moved, same];
+    if wide_target(&[194, 3, 1, 155, 0], 149, current, &admitted, None) != Some(moved)
+        || wide_target(&[194, 3, 1, 157, 0], 149, current, &admitted, None).is_some()
+        || wide_target(&[194, 3, 1, 155, 0], 149, current, &[current], None).is_some()
+        || wide_target(&[], 40, current, &admitted, None) != Some(same)
+        || wide_target(&[], 149, current, &admitted, None).is_some()
+    {
+        return TestResult::Fail("wide CSA target computation differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_wide_csa_target_follows_194_and_admission
+);
+
+/// An HT40+ link fixture: admitted HT40+ and in-span moved profiles,
+/// the AP's HT40 IEs, and the CSA-target primaries in the channel mask.
+fn ht40_link(channels: u64) -> Option<Harness> {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    let plus = crate::rtw89::operating_channel::Profile::new_2ghz_40(1, true)?;
+    let moved = crate::rtw89::operating_channel::Profile::new_2ghz_40(5, false)?;
+    let mut ht40 = HT_IES.to_vec();
+    ht40[2] |= 0x42;
+    ht40[31] = 0x05;
+    *NEXT_WIDE.lock() = vec![plus, moved];
+    *NEXT_HT.lock() = Some(ht40);
+    NEXT_CHANNELS.store(channels, Ordering::Release);
+    let h = Harness::build(false, true, false, Some(&RATES), true);
+    if h.join().is_err() {
+        return None;
+    }
+    Some(h)
+}
+
 /// `ieee80211_parse_ch_switch_ie`: ECSA precedes CSA when its class is
 /// understood (`ieee80211_operating_class_to_band`: 81..=84 2.4GHz, 112 and
 /// 115..=130 5GHz); CSA targets the current band; monitor chandef/RF
 /// readback follow the actual primary (rtw8852b_rfk.c `_ch_setting`).
 fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
-    use crate::rtw89::{monitor_wire, station::channel_switch};
+    use crate::rtw89::{monitor_wire, station::channel_switch, station::wide_bandwidth_switch};
     let csa = channel_switch(&[0, 1, b'x', 37, 3, 1, 11, 4], 6);
     let ecsa = channel_switch(&[37, 3, 0, 11, 4, 60, 4, 0, 81, 6, 2], 1);
     let five = channel_switch(&[60, 4, 1, 115, 36, 3], 6);
@@ -3431,6 +3617,12 @@ fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
         || channel_switch(&[37, 3, 0, 14, 1], 1).map(|a| a.primary) != Some(None)
         || channel_switch(&[37, 2, 0, 6], 1).is_some()
         || channel_switch(&[37, 9, 0, 6, 1], 1).is_some()
+        // Sweep F2: Wide Bandwidth element 194 (first wins, truncated
+        // body ignored, absent without a 194 element).
+        || wide_bandwidth_switch(&[0, 1, b'x', 194, 3, 1, 42, 0]) != Some((1, 42, 0))
+        || wide_bandwidth_switch(&[194, 3, 3, 42, 42, 194, 3, 1, 36, 0]) != Some((3, 42, 42))
+        || wide_bandwidth_switch(&[194, 2, 1, 42]).is_some()
+        || wide_bandwidth_switch(&[37, 3, 1, 6, 1]).is_some()
     {
         return TestResult::Fail("CSA/ECSA parse differs from mac80211");
     }

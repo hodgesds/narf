@@ -242,6 +242,17 @@ pub(super) unsafe trait Io: Send {
     async fn station_switch_channel(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Associated wide channel switch (CSA on a wide link): retune the
+    /// Ready radio to `profile` keeping the installed peer, same
+    /// admission/record rules as [`Self::station_switch_channel`].
+    /// `Busy` is a proven-unpublished refusal.
+    async fn station_switch_wide_channel(
+        &mut self,
+        _: super::operating_channel::Profile,
+        _: &Admission,
+    ) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// RTL8852C 6GHz 20MHz channels with a current signed record under a
     /// regd.c power context the host rule admits (`Native::admitted_six_ghz`).
     /// Default: none, so no 6GHz scan, join or band advertisement exists.
@@ -758,13 +769,17 @@ pub(super) struct State {
 }
 /// mac80211 station CSA state for one link: target primary, switch time
 /// (`csa_time_tu` after the announcing beacon), `csa.blocked_tx` and
-/// `csa.waiting_bcn` once the radio is on the target.
+/// `csa.waiting_bcn` once the radio is on the target. `wide` is the
+/// target wide chandef for a wide link (the Wide Bandwidth element, or
+/// the current width/center at the new primary); `None` on a wide link
+/// means the link cannot follow and fails instead of narrowing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Switch {
     pub primary: u8,
     pub at_ms: u64,
     pub block_tx: bool,
     pub switched: bool,
+    pub wide: Option<super::operating_channel::Profile>,
 }
 /// Parsed CSA/ECSA element of a beacon (`ieee80211_parse_ch_switch_ie`):
 /// ECSA (60) takes precedence over CSA (37) when its operating class is
@@ -824,6 +839,69 @@ pub(super) fn channel_switch(ies: &[u8], current: u8) -> Option<Announcement> {
         primary: primary.then_some(channel),
         count,
     })
+}
+/// Wide Bandwidth Channel Switch element (194) of a beacon, if any:
+/// (new channel width, center segment 0, center segment 1), first
+/// element wins like CSA/ECSA above. The width byte mirrors the VHT
+/// operation element (0 = 20/40, 1 = 80, 2 = 160, 3 = 80+80).
+pub(super) fn wide_bandwidth_switch(ies: &[u8]) -> Option<(u8, u8, u8)> {
+    let mut rest = ies;
+    while let [id, len, tail @ ..] = rest {
+        let len = usize::from(*len);
+        let Some(body) = tail.get(..len) else {
+            break;
+        };
+        if let (194, [width, seg0, seg1]) = (*id, body) {
+            return Some((*width, *seg0, *seg1));
+        }
+        rest = &tail[len..];
+    }
+    None
+}
+/// Target wide profile for a CSA on a wide link, or `None` when the
+/// link cannot follow (`ieee80211_sta_process_chanswitch` drops the
+/// connection on an unusable target). Without a Wide Bandwidth element
+/// the target keeps the current width and center at the new primary;
+/// with one, width 1 is 80MHz and width 2 is 160MHz at the announced
+/// segment 0 (segment 1 must be 0: 80+80 is never offered). Width 0
+/// (20/40, whose new secondary side is unknowable from the
+/// announcement) and width 3 (80+80) are unusable, as is any target
+/// outside the admitted wide profiles or with a passive-only
+/// subchannel (association's wide rule: every subchannel must be
+/// active, with no beacon-witness exception).
+pub(super) fn wide_target(
+    ies: &[u8],
+    primary: u8,
+    current: super::operating_channel::Profile,
+    admitted: &[super::operating_channel::Profile],
+    policy: Option<&Arc<RegulatoryDomain>>,
+) -> Option<super::operating_channel::Profile> {
+    use super::operating_channel::{Profile, Width};
+    let target = match wide_bandwidth_switch(ies) {
+        Some((1, seg0, 0)) => {
+            let profile = Profile::new_5ghz(primary, Width::Mhz80)?;
+            (profile.center() == seg0).then_some(profile)?
+        }
+        Some((2, seg0, 0)) => {
+            let profile = Profile::new_5ghz_160(primary)?;
+            (profile.center() == seg0).then_some(profile)?
+        }
+        Some(_) => return None,
+        None => {
+            let profile = match current.width() {
+                Width::Mhz160 => Profile::new_5ghz_160(primary)?,
+                width => Profile::new_wide(primary, width, current.center() > primary)?,
+            };
+            (profile.center() == current.center()).then_some(profile)?
+        }
+    };
+    if !admitted.contains(&target) {
+        return None;
+    }
+    if !target.subchannels().all(|ch| !passive_only(policy, ch)) {
+        return None;
+    }
+    Some(target)
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1410,6 +1488,9 @@ impl State {
     /// channel"); one to the current primary is ignored. The 20MHz link
     /// keeps 20MHz on the target (CSA chandef downgraded to the link's
     /// connection mode), so secondary/wide-bandwidth elements are not used.
+    /// A wide link follows to the target wide chandef (`Switch.wide`):
+    /// the Wide Bandwidth element, or the current width/center at the
+    /// new primary; an unusable wide target drops the connection.
     fn observe_csa(&mut self, io: &mut impl Io, frame: &Mpdu, now: u64) -> Result<(), Error> {
         if self.phase != Phase::Open || frame.bytes().first() != Some(&0x80) {
             return Ok(());
@@ -1457,12 +1538,32 @@ impl State {
         if !channel_admitted(io.station_channels()?, primary) {
             return Err(Error::PeerLost);
         }
+        let policy = io.station_regulatory()?;
+        // A wide link follows to the target wide chandef; an unusable
+        // target drops the connection, as for a 20MHz link.
+        let wide = match self.wide {
+            Some(current) => Some(
+                wide_target(
+                    &candidate.bss.information_elements,
+                    primary,
+                    current,
+                    &io.station_wide_channels()?,
+                    policy.as_ref(),
+                )
+                .ok_or(Error::PeerLost)?,
+            ),
+            None => None,
+        };
         // mac80211 `ieee80211_sta_process_chanswitch` drops the connection
         // on an unusable target. A passive-only (RADAR / NO_IR) target is
-        // usable here only under a current beacon witness for it.
-        if let Some(policy) = io.station_regulatory()? {
-            if !self.witness.may_associate(&policy, &[center(primary)]) {
-                return Err(Error::PeerLost);
+        // usable here only under a current beacon witness for it. A wide
+        // target already passed its stricter rule (every subchannel
+        // active), so it needs no witness check.
+        if wide.is_none() {
+            if let Some(policy) = &policy {
+                if !self.witness.may_associate(policy, &[center(primary)]) {
+                    return Err(Error::PeerLost);
+                }
             }
         }
         // csa_time_tu = (max(count, 1) - 1) * beacon_int.
@@ -1472,6 +1573,7 @@ impl State {
             at_ms: now.saturating_add((tu * 1024).div_ceil(1000)),
             block_tx: announced.mode,
             switched: false,
+            wide,
         });
         Ok(())
     }
@@ -1492,9 +1594,10 @@ impl State {
                 .csa
                 .is_some_and(|csa| !csa.switched && self.environment.now_ms() >= csa.at_ms)
     }
-    /// `ieee80211_csa_switch_work` -> rtw89 chanctx switch (`Io::station_switch_channel`)
-    /// once every TX in flight retired; the installed peer stays. A `Busy`
-    /// native refusal or TX still in flight retries on a later worker pass
+    /// `ieee80211_csa_switch_work` -> rtw89 chanctx switch (`Io::station_switch_channel`,
+    /// or `Io::station_switch_wide_channel` for a wide link) once every TX
+    /// in flight retired; the installed peer stays. A `Busy` native
+    /// refusal or TX still in flight retries on a later worker pass
     /// within one second of the switch time, then the link fails like a
     /// mac80211 switch failure. Afterwards the beacon monitor restarts
     /// (`ieee80211_sta_reset_beacon_monitor`) and TX stays blocked (if
@@ -1506,16 +1609,22 @@ impl State {
         if self.phase != Phase::Open || !typed(csa.primary) {
             return Err(Error::State);
         }
-        // A 40/80MHz link cannot follow the switch: the native CSA owner
-        // retunes 20MHz profiles only. mac80211 disconnects when it cannot
-        // use the new chandef (`ieee80211_sta_process_chanswitch` ->
-        // connection loss), so the link fails instead of narrowing silently.
-        if self.wide.is_some() {
-            if !self.admission.teardown_pending() {
-                self.fail(io);
-            }
-            return Err(Error::PeerLost);
-        }
+        // A wide link follows to the target chandef recorded at
+        // announcement time; without one (defensive: announcement time
+        // already failed it) the link fails instead of narrowing
+        // silently, like a mac80211 switch failure.
+        let wide = match self.wide {
+            Some(_) => Some(match csa.wide {
+                Some(target) => target,
+                None => {
+                    if !self.admission.teardown_pending() {
+                        self.fail(io);
+                    }
+                    return Err(Error::PeerLost);
+                }
+            }),
+            None => None,
+        };
         let now = self.now()?;
         let quiet = self.pending.is_empty()
             && self.fragment_tx.is_none()
@@ -1536,9 +1645,31 @@ impl State {
             }
             _ => None,
         };
+        // Re-check wide subchannels at the switch: the policy may have
+        // changed since announcement, and a wide target needs every
+        // subchannel active (a passive primary grant cannot cover it).
+        if let Some(target) = wide {
+            if !target
+                .subchannels()
+                .all(|ch| !passive_only(policy.as_ref(), ch))
+            {
+                if !self.admission.teardown_pending() {
+                    self.fail(io);
+                }
+                return Err(Error::PeerLost);
+            }
+        }
         let result = if quiet {
-            io.station_switch_channel(csa.primary, &self.admission)
-                .await
+            match wide {
+                Some(target) => {
+                    io.station_switch_wide_channel(target, &self.admission)
+                        .await
+                }
+                None => {
+                    io.station_switch_channel(csa.primary, &self.admission)
+                        .await
+                }
+            }
         } else {
             Err(power::Error::Busy)
         };
@@ -1549,6 +1680,7 @@ impl State {
         match result {
             Ok(epoch) => {
                 self.channel = OperatingChannel::legacy(csa.primary);
+                self.wide = wide;
                 self.epoch = Some(epoch);
                 if let Some(peer) = self.peer.as_mut() {
                     // An ECSA may move the link to the other band.

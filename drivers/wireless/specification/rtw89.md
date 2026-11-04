@@ -3709,13 +3709,15 @@ peer has `HE_SU_MU_PPDU_4XLTF_AND_08_US_GI`, else `RTW89_GILTF_2XHE08`
 on B and 160MHz on C, so a C owner admits a 160MHz PPDU only after
 `retune_radio_c` programmed a 160MHz profile. B bytes (20/40/80MHz
 bindings, `wide_fingerprint`, RA, capability bodies) are unchanged.
-Known gaps: 80+80 is never offered; a 160MHz link fails on CSA like every
-wide link; passive-only spans join at 20MHz. Unexecuted cases:
+Known gaps: 80+80 is never offered; a wide link follows CSA to the
+target chandef (194 element, else current width/center at the new primary); passive-only spans join at 20MHz. Unexecuted cases:
 `smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux`,
 `smoke_rtw8852c_wide_station_profiles_map_to_c_profiles` (160MHz part),
 `smoke_rtw89_b_rx_wide_bandwidth_and_vht_rates_reach_packet_owner` (C
 160MHz part), `smoke_rtw89_b_packet_rx_width_follows_programmed_channel`
-(C 160MHz part).
+(C 160MHz part), `smoke_rtw8852b_ht40_csa_follows_same_width_chandef`,
+`smoke_rtw8852b_ht40_csa_wide_failures_drop_instead_of_narrowing`,
+`smoke_rtw8852b_wide_csa_target_follows_194_and_admission`.
 
 **C 6GHz power, records and station (`six_ghz_operation`).** RTL8852C
 `support_bands` includes 6GHz; the C channel geometry, `channel_c` BB/MAC
