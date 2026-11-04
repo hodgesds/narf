@@ -6231,3 +6231,63 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_set_version_and_get_unique
 );
+
+/// drm_fb_release: closing an open removes every framebuffer on its fb
+/// list, generic-ADDFB ones included, as RMFB does (a CRTC showing one goes
+/// off); another open's framebuffers stay.
+fn smoke_drm_file_close_releases_generic_framebuffers() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    const CLOSER: u64 = SMOKE_MASTER_ID + 7;
+    let addfb = |open: u64| -> Option<u32> {
+        let handle = state.lock().gem.alloc(0x8000_0000, 8192).ok()?;
+        let mut b = [0u8; 32];
+        for (dst, value) in b[..28]
+            .chunks_exact_mut(4)
+            .zip([0, 64, 32, 256, 32, 24, handle])
+        {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open,
+            0xc01c_64ae,
+            b.as_mut_ptr() as usize,
+            false,
+        )
+        .ok()?;
+        Some(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+    };
+    let (Some(closing), Some(kept)) = (addfb(CLOSER), addfb(SMOKE_MASTER_ID)) else {
+        return TestResult::Fail("ADDFB failed");
+    };
+    {
+        let mut card = state.lock();
+        let crtc = card.crtcs.iter_mut().find(|c| c.id == 11).unwrap();
+        crtc.primary_fb = Some(closing);
+        crtc.enabled = true;
+        card.encoders[0].crtc_id = Some(11);
+    }
+    let mut card = state.lock();
+    if card.crtcs_showing_owner(CLOSER) != [11] {
+        return TestResult::Fail("the closing open's shown framebuffer not found");
+    }
+    if card.release_file_framebuffers(CLOSER) != 1
+        || card.framebuffer(closing).is_ok()
+        || card.framebuffer(kept).is_err()
+    {
+        return TestResult::Fail("file close did not remove exactly its generic framebuffer");
+    }
+    if card.crtc(11).unwrap().enabled || card.encoders[0].crtc_id.is_some() {
+        return TestResult::Fail("the CRTC showing it stayed on");
+    }
+    // Its handle names no CREATE_DUMB buffer: nothing to free.
+    if !card.take_released_backing().is_empty() {
+        return TestResult::Fail("a non-dumb framebuffer left backing to free");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_file_close_releases_generic_framebuffers
+);

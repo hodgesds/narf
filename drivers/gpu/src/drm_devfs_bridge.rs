@@ -279,8 +279,8 @@ impl Drop for DriCardFile {
         let was_master = if let Some(ms) = crate::drm_registry::mode_state(self.index) {
             let mut ms = ms.lock();
             let was_master = ms.is_master(self.open_id);
-            // drm_fb_release: the framebuffers it made of its GEM buffers,
-            // each removed as RMFB removes it (atomic_remove_fb: the CRTC
+            // drm_fb_release: every framebuffer on its fb list, each
+            // removed as RMFB removes it (atomic_remove_fb: the CRTC
             // showing it goes off and its connectors are detached).
             #[cfg(feature = "amdgpu")]
             let shown = ms.crtcs_showing_owner(self.open_id);
@@ -297,6 +297,11 @@ impl Drop for DriCardFile {
             }
             ms.master_release(self.open_id);
             ms.magic_release(self.open_id);
+            let released = ms.take_released_backing();
+            drop(ms);
+            for (phys, order) in released {
+                crate::drm_ioctl_bridge::free_backing_pages(phys, order);
+            }
             was_master
         } else {
             false

@@ -4834,7 +4834,7 @@ fn handle_closefb(
 }
 
 /// Buddy-free a dumb backing a framebuffer removal released.
-fn free_backing_pages(phys: u64, order: u8) {
+pub(crate) fn free_backing_pages(phys: u64, order: u8) {
     let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
     narf_memory::frame::free_pages(frame, order);
 }

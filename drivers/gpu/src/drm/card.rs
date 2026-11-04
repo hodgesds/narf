@@ -1057,6 +1057,9 @@ pub struct Card {
     /// SET_VERSION 1.1+ (drm_set_busid). GET_UNIQUE answers an empty name
     /// until then, which libdrm's drmOpenByName depends on.
     pub(crate) unique_masters: Vec<u64>,
+    /// Dumb-buffer backings [`Card::release_file_framebuffers`] removed,
+    /// for the caller to free once the card lock is dropped.
+    released_backing: Vec<(u64, u8)>,
     /// Issued DRM magic tokens: `(magic, open_id, authenticated)`. One magic
     /// per open, allocated on its first `GET_MAGIC` and kept for the life of
     /// the fd (a repeat `GET_MAGIC` returns the same value). `AUTH_MAGIC`
@@ -1334,6 +1337,7 @@ impl Card {
             next_vblank_ns: 0,
             current_master: None,
             unique_masters: Vec::new(),
+            released_backing: Vec::new(),
             magics: Vec::new(),
             next_magic: 1,
             native: Vec::new(),
@@ -2622,14 +2626,16 @@ impl Card {
             .filter(|c| {
                 c.primary_fb
                     .and_then(|id| self.framebuffer(id).ok())
-                    .is_some_and(|fb| fb.gem_owner() == Some(owner))
+                    .is_some_and(|fb| fb.owner() == Some(owner))
             })
             .map(|c| c.id)
             .collect()
     }
-    /// drm_fb_release for open `owner`: remove every framebuffer it made
-    /// from one of its GEM handles (as RMFB does, turning off what shows
-    /// it). Returns how many went.
+    /// drm_fb_release for open `owner`: remove every framebuffer on its fb
+    /// list, made from one of its GEM handles or through the generic ADDFB
+    /// path, as RMFB does (turning off what shows it). A removed dumb
+    /// buffer's backing waits in [`Card::take_released_backing`]. Returns
+    /// how many went.
     pub fn release_file_framebuffers(&mut self, owner: u64) -> usize {
         #[cfg(feature = "intel")]
         if self.intel_transaction {
@@ -2641,13 +2647,19 @@ impl Card {
         let ids: Vec<u32> = self
             .framebuffers
             .iter()
-            .filter(|fb| fb.gem_owner() == Some(owner))
+            .filter(|fb| fb.owner() == Some(owner))
             .map(|fb| fb.id)
             .collect();
         for &id in &ids {
-            let _ = self.rmfb(id);
+            if let Ok(Some(backing)) = self.rmfb(id) {
+                self.released_backing.push(backing);
+            }
         }
         ids.len()
+    }
+    /// The `(phys, order)` backings released framebuffers left to free.
+    pub fn take_released_backing(&mut self) -> Vec<(u64, u8)> {
+        core::mem::take(&mut self.released_backing)
     }
 
     #[cfg(feature = "intel")]
