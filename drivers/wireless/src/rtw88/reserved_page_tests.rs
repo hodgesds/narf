@@ -587,6 +587,49 @@ unsafe impl Registers for Port {
         })
         .map_err(|_| Error::State)
     }
+    /// `pci_firmware::station_ht_program_quiet` over the fake: the retained
+    /// packet/command owner is idle before TX paths change. The fake had no
+    /// override, so the `Registers` default `Err(Unsupported)` fired and
+    /// every `lps_window` caller failed before issuing anything.
+    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
+        self.station_allowed()?;
+        {
+            let m = self.0.lock();
+            if m.mailbox_pending || m.command_ring.pending() {
+                return Ok(false);
+            }
+        }
+        if !self
+            .packet_with(|core, port| {
+                core.transmit_quiet(|r| crate::rtw88::packet_core::Port::index(port, r))
+            })
+            .map_err(|_| Error::State)?
+        {
+            return Ok(false);
+        }
+        for r in crate::rtw88::dma_stop::TX_INDEX {
+            let v = self.read32(r)?;
+            if v == u32::MAX {
+                return Err(Error::Gone);
+            }
+            if v & 0xfff != (v >> 16) & 0xfff {
+                return Ok(false);
+            }
+        }
+        if self.read16(0x10c)? != 0xc5a0 {
+            return Err(Error::Prerequisite);
+        }
+        for r in [0x230, 0x234, 0x238, 0x23c] {
+            let n = if r == 0x23c { 14 } else { 16 };
+            if self.read16(r)? != n {
+                return Err(Error::Prerequisite);
+            }
+            if self.read16(r + 2)? != n {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     fn station_rts_request(&mut self) -> Result<crate::rtw88::RtsRequest, Error> {
         self.station_allowed()?;
         self.rts_request()
