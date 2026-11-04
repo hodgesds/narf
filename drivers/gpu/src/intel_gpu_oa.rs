@@ -620,7 +620,7 @@ pub(crate) async fn open(
         }
         exec = Some(class);
     }
-    let mut privileged = !(exec.is_some() && !p.sample);
+    let mut privileged = exec.is_none() || p.sample;
     if p.no_preempt {
         if exec.is_none() {
             return Err(FsError::InvalidData.into());
@@ -750,7 +750,7 @@ pub(crate) fn add_config(
     }
     // xe_oa_alloc_regs: kmalloc_objs(n_regs).
     let budget = |registry: &Registry| registry.regs + n as usize > MAX_REGISTRY_REGS;
-    if n > MAX_CONFIG_REGS || budget(&*REGISTRY[device.card as usize].lock()) {
+    if n > MAX_CONFIG_REGS || budget(&REGISTRY[device.card as usize].lock()) {
         return Err(FsError::OutOfMemory.into());
     }
     let mut regs = Vec::new();
@@ -771,7 +771,7 @@ pub(crate) fn add_config(
     if registry.configs.values().any(|config| config.uuid == uuid) {
         return Err(Error::Errno(EADDRINUSE));
     }
-    if budget(&*registry) {
+    if budget(&registry) {
         return Err(FsError::OutOfMemory.into());
     }
     // idr_alloc(.., 1, 0): the lowest free id.

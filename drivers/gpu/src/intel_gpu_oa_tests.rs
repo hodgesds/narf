@@ -605,11 +605,11 @@ fn smoke_oa_config_registry_errno_order_ids_and_whitelists() -> TestResult {
         Err(Error::Fs(FsError::OutOfMemory))
     );
     // Per register: address fault, then address validity, then value fault.
-    let edge = 0x20000 - 4;
+    let edge: u64 = 0x20000 - 4;
     let mut config = [0u8; 56];
     config[8..44].copy_from_slice(&uuid(1));
     config[44..48].copy_from_slice(&1u32.to_le_bytes());
-    config[48..56].copy_from_slice(&(edge as u64).to_le_bytes());
+    config[48..56].copy_from_slice(&edge.to_le_bytes());
     wire.put(at, &config);
     wire.put(edge, &0x9888u32.to_le_bytes());
     assert_eq!(
