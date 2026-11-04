@@ -1535,6 +1535,16 @@ impl Gate {
                 None => h.update(&[0]),
             }
         }
+        // The N21W program's MCS indices follow the bound width: an HT20
+        // record must not authorize HT40 tracking or vice versa. The None
+        // arm hashes nothing, so HT20 request identities — and every
+        // already-provisioned HT20 record — are byte-identical to before.
+        if let Some(g) = &self.ht40 {
+            let (i, d) = g.source_identity();
+            h.update(b"B");
+            h.update(&i);
+            h.update(&d);
+        }
         Ok(())
     }
     pub(super) fn c21_indices(&self) -> Option<[u8; 12]> {
