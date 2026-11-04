@@ -3241,30 +3241,37 @@ fn smoke_ixgbe_fcoe_ddp_context() -> TestResult {
         addr: 0x1000,
         len: 4096,
     }];
-    if ddp_context(511, FcoeFamily::Other, &one, false, Some(0x9000))
-        != Err(FcoeError::XidOutOfRange)
-    {
+    if !matches!(
+        ddp_context(511, FcoeFamily::Other, &one, false, Some(0x9000)),
+        Err(FcoeError::XidOutOfRange)
+    ) {
         return TestResult::Fail("xid 511 on 82599 accepted");
     }
-    if ddp_context(2047, FcoeFamily::X550, &one, false, Some(0x9000))
-        != Err(FcoeError::XidOutOfRange)
-    {
+    if !matches!(
+        ddp_context(2047, FcoeFamily::X550, &one, false, Some(0x9000)),
+        Err(FcoeError::XidOutOfRange)
+    ) {
         return TestResult::Fail("xid 2047 on X550 accepted");
     }
-    if ddp_context(0, FcoeFamily::Other, &[], false, None) != Err(FcoeError::EmptyBuffers) {
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &[], false, None),
+        Err(FcoeError::EmptyBuffers)
+    ) {
         return TestResult::Fail("empty buffers accepted");
     }
-    if ddp_context(
-        0,
-        FcoeFamily::Other,
-        &[DmaBuf {
-            addr: 0x1000,
-            len: 0,
-        }],
-        false,
-        None,
-    ) != Err(FcoeError::EmptyBuffer)
-    {
+    if !matches!(
+        ddp_context(
+            0,
+            FcoeFamily::Other,
+            &[DmaBuf {
+                addr: 0x1000,
+                len: 0,
+            }],
+            false,
+            None,
+        ),
+        Err(FcoeError::EmptyBuffer)
+    ) {
         return TestResult::Fail("zero-length buffer accepted");
     }
     let misaligned = [
@@ -3277,9 +3284,10 @@ fn smoke_ixgbe_fcoe_ddp_context() -> TestResult {
             len: 4096,
         },
     ];
-    if ddp_context(0, FcoeFamily::Other, &misaligned, false, None)
-        != Err(FcoeError::UnalignedBuffer)
-    {
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &misaligned, false, None),
+        Err(FcoeError::UnalignedBuffer)
+    ) {
         return TestResult::Fail("misaligned non-first buffer accepted");
     }
     let short = [
@@ -3292,19 +3300,26 @@ fn smoke_ixgbe_fcoe_ddp_context() -> TestResult {
             len: 4096,
         },
     ];
-    if ddp_context(0, FcoeFamily::Other, &short, false, None) != Err(FcoeError::ShortBuffer) {
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &short, false, None),
+        Err(FcoeError::ShortBuffer)
+    ) {
         return TestResult::Fail("short non-last buffer accepted");
     }
-    if ddp_context(0, FcoeFamily::Other, &one, false, None) != Err(FcoeError::MissingExtraBuffer) {
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &one, false, None),
+        Err(FcoeError::MissingExtraBuffer)
+    ) {
         return TestResult::Fail("full last piece without extra buffer accepted");
     }
     let many = alloc::vec![DmaBuf {
         addr: 0x1000,
         len: 4096,
     }; 257];
-    if ddp_context(0, FcoeFamily::Other, &many, false, Some(0x9000))
-        != Err(FcoeError::TooManyBuffers)
-    {
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &many, false, Some(0x9000)),
+        Err(FcoeError::TooManyBuffers)
+    ) {
         return TestResult::Fail("257 buffers accepted");
     }
     let mut edge = alloc::vec![DmaBuf {
