@@ -92,6 +92,7 @@ pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
 pub mod napi;
+pub mod native_emission;
 pub mod netfilter;
 pub mod netlink_audit;
 pub mod netlink_diag;
@@ -130,8 +131,9 @@ pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{
-    initial_loopback_admin, kernel_admin, AdminCap, AdminError, AdminHandle, AdminIpv4Route,
-    AdminIpv6Route, AttachError, StackAttach, StackAttachReply, StackDaemon,
+    initial_loopback_admin, kernel_admin, AdminCap, AdminEmissionAuthority, AdminError,
+    AdminHandle, AdminIpv4Route, AdminIpv6Route, AttachError, ControlRetirement, StackAttach,
+    StackAttachReply, StackDaemon,
 };
 
 // In-kernel test suites: compiled only under the `kernel-test` feature (or
@@ -473,6 +475,13 @@ pub trait Interface: Send + Sync {
     fn is_loopback(&self) -> bool {
         false
     }
+    /// A registered control-only object has no Ethernet/netdev boundary.
+    /// Its immutable namespace is explicit, and its frame rings stay absent.
+    /// Wireless P2P-device owners use this alongside their actual typed
+    /// interface capability, without inventing an ifindex or IFF_UP.
+    fn control_namespace(&self) -> Option<u64> {
+        None
+    }
     /// Offloads supported through the frame rings. Producers must negotiate
     /// before setting TX metadata; the default accepts plain frames only.
     fn offloads(&self) -> OffloadCapabilities {
@@ -537,7 +546,14 @@ impl From<CapError> for RegisterError {
 
 struct Entry {
     iface: Box<dyn Interface>,
+    // Immutable registration identity, captured before taking the registry
+    // lock. Control retirement compares these without driver callbacks.
+    name: String,
+    control_namespace: Option<u64>,
     handle: Cap<NetIface, Write>,
+    /// Actual typed parent registration for a freshly created control child.
+    control_parent: Option<Cap<NetIface, Write>>,
+    native_lifetime: native_emission::ProviderLifetime,
 }
 
 /// Owned control-plane view of a driver-backed interface.
@@ -556,7 +572,7 @@ pub struct InterfaceSnapshot {
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entry")
-            .field("name", &self.iface.name())
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
@@ -567,6 +583,88 @@ impl fmt::Debug for Entry {
 #[derive(Debug)]
 pub struct Registry {
     inner: IrqSafeSpinLock<Vec<Entry>>,
+}
+/// Control-only interface registration has no Ethernet metadata/frame ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlRegisterError {
+    AuthorityRevoked,
+    NotControl,
+    DuplicateName,
+}
+struct RegisterControl<'a, I> {
+    registry: &'a Registry,
+    iface: I,
+    parent: Option<Cap<NetIface, Write>>,
+}
+impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Grant> for RegisterControl<'_, I> {
+    type Output = Result<Cap<NetIface, Write>, ControlRegisterError>;
+    fn execute(
+        self,
+        _: &Cap<NetIface, Grant>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        if let Some(parent) = self.parent {
+            return parent.invoke(RegisterControlChild(self));
+        }
+        self.register()
+    }
+}
+struct RegisterControlChild<'a, I>(RegisterControl<'a, I>);
+impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Write>
+    for RegisterControlChild<'_, I>
+{
+    type Output = Result<Cap<NetIface, Write>, ControlRegisterError>;
+    fn execute(
+        self,
+        _: &Cap<NetIface, Write>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        self.0.register()
+    }
+}
+impl<I: Interface + 'static> RegisterControl<'_, I> {
+    fn register(
+        self,
+    ) -> Result<Result<Cap<NetIface, Write>, ControlRegisterError>, narf_capabilities::CapError>
+    {
+        let name = String::from(self.iface.name());
+        let namespace = self.iface.control_namespace();
+        if namespace.is_none()
+            || name == "lo"
+            || crate::iface::lookup(&name).is_some()
+            || self.iface.link_up()
+            || self.iface.rx_ring().lock().is_some()
+            || self.iface.tx_ring().lock().is_some()
+        {
+            return Ok(Err(ControlRegisterError::NotControl));
+        }
+        let mut entries = self.registry.inner.lock();
+        if let Some(parent) = self.parent {
+            let valid = entries
+                .iter()
+                .find(|entry| entry.handle.slot() == parent.slot())
+                .is_some_and(|entry| {
+                    entry.control_namespace.is_none()
+                        && crate::iface::lookup(&entry.name).is_some_and(|metadata| {
+                            metadata.ownership_epoch != 0 && Some(metadata.net_ns_id) == namespace
+                        })
+                });
+            if !valid {
+                return Ok(Err(ControlRegisterError::NotControl));
+            }
+        }
+        if entries.iter().any(|entry| entry.name == name) {
+            return Ok(Err(ControlRegisterError::DuplicateName));
+        }
+        let handle = Cap::<NetIface, Write>::bootstrap();
+        entries.push(Entry {
+            iface: Box::new(self.iface),
+            name,
+            control_namespace: namespace,
+            handle,
+            control_parent: self.parent,
+            native_lifetime: native_emission::ProviderLifetime::new(),
+        });
+        Ok(Ok(handle))
+    }
 }
 
 static REGISTRY: Registry = Registry {
@@ -580,6 +678,40 @@ pub fn registry() -> &'static Registry {
 }
 
 impl Registry {
+    /// Register a real control-only object under the current registration
+    /// grant invocation. The immutable namespace/absent frame rings never
+    /// create an Ethernet entry or a capability from discovery metadata.
+    pub fn register_control<I: Interface + 'static>(
+        &self,
+        authority: &Cap<NetIface, Grant>,
+        iface: I,
+    ) -> Result<Cap<NetIface, Write>, ControlRegisterError> {
+        authority
+            .invoke(RegisterControl {
+                registry: self,
+                iface,
+                parent: None,
+            })
+            .map_err(|_| ControlRegisterError::AuthorityRevoked)?
+    }
+    /// Register a freshly created control child under both the actual
+    /// registration grant and current typed physical-parent invocation.
+    /// The stored exact parent handle is consumed by scoped delegation;
+    /// a name, MAC or metadata-only WDEV never establishes this relation.
+    pub fn register_control_child<I: Interface + 'static>(
+        &self,
+        authority: &Cap<NetIface, Grant>,
+        parent: &Cap<NetIface, Write>,
+        iface: I,
+    ) -> Result<Cap<NetIface, Write>, ControlRegisterError> {
+        authority
+            .invoke(RegisterControl {
+                registry: self,
+                iface,
+                parent: Some(*parent),
+            })
+            .map_err(|_| ControlRegisterError::AuthorityRevoked)?
+    }
     /// Register an interface. Cap-gated on a `Cap<NetIface, Grant>`
     /// authority (mirrors the drivers/ framework). On success returns
     /// a `Cap<NetIface, Write>` handle the caller can later use to
@@ -590,15 +722,20 @@ impl Registry {
         iface: I,
     ) -> Result<Cap<NetIface, Write>, RegisterError> {
         authority.check_live()?;
-
+        let name = String::from(iface.name());
+        let control_namespace = iface.control_namespace();
         let mut q = self.inner.lock();
-        if q.iter().any(|e| e.iface.name() == iface.name()) {
+        if q.iter().any(|e| e.name == name) {
             return Err(RegisterError::DuplicateName);
         }
         let handle: Cap<NetIface, Write> = Cap::<NetIface, Write>::bootstrap();
         q.push(Entry {
             iface: Box::new(iface),
+            name,
+            control_namespace,
             handle,
+            control_parent: None,
+            native_lifetime: native_emission::ProviderLifetime::new(),
         });
         Ok(handle)
     }
@@ -608,10 +745,34 @@ impl Registry {
     /// intentionally owned by the in-kernel driver teardown path, where the
     /// interface has already been selected by its authoritative netdev name.
     pub fn unregister(&self, name: &str) -> bool {
-        let mut q = self.inner.lock();
-        let before = q.len();
-        q.retain(|entry| entry.iface.name() != name);
-        q.len() != before
+        self.remove_native_registrations(|entry| entry.name == name)
+    }
+    /// Trusted driver teardown of exactly its retained typed registration.
+    /// A stale original handle cannot remove a same-name successor. This
+    /// identifies cleanup only; it grants no hardware/device operation.
+    pub fn unregister_for_handle(&self, handle: &Cap<NetIface, Write>) -> bool {
+        self.remove_native_registrations(|entry| entry.handle.slot() == handle.slot())
+    }
+    fn remove_native_registrations(&self, matches: impl Fn(&Entry) -> bool) -> bool {
+        let mut entries = self.inner.lock();
+        let mut removed = Vec::new();
+        let mut notifications = Vec::new();
+        let mut index = 0;
+        while index < entries.len() {
+            if matches(&entries[index]) {
+                notifications.push(entries[index].native_lifetime.retire());
+                removed.push(entries.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        drop(entries);
+        for retirement in notifications {
+            retirement.notify();
+        }
+        let changed = !removed.is_empty();
+        drop(removed);
+        changed
     }
 
     /// Number of registered interfaces.
@@ -666,6 +827,7 @@ impl Registry {
         self.inner
             .lock()
             .iter()
+            .filter(|entry| entry.iface.control_namespace().is_none())
             .map(|entry| InterfaceSnapshot {
                 name: String::from(entry.iface.name()),
                 mac: entry.iface.mac(),

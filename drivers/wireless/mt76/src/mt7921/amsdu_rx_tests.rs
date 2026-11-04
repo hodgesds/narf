@@ -38,7 +38,7 @@ pub(super) fn activate_receive(session: &mut Session<Model>) {
     };
     let mut receiver = super::super::amsdu::Receiver::prepare(info, &ht_bss()).unwrap();
     receiver.active = true;
-    session.ht20_rx = Some(receiver);
+    session.station.ht20_rx = Some(receiver);
 }
 
 pub(super) fn packet(eth: &[u8], protected: bool, pn: u64, marker: u8, seq: u16) -> Vec<u8> {
@@ -77,10 +77,11 @@ pub(super) fn ethernet(value: u8, length: usize) -> Vec<u8> {
     eth
 }
 
-fn model(protected: bool) -> Session<Model> {
+#[inline(never)]
+fn model(protected: bool) -> NativeSession {
     let mut session = secure_model();
     if !protected {
-        session.security = None;
+        session.station.security = None;
     }
     activate_receive(&mut session);
     session
@@ -175,7 +176,7 @@ fn mt76_ht_receive_preparation_has_no_activation_or_device_side_effects() -> Tes
         || prepared.channel != 6
         || prepared.receive_mcs != 0xff
         || prepared.max_amsdu_bytes != 3839
-        || session.ht20_rx.as_ref().unwrap().active
+        || session.station.ht20_rx.as_ref().unwrap().active
         || session.backend.frames.len() != before
         || session.state != State::RadioReady(info)
     {
@@ -227,7 +228,7 @@ fn mt76_ht_receive_preparation_has_no_activation_or_device_side_effects() -> Tes
     if joined != Ok(42) {
         return TestResult::Fail("reactive AP did not complete the legacy association fixture");
     }
-    if session.ht20_rx.is_some() {
+    if session.station.ht20_rx.is_some() {
         return TestResult::Fail("legacy association inherited HT receive preparation");
     }
     if session.prepare_ht20_receive(&bss) != Err(Error::Busy) {
@@ -459,8 +460,10 @@ fn mt76_amsdu_bounds_timeout_and_peer_teardown_discard_partial_or_queued_data() 
     if session.receive_ethernet() != Ok(Some(eth)) {
         return TestResult::Fail("teardown fixture burst");
     }
-    session.peer_lost = true;
-    if session.receive_ethernet() != Err(Error::DeviceGone) || !session.received_msdu.is_empty() {
+    session.station.peer_lost = true;
+    if session.receive_ethernet() != Err(Error::DeviceGone)
+        || !session.station.received_msdu.is_empty()
+    {
         return TestResult::Fail("peer loss retained queued aggregate payload");
     }
     TestResult::Pass
@@ -490,7 +493,7 @@ fn mt76_amsdu_key_cancellation_teardown_and_reset_close_received_ownership() -> 
     }
     if session.receive_ethernet() != Ok(None)
         || !session.keys_pending()
-        || !session.received_msdu.is_empty()
+        || !session.station.received_msdu.is_empty()
     {
         return TestResult::Fail("closed-key aggregate reached pending cancellation ownership");
     }
@@ -502,7 +505,7 @@ fn mt76_amsdu_key_cancellation_teardown_and_reset_close_received_ownership() -> 
             return TestResult::Fail("key operation did not suspend");
         }
     }
-    if !session.received_msdu.is_empty()
+    if !session.station.received_msdu.is_empty()
         || !matches!(session.state, State::Running(_))
         || session.receive_ethernet() != Err(Error::Busy)
     {
@@ -516,7 +519,9 @@ fn mt76_amsdu_key_cancellation_teardown_and_reset_close_received_ownership() -> 
                 .packets
                 .push_back(packet(&eth, true, 1, marker, 8));
         }
-        if session.receive_ethernet() != Ok(Some(eth.clone())) || session.received_msdu.len() != 1 {
+        if session.receive_ethernet() != Ok(Some(eth.clone()))
+            || session.station.received_msdu.len() != 1
+        {
             return TestResult::Fail("aggregate teardown fixture");
         }
         let result = if reset {
@@ -525,8 +530,8 @@ fn mt76_amsdu_key_cancellation_teardown_and_reset_close_received_ownership() -> 
             run(session.disassociate_station())
         };
         if result.is_err()
-            || session.ht20_rx.is_some()
-            || !session.received_msdu.is_empty()
+            || session.station.ht20_rx.is_some()
+            || !session.station.received_msdu.is_empty()
             || session.receive_ethernet() != Err(Error::Busy)
         {
             return TestResult::Fail("teardown/reset retained aggregate receive owner or payload");

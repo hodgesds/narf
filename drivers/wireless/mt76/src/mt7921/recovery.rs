@@ -20,12 +20,26 @@ impl<B: Backend> Session<B> {
         &mut self,
         expected_mac: Option<[u8; 6]>,
     ) -> Result<RadioInfo, Error> {
-        if self.state == State::Prepared {
+        // A GO operation never resets in place: the WFSYS reset would
+        // retire the live home association. The GO role stays `Failed`
+        // until the home owner's verified recovery retires both.
+        if self.state == State::Prepared || self.go_role() {
             return Err(Error::Busy);
         }
+        // Keep the original request's serialization lease through the
+        // entire cleanup, including firmware reinitialization after the
+        // old autonomous AP owner is retired and removed below.
+        let _ap_request = self
+            .ap_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
+        let _p2p_request = self
+            .p2p_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
         self.boot_started = None;
-        self.rx_ba.fence();
-        self.tx_ba.fence();
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
         self.stage(Stage::RecoveryPark);
         let result = self.recover_inner(expected_mac).await;
         if let Err(error) = result {
@@ -39,6 +53,7 @@ impl<B: Backend> Session<B> {
     }
 
     async fn recover_inner(&mut self, expected_mac: Option<[u8; 6]>) -> Result<RadioInfo, Error> {
+        self.normalize_wake_bus().await?;
         self.backend.check()?;
         self.backend.park_bus_master()?;
         let mut owned = false;
@@ -88,24 +103,40 @@ impl<B: Backend> Session<B> {
         self.backend.release()?;
         self.stage(Stage::RecoveryRearm);
         self.backend.recycle()?;
-        self.rx_ba.reset_after_quiescence();
-        self.tx_ba.reset_after_quiescence();
-        self.tid0_used = false;
-        self.security = None;
-        self.wmm = None;
-        self.wmm_pending = None;
-        self.station_permission = None;
-        self.ht20_rx = None;
-        self.ht20_profile = None;
-        self.vht_profile = None;
-        self.he_profile = None;
-        self.ap_phy = None;
-        self.control_pending.clear();
-        self.tx_fragments.clear();
-        self.received_msdu.clear();
-        self.station_bss = None;
+        self.cancel_transmit_ba_restart();
+        self.station.rx_ba.reset_after_quiescence();
+        self.station.tx_ba.reset_after_quiescence();
+        self.scan_packets.clear();
+        self.scanning = false;
+        self.station.used_tids = 0;
+        self.station.security = None;
+        // Only verified MAC/FW reset plus DMA retirement releases AP owners.
+        self.ap_owner = None;
+        self.p2p_owner = None;
+        self.p2p_next = 1;
+        // The verified reset retired every vif's native BSS/WTBL state.
+        self.retire_group_link();
+        self.retire_go();
+        self.ap_keys.clear_active();
+        self.wow_config = None;
+        self.wow_nlo = None;
+        self.station.wmm = None;
+        self.station.wmm_pending = None;
+        self.station.permission = None;
+        self.station.ht20_rx = None;
+        self.station.ht20_profile = None;
+        self.station.vht_profile = None;
+        self.station.he_profile = None;
+        self.station.ap_phy = None;
+        self.station.control_pending.clear();
+        self.station.tx_fragments.clear();
+        self.station.received_msdu.clear();
+        self.station.demuxed.clear();
+        self.station.tx_credit.clear();
+        self.station.bss = None;
+        self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.data_pending.clear();
-        self.peer_lost = false;
+        self.station.peer_lost = false;
         self.events.clear();
         self.transferred = 0;
         self.seq = 0;

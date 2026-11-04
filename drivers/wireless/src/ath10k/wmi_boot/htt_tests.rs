@@ -27,6 +27,7 @@ struct HttModel {
     sequence: u8,
     stall_rx: bool,
     version: u8,
+    minor: u8,
     receive_pipe: u8,
     tx_next: u64,
     stall_tx: bool,
@@ -45,6 +46,7 @@ impl HttModel {
             sequence: 0,
             stall_rx: false,
             version: 3,
+            minor: 1,
             tx_next: 0x800000,
             stall_tx: false,
             raw: false,
@@ -62,6 +64,23 @@ impl HostMemory for HttModel {
     }
 }
 impl htt::HttMemory for HttModel {
+    fn supports_htt_pfc(&self) -> bool {
+        self.storage.as_ref().is_some_and(|s| s.qstate.is_some())
+    }
+    fn publish_htt_queue_state(&mut self, bytes: &[u8]) -> Result<(), htt::Error> {
+        self.storage
+            .as_mut()
+            .ok_or(htt::Error::Memory)?
+            .publish_queue_state(bytes)
+    }
+    fn pending_htt_tx(&self) -> Result<usize, htt::Error> {
+        Ok(self
+            .storage
+            .as_ref()
+            .ok_or(htt::Error::Memory)?
+            .tx
+            .pending())
+    }
     fn prepare_htt_tx(
         &mut self,
         c: htt::Config,
@@ -152,9 +171,10 @@ impl Hif for HttModel {
             if self.storage.is_some() {
                 return Err(BmiError::BadResponse);
             }
-            self.inner
-                .rx
-                .push_back((self.receive_pipe, header(1, &[0, 1, self.version, 0])));
+            self.inner.rx.push_back((
+                self.receive_pipe,
+                header(1, &[0, self.minor, self.version, 0]),
+            ));
             return Ok(());
         }
         let storage = self.storage.as_ref().ok_or(BmiError::BadResponse)?;
@@ -420,6 +440,56 @@ fn smoke_ath10k_htt_tx_cancel_and_duplicate_batch_preserve_dma() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath10k/htt-runtime",
     smoke_ath10k_htt_tx_cancel_and_duplicate_batch_preserve_dma
+);
+
+/// A deleted P2P client vif's in-flight MSDU: its completion still frees
+/// the DMA but is never delivered to a surviving owner, and a receipt that
+/// was already queued is consumed at once.
+fn smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently() -> TestResult {
+    let p = htt::tx::Parameters {
+        kind: htt::tx::Kind::Ethernet,
+        // The fixture boots only vdev 0; the orphan path keys on the MSDU id.
+        vdev: 0,
+        tid: 16,
+        hardware_crypto: false,
+    };
+    let frame = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 8, 0];
+    let mut r = htt_boot(HwRev::Qca6174, Dialect::Tlv, 4, 3, false);
+    assert!(matches!(once(r.start()), Poll::Ready(Ok(_))));
+    if once(r.transmit(p, &frame)) != Poll::Ready(Ok(0)) {
+        return TestResult::Fail("orphan test HTT transmit did not allocate MSDU id 0");
+    }
+    if r.orphan_tx(0).is_err()
+        || r.complete_tx(&[7, 0, 1, 0, 0, 0]) != Ok(0)
+        || r.wmi.htc.transport.storage.as_ref().unwrap().tx.pending() != 0
+        || r.take_tx_receipt().is_some()
+    {
+        return TestResult::Fail("orphaned MSDU completion leaked a receipt or kept its DMA");
+    }
+    // Completed before the owner was dropped: the queued receipt goes now
+    // and a later reuse of the id is delivered normally.
+    if once(r.transmit(p, &frame)) != Poll::Ready(Ok(1)) {
+        return TestResult::Fail("orphan test HTT transmit did not allocate MSDU id 1");
+    }
+    if r.complete_tx(&[7, 0, 1, 0, 1, 0]) != Ok(0)
+        || r.orphan_tx(1).is_err()
+        || r.take_tx_receipt().is_some()
+    {
+        return TestResult::Fail("queued receipt of a dropped owner was delivered");
+    }
+    if once(r.transmit(p, &frame)) != Poll::Ready(Ok(2)) {
+        return TestResult::Fail("orphan test HTT transmit did not allocate MSDU id 2");
+    }
+    if r.complete_tx(&[7, 0, 1, 0, 2, 0]) != Ok(0)
+        || r.take_tx_receipt().map(|receipt| receipt.id) != Some(2)
+    {
+        return TestResult::Fail("a live owner's completion was swallowed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/htt-runtime",
+    smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently
 );
 
 fn legacy_rx_literal() -> Vec<u8> {

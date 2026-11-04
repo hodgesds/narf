@@ -290,17 +290,52 @@ impl Owner {
                 52,
                 u32::from(status.erp_protection) | p.protection,
             );
+            if let Some(he) = p.he {
+                he.apply_link(&mut link);
+            }
         }
-        for (group, id, body) in [
-            (3, 9, link.to_vec()),
-            (3, 8, mac(local, Some(status.aid)).to_vec()),
-        ] {
+        let he = self.power.phy.negotiated.and_then(|p| p.he);
+        let client = self.hardware.p2p_client_native();
+        let mut mac = match &client {
+            Some(client) => client.mac(2, Some(status.aid), client.desired())?,
+            None => mac(local, Some(status.aid)),
+        };
+        if he.is_some() {
+            put32(&mut mac, 24, 1); // wifi_gen.he_support, MAC_CONFIG v1
+            put32(&mut mac, 32, 1); // NIC not ACK-enabled
+        }
+        let commands = if he.is_some() {
+            alloc::vec![(3, 8, mac.to_vec()), (3, 9, link.to_vec())]
+        } else {
+            alloc::vec![(3, 9, link.to_vec()), (3, 8, mac.to_vec())]
+        };
+        for (group, id, body) in commands {
             if !self
                 .qualified_link_command(group, id, &body, policy)
                 .await?
                 .is_empty()
             {
                 return Err("associated link/MAC receipt invalid");
+            }
+        }
+        if let Some(client) = &client {
+            client.associated(status.aid)?;
+            client.commit_window(
+                u32::from_le_bytes(mac[48..52].try_into().unwrap()),
+                u32::from_le_bytes(mac[20..24].try_into().unwrap()) & 32 != 0,
+            )?;
+        }
+        if let Some(he) = he {
+            let bytes = he.context(
+                self.he_context_version()
+                    .ok_or("MVM HE context API disappeared")?,
+            )?;
+            if !self
+                .qualified_link_command(5, 7, &bytes, policy)
+                .await?
+                .is_empty()
+            {
+                return Err("MVM HE station context receipt invalid");
             }
         }
         self.check_link_power(&policy()?)?;
@@ -329,6 +364,10 @@ impl Owner {
                 let Some(mpdu) = scan_api::mpdu_gen2(&packet.payload) else {
                     continue;
                 };
+                let client = self.hardware.p2p_client_native();
+                if client.is_some() && (mpdu.raw_fw_link != 0 || mpdu.status & 3 != 3) {
+                    continue;
+                }
                 let power = self.power.prepared.as_mut().unwrap();
                 let active = power.active_link.unwrap();
                 let f = mpdu.frame;
@@ -351,6 +390,9 @@ impl Owner {
                 };
                 let mut response = f[..24].to_vec();
                 response.extend_from_slice(body);
+                if let Some(client) = &client {
+                    client.plan.response(&body[6..])?;
+                }
                 let plan = power.mlme.plan.as_mut().unwrap();
                 if let Some(aid) = plan
                     .association_response(&response)
@@ -384,7 +426,7 @@ impl Owner {
                         supported_rates,
                         basic_rates,
                         protected: plan.security().is_rsn(),
-                        pmf: plan.security().is_sae(),
+                        pmf: plan.pmf(),
                         short_preamble: active.channel <= 14 && negotiated & 32 != 0,
                         short_slot: active.channel > 14 || negotiated & 1024 != 0,
                         erp_protection: active.channel <= 14 && erp.is_some_and(|erp| erp & 2 != 0),
@@ -493,7 +535,15 @@ impl Owner {
         let result = async {
             let reply = self
                 .hardware
-                .command_with_header_version(3, 8, &mac(local, None), 0)
+                .command_with_header_version(
+                    3,
+                    8,
+                    &match self.hardware.p2p_client_native() {
+                        Some(client) => client.mac(2, None, client.desired())?,
+                        None => mac(local, None),
+                    },
+                    0,
+                )
                 .await?;
             if !reply.payload.is_empty() {
                 return Err("MAC association close receipt invalid");

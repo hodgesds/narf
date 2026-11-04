@@ -52,3 +52,6 @@ controller paths) are not yet ported, so the board-telemetry drivers
 compile only on x86_64, while a smaller architecture-neutral core
 (SMBus, TPM, thermal, fan) builds everywhere. A `kernel-test` feature
 gates in-tree test support. The crate is `no_std`.
+
+System-sleep submission, per-request completion and SCI wake composition are
+specified in [Platform power service and SCI wake](specification/power-service.md).

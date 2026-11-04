@@ -36,6 +36,7 @@ narf-crypto      = { path = "../../crypto" }
 narf-boot         = { path = "../../boot" }
 narf-init         = { path = "../../init" }
 narf-power        = { path = "../../power" }
+narf-aml          = { path = "../../aml" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-usb  = { path = "../usb" }
 # Per-driver crate (promoted from the former src/mt7921/ module). Built-in
@@ -46,7 +47,7 @@ async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = ["narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test"]
+kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test"]
 
 [lints]
 workspace = true

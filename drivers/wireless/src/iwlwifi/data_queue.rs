@@ -22,6 +22,9 @@ pub struct DataQueue {
     pending: Vec<Option<DmaBuffer>>,
     id: Option<u16>,
     station_tid: Option<(u8, u8)>,
+    /// Further MLD link STAs served by this queue (Linux SCD_QUEUE_CONFIG
+    /// MODIFY new_sta_mask); the allocating station bit is never removed.
+    link_stations: u32,
     aggregated: bool,
     removing: bool,
     read: u16,
@@ -44,6 +47,7 @@ impl DataQueue {
             pending: (0..DEPTH).map(|_| None).collect(),
             id: None,
             station_tid: None,
+            link_stations: 0,
             aggregated: false,
             removing: false,
             read: 0,
@@ -85,6 +89,29 @@ impl DataQueue {
 
     pub(super) fn aggregated(&self) -> bool {
         self.aggregated
+    }
+    /// The firmware STA mask this allocated queue currently serves.
+    pub(super) fn station_mask(&self) -> Option<u32> {
+        let (station, _) = self.station_tid?;
+        self.id?;
+        Some(1 << station | self.link_stations)
+    }
+    pub(super) fn tid(&self) -> Option<u8> {
+        self.station_tid.map(|(_, tid)| tid)
+    }
+    /// Adopt a firmware-acknowledged MODIFY. Only an idle, retained queue
+    /// may change link STAs, and its allocating station stays a member.
+    pub(super) fn modify_station_mask(&mut self, old: u32, new: u32) -> Result<(), &'static str> {
+        let (station, _) = self.station_tid.ok_or("unallocated TX queue mask change")?;
+        if self.removing
+            || !self.is_idle()
+            || self.station_mask() != Some(old)
+            || new & (1 << station) == 0
+        {
+            return Err("TX queue STA mask change ownership/outstanding mismatch");
+        }
+        self.link_stations = new & !(1 << station);
+        Ok(())
     }
     pub(super) fn begin_remove(&mut self, station: u8, tid: u8) -> Result<(), &'static str> {
         if self.removing || !self.belongs_to(station, tid) || !self.is_idle() {
@@ -168,6 +195,45 @@ impl DataQueue {
         Ok(id)
     }
 
+    pub(super) fn ap_snapshot(&self, station: u8) -> Option<(u16, u8, u16, u16)> {
+        let (owned, tid) = self.station_tid?;
+        (owned == station).then_some((self.id?, tid, self.read, self.write))
+    }
+    pub(super) fn validate_ap_flush(
+        &self,
+        read: u16,
+        write: u16,
+        before: u16,
+        after: u16,
+    ) -> Result<(), &'static str> {
+        let normalize = |v: u16| {
+            if self.pre_ax210 {
+                read.wrapping_add(v.wrapping_sub(read) & 255)
+            } else {
+                v
+            }
+        };
+        let before = normalize(before);
+        let after = normalize(after);
+        if before.wrapping_sub(read) > write.wrapping_sub(read) || after != write {
+            return Err("AP flush read pointers exceed exact outstanding native prefix");
+        }
+        self.validate_reclaim(self.native_pointer(after))
+    }
+    /// `iwl_txq_set_q_ptrs`: after WoWLAN the firmware scheduler advanced
+    /// this queue by the frames it transmitted from D3; the drained host
+    /// ring follows it so later TFDs and BA reclaims use the firmware's
+    /// index. The host token keeps its own allocation-time origin, so the
+    /// move is relative (Linux's absolute `seq >> 4` assumes origin zero).
+    pub(super) fn advance_pointers(&mut self, frames: u16) -> Result<(), &'static str> {
+        if self.removing || !self.is_idle() {
+            return Err("TX queue pointers moved with outstanding descriptors");
+        }
+        self.write = self.write.wrapping_add(frames);
+        self.read = self.write;
+        Ok(())
+    }
+
     pub fn is_idle(&self) -> bool {
         self.read == self.write
     }
@@ -213,8 +279,61 @@ impl DataQueue {
         rate: Option<u32>,
         assist: u32,
     ) -> Result<u16, &'static str> {
+        self.send_inner(mmio, frame, header_len, rate, assist, None)
+    }
+    /// AP key authority chooses encryption independently of Protected FC:
+    /// native BIP group management can have that bit clear. Existing station
+    /// callers retain their original Protected-FC selection unchanged.
+    pub(super) fn send_ap(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        encrypt: bool,
+    ) -> Result<u16, &'static str> {
+        if !encrypt && frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            return Err("AP protected frame has no installed native encryption owner");
+        }
+        self.send_ap_assisted(mmio, frame, header_len, rate, encrypt, 0)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn send_ap_assisted(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        encrypt: bool,
+        assist: u32,
+    ) -> Result<u16, &'static str> {
+        if !encrypt && frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            return Err("AP protected frame lacks native key owner");
+        }
+        self.send_inner(mmio, frame, header_len, rate, assist, Some(encrypt))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn send_inner(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+        encrypt: Option<bool>,
+    ) -> Result<u16, &'static str> {
         use super::csum::{OFFLD_IP_HDR, OFFLD_L4_EN};
-        if assist & !(1 << OFFLD_L4_EN | 0x3f << OFFLD_IP_HDR) != 0 {
+        let amsdu = assist & (1 << 14) != 0;
+        if assist & !(1 << OFFLD_L4_EN | 0x3f << OFFLD_IP_HDR | 1 << 14) != 0
+            || amsdu
+                && (assist != 1 << 14
+                    || header_len != 26
+                    || frame.first() != Some(&0x88)
+                    || frame.get(24).is_none_or(|qos| qos & 0x80 == 0))
+            || !amsdu
+                && frame.first() == Some(&0x88)
+                && frame.get(24).is_some_and(|qos| qos & 0x80 != 0)
+        {
             return Err("unsupported TX offload_assist request");
         }
         if !mmio.authorized() {
@@ -235,9 +354,17 @@ impl DataQueue {
         if self.pending[slot].is_some() {
             return Err("TX slot still owned by device");
         }
-        let padding = header_len.next_multiple_of(4) - header_len;
-        // Short command header, 28-byte TX command, MAC header (padded
-        // to a dword), followed by the payload. len excludes the padding.
+        // Linux mvm/tx.c and mld/tx.c make AMSDU/PAD exclusive.
+        // pcie/gen1_2/tx-gen2.c passes !amsdu to build_tx: TB1 ends
+        // immediately after an A-MSDU's QoS header, without a dword gap.
+        let padding = if amsdu {
+            0
+        } else {
+            header_len.next_multiple_of(4) - header_len
+        };
+        // Short command header, generation-selected TX command, then the
+        // MAC header and payload. Ordinary headers use a dword pad; an
+        // A-MSDU has no gap. The native length excludes any padding.
         let command_bytes = if self.pre_ax210 { 20 } else { 28 };
         let mac_offset = 4 + command_bytes;
         let mut bytes = vec![0; mac_offset + frame.len() + padding];
@@ -246,7 +373,8 @@ impl DataQueue {
         put16(&mut bytes, 4, frame.len() as u16);
         // Protected frames use the station's firmware CCMP key. The
         // firmware inserts IV/MIC and advances its TX packet number.
-        let flags = u16::from(rate.is_some()) | if frame[1] & 0x40 != 0 { 0 } else { 2 };
+        let encrypt = encrypt.unwrap_or(frame[1] & 0x40 != 0);
+        let flags = u16::from(rate.is_some()) | if encrypt { 0 } else { 2 };
         let offload = assist
             | ((header_len / 2) as u32) << super::csum::OFFLD_MH_SIZE
             | if padding != 0 {
@@ -390,6 +518,63 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/gen2",
         smoke_gen2_native_tx_command_and_dword_byte_count
+    );
+
+    fn smoke_native_amsdu_omits_pad_flag_and_gap_in_both_tfh_command_layouts() -> TestResult {
+        use super::super::rx_rfh::CompletionFormat;
+        for (format, mac, remainder) in [
+            (CompletionFormat::Qu, 24, 30),
+            (CompletionFormat::Ax210, 32, 38),
+        ] {
+            let mut q = DataQueue::for_format(format).unwrap();
+            q.activate(&[17, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut frame = [0; 48];
+            frame[0] = 0x88;
+            frame[1] = 0x41;
+            frame[24] = 0x80;
+            // One literal Ethernet subframe: DA/SA, BE length8, LLC/SNAP.
+            let body = [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0, 8, 0xaa,
+                0xaa, 3, 0, 0, 0, 8, 0,
+            ];
+            frame[26..].copy_from_slice(&body);
+            q.send_assisted(&mut Mmio, &frame, 26, None, 1 << 14)
+                .unwrap();
+            let dma = q.pending[0].as_ref().unwrap();
+            let bytes = dma.as_slice();
+            let tfd = q.descriptors.as_slice();
+            let offload = if format == CompletionFormat::Qu {
+                u32::from(u16::from_le_bytes(bytes[6..8].try_into().unwrap()))
+            } else {
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+            };
+            let address = |at| u64::from_le_bytes(tfd[at..at + 8].try_into().unwrap());
+            if offload != 0x4d00
+                // The allocator retains whole pages; only the three
+                // independently checked TFD extents are device-visible.
+                || usize::from(u16::from_le_bytes(tfd[2..4].try_into().unwrap()))
+                    + usize::from(u16::from_le_bytes(tfd[12..14].try_into().unwrap()))
+                    + usize::from(u16::from_le_bytes(tfd[22..24].try_into().unwrap()))
+                    != mac + 48
+                || bytes[mac + 24..mac + 26] != [0x80, 0]
+                || bytes[mac + 26..mac + 48] != body
+                || tfd[..4] != [3, 0, 20, 0]
+                || tfd[12..14] != [remainder, 0]
+                || tfd[22..24] != [22, 0]
+                || address(4) != dma.dma_addr().raw()
+                || address(14) != address(4) + 20
+                || address(24) != address(4) + (mac + 26) as u64
+            {
+                return TestResult::Fail(
+                    "native A-MSDU/PAD exclusivity or independent TFH TB extent/address",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/runtime",
+        smoke_native_amsdu_omits_pad_flag_and_gap_in_both_tfh_command_layouts
     );
 
     fn smoke_tx_adaptive_rate_and_qos_padding() -> TestResult {

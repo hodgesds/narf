@@ -17,8 +17,10 @@
 //! order behind every posted write the function issued before the clear)
 //! that must observe a present function and stable D2H write indices,
 //! resets the chip by the ChipCommon watchdog, re-verifies BME clear after
-//! the config shadow restore, halts the ARM CR4 (`brcmf_chip_set_passive`)
-//! and reads the halt back. Only then is the published memory reclaimable.
+//! the config shadow restore, halts the ARM CR4 or CA7 (`brcmf_chip_set_passive`)
+//! and reads the halt back. Under a translating IOMMU the function is
+//! blocked (`Bus::block_dma`) after the flush reads and before the reset.
+//! Only then is the published memory reclaimable.
 use super::*;
 use crate::brcmfmac::chip::{self, Chip};
 
@@ -72,9 +74,14 @@ impl<B: Bus> Runtime<B> {
     /// `CPUHALT`, D11 cores disabled) read back from its wrapper. The
     /// caller must have released the IRQ and cleared BME.
     pub async fn reset_device(&mut self) -> Result<u32, Error> {
+        self.ap_live.store(false, Ordering::Release);
         let common = self.core_of(chip::CORE_CHIPCOMMON)?;
         let pcie = self.core_of(chip::CORE_PCIE2)?;
-        let arm = self.core_of(chip::CORE_ARM_CR4)?;
+        // brcmf_chip_set_passive dispatch: CR4 first, otherwise CA7.
+        let (arm, ca7) = match self.core_of(chip::CORE_ARM_CR4) {
+            Ok(arm) => (arm, false),
+            Err(_) => (self.core_of(chip::CORE_ARM_CA7)?, true),
+        };
         let lsc = self.bus.link_control()?;
         self.bus.set_link_control(lsc & !ASPM_ENAB)?;
         self.backplane_write(common.base + CC_WATCHDOG, 4)?;
@@ -102,14 +109,20 @@ impl<B: Bus> Runtime<B> {
         }
         Chip::reset_core(&mut self.bus, arm, CPUHALT, CPUHALT, CPUHALT)
             .map_err(|_| Error::Access)?;
-        let d11: Vec<chip::Core> = self
-            .cores
-            .iter()
-            .copied()
-            .filter(|core| core.id == chip::CORE_D11)
-            .collect();
-        for core in d11 {
-            Chip::disable_core(&mut self.bus, core, 12, 4).map_err(|_| Error::Access)?;
+        if ca7 {
+            // brcmf_chip_ca7_set_passive: reset the first 80211 core.
+            let d11 = self.core_of(chip::CORE_D11)?;
+            Chip::reset_core(&mut self.bus, d11, 12, 4, 4).map_err(|_| Error::Access)?;
+        } else {
+            let d11: Vec<chip::Core> = self
+                .cores
+                .iter()
+                .copied()
+                .filter(|core| core.id == chip::CORE_D11)
+                .collect();
+            for core in d11 {
+                Chip::disable_core(&mut self.bus, core, 12, 4).map_err(|_| Error::Access)?;
+            }
         }
         let ioctrl = self.backplane_read(arm.wrapper + AI_IOCTRL)?;
         let resetctrl = self.backplane_read(arm.wrapper + AI_RESETCTRL)?;
@@ -127,6 +140,7 @@ impl<B: Bus> Runtime<B> {
         if !self.reclaimable {
             return Err(alloc::boxed::Box::new(self));
         }
+        self.ap_live.store(false, Ordering::Release);
         // The device can no longer master any of these.
         drop(self.resources.take());
         let mut this = core::mem::ManuallyDrop::new(self);
@@ -140,6 +154,7 @@ impl<B: Bus> Runtime<B> {
             core::ptr::drop_in_place(&mut this.response);
             core::ptr::drop_in_place(&mut this.events);
             core::ptr::drop_in_place(&mut this.signal);
+            core::ptr::drop_in_place(&mut this.ap_live);
             core::ptr::drop_in_place(&mut this.cores);
             Ok(bus)
         }
@@ -148,6 +163,7 @@ impl<B: Bus> Runtime<B> {
     /// lost power, a timed-out or terminal owner). On success all
     /// published memory is reclaimable; any failure keeps it pinned.
     pub async fn stop_dead(&mut self) -> Result<DeadStop, Error> {
+        self.ap_live.store(false, Ordering::Release);
         if self.reclaimable {
             return Err(Error::Busy);
         }
@@ -169,6 +185,9 @@ impl<B: Bus> Runtime<B> {
         if first != second {
             return Err(Error::Protocol);
         }
+        // Dead firmware: block at the IOMMU before the watchdog reset and
+        // before anything is reclaimed.
+        self.block_iommu()?;
         let halted = self.reset_device().await?;
         self.reclaimable = true;
         Ok(DeadStop {

@@ -5,6 +5,9 @@ use crate::ath10k::regulatory::Permission;
 
 #[derive(Debug)]
 pub(super) struct Peer {
+    /// The station vdev this BSS peer was created on; HTT RX for any other
+    /// vdev never reaches this peer's data owner.
+    pub(super) vdev: u8,
     pub(super) permission: Permission,
     pub(super) bssid: [u8; 6],
     ids: [u64; 32],
@@ -17,6 +20,34 @@ pub(super) struct Peer {
     pub(super) rsn: Option<alloc::boxed::Box<pmf::Rsn>>,
 }
 impl Peer {
+    /// A BSS peer created on `vdev` and mapped to HTT peer id `id` through
+    /// its own PEER_MAP, for slot-routing tests.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn mapped_for_test(
+        vdev: u8,
+        permission: Permission,
+        bssid: [u8; 6],
+        id: u16,
+    ) -> Result<Self, Error> {
+        let mut peer = Self {
+            vdev,
+            permission,
+            bssid,
+            ids: [0; 32],
+            exchange_stage: 0,
+            associated: None,
+            wmm: None,
+            ht: None,
+            rsn: None,
+        };
+        let mut map = [3, vdev, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        map[2..4].copy_from_slice(&id.to_le_bytes());
+        map[4..10].copy_from_slice(&bssid);
+        if !peer.record(&map)? {
+            return Err(Error::Malformed);
+        }
+        Ok(peer)
+    }
     pub(super) fn owns(&self, id: u16) -> bool {
         id < 2048 && self.ids[usize::from(id) / 64] & (1u64 << (id % 64)) != 0
     }
@@ -25,6 +56,9 @@ impl Peer {
             .iter()
             .enumerate()
             .find_map(|(i, b)| (*b != 0).then(|| (i * 64 + b.trailing_zeros() as usize) as u16))
+    }
+    pub(super) fn pfc_ids(&self) -> &[u64; 32] {
+        &self.ids
     }
     fn record(&mut self, b: &[u8]) -> Result<bool, Error> {
         match b.first() {
@@ -36,7 +70,8 @@ impl Peer {
                 if id >= 2048 {
                     return Err(Error::Malformed);
                 }
-                if b[1] != 0 || b[4..10] != self.bssid {
+                // htt_rx.c PEER_MAP `vdev_id` (byte 1) must be this peer's vdev.
+                if b[1] != self.vdev || b[4..10] != self.bssid {
                     if self.ids[usize::from(id) / 64] & (1u64 << (id % 64)) != 0 {
                         return Err(Error::Malformed);
                     }
@@ -79,27 +114,34 @@ pub(super) mod pmf;
 pub use disconnect::Disconnected;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn retained_station_permission(&self) -> Result<Permission, Error> {
-        self.peer
+        self.station
+            .peer
             .as_ref()
-            .map(|p| p.permission)
+            .map(|p| p.permission.clone())
             .ok_or(Error::Failed)
     }
     pub(in crate::ath10k) fn ht_capabilities(&self) -> Option<[u8; 26]> {
-        self.htt
-            .wmi
-            .caps
-            .as_ref()
-            .and_then(|c| ht::capability(c, false))
+        self.htt.wmi.caps.as_ref().and_then(|c| {
+            self.chains
+                .and_then(|chains| ht::capability(c, false, chains))
+        })
     }
     pub(in crate::ath10k) fn ht40_capabilities(&self) -> Option<[u8; 26]> {
-        self.htt
-            .wmi
-            .caps
-            .as_ref()
-            .and_then(|c| ht::capability(c, true))
+        self.htt.wmi.caps.as_ref().and_then(|c| {
+            self.chains
+                .and_then(|chains| ht::capability(c, true, chains))
+        })
     }
     pub(in crate::ath10k) fn vht_capabilities(&self) -> Option<[u8; 12]> {
-        self.htt.wmi.caps.as_ref().and_then(ht::vht_capability)
+        self.htt.wmi.caps.as_ref().and_then(|caps| {
+            self.chains.and_then(|chains| {
+                self.htt
+                    .wmi
+                    .wide_vht_nss()
+                    .and_then(|maximum| ht::vht_wide_capability(caps, chains, maximum))
+                    .or_else(|| ht::vht_capability(caps, chains))
+            })
+        })
     }
     pub(super) async fn send_station_command(
         &mut self,
@@ -135,27 +177,81 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         frequency: u16,
     ) -> Result<(Permission, Option<ht::Profile>), Error> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
+        let chains = self.chains.ok_or(Error::Failed)?;
+        // Only the station client consumes the radar `beacon_found` witness.
+        let hint = self.beacon_hints.client_receipt(domain);
         let cached = self
             .scan_cache
             .iter()
             .find(|b| b.bssid == bssid && b.frequency == frequency)
             .ok_or(Error::Unsupported)?;
         let pair = ht40_pair(frequency);
+        if let Some(maximum) = self.htt.wmi.wide_vht_nss() {
+            if let Ok(Some(profile)) = ht::Profile::offer_wide(caps, cached, own, chains, maximum) {
+                if let (Some(partner), Some(wide)) =
+                    (profile.secondary, profile.vht.and_then(|v| v.wide))
+                {
+                    // Contiguous160 needs the whole 160 MHz block (AUTO_BW)
+                    // and the radar witness for each constituent; 80+80
+                    // needs each separate segment. Either falls back.
+                    let permission = if wide.contiguous {
+                        Permission::contiguous160_with_hint(
+                            caps,
+                            domain,
+                            frequency,
+                            partner,
+                            hint.clone(),
+                        )
+                    } else {
+                        Permission::discontiguous_with_hint(
+                            caps,
+                            domain,
+                            frequency,
+                            partner,
+                            wide.center2,
+                            hint.clone(),
+                        )
+                    };
+                    if let Ok(permission) = permission {
+                        if permission.center == profile.center
+                            && permission.center2 == Some(wide.center2)
+                            && permission.contiguous160() == wide.contiguous
+                        {
+                            return Ok((permission, Some(profile)));
+                        }
+                    }
+                }
+            }
+        }
         // VHT advertises HT20/40 plus an 80 MHz-capable VHT element, so it is
         // offered only when the whole 80 MHz segment is host-permitted. The
         // occupied receipt then matches the AP's selected 20/40/80 geometry;
         // a VHT offer the AP or policy cannot take falls back to HT40/HT20.
-        if let Some(wide) = pair
-            .filter(|_| ht::vht_supported(caps))
-            .and_then(|s| Permission::occupied_width(caps, domain, frequency, Some(s), true).ok())
-        {
-            if let Ok(Some(v)) = ht::Profile::offer(caps, cached, own, ht::Phy::Vht) {
+        if let Some(wide) = pair.filter(|_| ht::vht_supported(caps)).and_then(|s| {
+            Permission::occupied_width_with_hint(
+                caps,
+                domain,
+                frequency,
+                Some(s),
+                true,
+                hint.clone(),
+            )
+            .ok()
+        }) {
+            if let Ok(Some(v)) = ht::Profile::offer(caps, cached, own, ht::Phy::Vht, chains) {
                 if let Some(vht) = v.vht {
                     let permission = if vht.eighty {
                         Ok(wide)
                     } else {
-                        Permission::occupied(caps, domain, frequency, v.secondary)
+                        Permission::occupied_width_with_hint(
+                            caps,
+                            domain,
+                            frequency,
+                            v.secondary,
+                            false,
+                            hint.clone(),
+                        )
                     };
                     if let Ok(permission) = permission {
                         if permission.center != v.center
@@ -173,14 +269,25 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             caps,
             cached,
             own,
-            if pair.is_some() {
+            if pair.is_some() || self.coexistence_wide(bssid, frequency) {
                 ht::Phy::Ht40
             } else {
                 ht::Phy::Ht20
             },
+            chains,
         )?;
-        if let Some(h) = ht.filter(|h| h.secondary.is_some()) {
-            if let Ok(permission) = Permission::occupied(caps, domain, frequency, h.secondary) {
+        if let Some(h) = ht.filter(|h| {
+            h.secondary.is_some()
+                && (frequency >= 3000 || self.coexistence_geometry(bssid, frequency, h.secondary))
+        }) {
+            if let Ok(permission) = Permission::occupied_width_with_hint(
+                caps,
+                domain,
+                frequency,
+                h.secondary,
+                false,
+                hint.clone(),
+            ) {
                 if permission.center != h.center {
                     return Err(Error::Unsupported);
                 }
@@ -192,15 +299,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // because its negotiated offer narrowed to20 would still advertise40
         // without the occupied40 permission whose native owner it promises.
         Ok((
-            Permission::from_domain(caps, domain, frequency)?,
-            ht::Profile::offer(caps, cached, own, ht::Phy::Ht20)?,
+            Permission::occupied_width_with_hint(caps, domain, frequency, None, false, hint)?,
+            ht::Profile::offer(caps, cached, own, ht::Phy::Ht20, chains)?,
         ))
     }
     pub fn associated_station(&self) -> Option<StationAssociated> {
         if self.failed {
             return None;
         }
-        let peer = self.peer.as_ref()?;
+        let peer = self.station.peer.as_ref()?;
         peer.mapped()?;
         peer.associated
     }
@@ -270,7 +377,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(htt::Error::from)?;
         use narf_wireless::association::{channel, Bss, JoinPlan, SecurityMode};
         let peer = self.prepared_peer().ok_or(Error::Failed)?;
-        if self.peer.as_ref().ok_or(Error::Failed)?.exchange_stage != 0 {
+        if self
+            .station
+            .peer
+            .as_ref()
+            .ok_or(Error::Failed)?
+            .exchange_stage
+            != 0
+        {
             return Err(Error::Failed);
         }
         let cached = self
@@ -289,9 +403,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             beacon_interval: cached.beacon_interval,
             information_elements: wire::owned(&cached.information_elements)?,
         };
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
-        let offered_ht = self.peer.as_ref().ok_or(Error::Failed)?.ht;
+        let offered_ht = self.station.peer.as_ref().ok_or(Error::Failed)?.ht;
+        let vdev = self.station.peer.as_ref().ok_or(Error::Failed)?.vdev;
         let mut plan = JoinPlan::prepare_with_options(
             &bss,
             own,
@@ -356,16 +471,33 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             aid,
             protected: security != SecurityMode::Open,
         };
-        let command = mlme::peer_phy(
+        let mut command = mlme::peer_phy(
             self.wire.dialect,
+            vdev,
             associated,
             capability,
             plan.legacy_rates().0,
             wmm.is_some(),
             ht,
         )?;
-        let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
+        // Linux ath10k_peer_assoc_h_crypto: `peer_flags->pmf` for an MFP
+        // station on MFP-capable firmware. Only the hardware-key profile
+        // sets it; the software profile keeps robust management on the host.
+        let pmf_offload = if self.hardware_keys {
+            super::hw_keys::management_offload(self.wire.dialect, self.features, plan.pmf())
+        } else {
+            None
+        };
+        if let Some(flag) = pmf_offload {
+            super::hw_keys::mark_peer_pmf(self.wire.dialect, &mut command, flag)?;
+        }
+        self.station.peer_pmf_offload = pmf_offload.is_some();
+        let up = mlme::up(self.wire.dialect, vdev, peer.bssid, aid)?;
         let contention = wmm
+            .or_else(|| {
+                self.ap_dirty_wmm
+                    .then(|| wmm::legacy_defaults(peer.frequency, plan.legacy_rates().0))
+            })
             .map(|p| wmm::command(self.wire.dialect, p))
             .transpose()?;
         // Existing failed state precedes both publications and stays retained
@@ -373,6 +505,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         for command in contention.iter().chain([&command, &up]) {
             self.send_station_command(command, validate).await?;
         }
+        self.ap_dirty_wmm = false;
         // Consume maps/unmaps/completions already received with the command
         // receipts before reporting the configured peer; never revive a lost
         // peer. Flood/cancellation keeps this same owner closed.
@@ -383,15 +516,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let event = checked_policy(self.station_progress(), validate).await?;
-            if self.peer.as_ref().and_then(Peer::mapped).is_none() {
+            if self.station.peer.as_ref().and_then(Peer::mapped).is_none() {
                 return Err(Error::Failed);
             }
             match event {
                 htt::Event::Idle => {
-                    self.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
-                    self.peer.as_mut().ok_or(Error::Failed)?.wmm = wmm;
-                    self.peer.as_mut().ok_or(Error::Failed)?.ht = ht;
-                    self.peer.as_mut().ok_or(Error::Failed)?.rsn = rsn;
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.wmm = wmm;
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.ht = ht;
+                    self.station.peer.as_mut().ok_or(Error::Failed)?.rsn = rsn;
                     self.failed = false;
                     return Ok(associated);
                 }
@@ -406,12 +539,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed {
             return None;
         }
-        let peer = self.peer.as_ref()?;
+        self.prepared_peer_snapshot()
+    }
+    pub(super) fn prepared_peer_snapshot(&self) -> Option<PeerPrepared> {
+        let peer = self.station.peer.as_ref()?;
         Some(PeerPrepared {
             bssid: peer.bssid,
             frequency: peer.permission.frequency,
-            center_frequency: peer.permission.center,
-            bandwidth_mhz: bandwidth(peer.permission),
+            center_frequency: chandef(&peer.permission).0,
+            second_center_frequency: chandef(&peer.permission).1,
+            bandwidth_mhz: bandwidth(&peer.permission),
             peer_id: peer.mapped()?,
             maximum_power_dbm: peer.permission.half_dbm / 2,
         })
@@ -435,9 +572,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<PeerPrepared, Error> {
         validate()?;
-        if self.failed || self.ready.is_none() || self.peer.is_some() {
+        if self.failed
+            || self.ready.is_none()
+            || self.station.peer.is_some()
+            || self.scan_pending.is_some()
+        {
             return Err(Error::Failed);
         }
+        // One channel across station slots (`ath10k_tlv_if_limit`).
+        if !self.sibling_channel_admits(frequency) {
+            return Err(Error::Unsupported);
+        }
+        self.prepare_coexistence(domain, bssid, frequency, validate)
+            .await?;
         let bss = self
             .scan_cache
             .iter()
@@ -459,12 +606,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             ies = &ies[2 + n..];
         }
+        let beacon_interval = bss.beacon_interval;
         let (permission, ht) = self.station_profile(domain, bssid, frequency)?;
-        let rd = self.wire.domain(permission)?;
-        let power = self.wire.power(permission)?;
+        self.bind_coexistence_width(bssid, &permission)?;
+        let rd = self.wire.domain(&permission)?;
+        let power = self.wire.power(&permission)?;
+        // A station BSS lives on its slot's vdev: the managed vdev for the home
+        // station, the P2P_CLI vdev for a P2P client (`arvif->vdev_id`).
+        let vdev = self.station_vdev();
         let mut start = self
             .wire
-            .start_station(permission, bss.beacon_interval, dtim)?;
+            .start_station(vdev, &permission, beacon_interval, dtim)?;
         if let Some(ht) = ht {
             let channel = if self.wire.dialect == Dialect::Tlv {
                 84
@@ -474,20 +626,21 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             wire::put(
                 &mut start,
                 channel + 12,
-                ht.start_mode(frequency) | ht.channel_flags(),
+                ht.start_mode(frequency) | ht.channel_flags() | wire::start_center2(&permission).1,
             );
         }
         let inventory = if permission.secondary.is_some() {
             Some(
                 self.wire
-                    .station_ht40_channels(permission, ht.is_some_and(|h| h.vht.is_some()))?,
+                    .station_ht40_channels(&permission, ht.is_some_and(|h| h.vht.is_some()))?,
             )
         } else {
             None
         };
-        let create = self.wire.peer(bssid)?;
-        self.peer = Some(Peer {
-            permission,
+        let create = self.wire.peer(vdev, bssid)?;
+        self.station.peer = Some(Peer {
+            vdev,
+            permission: permission.clone(),
             bssid,
             ids: [0; 32],
             exchange_stage: 0,
@@ -520,14 +673,20 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Wmi(bytes)
                     if wire::word(&bytes, 0)? & 0xffffff == self.wire.start_response_id() =>
                 {
-                    if self.wire.start_response(&bytes[4..])?.is_some() {
+                    if self.wire.start_response(vdev, &bytes[4..])?.is_some() {
                         started = true;
                         break;
                     }
                 }
                 htt::Event::Idle => narf_scheduler::yield_now().await,
                 htt::Event::Progress => {}
-                other => self.queue(other)?,
+                // The radio observers and a sibling slot's PEER_MAP/UNMAP see
+                // the event once here (`station_event` parks the sibling's),
+                // instead of reaching a later data step that skips them.
+                other => match self.station_event(other)? {
+                    htt::Event::Idle | htt::Event::Progress => {}
+                    other => self.queue(other)?,
+                },
             }
         }
         if !started {
@@ -544,13 +703,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = checked_policy(self.station_progress(), validate).await?;
             match event {
                 htt::Event::Idle => {
-                    if let Some(id) = self.peer.as_ref().and_then(Peer::mapped) {
+                    if let Some(id) = self.station.peer.as_ref().and_then(Peer::mapped) {
                         self.failed = false;
                         return Ok(PeerPrepared {
                             bssid,
                             frequency,
-                            center_frequency: permission.center,
-                            bandwidth_mhz: bandwidth(permission),
+                            center_frequency: chandef(&permission).0,
+                            second_center_frequency: chandef(&permission).1,
+                            bandwidth_mhz: bandwidth(&permission),
                             peer_id: id,
                             maximum_power_dbm: permission.half_dbm / 2,
                         });
@@ -573,10 +733,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.prepared_peer().is_none() {
             return Err(Error::Failed);
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
-        let permission = peer.permission;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
+        let permission = peer.permission.clone();
         permission.check(domain)?;
-        management::validate(frame, self.ready.ok_or(Error::Failed)?.mac, peer.bssid)?;
+        management::validate(frame, self.station_own()?, peer.bssid)?;
         if frame[0] == 0 {
             let bss = self
                 .scan_cache
@@ -615,7 +775,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .transmit(
                         htt::tx::Parameters {
                             kind: htt::tx::Kind::Management,
-                            vdev: 0,
+                            vdev: self.station_vdev(),
                             tid: 17,
                             hardware_crypto: false,
                         },
@@ -628,7 +788,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             management::Path::Inline(command) => {
-                let command = management::inline(command, frame)?;
+                let command = management::inline(command, self.station_vdev(), frame)?;
                 self.htt
                     .wmi
                     .htc
@@ -642,7 +802,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             management::Path::Reference => {
                 let (id, address) = self.htt.wmi.htc.transport.prepare_wmi_management(frame)?;
-                let command = management::reference(id, address, frame)?;
+                let command = management::reference(self.station_vdev(), id, address, frame)?;
                 self.htt
                     .wmi
                     .htc
@@ -681,7 +841,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.prepared_peer().is_none() {
             return Err(Error::Failed);
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         let expected = match (
             peer.exchange_stage,
             frame.map_or(Some(0xb0), |f| f.first().copied()),
@@ -695,7 +855,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let bssid = peer.bssid;
         let frequency = peer.permission.frequency;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let own = self.station_own()?;
         if let Some(frame) = frame {
             self.transmit_management(domain, frame).await?;
         }
@@ -710,7 +870,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             let event = self.station_progress().await?;
-            if self.peer.as_ref().and_then(Peer::mapped).is_none() {
+            if self.station.peer.as_ref().and_then(Peer::mapped).is_none() {
                 return Err(Error::Failed);
             }
             match event {
@@ -751,7 +911,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     if status != 0 {
                         return Err(Error::Firmware(u32::from(status)));
                     }
-                    self.peer.as_mut().ok_or(Error::Failed)?.exchange_stage += 1;
+                    self.station
+                        .peer
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .exchange_stage += 1;
                     self.failed = false;
                     return Ok(rx.frame);
                 }
@@ -765,24 +929,53 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn take_management_completion(&mut self) -> Option<ManagementCompletion> {
         self.management_done.pop_front()
     }
+    /// The current slot's next event: one a sibling slot parked for it
+    /// (its own PEER_MAP, RX, BA note or BSS management polled while the
+    /// sibling owned the radio), else a fresh poll. Every station wait loop
+    /// (prepare START/PEER_MAP, association, MLME, protection/flush,
+    /// disconnect, WoW) therefore sees its own parked events.
     pub(super) async fn station_progress(&mut self) -> Result<htt::Event, Error> {
+        if let Some(event) = self.station.inbox.pop_front() {
+            return self.slot_event(event);
+        }
         let event = self.htt.poll().await?;
         self.station_event(event)
     }
     pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        // A GO beside this slot consumes the events it owns.
+        if self.ap_is_go() {
+            let frame = self.management_frame(&event);
+            let primary = self.primary.id();
+            if !self.station.claims(&event, primary, frame.as_deref()) {
+                match self.route_go(event, frame.as_deref()) {
+                    Some(event) => return self.station_event_owned(event),
+                    None => return Ok(htt::Event::Progress),
+                }
+            }
+        }
+        self.station_event_owned(event)
+    }
+    fn station_event_owned(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        self.observe_beacon_hint_event(&event)?;
+        self.observe_dwell_scan(&event)?;
+        self.observe_roc(&event)?;
+        self.capture_roc_management(&event)?;
+        self.observe_coexistence(&event)?;
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
                 if let Some(reports) = management::completions(bytes)? {
+                    let mut ids = Vec::new();
+                    ids.try_reserve_exact(reports.len())
+                        .map_err(|_| Error::NoMemory)?;
+                    ids.extend(reports.iter().map(|r| r.id));
+                    // The GO's own descriptors complete on its session.
+                    let reports = self.route_go_management(reports);
                     if self.management_done.len() + reports.len() > 128 {
                         return Err(Error::Exhausted);
                     }
                     self.management_done
                         .try_reserve(reports.len())
                         .map_err(|_| Error::NoMemory)?;
-                    let mut ids = Vec::new();
-                    ids.try_reserve_exact(reports.len())
-                        .map_err(|_| Error::NoMemory)?;
-                    ids.extend(reports.iter().map(|r| r.id));
                     self.htt.wmi.htc.transport.complete_wmi_management(&ids)?;
                     self.management_done.extend(reports);
                     return Ok(htt::Event::Progress);
@@ -790,8 +983,33 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         if let htt::Event::Message(bytes) = &event {
-            if self.peer.as_mut().ok_or(Error::Failed)?.record(bytes)? {
+            if self.observe_roc_peer(bytes)? {
                 return Ok(htt::Event::Progress);
+            }
+            if let Some(peer) = &mut self.station.peer {
+                if peer.record(bytes)? {
+                    return Ok(htt::Event::Progress);
+                }
+            }
+            // htt_rx.c ath10k_peer_map_event keys the peer by its vdev: a
+            // map/unmap this slot did not record may be the sibling's.
+            if matches!(bytes.first(), Some(3 | 4)) {
+                if let Some(sibling) = self.p2p_client.as_deref_mut().filter(|s| s.peer.is_some()) {
+                    sibling.park(htt::Event::Message(bytes.clone()));
+                }
+            }
+        }
+        Ok(event)
+    }
+    /// An event a sibling slot parked for this one: only this slot's own
+    /// peer map/unmap bookkeeping runs again (radio-level observers already
+    /// saw the event when it was first polled).
+    pub(super) fn slot_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        if let htt::Event::Message(bytes) = &event {
+            if let Some(peer) = &mut self.station.peer {
+                if peer.record(bytes)? {
+                    return Ok(htt::Event::Progress);
+                }
             }
         }
         Ok(event)
@@ -799,7 +1017,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// The future station worker must drive this same retained event path.
     /// No peer-map event authenticates an association or opens a data port.
     pub async fn poll_station(&mut self) -> Result<htt::Event, Error> {
-        if self.failed || self.peer.is_none() {
+        if self.failed || self.station.peer.is_none() {
             return Err(Error::Failed);
         }
         self.failed = true;
@@ -809,16 +1027,35 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 }
 
-/// The HT40 partner inside the qualified non-DFS 80 MHz segments.
+/// The HT40 partner inside the qualified 80 MHz segments.
 fn ht40_pair(frequency: u16) -> Option<u16> {
     Some(match frequency {
         5180 | 5220 | 5745 | 5785 => frequency + 20,
         5200 | 5240 | 5765 | 5805 => frequency - 20,
+        // Radar HT40 pairs ch52/56 .. ch140/144 (lower channel at a 40 MHz
+        // boundary from ch36), admitted only under a client radar witness.
+        f if Permission::dfs_frequency(f) => {
+            if (f - 5180) % 40 == 0 {
+                f + 20
+            } else {
+                f - 20
+            }
+        }
         _ => return None,
     })
 }
-fn bandwidth(permission: Permission) -> u8 {
-    if permission.width80 {
+/// cfg80211 chandef `center_freq1`/`center_freq2`: a contiguous160
+/// receipt reports its whole 160 MHz center and no second segment.
+fn chandef(permission: &Permission) -> (u16, Option<u16>) {
+    match permission.center2 {
+        Some(second) if permission.contiguous160() => ((permission.center + second) / 2, None),
+        second => (permission.center, second),
+    }
+}
+fn bandwidth(permission: &Permission) -> u8 {
+    if permission.center2.is_some() {
+        160
+    } else if permission.width80 {
         80
     } else if permission.secondary.is_some() {
         40

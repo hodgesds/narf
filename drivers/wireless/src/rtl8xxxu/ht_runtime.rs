@@ -14,6 +14,37 @@ use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
 use narf_wireless::association::phy::{LocalHt, LocalPhy};
 
+#[path = "ht40_geometry.rs"]
+mod ht40_geometry;
+#[path = "ht40_program.rs"]
+mod ht40_program;
+#[path = "ht40_qualification.rs"]
+mod ht40_qualification;
+pub(super) use ht40_geometry::Geometry;
+pub(super) use ht40_program::{Mode as WideMode, Plan as WidePlan, Program as WideProgram, RxSeal};
+pub(super) use ht40_qualification::{request as wide_request, Qualification as WideQualification};
+
+pub(super) fn wide_ht() -> LocalHt {
+    use narf_wireless::association::phy::{HtGi, HtWidth};
+    LocalHt::new(
+        [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        HtWidth::TwentyForty,
+        HtGi {
+            rx20: false,
+            tx20: false,
+            rx40: false,
+            tx40: false,
+        },
+        0,
+        0,
+    )
+    .expect("fixed EU HT20/40 LGI SISO")
+}
+pub(super) fn local_wide() -> LocalPhy {
+    LocalPhy::ht40(wide_ht()).expect("fixed EU HT20/40 LGI SISO")
+}
+
 const HEADER: usize = 160;
 const LENGTH: usize = HEADER + 8 * 128;
 const UNKNOWN: i16 = i16::MAX;

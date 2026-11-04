@@ -12,9 +12,9 @@
 //! Multi-Link element (UHR operation is defined for MLDs), the UHR
 //! Capabilities element outside beacons, a consistent NPCA configuration
 //! (`cfg80211_chandef_add_npca` / `cfg80211_chandef_npca_valid`) and
-//! consistent DBE parameters. Because a UHR association is an MLD
-//! association, the single-link `JoinPlan` never negotiates UHR; a native
-//! owner whose firmware associates as a non-AP MLD opts in with
+//! consistent DBE parameters. UHR requires MLD association: ordinary
+//! `JoinPlan` constructors keep it closed; `JoinPlan::prepare_mld` supplies
+//! the explicit single-link MLD contract. A native MLD owner opts in with
 //! `LocalUhr::for_mld_association` on the `Offer::from_elements` path.
 use super::eht::EhtNegotiation;
 use super::phy::Width;

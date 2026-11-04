@@ -45,6 +45,65 @@ pub trait Fullmac: Send {
     /// Exact attached native family can qualify VHT80 from its firmware.
     /// CYW43439 has no such PHY, regardless of malformed capability replies.
     const VHT80: bool = false;
+    /// Actual primary-bsscfg AP transport owner. SDIO stays conservative
+    /// until its own native AP lifecycle/terminal composition is qualified.
+    const PRIMARY_AP: bool = false;
+    /// Actual primary native flagged-radiotap owner; SDIO keeps false until
+    /// its independent firmware/BCDC/host composition is qualified.
+    const PRIMARY_MONITOR: bool = false;
+    fn monitor_reserve(
+        &mut self,
+        _prepared: crate::brcmfmac::monitor_native::Prepared,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn monitor_arm(&mut self, _armed: crate::brcmfmac::monitor_native::Armed) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn monitor_leave(
+        &mut self,
+        _original: &crate::brcmfmac::monitor_scope::Capture,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn pop_monitor(&mut self) -> Option<crate::brcmfmac::monitor_scope::Received> {
+        None
+    }
+    fn monitor_control_idle(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        None
+    }
+    fn ap_enter(&mut self, _original: crate::brcmfmac::ap_scope::Capture) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// An actual transport publication returns an owned native terminal
+    /// waiter. Dropping it requests no fabricated DMA release or ACK.
+    fn ap_send(
+        &mut self,
+        _bytes: &[u8],
+        _priority: u8,
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Err(Error::Unsupported)
+    }
+    /// Start actual flow retirement after the concrete AP closed host DATA.
+    /// False means old native IDs/delete receipts are still owned.
+    fn ap_leave(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_completed_prefix(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    /// All actual host TX IDs have matching native terminals. This is not
+    /// an assertion about the firmware's private MAC/RX-key FIFO state.
+    fn ap_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_retire_peer(&mut self, _peer: [u8; 6]) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
     fn command<'a>(
         &'a mut self,
         direction: Direction,
@@ -52,6 +111,66 @@ pub trait Fullmac: Send {
         input: &'a [u8],
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a;
+    /// Per-ifidx AP transport owners: one firmware-SME AP per firmware
+    /// interface (Linux `brcmf_cfg80211_start_ap` addresses every dcmd to
+    /// `ifp->ifidx`). Interface 0 is the primary methods above; a
+    /// secondary ifidx is owned only through `vif_bsscfg::Bsscfg`, whose
+    /// interface its owner opened. Primary ownership is unchanged by it.
+    const SECONDARY_AP: bool = false;
+    fn ap_enter_on(
+        &mut self,
+        _ifidx: u8,
+        _original: crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_send_on(
+        &mut self,
+        _ifidx: u8,
+        _bytes: &[u8],
+        _priority: u8,
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_leave_on(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_completed_prefix_on(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_quiet_on(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn ap_retire_peer_on(&mut self, _ifidx: u8, _peer: [u8; 6]) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    /// [`Self::command_ap`] addressed to secondary firmware interface
+    /// `ifidx`; `blocked` is the caller's retained per-bsscfg record check.
+    fn command_ap_on<'a>(
+        &'a mut self,
+        _ifidx: u8,
+        _original: &'a crate::brcmfmac::ap_scope::Capture,
+        _direction: Direction,
+        _command: u32,
+        _input: &'a [u8],
+        _maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        core::future::ready(Err(Error::Unsupported))
+    }
+    /// Original fixed AP Program scope reaches actual native publication.
+    /// Unsupported backends deny by default. Stop/source-only cleanup uses
+    /// ordinary command and never obtains new AP Program authority.
+    fn command_ap<'a>(
+        &'a mut self,
+        _original: &'a crate::brcmfmac::ap_scope::Capture,
+        _direction: Direction,
+        _command: u32,
+        _input: &'a [u8],
+        _maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        core::future::ready(Err(Error::Unsupported))
+    }
     fn configure_bus(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
     /// Consumed transport records, bounded per call. Positive progress may
     /// leave more RX/events beyond the budget. Zero requires an actual current
@@ -62,6 +181,69 @@ pub trait Fullmac: Send {
     fn pop_event(&mut self) -> Option<Event>;
     fn pop_data(&mut self) -> Option<Vec<u8>>;
     fn send_data(&mut self, frame: &[u8], priority: u8) -> Result<(), Error>;
+    /// The transport demultiplexes secondary firmware interfaces (ifidx
+    /// 1..`vif_wire::MAX_IFS`): BCDC `flags2`/`BCDC_DCMD_IF_SHIFT` on SDIO,
+    /// per-(ifidx, tid, da) flow rings and message ifidx on PCIe. Interface
+    /// 0 behaviour of every method above is unchanged by it.
+    const VIF_DEMUX: bool = false;
+    /// This runtime is the `struct brcmf_if` view of a secondary bsscfg
+    /// (`brcmfmac::vif_bsscfg::Bsscfg`). Role owners then issue the
+    /// `brcmf_fil_bsscfg_*` form Linux uses where the primary keeps its
+    /// established dcmd (e.g. `wsec` instead of `BRCMF_C_SET_WSEC`).
+    const BSSCFG: bool = false;
+    /// Retain `BRCMF_E_IF` and secondary-bsscfg events for
+    /// [`Self::pop_vif_event`] (otherwise they are dropped, as Linux does
+    /// for a bsscfg without `brcmf_if`). Disabling purges them.
+    fn vif_listen(&mut self, _on: bool) {}
+    /// Admit data on a secondary ifidx; only its interface owner calls
+    /// this, after its own link lifecycle allows traffic.
+    fn vif_open(&mut self, _ifidx: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Stop admitting data on `ifidx` and start retiring its native
+    /// resources. `Ok(true)` only once none remain owned (PCIe flow delete
+    /// completions); callers keep polling until then.
+    fn vif_close(&mut self, _ifidx: u8) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn pop_vif_event(&mut self) -> Option<Event> {
+        None
+    }
+    fn pop_vif_data(&mut self, _ifidx: u8) -> Option<Vec<u8>> {
+        None
+    }
+    fn send_vif_data(&mut self, _ifidx: u8, _frame: &[u8], _priority: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Control command addressed to firmware interface `ifidx`
+    /// (`brcmf_fil_cmd_data` uses `ifp->ifidx`). Never carries AP scope.
+    fn command_vif<'a>(
+        &'a mut self,
+        _ifidx: u8,
+        _direction: Direction,
+        _command: u32,
+        _input: &'a [u8],
+        _maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        core::future::ready(Err(Error::Unsupported))
+    }
+    /// Record `need`'s firmware events and return the device-wide union
+    /// every `event_msgs` writer must send (`brcmfmac::event_mask`; Linux
+    /// `brcmf_fweh_activate_events` writes the union of all registered
+    /// handlers). Transports without a composition return `events`.
+    fn events_compose(
+        &mut self,
+        _need: crate::brcmfmac::event_mask::Need,
+        events: crate::brcmfmac::event_mask::Mask,
+    ) -> crate::brcmfmac::event_mask::Mask {
+        events
+    }
+    /// A successful `event_msgs` SET carried `mask`.
+    fn events_written(&mut self, _mask: crate::brcmfmac::event_mask::Mask) {}
+    /// The mask last written, when the transport tracks it.
+    fn events_current(&mut self) -> Option<crate::brcmfmac::event_mask::Mask> {
+        None
+    }
     /// Only a station's correlated link/key lifecycle calls this method.
     /// Transport completion alone must never call it or open a controlled port.
     fn set_link(&mut self, peer: Option<[u8; 6]>);
@@ -84,6 +266,19 @@ pub trait Fullmac: Send {
     fn resume_transport(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
         async { Err(Error::Unsupported) }
     }
+    /// Linux `bus_if->wowl_supported`: the bus can keep the dongle powered
+    /// and let it wake the host from system suspend (PCIe
+    /// `pci_pme_capable(pdev, PCI_D3hot)`; SDIO `MMC_PM_KEEP_POWER` with a
+    /// wake IRQ). Enabling PME / the platform wake source is the system-PM
+    /// owner's job, not the driver's. Transports without one report false.
+    fn wowl_supported(&mut self) -> bool {
+        false
+    }
+    /// Linux `brcmf_bus_wowl_config`: WoWL was armed (`true`, end of
+    /// `brcmf_configure_wowl`) or disarmed (`brcmf_cfg80211_resume`); the
+    /// next [`Self::suspend_transport`] keeps a bus wake path. Buses whose
+    /// suspend does not depend on it ignore it.
+    fn wowl_config(&mut self, _enabled: bool) {}
     /// Bus-match firmware vendor (Linux `bus_if->fwvid`).
     fn firmware_vendor(&self) -> FirmwareVendor {
         FirmwareVendor::Wcc
@@ -122,10 +317,79 @@ pub trait Fullmac: Send {
     fn transport_failed(&self) -> bool {
         false
     }
+    /// The transport's chip profile is neither the retained 3x3/80 MHz
+    /// BCM43602 nor CYW43439, so the capability probe may admit up to four
+    /// chains/streams and, from the firmware's own `bw_cap` 160 bit plus a
+    /// reported 160 MHz chanspec, the 160 MHz VHT capability bits
+    /// (Linux `brcmf_update_ht_cap`/`brcmf_update_vht_cap`).
+    fn wide_phy(&self) -> bool {
+        false
+    }
 }
 impl<T: PacketTransport> Fullmac for Runtime<T> {
+    fn ap_enter(&mut self, original: crate::brcmfmac::ap_scope::Capture) -> Result<(), Error> {
+        Runtime::ap_enter(self, original)
+    }
+    fn ap_send(
+        &mut self,
+        bytes: &[u8],
+        priority: u8,
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Runtime::ap_send(self, bytes, priority, original)
+    }
+    fn ap_leave(&mut self) -> Result<bool, Error> {
+        Runtime::ap_leave(self)
+    }
+    fn ap_completed_prefix(&mut self) -> Result<bool, Error> {
+        Runtime::ap_completed_prefix(self)
+    }
+    fn ap_quiet(&mut self) -> Result<bool, Error> {
+        Runtime::ap_quiet(self)
+    }
+    fn ap_retire_peer(&mut self, peer: [u8; 6]) -> Result<bool, Error> {
+        Runtime::ap_retire_peer(self, peer)
+    }
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        Runtime::ap_source(self)
+    }
+    async fn stop_transport(&mut self) -> Result<(), Error> {
+        Runtime::stop_for_reset(self)
+    }
+    /// Linux `sdio.c::brcmf_sdio_bus_reset` (`mmc_hw_reset`) and the
+    /// function's re-probe (`runtime_reset.rs`).
+    async fn reset_transport(&mut self) -> Result<(), Error> {
+        Runtime::reset_transport(self)
+    }
+    fn take_generation(&mut self) -> Option<Self> {
+        Runtime::take_generation(self)
+    }
+    async fn suspend_transport(&mut self) -> Result<(), Error> {
+        Runtime::suspend_transport(self).await
+    }
+    async fn resume_transport(&mut self) -> Result<(), Error> {
+        Runtime::resume_transport(self).await
+    }
+    fn wowl_supported(&mut self) -> bool {
+        Runtime::wowl_supported(self)
+    }
+    fn wowl_config(&mut self, enabled: bool) {
+        Runtime::wowl_config(self, enabled)
+    }
+    fn release_transport(&mut self) -> bool {
+        Runtime::release_transport(self)
+    }
+    fn transport_failed(&self) -> bool {
+        Runtime::is_failed(self)
+    }
     const FAMILY: Family = Family::Sdio;
     const EXTERNAL_CLM: bool = true;
+    // The whole native SDIO AP composition (Card/F2/SDPCM/BCDC firmware-SME
+    // path, Program ownership, stop/pin, preverification hold) is in place.
+    // Metadata still requires an actual original typed Card/firmware source,
+    // exact native `ap` capability token and GET_AP0 discovery; START then
+    // requires its own actual command/BSS/SCB/key/port receipts.
+    const PRIMARY_AP: bool = true;
     fn command<'a>(
         &'a mut self,
         direction: Direction,
@@ -134,6 +398,16 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
         Runtime::command(self, direction, command, input, maximum)
+    }
+    fn command_ap<'a>(
+        &'a mut self,
+        original: &'a crate::brcmfmac::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        Runtime::command_ap(self, original, direction, command, input, maximum)
     }
     async fn configure_bus(&mut self) -> Result<(), Error> {
         for name in [b"bus:txglom\0".as_slice(), b"bus:rxglom\0".as_slice()] {
@@ -159,6 +433,97 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
         Runtime::send_data(self, frame, priority)
     }
     fn set_link(&mut self, _: Option<[u8; 6]>) {}
+    const VIF_DEMUX: bool = true;
+    fn vif_listen(&mut self, on: bool) {
+        Runtime::vif_listen(self, on)
+    }
+    fn events_compose(
+        &mut self,
+        need: crate::brcmfmac::event_mask::Need,
+        events: crate::brcmfmac::event_mask::Mask,
+    ) -> crate::brcmfmac::event_mask::Mask {
+        self.event_composition().compose(need, events)
+    }
+    fn events_written(&mut self, mask: crate::brcmfmac::event_mask::Mask) {
+        self.event_composition().written(mask)
+    }
+    fn events_current(&mut self) -> Option<crate::brcmfmac::event_mask::Mask> {
+        self.event_composition().current()
+    }
+    fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
+        Runtime::vif_open(self, ifidx)
+    }
+    fn vif_close(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Ok(Runtime::vif_close(self, ifidx))
+    }
+    fn pop_vif_event(&mut self) -> Option<Event> {
+        Runtime::pop_vif_event(self)
+    }
+    fn pop_vif_data(&mut self, ifidx: u8) -> Option<Vec<u8>> {
+        Runtime::pop_vif_data(self, ifidx)
+    }
+    fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
+        Runtime::send_data_on(self, ifidx, frame, priority)
+    }
+    const SECONDARY_AP: bool = true;
+    fn ap_enter_on(
+        &mut self,
+        ifidx: u8,
+        original: crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), Error> {
+        Runtime::ap_enter_if(self, secondary(ifidx)?, original)
+    }
+    fn ap_send_on(
+        &mut self,
+        ifidx: u8,
+        bytes: &[u8],
+        priority: u8,
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<crate::brcmfmac::ap_tx::Ticket, Error> {
+        Runtime::ap_send_if(self, secondary(ifidx)?, bytes, priority, original)
+    }
+    fn ap_leave_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Runtime::ap_leave_if(self, secondary(ifidx)?)
+    }
+    fn ap_completed_prefix_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Runtime::ap_completed_prefix_if(self, secondary(ifidx)?)
+    }
+    fn ap_quiet_on(&mut self, ifidx: u8) -> Result<bool, Error> {
+        Runtime::ap_completed_prefix_if(self, secondary(ifidx)?)
+    }
+    fn ap_retire_peer_on(&mut self, ifidx: u8, peer: [u8; 6]) -> Result<bool, Error> {
+        Runtime::ap_retire_peer_if(self, secondary(ifidx)?, peer)
+    }
+    async fn command_ap_on<'a>(
+        &'a mut self,
+        ifidx: u8,
+        original: &'a crate::brcmfmac::ap_scope::Capture,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        Runtime::command_ap_if(
+            self,
+            secondary(ifidx)?,
+            original,
+            direction,
+            command,
+            input,
+            maximum,
+        )
+        .await
+    }
+    fn command_vif<'a>(
+        &'a mut self,
+        ifidx: u8,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        Runtime::command_on(self, ifidx, direction, command, input, maximum)
+    }
     fn set_ac_priority(&mut self, ac_priority: [u8; 8]) {
         Runtime::set_ac_priority(self, ac_priority)
     }
@@ -167,5 +532,14 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     }
     fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
         Runtime::interrupt(self).map(|signal| (signal, true))
+    }
+}
+
+/// A secondary firmware interface index (1..`vif_wire::MAX_IFS`).
+pub(crate) fn secondary(ifidx: u8) -> Result<u8, Error> {
+    if ifidx == 0 || ifidx >= crate::brcmfmac::vif_wire::MAX_IFS {
+        Err(Error::Malformed)
+    } else {
+        Ok(ifidx)
     }
 }

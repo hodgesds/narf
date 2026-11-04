@@ -9,8 +9,14 @@ use super::{
         Memory, Phase, Prepared,
     },
 };
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use alloc::{
+    boxed::Box,
+    string::String,
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -18,6 +24,22 @@ use narf_wireless::{
     WirelessNetIface,
 };
 use zeroize::Zeroizing;
+#[path = "channel_runtime.rs"]
+mod channel_runtime;
+#[path = "endpoint_routes.rs"]
+mod endpoint_routes;
+#[path = "lifecycle.rs"]
+mod lifecycle;
+#[path = "rebuild_native.rs"]
+mod rebuild_native;
+#[path = "recovery.rs"]
+pub(crate) mod recovery;
+#[path = "scan_runtime.rs"]
+mod scan_runtime;
+#[path = "supervisor.rs"]
+pub(crate) mod supervisor;
+#[path = "system_sleep.rs"]
+mod system_sleep;
 type Error = station::Error;
 struct EndpointState {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
@@ -28,6 +50,7 @@ struct EndpointState {
 struct Received {
     bytes: Vec<u8>,
     publication: Arc<station::Publication>,
+    generation: u64,
 }
 impl EndpointState {
     fn clear(&mut self) {
@@ -46,13 +69,27 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     environment: E,
     name: String,
     published: AtomicBool,
+    route: AtomicU64,
     admission: Arc<station::Admission>,
     up: AtomicBool,
     bssid: AtomicU64,
     ht: AtomicBool,
+    ht40: AtomicBool,
+    /// RTL8821AE per-band host capability (`rtl8821ae::vht::HOST_*`).
+    rtl8821ae_caps: AtomicU8,
+    /// RTL8192EE `rtl8192ee::ht::host_capabilities` bits (0 otherwise).
+    rtl8192ee_caps: AtomicU8,
+    /// RTL8192CE / 8188CE `rtl8192ce::ht::host_capabilities` bits (0
+    /// otherwise).
+    rtl8192ce_caps: AtomicU8,
+    rts_threshold: AtomicU32,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
+    lifecycle: lifecycle::Lifecycle,
+    work: Mutex<Option<supervisor::Work>>,
+    scan_request: Mutex<()>,
+    scan_cache: IrqSafeSpinLock<Vec<scan_runtime::Observation>>,
     /// `rtl_pci_remove` ran: the publisher worker exits.
     removed: AtomicBool,
 }
@@ -72,6 +109,17 @@ const WATCHDOG_MS: u64 = 2_000;
 /// Linux `rtl88ee_mod_params.fwctrl_lps` (module parameter `fwlps`),
 /// default off exactly like the upstream RTL8188EE driver.
 static FW_LPS: AtomicBool = AtomicBool::new(false);
+static INACTIVE_PS: AtomicBool = AtomicBool::new(true);
+static PCIE_ASPM: AtomicBool = AtomicBool::new(true);
+/// Linux's default-on `aspm` preparation policy. Changes apply at the next
+/// cold preparation; they do not claim completion of a live PCI transition.
+pub fn set_pcie_aspm(enabled: bool) {
+    PCIE_ASPM.store(enabled, Ordering::Release);
+}
+/// Equivalent to Linux rtl8188ee's default-on `ips` parameter.
+pub fn set_inactive_power_save(enabled: bool) {
+    INACTIVE_PS.store(enabled, Ordering::Release);
+}
 /// Module-parameter equivalent of `rtl8188ee fwlps=`.
 pub fn set_leisure_power_save(enabled: bool) {
     FW_LPS.store(enabled, Ordering::Release);
@@ -118,11 +166,13 @@ impl<I: Port<Buffer = M>, M: Memory, E: Environment> core::fmt::Debug for Device
 struct Attempt<'a> {
     device: &'a dyn Close,
     owner: Option<Arc<AtomicBool>>,
+    generation: u64,
     armed: bool,
 }
 trait Close: Sync {
     fn close(&self);
     fn request_abort(&self);
+    fn abort_generation(&self, expected: u64);
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
@@ -130,7 +180,7 @@ impl Drop for Attempt<'_> {
             if let Some(owner) = &self.owner {
                 owner.store(true, Ordering::Release);
             }
-            self.device.request_abort();
+            self.device.abort_generation(self.generation);
         }
     }
 }
@@ -144,11 +194,38 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         self.admission.abort.store(true, Ordering::Release);
         self.close();
     }
+    fn abort_generation(&self, expected: u64) {
+        let publication = self.admission.publication.lock();
+        if self.lifecycle.generation() == expected {
+            self.admission.abort.store(true, Ordering::Release);
+            self.commit_close(publication);
+        }
+    }
 }
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Device<I, M, E> {
+    /// The RTL8821AE envelope publishes HT on some band.
+    fn rtl8821ae_host_ht(&self) -> bool {
+        use super::rtl8821ae::vht::{HOST_HT_2G, HOST_HT_5G};
+        self.rtl8821ae_caps.load(Ordering::Acquire) & (HOST_HT_2G | HOST_HT_5G) != 0
+    }
+    /// The RTL8192EE envelope publishes 2.4 GHz HT.
+    fn rtl8192ee_host_ht(&self) -> bool {
+        self.rtl8192ee_caps.load(Ordering::Acquire) & super::rtl8192ee::ht::HOST_HT_2G != 0
+    }
+    /// The RTL8192CE / 8188CE envelope publishes 2.4 GHz HT.
+    fn rtl8192ce_host_ht(&self) -> bool {
+        self.rtl8192ce_caps.load(Ordering::Acquire) & super::rtl8192ce::ht::HOST_HT_2G != 0
+    }
+    pub(crate) fn configured_rts_threshold(&self) -> Option<u16> {
+        u16::try_from(self.rts_threshold.load(Ordering::Acquire)).ok()
+    }
     fn commit_close(&self, _publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         self.admission.closed.store(true, Ordering::Release);
         self.ht.store(false, Ordering::Release);
+        self.ht40.store(false, Ordering::Release);
+        self.rtl8821ae_caps.store(0, Ordering::Release);
+        self.rtl8192ee_caps.store(0, Ordering::Release);
+        self.rtl8192ce_caps.store(0, Ordering::Release);
         *self.rx.lock() = None;
         self.update_link(None);
     }
@@ -176,13 +253,23 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             environment,
             name: name.into(),
             published: AtomicBool::new(false),
+            route: AtomicU64::new(0),
             admission,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
             ht: AtomicBool::new(false),
+            ht40: AtomicBool::new(false),
+            rtl8821ae_caps: AtomicU8::new(0),
+            rtl8192ee_caps: AtomicU8::new(0),
+            rtl8192ce_caps: AtomicU8::new(0),
+            rts_threshold: AtomicU32::new(u32::MAX),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
+            lifecycle: lifecycle::Lifecycle::new(),
+            work: Mutex::new(None),
+            scan_request: Mutex::new(()),
+            scan_cache: IrqSafeSpinLock::new(Vec::new()),
             removed: AtomicBool::new(false),
         }
     }
@@ -212,7 +299,53 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         {
             return Err(Error::State);
         }
-        if matches!(
+        if owner.chip() == super::prepare::Chip::Rtl8821ae {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8821ae(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
+        } else if owner.chip() == super::prepare::Chip::Rtl8192ee {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8192ee(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
+        } else if owner.chip() == super::prepare::Chip::Rtl8192ce {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8192ce(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
+        } else if owner.chip() == super::prepare::Chip::Rtl8723be {
+            // RTL8723BE is not admitted: its radio/channel/BT-coexistence
+            // owner is incomplete, so no 88EE calibration may qualify it.
+            return Err(Error::Profile);
+        } else if matches!(
             owner.phase(),
             Phase::RadioConfigured | Phase::ChannelConfigured
         ) {
@@ -220,16 +353,31 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .map_err(|_| Error::Profile)?;
             let domain = self.environment.domain()?;
             let permission = calibration
-                .permission(&domain, 1)
+                .permission(&domain, self.lifecycle.channel.load(Ordering::Acquire))
                 .map_err(|_| Error::Profile)?;
             owner.configure_channel(permission).await?;
             owner.configure_mac(&self.factory)?;
             owner.stage_station_calibration(calibration, &domain)?;
         }
         if owner.phase() == Phase::MacConfigured && !owner.station_calibration_present() {
+            if matches!(
+                owner.chip(),
+                super::prepare::Chip::Rtl8821ae
+                    | super::prepare::Chip::Rtl8192ee
+                    | super::prepare::Chip::Rtl8192ce
+            ) {
+                return Err(Error::Profile);
+            }
             let calibration = super::channel_power::Calibration::load_registered(&self.factory)
                 .map_err(|_| Error::Profile)?;
             owner.stage_station_calibration(calibration, &self.environment.domain()?)?;
+        }
+        if owner.station_phase() == station::Phase::Dormant && owner.phase() == Phase::MacConfigured
+        {
+            if let Err(error) = owner.prepare_station_bus_power(&self.environment).await {
+                self.close();
+                return Err(error);
+            }
         }
         if owner.station_phase() == station::Phase::Dormant {
             let rx = self.rx.clone();
@@ -245,6 +393,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             }
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
+            self.ht40
+                .store(owner.station_ht40_supported(), Ordering::Release);
+            self.rtl8821ae_caps.store(
+                owner.station_rtl8821ae_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ee_caps.store(
+                owner.station_rtl8192ee_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ce_caps.store(
+                owner.station_rtl8192ce_host_caps(&self.environment),
+                Ordering::Release,
+            );
             owner.start_station_service(&self.environment).await?;
         }
         if owner.station_phase() == station::Phase::Failed {
@@ -260,23 +422,28 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         {
             return Err(());
         }
-        let publication = {
+        let (publication, generation) = {
             let owner = self.prepared.try_lock().ok_or(())?;
             let owner = owner.as_ref().ok_or(())?;
             if owner.station_peer().is_none() {
                 return Err(());
             }
-            owner
+            let publication = owner
                 .station_publication_token(&self.environment)
                 .map_err(|_| {
                     self.request_abort();
-                })?
+                })?;
+            (publication, self.lifecycle.generation())
         };
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
+        let _lease = self
+            .lifecycle
+            .lease(&self.admission, generation)
+            .ok_or(())?;
         let result = self.environment.domain().and_then(|domain| {
             publication.invoke(&domain, || {
                 Ok(self
@@ -296,12 +463,18 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             Ok(Some(result)) => result,
             Ok(None) => Err(()),
             Err(_) => {
-                self.request_abort();
+                self.abort_generation(generation);
                 Err(())
             }
         }
     }
     fn progress(&self) -> Vec<Received> {
+        if self.lifecycle.rebuilding.load(Ordering::Acquire)
+            || self.lifecycle.suspended.load(Ordering::Acquire)
+            || self.lifecycle.inactive.load(Ordering::Acquire)
+        {
+            return Vec::new();
+        }
         let Some(mut storage) = self.prepared.try_lock() else {
             return Vec::new();
         };
@@ -311,6 +484,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
+        let generation = self.lifecycle.generation();
         if self.admission.closed.load(Ordering::Acquire) {
             state.clear();
             self.withdraw_interrupts(owner);
@@ -407,6 +581,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .map(|bytes| Received {
                     bytes,
                     publication: publication.clone(),
+                    generation,
                 })
                 .collect())
         })();
@@ -502,6 +677,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             signal.raise();
         }
         self.withdraw();
+        let _control = self.lifecycle.control.lock().await;
         let mut storage = self.prepared.lock().await;
         self.state.lock().await.clear();
         let Some(owner) = storage.as_mut() else {
@@ -513,38 +689,83 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let _ = owner.disconnect_station_peer().await;
         }
         let reclaimed = owner.retire().await;
+        let publishers_retired = self.lifecycle.drain_publications().await.is_ok();
         if reclaimed {
             // Proven idle (or never published): Drop releases every ring.
             storage.take();
         }
-        reclaimed
+        reclaimed && publishers_retired
     }
     /// Withdraw this device from every registry `publish` entered.
     fn withdraw(self: &Arc<Self>) {
         if !self.published.swap(false, Ordering::AcqRel) {
             return;
         }
-        let was_active = {
-            let mut active = ACTIVE.lock();
-            let this = Arc::as_ptr(self) as *const ();
-            let matches = active
-                .as_ref()
-                .is_some_and(|a| Arc::as_ptr(a) as *const () == this);
-            if matches {
-                *active = None;
-            }
-            matches
-        };
+        let cookie = self.route.swap(0, Ordering::AcqRel);
+        ROUTES.lock().remove(cookie, Arc::as_ptr(self) as *const ());
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
         narf_net::iface::unregister(&self.name);
-        if was_active {
-            CLAIMED.store(false, Ordering::Release);
-        }
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn removed_for_test(&self) -> bool {
         self.removed.load(Ordering::Acquire)
+    }
+    /// Thermal source watchdog; an unavailable/revoked qualification never
+    /// substitutes a default gain curve and a failed transition closes carrier.
+    pub(super) async fn gain_tracking(&self) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if owner.track_station_gain(&self.environment).await.is_err() {
+            owner.abort_station();
+            self.close();
+        }
+    }
+    pub(super) async fn antenna_diversity(&self) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if owner
+            .progress_station_antenna(&self.environment)
+            .await
+            .is_err()
+        {
+            owner.abort_station();
+            self.close();
+        }
+    }
+    pub(crate) fn antenna_diversity_request(
+        &self,
+        firmware: super::firmware_transport::Identity,
+    ) -> Result<super::AntennaDiversityRequest, Error> {
+        let storage = self.prepared.try_lock().ok_or(Error::Busy)?;
+        storage
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_antenna_request(firmware, &self.environment)
+    }
+    pub(crate) fn thermal_tracking_request(
+        &self,
+        firmware: super::firmware_transport::Identity,
+    ) -> Result<super::ThermalTrackingRequest, Error> {
+        let storage = self.prepared.try_lock().ok_or(Error::Busy)?;
+        storage
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_tracking_request(firmware, &self.environment)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn factory_for_test(&self) -> &Factory {
+        &self.factory
     }
     /// `rtl88e_dm_watchdog` RA step: refresh the firmware rate mask from
     /// the smoothed RX PWDB. A failed H2C aborts the station (the next
@@ -613,6 +834,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             if !allowed {
                 break;
             }
+            let Some(_lease) = self.lifecycle.lease(&self.admission, frame.generation) else {
+                break;
+            };
             let mut bytes = frame.bytes;
             let result = self.environment.domain().and_then(|domain| {
                 frame.publication.invoke(&domain, || {
@@ -623,7 +847,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 })
             });
             if result.is_err() {
-                self.request_abort();
+                self.abort_generation(frame.generation);
                 break;
             }
         }
@@ -639,9 +863,61 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     pub(crate) fn pending_for_test(&self) -> Option<bool> {
         self.state.try_lock().map(|state| state.pending.is_some())
     }
+    fn attach_route(self: &Arc<Self>) -> Result<u64, Error> {
+        if self.removed.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let cookie = ROUTES.lock().insert(self.clone())?;
+        if self
+            .route
+            .compare_exchange(0, cookie, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            ROUTES.lock().remove(cookie, Arc::as_ptr(self) as *const ());
+            return Err(Error::State);
+        }
+        Ok(cookie)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn attach_stack_for_test(self: &Arc<Self>) -> Result<(), Error> {
+        let cookie = self.attach_route()?;
+        narf_net::iface::register_with_context(&self.name, self.factory.mac, cookie, send);
+        narf_net::iface::install_rx_drain(drain);
+        self.published.store(true, Ordering::Release);
+        Ok(())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn withdraw_stack_for_test(self: &Arc<Self>) {
+        self.request_abort();
+        self.withdraw();
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn admit_for_test(&self) {
         self.published.store(true, Ordering::Release);
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fail_for_test(&self) {
+        self.request_abort();
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn generation_for_test(&self) -> u64 {
+        self.lifecycle.generation()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn environment_for_test(&self) -> &E {
+        &self.environment
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn channel_for_test(&self) -> u8 {
+        self.lifecycle.channel.load(Ordering::Acquire)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn power_flags_for_test(&self) -> (bool, bool, bool) {
+        (
+            self.lifecycle.suspended.load(Ordering::Acquire),
+            self.lifecycle.inactive.load(Ordering::Acquire),
+            self.lifecycle.sleep_complete.load(Ordering::Acquire),
+        )
     }
 }
 fn admitted(bytes: &[u8], own: [u8; 6]) -> bool {
@@ -689,6 +965,30 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> WirelessNetIface
     for Device<I, M, E>
 {
+    fn rts_threshold(&self) -> Option<u32> {
+        (!self.removed.load(Ordering::Acquire)).then(|| self.rts_threshold.load(Ordering::Acquire))
+    }
+    fn set_rts_threshold(&self, threshold: u32) -> Result<(), i32> {
+        if threshold != u32::MAX && threshold > 2347 {
+            return Err(-22); // EINVAL, cfg80211 maximum MPDU threshold.
+        }
+        if self.removed.load(Ordering::Acquire) {
+            return Err(-19); // ENODEV.
+        }
+        // Same owner -> publication order as ordinary TX. No await or
+        // interrupt-disabling lock surrounds the regular owner lock.
+        let storage = self.prepared.try_lock().ok_or(-16)?; // EBUSY.
+        let owner = storage.as_ref().ok_or(-16)?;
+        owner
+            .admit_station_rts_threshold(threshold != u32::MAX, &self.environment)
+            .map_err(|_| -95)?; // EOPNOTSUPP: no current exact NERT program.
+        let _publication = self.admission.publication.lock();
+        if self.removed.load(Ordering::Acquire) {
+            return Err(-19);
+        }
+        self.rts_threshold.store(threshold, Ordering::Release);
+        Ok(())
+    }
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -697,6 +997,28 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
     fn supports_scan_dwell(&self) -> bool {
         true
+    }
+    /// RTL8821AE `base.c::_rtl_init_mac80211` WoWLAN capability
+    /// (`rtl8821ae::wow::support`); the system suspend/resume owner is
+    /// `system_sleep.rs` (WoWLAN `rtl8821ae_card_disable` branch).
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.lifecycle
+            .wowlan_capable
+            .load(Ordering::Acquire)
+            .then(super::rtl8821ae::wow::support)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        if !self.lifecycle.wowlan_capable.load(Ordering::Acquire) {
+            return Err(narf_wireless::EOPNOTSUPP);
+        }
+        if let Some(config) = &config {
+            super::rtl8821ae::wow::validate(config).map_err(|_| -22)?; // EINVAL
+        }
+        *self.lifecycle.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.lifecycle.wowlan.lock().clone()
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if self.admission.closed.load(Ordering::Acquire) {
@@ -709,120 +1031,115 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         &[0x000fac04]
     }
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
-        self.prepared
-            .try_lock()?
-            .as_ref()?
-            .station_candidates(self.environment.now_ms())
-            .into_iter()
-            .find(|candidate| candidate.bss.bssid == bssid)
-            .map(|candidate| candidate.bss.information_elements)
+        self.scan_ies(bssid)
     }
     fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
         use narf_wireless::iface::*;
+        // One entry per band with an admitted channel (the RTL8821AE
+        // profile's 5 GHz `NAPC` permissions add the 5000 MHz band).
+        let bands = {
+            let (low, high): (Vec<u32>, Vec<u32>) = self
+                .available_channels()
+                .into_iter()
+                .partition(|&channel| channel < 36);
+            let mut bands = vec![WirelessBand {
+                freq_mhz: 2400,
+                channels: low,
+            }];
+            if !high.is_empty() {
+                bands.push(WirelessBand {
+                    freq_mhz: 5000,
+                    channels: high,
+                });
+            }
+            bands
+        };
+        // VHT is a 5 GHz sband capability only (`_rtl_init_mac80211`).
+        let vht_supported = bands.len() > 1
+            && self.rtl8821ae_caps.load(Ordering::Acquire) & super::rtl8821ae::vht::HOST_VHT_5G
+                != 0;
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.factory.mac,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: vec![1],
-            }],
+            bands,
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: self.ht.load(Ordering::Acquire),
-                vht_supported: false,
+                ht_supported: self.ht.load(Ordering::Acquire)
+                    || self.rtl8821ae_host_ht()
+                    || self.rtl8192ee_host_ht()
+                    || self.rtl8192ce_host_ht(),
+                vht_supported,
                 he_supported: false,
                 eht_supported: false,
             },
         }
     }
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        (band == 2400 && self.ht.load(Ordering::Acquire)).then(|| {
+        let band_listed = band == 2400
+            || band == 5000
+                && self
+                    .available_channels()
+                    .iter()
+                    .any(|&channel| channel >= 36);
+        // RTL8821AE: per-band HT/VHT from the envelope's admitted points
+        // (`_rtl_init_mac80211`: VHT only on the 5 GHz sband).
+        if band_listed && self.rtl8821ae_host_ht() {
+            return super::rtl8821ae::vht::host_phy(
+                self.rtl8821ae_caps.load(Ordering::Acquire),
+                band,
+            );
+        }
+        // RTL8192EE: 2.4 GHz HT from the `N92E` envelope's admitted points.
+        if band_listed && self.rtl8192ee_host_ht() {
+            return super::rtl8192ee::ht::host_phy(
+                self.rtl8192ee_caps.load(Ordering::Acquire),
+                band,
+            );
+        }
+        // RTL8192CE / 8188CE: 2.4 GHz HT from the `N92C` envelope's
+        // admitted points at the board's RF type.
+        if band_listed && self.rtl8192ce_host_ht() {
+            return super::rtl8192ce::ht::host_phy(
+                self.rtl8192ce_caps.load(Ordering::Acquire),
+                band,
+            );
+        }
+        (band_listed && self.ht.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: narf_wireless::association::phy::LocalHt::siso20(false, false)
-                    .capability_body(),
+                ht: if self.ht40.load(Ordering::Acquire) {
+                    super::ht::wide_capability()
+                } else {
+                    narf_wireless::association::phy::LocalHt::siso20(true, true)
+                        .with_rx_amsdu_7935(true)
+                }
+                .capability_body(),
                 vht: None,
             }
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
-        if self.admission.closed.load(Ordering::Acquire) {
-            return Err(WirelessError::HardwareError);
-        }
-        let mut storage = self.prepared.lock().await;
-        let owner = storage
-            .as_mut()
-            .ok_or(if self.environment.preparation_failed() {
-                WirelessError::HardwareError
-            } else {
-                WirelessError::Busy
-            })?;
-        self.ready(owner).await.map_err(error)?;
-        if owner.station_phase() != station::Phase::Passive {
-            return Err(WirelessError::Busy);
-        }
-        let mut attempt = Attempt {
-            device: self,
-            owner: Some(owner.station_cancellation()),
-            armed: true,
-        };
-        let deadline = self.environment.now_ms().saturating_add(dwell);
-        let result = async {
-            loop {
-                owner.progress_station(&self.environment)?;
-                if self.environment.now_ms() >= deadline {
-                    break;
-                }
-                self.environment.pause().await;
-            }
-            Ok::<_, Error>(
-                owner
-                    .station_candidates(self.environment.now_ms())
-                    .into_iter()
-                    .filter(|candidate| {
-                        request.ssids.is_empty()
-                            || request
-                                .ssids
-                                .iter()
-                                .any(|ssid| ssid.is_empty() || *ssid == candidate.bss.ssid)
-                    })
-                    .map(|candidate| BssInfo {
-                        bssid: candidate.bss.bssid,
-                        ssid: candidate.bss.ssid,
-                        channel: 1,
-                        frequency_mhz: 2412,
-                        rssi: i8::MIN,
-                        security: if candidate.rsne.is_some() {
-                            narf_wireless::scan::BssSecurity::Wpa2
-                        } else if candidate.bss.capability & 16 != 0 {
-                            narf_wireless::scan::BssSecurity::Wep
-                        } else {
-                            narf_wireless::scan::BssSecurity::Open
-                        },
-                    })
-                    .collect(),
-            )
-        }
-        .await;
-        attempt.armed = false;
-        if result.is_err() {
-            owner.abort_station();
-            self.close();
-        }
-        result.map_err(error)
+        self.scan_channels(request).await
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        if !matches!(
+            &request.security,
+            SecurityConfig::Open | SecurityConfig::Wpa2 { .. }
+        ) {
+            return Err(WirelessError::NotSupported);
+        }
+        self.select_join_channel(&request).await?;
+        let _control = self.lifecycle.control.lock().await;
         if self.admission.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        if request.channel != 1 || request.frequency_mhz != 2412 {
-            return Err(WirelessError::NotSupported);
+        if request.channel != u32::from(self.lifecycle.channel.load(Ordering::Acquire)) {
+            return Err(WirelessError::Busy);
         }
-        let (mode, pmk) = match request.security {
+        let (mode, pmk) = match &request.security {
             SecurityConfig::Open => (narf_wireless::association::SecurityMode::Open, None),
             SecurityConfig::Wpa2 { psk } => (
                 narf_wireless::association::SecurityMode::Wpa2Psk,
-                Some(Zeroizing::new(psk)),
+                Some(Zeroizing::new(*psk)),
             ),
             _ => return Err(WirelessError::NotSupported),
         };
@@ -836,18 +1153,23 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let mut attempt = Attempt {
             device: self,
             owner: Some(owner.station_cancellation()),
+            generation: self.lifecycle.generation(),
             armed: true,
         };
-        let result = owner
-            .connect_station(
-                request.bssid,
-                &request.ssid,
-                mode,
-                pmk,
-                &request.ie,
-                &self.environment,
-            )
-            .await;
+        let result = async {
+            self.observe_join_target(owner, &request).await?;
+            owner
+                .connect_station(
+                    request.bssid,
+                    &request.ssid,
+                    mode,
+                    pmk,
+                    &request.ie,
+                    &self.environment,
+                )
+                .await
+        }
+        .await;
         attempt.armed = false;
         if self.admission.closed.load(Ordering::Acquire) {
             owner.abort_station();
@@ -875,14 +1197,16 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let mut attempt = Attempt {
             device: self,
             owner: None,
+            generation: self.lifecycle.generation(),
             armed: true,
         };
+        let _control = self.lifecycle.control.lock().await;
+        attempt.generation = self.lifecycle.generation();
         let mut storage = self.prepared.lock().await;
         self.state.lock().await.clear();
         self.close();
         let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
         let result = owner.disconnect_station().await.map_err(error);
-        attempt.armed = false;
         // Safe rejoin: a completed disassociation leaves a Passive station
         // on the same live owner. Reopen admission under the owner and
         // publication locks; the advanced receive epoch fences every stale
@@ -891,34 +1215,58 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             && owner.station_phase() == station::Phase::Passive
             && !self.removed.load(Ordering::Acquire)
         {
+            if let Err(reason) = self.lifecycle.drain_publications().await {
+                owner.abort_station();
+                self.request_abort();
+                attempt.armed = false;
+                return Err(error(reason));
+            }
             let _publication = self.admission.publication.lock();
             self.admission.abort.store(false, Ordering::Release);
             self.admission.closed.store(false, Ordering::Release);
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
+            self.ht40
+                .store(owner.station_ht40_supported(), Ordering::Release);
+            self.rtl8821ae_caps.store(
+                owner.station_rtl8821ae_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ee_caps.store(
+                owner.station_rtl8192ee_host_caps(&self.environment),
+                Ordering::Release,
+            );
+            self.rtl8192ce_caps.store(
+                owner.station_rtl8192ce_host_caps(&self.environment),
+                Ordering::Release,
+            );
         }
+        attempt.armed = false;
         result
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
-        if config.channel == 1 && config.tx_power_dbm.is_none() {
-            Ok(())
-        } else {
-            Err(WirelessError::NotSupported)
+        let channel = u8::try_from(config.channel).map_err(|_| WirelessError::NotSupported)?;
+        if config.tx_power_dbm.is_some() || !super::rtl8821ae::envelope::station_channel(channel) {
+            return Err(WirelessError::NotSupported);
         }
+        if channel == self.lifecycle.channel.load(Ordering::Acquire)
+            && !self.admission.closed.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.environment
+            .change_channel(channel)
+            .ok_or(WirelessError::NotSupported)?
+            .await
+            .map_err(error)
     }
 }
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
+    if request.random_mac.is_some()
         || request.colocated_6ghz
         || !request.extra_ies.is_empty()
-        || request
-            .frequencies_mhz
-            .iter()
-            .any(|frequency| *frequency != 2412)
-        || request.frequencies_mhz.is_empty()
-            && request.channels.iter().any(|channel| *channel != 1)
         || request.ssids.len() > 32
+        || request.active && request.ssids.len() > super::probe_scan::MAX_SSIDS
         || request.ssids.iter().any(|ssid| ssid.len() > 32)
     {
         return Err(WirelessError::NotSupported);
@@ -939,6 +1287,87 @@ pub(super) mod publication_test {
         pin::pin,
         task::{Context, Waker},
     };
+
+    pub(in crate::rtlwifi) fn copied_then_revoke<
+        I: Port<Buffer = M> + 'static,
+        M: Memory + 'static,
+        E: Environment + 'static,
+    >(
+        device: &Device<I, M, E>,
+        source: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    ) -> Result<(), &'static str> {
+        let frame = device
+            .progress()
+            .pop()
+            .ok_or("EE fixture lacks real native copied RX")?;
+        source.revoke();
+        let mut invoked = false;
+        let domain = device
+            .environment
+            .domain()
+            .map_err(|_| "EE copied policy")?;
+        let result = frame.publication.invoke(&domain, || {
+            invoked = true;
+            Ok(())
+        });
+        if invoked || matches!(result, Ok(Some(_))) {
+            return Err("EE revoked source reached copied callback");
+        }
+        device.abort_generation(frame.generation);
+        Ok(())
+    }
+    pub(in crate::rtlwifi) async fn old_copy_and_error_across_rebuild<
+        I: Port<Buffer = M> + 'static,
+        M: Memory + 'static,
+        E: recovery::Rebuild<I, M> + 'static,
+    >(
+        device: &Arc<Device<I, M, E>>,
+    ) -> Result<(), &'static str> {
+        let old = device
+            .progress()
+            .pop()
+            .ok_or("EE fixture lacks actual native copied RX")?;
+        let lease = device
+            .lifecycle
+            .lease(&device.admission, old.generation)
+            .ok_or("EE old callback could not enter publication")?;
+        let attempt = Attempt {
+            device: device.as_ref(),
+            owner: None,
+            generation: old.generation,
+            armed: true,
+        };
+        device.request_abort();
+        let mut pending = Box::pin(
+            device
+                .schedule(supervisor::Operation::Recover)
+                .map_err(|_| "EE rebuild not scheduled")?,
+        );
+        if pending
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return Err("EE rebuild passed an active old publication lease");
+        }
+        if !device.admission.closed.load(Ordering::Acquire) {
+            return Err("EE paused old publication reopened logical carrier");
+        }
+        drop(lease);
+        pending
+            .await
+            .map_err(|_| "EE rebuild after publication retirement failed")?;
+        drop(attempt); // A late error/drop belongs exclusively to the old generation.
+        if device.admission.closed.load(Ordering::Acquire)
+            || device
+                .lifecycle
+                .lease(&device.admission, old.generation)
+                .is_some()
+        {
+            return Err("EE old copied RX or late error reached replacement generation");
+        }
+        Ok(())
+    }
 
     pub(in crate::rtlwifi) async fn paused_publisher_then_close<
         I: Port<Buffer = M> + 'static,
@@ -1023,7 +1452,14 @@ pub(super) mod publication_test {
 
 pub(super) struct NativeEnvironment {
     admission: Arc<station::Admission>,
-    firmware: Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>,
+    firmware: IrqSafeSpinLock<Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>>,
+    device: IrqSafeSpinLock<Weak<Native>>,
+    /// 0 active, 1 verified card-disabled, 2 unacknowledged transition,
+    /// 3 RTL8821AE WoWLAN firmware armed (`rtl8821ae_card_disable`'s
+    /// WoWLAN branch; MAC powered, host DMA retired).
+    power_state: AtomicU8,
+    /// H2C box state of the armed WoWLAN firmware (state 3 only).
+    wow_mailbox: IrqSafeSpinLock<Option<super::rtl8821ae::h2c::Mailbox>>,
 }
 /// Live station work consumes only the current installation. The explicit
 /// native preparation boundary owns signed-policy bootstrap.
@@ -1039,25 +1475,234 @@ impl NativeEnvironment {
         firmware: Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>,
     ) -> Self {
         Self {
-            firmware,
+            firmware: IrqSafeSpinLock::new(firmware),
             admission: Arc::new(station::Admission::new()),
+            device: IrqSafeSpinLock::new(Weak::new()),
+            power_state: AtomicU8::new(0),
+            wow_mailbox: IrqSafeSpinLock::new(None),
         }
+    }
+    pub(super) fn firmware(
+        &self,
+    ) -> Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>> {
+        self.firmware.lock().clone()
     }
 }
 impl Environment for NativeEnvironment {
+    async fn prepare_bus_power(&self) -> Result<(), Error> {
+        let device = self.firmware().device_id();
+        if matches!(
+            device,
+            super::regs::RTL_DEV_8821AE | super::regs::RTL_DEV_8192EE
+        ) || super::rtl8192ce::is_8192ce(device)
+        {
+            // `_rtl8821ae_enable_aspm_back_door` / ASPM and the 8192EE /
+            // 8192CE `enable_aspm` are not composed for these profiles:
+            // probe's ASPM-disabled link state is kept.
+            return Ok(());
+        }
+        self.firmware()
+            .native()
+            .prepare_aspm(PCIE_ASPM.load(Ordering::Acquire))
+            .await
+            .map_err(super::prepare::Error::Access)
+            .map_err(Error::from)
+    }
+
+    fn allow_channel(&self, factory: &Factory, channel: u8) -> Result<(), Error> {
+        if self.firmware().device_id() == super::regs::RTL_DEV_8821AE {
+            // Retuning rebuilds through the 8821AE card-disable/enable flow
+            // (`rebuild_native`); admission is the `NAPC` 20 MHz permission
+            // (2.4 GHz or 5 GHz) the fresh owner's `prepare_rtl8821ae`
+            // re-derives.
+            return super::rtl8821ae::envelope::Calibration::load_registered(factory)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
+        }
+        if self.firmware().device_id() == super::regs::RTL_DEV_8192EE {
+            // Retuning rebuilds through the 8192EE card-disable/enable flow
+            // (`rebuild_native`); admission is the `N92E` 20 MHz permission
+            // on 2.4 GHz channels 1-11 that `prepare_rtl8192ee` re-derives.
+            return super::rtl8192ee::envelope::Calibration::load_registered(factory)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
+        }
+        let device = self.firmware().device_id();
+        if super::rtl8192ce::is_8192ce(device) {
+            // Retuning rebuilds through `rtl92ce_card_disable` and a fresh
+            // `rtl92ce_hw_init` (`rebuild_native`); admission is the `N92C`
+            // 20 MHz permission on 2.4 GHz channels 1-11 that
+            // `prepare_rtl8192ce` re-derives for the probed device and the
+            // measured RF type.
+            if !(1..=11).contains(&channel) {
+                return Err(Error::Profile);
+            }
+            let rf = self
+                .firmware()
+                .rtl8192ce_version()
+                .map_err(|_| Error::Profile)?
+                .rf_type();
+            return super::rtl8192ce::envelope::Calibration::load_registered(factory, device, rf)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
+        }
+        let calibration = super::channel_power::Calibration::load_registered(factory)
+            .map_err(|_| Error::Profile)?;
+        calibration
+            .permission(&self.domain()?, channel)
+            .map(|_| ())
+            .map_err(|_| Error::Profile)
+    }
+    fn change_channel(
+        &self,
+        channel: u8,
+    ) -> Option<core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), Error>> + Send>>>
+    {
+        let device = self.device.lock().upgrade()?;
+        Some(
+            match device.schedule(supervisor::Operation::Retune(channel)) {
+                Ok(waiter) => Box::pin(waiter),
+                Err(reason) => Box::pin(async move { Err(reason) }),
+            },
+        )
+    }
     fn ht20(
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::ht::Grant>>, Error> {
-        super::ht::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
-            .map_err(Error::Radio)
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::ht::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+        )
+        .map_err(Error::Radio)
+    }
+    fn rts_threshold(&self) -> Option<u16> {
+        self.device
+            .lock()
+            .upgrade()
+            .and_then(|d| d.configured_rts_threshold())
+    }
+    fn protection(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+        ht: Option<Arc<super::ht::Grant>>,
+    ) -> Result<Option<Arc<super::protection::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::protection::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+            ht,
+        )
+        .map_err(Error::Radio)
+    }
+    fn antenna(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+        ht: Option<Arc<super::ht::Grant>>,
+        protection: Option<Arc<super::protection::Grant>>,
+        tracking: Option<Arc<super::tracking::Grant>>,
+    ) -> Result<Option<Arc<super::antenna::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::antenna::Grant::registered(super::antenna::Program {
+            base,
+            ht,
+            protection,
+            tracking,
+            channel,
+            firmware: self.firmware().identity().ok_or(Error::State)?,
+        })
+        .map_err(Error::Radio)
+    }
+    fn tracking(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+        ht: Option<Arc<super::ht::Grant>>,
+        protection: Option<Arc<super::protection::Grant>>,
+    ) -> Result<Option<Arc<super::tracking::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::tracking::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+            ht,
+            protection,
+        )
+        .map_err(Error::Radio)
+    }
+    fn ht40(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+    ) -> Result<Vec<Arc<super::ht::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::ht::Grant::registered_wide(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+        )
+        .map_err(Error::Radio)
     }
     fn fallback(
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::fallback::Grant>>, Error> {
-        super::fallback::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
-            .map_err(Error::Radio)
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::fallback::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+        )
+        .map_err(Error::Radio)
     }
     fn admission(&self) -> Option<&Arc<station::Admission>> {
         Some(&self.admission)
@@ -1078,13 +1723,23 @@ impl Environment for NativeEnvironment {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
     }
     fn preparation_failed(&self) -> bool {
-        self.firmware.status().stage == super::firmware_transport::Stage::Failed
+        self.firmware().status().stage == super::firmware_transport::Stage::Failed
     }
     fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
-        self.firmware.native().interrupt()
+        self.firmware().native().interrupt()
     }
     fn deliver(&self, enabled: bool) -> bool {
-        self.firmware.native().deliver(enabled)
+        self.firmware().native().deliver(enabled)
+    }
+    fn recovery(
+        &self,
+    ) -> Option<core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), Error>> + Send>>>
+    {
+        let device = self.device.lock().upgrade()?;
+        match device.schedule(supervisor::Operation::Recover) {
+            Ok(waiter) => Some(Box::pin(waiter)),
+            Err(error) => Some(Box::pin(async move { Err(error) })),
+        }
     }
 }
 pub(super) type Native = Device<
@@ -1106,44 +1761,117 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         Device::drain(self)
     }
 }
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let owner = ACTIVE.lock().clone().ok_or(())?;
+static ROUTES: IrqSafeSpinLock<endpoint_routes::Routes> =
+    IrqSafeSpinLock::new(endpoint_routes::Routes::new());
+fn send(cookie: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let owner = ROUTES.lock().get(cookie).ok_or(())?;
     owner.send(bytes, meta)
 }
 fn drain() -> bool {
-    let owner = ACTIVE.lock().clone();
-    owner.is_some_and(|owner| owner.drain())
+    let owners = ROUTES.lock().snapshot();
+    let mut received = false;
+    for owner in owners {
+        received |= owner.drain();
+    }
+    received
 }
 pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
-    CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::State)?;
-    narf_net::registry()
+    let cookie = device.attach_route()?;
+    *device.environment.device.lock() = Arc::downgrade(&device);
+    if device.environment.firmware().device_id() == super::regs::RTL_DEV_8821AE {
+        device
+            .lifecycle
+            .wowlan_capable
+            .store(true, Ordering::Release);
+    }
+    if narf_net::registry()
         .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Profile)?;
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::register(&device.name, device.factory.mac, send);
+        .is_err()
+    {
+        ROUTES
+            .lock()
+            .remove(cookie, Arc::as_ptr(&device) as *const ());
+        device.route.store(0, Ordering::Release);
+        return Err(Error::Profile);
+    }
+    narf_net::iface::register_with_context(&device.name, device.factory.mac, cookie, send);
     device.link(None);
     device.published.store(true, Ordering::Release);
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
+    let pm = Arc::new(system_sleep::SystemPm {
+        device: Arc::downgrade(&device),
+        config: IrqSafeSpinLock::new(None),
+        wake: IrqSafeSpinLock::new(None),
+    });
+    narf_power::system_pm::register_async_system_pm(&device.name, pm.clone());
+    narf_power::device_pm::register_device_pm_ops(&device.name, pm);
     // Linux `rtl_pci_intr_mode_decide`: MSI first. Without a vector the
     // owner keeps every IMR clear and this worker polls at 1 ms.
-    device.environment.firmware.native().arm_msi();
+    device.environment.firmware().native().arm_msi();
     narf_scheduler::spawn(async move {
+        let mut retries = 0;
+        let mut retry_at = 0;
         loop {
-            if device.removed.load(Ordering::Acquire) {
+            core::future::poll_fn(|cx| {
+                device.poll_transition(cx);
+                core::task::Poll::Ready(())
+            })
+            .await;
+            device.service_sleep_rollback();
+            let working = device.work.try_lock().is_none_or(|slot| slot.is_some());
+            if device.removed.load(Ordering::Acquire) && !working {
                 break;
+            }
+            if !working
+                && !device.removed.load(Ordering::Acquire)
+                && !device.lifecycle.suspended.load(Ordering::Acquire)
+                && !device.lifecycle.inactive.load(Ordering::Acquire)
+            {
+                if !device.admission.closed.load(Ordering::Acquire) {
+                    retries = 0;
+                } else if retries < 3
+                    && device.environment.now_ms() >= retry_at
+                    && device.schedule(supervisor::Operation::Recover).is_ok()
+                {
+                    retries += 1;
+                    retry_at = device.environment.now_ms().saturating_add(1000);
+                }
+            }
+            if !working
+                && !INACTIVE_PS.load(Ordering::Acquire)
+                && device.lifecycle.inactive.load(Ordering::Acquire)
+                && !device.lifecycle.suspended.load(Ordering::Acquire)
+                && !device.removed.load(Ordering::Acquire)
+            {
+                let _ = device.schedule(supervisor::Operation::Resume);
+            }
+            if !working
+                && INACTIVE_PS.load(Ordering::Acquire)
+                && !device.removed.load(Ordering::Acquire)
+                && !device.admission.closed.load(Ordering::Acquire)
+                && device
+                    .environment
+                    .now_ms()
+                    .saturating_sub(device.lifecycle.activity_ms.load(Ordering::Acquire))
+                    >= WATCHDOG_MS
+                && device.prepared.try_lock().is_some_and(|owner| {
+                    owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.station_phase() == station::Phase::Passive)
+                })
+            {
+                let _ = device.schedule(supervisor::Operation::Idle);
             }
             // Snapshot before servicing so a vector raised mid-pass is seen.
             let signal = device.environment.interrupt();
             let seen = signal.as_ref().map(|s| s.count());
             device.drain();
+            device.gain_tracking().await;
+            device.antenna_diversity().await;
             device.power_save(FW_LPS.load(Ordering::Acquire)).await;
             device.rate_adaptive().await;
             match (signal, seen) {

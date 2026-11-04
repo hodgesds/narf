@@ -1,6 +1,7 @@
 //! MT76 CONNAC2 station records plus the shared IEEE management plan.
 //! Firmware layouts follow Linux ecd997b0189a mt76_connac_mcu.{c,h}.
 use super::firmware_transport::ScanBss;
+use super::vif_slots::Link;
 use alloc::{vec, vec::Vec};
 use narf_wireless::association::JoinPlan as ManagementPlan;
 pub use narf_wireless::association::{validate_sme_ies, Error, Phase, SecurityMode};
@@ -8,6 +9,9 @@ pub use narf_wireless::association::{validate_sme_ies, Error, Phase, SecurityMod
 use narf_wireless::rsn::{self, RsnIe, Suite};
 #[cfg(any(test, feature = "builtin"))]
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+
+#[path = "ap_plan.rs"]
+pub(crate) mod ap;
 
 #[path = "wmm.rs"]
 pub(crate) mod wmm;
@@ -19,6 +23,7 @@ pub(crate) struct LegacyRate(u16);
 
 impl LegacyRate {
     pub(crate) const ONE_MBPS: Self = Self(0);
+    pub(crate) const SIX_MBPS: Self = Self(75);
 
     fn lowest(basic: u16) -> Self {
         const HARDWARE: [u16; 12] = [0, 1, 2, 3, 75, 79, 74, 78, 73, 77, 72, 76];
@@ -633,6 +638,18 @@ impl JoinPlan {
     /// Initial unencrypted AP record: CONN_STATE_CONNECT, never PORT_SECURE.
     /// Native RX remains enabled so later EAPOL processing sees full MPDUs.
     pub fn peer_record(&self, aid: u16, associated: bool) -> Result<Vec<u8>, Error> {
+        self.peer_record_on(Link::HOME, aid, associated)
+    }
+    /// `peer_record` for the peer WCID owned by `link`'s vif (Linux
+    /// `mt76_connac_mcu_alloc_sta_req`: `bss_idx = mvif->idx`,
+    /// `muar_idx = omac_idx`; `mt76_connac_mcu_wtbl_generic_tlv`:
+    /// `muar_idx = omac_idx`).
+    pub(crate) fn peer_record_on(
+        &self,
+        link: Link,
+        aid: u16,
+        associated: bool,
+    ) -> Result<Vec<u8>, Error> {
         if aid > 2007 || associated && aid == 0 {
             return Err(Error::Protocol);
         }
@@ -645,9 +662,11 @@ impl JoinPlan {
             return Err(Error::Protocol);
         }
         let mut out = vec![0u8; 8];
-        out[1] = 1;
+        out[0] = link.bss();
+        out[1] = link.peer();
         out[2] = 5;
-        out[4] = 1; // WCID 1, five TLVs, append
+        out[4] = 1; // peer WCID (1 for HOME), five TLVs, append
+        out[5] = link.omac();
         let basic = tlv(&mut out, 0, 20);
         out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
         out[basic + 8] = if associated && self.security == SecurityMode::Open {
@@ -673,11 +692,12 @@ impl JoinPlan {
         let state = tlv(&mut out, 7, 12);
         out[state + 8] = if associated { 2 } else { 1 }; // MLME state, independent of port authorization.
         let wtbl = tlv(&mut out, 13, 12); // outer TLV + eight-byte WTBL request
-        out[wtbl + 4] = 1;
+        out[wtbl + 4] = link.peer();
         out[wtbl + 5] = 1;
         out[wtbl + 6] = 3;
         let generic = tlv(&mut out, 0, 20);
         out[generic + 4..generic + 10].copy_from_slice(&self.peer);
+        out[generic + 10] = link.omac();
         out[generic + 13] = u8::from(associated && self.wmm.is_some());
         out[generic + 16..generic + 18].copy_from_slice(&aid.to_le_bytes());
         let rx = tlv(&mut out, 1, 12);
@@ -770,10 +790,18 @@ impl JoinPlan {
     /// Emits a completed station record for WCID 1 containing CCMP-128
     /// key installation and CONN_STATE_PORT_SECURE.
     pub fn secure_peer_record(&self, aid: u16, key: &[u8]) -> Result<Vec<u8>, Error> {
+        self.secure_peer_record_on(Link::HOME, aid, key)
+    }
+    pub(crate) fn secure_peer_record_on(
+        &self,
+        link: Link,
+        aid: u16,
+        key: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         if self.security == SecurityMode::Open || key.len() != 16 {
             return Err(Error::UnsupportedSecurity);
         }
-        let mut out = self.peer_record(aid, true)?;
+        let mut out = self.peer_record_on(link, aid, true)?;
         out[16] = 2; // STA_REC_BASIC.CONN_STATE_PORT_SECURE
         out[64] = 2; // STA_REC_STATE.CONN_STATE_PORT_SECURE
         out[2] += 1; // 6 TLVs
@@ -791,16 +819,21 @@ impl JoinPlan {
 /// The VIF's BMC WCID (19), used for received group keys. Linux uses the
 /// station's AP address for this record, not a fabricated multicast peer.
 pub fn group_record(peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
+    group_record_on(Link::HOME, peer, aid)
+}
+/// `group_record` for `link`'s vif BMC WCID (19 - idx) on its BSS.
+pub(crate) fn group_record_on(link: Link, peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
     if !unicast(peer) || !(1..=2007).contains(&aid) {
         return Err(Error::InvalidBss);
     }
     let mut out = vec![0; 8];
-    out[1] = 19;
+    out[0] = link.bss();
+    out[1] = link.bmc();
     out[2] = 1;
     out[4] = 1;
     out[5] = 0xe; // VIF/BMC MUAR, not a peer station's OMAC.
     let wtbl = tlv(&mut out, 13, 12);
-    out[wtbl + 4..wtbl + 8].copy_from_slice(&[19, 1, 3, 0]);
+    out[wtbl + 4..wtbl + 8].copy_from_slice(&[link.bmc(), 1, 3, 0]);
     let generic = tlv(&mut out, 0, 20);
     out[generic + 4..generic + 10].copy_from_slice(&peer);
     out[generic + 10] = 0xe;
@@ -823,11 +856,20 @@ pub fn group_record(peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
 /// GTK and its index) and `key[1]` carries `MCU_CIPHER_BIP_CMAC_128` with
 /// the IGTK (its `key_id` is left zero by Linux).
 pub fn igtk_record(gtk_id: u8, gtk: &[u8], igtk: &[u8]) -> Result<Vec<u8>, Error> {
+    igtk_record_on(Link::HOME, gtk_id, gtk, igtk)
+}
+pub(crate) fn igtk_record_on(
+    link: Link,
+    gtk_id: u8,
+    gtk: &[u8],
+    igtk: &[u8],
+) -> Result<Vec<u8>, Error> {
     if gtk_id > 3 || gtk.len() != 16 || igtk.len() != 16 {
         return Err(Error::UnsupportedSecurity);
     }
     let mut out = vec![0; 8];
-    out[1] = 19;
+    out[0] = link.bss();
+    out[1] = link.bmc();
     out[2] = 1;
     out[4] = 1;
     out[5] = 0xe;
@@ -842,18 +884,30 @@ pub fn igtk_record(gtk_id: u8, gtk: &[u8], igtk: &[u8]) -> Result<Vec<u8>, Error
 }
 
 pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-    if !matches!(wcid, 1 | 19)
+    key_record_on(Link::HOME, wcid, key_id, key)
+}
+/// Per-vif WTBL key: `wcid` is `link`'s peer (pairwise key zero) or its
+/// BMC WCID (indexed GTKs).
+pub(crate) fn key_record_on(
+    link: Link,
+    wcid: u8,
+    key_id: u8,
+    key: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
+    let group = wcid == link.bmc();
+    if !(group || wcid == link.peer())
         || key_id > 3
-        || wcid == 1 && key_id != 0
+        || !group && key_id != 0
         || key.is_some_and(|key| key.len() != 16)
     {
         return Err(Error::UnsupportedSecurity);
     }
     let mut out = vec![0; 8];
+    out[0] = link.bss();
     out[1] = wcid;
     out[2] = 1;
     out[4] = 1;
-    out[5] = if wcid == 19 { 0xe } else { 0 };
+    out[5] = if group { 0xe } else { link.omac() };
     let sec = tlv(&mut out, STA_REC_KEY_V2, if key.is_some() { 44 } else { 8 });
     // mt76_connac_mcu_sta_key_tlv copies enum set_key_cmd directly:
     // SET_KEY = 0, DISABLE_KEY = 1 (not an add/remove boolean).
@@ -868,6 +922,12 @@ pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, E
 
 /// Update the active single legacy BSS from the negotiated scan identity.
 pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
+    bss_record_on(Link::HOME, bss, connected)
+}
+/// Linux `mt76_connac_mcu_uni_add_bss` for `link`'s vif: header
+/// `bss_idx = mvif->idx`, `omac_idx`, `hw_bss_idx = idx`, `wmm_idx`, and
+/// `bmc_tx_wlan_idx = sta_idx` = the vif's BMC WCID.
+pub(crate) fn bss_record_on(link: Link, bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
     let six = is_six_ghz(bss);
     if !unicast(bss.bssid)
         || if six {
@@ -880,16 +940,20 @@ pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
         return Err(Error::InvalidBss);
     }
     let mut out = vec![0; 36];
+    out[0] = link.bss();
     out[6..8].copy_from_slice(&32u16.to_le_bytes());
     out[8] = 1; // Keep the station BSS active when disconnected.
+    out[9] = link.omac();
+    out[10] = link.bss(); // hardware BSS (< EXT_BSSID_START)
     out[12..16].copy_from_slice(&0x10001u32.to_le_bytes());
     out[16] = u8::from(!connected);
+    out[17] = link.wmm();
     out[18..24].copy_from_slice(&bss.bssid);
-    out[24..26].copy_from_slice(&19u16.to_le_bytes());
+    out[24..26].copy_from_slice(&u16::from(link.bmc()).to_le_bytes());
     out[26..28].copy_from_slice(&bss.beacon_interval.to_le_bytes());
     let five = six || super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5);
     out[29] = if five { 1 } else { 6 }; // PHY_MODE_A / PHY_MODE_B | PHY_MODE_G.
-    out[30..32].copy_from_slice(&19u16.to_le_bytes());
+    out[30..32].copy_from_slice(&u16::from(link.bmc()).to_le_bytes());
     out[32..34].copy_from_slice(&(if five { 8u16 } else { 3 }).to_le_bytes());
     if six {
         // mt76_connac_get_phy_mode is band-fixed on 6 GHz, and
@@ -903,13 +967,29 @@ pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
 /// Linux mt76_connac_mcu_uni_add_bss appends UNI_BSS_INFO_QBSS to
 /// BASIC. Set and retire BSS QoS explicitly, independently of peer WTBL.
 pub(crate) fn bss_record_qos(bss: &ScanBss, connected: bool, qos: bool) -> Result<Vec<u8>, Error> {
-    let mut out = bss_record(bss, connected)?;
+    bss_record_qos_on(Link::HOME, bss, connected, qos)
+}
+pub(crate) fn bss_record_qos_on(
+    link: Link,
+    bss: &ScanBss,
+    connected: bool,
+    qos: bool,
+) -> Result<Vec<u8>, Error> {
+    let mut out = bss_record_on(link, bss, connected)?;
     let qbss = tlv(&mut out, 15, 8);
     out[qbss + 4] = u8::from(connected && qos);
     Ok(out)
 }
 pub(crate) fn bss_record_ht20(bss: &ScanBss, qos: bool, ht: bool) -> Result<Vec<u8>, Error> {
-    let mut out = bss_record_qos(bss, true, qos)?;
+    bss_record_ht20_on(Link::HOME, bss, qos, ht)
+}
+pub(crate) fn bss_record_ht20_on(
+    link: Link,
+    bss: &ScanBss,
+    qos: bool,
+    ht: bool,
+) -> Result<Vec<u8>, Error> {
+    let mut out = bss_record_qos_on(link, bss, true, qos)?;
     if ht && !is_six_ghz(bss) {
         out[29] |= if bss.channel > 14 { 1 << 4 } else { 1 << 3 };
     }
@@ -917,7 +997,7 @@ pub(crate) fn bss_record_ht20(bss: &ScanBss, qos: bool, ht: bool) -> Result<Vec<
 }
 
 /// A complete occupied station channel authorized by the installed host policy.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TxPermission {
     pub country: [u8; 2],
     pub power_dbm: i8,
@@ -1510,28 +1590,37 @@ impl TxPermission {
 
 /// Disconnect station record: CONN_STATE_DISCONNECT for WCID 1.
 pub fn disconnect_record(peer: [u8; 6]) -> Vec<u8> {
+    disconnect_record_on(Link::HOME, peer)
+}
+pub(crate) fn disconnect_record_on(link: Link, peer: [u8; 6]) -> Vec<u8> {
     let mut out = vec![0u8; 8];
-    out[1] = 1;
+    out[0] = link.bss();
+    out[1] = link.peer();
     out[2] = 2; // Two TLVs: basic + state
-    out[4] = 1; // WCID 1
+    out[4] = 1; // peer WCID (1 for HOME)
+    out[5] = link.omac();
     let basic = tlv(&mut out, 0, 20);
     out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
     out[basic + 8] = 0;
     out[basic + 12..basic + 18].copy_from_slice(&peer);
     out[basic + 18..basic + 20].copy_from_slice(&1u16.to_le_bytes());
     let wtbl = tlv(&mut out, 13, 12);
-    out[wtbl + 4..wtbl + 6].copy_from_slice(&[1, 1]); // RESET_AND_SET, no nested TLVs.
+    out[wtbl + 4..wtbl + 6].copy_from_slice(&[link.peer(), 1]); // RESET_AND_SET, no nested TLVs.
     out
 }
 
 pub fn group_disconnect_record() -> Vec<u8> {
+    group_disconnect_record_on(Link::HOME)
+}
+pub(crate) fn group_disconnect_record_on(link: Link) -> Vec<u8> {
     let mut out = vec![0; 8];
-    out[1] = 19;
+    out[0] = link.bss();
+    out[1] = link.bmc();
     out[2] = 1;
     out[4] = 1;
     out[5] = 0xe;
     let wtbl = tlv(&mut out, 13, 12);
-    out[wtbl + 4..wtbl + 6].copy_from_slice(&[19, 1]);
+    out[wtbl + 4..wtbl + 6].copy_from_slice(&[link.bmc(), 1]);
     out
 }
 

@@ -50,6 +50,21 @@ fn artifact(factory: &Factory) -> Vec<u8> {
 pub(crate) fn calibration(factory: &Factory) -> Calibration {
     Calibration::from_verified(&artifact(factory), Some([0x44; 32]), factory).unwrap()
 }
+/// Inert single-channel envelope, decoded through the real NEPC parser.
+/// Never installed into the physical device/firmware registry.
+pub(crate) fn calibration_for_channel(factory: &Factory, channel: u8) -> Calibration {
+    let mut bytes = artifact(factory);
+    bytes[HEADER] = channel;
+    // Distinct inert curves prove per-channel permission/gain selection.
+    for class in 0..2 {
+        for index in 0..64 {
+            let at = HEADER + 4 + class * 128 + index * 2;
+            let value = index as i16 * 2 + i16::from(channel - 1) * 2;
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Calibration::from_verified(&bytes, Some([0x44; 32]), factory).unwrap()
+}
 pub(crate) fn calibration_with_cap(factory: &Factory, cap: Cap<FirmwareBlob, Read>) -> Calibration {
     let mut calibration = calibration(factory);
     calibration.authority = Some(cap);

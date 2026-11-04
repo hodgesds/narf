@@ -193,3 +193,63 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/power",
     smoke_rtlwifi_8188ee_enable_unlocks_before_flow
 );
+
+/// RTL8723BE: `_rtl8723be_init_mac` unlocks `REG_RSV_CTRL` and clears the
+/// auto-power-down bit before the exact `rtl8723B_card_enable_flow` PCI rows
+/// (including the `PWR_CUT_TESTCHIP_MSK` `0x68[3]` row, which Linux's
+/// `PWR_CUT_ALL_MSK` parse matches, and the `0x301 = 0` row).
+fn smoke_rtlwifi_8723be_enable_prefix_and_card_enable_flow() -> TestResult {
+    let io = Fake::new();
+    io.0.lock().bytes.resize(0x400, 0xff);
+    if power_on_with(&io, super::super::regs::RTL_DEV_8723BE).is_err() {
+        return TestResult::Fail("8723BE profile enable failed");
+    }
+    let m = io.0.lock();
+    if m.trace[..5]
+        != [
+            Op::Write(0x1c, 0),
+            Op::Read(5),
+            Op::Write(5, 0x7e),
+            Op::Read(5),
+            Op::Write(5, 0x76),
+        ]
+        || m.bytes[0x301] != 0
+        || m.bytes[0x75] & 1 != 0
+        || m.bytes[0x68] & 0x08 == 0
+        || m.bytes[0x69] & 0x40 == 0
+        || m.bytes[0x62] & 0x02 != 0
+    {
+        return TestResult::Fail("8723BE init_mac prefix / card enable flow differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/power",
+    smoke_rtlwifi_8723be_enable_prefix_and_card_enable_flow
+);
+
+/// RTL8723AE: `_rtl8712e_init_mac` unlocks `REG_RSV_CTRL` before the exact
+/// `rtl8723A_card_enable_flow` PCI rows (`RTL8723A_TRANS_CARDDIS_TO_CARDEMU`
+/// without its SDIO rows, then `RTL8723A_TRANS_CARDEMU_TO_ACT`), including
+/// the `0x301 = 0` row.
+fn smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow() -> TestResult {
+    let io = Fake::new();
+    io.0.lock().bytes.resize(0x400, 0xff);
+    if power_on_with(&io, super::super::regs::RTL_DEV_8723AE).is_err() {
+        return TestResult::Fail("8723AE profile enable failed");
+    }
+    let m = io.0.lock();
+    if m.trace[..3] != [Op::Write(0x1c, 0), Op::Read(5), Op::Write(5, 0xe6)]
+        || m.bytes[0x301] != 0
+        || m.bytes[5] != 0x62
+        || m.bytes[6] != 0xb3
+        || RTL8723AE_PWR_ON.len() != 10
+    {
+        return TestResult::Fail("8723AE init_mac prefix / card enable flow differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/power",
+    smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow
+);

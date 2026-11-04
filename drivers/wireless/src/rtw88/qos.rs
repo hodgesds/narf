@@ -24,7 +24,11 @@ pub(super) static KIND: Kind = Kind {
 };
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
-    matches!(did, 0xc821 | 0xc822) && bounds(p).is_some()
+    // RTL8822BE shares the PCI BK/BE/VI/VO rings (`pci.h` TXBD_IDX) and the
+    // `mac.c` EDCA registers. Its magic `N2BQ` equals the `N2BQ`
+    // calibration magic (as `N21Q` does on C21); the kind tag at 54, the
+    // request identity and the filename keep them apart.
+    matches!(did, 0xc821 | 0xc822 | 0xb822) && bounds(p).is_some()
 }
 
 /// Qualified extra-AC set, or `None` if the payload is inadmissible.

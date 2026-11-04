@@ -5,6 +5,48 @@ use super::fwdl;
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{future::poll_fn, ops::Range, task::Poll};
 
+#[path = "ap_session.rs"]
+mod ap;
+#[path = "p2p_device.rs"]
+mod p2p;
+pub(crate) use ap::ApRxEvent;
+pub(crate) type ApEvent = ap::ApEvent;
+#[path = "ap_crypto.rs"]
+mod ap_crypto;
+#[path = "ap_packet.rs"]
+mod ap_packet;
+#[path = "ap_peer.rs"]
+mod ap_peer;
+#[path = "ap_rx.rs"]
+mod ap_rx;
+#[path = "boot_ap.rs"]
+pub(crate) mod boot_ap;
+#[path = "boot_p2p.rs"]
+pub(crate) mod boot_p2p;
+#[path = "p2p_management.rs"]
+mod p2p_management;
+#[path = "p2p_management_capture.rs"]
+mod p2p_management_capture;
+#[path = "p2p_management_filters.rs"]
+pub(crate) mod p2p_management_filters;
+#[path = "p2p_management_implicit.rs"]
+mod p2p_management_implicit;
+#[path = "p2p_management_power.rs"]
+mod p2p_management_power;
+#[path = "p2p_management_tx.rs"]
+mod p2p_management_tx;
+#[path = "p2p_management_tx_wire.rs"]
+mod p2p_management_tx_wire;
+#[path = "p2p_management_wire.rs"]
+mod p2p_management_wire;
+#[path = "p2p_profile.rs"]
+mod p2p_profile;
+pub(crate) use p2p_profile::P2pProfile;
+
+#[path = "go_link.rs"]
+mod go_link;
+#[path = "group_link.rs"]
+mod group_link;
 #[path = "station_mcu.rs"]
 mod station;
 pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
@@ -26,15 +68,25 @@ mod fragment;
 mod join;
 #[path = "tx_ba.rs"]
 mod tx_ba;
+#[path = "tx_ba_restart.rs"]
+mod tx_ba_restart;
 #[path = "tx_ba_station.rs"]
 mod tx_ba_station;
 pub use amsdu::Ht20ReceiveInfo;
 pub use join::to_ethernet;
+#[path = "monitor.rs"]
+mod monitor;
 #[path = "recovery.rs"]
 mod recovery;
 #[path = "system_pm.rs"]
 mod system_pm;
+#[path = "wowlan_station.rs"]
+mod wowlan;
+#[path = "wowlan_owner.rs"]
+mod wowlan_owner;
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
+pub use monitor::{validate_channel as validate_monitor_channel, Capture as MonitorCapture};
+pub use wowlan_owner::{boot_validate_rekey_data, boot_wake_route_available, suspend_boot_wowlan};
 
 #[path = "firmware_transport_hw.rs"]
 mod hardware;
@@ -140,7 +192,9 @@ fn admit_completed<T>(
 fn retire_transport(mut transport: Transport) {
     let generation = transport.generation();
     // Unproven retirement keeps the published rings forever (Retained), so
-    // a later generation's freshly programmed rings can never alias them.
+    // a later generation's freshly programmed rings can never alias them;
+    // behind a per-domain IOMMU they are freed only after a completed DMA
+    // block of the function (`Hardware` drop).
     let _ = transport.retire_removed();
     drop(transport);
     super::pci::release_transport_claim(generation);
@@ -224,6 +278,17 @@ async fn finish_boot_keys() -> Result<(), Error> {
 /// requires the separate verified-reset recovery path, never a fresh claim.
 /// Repeating this on an initialized radio preserves its current station state.
 pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
+    if crate::module_host::owns_discovery() {
+        return Err(Error::Busy);
+    }
+    provision_radio_inner().await
+}
+
+pub(crate) async fn provision_module_radio_once() -> Result<RadioInfo, Error> {
+    provision_radio_inner().await
+}
+
+async fn provision_radio_inner() -> Result<RadioInfo, Error> {
     let Some(_provision) = PROVISION.try_lock() else {
         return Err(Error::Busy);
     };
@@ -257,18 +322,22 @@ pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
         }
     }
     finish_boot_keys().await?;
-    let info = {
+    let (info, profile) = {
         let Some(owner) = BOOT_OWNER.try_lock() else {
             return Err(Error::Busy);
         };
-        match owner.as_ref().map(Transport::state) {
-            Some(State::RadioReady(info) | State::ScanReady(info))
-            | Some(State::Associated { info, .. }) => info,
+        let info = match owner.as_ref().map(Transport::state) {
+            Some(State::RadioReady(info) | State::ScanReady(info) | State::P2pDevice(info))
+            | Some(State::Associated { info, .. } | State::AccessPoint { info, .. }) => info,
             Some(State::Failed { error, .. }) => return Err(error),
             _ => return Err(Error::Busy),
-        }
+        };
+        (
+            info,
+            owner.as_ref().and_then(|owner| owner.p2p_profile().ok()),
+        )
     };
-    crate::iface::register_scan_iface(info).map_err(|_| Error::Authority)?;
+    crate::iface::register_scan_iface_profile(info, profile).map_err(|_| Error::Authority)?;
     Ok(info)
 }
 
@@ -292,6 +361,21 @@ pub fn boot_status() -> BootStatus {
             BootStatus::Retained(owner.state())
         }),
     }
+}
+
+/// Copy only the executable images already opened and validated for the
+/// current native transport. There is no arbitrary registry name or new
+/// registry authority at the module boundary.
+pub(crate) fn module_firmware_chunk(
+    image: u8,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, Error> {
+    let owner = BOOT_OWNER.try_lock().ok_or(Error::Busy)?;
+    owner
+        .as_ref()
+        .ok_or(Error::DeviceGone)?
+        .module_firmware_chunk(image, offset, len)
 }
 
 /// Run a receive-only hardware diagnostic using the retained boot owner.
@@ -341,13 +425,9 @@ pub async fn scan_boot_with_options(
         .await
 }
 
-/// Dispatch station association using the retained boot owner.
-pub async fn associate_boot_station(
-    bss: &ScanBss,
-    ssid: &[u8],
-    security: crate::mt7921::association::Security,
-    extra_ies: &[u8],
-) -> Result<u16, Error> {
+/// Start passive capture through the retained native owner. Cancellation
+/// retains Running and requires recovery before another role can start.
+pub async fn start_boot_monitor(channel: narf_wireless::monitor::Channel) -> Result<(), Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
@@ -355,7 +435,97 @@ pub async fn associate_boot_station(
     owner
         .as_mut()
         .ok_or(Error::DeviceGone)?
-        .associate_station_with_ies(bss, ssid, security, extra_ies)
+        .start_monitor(channel)
+        .await
+}
+pub async fn stop_boot_monitor() -> Result<(), Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .stop_monitor()
+        .await
+}
+pub fn step_boot_monitor() -> Result<MonitorCapture, Error> {
+    let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .step_monitor(&domain)
+}
+
+/// Explicit originator control on the same retained registered radio. The
+/// requested TID must still have its fresh native sequence; the packet owner
+/// rejects queued DATA, pending key/control work and any used TID.
+pub async fn negotiate_boot_transmit_ba_tid(tid: u8) -> Result<bool, Error> {
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .negotiate_transmit_ba_tid(tid)
+        .await
+}
+
+/// Queue midstream BA restart on the actual retained radio. No fabricated
+/// packet is sent: the next real user MPDU supplies a native TXS sample.
+pub async fn request_boot_transmit_ba_restart_tid(tid: u8) -> Result<(), Error> {
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .request_transmit_ba_restart_tid(tid)
+        .await
+}
+
+/// Dispatch station association using the retained boot owner.
+pub async fn associate_boot_station(
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+) -> Result<u16, Error> {
+    associate_boot_station_as(bss, ssid, security, extra_ies, false).await
+}
+
+/// Station or P2P-client (`p2p_client`) join on the retained boot owner.
+pub(crate) async fn associate_boot_station_as(
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+    p2p_client: bool,
+) -> Result<u16, Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    let network = if p2p_client {
+        crate::mt7921::p2p_wire::Network::P2p
+    } else {
+        crate::mt7921::p2p_wire::Network::Infrastructure
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .associate_station_as(bss, ssid, security, extra_ies, network)
         .await
 }
 
@@ -445,8 +615,8 @@ pub(crate) fn boot_refresh_receive_epoch(refresh: impl FnOnce(Option<u64>)) -> R
     refresh(epoch);
     Ok(())
 }
-/// Non-reentrant IPC publication only: no callback or await may occur while
-/// the native owner serializes this final epoch check with key replacement.
+/// Non-reentrant IPC/module-byte publication only: no reentrant driver/module
+/// callback or await may occur while this final epoch check holds key ownership.
 pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result<bool, Error> {
     let Some(owner) = BOOT_OWNER.try_lock() else {
         return Ok(false);
@@ -464,6 +634,7 @@ pub(crate) static BOOT_FRAG_THRESHOLD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
+    prepare_boot_keys()?;
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
     match poll_boot_keys(&mut cx) {
         Poll::Ready(result) => result?,
@@ -475,7 +646,7 @@ pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     owner.as_mut().ok_or(Error::DeviceGone)?.step_network(tx)
 }
 
-pub async fn service_boot_keys() -> Result<(), Error> {
+fn prepare_boot_keys() -> Result<(), Error> {
     {
         let Some(mut work) = KEY_WORK.try_lock() else {
             return Err(Error::Busy);
@@ -498,7 +669,183 @@ pub async fn service_boot_keys() -> Result<(), Error> {
             });
         }
     }
+    Ok(())
+}
+pub async fn service_boot_keys() -> Result<(), Error> {
+    prepare_boot_keys()?;
     finish_boot_keys().await
+}
+
+/// Borrow the retained boot owner after pending key work (the same
+/// ownership rule as every other boot-owner entry).
+macro_rules! boot_owner_call {
+    ($owner:ident => $call:expr) => {{
+        finish_boot_keys().await?;
+        let Some(mut guard) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        let $owner = guard.as_mut().ok_or(Error::DeviceGone)?;
+        $call.await
+    }};
+}
+
+/// Publish the concurrent P2P-client group vif `vif` with own address
+/// `own` on the retained boot owner (Linux `mt7921_add_interface`).
+pub(crate) async fn start_boot_group_link(
+    vif: crate::mt7921::vif_slots::Vif,
+    own: [u8; 6],
+) -> Result<crate::mt7921::vif_slots::Link, Error> {
+    boot_owner_call!(owner => owner.start_group_link(vif, own))
+}
+/// Retire the idle group vif (`mt792x_remove_interface`).
+pub(crate) async fn stop_boot_group_link(
+    link: crate::mt7921::vif_slots::Link,
+) -> Result<(), Error> {
+    boot_owner_call!(owner => owner.stop_group_link(link))
+}
+/// Join the group link as a P2P client (`p2p_client`) or second station.
+pub(crate) async fn associate_boot_group(
+    link: crate::mt7921::vif_slots::Link,
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+    p2p_client: bool,
+) -> Result<u16, Error> {
+    let network = if p2p_client {
+        crate::mt7921::p2p_wire::Network::P2p
+    } else {
+        crate::mt7921::p2p_wire::Network::Infrastructure
+    };
+    boot_owner_call!(owner => owner.associate_group(link, bss, ssid, security, extra_ies, network))
+}
+/// Leave the group link's association (deauth, key/WCID/BSS retirement).
+pub(crate) async fn disassociate_boot_group(
+    link: crate::mt7921::vif_slots::Link,
+) -> Result<(), Error> {
+    boot_owner_call!(owner => owner.disassociate_group(link))
+}
+/// Explicit group-link originator BA for an unused TID.
+pub(crate) async fn negotiate_boot_group_transmit_ba_tid(
+    link: crate::mt7921::vif_slots::Link,
+    tid: u8,
+) -> Result<bool, Error> {
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    boot_owner_call!(owner => owner.negotiate_group_transmit_ba_tid(link, tid))
+}
+/// One bounded group-link packet step. Pending home or group key work
+/// first runs through the shared retained key owner (`prepare_boot_keys`
+/// covers both owners), exactly as `step_boot_network`.
+pub(crate) fn step_boot_group_network(
+    link: crate::mt7921::vif_slots::Link,
+    tx: Option<&[u8]>,
+) -> Result<PacketStep, Error> {
+    prepare_boot_keys()?;
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match poll_boot_keys(&mut cx) {
+        Poll::Ready(result) => result?,
+        Poll::Pending => return Err(Error::Busy),
+    }
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .step_group_network(link, tx)
+}
+/// The group-link analogue of `boot_receive_current`.
+pub(crate) fn boot_group_receive_current(
+    link: crate::mt7921::vif_slots::Link,
+    epoch: u64,
+) -> Result<bool, Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Ok(false);
+    };
+    owner
+        .as_ref()
+        .map_or(Ok(false), |owner| owner.group_receive_current(link, epoch))
+}
+/// The retained boot owner's group link and its role state.
+pub(crate) fn boot_group_link() -> Option<(crate::mt7921::vif_slots::Link, State)> {
+    let owner = BOOT_OWNER.try_lock()?;
+    let owner = owner.as_ref()?;
+    Some((owner.group_link()?, owner.group_state()?))
+}
+
+/// Reserve the concurrent P2P GO vif `vif` with own address `own` on the
+/// retained boot owner (no native command).
+pub(crate) fn open_boot_go(vif: crate::mt7921::vif_slots::Vif, own: [u8; 6]) -> Result<(), Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.open_go(vif, own)
+}
+/// Close an idle reserved GO that never sent a native command.
+pub(crate) fn close_boot_go() -> Result<(), Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.close_go()
+}
+/// START the GO beside the home station (`mt7921_add_interface` +
+/// `mt7921_start_ap` on the GO vif, no reset); returns its receive epoch.
+pub(crate) async fn start_boot_go(
+    authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+    config: narf_wireless::ApConfig,
+    settings: narf_wireless::ApStartSettings,
+) -> Result<u64, Error> {
+    boot_owner_call!(owner => owner.start_go(authority, config, settings))
+}
+/// STOP the GO (`mt7921_stop_ap` + `mt792x_remove_interface`, no reset).
+pub(crate) async fn stop_boot_go() -> Result<(), Error> {
+    boot_owner_call!(owner => owner.stop_go())
+}
+/// One AP control request on the GO (beacon, stations, keys, TX).
+pub(crate) async fn boot_go_request(
+    authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+    request: boot_ap::Request,
+) -> Result<boot_ap::Reply, Error> {
+    boot_owner_call!(owner => owner.go_request(authority, request))
+}
+/// One bounded GO data step after pending home/group key work, exactly as
+/// `step_boot_group_network`.
+pub(crate) fn step_boot_go_network(
+    tx: Option<&[u8]>,
+) -> Result<(PacketStep, Vec<ApRxEvent>), Error> {
+    prepare_boot_keys()?;
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match poll_boot_keys(&mut cx) {
+        Poll::Ready(result) => result?,
+        Poll::Pending => return Err(Error::Busy),
+    }
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.step_go_network(tx)
+}
+/// Whether a GO batch epoch is still current (`go_receive_current`).
+pub(crate) fn boot_go_receive_current(epoch: u64) -> Result<bool, Error> {
+    let Some(owner) = BOOT_OWNER.try_lock() else {
+        return Ok(false);
+    };
+    owner
+        .as_ref()
+        .map_or(Ok(false), |owner| owner.go_receive_current(epoch))
+}
+/// The retained boot owner's GO vif and role state.
+pub(crate) fn boot_go_state() -> Option<(crate::mt7921::vif_slots::Vif, State)> {
+    let owner = BOOT_OWNER.try_lock()?;
+    owner.as_ref()?.go_state()
+}
+/// The GO's peer addresses.
+pub(crate) fn boot_go_stations() -> Vec<[u8; 6]> {
+    BOOT_OWNER
+        .try_lock()
+        .and_then(|owner| owner.as_ref().map(|owner| owner.go_station_macs()))
+        .unwrap_or_default()
 }
 
 /// Recovery owns its transport across polls, including after caller
@@ -532,7 +879,12 @@ pub async fn resume_boot_radio(expected_mac: [u8; 6]) -> Result<(), Error> {
     retained_owner_work(true, move |mut transport| {
         alloc::boxed::Box::pin(async move {
             let result = match transport.state() {
-                State::Suspended(_) => transport.resume(expected_mac).await.map(|_| ()),
+                State::Suspended(_) | State::WowSuspended { .. } => {
+                    transport.resume(expected_mac).await.map(|_| ())
+                }
+                State::Failed { .. } | State::Running(_) => {
+                    transport.recover(expected_mac).await.map(|_| ())
+                }
                 // A suspend that never completed left the radio usable.
                 _ => Ok(()),
             };
@@ -650,6 +1002,9 @@ pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
     BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
+    if crate::module_host::owns_discovery() {
+        return InitResult::Ok;
+    }
     // Before executor polling, regular Mutex (no IRQ spinlock) retained.
     // This future is self-waking and never depends on another executor task.
     let result = narf_scheduler::block_on_spin(provision_boot_radio());
@@ -749,6 +1104,7 @@ impl<T> Drop for Retained<T> {
 /// Firmware/transport failure. A started failure cannot be replayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    Cancelled,
     EntropyUnavailable,
     Busy,
     InvalidFirmware,
@@ -775,6 +1131,7 @@ pub enum Stage {
     RecoveryReady,
     RecoveryRearm,
     Suspend,
+    WowSuspend,
     Resume,
     Quiesce,
     Initialize,
@@ -801,6 +1158,16 @@ pub enum Stage {
     EapolHandshake,
     StaRecord,
     Shutdown,
+    MonitorStart,
+    MonitorStop,
+    ApStart,
+    ApStop,
+    ApPeer,
+    P2pDeviceStart,
+    P2pDeviceStop,
+    P2pRocAcquire,
+    P2pRocExpire,
+    P2pManagementTx,
 }
 /// Firmware observations, not an operational WLAN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -810,6 +1177,14 @@ pub struct Report {
     pub patch_already_loaded: bool,
     pub bytes_transferred: usize,
 }
+
+/// Actual firmware association retained solely for autonomous wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeAssociation {
+    pub peer: [u8; 6],
+    pub channel: u8,
+    pub aid: u16,
+}
 /// Session state survives cancellation of its borrowed run future.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -818,14 +1193,34 @@ pub enum State {
     Ready(Report),
     RadioReady(RadioInfo),
     ScanReady(RadioInfo),
+    /// Native P2P-device DEV/BSS receipts. No RF grant, ordinary carrier
+    /// or Ethernet/controlled-port permission follows from this state.
+    P2pDevice(RadioInfo),
     Associated {
         info: RadioInfo,
         peer: [u8; 6],
         channel: u8,
         aid: u16,
     },
+    /// Native BSS, group WTBL and beacon template acknowledged. Host
+    /// carrier/peer admission requires the separate current interface owner.
+    AccessPoint {
+        info: RadioInfo,
+        frequency_mhz: u32,
+    },
+    /// Native passive sniffer acknowledged; ordinary station RX/TX stays closed.
+    Monitor {
+        info: RadioInfo,
+        channel: narf_wireless::monitor::Channel,
+    },
     /// PCIe low-power handoff completed; firmware owns LPCTL and DMA is off.
     Suspended(RadioInfo),
+    /// Firmware association/offloads retained for wake; host RX/TX closed.
+    WowSuspended {
+        info: RadioInfo,
+        association: Option<WakeAssociation>,
+        target: narf_power::system_pm::SystemSleepState,
+    },
     Failed {
         stage: Stage,
         error: Error,
@@ -849,6 +1244,7 @@ pub struct Firmware {
     version: [u8; 10],
     build_date: [u8; 15],
     override_addr: u32,
+    release_features: Result<Option<super::fw_features::Features>, super::fw_features::Error>,
 }
 impl Firmware {
     /// Validate every table, range and mode before any firmware command.
@@ -956,6 +1352,7 @@ impl Firmware {
             version: tail.fw_ver,
             build_date: tail.build_date,
             override_addr,
+            release_features: super::fw_features::parse(ram),
         })
     }
     /// Copy verified registry payloads into this session's immutable ownership.
@@ -967,6 +1364,15 @@ impl Firmware {
         let patch = super::firmware_assets::load(auth, patch)?;
         let ram = super::firmware_assets::load(auth, ram)?;
         Self::prepare(&patch, &ram)
+    }
+    /// Optional WM release metadata, retained from this immutable artifact.
+    /// Missing metadata gives no CNM capability; malformed metadata remains
+    /// distinguishable without breaking legacy firmware boot. This grants
+    /// no started device, channel, packet or RF permission.
+    pub fn cnm_capability(&self) -> Result<bool, Error> {
+        self.release_features
+            .map(|feature| feature.is_some_and(|feature| feature.cnm()))
+            .map_err(|_| Error::InvalidFirmware)
     }
 }
 
@@ -990,6 +1396,9 @@ fn command_frame(command: u8, seq: u8, payload: &[u8]) -> Result<Vec<u8>, Error>
 
 /// Immutable admission facts at the native DMA-to-owned-copy boundary.
 /// A later port opening cannot authorize a copy made while the port was shut.
+/// In AP mode this flag denotes the BSS capture binding only: the native
+/// WCID, per-peer association/port and current software CCMP proof are also
+/// required. Every AP peer/key/port change renews this global capture epoch.
 #[derive(Debug, PartialEq, Eq)]
 struct CapturedData {
     bytes: Vec<u8>,
@@ -998,6 +1407,22 @@ struct CapturedData {
 }
 
 trait Backend {
+    fn close_p2p_capture(&mut self) {}
+    fn configure_p2p_capture(
+        &mut self,
+        spec: Option<p2p_management_capture::Spec>,
+    ) -> Result<(), Error> {
+        if spec.is_some() {
+            Err(Error::UnsupportedFirmware)
+        } else {
+            Ok(())
+        }
+    }
+    fn receive_p2p_management(
+        &mut self,
+    ) -> Result<Option<p2p_management_capture::Captured>, Error> {
+        Err(Error::UnsupportedFirmware)
+    }
     /// Actual hardware chip ID; zero means no identity proof in a pure model.
     /// Wider chip-specific profiles must not infer this from firmware max_bw.
     fn chip_id(&self) -> Result<u16, Error> {
@@ -1011,6 +1436,9 @@ trait Backend {
     fn progress(&mut self, _stage: Stage) {}
     fn now_ns(&self) -> u64;
     fn check(&self) -> Result<(), Error>;
+    fn regulatory_domain(&self) -> Result<Arc<narf_wireless::reg::RegulatoryDomain>, Error> {
+        narf_wireless::reg::db::snapshot().ok_or(Error::Authority)
+    }
     fn check_tx_permission(
         &self,
         permission: crate::mt7921::association::TxPermission,
@@ -1043,6 +1471,36 @@ trait Backend {
     /// `__mt792x_mcu_fw_pmctrl`: return LPCTL ownership to firmware.
     fn request_firmware_own(&mut self) -> Result<(), Error>;
     fn firmware_owned(&mut self) -> Result<bool, Error>;
+    fn prepare_wake_route(
+        &mut self,
+        _target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn arm_wake_route(
+        &mut self,
+        _target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn wake_power_settled(&self) -> bool {
+        true
+    }
+    fn enter_wake_d3hot(&mut self) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn verify_wake_d3hot(&mut self) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn begin_wake_d0(&mut self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn verify_wake_d0(&mut self) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn disarm_wake_route(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
     /// Restore memory decoding after a platform power transition, without
     /// bus mastering (Linux PCI core config restore precedes driver resume).
     fn restore_bus(&mut self) -> Result<(), Error>;
@@ -1063,10 +1521,15 @@ trait Backend {
     /// and every device ring reference cleared.
     fn recycle(&mut self) -> Result<(), Error>;
     fn configure_mac(&mut self) -> Result<(), Error>;
+    fn pause_ap_timing(&mut self) -> Result<(), Error>;
+    fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
     fn wtbl_idle(&mut self) -> Result<bool, Error>;
+    /// Station management on `vif` (TXD1 `OWN_MAC`, mt76_connac2_mac_write_txwi);
+    /// `wcid` is that vif's peer or BMC WCID.
     fn submit_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
@@ -1074,32 +1537,122 @@ trait Backend {
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
-    /// One 802.11 data fragment (`packet_tx::fragment`) on the data ring.
-    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error>;
-    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error>;
+    /// One 802.11 data fragment (`packet_tx::fragment`) on the data ring, to
+    /// `link`'s peer WCID with its vif's OWN_MAC/WMM set.
+    fn submit_fragment(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+    ) -> Result<(), Error>;
+    /// Station data to `link`'s peer WCID; the TXD's OWN_MAC and AC queue
+    /// WMM set follow its vif (`packet_tx::on_vif`). `Link::HOME` is the
+    /// historical WCID 1 / OMAC0 / WMM0 descriptor.
+    fn submit_data(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error>;
+    /// Raw AP frame on the AP BSS `vif`, with no hardware encryption key or
+    /// header translation (`ap_packet::descriptor_on`).
+    fn submit_ap_frame(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error>;
+    fn arm_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        wcid: u8,
+    ) -> Result<(), Error>;
+    fn submit_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error>;
+    fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error>;
+    fn arm_p2p_management(
+        &mut self,
+        _vif: crate::mt7921::vif_slots::Vif,
+        _tid: u8,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn submit_p2p_management(
+        &mut self,
+        _frame: &[u8],
+        _vif: crate::mt7921::vif_slots::Vif,
+        _rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn poll_p2p_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        Err(Error::UnsupportedFirmware)
+    }
     fn submit_data_pipelined(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         qos: bool,
     ) -> Result<(), Error> {
-        self.submit_data(frame, protected, qos)
+        self.submit_data(link, frame, protected, qos)
     }
-    fn submit_data_aggregated(&mut self, _frame: &[u8], _protected: bool) -> Result<(), Error> {
+    fn submit_data_aggregated(
+        &mut self,
+        _link: crate::mt7921::vif_slots::Link,
+        _frame: &[u8],
+        _protected: bool,
+    ) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
+    /// Reserve a currently free, non-quarantined host-TXS PID after every older native packet
+    /// has DMA and TX_FREE terminal receipts. The next true user MPDU (or
+    /// final fragment) on this TID acquires that retained sample owner.
+    fn arm_transmit_sequence(&mut self, _tid: u8) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn transmit_sequence_published(&self, _tid: u8) -> bool {
+        false
+    }
+    fn poll_transmit_sequence(&mut self, _tid: u8) -> Result<Option<u16>, Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn cancel_transmit_sequence(&mut self) {}
+
     /// Linux `wcid->amsdu`: hardware TX A-MSDU (TXD7 HW_AMSDU) for this peer.
     fn set_hw_amsdu(&mut self, _enabled: bool) {}
     /// QoS data on user priority `tid` 1..=7 (TID 0 uses the BE paths above).
-    /// Never BA-aggregated: the originator agreement is TID0-only.
+    /// The non-BA path; agreement eligibility is supplied separately.
     fn submit_data_tid(
         &mut self,
+        _link: crate::mt7921::vif_slots::Link,
         _frame: &[u8],
         _protected: bool,
         _tid: u8,
         _pipelined: bool,
     ) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
+    }
+    /// QoS DATA under the independently completed originator agreement for
+    /// `tid`. No BA or sequence authority follows from calling this method.
+    fn submit_data_tid_aggregated(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        if tid == 0 {
+            self.submit_data_aggregated(link, frame, protected)
+        } else {
+            Err(Error::UnsupportedFirmware)
+        }
     }
 }
 
@@ -1117,24 +1670,25 @@ fn current_station_permission(
     }
 }
 
+/// One station-mode vif's association owner, keyed by its native
+/// [`Link`](crate::mt7921::vif_slots::Link) identity. Linux keeps this
+/// state per `mt792x_vif` / `mt792x_sta` (mt792x.h): the peer WCID, its BA
+/// sessions, WMM and PHY profiles and the RX reorder/defrag caches.
 #[derive(Debug)]
-struct Session<B: Backend> {
-    backend: B,
-    firmware: Firmware,
-    state: State,
-    seq: u8,
-    events: VecDeque<Vec<u8>>,
-    transferred: usize,
-    boot_started: Option<u64>,
-    scan_seq: u8,
+struct StationLink {
+    link: crate::mt7921::vif_slots::Link,
     security: Option<join::StationSecurity>,
     management_rate: crate::mt7921::association::LegacyRate,
-    data_pending: VecDeque<u64>,
-    tid0_used: bool,
+    used_tids: u8,
     tx_ba: tx_ba::Owner,
+    tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
-    station_bss: Option<ScanBss>,
-    station_permission: Option<crate::mt7921::association::TxPermission>,
+    bss: Option<ScanBss>,
+    /// This link's group role captured at join; retained for the exact
+    /// disconnect record of that association (Linux `vif->p2p` is fixed per
+    /// vif type).
+    network: crate::mt7921::p2p_wire::Network,
+    permission: Option<crate::mt7921::association::TxPermission>,
     wmm: Option<crate::mt7921::association::wmm::Parameters>,
     wmm_pending: Option<crate::mt7921::association::wmm::Parameters>,
     ht20_rx: Option<amsdu::Receiver>,
@@ -1146,12 +1700,105 @@ struct Session<B: Backend> {
     /// The remaining software fragments of the MSDU in flight (each one
     /// waits for the previous fragment's terminal completion).
     tx_fragments: VecDeque<Vec<u8>>,
-    /// The wiphy fragmentation threshold (`u32::MAX` = off).
-    frag_threshold: u32,
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
     rx_fragments: fragment::Cache,
+    /// Captured native packets whose RXD WCID is this link's peer, drained
+    /// from the shared RX ring by the other station owner (Linux
+    /// `mt76_rx` -> `mt792x_rx_get_wcid` -> per-`mt792x_sta` delivery).
+    demuxed: VecDeque<CapturedData>,
+    /// This owner's receive floor: the shared capture epoch of its last
+    /// key/association fence. A copy captured before it is never this
+    /// owner's (the other owner's fences do not move it).
+    epoch: u64,
+    /// Set by this owner's fence; the next time it becomes receive-current
+    /// next to another owner it moves its floor past every copy captured
+    /// while the shared capture stayed open only for that other owner.
+    fenced: bool,
+    /// Terminal TX statuses of this owner's data entries retired by the
+    /// other station owner's waits (`data_pending` is one device FIFO).
+    tx_credit: VecDeque<u8>,
+}
+/// The concurrent group vif's station owner and its own role state
+/// (`State::RadioReady` = WCID only, `ScanReady` = DEV_INFO/BSS published,
+/// `Associated`/`Failed` as for the home role). `info.capabilities.mac` is
+/// the group vif's own address.
+#[derive(Debug)]
+struct GroupOwner {
+    station: StationLink,
+    state: State,
+}
+impl StationLink {
+    fn new(link: crate::mt7921::vif_slots::Link) -> Self {
+        Self {
+            link,
+            security: None,
+            management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
+            used_tids: 0,
+            tx_ba: tx_ba::Owner::default(),
+            tx_restart: None,
+            peer_lost: false,
+            bss: None,
+            network: crate::mt7921::p2p_wire::Network::Infrastructure,
+            permission: None,
+            wmm: None,
+            wmm_pending: None,
+            ht20_rx: None,
+            ht20_profile: None,
+            vht_profile: None,
+            he_profile: None,
+            ap_phy: None,
+            control_pending: VecDeque::new(),
+            tx_fragments: VecDeque::new(),
+            rx_ba: ba::Owner::default(),
+            received_msdu: VecDeque::new(),
+            rx_fragments: fragment::Cache::default(),
+            demuxed: VecDeque::new(),
+            epoch: 0,
+            fenced: false,
+            tx_credit: VecDeque::new(),
+        }
+    }
+}
+#[derive(Debug)]
+struct Session<B: Backend> {
+    backend: B,
+    firmware: Firmware,
+    state: State,
+    seq: u8,
+    events: VecDeque<Vec<u8>>,
+    transferred: usize,
+    boot_started: Option<u64>,
+    scan_seq: u8,
+    data_pending: group_link::DataPending,
+    /// The home vif's station owner (BSS0, peer WCID 1).
+    station: StationLink,
+    /// A concurrent P2P group vif's station owner (Linux mt7921 keeps one
+    /// `mt792x_vif` per vif); opened by `open_group_link`. While a group
+    /// operation runs (`enter_group`) it holds the swapped-out home owner.
+    group: Option<GroupOwner>,
+    /// A concurrent P2P GO vif's AP owner (`go_link`); while a GO
+    /// operation runs (`enter_go`) it holds the swapped-out home role.
+    go: Option<go_link::GoOwner>,
+    /// Peer WCIDs owned by station links (Linux `dev->wcid_mask`).
+    wtbl: crate::mt7921::vif_slots::Wtbl,
+    /// The wiphy fragmentation threshold (`u32::MAX` = off).
+    frag_threshold: u32,
     receive_epoch: u64,
+    /// Original copy-time native packets handed from the scan collector to
+    /// the associated station's parsers; never re-stamped at delivery.
+    scan_packets: VecDeque<CapturedData>,
+    /// During an associated scan, RX consumes only the hand-off queue so
+    /// station service cannot swallow off-channel scan observations.
+    scanning: bool,
+    ap_owner: Option<ap::Owner>,
+    p2p_owner: Option<p2p::Owner>,
+    /// PHY-global CNM sequence survives independent wdev stop/recreation.
+    p2p_next: u8,
+    // Keep retired AP temporal-key evidence across verified role resets.
+    ap_keys: ap_crypto::Keys,
+    wow_config: Option<narf_wireless::WowlanConfig>,
+    wow_nlo: Option<Arc<scan::nlo::Plan>>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -1164,28 +1811,21 @@ impl<B: Backend> Session<B> {
             transferred: 0,
             boot_started: None,
             scan_seq: 0,
-            security: None,
-            management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
-            data_pending: VecDeque::with_capacity(crate::mt7921::packet_tx::PIPELINE),
-            tid0_used: false,
-            tx_ba: tx_ba::Owner::default(),
-            peer_lost: false,
-            station_bss: None,
-            station_permission: None,
-            wmm: None,
-            wmm_pending: None,
-            ht20_rx: None,
-            ht20_profile: None,
-            vht_profile: None,
-            he_profile: None,
-            ap_phy: None,
-            control_pending: VecDeque::new(),
-            tx_fragments: VecDeque::new(),
+            data_pending: group_link::DataPending::default(),
+            station: StationLink::new(crate::mt7921::vif_slots::Link::HOME),
+            group: None,
+            go: None,
+            wtbl: crate::mt7921::vif_slots::Wtbl::default(),
             frag_threshold: u32::MAX,
-            rx_ba: ba::Owner::default(),
-            received_msdu: VecDeque::new(),
-            rx_fragments: fragment::Cache::default(),
             receive_epoch: 0,
+            scan_packets: VecDeque::new(),
+            scanning: false,
+            ap_owner: None,
+            p2p_owner: None,
+            p2p_next: 1,
+            ap_keys: ap_crypto::Keys::default(),
+            wow_config: None,
+            wow_nlo: None,
         }
     }
     fn stage(&mut self, stage: Stage) {
@@ -1197,8 +1837,77 @@ impl<B: Backend> Session<B> {
         ms: u64,
         mut f: impl FnMut(&mut B) -> Result<Option<T>, Error>,
     ) -> Result<T, Error> {
+        self.wait_split(ms, |backend, _, _| f(backend)).await
+    }
+    /// `wait` whose poll also borrows the swapped-out station owner, so a
+    /// station wait can hand the other owner's frames and TX completions
+    /// to it instead of discarding them (`group_link::route_station_rx`).
+    async fn wait_split<T>(
+        &mut self,
+        ms: u64,
+        mut f: impl FnMut(
+            &mut B,
+            &mut Option<GroupOwner>,
+            &mut Option<go_link::GoOwner>,
+        ) -> Result<Option<T>, Error>,
+    ) -> Result<T, Error> {
         let start = self.backend.now_ns();
         poll_fn(|cx| {
+            // The AP can already beacon while its last command receipt is
+            // pending. Recheck the actual request and RF owner on every
+            // native wait poll; cleanup/recovery uses its own device grant.
+            if matches!(self.state, State::Running(Stage::ApStart | Stage::ApPeer)) {
+                if let Some(owner) = &self.ap_owner {
+                    if owner
+                        .pending
+                        .as_ref()
+                        .is_none_or(|grant| grant.current().is_err())
+                    {
+                        return Poll::Ready(Err(Error::Authority));
+                    }
+                    if owner.identity.current().is_err() {
+                        return Poll::Ready(Err(Error::Authority));
+                    }
+                    if let Err(error) = self.backend.check_tx_permission(owner.plan.permission) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pDeviceStart)) {
+                if let Some(owner) = self.p2p_owner.as_ref() {
+                    if owner
+                        .pending
+                        .as_ref()
+                        .is_none_or(|authority| authority.current().is_err())
+                        || owner.identity.current().is_err()
+                    {
+                        return Poll::Ready(Err(Error::Authority));
+                    }
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pRocAcquire)) {
+                if let Err(error) = self.check_p2p_roc_pending() {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pManagementTx)) {
+                if let Err(error) = self.check_p2p_management_tx() {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pRocExpire)) {
+                if let Some(implicit) = self
+                    .p2p_owner
+                    .as_ref()
+                    .and_then(|owner| owner.management.implicit)
+                {
+                    if let Err(error) =
+                        self.check_p2p_management_home(implicit.plan.home, implicit.home)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+            }
             if let Err(error) = self.backend.check() {
                 return Poll::Ready(Err(error));
             }
@@ -1210,7 +1919,7 @@ impl<B: Backend> Session<B> {
             {
                 return Poll::Ready(Err(Error::Timeout));
             }
-            match f(&mut self.backend) {
+            match f(&mut self.backend, &mut self.group, &mut self.go) {
                 Ok(Some(value)) => Poll::Ready(Ok(value)),
                 Err(error) => Poll::Ready(Err(error)),
                 Ok(None) => {
@@ -1392,20 +2101,43 @@ impl<B: Backend> Session<B> {
         if self.state == State::Stopped {
             return Ok(());
         }
+        let _ap_request = self
+            .ap_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
+        let _p2p_request = self
+            .p2p_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
+        if self.p2p_owner.is_some() {
+            let result = self.stop_p2p_device_owned().await;
+            if self.p2p_owner.is_some() {
+                return result;
+            }
+        }
+        // WFDMA shutdown alone cannot stop autonomous firmware beacons.
+        // Retain the AP owner unless its verified reset actually completes.
+        if self.ap_owner.is_some() {
+            let result = self.stop_ap_owned().await;
+            if self.ap_owner.is_some() {
+                return result;
+            }
+        }
         self.boot_started = None;
-        self.rx_ba.fence();
-        self.tx_ba.fence();
-        self.security = None;
-        self.station_permission = None;
-        self.ht20_rx = None;
-        self.ht20_profile = None;
-        self.vht_profile = None;
-        self.he_profile = None;
-        self.ap_phy = None;
-        self.received_msdu.clear();
-        self.rx_fragments.clear();
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
+        self.station.security = None;
+        self.station.permission = None;
+        self.station.ht20_rx = None;
+        self.station.ht20_profile = None;
+        self.station.vht_profile = None;
+        self.station.he_profile = None;
+        self.station.ap_phy = None;
+        self.station.received_msdu.clear();
+        self.station.rx_fragments.clear();
         self.stage(Stage::Shutdown);
         let result = async {
+            self.normalize_wake_bus().await?;
             self.backend.check()?;
             self.backend.quiesce()?;
             self.wait(100, |b| b.idle().map(|idle| idle.then_some(())))

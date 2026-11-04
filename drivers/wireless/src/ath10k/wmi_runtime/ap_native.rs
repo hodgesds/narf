@@ -1,0 +1,812 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Retained native AP transitions. Source/policy permission is rechecked on
+//! every suspension; cancellation leaves this same vdev/peer/DMA owner closed.
+use super::{
+    ap::{self, Session, Token, Vdev},
+    ap_wire, htt, wire, Error, Hif, HostMemory, HttMemory, Radio,
+};
+use alloc::{boxed::Box, vec::Vec};
+use narf_wireless::{ap_control::ApEmissionAuthority, ApConfig, ApStartSettings};
+
+impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub(in crate::ath10k) fn ap_supported(&self) -> bool {
+        self.wire.dialect == super::Dialect::Tlv
+            && self.htt.wmi.htc.transport.nonblocking_wmi()
+            && self.htt.ap_protocol()
+            && self.htt.wmi.raw_mode()
+            && self.htt.wmi.caps.as_ref().is_some_and(|caps| {
+                caps.service(self.wire.dialect, 0) && caps.service(self.wire.dialect, 92)
+            })
+            && self
+                .htt
+                .wmi
+                .ap_resources()
+                .is_some_and(|(vdevs, peers)| vdevs >= 1 && peers >= 9)
+            && super::management::path(
+                self.wire.dialect,
+                self.features,
+                self.htt.wmi.caps.as_ref().unwrap(),
+            )
+            .is_ok_and(|path| !matches!(path, super::management::Path::Inline(_)))
+    }
+    pub(in crate::ath10k) fn ap_uapsd(&self) -> bool {
+        self.ap_supported()
+            && self
+                .htt
+                .wmi
+                .caps
+                .as_ref()
+                .is_some_and(|caps| caps.service(self.wire.dialect, 6))
+    }
+    pub(in crate::ath10k) fn ap_policy(&self) -> Option<ap::Policy> {
+        self.ap.as_ref().map(|ap| ap.policy.clone())
+    }
+    pub(in crate::ath10k) fn ap_abandoned(&self) -> bool {
+        self.ap.as_ref().is_some_and(|ap| {
+            ap.busy
+                || ap.current(ap.policy.domain()).is_err()
+                || ap
+                    .pending
+                    .iter()
+                    .any(|pending| pending.control && pending.status.is_none())
+        })
+    }
+    pub(in crate::ath10k) fn ap_data_capture(&self) -> Result<ap::Capture, Error> {
+        self.ap.as_ref().ok_or(Error::Failed)?.capture(true, true)
+    }
+    pub(in crate::ath10k) fn ap_capture(&self) -> Result<ap::Capture, Error> {
+        self.ap.as_ref().ok_or(Error::Failed)?.capture(true, true)
+    }
+    pub(in crate::ath10k) fn ap_clients(&self) -> Result<Vec<[u8; 6]>, Error> {
+        let ap = self.ap.as_ref().ok_or(Error::Failed)?;
+        ap.current(ap.policy.domain())?;
+        let mut macs = Vec::new();
+        macs.try_reserve_exact(ap.peers.len())
+            .map_err(|_| Error::NoMemory)?;
+        macs.extend(
+            ap.peers
+                .iter()
+                .filter(|peer| peer.associated && peer.record.mapped())
+                .map(|peer| peer.record.mac),
+        );
+        Ok(macs)
+    }
+    pub(in crate::ath10k) fn ap_exists(&self) -> bool {
+        self.ap.is_some()
+    }
+    pub(in crate::ath10k) fn ap_failed(&self) -> bool {
+        self.ap.as_ref().is_some_and(|ap| ap.failed)
+    }
+    pub(in crate::ath10k) fn ap_running(&self) -> bool {
+        self.ap
+            .as_ref()
+            .is_some_and(|ap| !ap.failed && !ap.busy && ap.vdev == Vdev::Up && ap.own.mapped())
+    }
+    /// The AP-type vdev the running AP session addresses.
+    pub(super) fn ap_vdev(&self) -> Result<u8, Error> {
+        self.ap.as_ref().map(|ap| ap.plan.vdev).ok_or(Error::Failed)
+    }
+    pub(in crate::ath10k) fn ap_current(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.ap.as_ref().ok_or(Error::Failed)?.current(domain)
+    }
+    fn ap_next_echo(&mut self) -> Result<u32, Error> {
+        self.ap_sequence = self
+            .ap_sequence
+            .checked_add(1)
+            .filter(|n| *n != u32::MAX)
+            .ok_or(Error::Exhausted)?;
+        let value = self.ap_sequence;
+        self.ap.as_mut().ok_or(Error::Failed)?.echo = value;
+        Ok(value)
+    }
+    pub(super) async fn ap_command(
+        &mut self,
+        bytes: &[u8],
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.send_scan_command(bytes, validate).await
+    }
+    /// Consume only the one physical runtime's genuine received events. Every
+    /// native copied packet retains its original AP/copy/DATA/source epochs.
+    pub(super) fn ap_event(&mut self, event: htt::Event) -> Result<bool, Error> {
+        // A GO shares the radio with station slots: what a slot owns (its
+        // peer's RX, BA notes, BSS management) is parked for that slot.
+        let event = match self.park_station_owned(event) {
+            Some(event) => event,
+            None => return Ok(false),
+        };
+        if let htt::Event::Wmi(bytes) = &event {
+            if let Some((reports, foreign)) = self
+                .ap
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .management_completions(bytes)?
+            {
+                let mut ids = Vec::new();
+                ids.try_reserve_exact(reports.len())
+                    .map_err(|_| Error::NoMemory)?;
+                ids.extend(reports.iter().map(|report| report.id));
+                self.htt.wmi.htc.transport.complete_wmi_management(&ids)?;
+                // A station slot's completions, as `station_event` keeps
+                // them (bounded 128).
+                if self.management_done.len() + foreign.len() > 128 {
+                    return Err(Error::Exhausted);
+                }
+                self.management_done
+                    .try_reserve(foreign.len())
+                    .map_err(|_| Error::NoMemory)?;
+                self.management_done.extend(foreign);
+                return Ok(false);
+            }
+            let id = wire::word(bytes, 0)? & 0xffffff;
+            if id == self.wire.management_event {
+                let native = self.wire.management(&bytes[4..], self.features)?;
+                self.ap.as_mut().ok_or(Error::Failed)?.management(native)?;
+            } else if id == 0x5001
+                && self
+                    .ap
+                    .as_ref()
+                    .is_some_and(|ap| ap.vdev == Vdev::StartSent)
+            {
+                if self.wire.start_response(self.ap_vdev()?, &bytes[4..])? == Some(()) {
+                    self.ap.as_mut().unwrap().vdev = Vdev::Started;
+                }
+            } else {
+                self.ap.as_mut().ok_or(Error::Failed)?.wmi_event(bytes)?;
+            }
+        }
+        match event {
+            htt::Event::Idle => return Ok(true),
+            htt::Event::Message(bytes) => {
+                self.ap.as_mut().ok_or(Error::Failed)?.peer_event(&bytes)?
+            }
+            htt::Event::Rx(batch) => {
+                for (status, frame) in batch.frames {
+                    self.ap
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .receive(status, batch.peer, batch.tid, frame)?;
+                }
+            }
+            htt::Event::InOrder(indication, frames) => {
+                // TLV RX_IN_ORD supplies the same complete RAW descriptor
+                // plus an exact owned DMA pointer/peer/vdev/TID receipt.
+                // Decapped offload/fragment forms supply no AP RAW authority.
+                if !indication.offload
+                    && !indication.fragment
+                    && Ok(indication.vdev) == self.ap_vdev()
+                {
+                    for frame in frames {
+                        self.ap.as_mut().ok_or(Error::Failed)?.receive(
+                            1,
+                            indication.peer,
+                            indication.tid,
+                            frame,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let (session, htt) = (&mut self.ap, &mut self.htt);
+        session
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .htt_completions(htt)?;
+        Ok(false)
+    }
+    /// The decoded WMI management RX frame of `event`, if it is one.
+    pub(super) fn management_frame(&self, event: &htt::Event) -> Option<Vec<u8>> {
+        match event {
+            htt::Event::Wmi(bytes)
+                if bytes.len() > 4
+                    && wire::word(bytes, 0)
+                        .is_ok_and(|w| w & 0xffffff == self.wire.management_event) =>
+            {
+                self.wire
+                    .management(&bytes[4..], self.features)
+                    .ok()
+                    .map(|m| m.frame)
+            }
+            _ => None,
+        }
+    }
+    /// GO side of the AP <-> station-slot routing: an event the AP poll
+    /// read but a station slot owns (`StationSlot::claims`) goes to that
+    /// slot's inbox. An ordinary AP replaced the station role and has no
+    /// slot beside it, so this is the identity.
+    fn park_station_owned(&mut self, event: htt::Event) -> Option<htt::Event> {
+        if !self.ap_is_go() {
+            return Some(event);
+        }
+        let frame = self.management_frame(&event);
+        let primary = self.primary.id();
+        if self.station.claims(&event, primary, frame.as_deref()) {
+            self.station.park(event);
+            return None;
+        }
+        match self
+            .p2p_client
+            .as_deref_mut()
+            .filter(|s| s.claims(&event, primary, frame.as_deref()))
+        {
+            Some(slot) => {
+                slot.park(event);
+                None
+            }
+            None => Some(event),
+        }
+    }
+    /// Station side of the routing: an event a station owner polled that
+    /// the GO session owns (`Session::claims`) is consumed by the GO now
+    /// (`ap_event` only updates session state and its bounded RX queue).
+    /// A GO that cannot consume it is failed for its own netdev's
+    /// cleanup; the station owner continues.
+    pub(super) fn route_go(
+        &mut self,
+        event: htt::Event,
+        frame: Option<&[u8]>,
+    ) -> Option<htt::Event> {
+        if !self
+            .ap
+            .as_ref()
+            .is_some_and(|ap| ap.plan.role == super::p2p::Role::P2pGo && ap.claims(&event, frame))
+        {
+            return Some(event);
+        }
+        if self.ap_event(event).is_err() {
+            if let Some(ap) = self.ap.as_mut() {
+                ap.failed = true;
+            }
+        }
+        None
+    }
+    /// A station owner's TX completion that belongs to the GO session
+    /// (its HTT msdu id); `false` leaves it to the station owner.
+    pub(super) fn route_go_receipt(&mut self, receipt: htt::TxReceipt) -> bool {
+        self.ap
+            .as_deref_mut()
+            .is_some_and(|ap| ap.go_receipt(receipt))
+    }
+    /// A station owner's WMI management completions minus the GO's own
+    /// (completed on the GO session).
+    pub(super) fn route_go_management(
+        &mut self,
+        reports: Vec<super::ManagementCompletion>,
+    ) -> Vec<super::ManagementCompletion> {
+        let Some(ap) = self
+            .ap
+            .as_mut()
+            .filter(|ap| ap.plan.role == super::p2p::Role::P2pGo)
+        else {
+            return reports;
+        };
+        let mut station = reports;
+        station.retain(|report| {
+            if !ap.owns_token(Token::Wmi(report.id)) {
+                return true;
+            }
+            if ap
+                .terminal(Token::Wmi(report.id), report.status == 0)
+                .is_err()
+            {
+                ap.failed = true;
+            }
+            false
+        });
+        station
+    }
+    pub(super) async fn ap_wait(
+        &mut self,
+        matched: impl Fn(&Session) -> bool,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(3000);
+        for _ in 0..8192 {
+            validate()?;
+            if matched(self.ap.as_ref().ok_or(Error::Failed)?) {
+                return Ok(());
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            let event = super::checked_policy(
+                async { self.htt.poll().await.map_err(Error::from) },
+                validate,
+            )
+            .await?;
+            self.ap_event(event)?;
+            narf_scheduler::yield_now().await;
+        }
+        Err(Error::Exhausted)
+    }
+    pub(super) async fn ap_prefix(
+        &mut self,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(3000);
+        for _ in 0..8192 {
+            validate()?;
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            let event = super::checked_policy(
+                async { self.htt.poll().await.map_err(Error::from) },
+                validate,
+            )
+            .await?;
+            let deferred = self.htt.take_idle_deferred();
+            if self.ap_event(event)? && !deferred {
+                return Ok(());
+            }
+            narf_scheduler::yield_now().await;
+        }
+        Err(Error::Exhausted)
+    }
+    pub(super) async fn ap_barrier(
+        &mut self,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let value = self.ap_next_echo()?;
+        self.ap_command(&ap_wire::echo(value)?, validate).await?;
+        self.ap_wait(|ap| ap.echo_seen == value, validate).await
+    }
+    /// Open response windows only after the synchronous real CE handoff.
+    /// Native input consumed during credit/source waits stays in the OLD
+    /// phase; it cannot satisfy a command that has not been published.
+    pub(super) async fn ap_publish(
+        &mut self,
+        command: &[u8],
+        publication: ap::Publication,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(3000);
+        for _ in 0..8192 {
+            self.ap_prefix(validate).await?;
+            validate()?;
+            if self
+                .htt
+                .wmi
+                .htc
+                .try_begin_wmi_retained(command)
+                .map_err(htt::Error::from)?
+            {
+                let ap = self.ap.as_mut().ok_or(Error::Failed)?;
+                match publication {
+                    ap::Publication::Vdev(phase) => {
+                        ap.vdev = phase;
+                        if phase == Vdev::DeleteSent {
+                            ap.vdev_deleted = false;
+                        }
+                        if phase == Vdev::StopSent {
+                            ap.native_stopped = false;
+                        }
+                        if phase == Vdev::Up {
+                            ap.beacon_ok = false;
+                        }
+                    }
+                    ap::Publication::CreatePeer(mac) | ap::Publication::DeletePeer(mac) => {
+                        let record = if mac == ap.own.mac {
+                            &mut ap.own
+                        } else {
+                            &mut ap
+                                .peers
+                                .iter_mut()
+                                .find(|peer| peer.record.mac == mac)
+                                .ok_or(Error::Failed)?
+                                .record
+                        };
+                        if matches!(publication, ap::Publication::CreatePeer(_)) {
+                            record.expected = true;
+                        } else {
+                            record.delete_ack = false;
+                            record.deleting = true;
+                        }
+                    }
+                }
+                super::checked_policy(
+                    async {
+                        self.htt
+                            .wmi
+                            .htc
+                            .wait_wmi_source()
+                            .await
+                            .map_err(htt::Error::from)
+                            .map_err(Error::from)
+                    },
+                    validate,
+                )
+                .await?;
+                return Ok(());
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            narf_scheduler::yield_now().await;
+        }
+        Err(Error::Exhausted)
+    }
+    pub(super) async fn ap_create_peer(
+        &mut self,
+        mac: [u8; 6],
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.ap_publish(
+            &self.wire.offchannel_peer(self.ap_vdev()?, mac)?,
+            ap::Publication::CreatePeer(mac),
+            validate,
+        )
+        .await
+    }
+    pub(super) async fn ap_remove_peer(
+        &mut self,
+        mac: [u8; 6],
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.ap_publish(
+            &self.wire.delete_offchannel_peer(self.ap_vdev()?, mac)?,
+            ap::Publication::DeletePeer(mac),
+            validate,
+        )
+        .await
+    }
+    pub(super) async fn ap_quiet(
+        &mut self,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.ap_wait(
+            |ap| ap.pending.iter().all(|packet| packet.status.is_some()),
+            validate,
+        )
+        .await?;
+        // A GO shares the HTT TX pool with station slots: its own pending
+        // TX all completed above; the slots' in-flight MSDUs are theirs.
+        if !self.ap_is_go() && self.htt.wmi.htc.transport.pending_htt_tx()? != 0 {
+            return Err(Error::Failed);
+        }
+        self.ap_prefix(validate).await
+    }
+    /// The managed netdev's AP: it replaces the station discovery role on
+    /// the managed vdev (`Radio::primary`) and restores it at stop.
+    pub(in crate::ath10k) async fn ap_start(
+        &mut self,
+        config: ApConfig,
+        settings: ApStartSettings,
+        emission: ApEmissionAuthority,
+        policy: ap::Policy,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.ap_start_role(None, config, settings, emission, policy, validate)
+            .await
+    }
+    /// A P2P GO on its own AP-type vdev (subtype P2P_GO) beside the
+    /// managed vdev, as `mac.c::ath10k_add_interface` for
+    /// `NL80211_IFTYPE_P2P_GO`: lowest free id of `ar->free_vdev_map`,
+    /// `WMI_VDEV_CREATE` (AP, P2P_GO, `vif->addr` = `own`), the vdev NSS
+    /// parameter and the AP self peer; `Radio::primary` is untouched.
+    /// `ap_cleanup` deletes the self peer and the GO vdev
+    /// (`ath10k_remove_interface`) and returns the id.
+    pub(in crate::ath10k) async fn go_start(
+        &mut self,
+        own: [u8; 6],
+        config: ApConfig,
+        settings: ApStartSettings,
+        emission: ApEmissionAuthority,
+        policy: ap::Policy,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.ap_start_role(Some(own), config, settings, emission, policy, validate)
+            .await
+    }
+    /// Whether the AP session is a GO on its own vdev (not the managed
+    /// netdev's AP on `Radio::primary`).
+    pub(in crate::ath10k) fn ap_is_go(&self) -> bool {
+        self.ap
+            .as_ref()
+            .is_some_and(|ap| ap.plan.role == super::p2p::Role::P2pGo)
+    }
+    /// The AP-type vdev the session owns: the GO's own vdev, else the
+    /// managed vdev the AP replaced.
+    pub(super) fn ap_owned_vdev(&self) -> Result<super::p2p::Vdev, Error> {
+        let ap = self.ap.as_ref().ok_or(Error::Failed)?;
+        Ok(match ap.plan.role {
+            super::p2p::Role::P2pGo => super::p2p::Vdev::new(ap.plan.vdev, ap.plan.role),
+            _ => self.primary,
+        })
+    }
+    /// The GO's vdev and address while a GO session exists.
+    pub(in crate::ath10k) fn go_identity(&self) -> Option<(u8, [u8; 6])> {
+        self.ap
+            .as_ref()
+            .filter(|ap| ap.plan.role == super::p2p::Role::P2pGo)
+            .map(|ap| (ap.plan.vdev, ap.own.mac))
+    }
+    async fn ap_start_role(
+        &mut self,
+        go: Option<[u8; 6]>,
+        config: ApConfig,
+        settings: ApStartSettings,
+        emission: ApEmissionAuthority,
+        policy: ap::Policy,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        validate()?;
+        let domain = policy.domain();
+        let init = self.ready.ok_or(Error::Failed)?.mac;
+        // The managed netdev's AP replaces the station role, so its slot
+        // must be idle; a GO runs beside the station slots (their events
+        // are routed both ways, `route_go`/`park_station_owned`).
+        if !policy.current()
+            || !self.ap_supported()
+            || self.failed
+            || self.ap.is_some()
+            || go.is_none() && (self.station.peer.is_some() || self.station.data.is_some())
+            || self.roc.is_some()
+            || self.scan_pending.is_some()
+            || !emission.current()
+        {
+            return Err(Error::Unsupported);
+        }
+        if let Some(own) = go {
+            // TLV P2P firmware; the GO address is its own unicast vif
+            // address, never another vdev's. One channel
+            // (`ath10k_tlv_if_limit`) unless adaptive QCS was enabled
+            // (`ath10k_tlv_qcs_if_limit`: AP/P2P_GO <= 1 on two channels).
+            let client = self.p2p_client_identity().map(|(_, own)| own);
+            let frequency = u16::try_from(config.frequency_mhz).unwrap_or(0);
+            if !self.p2p_supported()
+                || self.in_client_scope
+                || own == [0; 6]
+                || own[0] & 1 != 0
+                || own == init
+                || Some(own) == client
+                || self.p2p_device.is_some() && own == self.p2p_device_mac
+                || !self.adaptive_qcs && !self.slots_on_channel(frequency)
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+        let own = go.unwrap_or(init);
+        let staging_stale = |plan: &ap_wire::Plan, radio: &Self| {
+            radio.ap_staging.as_ref().is_some_and(|staging| {
+                !staging.current() || !plan.config.privacy && !staging.keys.is_empty()
+            })
+        };
+        let (plan, templates, permission) = {
+            let (vdev, role) = match go {
+                Some(_) => (
+                    self.vdev_map.as_mut().ok_or(Error::Failed)?.allocate()?,
+                    super::p2p::Role::P2pGo,
+                ),
+                None => (self.primary.id(), super::p2p::Role::Ap),
+            };
+            let prepared = (|| {
+                let plan =
+                    ap_wire::Plan::new_role(vdev, role, config, settings, own, self.ap_uapsd())?;
+                if staging_stale(&plan, self) {
+                    self.ap_staging = None;
+                    return Err(Error::Unsupported);
+                }
+                let templates = ap_wire::templates(&plan)?;
+                let max = self.htt.wmi.htc.wmi_max_payload();
+                if templates.iter().any(|command| command.len() > max) {
+                    return Err(Error::Unsupported);
+                }
+                let permission =
+                    self.hinted_permission(domain, plan.config.frequency_mhz as u16, None, false)?;
+                Ok((plan, templates, permission))
+            })();
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    if go.is_some() {
+                        self.vdev_map.as_mut().ok_or(Error::Failed)?.release(vdev)?;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        self.htt.wmi.htc.transport.runtime_idle(false);
+        if self.ap_history.is_none() {
+            self.ap_history = Some(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                super::ap_key::History::default(),
+            )));
+        }
+        self.ap = Some(Box::new(Session::new(
+            policy.clone(),
+            plan,
+            permission.clone(),
+            emission.clone(),
+            own,
+        )));
+        // The immutable local proof closes every native await, without a
+        // callback to an AP socket or interface while Radio is borrowed.
+        let current = || {
+            validate()?;
+            if !policy.current() || !emission.current() {
+                return Err(Error::Failed);
+            }
+            permission.check(domain)
+        };
+        self.ap_prefix(&current).await?;
+        if go.is_none() {
+            self.ap_publish(
+                &ap_wire::delete(self.primary)?,
+                ap::Publication::Vdev(Vdev::DeleteSent),
+                &current,
+            )
+            .await?;
+            self.ap_wait(|ap| ap.vdev_deleted, &current).await?;
+            self.ap.as_mut().unwrap().vdev = Vdev::Absent;
+            self.ap_prefix(&current).await?;
+            // The AP replaces the station discovery role on the same id.
+            self.primary = super::p2p::Vdev::new(self.primary.id(), super::p2p::Role::Ap);
+        }
+        self.ap.as_mut().unwrap().vdev = Vdev::CreateSent;
+        self.ap_command(&ap_wire::create(self.ap_owned_vdev()?, own)?, &current)
+            .await?;
+        if go.is_some() {
+            // `ath10k_add_interface`: the vdev NSS parameter follows every
+            // VDEV_CREATE (`cfg_tx_chainmask`), as on the P2P client vdev.
+            let nss = self
+                .chains
+                .ok_or(Error::Failed)?
+                .vdev_nss_for(self.wire.dialect, self.ap_vdev()?)?;
+            self.ap_command(&nss, &current).await?;
+        }
+        self.ap_barrier(&current).await?;
+        self.ap.as_mut().unwrap().vdev = Vdev::Created;
+        self.ap_create_peer(own, &current).await?;
+        self.ap_wait(|ap| ap.own.mapped(), &current).await?;
+        let own_epoch = self.ap.as_ref().unwrap().own.epoch.clone();
+        let own_generation = own_epoch.load(core::sync::atomic::Ordering::Acquire);
+        let initial = current;
+        let current = || {
+            initial()?;
+            if own_generation == u64::MAX
+                || own_epoch.load(core::sync::atomic::Ordering::Acquire) != own_generation
+            {
+                return Err(Error::Failed);
+            }
+            Ok(())
+        };
+
+        self.ap_command(&self.wire.domain(&permission)?, &current)
+            .await?;
+        self.ap_command(&self.wire.power(&permission)?, &current)
+            .await?;
+        for command in ap_wire::parameters(&self.ap.as_ref().unwrap().plan)? {
+            self.ap_command(&command, &current).await?;
+        }
+
+        let plan = &self.ap.as_ref().unwrap().plan;
+        let contention = plan
+            .wmm
+            .unwrap_or_else(|| super::wmm::legacy_defaults(permission.frequency, plan.rates));
+        self.ap_dirty_wmm = true;
+        self.ap_command(
+            &super::wmm::command(self.wire.dialect, contention)?,
+            &current,
+        )
+        .await?;
+        let plan = &self.ap.as_ref().unwrap().plan;
+        let mut start = self.wire.start_station(
+            self.ap_vdev()?,
+            &permission,
+            plan.config.beacon_interval as u16,
+            plan.config.dtim_period as u8,
+        )?;
+        // wmi_tlv_vdev_start_cmd: vdev/request/interval/dtim/flags/SSID.
+        wire::put(&mut start, 24, u32::from(plan.config.hidden_ssid != 0));
+        wire::put(&mut start, 28, plan.config.ssid.len() as u32);
+        start[32..32 + plan.config.ssid.len()].copy_from_slice(&plan.config.ssid);
+        self.ap_publish(&start, ap::Publication::Vdev(Vdev::StartSent), &current)
+            .await?;
+        self.ap_wait(|ap| ap.vdev == Vdev::Started, &current)
+            .await?;
+        for command in &templates {
+            self.ap_command(command, &current).await?;
+        }
+        let vdev = self.ap.as_ref().ok_or(Error::Failed)?.plan.vdev;
+        let mut up = ap_wire::command(0x5005, 92, &[u32::from(vdev), 0, 0, 0])?;
+        up[16..22].copy_from_slice(&own);
+        self.ap_publish(&up, ap::Publication::Vdev(Vdev::Up), &current)
+            .await?;
+        self.ap_barrier(&current).await?;
+        self.ap_wait(|ap| ap.beacon_ok, &current).await?;
+        let ap = self.ap.as_mut().unwrap();
+        ap.current(domain)?;
+        ap.busy = false;
+        // Earlier NEW_KEY/default ACKs were zeroizing metadata only. Promote
+        // under each ORIGINAL still-current source after the real self peer,
+        // AP/UP/template receipts and actual native DATA quiescence.
+        if let Some(staging) = self.ap_staging.take() {
+            for (key, source) in staging.keys {
+                self.ap_add_key(key, source, domain, &current).await?;
+            }
+            if let Some((index, source)) = staging.default {
+                self.ap_default_key(index, (false, true, false, false), source, domain)?;
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::ath10k) fn ap_poll_now(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<Vec<ap::Received>, Error> {
+        self.ap_current(domain)?;
+        self.htt.wmi.htc.transport.runtime_idle(false);
+        for _ in 0..64 {
+            let event = self.htt.poll_now()?;
+            if self.ap_event(event)? {
+                break;
+            }
+            self.ap_current(domain)?;
+        }
+        let ap = self.ap.as_mut().ok_or(Error::Failed)?;
+        let mut received = Vec::new();
+        received
+            .try_reserve_exact(ap.received.len())
+            .map_err(|_| Error::NoMemory)?;
+        received.extend(ap.received.drain(..));
+        Ok(received)
+    }
+    pub(in crate::ath10k) fn ap_begin_ethernet(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        ethernet: &[u8],
+        original: &ap::Capture,
+    ) -> Result<bool, Error> {
+        self.ap_current(domain)?;
+        original.current(domain)?;
+        // A completed native loss may be arbitrarily far behind diagnostics.
+        // No fresh capture after draining may revive this queued original.
+        let mut quiet = false;
+        for _ in 0..64 {
+            let event = self.htt.poll_now()?;
+            let deferred = self.htt.take_idle_deferred();
+            if self.ap_event(event)? && !deferred {
+                quiet = true;
+                break;
+            }
+            original.current(domain)?;
+        }
+        original.current(domain)?;
+        if !quiet {
+            return Ok(false);
+        }
+        if !self.ap_running() || !self.htt.source_ready()? {
+            return Ok(false);
+        }
+        let ap = self.ap.as_mut().ok_or(Error::Failed)?;
+        // Preserve two real control/management IDs under ordinary DATA load.
+        if ap.pending.len() >= 30 {
+            return Ok(false);
+        }
+        ap.pending.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        let Some((bytes, tid)) = ap.ethernet(ethernet, false, false)? else {
+            return Ok(true);
+        };
+        ap.current(domain)?;
+        original.current(domain)?;
+        let id = self.htt.begin_transmit(
+            htt::tx::Parameters {
+                kind: htt::tx::Kind::Raw,
+                vdev: self.ap_vdev()?,
+                tid,
+                hardware_crypto: false,
+            },
+            &bytes,
+        )?;
+        self.ap.as_mut().unwrap().pending.push(ap::Pending {
+            token: Token::Htt(id),
+            deadline: narf_time::Deadline::after_ms(3000),
+            status: None,
+            control: false,
+        });
+        Ok(true)
+    }
+}

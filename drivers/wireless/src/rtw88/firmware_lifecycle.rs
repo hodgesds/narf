@@ -35,9 +35,13 @@ pub(super) struct Lifecycle<I: Io> {
     started: AtomicBool,
     /// Set by `remove`; no owner may be installed afterwards.
     removed: AtomicBool,
+    retirement_claimed: AtomicBool,
     pub(super) retained: Mutex<Option<Owner<I>>>,
     status: IrqSafeSpinLock<Status>,
     did: u16,
+    /// C21/B22 host interface handed to the owner (`phy8821c::Interface`):
+    /// PCIe by default, the claimed VID/PID for RTL8821CU/RTL8822BU.
+    interface: super::phy8821c::Interface,
 }
 impl<I: Io> core::fmt::Debug for Lifecycle<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -80,6 +84,7 @@ impl<I: Io> Lifecycle<I> {
         Self {
             started: AtomicBool::new(false),
             removed: AtomicBool::new(false),
+            retirement_claimed: AtomicBool::new(false),
             retained: Mutex::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
@@ -87,13 +92,30 @@ impl<I: Io> Lifecycle<I> {
                 error: None,
             }),
             did,
+            interface: super::phy8821c::Interface::Pcie,
         }
+    }
+    /// The same lifecycle behind another C21/B22 host interface. Only before
+    /// any owner exists; every signed C21/B22 record is then keyed by
+    /// `interface.host_of(did)`.
+    pub(super) fn on(self, interface: super::phy8821c::Interface) -> Self {
+        Self { interface, ..self }
     }
     pub(super) fn status(&self) -> Status {
         *self.status.lock()
     }
     pub(super) fn removed(&self) -> bool {
         self.removed.load(Ordering::Acquire)
+    }
+    /// A reset consumer may attempt original retirement once. Cancellation or
+    /// an unproven native stop cannot later turn an empty slot into a receipt.
+    pub(super) fn claim_retirement(&self) -> bool {
+        !self.removed()
+            && self
+                .retirement_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            && !self.removed()
     }
     /// Linux v7.2 `pci.c::rtw_pci_remove` for the retained owner: no later
     /// stage or initialization may start, the owner runs `rtw_pci_stop` and
@@ -120,6 +142,9 @@ impl<I: Io> Lifecycle<I> {
     }
     pub(super) fn device_id(&self) -> u16 {
         self.did
+    }
+    pub(super) fn interface(&self) -> super::phy8821c::Interface {
+        self.interface
     }
     pub(super) async fn ht20_request(&self) -> Result<super::Ht20Request, Error> {
         self.retained
@@ -152,6 +177,17 @@ impl<I: Io> Lifecycle<I> {
             .as_mut()
             .ok_or(Error::State)?
             .rts_request()
+    }
+    pub(super) async fn power_tracking_request(
+        &self,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .power_tracking_request()
+            .await
     }
     pub(super) async fn tracking_request(&self) -> Result<super::ContinuationRequest, Error> {
         self.retained
@@ -345,6 +381,231 @@ impl<I: Io> Lifecycle<I> {
             }
         }
         result
+    }
+    pub(super) async fn prepare_phy8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::phy8822b::Info, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::MacPrepared {
+            return Err(Error::State);
+        }
+        self.status.lock().stage = Stage::PreparingPhy;
+        let _attempt = Attempt(self);
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let result = owner.prepare_phy8822b(factory).await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::PhyTablesPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn calibration_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::calibration8822b::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .calibration_request8822b(factory)
+    }
+    pub(super) async fn calibration_info8822b(&self) -> Option<super::radio8822b::Calibration> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::calibration_info8822b)
+    }
+    /// RTL8822BE `N2BQ`-enclosed ch1/20 firmware IQK: `PhyTablesPrepared →
+    /// Calibrating → Calibrated`. A missing, unsigned, mismatched or
+    /// policy-refused record leaves the pure `PhyTablesPrepared` checkpoint.
+    pub(super) async fn prepare_calibration8822b_with<F>(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::calibration8822b::Source,
+        policy: F,
+    ) -> Result<super::radio8822b::Calibration, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let envelope = owner.preflight_calibration8822b(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::Calibrating;
+        let _attempt = Attempt(self);
+        let result = owner
+            .prepare_calibration8822b(factory, envelope, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Calibrated,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_calibration8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::radio8822b::Calibration, Error> {
+        narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| Error::Calibration8822b(super::calibration8822b::Error::Policy))?;
+        self.prepare_calibration8822b_with(
+            factory,
+            super::calibration8822b::Source::Registered,
+            || {
+                narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8822b(
+                    super::calibration8822b::Error::Policy,
+                ))
+            },
+        )
+        .await
+    }
+    pub(super) async fn operating_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .operating_request8822b(factory)
+    }
+    pub(super) async fn operating_info8822b(&self) -> Option<super::operating8822b::Info> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::operating_info8822b)
+    }
+    pub(super) async fn station_request8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::StationRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_request8822b(factory)
+    }
+    /// RTL8822BE `N2BP` parked operating power: `Calibrated →
+    /// PreparingOperating8821c → Operating8821cPrepared` (stage names are
+    /// shared with C21; the owner is keyed by `0xb822`). A missing, unsigned,
+    /// mismatched or policy-refused record leaves the pure `Calibrated`
+    /// checkpoint without register access.
+    pub(super) async fn prepare_operating8822b_with<F>(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::operating8822b::Source,
+        policy: F,
+    ) -> Result<super::operating8822b::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Calibrated {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let envelope = owner.preflight_operating8822b(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::PreparingOperating8821c;
+        let _attempt = Attempt(self);
+        let result = owner
+            .prepare_operating8822b(factory, envelope, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Operating8821cPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_operating8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::operating8822b::Info, Error> {
+        self.prepare_operating8822b_with(factory, super::operating8822b::Source::Registered, || {
+            narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8822b(
+                super::calibration8822b::Error::Policy,
+            ))
+        })
+        .await
+    }
+    /// RTL8822BE awake station radio (`radio8822b::prepare_station`):
+    /// `Operating8821cPrepared → PreparingRadio8821c → Radio8821cPrepared`
+    /// (stage names shared with C21; owner keyed by `0xb822`). A missing,
+    /// unsigned, mismatched or policy-refused `N2BS` record leaves the pure
+    /// `Operating8821cPrepared` checkpoint without register access.
+    pub(super) async fn prepare_station8822b_with<F>(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+        source: super::operating8822b::StationSource,
+        policy: F,
+    ) -> Result<super::radio8821c::StationInfo, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Operating8821cPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let grant = owner.preflight_station8822b(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::PreparingRadio8821c;
+        let _attempt = Attempt(self);
+        let result = owner.prepare_station8822b(factory, grant, policy).await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Radio8821cPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_station8822b(
+        &self,
+        factory: &super::efuse8822b::Factory8822b,
+    ) -> Result<super::radio8821c::StationInfo, Error> {
+        self.prepare_station8822b_with(
+            factory,
+            super::operating8822b::StationSource::Registered,
+            || {
+                narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8822b(
+                    super::calibration8822b::Error::Policy,
+                ))
+            },
+        )
+        .await
     }
     pub(super) async fn prepare_phy8821c(
         &self,
@@ -592,7 +853,7 @@ impl<I: Io> Lifecycle<I> {
         };
         let _attempt = Attempt(self);
         let result = async {
-            let owner = Owner::new(allocate()?, self.did);
+            let owner = Owner::new(allocate()?, self.did).on(self.interface);
             let mut retained = self.retained.lock().await;
             if retained.is_some() || self.removed.load(Ordering::Acquire) {
                 return Err(Error::State);

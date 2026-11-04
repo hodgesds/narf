@@ -15,6 +15,22 @@ use narf_wireless::{
     scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
+#[path = "iface_ap.rs"]
+mod ap;
+#[cfg(any(test, feature = "builtin"))]
+#[path = "iface_ap_tests.rs"]
+pub(crate) mod ap_tests;
+#[path = "iface_monitor.rs"]
+mod monitor;
+#[path = "iface_p2p.rs"]
+pub(crate) mod p2p;
+#[path = "iface_p2p_go.rs"]
+pub(crate) mod p2p_go;
+#[path = "iface_p2p_group.rs"]
+pub(crate) mod p2p_group;
+#[path = "iface_wowlan.rs"]
+mod wowlan;
+
 /// Publish physical carrier while preserving operator-controlled IFF_UP.
 /// No administrative open/stop callback runs under the caller's driver locks.
 /// Shared by production and its composition fixture.
@@ -49,6 +65,16 @@ pub(crate) fn deliver_received_batch(
 pub struct Mt76Iface {
     name: String,
     radio: RadioInfo,
+    p2p_profile: Option<crate::mt7921::firmware_transport::P2pProfile>,
+    registration_cap: IrqSafeSpinLock<
+        Option<narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>>,
+    >,
+    p2p_device: IrqSafeSpinLock<Option<Arc<p2p::P2pDeviceIface>>>,
+    /// The one concurrent P2P-client group netdev (`NEW_INTERFACE` type 8).
+    p2p_group: IrqSafeSpinLock<Option<Arc<p2p_group::P2pGroupIface>>>,
+    /// The concurrent P2P GO netdev (one group netdev: client or GO).
+    p2p_go: IrqSafeSpinLock<Option<Arc<p2p_go::P2pGoIface>>>,
+    vif_slots: IrqSafeSpinLock<crate::mt7921::vif_slots::Slots>,
     scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -61,6 +87,21 @@ pub struct Mt76Iface {
     recovery_attempts: AtomicU32,
     recovery_after_ns: AtomicU64,
     receive_epoch: AtomicU64,
+    iftype: AtomicU32,
+    ap_generation: AtomicU64,
+    ap_serial: Arc<narf_wireless::ap_control::ExclusiveControl>,
+    ap_started: AtomicBool,
+    ap_owned: AtomicBool,
+    ap_host: IrqSafeSpinLock<ap::Host>,
+    monitor_channel: IrqSafeSpinLock<Option<narf_wireless::monitor::Channel>>,
+    monitor_started: AtomicBool,
+    monitor_token: IrqSafeSpinLock<Option<narf_net::iface::MonitorRxToken>>,
+    sleeping: AtomicBool,
+    /// A positively proven implementation/platform profile for stable
+    /// capability reporting. Every actual configuration and handoff still
+    /// obtains a fresh native wake-route receipt.
+    wake_reported: AtomicBool,
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -74,6 +115,12 @@ impl Mt76Iface {
         Ok(Self {
             name,
             radio,
+            p2p_profile: None,
+            registration_cap: IrqSafeSpinLock::new(None),
+            p2p_device: IrqSafeSpinLock::new(None),
+            p2p_group: IrqSafeSpinLock::new(None),
+            p2p_go: IrqSafeSpinLock::new(None),
+            vif_slots: IrqSafeSpinLock::new(crate::mt7921::vif_slots::Slots::default()),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
             rx_ring: IrqSafeSpinLock::new(None),
             tx_ring: IrqSafeSpinLock::new(None),
@@ -86,6 +133,18 @@ impl Mt76Iface {
             recovery_attempts: AtomicU32::new(0),
             recovery_after_ns: AtomicU64::new(0),
             receive_epoch: AtomicU64::new(0),
+            iftype: AtomicU32::new(2),
+            ap_generation: AtomicU64::new(1),
+            ap_serial: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            ap_started: AtomicBool::new(false),
+            ap_owned: AtomicBool::new(false),
+            ap_host: IrqSafeSpinLock::new(ap::Host::default()),
+            monitor_channel: IrqSafeSpinLock::new(None),
+            monitor_started: AtomicBool::new(false),
+            monitor_token: IrqSafeSpinLock::new(None),
+            sleeping: AtomicBool::new(false),
+            wake_reported: AtomicBool::new(false),
+            wowlan: IrqSafeSpinLock::new(None),
         })
     }
     /// Legacy 20 MHz channels on firmware-reported bands.
@@ -119,8 +178,21 @@ impl Mt76Iface {
         bands
     }
 
+    /// STATION or P2P_CLIENT: mac80211 runs both as a STATION vif
+    /// (`ieee80211_setup_sdata`), sharing the native station owner.
+    pub(crate) fn station_role(&self) -> bool {
+        matches!(self.current_iftype(), 2 | 8)
+    }
+    /// AP or P2P_GO: one AP vif, `vif->p2p` only selecting the GO BSS type.
+    pub(crate) fn ap_role(&self) -> bool {
+        matches!(self.current_iftype(), 3 | 9)
+    }
+
     /// Transmit an 802.3 Ethernet frame over the associated wireless datapath.
     pub async fn transmit_frame(&self, frame: &[u8]) -> Result<(), WirelessError> {
+        if !self.station_role() {
+            return Err(WirelessError::NotSupported);
+        }
         if !self.link_up() {
             return Err(WirelessError::Denied);
         }
@@ -132,8 +204,55 @@ impl Mt76Iface {
         }
     }
 
+    /// Negotiate a fresh per-TID originator agreement on this registered
+    /// radio under the same control mutex used for scan and association.
+    pub async fn negotiate_transmit_ba_tid(&self, tid: u8) -> Result<bool, WirelessError> {
+        if tid >= 8 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let _control = self.control.lock().await;
+        if !self.link_up() {
+            return Err(WirelessError::Denied);
+        }
+        use crate::mt7921::firmware_transport::{negotiate_boot_transmit_ba_tid, Error};
+        negotiate_boot_transmit_ba_tid(tid)
+            .await
+            .map_err(|error| match error {
+                Error::Bounds => WirelessError::InvalidArgs,
+                Error::Busy => WirelessError::Busy,
+                Error::Authority => WirelessError::Denied,
+                Error::Timeout => WirelessError::Timeout,
+                _ => WirelessError::HardwareError,
+            })
+    }
+
+    /// Restart an originator after real midstream traffic. The next queued
+    /// user MPDU supplies the sequence sample; no extra RF traffic is made.
+    pub async fn request_transmit_ba_restart_tid(&self, tid: u8) -> Result<(), WirelessError> {
+        if tid >= 8 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let _control = self.control.lock().await;
+        if !self.link_up() {
+            return Err(WirelessError::Denied);
+        }
+        use crate::mt7921::firmware_transport::{request_boot_transmit_ba_restart_tid, Error};
+        request_boot_transmit_ba_restart_tid(tid)
+            .await
+            .map_err(|error| match error {
+                Error::Bounds => WirelessError::InvalidArgs,
+                Error::Busy | Error::EventOverflow => WirelessError::Busy,
+                Error::Authority => WirelessError::Denied,
+                Error::Timeout => WirelessError::Timeout,
+                _ => WirelessError::HardwareError,
+            })
+    }
+
     /// Receive an 802.3 Ethernet frame from the wireless datapath.
     pub async fn receive_frame(&self) -> Result<Option<Vec<u8>>, WirelessError> {
+        if !self.station_role() {
+            return Err(WirelessError::NotSupported);
+        }
         if !self.link_up() {
             return Err(WirelessError::Denied);
         }
@@ -148,6 +267,30 @@ impl Mt76Iface {
     /// Advance bounded packet work, then service authenticated rekeys. No
     /// IRQ-safe lock survives an await; hardware ownership uses a regular mutex.
     pub async fn poll_data(&self) -> Result<(), WirelessError> {
+        // Retained native cleanup is independent of carrier and role. A
+        // dropped callback must not strand autonomous AP beaconing.
+        match crate::mt7921::firmware_transport::boot_ap::progress() {
+            Ok(false) => return Ok(()),
+            Ok(true) => (),
+            Err(_) if self.ap_owned.load(Ordering::Acquire) => return self.poll_ap().await,
+            Err(_) => (),
+        }
+        if !self.sleeping.load(Ordering::Acquire) && self.poll_p2p().await? {
+            return Ok(());
+        }
+        if !self.sleeping.load(Ordering::Acquire) {
+            self.poll_p2p_group().await;
+            self.poll_p2p_go().await;
+        }
+        if self.ap_owned.load(Ordering::Acquire) || self.ap_role() {
+            return self.poll_ap().await;
+        }
+        if self.sleeping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.current_iftype() == 6 {
+            return self.poll_monitor().await;
+        }
         {
             if self.teardown_needed.load(Ordering::Acquire) || radio_needs_recovery() {
                 let Some(_control) = self.control.try_lock() else {
@@ -177,6 +320,14 @@ impl Mt76Iface {
 
     /// The synchronous path never waits on a future or another executor task.
     fn drain_network(&self) -> Result<bool, WirelessError> {
+        let progressed = crate::mt7921::firmware_transport::boot_ap::progress()
+            .map_err(|_| WirelessError::HardwareError)?;
+        if !progressed {
+            return Ok(false);
+        }
+        if self.ap_owned.load(Ordering::Acquire) || self.ap_role() {
+            return self.drain_ap_network();
+        }
         if !self.link_up() {
             return Ok(false);
         }
@@ -208,6 +359,7 @@ impl Mt76Iface {
             |epoch| self.receive_current(epoch),
             |data| narf_net::iface::on_rx_frame_from(&self.name, data),
             |data, epoch| {
+                crate::module_host::capture_receive(&self.name, &data, epoch);
                 if let Ok(mut buffer) =
                     narf_io::alloc_coherent(data.len(), narf_lib::id::DomainId::DRIVER_0)
                 {
@@ -292,9 +444,14 @@ impl Mt76Iface {
     }
 
     fn clear_link(&self) {
+        let ap = self.ap_role() || self.ap_owned.load(Ordering::Acquire);
+        self.close_ap_host();
+        self.close_monitor();
         self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
-        publish_link(&self.name, false);
+        if !ap {
+            publish_link(&self.name, false);
+        }
         *self.pending_tx.lock() = None;
         *self.tx_ring.lock() = None;
         *self.rx_ring.lock() = None;
@@ -303,7 +460,7 @@ impl Mt76Iface {
     }
 
     fn lose_link(&self) {
-        let connected = self.link_up();
+        let connected = self.station_role() && self.link_up();
         if connected {
             self.teardown_needed.store(true, Ordering::Release);
         }
@@ -353,6 +510,7 @@ impl Mt76Iface {
         crate::mt7921::firmware_transport::recover_boot_radio(self.mac())
             .await
             .map_err(|_| WirelessError::HardwareError)?;
+        self.sleeping.store(false, Ordering::Release);
         self.teardown_needed.store(false, Ordering::Release);
         self.recovery_attempts.store(0, Ordering::Release);
         self.recovery_after_ns.store(0, Ordering::Release);
@@ -362,31 +520,118 @@ impl Mt76Iface {
     /// cfg80211 `wiphy_suspend` without WoWLAN: leave the BSS (locally
     /// generated DEAUTH_LEAVING), then the PCIe low-power handoff.
     async fn prepare_suspend(&self) -> Result<(), WirelessError> {
-        let _control = self.control.lock().await;
-        let connected = self.associated_bssid.lock().is_some();
-        if connected {
-            self.teardown_needed.store(true, Ordering::Release);
-        }
-        self.clear_link();
-        self.scan_cache.lock().clear();
-        if connected {
-            narf_wireless::nl80211::notify_disconnect(&self.name, 3, false);
-        }
-        suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await)?;
-        self.teardown_needed.store(false, Ordering::Release);
-        Ok(())
+        self.prepare_suspend_target(narf_power::system_pm::SystemSleepState::S3)
+            .await
     }
 
     async fn resume_from_suspend(&self) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         suspend_result(crate::mt7921::firmware_transport::resume_boot_radio(self.mac()).await)?;
+        self.commit_p2p_stopped();
+        if self.ap_owned.load(Ordering::Acquire) {
+            self.commit_ap_stopped();
+        }
+        self.sleeping.store(false, Ordering::Release);
         self.recovery_attempts.store(0, Ordering::Release);
         self.recovery_after_ns.store(0, Ordering::Release);
         Ok(())
     }
 
+    /// Request validation shared by the home station and the concurrent
+    /// P2P-client group netdev; returns whether the target is 6 GHz. Runs
+    /// before any recovery I/O.
+    pub(super) fn validate_join(&self, req: &AssociateRequest) -> Result<bool, WirelessError> {
+        let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
+        // A 6 GHz request is identified by its frequency: channel numbers
+        // alone collide with 2.4/5 GHz.
+        let six = narf_wireless::association::channel::from_frequency_band(req.frequency_mhz)
+            == Some((narf_wireless::association::channel::Band::Ghz6, channel));
+        if !six && crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
+            return Err(WirelessError::InvalidArgs);
+        }
+        if six && !crate::mt7921::six_ghz::qualified(self.radio) {
+            return Err(WirelessError::NotSupported);
+        }
+        if req.ssid.is_empty()
+            || req.ssid.len() > 32
+            || req.bssid == [0; 6]
+            || req.bssid[0] & 1 != 0
+        {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let protected = match &req.security {
+            narf_wireless::SecurityConfig::Open => false,
+            narf_wireless::SecurityConfig::Wpa2 { .. }
+            | narf_wireless::SecurityConfig::Wpa3 { .. } => true,
+            _ => return Err(WirelessError::NotSupported),
+        };
+        crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
+            match error {
+                crate::mt7921::association::Error::InvalidBss => WirelessError::InvalidArgs,
+                _ => WirelessError::NotSupported,
+            }
+        })?;
+        Ok(six)
+    }
+
+    /// Resolve the cached scan target and the native security owner, and
+    /// require a current transmit permission for it.
+    pub(super) fn resolve_join(
+        &self,
+        req: &AssociateRequest,
+        security: narf_wireless::SecurityConfig,
+        six: bool,
+    ) -> Result<(ScanBss, crate::mt7921::association::Security), WirelessError> {
+        let security = match security {
+            narf_wireless::SecurityConfig::Open => crate::mt7921::association::Security::Open,
+            narf_wireless::SecurityConfig::Wpa2 { psk } => {
+                crate::mt7921::association::Security::Wpa2Psk { psk }
+            }
+            // WPA3-Personal: the driver runs SAE (sae_pwe=2) and PMF itself.
+            narf_wireless::SecurityConfig::Wpa3 { password } => {
+                crate::mt7921::association::Security::Wpa3Sae {
+                    password: crate::mt7921::association::SaePassword::new(&password)
+                        .ok_or(WirelessError::InvalidArgs)?,
+                }
+            }
+            // No external-supplicant mode: mt7921's firmware path runs the
+            // handshake from the PMK (nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
+        };
+        let bss = self
+            .scan_cache
+            .lock()
+            .iter()
+            .find(|b| {
+                b.bssid == req.bssid
+                    && b.ssid == req.ssid
+                    && u32::from(b.channel) == req.channel
+                    && crate::mt7921::association::is_six_ghz(b) == six
+            })
+            .cloned()
+            .ok_or(WirelessError::InvalidArgs)?;
+
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
+        if six {
+            crate::mt7921::association::TxPermission::from_ap(&domain, self.radio, &bss)
+        } else {
+            crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
+        }
+        .ok_or(WirelessError::Denied)?;
+
+        Ok((bss, security))
+    }
+
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
-        if !self.link_up() || !transmit_admitted(bytes, self.mac()) {
+        let admitted = match self.current_iftype() {
+            2 | 8 => transmit_admitted(bytes, self.mac()),
+            3 | 9 => self.ap_transmit_admitted(bytes),
+            _ => false,
+        };
+        if !admitted {
+            return Err(());
+        }
+        if !self.link_up() {
             return Err(());
         }
         let mut buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
@@ -417,9 +662,15 @@ fn suspend_result(
 /// mac80211 suspend). Runs in executor context with no IRQ lock held; the
 /// started transition is retained across caller cancellation.
 pub async fn system_prepare_suspend() -> Result<(), WirelessError> {
+    system_prepare_suspend_for(narf_power::system_pm::SystemSleepState::S3).await
+}
+
+pub async fn system_prepare_suspend_for(
+    target: narf_power::system_pm::SystemSleepState,
+) -> Result<(), WirelessError> {
     let iface = ACTIVE.lock().clone();
     match iface {
-        Some(iface) => iface.prepare_suspend().await,
+        Some(iface) => iface.prepare_suspend_target(target).await,
         None => suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await),
     }
 }
@@ -435,10 +686,12 @@ pub async fn system_resume() -> Result<(), WirelessError> {
         None => {
             use crate::mt7921::firmware_transport::{boot_status, BootStatus, State};
             match boot_status() {
-                BootStatus::Retained(State::Suspended(info)) => suspend_result(
-                    crate::mt7921::firmware_transport::resume_boot_radio(info.capabilities.mac)
-                        .await,
-                ),
+                BootStatus::Retained(State::Suspended(info) | State::WowSuspended { info, .. }) => {
+                    suspend_result(
+                        crate::mt7921::firmware_transport::resume_boot_radio(info.capabilities.mac)
+                            .await,
+                    )
+                }
                 _ => Ok(()),
             }
         }
@@ -470,7 +723,11 @@ impl Interface for Mt76Iface {
         1500
     }
     fn link_up(&self) -> bool {
-        self.associated_bssid.lock().is_some()
+        if self.ap_role() {
+            self.ap_link_up()
+        } else {
+            self.associated_bssid.lock().is_some()
+        }
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx_ring
@@ -481,6 +738,257 @@ impl Interface for Mt76Iface {
 }
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
+    fn async_control_interfaces(&self) -> bool {
+        self.p2p_profile.is_some()
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if iftype != 10 {
+            return Err(WirelessError::NotSupported);
+        }
+        self.new_p2p_device(authority, name, mac)
+    }
+    /// Only P2P_DEVICE (10) is a control-only WDEV; the P2P-client group
+    /// netdev (8) stays on the legacy `new_virtual_interface` path.
+    fn async_control_iftypes(&self) -> u32 {
+        1 << 10
+    }
+    fn supports_virtual_interfaces(&self) -> bool {
+        self.p2p_profile.is_some()
+    }
+    /// P2P_CLIENT (group netdev or physical role), P2P_GO (group netdev
+    /// beside the home station or physical role) and P2P_DEVICE.
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        if self.p2p_profile.is_some() {
+            vec![8, 9, 10]
+        } else {
+            Vec::new()
+        }
+    }
+    /// The combination NARF enforces: Linux `if_comb_chanctx_base`
+    /// (mt792x_core.c) limits — at most two STATION|P2P_CLIENT, one
+    /// AP|P2P_GO, one P2P_DEVICE, three interfaces — but on ONE channel.
+    /// Linux advertises `num_different_channels = 2` for the GO set (CNM
+    /// multi-channel concurrency); NARF keeps every owner on the home
+    /// station's channel context (`shares_channel_context`,
+    /// `shares_go_channel`), so it advertises 1. NARF also admits only one
+    /// concurrent group netdev (client or GO) beside the home interface.
+    fn interface_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
+        if self.p2p_profile.is_none() {
+            return Vec::new();
+        }
+        vec![narf_wireless::InterfaceCombination {
+            limits: vec![
+                narf_wireless::InterfaceTypeLimit {
+                    max: 2,
+                    iftypes: vec![2, 8],
+                },
+                narf_wireless::InterfaceTypeLimit {
+                    max: 1,
+                    iftypes: vec![3, 9],
+                },
+                narf_wireless::InterfaceTypeLimit {
+                    max: 1,
+                    iftypes: vec![10],
+                },
+            ],
+            max_interfaces: 3,
+            max_channels: 1,
+            sta_ap_beacon_interval_match: false,
+            beacon_interval_min_gcd: None,
+            radar_detect_widths: None,
+        }]
+    }
+    fn new_virtual_interface(
+        &self,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if iftype == 9 {
+            return self
+                .new_p2p_go(name, mac)
+                .map(|go| go as Arc<dyn WirelessNetIface>);
+        }
+        self.new_p2p_group(name, iftype, mac)
+            .map(|group| group as Arc<dyn WirelessNetIface>)
+    }
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.ap_serial.try_reserve().map(Some)
+    }
+    fn supports_ap(&self) -> bool {
+        true
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        true
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        true
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        true
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        true
+    }
+    fn ap_station_macs(&self) -> Vec<[u8; 6]> {
+        if self.ap_link_up() {
+            crate::mt7921::firmware_transport::boot_ap::stations()
+        } else {
+            Vec::new()
+        }
+    }
+    fn ap_station_info(&self, peer: [u8; 6]) -> Option<narf_wireless::StationInfo> {
+        self.ap_station_macs()
+            .contains(&peer)
+            .then(narf_wireless::StationInfo::default)
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.ap_serial.try_reserve().map(Some)
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_start(authority, config, settings).await
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_stop(authority).await
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_beacon(authority, head, tail, probe).await
+    }
+    async fn add_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_add_station(authority, config).await
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_set_station(authority, config).await
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        _reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_del_station(authority, peer).await
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_add_key(authority, key).await
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_del_key(authority, index, pairwise, peer).await
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_default_key(authority, index, unicast, multicast, management, beacon)
+            .await
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.ap_management(authority, request).await
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        frame_type: u16,
+        prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        self.ap_register_frame(authority, frame_type, prefix).await
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control_tx(authority, request).await
+    }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.native_wowlan_support()
+    }
+    fn wowlan_net_detect_limits(&self) -> Option<narf_wireless::SchedScanSupport> {
+        Some(crate::mt7921::wowlan_nlo::LIMITS)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        self.configure_wowlan(config)
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
+    }
+    fn supports_gtk_rekey_offload(&self) -> bool {
+        self.native_wowlan_support().is_some()
+    }
+    fn set_gtk_rekey_data(&self, data: narf_wireless::GtkRekeyData) -> Result<(), i32> {
+        self.validate_rekey_data(data)
+    }
+    fn current_iftype(&self) -> u32 {
+        self.iftype.load(Ordering::Acquire)
+    }
+    fn set_iftype(&self, iftype: u32) -> Result<(), WirelessError> {
+        self.change_iftype(iftype)
+    }
+    fn set_monitor_channel(
+        &self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<(), WirelessError> {
+        self.configure_monitor(channel)
+    }
     fn max_scan_ssids(&self) -> u8 {
         4
     }
@@ -495,7 +1003,14 @@ impl WirelessNetIface for Mt76Iface {
             base_name: self.name.clone(),
             base_mac: self.mac(),
             bands: self.bands(),
-            modes: WirelessModes::STATION,
+            modes: WirelessModes::STATION
+                | WirelessModes::AP
+                | WirelessModes::MONITOR
+                | if self.p2p_profile.is_some() {
+                    WirelessModes::P2P
+                } else {
+                    WirelessModes::empty()
+                },
             hw_caps: HwCaps {
                 ht_supported: self.radio.capabilities.phy.ht,
                 vht_supported: crate::mt7921::vht::qualified(self.radio),
@@ -528,6 +1043,9 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        if !self.station_role() {
+            return Err(WirelessError::NotSupported);
+        }
         let six = crate::mt7921::six_ghz::qualified(self.radio);
         let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands, six)?;
         // WIPHY_FLAG_SPLIT_SCAN_6GHZ (mt792x_core.c:711): the 2.4/5 GHz
@@ -549,10 +1067,13 @@ impl WirelessNetIface for Mt76Iface {
         };
         let _control = self.control.lock().await;
         if self.link_up() {
-            return Err(WirelessError::Busy);
+            if req.random_mac.is_some() {
+                return Err(WirelessError::Busy);
+            }
+        } else {
+            self.finish_teardown(true).await?;
         }
-        self.finish_teardown(true).await?;
-        {
+        let result = async {
             use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
             let map_error = |error| match error {
                 Error::Bounds => WirelessError::InvalidArgs,
@@ -604,6 +1125,11 @@ impl WirelessNetIface for Mt76Iface {
             *self.scan_cache.lock() = found;
             Ok(results)
         }
+        .await;
+        if result.is_err() && radio_needs_recovery() {
+            self.lose_link();
+        }
+        result
     }
 
     fn connected_bssid(&self) -> Option<[u8; 6]> {
@@ -631,82 +1157,23 @@ impl WirelessNetIface for Mt76Iface {
         Ok(())
     }
 
-    async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+    async fn associate(&self, mut req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
-        let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
-        // A 6 GHz request is identified by its frequency: channel numbers
-        // alone collide with 2.4/5 GHz.
-        let six = narf_wireless::association::channel::from_frequency_band(req.frequency_mhz)
-            == Some((narf_wireless::association::channel::Band::Ghz6, channel));
-        if !six && crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
-            return Err(WirelessError::InvalidArgs);
-        }
-        if six && !crate::mt7921::six_ghz::qualified(self.radio) {
+        if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
-        if req.ssid.is_empty()
-            || req.ssid.len() > 32
-            || req.bssid == [0; 6]
-            || req.bssid[0] & 1 != 0
-        {
-            return Err(WirelessError::InvalidArgs);
-        }
-        let protected = match &req.security {
-            narf_wireless::SecurityConfig::Open => false,
-            narf_wireless::SecurityConfig::Wpa2 { .. }
-            | narf_wireless::SecurityConfig::Wpa3 { .. } => true,
-            _ => return Err(WirelessError::NotSupported),
-        };
-        crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
-            match error {
-                crate::mt7921::association::Error::InvalidBss => WirelessError::InvalidArgs,
-                _ => WirelessError::NotSupported,
-            }
-        })?;
+        let six = self.validate_join(&req)?;
         self.finish_teardown(true).await?;
         if self.link_up() {
             return Err(WirelessError::Busy);
         }
-        let security = match req.security {
-            narf_wireless::SecurityConfig::Open => crate::mt7921::association::Security::Open,
-            narf_wireless::SecurityConfig::Wpa2 { psk } => {
-                crate::mt7921::association::Security::Wpa2Psk { psk }
-            }
-            // WPA3-Personal: the driver runs SAE (sae_pwe=2) and PMF itself.
-            narf_wireless::SecurityConfig::Wpa3 { password } => {
-                crate::mt7921::association::Security::Wpa3Sae {
-                    password: crate::mt7921::association::SaePassword::new(&password)
-                        .ok_or(WirelessError::InvalidArgs)?,
-                }
-            }
-            // No external-supplicant mode: mt7921's firmware path runs the
-            // handshake from the PMK (nl80211 never builds this for it).
-            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
-        };
-        let bss = self
-            .scan_cache
-            .lock()
-            .iter()
-            .find(|b| {
-                b.bssid == req.bssid
-                    && b.ssid == req.ssid
-                    && u32::from(b.channel) == req.channel
-                    && crate::mt7921::association::is_six_ghz(b) == six
-            })
-            .cloned()
-            .ok_or(WirelessError::InvalidArgs)?;
-
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
-        if six {
-            crate::mt7921::association::TxPermission::from_ap(&domain, self.radio, &bss)
-        } else {
-            crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
-        }
-        .ok_or(WirelessError::Denied)?;
-
+        let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
+        let (bss, security) = self.resolve_join(&req, security, six)?;
         {
-            use crate::mt7921::firmware_transport::{associate_boot_station, Error};
-            let aid = associate_boot_station(&bss, &req.ssid, security, &req.ie)
+            use crate::mt7921::firmware_transport::{associate_boot_station_as, Error};
+            // Stable under `control`: SET_INTERFACE also takes that lock.
+            let p2p_client = self.current_iftype() == 8;
+            let aid = associate_boot_station_as(&bss, &req.ssid, security, &req.ie, p2p_client)
                 .await
                 .map_err(|error| match error {
                     Error::Bounds => WirelessError::InvalidArgs,
@@ -979,12 +1446,19 @@ fn scan_security(
 /// Register one boot-owned radio with both network registries. The same
 /// bounded packet step services executor and synchronous network callers.
 pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, WirelessError> {
+    register_scan_iface_profile(info, None)
+}
+pub(crate) fn register_scan_iface_profile(
+    info: RadioInfo,
+    profile: Option<crate::mt7921::firmware_transport::P2pProfile>,
+) -> Result<Arc<Mt76Iface>, WirelessError> {
     // Reusing our retained interface grants no new registry access and must
     // not depend on the authority used for its original publication.
     if let Some(existing) = ACTIVE.lock().as_ref() {
         return if existing.radio.chip_id == info.chip_id
             && existing.radio.capabilities == info.capabilities
             && existing.radio.hardware_type == info.hardware_type
+            && profile.is_none_or(|profile| existing.p2p_profile == Some(profile))
         {
             Ok(existing.clone())
         } else {
@@ -995,6 +1469,7 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
         .and_then(|a| a.derive().ok())
         .ok_or(WirelessError::Denied)?;
     let mut iface = Mt76Iface::new(String::new(), info)?;
+    iface.p2p_profile = profile;
     // Bootstrap before control-plane discovery/association can query the
     // domain. Missing deployment policy still permits the receive-only scan
     // interface; TX admission retries the same signed bootstrap and fails shut.
@@ -1005,13 +1480,14 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, send_frame);
     publish_link(&iface.name, false);
     let iface = Arc::new(iface);
-    if narf_net::registry()
-        .register(&authority, RegisteredIface(iface.clone()))
-        .is_err()
-    {
-        narf_net::iface::unregister(&iface.name);
-        return Err(WirelessError::HardwareError);
-    }
+    let cap = match narf_net::registry().register(&authority, RegisteredIface(iface.clone())) {
+        Ok(cap) => cap,
+        Err(_) => {
+            narf_net::iface::unregister(&iface.name);
+            return Err(WirelessError::HardwareError);
+        }
+    };
+    *iface.registration_cap.lock() = Some(cap);
     *ACTIVE.lock() = Some(iface.clone());
     narf_wireless::registry::register(iface.clone());
     narf_net::iface::install_rx_drain(drain_network);
@@ -1029,6 +1505,12 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
 
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
 
+/// The permanent module host retains this exact publication, never a name
+/// which could be reused by a later native binding.
+pub(crate) fn module_active() -> Option<Arc<Mt76Iface>> {
+    ACTIVE.lock().clone()
+}
+
 /// PCI removal (Linux `mt76_unregister_device` → `ieee80211_unregister_hw`):
 /// close carrier, report the lost link, and withdraw every publication of
 /// this generation's interface. Its service worker exits on its next turn.
@@ -1038,13 +1520,18 @@ pub(crate) fn remove_scan_iface() {
         return;
     };
     iface.lose_link();
+    iface.withdraw_p2p_group();
+    iface.withdraw_p2p_go();
+    iface.withdraw_p2p_metadata();
     iface.scan_cache.lock().clear();
     narf_wireless::registry::unregister(&iface.name);
-    narf_net::registry().unregister(&iface.name);
+    if let Some(cap) = iface.registration_cap.lock().take() {
+        narf_net::registry().unregister_for_handle(&cap);
+    }
     narf_net::iface::unregister(&iface.name);
 }
 
-fn is_active(iface: &Arc<Mt76Iface>) -> bool {
+pub(crate) fn is_active(iface: &Arc<Mt76Iface>) -> bool {
     ACTIVE
         .lock()
         .as_ref()
@@ -1324,6 +1811,69 @@ mod tests {
         "drivers/wireless/mt7921/scan",
         mt76_repeat_scan_registration_preserves_same_associated_owner_and_admin
     );
+    fn mt76_wow_capability_busy_reporting_does_not_cache_authority() -> TestResult {
+        use crate::mt7921::firmware_transport::Error;
+        let iface = Mt76Iface::new(String::from("mt76-wake-report"), radio()).unwrap();
+        let config = narf_wireless::WowlanConfig {
+            magic_packet: true,
+            ..narf_wireless::WowlanConfig::default()
+        };
+        if iface.wowlan_support_with(|| Ok(false)).is_some()
+            || iface.wowlan_support_with(|| Err(Error::Busy)).is_some()
+            || iface.wake_reported.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("absent/busy route invented a wake capability");
+        }
+        let Some(expected) = iface.wowlan_support_with(|| Ok(true)) else {
+            return TestResult::Fail("actual positive route was not reported");
+        };
+        let mut calls = 0;
+        let reported = iface.wowlan_support_with(|| {
+            calls += 1;
+            Err(Error::Busy)
+        });
+        if reported != Some(expected) || calls != 0 {
+            return TestResult::Fail("temporary transport ownership changed reported capability");
+        }
+        iface.iftype.store(6, Ordering::Release);
+        if iface.wowlan_support_with(|| Ok(true)).is_some() {
+            return TestResult::Fail("station wake profile leaked into monitor mode");
+        }
+        iface.iftype.store(2, Ordering::Release);
+        for (receipt, expected_errno) in [
+            (Err(Error::Busy), -16),
+            (Err(Error::Authority), -1),
+            (Ok(false), -95),
+        ] {
+            if iface.configure_wowlan_with(Some(config.clone()), || receipt) != Err(expected_errno)
+                || iface.wowlan.lock().is_some()
+            {
+                return TestResult::Fail("capability cache authorized stale wake configuration");
+            }
+        }
+        if iface.configure_wowlan_with(Some(config.clone()), || Ok(true)) != Ok(())
+            || *iface.wowlan.lock() != Some(config.clone())
+        {
+            return TestResult::Fail("fresh wake route did not admit host configuration");
+        }
+        iface.sleeping.store(true, Ordering::Release);
+        if iface.configure_wowlan_with(None, || Ok(true)) != Err(-16)
+            || *iface.wowlan.lock() != Some(config)
+        {
+            return TestResult::Fail("sleeping owner allowed a configuration replacement");
+        }
+        iface.sleeping.store(false, Ordering::Release);
+        if iface.configure_wowlan_with(None, || Err(Error::Authority)) != Ok(())
+            || iface.wowlan.lock().is_some()
+        {
+            return TestResult::Fail("host wake configuration could not be cleared without arming");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/wowlan",
+        mt76_wow_capability_busy_reporting_does_not_cache_authority
+    );
     fn mt76_scan_interface_reports_implemented_profile() -> TestResult {
         let iface = Mt76Iface::new(String::from("wlan7"), radio()).unwrap();
         let info = iface.get_wireless_info();
@@ -1350,6 +1900,13 @@ mod tests {
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()
+            || !iface.supports_ap()
+            || !iface.supports_ap_authenticator()
+            || !iface.supports_ap_userspace_mlme()
+            || iface.supports_ap_uapsd()
+            || iface.supports_external_supplicant()
+            || iface.supports_userspace_mlme()
+            || !info.modes.contains(WirelessModes::AP)
             || iface.supports_sae_offload()
             || iface.max_scan_ssids() != 4
             || iface.max_scan_ie_len() != 600

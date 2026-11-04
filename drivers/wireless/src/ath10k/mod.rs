@@ -126,7 +126,7 @@ impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     }
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
-            pci::resume();
+            pci::resume_async().await;
             Ok(())
         })
     }

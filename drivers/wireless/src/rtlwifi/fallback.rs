@@ -36,42 +36,66 @@ pub(super) fn request(
     base: &Calibration,
     firmware: super::firmware_transport::Identity,
 ) -> Request {
+    request_on_channel(base, firmware, 1)
+}
+pub(super) fn request_on_channel(
+    base: &Calibration,
+    firmware: super::firmware_transport::Identity,
+    channel: u8,
+) -> Request {
     let f = base.factory();
     let mut h = narf_crypto::sha256::Sha256::new();
-    h.update(b"NARF RTL8188EE PCI8179 DATA rate fallback continuation v1");
+    if channel == 1 {
+        h.update(b"NARF RTL8188EE PCI8179 DATA rate fallback continuation v1");
+    } else {
+        h.update(b"NARF RTL8188EE PCI8179 DATA rate fallback exact-channel continuation v2");
+        h.update(&[channel]);
+    }
     h.update(&super::radio::factory_identity(f));
     h.update(&base.digest);
     h.update(super::fw::FW_8188EE.as_bytes());
     h.update(&firmware.digest);
     h.update(SOURCE);
+    if channel != 1 {
+        h.update(b"v2 exact channel: payload byte0 enable1, byte1 physical channel2..11, remaining zero; extends only that current NEPC channel; any HT also requires separately qualified NEHTv3; LGI fallback only, SGI keeps DISFB; never imports channel1 record");
+    }
     Request {
-        name: format!(
-            "rtlwifi/rtl8188ee-fallback-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            f.mac[0], f.mac[1], f.mac[2], f.mac[3], f.mac[4], f.mac[5]
-        ),
+        name: if channel == 1 {
+            format!(
+                "rtlwifi/rtl8188ee-fallback-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                f.mac[0], f.mac[1], f.mac[2], f.mac[3], f.mac[4], f.mac[5]
+            )
+        } else {
+            format!(
+                "rtlwifi/rtl8188ee-fallback-v2-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                channel, f.mac[0], f.mac[1], f.mac[2], f.mac[3], f.mac[4], f.mac[5]
+            )
+        },
         binding: h.finalize(),
     }
 }
 /// A current `NEFB` grant over one retained calibration and firmware.
 pub(crate) struct Grant {
+    channel: u8,
     base: Arc<Calibration>,
     cap: Cap<FirmwareBlob, Read>,
     firmware: super::firmware_transport::Identity,
 }
 impl Grant {
-    pub(super) fn matches(&self, base: &Arc<Calibration>) -> bool {
-        Arc::ptr_eq(&self.base, base)
+    pub(super) fn matches(&self, base: &Arc<Calibration>, channel: u8) -> bool {
+        self.channel == channel && Arc::ptr_eq(&self.base, base)
     }
     pub(super) fn registered(
         base: Arc<Calibration>,
         firmware: super::firmware_transport::Identity,
+        channel: u8,
     ) -> Result<Option<Arc<Self>>, Error> {
         let authority = narf_firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Power(super::channel_power::Error::Authority))?;
         let source = match crate::firmware_asset::load(
             &authority,
-            &request(&base, firmware).name,
+            &request_on_channel(&base, firmware, channel).name,
             LENGTH,
             true,
         ) {
@@ -93,21 +117,27 @@ impl Grant {
             return Err(Error::Power(super::channel_power::Error::Unsigned));
         }
         let f = base.factory();
+        let channel = match (b.get(4), b.get(119)) {
+            (Some(1), Some(0)) => 1,
+            (Some(2), Some(channel @ 2..=11)) => *channel,
+            _ => return Err(Error::Power(super::channel_power::Error::Format)),
+        };
         if b.len() != LENGTH
             || b[..4] != *b"NEFB"
-            || b[4..8] != [1, 0, LENGTH as u8, 0]
+            || b[4..8] != [if channel == 1 { 1 } else { 2 }, 0, LENGTH as u8, 0]
             || u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize != LENGTH
             || b[12..16] != [0xec, 0x10, 0x79, 0x81]
-            || b[16..48] != request(&base, firmware).binding
+            || b[16..48] != request_on_channel(&base, firmware, channel).binding
             || b[48..80] != super::radio::factory_identity(f)
             || b[80..112] != base.digest
             || b[112..118] != f.mac
             || b[118] != 1
-            || b[119..].iter().any(|v| *v != 0)
+            || b[120..].iter().any(|v| *v != 0)
         {
             return Err(Error::Power(super::channel_power::Error::Format));
         }
         let grant = Self {
+            channel,
             base,
             cap,
             firmware,
@@ -149,16 +179,72 @@ pub(crate) mod tests {
         base: &Calibration,
         firmware: super::super::firmware_transport::Identity,
     ) -> Vec<u8> {
+        artifact_on_channel(base, firmware, 1)
+    }
+    pub(crate) fn artifact_on_channel(
+        base: &Calibration,
+        firmware: super::super::firmware_transport::Identity,
+        channel: u8,
+    ) -> Vec<u8> {
         let mut b = alloc::vec![0; LENGTH];
         b[..4].copy_from_slice(b"NEFB");
-        b[4..8].copy_from_slice(&[1, 0, LENGTH as u8, 0]);
+        b[4..8].copy_from_slice(&[if channel == 1 { 1 } else { 2 }, 0, LENGTH as u8, 0]);
         b[8..12].copy_from_slice(&(LENGTH as u32).to_le_bytes());
         b[12..16].copy_from_slice(&[0xec, 0x10, 0x79, 0x81]);
-        b[16..48].copy_from_slice(&request(base, firmware).binding);
+        b[16..48].copy_from_slice(&request_on_channel(base, firmware, channel).binding);
         b[48..80].copy_from_slice(&super::super::radio::factory_identity(base.factory()));
         b[80..112].copy_from_slice(&base.digest);
         b[112..118].copy_from_slice(&base.factory().mac);
         b[118] = 1;
+        b[119] = if channel == 1 { 0 } else { channel };
         b
     }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod channel_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_rtl8188ee_channel_fallback_exact_source_version_and_revocation() -> TestResult {
+        use super::super::channel_power::tests as p;
+        let base = Arc::new(p::calibration_for_channel(&p::factory(), 6));
+        let firmware = super::super::firmware_transport::Identity::model();
+        let cap = Cap::bootstrap();
+        let bytes = super::tests::artifact_on_channel(&base, firmware, 6);
+        let grant = Grant::parse(base.clone(), firmware, &bytes, Some([7; 32]), cap).unwrap();
+        if !grant.matches(&base, 6) || grant.matches(&base, 1) || !grant.current() {
+            return TestResult::Fail(
+                "EE exact fallback source admitted the wrong physical channel",
+            );
+        }
+        for (at, value) in [(4, 1), (4, 3), (119, 0), (119, 1), (119, 7), (120, 1)] {
+            let mut wrong = bytes.clone();
+            wrong[at] = value;
+            if Grant::parse(base.clone(), firmware, &wrong, Some([7; 32]), cap).is_ok() {
+                return TestResult::Fail(
+                    "EE fallback channel/version mutation aliased its signed binding",
+                );
+            }
+        }
+        let old = Grant::parse(
+            base.clone(),
+            firmware,
+            &super::tests::artifact(&base, firmware),
+            Some([7; 32]),
+            cap,
+        )
+        .unwrap();
+        if old.matches(&base, 6) {
+            return TestResult::Fail("EE legacy channel1 fallback record authorized channel6");
+        }
+        cap.revoke();
+        if grant.current() {
+            return TestResult::Fail("EE revoked per-channel fallback source remained current");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtlwifi/ht_channels",
+        smoke_rtl8188ee_channel_fallback_exact_source_version_and_revocation
+    );
 }

@@ -49,6 +49,7 @@ pub(super) fn request_c21(
     qualification: [u8; 32],
     indices: [u8; 12],
     mac: [u8; 6],
+    host: super::phy8821c::Host,
 ) -> Request {
     let mut h = narf_crypto::sha256::Sha256::new();
     h.update(b"NARF RTL8821CE ch1/20 RF-A static legacy12 DATA and response-bound WMM BE/TID0 v1");
@@ -63,8 +64,50 @@ pub(super) fn request_c21(
         identity: h.finalize(),
         mac,
         filename: format!(
-            "rtw88/rtw8821ce-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "rtw88/{}-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            host.family(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
+        ),
+    }
+}
+/// RTL8822BE `N2BL`: legacy12 DATA + WMM BE/TID0 over the exact `N2BS`
+/// grant. The B22 base program already writes both paths' measured `N2BP`
+/// legacy words (`rtw8822b_set_tx_power_index_by_rate` 0x1d00/0x1d80), so
+/// this record measures DATA at those indices; no new gain program.
+pub(super) fn request_b22(
+    station: [u8; 32],
+    qualification: [u8; 32],
+    indices: [[u8; 12]; 2],
+    mac: [u8; 6],
+    host: super::phy8821c::Host,
+) -> Request {
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(b"NARF RTL8822BE ch1/20 2T2R static legacy12 DATA and response-bound WMM BE/TID0 v1");
+    h.update(&station);
+    h.update(&qualification);
+    h.update(&indices[0]);
+    h.update(&indices[1]);
+    h.update(b"exact retained N2BQ IQK/N2BP TXAGC12 A+B/N2BS awake qualification; measured full thermal0..63; rtw8822b_set_tx_power_index_by_rate 1d00/1d80 measured legacy words, HT/VHT words0; config_trx_mode AB/AB");
+    h.update(b"actual bound legacy12 intersection; rateID B8/BG6/G7; H2C40 init1 PTdisabled mask12; fixed highest IEEE kbps data USE_RATE DISDATAFB; mgmt/EAPOL1M");
+    h.update(b"WMM1 strict singleton Param; no UAPSD ACM BE; AP-response parameters; source EDCA 500/504/508/50c; SIFS10 slot9/20; BE AIFSN>=3 CWmin>=31 CWmax>=1023 TXOP0; no HT AMPDU BA");
+    h.update(b"source phy_get_rrsr_mask(selected_rate)&15f=1f/5f/15f; TXDESC48 TXBD16 RXDESC24 RXBD8; BE3a8; raw QoS26 TID0 before software CCMP; mgmt/EAPOL24; current Q/P/S/L signed sources and policy at every publication");
+    Request {
+        identity: h.finalize(),
+        mac,
+        filename: format!(
+            "rtw88/{}-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            host.family(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         ),
     }
 }
@@ -147,15 +190,14 @@ impl Grant {
         signer.ok_or(denied(power_policy::Error::Unsigned))?;
         if raw.len() != 128
             || &raw[..4]
-                != if base.did() == 0xc821 {
-                    b"N21L"
-                } else {
-                    b"N22L"
+                != match base.did() {
+                    0xc821 => b"N21L",
+                    0xb822 => b"N2BL",
+                    _ => b"N22L",
                 }
             || raw[4..8] != [1, 0, 128, 0]
             || raw[8..12] != 128u32.to_le_bytes()
-            || raw[12..14] != [0xec, 0x10]
-            || raw[14..16] != base.did().to_le_bytes()
+            || raw[12..16] != base.host().header()
             || raw[54..56] != [1, 20]
             || raw[90] & !1 != 0
             || raw[91..] != [0; 37]
@@ -170,9 +212,17 @@ impl Grant {
         let ceiling = signed(58);
         let peaks = core::array::from_fn(|i| signed(60 + i * 2));
         let rates = u16::from_le_bytes([raw[88], raw[89]]);
+        // The band's mandatory base rate: CCK1 on 2.4GHz; on 5GHz (a base
+        // scoped to a 5GHz N2xO primary) no CCK rate and OFDM6 present
+        // (`tx.c::rtw_tx_pkt_info_update_rate` uses DESC_RATE6M there).
+        let band5 = super::band5::primary(base.channel());
         if !(0..=128).contains(&antenna)
             || !(-512..=256).contains(&ceiling)
-            || rates & 1 == 0
+            || if band5 {
+                rates & 0x1f != 0x10
+            } else {
+                rates & 1 == 0
+            }
             || rates & !0xfff != 0
             || peaks
                 .iter()
@@ -209,10 +259,7 @@ impl Grant {
         self.request.mac
     }
     pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
-        match &self.base {
-            power_policy::ExtensionBase::C21(b) => b.temperature(value),
-            power_policy::ExtensionBase::C22(_) => Ok(()),
-        }
+        self.base.temperature(value)
     }
     pub(super) fn ht_identity(&self) -> ([u8; 32], [u8; 32]) {
         (self.request.identity, self.digest)
@@ -227,8 +274,27 @@ impl Grant {
     pub(super) fn did(&self) -> u16 {
         self.base.did()
     }
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        self.base.host()
+    }
+    /// Operating primary this extension was qualified for.
+    pub(super) fn channel(&self) -> u8 {
+        self.base.channel()
+    }
     pub(super) fn wmm(&self) -> bool {
         self.wmm
+    }
+    /// Qualified over a 5GHz N2xO primary: OFDM-only rates, OFDM6 base.
+    pub(super) fn band5(&self) -> bool {
+        super::band5::primary(self.channel())
+    }
+    /// C22 5GHz OFDM indices of the bound record (`ExtensionBase::ofdm5_indices`).
+    pub(super) fn ofdm5_indices(&self) -> Option<[u8; 8]> {
+        self.base.ofdm5_indices()
+    }
+    /// B22 per-path legacy TXAGC indices of the bound primary.
+    pub(super) fn b22_indices(&self) -> Option<[[u8; 12]; 2]> {
+        self.base.b22_indices()
     }
     pub(super) fn matches(&self, gate: &Gate) -> bool {
         gate.extension_request().as_ref() == Some(&self.request)

@@ -7,8 +7,69 @@
 //!
 //! - `rtlwifi/rtl8821ae/reg.h`  — register offsets
 //! - `rtlwifi/rtl8821ae/def.h`  — rate / VHT constants
+//!
+//! ## Retained-runtime foundation (`rtl8821ae/`)
+//!
+//! Exact Linux-derived pieces the retained RTL8821AE owner is built from.
+//! Probe retains `0x8821` and native provisioning composes them into the
+//! 2.4 GHz legacy station owner (`prepare_native::prepare_rtl8821ae`,
+//! `packet_ae.rs`); boards with the BT function strapped on are refused:
+//!
+//! - [`pwrseq`] — PCI rows of every `rtl8821A_*_flow` (`pwrseq.{c,h}`).
+//! - [`tables`] / [`headerfile`] — MAC/BB/AGC/RF-A/power-by-rate arrays and
+//!   the conditional `__rtl8821ae_phy_config_with_headerfile` walker,
+//!   qualified by SYS_CFG + factory EFUSE ([`headerfile::Condition`]).
+//! - [`power_limit`] — `RTL8821AE_TXPWR_LMT` per-regulation/band/bandwidth
+//!   limits; 63 ("unspecified") is never admitted as a limit.
+//! - [`fw`] — `rtl8821aefw_29.bin` / `rtl8821aefw.bin` /
+//!   `rtl8821aefw_wowlan.bin` header validation and the `rtl8821ae_download_fw`
+//!   page/self-reset sequence.
+//! - [`llt`] — `_rtl8821ae_llt_table_init` boundary/RQPN sequence.
+//! - [`trx`] — 40-byte TX / 24-byte RX status descriptors (`trx.h`).
+//! - [`mac`] / [`phy`] — parked `rtl8821ae_hw_init` hardware steps: the
+//!   `_rtl8821ae_init_mac` remainder, MAC/PHY_REG/AGC/RADIOA table walks, BB
+//!   enable, crystal cap, `_rtl8821ae_read_rfe_type`, `_rtl8821ae_hw_configure`.
+//! - [`txpower`] / [`envelope`] / [`channel`] — exact 2.4 GHz path-A
+//!   power-by-rate, regulatory-limit and TX power index arithmetic, the
+//!   signed per-board measured envelope that admits each programmed TXAGC
+//!   index, and band/channel/20 MHz/TXAGC register programming.
+//! - [`h2c`] — firmware mailbox, media status / RA mask / power-mode
+//!   commands, LPS RPWM and the PCI interrupt profile.
+//! - [`iqk`] — path-A IQ calibration (`_rtl8821ae_phy_iq_calibrate`) and
+//!   the DM linked-interval trigger (`rtl8821ae_dm_iq_calibrate`).
+//! - [`station`] / [`rsvd_page`] — station MAC registers
+//!   (`rtl8821ae_set_network_type`, BSSID/RRSR/slot/SIFS/AID, fixed
+//!   `set_qos` rows) and the `rtl8821ae_set_fw_rsvdpagepkt` page bodies used
+//!   by the native packet owner (`rtlwifi/packet_ae.rs`).
+//! - [`c2h`] — C2H packet parsing (`rtl_c2h_content_parsing`): TX reports
+//!   (`rtl_tx_report_handler` V1) and RA reports
+//!   (`rtl8821ae_c2h_ra_report_handler`).
 
 #![allow(dead_code)]
+
+pub mod c2h;
+pub mod channel;
+pub mod envelope;
+pub mod fw;
+pub mod h2c;
+pub mod headerfile;
+pub mod ht;
+pub mod iqk;
+pub mod llt;
+pub mod mac;
+pub mod phy;
+pub mod power_limit;
+pub mod pwrseq;
+pub mod rsvd_page;
+pub mod station;
+pub(crate) mod tables;
+pub mod trx;
+pub mod txpower;
+pub mod vht;
+pub mod wow;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
 
 /// PCI device ID.
 pub const DEV_ID: u16 = super::regs::RTL_DEV_8821AE;

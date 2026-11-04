@@ -123,6 +123,19 @@ impl PacketPort {
             drops: Arc::new(AtomicUsize::new(0)),
         }
     }
+    fn primary(&self) -> u8 {
+        let rf = self.radio.rf(0x18);
+        let center = (rf & 255) as u8;
+        if rf & 0xc00 == 0x400 {
+            match (self.radio.word(0x440) >> 21) & 3 {
+                1 => center.saturating_sub(2),
+                2 => center.saturating_add(2),
+                _ => 0,
+            }
+        } else {
+            center
+        }
+    }
     fn emit(&self, bytes: &[u8]) -> Result<(), Error> {
         self.emit_native(bytes, 0, 0, None)
     }
@@ -466,11 +479,23 @@ impl Port for PacketPort {
         let peer = { self.model.lock().peer.clone() };
         let mut held = false;
         if let Some(peer) = peer {
-            let result = { peer.lock().react(&bytes) };
+            let wide = peer.lock().ht40;
+            let result = {
+                let mut peer = peer.lock();
+                if self.primary() == peer.channel {
+                    peer.react(&bytes)
+                } else {
+                    Ok((Vec::new(), false))
+                }
+            };
             match result {
                 Ok((replies, hold)) => {
                     for reply in replies {
-                        self.emit(&reply)?;
+                        if wide && reply.first() == Some(&0x88) {
+                            self.emit_native(&reply, (1 << 6) | (1 << 9) | 19, 0, None)?;
+                        } else {
+                            self.emit(&reply)?;
+                        }
                     }
                     held = hold;
                 }
@@ -581,7 +606,7 @@ pub(crate) fn smoke_rtl8188ee_native_receive_offset_fcs_profiles_and_repost() ->
         return TestResult::Fail("native RX offset/FCS boundary differs");
     }
     let ring = port.region(u64::from(port.radio.word(LINUX_RX_BASE)));
-    if word(&ring.bytes.lock(), 0) != OWN | 4096 {
+    if word(&ring.bytes.lock(), 0) != OWN | 9100 {
         return TestResult::Fail("consumed native RX buffer not reposted");
     }
     // Distinct raw descriptor failures, including non-MPDU reports and an
@@ -1151,7 +1176,7 @@ pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestRe
     // Before the mask: DATA keeps USE_RATE|DISDATAFB and RATE_ID 0.
     let slot = owner.packet.next[4];
     owner
-        .submit_aggregate(&frame(true), 11, None, true)
+        .submit_aggregate(&frame(true), 11, None, true, false)
         .unwrap();
     let before = port.descriptor(4, slot);
     if word(&before, 16) & (1 << 10) == 0 || word(&before, 4) & (15 << 16) != 0 {
@@ -1170,7 +1195,7 @@ pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestRe
     // DATA: RATE_ID = ratr_index, DISDATAFB clear, USE_RATE kept.
     let slot = owner.packet.next[4];
     owner
-        .submit_aggregate(&frame(true), 11, None, true)
+        .submit_aggregate(&frame(true), 11, None, true, false)
         .unwrap();
     let data = port.descriptor(4, slot);
     if word(&data, 16) & (1 << 10) != 0
@@ -1186,7 +1211,7 @@ pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestRe
         let queue = if data { 4 } else { 1 };
         let slot = owner.packet.next[queue];
         owner
-            .submit_aggregate(&frame(data), 0, None, adaptive)
+            .submit_aggregate(&frame(data), 0, None, adaptive, false)
             .unwrap();
         let other = port.descriptor(queue, slot);
         if word(&other, 16) & (1 << 10) == 0 || word(&other, 4) & (15 << 16) != 0 {

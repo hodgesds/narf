@@ -1,5 +1,6 @@
 //! Native Qu/API77 Block Ack ownership. TLC43 owns TX negotiation/retries;
-//! recipient agreements are host-owned ADD_STA48 BAIDs (Linux mvm/sta.c).
+//! recipient agreements use ADD_STA48 or BAID_ML_SUPPORT CONFIG v1/v2,
+//! with the same host reorder and retirement owner (Linux mvm/sta.c).
 use super::super::{boot_context::put16, scan_api};
 use super::{Owner, Phase};
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
@@ -9,6 +10,8 @@ use narf_wireless::{reg::RegulatoryDomain, reorder::Reorder};
 #[path = "mvm_ba_bundle.rs"]
 mod bundle;
 use bundle::{Bundle, Partial, Raw};
+#[path = "mvm_baid.rs"]
+mod baid;
 
 const TIDS: usize = 8;
 const WINDOW: u16 = 32;
@@ -28,9 +31,25 @@ struct Session {
     request: Request,
     baid: Option<u8>,
     active: bool,
+    queues: Vec<Queue>,
+    last_rx: u64,
+}
+struct Queue {
     reorder: Reorder<Bundle>,
     partial: Option<Partial>,
-    last_rx: u64,
+}
+impl Queue {
+    fn new(request: Request) -> Result<Self, &'static str> {
+        let mut reorder = Reorder::new(request.window as u8, 100_000_000)
+            .map_err(|_| "MVM BA physical queue window")?;
+        reorder
+            .advance(request.ssn, now())
+            .map_err(|_| "MVM BA physical queue seed")?;
+        Ok(Self {
+            reorder,
+            partial: None,
+        })
+    }
 }
 #[derive(Clone, Copy)]
 enum Work {
@@ -51,22 +70,6 @@ pub(super) struct Context {
 }
 fn now() -> u64 {
     narf_time::wall::cycles_to_ns(narf_time::now_cycles())
-}
-fn add(request: Request) -> [u8; 48] {
-    let mut b = [0; 48];
-    b[0] = 1;
-    b[17] = 8;
-    b[28] = request.tid;
-    put16(&mut b, 30, request.ssn);
-    put16(&mut b, 44, request.window);
-    b
-}
-fn remove(tid: u8) -> [u8; 48] {
-    let mut b = [0; 48];
-    b[0] = 1;
-    b[17] = 16;
-    b[29] = tid;
-    b
 }
 fn permission(enabled: bool) -> [u8; 48] {
     let mut b = [0; 48];
@@ -108,17 +111,28 @@ impl Context {
         self.ready.clear();
         self.draining = None;
         for s in &mut self.sessions {
-            s.reorder.clear();
-            s.partial = None;
+            for queue in &mut s.queues {
+                queue.reorder.clear();
+                queue.partial = None;
+            }
             s.active = false;
         }
     }
     pub fn cancel_incomplete(&mut self) {
         for s in &mut self.sessions {
-            s.partial = None;
+            for queue in &mut s.queues {
+                queue.partial = None;
+            }
         }
     }
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
+    pub fn cancel_queue(&mut self, queue: u8) {
+        for session in &mut self.sessions {
+            if let Some(rx) = session.queues.get_mut(usize::from(queue)) {
+                rx.partial = None;
+            }
+        }
+    }
+    pub fn pop(&mut self) -> Option<(u8, Option<u64>, Vec<u8>)> {
         loop {
             if self.draining.as_ref().is_none_or(|b| b.0.is_empty()) {
                 self.draining = self.ready.pop_front();
@@ -130,7 +144,7 @@ impl Context {
                     .iter()
                     .any(|s| s.active && s.baid == Some(((m.reorder >> 24) & 127) as u8))
             }) {
-                return Some(raw.into_bytes());
+                return Some(raw.into_capture());
             }
         }
     }
@@ -147,13 +161,19 @@ impl Context {
             }
     }
     fn append(&mut self, frames: Vec<Bundle>) -> Result<(), &'static str> {
-        if self.ready.len() + frames.len() > TIDS * usize::from(WINDOW) {
+        if self.ready.len() + frames.len() > 3 * TIDS * usize::from(WINDOW) {
             return Err("MVM BA released packet bound");
         }
         self.ready.extend(frames);
         Ok(())
     }
-    pub fn observe(&mut self, bytes: &[u8], local: [u8; 6]) -> Result<(), &'static str> {
+    pub fn observe(
+        &mut self,
+        queue: u8,
+        epoch: Option<u64>,
+        bytes: &[u8],
+        local: [u8; 6],
+    ) -> Result<(), &'static str> {
         let Some(m) = scan_api::mpdu_gen2(bytes) else {
             self.cancel_incomplete();
             return Ok(());
@@ -167,13 +187,16 @@ impl Context {
             return Ok(());
         };
         let s = &mut self.sessions[index];
+        let Some(rx) = s.queues.get_mut(usize::from(queue)) else {
+            return Err("MVM BA physical queue absent");
+        };
         let f = m.frame;
         if f.len() < 26
             || f[0] != 0x88
             || f[4] & 1 != 0
             || f[4..10] != local
             || f[24] & 15 != s.request.tid
-            || f[24] & 0x10 != 0
+            || f[24] & 0x10 != 0 && f[1] & 0x80 == 0
             || !matches!(f[24] & 0x60, 0 | 0x60)
             || f[25] != 0
             || (f[24] & 0x80 != 0) != m.amsdu
@@ -181,44 +204,45 @@ impl Context {
             || m.reorder >> 31 != 0
             || f[22] & 15 != 0
         {
-            s.partial = None;
+            rx.partial = None;
             return Ok(());
         }
         let sn = u16::from_le_bytes([f[22], f[23]]) >> 4;
         if sn != ((m.reorder >> 12) & 4095) as u16 {
-            s.partial = None;
+            rx.partial = None;
             return Ok(());
         }
         let clock = now();
-        let raw = Raw::new(bytes, &self.raw_bytes)?;
+        let raw = Raw::captured(bytes, &self.raw_bytes, queue, epoch)?;
         let complete = if m.amsdu {
-            let Some(complete) = bundle::capture(&mut s.partial, &m, raw, clock) else {
+            let Some(complete) = bundle::capture(&mut rx.partial, &m, raw, clock) else {
                 return Ok(());
             };
             complete
         } else {
-            s.partial = None;
+            rx.partial = None;
             Bundle::one(raw)
         };
-        let mut frames = s
+        let mut frames = rx
             .reorder
             .push(sn, clock, complete)
             .map_err(|_| "MVM BA reorder insertion")?;
         frames.extend(
-            s.reorder
+            rx.reorder
                 .advance((m.reorder & 4095) as u16, clock)
                 .map_err(|_| "MVM BA NSSN")?,
         );
         s.last_rx = clock;
-        if s.partial
+        if rx
+            .partial
             .as_ref()
-            .is_some_and(|p| p.passed(s.reorder.head().unwrap()))
+            .is_some_and(|p| p.passed(rx.reorder.head().unwrap()))
         {
-            s.partial = None;
+            rx.partial = None;
         }
         self.append(frames)
     }
-    pub fn release(&mut self, command: u8, bytes: &[u8]) -> Result<(), &'static str> {
+    pub fn release(&mut self, queue: u8, command: u8, bytes: &[u8]) -> Result<(), &'static str> {
         let (baid, tid, nssn) = match command {
             0xc3 if bytes.len() == 4 && bytes[1] == 0 => {
                 (bytes[0], None, u16::from_le_bytes([bytes[2], bytes[3]]))
@@ -246,15 +270,19 @@ impl Context {
         if tid.is_some_and(|t| t != s.request.tid) {
             return Err("MVM BAR release foreign TID");
         }
-        let frames = s
+        let Some(rx) = s.queues.get_mut(usize::from(queue)) else {
+            return Err("MVM BA release physical queue absent");
+        };
+        let frames = rx
             .reorder
             .advance(nssn, now())
             .map_err(|_| "MVM BA release ordering")?;
-        if s.partial
+        if rx
+            .partial
             .as_ref()
-            .is_some_and(|p| s.reorder.head().is_some_and(|head| p.passed(head)))
+            .is_some_and(|p| rx.reorder.head().is_some_and(|head| p.passed(head)))
         {
-            s.partial = None;
+            rx.partial = None;
         }
         self.append(frames)
     }
@@ -265,15 +293,24 @@ impl Context {
             if !s.active {
                 continue;
             }
-            if s.partial.as_ref().is_some_and(|p| p.expired(clock)) {
-                s.partial = None;
-            }
-            let frames = s.reorder.expire(clock).map_err(|_| "MVM BA hole expiry")?;
-            if s.partial
-                .as_ref()
-                .is_some_and(|p| p.passed(s.reorder.head().unwrap()))
-            {
-                s.partial = None;
+            let mut frames = Vec::new();
+            for queue in &mut s.queues {
+                if queue.partial.as_ref().is_some_and(|p| p.expired(clock)) {
+                    queue.partial = None;
+                }
+                frames.extend(
+                    queue
+                        .reorder
+                        .expire(clock)
+                        .map_err(|_| "MVM BA hole expiry")?,
+                );
+                if queue
+                    .partial
+                    .as_ref()
+                    .is_some_and(|p| p.passed(queue.reorder.head().unwrap()))
+                {
+                    queue.partial = None;
+                }
             }
             let expired = s.request.timeout != 0
                 && clock.saturating_sub(s.last_rx) >= u64::from(s.request.timeout) * 1_024_000;
@@ -287,11 +324,25 @@ impl Context {
     }
 }
 impl Owner {
+    fn baid_profile(&self) -> Option<baid::Profile> {
+        let parsed = super::super::parse_ucode(&self.firmware).ok()?;
+        if !parsed.api.has_capability(63) {
+            return Some(baid::Profile::Station);
+        }
+        // Linux lookup defaults this command to v1, including UNKNOWN.
+        match self.hardware.version(5, 0x16).map(|v| v.0).unwrap_or(1) {
+            1 | 99 => Some(baid::Profile::ConfigV1),
+            2 => Some(baid::Profile::ConfigV2),
+            _ => None,
+        }
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) fn model_expire_ba_partials(&mut self) {
         for s in &mut self.power.phy.ba.sessions {
-            if let Some(p) = &mut s.partial {
-                p.model_expire();
+            for queue in &mut s.queues {
+                if let Some(p) = &mut queue.partial {
+                    p.model_expire();
+                }
             }
         }
     }
@@ -303,7 +354,7 @@ impl Owner {
                 .is_some_and(|v| matches!(v.1, 4 | 6 | 7))
             && self.hardware.version(0, 0xc2).is_some_and(|v| v.1 == 1)
             && self.hardware.version(0, 0xc3).is_some_and(|v| v.1 == 1)
-            && super::super::parse_ucode(&self.firmware).is_ok_and(|p| !p.api.has_capability(63))
+            && self.baid_profile().is_some()
     }
     pub(super) fn ba_qualified(&self) -> bool {
         self.power.phy.ba.selected
@@ -326,6 +377,7 @@ impl Owner {
         {
             return false;
         }
+        let queues = self.hardware.receive_queue_count();
         let ba = &mut self.power.phy.ba;
         if ba.work.len() >= 8 {
             return true;
@@ -360,18 +412,17 @@ impl Owner {
                         return false;
                     }
                 } else {
-                    let Ok(mut reorder) = Reorder::new(request.window as u8, 100_000_000) else {
+                    let Ok(queues) = (0..queues)
+                        .map(|_| Queue::new(request))
+                        .collect::<Result<Vec<_>, _>>()
+                    else {
                         return false;
                     };
-                    if reorder.advance(request.ssn, now()).is_err() {
-                        return false;
-                    }
                     ba.sessions.push(Session {
                         request,
                         baid: None,
                         active: false,
-                        reorder,
-                        partial: None,
+                        queues,
                         last_rx: now(),
                     });
                     ba.work.push_back(Work::Add(request));
@@ -499,28 +550,29 @@ impl Owner {
                             .position(|s| s.request == request)
                             .ok_or("MVM BA reservation lost")?;
                         if self.power.phy.ba.sessions[index].baid.is_none() {
+                            let profile = self.baid_profile().ok_or("MVM BAID profile changed")?;
+                            let command = profile.add(request.tid, request.ssn, request.window);
                             let reply = self
-                                .qualified_link_command(1, 0x18, &add(request), policy)
+                                .qualified_link_command(
+                                    command.group,
+                                    command.command,
+                                    &command.bytes,
+                                    policy,
+                                )
                                 .await?;
-                            if reply.len() == 4
-                                && u32::from_le_bytes(reply[..].try_into().unwrap()) & 255 == 4
-                            {
+                            let Some(id) = profile.allocated(&reply)? else {
                                 self.ba_management(&response(request, 37), policy).await?;
                                 self.power.phy.ba.sessions.remove(index);
                                 self.power.phy.ba.work.pop_front();
                                 continue;
-                            }
-                            let receipt = status(&reply)?;
-                            let id = ((receipt >> 8) & 127) as u8;
-                            if receipt & 0x8000 == 0
-                                || id >= 32
-                                || self
-                                    .power
-                                    .phy
-                                    .ba
-                                    .sessions
-                                    .iter()
-                                    .any(|s| s.baid == Some(id))
+                            };
+                            if self
+                                .power
+                                .phy
+                                .ba
+                                .sessions
+                                .iter()
+                                .any(|s| s.baid == Some(id))
                             {
                                 return Err("MVM allocated BAID missing/foreign/reused");
                             }
@@ -572,19 +624,23 @@ impl Owner {
             return Ok(());
         };
         self.power.phy.ba.sessions[index].active = false;
-        self.power.phy.ba.sessions[index].partial = None;
-        self.power.phy.ba.sessions[index].reorder.clear();
+        for queue in &mut self.power.phy.ba.sessions[index].queues {
+            queue.partial = None;
+            queue.reorder.clear();
+        }
         if self.power.phy.ba.sessions[index].baid.is_some() {
+            let profile = self.baid_profile().ok_or("MVM BAID profile changed")?;
+            let command = profile.remove(tid, self.power.phy.ba.sessions[index].baid.unwrap());
             let reply = if let Some(p) = policy.as_deref_mut() {
-                self.qualified_link_command(1, 0x18, &remove(tid), p)
+                self.qualified_link_command(command.group, command.command, &command.bytes, p)
                     .await?
             } else {
                 self.hardware
-                    .command_with_header_version(1, 0x18, &remove(tid), 0)
+                    .command_with_header_version(command.group, command.command, &command.bytes, 0)
                     .await?
                     .payload
             };
-            status(&reply)?;
+            profile.removed(&reply)?;
             // Do not reuse a firmware BAID/reorder map on command ACK alone.
             self.sync_ba_rx(self.power.phy.ba.sessions[index].baid.unwrap(), policy)
                 .await?;

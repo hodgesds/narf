@@ -248,6 +248,26 @@ the hard half masks it with ICENABLER (lock-free). EOI also deactivates
 on unmask. Each constructor returns `Error::Unsupported` on the other
 architecture.
 
+**System wake arming** (`wake`, Linux `enable_irq_wake`/`disable_irq_wake`,
+`kernel/irq/manage.c::irq_set_irq_wake`, `kernel/irq/pm.c`).
+`wake::enable_irq_wake(vector)` / `disable_irq_wake(vector)` keep a per-vector
+wake depth (`Err(InvalidVector)` below 32, `Err(Unbalanced)` for a disable
+without an enable, `Err(Unsupported)` on an architecture without a backend).
+Both in-tree controllers are `IRQCHIP_SKIP_SET_WAKE` in Linux (IO-APIC,
+GICv3), so arming programs no controller state. `armed_vectors()` is the
+allowlist the system-PM owner keeps unmasked across a suspend; it holds
+`set_suspend_window(true)` around the park, during which a delivery on an
+armed vector (`note_delivery`, called by the oneshot hard half) latches
+`wakeup_pending()` and records `last_wakeup()` (Linux `pm_system_irq_wakeup`
+/ `pm_wakeup_irq`); closing the window consumes the latch. Outside the window
+deliveries latch nothing. `oneshot::Line::set_wake(on)` is the per-owner,
+idempotent wrapper (one wake user per line); `Drop` disarms it. Whether a
+given sleep state then resumes on that vector is the platform's: the
+`narf-power` s2idle park consumes the latch (x86_64), ACPI S3 wake is
+firmware-owned GPE/PME routing (`narf-power` `pci_wake`), and an aarch64
+system-PM owner must keep armed SPIs enabled and consume the latch the same
+way before it offers a wake-capable sleep state.
+
 ## 4. Invariants & safety properties
 
 - Every IRQ has exactly one `target` at any time.

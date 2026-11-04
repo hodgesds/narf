@@ -891,7 +891,7 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
                 } else {
                     0
                 },
-            arphrd: ARPHRD_ETHER,
+            arphrd: nic.hatype(),
             name: nic.name.clone(),
             mac: nic.mac.to_vec(),
             mtu: nic.mtu,

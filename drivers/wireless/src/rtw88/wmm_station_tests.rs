@@ -58,7 +58,16 @@ fn setup(
     qualified: bool,
     response: Option<&[u8]>,
 ) -> Result<Extended, &'static str> {
-    let h = Harness::new(protected);
+    setup_paths(protected, wmm, qualified, response, false)
+}
+fn setup_paths(
+    protected: bool,
+    wmm: bool,
+    qualified: bool,
+    response: Option<&[u8]>,
+    ht2: bool,
+) -> Result<Extended, &'static str> {
+    let h = Harness::build_paths(protected, OWN, false, ht2);
     let mut peer = Peer::new(protected);
     peer.ap = peer
         .ap
@@ -162,21 +171,36 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
         let p = narf_wireless::wmm::Parameters::parse(&parameters(4))
             .map_err(|_| "literal WMM parse")?
             .ok_or("literal WMM absent")?;
-        if crate::rtw88::wmm::words(p, false).map_err(|_| "literal WMM encode")?
+        if crate::rtw88::wmm::words(p, false, false).map_err(|_| "literal WMM encode")?
             != [0xa55a, 0xa496, 0x005e4332, 0x002f3232]
         {
             return Err("source C22 EDCA register fields or conservative BE changed");
+        }
+        // 5GHz: rtw_aifsn_to_aifs SIFS16 and the forced short slot.
+        let short = crate::rtw88::wmm::words(p, true, false).map_err(|_| "short WMM encode")?;
+        let five = crate::rtw88::wmm::words(p, false, true).map_err(|_| "5GHz WMM encode")?;
+        if five != crate::rtw88::wmm::words(p, true, true).map_err(|_| "5GHz WMM encode")?
+            || five
+                .iter()
+                .zip(short)
+                .any(|(f, s)| *f != (s & !0xff) | ((s & 0xff) + 6))
+        {
+            return Err("5GHz EDCA AIFS is not SIFS16 over the forced short slot");
         }
         for (index, _) in RATES.iter().enumerate() {
             let profile = DataProfile {
                 rates: 1 | (1 << index),
                 qos: true,
                 mcs: 0,
+                rx_mcs: 0,
                 sgi: false,
                 ldpc: false,
                 stbc: false,
                 acs: 0,
                 fallback: false,
+                bw40: false,
+                band5: false,
+                vht: None,
             };
             let mut frame = vec![0x88, 1, 0, 0];
             frame.extend_from_slice(&AP);
@@ -209,11 +233,15 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
             rates: (1 << 3) | (1 << 4) | (1 << 5),
             qos: false,
             mcs: 0,
+            rx_mcs: 0,
             sgi: false,
             ldpc: false,
             stbc: false,
             acs: 0,
             fallback: false,
+            bw40: false,
+            band5: false,
+            vht: None,
         })
         .rate()
             != 3
@@ -499,7 +527,7 @@ fn smoke_rtw8822ce_wmm_wrong_response_lost_edca_or_gain_never_opens_port() -> Te
                 _ => {
                     e.h.model(|io| {
                         use crate::rtw88::firmware_transport::Io;
-                        io.write32(0x18e8, 0x400)
+                        crate::rtw88::firmware_transport::now(io.write32(0x18e8, 0x400))
                     })
                     .map_err(|_| "C22 lost-gain fixture native mutation failed")?
                 }

@@ -47,6 +47,8 @@ pub enum TransportError {
     BadFraming,
     /// Complete packet was not submitted; global hardware flow control is active.
     Busy,
+    /// Fixed original publication scope refused before native COMMAND.
+    Denied,
     /// The chip reported an `OVERFLOW` / `UNDERFLOW` status bit.
     ChipFlowError,
     /// Caller asked for an access wider than the transport supports.
@@ -65,6 +67,7 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TransportError::Busy => f.write_str("transport busy"),
+            TransportError::Denied => f.write_str("original native publication denied"),
             TransportError::BadFraming => f.write_str("bad framing"),
             TransportError::ChipFlowError => f.write_str("chip flow error"),
             TransportError::LengthOverflow => f.write_str("length overflow"),
@@ -122,6 +125,35 @@ pub trait Transport {
 /// `sdio_readsb` for F2 RX and incrementing writes for TX. A host adapter must implement actual
 /// FIFO transactions and readiness detection before attaching a runtime.
 pub trait PacketTransport: Transport + Send {
+    /// A real AP producer's original fixed scope must reach every native
+    /// COMMAND write after waits. Unknown adapters cannot fake this by
+    /// checking a bool before their ordinary transmit operation.
+    fn transmit_ap_packet(
+        &mut self,
+        _packet: &[u8],
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+    /// Same fixed Program boundary for serialized AP IOCTLs. A control
+    /// request is neither a DATA grant nor source-only stop authorization.
+    fn transmit_ap_control(
+        &mut self,
+        _packet: &[u8],
+        _original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+    /// Actual consumed native RX/control prefix, not a cached poll count.
+    /// Unknown transports cannot provide a firmware-SME AP Idle receipt.
+    fn completed_prefix(&mut self) -> Result<bool, TransportError> {
+        Err(TransportError::NotReady)
+    }
+    /// Sealed native host/card plus original signed firmware selection.
+    /// A raw receipt carries no live Runtime or AP/peer/key/port grant.
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        None
+    }
     /// Copy one complete SDPCM packet, including its 12-byte bus header.
     /// Zero means no packet is currently available. The adapter consumes
     /// physical bus padding but may include it in the returned byte count.
@@ -130,6 +162,23 @@ pub trait PacketTransport: Transport + Send {
     /// Synchronously copy one complete packet to F2. On return the adapter
     /// no longer borrows `packet`; it must not retain a pointer into it.
     fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError>;
+
+    /// Confirm the complete original transport generation stopped. The
+    /// default has no proof. Success must include native MCU/MAC/card and
+    /// original host/IRQ retirement, not just absence of borrowed PIO bytes.
+    /// No reset/resume or physical board-power receipt follows.
+    fn confirmed_stop(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
+    /// Linux `sdio.c::brcmf_sdio_bus_reset` prelude for a generation whose
+    /// confirmed stop failed: unregister the card interrupt, remove the bus
+    /// best-effort and power the host side off (the first half of
+    /// `mmc_hw_reset`). Success is the host's own read-back receipt; only a
+    /// reset authority may follow it. Transports without one refuse.
+    fn stop_dead(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
 
     /// Card-interrupt wake raised by the host's oneshot line (Linux
     /// `brcmf_sdiod_intr_register`); `None` keeps the polled service.
@@ -142,6 +191,24 @@ pub trait PacketTransport: Transport + Send {
 
     /// A service pass found no work (`brcmf_sdio_bus_watchdog` idle path).
     fn idle(&mut self) {}
+
+    /// System suspend of the bus with the dongle kept powered (Linux
+    /// `brcmf_ops_sdio_suspend` keep-power branch). `wake`: WoWL is armed
+    /// (`sdiodev->wowl_enabled`) and the bus must let the dongle wake the
+    /// host. Buses that cannot keep the dongle powered refuse.
+    fn suspend(&mut self, _wake: bool) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
+    /// Paired resume (`brcmf_ops_sdio_resume`). An error is terminal.
+    fn resume(&mut self) -> Result<(), TransportError> {
+        Err(TransportError::NotReady)
+    }
+
+    /// Linux `bus_if->wowl_supported` (`sdio.c::brcmf_sdio_probe_attach`).
+    fn wowl_supported(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

@@ -6,45 +6,76 @@ struct Fixture {
     device: Option<Arc<Device>>,
     firmware: super::super::runtime::model::Firmware,
     producer: Producer<Frame, TX_RING_N>,
+    policy_db: Arc<narf_wireless::reg::db::Database>,
 }
 impl Fixture {
     fn new(full: bool) -> Self {
-        let (hardware, firmware) = super::super::runtime::model::create(full);
+        let (mut hardware, firmware) = super::super::runtime::model::create(full);
         let source = hardware.source_fence().unwrap();
         let (producer, consumer) = narf_ipc::channel();
         let mut consumers = core::array::from_fn(|_| None);
         consumers[1] = Some(consumer);
-        let device = Arc::new(Device {
+        let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
+        policy_db.install(Connection::model_policy_domain());
+        let policy = super::super::mld_policy::Source::database(policy_db.clone());
+        let connection = Connection::open_model();
+        let fence = policy.bind(connection.regulatory_program()).unwrap();
+        hardware
+            .install_rf_policy(super::super::mld_policy::Authority::Station(fence.clone()))
+            .unwrap();
+        let device = Arc::new_cyclic(|me| Device {
             test_name: None,
+            me: me.clone(),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            scan_generation: Arc::new(super::super::scheduled_epoch::Epoch::new()),
+            mode: AtomicU32::new(2),
+            mode_generation: AtomicU64::new(1),
+            ap_capable: false,
+            go_capable: false,
+            ap_host: ap::Host::new(),
+            p2p: p2p::Host::new(),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
+                scheduled: None,
                 beacons: Vec::new(),
-                connection: Some(Connection::open_model()),
+                scan_seen: Vec::new(),
+                connection: Some(connection),
+                ap: None,
+                ap_probes: VecDeque::new(),
                 needs_reset: false,
+                stop_completed: false,
                 producer: None,
                 receive_ipc: None,
+                receive_ap_data: None,
                 eapol: VecDeque::new(),
                 tx: consumers,
                 pending: core::array::from_fn(|_| None),
+                pending_next: core::array::from_fn(|_| None),
                 tx_progress: false,
             }),
             control: Mutex::new(None),
             publication: AtomicBool::new(false),
             source,
+            policy,
+            policy_fence: IrqSafeSpinLock::new(Some(fence)),
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac: [2; 6],
             irq_vector: None,
             channels: alloc::vec![1],
+            six_channels: Vec::new(),
             tx_chains: 1,
+            rx_chains: 1,
             phy: super::super::ht_vht::Local::from_nvm(0, 1, 1),
             firmware: Vec::new(),
             pnvm: None,
             up: AtomicBool::new(true),
             bssid: AtomicU64::new(0),
+            mlo_report: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(None),
             tx: core::array::from_fn(|_| IrqSafeSpinLock::new(None)),
         });
@@ -52,6 +83,7 @@ impl Fixture {
             device: Some(device),
             firmware,
             producer,
+            policy_db,
         }
     }
     fn enqueue(&mut self) {
@@ -317,7 +349,6 @@ fn smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints() -> T
         authority.revoke();
         narf_net::registry()
             .register(authority, interface)
-            .map(|_| ())
             .map_err(|_| "revoked during registry publication")
     });
     if result != Err("revoked during registry publication")
@@ -333,4 +364,54 @@ fn smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints() -> T
 kernel_test_in!(
     "drivers/wireless/iwlwifi/progress",
     smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints
+);
+
+fn smoke_iwl_device_current_policy_closes_queued_tx_copied_rx_and_retains_stop() -> TestResult {
+    let mut fixture = Fixture::new(false);
+    fixture.receive_data();
+    let device = fixture.device.as_ref().unwrap().clone();
+    let deliveries = device.step(None);
+    if deliveries.len() != 1 {
+        return TestResult::Fail("policy fixture lacks original RFH delivery");
+    }
+    // A same-country safe replacement remains valid after configuration.
+    fixture.policy_db.install(Connection::model_policy_domain());
+    if !device.link_up() {
+        return TestResult::Fail("safe current policy replacement closed native link");
+    }
+    fixture.enqueue();
+    let before = fixture.firmware.tx_write();
+    let mut tight = Connection::model_policy_domain();
+    tight.rules[0].max_power_dbm = 9;
+    fixture.policy_db.install(tight);
+    if device.link_up() {
+        return TestResult::Fail("tightened policy retained carrier");
+    }
+    let mut callbacks = 0;
+    device.dispatch_with(deliveries, |_| callbacks += 1);
+    if callbacks != 0 {
+        return TestResult::Fail("copied native RX crossed policy tightening");
+    }
+    for _ in 0..4 {
+        let _ = device.step(None);
+    }
+    let state = device.state.try_lock().unwrap();
+    if fixture.firmware.tx_write() != before
+        || !state.needs_reset
+        || !state.stop_completed
+        || !state.hardware.is_failed()
+        || state.pending.iter().any(Option::is_some)
+        || super::super::runtime::model::retained(&state.hardware).1 != 1
+    {
+        return TestResult::Fail(
+            "policy loss emitted queued TX or released native stop/DMA ownership",
+        );
+    }
+    drop(state);
+    drop(device);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_iwl_device_current_policy_closes_queued_tx_copied_rx_and_retains_stop
 );

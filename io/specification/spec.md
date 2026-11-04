@@ -39,6 +39,55 @@ pub fn alloc_dma<T>(n: usize, dev: &BusDevice) -> DmaBuffer<T>;
 pub fn alloc_coherent_masked(len: usize, domain: DomainId, dma_mask: u64)
     -> Result<DmaBuffer, IoError>;
 
+/// Device DMA coherence (Linux `dev_is_dma_coherent`) and reserved coherent
+/// pools (Linux `kernel/dma/coherent.c`, `struct dma_coherent_mem`).
+/// Module `coherent_pool`; see "Non-coherent devices" below.
+pub enum DmaCoherence { Coherent, NonCoherent }
+pub struct CoherentPool { /* reserved range + WC mapping + page bitmap */ }
+impl CoherentPool {
+    /// `rmem_dma_device_init` → `dma_init_coherent_memory`: map a no-map
+    /// `shared-dma-pool` once, write-combining (aarch64 Normal-NC), shared
+    /// by later callers, permanent. `PoolRejected` for empty/unaligned,
+    /// overlapping or System-RAM ranges.
+    pub unsafe fn reserved(phys: u64, size: u64) -> Result<Arc<Self>, IoError>;
+    /// Pool over an existing caller-owned mapping (tests; not registered).
+    pub unsafe fn from_mapping(phys: u64, virt: usize, size: u64)
+        -> Result<Arc<Self>, IoError>;
+    pub fn phys(&self) -> PhysAddr;
+    pub fn virt(&self) -> usize;
+    pub fn pages(&self) -> usize;
+    pub fn free_pages(&self) -> usize;
+}
+/// `struct device` DMA facts, built by `narf_bus::dma::configure`.
+pub struct DmaDevice { /* coherence + selected pool */ }
+impl DmaDevice {
+    pub const fn coherent() -> Self;
+    /// Device pool wins; else a NonCoherent device takes the default
+    /// (`linux,dma-default`) pool; a Coherent device never does.
+    pub fn new(c: DmaCoherence, device_pool: Option<Arc<CoherentPool>>,
+               default_pool: Option<Arc<CoherentPool>>) -> Self;
+    pub fn coherence(&self) -> DmaCoherence;
+    pub fn pool(&self) -> Option<&Arc<CoherentPool>>;
+}
+/// `dma_alloc_coherent(dev, …)`: pool → `__dma_alloc_from_coherent`
+/// (zeroed, naturally aligned power-of-two page run, `<= dma_mask`);
+/// Coherent without pool → exactly `alloc_coherent_masked`; NonCoherent
+/// without pool → `Err(NoCoherentPool)`.
+pub fn alloc_coherent_for(dev: &DmaDevice, len: usize, domain: DomainId,
+                          dma_mask: u64) -> Result<DmaBuffer, IoError>;
+impl DmaBuffer {
+    /// Pool buffers resolve `cpu_ptr*`/`as_slice` through the pool mapping.
+    pub fn is_pool_backed(&self) -> bool;
+    /// Streaming maintenance, Linux `arch_sync_dma_for_device` (clean,
+    /// direction ignored) / `arch_sync_dma_for_cpu` (nothing for ToDevice,
+    /// else `dcache_inval_poc`: civac partial edge lines, ivac whole lines).
+    /// x86_64 flushes (CLFLUSH) in both. `sync` stays clean+invalidate.
+    pub fn sync_for_device(&self, offset: usize, len: usize, dir: DmaDirection);
+    pub fn sync_for_cpu(&self, offset: usize, len: usize, dir: DmaDirection);
+}
+pub enum DmaDirection { Bidirectional, ToDevice, FromDevice }
+pub enum IoError { /* … */ NoCoherentPool, PoolRejected }
+
 /// Bounded recycler for one hardware RX or TX queue. Construct, `prepare`,
 /// and `prefill` it before the queue is made live. `try_acquire` and
 /// `release` are the packet/completion-path API: neither may allocate.
@@ -89,6 +138,199 @@ pub fn register_fault_handler(dev: &BusDevice, h: IoFaultHandler);
 IOMMU: each driver gets its own IOMMU context so a malicious device
 cannot DMA outside the buffers its driver explicitly mapped.
 
+**Non-coherent devices.** `alloc_coherent*` returns write-back RAM through
+the direct map; that is coherent only on a snooping interconnect (all
+x86_64, QEMU `virt`). Linux arm64 remaps RAM Normal-NC for a non-snooping
+device (`DMA_DIRECT_REMAP`); NARF never aliases System RAM non-write-back
+(`memory/src/memtype.rs`), so such a device allocates from a firmware
+reserved `no-map` `shared-dma-pool` instead (its own `memory-region`, else
+`linux,dma-default`), mapped through `narf_memory::ioremap` with
+`MmioAttrs::WriteCombining`. No pool → `NoCoherentPool` (fail closed).
+Pools are permanent (the ioremap cache shares identical mappings, so
+tearing one down would revoke it from every user). On aarch64 the boot
+linear window still maps the low RAM GiB write-back in 2 MiB blocks; a pool
+inside it keeps that cacheable alias (the same residual Linux accepts for
+`DMA_DIRECT_REMAP`), so pool creation cleans+invalidates the range by VA
+(`arch_dma_prep_coherent`), and nothing in the kernel touches the alias.
+Removing `no-map` ranges from the linear map is a `memory/` change.
+
+**Per-domain IOMMU translation** (module `iommu`, `iova`; Linux
+`iommu.c` + `dma-iommu.c` + `iova.c` + `generic_pt/fmt/{amdv1,vtdss}.h`).
+
+```rust
+pub enum PageTableFormat { AmdV1, VtdSecondStage }   // 4-level, 48-bit IOVA
+pub trait IommuHw: Send + Sync {                      // one per unit type
+    fn name(&self) -> &'static str;
+    fn format(&self) -> PageTableFormat;
+    fn coherent_walk(&self) -> bool;                  // else PTE stores are cleaned
+    fn attach(&self, bdf: Bdf, domain_id: u16, root: u64, levels: u8) -> Result<(), IoError>;
+    fn detach(&self, bdf: Bdf, domain_id: u16) -> Result<(), IoError>;
+    /// Invalidate + completion wait; Ok = no cached translation survives.
+    fn flush_iotlb(&self, domain_id: u16, iova: u64, len: u64) -> Result<(), IoError>;
+    fn sync_map(&self, domain_id: u16, iova: u64, len: u64) -> Result<(), IoError>; // default Ok
+    /// IVMD unity / RMRR ranges; attach maps them 1:1 first. Default empty.
+    fn direct_mappings(&self, bdf: Bdf) -> Vec<DirectMapping>;
+}
+pub struct DirectMapping { pub start: u64, pub end: u64, pub perms: IommuPerms } // [start, end)
+pub enum IoError { /* … */ Timeout }              // invalidation did not complete
+pub const PER_DOMAIN_CMDLINE_KEY: &str = "iommu.passthrough";
+pub fn per_domain_requested_in(cmdline: &str) -> bool; // "0" | "n" | "N" | "off"
+pub enum PerDomainOptIn { Unknown, NotRequested, Enabled, NoBackend,
+                          DmaAlreadyHandedOut, AlreadyPerDomain, Failed(amd_vi::EnableError) }
+pub fn per_domain_opt_in() -> PerDomainOptIn;
+pub fn enable_per_domain(hw: &'static dyn IommuHw) -> Result<(), IoError>; // → IommuMode::PerDomain
+pub fn default_domain(bdf: Bdf) -> Result<Arc<IommuDomain>, IoError>;     // iommu_get_dma_domain
+pub fn release_default_domain(bdf: Bdf) -> Result<(), IoError>;
+pub enum DmaBlock { Untranslated, Blocked }
+pub fn block_device_dma(bdf: Bdf) -> Result<DmaBlock, IoError>;  // pci_dev_reset_iommu_prepare
+pub fn restore_device_dma(bdf: Bdf) -> Result<(), IoError>;       // pci_dev_reset_iommu_done
+pub fn device_dma_blocked(bdf: Bdf) -> bool;
+pub fn walk(format: PageTableFormat, root: u64, iova: u64) -> Option<u64>; // software walk
+impl IommuDomain {
+    pub fn attach(&self, bdf: Bdf) -> Result<(), IoError>;  // exclusive: DomainMismatch if attached elsewhere
+    pub fn detach(&self, bdf: Bdf) -> Result<(), IoError>;
+    pub fn map(&self, iova: u64, phys: u64, len: u64, perms: IommuPerms) -> Result<u64, IoError>;
+    pub fn map_below(&self, phys: u64, len: u64, perms: IommuPerms, dma_mask: u64, pci: bool)
+        -> Result<u64, IoError>;                              // iommu_dma_alloc_iova (PCI: 32-bit first)
+    pub fn unmap(&self, iova: u64, len: u64) -> Result<(), IoError>;
+    pub fn translate(&self, iova: u64) -> Option<(u64, IommuPerms)>;
+    pub fn page_table_root(&self) -> Option<(PageTableFormat, u64)>;
+    pub fn quarantined_pages(&self) -> u64;
+}
+pub struct IovaAllocator;  // new / reserve / alloc(pages, limit_pfn, size_aligned) /
+                           // alloc_fixed / free / quarantine
+impl DmaDevice { pub fn with_iommu_domain(self, d: Arc<IommuDomain>) -> Self;
+                 pub fn iommu_domain(&self) -> Option<&Arc<IommuDomain>>; }
+impl DmaBuffer { pub fn iommu_domain_id(&self) -> Option<u16>; }
+```
+
+In `PerDomain`, `alloc_coherent_for(dev, ..)` with a domain allocates frames
+anywhere, maps them read/write at a size-aligned top-down IOVA `<= dma_mask`
+(32-bit tried first: Linux PCI SAC behaviour) and `DmaBuffer::dma_addr()`
+returns the IOVA; `phys_addr()` stays physical. A device without a domain is
+`NotMapped`, as are device-less `map_phys` / `unmap_iova`.
+`narf_bus::dma::configure` attaches a PCI function (segment 0) to its default
+domain. Domain IDs start at 1 and are never recycled. Each domain reserves
+the x86 interrupt window `0xfee0_0000..=0xfeef_ffff` (and, for AMD v1, the
+HyperTransport window `0xfd_0000_0000..=0xff_ffff_ffff`). Intermediate
+tables live until the domain is destroyed; a domain dropped with devices
+still attached leaks its tables. `iommu_model::ModelIommu` is a recording
+software backend for tests only (`set_fail_flush` / `set_fail_detach`
+inject invalidation timeouts).
+
+**Device DMA quiescence.** `block_device_dma` is the driver-neutral way to
+stop a device's DMA before releasing memory it may still reach (Linux
+blocking domain: `pci_dev_reset_iommu_prepare`, and the blocked release
+domain on removal). Outside `PerDomain` it is `Untranslated` and touches no
+hardware: DMA addresses are physical and the caller's device-side evidence
+is the only proof. In `PerDomain` it detaches the device from its default
+domain, which per the `IommuHw::detach` contract returns only after the
+blocking DTE/context entry and the device-entry + domain IOTLB invalidation
+completed; the default domain stays recorded, so buffers still mapped there
+unmap with the usual strict invalidate → wait → free ordering. A device with
+a default domain but no attachment is reported `Blocked` (idempotent; a
+never-attached AMD-Vi requester passes through, so "no default domain" is
+`NotMapped`, never blocked). A detach error (`Timeout`) means the device may
+still translate. `restore_device_dma` re-attaches the retained default
+domain (`pci_dev_reset_iommu_done`) and must only be called by the holder of
+the device's own stop/reset proof. Users: brcmfmac PCIe
+(`drivers/wireless/specification/brcmfmac.md` "IOMMU-backed quiescence").
+
+**AMD-Vi silicon backend** (module `amd_vi`, Linux
+`drivers/iommu/amd/{init.c,iommu.c,amd_iommu_types.h}`):
+
+```rust
+pub mod amd_vi {
+    pub mod ivrs {                       // init_iommu_from_acpi / init_memory_definitions
+        pub fn parse(table: &[u8]) -> Result<IvrsInfo, IvrsError>;
+        pub struct IvrsInfo { iv_info, ivhd_type, units: Vec<IvhdUnit>, unity: Vec<UnityRange> }
+        pub struct IvhdUnit { ivhd_type, flags, devid, cap_ptr, mmio_phys, pci_seg, info,
+                              efr_attr, efr_reg, devices: Vec<DevRange>,
+                              aliases: Vec<AliasRange>, specials: Vec<SpecialDevice>,
+                              acpi_hids: Vec<AcpiHidDevice> }
+    }
+    pub trait AmdViRegs: Send + Sync { fn read64; fn write64; fn read32; fn write32; }
+    pub struct MmioRegs;                 // ioremap(Device) of the 16 KiB register block
+    pub fn bring_up(info: &IvrsInfo, map: &dyn Fn(&IvhdUnit) -> Option<Box<dyn AmdViRegs>>)
+        -> Result<AmdVi, BringUpError>;
+    pub struct AmdVi;                    // impl IommuHw; poll_events / event_count /
+                                         // recent_events / read_dte / unit_rings / alias_of
+    pub fn boot_enable() -> Result<&'static AmdVi, EnableError>; // used by iommu::init
+    pub fn active() -> Option<&'static AmdVi>;
+    pub fn poll_events() -> usize;
+    // Linux-exact encoders: cmd_completion_wait, cmd_inv_dte, cmd_inv_iommu_pages,
+    // cmd_inv_all, build_inv_address, dte_initial / dte_passthrough / dte_blocked /
+    // dte_translated.
+}
+```
+
+- **Opt-in only.** `init` keeps selecting `Identity` and never touches
+  IOMMU hardware unless the kernel command line carries
+  `iommu.passthrough=0` (Linux's switch for DMA-translated default
+  domains). Then, on an AMD-Vi platform where no DMA address has yet been
+  handed out (`alloc_with` / `alloc_coherent_for` set a gate), `init`
+  runs `amd_vi::boot_enable` and `enable_per_domain`; otherwise it stays
+  `Identity` and `per_domain_opt_in()` says why. Today `frame/` calls
+  `init` after the initcall stages have probed drivers, so the opt-in
+  reports `DmaAlreadyHandedOut` until `frame/` calls `init` before the
+  initcalls (a TCB change, pending maintainer review).
+- **IVRS.** Linux `get_highest_supported_ivhd_type`: only IVHD blocks of
+  the highest supported type are used. Device entries 01h/02h/03h/04h/
+  42h/43h/46h/47h/48h(IOAPIC, HPET)/F0h give the requester-ID → unit
+  lookup, aliases and the IVHD DTE setting flags (first range wins). IVMD
+  20h/21h/22h with the unity or exclusion flag become direct mappings
+  (exclusion = read/write unity, as Linux). Units outside PCI segment 0
+  are ignored (`narf_bus::dma::configure` only attaches segment 0).
+- **Device table.** One 2 MiB (65 536 × 32 B) order-9 block shared by the
+  segment's units; base register = `phys | 0x1ff`. Every DTE starts as
+  Linux's identity entry (`set_dte_passthrough`: `V|TV|IR|IW`, `Mode 0`,
+  domain 0) plus IVHD flag bits (erratum 63: SysMgt = 01b ⇒ `IW`), so an
+  unattached device DMAs untranslated. Attach writes the v1 entry
+  (`TV`, `Mode = levels`, root[51:12], `IR|IW`, domain ID) for the device
+  and its alias (`clone_aliases`); requesters sharing an alias must share
+  a domain. Detach follows the trait contract and **blocks**
+  (`V|TV`, `Mode 0`, no `IR`/`IW`) once the last user of a requester ID
+  leaves. DTE updates go upper half → blocking low quadword → domain ID →
+  new low quadword (Linux uses one `cmpxchg16b`). A requester no IVHD
+  covers is refused (`NotMapped`).
+- **Commands.** 512-entry ring, `COMPLETION_WAIT` storing a monotonic
+  sequence number to a per-unit semaphore page, polled for 100 ms
+  (Linux `LOOP_TIMEOUT`); failure is `IoError::Timeout`, which makes
+  `IommuDomain` quarantine the IOVA and leak the frames. Attach =
+  `INVALIDATE_DEVTAB_ENTRY`(+alias) + wait; detach = those +
+  `INVALIDATE_IOMMU_PAGES` (domain, all, `PDE`) + wait; unmap =
+  `INVALIDATE_IOMMU_PAGES` with Linux's `build_inv_address` size encoding +
+  wait on every segment-0 unit. An attach whose wait fails leaves the
+  device blocked. ATS is never enabled, so `INVALIDATE_IOTLB_PAGES` is
+  never sent.
+- **Enable sequence** per unit (`early_enable_iommu`): `iommu_disable`
+  (CmdBufEn, EvtIntEn, EvtLogEn, GALogEn, GAIntEn, PPRLogEn, PPRIntEn,
+  IommuEn, IRTCacheDis cleared) → `iommu_init_flags` (HtTunEn / PassPW /
+  ResPassPW / Isoc from the IVHD flags, Coherent, InvTimeout = 1 s) →
+  device-table base → command buffer + head/tail reset + CmdBufEn →
+  IommuEn → `INVALIDATE_IOMMU_ALL` (EFR.IA) or per-DTE + per-domain
+  invalidation → event log (512 entries) + EvtLogEn. A failure disables
+  the units again before the tables are freed.
+- **Event log** is polled (no MSI) after every command wait and by
+  `amd_vi::poll_events`: per-type counters (IO_PAGE_FAULT = type 2), the
+  last 16 decoded events, Linux's erratum-732 zero-entry retry and
+  overflow restart (`amd_iommu_restart_event_logging`).
+- **Not enabled:** interrupt remapping (DTE `IV`/`IntCtl` = 0: MSIs and
+  IOAPIC/HPET interrupts pass through untranslated; no IRT, GA, XT,
+  2K-IRTE), ATS, PPR/EPH, guest translation, SNP, the event interrupt.
+  Linux's AMD-Vi errata code targets family 15h (746, ATS write check) or
+  SNP systems; nothing applies to family 17h (Renoir) / 19h (Phoenix)
+  beyond erratum 63 / 732 handling above.
+- **Validation status.** Only kernel-test smokes against a register model
+  (`io/iommu/amdvi`) exist, written and not yet executed. Native
+  validation needs QEMU's emulated AMD IOMMU, e.g.
+  `qemu-system-x86_64 -machine q35 -device amd-iommu,intremap=off
+  -device <endpoint> … -append "… iommu.passthrough=0"` (`amd-iommu` must
+  precede the PCI endpoints; QEMU then publishes the IVRS), plus the
+  `frame/` change that calls `iommu::init` before the initcalls. No AMD-Vi silicon has run this code. VT-d
+  (context tables + queued invalidation) and SMMUv3 (STE + CMDQ
+  `CMD_SYNC`) backends are open work.
+
 `DmaPool` is deliberately per queue, rather than a global allocator cache:
 that maintains NUMA/device affinity and prevents unrelated RX/TX completion
 cores from contending on a shared recycler. The hot path treats an empty pool
@@ -103,6 +345,10 @@ the allocating APIs.
   equal the calling task's `DomainId`; mismatch is a panic, not a
   return value. Without this runtime check the correspondence is
   aspirational, not load-bearing.
+- Per-domain unmap is strict: PTEs cleared → `IommuHw::flush_iotlb`
+  (invalidate + completion wait) → IOVA freed → frames freed. A failed
+  flush quarantines the IOVA and leaks the frames (`DmaBuffer` drop);
+  neither is reused while a stale translation may exist.
 - Dropping a `DmaBuffer` tears down the IOMMU mapping before freeing
   physical storage. **IOTLB invalidation must complete before
   `PhysFrame` is returned to `memory/`.** Completion mechanism:
@@ -152,7 +398,9 @@ the allocating APIs.
   devicetree `iommus` property; `bus/` exposes a StreamID lookup by
   BDF. NARF does not synthesize StreamIDs — they are device-tree
   facts.
-- DMA coherency: check `dma-coherent` in devicetree; non-coherent
+- DMA coherency: `narf_bus::dma::configure` reads `dma-coherent` /
+  `dma-noncoherent` (host bridge node for PCI); non-coherent devices use
+  `alloc_coherent_for` and a reserved Normal-NC pool (§3). Non-coherent
   paths require cache maintenance around buffer use. **Ownership of
   these `DC CIVAC` operations belongs to `DmaBuffer<T>` lifecycle
   methods** (one before device handoff, one after device completion).

@@ -1,0 +1,538 @@
+use super::*;
+use alloc::sync::Arc;
+use alloc::vec;
+use narf_capabilities::{object_table, CapSlot, CapType, Rights};
+use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_wireless::reg::{RegFlags, RegRule};
+fn authority() -> Cap<FirmwareBlob, Read> {
+    let (index, generation) = object_table::register(FirmwareBlob::KIND);
+    // SAFETY: private freshly registered firmware object, exact Read type/rights;
+    // no unsigned device/firmware lookup or production policy is bypassed.
+    unsafe {
+        Cap::mint(CapSlot::new(
+            generation,
+            index,
+            Read::BITS,
+            FirmwareBlob::KIND as u32,
+        ))
+    }
+}
+fn board(profile: Profile, seed: u8) -> Board {
+    Board {
+        identity: [seed; 32],
+        mac: [2, 4, 6, 8, 10, 12],
+        device: 0xc852,
+        profile,
+        six: None,
+    }
+}
+fn header(b: &mut [u8; LENGTH], magic: &[u8; 4], version: u8) {
+    b[..4].copy_from_slice(magic);
+    b[4..8].copy_from_slice(&[version, 0, 128, 0]);
+    b[8..12].copy_from_slice(&(LENGTH as u32).to_le_bytes());
+    b[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    b[14..16].copy_from_slice(&0xc852u16.to_le_bytes());
+    b[48..54].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+    b[58..60].copy_from_slice(&4i16.to_le_bytes());
+    b[60..62].copy_from_slice(&76i16.to_le_bytes());
+    for at in [62, 64, 66] {
+        b[at..at + 2].copy_from_slice(&40i16.to_le_bytes());
+    }
+}
+fn base_image(board: Board) -> [u8; LENGTH] {
+    let mut b = [0; LENGTH];
+    header(&mut b, b"N5CB", 2);
+    b[16..48].copy_from_slice(&board.identity);
+    b[54..58].copy_from_slice(&[1, 20, 1, BASE_FLAGS]);
+    b
+}
+fn channel_image(base: &Qualification, board: Board) -> [u8; LENGTH] {
+    let p = board.profile;
+    let mut b = [0; LENGTH];
+    header(&mut b, b"N5CC", 1);
+    b[16..48].copy_from_slice(&binding(base, board).unwrap());
+    b[54..58].copy_from_slice(&[1, width_mhz(p.width()), p.primary(), BASE_FLAGS]);
+    b[68..70].copy_from_slice(&[p.band() as u8, p.center()]);
+    if let Some(six) = board.six {
+        b[70..72].copy_from_slice(&[six.power(), six.regd()]);
+    }
+    b
+}
+fn rule(start: u32, end: u32, bw: u32, flags: RegFlags) -> RegRule {
+    RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bw,
+        max_power_dbm: 20,
+        flags,
+    }
+}
+fn domain(rules: alloc::vec::Vec<RegRule>) -> Arc<RegulatoryDomain> {
+    Arc::new(RegulatoryDomain {
+        country_code: *b"US",
+        rules,
+    })
+}
+fn base(cap: Cap<FirmwareBlob, Read>) -> Qualification {
+    let board = board(Profile::INITIAL, 7);
+    let mut q =
+        Qualification::from_verified(&base_image(board), Some([3; 32]), board, cap).unwrap();
+    q.model_domain = Some(domain(vec![
+        rule(2402, 2482, 40, RegFlags::empty()),
+        rule(5170, 5250, 80, RegFlags::AUTO_BW),
+        rule(5250, 5330, 80, RegFlags::AUTO_BW | RegFlags::DFS),
+    ]));
+    q
+}
+fn smoke_rtw8852c_full_radio_base_record_is_n5cb_v2_exact_and_revocable() -> TestResult {
+    let exact = board(Profile::INITIAL, 7);
+    let bytes = base_image(exact);
+    let cap = authority();
+    if !matches!(
+        Qualification::from_verified(&bytes, None, exact, cap),
+        Err(Error::Unsigned)
+    ) {
+        return TestResult::Fail("unsigned C full-radio record accepted");
+    }
+    for end in 0..bytes.len() {
+        if Qualification::from_verified(&bytes[..end], Some([3; 32]), exact, cap).is_ok() {
+            return TestResult::Fail("truncated C record accepted");
+        }
+    }
+    for at in [0, 3, 4, 8, 12, 14, 16, 47, 48, 53, 54, 55, 56, 57, 68, 127] {
+        let mut bad = bytes;
+        bad[at] ^= 1;
+        if Qualification::from_verified(&bad, Some([3; 32]), exact, cap).is_ok() {
+            return TestResult::Fail("altered C full-radio record accepted");
+        }
+    }
+    let mut b_magic = bytes;
+    b_magic[..4].copy_from_slice(b"N52B");
+    if Qualification::from_verified(&b_magic, Some([3; 32]), exact, cap).is_ok() {
+        return TestResult::Fail("B N52B magic admitted C");
+    }
+    // The base record never stands for a noninitial profile.
+    let other = board(Profile::new20(Band::Ghz2, 6).unwrap(), 7);
+    if Qualification::from_verified(&bytes, Some([3; 32]), other, cap).is_ok() {
+        return TestResult::Fail("base record admitted a noninitial identity");
+    }
+    let q = base(cap);
+    if !q.matches(exact)
+        || q.current().is_err()
+        || !matches!(q.channel_allowed(Profile::INITIAL), Ok(true))
+    {
+        return TestResult::Fail("exact C base record refused");
+    }
+    if !matches!(
+        q.channel_allowed(Profile::new20(Band::Ghz2, 6).unwrap()),
+        Ok(false)
+    ) {
+        return TestResult::Fail("unprovisioned C channel admitted");
+    }
+    cap.revoke();
+    if !matches!(q.current(), Err(Error::Authority)) || q.with_current(|| Ok(())).is_ok() {
+        return TestResult::Fail("revoked C record still admits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_full_radio_base_record_is_n5cb_v2_exact_and_revocable
+);
+fn smoke_rtw8852c_channel_records_admit_exactly_their_profile_and_span() -> TestResult {
+    let mut q = base(authority());
+    let ch6 = Profile::new20(Band::Ghz2, 6).unwrap();
+    let vht80 = Profile::new_wide(Band::Ghz5, 44, Width::Mhz80).unwrap();
+    let vht160 = Profile::new_wide(Band::Ghz5, 36, Width::Mhz160).unwrap();
+    if !noninitial().contains(&vht160)
+        || noninitial().contains(&Profile::INITIAL)
+        || noninitial().iter().any(|p| !admissible(*p))
+        || admissible(Profile::new20(Band::Ghz2, 14).unwrap())
+        || Profile::new20(Band::Ghz6, 37).is_some_and(admissible)
+    {
+        return TestResult::Fail("admissible C profile set wrong");
+    }
+    for profile in [ch6, vht80, vht160] {
+        let b = board(profile, profile.primary());
+        let bytes = channel_image(&q, b);
+        // Signer must be the base signer; another record's profile refused.
+        if Channel::from_verified(&q, b, &bytes, Some([9; 32]), authority()).is_ok()
+            || Channel::from_verified(
+                &q,
+                board(Profile::new20(Band::Ghz2, 7).unwrap(), 1),
+                &bytes,
+                Some([3; 32]),
+                authority(),
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("C channel record admitted another signer/profile");
+        }
+        for at in [0, 4, 16, 54, 55, 56, 57, 68, 69, 70, 127] {
+            let mut bad = bytes;
+            bad[at] ^= 1;
+            if Channel::from_verified(&q, b, &bad, Some([3; 32]), authority()).is_ok() {
+                return TestResult::Fail("altered C channel record accepted");
+            }
+        }
+        let record = match Channel::from_verified(&q, b, &bytes, Some([3; 32]), authority()) {
+            Ok(record) => record,
+            Err(_) => return TestResult::Fail("exact C channel record refused"),
+        };
+        q.install(record);
+        if !q.channel_matches(b) || q.channel_matches(board(profile, 0x55)) {
+            return TestResult::Fail("C channel record bound to wrong identity");
+        }
+    }
+    // ch6 20MHz and 5GHz VHT80 (one AUTO_BW rule) pass; VHT160 spans two
+    // AUTO_BW runs (5170..5330 => 160MHz) incl. a DFS half: passive admit.
+    if !matches!(q.channel_allowed(ch6), Ok(true))
+        || !matches!(q.channel_allowed(vht80), Ok(true))
+        || !matches!(q.channel_allowed(vht160), Ok(true))
+    {
+        return TestResult::Fail("signed C channel refused under a passing rule");
+    }
+    // A rule narrower than the profile width refuses it; a gap refuses it.
+    q.model_domain = Some(domain(vec![
+        rule(2402, 2482, 40, RegFlags::empty()),
+        rule(5170, 5250, 40, RegFlags::empty()),
+        rule(5250, 5330, 80, RegFlags::empty()),
+    ]));
+    if !matches!(q.channel_allowed(vht80), Ok(false))
+        || !matches!(q.channel_allowed(vht160), Ok(false))
+    {
+        return TestResult::Fail("C width above the host rule admitted");
+    }
+    q.model_domain = Some(domain(vec![
+        rule(2402, 2482, 40, RegFlags::empty()),
+        rule(5170, 5240, 160, RegFlags::empty()),
+        rule(5250, 5330, 160, RegFlags::empty()),
+    ]));
+    if !matches!(q.channel_allowed(vht160), Ok(false)) {
+        return TestResult::Fail("C span with a rule gap admitted");
+    }
+    // select gates the active envelope; an unloaded profile cannot be selected.
+    if q.select(ch6).is_err() || q.active() != ch6 || q.with_current(|| Ok(())).is_err() {
+        return TestResult::Fail("signed C profile not selectable");
+    }
+    let unloaded = Profile::new20(Band::Ghz5, 149).unwrap();
+    if q.select(unloaded).is_ok() || q.active() != ch6 {
+        return TestResult::Fail("unsigned C profile selected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_channel_records_admit_exactly_their_profile_and_span
+);
+fn smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans() -> TestResult {
+    let mut q = base(authority());
+    let ch6 = Profile::new20(Band::Ghz2, 6).unwrap();
+    let dfs = Profile::new20(Band::Ghz5, 52).unwrap();
+    for profile in [ch6, dfs] {
+        let b = board(profile, profile.primary());
+        let bytes = channel_image(&q, b);
+        match Channel::from_verified(&q, b, &bytes, Some([3; 32]), authority()) {
+            Ok(record) => q.install(record),
+            Err(_) => return TestResult::Fail("exact C channel record refused"),
+        }
+    }
+    // Plain 2.4GHz spans admit frames on the base and on a noninitial record.
+    if q.tx_current().is_err() || q.select(ch6).is_err() || q.tx_current().is_err() {
+        return TestResult::Fail("C frame TX refused on a plain span");
+    }
+    // The DFS span admits the signed emissions (select/current) but no frame.
+    if q.select(dfs).is_err()
+        || q.current().is_err()
+        || !matches!(q.tx_current(), Err(Error::Policy))
+    {
+        return TestResult::Fail("C frame TX admitted on a DFS span");
+    }
+    // Back on a plain span frames are admitted again; revocation refuses.
+    let cap = q.authority;
+    if q.select(Profile::INITIAL).is_err() || q.tx_current().is_err() {
+        return TestResult::Fail("C frame TX not restored after leaving the DFS span");
+    }
+    cap.revoke();
+    if !matches!(q.tx_current(), Err(Error::Authority)) {
+        return TestResult::Fail("revoked C record admitted frame TX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_tx_current_refuses_frames_on_passive_spans
+);
+fn smoke_rtw8852c_base_record_programs_follow_b_program_layout() -> TestResult {
+    let exact = board(Profile::INITIAL, 7);
+    let cap = authority();
+    let flags = Program::FirmwareRa.flags();
+    let mut bytes = base_image(exact);
+    bytes[57] = flags;
+    // The record measures the program-extended identity.
+    if Qualification::from_verified(&bytes, Some([3; 32]), exact, cap).is_ok() {
+        return TestResult::Fail("program flags accepted on the program-free identity");
+    }
+    bytes[16..48].copy_from_slice(&exact.with_programs(flags).identity);
+    let Ok(mut q) = Qualification::from_verified(&bytes, Some([3; 32]), exact, cap) else {
+        return TestResult::Fail("signed C WMM + firmware RA record refused");
+    };
+    q.model_domain = base(cap).model_domain;
+    if !q.matches(exact)
+        || q.allows(Program::Wmm) != Ok(true)
+        || q.allows(Program::FirmwareRa) != Ok(true)
+        || q.allows(Program::Ht) != Ok(false)
+        || q.allows(Program::QosAll) != Ok(false)
+    {
+        return TestResult::Fail("C program allowances differ from the signed flags");
+    }
+    // Every B program bit (HT20/HE20/A-MPDU included); unknown bits and
+    // unmet dependencies stay refused.
+    for flags in [
+        Program::Ht.flags(),
+        Program::QosAll.flags(),
+        Program::Ampdu.flags(),
+        BASE_FLAGS | Program::FirmwareRa.bit(),
+        0x7,
+        0x6,
+    ] {
+        let mut bad = base_image(exact);
+        bad[57] = flags;
+        bad[16..48].copy_from_slice(&exact.with_programs(flags).identity);
+        let accepted = Qualification::from_verified(&bad, Some([3; 32]), exact, cap).is_ok();
+        let admitted = [
+            Program::Wmm.flags(),
+            Program::QosAll.flags(),
+            Program::Ht.flags(),
+            Program::Ampdu.flags(),
+        ];
+        if accepted != admitted.contains(&flags) {
+            return TestResult::Fail("C program flag admission differs");
+        }
+    }
+    // All-AC QoS (requires WMM) extends after WMM and before firmware RA.
+    let all = Program::QosAll.flags() | Program::FirmwareRa.bit();
+    let mut qos = base_image(exact);
+    qos[57] = all;
+    qos[16..48].copy_from_slice(&exact.with_programs(all).identity);
+    match Qualification::from_verified(&qos, Some([3; 32]), exact, cap) {
+        Ok(mut q) => {
+            q.model_domain = base(cap).model_domain;
+            if q.allows(Program::QosAll) != Ok(true) || !q.matches(exact) {
+                return TestResult::Fail("signed C all-AC QoS program not allowed");
+            }
+        }
+        Err(_) => return TestResult::Fail("signed C WMM + all-AC QoS + RA record refused"),
+    }
+    // The full HE20 + A-MPDU set extends the identity once per program.
+    let full = Program::Ampdu.flags() | Program::He.bit() | Program::QosAll.bit();
+    let mut he = base_image(exact);
+    he[57] = full;
+    he[16..48].copy_from_slice(&exact.with_programs(full).identity);
+    match Qualification::from_verified(&he, Some([3; 32]), exact, cap) {
+        Ok(mut q) => {
+            q.model_domain = base(cap).model_domain;
+            if q.allows(Program::He) != Ok(true) || q.allows(Program::Ampdu) != Ok(true) {
+                return TestResult::Fail("signed C HE20/A-MPDU programs not allowed");
+            }
+        }
+        Err(_) => return TestResult::Fail("signed C full program record refused"),
+    }
+    if exact.with_programs(full).identity == exact.with_programs(full & !Program::He.bit()).identity
+        || exact.with_programs(all).identity == exact.with_programs(flags).identity
+    {
+        return TestResult::Fail("all-AC QoS did not extend the C identity");
+    }
+    let plain = base(cap);
+    if plain.allows(Program::Wmm) != Ok(false) {
+        return TestResult::Fail("program-free C record allows WMM");
+    }
+    cap.revoke();
+    if q.allows(Program::Wmm).is_ok() {
+        return TestResult::Fail("revoked C record still allows a program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_base_record_programs_follow_b_program_layout
+);
+
+/// The shared station 40/80MHz chandefs and the C-only 5GHz 160MHz ones map
+/// onto the C typed profiles with the same primary/center/width and the
+/// same chan.c `rtw89_get_primary_chan_idx` / phy.c `rtw89_phy_get_txsc`
+/// (`command_native::c_profile`); every one is a profile a C record may
+/// admit. The B list (`wide_profiles`) never holds a 160MHz chandef.
+fn smoke_rtw8852c_wide_station_profiles_map_to_c_profiles() -> TestResult {
+    use crate::rtw89::command_native::{c_profile, wide_profiles, wide_profiles_c160};
+    use crate::rtw89::operating_channel::Width as Bw;
+    if wide_profiles().any(|p| p.width() == Bw::Mhz160) {
+        return TestResult::Fail("RTL8852B wide list holds a 160MHz chandef");
+    }
+    // 36..64 (center 50), 100..128 (114), 149..177 (163): 8 primaries each.
+    let c160: alloc::vec::Vec<_> = wide_profiles_c160().collect();
+    if c160.len() != 24
+        || c160
+            .iter()
+            .any(|p| p.width() != Bw::Mhz160 || !matches!(p.center(), 50 | 114 | 163))
+    {
+        return TestResult::Fail("C 160MHz chandef set differs from the IEEE 5GHz blocks");
+    }
+    let mut count = 0;
+    for profile in wide_profiles().chain(wide_profiles_c160()) {
+        let Some(c) = c_profile(profile) else {
+            return TestResult::Fail("shared wide profile without a C typed profile");
+        };
+        if c.primary() != profile.primary()
+            || c.center() != profile.center()
+            || c.width() as u8 != profile.width() as u8
+            || (c.band() == Band::Ghz5) != profile.is_5ghz()
+            || c.occupied() != profile.occupied()
+            || c.pri_ch_idx() != profile.pri_ch_idx()
+            || c.txsc(Width::Mhz20) != profile.txsc(Bw::Mhz20)
+            || c.txsc(Width::Mhz40) != profile.txsc(Bw::Mhz40)
+            || c.txsc(Width::Mhz80) != profile.txsc(Bw::Mhz80)
+            || !admissible(c)
+        {
+            return TestResult::Fail("C typed profile differs from the shared chandef");
+        }
+        let narrow = c_profile(profile.narrowed());
+        if narrow != Profile::new20(c.band(), profile.primary()) {
+            return TestResult::Fail("20MHz narrowing does not map to the C 20MHz profile");
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return TestResult::Fail("no shared wide profiles");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_wide_station_profiles_map_to_c_profiles
+);
+
+fn smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule() -> TestResult {
+    let mut q = base(authority());
+    let he160 = Profile::new_wide(Band::Ghz6, 37, Width::Mhz160).unwrap();
+    let ch37 = Profile::new20(Band::Ghz6, 37).unwrap();
+    // 59 6GHz primaries; every 6GHz profile only through the 6GHz key.
+    let six = noninitial_6ghz();
+    if six.iter().filter(|p| p.width() == Width::Mhz20).count() != 59
+        || !six.contains(&he160)
+        || six.iter().any(|p| admissible(*p) || !admissible_6ghz(*p))
+        || noninitial().iter().any(|p| p.band() == Band::Ghz6)
+    {
+        return TestResult::Fail("C 6GHz profile set wrong");
+    }
+    let lpi = SixGhzPower::for_test(2, 1);
+    let sp = SixGhzPower::for_test(2, 2);
+    let b = Board {
+        six: Some(lpi),
+        ..board(he160, 0x61)
+    };
+    let bytes = channel_image(&q, b);
+    // Bytes 70/71 carry power/regd; a 2/5GHz-shaped (no context) board or
+    // another power type is refused.
+    for at in [70, 71, 72] {
+        let mut bad = bytes;
+        bad[at] ^= 1;
+        if Channel::from_verified(&q, b, &bad, Some([3; 32]), authority()).is_ok() {
+            return TestResult::Fail("altered C 6GHz channel record accepted");
+        }
+    }
+    let other = Board { six: Some(sp), ..b };
+    if Channel::from_verified(&q, other, &bytes, Some([3; 32]), authority()).is_ok()
+        || binding(&q, board(he160, 0x61)).is_ok()
+        || channel_name_6ghz(he160, lpi, [2, 4, 6, 8, 10, 12])
+            != "rtw89/rtw8852c-chan-v1-6g-ch037-bw160-regd02-lpi-020406080a0c.bin"
+    {
+        return TestResult::Fail("C 6GHz record bound to another power type or name");
+    }
+    let Ok(record) = Channel::from_verified(&q, b, &bytes, Some([3; 32]), authority()) else {
+        return TestResult::Fail("exact C 6GHz channel record refused");
+    };
+    q.install(record);
+    let indoor = RegFlags::INDOOR_ONLY | RegFlags::DEPLOYMENT_INDOOR;
+    let six_rule = |flags| rule(5925, 7125, 320, flags);
+    let mut rules = vec![six_rule(indoor)];
+    rules.extend(q.model_domain.as_ref().unwrap().rules.iter().cloned());
+    q.model_domain = Some(domain(rules));
+    if !q.channel_matches(b)
+        || q.six_ghz_contexts(he160) != vec![lpi]
+        || !matches!(q.channel_active_6ghz(he160, lpi), Ok(true))
+        || !matches!(q.channel_allowed_6ghz(he160, sp), Ok(false))
+        || !matches!(q.channel_allowed_6ghz(ch37, lpi), Ok(false))
+        || q.select_6ghz(he160, lpi).is_err()
+        || q.active() != he160
+        || q.active_six_ghz() != Some(lpi)
+        || q.current().is_err()
+    {
+        return TestResult::Fail("signed C 6GHz record refused under a passing LPI rule");
+    }
+    // INDOOR_ONLY without the deployment assertion, or an SP-only client
+    // rule refusing this type, refuses; NO_IR stays passive (no frame TX).
+    // INDOOR_ONLY without the deployment assertion refuses; NO_IR stays
+    // passive: tuning admitted, no frame TX (`tx_current`).
+    for (flags, passive) in [
+        (RegFlags::INDOOR_ONLY, false),
+        (RegFlags::NO_IR | indoor, true),
+    ] {
+        if q.select(Profile::INITIAL).is_err() {
+            return TestResult::Fail("C initial profile reselect refused");
+        }
+        let mut rules = vec![six_rule(flags)];
+        rules.extend(
+            base(authority())
+                .model_domain
+                .unwrap()
+                .rules
+                .iter()
+                .cloned(),
+        );
+        q.model_domain = Some(domain(rules));
+        let allowed = q.channel_allowed_6ghz(he160, lpi);
+        let active = q.channel_active_6ghz(he160, lpi);
+        let ok = if passive {
+            matches!((allowed, active), (Ok(true), Ok(false)))
+                && q.select_6ghz(he160, lpi).is_ok()
+                && q.tx_current().is_err()
+        } else {
+            matches!((allowed, active), (Ok(false), Ok(false)))
+        };
+        if !ok {
+            return TestResult::Fail("C 6GHz envelope ignored an indoor/NO_IR rule");
+        }
+    }
+    if q.select(Profile::INITIAL).is_err() {
+        return TestResult::Fail("C initial profile reselect refused");
+    }
+    let b_sp = Board {
+        six: Some(sp),
+        ..board(he160, 0x62)
+    };
+    let bytes = channel_image(&q, b_sp);
+    if let Ok(record) = Channel::from_verified(&q, b_sp, &bytes, Some([3; 32]), authority()) {
+        q.install(record);
+    }
+    let mut rules = vec![six_rule(indoor | RegFlags::NO_6GHZ_AFC_CLIENT)];
+    rules.extend(
+        base(authority())
+            .model_domain
+            .unwrap()
+            .rules
+            .iter()
+            .cloned(),
+    );
+    q.model_domain = Some(domain(rules));
+    if !matches!(q.channel_allowed_6ghz(he160, sp), Ok(false))
+        || !matches!(q.channel_allowed_6ghz(he160, lpi), Ok(true))
+    {
+        return TestResult::Fail("C 6GHz SP record admitted under NO_6GHZ_AFC_CLIENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule
+);

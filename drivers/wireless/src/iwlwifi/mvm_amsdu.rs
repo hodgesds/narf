@@ -88,8 +88,9 @@ impl Receiver {
             let tid = f[24] & 15;
             let sequence = u16::from_le_bytes(f.get(22..24)?.try_into().ok()?);
             let encrypted = f[1] & 0x40 != 0;
+            let header = 26 + if f[1] & 0x80 != 0 { 4 } else { 0 };
             let (pn, key) = if encrypted {
-                let iv = f.get(26..34)?.try_into().ok()?;
+                let iv = f.get(header..header + 8)?.try_into().ok()?;
                 let (pn, key) = narf_wireless::ccmp::decode_ccmp_header(iv).ok()?;
                 (pn, key + if f[4] & 1 != 0 { 2 } else { 1 })
             } else {

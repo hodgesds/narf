@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Immutable B PHY overrides retained from the same verified firmware container.
+//! Immutable B/C PHY tables retained from the same verified firmware container.
+//!
+//! RTL8852B keeps its static rtw8852b_table.c fallback. RTL8852C mirrors
+//! `rtw8852c_chip_info.rf_table = {radiob, radioa}`: the firmware RADIO_A
+//! element carries `reg2.idx` 1 and RADIO_B idx 0 (fw.c
+//! `rtw89_build_phy_tbl_from_elm` stores by idx, writes by element path).
+//! NARF carries no static rtw8852c_table.c copy, so a C container lacking
+//! any of BB/GAIN/RADIO_A/RADIO_B/NCTL is refused rather than defaulted.
+//! RTL8851B mirrors `rtw8851b_chip_info.rf_table = {radioa}` (one RF path):
+//! the shipped `rtw8851b_fw-1.bin` carries BB, GAIN, RADIO_A idx 0 and NCTL;
+//! a RADIO_B element is refused and, with no static rtw8851b_table.c copy, a
+//! container missing any of the four is refused (`Error::Element`).
 use super::{mac::ChipId, prepared::PreparedFirmware, radio_table::Pair, radio_tables_b};
 use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +28,7 @@ pub(super) struct Element {
 }
 #[derive(Debug)]
 pub(super) struct Assets {
+    chip: ChipId,
     tables: [Option<Vec<Pair>>; 5],
     elements: Vec<Element>,
     container_digest: [u8; 32],
@@ -40,10 +52,13 @@ fn copy(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 }
 impl Assets {
     pub fn from_prepared(image: &PreparedFirmware) -> Result<Self, Error> {
-        if image.chip() != ChipId::Rtl8852B {
+        if !matches!(
+            image.chip(),
+            ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+        ) {
             return Err(Error::Unsupported);
         }
-        let mut result = Self::parse(image.container())?;
+        let mut result = Self::parse_for(image.chip(), image.container())?;
         result.firmware_version = image
             .image()
             .get(4..8)
@@ -52,10 +67,19 @@ impl Assets {
             .map_err(|_| Error::Container)?;
         Ok(result)
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_for(ChipId::Rtl8852B, bytes)
+    }
+    pub(super) fn parse_for(chip: ChipId, bytes: &[u8]) -> Result<Self, Error> {
+        let c = chip == ChipId::Rtl8852C;
+        let n51 = chip == ChipId::Rtl8851B;
+        // Chips without a static table fallback in NARF.
+        let no_static = c || n51;
         let mut digest = narf_crypto::sha256::Sha256::new();
         digest.update(bytes);
         let mut result = Self {
+            chip,
             tables: core::array::from_fn(|_| None),
             elements: Vec::new(),
             container_digest: digest.finalize(),
@@ -64,7 +88,11 @@ impl Assets {
         // Legacy single-image firmware has no MFW element region. B retains
         // Linux's explicit static-table transition fallback for that format.
         if bytes.first() != Some(&255) {
-            return Ok(result);
+            return if no_static {
+                Err(Error::Element)
+            } else {
+                Ok(result)
+            };
         }
         let count = usize::from(*bytes.get(1).ok_or(Error::Container)?);
         if count == 0 || 16 + count * 16 > bytes.len() {
@@ -112,8 +140,11 @@ impl Assets {
                     _ => None,
                 } {
                     let idx = bytes[cursor + 24];
-                    if (id == 4 && idx != 0)
-                        || (id == 5 && idx != 1)
+                    // Path slot = reg2.idx in Linux; B ships A at 0, C ships
+                    // `{radiob, radioa}` so RADIO_A is slot 1 and RADIO_B 0.
+                    let (a, b) = if c { (1, 0) } else { (0, 1) };
+                    if (id == 4 && idx != a)
+                        || (id == 5 && (n51 || idx != b))
                         || size == 0
                         || size % 8 != 0
                         || size / 8 > 65536
@@ -143,6 +174,11 @@ impl Assets {
             }
             cursor = next.checked_add(15).ok_or(Error::Element)? & !15;
         }
+        if c && result.tables.iter().any(Option::is_none)
+            || n51 && [0, 1, 2, 4].iter().any(|&i| result.tables[i].is_none())
+        {
+            return Err(Error::Element);
+        }
         Ok(result)
     }
     pub fn firmware_version(&self) -> [u8; 4] {
@@ -160,6 +196,10 @@ impl Assets {
         hash.update(&self.container_digest);
         hash.update(&self.firmware_version);
         for i in 0..5 {
+            if i == 3 && self.chip == ChipId::Rtl8851B {
+                // One RF path: no RADIO_B program exists to bind.
+                continue;
+            }
             let program =
                 super::radio_table::program(self.table(i).ok_or(Error::Element)?, rfe, cut)
                     .map_err(|_| Error::Element)?;
@@ -171,7 +211,15 @@ impl Assets {
         }
         Ok(())
     }
+    pub fn chip(&self) -> ChipId {
+        self.chip
+    }
+    /// Index 0 BB, 1 BB gain, 2 RF path A, 3 RF path B, 4 NCTL. RTL8851B
+    /// has no path B table (index 3 is `None`).
     pub fn table(&self, index: usize) -> Option<&[Pair]> {
+        if matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) {
+            return self.tables.get(index)?.as_deref();
+        }
         let defaults = [
             radio_tables_b::BB,
             radio_tables_b::GAIN,
@@ -270,5 +318,107 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/rtw89",
         smoke_rtw89_b_radio_assets_reject_partial_or_misdirected_elements
+    );
+    fn smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots() -> TestResult {
+        let pair = |a: u32| [a.to_le_bytes(), 0x12345u32.to_le_bytes()].concat();
+        // The shipped rtw8852c_fw-{1,2}.bin layout: BB, GAIN, RADIO_A idx1,
+        // RADIO_B idx0, NCTL; all aid 0.
+        let full = |a_idx: u8, b_idx: u8, skip: Option<u32>| {
+            let mut bytes = container();
+            for (id, idx) in [(2, 0), (3, 0), (4, a_idx), (5, b_idx), (8, 0)] {
+                if skip != Some(id) {
+                    add(&mut bytes, id, 0, idx, &pair(0x100 + id));
+                }
+            }
+            bytes
+        };
+        let Ok(assets) = Assets::parse_for(ChipId::Rtl8852C, &full(1, 0, None)) else {
+            return TestResult::Fail("C RADIO_A idx1 / RADIO_B idx0 container refused");
+        };
+        for (index, id) in [(0, 2), (1, 3), (2, 4), (3, 5), (4, 8)] {
+            if assets.table(index) != Some(&[Pair(0x100 + id, 0x12345)][..]) {
+                return TestResult::Fail("C element did not land in its Linux path table");
+            }
+        }
+        if assets.chip() != ChipId::Rtl8852C {
+            return TestResult::Fail("C assets lost their chip");
+        }
+        // B slot order on a C container, and any missing table, are refused:
+        // no static rtw8852c_table.c fallback is fabricated.
+        if Assets::parse_for(ChipId::Rtl8852C, &full(0, 1, None)).is_ok() {
+            return TestResult::Fail("C accepted the B radio slot order");
+        }
+        for id in [2, 3, 4, 5, 8] {
+            if Assets::parse_for(ChipId::Rtl8852C, &full(1, 0, Some(id))).is_ok() {
+                return TestResult::Fail("C container with a missing PHY table was defaulted");
+            }
+        }
+        if Assets::parse_for(ChipId::Rtl8852C, &[0u8; 64]).is_ok() {
+            return TestResult::Fail("legacy C image without elements produced PHY tables");
+        }
+        // B on the same C layout keeps refusing it, byte-identically to before.
+        if Assets::parse(&full(1, 0, None)).is_ok() {
+            return TestResult::Fail("B accepted the C radio slot order");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89",
+        smoke_rtw89_c_radio_assets_follow_linux_radiob_radioa_slots
+    );
+    fn smoke_rtw89_n51_radio_assets_follow_linux_single_radioa_slot() -> TestResult {
+        let pair = |a: u32| [a.to_le_bytes(), 0x12345u32.to_le_bytes()].concat();
+        // The shipped rtw8851b_fw-1.bin layout: BB, GAIN, RADIO_A idx0, NCTL
+        // (aid 0), followed by power/tracking elements kept verbatim.
+        let full = |a_idx: u8, extra_b: bool, skip: Option<u32>| {
+            let mut bytes = container();
+            for (id, idx) in [(2, 0), (3, 0), (4, a_idx), (8, 0)] {
+                if skip != Some(id) {
+                    add(&mut bytes, id, 0, idx, &pair(0x100 + id));
+                }
+            }
+            if extra_b {
+                add(&mut bytes, 5, 0, 0, &pair(0x105));
+            }
+            add(&mut bytes, 18, 0, 255, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            bytes
+        };
+        let Ok(assets) = Assets::parse_for(ChipId::Rtl8851B, &full(0, false, None)) else {
+            return TestResult::Fail("8851B BB/GAIN/RADIO_A idx0/NCTL container refused");
+        };
+        for (index, id) in [(0, 2), (1, 3), (2, 4), (4, 8)] {
+            if assets.table(index) != Some(&[Pair(0x100 + id, 0x12345)][..]) {
+                return TestResult::Fail("8851B element did not land in its Linux table");
+            }
+        }
+        if assets.table(3).is_some()
+            || assets.chip() != ChipId::Rtl8851B
+            || assets.elements().len() != 1
+            || assets.elements()[0].id != 18
+        {
+            return TestResult::Fail("8851B grew a path-B table or lost its retained elements");
+        }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        if assets.bind(&mut hash, 1, 0).is_err() {
+            return TestResult::Fail("8851B one-path table set did not bind");
+        }
+        if Assets::parse_for(ChipId::Rtl8851B, &full(1, false, None)).is_ok()
+            || Assets::parse_for(ChipId::Rtl8851B, &full(0, true, None)).is_ok()
+        {
+            return TestResult::Fail("8851B accepted a second RF path slot");
+        }
+        for id in [2, 3, 4, 8] {
+            if Assets::parse_for(ChipId::Rtl8851B, &full(0, false, Some(id))).is_ok() {
+                return TestResult::Fail("8851B container with a missing PHY table was defaulted");
+            }
+        }
+        if Assets::parse_for(ChipId::Rtl8851B, &[0u8; 64]).is_ok() {
+            return TestResult::Fail("legacy 8851B image without elements produced PHY tables");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89",
+        smoke_rtw89_n51_radio_assets_follow_linux_single_radioa_slot
     );
 }

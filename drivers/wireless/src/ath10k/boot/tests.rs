@@ -212,6 +212,7 @@ fn smoke_ath10k_revoked_cap_blocks_mmio_and_dma_publication() -> TestResult {
         cap,
         io,
         sources: None,
+        power: None,
     };
     let mut poisoned = false;
     let mut response = [0; 4];
@@ -271,6 +272,7 @@ fn smoke_ath10k_revoked_executable_or_board_blocks_real_bmi_mmio_and_pins_pendin
             cap: Cap::<BusDeviceCap, Write>::bootstrap(),
             io,
             sources: Some(source),
+            power: None,
         };
         let mut poisoned = false;
         let mut response = [0; 4];

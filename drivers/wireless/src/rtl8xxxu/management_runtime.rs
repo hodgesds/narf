@@ -53,6 +53,7 @@ pub struct Candidate {
     bss: Bss,
     ap_rsne: Option<Vec<u8>>,
     ap_rsnxe: Option<Vec<u8>>,
+    probe_response: bool,
 }
 impl Candidate {
     pub fn from_receive(frame: &Mpdu, channel: u8, local: [u8; 6]) -> Result<Self, Error> {
@@ -64,7 +65,7 @@ impl Candidate {
         local: [u8; 6],
         phy: Option<&association::phy::LocalPhy>,
     ) -> Result<Self, Error> {
-        if channel != 1 || !unicast(&local) || !native(frame) {
+        if !(1..=13).contains(&channel) || !unicast(&local) || !native(frame) {
             return Err(Error::Profile);
         }
         let bytes = &frame.bytes;
@@ -151,6 +152,7 @@ impl Candidate {
             },
             ap_rsne: rsne,
             ap_rsnxe: rsnxe,
+            probe_response: bytes[0] == 0x50,
         })
     }
     pub fn bssid(&self) -> [u8; 6] {
@@ -164,6 +166,9 @@ impl Candidate {
     }
     pub fn channel(&self) -> u8 {
         self.bss.channel
+    }
+    pub(super) fn probe_response(&self) -> bool {
+        self.probe_response
     }
     pub fn information_elements(&self) -> &[u8] {
         &self.bss.information_elements
@@ -236,15 +241,56 @@ impl Join {
     pub(super) fn wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
         self.wmm
     }
+    fn geometry(
+        primary: u8,
+        width: association::phy::Width,
+        center: u8,
+        secondary: Option<u8>,
+    ) -> Result<Option<super::ht_runtime::Geometry>, Error> {
+        match width {
+            association::phy::Width::Twenty if center == primary => Ok(None),
+            association::phy::Width::Forty => {
+                let geometry =
+                    super::ht_runtime::Geometry::new(primary, secondary.ok_or(Error::Profile)?)
+                        .map_err(|_| Error::Profile)?;
+                if geometry.center() != center {
+                    return Err(Error::Profile);
+                }
+                Ok(Some(geometry))
+            }
+            _ => Err(Error::Profile),
+        }
+    }
+    pub(super) fn offered_geometry(&self) -> Result<Option<super::ht_runtime::Geometry>, Error> {
+        self.plan.offered_phy().map_or(Ok(None), |phy| {
+            Self::geometry(
+                self.candidate.channel(),
+                phy.width(),
+                phy.center_channel(),
+                phy.ht().operation().secondary(),
+            )
+        })
+    }
+    pub(super) fn negotiated_geometry(&self) -> Result<Option<super::ht_runtime::Geometry>, Error> {
+        self.plan.negotiated_phy().map_or(Ok(None), |phy| {
+            Self::geometry(
+                self.candidate.channel(),
+                phy.width(),
+                phy.center_channel(),
+                phy.ht().operation().secondary(),
+            )
+        })
+    }
     pub(super) fn data_rate(&self) -> Result<u8, Error> {
         if !matches!(self.phase(), Phase::Associated { .. }) {
             return Err(Error::Profile);
         }
         if let Some(phy) = self.plan.negotiated_phy() {
             let ht = phy.ht();
-            if phy.width() != association::phy::Width::Twenty
-                || phy.center_channel() != 1
-                || ht.operation().protection() != 0
+            if !matches!(
+                phy.width(),
+                association::phy::Width::Twenty | association::phy::Width::Forty
+            ) || ht.operation().protection() != 0
             {
                 return Err(Error::Profile);
             }
@@ -278,6 +324,15 @@ impl Join {
             .negotiated_phy()
             .map_or(0, |phy| phy.ht().tx_mcs()[0]);
         (self.plan.legacy_rates().0, mcs, self.ht_selected())
+    }
+    /// Negotiated HT facts for gen2 firmware RA (`sta->deflink.ht_cap`
+    /// after mac80211 `ieee80211_ht_cap_ie_to_sta_ht_cap`): the peer RX MCS
+    /// the local TX selection may use (`rx_mask[0..2]`) and SGI_20.
+    pub(super) fn ht_peer(&self) -> Option<([u8; 2], bool)> {
+        self.plan.negotiated_phy().map(|phy| {
+            let mcs = phy.ht().tx_mcs();
+            ([mcs[0], mcs[1]], phy.ht().tx_sgi20())
+        })
     }
     pub(super) fn ht_selected(&self) -> bool {
         self.plan.negotiated_phy().is_some()

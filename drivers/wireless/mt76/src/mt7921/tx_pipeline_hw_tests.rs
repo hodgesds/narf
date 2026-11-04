@@ -1,6 +1,79 @@
 //! Native cut-through queue ownership; no host completion or synthetic BA ACK.
 use super::*;
 
+fn mt76_native_all_tid_originators_keep_tid_queue_and_packet_ownership() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("all-TID native packet allocation"),
+    };
+    hw.owner.published = true;
+    for (tid, queue) in [
+        (0, 1),
+        (1, 0),
+        (2, 0),
+        (3, 1),
+        (4, 2),
+        (5, 2),
+        (6, 3),
+        (7, 3),
+    ] {
+        let frame = ethernet(tid);
+        if hw
+            .submit_data_txd(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                true,
+                tid,
+            )
+            .is_err()
+        {
+            return TestResult::Fail("all-TID native aggregated publication");
+        }
+        let bytes = hw.owner.storage.as_ref().unwrap().data.buffers[usize::from(tid)].as_slice();
+        let word = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        if word(0) >> 25 != queue
+            || word(4) != 0x8000_8001 | u32::from(tid) << 20
+            || word(12) != 15 << 11 | 2
+            || bytes[32..34] != (0x8001 + u16::from(tid)).to_le_bytes()
+            || bytes[64..124] != frame
+        {
+            return TestResult::Fail("all-TID native queue/TID/sequence/token fields");
+        }
+    }
+    inject_rx(
+        &mut words,
+        &hw,
+        0,
+        &free(&(1..=8).map(|token| (token, 0)).collect::<Vec<_>>()),
+    );
+    if hw.receive() != Ok(None) || hw.management_complete() != Ok(None) {
+        return TestResult::Fail("all-TID firmware receipt replaced DMA completion");
+    }
+    for slot in 0..8 {
+        hw.owner
+            .storage
+            .as_ref()
+            .unwrap()
+            .data
+            .set_word(slot, 1, (64 << 16) | LAST | DONE);
+    }
+    words[(TX_DATA + 12) as usize / 4] = 8;
+    for token in 1..=8 {
+        if hw.management_complete() != Ok(Some(packet_tx::Completion { token, status: 0 })) {
+            return TestResult::Fail("all-TID packets lost distinct native terminal ownership");
+        }
+    }
+    hw.owner.published = false;
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx_ba",
+    mt76_native_all_tid_originators_keep_tid_queue_and_packet_ownership
+);
+
 fn mt76_native_originator_txd_eligibility_keeps_per_msdu_tokens_and_no_amsdu() -> TestResult {
     let (mut words, mut hw) = match rig() {
         Ok(rig) => rig,
@@ -10,7 +83,14 @@ fn mt76_native_originator_txd_eligibility_keeps_per_msdu_tokens_and_no_amsdu() -
     for n in 0..8 {
         let frame = ethernet(n as u8);
         if hw
-            .submit_data_profile(&frame, true, true, true, true)
+            .submit_data_profile(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                true,
+                true,
+                true,
+                true,
+            )
             .is_err()
         {
             return TestResult::Fail("native originator queued packet");
@@ -56,14 +136,14 @@ kernel_test_in!(
     mt76_native_originator_txd_eligibility_keeps_per_msdu_tokens_and_no_amsdu
 );
 
-fn ethernet(value: u8) -> Vec<u8> {
+pub(super) fn ethernet(value: u8) -> Vec<u8> {
     let mut frame = vec![value; 60];
     frame[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
     frame[6..12].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
     frame[12..14].copy_from_slice(&[8, 0]);
     frame
 }
-fn free(records: &[(u16, u8)]) -> Vec<u8> {
+pub(super) fn free(records: &[(u16, u8)]) -> Vec<u8> {
     // mt76_connac_tx_free: byte count:u16,ctrl low10 MSDU count,txd:u32;
     // MT_TX_FREE_PAIR/WLAN_ID, then native token/status/retry-count entries.
     let len = 12 + records.len() * 4;
@@ -86,8 +166,14 @@ fn native_order() -> Result<(), &'static str> {
             let first = round * packet_tx::PIPELINE;
             for offset in 0..packet_tx::PIPELINE {
                 let frame = ethernet((first + offset) as u8);
-                hw.submit_data_mode(&frame, true, true, true)
-                    .map_err(|_| "native pipeline publish")?;
+                hw.submit_data_mode(
+                    crate::mt7921::vif_slots::Link::HOME,
+                    &frame,
+                    true,
+                    true,
+                    true,
+                )
+                .map_err(|_| "native pipeline publish")?;
                 let slot = (first + offset) % DEPTH;
                 let ring = &hw.owner.storage.as_ref().unwrap().data;
                 let bytes = ring.buffers[slot].as_slice();
@@ -102,7 +188,13 @@ fn native_order() -> Result<(), &'static str> {
             }
             let cidx = words[(TX_DATA + 8) as usize / 4];
             if cidx != (first + packet_tx::PIPELINE) as u32 % DEPTH as u32
-                || hw.submit_data_mode(&ethernet(99), true, true, true) != Err(Error::Busy)
+                || hw.submit_data_mode(
+                    crate::mt7921::vif_slots::Link::HOME,
+                    &ethernet(99),
+                    true,
+                    true,
+                    true,
+                ) != Err(Error::Busy)
                 || words[(TX_DATA + 8) as usize / 4] != cidx
             {
                 return Err("pipeline overflow advanced native producer");
@@ -166,8 +258,14 @@ fn prefix() -> Result<(), &'static str> {
     let (mut words, mut hw) = rig().map_err(|_| "native prefix allocation")?;
     hw.owner.published = true;
     for n in 0..packet_tx::PIPELINE {
-        hw.submit_data_mode(&ethernet(n as u8), false, true, true)
-            .map_err(|_| "prefix submit")?;
+        hw.submit_data_mode(
+            crate::mt7921::vif_slots::Link::HOME,
+            &ethernet(n as u8),
+            false,
+            true,
+            true,
+        )
+        .map_err(|_| "prefix submit")?;
     }
     let records: Vec<_> = (1..=packet_tx::PIPELINE).map(|n| (n as u16, 0)).collect();
     inject_rx(&mut words, &hw, 1, &free(&records));

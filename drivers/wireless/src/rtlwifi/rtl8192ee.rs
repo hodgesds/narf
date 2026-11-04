@@ -8,8 +8,72 @@
 //!
 //! - `rtlwifi/rtl8192ee/reg.h`  — register offsets
 //! - `rtlwifi/rtl8192ee/def.h`  — chip-version, rate, qsel constants
+//!
+//! ## Retained runtime (`rtl8192ee/`)
+//!
+//! Exact Linux-derived pieces the retained RTL8192EE owner is built from.
+//! Probe retains an admissible `0x818b` function (no BT coexistence, EFUSE
+//! TX power present) and admits it under its signed `N92E` envelope
+//! (`prepare_native::prepare_rtl8192ee`); the HT20/40 station is in
+//! [`ht`].
+//!
+//! - [`pwrseq`] — PCI rows of every `rtl8192E_*_flow` (`pwrseq.{c,h}`).
+//! - [`fw`] — `rtl8192eefw.bin` header validation and the
+//!   `rtl92ee_download_fw` page/self-reset sequence.
+//! - [`adapter`] — `rtl92ee_read_eeprom_info` / `_rtl92ee_read_adapter_info`
+//!   factory facts; test chips and unprovisioned maps yield none.
+//! - [`trx`] — new-TRX-flow TX/RX buffer descriptors, TX descriptor, RX
+//!   status and the read/write-pointer helpers (`trx.{c,h}`, `pci.c`).
+//! - [`mac`] — the `_rtl92ee_init_mac` remainder (auto LLT, BD ring bases
+//!   and counts) with the `REG_CR` release deferred to the packet owner.
+//! - [`phy`] — MAC/PHY_REG/AGC/RADIOA/RADIOB configuration with the RF
+//!   serial writer (`0xb6`/`0xb2` read-back retries) and the PHY_REG_PG
+//!   power-by-rate store (`phy.c`, `rf.c`).
+//! - [`txpower`] — factory TX power decode and the TXAGC writes
+//!   (`_rtl92ee_read_txpower_info_from_hwpg`, `rtl92ee_phy_set_txpower_level`).
+//! - [`channel`] — `rtl92ee_phy_sw_chnl` and `rtl92ee_phy_set_bw_mode` (20/40).
+//! - [`iqk`] — `rtl92ee_phy_iq_calibrate` (paths A and B, three-run
+//!   similarity selection, matrix fill, result-register recovery) and
+//!   `_rtl92ee_phy_lc_calibrate`.
+//! - [`init`] — the `rtl92ee_hw_init` tail after the firmware download
+//!   (`_rtl92ee_hw_configure`, CAM reset, station address, IQK, PA bias,
+//!   NAV, LDPC fix), run by `Prepared::configure_rtl8192ee`.
+//! - [`h2c`] / [`c2h`] / [`dm`] — `rtl92ee_fill_h2c_cmd` mailbox (with the
+//!   Linux power-save gate), media status, PWRMODE/RPWM LPS, the 2T2R RA
+//!   mask, the interrupt profile, C2H TX/RA reports with the dynamic ARFB
+//!   table, the RA state check and the PHY-status PWDB.
+//! - `packet_owner.rs` — the BD-ring profile of the retained owner, mounted
+//!   as `prepare::packet::ee92` (allocation, publication, TXBD_IDX
+//!   doorbells, RXQ_TXBD_IDX consumption and the deferred DMA releases).
 
 #![allow(dead_code)]
+
+pub mod adapter;
+pub mod c2h;
+pub mod channel;
+pub mod dm;
+pub mod envelope;
+pub mod fw;
+pub mod h2c;
+pub mod headerfile;
+pub mod ht;
+pub mod init;
+pub mod iqk;
+pub mod mac;
+pub mod phy;
+pub mod pwrseq;
+pub mod rsvd_page;
+pub mod station;
+pub mod tables;
+pub mod trx;
+pub mod txpower;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod h2c_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod phy_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
 
 /// PCI device ID.
 pub const DEV_ID: u16 = super::regs::RTL_DEV_8192EE;

@@ -238,6 +238,22 @@ impl Backplane for PcieBackplane {
         })
         .map_err(|_| chip::Error::Access)?
     }
+
+    /// `brcmf_pcie_read_reg16` after `brcmf_pcie_buscore_prep_addr`.
+    fn read16(&mut self, address: u32) -> Result<u16, chip::Error> {
+        if address & 1 != 0 {
+            return Err(chip::Error::Address);
+        }
+        self.qualified()?;
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            let offset = self.select(address & !3)? + u64::from(address & 2);
+            // SAFETY: the dword window was validated by select; the half
+            // stays inside it. Exclusive window/access runs inside invoke.
+            Ok(unsafe { self.bar0.read16(offset) })
+        })
+        .map_err(|_| chip::Error::Access)?
+    }
 }
 
 impl core::fmt::Debug for BrcmfmacDevice {
@@ -420,10 +436,14 @@ pub unsafe fn bring_up(
     if bar0.len < 4096 {
         return Err(ProbeError::Bar0TooSmall);
     }
+    // BCM43602 ids as before; other ids only where Linux binds them with a
+    // vendor path the chip profiles implement (WCC/BCA, seeded or not).
     let bar2 = if matches!(
         device.id.device,
         BRCM_PCIE_43602_DEVICE_ID | BRCM_PCIE_43602_2G_DEVICE_ID | BRCM_PCIE_43602_5G_DEVICE_ID
-    ) {
+    ) || super::chip_profile::pci_match(&device.id)
+        .is_some_and(super::chip_profile::implemented)
+    {
         // BAR2 is both dongle RAM and firmware control metadata; Device mapping
         // preserves the required index/descriptor publication ordering.
         // SAFETY: caller owns this function's BARs/config exclusively and

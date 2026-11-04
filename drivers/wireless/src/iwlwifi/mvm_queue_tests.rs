@@ -56,6 +56,7 @@ impl Fixture {
                     bssid: AP,
                     ssid: b"net".to_vec(),
                     channel: 1,
+                    band: super::super::super::native_band::Band::Two,
                     interval: 100,
                     dtim: 1,
                     rsn: None,

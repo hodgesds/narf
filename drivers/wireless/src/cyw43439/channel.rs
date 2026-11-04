@@ -41,6 +41,8 @@ pub(super) struct Operating {
     pub(super) primary: u8,
     pub(super) secondary: Option<u8>,
     center80: Option<u8>,
+    /// Contiguous 160 MHz center (`center80` is then the primary80's).
+    center160: Option<u8>,
 }
 impl Operating {
     pub(super) fn twenty(primary: u8) -> Option<Self> {
@@ -49,6 +51,7 @@ impl Operating {
             primary,
             secondary: None,
             center80: None,
+            center160: None,
         })
     }
     pub(super) fn forty(primary: u8, secondary: u8) -> Option<Self> {
@@ -65,6 +68,7 @@ impl Operating {
             primary,
             secondary: Some(secondary),
             center80: None,
+            center160: None,
         })
     }
     pub(super) fn eighty(primary: u8, center: u8) -> Option<Self> {
@@ -83,6 +87,45 @@ impl Operating {
         value.center80 = Some(center);
         Some(value)
     }
+    /// Contiguous 160 MHz (`brcmf_cfg80211.c` `NL80211_CHAN_WIDTH_160`):
+    /// eight 20 MHz channels from `center - 14`, all in the brcmfmac 5 GHz
+    /// set (so 163 is out: 169..177 are not), primary80 the half holding
+    /// the primary.
+    pub(super) fn one_sixty(primary: u8, center: u8) -> Option<Self> {
+        if ![50, 114, 163].contains(&center) {
+            return None;
+        }
+        let first = center - 14;
+        let channels: [u8; 8] = core::array::from_fn(|i| first + i as u8 * 4);
+        if channels.iter().any(|ch| frequency(*ch).is_none()) {
+            return None;
+        }
+        let index = channels.iter().position(|ch| *ch == primary)?;
+        let mut value = Self::eighty(primary, if index < 4 { center - 8 } else { center + 8 })?;
+        value.center160 = Some(center);
+        Some(value)
+    }
+    /// The primary80 of a 160 MHz channel.
+    pub(super) fn primary80(self) -> Option<Self> {
+        self.center160?;
+        Some(Self {
+            center160: None,
+            ..self
+        })
+    }
+    /// Every occupied 20 MHz channel, 160 MHz included.
+    pub(super) fn channels(self) -> [Option<u8>; 8] {
+        let mut out = [None; 8];
+        if let Some(c) = self.center160 {
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = Some(c - 14 + i as u8 * 4);
+            }
+        } else {
+            out[..4].copy_from_slice(&self.constituents());
+        }
+        out
+    }
+    /// The 20 MHz quarters of the (primary) 80 MHz channel, or the 20/40.
     pub(super) fn constituents(self) -> [Option<u8>; 4] {
         if let Some(c) = self.center80 {
             [Some(c - 6), Some(c - 2), Some(c + 2), Some(c + 6)]
@@ -91,7 +134,9 @@ impl Operating {
         }
     }
     pub(super) fn width(self) -> u32 {
-        if self.center80.is_some() {
+        if self.center160.is_some() {
+            160
+        } else if self.center80.is_some() {
             80
         } else if self.secondary.is_some() {
             40
@@ -100,6 +145,12 @@ impl Operating {
         }
     }
     pub(super) fn chanspec(self) -> u16 {
+        if let Some(center) = self.center160 {
+            // brcmu_d11.c D11AC: band 5G, BW_160 (0x2800), sideband
+            // LLL..UUU = (primary offset + 70) / 20 at bit 8.
+            let side = (u16::from(self.primary) + 14 - u16::from(center)) / 4;
+            return 0xe800 | (side << 8) | u16::from(center);
+        }
         if let Some(center) = self.center80 {
             let side = (u16::from(self.primary) + 6 - u16::from(center)) / 4;
             return 0xe000 | (side << 8) | u16::from(center);
@@ -113,6 +164,10 @@ impl Operating {
         }
     }
     pub(super) fn span(self) -> (u32, u32) {
+        if let Some(center) = self.center160 {
+            let center = 5000 + u32::from(center) * 5;
+            return (center - 80, center + 80);
+        }
         if let Some(center) = self.center80 {
             let center = 5000 + u32::from(center) * 5;
             return (center - 40, center + 40);
@@ -141,6 +196,13 @@ impl Operating {
             return None;
         }
         let value = Self::eighty(primary(chanspec, 0)?, (chanspec & 255) as u8)?;
+        (value.chanspec() == chanspec).then_some(value)
+    }
+    pub(super) fn decode160(chanspec: u16) -> Option<Self> {
+        if chanspec & 0xf800 != 0xe800 {
+            return None;
+        }
+        let value = Self::one_sixty(primary(chanspec, 0)?, (chanspec & 255) as u8)?;
         (value.chanspec() == chanspec).then_some(value)
     }
 }

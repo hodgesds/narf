@@ -1,0 +1,609 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+//! Signed measured full RTL8851B radio program records, the RTL8851B
+//! counterpart of `radio_policy_c` (C `N5CB` v2 + `N5CC`), with their own
+//! magics, names and identities so no B or C record or identity ever admits
+//! RTL8851B (or vice versa).
+//!
+//! * `N51B` v2 (`rtw89/rtw8851b-radio-v2-<mac>.bin`, 128 bytes): the initial
+//!   full program (`radio_51::Radio::prepare`) at core.c
+//!   `rtw89_get_default_chandef` (2.4GHz channel 1, 20MHz), measured over
+//!   2402..2422.
+//! * `N51C` v1 (`rtw89/rtw8851b-chan-v1-<2|5>g-ch<primary>-c<center>-bw<width>-
+//!   <mac>.bin`, 128 bytes): one noninitial typed `operating_channel::Profile`
+//!   (rtw8851b.c `support_bands` 2.4/5GHz, `support_bandwidths`
+//!   20/40/80MHz, `support_unii4`). Every 2.4GHz 20MHz primary 2..=13,
+//!   2.4GHz HT40 either side and every 5GHz 20/40/80MHz block may carry one;
+//!   channel 14 (CCK-only) never does. The centre is part of the name, so the
+//!   two 2.4GHz HT40 sides of one primary never share a file. Its binding
+//!   covers the base record digest/signer, which must also sign it.
+//!
+//! Each record's peaks/antenna/ceiling are checked against the current host
+//! rule over the profile's whole occupied span exactly as the C family
+//! (`radio_policy_c::check_envelope`: overlapping rules must cover the span
+//! without a gap, each must allow the width incl. AUTO_BW/NO_160MHZ, and
+//! DFS/NO_IR are accepted, passive-only, only at 5GHz). The base record's
+//! profile flag byte may enable the RTL8851B station programs
+//! (WMM/QoS/RA/HT/HE/A-MPDU, [`PROGRAMS`]), each extending the identity;
+//! a 40/80MHz record binds the one-stream wide station capability. These
+//! are formats only: NARF carries
+//! no RTL8851B board value, and an unprovisioned board stays unadmitted.
+use super::operating_channel::{Profile, Width};
+pub(super) use super::radio_policy::Lifecycle;
+use super::radio_policy::Program;
+pub(super) use super::radio_policy_c::Error;
+use super::radio_policy_c::{check_envelope, envelope_at, loader, Envelope};
+use super::{factory::Factory, radio_assets::Assets, radio_power_c::Plan};
+use alloc::format;
+use narf_capabilities::{Cap, CapError, CapOp, Read};
+use narf_firmware::{FirmwareBlob, FirmwareError};
+use narf_wireless::reg::RegulatoryDomain;
+const LENGTH: usize = 128;
+/// Profile byte 57: the B base flags with no optional program bit.
+const BASE_FLAGS: u8 = 3;
+/// Optional operating programs an RTL8851B base record may enable (byte 57,
+/// the B `radio_policy::Program` bit layout): WMM, all-AC QoS, firmware RA,
+/// HT, HE and originator A-MPDU, the common AX station programs RTL8851B
+/// runs on B's v0 TXWD (`packet_format::transmit_51`) with one-stream
+/// capability bodies. No A-MSDU, fragment, sleep or WoW companion.
+pub(super) const PROGRAMS: [Program; 6] = [
+    Program::Wmm,
+    Program::QosAll,
+    Program::FirmwareRa,
+    Program::Ht,
+    Program::He,
+    Program::Ampdu,
+];
+/// Extend an RTL8851B identity by one enabled program (domain-separated
+/// from B's `Program::extend` and C's; the station H2C/TXWD programs are
+/// the common AX code the B fingerprints measure, on B's v0 TXWD path, with
+/// the one-stream HE body).
+fn extend(program: Program, identity: [u8; 32]) -> [u8; 32] {
+    use super::station_control as sc;
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    let (recipe, fingerprint): (&[u8], [u8; 32]) = match program {
+        Program::Wmm => (
+            b"NARF RTL8851B WMM BE/TID0 legacy12 optional operating recipe v1;txwd_body_v0",
+            sc::wmm_fingerprint(),
+        ),
+        Program::QosAll => (
+            b"NARF RTL8851B WMM all-AC TID0..7 optional operating recipe v1;txwd_body_v0;ach0..3",
+            sc::qos_all_fingerprint(),
+        ),
+        Program::FirmwareRa => (
+            b"NARF RTL8851B firmware RA legacy optional operating recipe v1;txwd_info0_v0;SS1",
+            sc::firmware_ra_fingerprint(),
+        ),
+        Program::Ht => (
+            b"NARF RTL8851B HT20 optional operating recipe v1;rx_desc_v0;bacam_v0 2;MCS0..7",
+            sc::ht_fingerprint(),
+        ),
+        Program::He => (
+            b"NARF RTL8851B HE20 optional operating recipe v1;txwd_info0_v0 DATA_ER;rx_nss 1",
+            sc::he_fingerprint_1ss(),
+        ),
+        Program::Ampdu => (
+            b"NARF RTL8851B originator BA TX A-MPDU optional operating recipe v1;txwd_body3/info1/info2 v0 agg;h2c_ampdu_cmac_tbl NULL on 8851B",
+            sc::ampdu_fingerprint(),
+        ),
+    };
+    hash.update(recipe);
+    hash.update(&identity);
+    hash.update(&fingerprint);
+    hash.finalize()
+}
+fn programs_valid(flags: u8) -> bool {
+    let known = PROGRAMS.iter().fold(BASE_FLAGS, |m, p| m | p.bit());
+    Program::valid(flags) && flags & !known == 0
+}
+
+/// The full RTL8851B program the identity measures (Linux 7.3-rc4).
+const RECIPE: &[u8] = b"rtw8851b radio_51::Radio: rtw8851b_rfk_init (path A), rtw8851b_set_txpwr_ctrl, rtw8851b_power_trim (path A), rtw8851b_bb_cfg_txrx_path(RF_A); core.c __rtw89_set_channel (rtw8851b_set_channel_help enter S0, rtw8851b_set_channel mac/bb/rf path A, rtw8851b_set_txpwr nss0/1TX, help exit, btc switch band + rtw8851b_tssi_scan on a band change) then rtw8851b_rfk_channel (RX DCK, IQK, TSSI, DPK); no RF_GET_MCCCH; core.c rtw89_track_work rtw8851b_rfk_track (path-A DPK track) outside scans";
+/// The RTL8851B TX power program a record measures (`Plan::visit_51`).
+const POWER: &[u8] = b"RTL8851B Plan::visit_51: rtw8851b_set_txpwr byrate nss0, offset, rtw8851b_set_tx_shape (2.4GHz dfir, OFDM triangular), 1TX limit + RU pages, rtw8851b_set_txpwr_ref path A";
+fn domain(profile: Profile) -> &'static [u8] {
+    if profile == Profile::INITIAL {
+        b"NARF RTL8851B initial full RF ch1 20MHz awake WLAN-only v1;1T1R RF-A;no hardwarecrypto;onefreshPCI lifecycle"
+    } else if profile.is_5ghz() {
+        b"NARF RTL8851B 5GHz full RF awake WLAN-only v1;1T1R RF-A;no CCK;no hardwarecrypto;retuned across band from Ready ch1 program"
+    } else {
+        b"NARF RTL8851B noninitial full RF 2.4GHz awake WLAN-only v1;1T1R RF-A;no hardwarecrypto;retuned from Ready ch1 program"
+    }
+}
+fn width_mhz(width: Width) -> u8 {
+    width.mhz() as u8
+}
+/// Profiles an RTL8851B record may admit: rtw8851b.c 2.4/5GHz at
+/// 20/40/80MHz (no 160MHz, no 2.4GHz 80MHz), never channel 14.
+pub(super) fn admissible(profile: Profile) -> bool {
+    match profile.width() {
+        Width::Mhz160 => false,
+        Width::Mhz80 => profile.is_5ghz(),
+        _ => profile.primary() != 14,
+    }
+}
+/// Every noninitial admissible profile, in a fixed order.
+pub(super) fn noninitial() -> alloc::vec::Vec<Profile> {
+    let mut out = alloc::vec::Vec::new();
+    for primary in 1..=13 {
+        out.extend(Profile::new_wide(primary, Width::Mhz20, false));
+        for above in [true, false] {
+            out.extend(Profile::new_2ghz_40(primary, above));
+        }
+    }
+    for primary in super::operating_channel::GHZ5 {
+        for width in [Width::Mhz20, Width::Mhz40, Width::Mhz80] {
+            out.extend(Profile::new_wide(primary, width, false));
+        }
+    }
+    out.retain(|p| *p != Profile::INITIAL && admissible(*p));
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Board {
+    identity: [u8; 32],
+    mac: [u8; 6],
+    device: u16,
+    profile: Profile,
+}
+impl Board {
+    /// Identity of the full RTL8851B program on `power.channel()`
+    /// (`profile`): the RTL8851B cold calibration identity, the
+    /// RTL8851B-bound firmware PHY-cap receipt, the recipe, the exact
+    /// `radio_power_c` program and the profile geometry, domain-separated
+    /// per lifecycle.
+    pub fn new(
+        lifecycle: Lifecycle,
+        factory: &Factory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+        profile: Profile,
+        power: &Plan,
+        phycap: &super::firmware_phycap::Receipt,
+    ) -> Result<Self, Error> {
+        let restated = power.channel();
+        if !admissible(profile)
+            || restated.primary() != profile.primary()
+            || restated.center() != profile.center()
+            || restated.width().mhz() != profile.width().mhz()
+            || !phycap.is_51()
+        {
+            return Err(Error::Identity);
+        }
+        phycap.initial_profile_51().map_err(|_| Error::Identity)?;
+        let base = super::calibration_policy::Board::new_51(factory, device, assets)
+            .map_err(|_| Error::Identity)?;
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(domain(profile));
+        h.update(&base.identity());
+        h.update(&phycap.fingerprint());
+        h.update(RECIPE);
+        // A 40/80MHz record also binds the shared wide station capability
+        // its channel lets the station offer (`station_control::wide_phy`).
+        if matches!(profile.width(), Width::Mhz40 | Width::Mhz80) {
+            h.update(&super::station_control::wide_fingerprint_1ss());
+        }
+        h.update(POWER);
+        power.bind(&mut h);
+        profile.bind(&mut h);
+        h.update(&[
+            profile.band_index(),
+            profile.primary(),
+            profile.center(),
+            width_mhz(profile.width()),
+        ]);
+        let mut identity = h.finalize();
+        if lifecycle == Lifecycle::Repeat {
+            let mut h = narf_crypto::sha256::Sha256::new();
+            h.update(b"NARF RTL8851B repeat observed-FLR PCI lifecycle v1;SER-L2 reset or S3 resume;same boot");
+            h.update(&identity);
+            identity = h.finalize();
+        }
+        Ok(Self {
+            identity,
+            mac: base.mac(),
+            device: device.device,
+            profile,
+        })
+    }
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+    /// Extend the identity by every RTL8851B program enabled in `flags`, in
+    /// the fixed [`PROGRAMS`] order.
+    pub(super) fn with_programs(mut self, flags: u8) -> Self {
+        for program in PROGRAMS {
+            if flags & program.bit() != 0 {
+                self.identity = extend(program, self.identity);
+            }
+        }
+        self
+    }
+    pub fn profile(&self) -> Profile {
+        self.profile
+    }
+}
+
+struct Current;
+impl CapOp<FirmwareBlob, Read> for Current {
+    type Output = ();
+    fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<(), CapError> {
+        Ok(())
+    }
+}
+fn envelope(bytes: &[u8], profile: Profile) -> Result<Envelope, Error> {
+    envelope_at(bytes, profile.occupied(), profile.width().mhz(), None)
+}
+
+/// One signed noninitial `N51C` record.
+struct Channel {
+    authority: Cap<FirmwareBlob, Read>,
+    board: Board,
+    binding: [u8; 32],
+    envelope: Envelope,
+}
+fn channel_recipe(profile: Profile) -> &'static [u8] {
+    if profile.is_5ghz() {
+        b"RTL8851B 5GHz noninitial full operating program v1; __rtw89_set_channel with btc switch band and rtw8851b_tssi_scan on a band change, then rtw8851b_rfk_channel on a Ready owner; actual primary/width WW0 1TX limits and RU limits, no CCK; worst-case peaks/antenna cover all calibration emissions on this profile under the current host rule over the whole occupied span"
+    } else {
+        b"RTL8851B 2.4GHz noninitial full operating program v1; __rtw89_set_channel then rtw8851b_rfk_channel on a Ready owner; same band, no band-change TSSI scan; actual primary/width WW0 CCK/OFDM 1TX limits, SCO CCK and TX shape; worst-case peaks/antenna cover all calibration emissions on this profile under the current host rule over the whole occupied span"
+    }
+}
+fn binding(base: &Qualification, board: Board) -> Result<[u8; 32], Error> {
+    let profile = board.profile;
+    if profile == Profile::INITIAL
+        || !admissible(profile)
+        || board.mac != base.board.mac
+        || board.device != base.board.device
+    {
+        return Err(Error::Identity);
+    }
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"NARF RTL8851B measured noninitial channel full program v1");
+    hash.update(&[
+        profile.band_index(),
+        profile.primary(),
+        profile.center(),
+        width_mhz(profile.width()),
+    ]);
+    hash.update(&board.identity);
+    hash.update(&base.board.identity);
+    hash.update(&base.record_digest);
+    hash.update(&base.record_signer);
+    hash.update(channel_recipe(profile));
+    Ok(hash.finalize())
+}
+/// Firmware name of the `N51C` record for `profile` on `mac`.
+pub(super) fn channel_name(profile: Profile, mac: [u8; 6]) -> alloc::string::String {
+    let m = mac;
+    format!(
+        "rtw89/rtw8851b-chan-v1-{}g-ch{:03}-c{:03}-bw{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+        if profile.is_5ghz() { 5 } else { 2 },
+        profile.primary(),
+        profile.center(),
+        width_mhz(profile.width()),
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
+    )
+}
+impl Channel {
+    fn from_verified(
+        base: &Qualification,
+        board: Board,
+        bytes: &[u8],
+        signer: Option<[u8; 32]>,
+        authority: Cap<FirmwareBlob, Read>,
+    ) -> Result<Self, Error> {
+        authority.invoke(Current).map_err(|_| Error::Authority)?;
+        let binding = binding(base, board)?;
+        if signer.ok_or(Error::Unsigned)? != base.record_signer {
+            return Err(Error::Identity);
+        }
+        let p = board.profile;
+        if bytes.len() != LENGTH
+            || &bytes[..4] != b"N51C"
+            || bytes[4..8] != [1, 0, 128, 0]
+            || bytes[8..12] != (LENGTH as u32).to_le_bytes()
+            || bytes[12..14] != 0x10ecu16.to_le_bytes()
+            || bytes[14..16] != base.board.device.to_le_bytes()
+            || bytes[54..58] != [1, width_mhz(p.width()), p.primary(), BASE_FLAGS]
+            || bytes[68..70] != [p.band_index(), p.center()]
+            || bytes[70..] != [0; 58]
+        {
+            return Err(Error::Format);
+        }
+        if bytes[16..48] != binding || bytes[48..54] != base.board.mac {
+            return Err(Error::Identity);
+        }
+        Ok(Self {
+            authority,
+            board,
+            binding,
+            envelope: envelope(bytes, p)?,
+        })
+    }
+    fn current(&self) -> Result<(), Error> {
+        self.authority.invoke(Current).map_err(|_| Error::Authority)
+    }
+    fn bound(&self, base: &Qualification) -> Result<(), Error> {
+        self.current()?;
+        if binding(base, self.board)? != self.binding {
+            return Err(Error::Identity);
+        }
+        Ok(())
+    }
+    fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::power::Error>,
+    ) -> Result<T, super::power::Error> {
+        struct Live<F>(F);
+        impl<T, F: FnOnce() -> Result<T, super::power::Error>> CapOp<FirmwareBlob, Read> for Live<F> {
+            type Output = Result<T, super::power::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        self.authority
+            .invoke(Live(operation))
+            .map_err(|_| super::power::Error::Access)?
+    }
+}
+
+/// The signed base `N51B` v2 record plus every loaded `N51C` record.
+pub(super) struct Qualification {
+    board: Board,
+    authority: Cap<FirmwareBlob, Read>,
+    envelope: Envelope,
+    record_digest: [u8; 32],
+    record_signer: [u8; 32],
+    /// Byte 57 of the base record: base flags plus enabled `PROGRAMS`.
+    flags: u8,
+    channels: alloc::vec::Vec<Channel>,
+    /// Profile whose envelope gates every publication.
+    active: narf_lib::sync::IrqSafeSpinLock<Profile>,
+    #[cfg(any(test, feature = "kernel-test"))]
+    model_domain: Option<alloc::sync::Arc<RegulatoryDomain>>,
+}
+impl Qualification {
+    /// Load the base record for `board` (which must be the initial-profile
+    /// identity). A missing record is `Firmware(NotFound)`: unadmitted.
+    pub fn load(board: Board) -> Result<Self, Error> {
+        if board.profile != Profile::INITIAL {
+            return Err(Error::Identity);
+        }
+        let m = board.mac;
+        let name = format!(
+            "rtw89/rtw8851b-radio-v2-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        );
+        let cap = narf_firmware::open(&name, &loader()?).map_err(Error::Firmware)?;
+        struct Decode(Board);
+        impl CapOp<FirmwareBlob, Read> for Decode {
+            type Output = Result<Qualification, Error>;
+            fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    let v = narf_firmware::view_of(cap).map_err(Error::Firmware)?;
+                    Qualification::from_verified(v.bytes, v.signer, self.0, *cap)
+                })())
+            }
+        }
+        cap.invoke(Decode(board)).map_err(|_| Error::Authority)?
+    }
+    pub(super) fn from_verified(
+        bytes: &[u8],
+        signer: Option<[u8; 32]>,
+        board: Board,
+        authority: Cap<FirmwareBlob, Read>,
+    ) -> Result<Self, Error> {
+        authority.invoke(Current).map_err(|_| Error::Authority)?;
+        let record_signer = signer.ok_or(Error::Unsigned)?;
+        if board.profile != Profile::INITIAL
+            || bytes.len() != LENGTH
+            || &bytes[..4] != b"N51B"
+            || bytes[4..8] != [2, 0, 128, 0]
+            || bytes[8..12] != (LENGTH as u32).to_le_bytes()
+            || bytes[12..14] != 0x10ecu16.to_le_bytes()
+            || bytes[14..16] != board.device.to_le_bytes()
+            || bytes[54..57] != [1, 20, 1]
+            || !programs_valid(bytes[57])
+            || bytes[68..] != [0; 60]
+        {
+            return Err(Error::Format);
+        }
+        let flags = bytes[57];
+        let extended = board.with_programs(flags);
+        if bytes[16..48] != extended.identity || bytes[48..54] != board.mac {
+            return Err(Error::Identity);
+        }
+        let envelope = envelope(bytes, Profile::INITIAL)?;
+        let mut digest = narf_crypto::sha256::Sha256::new();
+        digest.update(bytes);
+        Ok(Self {
+            board: extended,
+            authority,
+            envelope,
+            record_digest: digest.finalize(),
+            record_signer,
+            flags,
+            channels: alloc::vec::Vec::new(),
+            active: narf_lib::sync::IrqSafeSpinLock::new(Profile::INITIAL),
+            #[cfg(any(test, feature = "kernel-test"))]
+            model_domain: None,
+        })
+    }
+    /// `board` is the program-free identity [`Board::new`] rebinds.
+    pub fn matches(&self, board: Board) -> bool {
+        self.board == board.with_programs(self.flags)
+    }
+    /// Whether the base record enables `program` (current authority only).
+    pub(super) fn allows(&self, program: Program) -> Result<bool, Error> {
+        self.current()?;
+        Ok(self.flags & program.bit() != 0)
+    }
+    /// Load the optional `N51C` record for `board.profile()` (a noninitial
+    /// identity from [`Board::new`]). Absent: `Ok(false)`, unadmitted.
+    pub(super) fn load_channel(&mut self, board: Board) -> Result<bool, Error> {
+        binding(self, board)?;
+        let name = channel_name(board.profile, self.board.mac);
+        let cap = match narf_firmware::open(&name, &loader()?) {
+            Ok(cap) => cap,
+            Err(FirmwareError::NotFound) => return Ok(false),
+            Err(error) => return Err(Error::Firmware(error)),
+        };
+        struct Decode<'a>(&'a Qualification, Board);
+        impl CapOp<FirmwareBlob, Read> for Decode<'_> {
+            type Output = Result<Channel, Error>;
+            fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    let v = narf_firmware::view_of(cap).map_err(Error::Firmware)?;
+                    Channel::from_verified(self.0, self.1, v.bytes, v.signer, *cap)
+                })())
+            }
+        }
+        let record = cap
+            .invoke(Decode(self, board))
+            .map_err(|_| Error::Authority)??;
+        self.install(record);
+        Ok(true)
+    }
+    fn install(&mut self, record: Channel) {
+        let key = record.board.profile;
+        self.channels.retain(|c| c.board.profile != key);
+        self.channels.push(record);
+    }
+    fn channel(&self, profile: Profile) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.board.profile == profile)
+    }
+    /// The loaded record for `board.profile()` was measured for exactly
+    /// `board`.
+    pub(super) fn channel_matches(&self, board: Board) -> bool {
+        if board.profile == Profile::INITIAL {
+            return self.matches(board);
+        }
+        self.channel(board.profile)
+            .is_some_and(|record| record.board == board)
+    }
+    fn envelope_of(&self, profile: Profile) -> Result<Option<Envelope>, Error> {
+        if profile == Profile::INITIAL {
+            return Ok(Some(self.envelope));
+        }
+        let Some(record) = self.channel(profile) else {
+            return Ok(None);
+        };
+        record.bound(self)?;
+        Ok(Some(record.envelope))
+    }
+    /// Current signed admission of `profile`: a record exists, is bound to
+    /// this base, and the current host rule over its span passes.
+    pub(super) fn channel_allowed(&self, profile: Profile) -> Result<bool, Error> {
+        self.current()?;
+        let Some(envelope) = self.envelope_of(profile)? else {
+            return Ok(false);
+        };
+        Ok(check_envelope(&*self.policy()?, envelope).is_ok())
+    }
+    /// `channel_allowed` restricted to spans the host rule leaves active
+    /// (no DFS/NO_IR rule), where frame TX (`tx_current`) is admitted.
+    pub(super) fn channel_active(&self, profile: Profile) -> Result<bool, Error> {
+        self.current()?;
+        let Some(envelope) = self.envelope_of(profile)? else {
+            return Ok(false);
+        };
+        Ok(check_envelope(&*self.policy()?, envelope) == Ok(false))
+    }
+    /// Switch the gating envelope to `profile` before its first emission.
+    /// No register access happens here.
+    pub(super) fn select(&self, profile: Profile) -> Result<(), Error> {
+        if profile != Profile::INITIAL {
+            self.channel(profile).ok_or(Error::Policy)?.bound(self)?;
+        }
+        let previous = core::mem::replace(&mut *self.active.lock(), profile);
+        let result = self.current();
+        if result.is_err() {
+            *self.active.lock() = previous;
+        }
+        result
+    }
+    pub(super) fn active(&self) -> Profile {
+        *self.active.lock()
+    }
+    fn active_envelope(&self) -> Result<Envelope, Error> {
+        let active = *self.active.lock();
+        if active == Profile::INITIAL {
+            return Ok(self.envelope);
+        }
+        let record = self.channel(active).ok_or(Error::Policy)?;
+        record.current()?;
+        Ok(record.envelope)
+    }
+    pub(super) fn policy(&self) -> Result<alloc::sync::Arc<RegulatoryDomain>, Error> {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(domain) = self.model_domain.as_ref() {
+            return Ok(domain.clone());
+        }
+        narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Policy)
+    }
+    pub fn current(&self) -> Result<(), Error> {
+        self.authority
+            .invoke(Current)
+            .map_err(|_| Error::Authority)?;
+        check_envelope(&*self.policy()?, self.active_envelope()?).map(|_| ())
+    }
+    /// `current` plus the frame-TX rule: a passive-only (DFS / NO_IR) span
+    /// may carry the signed calibration/tuning emissions the record covers,
+    /// but no frame (RTL8851B has no beacon-witness passive TX grant).
+    pub(super) fn tx_current(&self) -> Result<(), Error> {
+        self.authority
+            .invoke(Current)
+            .map_err(|_| Error::Authority)?;
+        if check_envelope(&*self.policy()?, self.active_envelope()?)? {
+            return Err(Error::Policy);
+        }
+        Ok(())
+    }
+    /// Keep actual publication inside this exact signed capability
+    /// invocation (and the active channel record's).
+    pub fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::power::Error>,
+    ) -> Result<T, super::power::Error> {
+        struct Invoke<'a, F> {
+            qualification: &'a Qualification,
+            operation: F,
+        }
+        impl<T, F: FnOnce() -> Result<T, super::power::Error>> CapOp<FirmwareBlob, Read> for Invoke<'_, F> {
+            type Output = Result<T, super::power::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    let q = self.qualification;
+                    let domain = q.policy().map_err(|_| super::power::Error::Access)?;
+                    let envelope = q
+                        .active_envelope()
+                        .map_err(|_| super::power::Error::Access)?;
+                    check_envelope(&domain, envelope).map_err(|_| super::power::Error::Access)?;
+                    let active = *q.active.lock();
+                    if active == Profile::INITIAL {
+                        return (self.operation)();
+                    }
+                    match q.channel(active) {
+                        Some(record) => record.invoke(self.operation),
+                        None => Err(super::power::Error::Access),
+                    }
+                })())
+            }
+        }
+        self.authority
+            .invoke(Invoke {
+                qualification: self,
+                operation,
+            })
+            .map_err(|_| super::power::Error::Access)?
+    }
+}
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "radio_policy_51/tests.rs"]
+pub(super) mod tests;

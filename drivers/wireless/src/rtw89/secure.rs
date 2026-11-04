@@ -35,21 +35,52 @@ pub struct Fuses {
 pub struct Blacklist {
     version: u8,
     bits: [u8; 32],
+    /// False only for the exact Linux RTL8851B policy, whose
+    /// `rtw8851b_chip_info.fw_blacklist` is NULL (see [`Blacklist::upstream`]).
+    chip_list: bool,
 }
 impl Blacklist {
-    /// Linux supplies version0/all-clear lists only for these AX profiles.
+    /// Linux supplies version0/all-clear lists only for 8852B/8852C
+    /// (`rtw89_fw_blacklist_default`). RTL8851B carries no chip list at all:
+    /// fw.c `__check_secure_blacklist` returns -ENOENT and
+    /// `__parse_security_section` only `WARN_ONCE`s, so the hardware-verified
+    /// MSS signature selection is the whole secure policy. That exact policy
+    /// is returned here; the matching signature is still required. RTL8852A
+    /// (also NULL upstream) stays on the authenticated-board-policy path of its
+    /// own chip row.
     pub fn upstream(chip: ChipId) -> Option<Self> {
-        matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C).then_some(Self {
-            version: 0,
-            bits: [0; 32],
-        })
+        match chip {
+            ChipId::Rtl8852B | ChipId::Rtl8852C => Some(Self {
+                version: 0,
+                bits: [0; 32],
+                chip_list: true,
+            }),
+            ChipId::Rtl8851B => Some(Self {
+                version: 0,
+                bits: [0; 32],
+                chip_list: false,
+            }),
+            _ => None,
+        }
     }
     pub fn authenticated(version: u8, bits: [u8; 32]) -> Self {
-        Self { version, bits }
+        Self {
+            version,
+            bits,
+            chip_list: true,
+        }
+    }
+    /// Whether a host chip list is enforced (false = Linux NULL `fw_blacklist`).
+    pub fn has_chip_list(self) -> bool {
+        self.chip_list
     }
     fn check(self, content: &[u8]) -> Result<(), Error> {
         let bit = usize::from(*content.get(32).ok_or(Error::Bounds)?);
         let version = *content.get(33).ok_or(Error::Bounds)?;
+        if !self.chip_list {
+            // The section content must still be present (bounds above).
+            return Ok(());
+        }
         if version > self.version {
             return Err(Error::NewerBlacklist);
         }

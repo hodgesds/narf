@@ -24,6 +24,10 @@ pub enum SdioError {
     AddressOverflow,
     /// This adapter has no implementation for the requested transfer mode.
     Unsupported,
+    /// Fixed original scope denied before native COMMAND publication.
+    Denied,
+    /// Actual pending native card prefix, definitely no new COMMAND issued.
+    Busy,
 }
 
 impl core::fmt::Display for SdioError {
@@ -36,7 +40,33 @@ impl core::fmt::Display for SdioError {
             SdioError::NotEnabled => f.write_str("function not enabled"),
             SdioError::AddressOverflow => f.write_str("address overflow"),
             SdioError::Unsupported => f.write_str("unsupported transfer mode"),
+            SdioError::Denied => f.write_str("original publication scope retired"),
+            SdioError::Busy => f.write_str("native card input pending"),
         }
+    }
+}
+
+/// Host power-management capabilities / requested flags (Linux
+/// `mmc_pm_flag_t`, `include/linux/mmc/pm.h`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PmFlags(u8);
+impl PmFlags {
+    pub const NONE: Self = Self(0);
+    /// `MMC_PM_KEEP_POWER`: the card keeps power across system suspend.
+    pub const KEEP_POWER: Self = Self(1 << 0);
+    /// `MMC_PM_WAKE_SDIO_IRQ`: the card interrupt wakes the host.
+    pub const WAKE_SDIO_IRQ: Self = Self(1 << 1);
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn bits(self) -> u8 {
+        self.0
     }
 }
 
@@ -51,6 +81,11 @@ pub const CMD53_MAX_BLOCK_COUNT: u16 = 511;
 /// tests). The trait carries `&mut self` so adapters may hold mutable
 /// state such as interrupt pending flags without interior mutability.
 pub trait SdioFunction {
+    /// Original fixed native host plus actual Controller/Card generation.
+    /// Defaults None; metadata/function identity supplies no such receipt.
+    fn source(&self) -> Option<crate::source::Source> {
+        None
+    }
     /// Issue CMD52 — read a single byte from (func, addr).
     fn cmd52_read(&mut self, func: u8, addr: u32) -> Result<u8, SdioError>;
 
@@ -63,6 +98,41 @@ pub trait SdioFunction {
     /// Issue CMD53 in byte mode — write `buf` (≤ 512 bytes).
     fn cmd53_write(&mut self, func: u8, addr: u32, buf: &[u8]) -> Result<(), SdioError>;
 
+    /// Byte-mode CMD53 write whose original fixed kernel scope encloses
+    /// actual COMMAND publication after inhibit/readiness waits. Defaults
+    /// Unsupported; a pre-call bool is no scoped native issue receipt.
+    fn cmd53_write_published(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _buf: &[u8],
+        _scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Actual status-only card interrupt observation, including polling
+    /// hosts. No CPU callback/IRQ route or RF authority is installed.
+    fn observe_publication(&mut self, _functions: u8) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+    /// Clear only the original CARD_INT latch before a fresh physical
+    /// mailbox observation; this alone is never an empty-prefix receipt.
+    fn clear_publication_pending(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+    fn cmd53_block_write_published(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _block_size: u16,
+        _block_count: u16,
+        _buf: &[u8],
+        _scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
     /// Issue CMD53 in block mode — read `block_count` blocks into `buf`.
     fn cmd53_block_read(
         &mut self,
@@ -72,6 +142,25 @@ pub trait SdioFunction {
         block_count: u16,
         buf: &mut [u8],
     ) -> Result<(), SdioError>;
+
+    /// Card supports multi-block CMD53 (CCCR SMB; Linux
+    /// `card->cccr.multi_block`). Default: unknown, byte mode only.
+    fn multi_block(&self) -> bool {
+        false
+    }
+
+    /// Block-mode CMD53 read at a fixed (FIFO) address — Linux
+    /// `sdio_readsb` block part (`incr_addr = 0`). Default `Unsupported`.
+    fn cmd53_block_read_fixed(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _block_size: u16,
+        _block_count: u16,
+        _buf: &mut [u8],
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 
     /// Issue CMD53 in block mode — write `buf` as `block_count` blocks.
     fn cmd53_block_write(
@@ -85,6 +174,22 @@ pub trait SdioFunction {
 
     /// Enable function `func` by setting bit `func` in CCCR IO_ENABLE.
     fn enable_func(&mut self, func: u8) -> Result<(), SdioError>;
+
+    /// Retire one enabled function. Success requires actual CCCR I/O-enable
+    /// clear and I/O-ready clear; the host denies further CMD53 until a new
+    /// explicit enable. Other functions remain unchanged. Unsupported hosts
+    /// cannot manufacture a confirmed-stop receipt from a local flag.
+    fn disable_func(&mut self, _func: u8) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Retire this exclusive card owner's complete interrupt subscription.
+    /// Success requires actual CCCR master/function and host card status/signal
+    /// disable. Even on failure an implementation retires/quarantines its
+    /// original CPU callback/line, without claiming device quiet or DMA stop.
+    fn disable_card_interrupt(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 
     /// Fixed-address FIFO CMD53 read. Legacy adapters fail explicitly rather
     /// than silently incrementing a FIFO address.
@@ -118,6 +223,43 @@ pub trait SdioFunction {
     /// The owner serviced every function interrupt source; re-enable
     /// delivery (Linux's SDIO IRQ thread re-enabling the card interrupt).
     fn rearm_card_interrupt(&mut self) {}
+
+    /// Linux `sdio_get_host_pm_caps`: what this host can honour across a
+    /// system suspend. Adapters without a system-PM path report none.
+    fn host_pm_caps(&mut self) -> PmFlags {
+        PmFlags::NONE
+    }
+
+    /// System suspend of the card's host with the function driver's
+    /// requested `flags` (Linux `sdio_set_host_pm_flags` followed by
+    /// `mmc_sdio_suspend` and the host's suspend). With `KEEP_POWER` the
+    /// card stays powered and selected; without it the card is powered
+    /// off and [`Self::resume_host`] re-enumerates it. Every other access
+    /// is refused until resume.
+    fn suspend_host(&mut self, _flags: PmFlags) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Paired system resume (Linux host resume + `mmc_sdio_resume`).
+    fn resume_host(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Host-side stop of the whole card (Linux `brcmf_sdio_bus_reset`
+    /// before `mmc_hw_reset`): card-interrupt delivery retired, SD clock
+    /// and bus power off, read back. Every function and receipt is lost;
+    /// only [`Self::hw_reset`] brings the card back.
+    fn power_off_host(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Linux `mmc_hw_reset` of a card with a single function driver
+    /// (`mmc_sdio_hw_reset`: `mmc_power_cycle` + `mmc_sdio_reinit_card`).
+    /// Success re-enumerated the same card (function count and identities)
+    /// with every function disabled; failure leaves the card terminal.
+    fn hw_reset(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 }
 
 /// Encode a CMD52 argument for a read and validate fields.

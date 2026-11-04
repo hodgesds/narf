@@ -189,6 +189,25 @@ impl Interrupts {
         })
         .map_err(|_| "Wi-Fi authority revoked")?
     }
+    /// Additional RFH rings share the already retained RX MSI-X slot and
+    /// host vector. This changes neither handler lifetime nor table ownership.
+    pub(super) fn receive_queues(&mut self, count: u8) -> Result<(), &'static str> {
+        if !(1..=16).contains(&count) {
+            return Err("RFH interrupt queue count outside native mask");
+        }
+        super::mmio::invoke(&self.cap, || {
+            let mut state = self.shared.lock();
+            for queue in 1..count {
+                set_ivar(&mut state.mmio, CSR_MSIX_RX_IVAR_AD_REG, queue, 0);
+            }
+            let receive = (1u32 << count) - 1;
+            state
+                .mmio
+                .write(CSR_MSIX_FH_INT_MASK_AD, !(FH_ENABLED | receive));
+            state.mmio.write(CSR_MSIX_AUTOMASK_ST_AD, 3);
+        })
+        .map_err(|_| "Wi-Fi authority revoked")
+    }
     pub fn mask(&mut self) -> bool {
         mask(&mut self.shared.lock().mmio);
         super::mmio::invoke(&self.cap, || {

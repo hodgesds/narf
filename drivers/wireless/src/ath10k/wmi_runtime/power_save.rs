@@ -9,7 +9,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.features & (1 << 17) == 0 && self.data_supported()
     }
     pub(in crate::ath10k) fn submitted_power_save(&self) -> Option<bool> {
-        self.power_save
+        self.station.power_save
     }
     pub(in crate::ath10k) async fn set_station_power_save(
         &mut self,
@@ -22,7 +22,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.station_link().is_none() {
             return Err(Error::Failed);
         }
-        let previous = self.peer.as_ref().ok_or(Error::Failed)?.permission;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
+        let (vdev, previous) = (peer.vdev, peer.permission.clone());
         let validate = || previous.check(&current()?);
         validate()?;
         let mut commands = Vec::new();
@@ -30,10 +31,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if enabled {
             // Source mac.c non-UAPSD setup, then dynamic inactivity threshold.
             for (parameter, value) in [(0, 0), (1, 1), (2, 0), (4, 0), (3, 100)] {
-                commands.push(self.wire.station_ps_parameter(parameter, value)?);
+                commands.push(self.wire.station_ps_parameter(vdev, parameter, value)?);
             }
         }
-        commands.push(self.wire.station_ps_mode(enabled)?);
+        commands.push(self.wire.station_ps_mode(vdev, enabled)?);
         // A cancelled native control publication cannot reopen this owner.
         self.failed = true;
         for command in &commands {
@@ -52,7 +53,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .await?;
         }
         validate()?;
-        self.power_save = Some(enabled); // Submission, not a sleep/air ACK.
+        self.station.power_save = Some(enabled); // Submission, not a sleep/air ACK.
         self.failed = false;
         Ok(())
     }

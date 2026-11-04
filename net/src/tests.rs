@@ -9579,3 +9579,5 @@ kernel_test_in!(
     "net/raw",
     smoke_packet_hardware_timestamp_ingress_and_error_queue
 );
+#[path = "monitor_tests.rs"]
+mod monitor_tests;

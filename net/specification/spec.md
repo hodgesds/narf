@@ -83,8 +83,9 @@ pub fn open(id: IfaceId, rights: IfaceRights, cap: &Cap<IfaceRegistry, Bind>)
 ```
 
 The capability-gated interface registry is the canonical hardware inventory
-for the control plane. Compatibility views include every driver-backed entry,
+for the control plane. Compatibility views include every driver-backed netdev,
 even when an interface has not also joined the legacy kernel IPv4 data path.
+Control-only objects are a separate, explicitly hidden registration class.
 
 The legacy in-kernel IPv4 path also supports unload-safe, context-bearing send
 dispatch for separately compiled drivers:
@@ -127,6 +128,43 @@ unregistered and `None` otherwise. The new generation then registers it. That
 registration restores the retired entry's ifindex, admin state, addresses,
 MTU, namespace and counters, as an in-place same-name re-registration does,
 so the interface keeps its `wlan%d` name and ifindex across generations.
+
+### 3.1a Receive-only monitor link representation
+
+`iface::LinkLayer` defaults to `Ethernet`; `Ieee80211Radiotap` is a separate
+receive-only representation (`ARPHRD_IEEE80211_RADIOTAP = 803` in rtnetlink
+and packet socket metadata). `set_link_layer(name, kind)` requires the caller
+to hold live interface-control authority and accepts a change only while the
+interface is administratively down with no carrier. It invalidates existing
+bound packet hooks. All monitor transmit entry points return an error;
+primary/FIB egress selection excludes monitor devices. Ordinary Ethernet
+registrations and link transitions retain their existing behavior.
+
+A retained native driver calls `begin_monitor_rx(expected_snapshot)` only after its
+sniffer/channel receipts. This returns an opaque `MonitorRxToken` containing
+the original registration, ownership, MAC, ifindex, namespace and unique epoch,
+conditional on current monitor type, administrative UP and the same pre-start
+name/registration/ownership/MAC/ifindex/namespace/packet generation. Its carrier
+publication is atomic with that identity check;
+reused names cannot accept an old native setup or its carrier update. `monitor_rx_current(token)` also requires carrier.
+`on_monitor_frame_from(token, radiotap_and_mpdu)` verifies that current owner
+and bounded version-0 radiotap extent, then delivers only to AF_PACKET. It
+never invokes Ethernet/IP/XDP ingress or station frame-ring publication.
+The native adapter must validate the original frame and metadata before this
+boundary. `end_monitor_rx(token)` retires only that current generation and withdraws
+its carrier. Monitor DOWN, MAC ownership changes and namespace/rebind transitions also withdraw
+carrier before another native owner can start.
+
+Mode changes, monitor DOWN, MAC changes, native capture stop, unregister, driver rebind
+and namespace changes fence capture publication. Bound AF_PACKET hooks must
+be explicitly rebound after ownership/representation retirement; UP alone
+cannot resurrect an old monitor or station binding. A binding records the
+device's packet generation and checks it again at receive, including a bind
+or hook snapshot racing retirement. An unbound namespace-wide raw socket
+retains its explicitly granted namespace-wide capture scope. Packet socket
+creation continues to require the existing raw-socket authority; a monitor
+RX token grants no userspace permission. Driver control and administrative
+open/stop callbacks never execute under the capture publication lock.
 
 ### 3.2 Frame rings
 
@@ -265,6 +303,60 @@ retain registry-only behavior. `try_set_mtu`/`try_set_mac` preserve driver
 errnos; bool wrappers remain available. `AdminError::DeviceError(errno)` carries
 hardware failures through administrative handles to rtnetlink and ioctl
 callers, rather than treating a hardware rejection as a missing interface.
+`set_open_stop_target(snapshot, Arc<dyn OpenStopTarget>)` adds a registration-owned
+callback receiver. Installation compares the original immutable registration;
+re-registration clears both hook forms. `OpenStopEvent` carries the original
+transition and exposes `name`, `up` and a current-registration/namespace/ownership
+epoch observation. `original_snapshot()` clones that sealed original transition
+without a registry lookup, currentness check or grant. A stale event still
+returns its original metadata; the clone cannot follow a replacement and does
+not authorize a native operation. A trusted target captures its original
+concrete driver and uses that driver's actual current device capability; it must not resolve a new
+receiver by name. UP additionally requires the original event generation;
+retired DOWN may clean up only the captured old device. This event is no grant.
+Callbacks run after Registry, IFACES and PUBLISH locks are released. Reentrant
+retirement or reversal fences the later packet-socket UP/DOWN notification.
+`OpenStopEvent::native_identity()` may capture a denial-only weak
+`native_emission::Lifetime` outside native State/provider locks. It succeeds
+only for the event's exact original current UP Ethernet registration,
+namespace, ownership epoch, IFINDEX and MAC, and compares the returned
+registration with that original event. DOWN, stale/rebound and non-Ethernet
+events refuse. The token's fixed `current()` does no virtual query or registry
+lookup: real metadata retirement synchronously closes it before a DOWN,
+rebind, MAC/namespace/representation change callback can run; later UP or
+same-name/index/MAC replacement never revives it. It keeps no provider alive
+and supplies no administrative/device/RF/wake/cleanup permission. Actual
+trusted driver binding and current original capabilities remain independent
+requirements at every native operation. A retired DOWN can still clean up
+only the captured original receiver through its own current device authority.
+
+`OpenStopEvent::observe(expected_snapshot)` observes existing administrative
+state for that exact sealed registration, ownership, name, namespace, IFINDEX,
+MAC, link representation, packet generation and UP state. A mismatch refuses;
+the method neither dispatches a callback nor follows a same-name replacement.
+This lets a newly bound original receiver explicitly capture an actual UP
+state preserved across a driver rebind, without fabricating DOWN/UP transitions.
+The returned observation grants nothing. A driver may feed it to its captured
+target only after installation and after releasing metadata/provider locks;
+all original currentness and native device/RF requirements remain independent.
+Existing hook installation keeps its transition-only callback behavior.
+
+The legacy `fn(name, up)` hook retains its original-device binding precondition;
+a check immediately before that function does not make a fresh name lookup safe
+against concurrent replacement.
+
+`set_link_metadata_for(snapshot, carrier, speed_mbps, duplex)` additionally
+compares the original name, namespace, ifindex and nonzero ownership epoch
+under the same IFACES publication lock. DOWN/UP, namespace-away/back and
+same-name/index rebind cannot revive a stale physical-link observation or let
+it clear a successor's carrier. This snapshot is no device/admin grant: the
+trusted driver separately supplies actual native receipts/current authority.
+No callback or capability invocation runs under this comparison/publication.
+`withdraw_link_metadata_for(snapshot)` is a teardown-only complement: an
+immutable, nonwrapping registration identity permits carrier withdrawal after
+administrative DOWN or namespace changes, but rejects a replacement registration
+even with the same name/index/MAC. It can only clear carrier/speed/duplex and
+provides no packet, administrative or carrier-up authority.
 
 `stack::control_registered(&StackAttach)` validates the registered interface
 handle and daemon identity through `Cap::invoke`, returning an interface-bound
@@ -272,6 +364,88 @@ handle and daemon identity through `Cap::invoke`, returning an interface-bound
 control service alongside the existing IP stack. Its administrative handle
 retains both source grants and becomes unusable when either is revoked;
 creating it does not attach an XDP socket or consume interface frame rings.
+Delegated administration remains bound to the original still-registered typed
+`NetIface` handle and its legacy registration identity, including the explicit
+absence of a legacy entry for a typed-only device. Each `authorize_interface`
+and `check_live` boundary invokes the Admin, source daemon and exact source
+interface grants and rechecks that binding. A live capability dropped from the
+registry cannot freshly authorize a replacement with the same name; neither can
+a same-name/index/MAC legacy rebind renew the old delegation. A fresh delegation
+through the current registered handle captures its own registration. Device
+namespace moves preserve registration while authorization still requires the
+current namespace. Retired binding returns `NoIface`; revoked grants return
+`AuthorityRevoked`. Kernel namespace/name administrative handles retain their
+existing independent scope. Native async drivers still recheck current authority
+and actual device/interface generations at every awaited/publication boundary.
+
+`AdminHandle::set_link`, `set_mtu` and `set_mac` additionally perform their actual
+metadata mutation inside the Admin/source-daemon/source-interface invocations.
+The exact typed registry handle remains selected while IFACES compares the
+original nonzero registration and changes that same entry. Retirement/rebind
+after initial admission therefore cannot retarget these mutations. The outer
+PUBLISH fence precedes Registry/IFACES acquisition; monitor invalidation and
+detached driver/notifier effects occur after the typed Registry lock is released.
+No driver callback runs under any registry/IRQ lock. Kernel namespace/name
+handles retain their existing independent name scope. This mutation fence does
+not yet change namespace transfer, address, route or neighbor table ownership;
+those paths retain their existing operation boundaries and require separate
+generation-aware side-effect work.
+
+`Interface::control_namespace() -> Option<u64>` marks an actual control-only
+object and its immutable namespace for that registration's lifetime. Such an
+object has no frame-ring endpoints, link-up state, legacy IFACES entry or
+fabricated ifindex. `Registry::register_control` performs registration inside
+the actual `Cap<NetIface, Grant>::invoke`, validates the absent data boundary,
+and returns a real typed interface handle. `ControlRegisterError` distinguishes
+revoked authority, a data/noncontrol object and a duplicate name. Kernel
+Ethernet snapshots/sysfs/rtnetlink omit it, and stack-daemon/XDP attachment
+rejects it. Existing ordinary netdev registrations retain their behavior.
+
+Delegated administration of a control-only object invokes the actual Admin,
+daemon and still-registered typed interface grants, verifies absence of any
+same-name legacy entry, and checks the object's actual namespace. A parent
+interface's administrative handle grants no child administration. A fresh child
+grant or existing authenticated namespace authority is required. The existing
+namespace/name kernel handles can authorize that actual registered control
+object in its namespace; discovery supplies no grant. Legacy netdev mutation
+APIs have no IFACES entry to change. Trusted driver cleanup uses
+`Registry::unregister_for_handle` to remove only its original typed registration;
+an old live handle cannot remove a same-name successor or authorize hardware.
+
+`Registry::register_control_child(grant, parent_cap, child)` additionally invokes
+the actual physical parent's typed Write grant, requires its still-registered
+ordinary interface/current namespace and records that exact cap relation.
+`AdminHandle::control_registered_child(child_cap)` performs explicit delegation
+inside the actual parent Admin, creating daemon, parent Write and fresh child
+Write invocations. The child must still carry that registered physical-parent
+relation in the same namespace; names, MACs and observed WDEV ids do not mint
+authority. The returned fresh child Admin grants only that actual child and
+retains the original parent Admin/daemon, both typed registrations and the
+parent's original ownership epoch. Parent/daemon/child revocation, either
+registration's replacement and parent namespace transfer invalidate it; an
+away/back transfer needs a fresh explicit delegation. Registration, namespace
+and ownership epoch compare inside one invoked Registry/IFACES observation.
+Revoking the child's own Admin/Write grant does not revoke its parent.
+Kernel namespace handles validate the actual current typed child/parent
+relation and retain their existing scope, returning None rather than creating
+another daemon grant. `is_control_child` observes only a current
+explicit child delegation; it cannot promote an ordinary handle.
+
+`AdminHandle::retire_control_child(child_cap, namespace)` withdraws only that
+exact control registration, after its driver has completed native teardown.
+The removal runs inside the current original Admin/daemon/parent/child
+invocations and checks the recorded parent registration and ownership epoch.
+Namespace kernel handles preserve their existing scope and invoke the actual
+stored parent/child too. Cached immutable registry identity avoids driver
+callbacks while its spinlock is held; removed interfaces are dropped outside
+that lock. The returned `ControlRetirement::current()` is an observation-only
+terminal-publication receipt: it rechecks the original grants and parent epoch
+plus absence of the original child registration. It exports no capability,
+administrative operation or successor lookup. Normal administration ends at
+withdrawal; a same-name child requires a new explicit grant. Wireless callers
+must additionally retain the exact retired WDEV/object/mode and original
+socket through final ACK publication. Receipt validity alone proves neither
+native retirement nor packet/RF authority.
 
 ### 3.4 Loopback
 
@@ -448,6 +622,99 @@ the netlink core owns generic headers, multipart termination, acknowledgements,
 and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
+
+`build_replies_with_endpoint` additionally accepts the sending socket's
+`DeferredReplySink`; the bridge retains a weak reference to that exact file,
+never resolving a later namespace/port-id occupant. A family's additive
+`register_deferred_context_handler` receives a borrowed `DeferredRequest`.
+After synchronous validation it may `defer` an owned `Send` ACK future and
+return no immediate payloads. Only that successful empty return commits the
+job; errors or mixed immediate replies drop it unpolled. Dumps cannot defer.
+The job produces one actual terminal result, preserving the original request
+and sequence plus CAP_ACK/EXT_ACK/cookie options. Following `netlink_ack`,
+successful ACKs always cap their request echo; CAP_ACK additionally caps
+errors. Retained request bytes are zeroized on retirement/cancellation.
+Queuing never reports a
+successful ACK. Closing the original socket cancels the waiter and suppresses
+its reply; a bound replacement cannot receive it. A sink grants no object
+authority: families retain and invoke their actual current admin handle,
+interface identity and mode generation throughout native work/publication.
+Native autonomous AP emission may capture `AdminHandle::native_emission`
+only for a real current Ethernet netdev while administratively UP. Its
+`AdminEmissionAuthority::current` invokes the original Admin capability and,
+for delegation, the actual StackDaemon and NetIface capabilities, using fixed
+operations without virtual interfaces, Registry/IFACES locks or socket
+callbacks. Unsupported control-child ancestry refuses. Exact typed-registry
+and netdev identity receipts are weak, provider-owned observations, never
+grants. Providers retire old receipts before unregister, rebind, namespace
+move/release, MAC change, representation change or administrative DOWN;
+returning the same namespace/MAC/UP state never revives them. A provider
+`Retirement` closes its fence immediately and notifies watched native cleanup
+owners only after provider/publication locks are released. Each source may
+watch up to64 distinct owners; exhaustion refuses new watches. The additive
+`DeferredReplySink::native_source` defaults to refusal for unknown providers.
+Native owners also re-invoke cap epochs on a bounded timer because generic
+capability revocation supplies no provider wake callback. Such denial must
+retire autonomous emission, not only suppress an ACK. Physical non-emitting
+flush/disable/remove cleanup uses still-current device authority after the
+original administrative/socket guard dies, retaining uncertain DMA until
+actual terminal stop. Full arbitrary authority and delivery callbacks run
+outside native State locks; a cached successful check is never authority.
+`AdminHandle::native_control_emission(child_write_cap, namespace)` captures
+the exact already-registered control child under its original administrative
+grant. The explicit current child capability must match that registration,
+the handle's child scope and its recorded physical-parent capability. A
+delegated capture retains and re-invokes the original child Admin/daemon/Write
+and parent Admin/daemon/Write grants. A namespace kernel handle retains its
+existing Admin and the recorded actual parent/child Write grants; capture
+creates no additional administrative capability. Unsupported or nested
+ancestry refuses. The returned `AdminEmissionAuthority` uses the same fixed
+`current`/`watch` operations and weak exact provider receipts as netdev emission.
+The control object has no IFACES entry, fabricated ifindex or UP bit. Its
+physical parent's actual Ethernet registration, namespace and original
+delegation ownership epoch remain bound, including while that parent is DOWN.
+The ordinary `native_emission` constructor keeps its existing UP/netdev rule.
+
+Control capture serializes its fixed invoked-cap/metadata observation with
+legacy representation publication in `PUBLISH -> Registry -> IFACES` order.
+Creating a same-name legacy entry retires the control registration's prior
+native receipt before publication, and removal cannot revive that receipt.
+Parent/child typed unregister, parent identity replacement, namespace/MAC
+change and DOWN retire the captured observations; wakes run after provider
+locks release. A fresh capture requires the original grants to remain current.
+The native wireless owner separately retains the exact source socket, WDEV,
+role generation, actual START/channel grants and current device/RF policy.
+This net proof supplies no source socket, START receipt, packet or RF authority.
+Source or administrative loss closes emission while physical non-emitting
+cleanup remains owned by the driver's original device authority.
+The additive `DeferredReplySink::retain_control_admin` / `control_admin` methods
+retain only an explicit current control-child Admin on that exact source; default sinks refuse
+retention and return no grant. The real source prunes retired/revoked child
+controls. Namespace, names, port ids and WDEV observations never create them;
+families still prove the actual registered parent-child relation inside the
+authorized creation/delegation operation before retention.
+`defer_checked` additionally retains a family's `DeferredAuthority` through
+the final ACK edge. Revocation stops polling and converts a would-be success
+to `EPERM`, including revocation at the native terminal-result boundary.
+`defer_replies_checked` additionally accepts an owned `DeferredReplyFuture`
+returning terminal `GenlReply` payloads. The core frames these only after native
+completion, using the admitted family/version and original sequence. It rechecks
+the exact sink and retained family authority before each payload and after any
+reentrant delivery before the next payload/final ACK. Revocation suppresses
+remaining payloads and reports `EPERM` to a still-current original socket;
+closing that socket suppresses all further output. This is a unicast response
+path, with no dump/multipart admission and no success response to queued work.
+`DeferredAuthority::delivered()` is an optional terminal publication notice.
+It runs only after all successful replies and the requested successful ACK
+reach the original sink; a successful no-ACK request runs it after its replies.
+Native errors, authority loss, failed delivery, cancellation and drop never
+commit that notice. A family's creation guard may therefore keep its exact
+serialization lease and remove an unpublished metadata child on failure.
+The notice grants no capability and the family still rechecks its own current
+source/registration before committing publication.
+Drivers retain hardware resources until their own terminal cancellation or
+cleanup receipt even if the netlink waiter disappears. Existing synchronous
+handlers and context-only builders retain their existing behavior.
 
 Operation flags carry Linux's permission bits verbatim (`GENL_ADMIN_PERM`
 0x01, `GENL_UNS_ADMIN_PERM` 0x10, reported in `CTRL_ATTR_OP_FLAGS`). After the
@@ -721,6 +988,15 @@ reference counts (`NetIfaceSnapshot::promisc`/`allmulti`) and the device
 address lists. LINUX-GAP: NIC drivers do not reprogram their receive filters
 from those counts (`ndo_set_rx_mode`).
 
+Monitor capture takes a separate `raw_sock::monitor_receive` path from the
+current `MonitorRxToken` publisher. It uses `ETH_P_802_2`, `PACKET_OTHERHOST`,
+`ARPHRD_IEEE80211_RADIOTAP` and network offset zero. Both RAW and DGRAM
+receivers obtain the complete radiotap plus MPDU; no Ethernet source address,
+VLAN or protocol dissection is invented (`sll_halen = 0`). ETH_P_ALL and
+ETH_P_802_2 hooks receive it, with normal socket filters, queue bounds,
+readiness and namespace matching. The ordinary Ethernet tap refuses monitor
+devices. Injection is unsupported.
+
 `cbpf::Program::from_bytes` is `bpf_check_classic` + `check_load_and_stores`
 (`None` = `EINVAL`); `cbpf::run(prog, skb)` interprets the program with the
 semantics of its eBPF translation: 32-bit ALU, shifts masked to 31, division
@@ -843,6 +1119,16 @@ those bytes before the error or EOF.
 Deviation: `iface::for_dst` falls back to the primary interface when no
 route matches, so `ENETUNREACH` is reported only when no interface exists,
 not for every destination without a route.
+
+`NetIfaceEntry::ownership_epoch` and the corresponding snapshot field are
+an additive nonzero identity fence for retained interface controls. A fresh net
+device registration, namespace transfer, actual administrative DOWN or changed
+MAC receives a fresh epoch under the interface lock. No-change operations retain
+it. Zero marks counter exhaustion and consumers must refuse it; epochs never
+wrap or revive an earlier identity. Observing an epoch grants no capability or
+frame admission. Ordinary Ethernet link, carrier, routing and send behavior is
+unchanged. Native asynchronous wireless controls use this fence so a namespace
+away/back or DOWN/UP cycle cannot revive a prior socket/mode operation.
 
 ## 4. Invariants & safety properties
 

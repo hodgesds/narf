@@ -18,6 +18,7 @@ mod retained_backend_tests;
 include!("golden.rs");
 pub(super) struct RadioIo {
     base: Model,
+    expected_own: [u8; 6],
     radio: bool,
     commands: Vec<[u8; 32]>,
     pending: bool,
@@ -59,11 +60,15 @@ pub(super) struct RadioIo {
 }
 impl RadioIo {
     pub(super) fn new() -> Self {
+        Self::for_station([2, 4, 6, 8, 10, 12])
+    }
+    pub(super) fn for_station(own: [u8; 6]) -> Self {
         let mut base = Model::new(0, 3);
         base.regs[0x1208..0x120c].fill(0);
         base.regs[0x80..0x84].fill(0);
         Self {
             base,
+            expected_own: own,
             radio: false,
             commands: Vec::new(),
             pending: false,
@@ -104,7 +109,7 @@ impl RadioIo {
             quiesces: 0,
         }
     }
-    fn reference() -> Self {
+    pub(super) fn reference() -> Self {
         let mut io = Self::new();
         io.radio = true;
         for (i, v) in io.base.regs.iter_mut().enumerate() {
@@ -327,6 +332,9 @@ unsafe impl Io for RadioIo {
         let current = gate.clone();
         self.packets.authority = Some(Arc::new(move || current.current().is_ok()));
         self.packets.originator_ba = true;
+        self.packets.originator_tids = gate.tx_grant().ok_or(Error::State)?.tids();
+        let burst_gate = gate.clone();
+        self.packets.batch_authority = Some(Arc::new(move |p| burst_gate.allows_profile(p)));
         self.gate = Some(gate);
         Ok(())
     }
@@ -394,104 +402,179 @@ unsafe impl Io for RadioIo {
         self.gate = Some(gate);
         Ok(())
     }
+    fn station_bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        if !self.packet_ready() || self.mailbox_pending {
+            return Err(Error::State);
+        }
+        let gate = self.gate.as_ref().ok_or(Error::State)?.with_host(host)?;
+        let current = gate.clone();
+        let policy = self.policy.clone();
+        self.packets.authority = Some(Arc::new(move || {
+            current.current_with_policy_for_test(&policy.lock()).is_ok()
+        }));
+        self.gate = Some(gate);
+        Ok(())
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_ht_program_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            self.station_allowed()?;
+            if self.mailbox_pending {
+                return Ok(false);
+            }
+            let core = self.core.as_ref().ok_or(Error::State)?;
+            core.transmit_quiet(|r| crate::rtw88::packet_core::Port::index(&mut self.packets, r))
+                .map_err(|_| Error::State)
+        }
+    }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         self.base.claim_pristine()
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        if self.finished && !self.packets.live {
-            return Err(Error::Access);
-        }
-        let old = self.base.read8(r)?;
-        if self.radio && r == 0x2d9c {
-            return Ok(
-                if self.stale_iqk || (!self.no_iqk && !self.pending && self.commands.len() == 3) {
-                    0xaa
-                } else {
-                    0
-                },
-            );
-        }
-        Ok(old)
-    }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        if self.finished && !self.packets.live {
-            return Err(Error::Access);
-        }
-        if matches!(r, 0x232 | 0x236 | 0x23a | 0x23e)
-            && self
-                .gate
-                .as_ref()
-                .is_some_and(|g| g.allows_tx_ba() || g.protection_grant().is_some())
-        {
-            if self.packets.controls.fifo_invalid.load(Ordering::Acquire) {
-                return Ok(u16::MAX);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move {
+            if self.finished && !self.packets.live {
+                return Err(Error::Access);
             }
-            if self.packets.controls.fifo_stuck.load(Ordering::Acquire) {
-                return Ok(0);
+            let old = self.base.read8(r).await?;
+            if self.radio && r == 0x2d9c {
+                return Ok(
+                    if self.stale_iqk || (!self.no_iqk && !self.pending && self.commands.len() == 3)
+                    {
+                        0xaa
+                    } else {
+                        0
+                    },
+                );
             }
-            return Ok(64);
+            Ok(old)
         }
-        self.base.read16(r)
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        if self.finished && !self.packets.live {
-            return Err(Error::Access);
-        }
-        let v = self.base.read32(r)?;
-        if !self.radio {
-            return Ok(v);
-        }
-        Ok(match r {
-            0x2dbc if self.bad_samples => 0x100100,
-            0x2dbc => {
-                if self.word(0x1868) == 0x4010 || self.word(0x4168) == 0x4010 {
-                    0x10010
-                } else {
-                    0
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move {
+            if self.finished && !self.packets.live {
+                return Err(Error::Access);
+            }
+            if matches!(r, 0x232 | 0x236 | 0x23a | 0x23e)
+                && self
+                    .gate
+                    .as_ref()
+                    .is_some_and(|g| g.allows_tx_ba() || g.protection_grant().is_some())
+            {
+                if self.packets.controls.fifo_invalid.load(Ordering::Acquire) {
+                    return Ok(u16::MAX);
                 }
+                if self.packets.controls.fifo_stuck.load(Ordering::Acquire) {
+                    return Ok(0);
+                }
+                return Ok(64);
             }
-            0x2808 | 0x2834 | 0x4508 | 0x4534 => 0x7fff80,
-            0x2824 | 0x2850 | 0x4524 | 0x4550 => 128 << 19,
-            0x670 if !self.cam_stuck => v & !(1 << 31),
-            _ => v,
-        })
+            self.base.read16(r).await
+        }
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        if self.finished && !self.packets.live {
-            return Err(Error::Access);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move {
+            if self.finished && !self.packets.live {
+                return Err(Error::Access);
+            }
+            let v = self.base.read32(r).await?;
+            if !self.radio {
+                return Ok(v);
+            }
+            Ok(match r {
+                // Native RX stop receipt is generated by the independent device
+                // model only after RW_RELEASE; a lost write cannot fake idle.
+                0x284 if v & (1 << 18) != 0 && !self.rx_dma_busy => v | (1 << 17),
+                0x2dbc if self.bad_samples => 0x100100,
+                0x2dbc => {
+                    if self.word(0x1868) == 0x4010 || self.word(0x4168) == 0x4010 {
+                        0x10010
+                    } else {
+                        0
+                    }
+                }
+                0x2808 | 0x2834 | 0x4508 | 0x4534 => 0x7fff80,
+                0x2824 | 0x2850 | 0x4524 | 0x4550 => 128 << 19,
+                0x670 if !self.cam_stuck => v & !(1 << 31),
+                _ => v,
+            })
         }
-        self.base.write8(r, v)?;
-        if r == 0x610 {
-            self.port_writes.push(v);
-        }
-        if self.radio && r == 0x3d9 && !self.awake_stuck {
-            self.base.regs[0x3da] ^= 0x80;
-        }
-        Ok(())
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        if self.finished && !self.packets.live {
-            return Err(Error::Access);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.finished && !self.packets.live {
+                return Err(Error::Access);
+            }
+            if self.finished && r == 0x522 {
+                // The cold MAC model requires TXPAUSE throughout calibration.
+                // This retained packet owner has since started the native rings.
+                self.base.trace.push((1, 8, r, u32::from(v)));
+                if self.lost != Some(r) {
+                    self.base.regs[usize::from(r)] = v;
+                }
+                return Ok(());
+            }
+            self.base.write8(r, v).await?;
+            if r == 0x610 {
+                self.port_writes.push(v);
+            }
+            if self.radio && r == 0x3d9 && !self.awake_stuck {
+                self.base.regs[0x3da] ^= 0x80;
+            }
+            Ok(())
         }
-        self.base.write16(r, v)
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        if self.finished && matches!(r, 0x500 | 0x504 | 0x508 | 0x50c) {
-            self.edca_writes.fetch_add(1, Ordering::AcqRel);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.finished && !self.packets.live {
+                return Err(Error::Access);
+            }
+            self.base.write16(r, v).await
         }
-        if self.finished && !self.packets.live {
-            return Err(Error::Access);
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.finished && matches!(r, 0x500 | 0x504 | 0x508 | 0x50c) {
+                self.edca_writes.fetch_add(1, Ordering::AcqRel);
+            }
+            if self.finished && !self.packets.live {
+                return Err(Error::Access);
+            }
+            let old = self.word(usize::from(r));
+            self.base.write32(r, v).await?;
+            if self.lost == Some(r) {
+                self.base.regs[usize::from(r)..usize::from(r) + 4]
+                    .copy_from_slice(&old.to_le_bytes());
+            }
+            if r == 0x1808 || r == 0x4108 {
+                let target = if r == 0x1808 { 0x3c00 } else { 0x4c00 };
+                self.base.regs[target..target + 4].copy_from_slice(&(v & 0xfffff).to_le_bytes());
+            }
+            Ok(())
         }
-        let old = self.word(usize::from(r));
-        self.base.write32(r, v)?;
-        if self.lost == Some(r) {
-            self.base.regs[usize::from(r)..usize::from(r) + 4].copy_from_slice(&old.to_le_bytes());
-        }
-        if r == 0x1808 || r == 0x4108 {
-            let target = if r == 0x1808 { 0x3c00 } else { 0x4c00 };
-            self.base.regs[target..target + 4].copy_from_slice(&(v & 0xfffff).to_le_bytes());
-        }
-        Ok(())
     }
     async fn reserved_page(&mut self, b: &[u8]) -> Result<(), Error> {
         self.base.reserved_page(b).await
@@ -526,28 +609,37 @@ unsafe impl Io for RadioIo {
         self.base.regs[0x100] = 0x33;
         Ok(())
     }
-    fn submit_h2c(&mut self, p: &[u8; 32]) -> Result<(), Error> {
-        if self.pending {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        p: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if self.pending {
+                return Err(Error::State);
+            }
+            self.commands.push(*p);
+            self.pending = true;
+            self.polls = 0;
+            Ok(())
         }
-        self.commands.push(*p);
-        self.pending = true;
-        self.polls = 0;
-        Ok(())
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
-        if !self.pending {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.pending {
+                return Err(Error::State);
+            }
+            self.polls += 1;
+            if self.hold_dma || self.polls == 1 {
+                return Ok(false);
+            }
+            self.pending = false;
+            Ok(true)
         }
-        self.polls += 1;
-        if self.hold_dma || self.polls == 1 {
-            return Ok(false);
-        }
-        self.pending = false;
-        Ok(true)
     }
     fn finish_radio(&mut self, gate: crate::rtw88::power_policy::Gate) -> Result<(), Error> {
-        if self.pending || self.commands.len() != 3 || gate.own() != [2, 4, 6, 8, 10, 12] {
+        if self.pending || self.commands.len() != 3 || gate.own() != self.expected_own {
             return Err(Error::State);
         }
         self.base.regs[0x100] = 0x30;
@@ -596,21 +688,31 @@ unsafe impl Io for RadioIo {
             .configure_data(p)
             .map_err(|_| Error::State)
     }
-    fn station_profile_readback(&mut self) -> Result<(), Error> {
-        self.station_allowed()?;
-        if let Some(g) = self
-            .gate
-            .as_ref()
-            .and_then(crate::rtw88::power_policy::Gate::ht_grant)
-        {
-            return g.readback(|r| self.read32(r));
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_profile_readback(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.station_allowed()?;
+            if let Some(g) = self
+                .gate
+                .as_ref()
+                .and_then(crate::rtw88::power_policy::Gate::ht_grant)
+            {
+                return crate::rtw88::firmware_transport::ready_now(
+                    g.readback(crate::rtw88::firmware_transport::IoRead32(self)),
+                );
+            }
+            let gains = self
+                .gate
+                .as_ref()
+                .and_then(crate::rtw88::power_policy::Gate::cck_gains)
+                .ok_or(Error::State)?;
+            crate::rtw88::firmware_transport::ready_now(crate::rtw88::wmm::readback(
+                crate::rtw88::firmware_transport::IoRead32(self),
+                gains,
+            ))
         }
-        let gains = self
-            .gate
-            .as_ref()
-            .and_then(crate::rtw88::power_policy::Gate::cck_gains)
-            .ok_or(Error::State)?;
-        crate::rtw88::wmm::readback(|r| self.read32(r), gains)
     }
     fn station_allowed(&mut self) -> Result<(), Error> {
         if !self.finished || !self.packets.live || !self.packets.allowed {
@@ -630,33 +732,47 @@ unsafe impl Io for RadioIo {
         )
         .before_invoke(self.before_publication.clone()))
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        if !self.packets.live {
-            return Err(Error::Access);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.packets.live {
+                return Err(Error::Access);
+            }
+            Ok(!self.mailbox_pending && !self.mailbox_ready_hold.load(Ordering::Acquire))
         }
-        Ok(!self.mailbox_pending && !self.mailbox_ready_hold.load(Ordering::Acquire))
     }
-    fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
-        if !self.mailbox_ready()? {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if !self.mailbox_ready().await? {
+                return Err(Error::State);
+            }
+            self.mailbox_pending = true;
+            self.mailboxes.push(words);
+            Ok(())
         }
-        self.mailbox_pending = true;
-        self.mailboxes.push(words);
-        Ok(())
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        if !self.packets.live {
-            return Err(Error::Access);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.packets.live {
+                return Err(Error::Access);
+            }
+            if !self.mailbox_pending {
+                return Err(Error::State);
+            }
+            if self.mailbox_done_hold.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            self.mailbox_pending = false;
+            self.mailbox_cursor = (self.mailbox_cursor + 1) % 4;
+            Ok(true)
         }
-        if !self.mailbox_pending {
-            return Err(Error::State);
-        }
-        if self.mailbox_done_hold.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        self.mailbox_pending = false;
-        self.mailbox_cursor = (self.mailbox_cursor + 1) % 4;
-        Ok(true)
     }
     fn mailbox_pending(&self) -> bool {
         self.mailbox_pending
@@ -688,7 +804,10 @@ unsafe impl Io for RadioIo {
         Ok(())
     }
     fn packet_start(&mut self) -> Result<(), crate::rtw88::packet_core::Error> {
-        self.packet_with(|core, port| core.start(port))
+        self.packet_with(|core, port| core.start(port))?;
+        self.base.regs[0x522] = 0;
+        self.base.regs[0x284..0x288].fill(0);
+        Ok(())
     }
     fn packet_ready(&self) -> bool {
         self.packets.active
@@ -800,7 +919,7 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_frozen_references() ->
     let trims = core::array::from_fn(|i| 0x21u8.wrapping_add(i as u8 * 7));
     let factory = Factory::for_test_with_trims(raw, trims).unwrap();
     let result = narf_scheduler::block_on(async {
-        radio::trx(&mut io)?;
+        crate::rtw88::firmware_transport::now(radio::trx(&mut io))?;
         radio::channel(&mut io).await?;
         radio::trims(&mut io, &factory).await
     });
@@ -812,7 +931,7 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_frozen_references() ->
         return TestResult::Fail("TRX/channel/OTP diverged from the frozen reference");
     }
     let mut io = RadioIo::reference();
-    if radio::gains(&mut io, [36, 32]).is_err() {
+    if crate::rtw88::firmware_transport::now(radio::gains(&mut io, [36, 32])).is_err() {
         return TestResult::Fail("source response gain plan rejected");
     }
     let trace: Vec<_> = io.base.trace.iter().copied().filter(|v| v.0 != 0).collect();
@@ -820,7 +939,7 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_frozen_references() ->
         return TestResult::Fail("native response gain/RRSR plan diverged from source callbacks");
     }
     let mut io = RadioIo::reference();
-    if radio::receive_policy(&mut io).is_err() {
+    if crate::rtw88::firmware_transport::now(radio::receive_policy(&mut io)).is_err() {
         return TestResult::Fail("source fixed EDCCA rejected");
     }
     let trace: Vec<_> = io.base.trace.iter().copied().filter(|v| v.0 != 0).collect();

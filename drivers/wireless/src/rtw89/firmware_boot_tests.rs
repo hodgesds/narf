@@ -92,6 +92,7 @@ struct Model {
     pending_delay: Option<usize>,
     delays: usize,
     gone: bool,
+    swappable: bool,
 }
 impl Model {
     fn new(chip: ChipId, seed: u8) -> Self {
@@ -113,6 +114,7 @@ impl Model {
             pending_delay: None,
             delays: 0,
             gone: false,
+            swappable: false,
         }
     }
     fn access(&mut self) -> Result<(), power::Error> {
@@ -207,6 +209,9 @@ impl Transport for Model {
     }
     fn prepared(&self) -> bool {
         self.ready
+    }
+    fn swappable(&self) -> bool {
+        self.swappable
     }
     fn registers(&mut self) -> &mut Self {
         self
@@ -428,4 +433,59 @@ fn smoke_rtw89_wcpu_cancelled_wait_and_uncertain_publish_stay_closed() -> TestRe
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_wcpu_cancelled_wait_and_uncertain_publish_stay_closed
+);
+
+/// `rtw89_wow_swap_fw` re-download: only a running owner whose transport
+/// declares the halted/drained swap window; the replacement image travels
+/// the same header+section path, and a failed swap is terminal.
+fn smoke_rtw89_wcpu_wow_swap_requires_swappable_running_owner() -> TestResult {
+    for case in CASES {
+        let mut owner =
+            Firmware::new(Model::new(case.chip, case.seed), plan(case.chip, false)).unwrap();
+        if once(owner.swap(plan(case.chip, case.secure))).map(|r| r.is_err()) != Some(true)
+            || owner.phase() != Phase::Prepared
+        {
+            return TestResult::Fail("swap accepted before the first boot");
+        }
+        if once(owner.start()) != Some(Ok(())) {
+            return TestResult::Fail("initial boot");
+        }
+        let operations = owner.transport.operations;
+        if once(owner.swap(plan(case.chip, case.secure))).map(|r| r.err())
+            != Some(Some(Error::Terminal))
+            || owner.transport.operations != operations
+            || owner.phase() != Phase::Running
+        {
+            return TestResult::Fail("swap outside the swap window touched hardware");
+        }
+        owner.transport.swappable = true;
+        owner.transport.sent.clear();
+        let replacement = plan(case.chip, case.secure);
+        let mut expected = vec![(Kind::Header, replacement.header_command(0).unwrap())];
+        for section in 0..replacement.section_count() {
+            for offset in (0..replacement.section_len(section).unwrap()).step_by(2020) {
+                expected.push((Kind::Section, replacement.chunk(section, offset).unwrap()));
+            }
+        }
+        match once(owner.swap(replacement)) {
+            Some(Ok(old)) if !old.secure_enabled() => {}
+            _ => return TestResult::Fail("swap did not return the replaced plan"),
+        }
+        if owner.phase() != Phase::Running || owner.transport.sent != expected {
+            return TestResult::Fail("swap image transfers differ from a fresh download");
+        }
+        owner.transport.fail_send = Some(owner.transport.sent.len());
+        if once(owner.swap(plan(case.chip, false))).map(|r| r.is_err()) != Some(true)
+            || owner.phase() != Phase::Terminal
+            || once(owner.swap(plan(case.chip, false))).map(|r| r.err())
+                != Some(Some(Error::Terminal))
+        {
+            return TestResult::Fail("failed swap left the owner reusable");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_wcpu_wow_swap_requires_swappable_running_owner
 );

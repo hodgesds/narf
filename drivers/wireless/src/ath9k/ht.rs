@@ -41,14 +41,24 @@ impl Facts {
             || id.tx_chainmask != 1
             || id.rx_chainmask != 1
             || !id.ht20(image)
-            || base.reference_frequency != 2412
-            || report.frequency_mhz != 2412
+            || base.geometry.is_wide()
+            || base.reference_frequency != report.frequency_mhz
+            || !(2412..=2472).contains(&report.frequency_mhz)
+            || (report.frequency_mhz - 2412) % 5 != 0
         {
             return Err(BringUpError::BadIdentity);
         }
-        let powers = phy::rates::checked_plan(image, report.max_power_half_dbm)?.registers;
+        let powers =
+            phy::rates::checked_plan_at(image, report.frequency_mhz, report.max_power_half_dbm)?
+                .registers;
         let mut h = narf_crypto::sha256::Sha256::new();
-        h.update(b"NARF AR9285 N85H measured static HT20 LGI one-chain v1");
+        if report.frequency_mhz == 2412 {
+            h.update(b"NARF AR9285 N85H measured static HT20 LGI one-chain v1");
+        } else {
+            h.update(b"NARF AR9285 N85H measured exact-channel static HT20 LGI one-chain v2");
+            h.update(&report.frequency_mhz.to_le_bytes());
+            h.update(b"actual full reset/INI/channel synth slope spur/detector/CTL/current-host-calibration report and exact rate array; no channel1 calibration receipt reused; fresh packet/capture/key/BA generation for each cold retune");
+        }
         h.update(b"AR9285 rev2 source RX STBC1 only; exact advertised local HT RX_STBC1 and actual AP TX_STBC offer/response bind per-MPDU native AR_STBC; chain1 TX STBC stays zero; no SGI20");
         h.update(b"native HT/ERP protection: exact offer+response and later current AP beacon, sticky RTS/CTS required, negotiated CCK basic long preamble, ctl0 RTS bit22 and first series RTSCTSQual bit15 with native packet duration, no simultaneous CTS-only; current native ownership unchanged");
         h.update(b"independent Open/secured QoS TID sequence spaces across key replies; legacy management sequence is separate; current receive authorization independent of ordinary TX credit");
@@ -85,10 +95,23 @@ impl Facts {
         let request = Request {
             identity: h.finalize(),
             mac: id.mac,
-            filename: format!(
-                "ath9k/ar9285-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                id.mac[0], id.mac[1], id.mac[2], id.mac[3], id.mac[4], id.mac[5]
-            ),
+            filename: if report.frequency_mhz == 2412 {
+                format!(
+                    "ath9k/ar9285-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    id.mac[0], id.mac[1], id.mac[2], id.mac[3], id.mac[4], id.mac[5]
+                )
+            } else {
+                format!(
+                    "ath9k/ar9285-ht20-v2-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    (report.frequency_mhz - 2407) / 5,
+                    id.mac[0],
+                    id.mac[1],
+                    id.mac[2],
+                    id.mac[3],
+                    id.mac[4],
+                    id.mac[5]
+                )
+            },
         };
         Ok(Self {
             request,
@@ -122,6 +145,10 @@ pub(super) struct Grant {
     ceiling: i16,
     mcs: u8,
     digest: [u8; 32],
+    wide: Option<(
+        Arc<super::ht40::Grant>,
+        super::calibration::wide::WideReport,
+    )>,
 }
 pub(super) enum Source {
     Registered,
@@ -170,12 +197,26 @@ impl Grant {
         cap.invoke(NoopOp).map_err(|_| Error::Access)?;
         if signer.is_none()
             || b.len() != 160
-            || b[..8] != [b'N', b'8', b'5', b'H', 1, 0, 160, 0]
+            || b[..8]
+                != [
+                    b'N',
+                    b'8',
+                    b'5',
+                    b'H',
+                    if facts.report.frequency_mhz == 2412 {
+                        1
+                    } else {
+                        2
+                    },
+                    0,
+                    160,
+                    0,
+                ]
             || b[8..12] != 160u32.to_le_bytes()
             || b[12..16] != [0x8c, 0x16, 0x2b, 0]
             || b[16..48] != facts.request.identity
             || b[48..54] != facts.request.mac
-            || b[54..58] != [1, 20, 1, 0]
+            || b[54..58] != [((facts.report.frequency_mhz - 2407) / 5) as u8, 20, 1, 0]
             || b[62] == 0
             || b[63] != 0
             || b[106..] != [0; 54]
@@ -184,6 +225,7 @@ impl Grant {
         }
         let signed = |at| i16::from_le_bytes([b[at], b[at + 1]]);
         let g = Self {
+            wide: None,
             digest: {
                 let mut hash = narf_crypto::sha256::Sha256::new();
                 hash.update(b);
@@ -210,19 +252,37 @@ impl Grant {
         &self,
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
+        if let Some((grant, _)) = &self.wide {
+            return grant.invoke(operation);
+        }
+        self.invoke_twenty(operation)
+    }
+    /// Current nominal H1/2 authority only. A wide grant nests this exact
+    /// base before its own full-span checks; redispatching through invoke
+    /// here would recursively instantiate ever-growing closure types.
+    pub(super) fn invoke_twenty<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.wide.is_some() {
+            return Err(Error::State);
+        }
         struct Live<'a, F>(&'a Grant, F);
         impl<T, F: FnOnce() -> Result<T, Error>> CapOp<FirmwareBlob, Read> for Live<'_, F> {
             type Output = Result<T, Error>;
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
                     let d = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
-                    let p = Permission::from_domain(&d).map_err(|_| Error::Access)?;
+                    let p = Permission::from_domain_at(&d, self.0.facts.report.frequency_mhz)
+                        .map_err(|_| Error::Access)?;
                     if !p.allows_report(self.0.facts.report) {
                         return Err(Error::Access);
                     }
                     let mut ceiling = self.0.ceiling;
                     for r in &d.rules {
-                        if r.freq_start_mhz < 2422 && r.freq_end_mhz > 2402 {
+                        if r.freq_start_mhz < u32::from(self.0.facts.report.frequency_mhz) + 10
+                            && r.freq_end_mhz > u32::from(self.0.facts.report.frequency_mhz) - 10
+                        {
                             ceiling = ceiling.min(i16::from(r.max_power_dbm) * 2);
                         }
                     }
@@ -246,12 +306,77 @@ impl Grant {
         self.invoke(|| Ok(()))
     }
     pub(super) fn local(&self) -> LocalPhy {
-        local(self.mcs).expect("validated HT mask").0
+        self.wide.as_ref().map_or_else(
+            || local(self.mcs).expect("validated HT mask").0,
+            |(grant, _)| grant.local(),
+        )
+    }
+    pub(super) fn from_wide(
+        grant: Arc<super::ht40::Grant>,
+        actual: super::calibration::wide::WideReport,
+    ) -> Result<Arc<Self>, Error> {
+        grant.accept(actual)?;
+        let base = grant.base();
+        let (antenna, ceiling) = grant.ba_limit();
+        Ok(Arc::new(Self {
+            facts: base.facts.clone(),
+            cap: base.cap,
+            peaks: base.peaks,
+            antenna,
+            ceiling,
+            mcs: grant.mcs(),
+            digest: grant.ba_identity().1,
+            wide: Some((grant, actual)),
+        }))
+    }
+    pub(super) fn geometry(&self) -> super::channel_width::Geometry {
+        self.wide.as_ref().map_or_else(
+            || {
+                super::channel_width::Geometry::from_frequency(self.frequency())
+                    .expect("validated primary")
+            },
+            |(_, actual)| actual.geometry,
+        )
+    }
+    pub(super) fn child_geometry(&self, program: u8) -> [u8; 4] {
+        if self.wide.is_some() {
+            self.geometry().body()
+        } else {
+            [self.channel(), 20, 1, program]
+        }
     }
     pub(super) fn mcs(&self) -> u8 {
         self.mcs
     }
+    pub(super) fn frequency(&self) -> u16 {
+        self.facts.report.frequency_mhz
+    }
+    pub(super) fn channel(&self) -> u8 {
+        ((self.frequency() - 2407) / 5) as u8
+    }
+    pub(super) fn version(&self) -> u8 {
+        if self.wide.is_some() {
+            return 3;
+        }
+        if self.frequency() == 2412 {
+            1
+        } else {
+            2
+        }
+    }
+    pub(super) fn span(&self) -> (u32, u32) {
+        if let Some((grant, _)) = &self.wide {
+            return grant.geometry().span();
+        }
+        (
+            u32::from(self.frequency()) - 10,
+            u32::from(self.frequency()) + 10,
+        )
+    }
     pub(super) fn ba_identity(&self) -> ([u8; 32], [u8; 32], [u8; 6]) {
+        if let Some((grant, _)) = &self.wide {
+            return grant.ba_identity();
+        }
         (
             self.facts.request.identity,
             self.digest,
@@ -261,7 +386,62 @@ impl Grant {
     pub(super) fn ba_limit(&self) -> (i16, i16) {
         (self.antenna, self.ceiling)
     }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn initial_calibration(&self) -> super::calibration::Report {
+        self.wide
+            .as_ref()
+            .map_or(self.facts.report, |(_, actual)| actual.report)
+    }
+    /// Non-calibration physical invariants of the same admitted H program.
+    /// Caller retains current P/base/PCI around these raw actual reads; only
+    /// dynamic IQ/ADC/PA/NF/ANI are replaced by the independent live receipt.
+    pub(super) fn periodic_physical(
+        &self,
+        mut read: impl FnMut(u64) -> Result<u32, Error>,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let geometry = self.geometry();
+        if read(0x9874)? & 0x3fff_ffff
+            != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
+            || read(0x9804)? & 0x7ff != geometry.turbo()
+        {
+            return Err(Error::Descriptor);
+        }
+        if let Some((_, actual)) = &self.wide {
+            for (register, value) in actual.powers.registers {
+                if read(register)? != value {
+                    return Err(Error::Descriptor);
+                }
+            }
+            if read(0x8318)? != 1 {
+                return Err(Error::Descriptor);
+            }
+        } else {
+            for (register, value) in self.facts.powers {
+                if read(register)? != value {
+                    return Err(Error::Descriptor);
+                }
+            }
+        }
+        for (register, mask, value) in [
+            (0x99a4, u32::MAX, 1),
+            (0xa39c, u32::MAX, 1),
+            (0x832c, u32::MAX, 1),
+            (0xa200, u32::MAX, 4),
+            (0x24, 1, 0),
+            (0x8114, u32::MAX, 0x200),
+            (0x8340, u32::MAX, 0x380),
+        ] {
+            if read(register)? & mask != value {
+                return Err(Error::Descriptor);
+            }
+        }
+        Ok(())
+    }
     pub(super) fn readback(&self, io: &impl Port) -> Result<(), Error> {
+        if let Some((grant, actual)) = &self.wide {
+            return grant.readback(io, *actual);
+        }
         self.check()?;
         for (r, v) in self.facts.powers {
             if io.read(r)? != v {
@@ -274,13 +454,18 @@ impl Grant {
             (0xa39c, u32::MAX, 1),
             (0x832c, u32::MAX, 1),
             (0xa200, u32::MAX, 4),
-            (0x24, 1, 0),
             (0x8114, u32::MAX, 0x200),
             (0x8340, u32::MAX, 0x380),
         ] {
             if io.read(r)? & mask != v {
                 return Err(Error::Descriptor);
             }
+        }
+        // AR_IER is0x24 (RXCFG is0x34). The distinct actually bound
+        // S1 program owns interrupt kill/resume; a mere optional asset or
+        // desired policy cannot relax the original static HT IER0 contract.
+        if !io.station_ps_current()? && io.read(0x24)? & 1 != 0 {
+            return Err(Error::Descriptor);
         }
         for entry in 0..128u64 {
             if io.read(0x8800 + entry * 32 + 28)? & 0x8000 != 0 {
@@ -296,6 +481,10 @@ pub(super) struct Profile {
     be: narf_wireless::wmm::Ac,
     rx_stbc: bool,
     rts: bool,
+    geometry: super::channel_width::Geometry,
+    allow_twenty_secondary: bool,
+    tx_sgi40: bool,
+    rx_sgi40: bool,
 }
 impl Profile {
     pub(super) fn mcs(self) -> u8 {
@@ -310,14 +499,40 @@ impl Profile {
     pub(super) fn rts(self) -> bool {
         self.rts
     }
+    pub(super) fn geometry(self) -> super::channel_width::Geometry {
+        self.geometry
+    }
+    pub(super) fn tx_sgi40(self) -> bool {
+        self.tx_sgi40
+    }
+    pub(super) fn duration(self, air: usize, mcs: u8) -> Option<u32> {
+        self.geometry.ht_duration(self.tx_sgi40, air, mcs)
+    }
+    pub(super) fn accepts_rx(self, rate: usize, flags: u32) -> bool {
+        let wide = flags & 2 != 0;
+        let short = flags & 1 != 0;
+        flags & 4 == 0
+            && (!wide || self.geometry.is_wide())
+            && (!short || wide && self.rx_sgi40)
+            && (rate >= 12 || !wide && !short)
+    }
     pub(super) fn observe(
         mut self,
         offer: &Offer,
         ies: &[u8],
         basic: usize,
     ) -> Result<Self, Error> {
-        if offer.width() != Width::Twenty
-            || offer.ht().operation().secondary().is_some()
+        if offer.width()
+            != if self.geometry.is_wide() {
+                Width::Forty
+            } else {
+                Width::Twenty
+            }
+            || self.geometry.is_wide()
+                && offer.ht().operation().secondary() != self.geometry.secondary()
+            || !self.geometry.is_wide()
+                && !self.allow_twenty_secondary
+                && offer.ht().operation().secondary().is_some()
             || contention(ies)? != self.be
             || self.mcs & !offer.ht().tx_mcs()[0] != 0
         {
@@ -328,6 +543,7 @@ impl Profile {
             return Err(Error::Packet);
         }
         self.rx_stbc &= offer.ht().peer_capability() & 0x80 != 0;
+        self.tx_sgi40 &= offer.ht().tx_sgi40();
         Ok(self)
     }
 }
@@ -337,9 +553,19 @@ pub(super) fn response(
     offer_ies: &[u8],
     ies: &[u8],
     basic: usize,
+    geometry: super::channel_width::Geometry,
+    allow_twenty_secondary: bool,
 ) -> Result<Profile, Error> {
-    if n.width() != Width::Twenty
-        || n.ht().operation().secondary().is_some()
+    if n.width()
+        != if geometry.is_wide() {
+            Width::Forty
+        } else {
+            Width::Twenty
+        }
+        || geometry.is_wide() && n.ht().operation().secondary() != geometry.secondary()
+        || !geometry.is_wide()
+            && !allow_twenty_secondary
+            && n.ht().operation().secondary().is_some()
         || n.ht().tx_sgi20()
         || n.ht().rx_sgi20()
     {
@@ -360,6 +586,10 @@ pub(super) fn response(
         return Err(Error::Packet);
     }
     Ok(Profile {
+        geometry,
+        allow_twenty_secondary,
+        tx_sgi40: geometry.is_wide() && n.ht().tx_sgi40(),
+        rx_sgi40: geometry.is_wide() && n.ht().rx_sgi40(),
         mcs: tx[0],
         be,
         rx_stbc: n.ht().rx_stbc()

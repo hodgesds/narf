@@ -36,6 +36,8 @@ pub(in crate::rtw89) struct Submission {
     pub(in crate::rtw89) channel: u8,
     pub(in crate::rtw89) qsel: u8,
     pub(in crate::rtw89) mac_id: u8,
+    pub(in crate::rtw89) host_sequence: u16,
+    pub(in crate::rtw89) hardware_sequence: bool,
     body: u64,
     length: usize,
     next: u16,
@@ -65,7 +67,10 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) authority: Cap<BusDeviceCap, Write>,
     inside: bool,
     pub(in crate::rtw89) allowed: bool,
+    pub(in crate::rtw89) amsdu: Option<usize>,
+    pub(in crate::rtw89) revoke_amsdu_on_allocate: bool,
     peer_live: bool,
+    fragment: Option<crate::rtw89::command_native::FragmentPart>,
     pub(in crate::rtw89) peer: Option<crate::rtw89::station_control::Peer>,
     deny_after_allocation: Option<bool>,
     pub(in crate::rtw89) now: u64,
@@ -81,8 +86,13 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) release: bool,
     ignore: bool,
     pub(in crate::rtw89) controls: Arc<Controls>,
+    /// Reported `Port::chip` (RTL8852B unless a C case sets it).
+    pub(in crate::rtw89) chip: ChipId,
 }
 impl Model {
+    pub(in crate::rtw89) fn pending_receive(&self) -> bool {
+        !self.incoming.is_empty() || !self.controls.incoming.lock().is_empty()
+    }
     pub(in crate::rtw89) fn new() -> Self {
         let (index, generation) = object_table::register(CapKind::BusDevice);
         // SAFETY: private fresh fixture object has exact BusDevice/Write type.
@@ -103,7 +113,10 @@ impl Model {
             authority,
             inside: false,
             allowed: true,
+            amsdu: None,
+            revoke_amsdu_on_allocate: false,
             peer_live: true,
+            fragment: None,
             peer: None,
             deny_after_allocation: None,
             now: 0,
@@ -114,6 +127,7 @@ impl Model {
             last: None,
             history: Vec::new(),
             reaction: None,
+            chip: ChipId::Rtl8852B,
 
             consume: false,
             release: false,
@@ -183,6 +197,11 @@ impl Model {
     }
     pub(in crate::rtw89) fn inject(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.inject_rate(bytes, 0)
+    }
+    pub(in crate::rtw89) fn inject_c2h(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let event = rx_packet::C2h::parse(bytes.to_vec()).map_err(|_| Error::Packet)?;
+        self.incoming.push_back(rx_packet::Event::Firmware(event));
+        Ok(())
     }
     /// Inject with an RXWD DWORD1 rate (e.g. `0x80` = HT MCS0).
     pub(in crate::rtw89) fn inject_rate(&mut self, bytes: &[u8], rate: u16) -> Result<(), Error> {
@@ -286,11 +305,22 @@ impl Model {
             return Err(Error::Packet);
         }
         let body = self.bytes(body_dma, packet_len)?;
+        if let Some(part) = &self.fragment {
+            if part.model_issued_current().is_err() || part.bytes() != body {
+                return Err(Error::Access);
+            }
+        }
+        let a_ctrl = body[1] & 0x80 != 0;
+        let previous_a_ctrl = self
+            .transmitted
+            .last()
+            .is_some_and(|frame| frame[1] & 0x80 != 0);
         // Decode independently from the descriptor: the raw QoS data header
         // contributes its two actual control bytes to ieee80211_hdrlen/2.
         let header_words = if body[0] & 0xfc == 0x88 {
             // Independent decode of the QoS TID -> AC -> ACH mapping.
-            let tid = body.get(24).copied().ok_or(Error::Packet)?;
+            let qc = body.get(24).copied().ok_or(Error::Packet)?;
+            let tid = qc & 15;
             let expected = match tid {
                 0 | 3 => format::Queue::Data,
                 1 | 2 => format::Queue::Background,
@@ -300,11 +330,19 @@ impl Model {
             };
             if kind != expected
                 || body.get(25) != Some(&0)
+                || qc & if self.amsdu.is_some() { 0x68 } else { 0xe8 } != 0
+                || qc & 0x80 != 0 && (a_ctrl || body[16..22] != body[4..10])
+                || (qc & 0x10 != 0) != a_ctrl
+                || a_ctrl && body.get(26..30) != Some(&[0x1b, 0, 0, 0])
                 || (word(8) >> 23 & 1 == 1) != matches!(tid, 2 | 3 | 5 | 7)
             {
                 return Err(Error::Packet);
             }
-            13
+            if a_ctrl {
+                15
+            } else {
+                13
+            }
         } else {
             12
         };
@@ -312,7 +350,7 @@ impl Model {
             | u32::from(kind.channel()) << 16
             | header_words << 11
             | 1 << 7
-            | if kind == format::Queue::Management {
+            | if kind == format::Queue::Management && self.fragment.is_none() {
                 5
             } else {
                 0
@@ -331,11 +369,13 @@ impl Model {
                 && word(28) == 0
                 || kind != format::Queue::Management
                     && word(24) & !(1 << 15) == 0
-                    && word(28) & !(0x1ff << 16 | 0xff) == 0
+                    && word(28) & !(0x1ff << 16 | 0xff | 1 << 14) == 0
                     && (word(28) >> 16) & 0x1ff <= 11)
             || kind == format::Queue::Management && word(24) & (0x1ff << 16) != 0
             // A-MPDU fields only together on firmware-RA QoS DATA.
-            || word(12) & !(0xfff | 1 << 12) != 0
+            || word(12) & !(0xfff | 1 << 12 | 1 << 13) != 0
+            || (word(12) & (1 << 13) != 0) != (a_ctrl != previous_a_ctrl)
+            || (word(28) & (1 << 14) != 0) != a_ctrl
             || !(word(12) & 1 << 12 == 0 && word(28) & 0xff == 0 && word(32) == 0
                 || word(12) & 1 << 12 != 0
                     && body[0] == 0x88
@@ -368,6 +408,8 @@ impl Model {
             channel: kind.channel(),
             qsel: kind.qsel(),
             mac_id: (word(8) >> 24) as u8,
+            host_sequence: (word(12) & 0xfff) as u16,
+            hardware_sequence: word(0) & 7 != 0,
             body: body_dma,
             length: packet_len,
             next,
@@ -478,6 +520,9 @@ unsafe impl Port for Model {
         })
         .map_err(|_| Error::Access)?
     }
+    fn chip(&self) -> ChipId {
+        self.chip
+    }
     fn ordinary_allowed(&mut self) -> Result<(), Error> {
         self.guard()?;
         if self.allowed {
@@ -486,10 +531,18 @@ unsafe impl Port for Model {
             Err(Error::Access)
         }
     }
+    fn amsdu_allowed(&mut self) -> Result<Option<usize>, Error> {
+        self.guard()?;
+        Ok(self.amsdu)
+    }
     fn peer_allowed(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.guard()?;
         if let Some(peer) = self.peer.as_ref() {
-            return if peer.admits(bytes) {
+            return if if format::amsdu(bytes) && self.amsdu.is_some() {
+                peer.admits_amsdu(bytes)
+            } else {
+                peer.admits(bytes)
+            } {
                 Ok(())
             } else {
                 Err(Error::Access)
@@ -505,6 +558,32 @@ unsafe impl Port for Model {
             Err(Error::Access)
         }
     }
+    fn fragment_ready(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+    ) -> Result<(), Error> {
+        self.guard()?;
+        part.current().map_err(|_| Error::Access)?;
+        if self.pending_receive() {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    fn fragment_publish<T>(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+        operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.fragment.is_some() {
+            return Err(Error::State);
+        }
+        self.fragment = Some(part.clone());
+        let result = part
+            .model_with_current(|| Ok(operation(self)))
+            .map_err(|_| Error::Access);
+        self.fragment = None;
+        result?
+    }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error> {
         self.guard()?;
         let memory = narf_io::alloc_coherent_masked(
@@ -519,6 +598,9 @@ unsafe impl Port for Model {
             length: memory.len(),
         });
         self.allocations += 1;
+        if self.revoke_amsdu_on_allocate {
+            self.amsdu = None;
+        }
         if self.allocations == 4 {
             match self.deny_after_allocation {
                 Some(true) => self.allowed = false,
@@ -954,4 +1036,178 @@ fn smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement() -> TestResu
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement
+);
+
+/// Inert source/hardware setup for the actual Native publication fixture:
+/// prepare/start and retained mappings are genuine Core operations. Only PCI/
+/// RFK/startup readiness is replaced by this existing exclusive RAM model.
+pub(in crate::rtw89) fn native_fragment_core(
+    own: [u8; 6],
+) -> Result<(Core, Vec<(u32, u32)>), Error> {
+    let mut model = Model::new();
+    let mut core = Core::prepare(&mut model, own, 0)?;
+    core.start(&mut model)?;
+    let mut regs = Vec::new();
+    for queue in format::Queue::ordinary(false) {
+        let r = queue.regs();
+        for address in [r.desa_l, r.desa_h, r.num, r.idx] {
+            regs.push((address as u32, model.word(address as u32)));
+        }
+    }
+    regs.push((0x1010, model.word(0x1010)));
+    regs.push((0xc000, model.word(0xc000)));
+    Ok((core, regs))
+}
+pub(in crate::rtw89) struct FragmentSnapshot {
+    pub id: u64,
+    pub queue: format::Queue,
+    pub ticket: tx_transport::Ticket,
+    pub header: Vec<u8>,
+    pub body: Vec<u8>,
+    pub descriptors: Vec<u8>,
+    pub next: u16,
+}
+impl Core {
+    pub(in crate::rtw89) fn model_fragment(&self) -> Result<Option<FragmentSnapshot>, Error> {
+        let Some(pending) = self.pending.first() else {
+            return Ok(None);
+        };
+        let ring = self
+            .rings
+            .iter()
+            .find(|r| r.kind == pending.queue)
+            .ok_or(Error::State)?;
+        let packet = ring
+            .queue
+            .model_retained(pending.ticket)
+            .ok_or(Error::State)?;
+        Ok(Some(FragmentSnapshot {
+            id: pending.id,
+            queue: pending.queue,
+            ticket: pending.ticket,
+            header: copy_from(&packet.header, format::HEADER)?,
+            body: copy_from(&packet.body, packet.length)?,
+            descriptors: copy_from(
+                ring.descriptors.as_ref().ok_or(Error::State)?,
+                usize::from(format::DEPTH) * 8,
+            )?,
+            next: ring.queue.write_pointer(),
+        }))
+    }
+}
+
+fn smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs() -> TestResult {
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("C ordinary rings refused");
+    };
+    // Signed C A-MPDU on HT RX; A-MSDU has no C path.
+    if core.enable_aggregation().is_err() || core.enable_amsdu(1).is_ok() {
+        return TestResult::Fail("C A-MPDU refused or A-MSDU admitted");
+    }
+    // Signed C all-AC QoS: ACH1..3 at the `_V1` DESA (0x1238/0x1240/0x1248)
+    // with the shared NUM registers (0x1026/0x1028/0x102a).
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    if Core::prepare_with(&mut model, OWN, 0, true, RxPhy::Legacy).is_err() {
+        return TestResult::Fail("C all-AC QoS rings refused");
+    }
+    for (desa, num, base) in [
+        (0x1238, 0x1026, 0x1118),
+        (0x1240, 0x1028, 0x1120),
+        (0x1248, 0x102a, 0x1128),
+    ] {
+        if model.word(desa) == 0
+            || power::Io::read16(&mut model, num).unwrap() != format::DEPTH
+            || model.word(base) != 0
+        {
+            return TestResult::Fail("C ACH1..3 bases did not follow the V1 address set");
+        }
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    if Core::prepare(&mut model, OWN, 0).is_err()
+        || Core::prepare_ap(&mut model, OWN, false, RxPhy::Legacy).is_ok()
+    {
+        return TestResult::Fail("C station ring preparation or AP refusal");
+    }
+    // rtw89_pci_ch_dma_addr_set_v1: ACH0 0x1230/0x1234, CH8 0x1270/0x1274
+    // with the shared NUM registers; the baseline DESA stays untouched.
+    let half = |model: &mut Model, a: u32| power::Io::read16(model, a).unwrap();
+    if model.word(0x1230) == 0
+        || model.word(0x1270) == 0
+        || half(&mut model, 0x1024) != format::DEPTH
+        || half(&mut model, 0x1034) != format::DEPTH
+        || model.word(0x1110) != 0
+        || model.word(0x1150) != 0
+    {
+        return TestResult::Fail("C ring bases did not follow the V1 address set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs
+);
+
+fn smoke_rtw89_b_packet_rx_width_follows_programmed_channel() -> TestResult {
+    let mut model = Model::new();
+    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("HT packet preparation");
+    };
+    if core.rx_width != 0 || core.admits_rate(0x105) || !core.admits_rate(0x87) {
+        return TestResult::Fail("20MHz owner admits wide/VHT RX");
+    }
+    // 5GHz 80MHz: bandwidth up to 80MHz and VHT rates.
+    core.set_operating_width(2, true);
+    if core.rx_width != 2 || !core.admits_rate(0x105) || !core.admits_rate(0x119) {
+        return TestResult::Fail("5GHz 80MHz owner refuses VHT RX");
+    }
+    // 2.4GHz HT40: 40MHz, no VHT; a later 20MHz retune clears both.
+    core.set_operating_width(1, false);
+    if core.rx_width != 1 || core.admits_rate(0x105) {
+        return TestResult::Fail("2.4GHz HT40 owner admits VHT RX");
+    }
+    core.set_operating_width(0, true);
+    if core.rx_width != 0 || core.admits_rate(0x105) {
+        return TestResult::Fail("20MHz retune kept wide RX admission");
+    }
+    // VHT needs the HT program.
+    let mut model = Model::new();
+    let Ok(mut legacy) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Legacy) else {
+        return TestResult::Fail("legacy packet preparation");
+    };
+    legacy.set_operating_width(2, true);
+    if legacy.admits_rate(0x105) {
+        return TestResult::Fail("VHT admitted without the HT program");
+    }
+    // RTL8852B never widens past 80MHz; RTL8852C admits 160MHz only when
+    // programmed at RTW89_CHANNEL_WIDTH_160.
+    core.set_operating_width(3, true);
+    if core.rx_width != 2 {
+        return TestResult::Fail("RTL8852B RX bound widened to 160MHz");
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    let Ok(mut c) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("C HT packet preparation");
+    };
+    c.set_operating_width(2, true);
+    if c.rx_width != 2 {
+        return TestResult::Fail("C 80MHz program admitted 160MHz RX");
+    }
+    c.set_operating_width(3, true);
+    if c.rx_width != 3 || !c.admits_rate(0x105) {
+        return TestResult::Fail("C 160MHz program refused 160MHz VHT RX");
+    }
+    c.set_operating_width(0, true);
+    if c.rx_width != 0 || c.admits_rate(0x105) {
+        return TestResult::Fail("C 20MHz retune kept 160MHz RX admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_rx_width_follows_programmed_channel
 );

@@ -19,7 +19,7 @@
 //!
 //! | Bytes | Field |
 //! |---|---|
-//! | 0..4 | `N21<tag>` / `N22<tag>` |
+//! | 0..4 | `N21<tag>` / `N22<tag>` / `N2B<tag>` (RTL8822BE) |
 //! | 4..8 | `[1, 0, 128, 0]` (layout v1, length 128) |
 //! | 8..12 | length 128 LE |
 //! | 12..16 | `ec 10` + PCI device id LE |
@@ -42,7 +42,8 @@ pub(super) const PAYLOAD: usize = 64;
 pub(super) struct Kind {
     /// Fourth magic byte and kind-version tag.
     pub(super) tag: u8,
-    /// Filename stem: `rtw88/rtw882{1,2}ce-<stem>-v1-<mac>.bin`.
+    /// Filename stem: `rtw88/<family>-<stem>-v1-<mac>.bin`, family
+    /// `rtw882{1,2}ce` (PCI) or `rtw8821cu` (USB, `phy8821c::Host`).
     pub(super) stem: &'static str,
     /// Exact upstream source contract hashed into the identity.
     pub(super) source: &'static [u8],
@@ -55,17 +56,26 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Host identity keying the record header (`phy8821c::Host`).
+    pub host: super::phy8821c::Host,
 }
 
-fn base_identity(gate: &Gate) -> Result<[u8; 32], Error> {
-    Ok(gate.extension_request().ok_or(Error::State)?.identity)
+/// N2xO channel records bind the unscoped base; every other kind binds the
+/// channel-scoped base (`channel_policy::scope_request`) of its channel.
+fn base_identity(kind: &Kind, gate: &Gate) -> Result<[u8; 32], Error> {
+    let request = if kind.tag == b'O' {
+        gate.base_request()
+    } else {
+        gate.extension_request()
+    };
+    Ok(request.ok_or(Error::State)?.identity)
 }
 
 /// Measurement metadata for `kind` over the exact current base. No grant.
 pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error> {
     let did = gate.did();
     let mac = gate.own();
-    let base = base_identity(gate)?;
+    let base = base_identity(kind, gate)?;
     let mut hash = narf_crypto::sha256::Sha256::new();
     hash.update(b"NARF RTW88 separately signed continuation contract v1");
     hash.update(&[kind.tag]);
@@ -74,20 +84,36 @@ pub(super) fn request(kind: &'static Kind, gate: &Gate) -> Result<Request, Error
     hash.update(&mac);
     hash.update(&base);
     hash.update(kind.source);
+    // RTL8822BE programs differ from the C21/C22 ones the shared kind
+    // sources describe; their B22 contracts are hashed in addition.
+    if did == 0xb822 {
+        match kind.tag {
+            b'O' => hash.update(super::channel_policy::SOURCE8822B),
+            b'D' => hash.update(super::dm::SOURCE8822B),
+            b'W' => hash.update(super::tracking8822b::SOURCE),
+            b'B' => hash.update(super::ht40::SOURCE8822B),
+            b'V' => hash.update(super::vht::SOURCE8822B),
+            _ => {}
+        }
+    }
     Ok(Request {
         identity: hash.finalize(),
         mac,
-        filename: format!(
-            "rtw88/rtw882{}ce-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if did == 0xc821 { 1 } else { 2 },
-            kind.stem,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+        filename: super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/{}-{}-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                gate.host().family(),
+                kind.stem,
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            ),
+            if kind.tag == b'O' { 1 } else { gate.channel() },
         ),
+        host: gate.host(),
     })
 }
 
@@ -109,6 +135,7 @@ pub(super) struct Grant {
     request: Request,
     cap: Cap<FirmwareBlob, Read>,
     payload: [u8; PAYLOAD],
+    digest: [u8; 32],
 }
 
 impl core::fmt::Debug for Grant {
@@ -124,7 +151,7 @@ impl Source {
     pub(super) fn load(self, kind: &'static Kind, gate: &Gate) -> Result<Arc<Grant>, Error> {
         let request = request(kind, gate)?;
         let did = gate.did();
-        let base = base_identity(gate)?;
+        let base = base_identity(kind, gate)?;
         struct Decode {
             kind: &'static Kind,
             did: u16,
@@ -175,6 +202,22 @@ impl Source {
 }
 
 impl Grant {
+    pub(super) fn source_identity(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request.identity, self.digest)
+    }
+    pub(super) fn invoke_source<T>(
+        &self,
+        op: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        struct Live<F>(F);
+        impl<T, F: FnOnce() -> Result<T, Error>> CapOp<FirmwareBlob, Read> for Live<F> {
+            type Output = Result<T, Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        self.cap.invoke(Live(op)).map_err(|_| Error::Access)?
+    }
     fn decode(
         b: &[u8],
         signer: Option<[u8; 32]>,
@@ -188,6 +231,7 @@ impl Grant {
         let chip = match did {
             0xc821 => b'1',
             0xc822 => b'2',
+            0xb822 => b'B',
             _ => return Err(Error::Unsupported),
         };
         if signer.is_none()
@@ -195,8 +239,7 @@ impl Grant {
             || b[..4] != [b'N', b'2', chip, kind.tag]
             || b[4..8] != [1, 0, LENGTH as u8, 0]
             || b[8..12] != (LENGTH as u32).to_le_bytes()
-            || b[12..14] != [0xec, 0x10]
-            || b[14..16] != did.to_le_bytes()
+            || b[12..16] != request.host.header()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [kind.tag, 1]
@@ -215,6 +258,11 @@ impl Grant {
             request,
             cap,
             payload,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(b);
+                h.finalize()
+            },
         })
     }
     pub(super) fn tag(&self) -> u8 {
@@ -232,7 +280,7 @@ impl Grant {
     /// The grant applies only to the exact base it was qualified against.
     pub(super) fn matches(&self, gate: &Gate) -> bool {
         gate.did() == self.did
-            && base_identity(gate).is_ok_and(|b| b == self.base)
+            && base_identity(self.kind, gate).is_ok_and(|b| b == self.base)
             && request(self.kind, gate).as_ref() == Ok(&self.request)
     }
     /// Run `op` under the current continuation capability and the current

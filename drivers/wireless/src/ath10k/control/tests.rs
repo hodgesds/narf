@@ -13,6 +13,8 @@ struct Model {
     stall: bool,
     duplicate: bool,
     wmi_sent: u8,
+    defer_idle: bool,
+    deferred: bool,
 }
 fn wire(eid: u8, body: &[u8]) -> Vec<u8> {
     let mut bytes = vec![eid, 0, body.len() as u8, 0, 0, 0, 0, 0];
@@ -27,6 +29,17 @@ impl Model {
     }
 }
 impl Hif for Model {
+    fn runtime_idle(&mut self, eligible: bool) {
+        self.defer_idle = eligible;
+    }
+    fn take_idle_deferred(&mut self) -> bool {
+        core::mem::take(&mut self.deferred)
+    }
+    fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        let wire = self.rx.pop_front();
+        self.deferred = wire.is_none() && self.defer_idle;
+        Ok(wire)
+    }
     async fn receive(&mut self, _: u64) -> Result<(u8, Vec<u8>), BmiError> {
         self.rx.pop_front().ok_or(BmiError::Timeout)
     }
@@ -65,6 +78,37 @@ impl Hif for Model {
         Ok(())
     }
 }
+fn smoke_ath10k_host_pm_deferred_poll_never_forges_empty_native_prefix() -> TestResult {
+    let mut session = Session::new(Model::new(), HwRev::Qca6174);
+    if once(session.start()) != Poll::Ready(Ok(()))
+        || once(session.receive()) != Poll::Ready(Ok((2, vec![1, 0, 0, 0])))
+    {
+        return TestResult::Fail("PM prefix fixture lacks actual HTC endpoint setup");
+    }
+    session.transport.runtime_idle(true);
+    let commands = session.transport.wire.len();
+    if session.poll_now() != Ok((true, None))
+        || !session.take_idle_deferred()
+        || session.transport.wire.len() != commands
+    {
+        return TestResult::Fail("idle PM defer became a fresh RX prefix or native command");
+    }
+    // A real buffered HTC/HTT frame must not inherit denial from a prior
+    // deferred call; source/epoch admission above this boundary is unchanged.
+    session.transport.rx.push_back((1, wire(1, &[7, 8])));
+    if session.poll_now() != Ok((true, Some((1, vec![7, 8])))) || session.take_idle_deferred() {
+        return TestResult::Fail("old idle PM defer hid actual buffered native input");
+    }
+    session.transport.runtime_idle(false);
+    if session.poll_now() != Ok((false, None)) || session.take_idle_deferred() {
+        return TestResult::Fail("genuine empty native poll lost its distinct RX prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/host-bus-pm",
+    smoke_ath10k_host_pm_deferred_poll_never_forges_empty_native_prefix
+);
 fn once<F: Future>(f: F) -> Poll<F::Output> {
     let mut f = core::pin::pin!(f);
     f.as_mut().poll(&mut Context::from_waker(Waker::noop()))

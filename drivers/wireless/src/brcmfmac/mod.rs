@@ -41,23 +41,50 @@
 
 extern crate alloc;
 
+pub(crate) mod ap;
+pub(crate) mod ap_beacon;
+pub(crate) mod ap_key;
+pub(crate) mod ap_keys;
+pub(crate) mod ap_native;
+pub(crate) mod ap_operation;
+pub(crate) mod ap_packet;
+pub(crate) mod ap_peer;
+pub(crate) mod ap_plan;
+pub mod ap_scope;
+pub mod ap_source;
+pub(crate) mod ap_station;
+pub(crate) mod ap_stop;
+pub mod ap_tx;
+pub(crate) mod ap_wire;
 pub mod boot;
 pub mod bus;
 pub mod cfg80211;
 pub mod chip;
+pub mod chip_profile;
 pub mod connect;
+pub mod event_mask;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;
 pub mod irq;
+pub(crate) mod monitor;
+pub mod monitor_native;
+pub mod monitor_scope;
+pub(crate) mod monitor_wire;
 pub mod msgbuf;
 pub mod native_runtime;
+pub mod p2p;
+pub mod p2p_wire;
 pub mod pcie;
 pub mod provision;
 pub mod ringbuf;
 pub mod runtime;
 pub mod shared;
 pub mod station_transport;
+pub mod vif_bsscfg;
+pub mod vif_demux;
+pub mod vif_owner;
+pub mod vif_wire;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 
@@ -107,3 +134,18 @@ pub(crate) mod runtime_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod data_wire_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod vif_wire_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod vif_owner_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod vif_bsscfg_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod p2p_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod p2p_transport_cases;

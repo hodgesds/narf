@@ -8,10 +8,10 @@ use super::{
     station,
     station_lifecycle::Lifecycle,
 };
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use narf_bus::{BusDevice, BusDeviceCap};
+use narf_bus::{BusAddr, BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
@@ -41,6 +41,7 @@ pub(super) struct Bootstrap {
     reset: Mutex<Option<pci_reset::Reset>>,
     lifecycle: IrqSafeSpinLock<Option<Arc<Lifecycle<startup::Startup>>>>,
     shell: IrqSafeSpinLock<Option<Arc<Device<startup::Startup>>>>,
+    desired: Arc<super::monitor::Desired>,
     stage: AtomicU8,
     error: IrqSafeSpinLock<Option<Error>>,
     request: IrqSafeSpinLock<Option<super::command_native::QualificationRequest>>,
@@ -53,9 +54,102 @@ pub(super) struct Bootstrap {
     generation: AtomicU32,
     /// System suspend requested; the supervisor parks instead of resetting.
     suspended: AtomicBool,
+    /// System suspend took the WoW branch: the generation stays live (D3hot,
+    /// no card-off) with the WoW image owning the radio until resume; the
+    /// config header and MSI capability `pci_save_state` saved before the
+    /// driver op.
+    wow: IrqSafeSpinLock<Option<PciState>>,
+    /// cfg80211 `wiphy->wowlan_config` and the last wake report, carried
+    /// from a retired generation's shell into the next one.
+    wowlan: IrqSafeSpinLock<(
+        Option<narf_wireless::WowlanConfig>,
+        Option<super::wow_wire::WakeReport>,
+    )>,
 }
-static OWNER: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
-static RESERVED: AtomicBool = AtomicBool::new(false);
+/// Reservation precedes any config/reset access. A pinned function keeps
+/// its own entry while unrelated functions may continue to run or bind.
+struct Function {
+    addr: BusAddr,
+    owner: Option<Arc<Bootstrap>>,
+}
+struct Functions {
+    entries: Vec<Function>,
+    suspending: bool,
+}
+impl Functions {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            suspending: false,
+        }
+    }
+    fn owner(&self, addr: BusAddr) -> Option<Arc<Bootstrap>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.addr == addr)?
+            .owner
+            .clone()
+    }
+    fn snapshot(&self) -> Vec<Arc<Bootstrap>> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.owner.clone())
+            .collect()
+    }
+    fn reserve(&mut self, addr: BusAddr) -> Result<bool, narf_bus::ProbeError> {
+        if self.suspending {
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+        if let Some(entry) = self.entries.iter().find(|entry| entry.addr == addr) {
+            return if entry.owner.is_some() {
+                Ok(false)
+            } else {
+                Err(narf_bus::ProbeError::BadDevice)
+            };
+        }
+        if self.entries.len() == super::endpoints::MAX_FUNCTIONS {
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+        self.entries.push(Function { addr, owner: None });
+        Ok(true)
+    }
+    fn forget(&mut self, owner: &Arc<Bootstrap>) {
+        self.entries.retain(|entry| {
+            entry
+                .owner
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, owner))
+        });
+    }
+}
+static OWNERS: IrqSafeSpinLock<Functions> = IrqSafeSpinLock::new(Functions::new());
+struct Reservation {
+    addr: BusAddr,
+}
+impl Reservation {
+    fn claim(addr: BusAddr) -> Result<Option<Self>, narf_bus::ProbeError> {
+        let reserved = OWNERS.lock().reserve(addr)?;
+        Ok(if reserved { Some(Self { addr }) } else { None })
+    }
+    fn publish(self, owner: Arc<Bootstrap>) {
+        let mut owners = OWNERS.lock();
+        let entry = owners
+            .entries
+            .iter_mut()
+            .find(|entry| entry.addr == self.addr)
+            .expect("retained function reservation");
+        assert!(entry.owner.is_none());
+        entry.owner = Some(owner);
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        OWNERS
+            .lock()
+            .entries
+            .retain(|entry| entry.addr != self.addr || entry.owner.is_some());
+    }
+}
 struct Attempt<'a> {
     owner: &'a Bootstrap,
     complete: bool,
@@ -152,11 +246,13 @@ impl Bootstrap {
         };
         let mut name: Option<String> = None;
         loop {
+            let selected = self.desired.snapshot();
             let result = self.generation(name.as_deref()).await;
+            let role_changed = !self.desired.current(selected);
             let reclaimed = self.retire_generation().await;
             let generation = self.generation.load(Ordering::Acquire);
             let action = supervise(
-                result.is_ok(),
+                result.is_ok() || role_changed,
                 self.removed.load(Ordering::Acquire),
                 reclaimed,
                 self.suspended.load(Ordering::Acquire),
@@ -211,7 +307,10 @@ impl Bootstrap {
             Some(owner) => {
                 let reclaimed = owner.retire();
                 let _ = owner.io.finish_station_shutdown().await;
-                reclaimed
+                // A deep/uncertain LPS owner retains DMA until its awaited
+                // actual FLR fence. Re-sample that terminal retirement after
+                // cleanup instead of permanently pinning a proven generation.
+                reclaimed || owner.io.retire_published_dma()
             }
             None => !self.pinned.load(Ordering::Acquire),
         };
@@ -230,11 +329,17 @@ impl Bootstrap {
             return None;
         }
         let shell = self.shell.lock().take();
+        if let Some(shell) = &shell {
+            *self.wowlan.lock() = shell.wowlan();
+        }
         let kept = shell
             .as_ref()
             .map(|shell| super::interface::withdraw_keep_name(shell));
+        if let Some(shell) = &shell {
+            shell.wait_withdrawn().await;
+        }
         *self.lifecycle.lock() = None;
-        // SAFETY: the singleton reservation is still held, the previous
+        // SAFETY: the exclusive function reservation is still held, the previous
         // generation's DMA was proven stopped/reclaimed with BME off and no
         // producer remains; the reset still earns its own temporal fence.
         let reset = unsafe { pci_reset::Reset::claim(self.device, self.authority) }
@@ -292,12 +397,17 @@ impl Bootstrap {
         let name = kept
             .and_then(narf_net::iface::rebind_name)
             .unwrap_or_else(|| narf_net::iface::reserve_name("wlan%d"));
-        let shell = Arc::new(Device::new(
+        let shell = Arc::new(Device::new_selected(
             name,
             identity.mac(),
             lifecycle.clone(),
             Arc::new(station::NativeEnvironment),
+            self.desired.clone(),
         ));
+        {
+            let (config, wakeup) = self.wowlan.lock().clone();
+            shell.restore_wowlan(config, wakeup);
+        }
         *self.shell.lock() = Some(shell.clone());
         // Source factory discovery ended with BME off. The exact same shell
         // reaches all registries before the first CH12/firmware BME attempt.
@@ -436,6 +546,26 @@ async fn advance(io: &mut startup::Startup) -> Result<bool, startup::Error> {
         Phase::Running => io.prepare_mac().await?,
         Phase::MacPrepared => io.prepare_receive().await?,
         Phase::Receiving => io.prepare_radio_tables().await?,
+        // RTL8852C: one owner for DM/RFK/channel at Linux's default unlinked
+        // chandef (2.4GHz channel 1, 20MHz; core.c `rtw89_get_default_chandef`).
+        Phase::RadioTablesLoaded
+            if io
+                .identity()
+                .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C) =>
+        {
+            io.prepare_radio_c(super::operating_channel_c::Profile::INITIAL)
+                .await?
+        }
+        // RTL8851B: its own `radio_51` owner at the same default chandef;
+        // never B's basic/full calibration.
+        Phase::RadioTablesLoaded
+            if io
+                .identity()
+                .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8851B) =>
+        {
+            io.prepare_radio_51(super::operating_channel::Profile::INITIAL)
+                .await?
+        }
         Phase::RadioTablesLoaded => io.prepare_basic_calibration().await?,
         Phase::BasicCalibrated => io.prepare_full_radio().await?,
         Phase::RadioReady => return Ok(true),
@@ -456,6 +586,7 @@ impl Bootstrap {
         };
         if let Some(shell) = shell.as_ref() {
             super::interface::withdraw(shell);
+            shell.wait_withdrawn().await;
         }
         // An accepted FLR keeps its mandatory no-config quarantine; the
         // reset is dropped only after `run` returned.
@@ -479,11 +610,23 @@ async fn suspend_owner(
     if stage == Stage::Terminal as u8 || !owner.running.load(Ordering::Acquire) {
         return Ok(());
     }
-    owner.suspended.store(true, Ordering::Release);
     let shell = {
         let shell = owner.shell.lock();
         shell.clone()
     };
+    // `rtw89_ops_suspend` with WoWLAN on a WoW-configured, associated,
+    // settled station: the PCI core's `pci_save_state`, the driver op, then
+    // `pci_prepare_to_sleep` to D3hot without card-off (as rtw88). Any
+    // failure falls through to the cold path; PME/wake enable stays with
+    // system PM (iwlwifi.md section 3.80).
+    if stage == Stage::Station as u8 {
+        if let Some(shell) = shell.as_ref() {
+            if wow_suspend_owner(owner, shell).await {
+                return Ok(());
+            }
+        }
+    }
+    owner.suspended.store(true, Ordering::Release);
     if let Some(shell) = shell {
         shell.admission().close();
     }
@@ -503,43 +646,181 @@ async fn suspend_owner(
 /// `rtw89_ops_start` after resume: release the parked supervisor, which
 /// claims a fresh FLR and restarts with the `Repeat` radio identity.
 fn resume_owner(owner: &Bootstrap) {
+    if owner.wow.lock().take().is_some() {
+        // A rolled-back WoW suspend cannot await the D3hot exit delay or
+        // `rtw89_wow_resume` here: return to D0 and close the shell so the
+        // supervisor regenerates the station behind a fresh FLR.
+        let _ = narf_bus::pci::set_power_state(
+            &owner.authority,
+            &owner.device,
+            narf_bus::pci::PciPowerState::D0,
+        );
+        if let Some(shell) = owner.shell.lock().clone() {
+            shell.admission().close();
+        }
+    }
     owner.suspended.store(false, Ordering::Release);
+}
+async fn pci_settle() {
+    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+        narf_bus::pci::PM_D3HOT_DELAY_MS * 1_000_000,
+    ))
+    .await;
+}
+fn pci_state(owner: &Bootstrap, expected: narf_bus::pci::PciPowerState) -> bool {
+    narf_bus::pci::power_state(&owner.authority, &owner.device) == Ok(Some(expected))
+}
+/// `pci_pm_resume_noirq`: D0, the exit delay, `pci_restore_state`
+/// (header, then MSI) and a read-back of the restored BARs, command
+/// register and MSI capability.
+/// `pci_save_state`: the type-0 header and the MSI capability (address,
+/// data, mask, Multi-Message Enable and Enable), which a function may lose
+/// across D3hot (Linux `pci_restore_msi_state`).
+#[derive(Clone, Copy)]
+struct PciState {
+    config: narf_bus::pci::SavedPciConfig,
+    msi: narf_bus::msi::SavedMsi,
+}
+fn pci_save(owner: &Bootstrap) -> Option<PciState> {
+    Some(PciState {
+        config: narf_bus::pci::save_config(&owner.authority, &owner.device).ok()?,
+        msi: narf_bus::msi::save_msi(&owner.authority, &owner.device).ok()?,
+    })
+}
+async fn pci_wake(owner: &Bootstrap, saved: &PciState) -> bool {
+    if narf_bus::pci::set_power_state(
+        &owner.authority,
+        &owner.device,
+        narf_bus::pci::PciPowerState::D0,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    pci_settle().await;
+    let config = &saved.config;
+    pci_state(owner, narf_bus::pci::PciPowerState::D0)
+        && narf_bus::pci::restore_config(&owner.authority, &owner.device, config).is_ok()
+        && narf_bus::pci::save_config(&owner.authority, &owner.device).is_ok_and(|now| {
+            now.bars == config.bars
+                && now.expansion_rom_bar == config.expansion_rom_bar
+                && now.command == config.command
+        })
+        // `__pci_restore_msi_state`, proven by read-back of the capability.
+        && narf_bus::msi::restore_msi(&owner.authority, &owner.device, &saved.msi).is_ok()
+}
+/// The WoW suspend branch; false means the cold path must run (a failed
+/// WoW owner already closed its shell).
+async fn wow_suspend_owner(owner: &Bootstrap, shell: &Arc<Device<startup::Startup>>) -> bool {
+    // The WoW resume needs the bound MSI vector: refuse WoW unless it is
+    // enabled and saved (polled delivery keeps the cold path).
+    let Some(saved) = pci_save(owner).filter(|saved| saved.msi.enabled()) else {
+        return false;
+    };
+    if shell.wow_suspend().await != Ok(true) {
+        return false;
+    }
+    if narf_bus::pci::set_power_state(
+        &owner.authority,
+        &owner.device,
+        narf_bus::pci::PciPowerState::D3Hot,
+    )
+    .is_ok()
+    {
+        pci_settle().await;
+        if pci_state(owner, narf_bus::pci::PciPowerState::D3Hot) {
+            *owner.wow.lock() = Some(saved);
+            return true;
+        }
+    }
+    // Back to D0 and restore the station before the cold path retires it.
+    if pci_wake(owner, &saved).await {
+        let _ = shell.wow_resume().await;
+    }
+    false
+}
+/// `rtw89_ops_resume` -> `rtw89_wow_resume` for a WoW-suspended
+/// generation; a failure closed its shell, so the supervisor regenerates
+/// it (cold path). Cold-suspended owners are released as before.
+async fn resume_owner_async(owner: &Bootstrap) {
+    let saved = owner.wow.lock().take();
+    if let Some(saved) = saved {
+        let shell = owner.shell.lock().clone();
+        if let Some(shell) = shell {
+            let woke = pci_wake(owner, &saved).await;
+            if !woke || shell.wow_resume().await.is_err() {
+                // Any failure closes the shell; the supervisor regenerates.
+                shell.admission().close();
+                narf_console::klog!("rtw8852b: WoW resume failed; regenerating\n");
+            }
+        }
+    }
+    owner.suspended.store(false, Ordering::Release);
+}
+/// Cancellation of preparation rolls back every request made so far. Once
+/// preparation succeeds the barrier remains until resume_from_suspend.
+struct SuspendAttempt {
+    owners: Vec<Arc<Bootstrap>>,
+    armed: bool,
+}
+impl Drop for SuspendAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            for owner in &self.owners {
+                resume_owner(owner);
+            }
+            OWNERS.lock().suspending = false;
+        }
+    }
 }
 /// Async system-PM hook (the interrupt-gated `DevicePmOps` fan-out cannot
 /// await firmware/H2C or the DMA-stop retirement).
 pub(super) struct SystemPm;
+async fn suspend_all(timeout_ms: u64) -> Result<(), narf_power::device_pm::DevicePmError> {
+    let owners = {
+        let mut registry = OWNERS.lock();
+        // An unpublished claim may be touching config/reset. Do not enter
+        // system suspend until every claim has become retained.
+        if registry.suspending || registry.entries.iter().any(|entry| entry.owner.is_none()) {
+            return Err(narf_power::device_pm::DevicePmError::Busy);
+        }
+        registry.suspending = true;
+        registry.snapshot()
+    };
+    let mut attempt = SuspendAttempt {
+        owners,
+        armed: true,
+    };
+    for owner in &attempt.owners {
+        suspend_owner(owner, timeout_ms).await?;
+    }
+    attempt.armed = false;
+    Ok(())
+}
+async fn resume_all() {
+    let owners = OWNERS.lock().snapshot();
+    for owner in owners {
+        resume_owner_async(&owner).await;
+    }
+    OWNERS.lock().suspending = false;
+}
 impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
-        alloc::boxed::Box::pin(async {
-            let owner = OWNER.lock().clone();
-            match owner {
-                Some(owner) => suspend_owner(&owner, SUSPEND_MS).await,
-                None => Ok(()),
-            }
-        })
+        alloc::boxed::Box::pin(suspend_all(SUSPEND_MS))
     }
     fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
-            if let Some(owner) = OWNER.lock().clone() {
-                resume_owner(&owner);
-            }
+            resume_all().await;
             Ok(())
         })
     }
 }
-/// Release the singleton reservation only after proven reclamation. A
-/// pinned owner stays reserved (and its address quarantined) for the boot.
+/// Release only this function's reservation after proven reclamation. A
+/// pinned owner keeps its address quarantined for the boot.
 async fn finish_remove(owner: Arc<Bootstrap>) -> bool {
     let reclaimed = owner.retire().await;
     if reclaimed {
-        let mut retained = OWNER.lock();
-        if retained
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &owner))
-        {
-            *retained = None;
-            RESERVED.store(false, Ordering::Release);
-        }
+        OWNERS.lock().forget(&owner);
     }
     narf_console::klog!(
         "rtw8852b: removed; DMA {}\n",
@@ -553,7 +834,7 @@ async fn finish_remove(owner: Arc<Bootstrap>) -> bool {
 }
 /// `narf_bus` PCI remove hook for the retained RTL8852B owner.
 pub(super) fn remove(device: BusDevice, _authority: Cap<BusDeviceCap, Write>) {
-    let owner = OWNER.lock().clone();
+    let owner = OWNERS.lock().owner(device.addr);
     let Some(owner) = owner else {
         return;
     };
@@ -570,29 +851,14 @@ pub(super) fn probe(
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
-    let existing = OWNER.lock().clone();
-    if let Some(owner) = existing {
-        if owner.device.addr == device.addr {
-            return Ok(());
-        }
-        return crate::rtw88::pci_park::invoke(&authority, || {
-            crate::rtw88::pci_park::park(&device, &authority)
-        })
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?
-        .map_err(|_| narf_bus::ProbeError::BadDevice);
-    }
-    RESERVED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    // SAFETY: singleton reservation above is retained permanently before the
-    // first await; no diagnostic, IRQ or other producer can reach this BDF.
-    let reset = match unsafe { pci_reset::Reset::claim(device, authority) } {
-        Ok(reset) => reset,
-        Err(_) => {
-            RESERVED.store(false, Ordering::Release);
-            return Err(narf_bus::ProbeError::BadDevice);
-        }
+    let Some(reservation) = Reservation::claim(device.addr)? else {
+        // An active or quarantined same-function reprobe is observational.
+        return Ok(());
     };
+    // SAFETY: this BDF's reservation precedes all hardware access and is
+    // retained across the reset/firmware/radio/station lifetime.
+    let reset = unsafe { pci_reset::Reset::claim(device, authority) }
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // A parking operation before reset only limits inherited DMA. It grants
     // no fence; the retained reset below must still earn an actual FLR receipt.
     if crate::rtw88::pci_park::invoke(&authority, || {
@@ -601,7 +867,6 @@ pub(super) fn probe(
     .ok()
         != Some(Ok(()))
     {
-        RESERVED.store(false, Ordering::Release);
         return Err(narf_bus::ProbeError::BadDevice);
     }
     let owner = Arc::new(Bootstrap {
@@ -610,6 +875,7 @@ pub(super) fn probe(
         reset: Mutex::new(Some(reset)),
         lifecycle: IrqSafeSpinLock::new(None),
         shell: IrqSafeSpinLock::new(None),
+        desired: crate::rtw89::monitor::Desired::new(),
         stage: AtomicU8::new(Stage::Reset as u8),
         error: IrqSafeSpinLock::new(None),
         request: IrqSafeSpinLock::new(None),
@@ -618,13 +884,15 @@ pub(super) fn probe(
         pinned: AtomicBool::new(false),
         generation: AtomicU32::new(0),
         suspended: AtomicBool::new(false),
+        wow: IrqSafeSpinLock::new(None),
+        wowlan: IrqSafeSpinLock::new((None, None)),
     });
-    publish_owner(owner);
+    publish_owner(owner, reservation);
     Ok(())
 }
-fn publish_owner(owner: Arc<Bootstrap>) {
+fn publish_owner(owner: Arc<Bootstrap>, reservation: Reservation) {
     let device = owner.device;
-    *OWNER.lock() = Some(owner.clone());
+    reservation.publish(owner.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: String::from("rtw89-rtl8852b"),
         kind: narf_drivers::BoundKind::Net,
@@ -648,24 +916,16 @@ pub(super) unsafe fn attach_cold(
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
-    if device.id.vendor != 0x10ec
-        || !matches!(device.id.device, 0xb852 | 0xb85b)
-        || OWNER.lock().is_some()
-    {
+    if device.id.vendor != 0x10ec || !matches!(device.id.device, 0xb852 | 0xb85b | 0xc852) {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    RESERVED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let reservation = Reservation::claim(device.addr)?.ok_or(narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller's actual temporal platform-reset and exclusive function
     // contract above replaces only the observed FLR receipt, not any later
     // firmware/factory/radio/policy/packet prerequisite.
     let startup = match unsafe { startup::Startup::claim(device, authority) } {
         Ok(startup) => startup,
-        Err(_) => {
-            RESERVED.store(false, Ordering::Release);
-            return Err(narf_bus::ProbeError::BadDevice);
-        }
+        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     let lifecycle = Arc::new(Lifecycle::new(startup));
     let owner = Arc::new(Bootstrap {
@@ -674,6 +934,7 @@ pub(super) unsafe fn attach_cold(
         reset: Mutex::new(None),
         lifecycle: IrqSafeSpinLock::new(Some(lifecycle)),
         shell: IrqSafeSpinLock::new(None),
+        desired: crate::rtw89::monitor::Desired::new(),
         stage: AtomicU8::new(Stage::Discovery as u8),
         error: IrqSafeSpinLock::new(None),
         request: IrqSafeSpinLock::new(None),
@@ -682,21 +943,41 @@ pub(super) unsafe fn attach_cold(
         pinned: AtomicBool::new(false),
         generation: AtomicU32::new(0),
         suspended: AtomicBool::new(false),
+        wow: IrqSafeSpinLock::new(None),
+        wowlan: IrqSafeSpinLock::new((None, None)),
     });
-    publish_owner(owner);
+    publish_owner(owner, reservation);
     Ok(())
 }
 
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
+    use core::future::Future;
     use narf_kernel_test::{kernel_test_in, TestResult};
-    struct Reservation;
-    impl Drop for Reservation {
+    struct TestReservation(BusAddr);
+    impl Drop for TestReservation {
         fn drop(&mut self) {
-            *OWNER.lock() = None;
-            RESERVED.store(false, Ordering::Release);
+            OWNERS.lock().entries.retain(|entry| entry.addr != self.0);
         }
+    }
+    fn test_reserve(addr: BusAddr) -> Option<TestReservation> {
+        OWNERS
+            .lock()
+            .reserve(addr)
+            .ok()
+            .filter(|reserved| *reserved)?;
+        Some(TestReservation(addr))
+    }
+    fn install(owner: Arc<Bootstrap>) {
+        let mut registry = OWNERS.lock();
+        let entry = registry
+            .entries
+            .iter_mut()
+            .find(|entry| entry.addr == owner.device.addr)
+            .unwrap();
+        assert!(entry.owner.is_none());
+        entry.owner = Some(owner);
     }
     fn device() -> BusDevice {
         let addr = narf_bus::PcieAddr::new(u16::MAX, u8::MAX, 31, 7);
@@ -716,15 +997,10 @@ mod tests {
         }
     }
     fn smoke_rtw8852b_retained_probe_never_reparks_or_replaces_reset_owner() -> TestResult {
-        if OWNER.lock().is_some()
-            || RESERVED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return TestResult::Skip("physical RTL8852B reservation already exists");
-        }
-        let _reservation = Reservation;
         let device = device();
+        let Some(_reservation) = test_reserve(device.addr) else {
+            return TestResult::Skip("RTL8852B fixture function unavailable");
+        };
         let authority = Cap::bootstrap();
         // Pure ownership fixture: deliberately no Reset or native producer.
         // Any attempted config access to its zero ECAM would be invalid.
@@ -734,6 +1010,7 @@ mod tests {
             reset: Mutex::new(None),
             lifecycle: IrqSafeSpinLock::new(None),
             shell: IrqSafeSpinLock::new(None),
+            desired: crate::rtw89::monitor::Desired::new(),
             stage: AtomicU8::new(Stage::Reset as u8),
             error: IrqSafeSpinLock::new(None),
             request: IrqSafeSpinLock::new(None),
@@ -742,20 +1019,22 @@ mod tests {
             pinned: AtomicBool::new(false),
             generation: AtomicU32::new(0),
             suspended: AtomicBool::new(false),
+            wow: IrqSafeSpinLock::new(None),
+            wowlan: IrqSafeSpinLock::new((None, None)),
         });
-        *OWNER.lock() = Some(owner.clone());
+        install(owner.clone());
         if probe(device, authority).is_err() {
             return TestResult::Fail("retained same-function probe did not return without access");
         }
-        // SAFETY: the existing singleton must reject before any hardware or
+        // SAFETY: the existing function owner must reject before any hardware or
         // platform-reset claim is used; fixture has no physical PCI function.
         if unsafe { attach_cold(device, authority) }.is_ok() {
             return TestResult::Fail("cold-platform entry replaced a retained reset owner");
         }
-        if OWNER
+        if OWNERS
             .lock()
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(current, &owner))
+            .owner(device.addr)
+            .is_none_or(|current| !Arc::ptr_eq(&current, &owner))
             || owner.reset.try_lock().is_none_or(|reset| reset.is_some())
             || owner.stage.load(Ordering::Acquire) != Stage::Reset as u8
         {
@@ -773,6 +1052,7 @@ mod tests {
             reset: Mutex::new(None),
             lifecycle: IrqSafeSpinLock::new(lifecycle),
             shell: IrqSafeSpinLock::new(None),
+            desired: crate::rtw89::monitor::Desired::new(),
             stage: AtomicU8::new(Stage::Reset as u8),
             error: IrqSafeSpinLock::new(None),
             request: IrqSafeSpinLock::new(None),
@@ -781,6 +1061,8 @@ mod tests {
             pinned: AtomicBool::new(false),
             generation: AtomicU32::new(0),
             suspended: AtomicBool::new(false),
+            wow: IrqSafeSpinLock::new(None),
+            wowlan: IrqSafeSpinLock::new((None, None)),
         })
     }
     fn ready<T>(future: impl core::future::Future<Output = T>) -> Option<T> {
@@ -793,18 +1075,13 @@ mod tests {
         }
     }
     fn smoke_rtw8852b_remove_releases_unpublished_and_quarantines_pinned_owner() -> TestResult {
-        if OWNER.lock().is_some()
-            || RESERVED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return TestResult::Skip("physical RTL8852B reservation already exists");
-        }
-        let _reservation = Reservation;
         let device = device();
+        let Some(_reservation) = test_reserve(device.addr) else {
+            return TestResult::Skip("RTL8852B fixture function unavailable");
+        };
         // Owner that never completed reset: nothing was published.
         let owner = fixture(device, None);
-        *OWNER.lock() = Some(owner.clone());
+        install(owner.clone());
         let mut other = device;
         other.addr = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(u16::MAX, u8::MAX, 30, 7));
         remove(other, Cap::bootstrap());
@@ -812,30 +1089,32 @@ mod tests {
             return TestResult::Fail("remove hook acted on a different function");
         }
         if ready(finish_remove(owner.clone())) != Some(true)
-            || OWNER.lock().is_some()
-            || RESERVED.load(Ordering::Acquire)
+            || OWNERS
+                .lock()
+                .entries
+                .iter()
+                .any(|entry| entry.addr == device.addr)
             || !owner.removed.load(Ordering::Acquire)
             || owner.stage.load(Ordering::Acquire) != Stage::Terminal as u8
         {
-            return TestResult::Fail("unpublished owner removal kept the singleton reservation");
+            return TestResult::Fail("unpublished owner removal kept the function reservation");
         }
         // Owner whose retained DMA owner cannot be proven reclaimed (already
         // taken): the reservation and address stay quarantined.
-        RESERVED.store(true, Ordering::Release);
+        assert_eq!(OWNERS.lock().reserve(device.addr).ok(), Some(true));
         let lifecycle = Arc::new(Lifecycle {
             retained: Mutex::new(None),
         });
         let pinned = fixture(device, Some(lifecycle));
         pinned.pinned.store(true, Ordering::Release);
-        *OWNER.lock() = Some(pinned.clone());
+        install(pinned.clone());
         if ready(finish_remove(pinned.clone())) != Some(false)
-            || OWNER
+            || OWNERS
                 .lock()
-                .as_ref()
-                .is_none_or(|current| !Arc::ptr_eq(current, &pinned))
-            || !RESERVED.load(Ordering::Acquire)
+                .owner(device.addr)
+                .is_none_or(|current| !Arc::ptr_eq(&current, &pinned))
         {
-            return TestResult::Fail("unproven removal released the singleton reservation");
+            return TestResult::Fail("unproven removal released the function reservation");
         }
         // A quarantined address re-probe returns without configuration access.
         if probe(device, Cap::bootstrap()).is_err() {
@@ -929,6 +1208,122 @@ mod tests {
         }
         TestResult::Pass
     }
+    fn other_device(slot: u8) -> BusDevice {
+        let mut other = device();
+        other.addr = BusAddr::Pcie(narf_bus::PcieAddr::new(u16::MAX, u8::MAX, slot, 7));
+        other
+    }
+    fn smoke_rtw8852b_function_reservations_bound_duplicate_and_stale_removal() -> TestResult {
+        let mut functions = Functions::new();
+        let first = fixture(other_device(20), None);
+        let second = fixture(other_device(21), None);
+        if functions.reserve(first.device.addr).ok() != Some(true)
+            || functions.reserve(first.device.addr).is_ok()
+        {
+            return TestResult::Fail("pending BDF reservation admitted another reset producer");
+        }
+        functions.entries[0].owner = Some(first.clone());
+        if functions.reserve(first.device.addr).ok() != Some(false)
+            || functions.reserve(second.device.addr).ok() != Some(true)
+        {
+            return TestResult::Fail("live duplicate or independent function admission differed");
+        }
+        functions.entries[1].owner = Some(second.clone());
+        for slot in 22..24 {
+            functions.reserve(other_device(slot).addr).unwrap();
+        }
+        if functions.reserve(other_device(24).addr).is_ok() {
+            return TestResult::Fail("function bound exceeded native endpoint/IRQ capacity");
+        }
+        functions.forget(&first);
+        functions.reserve(first.device.addr).unwrap();
+        let replacement = fixture(first.device, None);
+        functions.entries.last_mut().unwrap().owner = Some(replacement.clone());
+        functions.forget(&first);
+        if functions
+            .owner(first.device.addr)
+            .is_none_or(|owner| !Arc::ptr_eq(&owner, &replacement))
+            || functions
+                .owner(second.device.addr)
+                .is_none_or(|owner| !Arc::ptr_eq(&owner, &second))
+        {
+            return TestResult::Fail("late retirement released a different function/generation");
+        }
+        TestResult::Pass
+    }
+    fn smoke_rtw8852b_system_pm_fans_out_and_rolls_back_failed_or_cancelled_prepare() -> TestResult
+    {
+        use narf_power::device_pm::DevicePmError;
+        let first = fixture(other_device(28), None);
+        let second = fixture(other_device(29), None);
+        {
+            let mut registry = OWNERS.lock();
+            if !registry.entries.is_empty() || registry.suspending {
+                return TestResult::Skip("physical function owners already present");
+            }
+            registry.reserve(first.device.addr).unwrap();
+            registry.reserve(second.device.addr).unwrap();
+        }
+        let _first = TestReservation(first.device.addr);
+        let _second = TestReservation(second.device.addr);
+        install(first.clone());
+        install(second.clone());
+        first.set_stage(Stage::Suspended);
+        second.set_stage(Stage::Station);
+        if ready(suspend_all(0)) != Some(Err(DevicePmError::Busy))
+            || first.suspended.load(Ordering::Acquire)
+            || second.suspended.load(Ordering::Acquire)
+            || OWNERS.lock().suspending
+        {
+            let _ = ready(resume_all());
+            return TestResult::Fail("later suspend failure left an earlier function parked");
+        }
+        // Cancellation after the first owner parks and the second awaits its
+        // supervisor must withdraw both requests and the new-probe barrier.
+        let mut future = alloc::boxed::Box::pin(suspend_all(SUSPEND_MS));
+        let pending = future
+            .as_mut()
+            .poll(&mut core::task::Context::from_waker(
+                core::task::Waker::noop(),
+            ))
+            .is_pending();
+        drop(future);
+        if !pending
+            || first.suspended.load(Ordering::Acquire)
+            || second.suspended.load(Ordering::Acquire)
+            || OWNERS.lock().suspending
+        {
+            let _ = ready(resume_all());
+            return TestResult::Fail("cancelled multi-function suspend retained requests");
+        }
+        second.set_stage(Stage::Suspended);
+        if ready(suspend_all(0)) != Some(Ok(()))
+            || !first.suspended.load(Ordering::Acquire)
+            || !second.suspended.load(Ordering::Acquire)
+            || Reservation::claim(other_device(27).addr).is_ok()
+        {
+            let _ = ready(resume_all());
+            return TestResult::Fail(
+                "successful multi-function suspend missed an owner/probe fence",
+            );
+        }
+        let _ = ready(resume_all());
+        if first.suspended.load(Ordering::Acquire)
+            || second.suspended.load(Ordering::Acquire)
+            || Reservation::claim(other_device(27).addr).is_err()
+        {
+            return TestResult::Fail("resume did not release every function and probe fence");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89/multiple",
+        smoke_rtw8852b_function_reservations_bound_duplicate_and_stale_removal
+    );
+    kernel_test_in!(
+        "drivers/wireless/rtw89/multiple",
+        smoke_rtw8852b_system_pm_fans_out_and_rolls_back_failed_or_cancelled_prepare
+    );
     kernel_test_in!(
         "drivers/wireless/rtw89/bootstrap",
         smoke_rtw8852b_retained_probe_never_reparks_or_replaces_reset_owner

@@ -12,6 +12,9 @@ use super::{
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zeroize::Zeroizing;
+#[path = "station_scan.rs"]
+mod station_scan;
+pub(in crate::rtl8xxxu) use station_scan::ActiveRequest;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,
@@ -176,8 +179,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Err(Error::Profile);
         }
         let own = radio.local().ok_or(Error::State)?;
-        let plan = Join::prepare_with_phy(candidate, own, ssid, mode, radio.ht_local())
-            .map_err(Error::Management)?;
+        let local = radio.ht_local_for(&candidate);
+        let plan =
+            Join::prepare_with_phy(candidate, own, ssid, mode, local).map_err(Error::Management)?;
         if plan.wmm().is_some() {
             radio.qualify_wmm(permission).map_err(Error::Radio)?;
         }
@@ -249,6 +253,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     pub(super) fn authority(&self) -> receive_runtime::Authority {
         self.radio.authority()
     }
+    pub(super) fn wide_supported(&self) -> bool {
+        self.radio.has_wide_profiles()
+    }
     pub(super) fn ht_enabled(&self) -> bool {
         self.radio.ht_enabled()
     }
@@ -309,6 +316,11 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 receive_runtime::Phase::Receiving => (),
                 _ => return Err(Error::State),
             }
+            let geometry = self.plan.offered_geometry().map_err(Error::Management)?;
+            self.radio
+                .select_station_geometry(geometry)
+                .await
+                .map_err(Error::Radio)?;
             self.radio
                 .enable_transmit(self.permission)
                 .await
@@ -460,6 +472,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                         }
                         self.radio
                             .association(aid, true)
+                            .await
+                            .map_err(Error::Radio)?;
+                        let geometry =
+                            self.plan.negotiated_geometry().map_err(Error::Management)?;
+                        let config = self.scan_config()?;
+                        self.radio
+                            .reconcile_station_geometry(geometry, config, self.permission)
                             .await
                             .map_err(Error::Radio)?;
                         if self.mode.is_wpa2() {
@@ -1413,7 +1432,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
 }
 /// A complete private authenticator EAPOL-Key original may cross only the
 /// M2/terminal-reply receive epoch. It never inherits captured DATA admission.
-fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
+pub(super) fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
     if b.len() < 24
         || !matches!(b[0], 8 | 0x88)
         || b[1] & 0xc7 != 2
@@ -1444,7 +1463,7 @@ fn private_eapol(b: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
     }
     usize::from(u16::from_be_bytes([payload[10], payload[11]])) + 12 == payload.len()
 }
-fn ethernet(frame: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn ethernet(frame: &[u8]) -> Option<Vec<u8>> {
     if frame.len() < 24
         || !matches!(frame[0], 8 | 0x88)
         || frame[1] & 0xc7 != 2

@@ -29,6 +29,17 @@ use narf_capabilities::{Cap, CapKind, CapType, Invoke, Write};
 
 use crate::bypass::xdp::XdpSocket;
 use crate::{Interface, NetIface};
+#[path = "stack_child.rs"]
+mod child;
+pub use child::retirement::ControlRetirement;
+#[cfg(feature = "kernel-test")]
+#[path = "stack_identity_tests.rs"]
+mod identity_tests;
+#[path = "stack_metadata.rs"]
+pub(crate) mod metadata;
+#[path = "stack_native.rs"]
+mod native;
+pub use native::AdminEmissionAuthority;
 
 /// Cap-type marker for per-interface admin authority.
 /// `Cap<AdminCap, Invoke>` gates `set_link_up` / `set_mtu` /
@@ -76,7 +87,13 @@ pub struct StackAttachReply {
 pub struct AdminHandle {
     cap: Cap<AdminCap, Invoke>,
     iface_name: String,
-    source: Option<StackAttach>,
+    source: Option<AdminSource>,
+}
+#[derive(Clone, Debug)]
+struct AdminSource {
+    attach: StackAttach,
+    registration: Option<u64>,
+    parent: Option<child::ControlParent>,
 }
 
 /// Mint the kernel-held administrative handle for the initial namespace's
@@ -100,7 +117,12 @@ static KERNEL_ADMIN: narf_lib::sync::IrqSafeSpinLock<
 
 /// The kernel-held handle for `iface`, or `None` if no such interface exists.
 pub fn kernel_admin(iface: &str) -> Option<AdminHandle> {
-    if iface != "lo" && crate::iface::lookup(iface).is_none() {
+    if iface != "lo"
+        && crate::iface::lookup(iface).is_none()
+        && !crate::registry()
+            .with_interface(iface, |iface| iface.control_namespace().is_some())
+            .unwrap_or(false)
+    {
         return None;
     }
     if let Some(handle) = KERNEL_ADMIN.lock().get(iface) {
@@ -160,31 +182,26 @@ impl AdminHandle {
 
     pub fn net_ns_id(&self) -> Result<u64, AdminError> {
         self.check_live()?;
+        self.observed_namespace().ok_or(AdminError::NoIface)
+    }
+    fn observed_namespace(&self) -> Option<u64> {
         if self.iface_name == "lo" {
-            return Ok(0);
+            return Some(0);
         }
         if let Some(iface) = crate::iface::lookup(&self.iface_name) {
-            return Ok(iface.net_ns_id);
+            return Some(iface.net_ns_id);
         }
-        crate::registry()
-            .with_interface(&self.iface_name, |_| 0)
-            .ok_or(AdminError::NoIface)
+        crate::registry().with_interface(&self.iface_name, |iface| {
+            iface.control_namespace().unwrap_or(0)
+        })
     }
 
     pub fn check_live(&self) -> Result<(), AdminError> {
-        if let Some(source) = &self.source {
-            source
-                .iface
-                .check_live()
-                .map_err(|_| AdminError::AuthorityRevoked)?;
-            source
-                .daemon
-                .check_live()
-                .map_err(|_| AdminError::AuthorityRevoked)?;
-        }
         self.cap
-            .check_live()
-            .map_err(|_| AdminError::AuthorityRevoked)
+            .invoke(AdminLiveness(self))
+            .map_err(|_| AdminError::AuthorityRevoked)?
+            .then_some(())
+            .ok_or(AdminError::NoIface)
     }
 
     /// Invoke the interface/namespace authorization operation at the
@@ -197,6 +214,7 @@ impl AdminHandle {
                 handle: self,
                 name,
                 net_ns_id,
+                ownership_epoch: None,
             })
             .map_err(|_| AdminError::AuthorityRevoked)?;
         if permitted {
@@ -214,9 +232,7 @@ impl AdminHandle {
         if self.iface_name == "lo" && up {
             return Ok(());
         }
-        crate::iface::set_link_state(&self.iface_name, up)
-            .then_some(())
-            .ok_or(AdminError::NoIface)
+        crate::iface::admin::apply(self, crate::iface::admin::Change::Link(up))
     }
 
     /// Transfer this interface to a network namespace. The interface-bound
@@ -233,11 +249,7 @@ impl AdminHandle {
         if !(68..=65_535).contains(&mtu) {
             return Err(AdminError::InvalidMtu);
         }
-        crate::iface::try_set_mtu(&self.iface_name, mtu).map_err(|code| match code {
-            19 => AdminError::NoIface,
-            22 => AdminError::InvalidMtu,
-            other => AdminError::DeviceError(other),
-        })
+        crate::iface::admin::apply(self, crate::iface::admin::Change::Mtu(mtu))
     }
 
     pub fn set_mac(&self, mac: [u8; 6]) -> Result<(), AdminError> {
@@ -245,11 +257,7 @@ impl AdminHandle {
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(AdminError::InvalidMac);
         }
-        crate::iface::try_set_mac(&self.iface_name, mac).map_err(|code| match code {
-            19 => AdminError::NoIface,
-            22 => AdminError::InvalidMac,
-            other => AdminError::DeviceError(other),
-        })
+        crate::iface::admin::apply(self, crate::iface::admin::Change::Mac(mac))
     }
 
     pub fn add_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {
@@ -442,12 +450,85 @@ struct AdminContext<'a> {
     handle: &'a AdminHandle,
     name: &'a str,
     net_ns_id: u64,
+    ownership_epoch: Option<u64>,
 }
 impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminContext<'_> {
     type Output = bool;
     fn execute(self, _: &Cap<AdminCap, Invoke>) -> Result<bool, narf_capabilities::CapError> {
-        Ok(self.handle.iface_name() == self.name
-            && self.handle.net_ns_id().ok() == Some(self.net_ns_id))
+        if self.handle.iface_name() != self.name {
+            return Ok(false);
+        }
+        if let Some(source) = self.handle.source.as_ref() {
+            source.attach.daemon.invoke(DelegatedAdminIdentity {
+                source,
+                name: self.name,
+                namespace: Some(self.net_ns_id),
+                ownership_epoch: self.ownership_epoch,
+            })
+        } else {
+            // Kernel namespace/name handles retain their existing scope.
+            Ok(self.handle.observed_namespace() == Some(self.net_ns_id))
+        }
+    }
+}
+struct AdminLiveness<'a>(&'a AdminHandle);
+impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminLiveness<'_> {
+    type Output = bool;
+    fn execute(self, _: &Cap<AdminCap, Invoke>) -> Result<bool, narf_capabilities::CapError> {
+        match self.0.source.as_ref() {
+            Some(source) => source.attach.daemon.invoke(DelegatedAdminIdentity {
+                source,
+                name: self.0.iface_name(),
+                namespace: None,
+                ownership_epoch: None,
+            }),
+            None => Ok(true),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct DelegatedAdminIdentity<'a> {
+    source: &'a AdminSource,
+    name: &'a str,
+    namespace: Option<u64>,
+    ownership_epoch: Option<u64>,
+}
+impl narf_capabilities::CapOp<StackDaemon, Invoke> for DelegatedAdminIdentity<'_> {
+    type Output = bool;
+    fn execute(self, _: &Cap<StackDaemon, Invoke>) -> Result<bool, narf_capabilities::CapError> {
+        if self
+            .source
+            .parent
+            .as_ref()
+            .is_some_and(|parent| !parent.current())
+        {
+            return Ok(false);
+        }
+        self.source.attach.iface.invoke(self)
+    }
+}
+impl narf_capabilities::CapOp<NetIface, Write> for DelegatedAdminIdentity<'_> {
+    type Output = bool;
+    fn execute(self, cap: &Cap<NetIface, Write>) -> Result<bool, narf_capabilities::CapError> {
+        Ok(crate::registry()
+            .with_interface_for_handle(cap, |iface| {
+                if iface.name() != self.name {
+                    return false;
+                }
+                if let Some(namespace) = iface.control_namespace() {
+                    self.source.registration.is_none()
+                        && crate::iface::registration_matches(self.name, None, None)
+                        && self.namespace.is_none_or(|expected| expected == namespace)
+                } else {
+                    crate::iface::registration_owner_matches(
+                        self.name,
+                        self.source.registration,
+                        self.namespace,
+                        self.ownership_epoch,
+                    )
+                }
+            })
+            .unwrap_or(false))
     }
 }
 
@@ -535,14 +616,24 @@ impl narf_capabilities::CapOp<NetIface, Write> for InterfaceControl {
         self,
         cap: &Cap<NetIface, Write>,
     ) -> Result<Self::Output, narf_capabilities::CapError> {
-        Ok(
-            crate::registry().with_interface_for_handle(cap, |iface| StackAttachReply {
-                admin: AdminHandle {
-                    cap: Cap::<AdminCap, Invoke>::bootstrap(),
-                    iface_name: String::from(iface.name()),
-                    source: Some(self.0),
-                },
-            }),
-        )
+        Ok(crate::registry()
+            .with_interface_for_handle(cap, |iface| {
+                let registration = crate::iface::registration_identity(iface.name());
+                if registration == Some(0) {
+                    return None;
+                }
+                Some(StackAttachReply {
+                    admin: AdminHandle {
+                        cap: Cap::<AdminCap, Invoke>::bootstrap(),
+                        iface_name: String::from(iface.name()),
+                        source: Some(AdminSource {
+                            attach: self.0,
+                            registration,
+                            parent: None,
+                        }),
+                    },
+                })
+            })
+            .flatten())
     }
 }

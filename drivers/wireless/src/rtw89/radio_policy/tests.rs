@@ -57,7 +57,7 @@ fn smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio() -> Te
     let cap = authority();
     let legacy = image(base);
     let mut old = Qualification::from_verified(&legacy, Some([3; 32]), base, cap).unwrap();
-    old.model_domain = Some(domain());
+    old.model_domain = Some(alloc::sync::Arc::new(domain()));
     if old.wmm_allowed() != Ok(false) {
         return TestResult::Fail("legacy full-radio qualification silently granted WMM");
     }
@@ -89,7 +89,7 @@ fn smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio() -> Te
         Ok(q) => q,
         Err(_) => return TestResult::Fail("exact signed WMM recipe rejected"),
     };
-    qualified.model_domain = Some(domain());
+    qualified.model_domain = Some(alloc::sync::Arc::new(domain()));
     if !qualified.matches(base)
         || qualified.wmm_allowed() != Ok(true)
         || base.wmm().identity() == base.identity()
@@ -366,7 +366,7 @@ pub(in crate::rtw89) fn revocable_model() -> (Qualification, Cap<FirmwareBlob, R
     let cap = authority();
     let mut calibration =
         Qualification::from_verified(&image(board), Some([3; 32]), board, cap).unwrap();
-    calibration.model_domain = Some(domain());
+    calibration.model_domain = Some(alloc::sync::Arc::new(domain()));
     (calibration, cap)
 }
 pub(in crate::rtw89) fn revoke_on_publication_model() -> (Qualification, Cap<FirmwareBlob, Read>) {
@@ -374,6 +374,144 @@ pub(in crate::rtw89) fn revoke_on_publication_model() -> (Qualification, Cap<Fir
     qualification.model_revoke_before_publication = true;
     (qualification, cap)
 }
+
+fn expanded_record(base: &Qualification, magic: &[u8; 4], binding: [u8; 32]) -> [u8; 128] {
+    let mut bytes = [0; 128];
+    bytes[..4].copy_from_slice(magic);
+    bytes[4..8].copy_from_slice(&[1, 0, 128, 0]);
+    bytes[8..12].copy_from_slice(&128u32.to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&base.board.device.to_le_bytes());
+    bytes[16..48].copy_from_slice(&binding);
+    bytes[48..54].copy_from_slice(&base.board.mac);
+    bytes[54..58].copy_from_slice(&[1, 20, 1, 3]);
+    bytes
+}
+/// Explicit inert authenticated-record boundary for native register tests;
+/// no production attach, measured RF envelope or physical receipt is minted.
+pub(in crate::rtw89) fn rf_tracking_model(
+    window: super::super::rf_tracking::Window,
+    aggregate: bool,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+) {
+    let board = board();
+    let flags = Program::Ampdu.flags();
+    let mut bytes = image(board.with_programs(flags));
+    bytes[57] = flags;
+    let base_cap = authority();
+    let mut base = Qualification::from_verified(&bytes, Some([3; 32]), board, base_cap).unwrap();
+    base.model_domain = Some(alloc::sync::Arc::new(domain()));
+    if aggregate {
+        let request = amsdu::AmsduRequest::new(&base).unwrap();
+        let mut record = expanded_record(&base, b"N52A", request.binding);
+        record[58..60].copy_from_slice(&5000u16.to_le_bytes());
+        record[60] = 8;
+        base.amsdu = Some(
+            amsdu::Amsdu::from_verified(&base, &request, &record, Some([3; 32]), authority())
+                .unwrap(),
+        );
+    }
+    let request = rf_tracking::Request::new(&base).unwrap();
+    let mut record = expanded_record(&base, b"N52T", request.binding);
+    record[58..60].copy_from_slice(&window.low.to_le_bytes());
+    record[60..62].copy_from_slice(&window.high.to_le_bytes());
+    let tracking_cap = authority();
+    base.rf_tracking = Some(
+        rf_tracking::Tracking::from_verified(&base, &request, &record, Some([3; 32]), tracking_cap)
+            .unwrap(),
+    );
+    (base, base_cap, tracking_cap)
+}
+
+fn smoke_rtw8852b_periodic_dpk_signed_joint_program_window_and_current_caps() -> TestResult {
+    use super::super::rf_tracking::Window;
+    let window = Window {
+        low: 100,
+        high: 140,
+    };
+    let (mut base, base_cap, tracking_cap) = rf_tracking_model(window, false);
+    if base.rf_tracking_window() != Ok(Some(window)) || base.with_current(|| Ok(7)) != Ok(7) {
+        return TestResult::Fail("actual signed tracking record/current power window");
+    }
+    let request = rf_tracking::Request::new(&base).unwrap();
+    let candidate_cap = authority();
+    let mut record = expanded_record(&base, b"N52T", request.binding);
+    record[58..60].copy_from_slice(&100u16.to_le_bytes());
+    record[60..62].copy_from_slice(&140u16.to_le_bytes());
+    for signer in [None, Some([4; 32])] {
+        if rf_tracking::Tracking::from_verified(&base, &request, &record, signer, candidate_cap)
+            .is_ok()
+        {
+            return TestResult::Fail("unsigned/different signer periodic RF program");
+        }
+    }
+    for length in 0..128 {
+        if rf_tracking::Tracking::from_verified(
+            &base,
+            &request,
+            &record[..length],
+            Some([3; 32]),
+            candidate_cap,
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("truncated periodic RF program");
+        }
+    }
+    for at in [0, 4, 8, 12, 14, 16, 48, 54, 55, 56, 57, 62, 127] {
+        let mut bad = record;
+        bad[at] ^= 1;
+        if rf_tracking::Tracking::from_verified(&base, &request, &bad, Some([3; 32]), candidate_cap)
+            .is_ok()
+        {
+            return TestResult::Fail("malformed/other identity periodic RF program");
+        }
+    }
+    let mut bad = record;
+    bad[58..60].copy_from_slice(&141u16.to_le_bytes());
+    if rf_tracking::Tracking::from_verified(&base, &request, &bad, Some([3; 32]), candidate_cap)
+        .is_ok()
+    {
+        return TestResult::Fail("inverted measured PWSF window");
+    }
+    let (with_aggregate, _, _) = rf_tracking_model(window, true);
+    let joint = rf_tracking::Request::new(&with_aggregate).unwrap();
+    if joint.binding == request.binding
+        || rf_tracking::Tracking::from_verified(
+            &with_aggregate,
+            &joint,
+            &record,
+            Some([3; 32]),
+            candidate_cap,
+        )
+        .is_ok()
+    {
+        return TestResult::Fail(
+            "tracking-only RF envelope silently admitted joint A-MSDU program",
+        );
+    }
+    alloc::sync::Arc::make_mut(base.model_domain.as_mut().unwrap()).rules[0].max_power_dbm = 1;
+    if base.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("periodic RF ignored tightened actual host power");
+    }
+    base.model_domain = Some(alloc::sync::Arc::new(domain()));
+    tracking_cap.revoke();
+    if base.current().is_ok() || base.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("actual tracking cap revocation left native RF authority");
+    }
+    base_cap.revoke();
+    if base.rf_tracking_window().is_ok() {
+        return TestResult::Fail("old base source revived tracking window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/tracking",
+    smoke_rtw8852b_periodic_dpk_signed_joint_program_window_and_current_caps
+);
 
 fn smoke_rtw89_b_each_calibration_packet_and_response_peak_is_independently_required() -> TestResult
 {
@@ -409,7 +547,7 @@ fn smoke_rtw89_b_full_radio_publication_runs_inside_current_signed_scope() -> Te
     {
         return TestResult::Fail("current full radio scope did not publish");
     }
-    grant.model_domain.as_mut().unwrap().rules[0].max_power_dbm = 1;
+    alloc::sync::Arc::make_mut(grant.model_domain.as_mut().unwrap()).rules[0].max_power_dbm = 1;
     if grant
         .with_current(|| {
             published += 1;
@@ -420,7 +558,7 @@ fn smoke_rtw89_b_full_radio_publication_runs_inside_current_signed_scope() -> Te
     {
         return TestResult::Fail("full radio scope ignored current host policy");
     }
-    grant.model_domain = Some(domain());
+    grant.model_domain = Some(alloc::sync::Arc::new(domain()));
     cap.revoke();
     if grant
         .with_current(|| {
@@ -478,7 +616,7 @@ fn smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity() ->
     let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("genuine all-AC record rejected");
     };
-    granted.model_domain = Some(domain());
+    granted.model_domain = Some(alloc::sync::Arc::new(domain()));
     if granted.allows(Program::QosAll) != Ok(true)
         || granted.wmm_allowed() != Ok(true)
         || !granted.matches(base)
@@ -490,7 +628,7 @@ fn smoke_rtw8852b_operating_programs_each_require_their_own_signed_identity() ->
     let Ok(mut wmm_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("WMM record rejected");
     };
-    wmm_only.model_domain = Some(domain());
+    wmm_only.model_domain = Some(alloc::sync::Arc::new(domain()));
     if wmm_only.allows(Program::QosAll) != Ok(false) {
         return TestResult::Fail("WMM record granted all-AC QoS");
     }
@@ -534,7 +672,7 @@ fn smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity() -> TestRe
     let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("genuine HE record rejected");
     };
-    granted.model_domain = Some(domain());
+    granted.model_domain = Some(alloc::sync::Arc::new(domain()));
     if granted.allows(Program::He) != Ok(true) || granted.allows(Program::Ht) != Ok(true) {
         return TestResult::Fail("HE record did not grant HE and HT");
     }
@@ -543,7 +681,7 @@ fn smoke_rtw8852b_he_program_requires_ht_and_its_own_signed_identity() -> TestRe
     let Ok(mut ht_only) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("HT record rejected");
     };
-    ht_only.model_domain = Some(domain());
+    ht_only.model_domain = Some(alloc::sync::Arc::new(domain()));
     if ht_only.allows(Program::He) != Ok(false) {
         return TestResult::Fail("HT record granted HE");
     }
@@ -621,7 +759,7 @@ fn smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity() -> Tes
     let Ok(mut granted) = Qualification::from_verified(&bytes, Some([3; 32]), base, cap) else {
         return TestResult::Fail("genuine A-MPDU record rejected");
     };
-    granted.model_domain = Some(domain());
+    granted.model_domain = Some(alloc::sync::Arc::new(domain()));
     if granted.allows(Program::Ampdu) != Ok(true) || granted.allows(Program::He) != Ok(false) {
         return TestResult::Fail("A-MPDU record grants differ");
     }
@@ -634,4 +772,673 @@ fn smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity() -> Tes
 kernel_test_in!(
     "drivers/wireless/rtw89/radio",
     smoke_rtw8852b_ampdu_program_requires_ht_and_its_own_signed_identity
+);
+
+fn smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_power() -> TestResult
+{
+    let base = board();
+    let flags = Program::Ampdu.flags();
+    let mut bytes = image(base.with_programs(flags));
+    bytes[57] = flags;
+    let base_cap = authority();
+    let mut qualified =
+        Qualification::from_verified(&bytes, Some([3; 32]), base, base_cap).unwrap();
+    qualified.model_domain = Some(alloc::sync::Arc::new(domain()));
+    if qualified.amsdu_allowed() != Ok(false) || qualified.allows(Program::Ampdu) != Ok(true) {
+        return TestResult::Fail("old A-MPDU record silently authorizes expanded A-MSDU");
+    }
+    let request = amsdu::AmsduRequest::new(&qualified).unwrap();
+    if request.name != "rtw89/rtw8852b-tx-amsdu-v1-020406080a0c.bin" {
+        return TestResult::Fail("actual companion provisioning name");
+    }
+    let mut expanded = [0; 128];
+    expanded[..4].copy_from_slice(b"N52A");
+    expanded[4..8].copy_from_slice(&[1, 0, 128, 0]);
+    expanded[8..12].copy_from_slice(&128u32.to_le_bytes());
+    expanded[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    expanded[14..16].copy_from_slice(&base.device.to_le_bytes());
+    expanded[16..48].copy_from_slice(&request.binding);
+    expanded[48..54].copy_from_slice(&base.mac);
+    expanded[54..58].copy_from_slice(&[1, 20, 1, 3]);
+    expanded[58..60].copy_from_slice(&5000u16.to_le_bytes());
+    expanded[60] = 8;
+    let cap = authority();
+    for signer in [None, Some([4; 32])] {
+        if amsdu::Amsdu::from_verified(&qualified, &request, &expanded, signer, cap).is_ok() {
+            return TestResult::Fail("unsigned/different signer expanded RF program");
+        }
+    }
+    for length in 0..128 {
+        if amsdu::Amsdu::from_verified(
+            &qualified,
+            &request,
+            &expanded[..length],
+            Some([3; 32]),
+            cap,
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("truncated expanded RF program");
+        }
+    }
+    for at in [0, 4, 8, 12, 14, 16, 48, 54, 55, 56, 57, 58, 60, 61, 127] {
+        let mut bad = expanded;
+        bad[at] ^= 1;
+        if amsdu::Amsdu::from_verified(&qualified, &request, &bad, Some([3; 32]), cap).is_ok() {
+            return TestResult::Fail("different identity/shape/reserved expanded RF program");
+        }
+    }
+    // Same board/program but a different actual measured power record must
+    // earn its own binding, even when both records remain individually valid.
+    let mut different = bytes;
+    different[62..64].copy_from_slice(&39i16.to_le_bytes());
+    let other = Qualification::from_verified(&different, Some([3; 32]), base, authority()).unwrap();
+    if amsdu::AmsduRequest::new(&other).unwrap().binding == request.binding {
+        return TestResult::Fail("companion identity omitted actual installed record digest");
+    }
+    let other_request = amsdu::AmsduRequest::new(&other).unwrap();
+    if amsdu::Amsdu::from_verified(&other, &other_request, &expanded, Some([3; 32]), cap).is_ok()
+        || amsdu::Amsdu::from_verified(&other, &request, &expanded, Some([3; 32]), cap).is_ok()
+    {
+        return TestResult::Fail("actual companion transplanted to another measured base record");
+    }
+    qualified.amsdu = Some(
+        amsdu::Amsdu::from_verified(&qualified, &request, &expanded, Some([3; 32]), cap).unwrap(),
+    );
+    if qualified.amsdu_allowed() != Ok(true) || qualified.with_current(|| Ok(7)) != Ok(7) {
+        return TestResult::Fail("genuine expanded program current base/power admission");
+    }
+    alloc::sync::Arc::make_mut(qualified.model_domain.as_mut().unwrap()).rules[0].max_power_dbm = 1;
+    if qualified.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("expanded program bypassed tightened actual host power");
+    }
+    qualified.model_domain = Some(alloc::sync::Arc::new(domain()));
+    cap.revoke();
+    if qualified.amsdu_allowed().is_ok() || qualified.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("revoked actual companion remained ordinary emission authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/aggregation",
+    smoke_rtw8852b_amsdu_companion_binds_exact_base_program_signer_and_current_power
+);
+
+fn smoke_rtw8852b_lps_joint_artifact_binds_all_current_optional_programs() -> TestResult {
+    let profile = super::super::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap();
+    for version in [
+        [0, 27, 32, 1],
+        [0, 29, 28, 255],
+        [0, 29, 122, 0],
+        [0, 29, 127, 0],
+        [0, 29, 128, 0],
+    ] {
+        if super::super::lps_wire::Profile::for_version(version).is_some() {
+            return TestResult::Fail("unadmitted B full-radio firmware gained LPS producer");
+        }
+    }
+    let window = super::super::rf_tracking::Window {
+        low: 0x30,
+        high: 0xc0,
+    };
+    let (mut base, _, tracking_cap) = rf_tracking_model(window, true);
+    if base.sleep_profile() != Ok(None) {
+        return TestResult::Fail("old expanded radio silently entered LPS");
+    }
+    let request = lps::Request::new(&base, profile).unwrap();
+    let mut record = expanded_record(&base, b"N52P", request.binding);
+    record[58..62].copy_from_slice(&profile.version);
+    let cap = authority();
+    for signer in [None, Some([4; 32])] {
+        if lps::Sleep::from_verified(&base, &request, profile, &record, signer, cap).is_ok() {
+            return TestResult::Fail("unsigned/wrong signer joint LPS accepted");
+        }
+    }
+    for at in [0, 4, 8, 12, 14, 16, 48, 54, 58, 61, 62, 127] {
+        let mut bad = record;
+        bad[at] ^= 1;
+        if lps::Sleep::from_verified(&base, &request, profile, &bad, Some([3; 32]), cap).is_ok() {
+            return TestResult::Fail("malformed/source-mismatched LPS joint record accepted");
+        }
+    }
+    let (other, _, _) = rf_tracking_model(window, false);
+    if lps::Request::new(&other, profile).unwrap().binding == request.binding {
+        return TestResult::Fail("LPS erased actual installed A-MSDU companion binding");
+    }
+    let old_digest = base.rf_tracking.as_ref().unwrap().digest();
+    let (narrow, _, _) = rf_tracking_model(
+        super::super::rf_tracking::Window {
+            low: 0x40,
+            high: 0x80,
+        },
+        true,
+    );
+    if narrow.rf_tracking.as_ref().unwrap().digest() == old_digest
+        || lps::Request::new(&narrow, profile).unwrap().binding == request.binding
+    {
+        return TestResult::Fail("LPS erased actual tracking window/raw-record binding");
+    }
+    base.lps = Some(
+        lps::Sleep::from_verified(&base, &request, profile, &record, Some([3; 32]), cap).unwrap(),
+    );
+    if base.sleep_profile() != Ok(Some(profile)) || base.with_current(|| Ok(9)) != Ok(9) {
+        return TestResult::Fail("exact joint LPS current scopes rejected");
+    }
+    cap.revoke();
+    if base.sleep_profile().is_ok() || base.with_current(|| Ok(9)).is_ok() {
+        return TestResult::Fail("revoked LPS companion retained native permission");
+    }
+    tracking_cap.revoke();
+    if base.current().is_ok() {
+        return TestResult::Fail("joint LPS bypassed revoked original tracking source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/runtime_sleep",
+    smoke_rtw8852b_lps_joint_artifact_binds_all_current_optional_programs
+);
+
+/// Explicit authenticated-record boundary for actual inert Native/NativeIo
+/// tests, like rf_tracking_model; no real attach/RFK or measurement is minted.
+pub(in crate::rtw89) fn lps_model(
+    effect: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+) {
+    let (mut base, base_cap, _) = rf_tracking_model(
+        super::super::rf_tracking::Window {
+            low: 100,
+            high: 140,
+        },
+        false,
+    );
+    let profile = super::super::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap();
+    let request = lps::Request::new(&base, profile).unwrap();
+    let mut record = expanded_record(&base, b"N52P", request.binding);
+    record[58..62].copy_from_slice(&profile.version);
+    let cap = authority();
+    base.lps = Some(
+        lps::Sleep::from_verified(&base, &request, profile, &record, Some([3; 32]), cap).unwrap(),
+    );
+    base.model_native_before_publication = effect;
+    (base, base_cap, cap)
+}
+
+/// Authenticated-record/RFK fixture boundary only, shared by actual Native and
+/// public worker fixtures. Production only loads an actually signed N52F file.
+pub(in crate::rtw89) fn fragment_model(
+    effect: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+) {
+    let (mut base, original, _) = rf_tracking_model(
+        super::super::rf_tracking::Window {
+            low: 100,
+            high: 140,
+        },
+        true,
+    );
+    let profile = super::super::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap();
+    let ps = lps::Request::new(&base, profile).unwrap();
+    let mut record = expanded_record(&base, b"N52P", ps.binding);
+    record[58..62].copy_from_slice(&profile.version);
+    base.lps = Some(
+        lps::Sleep::from_verified(&base, &ps, profile, &record, Some([3; 32]), authority())
+            .unwrap(),
+    );
+    base.model_native_before_publication = effect;
+    let request = fragment::Request::new(&base).unwrap();
+    let record = fragment_record(&base, &request);
+    let companion = authority();
+    base.fragments = Some(
+        fragment::Fragments::from_verified(&base, &request, &record, Some([3; 32]), companion)
+            .unwrap(),
+    );
+    (base, original, companion)
+}
+fn fragment_record(base: &Qualification, request: &fragment::Request) -> [u8; 128] {
+    let mut bytes = expanded_record(base, b"N52F", request.binding);
+    bytes[58..60].copy_from_slice(&2346u16.to_le_bytes());
+    bytes[60..64].copy_from_slice(&[16, 0, 3, 1]);
+    bytes
+}
+fn smoke_rtw8852b_fragment_full_joint_companion_preserves_prior_records_and_current_grants(
+) -> TestResult {
+    let (mut base, original, _) = fragment_model(None);
+    base.fragments = None;
+    let old = fragment::Request::new(&base).unwrap();
+    if base.fragments_allowed() != Ok(false) || base.current().is_err() {
+        return TestResult::Fail("absent fragment record changed prior native program");
+    }
+    let bytes = fragment_record(&base, &old);
+    for offset in [
+        0, 4, 8, 12, 14, 16, 47, 48, 54, 57, 58, 60, 61, 62, 63, 64, 127,
+    ] {
+        let mut bad = bytes;
+        bad[offset] ^= 1;
+        if fragment::Fragments::from_verified(&base, &old, &bad, Some([3; 32]), authority()).is_ok()
+        {
+            return TestResult::Fail("N52F accepted malformed/source/digest/size/sequence program");
+        }
+    }
+    if fragment::Fragments::from_verified(&base, &old, &bytes, None, authority()).is_ok()
+        || fragment::Fragments::from_verified(&base, &old, &bytes, Some([4; 32]), authority())
+            .is_ok()
+    {
+        return TestResult::Fail("N52F bypassed original signer/source");
+    }
+    for kind in 0..3 {
+        let (mut changed, _, _) = fragment_model(None);
+        changed.fragments = None;
+        match kind {
+            0 => changed.lps = None,
+            1 => changed.rf_tracking = None,
+            _ => changed.amsdu = None,
+        }
+        if fragment::Request::new(&changed).unwrap().binding == old.binding {
+            return TestResult::Fail("N52F joint binding lost actual A/T/P optional program");
+        }
+    }
+    original.revoke();
+    if fragment::Fragments::from_verified(&base, &old, &bytes, Some([3; 32]), authority()).is_ok() {
+        return TestResult::Fail("N52F recaptured revoked installed original base");
+    }
+    let (base, original, companion) = fragment_model(None);
+    if base.fragments_allowed() != Ok(true) || base.with_current(|| Ok(3)) != Ok(3) {
+        return TestResult::Fail("N52F actual finite joint current/invoke chain");
+    }
+    companion.revoke();
+    if base.fragments_allowed().is_ok() || base.with_current(|| Ok(3)).is_ok() {
+        return TestResult::Fail("revoked N52F retained fragment emission");
+    }
+    original.revoke();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/fragmentation",
+    smoke_rtw8852b_fragment_full_joint_companion_preserves_prior_records_and_current_grants
+);
+
+/// Explicit inert N52C boundary: authenticated test records only; no
+/// production attach, measured envelope or physical receipt is minted.
+pub(in crate::rtw89) fn channel_model(
+    primary: u8,
+    peak_qdbm: i16,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+    Board,
+) {
+    let (mut base, base_cap) = revocable_model();
+    let profile = super::super::operating_channel::Profile::from_primary(primary).unwrap();
+    let mut board = board();
+    board.identity = [primary; 32];
+    let request = channel::Request::new(&base, profile, board.with_programs(base.flags)).unwrap();
+    let record = channel_record(&base, &request, primary, peak_qdbm);
+    let cap = authority();
+    let channel = channel::Channel::from_verified(
+        &base,
+        &request,
+        profile,
+        board.with_programs(base.flags),
+        &record,
+        Some([3; 32]),
+        cap,
+    )
+    .unwrap();
+    base.channels.push(channel);
+    (base, base_cap, cap, board)
+}
+fn channel_record(
+    base: &Qualification,
+    request: &channel::Request,
+    primary: u8,
+    peak_qdbm: i16,
+) -> [u8; 128] {
+    let mut record = expanded_record(base, b"N52C", request.binding);
+    record[54..58].copy_from_slice(&[1, 20, primary, base.flags]);
+    record[58..60].copy_from_slice(&4i16.to_le_bytes());
+    record[60..62].copy_from_slice(&76i16.to_le_bytes());
+    for at in [62, 64, 66] {
+        record[at..at + 2].copy_from_slice(&peak_qdbm.to_le_bytes());
+    }
+    record
+}
+pub(in crate::rtw89) fn band_domain() -> narf_wireless::reg::RegulatoryDomain {
+    let mut domain = domain();
+    domain.rules[0].freq_end_mhz = 2472;
+    domain
+}
+fn smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span() -> TestResult {
+    use super::super::operating_channel::Profile;
+    use narf_wireless::association::channel::Band;
+    let six = Profile::new(Band::Ghz2, 6).unwrap();
+    let (mut base, base_cap, record_cap, board) = channel_model(6, 40);
+    // Channel1/14 never get a noninitial record; v2 is not reinterpreted.
+    for primary in [1, 14] {
+        let profile = Profile::new(Band::Ghz2, primary).unwrap();
+        if channel::Request::new(&base, profile, board.with_programs(base.flags)).is_ok() {
+            return TestResult::Fail("N52C admitted the initial or CCK-only primary");
+        }
+    }
+    let request = channel::Request::new(&base, six, board.with_programs(base.flags)).unwrap();
+    let good = channel_record(&base, &request, 6, 40);
+    for (signer, bytes, profile, label) in [
+        (Some([4; 32]), good, six, "foreign signer"),
+        (None, good, six, "unsigned record"),
+        (
+            Some([3; 32]),
+            channel_record(&base, &request, 7, 40),
+            six,
+            "wrong primary byte",
+        ),
+        (
+            Some([3; 32]),
+            good,
+            Profile::new(Band::Ghz2, 7).unwrap(),
+            "record reused for another primary",
+        ),
+    ] {
+        let rebuilt = channel::Request::new(&base, profile, board.with_programs(base.flags));
+        if rebuilt.is_ok_and(|request| {
+            channel::Channel::from_verified(
+                &base,
+                &request,
+                profile,
+                board.with_programs(base.flags),
+                &bytes,
+                signer,
+                authority(),
+            )
+            .is_ok()
+        }) {
+            return TestResult::Fail(label);
+        }
+    }
+    let mut other = board;
+    other.identity = [0x55; 32];
+    if channel::Channel::from_verified(
+        &base,
+        &request,
+        six,
+        other.with_programs(base.flags),
+        &good,
+        Some([3; 32]),
+        authority(),
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("N52C accepted another per-channel identity");
+    }
+    if !base.channel_matches(six, board)
+        || base.channel_matches(six, other)
+        || base.channel_allowed(six) != Ok(true)
+        || base.channel_allowed(Profile::new(Band::Ghz2, 7).unwrap()) != Ok(false)
+        || base.channel_allowed(Profile::INITIAL) != Ok(true)
+    {
+        return TestResult::Fail("N52C admission did not follow the signed record");
+    }
+    // Host rule covers only channel1: selecting 6 fails and leaves 1 active.
+    if base.select(six).is_ok() || base.active() != 1 || base.with_current(|| Ok(1)) != Ok(1) {
+        return TestResult::Fail("channel6 selected outside its occupied span");
+    }
+    base.model_domain = Some(alloc::sync::Arc::new(band_domain()));
+    if base.select(six).is_err() || base.active() != 6 || base.with_current(|| Ok(6)) != Ok(6) {
+        return TestResult::Fail("current channel6 record did not gate publication");
+    }
+    // A record whose peaks exceed the current ceiling is refused at select.
+    let (mut hot, _, _, _) = channel_model(9, 80);
+    hot.model_domain = Some(alloc::sync::Arc::new(band_domain()));
+    if hot.select(Profile::new(Band::Ghz2, 9).unwrap()).is_ok() || hot.active() != 1 {
+        return TestResult::Fail("channel9 peaks exceeded the host ceiling");
+    }
+    // A later companion change retires the old joint binding.
+    let (mut joint, _, _) = fragment_model(None);
+    let flags = joint.flags;
+    let request = channel::Request::new(&joint, six, board.with_programs(flags)).unwrap();
+    let record = channel_record(&joint, &request, 6, 40);
+    let channel = channel::Channel::from_verified(
+        &joint,
+        &request,
+        six,
+        board.with_programs(flags),
+        &record,
+        Some([3; 32]),
+        authority(),
+    )
+    .unwrap();
+    joint.channels.push(channel);
+    joint.model_domain = Some(alloc::sync::Arc::new(band_domain()));
+    if joint.channel_allowed(six) != Ok(true)
+        || request.binding
+            == channel::Request::new(&base, six, board.with_programs(base.flags))
+                .unwrap()
+                .binding
+    {
+        return TestResult::Fail("N52C joint binding ignored installed companions");
+    }
+    joint.fragments = None;
+    if joint.channel_allowed(six).is_ok() || joint.select(six).is_ok() {
+        return TestResult::Fail("N52C survived a changed companion set");
+    }
+    record_cap.revoke();
+    if base.with_current(|| Ok(6)).is_ok() || base.select(Profile::INITIAL).is_err() {
+        return TestResult::Fail("revoked N52C kept emitting or blocked channel1 return");
+    }
+    if base.select(six).is_ok() {
+        return TestResult::Fail("revoked N52C reselected");
+    }
+    base_cap.revoke();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_channel_record_binds_noninitial_identity_signer_and_occupied_span
+);
+
+/// 5GHz N52C: a typed 5GHz primary binds its own record (distinct recipe and
+/// name), is admitted and selectable under a plain, AUTO_BW/NO_160MHZ, DFS or
+/// NO_IR host span; an unknown flag refuses and keeps channel1 active. A
+/// DFS / NO_IR span is passive-only: frame TX (`tx_current`) needs a witness
+/// grant for that primary under the current policy snapshot, which `select`
+/// of another primary and a policy replacement both end.
+fn smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span() -> TestResult {
+    use super::super::operating_channel::Profile;
+    use narf_wireless::association::channel::Band;
+    use narf_wireless::reg::{RegFlags, RegRule};
+    let a36 = Profile::new(Band::Ghz5, 36).unwrap();
+    let (mut base, _base_cap, _record_cap, board) = channel_model(36, 40);
+    let Ok(request) = channel::Request::new(&base, a36, board.with_programs(base.flags)) else {
+        return TestResult::Fail("N52C refused a typed 5GHz primary");
+    };
+    if !request.name.contains("-ch36-")
+        || channel::Request::new(
+            &base,
+            Profile::new(Band::Ghz5, 40).unwrap(),
+            board.with_programs(base.flags),
+        )
+        .is_ok_and(|other| other.binding == request.binding)
+    {
+        return TestResult::Fail("5GHz N52C name/binding not per primary");
+    }
+    let rule = |start, end, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: 80,
+        max_power_dbm: 20,
+        flags,
+    };
+    let mut open = domain();
+    open.rules.push(rule(5170, 5250, RegFlags::empty()));
+    let mut radar = domain();
+    radar.rules.push(rule(5170, 5250, RegFlags::DFS));
+    let mut passive = domain();
+    passive.rules.push(rule(5170, 5250, RegFlags::NO_IR));
+    // wireless-regdb AUTO-BW / NO_160MHZ restrict nothing at 20MHz.
+    let mut auto = domain();
+    auto.rules
+        .push(rule(5170, 5250, RegFlags::AUTO_BW | RegFlags::NO_160MHZ));
+    let mut unknown = domain();
+    unknown
+        .rules
+        .push(rule(5170, 5250, RegFlags::from_bits_retain(1 << 12)));
+    for (domain, admitted, passive_only, label) in [
+        (radar, true, true, "DFS 5GHz span not admitted passively"),
+        (
+            passive,
+            true,
+            true,
+            "NO_IR 5GHz span not admitted passively",
+        ),
+        (unknown, false, false, "unknown rule flag admitted"),
+        (auto, true, false, "AUTO_BW/NO_160MHZ 5GHz span refused"),
+        (open, true, false, "non-DFS 5GHz span refused"),
+    ] {
+        let policy = alloc::sync::Arc::new(domain);
+        base.model_domain = Some(policy.clone());
+        if base.select(Profile::INITIAL).is_err()
+            || base.channel_allowed(a36) != Ok(admitted)
+            || base.select(a36).is_ok() != admitted
+            || base.active() != if admitted { 36 } else { 1 }
+        {
+            return TestResult::Fail(label);
+        }
+        if !admitted {
+            continue;
+        }
+        // RX/RF publication stays open; frame TX needs the witness grant.
+        if base.current().is_err() || base.tx_current().is_ok() == passive_only {
+            return TestResult::Fail("passive-only span changed TX admission");
+        }
+        base.grant_passive_tx(Some((36, policy.clone())));
+        if base.tx_current().is_err() {
+            return TestResult::Fail("witness grant did not admit TX");
+        }
+        // Same rules, new snapshot: the grant is bound to its policy.
+        base.model_domain = Some(alloc::sync::Arc::new(policy.as_ref().clone()));
+        if base.tx_current().is_ok() == passive_only {
+            return TestResult::Fail("passive TX grant outlived its policy snapshot");
+        }
+        base.model_domain = Some(policy.clone());
+        // Retuning elsewhere drops it; returning does not revive it.
+        if base.select(Profile::INITIAL).is_err()
+            || base.select(a36).is_err()
+            || base.tx_current().is_ok() == passive_only
+        {
+            return TestResult::Fail("passive TX grant survived a retune");
+        }
+        base.grant_passive_tx(None);
+    }
+    // A 2.4GHz span is never passive-admitted: NO_IR still refuses there.
+    let mut low = domain();
+    for r in low.rules.iter_mut() {
+        r.flags |= RegFlags::NO_IR;
+    }
+    base.model_domain = Some(alloc::sync::Arc::new(low));
+    if base.select(Profile::INITIAL).is_ok() {
+        return TestResult::Fail("2.4GHz NO_IR span admitted");
+    }
+    base.model_domain = Some(alloc::sync::Arc::new(domain()));
+    if base.select(Profile::INITIAL).is_err() || base.active() != 1 {
+        return TestResult::Fail("cross-band return to channel1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_5ghz_channel_record_admits_passive_dfs_host_span
+);
+/// A 40MHz N52C record is its own operating program: named and bound per
+/// primary/width/center, `[54..57] = [1, 40, primary]`, `[68] = center`,
+/// never admitting the 20MHz program of its primary (nor the other side),
+/// and gated by the host rule over the whole 40MHz span including the
+/// rule's maximum bandwidth (cfg80211 `reg_does_bw_fit`).
+fn smoke_rtw89_b_wide_channel_record_binds_width_center_and_whole_span() -> TestResult {
+    use super::super::operating_channel::Profile;
+    let (mut base, _base_cap, _record_cap, board) = channel_model(6, 40);
+    let wide = Profile::new_2ghz_40(1, true).unwrap();
+    let other_side = Profile::new_2ghz_40(5, false).unwrap();
+    let narrow_request = channel::Request::new(
+        &base,
+        Profile::from_primary(6).unwrap(),
+        board.with_programs(base.flags),
+    )
+    .unwrap();
+    let request = channel::Request::new(&base, wide, board.with_programs(base.flags)).unwrap();
+    if request.binding == narrow_request.binding
+        || !request.name.contains("-ch01-bw40-c003-")
+        || narrow_request.name.contains("-bw")
+    {
+        return TestResult::Fail("wide request aliased the 20MHz request/name");
+    }
+    let mut bytes = channel_record(&base, &request, 1, 40);
+    bytes[55] = 40;
+    let verify = |bytes: &[u8; 128], profile: Profile| {
+        channel::Request::new(&base, profile, board.with_programs(base.flags)).is_ok_and(|r| {
+            channel::Channel::from_verified(
+                &base,
+                &r,
+                profile,
+                board.with_programs(base.flags),
+                bytes,
+                Some([3; 32]),
+                authority(),
+            )
+            .is_ok()
+        })
+    };
+    if verify(&bytes, wide) {
+        return TestResult::Fail("wide record without its center byte accepted");
+    }
+    bytes[68] = 3;
+    let mut narrow = bytes;
+    narrow[55] = 20;
+    narrow[68] = 0;
+    if !verify(&bytes, wide) || verify(&bytes, other_side) || verify(&narrow, wide) {
+        return TestResult::Fail("wide record format/identity not exact");
+    }
+    let record = channel::Channel::from_verified(
+        &base,
+        &request,
+        wide,
+        board.with_programs(base.flags),
+        &bytes,
+        Some([3; 32]),
+        authority(),
+    )
+    .unwrap();
+    if record.envelope().span != (2402, 2442) {
+        return TestResult::Fail("wide envelope does not cover the whole 40MHz span");
+    }
+    base.channels.push(record);
+    // A 20MHz-wide rule over the span refuses; a 40MHz rule admits.
+    let mut domain = band_domain();
+    base.model_domain = Some(alloc::sync::Arc::new(domain.clone()));
+    if base.select(wide).is_ok() || base.active_profile().is_some() {
+        return TestResult::Fail("40MHz channel selected under a 20MHz maximum bandwidth");
+    }
+    domain.rules[0].max_bandwidth_mhz = 40;
+    base.model_domain = Some(alloc::sync::Arc::new(domain));
+    if base.channel_allowed(wide) != Ok(true)
+        || base.channel_allowed(other_side) != Ok(false)
+        || base.select(wide).is_err()
+        || base.active_profile() != Some(wide)
+        || base.active() != 1
+    {
+        return TestResult::Fail("signed 40MHz record did not gate its own span");
+    }
+    if base.select(Profile::INITIAL).is_err() || base.active_profile().is_some() {
+        return TestResult::Fail("return to channel1/20MHz failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_wide_channel_record_binds_width_center_and_whole_span
 );

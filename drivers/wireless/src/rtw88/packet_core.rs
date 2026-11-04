@@ -35,6 +35,29 @@ pub(super) unsafe trait Port {
     fn originator_ba_allowed(&self) -> bool {
         false
     }
+    fn originator_ba_tids(&self) -> u8 {
+        u8::from(self.originator_ba_allowed())
+    }
+    fn batch_allowed(&mut self, tid: u8, profile: format::DataProfile) -> Result<(), Error> {
+        if tid >= 6
+            || self.originator_ba_tids() & (1 << tid) == 0
+            || profile.tid_queue(tid).is_none()
+        {
+            return Err(Error::Access);
+        }
+        self.transmit_allowed()
+    }
+    fn batch_publication<T>(
+        &mut self,
+        profile: format::DataProfile,
+        operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error>
+    where
+        Self: Sized,
+    {
+        let _ = profile;
+        operation(self)
+    }
     fn recipient_ba_allowed(&self) -> bool {
         false
     }
@@ -61,6 +84,9 @@ pub(super) unsafe trait Port {
 enum Phase {
     Prepared,
     Running,
+    /// `pci.c::rtw_pci_stop` for WoW: rings were reset to index zero with
+    /// every mapping retained; reversible only through [`Core::restart`].
+    Halted,
     Stopped,
     Failed,
 }
@@ -88,6 +114,23 @@ pub(super) struct Frame {
     pub(super) phy: Option<super::packet_phy::Evidence>,
     /// Original32-byte PHY-status record for dynamic-mechanism statistics.
     pub(super) status: Option<alloc::boxed::Box<[u8; 32]>>,
+}
+impl Frame {
+    /// A received MPDU (FCS removed) parsed by another host interface's
+    /// packet owner (`usb_packet.rs`) under the same admission rules.
+    pub(super) fn received(
+        bytes: Vec<u8>,
+        rate: u8,
+        phy: Option<super::packet_phy::Evidence>,
+        status: Option<alloc::boxed::Box<[u8; 32]>>,
+    ) -> Self {
+        Self {
+            bytes,
+            rate,
+            phy,
+            status,
+        }
+    }
 }
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
@@ -118,6 +161,10 @@ pub(super) struct Core {
     mac_id: u8,
     data_profile: format::DataProfile,
     receive_chip: super::packet_phy::Chip,
+    /// Current operating primary; C22 PHY status must report it.
+    operating_channel: u8,
+    /// RTW bandwidth code of the committed channel (0=20, 1=40 via N2xB).
+    operating_width: u8,
     tx_host: [u16; 5],
     tx_device: [u16; 5],
     rx: u16,
@@ -205,9 +252,9 @@ impl Core {
         if port.index(0x3b4)? & 0x0fff_0fff != 0 {
             return Err(Error::State);
         }
-        let frame = port.allocate(format::TX_DESC + format::MAX_MPDU)?;
+        let frame = port.allocate(format::TX_DESC + format::MAX_TX_MPDU)?;
         let base = frame.dma_addr().raw();
-        if frame.len() < format::TX_DESC + format::MAX_MPDU
+        if frame.len() < format::TX_DESC + format::MAX_TX_MPDU
             || base == 0
             || base & 3 != 0
             || base
@@ -222,9 +269,9 @@ impl Core {
             .try_reserve_exact(4)
             .map_err(|_| Error::Memory)?;
         for _ in 0..4 {
-            let buffer = port.allocate(format::TX_DESC + format::MAX_MPDU)?;
-            format::buffer_descriptor(buffer.dma_addr().raw(), format::MAX_MPDU)?;
-            if buffer.len() < format::TX_DESC + format::MAX_MPDU {
+            let buffer = port.allocate(format::TX_DESC + format::MAX_TX_MPDU)?;
+            format::buffer_descriptor(buffer.dma_addr().raw(), format::MAX_TX_MPDU)?;
+            if buffer.len() < format::TX_DESC + format::MAX_TX_MPDU {
                 return Err(Error::Address);
             }
             port.memory(|| copy_to(&buffer, 0, &[0; format::TX_DESC]))?;
@@ -241,6 +288,8 @@ impl Core {
             mac_id,
             data_profile: format::DataProfile::LEGACY,
             receive_chip,
+            operating_channel: 1,
+            operating_width: 0,
             scan: None,
             tx_host: [0; 5],
             tx_device: [0; 5],
@@ -263,10 +312,65 @@ impl Core {
         self.phase = Phase::Running;
         Ok(())
     }
+    pub(super) fn maintenance_quiet(
+        &self,
+        mut index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<bool, Error> {
+        if !self.rx_idle || !self.transmit_quiet(&mut index)? {
+            return Ok(false);
+        }
+        let rx = index(0x3b4)?;
+        let expected = u32::from(self.rx);
+        Ok(rx & 0x0fff0fff == (expected | expected << 16))
+    }
+    /// TX joint completions and actual native ring pointers; RX may contain
+    /// an original pre-association beacon and is parked separately.
+    pub(super) fn transmit_quiet(
+        &self,
+        mut index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<bool, Error> {
+        if !self.ready() {
+            return Ok(false);
+        }
+        for q in [
+            Queue::Management,
+            Queue::Data,
+            Queue::Background,
+            Queue::Video,
+            Queue::Voice,
+        ] {
+            let slot = queue_slot(q);
+            let expected = u32::from(self.tx_host[slot]);
+            if self.tx_host[slot] != self.tx_device[slot]
+                || index(q.index())? & 0x0fff0fff != (expected | expected << 16)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
     }
     /// Admit broadcast Probe Requests from a unicast random scan address.
+    pub(super) fn set_operating_width(&mut self, width: u8) {
+        self.operating_width = width;
+    }
+    /// Commit the operating primary. Crossing bands resets DATA to that
+    /// band's base profile (`hal.current_band_type` selects CCK1 or OFDM6
+    /// in `rtw_tx_pkt_info_update_rate`); retunes run only on base-only
+    /// gates, and association reconfigures the profile afterwards.
+    pub(super) fn set_operating_channel(&mut self, channel: u8) {
+        self.operating_channel = channel;
+        let band5 = super::band5::primary(channel);
+        if self.data_profile.band5 != band5 {
+            self.data_profile = if band5 {
+                format::DataProfile::LEGACY5
+            } else {
+                format::DataProfile::LEGACY
+            };
+        }
+    }
     pub(super) fn set_scan(&mut self, address: Option<[u8; 6]>) -> Result<(), Error> {
         if address.is_some_and(|a| a == [0; 6] || a[0] & 1 != 0 || a == self.own)
             || address.is_some() == self.scan.is_some()
@@ -313,7 +417,9 @@ impl Core {
         if format::recipient_control(frame) && !port.recipient_ba_allowed() {
             return Err(Error::Access);
         }
-        if format::originator_control(frame) && !port.originator_ba_allowed() {
+        if format::originator_control_tid(frame)
+            .is_some_and(|tid| port.originator_ba_tids() & (1 << tid) == 0)
+        {
             return Err(Error::Access);
         }
         // A Probe Request from the current random scan address is the only
@@ -397,7 +503,11 @@ impl Core {
         }
         let descriptor = port.rx_bytes(slot, 0, format::RX_DESC)?;
         if let Ok(descriptor) = <&[u8; format::RX_DESC]>::try_from(descriptor.as_slice()) {
-            if let Ok(metadata) = format::receive_profile(descriptor, self.data_profile.mcs != 0) {
+            if let Ok(metadata) = format::receive_rates(
+                descriptor,
+                self.data_profile.rx_mcs,
+                self.data_profile.vht.map_or(0, |v| v.rx),
+            ) {
                 let mut body =
                     port.rx_bytes(slot, metadata.payload.start, metadata.payload.len())?;
                 if body.len() != metadata.payload.len() {
@@ -429,10 +539,17 @@ impl Core {
                             status = <[u8; 32]>::try_from(bytes.as_slice())
                                 .ok()
                                 .map(alloc::boxed::Box::new);
-                            super::packet_phy::parse(self.receive_chip, metadata.rate, &bytes)
-                                .ok()
-                                .filter(|p| p.initial_channel())
-                                .map(Some)
+                            super::packet_phy::parse_at(
+                                self.receive_chip,
+                                metadata.rate,
+                                &bytes,
+                                self.operating_width,
+                            )
+                            .ok()
+                            .filter(|p| {
+                                p.on_operating(self.operating_channel, self.operating_width)
+                            })
+                            .map(Some)
                         }
                         None => Some(None),
                     };
@@ -520,6 +637,69 @@ impl Core {
         self.rx_idle = false;
         // BME-off/stop bits do not release published allocations.
         port.stop()
+    }
+}
+impl Core {
+    /// `pci.c::rtw_pci_stop` -> `rtw_pci_dma_release`: only a running core
+    /// with no pending TX and every TX ring retired to the host's index may
+    /// be halted. Unreaped RX frames are dropped by the ring reset exactly
+    /// as Linux drops them. The caller then resets the native ring pointers
+    /// (`rtw_pci_reset_buf_desc`); host indices follow to zero. Unlike
+    /// [`Core::stop`], published buffers stay owned and reusable.
+    pub(super) fn halt(
+        &mut self,
+        index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<(), Error> {
+        if !self.transmit_quiet(index)? {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Halted;
+        self.rx_idle = false;
+        Ok(())
+    }
+    /// The native owner has reset every ring pointer (`rtw_pci_setup`:
+    /// `rtw_pci_reset_buf_desc` + `rtw_pci_dma_reset`, which also zeroes
+    /// `rx_tag`) and re-armed every RX descriptor; mirror the zero indices.
+    pub(super) fn reset_indices(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Halted {
+            return Err(Error::State);
+        }
+        self.tx_host = [0; 5];
+        self.tx_device = [0; 5];
+        self.rx = 0;
+        self.tag = 0;
+        self.rx_idle = false;
+        Ok(())
+    }
+    /// `rtw_pci_start` after [`Core::reset_indices`].
+    pub(super) fn restart(
+        &mut self,
+        mut index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Halted || self.tx_host != [0; 5] || self.rx != 0 || self.tag != 0 {
+            return Err(Error::State);
+        }
+        for q in [
+            Queue::Management,
+            Queue::Data,
+            Queue::Background,
+            Queue::Video,
+            Queue::Voice,
+        ] {
+            if index(q.index())? & 0x0fff_0fff != 0 {
+                self.phase = Phase::Failed;
+                return Err(Error::State);
+            }
+        }
+        if index(0x3b4)? & 0x0fff_0fff != 0 {
+            self.phase = Phase::Failed;
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(super) fn halted(&self) -> bool {
+        self.phase == Phase::Halted
     }
 }
 impl Core {

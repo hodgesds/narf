@@ -41,10 +41,17 @@
 
 extern crate alloc;
 
+mod band5;
+mod bf;
 mod calibration8821c;
+mod calibration8822b;
+mod channel_policy;
 mod coding;
 #[cfg(feature = "kernel-test")]
 mod coding_tests;
+mod coex;
+#[cfg(feature = "kernel-test")]
+mod coex_tests;
 mod command;
 mod dack;
 mod dm;
@@ -53,22 +60,50 @@ mod dm_station_tests;
 #[cfg(feature = "kernel-test")]
 mod dm_tests;
 mod dma_stop;
+mod dpk;
+#[cfg(feature = "kernel-test")]
+mod dpk_tests;
 pub mod efuse;
+pub mod efuse8822b;
+mod endpoints;
 mod fallback;
 #[cfg(feature = "kernel-test")]
 mod fallback_tests;
 mod firmware_lifecycle;
 mod firmware_native;
 mod firmware_transport;
+mod functions;
 pub mod fw;
 mod hardware;
 mod ht;
+mod ht40;
+pub mod operating_reset;
+mod vht;
+pub use operating_reset::{reset_function, Error as OperatingResetError};
+mod rejoin;
+mod runtime_idle;
+mod runtime_ps_scope;
+mod runtime_ps_wire;
+pub use firmware_transport::runtime_lps::{
+    lps_function, lps_request_function, lps_request_usb, lps_usb, Error as RuntimeSleepError,
+};
+pub use runtime_idle::{idle_function, RuntimeIdle};
+mod system_pm;
+mod system_pm_native;
+mod system_pm_wire;
+mod system_pm_worker;
+pub use rejoin::{rejoin_function, Error as RejoinError};
 mod rx_ba;
 mod rx_ba_power;
+mod tracking8821c;
+mod tracking8822b;
+pub use tracking8821c::Request as PowerTrackingRequest;
 mod tx_ba;
 mod tx_ba_power;
 #[cfg(feature = "kernel-test")]
 mod tx_ba_tests;
+#[cfg(feature = "kernel-test")]
+mod tx_ba_tid_tests;
 pub use tx_ba_power::Request as TxBaRequest;
 #[cfg(feature = "kernel-test")]
 mod rx_ba_tests;
@@ -78,6 +113,7 @@ mod ht_tests;
 pub(super) mod interface;
 mod mac;
 mod operating8821c;
+mod operating8822b;
 pub(super) mod packet_core;
 pub(super) mod packet_format;
 mod packet_phy;
@@ -85,6 +121,7 @@ mod pci_firmware;
 mod phy;
 #[path = "phy/rtl8821c.rs"]
 mod phy8821c;
+mod phy8822b;
 mod power_policy;
 mod probe_guard;
 mod protection;
@@ -97,18 +134,41 @@ pub use protection::Request as RtsRequest;
 mod publication;
 mod qualification;
 pub use qualification::Request as ContinuationRequest;
+mod native8822b;
 mod radio;
 mod radio8821c;
+mod radio8822b;
 mod reserved_page;
 mod scan;
 #[cfg(feature = "kernel-test")]
 mod scan_tests;
+mod security_cam;
 mod sibling;
 mod station;
 pub(super) mod station_control;
 mod station_power8821c;
 mod station_profile;
+/// RTL8821CU USB host-interface transport (Linux rtw88/usb.c).
+mod usb;
+/// RTL8821CU USB driver registration (Linux rtw88/rtw8821cu.c).
+mod usb_driver;
+/// RTL8821CU firmware/register backend (Linux rtw88/usb.c `rtw_usb_ops`).
+mod usb_firmware;
+#[cfg(feature = "kernel-test")]
+mod usb_firmware_tests;
+/// RTL8821CU USB packet owner (Linux rtw88/usb.c TX queues, RX split).
+mod usb_packet;
+#[cfg(feature = "kernel-test")]
+mod usb_packet_tests;
+/// RTL8821CU USB reset, rejoin, IPS and system sleep (Linux rtw88 core
+/// restart over usb.c).
+pub mod usb_recovery;
+#[cfg(feature = "kernel-test")]
+mod usb_recovery_tests;
+#[cfg(feature = "kernel-test")]
+mod usb_tests;
 mod wmm;
+mod wow;
 pub use calibration8821c::{Error as C21CalibrationError, Request as C21CalibrationRequest};
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
@@ -132,13 +192,18 @@ pub mod power;
 mod power_tables;
 pub mod regs;
 
-pub use pci::{name_for, probe, provision, register_pci_driver, Rtw88Device};
+pub use pci::{name_for, probe, provision, provision_function, register_pci_driver, Rtw88Device};
 pub use regs::{REALTEK_VENDOR, RTL_DEV_8821CE, RTL_DEV_8822BE, RTL_DEV_8822CE};
 
 /// Entry point invoked from the wireless crate's `register_initcalls`
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
+    usb_driver::register();
+    narf_power::system_pm::register_async_system_pm(
+        "rtw88",
+        alloc::sync::Arc::new(system_pm::SystemPm),
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

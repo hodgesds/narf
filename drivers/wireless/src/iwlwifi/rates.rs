@@ -9,11 +9,52 @@ pub struct Rates {
     pub basic: u16,
 }
 impl Rates {
+    pub(super) fn parse_six(ies: &[u8], sae_h2e: bool) -> Result<Self, &'static str> {
+        // OFDM-only independently of the aliased numeric channel. HT/VHT
+        // membership selectors remain forbidden on the HE-only6GHz path.
+        Self::parse_for_profiles(ies, 36, 0, sae_h2e, true)
+    }
+    pub(super) fn parse_six_eht(
+        ies: &[u8],
+        sae_h2e: bool,
+        eht: bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_for_native_profiles(ies, 36, 0, sae_h2e, true, eht)
+    }
     pub fn parse(ies: &[u8], channel: u8) -> Result<Self, &'static str> {
         Self::parse_for_phy(ies, channel, 0)
     }
 
-    pub fn parse_for_phy(mut ies: &[u8], channel: u8, mode: u8) -> Result<Self, &'static str> {
+    pub fn parse_for_phy(ies: &[u8], channel: u8, mode: u8) -> Result<Self, &'static str> {
+        Self::parse_for_security(ies, channel, mode, false)
+    }
+    /// SAE-H2E membership selector123 is admitted only after the shared
+    /// security plan proved H2E; it is never a legacy rate or TLC bit.
+    pub(super) fn parse_for_security(
+        ies: &[u8],
+        channel: u8,
+        mode: u8,
+        sae_h2e: bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_for_profiles(ies, channel, mode, sae_h2e, false)
+    }
+    pub(super) fn parse_for_profiles(
+        ies: &[u8],
+        channel: u8,
+        mode: u8,
+        sae_h2e: bool,
+        he: bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_for_native_profiles(ies, channel, mode, sae_h2e, he, false)
+    }
+    pub(super) fn parse_for_native_profiles(
+        mut ies: &[u8],
+        channel: u8,
+        mode: u8,
+        sae_h2e: bool,
+        he: bool,
+        eht: bool,
+    ) -> Result<Self, &'static str> {
         let allowed = if channel == 14 {
             0xf
         } else if channel <= 13 {
@@ -33,7 +74,12 @@ impl Rates {
             if matches!(ies[0], 1 | 50) {
                 for &rate in bytes {
                     // HT/VHT BSS membership selectors are not bitrates.
-                    if (rate == 0xff && mode >= 1) || (rate == 0xfe && mode >= 2) {
+                    if (rate == 0xff && mode >= 1)
+                        || (rate == 0xfe && mode >= 2)
+                        || (rate == 0xfb && sae_h2e)
+                        || (rate == 0xfa && he)
+                        || (rate == 0xf9 && eht)
+                    {
                         continue;
                     }
                     let bit = RATES

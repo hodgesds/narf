@@ -599,6 +599,17 @@ struct ModuleThunk {
 
 static MODULE_THUNKS: IrqSafeSpinLock<Vec<ModuleThunk>> = IrqSafeSpinLock::new(Vec::new());
 
+/// Whether an explicitly loaded module registered this exact PCI match.
+/// Permanent host engines can decline their ordinary built-in match before
+/// binding so the module frontend reaches the same real native engine. This
+/// does not detach or transfer an already bound device.
+pub fn module_pci_driver_registered(vendor: u16, device: u16) -> bool {
+    MODULE_THUNKS
+        .lock()
+        .iter()
+        .any(|entry| entry.vendor == vendor && entry.device == device)
+}
+
 /// Kernel-owned intern table for module-supplied driver names. A module's
 /// `.rodata` is unmapped on unload, so a `&str` borrowed from it cannot be
 /// stored `'static` in the registry; interning copies it into a kernel-owned
@@ -729,6 +740,9 @@ impl<F: FnOnce(&narf_io::DmaBuffer) -> T, T> CapOp<narf_io::DmaBuffer, Write> fo
 
 static DEVICE_CTXS: IrqSafeSpinLock<Vec<DeviceCtx>> = IrqSafeSpinLock::new(Vec::new());
 
+#[path = "module_wireless_tests.rs"]
+mod module_wireless_tests;
+
 fn install_device_ctx(owner: u64, token: u64, device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
     // A reprobe replaces the old ownership record only after disabling the
     // command bits it enabled.
@@ -769,6 +783,9 @@ fn remove_device_ctx(token: u64) {
 }
 
 fn teardown_device_ctx(mut ctx: DeviceCtx) {
+    // A wireless host retains its native futures/DMA independently of module
+    // text. Withdraw it while the original probe authority is still current.
+    crate::module_wireless::retire_device(ctx.owner, ctx.token);
     if let Some(iface) = ctx.net_iface.take() {
         let _ = narf_net::iface::unregister(&iface.name);
     }
@@ -826,6 +843,42 @@ pub fn module_dma_retain_on_teardown(owner: u64, token: u64, retain: bool) -> i3
     }
     ctx.retain_dma_on_teardown = retain;
     0
+}
+
+/// Borrow the existing module probe grant; this never claims another device
+/// or manufactures authority from an address. Service adapters retain this
+/// exact revocable cap and invoke it again before each operation/publication.
+pub(crate) fn module_device_authority(
+    owner: u64,
+    token: u64,
+) -> Result<(BusDevice, Cap<BusDeviceCap, Write>), i32> {
+    let (device, cap) = {
+        let contexts = DEVICE_CTXS.lock();
+        let ctx = contexts
+            .iter()
+            .find(|ctx| ctx.owner == owner && ctx.token == token)
+            .ok_or(-19)?;
+        (ctx.device, ctx.cap)
+    };
+    cap.invoke(DeviceOp(|| ())).map_err(|_| -19)?;
+    Ok((device, cap))
+}
+
+/// Non-reentrant copy publication only. Hold context presence and its exact
+/// current probe grant through the copy; never call a host or module callback
+/// from `publish`. Device removal cannot interleave this terminal copy.
+pub(crate) fn module_device_publish<T>(
+    owner: u64,
+    token: u64,
+    expected: Cap<BusDeviceCap, Write>,
+    publish: impl FnOnce() -> T,
+) -> Result<T, i32> {
+    let contexts = DEVICE_CTXS.lock();
+    let ctx = contexts
+        .iter()
+        .find(|ctx| ctx.owner == owner && ctx.token == token && ctx.cap.slot() == expected.slot())
+        .ok_or(-19)?;
+    ctx.cap.invoke(DeviceOp(publish)).map_err(|_| -19)
 }
 
 /// Enable PCI command bits (e.g. MEM_SPACE | BUS_MASTER) on a module-owned

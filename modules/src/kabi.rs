@@ -594,6 +594,102 @@ kernel_abi! {
         let owner = crate::symbols::current_execution_id().0;
         narf_bus::module_netif_rx(owner, dev, ifindex, frame)
     }
+
+    /// Open a versioned permanent wireless host on this module's existing
+    /// probe device. No Rust object, MMIO mapping or firmware pointer crosses
+    /// the boundary. `out_session` receives a never-reused, owner-scoped id.
+    ///
+    /// # Safety
+    /// `dev` is this module's probe token; `out_session` is writable/aligned.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_open(dev: u64, family: u32, version: u32, out_session: *mut u64) -> i32 {
+        if out_session.is_null() { return -22; }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_wireless::open(owner, dev, family, version) {
+            Ok(session) => {
+                // SAFETY: the module promises writable, aligned output storage.
+                unsafe { out_session.write(session) };
+                0
+            }
+            Err(error) => error,
+        }
+    }
+
+    /// Copy one bounded family-protocol request into retained host work.
+    /// Success means accepted; only poll's terminal result completes it.
+    ///
+    /// # Safety
+    /// Request storage is readable for `request_len` and `out_operation` is
+    /// writable/aligned. Ids must come from this module's exact probe service.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_submit(
+        dev: u64, session: u64, opcode: u32,
+        request: *const u8, request_len: usize, out_operation: *mut u64,
+    ) -> i32 {
+        if out_operation.is_null() || request_len > narf_bus::module_wireless::MAX_REQUEST
+            || (request_len != 0 && request.is_null()) { return -22; }
+        let request = if request_len == 0 { &[] } else {
+            // SAFETY: the module promises readable bytes for this bounded call;
+            // the host copies them before returning. The pointer is non-null.
+            unsafe { core::slice::from_raw_parts(request, request_len) }
+        };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_wireless::submit(owner, dev, session, opcode, request) {
+            Ok(operation) => {
+                // SAFETY: writable aligned output, per the export contract.
+                unsafe { out_operation.write(operation) };
+                0
+            }
+            Err(error) => error,
+        }
+    }
+
+    /// Poll once. `-EAGAIN` is pending; `-ENOBUFS` reports required bytes
+    /// without consuming the terminal reply. Zero consumes a copied result.
+    /// Other negative statuses are terminal errors, except invalid handles.
+    ///
+    /// # Safety
+    /// Reply storage is writable for `reply_len` and `out_len` is writable/
+    /// aligned. The two output ranges must not overlap.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_poll(
+        dev: u64, session: u64, operation: u64,
+        reply: *mut u8, reply_len: usize, out_len: *mut usize,
+    ) -> i32 {
+        if out_len.is_null() || reply_len > narf_bus::module_wireless::MAX_REPLY
+            || (reply_len != 0 && reply.is_null()) { return -22; }
+        let reply = if reply_len == 0 { &mut [] } else {
+            // SAFETY: bounded writable module storage, borrowed for this call;
+            // the nonempty buffer has a non-null pointer.
+            unsafe { core::slice::from_raw_parts_mut(reply, reply_len) }
+        };
+        let owner = crate::symbols::current_execution_id().0;
+        let (status, required) = narf_bus::module_wireless::poll(owner, dev, session, operation, reply);
+        // SAFETY: writable aligned scalar output, per the export contract.
+        unsafe { out_len.write(required) };
+        status
+    }
+
+    /// Request cancellation; native resources remain retained until terminal
+    /// completion. Continue polling the same operation id.
+    ///
+    /// # Safety
+    /// Ids identify an operation submitted by this module's exact service.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_cancel(dev: u64, session: u64, operation: u64) -> i32 {
+        narf_bus::module_wireless::cancel(crate::symbols::current_execution_id().0,
+            dev, session, operation)
+    }
+
+    /// Withdraw the service and request native teardown. Uncertain DMA and
+    /// in-flight work outlive module text; close never invents a DMA receipt.
+    ///
+    /// # Safety
+    /// Ids identify this module's service; no later use of them is permitted.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_close(dev: u64, session: u64) -> i32 {
+        narf_bus::module_wireless::close(crate::symbols::current_execution_id().0, dev, session)
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -660,18 +756,33 @@ kernel_test_in!("modules/kabi", smoke_kabi_irq_exports_require_cap);
 fn smoke_kabi_netif_exports_require_cap() -> TestResult {
     register_all();
     let denied = crate::manifest::Manifest::default();
-    match crate::symbols::resolve("narf_netif_register", None, &denied) {
-        Err(crate::symbols::ResolveError::CapMissing(narf_capabilities::CapKind::NetIface)) => {}
-        _ => return TestResult::Fail("netif export resolved without NetIface cap declaration"),
-    }
-
     let mut allowed = crate::manifest::Manifest::default();
     allowed.required_caps.push(crate::manifest::RequiredCap {
         kind: narf_capabilities::CapKind::NetIface,
         right: <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
     });
-    if crate::symbols::resolve("narf_netif_register", None, &allowed).is_err() {
-        return TestResult::Fail("netif export stayed hidden with NetIface cap declaration");
+    for name in [
+        "narf_netif_register",
+        "narf_wireless_open",
+        "narf_wireless_submit",
+        "narf_wireless_poll",
+        "narf_wireless_cancel",
+        "narf_wireless_close",
+    ] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(narf_capabilities::CapKind::NetIface)) => {
+            }
+            _ => {
+                return TestResult::Fail(
+                    "netif/wireless export resolved without NetIface cap declaration",
+                )
+            }
+        }
+        if crate::symbols::resolve(name, None, &allowed).is_err() {
+            return TestResult::Fail(
+                "netif/wireless export stayed hidden with NetIface cap declaration",
+            );
+        }
     }
     TestResult::Pass
 }

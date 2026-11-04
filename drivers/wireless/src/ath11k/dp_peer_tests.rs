@@ -8,8 +8,6 @@
 //! through its QMI shadow register) and writes REO status entries, in the
 //! host's real DMA32 memory by physical address.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::vec;

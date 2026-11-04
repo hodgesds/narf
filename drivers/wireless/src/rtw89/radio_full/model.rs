@@ -24,6 +24,8 @@ pub(super) struct Model {
     pub(super) ends: Vec<rfk::Kind>,
     pub(super) pauses: usize,
     pub(super) resumes: usize,
+    /// `coex_switch_band` calls (band-change coex notify).
+    pub(super) band_switches: usize,
     pub(super) paused: bool,
     pub(super) lock_stuck: bool,
     failed: bool,
@@ -59,6 +61,7 @@ impl Model {
             deny: None,
             hold_delay: None,
             starts: Vec::new(),
+            band_switches: 0,
             ends: Vec::new(),
             pauses: 0,
             resumes: 0,
@@ -302,6 +305,19 @@ impl rfk::Interface for Model {
             model.pauses += 1;
             Ok(saved)
         })?)
+    }
+    async fn coex_switch_band(&mut self) -> Result<(), rfk::Error> {
+        self.admit_current()?;
+        // Notify precedes the band-change TSSI scan and every channel RFK.
+        if self
+            .starts
+            .last()
+            .is_some_and(|kind| *kind != rfk::Kind::Dpk)
+        {
+            return Err(rfk::Error::Terminal);
+        }
+        self.band_switches += 1;
+        Ok(())
     }
     async fn resume(&mut self, saved: u32) -> Result<(), rfk::Error> {
         self.admit_current()?;

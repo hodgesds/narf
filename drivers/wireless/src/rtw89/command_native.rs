@@ -19,9 +19,29 @@ const DEVICE_DMA_MASK: u64 = (1u64 << 36) - 1;
 mod phycap;
 #[path = "command_native/radio.rs"]
 mod radio;
+#[path = "command_native/radio_51.rs"]
+mod radio_51;
+pub(in crate::rtw89) use radio::{c_profile, SixGhzChannel};
+#[cfg(any(test, feature = "kernel-test"))]
+pub(in crate::rtw89) use radio::{wide_profiles, wide_profiles_c160};
+#[path = "command_native/rf_tracking.rs"]
+mod rf_tracking;
 pub(super) use radio::{QualificationRequest, RadioPreflight};
+#[path = "command_native/fragment.rs"]
+mod fragment;
+pub(super) use fragment::{
+    Binding as FragmentBinding, Part as FragmentPart, Train as FragmentTrain,
+};
+#[path = "command_native/ap.rs"]
+mod ap;
+#[path = "command_native/lps.rs"]
+mod lps;
+#[path = "command_native/monitor.rs"]
+mod monitor;
 #[path = "command_native/station.rs"]
 mod station;
+#[path = "command_native/wow.rs"]
+mod wow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -50,14 +70,80 @@ pub(super) struct BasicPreflight {
 /// Sealed ordinary RF/response receipt. No value can be constructed while
 /// full BB/channel/IQK/TSSI/DPK/source-power qualification is incomplete.
 /// Basic calibration and DMA receipts cannot be converted into this type.
-struct OrdinaryGrant {
-    qualification: alloc::sync::Arc<super::radio_policy::Qualification>,
+///
+/// Chip-dispatched: RTL8852B holds the signed `N52B` v2 full program (with
+/// its WMM/QoS/RA/HT/HE/A-MPDU/sleep/fragment companions); RTL8852C holds
+/// the signed `N5CB` v2 + `N5CC` program, which carries no such companion.
+/// B-only program accessors ([`Self::b`]) therefore see "no program" on C.
+/// RTL8851B holds the signed `N51B` v2 + `N51C` program
+/// (`radio_policy_51`), likewise without a B companion.
+#[derive(Clone)]
+enum OrdinaryGrant {
+    B(alloc::sync::Arc<super::radio_policy::Qualification>),
+    C(alloc::sync::Arc<super::radio_policy_c::Qualification>),
+    N51(alloc::sync::Arc<super::radio_policy_51::Qualification>),
 }
 impl OrdinaryGrant {
     fn current(&self) -> Result<(), super::power::Error> {
-        self.qualification
-            .current()
-            .map_err(|_| super::power::Error::Access)
+        match self {
+            Self::B(q) => q.current().map_err(|_| super::power::Error::Access),
+            Self::C(q) => q.current().map_err(|_| super::power::Error::Access),
+            Self::N51(q) => q.current().map_err(|_| super::power::Error::Access),
+        }
+    }
+    /// Keep actual publication inside the chip's exact signed invocation.
+    fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::power::Error>,
+    ) -> Result<T, super::power::Error> {
+        match self {
+            Self::B(q) => q.with_current(operation),
+            Self::C(q) => q.with_current(operation),
+            Self::N51(q) => q.with_current(operation),
+        }
+    }
+    /// The RTL8852B program and its companions; `None` ("no program") on C
+    /// and RTL8851B.
+    fn b(&self) -> Option<&alloc::sync::Arc<super::radio_policy::Qualification>> {
+        match self {
+            Self::B(q) => Some(q),
+            Self::C(_) | Self::N51(_) => None,
+        }
+    }
+}
+/// Band-qualified identity of the programmed operating channel (mac80211
+/// `cfg80211_chan_def.chan`: band + channel number). A bare primary number
+/// cannot name a 6GHz channel (6GHz 1/5/9/13 collide with 2.4GHz), so the
+/// native owner records the band the program was built for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct OperatingChannel {
+    band: super::operating_channel_c::Band,
+    primary: u8,
+}
+impl OperatingChannel {
+    pub(in crate::rtw89) const fn new(band: super::operating_channel_c::Band, primary: u8) -> Self {
+        Self { band, primary }
+    }
+    /// The RTL8852B / 2.4+5GHz numbering: 1..=14 is 2.4GHz, every other
+    /// primary 5GHz (6GHz is never named by a bare primary).
+    pub(in crate::rtw89) const fn legacy(primary: u8) -> Self {
+        let band = if primary <= 14 {
+            super::operating_channel_c::Band::Ghz2
+        } else {
+            super::operating_channel_c::Band::Ghz5
+        };
+        Self { band, primary }
+    }
+    pub(in crate::rtw89) const fn band(self) -> super::operating_channel_c::Band {
+        self.band
+    }
+    pub(in crate::rtw89) const fn primary(self) -> u8 {
+        self.primary
+    }
+    /// No CCK on this band (5/6GHz): core.c `rtw89_core_get_mgmt_rate`
+    /// floors at `RTW89_HW_RATE_OFDM6` off 2.4GHz.
+    pub(in crate::rtw89) const fn ofdm_only(self) -> bool {
+        !matches!(self.band, super::operating_channel_c::Band::Ghz2)
     }
 }
 pub struct Native {
@@ -81,6 +167,8 @@ pub struct Native {
     radio: super::rf_access::Rf,
     runtime_sequence: u16,
     station_runtime: station::Runtime,
+    sleep_blocked: bool,
+    sleep_reset: Option<super::pci_reset::Reset<super::pci_reset::Native>>,
     calibration: Option<super::calibration_policy::Calibration>,
     coex_ready: bool,
     nctl_ready: bool,
@@ -93,6 +181,12 @@ pub struct Native {
     radio_shutdown: super::radio_shutdown::Shutdown,
     ordinary: Option<OrdinaryGrant>,
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
+    /// RTL8852C signed full program (N5CB v2 + N5CC records) gating every
+    /// C radio access together with the C calibration record.
+    qualification_c: Option<alloc::sync::Arc<super::radio_policy_c::Qualification>>,
+    /// RTL8851B signed full program (N51B v2 + N51C records) gating every
+    /// RTL8851B radio access together with the N51B calibration record.
+    qualification_51: Option<alloc::sync::Arc<super::radio_policy_51::Qualification>>,
     operating: Option<super::phy_operating::Operating>,
     irq: Option<super::irq::Binding>,
     /// RTL8852B HCI DMA-stop proof earned by the terminal closure.
@@ -101,6 +195,12 @@ pub struct Native {
     dma_reclaimed: bool,
     /// Observed-FLR lifecycle that selects the signed radio identity.
     lifecycle: super::radio_policy::Lifecycle,
+    /// Band-qualified channel and retune epoch of the completed full
+    /// program; cleared while a retune runs. Consumers compare the epoch
+    /// they were built against.
+    channel: Option<(OperatingChannel, u32)>,
+    /// Open reversible WoW TRX window (`command_native/wow.rs`).
+    wow_trx: Option<wow::Trx>,
 }
 /// Current-authority BAR/config adapter for the DMA-stop proof.
 struct StopPort<'a> {
@@ -254,21 +354,27 @@ impl Native {
             radio: super::rf_access::Rf::default(),
             runtime_sequence: 0,
             station_runtime: station::Runtime::default(),
+            sleep_blocked: false,
+            sleep_reset: None,
             calibration: None,
             coex_ready: false,
             nctl_ready: false,
             calibrating: None,
-            scheduler: Some(super::scheduler_mailbox::Mailbox::default()),
+            scheduler: Some(super::scheduler_mailbox::Mailbox::for_chip(chip)),
             phycap: None,
             phycap_attempted: false,
             dma_idle: None,
             dma_reclaimed: false,
             lifecycle: super::radio_policy::Lifecycle::Initial,
+            channel: None,
+            wow_trx: None,
             gain_bases: None,
             radio_started: false,
             radio_shutdown: super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
+            qualification_c: None,
+            qualification_51: None,
             operating: Some(super::phy_operating::Operating::default()),
             irq: None,
         })
@@ -287,13 +393,19 @@ impl Native {
         mac: &mut super::mac_runtime::Mac,
     ) -> Result<(), super::power::Error> {
         use super::power::Error as RegisterError;
-        if self.state != State::Active
-            || self.chip != ChipId::Rtl8852B
-            || self
-                .factory
-                .as_ref()
-                .is_none_or(|factory| factory.b_phycap().is_none())
-        {
+        // B, C or RTL8851B, each with its own completed factory PHY-cap
+        // window; the chip-specific MAC branches live in `mac_runtime` (C:
+        // `mac_runtime/c.rs`; RTL8851B: the B sequence's `n51` branches).
+        let phycap = self
+            .factory
+            .as_ref()
+            .is_some_and(|factory| match self.chip {
+                ChipId::Rtl8852B => factory.b_phycap().is_some(),
+                ChipId::Rtl8852C => factory.c_phycap().is_some(),
+                ChipId::Rtl8851B => factory.n51_phycap().is_some(),
+                _ => false,
+            });
+        if self.state != State::Active || !phycap {
             return Err(RegisterError::Unsupported);
         }
         let command = self.command().map_err(|_| RegisterError::Access)?;
@@ -376,7 +488,10 @@ impl Native {
     ) -> Result<(), super::rx_dma::Error> {
         use super::{power::Error as RegisterError, rx_dma::Error as ReceiveError};
         if self.state != State::Active
-            || self.chip != ChipId::Rtl8852B
+            || !matches!(
+                self.chip,
+                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
             || mac.state() != super::mac_runtime::State::Ready
             || self.identity().is_none()
         {
@@ -397,7 +512,8 @@ impl Native {
         };
         // SAFETY: retained exact cold/MAC owner above; every RX allocation is
         // stored in self before publication and survives the outer attempt.
-        unsafe { self.receive.prepare(&mut access, 64).await }
+        // C uses its own HAXI/V1 RX geometry (rx_dma::Rx::prepare_for).
+        unsafe { self.receive.prepare_for(&mut access, self.chip, 64).await }
     }
     pub(super) fn poll_receive(
         &mut self,
@@ -417,14 +533,34 @@ impl Native {
         result
     }
     fn radio_access(&mut self) -> Result<(), super::power::Error> {
+        // Chip dispatch: B, C or RTL8851B with its own factory PHY-cap and
+        // window.
+        let phycap = match self.chip {
+            ChipId::Rtl8851B => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.n51_phycap().is_some()),
+            ChipId::Rtl8852B => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.b_phycap().is_some()),
+            ChipId::Rtl8852C => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.c_phycap().is_some()),
+            _ => false,
+        };
         if self.state != State::Active
-            || self.chip != ChipId::Rtl8852B
+            || !phycap
             || self.receive.state() != super::rx_dma::State::Polling
-            || self.factory.as_ref().is_none_or(|f| f.b_phycap().is_none())
         {
             return Err(super::power::Error::Unsupported);
         }
-        self.io.b_phy_window()?;
+        match self.chip {
+            ChipId::Rtl8852C => self.io.c_phy_window()?,
+            ChipId::Rtl8851B => self.io.n51_phy_window()?,
+            _ => self.io.b_phy_window()?,
+        }
         let functions = self.io.read32(0xc000)?;
         if functions == u32::MAX || functions & (1 << 29) != 0 {
             return Err(super::power::Error::Access);
@@ -432,6 +568,12 @@ impl Native {
         Ok(())
     }
     fn calibration_access(&mut self) -> Result<(), super::power::Error> {
+        if let Some(c) = self.qualification_c.as_ref() {
+            c.current().map_err(|_| super::power::Error::Access)?;
+        }
+        if let Some(n51) = self.qualification_51.as_ref() {
+            n51.current().map_err(|_| super::power::Error::Access)?;
+        }
         if let Some(full) = self.full_radio_scope() {
             full.current().map_err(|_| super::power::Error::Access)?;
         } else {
@@ -468,7 +610,6 @@ impl Native {
             .ordinary
             .as_ref()
             .ok_or(super::power::Error::Unsupported)?
-            .qualification
             .clone();
         let authority = self.authority;
         crate::rtw88::pci_park::invoke(&authority, || {
@@ -595,13 +736,19 @@ impl Native {
         owner: &mut super::radio_init::Init,
         assets: &super::radio_assets::Assets,
     ) -> Result<(), super::radio_init::Error> {
-        self.phy_profile_current()?;
+        self.radio_profile_current()?;
         self.radio_access()?;
-        let qualified = super::radio_init::Qualified::from_factory(
-            self.factory
-                .as_ref()
-                .ok_or(super::radio_init::Error::Profile)?,
-        )
+        let factory = self
+            .factory
+            .as_ref()
+            .ok_or(super::radio_init::Error::Profile)?;
+        // Chip dispatch: B, C or RTL8851B tables from the matching factory
+        // snapshot.
+        let qualified = match self.chip {
+            ChipId::Rtl8852C => super::radio_init::Qualified::from_factory_c(factory),
+            ChipId::Rtl8851B => super::radio_init::Qualified::from_factory_51(factory),
+            _ => super::radio_init::Qualified::from_factory(factory),
+        }
         .ok_or(super::radio_init::Error::Profile)?;
         // Latch before the first possible BB/RF write; cancellation cannot
         // hide independent PMAC/NCTL state from terminal emission closure.
@@ -616,7 +763,7 @@ impl Native {
         page: u8,
         bytes: &[u8],
     ) -> Result<(), super::radio_init::Error> {
-        self.phy_profile_current()?;
+        self.radio_profile_current()?;
         self.radio_access()?;
         self.transmit_radio_page(path, page, bytes).await
     }
@@ -705,7 +852,8 @@ impl Native {
     ) -> Result<u32, super::power::Error> {
         self.radio_access()?;
         let full = self.full_radio_scope();
-        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full);
+        let chip = self.chip_program();
+        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full, chip);
         // SAFETY: actual cold/MAC/RX owner, complete B aperture and current
         // signed register scope; retained outer attempt handles cancellation.
         let result = unsafe { self.radio.read(&mut io, path, address, mask).await };
@@ -723,11 +871,15 @@ impl Native {
         mask: u32,
         value: u32,
     ) -> Result<(), super::power::Error> {
+        if self.station_runtime.monitor.is_some() {
+            return Err(super::power::Error::Unsupported);
+        }
         self.radio_access()?;
         // SAFETY: same actual full-aperture/current B radio owner; no parallel
         // producer and outer attempt retains DMA on failure/cancellation.
         let full = self.full_radio_scope();
-        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full);
+        let chip = self.chip_program();
+        let mut io = radio::Port::new(&mut self.io, self.calibration.as_ref(), full, chip);
         // SAFETY: same retained analog owner with current signed MMIO scope.
         let result = unsafe { self.radio.write(&mut io, path, address, mask, value).await };
         if result.is_err() {
@@ -739,21 +891,32 @@ impl Native {
     /// register stop/BME-off alone does not prove posted transactions drained.
     pub(super) fn fail(&mut self) {
         self.state = State::Terminal;
-        // rtw89_pci_ops_stop + free_irq: HIMR and MSI off before BME clears.
+        if self.sleep_reset.is_some() {
+            return;
+        } // Never access during/after FLR quarantine.
+          // rtw89_pci_ops_stop + free_irq: HIMR and MSI off before BME clears.
         self.irq_release();
         self.receive.fail();
+        if self.sleep_blocked {
+            // Clock-gated or interrupted PS work cannot borrow an ordinary
+            // register stop as a wake/firmware-autonomy retirement proof.
+            // Retained async cleanup takes the actual nonemitting FLR path.
+            return;
+        }
         // Autonomous ACK/CTS does not depend on a packet DMA doorbell.
         if let Ok(value) = self.io.read32(0xc000) {
             if !matches!(value, u32::MAX | 0xeaea_eaea) {
                 let _ = self.io.write32(0xc000, value & !(1 << 29));
             }
         }
-        if self.chip == ChipId::Rtl8852B {
+        if let Some(layout) = super::dma_stop::Layout::for_chip(self.chip) {
             // Linux stop/poll order with BME still on, then BME off and a
             // flushing re-read. An earlier proof already cleared BME.
             if self.dma_idle.is_none() && !self.dma_reclaimed {
-                self.dma_idle = super::dma_stop::stop(&mut self.stop_port()).ok();
+                self.dma_idle = super::dma_stop::stop_with(&mut self.stop_port(), layout).ok();
             }
+            // C shares the AX BB engine/clock closure registers (cr_base
+            // 0x10000; rtw8852c_mac_disable_bb_rf is exactly `clocks`).
             if self.radio_started {
                 let _ = super::radio_stop::engines(&mut self.io);
             }
@@ -797,7 +960,10 @@ impl Native {
                 narf_bus::pci::cmd::BUS_MASTER,
             )
         });
-        if self.chip == ChipId::Rtl8852B {
+        // rtw8851b.c `rtw8851b_mac_disable_bb_rf` is byte-identical to
+        // `__rtw8852bx_mac_disable_bb_rf`, and RTL8851B shares the AX PMAC/
+        // MAC_SEL/NCTL/KIP closure registers, so it takes B's closure.
+        if matches!(self.chip, ChipId::Rtl8852B | ChipId::Rtl8851B) {
             if self.radio_started {
                 let _ = super::radio_stop::engines(&mut self.io);
             }
@@ -807,17 +973,33 @@ impl Native {
     /// Complete source RF00S/RF10S disable after immediate terminal closure.
     /// This never reopens the owner or grants DMA reclamation/reset authority.
     pub(super) async fn finish_radio_shutdown(&mut self) -> Result<(), super::power::Error> {
-        if self.state != State::Terminal || self.chip != ChipId::Rtl8852B {
+        if self.sleep_reset.is_some()
+            || self.state != State::Terminal
+            || !matches!(
+                self.chip,
+                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
+        {
             return Err(super::power::Error::Terminal);
         }
         self.fail();
-        // SAFETY: same retained exclusively owned exact B function, closed
+        // RTL8851B: rtw8851b.c `rtw8851b_mac_disable_bb_rf` is byte-identical
+        // to `__rtw8852bx_mac_disable_bb_rf` (RF00S_EN at XTAL_SI_WL_RFC_S0
+        // and RF10S_EN at S1 are both cleared even on the one-path chip), so
+        // it takes B's `finish`.
+        // SAFETY: same retained exclusively owned exact B/C function, closed
         // producers and uncertain DMA kept alive; NativeIo invokes current
         // device authority for every actual shutdown register transaction.
         unsafe {
-            self.radio_shutdown
-                .finish(&mut self.io, self.radio_started)
-                .await
+            if self.chip == ChipId::Rtl8852C {
+                self.radio_shutdown
+                    .finish_c(&mut self.io, self.radio_started)
+                    .await
+            } else {
+                self.radio_shutdown
+                    .finish(&mut self.io, self.radio_started)
+                    .await
+            }
         }
     }
     fn command(&self) -> Result<u16, Error> {
@@ -1054,7 +1236,9 @@ impl Native {
         if self.state != State::Terminal || self.irq.is_some() || self.dma_idle.is_none() {
             return Err(super::dma_stop::Error::Unproven);
         }
-        super::dma_stop::verify(&mut self.stop_port())?;
+        let layout =
+            super::dma_stop::Layout::for_chip(self.chip).ok_or(super::dma_stop::Error::Unproven)?;
+        super::dma_stop::verify_with(&mut self.stop_port(), layout)?;
         let proof = self
             .dma_idle
             .take()
@@ -1063,6 +1247,28 @@ impl Native {
     }
     /// Consume the verified proof and free every published allocation.
     fn release_proven(&mut self, _proof: super::dma_stop::Idle) -> usize {
+        // SAFETY: the consumed sealed current DMA idle proof covers this owner.
+        unsafe { self.release_all_fenced() }
+    }
+    fn release_reset_fenced(
+        &mut self,
+        proof: super::pci_reset::Fence,
+    ) -> Result<usize, super::power::Error> {
+        if self.state != State::Terminal
+            || self.irq.is_some()
+            || self.sleep_reset.is_none()
+            || !proof.matches_function(&self.device, &self.authority)
+        {
+            return Err(super::power::Error::Terminal);
+        }
+        // SAFETY: exact sealed successful temporal FLR fence, exclusive original
+        // function, IRQ closed before quarantine, and no producer may restart.
+        Ok(unsafe { self.release_all_fenced() })
+    }
+    /// # Safety
+    /// A consumed actual same-function DMA idle or successful temporal FLR
+    /// fence proves all published descriptor/prefetch references are gone.
+    unsafe fn release_all_fenced(&mut self) -> usize {
         let mut released = 0;
         if let Some(core) = self.station_runtime.core.as_mut() {
             // SAFETY: proof above covers every TX channel and BME-off.
@@ -1169,6 +1375,17 @@ impl super::radio_init::Interface for Native {
     }
 }
 
+impl Native {
+    /// Chip dispatch of the WLAN-only `_set_ant(WONLY)` re-assertion: B
+    /// `coex_native::enforce` unchanged, C `coex_native::enforce_c`.
+    async fn coex_enforce(&mut self) -> Result<(), super::coex_native::Error> {
+        if self.chip == ChipId::Rtl8852C {
+            super::coex_native::enforce_c(self).await
+        } else {
+            super::coex_native::enforce(self).await
+        }
+    }
+}
 impl super::coex_native::Interface for Native {
     fn admit(&mut self) -> Result<(), super::coex_native::Error> {
         self.calibration_access().map_err(Into::into)
@@ -1227,6 +1444,20 @@ impl super::rfk::Interface for Native {
         // SAFETY: same actual serialized qualified B calibration attempt.
         unsafe { self.write_rf(path, address, mask, value).await }.map_err(Into::into)
     }
+    /// `_run_coex(BTC_RSN_NTFY_SWBAND)` with `dm->wl_only` set takes
+    /// `_action_wl_only` before any band/link-mode dispatch:
+    /// `_set_ant(FC_EXEC, BTC_ANT_WONLY)` is re-executed (actual grant
+    /// writes with readback, `coex_native::enforce`) and
+    /// `_set_policy(BTC_CXP_OFF_BT)` sends nothing because `_append_tdma`/
+    /// `_append_slot` skip an unchanged TDMA/slot (policy_len 0). The
+    /// band-specific `_action_wl_5g` (`BTC_ANT_FDD`, `OFF_EQ0`) is reached only
+    /// without `wl_only`, which needs BT link state this owner never has.
+    async fn coex_switch_band(&mut self) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        self.coex_enforce()
+            .await
+            .map_err(|_| super::rfk::Error::Policy)
+    }
     async fn begin(&mut self, kind: super::rfk::Kind) -> Result<(), super::rfk::Error> {
         super::rfk::Interface::admit(self)?;
         // Linux _ntfy_wl_rfk returns immediately for IQK one-shot events:
@@ -1250,7 +1481,7 @@ impl super::rfk::Interface for Native {
         super::coex_native::scoreboard(self, 0x4803)
             .await
             .map_err(|_| super::rfk::Error::Policy)?;
-        super::coex_native::enforce(self)
+        self.coex_enforce()
             .await
             .map_err(|_| super::rfk::Error::Policy)
     }
@@ -1273,7 +1504,7 @@ impl super::rfk::Interface for Native {
         super::coex_native::scoreboard(self, 0x4003)
             .await
             .map_err(|_| super::rfk::Error::Policy)?;
-        super::coex_native::enforce(self)
+        self.coex_enforce()
             .await
             .map_err(|_| super::rfk::Error::Policy)?;
         self.calibrating = None;
@@ -1300,4 +1531,4 @@ impl super::rfk::Interface for Native {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "command_native_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -28,6 +28,21 @@ pub(super) struct Runtime<B> {
     pub htt_memory: Option<crate::ath10k::htt_runtime::storage::Storage<B>>,
 }
 impl<B: Memory> Runtime<B> {
+    fn host_idle(&self) -> bool {
+        self.received.is_empty()
+            && self.pipes.iter().all(|pipe| {
+                pipe.direction != Direction::Source || pipe.pending.is_none() && !pipe.ring.busy()
+            })
+            && self.htt_memory.as_ref().is_none_or(|memory| {
+                // order is the permanently posted RX-buffer FIFO, not host
+                // pending work. Keep all those DMA mappings owned in sleep.
+                memory.tx.pending() == 0
+            })
+            && self
+                .management_memory
+                .as_ref()
+                .is_none_or(|memory| memory.pending() == 0)
+    }
     pub fn allocate(
         hw: HwRev,
         mut allocate: impl FnMut(usize) -> Result<B, BmiError>,
@@ -195,6 +210,7 @@ async fn send<B: Memory>(
 
 impl PciBoot {
     pub fn hif_source_ready(&mut self, number: u8) -> Result<bool, BmiError> {
+        self.mmio.idle_power_hint(false);
         if !self.mmio.authorized() || self.poisoned || !self.hif_live {
             return Err(BmiError::Pci);
         }
@@ -213,6 +229,7 @@ impl PciBoot {
         result
     }
     pub fn hif_begin_send(&mut self, number: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        self.mmio.idle_power_hint(false);
         if !self.mmio.authorized() || self.poisoned || !self.hif_live {
             return Err(BmiError::Pci);
         }
@@ -230,12 +247,26 @@ impl PciBoot {
         }
         result
     }
-    fn poll_packets(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+    fn poll_packets(&mut self, allow_idle: bool) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        self.mmio.mark_power_deferred(false);
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
         if self.hif.is_none() {
             return Err(BmiError::BadResponse);
+        }
+        let seen = self.signal.count();
+        let quiescent = self.hif.as_ref().is_some_and(Runtime::host_idle)
+            && !self.resources.tx.busy()
+            && !self.resources.diag_tx.busy()
+            && !self.resources.diag_rx.busy();
+        if !allow_idle || !quiescent {
+            self.mmio.idle_power_hint(false);
+        } else if self.mmio.idle_power_poll(seen)? && self.signal.count() == seen {
+            // A deferred poll is explicitly not an empty native prefix. The
+            // HTC/HTT caller consumes this flag before any key/copy commit.
+            self.mmio.mark_power_deferred(true);
+            return Ok(None);
         }
         let service = self.service_begin()?;
         let hif = self.hif.as_mut().ok_or(BmiError::BadResponse)?;
@@ -257,6 +288,15 @@ impl PciBoot {
         }
         let frame = hif.received.pop_front();
         self.service_finish(service);
+        if allow_idle
+            && frame.is_none()
+            && self.signal.count() == seen
+            && self.hif.as_ref().is_some_and(Runtime::host_idle)
+        {
+            self.mmio.power_quiet(seen)?;
+        } else {
+            self.mmio.idle_power_hint(false);
+        }
         Ok(frame)
     }
     pub fn hif_poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
@@ -264,7 +304,7 @@ impl PciBoot {
             return Err(BmiError::BadResponse);
         }
         self.poisoned = true;
-        let result = self.poll_packets();
+        let result = self.poll_packets(true);
         if result.is_ok() {
             self.poisoned = false;
         }
@@ -295,6 +335,7 @@ impl PciBoot {
         Ok(())
     }
     pub async fn hif_send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        self.mmio.idle_power_hint(false);
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
@@ -342,6 +383,7 @@ impl PciBoot {
         }
     }
     pub async fn hif_poll(&mut self, budget_ms: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        self.mmio.idle_power_hint(false);
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
@@ -353,7 +395,7 @@ impl PciBoot {
         let (signal, delivered) = self.interrupt();
         loop {
             let seen = signal.count();
-            if let Some(frame) = self.poll_packets()? {
+            if let Some(frame) = self.poll_packets(false)? {
                 self.poisoned = false;
                 return Ok(Some(frame));
             }

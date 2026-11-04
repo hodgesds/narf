@@ -45,9 +45,20 @@ pub(super) fn management(
     if protected && (multicast || !is_mgmt) {
         return Err(Error::Bounds);
     }
+    // mt76_connac2_mac_write_txwi_80211: ADDBA needs its target
+    // QoS TID and ADD_BA metadata even though the frame is management.
+    let add_ba = is_mgmt && subtype == 13 && frame.len() >= 33 && frame[24..26] == [3, 0];
+    let tid = if add_ba {
+        (u16::from_le_bytes([frame[27], frame[28]]) >> 2) & 15
+    } else {
+        0
+    };
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
     let words = [
         (frame.len() as u32 + 32) | (0x10 << 25), // CT, LMAC ALTX0.
-        (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid),
+        (1 << 31) | (u32::from(tid) << 20) | (2 << 16) | (12 << 11) | u32::from(wcid),
         (1 << 31)
             | (1 << 13)
             | (u32::from(multicast) << 10)
@@ -55,7 +66,7 @@ pub(super) fn management(
             | if is_data { 2 << 4 } else { 0 },
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1) | u32::from(multicast),
         0,
-        0,
+        if add_ba { 1 << 14 } else { 0 },
         4 | (u32::from(rate.hardware()) << 16),
         (if is_data { 2 << 20 } else { 0 }) | (subtype << 16),
     ];
@@ -244,6 +255,56 @@ fn ethernet_txd(
     Ok(bytes)
 }
 
+/// Retarget one HOME (OMAC0/WMM0) TXD to `vif`, as Linux
+/// mt76_connac2_mac_write_txwi derives both from `mvif`: TXD1 `OWN_MAC`
+/// (bits 24..=29) = `omac_idx`, and an LMAC AC queue (TXD0 `Q_IDX` below
+/// `MT_LMAC_ALTX0`) becomes `wmm_idx * MT76_CONNAC_MAX_WMM_SETS + ac`.
+/// ALTX/beacon queues are per-band and unchanged. `Vif::HOME` is a no-op,
+/// so the physical interface's descriptors stay byte-identical.
+pub(super) fn on_vif(header: &mut [u8; HEADER], vif: super::vif_slots::Vif) -> Result<(), Error> {
+    let mut word0 = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let mut word1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if word1 & (0x3f << 24) != 0 {
+        return Err(Error::Bounds); // already retargeted / not a HOME TXD
+    }
+    let queue = word0 >> 25;
+    if queue < 4 {
+        word0 = (word0 & !(0x7f << 25)) | ((u32::from(vif.wmm()) * 4 + queue) << 25);
+    } else if queue < 0x10 {
+        return Err(Error::Bounds);
+    }
+    word1 |= u32::from(vif.omac()) << 24;
+    header[0..4].copy_from_slice(&word0.to_le_bytes());
+    header[4..8].copy_from_slice(&word1.to_le_bytes());
+    Ok(())
+}
+
+/// One station data TXD for `link` (Linux mt76_connac2_mac_write_txwi with
+/// `mvif`/`wcid` of that vif): WCID = the link's peer, then `on_vif`.
+/// `tid` None is the non-QoS BE descriptor. `Link::HOME` reproduces the
+/// historical WCID 1 / OMAC0 / WMM0 bytes exactly.
+pub(super) fn station_data(
+    link: super::vif_slots::Link,
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    protected: bool,
+    tid: Option<u8>,
+    aggregated: bool,
+) -> Result<[u8; HEADER], Error> {
+    let wcid = u16::from(link.peer());
+    let mut header = match tid {
+        Some(tid) if aggregated => {
+            ethernet_tid_aggregated(frame, payload, token, wcid, protected, tid)?
+        }
+        Some(tid) => ethernet_tid(frame, payload, token, wcid, protected, tid)?,
+        None if aggregated => return Err(Error::Bounds),
+        None => ethernet(frame, payload, token, wcid, protected)?,
+    };
+    on_vif(&mut header, link.vif())?;
+    Ok(header)
+}
+
 /// mt76_connac2_mac_write_txwi: `MT_TXD7_HW_AMSDU` (bit 10) when the peer's
 /// `wcid->amsdu` is set; firmware aggregates up to STA_REC_HW_AMSDU's count.
 pub(super) fn set_hw_amsdu(header: &mut [u8; HEADER]) {
@@ -261,7 +322,17 @@ pub(super) fn ethernet_aggregated(
     token: u16,
     protected: bool,
 ) -> Result<[u8; HEADER], Error> {
-    let mut out = ethernet_qos(frame, payload, token, 1, protected, true)?;
+    ethernet_tid_aggregated(frame, payload, token, 1, protected, 0)
+}
+pub(super) fn ethernet_tid_aggregated(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u16,
+    protected: bool,
+    tid: u8,
+) -> Result<[u8; HEADER], Error> {
+    let mut out = ethernet_tid(frame, payload, token, wcid, protected, tid)?;
     let word = u32::from_le_bytes(out[12..16].try_into().unwrap()) & !(1 << 28);
     out[12..16].copy_from_slice(&word.to_le_bytes());
     Ok(out)

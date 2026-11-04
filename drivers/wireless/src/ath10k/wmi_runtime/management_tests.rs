@@ -17,11 +17,11 @@ fn smoke_ath10k_management_full_linux_generators_and_prefix_boundary() -> TestRe
         (0x9029, AUTH_102),
         (0x9031, AUTH_104),
     ] {
-        if inline(id, &f).as_deref() != Ok(expected) {
+        if inline(id, 0, &f).as_deref() != Ok(expected) {
             return TestResult::Fail("inline management differs from complete Linux C generator");
         }
     }
-    if reference(0, 0x900000, &f).as_deref() != Ok(AUTH_TLV) {
+    if reference(0, 0, 0x900000, &f).as_deref() != Ok(AUTH_TLV) {
         return TestResult::Fail("reference management padded32 prefix differs from Linux");
     }
     let mut assoc = vec![0; 101];
@@ -36,7 +36,7 @@ fn smoke_ath10k_management_full_linux_generators_and_prefix_boundary() -> TestRe
     for (i, b) in assoc.iter_mut().enumerate().skip(42) {
         *b = (i * 5) as u8;
     }
-    if reference(0, 0x900000, &assoc).as_deref() != Ok(ASSOC_TLV) {
+    if reference(0, 0, 0x900000, &assoc).as_deref() != Ok(ASSOC_TLV) {
         return TestResult::Fail("reference management full frame versus64-byte prefix mismatch");
     }
     TestResult::Pass

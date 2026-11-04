@@ -57,6 +57,7 @@ pub mod dp_frag;
 pub mod dp_group_pn;
 pub mod dp_peer;
 pub mod dp_ring;
+mod future_heap;
 pub mod fw;
 mod fw_stats;
 pub mod hal;

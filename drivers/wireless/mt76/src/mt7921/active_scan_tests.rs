@@ -107,7 +107,7 @@ fn native_probe_ies() -> Result<(), &'static str> {
             || body[1110..1116] != [255; 6]
             || body[1185] != 1
             || !matches!(session.state, State::ScanReady(_))
-            || session.security.is_some()
+            || session.station.security.is_some()
         {
             return Err(
                 "literal probe IE offsets/extent corrupted v1 extension or admitted a station",
@@ -274,7 +274,7 @@ fn native_random_mac() -> Result<(), &'static str> {
                 || body[5] != if active { 2 } else { 0 }
                 || session.backend.entropy_calls != 1
                 || !matches!(session.state, State::ScanReady(after) if after == info)
-                || session.security.is_some()
+                || session.station.security.is_some()
             {
                 return Err("random scan host-mask formula, native flags, identity or NO_IR passive contract");
             }
@@ -406,7 +406,7 @@ fn native_order(channels: &[u8]) -> Result<(), &'static str> {
         || report.bss.len() != 1
         || report.bss[0].ssid != b"hidden"
         || !matches!(session.state, State::ScanReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return Err("active scan observations or unauthorized station publication");
     }

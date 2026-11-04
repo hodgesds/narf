@@ -19,13 +19,18 @@ pub struct Nvm {
     pub tx_chains: u32,
     pub rx_chains: u32,
     pub channels: Vec<u8>,
+    /// Valid, explicitly band-qualified NVM tail channels, never numeric
+    /// aliases of the first51 legacy entries.
+    pub(super) six_channels: Vec<super::native_band::Channel>,
     pub phy: super::ht_vht::Local,
+    /// Actual NVM_MAC_SKU_FLAGS_802_11AX_ENABLED, not a PCI inference.
+    pub he: bool,
 }
 
 impl Nvm {
     /// Versions 4/5 share the header and the first 51 channel profiles.
-    /// This interface currently selects 2.4/5 GHz by channel number;
-    /// 6 GHz needs a band-qualified request to avoid channel aliasing.
+    /// Keep the6GHz tail separately and select it only with an explicit
+    /// frequency/band-qualified request.
     pub fn parse(version: u8, bytes: &[u8]) -> Result<Self, &'static str> {
         let capacity = match version {
             4 => 110,
@@ -44,24 +49,38 @@ impl Nvm {
         if tx_chains == 0 || rx_chains == 0 {
             return Err("NVM has no usable antennas");
         }
+        let flags: Vec<u32> = bytes[28..]
+            .chunks_exact(4)
+            .take(count)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
         let channels = CHANNELS
             .into_iter()
             .take(count)
             .enumerate()
-            .filter_map(|(i, channel)| {
-                let flags = u32::from_le_bytes(bytes[28 + 4 * i..32 + 4 * i].try_into().unwrap());
-                (flags & 1 != 0).then_some(channel)
-            })
+            .filter_map(|(i, channel)| (flags[i] & 1 != 0).then_some(channel))
             .collect();
         Ok(Self {
             tx_chains,
             rx_chains,
             channels,
+            six_channels: flags
+                .iter()
+                .enumerate()
+                .skip(51)
+                .filter_map(|(index, flags)| {
+                    (*flags & 1 != 0)
+                        .then(|| super::native_band::Channel::six(1 + 4 * (index - 51) as u8))
+                        .flatten()
+                })
+                .collect(),
             phy: super::ht_vht::Local::from_nvm(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 tx_chains,
                 rx_chains,
-            ),
+            )
+            .with_nvm_channels(&flags),
+            he: u32::from_le_bytes(bytes[8..12].try_into().unwrap()) & (1 << 4) != 0,
         })
     }
 }
@@ -86,6 +105,11 @@ pub fn phy(action: u32, channel: u8) -> [u8; 32] {
     out[12] = u8::from(channel <= 14); // PHY_BAND_24=1, PHY_BAND_5=0
     out[28] = 4; // unused secondary control channel, opposite primary
     out
+}
+pub(super) fn phy_channel(action: u32, channel: super::native_band::Channel) -> [u8; 32] {
+    let mut body = phy(action, channel.number);
+    body[12] = channel.band as u8;
+    body
 }
 
 pub fn link(
@@ -116,6 +140,27 @@ pub fn link(
     put32(&mut out, 136, beacon_interval as u32);
     put32(&mut out, 140, beacon_interval as u32 * dtim.max(1) as u32);
     out
+}
+pub(super) fn link_channel(
+    action: u32,
+    address: [u8; 6],
+    active: bool,
+    channel: super::native_band::Channel,
+    beacon_interval: u16,
+    dtim: u8,
+) -> [u8; 208] {
+    let mut body = link(
+        action,
+        address,
+        active,
+        channel.number,
+        beacon_interval,
+        dtim,
+    );
+    if channel.band == super::native_band::Band::Six {
+        put32(&mut body, 36, 0);
+    }
+    body
 }
 
 pub fn peer(address: [u8; 6]) -> [u8; 104] {
@@ -180,6 +225,9 @@ pub fn runtime_configuration(
 /// REDUCE_TX_POWER_CMD v10/v11, link 0. Firmware takes eighth-dBm
 /// units and applies this ceiling in addition to its regulatory limits.
 pub fn tx_power(version: u8, dbm: i8) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    if matches!(version, 5 | 8) {
+        return super::gen3_wire::power(version, dbm, false);
+    }
     let length = match version {
         10 => 108,
         11 => 116,

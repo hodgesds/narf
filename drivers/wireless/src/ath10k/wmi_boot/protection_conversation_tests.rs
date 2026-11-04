@@ -328,7 +328,12 @@ fn smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects() -> TestR
                         let t = &m.data.as_ref().unwrap().protection_trace;
                         t.len() == 3 && t[0].1 == 0x21 && t[1].1 == 1 && t[2] == (1, u32::MAX)
                     })
-                    || h.device.radio.try_lock().unwrap().submitted_station_protection() != Some(on)
+                    || h.device
+                        .radio
+                        .try_lock()
+                        .unwrap()
+                        .submitted_station_protection()
+                        != Some(on)
                 {
                     return Err("beacon ERP Use_Protection did not program use_cts_prot");
                 }

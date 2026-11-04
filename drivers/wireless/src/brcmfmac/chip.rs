@@ -37,6 +37,15 @@ pub enum Error {
 pub trait Backplane {
     fn read32(&mut self, address: u32) -> Result<u32, Error>;
     fn write32(&mut self, address: u32, value: u32) -> Result<(), Error>;
+    /// One 16-bit register (`brcmf_pcie_read_reg16`, the OTP shadow). The
+    /// default takes the half of the enclosing dword; a bus with native
+    /// 16-bit access overrides it.
+    fn read16(&mut self, address: u32) -> Result<u16, Error> {
+        if address & 1 != 0 {
+            return Err(Error::Address);
+        }
+        Ok((self.read32(address & !3)? >> ((address & 2) * 8)) as u16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

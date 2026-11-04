@@ -132,7 +132,8 @@ pub struct SharedInfo {
     /// Cap on number of pre-posted RX buffers. Saturated to
     /// `DEF_MAX_RXBUFPOST` (255) by Linux when the firmware reports 0.
     pub max_rxbufpost: u16,
-    /// Bytes from start of an RX DMA buffer to the 802.11 payload.
+    /// Prefix inside each fixed-stride D2H descriptor and event payload.
+    /// RX data uses this only when its explicit completion offset is zero.
     pub rx_dataoffset: u32,
     /// TCM address of the H2D mailbox-data slot.
     pub htod_mb_data_addr: u32,

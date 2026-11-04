@@ -43,31 +43,57 @@ unsafe impl Io for Regs {
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Ok(())
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        Ok(self.mem[usize::from(r)])
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { Ok(self.mem[usize::from(r)]) }
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        let r = usize::from(r);
-        Ok(u16::from_le_bytes([self.mem[r], self.mem[r + 1]]))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move {
+            let r = usize::from(r);
+            Ok(u16::from_le_bytes([self.mem[r], self.mem[r + 1]]))
+        }
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        Ok(self.get(r))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { Ok(self.get(r)) }
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.mem[usize::from(r)] = v;
-        self.writes.push((r, u32::from(v)));
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.mem[usize::from(r)] = v;
+            self.writes.push((r, u32::from(v)));
+            Ok(())
+        }
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        let a = usize::from(r);
-        self.mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
-        self.writes.push((r, u32::from(v)));
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            let a = usize::from(r);
+            self.mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+            self.writes.push((r, u32::from(v)));
+            Ok(())
+        }
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.set(r, v);
-        self.writes.push((r, v));
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.set(r, v);
+            self.writes.push((r, v));
+            Ok(())
+        }
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::Unsupported)
@@ -148,15 +174,20 @@ fn period(linked: bool) -> Period {
             rates: 0x15f & 0xfff,
             qos: true,
             mcs: 0xff,
+            rx_mcs: 0xff,
             sgi: false,
             ldpc: false,
             stbc: false,
             acs: 0,
             fallback: false,
+            bw40: false,
+            band5: false,
+            vht: None,
         },
         tx_bytes: 0,
         rx_bytes: 0,
         country: *b"US",
+        txrx_1ss: false,
     }
 }
 fn strong(t: &mut Tracker, n: usize, rssi: u8) {
@@ -191,7 +222,7 @@ fn smoke_rtw88_dm_payload_admission_per_chip() -> TestResult {
         payload(ALL, 0x5b, 4, 8, 8, 8),
         payload(ALL, 0x1f, 4, 8, 8, 8),
         payload(ALL, 0x40, 5, 8, 8, 8),
-        payload(ALL | 1 << 7, 0x40, 4, 8, 8, 8),
+        payload(ALL | 1 << 8, 0x40, 4, 8, 8, 8),
     ];
     let mut t = ok;
     t[7] = 51;
@@ -412,6 +443,62 @@ fn smoke_rtw88_dm_path_div_cfo_window_and_bt_reset() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88/dm_engine",
     smoke_rtw88_dm_path_div_cfo_window_and_bt_reset
+);
+
+fn smoke_rtw88_dm_path_div_held_under_coex_txrx_1ss() -> TestResult {
+    let b = dm::bounds(0xc822, &payload(dm::PATH_DIV, 0x40, 0, 2, 0, 0)).unwrap();
+    let mut t = Tracker::new(b, c22_facts());
+    let mut io = c22_regs();
+    let auth = Auth(Cell::new(true));
+    let b_stronger = |t: &mut Tracker| {
+        for _ in 0..5 {
+            t.observe(Sample {
+                rssi: 40,
+                path_rssi: [Some(30), Some(50)],
+                cfo_tail: None,
+                rate: 12,
+            });
+        }
+    };
+    b_stronger(&mut t);
+    let _ = run(t.tick(&mut io, &auth, period(true)));
+    if t.tx_path() != 2 {
+        return TestResult::Fail("path B not selected");
+    }
+    // Coexistence 1SS: diversity returns to A (rtw_phy_set_tx_path_by_reg).
+    if run(t.hold_tx_path(&mut io, &auth)).is_err()
+        || t.tx_path() != 1
+        || io.get(0x1a04) >> 28 != 8
+        || io.get(0x820) & 0xff != 0x31
+    {
+        return TestResult::Fail("hold did not return TX to path A");
+    }
+    // While hal.txrx_1ss the stronger path B is never selected.
+    b_stronger(&mut t);
+    io.writes.clear();
+    let held = Period {
+        txrx_1ss: true,
+        ..period(true)
+    };
+    let _ = run(t.tick(&mut io, &auth, held));
+    if t.tx_path() != 1
+        || io
+            .writes
+            .iter()
+            .any(|(a, _)| matches!(*a, 0x820 | 0x1a04 | 0x1e2c))
+    {
+        return TestResult::Fail("path diversity wrote while 1SS was held");
+    }
+    // Released: samples taken under 1SS were dropped, fresh ones decide.
+    let _ = run(t.tick(&mut io, &auth, period(true)));
+    if t.tx_path() != 1 {
+        return TestResult::Fail("held-period samples leaked into selection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/dm_engine",
+    smoke_rtw88_dm_path_div_held_under_coex_txrx_1ss
 );
 
 fn smoke_rtw88_dm_power_tracking_trigger_clamp_and_envelope() -> TestResult {

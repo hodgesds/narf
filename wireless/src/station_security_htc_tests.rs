@@ -82,3 +82,76 @@ kernel_test_in!(
     "wireless/station_security/htc",
     smoke_station_htc_qos_data_is_received
 );
+
+fn smoke_station_htc_transmit_authenticates_payload_and_shares_pn_sn() -> TestResult {
+    let mut s = established();
+    let p = ptk(AN, SN);
+    let mut ethernet = AP.to_vec();
+    ethernet.extend_from_slice(&OWN);
+    ethernet.extend_from_slice(&[8, 0, 0x45, 0, 0, 4]);
+    let sn = s.next_qos_sequence(5).unwrap();
+    let htc = s
+        .transmit_ethernet_qos_htc(&ethernet, 5, [0x1b, 0, 0, 0])
+        .unwrap();
+    if htc[..2] != [0x88, 0xc1]
+        || htc[24..30] != [0x15, 0, 0x1b, 0, 0, 0]
+        || u16::from_le_bytes([htc[22], htc[23]]) >> 4 != sn
+    {
+        return TestResult::Fail("HE +HTC Order/EOSP/control/header sequence");
+    }
+    let mut replay = crate::ccmp::ReplayWindow { last_seen_pn: 0 };
+    let mut wire = htc[30..].to_vec();
+    let Ok(plain) = crate::ccmp::unprotect(
+        &Ccm,
+        &htc[..30],
+        p.tk.as_slice().try_into().unwrap(),
+        5,
+        false,
+        &mut replay,
+        &mut wire,
+    ) else {
+        return TestResult::Fail("HE +HTC TX MIC/nonce did not authenticate");
+    };
+    if plain[..8] != [0xaa, 0xaa, 3, 0, 0, 0, 8, 0] || plain[8..] != ethernet[14..] {
+        return TestResult::Fail("HE +HTC changed the MSDU");
+    }
+    let old_pn = replay.last_seen_pn;
+    let plain = s.transmit_ethernet_qos(&ethernet, 5).unwrap();
+    let mut wire = plain[26..].to_vec();
+    if crate::ccmp::unprotect(
+        &Ccm,
+        &plain[..26],
+        p.tk.as_slice().try_into().unwrap(),
+        5,
+        false,
+        &mut replay,
+        &mut wire,
+    )
+    .is_err()
+        || replay.last_seen_pn != old_pn + 1
+        || u16::from_le_bytes([plain[22], plain[23]]) >> 4 != (sn + 1) & 4095
+    {
+        return TestResult::Fail("HE +HTC split the ordinary TID sequence or key PN");
+    }
+    let next = s.next_qos_sequence(5).unwrap();
+    for (tid, control) in [(16, [0x1b, 0, 0, 0]), (5, [0, 0, 0, 0])] {
+        if s.transmit_ethernet_qos_htc(&ethernet, tid, control) != Err(Error::Profile) {
+            return TestResult::Fail("invalid HE +HTC profile accepted");
+        }
+    }
+    ethernet[12..14].copy_from_slice(&[0x88, 0x8e]);
+    if s.transmit_ethernet_qos_htc(&ethernet, 5, [0x1b, 0, 0, 0]) != Err(Error::Profile)
+        || s.next_qos_sequence(5) != Ok(next)
+    {
+        return TestResult::Fail("HE +HTC admitted EAPOL or consumed SN on refusal");
+    }
+    ethernet[12..14].copy_from_slice(&[8, 0]);
+    if security().transmit_ethernet_qos_htc(&ethernet, 5, [0x1b, 0, 0, 0]) != Err(Error::State) {
+        return TestResult::Fail("HE +HTC bypassed the controlled port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security/htc",
+    smoke_station_htc_transmit_authenticates_payload_and_shares_pn_sn
+);

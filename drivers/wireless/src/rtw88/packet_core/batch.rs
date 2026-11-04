@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Independent native BE allocations and one immutable descriptor batch.
+//! Independent native allocations and one same-TID physical-ring batch.
 use super::*;
 pub(super) struct Pending {
     id: u64,
     slot: usize,
+    queue: Queue,
     length: usize,
     next: u16,
     consumed: bool,
@@ -34,7 +35,16 @@ impl Core {
         if !port.originator_ba_allowed() || !cfg.admits(self.data_profile, frames) {
             return Err(Error::Access);
         }
-        port.transmit_allowed()?;
+        // QoS TID without the A-MSDU-present bit; `transmit_profile` admits
+        // that bit only for a 5GHz HT/VHT profile.
+        let tid = frames
+            .first()
+            .and_then(|f| f.get(24))
+            .ok_or(Error::Packet)?
+            & 0x7f;
+        let queue = self.data_profile.tid_queue(tid).ok_or(Error::Packet)?;
+        let ring = queue_slot(queue);
+        port.batch_allowed(tid, self.data_profile)?;
         let count = frames.len();
         if usize::from(self.reports) + count > 64 {
             let index = port.index(0x3b4)?;
@@ -56,11 +66,11 @@ impl Core {
             .try_reserve(count)
             .map_err(|_| Error::Memory)?;
         for (slot, frame) in frames.iter().enumerate() {
-            if frame.len() < 26 || frame[0] != 0x88 || frame[24..26] != [0, 0] {
+            if frame.len() < 26 || frame[0] != 0x88 || frame[24] & 0x7f != tid || frame[25] != 0 {
                 return Err(Error::Packet);
             }
             let sequence = (self.reports + slot as u8) << 2;
-            let (mut descriptor, queue) = format::transmit_profile(
+            let (mut descriptor, actual_queue) = format::transmit_profile(
                 frame,
                 self.own,
                 self.mac_id,
@@ -72,7 +82,7 @@ impl Core {
                     ..self.data_profile
                 },
             )?;
-            if queue != Queue::Data {
+            if actual_queue != queue || !queue.data() || queue == Queue::Voice {
                 return Err(Error::Packet);
             }
             let word2 = u32::from_le_bytes(descriptor[8..12].try_into().unwrap())
@@ -89,12 +99,13 @@ impl Core {
             let memory = self.batch_buffers.get(slot).ok_or(Error::State)?;
             let bd = format::buffer_descriptor(memory.dma_addr().raw(), frame.len())?;
             let id = self.next_id.checked_add(slot as u64).ok_or(Error::State)?;
-            let next = (usize::from(self.tx_host[1]) + slot + 1) % Queue::Data.depth();
+            let next = (usize::from(self.tx_host[ring]) + slot + 1) % queue.depth();
             prepared.push((descriptor, bd, next as u16, sequence));
             ids.push(id);
         }
         let next_id = self.next_id.checked_add(count as u64).ok_or(Error::State)?;
-        let result = (|| {
+        let profile = self.data_profile;
+        let result = port.batch_publication(profile, |port| {
             for (slot, (frame, (descriptor, bd, next, sequence))) in
                 frames.iter().zip(&prepared).enumerate()
             {
@@ -108,6 +119,7 @@ impl Core {
                 self.batch_pending.push_back(Pending {
                     id: ids[slot],
                     slot,
+                    queue,
                     length: frame.len(),
                     next: *next,
                     consumed: false,
@@ -116,20 +128,20 @@ impl Core {
                     report: None,
                 });
                 self.batch_published = true;
-                let ring_slot = (usize::from(self.tx_host[1]) + slot) % Queue::Data.depth();
-                port.transmit_allowed()?;
-                port.tx_descriptor(Queue::Data, ring_slot, bd)?;
+                let ring_slot = (usize::from(self.tx_host[ring]) + slot) % queue.depth();
+                port.batch_allowed(tid, profile)?;
+                port.tx_descriptor(queue, ring_slot, bd)?;
             }
             let next = prepared.last().ok_or(Error::Packet)?.2;
-            port.transmit_allowed()?;
+            port.batch_allowed(tid, profile)?;
             barrier();
-            port.publish(Queue::Data.index(), next)?;
-            self.tx_host[1] = next;
+            port.publish(queue.index(), next)?;
+            self.tx_host[ring] = next;
             self.next_id = next_id;
             self.reports += count as u8;
             self.rx_idle = false;
             Ok(ids)
-        })();
+        });
         if result.is_err() {
             self.phase = Phase::Failed;
         }
@@ -142,23 +154,28 @@ impl Core {
         if self.batch_pending.is_empty() {
             return Ok(None);
         }
-        let index = port.index(Queue::Data.index())?;
+        let queue = self.batch_pending.front().ok_or(Error::State)?.queue;
+        if self.batch_pending.iter().any(|p| p.queue != queue) {
+            return Err(Error::State);
+        }
+        let ring = queue_slot(queue);
+        let index = port.index(queue.index())?;
         let host = (index & 0xfff) as u16;
         let device = (index >> 16 & 0xfff) as u16;
-        let depth = Queue::Data.depth();
-        if host != self.tx_host[1] || usize::from(device) >= depth {
+        let depth = queue.depth();
+        if host != self.tx_host[ring] || usize::from(device) >= depth {
             return Err(Error::Packet);
         }
         let available =
-            (usize::from(self.tx_host[1]) + depth - usize::from(self.tx_device[1])) % depth;
-        let advanced = (usize::from(device) + depth - usize::from(self.tx_device[1])) % depth;
+            (usize::from(self.tx_host[ring]) + depth - usize::from(self.tx_device[ring])) % depth;
+        let advanced = (usize::from(device) + depth - usize::from(self.tx_device[ring])) % depth;
         if advanced > available {
             return Err(Error::Packet);
         }
         for p in &mut self.batch_pending {
             if !p.consumed {
                 let distance =
-                    (usize::from(p.next) + depth - usize::from(self.tx_device[1])) % depth;
+                    (usize::from(p.next) + depth - usize::from(self.tx_device[ring])) % depth;
                 if distance != 0 && distance <= advanced {
                     p.consumed = true;
                 }
@@ -170,7 +187,7 @@ impl Core {
                 return Err(Error::Packet);
             }
         }
-        self.tx_device[1] = device;
+        self.tx_device[ring] = device;
         let p = self.batch_pending.front().ok_or(Error::State)?;
         if !p.consumed || p.report != Some(true) {
             return Ok(None);

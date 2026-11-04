@@ -89,10 +89,26 @@ pub(super) struct State<M: Memory> {
     reserved: Option<M>,
     pub(super) qos: bool,
     pub(super) ht: bool,
+    pub(super) width: Option<super::super::ht::Geometry>,
+    /// RTL8821AE: the channel is the 80 MHz VHT channel (`current_chan_bw`
+    /// `HT_CHANNEL_WIDTH_80`, `mac->bw_80`); `width` then holds the
+    /// primary HT40 pair inside it.
+    pub(super) eighty: bool,
+    /// RTL8821AE VHT link: `_rtl_get_vht_highest_n_rate` for the AP (the
+    /// AC_5G data `hw_rate`); `None` without a negotiated VHT peer.
+    pub(super) vht_highest: Option<u8>,
+    pub(super) protection: super::super::protection::Mode,
+    pub(super) antenna: Option<u8>,
     /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
     interrupts: bool,
     /// Firmware leisure power save (fw_current_inpsmode) is active.
     leisure: bool,
+    /// RTL8821AE mailbox and receive/beacon-control cache (`packet_ae`).
+    pub(super) ae: ae::State,
+    /// RTL8192EE buffer-descriptor RX pointers (`rtl8192ee/packet_owner.rs`).
+    pub(super) ee92: ee92::State,
+    /// RTL8192CE / RTL8188CE mailbox and DM state (`rtl8192ce/packet_owner.rs`).
+    pub(super) ce92: ce92::State,
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
     /// rate fallback is only enabled while the firmware owns this mask
     /// and the caller holds a current `NEFB` grant.
@@ -114,8 +130,16 @@ impl<M: Memory> State<M> {
             reserved: None,
             qos: false,
             ht: false,
+            width: None,
+            eighty: false,
+            vht_highest: None,
+            protection: super::super::protection::Mode::None,
+            antenna: None,
             interrupts: false,
             leisure: false,
+            ae: ae::State::new(),
+            ee92: ee92::State::new(),
+            ce92: ce92::State::new(),
             rate_mask: None,
             retired: Vec::new(),
         }
@@ -147,11 +171,14 @@ pub struct Mpdu {
     bytes: Vec<u8>,
     channel: u8,
     ht: bool,
+    short_gi: bool,
+    width40: bool,
     /// Native RXD DW1 PAGGR/FAGGR: this MPDU arrived inside an A-MPDU.
     aggregated: bool,
     /// `_rtl88ee_query_rxphystatus` `rx_pwdb_all` when RXD PHYST carried
     /// the 28-byte EE PHY status.
     pwdb: Option<u8>,
+    antenna_mux: Option<u8>,
 }
 /// Consuming a rejected packet/report is progress, never a receive-idle
 /// proof. Station output waits for a genuine OWN-owned next descriptor.
@@ -169,9 +196,18 @@ impl Mpdu {
     pub(super) fn ht(&self) -> bool {
         self.ht
     }
+    pub(super) fn width40(&self) -> bool {
+        self.width40
+    }
+    pub(super) fn short_gi(&self) -> bool {
+        self.short_gi
+    }
     /// Only the station's recipient BA owner may admit such an MPDU.
     pub(super) fn pwdb(&self) -> Option<u8> {
         self.pwdb
+    }
+    pub(super) fn antenna_mux(&self) -> Option<u8> {
+        self.antenna_mux
     }
     pub(super) fn aggregated(&self) -> bool {
         self.aggregated
@@ -244,9 +280,39 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.local
     }
     pub(crate) fn transmit_ready(&self) -> bool {
-        self.phase == Phase::Running && self.packet.pending.is_none() && !self.packet.mailbox.failed
+        self.phase == Phase::Running
+            && self.packet.pending.is_none()
+            && !self.packet.mailbox.failed
+            && !self.packet.ae.mailbox.failed
+            && !self.packet.ee92.mailbox.failed
+            && !self.packet.ce92.mailbox.failed
+    }
+    fn rtl8821ae(&self) -> bool {
+        self.chip == super::Chip::Rtl8821ae
+    }
+    fn rtl8192ee(&self) -> bool {
+        self.chip == super::Chip::Rtl8192ee
+    }
+    fn rtl8192ce(&self) -> bool {
+        self.chip == super::Chip::Rtl8192ce
+    }
+    /// RTL8723BE owns prepared rings only; no packet path is admitted.
+    fn rtl8723be(&self) -> bool {
+        self.chip == super::Chip::Rtl8723be
     }
     pub(crate) async fn awake_station(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_awake_station();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_awake_station();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_awake_station();
+        }
+        if self.rtl8723be() {
+            return Err(Error::State);
+        }
         if self.phase != Phase::MacConfigured {
             return Err(Error::State);
         }
@@ -262,6 +328,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         basic: u16,
         capability: u16,
     ) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_prepare_peer(peer, rates, basic, capability);
+        }
+        if self.rtl8192ee() {
+            return self.ee92_prepare_peer(peer, rates, basic, capability);
+        }
+        if self.rtl8192ce() {
+            return self.ce92_prepare_peer(peer, rates, basic, capability);
+        }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
         }
@@ -289,6 +364,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         admission: Option<&super::station::Admission>,
         policy: impl Fn(&Self) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_complete_peer(peer, aid, admission, policy).await;
+        }
+        if self.rtl8192ee() {
+            return self.ee92_complete_peer(peer, aid, admission, policy).await;
+        }
+        if self.rtl8192ce() {
+            return self.ce92_complete_peer(peer, aid, admission, policy).await;
+        }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
         }
@@ -441,7 +525,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         payload: [u8; 5],
         admission: Option<&super::station::Admission>,
     ) -> Result<(), Error> {
-        if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
+        if self.rtl8821ae()
+            || self.rtl8192ee()
+            || self.rtl8192ce()
+            || !self.transmit_ready()
+            || self.packet.leisure
+            || self.packet.local.is_none()
+        {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
@@ -464,6 +554,104 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.phase = Phase::Running;
         Ok(())
     }
+    /// 8821AE `rtl8821ae_update_hal_rate_mask` (`H2C_8821AE_RA_MASK`, 7
+    /// bytes from [`super::super::rtl8821ae::h2c::rate_mask`]).
+    pub(crate) async fn install_rtl8821ae_rate_mask(
+        &mut self,
+        payload: [u8; 7],
+        admission: Option<&super::station::Admission>,
+    ) -> Result<(), Error> {
+        if !self.rtl8821ae() {
+            return Err(Error::State);
+        }
+        self.ae_install_rate_mask(payload, admission).await
+    }
+    /// 8192EE `rtl92ee_update_hal_rate_mask` (`H2C_92E_RA_MASK`) for `peer`
+    /// at DM `level`, bounded by the permission's `admitted` rates
+    /// (`packet_owner.rs::ee92_install_rate_mask`). Records the RA link the
+    /// watchdog refreshes and the `ratr_index` the data descriptors carry.
+    pub(crate) async fn install_rtl8192ee_rate_mask(
+        &mut self,
+        peer: super::super::rtl8192ee::h2c::Peer,
+        bw40: bool,
+        level: u8,
+        admitted: u32,
+    ) -> Result<(), Error> {
+        if !self.rtl8192ee() {
+            return Err(Error::State);
+        }
+        self.ee92_install_rate_mask(peer, bw40, level, admitted)
+            .await?;
+        self.packet.rate_mask = self.packet.ee92.link.map(|(_, _, index)| index);
+        Ok(())
+    }
+    /// 8192CE / 8188CE `rtl92ce_update_hal_rate_mask` (`H2C_RA_MASK`) for
+    /// `peer` at DM `level`, bounded by the permission's `admitted` rates
+    /// (`packet_owner.rs::ce92_install_rate_mask`). Records the
+    /// `ratr_index` the data descriptors carry.
+    pub(crate) async fn install_rtl8192ce_rate_mask(
+        &mut self,
+        peer: super::super::rtl8192ce::h2c::Peer,
+        bw40: bool,
+        level: u8,
+        admitted: u32,
+    ) -> Result<(), Error> {
+        if !self.rtl8192ce() {
+            return Err(Error::State);
+        }
+        self.ce92_install_rate_mask(peer, bw40, level, admitted)
+            .await?;
+        self.packet.rate_mask = self.packet.ce92.link.map(|(_, _, index)| index);
+        Ok(())
+    }
+    /// 8192CE / 8188CE composed `rtl92c_dm_watchdog` step
+    /// (`packet_owner.rs::ce92_dm_watchdog`).
+    pub(crate) fn rtl8192ce_dm_watchdog(&mut self, undec_sm_pwdb: i64) -> Result<bool, Error> {
+        if !self.rtl8192ce() {
+            return Err(Error::State);
+        }
+        self.ce92_dm_watchdog(undec_sm_pwdb)
+    }
+    /// 8192EE composed `rtl92ee_dm_watchdog` step
+    /// (`packet_owner.rs::ee92_dm_watchdog`). Returns whether the RA mask
+    /// was refreshed.
+    pub(crate) async fn rtl8192ee_dm_watchdog(
+        &mut self,
+        undec_sm_pwdb: i64,
+        admitted: u32,
+    ) -> Result<bool, Error> {
+        if !self.rtl8192ee() {
+            return Err(Error::State);
+        }
+        let refreshed = self.ee92_dm_watchdog(undec_sm_pwdb, admitted).await?;
+        self.packet.rate_mask = self.packet.ee92.link.map(|(_, _, index)| index);
+        Ok(refreshed)
+    }
+    /// RTL8821AE: the latest C2H TX report matched to its frame.
+    pub(crate) fn take_rtl8821ae_tx_report(&mut self) -> Option<ae::TxReport> {
+        if !self.rtl8821ae() {
+            return None;
+        }
+        self.ae_take_tx_report()
+    }
+    /// RTL8821AE: every `SPE_RPT` request has its C2H report.
+    pub(crate) fn rtl8821ae_tx_reports_settled(&self) -> bool {
+        !self.rtl8821ae() || self.ae_tx_reports_settled()
+    }
+    /// RTL8821AE: firmware RA's current rate (`DESC_RATE*`) from C2H.
+    pub(crate) fn rtl8821ae_ra_rate(&self) -> Option<u8> {
+        if !self.rtl8821ae() {
+            return None;
+        }
+        self.ae_ra_rate()
+    }
+    /// RTL8821AE: apply a pending RA report (`rtl8821ae_dm_update_init_rate`).
+    pub(crate) fn update_rtl8821ae_init_rate(&mut self) -> Result<bool, Error> {
+        if !self.rtl8821ae() {
+            return Err(Error::State);
+        }
+        self.ae_update_init_rate()
+    }
     /// True while the firmware is in leisure power save.
     pub(crate) fn leisure(&self) -> bool {
         self.packet.leisure
@@ -471,6 +659,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl_lps_set_psmode(EAUTOPS)` → HW_VAR_FW_LPS_ACTION(true):
     /// only a running, idle owner may hand the radio to firmware LPS.
     pub(crate) async fn enter_leisure(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_enter_leisure().await;
+        }
+        if self.rtl8192ee() {
+            return self.ee92_enter_leisure().await;
+        }
+        if self.rtl8192ce() {
+            return self.ce92_enter_leisure().await;
+        }
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
@@ -483,6 +680,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl_lps_set_psmode(EACTIVE)` → HW_VAR_FW_LPS_ACTION(false):
     /// `_rtl88ee_fwlps_leave` RPWM ALL_ON then H2C FW_PS_ACTIVE_MODE.
     pub(crate) async fn leave_leisure(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_leave_leisure().await;
+        }
+        if self.rtl8192ee() {
+            return self.ee92_leave_leisure().await;
+        }
+        if self.rtl8192ce() {
+            return self.ce92_leave_leisure().await;
+        }
         if self.phase != Phase::Running || !self.packet.leisure {
             return Err(Error::State);
         }
@@ -510,14 +716,23 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .try_reserve(1)
             .map_err(|_| Error::Memory)?;
         self.phase = Phase::Failed;
-        if core::mem::take(&mut self.packet.leisure) {
-            self.packet.mailbox.awake(&self.io).await?;
+        if self.rtl8821ae() {
+            self.ae_disconnected().await?;
+        } else if self.rtl8192ee() {
+            self.ee92_disconnected().await?;
+        } else if self.rtl8192ce() {
+            self.ce92_disconnected().await?;
+        } else {
+            if core::mem::take(&mut self.packet.leisure) {
+                self.packet.mailbox.awake(&self.io).await?;
+            }
+            self.packet.mailbox.send(&self.io, 1, &[0]).await?;
+            super::super::station_control::disconnected(&self.io)?;
         }
-        self.packet.mailbox.send(&self.io, 1, &[0]).await?;
-        super::super::station_control::disconnected(&self.io)?;
         self.packet.rate_mask = None;
         self.packet.qos = false;
         self.packet.ht = false;
+        self.packet.vht_highest = None;
         if let Some(reserved) = self.packet.reserved.take() {
             self.packet.retired.push(reserved);
         }
@@ -536,11 +751,49 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.phase == Phase::Running && self.packet.pending.is_none()
     }
+    /// The RTL8821AE H2C box state, handed to the parked WoWLAN firmware
+    /// owner after `wow_card_disable`.
+    pub(crate) fn take_ae_mailbox(&mut self) -> super::super::rtl8821ae::h2c::Mailbox {
+        core::mem::take(&mut self.packet.ae.mailbox)
+    }
+    /// RTL8821AE only: the WoWLAN `rtl8821ae_card_disable` branch
+    /// (`packet_ae.rs::ae_wow_card_disable`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn wow_card_disable(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        image: &[u8],
+        bssid: [u8; 6],
+        aid: u16,
+        pairwise: u8,
+        group: u8,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !self.rtl8821ae() || self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        self.ae_wow_card_disable(config, image, bssid, aid, pairwise, group, policy)
+            .await
+    }
     pub(crate) async fn disconnect_station_peer(&mut self) -> Result<(), Error> {
         if !matches!(self.phase, Phase::Running | Phase::Failed) {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
+        if self.rtl8821ae() || self.rtl8192ee() || self.rtl8192ce() {
+            let report = if self.rtl8821ae() {
+                self.ae_disconnected().await
+            } else if self.rtl8192ee() {
+                self.ee92_disconnected().await
+            } else {
+                self.ce92_disconnected().await
+            };
+            let stopped = self.stop_packets();
+            if stopped.is_ok() {
+                let _ = self.quiesce().await;
+            }
+            return report.and(stopped);
+        }
         // mac80211 disassociation leaves PS before the join report clears.
         let awake = if core::mem::take(&mut self.packet.leisure) {
             self.packet.mailbox.awake(&self.io).await
@@ -589,6 +842,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// timeout leaves every mapping retained. Success is the retirement
     /// proof that allows the published rings and buffers to be unmapped.
     pub(crate) async fn quiesce(&mut self) -> Result<(), Error> {
+        if self.rtl8192ee() {
+            return self.ee92_quiesce().await;
+        }
+        if self.rtl8192ce() {
+            return self.ce92_quiesce().await;
+        }
         if self.phase != Phase::Stopped || !self.published {
             return Err(Error::State);
         }
@@ -632,6 +891,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// factory IQ/LC calibration and opaque channel/power grant are required.
     /// Device interrupts remain masked; no native netdev is raised here.
     pub(crate) fn start_packets(&mut self) -> Result<(), Error> {
+        if self.rtl8821ae() {
+            return self.ae_start_packets();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_start_packets();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_start_packets();
+        }
+        if self.rtl8723be() {
+            return Err(Error::State);
+        }
         if self.phase != Phase::MacConfigured
             || self.packet.local.is_none()
             || self.permission.is_none()
@@ -675,6 +946,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// fallback keeps every mask clear.
     pub(crate) fn enable_interrupts(&mut self) -> Result<(), Error> {
         use super::super::irq::*;
+        if self.rtl8821ae() {
+            return self.ae_enable_interrupts();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_enable_interrupts();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_enable_interrupts();
+        }
+        if self.rtl8723be() {
+            return Err(Error::State);
+        }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);
         }
@@ -697,6 +980,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// Linux `rtl88ee_disable_interrupt` (HIMR/HIMRE = IMR_DISABLED). Used
     /// when the bound vector is withdrawn while the owner keeps polling.
     pub(crate) fn disable_interrupts(&mut self) -> Result<(), Error> {
+        if self.rtl8192ce() {
+            return self.ce92_disable_interrupts();
+        }
         self.packet.interrupts = false;
         self.io.write32(0xb0, 0)?;
         self.io.write32(0xb8, 0)?;
@@ -714,6 +1000,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// the function vanished and is terminal.
     pub(crate) fn recognize_interrupts(&mut self) -> Result<super::super::irq::Recognized, Error> {
         use super::super::irq::*;
+        if self.rtl8821ae() {
+            return self.ae_recognize_interrupts();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_recognize_interrupts();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_recognize_interrupts();
+        }
         if self.phase != Phase::Running || !self.packet.interrupts {
             return Err(Error::State);
         }
@@ -774,7 +1069,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// One outstanding native frame is retained across all active queues.
     /// A free descriptor alone cannot substitute a different pending payload.
     pub(crate) fn submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
-        self.submit_aggregate(frame, rate, None, false)
+        self.submit_aggregate(frame, rate, None, false, false)
     }
     /// `submit` with `rtl8188ee_tx_fill_desc` aggregation fields for QoS
     /// DATA to an HT station: `aggregate = (ampdu_density, ampdu)` sets
@@ -792,12 +1087,34 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         rate: u8,
         aggregate: Option<(u8, bool)>,
         adaptive: bool,
+        short_gi: bool,
     ) -> Result<u64, Error> {
+        if self.rtl8821ae() {
+            return self.ae_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
+        if self.rtl8192ee() {
+            return self.ee92_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
+        if self.rtl8192ce() {
+            return self.ce92_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
         if aggregate.is_some_and(|(density, _)| density > 7)
             || aggregate.is_some() && !(self.packet.ht && frame.first() == Some(&0x88))
+        {
+            return Err(Error::Packet);
+        }
+        // rtl8188ee/trx.c selects use_shortgi only above DESC92C_RATEMCS0.
+        // Legacy/management/control frames and the MCS0 source case retain
+        // the existing long-GI/long-preamble form. SGI fallback needs its own
+        // signed continuation; NEFB v1 does not cover mixed-GI retries.
+        if short_gi
+            && !(self.packet.ht
+                && (13..=19).contains(&rate)
+                && frame.first() == Some(&0x88)
+                && !adaptive)
         {
             return Err(Error::Packet);
         }
@@ -848,6 +1165,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             prefix[1] |= u32::from(index) << 16;
             prefix[4] &= !(1 << 10);
         }
+        if frame[0] & 0x0c == 8 && frame[4] & 1 == 0 {
+            prefix[4] |= self.packet.protection.fields();
+        }
+        if let Some(g) = self.packet.width {
+            prefix[4] |= if frame[0] == 0x88 && rate >= 12 {
+                (1 << 25) | (3 << 20)
+            } else {
+                u32::from(g.prime()) << 20
+            };
+        }
         if frame[0] == 0x88 {
             prefix[4] |= 1 << 6;
         } // EE TXD.QOS; host SSN retained.
@@ -858,8 +1185,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 prefix[6] |= MAX_AGG_NUM << 11;
             }
         }
-        prefix[5] = u32::from(rate) | (0x1f << 8) | (15 << 13);
+        prefix[5] = u32::from(rate) | (u32::from(short_gi) << 6) | (0x1f << 8) | (15 << 13);
         prefix[7] = frame.len() as u32;
+        if let Some(mux) = self.packet.antenna {
+            if mux > 1 {
+                return Err(Error::Packet);
+            }
+            prefix[2] |= (u32::from(mux & 1) << 24) | (u32::from((mux >> 1) & 1) << 25);
+            prefix[7] |= u32::from((mux >> 2) & 1) << 29;
+        }
         prefix[8] = address;
         // Fill through the actual live DMA mapping before it can be named
         // by OWN. Retain its owner before the first descriptor mutation.
@@ -899,6 +1233,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(id)
     }
     fn delivery(&mut self) -> Result<Option<Delivery>, Error> {
+        if self.rtl8821ae() {
+            return self.ae_delivery();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_delivery();
+        }
         let Some(pending) = self.packet.pending.as_ref() else {
             return Ok(None);
         };
@@ -971,6 +1311,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.poll_receive_step().map(|step| step.packet)
     }
     pub(crate) fn poll_receive_step(&mut self) -> Result<ReceiveStep, Error> {
+        if self.rtl8821ae() {
+            return self.ae_receive_step();
+        }
+        if self.rtl8192ee() {
+            return self.ee92_receive_step();
+        }
+        if self.rtl8192ce() {
+            return self.ce92_receive_step();
+        }
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -1007,7 +1356,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let ht_profile = self.packet.ht
                 && ht
                 && (12..=19).contains(&(report & 63))
-                && report & ((1 << 7) | (1 << 8) | (1 << 9)) == 0;
+                && report & (1 << 7) == 0
+                && (report & (1 << 9) == 0 || self.packet.width.is_some());
             let legacy_profile = !ht && report & (1 << 9) == 0 && report & 63 <= 11;
             // DW1 PAGGR/FAGGR (rtl8188ee trx.h): A-MPDU membership is only
             // admissible on the HT profile, where the station BA owner gates it.
@@ -1020,7 +1370,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && sequence & 0xf000 == 0
                 && (legacy_profile || ht_profile)
                 && (24..=if self.packet.ht {
-                    26 + 16 + narf_wireless::amsdu::MAX_BYTES + 4
+                    26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
                 } else {
                     MAX_MPDU + 4
                 })
@@ -1030,6 +1380,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // EE's PHY info is its own28-byte structure inside drvinfo,
                 // not rtw88 page1. RXD owns rate/BW; no channel field exists.
                 let mut pwdb = None;
+                let mut antenna_mux = None;
+                let mut short_gi = ht && report & (1 << 8) != 0;
                 if status & (1 << 26) != 0 {
                     let info = (((status >> 16) & 15) * 8) as usize;
                     if info < 28 {
@@ -1037,17 +1389,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     }
                     let mut phy = [0; 28];
                     buffer.read_bytes(((status >> 24) & 3) as usize, &mut phy)?;
-                    if ht && phy[27] & 2 != 0 {
-                        // sgi_en: LGI-only receive profile.
-                        for word in 0..6 {
-                            ring.write32(offset + word * 4, 0)?;
-                        }
-                        buffer.sync();
-                        ring.sync();
-                        ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
-                        ring.sync();
-                        return Ok((true, None));
-                    }
+                    short_gi |= ht && phy[27] & 2 != 0;
+                    antenna_mux = Some(
+                        ((phy[27] >> 7) & 1) | (((phy[27] >> 6) & 1) << 1) | ((phy[27] & 1) << 2),
+                    );
                     // RX_HAL_IS_CCK_RATE(rxmcs): DESC92C_RATE1M..11M.
                     let cck = !ht && report & 63 < 4;
                     // trx.c reads RFPGA0_XA_HSSIPARAMETER2 BIT(9) with RF on.
@@ -1071,8 +1416,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             bytes,
                             channel,
                             ht,
+                            short_gi,
+                            width40: report & (1 << 9) != 0,
                             aggregated,
                             pwdb,
+                            antenna_mux,
                         });
                     }
                 } else if bytes.len() >= 24
@@ -1086,8 +1434,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         bytes,
                         channel,
                         ht,
+                        short_gi,
+                        width40: report & (1 << 9) != 0,
                         aggregated,
                         pwdb,
+                        antenna_mux,
                     });
                 }
             }
@@ -1120,12 +1471,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.interrupts = false;
         self.packet.leisure = false;
         self.packet.rate_mask = None;
+        self.packet.vht_highest = None;
         let mut result = Ok(());
+        // RTL8192CE: 92C IMRs and no HCI DMA-stop byte (0x301 is part of
+        // its TX polling doorbell).
+        let ce = self.rtl8192ce();
+        let (himr, himre) = if ce { (0x120, 0x128) } else { (0xb0, 0xb8) };
         for operation in [
-            self.io.write32(0xb0, 0).map_err(Error::from),
-            self.io.write32(0xb8, 0).map_err(Error::from),
+            self.io.write32(himr, 0).map_err(Error::from),
+            self.io.write32(himre, 0).map_err(Error::from),
             self.io.write8(0x522, 0xff).map_err(Error::from),
-            self.io.write8(0x301, 0xff).map_err(Error::from),
+            if ce {
+                Ok(())
+            } else {
+                self.io.write8(0x301, 0xff).map_err(Error::from)
+            },
         ] {
             if result.is_ok() {
                 result = operation;
@@ -1135,9 +1495,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let cr = self.io.read8(0x100)?;
             self.io.write8(0x100, cr & !0xcf)?;
             if self.io.read8(0x100)? & 0xcf != 0
-                || self.io.read8(0x301)? != 0xff
-                || self.io.read32(0xb0)? != 0
-                || self.io.read32(0xb8)? != 0
+                || (!ce && self.io.read8(0x301)? != 0xff)
+                || self.io.read32(himr)? != 0
+                || self.io.read32(himre)? != 0
             {
                 return Err(Error::Readback);
             }
@@ -1158,6 +1518,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         result
     }
 }
+
+#[path = "packet_ae.rs"]
+pub(crate) mod ae;
+#[path = "rtl8192ce/packet_owner.rs"]
+pub(crate) mod ce92;
+#[path = "rtl8192ee/packet_owner.rs"]
+pub(crate) mod ee92;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "packet_tests.rs"]

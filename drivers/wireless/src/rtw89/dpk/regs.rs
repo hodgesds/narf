@@ -74,3 +74,9 @@ pub(super) const R_RPT_COM: u32 = 0x80fc;
 pub(super) const R_RXIQC: u32 = 0x813c;
 pub(super) const R_TPG_MOD: u32 = 0x806c;
 pub(super) const R_TXAGC_RFK: u32 = 0x81c4;
+// Linux reg.h fields of the rtw8852b_rfk.c `_dpk_rf_setting` 5GHz branch.
+pub(super) const RR_RXA2: u32 = 0x8c;
+pub(super) const RR_RAA2_SWATT: u32 = 0xfe00;
+pub(super) const RR_RXA_LNA: u32 = 0x8b;
+pub(super) const RR_XALNA2: u32 = 0x90;
+pub(super) const RR_IQGEN: u32 = 0x97;

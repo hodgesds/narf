@@ -22,6 +22,8 @@ struct State {
     interface: Option<Arc<dyn narf_wireless::WirelessNetIface>>,
     discovery: Option<narf_bus::MmioRegion>,
     gen2: Option<super::gen2_profile::Profile>,
+    gen3: Option<super::gen3_profile::Profile>,
+    bz: Option<super::bz_profile::Profile>,
     mvm: Option<Arc<super::mvm_device::Device>>,
 }
 pub(super) struct Owner {
@@ -42,6 +44,8 @@ impl Owner {
                 interface: None,
                 discovery: None,
                 gen2: None,
+                gen3: None,
+                bz: None,
                 mvm: None,
             }),
         }
@@ -129,6 +133,46 @@ impl Owner {
                 None,
             ));
         }
+        if self.chip.mac == super::MacFamily::BzA0 {
+            let region = match state.discovery {
+                Some(region) => region,
+                None => {
+                    let region = super::mmio::map(&self.device, &self.cap)?;
+                    state.discovery = Some(region);
+                    region
+                }
+            };
+            let mut io = super::IwlMmioImpl::new(region, self.cap);
+            let profile = super::bz_profile::Profile::read(self.device.id.device, &mut io)?;
+            state.bz = Some(profile);
+            return Ok((
+                alloc::vec![alloc::format!("iwlwifi/{}-c103.ucode", profile.prefix)],
+                None,
+            ));
+        }
+        if matches!(
+            self.chip.mac,
+            super::MacFamily::TyA0
+                | super::MacFamily::SoA0
+                | super::MacFamily::MaA0
+                | super::MacFamily::MaB0
+        ) {
+            let region = match state.discovery {
+                Some(region) => region,
+                None => {
+                    let region = super::mmio::map(&self.device, &self.cap)?;
+                    state.discovery = Some(region);
+                    region
+                }
+            };
+            let mut io = super::IwlMmioImpl::new(region, self.cap);
+            let profile = super::gen3_profile::Profile::read(self.device.id.device, &mut io)?;
+            state.gen3 = Some(profile);
+            return Ok((
+                alloc::vec![alloc::format!("iwlwifi/{}-89.ucode", profile.prefix)],
+                None,
+            ));
+        }
         if self.chip.mac != super::MacFamily::ScA0 {
             return Ok((super::firmware_filename_ladder(&self.chip), None));
         }
@@ -179,6 +223,22 @@ impl Owner {
         let _ = narf_wireless::reg::db::ensure_domain();
         if !input.firmware.current() || input.pnvm.as_ref().is_some_and(|asset| !asset.current()) {
             return Err("Intel selected asset authority revoked before attempt");
+        }
+        if let Some(profile) = state.bz {
+            profile.validate(&parsed)?;
+            let mut io = super::IwlMmioImpl::new(
+                state.discovery.ok_or("Bz discovery mapping absent")?,
+                self.cap,
+            );
+            profile.check(self.device.id.device, &mut io)?;
+        }
+        if let Some(profile) = state.gen3 {
+            profile.validate(&parsed)?;
+            let mut io = super::IwlMmioImpl::new(
+                state.discovery.ok_or("API89 discovery mapping absent")?,
+                self.cap,
+            );
+            profile.check(self.device.id.device, &mut io)?;
         }
         if let Some(identity) = identity {
             let mut io = super::IwlMmioImpl::new(
@@ -376,6 +436,40 @@ pub async fn provision() -> Result<(), &'static str> {
 pub fn provision_state() -> Option<ProvisionState> {
     Some(NATIVE.lock().as_ref()?.phase())
 }
+/// Read-only live Gen2 firmware geometry. These opaque FIFO sizes do not
+/// supply transmit, calibration or DMA mapping authority.
+pub async fn gen2_shared_memory_configuration() -> Result<super::Gen2SharedMemory, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.shared_memory().await
+}
+/// Metadata for an externally measured signed active-scan program. The
+/// exact ordered channel list is included in the firmware/platform binding.
+pub async fn gen2_scan_transmit_power_request(
+    channels: &[u8],
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.scan_power_request(channels).await
+}
 /// Current physical/firmware/SMBIOS binding for an externally measured signed
 /// input. This metadata supplies no calibration, transmit or station grant.
 pub async fn gen2_transmit_power_request() -> Result<super::Gen2TransmitPowerRequest, &'static str>
@@ -392,6 +486,84 @@ pub async fn gen2_transmit_power_request() -> Result<super::Gen2TransmitPowerReq
         .clone()
         .ok_or("native Intel binding is not Gen2")?;
     device.power_request().await
+}
+/// Actual retained physical/firmware/platform binding for the distinct
+/// legacy20 AP emission program. No measurement, role or TX grant is made.
+pub async fn gen2_ap_transmit_power_request(
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.ap_power_request().await
+}
+/// Exact source/physical-MAC/channel/P2P DeviceID binding for tag9 GO.
+/// Metadata makes no measurement, role, native NoA or transmit grant.
+pub async fn gen2_go_transmit_power_request(
+    device: [u8; 6],
+    frequency_mhz: u32,
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let owner = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    owner.go_power_request(device, frequency_mhz).await
+}
+/// Exact tag10 physical/RF/firmware/NVM/platform and observed GO/client IE
+/// program proposal. Metadata creates no measurement, role or packet grant.
+pub async fn gen2_client_transmit_power_request(
+    bssid: [u8; 6],
+    ssid: &[u8],
+    frequency_mhz: u32,
+    request_ies: &[u8],
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device
+        .client_power_request(bssid, ssid, frequency_mhz, request_ies)
+        .await
+}
+/// Exact native radio/platform, proposed control MAC and channel binding
+/// for tag8. This returns metadata and grants no child, RF or measurement.
+pub async fn gen2_p2p_transmit_power_request(
+    own: [u8; 6],
+    frequency_mhz: u32,
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.p2p_power_request(own, frequency_mhz).await
 }
 /// Metadata for the distinct legacy-management + WMM/HT20/SISO emitting
 /// program. The returned binding and filename do not supply measured limits.

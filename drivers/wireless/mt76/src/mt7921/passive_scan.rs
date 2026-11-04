@@ -2,6 +2,17 @@
 //! Reference: Linux ecd997b0189a
 //! mt76_connac_mcu.{c,h}, mt7921/{mac,mcu}.c and mt792x.h.
 use super::{station::Command, *};
+#[path = "associated_scan.rs"]
+mod associated;
+pub(super) fn occupied_domain(
+    info: RadioInfo,
+    permission: crate::mt7921::association::TxPermission,
+    six: bool,
+) -> Result<Vec<u8>, Error> {
+    associated::associated_domain(info, permission, None, &[], six)
+}
+#[path = "wowlan_nlo_station.rs"]
+pub(super) mod nlo;
 
 pub use narf_wireless::association::Bss as ScanBss;
 /// Linux MT76_CONNAC_SCAN_IE_LEN; the packed v1 request reserves600 bytes.
@@ -107,7 +118,8 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r2 = word(packet, 8)?;
-    let frequency = (word(packet, 12)? >> 8) & 0x1ff;
+    // CONNAC2 CH_FREQ is bits15:8. Bit16 belongs to ADDR_TYPE/U2M.
+    let frequency = (word(packet, 12)? >> 8) & 0xff;
     let channel = u8::try_from(frequency).ok()?;
     // RXD3 CH_FREQ, kept raw: 6 GHz values (181..) decode through
     // mt792x_get_status_freq_info and are compared against rx_channel().
@@ -183,10 +195,7 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r3 = word(packet, 12)?;
-    let frequency = (r3 >> 8) & 0x1ff;
-    if frequency & 0x100 != 0 {
-        return None;
-    }
+    let frequency = (r3 >> 8) & 0xff;
     // mt792x_get_status_freq_info: 6 GHz beacons arrive with CH_FREQ > 180.
     let (band, channel) = super::super::channel::from_rx_channel(frequency as u8)?;
     let mut offset = 24usize;
@@ -362,7 +371,7 @@ pub(super) fn scan_id(bss: &ScanBss) -> Option<u8> {
 /// `mt76_connac_mcu_set_channel_domain` with the 6 GHz sband appended
 /// (`n_6ch`, mt76_connac_mcu.c:110-160), every channel NO_IR. Only scans
 /// that include 6 GHz channels publish it; others keep `passive_domain`.
-fn passive_domain_6ghz(info: RadioInfo) -> Vec<u8> {
+pub(super) fn passive_domain_6ghz(info: RadioInfo) -> Vec<u8> {
     let mut domain = passive_domain(info);
     let six: Vec<u8> = super::super::channel::channels_6ghz().collect();
     domain[10] = six.len() as u8;
@@ -375,7 +384,7 @@ fn passive_domain_6ghz(info: RadioInfo) -> Vec<u8> {
     domain
 }
 
-fn passive_domain(info: RadioInfo) -> Vec<u8> {
+pub(super) fn passive_domain(info: RadioInfo) -> Vec<u8> {
     let channels = super::super::channel::channels(info.capabilities.phy.bands);
     let mut domain = vec![0u8; 12 + channels.len() * 8];
     domain[..2].copy_from_slice(b"00");
@@ -454,14 +463,37 @@ impl ActiveScan {
 /// Unassociated station `BSS_INFO_UPDATE` basic TLV. `active = false` is the
 /// first half of `mt76_connac_mcu_uni_add_dev(.., enable = false)`.
 pub(super) fn station_bss_record(active: bool) -> [u8; 36] {
+    station_bss_record_on(crate::mt7921::vif_slots::Vif::HOME, active)
+}
+/// `station_bss_record` for the station vif `vif`: Linux
+/// `mt76_connac_mcu_uni_add_dev` stamps `bss_idx = mvif->idx`,
+/// `omac_idx`/`hw_bss_idx = omac_idx`, `wmm_idx` and the vif's own BMC
+/// WCID (`mt7921_add_interface`: 19 - idx). HOME is the historical record.
+pub(super) fn station_bss_record_on(vif: crate::mt7921::vif_slots::Vif, active: bool) -> [u8; 36] {
     let mut bss = [0u8; 36];
+    bss[0] = vif.index();
     bss[6..8].copy_from_slice(&32u16.to_le_bytes());
     bss[8] = u8::from(active);
+    bss[9] = vif.omac();
+    bss[10] = vif.omac(); // hardware BSS (< EXT_BSSID_START)
     bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes()); // station/infra
     bss[16] = 1; // initial connection state
-    bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
-    bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+    bss[17] = vif.wmm();
+    bss[24..26].copy_from_slice(&u16::from(vif.bmc()).to_le_bytes()); // reserved BMC WCID
+    bss[30..32].copy_from_slice(&u16::from(vif.bmc()).to_le_bytes());
     bss
+}
+/// `mt76_connac_mcu_uni_add_dev` DEV_INFO for the station vif `vif`
+/// (`omac_idx`, band 0) with the vif's own address.
+pub(super) fn station_device_record_on(
+    vif: crate::mt7921::vif_slots::Vif,
+    own: [u8; 6],
+    active: bool,
+) -> Result<[u8; 16], Error> {
+    let mut dev = [0u8; 16];
+    super::super::cmd::encode_uni_dev_info_update(vif.omac(), 0, active, own, &mut dev)
+        .ok_or(Error::Bounds)?;
+    Ok(dev)
 }
 
 impl<B: Backend> Session<B> {
@@ -470,12 +502,18 @@ impl<B: Backend> Session<B> {
         self.send(false, &command.encode(self.seq, body)?).await
     }
     pub(super) async fn scan_setup(&mut self, info: RadioInfo) -> Result<(), Error> {
-        // Publish a single unassociated station VIF, not a host netdev.
-        let mut dev = [0u8; 16];
-        super::super::cmd::encode_uni_dev_info_update(0, 0, true, info.capabilities.mac, &mut dev)
-            .ok_or(Error::Bounds)?;
+        // Publish a single unassociated station VIF, not a host netdev: the
+        // station owner's own link (the physical interface's HOME vif).
+        // Its NO_IR passive domain would revoke the other live station
+        // owner's shared channel grant.
+        // A live GO beacons on the shared channel; no NO_IR scan domain.
+        if self.other_station_permission().is_some() || self.go_plan().is_some() {
+            return Err(Error::Busy);
+        }
+        let vif = self.station.link.vif();
+        let dev = station_device_record_on(vif, info.capabilities.mac, true)?;
         self.exchange(Command::Unified { id: 1 }, &dev).await?;
-        let bss = station_bss_record(true);
+        let bss = station_bss_record_on(vif, true);
         self.exchange(Command::Unified { id: 2 }, &bss).await?;
         // Every exposed band remains NO_IR during passive scan. Association
         // installs a separate authenticated host policy before transmission.
@@ -558,6 +596,9 @@ impl<B: Backend> Session<B> {
         mut policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         validate_scan_options(options)?;
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         let sequence = self.scan_seq % 127 + 1;
         let mut request = if ssids.is_empty() {
             if !options.extra_ies.is_empty() {
@@ -567,16 +608,39 @@ impl<B: Backend> Session<B> {
         } else {
             active_scan_request_with_ies(sequence, channels, ssids, options.extra_ies)?
         }; // No writes on invalid input.
-        let active = if ssids.is_empty() {
+        let mut active = if ssids.is_empty() {
             None
         } else {
             Some(ActiveScan::prepare(&policy()?, channels)?)
         };
+        let associated = matches!(self.state, State::Associated { .. }).then_some(self.state);
         let (info, setup) = match self.state {
             State::RadioReady(info) => (info, true),
-            State::ScanReady(info) => (info, false),
+            State::ScanReady(info) | State::Associated { info, .. } => (info, false),
             _ => return Err(Error::Busy),
         };
+        let operating = if associated.is_some() {
+            if options.random_mac.is_some() || self.data_controls_pending() {
+                return Err(Error::Busy);
+            }
+            self.check_station_tx()?;
+            Some(self.station.permission.ok_or(Error::Authority)?)
+        } else {
+            None
+        };
+        if let (Some(active), Some(operating)) = (&mut active, operating) {
+            let occupied = operating.channels();
+            for (channel, permission) in &mut active.permissions {
+                if permission.country != operating.country {
+                    return Err(Error::Authority);
+                }
+                if permission.band() == operating.band() && occupied.contains(channel) {
+                    // A scan's per-channel 20MHz row cannot raise the live
+                    // operating width's ceiling while firmware remains linked.
+                    permission.power_dbm = permission.power_dbm.min(operating.power_dbm);
+                }
+            }
+        }
         if channels.iter().any(|channel| {
             match super::super::channel::from_rx_channel(*channel) {
                 // MT_NIC_CAP_6G gates the 6 GHz band.
@@ -616,6 +680,8 @@ impl<B: Backend> Session<B> {
         }
         self.scan_seq = sequence;
         self.boot_started = Some(self.backend.now_ns());
+        self.scanning = associated.is_some();
+        self.scan_packets.clear();
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -628,12 +694,32 @@ impl<B: Backend> Session<B> {
                 if !setup {
                     self.stage(Stage::ScanSetup);
                 }
-                for (index, (_, permission)) in active.permissions.iter().enumerate() {
+                // Include the live occupied channel in the same SKU batch.
+                // Stable band ordering keeps operating rows before overlapping
+                // (clipped) scan rows, while preserving Linux's 2G/5G order.
+                let mut rows = Vec::new();
+                if let Some(permission) = operating {
+                    rows.push(
+                        permission
+                            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+                            .ok_or(Error::Bounds)?,
+                    );
+                }
+                for (_, permission) in &active.permissions {
+                    rows.push(
+                        permission
+                            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+                            .ok_or(Error::Bounds)?,
+                    );
+                }
+                rows.sort_by_key(|row| row[5]);
+                let row_count = rows.len();
+                for (index, mut limits) in rows.into_iter().enumerate() {
+                    if operating.is_some() {
+                        self.check_station_tx()?;
+                    }
                     active.current(&policy()?, channels)?;
-                    let mut limits = permission
-                        .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
-                        .ok_or(Error::Bounds)?;
-                    limits[6] = u8::from(index + 1 == active.permissions.len());
+                    limits[6] = u8::from(index + 1 == row_count);
                     self.notify(
                         Command::Ce {
                             id: 0x5d,
@@ -665,7 +751,16 @@ impl<B: Backend> Session<B> {
                         id: 0x0f,
                         query: false,
                     },
-                    &active.domain(channels),
+                    &match operating {
+                        Some(permission) => associated::associated_domain(
+                            info,
+                            permission,
+                            Some(active),
+                            channels,
+                            six,
+                        )?,
+                        None => active.domain(channels),
+                    },
                 )
                 .await?;
                 // Scan is the first autonomous probe-producing command.
@@ -677,13 +772,21 @@ impl<B: Backend> Session<B> {
                         id: 0x0f,
                         query: false,
                     },
-                    &passive_domain_6ghz(info),
+                    &match operating {
+                        Some(permission) => {
+                            associated::associated_domain(info, permission, None, channels, true)?
+                        }
+                        None => passive_domain_6ghz(info),
+                    },
                 )
                 .await?;
             }
             // Discard bounded stale completions before this scan's command.
             self.events.retain(|event| event.get(28) != Some(&0x0d));
             self.stage(Stage::ScanWait);
+            if operating.is_some() {
+                self.check_station_tx()?;
+            }
             self.notify(
                 Command::Ce {
                     id: 3,
@@ -698,59 +801,76 @@ impl<B: Backend> Session<B> {
                 ignored: 0,
                 truncated: false,
             };
-            self.wait(15_000, |backend| {
-                if let Some(active) = &active {
-                    active.current(&policy()?, channels)?;
-                }
-                // Bound work per poll even if the device continuously receives.
-                for _ in 0..16 {
-                    let Some(packet) = backend.receive_data()? else {
-                        break;
-                    };
-                    report.received = report.received.saturating_add(1);
-                    let Some(bss) = beacon(&packet, info.capabilities.phy.spatial_streams) else {
-                        report.ignored = report.ignored.saturating_add(1);
-                        continue;
-                    };
-                    if scan_id(&bss).is_none_or(|id| !channels.contains(&id)) {
-                        continue;
+            if let Some(associated) = associated {
+                self.wait_associated_scan(
+                    associated,
+                    sequence,
+                    channels,
+                    active.as_ref(),
+                    &mut policy,
+                    &mut report,
+                )
+                .await?;
+            } else {
+                self.wait(15_000, |backend| {
+                    if let Some(active) = &active {
+                        active.current(&policy()?, channels)?;
                     }
-                    if let Some(old) = report.bss.iter_mut().find(|old| {
-                        old.bssid == bss.bssid && old.channel == bss.channel && old.band == bss.band
-                    }) {
-                        if !bss.ssid.is_empty() || old.ssid.is_empty() {
-                            *old = bss;
+                    // Bound work per poll even if the device continuously receives.
+                    for _ in 0..16 {
+                        let Some(packet) = backend.receive_data()? else {
+                            break;
+                        };
+                        report.received = report.received.saturating_add(1);
+                        let Some(bss) = beacon(&packet, info.capabilities.phy.spatial_streams)
+                        else {
+                            report.ignored = report.ignored.saturating_add(1);
+                            continue;
+                        };
+                        if scan_id(&bss).is_none_or(|id| !channels.contains(&id)) {
+                            continue;
                         }
-                    } else if report.bss.len() < 64 {
-                        report.bss.push(bss);
-                    } else {
-                        report.truncated = true;
+                        if let Some(old) = report.bss.iter_mut().find(|old| {
+                            old.bssid == bss.bssid
+                                && old.channel == bss.channel
+                                && old.band == bss.band
+                        }) {
+                            if !bss.ssid.is_empty() || old.ssid.is_empty() {
+                                *old = bss;
+                            }
+                        } else if report.bss.len() < 64 {
+                            report.bss.push(bss);
+                        } else {
+                            report.truncated = true;
+                        }
                     }
-                }
-                if let Some(event) = backend.receive()? {
-                    if event.len() < 36 {
-                        return Err(Error::MalformedEvent);
-                    }
-                    let len = usize::from(u16::from_le_bytes([event[24], event[25]])) + 24;
-                    if len < 36 || len > event.len() {
-                        return Err(Error::MalformedEvent);
-                    }
-                    if event[28] == 0x0d {
-                        if len < 44 {
+                    if let Some(event) = backend.receive()? {
+                        if event.len() < 36 {
                             return Err(Error::MalformedEvent);
                         }
-                        if event[36] == sequence {
-                            return Ok(Some(()));
+                        let len = usize::from(u16::from_le_bytes([event[24], event[25]])) + 24;
+                        if len < 36 || len > event.len() {
+                            return Err(Error::MalformedEvent);
                         }
+                        if event[28] == 0x0d {
+                            if len < 44 {
+                                return Err(Error::MalformedEvent);
+                            }
+                            if event[36] == sequence {
+                                return Ok(Some(()));
+                            }
+                        }
+                        // Scan owns no command waiter here; bounded diagnostics
+                        // count unrelated notifications without growing a queue.
+                        report.ignored = report.ignored.saturating_add(1);
                     }
-                    // Scan owns no command waiter here; bounded diagnostics
-                    // count unrelated notifications without growing a queue.
-                    report.ignored = report.ignored.saturating_add(1);
-                }
-                Ok(None)
-            })
-            .await?;
-            if active.is_some() || six {
+                    Ok(None)
+                })
+                .await?;
+            }
+            if let Some(permission) = operating {
+                self.restore_associated_scan_power(info, permission).await?;
+            } else if active.is_some() || six {
                 // Probe permission belongs to this scan, not the idle VIF.
                 // Passive follow-up scans inherit a NO_IR-only domain.
                 self.notify(
@@ -767,7 +887,9 @@ impl<B: Backend> Session<B> {
         .await;
         match result {
             Ok(report) => {
-                self.state = State::ScanReady(info);
+                self.state = associated.unwrap_or(State::ScanReady(info));
+                self.scanning = false;
+                self.boot_started = None;
                 Ok(report)
             }
             Err(error) => {
@@ -775,6 +897,11 @@ impl<B: Backend> Session<B> {
                     State::Running(stage) => stage,
                     _ => Stage::ScanWait,
                 };
+                if associated.is_some() {
+                    // Close carrier/key/epoch authority before the first
+                    // best-effort cancellation wait can yield to another task.
+                    self.fail_data(error);
+                }
                 if active.is_some() {
                     // Best effort only: neither DMA receipt proves firmware
                     // scan-idle. Keep this attempt terminal and require reset
@@ -798,6 +925,9 @@ impl<B: Backend> Session<B> {
                         )
                         .await;
                 }
+                self.scan_packets.clear();
+                self.scanning = false;
+                self.boot_started = None;
                 self.state = State::Failed { stage, error };
                 Err(error)
             }

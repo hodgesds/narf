@@ -61,6 +61,7 @@ pub(super) fn occupied(chanspec: u16) -> Option<channel::Operating> {
         0x1000 => channel::Operating::twenty(channel::primary(chanspec, 0)?)
             .filter(|op| op.chanspec() == chanspec),
         0x1800 => channel::Operating::decode40(chanspec),
+        0x2800 => channel::Operating::decode160(chanspec),
         _ => channel::Operating::decode80(chanspec),
     }
 }
@@ -99,7 +100,7 @@ impl<R: Fullmac> Station<R> {
                     .command(ioctl::Direction::Set, SET_ROAM_DELTA, &delta, 4)
                     .await?;
             }
-            set_var(&mut self.runtime, "event_msgs", &event_mask(enabled)).await
+            super::write_events(&mut self.runtime, event_mask(enabled), true).await
         }
         .await;
         self.operation = false;
@@ -250,7 +251,10 @@ impl<R: Fullmac> Station<R> {
             .ok()
             .and_then(occupied)
             .ok_or(Error::Malformed)?;
-        if !self.channels.contains(&occupied.primary) {
+        // A 160 MHz roam target only on a wide_phy chip (43602/CYW <= 80).
+        if !self.channels.contains(&occupied.primary)
+            || occupied.width() > 80 && !self.runtime.wide_phy()
+        {
             return Err(Error::Unsupported);
         }
         let power = occupied_power(&self.domain, occupied).ok_or(Error::Unsupported)?;

@@ -152,6 +152,10 @@ impl DownloadPlan {
     pub fn chip(&self) -> ChipId {
         self.image.chip()
     }
+    /// The canonical file the image was selected from.
+    pub fn name(&self) -> &'static str {
+        self.image.name()
+    }
     pub fn secure_enabled(&self) -> bool {
         self.secure
     }

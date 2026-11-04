@@ -75,7 +75,9 @@ pub(super) fn read_factory_with(
         RTL_DEV_8188EE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8821AE => {
             (256 - 18, 512, 0xd0, true)
         }
-        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT => (512 - 15, 128, 0x16, false),
+        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT | RTL_DEV_8192CE_8177 | RTL_DEV_8192CE_8191 => {
+            (512 - 15, 128, 0x16, false)
+        }
         RTL_DEV_8192DE if function < 2 => (
             512 - 15,
             256,
@@ -143,6 +145,41 @@ pub(super) fn read_factory_with(
         return Err(EfuseError::MacUninitialized);
     }
     Ok(Factory { mac, logical })
+}
+
+/// One physical EFUSE byte through `efuse_power_switch(hw, false, true)`,
+/// `efuse_one_byte_read` and `efuse_power_switch(hw, false, false)` for the
+/// `EFUSE_ACCESS`-gated chips (the RTL8723BE `_rtl8723be_read_package_type`
+/// read of `0x1fb`). `None` is Linux's 100-read timeout (value `0xff`,
+/// result false).
+pub(super) fn read_physical_byte_with(io: &mut impl Io, addr: u16) -> Option<u8> {
+    io.write8(REG_EFUSE_ACCESS, 0x69);
+    let value = io.read16(REG_SYS_FUNC_EN);
+    if value & (1 << 12) == 0 {
+        io.write16(REG_SYS_FUNC_EN, value | (1 << 12));
+    }
+    let value = io.read16(REG_SYS_CLKR);
+    let clock = (1 << 5) | (1 << 1);
+    if value & clock != clock {
+        io.write16(REG_SYS_CLKR, value | clock);
+    }
+    io.write8(REG_EFUSE_CTRL + 1, addr as u8);
+    let value = io.read8(REG_EFUSE_CTRL + 2);
+    io.write8(REG_EFUSE_CTRL + 2, ((addr >> 8) as u8 & 3) | (value & 0xfc));
+    io.write8(REG_EFUSE_CTRL + 3, 0x72);
+    let mut tries = 0;
+    while io.read8(REG_EFUSE_CTRL + 3) & 0x80 == 0 && tries < 100 {
+        tries += 1;
+    }
+    let byte = (tries < 100).then(|| io.read8(REG_EFUSE_CTRL));
+    io.write8(REG_EFUSE_ACCESS, 0);
+    byte
+}
+
+/// # Safety
+/// Same exclusive powered BAR2 contract as read_mac; no programming occurs.
+pub unsafe fn read_physical_byte(mmio: &MmioRegion, addr: u16) -> Option<u8> {
+    read_physical_byte_with(&mut Mmio(mmio), addr)
 }
 
 /// # Safety

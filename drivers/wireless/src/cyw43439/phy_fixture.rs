@@ -124,10 +124,30 @@ pub(crate) struct Vht80 {
     pub fault: VhtFault,
 }
 impl Vht80 {
+    /// A `center` of 50/114 describes a contiguous 160 MHz BSS (brcmfmac
+    /// wide_phy chips); every other value is the 80 MHz center as before.
+    pub(crate) fn is160(&self) -> bool {
+        matches!(self.center, 50 | 114)
+    }
+    /// The 80 MHz center holding `primary` (the primary80 of a 160 BSS).
+    pub(crate) fn center80(&self, primary: u8) -> u8 {
+        match (self.is160(), primary < self.center) {
+            (false, _) => self.center,
+            (true, true) => self.center - 8,
+            (true, false) => self.center + 8,
+        }
+    }
     pub(crate) fn channel(&self, primary: u8, width: u32) -> u16 {
-        let index = (u16::from(primary) + 6 - u16::from(self.center)) / 4;
+        let center = self.center80(primary);
+        let index = (u16::from(primary) + 6 - u16::from(center)) / 4;
         match width {
-            80 => 0xe000 | (index << 8) | u16::from(self.center),
+            // brcmu_d11.c D11AC 5 GHz BW_160, sideband (primary - first)/4.
+            160 => {
+                0xe800
+                    | ((u16::from(primary) + 14 - u16::from(self.center)) / 4) << 8
+                    | u16::from(self.center)
+            }
+            80 => 0xe000 | (index << 8) | u16::from(center),
             40 => {
                 let buddy = if index & 1 == 0 {
                     primary + 4
@@ -203,14 +223,19 @@ impl Vht80 {
     pub(crate) fn response(&self, primary: u8, chains: u32) -> Vec<u8> {
         let mut ies = response(primary, chains);
         ies[2] |= 2 | 64;
-        let index = (primary + 6 - self.center) / 4;
+        let index = (primary + 6 - self.center80(primary)) / 4;
         ies[31] = 4 | if index & 1 == 0 { 1 } else { 3 };
         ies.extend_from_slice(&[1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108]);
         if self.fault == VhtFault::ResponseMissing {
             return ies;
         }
         ies.extend_from_slice(&[191, 12]);
-        ies.extend_from_slice(&self.capability(chains));
+        let mut cap = self.capability(chains);
+        if self.is160() {
+            // The 160 AP also advertises SUPP_CHAN_WIDTH_160 | SHORT_GI_160.
+            cap[0] |= 4 | 64;
+        }
+        ies.extend_from_slice(&cap);
         let width = if self.fault == VhtFault::ResponseWidth {
             0
         } else {
@@ -221,7 +246,12 @@ impl Vht80 {
         } else {
             self.center
         };
-        ies.extend_from_slice(&[192, 5, width, if width == 0 { 0 } else { center }, 0]);
+        // A 160 BSS: revised width 1, CCFS0 the primary80, CCFS1 the 160.
+        if self.is160() && width != 0 {
+            ies.extend_from_slice(&[192, 5, 1, self.center80(primary), center]);
+        } else {
+            ies.extend_from_slice(&[192, 5, width, if width == 0 { 0 } else { center }, 0]);
+        }
         ies.extend_from_slice(
             &if self.fault == VhtFault::ResponseBasic {
                 0xff00u16

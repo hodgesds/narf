@@ -117,6 +117,12 @@ impl Pipeline {
     pub(super) fn expired(&self) -> bool {
         self.entries.iter().any(|e| e.deadline.expired())
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn expire_for_test(&mut self) {
+        for entry in &mut self.entries {
+            entry.deadline = narf_time::Deadline::after_cycles(0);
+        }
+    }
     /// Record a freshly published HTT ID. Admission was checked before the
     /// HTT publish; a duplicate ID means the DMA pool and this table diverged.
     pub(super) fn push(&mut self, id: u16, role: Role, length: usize) -> Result<(), Error> {
@@ -134,6 +140,10 @@ impl Pipeline {
             deadline: narf_time::Deadline::after_ms(TIMEOUT_MS),
         });
         Ok(())
+    }
+    /// Whether MSDU `id` is one of this pipeline's in-flight entries.
+    pub(super) fn owns(&self, id: u16) -> bool {
+        self.entries.iter().any(|e| e.id == id)
     }
     /// Retire the ID named by one terminal HTT receipt.
     pub(super) fn complete(&mut self, receipt: htt::TxReceipt) -> Completion {
@@ -161,7 +171,6 @@ impl Pipeline {
     pub(super) fn counters(&self, tid: u8) -> TidCounters {
         self.counters[usize::from(tid.min(8))]
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn ids(&self) -> Vec<u16> {
         self.entries.iter().map(|e| e.id).collect()
     }

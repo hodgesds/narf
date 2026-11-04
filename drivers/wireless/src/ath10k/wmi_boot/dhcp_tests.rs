@@ -6,26 +6,46 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "associated_scan_conversation_tests.rs"]
+mod associated_scan_conversation_tests;
+#[path = "beacon_hint_conversation_tests.rs"]
+mod beacon_hint_conversation_tests;
+#[path = "chains_conversation_tests.rs"]
+mod chains_conversation_tests;
 #[path = "coding_conversation_tests.rs"]
 mod coding_conversation_tests;
+#[path = "coexistence_conversation_tests.rs"]
+mod coexistence_conversation_tests;
 #[path = "ht40_conversation_tests.rs"]
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "hw_keys_conversation_tests.rs"]
+mod hw_keys_conversation_tests;
+#[path = "indoor_conversation_tests.rs"]
+mod indoor_conversation_tests;
+#[path = "nwifi_conversation_tests.rs"]
+mod nwifi_conversation_tests;
+#[path = "offchannel_conversation_tests.rs"]
+mod offchannel_conversation_tests;
 #[path = "pmf_conversation_tests.rs"]
 mod pmf_conversation_tests;
-#[path = "rebind_conversation_tests.rs"]
-mod rebind_conversation_tests;
 #[path = "protection_conversation_tests.rs"]
 mod protection_conversation_tests;
+#[path = "rebind_conversation_tests.rs"]
+mod rebind_conversation_tests;
 #[path = "sgi40_conversation_tests.rs"]
 mod sgi40_conversation_tests;
 #[path = "source_conversation_tests.rs"]
 mod source_conversation_tests;
 #[path = "vht_conversation_tests.rs"]
 mod vht_conversation_tests;
+#[path = "vht_wide_conversation_tests.rs"]
+mod vht_wide_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
+#[path = "wow_conversation_tests.rs"]
+mod wow_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
     let mut domain = station_tests::policy();
     for (low, high) in [(5150, 5350), (5725, 5850)] {
@@ -51,6 +71,15 @@ fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>
 fn drain() -> bool {
     let device = ACTIVE_TEST.lock().clone();
     device.is_some_and(|device| device.drain())
+}
+struct NativeFirmware {
+    ht: Option<u32>,
+    radio: RadioSource,
+    all_inventory: bool,
+    features: u64,
+    htt: (u8, u8),
+    /// Linux `cryptmode=0`: the radio offloads station keys (`pci.rs`).
+    hardware_keys: bool,
 }
 struct Harness {
     device: Arc<ModelDevice>,
@@ -94,15 +123,150 @@ impl Harness {
         factory: u32,
         ht: Option<u32>,
     ) -> Self {
-        let mut radio = radio_boot_country_ht(
+        Self::new_on_profile(
             version,
             dialect,
-            (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
-            3,
+            secured,
+            active_scan,
+            frequency,
             factory,
-            ht,
+            (ht, 2),
+        )
+    }
+    fn new_on_profile(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: (Option<u32>, u32),
+    ) -> Self {
+        Self::new_on_inventory(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (profile.0, profile.1, false),
+        )
+    }
+    fn new_on_inventory(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: (Option<u32>, u32, bool),
+    ) -> Self {
+        let hardware = if dialect == Dialect::Tlv {
+            HwRev::Qca6174
+        } else if dialect == Dialect::TenFour {
+            HwRev::Qca9984
+        } else {
+            HwRev::Qca988x
+        };
+        Self::new_on_source(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (
+                profile.0,
+                RadioSource {
+                    hardware,
+                    rf_chains: profile.1,
+                    vht: None,
+                },
+                profile.2,
+            ),
+        )
+    }
+    fn new_on_source(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: (Option<u32>, RadioSource, bool),
+    ) -> Self {
+        Self::new_on_firmware(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            NativeFirmware {
+                ht: profile.0,
+                radio: profile.1,
+                all_inventory: profile.2,
+                features: (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
+                htt: (3, 1),
+                hardware_keys: false,
+            },
+        )
+    }
+    fn new_on_firmware(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: NativeFirmware,
+    ) -> Self {
+        Self::new_on_snapshot(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (profile, None),
+        )
+    }
+    fn new_on_snapshot(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        source: (
+            NativeFirmware,
+            Option<Arc<narf_wireless::reg::db::Database>>,
+        ),
+    ) -> Self {
+        let (profile, snapshot) = source;
+        let hardware = profile.radio.hardware;
+        let radio = radio_boot_source_version(
+            version,
+            dialect,
+            profile.features,
+            profile.htt,
+            factory,
+            profile.ht,
+            profile.radio,
         );
+        let mut radio = radio.with_hardware_keys(profile.hardware_keys);
+        if profile.features & (1 << 6) != 0 {
+            // ATH10K_FW_FEATURE_WOWLAN_SUPPORT images advertise TLV service
+            // WMI_TLV_SERVICE_WOW (13): word 3, bit 1 (`ath10k_wow_init`).
+            if let Some(caps) = radio.htt.wmi.caps.as_mut() {
+                caps.bitmap[12] |= 2;
+            }
+        }
         radio.htt.wmi.htc.transport.frequency = frequency;
+        if let Some(database) = &snapshot {
+            radio.beacon_policy_for_test(database.clone());
+            radio.htt.wmi.htc.transport.beacon_hint = BeaconHintFixture::Beacon;
+        }
         if active_scan {
             let mut fixture = if frequency < 3000 {
                 super::super::active_scan_tests::Fixture::directed(1)
@@ -118,7 +282,15 @@ impl Harness {
         } else {
             &pair
         };
-        assert!(matches!(drive(radio.start(configured)), Poll::Ready(Ok(_))));
+        if profile.all_inventory {
+            radio.htt.wmi.htc.transport.default_channels = true;
+            assert!(matches!(
+                drive(radio.start_from_hardware()),
+                Poll::Ready(Ok(_))
+            ));
+        } else {
+            assert!(matches!(drive(radio.start(configured)), Poll::Ready(Ok(_))));
+        }
         let m = &mut radio.htt.wmi.htc.transport;
         let mut fixture = Fixture::on_channel(
             secured,
@@ -130,13 +302,6 @@ impl Harness {
         );
         fixture.automatic = true;
         m.data = Some(fixture);
-        let hardware = if dialect == Dialect::Tlv {
-            HwRev::Qca6174
-        } else if dialect == Dialect::TenFour {
-            HwRev::Qca9984
-        } else {
-            HwRev::Qca988x
-        };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
         let name = String::from(
             NEXT_NAME
@@ -154,7 +319,10 @@ impl Harness {
             &name,
             OWN,
             Arc::new(Mutex::new(radio)),
-            move || current.lock().clone(),
+            move || match &snapshot {
+                Some(database) => database.snapshot().map(|policy| policy.as_ref().clone()),
+                None => current.lock().clone(),
+            },
         ));
         narf_net::iface::register_with_context(&name, OWN, device.generation_for_test(), send);
         *ACTIVE_TEST.lock() = Some(device.clone());
@@ -927,11 +1095,14 @@ fn composition_profile(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TestPhy {
     Legacy,
+    Indoor,
+    BeaconHint,
     Wmm,
     Ht,
     Ht40,
     Sgi40,
     Vht80,
+    Mimo,
 }
 fn composition_radio(
     version: u32,
@@ -942,16 +1113,29 @@ fn composition_radio(
     frequency: u16,
     phy: TestPhy,
 ) -> Result<(), &'static str> {
-    let qos = phy != TestPhy::Legacy;
-    let h = Harness::new_on_ht(
-        version,
-        dialect,
-        secured,
-        active_scan,
-        frequency,
-        if frequency < 3000 { 0x64 } else { 0x8348 },
-        (phy == TestPhy::Sgi40).then_some(0x803),
-    );
+    let qos = !matches!(phy, TestPhy::Legacy | TestPhy::Indoor | TestPhy::BeaconHint);
+    let h = if phy == TestPhy::BeaconHint {
+        beacon_hint_conversation_tests::harness(version, dialect, secured, None)
+    } else {
+        Harness::new_on_ht(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            if frequency < 3000 { 0x64 } else { 0x8348 },
+            if phy == TestPhy::Sgi40 {
+                Some(0x803)
+            } else if phy == TestPhy::Mimo {
+                Some(0x7b)
+            } else {
+                None
+            },
+        )
+    };
+    if phy == TestPhy::Indoor {
+        indoor_conversation_tests::install(&h);
+    }
     if qos {
         h.model(|model| {
             let f = model.data.as_mut().unwrap();
@@ -971,6 +1155,9 @@ fn composition_radio(
     }
     if phy == TestPhy::Vht80 {
         vht_conversation_tests::enable(&h, 2)?;
+    }
+    if phy == TestPhy::Mimo {
+        chains_conversation_tests::enable(&h);
     }
     if power_save {
         h.model(|model| {
@@ -1004,28 +1191,6 @@ fn composition_radio(
         })
     {
         return Err("power-save initialization did not precede carrier");
-    }
-    if active_scan {
-        let sent = h.model(|m| m.sent.len());
-        let request = ScanRequest {
-            ssids: vec![b"narf".to_vec()],
-            frequencies_mhz: vec![2412],
-            channels: vec![1],
-            active: true,
-            random_mac: None,
-            colocated_6ghz: false,
-            duration_tu: None,
-            duration_mandatory: false,
-            extra_ies: Vec::new(),
-        };
-        if !matches!(
-            drive(h.device.scan(request)),
-            Poll::Ready(Err(WirelessError::Busy))
-        ) || !h.device.link_up()
-            || h.model(|m| m.sent.len()) != sent
-        {
-            return Err("associated active scan failed to preserve exclusive peer and carrier");
-        }
     }
     let lease = narf_net::dhcp::dhcp_acquire(&h.name, 0)
         .map_err(|_| "actual kernel DHCP through CE/HTT failed")?;

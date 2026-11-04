@@ -9,6 +9,11 @@ use super::{
 use alloc::{format, string::String, vec::Vec};
 use core::ops::Range;
 
+mod calibration;
+mod platform;
+pub(super) use calibration::prepare_for_address;
+pub(super) use platform::Platform;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Bmi(BmiError),
@@ -92,7 +97,7 @@ impl Files for RegistryFiles {
         self.source
             .invoke_boot(|| ())
             .map_err(|_| Error::Authority)?;
-        let board = matches!(name.rsplit('/').next(), Some("board.bin" | "board-2.bin"));
+        let board = calibration::signed_input(name);
         crate::firmware_asset::load(&self.authority, name, 16 * 1024 * 1024, board)
             .and_then(|asset| {
                 let bytes = asset.bytes.clone();
@@ -100,7 +105,7 @@ impl Files for RegistryFiles {
                     .rsplit('/')
                     .next()
                     .is_some_and(|n| n.starts_with("firmware-") && n.ends_with(".bin"));
-                self.source.retain(asset, image, board)?;
+                self.source.retain(name, asset, image, board)?;
                 Ok(bytes)
             })
             .map_err(|error| match error {
@@ -415,6 +420,7 @@ async fn wait_extended_board(
 /// Execute ROM-side boot preparation using the existing DMA-backed BMI.
 /// No DONE occurs here: the next owned HIF stage must publish all live CE
 /// buffers and arrange reset/IRQ teardown before firmware is permitted to run.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) async fn prepare<T: Transport>(
     bmi: &mut Bmi<T>,
     files: &mut impl Files,
@@ -423,89 +429,17 @@ pub(super) async fn prepare<T: Transport>(
     variant: &str,
     image: &Image,
 ) -> Result<Option<OtpIdentity>, Error> {
-    if profile.pll {
-        super::clock::enable(bmi).await?;
-    }
-    let otp_bytes = image.otp().ok_or(Error::Calibration)?;
-    bmi.fast_download(profile.patch, otp_bytes).await?;
-    let otp = OtpIdentity::from_result(bmi.execute(profile.patch, 0x10).await?);
-    let names = board_names(identity, otp, variant)?;
-    // Keep this exact completed OTP identity while a signed board arrives.
-    // Restarting prepare would repeat PLL/OTP execution on the live target.
-    let board = wait_board(files, profile, &names).await?;
-    if board.len() != profile.board + profile.board_tail {
-        return Err(Error::Calibration);
-    }
-    bmi.write_u32(HI, 0x0002).await?; // HTC_PROTOCOL_VERSION 2.0.
-    let options = bmi.read_u32(HI + 0x10).await?;
-    bmi.write_u32(HI + 0x10, options | (1 << 9) | (2 << 12) | (1 << 3))
-        .await?;
-    bmi.write_u32(HI + 0x44, 0).await?;
-    bmi.write_u32(HI + 0x104, 0).await?;
-    bmi.write_u32(HI + 0xbc, u32::from(identity.device)).await?;
-    let extra = bmi.read_u32(HI + 0xac).await?;
-    // Linux `core.c::ath10k_download_cal_data` tries the QCA9887 SI EEPROM
-    // before OTP. Its 2116-byte image replaces board data only when
-    // `ath10k_push_board_ext_data` accepts that length (no extension region);
-    // otherwise, or on any EEPROM failure, the board file plus OTP is used.
-    let eeprom = if profile.device == super::hw::QCA9887_DEVICE_ID && extra == 0 {
-        bmi.calibration_eeprom(profile.calibration).await?
-    } else {
-        None
-    };
-    if extra != 0 {
-        if extra & 3 != 0 {
-            return Err(Error::Calibration);
-        }
-        bmi.write_memory(extra, &board[profile.board..]).await?;
-        bmi.write_u32(HI + 0xb0, ((profile.board_tail as u32) << 16) | 1)
-            .await?;
-    }
-    let base = bmi.read_u32(HI + 0x54).await?;
-    if base == 0 || base & 3 != 0 {
-        return Err(Error::Address);
-    }
-    match &eeprom {
-        Some(calibration) => {
-            let length = calibration.len().min(profile.board);
-            bmi.write_memory(base, &calibration[..length]).await?
-        }
-        None => bmi.write_memory(base, &board[..profile.board]).await?,
-    }
-    bmi.write_u32(HI + 0x58, 1).await?;
-    if otp.is_some_and(|identity| identity.extended) {
-        bmi.fast_download(profile.patch, otp_bytes).await?;
-        let result = bmi.execute(profile.patch, 0x40000).await?;
-        let extended_id = result & 255;
-        if extended_id != 0 {
-            let chip = otp.unwrap().chip;
-            let name = format!("bus=pci,bmi-chip-id={chip},bmi-eboard-id={extended_id}");
-            let data = wait_extended_board(files, profile, name).await?;
-            if data.len() != profile.extended_board {
-                return Err(Error::Calibration);
-            }
-            let address = base.checked_add(0x3000).ok_or(Error::Address)?;
-            bmi.write_memory(address, &data).await?;
-        }
-    }
-    // A successful EEPROM download is Linux's `done` calibration mode: the
-    // OTP calibration execution is skipped.
-    if eeprom.is_none() {
-        bmi.fast_download(profile.patch, otp_bytes).await?;
-        let result = bmi.execute(profile.patch, profile.otp_parameter).await?;
-        if result != 0 && image.features & (1 << 7) == 0 {
-            return Err(Error::Calibration);
-        }
-    }
-    if image.features & (1 << 9) != 0 {
-        bmi.write_u32(HI + 0x20, 1).await?;
-    }
-    if let Some(bytes) = image.codeswap() {
-        bmi.configure_codeswap(bytes).await?;
-    }
-    bmi.fast_download(profile.patch, image.image()).await?;
-    bmi.write_u32(HI + 0x14, 0).await?;
-    Ok(otp)
+    prepare_for_address(
+        bmi,
+        files,
+        profile,
+        identity,
+        variant,
+        image,
+        None,
+        &Platform::default(),
+    )
+    .await
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -523,7 +457,12 @@ mod asset_authority_tests {
     fn smoke_ath10k_board_data_requires_signer_and_current_registry_invocation() -> TestResult {
         let (write, read) = narf_firmware::bootstrap_authority();
         let mut files = RegistryFiles::with_authority(read);
-        for name in ["ath10k/narf-test/board-2.bin", "ath10k/narf-test/board.bin"] {
+        for name in [
+            "ath10k/narf-test/board-2.bin",
+            "ath10k/narf-test/board.bin",
+            "ath10k/pre-cal-pci-0000:fe:1f.7.bin",
+            "ath10k/cal-pci-0000:fe:1f.7.bin",
+        ] {
             match install(&write, name, b"inert-board", false) {
                 Ok(()) => {
                     if files.load(name).is_ok() {

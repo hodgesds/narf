@@ -4,7 +4,8 @@
 //! traffic can never satisfy its waiter. Host FIFO access is explicit.
 
 use super::{events, ioctl, sdpcm::*, PacketTransport, TransportError};
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const MAX_CONTROL: usize = 8192;
 // Linux BRCMF_TX_IOCTL_MAX_MSG_SIZE (1518) includes the 16-byte dcmd header.
@@ -12,6 +13,14 @@ const MAX_CONTROL_INPUT: usize = 1502;
 pub const MAX_PACKET: usize = 12 + 16 + MAX_CONTROL;
 pub const QUEUE_DEPTH: usize = 32;
 const RECEIVE_BUDGET: usize = 16;
+
+#[path = "runtime_ap.rs"]
+mod ap;
+#[path = "runtime_pm.rs"]
+mod pm;
+#[path = "runtime_reset.rs"]
+mod reset;
+pub(crate) use reset::Reboot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -48,7 +57,12 @@ struct Pending {
 /// One interface (firmware ifidx zero), with no aggregation or firmware
 /// signalling offload. A caller serializes access with an async mutex.
 pub struct Runtime<T: PacketTransport> {
-    transport: T,
+    transport: Option<T>,
+    stopped: bool,
+    ap_live: Arc<AtomicBool>,
+    ap: Option<alloc::boxed::Box<ap::Owner>>,
+    /// Secondary-ifidx firmware-SME AP owners (one per open ifidx).
+    vif_ap: Vec<ap::Owner>,
     tx_sequence: u8,
     tx_max: u8,
     flow_control: u8,
@@ -60,8 +74,29 @@ pub struct Runtime<T: PacketTransport> {
     response: Option<Result<Vec<u8>, Error>>,
     events: VecDeque<Event>,
     data: VecDeque<Vec<u8>>,
+    /// Secondary-ifidx records; interface 0 keeps `events`/`data` above.
+    vif: crate::brcmfmac::vif_demux::Demux,
     failed: bool,
     vendor: super::fullmac::FirmwareVendor,
+    /// The bus is system-suspended (`runtime_pm.rs`): no FIFO access.
+    suspended: bool,
+    /// Linux `sdiodev->wowl_enabled` (`brcmf_bus_wowl_config`).
+    wowl_enabled: bool,
+    /// Retained reset/reboot authority (`runtime_reset.rs`); `None`: this
+    /// generation cannot be reset in place.
+    reboot: Option<alloc::boxed::Box<dyn Reboot<T>>>,
+}
+impl<T: PacketTransport> Drop for Runtime<T> {
+    fn drop(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
+        if !self.stopped {
+            // A dropped operation/runtime is no native device-stop receipt.
+            // Keep the original host/card/register owner pinned on uncertainty.
+            if let Some(transport) = self.transport.take() {
+                core::mem::forget(transport);
+            }
+        }
+    }
 }
 impl<T: PacketTransport> core::fmt::Debug for Runtime<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -77,8 +112,15 @@ impl<T: PacketTransport> Runtime<T> {
     /// Attach only after the firmware loader completed. Credit begins at
     /// zero: a real firmware SDPCM header must grant the initial TX window.
     pub fn new(transport: T) -> Self {
+        Self::with_transport(Some(transport))
+    }
+    fn with_transport(transport: Option<T>) -> Self {
         Self {
             transport,
+            stopped: false,
+            ap_live: Arc::new(AtomicBool::new(true)),
+            ap: None,
+            vif_ap: Vec::new(),
             tx_sequence: 0,
             tx_max: 0,
             flow_control: 0,
@@ -89,8 +131,12 @@ impl<T: PacketTransport> Runtime<T> {
             response: None,
             events: VecDeque::new(),
             data: VecDeque::new(),
+            vif: crate::brcmfmac::vif_demux::Demux::new(),
             failed: false,
             vendor: super::fullmac::FirmwareVendor::Wcc,
+            suspended: false,
+            wowl_enabled: false,
+            reboot: None,
         }
     }
 
@@ -110,7 +156,46 @@ impl<T: PacketTransport> Runtime<T> {
     }
 
     pub fn fail(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
         self.failed = true;
+        self.vif.clear();
+        self.vif_ap.clear();
+    }
+    pub(crate) fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        if self.failed || self.stopped {
+            return None;
+        }
+        Some(self.transport.as_ref()?.ap_source()?.retain(&self.ap_live))
+    }
+
+    /// Close ordinary work first and retain the original transport through
+    /// the full actual native receipt chain, even after a protocol failure.
+    pub(crate) fn stop_transport(&mut self) -> Result<(), Error> {
+        self.fail();
+        if self.stopped {
+            return Ok(());
+        }
+        self.transport
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .confirmed_stop()?;
+        self.stopped = true;
+        self.pending = None;
+        self.response = None;
+        self.events.clear();
+        self.data.clear();
+        self.vif.clear();
+        Ok(())
+    }
+    pub(crate) fn release_transport(&mut self) -> bool {
+        if !self.stopped {
+            return false;
+        }
+        // Every native PIO borrow ended before its synchronous command
+        // returned. The complete stop proof, not that fact alone, permits
+        // dropping this original Card/register owner now.
+        drop(self.transport.take());
+        true
     }
 
     /// Install the station's negotiated AC rank map. SDPCM `fc_mask` bits
@@ -142,27 +227,38 @@ impl<T: PacketTransport> Runtime<T> {
         if self.failed {
             return Err(Error::Failed);
         }
+        if self.suspended {
+            // brcmf_sdiod_freezer: the DPC does not run while suspended.
+            return Ok(0);
+        }
         let result = self.poll_inner();
         if result.is_err() {
-            self.failed = true;
+            self.fail();
         } else {
             // The SDIO IRQ thread re-enables the card interrupt after its
             // function handlers ran; a still-asserted line fires again.
-            self.transport.interrupt_serviced();
+            self.transport
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .interrupt_serviced();
             if result == Ok(0) {
-                self.transport.idle();
+                self.transport.as_mut().ok_or(Error::Failed)?.idle();
             }
         }
         result
     }
     pub fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
-        self.transport.interrupt()
+        self.transport.as_ref()?.interrupt()
     }
 
     fn poll_inner(&mut self) -> Result<usize, Error> {
         let mut bytes = vec![0; MAX_PACKET];
         for count in 0..RECEIVE_BUDGET {
-            let length = self.transport.receive_packet(&mut bytes)?;
+            let length = self
+                .transport
+                .as_mut()
+                .ok_or(Error::Failed)?
+                .receive_packet(&mut bytes)?;
             if length == 0 {
                 return Ok(count);
             }
@@ -208,17 +304,30 @@ impl<T: PacketTransport> Runtime<T> {
             CHANNEL_EVENT | CHANNEL_DATA => {
                 // BDC data header, distinct from the 16-byte IOCTL header.
                 let bdc = payload.get(..4).ok_or(Error::Malformed)?;
-                if bdc[0] >> 4 != 2 || bdc[2] & 15 != 0 {
+                if bdc[0] >> 4 != 2 {
                     return Err(Error::Malformed);
                 }
+                // `BCDC_GET_IF_IDX`: flags2 low nibble names the interface.
+                let if_idx = bdc[2] & 15;
                 let body = payload
                     .get(4 + usize::from(bdc[3]) * 4..)
                     .ok_or(Error::Malformed)?;
                 if sw.channel == CHANNEL_EVENT {
                     let event = events::parse_event(body).map_err(|_| Error::Malformed)?;
                     let header = event.header;
-                    if header.if_idx != 0 || header.bsscfg_idx != 0 {
-                        return Ok(());
+                    use crate::brcmfmac::vif_demux::{route, Route};
+                    match route(header.event_type, header.if_idx, header.bsscfg_idx) {
+                        Route::Primary => {}
+                        Route::Secondary => {
+                            return self
+                                .vif
+                                .push_event(Event {
+                                    header,
+                                    payload: event.payload.to_vec(),
+                                })
+                                .map_err(|_| Error::EventOverflow);
+                        }
+                        Route::Invalid => return Ok(()),
                     }
                     if self.events.len() == QUEUE_DEPTH {
                         return Err(Error::EventOverflow);
@@ -237,6 +346,12 @@ impl<T: PacketTransport> Runtime<T> {
                     if body[12..14] == [0x88, 0x6c] {
                         return Err(Error::Malformed);
                     }
+                    if if_idx != 0 {
+                        // `brcmf_proto_bcdc_hdrpull`: an ifidx without a
+                        // registered interface is dropped, not fatal.
+                        self.vif.push_data(if_idx, body.to_vec());
+                        return Ok(());
+                    }
                     if self.data.len() == QUEUE_DEPTH {
                         self.data.pop_front();
                     }
@@ -253,10 +368,14 @@ impl<T: PacketTransport> Runtime<T> {
         let Some(pending) = self.pending else {
             return Ok(());
         };
-        // Stale, foreign-interface and wrong-command replies cannot affect
-        // the current operation, including replies carrying an ERROR flag.
+        // Stale and wrong-command replies cannot affect the current
+        // operation, including replies carrying an ERROR flag. As in Linux
+        // bcdc.c (`brcmf_proto_bcdc_cmplt`/`brcmf_proto_bcdc_query_dcmd`),
+        // a reply is correlated by its BCDC_DCMD_ID request id; the
+        // BCDC_DCMD_IF_SHIFT ifidx of the reply is not consulted, so a
+        // secondary-interface reply with a zeroed or different echo still
+        // completes its own request.
         if header.xact_id() != pending.id
-            || header.if_idx() != 0
             || header.cmd != pending.command
             || header.is_set() != (pending.direction == ioctl::Direction::Set)
         {
@@ -292,10 +411,39 @@ impl<T: PacketTransport> Runtime<T> {
         payload: &[u8],
         maximum: usize,
     ) -> Result<Vec<u8>, Error> {
+        self.command_scoped(0, direction, command, payload, maximum, None)
+            .await
+    }
+    /// [`Self::command`] addressed to firmware interface `if_idx`
+    /// (`brcmf_proto_bcdc_msg` `BCDC_DCMD_IF_SHIFT`). Interface 0 is the
+    /// ordinary [`Self::command`]; a secondary ifidx carries no AP scope.
+    pub async fn command_on(
+        &mut self,
+        if_idx: u8,
+        direction: ioctl::Direction,
+        command: u32,
+        payload: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if if_idx >= crate::brcmfmac::vif_wire::MAX_IFS {
+            return Err(Error::Malformed);
+        }
+        self.command_scoped(if_idx, direction, command, payload, maximum, None)
+            .await
+    }
+    async fn command_scoped(
+        &mut self,
+        if_idx: u8,
+        direction: ioctl::Direction,
+        command: u32,
+        payload: &[u8],
+        maximum: usize,
+        original: Option<&crate::brcmfmac::ap_scope::Capture>,
+    ) -> Result<Vec<u8>, Error> {
         if self.failed {
             return Err(Error::Failed);
         }
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.suspended {
             return Err(Error::Busy);
         }
         if payload.len() > MAX_CONTROL_INPUT || maximum > MAX_CONTROL {
@@ -338,7 +486,7 @@ impl<T: PacketTransport> Runtime<T> {
         let mut request = zeroize::Zeroizing::new(ioctl::build_request(
             transaction.runtime.tx_sequence,
             pending.id,
-            0,
+            if_idx,
             direction,
             command,
             &body,
@@ -354,7 +502,42 @@ impl<T: PacketTransport> Runtime<T> {
             .encode(),
         );
         loop {
-            match transaction.runtime.transport.transmit_packet(&request) {
+            if direction == ioctl::Direction::Set
+                && original.is_some_and(|original| {
+                    if if_idx == 0 {
+                        transaction
+                            .runtime
+                            .events
+                            .iter()
+                            .any(|event| original.program_event_blocks(&event.header))
+                    } else {
+                        transaction
+                            .runtime
+                            .vif
+                            .events()
+                            .filter(|event| event.header.if_idx == if_idx)
+                            .any(|event| original.program_event_blocks(&event.header))
+                    }
+                })
+            {
+                // Do not program past a consumed native denial/replacement.
+                // Benign BSS-UP and same-drain EAPOL stay queued, and actual
+                // GET queries can inspect firmware without new RF/key/port
+                // authority. Session still applies every record afterward.
+                transaction.runtime.pending = None;
+                transaction.finished = true;
+                return Err(Error::Busy);
+            }
+            let transport = transaction
+                .runtime
+                .transport
+                .as_mut()
+                .ok_or(Error::Failed)?;
+            let result = match original {
+                Some(original) => transport.transmit_ap_control(&request, original),
+                None => transport.transmit_packet(&request),
+            };
+            match result {
                 Ok(()) => break,
                 Err(super::TransportError::Busy) => {
                     transaction.runtime.poll()?;
@@ -362,6 +545,14 @@ impl<T: PacketTransport> Runtime<T> {
                         return Err(Error::Timeout);
                     }
                     delay().await;
+                }
+                Err(super::TransportError::Denied) if original.is_some() => {
+                    // No COMMAND entered. Clear only this unissued waiter;
+                    // preserve sequence, queued native records and transport.
+                    transaction.runtime.pending = None;
+                    transaction.runtime.response = None;
+                    transaction.finished = true;
+                    return Err(Error::Authority);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -382,6 +573,61 @@ impl<T: PacketTransport> Runtime<T> {
     }
 
     pub fn send_data(&mut self, ethernet: &[u8], priority: u8) -> Result<(), Error> {
+        if self.ap.is_some() {
+            return Err(Error::Authority);
+        }
+        self.send_data_inner(0, ethernet, priority, None)
+    }
+    /// Transmit on secondary firmware interface `if_idx` (BDC
+    /// `BCDC_SET_IF_IDX`). Only an ifidx its owner opened is admitted. The
+    /// primary AP session owns interface 0 data only: BCDC addresses every
+    /// packet by ifidx (`brcmf_proto_bcdc_hdrpush`), so a secondary
+    /// interface keeps its own data beside it (Linux combo0).
+    pub fn send_data_on(&mut self, if_idx: u8, ethernet: &[u8], priority: u8) -> Result<(), Error> {
+        // A secondary AP owns its ifidx's data (`ap_send_if` only), as the
+        // primary AP owns interface 0's.
+        if if_idx == 0 || !self.vif.is_open(if_idx) || self.ap_owns_if(if_idx) {
+            return Err(Error::Authority);
+        }
+        self.send_data_inner(if_idx, ethernet, priority, None)
+    }
+    pub fn vif_listen(&mut self, on: bool) {
+        self.vif.listen(on);
+    }
+    pub fn event_composition(&mut self) -> &mut crate::brcmfmac::event_mask::Composition {
+        self.vif.event_mask()
+    }
+    pub fn vif_open(&mut self, if_idx: u8) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        self.vif.open(if_idx)
+    }
+    /// BCDC holds no per-interface native resource; closing is immediate.
+    pub fn vif_close(&mut self, if_idx: u8) -> bool {
+        // An AP owner of this ifidx keeps it until its own stop retires it.
+        if self.ap_owns_if(if_idx) {
+            return false;
+        }
+        self.vif.close(if_idx);
+        true
+    }
+    pub fn pop_vif_event(&mut self) -> Option<Event> {
+        self.vif.pop_event()
+    }
+    pub fn pop_vif_data(&mut self, if_idx: u8) -> Option<Vec<u8>> {
+        self.vif.pop_data(if_idx)
+    }
+    fn send_data_inner(
+        &mut self,
+        if_idx: u8,
+        ethernet: &[u8],
+        priority: u8,
+        original: Option<&crate::brcmfmac::ap_scope::Capture>,
+    ) -> Result<(), Error> {
+        if self.suspended {
+            return Err(Error::Busy);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -416,13 +662,21 @@ impl<T: PacketTransport> Runtime<T> {
             }
             .encode(),
         );
-        bytes[12..16].copy_from_slice(&[0x20, priority, 0, 0]);
+        bytes[12..16].copy_from_slice(&[0x20, priority, if_idx & 15, 0]);
         bytes[16..length].copy_from_slice(ethernet);
-        if let Err(error) = self.transport.transmit_packet(&bytes) {
+        let transport = self.transport.as_mut().ok_or(Error::Failed)?;
+        let result = match original {
+            Some(original) => transport.transmit_ap_packet(&bytes, original),
+            None => transport.transmit_packet(&bytes),
+        };
+        if let Err(error) = result {
             if error == super::TransportError::Busy {
                 return Err(Error::Busy);
             }
-            self.failed = true;
+            if error == super::TransportError::Denied {
+                return Err(Error::Authority);
+            }
+            self.fail();
             return Err(error.into());
         }
         self.tx_sequence = self.tx_sequence.wrapping_add(1);
@@ -441,7 +695,7 @@ struct Transaction<'a, T: PacketTransport> {
 impl<T: PacketTransport> Drop for Transaction<'_, T> {
     fn drop(&mut self) {
         if !self.finished {
-            self.runtime.failed = true;
+            self.runtime.fail();
         }
     }
 }

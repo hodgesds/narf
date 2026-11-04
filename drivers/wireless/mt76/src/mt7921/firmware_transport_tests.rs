@@ -4,13 +4,27 @@ use core::{
     cell::Cell,
     future::Future,
     pin::pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     task::{Context, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+// A native model contains large packet/BA owners. All shared preparation
+// boundaries return a heap owner so nested fixtures cannot accumulate
+// several by-value Session return places on the kernel boot stack.
+type NativeSession = alloc::boxed::Box<Session<Model>>;
+
+#[path = "ap_runtime_tests.rs"]
+mod ap_runtime_tests;
+#[path = "p2p_native_tests.rs"]
+mod p2p;
+#[path = "p2p_management_model.rs"]
+mod p2p_management_model;
+
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
+#[path = "rxd_fields_tests.rs"]
+mod rxd_fields_tests;
 
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
@@ -29,6 +43,10 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "ht_protection_tests.rs"]
 mod ht_protection_tests;
+#[path = "key_replace_tests.rs"]
+mod key_replace_tests;
+#[path = "monitor_tests.rs"]
+mod monitor_tests;
 #[path = "pmf_tests.rs"]
 mod pmf_tests;
 #[path = "receive_epoch_tests.rs"]
@@ -41,6 +59,8 @@ mod rx_fragment_tests;
 mod six_ghz_tests;
 #[path = "system_pm_tests.rs"]
 mod system_pm_tests;
+#[path = "tx_ba_restart_tests.rs"]
+mod tx_ba_restart_tests;
 #[path = "tx_ba_tests.rs"]
 mod tx_ba_tests;
 #[path = "tx_nss_tests.rs"]
@@ -116,7 +136,7 @@ fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestR
     if result.is_err()
         || allocations.get() != 1
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
         || run(session.run()) != Err(Error::Busy)
     {
         return TestResult::Fail("MT76 staged startup replayed or published invalid radio state");
@@ -182,13 +202,28 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
     event[32] = status;
     event
 }
+#[derive(Debug, Default)]
+struct RocModel {
+    hold: AtomicBool,
+    seen: AtomicBool,
+    fault: AtomicU32,
+    interval_ms: AtomicU32,
+}
 #[derive(Debug)]
 struct Model {
     chip_id: u16,
     phy_capability: Option<[u8; 12]>,
+    ap_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    p2p_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    packet_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    roc: Option<Arc<RocModel>>,
+    ap_timing_pause: Option<u64>,
+    ap_timing: Option<(u32, u32, u32, u16)>,
     receive_epoch: u64,
     receive_open: bool,
     captured_packets: VecDeque<CapturedData>,
+    p2p_capture: super::p2p_management_capture::Queue,
+    p2p_tx: Option<Arc<p2p_management_model::Observer>>,
     ticks: Cell<u64>,
     tick_step_ns: u64,
     management_stall_after: Option<usize>,
@@ -197,6 +232,7 @@ struct Model {
     tx_ba_status: u16,
     tx_ba_fault: u8,
     tx_ba_native: bool,
+    tx_ba_native_tids: u8,
     tx_ba_late_rx: VecDeque<Vec<u8>>,
     data_aggregation: Vec<bool>,
     data_ba_disabled: Vec<bool>,
@@ -231,6 +267,7 @@ struct Model {
     notifications: usize,
     revoke_on_submit: bool,
     wtbl_stall: bool,
+    wtbl_clears: Vec<u8>,
     clc_result: bool,
     packets: VecDeque<Vec<u8>>,
     scan_stall: bool,
@@ -247,12 +284,24 @@ struct Model {
     link_stall: bool,
     pm: PowerModel,
     data_tids: Vec<u8>,
+    /// The vif index (`OWN_MAC`) of every station/AP TX submission.
+    tx_vifs: Vec<u8>,
     hw_amsdu: bool,
     data_amsdu: Vec<bool>,
+    sequence: crate::mt7921::tx_sequence::Owner,
+    tx_status: VecDeque<Vec<u8>>,
+    data_headers: Vec<[u8; 64]>,
 }
+#[path = "associated_scan_tests.rs"]
+mod associated_scan_tests;
+#[path = "wowlan_model.rs"]
+mod wowlan_model;
+#[path = "wowlan_tests.rs"]
+mod wowlan_tests;
 /// Low-power state of the model device, for system suspend/resume.
 #[derive(Debug, Default)]
 struct PowerModel {
+    wow: wowlan_model::Fixture,
     trace: Vec<&'static str>,
     dma_enabled: bool,
     firmware_owned: bool,
@@ -262,14 +311,59 @@ struct PowerModel {
     driver_own_stall: bool,
 }
 impl Model {
+    fn model_data(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        self.check()?;
+        if self.access_point.as_ref().is_some_and(|ap| {
+            ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
+        }) {
+            return Err(Error::Bounds);
+        }
+        let mut header = if qos {
+            crate::mt7921::packet_tx::ethernet_tid(frame, 0x1000, 1, 1, protected, tid)?
+        } else {
+            crate::mt7921::packet_tx::ethernet(frame, 0x1000, 1, 1, protected)?
+        };
+        if qos && self.hw_amsdu {
+            crate::mt7921::packet_tx::set_hw_amsdu(&mut header);
+        }
+        if qos {
+            if let Some(pid) = self.sequence.pid(tid)? {
+                crate::mt7921::tx_sequence::request(&mut header, pid)?;
+                self.sequence.begin(tid, 1)?;
+            }
+        }
+        self.data_amsdu
+            .push(u32::from_le_bytes(header[28..32].try_into().unwrap()) & (1 << 10) != 0);
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        self.data_protection.push(protected);
+        self.data_qos.push(qos);
+        self.data_aggregation.push(false);
+        self.data_ba_disabled.push(header[15] & 0x10 != 0);
+        Ok(())
+    }
     fn new() -> Self {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
             chip_id: 0,
             phy_capability: None,
+            ap_hold: None,
+            p2p_hold: None,
+            packet_hold: None,
+            roc: None,
+            ap_timing_pause: None,
+            ap_timing: None,
             receive_epoch: 0,
             receive_open: false,
             captured_packets: VecDeque::new(),
+            p2p_capture: super::p2p_management_capture::Queue::new(),
+            p2p_tx: None,
             ticks: Cell::new(0),
             tick_step_ns: 1_000_000,
             management_stall_after: None,
@@ -278,6 +372,7 @@ impl Model {
             tx_ba_status: 0,
             tx_ba_fault: 0,
             tx_ba_native: false,
+            tx_ba_native_tids: 0,
             tx_ba_late_rx: VecDeque::new(),
             data_aggregation: Vec::new(),
             data_ba_disabled: Vec::new(),
@@ -315,6 +410,7 @@ impl Model {
             notifications: 0,
             revoke_on_submit: false,
             wtbl_stall: false,
+            wtbl_clears: Vec::new(),
             clc_result: false,
             packets: VecDeque::new(),
             scan_stall: false,
@@ -331,8 +427,12 @@ impl Model {
             link_stall: false,
             pm: PowerModel::default(),
             data_tids: Vec::new(),
+            tx_vifs: Vec::new(),
             hw_amsdu: false,
             data_amsdu: Vec::new(),
+            sequence: crate::mt7921::tx_sequence::Owner::new(),
+            tx_status: VecDeque::new(),
+            data_headers: Vec::new(),
         }
     }
 }
@@ -378,6 +478,14 @@ impl Backend for Model {
         } else {
             Err(Error::Authority)
         }
+    }
+    fn regulatory_domain(&self) -> Result<Arc<narf_wireless::reg::RegulatoryDomain>, Error> {
+        self.tx_policy
+            .as_ref()
+            .map_or_else(narf_wireless::reg::db::snapshot, |policy| {
+                policy.database.snapshot()
+            })
+            .ok_or(Error::Authority)
     }
     fn check_tx_permission(
         &self,
@@ -470,10 +578,16 @@ impl Backend for Model {
                     if frame[34..36] == [3, 0]
                         && frame
                             .get(56..64)
-                            .is_some_and(|b| b[..6] == [6, 0, 12, 0, 0, 1])
+                            .is_some_and(|b| b[..4] == [6, 0, 12, 0] && b[4] < 8 && b[5] == 1)
                         && result[4..] == [0; 4]
                     {
-                        self.tx_ba_native = frame[63] == 1;
+                        let tid = frame[60];
+                        if frame[63] != 0 {
+                            self.tx_ba_native_tids |= 1 << tid;
+                        } else {
+                            self.tx_ba_native_tids &= !(1 << tid);
+                        }
+                        self.tx_ba_native = self.tx_ba_native_tids & 1 != 0;
                         if self.tx_ba_native {
                             self.packets.append(&mut self.tx_ba_late_rx);
                         }
@@ -530,9 +644,56 @@ impl Backend for Model {
                     || cmd == 0x1b
                     || cmd == 0x1d
                     || cmd == 0xb0
+                    || cmd == 0x61
+                    || cmd == 0x62
+                    || cmd == 0x16
+                    || cmd == 0x17
                     || cmd == 3 && self.scan_stall)
                 {
                     self.replies.push_back(reply);
+                }
+            }
+        }
+        if frame.len() == 76
+            && frame[43] == 7
+            && frame[34..36] == [0x27, 0]
+            && frame[52..56] == [0, 0, 24, 0]
+        {
+            if let Some(model) = &self.roc {
+                let fault = model.fault.load(Ordering::Acquire);
+                if fault != 5 {
+                    let mut grant = vec![0; 24];
+                    grant[6..8].copy_from_slice(&20u16.to_le_bytes());
+                    grant[8] = frame[56];
+                    grant[9] = frame[57];
+                    grant[11] = frame[58];
+                    grant[13] = frame[60];
+                    grant[15] = frame[62];
+                    grant[17] = frame[67];
+                    grant[18] = 0xff;
+                    let reported = model.interval_ms.load(Ordering::Acquire);
+                    let interval = if reported == 0 {
+                        u32::from_le_bytes(frame[68..72].try_into().unwrap())
+                    } else {
+                        reported
+                    };
+                    grant[20..24].copy_from_slice(&interval.to_le_bytes());
+                    if fault == 2 {
+                        grant[11] ^= 1;
+                    }
+                    let mut event = runtime_event(0x27, 0, 0, &grant);
+                    if fault != 3 {
+                        event[30] |= 4;
+                    }
+                    if fault == 4 {
+                        event.truncate(59);
+                    }
+                    if fault == 1 {
+                        let mut old = event.clone();
+                        old[45] ^= 0x80;
+                        self.replies.push_back(old);
+                    }
+                    self.replies.push_back(event);
                 }
             }
         }
@@ -562,6 +723,48 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self
+            .replies
+            .front()
+            .is_some_and(|event| event.get(28) == Some(&0x27))
+        {
+            if let Some(model) = &self.roc {
+                model.seen.store(true, Ordering::Release);
+                if model.hold.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+        }
+        if self.frames.last().is_some_and(|(_, f)| {
+            f.len() == 84 && f[43] == 7 && f[34..36] == [2, 0] && f[52..56] == [0, 0, 32, 0]
+        }) {
+            if let Some(hold) = &self.p2p_hold {
+                hold.seen.store(true, Ordering::Release);
+                if !hold.release.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+        }
+        if self.frames.last().is_some_and(|(_, f)| {
+            f.len() >= 54
+                && f[43] == 7
+                && (f.len() == 578 && f[34..36] == [2, 0] && f[52..54] == [7, 0]
+                    || f.len() == 88 && f[34..36] == [3, 0] && f[50] == 2)
+        }) {
+            if let Some(hold) = &self.ap_hold {
+                hold.seen.store(true, Ordering::Release);
+                if !hold.release.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+        }
+        if self.pm.wow.hold_offload_ack.load(Ordering::Acquire)
+            && self.frames.last().is_some_and(|(_, frame)| {
+                frame.len() >= 48 && frame[43] == 7 && frame[34..36] == [6, 0]
+            })
+        {
+            return Ok(None);
+        }
         let held = self.tx_policy.as_ref().is_some_and(|policy| {
             policy.hold_bss_ack.load(Ordering::SeqCst)
                 && self.frames.last().is_some_and(|(_, frame)| {
@@ -575,21 +778,69 @@ impl Backend for Model {
         }
     }
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self
-            .captured_packets
-            .pop_front()
-            .map(|packet| packet.bytes)
-            .or_else(|| self.packets.pop_front()))
+        Ok(self.receive_data_captured()?.map(|packet| packet.bytes))
     }
     fn receive_data_captured(&mut self) -> Result<Option<CapturedData>, Error> {
         if let Some(packet) = self.captured_packets.pop_front() {
             return Ok(Some(packet));
         }
-        Ok(self.packets.pop_front().map(|bytes| CapturedData {
-            bytes,
-            epoch: self.receive_epoch,
-            port_open: self.receive_open,
+        Ok(self.packets.pop_front().map(|bytes| {
+            self.p2p_capture.copy(&bytes, self.ticks.get());
+            CapturedData {
+                bytes,
+                epoch: self.receive_epoch,
+                port_open: self.receive_open,
+            }
         }))
+    }
+    fn close_p2p_capture(&mut self) {
+        self.p2p_capture.close();
+    }
+    fn configure_p2p_capture(
+        &mut self,
+        spec: Option<super::p2p_management_capture::Spec>,
+    ) -> Result<(), Error> {
+        self.p2p_capture.close();
+        let Some(spec) = spec else {
+            return Ok(());
+        };
+        self.check()?;
+        let cut = self.packets.len();
+        for _ in 0..cut {
+            let bytes = self.packets.pop_front().ok_or(Error::Ring)?;
+            self.captured_packets.push_back(CapturedData {
+                bytes,
+                epoch: self.receive_epoch,
+                port_open: self.receive_open,
+            });
+        }
+        self.p2p_capture.open_after_cut(spec, self.ticks.get())
+    }
+    fn receive_p2p_management(
+        &mut self,
+    ) -> Result<Option<super::p2p_management_capture::Captured>, Error> {
+        self.check()?;
+        if let Some(observer) = &self.p2p_tx {
+            self.packets.append(&mut observer.received.lock());
+        }
+        if let Some(packet) = self.p2p_capture.pop() {
+            return Ok(Some(packet));
+        }
+        for _ in 0..16 {
+            let Some(bytes) = self.packets.pop_front() else {
+                break;
+            };
+            self.p2p_capture.copy(&bytes, self.ticks.get());
+            if self.captured_packets.len() == 32 {
+                self.captured_packets.pop_front();
+            }
+            self.captured_packets.push_back(CapturedData {
+                bytes,
+                epoch: self.receive_epoch,
+                port_open: self.receive_open,
+            });
+        }
+        Ok(self.p2p_capture.pop())
     }
     fn close_receive_capture(&mut self, epoch: u64) {
         self.receive_epoch = epoch;
@@ -625,6 +876,36 @@ impl Backend for Model {
     fn firmware_owned(&mut self) -> Result<bool, Error> {
         Ok(self.pm.firmware_owned)
     }
+    fn prepare_wake_route(
+        &mut self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        self.wow_prepare_route(target)
+    }
+    fn arm_wake_route(
+        &mut self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        self.wow_arm_route(target)
+    }
+    fn wake_power_settled(&self) -> bool {
+        self.wow_settled()
+    }
+    fn enter_wake_d3hot(&mut self) -> Result<(), Error> {
+        self.wow_enter_d3hot()
+    }
+    fn verify_wake_d3hot(&mut self) -> Result<(), Error> {
+        self.wow_verify_d3hot()
+    }
+    fn begin_wake_d0(&mut self) -> Result<bool, Error> {
+        self.wow_begin_d0()
+    }
+    fn verify_wake_d0(&mut self) -> Result<(), Error> {
+        self.wow_verify_d0()
+    }
+    fn disarm_wake_route(&mut self) -> Result<(), Error> {
+        self.wow_disarm_route()
+    }
     fn restore_bus(&mut self) -> Result<(), Error> {
         self.check()?;
         self.pm.trace.push("bus");
@@ -646,6 +927,7 @@ impl Backend for Model {
         self.active = false;
         self.replies.clear();
         self.packets.clear();
+        self.p2p_capture.close();
         self.pm.dma_enabled = true;
         Ok(())
     }
@@ -689,6 +971,10 @@ impl Backend for Model {
             return Err(Error::Busy);
         }
         self.recovery_trace.push(("recycle", self.ticks.get()));
+        self.ap_timing = None;
+        self.ap_timing_pause = None;
+        self.sequence.firmware_reset();
+        self.tx_status.clear();
         self.active = false;
         self.loaded = false;
         self.replies.clear();
@@ -698,6 +984,31 @@ impl Backend for Model {
         self.management_resume = None;
         Ok(())
     }
+    fn pause_ap_timing(&mut self) -> Result<(), Error> {
+        self.check()?;
+        self.ap_timing_pause = Some(self.ticks.get());
+        Ok(())
+    }
+    fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error> {
+        self.check()?;
+        if self
+            .ap_timing_pause
+            .is_none_or(|began| self.ticks.get().saturating_sub(began) < 1_000)
+        {
+            return Err(Error::Timeout);
+        }
+        let short = five || short_slot;
+        self.ap_timing = Some((
+            231 | 48 << 16,
+            60 | 28 << 16,
+            360 | 2 << 10
+                | if five { 16 << 16 } else { 10 << 16 }
+                | if short { 9 << 24 } else { 20 << 24 },
+            if short { 0x49 } else { 3 },
+        ));
+        self.ap_timing_pause = None;
+        Ok(())
+    }
     fn configure_mac(&mut self) -> Result<(), Error> {
         self.check()
     }
@@ -705,18 +1016,22 @@ impl Backend for Model {
         if index >= 20 {
             return Err(Error::Bounds);
         }
-        self.check()
+        self.check()?;
+        self.wtbl_clears.push(index);
+        Ok(())
     }
     fn wtbl_idle(&mut self) -> Result<bool, Error> {
         Ok(!self.wtbl_stall)
     }
     fn submit_management(
         &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
         frame: &[u8],
         _wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
         self.check()?;
+        self.tx_vifs.push(vif.index());
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
         if frame.first() == Some(&0xc0) {
@@ -770,13 +1085,19 @@ impl Backend for Model {
                     if frame[24..26] != [3, 2]
                         || parameters & 0x7ff != 0
                         || parameters >> 12 >= 8
-                        || parameters & 0x800 != 0 && parameters >> 12 != 0
                         || frame[28..30] != [39, 0]
                     {
                         return Err(Error::Bounds);
                     }
                 } else if frame[24..26] == [3, 0] {
-                    if frame[26] == 0 || frame[27..33] != [3, 16, 0, 0, 0, 0] {
+                    let parameters = u16::from_le_bytes([frame[27], frame[28]]);
+                    let tid = (parameters >> 2) & 15;
+                    if frame[26] == 0
+                        || tid >= 8
+                        || parameters & !0x3c != 0x1003
+                        || frame[29..31] != [0; 2]
+                        || frame[31] & 15 != 0
+                    {
                         return Err(Error::Bounds);
                     }
                     if let Some((window, timeout)) = self.tx_ba_offer {
@@ -787,11 +1108,11 @@ impl Backend for Model {
                         reply[16..22].copy_from_slice(&frame[16..22]);
                         reply[24..27].copy_from_slice(&[3, 1, frame[26]]);
                         reply[27..29].copy_from_slice(&self.tx_ba_status.to_le_bytes());
-                        reply[29..31].copy_from_slice(&(2 | window << 6).to_le_bytes());
+                        reply[29..31].copy_from_slice(&(2 | tid << 2 | window << 6).to_le_bytes());
                         reply[31..33].copy_from_slice(&timeout.to_le_bytes());
                         match self.tx_ba_fault {
                             1 => reply[26] = reply[26].wrapping_add(1),
-                            2 => reply[29] |= 4,
+                            2 => reply[29] ^= 4,
                             3 => reply[29] |= 1,
                             4 => reply[29] &= !2,
                             5 => reply[4] ^= 2,
@@ -948,33 +1269,167 @@ impl Backend for Model {
         }
         Ok(())
     }
-    fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+    fn submit_fragment(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+    ) -> Result<(), Error> {
         self.check()?;
-        crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, wcid)?;
+        self.tx_vifs.push(link.bss());
+        let mut header = crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, link.peer().into())?;
+        if frame[0] == 0x88 && frame[1] & 4 == 0 {
+            let tid = frame[24] & 7;
+            if let Some(pid) = self.sequence.pid(tid)? {
+                crate::mt7921::tx_sequence::request(&mut header, pid)?;
+                self.sequence.begin(tid, 1)?;
+            }
+        }
+        self.data_headers.push(header);
         self.frames.push((false, frame.to_vec()));
         Ok(())
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
+    fn submit_data(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error> {
+        self.tx_vifs.push(link.bss());
+        self.model_data(frame, protected, qos, 0)
+    }
+    fn submit_ap_frame(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
         self.check()?;
-        if self.access_point.as_ref().is_some_and(|ap| {
-            ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
-        }) {
-            return Err(Error::Bounds);
-        }
-        let header = crate::mt7921::packet_tx::ethernet_qos(frame, 0x1000, 1, 1, protected, qos)?;
-        self.data_amsdu.push(qos && self.hw_amsdu);
+        self.tx_vifs.push(vif.index());
+        let header = super::ap_packet::descriptor_on(vif, frame, 0x1000, 1, wcid, rate)?;
+        self.data_headers.push(header);
         self.frames.push((false, frame.to_vec()));
-        self.data_protection.push(protected);
-        self.data_qos.push(qos);
-        self.data_aggregation.push(false);
-        self.data_ba_disabled.push(header[15] & 0x10 != 0);
         Ok(())
+    }
+    fn arm_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        wcid: u8,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.sequence.arm_ap_management_on(vif, wcid)
+    }
+    fn submit_ap_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.tx_vifs.push(vif.index());
+        let mut header = super::ap_packet::descriptor_on(vif, frame, 0x1000, 1, wcid, rate)?;
+        if let Some(pid) = self.sequence.pid(0)? {
+            crate::mt7921::tx_sequence::request(&mut header, pid)?;
+            self.sequence.begin(0, 1)?;
+        }
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        Ok(())
+    }
+    fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        self.check()?;
+        for _ in 0..8 {
+            let Some(report) = self.tx_status.pop_front() else {
+                break;
+            };
+            self.sequence.receive(&report)?;
+        }
+        self.sequence.take_ap_ack()
+    }
+    fn arm_p2p_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        tid: u8,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.sequence.arm_p2p_management(vif, tid)
+    }
+    fn submit_p2p_management(
+        &mut self,
+        frame: &[u8],
+        vif: crate::mt7921::vif_slots::Vif,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let local = frame
+            .get(10..16)
+            .ok_or(Error::Bounds)?
+            .try_into()
+            .map_err(|_| Error::Bounds)?;
+        let shape = super::p2p_management_tx_wire::Header::prepare(frame, local)?;
+        let mut header = super::p2p_management_tx_wire::descriptor(
+            frame,
+            0x1000,
+            1,
+            vif,
+            rate,
+            shape.multicast,
+        )?;
+        if let Some(pid) = if shape.multicast {
+            None
+        } else {
+            self.sequence.pid(shape.tid)?
+        } {
+            crate::mt7921::tx_sequence::request(&mut header, pid)?;
+            self.sequence.begin(shape.tid, 1)?;
+        }
+        if let Some(observer) = &self.p2p_tx {
+            observer.published.lock().push((header, frame.to_vec()));
+        }
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        Ok(())
+    }
+    fn poll_p2p_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        self.check()?;
+        if let Some(observer) = &self.p2p_tx {
+            for _ in 0..8 {
+                let Some(report) = observer.reports.lock().pop_front() else {
+                    break;
+                };
+                self.sequence.receive(&report)?;
+            }
+        }
+        self.sequence.take_ap_ack()
+    }
+    fn arm_transmit_sequence(&mut self, tid: u8) -> Result<(), Error> {
+        self.check()?;
+        self.sequence.arm(tid)
+    }
+    fn transmit_sequence_published(&self, tid: u8) -> bool {
+        self.sequence.published(tid)
+    }
+    fn poll_transmit_sequence(&mut self, tid: u8) -> Result<Option<u16>, Error> {
+        self.check()?;
+        for _ in 0..8 {
+            let Some(report) = self.tx_status.pop_front() else {
+                break;
+            };
+            self.sequence.receive(&report)?;
+        }
+        self.sequence.take(tid)
+    }
+    fn cancel_transmit_sequence(&mut self) {
+        self.sequence.cancel();
     }
     fn set_hw_amsdu(&mut self, enabled: bool) {
         self.hw_amsdu = enabled;
     }
     fn submit_data_tid(
         &mut self,
+        link: crate::mt7921::vif_slots::Link,
         frame: &[u8],
         protected: bool,
         tid: u8,
@@ -983,18 +1438,49 @@ impl Backend for Model {
         if tid == 0 {
             return Err(Error::Bounds);
         }
-        self.submit_data(frame, protected, true)?;
-        let header = crate::mt7921::packet_tx::ethernet_tid(frame, 0x1000, 1, 1, protected, tid)?;
+        self.tx_vifs.push(link.bss());
+        self.model_data(frame, protected, true, tid)?;
+        let header = crate::mt7921::packet_tx::ethernet_tid(
+            frame,
+            0x1000,
+            1,
+            link.peer().into(),
+            protected,
+            tid,
+        )?;
         self.data_tids.push(tid);
         *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
         Ok(())
     }
-    fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
-        if !self.tx_ba_native {
+    fn submit_data_aggregated(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+    ) -> Result<(), Error> {
+        self.submit_data_tid_aggregated(link, frame, protected, 0)
+    }
+    fn submit_data_tid_aggregated(
+        &mut self,
+        link: crate::mt7921::vif_slots::Link,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        if tid >= 8 || self.tx_ba_native_tids & (1 << tid) == 0 {
             return Err(Error::Bounds);
         }
-        self.submit_data(frame, protected, true)?;
-        let header = crate::mt7921::packet_tx::ethernet_aggregated(frame, 0x1000, 1, protected)?;
+        self.tx_vifs.push(link.bss());
+        self.model_data(frame, protected, true, tid)?;
+        let header = crate::mt7921::packet_tx::ethernet_tid_aggregated(
+            frame,
+            0x1000,
+            1,
+            link.peer().into(),
+            protected,
+            tid,
+        )?;
+        self.data_tids.push(tid);
         *self.data_aggregation.last_mut().unwrap() = true;
         *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
         Ok(())
@@ -1007,6 +1493,17 @@ impl Backend for Model {
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
         self.check()?;
+        if self.p2p_tx.as_ref().is_some_and(|observer| {
+            !observer.published.lock().is_empty() && !observer.terminal.load(Ordering::Acquire)
+        }) {
+            return Ok(None);
+        }
+        if let Some(hold) = &self.packet_hold {
+            hold.seen.store(true, Ordering::Release);
+            if !hold.release.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+        }
         if self
             .management_stall_after
             .is_some_and(|after| self.frames.len() >= after)
@@ -1026,10 +1523,12 @@ impl Backend for Model {
             }
             *budget -= 1;
         }
-        Ok(Some(crate::mt7921::packet_tx::Completion {
+        let completion = crate::mt7921::packet_tx::Completion {
             token: 1,
             status: self.completion_status,
-        }))
+        };
+        self.sequence.terminal(completion);
+        Ok(Some(completion))
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -2089,7 +2588,7 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
                     error: Error::EntropyUnavailable
                 }
             )
-            || session.security.is_some()
+            || session.station.security.is_some()
             || session.backend.entropy_calls != 1
             || session.backend.frames[before..]
                 .iter()
@@ -2180,7 +2679,7 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
         return TestResult::Fail("deauthentication ignored AP basic rate");
     }
     if run(session.recover(own)).is_err()
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !matches!(session.state, State::RadioReady(_))
     {
         return TestResult::Fail("dual-band reset retained association/keys");
@@ -2219,7 +2718,7 @@ fn mcu_ethernet_tx_rx_frame_transport() -> TestResult {
     let State::RadioReady(info) = session.state else {
         return TestResult::Fail("radio state");
     };
-    session.station_permission = Some(test_permission());
+    session.station.permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: [2, 1, 2, 3, 4, 5],
@@ -2447,7 +2946,7 @@ fn mt76_receive_discards_bad_descriptors_and_other_station_frames() -> TestResul
     };
     // This isolated decoder fixture explicitly supplies its synthetic native
     // station grant and receive generation; state alone cannot open RX.
-    session.station_permission = Some(test_permission());
+    session.station.permission = Some(test_permission());
     session.renew_receive_epoch().unwrap();
     for (offset, value) in [
         (3, 0),       // Invalid RX packet discriminator.
@@ -2491,7 +2990,8 @@ fn descriptor(frame: &[u8]) -> Vec<u8> {
     let mut packet = vec![0; 24];
     packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes()); // One MPDU, no BA aggregate.
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
-    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    let u2m = frame.get(4).is_some_and(|byte| byte & 1 == 0);
+    packet[12..16].copy_from_slice(&((6u32 << 8) | u32::from(u2m) << 16).to_le_bytes());
     packet.extend_from_slice(frame);
     packet
 }
@@ -2559,9 +3059,10 @@ kernel_test_in!(
     mt76_eapol_rx_requires_native_peer_and_declared_pdu
 );
 
-fn secure_model() -> Session<Model> {
+#[inline(never)]
+fn secure_model() -> NativeSession {
     use crate::mt7921::association::{JoinPlan, Security};
-    let mut session = Session::new(Model::new(), firmware(32));
+    let mut session = alloc::boxed::Box::new(Session::new(Model::new(), firmware(32)));
     run(session.run()).unwrap();
     let info = run(session.initialize_radio()).unwrap();
     let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
@@ -2610,8 +3111,8 @@ fn secure_model() -> Session<Model> {
         })
         .unwrap();
     security.port_open = true; // This helper explicitly synthesizes an installed test port.
-    session.security = Some(security);
-    session.station_permission = Some(test_permission());
+    session.station.security = Some(security);
+    session.station.permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: bss.bssid,
@@ -2835,7 +3336,7 @@ fn mt76_retained_key_work_survives_waiter_drop_and_sync_poll_progresses() -> Tes
     };
     if result.is_err()
         || !matches!(session.state, State::Associated { .. })
-        || session.security.is_none()
+        || session.station.security.is_none()
         || session.keys_pending()
     {
         return TestResult::Fail("cancelled waiter lost RSNA state or transport owner");
@@ -2864,15 +3365,15 @@ fn mt76_peer_disconnect_stops_data_and_teardown_requires_firmware_ack() -> TestR
     session.backend.packets.push_back(other);
     session.backend.packets.push_back(valid);
     if session.receive_ethernet() != Err(Error::DeviceGone)
-        || !session.peer_lost
+        || !session.station.peer_lost
         || !matches!(session.step_network(None), Err(Error::DeviceGone))
     {
         return TestResult::Fail("peer deauthentication did not close the packet path");
     }
     if run(session.disassociate_station()).is_err()
         || !matches!(session.state, State::ScanReady(_))
-        || session.peer_lost
-        || session.security.is_some()
+        || session.station.peer_lost
+        || session.station.security.is_some()
     {
         return TestResult::Fail("acknowledged peer/key cleanup did not restore scan-ready state");
     }
@@ -2966,8 +3467,8 @@ fn mt76_reset_recovers_cancelled_dma_then_requires_fresh_station() -> TestResult
             ]
         || trace[3].1.saturating_sub(trace[2].1) < 50_000_000
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
-        || session.station_bss.is_some()
+        || session.station.security.is_some()
+        || session.station.bss.is_some()
         || !session.data_pending.is_empty()
         || !session.events.is_empty()
         || !session.backend.packets.is_empty()
@@ -3051,7 +3552,7 @@ fn mt76_owned_reset_survives_cancelled_waiter() -> TestResult {
     };
     if result.is_err()
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return TestResult::Fail(
             "retained reset completion lost the owner or reopened the old port",
@@ -3068,7 +3569,7 @@ fn mt76_reset_rejects_changed_radio_identity() -> TestResult {
     let mut session = secure_model();
     if run(session.recover([0; 6])) != Err(Error::Bounds)
         || !matches!(session.state, State::Associated { .. })
-        || session.security.is_none()
+        || session.station.security.is_none()
     {
         return TestResult::Fail("invalid reset identity mutated a live station");
     }
@@ -3080,7 +3581,7 @@ fn mt76_reset_rejects_changed_radio_identity() -> TestResult {
                 ..
             }
         )
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return TestResult::Fail("changed post-reset MAC reused an existing network interface");
     }
@@ -3100,7 +3601,7 @@ fn mt76_unregistered_boot_failure_can_recover_before_mac_discovery() -> TestResu
     }
     if run(session.recover_unregistered()).is_err()
         || !matches!(session.state, State::RadioReady(_))
-        || session.security.is_some()
+        || session.station.security.is_some()
     {
         return TestResult::Fail(
             "initial boot failure could not establish a fresh unregistered radio",
@@ -3135,9 +3636,13 @@ fn mt76_dual_band_scan_encodes_extension_and_rejects_6ghz_aliases() -> TestResul
     }
     for channel in [6, 36] {
         let mut packet = scan_beacon(channel, b"narf");
-        packet[14] |= 1; // RXD3 CH_FREQ bit8: 6 GHz, never a 2.4/5 GHz alias.
+        packet[14] |= 1; // Actual RXD3 ADDR_TYPE=U2M, separate from CH_FREQ.
+        if scan::beacon(&packet, 2).is_none_or(|bss| bss.channel != channel || bss.band.is_some()) {
+            return TestResult::Fail("unicast address type contaminated the native channel");
+        }
+        packet[13] = 181; // Actual 6GHz channel1 RX tag, not a ninth channel bit.
         if scan::beacon(&packet, 2).is_some() {
-            return TestResult::Fail("6 GHz RX channel truncated to legacy channel");
+            return TestResult::Fail("real6GHz RX tag aliased the legacy DS channel");
         }
     }
     let permit = test_permission_for(36);
@@ -3192,7 +3697,7 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
         }
         for frequency in [
             if channel == 6 { 36u16 } else { 6 },
-            0x100 | u16::from(channel),
+            181, // Actual6GHz channel1 tag; RXD3 bit16 is U2M, not channel.
             0,
         ] {
             let mut invalid = ccmp_packet(100, 0, false);
@@ -3200,7 +3705,7 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
             session.backend.packets.push_back(invalid);
         }
         let mut good = ccmp_packet(1, 0, false);
-        good[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+        good[12..16].copy_from_slice(&((u32::from(channel) << 8) | 1 << 16).to_le_bytes());
         session.backend.packets.push_back(good);
         if !matches!(session.receive_ethernet(), Ok(Some(_))) || !session.backend.packets.is_empty()
         {
@@ -3210,7 +3715,7 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
         let peer = [2, 1, 2, 3, 4, 5];
         let pdu = narf_wireless::eapol::KeyFrame::empty(16).into_eapol();
         let mut eapol = descriptor(&ap_eapol_frame(own, peer, &pdu));
-        eapol[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+        eapol[12..16].copy_from_slice(&((u32::from(channel) << 8) | 1 << 16).to_le_bytes());
         if join::peer_eapol(&eapol, own, peer, channel) != Some(pdu.as_slice())
             || join::peer_eapol(&eapol, own, peer, if channel == 6 { 36 } else { 6 }).is_some()
         {
@@ -3257,7 +3762,7 @@ fn mt76_rekey_nonce_failure_closes_authorization_before_reply() -> TestResult {
     session.backend.entropy_fail = true;
     if run(session.service_keys()) != Err(Error::EntropyUnavailable)
         || session.backend.frames.len() != sent
-        || session.security.is_some()
+        || session.station.security.is_some()
         || !matches!(
             session.state,
             State::Failed {

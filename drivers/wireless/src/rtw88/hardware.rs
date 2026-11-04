@@ -22,17 +22,17 @@ impl Features {
             protocol: ((word >> 26) & 3) as u8,
         }
     }
-    pub(super) fn read(io: &mut impl Io) -> Result<Self, Error> {
+    pub(super) async fn read(io: &mut impl Io) -> Result<Self, Error> {
         // Native claim writes0xfd before MCU boot, replacing any old report.
         // A successful firmware boot alone cannot fabricate this0x19 receipt.
-        if io.read8(0x1a0)? != 0x19 {
+        if io.read8(0x1a0).await? != 0x19 {
             return Err(Error::Prerequisite);
         }
         let mut raw = [0; 13];
         for (index, byte) in raw.iter_mut().enumerate() {
-            *byte = io.read8(0x1a2 + index as u16)?;
+            *byte = io.read8(0x1a2 + index as u16).await?;
         }
-        io.write8(0x1a0, 0)?;
+        io.write8(0x1a0, 0).await?;
         Ok(Self::decode(raw))
     }
 }

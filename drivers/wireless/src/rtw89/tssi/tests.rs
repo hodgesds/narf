@@ -316,11 +316,19 @@ pub(in crate::rtw89) fn tracking(custom: bool) -> Tracking {
         Tracking {
             up: core::array::from_fn(|p| core::array::from_fn(|i| [11, 9][p] * 3 + i as i8 - 64)),
             down: core::array::from_fn(|p| core::array::from_fn(|i| [10, 8][p] * 3 + i as i8 - 64)),
+            up5: core::array::from_fn(|p| {
+                core::array::from_fn(|b| core::array::from_fn(|i| [7, 5][p] + b as i8 + i as i8))
+            }),
+            down5: core::array::from_fn(|p| {
+                core::array::from_fn(|b| core::array::from_fn(|i| [6, 4][p] - b as i8 - i as i8))
+            }),
         }
     } else {
         Tracking {
             up: [tables::A_P, tables::B_P],
             down: [tables::A_N, tables::B_N],
+            up5: [tables::A_P_5G, tables::B_P_5G],
+            down5: [tables::A_N_5G, tables::B_N_5G],
         }
     }
 }

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use narf_net::Interface;
 
 pub mod amsdu;
+pub mod ap_control;
 pub mod association;
 pub mod caps;
 pub mod ccmp;
@@ -17,8 +18,10 @@ pub mod iface;
 pub mod mfp;
 pub mod mgmt_defrag;
 pub mod mlme;
+pub mod monitor;
 pub mod nl80211;
 pub mod packet_key;
+pub mod reconnect;
 pub mod reg;
 pub mod reorder;
 pub mod rsn;
@@ -67,6 +70,59 @@ pub struct IftypeExtendedCapability {
     pub iftype: u32,
     pub capabilities: Vec<u8>,
     pub mask: Vec<u8>,
+    /// `wiphy_iftype_ext_capab::eml_capabilities` (EML Capabilities
+    /// subfield of the Basic MLE this interface type requests with).
+    /// Emitted as `NL80211_ATTR_EML_CAPABILITY` only on a wiphy that
+    /// reports [`WirelessNetIface::supports_mlo`].
+    pub eml_capabilities: u16,
+    /// `mld_capa_and_ops` (`NL80211_ATTR_MLD_CAPA_AND_OPS`), likewise only
+    /// on an MLO wiphy.
+    pub mld_capa_and_ops: u16,
+    /// `ext_mld_capa_and_ops` (`NL80211_ATTR_EXT_MLD_CAPA_AND_OPS`), on an
+    /// MLO wiphy and only when non-zero.
+    pub ext_mld_capa_and_ops: u16,
+}
+
+/// The operating channel of one MLO link (`struct cfg80211_chan_def` as
+/// `nl80211_send_chandef` reports it). `width` is an
+/// `enum nl80211_chan_width` value (20_NOHT=0, 20=1, 40=2, 80=3, 160=5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkChannel {
+    pub frequency_mhz: u32,
+    pub width: u32,
+    pub center_freq1_mhz: u32,
+    /// Zero when the width has no second segment.
+    pub center_freq2_mhz: u32,
+}
+
+/// One requested link of a multi-link station connection
+/// (`cfg80211_connect_resp_params::links[]`, then `wdev->links[]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MloLink {
+    pub link_id: u8,
+    /// Our affiliated STA's link address (`links[id].addr`).
+    pub address: [u8; 6],
+    /// The affiliated AP's BSSID (`links[id].bssid`).
+    pub bssid: [u8; 6],
+    /// The association response's status for this link: 0 for an accepted
+    /// (valid) link, else the per-STA profile status code.
+    pub status: u16,
+    /// The negotiated operating channel of an accepted link.
+    pub channel: Option<LinkChannel>,
+}
+
+/// A connected multi-link (MLO) station: what cfg80211 learns from
+/// `cfg80211_connect_done` with `valid_links` (sme.c
+/// `__cfg80211_connect_result`). `links` names every requested link,
+/// association link included, in ascending link-id order; rejected links
+/// carry their non-zero status and are reported only by the CONNECT event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MloConnection {
+    /// The AP MLD MAC address (`ap_mld_addr`, the station's peer address).
+    pub ap_mld: [u8; 6],
+    /// The link the association exchange ran on (`sta->deflink.link_id`).
+    pub assoc_link_id: u8,
+    pub links: Vec<MloLink>,
 }
 
 /// Wiphy-wide Extended Capabilities (`NL80211_ATTR_EXT_CAPA` and its mask).
@@ -223,6 +279,15 @@ pub trait WirelessNetIface: Interface {
     /// interfaces (`NL80211_CMD_NEW_INTERFACE`).
     fn supports_virtual_interfaces(&self) -> bool {
         false
+    }
+
+    /// The family's actual P2P role subset for wiphy advertisement. This is
+    /// consulted only when WirelessModes::P2P is present; values outside
+    /// CLIENT8/GO9/DEVICE10 and duplicates are ignored. The default retains
+    /// the historical complete P2P advertisement, including its wire order.
+    /// A device-only native implementation must return just DEVICE10.
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        alloc::vec![10, 8, 9]
     }
 
     /// Valid simultaneous virtual-interface sets for this physical wiphy.
@@ -511,6 +576,45 @@ pub trait WirelessNetIface: Interface {
         Err(WirelessError::NotSupported)
     }
 
+    /// Opt into source-bound, receipt-complete control-only NEW/DEL. Legacy
+    /// virtual-netdev callbacks retain their existing synchronous path.
+    fn async_control_interfaces(&self) -> bool {
+        false
+    }
+    /// Bitmask (`1 << NL80211_IFTYPE_*`) of the `NEW_INTERFACE` iftypes
+    /// routed to [`Self::new_control_interface_async`] when
+    /// [`Self::async_control_interfaces`] is true; the remaining iftypes
+    /// keep the legacy [`Self::new_virtual_interface`] path. The same mask,
+    /// tested with the selected object's current iftype, picks the
+    /// `DEL_INTERFACE` path. The default routes every iftype async, so a
+    /// radio that opts into control-only interfaces without overriding this
+    /// behaves exactly as before the mask existed.
+    fn async_control_iftypes(&self) -> u32 {
+        u32::MAX
+    }
+    async fn new_control_interface_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _name: &str,
+        _iftype: u32,
+        _mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// Native teardown must be retained beyond cancellation of this borrowed
+    /// waiter. Only actual native retirement may produce the typed receipt.
+    async fn delete_control_interface_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+    ) -> Result<ap_control::RadioControlRetirement, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// Trusted metadata cleanup after unpublished NEW or completed native
+    /// DEL. No hardware wait, RF action or native-resource retirement is
+    /// permitted here. Called outside registry locks and idempotent for the
+    /// exact object, never a same-name successor.
+    fn release_control_metadata(&self) {}
+
     /// Actual supported HT/VHT capabilities for a band (2400, 5000, or
     /// 6000 MHz). Six-GHz devices expose HE through their driver-specific
     /// capability path until this generic interface gains an HE body.
@@ -555,6 +659,28 @@ pub trait WirelessNetIface: Interface {
     /// driver may offload the PSK 4-way handshake without doing SAE.
     fn supports_sae_offload(&self) -> bool {
         false
+    }
+
+    /// `WIPHY_FLAG_SUPPORTS_MLO`: the station side can associate as a
+    /// non-AP MLD over several links (GET_WIPHY `NL80211_ATTR_MLO_SUPPORT`).
+    fn supports_mlo(&self) -> bool {
+        false
+    }
+
+    /// CONNECT carrying `NL80211_ATTR_MLO_SUPPORT` (`CONNECT_REQ_MLO_SUPPORT`):
+    /// userspace handles MLD links, so the driver may request further links
+    /// of the selected BSS's AP MLD. Without it the driver "shall disable
+    /// MLO features for the current association" and nl80211 calls
+    /// [`associate`](Self::associate). The default ignores the permission.
+    async fn associate_mlo(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        self.associate(req).await
+    }
+
+    /// The current multi-link connection made through
+    /// [`associate_mlo`](Self::associate_mlo), if any. `None` for every
+    /// non-MLO association, whose peer is [`connected_bssid`](Self::connected_bssid).
+    fn mlo_connection(&self) -> Option<MloConnection> {
+        None
     }
 
     /// Driver emits nl80211 link-loss notifications, including local teardown.
@@ -621,6 +747,18 @@ pub trait WirelessNetIface: Interface {
     fn supports_userspace_mlme(&self) -> bool {
         false
     }
+    /// AP userspace authentication/association management without changing
+    /// the station SME/handshake-offload contract of this physical device.
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        self.supports_ap() && self.supports_userspace_mlme()
+    }
+    /// Actual device/firmware AP SME capabilities (NL80211_ATTR_DEVICE_AP_SME).
+    /// None advertises no device AP SME; Some(0) promises a native AP SME
+    /// without optional offloads.
+    /// This does not offload the WPA authenticator, keys or controlled port.
+    fn ap_sme_capabilities(&self) -> Option<u32> {
+        None
+    }
 
     /// Send an Authentication frame and return the peer's response frame,
     /// delivered to userspace as NL80211_CMD_AUTHENTICATE.
@@ -669,6 +807,31 @@ pub trait WirelessNetIface: Interface {
     /// whether it was acknowledged, for NL80211_CMD_FRAME_TX_STATUS.
     async fn mgmt_tx(&self, _cookie: u64, _req: MgmtTxRequest) -> Result<bool, WirelessError> {
         Err(WirelessError::NotSupported)
+    }
+    /// Native AP userspace-SME counterpart. This uses the same synchronous
+    /// control reservation and exact source/interface guard as AP lifecycle
+    /// operations; completion must report actual native peer ACK status.
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        cookie: u64,
+        request: MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        authority.check_for(self)?;
+        let result = self.mgmt_tx(cookie, request).await;
+        authority.check_for(self)?;
+        result
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        frame_type: u16,
+        match_prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.register_mgmt_frame(frame_type, &match_prefix);
+        authority.check_for(self)?;
+        result
     }
 
     /// Maximum `NL80211_CMD_REMAIN_ON_CHANNEL` duration in milliseconds.
@@ -768,6 +931,21 @@ pub trait WirelessNetIface: Interface {
         Err(WirelessError::NotSupported)
     }
 
+    /// Validate an explicitly supplied nl80211 MONITOR_FLAGS mask before
+    /// changing mode. Absence uses the driver's documented default capture
+    /// profile. Unsupported active/injection or error-frame requests must
+    /// fail rather than silently accepting a weaker/different profile.
+    fn validate_monitor_flags(&self, _flags: u32) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Configure a receive-only monitor channel while administratively down.
+    /// Existing interface-control authority gates the caller. The driver
+    /// retains the selection; admin-UP starts native capture asynchronously.
+    fn set_monitor_channel(&self, _channel: monitor::Channel) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
     /// Whether this station interface supports `NL80211_ATTR_4ADDR`.
     /// cfg80211's `WIPHY_FLAG_4ADDR_STATION` is an internal driver
     /// capability; nl80211 exposes the selected state in each interface
@@ -789,6 +967,322 @@ pub trait WirelessNetIface: Interface {
     /// state for future association and recovery and updates a live BSS peer
     /// through its ordered control path.
     fn set_four_addr(&self, _enabled: bool) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Opt into native terminal-completion AP controls and identify this
+    /// interface's current mode generation. An opting-in driver increments
+    /// the nonzero generation on every mode/identity replacement; it never
+    /// wraps into an old generation. Legacy queued-control drivers return
+    /// None and keep their existing synchronous admission contract.
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        None
+    }
+    /// Optional synchronous native-control admission. This serializes the
+    /// original request before its async callback is first polled; it is not
+    /// an administrative capability or a native completion receipt.
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn ap_control::ApControlReservation>>, WirelessError> {
+        Ok(None)
+    }
+    /// Native radio/CNM/P2P controls opt in independently of AP lifecycle.
+    /// The current mode/identity generation never wraps; legacy ROC drivers
+    /// keep None and retain their existing admission/completion contract.
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        None
+    }
+    /// Actual native serialization, supplementing current delegated grants.
+    /// A driver sharing its physical owner with AP must share that AP lease.
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn ap_control::ApControlReservation>>, WirelessError> {
+        Ok(None)
+    }
+
+    /// A real control-only P2P-device supports explicit native start/stop.
+    /// Creating/discovering its WDEV supplies neither a started BSS nor RF
+    /// permission. The exact current request remains required throughout.
+    fn async_p2p_device_control(&self) -> bool {
+        false
+    }
+    /// Register host management filters on an actual control WDEV. This
+    /// metadata operation may precede START and grants no RF/capture owner.
+    fn async_p2p_management_rx_control(&self) -> bool {
+        false
+    }
+    /// Source-bound native FRAME on a control-only WDEV. Native started
+    /// BSS, channel, transmit policy and actual ACK proof remain driver-owned.
+    fn async_p2p_management_tx_control(&self) -> bool {
+        false
+    }
+    /// Opt an actual managed netdev into source-bound native FRAME. Legacy
+    /// station/AP handlers retain their existing route; this is independent
+    /// of the control-only P2P-device opt-in above.
+    fn async_radio_management_tx_control(&self) -> bool {
+        false
+    }
+    /// Source-bound management subscription on a real managed netdev.
+    /// Metadata registration itself grants no channel/capture/key authority.
+    fn async_radio_management_rx_control(&self) -> bool {
+        false
+    }
+    /// Source-bound management TX on an actual P2P CLIENT8/GO9 netdev.
+    /// This is independent of managed2/control10 and grants no role or RF.
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        false
+    }
+    /// Management subscriptions on an implemented actual CLIENT8/GO9
+    /// netdev. Original source, administrative UP and role epochs remain.
+    fn async_p2p_netdev_management_rx_control(&self) -> bool {
+        false
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _cookie: u64,
+        _request: MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _frame_type: u16,
+        _prefix: &[u8],
+    ) -> Result<(), i32> {
+        Err(95)
+    }
+    async fn start_p2p_device_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn stop_p2p_device_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// Native ROC completion is independent of P2P-device creation/start.
+    /// Legacy drivers keep their existing synchronous queued-ROC contract.
+    fn async_roc_control(&self) -> bool {
+        false
+    }
+    async fn remain_on_channel_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _cookie: u64,
+        _frequency_mhz: u32,
+        _duration_ms: u32,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn cancel_remain_on_channel_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _cookie: u64,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// `NL80211_CMD_TRIGGER_SCAN` addressed by `NL80211_ATTR_WDEV` to an
+    /// actual control-only P2P_DEVICE WDEV (Linux `nl80211_trigger_scan`
+    /// → `rdev_scan` with the P2P_DEVICE `wdev`). Off by default: such a
+    /// WDEV scan is then refused with `-EOPNOTSUPP`, and every ifindex scan
+    /// keeps `scan`/`scan_with_flags`.
+    fn async_p2p_device_scan_control(&self) -> bool {
+        false
+    }
+    /// The WDEV scan itself, bound to the exact current request. Returned
+    /// BSSes are this WDEV's scan results; their IEs come from
+    /// `scan_information_elements` on the same WDEV.
+    async fn p2p_device_scan_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Opt into scheduled-scan acknowledgements after native completion.
+    /// This flag supplies no grant: radio_control_generation and the actual
+    /// serialized reserve_radio_control lease still bind every request.
+    fn async_sched_scan_control(&self) -> bool {
+        false
+    }
+    /// Native scheduled scans may return every admitted BSS without SSID
+    /// profiles. Existing network-detect-only drivers require match sets.
+    fn sched_scan_pass_all(&self) -> bool {
+        false
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &ap_control::RadioControlAuthority,
+        request: SchedScanRequest,
+    ) -> Result<(), i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?; // EPERM
+        let result = self.start_sched_scan(request);
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?;
+        result
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?; // EPERM
+        let result = self.stop_sched_scan();
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?;
+        result
+    }
+
+    /// Native terminal-completion counterparts. The request guard must stay
+    /// current through every awaited command and final state publication;
+    /// drivers retain cancellation cleanup even if the borrowed waiter is
+    /// dropped. Defaults adapt synchronous implementations only; nl80211
+    /// selects this path solely for an explicit generation opt-in.
+    async fn start_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        config: ApConfig,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.start_ap(config);
+        authority.check_for(self)?;
+        result
+    }
+    /// Preserve actual START_AP crypto/control-port attributes for a native
+    /// userspace authenticator. Drivers that only adapt the historic AP
+    /// callback refuse additional settings rather than silently discarding them.
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        config: ApConfig,
+        settings: ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        if settings != ApStartSettings::default() {
+            return Err(WirelessError::NotSupported);
+        }
+        self.start_ap_async(authority, config).await
+    }
+    /// Implemented P2P GO CTWindow/OPPPS START and live-update contract.
+    /// Native callbacks must retain actual mode9/source and receipts; the
+    /// default preserves existing drivers' advertisement and behavior.
+    fn supports_p2p_go_power_save(&self) -> bool {
+        false
+    }
+    async fn set_p2p_go_power_save_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        settings: P2pGoPowerSave,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        authority.require_up()?;
+        settings.validate()?;
+        Err(WirelessError::NotSupported)
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.stop_ap();
+        authority.check_for(self)?;
+        result
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe_resp: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.set_beacon(head, tail, probe_resp);
+        authority.check_for(self)?;
+        result
+    }
+    async fn add_station_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        station: StationConfig,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.add_station(station);
+        authority.check_for(self)?;
+        result
+    }
+    async fn set_station_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        station: StationConfig,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.set_station(station);
+        authority.check_for(self)?;
+        result
+    }
+    async fn del_station_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        reason: u16,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.del_station(peer, reason);
+        authority.check_for(self)?;
+        result
+    }
+    /// Native AP key controls own zeroizing staging before construction of
+    /// their async callback. A queue entry supplies no installed-key receipt.
+    async fn add_key_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _key: OwnedKey,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    async fn del_key_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _index: u8,
+        _pairwise: bool,
+        _peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    /// Snapshot the actual installed AP transmit PN/IPN under the original
+    /// caller, role, source and key lifetime. Includes consumed unsent PNs;
+    /// it is never a receive replay counter or an inferred firmware value.
+    async fn key_sequence_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _index: u8,
+        _pairwise: bool,
+        _peer: Option<[u8; 6]>,
+    ) -> Result<KeySequence, i32> {
+        Err(EOPNOTSUPP)
+    }
+    async fn default_key_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _index: u8,
+        _unicast: bool,
+        _multicast: bool,
+        _management: bool,
+        _beacon: bool,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _request: ControlPortTxRequest,
+    ) -> Result<bool, i32> {
         Err(EOPNOTSUPP)
     }
 
@@ -896,6 +1390,19 @@ pub trait WirelessNetIface: Interface {
     fn supports_external_supplicant(&self) -> bool {
         false
     }
+    /// Physical AP key/control-port operations, independently of managed
+    /// station SecurityConfig::External admission. Report this before mode
+    /// selection only when the actual AP key/control path is complete.
+    fn supports_ap_authenticator(&self) -> bool {
+        self.supports_ap() && self.supports_external_supplicant()
+    }
+    /// Opt in only with an actual installed-key transmit-sequence owner.
+    fn supports_ap_key_sequence(&self) -> bool {
+        false
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        self.supports_external_supplicant()
+    }
 
     /// The control-port TX path retains `IEEE80211_TX_CTL_REQ_TX_STATUS`
     /// through its asynchronous completion path and therefore exposes
@@ -957,6 +1464,18 @@ pub trait WirelessNetIface: Interface {
     /// Absence means `GET/SET_WOWLAN` must return `-EOPNOTSUPP`.
     fn wowlan_support(&self) -> Option<WowlanSupport> {
         None
+    }
+
+    /// Per-family NET_DETECT bounds. These do not create an offload
+    /// capability; `wowlan_support` must also advertise network detection.
+    /// The default preserves the existing ath11k low-power scan profile.
+    fn wowlan_net_detect_limits(&self) -> Option<SchedScanSupport> {
+        let support = self.wowlan_support()?;
+        (support.net_detect_max_match_sets != 0).then_some(SchedScanSupport {
+            max_match_sets: support.net_detect_max_match_sets,
+            random_mac: support.net_detect_random_mac,
+            ..SchedScanSupport::NET_DETECT
+        })
     }
 
     /// `nl80211_set_wowlan`: retain a validated wake configuration until a
@@ -1174,6 +1693,76 @@ pub struct KeyParams {
     /// `NL80211_ATTR_KEY_DEFAULT_MGMT`: this IGTK is the AP's selected
     /// transmit management key. Meaningful only for a non-pairwise IGTK.
     pub default_mgmt: bool,
+}
+
+/// Sequence-only GET_KEY result. No temporal key material is exported.
+/// `seq` is the installed key's actual 48-bit transmit PN/IPN in wire
+/// little-endian order; zero is valid for a freshly installed unused key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeySequence {
+    pub cipher: u32,
+    pub seq: [u8; 6],
+}
+
+/// Opaque owned staging for a native asynchronous key operation. Creation
+/// belongs to synchronous admission, so an unpolled future also erases its
+/// key/RSC on drop. Access supplies bytes, never installed-key authority.
+#[derive(Debug)]
+pub struct OwnedKey(KeyParams);
+impl OwnedKey {
+    pub fn new(params: KeyParams) -> Self {
+        Self(params)
+    }
+    pub fn params(&self) -> &KeyParams {
+        &self.0
+    }
+}
+impl Drop for OwnedKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.key.zeroize();
+        self.0.seq.zeroize();
+    }
+}
+
+/// An actual admitted control-port PDU, separate from ordinary Ethernet TX.
+/// Staging is zeroizing before any asynchronous callback is constructed.
+pub struct ControlPortTxRequest {
+    pub dest: [u8; 6],
+    pub ethertype: u16,
+    pub no_encrypt: bool,
+    pub wait_for_ack: bool,
+    pdu: zeroize::Zeroizing<Vec<u8>>,
+}
+impl ControlPortTxRequest {
+    pub fn new(
+        dest: [u8; 6],
+        ethertype: u16,
+        pdu: Vec<u8>,
+        no_encrypt: bool,
+        wait_for_ack: bool,
+    ) -> Self {
+        Self {
+            dest,
+            ethertype,
+            pdu: zeroize::Zeroizing::new(pdu),
+            no_encrypt,
+            wait_for_ack,
+        }
+    }
+    pub fn pdu(&self) -> &[u8] {
+        &self.pdu
+    }
+}
+impl core::fmt::Debug for ControlPortTxRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ControlPortTxRequest")
+            .field("dest", &self.dest)
+            .field("ethertype", &self.ethertype)
+            .field("length", &self.pdu.len())
+            .field("wait_for_ack", &self.wait_for_ack)
+            .finish_non_exhaustive()
+    }
 }
 
 /// GTK rekey material from `NL80211_CMD_SET_REKEY_OFFLOAD` /
@@ -1492,12 +2081,14 @@ pub struct MlmeAssocRequest {
 /// A management frame to transmit (NL80211_CMD_FRAME). `frequency_mhz` 0
 /// means the current operating channel; otherwise it preserves the exact
 /// `NL80211_ATTR_WIPHY_FREQ` identity. `offchannel_ok` permits off-channel
-/// transmission for the given `duration` (milliseconds).
+/// transmission for the given `duration` (milliseconds). `no_cck` preserves
+/// `NL80211_ATTR_TX_NO_CCK_RATE`: management TX must avoid CCK at 2.4GHz.
 pub struct MgmtTxRequest {
     pub frequency_mhz: u32,
     pub frame: Vec<u8>,
     pub offchannel_ok: bool,
     pub duration: u32,
+    pub no_cck: bool,
 }
 
 /// Access-Point configuration for NL80211_CMD_START_AP. `beacon_head` is the
@@ -1556,6 +2147,37 @@ pub struct ApConfig {
     pub he_obss_pd: Option<HeObssPdConfig>,
     /// Optional `NL80211_ATTR_HE_BSS_COLOR` state for an HE AP.
     pub he_bss_color: Option<HeBssColorConfig>,
+}
+
+/// Actual optional nl80211 START_AP crypto metadata, distinct from the
+/// on-air beacon RSNE. A native driver checks agreement before publication.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApStartSettings {
+    pub auth_type: Option<u32>,
+    pub wpa_versions: Option<u32>,
+    pub pairwise_ciphers: Option<Vec<u32>>,
+    pub group_cipher: Option<u32>,
+    pub akms: Option<Vec<u32>>,
+    pub control_port: ControlPort,
+    /// Actual optional P2P GO CTWindow/OPPPS metadata. Ordinary APs and
+    /// drivers without the explicit native contract refuse these fields.
+    pub p2p_go: Option<P2pGoPowerSave>,
+}
+
+/// Bounded P2P GO part of START_AP/SET_BSS. None preserves a live value;
+/// Some(0)/Some(false) is an explicit reset, not an omitted attribute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct P2pGoPowerSave {
+    pub ctwindow_tu: Option<u8>,
+    pub opportunistic: Option<bool>,
+}
+impl P2pGoPowerSave {
+    pub fn validate(&self) -> Result<(), WirelessError> {
+        if self.ctwindow_tu.is_some_and(|window| window > 127) {
+            return Err(WirelessError::InvalidArgs);
+        }
+        Ok(())
+    }
 }
 
 /// Request-side `NL80211_ATTR_MBSSID_CONFIG`. `index == 0` is the
@@ -1792,52 +2414,8 @@ pub struct StationConfig {
     pub station_tx_power: Option<StationTxPower>,
 }
 
-pub mod registry {
-    use super::*;
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
-    use narf_lib::sync::IrqSafeSpinLock;
-
-    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn WirelessNetIface>>> =
-        IrqSafeSpinLock::new(Vec::new());
-
-    pub fn register(iface: Arc<dyn WirelessNetIface>) {
-        REGISTRY.lock().push(iface);
-    }
-
-    pub fn list() -> Vec<Arc<dyn WirelessNetIface>> {
-        REGISTRY.lock().clone()
-    }
-
-    /// One representative per physical radio, in the stable order nl80211
-    /// exposes as `phyN`.  Multiple virtual interfaces with the same
-    /// [`WirelessNetIface::wiphy_id`] must never produce duplicate wiphys.
-    pub fn wiphys() -> Vec<Arc<dyn WirelessNetIface>> {
-        let mut ids = Vec::new();
-        let mut out = Vec::new();
-        for iface in REGISTRY.lock().iter() {
-            let id = iface.wiphy_id();
-            if !ids.contains(&id) {
-                ids.push(id);
-                out.push(iface.clone());
-            }
-        }
-        out
-    }
-
-    /// Current `phyN` index of a physical radio identity.
-    pub fn wiphy_index(id: u64) -> Option<u32> {
-        wiphys()
-            .iter()
-            .position(|iface| iface.wiphy_id() == id)
-            .map(|index| index as u32)
-    }
-
-    /// Remove the interface named `name` (its netdev went away).
-    pub fn unregister(name: &str) {
-        REGISTRY.lock().retain(|i| i.name() != name);
-    }
-}
+#[path = "wdev_registry.rs"]
+pub mod registry;
 
 /// Force-link hook.
 pub fn register_initcalls() {

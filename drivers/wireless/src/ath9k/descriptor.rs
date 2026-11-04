@@ -19,6 +19,10 @@
 use super::rates::{Feedback, Series};
 use alloc::vec::Vec;
 
+#[path = "descriptor_ps.rs"]
+mod power_save;
+pub(super) use power_save::{receive_ps, transmit_ps, unmark as ps_unmark};
+
 pub(super) const WORDS: usize = 24;
 pub(super) const BYTES: usize = WORDS * 4;
 pub(super) const MAX_MPDU: usize = 2304;
@@ -208,6 +212,12 @@ pub(super) fn transmit_ht_tid(
         group,
         true,
     )?;
+    if profile.geometry().is_wide() {
+        words[6] = profile
+            .duration(frame.len() + 4, mcs)
+            .ok_or(Error::Profile)?;
+        words[9] |= 1 | (u32::from(profile.tx_sgi40()) << 1);
+    }
     if profile.rts() && !group {
         // Linux ath_buf_set_rate + set11nPktDurRTSCTS: native packet duration
         // remains the DATA duration; hardware forms RTS/CTS NAV itself.
@@ -276,49 +286,66 @@ pub(super) fn transmit_bar(
         false,
     )
 }
-pub(super) struct PairAddresses {
-    pub payloads: [u64; 2],
-    pub tail: u64,
+pub(super) struct AggregateAddresses<'a> {
+    pub payloads: &'a [u64],
+    pub descriptors: &'a [u64],
 }
-pub(super) fn transmit_pair(
-    frames: [&[u8]; 2],
+pub(super) fn transmit_aggregate(
+    frames: &[Vec<u8>],
     local: [u8; 6],
-    addresses: PairAddresses,
+    addresses: AggregateAddresses<'_>,
     mcs: u8,
     basic: usize,
     profile: super::ht::Profile,
-    permit: super::tx_ba::PairPermit,
-) -> Result<[[u32; WORDS]; 2], Error> {
-    if addresses.tail == 0 || addresses.tail & 3 != 0 || addresses.tail > u64::from(u32::MAX) {
+    permit: super::tx_ba::AggregatePermit,
+) -> Result<Vec<[u32; WORDS]>, Error> {
+    if frames.len() != permit.count
+        || !(2..=super::tx_ba::MAX_MEMBERS).contains(&frames.len())
+        || addresses.payloads.len() != frames.len()
+        || addresses.descriptors.len() != frames.len()
+        || addresses
+            .descriptors
+            .iter()
+            .any(|address| *address == 0 || address & 3 != 0 || *address > u64::from(u32::MAX))
+        || permit.air > 65535
+    {
         return Err(Error::Address);
     }
-    let mut first = transmit_ht(frames[0], local, addresses.payloads[0], mcs, basic, profile)?;
-    let encoded_last = transmit_ht(frames[1], local, addresses.payloads[1], mcs, basic, profile)?;
-    if frames
-        .iter()
-        .enumerate()
-        .any(|(i, f)| u16::from_le_bytes([f[22], f[23]]) >> 4 != permit.seq[i])
-    {
-        return Err(Error::Profile);
+    let mut words = Vec::with_capacity(frames.len());
+    for (index, frame) in frames.iter().enumerate() {
+        let encoded = transmit_ht(frame, local, addresses.payloads[index], mcs, basic, profile)?;
+        if u16::from_le_bytes([frame[22], frame[23]]) >> 4 != permit.seq[index] {
+            return Err(Error::Profile);
+        }
+        let mut member = if index == 0 {
+            encoded
+        } else {
+            let mut value = [0; WORDS];
+            value[1] = encoded[1];
+            value[2] = encoded[2];
+            value[3] = encoded[3];
+            value
+        };
+        member[3] |= 0x4000_0000; // IsAggr on every original.
+        if index + 1 < frames.len() {
+            member[0] = addresses.descriptors[index + 1] as u32;
+            member[3] |= 0x2000_0000; // MoreAggr, not 802.11 More Fragments.
+            member[8] = u32::from(permit.delims[index]) << 18;
+        }
+        if index == 0 {
+            member[8] |= permit.air as u32;
+            member[6] = profile.duration(permit.air, mcs).ok_or(Error::Profile)?
+                | if profile.rts() { 0x8000 } else { 0 };
+        }
+        words.push(member);
     }
-    first[0] = addresses.tail as u32;
-    first[3] |= 0x6000_0000;
-    first[8] = permit.air as u32 | (u32::from(permit.delims) << 18);
-    first[6] = (36
-        + 4 * (8 * permit.air as u32 + 22)
-            .div_ceil([26, 52, 78, 104, 156, 208, 234, 260][usize::from(mcs)]))
-        | if profile.rts() { 0x8000 } else { 0 };
-    let mut last = [0; WORDS];
-    last[1] = encoded_last[1];
-    last[2] = encoded_last[2];
-    last[3] = encoded_last[3] | 0x4000_0000;
-    Ok([first, last])
+    Ok(words)
 }
-pub(super) fn pair_status(
+pub(super) fn aggregate_status(
     first: &[u32; WORDS],
     tail: &[u32; WORDS],
-    seq: [u16; 2],
-) -> Result<([bool; 2], Feedback), Error> {
+    seq: &[u16],
+) -> Result<(Vec<bool>, Feedback), Error> {
     let mut status = *first;
     status[14..].copy_from_slice(&tail[14..]);
     let feedback = transmit_feedback(&status)?;
@@ -331,15 +358,17 @@ pub(super) fn pair_status(
         return Err(Error::Status);
     } // Source STA deaf/mute/reset case.
     if !txok || tail[TX_DONE] >> 28 != 0 {
-        return Ok(([false; 2], feedback));
+        return Ok((alloc::vec![false; seq.len()], feedback));
     }
     let start = ((tail[TX_DONE] >> 1) & 4095) as u16;
     let bitmap = u64::from(tail[17]) | (u64::from(tail[18]) << 32);
     Ok((
-        seq.map(|s| {
-            let i = s.wrapping_sub(start) & 4095;
-            i < 64 && bitmap & (1u64 << i) != 0
-        }),
+        seq.iter()
+            .map(|s| {
+                let index = s.wrapping_sub(start) & 4095;
+                index < 64 && bitmap & (1u64 << index) != 0
+            })
+            .collect(),
         feedback,
     ))
 }
@@ -381,7 +410,7 @@ fn encode_series(
     group: bool,
     ht: bool,
 ) -> Result<[u32; WORDS], Error> {
-    if !(20..=MAX_MPDU).contains(&length) {
+    if !(16..=MAX_MPDU).contains(&length) {
         return Err(Error::Length);
     }
     if address == 0
@@ -407,8 +436,8 @@ fn encode_series(
     // CTL/host-limited power is already programmed in the per-rate registers.
     words[2] = packet_length | (63 << 16) | (1 << 24);
     words[3] = (length + if ht { 2 } else { 0 }) as u32 | if group { 1 << 24 } else { 0 };
-    // Linux enables native duration/L-SIG update for every supported frame;
-    // the excluded PS-Poll profile is the sole upstream exception.
+    // Linux enables native duration/L-SIG update for ordinary frames. The
+    // separate source-qualified PS-Poll encoder clears it to preserve AID.
     words[4] = 0x8000;
     words[9] = u32::from(RATES[usize::from(series.basic)].1) << 20;
     for slot in 0..4 {
@@ -442,6 +471,29 @@ fn encode_series(
         }
     }
     Ok(words)
+}
+
+/// `xmit.c::ath_buf_set_rate` chain selection for a multi-chain AR9002 or AR5008
+/// part: on 2.4 GHz `ath_txchainmask_reduction` returns `ah->txchainmask`
+/// unchanged (its reductions are APM 5 GHz and AR9462 BT-coex CCK only), and
+/// `ar9002_set_txdesc` encodes it as `set11nChainSel` (ctl7 `AR_ChainSel0..3`)
+/// for every populated series. Aggregate middle/last descriptors, which carry
+/// no series, are left untouched as `ar9002_set_txdesc` never writes their
+/// ctl7.
+pub(super) fn select_chains(words: &mut [u32; WORDS], tx_chainmask: u8) -> Result<(), Error> {
+    // Up to the three AR5416/AR9160 chains (`AR_ChainSel` is three bits);
+    // the APM reduction is AR9003-only.
+    if !(1..=7).contains(&tx_chainmask) {
+        return Err(Error::Profile);
+    }
+    for slot in 0..4 {
+        if (words[4] >> (16 + slot * 4)) & 0xf == 0 {
+            break;
+        }
+        let shift = 2 + slot * 5;
+        words[9] = (words[9] & !(7 << shift)) | (u32::from(tx_chainmask) << shift);
+    }
+    Ok(())
 }
 
 pub(super) fn receive_descriptor(address: u64, next: u64) -> Result<[u32; WORDS], Error> {
@@ -540,27 +592,28 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 /// exact payload extent. KeyMiss is normal for protected host-CCMP frames;
 /// the MAC owner must have cleared the complete hardware key cache.
 pub(super) fn receive(words: &[u32; WORDS], payload: &[u8]) -> Result<Option<Mpdu>, Error> {
-    receive_inner(words, payload, None, false)
+    receive_inner(words, payload, None, false, false)
 }
 pub(super) fn receive_profile(
     words: &[u32; WORDS],
     payload: &[u8],
     profile: super::ht::Profile,
 ) -> Result<Option<Mpdu>, Error> {
-    receive_inner(words, payload, Some(profile), false)
+    receive_inner(words, payload, Some(profile), false, false)
 }
 pub(super) fn receive_ba(
     words: &[u32; WORDS],
     payload: &[u8],
     profile: super::ht::Profile,
 ) -> Result<Option<Mpdu>, Error> {
-    receive_inner(words, payload, Some(profile), true)
+    receive_inner(words, payload, Some(profile), true, false)
 }
 fn receive_inner(
     words: &[u32; WORDS],
     payload: &[u8],
     profile: Option<super::ht::Profile>,
     ba: bool,
+    ps: bool,
 ) -> Result<Option<Mpdu>, Error> {
     let ht = profile.is_some();
     let status = words[RX_DONE];
@@ -573,7 +626,7 @@ fn receive_inner(
     }
     if status & !(0x8000_0003 | if ba { 0x2003_0000 } else { 0 }) != 0
         || words[5] & 0x1000 != 0
-        || words[7] & 7 != 0
+        || words[7] & 4 != 0
         || !(if ba { 24 } else { 28 }..=if ht { 3887 } else { MAX_MPDU + 4 }).contains(&length)
     {
         return Ok(None);
@@ -593,6 +646,9 @@ fn receive_inner(
     let Some(rate) = rate else {
         return Ok(None);
     };
+    if words[7] & 3 != 0 && profile.is_none_or(|p| !p.accepts_rx(rate, words[7])) {
+        return Ok(None);
+    }
     // AR9002 status3 reports one-spatial-stream STBC in bit3. Admission is
     // directional: our source-bound RX capability plus the actual AP's
     // association-response TX_STBC, never the AP's RX capability alone.
@@ -644,9 +700,19 @@ fn receive_inner(
         && bytes.len() >= 28
         && (bytes[24] & 0x70 == 0 || ba && bytes[24] & 0x70 == 0x60)
         && bytes[25] == 0;
+    // Only the distinct S entry admits a native plaintext AP Null that
+    // can finish a PS-Poll wait. It never supplies DATA/crypto authority;
+    // Radio still requires exact current own/AP identities and pending wait.
+    let ps_null = ps
+        && bytes.len() == 24
+        && bytes[0] == 0x48
+        && bytes[1] & !0x20 == 2
+        && rate < 12
+        && !stbc
+        && aggregation == Aggregation::default();
     let legacy = match (fc >> 2) & 3 {
         0 => fc & 0x4300 == 0,
-        2 => fc & 0x03f0 == 0x0200 || qos,
+        2 => fc & 0x03f0 == 0x0200 || qos || ps_null,
         _ => false,
     };
     if !legacy || !qos && length > MAX_MPDU + 4 || rate >= 12 && (!ht || (fc >> 2) & 3 != 2) {

@@ -390,6 +390,34 @@ case!(wifi_fixture_legacy_rate_profile_wire_and_five_ghz_bounds, {
             "unsupported/DFS fixture channel"
         );
     }
+    for channel in [1, 2, 5, 17, 61, 93, 233, 253] {
+        let ap = FakeAp::open(PLAN, b"narf", 5, 42)
+            .unwrap()
+            .with_six_ghz_channel(channel)
+            .map_err(|_| "typed6GHz fixture geometry")?;
+        ensure!(
+            ap.channel_band() == (narf_wireless::association::channel::Band::Ghz6, channel)
+                && !ap.beacon()[36..].windows(3).any(|w| w == [3, 1, channel]),
+            "typed6GHz primary aliased legacy DS channel"
+        );
+        ensure!(
+            ap.with_basic_1mbps().is_err(),
+            "typed6GHz CCK fallback offered"
+        );
+    }
+    for channel in [0, 3, 4, 254, 255] {
+        ensure!(
+            FakeAp::open(PLAN, b"narf", 5, 42)
+                .unwrap()
+                .with_six_ghz_channel(channel)
+                .is_err(),
+            "typed6GHz invalid20MHz primary accepted"
+        );
+    }
+    ensure!(
+        FakeAp::open(PLAN, b"narf", 17, 42).is_err(),
+        "bare legacy fixture constructor inferred6GHz"
+    );
     for bad in [
         &[][..],
         &[2][..],

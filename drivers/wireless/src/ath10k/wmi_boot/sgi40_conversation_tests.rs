@@ -101,7 +101,7 @@ fn smoke_ath10k_sgi40_native_service_bits_and_separate_band_advertisement() -> T
                 for (band,cap) in [(2400,two),(5000,five)] {
                     let actual=h.device.phy_capabilities(band);
                     let expected=cap.map(|first| {
-                        let mut body=[0;26];body[0]=first;body[2]=24;body[3]=255;body[15]=1;body
+                        let mut body=[0;26];body[0]=first;body[2]=24;body[3]=255;body[4]=255;body[15]=1;body
                     });
                     if actual.as_ref().map(|p|p.ht)!=expected || actual.is_some_and(|p|p.vht.is_some()) {
                         return Err("SGI40 band advertisement inferred GI from SGI20/width/PCI or omitted actual source bit");

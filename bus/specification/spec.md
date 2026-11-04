@@ -83,10 +83,25 @@ and synchronize handlers before releasing their state or vector numbers.
 programmed message or Multi-Message Enable, so a later `msi::enable`
 resumes the same vectors.
 
+`msi::save_msi(&authority, &device) -> Result<SavedMsi, _>` snapshots the
+MSI capability (control, address lo/hi, data, per-vector mask when
+present). `msi::restore_msi(&authority, &device, &SavedMsi)` follows Linux
+`__pci_restore_msi_state`: Enable off, address and data (32- or 64-bit
+layout), mask, then Multi-Message Enable and Enable last; it reads the whole
+capability back and fails unless it equals the snapshot. Drivers use it after
+a D3hot->D0 transition that kept the function owner (e.g. rtw89 WoW).
+
 `pci_express::clear_and_set_link_control(cap, dev, clear, set) -> u16`
 read-modify-writes PCIe Link Control and returns the prior value (Linux
 `pcie_capability_clear_and_set_word(PCI_EXP_LNKCTL)`); `LNKCTL_ASPMC` names
 the ASPM L0s/L1 field.
+
+`pci_express::parent_link_control(child_cap, child) -> Result<Option<u16>,
+PcieCapError>` reads the immediate registered upstream bridge's Link Control
+inside the child's current `Read` capability invocation. `None` denotes no
+parent, no PCIe capability or an all-ones unavailable register; a revoked
+child capability fails before config access. This read-only relationship
+query grants no bridge capability and cannot change either end's ASPM policy.
 
 ### 3.1 Device descriptor
 
@@ -250,6 +265,48 @@ numbers. `upstream_bridge` (Linux `pci_upstream_bridge`) finds the
 registered bridge whose secondary bus is the function's bus, and
 `sibling_function` another function of the same slot; both read only
 the type-1 / registry data and need no capability.
+
+`pci::pme` exposes endpoint PME registers without claiming a platform route:
+
+```rust
+pub enum WakeState { D0, D1, D2, D3Hot, D3Cold }
+pub struct Status { pub supported_states: u8, pub enabled: bool, pub pending: bool }
+pub fn status(cap: &Cap<BusDeviceCap, Read>, device: &BusDevice)
+    -> Result<Status, PmeError>;
+pub fn arm(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice, state: WakeState)
+    -> Result<(), PmeError>;
+pub fn disarm(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice)
+    -> Result<bool, PmeError>;
+```
+
+The trusted driver binding must supply the capability and `BusDevice` for
+the same exclusively owned endpoint. `BusDeviceCap` currently carries a
+capability identity and epoch without a recorded PCI-address binding;
+`Cap::invoke` checks current validity, not that the supplied device matches
+that identity. These APIs rely on the existing config-space caller-ownership
+contract and do not authorize selecting another function with an endpoint cap.
+The caller also serializes PMCSR with its power-state writer.
+
+Every read/write runs inside the supplied current `Cap::invoke`. `arm`
+requires the actual PMC.PME_Support bit and refuses an already-enabled source
+without changing it. It sets PME_Enable and acknowledges stale W1C
+PME_Status while preserving D-state, data and unrelated control fields;
+enable readback must succeed. `disarm` returns the observed terminal status,
+disables PME and acknowledges status, with disable readback. Absent,
+malformed, truncated or all-ones PM capability words fail closed. The caller
+retains ownership through failed cleanup. These functions neither change
+D-state nor provide auxiliary
+power, an upstream bridge grant, ACPI wake routing or a wake interrupt.
+`disarm_observed` returns a `DisarmObservation` containing the actual observed
+pending bit and a separate `terminal: Result<(), PmeError>`. An outer Ok
+means an observation exists, not that disable succeeded. Callers retain the
+observation before propagating a terminal error, because W1C may already
+have cleared the hardware cause. The existing `disarm` wrapper still returns
+an error unless terminal disable/readback succeeded.
+The `kernel-test` graph additionally exports the scoped
+`ecam::__test_windows` registration and one-window PME arm/disarm-receipt failure
+fixture. Both restore their prior test ownership and are absent from the
+production feature graph; neither establishes an actual platform wake route.
 
 ### 3.5 Hot-plug
 
@@ -429,6 +486,62 @@ the demux re-dispatches each recorded child vector through
 `interrupts::dispatch::on_irq`; an entry with no children reports
 spurious. Legacy MSI collapses onto one entry, as the remap
 ignores message data — MSI's only per-vector signal.
+
+### 3.12 Loadable wireless host services
+
+`module_wireless::register(&'static Host)` installs a permanent family host,
+identified by family and protocol version. Bus retains no firmware/wireless
+Rust dependency. Its `open/submit/poll/cancel/close` adapters accept opaque
+module owner, exact probe-device token, session/operation ids and copied byte
+slices. The five `narf_wireless_*` C exports (§modules ABI) obtain owner from
+the module call gate, never from a module-supplied argument. Open borrows the
+existing device context's exact `Cap<BusDeviceCap, Write>`; every subsequent
+operation invokes that same current grant and checks its slot/generation
+against the current context. No address lookup claims an ungranted device.
+
+Session ids never repeat in a boot. One service may own a module/device at
+a time; a different owner, token, stale session, unsupported family/version,
+or request over4096 bytes fails before native work. Replies are bounded to
+65536 bytes, retained in host memory, and copied during a final current
+device invocation while exact service/context presence is held. Host hooks
+run outside bus registry locks. A kernel-only non-reentrant copy closure lets
+the native host hold its receive epoch through the actual module-byte copy.
+`-EAGAIN` is pending; `-ENOBUFS` reports required size and
+retains a completed reply. Cancellation requests never release native DMA.
+Closing remains reachable after revocation and removes the exact old session.
+Device teardown calls the permanent host's close hook before revoking the
+probe grant; the host must withdraw publication and retain uncertain native
+work/storage independently of unloadable module text.
+
+`driver_match::module_pci_driver_registered(vendor, device)` is a read-only
+exact-match query. MT76's permanent engine declines its ordinary built-in
+probe when an explicit module match exists, allowing that frontend to bind
+through its own probe grant. This query never detaches an existing binding.
+The permanent native host's discovery bypasses that preference check, while
+still refusing to alias an already bound radio.
+
+### 3.13 DMA configuration
+
+```rust
+/// Linux `of_dma_configure` + `of_reserved_mem_device_init`.
+pub fn dma::configure(device: &BusDevice) -> Result<narf_io::DmaDevice, IoError>;
+/// Devicetree half for a PCI function (`default_coherent` = arch
+/// `dma_default_coherent`; arm64 false).
+pub unsafe fn dma::pci_from_dt(blob: &[u8], domain: u16, devfns: Option<&[u8]>,
+                               default_coherent: bool) -> Result<DmaDevice, IoError>;
+```
+
+x86_64 is always coherent with no pools (Linux x86 `dev_is_dma_coherent`
+is constant true). aarch64 PCI functions take their host bridge node's
+`of_dma_is_coherent` (non-coherent by default and for an unresolved
+`dma-mem` interconnect parent), the function node's `memory-region[0]`
+`shared-dma-pool` as device pool, and — non-coherent without one — the
+`linux,dma-default` pool; both are mapped by `narf_io::CoherentPool::reserved`.
+Linux leaves `of_reserved_mem_device_init` to drivers; NARF calls it here
+because it cannot remap RAM non-cacheable, so a pool is the only
+non-coherent backing. A DTB-less aarch64 boot (QEMU `virt` fallback) stays
+coherent; aarch64 boots carry no ACPI, so `_CCA` has no source. Non-PCI
+devices on a Devicetree boot return `NotMapped` (no node association yet).
 
 ## 4. Invariants & safety properties
 

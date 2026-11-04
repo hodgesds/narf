@@ -4,6 +4,52 @@ use alloc::sync::Arc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 include!("policy_fixture.rs");
+include!("indoor_fixture.rs");
+
+fn smoke_signed_indoor_installation_requires_real_signature_and_current_blob() -> TestResult {
+    let (write, read) = narf_firmware::bootstrap_authority();
+    narf_firmware::register_trusted_signer(FINGERPRINT, PUBLIC);
+    let mut signed = INDOOR_PAYLOAD.to_vec();
+    signed.extend_from_slice(&INDOOR_SIGNATURE);
+    signed.extend_from_slice(&FINGERPRINT);
+    signed.extend_from_slice(&[0; 4]);
+    signed.extend_from_slice(b"NRFW");
+    if narf_firmware::install("test/wireless-indoor-signed", &signed, &write).is_err() {
+        return TestResult::Fail("independently signed indoor policy was rejected");
+    }
+    let domain = match load_from(&read, "test/wireless-indoor-signed") {
+        Ok(domain) => domain,
+        Err(_) => return TestResult::Fail("signed indoor policy did not use actual firmware load"),
+    };
+    if domain.country_code != *b"US"
+        || domain.rules.len() != 1
+        || domain.rules[0].freq_start_mhz != 5170
+        || domain.rules[0].freq_end_mhz != 5250
+        || domain.rules[0].max_bandwidth_mhz != 80
+        || domain.rules[0].max_power_dbm != 27
+        || domain.rules[0].flags.bits() != 0x82
+    {
+        return TestResult::Fail("indoor assertion altered signed country, span or power");
+    }
+    if !matches!(decode(&INDOOR_PAYLOAD, None), Err(Error::Unsigned)) {
+        return TestResult::Fail("unsigned indoor assertion supplied policy authority");
+    }
+    // Strip the installation assertion without changing its old signature.
+    signed[25] = 2;
+    if narf_firmware::install("test/wireless-indoor-tampered", &signed, &write).is_ok() {
+        return TestResult::Fail("modified installation fact retained signature authority");
+    }
+    let blob = narf_firmware::open("test/wireless-indoor-signed", &read).unwrap();
+    blob.revoke();
+    if blob.invoke(ReadPolicy).is_ok() {
+        return TestResult::Fail("revoked indoor blob was read outside current invocation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/regulatory",
+    smoke_signed_indoor_installation_requires_real_signature_and_current_blob
+);
 
 fn signed_blob() -> alloc::vec::Vec<u8> {
     let mut bytes = PAYLOAD.to_vec();

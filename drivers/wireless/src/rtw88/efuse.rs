@@ -28,6 +28,10 @@ pub enum EfuseError {
 #[derive(Clone)]
 pub struct Factory8821c {
     logical: [u8; 512],
+    /// RTL8821CU logical map (`rtw8821cu_efuse_parsing`): the MAC sits at
+    /// 0x107 (`struct rtw8821cu_efuse`) instead of the PCI 0xd0; every other
+    /// C21 field (`rtw8821c_efuse`) is shared.
+    usb: bool,
 }
 impl core::fmt::Debug for Factory8821c {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -41,7 +45,10 @@ impl core::fmt::Debug for Factory8821c {
 impl Factory8821c {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn for_test(logical: [u8; 512]) -> Result<Self, EfuseError> {
-        let factory = Self { logical };
+        let factory = Self {
+            logical,
+            usb: false,
+        };
         if !mac_is_valid(factory.mac()) {
             return Err(EfuseError::MacUninitialized);
         }
@@ -49,7 +56,22 @@ impl Factory8821c {
     }
 
     pub fn mac(&self) -> [u8; 6] {
+        if self.usb {
+            return super::usb::efuse_mac(&self.logical);
+        }
         self.logical[0xd0..0xd6].try_into().unwrap()
+    }
+    /// The same logical map read through the RTL8821CU USB host interface:
+    /// the MAC moves to 0x107 and must itself be a valid unicast address.
+    pub(super) fn usb(&self) -> bool {
+        self.usb
+    }
+    pub(super) fn on_usb(self) -> Result<Self, EfuseError> {
+        let factory = Self { usb: true, ..self };
+        if !mac_is_valid(factory.mac()) {
+            return Err(EfuseError::MacUninitialized);
+        }
+        Ok(factory)
     }
     pub fn rfe(&self) -> u8 {
         self.logical[0xca] & 0x1f
@@ -69,6 +91,10 @@ impl Factory8821c {
     /// Original RTL8821C map offset0xc6; calibration does not invent an erased swing.
     pub fn swing_2g(&self) -> u8 {
         self.logical[0xc6]
+    }
+    /// `rtw8821c_efuse::tx_bb_swing_setting_5g` (map 0xc7), raw.
+    pub fn swing_5g(&self) -> u8 {
+        self.logical[0xc7]
     }
     pub fn board_option(&self) -> u8 {
         self.logical[0xc1]
@@ -387,11 +413,91 @@ pub(super) fn read_factory8821c_with(
     let map = read_map_with(io, geometry(did)?)?;
     let factory = Factory8821c {
         logical: map[..512].try_into().unwrap(),
+        usb: false,
     };
     if !mac_is_valid(factory.mac()) {
         return Err(EfuseError::MacUninitialized);
     }
     Ok(factory)
+}
+/// RTL8821CU factory map over the asynchronous register `Io` (EP0 vendor
+/// requests on USB): the same `efuse.c::rtw_dump_physical_efuse_map`
+/// sequence as [`read_factory8821c_with`] (bank 0, programming LDO off, one
+/// REG_EFUSE_CTRL address write and VALID poll per byte), decoded with the
+/// same `rtw_dump_logical_efuse_map` and parsed as `rtw8821cu_efuse_parsing`
+/// ([`Factory8821c::on_usb`], MAC at 0x107). Each poll is a USB transfer, so
+/// the wait never spins the CPU; the per-byte bound is `EFUSE_POLL_MS`. The
+/// synchronous PCI path is unchanged.
+pub(super) async fn read_factory8821c_usb(
+    io: &mut impl super::firmware_transport::Io,
+) -> Result<Factory8821c, EfuseError> {
+    let logical = read_logical_usb(io, RTL_DEV_8821CE).await?;
+    Factory8821c {
+        logical: logical[..512]
+            .try_into()
+            .map_err(|_| EfuseError::MalformedMap)?,
+        usb: false,
+    }
+    .on_usb()
+}
+/// RTL8822BU factory map over the asynchronous register `Io`: the same
+/// physical dump and logical decode as the PCI RTL8822BE
+/// ([`read_logical8822b_with`]) issued as EP0 transfers, parsed as
+/// `rtw8822b.c::rtw8822b_read_efuse` -> `rtw8822bu_efuse_parsing`
+/// (`efuse8822b::Factory8822b::usb_map`, MAC at 0x107).
+pub(super) async fn read_factory8822b_usb(
+    io: &mut impl super::firmware_transport::Io,
+) -> Result<super::efuse8822b::Factory8822b, EfuseError> {
+    let logical = read_logical_usb(io, RTL_DEV_8822BE).await?;
+    super::efuse8822b::Factory8822b::usb_map(
+        logical[..768]
+            .try_into()
+            .map_err(|_| EfuseError::MalformedMap)?,
+    )
+}
+/// `efuse.c::rtw_dump_physical_efuse_map` + `rtw_dump_logical_efuse_map`
+/// for chip `did` over the asynchronous register `Io` (bank 0, programming
+/// LDO off, one REG_EFUSE_CTRL address write and VALID poll per byte).
+async fn read_logical_usb(
+    io: &mut impl super::firmware_transport::Io,
+    did: u16,
+) -> Result<alloc::vec::Vec<u8>, EfuseError> {
+    let chip = geometry(did)?;
+    let access = |_| EfuseError::Timeout;
+    let bank = io.read32(REG_LDO_EFUSE_CTRL as u16).await.map_err(access)?;
+    io.write32(REG_LDO_EFUSE_CTRL as u16, bank & !EFUSE_BANK_MASK)
+        .await
+        .map_err(access)?;
+    let ldo = io.read8(chip.ldo_addr as u16).await.map_err(access)?;
+    io.write8(chip.ldo_addr as u16, ldo & !chip.ldo_mask)
+        .await
+        .map_err(access)?;
+    // Heap-held: this future can be polled on small (aarch64) stacks.
+    let mut physical = alloc::vec![0xffu8; chip.readable];
+    let mut control = io.read32(REG_EFUSE_CTRL as u16).await.map_err(access)?;
+    for (addr, byte) in physical.iter_mut().enumerate() {
+        control &= !(EFUSE_CTRL_DATA_MASK
+            | (EFUSE_CTRL_ADDR_MASK << EFUSE_CTRL_ADDR_SHIFT)
+            | EFUSE_CTRL_VALID);
+        control |= (addr as u32) << EFUSE_CTRL_ADDR_SHIFT;
+        io.write32(REG_EFUSE_CTRL as u16, control)
+            .await
+            .map_err(access)?;
+        let deadline = Deadline::after_ms(EFUSE_POLL_MS);
+        loop {
+            control = io.read32(REG_EFUSE_CTRL as u16).await.map_err(access)?;
+            if control & EFUSE_CTRL_VALID != 0 {
+                break;
+            }
+            if deadline.expired() {
+                return Err(EfuseError::Timeout);
+            }
+        }
+        *byte = (control & EFUSE_CTRL_DATA_MASK) as u8;
+    }
+    let mut logical = alloc::vec![0xffu8; chip.logical];
+    decode_map(&physical, &mut logical)?;
+    Ok(logical)
 }
 /// # Safety
 /// Same powered, exclusive BAR2 ownership contract as `read_mac`.
@@ -416,4 +522,24 @@ pub unsafe fn read_mac(mmio: &MmioRegion, did: u16) -> Result<[u8; MAC_ADDR_LEN]
 /// A factory station identity must be nonzero and unicast.
 pub fn mac_is_valid(mac: [u8; MAC_ADDR_LEN]) -> bool {
     mac != [0; MAC_ADDR_LEN] && mac[0] & 1 == 0
+}
+
+/// RTL8822BE one-read logical map for the distinct B22 factory type
+/// (`efuse8822b`): the same sparse physical decode as every chip above.
+pub(super) fn read_logical8822b_with(
+    io: &mut impl EfuseIo,
+    did: u16,
+) -> Result<[u8; 768], EfuseError> {
+    if did != RTL_DEV_8822BE {
+        return Err(EfuseError::UnsupportedChip);
+    }
+    read_map_with(io, geometry(did)?)
+}
+/// # Safety
+/// Same powered, exclusive BAR2 ownership contract as `read_mac`.
+pub(super) unsafe fn read_logical8822b(
+    mmio: &MmioRegion,
+    did: u16,
+) -> Result<[u8; 768], EfuseError> {
+    read_logical8822b_with(&mut MmioEfuse(mmio), did)
 }

@@ -15,7 +15,7 @@ use alloc::{
 use core::{
     future::{poll_fn, Future},
     pin::{pin, Pin},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     task::{Context, Poll, Waker},
 };
 use narf_capabilities::{Cap, Grant};
@@ -31,12 +31,20 @@ use zeroize::{Zeroize, Zeroizing};
 type Policy = Arc<dyn Fn() -> Result<RegulatoryDomain, &'static str> + Send + Sync>;
 type Nonce = Arc<dyn Fn() -> Result<[u8; 32], &'static str> + Send + Sync>;
 type Power = Arc<dyn Fn(&mut Owner) -> Result<(Asset, [u8; 32]), &'static str> + Send + Sync>;
+type ScanPower =
+    Arc<dyn Fn(&mut Owner, &[u8]) -> Result<(Asset, [u8; 32]), &'static str> + Send + Sync>;
+type ApPower =
+    Arc<dyn Fn(&super::Gen2TransmitPowerRequest) -> Result<Asset, &'static str> + Send + Sync>;
 #[derive(Clone)]
 struct Environment {
     observation_clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     policy: Policy,
     nonce: Nonce,
     power: Power,
+    scan_power: ScanPower,
+    ap_power: ApPower,
+    p2p_power: ApPower,
+    ap_policy: super::mld_policy::Source,
 }
 impl Environment {
     fn native() -> Self {
@@ -46,6 +54,30 @@ impl Environment {
                 narf_wireless::reg::db::get_domain().ok_or("MVM authenticated policy unavailable")
             }),
             nonce: Arc::new(super::security::fresh_nonce),
+            ap_policy: super::mld_policy::Source::native(),
+            ap_power: Arc::new(|request| {
+                let authority = narf_firmware::trusted_loader_authority()
+                    .and_then(|c| c.derive().ok())
+                    .ok_or("MVM AP power loader authority unavailable")?;
+                crate::firmware_asset::load(&authority, &request.name, 64, true)
+                    .map_err(|_| "MVM signed AP tag7 program unavailable")
+            }),
+            p2p_power: Arc::new(|request| {
+                let authority = narf_firmware::trusted_loader_authority()
+                    .and_then(|cap| cap.derive().ok())
+                    .ok_or("MVM P2P power loader authority unavailable")?;
+                crate::firmware_asset::load(&authority, &request.name, 64, true)
+                    .map_err(|_| "MVM original signed P2P tag8 program unavailable")
+            }),
+            scan_power: Arc::new(|owner, channels| {
+                let request = owner.scan_power_request(channels)?;
+                let authority = narf_firmware::trusted_loader_authority()
+                    .and_then(|c| c.derive().ok())
+                    .ok_or("MVM active-scan power loader authority unavailable")?;
+                let source = crate::firmware_asset::load(&authority, &request.name, 64, true)
+                    .map_err(|_| "MVM signed active-scan power source unavailable")?;
+                Ok((source, request.binding))
+            }),
             power: Arc::new(|owner| {
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
@@ -93,9 +125,15 @@ struct State {
     transmit: Option<Consumer<Frame, TX_RING_N>>,
     pending: Option<Frame>,
     scan_time: Option<u64>,
+    scheduled: Option<scheduled::Control>,
+    ap: Option<Box<super::ap_session::Session>>,
+    ap_probes: alloc::collections::VecDeque<Vec<u8>>,
+    ap_pending: Option<super::progress::PendingTx<Frame>>,
 }
 enum Operation {
-    Scan(Vec<u8>, Vec<Vec<u8>>),
+    StartScheduled(Box<scheduled::Start>),
+    StopScheduled,
+    Scan(Vec<u8>, Vec<Vec<u8>>, bool),
     Join(Join),
     Maintain,
     Transmit,
@@ -104,8 +142,14 @@ enum Operation {
     Recover,
     /// System-suspend transport stop (`Owner::suspend_transport`).
     Suspend,
+    /// Associated WoWLAN entry into D3 (`__iwl_mvm_suspend`).
+    WowlanSuspend(super::mvm_d3::Wake),
+    /// D3 exit and wake-reason query (`__iwl_mvm_resume`).
+    WowlanResume,
+    QuerySharedMemory,
 }
 struct Join {
+    client_role: Option<narf_net::native_emission::Lifetime>,
     bssid: [u8; 6],
     ssid: Vec<u8>,
     channel: u8,
@@ -116,6 +160,8 @@ enum Outcome {
     Scan(Vec<BssInfo>),
     Joined([u8; 6]),
     Done,
+    SharedMemory(super::mvm_boot::SharedMemory),
+    Wowlan(super::mvm_boot::WowlanResumed),
 }
 struct Completion {
     result: Option<Result<Outcome, &'static str>>,
@@ -127,6 +173,18 @@ pub(super) struct Device {
     me: Weak<Self>,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
+    radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
+    mode: AtomicU32,
+    mode_generation: AtomicU64,
+    ap_capable: bool,
+    go_capable: bool,
+    p2p_capable: bool,
+    p2p: super::device::p2p::Host,
+    ap_host: super::ap_host::Host,
+    ap_stopped: AtomicBool,
+    ap_cleanup: AtomicBool,
+    scan_generation: Arc<super::scheduled_epoch::Epoch>,
+    schedule_profiles: u8,
     source: Source,
     environment: Environment,
     mac: [u8; 6],
@@ -134,11 +192,22 @@ pub(super) struct Device {
     wpa2: bool,
     sae: bool,
     ht20: bool,
+    vht: bool,
+    he: bool,
     irq: Option<u8>,
     publication: AtomicBool,
     terminal: AtomicBool,
     /// Set by a completed system-suspend stop until resume restarts it.
     suspended: AtomicBool,
+    /// The retained executable admits the exact API77 D3 surface on a
+    /// 22000 transport (`wiphy->wowlan` registration).
+    wowlan_capable: bool,
+    /// cfg80211's retained `SET_WOWLAN` configuration.
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// Firmware owns the association in D3 until the resume conversation.
+    wowlan_d3: AtomicBool,
+    /// The last resume's `ieee80211_report_wowlan_wakeup` report.
+    wowlan_wakeup: IrqSafeSpinLock<Option<super::mvm_d3::WakeReport>>,
     stopping: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     up: AtomicBool,
@@ -160,6 +229,26 @@ impl core::fmt::Debug for Device {
     }
 }
 impl Device {
+    pub(super) async fn shared_memory(&self) -> Result<super::Gen2SharedMemory, &'static str> {
+        let reply = self.begin(Operation::QuerySharedMemory)?;
+        match self.wait(reply).await? {
+            Outcome::SharedMemory(memory) => Ok(memory),
+            _ => Err("MVM shared-memory operation returned another outcome"),
+        }
+    }
+    pub(super) async fn scan_power_request(
+        &self,
+        channels: &[u8],
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native owner absent")?
+                .scan_power_request(channels)
+        })
+    }
     pub(super) async fn power_request(
         &self,
     ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
@@ -170,6 +259,58 @@ impl Device {
                 .as_mut()
                 .ok_or("MVM native owner absent")?
                 .transmit_power_request()
+        })
+    }
+    /// Metadata for the separate AP emission qualification. Holding the
+    /// returned binding/name never grants a role or permits radiation.
+    pub(super) async fn ap_power_request(
+        &self,
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native owner absent")?
+                .transmit_power_request_for(super::mvm_boot::PowerEmission::ApLegacy)
+        })
+    }
+    /// Exact proposed GO9 metadata; no native role or power receipt is made.
+    pub(super) async fn go_power_request(
+        &self,
+        device: [u8; 6],
+        frequency_mhz: u32,
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        if device == [0; 6] || device[0] & 1 != 0 {
+            return Err("GO P2P device address invalid");
+        }
+        let channel = (1..=196)
+            .filter_map(super::native_band::Channel::legacy)
+            .find(|channel| channel.frequency() == frequency_mhz)
+            .ok_or("GO native frequency absent")?;
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native owner absent")?
+                .go_power_request(super::p2p_go::Identity { device }, channel)
+        })
+    }
+    pub(super) async fn client_power_request(
+        &self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        frequency: u32,
+        elements: &[u8],
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native client metadata owner absent")?
+                .client_power_request_for_bss(bssid, ssid, frequency, elements)
         })
     }
     pub(super) async fn ht20_power_request(
@@ -240,6 +381,20 @@ impl Device {
         let wpa2 = owner.station_wpa2_supported();
         let sae = owner.station_sae_supported();
         let ht20 = owner.supports_native_ht20();
+        let vht = ht20 && nvm.phy.vht;
+        let he = owner.supports_native_he_contract();
+        let schedule_profiles = owner.scheduled_profile()?.0 as u8;
+        let ap_capable = owner.ap_capable();
+        let wowlan_capable = owner.wowlan_capable();
+        let p2p_capable = owner.p2p_capable();
+        let go_capable = ap_capable
+            && matches!(
+                owner
+                    .ap_hardware()
+                    .version(3, 0xfc)
+                    .map(|version| version.1),
+                None | Some(1 | 99)
+            );
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
         Ok(Arc::new_cyclic(|me| Self {
@@ -250,8 +405,24 @@ impl Device {
                 transmit: None,
                 pending: None,
                 scan_time: None,
+                scheduled: None,
+                ap: None,
+                ap_probes: alloc::collections::VecDeque::new(),
+                ap_pending: None,
             }),
             control: Mutex::new(None),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            mode: AtomicU32::new(2),
+            mode_generation: AtomicU64::new(1),
+            ap_capable,
+            go_capable,
+            p2p_capable,
+            p2p: super::device::p2p::Host::new(),
+            ap_host: super::ap_host::Host::new(),
+            ap_stopped: AtomicBool::new(true),
+            ap_cleanup: AtomicBool::new(false),
+            scan_generation: Arc::new(super::scheduled_epoch::Epoch::new()),
+            schedule_profiles,
             source,
             environment,
             mac,
@@ -259,10 +430,16 @@ impl Device {
             wpa2,
             sae,
             ht20,
+            vht,
+            he,
             irq,
             publication: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            wowlan_capable,
+            wowlan: IrqSafeSpinLock::new(None),
+            wowlan_d3: AtomicBool::new(false),
+            wowlan_wakeup: IrqSafeSpinLock::new(None),
             stopping,
             generation: Arc::new(AtomicU64::new(0)),
             up: AtomicBool::new(false),
@@ -281,9 +458,17 @@ impl Device {
         self.down_locked(terminal);
     }
     fn down_current(&self, authority: &Publication) {
-        let _publication = self.admission.lock();
-        if authority.current() && !self.stopping.load(Ordering::Acquire) {
-            self.down_locked(true);
+        let stop_ap = {
+            let _publication = self.admission.lock();
+            if authority.current() && !self.stopping.load(Ordering::Acquire) {
+                self.down_locked(true);
+                matches!(self.current_iftype(), 3 | 9)
+            } else {
+                false
+            }
+        };
+        if stop_ap {
+            self.ap_request_stop();
         }
     }
     // Caller holds admission, serializing generation and ring publication.
@@ -313,7 +498,7 @@ impl Device {
         *self.fence.lock() = None;
         let was_up = self.up.swap(false, Ordering::AcqRel);
         narf_net::iface::set_link_metadata(self.name(), false, None, None);
-        if was_up {
+        if was_up && !matches!(self.current_iftype(), 3 | 9) {
             narf_wireless::nl80211::notify_disconnect(self.name(), 1, false);
         }
     }
@@ -329,9 +514,19 @@ impl Device {
             .checked_add(1)
             .ok_or("MVM publication generation exhausted")?;
         self.generation.store(generation, Ordering::Release);
+        if owner.ap_hardware().p2p_client_native().is_some() {
+            owner
+                .ap_hardware()
+                .client_receive_power(super::p2p_client_rx::MvmPower {
+                    power: power.clone(),
+                    policy: self.environment.ap_policy.clone(),
+                    source: self.source.clone(),
+                    generation: (self.generation.clone(), generation),
+                });
+        }
         let authority = Publication {
             source: self.source.clone(),
-            power,
+            power: Arc::new(super::mvm_publication::Power::Station(power)),
             generation: (self.generation.clone(), generation),
         };
         authority.invoke(&(self.environment.policy)()?, || {
@@ -349,16 +544,32 @@ impl Device {
         })
     }
     fn begin(&self, operation: Operation) -> Result<Reply, &'static str> {
+        if self.p2p.active() && !matches!(operation, Operation::Recover) {
+            return Err("MVM control busy");
+        }
+        if matches!(self.current_iftype(), 3 | 9)
+            && !matches!(
+                operation,
+                Operation::Recover | Operation::Suspend | Operation::Close
+            )
+        {
+            return Err("MVM station control while actual AP role selected");
+        }
         if !self.publication.load(Ordering::Acquire) {
             return Err("MVM native interface is not published");
         }
+        let wowlan_resuming = matches!(operation, Operation::WowlanResume);
+        if self.wowlan_d3.load(Ordering::Acquire) != wowlan_resuming {
+            return Err("MVM WoWLAN D3 ownership mismatch");
+        }
+        let wowlan_suspending = matches!(operation, Operation::WowlanSuspend(_));
         let recovering = matches!(operation, Operation::Recover);
         let suspending = matches!(operation, Operation::Suspend);
         let terminal = self.terminal.load(Ordering::Acquire);
         if recovering && !terminal {
             return Err("MVM recovery requires a terminal station");
         }
-        if terminal && !recovering && !suspending {
+        if terminal && !recovering && !suspending && !wowlan_resuming {
             return Err("MVM station is terminal");
         }
         if self.stopping.load(Ordering::Acquire) && !matches!(operation, Operation::Close) {
@@ -376,12 +587,18 @@ impl Device {
             let state = self.state.try_lock().ok_or("MVM control busy")?;
             let owner = state.owner.as_ref().ok_or("MVM native owner absent")?;
             let phase = owner.phase();
-            if (matches!(operation, Operation::Scan(..) | Operation::Join(_))
-                && phase != Phase::Configured)
+            if (matches!(
+                operation,
+                Operation::Scan(..)
+                    | Operation::Join(_)
+                    | Operation::QuerySharedMemory
+                    | Operation::StartScheduled(_)
+            ) && phase != Phase::Configured)
                 || (matches!(operation, Operation::Maintain | Operation::Transmit)
                     && phase != Phase::DataPrepared)
                 || (recovering && !owner.station_failed())
                 || (suspending && phase != Phase::Configured && !owner.station_failed())
+                || ((wowlan_suspending || wowlan_resuming) && phase != Phase::DataPrepared)
             {
                 return Err("MVM control busy");
             }
@@ -396,9 +613,18 @@ impl Device {
         }));
         let result_slot = reply.clone();
         let closing = matches!(operation, Operation::Close);
+        let stopping_schedule = matches!(operation, Operation::StopScheduled);
+        let scheduled_request = match &operation {
+            Operation::StartScheduled(start) => {
+                Some((start.authority.clone(), start.cancel.clone()))
+            }
+            _ => None,
+        };
+        let reading_geometry = matches!(operation, Operation::QuerySharedMemory);
         let port_commit = matches!(operation, Operation::Join(_) | Operation::Maintain);
         let channels = match &operation {
-            Operation::Scan(channels, _) => channels.clone(),
+            Operation::Scan(channels, _, _) => channels.clone(),
+            Operation::StartScheduled(start) => start.channels.clone(),
             Operation::Join(request) => alloc::vec![request.channel],
             _ => Vec::new(),
         };
@@ -413,6 +639,16 @@ impl Device {
             let result = {
                 let mut future = pin!(device.execute(&mut state, operation));
                 poll_fn(|cx| {
+                    if scheduled_request
+                        .as_ref()
+                        .is_some_and(|(authority, cancel)| {
+                            cancel.load(Ordering::Acquire)
+                                || authority.check_for(device.as_ref()).is_err()
+                                || authority.require_link().is_err()
+                        })
+                    {
+                        return Poll::Ready(Err("MVM scheduled start request retired"));
+                    }
                     if let Some(boot) = restart.as_ref() {
                         return match boot.invoke(|| Ok(future.as_mut().poll(cx))) {
                             Ok(result) => result,
@@ -420,7 +656,12 @@ impl Device {
                         };
                     }
                     match device.source.invoke(|| {
-                        if closing || suspending {
+                        if closing
+                            || suspending
+                            || wowlan_resuming
+                            || reading_geometry
+                            || stopping_schedule
+                        {
                             return Ok(future.as_mut().poll(cx));
                         }
                         let domain = (device.environment.policy)()?;
@@ -451,11 +692,42 @@ impl Device {
                 })
                 .await
             };
+            let scheduled_failed = stopping_schedule && state.scheduled.is_some();
+            let mut wowlan_lost = false;
             let owner = state.owner.as_mut().unwrap();
+            if result.is_err() && (owner.phase() == Phase::Scanning || scheduled_failed) {
+                // The outer executable/PCI/receive-policy fence can stop
+                // polling execute while firmware still owns a scan. Retain
+                // and stop that owner before reporting its terminal error.
+                owner.station_fail();
+                let _ = owner.suspend_transport().await;
+            }
             let result = match result {
                 Ok(_) if !closing && device.stopping.load(Ordering::Acquire) => Ok(Outcome::Done),
                 Ok(Outcome::Joined(bssid)) => {
                     device.admit_port(owner, bssid).map(|()| Outcome::Done)
+                }
+                Ok(Outcome::Wowlan(mut resumed)) => {
+                    // iwl_mvm_d3_disconnect_iter: only a kept connection
+                    // reopens its port; anything else is torn down and
+                    // restarted by the caller.
+                    if resumed.keep {
+                        let bssid = owner
+                            .prepared_legacy_data()
+                            .ok_or("MVM WoWLAN data identity missing")
+                            .map(|s| s.bssid);
+                        if bssid
+                            .and_then(|bssid| device.admit_port(owner, bssid))
+                            .is_err()
+                        {
+                            resumed.keep = false;
+                        }
+                    }
+                    if !resumed.keep {
+                        owner.station_fail();
+                        wowlan_lost = true;
+                    }
+                    Ok(Outcome::Wowlan(resumed))
                 }
                 Ok(Outcome::Done)
                     if !closing && port_commit && owner.phase() == Phase::DataPrepared =>
@@ -477,10 +749,23 @@ impl Device {
                     owner.station_fail();
                     device.down(true);
                     state.pending = None;
+                    state.scheduled = None;
                 }
             } else if closing {
                 let _publication = device.admission.lock();
                 device.stopping.store(false, Ordering::Release);
+            } else if wowlan_suspending {
+                let _publication = device.admission.lock();
+                device.retire_port_locked();
+                *device.fence.lock() = None;
+                device.wowlan_d3.store(true, Ordering::Release);
+                device.suspended.store(true, Ordering::Release);
+                state.pending = None;
+                state.scan_time = None;
+            } else if wowlan_lost {
+                device.down(true);
+                state.pending = None;
+                state.scan_time = None;
             } else if suspending {
                 owner.station_fail();
                 device.down(true);
@@ -500,6 +785,9 @@ impl Device {
                     state.scan_time = None;
                     device.terminal.store(false, Ordering::Release);
                 }
+            }
+            if wowlan_resuming {
+                device.wowlan_d3.store(false, Ordering::Release);
             }
             let wake = {
                 let mut completion = result_slot.lock();
@@ -535,6 +823,27 @@ impl Device {
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.p2p
+            .stop_retained()
+            .await
+            .map_err(|_| "MVM suspend could not retire P2P native owner")?;
+        // mac80211 `__ieee80211_suspend` -> `drv_suspend` with a WoWLAN
+        // configuration: an associated station enters D3; an idle one makes
+        // `__iwl_mvm_suspend` return 1 (no net-detect) and falls through to
+        // the ordinary quiesce/stop below. A D3 entry failure aborts suspend.
+        let wake = self
+            .wowlan
+            .lock()
+            .as_ref()
+            .and_then(|config| super::mvm_d3::Wake::from_config(config).ok());
+        if let Some(wake) = wake.filter(|_| self.wowlan_capable && self.link_up()) {
+            let reply = self.begin(Operation::WowlanSuspend(wake))?;
+            self.wait(reply).await?;
+            if !self.wowlan_d3.load(Ordering::Acquire) {
+                return Err("MVM WoWLAN suspend did not enter D3");
+            }
+            return Ok(());
+        }
         if !self.terminal.load(Ordering::Acquire) {
             WirelessNetIface::disassociate(self)
                 .await
@@ -554,11 +863,38 @@ impl Device {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
+        if self.wowlan_d3.load(Ordering::Acquire) {
+            // `iwl_mvm_resume`: report the wake, keep the connection when
+            // Linux would; otherwise the firmware restart below replaces
+            // `IWL_MVM_STATUS_HW_RESTART_REQUESTED` + `ieee80211_reconfig`.
+            let reply = self.begin(Operation::WowlanResume)?;
+            let kept = match self.wait(reply).await {
+                Ok(Outcome::Wowlan(resumed)) => {
+                    let keep = resumed.keep;
+                    *self.wowlan_wakeup.lock() = Some(resumed.report);
+                    keep
+                }
+                _ => {
+                    *self.wowlan_wakeup.lock() = None;
+                    false
+                }
+            };
+            if kept {
+                self.suspended.store(false, Ordering::Release);
+                return Ok(());
+            }
+        }
         let result = self.recover_failed().await;
         if result.is_ok() {
             self.suspended.store(false, Ordering::Release);
         }
         result
+    }
+    /// The last WoWLAN resume's wake report (cfg80211
+    /// `struct cfg80211_wowlan_wakeup`); `None` after a resume that never
+    /// reached the firmware's report.
+    pub(super) fn wowlan_wakeup(&self) -> Option<super::mvm_d3::WakeReport> {
+        self.wowlan_wakeup.lock().clone()
     }
     async fn wait(&self, reply: Reply) -> Result<Outcome, &'static str> {
         poll_fn(|cx| {
@@ -585,19 +921,37 @@ impl Device {
             pending,
             scan_time,
             transmit,
+            scheduled,
             ..
         } = state;
         let owner = owner.as_mut().ok_or("MVM native owner absent")?;
         match operation {
-            Operation::Scan(channels, ssids) => {
+            Operation::StartScheduled(start) => {
+                let result = self
+                    .execute_scheduled_start(owner, scheduled, *start)
+                    .await?;
+                *scan_time = None;
+                Ok(result)
+            }
+            Operation::StopScheduled => self.execute_scheduled_stop(owner, scheduled).await,
+            Operation::Scan(channels, ssids, active) => {
                 // A beacon can arrive at any point during this bounded scan.
                 // Start time conservatively bounds every retained observation;
                 // completion must not refresh an early beacon's age.
                 let started = (self.environment.observation_clock)();
                 *scan_time = None;
-                let mut result = owner
-                    .station_scan(&channels, &(self.environment.policy)()?)
-                    .await?;
+                let mut result = if active {
+                    let (source, binding) = (self.environment.scan_power)(owner, &channels)?;
+                    owner
+                        .active_scan_using(&channels, &ssids, source, binding, || {
+                            (self.environment.policy)()
+                        })
+                        .await?
+                } else {
+                    owner
+                        .station_scan(&channels, &(self.environment.policy)()?)
+                        .await?
+                };
                 let current = (self.environment.policy)()?;
                 if channels
                     .iter()
@@ -617,6 +971,15 @@ impl Device {
                         > narf_time::wall::ns_to_cycles(10_000_000_000)
                 }) {
                     return Err("MVM scan observation expired");
+                }
+                if let Some(role) = request.client_role {
+                    owner.select_client(
+                        request.bssid,
+                        &request.ssid,
+                        request.channel,
+                        &request.elements,
+                        role,
+                    )?;
                 }
                 owner.select_station_offer(
                     request.bssid,
@@ -664,7 +1027,9 @@ impl Device {
                 };
                 // The BA pipeline carries only BE/TID0; other QoS TIDs use
                 // their own DQA queue singly.
-                if owner.station_can_pipeline() && owner.data_tid(frame.payload()) == 0 {
+                let tid = owner.data_tid(frame.payload());
+                let amsdu = owner.station_can_amsdu_batch(tid);
+                if (owner.station_can_pipeline() && tid == 0) || amsdu {
                     let mut packets = alloc::vec![prepare(&frame)?];
                     if let Some(tx) = transmit.as_mut() {
                         for _ in 1..8 {
@@ -676,7 +1041,7 @@ impl Device {
                             if !admitted(next.payload(), self.mac, next.tx_meta()) {
                                 continue;
                             }
-                            if owner.data_tid(next.payload()) != 0 {
+                            if owner.data_tid(next.payload()) != tid {
                                 // Keep order within this TID: it is the next
                                 // single send.
                                 *pending = Some(next);
@@ -685,9 +1050,15 @@ impl Device {
                             packets.push(prepare(&next)?);
                         }
                     }
-                    owner
-                        .transmit_data_batch_using(&packets, || (self.environment.policy)())
-                        .await?;
+                    if amsdu {
+                        owner
+                            .transmit_amsdu_batch_using(&packets, || (self.environment.policy)())
+                            .await?;
+                    } else {
+                        owner
+                            .transmit_data_batch_using(&packets, || (self.environment.policy)())
+                            .await?;
+                    }
                 } else {
                     let (bytes, assist) = prepare(&frame)?;
                     owner
@@ -697,6 +1068,7 @@ impl Device {
                 Ok(Outcome::Done)
             }
             Operation::Close => {
+                self.execute_scheduled_stop(owner, scheduled).await?;
                 *pending = None;
                 if let Some(tx) = transmit.as_mut() {
                     for _ in 0..TX_RING_N {
@@ -709,6 +1081,7 @@ impl Device {
                 Ok(Outcome::Done)
             }
             Operation::Recover => {
+                *scheduled = None;
                 // Host frames queued for the failed station never reach the
                 // restarted instance (mac80211 drops them on restart).
                 *pending = None;
@@ -736,9 +1109,23 @@ impl Device {
                 owner.suspend_transport().await?;
                 Ok(Outcome::Done)
             }
+            Operation::QuerySharedMemory => {
+                owner.query_shared_memory().await.map(Outcome::SharedMemory)
+            }
+            Operation::WowlanSuspend(wake) => {
+                *pending = None;
+                *scan_time = None;
+                owner.wowlan_suspend(&wake).await?;
+                Ok(Outcome::Done)
+            }
+            Operation::WowlanResume => owner.wowlan_resume().await.map(Outcome::Wowlan),
         }
     }
     fn request_close(&self) {
+        if matches!(self.current_iftype(), 3 | 9) {
+            self.ap_request_stop();
+            return;
+        }
         {
             let _publication = self.admission.lock();
             self.stopping.store(true, Ordering::Release);
@@ -747,11 +1134,30 @@ impl Device {
         let _ = self.begin(Operation::Close);
     }
     fn step(&self, cx: Option<&mut Context<'_>>) -> Vec<(Vec<u8>, Publication)> {
+        let output = self.step_native(cx);
+        for publication in self.client_publications() {
+            publication.publish();
+        }
+        output
+    }
+    fn step_native(&self, cx: Option<&mut Context<'_>>) -> Vec<(Vec<u8>, Publication)> {
+        if matches!(self.current_iftype(), 3 | 9) {
+            return self.ap_step(cx);
+        }
+        let mut cx = cx;
         let mut fallback = Context::from_waker(Waker::noop());
-        if progress::poll_work(&self.control, cx.unwrap_or(&mut fallback)).is_pending() {
+        let root_pending =
+            progress::poll_work(&self.control, cx.as_deref_mut().unwrap_or(&mut fallback))
+                .is_pending();
+        // Either retained owner can hold State while the other awaits it.
+        // Both must progress before any early return or ordinary idle RX.
+        let p2p_busy = self.p2p.step(cx);
+        if root_pending || p2p_busy {
             return Vec::new();
         }
-        if self.terminal.load(Ordering::Acquire) {
+        // Firmware owns the device in D3; the transport is not touched
+        // until the resume conversation (`IWL_MVM_STATUS_IN_D3`).
+        if self.terminal.load(Ordering::Acquire) || self.wowlan_d3.load(Ordering::Acquire) {
             return Vec::new();
         }
         if self.stopping.load(Ordering::Acquire) {
@@ -761,6 +1167,17 @@ impl Device {
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
+        if state.scheduled.is_some() {
+            let (deliveries, retire) = self.scheduled_tick(&mut state);
+            drop(state);
+            if retire {
+                let _ = self.begin(Operation::StopScheduled);
+            }
+            for delivery in deliveries {
+                delivery.publish();
+            }
+            return Vec::new();
+        }
         let result = (|| {
             let owner = state.owner.as_mut().ok_or("MVM retained owner missing")?;
             self.source.invoke(|| Ok(()))?;
@@ -794,7 +1211,9 @@ impl Device {
             }
             let authority = Publication {
                 source: self.source.clone(),
-                power: owner.station_power_fence(&(self.environment.policy)()?)?,
+                power: Arc::new(super::mvm_publication::Power::Station(
+                    owner.station_power_fence(&(self.environment.policy)()?)?,
+                )),
                 generation: (
                     self.generation.clone(),
                     self.generation.load(Ordering::Acquire),
@@ -899,7 +1318,20 @@ impl Device {
         progressed
     }
     fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-        if !admitted(bytes, self.mac, meta) {
+        let valid = if matches!(self.current_iftype(), 3 | 9) {
+            (14..=1514).contains(&bytes.len())
+                && bytes[6] & 1 == 0
+                && bytes[6..12] != [0; 6]
+                && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
+                && !matches!(
+                    u16::from_be_bytes([bytes[12], bytes[13]]),
+                    0x888e | 0x80f3 | 0x8137
+                )
+                && super::csum::tx_admissible(bytes, meta)
+        } else {
+            admitted(bytes, self.mac, meta)
+        };
+        if !valid {
             return Err(());
         }
         let authority = self.fence.lock().clone().ok_or(())?;
@@ -959,10 +1391,10 @@ impl Device {
         let (rxp, rxc) = narf_ipc::channel::<Frame, RX_RING_N>();
         let (txp, txc) = narf_ipc::channel::<Frame, TX_RING_N>();
         self.source.invoke(|| {
-            narf_net::registry()
+            let original = narf_net::registry()
                 .register(authority, Registered(self.clone()))
-                .map(|_| ())
                 .map_err(|_| "MVM net capability registration failed")?;
+            self.p2p.registered(*authority, original);
             state.receive = Some(rxp);
             state.transmit = Some(txc);
             *self.rx.lock() = Some(rxc);
@@ -997,7 +1429,14 @@ impl Device {
     }
     async fn pump(self: Arc<Self>) {
         loop {
-            let mut activity = super::iwl_msix::Activity::new(self.irq, 20);
+            let mut activity = super::iwl_msix::Activity::new(
+                self.irq,
+                if matches!(self.current_iftype(), 3 | 9) || self.p2p.active() {
+                    1
+                } else {
+                    20
+                },
+            );
             let frames = poll_fn(|cx| {
                 let frames = self.step(Some(cx));
                 if !frames.is_empty() || Pin::new(&mut activity).poll(cx).is_ready() {
@@ -1046,22 +1485,333 @@ fn error(error: &'static str) -> WirelessError {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn supports_virtual_interfaces(&self) -> bool {
+        self.p2p_capable
+    }
+    fn async_control_interfaces(&self) -> bool {
+        self.p2p_capable
+    }
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        let mut types = Vec::new();
+        if self.go_capable {
+            types.push(8);
+            types.push(9);
+        }
+        if self.p2p_capable {
+            types.push(10);
+        }
+        types
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        mode: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        self.new_p2p_control(authority, name, mode, mac).await
+    }
+    fn current_iftype(&self) -> u32 {
+        self.mode.load(Ordering::Acquire)
+    }
+    fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        self.ap_set_mode(mode)
+    }
+    fn supports_ap(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_uapsd(&self) -> bool {
+        self.ap_capable
+    }
+    fn max_ap_assoc_sta(&self) -> u32 {
+        if self.ap_capable {
+            super::ap_wire::MAX_PEERS as u32
+        } else {
+            0
+        }
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_key_sequence(&self) -> bool {
+        self.current_iftype() == 9 && self.go_capable
+    }
+    async fn key_sequence_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<narf_wireless::KeySequence, i32> {
+        self.ap_key_sequence(authority, index, pairwise, peer)
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        self.ap_capable
+    }
+    fn cipher_suites(&self) -> &'static [u32] {
+        if self.ap_capable {
+            &[
+                narf_wireless::CIPHER_SUITE_CCMP,
+                narf_wireless::CIPHER_SUITE_AES_CMAC,
+            ]
+        } else {
+            &[narf_wireless::CIPHER_SUITE_CCMP]
+        }
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_capable
+            .then(|| core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire)))
+            .flatten()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.radio_control.try_reserve().map(Some)
+    }
+    async fn start_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), WirelessError> {
+        self.start_ap_with_settings_async(
+            authority,
+            config,
+            narf_wireless::ApStartSettings::default(),
+        )
+        .await
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(
+            authority,
+            ap::Operation::Start(Box::new(config), Box::new(settings)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(ap::error)
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Stop)
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Beacon(head, tail, probe))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn add_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Add(station))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Set(station))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        _reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Delete(peer))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::Key(key))
+            .await
+            .map(|_| ())
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::DeleteKey(index, pairwise, peer))
+            .await
+            .map(|_| ())
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_control(
+            authority,
+            ap::Operation::DefaultKey(index, unicast, multicast, management, beacon),
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control(authority, ap::Operation::Control(request))
+            .await
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.ap_control(authority, ap::Operation::Management(request))
+            .await
+            .map_err(ap::error)
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        frame_type: u16,
+        prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        self.ap_register(authority, frame_type, prefix)
+    }
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        matches!(self.current_iftype(), 8 | 9) && self.go_capable
+    }
+    fn async_p2p_netdev_management_rx_control(&self) -> bool {
+        matches!(self.current_iftype(), 8 | 9) && self.go_capable
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        if self.current_iftype() == 8 {
+            return self.client_frame(authority, cookie, request).await;
+        }
+        let original = authority.go_ap_control_for(self)?;
+        self.mgmt_tx_ap_async(&original, cookie, request).await
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        if self.current_iftype() == 8 {
+            return self.client_register(authority, frame_type, prefix);
+        }
+        let original = authority.go_ap_control_for(self).map_err(|_| 1)?;
+        self.register_mgmt_frame_ap_async(&original, frame_type, prefix.to_vec())
+            .await
+            .map_err(|error| match error {
+                WirelessError::Busy => 16,
+                WirelessError::InvalidArgs => 22,
+                WirelessError::NotSupported => 95,
+                WirelessError::Denied => 1,
+                _ => 5,
+            })
+    }
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        if matches!(self.current_iftype(), 3 | 8 | 9) {
+            return self.ap_control_generation();
+        }
+        core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.radio_control.try_reserve().map(Some)
+    }
+    fn sched_scan_support(&self) -> Option<narf_wireless::SchedScanSupport> {
+        (self.current_iftype() == 2)
+            .then(|| self.scheduled_support())
+            .flatten()
+    }
+    fn async_sched_scan_control(&self) -> bool {
+        true
+    }
+    fn sched_scan_pass_all(&self) -> bool {
+        true
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        request: narf_wireless::SchedScanRequest,
+    ) -> Result<(), i32> {
+        self.scheduled_control(authority, Some(request)).await
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        self.scheduled_control(authority, None).await
+    }
     fn supports_handshake_offload(&self) -> bool {
-        self.wpa2
+        matches!(self.current_iftype(), 2 | 8) && self.wpa2
     }
     /// Host SAE plus the native PMF key owner (§3.33).
     fn supports_sae_offload(&self) -> bool {
-        self.sae
+        matches!(self.current_iftype(), 2 | 8) && self.sae
     }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        (self.ht20 && matches!(band_mhz, 2400 | 5000)).then(|| {
-            narf_wireless::iface::PhyCapabilities {
-                ht: super::mvm_boot::local_ht().capability_body(),
-                vht: None,
+        (!matches!(self.current_iftype(), 3 | 8 | 9)
+            && self.ht20
+            && matches!(band_mhz, 2400 | 5000))
+        .then(|| narf_wireless::iface::PhyCapabilities {
+            ht: if self.vht && band_mhz == 5000 {
+                super::mvm_boot::local_ht_for(super::mvm_boot::feature_bits::HT40)
+            } else {
+                super::mvm_boot::local_ht()
             }
+            .capability_body(),
+            vht: (self.vht && band_mhz == 5000)
+                .then(|| super::mvm_boot::local_vht_for(0).capability_body()),
         })
     }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
@@ -1082,11 +1832,19 @@ impl WirelessNetIface for Device {
                         .collect(),
                 })
                 .collect(),
-            modes: WirelessModes::STATION,
+            modes: (if self.ap_capable {
+                WirelessModes::STATION | WirelessModes::AP
+            } else {
+                WirelessModes::STATION
+            }) | if self.go_capable || self.p2p_capable {
+                WirelessModes::P2P
+            } else {
+                WirelessModes::empty()
+            },
             hw_caps: HwCaps {
-                ht_supported: self.ht20,
-                vht_supported: false,
-                he_supported: false,
+                ht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.ht20,
+                vht_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.vht,
+                he_supported: !matches!(self.current_iftype(), 3 | 8 | 9) && self.he,
                 eht_supported: false,
             },
         }
@@ -1099,8 +1857,10 @@ impl WirelessNetIface for Device {
             .station_information(bssid)
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        if request.active
-            || request.random_mac.is_some()
+        if !matches!(self.current_iftype(), 2 | 8) {
+            return Err(WirelessError::Busy);
+        }
+        if request.random_mac.is_some()
             || request.colocated_6ghz
             || request.duration_mandatory
             || !request.extra_ies.is_empty()
@@ -1147,9 +1907,10 @@ impl WirelessNetIface for Device {
             }
             channels
         };
+        self.ensure_scheduled_stopped().await.map_err(error)?;
         self.recover_failed().await.map_err(error)?;
         let reply = self
-            .begin(Operation::Scan(channels, request.ssids))
+            .begin(Operation::Scan(channels, request.ssids, request.active))
             .map_err(error)?;
         match self.wait(reply).await.map_err(error)? {
             Outcome::Scan(result) => Ok(result),
@@ -1157,6 +1918,9 @@ impl WirelessNetIface for Device {
         }
     }
     async fn associate(&self, mut request: AssociateRequest) -> Result<(), WirelessError> {
+        if !matches!(self.current_iftype(), 2 | 8) {
+            return Err(WirelessError::Busy);
+        }
         let channel = u8::try_from(request.channel).map_err(|_| WirelessError::InvalidArgs)?;
         let frequency = channel_frequency(channel);
         if !self.channels.contains(&channel)
@@ -1183,16 +1947,27 @@ impl WirelessNetIface for Device {
             _ => return Err(WirelessError::NotSupported),
         };
         let join = Join {
+            client_role: (self.current_iftype() == 8).then(|| self.ap_host.role.lock().observe()),
             bssid: request.bssid,
             ssid: request.ssid,
             channel,
             elements: request.ie,
             credential,
         };
+        self.ensure_scheduled_stopped().await.map_err(error)?;
         let reply = self.begin(Operation::Join(join)).map_err(error)?;
         self.wait(reply).await.map_err(error).map(|_| ())
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        if self.p2p.active() {
+            return Err(WirelessError::Busy);
+        }
+        if matches!(self.current_iftype(), 3 | 9) {
+            return self
+                .stop_ap_retained()
+                .await
+                .map_err(|_| WirelessError::HardwareError);
+        }
         self.request_close();
         poll_fn(|cx| {
             let _ = progress::poll_work(&self.control, cx);
@@ -1208,11 +1983,30 @@ impl WirelessNetIface for Device {
         })
         .await
     }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.wowlan_capable.then(super::mvm_d3::support)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        if !self.wowlan_capable {
+            return Err(narf_wireless::EOPNOTSUPP);
+        }
+        if let Some(config) = &config {
+            super::mvm_d3::Wake::from_config(config).map_err(|_| 22)?; // EINVAL, like nl80211 parse_wowlan
+        }
+        *self.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         let v = self.bssid.load(Ordering::Acquire);
         (v >> 56 != 0).then(|| core::array::from_fn(|i| (v >> (8 * i)) as u8))
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
+        if matches!(self.current_iftype(), 3 | 9) {
+            return Err(WirelessError::NotSupported);
+        }
         if config.tx_power_dbm.is_some() || config.channel != 0 {
             return Err(WirelessError::NotSupported);
         }
@@ -1293,3 +2087,14 @@ fn drain_network() -> bool {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_device_tests.rs"]
 mod tests;
+
+#[path = "mvm_scheduled_device.rs"]
+mod scheduled;
+
+#[path = "mvm_ap_device.rs"]
+mod ap;
+#[path = "mvm_p2p_device.rs"]
+mod p2p;
+
+#[path = "mvm_client_device.rs"]
+mod client_control;

@@ -240,6 +240,54 @@ fn smoke_rtw89_irq_quarantine_keeps_vector_reserved() -> TestResult {
     TestResult::Pass
 }
 
+fn smoke_rtw89_multiple_vectors_route_and_retire_independently() -> TestResult {
+    let first = Line::new();
+    let second = Line::new();
+    let Ok(a) = Vector::install(&first) else {
+        return TestResult::Skip("no free first interrupt vector");
+    };
+    let Ok(b) = Vector::install(&second) else {
+        a.release();
+        return TestResult::Skip("no free second interrupt vector");
+    };
+    let a_number = a.number();
+    let b_number = b.number();
+    narf_interrupts::enable_irq(a_number);
+    narf_interrupts::enable_irq(b_number);
+    narf_interrupts::on_irq(a_number);
+    if first.delivered() != 1 || second.delivered() != 0 || a_number == b_number {
+        a.release();
+        b.release();
+        return TestResult::Fail("MSI delivery crossed retained functions");
+    }
+    a.release();
+    narf_interrupts::on_irq(b_number);
+    if first.delivered() != 1 || second.delivered() != 1 {
+        b.release();
+        return TestResult::Fail("retiring one MSI disabled another function");
+    }
+    let replacement = Line::new();
+    let Ok(c) = Vector::install(&replacement) else {
+        b.release();
+        return TestResult::Fail("released vector/handler slot could not be rebound");
+    };
+    narf_interrupts::enable_irq(c.number());
+    narf_interrupts::on_irq(c.number());
+    narf_interrupts::on_irq(b_number);
+    let isolated =
+        first.delivered() == 1 && second.delivered() == 2 && replacement.delivered() == 1;
+    c.release();
+    b.release();
+    if !isolated {
+        return TestResult::Fail("reused IRQ slot aliased an old or unrelated line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/multiple",
+    smoke_rtw89_multiple_vectors_route_and_retire_independently
+);
+
 kernel_test_in!(
     "drivers/wireless/rtw89/irq",
     smoke_rtw89_irq_mask_matches_linux_config_intr_mask

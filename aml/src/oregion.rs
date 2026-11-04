@@ -12,6 +12,17 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::{full_path, AmlError, NameValue};
 use crate::{read_name_string, read_pkg_length, try_read_simple_value, Parser};
 
+#[path = "oregion_checked.rs"]
+mod checked;
+pub use checked::{read_field_checked, write_field_checked};
+#[path = "ec_checked.rs"]
+mod ec_checked;
+#[cfg(feature = "kernel-test")]
+#[path = "oregion_test_scope.rs"]
+mod test_scope;
+#[cfg(feature = "kernel-test")]
+pub(crate) use test_scope::TestRegions;
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Address-space kind for an OpRegion.
@@ -83,6 +94,9 @@ pub struct FieldInfo {
     ///   1 = WriteAsOnes  (unmodified bits = 1)
     ///   2 = WriteAsZeros (unmodified bits = 0)
     pub update_rule: u8,
+    /// FieldFlags bit4: requires the ACPI Global Lock. Checked accessors
+    /// refuse it until that firmware lock owner is implemented.
+    pub lock_rule: bool,
     /// `Some` when this field belongs to an IndexField (audit
     /// #7 full impl). Reads write the field's byte offset to the
     /// index register, then read the data register; writes write
@@ -522,6 +536,11 @@ fn ec_read_byte(offset: u8) -> Result<u8, FieldAccessError> {
     // Shared gate (#913): the whole command → address → data
     // sequence must not interleave with any other EC transaction.
     let _gate = acquire_ec_txn_gate();
+    ec_read_byte_under_gate(offset)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ec_read_byte_under_gate(offset: u8) -> Result<u8, FieldAccessError> {
     let (data, cmd) = match *EC_PORTS.lock() {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
@@ -545,6 +564,11 @@ fn ec_read_byte(offset: u8) -> Result<u8, FieldAccessError> {
 fn ec_write_byte(offset: u8, val: u8) -> Result<(), FieldAccessError> {
     // Shared gate (#913): see ec_read_byte.
     let _gate = acquire_ec_txn_gate();
+    ec_write_byte_under_gate(offset, val)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ec_write_byte_under_gate(offset: u8, val: u8) -> Result<(), FieldAccessError> {
     let (data, cmd) = match *EC_PORTS.lock() {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
@@ -1404,6 +1428,7 @@ fn parse_field_list_full(
                     bit_length: bit_len,
                     access_kind,
                     update_rule,
+                    lock_rule: flags & 0x10 != 0,
                     index_field: index_field.clone(),
                     bank_field: bank_field.clone(),
                 });

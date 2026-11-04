@@ -2,7 +2,7 @@
 //! SDIO function match → verified firmware → actual loader → FIFO station.
 //! The SDHCI host hands over whole-card ownership, never a second F1 window.
 
-use super::{firmware::FirmwareLoader, interface, sdio_bridge::SdioTransport};
+use super::{interface, sdio_bridge::SdioTransport};
 use core::fmt::Write;
 use narf_drivers_sdio::native::{FunctionDriver, NativeCard};
 
@@ -32,9 +32,14 @@ pub enum ProvisionState {
     Ready = 2,
     Failed = 3,
 }
+/// Retained generation owner of one provisioned card.
+pub type SdioGeneration<R> = interface::generation::Generation<
+    super::runtime::Runtime<SdioTransport<narf_drivers_sdio::card::Card<R>>>,
+>;
 pub struct Provisioner<R: narf_drivers_sdio::pio::Registers + Send + 'static> {
     card: narf_lib::mutex::Mutex<Option<narf_drivers_sdio::card::Card<R>>>,
     state: core::sync::atomic::AtomicU8,
+    generation: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<SdioGeneration<R>>>>,
 }
 impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> core::fmt::Debug for Provisioner<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -58,7 +63,12 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
         Self {
             card: narf_lib::mutex::Mutex::new(Some(card)),
             state: core::sync::atomic::AtomicU8::new(ProvisionState::Parked as u8),
+            generation: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
+    }
+    /// The published generation owner, once provisioning completed.
+    pub fn generation(&self) -> Option<alloc::sync::Arc<SdioGeneration<R>>> {
+        self.generation.lock().clone()
     }
     pub fn state(&self) -> ProvisionState {
         use core::sync::atomic::Ordering;
@@ -102,7 +112,6 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
         manifest: &str,
         policy: impl FnOnce() -> Result<(), &'static str>,
     ) -> Result<(), &'static str> {
-        use crate::brcmfmac::provision::{select_using, Family};
         use core::sync::atomic::Ordering;
         let mut slot = self.card.lock().await;
         if self.state() != ProvisionState::Parked {
@@ -114,20 +123,9 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
             .ok_or("explicit SDIO host/board identity required")?;
         let function = card.function(1).ok_or("CYW43439 F1 identity unavailable")?;
         let vendor = super::fullmac::FirmwareVendor::sdio(function.vendor);
-        let selection = select_using(
-            authority,
-            manifest,
-            Family::Sdio43439,
-            host,
-            Some((1, function.vendor, function.device)),
-        )
-        .map_err(|_| "signed CYW43439 host/card board selection unavailable or mismatched")?;
-        let assets = selection
-            .load_using(authority)
-            .map_err(|_| "selected CYW43439 asset signature/key/length/hash mismatch")?;
-        // Shared single-board parser rejects generic/multi-device selectors.
-        let nvram = crate::brcmfmac::boot::pack_nvram(&assets.nvram)
-            .map_err(|_| "invalid selected CYW43439 NVRAM")?;
+        let identity = (function.vendor, function.device);
+        let (selection, assets, nvram) =
+            super::sdio_reset::select(authority, manifest, host, identity)?;
         policy()?;
         assets
             .proof
@@ -137,35 +135,34 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
             .store(ProvisionState::Starting as u8, Ordering::Release);
         let _attempt = Attempt(&self.state);
         let card = slot.take().ok_or("parked SDIO card unavailable")?;
-        let mut transport = SdioTransport::new(card).qualify(assets.proof.clone());
-        transport
-            .prepare()
-            .map_err(|_| "SDIO F1 preparation failed")?;
-        let mut loader = FirmwareLoader::new(transport, &assets.firmware, &nvram, 0, false)
-            .require_revisions(selection.revisions());
-        loader
-            .run()
-            .map_err(|_| "firmware bootstrap/chip revision failed")?;
-        let core = loader.packet_core().ok_or("firmware did not release CM3")?;
-        let revision = loader
-            .packet_core_revision()
-            .ok_or("firmware did not release CM3")?;
-        let mut transport = loader
-            .into_transport()
-            .map_err(|_| "firmware owner not ready")?;
-        transport
-            .initialize_packets(core)
-            .map_err(|_| "F2/mailbox setup failed")?;
-        // brcmf_sdio_firmware_callback: save-restore idle sleep setup.
-        transport
-            .initialize_sleep(revision)
-            .map_err(|_| "SDIO save-restore setup failed")?;
+        let transport = super::sdio_reset::boot_card(card, &assets, &nvram, selection.revisions())?;
         drop(slot);
         let name = narf_net::iface::reserve_name("wlan%d");
-        let runtime = super::runtime::Runtime::new(transport).with_firmware_vendor(vendor);
-        interface::attach_runtime(name, runtime, &assets.clm)
+        // brcmf_sdio_bus_reset + re-probe: the retained authority resets
+        // and reboots this card in place (`sdio_reset.rs`).
+        let clm: super::sdio_reset::Clm =
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(assets.clm.clone()));
+        let reboot =
+            super::sdio_reset::Reprovision::new(*authority, manifest, host, identity, clm.clone());
+        let runtime = super::runtime::Runtime::new(transport)
+            .with_firmware_vendor(vendor)
+            .with_reboot(alloc::boxed::Box::new(reboot));
+        let device = interface::attach_runtime(name, runtime, &assets.clm)
             .await
             .map_err(|_| "station initialization failed")?;
+        let generation = alloc::sync::Arc::new(SdioGeneration::with_publisher(
+            device,
+            alloc::boxed::Box::new(move |name, runtime| {
+                let clm = clm.lock().clone();
+                alloc::boxed::Box::pin(async move {
+                    interface::attach_runtime(name, runtime, &clm).await
+                })
+            }),
+        ));
+        *self.generation.lock() = Some(generation.clone());
+        // brcmf_fw_crashed / a fatal bus error -> brcmf_sdio_bus_reset, as
+        // a supervised generation swap with Station replay and rejoin.
+        narf_scheduler::spawn(generation.supervise());
         self.state
             .store(ProvisionState::Ready as u8, Ordering::Release);
         narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -179,7 +176,7 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
     }
 }
 static NATIVE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::sync::Arc<Provisioner<narf_drivers_sdio::native::Mmio>>>,
+    Option<alloc::sync::Arc<Provisioner<narf_drivers_sdio::native::NativeRegisters>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 pub(super) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
     max_attempts: usize,

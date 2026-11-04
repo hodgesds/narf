@@ -15,6 +15,32 @@ mod firmware_metadata {
 }
 include!("firmware/rtl8821c_metadata.rs");
 
+fn smoke_rtw88_firmware_feature_signature_is_not_a_power_receipt() -> TestResult {
+    let mut bytes = narf_wifi_fixtures::firmware::sparse_image(
+        SOURCE_8821C_LENGTH,
+        &[(0, SOURCE_8821C_HEADER)],
+    )
+    .unwrap();
+    for (wire, expected) in [
+        (0u32, 0u32),
+        (0x16, 0),
+        (0x17, 0x17),
+        (0x8000_0001, 0x8000_0001),
+    ] {
+        bytes[0x0c..0x10].copy_from_slice(&wire.to_le_bytes());
+        bytes[7] = 29;
+        match parse(0xc821, &bytes) {
+            Ok(image) if image.info.features == expected && image.info.subindex == 29 => {}
+            _ => return TestResult::Fail("firmware feature signature or subindex parsing"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw88_firmware_feature_signature_is_not_a_power_receipt
+);
+
 fn smoke_rtw8821ce_raw_source_header_and_exact_profile_binding() -> TestResult {
     let bytes = narf_wifi_fixtures::firmware::sparse_image(
         SOURCE_8821C_LENGTH,
@@ -35,6 +61,8 @@ fn smoke_rtw8821ce_raw_source_header_and_exact_profile_binding() -> TestResult {
         != (Info {
             version: 24,
             subversion: 11,
+            subindex: 0,
+            features: 7,
             h2c: 12,
             sections: 3,
         })
@@ -88,6 +116,8 @@ fn smoke_rtw8822ce_raw_source_metadata_parser_golden() -> TestResult {
         != (Info {
             version: 9,
             subversion: 9,
+            subindex: 15,
+            features: 0x1e7,
             h2c: 15,
             sections: 3,
         })
@@ -221,23 +251,47 @@ unsafe impl Io for Model {
         self.claim = true;
         Ok(())
     }
-    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
-        Ok(self.read(8, reg)? as u8)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { Ok(self.read(8, reg)? as u8) }
     }
-    fn read16(&mut self, reg: u16) -> Result<u16, Error> {
-        Ok(self.read(16, reg)? as u16)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move { Ok(self.read(16, reg)? as u16) }
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
-        self.read(32, reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { self.read(32, reg) }
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
-        self.write(8, reg, u32::from(value))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(8, reg, u32::from(value)) }
     }
-    fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error> {
-        self.write(16, reg, u32::from(value))
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        reg: u16,
+        value: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(16, reg, u32::from(value)) }
     }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
-        self.write(32, reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.write(32, reg, value) }
     }
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error> {
         self.access(Op::Packet(data.to_vec()))?;

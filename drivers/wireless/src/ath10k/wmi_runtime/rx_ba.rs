@@ -33,6 +33,14 @@ fn order_error(error: narf_wireless::reorder::Error) -> Error {
     }
 }
 impl Owner {
+    pub(super) fn host_idle(&self) -> bool {
+        self.ppdu.is_none()
+            && self
+                .sessions
+                .iter()
+                .flatten()
+                .all(|session| session.order.buffered() == 0)
+    }
     pub(super) fn new(profile: Option<ht::Profile>) -> Result<Self, Error> {
         let mut sessions = Vec::new();
         sessions
@@ -44,6 +52,15 @@ impl Owner {
             sessions,
             ppdu: None,
         })
+    }
+    pub(super) fn narrow_coexistence(&mut self, primary: u16) -> Result<(), Error> {
+        let profile = self
+            .profile
+            .ok_or(Error::Failed)?
+            .coexistence_twenty(primary)?;
+        self.flush();
+        self.profile = Some(profile);
+        Ok(())
     }
     pub(super) fn ht(&self) -> bool {
         self.profile.is_some()

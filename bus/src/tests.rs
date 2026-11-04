@@ -7,6 +7,10 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 extern crate alloc;
 
+#[cfg(feature = "kernel-test")]
+#[path = "pci_pme_tests.rs"]
+mod pci_pme;
+
 /// Restore the live bus registry after a smoke temporarily installs
 /// synthetic devices.  Kernel smokes share one process and therefore one
 /// registry; leaking a fake ECAM address makes later MMIO tests order-
@@ -1371,6 +1375,81 @@ fn smoke_pci_express_link_control_update() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_pci_express_link_control_update);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_pci_express_parent_link_control_uses_current_child_authority() -> TestResult {
+    use crate::pci_express::{parent_link_control, PcieCapError};
+    use narf_capabilities::{Cap, Read};
+    struct Restore(alloc::vec::Vec<crate::BusDevice>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::registry::install(core::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(crate::registry::devices());
+    let parent_cfg = FakeWindow::new(4096);
+    let child_cfg = FakeWindow::new(4096);
+    // SAFETY: both config windows remain owned until after this mapping guard
+    // is dropped. The smoke owns and restores the synthetic PCI registry.
+    let _ecam = unsafe {
+        crate::ecam::__test_windows(&[
+            (
+                narf_memory::PhysAddr::new(parent_cfg.phys),
+                parent_cfg.ptr,
+                4096,
+            ),
+            (
+                narf_memory::PhysAddr::new(child_cfg.phys),
+                child_cfg.ptr,
+                4096,
+            ),
+        ])
+    };
+    parent_cfg.write32(0x0c, 1 << 16); // type1 bridge header
+    parent_cfg.write32(0x18, 0x0003_0300); // secondary/subordinate bus3
+    parent_cfg.write32(0x04, 0x0010_0000); // PCI Status CAP_LIST
+    parent_cfg.write32(0x34, 0x80);
+    parent_cfg.write32(0x80, 0x10); // PCIe capability, no next capability
+    parent_cfg.write32(0x90, 0x1234_0042); // Link Status / Link Control
+    let parent = fake_pcie(0x7f30, 1, 0x1234, 1, 0x060400, parent_cfg.phys);
+    let mut child = fake_pcie(0x7f30, 0, 0x168c, 0x2b, 0x028000, child_cfg.phys);
+    let child_addr = crate::addr::PcieAddr::new(0x7f30, 3, 0, 0);
+    child.addr = crate::BusAddr::Pcie(child_addr);
+    child.kind = crate::BusKind::Pcie {
+        addr: child_addr,
+        cfg_phys: narf_memory::PhysAddr::new(child_cfg.phys),
+    };
+    crate::registry::install(alloc::vec![parent, child]);
+    let cap = Cap::<crate::BusDeviceCap, Read>::bootstrap();
+    if parent_link_control(&cap, &child) != Ok(Some(0x42)) || parent_cfg.read32(0x90) != 0x1234_0042
+    {
+        return TestResult::Fail("parent Link Control missing or read changed shared policy");
+    }
+    // A function on the root bus must not borrow another device's parent.
+    if parent_link_control(&cap, &parent) != Ok(None) {
+        return TestResult::Fail("root function acquired a false upstream link");
+    }
+    parent_cfg.write32(0x04, 0);
+    if parent_link_control(&cap, &child) != Ok(None) {
+        return TestResult::Fail("parent without a capability list became a device failure");
+    }
+    parent_cfg.write32(0x04, 0x0010_0000);
+    parent_cfg.write32(0x90, u32::MAX);
+    if parent_link_control(&cap, &child) != Ok(None) {
+        return TestResult::Fail("unavailable parent config became ASPM permission");
+    }
+    cap.revoke();
+    parent_cfg.write32(0x90, 0x1234_0042);
+    if parent_link_control(&cap, &child) != Err(PcieCapError::AuthorityRevoked) {
+        return TestResult::Fail("revoked child retained parent Link Control access");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "bus/pcie",
+    smoke_pci_express_parent_link_control_uses_current_child_authority
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_msix_program_block() -> TestResult {

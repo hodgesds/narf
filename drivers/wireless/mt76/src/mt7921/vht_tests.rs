@@ -89,7 +89,8 @@ fn ht_rx2_basic(ies: &mut [u8], mandatory: bool) {
         offset += 2 + usize::from(ies[offset + 1]);
     }
 }
-pub(super) fn prepared(width: u8, secure: bool) -> (Session<Model>, ScanBss, TxPermission) {
+#[inline(never)]
+pub(super) fn prepared(width: u8, secure: bool) -> (NativeSession, ScanBss, TxPermission) {
     let (mut session, mut bss) = super::wmm_tests::prepared(true, secure);
     session.backend.station_channel = 36;
     bss.channel = 36;
@@ -256,7 +257,8 @@ fn native() -> Result<(), &'static str> {
         for secure in [false, true] {
             let (mut s, b, p) = prepared(width, secure);
             if join(&mut s, &b, p, secure) != Ok(42)
-                || s.vht_profile
+                || s.station
+                    .vht_profile
                     .is_none_or(|v| v.width() != width || v.center() != p.center_channel())
             {
                 return Err("native VHT association/width");
@@ -331,7 +333,10 @@ fn native() -> Result<(), &'static str> {
                 return Err("native VHT packet changed BA/key ownership");
             }
             run(s.disassociate_station()).map_err(|_| "VHT native teardown")?;
-            if s.vht_profile.is_some() || s.tx_ba.published() || s.station_permission.is_some() {
+            if s.station.vht_profile.is_some()
+                || s.station.tx_ba.published()
+                || s.station.permission.is_some()
+            {
                 return Err("VHT teardown retained admission");
             }
         }
@@ -353,8 +358,8 @@ fn narrow() -> Result<(), &'static str> {
         s.backend.ht_reply = Some(ht);
         s.backend.vht_reply = Some(vht);
         if join(&mut s, &b, p, true) != Ok(42)
-            || s.vht_profile.is_none_or(|v| v.width() != response)
-            || s.station_permission.is_none_or(|g| {
+            || s.station.vht_profile.is_none_or(|v| v.width() != response)
+            || s.station.permission.is_none_or(|g| {
                 g.native_width() != response
                     || !g.channels().iter().all(|ch| p.channels().contains(ch))
             })
@@ -389,7 +394,7 @@ fn narrow() -> Result<(), &'static str> {
     let (ht, vht) = elements(2, 36);
     s.backend.ht_reply = Some(ht);
     s.backend.vht_reply = Some(vht);
-    if join(&mut s, &b, p, false).is_ok() || s.vht_profile.is_some() {
+    if join(&mut s, &b, p, false).is_ok() || s.station.vht_profile.is_some() {
         return Err("response gained occupied channels beyond original offer");
     }
     Ok(())
@@ -517,7 +522,7 @@ fn mcs_basic() -> Result<(), &'static str> {
         s.backend.vht_reply = Some(vht);
         let before = s.backend.frames.len();
         if join(&mut s, &b, p, false).is_ok()
-            || s.vht_profile.is_some()
+            || s.station.vht_profile.is_some()
             || matches!(s.state, State::Associated { .. })
             || s.backend.frames[before..]
                 .iter()
@@ -534,7 +539,9 @@ fn mcs_basic() -> Result<(), &'static str> {
     s.backend.ht_reply = Some(ht);
     s.backend.vht_reply = Some(vht);
     if join(&mut s, &b, p, false) != Ok(42)
-        || s.vht_profile.is_none_or(|profile| profile.width() != 0)
+        || s.station
+            .vht_profile
+            .is_none_or(|profile| profile.width() != 0)
     {
         return Err("mandatory MCS8 response narrowing was rejected");
     }
@@ -604,7 +611,8 @@ fn receive_nss() -> Result<(), &'static str> {
                     .ok_or("native directional NSS peer")?;
                 if peer[8..10] != tx_map.to_le_bytes()
                     || peer[10..12] != rx.to_le_bytes()
-                    || s.vht_profile
+                    || s.station
+                        .vht_profile
                         .is_none_or(|profile| profile.state() != selected | ((streams - 1) << 4))
                 {
                     return Err("native NSS qualification or directional map lost");
@@ -949,8 +957,8 @@ fn failure() -> Result<(), &'static str> {
                 return Err("rejected VHT peer accepted");
             }
         }
-        if s.vht_profile.is_some()
-            || s.ht20_rx.as_ref().is_some_and(|r| r.active)
+        if s.station.vht_profile.is_some()
+            || s.station.ht20_rx.as_ref().is_some_and(|r| r.active)
             || matches!(s.state, State::Associated { .. })
             || !s.backend.owner.published
         {
@@ -961,8 +969,8 @@ fn failure() -> Result<(), &'static str> {
         let (mut s, b, p) = prepared(2, false);
         s.backend.deny_tx_after = Some(stage);
         if join(&mut s, &b, p, false) != Err(Error::Authority)
-            || s.vht_profile.is_some()
-            || s.station_permission.is_some()
+            || s.station.vht_profile.is_some()
+            || s.station.permission.is_some()
         {
             return Err("VHT native publication crossed current policy");
         }
@@ -995,7 +1003,7 @@ fn changes() -> Result<(), &'static str> {
         let mut packet = descriptor(&unchanged);
         packet[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
         s.backend.packets.push_back(packet);
-        if s.receive_ethernet() != Ok(None) || s.peer_lost {
+        if s.receive_ethernet() != Ok(None) || s.station.peer_lost {
             return Err("unchanged AP PHY facts compared with local transmit intersection");
         }
         let mut frame = vec![0; if action { 27 } else { 36 }];
@@ -1038,7 +1046,7 @@ fn capability() -> Result<(), &'static str> {
         };
         info.capabilities.phy.max_bandwidth = opaque_width;
         s.state = State::RadioReady(info);
-        if join(&mut s, &b, p, false) != Ok(42) || s.vht_profile.is_none() {
+        if join(&mut s, &b, p, false) != Ok(42) || s.station.vht_profile.is_none() {
             return Err("opaque PHY max_bw decoded as a command enum");
         }
     }
@@ -1057,7 +1065,7 @@ fn capability() -> Result<(), &'static str> {
         let before = s.backend.frames.len();
         if join(&mut s, &b, p, false).is_ok()
             || s.backend.frames.len() != before
-            || s.vht_profile.is_some()
+            || s.station.vht_profile.is_some()
         {
             return Err("missing actual NIC VHT/HT/band/NSS admitted native80");
         }
@@ -1107,10 +1115,10 @@ fn selectors() -> Result<(), &'static str> {
         }
         let result = join(&mut s, &b, p, false);
         if selector == 0xfa {
-            if result.is_ok() || s.vht_profile.is_some() {
+            if result.is_ok() || s.station.vht_profile.is_some() {
                 return Err("HE mandatory membership silently stripped");
             }
-        } else if result != Ok(42) || s.vht_profile.is_none() {
+        } else if result != Ok(42) || s.station.vht_profile.is_none() {
             return Err("native completed VHT profile did not bind mandatory HT/VHT selector");
         }
     }
@@ -1133,7 +1141,7 @@ fn selectors() -> Result<(), &'static str> {
             }
         }
         if join(&mut s, &b, p, false).is_ok()
-            || s.vht_profile.is_some()
+            || s.station.vht_profile.is_some()
             || matches!(s.state, State::Associated { .. })
         {
             return Err("incompatible response MCS/geometry left a partial associated producer");
@@ -1180,8 +1188,8 @@ fn rekey() -> Result<(), &'static str> {
     s.backend.anonce = [0x55; 32];
     let before = s.backend.frames.len();
     run(s.service_keys()).map_err(|_| "VHT originator retirement before M2")?;
-    if s.tx_ba.published()
-        || s.tx_ba.active()
+    if s.station.tx_ba.published()
+        || s.station.tx_ba.active()
         || s.backend.frames[before..]
             .iter()
             .position(|(_, f)| extract_eapol(f).is_some())
@@ -1194,7 +1202,8 @@ fn rekey() -> Result<(), &'static str> {
     }
     run(s.service_keys()).map_err(|_| "VHT native PTK receipts")?;
     s.backend.packets.push_back(data(true, 2, 7, 1, 1));
-    if s.receive_ethernet().ok().flatten().is_none() || s.vht_profile.is_none_or(|v| v.width() != 2)
+    if s.receive_ethernet().ok().flatten().is_none()
+        || s.station.vht_profile.is_none_or(|v| v.width() != 2)
     {
         return Err("new VHT key retained old PN or lost completed PHY context");
     }
@@ -1247,9 +1256,10 @@ fn fallback() -> Result<(), &'static str> {
             }
         } else {
             if result != Ok(42)
-                || s.vht_profile.is_some()
-                || s.ht20_profile.is_none()
-                || s.station_permission
+                || s.station.vht_profile.is_some()
+                || s.station.ht20_profile.is_none()
+                || s.station
+                    .permission
                     .is_none_or(|g| g.native_width() != u8::from(width == 40))
                 || s.backend
                     .frames

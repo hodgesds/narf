@@ -8,12 +8,45 @@ use narf_lib::id::DomainId;
 
 use super::{boot_context, rx, rx_rfh, transport::IwlMmio, tx_gen2, ParsedUcode};
 
+/// A native IRQ/timer wait whose current source/RF authority is checked
+/// on every poll. Revocation completes the wait immediately so its owner
+/// reaches `Hardware::poll` and the retained stop path without timer lag.
+pub struct Activity {
+    inner: super::iwl_msix::Activity,
+    source: Result<source::Fence, &'static str>,
+}
+impl core::fmt::Debug for Activity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IwlNativeActivity").finish_non_exhaustive()
+    }
+}
+impl core::future::Future for Activity {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if match &self.source {
+            Ok(source) => source.invoke(|| Ok(())).is_err(),
+            Err(_) => true,
+        } {
+            return core::task::Poll::Ready(());
+        }
+        core::future::Future::poll(core::pin::Pin::new(&mut self.inner), cx)
+    }
+}
+
 pub const RX_DEPTH: usize = 512;
 pub const COMMAND_DEPTH: usize = 128;
 pub const RX_BUFFER_BYTES: usize = 4096;
 
 /// Order coherent DMA against the peripheral, including on aarch64
 /// where an inner-shareable CPU atomic barrier alone is insufficient.
+/// `CSR_HW_IF_CONFIG_REG_PERSISTENCE` (`iwl-csr.h`, 0x40000000).
+const D3_PERSISTENCE: u32 = 0x4000_0000;
+/// `CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ` (`iwl-csr.h`).
+const GP_CNTRL_MAC_ACCESS_REQ: u32 = 1 << 3;
+
 pub fn dma_barrier() {
     compiler_fence(Ordering::SeqCst);
     #[cfg(target_arch = "aarch64")]
@@ -46,6 +79,8 @@ pub struct Packet {
     /// Immutable RFH copy-time owner. Closed-port captures never acquire a
     /// later key/association epoch merely because parsing was delayed.
     pub receive_epoch: Option<u64>,
+    /// Physical RFH owner that copied this packet; never firmware payload.
+    pub receive_queue: u8,
 }
 
 /// Extract notifications/responses without treating padding or a short
@@ -66,6 +101,7 @@ pub fn packets(bytes: &[u8]) -> Result<Vec<Packet>, &'static str> {
             header,
             payload: bytes[offset + 8..offset + 4 + length].to_vec(),
             receive_epoch: None,
+            receive_queue: 0,
         });
         offset += (length + 4).next_multiple_of(64);
     }
@@ -74,6 +110,7 @@ pub fn packets(bytes: &[u8]) -> Result<Vec<Packet>, &'static str> {
 
 #[derive(Debug)]
 pub struct ReceiveQueue {
+    id: u8,
     free: DmaBuffer,
     used: DmaBuffer,
     status: DmaBuffer,
@@ -88,7 +125,14 @@ pub struct ReceiveQueue {
 
 impl ReceiveQueue {
     pub fn new(format: rx_rfh::CompletionFormat) -> Result<Self, &'static str> {
+        Self::for_queue(format, 0)
+    }
+    fn for_queue(format: rx_rfh::CompletionFormat, id: u8) -> Result<Self, &'static str> {
+        if id >= 16 {
+            return Err("RFH queue outside native sender mask");
+        }
         let mut queue = Self {
+            id,
             free: dma_alloc(RX_DEPTH * format.free_size())?,
             used: dma_alloc(RX_DEPTH * format.size())?,
             status: dma_alloc(16)?,
@@ -131,6 +175,24 @@ impl ReceiveQueue {
         self.write = (self.write + 1) & (RX_DEPTH - 1);
     }
 
+    /// RFH_QUEUE_CONFIG publishes the initial free index itself. Record
+    /// every posted buffer before publishing that command, since firmware
+    /// may fetch the named ring before its command ACK reaches fallback0.
+    fn prepare_configuration(&mut self) -> Result<(), &'static str> {
+        if self.id == 0 || self.advertised != 0 || self.read != 0 {
+            return Err("RFH initial configuration ownership mismatch");
+        }
+        let next = self.write & !7;
+        while self.advertised != next {
+            self.tracker
+                .post(self.tags[self.advertised])
+                .map_err(|_| "double-posted configured RX buffer")?;
+            self.advertised = (self.advertised + 1) & (RX_DEPTH - 1);
+        }
+        dma_barrier();
+        Ok(())
+    }
+
     pub fn publish(&mut self, mmio: &mut impl IwlMmio) -> Result<(), &'static str> {
         if !mmio.authorized() {
             return Err("Wi-Fi authority revoked");
@@ -146,7 +208,7 @@ impl ReceiveQueue {
             self.advertised = (self.advertised + 1) & (RX_DEPTH - 1);
         }
         dma_barrier();
-        let (register, value) = self.format.doorbell(0, next as u16);
+        let (register, value) = self.format.doorbell(u16::from(self.id), next as u16);
         mmio.write(register, value);
         Ok(())
     }
@@ -189,9 +251,12 @@ impl ReceiveQueue {
             }
             if !buffer.discard {
                 // Complete packet copies precede any restock/doorbell.
-                output.extend(packets(
-                    &self.buffers[buffer.buffer_index].as_slice()[..RX_BUFFER_BYTES],
-                )?);
+                let mut copied =
+                    packets(&self.buffers[buffer.buffer_index].as_slice()[..RX_BUFFER_BYTES])?;
+                for packet in &mut copied {
+                    packet.receive_queue = self.id;
+                }
+                output.extend(copied);
             }
             returned.push(buffer.buffer_index);
             self.read = (self.read + 1) & (RX_DEPTH - 1);
@@ -515,6 +580,7 @@ impl BootImage {
 #[derive(Debug)]
 struct Resources {
     rx: ReceiveQueue,
+    extra_rx: Vec<ReceiveQueue>,
     commands: CommandQueue,
     boot: BootImage,
     data: Vec<super::data_queue::DataQueue>,
@@ -565,15 +631,49 @@ pub struct Hardware {
     responses: alloc::collections::VecDeque<Packet>,
     tx_completed: alloc::collections::VecDeque<(u16, u16, bool)>,
     versions: Vec<u8>,
+    band_in_rx: bool,
+    scan_fixed_antenna: bool,
+    /// Actual TLV capabilities59(hidden6GHz) and10(TPC report), separate
+    /// from API59(BAND_IN_RX_DATA) and from the native MLD consumer.
+    scan_six_capabilities: u8,
+    /// The actual installed6GHz AP power/HE snapshot. This constraint
+    /// gate is checked after native credit waits at every TX publication.
+    six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
+    ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
+    p2p_go: Option<alloc::sync::Arc<super::p2p_go::Native>>,
+    p2p_client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
+    client_request: Option<alloc::sync::Arc<super::p2p_client_request::Request>>,
+    client_rx: Option<alloc::sync::Arc<super::p2p_client_rx::Host>>,
+    client_receiver: Option<super::p2p_client_rx::Receiver>,
+    client_rx_mvm: Option<alloc::sync::Arc<super::p2p_client_rx::MvmPower>>,
+    client_copies: Vec<super::p2p_client_rx::Publication>,
+    ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
+    p2p: p2p::State,
+    ap_gen2: Option<super::ap_gen2_wire::Adapter>,
+    mld_link: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
+    eht_source: Option<super::sc_eht::Source>,
+    bios_versions: Vec<u8>,
+    platform_power: platform_power::State,
+    shared_memory: smem::State,
     armed: bool,
     failed: bool,
+    /// Firmware owns the device in WoWLAN D3 (`IWL_MVM_STATUS_IN_D3`).
+    in_d3: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
     /// Protected MPDUs published to data/management queues. Each consumes
     /// at most one fresh firmware TX PN (retries reuse it), so differences
     /// bound the PN range a pairwise key can have used.
     protected_tx: u64,
     rx_epoch: rx_epoch::State,
+    receive_queues: rx_multi::State,
     sources: Option<source::Assets>,
+    rf_policy: Option<super::mld_policy::Authority>,
+    /// Retained firmware scan ownership. A received CHUB/MCC change must
+    /// break a command wait even while its SCAN_REQ receipt is still held.
+    scan_mcc_watch: bool,
+    api89: Option<(super::gen3_profile::Profile, super::gen3_profile::Abi)>,
+    bz: Option<super::bz_profile::Profile>,
+    mld_station: bool,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -652,6 +752,7 @@ impl Hardware {
             mmio,
             resources: core::mem::ManuallyDrop::new(Resources {
                 rx,
+                extra_rx: Vec::new(),
                 commands,
                 boot,
                 data: Vec::new(),
@@ -665,12 +766,40 @@ impl Hardware {
             responses: alloc::collections::VecDeque::new(),
             tx_completed: alloc::collections::VecDeque::new(),
             versions: parsed.api.commands.to_vec(),
+            band_in_rx: parsed.api.api_changes[1] & (1 << 27) != 0,
+            scan_fixed_antenna: parsed.api.has_capability(111),
+            scan_six_capabilities: u8::from(parsed.api.has_capability(59))
+                | (u8::from(parsed.api.has_capability(10)) << 1),
+            six_tx_profile: None,
+            ap_owner: None,
+            p2p_go: None,
+            p2p_client: None,
+            client_request: None,
+            client_rx: None,
+            client_receiver: None,
+            client_rx_mvm: None,
+            client_copies: Vec::new(),
+            ap_request: None,
+            p2p: p2p::State::new(&parsed.api),
+            ap_gen2: None,
+            mld_link: None,
+            eht_source: None,
+            bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
+            platform_power: platform_power::State::default(),
+            shared_memory: smem::State::new(parsed),
             armed: false,
             failed: false,
+            in_d3: false,
             station_stop: None,
             protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
+            receive_queues: rx_multi::State::new(parsed),
             sources: None,
+            rf_policy: None,
+            scan_mcc_watch: false,
+            api89: None,
+            bz: None,
+            mld_station: sc,
         })
     }
 
@@ -714,6 +843,11 @@ impl Hardware {
     pub(super) fn matches_firmware(&self, parsed: &ParsedUcode<'_>) -> bool {
         if self.format != rx_rfh::CompletionFormat::Qu
             || self.versions != parsed.api.commands
+            || self.band_in_rx != (parsed.api.api_changes[1] & (1 << 27) != 0)
+            || self.scan_fixed_antenna != parsed.api.has_capability(111)
+            || self.scan_six_capabilities
+                != (u8::from(parsed.api.has_capability(59))
+                    | (u8::from(parsed.api.has_capability(10)) << 1))
             || self.resources.boot.phy_config != parsed.api.phy_config
         {
             return false;
@@ -738,9 +872,22 @@ impl Hardware {
             .map(|entry| (entry[2], entry[3]))
     }
 
+    /// Command payload lookup normalizes a narrow ID like Linux. Keep raw
+    /// notification lookup and data TX header encoding separate.
+    pub(super) fn command_version(&self, group: u8, command: u8) -> Option<u8> {
+        self.version(if group == 0 { 1 } else { group }, command)
+            .map(|entry| entry.0)
+    }
+
     pub fn runtime_configuration(
         &self,
     ) -> Result<super::station_api::RuntimeConfiguration, &'static str> {
+        if let Some((profile, _)) = self.api89 {
+            return Ok(self.api89_runtime(profile));
+        }
+        if let Some(profile) = self.bz {
+            return Ok(self.bz_runtime(profile));
+        }
         super::station_api::runtime_configuration(
             self.device.id.device,
             self.version(1, 0x9b).ok_or("missing BT coexistence API")?.0,
@@ -767,8 +914,11 @@ impl Hardware {
 
     /// Capture the IRQ count before polling completions, including when
     /// the command caller owns the device mutex across this wait.
-    pub fn activity(&self) -> super::iwl_msix::Activity {
-        super::iwl_msix::Activity::new(self.irq_vector(), 10)
+    pub fn activity(&self) -> Activity {
+        Activity {
+            inner: super::iwl_msix::Activity::new(self.irq_vector(), 10),
+            source: self.source_fence(),
+        }
     }
 
     async fn sample_delay() {
@@ -799,6 +949,8 @@ impl Hardware {
     }
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        self.p2p.metadata(&parsed.api)?;
+        self.prepare_station_profile(parsed)?;
         use core::{
             future::{poll_fn, Future},
             pin::pin,
@@ -956,6 +1108,7 @@ impl Hardware {
     }
     async fn finish_boot(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
+        self.eht_source = None;
         let alive = self.wait_notification(0, 1, 2000).await?;
         let alive_version = self
             .version(0, 1)
@@ -964,6 +1117,7 @@ impl Hardware {
         let expected = match (self.format, alive_version) {
             (rx_rfh::CompletionFormat::Qu, Some(6)) => 144,
             (rx_rfh::CompletionFormat::Qu, _) => return Err("unsupported MVM ALIVE version"),
+            (_, Some(6)) if self.is_mvm89() => 144,
             (_, Some(7)) => 144,
             (_, Some(8)) => 152,
             _ => return Err("unsupported ALIVE notification version"),
@@ -995,7 +1149,8 @@ impl Hardware {
                 return Err("PNVM initialization failed");
             }
         }
-        if self.format == rx_rfh::CompletionFormat::Qu {
+        self.retain_eht_boot(parsed, &alive.payload)?;
+        if self.format == rx_rfh::CompletionFormat::Qu || self.is_mvm89() {
             // MVM unified image: allow firmware to populate NVM, then signal
             // completion. Do not send MLD's separate PHY configuration flow.
             self.command(2, 3, &2u32.to_le_bytes()).await?;
@@ -1064,11 +1219,91 @@ impl Hardware {
                 return Err("Wi-Fi hardware radio disabled");
             }
         }
+        // Fixed original source/provider observations only. A closed probe
+        // subscriber must drive a native filter-clear receipt while idle.
+        self.client_refresh_filter();
         let capture = self.rx_epoch.capture();
-        for mut packet in self.resources.rx.drain(&mut self.mmio)? {
+        let p2p_capture = self.p2p.copy_grant();
+        let go_capture = self.p2p_go.clone();
+        let client_capture = self.p2p_client.clone();
+        let client_registrations = self
+            .client_rx
+            .as_ref()
+            .map(|host| alloc::sync::Arc::new(host.snapshot()));
+        let client_owner = client_capture.as_ref().and_then(|native| {
+            if native.observation().is_err()
+                || self.format == rx_rfh::CompletionFormat::Qu && self.client_rx_mvm.is_none()
+            {
+                return None;
+            }
+            Some(alloc::sync::Arc::new(super::p2p_client_rx::CopyOwner {
+                native: native.clone(),
+                port: self.client_receiver.as_ref()?.capture()?,
+                source: self.client_receive_source().ok()?,
+                receive: self.receive_publication()?,
+                mvm: self.client_rx_mvm.clone(),
+            }))
+        });
+        let mut copied = self.resources.rx.drain(&mut self.mmio)?;
+        for queue in &mut self.resources.extra_rx {
+            copied.extend(queue.drain(&mut self.mmio)?);
+        }
+        for mut packet in copied {
             packet.receive_epoch = capture;
+            if packet.receive_queue != 0
+                && !(packet.header.group_id == 0 && matches!(packet.header.cmd, 0xc1..=0xc3)
+                    || packet.header.group_id == 5 && packet.header.cmd == 0xff)
+            {
+                // Command/control ownership belongs to fallback0. A payload
+                // copied from another physical ring cannot complete its DMA.
+                continue;
+            }
+            if self.p2p.observe(&packet, p2p_capture.as_ref())? {
+                continue;
+            }
+            if let Some(go) = &go_capture {
+                if go.receive(&packet)? {
+                    continue;
+                }
+            }
+            if let Some(client) = &client_capture {
+                if packet.receive_queue == 0
+                    && packet.header.group_id == 0
+                    && packet.header.cmd == 0xc1
+                {
+                    if let Some(mpdu) = self.ap_mpdu(&packet.payload) {
+                        client.receive(&mpdu, self.band_in_rx_supported())?;
+                        if let (Some(registrations), Some(owner)) =
+                            (&client_registrations, &client_owner)
+                        {
+                            let publications = registrations.copy(
+                                owner,
+                                &packet,
+                                &mpdu,
+                                self.band_in_rx_supported(),
+                            );
+                            let available = 64usize.saturating_sub(self.client_copies.len());
+                            self.client_copies
+                                .extend(publications.into_iter().take(available));
+                        }
+                    }
+                }
+            }
+            if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
+                if let Some(client) = &self.p2p_client {
+                    client.retire();
+                    return Err("P2P client native MCC changed; reassociation required");
+                }
+                if let Some(policy) = &self.rf_policy {
+                    policy.invalidate();
+                    return Err("Intel native MCC changed during retained RF policy");
+                }
+                if self.scan_mcc_watch {
+                    return Err("Intel native MCC changed during retained firmware scan");
+                }
+            }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc5 {
-                if !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7)) {
+                if !self.compressed_ba_supported() {
                     return Err("unsupported compressed BA notification");
                 }
                 if self.format == rx_rfh::CompletionFormat::Qu {
@@ -1137,9 +1372,7 @@ impl Hardware {
     }
 
     pub fn check_aggregation_api(&self) -> Result<(), &'static str> {
-        if self.version(5, 0x16).map(|v| v.0) != Some(2)
-            || !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7))
-        {
+        if self.version(5, 0x16).map(|v| v.0) != Some(2) || !self.compressed_ba_supported() {
             return Err("firmware has no supported Block Ack API");
         }
         Ok(())
@@ -1222,6 +1455,53 @@ impl Hardware {
         }
     }
 
+    /// Linux mld/tx.c `iwl_mld_update_sta_txqs`: SCD_QUEUE_CONFIG MODIFY
+    /// moves every allocated queue of the AP MLD station from `old` to
+    /// `new` STA mask, TID by TID (management queue as IWL_MGMT_TID).
+    /// Queues must already be quiesced: an outstanding descriptor's
+    /// completion is never re-attributed to a different link STA set.
+    pub(super) async fn modify_tx_station_mask(
+        &mut self,
+        old: u32,
+        new: u32,
+    ) -> Result<(), &'static str> {
+        if self.failed || self.version(5, 0x17).map(|v| v.0) != Some(3) || old == 0 || new == 0 {
+            return Err("unsupported or failed TX queue STA mask change");
+        }
+        let targets: Vec<(u16, u8)> = self
+            .resources
+            .data
+            .iter()
+            .filter(|q| q.station_mask() == Some(old))
+            .map(|q| {
+                if !q.is_idle() {
+                    return Err("TX queue STA mask change before quiescing");
+                }
+                Ok((q.id().unwrap(), q.tid().unwrap()))
+            })
+            .collect::<Result<_, _>>()?;
+        for (id, tid) in targets {
+            let mut body = [0; 36];
+            boot_context::put32(&mut body, 0, 2); // IWL_SCD_QUEUE_MODIFY
+            boot_context::put32(&mut body, 4, old);
+            boot_context::put32(&mut body, 8, u32::from(tid));
+            boot_context::put32(&mut body, 12, new);
+            if let Err(reason) = self.command(5, 0x17, &body).await {
+                // The firmware's queue mask is no longer known.
+                self.failed = true;
+                return Err(reason);
+            }
+            let queue = self
+                .resources
+                .data
+                .iter_mut()
+                .find(|q| q.id() == Some(id))
+                .ok_or("TX queue vanished during STA mask change")?;
+            queue.modify_station_mask(old, new)?;
+        }
+        Ok(())
+    }
+
     pub async fn remove_tx(&mut self, id: u16, station: u8, tid: u8) -> Result<(), &'static str> {
         self.remove_idle_tx(id, station, tid).await
     }
@@ -1246,12 +1526,14 @@ impl Hardware {
             .ok_or("unknown idle TX queue")?;
         let mut body = [0; 36];
         boot_context::put32(&mut body, 0, 1);
-        boot_context::put32(
-            &mut body,
-            4,
-            1u32.checked_shl(u32::from(station))
-                .ok_or("invalid idle TX station")?,
-        );
+        1u32.checked_shl(u32::from(station))
+            .ok_or("invalid idle TX station")?;
+        // Linux mld/tx.c iwl_mld_remove_txq names the queue's current
+        // full STA mask, including any further MLD link STA.
+        let mask = self.resources.data[index]
+            .station_mask()
+            .ok_or("unknown idle TX queue")?;
+        boot_context::put32(&mut body, 4, mask);
         boot_context::put32(&mut body, 8, u32::from(tid));
         // Reserve before publication: dropping the waiter cannot reopen
         // packet admission, replay REMOVE or let ADD reuse this native ID.
@@ -1296,9 +1578,53 @@ impl Hardware {
         self.protected_tx
     }
 
+    pub(super) fn install_rf_policy(
+        &mut self,
+        policy: super::mld_policy::Authority,
+    ) -> Result<(), &'static str> {
+        policy.check()?;
+        self.rf_policy = Some(policy);
+        Ok(())
+    }
+    pub(super) fn rf_policy_validity(&self) -> Result<super::mld_policy::Validity, &'static str> {
+        self.rf_policy
+            .as_ref()
+            .map(super::mld_policy::Authority::validity)
+            .ok_or("Intel native RF policy owner absent")
+    }
+    pub(super) fn rf_policy_clone(&self) -> Option<super::mld_policy::Authority> {
+        self.rf_policy.clone()
+    }
+    pub(super) fn watch_scan_mcc(&mut self, active: bool) {
+        self.scan_mcc_watch = active;
+    }
+
+    pub(super) fn clear_rf_policy(&mut self) {
+        self.p2p_go = None;
+        self.client_request = None;
+        self.client_rx_mvm = None;
+        self.client_copies.clear();
+        if let Some(client) = self.p2p_client.take() {
+            client.retire();
+        }
+        self.ap_request = None;
+        if let Some(owner) = self.ap_owner.take() {
+            owner.retire();
+        }
+        self.six_tx_profile = None;
+        self.mld_link = None;
+        if let Some(policy) = self.rf_policy.take() {
+            policy.invalidate();
+        }
+    }
+
     pub fn fail(&mut self) {
         self.failed = true;
         self.rx_epoch.deny();
+        self.p2p.deny();
+        if let Some(client) = &self.p2p_client {
+            client.retire();
+        }
     }
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -1315,13 +1641,14 @@ impl Hardware {
     /// are retained (DMA is provably stopped) until the resume restart
     /// replaces them, or final teardown frees them.
     pub async fn stop_for_suspend(&mut self) -> Result<(), &'static str> {
+        self.clear_rf_policy();
         self.fail();
         if let Some(interrupts) = &mut self.interrupts {
             interrupts.mask();
         }
         self.mmio.write(super::regs::CSR_INT_MASK, 0);
         let bz = self.format == rx_rfh::CompletionFormat::Bz;
-        if self.armed {
+        let stopped = if self.armed {
             let (register, request, done) = if bz {
                 (super::regs::CSR_GP_CNTRL, 1 << 29, 1 << 28)
             } else {
@@ -1329,19 +1656,172 @@ impl Hardware {
             };
             let value = self.mmio.read(register);
             self.mmio.write(register, value | request);
-            self.poll_register(register, done, done, 100).await?;
+            // Keep the bounded proof result, but never let an ambiguous
+            // engine ACK skip the independent RF-reset/BME-off attempts.
+            let result = self.poll_register(register, done, done, 100).await;
+            if bz {
+                // Linux iwl_pcie_apm_stop_master waits10..20ms after its Bz
+                // stop attempt, including timeout, before the SW reset.
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(10_000_000)).await;
+            }
+            result
+        } else {
+            Ok(())
+        };
+        let authority = self.authority(false);
+        let device = self.device;
+        let cap = self.cap;
+        let result = self.finish_stop(stopped, || {
+            if authority.native {
+                super::mmio::set_master(&device, &cap, false)
+            } else {
+                // Explicit RAM backend: invoke its real PCI capability;
+                // the fixture owns no physical config space or bus master.
+                authority.invoke(|| Ok(()))
+            }
+        });
+        if result.is_ok() {
+            self.scan_mcc_watch = false;
         }
-        // CSR_GP_CNTRL_REG_FLAG_SW_RESET (bit 31) on Bz+, else
-        // CSR_RESET_REG_FLAG_SW_RESET (bit 7).
-        let (register, reset) = if bz {
+        result
+    }
+
+    /// WoWLAN transport half of `pcie/gen1_2/trans.c::iwl_trans_pcie_d3_suspend`
+    /// for a unified image (`reset == false`) on the 22000 family: set
+    /// `CSR_HW_IF_CONFIG_REG_PERSISTENCE`, then `iwl_pcie_d3_complete_suspend`
+    /// masks interrupts and clears `MAC_ACCESS_REQ` and `INIT_DONE`. 22000 has
+    /// no D3 doorbell handshake (`iwl_pcie_d3_handshake` starts at AX210) and
+    /// `iwl_pcie_set_pwr` is a no-op without APMG. Firmware stays alive and
+    /// every DMA allocation stays published for it; nothing is released.
+    pub(in crate::iwlwifi) fn d3_suspend(&mut self) -> Result<(), &'static str> {
+        if self.failed || self.in_d3 || !self.d3_transport_supported() {
+            return Err("MVM D3 suspend without a live 22000 transport");
+        }
+        // The RAM fixture never arms a physical transport.
+        #[cfg(any(test, feature = "kernel-test"))]
+        if model::is_model(self) {
+            self.in_d3 = true;
+            return Ok(());
+        }
+        if !self.armed {
+            return Err("MVM D3 suspend without a live transport");
+        }
+        let value = self.mmio.read(super::regs::CSR_HW_IF_CONFIG_REG);
+        self.mmio
+            .write(super::regs::CSR_HW_IF_CONFIG_REG, value | D3_PERSISTENCE);
+        if let Some(interrupts) = &mut self.interrupts {
+            interrupts.mask();
+        }
+        self.mmio.write(super::regs::CSR_INT_MASK, 0);
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio.write(
+            super::regs::CSR_GP_CNTRL,
+            value & !(GP_CNTRL_MAC_ACCESS_REQ | super::regs::csr_gp_cntrl::MAC_INIT),
+        );
+        self.in_d3 = true;
+        Ok(())
+    }
+
+    /// `iwl_trans_pcie_d3_resume(trans, reset = false)` for 22000: request MAC
+    /// access, `iwl_trans_activate_nic` (INIT_DONE then MAC_CLOCK_READY),
+    /// reprogram MSI-X and re-enable interrupts, release MAC access, and
+    /// treat `CSR_RESET_REG_FLAG_NEVO_RESET` ("device was reset during
+    /// suspend") as failure so the caller performs the full restart.
+    pub(in crate::iwlwifi) async fn d3_resume(&mut self) -> Result<(), &'static str> {
+        if !self.in_d3 {
+            return Err("MVM D3 resume without D3 suspend");
+        }
+        self.in_d3 = false;
+        #[cfg(any(test, feature = "kernel-test"))]
+        if model::is_model(self) {
+            return if self.failed {
+                Err("MVM device was reset during suspend")
+            } else {
+                Ok(())
+            };
+        }
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio
+            .write(super::regs::CSR_GP_CNTRL, value | GP_CNTRL_MAC_ACCESS_REQ);
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio.write(
+            super::regs::CSR_GP_CNTRL,
+            value | super::regs::csr_gp_cntrl::MAC_INIT,
+        );
+        let ready = super::regs::csr_gp_cntrl::MAC_CLOCK_READY;
+        if let Err(error) = self
+            .poll_register(super::regs::CSR_GP_CNTRL, ready, ready, 25)
+            .await
+        {
+            self.fail();
+            return Err(error);
+        }
+        let queues = self.receive_queue_count();
+        if let Some(interrupts) = &mut self.interrupts {
+            let enabled = interrupts.enable(false).and_then(|()| {
+                if queues > 1 {
+                    interrupts.receive_queues(queues)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = enabled {
+                self.fail();
+                return Err(error);
+            }
+        }
+        let value = self.mmio.read(super::regs::CSR_GP_CNTRL);
+        self.mmio
+            .write(super::regs::CSR_GP_CNTRL, value & !GP_CNTRL_MAC_ACCESS_REQ);
+        if self.mmio.read(super::regs::CSR_RESET) & super::regs::csr_reset::NEVO_RESET != 0 {
+            self.fail();
+            return Err("MVM device was reset during suspend");
+        }
+        Ok(())
+    }
+
+    /// `iwl_trans_set_q_ptrs` on the WoWLAN offload TID queue.
+    pub(in crate::iwlwifi) fn advance_queue_pointers(
+        &mut self,
+        id: u16,
+        frames: u16,
+    ) -> Result<(), &'static str> {
+        self.resources
+            .data
+            .iter_mut()
+            .find(|queue| queue.id() == Some(id))
+            .ok_or("WoWLAN offload queue absent")?
+            .advance_pointers(frames)
+    }
+
+    pub(in crate::iwlwifi) fn d3_transport_supported(&self) -> bool {
+        self.format == rx_rfh::CompletionFormat::Qu
+    }
+
+    pub(in crate::iwlwifi) fn is_in_d3(&self) -> bool {
+        self.in_d3
+    }
+
+    fn finish_stop(
+        &mut self,
+        stopped: Result<(), &'static str>,
+        disable_master: impl FnOnce() -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        // Always attempt the physical RF reset and BME disable, as Linux
+        // does after iwl_pcie_apm_stop_master warns about a missing ACK.
+        let (register, reset) = if self.format == rx_rfh::CompletionFormat::Bz {
             (super::regs::CSR_GP_CNTRL, 1 << 31)
         } else {
             (super::regs::CSR_RESET, 1 << 7)
         };
         let value = self.mmio.read(register);
         self.mmio.write(register, value | reset);
-        super::mmio::set_master(&self.device, &self.cap, false)?;
+        disable_master()?;
+        // BME-off/reset do not prove already-issued DMA drained. Keep the
+        // transport armed and every allocation pinned if that ACK was lost.
+        stopped?;
         self.armed = false;
+        self.p2p.reset_after_dma_stop();
         self.notifications.clear();
         self.responses.clear();
         self.tx_completed.clear();
@@ -1349,6 +1829,7 @@ impl Hardware {
     }
 
     pub async fn restart(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        self.clear_rf_policy();
         self.fail();
         if let Some(interrupts) = &mut self.interrupts {
             interrupts.mask();
@@ -1375,6 +1856,7 @@ impl Hardware {
         )?;
         let resources = Resources {
             rx,
+            extra_rx: Vec::new(),
             commands,
             boot,
             data: Vec::new(),
@@ -1385,9 +1867,15 @@ impl Hardware {
             core::mem::ManuallyDrop::drop(&mut self.resources);
         }
         self.resources = core::mem::ManuallyDrop::new(resources);
+        self.platform_power = platform_power::State::default();
+        self.shared_memory = smem::State::new(parsed);
+        self.receive_queues = rx_multi::State::new(parsed);
         self.rx_epoch.reset_after_dma_stop();
+        self.p2p.reset_after_dma_stop();
+        self.scan_mcc_watch = false;
         self.armed = false;
         self.failed = false;
+        self.in_d3 = false;
         self.notifications.clear();
         self.responses.clear();
         self.tx_completed.clear();
@@ -1469,14 +1957,19 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
+        self.check_p2p_tx_publication()?;
+        self.check_client_tx_publication()?;
         let sources = self.source_fence()?;
+        self.check_six_tx_publication()?;
         let queue = self
             .resources
             .data
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        sources.invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        sources.invoke_packet(|| {
+            queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist)
+        })?;
         self.count_protected(frame);
         Ok(())
     }
@@ -1530,7 +2023,7 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, false, 0)
+        self.transmit_owned(id, frame, header_len, rate, false, 0, None)
             .await
     }
 
@@ -1544,7 +2037,7 @@ impl Hardware {
         rate: Option<u32>,
         assist: u32,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, false, assist)
+        self.transmit_owned(id, frame, header_len, rate, false, assist, None)
             .await
     }
 
@@ -1558,10 +2051,22 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, true, 0)
+        self.transmit_owned(id, frame, header_len, rate, true, 0, None)
             .await
     }
 
+    pub(in crate::iwlwifi) async fn transmit_ap(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        encrypt: bool,
+    ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, false, 0, Some(encrypt))
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn transmit_owned(
         &mut self,
         id: u16,
@@ -1570,8 +2075,26 @@ impl Hardware {
         rate: Option<u32>,
         closing: bool,
         assist: u32,
+        encrypt: Option<bool>,
     ) -> Result<(), &'static str> {
-        self.wait_tx_space(id).await?;
+        // A credit wait can copy a newer AP TPE. Resolve its exact native
+        // power receipt before publishing this still-unsubmitted frame.
+        let mut ready = false;
+        for _ in 0..16 {
+            self.wait_tx_space(id).await?;
+            match self.check_six_tx_publication() {
+                Ok(()) => {
+                    ready = true;
+                    break;
+                }
+                Err(super::six_ghz_station::UPDATE_REQUIRED) => self.service_six_power().await?,
+                Err(reason) => return Err(reason),
+            }
+        }
+        if !ready {
+            self.fail();
+            return Err("6GHz TPE changed continuously before TX publication");
+        }
         if !closing
             && self
                 .station_stop
@@ -1580,15 +2103,26 @@ impl Hardware {
         {
             return Err("MVM station closed before native packet publication");
         }
+        self.check_p2p_tx_publication()?;
+        self.service_p2p_client().await?;
+        let projected = if encrypt.is_some() {
+            self.project_go_probe(frame)?
+        } else {
+            None
+        };
+        let frame = projected.as_deref().unwrap_or(frame);
         let sources = self.source_fence()?;
+        self.check_six_tx_publication()?;
         let queue = self
             .resources
             .data
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        let ssn = sources
-            .invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        let ssn = sources.invoke_packet(|| match encrypt {
+            Some(encrypt) => queue.send_ap(&mut self.mmio, frame, header_len, rate, encrypt),
+            None => queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist),
+        })?;
         self.count_protected(frame);
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
@@ -1654,6 +2188,13 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
+        if self.in_d3 {
+            return Err("Wi-Fi transport is in WoWLAN D3");
+        }
+        // iwl-trans.c::iwl_trans_send_cmd maps narrow HostCommands to
+        // LONG_GROUP on a wide-header transport, except REPLY_ERROR.
+        // Data TX commands and unsolicited RX packets never enter here.
+        let group = if group == 0 && command != 2 { 1 } else { group };
         let sources = self.source_fence()?;
         let sequence = sources.invoke(|| {
             self.resources
@@ -1801,5 +2342,40 @@ mod retirement_tests;
 #[path = "runtime_rx_epoch.rs"]
 pub(super) mod rx_epoch;
 
+#[path = "runtime_rx_multi.rs"]
+mod rx_multi;
+
 #[path = "runtime_source.rs"]
 pub(super) mod source;
+
+#[path = "runtime_mld_power.rs"]
+mod platform_power;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_stop_tests.rs"]
+mod stop_tests;
+
+#[path = "runtime_smem.rs"]
+mod smem;
+
+#[path = "runtime_profile.rs"]
+mod station_profile;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_gen3_tests.rs"]
+mod gen3_tests;
+
+#[path = "runtime_bz.rs"]
+mod bz_profile;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_bz_tests.rs"]
+mod bz_tests;
+
+#[path = "runtime_ap.rs"]
+mod ap;
+
+#[path = "runtime_p2p.rs"]
+pub(in crate::iwlwifi) mod p2p;
+#[path = "runtime_p2p_client.rs"]
+mod p2p_client_native;

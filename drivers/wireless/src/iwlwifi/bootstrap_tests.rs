@@ -560,3 +560,179 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/bootstrap",
     smoke_iwlwifi_drive_scheduled_retries_and_terminates
 );
+
+fn smoke_api89_native_discovery_selects_exact_mac_rf_cdb_and_linux_pci_profile() -> TestResult {
+    for (did, rev, rf, name) in [
+        (
+            0x2725,
+            0x42f,
+            0x10d200,
+            "iwlwifi/iwlwifi-ty-a0-gf-a0-89.ucode",
+        ),
+        (
+            0x7af0,
+            0x37a,
+            0x10d000,
+            "iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+        ),
+        (
+            0x54f0,
+            0x430,
+            0x10d000,
+            "iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+        ),
+        (
+            0x51f1,
+            0x370,
+            0x1010d000,
+            "iwlwifi/iwlwifi-so-a0-gf4-a0-89.ucode",
+        ),
+        (
+            0x7e40,
+            0x441,
+            0x10d000,
+            "iwlwifi/iwlwifi-ma-b0-gf-a0-89.ucode",
+        ),
+    ] {
+        let mut startup = owner();
+        startup.device.id.device = did;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, did).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = rev;
+        registers[0x9c / 4] = rf;
+        discovery(&startup, &mut registers);
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if !matches!(selected,Ok((names,None)) if names==[name])
+            || startup.phase() != ProvisionState::Parked
+        {
+            return TestResult::Fail(
+                "API89 native identity selected filename/API fallback or consumed startup",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/api89",
+    smoke_api89_native_discovery_selects_exact_mac_rf_cdb_and_linux_pci_profile
+);
+
+fn smoke_api89_changed_unsupported_or_revoked_native_identity_has_no_fallback() -> TestResult {
+    for fault in 0..4 {
+        let mut startup = owner();
+        startup.device.id.device = 0x51f0;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, 0x51f0).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = 0x370;
+        registers[0x9c / 4] = 0x10d000;
+        discovery(&startup, &mut registers);
+        match fault {
+            0 => registers[0x28 / 4] = 0x480,
+            1 => registers[0x9c / 4] = 0x112200,
+            2 => startup.cap.revoke(),
+            _ => ready(async {
+                startup.state.lock().await.discovery.as_mut().unwrap().len = 0x9c;
+            })
+            .unwrap(),
+        }
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if selected.is_ok()
+            || startup.phase() != ProvisionState::Parked
+            || ready(async { startup.state.lock().await.interface.is_some() }).unwrap()
+        {
+            return TestResult::Fail(
+                "API89 invalid identity borrowed another RF source or native owner",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/api89",
+    smoke_api89_changed_unsupported_or_revoked_native_identity_has_no_fallback
+);
+
+fn smoke_bz_core103_native_identity_selects_single_exact_fm_wh_filename() -> TestResult {
+    for (did, radio, name) in [
+        (0x272b, 0x20112200, "iwlwifi/iwlwifi-bz-b0-fm-c0-c103.ucode"),
+        (0x272b, 0x20113100, "iwlwifi/iwlwifi-bz-b0-wh-b0-c103.ucode"),
+        (0x7740, 0x20112200, "iwlwifi/iwlwifi-bz-b0-fm-c0-c103.ucode"),
+        (0x4d40, 0x20113100, "iwlwifi/iwlwifi-bz-b0-wh-b0-c103.ucode"),
+    ] {
+        let mut startup = owner();
+        startup.device.id.device = did;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, did).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = 0x461;
+        registers[0x9c / 4] = radio;
+        discovery(&startup, &mut registers);
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if !matches!(selected,Ok((names,None)) if names==[name])
+            || startup.phase() != ProvisionState::Parked
+        {
+            return TestResult::Fail(
+                "Bz native identity borrowed RF/API ladder or consumed startup",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/bz103",
+    smoke_bz_core103_native_identity_selects_single_exact_fm_wh_filename
+);
+fn smoke_bz_core103_native_discovery_refuses_a0_gl_cdb_old_rf_or_revoked_owner() -> TestResult {
+    for fault in 0..7 {
+        let mut startup = owner();
+        startup.device.id.device = 0x272b;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, 0x272b).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = 0x461;
+        registers[0x9c / 4] = 0x20112200;
+        discovery(&startup, &mut registers);
+        match fault {
+            0 => registers[0x28 / 4] = 0x460,
+            1 => registers[0x28 / 4] = 0x471,
+            2 => registers[0x9c / 4] |= 1 << 28,
+            3 => registers[0x9c / 4] = 0x10d000,
+            4 => registers[0x9c / 4] = 0x20112300,
+            5 => startup.cap.revoke(),
+            _ => ready(async {
+                startup.state.lock().await.discovery.as_mut().unwrap().len = 0x9c;
+            })
+            .unwrap(),
+        }
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if selected.is_ok()
+            || startup.phase() != ProvisionState::Parked
+            || ready(async { startup.state.lock().await.interface.is_some() }).unwrap()
+        {
+            return TestResult::Fail("Bz refused native identity admitted another source/owner");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/bz103",
+    smoke_bz_core103_native_discovery_refuses_a0_gl_cdb_old_rf_or_revoked_owner
+);

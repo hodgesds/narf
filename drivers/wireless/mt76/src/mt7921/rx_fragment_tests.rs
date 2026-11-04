@@ -234,19 +234,19 @@ fn mt76_protected_rx_defragments_with_sequential_pn_and_replay() -> TestResult {
     }
     // A receive-epoch renewal (every rekey path) discards partial MSDUs.
     let frame = fragment_frame(40, 0, true, true, 0, &MSDU[..5]);
-    let before = session.rx_fragments.pending();
+    let before = session.station.rx_fragments.pending();
     session
         .backend
         .packets
         .push_back(fragment_packet(&frame, Some(200), true, false));
     // Earlier rejected bursts may still hold a stale first fragment (seq 21).
     if session.receive_ethernet() != Ok(None)
-        || session.rx_fragments.pending() != (before + 1).min(ENTRIES)
+        || session.station.rx_fragments.pending() != (before + 1).min(ENTRIES)
     {
         return TestResult::Fail("first fragment not retained");
     }
     session.renew_receive_epoch().unwrap();
-    if session.rx_fragments.pending() != 0 {
+    if session.station.rx_fragments.pending() != 0 {
         return TestResult::Fail("epoch renewal kept a partial MSDU");
     }
     let frame = fragment_frame(40, 1, false, true, 0, &MSDU[5..]);

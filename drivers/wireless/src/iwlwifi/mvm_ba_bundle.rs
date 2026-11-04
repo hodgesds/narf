@@ -17,9 +17,20 @@ pub(super) struct Raw {
     bytes: Vec<u8>,
     size: usize,
     budget: Arc<AtomicUsize>,
+    queue: u8,
+    epoch: Option<u64>,
 }
 impl Raw {
+    #[cfg(feature = "kernel-test")]
     pub fn new(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Result<Self, &'static str> {
+        Self::captured(bytes, budget, 0, None)
+    }
+    pub fn captured(
+        bytes: &[u8],
+        budget: &Arc<AtomicUsize>,
+        queue: u8,
+        epoch: Option<u64>,
+    ) -> Result<Self, &'static str> {
         budget
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes.len())
@@ -30,10 +41,12 @@ impl Raw {
             bytes: bytes.to_vec(),
             size: bytes.len(),
             budget: budget.clone(),
+            queue,
+            epoch,
         })
     }
-    pub fn into_bytes(mut self) -> Vec<u8> {
-        core::mem::take(&mut self.bytes)
+    pub fn into_capture(mut self) -> (u8, Option<u64>, Vec<u8>) {
+        (self.queue, self.epoch, core::mem::take(&mut self.bytes))
     }
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -88,8 +101,9 @@ pub(super) fn capture(
 ) -> Option<Bundle> {
     let f = m.frame;
     let sn = u16::from_le_bytes([f[22], f[23]]) >> 4;
+    let header = 26 + if f[1] & 0x80 != 0 { 4 } else { 0 };
     let iv = if f[1] & 0x40 != 0 {
-        <[u8; 8]>::try_from(f.get(26..34)?).ok()?
+        <[u8; 8]>::try_from(f.get(header..header + 8)?).ok()?
     } else {
         [0; 8]
     };
@@ -113,7 +127,7 @@ pub(super) fn capture(
         });
     }
     let p = pending.as_mut().unwrap();
-    let Some(body) = m.body(26, if f[1] & 0x40 != 0 { 8 } else { 0 }) else {
+    let Some(body) = m.body(header, if f[1] & 0x40 != 0 { 8 } else { 0 }) else {
         *pending = None;
         return None;
     };

@@ -1,5 +1,5 @@
-//! Single-RFH MLD BAID retirement. Firmware echoes an opaque host cookie,
-//! type and BAID after that queue's prefix (Linux mld/{agg,rx}.c,rx.h).
+//! All-owned-RFH MLD BAID retirement. Firmware echoes an opaque host cookie,
+//! type and BAID after each queue's prefix (Linux mld/{agg,rx}.c,rx.h).
 use super::super::scan_api;
 use super::*;
 use alloc::sync::Arc;
@@ -67,6 +67,16 @@ impl Hardware {
     pub(in crate::iwlwifi) fn receive_capture_epoch(&self) -> Option<u64> {
         self.rx_epoch.capture()
     }
+    /// A real completed prefix for this still-closed current generation.
+    /// This is denial metadata, never permission to open or publish copies.
+    pub(in crate::iwlwifi) fn closed_proved_receive_epoch(&self) -> Option<u64> {
+        self.rx_epoch.proved.filter(|epoch| {
+            !self.failed
+                && !self.rx_epoch.open.load(Ordering::Acquire)
+                && self.rx_epoch.pending.is_none()
+                && self.rx_epoch.generation.load(Ordering::Acquire) == *epoch
+        })
+    }
     pub(in crate::iwlwifi) fn receive_publication(&self) -> Option<Publication> {
         self.rx_epoch.capture().map(|epoch| Publication {
             generation: self.rx_epoch.generation.clone(),
@@ -104,7 +114,28 @@ impl Hardware {
         self.rx_epoch.open.store(true, Ordering::Release);
         Ok(())
     }
-    /// MLD EMPTY (type0) is an ordered single-RFH prefix proof, not a
+    /// Called only by MVM's retained all-owned-ring sync1 receiver after
+    /// every physical queue matched the current cookie/type/BAID contract.
+    /// It records the closed copy epoch; opening still invokes the actual
+    /// source owner and cannot adopt packets copied while closed.
+    pub(in crate::iwlwifi) fn confirm_gen2_receive_prefix(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), &'static str> {
+        self.source_fence()?.invoke(|| Ok(()))?;
+        if self.failed
+            || self.format != rx_rfh::CompletionFormat::Qu
+            || self.receive_queue_count() <= 1
+            || self.rx_epoch.pending.is_some()
+            || self.rx_epoch.open.load(Ordering::Acquire)
+            || self.rx_epoch.generation.load(Ordering::Acquire) != epoch
+        {
+            return Err("MVM all-RFH proof differs from closed native epoch");
+        }
+        self.rx_epoch.proved = Some(epoch);
+        Ok(())
+    }
+    /// MLD EMPTY (type0) is an ordered all-owned-RFH prefix proof, not a
     /// temporarily empty descriptor ring or a key-command acknowledgement.
     pub(in crate::iwlwifi) async fn synchronize_receive_epoch(
         &mut self,
@@ -126,8 +157,31 @@ impl Hardware {
         self.synchronize_rx(Some(baid)).await
     }
     async fn synchronize_rx(&mut self, baid: Option<u8>) -> Result<Vec<Packet>, &'static str> {
+        // Ordinary Qu station/BAID retirement retains its original MVM
+        // receiver. Only the complete selected API77 AP consumer with its
+        // original current START role uses this common EMPTY/sync1 path.
+        let legacy_ap = baid.is_none()
+            && self.ap_legacy_selected()
+            && self
+                .ap_owner
+                .as_ref()
+                .is_some_and(|owner| owner.check().is_ok());
+        // A retained, closing SESSION1 lease may retire its own physical
+        // prefix after the emitting source dies. This complete adapter's
+        // actual original DMA/session owner is separate from ordinary Qu
+        // station/BAID service, which keeps its original refusal below.
+        let legacy_p2p = baid.is_none() && self.p2p_gen2_prefix();
+        let legacy_client = baid.is_none()
+            && self.ap_legacy_selected()
+            && self
+                .p2p_client
+                .as_ref()
+                .is_some_and(|client| client.current().is_ok());
         if self.failed
-            || self.format == rx_rfh::CompletionFormat::Qu
+            || (self.format == rx_rfh::CompletionFormat::Qu
+                && !legacy_ap
+                && !legacy_p2p
+                && !legacy_client)
             || !matches!(self.version(5, 2).map(|v| v.0), None | Some(1 | 99))
         {
             return Err("unsupported/failed native MLD RX epoch contract");
@@ -151,10 +205,20 @@ impl Hardware {
         cookie: u32,
     ) -> Result<Vec<Packet>, &'static str> {
         let mut body = vec![0; if baid.is_some() { 24 } else { 20 }];
-        boot_context::put32(&mut body, 4, 1); // single owned RFH queue0
+        let queues = self.receive_queue_count();
+        let mvm_sync = self.is_mvm89() || self.ap_legacy_selected() || self.p2p_gen2_prefix();
+        let mut prefix = if mvm_sync {
+            super::super::rx_multi::Prefix::gen2(queues, cookie, baid)?
+        } else {
+            super::super::rx_multi::Prefix::new(queues, cookie, baid)?
+        };
+        boot_context::put32(&mut body, 4, u32::from(prefix.mask()));
         let count = if baid.is_some() { 12 } else { 8 };
         boot_context::put32(&mut body, 8, count);
         body[12] = u8::from(baid.is_some()); // EMPTY0 / DEL_BA1
+        if mvm_sync {
+            boot_context::put16(&mut body, 14, 1);
+        }
         boot_context::put32(&mut body, 16, cookie);
         if let Some(id) = baid {
             boot_context::put32(&mut body, 20, u32::from(id));
@@ -177,23 +241,19 @@ impl Hardware {
                 };
                 let packet = self.notifications.remove(index).unwrap();
                 if packet.header.group_id == 5 {
-                    let b = &packet.payload;
-                    if b.len() != count as usize + 4
-                        || b[..8] != [count as u8, 0, 0, 0, u8::from(baid.is_some()), 0, 0, 0]
-                    {
-                        return Err("MLD RX BAID marker geometry/type");
+                    if prefix.observe(packet.receive_queue, &packet.payload)? {
+                        return Ok(management);
                     }
-                    if u32::from_le_bytes(b[8..12].try_into().unwrap()) != cookie {
-                        continue;
-                    }
-                    if baid.is_some_and(|id| b[12..16] != u32::from(id).to_le_bytes()) {
-                        return Err("MLD RX BAID marker identity");
-                    }
-                    return Ok(management);
+                    continue;
                 }
-                if packet.header.cmd == 0xc1
-                    && scan_api::mpdu(&packet.payload)
-                        .is_some_and(|m| m.frame.first().is_some_and(|fc| fc & 12 == 0))
+                if packet.receive_queue == 0
+                    && packet.header.cmd == 0xc1
+                    && (if self.ap_legacy_selected() {
+                        scan_api::mpdu_gen2(&packet.payload)
+                    } else {
+                        scan_api::mpdu(&packet.payload)
+                    })
+                    .is_some_and(|m| m.frame.first().is_some_and(|fc| fc & 12 == 0))
                 {
                     if management.len() == 32 {
                         return Err("MLD RX epoch management prefix bound");

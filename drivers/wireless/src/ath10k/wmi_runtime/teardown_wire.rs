@@ -12,18 +12,30 @@ impl Wire {
             Dialect::TenFour => (0x9019, 0x9023, 0x9018, 0x9007),
         }
     }
-    pub fn down_station(self) -> Result<Vec<u8>, Error> {
+    /// `WMI_VDEV_DOWN` of `vdev` (`struct wmi_vdev_down_cmd`).
+    pub fn down_station(self, vdev: u8) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.teardown_ids().0, if tlv { 8 } else { 4 })?;
         if tlv {
             header(&mut out, 94, 4);
         }
+        put(&mut out, if tlv { 8 } else { 4 }, u32::from(vdev));
         Ok(out)
     }
-    pub fn delete_peer(self, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
+    pub fn delete_peer(self, vdev: u8, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
         if bssid == [0; 6] || bssid[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
+        self.delete_peer_record(vdev, bssid)
+    }
+    /// `WMI_PEER_DELETE` of a DEFAULT peer on its owning `vdev`.
+    pub fn delete_offchannel_peer(self, vdev: u8, destination: [u8; 6]) -> Result<Vec<u8>, Error> {
+        if destination == [0; 6] {
+            return Err(Error::Malformed);
+        }
+        self.delete_peer_record(vdev, destination)
+    }
+    fn delete_peer_record(self, vdev: u8, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.teardown_ids().1, if tlv { 16 } else { 12 })?;
         let at = if tlv {
@@ -32,21 +44,25 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         out[at + 4..at + 10].copy_from_slice(&bssid);
         Ok(out)
     }
-    pub fn stop_station(self) -> Result<Vec<u8>, Error> {
+    /// `WMI_VDEV_STOP` of `vdev` (`struct wmi_vdev_stop_cmd`).
+    pub fn stop_station(self, vdev: u8) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.teardown_ids().2, if tlv { 8 } else { 4 })?;
         if tlv {
             header(&mut out, 93, 4);
         }
+        put(&mut out, if tlv { 8 } else { 4 }, u32::from(vdev));
         Ok(out)
     }
     pub fn stopped_event_id(self) -> u32 {
         self.teardown_ids().3
     }
-    pub fn stopped_response(self, body: &[u8]) -> Result<bool, Error> {
+    /// `WMI_VDEV_STOPPED` for `vdev` (`wmi_vdev_stopped_event.vdev_id`).
+    pub fn stopped_response(self, vdev: u8, body: &[u8]) -> Result<bool, Error> {
         let body = if self.dialect == Dialect::Tlv {
             tag(body, 41)?
         } else {
@@ -55,12 +71,12 @@ impl Wire {
         if body.len() != 4 {
             return Err(Error::Malformed);
         }
-        Ok(word(body, 0)? == 0)
+        Ok(word(body, 0)? == u32::from(vdev))
     }
     pub fn delete_event_id(self) -> Option<u32> {
         (self.dialect == Dialect::Tlv).then_some(0x6007)
     }
-    pub fn delete_response(self, body: &[u8], bssid: [u8; 6]) -> Result<bool, Error> {
+    pub fn delete_response(self, vdev: u8, body: &[u8], bssid: [u8; 6]) -> Result<bool, Error> {
         if self.dialect != Dialect::Tlv {
             return Err(Error::Unsupported);
         }
@@ -68,7 +84,7 @@ impl Wire {
         if body.len() != 12 {
             return Err(Error::Malformed);
         }
-        Ok(word(body, 0)? == 0 && body[4..10] == bssid)
+        Ok(word(body, 0)? == u32::from(vdev) && body[4..10] == bssid)
     }
     pub fn sync_delete_required(self, caps: &Capabilities) -> bool {
         // Only the TLV service map advertises Linux SYNC_DELETE_CMDS.

@@ -14,8 +14,6 @@
 //! `ath11k_hw_ring_mask_qca6390`, `ath11k_hw_hal_params_qca6390`), not
 //! from the code under test.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::vec;

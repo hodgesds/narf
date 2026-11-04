@@ -16,6 +16,8 @@ struct Bus {
     busy: bool,
     header_only: bool,
     firmware_error: Option<u32>,
+    /// Reply with BCDC_DCMD_IF bits cleared (no ifidx echo).
+    zero_ifidx: bool,
 }
 impl Transport for Bus {
     fn read32(&mut self, _: Function, _: u32) -> Result<u32, TransportError> {
@@ -62,6 +64,9 @@ impl PacketTransport for Bus {
             data.extend_from_slice(&ethernet());
             self.rx.push_back(frame(2, CHANNEL_DATA, 8, &data));
             let mut reply = request;
+            if self.zero_ifidx {
+                reply.flags &= !bcdc_flag::IF_MASK;
+            }
             if !self.header_only {
                 reply.len = 4;
             }
@@ -126,7 +131,7 @@ fn smoke_cyw_f2_control_correlates_and_demultiplexes() -> TestResult {
     let mut runtime = Runtime::new(bus);
     if ready(runtime.command(ioctl::Direction::Get, 1, &[0; 4], 4)) != Some(Ok(vec![1, 2, 3, 4]))
         || runtime.pop_data() != Some(ethernet())
-        || runtime.transport.tx.len() != 1
+        || runtime.transport.as_mut().unwrap().tx.len() != 1
         || runtime.tx_sequence != 1
         || runtime.pending.is_some()
         || runtime.is_failed()
@@ -159,7 +164,7 @@ fn smoke_cyw_f2_get_query_zero_fills_linux_wire_extent() -> TestResult {
         {
             return TestResult::Fail("query wire fixture did not complete");
         }
-        let bytes = &runtime.transport.tx[0];
+        let bytes = &runtime.transport.as_mut().unwrap().tx[0];
         let length = HwHeader::decode(bytes).unwrap().length as usize;
         let header = BcdcHeader::decode(&bytes[12..]).unwrap();
         if header.cmd != command
@@ -233,6 +238,8 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
     runtime.tx_sequence = 254;
     runtime
         .transport
+        .as_mut()
+        .unwrap()
         .rx
         .push_back(frame(0, CHANNEL_CONTROL, 3, &[]));
     if runtime.poll() != Ok(1) {
@@ -248,7 +255,7 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
     runtime.set_ac_priority([1, 0, 0, 1, 3, 3, 1, 1]);
     if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
         || runtime.send_data(&ethernet(), 6) != Err(Error::Busy)
-        || !runtime.transport.tx.is_empty()
+        || !runtime.transport.as_mut().unwrap().tx.is_empty()
     {
         return TestResult::Fail("TX ignored the precedence-mapped flow stop");
     }
@@ -260,9 +267,9 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
         }
     }
     if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
-        || runtime.transport.tx.len() != 3
-        || runtime.transport.tx[0][4] != 254
-        || runtime.transport.tx[0][12..16] != [0x20, 0, 0, 0]
+        || runtime.transport.as_mut().unwrap().tx.len() != 3
+        || runtime.transport.as_mut().unwrap().tx[0][4] != 254
+        || runtime.transport.as_mut().unwrap().tx[0][12..16] != [0x20, 0, 0, 0]
     {
         return TestResult::Fail("data consumed reserved control credit or invalid BDC header");
     }
@@ -281,17 +288,19 @@ fn smoke_cyw_f2_global_busy_preserves_credit_and_rx() -> TestResult {
     runtime.tx_max = 8;
     runtime
         .transport
+        .as_mut()
+        .unwrap()
         .rx
         .push_back(frame(0, CHANNEL_CONTROL, 8, &[]));
     if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
         || runtime.tx_sequence != 0
         || runtime.is_failed()
         || runtime.poll() != Ok(1)
-        || !runtime.transport.tx.is_empty()
+        || !runtime.transport.as_mut().unwrap().tx.is_empty()
     {
         return TestResult::Fail("global FIFO stop consumed sequence/credit or blocked RX");
     }
-    runtime.transport.busy = false;
+    runtime.transport.as_mut().unwrap().busy = false;
     if runtime.send_data(&ethernet(), 0).is_err() || runtime.tx_sequence != 1 {
         return TestResult::Fail("unblocked FIFO did not resume retained credit");
     }
@@ -308,7 +317,7 @@ fn smoke_cyw_f2_cancel_and_bus_error_fail_session() -> TestResult {
     if ready(runtime.command(ioctl::Direction::Set, 2, &[], 0)).is_some()
         || !runtime.is_failed()
         || ready(runtime.command(ioctl::Direction::Get, 1, &[], 4)) != Some(Err(Error::Failed))
-        || !runtime.transport.tx.is_empty()
+        || !runtime.transport.as_mut().unwrap().tx.is_empty()
     {
         return TestResult::Fail("cancelled control request could be replayed");
     }
@@ -350,10 +359,15 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
     for seq in 0..17 {
         runtime
             .transport
+            .as_mut()
+            .unwrap()
             .rx
             .push_back(frame(seq, CHANNEL_EVENT, 8, &event));
     }
-    if runtime.poll() != Ok(16) || runtime.events.len() != 16 || runtime.transport.rx.len() != 1 {
+    if runtime.poll() != Ok(16)
+        || runtime.events.len() != 16
+        || runtime.transport.as_mut().unwrap().rx.len() != 1
+    {
         return TestResult::Fail("F2 worker exceeded RX budget");
     }
     if runtime.poll() != Ok(1) || runtime.pop_event().map(|e| e.header.event_type) != Some(16) {
@@ -362,6 +376,8 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
     // Repeated sequence does not dispatch the last event twice.
     runtime
         .transport
+        .as_mut()
+        .unwrap()
         .rx
         .push_back(frame(16, CHANNEL_EVENT, 8, &event));
     if runtime.poll() != Ok(1) || runtime.events.len() != 16 {
@@ -373,13 +389,18 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
         frame(0, CHANNEL_GLOM, 8, &[0; 20]),
     ] {
         let mut runtime = Runtime::new(Bus::default());
-        runtime.transport.rx.push_back(bad.clone());
+        runtime
+            .transport
+            .as_mut()
+            .unwrap()
+            .rx
+            .push_back(bad.clone());
         if runtime.poll().is_ok() || !runtime.is_failed() {
             return TestResult::Fail("unsupported or malformed packet admitted");
         }
         bad[2] ^= 1;
         let mut runtime = Runtime::new(Bus::default());
-        runtime.transport.rx.push_back(bad);
+        runtime.transport.as_mut().unwrap().rx.push_back(bad);
         if runtime.poll() != Err(Error::Malformed) {
             return TestResult::Fail("bad checksum accepted");
         }
@@ -389,4 +410,125 @@ fn smoke_cyw_f2_bounded_events_and_bad_packets() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/runtime",
     smoke_cyw_f2_bounded_events_and_bad_packets
+);
+
+fn vif_event_body(event_type: u32, if_idx: u8, bsscfg_idx: u8) -> Vec<u8> {
+    let mut bytes = event_body();
+    let e = &mut bytes[4..];
+    e[28..32].copy_from_slice(&event_type.to_be_bytes());
+    e[70] = if_idx;
+    e[71] = bsscfg_idx;
+    bytes
+}
+
+/// Linux `bcdc.c` `BCDC_GET_IF_IDX`/`BCDC_SET_IF_IDX` and
+/// `BCDC_DCMD_IF_SHIFT`; `fweh.c` routes `BRCMF_E_IF` and secondary-bsscfg
+/// events away from interface 0. Interface-0 queues stay unchanged.
+fn smoke_cyw_f2_secondary_ifidx_demux() -> TestResult {
+    use crate::brcmfmac::vif_demux::{route, Route};
+    if route(54, 0, 0) != Route::Secondary
+        || route(16, 0, 0) != Route::Primary
+        || route(16, 1, 1) != Route::Secondary
+        || route(16, 0, 16) != Route::Invalid
+    {
+        return TestResult::Fail("event route differs from fweh dispatch");
+    }
+    let mut runtime = Runtime::new(Bus::default());
+    let mut data = vec![0x20, 0, 1, 0];
+    data.extend_from_slice(&ethernet());
+    let rx = |runtime: &mut Runtime<Bus>, packet| {
+        runtime.transport.as_mut().unwrap().rx.push_back(packet);
+        runtime.poll()
+    };
+    // Unregistered ifidx: dropped like brcmf_proto_bcdc_hdrpull -EBADE.
+    if rx(&mut runtime, frame(0, CHANNEL_DATA, 8, &data)) != Ok(1)
+        || runtime.is_failed()
+        || runtime.pop_data().is_some()
+        || runtime.pop_vif_data(1).is_some()
+    {
+        return TestResult::Fail("unopened secondary ifidx data not dropped");
+    }
+    if runtime.vif_open(1).is_err()
+        || runtime.vif_open(0).is_ok()
+        || runtime.vif_open(16).is_ok()
+        || rx(&mut runtime, frame(1, CHANNEL_DATA, 8, &data)) != Ok(1)
+        || runtime.pop_data().is_some()
+        || runtime.pop_vif_data(2).is_some()
+        || runtime.pop_vif_data(1) != Some(ethernet())
+    {
+        return TestResult::Fail("secondary ifidx data not demultiplexed");
+    }
+    // Secondary events are retained only while an owner listens.
+    if rx(
+        &mut runtime,
+        frame(2, CHANNEL_EVENT, 8, &vif_event_body(16, 1, 1)),
+    ) != Ok(1)
+        || runtime.pop_vif_event().is_some()
+        || runtime.pop_event().is_some()
+    {
+        return TestResult::Fail("unlistened secondary event retained");
+    }
+    runtime.vif_listen(true);
+    if rx(
+        &mut runtime,
+        frame(3, CHANNEL_EVENT, 8, &vif_event_body(54, 0, 0)),
+    ) != Ok(1)
+        || rx(
+            &mut runtime,
+            frame(4, CHANNEL_EVENT, 8, &vif_event_body(16, 1, 1)),
+        ) != Ok(1)
+        || rx(
+            &mut runtime,
+            frame(5, CHANNEL_EVENT, 8, &vif_event_body(16, 0, 0)),
+        ) != Ok(1)
+        || runtime.pop_vif_event().map(|e| e.header.event_type) != Some(54)
+        || runtime.pop_vif_event().map(|e| e.header.bsscfg_idx) != Some(1)
+        || runtime.pop_vif_event().is_some()
+        || runtime.pop_event().map(|e| e.header.event_type) != Some(16)
+    {
+        return TestResult::Fail("IF/secondary events not separated from interface 0");
+    }
+    // TX carries BDC flags2 ifidx; an unopened ifidx is refused.
+    if runtime.send_data_on(1, &ethernet(), 5).is_err()
+        || runtime.send_data_on(2, &ethernet(), 5) != Err(Error::Authority)
+        || runtime.send_data(&ethernet(), 5).is_err()
+    {
+        return TestResult::Fail("secondary transmit admission");
+    }
+    let tx = &runtime.transport.as_mut().unwrap().tx;
+    if tx.len() != 2 || tx[0][12..16] != [0x20, 5, 1, 0] || tx[1][12..16] != [0x20, 5, 0, 0] {
+        return TestResult::Fail("BDC flags2 ifidx not encoded");
+    }
+    // IOCTL ifidx is BCDC_DCMD_IF_SHIFT and the echoed reply completes it.
+    runtime.transport.as_mut().unwrap().auto_reply = true;
+    if ready(runtime.command_on(1, ioctl::Direction::Get, 262, b"ver\0", 4))
+        != Some(Ok(vec![1, 2, 3, 4]))
+        || BcdcHeader::decode(&runtime.transport.as_mut().unwrap().tx[2][12..])
+            .unwrap()
+            .if_idx()
+            != 1
+    {
+        return TestResult::Fail("secondary IOCTL ifidx not encoded/correlated");
+    }
+    // Linux bcdc.c correlates by request id only: a reply without the
+    // ifidx echo still completes the secondary request.
+    runtime.transport.as_mut().unwrap().zero_ifidx = true;
+    if ready(runtime.command_on(1, ioctl::Direction::Get, 262, b"ver\0", 4))
+        != Some(Ok(vec![1, 2, 3, 4]))
+    {
+        return TestResult::Fail("secondary IOCTL reply required an ifidx echo");
+    }
+    runtime.transport.as_mut().unwrap().zero_ifidx = false;
+    // Close discards queued data; failure clears every secondary record.
+    if rx(&mut runtime, frame(9, CHANNEL_DATA, 8, &data)) != Ok(1) || !runtime.vif_close(1) {
+        return TestResult::Fail("close");
+    }
+    if runtime.pop_vif_data(1).is_some() || runtime.send_data_on(1, &ethernet(), 0).is_ok() {
+        return TestResult::Fail("closed ifidx kept data authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/runtime",
+    smoke_cyw_f2_secondary_ifidx_demux
 );

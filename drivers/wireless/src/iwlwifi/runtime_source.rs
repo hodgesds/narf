@@ -71,16 +71,66 @@ impl Assets {
 pub(in crate::iwlwifi) struct Fence {
     assets: Assets,
     pci: super::Authority,
+    policy: Option<super::super::mld_policy::Authority>,
+    ap: Option<alloc::sync::Arc<super::super::ap_owner::Owner>>,
+    ap_request: Option<alloc::sync::Arc<super::super::ap_owner::Request>>,
+    p2p: Option<alloc::sync::Arc<super::super::p2p_owner::Gate>>,
+    client: Option<alloc::sync::Arc<super::super::p2p_client::Native>>,
+    client_request: Option<alloc::sync::Arc<super::super::p2p_client_request::Request>>,
 }
 impl Fence {
     pub(super) fn new(assets: Assets, pci: super::Authority) -> Self {
-        Self { assets, pci }
+        Self {
+            assets,
+            pci,
+            policy: None,
+            ap: None,
+            ap_request: None,
+            p2p: None,
+            client: None,
+            client_request: None,
+        }
     }
     pub(in crate::iwlwifi) fn invoke<T>(
         &self,
         operation: impl FnOnce() -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
-        self.assets.invoke(|| self.pci.invoke(operation))
+        self.assets.invoke(|| {
+            self.pci.invoke(|| {
+                if let Some(ap) = &self.ap {
+                    ap.check()?;
+                }
+                if let Some(request) = &self.ap_request {
+                    request.check()?;
+                }
+                if let Some(p2p) = &self.p2p {
+                    p2p.check()?;
+                }
+                if let Some(request) = &self.client_request {
+                    request.check()?;
+                }
+                if let Some(client) = &self.client {
+                    client.current()?;
+                }
+                if let Some(policy) = &self.policy {
+                    policy.check()?;
+                }
+                operation()
+            })
+        })
+    }
+    /// The initiating RF receipt is mandatory at the actual packet publish,
+    /// while source-only checks still permit non-emitting MCC/config waits.
+    pub(in crate::iwlwifi) fn invoke_packet<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        self.invoke(|| {
+            if let Some(request) = &self.client_request {
+                request.transmission()?;
+            }
+            operation()
+        })
     }
     #[cfg(feature = "kernel-test")]
     pub(in crate::iwlwifi) fn revoke_model_pci(&self) {
@@ -113,8 +163,48 @@ impl super::Hardware {
         }
         Err("native Intel executable/PNVM source owner absent")
     }
+    pub(in crate::iwlwifi) fn client_receive_source(&self) -> Result<Fence, &'static str> {
+        if !matches!(
+            &self.rf_policy,
+            None | Some(super::super::mld_policy::Authority::Station(_))
+        ) || self.ap_owner.is_some()
+            || self.p2p.gate.is_some()
+        {
+            return Err("CLIENT RX source belongs to another native role");
+        }
+        let mut source = self.source_fence()?;
+        // A receive subscription owns its original separate socket; it never
+        // borrows a concurrent FRAME request's source or initiating RF grant.
+        source.client_request = None;
+        Ok(source)
+    }
+    /// CLIENT completion never retains the callback-capable periodic-scan
+    /// authority or another role/request. Only concrete station providers
+    /// may reach the fixed shared final FRAME receipt.
+    pub(in crate::iwlwifi) fn client_frame_source(&self) -> Result<Fence, &'static str> {
+        if self.p2p_client.is_none()
+            || self.client_request.is_some()
+            || self.ap_owner.is_some()
+            || self.ap_request.is_some()
+            || self.p2p.gate.is_some()
+            || !matches!(
+                &self.rf_policy,
+                None | Some(super::super::mld_policy::Authority::Station(_))
+            )
+        {
+            return Err("P2P CLIENT FRAME source is not a fixed original station owner");
+        }
+        self.source_fence()
+    }
     pub(in crate::iwlwifi) fn source_fence(&self) -> Result<Fence, &'static str> {
-        Ok(Fence::new(self.source_assets()?, self.authority(true)))
+        let mut fence = Fence::new(self.source_assets()?, self.authority(true));
+        fence.policy = self.rf_policy.clone();
+        fence.ap = self.ap_owner.clone();
+        fence.ap_request = self.ap_request.clone();
+        fence.p2p = self.p2p.gate.clone();
+        fence.client = self.p2p_client.clone();
+        fence.client_request = self.client_request.clone();
+        Ok(fence)
     }
 }
 

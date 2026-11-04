@@ -47,8 +47,9 @@
 //! parameterised on `mic_len` so the supplicant code-paths can pick
 //! the right size without forking the codec.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
+pub mod mlo;
 mod rsna;
 pub use rsna::{
     key_ver_allowed, wpa_eapol_key_mic, wpa_pmk_to_ptk, EapolRx, EapolRxError, KeyMgmt,
@@ -400,6 +401,7 @@ pub struct Supplicant {
     pub renew_snonce: bool,
     /// `sm->ptk.installed`.
     pub ptk_installed: bool,
+    mlo: Option<Box<crate::association::mlo::Context>>,
 }
 
 impl Supplicant {
@@ -420,6 +422,7 @@ impl Supplicant {
             tptk: None,
             renew_snonce: false,
             ptk_installed: false,
+            mlo: None,
         }
     }
 
@@ -739,6 +742,10 @@ impl Supplicant {
     ) -> Result<GroupKeyM1, GroupKeyError> {
         use GroupKeyDrop as D;
         use GroupKeyError::{Drop, Fail};
+        let normalized = self
+            .mlo_front(f, mlo::Kind::Group1)
+            .map_err(|_| Fail(GroupKeyFail::KeyData))?;
+        let f = normalized.as_ref().unwrap_or(f);
         let (tmp, key_info, ver, replay_counter) = (&f.tmp, f.key_info, f.ver, f.replay_counter);
         let key_data = &f.key_data[..];
         let body = 4;

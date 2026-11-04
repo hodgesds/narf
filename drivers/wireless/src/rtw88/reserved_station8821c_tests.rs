@@ -14,12 +14,17 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const SSID: &[u8] = b"narf-8822ce"; // shared independent AP actor, not a chip identity
+#[path = "runtime_lps_tests.rs"]
+mod lps_tests;
 #[path = "wmm8821c_tests.rs"]
 mod wmm_tests;
 
 type OperatingFixture = (Fixture, Cap<FirmwareBlob, Read>, Cap<FirmwareBlob, Read>);
 fn operating() -> Result<OperatingFixture, &'static str> {
-    let (f, iqk) = calibrated()?;
+    operating_with_features(0)
+}
+fn operating_with_features(features: u32) -> Result<OperatingFixture, &'static str> {
+    let (f, iqk) = calibrated_with_features(features)?;
     let req = request(&f)?;
     let power = Cap::bootstrap();
     narf_scheduler::block_on(f.lifecycle.prepare_operating8821c_with(
@@ -152,21 +157,29 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
                     rates: 0xfff,
                     qos: false,
                     mcs: 0,
+                    rx_mcs: 0,
                     sgi: false,
                     ldpc: false,
                     stbc: false,
                     acs: 0,
                     fallback: false,
+                    bw40: false,
+                    band5: false,
+                    vht: None,
                 })
                 || g.allows_profile(crate::rtw88::packet_format::DataProfile {
                     rates: 1,
                     qos: true,
                     mcs: 0,
+                    rx_mcs: 0,
                     sgi: false,
                     ldpc: false,
                     stbc: false,
                     acs: 0,
                     fallback: false,
+                    bw40: false,
+                    band5: false,
+                    vht: None,
                 })
         })
         || m.command_ring.pending()
@@ -366,10 +379,13 @@ struct Harness {
 }
 impl Harness {
     fn new(protected: bool) -> Result<Self, &'static str> {
+        Self::with_features(protected, 0)
+    }
+    fn with_features(protected: bool, features: u32) -> Result<Self, &'static str> {
         if ACTIVE.lock().is_some() {
             return Err("C21 native fixture interface collision");
         }
-        let (f, iqk, power) = operating()?;
+        let (f, iqk, power) = operating_with_features(features)?;
         let req = station_request(&f)?;
         let station = Cap::bootstrap();
         let db = policy();

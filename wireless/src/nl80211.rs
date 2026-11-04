@@ -2,6 +2,8 @@
 
 mod control;
 
+pub(crate) use control::scheduled_results;
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub use control::connect_for_test;
 
@@ -72,6 +74,14 @@ const NL80211_ATTR_MAX_AP_ASSOC_STA: u16 = 202;
 const NL80211_ATTR_EXT_CAPA: u16 = 169;
 const NL80211_ATTR_EXT_CAPA_MASK: u16 = 170;
 const NL80211_ATTR_IFTYPE_EXT_CAPA: u16 = 230;
+const NL80211_ATTR_BSSID: u16 = 245;
+const NL80211_ATTR_MLO_LINKS: u16 = 312;
+const NL80211_ATTR_MLO_LINK_ID: u16 = 313;
+const NL80211_ATTR_MLD_ADDR: u16 = 314;
+const NL80211_ATTR_MLO_SUPPORT: u16 = 315;
+const NL80211_ATTR_EML_CAPABILITY: u16 = 317;
+const NL80211_ATTR_MLD_CAPA_AND_OPS: u16 = 318;
+const NL80211_ATTR_EXT_MLD_CAPA_AND_OPS: u16 = 337;
 const NL80211_ATTR_MAC_ADDRS: u16 = 166;
 const NL80211_ATTR_OFFCHANNEL_TX_OK: u16 = 108;
 const NL80211_ATTR_MAX_CSA_COUNTERS: u16 = 206;
@@ -221,6 +231,33 @@ pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
     );
 }
 
+/// Report a netdev the driver removed on its own after `NEW_INTERFACE`
+/// returned (e.g. its deferred firmware vif creation failed):
+/// `_cfg80211_unregister_wdev` -> `nl80211_notify_iface(rdev, wdev,
+/// NL80211_CMD_DEL_INTERFACE)` on the `config` group, with the
+/// `nl80211_send_iface` attributes. Call while the netdev is still
+/// registered (its ifindex resolves), then unpublish it; this also drops
+/// the nl80211 per-netdev state a user `DEL_INTERFACE` would.
+pub fn notify_interface_removed(iface: &dyn crate::WirelessNetIface) {
+    let name = iface.name();
+    let published = narf_net::iface::lookup(name);
+    if let (Some(net), Some(wiphy)) = (published, crate::registry::wiphy_index(iface.wiphy_id())) {
+        let attrs = interface_attrs(wiphy, iface, iface.current_iftype());
+        if !attrs.is_empty() {
+            narf_net::netlink_generic::publish_event(
+                NL80211_FAMILY_ID,
+                17,
+                net.net_ns_id,
+                GenlReply {
+                    command: NL80211_CMD_DEL_INTERFACE,
+                    attrs,
+                },
+            );
+        }
+    }
+    control::forget_interface(name);
+}
+
 /// Report a driver-completed roam (`cfg80211_roamed` →
 /// `nl80211_send_roamed`, NL80211_CMD_ROAM = 47): the new BSSID, its
 /// operating frequency and the (re)association request/response elements.
@@ -294,6 +331,40 @@ pub fn notify_cqm_packet_loss(name: &str, peer: [u8; 6], packets: u32) {
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
     push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
     push_attr(&mut attrs, NL80211_ATTR_MAC, &peer);
+    push_attr(&mut attrs, ATTR_CQM | NLA_F_NESTED, &cqm);
+    narf_net::netlink_generic::publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        net.net_ns_id,
+        GenlReply {
+            command: NOTIFY_CQM,
+            attrs,
+        },
+    );
+}
+
+/// `cfg80211_cqm_beacon_loss_notify`: the driver's beacon-loss threshold
+/// was crossed (`cfg80211_prepare_cqm` with no peer address, then the
+/// `NL80211_ATTR_CQM_BEACON_LOSS_EVENT` flag). Userspace owns any roam.
+pub fn notify_cqm_beacon_loss(name: &str) {
+    const NOTIFY_CQM: u8 = 64;
+    const ATTR_CQM: u16 = 94;
+    const CQM_BEACON_LOSS_EVENT: u16 = 8;
+    const NLA_F_NESTED: u16 = 1 << 15;
+    let Some(ifindex) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(net) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let Some(wiphy) = wiphy_for_name(name) else {
+        return;
+    };
+    let mut cqm = Vec::new();
+    push_attr(&mut cqm, CQM_BEACON_LOSS_EVENT, &[]);
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
     push_attr(&mut attrs, ATTR_CQM | NLA_F_NESTED, &cqm);
     narf_net::netlink_generic::publish_event(
         NL80211_FAMILY_ID,
@@ -637,18 +708,33 @@ fn find_attr(attrs: &[u8], requested_kind: u16) -> Option<&[u8]> {
 }
 
 fn interface_attrs(wiphy: u32, iface: &dyn crate::WirelessNetIface, iftype: u32) -> Vec<u8> {
+    let control = if iface.control_namespace().is_some() {
+        match crate::registry::control_for(iface).filter(|entry| entry.current_for(iface)) {
+            Some(entry) => Some(entry),
+            None => return Vec::new(),
+        }
+    } else {
+        None
+    };
     let info = iface.get_wireless_info();
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
     let ifindex = narf_net::netlink_route::ifindex_for_name(&info.base_name).unwrap_or(0);
-    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    if control.is_none() {
+        push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    }
     named_attr(&mut attrs, NL80211_ATTR_IFNAME, &info.base_name);
     push_attr(&mut attrs, NL80211_ATTR_IFTYPE, &iftype.to_ne_bytes());
     // nl80211_send_iface: NL80211_ATTR_WDEV = wdev_id(wdev) (u64).
     push_attr(
         &mut attrs,
         NL80211_ATTR_WDEV,
-        &control::station::wdev_id(wiphy, ifindex).to_ne_bytes(),
+        &control
+            .map_or_else(
+                || control::station::wdev_id(wiphy, ifindex),
+                |entry| entry.id(),
+            )
+            .to_ne_bytes(),
     );
     push_attr(&mut attrs, NL80211_ATTR_MAC, &info.base_mac);
     // `nl80211_send_iface` emits this unconditionally, including for
@@ -667,7 +753,99 @@ fn interface_attrs(wiphy: u32, iface: &dyn crate::WirelessNetIface, iftype: u32)
             &dbm.saturating_mul(100).to_ne_bytes(),
         );
     }
+    if let Some(mlo) = iface.mlo_connection() {
+        push_interface_mlo_links(&mut attrs, &mlo);
+    }
     attrs
+}
+
+/// `nl80211_send_chandef` for one MLO link's channel (no S1G, NPCA or
+/// fractional-MHz members: `WIPHY_FREQ_OFFSET` is always 0 here).
+fn push_link_chandef(out: &mut Vec<u8>, channel: &crate::LinkChannel) {
+    const ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
+    const ATTR_CHANNEL_WIDTH: u16 = 159;
+    const ATTR_CENTER_FREQ1: u16 = 160;
+    const ATTR_CENTER_FREQ2: u16 = 161;
+    const ATTR_WIPHY_FREQ_OFFSET: u16 = 290;
+    push_attr(
+        out,
+        NL80211_ATTR_WIPHY_FREQ,
+        &channel.frequency_mhz.to_ne_bytes(),
+    );
+    push_attr(out, ATTR_WIPHY_FREQ_OFFSET, &0u32.to_ne_bytes());
+    // cfg80211_get_chandef_type: NO_HT=0, HT20=1, HT40MINUS=2, HT40PLUS=3.
+    let channel_type = match channel.width {
+        0 => Some(0u32),
+        1 => Some(1),
+        2 if channel.center_freq1_mhz > channel.frequency_mhz => Some(3),
+        2 => Some(2),
+        _ => None,
+    };
+    if let Some(channel_type) = channel_type {
+        push_attr(out, ATTR_WIPHY_CHANNEL_TYPE, &channel_type.to_ne_bytes());
+    }
+    push_attr(out, ATTR_CHANNEL_WIDTH, &channel.width.to_ne_bytes());
+    push_attr(
+        out,
+        ATTR_CENTER_FREQ1,
+        &channel.center_freq1_mhz.to_ne_bytes(),
+    );
+    if channel.center_freq2_mhz != 0 {
+        push_attr(
+            out,
+            ATTR_CENTER_FREQ2,
+            &channel.center_freq2_mhz.to_ne_bytes(),
+        );
+    }
+}
+
+/// `nl80211_send_iface`'s `wdev->valid_links` block: one nested entry
+/// (`link_id + 1`) per valid link with its link id, our link address and
+/// its chandef. Rejected requested links are not valid links.
+fn push_interface_mlo_links(out: &mut Vec<u8>, mlo: &crate::MloConnection) {
+    let mut links = Vec::new();
+    for link in mlo.links.iter().filter(|link| link.status == 0) {
+        let mut entry = Vec::new();
+        push_attr(&mut entry, NL80211_ATTR_MLO_LINK_ID, &[link.link_id]);
+        push_attr(&mut entry, NL80211_ATTR_MAC, &link.address);
+        if let Some(channel) = &link.channel {
+            push_link_chandef(&mut entry, channel);
+        }
+        push_attr(
+            &mut links,
+            (u16::from(link.link_id) + 1) | NLA_F_NESTED,
+            &entry,
+        );
+    }
+    if !links.is_empty() {
+        push_attr(out, NL80211_ATTR_MLO_LINKS | NLA_F_NESTED, &links);
+    }
+}
+
+/// `nl80211_send_connect_result` / `nl80211_send_roamed` for
+/// `cr->valid_links`: entries numbered from 1 for every requested link
+/// (rejected ones too) with link id, the AP link BSSID, our link address
+/// and that link's status code.
+pub(crate) fn push_connect_mlo_links(out: &mut Vec<u8>, mlo: &crate::MloConnection) {
+    let mut links = Vec::new();
+    for (index, link) in mlo.links.iter().enumerate() {
+        let mut entry = Vec::new();
+        push_attr(&mut entry, NL80211_ATTR_MLO_LINK_ID, &[link.link_id]);
+        push_attr(&mut entry, NL80211_ATTR_BSSID, &link.bssid);
+        push_attr(&mut entry, NL80211_ATTR_MAC, &link.address);
+        push_attr(&mut entry, 72, &link.status.to_ne_bytes()); // STATUS_CODE
+        push_attr(&mut links, (index as u16 + 1) | NLA_F_NESTED, &entry);
+    }
+    push_attr(out, NL80211_ATTR_MLO_LINKS | NLA_F_NESTED, &links);
+}
+
+/// `nl80211_send_station`'s `sinfo->mlo_params_valid` tail: the
+/// association link id and the AP MLD address.
+pub(crate) fn push_station_mlo_params(out: &mut Vec<u8>, mlo: &crate::MloConnection) {
+    push_attr(out, NL80211_ATTR_MLO_LINK_ID, &[mlo.assoc_link_id]);
+    if mlo.ap_mld != [0; 6] {
+        push_attr(out, NL80211_ATTR_MLD_ADDR, &mlo.ap_mld);
+    }
 }
 
 fn wiphy_attrs(
@@ -676,6 +854,7 @@ fn wiphy_attrs(
     iface: Option<&dyn crate::WirelessNetIface>,
 ) -> Vec<u8> {
     let mut attrs = Vec::new();
+    let p2p_go_power = iface.is_some_and(p2p_go_power_save_supported);
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
     named_attr(
         &mut attrs,
@@ -831,9 +1010,23 @@ fn wiphy_attrs(
         push_attr(&mut modes, NL80211_IFTYPE_MONITOR as u16, &[]);
     }
     if info.modes.contains(crate::iface::WirelessModes::P2P) {
-        push_attr(&mut modes, NL80211_IFTYPE_P2P_DEVICE as u16, &[]);
-        push_attr(&mut modes, NL80211_IFTYPE_P2P_CLIENT as u16, &[]);
-        push_attr(&mut modes, NL80211_IFTYPE_P2P_GO as u16, &[]);
+        let mut advertised = 0u16;
+        for iftype in iface.map_or_else(
+            || {
+                alloc::vec![
+                    NL80211_IFTYPE_P2P_DEVICE,
+                    NL80211_IFTYPE_P2P_CLIENT,
+                    NL80211_IFTYPE_P2P_GO
+                ]
+            },
+            crate::WirelessNetIface::p2p_interface_types,
+        ) {
+            if !matches!(iftype, 8..=10) || advertised & (1 << iftype) != 0 {
+                continue;
+            }
+            advertised |= 1 << iftype;
+            push_attr(&mut modes, iftype as u16, &[]);
+        }
     }
     push_attr(
         &mut attrs,
@@ -878,6 +1071,28 @@ fn wiphy_attrs(
                 );
                 push_attr(&mut record, NL80211_ATTR_EXT_CAPA, &capability.capabilities);
                 push_attr(&mut record, NL80211_ATTR_EXT_CAPA_MASK, &capability.mask);
+                // nl80211_send_wiphy: the MLD capabilities of this type
+                // only on a WIPHY_FLAG_SUPPORTS_MLO wiphy, EXT_MLD_CAPA only
+                // when non-zero.
+                if iface.supports_mlo() {
+                    push_attr(
+                        &mut record,
+                        NL80211_ATTR_EML_CAPABILITY,
+                        &capability.eml_capabilities.to_ne_bytes(),
+                    );
+                    push_attr(
+                        &mut record,
+                        NL80211_ATTR_MLD_CAPA_AND_OPS,
+                        &capability.mld_capa_and_ops.to_ne_bytes(),
+                    );
+                    if capability.ext_mld_capa_and_ops != 0 {
+                        push_attr(
+                            &mut record,
+                            NL80211_ATTR_EXT_MLD_CAPA_AND_OPS,
+                            &capability.ext_mld_capa_and_ops.to_ne_bytes(),
+                        );
+                    }
+                }
                 push_attr(&mut records, index as u16, &record);
             }
             if !records.is_empty() {
@@ -920,6 +1135,11 @@ fn wiphy_attrs(
             // NL80211_ATTR_INTERFACE_COMBINATIONS.
             push_attr(&mut attrs, 120 | NLA_F_NESTED, &records);
         }
+    }
+    // `if (rdev->wiphy.flags & WIPHY_FLAG_SUPPORTS_MLO)
+    // nla_put_flag(msg, NL80211_ATTR_MLO_SUPPORT)`.
+    if iface.is_some_and(|iface| iface.supports_mlo()) {
+        push_attr(&mut attrs, NL80211_ATTR_MLO_SUPPORT, &[]);
     }
     if iface.is_some_and(|iface| iface.supports_ap_uapsd()) {
         push_attr(&mut attrs, NL80211_ATTR_SUPPORT_AP_UAPSD, &[]);
@@ -999,13 +1219,18 @@ fn wiphy_attrs(
             }
             push_attr(&mut triggers, 4, &pattern); // PKT_PATTERN support
         }
-        if wowlan.net_detect_max_match_sets != 0 {
+        if let Some(limits) = iface
+            .filter(|_| wowlan.net_detect_max_match_sets != 0)
+            .and_then(|iface| iface.wowlan_net_detect_limits())
+            .filter(|limits| limits.max_match_sets != 0)
+        {
+            let matches = limits.max_match_sets.min(wowlan.net_detect_max_match_sets);
             // WIPHY_WOWLAN_NET_DETECT is represented by the maximum number
             // of cfg80211 match sets, not a nested capability structure.
             push_attr(
                 &mut triggers,
                 17, // NL80211_WOWLAN_TRIG_NET_DETECT
-                &(wowlan.net_detect_max_match_sets as u32).to_ne_bytes(),
+                &u32::from(matches).to_ne_bytes(),
             );
             // ath11k publishes its PNO limits on the wiphy even though it
             // implements NLO only as the WoWLAN NET_DETECT path, not as a
@@ -1014,12 +1239,16 @@ fn wiphy_attrs(
             // their attribute widths are part of the netlink ABI.
             // A wiphy with `sched_scan_support()` publishes its own limits.
             if iface.is_none_or(|iface| iface.sched_scan_support().is_none()) {
-                push_attr(&mut attrs, 123, &[16]);
-                push_attr(&mut attrs, 124, &512u16.to_ne_bytes());
-                push_attr(&mut attrs, 133, &[wowlan.net_detect_max_match_sets]);
-                push_attr(&mut attrs, 222, &2u32.to_ne_bytes());
-                push_attr(&mut attrs, 223, &7200u32.to_ne_bytes());
-                push_attr(&mut attrs, 224, &100u32.to_ne_bytes());
+                push_attr(&mut attrs, 123, &[limits.max_ssids]);
+                push_attr(&mut attrs, 124, &limits.max_ie_len.to_ne_bytes());
+                push_attr(&mut attrs, 133, &[matches]);
+                push_attr(&mut attrs, 222, &limits.max_scan_plans.to_ne_bytes());
+                push_attr(
+                    &mut attrs,
+                    223,
+                    &limits.max_plan_interval_secs.to_ne_bytes(),
+                );
+                push_attr(&mut attrs, 224, &limits.max_plan_iterations.to_ne_bytes());
             }
         }
         push_attr(&mut attrs, 118 | NLA_F_NESTED, &triggers);
@@ -1068,6 +1297,9 @@ fn wiphy_attrs(
             NL80211_CMD_DEL_INTERFACE as u32,
         ]);
     }
+    if iface.is_some_and(|iface| iface.async_p2p_device_control()) {
+        command_list.extend_from_slice(&[89, 90]); // START/STOP_P2P_DEVICE
+    }
     // A userspace-SME driver additionally advertises the low-level MLME /
     // management-frame commands wpa_supplicant uses when it runs its own SME.
     if iface.is_some_and(|iface| iface.supports_userspace_mlme()) {
@@ -1076,10 +1308,28 @@ fn wiphy_attrs(
             38,  // ASSOCIATE
             39,  // DEAUTHENTICATE
             40,  // DISASSOCIATE
-            58,  // REGISTER_FRAME
-            59,  // FRAME
             127, // EXTERNAL_AUTH
         ]);
+    }
+    if let Some(iface) = iface {
+        let legacy = iface.supports_userspace_mlme() || iface.supports_ap_userspace_mlme();
+        let p2p_netdev = info.modes.contains(crate::iface::WirelessModes::P2P)
+            && iface
+                .p2p_interface_types()
+                .iter()
+                .any(|mode| matches!(mode, 8 | 9));
+        if legacy
+            || iface.async_radio_management_rx_control()
+            || p2p_netdev && iface.async_p2p_netdev_management_rx_control()
+        {
+            command_list.push(58); // REGISTER_FRAME.
+        }
+        if legacy
+            || iface.async_radio_management_tx_control()
+            || p2p_netdev && iface.async_p2p_netdev_management_tx_control()
+        {
+            command_list.push(59); // FRAME.
+        }
     }
     if iface.is_some_and(|iface| iface.max_remain_on_channel_duration_ms() != 0) {
         command_list.extend_from_slice(&[
@@ -1088,7 +1338,14 @@ fn wiphy_attrs(
         ]);
     }
     // An external-supplicant driver has `add_key` (CMD(add_key, NEW_KEY)).
-    if iface.is_some_and(|iface| iface.supports_external_supplicant()) {
+    if iface
+        .is_some_and(|iface| iface.supports_ap_authenticator() && iface.supports_ap_key_sequence())
+    {
+        command_list.push(9); // GET_KEY: installed AP transmit sequence only.
+    }
+    if iface.is_some_and(|iface| {
+        iface.supports_external_supplicant() || iface.supports_ap_authenticator()
+    }) {
         command_list.push(11); // NEW_KEY
     }
     if iface.is_some_and(|iface| iface.supports_gtk_rekey_offload()) {
@@ -1119,6 +1376,9 @@ fn wiphy_attrs(
             20, // DEL_STATION
         ]);
     }
+    if p2p_go_power {
+        command_list.push(25);
+    } // bounded P2P GO SET_BSS.
     if iface.is_some_and(|iface| iface.supports_channel_switch()) {
         command_list.push(107); // CHANNEL_SWITCH
     }
@@ -1135,6 +1395,17 @@ fn wiphy_attrs(
         &commands,
     );
     attrs
+}
+
+fn p2p_go_power_save_supported(iface: &dyn crate::WirelessNetIface) -> bool {
+    iface.supports_p2p_go_power_save()
+        && iface.supports_ap()
+        && iface.ap_control_generation().is_some()
+        && iface
+            .get_wireless_info()
+            .modes
+            .contains(crate::iface::WirelessModes::P2P)
+        && iface.p2p_interface_types().contains(&9)
 }
 
 /// A wiphy's ciphers and the features wpa_supplicant keys its driver
@@ -1156,7 +1427,17 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     push_attr(attrs, NL80211_ATTR_MAX_NUM_PMKIDS, &[0]);
     let sme = iface.supports_userspace_mlme();
     let external = iface.supports_external_supplicant();
-    let mut feature_flags = iface.nl80211_feature_flags();
+    if let Some(capabilities) = iface.ap_sme_capabilities().filter(|_| iface.supports_ap()) {
+        // DEVICE_AP_SME is a u32 even when no optional capability is set.
+        // Only the currently defined SA_QUERY_OFFLOAD bit is meaningful.
+        push_attr(attrs, 141, &(capabilities & 1).to_ne_bytes());
+    }
+    // These two flags promise the explicit native GO settings contract.
+    // Raw legacy feature words cannot bypass the role/generation opt-in.
+    let mut feature_flags = iface.nl80211_feature_flags() & !((1 << 11) | (1 << 12));
+    if p2p_go_power_save_supported(iface) {
+        feature_flags |= (1 << 11) | (1 << 12);
+    }
     if sme && external {
         // NL80211_FEATURE_SAE: SAE over AUTHENTICATE.
         feature_flags |= 1 << 5;
@@ -1176,6 +1457,9 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     if iface
         .wowlan_support()
         .is_some_and(|support| support.net_detect_random_mac)
+        && iface
+            .wowlan_net_detect_limits()
+            .is_some_and(|limits| limits.random_mac)
     {
         // NL80211_FEATURE_ND_RANDOM_MAC_ADDR.  This applies only to the
         // low-power NET_DETECT payload, independently of normal scans.
@@ -1194,9 +1478,11 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     if iface.supports_sae_offload() && !sme {
         bits.push(38); // SAE_OFFLOAD
     }
-    if external {
+    if external || iface.supports_ap_authenticator() {
         bits.push(26); // CONTROL_PORT_OVER_NL80211
-        bits.push(42); // CONTROL_PORT_NO_PREAUTH
+        if iface.supports_control_port_no_preauth() {
+            bits.push(42);
+        } // CONTROL_PORT_NO_PREAUTH
         if iface.supports_control_port_tx_status() {
             bits.push(48); // CONTROL_PORT_OVER_NL80211_TX_STATUS
         }
@@ -1242,10 +1528,24 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
 }
 
 fn in_namespace(iface: &dyn crate::WirelessNetIface, namespace: u64) -> bool {
+    if let Some(actual) = iface.control_namespace() {
+        return actual == namespace
+            && crate::registry::control_for(iface).is_some_and(|entry| entry.current_for(iface));
+    }
     narf_net::iface::lookup(iface.name())
         .map(|i| i.net_ns_id)
         .unwrap_or(0)
         == namespace
+}
+fn interface_wdev(iface: &dyn crate::WirelessNetIface) -> Option<u64> {
+    if iface.control_namespace().is_some() {
+        return crate::registry::control_for(iface)
+            .filter(|entry| entry.current_for(iface))
+            .map(|entry| entry.id());
+    }
+    let wiphy = crate::registry::wiphy_index(iface.wiphy_id())?;
+    let ifindex = narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap_or(0);
+    Some(control::station::wdev_id(wiphy, ifindex))
 }
 
 /// Resolve a registered netdev to the index of its physical wiphy.  Virtual
@@ -1264,9 +1564,10 @@ fn u32_of(raw: &[u8]) -> Result<u32, i32> {
 /// `nl80211_pre_doit` for `NL80211_FLAG_NEED_WIPHY`
 /// (`__cfg80211_rdev_from_attrs`): the wiphy named by `NL80211_ATTR_WIPHY`,
 /// `NL80211_ATTR_WDEV` or the netdev `NL80211_ATTR_IFINDEX` — wpa_supplicant
-/// asks by ifindex.  WDEV's high half is its physical wiphy and the low half
-/// is the individual netdev ifindex, and both halves must resolve to the
-/// same live wireless interface. A netdev that is not wireless, or
+/// asks by ifindex. Legacy netdev WDEV halves resolve to the same live
+/// wireless interface; an actual control-only WDEV instead resolves its
+/// exact opaque registry identity and namespace to the physical wiphy.
+/// A netdev that is not wireless, or
 /// names disagreeing on the wiphy, is -EINVAL; nothing found, or a wiphy in
 /// another namespace, is -ENODEV.
 fn wiphy_from_attrs(
@@ -1292,20 +1593,28 @@ fn wiphy_from_attrs(
     }
     let mut wiphy = by_index.filter(|index| crate::registry::wiphys().len() > *index as usize);
     if let Some(wdev) = wdev {
-        let from_wdev = (wdev >> 32) as u32;
-        let wdev_ifindex = wdev as u32;
-        let from_wdev_netdev = narf_net::netlink_route::iface_name_for_index(wdev_ifindex)
-            .filter(|name| narf_net::iface::lookup_in(namespace, name).is_some())
-            .and_then(|name| {
-                interfaces
-                    .iter()
-                    .find(|iface| iface.name() == name)
-                    .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
-            })
-            .ok_or(ENODEV)?;
-        if from_wdev_netdev != from_wdev {
-            return Err(EINVAL);
-        }
+        let from_wdev = if let Some(iface) = crate::registry::control_by_id(wdev, namespace) {
+            crate::registry::wiphy_index(iface.wiphy_id()).ok_or(ENODEV)?
+        } else {
+            let from_wdev = (wdev >> 32) as u32;
+            if from_wdev > i32::MAX as u32 {
+                return Err(ENODEV);
+            }
+            let wdev_ifindex = wdev as u32;
+            let from_wdev_netdev = narf_net::netlink_route::iface_name_for_index(wdev_ifindex)
+                .filter(|name| narf_net::iface::lookup_in(namespace, name).is_some())
+                .and_then(|name| {
+                    interfaces
+                        .iter()
+                        .find(|iface| iface.name() == name)
+                        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+                })
+                .ok_or(ENODEV)?;
+            if from_wdev_netdev != from_wdev {
+                return Err(EINVAL);
+            }
+            from_wdev
+        };
         if wiphy.is_some_and(|wiphy| wiphy != from_wdev) {
             return Err(EINVAL);
         }
@@ -1351,7 +1660,11 @@ fn dump_wiphy_filter(
         .and_then(|raw| <[u8; 8]>::try_from(raw).ok())
         .map(u64::from_ne_bytes)
     {
-        filter = Some((wdev >> 32) as u32);
+        filter = if let Some(iface) = crate::registry::control_by_id(wdev, namespace) {
+            crate::registry::wiphy_index(iface.wiphy_id())
+        } else {
+            Some((wdev >> 32) as u32)
+        };
     }
     if let Some(ifindex) = find_attr(attrs, NL80211_ATTR_IFINDEX).and_then(|raw| u32_of(raw).ok()) {
         let name = narf_net::netlink_route::iface_name_for_index(ifindex)
@@ -1406,7 +1719,11 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
             .enumerate()
             .filter(|(_, iface)| in_namespace(iface.as_ref(), namespace))
             .filter(|(_index, iface)| {
-                dump || find_attr(attrs, NL80211_ATTR_IFINDEX).is_some_and(|raw| {
+                dump || find_attr(attrs, NL80211_ATTR_WDEV).is_some_and(|raw| {
+                    raw.len() == 8
+                        && interface_wdev(iface.as_ref())
+                            == Some(u64::from_ne_bytes(raw.try_into().unwrap_or([0; 8])))
+                }) || find_attr(attrs, NL80211_ATTR_IFINDEX).is_some_and(|raw| {
                     raw.len() == 4
                         && narf_net::netlink_route::ifindex_for_name(
                             &iface.get_wireless_info().base_name,
@@ -1416,13 +1733,23 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
                         == iface.get_wireless_info().base_name.as_bytes()
                 })
             })
-            .map(|(_index, iface)| GenlReply {
-                command: NL80211_CMD_NEW_INTERFACE,
-                attrs: interface_attrs(
+            .filter(|(_, iface)| {
+                dump || find_attr(attrs, NL80211_ATTR_WDEV).is_none_or(|raw| {
+                    raw.len() == 8
+                        && interface_wdev(iface.as_ref())
+                            == Some(u64::from_ne_bytes(raw.try_into().unwrap_or([0; 8])))
+                })
+            })
+            .filter_map(|(_index, iface)| {
+                let attrs = interface_attrs(
                     crate::registry::wiphy_index(iface.wiphy_id()).unwrap_or(0),
                     iface.as_ref(),
                     iface.current_iftype(),
-                ),
+                );
+                (!attrs.is_empty()).then_some(GenlReply {
+                    command: NL80211_CMD_NEW_INTERFACE,
+                    attrs,
+                })
             })
             .collect(),
         NL80211_CMD_GET_PROTOCOL_FEATURES => {
@@ -1482,6 +1809,10 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(NL80211_CMD_SET_WOWLAN, DO, UNS),
     op(75, DO, UNS),         // START_SCHED_SCAN
     op(76, DO, UNS),         // STOP_SCHED_SCAN
+    op(89, DO, UNS),         // START_P2P_DEVICE
+    op(90, DO, UNS),         // STOP_P2P_DEVICE
+    op(55, DO, UNS),         // REMAIN_ON_CHANNEL
+    op(56, DO, UNS),         // CANCEL_REMAIN_ON_CHANNEL
     op(6, DO, UNS),          // SET_INTERFACE
     op(17, DO | DUMP, OPEN), // GET_STATION
     op(32, DUMP, OPEN),      // GET_SCAN
@@ -1506,9 +1837,11 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(18, DO, UNS),  // SET_STATION
     op(19, DO, UNS),  // NEW_STATION
     op(20, DO, UNS),  // DEL_STATION
+    op(25, DO, UNS),  // bounded P2P GO SET_BSS
     op(107, DO, UNS), // CHANNEL_SWITCH
     op(142, DO, UNS), // COLOR_CHANGE_REQUEST
     // External-supplicant station commands.
+    op(9, DO, UNS),          // GET_KEY: AP transmit sequence only
     op(10, DO, UNS),         // SET_KEY
     op(11, DO, UNS),         // NEW_KEY
     op(12, DO, UNS),         // DEL_KEY
@@ -1565,6 +1898,10 @@ pub fn register() -> bool {
     if registered {
         let _ =
             narf_net::netlink_generic::register_context_handler(NL80211_FAMILY_ID, control::handle);
+        let _ = narf_net::netlink_generic::register_deferred_context_handler(
+            NL80211_FAMILY_ID,
+            control::deferred_handle,
+        );
         // nl80211_netlink_notifier.
         narf_net::netlink_generic::register_release_notifier(control::station::release);
     }

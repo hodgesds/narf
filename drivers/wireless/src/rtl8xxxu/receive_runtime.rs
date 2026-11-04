@@ -1,12 +1,22 @@
-//! Retained first-channel native radio owner. TX starts only through the
-//! private signed-power path; the controlled port remains closed. Reusing
-//! this owner never changes the channel label.
+//! Retained native radio owner. TX starts only through the private signed
+//! power path; the controlled port remains closed. An idle channel change
+//! requires complete MAC/FIFO/USB retirement before a new receive stream.
 use super::{
     firmware_transport::{ControlIo, Error as ControlError, Owner as Firmware, Stage},
     packet_codec::{Mpdu, Record},
     packet_transport::{self, Io as PacketIo, Owner as Packets},
 };
 use alloc::{sync::Arc, vec::Vec};
+
+#[path = "receive_associated.rs"]
+mod receive_associated;
+#[path = "receive_ht40.rs"]
+mod receive_ht40;
+#[path = "receive_probe.rs"]
+mod receive_probe;
+pub(in crate::rtl8xxxu) use receive_associated::ScanConfig;
+#[path = "receive_retune.rs"]
+mod receive_retune;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -25,11 +35,13 @@ pub enum Phase {
     Active,
     Configuring,
     Stopped,
+    Parked,
     Failed,
 }
 /// The caller authenticates the deployment regulatory domain; this value
 /// bounds the supported receive profile and grants no TX gain/power authority. The initial
-/// profile receives on channel1 only; no hot retune is implemented.
+/// profile receives on channel1. Later idle channel changes need the separate
+/// signed operating profile and actual cold MAC/FIFO/USB retirement.
 #[derive(Debug, Clone, Copy)]
 pub struct Permission {
     channel: u8,
@@ -56,7 +68,10 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     peer: Option<[u8; 6]>,
     wmm: Option<Arc<super::wmm_runtime::Proof>>,
     ht: Option<Arc<super::ht_runtime::Grant>>,
+    home_ht: Option<Arc<super::ht_runtime::Grant>>,
     ht_gains: Option<[u8; 8]>,
+    wide: Option<Arc<super::ht_runtime::WideProgram>>,
+    wide_profiles: Vec<Arc<super::ht_runtime::WideQualification>>,
     /// `priv->ra_info` while a station association is bound.
     ra: Option<super::rate_adaptation::RateAdaptation>,
     /// REG_TX_REPORT_TIME value owed to the async maintain path.
@@ -64,18 +79,22 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
 }
 #[derive(Clone)]
 pub(super) struct Authority {
+    wide: Option<Arc<super::ht_runtime::WideProgram>>,
     executable: Option<super::firmware_transport::Executable>,
     base: Option<Arc<super::wmm_runtime::Proof>>,
     ht: Option<Arc<super::ht_runtime::Grant>>,
 }
 pub(super) struct Profile {
+    wide: Vec<Arc<super::ht_runtime::WideQualification>>,
     base: Arc<super::wmm_runtime::Proof>,
     ht: Option<Arc<super::ht_runtime::Grant>>,
 }
 impl Authority {
     pub(super) fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
         let operation = || {
-            if let Some(ht) = &self.ht {
+            if let Some(wide) = &self.wide {
+                wide.invoke(operation)
+            } else if let Some(ht) = &self.ht {
                 ht.invoke(operation)
             } else if let Some(base) = &self.base {
                 base.invoke(operation)
@@ -137,7 +156,10 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             peer: None,
             wmm: None,
             ht: None,
+            home_ht: None,
             ht_gains: None,
+            wide: None,
+            wide_profiles: Vec::new(),
             ra: None,
             report_time: None,
         })
@@ -154,16 +176,21 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
     }
     pub(super) fn authority(&self) -> Authority {
         Authority {
+            wide: self.wide.clone(),
             executable: self.firmware.executable(),
             base: self.wmm.clone(),
             ht: self.ht.clone(),
         }
     }
     pub(super) fn ht_enabled(&self) -> bool {
-        self.ht.is_some()
+        self.ht.is_some() || self.wide.is_some()
     }
     pub(super) fn ht_local(&self) -> Option<narf_wireless::association::phy::LocalPhy> {
-        self.ht.as_ref().map(|_| super::ht_runtime::local())
+        if self.wide.is_some() {
+            Some(super::ht_runtime::local_wide())
+        } else {
+            self.ht.as_ref().map(|_| super::ht_runtime::local())
+        }
     }
     /// Optional profile resolution and programming occurs before the first RX
     /// TD or packet gate. A running legacy station can never be upgraded here.
@@ -178,15 +205,23 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         let base = super::wmm_runtime::Proof::registered(factory, vid, pid, permission)?;
         let ht =
             super::ht_runtime::Grant::registered(base.clone(), executable, factory.ht40_power[0])?;
-        Ok(Profile { base, ht })
+        let wide = Self::resolve_wide_profiles(&base, executable, factory)?;
+        Ok(Profile { base, ht, wide })
     }
     pub(super) async fn prepare_profile(&mut self, profile: Profile) -> Result<(), Error> {
         if self.phase() != Phase::Prepared || self.ht.is_some() {
             return Err(Error::State);
         }
         self.wmm = Some(profile.base);
+        self.wide_profiles = profile.wide;
         if let Some(grant) = profile.ht {
             self.install_ht(grant).await?;
+        }
+        if let Some(plan) = self.wide_plan_for_channel(self.channel()) {
+            let program = super::ht_runtime::WideProgram::install(&self.firmware, plan).await?;
+            self.ht = None;
+            self.ht_gains = None;
+            self.wide = Some(program);
         }
         Ok(())
     }
@@ -209,6 +244,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             self.fail();
             return result;
         }
+        self.home_ht = Some(grant.clone());
         self.ht = Some(grant);
         self.ht_gains = Some(gains);
         self.phase = Phase::Prepared;
@@ -293,6 +329,14 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         if result.is_ok() {
             self.packets.qos = true;
             self.packets.ht = ht;
+            self.packets.wide = if ht {
+                self.wide
+                    .as_ref()
+                    .filter(|p| p.mode() == super::ht_runtime::WideMode::Forty)
+                    .map(|p| p.geometry())
+            } else {
+                None
+            };
             self.phase = Phase::Active;
         } else {
             self.fail();
@@ -449,7 +493,12 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     match record {
                         // Hardware decryption is disabled. Never adopt unexpected
                         // plaintext metadata as a software-authenticated MPDU.
-                        Record::Frame(f) if f.admitted_or_aggregate(ht) => frames.push(f),
+                        Record::Frame(mut f) => {
+                            f.wide = self.wide.as_ref().map(|program| program.seal());
+                            if f.admitted_or_aggregate(ht) {
+                                frames.push(f);
+                            }
+                        }
                         // `rtl8188e_c2hcmd_callback` rpt_sel 2.
                         Record::Report {
                             kind: 2,
@@ -578,7 +627,12 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             if cr & 0xc0 != 0x80 {
                 return Err(Error::State);
             }
-            if let Some(ht) = &self.ht {
+            if let Some(wide) = &self.wide {
+                if wide.legacy_gains() != (cck, ofdm) {
+                    return Err(Error::Policy);
+                }
+                wide.readback(&self.firmware).await?;
+            } else if let Some(ht) = &self.ht {
                 ht.readback(&self.firmware, self.ht_gains.ok_or(Error::State)?)
                     .await?;
             }

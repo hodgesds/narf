@@ -27,12 +27,13 @@ pub(crate) fn run(args: Args) -> Result<()> {
     }
 }
 
-fn safe_name(name: &str) -> Result<()> {
+/// `comma`: family-3 keys may carry a Linux board type (`apple,<board>`).
+fn safe_name(name: &str, comma: bool) -> Result<()> {
     ensure!(
         !name.is_empty()
-            && name
-                .bytes()
-                .all(|x| x.is_ascii_alphanumeric() || b"/_.-".contains(&x))
+            && name.bytes().all(|x| {
+                x.is_ascii_alphanumeric() || b"/_.-".contains(&x) || (comma && x == b',')
+            })
             && Path::new(name)
                 .components()
                 .all(|x| matches!(x, Component::Normal(_)))

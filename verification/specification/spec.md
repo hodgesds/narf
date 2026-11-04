@@ -77,6 +77,16 @@ CCK profiles on those channels, malformed/duplicate rates, absent basic rates
 and post-authentication profile replacement are refused. These fixture profiles
 grant no device, calibration or regulatory authority.
 
+**Explicit6GHz fixture geometry.**
+`FakeAp::with_six_ghz_channel(primary)` is a pre-authentication opt-in that
+retains `Band::Ghz6` separately from the channel number. It accepts source
+20MHz primary geometry1+4k through253 and special channel2, omits the legacy
+DS Parameter Set and refuses CCK profiles. `channel_band()` exposes those
+immutable selected facts. Bare legacy constructors keep their existing
+2.4/5GHz bounds. Native wrappers independently author actual HE6/EHT,
+operation/TPE, copied physical RX band/channel and security facts; this
+geometry method supplies no device, legal, RF or security permission.
+
 **WPA3 and PMF profiles.** `FakeAp::wpa3_sae(plan, ssid, channel, aid,
 password, ApSaePwe::{HuntAndPeck, HashToElement}, anonce)` builds a
 WPA3-Personal AP. It offers AKM 8 with MFPC|MFPR, plus the RSNXE SAE-H2E
@@ -99,6 +109,41 @@ and, when PMF is negotiated, the IGTK KDE.
 group-addressed Deauthentication with the next IPN. `pmf()`, `akm()`,
 `pairwise_tk()` and `igtk()` expose the outcome. Without a profile the AP
 keeps its byte-exact legacy WPA2 behaviour.
+
+**Single-link MLD fixture.** `FakeAp::with_single_link_mld(Context)` is a
+pre-authentication opt-in on an RSN AP with required PMF. It binds exactly
+the `NetworkPlan` physical station/AP pair to one selected IEEE Link ID and
+separate logical MLD identities. Existing constructors and non-MLD bytes are
+unchanged. Beacons retain their physical AP source and add the canonical Basic
+MLE; authentication/association use logical MLD headers and exact canonical
+request/authentication MLEs. SAE sessions and PTK derivation use the MLD pair.
+M1 carries the AP MLD MAC KDE; M2 must contain the exact station association
+RSNE/RSNXE plus its MLD MAC KDE and a valid AKM-selected MIC. M3 uses actual
+AES wrapping and MIC over AP MLD MAC, selected physical Link+RSNE/RSNXE,
+ML GTK and ML IGTK KDEs, including the selected link's own PN/IPN.
+
+Returned EAPOL radio MPDUs use physical A1/A2 and logical authenticator A3;
+unicast DATA CCMP A1/A2 and nonce A2 use logical MLD addresses only after
+exact physical source admission. Group DATA and management keep physical
+crypto. Ordinary A3 is unchanged; the exact unicast A-MSDU BSSID alone uses
+AP MLD A3 in its crypto copy. This follows Linux7.2 rx.c:5228..5250,
+wpa.c:574..587 and Intel mld/tx.c:515..530. A native fixture supplies its actual HE/EHT
+IEs and proves programmed MAC/LINK/STA role and source before translating
+firmware-facing headers. The AP never accepts both logical and physical forms
+for one packet class and never edits key data after signing. `single_link_mld`
+exposes the immutable context. `start_mld_pairwise_rekey(anonce)` retains the
+old packet key for M1/M2/M3/M4 while the new PTK authenticates M3/M4;
+`start_mld_group_rekey(MldGroupKeys)` delivers checked per-link material under
+the installed PTK. Only authenticated responses complete those exchanges.
+`transmit_mld_data(ethernet)` produces a complete protected radio MPDU for
+the exact logical local/group DA, preserving external bridged SA in A3. It
+shares the AP pairwise TX PN with EAPOL; group data uses the current GTK's
+own PN. A native wrapper cannot allocate a second independent AP PN stream.
+`retransmit_mld` returns the exact retained M1/M3/group bytes; exact duplicate
+requests return their saved response without a new PN, replay counter or KDF.
+Bounds, current phase, MIC, CCMP replay and full address checks stay enforced.
+The new fixture cases are source written; execution is pending the coordinated
+validation pass. Multiple active links and RF acceptance remain outside it.
 The kit has no device, driver-registration or carrier authority.
 Driver adapters retain native RX/TX framing, completions and controlled-port
 admission. MT76 and ath11k compose production station/security paths through a

@@ -20,6 +20,8 @@ pub(in crate::rtw89) struct Model {
     pub(in crate::rtw89) busy_after_master: bool,
     pub(in crate::rtw89) gone: bool,
     pub(in crate::rtw89) ops: Vec<Op>,
+    /// Register reporting RXQ/RPQ busy (`dma_busy3_reg`).
+    rx_address: u32,
 }
 impl Model {
     pub(in crate::rtw89) fn new() -> Self {
@@ -39,7 +41,19 @@ impl Model {
             busy_after_master: false,
             gone: false,
             ops: Vec::new(),
+            rx_address: BUSY1,
         }
+    }
+    /// Running RTL8852C HAXI block: CH12 open, HCI V1 and DMA enabled.
+    pub(in crate::rtw89) fn new_c() -> Self {
+        let mut model = Self::new();
+        model.registers.clear();
+        model.registers.insert(STOP1, 0);
+        model.registers.insert(C_STOP2, 0);
+        model.registers.insert(INIT_CFG1, C_HCI_EN | 1 << 5);
+        model.registers.insert(C_HCI_FUNC_EN, 3);
+        model.rx_address = C_BUSY3;
+        model
     }
     pub(in crate::rtw89) fn word(&self, address: u32) -> u32 {
         self.registers.get(&address).copied().unwrap_or(0)
@@ -50,21 +64,21 @@ impl Port for Model {
         if self.gone {
             return Ok(u32::MAX);
         }
-        if address != BUSY1 {
+        if address != BUSY1 && address != self.rx_address {
             return Ok(self.word(address));
         }
         self.ops.push(Op::Poll(address));
         let mut busy = 0;
         // Independent engines: each busy count drains one per read.
-        if self.tx_busy_reads != 0 {
+        if address == BUSY1 && self.tx_busy_reads != 0 {
             self.tx_busy_reads -= 1;
             busy |= 1 << 8;
         }
-        if self.rx_busy_reads != 0 {
+        if address == self.rx_address && self.rx_busy_reads != 0 {
             self.rx_busy_reads -= 1;
             busy |= 2;
         }
-        if self.busy_after_master && !self.bme {
+        if address == BUSY1 && self.busy_after_master && !self.bme {
             busy |= 1 << 18;
         }
         Ok(busy)
@@ -181,4 +195,49 @@ fn smoke_rtw89_dma_stop_verify_rechecks_master_and_busy() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/dma_stop",
     smoke_rtw89_dma_stop_verify_rechecks_master_and_busy
+);
+
+fn smoke_rtw8852c_dma_stop_follows_haxi_v1_pci_info() -> TestResult {
+    let mut model = Model::new_c();
+    model.tx_busy_reads = 2;
+    model.rx_busy_reads = 3;
+    if stop_with(&mut model, Layout::C).is_err() {
+        return TestResult::Fail("draining C engines did not yield the idle proof");
+    }
+    let written = |address: u32| {
+        model
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Write(a, _) if *a == address))
+    };
+    if model.word(STOP1) != C_STOPPED
+        || model.word(C_STOP2) != 3
+        || model.word(INIT_CFG1) != C_STOP_AXI_MST | 1 << 5
+        || model.word(C_HCI_FUNC_EN) != 0
+        || model.bme
+        || written(HCI_FUNC_EN)
+        || !model.ops.contains(&Op::Poll(C_BUSY3))
+        // Busy2 is a plain register read in the model: idle immediately.
+        || model.ops.iter().filter(|op| **op == Op::Delay).count() != 5
+    {
+        return TestResult::Fail("C stop1/stop2/AXI-MST/HCI V1 closure or busy3 poll differed");
+    }
+    // A C proof never verifies against the B layout and vice versa.
+    if verify_with(&mut model, Layout::B).is_ok() || verify_with(&mut model, Layout::C).is_err() {
+        return TestResult::Fail("layouts were interchangeable");
+    }
+    model.registers.insert(C_STOP2, 1);
+    if verify_with(&mut model, Layout::C) != Err(Error::Ignored) {
+        return TestResult::Fail("reopened CH11 passed C verification");
+    }
+    model.registers.insert(C_STOP2, 3);
+    model.registers.insert(C_BUSY2, 2);
+    if verify_with(&mut model, Layout::C) != Err(Error::TxBusy) {
+        return TestResult::Fail("busy CH11 passed C verification");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/dma_stop",
+    smoke_rtw8852c_dma_stop_follows_haxi_v1_pci_info
 );

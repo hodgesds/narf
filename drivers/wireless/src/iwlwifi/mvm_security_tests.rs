@@ -204,6 +204,40 @@ fn ap_ethernet(pdu: &[u8]) -> Vec<u8> {
     bytes
 }
 impl Device {
+    pub(in crate::iwlwifi) fn decode_amsdu(mut body: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+        let mut frames = Vec::new();
+        while !body.is_empty() {
+            if body.len() < 22 || body[6..12] != OWN {
+                return Err("AP A-MSDU subframe address/extent");
+            }
+            let length = usize::from(u16::from_be_bytes([body[12], body[13]]));
+            if !(8..=1508).contains(&length)
+                || body.len() < 14 + length
+                || body[14..20] != [0xaa, 0xaa, 3, 0, 0, 0]
+            {
+                return Err("AP A-MSDU LLC or length");
+            }
+            let mut ethernet = body[..12].to_vec();
+            ethernet.extend_from_slice(&body[20..14 + length]);
+            if ethernet[12..14] == [0x88, 0x8e] {
+                return Err("AP A-MSDU aggregated EAPOL");
+            }
+            frames.push(ethernet);
+            let extent = 14 + length;
+            if extent == body.len() {
+                break;
+            }
+            let aligned = (extent + 3) & !3;
+            if aligned > body.len() || body[extent..aligned].iter().any(|byte| *byte != 0) {
+                return Err("AP A-MSDU padding");
+            }
+            body = &body[aligned..];
+        }
+        if frames.len() < 2 {
+            return Err("AP A-MSDU has no batch");
+        }
+        Ok(frames)
+    }
     pub(in crate::iwlwifi) fn restart_authenticator(
         &mut self,
         expected_group_floor: u64,
@@ -501,14 +535,17 @@ impl Device {
             let flags = u32::from_le_bytes(p.bytes[8..12].try_into().unwrap());
             let mut frame = p.bytes[24..].to_vec();
             let header = if frame[0] == 0x88 { 26 } else { 24 };
+            let amsdu = header == 26 && frame[24] & 0x80 != 0;
             if header == 26 {
-                if p.bytes[6..8] != [0, 0x2d]
-                    || frame.get(26..28) != Some(&[0, 0])
-                    || frame[24..26] != [0, 0]
+                if p.bytes[6..8] != [0, if amsdu { 0x4d } else { 0x2d }]
+                    || !amsdu && frame.get(26..28) != Some(&[0, 0])
+                    || frame[24..26] != [if amsdu { 0x80 } else { 0 }, 0]
                 {
                     return Err("native QoS TX-v9 padding/TID/offload geometry");
                 }
-                frame.drain(26..28);
+                if !amsdu {
+                    frame.drain(26..28);
+                }
             }
             if !matches!(frame[0], 8 | 0x88)
                 || frame[1] & 0x87 != 1
@@ -571,9 +608,13 @@ impl Device {
                 let key = KeyFrame::decode(&pdu[4..], 16).ok_or("AP EAPOL descriptor")?;
                 if let Some(mut rekey) = self.rekey.take() {
                     if let Some(anonce) = rekey.anonce {
-                        if key.key_information == 0x10a {
+                        // M2 and M4 both carry Secure while the original
+                        // PTK remains installed. The challenge counter and
+                        // exact nonce/data transcript select the native phase.
+                        if key.replay_counter == rekey.replay {
                             kind = Kind::Message2;
-                            if key.replay_counter != rekey.replay
+                            if key.key_information != 0x30a
+                                || key.key_nonce == [0; 32]
                                 || key.key_nonce == SNONCE
                                 || key.key_data != rsn()
                             {
@@ -611,6 +652,7 @@ impl Device {
                             kind = Kind::Message4;
                             if key.key_information != 0x30a
                                 || key.replay_counter != rekey.replay + 1
+                                || key.key_nonce != [0; 32]
                                 || !key.key_data.is_empty()
                             {
                                 return Err("rekey M4 flags/replay/data");
@@ -678,10 +720,14 @@ impl Device {
                 if !encrypted || flags != 0 || self.ap.phase() != ApPhase::Authorized {
                     return Err("ordinary secured Ethernet lacked native key/authorization");
                 }
-                let mut ethernet = frame[16..22].to_vec();
-                ethernet.extend_from_slice(&frame[10..16]);
-                ethernet.extend_from_slice(&frame[header + 6..]);
-                self.data.push(ethernet);
+                if amsdu {
+                    self.data.extend(Self::decode_amsdu(&frame[header..])?);
+                } else {
+                    let mut ethernet = frame[16..22].to_vec();
+                    ethernet.extend_from_slice(&frame[10..16]);
+                    ethernet.extend_from_slice(&frame[header + 6..]);
+                    self.data.push(ethernet);
+                }
                 kind = Kind::Data;
             }
             let mut complete = vec![0; 48];
@@ -908,8 +954,8 @@ fn fixture(api: u8) -> Result<(Fixture, Device), &'static str> {
     let parsed = super::super::super::parse_ucode(&image).unwrap();
     let mut versions = parsed.api.commands.to_vec();
     versions.extend_from_slice(&[
-        0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, api, 0,
-        2, 5, 1, 0, 0xff, 5, 0, 1,
+        0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, api, 0, 2, 5, 1, 0,
+        0xff, 5, 0, 1,
     ]);
     runtime::model::versions(&mut owner.hardware, &versions);
     let mut caps = FirmwareApi::default();
@@ -1803,9 +1849,7 @@ fn smoke_gen2_wpa2_linux_default_key_and_unversioned_rx_sync_contract() -> TestR
             let image = firmware_parser_tests::mvm_image();
             let parsed = super::super::super::parse_ucode(&image).unwrap();
             let mut versions = parsed.api.commands.to_vec();
-            versions.extend_from_slice(&[
-                0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0,
-            ]);
+            versions.extend_from_slice(&[0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0]);
             if unknown {
                 versions.extend_from_slice(&[0x17, 1, 99, 99, 2, 5, 99, 99, 0xff, 5, 99, 99]);
             }

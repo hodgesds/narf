@@ -73,15 +73,88 @@ pub struct Report {
 pub(super) struct Permission {
     country: [u8; 2],
     ceiling: u8,
+    frequency: u16,
 }
 impl Permission {
     pub(super) fn allows_report(self, report: Report) -> bool {
         self.country == report.country
-            && report.frequency_mhz == 2412
+            && report.frequency_mhz == self.frequency
             && self.ceiling >= report.max_power_half_dbm
     }
+    pub(super) fn budget(self) -> u8 {
+        self.ceiling
+    }
+    /// Current permission for an AR9287 report whose signed grant lowered
+    /// the host ceiling (`admission::Grant::ceiling`).
+    pub(super) fn allows_ar9287(self, report: &ar9287::Report, ceiling: u8) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == self.frequency
+            && ceiling <= self.ceiling
+            && ceiling >= report.max_power_half_dbm
+    }
+    /// Current dual-band permission for an AR9280 report whose signed
+    /// `N80A` grant lowered the host ceiling.
+    pub(super) fn allows_ar9280(self, report: &ar9280::Report, ceiling: u8) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == self.frequency
+            && ceiling <= self.ceiling
+            && ceiling >= report.max_power_half_dbm
+    }
+    /// Current dual-band permission for an AR5416/AR9160 report whose
+    /// signed `N54A`/`N60A` grant lowered the host ceiling.
+    pub(super) fn allows_ar5008(self, report: &ar5008::Report, ceiling: u8) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == self.frequency
+            && ceiling <= self.ceiling
+            && ceiling >= report.max_power_half_dbm
+    }
+    /// `current_in` under the dual-band (`from_domain_dual`) rule.
+    pub(super) fn current_dual_in(self, domain: &RegulatoryDomain) -> bool {
+        Self::from_domain_dual(domain, self.frequency)
+            .is_ok_and(|p| p.country == self.country && p.ceiling >= self.ceiling)
+    }
+    /// Same country and frequency with the given (lower) signed ceiling.
+    pub(super) fn with_ceiling(self, ceiling: u8) -> Self {
+        Self {
+            ceiling: ceiling.min(self.ceiling),
+            ..self
+        }
+    }
+    pub(super) fn current_in(self, domain: &RegulatoryDomain) -> bool {
+        Self::from_domain_at(domain, self.frequency)
+            .is_ok_and(|p| p.country == self.country && p.ceiling >= self.ceiling)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn from_domain(domain: &RegulatoryDomain) -> Result<Self, BringUpError> {
-        // The first one-shot profile is channel1/full-rate/20MHz. The entire
+        Self::from_domain_at(domain, 2412)
+    }
+    pub(super) fn from_domain_at(
+        domain: &RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Self, BringUpError> {
+        if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+            return Err(BringUpError::Policy);
+        }
+        Self::span(domain, frequency)
+    }
+    /// AR9280 dual-band permission: a 2.4 GHz channel as `from_domain_at`,
+    /// or a 20 MHz 5 GHz channel of `phy::ar9280::channel_5ghz`. The same
+    /// span rule applies, so a DFS, NO_IR or indoor-only rule refuses the
+    /// channel (this station never radiates where it may only listen).
+    pub(super) fn from_domain_dual(
+        domain: &RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Self, BringUpError> {
+        if super::phy::ar9280::channel_5ghz(frequency).is_some() {
+            Self::span(domain, frequency)
+        } else {
+            Self::from_domain_at(domain, frequency)
+        }
+    }
+    fn span(domain: &RegulatoryDomain, frequency: u16) -> Result<Self, BringUpError> {
+        let lower = u32::from(frequency) - 10;
+        let upper = u32::from(frequency) + 10;
+        // Every admitted primary uses full-rate/20MHz. The entire
         // occupied span must be covered; every overlapping limit constrains it.
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(BringUpError::Policy);
@@ -89,7 +162,7 @@ impl Permission {
         let mut covered = false;
         let mut ceiling = 20i8;
         for rule in &domain.rules {
-            if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
+            if rule.freq_start_mhz >= upper || rule.freq_end_mhz <= lower {
                 continue;
             }
             if rule.max_bandwidth_mhz < 20
@@ -101,7 +174,7 @@ impl Permission {
                 return Err(BringUpError::Policy);
             }
             ceiling = ceiling.min(rule.max_power_dbm);
-            covered |= rule.freq_start_mhz <= 2402 && rule.freq_end_mhz >= 2422;
+            covered |= rule.freq_start_mhz <= lower && rule.freq_end_mhz >= upper;
         }
         if !covered {
             return Err(BringUpError::Policy);
@@ -109,6 +182,7 @@ impl Permission {
         Ok(Self {
             country: domain.country_code,
             ceiling: (ceiling as u8) * 2,
+            frequency,
         })
     }
 }
@@ -164,7 +238,7 @@ impl Calibration {
         };
         // Caller supplied the signed domain; factory CTL, antenna and all
         // per-rate target limits are intersected before PHY activation.
-        super::phy::program_live_power(io, image, permission.ceiling)?;
+        super::phy::program_live_power_at(io, image, permission.frequency, permission.ceiling)?;
         pcie(io, xe2).await?;
         let delay = read(io, 0x9914)? & 0x3fff;
         write(io, 0x981c, 1)?;
@@ -187,7 +261,7 @@ impl Calibration {
         }
         let report = Report {
             country: permission.country,
-            frequency_mhz: 2412,
+            frequency_mhz: permission.frequency,
             max_power_half_dbm: permission.ceiling,
             pa_offset,
             iq_i,
@@ -212,6 +286,15 @@ fn read(io: &mut impl RegisterIo, register: u64) -> Result<u32, BringUpError> {
     }
 }
 fn measurement(io: &mut impl RegisterIo, register: u64) -> Result<u32, BringUpError> {
+    measurement_for(io, register, 0xc0)
+}
+/// `measurement` for the silicon whose new-format `AR_SREV` version field
+/// (`(srev & 0xfffc0000) >> 12`) is `version`.
+fn measurement_for(
+    io: &mut impl RegisterIo,
+    register: u64,
+    version: u32,
+) -> Result<u32, BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -220,7 +303,7 @@ fn measurement(io: &mut impl RegisterIo, register: u64) -> Result<u32, BringUpEr
         // A full-width IQ correlation of -1 is legitimate. Check immutable
         // silicon identity instead of confusing that data value with removal.
         let revision = read(io, 0x4020)?;
-        if revision & 0xff != 0xff || (revision & 0xfffc0000) >> 12 != 0xc0 {
+        if revision & 0xff != 0xff || (revision & 0xfffc0000) >> 12 != version {
             return Err(BringUpError::DeviceGone);
         }
     }
@@ -455,4 +538,18 @@ async fn iq(io: &mut impl Io) -> Result<(u8, i8), BringUpError> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "calibration/tests.rs"]
-mod tests;
+pub(super) mod tests;
+
+/// Distinct full40 initial analog/NF/ADC/IQ receipt.
+pub(in crate::ath9k) mod wide;
+
+/// AR9287 two-chain AGC/NF/IQ/ADC-DC and open-loop temperature compensation.
+pub(in crate::ath9k) mod ar9287;
+
+/// AR9280 dual-band closed-loop AGC (with `OFF_PWDADC`), per-band NF and
+/// two-chain IQ calibration.
+pub(in crate::ath9k) mod ar9280;
+
+/// AR5416/AR5418 (plain AGC, no per-calibration) and AR9160 (plain AGC +
+/// multi-sample IQ) three-chain calibration on the AR5008 PHY ops.
+pub(in crate::ath9k) mod ar5008;

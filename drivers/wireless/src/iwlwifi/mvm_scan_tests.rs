@@ -57,6 +57,7 @@ impl Fixture {
                     nvm_lar: false,
                     ready: false,
                     permissions: None,
+                    he_allowed: false,
                 },
             }),
             firmware,

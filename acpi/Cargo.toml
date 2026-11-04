@@ -17,5 +17,8 @@ narf-memory      = { path = "../memory" }
 narf-arch        = { path = "../arch" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
+[features]
+kernel-test = []
+
 [lints]
 workspace = true

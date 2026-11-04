@@ -26,6 +26,10 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32, Error> {
 }
 /// `RTW89_HW_RATE_HE_NSS1_MCS0..MCS11` or `RTW89_HW_RATE_HE_NSS2_MCS0..MCS11`:
 /// the HE rates this two-RX-path station can receive.
+/// `RTW89_HW_RATE_VHT_NSS1_MCS0..MCS9` / `VHT_NSS2_MCS0..MCS9`.
+pub(super) fn vht_rate(rate: u16) -> bool {
+    (0x100..=0x109).contains(&rate) || (0x110..=0x119).contains(&rate)
+}
 pub(super) fn he_rate(rate: u16) -> bool {
     (0x180..=0x18b).contains(&rate) || (0x190..=0x19b).contains(&rate)
 }
@@ -53,6 +57,13 @@ pub(super) struct Descriptor {
     pub mac_id: u8,
 }
 impl Descriptor {
+    /// RTL8852C: core.c `rtw89_core_query_rxdesc` reads `AX_RXD_BW_v1_MASK`
+    /// (dword1 [31:29]); on the other AX chips bit 29 is `AX_RXD_INTER_PPDU`.
+    pub fn parse_v1(bytes: &[u8]) -> Result<Self, Error> {
+        let mut descriptor = Self::parse(bytes)?;
+        descriptor.bandwidth = ((word(bytes, 8)? >> 29) & 7) as u8;
+        Ok(descriptor)
+    }
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let d0 = word(bytes, 4)?;
         let d1 = word(bytes, 8)?;
@@ -167,7 +178,14 @@ const CCK_PKT: u32 = 11;
 /// PHY status header (`rtw89_core_rx_process_phy_ppdu`) and its IE walk
 /// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG` only when
 /// every step Linux checks succeeds, since Linux updates `avg_rssi` only then.
-pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<(u8, Option<i16>)> {
+///
+/// `premb_cfo` selects IE01 `PREMB_CFO` [31:20] instead of `FD_CFO` [19:8]
+/// (core.c `rtw89_core_parse_phy_status_ie01`: RTL8852C `cfo_src_fd` false).
+pub(super) fn phy_status(
+    descriptor: &Descriptor,
+    bytes: &[u8],
+    premb_cfo: bool,
+) -> Option<(u8, Option<i16>)> {
     let mut start = 0;
     if descriptor.mac_info {
         let w0 = word(bytes, 0).ok()?;
@@ -205,10 +223,12 @@ pub(super) fn phy_status(descriptor: &Descriptor, bytes: &[u8]) -> Option<(u8, O
             return None;
         }
         // rtw89_core_parse_phy_status_ie01: OFDM-or-faster PPDUs addressed
-        // to this station carry FD_CFO (cfo_src_fd on B), S(12,2).
+        // to this station carry FD_CFO (cfo_src_fd on B) or PREMB_CFO (C),
+        // S(12,2).
         if kind == 1 && descriptor.rate >= OFDM6 && descriptor.to_self {
             let w1 = word(status, position + 4).ok()?;
-            cfo = Some((((w1 >> 8) & 0xfff) as i16) << 4 >> 4);
+            let shift = if premb_cfo { 20 } else { 8 };
+            cfo = Some((((w1 >> shift) & 0xfff) as i16) << 4 >> 4);
         }
         position += length;
     }
@@ -243,8 +263,28 @@ struct Partial {
 #[derive(Default)]
 pub(super) struct Assembler {
     partial: Option<Partial>,
+    /// RTL8852C RX descriptor bandwidth layout (`AX_RXD_BW_v1_MASK`); also
+    /// selects the C IE01 `PREMB_CFO` source (`cfo_src_fd` false).
+    bw_v1: bool,
 }
 impl Assembler {
+    /// The RTL8852C assembler; `default()` is the AX baseline (8852B).
+    pub(super) fn for_chip(chip: super::mac::ChipId) -> Self {
+        Self {
+            partial: None,
+            bw_v1: chip == super::mac::ChipId::Rtl8852C,
+        }
+    }
+    fn descriptor(&self, bytes: &[u8]) -> Result<Descriptor, Error> {
+        if self.bw_v1 {
+            Descriptor::parse_v1(bytes)
+        } else {
+            Descriptor::parse(bytes)
+        }
+    }
+    pub(super) fn assembling(&self) -> bool {
+        self.partial.is_some()
+    }
     pub fn segment(&mut self, bytes: &[u8], reports: bool) -> Result<Option<Event>, Error> {
         let info = word(bytes, 0)?;
         let fs = info & (1 << 15) != 0;
@@ -258,7 +298,7 @@ impl Assembler {
             if !fs || !ls || self.partial.is_some() {
                 return Err(Error::Segment);
             }
-            let descriptor = Descriptor::parse(bytes)?;
+            let descriptor = self.descriptor(bytes)?;
             if descriptor.kind != 7 {
                 return Err(Error::Report);
             }
@@ -279,7 +319,7 @@ impl Assembler {
             if self.partial.is_some() {
                 return Err(Error::Segment);
             }
-            let descriptor = Descriptor::parse(bytes)?;
+            let descriptor = self.descriptor(bytes)?;
             if descriptor.size == 0 {
                 return Err(Error::Extent);
             }
@@ -322,12 +362,18 @@ impl Assembler {
                     || descriptor.icv_error
                     || descriptor.hardware_decrypted
                     || descriptor.aggregate
-                    || descriptor.bandwidth != 0
-                    // Legacy CCK1..OFDM54, 20MHz HT MCS0..15 (RTW89_HW_RATE_MCS0)
+                    // Up to RTW89_CHANNEL_WIDTH_80 (B `support_bandwidths`)
+                    // or, on the v1 (RTL8852C) descriptor, _160 (C
+                    // `support_bandwidths`); the packet owner bounds it by
+                    // the programmed width.
+                    || descriptor.bandwidth > if self.bw_v1 { 3 } else { 2 }
+                    // Legacy CCK1..OFDM54, HT MCS0..15 (RTW89_HW_RATE_MCS0),
+                    // VHT NSS1/NSS2 MCS0..9 (RTW89_HW_RATE_VHT_NSS1_MCS0)
                     // or HE NSS1/NSS2 MCS0..11 with a defined GI/LTF
                     // (RTW89_HW_RATE_HE_NSS1_MCS0, RTW89_GILTF_1XHE08 = 5).
                     || !(descriptor.rate <= 11
                         || (0x80..=0x8f).contains(&descriptor.rate)
+                        || vht_rate(descriptor.rate)
                         || he_rate(descriptor.rate) && descriptor.gi_ltf <= 5)
                 {
                     Event::Dropped
@@ -340,7 +386,7 @@ impl Assembler {
                     Event::Wifi(descriptor, bytes)
                 }
             }
-            1 => match phy_status(&descriptor, &bytes) {
+            1 => match phy_status(&descriptor, &bytes, self.bw_v1) {
                 Some((rssi, cfo)) if descriptor.to_self => Event::PhyStatus(PhyStatus {
                     mac_id: descriptor.mac_id,
                     rssi,

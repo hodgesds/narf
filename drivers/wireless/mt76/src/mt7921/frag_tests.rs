@@ -16,7 +16,8 @@ fn ethernet(len: usize) -> Vec<u8> {
     frame
 }
 
-fn joined(wmm: bool, wpa2: bool) -> Session<Model> {
+#[inline(never)]
+fn joined(wmm: bool, wpa2: bool) -> NativeSession {
     let (mut session, bss) = wmm_tests::prepared(wmm, wpa2);
     let security = if wpa2 {
         Security::Wpa2Psk { psk: [0x55; 32] }
@@ -146,8 +147,8 @@ fn mt76_tx_fragment_failure_and_teardown_drop_the_remaining_fragments() -> TestR
     session.start_ethernet(&ethernet(1000)).unwrap();
     session.backend.completion_status = 1;
     if session.poll_data_tx().is_ok()
-        || !session.tx_fragments.is_empty()
-        || session.security.is_some()
+        || !session.station.tx_fragments.is_empty()
+        || session.station.security.is_some()
     {
         return TestResult::Fail("rejected fragment kept the remaining fragments");
     }
@@ -157,7 +158,7 @@ fn mt76_tx_fragment_failure_and_teardown_drop_the_remaining_fragments() -> TestR
     session.start_ethernet(&ethernet(1000)).unwrap();
     let before = session.backend.frames.len();
     if run(session.disassociate_station()).is_err()
-        || !session.tx_fragments.is_empty()
+        || !session.station.tx_fragments.is_empty()
         || !fragments(&session, before).is_empty()
     {
         return TestResult::Fail("teardown transmitted queued fragments");

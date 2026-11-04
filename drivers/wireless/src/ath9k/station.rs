@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One retained AR9285 channel1 legacy/qualified-HT20 station, host RSNA/CCMP.
+//! One retained AR9285 exact-channel legacy/qualified-HT20 station, host RSNA/CCMP.
 use super::{
     descriptor::Mpdu,
     packet::{self, Packet, Port},
@@ -24,6 +24,7 @@ pub(super) enum Error {
     Entropy,
     Timeout,
     PeerLost,
+    WidthFallback,
     Transport(packet::Error),
     Management(association::Error),
     Security(station_security::Error),
@@ -55,12 +56,58 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Environment: Send + Sync {
+    fn retune(&self, _frequency: u16) -> Option<super::channels::Transition> {
+        None
+    }
+    fn wide_qualification(
+        &self,
+        _base: Arc<super::ht::Grant>,
+        _geometry: super::channel_width::Geometry,
+    ) -> Result<Option<Arc<super::ht40::Grant>>, Error> {
+        Ok(None)
+    }
+    fn retune_geometry(
+        &self,
+        geometry: super::channel_width::Geometry,
+        _wide: Option<Arc<super::ht40::Grant>>,
+    ) -> Option<super::channels::Transition> {
+        if geometry.is_wide() {
+            None
+        } else {
+            self.retune(geometry.control())
+        }
+    }
     fn now_ms(&self) -> u64;
     fn nonce(&self) -> Option<[u8; 32]>;
     fn pause(&self) -> impl Future<Output = ()> + Send;
 }
-pub(super) struct NativeEnvironment;
+pub(super) struct NativeEnvironment {
+    pub(super) generation: u32,
+}
 impl Environment for NativeEnvironment {
+    fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
+        Some(
+            super::channels::request(frequency, self.generation)
+                .unwrap_or_else(|error| alloc::boxed::Box::pin(async move { Err(error) })),
+        )
+    }
+    fn wide_qualification(
+        &self,
+        base: Arc<super::ht::Grant>,
+        geometry: super::channel_width::Geometry,
+    ) -> Result<Option<Arc<super::ht40::Grant>>, Error> {
+        super::wide_qualification(base, geometry, self.generation)
+    }
+    fn retune_geometry(
+        &self,
+        geometry: super::channel_width::Geometry,
+        wide: Option<Arc<super::ht40::Grant>>,
+    ) -> Option<super::channels::Transition> {
+        Some(
+            super::channels::request_geometry(geometry, self.generation, wide)
+                .unwrap_or_else(|error| alloc::boxed::Box::pin(async move { Err(error) })),
+        )
+    }
     fn now_ms(&self) -> u64 {
         narf_time::monotonic_ns() / 1_000_000
     }
@@ -87,16 +134,19 @@ enum Kind {
     TxRetry(u64, usize),
     TxBar(u64),
     TxDelba(u64),
+    PsNull(u64),
+    PsPoll(u64),
 }
 struct Pending {
     id: u64,
     bytes: Vec<u8>,
+    security_original: Option<Vec<u8>>,
     kind: Kind,
     epoch: u64,
 }
 struct PairPending {
     id: u64,
-    originals: [Vec<u8>; 2],
+    originals: Vec<Vec<u8>>,
 }
 struct Entry {
     candidate: ObservedBss,
@@ -121,8 +171,9 @@ impl Drop for Attempt {
         }
     }
 }
-pub(super) struct Radio<P: Port, E: Environment> {
-    packet: Packet<P>,
+pub(super) struct Radio<P: Port, E: Environment, K: Engine = Packet<P>> {
+    packet: K,
+    _port: core::marker::PhantomData<fn() -> P>,
     environment: E,
     own: [u8; 6],
     noise: i16,
@@ -142,6 +193,13 @@ pub(super) struct Radio<P: Port, E: Environment> {
     tx_ba: Option<super::tx_ba::Owner>,
     tx_ba_checked: bool,
     pair_pending: Option<PairPending>,
+    ps: Option<super::ps::Owner>,
+    ps_bound: bool,
+    delivered_ps: Option<Pending>,
+    // Bounded unpublished BA replies while an actual PS receipt owns TX.
+    // Key/peer epoch retirement withdraws these before any publication.
+    ps_controls: VecDeque<(Vec<u8>, Kind)>,
+    rx_idle: bool,
     tx_sequence: Option<u16>,
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
@@ -152,9 +210,10 @@ pub(super) struct Radio<P: Port, E: Environment> {
     last_now: u64,
     rates: Option<super::rates::Control>,
     ht: Option<u8>,
+    force_twenty: bool,
     epoch: u64,
 }
-impl<P: Port, E: Environment> core::fmt::Debug for Radio<P, E> {
+impl<P: Port, E: Environment, K: Engine> core::fmt::Debug for Radio<P, E, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ar9285Station")
             .field("phase", &self.phase)
@@ -162,10 +221,11 @@ impl<P: Port, E: Environment> core::fmt::Debug for Radio<P, E> {
             .finish_non_exhaustive()
     }
 }
-impl<P: Port, E: Environment> Radio<P, E> {
-    pub(super) fn new(packet: Packet<P>, own: [u8; 6], noise: i16, environment: E) -> Self {
+impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
+    pub(super) fn new(packet: K, own: [u8; 6], noise: i16, environment: E) -> Self {
         Self {
             packet,
+            _port: core::marker::PhantomData,
             environment,
             own,
             noise,
@@ -185,6 +245,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
             tx_ba: None,
             tx_ba_checked: false,
             pair_pending: None,
+            ps: None,
+            ps_bound: false,
+            delivered_ps: None,
+            ps_controls: VecDeque::new(),
+            rx_idle: false,
             tx_sequence: None,
             initial_nonce: None,
             sequence: 1,
@@ -195,6 +260,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             last_now: 0,
             rates: None,
             ht: None,
+            force_twenty: false,
             epoch: 1,
         }
     }
@@ -203,6 +269,89 @@ impl<P: Port, E: Environment> Radio<P, E> {
     }
     pub(super) fn publication(&self) -> Arc<IrqSafeSpinLock<()>> {
         self.publication.clone()
+    }
+    /// Capture an owned transition before releasing this generation's lock.
+    pub(super) fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
+        self.environment.retune(frequency)
+    }
+    pub(super) fn geometry(&self) -> super::channel_width::Geometry {
+        self.packet.geometry()
+    }
+    pub(super) fn ht_grant(&self) -> Option<Arc<super::ht::Grant>> {
+        self.packet.ht_grant()
+    }
+    pub(super) fn retune_width(
+        &self,
+        geometry: super::channel_width::Geometry,
+        wide: Option<Arc<super::ht40::Grant>>,
+    ) -> Option<super::channels::Transition> {
+        self.environment.retune_geometry(geometry, wide)
+    }
+    pub(super) fn preferred_width(
+        &self,
+        peer: [u8; 6],
+    ) -> Result<Option<Arc<super::ht40::Grant>>, Error> {
+        if self.geometry().is_wide() {
+            return Ok(None);
+        }
+        let Some(base) = self.packet.ht_grant() else {
+            return Ok(None);
+        };
+        base.check()?;
+        let candidate = self
+            .candidates()
+            .into_iter()
+            .find(|entry| entry.bss.bssid == peer)
+            .ok_or(Error::Profile)?;
+        let elements = narf_wireless::association::phy::ApElements::parse(
+            &candidate.bss.information_elements,
+        )?;
+        let Some(operation) = elements.ht_operation() else {
+            return Ok(None);
+        };
+        if operation[0] != self.channel() || operation[1] & 4 == 0 {
+            return Ok(None);
+        }
+        let width = match operation[1] & 3 {
+            1 => super::channel_width::Width::FortyAbove,
+            3 => super::channel_width::Width::FortyBelow,
+            _ => return Ok(None),
+        };
+        let geometry = super::channel_width::Geometry::new(self.channel(), width)
+            .map_err(|_| Error::Profile)?;
+        let Some(grant) = self.environment.wide_qualification(base, geometry)? else {
+            return Ok(None);
+        };
+        // Fully validate the offered primary/secondary and peer capabilities
+        // through the real common parser, not just the preliminary IE hint.
+        let mode = if candidate.ap_rsne.is_some() {
+            SecurityMode::Wpa2Psk
+        } else {
+            SecurityMode::Open
+        };
+        let plan = JoinPlan::prepare_with_phy(
+            &candidate.bss,
+            self.own,
+            &candidate.bss.ssid,
+            mode,
+            grant.local(),
+        )?;
+        if !plan.offered_phy().is_some_and(|offer| {
+            offer.width() == association::phy::Width::Forty
+                && offer.ht().operation().secondary() == geometry.secondary()
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(grant))
+    }
+    pub(super) fn frequency_mhz(&self) -> u16 {
+        self.packet.frequency_mhz()
+    }
+    pub(super) fn channel_mask(&self) -> u64 {
+        self.packet.channel_mask()
+    }
+    pub(super) fn channel(&self) -> u8 {
+        self.packet.channel()
     }
     pub(super) fn local(&self) -> [u8; 6] {
         self.own
@@ -223,6 +372,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
     }
     pub(super) fn ready(&self) -> bool {
         self.receive_open()
+            && (!self.ps_bound || self.rx_idle)
+            && self.ps.as_ref().is_none_or(super::ps::Owner::data_ready)
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
             && self.pair_pending.is_none()
             && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
             && self.pending.is_none()
@@ -233,8 +386,52 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
     }
+    /// Factual idle admission, not a hardware quiet receipt. The retained RX
+    /// tail is intentionally allowed; actual retirement owns its DMA proof.
+    pub(super) fn idle_admissible(&self) -> bool {
+        self.phase() == Phase::Passive
+            && !self.established
+            && self.peer.is_none()
+            && self.plan.is_none()
+            && self.security.is_none()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
+            && self.incoming.is_empty()
+            && self.received.is_empty()
+            && self.packet.idle_admissible()
+    }
+    /// Counted use is not IO authority: a public wake-use return also requires
+    /// the current native source, PCI and actual awake program to admit access.
+    pub(super) fn idle_wake_current(&self) -> Result<(), Error> {
+        if self.terminal() || self.packet.phase() != packet::Phase::Running {
+            return Err(Error::State);
+        }
+        self.packet.check_transmit().map_err(Error::Transport)
+    }
     pub(super) fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
         self.packet.interrupt()
+    }
+    /// One periodic calibration tick of a live station (AR9287
+    /// `ath_ani_calibrate` NF/IQ/open-loop temperature compensation); a
+    /// closed station has none. A failed calibration closes this generation
+    /// (Linux `ath9k_queue_reset(RESET_TYPE_CALIBRATION)`); a busy owner
+    /// retries on the next tick.
+    pub(super) fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
+        if self.terminal() {
+            return Err(Error::State);
+        }
+        match self.packet.long_calibration() {
+            Err(packet::Error::Busy) => Err(Error::Transport(packet::Error::Busy)),
+            Err(error) => {
+                self.fail();
+                Err(Error::Transport(error))
+            }
+            ok => ok.map_err(Error::Transport),
+        }
     }
     /// Stop (if still running) and report whether the packet owner proved
     /// DMA quiescence and released its storage.
@@ -262,16 +459,96 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn tx_ba_request(&self) -> Option<super::tx_ba::Request> {
         self.packet.ht_grant().map(|g| super::tx_ba::request(&g))
     }
+    pub(super) fn tx_aggregate_request(&self) -> Option<super::tx_ba::Request> {
+        self.packet
+            .ht_grant()
+            .map(|g| super::tx_ba::large_request(&g))
+    }
     pub(super) fn can_aggregate(&self) -> bool {
         self.ready() && self.tx_ba.as_ref().is_some_and(super::tx_ba::Owner::paired)
     }
+    pub(super) fn ps_request(&self) -> Option<super::ps::Request> {
+        self.packet.ht_grant().map(|base| super::ps::request(&base))
+    }
+    pub(super) fn periodic_request(&self) -> Option<super::periodic::Request> {
+        self.packet
+            .ht_grant()
+            .map(|base| super::periodic::request(&base))
+    }
+    pub(super) fn power_save(&self) -> Option<bool> {
+        if self.terminal() {
+            return None;
+        }
+        if self.packet.periodic_bound() {
+            return None;
+        }
+        if let Some(owner) = &self.ps {
+            return owner.grant.check().ok().map(|_| owner.desired());
+        }
+        self.packet
+            .ps_grant()
+            .filter(|source| source.check().is_ok())
+            .map(|_| false)
+    }
+    pub(super) fn set_power_save(&mut self, desired: bool) -> Result<(), Error> {
+        let result = (|| {
+            let publication = self.publication.clone();
+            let _publication = publication.lock();
+            if self.terminal() {
+                return Err(Error::State);
+            }
+            if self.packet.periodic_bound() {
+                return Err(Error::Profile);
+            }
+            if self.ps.is_none() {
+                let source = self.packet.ps_grant().ok_or(Error::Profile)?;
+                source.check()?;
+                self.ps = Some(super::ps::Owner::new(source, self.epoch));
+            }
+            self.ps.as_mut().ok_or(Error::State)?.set(desired)?;
+            if let Some(signal) = self.packet.interrupt() {
+                signal.raise();
+            }
+            Ok(())
+        })();
+        // Missing qualification is an unsupported setting. A formerly
+        // admitted owner losing authority is a terminal hardware boundary;
+        // retire only after releasing publication to avoid lock reentry.
+        if result.is_err() && !matches!(result, Err(Error::Profile)) {
+            self.fail();
+        }
+        result
+    }
+    fn ps_aid(&self) -> Result<u16, Error> {
+        match self.plan.as_ref().ok_or(Error::State)?.phase() {
+            association::Phase::Associated { aid } => Ok(aid),
+            _ => Err(Error::State),
+        }
+    }
+    fn ps_data(&mut self, frame: &[u8]) {
+        if let Some(owner) = &mut self.ps {
+            owner.accepted_data(
+                frame.get(4).is_some_and(|a| a & 1 == 0),
+                frame.get(1).is_some_and(|flags| flags & 0x20 != 0),
+                frame.get(1).is_some_and(|flags| flags & 4 != 0),
+            );
+        }
+    }
     pub(super) fn current_receive(&self, epoch: u64) -> Result<bool, Error> {
+        if self.packet.periodic_deferred()? {
+            return Ok(false);
+        }
         self.packet.check_transmit()?;
         Ok(self.epoch == epoch && self.receive_open())
     }
     fn retire_receive(&mut self) -> Result<(), Error> {
         self.epoch = self.epoch.checked_add(1).ok_or(Error::State)?;
+        self.packet.periodic_epoch();
+        if let Some(owner) = &mut self.ps {
+            owner.key_epoch(self.epoch);
+        }
         self.received.clear();
+        self.ps_controls.clear();
         // Retain only exact unprotected EAPOL for the supplicant, never data
         // captured before this key/controlled-port boundary.
         self.incoming.retain(|i| plaintext_eapol(i.frame.bytes()));
@@ -307,6 +584,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         self.incoming.clear();
         self.received.clear();
+        self.ps_controls.clear();
         if let Some(ba) = &mut self.ba {
             ba.retire();
         }
@@ -348,6 +626,41 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .find(|candidate| candidate.bss.bssid == bssid)
             .map(|candidate| candidate.bss.information_elements)
     }
+    fn recipient_delba(&mut self, frame: &[u8], ap: [u8; 6]) -> bool {
+        if self
+            .ba
+            .as_mut()
+            .is_none_or(|ba| !ba.delba(frame, self.own, ap))
+        {
+            return false;
+        }
+        // Unlike already-published DMA, an unpublished reply can be
+        // withdrawn for this actual current peer TID. Check again during
+        // incoming processing: the ADDBA may have created the owner only
+        // after the raw RX batch was initially copied.
+        let tid = u16::from_le_bytes([frame[26], frame[27]]) >> 12;
+        self.ps_controls.retain(|(bytes, _)| {
+            bytes.len() != 33
+                || bytes[24..26] != [3, 1]
+                || u16::from_le_bytes([bytes[29], bytes[30]]) >> 2 & 15 != tid
+        });
+        true
+    }
+    /// A completed PS native TX receipt must drain all queued key/peer
+    /// updates before AP PM commit. Retain BA replies without publishing or
+    /// activating their tickets; blocking this RX loop would deadlock that
+    /// fresh-idle fence. The same epoch owner clears this queue on rekey.
+    fn transmit_or_defer_ps_control(&mut self, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
+        if self.delivered_ps.is_some() {
+            if self.ps_controls.len() == 8 {
+                return Err(Error::State);
+            }
+            self.ps_controls.push_back((bytes, kind));
+            Ok(())
+        } else {
+            self.transmit(bytes, kind)
+        }
+    }
     fn transmit(&mut self, mut bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
         // Caller holds publication; this helper never awaits or re-enters it.
         if self.closed.load(Ordering::Acquire) {
@@ -357,17 +670,44 @@ impl<P: Port, E: Environment> Radio<P, E> {
             || self.pair_pending.is_some()
             || self.delivered_reply.is_some()
             || self.delivered_ba.is_some()
+            || self.delivered_ps.is_some()
         {
             return Err(Error::Busy);
         }
         if !matches!(
             kind,
-            Kind::Security | Kind::Data | Kind::TxRetry(..) | Kind::TxBar(_)
+            Kind::Security
+                | Kind::Data
+                | Kind::TxRetry(..)
+                | Kind::TxBar(_)
+                | Kind::PsNull(_)
+                | Kind::PsPoll(_)
         ) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = if matches!(kind, Kind::Data | Kind::TxRetry(..)) {
+        let security_original = if kind == Kind::Security
+            && self.ps_bound
+            && self.ps.as_ref().is_some_and(super::ps::Owner::mark_pm)
+        {
+            Some(bytes.clone())
+        } else {
+            None
+        };
+        if matches!(kind, Kind::Data | Kind::Security)
+            && self.ps_bound
+            && self.ps.as_ref().is_some_and(super::ps::Owner::mark_pm)
+        {
+            bytes[1] |= 0x10;
+        }
+        let id = if matches!(kind, Kind::PsNull(_) | Kind::PsPoll(_)) {
+            self.packet.submit_ps(
+                &bytes,
+                self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                self.ps_aid()?,
+                self.rates.ok_or(Error::State)?.basic(),
+            )?
+        } else if matches!(kind, Kind::Data | Kind::TxRetry(..)) {
             let control = self.rates.ok_or(Error::State)?;
             if let Some(mask) = self.ht {
                 self.packet
@@ -389,7 +729,13 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 .submit_ba_response(&bytes, self.rates.ok_or(Error::State)?.basic())?
         } else {
             let rate = if kind == Kind::Probe {
-                0
+                // 1 Mbps CCK on 2.4 GHz; 6 Mbps OFDM (`rates::BITRATES[4]`)
+                // on 5 GHz, where CCK does not exist.
+                if self.frequency_mhz() >= 5000 {
+                    4
+                } else {
+                    0
+                }
             } else {
                 self.rates.ok_or(Error::State)?.basic()
             };
@@ -398,6 +744,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         self.pending = Some(Pending {
             id,
             bytes,
+            security_original,
             kind,
             epoch: self.epoch,
         });
@@ -419,9 +766,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     && (bytes[4..10] == self.own || bytes[4..10] == [255; 6])
             });
         let observed = if let Some(g) = &grant {
-            association::observe_with_phy(frame, 1, self.own, signal, &g.local())
+            association::observe_with_phy(frame, self.channel(), self.own, signal, &g.local())
         } else {
-            association::observe(frame, 1, self.own, signal)
+            association::observe(frame, self.channel(), self.own, signal)
         };
         let Ok(candidate) = observed else {
             if current {
@@ -434,6 +781,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .as_ref()
             .is_some_and(|peer| peer.bss.bssid == candidate.bss.bssid)
         {
+            if bytes.first() == Some(&0x80) && frame.rssi != i8::MIN {
+                self.packet.periodic_beacon(frame.rssi);
+            }
             if self.ht.is_some() {
                 let peer = self.peer.as_ref().ok_or(Error::State)?;
                 let mode = if self.security.is_some() {
@@ -453,6 +803,25 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     &candidate.bss.information_elements,
                     self.rates.ok_or(Error::State)?.basic(),
                 )?;
+                if let Some(owner) = &mut self.tx_ba {
+                    owner.observe(
+                        plan.offered_phy().ok_or(Error::Profile)?,
+                        self.packet.ht_profile().ok_or(Error::State)?,
+                    )?;
+                }
+            }
+            if self.ps_bound
+                && self.ps.as_ref().is_some_and(super::ps::Owner::active)
+                && bytes.first() == Some(&0x80)
+            {
+                let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                if let Some(tim) = super::ps::tim::Tim::parse(bytes, self.own, ap, self.ps_aid()?)?
+                {
+                    let tsf = self.packet.ps_tsf()?;
+                    if let Some(plan) = self.ps.as_mut().ok_or(Error::State)?.beacon(tim, tsf) {
+                        self.packet.ps_timers(plan)?;
+                    }
+                }
             }
             self.last_peer = now;
         }
@@ -553,7 +922,12 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     self.last_now.saturating_mul(1_000_000),
                     self.epoch,
                 )?;
-            } else if pending.kind == Kind::Data {
+            } else if pending.kind == Kind::Data
+                && pending.bytes.first() == Some(&0x88)
+                && pending.bytes.get(24..26) == Some(&[0, 0])
+            {
+                // This agreement owns TID0 only. N85Q singles on other
+                // queues consume an independent SC and cannot advance it.
                 ba.single_delivered(
                     u16::from_le_bytes([pending.bytes[22], pending.bytes[23]]) >> 4,
                     delivery.delivered,
@@ -563,7 +937,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 )?;
             }
         }
-        if pending.kind == Kind::Security {
+        if matches!(pending.kind, Kind::PsNull(_) | Kind::PsPoll(_)) {
+            self.delivered_ps = Some(pending);
+        } else if pending.kind == Kind::Security {
             self.delivered_reply = Some(pending);
         } else if matches!(
             pending.kind,
@@ -584,13 +960,75 @@ impl<P: Port, E: Environment> Radio<P, E> {
             // Interrupt bottom half brackets one service pass: causes are
             // read and IER killed first, then resumed after RX/TX work.
             self.packet
-                .service_begin()
+                .periodic_service(false)
                 .map_err(Error::from)
-                .and_then(|_| self.progress())
+                .and_then(|_| {
+                    self.ps
+                        .as_ref()
+                        .map_or(Ok(()), |owner| owner.grant.check())
+                        .map_err(Error::from)
+                })
+                .and_then(|_| self.packet.service_begin().map_err(Error::from))
+                .and_then(|events| {
+                    if let Some(events) = events {
+                        if events.bmiss && self.ps_bound {
+                            return Err(Error::PeerLost);
+                        }
+                        if self.ps_bound && (events.tim_timer || events.tsf_oor) {
+                            self.packet.ps_receive_on()?;
+                            let owner = self.ps.as_mut().ok_or(Error::State)?;
+                            if events.tsf_oor {
+                                owner.resync();
+                            } else {
+                                owner.wake_beacon();
+                            }
+                        }
+                    }
+                    self.progress()
+                })
                 .and_then(|frames| {
                     self.packet.service_end()?;
+                    self.restore_ps_inner()?;
+                    let periodic_idle = self.ps.is_none()
+                        && self.ready()
+                        && self.rx_idle
+                        && self.incoming.is_empty();
+                    self.packet.periodic_service(periodic_idle)?;
                     Ok(frames)
                 })
+        };
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    fn restore_ps_inner(&mut self) -> Result<(), Error> {
+        if self.ps_bound
+            && self.ps.as_ref().is_some_and(super::ps::Owner::quiet)
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.incoming.is_empty()
+            && self.rx_idle
+            && self.receive_open()
+            && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+        {
+            self.packet.ps_sleep()?;
+        }
+        Ok(())
+    }
+    pub(super) fn restore_power_save(&mut self) -> Result<(), Error> {
+        let result = {
+            let publication = self.publication.clone();
+            let _publication = publication.lock();
+            self.restore_ps_inner()
         };
         if result.is_err() {
             self.fail();
@@ -605,7 +1043,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         self.packet.check_transmit()?;
         let now = self.now()?;
+        if let Some(owner) = &self.ps {
+            owner.tick(now.saturating_mul(1_000_000))?;
+        }
         self.delivery()?;
+        self.rx_idle = false;
         let mut idle = false;
         for _ in 0..32 {
             let step = self.packet.receive()?;
@@ -626,10 +1068,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         }
                     }
                 }
-                if let (Some(peer), Some(ba)) = (peer, &mut self.ba) {
-                    if ba.delba(frame.bytes(), self.own, peer) {
-                        continue;
-                    }
+                if peer.is_some_and(|ap| self.recipient_delba(frame.bytes(), ap)) {
+                    continue;
+                }
+                if let (Some(peer), Some(_)) = (peer, &mut self.ba) {
                     if frame.bytes().first() == Some(&0x84) {
                         self.ba.as_mut().ok_or(Error::State)?.discard_ppdu();
                         if self.receive_open() {
@@ -717,6 +1159,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 ba.discard_ppdu();
             }
         }
+        self.rx_idle = idle;
         if self.established {
             if let (Some(ba), Some(peer)) = (&mut self.ba, self.peer.as_ref()) {
                 let frames = ba.expire(now.saturating_mul(1_000_000), self.own, peer.bss.bssid)?;
@@ -750,16 +1193,25 @@ impl<P: Port, E: Environment> Radio<P, E> {
             }
             if let Some(receipt) = self.delivered_reply.take() {
                 let security = self.security.as_mut().ok_or(Error::State)?;
-                if security.pending_frame() != Some(receipt.bytes.as_slice()) {
+                // Native proves the exact transmitted PM-marked original;
+                // shared Security commits its exact original message. Only
+                // the S-authorized CCMP-mutable PM bit distinguishes them.
+                let original = receipt
+                    .security_original
+                    .as_deref()
+                    .unwrap_or(&receipt.bytes);
+                if security.pending_frame() != Some(original) {
                     return Err(Error::State);
                 }
-                security.reply_delivered(receipt.bytes.len())?;
+                security.reply_delivered(original.len())?;
                 self.retire_receive()?;
             }
         }
         if self.established
             && self.pending.is_none()
             && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
             && self
@@ -841,6 +1293,19 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         .ok_or(Error::State)?
                         .association_response(frame.bytes())?
                     {
+                        if self.geometry().is_wide()
+                            && self
+                                .plan
+                                .as_ref()
+                                .and_then(JoinPlan::negotiated_phy)
+                                .is_none_or(|n| {
+                                    n.width() != association::phy::Width::Forty
+                                        || n.ht().operation().secondary()
+                                            != self.geometry().secondary()
+                                })
+                        {
+                            return Err(Error::WidthFallback);
+                        }
                         let peer = self.peer.as_ref().ok_or(Error::State)?;
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
@@ -862,6 +1327,8 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                 &peer.bss.information_elements,
                                 &frame.bytes()[30..],
                                 self.rates.ok_or(Error::State)?.basic(),
+                                self.geometry(),
+                                self.force_twenty,
                             )?;
                             self.packet.set_ht(profile)?;
                             self.ht = Some(profile.mcs());
@@ -883,6 +1350,29 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     }
                     if let Some((tid, generation)) = ba_token {
                         if self.ba.as_ref().is_none_or(|b| !b.live(tid, generation)) {
+                            continue;
+                        }
+                    }
+                    if admitted && self.receive_open() {
+                        let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        if self.recipient_delba(frame.bytes(), ap) {
+                            continue;
+                        }
+                    }
+                    if self.ps_bound && admitted && self.receive_open() {
+                        let bytes = frame.bytes();
+                        let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        // Linux PS-Poll wait may finish on a plaintext Null
+                        // response. It grants no DATA/key/PN/replay receipt.
+                        if bytes.len() == 24
+                            && bytes[0] == 0x48
+                            && bytes[1] & !0x20 == 2
+                            && bytes[4..10] == self.own
+                            && bytes[10..16] == ap
+                            && bytes[16..22] == ap
+                            && bytes[22] & 15 == 0
+                        {
+                            self.ps_data(bytes);
                             continue;
                         }
                     }
@@ -936,9 +1426,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                 } else {
                                     Kind::Decline
                                 };
-                                self.transmit(answer.bytes, kind)?;
+                                self.transmit_or_defer_ps_control(answer.bytes, kind)?;
                             } else {
-                                self.transmit(reply, Kind::Decline)?;
+                                self.transmit_or_defer_ps_control(reply, Kind::Decline)?;
                             }
                             continue;
                         }
@@ -989,6 +1479,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                             None
                         };
                         if let Some(batch) = batch {
+                            self.ps_data(frame.bytes());
                             if self.received.len() + batch.len() > 256 {
                                 return Err(Error::State);
                             }
@@ -1010,6 +1501,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                     self.own,
                                     self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                                 ) {
+                                    self.ps_data(frame.bytes());
                                     self.last_peer = now;
                                     if self.received.len() == 256 {
                                         return Err(Error::State);
@@ -1030,6 +1522,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         self.own,
                         self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                     ) {
+                        self.ps_data(frame.bytes());
                         self.last_peer = now;
                         if self.received.len() == 256 {
                             return Err(Error::State);
@@ -1040,7 +1533,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 _ => {}
             }
         }
-        if self.pending.is_none() && self.pair_pending.is_none() && self.delivered_reply.is_none() {
+        if self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ps.is_none()
+        {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -1061,11 +1558,107 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.phase = Phase::Open;
             self.last_peer = now;
         }
+        if !self.ps_bound
+            && self.receive_open()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
+        {
+            if let Some(owner) = self.ps.as_ref().filter(|owner| owner.active()) {
+                self.packet.enable_ps(&owner.grant)?;
+                self.ps_bound = true;
+            }
+        }
+        if idle && self.incoming.is_empty() {
+            if let Some(receipt) = self.delivered_ps.take() {
+                let ticket = match receipt.kind {
+                    Kind::PsNull(ticket) | Kind::PsPoll(ticket) => ticket,
+                    _ => return Err(Error::State),
+                };
+                if let Some(false) = self.ps.as_mut().ok_or(Error::State)?.delivered(
+                    ticket,
+                    now.saturating_mul(1_000_000),
+                    self.epoch,
+                )? {
+                    self.packet.ps_awake_mode()?;
+                }
+            }
+        }
+        if idle
+            && self.incoming.is_empty()
+            && self.receive_open()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+        {
+            if let Some((bytes, kind)) = self.ps_controls.pop_front() {
+                self.transmit(bytes, kind)?;
+            }
+        }
+        if self.ps_bound
+            && idle
+            && self.incoming.is_empty()
+            && self.receive_open()
+            && self.ps_controls.is_empty()
+            && self.tx_ba_checked
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+        {
+            if self.ps.as_ref().is_some_and(super::ps::Owner::active) {
+                let grant = self.ps.as_ref().ok_or(Error::State)?.grant.clone();
+                self.packet.enable_ps(&grant)?;
+            }
+            if let Some(action) = self
+                .ps
+                .as_mut()
+                .ok_or(Error::State)?
+                .next(now.saturating_mul(1_000_000), self.epoch)?
+            {
+                let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                let (bytes, kind) = match action {
+                    super::ps::Action::Null(ticket, on) => {
+                        let sequence = if let Some(security) = &mut self.security {
+                            security.reserve_plain_control_sequence()?
+                        } else {
+                            let sequence = self.sequence;
+                            self.sequence = (sequence + 1) & 4095;
+                            sequence
+                        };
+                        (
+                            super::ps::null(self.own, ap, sequence, on),
+                            Kind::PsNull(ticket),
+                        )
+                    }
+                    super::ps::Action::Poll(ticket) => (
+                        super::ps::poll(self.own, ap, self.ps_aid()?),
+                        Kind::PsPoll(ticket),
+                    ),
+                };
+                self.transmit(bytes, kind)?;
+            }
+        }
         if self.receive_open()
             && self.pending.is_none()
             && self.pair_pending.is_none()
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
         {
             if !self.tx_ba_checked && self.ht.is_some() {
                 self.tx_ba_checked = true;
@@ -1197,10 +1790,35 @@ impl<P: Port, E: Environment> Radio<P, E> {
             probe.extend_from_slice(&[255; 6]);
             probe.extend_from_slice(&[0, 0, 0, name.len() as u8]);
             probe.extend_from_slice(name);
-            // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
-            probe.extend_from_slice(&[
-                1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108, 3, 1, 1,
-            ]);
+            if self.frequency_mhz() >= 5000 {
+                // 5 GHz (AR9280): the eight OFDM rates only and no DS
+                // Parameter Set (`mac80211 ieee80211_build_preq_ies_band`
+                // adds DS params on 2.4 GHz only).
+                probe.extend_from_slice(&[1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]);
+            } else {
+                // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
+                probe.extend_from_slice(&[
+                    1,
+                    4,
+                    0x82,
+                    0x84,
+                    0x8b,
+                    0x96,
+                    50,
+                    8,
+                    12,
+                    18,
+                    24,
+                    36,
+                    48,
+                    72,
+                    96,
+                    108,
+                    3,
+                    1,
+                    self.channel(),
+                ]);
+            }
             {
                 let publication = self.publication.clone();
                 let _publication = publication.lock();
@@ -1230,6 +1848,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.environment.pause().await;
         }
     }
+    #[cfg(feature = "kernel-test")]
     pub(super) async fn associate(
         &mut self,
         bssid: [u8; 6],
@@ -1237,6 +1856,17 @@ impl<P: Port, E: Environment> Radio<P, E> {
         pmk: Option<Zeroizing<[u8; 32]>>,
         ies: &[u8],
     ) -> Result<(), Error> {
+        self.associate_mode(bssid, ssid, pmk, ies, false).await
+    }
+    pub(super) async fn associate_mode(
+        &mut self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        pmk: Option<Zeroizing<[u8; 32]>>,
+        ies: &[u8],
+        force_twenty: bool,
+    ) -> Result<(), Error> {
+        self.force_twenty = force_twenty;
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
@@ -1245,7 +1875,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if candidate.bss.channel != 1 {
+        if candidate.bss.channel != self.channel() {
             return Err(Error::Profile);
         }
         let mode = if pmk.is_some() {
@@ -1257,8 +1887,17 @@ impl<P: Port, E: Environment> Radio<P, E> {
         let mut plan = if let Some(g) = grant {
             let plan = JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, g.local())?;
             if let Some(offer) = plan.offered_phy() {
-                if offer.ht().operation().secondary().is_some() {
+                if !self.geometry().is_wide()
+                    && !force_twenty
+                    && offer.ht().operation().secondary().is_some()
+                {
                     return Err(Error::Profile);
+                }
+                if self.geometry().is_wide()
+                    && (offer.width() != association::phy::Width::Forty
+                        || offer.ht().operation().secondary() != self.geometry().secondary())
+                {
+                    return Err(Error::WidthFallback);
                 }
                 super::ht::contention(&candidate.bss.information_elements)?;
             }
@@ -1334,7 +1973,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
     fn native_data(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let tid = self.transmit_tid(frame);
-        let native = if let Some(security) = &mut self.security {
+        let mut native = if let Some(security) = &mut self.security {
             if self.ht.is_some() {
                 security.transmit_ethernet_qos(frame, tid)?
             } else {
@@ -1366,13 +2005,43 @@ impl<P: Port, E: Environment> Radio<P, E> {
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
+        if self.ps_bound && self.ps.as_ref().is_some_and(super::ps::Owner::mark_pm) {
+            native[1] |= 0x10;
+        }
         if self.ht.is_some() && tid == 0 {
             self.tx_sequence =
                 Some(((u16::from_le_bytes([native[22], native[23]]) >> 4) + 1) & 4095);
         }
         Ok(native)
     }
+    /// Exact Ethernet prefix capacity before any shared QoS SN/CCMP PN is
+    /// consumed. Does not manufacture a packet or grant native publication.
+    pub(super) fn aggregate_count(&self, frames: &[&[u8]]) -> Result<usize, Error> {
+        if !self.can_aggregate() {
+            return Ok(1);
+        }
+        self.packet.check_transmit()?;
+        let mut lengths = Vec::new();
+        for frame in frames.iter().take(super::tx_ba::MAX_MEMBERS) {
+            if !admitted(frame, self.own) || self.transmit_tid(frame) != 0 {
+                break;
+            }
+            // QoS26 + SNAP8 - Ethernet14; CCMP ExtIV8 + MIC8 only
+            // when the retained shared security owner protects the original.
+            lengths.push(frame.len() + 20 + if self.security.is_some() { 16 } else { 0 });
+        }
+        let mcs = 7 - self.ht.ok_or(Error::State)?.leading_zeros() as u8;
+        Ok(self
+            .tx_ba
+            .as_ref()
+            .ok_or(Error::State)?
+            .prefix(&lengths, mcs))
+    }
+    #[cfg(feature = "kernel-test")]
     pub(super) fn send_pair(&mut self, a: &[u8], b: &[u8]) -> Result<(), Error> {
+        self.send_aggregate(&[a, b])
+    }
+    pub(super) fn send_aggregate(&mut self, ethernet: &[&[u8]]) -> Result<(), Error> {
         let result = {
             let publication = self.publication.clone();
             let _publication = publication.lock();
@@ -1380,21 +2049,46 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 if !self.can_aggregate() {
                     return Err(Error::Busy);
                 }
-                self.packet.check_transmit()?;
-                if !admitted(a, self.own) || !admitted(b, self.own) {
+                if ethernet.len() < 2
+                    || ethernet.len() > super::tx_ba::MAX_MEMBERS
+                    || self.aggregate_count(ethernet)? != ethernet.len()
+                {
                     return Err(Error::Profile);
                 }
-                // The measured sender agreement owns BE/TID0 only.
-                if self.transmit_tid(a) != 0 || self.transmit_tid(b) != 0 {
-                    return Err(Error::Profile);
-                }
-                let frames = [self.native_data(a)?, self.native_data(b)?];
+                // Preflight all lengths/TIDs/source bounds before the first
+                // reservation. Encoding failure is terminal; consumed PNs and
+                // sequence numbers are never reused or silently retried fresh.
+                let frames: Vec<Vec<u8>> = ethernet
+                    .iter()
+                    .map(|frame| self.native_data(frame))
+                    .collect::<Result<_, _>>()?;
                 let mcs = 7 - self.ht.ok_or(Error::State)?.leading_zeros() as u8;
                 let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                let copies: Option<Vec<Vec<u8>>> =
+                    if frames.iter().any(|frame| frame[1] & 0x10 != 0) {
+                        let source = &self.ps.as_ref().ok_or(Error::State)?.grant;
+                        Some(
+                            frames
+                                .iter()
+                                .map(|frame| {
+                                    super::descriptor::ps_unmark(frame, source)
+                                        .map_err(|_| Error::Profile)
+                                })
+                                .collect::<Result<_, _>>()?,
+                        )
+                    } else {
+                        None
+                    };
                 let ba = self.tx_ba.as_mut().ok_or(Error::State)?;
-                let permit = ba.permit([&frames[0], &frames[1]], self.own, peer, mcs)?;
+                let refs: Vec<&[u8]> = copies
+                    .as_deref()
+                    .unwrap_or(&frames)
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect();
+                let permit = ba.permit(&refs, self.own, peer, mcs)?;
                 ba.begin_pair(permit, frames.clone(), self.epoch)?;
-                let id = self.packet.submit_pair(
+                let id = self.packet.submit_aggregate(
                     &frames,
                     mcs,
                     self.rates.ok_or(Error::State)?.basic(),
@@ -1409,7 +2103,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         };
         if result
             .as_ref()
-            .is_err_and(|e| !matches!(e, Error::Busy | Error::Profile))
+            .is_err_and(|error| !matches!(error, Error::Busy | Error::Profile))
         {
             self.fail();
         }
@@ -1461,3 +2155,6 @@ fn plaintext_eapol(f: &[u8]) -> bool {
 #[cfg(feature = "kernel-test")]
 #[path = "station/tests.rs"]
 pub(super) mod tests;
+
+mod engine;
+pub(in crate::ath9k) use engine::{Dispatch, Engine};

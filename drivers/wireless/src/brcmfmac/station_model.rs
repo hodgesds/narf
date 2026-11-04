@@ -4,9 +4,17 @@
 use super::*;
 use crate::brcmfmac::station_transport::Adapter;
 use narf_wifi_fixtures::{DhcpServer, NetworkPlan};
+#[path = "ap_model.rs"]
+pub(crate) mod ap_model;
+#[path = "monitor_model.rs"]
+pub(crate) mod monitor_model;
+#[path = "sdio_ap_firmware.rs"]
+pub(crate) mod sdio_ap;
 
 pub(crate) const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 pub(crate) const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
+/// Address of the modeled secondary interface (IF ADD event address).
+pub(crate) const VIF: [u8; 6] = [6, 6, 7, 8, 9, 10];
 pub(crate) type TestAdapter = Adapter<Model>;
 
 pub(crate) fn network_plan() -> NetworkPlan {
@@ -36,8 +44,38 @@ struct Flow {
     address: u64,
     read: u16,
     depth: u16,
+    /// Creating request's `msg.ifidx`.
+    ifidx: u8,
+}
+/// The modeled secondary firmware interface (ifidx 1, bsscfg 1). Its
+/// dcmds arrive with `msg.ifidx` 1 and its `brcmf_fil_bsscfg_*` iovars
+/// with the `bsscfg:` prefix (Linux 7.3-rc4 `fwil.c`); its events carry
+/// ifidx/bsscfgidx 1 (`fweh.c` dispatch). It is either a STA joining
+/// [`AP`] or, with [`Handle::enable_vif_ap`], a firmware-SME AP.
+#[derive(Default)]
+struct Vif {
+    ap: Option<ap_model::Profile>,
+    /// Associated after a `SET_SSID` on ifidx 1 until `DISASSOC`.
+    joined: bool,
+    /// Plain values of the bsscfg iovars/dcmds this interface was set.
+    sets: Vec<(u32, Vec<u8>)>,
+    /// `p2p_da_override`: the P2P Device Address of the discovery bsscfg.
+    p2p_device: Option<[u8; 6]>,
+    /// The discovery bsscfg (ifidx/bsscfg 1, NOIF) exists (`p2p_disc 1`).
+    p2p_discovery: bool,
+    /// `BRCMF_E_IF_ROLE_*` of the `p2p_ifadd` connection bsscfg.
+    p2p_role: u8,
 }
 pub(super) struct Firmware {
+    ap: Option<ap_model::Profile>,
+    vif: Vif,
+    /// `msg.ifidx` of the IOCTL being answered (for its status).
+    command_ifidx: u8,
+    /// Firmware `cap` token list (`brcmf_feat_firmware_capabilities`);
+    /// empty answers the historical zero reply.
+    caps: Vec<u8>,
+    monitor: Option<monitor_model::Profile>,
+    raw_downlink: VecDeque<(Vec<u8>, u16)>,
     secured: bool,
     keys_first: bool,
     hold_keys: bool,
@@ -71,6 +109,7 @@ pub(super) struct Firmware {
     rx_posts: VecDeque<(u32, u64)>,
     rx_read: u16,
     rx_write: u16,
+    prefix_rx_fallback: bool,
     tx_write: u16,
     flows: BTreeMap<u16, Flow>,
     completions: VecDeque<(u32, u16)>,
@@ -84,10 +123,27 @@ pub(super) struct Firmware {
     wme_ac_sta: [u8; 16],
     deletes: usize,
     statuses: usize,
+    /// `wowl_cap` reply and the `wowl_wakeind` the firmware reports.
+    wowl_cap: u32,
+    wakeind: u32,
+    /// Current `BRCMF_C_SET_PM` mode (`BRCMF_C_GET_PM` answers it).
+    pm: u32,
 }
 impl Firmware {
+    /// Inject one real firmware-SME peer loss at the native control setup
+    /// boundary; parent register model cannot mutate the private AP model.
+    pub(super) fn ap_peer_loss(&mut self, peer: [u8; 6]) {
+        self.ap.as_mut().unwrap().remove(peer);
+    }
+
     fn new(secured: bool) -> Self {
         Self {
+            ap: None,
+            vif: Vif::default(),
+            command_ifidx: 0,
+            caps: Vec::new(),
+            monitor: None,
+            raw_downlink: VecDeque::new(),
             secured,
             keys_first: false,
             hold_keys: false,
@@ -121,6 +177,7 @@ impl Firmware {
             rx_posts: VecDeque::new(),
             rx_read: 0,
             rx_write: 0,
+            prefix_rx_fallback: false,
             tx_write: 0,
             flows: BTreeMap::new(),
             completions: VecDeque::new(),
@@ -134,6 +191,9 @@ impl Firmware {
             wme_ac_sta: [0; 16],
             deletes: 0,
             statuses: 0,
+            wowl_cap: 0,
+            wakeind: 0,
+            pm: 0,
         }
     }
     /// Watchdog reset: the session (rings, flows, association, keys)
@@ -150,6 +210,7 @@ impl Firmware {
         fresh.vht = self.vht.take();
         fresh.channel = self.channel;
         fresh.wme_ac_sta = self.wme_ac_sta;
+        fresh.caps = core::mem::take(&mut self.caps);
         *self = fresh;
     }
     pub(super) fn post_event(&mut self, descriptor: &[u8]) {
@@ -161,7 +222,15 @@ impl Firmware {
     pub(super) fn flow(&mut self, descriptor: &[u8]) {
         if descriptor[0] == 3 {
             let id = u16::from_le_bytes(descriptor[22..24].try_into().unwrap());
-            assert_eq!(&descriptor[14..20], &OWN);
+            if descriptor[1] != 0 {
+                // A secondary interface's flow carries its own address.
+                assert_eq!(&descriptor[14..20], &VIF);
+            } else if self.ap.is_none() {
+                assert_eq!(&descriptor[14..20], &OWN);
+            } else {
+                assert_ne!(&descriptor[14..20], &[0; 6]);
+                assert_eq!(descriptor[14] & 1, 0);
+            }
             assert_eq!(
                 u16::from_le_bytes(descriptor[30..32].try_into().unwrap()),
                 48
@@ -172,6 +241,7 @@ impl Firmware {
                     address: u64::from_le_bytes(descriptor[32..40].try_into().unwrap()),
                     read: 0,
                     depth: u16::from_le_bytes(descriptor[28..30].try_into().unwrap()),
+                    ifidx: descriptor[1],
                 },
             );
             self.creates += 1;
@@ -193,6 +263,7 @@ impl Firmware {
             ies.extend_from_slice(&vht.request(
                 self.phy_profile.map_or(0, |p| p.0),
                 match self.bandwidth[0] {
+                    15 => 160,
                     7 => 80,
                     3 => 40,
                     _ => 20,
@@ -237,7 +308,112 @@ impl Firmware {
         }));
         ies
     }
+    /// One IOCTL addressed by `msg.ifidx` (Linux `msgbuf.c`
+    /// `brcmf_msgbuf_tx_ioctl`).
+    pub(super) fn command_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: u16,
+    ) -> Vec<u8> {
+        self.command_ifidx = ifidx;
+        if ifidx == 0 || input.starts_with(b"bsscfg:interface_remove\0") {
+            return self.command(command, input, maximum);
+        }
+        assert_eq!(ifidx, 1, "only ifidx 1 is modeled");
+        // fwil.c brcmf_create_bsscfg: `bsscfg:` + name + NUL + le32 index.
+        let plain;
+        let input = match input.strip_prefix(b"bsscfg:") {
+            Some(rest) if matches!(command, 262 | 263) => {
+                let end = rest.iter().position(|byte| *byte == 0).unwrap();
+                assert_eq!(&rest[end + 1..end + 5], &1u32.to_le_bytes());
+                let mut body = rest[..=end].to_vec();
+                body.extend_from_slice(&rest[end + 5..]);
+                plain = body;
+                &plain[..]
+            }
+            _ => input,
+        };
+        if let Some(ap) = self.vif.ap.as_mut() {
+            if let Some(reply) = ap.command(command, input, maximum) {
+                return reply;
+            }
+        }
+        match command {
+            // The secondary STA join completes on bsscfg 1 only.
+            26 => {
+                assert_eq!(&input[..8], &[4, 0, 0, 0, b't', b'e', b's', b't']);
+                assert_eq!(&input[36..42], &AP);
+                self.vif.joined = true;
+                self.event_on(16, (1, 1), AP, &[]);
+                self.events.back_mut().unwrap()[26..28].copy_from_slice(&1u16.to_be_bytes());
+                self.event_on(0, (1, 1), AP, &[]);
+                Vec::new()
+            }
+            52 => {
+                if core::mem::take(&mut self.vif.joined) {
+                    self.event_on(16, (1, 1), AP, &[]);
+                }
+                Vec::new()
+            }
+            23 if self.vif.joined => AP.to_vec(),
+            23 => vec![0; 6],
+            // brcmf_p2p_tx_action_frame: `actframe` on the discovery bsscfg
+            // completes on-channel (BRCMF_E_ACTION_FRAME_COMPLETE, status
+            // success = ACK) and off-channel
+            // (BRCMF_E_ACTION_FRAME_OFF_CHAN_COMPLETE).
+            263 if input.starts_with(b"actframe\0") => {
+                let da = crate::brcmfmac::p2p_wire::af_da(&input[9..]);
+                self.vif.sets.push((command, input.to_vec()));
+                for kind in [
+                    crate::brcmfmac::p2p_wire::E_ACTION_FRAME_COMPLETE,
+                    crate::brcmfmac::p2p_wire::E_ACTION_FRAME_OFF_CHAN_COMPLETE,
+                ] {
+                    self.event_on(kind, (1, 1), da, &[]);
+                }
+                Vec::new()
+            }
+            // brcmf_p2p_escan: bsscfg `p2p_scan` 'E' answers with one
+            // partial BRCMF_E_ESCAN_RESULT of the P2P sync_id from the
+            // discovery bsscfg and the final success record.
+            263 if input.starts_with(b"p2p_scan\0") => {
+                self.vif.sets.push((command, input.to_vec()));
+                let result = scan_result(
+                    crate::brcmfmac::p2p_wire::ESCAN_SYNC_ID,
+                    false,
+                    self.channel,
+                    (false, None),
+                    None,
+                    None,
+                    None,
+                );
+                self.event(69, 8, 0, &result);
+                let bytes = self.events.back_mut().unwrap();
+                bytes[70] = 1;
+                bytes[71] = 1;
+                self.event(69, 0, 0, &[]);
+                Vec::new()
+            }
+            // Read-only queries share the device answers.
+            262 => self.command(command, input, maximum),
+            _ => {
+                self.vif.sets.push((command, input.to_vec()));
+                Vec::new()
+            }
+        }
+    }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
+        if let Some(monitor) = self.monitor.as_mut() {
+            if let Some(reply) = monitor.command(command, input, maximum) {
+                return reply;
+            }
+        }
+        if let Some(ap) = self.ap.as_mut() {
+            if let Some(reply) = ap.command(command, input, maximum) {
+                return reply;
+            }
+        }
         if self
             .policy_clear
             .as_ref()
@@ -258,7 +434,77 @@ impl Firmware {
                 || input.starts_with(b"txbf_bfr_cap\0")
                     && self.vht.as_ref().is_some_and(|p| p.txbf[1].is_none()));
         match command {
+            // fweh `BRCMF_E_IF` (`struct brcmf_if_event`) for the one
+            // modeled secondary STA interface: ifidx 1, bsscfg 1.
+            262 if input.starts_with(b"interface_create\0") => {
+                let role = u8::from(self.vif.ap.is_some());
+                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, role]);
+                Vec::new()
+            }
+            262 if input.starts_with(b"cap\0") && !self.caps.is_empty() => {
+                let mut caps = self.caps.clone();
+                caps.push(0);
+                caps
+            }
+            // p2p.c brcmf_p2p_add_vif / brcmf_p2p_del_vif for the one
+            // modeled connection bsscfg (ifidx 1, bsscfg 1, role P2P_GO 3).
+            // `struct brcmf_fil_p2p_if_le` type: CLIENT 0 -> role
+            // BRCMF_E_IF_ROLE_P2P_CLIENT 2, GO 1 -> BRCMF_E_IF_ROLE_P2P_GO 3.
+            263 if input.starts_with(b"p2p_ifadd\0") => {
+                self.vif.p2p_role = match input[10 + 6] {
+                    0 => 2,
+                    1 => 3,
+                    kind => panic!("p2p_ifadd type {kind} is not modeled"),
+                };
+                self.event_on(54, (1, 1), VIF, &[1, 1, 0, 1, self.vif.p2p_role]);
+                Vec::new()
+            }
+            // brcmf_p2p_create_p2pdev: `p2p_da_override`, then `p2p_disc 1`
+            // creates the NOIF discovery bsscfg (BRCMF_E_IF ADD, flags
+            // BRCMF_E_IF_FLAG_NOIF, role P2P device 4) on ifidx/bsscfg 1;
+            // `p2p_disc 0` deletes it again (brcmf_p2p_deinit_discovery).
+            263 if input.starts_with(b"p2p_da_override\0") => {
+                self.vif.p2p_device = Some(input[16..22].try_into().unwrap());
+                Vec::new()
+            }
+            263 if input.starts_with(b"p2p_disc\0") => {
+                let enable = input[9..13] == 1u32.to_le_bytes();
+                if enable != self.vif.p2p_discovery {
+                    self.vif.p2p_discovery = enable;
+                    let action = if enable { 1 } else { 2 };
+                    let device = self.vif.p2p_device.expect("p2p_da_override first");
+                    self.event_on(54, (1, 1), device, &[1, action, 1, 1, 4]);
+                }
+                Vec::new()
+            }
+            262 if input.starts_with(b"p2p_dev\0") => {
+                assert!(self.vif.p2p_discovery, "p2p_dev before p2p_disc 1");
+                1u32.to_le_bytes().to_vec()
+            }
+            // brcmf_notify_connect_status_ap: the GO bsscfg's BRCMF_E_LINK
+            // with BRCMF_E_REASON_LINK_BSSCFG_DIS (4) completes vif_disabled.
+            263 if input.starts_with(b"p2p_ifdis\0") => {
+                assert_eq!(&input[10..16], &VIF);
+                self.event_on(16, (1, 1), VIF, &[]);
+                self.events.back_mut().unwrap()[36..40].copy_from_slice(&4u32.to_be_bytes());
+                Vec::new()
+            }
+            263 if input.starts_with(b"p2p_ifdel\0") => {
+                assert_eq!(&input[10..16], &VIF);
+                self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, self.vif.p2p_role]);
+                Vec::new()
+            }
+            263 if input.starts_with(b"bsscfg:interface_remove\0") => {
+                assert_eq!(&input[24..28], &1u32.to_le_bytes());
+                self.event_on(54, (1, 1), VIF, &[1, 2, 0, 1, 0]);
+                Vec::new()
+            }
             1 => 2u32.to_le_bytes().to_vec(),
+            85 => self.pm.to_le_bytes().to_vec(),
+            86 => {
+                self.pm = u32::from_le_bytes(input[..4].try_into().unwrap());
+                Vec::new()
+            }
             23 => {
                 if self.mfp_fault == 3 || self.phy_profile.is_some_and(|p| p.1 == 6) {
                     vec![2, 9, 8, 7, 6, 5]
@@ -290,6 +536,12 @@ impl Firmware {
                 let mut out = vec![0; usize::from(maximum)];
                 if input.starts_with(b"cur_etheraddr\0") {
                     out[..6].copy_from_slice(&OWN);
+                } else if input.starts_with(b"wowl_cap\0") {
+                    out[..4].copy_from_slice(&self.wowl_cap.to_le_bytes());
+                } else if input.starts_with(b"wowl_wakeind\0") {
+                    // brcmf_wowl_wakeind_le: pci_wakeind, ucode_wakeind.
+                    out[..4].copy_from_slice(&u32::from(self.wakeind != 0).to_le_bytes());
+                    out[4..8].copy_from_slice(&self.wakeind.to_le_bytes());
                 } else if input.starts_with(b"nmode\0") {
                     out[..4].copy_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
                 } else if input.starts_with(b"rxchain\0") {
@@ -392,12 +644,16 @@ impl Firmware {
                     let ch = u32::from_le_bytes(input[14..18].try_into().unwrap());
                     if let Some(vht) = &self.vht {
                         assert_eq!(ch & !255, 0xd000);
-                        let channels = [
-                            vht.center - 6,
-                            vht.center - 2,
-                            vht.center + 2,
-                            vht.center + 6,
-                        ];
+                        let channels: Vec<u8> = if vht.is160() {
+                            (0..8).map(|i| vht.center - 14 + i * 4).collect()
+                        } else {
+                            vec![
+                                vht.center - 6,
+                                vht.center - 2,
+                                vht.center + 2,
+                                vht.center + 6,
+                            ]
+                        };
                         assert!(channels.contains(&((ch & 255) as u8)));
                         let flags = 7u32
                             | if ch & 255 == u32::from(vht.center + 6)
@@ -527,6 +783,7 @@ impl Firmware {
                     vht.channel(
                         self.channel,
                         match self.bandwidth[0] {
+                            15 => 160,
                             7 => 80,
                             3 => 40,
                             _ => 20,
@@ -589,6 +846,20 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
+        if self.command_ifidx != 0 {
+            return self
+                .vif
+                .ap
+                .as_ref()
+                .filter(|ap| ap.handled)
+                .map_or(0, |ap| ap.status);
+        }
+        if let Some(monitor) = self.monitor.as_ref().filter(|monitor| monitor.handled) {
+            return monitor.status;
+        }
+        if let Some(ap) = self.ap.as_ref().filter(|ap| ap.handled) {
+            return ap.status;
+        }
         if self.mfp_missing {
             -23
         } else if command == 52 && self.fail_disconnect || self.last_power_save_error {
@@ -598,6 +869,18 @@ impl Firmware {
         }
     }
     pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        if self
+            .monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.hold(command, input))
+        {
+            return true;
+        }
+        if let Some(ap) = &self.ap {
+            if ap.hold(command, input) {
+                return true;
+            }
+        }
         if let Some(p) = &self.mfp_conversation {
             use crate::cyw43439::mfp_fixture::Hold;
             if command == 262
@@ -639,6 +922,20 @@ impl Firmware {
                         w.fault == crate::cyw43439::phy_fixture::WideFault::HoldResponse
                     }) && input.starts_with(b"assoc_resp_ies\0"))
     }
+    /// Event addressed to firmware interface (ifidx, bsscfgidx).
+    pub(super) fn event_on(
+        &mut self,
+        kind: u32,
+        (ifidx, bsscfg): (u8, u8),
+        source: [u8; 6],
+        data: &[u8],
+    ) {
+        self.event(kind, 0, 0, data);
+        let bytes = self.events.back_mut().unwrap();
+        bytes[48..54].copy_from_slice(&source);
+        bytes[70] = ifidx;
+        bytes[71] = bsscfg;
+    }
     fn event(&mut self, kind: u32, status: u32, flags: u16, data: &[u8]) {
         let mut bytes = vec![0; 72 + data.len()];
         bytes[12..16].copy_from_slice(&[0x88, 0x6c, 0x80, 1]);
@@ -653,10 +950,28 @@ impl Firmware {
         self.events.push_back(bytes);
     }
     pub(super) fn step(&mut self, state: &mut State, control: &mut super::Firmware) {
+        if let Some(monitor) = self.monitor.as_mut() {
+            self.raw_downlink.extend(monitor.raw.drain(..));
+        }
+        if let Some(ap) = self.ap.as_mut() {
+            self.events.extend(ap.events.drain(..));
+            self.downlink.extend(ap.downlink.drain(..));
+        }
+        // The secondary AP's SME events come from its own interface.
+        if let Some(ap) = self.vif.ap.as_mut() {
+            for mut event in ap.events.drain(..) {
+                event[70] = 1;
+                event[71] = 1;
+                self.events.push_back(event);
+            }
+        }
         while !self.events.is_empty() && !self.event_posts.is_empty() {
             let event = self.events.pop_front().unwrap();
             let (id, address) = self.event_posts.pop_front().unwrap();
-            state.dma.get_mut(&address).unwrap()[..event.len()].copy_from_slice(&event);
+            let prefix = word(state, SHARED + 36) as usize;
+            let buffer = state.dma.get_mut(&address).unwrap();
+            buffer[..prefix].fill(0xa5);
+            buffer[prefix..prefix + event.len()].copy_from_slice(&event);
             complete(
                 state,
                 usize::from(control.completion_write),
@@ -700,7 +1015,13 @@ impl Firmware {
                 ethernet.extend_from_slice(&state.dma[&body][..length]);
                 self.uplink.push(ethernet.clone());
                 self.tx_priorities.push((id, tx[22] >> 5));
-                if let Some(reply) = self.server.receive(&ethernet) {
+                if flow.ifidx != 0 {
+                    if let Some(ap) = self.vif.ap.as_mut() {
+                        ap.transmit(&ethernet);
+                    }
+                } else if let Some(ap) = self.ap.as_mut() {
+                    ap.transmit(&ethernet);
+                } else if let Some(reply) = self.server.receive(&ethernet) {
                     self.downlink.push_back(reply);
                 }
                 self.tx_history.push((request, body));
@@ -708,6 +1029,11 @@ impl Firmware {
                 flow.read = (flow.read + 1) % flow.depth;
             }
             put(state, H2DR + u32::from(id) * 4, &flow.read.to_le_bytes());
+        }
+        // An actual radio peer may answer M1/M3 before the native TX-status
+        // waiter returns. Write its actual RX descriptor in this SAME drain.
+        if let Some(ap) = self.ap.as_mut() {
+            self.downlink.extend(ap.downlink.drain(..));
         }
         if !self.hold_tx {
             while let Some((id, flow)) = self.completions.pop_front() {
@@ -718,9 +1044,9 @@ impl Firmware {
                 } else {
                     16
                 };
-                let at = usize::from(self.tx_write) * size;
-                let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
-                entry.fill(0);
+                assert_eq!((word(state, RINGS + 3 * 16 + 4) >> 16) as usize, size);
+                assert_ne!(ring, 0);
+                let entry = completion_entry(state, 3, usize::from(self.tx_write));
                 entry[0] = 0x10;
                 entry[4..8].copy_from_slice(&id.to_le_bytes());
                 entry[10..12].copy_from_slice(&flow.to_le_bytes());
@@ -729,10 +1055,24 @@ impl Firmware {
                 self.statuses += 1;
             }
         }
-        while !self.downlink.is_empty() && !self.rx_posts.is_empty() {
-            let bytes = self.downlink.pop_front().unwrap();
+        while (!self.downlink.is_empty() || !self.raw_downlink.is_empty())
+            && !self.rx_posts.is_empty()
+        {
+            let (bytes, flags) = self
+                .raw_downlink
+                .pop_front()
+                .unwrap_or_else(|| (self.downlink.pop_front().unwrap(), 1));
             let (id, address) = self.rx_posts.pop_front().unwrap();
-            state.dma.get_mut(&address).unwrap()[256..256 + bytes.len()].copy_from_slice(&bytes);
+            let prefix = word(state, SHARED + 36) as usize;
+            self.prefix_rx_fallback = prefix != 0 && !self.prefix_rx_fallback;
+            let explicit_offset = if self.prefix_rx_fallback { 0 } else { 256 };
+            if prefix != 0 {
+                state.prefixed_rx_offsets[usize::from(explicit_offset != 0)] += 1;
+            }
+            let offset = if explicit_offset == 0 { prefix } else { 256 };
+            let buffer = state.dma.get_mut(&address).unwrap();
+            buffer[..offset].fill(0xa5);
+            buffer[offset..offset + bytes.len()].copy_from_slice(&bytes);
             let ring = pointer(state, RINGS + 4 * 16 + 8);
             // Shared 7 RX completion items are 40 bytes (msgbuf.h).
             let size = if word(state, SHARED) & 0xff >= 7 {
@@ -740,14 +1080,14 @@ impl Firmware {
             } else {
                 32
             };
-            let at = usize::from(self.rx_write) * size;
-            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
-            entry.fill(0);
+            assert_eq!((word(state, RINGS + 4 * 16 + 4) >> 16) as usize, size);
+            assert_ne!(ring, 0);
+            let entry = completion_entry(state, 4, usize::from(self.rx_write));
             entry[0] = 0x12;
             entry[4..8].copy_from_slice(&id.to_le_bytes());
             entry[14..16].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-            entry[16..18].copy_from_slice(&256u16.to_le_bytes());
-            entry[18..20].copy_from_slice(&1u16.to_le_bytes());
+            entry[16..18].copy_from_slice(&(explicit_offset as u16).to_le_bytes());
+            entry[18..20].copy_from_slice(&flags.to_le_bytes());
             self.rx_write = (self.rx_write + 1) % (word(state, RINGS + 4 * 16 + 4) as u16);
             put(state, D2HW + 8, &self.rx_write.to_le_bytes());
         }
@@ -815,10 +1155,158 @@ fn scan_result(
 #[derive(Clone)]
 pub(crate) struct Handle(Rc<IrqSafeSpinLock<State>>);
 impl Handle {
+    pub(crate) fn ap_program_down_after_setup(&self, admin: narf_net::AdminHandle) {
+        self.0.lock().ap_program_down_at_control_read = Some(admin);
+    }
+    pub(crate) fn ap_program_loss_after_setup(&self, peer: [u8; 6]) {
+        self.0.lock().ap_program_loss_at_control_read = Some(peer);
+    }
+    pub(crate) fn ap_program_fail_index(&self) {
+        self.0.lock().ap_program_fail_index_once = true;
+    }
+
+    pub(crate) fn enable_monitor(&self, profile: monitor_model::Profile) {
+        let mut state = self.0.lock();
+        state.ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));
+        state
+            .firmware
+            .as_mut()
+            .unwrap()
+            .station
+            .as_mut()
+            .unwrap()
+            .monitor = Some(profile);
+    }
+    pub(crate) fn monitor_change<T>(
+        &self,
+        change: impl FnOnce(&mut monitor_model::Profile) -> T,
+    ) -> T {
+        let mut state = self.0.lock();
+        let result = change(
+            state
+                .firmware
+                .as_mut()
+                .unwrap()
+                .station
+                .as_mut()
+                .unwrap()
+                .monitor
+                .as_mut()
+                .unwrap(),
+        );
+        firmware_step(&mut state);
+        result
+    }
+    pub(crate) fn monitor_control_prefix(&self, count: usize) {
+        self.change(|firmware| {
+            for _ in 0..count {
+                firmware.event(23, 0, 0, &[]);
+            }
+            firmware.event(63, 0, 0, &[]);
+        });
+    }
+    pub(crate) fn enable_ap(&self) {
+        let mut state = self.0.lock();
+        state.ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));
+        state
+            .firmware
+            .as_mut()
+            .unwrap()
+            .station
+            .as_mut()
+            .unwrap()
+            .ap = Some(ap_model::Profile::default());
+    }
+    /// The secondary interface is created as a firmware-SME AP (IF ADD
+    /// role 1) whose BSS reports the IF ADD address.
+    /// The native AP source authority is present (as `enable_ap`) while
+    /// the primary interface stays a plain station.
+    pub(crate) fn enable_vif_ap(&self) {
+        self.0.lock().ap_authority = Some(Rc::new(core::sync::atomic::AtomicBool::new(true)));
+        self.change(|f| {
+            let mut ap = ap_model::Profile::default();
+            ap.own = VIF;
+            f.vif.ap = Some(ap);
+        });
+    }
+    /// Firmware `cap` tokens (e.g. `b"ap sta mchan"`).
+    pub(crate) fn set_caps(&self, caps: &[u8]) {
+        self.change(|f| f.caps = caps.to_vec());
+    }
+    /// Apply `change` to the secondary AP model.
+    pub(crate) fn vif_ap_change<T>(&self, change: impl FnOnce(&mut ap_model::Profile) -> T) -> T {
+        let mut state = self.0.lock();
+        let station = state.firmware.as_mut().unwrap().station.as_mut().unwrap();
+        let result = change(station.vif.ap.as_mut().unwrap());
+        firmware_step(&mut state);
+        result
+    }
+    /// Secondary STA dcmds/iovars (plain form) the firmware accepted.
+    pub(crate) fn vif_sets(&self) -> Vec<(u32, Vec<u8>)> {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .station
+            .as_ref()
+            .unwrap()
+            .vif
+            .sets
+            .clone()
+    }
+    pub(crate) fn ap_change<T>(&self, change: impl FnOnce(&mut ap_model::Profile) -> T) -> T {
+        let mut state = self.0.lock();
+        let result = change(
+            state
+                .firmware
+                .as_mut()
+                .unwrap()
+                .station
+                .as_mut()
+                .unwrap()
+                .ap
+                .as_mut()
+                .unwrap(),
+        );
+        firmware_step(&mut state);
+        result
+    }
+    pub(crate) fn ap_revoke(&self) {
+        if let Some(present) = self.0.lock().ap_authority.as_ref() {
+            present.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+    pub(crate) fn prefix_observations(&self) -> ([usize; 3], [usize; 2]) {
+        let state = self.0.lock();
+        (state.prefixed_completions, state.prefixed_rx_offsets)
+    }
     fn change(&self, operation: impl FnOnce(&mut Firmware)) {
         let mut state = self.0.lock();
         operation(state.firmware.as_mut().unwrap().station.as_mut().unwrap());
         firmware_step(&mut state);
+    }
+    /// The function's PCI PM capability lists PME from D3hot (Linux
+    /// `wowl_supported`) and the firmware answers `wowl_cap` with `cap`.
+    pub(crate) fn wowl_profile(&self, cap: u32) {
+        self.0.lock().pme = true;
+        self.change(|f| f.wowl_cap = cap);
+    }
+    /// The wake indication the firmware latched while the host slept.
+    pub(crate) fn wowl_wake(&self, wakeind: u32) {
+        self.change(|f| f.wakeind = wakeind);
+    }
+    /// Current firmware PM mode.
+    pub(crate) fn pm(&self) -> u32 {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .station
+            .as_ref()
+            .unwrap()
+            .pm
     }
     /// Firmware answers D3_INFORM with D3_ACK (confirmed stop).
     pub(crate) fn d3_ack(&self, value: bool) {
@@ -931,6 +1419,51 @@ impl Handle {
     }
     pub(crate) fn hold_wide_bandwidth(&self) {
         self.change(|f| f.bandwidth_stuck = true);
+    }
+    /// Secondary-interface event with an event body (e.g. a P2P action
+    /// frame's `wl_event_rx_frame_data` + body on the discovery bsscfg).
+    pub(crate) fn secondary_event_data(&self, kind: u32, source: [u8; 6], data: &[u8]) {
+        self.change(|f| f.event_on(kind, (1, 1), source, data));
+    }
+    /// Secondary-interface event from the firmware (`if_idx`/`bsscfg_idx`).
+    pub(crate) fn secondary_event(&self, kind: u32, flags: u16, source: [u8; 6]) {
+        self.change(|f| {
+            f.event_on(kind, (1, 1), source, &[]);
+            f.events.back_mut().unwrap()[26..28].copy_from_slice(&flags.to_be_bytes());
+        });
+    }
+    /// `msg.ifidx` of each IOCTL request, parallel to [`Self::commands`].
+    pub(crate) fn command_ifidx(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .command_ifidx
+            .clone()
+    }
+    /// Live flow rings as (flow id, creating `msg.ifidx`).
+    pub(crate) fn flow_ifidx(&self) -> Vec<(u16, u8)> {
+        let state = self.0.lock();
+        let station = state.firmware.as_ref().unwrap().station.as_ref().unwrap();
+        station
+            .flows
+            .iter()
+            .map(|(&id, flow)| (id, flow.ifidx))
+            .collect()
+    }
+    /// Uplink frames the firmware consumed, in order.
+    pub(crate) fn uplink_frames(&self) -> Vec<Vec<u8>> {
+        let state = self.0.lock();
+        state
+            .firmware
+            .as_ref()
+            .unwrap()
+            .station
+            .as_ref()
+            .unwrap()
+            .uplink
+            .clone()
     }
     pub(crate) fn commands(&self) -> Vec<(u32, Vec<u8>, u16)> {
         self.0.lock().firmware.as_ref().unwrap().commands.clone()
@@ -1051,7 +1584,17 @@ impl Handle {
     }
 }
 pub(crate) fn create(version: u32, secured: bool) -> Result<(TestAdapter, Handle), runtime::Error> {
-    create_inner(version, secured, None)
+    create_inner(version, secured, None, 0, None)
+}
+/// The same CR4 model discovered as another covered `chip_profile` chip
+/// (ChipCommon identity word, chip id, PCI device id), booted through an
+/// explicit board profile for that chip. Synthetic identities only.
+pub(crate) fn create_chip(
+    version: u32,
+    secured: bool,
+    chip: (u32, u16, u16),
+) -> Result<(TestAdapter, Handle), runtime::Error> {
+    create_inner(version, secured, None, 0, Some(chip))
 }
 pub(crate) fn create_selected(
     version: u32,
@@ -1063,7 +1606,13 @@ pub(crate) fn create_selected(
         .proof
         .validate()
         .map_err(|_| runtime::Error::Access)?;
-    create_inner(version, secured, Some((selection, assets)))
+    create_inner(version, secured, Some((selection, assets)), 0, None)
+}
+pub(crate) fn create_prefixed(
+    secured: bool,
+    prefix: u32,
+) -> Result<(TestAdapter, Handle), runtime::Error> {
+    create_inner(7, secured, None, prefix, None)
 }
 fn create_inner(
     version: u32,
@@ -1072,12 +1621,24 @@ fn create_inner(
         &crate::brcmfmac::provision::Selection,
         &crate::brcmfmac::provision::Assets,
     )>,
+    prefix: u32,
+    chip: Option<(u32, u16, u16)>,
 ) -> Result<(TestAdapter, Handle), runtime::Error> {
     assert!(matches!(version, 5..=7));
     let (bus, state) = model();
     {
         let mut s = state.lock();
+        if let Some((identity, id, _)) = chip {
+            s.registers.insert(chip::ENUM_BASE, identity);
+            use crate::brcmfmac::chip_profile;
+            if chip_profile::covered(id) == Some(Some(chip_profile::Cpu::Ca7)) {
+                let rambase = chip_profile::tcm_rambase(id, (identity >> 16 & 15) as u8)
+                    .expect("CA7 Linux RAM base");
+                ca7_layout(&mut s, rambase);
+            }
+        }
         put(&mut s, SHARED, &version.to_le_bytes());
+        put(&mut s, SHARED + 36, &prefix.to_le_bytes());
         if version == 5 {
             put(&mut s, INFO + 52, &4u16.to_le_bytes());
         }
@@ -1093,6 +1654,18 @@ fn create_inner(
         boot::Cr4::claim_selected(bus, pci(), selection)
             .and_then(|cr4| cr4.boot(&assets.firmware, &nvram))
             .map_err(|refused| refused.error)?
+    } else if let Some((identity, id, device)) = chip {
+        let pci = boot::PciIdentity { device, ..pci() };
+        let profile = boot::BoardProfile {
+            chip: id,
+            revision_mask: 1 << ((identity >> 16) & 15),
+            pci,
+            ..profile()
+        };
+        let nvram = boot::pack_nvram(b"boardrev=1\n")?;
+        boot::Cr4::claim(bus, pci, profile)
+            .and_then(|cr4| cr4.boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram))
+            .map_err(|refused| refused.error)?
     } else {
         boot_fixture(bus).map_err(|refused| refused.error)?
     };
@@ -1106,7 +1679,7 @@ fn create_inner(
         })
         .map_err(|_| runtime::Error::Protocol)
 }
-fn boot_fixture(bus: Model) -> Result<boot::Booted<Model>, boot::Refused<Model>> {
+pub(crate) fn boot_fixture(bus: Model) -> Result<boot::Booted<Model>, boot::Refused<Model>> {
     let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
     boot::Cr4::claim(bus, pci(), profile())?.boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)
 }

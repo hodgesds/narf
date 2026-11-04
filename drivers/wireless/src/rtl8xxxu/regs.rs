@@ -62,6 +62,8 @@ pub const RTL8188EU_ID_ALT: u16 = 0x0179;
 
 /// RTL8192EU native ID — 802.11n 2x2 USB (`0x0BDA:0x818B`).
 pub const RTL8192EU_ID: u16 = 0x818B;
+/// Second Realtek-vendor RTL8192EU ID (`0x0BDA:0x818C`, core.c dev_table).
+pub const RTL8192EU_ID_ALT: u16 = 0x818C;
 
 /// RTL8723BU native ID — 802.11n 1x1 + BT combo (`0x0BDA:0xB720`).
 pub const RTL8723BU_ID: u16 = 0xB720;
@@ -74,10 +76,17 @@ pub const RTL8822BU_ID: u16 = 0xB82C;
 
 /// All USB IDs carried by the Realtek vendor. Rebranded dongles use
 /// third-party vendor IDs; those appear in `REBRANDED_IDS`.
+///
+/// This is an identification table only (chip-family naming and the
+/// `rtl8xxxu` tests). It is not the bind table: `RTL8XXXU_USB_IDS` omits
+/// RTL8821CU and RTL8822BU, which `rtw88::usb_driver` binds from
+/// `rtw8821cu.c::rtw_8821cu_id_table` / `rtw8822bu.c::rtw_8822bu_id_table`
+/// as Linux does.
 pub const REALTEK_USB_IDS: &[(u16, u16)] = &[
     (RTL8XXXU_VENDOR, RTL8188EU_ID),
     (RTL8XXXU_VENDOR, RTL8188EU_ID_ALT),
     (RTL8XXXU_VENDOR, RTL8192EU_ID),
+    (RTL8XXXU_VENDOR, RTL8192EU_ID_ALT),
     (RTL8XXXU_VENDOR, RTL8723BU_ID),
     (RTL8XXXU_VENDOR, RTL8821CU_ID),
     (RTL8XXXU_VENDOR, RTL8822BU_ID),
@@ -93,14 +102,18 @@ pub const REALTEK_USB_IDS: &[(u16, u16)] = &[
 /// Each entry is `(vendor_id, product_id, chip_family)` where
 /// `chip_family` is one of the `ChipFamily` variant discriminants.
 pub const REBRANDED_IDS: &[(u16, u16, ChipFamily)] = &[
-    // TP-Link TL-WN822N v4 / TL-WN823Nv2 — RTL8192EU
+    // RTL8192EU, exactly the `rtl8192eu_fops` rows of core.c::dev_table.
+    // 2357:0135 and 7392:b722 are RTL8192FU (`rtl8192fu_fops`) in Linux and
+    // have no NARF owner, so they classify as Unknown.
     (0x2357, 0x0108, ChipFamily::Rtl8192eu),
-    (0x2357, 0x0109, ChipFamily::Rtl8192eu),
-    (0x2357, 0x0135, ChipFamily::Rtl8192eu),
-    // D-Link DWA-131 rev E1 — RTL8192EU
     (0x2001, 0x3319, ChipFamily::Rtl8192eu),
-    // EDIMAX EW-7722UTn V3 — RTL8192EU
-    (0x7392, 0xB722, ChipFamily::Rtl8192eu),
+    (0x2357, 0x0109, ChipFamily::Rtl8192eu),
+    (0x2357, 0x0107, ChipFamily::Rtl8192eu),
+    (0x2019, 0xAB33, ChipFamily::Rtl8192eu),
+    (0x2001, 0x3312, ChipFamily::Rtl8192eu),
+    (0x2357, 0x0126, ChipFamily::Rtl8192eu),
+    (0x2C4E, 0x0100, ChipFamily::Rtl8192eu),
+    (0x2C4E, 0x0104, ChipFamily::Rtl8192eu),
     // Edimax EW-7811Un V2 — RTL8188EU
     (0x7392, 0xB811, ChipFamily::Rtl8188eu),
     // TP-Link TL-WN722N v2, TL-WN727N v5.21 — RTL8188EU
@@ -136,7 +149,9 @@ impl ChipFamily {
             (RTL8XXXU_VENDOR, RTL8188EU_ID) | (RTL8XXXU_VENDOR, RTL8188EU_ID_ALT) => {
                 ChipFamily::Rtl8188eu
             }
-            (RTL8XXXU_VENDOR, RTL8192EU_ID) => ChipFamily::Rtl8192eu,
+            (RTL8XXXU_VENDOR, RTL8192EU_ID) | (RTL8XXXU_VENDOR, RTL8192EU_ID_ALT) => {
+                ChipFamily::Rtl8192eu
+            }
             (RTL8XXXU_VENDOR, RTL8723BU_ID) => ChipFamily::Rtl8723bu,
             (RTL8XXXU_VENDOR, RTL8821CU_ID) => ChipFamily::Rtl8821cu,
             (RTL8XXXU_VENDOR, RTL8822BU_ID) => ChipFamily::Rtl8822bu,
@@ -169,8 +184,8 @@ impl ChipFamily {
     pub const fn firmware_name(self) -> Option<&'static str> {
         match self {
             ChipFamily::Rtl8188eu => Some("rtlwifi/rtl8188eufw.bin"),
-            ChipFamily::Rtl8192eu => Some("rtlwifi/rtl8192eufw.bin"),
-            ChipFamily::Rtl8723bu => Some("rtlwifi/rtl8723bufw.bin"),
+            ChipFamily::Rtl8192eu => Some("rtlwifi/rtl8192eu_nic.bin"),
+            ChipFamily::Rtl8723bu => Some("rtlwifi/rtl8723bu_nic.bin"),
             ChipFamily::Rtl8821cu => Some("rtlwifi/rtl8821cufw.bin"),
             ChipFamily::Rtl8822bu => Some("rtlwifi/rtl8822bufw.bin"),
             ChipFamily::Unknown => None,
@@ -289,10 +304,10 @@ pub const CR_RXDMA_ENABLE: u16 = 1 << 3;
 pub const CR_PROTOCOL_ENABLE: u16 = 1 << 4;
 /// `CR_SCHEDULE_ENABLE` — scheduler enable (bit 5).
 pub const CR_SCHEDULE_ENABLE: u16 = 1 << 5;
-/// `CR_SECURITY_ENABLE` — security engine enable (bit 6).
-pub const CR_SECURITY_ENABLE: u16 = 1 << 6;
-/// `CR_CALTIMER_ENABLE` — 32 kHz calibration timer enable (bit 7).
-pub const CR_CALTIMER_ENABLE: u16 = 1 << 7;
+/// `CR_SECURITY_ENABLE` — security engine enable (bit 9, `regs.h`).
+pub const CR_SECURITY_ENABLE: u16 = 1 << 9;
+/// `CR_CALTIMER_ENABLE` — 32 kHz calibration timer enable (bit 10, `regs.h`).
+pub const CR_CALTIMER_ENABLE: u16 = 1 << 10;
 
 /// CR open mask for 8188EU-style bring-up.
 /// Source: `8188e.c::rtl8188eu_power_on` — `CR_HCI_TXDMA_ENABLE |

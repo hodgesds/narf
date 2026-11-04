@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+mod ba_sessions;
 pub mod btcoex;
 mod calibration;
 mod calibration_regs;
@@ -42,6 +43,9 @@ pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
 pub mod fw;
+mod gen2_interface;
+mod gen2_radio;
+mod gen2_station;
 mod ht_runtime;
 pub mod interface;
 pub mod intr;
@@ -52,6 +56,8 @@ pub mod packet_transport;
 pub mod phy;
 pub mod phy_tables;
 pub mod power_policy;
+mod probe_runtime;
+mod ps_null;
 mod radio_init;
 pub mod rate;
 pub mod rate_adaptation;
@@ -59,7 +65,26 @@ pub mod receive_runtime;
 pub mod regs;
 pub mod rtl8188e;
 pub mod rtl8192e;
+pub mod rtl8192e_admission;
+pub mod rtl8192e_init;
+mod rtl8192e_iqk;
+pub mod rtl8192e_packet;
+mod rtl8192e_phy;
+pub mod rtl8192e_policy;
+mod rtl8192e_power;
+mod rtl8192e_ra;
+mod rtl8192e_radio;
+mod rtl8192e_tables;
 pub mod rtl8723b;
+mod rtl8723b_admission;
+pub mod rtl8723b_init;
+mod rtl8723b_iqk;
+mod rtl8723b_packet;
+mod rtl8723b_phy;
+mod rtl8723b_policy;
+mod rtl8723b_power;
+mod rtl8723b_radio;
+mod rtl8723b_tables;
 pub mod rtl8821c;
 pub mod rtl8822b;
 pub mod rx;
@@ -70,6 +95,7 @@ pub mod usb;
 mod wmm_runtime;
 
 pub use ht_runtime::Request as Ht20Request;
+pub use ht_runtime::Request as Ht40Request;
 pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 
 // ── MLME scaffold ───────────────────────────────────────────────────
@@ -94,6 +120,10 @@ pub use crate::iwlwifi::mlme::{
 ///
 /// Linux analogue: `struct usb_device_id rtl8xxxu_dev_table[]` in
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7942).
+/// RTL8821CU (0bda:c811 and the rest of `rtw8821cu.c::rtw_8821cu_id_table`)
+/// and RTL8822BU (0bda:b82c and the rest of
+/// `rtw8822bu.c::rtw_8822bu_id_table`) are bound by rtw88
+/// (`rtw88::usb_driver`), as in Linux; they are not listed here.
 pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] = {
     use narf_drivers_usb::class_registry::UsbClassMatch;
     use regs::*;
@@ -102,9 +132,8 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8188EU_ID),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8188EU_ID_ALT),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID),
+        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8192EU_ID_ALT),
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8723BU_ID),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8821CU_ID),
-        UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, RTL8822BU_ID),
         // RTL8710BU / RTL8188GU
         UsbClassMatch::vid_pid(RTL8XXXU_VENDOR, 0xB711),
         // RTL8188EU rosewill ffef
@@ -112,14 +141,19 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
         // Rebranded — TP-Link
         UsbClassMatch::vid_pid(0x2357, 0x0108),
         UsbClassMatch::vid_pid(0x2357, 0x0109),
-        UsbClassMatch::vid_pid(0x2357, 0x0135),
         UsbClassMatch::vid_pid(0x2357, 0x010C),
         UsbClassMatch::vid_pid(0x2357, 0x0111),
+        // Rebranded RTL8192EU (core.c dev_table `rtl8192eu_fops`).
+        UsbClassMatch::vid_pid(0x2357, 0x0107),
+        UsbClassMatch::vid_pid(0x2357, 0x0126),
+        UsbClassMatch::vid_pid(0x2019, 0xAB33),
+        UsbClassMatch::vid_pid(0x2001, 0x3312),
+        UsbClassMatch::vid_pid(0x2C4E, 0x0100),
+        UsbClassMatch::vid_pid(0x2C4E, 0x0104),
         // Rebranded — D-Link
         UsbClassMatch::vid_pid(0x2001, 0x3319),
         UsbClassMatch::vid_pid(0x2001, 0x3311),
         // Rebranded — Edimax
-        UsbClassMatch::vid_pid(0x7392, 0xB722),
         UsbClassMatch::vid_pid(0x7392, 0xB811),
         UsbClassMatch::vid_pid(0x7392, 0xA611),
         // Rebranded — ASUS
@@ -132,8 +166,9 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
 /// USB class probe function. Called by the class registry when a
 /// newly-enumerated USB device matches `RTL8XXXU_USB_IDS`. Stores
 /// the `Arc<USBDevice>` in the global device table and logs the
-/// chip family. RTL8188EU starts a retained async factory/power/firmware/table owner;
-/// other families remain detection-only until their runtime is implemented.
+/// chip family. RTL8188EU and RTL8192EU start a retained async
+/// factory/power/firmware/table owner; RTL8192EU then waits for its signed
+/// record and deployment policy. Other families remain detection-only.
 ///
 /// Linux analogue: `rtl8xxxu_probe` in
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7692).
@@ -209,6 +244,90 @@ pub fn rtl8xxxu_probe(
                     service
                 );
             }
+        });
+    } else if family == regs::ChipFamily::Rtl8192eu {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8192eu:   firmware required at /firmware/rtlwifi/rtl8192eu_nic.bin"
+        );
+        narf_scheduler::spawn(async move {
+            let result = firmware.wait_initialize_registered().await;
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8192eu: firmware attempt {:?}",
+                result
+            );
+            if result.is_err() {
+                return;
+            }
+            if let Some(factory) = firmware.factory_8192e() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  {}:   signed record required at /firmware/{}",
+                    factory.identity.name(),
+                    rtl8192e_policy::Calibration::asset_name(&factory),
+                );
+            }
+            // Unprovisioned (no record/policy/authority) stays unadmitted.
+            let admitted = rtl8192e_admission::wait_admit(firmware.clone()).await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8192eu: admission {:?}",
+                admitted.as_ref().map(|a| a.permission)
+            );
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            // Netdev publication only after admission (RTL8188EU order).
+            let (authority, grant) = gen2_radio::Authority::from_8192e(admitted);
+            let device = gen2_interface::attach(firmware.clone(), authority, grant).await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8192eu: station {:?}",
+                device.as_ref().map(|_| ())
+            );
+        });
+    } else if family == regs::ChipFamily::Rtl8723bu {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8723bu:   firmware required at /firmware/rtlwifi/rtl8723bu_nic.bin"
+        );
+        narf_scheduler::spawn(async move {
+            let result = firmware.wait_initialize_registered().await;
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8723bu: firmware attempt {:?}",
+                result
+            );
+            if result.is_err() {
+                return;
+            }
+            if let Some(factory) = firmware.factory_8723b() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8723bu:   signed record required at /firmware/{}",
+                    rtl8723b_policy::Calibration::asset_name(&factory),
+                );
+            }
+            // Unprovisioned (no record/policy/authority) stays unadmitted.
+            let admitted = rtl8723b_admission::wait_admit(firmware.clone()).await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8723bu: admission {:?}",
+                admitted.as_ref().map(|a| a.permission)
+            );
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            let (authority, grant) = gen2_radio::Authority::from_8723b(admitted);
+            let device = gen2_interface::attach(firmware.clone(), authority, grant).await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8723bu: station {:?}",
+                device.as_ref().map(|_| ())
+            );
         });
     }
 
@@ -309,3 +428,15 @@ mod management_tests;
 
 #[cfg(feature = "kernel-test")]
 mod rate_adaptation_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rtl8192e_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rtl8192e_packet_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rtl8192e_ra_tests;
+
+#[cfg(feature = "kernel-test")]
+mod rtl8723b_tests;

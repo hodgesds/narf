@@ -1023,6 +1023,7 @@ pub struct SocketFile {
     /// AF_NETLINK local and connected peer addresses. Port ID zero means
     /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
     netlink_portid: AtomicU32,
+    native_source: IrqSafeSpinLock<narf_net::native_emission::ProviderLifetime>,
     netlink_groups: AtomicU32,
     /// Full Linux multicast group-number membership. `sockaddr_nl.nl_groups`
     /// mirrors groups 1..=32; SOL_NETLINK can address higher group numbers.
@@ -1052,6 +1053,9 @@ pub struct SocketFile {
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
+    /// Explicit fresh control-child grants from this exact socket's
+    /// authorized create operation; never a namespace/port-id registry.
+    netlink_controls: IrqSafeSpinLock<Vec<narf_net::AdminHandle>>,
     /// The opener held CAP_NET_ADMIN over this socket's network namespace when
     /// it created the socket — the `file_ns_capable(file, ...)` half of Linux
     /// `netlink_net_capable`, which judges the socket's `f_cred`, not only the
@@ -2030,6 +2034,7 @@ impl SocketFile {
             listen_owner_fd: AtomicU32::new(u32::MAX),
             netlink_readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
             netlink_portid: AtomicU32::new(0),
+            native_source: IrqSafeSpinLock::new(narf_net::native_emission::ProviderLifetime::new()),
             netlink_groups: AtomicU32::new(0),
             netlink_memberships: IrqSafeSpinLock::new(BTreeSet::new()),
             netlink_peer_portid: AtomicU32::new(0),
@@ -2044,6 +2049,7 @@ impl SocketFile {
             netlink_recv_groups: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_user_recv_creds: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_admin: IrqSafeSpinLock::new(None),
+            netlink_controls: IrqSafeSpinLock::new(Vec::new()),
             opener_net_admin: AtomicBool::new(false),
             opener_init_net_admin: AtomicBool::new(false),
             netfilter_admin: IrqSafeSpinLock::new(None),
@@ -2289,6 +2295,7 @@ impl SocketFile {
             return Err(SockError::InvalidArg);
         }
         *self.netlink_admin.lock() = Some(admin);
+        self.netlink_controls.lock().clear();
         Ok(())
     }
 
@@ -2968,8 +2975,20 @@ impl SocketFile {
 
     /// Stamp this socket's network-namespace id (see field docs).
     pub fn set_net_ns_id(&self, id: u64) {
-        self.net_ns_id
-            .store(id, core::sync::atomic::Ordering::Relaxed);
+        let retired = {
+            let mut source = self.native_source.lock();
+            if self.net_ns_id.load(Ordering::Acquire) == id {
+                None
+            } else {
+                let retired = source.retire();
+                *source = narf_net::native_emission::ProviderLifetime::new();
+                self.net_ns_id.store(id, Ordering::Release);
+                Some(retired)
+            }
+        };
+        if let Some(retired) = retired {
+            retired.notify();
+        }
     }
 
     #[cfg(feature = "container")]
@@ -3553,6 +3572,74 @@ impl core::fmt::Debug for SocketFile {
             .field("domain", &self.domain)
             .field("kind", &self.kind)
             .finish_non_exhaustive()
+    }
+}
+
+/// Deferred control replies stay attached to this exact file, even when
+/// its port id is later reused by another netlink socket. A pending native
+/// operation never keeps the file alive after its last descriptor closes.
+#[derive(Debug)]
+struct GenericReplyEndpoint {
+    socket: Weak<SocketFile>,
+    namespace: u64,
+    portid: u32,
+    source: narf_net::native_emission::Lifetime,
+}
+
+#[path = "socket_control_admin.rs"]
+mod control_admin;
+#[path = "socket_native_source.rs"]
+mod native_source;
+
+#[cfg(feature = "kernel-test")]
+#[path = "socket_deferred_tests.rs"]
+mod deferred_tests;
+
+impl narf_net::netlink_generic::DeferredReplySink for GenericReplyEndpoint {
+    fn native_source(&self) -> Option<narf_net::native_emission::Lifetime> {
+        self.native_source_guard()
+    }
+    fn retain_control_admin(&self, admin: narf_net::AdminHandle) -> Result<(), i32> {
+        self.retain_child_admin(admin)
+    }
+    fn control_admin(&self, name: &str, namespace: u64) -> Option<narf_net::AdminHandle> {
+        self.child_admin(name, namespace)
+    }
+    fn current(&self) -> bool {
+        self.source.current()
+            && self.socket.upgrade().is_some_and(|socket| {
+                socket.protocol == NETLINK_GENERIC
+                    && socket.net_ns_id() == self.namespace
+                    && socket.netlink_portid.load(Ordering::Acquire) == self.portid
+                    && matches!(&*socket.state.lock(), SocketState::NetlinkGeneric { .. })
+            })
+    }
+
+    fn deliver(&self, mut message: Vec<u8>) -> Result<(), i32> {
+        const NLMSG_HDRLEN: usize = 16;
+        let socket = self.socket.upgrade().ok_or(111)?;
+        if !self.source.current()
+            || socket.protocol != NETLINK_GENERIC
+            || socket.net_ns_id() != self.namespace
+            || socket.netlink_portid.load(Ordering::Acquire) != self.portid
+            || message.len() < NLMSG_HDRLEN
+        {
+            return Err(111);
+        }
+        message[12..16].copy_from_slice(&self.portid.to_ne_bytes());
+        {
+            let mut state = socket.state.lock();
+            let SocketState::NetlinkGeneric { replies } = &mut *state else {
+                return Err(111);
+            };
+            // Like synchronous command ACKs, this is an owned reply to a
+            // request, not a lossy multicast notification.
+            replies.push_back(message);
+            socket.netlink_reply_groups.lock().push_back(0);
+        }
+        socket.wake_netlink_readable();
+        narf_net::readiness::notify(0);
+        Ok(())
     }
 }
 
@@ -5652,7 +5739,7 @@ impl SocketFile {
                 narf_net::netlink_generic::install_event_sink(Self::broadcast_netlink_generic);
                 narf_net::netlink_generic::install_unicast_sink(Self::unicast_netlink_generic);
                 let admin = self.netlink_admin.lock().clone();
-                let mut replies = match narf_net::netlink_generic::build_replies_with_context(
+                let mut replies = match narf_net::netlink_generic::build_replies_with_endpoint(
                     buf,
                     narf_net::netlink_generic::ReplyOptions {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
@@ -5668,6 +5755,7 @@ impl SocketFile {
                         portid: dest_portid,
                         ack_cookie: None,
                     },
+                    Arc::new(GenericReplyEndpoint::capture(self, dest_portid)),
                 ) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
@@ -9903,6 +9991,8 @@ fn unix_skb_truesize(unit: usize) -> usize {
 /// so it does not pin the refcount.)
 impl Drop for SocketFile {
     fn drop(&mut self) {
+        let native = self.native_source.lock().retire();
+        native.notify();
         self.release_multicast();
         // netlink_release → NETLINK_URELEASE for a bound generic socket
         // (nl80211_netlink_notify: the connection owner went away).

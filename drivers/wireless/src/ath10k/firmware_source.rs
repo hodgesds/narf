@@ -1,7 +1,7 @@
 //! Exact immutable loader records retained by the same BMI/mission owner.
 //! No registry-name reopen can replace executable or calibration authority.
 use crate::firmware_asset::Asset;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read, Write};
 use narf_firmware::{FirmwareBlob, FirmwareError, FirmwareRegistry};
@@ -28,6 +28,7 @@ pub(super) fn invoke<T>(
 }
 struct Records {
     assets: Vec<Arc<Asset>>,
+    names: Vec<String>,
     image: bool,
     board: bool,
     sealed: bool,
@@ -85,6 +86,7 @@ impl Source {
             registry,
             records: Arc::new(IrqSafeSpinLock::new(Records {
                 assets: Vec::new(),
+                names: Vec::new(),
                 image: false,
                 board: false,
                 sealed: false,
@@ -102,20 +104,70 @@ impl Source {
         r.pci = Some(cap);
         Ok(())
     }
-    pub fn retain(&self, asset: Asset, image: bool, board: bool) -> Result<(), FirmwareError> {
+    pub fn retain(
+        &self,
+        name: &str,
+        asset: Asset,
+        image: bool,
+        board: bool,
+    ) -> Result<(), FirmwareError> {
         self.registry
             .invoke(NoopOp)
             .map_err(|_| FirmwareError::AuthorityRevoked)?;
         if !asset.current() {
             return Err(FirmwareError::AuthorityRevoked);
         }
+        // A staged extended-board lookup may reread the same signed container
+        // many times before its missing entry arrives. An identical lookup is
+        // not another consumed input and must not exhaust this bounded log.
+        // Preserve the original capability; a fresh name-open cannot replace
+        // its epoch, even when the replacement bytes happen to be identical.
+        let previous = {
+            let r = self.records.lock();
+            if r.sealed {
+                return Err(FirmwareError::BadFormat);
+            }
+            r.names.iter().enumerate().find_map(|(i, old)| {
+                let prior = &r.assets[i];
+                (old == name && prior.digest == asset.digest && prior.signer == asset.signer)
+                    .then(|| (i, prior.clone()))
+            })
+        };
+        if let Some((index, prior)) = previous {
+            // Payloads can be large. Compare and invoke outside the IRQ lock.
+            if prior.bytes == asset.bytes {
+                if !prior.current() {
+                    return Err(FirmwareError::AuthorityRevoked);
+                }
+                let mut r = self.records.lock();
+                if r.sealed || !r.assets.get(index).is_some_and(|a| Arc::ptr_eq(a, &prior)) {
+                    return Err(FirmwareError::BadFormat);
+                }
+                r.image |= image;
+                r.board |= board;
+                drop(r);
+                return Ok(());
+            }
+        }
         let mut r = self.records.lock();
-        if r.sealed || r.assets.len() == MAX_SOURCES {
+        if r.sealed {
             return Err(FirmwareError::BadFormat);
         }
+        if r.assets.len() == MAX_SOURCES {
+            return Err(FirmwareError::BadFormat);
+        }
+        let mut owned_name = String::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| FirmwareError::OutOfMemory)?;
+        owned_name.push_str(name);
         r.assets
             .try_reserve(1)
             .map_err(|_| FirmwareError::OutOfMemory)?;
+        r.names
+            .try_reserve(1)
+            .map_err(|_| FirmwareError::OutOfMemory)?;
+        r.names.push(owned_name);
         r.assets.push(Arc::new(asset));
         r.image |= image;
         r.board |= board;
@@ -210,6 +262,44 @@ pub(super) fn fixture() -> Result<FixtureSources, &'static str> {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_ath10k_staged_identical_board_lookups_preserve_original_epoch() -> TestResult {
+        use super::super::firmware::Files;
+        (|| {
+            const BOARD: &str = "ath10k/narf-staged-source/board-2.bin";
+            let (write, read) = narf_firmware::bootstrap_authority();
+            crate::firmware_asset::tests::install(&write, BOARD, b"inert staged board", true)
+                .map_err(|_| "staged board install")?;
+            let mut files = super::super::firmware::RegistryFiles::with_authority(read);
+            files.load(BOARD).map_err(|_| "first signed lookup")?;
+            let source = files.source();
+            let original = source.records.lock().assets[0].cap;
+            for _ in 0..32 {
+                files
+                    .load(BOARD)
+                    .map_err(|_| "unchanged staged lookup exhausted source log")?;
+            }
+            {
+                let records = source.records.lock();
+                if records.assets.len() != 1
+                    || records.names.as_slice() != [BOARD]
+                    || records.assets[0].cap.slot() != original.slot()
+                {
+                    return Err("staged source reopened or multiplied original capability");
+                }
+            }
+            original.revoke();
+            if files.load(BOARD).is_ok() || source.invoke_boot(|| ()).is_ok() {
+                return Err("fresh registry open replaced revoked original source epoch");
+            }
+            Ok(())
+        })()
+        .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath10k/source",
+        smoke_ath10k_staged_identical_board_lookups_preserve_original_epoch
+    );
     fn smoke_ath10k_signed_source_exact_bytes_digest_and_revocation_are_retained() -> TestResult {
         (|| {
             for index in 0..2 {

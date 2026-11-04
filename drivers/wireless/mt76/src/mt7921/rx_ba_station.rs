@@ -12,10 +12,12 @@ impl<B: Backend> Session<B> {
         own: [u8; 6],
         peer: [u8; 6],
     ) -> bool {
-        if self.tx_ba.receive(native) {
+        let peer_wcid = u16::from(self.station.link.peer());
+        if self.station.tx_ba.receive(native, peer_wcid) {
             return true;
         }
-        if self.ht20_profile.is_none() || native.ccmp.is_some() || native.wcid != 1 {
+        if self.station.ht20_profile.is_none() || native.ccmp.is_some() || native.wcid != peer_wcid
+        {
             return false;
         }
         let frame = native.frame;
@@ -28,7 +30,7 @@ impl<B: Backend> Session<B> {
             let control = u16::from_le_bytes([frame[16], frame[17]]);
             let sequence = u16::from_le_bytes([frame[18], frame[19]]);
             if control & 0x0ffe == 4 && sequence & 15 == 0 {
-                self.rx_ba.bar((control >> 12) as u8, sequence >> 4);
+                self.station.rx_ba.bar((control >> 12) as u8, sequence >> 4);
             }
             return true;
         }
@@ -46,13 +48,13 @@ impl<B: Backend> Session<B> {
             return false;
         }
         if header[25] == 0 && frame.len() == 33 {
-            let limit = if self.he_profile.is_some() {
+            let limit = if self.station.he_profile.is_some() {
                 ba::HE_WINDOW
             } else {
                 ba::HT_WINDOW
             };
             if ba::Request::parse(frame, limit)
-                .is_some_and(|r| self.rx_ba.reserve(r, self.backend.now_ns()))
+                .is_some_and(|r| self.station.rx_ba.reserve(r, self.backend.now_ns()))
             {
                 return true;
             }
@@ -67,7 +69,7 @@ impl<B: Backend> Session<B> {
             } else {
                 37
             };
-            if self.control_pending.len() < 4 {
+            if self.station.control_pending.len() < 4 {
                 let mut response = vec![0; 33];
                 response[0] = 0xd0;
                 response[4..10].copy_from_slice(&peer);
@@ -75,14 +77,14 @@ impl<B: Backend> Session<B> {
                 response[16..22].copy_from_slice(&peer);
                 response[24..29].copy_from_slice(&[3, 1, frame[26], status, 0]);
                 response[29] = (frame[27] & 0x3c) | 2;
-                self.control_pending.push_back(response);
+                self.station.control_pending.push_back(response);
             }
             return true;
         }
         if header[25] == 2 && frame.len() == 30 {
             let parameters = u16::from_le_bytes([frame[26], frame[27]]);
             if parameters & 0x0fff == 0x0800 && frame[28..30] != [0, 0] {
-                self.rx_ba.stop((parameters >> 12) as u8, false);
+                self.station.rx_ba.stop((parameters >> 12) as u8, false);
                 self.clear_aggregate_receive();
             }
             return true;
@@ -97,50 +99,61 @@ impl<B: Backend> Session<B> {
         own: [u8; 6],
         peer: [u8; 6],
     ) -> Result<(), Error> {
-        if self.rx_ba.tick(self.backend.now_ns()) {
+        let link = self.station.link;
+        let peer_wcid = u16::from(link.peer());
+        if self.station.rx_ba.tick(self.backend.now_ns()) {
             self.clear_aggregate_receive();
         }
         for _ in 0..12 {
-            let Some(work) = self.rx_ba.next() else {
+            let Some(work) = self.station.rx_ba.next() else {
                 break;
             };
             let (tid, epoch) = match work {
                 ba::Work::Start(t, e) | ba::Work::Repeat(t, e) | ba::Work::Stop(t, e, _) => (t, e),
             };
-            let Some(request) = self.rx_ba.request(tid, epoch) else {
+            let Some(request) = self.station.rx_ba.request(tid, epoch) else {
                 continue;
             };
             match work {
                 ba::Work::Start(..) => {
-                    self.exchange_station(Command::Unified { id: 3 }, &request.wtbl(peer, true))
+                    self.exchange_station(
+                        Command::Unified { id: 3 },
+                        &request.wtbl(link, peer, true),
+                    )
+                    .await?;
+                    self.exchange_station(Command::Unified { id: 3 }, &request.station(link, true))
                         .await?;
-                    self.exchange_station(Command::Unified { id: 3 }, &request.station(true))
-                        .await?;
-                    self.send_management(&request.response(own, peer), 1)
+                    self.send_management(&request.response(own, peer), peer_wcid)
                         .await?;
                     self.check_station_tx()?;
-                    if !self.rx_ba.activate(tid, epoch, self.backend.now_ns()) {
+                    if !self
+                        .station
+                        .rx_ba
+                        .activate(tid, epoch, self.backend.now_ns())
+                    {
                         return Err(Error::Busy);
                     }
                 }
                 ba::Work::Repeat(..) => {
-                    if self.rx_ba.active(tid) {
-                        self.send_management(&request.response(own, peer), 1)
+                    if self.station.rx_ba.active(tid) {
+                        self.send_management(&request.response(own, peer), peer_wcid)
                             .await?;
-                        self.rx_ba
+                        self.station
+                            .rx_ba
                             .response_complete(tid, epoch, self.backend.now_ns());
                     }
                 }
                 ba::Work::Stop(_, _, notify) => {
                     // Receive/WTBL retirement is non-RF cleanup, including
                     // after policy loss. Current device authority still applies.
-                    self.exchange(Command::Unified { id: 3 }, &request.wtbl(peer, false))
+                    self.exchange(Command::Unified { id: 3 }, &request.wtbl(link, peer, false))
                         .await?;
-                    self.exchange(Command::Unified { id: 3 }, &request.station(false))
+                    self.exchange(Command::Unified { id: 3 }, &request.station(link, false))
                         .await?;
-                    self.rx_ba.finish_stop(tid, epoch);
+                    self.station.rx_ba.finish_stop(tid, epoch);
                     if notify {
-                        self.send_management(&request.delba(own, peer), 1).await?;
+                        self.send_management(&request.delba(own, peer), peer_wcid)
+                            .await?;
                     }
                 }
             }
@@ -152,14 +165,15 @@ impl<B: Backend> Session<B> {
     /// Close delivery before the first wait and retain each native BA record
     /// until both terminal disable receipts. Key/WCID reuse follows this fence.
     pub(super) async fn retire_receive_ba(&mut self, peer: [u8; 6]) -> Result<(), Error> {
-        self.rx_ba.fence();
+        let link = self.station.link;
+        self.station.rx_ba.fence();
         self.clear_aggregate_receive();
-        for (tid, epoch, request) in self.rx_ba.records() {
-            self.exchange(Command::Unified { id: 3 }, &request.wtbl(peer, false))
+        for (tid, epoch, request) in self.station.rx_ba.records() {
+            self.exchange(Command::Unified { id: 3 }, &request.wtbl(link, peer, false))
                 .await?;
-            self.exchange(Command::Unified { id: 3 }, &request.station(false))
+            self.exchange(Command::Unified { id: 3 }, &request.station(link, false))
                 .await?;
-            self.rx_ba.finish_stop(tid, epoch);
+            self.station.rx_ba.finish_stop(tid, epoch);
         }
         Ok(())
     }

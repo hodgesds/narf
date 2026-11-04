@@ -1,7 +1,7 @@
 //! Firmware-side RAW packet conversation over actual HTT TX/RX DMA storage.
 use super::*;
-use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use alloc::boxed::Box;
+use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 const OWN: [u8; 6] = [2, 3, 4, 5, 6, 7];
 const AP: [u8; 6] = [2, 8, 9, 10, 11, 12];
@@ -57,6 +57,7 @@ pub(super) struct Fixture {
     pub(super) automatic: bool,
     control_phase: u8,
     group_replies: usize,
+    pfc_responses: Vec<Vec<u8>>,
     server: DhcpServer,
     ap: FakeAp,
     ptk: Option<Ptk>,
@@ -64,6 +65,8 @@ pub(super) struct Fixture {
     uplink: Vec<Vec<u8>>,
     held: VecDeque<u16>,
     pn: u64,
+    /// Opt-in native AP QoS sequence owner for composed receive BA traffic.
+    receive_sequence: Option<u16>,
     replay: narf_wireless::ccmp::ReplayWindow,
     hold_m4: bool,
     m4_before_receipt: Option<Vec<u8>>,
@@ -94,11 +97,14 @@ pub(super) struct Fixture {
     protection_delay: u8,
     ht_response: Option<Vec<u8>>,
     ht_mcs: u8,
+    pub(super) ht_mcs_more: [u8; 3],
+    pub(super) ht_peer_nss: u32,
     ht_sgi: bool,
     ht_request_sgi: bool,
-    ht_request_sgi40: bool,
+    pub(super) ht_request_sgi40: bool,
+    pub(super) ht_request_nss: u8,
     ht_ampdu: u8,
-    ht_capabilities: u16,
+    pub(super) ht_capabilities: u16,
     // Source-cited coding bits beyond the base request IE: IEEE LDPC 0x0001
     // and one-stream RX STBC 0x0100; native PEER_LDPC/PEER_STBC flags and
     // WMI_RC_TX_STBC_FLAG expected in PEER_ASSOC.
@@ -111,7 +117,7 @@ pub(super) struct Fixture {
     /// Robust management frames the host sent after authorization (SA
     /// Query responses, the PMF teardown deauthentication).
     pub(super) management_tx: Vec<Vec<u8>>,
-    rx_phy: Option<(u8, u32, u32)>,
+    pub(super) rx_phy: Option<(u8, u32, u32)>,
     // Authored native descriptors per actual DMA frame, including invalid
     // stale middle PHY words that the host must never reinterpret.
     rx_descriptors: VecDeque<(u8, u8, u32, u32)>,
@@ -121,6 +127,19 @@ pub(super) struct Fixture {
     wmm_fail: bool,
     wmm_policy: Option<TestPolicy>,
     qos_frames: usize,
+    /// Replay counter of the AP's next group-key handshake request.
+    group_replay: u64,
+    /// Firmware key cache of the hardware-key profile (Linux `cryptmode=0`).
+    pub(super) hw: Option<Box<HwKeyCache>>,
+    /// Native-WiFi decap firmware (INIT `rx_decap_mode` 1): data TX arrives
+    /// as native-WiFi MSDUs, decryptable data RX leaves as native-WiFi
+    /// MSDUs with the original header in `rx_hdr_status`.
+    pub(super) native_wifi: bool,
+    /// The firmware's own pairwise TX PN under native WiFi.
+    pub(super) native_pn: u64,
+    /// Native-WiFi MSDUs transmitted / delivered.
+    pub(super) native_tx: usize,
+    pub(super) native_rx: usize,
 }
 /// Source-derived VHT expectations: the exact association-request VHT
 /// Capabilities body and the native PEER_ASSOC/VDEV_START VHT words.
@@ -128,6 +147,9 @@ pub(super) struct Fixture {
 pub(super) struct VhtExpect {
     /// 0 = VHT20, 1 = VHT40, 2 = VHT80 (the AP-selected bandwidth).
     pub(super) width: u8,
+    pub(super) center2: Option<u16>,
+    pub(super) wide_override: u32,
+    pub(super) half_dbm: u8,
     pub(super) request: [u8; 12],
     pub(super) capabilities: u32,
     pub(super) rates: [u32; 4],
@@ -170,9 +192,12 @@ impl Fixture {
             protection_delay: 0,
             ht_response: None,
             ht_mcs: 0xff,
+            ht_mcs_more: [0; 3],
+            ht_peer_nss: 1,
             ht_sgi: true,
             ht_request_sgi: true,
             ht_request_sgi40: false,
+            ht_request_nss: 2,
             ht_ampdu: 0x1b,
             ht_capabilities: 0x002c,
             ht_request_coding: 0,
@@ -188,7 +213,14 @@ impl Fixture {
             wmm_fail: false,
             wmm_policy: None,
             qos_frames: 0,
+            group_replay: 3,
+            hw: None,
+            native_wifi: false,
+            native_pn: 0,
+            native_tx: 0,
+            native_rx: 0,
             group_replies: 0,
+            pfc_responses: Vec::new(),
             server: DhcpServer::new(network()),
             ap,
             ptk: None,
@@ -196,6 +228,7 @@ impl Fixture {
             uplink: Vec::new(),
             held: VecDeque::new(),
             pn: 1,
+            receive_sequence: None,
             replay: narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 },
             hold_m4: false,
             m4_before_receipt: None,
@@ -278,7 +311,7 @@ impl Fixture {
             let pdu = body.get(8..).ok_or(BmiError::BadResponse)?;
             let key = KeyFrame::decode(pdu.get(4..).ok_or(BmiError::BadResponse)?, 16)
                 .ok_or(BmiError::BadResponse)?;
-            if key.key_information != 0x302 || key.replay_counter != 3 {
+            if key.key_information != 0x302 || key.replay_counter != self.group_replay {
                 return Err(BmiError::BadResponse);
             }
             let mut checked = pdu.to_vec();
@@ -320,7 +353,16 @@ impl Fixture {
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
-        frame.extend_from_slice(&[0, 0]);
+        let sequence = if qos {
+            self.receive_sequence.as_mut().map_or(0, |sequence| {
+                let current = *sequence;
+                *sequence = (*sequence + 1) & 4095;
+                current
+            })
+        } else {
+            0
+        };
+        frame.extend_from_slice(&(sequence << 4).to_le_bytes());
         if qos {
             frame.extend_from_slice(&[0, 0]);
         }
@@ -336,11 +378,16 @@ impl Fixture {
         frame
     }
     fn group_rekey(&mut self) -> Vec<u8> {
+        self.group_rekey_with(2, [0x66; 16])
+    }
+    /// A group-key handshake request delivering `gtk` under `key_id`, with
+    /// the current `group_replay` counter.
+    pub(super) fn group_rekey_with(&mut self, key_id: u8, gtk: [u8; 16]) -> Vec<u8> {
         let ptk = self.ptk.as_ref().unwrap();
         let mut clear = vec![48, 20];
         clear.extend_from_slice(&narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body());
-        clear.extend_from_slice(&[0xdd, 22, 0, 0x0f, 0xac, 1, 2, 0]);
-        clear.extend_from_slice(&[0x66; 16]);
+        clear.extend_from_slice(&[0xdd, 22, 0, 0x0f, 0xac, 1, key_id, 0]);
+        clear.extend_from_slice(&gtk);
         if clear.len() % 8 != 0 {
             clear.push(0xdd);
         }
@@ -350,7 +397,7 @@ impl Fixture {
         let mut key = KeyFrame::empty(16);
         key.key_information = 0x1382;
         key.key_length = 16;
-        key.replay_counter = 3;
+        key.replay_counter = self.group_replay;
         key.key_data =
             narf_crypto::aes_kw::aes_wrap(ptk.kek.as_slice().try_into().unwrap(), &clear).unwrap();
         let mut pdu = key.into_eapol();
@@ -456,6 +503,7 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             expected.extend_from_slice(&[0; 11]);
             expected.push(1);
             expected.extend_from_slice(&[0; 10]);
+            expected[5..5 + usize::from(m.data.as_ref().unwrap().ht_request_nss)].fill(255);
             if !frame.windows(expected.len()).any(|ie| ie == expected) {
                 return Err(BmiError::BadResponse);
             }
@@ -505,7 +553,15 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         };
         let f = m.data.as_ref().unwrap();
         let ht = f.ht_expected;
-        let ht_rates: Vec<u8> = (0..8).filter(|n| f.ht_mcs & (1 << n) != 0).collect();
+        let masks = [
+            f.ht_mcs,
+            f.ht_mcs_more[0],
+            f.ht_mcs_more[1],
+            f.ht_mcs_more[2],
+        ];
+        let ht_rates: Vec<u8> = (0..32)
+            .filter(|n| masks[usize::from(*n / 8)] & (1 << (n % 8)) != 0)
+            .collect();
         let size = size
             + if ht && dialect == Dialect::Tlv {
                 ht_rates.len().next_multiple_of(4)
@@ -521,14 +577,24 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || word(at + 16) != 7
             || word(at + 20)
                 != ((if secured { 5 } else { 1 })
+                    | f.hw.as_ref().map_or(0, |h| h.pmf_flag)
                     | if qos { 2 } else { 0 }
                     | if ht { 0x1000 } else { 0 }
                     | if f.ht_secondary.is_some() { 0x2000 } else { 0 }
                     | if ht { f.ht_peer_flags } else { 0 }
                     | f.vht.as_ref().map_or(0, |v| {
-                        0x0200_0000 | if v.width == 2 { 0x0400_0000 } else { 0 }
+                        0x0200_0000
+                            | if v.width == 3 {
+                                0x2000_0000
+                            } else if v.width == 2 {
+                                0x0400_0000
+                            } else {
+                                0
+                            }
                     }))
             || word(at + 24) != (if secured { 0x11 } else { 1 })
+            || word(at + if dialect == Dialect::Tlv { 48 } else { 320 })
+                != if ht { f.ht_peer_nss } else { 1 }
         {
             return Err(BmiError::BadResponse);
         }
@@ -545,6 +611,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         {
             return Err(BmiError::BadResponse);
         }
+        if dialect == Dialect::TenFour && word(at + 352) != vht.map_or(0, |v| v.wide_override) {
+            return Err(BmiError::BadResponse);
+        }
         let count = at + if dialect == Dialect::Tlv { 68 } else { 48 };
         let rates = count + if dialect == Dialect::Tlv { 12 } else { 4 };
         let phy = at + if dialect == Dialect::Tlv { 56 } else { 328 };
@@ -552,10 +621,18 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || command[rates..rates + 3] != [12, 24, 48]
             || word(phy)
                 != if let Some(v) = f.vht.as_deref() {
-                    8 + u32::from(v.width)
+                    if v.width == 3 {
+                        14
+                    } else {
+                        8 + u32::from(v.width)
+                    }
                 } else if ht {
                     if f.ht_secondary.is_some() {
-                        6
+                        if m.frequency < 3000 {
+                            7
+                        } else {
+                            6
+                        }
                     } else if m.frequency < 3000 {
                         5
                     } else {
@@ -577,7 +654,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             let density = [0, 1, 1, 1, 2, 4, 8, 16][usize::from((f.ht_ampdu >> 2) & 7)];
             if word(at + 32) != u32::from(f.ht_capabilities)
                 || word(at + 36)
-                    != f.vht.as_ref().map_or((1 << (13 + (f.ht_ampdu & 3))) - 1, |v| v.max_mpdu)
+                    != f.vht
+                        .as_ref()
+                        .map_or((1 << (13 + (f.ht_ampdu & 3))) - 1, |v| v.max_mpdu)
                 || word(at + 40) != density
                 || word(at + 44)
                     != (if f.ht_sgi { 12 } else { 8 }
@@ -673,14 +752,87 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     }
     Ok(())
 }
+/// Actual HTT3 TX_FRM management for the bounded legacy auth/association
+/// composition. Firmware without WMI MGMT_TX still sends these frames over
+/// pipe4; decoding them as raw DATA would reject before the independent AP.
+fn initial_htt_management(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let body = bytes.get(8..).ok_or(BmiError::BadResponse)?;
+    let fixture = m.data.as_ref().ok_or(BmiError::BadResponse)?;
+    let phase = fixture.control_phase;
+    if m.inner.version < 3
+        || bytes[0] != 1
+        || bytes[1] != 0
+        || bytes[5] != m.inner.sequence
+        || bytes[2..4] != (bytes.len() as u16 - 8).to_le_bytes()
+        || body.len() < 16
+        || body[..4] != [1, 0x65, 0x40, 0x0c] // MGMT/plaintext, extTID17, vdev0.
+        || body[12..16] != [0xff, 0xff, 0, 0] // Home-channel peer/freq union.
+        || phase >= 2
+        || fixture.qos()
+        || fixture.ht_expected
+        || m.station.as_ref().is_none_or(|station| station.phase < 4)
+    {
+        return Err(BmiError::BadResponse);
+    }
+    let length = usize::from(u16::from_le_bytes(body[4..6].try_into().unwrap()));
+    let id = u16::from_le_bytes(body[6..8].try_into().unwrap());
+    let frame = {
+        let storage = m.inner.storage.as_ref().ok_or(BmiError::BadResponse)?;
+        let (address, payload) = storage.tx.snapshot(id).ok_or(BmiError::BadResponse)?;
+        let prefetch = length.min(50).div_ceil(4) * 4;
+        if u32::from_le_bytes(body[8..12].try_into().unwrap()) != address as u32
+            || body.len() != 16 + prefetch
+            || payload.get(..prefetch) != body.get(16..)
+        {
+            return Err(BmiError::BadResponse);
+        }
+        payload.get(..length).ok_or(BmiError::BadResponse)?.to_vec()
+    };
+    if frame.len() < 24
+        || frame[..2] != if phase == 0 { [0xb0, 0] } else { [0, 0] }
+        || frame[4..10] != AP
+        || frame[10..16] != OWN
+        || frame[16..22] != AP
+    {
+        return Err(BmiError::BadResponse);
+    }
+    // The real AP validates authentication/RSNE and creates the actual early
+    // M1. No key/controlled-port or synthetic association receipt is supplied.
+    let replies = m
+        .data
+        .as_mut()
+        .unwrap()
+        .ap
+        .receive(&frame)
+        .map_err(|_| BmiError::BadResponse)?;
+    m.inner.sequence = m.inner.sequence.wrapping_add(1);
+    m.native_management.push(frame);
+    m.sent.push(bytes.to_vec());
+    m.data.as_mut().unwrap().control_phase += 1;
+    // A real ID from the retained DMA slot is completed through the normal
+    // HTT3 TX terminal event, independently of the AP management response.
+    complete(m, id, 0);
+    for reply in replies {
+        if reply[0] == 8 {
+            m.data.as_mut().unwrap().queue.push_back(reply);
+        } else {
+            management_frame(m, reply);
+        }
+    }
+    Ok(())
+}
 pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    if bytes.get(8..10) == Some(&[1, 0x65]) {
+        return initial_htt_management(m, bytes);
+    }
     let body = bytes.get(8..).ok_or(BmiError::BadResponse)?;
     if bytes[0] != 1
         || bytes[1] != 0
         || bytes[5] != m.inner.sequence
         || bytes[2..4] != (bytes.len() as u16 - 8).to_le_bytes()
         || body.len() < 16
-        || body[..2] != [1, 5]
+        || body[0] != 1
+        || !matches!(body[1], 1 | 5 | 0x21 | 0x25)
         || body[12..16] != [0xff, 0xff, 0, 0]
     {
         return Err(BmiError::BadResponse);
@@ -706,6 +858,31 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         }
     }
     let fixture = m.data.as_mut().unwrap();
+    // PKT_TYPE native WiFi (flags0 bit 5): only native-WiFi firmware, and
+    // the firmware rebuilds QoS from the descriptor TID and, without
+    // NO_ENCRYPT, inserts its own CCMP header.
+    let native;
+    let frame = if body[1] & 0x20 != 0 {
+        if !fixture.native_wifi {
+            return Err(BmiError::BadResponse);
+        }
+        let flags1 = u16::from_le_bytes([body[2], body[3]]);
+        native = fixture.native_frame(frame, (flags1 >> 6) as u8 & 31, body[1] & 4 == 0)?;
+        &native[..]
+    } else if fixture.native_wifi {
+        return Err(BmiError::BadResponse);
+    } else {
+        frame
+    };
+    // flags0 without HTT_DATA_TX_DESC_FLAGS0_NO_ENCRYPT: the firmware
+    // encrypts the header-only MPDU with its installed pairwise key.
+    let encrypted;
+    let frame = if body[1] & 4 == 0 {
+        encrypted = fixture.firmware_encrypt(frame)?;
+        &encrypted[..]
+    } else {
+        frame
+    };
     let expected_tid = if frame[0] == 0x88 { 0 } else { 16 };
     if body[2..4] != (0x800u16 | (expected_tid << 6)).to_le_bytes() {
         return Err(BmiError::BadResponse);
@@ -737,6 +914,41 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
     }
     Ok(())
 }
+/// Independent native CE/HTC response observer. No response creates a DATA
+/// receipt or releases HTT DMA; those still come only from complete().
+pub(super) fn pfc_response(m: &mut RadioModel, bytes: &[u8]) -> Option<Result<(), BmiError>> {
+    if !m.inner.config.pfc || bytes.get(8).copied() != Some(11) {
+        return None;
+    }
+    Some((|| {
+        let body = &bytes[8..];
+        if bytes.len() > 256
+            || body.len() < 12
+            || bytes[0] != 1
+            || bytes[1] != 0
+            || bytes[5] != m.inner.sequence
+            || bytes[2..4] != (body.len() as u16).to_le_bytes()
+            || body[1..4] != [0; 3]
+            || body.len()
+                != 12 + usize::from(u16::from_le_bytes(body[6..8].try_into().unwrap())) * 8
+        {
+            return Err(BmiError::BadResponse);
+        }
+        if let Some(ce) = &m.ce {
+            let actual = ce.source_bytes(4);
+            if actual.get(..bytes.len()) != Some(bytes) {
+                return Err(BmiError::BadResponse);
+            }
+        }
+        m.data
+            .as_mut()
+            .ok_or(BmiError::BadResponse)?
+            .pfc_responses
+            .push(body.to_vec());
+        m.inner.sequence = m.inner.sequence.wrapping_add(1);
+        Ok(())
+    })())
+}
 pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
     if let Some(f) = &mut m.data {
         if f.protection_delay != 0 {
@@ -760,12 +972,16 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         }
         return Ok(());
     };
-    let peer = fixture.next_peer.take().unwrap_or(1800);
+    let peer = fixture
+        .next_peer
+        .take()
+        .unwrap_or(if m.inner.config.pfc { 17 } else { 1800 });
     let tid = fixture
         .next_tid
         .take()
         .unwrap_or(if frame[0] == 0x88 { 0 } else { 16 });
     let protected = frame[1] & 0x40 != 0;
+    let decrypted = fixture.firmware_decrypt(&mut frame);
     let control = frame[0] == 0x84;
     let sequence = if control {
         0
@@ -773,15 +989,26 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         u16::from_le_bytes([frame[22], frame[23]]) >> 4
     };
     let per_frame = fixture.rx_descriptors.pop_front();
-    frame.extend_from_slice(&[0; 4]);
     let mut descriptor = [0u8; 300];
+    // htt_rx.c: a native-WiFi firmware decaps data it could decrypt (or
+    // that was never protected); anything else stays RAW with its FCS.
+    let native = fixture.native_wifi
+        && !control
+        && matches!(frame[0], 8 | 0x88)
+        && (!protected || decrypted)
+        && !(frame[0] == 0x88 && frame[24] & 0x80 != 0);
+    if native {
+        frame = fixture.native_rx_msdu(&frame, &mut descriptor);
+    } else {
+        frame.extend_from_slice(&[0; 4]);
+    }
     u32at(
         &mut descriptor,
         4,
         (1 << 31)
             | u32::from(per_frame.map_or(3, |d| d.0))
             | if control { 1 << 9 } else { 0 }
-            | if protected { 1 << 29 } else { 0 }
+            | if protected && !decrypted { 1 << 29 } else { 0 }
             | core::mem::take(&mut fixture.next_attention),
     );
     u32at(
@@ -798,10 +1025,15 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         u32::from(if tid == 16 { 0 } else { tid }) << 28,
     );
     u32at(&mut descriptor, 24, frame.len() as u32);
+    // rx_msdu_start_common.info1 DECAP_FORMAT (after flow_id_crc).
     u32at(
         &mut descriptor,
-        28,
-        core::mem::take(&mut fixture.next_decap) << 8,
+        32,
+        if native {
+            1 << 8
+        } else {
+            core::mem::take(&mut fixture.next_decap) << 8
+        },
     );
     u32at(&mut descriptor, 56, 0xc000);
     u32at(&mut descriptor, 104, 0x0400000b); // legacy OFDM6
@@ -845,7 +1077,36 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
     Ok(())
 }
 fn joined(version: u32, dialect: Dialect, secured: bool, raw: bool) -> radio::Radio<RadioModel> {
-    let mut r = mlme_tests::prepared_profile(version, dialect, secured, raw);
+    joined_features(version, dialect, secured, raw, 0)
+}
+fn joined_features(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    raw: bool,
+    extra: u64,
+) -> radio::Radio<RadioModel> {
+    let mut r = mlme_tests::prepared_profile_features(version, dialect, secured, raw, extra);
+    if extra & (1 << 13) != 0 {
+        r.htt.wmi.htc.transport.ce = Some(crate::ath10k::boot::CeFixture::new(HwRev::Qca9984));
+        // alloc_coherent_masked retains a power-of-two page extent: the
+        // 4772-byte native qstate therefore lives in8192 bytes. Exercise
+        // that physical shape before any handshake/queue publication, and
+        // retain a sentinel outside the exact advertised qstate span.
+        r.htt
+            .wmi
+            .htc
+            .transport
+            .inner
+            .storage
+            .as_mut()
+            .unwrap()
+            .qstate
+            .as_mut()
+            .unwrap()
+            .bytes
+            .resize(8192, 0xa5);
+    }
     let mode = if secured {
         narf_wireless::association::SecurityMode::Wpa2Psk
     } else {
@@ -1079,6 +1340,8 @@ kernel_test_in!(
 
 #[path = "dhcp_tests.rs"]
 mod dhcp_tests;
+#[path = "pfc_tests.rs"]
+mod pfc_tests;
 #[path = "tx_pipeline_tests.rs"]
 mod tx_pipeline_tests;
 
@@ -1097,11 +1360,13 @@ pub(super) fn captures_management(m: &RadioModel, command: &[u8]) -> bool {
         .as_ref()
         .is_some_and(|d| d.ap.phase() == ApPhase::Authorized)
         && command.len() >= 4
-        && u32::from_le_bytes(command[..4].try_into().unwrap()) == management_id(m.inner.inner.dialect)
+        && u32::from_le_bytes(command[..4].try_into().unwrap())
+            == management_id(m.inner.inner.dialect)
 }
 pub(super) fn capture_management(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let command = &bytes[8..];
     let frame = mlme_tests::native_frame(m, command)?;
+    let frame = m.data.as_mut().unwrap().firmware_management_tx(frame)?;
     m.data.as_mut().unwrap().management_tx.push(frame);
     if m.inner.inner.dialect == Dialect::Tlv {
         let mut terminal = vec![16, 0, 0xa7, 1];
@@ -1214,4 +1479,340 @@ pub(super) async fn protection_send(m: &mut RadioModel, bytes: &[u8]) -> Result<
         core::future::pending::<()>().await;
     }
     Ok(())
+}
+
+/// Firmware key cache of the hardware-key profile: what Linux ath10k
+/// `cryptmode=0` firmware holds after `WMI_VDEV_INSTALL_KEY` (wmi.h
+/// `struct wmi_vdev_install_key_cmd`). The model encrypts header-only RAW
+/// MPDUs, decrypts received MPDUs and PMF unicast management with it, and
+/// answers each install with the HTT `SEC_IND` (htt.h
+/// `struct htt_security_indication`, htt_rx.c `install_key_done`).
+#[derive(Default)]
+pub(super) struct HwKeyCache {
+    /// (pairwise, key index, key) currently programmed.
+    pub(super) keys: Vec<(bool, u8, [u8; 16])>,
+    /// Every accepted install command.
+    pub(super) installs: usize,
+    /// PEER_ASSOC `peer_flags->pmf` this firmware expects (0: none).
+    pub(super) pmf_flag: u32,
+    /// Leave the next install unapplied (the stale key stays programmed and
+    /// no indication is sent) until `release_install`.
+    pub(super) hold: bool,
+    held: Option<(bool, u8, [u8; 16])>,
+    /// Header-only MPDUs the firmware encrypted.
+    pub(super) hardware_tx: usize,
+    /// Received MPDUs the firmware decrypted (no DECRYPT_ERR).
+    pub(super) decrypted_rx: usize,
+}
+impl HwKeyCache {
+    pub(super) fn key(&self, pairwise: bool, id: u8) -> Option<[u8; 16]> {
+        self.keys
+            .iter()
+            .find(|k| k.0 == pairwise && k.1 == id)
+            .map(|k| k.2)
+    }
+    pub(super) fn held(&self) -> bool {
+        self.held.is_some()
+    }
+}
+impl Fixture {
+    /// RAW TX without NO_ENCRYPT: `[header][CCMP header][plaintext][8 zero
+    /// MIC octets]` (mac80211 GENERATE_IV, htt_tx.c MIC tail). The firmware
+    /// encrypts with its pairwise key at the host's PN.
+    fn firmware_encrypt(&mut self, frame: &[u8]) -> Result<Vec<u8>, BmiError> {
+        let hw = self.hw.as_mut().ok_or(BmiError::BadResponse)?;
+        let key = hw.key(true, 0).ok_or(BmiError::BadResponse)?;
+        let header = if frame.first() == Some(&0x88) { 26 } else { 24 };
+        if frame.len() < header + 16 || frame[1] & 0x40 == 0 {
+            return Err(BmiError::BadResponse);
+        }
+        let (body, mic) = frame[header..].split_at(frame.len() - header - 8);
+        let (pn, key_id) = narf_wireless::ccmp::decode_ccmp_header(body[..8].try_into().unwrap())
+            .map_err(|_| BmiError::BadResponse)?;
+        if mic != [0; 8] || key_id != 0 {
+            return Err(BmiError::BadResponse);
+        }
+        let priority = if header == 26 { frame[24] & 15 } else { 0 };
+        let mut plain = body[8..].to_vec();
+        let mut out = frame[..header].to_vec();
+        out.extend_from_slice(
+            &narf_wireless::ccmp::protect(
+                &Ccm,
+                &frame[..header],
+                &key,
+                pn,
+                0,
+                priority,
+                false,
+                &mut plain,
+            )
+            .map_err(|_| BmiError::BadResponse)?,
+        );
+        hw.hardware_tx += 1;
+        Ok(out)
+    }
+    /// Native-WiFi TX (mac.c `ath10k_tx_h_nwifi` reversed): QoS Control
+    /// from the descriptor TID, then, when the firmware encrypts, a CCMP
+    /// header at its own PN plus MIC space for `firmware_encrypt`.
+    fn native_frame(&mut self, frame: &[u8], tid: u8, encrypt: bool) -> Result<Vec<u8>, BmiError> {
+        if frame.len() < 24 || frame[0] != 8 || frame[1] & 0x03 != 1 {
+            return Err(BmiError::BadResponse);
+        }
+        let protected = frame[1] & 0x40 != 0;
+        if protected != encrypt {
+            return Err(BmiError::BadResponse);
+        }
+        let mut out = frame[..24].to_vec();
+        if tid < 16 {
+            out[0] = 0x88;
+            out.extend_from_slice(&[tid, 0]);
+        }
+        if encrypt {
+            self.native_pn += 1;
+            let pn = self.native_pn.to_le_bytes();
+            out.extend_from_slice(&[pn[0], pn[1], 0, 0x20, pn[2], pn[3], pn[4], pn[5]]);
+        }
+        out.extend_from_slice(&frame[24..]);
+        if encrypt {
+            out.extend_from_slice(&[0; 8]);
+        }
+        self.native_tx += 1;
+        Ok(out)
+    }
+    /// Native-WiFi RX (`ath10k_htt_rx_h_undecap_nwifi` reversed): the
+    /// original header (+CCMP header at 4-byte alignment) in
+    /// `rx_hdr_status`, the MSDU as `[nwifi header][LLC...]` without MIC/FCS.
+    fn native_rx_msdu(&mut self, frame: &[u8], descriptor: &mut [u8; 300]) -> Vec<u8> {
+        let header = if frame[0] == 0x88 { 26 } else { 24 };
+        let protected = frame[1] & 0x40 != 0;
+        let mut status = frame[..header].to_vec();
+        let mut body = &frame[header..];
+        if protected {
+            status.resize(header.next_multiple_of(4), 0);
+            status.extend_from_slice(&body[..8]);
+            body = &body[8..body.len() - 8];
+        }
+        descriptor[236..236 + status.len()].copy_from_slice(&status);
+        let mut native = vec![8, frame[1] & 0x03, 0, 0];
+        native.extend_from_slice(&frame[4..10]);
+        native.extend_from_slice(&frame[10..16]);
+        native.extend_from_slice(&frame[16..22]);
+        native.extend_from_slice(&frame[22..24]);
+        native.extend_from_slice(body);
+        self.native_rx += 1;
+        native
+    }
+    /// RX: an MPDU under a programmed key leaves the firmware decrypted with
+    /// Protected, CCMP header and MIC kept (htt_rx.c `is_decrypted`); any
+    /// other protected MPDU keeps its ciphertext and DECRYPT_ERR.
+    fn firmware_decrypt(&mut self, frame: &mut Vec<u8>) -> bool {
+        let Some(hw) = self.hw.as_mut() else {
+            return false;
+        };
+        if frame.len() < 24 || !matches!(frame[0], 8 | 0x88) || frame[1] & 0x40 == 0 {
+            return false;
+        }
+        let header = if frame[0] == 0x88 { 26 } else { 24 };
+        if frame.len() < header + 16 {
+            return false;
+        }
+        let key_id = frame[header + 3] >> 6;
+        let key = if frame[4] & 1 == 0 {
+            hw.key(true, 0).filter(|_| key_id == 0)
+        } else {
+            hw.key(false, key_id)
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        let priority = if header == 26 { frame[24] & 15 } else { 0 };
+        let mut wire = frame[header..].to_vec();
+        let mic = wire[wire.len() - 8..].to_vec();
+        let mut replay = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+        let Ok(plain) = narf_wireless::ccmp::unprotect(
+            &Ccm,
+            &frame[..header],
+            &key,
+            priority,
+            false,
+            &mut replay,
+            &mut wire,
+        ) else {
+            return false;
+        };
+        frame.truncate(header + 8);
+        frame.extend_from_slice(&plain);
+        frame.extend_from_slice(&mic);
+        hw.decrypted_rx += 1;
+        true
+    }
+    /// WMI management TX on a `peer_flags->pmf` peer: a protected unicast
+    /// robust frame carries only the CCMP header plus MIC space (wmi.c
+    /// `ath10k_wmi_op_gen_mgmt_tx`) and the firmware encrypts it with the
+    /// pairwise key (management nonce/AAD). Other frames pass unchanged.
+    fn firmware_management_tx(&mut self, frame: Vec<u8>) -> Result<Vec<u8>, BmiError> {
+        let Some(hw) = self.hw.as_mut() else {
+            return Ok(frame);
+        };
+        let Some(key) = hw.key(true, 0).filter(|_| hw.pmf_flag != 0) else {
+            return Ok(frame);
+        };
+        if frame.len() < 24 || frame[1] & 0x40 == 0 || frame[4] & 1 != 0 {
+            return Ok(frame);
+        }
+        if frame.len() < 24 + 16 || frame[frame.len() - 8..] != [0; 8] {
+            return Err(BmiError::BadResponse);
+        }
+        let (pn, key_id) =
+            narf_wireless::ccmp::decode_ccmp_header(frame[24..32].try_into().unwrap())
+                .map_err(|_| BmiError::BadResponse)?;
+        if key_id != 0 {
+            return Err(BmiError::BadResponse);
+        }
+        let mut plain = frame[32..frame.len() - 8].to_vec();
+        let mut out = frame[..24].to_vec();
+        out.extend_from_slice(
+            &narf_wireless::ccmp::protect(&Ccm, &frame[..24], &key, pn, 0, 0, true, &mut plain)
+                .map_err(|_| BmiError::BadResponse)?,
+        );
+        hw.hardware_tx += 1;
+        Ok(out)
+    }
+    /// WMI management RX on a `peer_flags->pmf` peer: the firmware decrypts
+    /// a protected unicast robust frame with the pairwise key and keeps
+    /// Protected, CCMP header and MIC (wmi.c `ath10k_wmi_rx_is_decrypted`).
+    pub(super) fn firmware_management_rx(&mut self, frame: Vec<u8>) -> Vec<u8> {
+        let Some(hw) = self.hw.as_mut() else {
+            return frame;
+        };
+        let Some(key) = hw.key(true, 0).filter(|_| hw.pmf_flag != 0) else {
+            return frame;
+        };
+        if frame.len() < 24 + 16 || frame[1] & 0x40 == 0 || frame[4] & 1 != 0 {
+            return frame;
+        }
+        let mut wire = frame[24..].to_vec();
+        let mic = wire[wire.len() - 8..].to_vec();
+        let mut replay = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+        let Ok(plain) = narf_wireless::ccmp::unprotect(
+            &Ccm,
+            &frame[..24],
+            &key,
+            0,
+            true,
+            &mut replay,
+            &mut wire,
+        ) else {
+            return frame;
+        };
+        let mut out = frame[..32].to_vec();
+        out.extend_from_slice(&plain);
+        out.extend_from_slice(&mic);
+        hw.decrypted_rx += 1;
+        out
+    }
+}
+/// `vdev_install_key_cmdid` (wmi.h main/TLV maps 0x5009; 10.1 0x901b;
+/// 10.2 0x901a; 10.4 0x901d).
+fn install_id(dialect: Dialect) -> u32 {
+    match dialect {
+        Dialect::Main | Dialect::Tlv => 0x5009,
+        Dialect::TenOne => 0x901b,
+        Dialect::TenTwo | Dialect::TenTwoFour => 0x901a,
+        Dialect::TenFour => 0x901d,
+    }
+}
+pub(super) fn install_handles(m: &RadioModel, command: &[u8]) -> bool {
+    m.data.as_ref().is_some_and(|d| d.hw.is_some())
+        && command.get(..4) == Some(&install_id(m.inner.inner.dialect).to_le_bytes()[..])
+}
+/// Firmware side of `WMI_VDEV_INSTALL_KEY`: vdev 0, the BSSID peer, a
+/// CCMP-128 (`WMI_CIPHER_AES_CCM` = 4) pairwise (key 0) or group key, zero
+/// RSC/TSC and MIC lengths; TLV wraps the struct in tag 96 and the key in an
+/// ARRAY_BYTE (17) TLV (wmi-tlv.c `ath10k_wmi_tlv_op_gen_vdev_install_key`).
+pub(super) fn install_key(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let tlv = m.inner.inner.dialect == Dialect::Tlv;
+    let c = &bytes[8..];
+    let at = if tlv { 8 } else { 4 };
+    let size = at + 92 + if tlv { 4 } else { 0 } + 16;
+    let word = |o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+    if c.len() != size
+        || tlv && word(4) != (96 << 16) | 92
+        || word(at) != 0
+        || c[at + 4..at + 10] != AP
+        || c[at + 10..at + 12] != [0, 0]
+        || word(at + 12) > 3
+        || word(at + 16) > 1
+        || word(at + 16) == 0 && word(at + 12) != 0
+        || word(at + 20) != 4
+        || c[at + 24..at + 80].iter().any(|b| *b != 0)
+        || word(at + 80) != 16
+        || word(at + 84) != 0
+        || word(at + 88) != 0
+        || tlv && word(at + 92) != (17 << 16) | 16
+    {
+        return Err(BmiError::BadResponse);
+    }
+    let key = (
+        word(at + 16) == 0,
+        word(at + 12) as u8,
+        c[size - 16..].try_into().unwrap(),
+    );
+    m.sent.push(bytes.to_vec());
+    m.inner.inner.rx.push_back((
+        2,
+        vec![
+            2,
+            2,
+            8,
+            0,
+            8,
+            0,
+            0,
+            0,
+            1,
+            4,
+            0,
+            0,
+            2,
+            bytes.len().div_ceil(256) as u8,
+            0,
+            0,
+        ],
+    ));
+    let hw = m.data.as_mut().unwrap().hw.as_mut().unwrap();
+    hw.installs += 1;
+    if hw.hold {
+        hw.hold = false;
+        hw.held = Some(key);
+    } else {
+        apply_install(m, key);
+    }
+    Ok(())
+}
+/// Program a held install and send its indication.
+pub(super) fn release_install(m: &mut RadioModel) {
+    if let Some(key) = m
+        .data
+        .as_mut()
+        .and_then(|d| d.hw.as_mut())
+        .and_then(|h| h.held.take())
+    {
+        apply_install(m, key);
+    }
+}
+fn apply_install(m: &mut RadioModel, key: (bool, u8, [u8; 16])) {
+    let hw = m.data.as_mut().unwrap().hw.as_mut().unwrap();
+    hw.keys.retain(|k| !(k.0 == key.0 && k.1 == key.1));
+    hw.keys.push(key);
+    let peer: u16 = if m.inner.config.pfc { 17 } else { 1800 };
+    // HTT_SECURITY_AES_CCMP (6) | HTT_SECURITY_IS_UNICAST, peer_id, then
+    // michael_key[8] and wapi_rsc[16].
+    let mut b = vec![0x0b, if key.0 { 0x86 } else { 6 }];
+    b.extend_from_slice(&peer.to_le_bytes());
+    b.extend_from_slice(&[0; 24]);
+    m.inner
+        .inner
+        .rx
+        .push_back((m.inner.receive_pipe, header(1, &b)));
 }

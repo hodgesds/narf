@@ -9,6 +9,7 @@ use core::{
     pin::pin,
     task::Poll,
 };
+mod retained_wmi;
 async fn source_wait<T>(
     source: Option<super::firmware_source::Source>,
     operation: impl Future<Output = Result<T, BmiError>>,
@@ -40,6 +41,22 @@ impl From<BmiError> for Error {
     }
 }
 pub(super) trait Hif {
+    /// Metadata opt-in for a physical MSI-backed host-vote owner. A generic
+    /// transport does not gain a new background receive consumer by default.
+    fn runtime_idle_supported(&self) -> bool {
+        false
+    }
+    /// Denial-only permission to defer an idle BAR poll. It grants no RF,
+    /// key or fresh RX-idle authority and defaults to the ordinary full poll.
+    fn runtime_idle(&mut self, _eligible: bool) {}
+    /// Consume a deferred physical poll indication. An idle PM defer is not
+    /// an actual empty native receive prefix and cannot commit publication.
+    fn take_idle_deferred(&mut self) -> bool {
+        false
+    }
+    fn nonblocking_wmi(&self) -> bool {
+        false
+    }
     fn current_sources(&self) -> Option<super::firmware_source::Source> {
         None
     }
@@ -67,6 +84,15 @@ pub(super) trait Hif {
     fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
         Err(BmiError::Unsupported)
     }
+    /// `ath10k_hif_suspend` + bus PM after an acknowledged WOW_ENABLE; the
+    /// generation and its DMA stay live. Models have no bus to quiesce.
+    fn wow_suspend_hif(&mut self) -> Result<(), BmiError> {
+        Ok(())
+    }
+    /// Bus PM resume + `ath10k_hif_resume` before WOW_HOSTWAKEUP.
+    fn wow_resume_hif(&mut self) -> Result<(), BmiError> {
+        Ok(())
+    }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError>;
     async fn receive(&mut self, budget_ms: u64) -> Result<(u8, Vec<u8>), BmiError>;
     /// Optional idle-safe progress. A timeout of an outstanding protocol wait
@@ -76,6 +102,18 @@ pub(super) trait Hif {
     }
 }
 impl Hif for super::boot::PciBoot {
+    fn runtime_idle_supported(&self) -> bool {
+        self.host_idle_supported()
+    }
+    fn runtime_idle(&mut self, eligible: bool) {
+        self.host_idle_hint(eligible);
+    }
+    fn take_idle_deferred(&mut self) -> bool {
+        self.take_host_idle_deferred()
+    }
+    fn nonblocking_wmi(&self) -> bool {
+        true
+    }
     fn current_sources(&self) -> Option<super::firmware_source::Source> {
         super::boot::PciBoot::current_sources(self)
     }
@@ -90,6 +128,12 @@ impl Hif for super::boot::PciBoot {
     }
     fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
         self.hif_poll_now()
+    }
+    fn wow_suspend_hif(&mut self) -> Result<(), BmiError> {
+        self.wow_sleep()
+    }
+    fn wow_resume_hif(&mut self) -> Result<(), BmiError> {
+        self.wow_wake()
     }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
         self.hif_send(pipe, bytes).await
@@ -195,6 +239,10 @@ pub(super) struct Session<T> {
     rx_htt_pipe: u8,
     pending_wire: VecDeque<(u8, Vec<u8>)>,
     payloads: VecDeque<(u8, Vec<u8>)>,
+    idle_deferred: bool,
+    /// `htc.c::ath10k_htc_control_rx_complete` SEND_SUSPEND_COMPLETE
+    /// (`core.c::ath10k_send_suspend_complete`): firmware's WOW_ENABLE ack.
+    suspend_complete: bool,
     started: bool,
     failed: bool,
 }
@@ -221,6 +269,8 @@ impl<T: Hif> Session<T> {
             },
             pending_wire: VecDeque::new(),
             payloads: VecDeque::new(),
+            idle_deferred: false,
+            suspend_complete: false,
             started: false,
             failed: false,
         }
@@ -369,6 +419,16 @@ impl<T: Hif> Session<T> {
     }
     fn accept(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), Error> {
         let packet = packet(bytes)?;
+        if packet.eid == 0 && pipe == 1 && self.started {
+            // Linux handles only SEND_SUSPEND_COMPLETE after READY/CONNECT;
+            // any other unsolicited endpoint-0 message stays fail-stop here.
+            if u16at(&packet.payload, 0)? != super::htc::MessageId::SendSuspendComplete as u16 {
+                return Err(Error::Malformed);
+            }
+            self.credit_reports(&packet)?;
+            self.suspend_complete = true;
+            return Ok(());
+        }
         let endpoint = self.endpoints[packet.eid as usize];
         if endpoint.service == 0
             || packet.eid == 0
@@ -503,6 +563,7 @@ impl<T: Hif> Session<T> {
         Ok(())
     }
     pub fn poll_now(&mut self) -> Result<ReceiveProgress, Error> {
+        self.idle_deferred = false;
         self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);
@@ -515,13 +576,18 @@ impl<T: Hif> Session<T> {
         let wire = match self.pending_wire.pop_front() {
             Some(wire) => Some(wire),
             None => {
-                super::firmware_source::invoke(self.transport.current_sources().as_ref(), || {
-                    self.transport.poll_now()
-                })
-                .map_err(|_| Error::Transport(BmiError::DeviceGone))??
+                let wire = super::firmware_source::invoke(
+                    self.transport.current_sources().as_ref(),
+                    || self.transport.poll_now(),
+                )
+                .map_err(|_| Error::Transport(BmiError::DeviceGone))??;
+                self.idle_deferred = self.transport.take_idle_deferred();
+                wire
             }
         };
-        let progressed = wire.is_some();
+        // Deferred idle work denies a fresh RX prefix. Preserve the existing
+        // Progress/Idle distinction so no key/copy consumer sees fake idle.
+        let progressed = wire.is_some() || self.idle_deferred;
         if let Some((pipe, bytes)) = wire {
             self.accept(pipe, &bytes)?;
         }
@@ -529,12 +595,21 @@ impl<T: Hif> Session<T> {
         self.failed = false;
         Ok((progressed, payload))
     }
+    pub(super) fn take_idle_deferred(&mut self) -> bool {
+        core::mem::take(&mut self.idle_deferred)
+    }
+    /// Clear before WOW_ENABLE; true once the target's HTC suspend-complete
+    /// control message has been received (Linux `ar->target_suspend`).
+    pub(super) fn take_suspend_complete(&mut self) -> bool {
+        core::mem::take(&mut self.suspend_complete)
+    }
     pub async fn poll(&mut self) -> Result<Option<(u8, Vec<u8>)>, Error> {
         self.poll_with_progress().await.map(|(_, payload)| payload)
     }
     /// Credit-only input is progress, even though it carries no payload.
     /// Only an empty nonblocking HIF poll establishes receive quiescence.
     pub async fn poll_with_progress(&mut self) -> Result<ReceiveProgress, Error> {
+        self.idle_deferred = false;
         self.transport.check_current()?;
         if !self.started || self.failed {
             return Err(Error::Failed);

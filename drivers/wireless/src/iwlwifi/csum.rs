@@ -174,6 +174,35 @@ pub fn prepare_tx(eth: &mut [u8], kind: Option<L4CsumKind>) -> Result<u32, &'sta
     Ok(1 << OFFLD_L4_EN | SNAP_WORDS << OFFLD_IP_HDR)
 }
 
+/// Complete the exact already-validated native PARTIAL contract before
+/// host group encryption. Firmware cannot inspect encrypted IP/L4 bytes.
+pub(super) fn complete_prepared(eth: &mut [u8], assist: u32) -> Result<(), &'static str> {
+    if assist == 0 {
+        return Ok(());
+    }
+    if assist != (1 << OFFLD_L4_EN | SNAP_WORDS << OFFLD_IP_HDR) {
+        return Err("GO host crypto checksum assist unsupported");
+    }
+    let layout = layout(eth).ok_or("GO host crypto L3 layout unavailable")?;
+    let kind = match layout.proto {
+        IPPROTO_TCP => L4CsumKind::Tcp,
+        IPPROTO_UDP => L4CsumKind::Udp,
+        _ => return Err("GO host crypto L4 unavailable"),
+    };
+    let field = l4_field(eth, &layout, kind).ok_or("GO host crypto checksum field invalid")?;
+    eth[field..field + 2].fill(0);
+    let sum =
+        layout.pseudo + u32::from(layout.proto) + layout.l4_len as u32 + sum16(&eth[layout.l4..]);
+    let value = !fold(sum);
+    let value = if layout.proto == IPPROTO_UDP && value == 0 {
+        u16::MAX
+    } else {
+        value
+    };
+    eth[field..field + 2].copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
 /// Validate a TX metadata request for this offload contract without
 /// changing the frame. Used before an Ethernet frame is queued.
 pub fn tx_admissible(eth: &[u8], meta: narf_net::TxMeta) -> bool {

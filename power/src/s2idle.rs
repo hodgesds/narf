@@ -85,6 +85,10 @@ use narf_capabilities::{Cap, NoopOp};
 use crate::suspend::{self, SuspendError, SuspendPhase};
 use crate::Power;
 
+#[cfg(all(feature = "wake-test", target_arch = "x86_64"))]
+#[path = "wake_test_latch.rs"]
+pub(crate) mod wake_test_latch;
+
 // ── Support query ───────────────────────────────────────────────────
 
 /// Whether suspend-to-idle is available on this platform.
@@ -225,6 +229,8 @@ pub fn note_wake_event(source: WakeSource) {
 /// Whether a wake event is latched and not yet consumed by a park.
 pub fn wake_event_pending() -> bool {
     WAKE_LATCH.load(Ordering::Acquire)
+        || crate::pci_wake::wake_event_pending()
+        || narf_interrupts::wake::wakeup_pending()
 }
 
 /// The most recent source passed to [`note_wake_event`], if any.
@@ -259,16 +265,17 @@ pub fn last_wake_source() -> Option<WakeSource> {
 /// guess; the park then relies on the latch alone, which a test or
 /// a future non-ACPI source can still set.
 pub fn wake_irq_allowlist() -> Vec<u8> {
+    // Driver lines armed with `enable_irq_wake` (Linux keeps
+    // `IRQD_WAKEUP_ARMED` lines enabled across `suspend_device_irqs`).
+    #[allow(unused_mut)]
+    let mut v = narf_interrupts::wake::armed_vectors();
     #[cfg(target_arch = "x86_64")]
-    {
-        let mut v = Vec::new();
-        if let Some(vector) = narf_acpi::sci_vector() {
+    if let Some(vector) = narf_acpi::sci_vector() {
+        if !v.contains(&vector) {
             v.push(vector);
         }
-        v
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    Vec::new()
+    v
 }
 
 // ── Park statistics ─────────────────────────────────────────────────
@@ -393,7 +400,9 @@ pub async fn suspend_to_idle_async(
     cap.invoke(NoopOp)?;
     suspend::claim_suspend_transition()?;
 
-    let transition = crate::system_pm::prepare_async_system_pm().await;
+    let transition =
+        crate::system_pm::prepare_async_system_pm_for(crate::system_pm::SystemSleepState::S0Idle)
+            .await;
     if !transition.succeeded() {
         // Same rollback contract as suspend_async: the failing hook
         // unwinds its predecessors; no device has been quiesced yet.
@@ -498,12 +507,17 @@ fn s2idle_after_claim(
     // deliberate, not racy tidiness: the event that *requested*
     // this sleep (a sleep-button press routed through the policy
     // service) must not instantly end it, and ACPI wake sources
-    // stay asserted in the PM status registers until serviced, so
-    // a still-pending physical event re-latches from its handler
-    // once the park begins.
+    // stay asserted in the PM status registers until serviced. A leased
+    // device GPE already serviced by the SCI instead stays in the power
+    // wake owner's retained evidence, which wake_event_pending also checks
+    // until terminal route cleanup; this clear cannot erase that event.
     WAKE_LATCH.store(false, Ordering::Release);
+    // Armed driver lines latch a wakeup only inside this window
+    // (Linux `suspend_device_irqs` .. `resume_device_irqs`).
+    narf_interrupts::wake::set_suspend_window(true);
     STAT_PARKS.fetch_add(1, Ordering::Relaxed);
     let exit = park(max_halts);
+    narf_interrupts::wake::set_suspend_window(false);
     STAT_LAST_EXIT.store(exit as u8, Ordering::Release);
     if exit == ParkExit::WakeEvent {
         STAT_WAKES.fetch_add(1, Ordering::Relaxed);

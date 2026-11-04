@@ -196,7 +196,15 @@ pub struct IvrsIommu {
 pub unsafe fn parse_ivrs(rsdp_phys: PhysAddr) -> Result<u32, AcpiError>;
 pub fn is_ivrs_known() -> bool;
 pub fn copy_ivrs_iommus(out: &mut [IvrsIommu]) -> usize;
+/// Heap copy of the checksum-verified IVRS (SDT header included), kept by
+/// `parse_ivrs` so `narf_io::amd_vi::ivrs::parse` can walk IVHD device
+/// entries and IVMD blocks after firmware tables may be reclaimed.
+pub fn ivrs_table_copy() -> Option<Vec<u8>>;
 ```
+
+`copy_ivrs_iommus` counts every IVHD block of type 10h / 11h / 40h, so a
+unit the firmware describes twice (10h + 40h) is counted twice; the
+AMD-Vi backend uses Linux `get_highest_supported_ivhd_type` instead.
 
 ## 5. SPCR
 
@@ -265,8 +273,9 @@ hardware-specific.
 - IORT named-component / root-complex devices.
 - DMAR RMRR / ATSR / RHSA / ANDD remap-structure types beyond
   DRHD enumeration.
-- IVRS device-entry parsing (we expose IOMMU base + segment;
-  device-entry walking lands when AMD-Vi bring-up does).
+- IVRS device-entry parsing in this crate (we expose IOMMU base +
+  segment and the raw table copy; IVHD device entries / IVMD are decoded
+  by `narf_io::amd_vi::ivrs`, see `io/specification/spec.md` §3).
 - PPTT identical-implementation flag → cluster grouping (we
   emit per-CPU + per-cache entries; cluster derivation lives
   in `arch::aarch64::topology` follow-ups).

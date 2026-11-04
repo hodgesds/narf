@@ -29,6 +29,7 @@ pub mod ac_adapter;
 pub mod battery;
 pub mod buttons;
 pub mod fan;
+pub mod gpe_wake;
 pub mod ioapic;
 pub mod lid;
 pub mod smbios;
@@ -1556,6 +1557,13 @@ pub struct GpeBlockInfo {
     pub byte_count: u8,
     /// First GPE number this block handles (0 for GPE0, GPE1_BASE for GPE1).
     pub base_gsi: u32,
+    /// GAS address-space ID: 1=System I/O, 0=System Memory. Legacy FADT
+    /// blocks use 1. Unsupported spaces must never become truncated ports.
+    pub address_space: u8,
+    /// GAS bit offset; byte-register access requires zero.
+    pub bit_offset: u8,
+    /// GAS access-size encoding: zero=unspecified, one=byte.
+    pub access_size: u8,
 }
 
 static GPE0_BLOCK: IrqSafeSpinLock<Option<GpeBlockInfo>> = IrqSafeSpinLock::new(None);
@@ -1607,61 +1615,31 @@ pub unsafe fn parse_gpe_blocks(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     let gpe1_len = body[93];
     let gpe1_base = body[95] as u32;
 
-    // ── extended GAS fields (ACPI 2.0+, FADT total ≥ 232+12=244) ───
-    // X_GPE0_BLK is at offset 220, X_GPE1_BLK at 232. Each is 12 bytes.
-    let (x_gpe0_addr, x_gpe1_addr) = if total >= 244 {
-        // GAS address is at byte offset 4 within the 12-byte GAS struct.
-        let x0 = u64::from_le_bytes([
-            body[220 + 4],
-            body[220 + 5],
-            body[220 + 6],
-            body[220 + 7],
-            body[220 + 8],
-            body[220 + 9],
-            body[220 + 10],
-            body[220 + 11],
-        ]);
-        let x1 = u64::from_le_bytes([
-            body[232 + 4],
-            body[232 + 5],
-            body[232 + 6],
-            body[232 + 7],
-            body[232 + 8],
-            body[232 + 9],
-            body[232 + 10],
-            body[232 + 11],
-        ]);
-        (x0, x1)
-    } else {
-        (0, 0)
+    // Retain the GAS geometry, including unsupported address spaces. A
+    // nonzero extended GAS overrides the legacy block, but never silently
+    // becomes a truncated x86 port if firmware declares System Memory.
+    let descriptor = |offset: usize, legacy: u64, byte_count: u8, base_gsi: u32| {
+        let mut block = GpeBlockInfo {
+            address: legacy,
+            byte_count,
+            base_gsi,
+            address_space: 1,
+            bit_offset: 0,
+            access_size: 1,
+        };
+        if total >= offset + 12 {
+            let address = u64::from_le_bytes(body[offset + 4..offset + 12].try_into().unwrap());
+            if address != 0 {
+                block.address = address;
+                block.address_space = body[offset];
+                block.bit_offset = body[offset + 2];
+                block.access_size = body[offset + 3];
+            }
+        }
+        (block.address != 0 && byte_count != 0).then_some(block)
     };
-
-    // ── choose best address ──────────────────────────────────────────
-    let gpe0_addr = if x_gpe0_addr != 0 {
-        x_gpe0_addr
-    } else {
-        legacy_gpe0_addr
-    };
-    let gpe1_addr = if x_gpe1_addr != 0 {
-        x_gpe1_addr
-    } else {
-        legacy_gpe1_addr
-    };
-
-    if gpe0_addr != 0 && gpe0_len != 0 {
-        *GPE0_BLOCK.lock() = Some(GpeBlockInfo {
-            address: gpe0_addr,
-            byte_count: gpe0_len,
-            base_gsi: 0,
-        });
-    }
-    if gpe1_addr != 0 && gpe1_len != 0 {
-        *GPE1_BLOCK.lock() = Some(GpeBlockInfo {
-            address: gpe1_addr,
-            byte_count: gpe1_len,
-            base_gsi: gpe1_base,
-        });
-    }
+    *GPE0_BLOCK.lock() = descriptor(220, legacy_gpe0_addr, gpe0_len, 0);
+    *GPE1_BLOCK.lock() = descriptor(232, legacy_gpe1_addr, gpe1_len, gpe1_base);
 
     Ok(())
 }
@@ -1679,46 +1657,22 @@ pub fn gpe1_block() -> Option<GpeBlockInfo> {
 /// Enable a GPE by number. Correctly identifies the block and
 /// offset within the enable register set.
 pub fn enable_gpe(gpe_num: u32) {
-    let (block, bit) = if let Some(b) = gpe0_block() {
-        if gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4) {
-            (Some(b), gpe_num - b.base_gsi)
-        } else {
-            (None, 0)
-        }
-    } else {
-        (None, 0)
-    };
-    let (block, bit) = if block.is_none() {
-        if let Some(b) = gpe1_block() {
-            if gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4) {
-                (Some(b), gpe_num - b.base_gsi)
-            } else {
-                (None, 0)
-            }
-        } else {
-            (block, bit)
-        }
-    } else {
-        (block, bit)
-    };
+    gpe_wake::enable_runtime(gpe_num);
+}
 
-    if let Some(b) = block {
-        // GPE enable is an x86 port-I/O write; a no-op on other arches.
-        #[cfg(target_arch = "x86_64")]
-        {
-            let half = b.byte_count as u64 / 2;
-            let reg_idx = bit / 8;
-            let reg_bit = bit % 8;
-            let port = b.address + half + reg_idx as u64;
-            // SAFETY: part of the validated GPE block.
-            unsafe {
-                let val = narf_arch::x86_64::io_port::inb(port as u16);
-                narf_arch::x86_64::io_port::outb(port as u16, val | (1 << reg_bit));
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = (&b, bit);
-    }
+/// Whether byte port-I/O access describes this entire FADT block. MMIO,
+/// reserved GAS encodings, odd-length pairs and wrapping ports are refused.
+fn gpe_byte_ports_valid(block: GpeBlockInfo) -> bool {
+    block.address_space == 1
+        && block.bit_offset == 0
+        && matches!(block.access_size, 0 | 1)
+        && block.byte_count != 0
+        && block.byte_count % 2 == 0
+        && block.address != 0
+        && block
+            .address
+            .checked_add(u64::from(block.byte_count))
+            .is_some_and(|end| end <= 0x1_0000)
 }
 
 // ── FADT power-management fields (SCI_INT, PM1, SMI_CMD) ───────────
@@ -2158,12 +2112,15 @@ pub fn acpi_enable() {
 /// block is the lower half, enable the upper).
 #[cfg(target_arch = "x86_64")]
 pub fn gpe_block_status(b: GpeBlockInfo) -> alloc::vec::Vec<u8> {
+    if !gpe_byte_ports_valid(b) {
+        return alloc::vec::Vec::new();
+    }
     let half = (b.byte_count / 2) as usize;
     let mut out = alloc::vec![0u8; half];
     for (i, slot) in out.iter_mut().enumerate() {
         let port = (b.address + i as u64) as u16;
         // SAFETY: GPE block address from a checksummed FADT.
-        *slot = unsafe { narf_arch::x86_64::io_port::inb(port) };
+        *slot = unsafe { gpe_wake::read_port(port) };
     }
     out
 }
@@ -2177,13 +2134,16 @@ pub fn gpe_block_status(b: GpeBlockInfo) -> alloc::vec::Vec<u8> {
 /// allocator is not available there.
 #[cfg(target_arch = "x86_64")]
 pub fn gpe_block_status_irq(b: GpeBlockInfo) -> ([u8; 32], usize) {
+    if !gpe_byte_ports_valid(b) {
+        return ([0; 32], 0);
+    }
     let half = (b.byte_count / 2) as usize;
     let count = half.min(32);
     let mut buf = [0u8; 32];
     for (i, slot) in buf.iter_mut().enumerate().take(count) {
         let port = (b.address + i as u64) as u16;
         // SAFETY: GPE block address from a checksummed FADT.
-        *slot = unsafe { narf_arch::x86_64::io_port::inb(port) };
+        *slot = unsafe { gpe_wake::read_port(port) };
     }
     (buf, count)
 }
@@ -2199,7 +2159,7 @@ pub fn gpe_status_clear_bit(gpe_num: u32) {
                 gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4)
             })
         });
-    if let Some(b) = block {
+    if let Some(b) = block.filter(|b| gpe_byte_ports_valid(*b)) {
         let bit = gpe_num - b.base_gsi;
         let reg_idx = bit / 8;
         let reg_bit = bit % 8;
@@ -2207,7 +2167,7 @@ pub fn gpe_status_clear_bit(gpe_num: u32) {
         // SAFETY: GPE block address from a checksummed FADT. W1C
         // means writing other bits as 0 leaves them untouched.
         // SAFETY: Valid memory or trusted environment
-        unsafe { narf_arch::x86_64::io_port::outb(port, 1 << reg_bit) };
+        unsafe { gpe_wake::write_port(port, 1 << reg_bit) };
     }
 }
 
@@ -3059,8 +3019,19 @@ pub unsafe fn parse_ivrs(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
         return Err(AcpiError::BadTableChecksum);
     }
     let n = parse_ivrs_body(body);
+    *IVRS_COPY.lock() = Some(body.to_vec());
     IVRS_PARSED.store(true, Ordering::Release);
     Ok(n)
+}
+
+/// Heap copy of the checksum-verified IVRS (SDT header included), kept so
+/// the AMD-Vi backend (`narf_io::amd_vi::ivrs`) can decode IVHD device
+/// entries and IVMD blocks after firmware memory may have been reclaimed.
+static IVRS_COPY: IrqSafeSpinLock<Option<alloc::vec::Vec<u8>>> = IrqSafeSpinLock::new(None);
+
+/// The IVRS bytes [`parse_ivrs`] verified, if it succeeded.
+pub fn ivrs_table_copy() -> Option<alloc::vec::Vec<u8>> {
+    IVRS_COPY.lock().clone()
 }
 
 pub fn is_ivrs_known() -> bool {

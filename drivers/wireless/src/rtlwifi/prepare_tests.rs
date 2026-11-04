@@ -81,6 +81,16 @@ impl Io for Port {
     fn write_bytes(&self, _: u16, _: &[u8]) -> Result<(), AccessError> {
         unreachable!()
     }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError> {
+        let mut m = self.0.lock();
+        access(&mut m)?;
+        m.trace.push((16, reg, u32::from(value)));
+        let at = usize::from(reg);
+        if m.ignore != Some(reg) {
+            m.regs[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
+    }
     async fn delay_us(&self, _: u64) {
         let pending = self.0.lock().pending;
         if pending {
@@ -161,7 +171,7 @@ pub(crate) fn smoke_rtl8188ee_distinct_linked_rings_and_rx_storage_before_public
         let receive = owner.receive.as_ref().unwrap();
         for slot in 0..depth {
             let end = if slot == depth - 1 { 1 << 30 } else { 0 };
-            if word(receive, slot * 32) != 4096 | end | (1 << 31)
+            if word(receive, slot * 32) != 9100 | end | (1 << 31)
                 || word(receive, slot * 32 + 24) != owner.buffers[slot].address as u32
                 || word(receive, slot * 32 + 28) != 0
             {
@@ -512,4 +522,221 @@ fn smoke_rtl8188ee_drive_scheduled_retries_and_terminates() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_drive_scheduled_retries_and_terminates
+);
+
+/// RTL8821AE profile of the same retained owner: next descriptor at dword 12
+/// (`rtl8821ae/trx.h`), the 8821AE LLT (`_rtl8821ae_llt_table_init`) and the
+/// shared `REG_*_DESA` publication; radio qualification stays EE-only.
+pub(crate) fn smoke_rtl8821ae_retained_rings_dw12_and_exact_llt() -> TestResult {
+    let port = Port::new();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut address = 0x10000;
+    let mut owner = Prepared::allocate_for(Chip::Rtl8821ae, port.clone(), 4, |bytes| {
+        address = (address + 255) & !255;
+        let block = Block {
+            address,
+            bytes: vec![0xa5; bytes],
+            drops: drops.clone(),
+        };
+        address += bytes as u64;
+        Ok(block)
+    })
+    .unwrap();
+    for ring in &owner.tx {
+        let base = ring.address as u32;
+        for slot in 0..4 {
+            if word(ring, slot * 64 + 48) != base + (((slot + 1) % 4) * 64) as u32
+                || word(ring, slot * 64 + 40) != 0
+            {
+                return TestResult::Fail("8821AE next-descriptor dword / cleared buffer dword");
+            }
+        }
+    }
+    if owner.chip() != Chip::Rtl8821ae
+        || Chip::from_device(0x8821) != Some(Chip::Rtl8821ae)
+        || Chip::from_device(0x8178) != Some(Chip::Rtl8192ce)
+    {
+        return TestResult::Fail("8821AE ring profile selection");
+    }
+    narf_scheduler::block_on(owner.prepare()).unwrap();
+    let m = port.0.lock();
+    let llt: Vec<_> = m.trace.iter().filter(|row| row.1 == 0x1e0).collect();
+    if llt.len() != 256
+        || *llt[0] != (32, 0x1e0, 0x4000_0001)
+        || *llt[0xf6] != (32, 0x1e0, 0x4000_f6ff)
+        || *llt[255] != (32, 0x1e0, 0x4000_fff7)
+        || !m.trace.contains(&(8, 0x114, 0xf7))
+        || !m.trace.contains(&(16, 0x116, 0x3e7f))
+        || !m.trace.contains(&(32, 0x200, 0x80e6_0808))
+        || m.trace.contains(&(32, 0x200, 0x8073_0d29))
+        || !m.trace.contains(&(8, 0x214, 0))
+    {
+        return TestResult::Fail("8821AE LLT/RQPN trace differs from Linux");
+    }
+    for (at, ring) in LINUX_TX_BASES.iter().zip(&owner.tx) {
+        if !m.trace.contains(&(32, *at, ring.address as u32)) {
+            return TestResult::Fail("8821AE queue base not published");
+        }
+    }
+    if m.regs[0x301] != 255 || m.regs[0x100] & 0xcf != 0 || owner.phase() != Phase::Prepared {
+        return TestResult::Fail("8821AE preparation opened DMA gates");
+    }
+    drop(m);
+    let profile_gate = narf_scheduler::block_on(
+        owner.configure_radio(super::super::radio::Profile::gate_fixture()),
+    );
+    if profile_gate != Err(Error::State) || owner.phase() != Phase::Prepared {
+        return TestResult::Fail("EE radio tables qualified an 8821AE owner");
+    }
+    drop(owner);
+    if drops.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("published 8821AE rings freed without quiescence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8821ae_retained_rings_dw12_and_exact_llt
+);
+
+/// RTL8723BE profile of the retained owner: next link at byte 48
+/// (`rtl8723be/trx.h`), the `_rtl8723be_init_mac` pre-CR / `REG_CR = 0xff`
+/// / clock segment before the gates are closed again, `_rtl8723be_llt_table_init`
+/// (boundary 245) and the shared `REG_*_DESA` publication behind the 0x301
+/// DMA stop. No radio, packet or station path qualifies the owner.
+pub(crate) fn smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt() -> TestResult {
+    let port = Port::new();
+    port.0.lock().regs[0xf3] = 1; // REG_SYS_CFG[24]: the 0x7c[6] branch
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut address = 0x10000;
+    let mut owner = Prepared::allocate_for(Chip::Rtl8723be, port.clone(), 4, |bytes| {
+        address = (address + 255) & !255;
+        let block = Block {
+            address,
+            bytes: vec![0xa5; bytes],
+            drops: drops.clone(),
+        };
+        address += bytes as u64;
+        Ok(block)
+    })
+    .unwrap();
+    for ring in &owner.tx {
+        let base = ring.address as u32;
+        for slot in 0..4 {
+            if word(ring, slot * 64 + 48) != base + (((slot + 1) % 4) * 64) as u32
+                || word(ring, slot * 64 + 40) != 0
+            {
+                return TestResult::Fail("8723BE next link at byte 48 / cleared buffer dword");
+            }
+        }
+    }
+    if Chip::from_device(0xb723) != Some(Chip::Rtl8723be)
+        || Chip::from_device(0x8723).is_some()
+        || Chip::Rtl8723be.next_desc_offset() != Some(48)
+    {
+        return TestResult::Fail("8723BE ring profile selection (8723AE excluded)");
+    }
+    // `rtl_pci_start` → `btc_init_variables` precedes `hw_init`; an unbound
+    // owner refuses before the 0x301 stop's successor writes.
+    {
+        use super::super::btcoex::btc::{ChipInterface, ChipType, HwPg};
+        let pg = HwPg {
+            bt_exist: true,
+            ant_num: 2,
+            single_ant_path: 0,
+            chip_type: ChipType::Rtl8723b,
+            package_type: 0,
+            rfe_type: 0,
+            interface: ChipInterface::Pci,
+        };
+        let unbound_port = Port::new();
+        let mut at = 0x80_0000u64;
+        let mut unbound = Prepared::allocate_for(Chip::Rtl8723be, unbound_port, 4, |bytes| {
+            at = (at + 255) & !255;
+            let block = Block {
+                address: at,
+                bytes: vec![0; bytes],
+                drops: Arc::new(AtomicUsize::new(0)),
+            };
+            at += bytes as u64;
+            Ok(block)
+        })
+        .unwrap();
+        if narf_scheduler::block_on(unbound.prepare()) != Err(Error::State) {
+            return TestResult::Fail("8723BE prepared without its coexistence owner");
+        }
+        drop(unbound);
+        if owner.bind_rtl8723be_coex(pg).is_err() || owner.bind_rtl8723be_coex(pg).is_ok() {
+            return TestResult::Fail("8723BE coexistence bind");
+        }
+    }
+    narf_scheduler::block_on(owner.prepare()).unwrap();
+    let m = port.0.lock();
+    // `ex_btc8723b2ant_power_on_setting` between the enable flow and
+    // `REG_MULTI_FUNC_CTRL |= BIT(3)` (`hw.c:827`).
+    let coex_on = m.trace.iter().position(|r| *r == (8, 0x67, 0x20));
+    let func_at = m.trace.iter().position(|r| *r == (8, 0x68, 0x08));
+    if !matches!((coex_on, func_at), (Some(c), Some(f)) if c < f)
+        || !m.trace.contains(&(32, 0x948, 0))
+    {
+        return TestResult::Fail("8723BE btc_power_on_setting not at hw.c:827");
+    }
+    let at = |row: (u8, u16, u32)| m.trace.iter().position(|r| *r == row);
+    let (Some(stop), Some(func), Some(open), Some(hwseq), Some(clkr), Some(close)) = (
+        at((8, 0x301, 0xff)),
+        at((8, 0x68, 0x08)),
+        at((8, 0x100, 0xff)),
+        at((8, 0x423, 0x7f)),
+        at((8, 0x08, 0x08)),
+        at((8, 0x100, 0x30)),
+    ) else {
+        return TestResult::Fail("8723BE init_mac prefix rows missing");
+    };
+    if !(stop < func && func < open && open < hwseq && hwseq < clkr && clkr < close)
+        || at((8, 0x04, 0x10)).is_none_or(|aps| aps < func || aps > open)
+        || at((8, 0x7c, 0x40)).is_none()
+    {
+        return TestResult::Fail("8723BE init_mac prefix order differs from Linux");
+    }
+    let llt: Vec<_> = m.trace.iter().filter(|row| row.1 == 0x1e0).collect();
+    if llt.len() != 256
+        || *llt[0] != (32, 0x1e0, 0x4000_0001)
+        || *llt[244] != (32, 0x1e0, 0x4000_f4ff)
+        || *llt[255] != (32, 0x1e0, 0x4000_fff5)
+        || at((32, 0x114, 0x27ff_00f5)).is_none_or(|b| b < close)
+        || at((32, 0x200, 0x80e4_0808)).is_none()
+        || at((8, 0x214, 0)).is_none()
+        || at((32, 0x200, 0x8073_0d29)).is_some()
+    {
+        return TestResult::Fail("8723BE LLT/RQPN trace differs from Linux");
+    }
+    for (row, ring) in LINUX_TX_BASES.iter().zip(&owner.tx) {
+        if !m.trace.contains(&(32, *row, ring.address as u32)) {
+            return TestResult::Fail("8723BE queue base not published");
+        }
+    }
+    if m.regs[0x301] != 255
+        || m.regs[0x100] & 0xcf != 0
+        || m.regs[0xb0..0xb4] != [0; 4]
+        || m.regs[0xb8..0xbc] != [0; 4]
+        || owner.phase() != Phase::Prepared
+    {
+        return TestResult::Fail("8723BE preparation opened DMA/IRQ gates");
+    }
+    drop(m);
+    let profile_gate = narf_scheduler::block_on(
+        owner.configure_radio(super::super::radio::Profile::gate_fixture()),
+    );
+    if profile_gate != Err(Error::State) || owner.phase() != Phase::Prepared {
+        return TestResult::Fail("EE radio tables qualified an 8723BE owner");
+    }
+    drop(owner);
+    if drops.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("published 8723BE rings freed without quiescence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt
 );

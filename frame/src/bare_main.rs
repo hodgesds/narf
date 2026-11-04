@@ -4604,6 +4604,37 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     last_stage.name()
                 );
             }
+            // IOMMU probe before any initcall probes a driver, so no device
+            // holds a physical DMA address yet and the `iommu.passthrough=0`
+            // opt-in can enter PerDomain (narf_io::iommu::init docs). Without
+            // the switch this only reads capabilities and selects Identity,
+            // exactly as the former post-stage call did. ACPI IVRS/DMAR were
+            // parsed above; an uncalibrated TSC only shortens the AMD-Vi
+            // completion timeout (cycles_to_ns is identity until calibration).
+            // Failure is non-fatal — alloc_coherent + the IommuContext::map
+            // fallback still hand out identity-equivalent addresses.
+            match narf_io::iommu::init() {
+                Ok(mode) => {
+                    let caps = narf_io::iommu::caps();
+                    let _ = writeln!(
+                        console::Writer,
+                        "  iommu: {} initialised in {:?} mode ({} unit(s), max_iova_bits {}, IR {}, opt-in {:?})",
+                        narf_io::iommu::vendor(),
+                        mode,
+                        narf_io::iommu::unit_count(),
+                        caps.max_iova_bits,
+                        if caps.interrupt_remap { "supported" } else { "absent" },
+                        narf_io::iommu::per_domain_opt_in(),
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  iommu: init skipped ({:?}) — drivers use identity-equivalence",
+                        e
+                    );
+                }
+            }
             // Run stages one at a time.
             for s in narf_init::Stage::ALL {
                 if (s as u8) > (last_stage as u8) {
@@ -5183,37 +5214,9 @@ fn run_async_demo() -> ! {
         }
     }
 
-    // IOMMU probe + identity-map enable. Drivers doing DMA
-    // benefit from a known-good translation path (no SMMU faults
-    // on virtualized hosts; future per-driver isolation slots
-    // in here). Failure is non-fatal — alloc_coherent + the
-    // IommuContext::map fallback still hand out identity-
-    // equivalent addresses, so drivers see the same behaviour
-    // they did before the IOMMU work landed.
-    {
-        match narf_io::iommu::init() {
-            Ok(mode) => {
-                let caps = narf_io::iommu::caps();
-                let _ =
-                    writeln!(
-                    console::Writer,
-                    "  iommu: {} initialised in {:?} mode ({} unit(s), max_iova_bits {}, IR {})",
-                    narf_io::iommu::vendor(),
-                    mode,
-                    narf_io::iommu::unit_count(),
-                    caps.max_iova_bits,
-                    if caps.interrupt_remap { "supported" } else { "absent" },
-                );
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    console::Writer,
-                    "  iommu: init skipped ({:?}) — drivers use identity-equivalence",
-                    e
-                );
-            }
-        }
-    }
+    // IOMMU init moved before the initcall stages (see "IOMMU probe
+    // before any initcall" above) so no driver holds a physical DMA
+    // address when the `iommu.passthrough=0` opt-in is evaluated.
 
     // NOTE: do NOT call narf_scheduler::init() here. It already
     // ran before AP bring-up (line ~1247) and the queues survive.

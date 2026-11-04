@@ -51,8 +51,15 @@ pub struct ReservedRegion {
     pub reusable: bool,
 }
 
+pub mod dma;
+pub mod nvmem;
 pub mod pci;
 mod tests;
+pub use dma::{
+    default_shared_dma_pool, node_dma_coherence, pci_function_dma_pool,
+    pci_host_bridge_dma_coherence, shared_dma_pool, DmaCoherenceProp, SharedDmaPool,
+};
+pub use nvmem::{rmem_cell, NvmemError, RmemCell};
 pub use pci::{for_pci_function, memory_region_phandle, reserved_memory_region};
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {

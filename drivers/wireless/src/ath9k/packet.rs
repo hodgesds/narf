@@ -62,6 +62,8 @@ pub(super) enum Error {
     Timeout,
 }
 
+#[path = "packet/periodic.rs"]
+mod periodic_owner;
 #[cfg(feature = "kernel-test")]
 #[path = "packet/tests.rs"]
 pub(super) mod tests;
@@ -73,6 +75,80 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Port {
+    /// MAC clock of the prepared chip (`ath9k_hw_set_clockrate`).
+    fn mac_clock(&self) -> super::mac::Clock {
+        super::mac::Clock::Ofdm2g
+    }
+    /// Factory `txMask` used for `set11nChainSel`; single-chain by default.
+    fn tx_chainmask(&self) -> u8 {
+        1
+    }
+    /// One AR9287 long-calibration step (`ar9287_hw_olc_temp_compensation`)
+    /// under the current physical source; other profiles have none.
+    fn long_calibration(&self) -> Result<Option<i32>, Error> {
+        Err(Error::State)
+    }
+    /// Actual fresh calibrated physical owner. RXD has no channel field.
+    fn frequency_mhz(&self) -> u16 {
+        2412
+    }
+    /// `channels::bit` mask of the primaries this owner may retune to.
+    fn channel_mask(&self) -> u64 {
+        1
+    }
+    fn geometry(&self) -> super::channel_width::Geometry {
+        super::channel_width::Geometry::from_frequency_dual(self.frequency_mhz())
+            .expect("prepared physical primary")
+    }
+    fn periodic_grant(&self) -> Option<alloc::sync::Arc<super::periodic::Grant>> {
+        None
+    }
+    fn bind_periodic(
+        &self,
+        _source: &alloc::sync::Arc<super::periodic::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn periodic_initial(
+        &self,
+    ) -> Result<
+        (
+            super::calibration::Report,
+            Option<super::calibration::wide::WideReport>,
+        ),
+        Error,
+    > {
+        Err(Error::State)
+    }
+    fn periodic_read(&self, _register: u64) -> Result<u32, Error> {
+        Err(Error::State)
+    }
+    fn periodic_write(&self, _register: u64, _value: u32) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn periodic_install(&self, _live: super::periodic::Live) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn periodic_failed(&self) {}
+    /// True only after actual current P/native dynamic receipt validation.
+    /// Default profiles retain exact original initial coefficient checks.
+    fn periodic_current(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
+        None
+    }
+    /// Actual bound/current S1 program, not an advertised desired setting.
+    /// Qualified ISR kill/resume may hold IER0 or1; ordinary HT stays IER0.
+    fn station_ps_current(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn bind_ps(&self, _grant: &alloc::sync::Arc<super::ps::Grant>) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn network_sleep(&self) -> Result<(), Error> {
+        Err(Error::State)
+    }
     fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         None
     }
@@ -205,6 +281,7 @@ struct Storage {
     rx: Memory,
     tx_bytes: Vec<Memory>,
     rx_bytes: Vec<Memory>,
+    retired_tx: Option<Memory>,
 }
 impl Storage {
     fn allocate(port: &impl Port) -> Result<Self, Error> {
@@ -237,7 +314,54 @@ impl Storage {
             rx: blocks.next().ok_or(Error::Memory)?,
             tx_bytes: blocks.by_ref().take(TX_DEPTH).collect(),
             rx_bytes: blocks.collect(),
+            retired_tx: None,
         })
+    }
+    /// Grow only under a current v4 source and a completely idle TX owner.
+    /// Retain the old QTXDP-reachable ring until the final full DMA proof.
+    fn expand(&mut self, port: &impl Port, depth: usize) -> Result<(), Error> {
+        if depth <= self.tx_bytes.len() {
+            return Ok(());
+        }
+        if depth > super::tx_ba::MAX_MEMBERS || self.retired_tx.is_some() {
+            return Err(Error::State);
+        }
+        let mut fresh: Vec<Memory> = Vec::new();
+        for length in core::iter::once(depth * STRIDE).chain(core::iter::repeat_n(
+            descriptor::MAX_MPDU + 2,
+            depth - self.tx_bytes.len(),
+        )) {
+            let buffer = port.allocate(length)?;
+            let address = buffer.dma_addr().raw();
+            if buffer.len() < length
+                || address == 0
+                || address & 127 != 0
+                || address
+                    .checked_add(buffer.len() as u64 - 1)
+                    .is_none_or(|end| end > u64::from(u32::MAX))
+                || core::iter::once(&self.tx)
+                    .chain(core::iter::once(&self.rx))
+                    .chain(self.tx_bytes.iter())
+                    .chain(self.rx_bytes.iter())
+                    .chain(fresh.iter())
+                    .any(|old| {
+                        address < u64::from(old.address()) + old.0.len() as u64
+                            && u64::from(old.address()) < address + buffer.len() as u64
+                    })
+            {
+                return Err(Error::Address);
+            }
+            fresh.push(Memory(buffer));
+        }
+        let mut fresh = fresh.into_iter();
+        let ring = fresh.next().ok_or(Error::Memory)?;
+        for slot in 0..depth {
+            ring.put_words(slot, &[0; WORDS])?;
+        }
+        ring.sync();
+        self.retired_tx = Some(core::mem::replace(&mut self.tx, ring));
+        self.tx_bytes.extend(fresh);
+        Ok(())
     }
 }
 struct Pending {
@@ -252,18 +376,18 @@ struct Pending {
     queue: u64,
 }
 struct PairPending {
-    slots: [usize; 2],
+    slots: Vec<usize>,
     id: u64,
-    words: [[u32; WORDS]; 2],
-    originals: [Vec<u8>; 2],
-    dma: [Vec<u8>; 2],
-    seq: [u16; 2],
+    words: Vec<[u32; WORDS]>,
+    originals: Vec<Vec<u8>>,
+    dma: Vec<Vec<u8>>,
+    seq: Vec<u16>,
     deadline: u64,
 }
 pub(super) struct PairDelivery {
     pub id: u64,
-    pub originals: [Vec<u8>; 2],
-    pub acked: [bool; 2],
+    pub originals: Vec<Vec<u8>>,
+    pub acked: Vec<bool>,
     pub feedback: super::rates::Feedback,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -299,8 +423,12 @@ pub(super) struct Packet<P: Port> {
     ba: bool,
     tx_ba: bool,
     reclaimed: bool,
+    ps: Option<alloc::sync::Arc<super::ps::Grant>>,
+    ps_irq_created: bool,
     irq: Option<super::irq::Mask>,
     full_imr: u32,
+    periodic: Option<super::periodic::Owner>,
+    periodic_checked: bool,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -324,6 +452,10 @@ impl<P: Port> Packet<P> {
     /// BME, RX, all TX queues and IRQ delivery remained off. No inherited DMA
     /// may refer to these fresh mappings. No other actor can start the engines.
     pub(super) unsafe fn prepare(port: P, local: [u8; 6]) -> Result<Self, Error> {
+        let frequency = port.frequency_mhz();
+        if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+            return Err(Error::Packet);
+        }
         if local[0] & 1 != 0 || local == [0; 6] {
             return Err(Error::Packet);
         }
@@ -378,8 +510,12 @@ impl<P: Port> Packet<P> {
             ba: false,
             tx_ba: false,
             reclaimed: false,
+            ps: None,
+            ps_irq_created: false,
             irq: None,
             full_imr: 0,
+            periodic: None,
+            periodic_checked: false,
         })
     }
     pub(super) fn phase(&self) -> Phase {
@@ -389,6 +525,9 @@ impl<P: Port> Packet<P> {
     /// with bus mastering off and released the packet allocations.
     pub(super) fn reclaimed(&self) -> bool {
         self.reclaimed
+    }
+    pub(super) fn idle_admissible(&self) -> bool {
+        self.phase == Phase::Running && self.pending.is_none() && self.pair.is_none()
     }
     pub(super) fn check_transmit(&self) -> Result<(), Error> {
         self.port.transmit_allowed()?;
@@ -428,11 +567,142 @@ impl<P: Port> Packet<P> {
         }
         self.port.access(self.phase != Phase::Prepared, || Ok(()))
     }
+    pub(super) fn geometry(&self) -> super::channel_width::Geometry {
+        self.port.geometry()
+    }
+    pub(super) fn frequency_mhz(&self) -> u16 {
+        self.port.frequency_mhz()
+    }
+    pub(super) fn channel_mask(&self) -> u64 {
+        self.port.channel_mask()
+    }
+    pub(super) fn channel(&self) -> u8 {
+        super::channels::channel(self.frequency_mhz()).unwrap_or(0)
+    }
     pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
         self.port.ht_grant()
     }
     pub(super) fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
         self.port.rx_ba_grant()
+    }
+    pub(super) fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
+        self.port.ps_grant()
+    }
+    pub(super) fn enable_ps(
+        &mut self,
+        source: &alloc::sync::Arc<super::ps::Grant>,
+    ) -> Result<(), Error> {
+        if let Some(bound) = &self.ps {
+            if !alloc::sync::Arc::ptr_eq(bound, source) {
+                return Err(Error::State);
+            }
+            source.check()?;
+        }
+        if self.phase != Phase::Running
+            || self.ht.is_none()
+            || self.pending.is_some()
+            || self.pair.is_some()
+            || self
+                .port
+                .ps_grant()
+                .is_none_or(|current| !alloc::sync::Arc::ptr_eq(&current, source))
+        {
+            return Err(Error::State);
+        }
+        source.readback(&self.port)?;
+        self.port.bind_ps(source)?;
+        self.ps = Some(source.clone());
+        if self.irq.is_none() {
+            self.irq = Some(super::irq::enable(&self.port, true, false)?);
+            if self.qos.is_some() {
+                super::irq::data_queues(&self.port)?;
+            }
+            self.full_imr = self.irq.ok_or(Error::State)?.imr;
+            self.ps_irq_created = true;
+        }
+        Ok(())
+    }
+    pub(super) fn ps_receive_on(&self) -> Result<(), Error> {
+        self.ps.as_ref().ok_or(Error::State)?.check()?;
+        let old = self.port.read(DIAG)?;
+        self.port.write(DIAG, old & !RX_PARK)?;
+        if self.port.read(DIAG)? & RX_PARK != 0 {
+            return Err(Error::Descriptor);
+        }
+        Ok(())
+    }
+    pub(super) fn ps_timers(&mut self, plan: super::ps::tim::Plan) -> Result<(), Error> {
+        self.ps.as_ref().ok_or(Error::State)?.readback(&self.port)?;
+        for (register, value) in plan.registers {
+            self.port.write(register, value)?;
+            if self.port.read(register)? != value {
+                return Err(Error::Descriptor);
+            }
+        }
+        let rssi = (self.port.read(0x8018)? & !0xff00) | (10 << 8);
+        self.port.write(0x8018, rssi)?;
+        let mode = self.port.read(0x8240)? | 0x31;
+        self.port.write(0x8240, mode)?;
+        if self.port.read(0x8018)? != rssi || self.port.read(0x8240)? != mode {
+            return Err(Error::Descriptor);
+        }
+        let mask = super::irq::power_save(&self.port, self.irq.ok_or(Error::State)?, true)?;
+        self.full_imr = mask.imr;
+        self.irq = Some(mask);
+        Ok(())
+    }
+    pub(super) fn ps_awake_mode(&mut self) -> Result<(), Error> {
+        self.ps_receive_on()?;
+        let mode = self.port.read(0x8240)? & !0x31;
+        self.port.write(0x8240, mode)?;
+        if self.port.read(0x8240)? != mode {
+            return Err(Error::Descriptor);
+        }
+        let mask = super::irq::power_save(&self.port, self.irq.ok_or(Error::State)?, false)?;
+        if self.ps_irq_created {
+            super::irq::kill(&self.port, false)?;
+            self.irq = None;
+            self.ps_irq_created = false;
+        } else {
+            self.full_imr = mask.imr;
+            self.irq = Some(mask);
+        }
+        Ok(())
+    }
+    pub(super) fn ps_sleep(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || self.pending.is_some() || self.pair.is_some() {
+            return Err(Error::Busy);
+        }
+        // held is the completed RX tail retained against descriptor prefetch,
+        // not a pending packet. Keep its mapping/rearm ownership through sleep;
+        // Radio drained RX and native sleep still proves QCU/RX-abort/RTC state.
+        self.check_transmit()?;
+        self.ps.as_ref().ok_or(Error::State)?.check()?;
+        self.port.network_sleep()
+    }
+    pub(super) fn ps_tsf(&self) -> Result<u64, Error> {
+        self.ps.as_ref().ok_or(Error::State)?.check()?;
+        for _ in 0..8 {
+            let high = self.port.read(0x8050)?;
+            let low = self.port.read(0x804c)?;
+            if self.port.read(0x8050)? == high {
+                return Ok((u64::from(high) << 32) | u64::from(low));
+            }
+        }
+        Err(Error::Descriptor)
+    }
+    pub(super) fn submit_ps(
+        &mut self,
+        frame: &[u8],
+        ap: [u8; 6],
+        aid: u16,
+        basic: usize,
+    ) -> Result<u64, Error> {
+        let source = self.ps.clone().ok_or(Error::State)?;
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit_ps(frame, local, ap, aid, address, basic, &source)
+        })
     }
     pub(super) fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         self.port.tx_ba_grant()
@@ -461,6 +731,18 @@ impl<P: Port> Packet<P> {
             return Err(Error::Descriptor);
         }
         grant.readback(&self.port)?;
+        if grant.members() > TX_DEPTH {
+            for queue in 0..QUEUES {
+                if !self.tx_idle(queue)? {
+                    return Err(Error::Descriptor);
+                }
+            }
+            let storage = self.storage.as_mut().ok_or(Error::State)?;
+            grant.invoke(|| {
+                self.port
+                    .access(true, || storage.expand(&self.port, grant.members()))
+            })?;
+        }
         self.tx_ba = true;
         self.phase = Phase::Running;
         Ok(())
@@ -543,6 +825,9 @@ impl<P: Port> Packet<P> {
         Ok(())
     }
     pub(super) fn set_ht(&mut self, profile: super::ht::Profile) -> Result<(), Error> {
+        if profile.geometry() != self.geometry() {
+            return Err(Error::State);
+        }
         if self.phase != Phase::Running || self.pending.is_some() || self.ht.is_some() {
             return Err(Error::State);
         }
@@ -561,6 +846,9 @@ impl<P: Port> Packet<P> {
             Some(u32::from(be.cw_min()) | u32::from(be.cw_max()) << 10 | u32::from(be.aifsn) << 20);
         self.phase = Phase::Running;
         Ok(())
+    }
+    pub(super) fn ht_profile(&self) -> Option<super::ht::Profile> {
+        self.ht
     }
     pub(super) fn observe_ht(
         &mut self,
@@ -590,7 +878,7 @@ impl<P: Port> Packet<P> {
         }
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
-        super::mac::peer(&self.port, peer, slot_us)?;
+        super::mac::peer_clocked(&self.port, peer, slot_us, self.port.mac_clock())?;
         self.slot_us = slot_us;
         self.phase = Phase::Running;
         Ok(())
@@ -643,8 +931,16 @@ impl<P: Port> Packet<P> {
     }
     pub(super) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
         let local = self.local;
+        let copy = if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
+            Some(
+                descriptor::ps_unmark(frame, self.ps.as_ref().ok_or(Error::State)?)
+                    .map_err(|_| Error::Packet)?,
+            )
+        } else {
+            None
+        };
         self.submit_inner(frame, |address| {
-            descriptor::transmit(frame, local, address, rate)
+            descriptor::transmit(copy.as_deref().unwrap_or(frame), local, address, rate)
         })
     }
     pub(super) fn submit_rates(
@@ -653,8 +949,16 @@ impl<P: Port> Packet<P> {
         series: super::rates::Series,
     ) -> Result<u64, Error> {
         let local = self.local;
+        let copy = if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
+            Some(
+                descriptor::ps_unmark(frame, self.ps.as_ref().ok_or(Error::State)?)
+                    .map_err(|_| Error::Packet)?,
+            )
+        } else {
+            None
+        };
         self.submit_inner(frame, |address| {
-            descriptor::transmit_series(frame, local, address, series)
+            descriptor::transmit_series(copy.as_deref().unwrap_or(frame), local, address, series)
         })
     }
     pub(super) fn submit_ba_response(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
@@ -694,8 +998,24 @@ impl<P: Port> Packet<P> {
         } else {
             0
         };
+        let copy = if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
+            Some(
+                descriptor::ps_unmark(frame, self.ps.as_ref().ok_or(Error::State)?)
+                    .map_err(|_| Error::Packet)?,
+            )
+        } else {
+            None
+        };
         self.submit_queue(frame, queue, |address| {
-            descriptor::transmit_ht_tid(frame, local, address, mcs, basic, profile, tids)
+            descriptor::transmit_ht_tid(
+                copy.as_deref().unwrap_or(frame),
+                local,
+                address,
+                mcs,
+                basic,
+                profile,
+                tids,
+            )
         })
     }
     pub(super) fn submit_sender_action(
@@ -720,12 +1040,12 @@ impl<P: Port> Packet<P> {
             super::descriptor::transmit_bar(frame, local, address, basic)
         })
     }
-    pub(super) fn submit_pair(
+    pub(super) fn submit_aggregate(
         &mut self,
-        frames: &[Vec<u8>; 2],
+        frames: &[Vec<u8>],
         mcs: u8,
         basic: usize,
-        permit: super::tx_ba::PairPermit,
+        permit: super::tx_ba::AggregatePermit,
     ) -> Result<u64, Error> {
         if self.phase != Phase::Running || !self.tx_ba {
             return Err(Error::State);
@@ -734,13 +1054,40 @@ impl<P: Port> Packet<P> {
             return Err(Error::Busy);
         }
         let storage = self.storage.as_ref().ok_or(Error::State)?;
-        let slots = [self.next_tx, (self.next_tx + 1) % TX_DEPTH];
-        let words = descriptor::transmit_pair(
-            [&frames[0], &frames[1]],
+        if frames.len() != permit.count || frames.len() > storage.tx_bytes.len() {
+            return Err(Error::State);
+        }
+        let slots: Vec<usize> = (0..frames.len())
+            .map(|offset| (self.next_tx + offset) % storage.tx_bytes.len())
+            .collect();
+        let payloads: Vec<u64> = slots
+            .iter()
+            .map(|s| u64::from(storage.tx_bytes[*s].address()))
+            .collect();
+        let descriptors: Vec<u64> = slots
+            .iter()
+            .map(|s| u64::from(storage.tx.address()) + (*s * STRIDE) as u64)
+            .collect();
+        let copies: Option<Vec<Vec<u8>>> = if frames
+            .iter()
+            .any(|frame| frame.get(1).is_some_and(|flag| flag & 0x10 != 0))
+        {
+            let source = self.ps.as_ref().ok_or(Error::State)?;
+            Some(
+                frames
+                    .iter()
+                    .map(|frame| descriptor::ps_unmark(frame, source).map_err(|_| Error::Packet))
+                    .collect::<Result<_, _>>()?,
+            )
+        } else {
+            None
+        };
+        let words = descriptor::transmit_aggregate(
+            copies.as_deref().unwrap_or(frames),
             self.local,
-            descriptor::PairAddresses {
-                payloads: slots.map(|s| u64::from(storage.tx_bytes[s].address())),
-                tail: u64::from(storage.tx.address()) + (slots[1] * STRIDE) as u64,
+            descriptor::AggregateAddresses {
+                payloads: &payloads,
+                descriptors: &descriptors,
             },
             mcs,
             basic,
@@ -748,11 +1095,11 @@ impl<P: Port> Packet<P> {
             permit,
         )
         .map_err(|_| Error::Packet)?;
-        let dma = [
-            descriptor::dma_bytes(&frames[0]).map_err(|_| Error::Packet)?,
-            descriptor::dma_bytes(&frames[1]).map_err(|_| Error::Packet)?,
-        ];
-        let originals = frames.clone();
+        let dma: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|frame| descriptor::dma_bytes(frame).map_err(|_| Error::Packet))
+            .collect::<Result<_, _>>()?;
+        let originals = frames.to_vec();
         let id = self.serial.checked_add(1).ok_or(Error::State)?;
         let deadline = self
             .port
@@ -761,11 +1108,14 @@ impl<P: Port> Packet<P> {
             .ok_or(Error::Timeout)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
+        if self.ps.is_some() {
+            self.ps_receive_on()?;
+        }
         if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
             return Err(Error::Descriptor);
         }
         self.port.access(true, || {
-            for i in 0..2 {
+            for i in 0..frames.len() {
                 storage.tx_bytes[slots[i]].write_bytes(&dma[i])?;
                 storage.tx_bytes[slots[i]].sync();
                 storage.tx.put_words(slots[i], &words[i])?;
@@ -775,12 +1125,12 @@ impl<P: Port> Packet<P> {
         })?;
         self.serial = id;
         self.pair = Some(PairPending {
-            slots,
+            slots: slots.clone(),
             id,
             words,
             originals,
             dma,
-            seq: permit.seq,
+            seq: permit.seq[..permit.count].to_vec(),
             deadline,
         });
         let address = storage.tx.address() + (slots[0] * STRIDE) as u32;
@@ -807,7 +1157,7 @@ impl<P: Port> Packet<P> {
             storage.tx.sync();
             if storage
                 .tx
-                .word(p.slots[1] * STRIDE + descriptor::TX_DONE * 4)?
+                .word(*p.slots.last().ok_or(Error::State)? * STRIDE + descriptor::TX_DONE * 4)?
                 & 1
                 == 0
             {
@@ -817,7 +1167,11 @@ impl<P: Port> Packet<P> {
                 return Ok(None);
             }
             storage.tx.sync();
-            let words = [storage.tx.words(p.slots[0])?, storage.tx.words(p.slots[1])?];
+            let words: Vec<[u32; WORDS]> = p
+                .slots
+                .iter()
+                .map(|slot| storage.tx.words(*slot))
+                .collect::<Result<_, _>>()?;
             for (i, w) in words.iter().enumerate() {
                 if w[..14] != p.words[i][..14] {
                     return Err(Error::Descriptor);
@@ -833,8 +1187,9 @@ impl<P: Port> Packet<P> {
                 }
                 return Ok(None);
             }
-            let (acked, feedback) = descriptor::pair_status(&words[0], &words[1], p.seq)
-                .map_err(|_| Error::Descriptor)?;
+            let (acked, feedback) =
+                descriptor::aggregate_status(&words[0], words.last().ok_or(Error::State)?, &p.seq)
+                    .map_err(|_| Error::Descriptor)?;
             Ok(Some(PairDelivery {
                 id: p.id,
                 originals: p.originals.clone(),
@@ -843,8 +1198,8 @@ impl<P: Port> Packet<P> {
             }))
         })?;
         if result.is_some() {
+            self.next_tx = (self.next_tx + p.slots.len()) % storage.tx_bytes.len();
             self.pair = None;
-            self.next_tx = (self.next_tx + 2) % TX_DEPTH;
         }
         self.phase = Phase::Running;
         Ok(result)
@@ -873,11 +1228,20 @@ impl<P: Port> Packet<P> {
         }
         let slot = self.next_tx;
         let storage = self.storage.as_ref().ok_or(Error::State)?;
-        let words =
+        let mut words =
             encode(u64::from(storage.tx_bytes[slot].address())).map_err(|_| Error::Packet)?;
+        // `xmit.c::ath_buf_set_rate`: multi-chain parts select their chains;
+        // the single-chain encoding is left byte-identical.
+        let chains = self.port.tx_chainmask();
+        if chains != 1 {
+            descriptor::select_chains(&mut words, chains).map_err(|_| Error::Packet)?;
+        }
         let dma = descriptor::dma_bytes(frame).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
+        if self.ps.is_some() {
+            self.ps_receive_on()?;
+        }
         if self.port.read(QTXE)? & 0xf != 0
             || self.port.read(QSTS)? & 3 != 0
             || self.qos.is_some() && !self.data_queues_idle()?
@@ -1028,7 +1392,15 @@ impl<P: Port> Packet<P> {
             }
             storage.rx_bytes[slot].sync();
             let payload = storage.rx_bytes[slot].bytes(length)?;
-            let frame = if self.ba {
+            let frame = if let Some(source) = &self.ps {
+                descriptor::receive_ps(
+                    &words,
+                    &payload,
+                    self.ht.ok_or(Error::State)?,
+                    self.ba,
+                    source,
+                )
+            } else if self.ba {
                 descriptor::receive_ba(&words, &payload, self.ht.ok_or(Error::State)?)
             } else if let Some(profile) = self.ht {
                 descriptor::receive_profile(&words, &payload, profile)
@@ -1082,6 +1454,17 @@ impl<P: Port> Packet<P> {
         self.port.deliver(true)?;
         self.phase = Phase::Running;
         Ok(true)
+    }
+    /// `ar9002_hw_calibrate` long-calibration continuation of a running owner
+    /// with no transmission in flight.
+    pub(super) fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        if self.pending.is_some() || self.pair.is_some() {
+            return Err(Error::Busy);
+        }
+        self.port.long_calibration()
     }
     /// The wake source, only while chip interrupts are programmed.
     pub(super) fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
@@ -1263,9 +1646,11 @@ impl<P: Port> Packet<P> {
                 rx,
                 tx_bytes,
                 rx_bytes,
+                retired_tx,
             } = storage;
             buffers.push(tx.0);
             buffers.push(rx.0);
+            buffers.extend(retired_tx.into_iter().map(|memory| memory.0));
             buffers.extend(tx_bytes.into_iter().map(|m| m.0));
             buffers.extend(rx_bytes.into_iter().map(|m| m.0));
             self.port.release(buffers);

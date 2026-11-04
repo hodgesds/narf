@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Retained B asynchronous XTAL shutdown after immediate engine/clock closure.
-//! Completion acknowledges the source RF00S/RF10S disable fields, not RF/DMA
-//! idle, an old-DMA fence, reset readiness or permission to free memory.
+//! Retained B/C asynchronous XTAL shutdown after immediate engine/clock closure.
+//! Completion acknowledges the source RF00S/RF10S (B) or RF00/RF10 (C) disable
+//! fields, not RF/DMA idle, an old-DMA fence, reset readiness or permission to
+//! free memory.
 use super::power::{Error, Io};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum State {
@@ -36,6 +37,19 @@ impl<I: Io> Access<'_, I> {
             }
             self.0.delay_us(50).await;
         }
+    }
+    /// One AX masked XTAL-SI write (mac.c `rtw89_mac_write_xtal_si`): only the
+    /// address echo is checked; the final field state is proven by a read.
+    async fn masked_write(&mut self, address: u8, value: u8, mask: u8) -> Result<(), Error> {
+        self.idle().await?;
+        let command =
+            (1 << 31) | u32::from(address) | (u32::from(mask) << 16) | (u32::from(value) << 8);
+        self.0.write32(0x270, command)?;
+        let reply = self.idle().await?;
+        if reply as u8 != address {
+            return Err(Error::Access);
+        }
+        Ok(())
     }
     async fn transaction(&mut self, address: u8, value: Option<(u8, u8)>) -> Result<u8, Error> {
         // A cancelled earlier power/BB XTAL operation may still own the controller.
@@ -122,6 +136,60 @@ impl Shutdown {
         for address in [0x80u8, 0x81] {
             let result = a.transaction(address, None).await.and_then(|v| {
                 if v & 7 == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Access)
+                }
+            });
+            if error.is_none() {
+                error = result.err();
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.state = State::ShutdownAcknowledged;
+        Ok(())
+    }
+}
+impl Shutdown {
+    /// RTL8852C terminal analog closure. rtw8852c.c `rtw8852c_mac_disable_bb_rf`
+    /// is only the AFE-digital clock and BB reset clear (no XTAL step, unlike
+    /// B's `__rtw8852bx_mac_disable_bb_rf`); the C RF00/RF10 disable lives in
+    /// `rtw8852c_pwr_off_func` as masked `XTAL_SI_WL_RFC_S0`/`S1` writes of
+    /// `XTAL_SI_RF00`/`XTAL_SI_RF10` (BIT 0) to zero, which this performs
+    /// right after the clocks and then proves by reading both bytes back.
+    /// The rest of `rtw8852c_pwr_off_func` (ANAPAR_WL, pads, APFM off) stays
+    /// with the power owner's `power_off`.
+    ///
+    /// # Safety
+    /// Same contract as `finish`, for the retained exclusively owned C function.
+    pub async unsafe fn finish_c(
+        &mut self,
+        io: &mut impl Io,
+        radio_started: bool,
+    ) -> Result<(), Error> {
+        if self.state != State::New {
+            return Err(Error::Terminal);
+        }
+        self.state = State::Stopping;
+        let engine = if radio_started {
+            super::radio_stop::engines(io)
+        } else {
+            Ok(())
+        };
+        let clock = super::radio_stop::clocks(io);
+        let mut error = engine.err().or(clock.err());
+        let mut a = Access(io);
+        for address in [0x80u8, 0x81] {
+            let result = a.masked_write(address, 0, 1).await;
+            if error.is_none() {
+                error = result.err();
+            }
+        }
+        for address in [0x80u8, 0x81] {
+            let result = a.transaction(address, None).await.and_then(|v| {
+                if v & 1 == 0 {
                     Ok(())
                 } else {
                     Err(Error::Access)

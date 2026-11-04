@@ -7,31 +7,63 @@ use super::{
     station_control::Admission,
 };
 use narf_wireless::wmm::Parameters;
-pub(super) fn readback(
-    mut read: impl FnMut(u16) -> Result<u32, Error>,
+pub(super) async fn readback(
+    mut read: impl super::firmware_transport::Read32,
     gains: [u8; 2],
 ) -> Result<(), Error> {
     for (reg, gain) in [0x18a0, 0x41a0].into_iter().zip(gains) {
-        if (read(reg)? >> 16) & 127 != u32::from(gain) {
+        if (read.read32(reg).await? >> 16) & 127 != u32::from(gain) {
             return Err(Error::Prerequisite);
         }
     }
     for reg in [0x18e8, 0x41e8] {
-        if read(reg)? & 0x1fc00 != 0 {
+        if read.read32(reg).await? & 0x1fc00 != 0 {
             return Err(Error::Prerequisite);
         }
     }
     for reg in [0x3a00, 0x3a04, 0x3a08] {
-        if read(reg)? != 0 {
+        if read.read32(reg).await? != 0 {
             return Err(Error::Prerequisite);
         }
     }
-    if read(0x100)? & 0x200 != 0 || read(0x680)? & 0xcf != 0 {
+    if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())
 }
-pub(super) fn words(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
+/// Readback of a C22 5GHz primary's retained OFDM program (`radio::ofdm5`):
+/// CCK references zero, the N2xO per-path OFDM references and the
+/// 0x3a04/0x3a08 differences. REG_RRSR is the profile's, checked by
+/// [`commit`] itself.
+pub(super) async fn readback5(
+    mut read: impl super::firmware_transport::Read32,
+    ofdm: [u8; 2],
+    diffs: [u32; 2],
+) -> Result<(), Error> {
+    for ((cck, reg), reference) in [(0x18a0, 0x18e8), (0x41a0, 0x41e8)].into_iter().zip(ofdm) {
+        if read.read32(cck).await? & 0x7f_0000 != 0
+            || read.read32(reg).await? & 0x1fc00 != u32::from(reference) << 10
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read.read32(0x3a00).await? != 0
+        || read.read32(0x3a04).await? != diffs[0]
+        || read.read32(0x3a08).await? != diffs[1]
+    {
+        return Err(Error::Prerequisite);
+    }
+    if read.read32(0x100).await? & 0x200 != 0 || read.read32(0x680).await? & 0xcf != 0 {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// EDCA words. rtw88 mac80211.c::rtw_aifsn_to_aifs: AIFS = AIFSN * slot +
+/// SIFS, SIFS 16 on `RTW_BAND_5G` and 10 otherwise; mac80211 mlme.c
+/// `ieee80211_handle_bss_capability` forces the short slot on 5GHz.
+pub(super) fn words(p: Parameters, short: bool, band5: bool) -> Result<[u32; 4], Error> {
+    let short = short || band5;
+    let sifs = if band5 { 16 } else { 10 };
     if p.ac[0].admission_control {
         return Err(Error::Unsupported);
     }
@@ -43,7 +75,7 @@ pub(super) fn words(p: Parameters, short: bool) -> Result<[u32; 4], Error> {
             ac.ecw_max = ac.ecw_max.max(10);
             ac.txop = 0;
         }
-        let aifs = u16::from(ac.aifsn) * if short { 9 } else { 20 } + 10;
+        let aifs = u16::from(ac.aifsn) * if short { 9 } else { 20 } + sifs;
         if ac.aifsn < 2
             || ac.ecw_min > ac.ecw_max
             || ac.ecw_max > 15
@@ -69,49 +101,54 @@ pub(super) async fn commit(
     // The chip-specific N21L/N22L grant already encloses these publications.
     // The native gains are unchanged; read them through the same retained
     // backend before opening a descriptor/rate mode that depends on them.
-    io.station_profile_readback()?;
+    io.station_profile_readback().await?;
     if let Some(p) = p {
-        let words = words(p, short)?;
+        let words = words(p, short, profile.band5)?;
         // Canonical ACI BE/BK/VI/VO maps to source BE/BK/VI/VO registers.
         for (reg, value) in [0x508, 0x50c, 0x504, 0x500].into_iter().zip(words) {
-            admission.run(|| {
+            crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
                 io.station_allowed()?;
-                super::radio::mask(io, reg, 0x07ff_ffff, value)?;
-                if io.read32(reg)? & 0x07ff_ffff != value {
+                super::radio::mask(io, reg, 0x07ff_ffff, value).await?;
+                if io.read32(reg).await? & 0x07ff_ffff != value {
                     return Err(Error::Prerequisite);
                 }
                 Ok(())
-            })?;
+            })
+            .await?;
             narf_scheduler::yield_now().await;
         }
     }
     ra_info(io, profile, admission).await?;
-    admission.run(|| {
+    crate::rtw88::firmware_transport::enclosed(|op| admission.run(op), async {
         io.station_allowed()?;
         let mask = profile.response_mask();
-        io.write32(0x440, mask)?;
-        if io.read32(0x440)? != mask {
+        io.write32(0x440, mask).await?;
+        if io.read32(0x440).await? != mask {
             return Err(Error::Prerequisite);
         }
-        io.station_profile_readback()?;
+        io.station_profile_readback().await?;
         io.packet_profile(profile)
     })
+    .await
 }
 /// Source `fw.c::rtw_fw_send_ra_info`: RATE_ID 20:16, INIT_RA_LVL1, SGI_EN
-/// bit23, LDPC bit26 (`si->ldpc_en`, separately qualified N2xC), DIS_PT bit30.
+/// bit23, BW_MODE 25:24 (N2xB 40MHz, N2xV 80MHz), LDPC bit26, VHT_EN 29:28
+/// (N2xV `si->vht_enable`, mask `RA_MASK_VHT_RATES | RA_MASK_OFDM_IN_VHT`) (`si->ldpc_en`, separately qualified N2xC), DIS_PT bit30.
 pub(super) async fn ra_info(
     io: &mut impl Io,
     profile: DataProfile,
     admission: &Admission,
 ) -> Result<(), Error> {
-    let rates = (u32::from(profile.rates) | (u32::from(profile.mcs) << 12)).to_le_bytes();
+    let rates = profile.ra_mask().to_le_bytes();
     super::station_control::send(
         io,
         [
             0x40,
             0,
             profile.rate_id() | (1 << 5) | (u8::from(profile.sgi) << 7),
-            0x40 | (u8::from(profile.ldpc) << 2),
+            0x40 | (u8::from(profile.vht.is_some()) << 4)
+                | (u8::from(profile.ldpc) << 2)
+                | profile.bw_mode(),
             rates[0],
             rates[1],
             rates[2],

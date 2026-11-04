@@ -225,7 +225,9 @@ fn smoke_ath10k_ht40_response_geometry_or_basic_mcs_change_never_publishes_peer(
                     0 => v[31] = 0,
                     1 => v[31] = 7,
                     2 => v[30] = 40,
-                    3 => v[37] = 1,
+                    // Basic MCS16 exceeds the actual two selected chains;
+                    // MCS8 is now a valid mandatory second-stream rate.
+                    3 => v[38] = 1,
                     _ => v.extend_from_slice(&[
                         61, 22, 36, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     ]),

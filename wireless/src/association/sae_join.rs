@@ -192,12 +192,22 @@ impl SaeJoin {
     }
 }
 
-fn auth_frame(own: [u8; 6], peer: [u8; 6], seq: u16, status: u16, body: &[u8]) -> Vec<u8> {
+fn auth_frame(
+    own: [u8; 6],
+    peer: [u8; 6],
+    seq: u16,
+    status: u16,
+    body: &[u8],
+    mld: Option<super::mlo::Context>,
+) -> Vec<u8> {
     let mut frame = management(0xb0, own, peer);
     frame.extend_from_slice(&AUTH_SAE.to_le_bytes());
     frame.extend_from_slice(&seq.to_le_bytes());
     frame.extend_from_slice(&status.to_le_bytes());
     frame.extend_from_slice(body);
+    if let Some(mld) = mld {
+        frame.extend_from_slice(&mld.own_auth_element());
+    }
     frame
 }
 
@@ -258,6 +268,7 @@ impl JoinPlan {
             return Err(Error::Busy);
         }
         let (own, peer) = (self.own, self.peer);
+        let mld = self.mld.as_deref().copied();
         let sae = self.sae.as_mut().ok_or(Error::UnsupportedSecurity)?;
         if sae.auth != Auth::Idle {
             return Err(Error::Busy);
@@ -271,7 +282,7 @@ impl JoinPlan {
             return Err(Error::UnsupportedSecurity);
         }
         let status = if sae.h2e { STATUS_H2E } else { 0 };
-        sae.frame = auth_frame(own, peer, 1, status, &session.commit_body(None));
+        sae.frame = auth_frame(own, peer, 1, status, &session.commit_body(None), mld);
         sae.auth = Auth::AwaitCommit;
         self.phase = Phase::AwaitAuthentication;
         Ok(&self.sae.as_ref().ok_or(Error::Protocol)?.frame)
@@ -327,7 +338,11 @@ impl JoinPlan {
         }
         let field = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
         let (alg, seq, status) = (field(24), field(26), field(28));
-        let body = &bytes[30..];
+        let mld = self.mld.as_deref().copied();
+        let body = match mld {
+            Some(context) => context.authentication_body(&bytes[30..])?,
+            None => &bytes[30..],
+        };
         if alg != AUTH_SAE {
             return Err(Error::Protocol);
         }
@@ -348,7 +363,7 @@ impl JoinPlan {
                     return Err(Error::Protocol);
                 }
                 let status = if sae.h2e { STATUS_H2E } else { 0 };
-                sae.frame = auth_frame(own, peer, 1, status, &commit);
+                sae.frame = auth_frame(own, peer, 1, status, &commit, mld);
                 Ok(Some(false))
             }
             (Auth::AwaitCommit, 1) => {
@@ -369,7 +384,7 @@ impl JoinPlan {
                 if confirm.is_empty() {
                     return Err(Error::Protocol);
                 }
-                sae.frame = auth_frame(own, peer, 2, 0, &confirm);
+                sae.frame = auth_frame(own, peer, 2, 0, &confirm, mld);
                 sae.auth = Auth::AwaitConfirm;
                 Ok(Some(false))
             }

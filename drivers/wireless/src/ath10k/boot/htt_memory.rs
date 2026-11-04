@@ -6,7 +6,60 @@ use crate::ath10k::{
     dma::barrier,
     htt_runtime::{storage::Storage, Config, DmaConfig, Error, HttMemory},
 };
+use narf_bus::BusDeviceCap;
+use narf_capabilities::{Cap, CapError, CapOp, Write};
+use narf_io::DmaBuffer;
+
+struct PublishQueue<'a> {
+    storage: &'a mut Storage<DmaBuffer>,
+    bytes: &'a [u8],
+}
+impl CapOp<BusDeviceCap, Write> for PublishQueue<'_> {
+    type Output = Result<(), Error>;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        Ok(self.storage.publish_queue_state(self.bytes))
+    }
+}
 impl HttMemory for PciBoot {
+    fn supports_htt_pfc(&self) -> bool {
+        self.hif
+            .as_ref()
+            .and_then(|h| h.htt_memory.as_ref())
+            .is_some_and(|s| s.qstate.is_some())
+    }
+    fn publish_htt_queue_state(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if !self.mmio.authorized() || self.poisoned || !self.hif_live {
+            return Err(Error::Memory);
+        }
+        let storage = self
+            .hif
+            .as_mut()
+            .and_then(|h| h.htt_memory.as_mut())
+            .ok_or(Error::Memory)?;
+        let mut publish = || {
+            self.mmio
+                .cap
+                .invoke(PublishQueue { storage, bytes })
+                .map_err(|_| Error::Memory)
+                .and_then(core::convert::identity)
+        };
+        // Original executable/board and original PCI invocation cover the
+        // complete coherent copy and its final sequence word.
+        match self.mmio.sources.as_ref() {
+            Some(source) => source.invoke_boot(publish).map_err(|_| Error::Memory)?,
+            None => publish(),
+        }
+    }
+    fn pending_htt_tx(&self) -> Result<usize, Error> {
+        if !self.mmio.authorized() || self.poisoned || !self.hif_live {
+            return Err(Error::Memory);
+        }
+        self.hif
+            .as_ref()
+            .and_then(|h| h.htt_memory.as_ref())
+            .map(|s| s.tx.pending())
+            .ok_or(Error::Memory)
+    }
     fn prepare_wmi_management(&mut self, bytes: &[u8]) -> Result<(u32, u64), Error> {
         if !self.mmio.authorized() || self.poisoned || !self.hif_live {
             return Err(Error::Memory);

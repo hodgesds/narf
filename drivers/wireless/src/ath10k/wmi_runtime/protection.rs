@@ -16,7 +16,7 @@ impl Request {
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn submitted_station_protection(&self) -> Option<Request> {
-        (!self.failed).then_some(self.protection).flatten()
+        (!self.failed).then_some(self.station.protection).flatten()
     }
     pub(in crate::ath10k) async fn set_station_protection(
         &mut self,
@@ -26,11 +26,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if request.rts_threshold.is_some_and(|n| n > 2347) {
             return Err(Error::Unsupported);
         }
-        let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let peer = self.station.peer.as_ref().ok_or(Error::Failed)?;
         if self.failed
             || peer.associated.is_none()
             || peer.mapped().is_none()
-            || self.data.as_ref().is_some_and(|d| !d.protection_allowed())
+            || self
+                .station
+                .data
+                .as_ref()
+                .is_some_and(|d| !d.protection_allowed())
         {
             return Err(Error::Failed);
         }
@@ -41,7 +45,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Unsupported);
         }
-        let permission = peer.permission;
+        let permission = peer.permission.clone();
         let source = self.htt.wmi.htc.transport.current_sources();
         let validate = || permission.check(&current()?);
         validate()?;
@@ -52,7 +56,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .check_current()
             .map_err(crate::ath10k::control::Error::from)
             .map_err(htt::Error::from)?;
-        let commands = self.wire.protection(request)?;
+        let commands = self.wire.protection(peer.vdev, request)?;
         // Reserve before any native wait. Cancellation cannot return the
         // still-programmed owner to ordinary packet admission.
         self.failed = true;
@@ -64,14 +68,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             let event = checked_policy(self.station_progress(), &validate).await?;
             if self
+                .station
                 .peer
                 .as_ref()
                 .is_none_or(|p| p.associated.is_none() || p.mapped().is_none())
             {
                 return Err(Error::Failed);
             }
-            while let Some(receipt) = self.htt.take_tx_receipt() {
-                if let Some(data) = &mut self.data {
+            while let Some(receipt) = self.take_station_receipt() {
+                if let Some(data) = &mut self.station.data {
                     data.protection_receipt(receipt)?;
                 }
             }
@@ -80,7 +85,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 self.queue(event)?;
             }
             if idle
-                && self.data.as_ref().is_none_or(|d| d.protection_idle())
+                && self
+                    .station
+                    .data
+                    .as_ref()
+                    .is_none_or(|d| d.protection_idle())
                 && self.htt.source_ready()?
             {
                 drained = true;
@@ -115,6 +124,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             let event = checked_policy(self.station_progress(), &validate).await?;
             if self
+                .station
                 .peer
                 .as_ref()
                 .is_none_or(|p| p.associated.is_none() || p.mapped().is_none())
@@ -135,7 +145,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         validate()?;
         crate::ath10k::firmware_source::invoke(source.as_ref(), || {
-            self.protection = Some(request);
+            self.station.protection = Some(request);
             self.failed = false;
         })
         .map_err(|_| Error::Failed)?;

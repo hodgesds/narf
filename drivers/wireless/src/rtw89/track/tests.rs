@@ -23,19 +23,27 @@ struct Fake {
     cck_pd: bool,
     profile: Option<Profile>,
     crystal: Vec<u8>,
+    rfk_calls: usize,
+    /// RTL8852C layout (`REGISTERS_C`) and a 5 GHz operating channel.
+    c: bool,
+    ghz5: bool,
 }
 impl Hw for Fake {
+    async fn rfk(&mut self) -> Result<(), power::Error> {
+        self.rfk_calls += 1;
+        Ok(())
+    }
     fn read(&mut self, address: u32) -> Result<u32, power::Error> {
         if self.unsupported {
             return Err(power::Error::Unsupported);
         }
-        if !REGISTERS.contains(&address) {
+        if !self.registers().contains(&address) {
             return Err(power::Error::Access);
         }
         Ok(*self.regs.get(&address).unwrap_or(&0))
     }
     fn write(&mut self, address: u32, value: u32) -> Result<(), power::Error> {
-        if !REGISTERS.contains(&address) {
+        if !self.registers().contains(&address) {
             return Err(power::Error::Access);
         }
         self.regs.insert(address, value);
@@ -52,12 +60,22 @@ impl Hw for Fake {
             crystal_upper: 104,
         }))
     }
+    fn layout(&mut self) -> Result<(Layout, bool), power::Error> {
+        Ok((if self.c { LAYOUT_C } else { LAYOUT_B }, self.ghz5))
+    }
     async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
         self.crystal.push(cap);
         Ok(cap)
     }
 }
 impl Fake {
+    fn registers(&self) -> &'static [u32] {
+        if self.c {
+            &REGISTERS_C
+        } else {
+            &REGISTERS
+        }
+    }
     fn get(&self, address: u32, mask: u32) -> u32 {
         field(*self.regs.get(&address).unwrap_or(&0), mask)
     }
@@ -144,7 +162,7 @@ fn smoke_rtw89_track_dig_pd_threshold_matches_linux() -> TestResult {
         cck_pd: (-121i32) as u32,
         sdagc_follow_pagc: false,
     };
-    if dig.step(None, 0) != expected {
+    if dig.step(None, 0, false) != expected {
         return TestResult::Fail("unlinked DIG differs from Linux");
     }
     // First connected at rssi 160: igi_rssi 80 seeds igi_fa_rssi.
@@ -153,7 +171,7 @@ fn smoke_rtw89_track_dig_pd_threshold_matches_linux() -> TestResult {
         cck_pd: (-53i32) as u32,
         sdagc_follow_pagc: false,
     };
-    if dig.step(Some(160), 0) != quiet {
+    if dig.step(Some(160), 0, false) != quiet {
         return TestResult::Fail("first-connected DIG differs from Linux");
     }
     // Noisy (FA >= 88 permil): +6 per period up to dyn_igi_max 90; the PD
@@ -162,14 +180,14 @@ fn smoke_rtw89_track_dig_pd_threshold_matches_linux() -> TestResult {
         sdagc_follow_pagc: true,
         ..quiet
     };
-    if dig.step(Some(160), 100) != noisy || dig.igi_fa_rssi != 86 {
+    if dig.step(Some(160), 100, false) != noisy || dig.igi_fa_rssi != 86 {
         return TestResult::Fail("noisy DIG offset differs from Linux");
     }
-    if dig.step(Some(160), 100) != noisy || dig.igi_fa_rssi != 90 || dig.fa_rssi_ofst != 12 {
+    if dig.step(Some(160), 100, false) != noisy || dig.igi_fa_rssi != 90 || dig.fa_rssi_ofst != 12 {
         return TestResult::Fail("DIG does not clamp at dyn_igi_max");
     }
     // Quiet again: level0 backs the offset off by 2.
-    dig.step(Some(160), 0);
+    dig.step(Some(160), 0, false);
     if dig.fa_rssi_ofst != 10 {
         return TestResult::Fail("quiet DIG offset does not decay");
     }
@@ -180,7 +198,7 @@ fn smoke_rtw89_track_dig_pd_threshold_matches_linux() -> TestResult {
         cck_pd: (-111i32) as u32,
         sdagc_follow_pagc: true,
     };
-    if dig.step(None, 0) != disconnected || dig.fa_th != FA_TH_NOLINK {
+    if dig.step(None, 0, false) != disconnected || dig.fa_th != FA_TH_NOLINK {
         return TestResult::Fail("first-disconnected DIG differs from Linux");
     }
     TestResult::Pass
@@ -199,6 +217,9 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
     let mut track = Tracker::default();
     if ready(track.run(&mut hw, 0, None, false)).is_err() {
         return TestResult::Fail("first track period failed");
+    }
+    if hw.rfk_calls != 1 {
+        return TestResult::Fail("initial source RF tracking callback");
     }
     // rtw89_core_start half: PPDU status to host, CCX and IFS-CLM init.
     if hw.get(R_AX_PPDU_STAT, u32::MAX) != 0x2b
@@ -234,11 +255,17 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
     {
         return TestResult::Fail("track work ran before its period");
     }
+    if hw.rfk_calls != 1 {
+        return TestResult::Fail("RF tracking ran before its2s period");
+    }
     track.sample(peer, 160);
     if ready(track.run(&mut hw, 2000, peer, true)).is_err()
         || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 0
     {
         return TestResult::Fail("track work ran while scanning");
+    }
+    if hw.rfk_calls != 1 {
+        return TestResult::Fail("RF tracking ran during scan");
     }
     hw.regs.insert(R_IFSCNT, B_IFSCNT_DONE_MSK);
     hw.regs.insert(R_IFS_CLM_FA, (2969 << 16) | 2969);
@@ -250,6 +277,9 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
         || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 95
     {
         return TestResult::Fail("linked noisy DIG/EDCCA registers differ");
+    }
+    if hw.rfk_calls != 2 {
+        return TestResult::Fail("due2s work omitted retained RF callback");
     }
     // A new peer restarts the RSSI average.
     track.sample(Some([2, 0, 0, 0, 0, 2]), 100);
@@ -368,4 +398,91 @@ fn smoke_rtw89_track_cfo_timer_follows_tx_throughput() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_track_cfo_timer_follows_tx_throughput
+);
+
+fn smoke_rtw8852c_track_uses_c_dig_edcca_dcfo_layout_and_5g_fa_thresholds() -> TestResult {
+    let peer = Some([2, 0, 0, 0, 0, 1]);
+    let mut hw = Fake {
+        cck_pd: true,
+        c: true,
+        ghz5: true,
+        ..Fake::default()
+    };
+    let mut track = Tracker::default();
+    if ready(track.run(&mut hw, 0, None, false)).is_err() {
+        return TestResult::Fail("first C track period failed");
+    }
+    // rtw8852c_dig_regs / rtw8852c_edcca_regs; no B-only DIG register.
+    if hw.get(R_SEG0R_PD, B_SEG0R_PD_SPATIAL_REUSE_EN_MSK) != 1
+        || hw.get(R_SEG0R_EDCCA_LVL, u32::MAX) != 0xf900_f9f9
+        || hw.regs.contains_key(&R_SEG0R_PD_V1)
+        || hw.regs.contains_key(&R_SEG0R_EDCCA_LVL_V1)
+        || R_PAGCUGC.iter().any(|r| hw.regs.contains_key(r))
+    {
+        return TestResult::Fail("C unlinked DIG/EDCCA not on the C registers");
+    }
+    track.sample(peer, 160);
+    hw.regs.insert(R_IFSCNT, B_IFSCNT_DONE_MSK);
+    hw.regs.insert(R_IFS_CLM_FA, (2969 << 16) | 2969);
+    if ready(track.run(&mut hw, 2000, peer, false)).is_err() {
+        return TestResult::Fail("linked C track period failed");
+    }
+    // rtw89_phy_dig_update_para on a 5 GHz link: fa_th_5g.
+    if track.dig.fa_th != FA_TH_5G {
+        return TestResult::Fail("5 GHz link did not take fa_th_5g");
+    }
+    let mut dig = Dig::default();
+    dig.step(None, 0, true);
+    let expected = dig.step(Some(160), track.env.fa_permil(), true);
+    if hw.get(R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK) != expected.pd
+        || R_PAGCUGC_V1
+            .iter()
+            .any(|&r| hw.get(r, B_PAGCUGC_EN_MSK) != u32::from(expected.sdagc_follow_pagc))
+        || hw.get(R_SEG0R_EDCCA_LVL, 0xff) != 95
+    {
+        return TestResult::Fail("linked C DIG/EDCCA registers differ");
+    }
+    // rtw89_phy_cfo_dm with dcfo_comp_sft 12 on R_DCFO_COMP_S0_V1 [13:0].
+    let mut cfo = Cfo::default();
+    cfo.init(hw.profile().unwrap());
+    for _ in 0..10 {
+        cfo.sample(100);
+    }
+    // (1000 << 12) / 10 - (8 << 12) = 376832; / 625 = 602.
+    if ready(cfo.dm(&mut hw, true)).is_err()
+        || hw.crystal != [43]
+        || hw.get(R_DCFO_COMP_S0_V1, B_DCFO_COMP_S0_V1_MSK) != 602
+        || hw.regs.contains_key(&R_DCFO_COMP_S0)
+    {
+        return TestResult::Fail("C DCFO compensation differs from rtw89_dcfo_comp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_track_uses_c_dig_edcca_dcfo_layout_and_5g_fa_thresholds
+);
+/// RTL8851B track work: `rtw8851b_dig_regs`/`rtw8851b_edcca_regs` are
+/// RTL8852B's; only `rtw8851b_dcfo_comp` (R_DCFO_COMP_S0_V2 [13:0],
+/// `dcfo_comp_sft` 12) differs, and the register allow-list follows it.
+fn smoke_rtw8851b_track_layout_is_b_with_v2_dcfo_comp() -> TestResult {
+    let (b, n) = (LAYOUT_B, LAYOUT_51);
+    if n.pd != b.pd
+        || n.pd_spatial_reuse != b.pd_spatial_reuse
+        || n.pagcugc != b.pagcugc
+        || n.edcca != b.edcca
+        || n.dcfo_comp != BB + 0x4b20
+        || n.dcfo_comp_mask != 0x3fff
+        || n.dcfo_comp_sft != 12
+        || REGISTERS_51[..19] != REGISTERS[..19]
+        || REGISTERS_51[19] != n.dcfo_comp
+        || REGISTERS_51.contains(&R_DCFO_COMP_S0)
+    {
+        return TestResult::Fail("RTL8851B track layout differs from rtw8851b_chip_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_track_layout_is_b_with_v2_dcfo_comp
 );

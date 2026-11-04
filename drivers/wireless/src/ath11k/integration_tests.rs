@@ -21,8 +21,6 @@
 //! (`net/mac80211/tx.c::ieee80211_build_hdr`, `ath11k/dp_tx.c`,
 //! `hal_tx.c`), not re-encoded with the code under test.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::collections::VecDeque;
@@ -32,7 +30,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::future::Future;
-use core::pin::pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -74,6 +71,27 @@ macro_rules! ensure {
     };
 }
 
+// Construct the future in a separate, short-lived stack frame as well as
+// pinning it on the heap. Passing an already-built future by value leaves
+// its full return-place storage in the caller across subsequent nested
+// driver polls; the ARM64 boot stack is only64KiB.
+macro_rules! run {
+    ($future:expr) => {
+        crate::ath11k::integration_tests::run_future(|| $future)
+    };
+}
+
+#[inline(never)]
+fn heap_future<F: Future>(
+    build: impl FnOnce() -> F,
+) -> core::pin::Pin<alloc::boxed::Box<super::future_heap::HeapFuture<F>>> {
+    // Retain the explicit poll boundary as well as heap storage. Otherwise
+    // LTO inlines the large native async poll into the fixture driver.
+    alloc::boxed::Box::pin(super::future_heap::build(build))
+}
+
+#[path = "admin_target_tests.rs"]
+mod admin_target;
 #[path = "power_stats_tests.rs"]
 mod power_stats_tests;
 #[path = "recovery_channel_tests.rs"]
@@ -88,8 +106,9 @@ fn check(f: impl FnOnce() -> R) -> TestResult {
 
 /// Drive a future whose waits are all immediately ready (the device
 /// model runs inside every wait).
-fn run<F: Future>(f: F) -> F::Output {
-    let mut f = pin!(f);
+#[inline(never)]
+fn run_future<F: Future>(build: impl FnOnce() -> F) -> F::Output {
+    let mut f = heap_future(build);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..2_000_000 {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
@@ -939,7 +958,7 @@ fn bring_up<D: CoreHooks<CeHif<Io, DevIrq>, TestQmi>>(
     u32,
     narf_memory::diag::WifiStage,
 ) {
-    let r = latched(|| run(core.qmi_firmware_ready(hooks)));
+    let r = latched(|| run!(core.qmi_firmware_ready(hooks)));
     ce::set_ce_irqs_enabled(false);
     runtime::set_dp_irqs_enabled(false);
     r
@@ -1035,6 +1054,7 @@ fn up(cfg: FwCfg) -> Result<Up, &'static str> {
 }
 
 /// [`up`] with the mac layer's device capabilities adjusted first.
+#[inline(never)]
 fn up_caps(
     cfg: FwCfg,
     adjust: impl FnOnce(&mut super::mac::DeviceCaps),
@@ -1044,7 +1064,7 @@ fn up_caps(
     let (_, err, _, _) = latched(|| pump(&u, 1));
     ensure!(err == 0, "mac start over the runtime");
     ensure!(
-        run(u.netdev.mac.lock())
+        run!(u.netdev.mac.lock())
             .vif()
             .is_some_and(|v| v.vdev_id == 0),
         "vif 0"
@@ -1067,6 +1087,10 @@ fn up_down_caps(
 ) -> Result<Up, &'static str> {
     up_down_caps_for_rev(cfg, adjust, HwRev::Wcn6855Hw21)
 }
+// Keep by-value core/Rt reconstruction in this transient fixture frame.
+// Inlining it into both up_caps and a multi-radio HE test previously left
+// roughly27KiB reserved in each caller on the64KiB ARM64 boot stack.
+#[inline(never)]
 fn up_down_caps_for_rev(
     cfg: FwCfg,
     adjust: impl FnOnce(&mut super::mac::DeviceCaps),
@@ -1127,8 +1151,8 @@ fn up_down_caps_for_rev(
 /// Runtime-loop passes (service + deliver + mac housekeeping + wait).
 fn pump(u: &Up, n: u32) {
     for _ in 0..n {
-        run(u.netdev.service_once());
-        run(u.shared.irq.wait(10));
+        run!(u.netdev.service_once());
+        run!(u.shared.irq.wait(10));
     }
 }
 
@@ -1144,7 +1168,7 @@ fn wpa2_req() -> AssociateRequest {
 }
 
 fn scan6(u: &Up) -> Result<Vec<narf_wireless::BssInfo>, &'static str> {
-    run(u.netdev.scan(ScanRequest {
+    run!(u.netdev.scan(ScanRequest {
         ssids: Vec::new(),
         frequencies_mhz: Vec::new(),
         channels: vec![6],
@@ -1160,7 +1184,7 @@ fn scan6(u: &Up) -> Result<Vec<narf_wireless::BssInfo>, &'static str> {
 
 fn connect(u: &Up) -> R {
     scan6(u)?;
-    let (r, err, _, stage) = latched(|| run(u.netdev.associate_kernel(wpa2_req())));
+    let (r, err, _, stage) = latched(|| run!(u.netdev.associate_kernel(wpa2_req())));
     ensure!(r.is_ok() && err == 0, "WPA2 associate");
     ensure!(
         stage == narf_memory::diag::WifiStage::Connected,
@@ -1185,7 +1209,7 @@ fn rx_while_authenticating(u: &Up, frames: Vec<Vec<u8>>) -> R {
     };
     ap_auth(None);
     u.dev.st.borrow_mut().rx_on_auth = frames;
-    let (r, _, _, _) = latched(|| run(u.netdev.associate_kernel(wpa2_req())));
+    let (r, _, _, _) = latched(|| run!(u.netdev.associate_kernel(wpa2_req())));
     ap_auth(Some(0));
     ensure!(r.is_err(), "the join to a silent AP times out");
     ensure!(
@@ -1349,7 +1373,7 @@ fn smoke_ath11k_int_bring_up_to_netdev() -> TestResult {
             "HT / VHT from the firmware caps; HE on every supported band \
              (ath11k_mac_copy_he_cap sets has_he unconditionally)"
         );
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(g.vdev(0).unwrap().link.vif.is_some(), "DP vdev TX attach");
         ensure!(
             g.mon_reap_at.is_some(),
@@ -1434,7 +1458,7 @@ fn smoke_ath11k_int_wpa2_connect() -> TestResult {
         // (ath11k_dp_peer_rx_pn_replay_config) updates all 17 TIDs.
         ensure!(st.reo_cmds == 17, "17 REO UPDATE_RX_QUEUE for the PTK");
         drop(st);
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.vdev(0).unwrap().link.authorized
                 && g.vdev(0).unwrap().link.ptk
@@ -1496,7 +1520,7 @@ fn smoke_ath11k_int_data_tx_rx() -> TestResult {
                 f.payload() == &eth[..],
                 "TX ring carries the Ethernet frame"
             );
-            run(u.netdev.tx_one(&f)).map_err(|_| "TX pump → dp.tx")?;
+            run!(u.netdev.tx_one(&f)).map_err(|_| "TX pump → dp.tx")?;
         }
         pump(&u, 3);
         let st = u.dev.st.borrow();
@@ -1575,7 +1599,7 @@ fn smoke_ath11k_int_data_tx_rx() -> TestResult {
         u.dev.st.borrow_mut().rx_queue.push_back(echo);
         pump(&u, 3);
         ensure!(RX_SEEN.lock().len() == 1, "own multicast echo dropped");
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.stats.rx_dropped_echo == 1 && g.stats.tx_completed >= 4,
             "echo counted; TX completions reaped"
@@ -1604,7 +1628,7 @@ fn smoke_ath11k_int_dp_poll_fallback() -> TestResult {
         RX_SEEN.lock().clear();
         pump(&u, 3);
         ensure!(RX_SEEN.lock().len() == 1, "RX without interrupts");
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.stats.dp_irqs.iter().all(|&n| n == 0),
             "no DP interrupt seen"
@@ -1627,11 +1651,11 @@ fn smoke_ath11k_int_unauthorized_and_disconnect() -> TestResult {
             "data before authorization dropped"
         );
         ensure!(
-            run(u.shared.lock()).stats.rx_dropped_unauth == 1,
+            run!(u.shared.lock()).stats.rx_dropped_unauth == 1,
             "counted as unauthorized"
         );
         connect(&u)?;
-        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        let (r, _, _, _) = latched(|| run!(u.netdev.disassociate()));
         ensure!(r.is_ok(), "disassociate");
         ensure!(!u.netdev.link_up(), "carrier off");
         ensure!(*LINK_SEEN.lock() == [true, false], "carrier on, then off");
@@ -1655,7 +1679,7 @@ fn smoke_ath11k_int_unauthorized_and_disconnect() -> TestResult {
             "peer deleted"
         );
         drop(st);
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.dp.peers.is_empty()
                 && g.vdev(0).unwrap().link.bss.is_none()
@@ -1701,7 +1725,7 @@ fn smoke_ath11k_int_eapol_filter() -> TestResult {
                 from_ap(&OWN),
             ],
         )?;
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.stats.rx_dropped_eapol_da == 2 && g.stats.rx_dropped_not_ours == 1,
             "group EAPOL dropped, foreign unicast not ours"
@@ -1829,7 +1853,7 @@ fn smoke_ath11k_int_group_rekey() -> TestResult {
         g[81..97].copy_from_slice(&mic[..16]);
         ensure!(tx[0] == g, "2/2 golden, MIC by the AP's KCK");
         ensure!(
-            run(u.netdev.mac.lock()).link().and_then(|l| l.gtk_idx) == Some(2),
+            run!(u.netdev.mac.lock()).link().and_then(|l| l.gtk_idx) == Some(2),
             "GTK index 2 in use"
         );
 
@@ -1946,7 +1970,7 @@ fn smoke_ath11k_int_rx_ba_session() -> TestResult {
         })?;
         connect(&u)?;
         ensure!(
-            run(u.netdev.mac.lock())
+            run!(u.netdev.mac.lock())
                 .link()
                 .is_some_and(|l| l.sta.ht_cap.ht_supported),
             "HT association"
@@ -1968,7 +1992,7 @@ fn smoke_ath11k_int_rx_ba_session() -> TestResult {
                 .collect()
         };
         let tid_q = |u: &Up, tid: usize| {
-            let g = run(u.shared.lock());
+            let g = run!(u.shared.lock());
             let t = &g.dp.peer_rx.peer(0, &BSSID).expect("AP rx peer").rx_tid[tid];
             (t.paddr, t.ba_win_sz)
         };
@@ -2087,7 +2111,7 @@ fn smoke_ath11k_int_rx_ba_session() -> TestResult {
         rx(&u, addba_req(13, 1, 6, 64, 0, 0));
         let (pa6, _) = tid_q(&u, 6);
         let (w4, m4) = (u.dev.st.borrow().wmi.len(), mgmt(&u).len());
-        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        let (r, _, _, _) = latched(|| run!(u.netdev.disassociate()));
         ensure!(r.is_ok(), "disassociate");
         let got = reorder(&u, w4);
         ensure!(
@@ -2210,7 +2234,7 @@ fn smoke_ath11k_int_link_loss() -> TestResult {
             u.netdev.stats.link_losses.load(Ordering::Relaxed) == 1,
             "one link loss"
         );
-        ensure!(run(u.shared.lock()).dp.peers.is_empty(), "AP peer gone");
+        ensure!(run!(u.shared.lock()).dp.peers.is_empty(), "AP peer gone");
         Ok(())
     })
 }
@@ -2343,7 +2367,7 @@ fn smoke_ath11k_int_peer_map_timeout() -> TestResult {
             ..wpa2_cfg()
         })?;
         scan6(&u)?;
-        let (r, err, _, _) = latched(|| run(u.netdev.associate(wpa2_req())));
+        let (r, err, _, _) = latched(|| run!(u.netdev.associate(wpa2_req())));
         ensure!(r.is_err(), "associate fails");
         ensure!(
             err == super::mac::step::PEER_MAP_TIMEOUT,
@@ -2724,7 +2748,7 @@ fn smoke_ath11k_int_mgmt_seq_shared() -> TestResult {
         // Over the device.
         let u = up(wpa2_cfg())?;
         connect(&u)?;
-        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        let (r, _, _, _) = latched(|| run!(u.netdev.disassociate()));
         ensure!(r.is_ok(), "disassociate");
         let st = u.dev.st.borrow();
         let seqs: Vec<(u8, [u8; 2])> = st
@@ -2743,7 +2767,7 @@ fn smoke_ath11k_int_mgmt_seq_shared() -> TestResult {
         );
         drop(st);
         ensure!(
-            run(u.shared.lock()).vdev(0).unwrap().link.seq.global == 0x30,
+            run!(u.shared.lock()).vdev(0).unwrap().link.seq.global == 0x30,
             "vif counter survives the AP's sta_info"
         );
         Ok(())
@@ -2875,7 +2899,7 @@ fn smoke_ath11k_int_autoconnect_attempt() -> TestResult {
             pmk: Some(PMK),
             passphrase: None,
         };
-        let (r, err, _, stage) = latched(|| run(attempt(u.netdev.as_ref(), &cfg)));
+        let (r, err, _, stage) = latched(|| run!(attempt(u.netdev.as_ref(), &cfg)));
         ensure!(r == Ok(Some(BSSID)) && err == 0, "connected");
         ensure!(
             stage == narf_memory::diag::WifiStage::Connected && u.netdev.link_up(),
@@ -2897,7 +2921,7 @@ fn smoke_ath11k_int_autoconnect_attempt() -> TestResult {
             pmk: None,
             passphrase: None,
         };
-        let (r, _, _, _) = latched(|| run(attempt(u.netdev.as_ref(), &wrong)));
+        let (r, _, _, _) = latched(|| run!(attempt(u.netdev.as_ref(), &wrong)));
         ensure!(r.is_err(), "no matching BSS → error, no association");
         Ok(())
     })
@@ -3061,7 +3085,7 @@ fn smoke_ath11k_int_tx_csum_offload() -> TestResult {
                 .flatten()
                 .ok_or("frame on the TX ring")?;
             ensure!(f.tx_meta() == meta, "the offload request rides the frame");
-            run(u.netdev.tx_one(&f)).map_err(|_| "TX pump → dp.tx")?;
+            run!(u.netdev.tx_one(&f)).map_err(|_| "TX pump → dp.tx")?;
         }
         pump(&u, 3);
         let st = u.dev.st.borrow();
@@ -3099,7 +3123,7 @@ fn smoke_ath11k_int_tx_csum_offload() -> TestResult {
         ensure!(snap.xmit_meta(&eth, udp).is_ok(), "queued");
         let f = u.tx_cons.try_recv().ok().flatten().ok_or("frame")?;
         ensure!(
-            run(u.netdev.tx_one(&f)) == Err(super::tx_offload::EINVAL) && refused(&u) == 3,
+            run!(u.netdev.tx_one(&f)) == Err(super::tx_offload::EINVAL) && refused(&u) == 3,
             "UDP checksum on a TCP segment refused before TCL"
         );
         pump(&u, 2);
@@ -3297,7 +3321,7 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
             let eth = ipv4_frame(&GW, &OWN, tos, &[tos]);
             ensure!(narf_net::iface::send_on(u.name, &eth).is_ok(), "send hook");
             let fr = u.tx_cons.try_recv().ok().flatten().ok_or("TX ring")?;
-            ensure!(run(u.netdev.tx_one(&fr)).is_ok(), "queued");
+            ensure!(run!(u.netdev.tx_one(&fr)).is_ok(), "queued");
             Ok(())
         };
         // BK (CS1 → UP 1), BE (0), VI (CS4 → UP 4), VO (EF → UP 6).
@@ -3306,7 +3330,7 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
         send(&mut u, 0x00)?;
         ensure!(tcl(&u) == base + 1, "running queues: straight to TCL");
 
-        run(u.shared.lock()).stop_queues(TxQueues::vif_queues(), reason::DRIVER);
+        run!(u.shared.lock()).stop_queues(TxQueues::vif_queues(), reason::DRIVER);
         let base = tcl(&u);
         for tos in arrivals {
             send(&mut u, tos)?;
@@ -3314,10 +3338,10 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
         pump(&u, 2);
         ensure!(tcl(&u) == base, "stopped: nothing reaches TCL");
         ensure!(
-            run(u.shared.lock()).vdev(0).unwrap().txq.backlog() == 4,
+            run!(u.shared.lock()).vdev(0).unwrap().txq.backlog() == 4,
             "four frames queued"
         );
-        let sent = run(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
+        let sent = run!(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
         ensure!(sent == 4, "the wake pushes all four");
         pump(&u, 2);
         let st = u.dev.st.borrow();
@@ -3335,40 +3359,40 @@ fn smoke_ath11k_int_tx_ac_priority() -> TestResult {
         drop(st);
 
         // Only hardware queue 2 (BE) stopped: VO passes, BE waits.
-        run(u.shared.lock()).stop_queues(1 << 2, reason::FLUSH);
+        run!(u.shared.lock()).stop_queues(1 << 2, reason::FLUSH);
         let base = tcl(&u);
         send(&mut u, 0x00)?;
         send(&mut u, 0xb8)?;
         ensure!(tcl(&u) == base + 1, "VO sent past the stopped BE queue");
-        run(u.shared.lock()).wake_queues(1 << 2, reason::FLUSH);
+        run!(u.shared.lock()).wake_queues(1 << 2, reason::FLUSH);
         ensure!(tcl(&u) == base + 2, "BE sent on wake");
 
         // A dropping flush purges what is queued.
-        run(u.shared.lock()).stop_queues(TxQueues::vif_queues(), reason::DRIVER);
+        run!(u.shared.lock()).stop_queues(TxQueues::vif_queues(), reason::DRIVER);
         send(&mut u, 0x00)?;
         send(&mut u, 0x80)?;
-        run(u.shared.flush_queues(true));
+        run!(u.shared.flush_queues(true));
         let base = tcl(&u);
-        run(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
+        run!(u.shared.lock()).wake_queues(TxQueues::vif_queues(), reason::DRIVER);
         let after = tcl(&u);
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             after == base && g.vdev(0).unwrap().txq.is_empty() && g.stats.tx_queue_dropped == 2,
             "flush(drop): both purged, nothing sent"
         );
         drop(g);
         // Non-dropping flush with nothing pending returns at once.
-        run(u.shared.flush_queues(false));
+        run!(u.shared.flush_queues(false));
         ensure!(
-            run(u.shared.lock()).vdev(0).unwrap().txq.stop_reasons(0) == 0,
+            run!(u.shared.lock()).vdev(0).unwrap().txq.stop_reasons(0) == 0,
             "flush leaves the queues running"
         );
 
         // No station: ieee80211_build_hdr refuses before the TXQ.
-        let (r, _, _, _) = latched(|| run(u.netdev.disassociate()));
+        let (r, _, _, _) = latched(|| run!(u.netdev.disassociate()));
         ensure!(r.is_ok(), "disassociate");
         let eth = ipv4_frame(&GW, &OWN, 0, &[1]);
-        let r = run(u.shared.tx_frames(vec![(eth, false)]));
+        let r = run!(u.shared.tx_frames(vec![(eth, false)]));
         ensure!(r == [Err(runtime::ENOTCONN)], "no station → ENOTCONN");
         Ok(())
     })
@@ -3393,11 +3417,11 @@ fn smoke_ath11k_int_open_stop() -> TestResult {
         let n0 = wmi_len(&u);
         pump(&u, 2);
         ensure!(
-            wmi_len(&u) == n0 && run(u.netdev.mac.lock()).vif().is_none(),
+            wmi_len(&u) == n0 && run!(u.netdev.mac.lock()).vif().is_none(),
             "down: hardware not started"
         );
         ensure!(
-            run(u.netdev.scan(ScanRequest {
+            run!(u.netdev.scan(ScanRequest {
                 ssids: Vec::new(),
                 frequencies_mhz: Vec::new(),
                 channels: vec![6],
@@ -3434,7 +3458,7 @@ fn smoke_ath11k_int_open_stop() -> TestResult {
             "op_start then add_interface"
         );
         ensure!(
-            run(u.shared.lock()).vdev(0).unwrap().link.vif.is_some(),
+            run!(u.shared.lock()).vdev(0).unwrap().link.vif.is_some(),
             "ath11k_dp_vdev_tx_attach"
         );
         let n1 = wmi_len(&u);
@@ -3474,10 +3498,10 @@ fn smoke_ath11k_int_open_stop() -> TestResult {
             "carrier off"
         );
         ensure!(
-            run(u.netdev.mac.lock()).vif().is_none() && !run(u.netdev.mac.lock()).is_started(),
+            run!(u.netdev.mac.lock()).vif().is_none() && !run!(u.netdev.mac.lock()).is_started(),
             "vif removed, hardware stopped"
         );
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.vdev(0).unwrap().link.vif.is_none()
                 && g.mgmt.pending == 0
@@ -3520,7 +3544,7 @@ fn smoke_ath11k_int_open_from_control_op() -> TestResult {
             pmk: Some(PMK),
             passphrase: None,
         };
-        let (r, err, _, _) = latched(|| run(attempt(u.netdev.as_ref(), &cfg)));
+        let (r, err, _, _) = latched(|| run!(attempt(u.netdev.as_ref(), &cfg)));
         ensure!(r == Ok(Some(BSSID)) && err == 0, "opened and connected");
         ensure!(u.netdev.link_up(), "carrier on");
         Ok(())
@@ -3597,7 +3621,7 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
             ack_signal: None,
         };
         let peer = AP_PEER_ID as u32;
-        let before_status = run(u.shared.lock()).stats;
+        let before_status = run!(u.shared.lock()).stats;
         let cases: [(&str, TxRel, Result<TxStatus, i32>); 8] = [
             (
                 "TQM acked",
@@ -3674,13 +3698,13 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
         ];
         for (what, rel, want) in cases {
             u.dev.st.borrow_mut().tx_rel = rel;
-            if run(u.shared.send_eth_tx_status(&eth, 200)) != want {
+            if run!(u.shared.send_eth_tx_status(&eth, 200)) != want {
                 return Err(what);
             }
         }
         u.dev.st.borrow_mut().tx_rel = TxRel::default();
         {
-            let g = run(u.shared.lock());
+            let g = run!(u.shared.lock());
             ensure!(
                 g.vdev(0).unwrap().ack_frames.is_empty()
                     && g.vdev(0).unwrap().ack_status.is_empty(),
@@ -3699,13 +3723,13 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
                 "station completions count ACKs, failures and valid-peer retries"
             );
         }
-        let before_plain = run(u.shared.lock()).stats;
+        let before_plain = run!(u.shared.lock()).stats;
         ensure!(narf_net::iface::send_on(u.name, &eth).is_ok(), "plain send");
         let mut u = u;
         let f = u.tx_cons.try_recv().ok().flatten().ok_or("TX ring")?;
-        ensure!(run(u.netdev.tx_one(&f)).is_ok(), "queued");
+        ensure!(run!(u.netdev.tx_one(&f)).is_ok(), "queued");
         pump(&u, 3);
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.stats.tx_status_acked == before_plain.tx_status_acked + 1
                 && g.vdev(0).unwrap().ack_status.is_empty(),
@@ -3715,7 +3739,7 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
 
         // Purged before TCL → dropped.
         let id = {
-            let mut g = run(u.shared.lock());
+            let mut g = run!(u.shared.lock());
             g.stop_queues(TxQueues::vif_queues(), reason::DRIVER);
             let id = g.tx_enqueue_status(eth.clone()).map_err(|_| "enqueue")?;
             g.purge_txqs();
@@ -3723,7 +3747,7 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
             id
         };
         let purged_status = {
-            let mut g = run(u.shared.lock());
+            let mut g = run!(u.shared.lock());
             g.vdev_mut(0).unwrap().ack_status.pop_front()
         };
         ensure!(
@@ -3732,13 +3756,13 @@ fn smoke_ath11k_int_tx_status() -> TestResult {
         );
         // Interface down with a frame waiting → dropped.
         let id = {
-            let mut g = run(u.shared.lock());
+            let mut g = run!(u.shared.lock());
             g.stop_queues(TxQueues::vif_queues(), reason::DRIVER);
             g.tx_enqueue_status(eth.clone()).map_err(|_| "enqueue")?
         };
         ensure!(narf_net::iface::set_link_state(u.name, false), "down");
         pump(&u, 1);
-        let mut g = run(u.shared.lock());
+        let mut g = run!(u.shared.lock());
         ensure!(
             g.vdev_mut(0)
                 .unwrap()
@@ -3766,9 +3790,9 @@ fn smoke_ath11k_int_nullfunc_probe() -> TestResult {
     check(|| {
         let u = up(wpa2_cfg())?;
         connect(&u)?;
-        let before = run(u.shared.lock()).stats;
+        let before = run!(u.shared.lock()).stats;
         ensure!(
-            run(u.shared.probe_ap(200))
+            run!(u.shared.probe_ap(200))
                 == Ok(TxStatus {
                     acked: true,
                     dropped: false,
@@ -3789,7 +3813,7 @@ fn smoke_ath11k_int_nullfunc_probe() -> TestResult {
                 && f[22..24] == [0, 0],
             "native-wifi QoS Null decapsulation"
         );
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.stats.tx_nullfunc == before.tx_nullfunc + 1
                 && g.stats.tx_status_acked == before.tx_status_acked + 1
@@ -3908,13 +3932,13 @@ fn smoke_ath11k_int_tx_rate_report() -> TestResult {
         let raw = raw(2, 3, 1, 9, false, 0);
         u.dev.st.borrow_mut().tx_rate_stats = raw;
         let nss = {
-            let m = run(u.netdev.mac.lock());
+            let m = run!(u.netdev.mac.lock());
             m.link().ok_or("associated station")?.sta.rx_nss
         };
         let expected = runtime::tx_rate_info(raw, nss).ok_or("decoded station rate")?;
         let eth = ipv4_frame(&GW, &OWN, 0, &[9]);
         ensure!(
-            run(u.shared.send_eth_tx_status(&eth, 200)).is_ok(),
+            run!(u.shared.send_eth_tx_status(&eth, 200)).is_ok(),
             "TX completion for station rate"
         );
         ensure!(
@@ -3948,7 +3972,7 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_tx_rate_report);
 fn smoke_ath11k_int_fw_transport_service() -> TestResult {
     check(|| {
         let u = up(FwCfg::default())?;
-        let mut g = run(u.shared.lock());
+        let mut g = run!(u.shared.lock());
         g.service();
         let base = g.core.qmi.services;
         // Within QMI_SERVICE_MS and no interrupt: not serviced.
@@ -3988,7 +4012,7 @@ kernel_test_in!(
 
 /// Raise a transport notice the next runtime pass picks up.
 fn crash(u: &Up, n: FwNotice) {
-    let mut g = run(u.shared.lock());
+    let mut g = run!(u.shared.lock());
     g.core.qmi.notice = Some(n);
     g.core.qmi.irq = true;
 }
@@ -4011,7 +4035,7 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
         let mut u = up(wpa2_cfg())?;
         connect(&u)?;
         ensure!(u.netdev.link_up(), "connected before the crash");
-        let rings = run(u.shared.lock()).core.hif.ce.hal.srng_ids();
+        let rings = run!(u.shared.lock()).core.hif.ce.hal.srng_ids();
         let htt_before = htt_types(&u);
         let install_keys = |u: &Up| {
             u.dev
@@ -4042,7 +4066,7 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
         );
         // ath11k_core_reset's half: one power cycle, then the restart.
         {
-            let g = run(u.shared.lock());
+            let g = run!(u.shared.lock());
             ensure!(g.core.qmi.recovers == [true], "recover(power_cycle)");
             ensure!(g.core.qmi.starts == 2, "QMI firmware start again");
             ensure!(g.stats.fw_crash_counter == 1, "fw_crash_counter");
@@ -4101,7 +4125,7 @@ fn smoke_ath11k_int_crash_recover_reconnect() -> TestResult {
             .ok()
             .flatten()
             .ok_or("frame on the TX ring")?;
-        run(u.netdev.tx_one(&f)).map_err(|_| "TX after recovery")?;
+        run!(u.netdev.tx_one(&f)).map_err(|_| "TX after recovery")?;
         pump(&u, 2);
         ensure!(
             u.dev.st.borrow().tcl_tx.len() == before + 1,
@@ -4126,7 +4150,7 @@ fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
         // The firmware restarts on its own (its state is gone).
         u.dev.power_cycle();
         {
-            let mut g = run(u.shared.lock());
+            let mut g = run!(u.shared.lock());
             g.core.qmi.notice = Some(FwNotice::ServerExit);
             g.core.qmi.irq = true;
             let (_, _, _, stage) = latched(|| g.service());
@@ -4169,11 +4193,11 @@ fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
             buf: vec![0; 16],
         };
         ensure!(
-            run(u.shared.wmi_send(&cmd)) == Err(runtime::ESHUTDOWN),
+            run!(u.shared.wmi_send(&cmd)) == Err(runtime::ESHUTDOWN),
             "WMI send: -ESHUTDOWN"
         );
         ensure!(
-            run(u.shared.wait_until(5_000, |_| None::<()>)).is_none(),
+            run!(u.shared.wait_until(5_000, |_| None::<()>)).is_none(),
             "wait released"
         );
         ensure!(
@@ -4186,7 +4210,7 @@ fn smoke_ath11k_int_crash_flush_and_server_exit() -> TestResult {
             stage == narf_memory::diag::WifiStage::Connected,
             "reconnected"
         );
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(g.core.qmi.recovers == [false], "no power cycle");
         ensure!(
             (0..3).all(|q| g.vdev(0).unwrap().txq.stop_reasons(q) == 0),
@@ -4209,7 +4233,7 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
     check(|| {
         // The QMI handshake after the power cycle fails.
         let u = up(wpa2_cfg())?;
-        run(u.shared.lock()).core.qmi.recover_fail =
+        run!(u.shared.lock()).core.qmi.recover_fail =
             Some(WlfwError::new(super::wlfw::step::SERVER_TIMEOUT, 1, 110));
         crash(&u, FwNotice::Reset(MhiNotify::SysError));
         let (_, err, detail, stage) = latched(|| pump(&u, 1));
@@ -4225,7 +4249,7 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
         ensure!(u.shared.is_dead(), "device dead");
         ensure!(u.shared.try_lock().is_none(), "runtime parked");
         ensure!(
-            run(u.netdev.scan(ScanRequest {
+            run!(u.netdev.scan(ScanRequest {
                 ssids: Vec::new(),
                 frequencies_mhz: Vec::new(),
                 channels: vec![6],
@@ -4263,7 +4287,7 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
         // ath11k_core_reset's gate: FINAL failures in a row → ignored.
         let u = up(wpa2_cfg())?;
         {
-            let mut g = run(u.shared.lock());
+            let mut g = run!(u.shared.lock());
             g.reset.fail_cont_count = runtime::ATH11K_RESET_MAX_FAIL_COUNT_FINAL;
         }
         crash(&u, FwNotice::Reset(MhiNotify::EeRddm));
@@ -4273,7 +4297,7 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
             "RECOVERY_LIMIT"
         );
         {
-            let mut g = run(u.shared.lock());
+            let mut g = run!(u.shared.lock());
             ensure!(
                 g.fw_notice.is_none() && !g.crash_flush && g.core.qmi.recovers.is_empty(),
                 "no reset"
@@ -4294,7 +4318,7 @@ fn smoke_ath11k_int_recovery_failures() -> TestResult {
             stage == narf_memory::diag::WifiStage::DataPath,
             "not connected before: data-path"
         );
-        let g = run(u.shared.lock());
+        let g = run!(u.shared.lock());
         ensure!(
             g.reset.fail_cont_count == 0 && g.core.qmi.recovers == [true],
             "reset ran, fail count cleared"
@@ -4392,7 +4416,7 @@ fn no_seq(f: &[u8]) -> Vec<u8> {
 
 fn pmf_connect(u: &Up) -> R {
     scan6(u)?;
-    let (r, err, _, _) = latched(|| run(u.netdev.associate(wpa2_req())));
+    let (r, err, _, _) = latched(|| run!(u.netdev.associate(wpa2_req())));
     ensure!(r.is_ok() && err == 0, "PMF associate");
     Ok(())
 }
@@ -4747,7 +4771,7 @@ fn smoke_ath11k_int_sae_h2e_connect() -> TestResult {
         );
         let u = up(cfg)?;
         scan6(&u)?;
-        let (r, err, _, stage) = latched(|| run(u.netdev.associate(sae_req())));
+        let (r, err, _, stage) = latched(|| run!(u.netdev.associate(sae_req())));
         ensure!(r.is_ok() && err == 0, "SAE associate");
         ensure!(
             stage == narf_memory::diag::WifiStage::Connected,
@@ -4837,7 +4861,7 @@ fn smoke_ath11k_int_sae_transition_hunt_and_peck() -> TestResult {
             matches!(&req.security, SecurityConfig::Wpa3 { password } if password == SAE_PW),
             "passphrase → SAE for a transition AP"
         );
-        let (r, err, _, _) = latched(|| run(u.netdev.associate(req)));
+        let (r, err, _, _) = latched(|| run!(u.netdev.associate(req)));
         ensure!(r.is_ok() && err == 0, "transition SAE associate");
         let st = u.dev.st.borrow();
         let rx = &st.world.ap.sae_rx;
@@ -4905,7 +4929,7 @@ fn smoke_ath11k_int_sae_negatives() -> TestResult {
         for (sae, s, d) in cases {
             let u = up(sae_cfg(&AP_RSNE_SAE, true, sae))?;
             scan6(&u)?;
-            let (r, err, detail, _) = latched(|| run(u.netdev.associate(sae_req())));
+            let (r, err, detail, _) = latched(|| run!(u.netdev.associate(sae_req())));
             ensure!(r.is_err() && err == s && detail == d, "SAE failure step");
             ensure!(
                 !u.dev.st.borrow().world.mgmt.iter().any(|f| f[0] == 0x00),
@@ -4923,7 +4947,7 @@ fn smoke_ath11k_int_sae_negatives() -> TestResult {
             },
         ))?;
         scan6(&u)?;
-        let (r, err, detail, _) = latched(|| run(u.netdev.associate(sae_req())));
+        let (r, err, detail, _) = latched(|| run!(u.netdev.associate(sae_req())));
         ensure!(
             r.is_err() && err == step::SAE_TIMEOUT && detail == 3,
             "no Confirm: SAE timeout after 3 tries"
@@ -4943,7 +4967,7 @@ fn smoke_ath11k_int_sae_negatives() -> TestResult {
         // SAE asked of a PSK-only AP.
         let u = up(wpa2_cfg())?;
         scan6(&u)?;
-        let (r, err, detail, _) = latched(|| run(u.netdev.associate(sae_req())));
+        let (r, err, detail, _) = latched(|| run!(u.netdev.associate(sae_req())));
         ensure!(
             r.is_err() && err == step::CONNECT_UNSUPPORTED && detail == 3,
             "no AKM 8"
@@ -5175,7 +5199,7 @@ fn smoke_ath11k_int_he_connect() -> TestResult {
             security: SecurityConfig::Open,
             ie: Vec::new(),
         };
-        let (r, err, _, _) = latched(|| run(u.netdev.associate(req)));
+        let (r, err, _, _) = latched(|| run!(u.netdev.associate(req)));
         ensure!(r.is_ok() && err == 0, "HE associate");
         let st = u.dev.st.borrow();
         let assoc = st.world.mgmt.iter().find(|f| f[0] == 0x00).unwrap();
@@ -5205,7 +5229,7 @@ fn smoke_ath11k_int_he_connect() -> TestResult {
         );
         // ath11k_peer_assoc_h_phymode for the link's width (the fake
         // firmware's regulatory rules decide 20 / 40 MHz).
-        let w = run(u.netdev.mac.lock()).link().map(|l| l.def.width);
+        let w = run!(u.netdev.mac.lock()).link().map(|l| l.def.width);
         let want = if w == Some(super::mac_peer::Width::W40) {
             super::wmi::phy_mode::MODE_11AX_HE40_2G
         } else {
@@ -5411,7 +5435,7 @@ fn smoke_ath11k_qca6390_production_profile_station_and_capacity() -> TestResult 
     check(|| {
         let mut u = up_down_caps_for_rev(wpa2_cfg(), |_| {}, HwRev::Qca6390Hw20)?;
         {
-            let rt = run(u.shared.lock());
+            let rt = run!(u.shared.lock());
             ensure!(
                 rt.core.cfg.num_vdevs == 4 && rt.dp.cfg.hal_desc_sz == 384,
                 "production QCA6390 core and native DP profile"
@@ -5472,7 +5496,7 @@ fn smoke_ath11k_qca6390_production_profile_station_and_capacity() -> TestResult 
             .ok()
             .flatten()
             .ok_or("queued Ethernet")?;
-        run(u.netdev.tx_one(&frame)).map_err(|_| "native TCL TX")?;
+        run!(u.netdev.tx_one(&frame)).map_err(|_| "native TCL TX")?;
         pump(&u, 3);
         ensure!(
             u.dev.st.borrow().tcl_tx.len() == before + 1,

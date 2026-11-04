@@ -221,9 +221,19 @@ pub(super) fn prepared_profile(
     protected: bool,
     raw: bool,
 ) -> radio::Radio<RadioModel> {
+    prepared_profile_features(version, dialect, protected, raw, 0)
+}
+pub(super) fn prepared_profile_features(
+    version: u32,
+    dialect: Dialect,
+    protected: bool,
+    raw: bool,
+    extra_features: u64,
+) -> radio::Radio<RadioModel> {
     let features = (1 << 2)
         | if dialect == Dialect::Tlv { 1 << 18 } else { 0 }
-        | if raw { 1 << 10 } else { 0 };
+        | if raw { 1 << 10 } else { 0 }
+        | extra_features;
     let mut r = radio_boot_features(version, dialect, features);
     r.htt.wmi.htc.transport.mlme_beacon = Some(protected);
     assert!(matches!(drive(r.start(&[2412, 5180])), Poll::Ready(Ok(_))));

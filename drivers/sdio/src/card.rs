@@ -63,10 +63,18 @@ pub struct FunctionInfo {
 /// [`InterruptLine::unmask`] re-enables it after service.
 pub trait InterruptLine: Send {
     fn unmask(&self);
+    /// Linux `enable_irq_wake`/`disable_irq_wake` on the host's line.
+    /// `false`: the line cannot be a system wake source.
+    fn set_wake(&self, _on: bool) -> bool {
+        false
+    }
 }
 impl InterruptLine for narf_interrupts::oneshot::Line {
     fn unmask(&self) {
         narf_interrupts::oneshot::Line::unmask(self)
+    }
+    fn set_wake(&self, on: bool) -> bool {
+        narf_interrupts::oneshot::Line::set_wake(self, on).is_ok()
     }
 }
 type Notify = alloc::sync::Arc<dyn Fn() + Send + Sync>;
@@ -86,6 +94,12 @@ impl Subscriber {
     }
     fn set(&self, notify: Notify) {
         *self.0.lock() = Some(notify);
+    }
+    fn clear(&self) {
+        let previous = { self.0.lock().take() };
+        // Captured state may have its own destructor. Never run it while
+        // the subscription's IRQ guard is held.
+        drop(previous);
     }
 }
 impl core::fmt::Debug for Subscriber {
@@ -112,13 +126,28 @@ pub struct Card<R: Registers> {
     functions: [FunctionInfo; 8],
     block_sizes: [u16; 8],
     enabled: u8,
+    observing: u8,
+    live: alloc::sync::Arc<crate::source::Lifetime>,
     /// Platform card-interrupt line; dropped (masked) after the host's
     /// signal enables are cleared.
     interrupt: Option<Interrupt>,
+    /// Enumeration configuration, replayed by a power-off resume.
+    config: Config,
+    /// System-suspend state (`card_pm.rs`); every access is refused while
+    /// it is held.
+    suspend: Option<pm::Suspended>,
+    /// A resume could not prove the card kept its state; terminal.
+    pm_failed: bool,
 }
 impl<R: Registers> Drop for Card<R> {
     fn drop(&mut self) {
+        self.live.retire();
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.subscriber.clear();
+            interrupt.line.set_wake(false);
+        }
         let io = self.controller.registers();
+        io.write8(WAKE_UP_CONTROL, 0);
         io.write32(SIGNAL_ENABLE, 0);
         io.write32(INT_ENABLE, 0);
         io.write16(CLOCK_CONTROL, 0);
@@ -135,9 +164,14 @@ impl<R: Registers> Card<R> {
             functions: [FunctionInfo::default(); 8],
             block_sizes: [0; 8],
             enabled: 0,
+            observing: 0,
+            live: crate::source::Lifetime::new(),
             interrupt: None,
+            config,
+            suspend: None,
+            pm_failed: false,
         };
-        card.start(config)?;
+        card.start(config, false)?;
         Ok(card)
     }
     pub fn host(&self) -> &SdhciHost {
@@ -202,9 +236,13 @@ impl<R: Registers> Card<R> {
             .registers()
             .write16(CLOCK_CONTROL, word | CLK_CARD_EN);
         self.host.current_clock_hz = self.host.clock_base_hz / divisor;
+        self.controller.registers().clock_changed(target);
         Ok(())
     }
-    fn start(&mut self, config: Config) -> Result<(), Error> {
+    /// Linux `mmc_power_up` + `mmc_attach_sdio`/`mmc_sdio_init_card`.
+    /// `reinit`: `mmc_sdio_reinit_card`, whose `mmc_sdio_pre_init` resets
+    /// the card's I/O portion (`sdio_reset`) before CMD0/CMD5.
+    fn start(&mut self, config: Config, reinit: bool) -> Result<(), Error> {
         let io = self.controller.registers();
         io.write32(SIGNAL_ENABLE, 0);
         io.write32(INT_ENABLE, 0);
@@ -229,6 +267,16 @@ impl<R: Registers> Card<R> {
             return Err(Error::Unsupported);
         }
         self.host = SdhciHost::new(0, version, caps, caps1);
+        if self.host.clock_base_hz == 0 {
+            // sdhci_setup_host: no CAPABILITIES base clock -> get_max_clock.
+            if let Some(hz) = self.controller.registers().base_clock_hz() {
+                self.host.clock_base_hz = hz;
+            }
+        }
+        // sdhci_setup_host: DMA admission (and the platform's bus-master
+        // grant) before the card is touched; failure keeps PIO.
+        self.host.dma = self.controller.setup_dma(version, caps);
+        let io = self.controller.registers();
         if !config.non_removable && io.read32(PRESENT_STATE) & PS_CARD_PRESENT == 0 {
             return Err(Error::NoCard);
         }
@@ -247,7 +295,12 @@ impl<R: Registers> Card<R> {
             INT_CMD_MASK | INT_DATA_MASK | INT_ERROR | INT_BUS_POWER | INT_AUTO_CMD_ERR,
         );
         self.set_clock(400_000)?;
-        Self::delay(1_000); // >74 initialization clocks at 400 kHz.
+        // mmc_power_up: "at least 74 clock sizes, or 1 ms, or the time
+        // required to reach a stable voltage" (`ios.power_delay_ms`, 10).
+        Self::delay(10_000);
+        if reinit {
+            self.sdio_reset();
+        }
         self.controller.execute(0, 0, Response::None, None)?;
         let query = self.controller.execute(5, 0, Response::R4, None)?;
         let count = ((query & OCR_FUNC_COUNT_MASK) >> OCR_FUNC_COUNT_SHIFT) as u8;
@@ -315,6 +368,7 @@ impl<R: Registers> Card<R> {
         let capability = self
             .direct(false, 0, CCCR_CARD_CAPABILITY, 0)
             .map_err(|_| Error::Response)?;
+        self.host.multi_block = capability & CARD_CAP_SMB != 0;
         let mut high_speed = false;
         if config.high_speed
             && self.host.can_do_hispeed()
@@ -359,7 +413,19 @@ impl<R: Registers> Card<R> {
         self.host.high_speed = high_speed;
         Ok(())
     }
+    /// Linux `mmc_card_suspended`: no command reaches a suspended card,
+    /// and a card whose resume failed stays refused.
+    fn pm_gate(&self) -> Result<(), SdioError> {
+        if self.pm_failed {
+            Err(SdioError::HostError)
+        } else if self.suspend.is_some() {
+            Err(SdioError::Busy)
+        } else {
+            Ok(())
+        }
+    }
     fn direct(&mut self, write: bool, func: u8, addr: u32, value: u8) -> Result<u8, SdioError> {
+        self.pm_gate()?;
         if func > self.host.func_count {
             return Err(SdioError::BadFunction);
         }
@@ -452,11 +518,26 @@ impl<R: Registers> Card<R> {
         block_mode: bool,
         data: Data<'_>,
     ) -> Result<(), SdioError> {
+        self.transfer_published(func, addr, increment, block_mode, data, None)
+    }
+    fn transfer_published(
+        &mut self,
+        func: u8,
+        addr: u32,
+        increment: bool,
+        block_mode: bool,
+        data: Data<'_>,
+        scope: Option<&mut dyn crate::pio::Publication>,
+    ) -> Result<(), SdioError> {
+        self.pm_gate()?;
         if func == 0 || func > self.host.func_count {
             return Err(SdioError::BadFunction);
         }
         if self.enabled & (1 << func) == 0 {
             return Err(SdioError::NotEnabled);
+        }
+        if scope.is_some() && self.observing & (1 << func) == 0 {
+            return Err(SdioError::Unsupported);
         }
         let (len, block, write) = match &data {
             Data::Read { bytes, block_size } => (bytes.len(), *block_size, false),
@@ -477,25 +558,54 @@ impl<R: Registers> Card<R> {
         {
             return Err(SdioError::LengthOverflow);
         }
+        if scope.is_some() {
+            let required = (1 << func) | 1;
+            let enabled = self.direct(false, 0, CCCR_INT_ENABLE, 0)?;
+            if enabled & required != required {
+                return Err(SdioError::NotEnabled);
+            }
+        }
+        if block_mode && scope.is_some() {
+            // The physical block extent is accepted only after actual
+            // current FBR geometry matches the original retained program.
+            let at = fbr_base(func) + FBR_BLKSZ_0;
+            let low = self.direct(false, 0, at, 0)?;
+            let high = self.direct(false, 0, at + 1, 0)?;
+            if u16::from_le_bytes([low, high]) != block {
+                return Err(SdioError::LengthOverflow);
+            }
+        }
         let count = if block_mode {
             len / usize::from(block)
         } else {
             len & 511
         } as u16;
         let argument = cmd53_arg(write, func, block_mode, increment, addr, count);
-        self.controller
-            .execute(53, argument, Response::R5, Some(data))
-            .map(|_| ())
-            .map_err(map_error)
+        match scope {
+            Some(scope) => {
+                self.controller
+                    .execute_published(53, argument, Response::R5, Some(data), scope)
+            }
+            None => self
+                .controller
+                .execute(53, argument, Response::R5, Some(data)),
+        }
+        .map(|_| ())
+        .map_err(map_error)
     }
 }
 fn map_error(error: HostError) -> SdioError {
     match error {
         HostError::Card(flags) => SdioError::ResponseError(flags),
+        HostError::Denied => SdioError::Denied,
+        HostError::Busy => SdioError::Busy,
         _ => SdioError::HostError,
     }
 }
 impl<R: Registers> SdioFunction for Card<R> {
+    fn source(&self) -> Option<crate::source::Source> {
+        self.controller.source()?.retain_card(&self.live)
+    }
     fn cmd52_read(&mut self, func: u8, addr: u32) -> Result<u8, SdioError> {
         self.direct(false, func, addr, 0)
     }
@@ -528,6 +638,84 @@ impl<R: Registers> SdioFunction for Card<R> {
             },
         )
     }
+    fn observe_publication(&mut self, functions: u8) -> Result<(), SdioError> {
+        let valid = ((1u16 << (self.host.func_count + 1)) - 2) as u8;
+        if functions == 0 || functions & !valid != 0 || self.enabled & functions != functions {
+            return Err(SdioError::BadFunction);
+        }
+        let before = self.direct(false, 0, CCCR_INT_ENABLE, 0)?;
+        let expected = before | functions | 1;
+        self.direct(true, 0, CCCR_INT_ENABLE, expected)?;
+        if self.direct(false, 0, CCCR_INT_ENABLE, 0)? != expected {
+            return Err(SdioError::HostError);
+        }
+        let io = self.controller.registers();
+        let status = io.read32(INT_ENABLE);
+        if status == u32::MAX {
+            return Err(SdioError::HostError);
+        }
+        io.write32(INT_ENABLE, status | INT_CARD_INT);
+        let observed = io.read32(INT_ENABLE);
+        if observed == u32::MAX || observed & INT_CARD_INT == 0 {
+            return Err(SdioError::HostError);
+        }
+        self.observing |= functions;
+        Ok(())
+    }
+    fn clear_publication_pending(&mut self) -> Result<(), SdioError> {
+        self.pm_gate()?;
+        if self.observing == 0 {
+            return Err(SdioError::Unsupported);
+        }
+        self.controller
+            .registers()
+            .write32(INT_STATUS, INT_CARD_INT);
+        Ok(())
+    }
+    fn cmd53_block_write_published(
+        &mut self,
+        func: u8,
+        addr: u32,
+        size: u16,
+        count: u16,
+        buf: &[u8],
+        scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        if usize::from(size) * usize::from(count) != buf.len() {
+            return Err(SdioError::LengthOverflow);
+        }
+        self.transfer_published(
+            func,
+            addr,
+            true,
+            true,
+            Data::Write {
+                bytes: buf,
+                block_size: size,
+            },
+            Some(scope),
+        )
+    }
+    fn cmd53_write_published(
+        &mut self,
+        func: u8,
+        addr: u32,
+        buf: &[u8],
+        scope: &mut dyn crate::pio::Publication,
+    ) -> Result<(), SdioError> {
+        let size = u16::try_from(buf.len()).map_err(|_| SdioError::LengthOverflow)?;
+        self.transfer_published(
+            func,
+            addr,
+            true,
+            false,
+            Data::Write {
+                bytes: buf,
+                block_size: size,
+            },
+            Some(scope),
+        )
+    }
     fn cmd53_read_fixed(&mut self, func: u8, addr: u32, buf: &mut [u8]) -> Result<(), SdioError> {
         let size = u16::try_from(buf.len()).map_err(|_| SdioError::LengthOverflow)?;
         self.transfer(
@@ -535,6 +723,31 @@ impl<R: Registers> SdioFunction for Card<R> {
             addr,
             false,
             false,
+            Data::Read {
+                bytes: buf,
+                block_size: size,
+            },
+        )
+    }
+    fn multi_block(&self) -> bool {
+        self.host.multi_block
+    }
+    fn cmd53_block_read_fixed(
+        &mut self,
+        func: u8,
+        addr: u32,
+        size: u16,
+        count: u16,
+        buf: &mut [u8],
+    ) -> Result<(), SdioError> {
+        if usize::from(size) * usize::from(count) != buf.len() {
+            return Err(SdioError::LengthOverflow);
+        }
+        self.transfer(
+            func,
+            addr,
+            false,
+            true,
             Data::Read {
                 bytes: buf,
                 block_size: size,
@@ -610,10 +823,97 @@ impl<R: Registers> SdioFunction for Card<R> {
         }
         Ok(true)
     }
+    fn disable_card_interrupt(&mut self) -> Result<(), SdioError> {
+        // This Card is handed off whole and has exactly one subscriber. Close
+        // that original CPU route even if current MMIO or a later CMD52 fails.
+        self.observing = 0;
+        let interrupt = self.interrupt.take();
+        if let Some(interrupt) = interrupt.as_ref() {
+            interrupt.subscriber.clear();
+        }
+        let host_disabled = {
+            let io = self.controller.registers();
+            let signal = io.read32(SIGNAL_ENABLE);
+            io.write32(SIGNAL_ENABLE, signal & !INT_CARD_INT);
+            let status = io.read32(INT_ENABLE);
+            io.write32(INT_ENABLE, status & !INT_CARD_INT);
+            io.read32(SIGNAL_ENABLE) & INT_CARD_INT == 0
+                && io.read32(INT_ENABLE) & INT_CARD_INT == 0
+        };
+        // oneshot::Line::drop masks the original CPU line. No rearm or fresh
+        // endpoint lookup can reattach this retired subscription.
+        drop(interrupt);
+        self.direct(true, 0, CCCR_INT_ENABLE, 0)?;
+        let card_disabled = self.direct(false, 0, CCCR_INT_ENABLE, 0)? == 0;
+        if !host_disabled || !card_disabled {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
+    }
+    fn disable_func(&mut self, func: u8) -> Result<(), SdioError> {
+        if func == 0 || func > self.host.func_count {
+            return Err(SdioError::BadFunction);
+        }
+        // Destructive native function retirement cannot leave a copied AP
+        // host/Card receipt live, even if a later explicit enable succeeds.
+        self.live.retire();
+        let bit = 1 << func;
+        // Deny host transfers before any uncertain native transition. CMD52
+        // cleanup remains possible; an explicit new enable is a separate act.
+        self.enabled &= !bit;
+        let before = self.direct(false, 0, CCCR_IO_ENABLE, 0)?;
+        let expected = before & !bit;
+        self.direct(true, 0, CCCR_IO_ENABLE, expected)?;
+        if self.direct(false, 0, CCCR_IO_ENABLE, 0)? != expected {
+            return Err(SdioError::NotEnabled);
+        }
+        let mut error = None;
+        let deadline = Deadline::after_us(
+            u64::from(self.functions[func as usize].enable_timeout_ms.max(1)) * 1000,
+        );
+        let ready = narf_scheduler::responsive_spin_until(
+            || match self.direct(false, 0, CCCR_IO_READY, 0) {
+                Ok(value) => value & bit == 0,
+                Err(e) => {
+                    error = Some(e);
+                    true
+                }
+            },
+            deadline,
+        );
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if !ready {
+            return Err(SdioError::NotEnabled);
+        }
+        // Successful PIO commands own no caller pointer. An asserted current
+        // command/data engine is nevertheless not a transport-stop receipt.
+        let state = self.controller.registers().read32(PRESENT_STATE);
+        if state & (PS_CMD_INHIBIT | PS_DATA_INHIBIT | PS_DOING_READ | PS_DOING_WRITE) != 0 {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
+    }
     fn rearm_card_interrupt(&mut self) {
         if let Some(interrupt) = self.interrupt.as_ref() {
             interrupt.line.unmask();
         }
+    }
+    fn host_pm_caps(&mut self) -> crate::sdio::function::PmFlags {
+        Card::host_pm_caps(self)
+    }
+    fn suspend_host(&mut self, flags: crate::sdio::function::PmFlags) -> Result<(), SdioError> {
+        Card::suspend_host(self, flags)
+    }
+    fn resume_host(&mut self) -> Result<(), SdioError> {
+        Card::resume_host(self)
+    }
+    fn power_off_host(&mut self) -> Result<(), SdioError> {
+        Card::power_off_host(self)
+    }
+    fn hw_reset(&mut self) -> Result<(), SdioError> {
+        Card::hw_reset(self)
     }
     fn set_block_size(&mut self, func: u8, size: u16) -> Result<(), SdioError> {
         if func == 0 || func > self.host.func_count {
@@ -660,6 +960,9 @@ impl<R: Registers> SdioFunction for Card<R> {
         Ok(())
     }
 }
+
+#[path = "card_pm.rs"]
+mod pm;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "card_tests.rs"]

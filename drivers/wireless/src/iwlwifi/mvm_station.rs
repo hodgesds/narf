@@ -39,7 +39,9 @@ impl Owner {
             .as_mut()
             .and_then(|p| p.mlme.data.as_mut())
         {
-            d.aggregate.pop(now);
+            d.each_receiver(|_, aggregate| {
+                aggregate.pop(now);
+            });
         }
     }
     pub(in crate::iwlwifi) fn station_wpa2_supported(&self) -> bool {
@@ -85,6 +87,10 @@ impl Owner {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) async fn model_configure(&mut self) -> Result<(), &'static str> {
         self.configure([2; 6]).await
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::iwlwifi) fn model_receive_queue_count(&self) -> u8 {
+        self.hardware.receive_queue_count()
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) fn model_retained(&self) -> (usize, usize, usize) {
@@ -173,6 +179,7 @@ impl Owner {
             || nvm.tx_chains != original.tx_chains
             || nvm.rx_chains != original.rx_chains
             || nvm.phy != original.phy
+            || nvm.he != original.he
         {
             return Err("MVM recovery changed NVM identity");
         }
@@ -256,6 +263,7 @@ impl Owner {
     }
     pub(in crate::iwlwifi) fn station_needs_security(&self) -> bool {
         self.security.needs_service()
+            || self.hardware.client_filter_pending()
             || !self.power.phy.actions.is_empty()
             || self.power.phy.ba.needs_work()
     }
@@ -301,6 +309,10 @@ impl Owner {
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         let mut policy = policy;
+        if self.hardware.p2p_client_native().is_some() {
+            self.check_link_power(&policy()?)?;
+            self.hardware.service_p2p_client().await?;
+        }
         self.service_ba(&mut policy).await?;
         self.service_phy_actions(&mut policy).await?;
         if let Some(frame) = self.receive_data_inner(&mut policy)? {
@@ -329,6 +341,30 @@ impl Owner {
         }
     }
 
+    pub(in crate::iwlwifi) fn select_client(
+        &mut self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        channel: u8,
+        elements: &[u8],
+        role: narf_net::native_emission::Lifetime,
+    ) -> Result<(), &'static str> {
+        if self.phase != Phase::Configured {
+            return Err("MVM client requires configured original owner");
+        }
+        let beacon = self
+            .beacons
+            .iter()
+            .find(|b| b.bssid == bssid && b.ssid == ssid && b.channel == channel)
+            .ok_or("MVM client current observed GO absent")?;
+        let plan = super::super::p2p_client::Plan::new(
+            self.mac.ok_or("MVM client native MAC absent")?,
+            beacon,
+            elements,
+        )?;
+        self.hardware.install_p2p_client(plan, role)?;
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     pub(in crate::iwlwifi) async fn station_join(
         &mut self,
@@ -363,6 +399,11 @@ impl Owner {
             information_elements: beacon.information_elements.clone(),
         };
         self.station_plan(&bss, ssid, mode, elements, self.power.phy.offered.is_some())?;
+        if let Some(client) = self.hardware.p2p_client_native() {
+            if self.client_power_request(&client.plan)?.binding != binding {
+                return Err("MVM client signed source differs from actual original program");
+            }
+        }
         // Decode and bind the exact signed input BEFORE the first PHY/queue
         // publication. No missing/malformed board asset consumes a lifecycle.
         let probe = Asset {
@@ -379,7 +420,13 @@ impl Owner {
             self.power.phy.emission(),
         )?
         .with_span(self.power.phy.span())
+        .with_client(self.hardware.p2p_client_native())?
         .host_ceiling(&policy()?)?;
+        if self.hardware.p2p_client_native().is_some() {
+            let epoch = self.hardware.close_receive_epoch()?;
+            self.hardware.prepare_p2p_client().await?;
+            self.hardware.commit_receive_epoch(epoch)?;
+        }
         self.prepare_channel_in_domain(channel, &policy()?).await?;
         self.prepare_peer_in_domain(bssid, &policy()?).await?;
         self.prepare_management_queue().await?;
@@ -454,6 +501,7 @@ impl Owner {
         if self.phase != Phase::Configured {
             return Err("MVM station close has uncertain native owner");
         }
+        self.hardware.restore_p2p_client_default().await?;
         Ok(())
     }
 }

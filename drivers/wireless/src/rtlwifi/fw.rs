@@ -44,8 +44,10 @@ pub const FW_8192DE: &str = "rtlwifi/rtl8192defw.bin";
 pub const FW_8192EE: &str = "rtlwifi/rtl8192eefw.bin";
 
 /// Firmware blob for RTL8723AE.
-/// Linux `rtl8723ae/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8723aefw.bin")`.
-pub const FW_8723AE: &str = "rtlwifi/rtl8723aefw.bin";
+/// Linux `rtl8723ae/sw.c::rtl8723e_init_sw_vars` default `fw_name`
+/// (`MODULE_FIRMWARE("rtlwifi/rtl8723fw.bin")`; UMC B-cut parts load
+/// `rtl8723fw_B.bin`, `rtl8723ae::version::Version::firmware`).
+pub const FW_8723AE: &str = "rtlwifi/rtl8723fw.bin";
 
 /// Firmware blob for RTL8723BE.
 /// Linux `rtl8723be/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8723befw.bin")`.
@@ -82,7 +84,9 @@ pub const fn fw_page_count(len: usize) -> usize {
 pub const fn fw_name_for(did: u16) -> Option<&'static str> {
     match did {
         RTL_DEV_8188EE => Some(FW_8188EE),
-        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT => Some(FW_8192CE),
+        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT | RTL_DEV_8192CE_8177 | RTL_DEV_8192CE_8191 => {
+            Some(FW_8192CE)
+        }
         RTL_DEV_8192DE => Some(FW_8192DE),
         RTL_DEV_8192EE => Some(FW_8192EE),
         RTL_DEV_8723AE => Some(FW_8723AE),

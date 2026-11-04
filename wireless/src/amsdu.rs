@@ -135,7 +135,24 @@ pub fn decode_with_limit(
     receiver: [u8; 6],
     limit: Limit,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    if !unicast(&local) || receiver == [0; 6] || receiver[0] & 1 == 0 && receiver != local {
+    decode_for_link(body, local, receiver, local, limit)
+}
+
+/// Internal single-link MLD seam: physical receiver/link provenance is already
+/// admitted by its packet owner; subframe addresses use the separately
+/// negotiated logical MSDU identity. Other bridged unicast SAs stay valid.
+pub(crate) fn decode_for_link(
+    body: &[u8],
+    local: [u8; 6],
+    receiver: [u8; 6],
+    physical_local: [u8; 6],
+    limit: Limit,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if !unicast(&local)
+        || !unicast(&physical_local)
+        || receiver == [0; 6]
+        || receiver[0] & 1 == 0 && receiver != physical_local
+    {
         return Err(Error::Address);
     }
     if !(22..=limit.bytes()).contains(&body.len()) {
@@ -167,6 +184,7 @@ pub fn decode_with_limit(
             || receiver[0] & 1 == 0 && da[0] & 1 == 0 && da != local
             || !unicast(sa)
             || sa == local
+            || sa == physical_local
         {
             return Err(Error::Address);
         }

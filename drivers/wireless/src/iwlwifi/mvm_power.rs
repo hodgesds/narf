@@ -34,6 +34,21 @@ pub(in crate::iwlwifi) enum Emission {
     /// own externally qualified program, bound by name, binding domain and
     /// record bytes 62..64; one set never authorizes another.
     Features(u16),
+    /// Firmware probe requests before a station/PHY exists. The exact
+    /// requested scan-channel list is additionally included in the binding.
+    ActiveScan,
+    /// Ordinary legacy20 AP: autonomous beacons/TIM, two internal stations,
+    /// up to8 external clients, four ACs and separately admitted SME/key TX.
+    /// An existing station/active-scan program never qualifies this role.
+    ApLegacy,
+    /// Separate DEVICE discovery/negotiation: MAC1/PHY1/BCAST/TID16 and
+    /// finite SESSION1, legacy20/no-CCK management, global SAR/device limit.
+    P2pDevice,
+    /// Separate GO9 legacy20 OFDM program: current P2P DeviceID, physical
+    /// MAC/channel, autonomous beacon/TIM and native NoA/probe projection.
+    /// Ordinary tag7 AP and tag8 DEVICE qualifications cannot substitute.
+    P2pGo,
+    P2pClient,
 }
 
 /// Emitting-feature bits of a tag5 program.
@@ -63,9 +78,23 @@ pub(in crate::iwlwifi) mod feature {
     /// Contiguous 160MHz VHT (requires `VHT`): a 160MHz PHY context, TLC
     /// 160MHz width, SGI160 and the `IWL_TLC_MCS_PER_BW_160` map.
     pub const WIDTH_160: u16 = 1 << 8;
+    /// Host-built plaintext A-MSDU under current firmware TLC/FIFO limits,
+    /// with firmware key/PN ownership and TX_CMD_OFFLD_AMSDU.
+    pub const TX_AMSDU: u16 = 1 << 9;
+    /// Native HE MAC/link/station/TLC profile and HE-variant HT Control RX.
+    pub const HE: u16 = 1 << 10;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 =
-        BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2 | VHT | WIDTH_160;
+    pub const KNOWN: u16 = BA
+        | NESTED_BA
+        | QOS_TIDS
+        | TX_LDPC
+        | TX_STBC
+        | HT40
+        | NSS2
+        | VHT
+        | WIDTH_160
+        | TX_AMSDU
+        | HE;
 }
 
 impl Emission {
@@ -77,12 +106,23 @@ impl Emission {
             Emission::Ht20Ba => 3,
             Emission::Ht20NestedBa => 4,
             Emission::Features(_) => 5,
+            Emission::ActiveScan => 6,
+            Emission::ApLegacy => 7,
+            Emission::P2pDevice => 8,
+            Emission::P2pGo => 9,
+            Emission::P2pClient => 10,
         }
     }
     /// Feature bits granted by this program (tag3/4 imply their BA bits).
     pub(in crate::iwlwifi) fn features(self) -> u16 {
         match self {
-            Emission::Legacy | Emission::Ht20 => 0,
+            Emission::Legacy
+            | Emission::Ht20
+            | Emission::ActiveScan
+            | Emission::ApLegacy
+            | Emission::P2pDevice
+            | Emission::P2pGo
+            | Emission::P2pClient => 0,
             Emission::Ht20Ba => feature::BA,
             Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
             Emission::Features(bits) => bits,
@@ -108,6 +148,8 @@ pub(super) struct Context {
     pub(super) nvm_permissions: Option<Vec<u32>>,
     pub(super) prepared: Option<Prepared>,
     pub(super) phy: super::phy::Context,
+    /// Opaque FIFO geometry returned by this firmware generation.
+    pub(super) shared_memory: Option<super::SharedMemory>,
 }
 impl Context {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -116,12 +158,14 @@ impl Context {
             nvm_permissions: None,
             prepared: None,
             phy: super::phy::Context::default(),
+            shared_memory: None,
         }
     }
 }
 
-pub(super) struct Prepared {
+pub(in crate::iwlwifi) struct Prepared {
     pub(super) emission: Emission,
+    client: Option<Arc<super::super::p2p_client::Native>>,
     source: Asset,
     sar: [[u8; 5]; 2],
     maximum: i16,
@@ -174,12 +218,60 @@ pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<Sp
 }
 
 impl Prepared {
+    pub(super) fn with_client(
+        mut self,
+        client: Option<Arc<super::super::p2p_client::Native>>,
+    ) -> Result<Self, &'static str> {
+        if (self.emission == Emission::P2pClient) != client.is_some() {
+            return Err("MVM client/ordinary power purpose differs");
+        }
+        if let Some(client) = &client {
+            client.current()?;
+            if self.channel != client.plan.channel.number || self.span.is_some() {
+                return Err("MVM client qualified native span differs");
+            }
+        }
+        self.client = client;
+        Ok(self)
+    }
+
+    pub(in crate::iwlwifi) fn is_ap(&self) -> bool {
+        self.emission == Emission::ApLegacy
+    }
+    pub(in crate::iwlwifi) fn is_go(&self) -> bool {
+        self.emission == Emission::P2pGo
+    }
+    pub(super) fn ap_source(
+        &self,
+    ) -> (
+        narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+        i16,
+        i16,
+    ) {
+        (self.source.cap, self.maximum, self.gain)
+    }
+    pub(super) fn ap_commands(&self, planned: i16) -> ([u8; 44], [u8; 44]) {
+        (chain_command(self.sar), link_command(planned))
+    }
+    pub(super) fn ap_acknowledge(&mut self, planned: i16) {
+        self.applied = Some(planned);
+    }
     /// Bind the span of a granted HT40/VHT program.
     pub(super) fn with_span(mut self, span: Option<Span>) -> Self {
         self.span = span;
         self
     }
     pub(super) fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+        if self.emission == Emission::P2pClient {
+            let client = self
+                .client
+                .as_ref()
+                .ok_or("MVM client power lacks original native role")?;
+            client.current()?;
+            if !super::super::p2p_go::host_allows(domain, client.plan.channel) {
+                return Err("MVM client current host NO_P2P prohibits role");
+            }
+        }
         if !self.source.current() || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err("MVM platform power authority or host policy is no longer valid");
         }
@@ -215,6 +307,11 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
         Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
         Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
         Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
+        Emission::ActiveScan => "mvm-api77-active-scan-power-v6",
+        Emission::ApLegacy => "mvm-api77-legacy20-ap-power-v7",
+        Emission::P2pDevice => "mvm-api77-p2p-device-power-v8",
+        Emission::P2pGo => "mvm-api77-p2p-go-power-v9",
+        Emission::P2pClient => "mvm-api77-p2p-client-power-v10",
         Emission::Features(bits) => {
             features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
             &features
@@ -225,6 +322,19 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
             "iwlwifi/{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             program, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         ),
+        binding,
+    }
+}
+fn bind_scan_program(base: [u8; 32], channels: &[u8]) -> PowerRequest {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"NARF Intel MVM exact active-scan channel program v6");
+    hash.update(&base);
+    hash.update(&[channels.len() as u8]);
+    hash.update(channels);
+    let binding = hash.finalize();
+    let digest: String = binding.iter().map(|b| format!("{b:02x}")).collect();
+    PowerRequest {
+        name: format!("iwlwifi/mvm-api77-active-scan-power-v6-{digest}.bin"),
         binding,
     }
 }
@@ -247,6 +357,7 @@ pub(super) fn parse_for(
     let values = validate_record(&source, binding, mac, emission)?;
     Ok(Prepared {
         emission,
+        client: None,
         source,
         sar: values.sar,
         maximum: values.maximum,
@@ -264,6 +375,110 @@ pub(super) struct Values {
     sar: [[u8; 5]; 2],
     maximum: i16,
     gain: i16,
+}
+
+/// Retained qualification and device-wide ceiling for one firmware scan.
+/// A command/future is polled inside current capability invocation; neither
+/// an earlier power receipt nor a copied policy can authorize later probes.
+pub(super) struct ScanFence {
+    cap: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    channels: Vec<u8>,
+    active: Vec<bool>,
+    maximum: i16,
+    gain: i16,
+    applied: i16,
+}
+impl ScanFence {
+    fn ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return Err("MVM active-scan current country unavailable");
+        }
+        let mut ceiling = self.maximum;
+        for (&channel, &active) in self.channels.iter().zip(&self.active) {
+            if !super::scan::passive_permitted(domain, channel) {
+                return Err("MVM active-scan receive policy tightened");
+            }
+            if active {
+                let host = super::super::connection::host_channel_power(domain, channel, true)
+                    .ok_or("MVM active-scan probe policy tightened")?;
+                ceiling = ceiling.min(i16::from(host) * 8 - self.gain);
+            }
+        }
+        if !(-1024..=1016).contains(&ceiling) {
+            return Err("MVM active-scan power ceiling out of range");
+        }
+        Ok(ceiling)
+    }
+    pub(super) fn invoke<T>(
+        &self,
+        domain: &RegulatoryDomain,
+        operation: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        struct Live<'a, F> {
+            fence: &'a ScanFence,
+            domain: &'a RegulatoryDomain,
+            operation: F,
+        }
+        impl<T, F: FnOnce() -> Result<T, &'static str>> CapOp<narf_firmware::FirmwareBlob, Read>
+            for Live<'_, F>
+        {
+            type Output = Result<T, &'static str>;
+            fn execute(
+                self,
+                _: &Cap<narf_firmware::FirmwareBlob, Read>,
+            ) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    if self.fence.ceiling(self.domain)? < self.fence.applied {
+                        return Err("MVM active-scan ceiling tightened below applied power");
+                    }
+                    (self.operation)()
+                })())
+            }
+        }
+        self.cap
+            .invoke(Live {
+                fence: self,
+                domain,
+                operation,
+            })
+            .map_err(|_| "MVM active-scan qualification revoked")?
+    }
+    pub(super) fn device_command(&self) -> [u8; 44] {
+        let mut body = [0; 44];
+        put32(&mut body, 0, 1); // IWL_TX_POWER_MODE_SET_DEVICE, no PHY/link.
+        body[8..10].copy_from_slice(&self.applied.to_le_bytes());
+        body
+    }
+}
+impl Prepared {
+    pub(super) fn scan_fence(
+        &self,
+        channels: &[u8],
+        active: &[bool],
+        domain: &RegulatoryDomain,
+    ) -> Result<ScanFence, &'static str> {
+        if self.emission != Emission::ActiveScan
+            || channels.len() != active.len()
+            || !active.iter().any(|active| *active)
+        {
+            return Err("MVM active-scan has no qualified probe channel");
+        }
+        let mut fence = ScanFence {
+            cap: self.source.cap,
+            channels: channels.to_vec(),
+            active: active.to_vec(),
+            maximum: self.maximum,
+            gain: self.gain,
+            applied: -1024,
+        };
+        fence.applied = fence.ceiling(domain)?;
+        fence.invoke(domain, || Ok(()))?;
+        Ok(fence)
+    }
+    pub(super) fn scan_chain_command(&self) -> [u8; 44] {
+        chain_command(self.sar)
+    }
 }
 pub(super) fn validate_record(
     source: &Asset,
@@ -315,6 +530,7 @@ pub(super) fn validate_record(
 /// native power owner. It retains the actual signed source, not a ready bit.
 #[derive(Clone)]
 pub(in crate::iwlwifi) struct Fence {
+    client: Option<Arc<super::super::p2p_client::Native>>,
     cap: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     maximum: i16,
     gain: i16,
@@ -324,6 +540,13 @@ pub(in crate::iwlwifi) struct Fence {
     stop: Option<Arc<AtomicBool>>,
 }
 impl Fence {
+    pub(in crate::iwlwifi) fn radiated_dbm(&self) -> Result<i8, &'static str> {
+        i8::try_from(
+            (self.applied + self.gain).div_euclid(8)
+                + i16::from((self.applied + self.gain).rem_euclid(8) != 0),
+        )
+        .map_err(|_| "MVM actual radiated bound exceeds supported range")
+    }
     pub(in crate::iwlwifi) fn invoke<T>(
         &self,
         domain: &RegulatoryDomain,
@@ -345,6 +568,12 @@ impl Fence {
             ) -> Result<Self::Output, CapError> {
                 Ok((|| {
                     let f = self.fence;
+                    if let Some(client) = &f.client {
+                        client.current()?;
+                        if !super::super::p2p_go::host_allows(self.domain, client.plan.channel) {
+                            return Err("MVM client current NO_P2P publication prohibited");
+                        }
+                    }
                     if f.stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire))
                         || !self.domain.country_code.iter().all(u8::is_ascii_uppercase)
                     {
@@ -375,6 +604,7 @@ impl Fence {
 impl Prepared {
     pub(super) fn fence(&self) -> Result<Fence, &'static str> {
         Ok(Fence {
+            client: self.client.clone(),
             cap: self.source.cap,
             maximum: self.maximum,
             gain: self.gain,
@@ -489,6 +719,21 @@ impl Owner {
             Emission::Features(_) => {
                 &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM feature program power v5"[..]
             }
+            Emission::ActiveScan => {
+                &b"NARF Intel MVM API77 qualified active-scan legacy probe rates24+5 raw26 SSIDs20 dwell30TU SET_CHAINS+SET_DEVICE power v6"[..]
+            }
+            Emission::ApLegacy => {
+                &b"NARF Intel MVM API77 qualified legacy20 AP beacon-TIM two-internal eight-client four-AC SME-CCMP-PMF source-fenced program power v7"[..]
+            }
+            Emission::P2pDevice => {
+                &b"NARF Intel MVM API77 qualified P2P DEVICE MAC1 PHY1 BCAST TID16 SESSION1 legacy20 OFDM6 management SET_CHAINS SET_DEVICE power v8"[..]
+            }
+            Emission::P2pGo => {
+                &b"NARF Intel MVM API77 qualified P2P GO9 MAC0 PHY0 OFDM-only legacy20 beacon TIM eight-client four-AC SME host-GTK-CCMP IGTK-CMAC exact-PN native-NoA probe program power v9"[..]
+            }
+            Emission::P2pClient => {
+                &b"NARF Intel MVM API77 qualified P2P CLIENT8 MAC0 STA7 PHY0 OFDM-only legacy20 protected RSNA peer-NoA CTWindow original-role source-bound public-P2P FRAME native-ACK program power v10-public1"[..]
+            }
         });
         if let Emission::Features(bits) = emission {
             hash.update(&bits.to_le_bytes());
@@ -501,6 +746,70 @@ impl Owner {
         hash.update(&image.finalize());
         hash.update(&platform_digest()?);
         Ok(request(hash.finalize(), mac, emission))
+    }
+
+    pub(in crate::iwlwifi) fn client_power_request_for_bss(
+        &mut self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        frequency: u32,
+        elements: &[u8],
+    ) -> Result<PowerRequest, &'static str> {
+        let beacon = self
+            .beacons
+            .iter()
+            .find(|b| {
+                b.bssid == bssid
+                    && b.ssid == ssid
+                    && super::super::native_band::Channel {
+                        band: b.band,
+                        number: b.channel,
+                    }
+                    .frequency()
+                        == frequency
+            })
+            .ok_or("MVM client qualification requires actual observed GO")?;
+        let plan = super::super::p2p_client::Plan::new(
+            self.mac.ok_or("MVM client physical MAC unavailable")?,
+            beacon,
+            elements,
+        )?;
+        self.client_power_request(&plan)
+    }
+    pub(in crate::iwlwifi) fn client_power_request(
+        &mut self,
+        plan: &super::super::p2p_client::Plan,
+    ) -> Result<PowerRequest, &'static str> {
+        if self.mac != Some(plan.own) || !self.ap_capable() {
+            return Err("MVM client physical/native consumer absent");
+        }
+        let base = self.transmit_power_request_for(Emission::P2pClient)?;
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(b"NARF exact API77 P2P client8 station7 peer/device/request program v10");
+        hash.update(&base.binding);
+        hash.update(&plan.binding());
+        Ok(request(hash.finalize(), plan.own, Emission::P2pClient))
+    }
+
+    /// Exact scan-emission qualification name and binding for the retained
+    /// MAC, firmware, platform, chain facts and ordered channel list. This
+    /// does not authorize association or reuse a station's power program.
+    pub fn scan_power_request(&mut self, channels: &[u8]) -> Result<PowerRequest, &'static str> {
+        if channels.is_empty()
+            || channels.len() > 51
+            || channels.iter().enumerate().any(|(i, ch)| {
+                super::super::station_api::channel_index(*ch).is_none()
+                    || channels[..i].contains(ch)
+            })
+        {
+            return Err("invalid MVM active-scan qualification channels");
+        }
+        let base = self.transmit_power_request_for(Emission::ActiveScan)?;
+        Ok(bind_scan_program(base.binding, channels))
+    }
+
+    pub(super) fn scan_power_api(&self) -> bool {
+        self.power.reduced_v5 && self.hardware.version(1, REDUCE_TX_POWER) == Some((5, 0))
     }
 
     pub fn prepared_transmit_power(&self) -> Option<PowerStatus> {
@@ -582,7 +891,8 @@ impl Owner {
                 self.power.phy.emission(),
             )?
         }
-        .with_span(self.power.phy.span());
+        .with_span(self.power.phy.span())
+        .with_client(self.hardware.p2p_client_native())?;
         let domain = policy()?;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase)
             || span_power(&domain, channel, self.power.phy.span()).is_none()
@@ -607,6 +917,9 @@ impl Owner {
     }
 
     pub(super) fn current_power(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+        if self.power.phy.features & feature::HE != 0 && !self.scan_he_permitted() {
+            return Err("MVM current MCC profile prohibits HE operation");
+        }
         let prepared = self
             .power
             .prepared

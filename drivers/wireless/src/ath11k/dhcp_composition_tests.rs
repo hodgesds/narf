@@ -74,13 +74,13 @@ fn drain() -> bool {
         .and_then(|consumer| consumer.try_recv().ok().flatten());
     let transmitted = frame.is_some();
     if let Some(frame) = frame {
-        if run(netdev.tx_one(&frame)).is_err() {
+        if run!(netdev.tx_one(&frame)).is_err() {
             DRAIN_FAILED.store(true, Ordering::Release);
         }
     }
     let before = RX_SEEN.lock().len();
-    run(netdev.shared.irq.wait(1));
-    run(netdev.service_once());
+    run!(netdev.shared.irq.wait(1));
+    run!(netdev.service_once());
     transmitted || RX_SEEN.lock().len() != before
 }
 
@@ -147,7 +147,7 @@ fn composition(secured: bool) -> R {
         },
         ie: Vec::new(),
     };
-    let (r, err, _, _) = latched(|| run(u.netdev.associate_kernel(req)));
+    let (r, err, _, _) = latched(|| run!(u.netdev.associate_kernel(req)));
     ensure!(r.is_ok() && err == 0, "composition association");
     ensure!(u.netdev.link_up(), "carrier after association");
     ensure!(
@@ -249,7 +249,7 @@ fn composition(secured: bool) -> R {
         "post-lease downlink entered stack RX dispatch"
     );
 
-    run(u.netdev.disassociate()).map_err(|_| "composition disconnect")?;
+    run!(u.netdev.disassociate()).map_err(|_| "composition disconnect")?;
     ensure!(!u.netdev.link_up(), "carrier after disconnect");
     ensure!(
         narf_net::iface::lookup(u.name).is_some_and(|iface| !iface.carrier),

@@ -569,3 +569,6 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_brcmf_flow_budget_follows_firmware_max_flowrings
 );
+
+#[path = "iommu_quiesce_tests.rs"]
+mod iommu_quiesce_tests;

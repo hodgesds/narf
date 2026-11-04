@@ -41,6 +41,47 @@ fn ht40() -> LocalHt {
 fn local_ht() -> LocalPhy {
     LocalPhy::ht20(LocalHt::siso20(true, true)).unwrap()
 }
+fn rx_amsdu_capacity() -> Result<(), &'static str> {
+    for large in [false, true] {
+        let local = LocalHt::siso20(false, false).with_rx_amsdu_7935(large);
+        check!(
+            (u16::from_le_bytes(local.capability_body()[..2].try_into().unwrap()) & 0x800 != 0)
+                == large,
+            "local RX capacity did not drive HT bit11"
+        );
+        // The AP advertises only mandatory3839 reception. Its TX can still
+        // send our advertised7935; do not intersect these directional facts.
+        let mut ht_op = [0; 22];
+        ht_op[0] = 1;
+        ht_op[6] = 255;
+        let peer = bss(
+            LocalHt::siso20(false, false).capability_body(),
+            ht_op,
+            None,
+            None,
+        );
+        let mut plan = ready(&peer, LocalPhy::ht20(local).unwrap());
+        check!(
+            plan.association_response(&response(&peer)) == Ok(Some(7)),
+            "directional RX capacity association refused"
+        );
+        let ht = plan.negotiated_phy().ok_or("missing HT negotiation")?.ht();
+        check!(
+            ht.rx_amsdu_limit().bytes() == if large { 7935 } else { 3839 }
+                && ht.peer_capability() & 0x800 == 0,
+            "peer RX capacity narrowed the independent local RX promise"
+        );
+    }
+    check!(
+        LocalHt::siso20(false, false).capability_body()[1] & 8 == 0,
+        "default HT constructors enlarged their RX promise"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_rx_amsdu_capacity_is_directional,
+    rx_amsdu_capacity
+);
 fn local_vht() -> LocalPhy {
     LocalPhy::vht80(
         ht40(),
@@ -57,6 +98,43 @@ fn local_vht160() -> LocalPhy {
     )
     .unwrap()
 }
+fn native_response_sae_h2e_selector() -> Result<(), &'static str> {
+    let scan = ap(true, true, None);
+    let offer = Offer::from_elements(local_vht(), &scan.information_elements, scan.channel)
+        .map_err(|_| "native selector offer")?
+        .ok_or("native selector PHY absent")?;
+    let mut response = scan.information_elements.clone();
+    element(&mut response, 50, &[0xfb]);
+    check!(
+        offer.response_elements(&response).is_err()
+            && offer
+                .response_elements_with_sae_h2e(&response, false)
+                .is_err()
+            && Offer::from_elements(local_vht(), &response, scan.channel).is_err(),
+        "legacy native PHY entrypoint silently acquired SAE-H2E permission"
+    );
+    let confirmed = offer
+        .response_elements_with_sae_h2e(&response, true)
+        .map_err(|_| "negotiated H2E selector was rejected by independent PHY parser")?;
+    check!(
+        confirmed.width() == offer.width()
+            && confirmed.center_channel() == offer.center_channel()
+            && confirmed.ht().tx_mcs() == offer.ht().tx_mcs(),
+        "security selector changed native PHY facts"
+    );
+    *response.last_mut().unwrap() = 0xfa;
+    check!(
+        offer
+            .response_elements_with_sae_h2e(&response, true)
+            .is_err(),
+        "H2E parsing fact admitted unsupported HE membership"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_native_response_sae_h2e_selector_requires_explicit_fact,
+    native_response_sae_h2e_selector
+);
 fn ap160(primary: u8, center: u8, revised: bool) -> Bss {
     let index = usize::from((primary - (center - 14)) / 4);
     let mut operation = [0; 22];

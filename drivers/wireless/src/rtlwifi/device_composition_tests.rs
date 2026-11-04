@@ -2,6 +2,7 @@
 //! DHCP client. Only MMIO, DMA and the peer are inert. No test installs a
 //! physical firmware or board-calibration registry entry.
 use super::super::super::super::super::{
+    aspm,
     firmware_transport::{Owner as Firmware, PacketIo, Stage},
     interface::Device,
 };
@@ -15,10 +16,36 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 struct BootPort {
     packet: PacketPort,
     pages: Arc<IrqSafeSpinLock<Vec<Vec<u8>>>>,
+    powered_off: Arc<AtomicBool>,
+    power_ack: Arc<AtomicBool>,
+    cycles: Arc<AtomicUsize>,
 }
 #[async_trait::async_trait]
 impl Io for BootPort {
     fn read8(&self, reg: u16) -> Result<u8, AccessError> {
+        if reg == 5 && self.power_ack.load(Ordering::Acquire) {
+            let value = self.packet.radio.hardware_read8(reg);
+            if value & 3 != 0 {
+                if self.packet.model.lock().master {
+                    return Err(AccessError::Gate);
+                }
+                if value & 2 != 0 {
+                    self.powered_off.store(true, Ordering::Release);
+                }
+                if value & 1 != 0 {
+                    if !self.powered_off.swap(false, Ordering::AcqRel) {
+                        return Err(AccessError::Gate);
+                    }
+                    let mut model = self.packet.model.lock();
+                    model.started = false;
+                    model.slots = [0; 7];
+                    model.rx_next = 0;
+                    model.held = None;
+                    self.cycles.fetch_add(1, Ordering::AcqRel);
+                }
+                self.packet.radio.hardware_byte(reg, value & !3);
+            }
+        }
         self.packet.read8(reg)
     }
     fn read32(&self, reg: u16) -> Result<u32, AccessError> {
@@ -35,9 +62,16 @@ impl Io for BootPort {
         self.packet.read32(reg)
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), AccessError> {
+        let begin_download =
+            reg == 0x80 && value & 1 != 0 && self.packet.radio.hardware_read8(0x80) & 1 == 0;
         self.packet.write8(reg, value)?;
         if reg == 0x80 && value & 4 != 0 {
             self.packet.radio.hardware_byte(reg, value & !4);
+        }
+        if begin_download {
+            for page in self.pages.lock().iter_mut() {
+                page.clear();
+            }
         }
         Ok(())
     }
@@ -104,25 +138,138 @@ impl Default for IrqFixture {
         }
     }
 }
+type ChannelFixtureSource = (
+    u8,
+    Vec<u8>,
+    narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+);
 struct DeviceEnvironment {
+    firmware: IrqSafeSpinLock<Arc<Firmware<BootPort>>>,
+    device: IrqSafeSpinLock<alloc::sync::Weak<TestDevice>>,
     irq: Arc<IrqFixture>,
     admission: Arc<Admission>,
     base: Arc<Env>,
     packet: PacketPort,
     beacon: AtomicBool,
     ht: Option<HtFixtureSource>,
+    ht_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    ht_wide: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    protection: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    tracking: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    antenna: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    fallback_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    bus_power: IrqSafeSpinLock<Option<Arc<aspm::tests::Model>>>,
 }
 impl Environment for DeviceEnvironment {
+    async fn prepare_bus_power(&self) -> Result<(), StationError> {
+        let model = self.bus_power.lock().clone();
+        if let Some(model) = model {
+            aspm::configure(model.as_ref(), true)
+                .await
+                .map_err(Error::Access)
+                .map_err(StationError::Radio)
+        } else {
+            Ok(())
+        }
+    }
+    fn allow_channel(
+        &self,
+        factory: &super::super::super::super::super::efuse::Factory,
+        channel: u8,
+    ) -> Result<(), StationError> {
+        if !(1..=11).contains(&channel) {
+            return Err(StationError::Profile);
+        }
+        power::calibration_for_channel(factory, channel)
+            .permission(&self.domain()?, channel)
+            .map(|_| ())
+            .map_err(|_| StationError::Profile)
+    }
+    fn change_channel(
+        &self,
+        channel: u8,
+    ) -> Option<core::pin::Pin<Box<dyn Future<Output = Result<(), StationError>> + Send>>> {
+        let device = self.device.lock().upgrade()?;
+        Some(
+            match device.schedule(
+                super::super::super::super::super::interface::supervisor::Operation::Retune(
+                    channel,
+                ),
+            ) {
+                Ok(waiter) => Box::pin(waiter),
+                Err(reason) => Box::pin(async move { Err(reason) }),
+            },
+        )
+    }
+    fn recovery(
+        &self,
+    ) -> Option<core::pin::Pin<Box<dyn Future<Output = Result<(), StationError>> + Send>>> {
+        let device = self.device.lock().upgrade()?;
+        let pending = device
+            .schedule(super::super::super::super::super::interface::supervisor::Operation::Recover);
+        Some(match pending {
+            Ok(waiter) => Box::pin(waiter),
+            Err(error) => Box::pin(async move { Err(error) }),
+        })
+    }
     fn fallback(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::super::super::super::fallback::Grant>>, StationError> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(StationError::State)?
+            .channel_for_test();
+        if channel != 1 {
+            let source = self.fallback_channel.lock();
+            let Some((expected, bytes, cap)) = source.as_ref() else {
+                return Ok(None);
+            };
+            if *expected != channel {
+                return Ok(None);
+            }
+            return super::super::super::super::super::fallback::Grant::parse(
+                base,
+                self.firmware.lock().identity().ok_or(StationError::State)?,
+                bytes,
+                Some([0x77; 32]),
+                *cap,
+            )
+            .map(|grant| Some(Arc::new(grant)))
+            .map_err(StationError::Radio);
+        }
         self.base.fallback(base)
     }
     fn ht20(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::super::super::super::ht::Grant>>, StationError> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(StationError::State)?
+            .channel_for_test();
+        if channel != 1 {
+            let source = self.ht_channel.lock();
+            let Some((expected, bytes, cap)) = source.as_ref() else {
+                return Ok(None);
+            };
+            if *expected != channel {
+                return Ok(None);
+            }
+            return super::super::super::super::super::ht::Grant::parse(
+                base,
+                self.firmware.lock().identity().ok_or(StationError::State)?,
+                bytes,
+                Some([0x77; 32]),
+                *cap,
+            )
+            .map(|grant| Some(Arc::new(grant)))
+            .map_err(StationError::Radio);
+        }
         self.ht
             .as_ref()
             .map(|(b, cap, firmware)| {
@@ -137,6 +284,106 @@ impl Environment for DeviceEnvironment {
                 .map_err(StationError::Radio)
             })
             .transpose()
+    }
+    fn rts_threshold(&self) -> Option<u16> {
+        self.device
+            .lock()
+            .upgrade()
+            .and_then(|d| d.configured_rts_threshold())
+    }
+    fn protection(
+        &self,
+        base: Arc<crate::rtlwifi::channel_power::Calibration>,
+        ht: Option<Arc<crate::rtlwifi::ht::Grant>>,
+    ) -> Result<Option<Arc<crate::rtlwifi::protection::Grant>>, StationError> {
+        let source = self.protection.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(None);
+        };
+        crate::rtlwifi::protection::Grant::parse(
+            base,
+            self.firmware.lock().identity().ok_or(StationError::State)?,
+            *channel,
+            ht,
+            bytes,
+            Some([0x77; 32]),
+            *cap,
+        )
+        .map(|g| Some(Arc::new(g)))
+        .map_err(StationError::Radio)
+    }
+    fn antenna(
+        &self,
+        base: Arc<crate::rtlwifi::channel_power::Calibration>,
+        ht: Option<Arc<crate::rtlwifi::ht::Grant>>,
+        protection: Option<Arc<crate::rtlwifi::protection::Grant>>,
+        tracking: Option<Arc<crate::rtlwifi::tracking::Grant>>,
+    ) -> Result<Option<Arc<crate::rtlwifi::antenna::Grant>>, StationError> {
+        let source = self.antenna.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(None);
+        };
+        let program = crate::rtlwifi::antenna::Program {
+            base,
+            ht,
+            protection,
+            tracking,
+            channel: *channel,
+            firmware: self.firmware.lock().identity().ok_or(StationError::State)?,
+        };
+        crate::rtlwifi::antenna::Grant::parse(program, bytes, Some([0x77; 32]), *cap)
+            .map(|g| Some(Arc::new(g)))
+            .map_err(StationError::Radio)
+    }
+    fn tracking(
+        &self,
+        base: Arc<crate::rtlwifi::channel_power::Calibration>,
+        ht: Option<Arc<crate::rtlwifi::ht::Grant>>,
+        protection: Option<Arc<crate::rtlwifi::protection::Grant>>,
+    ) -> Result<Option<Arc<crate::rtlwifi::tracking::Grant>>, StationError> {
+        let source = self.tracking.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(None);
+        };
+        crate::rtlwifi::tracking::Grant::parse(
+            base,
+            self.firmware.lock().identity().ok_or(StationError::State)?,
+            *channel,
+            ht,
+            protection,
+            bytes,
+            Some([0x77; 32]),
+            *cap,
+        )
+        .map(|g| Some(Arc::new(g)))
+        .map_err(StationError::Radio)
+    }
+    fn ht40(
+        &self,
+        base: Arc<super::super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Vec<Arc<super::super::super::super::super::ht::Grant>>, StationError> {
+        let source = self.ht_wide.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let actual = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(StationError::State)?
+            .channel_for_test();
+        if *channel != actual {
+            return Ok(Vec::new());
+        }
+        let grant = super::super::super::super::super::ht::Grant::parse(
+            base,
+            self.firmware.lock().identity().ok_or(StationError::State)?,
+            bytes,
+            Some([0x77; 32]),
+            *cap,
+        )
+        .map_err(StationError::Radio)?;
+        Ok(vec![Arc::new(grant)])
     }
     fn admission(&self) -> Option<&Arc<Admission>> {
         Some(&self.admission)
@@ -164,12 +411,22 @@ impl Environment for DeviceEnvironment {
     async fn pause(&self) {
         // The AP beacon is injected only after native packet gates opened,
         // in response to actual service progress. Nothing fills scan cache.
-        let active = { self.packet.model.lock().master };
+        let active = {
+            let model = self.packet.model.lock();
+            model.master
+                && model
+                    .peer
+                    .as_ref()
+                    .is_some_and(|peer| self.packet.primary() == peer.lock().channel)
+        };
         if active && !self.beacon.swap(true, Ordering::AcqRel) {
             let peer = self.packet.model.lock().peer.clone().unwrap();
             let beacon = {
                 let p = peer.lock();
                 let mut b = p.ap.beacon();
+                if p.erp {
+                    b.extend_from_slice(&[42, 1, 2]);
+                }
                 if let Some(w) = &p.wmm {
                     b.extend_from_slice(w);
                 }
@@ -216,18 +473,45 @@ impl Harness {
         ht: bool,
         policy: Option<Arc<narf_wireless::reg::db::Database>>,
     ) -> Self {
-        assert!(ACTIVE_TEST.lock().is_none());
+        Self::with_routes(protected, ht, policy, false)
+    }
+    fn with_routes(
+        protected: bool,
+        ht: bool,
+        policy: Option<Arc<narf_wireless::reg::db::Database>>,
+        context: bool,
+    ) -> Self {
+        Self::with_factory(protected, ht, policy, context, power::factory())
+    }
+    fn with_factory(
+        protected: bool,
+        ht: bool,
+        policy: Option<Arc<narf_wireless::reg::db::Database>>,
+        context: bool,
+        factory: crate::rtlwifi::efuse::Factory,
+    ) -> Self {
+        if !context {
+            assert!(ACTIVE_TEST.lock().is_none());
+        }
         let packet = PacketPort::new();
-        let factory = Arc::new(power::factory());
+        if context {
+            static NEXT_DMA: AtomicU64 = AtomicU64::new(0x100000);
+            packet.model.lock().next = NEXT_DMA.fetch_add(0x100000, Ordering::AcqRel);
+        }
+        let factory = Arc::new(factory);
         packet.radio.w1c(0x20a);
         packet.radio.hardware_word(0x6c, 1 << 31);
         packet.radio.hardware_byte(3, 0xff);
         packet.radio.hardware_byte(0x82, 0xf8);
+        packet.radio.hardware_byte(6, 2); // Independently supplied power-ready status.
         let pages = Arc::new(IrqSafeSpinLock::new(vec![Vec::new(); 8]));
         let firmware = Arc::new(Firmware::new(
             BootPort {
                 packet: packet.clone(),
                 pages: pages.clone(),
+                powered_off: Arc::new(AtomicBool::new(false)),
+                power_ack: Arc::new(AtomicBool::new(true)),
+                cycles: Arc::new(AtomicUsize::new(0)),
             },
             super::super::super::super::super::regs::RTL_DEV_8188EE,
         ));
@@ -304,17 +588,31 @@ impl Harness {
             Arc::new(Mutex::new(Some(owner))),
             factory,
             DeviceEnvironment {
+                firmware: IrqSafeSpinLock::new(firmware.clone()),
+                device: IrqSafeSpinLock::new(alloc::sync::Weak::new()),
                 irq: irq.clone(),
                 admission: Arc::new(Admission::new()),
                 base: env.clone(),
                 packet: packet.clone(),
                 beacon: AtomicBool::new(false),
                 ht: ht_source.clone(),
+                ht_channel: IrqSafeSpinLock::new(None),
+                ht_wide: IrqSafeSpinLock::new(None),
+                protection: IrqSafeSpinLock::new(None),
+                tracking: IrqSafeSpinLock::new(None),
+                antenna: IrqSafeSpinLock::new(None),
+                fallback_channel: IrqSafeSpinLock::new(None),
+                bus_power: IrqSafeSpinLock::new(None),
             },
         ));
+        *device.environment_for_test().device.lock() = Arc::downgrade(&device);
         device.admit_for_test();
-        *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::register(name, device.mac(), send);
+        if context {
+            device.attach_stack_for_test().unwrap();
+        } else {
+            *ACTIVE_TEST.lock() = Some(device.clone());
+            narf_net::iface::register(name, device.mac(), send);
+        }
         narf_net::iface::set_link_state(name, true); // operator IFF_UP
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
@@ -413,12 +711,36 @@ impl Harness {
             .map_or(0, |iface| iface.rx_packets)
     }
 }
+#[path = "aspm_composition_tests.rs"]
+mod aspm_composition;
+#[path = "channel_composition_tests.rs"]
+mod channel_tests;
+#[path = "ht_channel_composition_tests.rs"]
+mod ht_channels;
 #[path = "ht_composition_tests.rs"]
 mod ht_tests;
+#[path = "multi_radio_composition_tests.rs"]
+mod multi_radio;
+#[path = "power_composition_tests.rs"]
+mod power_tests;
+#[path = "probe_composition_tests.rs"]
+mod probe_tests;
+#[path = "recovery_composition_tests.rs"]
+mod recovery_tests;
+#[path = "scan_composition_tests.rs"]
+mod scans;
 impl Drop for Harness {
     fn drop(&mut self) {
-        *ACTIVE_TEST.lock() = None;
-        narf_net::iface::unregister(self.device.name());
+        {
+            let mut active = ACTIVE_TEST.lock();
+            if active
+                .as_ref()
+                .is_some_and(|device| Arc::ptr_eq(device, &self.device))
+            {
+                *active = None;
+            }
+        }
+        self.device.withdraw_stack_for_test();
     }
 }
 fn composition(protected: bool) -> TestResult {

@@ -118,6 +118,7 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(super) struct Peer {
+    pub(super) channel: u8,
     ap: FakeAp,
     plan: NetworkPlan,
     server: DhcpServer,
@@ -129,8 +130,13 @@ pub(super) struct Peer {
     hold_data: bool,
     wmm: Option<Vec<u8>>,
     ht: Option<Vec<u8>>,
+    response_ht: Option<Vec<u8>>,
+    pub(super) ht40: bool,
+    erp: bool,
     controls: Vec<Vec<u8>>,
     hold_control: bool,
+    probes: Vec<Vec<u8>>,
+    hold_probe: bool,
     tids: Vec<u8>,
 }
 impl Peer {
@@ -152,6 +158,7 @@ impl Peer {
         .with_basic_1mbps()
         .unwrap();
         Self {
+            channel: 1,
             ap,
             plan,
             server: DhcpServer::new(plan),
@@ -163,8 +170,13 @@ impl Peer {
             hold_data: false,
             wmm: None,
             ht: None,
+            response_ht: None,
+            ht40: false,
+            erp: false,
             controls: Vec::new(),
             hold_control: false,
+            probes: Vec::new(),
+            hold_probe: false,
             tids: Vec::new(),
         }
     }
@@ -201,6 +213,45 @@ impl Peer {
         Ok(frame)
     }
     pub(super) fn react(&mut self, frame: &[u8]) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.first() == Some(&0x40) {
+            if frame.len() < 26
+                || frame[1..4] != [0, 0, 0]
+                || frame[4..10] != [255; 6]
+                || frame[10..16] != self.plan.station
+                || frame[16..22] != [255; 6]
+            {
+                return Err("native AP probe identity");
+            }
+            let mut ies = &frame[24..];
+            let mut ssid = None;
+            while !ies.is_empty() {
+                let h = ies.get(..2).ok_or("native AP truncated probe IE")?;
+                let end = 2 + usize::from(h[1]);
+                let body = ies.get(2..end).ok_or("native AP probe IE extent")?;
+                if h[0] == 0 && ssid.replace(body).is_some() {
+                    return Err("native AP duplicate probe SSID");
+                }
+                ies = &ies[end..];
+            }
+            self.probes.push(frame.to_vec());
+            if ssid.is_none_or(|s| !s.is_empty() && s != SSID) {
+                return Ok((Vec::new(), self.hold_probe));
+            }
+            let mut response = self.ap.beacon();
+            response[0] = 0x50;
+            response[4..10].copy_from_slice(&self.plan.station);
+            if let Some(wmm) = &self.wmm {
+                response.extend_from_slice(wmm);
+            }
+            if let Some(ht) = &self.ht {
+                response[35] |= 4;
+                response.extend_from_slice(ht);
+            }
+            if self.erp {
+                response.extend_from_slice(&[42, 1, 2]);
+            }
+            return Ok((vec![response], self.hold_probe));
+        }
         if frame.len() < 24 || frame[4..10] != PEER || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }
@@ -222,10 +273,13 @@ impl Peer {
                 .map_err(|_| "shared AP rejected real native MLME/EAPOL")?;
             for reply in &mut replies {
                 if reply.first() == Some(&0x10) {
+                    if self.erp {
+                        reply.extend_from_slice(&[42, 1, 2]);
+                    }
                     if let Some(parameters) = &self.wmm {
                         reply.extend_from_slice(parameters);
                     }
-                    if let Some(ht) = &self.ht {
+                    if let Some(ht) = self.response_ht.as_ref().or(self.ht.as_ref()) {
                         reply[25] |= 4;
                         reply.extend_from_slice(ht);
                     }

@@ -33,6 +33,13 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_local(&self) -> Option<[u8; 6]> {
         self.station.as_ref().map(super::station::State::local)
     }
+    /// Station primary and accepted CSA state (test observation only).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn station_channel_switch(&self) -> Option<(u8, Option<station::Switch>)> {
+        self.station
+            .as_ref()
+            .map(|station| (station.channel(), station.channel_switch()))
+    }
     pub(super) fn station_peer(&self) -> Option<[u8; 6]> {
         self.station.as_ref().and_then(super::station::State::peer)
     }
@@ -78,6 +85,9 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_poll(
         &mut self,
     ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
+        if self.io.station_sleep_blocked() {
+            return Ok(alloc::vec::Vec::new());
+        }
         let station = self.station.as_mut().ok_or(super::station::Error::State)?;
         let events = self
             .io
@@ -89,6 +99,80 @@ impl<I: Io> Owner<I> {
         let frames = station.poll(&mut self.io)?;
         self.io.irq_rearm().map_err(super::station::Error::Native)?;
         Ok(frames)
+    }
+    pub(super) fn station_sleep_blocked(&self) -> bool {
+        self.io.station_sleep_blocked()
+    }
+    pub(super) async fn station_sleep_service(
+        &mut self,
+        identity: Option<narf_net::native_emission::Lifetime>,
+        enabled: bool,
+        host_idle: bool,
+        force: bool,
+        admission: &Admission,
+    ) -> Result<bool, station::Error> {
+        let idle = host_idle
+            && self
+                .station
+                .as_ref()
+                .is_some_and(station::State::sleep_idle);
+        let (sleeping, restored) = self
+            .io
+            .station_sleep_service(identity, enabled, idle, force, admission)
+            .await
+            .map_err(station::Error::Native)?;
+        if restored {
+            if let Some(station) = self.station.as_mut() {
+                station.sleep_restored();
+            }
+        }
+        Ok(sleeping)
+    }
+    /// `rtw89_ops_suspend` -> `rtw89_wow_suspend` on the started station.
+    pub(super) async fn station_wow_suspend(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        admission: &Admission,
+    ) -> Result<(), station::Error> {
+        if !self.active {
+            return Err(station::Error::State);
+        }
+        let station = self.station.as_ref().ok_or(station::Error::State)?;
+        let (keys, floors) = station.wow_snapshot()?;
+        self.io
+            .station_wow_suspend(config, keys.as_ref(), floors.as_ref(), admission)
+            .await
+            .map_err(station::Error::Native)
+    }
+    /// `rtw89_ops_resume` -> `rtw89_wow_resume`. Success keeps the same
+    /// association only when the wake reason keeps the link; an AP-gone or
+    /// unknown reason is an error so the caller drops it (cold path).
+    pub(super) async fn station_wow_resume(
+        &mut self,
+        admission: &Admission,
+    ) -> (
+        Option<super::wow_wire::WakeReport>,
+        Result<(), station::Error>,
+    ) {
+        let (report, result) = self.io.station_wow_resume(admission).await;
+        let result = result.map_err(station::Error::Native).and_then(|()| {
+            if !report.as_ref().is_some_and(super::wow_wire::keeps_link) {
+                return Err(station::Error::State);
+            }
+            self.station
+                .as_mut()
+                .ok_or(station::Error::State)?
+                .wow_resumed()
+        });
+        (report, result)
+    }
+    pub(super) fn station_wow_capable(&mut self) -> bool {
+        self.active && self.io.station_wow_capable()
+    }
+    pub(super) fn station_sleep_capable(&mut self) -> Result<bool, station::Error> {
+        self.io
+            .station_sleep_capable()
+            .map_err(station::Error::Native)
     }
     pub(super) fn station_qos_all(&self) -> bool {
         self.station
@@ -124,13 +208,43 @@ impl<I: Io> Owner<I> {
             .irq_start(line)
             .map_err(super::station::Error::Native)
     }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn station_model_management(
+        &mut self,
+        bytes: alloc::vec::Vec<u8>,
+    ) -> Result<(), station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(station::Error::State)?
+            .model_management(&mut self.io, bytes)
+    }
+    pub(super) fn station_fragment_policy(&mut self, policy: Option<Arc<super::monitor::Desired>>) {
+        if let Some(station) = self.station.as_mut() {
+            station.set_fragment_policy(policy);
+        }
+    }
     pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
             .send(&mut self.io, frame)
     }
+    pub(super) fn station_send_prefix(
+        &mut self,
+        frames: &[&[u8]],
+    ) -> Result<usize, super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .send_prefix(&mut self.io, frames)
+    }
     pub(super) fn station_stop(&mut self) -> Result<(), super::station::Error> {
+        if self.io.monitor_active() {
+            return self
+                .io
+                .monitor_stop()
+                .map_err(super::station::Error::Native);
+        }
         match self.station.as_mut() {
             Some(station) => station.stop(&mut self.io),
             None => self
@@ -154,16 +268,31 @@ impl<I: Io> Owner<I> {
             .disconnect(&mut self.io)
             .await
     }
-    pub(super) async fn station_scan(
+    pub(super) async fn station_scan_channels(
         &mut self,
+        channels: &[u8],
         dwell_ms: u64,
-        probe: Option<super::station::Probe>,
+        probe: impl Fn() -> Option<super::station::Probe>,
     ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
     {
         self.station
             .as_mut()
             .ok_or(super::station::Error::State)?
-            .scan_with(&mut self.io, dwell_ms, probe)
+            .scan_channels(&mut self.io, channels, dwell_ms, probe)
+            .await
+    }
+    /// `station::State::scan_six_ghz` over admitted RTL8852C 6GHz channels.
+    pub(super) async fn station_scan_six_ghz(
+        &mut self,
+        channels: &[super::command_native::SixGhzChannel],
+        dwell_ms: u64,
+        probe: impl Fn(&super::command_native::SixGhzChannel) -> Option<super::station::Probe>,
+    ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
+    {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .scan_six_ghz(&mut self.io, channels, dwell_ms, probe)
             .await
     }
     pub(super) async fn station_associate(

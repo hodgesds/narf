@@ -144,3 +144,4 @@ pub(super) const R_TXNSS_MAP: u32 = 0x45b4;
 pub(super) const R_TXPATH_SEL: u32 = 0x458c;
 pub(super) const R_TXPWR: u32 = 0x4594;
 pub(super) const R_TX_COUNTER: u32 = 0x1a40;
+pub(super) const RR_TXPOW_TXA: u32 = 0x100;

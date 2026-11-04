@@ -26,6 +26,7 @@ pub(super) struct ScanContext {
     pub(super) nvm_lar: bool,
     pub(super) ready: bool,
     pub(super) permissions: Option<Vec<u32>>,
+    he_allowed: bool,
 }
 impl ScanContext {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -41,6 +42,7 @@ impl ScanContext {
             nvm_lar: false,
             ready: false,
             permissions: None,
+            he_allowed: false,
         }
     }
 }
@@ -115,6 +117,21 @@ fn mcc_permissions(version: u8, bytes: &[u8]) -> Result<Vec<u32>, &'static str> 
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect())
+}
+
+pub(super) fn mcc_he_permitted(version: u8, bytes: &[u8]) -> bool {
+    // iwl-nvm-parse.c iwl_get_reg_capa: v4 carries the v1 bit10
+    // prohibition; v8 carries the v4/v5 bit13. The v3 byte cannot express
+    // an HE regulatory profile, so it cannot qualify an HE LAR owner.
+    match version {
+        4 => bytes
+            .get(6..8)
+            .is_some_and(|v| u16::from_le_bytes(v.try_into().unwrap()) & (1 << 10) == 0),
+        8 => bytes
+            .get(8..12)
+            .is_some_and(|v| u32::from_le_bytes(v.try_into().unwrap()) & (1 << 13) == 0),
+        _ => false,
+    }
 }
 
 pub(super) fn passive_permitted(domain: &RegulatoryDomain, channel: u8) -> bool {
@@ -305,10 +322,24 @@ impl Owner {
     }
     pub(super) fn accept_mcc(&mut self, version: u8, payload: &[u8]) -> Result<(), &'static str> {
         self.scan.permissions = Some(mcc_permissions(version, payload)?);
+        self.scan.he_allowed = mcc_he_permitted(version, payload);
         Ok(())
+    }
+    pub(super) fn scan_he_permitted(&self) -> bool {
+        !(self.scan.lar && self.scan.nvm_lar)
+            || self.scan.permissions.is_some()
+                && self.scan.he_allowed
+                && !self
+                    .hardware
+                    .notifications
+                    .iter()
+                    .any(|packet| packet.header.group_id == 0 && packet.header.cmd == 0xc9)
     }
     pub(super) async fn refresh_mcc(&mut self) -> Result<(), &'static str> {
         if let Some((version, query)) = self.mcc_request()? {
+            self.hardware
+                .notifications
+                .retain(|packet| !(packet.header.group_id == 0 && packet.header.cmd == 0xc9));
             let reply = self.hardware.command(1, 0xc8, &query).await?;
             self.accept_mcc(version, &reply.payload)?;
         }
@@ -337,6 +368,12 @@ impl Owner {
         self.hardware.poll()?;
         self.hardware.notifications.clear();
         self.hardware.command(1, 0xd, request).await?;
+        self.scan_results_inner(channels).await
+    }
+    pub(super) async fn scan_results_inner(
+        &mut self,
+        channels: &[u8],
+    ) -> Result<(Vec<Beacon>, Vec<BssInfo>), &'static str> {
         let deadline = narf_time::Deadline::after_ms(15_000);
         let mut beacons: Vec<Beacon> = Vec::new();
         let mut results: Vec<BssInfo> = Vec::new();
@@ -416,7 +453,8 @@ impl Owner {
 fn observed_beacon(payload: &[u8], channels: &[u8], local: [u8; 6]) -> Option<(Beacon, i8)> {
     let mpdu = scan_api::mpdu_gen2(payload)?;
     let frame = mpdu.frame;
-    if frame.len() < 36
+    if mpdu.raw_band >= 2
+        || frame.len() < 36
         || !matches!(frame[0], 0x80 | 0x50)
         || frame[1] & 0xc7 != 0
         || frame[22] & 15 != 0
@@ -500,6 +538,7 @@ fn observed_beacon(payload: &[u8], channels: &[u8], local: [u8; 6]) -> Option<(B
             bssid,
             ssid: ssid?,
             channel: mpdu.channel,
+            band: super::super::native_band::Channel::legacy(mpdu.channel)?.band,
             interval,
             dtim: scan_api::dtim_period(body),
             rsn,

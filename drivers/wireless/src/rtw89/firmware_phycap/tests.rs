@@ -32,8 +32,17 @@ struct Model {
     close_delay: bool,
     oversleep: bool,
     requested: bool,
+    /// 0x8100 (B H2CREG block) or 0x7100 (RTL8852C V1 block).
+    base: usize,
 }
 impl Model {
+    fn new_c(seed: u8, response: [u32; 4]) -> Self {
+        let mut model = Self::new(seed, response);
+        model.base = 0x7100;
+        model.bytes[0x7160] = 0;
+        model.bytes[0x7164] = 0;
+        model
+    }
     fn new(seed: u8, response: [u32; 4]) -> Self {
         let (index, generation) = object_table::register(CapKind::BusDevice);
         // SAFETY: fresh exact inert BusDevice fixture object with Write rights.
@@ -67,6 +76,7 @@ impl Model {
             close_delay: false,
             oversleep: false,
             requested: false,
+            base: 0x8100,
         }
     }
     fn access(&mut self) -> Result<(), Error> {
@@ -87,7 +97,7 @@ impl Model {
                 self.hash = self.hash.wrapping_mul(1099511628211);
             }
         }
-        if !(self.ignore_clear && a == 0x8164 && bytes == [0]) {
+        if !(self.ignore_clear && a as usize == self.base + 0x64 && bytes == [0]) {
             self.bytes[a as usize..a as usize + bytes.len()].copy_from_slice(bytes);
         }
         Ok(())
@@ -110,21 +120,22 @@ impl Io for Model {
     }
     fn write8(&mut self, a: u32, value: u8) -> Result<(), Error> {
         self.write(a, &[value])?;
-        if a == 0x8160 && value == 1 {
+        let b = self.base;
+        if a as usize == b + 0x60 && value == 1 {
             self.requested = true;
             if !self.hold {
                 if !self.no_consume {
                     self.bytes[a as usize] = 0;
                 }
-                self.bytes[0x8164] = 1;
-                if self.word(0x8140) & 127 == 3 {
+                self.bytes[b + 0x64] = 1;
+                if self.word(b + 0x40) & 127 == 3 {
                     for (index, word) in self.response.iter().enumerate() {
-                        self.bytes[0x8150 + index * 4..0x8154 + index * 4]
+                        self.bytes[b + 0x50 + index * 4..b + 0x54 + index * 4]
                             .copy_from_slice(&word.to_le_bytes());
                     }
                 } else {
-                    self.bytes[0x8150..0x8154].copy_from_slice(&0x204u32.to_le_bytes());
-                    let enable = self.bytes[0x8142..0x8144].to_vec();
+                    self.bytes[b + 0x50..b + 0x54].copy_from_slice(&0x204u32.to_le_bytes());
+                    let enable = self.bytes[b + 0x42..b + 0x44].to_vec();
                     self.bytes[0xc348..0xc34a].copy_from_slice(&enable);
                 }
             }
@@ -146,10 +157,10 @@ impl Io for Model {
         }
         self.now += if self.oversleep { us.max(500_000) } else { us };
         if self.busy && !self.hold {
-            self.bytes[0x8160] = 0;
+            self.bytes[self.base + 0x60] = 0;
         }
         if self.stale_late {
-            self.bytes[0x8164] = 1;
+            self.bytes[self.base + 0x64] = 1;
         }
         if self.revoke_delay {
             self.authority.revoke();
@@ -348,4 +359,49 @@ fn smoke_rtw8852b_phycap_wait_timeout_and_cancellation_keep_mailbox_terminal() -
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852b_phycap_wait_timeout_and_cancellation_keep_mailbox_terminal
+);
+
+/// rtw8852c.c `rtw8852c_h2c_regs`/`rtw8852c_c2h_regs` + `*_CTRL_V1`: the
+/// same AX GET_FEATURE part0 exchange through 0x7140..0x7164, shared UDM1
+/// counters, and a C-bound receipt whose fingerprint differs from B's.
+fn smoke_rtw8852c_phycap_uses_v1_register_block_and_binds_c_receipt() -> TestResult {
+    let words = [0x00020403, 2, 0, 0x00020200];
+    let mut model = Model::new_c(0x5a, words);
+    let mut mailbox = Mailbox::for_chip(crate::rtw89::mac::ChipId::Rtl8852C);
+    let receipt = match ready(mailbox.phycap(&mut model)) {
+        Some(Ok(value)) => value,
+        _ => return TestResult::Fail("V1 PHY_CAP query failed"),
+    };
+    if !receipt.is_c()
+        || receipt.words() != words
+        || receipt.initial_profile().is_err()
+        || model.word(0x7140) != 0x103
+        || model.bytes[0x7164] != 0
+        || model.bytes[0x7160] != 0
+        || model.word(0x8140) != 0x5a5a_5a5a
+        || model.bytes[0x1f5] != 0x11
+    {
+        return TestResult::Fail("RTL8852C PHY_CAP did not use the V1 H2CREG/C2HREG block");
+    }
+    let b = Receipt::decode(words).unwrap();
+    if b.is_c() || b.fingerprint() == receipt.fingerprint() {
+        return TestResult::Fail("RTL8852C receipt is not distinct from a B receipt");
+    }
+    if ready(mailbox.scheduler(&mut model, 0)) != Some(Ok(()))
+        || model.word(0x7140) & 0xffff != 0x205
+        || model.word(0x8140) != 0x5a5a_5a5a
+    {
+        return TestResult::Fail("RTL8852C scheduler H2C left the V1 register block");
+    }
+    // A B-block mailbox never observes the C reply.
+    let mut model = Model::new_c(0x5a, words);
+    model.bytes[0x8160] = 1;
+    if ready(Mailbox::default().phycap(&mut model)).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("B register block accepted on RTL8852C");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_phycap_uses_v1_register_block_and_binds_c_receipt
 );

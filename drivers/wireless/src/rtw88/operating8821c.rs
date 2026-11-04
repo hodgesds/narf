@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;
-use narf_wireless::reg::{RegFlags, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 type QError = calibration8821c::Error;
 fn denied(error: QError) -> Error {
     Error::Calibration8821c(error)
@@ -26,6 +26,7 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    pub host: super::phy8821c::Host,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
@@ -33,6 +34,7 @@ pub struct Info {
     pub thermal: u8,
     pub response_rates: u16,
     pub identity: [u8; 32],
+    pub host: super::phy8821c::Host,
 }
 pub(super) fn request(
     calibration: calibration8821c::Request,
@@ -56,9 +58,16 @@ pub(super) fn request(
         identity: hash.finalize(),
         mac: m,
         filename: format!(
-            "rtw88/rtw8821ce-power-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            "rtw88/{}-power-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            calibration.host.family(),
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
         ),
+        host: calibration.host,
     }
 }
 pub(super) enum Source {
@@ -80,20 +89,44 @@ pub(super) struct Envelope {
     peaks: [i16; 14],
     thermal: [u8; 2],
     ht_limit: Option<u8>,
+    factory_limits: [u8; 2],
+    /// Per-channel-group factory ceilings for groups 0..=4, None if erased.
+    group_limits: [Option<[u8; 2]>; 5],
+    /// HT20 1S factory ceilings per channel group (`bw40_base[group]`).
+    ht_groups: [Option<u8>; 5],
+    ht40_groups: [Option<u8>; 5],
+    /// 5GHz OFDM factory ceilings per `rtw_get_channel_group` 5GHz group
+    /// (`band5::Power5g::ofdm`, path A, txgi factor 1, max index 0x3f).
+    band5_groups: [Option<u8>; 14],
+    /// HT20 1S factory ceilings per 5GHz group (`band5::Power5g::bw20`,
+    /// path A, txgi factor 1, max index 0x3f).
+    ht5_groups: [Option<u8>; 14],
+    /// HT40 1S factory ceilings per 5GHz group (`band5::Power5g::bw40`,
+    /// path A, txgi factor 1, max index 0x3f).
+    ht40_5_groups: [Option<u8>; 14],
+    /// VHT80 1S factory ceilings per 5GHz group of an 80MHz center
+    /// (`band5::Power5g::bw80`, path A, txgi factor 1, max index 0x3f).
+    vht80_groups: [Option<u8>; 14],
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
+    group_limits(factory, 0) // C21 factor1, channel1 group0, max_power_index0x3f.
+}
+/// Linux phy.c `rtw_phy_get_2g_tx_power_index` over `rtw_get_channel_group`
+/// `group` (0..=4 for 2.4GHz channels 1..13): CCK `cck_base[group]` and 1S
+/// OFDM `bw40_base[group] + ofdm_diff`, without erased-cell defaults.
+pub(super) fn group_limits(factory: &Factory8821c, group: usize) -> Result<[u8; 2], QError> {
     // Original C21 BTG RFE2/4 substitutes pathB's 2G record for physical RF-A.
     let path = u8::from(matches!(factory.rfe(), 2 | 4));
     let raw = factory.power_path(path).ok_or(QError::Factory)?;
-    if raw[0] > 63 || raw[6] > 63 || raw[11] == 255 {
+    if group > 4 || raw[group] > 63 || raw[6 + group] > 63 || raw[11] == 255 {
         return Err(QError::Factory);
     }
     let nibble = i16::from(raw[11] & 15);
-    let ofdm = i16::from(raw[6]) + if nibble & 8 != 0 { nibble - 16 } else { nibble };
+    let ofdm = i16::from(raw[6 + group]) + if nibble & 8 != 0 { nibble - 16 } else { nibble };
     if ofdm < 0 {
         return Err(QError::Factory);
     }
-    Ok([raw[0], ofdm.min(63) as u8]) // C21 factor1, channel1 group0, max_power_index0x3f.
+    Ok([raw[group], ofdm.min(63) as u8])
 }
 impl Source {
     pub(super) fn load(
@@ -148,15 +181,89 @@ impl Source {
             e.ht_limit = factory
                 .power_path(path)
                 .and_then(|p| super::ht::factory_limit(p, 1, 63));
+            e.group_limits = core::array::from_fn(|g| group_limits(factory, g).ok());
+            e.ht_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_group(p, g, 1, 63))
+            });
+            e.ht40_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(path)
+                    .and_then(|p| super::ht::factory_limit_bw40(p, g, 63))
+            });
+            // rtw8821c_read_efuse substitutes only the 2.4GHz record; 5GHz
+            // power always comes from path A.
+            e.band5_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(0)
+                    .and_then(super::band5::Power5g::parse)
+                    .and_then(|p| p.ofdm(g, 1))
+                    .map(|v| v.min(63))
+            });
+            e.ht5_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(0)
+                    .and_then(super::band5::Power5g::parse)
+                    .and_then(|p| p.bw20(g, false, 1))
+                    .map(|v| v.min(63))
+            });
+            e.ht40_5_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(0)
+                    .and_then(super::band5::Power5g::parse)
+                    .and_then(|p| p.bw40(g, false, 1))
+                    .map(|v| v.min(63))
+            });
+            e.vht80_groups = core::array::from_fn(|g| {
+                factory
+                    .power_path(0)
+                    .and_then(super::band5::Power5g::parse)
+                    .and_then(|p| p.bw80(g, false, 1))
+                    .map(|v| v.min(63))
+            });
             e
         })
     }
 }
 impl Envelope {
+    pub(super) fn factory_limits(&self) -> [u8; 2] {
+        self.factory_limits
+    }
+    pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
+        self.group_limits.get(group).copied().flatten()
+    }
+    pub(super) fn ht_group(&self, group: usize) -> Option<u8> {
+        self.ht_groups.get(group).copied().flatten()
+    }
+    /// Factory 5GHz OFDM index ceiling for one 5GHz channel group.
+    pub(super) fn band5_group(&self, group: usize) -> Option<u8> {
+        self.band5_groups.get(group).copied().flatten()
+    }
+    /// Factory 5GHz HT20 1S index ceiling for one 5GHz channel group.
+    pub(super) fn ht5_group(&self, group: usize) -> Option<u8> {
+        self.ht5_groups.get(group).copied().flatten()
+    }
+    /// Factory VHT80 1S index ceiling for one 5GHz channel group.
+    pub(super) fn vht80_group(&self, group: usize) -> Option<u8> {
+        self.vht80_groups.get(group).copied().flatten()
+    }
+    /// Factory 5GHz HT40 1S index ceiling for one 5GHz channel group.
+    pub(super) fn ht40_5_group(&self, group: usize) -> Option<u8> {
+        self.ht40_5_groups.get(group).copied().flatten()
+    }
+    /// Factory HT40 1S index ceiling (`bw40_base[group]`, txgi factor 1).
+    pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
+        self.ht40_groups.get(group).copied().flatten()
+    }
+    pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
+        self.calibration.band_facts()
+    }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         Some(super::ht::Facts {
             hardware: self.calibration.hardware(),
             maximum: self.ht_limit?,
+            maximum_2ss: None,
             legacy: self.indices,
             cck: [0; 2],
         })
@@ -186,7 +293,7 @@ impl Envelope {
             || &raw[..4] != b"N21P"
             || raw[4..8] != [1, 0, 160, 0]
             || raw[8..12] != 160u32.to_le_bytes()
-            || raw[12..16] != [0xec, 0x10, 0x21, 0xc8]
+            || raw[12..16] != request.host.header()
             || raw[54..56] != [1, 20]
             || &raw[66..68] != b"US"
             || raw[104..] != [0; 56]
@@ -229,6 +336,14 @@ impl Envelope {
             peaks,
             thermal,
             ht_limit: None,
+            factory_limits: limits,
+            group_limits: [None; 5],
+            ht_groups: [None; 5],
+            ht40_groups: [None; 5],
+            band5_groups: [None; 14],
+            ht5_groups: [None; 14],
+            ht40_5_groups: [None; 14],
+            vht80_groups: [None; 14],
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {
@@ -241,14 +356,11 @@ impl Envelope {
         }
         let mut limit = self.ceiling.min(80);
         let mut covering = false;
-        for rule in &domain.rules {
+        for (i, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
                 continue;
             }
-            if rule.freq_start_mhz >= rule.freq_end_mhz
-                || rule.max_bandwidth_mhz < 20
-                || rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-            {
+            if !super::channel_policy::plain_rule(domain, i, 20) {
                 return Err(denied(QError::Policy));
             }
             covering |= rule.freq_start_mhz <= 2402 && rule.freq_end_mhz >= 2422;
@@ -295,50 +407,55 @@ impl Envelope {
         io: &mut impl Io,
         policy: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<Info, Error> {
-        self.invoke(&policy, || {
+        crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
             io.begin_operating8821c()?;
-            let old = io.read32(0x2908)?;
+            let old = io.read32(0x2908).await?;
             if old == u32::MAX {
                 return Err(Error::Gone);
             }
             io.write32(0xc90, (0x42 << 20) | (old & 0xcffff) | 0x30000)
-        })?;
+                .await
+        })
+        .await?;
         io.delay_us(13).await;
         io.delay_us(2_000_000).await;
-        let thermal = self.invoke(&policy, || {
-            let value = io.read32(0x2908)?;
-            if value == u32::MAX {
-                return Err(Error::Gone);
-            }
-            let thermal = ((value >> 10) & 63) as u8;
-            self.calibration.temperature(thermal).map_err(denied)?;
-            if !(self.thermal[0]..=self.thermal[1]).contains(&thermal)
-                || io.read32(0x2820)? & 0xfffff != 0
-                || io.read32(0x1bf0)? & 0x100ff != 0
-            {
-                return Err(denied(QError::Thermal));
-            }
-            Ok(thermal)
-        })?;
+        let thermal =
+            crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
+                let value = io.read32(0x2908).await?;
+                if value == u32::MAX {
+                    return Err(Error::Gone);
+                }
+                let thermal = ((value >> 10) & 63) as u8;
+                self.calibration.temperature(thermal).map_err(denied)?;
+                if !(self.thermal[0]..=self.thermal[1]).contains(&thermal)
+                    || io.read32(0x2820).await? & 0xfffff != 0
+                    || io.read32(0x1bf0).await? & 0x100ff != 0
+                {
+                    return Err(denied(QError::Thermal));
+                }
+                Ok(thermal)
+            })
+            .await?;
         for (i, reg) in REGISTERS.into_iter().enumerate() {
             let value = if i < 3 {
                 u32::from_le_bytes(self.indices[i * 4..i * 4 + 4].try_into().unwrap())
             } else {
                 0
             };
-            self.invoke(&policy, || {
-                io.write32(reg, value)?;
-                if io.read32(reg)? != value {
+            crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
+                io.write32(reg, value).await?;
+                if io.read32(reg).await? != value {
                     return Err(Error::Prerequisite);
                 }
                 Ok(())
-            })?;
+            })
+            .await?;
             // Cooperative ownership boundary, not an invented radio settle/done bit.
             narf_scheduler::yield_now().await;
         }
-        self.invoke(&policy, || {
-            io.write32(0x440, 0x15f)?;
-            if io.read32(0x440)? != 0x15f {
+        crate::rtw88::firmware_transport::enclosed(|op| self.invoke(&policy, op), async {
+            io.write32(0x440, 0x15f).await?;
+            if io.read32(0x440).await? != 0x15f {
                 return Err(Error::Prerequisite);
             }
             io.finish_operating8821c()?;
@@ -347,7 +464,9 @@ impl Envelope {
                 thermal,
                 response_rates: 0x15f,
                 identity: self.request.identity,
+                host: self.request.host,
             })
         })
+        .await
     }
 }

@@ -6,6 +6,7 @@ use crate::rtw88::{
     efuse::Factory8821c,
     firmware_lifecycle::{Lifecycle, Stage},
     firmware_transport::Phase,
+    phy8821c,
 };
 use narf_capabilities::{Cap, Read};
 use narf_firmware::FirmwareBlob;
@@ -19,10 +20,25 @@ struct Fixture {
     request: Request,
 }
 fn fixture(rfe: u8, swing: u8) -> Result<Fixture, &'static str> {
+    fixture_with_features(rfe, swing, 0)
+}
+fn fixture_with_features(rfe: u8, swing: u8, features: u32) -> Result<Fixture, &'static str> {
+    fixture_on(rfe, swing, features, phy8821c::Interface::Pcie)
+}
+/// The fixture behind `interface`; a USB board carries its MAC at the
+/// RTL8821CU efuse offset 0x107 (`rtw8821cu_efuse_parsing`).
+fn fixture_on(
+    rfe: u8,
+    swing: u8,
+    features: u32,
+    interface: phy8821c::Interface,
+) -> Result<Fixture, &'static str> {
+    let usb = matches!(interface, phy8821c::Interface::Usb { .. });
     let (backend, port, drops) = allocated();
     let mut firmware = image();
     firmware[0] = 0x21;
-    let lifecycle = Lifecycle::new(0xc821);
+    firmware[0x0c..0x10].copy_from_slice(&features.to_le_bytes());
+    let lifecycle = Lifecycle::new(0xc821).on(interface);
     narf_scheduler::block_on(lifecycle.initialize_bytes(|| Ok(backend), firmware))
         .map_err(|_| "C21 calibration fixture firmware failed")?;
     {
@@ -49,7 +65,17 @@ fn fixture(rfe: u8, swing: u8) -> Result<Fixture, &'static str> {
     raw[0xba] = 25;
     raw[0xc6] = swing;
     raw[0xca] = rfe;
+    if usb {
+        raw[0x107..0x10d].copy_from_slice(&[0x02, 0x0b, 0xda, 0x11, 0xc8, 0x01]);
+    }
     let factory = Factory8821c::for_test(raw).map_err(|_| "C21 factory fixture invalid")?;
+    let factory = if usb {
+        factory
+            .on_usb()
+            .map_err(|_| "C21 USB factory fixture invalid")?
+    } else {
+        factory
+    };
     narf_scheduler::block_on(lifecycle.prepare_phy8821c(&factory))
         .map_err(|_| "C21 calibration fixture retained PHY failed")?;
     {
@@ -612,4 +638,80 @@ fn smoke_rtw8821ce_thermal_conversion_pending_cancel_and_authority_loss_are_term
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8821c",
     smoke_rtw8821ce_thermal_conversion_pending_cancel_and_authority_loss_are_terminal
+);
+/// Step 3 of the RTL8821CU transport: every signed C21 record is keyed by
+/// its host identity. The PCI board keeps the historical 0x10ec:0xc821
+/// header and `rtw8821ce-*` name; a USB board (here 0bda:c811 from
+/// `rtw_8821cu_id_table`) gets its own `rtw8821cu-*` name, its 0x107 MAC, a
+/// distinct identity and a VID/PID header, and neither host's record is
+/// accepted by the other. No real RTL8821CU record exists; these are
+/// synthetic fixtures only.
+fn smoke_rtw8821cu_calibration_records_keyed_by_usb_host() -> TestResult {
+    let usb_interface = phy8821c::Interface::Usb {
+        vendor: 0x0bda,
+        product: 0xc811,
+    };
+    let (pci, usb) = match (fixture(0, 0), fixture_on(0, 0, 0, usb_interface)) {
+        (Ok(p), Ok(u)) => (p, u),
+        (Err(e), _) | (_, Err(e)) => return TestResult::Fail(e),
+    };
+    let usb_mac = [0x02, 0x0b, 0xda, 0x11, 0xc8, 0x01];
+    if pci.request.host != phy8821c::Host::PCI_C21
+        || pci.request.host.header() != [0xec, 0x10, 0x21, 0xc8]
+        || pci.request.filename != "rtw88/rtw8821ce-iqk-v1-020406080a0c.bin"
+        || usb.request.host.header() != [0xda, 0x0b, 0x11, 0xc8]
+        || !usb.request.host.usb
+        || usb.request.mac != usb_mac
+        || usb.request.filename != "rtw88/rtw8821cu-iqk-v1-020bda11c801.bin"
+        || usb.request.identity == pci.request.identity
+    {
+        return TestResult::Fail("C21 calibration request not keyed by host identity");
+    }
+    if crate::rtw88::channel_policy::scoped_filename(
+        "rtw88/rtw8821cu-legacy-wmm-v1-020bda11c801.bin",
+        36,
+    ) != "rtw88/rtw8821cu-ch36-legacy-wmm-v1-020bda11c801.bin"
+    {
+        return TestResult::Fail("USB per-channel record name collapsed");
+    }
+    // A PCI-keyed header never admits the USB board, and vice versa.
+    let mut wrong_host = envelope(&usb.request);
+    let mut usb_keyed = envelope(&usb.request);
+    usb_keyed[12..16].copy_from_slice(&usb.request.host.header());
+    let mut pci_with_usb_header = envelope(&pci.request);
+    pci_with_usb_header[12..16].copy_from_slice(&usb.request.host.header());
+    wrong_host[48..54].copy_from_slice(&usb_mac);
+    let calls = usb.port.0.lock().calls;
+    let refused = narf_scheduler::block_on(usb.lifecycle.prepare_calibration8821c_with(
+        &usb.factory,
+        source(wrong_host, Cap::bootstrap()),
+        || Ok(domain()),
+    ));
+    if refused != Err(Error::Calibration8821c(QualificationError::Format))
+        || usb.port.0.lock().calls != calls
+    {
+        return TestResult::Fail("USB board accepted a PCI-keyed N21Q record");
+    }
+    let refused = narf_scheduler::block_on(pci.lifecycle.prepare_calibration8821c_with(
+        &pci.factory,
+        source(pci_with_usb_header, Cap::bootstrap()),
+        || Ok(domain()),
+    ));
+    if refused != Err(Error::Calibration8821c(QualificationError::Format)) {
+        return TestResult::Fail("PCI board accepted a USB-keyed N21Q record");
+    }
+    if narf_scheduler::block_on(usb.lifecycle.prepare_calibration8821c_with(
+        &usb.factory,
+        source(usb_keyed, Cap::bootstrap()),
+        || Ok(domain()),
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("USB-keyed N21Q record refused on its own board");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821cu_calibration_records_keyed_by_usb_host
 );

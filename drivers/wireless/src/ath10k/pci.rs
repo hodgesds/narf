@@ -201,34 +201,119 @@ pub struct RecoveryScheduled {
 static RESTART: super::restart::Gate = super::restart::Gate::new();
 static LAST_RECOVERY: IrqSafeSpinLock<Option<super::restart::Outcome>> = IrqSafeSpinLock::new(None);
 
-/// Firmware crash reported by the PCIe owner's service (Linux
-/// `ath10k_pci_fw_dump_work` -> `ath10k_core_start_recovery`). One supervisor
-/// runs at a time; it drives [`recover`] and records the outcome.
-pub(in crate::ath10k) fn firmware_crashed() {
-    if !RESTART.request() {
+type RecoveryRequest =
+    super::restart::Scope<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>>;
+static GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static PENDING_RECOVERY: IrqSafeSpinLock<
+    super::restart::Requests<
+        narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+    >,
+> = IrqSafeSpinLock::new(super::restart::Requests::new());
+
+fn queue_recovery(request: RecoveryRequest, crash: bool) {
+    let mut pending = PENDING_RECOVERY.lock();
+    let discarded = pending.enqueue(request);
+    let start = if crash {
+        RESTART.request()
+    } else {
+        RESTART.request_non_crash()
+    };
+    drop(pending);
+    // A last retired Arc can own DMA; never run its Drop under this IRQ lock.
+    drop(discarded);
+    if !start {
         return;
     }
-    let _ = writeln!(
-        narf_console::Writer,
-        "  ath10k: firmware crashed (count {}), restarting",
-        RESTART.crashes()
-    );
     narf_scheduler::spawn(async {
-        let delay = super::restart::BUSY_DELAY_MS * 1_000_000;
-        let outcome = super::restart::supervise(
-            recover,
-            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay)),
-            super::restart::BUSY_RETRIES,
-        )
-        .await;
-        let _ = writeln!(
-            narf_console::Writer,
-            "  ath10k: automatic recovery {:?}",
-            outcome
-        );
-        *LAST_RECOVERY.lock() = Some(outcome);
-        RESTART.complete();
+        loop {
+            let request = {
+                let mut pending = PENDING_RECOVERY.lock();
+                match pending.take() {
+                    Some(request) => request,
+                    None => {
+                        // Complete under the queue lock: an arrival either
+                        // stays in this worker or starts its own successor.
+                        RESTART.complete();
+                        break;
+                    }
+                }
+            };
+            let delay = super::restart::BUSY_DELAY_MS * 1_000_000;
+            let outcome = super::restart::supervise_scoped(
+                || recover_scoped(&request),
+                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay)),
+                super::restart::BUSY_RETRIES,
+            )
+            .await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath10k: automatic recovery {:?}",
+                outcome
+            );
+            *LAST_RECOVERY.lock() = Some(outcome);
+        }
     });
+}
+
+/// Firmware crash notification keeps its Linux crash-counter meaning while
+/// automatic recovery is bound to the reporting physical generation.
+pub(in crate::ath10k) fn firmware_crashed() {
+    queue_recovery(
+        RecoveryRequest {
+            generation: GENERATION.load(core::sync::atomic::Ordering::Acquire),
+            owner: None,
+        },
+        true,
+    );
+}
+
+/// The registered native worker calls this after retained scan cleanup fails.
+/// It creates no new firmware/board grant: only the existing PCI owner may
+/// silence that exact physical generation and arrange a fresh-ROM attempt.
+pub(in crate::ath10k) fn scan_cleanup_failed(
+    radio: alloc::sync::Arc<
+        narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+    >,
+) {
+    queue_recovery(
+        RecoveryRequest {
+            generation: GENERATION.load(core::sync::atomic::Ordering::Acquire),
+            owner: Some(radio),
+        },
+        false,
+    );
+}
+
+/// Declared before SESSION/Radio guards, so cancellation drops those guards
+/// before queueing physical recovery. Immediate denied preflight disarms it.
+struct DiagnosticScan {
+    request: Option<RecoveryRequest>,
+}
+impl DiagnosticScan {
+    fn new(
+        radio: alloc::sync::Arc<
+            narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+        >,
+    ) -> Self {
+        Self {
+            request: Some(RecoveryRequest {
+                generation: GENERATION.load(core::sync::atomic::Ordering::Acquire),
+                owner: Some(radio),
+            }),
+        }
+    }
+    fn finish(&mut self, pending: bool) {
+        if !pending {
+            self.request = None;
+        }
+    }
+}
+impl Drop for DiagnosticScan {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            queue_recovery(request, false);
+        }
+    }
 }
 
 /// Firmware crashes observed this boot (`fw_crash_counter`).
@@ -245,23 +330,64 @@ pub fn last_automatic_recovery() -> Option<super::restart::Outcome> {
 /// interface. Three attempts per boot bound permanently pinned old DMA.
 /// Success reports scheduling, not readiness, RF quiescence or DMA reclamation.
 pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
+    recover_inner(None).await?.ok_or(RecoveryError::Busy)
+}
+
+async fn recover_scoped(
+    request: &RecoveryRequest,
+) -> Result<Option<RecoveryScheduled>, RecoveryError> {
+    recover_inner(Some(request)).await
+}
+
+async fn recover_inner(
+    request: Option<&RecoveryRequest>,
+) -> Result<Option<RecoveryScheduled>, RecoveryError> {
     let mut session = SESSION.lock().await;
+    if request.is_some_and(|request| {
+        request.generation != GENERATION.load(core::sync::atomic::Ordering::Acquire)
+    }) {
+        // Fresh boot can leave SESSION empty temporarily. An obsolete request
+        // must not spend Busy retries waiting for that successor to appear.
+        return Ok(None);
+    }
     let owner = session.as_mut().ok_or(RecoveryError::Busy)?;
+    if let Some(request) = request {
+        let radio = match owner {
+            DriverSession::Radio(owner) => Some(&owner.radio),
+            _ => None,
+        };
+        if !request.matches(
+            GENERATION.load(core::sync::atomic::Ordering::Acquire),
+            radio,
+        ) {
+            return Ok(None);
+        }
+    }
     let attempt = {
         let mut attempts = RECOVERY_ATTEMPTS.lock();
         if *attempts >= 3 {
-            return Err(RecoveryError::Exhausted);
+            None
+        } else {
+            *attempts += 1;
+            Some(*attempts)
         }
-        *attempts += 1;
-        *attempts
     };
-    let restart = retire_owner(owner)
-        .await
-        .map_err(RecoveryError::Transport)?;
-    // A retired transport's Drop performs no hardware access and preserves all
-    // old mappings. A late old firmware/CE write can only hit permanently pinned DMA.
+    // A spent fresh-boot budget cannot skip the current owner's independent
+    // physical silencing attempt after an autonomous scan cleanup failure.
+    if attempt.is_none() && request.is_none() {
+        return Err(RecoveryError::Exhausted);
+    }
+    let restart = if request.is_some() {
+        retire_owner_physically(owner).await
+    } else {
+        retire_owner(owner).await
+    }
+    .map_err(RecoveryError::Transport)?;
     *session = None;
     let revision = clear_generation().ok_or(RecoveryError::Busy)?;
+    let Some(attempt) = attempt else {
+        return Err(RecoveryError::Exhausted);
+    };
     narf_scheduler::spawn(boot_task(
         restart.device,
         restart.cap,
@@ -269,7 +395,25 @@ pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
         restart.hardware,
         revision,
     ));
-    Ok(RecoveryScheduled { attempt })
+    Ok(Some(RecoveryScheduled { attempt }))
+}
+
+async fn retire_owner_physically(
+    owner: &mut DriverSession,
+) -> Result<super::boot::Restart, super::bmi::BmiError> {
+    match owner {
+        DriverSession::Boot(owner) => owner.bmi.transport.retire_after_failed_scan().await,
+        DriverSession::Runtime(owner) => owner.htc.transport.retire_after_failed_scan().await,
+        DriverSession::Wmi(owner) => owner.wmi.htc.transport.retire_after_failed_scan().await,
+        DriverSession::Htt(owner) => owner.htt.wmi.htc.transport.retire_after_failed_scan().await,
+        DriverSession::Radio(owner) => {
+            let mut radio = retire_radio(&owner.radio, &owner.quarantine, || {
+                super::interface::retire(&owner.radio)
+            })
+            .await;
+            radio.htt.wmi.htc.transport.retire_after_failed_scan().await
+        }
+    }
 }
 
 /// Retire whichever generation the session holds (host interface first for
@@ -309,6 +453,20 @@ pub async fn suspend() -> Result<(), super::pm::SuspendError> {
         return Ok(());
     }
     let owner = session.as_mut().ok_or(super::pm::SuspendError::Busy)?;
+    if let DriverSession::Radio(radio) = owner {
+        // mac80211 with a WoWLAN configuration calls `ath10k_wow_op_suspend`
+        // first; its failure ("return 1") falls back to the stop below.
+        if let Some(device) = super::interface::active_for(&radio.radio) {
+            if let Ok(Some((arming, holder))) = device.wow_suspend() {
+                narf_scheduler::spawn(holder);
+                if let Ok(armed) = arming.armed().await {
+                    *WOW.lock() = Some(armed);
+                    let _ = writeln!(narf_console::Writer, "  ath10k: suspended (WoWLAN armed)");
+                    return Ok(());
+                }
+            }
+        }
+    }
     let parked = retire_owner(owner)
         .await
         .map_err(super::pm::SuspendError::Failed)?;
@@ -325,12 +483,64 @@ pub async fn suspend() -> Result<(), super::pm::SuspendError> {
     Ok(())
 }
 
+type WowSuspended = super::interface::wowlan::Suspended<super::boot::PciBoot>;
+/// A WoW-armed generation (`wow.c`); exclusive with [`PARKED`].
+static WOW: IrqSafeSpinLock<Option<WowSuspended>> = IrqSafeSpinLock::new(None);
+static LAST_WAKE: IrqSafeSpinLock<Option<super::wmi_runtime::wow::WakeReport>> =
+    IrqSafeSpinLock::new(None);
+
+/// The firmware wake report of the last WoWLAN resume (`None` when that
+/// resume never received `WOW_WAKEUP_HOST`). The shared contract has no
+/// `ieee80211_report_wowlan_wakeup` event, so this is a driver accessor.
+pub fn last_wowlan_wakeup() -> Option<super::wmi_runtime::wow::WakeReport> {
+    LAST_WAKE.lock().clone()
+}
+
+/// System resume: `ath10k_wow_op_resume` for a WoW-armed generation, else
+/// the ordinary [`resume`]. A failed WoW resume, or a wake whose reason
+/// lost the association, retires that generation and boots a fresh one
+/// (Linux RESTARTING -> `ieee80211_reconfig`), outside the recovery budget.
+pub async fn resume_async() -> bool {
+    let Some(armed) = WOW.lock().take() else {
+        return resume();
+    };
+    let mut session = SESSION.lock().await;
+    let device = armed.device().clone();
+    let result = armed.resume().await;
+    *LAST_WAKE.lock() = device.wowlan_wakeup();
+    if result.is_ok() {
+        let _ = writeln!(narf_console::Writer, "  ath10k: resumed from WoWLAN");
+        return true;
+    }
+    let Some(owner) = session.as_mut() else {
+        return false;
+    };
+    let Ok(parked) = retire_owner(owner).await else {
+        return false;
+    };
+    *session = None;
+    if !parked.reclaimable {
+        *SUSPEND_PINNED.lock() += 1;
+    }
+    let Some(revision) = clear_generation() else {
+        return false;
+    };
+    drop(session);
+    restart_parked(parked, revision);
+    true
+}
+
 /// `ath10k_pci_resume` + `ath10k_start`: clear config 0x41 and schedule a
 /// fresh-ROM boot of the parked function. `false` when nothing was parked.
 pub fn resume() -> bool {
     let Some((parked, revision)) = PARKED.lock().take() else {
         return false;
     };
+    restart_parked(parked, revision);
+    true
+}
+
+fn restart_parked(parked: super::boot::Restart, revision: u32) {
     let (cap, device) = (parked.cap, parked.device);
     let read =
         crate::qualcomm_pci::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40));
@@ -348,11 +558,17 @@ pub fn resume() -> bool {
         parked.hardware,
         revision,
     ));
-    true
 }
 
 /// Clear per-generation controller facts; returns the chip revision.
 fn clear_generation() -> Option<u32> {
+    GENERATION
+        .fetch_update(
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+            |old| old.checked_add(1),
+        )
+        .ok()?;
     let mut controller = CONTROLLER.lock();
     let controller = controller.as_mut()?;
     controller.target_info = None;
@@ -478,7 +694,12 @@ async fn initialize_radio(
             )
         }
     };
-    let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features);
+    // Linux's default `cryptmode=0` (ATH10K_CRYPT_MODE_HW): station
+    // PTK/GTK are offloaded once the firmware confirms them. Under RAW decap
+    // software CCMP/BIP stays the per-frame fallback; native-WiFi decap (TLV
+    // firmware without RAW_MODE_SUPPORT) has no software data crypto.
+    let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features)
+        .with_hardware_keys(true);
     let result = radio.start_from_hardware().await;
     let owner = RadioSession {
         quarantine: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
@@ -496,15 +717,21 @@ async fn initialize_radio(
 pub async fn scan_passive(
     frequencies: &[u16],
 ) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
+    let mut cleanup;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
+    cleanup = DiagnosticScan::new(owner.radio.clone());
     let result = radio.passive_scan(frequencies).await;
     if let Err(error) = &result {
         if let Some(controller) = CONTROLLER.lock().as_mut() {
             controller.scan_error = Some(*error);
         }
     }
+    cleanup.finish(result.is_err() && radio.failed_scan_pending());
+    drop(radio);
+    drop(session);
+    drop(cleanup);
     result
 }
 
@@ -530,12 +757,14 @@ pub async fn scan_active_with_ies(
     use super::wmi_runtime::Error;
     super::wmi_runtime::validate_probe_ies(extra_ies)?;
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
+    let mut cleanup;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let plan = radio
         .prepare_active_scan(frequencies, ssids, &domain)?
         .with_extra_ies(extra_ies)?;
+    cleanup = DiagnosticScan::new(owner.radio.clone());
     let result = radio
         .active_scan(plan, || {
             narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)
@@ -546,6 +775,10 @@ pub async fn scan_active_with_ies(
             controller.scan_error = Some(*error);
         }
     }
+    cleanup.finish(result.is_err() && radio.failed_scan_pending());
+    drop(radio);
+    drop(session);
+    drop(cleanup);
     result
 }
 
@@ -565,7 +798,7 @@ pub async fn prepare_station(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.station_permission(&domain, bssid, frequency)?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = radio
         .prepare_station_checked(&domain, bssid, frequency, &validate)
         .await;
@@ -597,7 +830,7 @@ pub async fn exchange_initial_management(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = super::wmi_runtime::checked_policy(
         radio.exchange_initial_management(&domain, frame),
         &validate,
@@ -629,7 +862,7 @@ pub async fn associate_station(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = radio
         .associate_station_checked(&domain, ssid, security, sme_ies, &validate)
         .await;
@@ -675,7 +908,7 @@ pub async fn start_station_data(
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
     let quarantine = owner.quarantine.clone();
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     radio
         .start_data_with_nonce_checked(
             &domain,
@@ -721,7 +954,7 @@ pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result =
         super::wmi_runtime::checked_policy(radio.transmit_ethernet(&domain, bytes), &validate)
             .await;
@@ -742,7 +975,7 @@ pub async fn poll_ethernet(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = super::wmi_runtime::checked_policy(radio.poll_ethernet(&domain), &validate).await;
     if result.is_err() {
         radio.fail_station_data();
@@ -751,7 +984,7 @@ pub async fn poll_ethernet(
 }
 
 fn current_station(
-    permission: super::regulatory::Permission,
+    permission: &super::regulatory::Permission,
     quarantine: &core::sync::atomic::AtomicBool,
 ) -> Result<(), super::wmi_runtime::Error> {
     if quarantine.load(core::sync::atomic::Ordering::Acquire) {
@@ -1005,11 +1238,31 @@ async fn boot_task(
                     subsystem_vendor: device.id.subsystem_vendor,
                     subsystem_device: device.id.subsystem_id,
                 };
-                let variant = crate::ath11k::board::check_smbios().bdf_ext;
+                // Linux `ath10k_core_check_smbios` then `ath10k_core_check_dt`,
+                // whose variant (when present) replaces the SMBIOS one. The
+                // function's DT/NVMEM calibration sources are read once here.
+                let sources = super::firmware::Platform::for_device(&device);
+                let variant = sources
+                    .variant
+                    .clone()
+                    .unwrap_or_else(|| crate::ath11k::board::check_smbios().bdf_ext);
                 let variant = core::str::from_utf8(&variant)
                     .map_err(|_| super::firmware::Error::Unsupported)?;
-                super::firmware::prepare(&mut bmi, &mut files, profile, identity, variant, &image)
-                    .await?;
+                let address = match device.addr {
+                    narf_bus::BusAddr::Pcie(address) => address,
+                    _ => return Err(super::firmware::Error::Unsupported),
+                };
+                super::firmware::prepare_for_address(
+                    &mut bmi,
+                    &mut files,
+                    profile,
+                    identity,
+                    variant,
+                    &image,
+                    Some(address),
+                    &sources,
+                )
+                .await?;
                 files.seal()?;
                 let status = FirmwarePrepared {
                     directory: profile.directory,

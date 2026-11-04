@@ -96,6 +96,25 @@ pub(super) fn phydm8821c(info: super::phy8821c::Info, sequence: u16) -> Result<[
     packet[11] = 0x11; // source physical TX-A/RX-A antenna fields.
     Ok(packet)
 }
+/// `fw.c::rtw_fw_send_phydm_info` for RTL8822BE: `rfe_option`,
+/// `FW_RF_2T2R`, cut and the 2T2R `antenna_tx`/`antenna_rx` = `BB_PATH_AB`
+/// in Linux's RX_ANT/TX_ANT status fields.
+pub(super) fn phydm8822b(info: super::phy8822b::Info, sequence: u16) -> Result<[u8; BYTES], Error> {
+    if info.cut > 15 || !matches!(info.rfe, 2 | 3 | 5) {
+        return Err(Error::Unsupported);
+    }
+    let mut packet = header(17, 16, sequence);
+    packet[8] = info.rfe;
+    packet[9] = 2;
+    packet[10] = info.cut;
+    packet[11] = 0x33;
+    Ok(packet)
+}
+pub(super) fn iqk8821c_associated(sequence: u16) -> [u8; BYTES] {
+    let mut packet = header(14, 9, sequence);
+    packet[8] = 2;
+    packet
+}
 pub(super) fn iqk8821c(sequence: u16) -> [u8; BYTES] {
     // rtw8821c_do_iqk: clear=0 and segment=0 before association.
     header(14, 9, sequence)
@@ -113,9 +132,9 @@ pub(super) fn descriptor() -> [u8; 48] {
     bytes
 }
 pub(super) async fn send(io: &mut impl Io, packet: &[u8; BYTES]) -> Result<(), Error> {
-    io.submit_h2c(packet)?;
+    io.submit_h2c(packet).await?;
     for _ in 0..1000 {
-        if io.poll_h2c()? {
+        if io.poll_h2c().await? {
             return Ok(());
         }
         io.delay_us(10).await;

@@ -2,6 +2,7 @@
 //! Policy-bounded unassociated probes over the retained mission transport.
 use super::*;
 use crate::ath10k::{regulatory::Permission, wmi_boot::Capabilities};
+use alloc::sync::Arc;
 use core::{future::Future, pin::pin, task::Poll};
 use narf_wireless::reg::RegulatoryDomain;
 
@@ -9,17 +10,22 @@ fn permission(
     caps: &Capabilities,
     domain: &RegulatoryDomain,
     frequency: u16,
+    hint: Option<Arc<beacon_hints::Receipt>>,
 ) -> Result<Permission, Error> {
-    Permission::from_domain(caps, domain, frequency)
+    Permission::occupied_width_with_hint(caps, domain, frequency, None, false, hint)
 }
 
+#[derive(Clone, Debug)]
 pub(in crate::ath10k) struct Plan {
-    channels: Vec<u16>,
-    ssids: Vec<Vec<u8>>,
-    extra_ies: Vec<u8>,
-    permissions: Vec<Permission>,
-    setup: Vec<Vec<u8>>,
-    restore: Vec<u8>,
+    pub(super) channels: Vec<u16>,
+    pub(super) ssids: Vec<Vec<u8>>,
+    pub(super) extra_ies: Vec<u8>,
+    pub(super) permissions: Vec<Permission>,
+    pub(super) setup: Vec<Vec<u8>>,
+    pub(super) restore: Vec<Vec<u8>>,
+    pub(super) station: Option<associated_scan::Binding>,
+    /// Run on the P2P_DEVICE vdev (`Radio::p2p_device_scan`), not vdev0.
+    pub(super) p2p_device: Option<u8>,
 }
 impl Plan {
     /// Own and validate all probe content before reserving an ID or touching HIF.
@@ -28,9 +34,17 @@ impl Plan {
         self.extra_ies = wire::owned(bytes)?;
         Ok(self)
     }
-    fn validate(&self, caps: &Capabilities, domain: &RegulatoryDomain) -> Result<(), Error> {
+    pub(in crate::ath10k) fn validate(
+        &self,
+        caps: &Capabilities,
+        domain: &RegulatoryDomain,
+    ) -> Result<(), Error> {
+        associated_scan::receive_permission(domain, &self.channels)?;
+        if let Some(station) = &self.station {
+            station.check(domain)?;
+        }
         for previous in &self.permissions {
-            let current = permission(caps, domain, previous.frequency)?;
+            let current = permission(caps, domain, previous.frequency, previous.hint.clone())?;
             if current.factory != previous.factory
                 || current.country != previous.country
                 || current.half_dbm < previous.half_dbm
@@ -68,12 +82,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         frequency: u16,
     ) -> bool {
         self.channels.contains(&frequency)
-            && self
-                .htt
-                .wmi
-                .caps
-                .as_ref()
-                .is_some_and(|caps| permission(caps, domain, frequency).is_ok())
+            && self.htt.wmi.caps.as_ref().is_some_and(|caps| {
+                permission(caps, domain, frequency, self.beacon_hints.receipt(domain)).is_ok()
+            })
     }
     /// Preflight performs no transport access and reserves no scan ID.
     pub(in crate::ath10k) fn prepare_active_scan(
@@ -82,8 +93,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         ssids: &[Vec<u8>],
         domain: &RegulatoryDomain,
     ) -> Result<Plan, Error> {
-        if self.failed || self.ready.is_none() || self.peer.is_some() {
+        if self.failed || self.ready.is_none() || self.scan_pending.is_some() {
             return Err(Error::Failed);
+        }
+        let station = self.scan_binding()?;
+        if let Some(station) = &station {
+            station.check(domain)?;
         }
         wire::validate_channels(channels)?;
         wire::validate_ssids(ssids)?;
@@ -91,14 +106,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
+        let hint = self.beacon_hints.receipt(domain);
         let mut permissions = Vec::new();
         permissions
             .try_reserve_exact(channels.len())
             .map_err(|_| Error::NoMemory)?;
         for &frequency in channels {
-            permissions.push(permission(caps, domain, frequency)?);
+            permissions.push(permission(caps, domain, frequency, hint.clone())?);
         }
-        let global = *permissions.first().ok_or(Error::Unsupported)?;
+        let global = station
+            .as_ref()
+            .map(|s| &s.permission)
+            .or_else(|| permissions.first())
+            .ok_or(Error::Unsupported)?;
         let mut setup = Vec::new();
         setup.try_reserve_exact(4).map_err(|_| Error::NoMemory)?;
         setup.push(self.wire.domain(global)?);
@@ -108,14 +128,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         for two_ghz in [true, false] {
             if let Some(permission) = permissions
                 .iter()
+                .chain(station.as_ref().map(|s| &s.permission))
                 .filter(|p| (p.frequency < 3000) == two_ghz)
                 .min_by_key(|p| p.half_dbm)
             {
-                setup.push(self.wire.power(*permission)?);
+                setup.push(self.wire.power(permission)?);
             }
         }
-        setup.push(self.wire.active_channels(&permissions)?);
-        let restore = self.wire.channels(&self.channels)?;
+        setup.push(if station.is_some() {
+            self.scan_inventory(&permissions, station.as_ref())?
+        } else {
+            self.wire.active_channels(&permissions)?
+        });
+        let restore = self.scan_restore(station.as_ref())?;
         let mut names = Vec::new();
         names
             .try_reserve_exact(ssids.len())
@@ -135,6 +160,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             permissions,
             setup,
             restore,
+            station,
+            p2p_device: None,
         })
     }
 
@@ -146,26 +173,37 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         plan: Plan,
         current: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
+        // Raw PCI diagnostics keep their original exclusive unassociated
+        // owner. Registered associated scans use retained stepwise dwell.
+        if plan.station.is_some() || self.station.peer.is_some() {
+            return Err(Error::Failed);
+        }
         // Plans carry requested geometry, not authority for another physical
         // owner. Bind every check to this owner's actual SERVICE_READY facts.
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?.clone();
         plan.validate(&caps, &current()?)?;
+        self.check_scan_binding(plan.station.as_ref())?;
         let before = self.sequence;
         let result = self
-            .scan_run(
+            .scan_run_on(
+                plan.p2p_device,
                 &plan.channels,
                 (&plan.ssids, &plan.extra_ies),
                 &plan.setup,
-                Some(&plan.restore),
+                plan.restore.first().map(Vec::as_slice),
                 || plan.validate(&caps, &current()?),
             )
             .await;
         if result.is_err() && self.sequence != before {
             // Only the freshly reserved ID can be stopped. A denied preflight
             // does not send STOP or configure channels behind the caller's back.
-            if let Ok(stop) = self.wire.stop_scan(self.sequence) {
-                if self.htt.wmi.htc.send_wmi(&stop).await.is_ok() {
-                    let _ = self.htt.wmi.htc.send_wmi(&plan.restore).await;
+            if !self.htt.wmi.htc.transport.nonblocking_wmi() {
+                if let Ok(stop) = self.wire.stop_scan(self.sequence) {
+                    if self.htt.wmi.htc.send_wmi(&stop).await.is_ok() && plan.station.is_none() {
+                        for packet in &plan.restore {
+                            let _ = self.htt.wmi.htc.send_wmi(packet).await;
+                        }
+                    }
                 }
             }
             self.failed = true;

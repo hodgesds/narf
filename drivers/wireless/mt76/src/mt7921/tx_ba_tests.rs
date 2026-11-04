@@ -1,4 +1,6 @@
 //! Actual retained originator protocol/control/data, with native firmware replies.
+#[path = "tx_ba_tid_tests.rs"]
+mod tid_tests;
 use super::*;
 use crate::mt7921::association::Security;
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
@@ -10,7 +12,8 @@ fn frame(n: u8) -> Vec<u8> {
     f[12..14].copy_from_slice(&[8, 0]);
     f
 }
-fn joined(channel: u8, wide: bool, secure: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(channel: u8, wide: bool, secure: bool) -> Result<NativeSession, &'static str> {
     let (mut session, bss) = super::ht20_tests::prepared(channel, secure);
     let permission = if wide {
         super::ht40_tests::permission40(channel, channel + 4)
@@ -29,8 +32,8 @@ fn joined(channel: u8, wide: bool, secure: bool) -> Result<Session<Model>, &'sta
 }
 fn establish(session: &mut Session<Model>) -> Result<(), &'static str> {
     if run(session.negotiate_transmit_ba()) != Ok(true)
-        || !session.tx_ba.active()
-        || !session.tx_ba.published()
+        || !session.station.tx_ba.active()
+        || !session.station.tx_ba.published()
         || !session.backend.tx_ba_native
     {
         return Err("actual ADDBA/native receipts did not activate originator");
@@ -90,7 +93,7 @@ fn native() -> Result<(), &'static str> {
                 let count = session.backend.frames.len();
                 if run(session.negotiate_transmit_ba()) != Err(Error::Busy)
                     || session.backend.frames.len() != count
-                    || !session.tx_ba.active()
+                    || !session.station.tx_ba.active()
                 {
                     return Err("second entry reset active QoS sequence or native window");
                 }
@@ -121,9 +124,9 @@ fn fallback() -> Result<(), &'static str> {
         }
         let before = session.backend.frames.len();
         if run(session.negotiate_transmit_ba()) != Ok(false)
-            || session.tx_ba.active()
-            || session.tx_ba.published()
-            || session.tx_ba.remote()
+            || session.station.tx_ba.active()
+            || session.station.tx_ba.published()
+            || session.station.tx_ba.remote()
             || !matches!(session.state, State::Associated { .. })
         {
             return Err(
@@ -175,9 +178,9 @@ fn cancelled() -> Result<(), &'static str> {
             }
         }
         if !matches!(session.state, State::Running(Stage::StaRecord))
-            || session.tx_ba.active()
-            || !session.tx_ba.remote()
-            || session.tx_ba.published() != (stage != 0)
+            || session.station.tx_ba.active()
+            || !session.station.tx_ba.remote()
+            || session.station.tx_ba.published() != (stage != 0)
             || !session.backend.owner.published
         {
             return Err("cancelled originator released dialog/native uncertainty");
@@ -193,7 +196,10 @@ fn cancelled() -> Result<(), &'static str> {
             return Err("late native reply revived cancelled originator");
         }
         run(session.recover(OWN)).map_err(|_| "verified originator cancellation reset")?;
-        if session.tx_ba.active() || session.tx_ba.published() || session.tx_ba.remote() {
+        if session.station.tx_ba.active()
+            || session.station.tx_ba.published()
+            || session.station.tx_ba.remote()
+        {
             return Err("verified reset retained uncertain originator record");
         }
     }
@@ -213,9 +219,9 @@ fn rejected() -> Result<(), &'static str> {
         session.backend.ba_error_tag = Some(tag);
         if run(session.negotiate_transmit_ba()).is_ok()
             || !matches!(session.state, State::Failed { .. })
-            || session.tx_ba.active()
-            || !session.tx_ba.published()
-            || session.security.is_some()
+            || session.station.tx_ba.active()
+            || !session.station.tx_ba.published()
+            || session.station.security.is_some()
             || !session.backend.owner.published
             || session.start_ethernet(&frame(1)) != Err(Error::Busy)
         {
@@ -229,8 +235,8 @@ fn rejected() -> Result<(), &'static str> {
         if run(session.negotiate_transmit_ba()) != Err(Error::Authority)
             || session.backend.frames.len() != before + stage
             || !matches!(session.state, State::Failed { .. })
-            || session.tx_ba.active()
-            || session.station_permission.is_some()
+            || session.station.tx_ba.active()
+            || session.station.permission.is_some()
         {
             return Err("originator publication crossed a revoked source/policy boundary");
         }
@@ -259,7 +265,10 @@ fn peer_stop() -> Result<(), &'static str> {
         return Err("host queue exceeded actual response window");
     }
     session.backend.packets.push_back(delba());
-    if session.receive_ethernet() != Ok(None) || session.tx_ba.active() || session.keys_pending() {
+    if session.receive_ethernet() != Ok(None)
+        || session.station.tx_ba.active()
+        || session.keys_pending()
+    {
         return Err("peer DELBA did not pause replenishment before old packet drain");
     }
     session.backend.tx_stall = false;
@@ -275,8 +284,8 @@ fn peer_stop() -> Result<(), &'static str> {
     if f.len() != 2
         || f[0].1.get(68..82) != Some(&[8, 0, 28, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0][..])
         || f[1].1.get(56..68) != Some(&[6, 0, 12, 0, 0, 1, 0, 0, 0, 0, 0, 0][..])
-        || session.tx_ba.published()
-        || session.tx_ba.remote()
+        || session.station.tx_ba.published()
+        || session.station.tx_ba.remote()
     {
         return Err("peer DELBA native disable/zero window records or exact receipts missing");
     }
@@ -317,8 +326,8 @@ fn local_stop() -> Result<(), &'static str> {
                 }
             }
             if !matches!(session.state, State::Running(_))
-                || session.tx_ba.active()
-                || !session.tx_ba.published()
+                || session.station.tx_ba.active()
+                || !session.station.tx_ba.published()
                 || session.start_ethernet(&frame(0)) != Err(Error::Busy)
             {
                 return Err("cancelled originator stop freed its native record");
@@ -328,9 +337,9 @@ fn local_stop() -> Result<(), &'static str> {
             let f = &session.backend.frames[before..];
             if f.len() != 3
                 || f[2].1.get(24..) != Some(&[3, 2, 0, 8, 39, 0][..])
-                || session.tx_ba.active()
-                || session.tx_ba.published()
-                || session.tx_ba.remote()
+                || session.station.tx_ba.active()
+                || session.station.tx_ba.published()
+                || session.station.tx_ba.remote()
             {
                 return Err("native disable receipts did not precede positive local DELBA");
             }
@@ -390,9 +399,9 @@ fn rekey() -> Result<(), &'static str> {
     if f.len() != 6
         || f[2].1.get(24..) != Some(&[3, 2, 0, 8, 39, 0][..])
         || extract_eapol(&f[5].1).is_none()
-        || session.tx_ba.active()
-        || session.tx_ba.published()
-        || !session.rx_ba.records().is_empty()
+        || session.station.tx_ba.active()
+        || session.station.tx_ba.published()
+        || !session.station.rx_ba.records().is_empty()
     {
         return Err("rekey M2 preceded terminal originator/recipient retirement");
     }
@@ -401,7 +410,8 @@ fn rekey() -> Result<(), &'static str> {
     }
     run(session.service_keys()).map_err(|_| "new native PTK after both role fences")?;
     run(session.send_ethernet(&frame(12))).map_err(|_| "post-rekey nonaggregated fallback")?;
-    if session.backend.data_aggregation.last() != Some(&false) || session.security.is_none() {
+    if session.backend.data_aggregation.last() != Some(&false) || session.station.security.is_none()
+    {
         return Err("old originator window crossed native key epoch");
     }
     Ok(())
@@ -425,8 +435,8 @@ fn close() -> Result<(), &'static str> {
         || f[1].1.get(56..64) != Some(&[6, 0, 12, 0, 0, 1, 0, 0][..])
         || f[2].1.first() != Some(&0xc0)
         || f[3].1.get(56..64) != Some(&[17, 0, 8, 0, 1, 0, 0, 0][..])
-        || session.tx_ba.published()
-        || session.tx_ba.remote()
+        || session.station.tx_ba.published()
+        || session.station.tx_ba.remote()
         || !matches!(session.state, State::ScanReady(_))
     {
         return Err("originator/key/WCID close did not preserve native retirement order");
@@ -440,12 +450,14 @@ fn close() -> Result<(), &'static str> {
     }
     let mut exhausted = joined(6, false, false)?;
     for _ in 0..255 {
-        if !exhausted.tx_ba.begin_connection() || exhausted.tx_ba.start(OWN, AP, 6) != Ok(true) {
+        if !exhausted.station.tx_ba.begin_connection()
+            || exhausted.station.tx_ba.start(OWN, AP, 6) != Ok(true)
+        {
             return Err("bounded native dialog inventory fixture");
         }
-        exhausted.tx_ba.fallback();
+        exhausted.station.tx_ba.fallback();
     }
-    if !exhausted.tx_ba.begin_connection() {
+    if !exhausted.station.tx_ba.begin_connection() {
         return Err("clean exhausted-dialog peer fixture");
     }
     let before = exhausted.backend.frames.len();
@@ -497,14 +509,14 @@ fn late_control() -> Result<(), &'static str> {
         if deauth {
             if result != Err(Error::DeviceGone)
                 || !matches!(session.state, State::Failed { .. })
-                || !session.tx_ba.published()
+                || !session.station.tx_ba.published()
             {
                 return Err("queued AP close did not preserve uncertain native originator claims");
             }
         } else if result != Ok(false)
-            || session.tx_ba.active()
-            || session.tx_ba.published()
-            || session.tx_ba.remote()
+            || session.station.tx_ba.active()
+            || session.station.tx_ba.published()
+            || session.station.tx_ba.remote()
         {
             return Err("data ahead of DELBA was mistaken for current native idle");
         }
@@ -532,7 +544,7 @@ fn tx_amsdu() -> Result<(), &'static str> {
     for responder_amsdu in [true, false] {
         let mut session = joined(6, false, true)?;
         // mt76_connac_mcu_sta_amsdu_tlv on the HT peer record.
-        let profile = session.ht20_profile.ok_or("HT profile")?;
+        let profile = session.station.ht20_profile.ok_or("HT profile")?;
         let record = session
             .backend
             .frames
@@ -569,7 +581,7 @@ fn tx_amsdu() -> Result<(), &'static str> {
         if !session.backend.frames[before..]
             .iter()
             .any(|(_, f)| f.len() == 33 && f[24..26] == [3, 0] && f[27..29] == [3, 16])
-            || session.tx_ba.amsdu() != responder_amsdu
+            || session.station.tx_ba.amsdu() != responder_amsdu
         {
             return Err("ADDBA request lacked AMSDU or response bit was not retained");
         }

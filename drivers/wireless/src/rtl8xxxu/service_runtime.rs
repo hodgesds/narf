@@ -13,6 +13,15 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use zeroize::Zeroizing;
+
+#[path = "service_associated_active.rs"]
+mod service_associated_active;
+#[path = "service_channels.rs"]
+mod service_channels;
+#[path = "service_power.rs"]
+mod service_power;
+#[path = "service_probe.rs"]
+mod service_probe;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,
@@ -25,9 +34,11 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Passive,
+    Scanning,
     Joining,
     Connected,
     Stopped,
+    Parked,
     Failed,
 }
 /// No timer-derived nonce is admissible. The native environment delegates to
@@ -40,6 +51,7 @@ pub trait Environment: Send + Sync {
 struct Entry {
     candidate: Candidate,
     seen: u64,
+    generation: u64,
 }
 struct Attempt {
     failed: Arc<AtomicBool>,
@@ -63,6 +75,9 @@ pub struct Service<C: ControlIo, B: packet_transport::Io, E: Environment> {
     own: [u8; 6],
     last_now: u64,
     retire: Option<Arc<dyn Fn() + Send + Sync>>,
+    generation: u64,
+    probing: bool,
+    probe_sequence: u16,
 }
 impl<C: ControlIo, B: packet_transport::Io, E: Environment> core::fmt::Debug for Service<C, B, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -98,6 +113,9 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             own,
             last_now: now,
             retire: None,
+            generation: 1,
+            probing: false,
+            probe_sequence: 0,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -114,11 +132,17 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
         match self.radio.as_ref().map(Receiver::phase) {
             Some(receive_runtime::Phase::Receiving) => Phase::Passive,
+            Some(receive_runtime::Phase::Active) if self.probing => Phase::Scanning,
+            Some(receive_runtime::Phase::Parked) => Phase::Parked,
             _ => Phase::Failed,
         }
     }
     pub fn local(&self) -> [u8; 6] {
         self.own
+    }
+    pub(super) fn wide_supported(&self) -> bool {
+        self.radio.as_ref().is_some_and(Receiver::has_wide_profiles)
+            || self.station.as_ref().is_some_and(Station::wide_supported)
     }
     pub(super) fn ht_enabled(&self) -> bool {
         self.radio.as_ref().is_some_and(Receiver::ht_enabled)
@@ -178,12 +202,27 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         Ok(now)
     }
     pub fn candidates(&self) -> Vec<Candidate> {
+        if self.current().is_err() {
+            self.failed.store(true, Ordering::Release);
+            return Vec::new();
+        }
         let now = self.environment.now_ms();
-        self.cache
+        let candidates = self
+            .cache
             .iter()
-            .filter(|e| now >= e.seen && now - e.seen < 10000)
+            .filter(|e| {
+                now >= e.seen
+                    && now - e.seen < 10000
+                    && self.channel_permission(e.candidate.channel()).is_ok()
+            })
             .map(|e| e.candidate.clone())
-            .collect()
+            .collect();
+        if self.current().is_err() {
+            self.failed.store(true, Ordering::Release);
+            Vec::new()
+        } else {
+            candidates
+        }
     }
     /// Bounded progress from both a worker and a synchronous network waiter.
     /// No EP0 await, block_on, or dependence on another executor task occurs.
@@ -197,7 +236,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     fn poll_inner(&mut self) -> Result<Vec<Vec<u8>>, Error> {
         let now = self.now()?;
         match self.phase() {
-            Phase::Passive => {
+            Phase::Passive | Phase::Scanning => {
                 let radio = self.radio.as_mut().ok_or(Error::State)?;
                 if let Some(frames) = radio.poll().map_err(Error::Radio)? {
                     for frame in frames {
@@ -217,6 +256,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                             *entry = Entry {
                                 candidate,
                                 seen: now,
+                                generation: self.generation,
                             };
                         } else {
                             if self.cache.len() == 32 {
@@ -232,6 +272,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                             self.cache.push(Entry {
                                 candidate,
                                 seen: now,
+                                generation: self.generation,
                             });
                         }
                     }
@@ -259,7 +300,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                 }
                 Ok(frames)
             }
-            Phase::Stopped => Ok(Vec::new()),
+            Phase::Stopped | Phase::Parked => Ok(Vec::new()),
             _ => Err(Error::State),
         }
     }
@@ -276,17 +317,64 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
-        let candidate = self
+        let mut candidate = self
             .candidates()
             .into_iter()
             .find(|b| b.bssid() == bssid && b.ssid() == ssid)
             .ok_or(Error::Profile)?;
+        // Reject malformed caller input before changing the physical stream.
+        let mut preflight =
+            Join::prepare(candidate.clone(), self.own, ssid, mode).map_err(Error::Management)?;
+        preflight.append_sme_ies(ies).map_err(Error::Management)?;
+        if mode.is_wpa2() != pmk.is_some() {
+            return Err(Error::Profile);
+        }
+        if candidate.channel() != self.channel()? {
+            self.select_channel(candidate.channel()).await?;
+        }
+        if !self.cache.iter().any(|entry| {
+            entry.candidate.bssid() == bssid
+                && entry.candidate.ssid() == ssid
+                && entry.generation == self.generation
+        }) {
+            // A directed response can identify a hidden SSID. After a cold
+            // transition it needs a new genuine target response; an older
+            // display entry alone cannot authorize authentication.
+            if candidate.probe_response() {
+                self.probe_current(ssid, &[], 0, false).await?;
+            }
+            let deadline = self.now()?.checked_add(2_000).ok_or(Error::State)?;
+            for _ in 0..20_000 {
+                self.poll()?;
+                if let Some(entry) = self.cache.iter().find(|entry| {
+                    entry.candidate.bssid() == bssid
+                        && entry.candidate.ssid() == ssid
+                        && entry.generation == self.generation
+                }) {
+                    candidate = entry.candidate.clone();
+                    break;
+                }
+                if self.now()? >= deadline {
+                    return Err(Error::Profile);
+                }
+                self.environment.pause().await;
+            }
+            if !self.cache.iter().any(|entry| {
+                entry.candidate.bssid() == bssid
+                    && entry.candidate.ssid() == ssid
+                    && entry.generation == self.generation
+            }) {
+                return Err(Error::Profile);
+            }
+        }
         let mut plan = Join::prepare_with_phy(
             candidate.clone(),
             self.own,
             ssid,
             mode,
-            self.radio.as_ref().and_then(Receiver::ht_local),
+            self.radio
+                .as_ref()
+                .and_then(|radio| radio.ht_local_for(&candidate)),
         )
         .map_err(Error::Management)?;
         plan.append_sme_ies(ies).map_err(Error::Management)?;
@@ -420,7 +508,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     }
     pub async fn disconnect(&mut self) -> Result<(), Error> {
         match self.phase() {
-            Phase::Passive | Phase::Stopped => return Ok(()),
+            Phase::Passive | Phase::Stopped | Phase::Parked => return Ok(()),
             Phase::Connected | Phase::Joining => (),
             _ => return Err(Error::State),
         }

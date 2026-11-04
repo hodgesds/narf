@@ -2,6 +2,8 @@
 //! Persistent PCIe beacon-DMA reserved-page owner, Linux rtw88/{fw,pci,tx}.c.
 use super::firmware_transport::{self, Error};
 use alloc::boxed::Box;
+#[path = "runtime_ps_page.rs"]
+mod runtime_ps_page;
 const DESC: usize = 48;
 const PAYLOAD: usize = 4096;
 /// # Safety
@@ -126,6 +128,23 @@ pub(super) unsafe trait Registers: Send {
     fn station_bind_ht(&mut self, _: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_bind_host(&mut self, _: narf_net::native_emission::Lifetime) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_ps_rx_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    /// See `firmware_transport::Io::ps_mailbox_submit`.
+    fn ps_mailbox_submit(
+        &mut self,
+        _: [u8; 8],
+        _: &mut firmware_transport::PsScope<'_>,
+    ) -> Result<firmware_transport::PsSubmit, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         Err(Error::Unsupported)
     }
@@ -161,6 +180,45 @@ pub(super) unsafe trait Registers: Send {
         Err(Error::Unsupported)
     }
     /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    fn station_power_tracking_request(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_extension(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_power_tracking(
+        &mut self,
+        _: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_begin(
+        &mut self,
+        _: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        _: bool,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_finish(
+        &mut self,
+        _: Option<super::tracking8821c::Program>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_continuation(
         &mut self,
         _: alloc::sync::Arc<super::qualification::Grant>,
@@ -186,6 +244,48 @@ pub(super) unsafe trait Registers: Send {
     }
     /// A clone of the current retained station gate.
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_channel(&self) -> (u8, u64) {
+        (1, 1)
+    }
+    fn station_channel_grant(
+        &mut self,
+        _: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        Ok(None)
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        match grant {
+            None => Ok(()),
+            Some(_) => Err(Error::Unsupported),
+        }
+    }
+    fn station_retune_begin(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_width_begin(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_retune_iqk(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_b22_iqk(&mut self, _: super::tracking8822b::Step) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_retune_finish(&mut self, _: u8) -> Result<u64, Error> {
         Err(Error::Unsupported)
     }
     fn station_bind_tx_ba(
@@ -250,6 +350,39 @@ pub(super) unsafe trait Registers: Send {
     fn dma_reclaimable(&self) -> bool {
         false
     }
+    /// `pci.c::rtw_pci_stop`: reversible ring reset of a quiet packet owner.
+    fn hci_stop(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// `pci.c::rtw_pci_setup` + `rtw_pci_start` after [`Registers::hci_stop`].
+    fn hci_restart(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// `wow.c::rtw_wow_swap_fw` precondition on the live packet owner: TRX
+    /// stopped and quiet, RX DMA released and idle. Re-claim inside an open
+    /// swap window is allowed.
+    fn claim_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// The swapped image runs (`Owner::run` tail); stay in the swap window
+    /// instead of parking as bring-up's `finish_dma` does.
+    fn finish_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// Close the swap window and readmit packet producers.
+    fn end_swap(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+}
+/// `mac.c::rtw_set_trx_fifo_info` `rsvd_boundary` as station pages use it
+/// (`runtime_ps_page`): the firmware swap restores this value, as Linux
+/// `rtw_fw_write_data_rsvd_page` restores `fifo.rsvd_boundary`.
+pub(super) fn station_boundary(did: u16) -> Option<u16> {
+    match did {
+        0xc821 => Some(460),
+        0xc822 => Some(1938),
+        _ => None,
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
@@ -270,6 +403,9 @@ pub(super) struct Backend<R: Registers, M: Memory> {
     completed: bool,
     /// The completed beacon descriptor was zeroed under parked authority.
     disarmed: bool,
+    /// `rtw_wow_swap_fw` window: the station boundary every swap page
+    /// restores (`station_boundary`). `None` outside the window.
+    swap: Option<u16>,
 }
 impl<R: Registers, M: Memory> core::fmt::Debug for Backend<R, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -312,23 +448,34 @@ impl<R: Registers, M: Memory> Backend<R, M> {
             boundary,
             completed: false,
             disarmed: false,
+            swap: None,
         })
     }
     fn word(memory: &mut M, offset: usize, value: u32) -> Result<(), Error> {
         memory.write(offset, &value.to_le_bytes())
     }
     async fn page(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.page_at(data, 0).await
+    }
+    /// Firmware page at `target` (0 for firmware sections; the station
+    /// boundary for swap-window reserved pages, Linux
+    /// `rtw_fw_download_rsvd_page`). Inside a swap window the completion
+    /// restores the station boundary, `BCNQ_DL` and disarms the descriptor.
+    async fn page_at(&mut self, data: &[u8], target: u16) -> Result<(), Error> {
         if self.state != PageState::Idle {
             return Err(Error::State);
         }
-        if data.is_empty() || data.len() > PAYLOAD {
+        if data.is_empty() || data.len() > PAYLOAD || target & !0xfff != 0 {
             return Err(Error::Image);
         }
         // Poison before MMIO, page or descriptor mutation. An outstanding TD
         // and a cancelled restoration sequence must never permit buffer reuse.
         self.state = PageState::Terminal;
+        if self.swap.is_some() {
+            self.disarmed = false;
+        }
         let beacon = self.io.read8(0x550)?;
-        self.io.write16(0x204, 1 << 15)?; // page0 + W1C prior beacon-valid
+        self.io.write16(0x204, target | 1 << 15)?; // page + W1C prior beacon-valid
         if self.io.read16(0x204)? & 1 << 15 != 0 {
             return Err(Error::Prerequisite);
         }
@@ -389,10 +536,24 @@ impl<R: Registers, M: Memory> Backend<R, M> {
         frame.acquire();
         // Fresh beacon-valid proves the exact serially published page reached
         // device TXBUF. Only completed transfers restore registers/reopen reuse.
-        self.io.write16(0x204, self.boundary | 1 << 15)?;
+        let restore = self.swap.unwrap_or(self.boundary);
+        self.io.write16(0x204, restore | 1 << 15)?;
         self.io.write8(0x550, beacon)?;
         self.io.write8(0x422, queue)?;
         self.io.write8(0x101, cr)?;
+        if self.swap.is_some() {
+            // runtime_ps_page tail: BCNQ_DL back to the station value and the
+            // consumed descriptor zeroed, so the window never leaves an armed
+            // beacon descriptor behind (hci_stop / sleep / failure).
+            self.io.write8(0x383, work)?;
+            if self.io.read8(0x383)? & 0x10 != 0 {
+                return Err(Error::Prerequisite);
+            }
+            let ring = self.ring.as_mut().ok_or(Error::State)?;
+            ring.write(0, &[0; 16])?;
+            ring.sync();
+            self.disarmed = true;
+        }
         self.state = PageState::Idle;
         Ok(())
     }
@@ -402,6 +563,59 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_request(
+        &mut self,
+        t: u8,
+        d: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> impl core::future::Future<Output = Result<super::PowerTrackingRequest, Error>> + Send {
+        async move { self.io.station_power_tracking_request(t, d) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_extension(
+        &mut self,
+        thermal: u8,
+        dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> impl core::future::Future<
+        Output = Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error>,
+    > + Send {
+        async move { self.io.station_power_tracking_extension(thermal, dm) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_bind_power_tracking(
+        &mut self,
+        g: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_bind_power_tracking(g) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_begin(
+        &mut self,
+        g: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        restore: bool,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_power_tracking_begin(g, restore) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_power_tracking_quiet() }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_power_tracking_iqk() }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_power_tracking_finish(
+        &mut self,
+        p: Option<super::tracking8821c::Program>,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_power_tracking_finish(p) }
+    }
+
     fn station_tx_ba_extension(
         &mut self,
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {
@@ -441,6 +655,60 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn station_gate(&mut self) -> Result<super::power_policy::Gate, Error> {
         self.io.station_gate()
+    }
+    fn station_channel(&self) -> (u8, u64) {
+        self.io.station_channel()
+    }
+    fn station_channel_grant(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error> {
+        self.io.station_channel_grant(channel)
+    }
+    fn station_regulatory(
+        &self,
+    ) -> Result<Option<alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>>, Error> {
+        self.io.station_regulatory()
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, alloc::sync::Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), Error> {
+        self.io.station_passive_tx(grant)
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_begin(
+        &mut self,
+        channel: u8,
+        grant: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_retune_begin(channel, grant) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_width_begin(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_width_begin() }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_iqk(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_retune_iqk() }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_b22_iqk(
+        &mut self,
+        step: super::tracking8822b::Step,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_b22_iqk(step) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_retune_finish(
+        &mut self,
+        channel: u8,
+    ) -> impl core::future::Future<Output = Result<u64, Error>> + Send {
+        async move { self.io.station_retune_finish(channel) }
     }
     fn station_bind_tx_ba(
         &mut self,
@@ -490,6 +758,18 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn station_bind_ht(&mut self, g: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
         self.io.station_bind_ht(g)
     }
+    fn station_bind_host(
+        &mut self,
+        host: narf_net::native_emission::Lifetime,
+    ) -> Result<(), Error> {
+        self.io.station_bind_host(host)
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_ht_program_quiet(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.station_ht_program_quiet() }
+    }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         self.io.station_ht_request()
     }
@@ -510,8 +790,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
         self.io.packet_profile(profile)
     }
-    fn station_profile_readback(&mut self) -> Result<(), Error> {
-        self.io.station_profile_readback()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn station_profile_readback(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.station_profile_readback() }
     }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         if self.state != PageState::Unclaimed {
@@ -526,26 +809,59 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         self.state = PageState::Idle;
         Ok(())
     }
-    fn read8(&mut self, reg: u16) -> Result<u8, Error> {
-        self.io.read8(reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, reg: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { self.io.read8(reg) }
     }
-    fn read16(&mut self, reg: u16) -> Result<u16, Error> {
-        self.io.read16(reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move { self.io.read16(reg) }
     }
-    fn read32(&mut self, reg: u16) -> Result<u32, Error> {
-        self.io.read32(reg)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(
+        &mut self,
+        reg: u16,
+    ) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { self.io.read32(reg) }
     }
-    fn write8(&mut self, reg: u16, value: u8) -> Result<(), Error> {
-        self.io.write8(reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        reg: u16,
+        value: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.write8(reg, value) }
     }
-    fn write16(&mut self, reg: u16, value: u16) -> Result<(), Error> {
-        self.io.write16(reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        reg: u16,
+        value: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.write16(reg, value) }
     }
-    fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
-        self.io.write32(reg, value)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        reg: u16,
+        value: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.write32(reg, value) }
     }
     async fn reserved_page(&mut self, data: &[u8]) -> Result<(), Error> {
         self.page(data).await
+    }
+    async fn station_reserved_page(
+        &mut self,
+        data: &[u8],
+        boundary: u16,
+        source: &super::runtime_ps_scope::Bound,
+        admission: &super::station_control::Admission,
+    ) -> Result<(), Error> {
+        self.station_page(data, boundary, source, admission).await
     }
     async fn lte_backup(&mut self) -> Result<u32, Error> {
         self.io.lte_backup().await
@@ -554,7 +870,71 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         self.io.lte_restore(value).await
     }
     async fn finish_dma(&mut self) -> Result<(), Error> {
+        if self.swap.is_some() {
+            // `rtw_wow_swap_fw`: the swapped image runs on the live station;
+            // the window stays open instead of bring-up's park.
+            if self.state != PageState::Idle || !self.disarmed {
+                self.state = PageState::Terminal;
+                return Err(Error::State);
+            }
+            let result = self.io.finish_swap();
+            if result.is_err() {
+                self.state = PageState::Terminal;
+            }
+            return result;
+        }
         self.io.finish_dma().await
+    }
+    fn claim_swap(&mut self, boundary: u16) -> Result<(), Error> {
+        if let Some(open) = self.swap {
+            if self.state != PageState::Idle || !self.disarmed || open != boundary {
+                return Err(Error::State);
+            }
+            let result = self.io.claim_swap();
+            if result.is_err() {
+                self.state = PageState::Terminal;
+            }
+            return result;
+        }
+        // Only the exact original mapping after a real completed and
+        // disarmed transfer (radio handoff, or a finished station page) may
+        // reopen; a poisoned/cancelled transfer stays retained and closed.
+        if self.state != PageState::Terminal
+            || !self.published
+            || !self.completed
+            || !self.disarmed
+            || boundary & !0xfff != 0
+        {
+            return Err(Error::State);
+        }
+        let ring = self.ring.as_ref().ok_or(Error::State)?;
+        let base = address(ring, 16, 256)?;
+        if self.io.read32(0x308)? != base
+            || self.io.read16(0x204)? & 0xfff != boundary
+            || self.io.read8(0x383)? & 0x10 != 0
+            || self.io.read8(0x550)? & 8 != 0
+        {
+            return Err(Error::Prerequisite);
+        }
+        self.io.claim_swap()?;
+        self.swap = Some(boundary);
+        self.state = PageState::Idle;
+        Ok(())
+    }
+    async fn swap_page(&mut self, data: &[u8]) -> Result<(), Error> {
+        let boundary = self.swap.ok_or(Error::State)?;
+        self.page_at(data, boundary).await
+    }
+    fn end_swap(&mut self) -> Result<(), Error> {
+        if self.swap.is_none() || self.state != PageState::Idle || !self.disarmed {
+            return Err(Error::State);
+        }
+        // Back to the station-era closed channel: only runtime_ps_page may
+        // reuse it (it requires Terminal + disarmed + completed).
+        self.state = PageState::Terminal;
+        self.io.end_swap()?;
+        self.swap = None;
+        Ok(())
     }
     fn begin_mac(&mut self) -> Result<(), Error> {
         if self.state != PageState::Idle {
@@ -592,7 +972,11 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         self.io.begin_station8821c()
     }
     fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != PageState::Continued || !self.completed || gate.did() != 0xc821 {
+        // C21 and B22 (`radio8822b::prepare_station`) both arrive parked.
+        if self.state != PageState::Continued
+            || !self.completed
+            || !matches!(gate.did(), 0xc821 | 0xb822)
+        {
             return Err(Error::State);
         }
         self.state = PageState::Terminal;
@@ -620,16 +1004,24 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn begin_commands(&mut self) -> Result<(), Error> {
         self.io.begin_commands()
     }
-    fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
-        self.io.submit_h2c(packet)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        packet: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.submit_h2c(packet) }
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
-        self.io.poll_h2c()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.poll_h2c() }
     }
-    fn park_radio(&mut self) -> Result<(), Error> {
-        // The calibration-only continuation retains the completed beacon
-        // mappings unchanged and never admits ordinary packet producers.
-        self.io.park_radio()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn park_radio(&mut self) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            // The calibration-only continuation retains the completed beacon
+            // mappings unchanged and never admits ordinary packet producers.
+            self.io.park_radio()
+        }
     }
     fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
         if self.state != PageState::Continued || !self.completed {
@@ -670,14 +1062,31 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.io.station_own()
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        self.io.mailbox_ready()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.mailbox_ready() }
     }
-    fn mailbox_submit(&mut self, p: [u8; 8]) -> Result<(), Error> {
-        self.io.mailbox_submit(p)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        p: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move { self.io.mailbox_submit(p) }
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        self.io.mailbox_consumed()
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn ps_mailbox_submit(
+        &mut self,
+        p: [u8; 8],
+        scope: &mut firmware_transport::PsScope<'_>,
+    ) -> impl core::future::Future<Output = Result<firmware_transport::PsSubmit, Error>> + Send
+    {
+        async move { self.io.ps_mailbox_submit(p, scope) }
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move { self.io.mailbox_consumed() }
     }
     fn mailbox_pending(&self) -> bool {
         self.io.mailbox_pending()
@@ -713,6 +1122,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
         self.io.packet_stop()
+    }
+    fn hci_stop(&mut self) -> Result<(), Error> {
+        self.io.hci_stop()
+    }
+    fn hci_restart(&mut self) -> Result<(), Error> {
+        self.io.hci_restart()
     }
     async fn quiesce_dma(&mut self) -> Result<(), Error> {
         // The beacon page must have completed (fresh BCN_VALID) or been

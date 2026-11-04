@@ -12,8 +12,10 @@ use crate::{
 pub(in crate::ath9k) struct Plan {
     pub(in crate::ath9k) registers: [(u64, u32); 7],
 }
-fn target<const N: usize>(
-    image: &[u8; EEPROM_4K_BYTES],
+/// `eeprom.c::ath9k_hw_get_legacy_target_powers`/`_get_target_powers` over
+/// three `{bChannel, tPow2x[N]}` rows; shared by the 4k and AR9287 maps.
+pub(in crate::ath9k) fn target<const N: usize>(
+    image: &[u8],
     at: usize,
     frequency: u16,
 ) -> Result<[u8; N], BringUpError> {
@@ -64,7 +66,10 @@ fn target<const N: usize>(
     }))
 }
 fn edge(image: &[u8; EEPROM_4K_BYTES], index: usize, frequency: u16) -> Result<u8, BringUpError> {
-    let edges = &image[279 + index * 8..279 + (index + 1) * 8];
+    edge_power(&image[279 + index * 8..279 + (index + 1) * 8], frequency)
+}
+/// `eeprom.c::ath9k_hw_get_max_edge_power` over four `{bChannel, ctl}` edges.
+pub(in crate::ath9k) fn edge_power(edges: &[u8], frequency: u16) -> Result<u8, BringUpError> {
     let count = edges.chunks_exact(2).position(|r| r[0] == 255).unwrap_or(4);
     for i in 1..count {
         if edges[(i - 1) * 2] >= edges[i * 2] {
@@ -92,18 +97,30 @@ fn limit(
     mode: u16,
     ceiling: u8,
 ) -> Result<u8, BringUpError> {
+    limit_with(
+        &image[267..279],
+        |i| edge(image, i, frequency),
+        cfg_ctl,
+        mode,
+        ceiling,
+    )
+}
+/// The CMP_CTL / CMP_NO_CTL walk of the per-family `set_power_per_rate_table`
+/// over `indices` (`ctlIndex[]`), with `edge(i)` the matching edge power.
+pub(in crate::ath9k) fn limit_with(
+    indices: &[u8],
+    mut edge: impl FnMut(usize) -> Result<u8, BringUpError>,
+    cfg_ctl: u16,
+    mode: u16,
+    ceiling: u8,
+) -> Result<u8, BringUpError> {
     let mut power = 63;
     let wanted = (cfg_ctl & !15) | (mode & 15);
-    for (i, index) in image[267..279]
-        .iter()
-        .copied()
-        .take_while(|n| *n != 0)
-        .enumerate()
-    {
+    for (i, index) in indices.iter().copied().take_while(|n| *n != 0).enumerate() {
         if wanted != u16::from(index) && wanted != (u16::from(index) & 15) | 0xe0 {
             continue;
         }
-        let p = edge(image, i, frequency)?;
+        let p = edge(i)?;
         if cfg_ctl & !15 == 0xe0 {
             power = power.min(p);
         } else {
@@ -154,7 +171,7 @@ fn plan(
         ],
     })
 }
-fn initial_ctl(factory: Factory) -> u16 {
+pub(in crate::ath9k) fn initial_ctl(factory: Factory) -> u16 {
     // ath_regd_get_band_ctl, initial DFS region unset. World SKUs take the
     // minimum across matching EEPROM regulatory groups rather than NO_CTL.
     let rd = factory.eeprom & !0x4000;
@@ -165,15 +182,31 @@ fn initial_ctl(factory: Factory) -> u16 {
         factory.ctl_2ghz
     }) | 2
 }
-pub(in crate::ath9k) fn checked_plan(
+/// `ath_regd_get_band_ctl(NL80211_BAND_5GHZ)` | `CTL_11A` with the same
+/// world-SKU rule as [`initial_ctl`].
+pub(in crate::ath9k) fn initial_ctl_5ghz(factory: Factory) -> u16 {
+    let rd = factory.eeprom & !0x4000;
+    let world = rd & 0x8000 == 0 && (rd & 0xf0 == 0x60 || rd == 0x199);
+    if factory.country == 0 && world {
+        0xe0
+    } else {
+        factory.ctl_5ghz
+    }
+}
+pub(in crate::ath9k) fn checked_plan_at(
     image: &[u8; EEPROM_4K_BYTES],
+    frequency: u16,
     ceiling: u8,
 ) -> Result<Plan, BringUpError> {
-    let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
-        image[8..10].try_into().unwrap(),
-    )))
-    .map_err(|_| BringUpError::BadCalibration)?;
-    plan(image, 2412, initial_ctl(factory), ceiling)
+    if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+        return Err(BringUpError::BadCalibration);
+    }
+    if frequency != 2412 && ceiling < image[60] {
+        return Err(BringUpError::Policy);
+    }
+    let factory = Factory::from_eeprom(u32::from(crate::ath9k::identity::eeprom_word(image, 8)))
+        .map_err(|_| BringUpError::BadCalibration)?;
+    plan(image, frequency, initial_ctl(factory), ceiling)
 }
 pub(super) fn program(
     io: &mut impl RegisterIo,
@@ -184,10 +217,8 @@ pub(super) fn program(
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
-    let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
-        image[8..10].try_into().unwrap(),
-    )))
-    .map_err(|_| BringUpError::BadCalibration)?;
+    let factory = Factory::from_eeprom(u32::from(crate::ath9k::identity::eeprom_word(image, 8)))
+        .map_err(|_| BringUpError::BadCalibration)?;
     let p = plan(image, frequency, initial_ctl(factory), ceiling)?;
     for (register, value) in p.registers {
         if !io.authorized() {
@@ -202,3 +233,6 @@ pub(super) fn program(
 }
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+/// Full20/40 exact primary/extension/center power program; v1/v2 remain20.
+pub(in crate::ath9k) mod wide;

@@ -7,8 +7,6 @@
 //! The SRING_SETUP / RX_RING_SELECTION_CFG goldens of every ring WCN6855
 //! configures are in `dp_tests.rs` (they need the rings set up).
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::vec::Vec;

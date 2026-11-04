@@ -225,11 +225,15 @@ fn ht_profile(ldpc: bool, stbc: bool) -> DataProfile {
         rates: 0xff0,
         qos: true,
         mcs: 0xff,
+        rx_mcs: 0xff,
         sgi: true,
         ldpc,
         stbc,
         acs: 0,
         fallback: false,
+        bw40: false,
+        band5: false,
+        vht: None,
     }
 }
 
@@ -284,7 +288,9 @@ fn smoke_rtw88_coding_payload_bounds_and_apply() -> TestResult {
         || ok(0xc821, STBC, &mut p).is_some()
         || ok(0xc822, 0, &mut p).is_some()
         || ok(0xc822, 4, &mut p).is_some()
-        || ok(0xb822, LDPC, &mut p).is_some()
+        || ok(0xb822, LDPC, &mut p) != Some(1)
+        || ok(0xb822, STBC, &mut p).is_some()
+        || ok(0x8822, LDPC, &mut p).is_some()
     {
         return TestResult::Fail("rtw88 TX coding narrow check");
     }

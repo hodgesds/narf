@@ -18,7 +18,13 @@ pub(super) struct Wire {
     pub management_event: u32,
 }
 impl Wire {
-    pub fn protection(self, request: super::StationProtection) -> Result<[Vec<u8>; 3], Error> {
+    /// `WMI_VDEV_SET_PARAM` RTS/CTS on the station `vdev`
+    /// (`mac.c::ath10k_recalc_rtscts_prot`, `ath10k_bss_info_changed`).
+    pub fn protection(
+        self,
+        vdev: u8,
+        request: super::StationProtection,
+    ) -> Result<[Vec<u8>; 3], Error> {
         let (id, cts, enable) = match self.dialect {
             Dialect::Main | Dialect::Tlv => (0x5008, 26, 44),
             Dialect::TenOne => (0x901a, 24, 43),
@@ -34,6 +40,7 @@ impl Wire {
             } else {
                 4
             };
+            put(&mut out, at, u32::from(vdev));
             put(&mut out, at + 4, parameter);
             put(&mut out, at + 8, value);
             Ok::<_, Error>(out)
@@ -55,7 +62,8 @@ impl Wire {
             Dialect::TenFour => (0x9039, 0x903a),
         }
     }
-    pub fn station_ps_mode(self, enabled: bool) -> Result<Vec<u8>, Error> {
+    /// `WMI_STA_POWERSAVE_MODE` of the station `vdev`.
+    pub fn station_ps_mode(self, vdev: u8, enabled: bool) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.ps_ids().0, if tlv { 12 } else { 8 })?;
         let at = if tlv {
@@ -64,10 +72,17 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         put(&mut out, at + 4, u32::from(enabled));
         Ok(out)
     }
-    pub fn station_ps_parameter(self, parameter: u32, value: u32) -> Result<Vec<u8>, Error> {
+    /// `WMI_STA_POWERSAVE_PARAM` of the station `vdev`.
+    pub fn station_ps_parameter(
+        self,
+        vdev: u8,
+        parameter: u32,
+        value: u32,
+    ) -> Result<Vec<u8>, Error> {
         if !matches!(
             (parameter, value),
             (0, 0) | (1, 1) | (2, 0) | (4, 0) | (3, 1..=1000)
@@ -82,6 +97,7 @@ impl Wire {
         } else {
             4
         };
+        put(&mut out, at, u32::from(vdev));
         put(&mut out, at + 4, parameter);
         put(&mut out, at + 8, value);
         Ok(out)
@@ -105,21 +121,9 @@ impl Wire {
             management_event,
         }
     }
+    /// The managed station vdev: vdev0, VDEV_TYPE_STA, subtype NONE.
     pub fn create(&self, mac: [u8; 6]) -> Result<Vec<u8>, Error> {
-        if mac[0] & 1 != 0 || mac == [0; 6] {
-            return Err(Error::Malformed);
-        }
-        let tlv = self.dialect == Dialect::Tlv;
-        let mut out = packet(self.create, 20 + usize::from(tlv) * 4)?;
-        let at = if tlv {
-            header(&mut out, 86, 20);
-            8
-        } else {
-            4
-        };
-        put(&mut out, at + 4, 2); // VDEV_TYPE_STA, vdev0/subtypeNONE.
-        out[at + 12..at + 18].copy_from_slice(&mac);
-        Ok(out)
+        super::p2p::Vdev::new(0, super::p2p::Role::Station).create(self, mac)
     }
     pub fn channels(&self, channels: &[u16]) -> Result<Vec<u8>, Error> {
         validate_channels(channels)?;
@@ -160,12 +164,12 @@ impl Wire {
     /// Linux mac.c::ath10k_update_channel_list sets HT40_PLUS here (not
     /// VDEV_START): each row is a real20MHz primary with its supported side.
     /// Only the exact fully granted pair replaces the passive inventory;
-    /// associated/offchannel scanning remains forbidden by the retained owner.
+    /// an associated scan retains these occupied home rows during dwell.
     /// A VHT profile adds `WMI_CHAN_FLAG_ALLOW_VHT` (Linux sets it on every
     /// enabled row); a granted 80 MHz receipt lists all four segment rows.
     pub fn station_ht40_channels(
         &self,
-        permission: crate::ath10k::regulatory::Permission,
+        permission: &crate::ath10k::regulatory::Permission,
         vht: bool,
     ) -> Result<Vec<u8>, Error> {
         let secondary = permission.secondary.ok_or(Error::Unsupported)?;
@@ -174,26 +178,43 @@ impl Wire {
         } else {
             permission.frequency.min(secondary)
         };
-        let segment;
-        let rows: &[u16] = if permission.width80 {
-            segment = [low, low + 20, low + 40, low + 60];
-            &segment
+        let mut segment = Vec::new();
+        segment.try_reserve_exact(8).map_err(|_| Error::NoMemory)?;
+        if permission.width80 {
+            segment.extend_from_slice(&[low, low + 20, low + 40, low + 60]);
+            if let Some(center2) = permission.center2 {
+                segment.extend_from_slice(&[
+                    center2 - 30,
+                    center2 - 10,
+                    center2 + 10,
+                    center2 + 30,
+                ]);
+            }
         } else {
-            segment = [permission.frequency, secondary, 0, 0];
-            &segment[..2]
-        };
-        let mut out = self.channels(rows)?;
+            segment.extend_from_slice(&[permission.frequency, secondary]);
+        }
+        let mut out = self.channels(&segment)?;
         let tlv = self.dialect == Dialect::Tlv;
-        for (i, frequency) in rows.iter().copied().enumerate() {
+        for (i, frequency) in segment.iter().copied().enumerate() {
+            let pair_base = permission
+                .center2
+                .filter(|center| frequency.abs_diff(*center) <= 30)
+                .map_or(low, |center| center - 30);
             let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
             // Legacy11A inventory row, ALLOW_HT; only the lower channel of
-            // each HT40 pair admits a positive secondary. No IBSS/DFS.
+            // each HT40 pair admits a positive secondary. No IBSS. A host
+            // radar row is PASSIVE | DFS (Linux mac.c
+            // ath10k_update_channel_list: `passive |= chan_radar`).
+            let radar =
+                super::beacon_hints::bit(frequency).is_some_and(|b| permission.radar & b != 0);
             put(
                 &mut out,
                 at + 12,
-                (1 << 11)
+                u32::from(frequency < 3000)
+                    | if radar { (1 << 7) | (1 << 10) } else { 0 }
+                    | (1 << 11)
                     | if vht { 1 << 12 } else { 0 }
-                    | if (frequency - low) % 40 == 0 {
+                    | if (frequency - pair_base) % 40 == 0 {
                         1 << 6
                     } else {
                         0
@@ -219,6 +240,68 @@ impl Wire {
         validate_ssids(ssids)?;
         validate_probe_ies(extra_ies)?;
         self.scan_mode(sequence, channels, ssids, extra_ies)
+    }
+    /// `mac.c::ath10k_hw_scan` on the P2P_DEVICE vif: the scan is bound to
+    /// that vdev (`arg->vdev_id = arvif->vdev_id`), so firmware sources its
+    /// Probe Requests from the P2P Device Address. Probe content is the
+    /// caller's (wpa_supplicant's P2P + WSC IEs and the `DIRECT-` SSID). A
+    /// P2P probe never offers 11b rates (Wi-Fi P2P 2.4.1; mac80211 builds
+    /// the P2P request with `no_cck` and an OFDM-only rate mask), so
+    /// WMI_SCAN_ADD_CCK_RATES (0x4) is cleared from the active flags.
+    /// TLV only (P2P exists only there).
+    pub fn p2p_device_scan(
+        &self,
+        vdev: u8,
+        sequence: u16,
+        channels: &[u16],
+        ssids: &[Vec<u8>],
+        extra_ies: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if self.dialect != Dialect::Tlv {
+            return Err(Error::Unsupported);
+        }
+        let active = !ssids.is_empty();
+        let mut out = if active {
+            self.active_scan(sequence, channels, ssids, extra_ies)?
+        } else if extra_ies.is_empty() {
+            self.scan(sequence, channels)?
+        } else {
+            return Err(Error::Unsupported);
+        };
+        // `wmi_start_scan_common.vdev_id` follows scan_id and scan_req_id.
+        put(&mut out, 16, u32::from(vdev));
+        if active {
+            // `scan_ctrl_flags`, the 15th common word.
+            let flags = word(&out, 8 + 56)? & !0x4;
+            put(&mut out, 8 + 56, flags);
+        }
+        Ok(out)
+    }
+    /// `mac.c::ath10k_hw_scan` on a station-type vif other than the managed
+    /// one (the P2P client): `arg->vdev_id = arvif->vdev_id`, so firmware
+    /// sources Probe Requests from that vif's address. Flags and probe
+    /// content are the ordinary station scan's. TLV only.
+    pub fn scan_on_vdev(
+        &self,
+        vdev: u8,
+        sequence: u16,
+        channels: &[u16],
+        ssids: &[Vec<u8>],
+        extra_ies: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if self.dialect != Dialect::Tlv {
+            return Err(Error::Unsupported);
+        }
+        let mut out = if !ssids.is_empty() {
+            self.active_scan(sequence, channels, ssids, extra_ies)?
+        } else if extra_ies.is_empty() {
+            self.scan(sequence, channels)?
+        } else {
+            return Err(Error::Unsupported);
+        };
+        // `wmi_start_scan_common.vdev_id` follows scan_id and scan_req_id.
+        put(&mut out, 16, u32::from(vdev));
+        Ok(out)
     }
     pub fn active_channels(
         &self,
@@ -369,6 +452,35 @@ impl Wire {
         }
         Ok(out)
     }
+    pub fn roc(
+        &self,
+        vdev: u8,
+        sequence: u16,
+        frequency: u16,
+        duration: u32,
+    ) -> Result<Vec<u8>, Error> {
+        if !(1..=super::offchannel::MAX_DURATION).contains(&duration) {
+            return Err(Error::Unsupported);
+        }
+        let mut out = self.scan(sequence, &[frequency])?;
+        let base = if self.dialect == Dialect::Tlv { 8 } else { 4 };
+        // `wmi_start_scan_common.vdev_id` follows scan_id and scan_req_id.
+        put(&mut out, base + 8, u32::from(vdev));
+        // mac.c::ath10k_remain_on_channel fields, with a stricter native
+        // finite dwell/max-scan budget. A delayed host/credit waiter cannot
+        // extend RF beyond this requested interval. 10.x has no burst word.
+        // PASSIVE/filter flags and empty probe content remain unchanged.
+        for offset in [20, 24, 48] {
+            put(&mut out, base + offset, duration);
+        }
+        if matches!(
+            self.dialect,
+            Dialect::Main | Dialect::TenFour | Dialect::Tlv
+        ) {
+            put(&mut out, base + 60, duration);
+        }
+        Ok(out)
+    }
     pub fn stop_scan(&self, sequence: u16) -> Result<Vec<u8>, Error> {
         if sequence == 0 || sequence > 4095 {
             return Err(Error::Exhausted);
@@ -484,7 +596,7 @@ pub(super) fn owned(v: &[u8]) -> Result<Vec<u8>, Error> {
     out.extend_from_slice(v);
     Ok(out)
 }
-fn tag(mut v: &[u8], wanted: u16) -> Result<&[u8], Error> {
+pub(super) fn tag(mut v: &[u8], wanted: u16) -> Result<&[u8], Error> {
     let mut found = None;
     while !v.is_empty() {
         let h = word(v, 0)?;
@@ -565,6 +677,24 @@ pub(super) fn supported(caps: &Capabilities, frequency: u16) -> bool {
     frequency_to_channel(frequency).is_some() && (low..=high).contains(&u32::from(frequency))
 }
 
+/// VDEV_START `band_center_freq2` and the extra channel flag, Linux wmi.c
+/// `ath10k_wmi_put_wmi_channel`. `band_center_freq1` is always the primary80
+/// half (`Permission::center`). VHT80_80 puts the other segment center;
+/// VHT160 puts the whole 160 MHz center. Either sets
+/// `WMI_CHAN_FLAG_DFS_CFREQ2` (1 << 15) when the 20 MHz channel just below
+/// the other segment's center (`center2 - 10`) is a radar channel.
+pub(super) fn start_center2(permission: &crate::ath10k::regulatory::Permission) -> (u32, u32) {
+    let Some(center2) = permission.center2 else {
+        return (0, 0);
+    };
+    let frequency = if permission.contiguous160() {
+        (permission.center + center2) / 2
+    } else {
+        center2
+    };
+    let radar = super::beacon_hints::bit(center2 - 10).is_some_and(|b| permission.radar & b != 0);
+    (u32::from(frequency), if radar { 1 << 15 } else { 0 })
+}
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "tests.rs"]
 mod tests;

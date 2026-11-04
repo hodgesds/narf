@@ -219,3 +219,237 @@ kernel_test_in!(
     "drivers/wireless/ath9k/mac",
     smoke_ar9285_mac_every_access_failure_stops_before_packet_activation
 );
+
+fn smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu() -> TestResult {
+    let io = Model::new(0);
+    if peer_clocked(&io, None, 9, Clock::AsyncFifo).is_err()
+        || async_fifo_pcu(&io).is_err()
+        || dma_txbuf(&io, 0x700).is_err()
+    {
+        return TestResult::Fail("AR9287 async-FIFO MAC settings refused");
+    }
+    // 117 MHz: SIFS (10 - 2) us, 9 us slot, 64 us ACK / 48 us CTS, EIFS
+    // AR_D_GBL_IFS_EIFS_ASYNC_FIFO and USEC = AR_USEC_ASYNC_FIFO.
+    for (reg, value) in [
+        (0x1030, 8 * 117),
+        (0x1070, 9 * 117),
+        (0x8014, (64 * 117) | ((48 * 117) << 16)),
+        (0x10b0, 363 * 117),
+        (0x801c, 0x12e0_0074),
+        (0x8264, 0x2000_0000),
+        (0x4024, 0xc4),
+        (0x8344, 0x2_0000),
+        (0x8340, 0x700),
+    ] {
+        if io.raw(reg) != value {
+            return TestResult::Fail("AR9287 async-FIFO MAC register differs from hw.c");
+        }
+    }
+    let ofdm = Model::new(0);
+    if peer_clocked(&ofdm, None, 9, Clock::Ofdm2g).is_err()
+        || ofdm.raw(0x801c) != 43
+        || ofdm.trace.borrow().iter().any(|w| w.0 == 0x10b0)
+    {
+        return TestResult::Fail("44 MHz clock profile changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu
+);
+
+/// `prepare_chip` with the AR9285 profile is the historical trace; the AR9287
+/// profile adds the two-chain factory masks, 117 MHz clock, the 1.3+ PCU block
+/// before `set_dma` and the 0x700 TX buffer.
+fn smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo() -> TestResult {
+    let historical = Model::new(0x5a93a5c3);
+    historical.parked();
+    let generic = Model::new(0x5a93a5c3);
+    generic.parked();
+    if prepare(&historical, &image(), LOCAL).is_err()
+        || prepare_chip(&generic, &image(), LOCAL, Profile::AR9285).is_err()
+        || historical.hash() != generic.hash()
+    {
+        return TestResult::Fail("AR9285 profile is not byte-identical");
+    }
+    let mut map = alloc::vec![0u8; crate::ath9k::chips::MAP_9287.bytes()];
+    map[12..18].copy_from_slice(&LOCAL);
+    map[18..20].copy_from_slice(&[3, 3]);
+    let io = Model::new(0);
+    io.parked();
+    if prepare_chip(&io, &map, LOCAL, Profile::ar9287(3, 3, true)).is_err() {
+        return TestResult::Fail("AR9287 two-chain profile refused");
+    }
+    let trace = io.trace.borrow();
+    let pcu = trace.iter().position(|w| w.0 == 0x8264);
+    let txbuf = trace.iter().position(|w| w.0 == 0x8340);
+    if pcu.is_none() || txbuf.is_none() || pcu > txbuf {
+        return TestResult::Fail("async-FIFO PCU block does not precede set_dma");
+    }
+    drop(trace);
+    if io.raw(0x8340) != 0x700
+        || io.raw(0x1070) != 20 * 117
+        || io.raw(0x10b0) != 363 * 117
+        || io.raw(0x801c) & 0x1fff_c07f != 0x12e0_0074
+        || io.raw(0x8344) & 0x2_0000 == 0
+    {
+        return TestResult::Fail("AR9287 MAC clock/PCU/TX buffer differs from hw.c");
+    }
+    let early = Model::new(0);
+    early.parked();
+    if prepare_chip(&early, &map, LOCAL, Profile::ar9287(3, 3, false)).is_err()
+        || early.raw(0x8340) != 0x700
+        || early
+            .trace
+            .borrow()
+            .iter()
+            .any(|w| w.0 == 0x8264 || w.0 == 0x10b0)
+    {
+        return TestResult::Fail("AR9287 1.1/1.2 used the async-FIFO path");
+    }
+    for (masks, profile) in [
+        ([3, 3], Profile::AR9285),
+        ([1, 1], Profile::ar9287(3, 3, true)),
+        ([3, 1], Profile::ar9287(3, 3, true)),
+    ] {
+        map[18..20].copy_from_slice(&masks);
+        let io = Model::new(0);
+        io.parked();
+        if prepare_chip(&io, &map, LOCAL, profile) != Err(Error::Packet)
+            || !io.trace.borrow().is_empty()
+        {
+            return TestResult::Fail("factory chain masks not bound to the MAC profile");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo
+);
+
+/// AR9280: 2.4 GHz is the 44 MHz OFDM profile; 5 GHz is the fast 44 MHz
+/// clock with SIFS 16 and slot + SIFS ACK/CTS (`ath9k_hw_init_global_settings`),
+/// whose values equal the Linux `ar9280Modes_fast_clock_9280_2` 5G_HT20 INI.
+fn smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs() -> TestResult {
+    let mut map = alloc::vec![0u8; crate::ath9k::chips::MAP_DEF.bytes()];
+    map[12..18].copy_from_slice(&LOCAL);
+    map[18..20].copy_from_slice(&[3, 3]);
+    let five = Model::new(0);
+    five.parked();
+    if prepare_chip(&five, &map, LOCAL, Profile::ar9280(3, 3, true)).is_err() {
+        return TestResult::Fail("AR9280 5 GHz MAC profile refused");
+    }
+    for (reg, value) in [(0x1030, 0x268), (0x1070, 0x18c), (0x8340, 0x700)] {
+        if five.raw(reg) != value {
+            return TestResult::Fail("AR9280 5 GHz SIFS/slot/TX buffer differs from Linux");
+        }
+    }
+    if five.raw(0x8014) & 0x3fff_3fff != 0x044c_044c
+        || five.raw(0x801c) & 0x7f != 43
+        || five
+            .trace
+            .borrow()
+            .iter()
+            .any(|w| w.0 == 0x10b0 || w.0 == 0x8264)
+    {
+        return TestResult::Fail("AR9280 5 GHz ACK/CTS/USEC differs from the fast-clock INI");
+    }
+    if peer_clocked(&five, None, 20, Clock::Fast5g) != Err(Error::Packet) {
+        return TestResult::Fail("AR9280 5 GHz accepted a long slot");
+    }
+    let two = Model::new(0);
+    two.parked();
+    if prepare_chip(&two, &map, LOCAL, Profile::ar9280(3, 3, false)).is_err()
+        || two.raw(0x1030) != 8 * 44
+        || two.raw(0x1070) != 20 * 44
+        || two.raw(0x8014) & 0x3fff_3fff != (64 * 44) | ((48 * 44) << 16)
+    {
+        return TestResult::Fail("AR9280 2.4 GHz MAC profile differs from the OFDM clock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs
+);
+
+/// AR5416/AR5418/AR9160: the 40 MHz non-fast 5 GHz clock (SIFS 16, slot 9,
+/// slot + SIFS ACK/CTS, USEC 39), `ath9k_hw_init_mfp` per generation and
+/// the three-chain `fixup_chainmask` / CB71 mask binding.
+fn smoke_ath9k_ar5008_mac_profile_5ghz_clock_mfp_and_cb71_masks() -> TestResult {
+    let mut map = alloc::vec![0u8; crate::ath9k::chips::MAP_DEF.bytes()];
+    map[6] = 0x3; // AR5416_OPFLAGS_11A | 11G.
+    map[12..18].copy_from_slice(&LOCAL);
+    map[18..20].copy_from_slice(&[7, 7]);
+    let five = Model::new(0);
+    five.parked();
+    if prepare_chip(&five, &map, LOCAL, Profile::ar5008(7, 7, true, true, false)).is_err() {
+        return TestResult::Fail("AR9160 5 GHz three-chain MAC profile refused");
+    }
+    if five.raw(0x1030) != 14 * 40
+        || five.raw(0x1070) != 9 * 40
+        || five.raw(0x8014) & 0x3fff_3fff != 0x03e8_03e8
+        || five.raw(0x801c) & 0x7f != 39
+        || five.raw(0x8340) != 0x700
+    {
+        return TestResult::Fail("AR5008 5 GHz MAC timing is not the 40 MHz clock");
+    }
+    // AR9160 init_mfp: MISC_MODE2 bit 2 set, bit 1 clear, no AES mute.
+    if five.raw(0x8344) & 0x6 != 0x4 || five.trace.borrow().iter().any(|w| w.0 == 0x8060) {
+        return TestResult::Fail("AR9160 init_mfp differs from hw.c");
+    }
+    let two = Model::new(0);
+    two.parked();
+    if prepare_chip(
+        &two,
+        &map,
+        LOCAL,
+        Profile::ar5008(7, 7, false, false, false),
+    )
+    .is_err()
+        || two.raw(0x1070) != 20 * 44
+        || two
+            .trace
+            .borrow()
+            .iter()
+            .any(|w| w.0 == 0x8060 || w.0 == 0x8344)
+    {
+        return TestResult::Fail("AR5416 2.4 GHz profile or empty init_mfp differs");
+    }
+    // CB71: no 11a in the map; the GPIO 0 strap decides the RX mask.
+    map[6] = 0x2;
+    for (gpio, rx, ok) in [
+        (1u32 << 14, 5, true),
+        (1 << 14, 7, false),
+        (0, 7, true),
+        (0, 5, false),
+    ] {
+        let io = Model::new(0);
+        io.parked();
+        io.values.borrow_mut().insert(0x4048, gpio);
+        let result = prepare_chip(&io, &map, LOCAL, Profile::ar5008(rx, 7, false, false, true));
+        if result.is_ok() != ok {
+            return TestResult::Fail("CB71 effective RX mask not bound to the GPIO strap");
+        }
+    }
+    // CB71 is refused for a map that advertises 11a; a zero map mask
+    // fixes up to all three chains.
+    map[6] = 0x3;
+    map[18] = 0;
+    for (rx, cb71, ok) in [(5, true, false), (7, false, true), (3, false, false)] {
+        let io = Model::new(0);
+        io.parked();
+        io.values.borrow_mut().insert(0x4048, 1 << 14);
+        let result = prepare_chip(&io, &map, LOCAL, Profile::ar5008(rx, 7, false, false, cb71));
+        if result.is_ok() != ok {
+            return TestResult::Fail("AR5008 fixup_chainmask binding differs from hw.c");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/mac",
+    smoke_ath9k_ar5008_mac_profile_5ghz_clock_mfp_and_cb71_masks
+);

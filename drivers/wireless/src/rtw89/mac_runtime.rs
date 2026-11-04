@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! RTL8852B SCC post-WCPU MAC preparation. Packet DMA and IRQs stay closed.
+//! RTL8852B/RTL8852C/RTL8851B SCC post-WCPU MAC preparation. Packet DMA
+//! and IRQs stay closed. The RTL8852C branches live in `mac_runtime/c.rs`;
+//! RTL8851B is the B sequence with its own `n51` branches (below).
 use super::{
     mac::ChipId,
     mac_runtime_regs::*,
@@ -85,13 +87,18 @@ impl<I: Io> Access<'_, I> {
             self.0.delay_us(50).await;
         }
     }
-    async fn enable_bb_rf(&mut self) -> Result<(), Error> {
+    /// rtw8852b_common.c `__rtw8852bx_mac_enable_bb_rf`; RTL8851B is
+    /// rtw8851b.c `rtw8851b_mac_enable_bb_rf`, the same sequence without the
+    /// `R_AX_SPS_DIG_ON_CTRL0` ZCDC write.
+    async fn enable_bb_rf(&mut self, n51: bool) -> Result<(), Error> {
         self.m8(
             R_AX_SYS_FUNC_EN,
             B_AX_FEN_BBRSTB | B_AX_FEN_BB_GLB_RSTN,
             B_AX_FEN_BBRSTB | B_AX_FEN_BB_GLB_RSTN,
         )?;
-        self.f32(R_AX_SPS_DIG_ON_CTRL0, B_AX_REG_ZCDC_H_MASK, 1)?;
+        if !n51 {
+            self.f32(R_AX_SPS_DIG_ON_CTRL0, B_AX_REG_ZCDC_H_MASK, 1)?;
+        }
         self.m32(R_AX_WLRF_CTRL, B_AX_AFC_AFEDIG, B_AX_AFC_AFEDIG)?;
         self.m32(R_AX_WLRF_CTRL, B_AX_AFC_AFEDIG, 0)?;
         self.m32(R_AX_WLRF_CTRL, B_AX_AFC_AFEDIG, B_AX_AFC_AFEDIG)?;
@@ -151,20 +158,41 @@ impl<I: Io> Access<'_, I> {
         self.m32(R_AX_CMAC_FUNC_EN, function, function & !B_AX_CMAC_TXEN)?;
         self.m32(R_AX_SPS_DIG_ON_CTRL0, B_AX_OCP_L1_MASK, B_AX_OCP_L1_MASK)
     }
-    async fn scc(&mut self) -> Result<(), Error> {
+    /// mac.c `dle_init_ax` + `hfc_init` with the chip's PCIe SCC
+    /// `dle_mem`/`hfc_param_ini`. RTL8851B (rtw8851b.c
+    /// `rtw8851b_dle_mem_pcie`: `wde_size6` 512 link + 0 unlink pages,
+    /// `wde_qt6` 448/48/0/16, the same `ple_size6`/`ple_qt18`/`ple_qt58`;
+    /// `rtw8851b_hfc_chcfg_pcie` ACH0..3 {5,343}, B0MGQ/B0HIQ {4,344}, pub
+    /// 448/448) also sets `B_AX_AXIDMA_CLK_EN` in mac.c `dle_clk_en_ax`.
+    async fn scc(&mut self, n51: bool) -> Result<(), Error> {
+        let (wde_pages, wde_qta0, ach, mgq, public) = if n51 {
+            (512, 448, [(5, 343); 4], (4, 344), 448)
+        } else {
+            (
+                510,
+                446,
+                [(5, 341), (5, 341), (4, 342), (4, 342)],
+                (4, 342),
+                446,
+            )
+        };
         let dle = B_AX_DLE_WDE_EN | B_AX_DLE_PLE_EN;
         self.m32(R_AX_DMAC_FUNC_EN, dle, 0)?;
-        self.m32(
-            R_AX_DMAC_CLK_EN,
-            B_AX_DLE_WDE_CLK_EN | B_AX_DLE_PLE_CLK_EN,
-            B_AX_DLE_WDE_CLK_EN | B_AX_DLE_PLE_CLK_EN,
-        )?;
-        // B PCI SCC: (510+2)*64 + (496+16)*128 =98304 bytes, with
-        // Linux's remaining98304-byte SCC reservation, not the DLFW carve.
+        let clock = B_AX_DLE_WDE_CLK_EN
+            | B_AX_DLE_PLE_CLK_EN
+            | if n51 {
+                super::fifo_regs::B_AX_AXIDMA_CLK_EN
+            } else {
+                0
+            };
+        self.m32(R_AX_DMAC_CLK_EN, clock, clock)?;
+        // B PCI SCC: (510+2)*64 + (496+16)*128 =98304 bytes (RTL8851B
+        // (512+0)*64 + the same PLE), with Linux's remaining 98304-byte SCC
+        // reservation, not the DLFW carve.
         self.m32(
             R_AX_WDE_PKTBUF_CFG,
             B_AX_WDE_PAGE_SEL_MASK | B_AX_WDE_START_BOUND_MASK | B_AX_WDE_FREE_PAGE_NUM_MASK,
-            field(B_AX_WDE_FREE_PAGE_NUM_MASK, 510),
+            field(B_AX_WDE_FREE_PAGE_NUM_MASK, wde_pages),
         )?;
         self.m32(
             R_AX_PLE_PKTBUF_CFG,
@@ -174,7 +202,7 @@ impl<I: Io> Access<'_, I> {
                 | field(B_AX_PLE_FREE_PAGE_NUM_MASK, 496),
         )?;
         for (a, pages) in [
-            (R_AX_WDE_QTA0_CFG, 446),
+            (R_AX_WDE_QTA0_CFG, wde_qta0),
             (R_AX_WDE_QTA1_CFG, 48),
             (R_AX_WDE_QTA3_CFG, 0),
             (R_AX_WDE_QTA4_CFG, 16),
@@ -213,16 +241,16 @@ impl<I: Io> Access<'_, I> {
         // preload_init is a real no-op for8852B's PCI POH path.
         self.m32(R_AX_HCI_FC_CTRL, B_AX_HCI_FC_EN | B_AX_HCI_FC_CH12_EN, 0)?;
         for (channel, (minimum, maximum)) in [
-            (5, 341),
-            (5, 341),
-            (4, 342),
-            (4, 342),
+            ach[0],
+            ach[1],
+            ach[2],
+            ach[3],
             (0, 0),
             (0, 0),
             (0, 0),
             (0, 0),
-            (4, 342),
-            (4, 342),
+            mgq,
+            mgq,
             (0, 0),
             (0, 0),
         ]
@@ -239,14 +267,14 @@ impl<I: Io> Access<'_, I> {
             )?;
         }
         self.0
-            .write32(R_AX_PUB_PAGE_CTRL1, field(B_AX_PUBPG_G0_MASK, 446))?;
+            .write32(R_AX_PUB_PAGE_CTRL1, field(B_AX_PUBPG_G0_MASK, public))?;
         self.0.write32(R_AX_WP_PAGE_CTRL2, 0)?;
         self.0.write32(
             R_AX_CH_PAGE_CTRL,
             field(B_AX_PREC_PAGE_CH011_MASK, 2) | field(B_AX_PREC_PAGE_CH12_MASK, 40),
         )?;
         self.0
-            .write32(R_AX_PUB_PAGE_CTRL2, field(B_AX_PUBPG_ALL_MASK, 446))?;
+            .write32(R_AX_PUB_PAGE_CTRL2, field(B_AX_PUBPG_ALL_MASK, public))?;
         self.0.write32(R_AX_WP_PAGE_CTRL1, 0)?;
         self.m32(
             R_AX_HCI_FC_CTRL,
@@ -287,15 +315,15 @@ impl<I: Io> Access<'_, I> {
         }
         if self.r32(R_AX_HCI_FC_CTRL)? & (B_AX_HCI_FC_EN | B_AX_HCI_FC_CH12_EN)
             != B_AX_HCI_FC_EN | B_AX_HCI_FC_CH12_EN
-            || get(self.r32(R_AX_WDE_PKTBUF_CFG)?, B_AX_WDE_FREE_PAGE_NUM_MASK) != 510
+            || get(self.r32(R_AX_WDE_PKTBUF_CFG)?, B_AX_WDE_FREE_PAGE_NUM_MASK) != wde_pages
             || get(self.r32(R_AX_PLE_PKTBUF_CFG)?, B_AX_PLE_FREE_PAGE_NUM_MASK) != 496
         {
             return Err(Error::Access);
         }
         Ok(())
     }
-    async fn dmac(&mut self) -> Result<(), Error> {
-        self.scc().await?;
+    async fn dmac(&mut self, n51: bool) -> Result<(), Error> {
+        self.scc(n51).await?;
         self.m8(R_AX_SS_CTRL, B_AX_SS_EN, B_AX_SS_EN)?;
         self.poll(R_AX_SS_CTRL, B_AX_SS_INIT_DONE_1, B_AX_SS_INIT_DONE_1, 2000)
             .await?;
@@ -616,13 +644,26 @@ impl Mac {
             return Err(Error::Terminal);
         }
         let identity = factory.identity().ok_or(Error::Unsupported)?;
-        if identity.chip() != ChipId::Rtl8852B
-            || !identity.calibration().valid
-            || identity.calibration().rfe_type == 255
-            || factory.b_phycap().is_none()
-        {
+        let (c, n51) = match identity.chip() {
+            ChipId::Rtl8852B if factory.b_phycap().is_some() => (false, false),
+            ChipId::Rtl8852C if factory.c_phycap().is_some() => (true, false),
+            // RTL8851B: B's download geometry (download_dma) and B MAC with
+            // the `n51` branches.
+            ChipId::Rtl8851B if factory.n51_phycap().is_some() => (false, true),
+            _ => return Err(Error::Unsupported),
+        };
+        if !identity.calibration().valid || identity.calibration().rfe_type == 255 {
             return Err(Error::Unsupported);
         }
+        // download_dma geometry: B keeps ACH0..3/CH8/CH9 stopped (CH12 open)
+        // plus bit 19, RX init bit 13 clear, HCI 0x8380; C (HAXI) keeps
+        // ACH0..7/CH8..11 stopped plus bit 19, RX init bit 15 clear and HCI
+        // `R_AX_HCI_FUNC_EN_V1` 0x7880.
+        let (stopped, rx, hci_reg) = if c {
+            (0x000b_ff00, 1 << 15, 0x7880)
+        } else {
+            (0x000b_0f00, 1 << 13, 0x8380)
+        };
         self.state = State::Preparing;
         let mut a = Access(io);
         let firmware = a.r8(0x1e0)?;
@@ -636,17 +677,28 @@ impl Mac {
         // throughout MAC preparation; no ring base or host IRQ is written here.
         let stops = a.r32(0x1010)?;
         let init = a.r32(0x1000)?;
-        let hci = a.r32(0x8380)?;
-        if stops & 0x000b_0f00 != 0x000b_0f00 || init & (1 << 13) != 0 || hci & 2 != 0 {
+        let hci = a.r32(hci_reg)?;
+        if stops & stopped != stopped || init & rx != 0 || hci & 2 != 0 {
             return Err(Error::Access);
         }
-        a.enable_bb_rf().await?;
-        a.system()?;
-        a.dmac().await?;
-        a.cmac().await?;
-        a.interrupts()?;
-        a.host_rpq()?;
-        let dmac = B_AX_MAC_FUNC_EN
+        if c {
+            a.enable_bb_rf_c().await?;
+            a.system_c()?;
+            a.dmac_c().await?;
+            a.cmac_c().await?;
+            a.interrupts_c()?;
+            a.host_rpq()?;
+            a.trx_tail_c()?;
+        } else {
+            a.enable_bb_rf(n51).await?;
+            a.system()?;
+            a.dmac(n51).await?;
+            a.cmac().await?;
+            a.interrupts()?;
+            a.host_rpq()?;
+        }
+        let dmac = if c { c::B_AX_H_AXIDMA_EN } else { 0 }
+            | B_AX_MAC_FUNC_EN
             | B_AX_DMAC_FUNC_EN
             | B_AX_MAC_SEC_EN
             | B_AX_DISPATCHER_EN
@@ -675,9 +727,9 @@ impl Mac {
         if a.r32(R_AX_DMAC_FUNC_EN)? & dmac != dmac || functions & cmac != cmac & !B_AX_CMAC_TXEN {
             return Err(Error::Access);
         }
-        if a.r32(0x1010)? & 0x000b_0f00 != 0x000b_0f00
-            || a.r32(0x1000)? & (1 << 13) != 0
-            || a.r32(0x8380)? & 2 != 0
+        if a.r32(0x1010)? & stopped != stopped
+            || a.r32(0x1000)? & rx != 0
+            || a.r32(hci_reg)? & 2 != 0
         {
             return Err(Error::Access);
         }
@@ -685,6 +737,9 @@ impl Mac {
         Ok(())
     }
 }
+
+#[path = "mac_runtime/c.rs"]
+mod c;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mac_runtime/tests.rs"]

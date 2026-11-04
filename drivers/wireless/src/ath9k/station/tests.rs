@@ -66,6 +66,7 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(in crate::ath9k) struct Peer {
+    pub(in crate::ath9k) channel: u8,
     pub(in crate::ath9k) ap: FakeAp,
     pub(in crate::ath9k) plan: NetworkPlan,
     pub(in crate::ath9k) server: DhcpServer,
@@ -77,7 +78,8 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) hold_m4: bool,
     pub(in crate::ath9k) hold_data: bool,
     pub(in crate::ath9k) ht: Option<Vec<u8>>,
-    ht_response: Option<Vec<u8>>,
+    pub(in crate::ath9k) ht_response: Option<Vec<u8>>,
+    pub(in crate::ath9k) expected_ht_cap: [u8; 2],
     pub(in crate::ath9k) ht_active: bool,
     pub(in crate::ath9k) declines: Vec<Vec<u8>>,
     pub(in crate::ath9k) hold_decline: bool,
@@ -102,9 +104,22 @@ pub(in crate::ath9k) struct Peer {
     rx_sequence: u16,
     /// Accept uplink QoS TIDs 0..7 (N85Q); otherwise only TID0.
     pub(in crate::ath9k) qos_tids: bool,
+    pub(in crate::ath9k) ps_test: bool,
+    pub(in crate::ath9k) ps_asleep: bool,
+    pub(in crate::ath9k) ps_notices: Vec<Vec<u8>>,
+    pub(in crate::ath9k) ps_polls: Vec<Vec<u8>>,
+    pub(in crate::ath9k) ps_buffered: alloc::collections::VecDeque<Vec<u8>>,
+    pub(in crate::ath9k) hold_ps: bool,
 }
 impl Peer {
     pub(in crate::ath9k) fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
+        Self::new_channel(protected, rates, 1)
+    }
+    pub(in crate::ath9k) fn new_channel(
+        protected: bool,
+        rates: Option<&[u8]>,
+        channel: u8,
+    ) -> Self {
         let plan = NetworkPlan {
             station: OWN,
             bssid: AP,
@@ -114,9 +129,9 @@ impl Peer {
             lease_seconds: 3600,
         };
         let ap = if protected {
-            FakeAp::wpa2(plan, SSID, 1, 42, PMK, ANONCE)
+            FakeAp::wpa2(plan, SSID, channel, 42, PMK, ANONCE)
         } else {
-            FakeAp::open(plan, SSID, 1, 42)
+            FakeAp::open(plan, SSID, channel, 42)
         }
         .unwrap();
         let ap = if let Some(rates) = rates {
@@ -125,6 +140,7 @@ impl Peer {
             ap.with_basic_1mbps().unwrap()
         };
         Self {
+            channel,
             ap,
             plan,
             server: DhcpServer::new(plan),
@@ -139,6 +155,7 @@ impl Peer {
             hold_data: false,
             ht: None,
             ht_response: None,
+            expected_ht_cap: [12, 1],
             ht_active: false,
             declines: Vec::new(),
             hold_decline: false,
@@ -162,6 +179,12 @@ impl Peer {
             sender_reorder: None,
             rx_sequence: 0,
             qos_tids: false,
+            ps_test: false,
+            ps_asleep: false,
+            ps_notices: Vec::new(),
+            ps_polls: Vec::new(),
+            ps_buffered: alloc::collections::VecDeque::new(),
+            hold_ps: false,
         }
     }
     pub(in crate::ath9k) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -209,6 +232,46 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if self.ps_test && frame.len() == 24 && frame[0] == 0x48 {
+            if !matches!(frame[1], 1 | 0x11)
+                || frame[4..10] != AP
+                || frame[10..16] != self.plan.station
+                || frame[16..22] != AP
+                || frame[22] & 15 != 0
+                || !self.ht_active
+                || self.ap.protected() && self.ptk.is_none()
+            {
+                return Err("native PM Null identity/cleartext/port");
+            }
+            self.ps_asleep = frame[1] & 0x10 != 0;
+            self.ps_notices.push(frame.to_vec());
+            return Ok((Vec::new(), self.hold_ps));
+        }
+        if self.ps_test && frame.len() == 16 && frame[0] == 0xa4 {
+            if frame[..4] != [0xa4, 0x10, 42, 0xc0]
+                || frame[4..10] != AP
+                || frame[10..16] != self.plan.station
+                || !self.ps_asleep
+            {
+                return Err("native PS-Poll AID/identity/PM");
+            }
+            self.ps_polls.push(frame.to_vec());
+            let reply = if let Some(ethernet) = self.ps_buffered.pop_front() {
+                let mut wire = self.downlink(&ethernet)?;
+                if !self.ps_buffered.is_empty() {
+                    wire[1] |= 0x20;
+                }
+                wire
+            } else {
+                let mut wire = vec![0x48, 2, 0, 0];
+                wire.extend_from_slice(&self.plan.station);
+                wire.extend_from_slice(&AP);
+                wire.extend_from_slice(&AP);
+                wire.extend_from_slice(&[0, 0]);
+                wire
+            };
+            return Ok((vec![reply], self.hold_ps));
+        }
         if frame.first() == Some(&0x84) {
             if frame.len() != 20
                 || frame[..2] != [0x84, 0]
@@ -253,8 +316,25 @@ impl Peer {
                 || frame.get(26 + length..)
                     != Some(
                         &[
-                            1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108,
-                            3, 1, 1,
+                            1,
+                            4,
+                            0x82,
+                            0x84,
+                            0x8b,
+                            0x96,
+                            50,
+                            8,
+                            12,
+                            18,
+                            24,
+                            36,
+                            48,
+                            72,
+                            96,
+                            108,
+                            3,
+                            1,
+                            self.channel,
                         ][..],
                     )
             {
@@ -372,7 +452,11 @@ impl Peer {
                         ies = &ies[end..];
                     }
                     if let Some(cap) = ht {
-                        if cap.len() != 28 || cap[2..4] != [12, 1] || cap[5] != 255 || !wmm {
+                        if cap.len() != 28
+                            || cap[2..4] != self.expected_ht_cap
+                            || cap[5] != 255
+                            || !wmm
+                        {
                             return Err("native local HT/WMM/SGI20");
                         }
                         replies[0]
@@ -396,7 +480,7 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        if frame[0] == 0x88 && self.sender_reorder.is_some() {
+        if frame[0] == 0x88 && frame.get(24..26) == Some(&[0, 0]) && self.sender_reorder.is_some() {
             let seq = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
             let released = self
                 .sender_reorder
@@ -520,8 +604,15 @@ impl Peer {
         let mut ethernet = frame[16..22].to_vec();
         ethernet.extend_from_slice(&frame[10..16]);
         ethernet.extend_from_slice(&body[6..]);
+        if self.ps_test {
+            self.ps_asleep = frame[1] & 0x10 != 0;
+        }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {
+            Some(reply) if self.ps_test && self.ps_asleep => {
+                self.ps_buffered.push_back(reply);
+                Vec::new()
+            }
             Some(reply) => vec![self.downlink(&reply)?],
             None => Vec::new(),
         };

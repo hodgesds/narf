@@ -183,6 +183,8 @@ fn real_network() -> Result<(), &'static str> {
                     phy: Some((7, 0)),
                     wide: None,
                     vht: Some(profile(center, VhtFault::None)),
+                    prefix: 0,
+                    chip: None,
                 },
             )?;
             // Signed exact-board selection, CR4/common DMA rings and actual

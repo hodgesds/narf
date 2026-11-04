@@ -54,7 +54,7 @@ fn mt76_greenfield_actual_ht_offer_native_peer_and_directional_response() -> Tes
                         .1
                         .windows(28)
                         .any(|ie| ie[..2] == [45, 26] && ie[2] & 16 != 0)
-                        || !s.ht20_profile.unwrap().receive_greenfield()
+                        || !s.station.ht20_profile.unwrap().receive_greenfield()
                     {
                         return TestResult::Fail(
                             "actual greenfield decoder promise lost from association request",

@@ -44,7 +44,7 @@ pub(super) fn words_profile(p: Parameters, short: bool, ht: bool) -> Result<[u32
     Ok(result)
 }
 pub(super) struct Proof {
-    calibration: Calibration,
+    calibration: Arc<Calibration>,
     permission: Permission,
     cap: Cap<FirmwareBlob, Read>,
     country: [u8; 2],
@@ -75,11 +75,15 @@ impl Proof {
         let cap = calibration.authority().ok_or(Error::State)?;
         // Only this explicit pre-attempt boundary may bootstrap policy.
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
-        if calibration.permission(&domain, 1).map_err(Error::Power)? != permission {
+        if calibration
+            .permission(&domain, permission.channel())
+            .map_err(Error::Power)?
+            != permission
+        {
             return Err(Error::Policy);
         }
         Ok(Arc::new(Self {
-            calibration,
+            calibration: Arc::new(calibration),
             permission,
             cap,
             country: domain.country_code,
@@ -96,7 +100,7 @@ impl Proof {
     ) -> Arc<Self> {
         let country = domain.lock().country_code;
         Arc::new(Self {
-            calibration,
+            calibration: Arc::new(calibration),
             permission,
             cap,
             country,
@@ -116,13 +120,30 @@ impl Proof {
         if domain.country_code != self.country
             || self
                 .calibration
-                .permission(&domain, 1)
+                .permission(&domain, self.permission.channel())
                 .map_err(Error::Power)?
                 != self.permission
         {
             return Err(Error::Policy);
         }
         Ok(())
+    }
+    pub(super) fn for_channel(&self, channel: u8) -> Result<Arc<Self>, Error> {
+        self.invoke(|| {
+            let domain = self.domain()?;
+            let permission = self
+                .calibration
+                .permission(&domain, channel)
+                .map_err(Error::Power)?;
+            Ok(Arc::new(Self {
+                calibration: self.calibration.clone(),
+                permission,
+                cap: self.cap,
+                country: self.country,
+                #[cfg(any(test, feature = "kernel-test"))]
+                model: self.model.clone(),
+            }))
+        })?
     }
     pub(super) fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
         struct Invoke<'a, F> {

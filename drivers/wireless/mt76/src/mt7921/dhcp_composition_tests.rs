@@ -575,16 +575,18 @@ fn composition_body(
     if aid != 42
         || !matches!(session.state, State::Associated { .. })
         || session.backend.access_point.as_ref().map(FakeAp::phase) != Some(ApPhase::Authorized)
-        || session.wmm.is_some() != wmm
-        || session.ht20_profile.is_some() != ht20
-        || session.vht_profile.map(|p| p.width()) != vht
+        || session.station.wmm.is_some() != wmm
+        || session.station.ht20_profile.is_some() != ht20
+        || session.station.vht_profile.map(|p| p.width()) != vht
         || session
+            .station
             .ht20_profile
             .and_then(|profile| profile.negotiated_secondary())
             .is_some()
             != ht40
         || ht20
             && session
+                .station
                 .ht20_profile
                 .is_none_or(|profile| !profile.short_gi())
     {
@@ -595,8 +597,8 @@ fn composition_body(
         // The lease traverses the actual post-response two-path owner, not
         // only a local capability IE or an isolated rate-map constructor.
         let native = &session.backend.frames;
-        if session.ht20_profile.unwrap().transmit_streams() != 2
-            || !session.ht20_profile.unwrap().receive_greenfield()
+        if session.station.ht20_profile.unwrap().transmit_streams() != 2
+            || !session.station.ht20_profile.unwrap().receive_greenfield()
             || !native
                 .iter()
                 .any(|(_, f)| f.len() >= 140 && f[36] == 0xed && f[41] == 8 && f[67..69] == [2, 2])
@@ -627,7 +629,7 @@ fn composition_body(
         session.backend.packets.push_back(request);
         if session.receive_ethernet() != Ok(None)
             || run(session.service_keys()).is_err()
-            || !session.rx_ba.active(0)
+            || !session.station.rx_ba.active(0)
         {
             put_session(session);
             return TestResult::Fail("composed DHCP BA native negotiation/response failed");
@@ -637,9 +639,9 @@ fn composition_body(
     // peer. Authored legacy APs consume the genuine request but make no offer;
     // their completed timeout/DELBA fallback must keep DHCP reachable.
     if run(session.negotiate_transmit_ba()) != Ok(ba_tx)
-        || session.tx_ba.active() != ba_tx
-        || session.tx_ba.published() != ba_tx
-        || session.tx_ba.remote() != ba_tx
+        || session.station.tx_ba.active() != ba_tx
+        || session.station.tx_ba.published() != ba_tx
+        || session.station.tx_ba.remote() != ba_tx
     {
         put_session(session);
         return TestResult::Fail("composed DHCP originator transaction did not complete");
@@ -656,10 +658,10 @@ fn composition_body(
         if session.receive_ethernet() != Ok(None)
             || !session.data_controls_pending()
             || run(session.service_keys()).is_err()
-            || session.wmm_pending.is_some()
+            || session.station.wmm_pending.is_some()
             || session.receive_current(epoch) != Ok(true)
-            || session.tx_ba.active() != ba_tx
-            || session.rx_ba.active(0) != ba_rx
+            || session.station.tx_ba.active() != ba_tx
+            || session.station.rx_ba.active(0) != ba_rx
         {
             put_session(session);
             return TestResult::Fail("AP EDCA update lost the composed PHY/BA/controlled port");

@@ -538,3 +538,69 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/packet",
     smoke_rtl8188eu_packet_halted_pipes_recover_and_reuse_slots
 );
+
+fn smoke_rtl8192eu_packet_owner_codec_and_queue_map() -> TestResult {
+    use super::super::rtl8192e_init::{queue_map, Queues};
+    use super::super::rtl8192e_packet::{TxControl, TX_DESC as TX_DESC_8192E};
+    let queues = queue_map(Queues::from_sie(0x0111)).unwrap();
+    if Owner::new_8192e(Fake::new(), endpoints(1), queues, 1).err() != Some(Error::Endpoints) {
+        return TestResult::Fail("8192eu queue map past the bulk-OUT endpoints admitted");
+    }
+    let io = Fake::new();
+    let mut owner = Owner::new_8192e(io.clone(), endpoints(3), queues, 1).unwrap();
+    owner.start().unwrap();
+    let mgmt = frame(Kind::Management);
+    let wrong = Err(Error::Packet(packet_codec::Error::Header));
+    if owner.submit(Kind::Management, &mgmt) != wrong || owner.poll_receive().err() != wrong.err() {
+        return TestResult::Fail("8188e codec reached an 8192e owner");
+    }
+    if owner.submit_8192e(Kind::Management, &mgmt, TxControl::default()) != Ok(()) {
+        return TestResult::Fail("8192eu management submit");
+    }
+    {
+        let m = io.0.lock();
+        let (dci, bytes) = &m.sent[0];
+        if *dci != endpoints(3).output[usize::from(queues.mgmt)] * 2
+            || bytes.len() != TX_DESC_8192E + mgmt.len()
+            || bytes[TX_DESC_8192E..] != mgmt[..]
+        {
+            return TestResult::Fail("8192eu txdesc40/management pipe");
+        }
+    }
+    io.0.lock().tx_result = Some(Ok(TX_DESC_8192E + mgmt.len()));
+    if owner.poll_transmit()
+        != Ok(Some(Delivered {
+            native_bytes: mgmt.len(),
+        }))
+    {
+        return TestResult::Fail("8192eu delivered length");
+    }
+    // Caller-supplied A-MPDU fields are refused; the owner derives them.
+    let data = frame(Kind::Data);
+    let forged = TxControl {
+        ampdu_density: Some(5),
+        ..TxControl::default()
+    };
+    if owner.submit_8192e(Kind::Data, &data, forged) != wrong {
+        return TestResult::Fail("8192eu forged A-MPDU control");
+    }
+    if owner.submit_8192e(Kind::Data, &data, TxControl::default()) != Ok(()) {
+        return TestResult::Fail("8192eu data submit");
+    }
+    if io.0.lock().sent[1].0 != endpoints(3).output[usize::from(queues.be)] * 2 {
+        return TestResult::Fail("8192eu BE pipe");
+    }
+    let plain = Owner::new(Fake::new(), endpoints(3), 1).unwrap();
+    let mut plain = plain;
+    plain.start().unwrap();
+    if plain.submit_8192e(Kind::Management, &mgmt, TxControl::default()) != wrong
+        || plain.poll_receive_8192e().err() != wrong.err()
+    {
+        return TestResult::Fail("8192e codec reached an 8188e owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8192eu",
+    smoke_rtl8192eu_packet_owner_codec_and_queue_map
+);

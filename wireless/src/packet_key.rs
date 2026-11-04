@@ -3,7 +3,7 @@
 //! header/CCMP bounds, peer binding, per-key/TID replay and non-wrapping TX PN.
 //! It does not open a controlled port or install keys before RSNA completes.
 use crate::ccmp::{self, AesCcm, CcmpError, ReplayWindow};
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_PN: u64 = (1u64 << 48) - 1;
@@ -152,16 +152,21 @@ impl AesCcm for Ccm {
 /// `reinstall`, which preserves counters for an identical key. The station
 /// retains these slots across rekeys/failed joins; it must not rebuild an
 /// identical key with a reset PN. GTK slots are receive-only in station mode.
-/// Hardware encryption must remain disabled while software CCMP owns packets.
+/// Hardware encryption must remain disabled while software CCMP owns packets,
+/// except through the explicit offload entry points below (`protect_header*`,
+/// `accept_decrypted*`), which share this key's TX PN and RX replay state.
 pub struct Key {
     tk: Zeroizing<[u8; 16]>,
     key_id: u8,
     role: Role,
     local: [u8; 6],
+    msdu_local: [u8; 6],
+    mld: Option<Box<crate::association::mlo::Context>>,
     peer: [u8; 6],
     tx_pn: u64,
     receive: [ReplayWindow; 18],
     spp_amsdu: bool,
+    fragment_color: Option<fragment::KeyIdentity>,
 }
 impl core::fmt::Debug for Key {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -194,10 +199,13 @@ impl Key {
             key_id,
             role,
             local,
+            msdu_local: local,
+            mld: None,
             peer,
             tx_pn: 0,
             receive: [ReplayWindow { last_seen_pn: rsc }; 18],
             spp_amsdu: false,
+            fragment_color: None,
         })
     }
     /// Bind this pairwise key to a negotiated SPP A-MSDU association: both
@@ -213,6 +221,42 @@ impl Key {
         self.spp_amsdu = enabled;
         Ok(self)
     }
+    /// Only the retained Security owner supplies this exact negotiated
+    /// context. Physical raw header/key/PN bindings stay unchanged; the
+    /// unicast DATA cryptographic address form is a separate checked copy.
+    pub(crate) fn with_mld_context(
+        mut self,
+        context: Option<&crate::association::mlo::Context>,
+    ) -> Result<Self, Error> {
+        if let Some(context) = context {
+            if context.own_link() != self.local || context.peer_link() != self.peer {
+                return Err(Error::Key);
+            }
+            self.msdu_local = context.own_mld();
+            self.mld = Some(Box::new(*context));
+        }
+        Ok(self)
+    }
+    fn data_crypto_header(&self, physical: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.mld
+            .as_deref()
+            .map(|context| context.data_crypto_header(physical).map_err(|_| Error::Key))
+            .transpose()
+    }
+    /// Highest PN accepted on any data receive counter (TIDs and non-QoS;
+    /// management excluded). A peer transmits one PN sequence per key, so
+    /// this is a floor every later data frame of that key must exceed.
+    pub fn data_replay_floor(&self) -> u64 {
+        self.receive[..=NON_QOS]
+            .iter()
+            .map(|window| window.last_seen_pn)
+            .max()
+            .unwrap_or(0)
+    }
+    /// The last transmit PN this key used (0 before the first frame).
+    pub fn transmit_pn(&self) -> u64 {
+        self.tx_pn
+    }
     pub fn spp_amsdu(&self) -> bool {
         self.spp_amsdu
     }
@@ -224,6 +268,9 @@ impl Key {
         }
         if *self.tk == *tk {
             return Ok(false);
+        }
+        if let Some(color) = self.fragment_color.take() {
+            color.retire();
         }
         self.tk.zeroize();
         self.tk.copy_from_slice(tk);
@@ -249,11 +296,12 @@ impl Key {
         if self.tx_pn == MAX_PN {
             return Err(Error::Exhausted);
         }
+        let crypto_header = self.data_crypto_header(header)?;
         self.tx_pn += 1;
         let mut ciphertext = Zeroizing::new(body.to_vec());
         ccmp::protect(
             &Ccm,
-            header,
+            crypto_header.as_deref().unwrap_or(header),
             &self.tk,
             self.tx_pn,
             self.key_id,
@@ -262,6 +310,161 @@ impl Key {
             &mut ciphertext,
         )
         .map_err(Error::Crypto)
+    }
+    /// Hardware-offload transmit form (mac80211 wpa.c `ccmp_encrypt_skb`
+    /// with a hardware key flagged `IEEE80211_KEY_FLAG_GENERATE_IV`): the
+    /// same admission as `protect`, a PN consumed from the shared counter and
+    /// only the 8-octet CCMP header prepended to the plaintext body. The
+    /// device appends the MIC; the caller reserves any tail space it needs.
+    pub fn protect_header(&mut self, header: &[u8], body: &[u8]) -> Result<Vec<u8>, Error> {
+        shape(header)?;
+        if self.role != Role::Pairwise
+            || header[1] & 3 != 1
+            || header[4..10] != self.peer
+            || header[10..16] != self.local
+            || header[16..22] == [0; 6]
+            || self.mld.is_some()
+        {
+            return Err(Error::Key);
+        }
+        self.header_only(body)
+    }
+    /// Management counterpart of `protect_header`
+    /// (`IEEE80211_KEY_FLAG_GENERATE_IV_MGMT`), sharing the pairwise TX PN.
+    pub fn protect_management_header(
+        &mut self,
+        header: &[u8],
+        body: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if !management_header(header)
+            || self.role != Role::Pairwise
+            || header[4..10] != self.peer
+            || header[10..16] != self.local
+        {
+            return Err(Error::Key);
+        }
+        self.header_only(body)
+    }
+    fn header_only(&mut self, body: &[u8]) -> Result<Vec<u8>, Error> {
+        if body.len() > MAX_BODY {
+            return Err(Error::Length);
+        }
+        if self.tx_pn == MAX_PN {
+            return Err(Error::Exhausted);
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(ccmp::CCMP_HDR_LEN + body.len())
+            .map_err(|_| Error::Length)?;
+        self.tx_pn += 1;
+        out.extend_from_slice(&ccmp::build_ccmp_header(self.tx_pn, self.key_id));
+        out.extend_from_slice(body);
+        Ok(out)
+    }
+    /// Check one device-decrypted CCMP payload: mac80211
+    /// `ieee80211_crypto_ccmp_decrypt` with `RX_FLAG_DECRYPTED` and the IV
+    /// kept (MIC already removed by the driver). The CCMP header must name
+    /// this key, and its PN must exceed the same per-TID replay counter that
+    /// software `unprotect` uses; nothing commits on failure. Returns the
+    /// plaintext body after the CCMP header.
+    pub fn accept_decrypted(&mut self, header: &[u8], wire: &[u8]) -> Result<Vec<u8>, Error> {
+        let shape = shape(header)?;
+        if header[1] & 3 != 2
+            || header[10..16] != self.peer
+            || !unicast(header[16..22].try_into().unwrap())
+            || self.mld.is_some()
+            || match self.role {
+                Role::Pairwise => header[4..10] != self.local,
+                Role::Group => header[4] & 1 == 0,
+            }
+        {
+            return Err(Error::Key);
+        }
+        self.accept_pn(shape.index, wire, MAX_BODY)
+    }
+    /// Management counterpart of `accept_decrypted` against the separate
+    /// management replay counter (`unprotect_management`).
+    pub fn accept_decrypted_management(
+        &mut self,
+        header: &[u8],
+        wire: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if !management_header(header)
+            || self.role != Role::Pairwise
+            || header[4..10] != self.local
+            || header[10..16] != self.peer
+        {
+            return Err(Error::Key);
+        }
+        self.accept_pn(MGMT, wire, MAX_BODY)
+    }
+    /// Device-decrypted original QoS A-MSDU: the admission, subframe
+    /// validation and single replay commit of `unprotect_amsdu_with`, with
+    /// the PN check of `accept_decrypted` in place of the CCMP MIC.
+    pub fn accept_decrypted_amsdu_with(
+        &mut self,
+        header: &[u8],
+        wire: &[u8],
+        admission: AmsduAdmission,
+    ) -> Result<AmsduReceive, Error> {
+        let priority = aggregate_header_with(header, admission)?;
+        if header[10..16] != self.peer
+            || !unicast(header[16..22].try_into().unwrap())
+            || self.mld.is_some()
+            || match self.role {
+                Role::Pairwise => header[4..10] != self.local,
+                Role::Group => header[4] & 1 == 0,
+            }
+        {
+            return Err(Error::Key);
+        }
+        if !(ccmp::CCMP_HDR_LEN + 22..=ccmp::CCMP_HDR_LEN + admission.limit.bytes())
+            .contains(&wire.len())
+        {
+            return Err(Error::Length);
+        }
+        let mut candidate = self.receive[usize::from(priority)];
+        let pn = self.decrypted_pn(wire)?;
+        candidate.check(pn).map_err(Error::Crypto)?;
+        let frames = crate::amsdu::decode_for_link(
+            &wire[ccmp::CCMP_HDR_LEN..],
+            self.msdu_local,
+            header[4..10].try_into().unwrap(),
+            self.local,
+            admission.limit,
+        )
+        .map_err(Error::Aggregate)?;
+        self.receive[usize::from(priority)] = candidate;
+        Ok(AmsduReceive {
+            frames,
+            tid: priority,
+            ack_policy: AckPolicy::from_qos(header[24]),
+            eosp: header[24] & 0x10 != 0,
+        })
+    }
+    fn decrypted_pn(&self, wire: &[u8]) -> Result<u64, Error> {
+        let head: &[u8; ccmp::CCMP_HDR_LEN] = wire
+            .get(..ccmp::CCMP_HDR_LEN)
+            .and_then(|h| h.try_into().ok())
+            .ok_or(Error::Length)?;
+        if head[2] != 0 || head[3] & 0x3f != 0x20 || head[3] >> 6 != self.key_id {
+            return Err(Error::Key);
+        }
+        let (pn, _) = ccmp::decode_ccmp_header(head).map_err(Error::Crypto)?;
+        Ok(pn)
+    }
+    fn accept_pn(&mut self, index: usize, wire: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
+        if !(ccmp::CCMP_HDR_LEN..=limit + ccmp::CCMP_HDR_LEN).contains(&wire.len()) {
+            return Err(Error::Length);
+        }
+        let pn = self.decrypted_pn(wire)?;
+        let mut candidate = self.receive[index];
+        candidate.check(pn).map_err(Error::Crypto)?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(wire.len() - ccmp::CCMP_HDR_LEN)
+            .map_err(|_| Error::Length)?;
+        body.extend_from_slice(&wire[ccmp::CCMP_HDR_LEN..]);
+        self.receive[index] = candidate;
+        Ok(body)
     }
     /// Protect one unicast robust management frame (IEEE802.11-2020 12.5.3,
     /// 11.13) to the bound peer: a 24-octet management header with the
@@ -344,10 +547,11 @@ impl Key {
         }
         // Keep the driver transaction explicit even though shared unprotect
         // also commits only after MIC. This binds state to the selected TID.
+        let crypto_header = self.data_crypto_header(header)?;
         let mut candidate = self.receive[shape.index];
         let plaintext = ccmp::unprotect(
             &Ccm,
-            header,
+            crypto_header.as_deref().unwrap_or(header),
             &self.tk,
             shape.priority,
             false,
@@ -410,11 +614,12 @@ impl Key {
             .try_reserve_exact(wire.len())
             .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
         scratch.extend_from_slice(wire);
+        let crypto_header = self.data_crypto_header(header)?;
         let mut candidate = self.receive[usize::from(priority)];
         let opened = if self.spp_amsdu {
             ccmp::unprotect_spp_amsdu(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 priority,
                 &mut candidate,
@@ -423,7 +628,7 @@ impl Key {
         } else {
             ccmp::unprotect(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 priority,
                 false,
@@ -432,10 +637,11 @@ impl Key {
             )
         };
         let plaintext = Zeroizing::new(opened.map_err(Error::Crypto)?);
-        let frames = crate::amsdu::decode_with_limit(
+        let frames = crate::amsdu::decode_for_link(
             &plaintext,
-            self.local,
+            self.msdu_local,
             header[4..10].try_into().unwrap(),
+            self.local,
             admission.limit,
         )
         .map_err(Error::Aggregate)?;
@@ -487,12 +693,13 @@ impl Key {
             .try_reserve_exact(body.len())
             .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
         ciphertext.extend_from_slice(body);
+        let crypto_header = self.data_crypto_header(header)?;
         self.tx_pn += 1;
         let priority = header[24] & 15;
         if self.spp_amsdu {
             ccmp::protect_spp_amsdu(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 self.tx_pn,
                 self.key_id,
@@ -502,7 +709,7 @@ impl Key {
         } else {
             ccmp::protect(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 self.tx_pn,
                 self.key_id,
@@ -590,5 +797,20 @@ fn shape(header: &[u8]) -> Result<Shape, Error> {
 #[path = "packet_key_amsdu_tests.rs"]
 mod amsdu_tests;
 #[cfg(feature = "kernel-test")]
+#[path = "packet_key_offload_tests.rs"]
+mod offload_tests;
+#[cfg(feature = "kernel-test")]
 #[path = "packet_key_tests.rs"]
 mod tests;
+
+/// Additive opt-in fragment crypto/cache; ordinary methods keep their strict
+/// unfragmented header contract and MLD is not admitted by these helpers.
+#[path = "packet_key_fragment.rs"]
+pub mod fragment;
+impl Drop for Key {
+    fn drop(&mut self) {
+        if let Some(color) = self.fragment_color.as_ref() {
+            color.retire();
+        }
+    }
+}

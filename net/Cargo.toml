@@ -19,6 +19,7 @@ narf-io           = { path = "../io" }
 narf-scheduler    = { path = "../scheduler" }
 narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
 # Compile the in-kernel test suite (the `kernel_test_in!` smokes). Off by

@@ -82,6 +82,7 @@ pub(crate) fn stage_invalid_executable(write: &Cap<FirmwareRegistry, Write>, fam
                 0x05, 0x74, 0x5d, 0x43,
             ],
         ),
+        Family::PcieFullmac => unreachable!("the literal fixture has no family-3 record"),
         Family::Sdio43439 => (
             1,
             4_194_305u32,
@@ -127,6 +128,12 @@ pub(crate) fn selected_fixture(family: Family) -> Result<(Selection, Assets), &'
         .load_using(&read)
         .map_err(|_| "real signed selected assets")?;
     Ok((selection, assets))
+}
+
+/// Revoke the actual selected calibration cap in composed native family
+/// lifecycle fixtures; this exposes no production constructor or authority.
+pub(crate) fn revoke_fixture_calibration(proof: &Proof) {
+    proof.receipts[2].cap.revoke();
 }
 
 fn smoke_brcm_board_selection_real_registry_identity_asset_and_signature_binding() -> TestResult {
@@ -573,4 +580,232 @@ fn smoke_brcm_signed_manifest_family_executable_boundaries_precede_asset_loading
 kernel_test_in!(
     "drivers/wireless/brcmfmac/provision",
     smoke_brcm_signed_manifest_family_executable_boundaries_precede_asset_loading
+);
+
+/// NBSP family 3 from the literal PCIe record: chip, mask, PCI id and keys.
+fn fullmac_record(chip: u16, mask: u16, device: u16, fw: &str, nv: &str) -> Vec<u8> {
+    let mut bytes = MANIFEST_BYTES[..HEADER + RECORD].to_vec();
+    let length = bytes.len() as u32;
+    bytes[8..12].copy_from_slice(&length.to_le_bytes());
+    bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
+    let raw = &mut bytes[HEADER..];
+    raw[0] = 3;
+    raw[2..4].copy_from_slice(&chip.to_le_bytes());
+    raw[4..6].copy_from_slice(&mask.to_le_bytes());
+    raw[18..20].copy_from_slice(&device.to_le_bytes());
+    for (slot, key) in [(0, fw), (1, nv)] {
+        let at = 112 + slot * ASSET + 40;
+        raw[at..at + 128].fill(0);
+        raw[at..at + key.len()].copy_from_slice(key.as_bytes());
+    }
+    bytes
+}
+fn smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables() -> TestResult {
+    let ok = fullmac_record(
+        0x4356,
+        4,
+        0x43ec,
+        "brcm/brcmfmac4356-pcie.bin",
+        "brcm/brcmfmac4356-pcie.synthetic-not-a-board.txt",
+    );
+    match parse(&ok) {
+        Ok(records)
+            if records.len() == 1
+                && records[0].family == Family::PcieFullmac
+                && records[0].admits_chip(0x4356, 2)
+                && !records[0].admits_chip(0x4356, 3) => {}
+        _ => return TestResult::Fail("covered BCM4356 family-3 record rejected"),
+    }
+    if parse(&fullmac_record(
+        0x4366,
+        0x10,
+        0x43c3,
+        "brcm/brcmfmac4366c-pcie.bin",
+        "brcm/brcmfmac4366c-pcie.txt",
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("covered BCM4366 CA7 family-3 record rejected");
+    }
+    // A seeded WCC id (BCM43752, 0x449d) is admitted now that the loader
+    // writes Linux's random-seed footer.
+    if parse(&fullmac_record(
+        43752,
+        2,
+        0x449d,
+        "brcm/brcmfmac43752-pcie.bin",
+        "brcm/brcmfmac43752-pcie.txt",
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("seeded BCM43752 family-3 record rejected");
+    }
+    for bad in [
+        // One record cannot span the 4350c2 (rev <8) and 4350 (rev >=8) rows.
+        fullmac_record(
+            0x4350,
+            0x180,
+            0x43a3,
+            "brcm/brcmfmac4350-pcie.bin",
+            "brcm/brcmfmac4350-pcie.txt",
+        ),
+        fullmac_record(
+            0x4350,
+            0x100,
+            0x43a3,
+            "brcm/brcmfmac4350c2-pcie.bin",
+            "brcm/brcmfmac4350c2-pcie.txt",
+        ),
+        // BCM43602 keeps family 1.
+        fullmac_record(
+            43602,
+            8,
+            0x43ba,
+            "brcm/brcmfmac43602-pcie.bin",
+            "brcm/brcmfmac43602-pcie.txt",
+        ),
+        // No Linux PCIe firmware row / CYW-vendor PCI id / non-Linux key.
+        fullmac_record(
+            0x4354,
+            2,
+            0x4354,
+            "brcm/brcmfmac4354-pcie.bin",
+            "brcm/brcmfmac4354-pcie.txt",
+        ),
+        fullmac_record(
+            0x4356,
+            4,
+            0x4415,
+            "brcm/brcmfmac4356-pcie.bin",
+            "brcm/brcmfmac4356-pcie.txt",
+        ),
+        fullmac_record(
+            0x4356,
+            4,
+            0x43ec,
+            "narf-test/brcm/fw",
+            "brcm/brcmfmac4356-pcie.txt",
+        ),
+        fullmac_record(
+            0x4356,
+            4,
+            0x43ec,
+            "brcm/brcmfmac4356-pcie.bin",
+            "brcm/brcmfmac4356-pcie.bin",
+        ),
+    ] {
+        if parse(&bad).is_ok() {
+            return TestResult::Fail("family-3 record outside the Linux chip tables accepted");
+        }
+    }
+    // External CLM over msgbuf is not ported: the third slot stays zero.
+    let mut clm = ok.clone();
+    clm[HEADER + 112 + 2 * ASSET] = 3;
+    let mut class = ok;
+    class[HEADER + 26] = 0;
+    if parse(&clm).is_ok() || parse(&class).is_ok() {
+        return TestResult::Fail("family-3 CLM slot or non-network class accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/provision",
+    smoke_brcm_signed_manifest_fullmac_family_linux_chip_tables
+);
+
+/// Family 3 for a Linux OTP chip (BCM4378, seeded id 0x4425): the record
+/// carries Linux's `board_type` and antenna SKU; at claim the OTP read must
+/// make the NVRAM key one of `board_types[0..=3]` and the executable one of
+/// `[0..=5]` or plain. Strings follow Linux's own comment example.
+fn smoke_brcm_signed_manifest_fullmac_otp_board_binding() -> TestResult {
+    let record = |board: &str, sku: &str, fw: &str, nv: &str| {
+        let mut bytes = fullmac_record(0x4378, 1 << 3, 0x4425, fw, nv);
+        let raw = &mut bytes[HEADER..];
+        raw[32..112].fill(0);
+        raw[32..32 + board.len()].copy_from_slice(board.as_bytes());
+        raw[96..96 + sku.len()].copy_from_slice(sku.as_bytes());
+        bytes
+    };
+    let otp = super::super::chip_profile::OtpParams {
+        module: "RASP".into(),
+        vendor: "m".into(),
+        version: "6.11".into(),
+    };
+    let ok = record(
+        "apple,shikoku",
+        "X3",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku.bin",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku-RASP-m-6.11-X3.txt",
+    );
+    let records = match parse(&ok) {
+        Ok(records) if records.len() == 1 => records,
+        _ => return TestResult::Fail("OTP-bound BCM4378 record rejected"),
+    };
+    let other = super::super::chip_profile::OtpParams {
+        module: "RASP".into(),
+        vendor: "u".into(),
+        version: "6.11".into(),
+    };
+    if !records[0].admits_otp(0x4378, Some(&otp))
+        || records[0].admits_otp(0x4378, Some(&other))
+        || records[0].admits_otp(0x4378, None)
+    {
+        return TestResult::Fail("OTP identity not bound by the signed record");
+    }
+    // NVRAM naming only the board-SKU form binds no OTP: parses, never claims.
+    match parse(&record(
+        "apple,shikoku",
+        "X3",
+        "brcm/brcmfmac4378b1-pcie.bin",
+        "brcm/brcmfmac4378b1-pcie.apple,shikoku-X3.txt",
+    )) {
+        Ok(records) if !records[0].admits_otp(0x4378, Some(&otp)) => {}
+        _ => return TestResult::Fail("board-SKU NVRAM admitted without OTP binding"),
+    }
+    for bad in [
+        // No antenna SKU, plain NVRAM, an NVRAM for another board type.
+        record(
+            "apple,shikoku",
+            "",
+            "brcm/brcmfmac4378b1-pcie.bin",
+            "brcm/brcmfmac4378b1-pcie.apple,shikoku-RASP.txt",
+        ),
+        record(
+            "apple,shikoku",
+            "X3",
+            "brcm/brcmfmac4378b1-pcie.bin",
+            "brcm/brcmfmac4378b1-pcie.txt",
+        ),
+        record(
+            "apple,shikoku",
+            "X3",
+            "brcm/brcmfmac4378b1-pcie.bin",
+            "brcm/brcmfmac4378b1-pcie.apple,other-RASP.txt",
+        ),
+    ] {
+        if parse(&bad).is_ok() {
+            return TestResult::Fail("OTP chip record without Linux board binding accepted");
+        }
+    }
+    // A non-OTP chip still needs bytes 96..112 zero and no OTP at claim.
+    let mut plain = fullmac_record(
+        0x4356,
+        4,
+        0x43ec,
+        "brcm/brcmfmac4356-pcie.bin",
+        "brcm/brcmfmac4356-pcie.txt",
+    );
+    match parse(&plain) {
+        Ok(records) if records[0].admits_otp(0x4356, None) => {}
+        _ => return TestResult::Fail("non-OTP chip record changed"),
+    }
+    plain[HEADER + 96] = b'X';
+    if parse(&plain).is_ok() {
+        return TestResult::Fail("antenna SKU accepted for a non-OTP chip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/provision",
+    smoke_brcm_signed_manifest_fullmac_otp_board_binding
 );

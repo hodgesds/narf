@@ -33,6 +33,10 @@ struct Model {
     delays: usize,
     pause: Option<usize>,
     gone: bool,
+    eeprom: Option<[u8; EEPROM_4K_BYTES]>,
+    magic: u16,
+    selected: usize,
+    ignored: Option<u64>,
 }
 impl Model {
     fn new(seed: u32, xe2: bool, redo: bool, correlation: u32) -> Self {
@@ -49,6 +53,10 @@ impl Model {
             delays: 0,
             pause: None,
             gone: false,
+            eeprom: None,
+            magic: 0xa55a,
+            selected: 0,
+            ignored: None,
         };
         for (register, value) in [
             (0x981c, 0),
@@ -60,6 +68,7 @@ impl Model {
             (0x9c10, 20000),
             (0x9c14, 16000),
             (0x9c18, correlation),
+            (0x9c1c, 12000),
         ] {
             m.values.insert(register, value);
         }
@@ -110,6 +119,25 @@ impl RegisterIo for Model {
         if !self.access() {
             return u32::MAX;
         }
+        if let Some(image) = &self.eeprom {
+            if (0x2000..0x2400).contains(&register) {
+                self.selected = ((register - 0x2000) / 4) as usize;
+                return 0;
+            }
+            if register == 0x407c {
+                return if self.selected == 0 {
+                    u32::from(self.magic)
+                } else if (64..64 + EEPROM_4K_BYTES / 2).contains(&self.selected) {
+                    let at = (self.selected - 64) * 2;
+                    u32::from(u16::from_le_bytes([image[at], image[at + 1]]))
+                } else {
+                    0xffff
+                };
+            }
+            if register == 0x7044 {
+                return 2;
+            }
+        }
         if register == 0x9860 {
             let old = self.raw(register);
             let hold = self.hold.filter(|h| h.0 == register).map_or(0, |h| h.1);
@@ -117,18 +145,26 @@ impl RegisterIo for Model {
             if old & 2 != 0 && old & 0x8000 != 0 && hold & 2 == 0 {
                 let value = (self.raw(0x9864) & !0x1ff00000) | (((-115i32 as u32) & 511) << 20);
                 self.values.insert(0x9864, value);
+                if self.eeprom.is_some() && self.raw(0x9804) & 4 != 0 {
+                    let value = (self.raw(0x99bc) & !0x01ff0000) | (((-117i32 as u32) & 511) << 16);
+                    self.values.insert(0x99bc, value);
+                }
             }
         }
         if register == 0x9920 && self.hold != Some((0x9920, 0x10000)) {
             let value = self.raw(register) & !0x10000;
             self.values.insert(register, value);
         }
+        if self.eeprom.is_some() && self.raw(0x99f0) == 2 && (0x9c10..=0x9c1c).contains(&register) {
+            return [0x1234, 0x5678, (-82000i32) as u32, (-17000i32) as u32]
+                [((register - 0x9c10) / 4) as usize];
+        }
         if register == 0x7840 {
             let bit = (0x5bu32 >> (6 - self.spare % 7)) & 1;
             self.spare += 1;
             return (self.raw(register) & !1) | bit;
         }
-        if (0xa35c..0xa39c).contains(&register) {
+        if self.eeprom.is_none() && (0xa35c..0xa39c).contains(&register) {
             return if self.redo { 0 } else { 0x00410020 };
         }
         self.raw(register)
@@ -138,13 +174,20 @@ impl RegisterIo for Model {
             return;
         }
         self.trace.push(Op::Write(register, value));
+        if self.ignored == Some(register) {
+            return;
+        }
         if register == 0x7868 {
             value = (value & !7) | (self.raw(register) & 7);
         }
         self.values.insert(register, value);
     }
-    fn delay_us(&mut self, _: u64) {
-        panic!("async calibration used a synchronous wait")
+    fn delay_us(&mut self, us: u64) {
+        if self.eeprom.is_none() {
+            panic!("async calibration used a synchronous wait");
+        }
+        self.now += us;
+        self.trace.push(Op::Delay(us));
     }
 }
 impl Io for Model {
@@ -168,6 +211,7 @@ fn image(high: bool) -> [u8; EEPROM_4K_BYTES] {
 }
 fn permission() -> Permission {
     Permission {
+        frequency: 2412,
         country: *b"US",
         ceiling: 0,
     }
@@ -354,6 +398,7 @@ fn smoke_ath9k_calibration_policy_span_limits_and_current_cap() -> TestResult {
     };
     if Permission::from_domain(&domain)
         != Ok(Permission {
+            frequency: 2412,
             country: *b"US",
             ceiling: 34,
         })
@@ -411,3 +456,170 @@ kernel_test_in!(
     "drivers/wireless/ath9k/calibration",
     smoke_ath9k_calibration_policy_span_limits_and_current_cap
 );
+
+/// Actual cold reset/EEPROM/INI/channel/detector/CTL/analog calibration chain.
+/// The returned model receipt is never a native PCI capability or RF evidence.
+pub(in crate::ath9k) struct ChannelReceipt {
+    pub image: [u8; EEPROM_4K_BYTES],
+    pub identity: crate::ath9k::identity::Identity,
+    pub prepared: crate::ath9k::phy::Prepared,
+    pub report: Report,
+    pub registers: BTreeMap<u64, u32>,
+}
+pub(in crate::ath9k) fn channel_receipt(
+    frequency: u16,
+    ceiling: u8,
+) -> Result<ChannelReceipt, BringUpError> {
+    channel_receipt_image(frequency, ceiling, channel_image())
+}
+pub(in crate::ath9k) fn channel_image() -> [u8; EEPROM_4K_BYTES] {
+    let mut image = image(false);
+    image[..2].copy_from_slice(&(EEPROM_4K_BYTES as u16).to_le_bytes());
+    image[6] = 2; // Actual AR9285 HT20 EEPROM capability; no test grant yet.
+    image[12..18].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    image[18..20].copy_from_slice(&[1, 1]);
+    image[60] = 4;
+    for entry in image[100..120].chunks_exact_mut(4) {
+        entry[..2].copy_from_slice(&0x8000u16.to_le_bytes());
+    }
+    image[2..4].fill(0);
+    let sum = image
+        .chunks_exact(2)
+        .fold(0u16, |s, b| s ^ u16::from_le_bytes([b[0], b[1]]));
+    image[2..4].copy_from_slice(&(sum ^ 0xffff).to_le_bytes());
+    image
+}
+pub(in crate::ath9k) fn channel_receipt_image(
+    frequency: u16,
+    ceiling: u8,
+    image: [u8; EEPROM_4K_BYTES],
+) -> Result<ChannelReceipt, BringUpError> {
+    channel_receipt_factory(frequency, ceiling, image, false, false)
+}
+pub(in crate::ath9k) fn channel_receipt_factory(
+    frequency: u16,
+    ceiling: u8,
+    image: [u8; EEPROM_4K_BYTES],
+    swapped: bool,
+    xe2: bool,
+) -> Result<ChannelReceipt, BringUpError> {
+    let mut io = Model::new(0, xe2, false, 1400);
+    io.magic = if swapped { 0x5aa5 } else { 0xa55a };
+    let mut wire = image;
+    if swapped {
+        for word in wire.chunks_exact_mut(2) {
+            word.swap(0, 1);
+        }
+    }
+    io.eeprom = Some(wire);
+    let (identity, image) = crate::ath9k::identity::identify(&mut io)?;
+    let prepared = crate::ath9k::phy::prepare_at(&mut io, &image, frequency)?;
+    let permission = Permission {
+        country: *b"US",
+        frequency,
+        ceiling,
+    };
+    let mut owner = Calibration::default();
+    // SAFETY: actual parked model preparation above, exclusive model BAR,
+    // no packet rings/BME exist, and this calibration owner is one-shot.
+    let report = ready(unsafe { owner.run(&mut io, &image, permission, prepared.xe2_gain) })?;
+    if owner.state() != State::Ready || owner.report() != Some(report) {
+        return Err(BringUpError::BadState);
+    }
+    Ok(ChannelReceipt {
+        image,
+        identity,
+        prepared,
+        report,
+        registers: io.values,
+    })
+}
+
+pub(in crate::ath9k) fn wide_image() -> [u8; EEPROM_4K_BYTES] {
+    let mut image = channel_image();
+    // Synthetic source piers/CTLs for the model only; no board data supplied.
+    for (index, bin) in [112u8, 137, 162].into_iter().enumerate() {
+        image[240 + index * 9] = bin;
+        for mcs in 0..8 {
+            image[241 + index * 9 + mcs] = (18 + index + mcs) as u8;
+        }
+    }
+    image[82] = 2;
+    image[273..276].copy_from_slice(&[0x17, 0x37, 0]);
+    for group in 6..8 {
+        let at = 279 + group * 8;
+        image[at..at + 8].copy_from_slice(&[112, 0x50, 137, 0x55, 162, 0x58, 255, 0]);
+    }
+    image[2..4].fill(0);
+    let sum = image
+        .chunks_exact(2)
+        .fold(0u16, |s, b| s ^ u16::from_le_bytes([b[0], b[1]]));
+    image[2..4].copy_from_slice(&(sum ^ 0xffff).to_le_bytes());
+    image
+}
+pub(in crate::ath9k) struct WideReceipt {
+    pub image: [u8; EEPROM_4K_BYTES],
+    pub identity: crate::ath9k::identity::Identity,
+    pub prepared: crate::ath9k::phy::Prepared,
+    pub report: crate::ath9k::calibration::wide::WideReport,
+    pub registers: BTreeMap<u64, u32>,
+}
+pub(in crate::ath9k) fn wide_receipt(
+    geometry: crate::ath9k::channel_width::Geometry,
+    ceiling: u8,
+    image: [u8; EEPROM_4K_BYTES],
+    ignored: Option<u64>,
+) -> Result<WideReceipt, BringUpError> {
+    wide_receipt_factory(geometry, ceiling, image, ignored, false, false)
+}
+pub(in crate::ath9k) fn wide_receipt_factory(
+    geometry: crate::ath9k::channel_width::Geometry,
+    ceiling: u8,
+    image: [u8; EEPROM_4K_BYTES],
+    ignored: Option<u64>,
+    swapped: bool,
+    xe2: bool,
+) -> Result<WideReceipt, BringUpError> {
+    let mut io = Model::new(0, xe2, false, 1400);
+    io.magic = if swapped { 0x5aa5 } else { 0xa55a };
+    let mut wire = image;
+    if swapped {
+        for word in wire.chunks_exact_mut(2) {
+            word.swap(0, 1);
+        }
+    }
+    io.eeprom = Some(wire);
+    let (identity, image) = crate::ath9k::identity::identify(&mut io)?;
+    io.ignored = ignored;
+    let prepared = crate::ath9k::phy::prepare_geometry(&mut io, &image, geometry)?;
+    let permission = crate::ath9k::channel_width::Permission {
+        country: *b"US",
+        ceiling,
+        geometry,
+    };
+    let mut owner = Calibration::default();
+    // SAFETY: same exclusive model BAR after full40 preparation; synthetic
+    // fixture authorization has no native PCI or physical RF authority.
+    let report = ready(unsafe {
+        crate::ath9k::calibration::wide::run(
+            &mut owner,
+            &mut io,
+            &image,
+            permission,
+            prepared.xe2_gain,
+        )
+    })?;
+    if owner.state() != State::Ready || owner.report() != Some(report.report) {
+        return Err(BringUpError::BadState);
+    }
+    Ok(WideReceipt {
+        image,
+        identity,
+        prepared,
+        report,
+        registers: io.values,
+    })
+}
+
+#[path = "factory_tests.rs"]
+pub(in crate::ath9k) mod factory;

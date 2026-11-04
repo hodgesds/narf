@@ -16,7 +16,7 @@ fn smoke_ath10k_peer_assoc_vdev_up_match_complete_native_linux_generators() -> T
                 return TestResult::Fail("complete PEER_ASSOC body differs from native Linux C");
             }
         }
-        if up(dialect, bssid, 7).as_deref() != Ok(vdev_up) {
+        if up(dialect, 0, bssid, 7).as_deref() != Ok(vdev_up) {
             return TestResult::Fail("VDEV_UP body differs from native Linux C");
         }
     }

@@ -34,6 +34,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod ap_wire;
 pub mod association;
 pub mod bringup;
 pub(crate) mod channel;
@@ -42,11 +43,14 @@ pub mod dma;
 mod firmware_assets;
 mod firmware_parser_tests;
 pub mod firmware_transport;
+mod fw_features;
 pub mod fwdl;
 pub(crate) mod he;
 pub(crate) mod ht20;
 pub mod mac;
 pub mod mcu;
+mod p2p_cnm;
+mod p2p_wire;
 mod packet_tx;
 pub mod pci;
 mod registers;
@@ -54,8 +58,12 @@ mod registers_tests;
 pub mod regs;
 pub(crate) mod six_ghz;
 pub(crate) mod tx_priority;
+mod tx_sequence;
 pub mod txrx;
 pub(crate) mod vht;
+pub(crate) mod vif_slots;
+pub(crate) mod wowlan;
+pub(crate) mod wowlan_nlo;
 
 pub use pci::{
     firmware_blobs_for, l1_remap, name_for, probe, register_pci_driver, Mt7921Device, ProbeError,

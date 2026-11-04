@@ -42,7 +42,7 @@ use super::phy::{BB_BRINGUP_PREAMBLE, BB_RST_VALUE, RF_EN, RF_RSTB, RF_SDMRSTB};
 use super::power::{
     power_on_table_for, WlanPwrCfg, PWR_BASEADDR_MAC, PWR_CMD_END, PWR_CMD_POLLING, PWR_CMD_WRITE,
     PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK, RTL8188EE_PWR_ON, RTL8192CE_PWR_ON,
-    RTL8192EE_PWR_ON, RTL8723BE_PWR_ON, RTL8821AE_PWR_ON,
+    RTL8192EE_PWR_ON, RTL8723AE_PWR_ON, RTL8723BE_PWR_ON, RTL8821AE_PWR_ON,
 };
 use super::regs::*;
 use super::rf::{lssi_pack, RfPath, RF_MASK_12};
@@ -203,7 +203,7 @@ fn smoke_rtlwifi_fw_blob_name_by_chip() -> TestResult {
         (RTL_DEV_8192CE_ALT, "rtlwifi/rtl8192cfw.bin"),
         (RTL_DEV_8192DE, "rtlwifi/rtl8192defw.bin"),
         (RTL_DEV_8192EE, "rtlwifi/rtl8192eefw.bin"),
-        (RTL_DEV_8723AE, "rtlwifi/rtl8723aefw.bin"),
+        (RTL_DEV_8723AE, "rtlwifi/rtl8723fw.bin"),
         (RTL_DEV_8723BE, "rtlwifi/rtl8723befw.bin"),
         (RTL_DEV_8821AE, "rtlwifi/rtl8821aefw.bin"),
     ];
@@ -345,11 +345,9 @@ kernel_test_in!(
 fn smoke_rtlwifi_power_on_tables_present() -> TestResult {
     let cases: &[(u16, &[WlanPwrCfg])] = &[
         (RTL_DEV_8188EE, RTL8188EE_PWR_ON),
-        (RTL_DEV_8192CE, RTL8192CE_PWR_ON),
-        (RTL_DEV_8192CE_ALT, RTL8192CE_PWR_ON),
         (RTL_DEV_8192DE, RTL8192CE_PWR_ON),
         (RTL_DEV_8192EE, RTL8192EE_PWR_ON),
-        (RTL_DEV_8723AE, RTL8723BE_PWR_ON),
+        (RTL_DEV_8723AE, RTL8723AE_PWR_ON),
         (RTL_DEV_8723BE, RTL8723BE_PWR_ON),
         (RTL_DEV_8821AE, RTL8821AE_PWR_ON),
     ];
@@ -372,6 +370,18 @@ fn smoke_rtlwifi_power_on_tables_present() -> TestResult {
     if power_on_table_for(0xFFFF).is_some() {
         return TestResult::Fail("rtlwifi: unknown DID got a table");
     }
+    // RTL8192CE / 8188CE have no pwrseq table (`_rtl92ce_init_mac` prefix,
+    // run by the firmware owner).
+    for did in [
+        RTL_DEV_8192CE,
+        RTL_DEV_8192CE_ALT,
+        RTL_DEV_8192CE_8177,
+        RTL_DEV_8192CE_8191,
+    ] {
+        if power_on_table_for(did).is_some() {
+            return TestResult::Fail("rtlwifi: 8192CE family got a pwrseq table");
+        }
+    }
     // RTL8822BE (0xB822) belongs to rtw88 and must not resolve here.
     if power_on_table_for(0xB822).is_some() {
         return TestResult::Fail("rtlwifi: rtw88-owned 0xB822 got a table");
@@ -390,6 +400,7 @@ fn smoke_rtlwifi_power_on_row_encoding() -> TestResult {
         RTL8188EE_PWR_ON,
         RTL8192CE_PWR_ON,
         RTL8192EE_PWR_ON,
+        RTL8723AE_PWR_ON,
         RTL8723BE_PWR_ON,
         RTL8821AE_PWR_ON,
     ];
@@ -803,7 +814,8 @@ fn smoke_rtlwifi_per_chip_coverage_matrix() -> TestResult {
             return TestResult::Fail("name_for: generic fallback for known chip");
         }
         // 2) Power-on table resolves.
-        if power_on_table_for(did).is_none() {
+        // (RTL8192CE / 8188CE power on through `_rtl92ce_init_mac`.)
+        if power_on_table_for(did).is_none() != super::rtl8192ce::is_8192ce(did) {
             return TestResult::Fail("power_on_table_for: missing entry");
         }
         // 3) FW blob name resolves.
@@ -853,6 +865,7 @@ kernel_test_in!(
 
 fn smoke_rtlwifi_unready_control_plane_fails_closed() -> TestResult {
     let device = super::pci::RtlwifiDevice {
+        name: "rtlwifi-unready-fixture",
         native: None,
         firmware: None,
         prepared: None,

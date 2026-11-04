@@ -136,6 +136,31 @@ the admin handle returned by stack attachment to a task's generic-netlink
 fd. This is an internal launcher API, not a Linux syscall accepting raw
 capability bytes. Kernel generic-netlink events reach only subscribers in
 the event's namespace and preserve their multicast group in packet info.
+Native asynchronous control ACKs use `GenericReplyEndpoint`, which holds a
+weak reference to the exact sending `SocketFile` and checks its namespace,
+protocol and bound port before publication. It never looks up a replacement
+socket by port id and does not keep a closed file alive across firmware waits.
+Its optional native-emission source is a weak receipt from the actual
+`SocketFile` provider, captured only after the full socket check outside
+native device State. Final native checks use only concrete lifetime state,
+without taking the socket lock or calling the sink. Namespace changes retire
+the old source before publication, including move/back; final file Drop
+retires and wakes native cleanup before release notifications. A reused port
+never revives that weak source. Each endpoint captures its source generation
+once; an old request cannot recapture a fresh source after namespace move/back.
+A bound generic socket cannot rebind to a
+different port. The receipt grants no administration, native key or packet
+authority, and does not replace ordinary exact-source ACK/event checks.
+The endpoint may explicitly retain a fresh control-child Admin after its
+authorized parent/daemon/child delegation. These handles remain attached to
+that exact file, alongside its existing parent handle, and preserve actual
+parent/daemon/child grant and registration lifetimes. Lookup checks the actual
+child namespace and prunes retired/revoked controls; a same-name successor,
+closed source or reused port obtains no inherited grant. Replacing the base
+socket delegation clears its retained child controls. Ordinary endpoints keep
+their existing behavior, and no capability bytes cross the Linux wire ABI.
+Owned command replies are queued with that socket's port id and group0 only
+after actual terminal completion; multicast delivery remains independent.
 A wireless-only service obtains its reply with
 `net::stack::control_registered`, leaving IP frame delivery with the existing
 stack. `network_daemon::prepare(process, &StackAttachReply, TaskSpec)` installs

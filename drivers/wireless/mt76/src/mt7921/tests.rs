@@ -506,7 +506,12 @@ fn smoke_mt7921_firmware_radio_ready_or_skip() -> TestResult {
     let info = match boot_status() {
         BootStatus::Retained(State::RadioReady(info))
         | BootStatus::Retained(State::ScanReady(info))
-        | BootStatus::Retained(State::Associated { info, .. }) => info,
+        | BootStatus::Retained(State::P2pDevice(info))
+        | BootStatus::Retained(
+            State::Associated { info, .. }
+            | State::AccessPoint { info, .. }
+            | State::Monitor { info, .. },
+        ) => info,
         BootStatus::Absent => {
             return TestResult::Fail("mt7921: PCI device bound but firmware owner absent");
         }
@@ -530,7 +535,7 @@ fn smoke_mt7921_firmware_radio_ready_or_skip() -> TestResult {
         BootStatus::Retained(State::Stopped) => {
             return TestResult::Fail("mt7921: firmware transport stopped during initialization");
         }
-        BootStatus::Retained(State::Suspended(_)) => {
+        BootStatus::Retained(State::Suspended(_) | State::WowSuspended { .. }) => {
             return TestResult::Fail("mt7921: radio left suspended after system resume");
         }
     };

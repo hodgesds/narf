@@ -10,7 +10,16 @@ pub(super) const TX_BD: usize = 16;
 pub(super) const RX_DESC: usize = 24;
 pub(super) const RX_BD: usize = 8;
 pub(super) const MAX_MPDU: usize = 2304;
+/// TX allocation bound for one QoS A-MSDU MPDU without FCS: the smallest
+/// VHT maximum MPDU length (`IEEE80211_MAX_MPDU_LEN_VHT_3895`) less the
+/// hardware FCS. It also covers the default HT 3839-byte A-MSDU body plus
+/// the 26-byte QoS header and CCMP header/MIC (3881). Peers advertising a
+/// larger A-MSDU/MPDU length are narrowed to it; only a 5GHz HT/VHT QoS
+/// MPDU with the A-MSDU-present bit may exceed `MAX_MPDU`.
+pub(super) const MAX_TX_MPDU: usize = 3895 - 4;
 pub(super) const MAX_HT_RX: usize = 26 + 16 + narf_wireless::amsdu::MAX_BYTES;
+/// VHT RX MPDU bound including FCS (advertised maximum MPDU length 3895).
+pub(super) const MAX_VHT_RX: usize = 3895;
 pub(super) const RX_BYTES: usize = 11454 + RX_DESC;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Aggregation {
@@ -37,7 +46,9 @@ impl Aggregation {
         profile: DataProfile,
         frames: impl ExactSizeIterator<Item = usize>,
     ) -> bool {
-        const NDBPS: [usize; 8] = [26, 52, 78, 104, 156, 208, 234, 260];
+        const NDBPS: [usize; 16] = [
+            26, 52, 78, 104, 156, 208, 234, 260, 52, 104, 156, 208, 312, 416, 468, 520,
+        ];
         if !self.valid()
             || !profile.valid()
             || profile.mcs == 0
@@ -57,9 +68,17 @@ impl Aggregation {
         if bytes > usize::from(self.bytes) {
             return false;
         }
-        let symbols = (16 + bytes * 8 + 6).div_ceil(NDBPS[usize::from(profile.rate() - 12)]);
+        // A VHT descriptor rate is bounded by the HT20 MCS of the same stream
+        // count (MCS8/9 by MCS7), which never undercounts its airtime.
+        let rate = match profile.rate() {
+            r @ 0x2c..=0x35 => 12 + (r - 0x2c).min(7),
+            r @ 0x36.. => 20 + (r - 0x36).min(7),
+            r => r,
+        };
+        let symbols = (16 + bytes * 8 + 6).div_ceil(NDBPS[usize::from(rate - 12)]);
         bytes <= usize::from(self.bytes)
-            && 36 + symbols * 4 + count * 16 <= usize::from(self.airtime)
+            && (if rate >= 20 || profile.stbc { 40 } else { 36 }) + symbols * 4 + count * 16
+                <= usize::from(self.airtime)
     }
 }
 
@@ -140,7 +159,9 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
 pub(super) struct DataProfile {
     pub rates: u16,
     pub qos: bool,
-    pub mcs: u8,
+    pub mcs: u16,
+    /// Locally advertised receive MCS mask, independent of peer TX selection.
+    pub rx_mcs: u16,
     pub sgi: bool,
     /// Source `tx.c::rtw_tx_pkt_info_update`: `si->ldpc_en` (W5 bit7).
     pub ldpc: bool,
@@ -152,25 +173,138 @@ pub(super) struct DataProfile {
     /// Separately qualified (N2xF) firmware RA fallback: DATA clears
     /// W3 USE_RATE/DISDATAFB.
     pub fallback: bool,
+    /// Separately qualified (N2xB) 40MHz HT DATA: `si->bw_mode` 40, TX
+    /// descriptor W5_DATA_BW 1, RA BW_MODE 1 and BGN_40M rate ids; `sgi`
+    /// then means SGI40.
+    pub bw40: bool,
+    /// 5GHz operation (`hal.current_band_type == RTW_BAND_5G`): no CCK
+    /// rate is admitted, management uses OFDM6 with `RTW_RATEID_G`
+    /// (`tx.c::rtw_tx_pkt_info_update_rate`) and response rates come from
+    /// `RRSR_INIT_5G` (0x150) instead of `RRSR_INIT_2G` (0x15f).
+    pub band5: bool,
+    /// Separately qualified (N2xV) VHT DATA at 80MHz: `si->vht_enable`,
+    /// `si->bw_mode` 80, RA_INFO VHT_EN / BW_MODE 2, rate id
+    /// `RTW_RATEID_ARFR1_AC_1SS` (10) / `ARFR0_AC_2SS` (9), descriptor
+    /// W5_DATA_BW 2 and the highest VHT TX rate; `sgi` then means SGI80.
+    pub vht: Option<VhtRates>,
+}
+/// VHT rate sets in the `ra_mask >> 12` layout of `main.c::get_vht_ra_mask`:
+/// 1SS MCS0..9 in bits 0..9, 2SS MCS0..9 in bits 10..19.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct VhtRates {
+    /// Negotiated TX/RA set (local N2xV selection within the peer's RX map).
+    pub tx: u32,
+    /// Locally advertised RX set (`rtw_init_vht_cap` RX MCS map).
+    pub rx: u32,
+}
+impl VhtRates {
+    /// One stream group is MCS0..7, 0..8 or 0..9
+    /// (`IEEE80211_VHT_MCS_SUPPORT_0_{7,8,9}`) or absent (2SS only).
+    fn group_ok(g: u32, required: bool) -> bool {
+        matches!(g, 0xff | 0x1ff | 0x3ff) || !required && g == 0
+    }
+    pub(super) fn valid(self) -> bool {
+        let ok = |m: u32| {
+            m & !0xfffff == 0 && Self::group_ok(m & 0x3ff, true) && Self::group_ok(m >> 10, false)
+        };
+        ok(self.tx) && ok(self.rx) && self.tx & !self.rx == 0
+    }
+    /// `get_vht_ra_mask` over a VHT MCS map's first two streams.
+    pub(super) fn from_map(map: u16) -> u32 {
+        (0..2).fold(0, |mask, s| {
+            let group: u32 = match map >> (2 * s) & 3 {
+                0 => 0xff,
+                1 => 0x1ff,
+                2 => 0x3ff,
+                _ => 0,
+            };
+            mask | group << (10 * s)
+        })
+    }
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
         rates: 1,
         qos: false,
         mcs: 0,
+        rx_mcs: 0,
         sgi: false,
         ldpc: false,
         stbc: false,
         acs: 0,
         fallback: false,
+        bw40: false,
+        band5: false,
+        vht: None,
     };
+    /// The 5GHz base profile: OFDM6 only (`get_rate_id` WIRELESS_OFDM =
+    /// `RTW_RATEID_G`).
+    pub(super) const LEGACY5: Self = Self {
+        rates: 1 << 4,
+        band5: true,
+        ..Self::LEGACY
+    };
+    /// Management/control rate id and descriptor rate:
+    /// `rtw_tx_pkt_info_update_rate` (2.4GHz `RTW_RATEID_B_20M` at
+    /// DESC_RATE1M, 5GHz `RTW_RATEID_G` at DESC_RATE6M), with the lowest
+    /// rate forced like `RTW_FLAG_FORCE_LOWEST_RATE`.
+    pub(super) const fn management(self) -> (u8, u8) {
+        if self.band5 {
+            (7, 4)
+        } else {
+            (8, 0)
+        }
+    }
+    /// `RRSR_INIT_5G` / `RRSR_INIT_2G` (`main.c::rtw_update_sta_info`).
+    pub(super) const fn rrsr_init(self) -> u32 {
+        if self.band5 {
+            0x150
+        } else {
+            0x15f
+        }
+    }
     pub(super) fn valid(self) -> bool {
         self.rates != 0
             && self.rates & !0xfff == 0
             && (self.mcs == 0 && !self.sgi || self.mcs != 0 && self.qos)
+            && (self.mcs == 0 && self.rx_mcs == 0
+                || self.mcs != 0
+                    && matches!(self.rx_mcs, 0xff | 0xffff)
+                    && self.mcs & !self.rx_mcs == 0)
             && (self.mcs != 0 || !self.ldpc && !self.stbc)
+            && (!self.stbc || self.mcs & 0xff00 == 0)
             && self.acs & !(ACS_BK | ACS_VI | ACS_VO) == 0
             && (self.acs == 0 || self.qos)
+            && (!self.bw40 || self.mcs != 0)
+            && (!self.band5 || self.rates & 15 == 0)
+            && self
+                .vht
+                .is_none_or(|v| v.valid() && self.band5 && !self.bw40 && self.mcs != 0)
+    }
+    /// `rtw_init_vht_cap` RX set for the HT RX mask's streams (MCS0..9).
+    pub(super) fn vht_rx_for(rx_mcs: u16) -> u32 {
+        if rx_mcs == 0xffff {
+            0xfffff
+        } else {
+            0x3ff
+        }
+    }
+    /// `si->bw_mode`: 0 (20MHz), 1 (N2xB 40MHz) or 2 (N2xV 80MHz).
+    pub(super) fn bw_mode(self) -> u8 {
+        if self.vht.is_some() {
+            2
+        } else {
+            u8::from(self.bw40)
+        }
+    }
+    /// RA_INFO mask (`rtw_update_sta_info`): legacy rates plus HT MCS, or on
+    /// a VHT association `RA_MASK_VHT_RATES | RA_MASK_OFDM_IN_VHT` (HT
+    /// rates dropped).
+    pub(super) fn ra_mask(self) -> u32 {
+        match self.vht {
+            Some(v) => u32::from(self.rates) | v.tx << 12,
+            None => u32::from(self.rates) | u32::from(self.mcs) << 12,
+        }
     }
     /// The QoS ring for `tid`, if this profile admits it.
     pub(super) fn tid_queue(self, tid: u8) -> Option<Queue> {
@@ -188,9 +322,22 @@ impl DataProfile {
             ..self
         }
     }
+    /// `main.c::get_rate_id`: BGN at BW40 uses BGN_40M_1SS (1) / 2SS (0);
+    /// GN (no CCK) does not depend on the bandwidth.
     pub(super) fn rate_id(self) -> u8 {
+        // WIRELESS_OFDM | WIRELESS_VHT: ARFR1_AC_1SS (10) / ARFR0_AC_2SS (9).
+        if let Some(v) = self.vht {
+            return if v.tx >> 10 != 0 { 9 } else { 10 };
+        }
         if self.mcs != 0 {
-            return if self.rates & 15 == 0 { 5 } else { 3 };
+            return match (self.rates & 15 == 0, self.mcs & 0xff00 != 0) {
+                (false, false) if self.bw40 => 1,
+                (false, true) if self.bw40 => 0,
+                (false, false) => 3,
+                (false, true) => 2,
+                (true, false) => 5,
+                (true, true) => 4,
+            };
         }
         if self.rates & 0xff0 == 0 {
             8
@@ -201,8 +348,13 @@ impl DataProfile {
         }
     }
     pub(super) fn rate(self) -> u8 {
+        // tx.c::get_highest_vht_tx_rate: DESC_RATEVHT1SS_MCS0 (0x2c) + the
+        // highest negotiated stream/MCS.
+        if let Some(v) = self.vht {
+            return 0x2c + (31 - v.tx.leading_zeros()) as u8;
+        }
         if self.mcs != 0 {
-            return 12 + (7 - self.mcs.leading_zeros() as u8);
+            return 12 + (15 - self.mcs.leading_zeros() as u8);
         }
         const KBPS: [u32; 12] = [
             1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000,
@@ -214,7 +366,29 @@ impl DataProfile {
             .map_or(0, |(i, _)| i as u8)
     }
     pub(super) fn response_mask(self) -> u32 {
-        let rate = self.rate();
+        // A VHT rate solicits responses like the HT MCS of the same
+        // modulation and stream count (VHT MCS0..7 = HT MCS0..7 per stream).
+        let rate = match self.rate() {
+            r @ 0x2c..=0x35 => 12 + (r - 0x2c).min(7),
+            r @ 0x36.. => 20 + (r - 0x36).min(7),
+            r => r,
+        };
+        if rate >= 20 {
+            // A second spatial stream doubles N_DBPS, not the modulation
+            // order. MCS8 is13Mbps: it cannot solicit a24Mbps basic ACK.
+            const DBPS: [u32; 8] = [52, 104, 156, 208, 312, 416, 468, 520];
+            const KBPS: [u32; 12] = [
+                1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000,
+            ];
+            let kbps = DBPS[usize::from(rate - 20)] * 250;
+            return KBPS.iter().enumerate().fold(0, |mask, (i, basic)| {
+                mask | if (self.rrsr_init() & (1 << i)) != 0 && *basic <= kbps {
+                    1 << i
+                } else {
+                    0
+                }
+            });
+        }
         let mut order = if rate >= 12 {
             rate - 12
         } else if rate >= 4 {
@@ -225,17 +399,25 @@ impl DataProfile {
         if rate >= 12 || order == 0 {
             order += 1;
         }
-        ((1u32 << (u32::from(order) + 4)) - 1) & 0x15f
+        ((1u32 << (u32::from(order) + 4)) - 1) & self.rrsr_init()
     }
 }
 fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<Queue, Error> {
     if !profile.valid() {
         return Err(Error::Metadata);
     }
-    if profile.mcs != 0 && native_bar(frame) && frame[10..16] == own && frame[17] >> 4 == 0 {
+    if profile.mcs != 0 && native_bar(frame) && originator_control(frame) && frame[10..16] == own {
         return Ok(Queue::Management);
     }
-    if !(24..=MAX_MPDU).contains(&frame.len())
+    // `mac80211.c::rtw_ops_can_aggregate_in_amsdu`: TX A-MSDU only outside
+    // 2.4GHz, on an HT/VHT QoS profile.
+    let amsdu = profile.band5
+        && profile.qos
+        && profile.mcs != 0
+        && frame.len() >= 26
+        && frame[0] == 0x88
+        && frame[24] & 0x80 != 0;
+    if !(24..=if amsdu { MAX_TX_MPDU } else { MAX_MPDU }).contains(&frame.len())
         || !unicast(&own)
         || frame[10..16] != own
         || frame[0] & 3 != 0
@@ -261,36 +443,65 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         {
             Ok(Queue::Management)
         }
+        0xd0 if profile.mcs != 0 && smps_action(frame) => Ok(Queue::Management),
         0xd0 if profile.mcs != 0 && recipient_control(frame) => Ok(Queue::Management),
         0xd0 if profile.mcs != 0 && originator_control(frame) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
-        // QoS Control: TID only (normal ack, no EOSP/A-MSDU), byte1 zero.
+        // QoS Control: TID (normal ack, no EOSP), byte1 zero; the A-MSDU
+        // present bit only under the 5GHz `amsdu` admission above.
         0x88 if profile.qos
             && frame.len() >= 26
-            && frame[24] & 0xf0 == 0
+            && frame[24] & 0x70 == 0
+            && (frame[24] & 0x80 == 0 || amsdu)
             && frame[25] == 0
             && frame[1] & 3 == 1
             && unicast(&frame[4..10]) =>
         {
-            profile.tid_queue(frame[24]).ok_or(Error::Frame)
+            profile.tid_queue(frame[24] & 15).ok_or(Error::Frame)
         }
         _ => Err(Error::Frame),
     }
 }
+/// `mac80211 ht.c::ieee80211_send_smps_action` from a station: HT category
+/// (7), `WLAN_HT_ACTION_SMPS` (1), SM Power Control disabled (0) or static
+/// (1); `rtw88` sets no `NL80211_FEATURE_DYNAMIC_SMPS`, so never dynamic.
+pub(super) fn smps_action(b: &[u8]) -> bool {
+    b.len() == 27
+        && b[..2] == [0xd0, 0]
+        && unicast(&b[4..10])
+        && b[4..10] == b[16..22]
+        && b[22] & 15 == 0
+        && b[24..26] == [7, 1]
+        && b[26] <= 1
+}
 pub(super) fn originator_control(b: &[u8]) -> bool {
+    originator_control_tid(b).is_some()
+}
+/// Literal source control shape only. The native Core separately requires
+/// this exact TID in its actual current T1/T2 owner's admission mask.
+pub(super) fn originator_control_tid(b: &[u8]) -> Option<u8> {
     if native_bar(b) {
-        return b[17] >> 4 == 0;
+        let tid = b[17] >> 4;
+        return (tid < 6).then_some(tid);
     }
     if b.len() < 30 || b[..2] != [0xd0, 0] || b[24] != 3 {
-        return false;
+        return None;
     }
     match (b.len(), b[25]) {
         (33, 0) => {
             let p = u16::from_le_bytes([b[27], b[28]]);
-            p & 0x3f == 2 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0
+            let tid = ((p >> 2) & 15) as u8;
+            // Policy immediate; the A-MSDU-supported bit is the 5GHz
+            // producer's request (`agg-tx.c::ieee80211_send_addba_request`).
+            (p & 2 == 2 && tid < 6 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0)
+                .then_some(tid)
         }
-        (30, 2) => b[26..30] == [0, 8, 39, 0],
-        _ => false,
+        (30, 2) => {
+            let p = u16::from_le_bytes([b[26], b[27]]);
+            let tid = (p >> 12) as u8;
+            (p & 0x0fff == 0x0800 && tid < 6 && b[28..30] == [39, 0]).then_some(tid)
+        }
+        _ => None,
     }
 }
 /// Newly emitting recipient control is separately qualified by the retained
@@ -361,8 +572,14 @@ pub(super) fn transmit_profile(
     if frame[0] == 0x88 && !ordinary {
         return Err(Error::Frame);
     }
-    let rate_id = if ordinary { profile.rate_id() } else { 8 };
-    // Source fixed-rate/no-fallback; management/EAPOL remain CCK1. QoS comes
+    let (management_id, management_rate) = profile.management();
+    let rate_id = if ordinary {
+        profile.rate_id()
+    } else {
+        management_id
+    };
+    // Source fixed-rate/no-fallback; management/EAPOL stay at the band's
+    // lowest rate (CCK1 / OFDM6). QoS comes
     // from the actual26-byte frame, with TID0 selecting the same BE queue.
     put(
         &mut bytes,
@@ -381,16 +598,18 @@ pub(super) fn transmit_profile(
         if ordinary {
             u32::from(profile.rate())
         } else {
-            0
+            u32::from(management_rate)
         },
     );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));
     if ordinary && profile.mcs != 0 {
-        // Source W5_DATA_SHORT bit4, W5_DATA_LDPC bit7, W5_DATA_STBC bits9:8.
+        // Source W5_DATA_SHORT bit4, W5_DATA_BW bits6:5, W5_DATA_LDPC bit7,
+        // W5_DATA_STBC bits9:8.
         put(
             &mut bytes,
             20,
             u32::from(profile.sgi) << 4
+                | u32::from(profile.bw_mode()) << 5
                 | u32::from(profile.ldpc) << 7
                 | u32::from(profile.stbc) << 8,
         );
@@ -405,7 +624,7 @@ pub(super) fn transmit_profile(
 }
 pub(super) fn buffer_descriptor(address: u64, length: usize) -> Result<[u8; TX_BD], Error> {
     let extent = TX_DESC.checked_add(length).ok_or(Error::Address)?;
-    if (!(24..=MAX_MPDU).contains(&length) && length != 20)
+    if (!(24..=MAX_TX_MPDU).contains(&length) && length != 20)
         || address == 0
         || address & 3 != 0
         || address
@@ -445,6 +664,27 @@ pub(super) fn phy_status(descriptor: &[u8; RX_DESC]) -> Option<Range<usize>> {
     Some(start..start + 32)
 }
 pub(super) fn receive_profile(descriptor: &[u8; RX_DESC], ht: bool) -> Result<Receive, Error> {
+    receive_mcs(descriptor, if ht { 0xff } else { 0 })
+}
+pub(super) fn receive_mcs(descriptor: &[u8; RX_DESC], mcs: u16) -> Result<Receive, Error> {
+    receive_rates(descriptor, mcs, 0)
+}
+/// [`receive_mcs`] also admitting the locally advertised VHT RX set `vht`
+/// (`VhtRates::rx`, DESC_RATEVHT1SS_MCS0 0x2c onward) up to the advertised
+/// VHT maximum MPDU length 3895 (`IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_3895`).
+pub(super) fn receive_rates(
+    descriptor: &[u8; RX_DESC],
+    mcs: u16,
+    vht: u32,
+) -> Result<Receive, Error> {
+    let ht = mcs != 0;
+    let maximum = if vht != 0 {
+        MAX_VHT_RX
+    } else if ht {
+        MAX_HT_RX + 4
+    } else {
+        MAX_MPDU + 4
+    };
     let first = word(descriptor, 0);
     let length = (first & 0x3fff) as usize;
     let info = ((first >> 16) & 15) as usize;
@@ -466,9 +706,10 @@ pub(super) fn receive_profile(descriptor: &[u8; RX_DESC], ht: bool) -> Result<Re
     } else {
         let encryption = (first >> 20) & 7;
         let software = first & (1 << 27) != 0;
-        if !(if ht { 24 } else { 28 }..=if ht { MAX_HT_RX + 4 } else { MAX_MPDU + 4 })
-            .contains(&length)
-            || rate >= if ht { 20 } else { 12 }
+        let vht_rate = (0x2c..0x40).contains(&rate) && vht & (1 << (rate - 0x2c)) != 0;
+        if !(if ht { 24 } else { 28 }..=maximum).contains(&length)
+            || rate >= 28 && !vht_rate
+            || (12..28).contains(&rate) && mcs & (1u16 << (rate - 12)) == 0
             || word(descriptor, 16) & 0x30 != 0
             || encryption != 0 && !(encryption == 4 && software)
         {

@@ -6,6 +6,9 @@ use narf_net::netlink_generic::{build_replies_with_context, ReplyOptions};
 
 const NAME: &str = "wlan-wops";
 
+#[path = "wowlan_limits_tests.rs"]
+mod wowlan_limits;
+
 struct OpsIface {
     base: InterfaceStub,
     frag: AtomicU32,
@@ -230,3 +233,6 @@ kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_frag_threshold_sched_scan_and_random_sn
 );
+
+#[path = "monitor_control_tests.rs"]
+mod monitor_control_tests;

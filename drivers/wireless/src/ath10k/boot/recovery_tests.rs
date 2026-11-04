@@ -118,6 +118,7 @@ fn smoke_ath10k_recovery_real_cap_revocation_before_and_after_master_disable() -
             cap,
             io: ready(0x34400, 8),
             sources: None,
+            power: None,
         };
         let mut revoke = Some(revoke);
         if !during {
@@ -177,6 +178,7 @@ fn smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma(
         mmio: Mmio {
             cap: Cap::bootstrap(),
             sources: None,
+            power: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,
@@ -265,6 +267,7 @@ fn smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access(
         mmio: Mmio {
             cap: Cap::bootstrap(),
             sources: None,
+            power: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,
@@ -310,4 +313,207 @@ fn smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access(
 kernel_test_in!(
     "drivers/wireless/ath10k/recovery",
     smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access
+);
+
+fn smoke_ath10k_failed_scan_halt_ambiguity_still_resets_and_disables_master() -> TestResult {
+    for (hardware, base, count, reset_address, reset_value) in [
+        (HwRev::Qca988x, 0x57400, 8, 0x4000, 0x40),
+        (HwRev::Qca6174, 0x34400, 8, 0x80008, 1),
+        (HwRev::Qca9984, 0x4a000, 12, 8, 1),
+    ] {
+        let mut io = ready(base, count);
+        io.values.insert(base + 0x18, u32::MAX); // ambiguous first CE
+        let trace = io.writes.clone();
+        let result = narf_scheduler::block_on_spin(silence(&mut io, hardware, || {
+            trace.borrow_mut().push((MASTER_DISABLED, 0));
+            Ok(())
+        }));
+        let writes = trace.borrow();
+        let resets = writes
+            .iter()
+            .position(|value| *value == (reset_address, reset_value));
+        let disables: Vec<_> = writes
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.0 == MASTER_DISABLED)
+            .map(|(i, _)| i)
+            .collect();
+        if result != Ok(false)
+            || disables.len() != 2
+            || resets.is_none_or(|at| at <= disables[0] || at >= disables[1])
+        {
+            return TestResult::Fail(
+                "ambiguous CE skipped family reset/BME attempts or invented reclaim proof",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_failed_scan_halt_ambiguity_still_resets_and_disables_master
+);
+
+fn smoke_ath10k_failed_scan_warm_reset_prepares_si0_before_cpu_without_ce_reprogram() -> TestResult
+{
+    for hardware in [HwRev::Qca988x, HwRev::Qca9887] {
+        let mut io = ready(0x57400, 8);
+        io.values.insert(0x57418, u32::MAX); // retain uncertain DMA
+        io.values.insert(0x4000, 0x20); // preserve unrelated reset-control bits
+        let trace = io.writes.clone();
+        let result = narf_scheduler::block_on_spin(silence(&mut io, hardware, || {
+            trace.borrow_mut().push((MASTER_DISABLED, 0));
+            Ok(())
+        }));
+        let writes = trace.borrow();
+        let Some(first) = writes.iter().position(|v| v.0 == MASTER_DISABLED) else {
+            return TestResult::Fail("warm reset omitted first BME-off attempt");
+        };
+        let after_disable: Vec<_> = writes[first + 1..]
+            .iter()
+            .copied()
+            .take_while(|v| v.0 != MASTER_DISABLED)
+            .collect();
+        // Authored QCA988X/9887 addresses and reset bits from Linux hw.c/hw.h;
+        // no queue/CE configuration or BME-enable operation is permitted here.
+        if result != Ok(false)
+            || after_disable != [(0x4000, 0x21), (0x4000, 0x20), (0x9030, 0), (0x4000, 0x60)]
+            || writes.last() != Some(&(MASTER_DISABLED, 0))
+        {
+            return TestResult::Fail("warm fallback changed SI0/CPU order or reprogrammed CEs");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_failed_scan_warm_reset_prepares_si0_before_cpu_without_ce_reprogram
+);
+
+fn smoke_ath10k_failed_scan_bme_error_cannot_skip_reset_or_authorize_reclaim() -> TestResult {
+    let mut io = ready(0x57400, 8);
+    let trace = io.writes.clone();
+    let result = narf_scheduler::block_on_spin(silence(&mut io, HwRev::Qca988x, || {
+        trace.borrow_mut().push((MASTER_DISABLED, 0));
+        Err(BmiError::Pci)
+    }));
+    if result != Err(BmiError::Pci)
+        || !trace.borrow().contains(&(0x4000, 0x40))
+        || trace
+            .borrow()
+            .iter()
+            .filter(|value| value.0 == MASTER_DISABLED)
+            .count()
+            != 2
+    {
+        return TestResult::Fail(
+            "BME failure skipped actual reset or returned a reclamation proof",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_failed_scan_bme_error_cannot_skip_reset_or_authorize_reclaim
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_ath10k_failed_scan_expired_firmware_still_uses_live_pci_to_reset() -> TestResult {
+    let (source, caps) = match crate::ath10k::firmware_source::fixture() {
+        Ok(input) => input,
+        Err(error) => return TestResult::Fail(error),
+    };
+    let hardware = HwRev::Qca988x;
+    let registers = hardware.registers().unwrap();
+    let mut words = vec![0u32; 0x100000 / 4];
+    for pipe in 0..8 {
+        words[(0x57418 + pipe * 0x400) / 4] = 8;
+    }
+    // No physical PCI config exists in this RAM fixture. BME confirmation
+    // must fail, but it must not skip the owned reset/terminal DMA contract.
+    let base = narf_memory::PhysAddr::new(0);
+    let device = BusDevice {
+        addr: narf_bus::BusAddr::Mmio(base),
+        id: narf_bus::DeviceId {
+            vendor: 0x168c,
+            device: 0x003c,
+            class: 0x028000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: narf_bus::BusKind::VirtioMmio {
+            base,
+            len: 0x1000,
+            device_id: 1,
+        },
+    };
+    let mut owner = PciBoot {
+        mmio: Mmio {
+            cap: Cap::bootstrap(),
+            sources: Some(source.clone()),
+            power: None,
+            io: RawMmio(MmioRegion {
+                phys: base,
+                virt: words.as_mut_ptr() as u64,
+                len: 0x100000,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            }),
+        },
+        hardware,
+        registers,
+        device,
+        resources: ManuallyDrop::new(Resources::allocate(hardware).unwrap()),
+        hif: ManuallyDrop::new(None),
+        hif_live: false,
+        mission_pending: true,
+        power_ready: true,
+        armed: true,
+        poisoned: false,
+        saved_aspm: None,
+        retired: false,
+        reclaimable: false,
+        interrupts: None,
+        msi: None,
+        signal: crate::ath10k::irq::Signal::new(),
+        serviced: 0,
+        firmware_crashed: false,
+    };
+    caps[0].revoke();
+    if owner.mmio.authorized() || source.check().is_ok() {
+        return TestResult::Fail("expired executable fixture remained authoritative");
+    }
+    let result = narf_scheduler::block_on_spin(owner.retire_after_failed_scan());
+    if !matches!(result, Err(BmiError::Pci))
+        || !owner.retired
+        || owner.reclaimable
+        || words[0x4000 / 4] & 0x40 == 0
+        || owner.mmio.sources.is_some()
+        || source.check().is_ok()
+        || owner.hif_source_ready(3).is_ok()
+    {
+        return TestResult::Fail(
+            "expired firmware blocked independent PCI reset or revived mission authority",
+        );
+    }
+    let after = words.clone();
+    if !matches!(
+        narf_scheduler::block_on_spin(owner.retire_after_failed_scan()),
+        Err(BmiError::BadResponse)
+    ) || words != after
+    {
+        return TestResult::Fail("terminal failed-scan owner repeated physical retirement");
+    }
+    words.fill(0x5678); // A hypothetical successor's live CSR contents.
+    drop(owner);
+    if words.iter().any(|value| *value != 0x5678) {
+        return TestResult::Fail("late failed-scan owner touched successor registers");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_failed_scan_expired_firmware_still_uses_live_pci_to_reset
 );

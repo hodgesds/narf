@@ -109,6 +109,27 @@ fn smoke_rtw89_native_rejects_unsupported_extents() -> TestResult {
                 1 => 0x40,
                 _ => 1,
             };
+            // RTL8852C admits plain QoS data (TID0, no A-MSDU) for its
+            // signed WMM program; 8852A keeps refusing it.
+            if chip == ChipId::Rtl8852C && index == 0 {
+                if prepare_header(chip, info(100), 0, 0, &bad).is_err() {
+                    return TestResult::Fail("C QoS TID0 data refused");
+                }
+                let mut amsdu = bad.clone();
+                amsdu[24] = 0x80;
+                if prepare_header(chip, info(100), 0, 0, &amsdu) != Err(Error::BadFrame) {
+                    return TestResult::Fail("C A-MSDU QoS data accepted");
+                }
+                // Signed C HE20: QoS data with +HTC (Order, EOSP, HE variant).
+                let mut htc = bad.clone();
+                htc[1] |= 0x80;
+                htc[24] = 0x10;
+                htc[26] = 3;
+                if prepare_header(chip, info(100), 0, 0, &htc).is_err() {
+                    return TestResult::Fail("C HE +HTC QoS data refused");
+                }
+                continue;
+            }
             if prepare_header(chip, info(100), 0, 0, &bad) != Err(Error::BadFrame) {
                 return TestResult::Fail("QoS/protected/fragmented frame accepted");
             }

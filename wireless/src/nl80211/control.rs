@@ -14,6 +14,19 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::netlink_generic::{publish_event, RequestContext};
 use zeroize::Zeroizing;
 
+#[path = "ap_async.rs"]
+mod ap_async;
+#[path = "ap_key_async.rs"]
+mod ap_key_async;
+#[path = "p2p_async.rs"]
+mod p2p_async;
+#[path = "p2p_scan_async.rs"]
+mod p2p_scan_async;
+#[path = "sched_async.rs"]
+mod sched_async;
+#[path = "virtual_async.rs"]
+mod virtual_async;
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "control_tests.rs"]
 mod tests;
@@ -79,10 +92,13 @@ const FRAME_TX_STATUS: u8 = 60;
 const EXTERNAL_AUTH: u8 = 127;
 const REMAIN_ON_CHANNEL: u8 = 55;
 const CANCEL_REMAIN_ON_CHANNEL: u8 = 56;
+const START_P2P_DEVICE: u8 = 89;
+const STOP_P2P_DEVICE: u8 = 90;
 // Access-Point command numbers (nl80211_commands).
 const SET_BEACON: u8 = 14;
 const START_AP: u8 = 15;
 const STOP_AP: u8 = 16;
+const SET_BSS: u8 = 25;
 const SET_STATION: u8 = 18;
 const NEW_STATION: u8 = 19;
 const DEL_STATION: u8 = 20;
@@ -110,6 +126,41 @@ impl Cache {
     }
 }
 static CACHE: IrqSafeSpinLock<Vec<Cache>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Called only by the typed, exact-source radio event facade after native
+/// BSS admission. A background scan never replaces another identity's cache
+/// or an in-flight foreground scan's results.
+pub(crate) fn scheduled_results(
+    source: &crate::ap_control::RadioEventAuthority,
+    name: &str,
+    namespace: u64,
+    index: u32,
+    mut results: Vec<(crate::BssInfo, Vec<u8>)>,
+) -> Result<(), crate::WirelessError> {
+    let mut caches = CACHE.lock();
+    if narf_net::iface::lookup_in(namespace, name).is_none_or(|link| link.ifindex != index) {
+        return Err(crate::WirelessError::Denied);
+    }
+    source.current()?;
+    results.truncate(256);
+    if let Some(cache) = caches.iter_mut().find(|c| c.name == name) {
+        if cache.busy {
+            return Err(crate::WirelessError::Busy);
+        }
+        cache.ifindex = index;
+        cache.namespace = namespace;
+        cache.results = results;
+    } else {
+        caches.push(Cache {
+            name: name.into(),
+            ifindex: index,
+            namespace,
+            busy: false,
+            results,
+        });
+    }
+    Ok(())
+}
 
 // Clearing on Drop also covers cancellation before the first poll.
 struct OperationGuard(String, u32, u64);
@@ -175,6 +226,8 @@ enum Operation {
         ie: Vec<u8>,
         /// The sender, when NL80211_ATTR_SOCKET_OWNER was set.
         owner: Option<u32>,
+        /// NL80211_ATTR_MLO_SUPPORT (`CONNECT_REQ_MLO_SUPPORT`).
+        mlo: bool,
     },
     Disconnect,
 }
@@ -499,9 +552,10 @@ const CONNECT_ATTRS: &[u16] = &[
 
 /// `nl80211_connect`'s checks of the advisory attributes. The hints
 /// (MAC_HINT, WIPHY_FREQ_HINT, BG_SCAN_PERIOD, PREV_BSSID), the HT/VHT
-/// override masks and MLO_SUPPORT only steer driver BSS selection and are
-/// not acted on; CONTROL_PORT is what an offloading driver does anyway (no
-/// data before the 4-way handshake completes).
+/// override masks only steer driver BSS selection and are not acted on;
+/// CONTROL_PORT is what an offloading driver does anyway (no data before the
+/// 4-way handshake completes). MLO_SUPPORT (`CONNECT_REQ_MLO_SUPPORT`) lets
+/// an MLO wiphy request further links (`WirelessNetIface::associate_mlo`).
 fn connect_side_attrs(attrs: &[(u16, &[u8])]) -> Result<(), i32> {
     for kind in [200u16, 79] {
         if attr(attrs, kind).is_some_and(|b| b.len() != 6) {
@@ -510,6 +564,10 @@ fn connect_side_attrs(attrs: &[(u16, &[u8])]) -> Result<(), i32> {
     }
     if let Some(freq) = u32_attr(attrs, 201)? {
         channel(freq)?;
+    }
+    // NL80211_ATTR_MLO_SUPPORT is an NLA_FLAG (no payload).
+    if attr(attrs, 315).is_some_and(|flag| !flag.is_empty()) {
+        return Err(EINVAL);
     }
     // An HT/VHT capability override needs its mask (-EINVAL).
     if attr(attrs, 31).is_some() && attr(attrs, 148).is_none()
@@ -1009,6 +1067,7 @@ fn parse_operation_caps(
                 cred,
                 ie: attr(attrs, 42).unwrap_or(&[]).to_vec(),
                 owner: attr(attrs, 204).is_some().then_some(portid),
+                mlo: attr(attrs, 315).is_some(),
             })
         }
         DISCONNECT => {
@@ -1031,14 +1090,40 @@ pub(super) fn handle(
     dump: bool,
     context: RequestContext<'_>,
 ) -> Result<Vec<GenlReply>, i32> {
+    route(command, bytes, dump, context, None)
+}
+
+pub(super) fn deferred_handle(
+    command: u8,
+    bytes: &[u8],
+    dump: bool,
+    context: RequestContext<'_>,
+    slot: &narf_net::netlink_generic::DeferredRequest,
+) -> Result<Vec<GenlReply>, i32> {
+    route(command, bytes, dump, context, Some(slot))
+}
+
+fn route(
+    command: u8,
+    bytes: &[u8],
+    dump: bool,
+    context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
+) -> Result<Vec<GenlReply>, i32> {
+    if command == 9 {
+        if dump {
+            return Err(EOPNOTSUPP);
+        }
+        return ap_key_async::handle(bytes, context, deferred);
+    }
     if matches!(command, NEW_INTERFACE | DEL_INTERFACE) {
-        return virtual_interface_handle(command, bytes, context);
+        return virtual_interface_handle(command, bytes, context, deferred);
     }
     if matches!(command, GET_WOWLAN | SET_WOWLAN) {
         return wowlan_handle(command, bytes, context);
     }
     if matches!(command, START_SCHED_SCAN | STOP_SCHED_SCAN) {
-        return sched_scan_handle(command, bytes, context);
+        return sched_scan_handle(command, bytes, context, deferred);
     }
     if command == SET_SAR_SPECS {
         return sar_handle(bytes, context);
@@ -1055,8 +1140,11 @@ pub(super) fn handle(
     if command == GET_SURVEY {
         return survey_handle(bytes, dump, context.net_ns_id);
     }
+    if matches!(command, START_P2P_DEVICE | STOP_P2P_DEVICE) {
+        return p2p_async::device(command, bytes, context, deferred);
+    }
     if matches!(command, REMAIN_ON_CHANNEL | CANCEL_REMAIN_ON_CHANNEL) {
-        return roc_handle(command, bytes, context);
+        return roc_handle(command, bytes, context, deferred);
     }
     if matches!(
         command,
@@ -1068,7 +1156,7 @@ pub(super) fn handle(
             | FRAME
             | EXTERNAL_AUTH
     ) {
-        return mlme_handle(command, bytes, context);
+        return mlme_handle(command, bytes, context, deferred);
     }
     if matches!(
         command,
@@ -1084,7 +1172,7 @@ pub(super) fn handle(
             | station::SET_REKEY_OFFLOAD
     ) || command == SET_STATION && station_iface(bytes, context.net_ns_id)
     {
-        return station_handle(command, bytes, context);
+        return station_handle(command, bytes, context, deferred);
     }
     if command == station::GET_REG {
         return station::get_reg(bytes, dump, context.net_ns_id);
@@ -1093,6 +1181,7 @@ pub(super) fn handle(
         command,
         START_AP
             | STOP_AP
+            | SET_BSS
             | SET_BEACON
             | NEW_STATION
             | SET_STATION
@@ -1100,7 +1189,10 @@ pub(super) fn handle(
             | CHANNEL_SWITCH
             | COLOR_CHANGE_REQUEST
     ) {
-        return ap_handle(command, bytes, context);
+        return match deferred {
+            Some(slot) => ap_handle_with(command, bytes, context, Some(slot)),
+            None => ap_handle(command, bytes, context),
+        };
     }
     if matches!(command, SET_INTERFACE | GET_STATION) {
         return interface_handle(command, bytes, dump, context);
@@ -1108,8 +1200,25 @@ pub(super) fn handle(
     if !matches!(command, SCAN | GET_SCAN | CONNECT | DISCONNECT) {
         return super::handle_in(command, bytes, dump, context.net_ns_id);
     }
-    let attrs = attributes(bytes)?;
-    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
+    let mut attrs = attributes(bytes)?;
+    // `nl80211_trigger_scan` / `nl80211_dump_scan` take their wdev from
+    // NL80211_ATTR_WDEV as well as from a netdev IFINDEX. An actual
+    // control-only WDEV (P2P_DEVICE) has its own source-bound path; a netdev
+    // WDEV resolves to (and must agree with) its IFINDEX.
+    let wdev_index = if matches!(command, SCAN | GET_SCAN) && attr(&attrs, 153).is_some() {
+        let (iface, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
+        let Some(index) = index else {
+            return p2p_scan_async::handle(command, &attrs, dump, context, deferred, iface);
+        };
+        attrs.retain(|(kind, _)| *kind != 153);
+        Some(index)
+    } else {
+        None
+    };
+    let index = match wdev_index {
+        Some(index) => index,
+        None => u32_attr(&attrs, 3)?.ok_or(EINVAL)?,
+    };
     let iface = crate::registry::list()
         .into_iter()
         .find(|iface| {
@@ -1264,6 +1373,10 @@ fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<Gen
             ATTR_RTS_THRESHOLD,
             ATTR_ANTENNA_TX,
             ATTR_ANTENNA_RX,
+            38,  // WIPHY_FREQ
+            159, // CHANNEL_WIDTH
+            160, // CENTER_FREQ1
+            161, // CENTER_FREQ2
         ],
     )?;
     let interfaces = crate::registry::list();
@@ -1273,6 +1386,22 @@ fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<Gen
         .cloned()
         .ok_or(ENODEV)?;
     let _admin = authority(&context, iface.as_ref())?;
+
+    if let Some(frequency_mhz) = u32_attr(&attrs, 38)? {
+        if iface.current_iftype() != 6 {
+            return Err(EOPNOTSUPP);
+        }
+        iface
+            .set_monitor_channel(crate::monitor::Channel {
+                frequency_mhz,
+                width: u32_attr(&attrs, 159)?.unwrap_or(0),
+                center1_mhz: u32_attr(&attrs, 160)?.unwrap_or(frequency_mhz),
+                center2_mhz: u32_attr(&attrs, 161)?.unwrap_or(0),
+            })
+            .map_err(mlme_errno)?;
+    } else if [159, 160, 161].iter().any(|id| attr(&attrs, *id).is_some()) {
+        return Err(EINVAL);
+    }
 
     let tx = u32_attr(&attrs, ATTR_ANTENNA_TX)?;
     let rx = u32_attr(&attrs, ATTR_ANTENNA_RX)?;
@@ -1518,21 +1647,19 @@ fn roc_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
-    let iface = crate::registry::list()
-        .into_iter()
-        .find(|iface| {
-            narf_net::netlink_route::ifindex_for_name(iface.name()) == Some(index)
-                && super::in_namespace(iface.as_ref(), context.net_ns_id)
-        })
-        .ok_or(ENODEV)?;
-    let _admin = authority(&context, iface.as_ref())?;
-    station::netdev_up(iface.as_ref())?;
+    let (iface, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
+    let admin = p2p_async::source_authority(&context, iface.as_ref(), deferred)?;
+    let native = iface.async_roc_control();
+    if !native {
+        index.ok_or(EOPNOTSUPP)?;
+        station::netdev_up(iface.as_ref())?;
+    }
     match command {
         REMAIN_ON_CHANNEL => {
-            reject_unknown(&attrs, &[3, 38, 87])?;
+            reject_unknown(&attrs, &[3, 38, 87, 153])?;
             let frequency_mhz = u32_attr(&attrs, 38)?.ok_or(EINVAL)?;
             channel(frequency_mhz)?;
             let duration_ms = u32_attr(&attrs, 87)?.ok_or(EINVAL)?;
@@ -1543,7 +1670,27 @@ fn roc_handle(
             if duration_ms == 0 || duration_ms > max {
                 return Err(EINVAL);
             }
-            let cookie = ROC_COOKIE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let cookie = ROC_COOKIE
+                .fetch_update(
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                    |value| value.checked_add(1),
+                )
+                .map_err(|_| EBUSY)?;
+            if native {
+                return p2p_async::defer(
+                    iface,
+                    admin,
+                    context.net_ns_id,
+                    index,
+                    deferred,
+                    p2p_async::Operation::Roc {
+                        cookie,
+                        frequency_mhz,
+                        duration_ms,
+                    },
+                );
+            }
             iface
                 .remain_on_channel(cookie, frequency_mhz, duration_ms)
                 .map_err(mlme_errno)?;
@@ -1555,8 +1702,21 @@ fn roc_handle(
             }])
         }
         CANCEL_REMAIN_ON_CHANNEL => {
-            reject_unknown(&attrs, &[3, 88])?;
+            reject_unknown(&attrs, &[3, 88, 153])?;
             let cookie = u64_attr(&attrs, 88)?.ok_or(EINVAL)?;
+            if cookie == 0 {
+                return Err(EINVAL);
+            }
+            if native {
+                return p2p_async::defer(
+                    iface,
+                    admin,
+                    context.net_ns_id,
+                    index,
+                    deferred,
+                    p2p_async::Operation::Cancel(cookie),
+                );
+            }
             iface.cancel_remain_on_channel(cookie).map_err(mlme_errno)?;
             Ok(Vec::new())
         }
@@ -1636,16 +1796,33 @@ fn station_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    let (_, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
+    let (index, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
     if command == station::GET_POWER_SAVE {
         return station::power_save(command, iface, &attrs, context.net_ns_id);
     }
     if command != station::SET_POWER_SAVE {
         station::netdev_up(iface.as_ref())?;
     }
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
+    if matches!(
+        command,
+        station::NEW_KEY | station::SET_KEY | station::DEL_KEY
+    ) && matches!(iface.current_iftype(), 3 | 9)
+        && iface.ap_control_generation().is_some()
+    {
+        let operation = station::native_ap_key(command, iface.as_ref(), &attrs)?;
+        return ap_async::defer(iface, admin, deferred, context.net_ns_id, index, operation);
+    }
+    if command == station::CONTROL_PORT_FRAME
+        && matches!(iface.current_iftype(), 3 | 9)
+        && iface.ap_control_generation().is_some()
+    {
+        let operation = station::native_ap_control(iface.as_ref(), &attrs, &context)?;
+        return ap_async::defer(iface, admin, deferred, context.net_ns_id, index, operation);
+    }
     match command {
         station::NEW_KEY => station::new_key(iface, &attrs),
         station::SET_KEY => station::set_key(iface, &attrs),
@@ -1672,6 +1849,7 @@ fn sched_scan_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     const ATTR_IFINDEX: u16 = 3;
     const ATTR_COOKIE: u16 = 88;
@@ -1679,7 +1857,7 @@ fn sched_scan_handle(
     const ATTR_SCHED_SCAN_MULTI: u16 = 255;
     let attrs = attributes(bytes)?;
     let (index, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
     let support = iface.sched_scan_support().ok_or(EOPNOTSUPP)?;
     match command {
         START_SCHED_SCAN => {
@@ -1687,7 +1865,18 @@ fn sched_scan_handle(
                 &attrs,
                 support,
                 &[ATTR_IFINDEX, ATTR_SOCKET_OWNER, ATTR_SCHED_SCAN_MULTI],
+                iface.sched_scan_pass_all(),
             )?;
+            if iface.async_sched_scan_control() {
+                return sched_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    sched_async::Operation::Start(request),
+                );
+            }
             iface.start_sched_scan(request)?;
             super::notify_sched_scan(iface.name(), index, START_SCHED_SCAN);
         }
@@ -1697,6 +1886,16 @@ fn sched_scan_handle(
             // without multi-request support).
             if u64_attr(&attrs, ATTR_COOKIE)?.is_some_and(|cookie| cookie != 0) {
                 return Err(ENOENT);
+            }
+            if iface.async_sched_scan_control() {
+                return sched_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    sched_async::Operation::Stop,
+                );
             }
             iface.stop_sched_scan()?;
             super::notify_sched_scan(iface.name(), index, SCHED_SCAN_STOPPED);
@@ -1744,7 +1943,7 @@ fn wowlan_handle(
         SET_WOWLAN => {
             let _admin = authority(&context, iface.as_ref())?;
             let config = attr(&attrs, ATTR_WOWLAN_TRIGGERS)
-                .map(|raw| parse_wowlan(raw, support))
+                .map(|raw| parse_wowlan(raw, support, iface.wowlan_net_detect_limits()))
                 .transpose()?;
             iface.set_wowlan(config)?;
             Ok(Vec::new())
@@ -1756,7 +1955,11 @@ fn wowlan_handle(
 /// Parse `NL80211_ATTR_WOWLAN_TRIGGERS` using the exact trigger subset
 /// ath11k advertises.  Unsupported known triggers fail like cfg80211;
 /// unknown future attributes remain ignored by the deprecated Linux parser.
-fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::WowlanConfig, i32> {
+fn parse_wowlan(
+    raw: &[u8],
+    support: crate::WowlanSupport,
+    net_detect_limits: Option<crate::SchedScanSupport>,
+) -> Result<crate::WowlanConfig, i32> {
     const ANY: u16 = 1;
     const DISCONNECT: u16 = 2;
     const MAGIC_PACKET: u16 = 3;
@@ -1817,7 +2020,7 @@ fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::Wowl
                 }
             }
             NET_DETECT => {
-                config.net_detect = Some(parse_net_detect(value, support)?);
+                config.net_detect = Some(parse_net_detect(value, support, net_detect_limits)?);
             }
             // Linux sees these as requests for capabilities ath11k does not
             // advertise, hence -EINVAL rather than silently accepting them.
@@ -1835,19 +2038,15 @@ fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::Wowl
 fn parse_net_detect(
     raw: &[u8],
     support: crate::WowlanSupport,
+    limits: Option<crate::SchedScanSupport>,
 ) -> Result<crate::NetDetectConfig, i32> {
     if support.net_detect_max_match_sets == 0 {
         return Err(EOPNOTSUPP);
     }
-    // Linux ath11k advertises the PNO 512-byte probe-IE limit even though
-    // this WMI layout only has an IE bitmap; retain the bytes for
-    // GET_WOWLAN like cfg80211 does.
-    let limits = crate::SchedScanSupport {
-        max_match_sets: support.net_detect_max_match_sets,
-        random_mac: support.net_detect_random_mac,
-        ..crate::SchedScanSupport::NET_DETECT
-    };
-    parse_sched_scan(&attributes(raw)?, limits, &[])
+    let mut limits = limits.ok_or(EOPNOTSUPP)?;
+    limits.max_match_sets = limits.max_match_sets.min(support.net_detect_max_match_sets);
+    limits.random_mac &= support.net_detect_random_mac;
+    parse_sched_scan(&attributes(raw)?, limits, &[], false)
 }
 
 /// cfg80211 `nl80211_parse_sched_scan` over already-split attributes, with
@@ -1858,6 +2057,7 @@ fn parse_sched_scan(
     fields: &[(u16, &[u8])],
     limits: crate::SchedScanSupport,
     extra: &[u16],
+    pass_all: bool,
 ) -> Result<crate::NetDetectConfig, i32> {
     // These are the NL80211_ATTR_* values accepted by
     // nl80211_parse_sched_scan.
@@ -1933,8 +2133,9 @@ fn parse_sched_scan(
     let raw_matches = attr(fields, ATTR_SCHED_SCAN_MATCH)
         .map(attributes)
         .transpose()?
-        .ok_or(EINVAL)?;
-    if raw_matches.is_empty() || raw_matches.len() > usize::from(limits.max_match_sets) {
+        .unwrap_or_default();
+    if !pass_all && raw_matches.is_empty() || raw_matches.len() > usize::from(limits.max_match_sets)
+    {
         return Err(EINVAL);
     }
     let mut matches = Vec::with_capacity(raw_matches.len());
@@ -1945,7 +2146,7 @@ fn parse_sched_scan(
             return Err(EOPNOTSUPP);
         }
         let ssid = attr(&one, 1).ok_or(EINVAL)?;
-        if ssid.is_empty() || ssid.len() > 32 {
+        if !pass_all && ssid.is_empty() || ssid.len() > 32 {
             return Err(EINVAL);
         }
         let rssi_threshold_dbm = attr(&one, 2)
@@ -2133,6 +2334,7 @@ fn virtual_interface_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
     match command {
@@ -2170,7 +2372,18 @@ fn virtual_interface_handle(
                 .find(|iface| crate::registry::wiphy_index(iface.wiphy_id()) == Some(wiphy))
                 .filter(|iface| super::in_namespace(iface.as_ref(), context.net_ns_id))
                 .ok_or(ENODEV)?;
-            let _admin = authority(&context, radio.as_ref())?;
+            let admin = authority(&context, radio.as_ref())?;
+            if routes_async_control(radio.as_ref(), iftype) {
+                return virtual_async::create(
+                    radio,
+                    admin,
+                    context.net_ns_id,
+                    name.into(),
+                    iftype,
+                    mac,
+                    deferred,
+                );
+            }
             if !radio.supports_virtual_interfaces() {
                 return Err(EOPNOTSUPP);
             }
@@ -2184,7 +2397,20 @@ fn virtual_interface_handle(
             }])
         }
         DEL_INTERFACE => {
-            if attrs.iter().any(|(kind, _)| *kind != 3) {
+            if attrs.iter().any(|(kind, _)| ![3, 153].contains(kind)) {
+                return Err(EOPNOTSUPP);
+            }
+            let (selected, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
+            if selected.control_namespace().is_some()
+                && routes_async_control(selected.as_ref(), selected.current_iftype())
+            {
+                if index.is_some() {
+                    return Err(EINVAL);
+                }
+                let admin = p2p_async::source_authority(&context, selected.as_ref(), deferred)?;
+                return virtual_async::delete(selected, admin, context.net_ns_id, deferred);
+            }
+            if attr(&attrs, 153).is_some() {
                 return Err(EOPNOTSUPP);
             }
             let (_ifindex, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
@@ -2192,12 +2418,30 @@ fn virtual_interface_handle(
             iface
                 .delete_virtual_interface()
                 .map_err(virtual_interface_errno)?;
-            station::unregister_wdev(iface.name());
-            CACHE.lock().retain(|cache| cache.name != iface.name());
+            forget_interface(iface.name());
             Ok(Vec::new())
         }
         _ => Err(EOPNOTSUPP),
     }
+}
+
+/// Drop the nl80211 per-netdev state of a removed interface (its station
+/// wdev and cached connect state).
+pub(super) fn forget_interface(name: &str) {
+    station::unregister_wdev(name);
+    CACHE.lock().retain(|cache| cache.name != name);
+}
+
+/// `NEW_INTERFACE`/`DEL_INTERFACE` routing: the async control path is taken
+/// only when the radio opts in and its `async_control_iftypes` mask holds
+/// `iftype`. With the default mask (`u32::MAX`) this is exactly
+/// `async_control_interfaces()`, preserving existing radios' dispatch.
+pub(crate) fn routes_async_control(radio: &dyn crate::WirelessNetIface, iftype: u32) -> bool {
+    if !radio.async_control_interfaces() {
+        return false;
+    }
+    let mask = radio.async_control_iftypes();
+    mask == u32::MAX || 1u32.checked_shl(iftype).is_some_and(|bit| mask & bit != 0)
 }
 
 fn virtual_interface_errno(error: crate::WirelessError) -> i32 {
@@ -2260,8 +2504,19 @@ fn interface_handle(
             }
             // NL80211_ATTR_MNTR_FLAGS needs a monitor interface.
             const MONITOR: u32 = 6;
-            if attr(&attrs, 23).is_some() && new != MONITOR {
-                return Err(EINVAL);
+            if let Some(raw) = attr(&attrs, 23) {
+                if new != MONITOR {
+                    return Err(EINVAL);
+                }
+                let nested = attributes(raw)?;
+                let mut flags = 0u32;
+                for (kind, data) in nested {
+                    if !(1..=7).contains(&kind) || !data.is_empty() {
+                        return Err(EINVAL);
+                    }
+                    flags |= 1 << kind;
+                }
+                iface.validate_monitor_flags(flags).map_err(mlme_errno)?;
             }
             if new != current {
                 iface.set_iftype(new).map_err(mlme_errno)?;
@@ -2290,7 +2545,12 @@ fn interface_handle(
                     None => iface.ap_station_macs(),
                 }
             } else {
-                let peer = iface.connected_bssid();
+                // An MLO AP station is keyed by the AP MLD address
+                // (`sta->addr`), not by a link BSSID.
+                let peer = iface
+                    .mlo_connection()
+                    .map(|mlo| mlo.ap_mld)
+                    .or_else(|| iface.connected_bssid());
                 let Some(peer) = peer.filter(|peer| wanted.is_none_or(|w| w == *peer)) else {
                     return if dump { Ok(Vec::new()) } else { Err(ENOENT) };
                 };
@@ -2331,6 +2591,16 @@ fn interface_handle(
                 push_attr(&mut attrs, 6, &peer);
                 push_attr(&mut attrs, 46, &0u32.to_ne_bytes()); // NL80211_ATTR_GENERATION
                 push_attr(&mut attrs, 21 | NLA_F_NESTED, &info); // NL80211_ATTR_STA_INFO
+
+                // sta_set_sinfo: `sta->sta.valid_links` sets
+                // mlo_params_valid (association link id, AP MLD address).
+                if let Some(mlo) = (!ap)
+                    .then(|| iface.mlo_connection())
+                    .flatten()
+                    .filter(|mlo| mlo.ap_mld == peer)
+                {
+                    super::push_station_mlo_params(&mut attrs, &mlo);
+                }
                 replies.push(GenlReply {
                     command: NEW_STATION,
                     attrs,
@@ -2760,8 +3030,15 @@ fn mlme_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
+    if command == REGISTER_FRAME && attr(&attrs, 153).is_some() {
+        return p2p_async::register_frame(bytes, context, deferred);
+    }
+    if command == FRAME && attr(&attrs, 153).is_some() {
+        return p2p_async::frame(bytes, context, deferred);
+    }
     let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
     let iface = crate::registry::list()
         .into_iter()
@@ -2770,7 +3047,13 @@ fn mlme_handle(
                 && super::in_namespace(iface.as_ref(), context.net_ns_id)
         })
         .ok_or(ENODEV)?;
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
+    if command == FRAME && p2p_async::netdev_management_supported(iface.as_ref(), true) {
+        return p2p_async::frame(bytes, context, deferred);
+    }
+    if command == REGISTER_FRAME && p2p_async::netdev_management_supported(iface.as_ref(), false) {
+        return p2p_async::register_frame(bytes, context, deferred);
+    }
     let ns = context.net_ns_id;
     if matches!(
         command,
@@ -2782,7 +3065,9 @@ fn mlme_handle(
     }
     // cfg80211 rejects these on a driver that offloads its SME (-EOPNOTSUPP
     // before the op is attempted).
-    if !iface.supports_userspace_mlme() {
+    if !(iface.supports_userspace_mlme()
+        || matches!(iface.current_iftype(), 3 | 9) && iface.supports_ap_userspace_mlme())
+    {
         return Err(EOPNOTSUPP);
     }
     match command {
@@ -2797,6 +3082,16 @@ fn mlme_handle(
             // empty; presence distinguishes a registration from a malformed
             // request.
             let match_prefix = attr(&attrs, 91).ok_or(EINVAL)?;
+            if matches!(iface.current_iftype(), 3 | 9) && iface.ap_control_generation().is_some() {
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    ns,
+                    index,
+                    ap_async::Operation::RegisterFrame(frame_type, match_prefix.to_vec()),
+                );
+            }
             iface
                 .register_mgmt_frame(frame_type, match_prefix)
                 .map_err(mlme_errno)?;
@@ -2820,8 +3115,18 @@ fn mlme_handle(
                 frame: frame.to_vec(),
                 offchannel_ok: attr(&attrs, 108).is_some(),
                 duration: u32_attr(&attrs, 87)?.unwrap_or(0),
+                no_cck: false,
             };
-            let cookie = FRAME_COOKIE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let cookie = FRAME_COOKIE
+                .fetch_update(
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                    |value| (value != 0).then(|| value.checked_add(1)).flatten(),
+                )
+                .map_err(|_| EBUSY)?;
+            if matches!(iface.current_iftype(), 3 | 9) && iface.ap_control_generation().is_some() {
+                return ap_async::defer_frame(iface, admin, deferred, ns, index, cookie, request);
+            }
             narf_scheduler::spawn(run_mlme(
                 iface,
                 ns,
@@ -3140,6 +3445,51 @@ fn ap_handle(
     bytes: &[u8],
     context: RequestContext<'_>,
 ) -> Result<Vec<GenlReply>, i32> {
+    ap_handle_with(command, bytes, context, None)
+}
+
+fn p2p_go_power_save(
+    iface: &dyn crate::WirelessNetIface,
+    attrs: &[(u16, &[u8])],
+) -> Result<Option<crate::P2pGoPowerSave>, i32> {
+    if [162, 163].iter().all(|kind| attr(attrs, *kind).is_none()) {
+        return Ok(None);
+    }
+    if [162, 163]
+        .iter()
+        .any(|kind| attrs.iter().filter(|(id, _)| id == kind).count() > 1)
+    {
+        return Err(EINVAL);
+    }
+    let ctwindow_tu = u8_attr(attrs, 162)?;
+    let opportunistic = u8_attr(attrs, 163)?;
+    if ctwindow_tu.is_some_and(|window| window > 127)
+        || opportunistic.is_some_and(|enabled| enabled > 1)
+        || iface.current_iftype() != 9
+    {
+        return Err(EINVAL);
+    }
+    if !iface.supports_p2p_go_power_save()
+        || iface.ap_control_generation().is_none()
+        || !iface
+            .get_wireless_info()
+            .modes
+            .contains(crate::iface::WirelessModes::P2P)
+        || !iface.p2p_interface_types().contains(&9)
+    {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(Some(crate::P2pGoPowerSave {
+        ctwindow_tu,
+        opportunistic: opportunistic.map(|v| v != 0),
+    }))
+}
+fn ap_handle_with(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
+) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
     let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
     let iface = crate::registry::list()
@@ -3149,19 +3499,36 @@ fn ap_handle(
                 && super::in_namespace(iface.as_ref(), context.net_ns_id)
         })
         .ok_or(ENODEV)?;
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
     if !iface.supports_ap() {
         return Err(EOPNOTSUPP);
     }
     match command {
+        SET_BSS => {
+            // Only the explicitly implemented P2P GO portion is supported.
+            // Other BSS controls retain their existing unsupported route.
+            reject_unknown(&attrs, &[3, 162, 163])?;
+            let settings = p2p_go_power_save(iface.as_ref(), &attrs)?.ok_or(EOPNOTSUPP)?;
+            station::netdev_up(iface.as_ref())?;
+            ap_async::defer(
+                iface,
+                admin,
+                deferred,
+                context.net_ns_id,
+                index,
+                ap_async::Operation::PowerSave(settings),
+            )
+        }
         START_AP => {
-            reject_unknown(
-                &attrs,
-                &[
-                    3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 145, 159, 160, 161, 270, 278, 279,
-                    283, 294, 295, 306, 307, 325,
-                ],
-            )?;
+            let mut allowed = alloc::vec![
+                3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 145, 159, 160, 161, 270, 278, 279, 283,
+                294, 295, 306, 307, 325, 162, 163,
+            ];
+            if iface.ap_control_generation().is_some() {
+                allowed.extend_from_slice(&[68, 73, 74, 75, 76, 102, 103, 204, 264, 286]);
+            }
+            reject_unknown(&attrs, &allowed)?;
+            let p2p_go = p2p_go_power_save(iface.as_ref(), &attrs)?;
             let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -3328,11 +3695,55 @@ fn ap_handle(
                 he_obss_pd,
                 he_bss_color,
             };
+            if iface.ap_control_generation().is_some() {
+                station::netdev_up(iface.as_ref())?;
+                crypto_suites(&attrs, iface.cipher_suites(), 5)?;
+                let suite_list = |kind| -> Result<Option<Vec<u32>>, i32> {
+                    attr(&attrs, kind)
+                        .map(|raw| {
+                            if raw.len() % 4 != 0 {
+                                return Err(EINVAL);
+                            }
+                            Ok(raw
+                                .chunks_exact(4)
+                                .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                                .collect())
+                        })
+                        .transpose()
+                };
+                let settings = crate::ApStartSettings {
+                    auth_type: u32_attr(&attrs, 53)?,
+                    wpa_versions: u32_attr(&attrs, 75)?,
+                    pairwise_ciphers: suite_list(73)?,
+                    group_cipher: u32_attr(&attrs, 74)?,
+                    akms: suite_list(76)?,
+                    control_port: control_port(&attrs, iface.supports_ap_authenticator())?,
+                    p2p_go,
+                };
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::Start(alloc::boxed::Box::new((cfg, settings))),
+                );
+            }
             iface.start_ap(cfg).map_err(mlme_errno)?;
             Ok(Vec::new())
         }
         STOP_AP => {
             reject_unknown(&attrs, &[3])?;
+            if iface.ap_control_generation().is_some() {
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::Stop,
+                );
+            }
             iface.stop_ap().map_err(mlme_errno)?;
             Ok(Vec::new())
         }
@@ -3372,6 +3783,27 @@ fn ap_handle(
             }
             if head.is_some_and(|h| h.len() < 24) {
                 return Err(EINVAL);
+            }
+            if iface.ap_control_generation().is_some() {
+                if fils.is_some()
+                    || unsol_bcast_probe_resp.is_some()
+                    || ftm_responder.is_some()
+                    || he_bss_color.is_some()
+                {
+                    return Err(EOPNOTSUPP);
+                }
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::Beacon(
+                        head.map(|value| value.to_vec()),
+                        tail.map(|value| value.to_vec()),
+                        probe_resp.map(|value| value.to_vec()),
+                    ),
+                );
             }
             if head.is_some() || tail.is_some() || probe_resp.is_some() {
                 iface
@@ -3656,8 +4088,28 @@ fn ap_handle(
                 station_tx_power,
             };
             if command == NEW_STATION {
+                if iface.ap_control_generation().is_some() {
+                    return ap_async::defer(
+                        iface,
+                        admin,
+                        deferred,
+                        context.net_ns_id,
+                        index,
+                        ap_async::Operation::AddStation(sta),
+                    );
+                }
                 iface.add_station(sta).map_err(mlme_errno)?;
             } else {
+                if iface.ap_control_generation().is_some() {
+                    return ap_async::defer(
+                        iface,
+                        admin,
+                        deferred,
+                        context.net_ns_id,
+                        index,
+                        ap_async::Operation::SetStation(sta),
+                    );
+                }
                 iface.set_station(sta).map_err(mlme_errno)?;
             }
             Ok(Vec::new())
@@ -3670,6 +4122,16 @@ fn ap_handle(
                 return Err(EINVAL);
             }
             let reason = u16_attr(&attrs, 54)?.unwrap_or(2);
+            if iface.ap_control_generation().is_some() {
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::DelStation(mac, reason),
+                );
+            }
             iface.del_station(mac, reason).map_err(mlme_errno)?;
             Ok(Vec::new())
         }
@@ -3833,6 +4295,7 @@ async fn execute(
             cred,
             ie,
             owner: _,
+            mlo,
         } => {
             let akm = cred.akm();
             let mut selected = None;
@@ -3925,6 +4388,8 @@ async fn execute(
                     .is_some_and(|current| current != bss.bssid);
                 if roaming {
                     iface.roam(request).await
+                } else if mlo && iface.supports_mlo() {
+                    iface.associate_mlo(request).await
                 } else {
                     iface.associate(request).await
                 }
@@ -3938,7 +4403,16 @@ async fn execute(
             if let Some(index) = wiphy_index(iface.as_ref()) {
                 push_attr(&mut attrs, 1, &index.to_ne_bytes()); // NL80211_ATTR_WIPHY
             }
-            if let Some(address) = selected.map(|b| b.bssid).or(bssid) {
+            // __cfg80211_connect_result: an MLO connection's peer is the
+            // AP MLD (`connected_addr = cr->ap_mld_addr`) and the event
+            // names every requested link with its own status.
+            let multi_link = (status == 0).then(|| iface.mlo_connection()).flatten();
+            let peer = multi_link
+                .as_ref()
+                .map(|mlo| mlo.ap_mld)
+                .or(selected.map(|b| b.bssid))
+                .or(bssid);
+            if let Some(address) = peer {
                 push_attr(&mut attrs, 6, &address);
                 // The offloading driver completed the 4-way handshake (or
                 // SAE + 4-way) before associate() returned: the port is
@@ -3951,6 +4425,9 @@ async fn execute(
                 }
             }
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
+            if let Some(mlo) = &multi_link {
+                super::push_connect_mlo_links(&mut attrs, mlo);
+            }
             if status != 0 {
                 // __cfg80211_connect_result failure: owner cleared.
                 let _ = station::clear_owner_for_link(iface.name(), ns, index);
@@ -4064,6 +4541,23 @@ fn scan_reply(
 ) -> GenlReply {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    scan_reply_with(attrs, bss, information_elements, associated)
+}
+
+/// `nl80211_send_bss` for a wdev without a netdev: the selector is
+/// `NL80211_ATTR_WDEV` (`wdev_id`) instead of `NL80211_ATTR_IFINDEX`.
+fn scan_reply_wdev(wdev: u64, bss: &crate::BssInfo, information_elements: &[u8]) -> GenlReply {
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 153, &wdev.to_ne_bytes());
+    scan_reply_with(attrs, bss, information_elements, false)
+}
+
+fn scan_reply_with(
+    mut attrs: Vec<u8>,
+    bss: &crate::BssInfo,
+    information_elements: &[u8],
+    associated: bool,
+) -> GenlReply {
     let mut nested = Vec::new();
     push_attr(&mut nested, 1, &bss.bssid);
     if associated {

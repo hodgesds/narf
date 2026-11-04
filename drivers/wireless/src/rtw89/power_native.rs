@@ -50,8 +50,45 @@ impl NativeIo {
         }
         self.checked(0x1f3fc, 4, |_, _| ())
     }
+    /// RTL8852C: the same AX PHY offset and `rf_base_addr` {0xe000,
+    /// 0xf000} as B (rtw8852c.c `rtw8852c_chip_info`), so the same last
+    /// direct RF dword bounds the window.
+    /// RTL8851B: the same AX PHY offset; `rf_base_addr` is {0xe000} only
+    /// (rtw8851b.c), but the window is bounded by B's last direct RF dword
+    /// as for B/C (a stricter bound than path A alone needs).
+    pub(super) fn n51_phy_window(&self) -> Result<(), Error> {
+        if self.chip != ChipId::Rtl8851B {
+            return Err(Error::Unsupported);
+        }
+        self.checked(0x1f3fc, 4, |_, _| ())
+    }
+    pub(super) fn c_phy_window(&self) -> Result<(), Error> {
+        if self.chip != ChipId::Rtl8852C {
+            return Err(Error::Unsupported);
+        }
+        self.checked(0x1f3fc, 4, |_, _| ())
+    }
     pub(super) fn b_station_window(&self, indirect: bool) -> Result<(), Error> {
         self.b_phy_window()?;
+        if indirect {
+            self.checked(0x4001c, 4, |_, _| ())?;
+        }
+        Ok(())
+    }
+    /// RTL8851B station window: its PHY window plus, for the nonsecure
+    /// table init, `R_AX_INDIR_ACCESS_ENTRY` words (common AX code).
+    pub(super) fn n51_station_window(&self, indirect: bool) -> Result<(), Error> {
+        self.n51_phy_window()?;
+        if indirect {
+            self.checked(0x4001c, 4, |_, _| ())?;
+        }
+        Ok(())
+    }
+    /// RTL8852C station window: the same PHY window plus, for the
+    /// nonsecure table init, `R_AX_INDIR_ACCESS_ENTRY` (0x40000) words
+    /// (mac.c `rtw89_mac_{d,c}mac_tbl_init` are common AX code).
+    pub(super) fn c_station_window(&self, indirect: bool) -> Result<(), Error> {
+        self.c_phy_window()?;
         if indirect {
             self.checked(0x4001c, 4, |_, _| ())?;
         }

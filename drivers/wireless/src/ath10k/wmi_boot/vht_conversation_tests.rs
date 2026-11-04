@@ -7,11 +7,13 @@ use alloc::boxed::Box;
 /// SERVICE_READY `vht_cap_info`: SGI80 (0x20) and A-MPDU exponent3.
 const LOCAL_VHT: u32 = 0x0180_0020;
 /// Association-request VHT Capabilities body (ath10k_create_vht_cap):
-/// the info word above and one-stream MCS0-9 RX/TX maps.
-const REQUEST: [u8; 12] = [0x20, 0, 0x80, 0x01, 0xfe, 0xff, 0, 0, 0xfe, 0xff, 0, 0];
+/// the info word above and the actual two selected streams' MCS0-9 maps.
+const REQUEST: [u8; 12] = [0x20, 0, 0x80, 0x01, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
 /// AP VHT Capabilities: RX LDPC, SGI80, TX STBC, RX STBC1, exponent7, a
 /// two-stream MCS0-9 RX/TX map and780 Mb/s highest rates.
-const AP_VHT: [u8; 12] = [0xb0, 0x01, 0x80, 0x03, 0xfa, 0xff, 0x0c, 0x03, 0xfa, 0xff, 0x0c, 0x03];
+const AP_VHT: [u8; 12] = [
+    0xb0, 0x01, 0x80, 0x03, 0xfa, 0xff, 0x0c, 0x03, 0xfa, 0xff, 0x0c, 0x03,
+];
 
 fn pair(f: u16) -> u16 {
     match f {
@@ -39,7 +41,15 @@ fn elements(primary: u16, forty: bool, width: u8) -> Vec<u8> {
     v.extend_from_slice(&[191, 12]);
     v.extend_from_slice(&AP_VHT);
     let center = if primary < 5500 { 42 } else { 155 };
-    v.extend_from_slice(&[192, 5, width, if width == 1 { center } else { 0 }, 0, 0xfc, 0xff]);
+    v.extend_from_slice(&[
+        192,
+        5,
+        width,
+        if width == 1 { center } else { 0 },
+        0,
+        0xfc,
+        0xff,
+    ]);
     v
 }
 /// `width`: 0 = VHT20, 1 = VHT40, 2 = VHT80 selected by the AP.
@@ -73,14 +83,18 @@ pub(super) fn enable(h: &Harness, width: u8) -> Result<(), &'static str> {
         // HT facts match the HT40 local profile (no SGI40, SGI20 kept).
         f.ht_capabilities = if width > 0 { 0x002e } else { 0x002c };
         f.ht_sgi = true;
+        f.ht_peer_nss = 2;
         f.vht = Some(Box::new(VhtExpect {
             width,
+            center2: None,
+            wide_override: 0,
+            half_dbm: 54,
             request: REQUEST,
             // mac80211 masking: RX LDPC, exponent7 kept; SGI80 symmetric;
             // the AP's TX STBC needs our (absent) RX STBC promise.
             capabilities: 0x0380_0030,
-            // rx: AP RX map ∩ our TX (1SS MCS0-9); tx: AP TX ∩ our RX.
-            rates: [780, 0xfffe, 780, 0xfffe],
+            // rx: AP RX map ∩ our TX (2SS MCS0-9); tx: AP TX ∩ our RX.
+            rates: [780, 0xfffa, 780, 0xfffa],
             max_mpdu: (1 << 20) - 1,
         }));
         f.rx_phy = Some((12, u32::from(width), 0x90));
@@ -245,6 +259,10 @@ fn smoke_ath10k_vht_denied_segment_or_no_vht_fact_falls_back_without_vht_element
             h.model(|m| {
                 let f = m.data.as_mut().unwrap();
                 f.vht = None;
+                // The remaining actual HT AP map is MCS0..7 only. Its
+                // HT-only PEER_ASSOC has NSS1 even though local chains and
+                // the discarded VHT map legitimately support two streams.
+                f.ht_peer_nss = 1;
                 f.rx_phy = Some((8, 0x87, 0));
             });
             h.join()?;
@@ -276,12 +294,12 @@ kernel_test_in!(
 );
 
 fn smoke_ath10k_vht80_ppdu_admits_only_promised_bandwidth_stream_coding_and_mcs() -> TestResult {
-    // (preamble, VHT-SIG-A1, VHT-SIG-A2): TXBF, MU group, two streams,
+    // (preamble, VHT-SIG-A1, VHT-SIG-A2): TXBF, MU group, three streams,
     // STBC without our RX STBC, LDPC without our RX LDPC, bw160, MCS10.
     let refused: [(u8, u32, u32); 7] = [
         (13, 2, 0x90),
         (12, 2 | 5 << 4, 0x90),
-        (12, 2 | 1 << 10, 0x90),
+        (12, 2 | 2 << 10, 0x90),
         (12, 2 | 8 | 1 << 10, 0x90),
         (12, 2, 0x94),
         (12, 3, 0x90),
@@ -298,8 +316,8 @@ fn smoke_ath10k_vht80_ppdu_admits_only_promised_bandwidth_stream_coding_and_mcs(
                 return Err("unpromised VHT PPDU escaped");
             }
         }
-        // SGI80 is promised; the refused PPDUs consumed no CCMP PN.
-        rx(&h, bytes.clone(), 12, 2, 0x91);
+        // Two streams and SGI80 are promised; refused PPDUs consumed no PN.
+        rx(&h, bytes.clone(), 12, 2 | 1 << 10, 0x91);
         if !h.received(&down) {
             return Err("promised VHT80 SGI PPDU refused or PN consumed");
         }
@@ -331,10 +349,11 @@ fn smoke_ath10k_vht80_response_without_vht_or_changed_width_never_publishes_peer
                         v[op] = 0;
                         v[op + 1] = 0;
                     }
-                    // Basic VHT-MCS set requiring two streams.
+                    // Basic VHT-MCS set requiring three streams. The
+                    // actual initialized two-stream source admits0xfff0.
                     _ => {
                         let basic = v.len() - 2;
-                        v[basic] = 0xf0;
+                        v[basic] = 0xc0;
                     }
                 }
             });

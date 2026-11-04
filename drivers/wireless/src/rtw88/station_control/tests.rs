@@ -63,38 +63,64 @@ unsafe impl Io for Model {
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Err(Error::State)
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        Ok(self.regs[usize::from(r)])
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { Ok(self.regs[usize::from(r)]) }
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        let p = usize::from(r);
-        Ok(u16::from_le_bytes(self.regs[p..p + 2].try_into().unwrap()))
-    }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        Ok(self.word(usize::from(r)))
-    }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.writes.push(r);
-        if self.ignore_write != Some(r) {
-            self.regs[usize::from(r)] = v;
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move {
+            let p = usize::from(r);
+            Ok(u16::from_le_bytes(self.regs[p..p + 2].try_into().unwrap()))
         }
-        Ok(())
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        let p = usize::from(r);
-        self.regs[p..p + 2].copy_from_slice(&v.to_le_bytes());
-        Ok(())
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { Ok(self.word(usize::from(r))) }
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.writes.push(r);
-        let p = usize::from(r);
-        if self.ignore_write != Some(r) {
-            self.regs[p..p + 4].copy_from_slice(&v.to_le_bytes());
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.writes.push(r);
+            if self.ignore_write != Some(r) {
+                self.regs[usize::from(r)] = v;
+            }
+            Ok(())
         }
-        if self.restrict_after == Some(r) {
-            self.allowed = false;
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            let p = usize::from(r);
+            self.regs[p..p + 2].copy_from_slice(&v.to_le_bytes());
+            Ok(())
         }
-        Ok(())
+    }
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.writes.push(r);
+            let p = usize::from(r);
+            if self.ignore_write != Some(r) {
+                self.regs[p..p + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            if self.restrict_after == Some(r) {
+                self.allowed = false;
+            }
+            Ok(())
+        }
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::State)
@@ -121,35 +147,49 @@ unsafe impl Io for Model {
     fn mailbox_pending(&self) -> bool {
         self.pending
     }
-    fn mailbox_ready(&mut self) -> Result<bool, Error> {
-        if self.pending {
-            Err(Error::State)
-        } else {
-            Ok(!self.ready_hold)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_ready(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if self.pending {
+                Err(Error::State)
+            } else {
+                Ok(!self.ready_hold)
+            }
         }
     }
-    fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
-        if !self.mailbox_ready()? {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_submit(
+        &mut self,
+        words: [u8; 8],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            if !self.mailbox_ready().await? {
+                return Err(Error::State);
+            }
+            if words != [1, 0, 0, 0, 0, 0, 0, 0] {
+                self.station_allowed()?;
+            }
+            self.pending = true;
+            self.commands.push(words);
+            self.slots.push(self.cursor);
+            Ok(())
         }
-        if words != [1, 0, 0, 0, 0, 0, 0, 0] {
-            self.station_allowed()?;
-        }
-        self.pending = true;
-        self.commands.push(words);
-        self.slots.push(self.cursor);
-        Ok(())
     }
-    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
-        if !self.pending {
-            return Err(Error::State);
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn mailbox_consumed(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
+        async move {
+            if !self.pending {
+                return Err(Error::State);
+            }
+            if self.consumed_hold {
+                return Ok(false);
+            }
+            self.pending = false;
+            self.cursor = (self.cursor + 1) % 4;
+            Ok(true)
         }
-        if self.consumed_hold {
-            return Ok(false);
-        }
-        self.pending = false;
-        self.cursor = (self.cursor + 1) % 4;
-        Ok(true)
     }
     async fn delay_us(&mut self, _: u64) {
         if let Some(close) = self.close.take() {
@@ -176,7 +216,7 @@ fn smoke_rtw8822ce_station_controls_bind_source_port_peer_and_real_mailbox_consu
             }
         }
         prepare_peer(&mut io, peer, &admission).await?;
-        commit_peer(&mut io, peer, 42, true, &admission).await
+        commit_peer(&mut io, peer, 42, true, false, &admission).await
     });
     if result.is_err()
         || io.commands != LINUX_MAILBOX
@@ -218,7 +258,8 @@ fn smoke_rtw8822ce_station_dcf_matches_original_non_qos_defaults_and_fails_close
         for register in [0x500usize, 0x504, 0x508, 0x50c] {
             io.regs[register..register + 4].copy_from_slice(&0xf8ff_ffffu32.to_le_bytes());
         }
-        if configure_dcf(&mut io, short, &Admission::new()).is_err()
+        if crate::rtw88::firmware_transport::now(configure_dcf(&mut io, short, &Admission::new()))
+            .is_err()
             || [0x500, 0x504, 0x508, 0x50c]
                 .into_iter()
                 .zip(expected)
@@ -229,10 +270,30 @@ fn smoke_rtw8822ce_station_dcf_matches_original_non_qos_defaults_and_fails_close
             return TestResult::Fail("non-QoS CCK DCF differs from original mac80211/rtw88 output");
         }
     }
+    // 5GHz: rtw_aifsn_to_aifs SIFS16 and the mac80211 forced short slot,
+    // whatever the AP's Short Slot Time bit says.
+    for short in [false, true] {
+        let mut io = Model::new();
+        if crate::rtw88::firmware_transport::now(configure_dcf_in(
+            &mut io,
+            short,
+            true,
+            &Admission::new(),
+        ))
+        .is_err()
+            || [0x500, 0x504, 0x508, 0x50c]
+                .into_iter()
+                .any(|r| io.word(r) & 0x07ff_ffff != (10 << 12) | (5 << 8) | 34)
+            || io.regs[0x51b] != 9
+        {
+            return TestResult::Fail("5GHz DCF must use SIFS16 and the short slot");
+        }
+    }
     for lost in [0x500, 0x504, 0x508, 0x50c, 0x51b] {
         let mut io = Model::new();
         io.ignore_write = Some(lost);
-        if configure_dcf(&mut io, false, &Admission::new()) != Err(Error::Prerequisite)
+        if crate::rtw88::firmware_transport::now(configure_dcf(&mut io, false, &Admission::new()))
+            != Err(Error::Prerequisite)
             || io.writes.last() != Some(&lost)
             || !io.commands.is_empty()
         {
@@ -244,18 +305,22 @@ fn smoke_rtw8822ce_station_dcf_matches_original_non_qos_defaults_and_fails_close
     let mut io = Model::new();
     let closed = Admission::new();
     closed.close();
-    if configure_dcf(&mut io, false, &closed) != Err(Error::State) || !io.writes.is_empty() {
+    if crate::rtw88::firmware_transport::now(configure_dcf(&mut io, false, &closed))
+        != Err(Error::State)
+        || !io.writes.is_empty()
+    {
         return TestResult::Fail("closed admission published new DCF parameters");
     }
     io.cap.revoke();
-    if configure_dcf(&mut io, false, &Admission::new()) != Err(Error::Access)
+    if crate::rtw88::firmware_transport::now(configure_dcf(&mut io, false, &Admission::new()))
+        != Err(Error::Access)
         || !io.writes.is_empty()
     {
         return TestResult::Fail("revoked calibration authority published DCF parameters");
     }
     let mut io = Model::new();
     io.restrict_after = Some(0x500);
-    if configure_dcf(&mut io, false, &Admission::new())
+    if crate::rtw88::firmware_transport::now(configure_dcf(&mut io, false, &Admission::new()))
         != Err(Error::Power(crate::rtw88::power_policy::Error::Policy))
         || io.writes != [0x500]
         || io.regs[0x51b] != 0
@@ -287,7 +352,7 @@ fn smoke_rtw8822ce_station_control_close_cancel_revocation_and_missing_receipts_
     let mut io = Model::new();
     io.consumed_hold = true;
     io.close = Some(admission.clone());
-    if narf_scheduler::block_on(commit_peer(&mut io, peer, 42, false, &admission))
+    if narf_scheduler::block_on(commit_peer(&mut io, peer, 42, false, false, &admission))
         != Err(Error::State)
         || io.commands != [[1, 1, 0, 0, 0, 0, 0, 0]]
         || !io.pending

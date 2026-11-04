@@ -237,3 +237,164 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_rf_synth_fail_cancel_and_lock_deadline_are_terminal
 );
+/// Linux rtw8852b_rfk.c `_ctrl_ch`/`_ch_setting`: FIELD_PREP(RR_CFGCH_CH,
+/// central_ch) on A/B DAV then A/B DDV words, 2.4GHz band bits clear.
+fn smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let Some(&(seed, lock, busy, count, hash)) = CASES.first() else {
+        return TestResult::Fail("RF frozen reference cases");
+    };
+    for primary in 1..=13u8 {
+        let Some(profile) = Profile::new(Band::Ghz2, primary) else {
+            return TestResult::Fail("typed2.4GHz primary refused");
+        };
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned RF words; no native caller or grant.
+        let result = ready(unsafe { owner.prepare_for_channel(&mut io, profile) });
+        if result != Some(Ok(())) || owner.state() != State::SynthConfigured {
+            return TestResult::Fail("noninitial primary RF synth/readback failed");
+        }
+        if io.count != count || (primary == 1) != (io.hash == hash) {
+            return TestResult::Fail("RF synth stream is not the source order for this primary");
+        }
+        for p in 0..2 {
+            for a in [RR_CFGCH, RR_CFGCH_V1] {
+                let word = io.rf[p][Model::slot(a)];
+                if word & RR_CFGCH_CH != u32::from(primary)
+                    || word & (RR_CFGCH_BAND0 | RR_CFGCH_BAND1) != 0
+                {
+                    return TestResult::Fail("RF channel word lost the actual 2.4GHz primary");
+                }
+            }
+        }
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        io.ignore = true;
+        let mut owner = Channel::default();
+        // SAFETY: inert model that drops writes; readback must refuse readiness.
+        if ready(unsafe { owner.prepare_for_channel(&mut io, profile) }).is_none_or(|r| r.is_ok())
+            || owner.state() == State::SynthConfigured
+        {
+            return TestResult::Fail("ignored RF primary programming became ready");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rf_synth_tunes_and_reads_back_each_actual_primary
+);
+/// Linux rtw8852b_rfk.c `_ch_setting` for every typed 5GHz 20MHz primary:
+/// CFGCH channel plus `CFGCH_BAND1_5G`/`CFGCH_BAND0_5G`, 20MHz BW and the
+/// critical all-path DAV/DDV readback.
+fn smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let Some(&(seed, lock, busy, count, _)) = CASES.first() else {
+        return TestResult::Fail("RF frozen reference cases");
+    };
+    for primary in super::super::operating_channel::GHZ5 {
+        let Some(profile) = Profile::new(Band::Ghz5, primary) else {
+            return TestResult::Fail("typed5GHz primary refused");
+        };
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned RF words; no native caller or grant.
+        let result = ready(unsafe { owner.prepare_for_channel(&mut io, profile) });
+        if result != Some(Ok(())) || owner.state() != State::SynthConfigured || io.count != count {
+            return TestResult::Fail("5GHz primary RF synth/readback failed");
+        }
+        for p in 0..2 {
+            for a in [RR_CFGCH, RR_CFGCH_V1] {
+                let word = io.rf[p][Model::slot(a)];
+                if word & RR_CFGCH_CH != u32::from(primary)
+                    || word & RR_CFGCH_BAND0 != 0x100
+                    || word & RR_CFGCH_BAND1 != 0x10000
+                    || word & RR_CFGCH_BW != 0xc00
+                {
+                    return TestResult::Fail("RF channel word lost the 5GHz band/primary bits");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rf_synth_tunes_5ghz_band_bits_for_each_primary
+);
+/// rtw8852b_rfk.c `rtw8852b_ctrl_bw_ch`: `_ctrl_ch(chan->channel)` tunes the
+/// center channel, `_bw_setting` sets CFGCH_BW_40M/80M on every DAV/DDV word
+/// and `_set_rxbb_bw` writes the per-width RXBB LUT, readback-gated.
+fn smoke_rtw89_b_rf_synth_tunes_wide_center_and_bandwidth_bits() -> TestResult {
+    use super::super::operating_channel::Width;
+    let Some(&(seed, lock, busy, count, _)) = CASES.first() else {
+        return TestResult::Fail("RF frozen reference cases");
+    };
+    let rows = [
+        (Profile::new_2ghz_40(1, true), 0x800),
+        (Profile::new_5ghz(36, Width::Mhz40), 0x800),
+        (Profile::new_5ghz(149, Width::Mhz80), 0x400),
+    ];
+    for (profile, bw) in rows {
+        let Some(profile) = profile else {
+            return TestResult::Fail("wide chandef refused");
+        };
+        let mut io = Model::new(seed, lock, u16::from(busy));
+        let mut owner = Channel::default();
+        // SAFETY: inert exclusively owned RF words; no native caller or grant.
+        let result = ready(unsafe { owner.prepare_for_channel(&mut io, profile) });
+        if result != Some(Ok(())) || owner.state() != State::SynthConfigured || io.count != count {
+            return TestResult::Fail("wide RF synth/readback failed");
+        }
+        for p in 0..2 {
+            for a in [RR_CFGCH, RR_CFGCH_V1] {
+                let word = io.rf[p][Model::slot(a)];
+                if word & RR_CFGCH_CH != u32::from(profile.center())
+                    || word & RR_CFGCH_BW != bw
+                    || word & RR_CFGCH_BW2 == 0
+                {
+                    return TestResult::Fail("RF word lost the wide center/bandwidth bits");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_rf_synth_tunes_wide_center_and_bandwidth_bits
+);
+/// rtw8851b_rfk.c `rtw8851b_set_channel_rf`: path A only (both RR_CFGCH
+/// words and RXBB LB), path B never touched.
+fn smoke_rtw89_n51_rf_channel_programs_path_a_only() -> TestResult {
+    let Some(profile) = Profile::new_5ghz(36, Width::Mhz80) else {
+        return TestResult::Fail("5GHz 80MHz profile refused");
+    };
+    let mut io = Model::new(0x5a, 0, 0);
+    let untouched = io.rf[1];
+    let mut owner = Channel::default();
+    // SAFETY: owned inert RF model only.
+    if ready(unsafe { owner.prepare_for_channel_51(&mut io, profile) }) != Some(Ok(()))
+        || owner.state() != State::SynthConfigured
+    {
+        return TestResult::Fail("RTL8851B RF channel failed on a ready model");
+    }
+    if io.rf[1] != untouched {
+        return TestResult::Fail("RTL8851B RF channel wrote RF path B");
+    }
+    let bw = (CFGCH_BW_80M << RR_CFGCH_BW.trailing_zeros()) & RR_CFGCH_BW;
+    for a in [RR_CFGCH, RR_CFGCH_V1] {
+        let word = io.rf[0][Model::slot(a)];
+        if word & RR_CFGCH_CH != 42 || word & RR_CFGCH_BW != bw || word & RR_CFGCH_BW2 == 0 {
+            return TestResult::Fail("RTL8851B path-A RF word differs from _ch/_bw_setting");
+        }
+    }
+    if io.rf[0][Model::slot(RR_LUTWD0)] & RR_LUTWD0_LB != 0xb {
+        return TestResult::Fail("RTL8851B RXBB 80MHz LB differs from _set_rxbb_bw");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_n51_rf_channel_programs_path_a_only
+);

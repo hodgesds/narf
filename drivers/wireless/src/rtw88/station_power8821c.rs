@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;
-use narf_wireless::reg::{RegFlags, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 fn denied(error: QError) -> Error {
     Error::Calibration8821c(error)
 }
@@ -16,6 +16,7 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    pub host: super::phy8821c::Host,
 }
 pub(super) fn request(power: operating8821c::Info, mac: [u8; 6]) -> Request {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -43,9 +44,16 @@ pub(super) fn request(power: operating8821c::Info, mac: [u8; 6]) -> Request {
         identity: hash.finalize(),
         mac,
         filename: format!(
-            "rtw88/rtw8821ce-station-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "rtw88/{}-station-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            power.host.family(),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         ),
+        host: power.host,
     }
 }
 pub(super) enum Source {
@@ -116,8 +124,46 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn factory_limits(&self) -> [u8; 2] {
+        self.power.factory_limits()
+    }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         self.power.ht_facts()
+    }
+    /// Factory HT20 1S index ceiling for one 2.4GHz channel group.
+    pub(super) fn ht_group(&self, group: usize) -> Option<u8> {
+        self.power.ht_group(group)
+    }
+    /// Factory HT40 1S index ceiling for one 2.4GHz channel group.
+    pub(super) fn ht40_group(&self, group: usize) -> Option<u8> {
+        self.power.ht40_group(group)
+    }
+    /// Factory VHT80 1S index ceiling for one 5GHz channel group.
+    pub(super) fn vht80_group(&self, group: usize) -> Option<u8> {
+        self.power.vht80_group(group)
+    }
+    /// Factory 5GHz HT40 1S index ceiling for one 5GHz channel group.
+    pub(super) fn ht40_5_group(&self, group: usize) -> Option<u8> {
+        self.power.ht40_5_group(group)
+    }
+    pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
+        self.power.band_facts()
+    }
+    /// Factory OFDM index ceiling for one 5GHz channel group.
+    pub(super) fn band5_group(&self, group: usize) -> Option<u8> {
+        self.power.band5_group(group)
+    }
+    /// Factory 5GHz HT20 1S index ceiling for one 5GHz channel group.
+    pub(super) fn ht5_group(&self, group: usize) -> Option<u8> {
+        self.power.ht5_group(group)
+    }
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub(super) fn host(&self) -> super::phy8821c::Host {
+        self.request.host
+    }
+    /// Factory CCK/OFDM index ceilings for one 2.4GHz channel group.
+    pub(super) fn group_limits(&self, group: usize) -> Option<[u8; 2]> {
+        self.power.group_limits(group)
     }
     fn decode(
         raw: &[u8],
@@ -132,7 +178,7 @@ impl Grant {
             || &raw[..4] != b"N21S"
             || raw[4..8] != [1, 0, 128, 0]
             || raw[8..12] != 128u32.to_le_bytes()
-            || raw[12..16] != [0xec, 0x10, 0x21, 0xc8]
+            || raw[12..16] != request.host.header()
             || raw[54..56] != [1, 20]
             || &raw[68..70] != b"US"
             || raw[70..] != [0; 58]
@@ -190,6 +236,7 @@ impl Grant {
             self.digest,
             self.indices(),
             self.own(),
+            self.host(),
         )
     }
     pub(super) fn extension_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
@@ -215,14 +262,11 @@ impl Grant {
         }
         let mut limit = self.ceiling.min(80);
         let mut covering = false;
-        for r in &domain.rules {
+        for (i, r) in domain.rules.iter().enumerate() {
             if r.freq_start_mhz >= 2422 || r.freq_end_mhz <= 2402 {
                 continue;
             }
-            if r.freq_start_mhz >= r.freq_end_mhz
-                || r.max_bandwidth_mhz < 20
-                || r.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-            {
+            if !super::channel_policy::plain_rule(domain, i, 20) {
                 return Err(denied(QError::Policy));
             }
             covering |= r.freq_start_mhz <= 2402 && r.freq_end_mhz >= 2422;

@@ -61,6 +61,10 @@ impl Native {
         &mut self,
         b: &[Vec<u8>],
     ) -> Result<Vec<u64>, packet::Error> {
+        if self.retune_active() {
+            return Err(packet::Error::State);
+        }
+        self.passive_tx_allowed().map_err(access_error)?;
         self.with_packet(|core, port| core.submit_batch(port, b))
     }
     pub(in crate::rtw88) fn configure_packet_profile(
@@ -77,6 +81,7 @@ impl Native {
         if !matches!(self.state, State::Calibrated | State::Packets) {
             return Err(packet::Error::State);
         }
+        self.check_packet_permission().map_err(access_error)?;
         let gate = self.packet_gate.clone().ok_or(packet::Error::Access)?;
         let result = gate
             .invoke(|| {
@@ -117,7 +122,7 @@ impl Native {
             }
         }
     }
-    fn with_packet<T>(
+    pub(super) fn with_packet<T>(
         &mut self,
         operation: impl FnOnce(&mut Core, &mut Self) -> Result<T, packet::Error>,
     ) -> Result<T, packet::Error> {
@@ -146,6 +151,10 @@ impl Native {
         frame: &[u8],
         radio_report: bool,
     ) -> Result<u64, packet::Error> {
+        if self.retune_active() {
+            return Err(packet::Error::State);
+        }
+        self.passive_tx_allowed().map_err(access_error)?;
         self.with_packet(|core, port| core.submit(port, frame, radio_report))
     }
     pub(in crate::rtw88) fn scan_packet_address(
@@ -179,9 +188,43 @@ unsafe impl Port for Native {
             .as_ref()
             .is_some_and(crate::rtw88::power_policy::Gate::allows_tx_ba)
     }
+    fn originator_ba_tids(&self) -> u8 {
+        self.packet_gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::tx_grant)
+            .map_or(0, |g| g.tids())
+    }
+    fn batch_allowed(
+        &mut self,
+        tid: u8,
+        profile: format::DataProfile,
+    ) -> Result<(), packet::Error> {
+        if tid >= 6
+            || self.originator_ba_tids() & (1 << tid) == 0
+            || self
+                .packet_gate
+                .as_ref()
+                .is_none_or(|g| !g.allows_profile(profile))
+            || profile.tid_queue(tid).is_none()
+        {
+            return Err(packet::Error::Access);
+        }
+        self.transmit_allowed()
+    }
+    fn batch_publication<T>(
+        &mut self,
+        profile: format::DataProfile,
+        operation: impl FnOnce(&mut Self) -> Result<T, packet::Error>,
+    ) -> Result<T, packet::Error> {
+        let gate = self.packet_gate.clone().ok_or(packet::Error::Access)?;
+        gate.invoke_batch(profile, || Ok(operation(self)))
+            .map_err(access_error)?
+    }
     fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, packet::Error> {
         match self.device.id.device {
-            0xc821 => Ok(crate::rtw88::packet_phy::Chip::C21),
+            // rtw8822b.h GET_PHY_STAT_P0/P1_* (page, RXSC, RF_MODE word 3
+            // bits 29:28) equal rtw8821c.h; 8822B also reports no channel.
+            0xc821 | 0xb822 => Ok(crate::rtw88::packet_phy::Chip::C21),
             0xc822 => Ok(crate::rtw88::packet_phy::Chip::C22),
             _ => Err(packet::Error::Packet),
         }
@@ -192,6 +235,11 @@ unsafe impl Port for Native {
             .is_some_and(crate::rtw88::power_policy::Gate::allows_rx_ba)
     }
     fn transmit_allowed(&mut self) -> Result<(), packet::Error> {
+        // A halted owner (`rtw_hci_stop`) or the firmware-swap window admits
+        // no packet work until `restart_packets` / `end_swap`.
+        if matches!(self.state, State::Halted | State::Swap) {
+            return Err(packet::Error::State);
+        }
         self.check_packet_permission().map_err(access_error)
     }
     fn memory<T>(
@@ -464,8 +512,17 @@ fn smoke_rtw8822ce_native_packet_revocation_precedes_cpu_dma_config_and_mmio(
         command_ring: Default::default(),
         packet: None,
         packet_gate: None,
+        passive_tx: None,
         mailbox_cursor: 0,
         mailbox_pending: false,
+        tracking_maintenance: false,
+        tracking_sequence: 3,
+        retune: None,
+        widening: false,
+        wide: false,
+        halted_from: None,
+        channel: 1,
+        channel_epoch: 1,
     };
     cap.revoke();
     // Invalid physical config/BAR and absent allocations are deliberate. The

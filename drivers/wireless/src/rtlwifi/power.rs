@@ -311,26 +311,11 @@ const fn pci_end() -> WlanPwrCfg {
     )
 }
 
-/// RTL8192EE Cardemu→Active power-on flow.
-///
-/// Source: `rtl8192ee/pwrseq.h::RTL8192E_TRANS_CARDEMU_TO_ACT`.
-pub static RTL8192EE_PWR_ON: &[WlanPwrCfg] = &[
-    // disable HWPDN 0x04[15]=0
-    pci_w(0x0005, 1 << 7, 0),
-    // disable SW LPS 0x04[10]=0
-    pci_w(0x0005, 1 << 2, 0),
-    // disable WL suspend 0x04[12:11]=00
-    pci_w(0x0005, (1 << 4) | (1 << 3), 0),
-    // wait till 0x04[17] = 1   power ready
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    // release WLON reset 0x04[16]=1
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    // 0x04[0]=1
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    // polling until return 0
-    pci_p(0x0005, 1 << 0, 0),
-    pci_end(),
-];
+/// Exact RTL8192EE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
+/// Linux `rtl8192ee/hw.c::_rtl92ee_init_mac` runs `RTL8192E_NIC_ENABLE_FLOW`
+/// (`pwrseq.c::rtl8192E_card_enable_flow`) with all-cut/all-fab/PCI masks;
+/// USB/SDIO-only rows are omitted.
+pub static RTL8192EE_PWR_ON: &[WlanPwrCfg] = super::rtl8192ee::pwrseq::RTL8192E_CARD_ENABLE_FLOW;
 
 /// Complete RTL8188EE PCI NIC-enable flow, including CardDisabled→CardEmu.
 /// Linux rtl8188ee/pwrseq.c::rtl8188ee_card_enable_flow and pwrseq.h.
@@ -350,35 +335,23 @@ pub static RTL8188EE_PWR_ON: &[WlanPwrCfg] = &[
     pci_end(),
 ];
 
-/// RTL8723BE Cardemu→Active power-on flow.  Source:
-/// `rtl8723be/pwrseq.h::RTL8723BE_TRANS_CARDEMU_TO_ACT`.
-pub static RTL8723BE_PWR_ON: &[WlanPwrCfg] = &[
-    pci_w(0x0005, 1 << 7, 0),
-    pci_w(0x0005, 1 << 2, 0),
-    pci_w(0x0005, (1 << 4) | (1 << 3), 0),
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    pci_p(0x0005, 1 << 0, 0),
-    pci_end(),
-];
+/// Exact RTL8723AE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
+/// Linux `rtl8723ae/hw.c::_rtl8712e_init_mac` runs `RTL8723_NIC_ENABLE_FLOW`
+/// (`pwrseq.c::rtl8723A_card_enable_flow`) with all-cut/all-fab/PCI masks;
+/// SDIO-only rows are omitted.
+pub static RTL8723AE_PWR_ON: &[WlanPwrCfg] = super::rtl8723ae::pwrseq::RTL8723A_CARD_ENABLE_FLOW;
 
-/// RTL8821AE Cardemu→Active power-on flow.  Source:
-/// `rtl8821ae/pwrseq.h::RTL8812_TRANS_CARDEMU_TO_ACT`.
-pub static RTL8821AE_PWR_ON: &[WlanPwrCfg] = &[
-    // 0x20[0]=1  enable LDO
-    pci_w(0x0020, 1 << 0, 1 << 0),
-    // 0x67[0]=0
-    pci_w(0x0067, 1 << 0, 0),
-    pci_w(0x0005, 1 << 7, 0),
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    pci_w(0x0005, (1 << 4) | (1 << 3), 0),
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    pci_p(0x0005, 1 << 0, 0),
-    pci_w(0x0023, 1 << 4, 1 << 4),
-    pci_end(),
-];
+/// Exact RTL8723BE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
+/// Linux `rtl8723be/hw.c::_rtl8723be_init_mac` runs `RTL8723_NIC_ENABLE_FLOW`
+/// (`pwrseq.c::rtl8723B_card_enable_flow`) with all-cut/all-fab/PCI masks;
+/// USB/SDIO-only rows are omitted.
+pub static RTL8723BE_PWR_ON: &[WlanPwrCfg] = super::rtl8723be::pwrseq::RTL8723B_CARD_ENABLE_FLOW;
+
+/// Exact RTL8821AE PCI NIC-enable flow (CardDisabled→CardEmu→Active).
+/// Linux `rtl8821ae/hw.c::_rtl8821ae_init_mac` runs
+/// `RTL8821A_NIC_ENABLE_FLOW` (`pwrseq.c::rtl8821A_card_enable_flow`) with
+/// all-cut/all-fab/PCI masks; USB/SDIO-only rows are omitted.
+pub static RTL8821AE_PWR_ON: &[WlanPwrCfg] = super::rtl8821ae::pwrseq::RTL8821A_CARD_ENABLE_FLOW;
 
 /// RTL8192CE Cardemu→Active power-on flow.  Source:
 /// `rtl8192ce/pwrseq.h::RTL8192C_TRANS_CARDEMU_TO_ACT`.
@@ -398,9 +371,14 @@ pub fn power_on_table_for(did: u16) -> Option<&'static [WlanPwrCfg]> {
     use super::regs::*;
     match did {
         RTL_DEV_8188EE => Some(RTL8188EE_PWR_ON),
-        RTL_DEV_8192CE | RTL_DEV_8192CE_ALT | RTL_DEV_8192DE => Some(RTL8192CE_PWR_ON),
+        // RTL8192CE / 8188CE have no pwrseq table: Linux reads the chip
+        // version and EFUSE at probe without a power-on step and powers the
+        // MAC in `rtl92ce_hw_init` (`_rtl92ce_init_mac`,
+        // `rtl8192ce::power::power_on`, run by the firmware owner).
+        RTL_DEV_8192DE => Some(RTL8192CE_PWR_ON),
         RTL_DEV_8192EE => Some(RTL8192EE_PWR_ON),
-        RTL_DEV_8723AE | RTL_DEV_8723BE => Some(RTL8723BE_PWR_ON),
+        RTL_DEV_8723AE => Some(RTL8723AE_PWR_ON),
+        RTL_DEV_8723BE => Some(RTL8723BE_PWR_ON),
         RTL_DEV_8821AE => Some(RTL8821AE_PWR_ON),
         _ => None,
     }
@@ -418,13 +396,60 @@ pub fn power_on_with(io: &impl Io, did: u16) -> Result<(), PwrSeqError> {
         io.write8(5, value & !0x80)?;
         io.write8(0x1c, 0)?;
     }
-    run_with(
-        io,
-        PWR_CUT_ALL_MSK,
-        PWR_FAB_ALL_MSK,
-        PWR_INTF_PCI_MSK,
-        table,
-    )
+    // rtl8821ae/hw.c::_rtl8821ae_init_mac: unlock REG_RSV_CTRL, clear the
+    // auto-power-down bit (APS_FSMCO[15]) and parse the enable flow with
+    // PWR_CUT_A_MSK, which skips the test-chip-only 0x7a BT-start row.
+    if did == super::regs::RTL_DEV_8192EE {
+        rtl8192ee_init_mac_prefix(io)?;
+    }
+    // rtl8723ae/hw.c::_rtl8712e_init_mac: unlock REG_RSV_CTRL before the
+    // enable flow (the post-flow segment runs in the firmware owner).
+    if did == super::regs::RTL_DEV_8723AE {
+        io.write8(0x1c, 0)?;
+    }
+    // rtl8723be/hw.c::_rtl8723be_init_mac: unlock REG_RSV_CTRL and clear
+    // the auto-power-down bit (APS_FSMCO[15]) before the enable flow.
+    if did == super::regs::RTL_DEV_8723BE {
+        io.write8(0x1c, 0)?;
+        let value = io.read8(5)?;
+        io.write8(5, value & !0x80)?;
+    }
+    let cut = if did == super::regs::RTL_DEV_8821AE {
+        io.write8(0x1c, 0)?;
+        let value = io.read8(5)?;
+        io.write8(5, value & !0x80)?;
+        PWR_CUT_A_MSK
+    } else {
+        PWR_CUT_ALL_MSK
+    };
+    run_with(io, cut, PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK, table)
+}
+
+/// `rtl8192ee/hw.c::_rtl92ee_init_mac` before the NIC-enable flow: unlock
+/// `REG_RSV_CTRL`, the `REG_SYS_CFG1[24]` crystal/`0x16` selection, the 40 MHz
+/// crystal source (`REG_AFE_CTRL2[2]`, `REG_AFE_CTRL4[9:7]`) and the 92E AFE
+/// parameters (`REG_AFE_CTRL2[6]`, `REG_AFE_CTRL4[21]`). This byte interface
+/// issues Linux's `rtl_read_dword`/`rtl_write_dword` masks as RMWs of the
+/// affected bytes only (the other bytes would be rewritten unchanged).
+fn rtl8192ee_init_mac_prefix(io: &impl Io) -> Result<(), PwrSeqError> {
+    io.write8(0x1c, 0)?;
+    if io.read8(0xf0 + 3)? & 1 != 0 {
+        io.write8(0x7c, 0xc3)?;
+    } else {
+        let value = io.read8(0x16)?;
+        io.write8(0x16, value | (1 << 4) | (1 << 6))?;
+        io.write8(0x7c, 0x83)?;
+    }
+    let value = io.read8(0x28)?;
+    io.write8(0x28, value & 0xfb)?;
+    let value = io.read8(0x78)?;
+    io.write8(0x78, value & 0x7f)?;
+    let value = io.read8(0x79)?;
+    io.write8(0x79, value & 0xfc)?;
+    let value = io.read8(0x28)?;
+    io.write8(0x28, value & 0xbf)?;
+    let value = io.read8(0x7a)?;
+    io.write8(0x7a, value & 0xdf)
 }
 
 /// High-level power-on entry. Walks the chip's enable table over PCIe.

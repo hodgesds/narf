@@ -23,6 +23,12 @@
 
 #![allow(dead_code)]
 
+pub mod b8723b1ant;
+pub mod b8723b2ant;
+pub mod btc;
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests;
+
 use super::h2c::{send_h2c, H2cError, H2cState};
 use super::regs::*;
 use narf_bus::MmioRegion;

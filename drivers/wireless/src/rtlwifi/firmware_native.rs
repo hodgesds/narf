@@ -9,6 +9,8 @@ pub struct PciIo {
     cap: Cap<BusDeviceCap, Write>,
     registers: MmioRegion,
     packet_mode: AtomicBool,
+    quarantined: AtomicBool,
+    aspm_prepared: AtomicBool,
     msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
 }
 /// Single MSI vector (Linux `rtl_pci_intr_mode_msi`: `pci_enable_msi` +
@@ -19,10 +21,14 @@ struct Msi {
     vector: u8,
     signal: alloc::sync::Arc<super::irq::Signal>,
 }
-static SIGNAL: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::irq::Signal>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
-    let signal = { SIGNAL.lock().clone() };
+#[path = "aspm_native.rs"]
+mod aspm_native;
+#[path = "irq_routes.rs"]
+mod irq_routes;
+static SIGNALS: narf_lib::sync::IrqSafeSpinLock<irq_routes::Routes> =
+    narf_lib::sync::IrqSafeSpinLock::new(irq_routes::Routes::new());
+fn vector_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+    let signal = { SIGNALS.lock().get(cookie) };
     match signal {
         Some(signal) => {
             signal.raise();
@@ -39,16 +45,14 @@ fn quarantine(msi: &Msi) {
 /// Disabled delivery: drain the handler and return the vector.
 fn teardown(msi: Msi) {
     narf_interrupts::disable_irq(msi.vector);
-    let _ = narf_interrupts::remove_handler(msi.vector, "rtlwifi", 0);
+    let _ = narf_interrupts::remove_handler(msi.vector, "rtlwifi", u64::from(msi.vector));
     narf_interrupts::dispatch::clear_all_wakers(msi.vector);
     narf_interrupts::synchronize_irq(msi.vector);
-    let _ = narf_interrupts::vector::free(msi.vector);
-    let mut signal = SIGNAL.lock();
-    if signal
-        .as_ref()
-        .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, &msi.signal))
-    {
-        *signal = None;
+    // Withdraw the old route before the allocator may reuse its vector.
+    // The drained handler's snapshots retain only their original Arc.
+    let removed = SIGNALS.lock().remove(msi.vector, &msi.signal);
+    if removed {
+        let _ = narf_interrupts::vector::free(msi.vector);
     }
 }
 fn command_gate(command: u16, packet_mode: bool) -> Result<(), Error> {
@@ -89,6 +93,8 @@ impl PciIo {
             cap,
             registers,
             packet_mode: AtomicBool::new(false),
+            quarantined: AtomicBool::new(false),
+            aspm_prepared: AtomicBool::new(false),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }
@@ -96,7 +102,7 @@ impl PciIo {
     /// disabled. Any failure leaves the owner on scheduled polling; a
     /// vector whose source cannot be proven disabled stays quarantined.
     pub(super) fn arm_msi(&self) -> bool {
-        if self.msi.lock().is_some() || SIGNAL.lock().is_some() {
+        if self.msi.lock().is_some() {
             return false;
         }
         let Ok(Ok(mut config)) = crate::rtw88::pci_park::invoke(&self.cap, || {
@@ -107,6 +113,11 @@ impl PciIo {
         let Ok(vector) = narf_interrupts::vector::alloc() else {
             return false;
         };
+        if SIGNALS.lock().get(u64::from(vector)).is_some() {
+            // An occupied route cannot become another function's vector.
+            // Retain this inconsistent allocation rather than reuse it.
+            return false;
+        }
         // SAFETY: this sole retained function owns its cfg space; delivery
         // is disabled again below before any chip interrupt is unmasked.
         let programmed = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
@@ -117,8 +128,12 @@ impl PciIo {
             return false;
         }
         let signal = super::irq::Signal::new();
-        *SIGNAL.lock() = Some(signal.clone());
-        narf_interrupts::install_handler_named(vector, "rtlwifi", 0, vector_irq);
+        if !SIGNALS.lock().insert(vector, signal.clone()) {
+            // Vector allocation is exclusive. A conflicting route is a
+            // terminal allocator inconsistency, never permission to reuse it.
+            return false;
+        }
+        narf_interrupts::install_handler_named(vector, "rtlwifi", u64::from(vector), vector_irq);
         let msi = Msi {
             config,
             vector,
@@ -130,6 +145,7 @@ impl PciIo {
             narf_bus::msi::disable(&msi.config)
         });
         if !matches!(disabled, Ok(Ok(()))) {
+            self.quarantined.store(true, Ordering::Release);
             quarantine(&msi);
             core::mem::forget(msi);
             return false;
@@ -168,10 +184,161 @@ impl PciIo {
         if matches!(disabled, Ok(Ok(()))) {
             teardown(msi);
         } else {
+            self.quarantined.store(true, Ordering::Release);
             quarantine(&msi);
             core::mem::forget(msi);
         }
         false
+    }
+    /// Only the serialized replacement owner calls this after the old
+    /// Prepared DMA retirement receipt and IRQ withdrawal. A failed MSI
+    /// disable cannot be converted into a fresh source of register authority.
+    pub(super) fn parked_control(&self) -> Result<Self, Error> {
+        if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
+            return Err(Error::Gate);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check(0, 1)?;
+            let command =
+                narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
+            command_gate(command, false)?;
+            self.check_identity()?;
+            // SAFETY: the old IRQ and DMA owner is retired, the caller owns
+            // the device control mutex, and current config proves parked DMA.
+            Ok(unsafe { Self::new(self.device, self.cap, self.registers) })
+        })
+        .map_err(|_| Error::Access)?
+    }
+    fn check_identity(&self) -> Result<(), Error> {
+        self.check_function_identity()?;
+        let read = |at| {
+            narf_bus::pci::read_config32(&self.cap, &self.device, at).map_err(|_| Error::Access)
+        };
+        let low = read(0x18)?;
+        if low & 1 != 0 || low == u32::MAX {
+            return Err(Error::Gone);
+        }
+        let high = if low & 6 == 4 {
+            u64::from(read(0x1c)?) << 32
+        } else {
+            0
+        };
+        if high | u64::from(low & !15) != self.registers.phys.raw() {
+            return Err(Error::Gone);
+        }
+        Ok(())
+    }
+    fn check_function_identity(&self) -> Result<(), Error> {
+        let read = |at| {
+            narf_bus::pci::read_config32(&self.cap, &self.device, at).map_err(|_| Error::Access)
+        };
+        let id = u32::from(self.device.id.vendor) | (u32::from(self.device.id.device) << 16);
+        let subsystem = u32::from(self.device.id.subsystem_vendor)
+            | (u32::from(self.device.id.subsystem_id) << 16);
+        if read(0)? != id || read(0x2c)? != subsystem {
+            return Err(Error::Gone);
+        }
+        Ok(())
+    }
+    /// RTL8821AE WoWLAN PCI wake (`rtl_op_suspend`'s
+    /// `device_set_wakeup_enable(true)` → PCI core `pci_prepare_to_sleep`):
+    /// the endpoint PME → ACPI `_PRW` GPE route admitted for `target` from
+    /// D3hot. Only this endpoint's Write authority is used; the platform
+    /// Power grant is the `narf_power::pci_wake` owner's.
+    pub(super) fn wake_route(
+        &self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<narf_power::pci_wake::PciWake, Error> {
+        if self.quarantined.load(Ordering::Acquire) {
+            return Err(Error::Gate);
+        }
+        let route = narf_power::pci_wake::PciWake::discover(&self.cap, self.device)
+            .map_err(|_| Error::Access)?;
+        route
+            .admits(target, narf_bus::pci::pme::WakeState::D3Hot)
+            .map_err(|_| Error::Access)?;
+        Ok(route)
+    }
+    /// PMCSR power-state write of this exact function (config space only).
+    pub(super) fn set_pci_power(&self, state: narf_bus::pci::PciPowerState) -> Result<(), Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_function_identity()?;
+            narf_bus::pci::set_power_state(&self.cap, &self.device, state)
+                .map_err(|_| Error::Access)
+        })
+        .map_err(|_| Error::Access)?
+    }
+    pub(super) fn pci_power(&self) -> Result<Option<narf_bus::pci::PciPowerState>, Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_function_identity()?;
+            narf_bus::pci::power_state(&self.cap, &self.device).map_err(|_| Error::Access)
+        })
+        .map_err(|_| Error::Access)?
+    }
+    pub(super) fn suspend_config(&self) -> Result<narf_bus::pci::SavedPciConfig, Error> {
+        if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
+            return Err(Error::Gate);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_identity()?;
+            let saved =
+                narf_bus::pci::save_config(&self.cap, &self.device).map_err(|_| Error::Access)?;
+            command_gate(saved.command, false)?;
+            Ok(saved)
+        })
+        .map_err(|_| Error::Access)?
+    }
+    pub(super) fn resume_config(&self, saved: &narf_bus::pci::SavedPciConfig) -> Result<(), Error> {
+        if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
+            return Err(Error::Gate);
+        }
+        command_gate(saved.command, false)?;
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_function_identity()?;
+            // Config decoding may have been lost in S3. Disable DMA and MEM
+            // before restoring BARs; the saved command restores only parked
+            // MEM+INTx-disabled state. Fresh rings enable BME much later.
+            narf_bus::pci::clear_command(
+                &self.cap,
+                &self.device,
+                narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE,
+            )
+            .map_err(|_| Error::Access)?;
+            let command =
+                narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
+            if command == u16::MAX
+                || command & (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE) != 0
+            {
+                return Err(Error::Gate);
+            }
+            narf_bus::pci::restore_config(&self.cap, &self.device, saved)
+                .map_err(|_| Error::Access)?;
+            command_gate(
+                narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?,
+                false,
+            )?;
+            self.check_identity()
+        })
+        .map_err(|_| Error::Access)?
+    }
+    pub(super) fn verify_factory(&self, expected: &super::efuse::Factory) -> Result<(), Error> {
+        self.access(0xcf, 1, || {
+            self.check_identity()?;
+            let function = match self.device.addr {
+                narf_bus::BusAddr::Pcie(address) => address.function,
+                _ => return Err(Error::Unsupported),
+            };
+            // SAFETY: the caller holds exclusive control after card enable,
+            // current PCI identity/BAR were checked within this invocation.
+            let actual = unsafe {
+                super::efuse::read_factory(&self.registers, self.device.id.device, function)
+            }
+            .map_err(|_| Error::Gate)?;
+            if actual.mac != expected.mac || actual.logical != expected.logical {
+                return Err(Error::Gate);
+            }
+            Ok(())
+        })?
     }
     pub(super) fn allocate_dma(&self, bytes: usize) -> Result<narf_io::DmaBuffer, Error> {
         if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
@@ -337,6 +504,15 @@ impl Io for PciIo {
         // SAFETY: aligned dword extent checked inside the live invocation.
         self.access(reg, 4, || unsafe {
             self.registers.write32(u64::from(reg), value)
+        })
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), Error> {
+        if reg & 1 != 0 {
+            return Err(Error::Access);
+        }
+        // SAFETY: aligned word extent checked inside the live invocation.
+        self.access(reg, 2, || unsafe {
+            self.registers.write16(u64::from(reg), value)
         })
     }
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error> {

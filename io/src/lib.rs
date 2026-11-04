@@ -11,8 +11,16 @@
 
 extern crate alloc;
 
+pub mod amd_vi;
+mod amd_vi_tests;
+pub mod coherent_pool;
+mod coherent_pool_tests;
 pub mod iommu;
 mod iommu_e2e_tests;
+#[doc(hidden)]
+pub mod iommu_model;
+mod iommu_perdomain_tests;
+pub mod iova;
 pub mod pool;
 mod tests;
 
@@ -20,6 +28,7 @@ use core::fmt;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+pub use coherent_pool::{alloc_coherent_for, CoherentPool, DmaCoherence, DmaDevice};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_capabilities::{Cap, CapError, CapKind, CapOp, CapType};
 use narf_lib::id::DomainId;
@@ -146,6 +155,16 @@ pub enum IoError {
     DomainMismatch,
     OutOfIova,
     NotMapped,
+    /// A non-coherent device has no reserved coherent pool. NARF never
+    /// remaps System RAM non-cacheable (see `memory/src/memtype.rs`), so it
+    /// fails closed instead of handing out write-back memory.
+    NoCoherentPool,
+    /// A reserved DMA pool range was refused: unaligned, empty, overlapping
+    /// another pool, or intersecting System RAM.
+    PoolRejected,
+    /// An IOMMU command (invalidation + completion wait) did not complete
+    /// in time; the affected translation must be treated as live.
+    Timeout,
 }
 
 impl fmt::Display for IoError {
@@ -155,6 +174,11 @@ impl fmt::Display for IoError {
             IoError::DomainMismatch => f.write_str("io: buffer domain mismatch"),
             IoError::OutOfIova => f.write_str("io: no IOVA window available"),
             IoError::NotMapped => f.write_str("io: not mapped"),
+            IoError::NoCoherentPool => {
+                f.write_str("io: non-coherent device has no reserved DMA pool")
+            }
+            IoError::PoolRejected => f.write_str("io: reserved DMA pool range refused"),
+            IoError::Timeout => f.write_str("io: IOMMU command completion timed out"),
         }
     }
 }
@@ -188,6 +212,19 @@ pub struct DmaBuffer {
     /// `slot` field — that's how a device's `submit()` can resolve
     /// the cap back to *this* buffer's `PhysAddr` + length.
     slot_index: Option<u32>,
+    /// Kernel virtual base of a reserved-pool buffer (Linux
+    /// `dma_coherent_mem::virt_base` + page offset). `None` for buddy
+    /// buffers, whose CPU view is the direct map.
+    cpu_base: Option<core::num::NonZeroUsize>,
+    /// Reserved pool and first page this buffer occupies; released to the
+    /// pool (never the buddy) on drop.
+    pool: Option<(Arc<CoherentPool>, usize)>,
+    /// Per-domain IOMMU mapping `(domain, iova)` when the buffer was
+    /// allocated for a device in [`iommu::IommuMode::PerDomain`]
+    /// (Linux `iommu_dma_alloc` → `__iommu_dma_map`). The device sees
+    /// `iova`, never `phys`.
+    /// Boxed so `DmaBuffer` does not grow for the common unmapped case.
+    iommu: Option<alloc::boxed::Box<(Arc<iommu::IommuDomain>, u64)>>,
 }
 
 impl fmt::Debug for DmaBuffer {
@@ -197,6 +234,8 @@ impl fmt::Debug for DmaBuffer {
             .field("len", &self.len)
             .field("domain", &self.domain)
             .field("coherency", &self.coherency)
+            .field("pool_backed", &self.pool.is_some())
+            .field("iova", &self.iommu.as_deref().map(|(_, iova)| *iova))
             .finish_non_exhaustive()
     }
 }
@@ -250,20 +289,29 @@ impl DmaBuffer {
     /// registers; it cannot be dereferenced (see [`DmaAddr`]).
     #[inline]
     pub fn dma_addr(&self) -> DmaAddr {
-        DmaAddr(self.phys.raw())
+        match self.iommu.as_deref() {
+            Some((_, iova)) => DmaAddr(*iova),
+            None => DmaAddr(self.phys.raw()),
+        }
     }
 
     /// Device-side address of a sub-range, for ring arithmetic.
     #[inline]
     pub fn dma_addr_at(&self, offset: u64) -> DmaAddr {
-        DmaAddr(self.phys.raw() + offset)
+        self.dma_addr().offset(offset)
     }
 
     /// The pointer the CPU should use, resolved through the kernel direct
     /// map (x86_64) / TTBR1 high-half window (aarch64). Valid in every
     /// address space, so it survives a user CR3/TTBR0 swap.
+    ///
+    /// A reserved-pool buffer (non-coherent device, see [`coherent_pool`])
+    /// resolves through the pool's own non-cacheable mapping instead.
     #[inline]
     pub fn cpu_ptr<T>(&self) -> *const T {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
+            return base as *const T;
+        }
         self.phys.kernel_ptr::<T>()
     }
 
@@ -273,12 +321,18 @@ impl DmaBuffer {
     /// holds only a shared reference.
     #[inline]
     pub fn cpu_mut_ptr<T>(&self) -> *mut T {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
+            return base as *mut T;
+        }
         self.phys.kernel_mut_ptr::<T>()
     }
 
     /// Const CPU pointer at a byte offset.
     #[inline]
     pub fn cpu_ptr_at<T>(&self, offset: u64) -> *const T {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
+            return (base + offset as usize) as *const T;
+        }
         crate::PhysAddr::new(self.phys.raw() + offset).kernel_ptr::<T>()
     }
 
@@ -286,6 +340,9 @@ impl DmaBuffer {
     /// [`Self::dma_addr_at`] for descriptor-ring walks.
     #[inline]
     pub fn cpu_mut_ptr_at<T>(&self, offset: u64) -> *mut T {
+        if let Some(base) = self.cpu_base.map(core::num::NonZeroUsize::get) {
+            return (base + offset as usize) as *mut T;
+        }
         crate::PhysAddr::new(self.phys.raw() + offset).kernel_mut_ptr::<T>()
     }
 
@@ -306,15 +363,49 @@ impl DmaBuffer {
     /// `offset..offset + len` (clamped to the buffer), for a device that does
     /// not snoop CPU caches: call it after CPU writes the device will read,
     /// and before CPU reads of what the device wrote. Linux maps such buffers
-    /// uncached instead (e.g. HD-Audio's `AZX_DCAPS_SNOOP_OFF`); every
-    /// allocation here is write-back, so maintenance is explicit.
+    /// uncached instead (e.g. HD-Audio's `AZX_DCAPS_SNOOP_OFF`); buddy
+    /// allocations here are write-back, so maintenance is explicit. Prefer the
+    /// directional [`Self::sync_for_device`] / [`Self::sync_for_cpu`] pair.
     pub fn sync(&self, offset: usize, len: usize) {
-        let end = offset.saturating_add(len).min(self.len);
-        if offset >= end {
+        if let Some((start, end)) = self.sync_range(offset, len) {
+            cache_clean_invalidate(start, end);
+        }
+    }
+
+    /// Linux `dma_sync_single_for_device` → arm64 `arch_sync_dma_for_device`
+    /// (`arch/arm64/mm/dma-mapping.c`): clean `offset..offset + len` to the
+    /// point of coherency so a non-snooping device reads what the CPU wrote.
+    /// The direction is ignored there too — a FROM_DEVICE buffer is cleaned
+    /// so no dirty line can later be evicted over the device's data.
+    /// x86_64 has no clean-only baseline instruction; it flushes (CLFLUSH).
+    pub fn sync_for_device(&self, offset: usize, len: usize, _dir: DmaDirection) {
+        if let Some((start, end)) = self.sync_range(offset, len) {
+            cache_clean(start, end);
+        }
+    }
+
+    /// Linux `dma_sync_single_for_cpu` → arm64 `arch_sync_dma_for_cpu`:
+    /// nothing for [`DmaDirection::ToDevice`], otherwise invalidate
+    /// `offset..offset + len` so the CPU reads what the device wrote. Partial
+    /// lines at either end are cleaned and invalidated rather than discarded
+    /// (`dcache_inval_poc`), so neighbouring CPU data survives.
+    pub fn sync_for_cpu(&self, offset: usize, len: usize, dir: DmaDirection) {
+        if dir == DmaDirection::ToDevice {
             return;
         }
+        if let Some((start, end)) = self.sync_range(offset, len) {
+            cache_invalidate(start, end);
+        }
+    }
+
+    /// CPU virtual `[start, end)` of `offset..offset + len`, clamped.
+    fn sync_range(&self, offset: usize, len: usize) -> Option<(usize, usize)> {
+        let end = offset.saturating_add(len).min(self.len);
+        if offset >= end {
+            return None;
+        }
         let base = self.cpu_ptr::<u8>() as usize;
-        cache_clean_invalidate(base + offset, base + end);
+        Some((base + offset, base + end))
     }
 
     #[inline]
@@ -352,7 +443,7 @@ impl DmaBuffer {
         // TTBR0/CR3 swaps. `len` is the buffer's true length and
         // `&self` keeps the buffer alive across this borrow.
         // SAFETY: Valid memory or trusted environment
-        unsafe { core::slice::from_raw_parts(self.phys.kernel_ptr::<u8>(), self.len) }
+        unsafe { core::slice::from_raw_parts(self.cpu_ptr::<u8>(), self.len) }
     }
 
     /// Mutable byte view. Same kernel-mapping argument as
@@ -361,7 +452,7 @@ impl DmaBuffer {
         // SAFETY: see `as_slice` — the unique-mut borrow comes from
         // `&mut self`, so no aliasing is possible.
         // SAFETY: Valid memory or trusted environment
-        unsafe { core::slice::from_raw_parts_mut(self.phys.kernel_mut_ptr::<u8>(), self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.cpu_mut_ptr::<u8>(), self.len) }
     }
 
     /// Read this buffer's object-table slot index, if it has been
@@ -387,13 +478,71 @@ impl DmaBuffer {
     /// yielding mid-borrow.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
-        self.phys.kernel_ptr::<u8>()
+        self.cpu_ptr::<u8>()
     }
 
     /// See [`Self::as_ptr`].
     #[inline]
     pub fn as_mut_ptr(&self) -> *mut u8 {
-        self.phys.kernel_mut_ptr::<u8>()
+        self.cpu_mut_ptr::<u8>()
+    }
+
+    /// Whether this buffer came from a reserved coherent pool (mapped
+    /// non-cacheable) rather than the buddy allocator's write-back RAM.
+    #[inline]
+    pub fn is_pool_backed(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// IOMMU domain ID this buffer is mapped in, when its DMA address
+    /// is a per-domain IOVA rather than the physical address.
+    #[inline]
+    pub fn iommu_domain_id(&self) -> Option<u16> {
+        self.iommu.as_deref().map(|(d, _)| d.domain_id())
+    }
+
+    /// Map this buffer into `domain` (read/write) with an IOVA at or
+    /// below `dma_mask`, making [`Self::dma_addr`] return the IOVA.
+    pub(crate) fn map_into(
+        &mut self,
+        domain: &Arc<iommu::IommuDomain>,
+        dma_mask: u64,
+        pci: bool,
+    ) -> Result<(), IoError> {
+        if self.iommu.is_some() {
+            return Err(IoError::DomainMismatch);
+        }
+        let iova = domain.map_below(
+            self.phys.raw(),
+            self.len as u64,
+            iommu::IommuPerms::READ_WRITE,
+            dma_mask,
+            pci,
+        )?;
+        self.iommu = Some(alloc::boxed::Box::new((domain.clone(), iova)));
+        Ok(())
+    }
+
+    /// Return the storage to its owner exactly once. A per-domain IOVA
+    /// is torn down first (PTE clear → IOTLB invalidate + wait → IOVA
+    /// free); if that invalidation fails the frames are leaked rather
+    /// than reused, since the device may still translate to them.
+    fn release(&mut self) {
+        if self.freed {
+            return;
+        }
+        self.freed = true;
+        if let Some(mapping) = self.iommu.take() {
+            let (domain, iova) = *mapping;
+            if domain.unmap(iova, self.len as u64).is_err() {
+                self.pool = None;
+                return;
+            }
+        }
+        match self.pool.take() {
+            Some((pool, page)) => pool.release(page, self.order),
+            None => free_pages(PhysFrame::new(self.phys), self.order),
+        }
     }
 }
 
@@ -403,38 +552,60 @@ impl CapType for DmaBuffer {
 
 impl Drop for DmaBuffer {
     fn drop(&mut self) {
-        if !self.freed {
-            free_pages(PhysFrame::new(self.phys), self.order);
-            self.freed = true;
-        }
+        self.release();
     }
+}
+
+/// Linux `enum dma_data_direction` for streaming-buffer cache maintenance.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DmaDirection {
+    /// `DMA_BIDIRECTIONAL`.
+    Bidirectional,
+    /// `DMA_TO_DEVICE`: the device only reads the buffer.
+    ToDevice,
+    /// `DMA_FROM_DEVICE`: the device only writes the buffer.
+    FromDevice,
+}
+
+/// Smallest data-cache line in bytes (aarch64 `CTR_EL0.DminLine`, Linux
+/// `dcache_line_size`).
+#[cfg(target_arch = "aarch64")]
+fn dcache_line() -> usize {
+    let ctr: u64;
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // SAFETY: CTR_EL0 is readable at EL1.
+    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    4usize << ((ctr >> 16) & 0xf)
+}
+
+/// x86_64: CLFLUSH every 64-byte line of `start..end` between MFENCEs.
+#[cfg(target_arch = "x86_64")]
+fn clflush_range(start: usize, end: usize) {
+    let mut line = start & !63;
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // SAFETY: fences and CLFLUSH of the caller's mapped buffer lines.
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+        while line < end {
+            core::arch::asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags));
+            line += 64;
+        }
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 /// Clean and invalidate every data-cache line touching `start..end`, then
 /// order the maintenance before later device-visible accesses.
-fn cache_clean_invalidate(start: usize, end: usize) {
+pub(crate) fn cache_clean_invalidate(start: usize, end: usize) {
     #[cfg(target_arch = "x86_64")]
-    {
-        // CLFLUSH is in the x86-64 baseline; lines are 64 bytes.
-        let mut line = start & !63;
-        // SAFETY: fences and CLFLUSH of the caller's mapped buffer lines.
-        unsafe {
-            core::arch::asm!("mfence", options(nostack, preserves_flags));
-            while line < end {
-                core::arch::asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags));
-                line += 64;
-            }
-            core::arch::asm!("mfence", options(nostack, preserves_flags));
-        }
-    }
+    clflush_range(start, end);
     #[cfg(target_arch = "aarch64")]
     {
-        let ctr: u64;
-        // SAFETY: CTR_EL0 is readable at EL1.
-        unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
-        // DminLine: log2 of the smallest data-cache line in words.
-        let step = 4usize << ((ctr >> 16) & 0xf);
+        let step = dcache_line();
         let mut line = start & !(step - 1);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
         // SAFETY: DC CIVAC of the caller's mapped buffer lines, then DSB.
         unsafe {
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -444,6 +615,64 @@ fn cache_clean_invalidate(start: usize, end: usize) {
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// Linux arm64 `dcache_clean_poc`: DC CVAC every line of `start..end`.
+fn cache_clean(start: usize, end: usize) {
+    #[cfg(target_arch = "x86_64")]
+    clflush_range(start, end);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let step = dcache_line();
+        let mut line = start & !(step - 1);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        // SAFETY: DC CVAC of the caller's mapped buffer lines, then DSB.
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            while line < end {
+                core::arch::asm!("dc cvac, {}", in(reg) line, options(nostack, preserves_flags));
+                line += step;
+            }
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// Linux arm64 `dcache_inval_poc`: DC IVAC whole lines of `start..end`, but
+/// DC CIVAC a partial first or last line so bytes outside the range that
+/// share it are written back rather than discarded.
+fn cache_invalidate(start: usize, end: usize) {
+    #[cfg(target_arch = "x86_64")]
+    clflush_range(start, end);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let step = dcache_line();
+        let mask = step - 1;
+        let first = start & !mask;
+        let last = end & !mask;
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        // SAFETY: DC (C)IVAC of the caller's mapped, writable buffer lines,
+        // then DSB. Partial edge lines are cleaned first, so no byte outside
+        // `start..end` is lost.
+        unsafe {
+            if end & mask != 0 {
+                core::arch::asm!("dc civac, {}", in(reg) last, options(nostack, preserves_flags));
+            }
+            let mut line = first;
+            if start & mask != 0 {
+                core::arch::asm!("dc civac, {}", in(reg) first, options(nostack, preserves_flags));
+                line += step;
+            }
+            while line < last {
+                core::arch::asm!("dc ivac, {}", in(reg) line, options(nostack, preserves_flags));
+                line += step;
+            }
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
     }
 }
 
@@ -473,10 +702,7 @@ pub fn alloc_coherent_masked(
 }
 
 pub fn free_coherent(mut buf: DmaBuffer) {
-    if !buf.freed {
-        free_pages(PhysFrame::new(buf.phys), buf.order);
-        buf.freed = true;
-    }
+    buf.release();
 }
 
 /// Largest single coherent DMA buffer, expressed as a buddy order.
@@ -499,6 +725,9 @@ fn alloc_with(
     if len == 0 {
         return Err(IoError::NoMemory);
     }
+    // Gate for the late per-domain opt-in (`iommu::init`): physical DMA
+    // addresses may now be in a device's hands.
+    iommu::note_dma_issued();
     // Round the request up to a power-of-two page count and allocate that
     // many PHYSICALLY-CONTIGUOUS frames from the buddy, so a device can DMA
     // the whole buffer through a single (phys, len) descriptor — the block
@@ -549,6 +778,9 @@ fn alloc_with(
         coherency,
         freed: false,
         slot_index: None,
+        cpu_base: None,
+        pool: None,
+        iommu: None,
     })
 }
 

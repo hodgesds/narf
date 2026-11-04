@@ -37,6 +37,7 @@ const MLD_COMMANDS: &[[u8; 4]] = &[
     [0xc, 3, 1, 0],   // STA removal
     [5, 3, 3, 0],     // association
     [0xd, 1, 18, 0],  // scan
+    [0x6e, 1, 3, 0],  // normalized scheduled-scan profiles
     [0xc5, 0, 0, 7],  // receive notification
     [0xc8, 1, 1, 8],  // MCC response used by the MLD model
 ];
@@ -76,6 +77,100 @@ pub(super) fn mld_commands() -> Vec<u8> {
 pub(super) fn mld_image() -> Vec<u8> {
     image(MLD_COMMANDS)
 }
+
+fn smoke_iwlwifi_actual_resource_count_tlvs_preserve_legacy_and_reject_replacement() -> TestResult {
+    let base = image(MLD_COMMANDS);
+    let original = parse_ucode(&base).unwrap();
+    if original.api.num_stations.is_some() || original.api.num_links.is_some() {
+        return TestResult::Fail("absent resource counts became invented native slots");
+    }
+    for (stations, links) in [(15u32, 4u32), (14, 4), (16, 4), (0, 0)] {
+        let mut bytes = base.clone();
+        tlv(&mut bytes, 0x100, &stations.to_le_bytes());
+        tlv(&mut bytes, 0x101, &links.to_le_bytes());
+        let parsed = parse_ucode(&bytes).unwrap();
+        if parsed.api.num_stations != Some(stations as u8)
+            || parsed.api.num_links != Some(links as u8)
+            || parsed.api.commands != original.api.commands
+            || parsed.api.api_changes != original.api.api_changes
+            || parsed.api.capabilities != original.api.capabilities
+            || parsed.api.phy_config != original.api.phy_config
+        {
+            return TestResult::Fail(
+                "resource count extent/value changed unrelated executable facts",
+            );
+        }
+        tlv(&mut bytes, 0x100, &stations.to_le_bytes());
+        if parse_ucode(&bytes).is_ok() {
+            return TestResult::Fail("duplicate station count replaced original resource facts");
+        }
+    }
+    for (tag, maximum) in [(0x100u32, 16u32), (0x101, 4)] {
+        for body in [
+            vec![],
+            vec![0; 3],
+            vec![0; 5],
+            (maximum + 1).to_le_bytes().to_vec(),
+            u32::MAX.to_le_bytes().to_vec(),
+        ] {
+            let mut bytes = base.clone();
+            tlv(&mut bytes, tag, &body);
+            if parse_ucode(&bytes).is_ok() {
+                return TestResult::Fail(
+                    "malformed/out-of-range count silently became missing metadata",
+                );
+            }
+        }
+        let mut duplicate = base.clone();
+        tlv(&mut duplicate, tag, &0u32.to_le_bytes());
+        tlv(&mut duplicate, tag, &1u32.to_le_bytes());
+        if parse_ucode(&duplicate).is_ok() {
+            return TestResult::Fail(
+                "factual zero resource count treated as absent for replacement",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/firmware",
+    smoke_iwlwifi_actual_resource_count_tlvs_preserve_legacy_and_reject_replacement
+);
+
+fn smoke_iwlwifi_bios_command_revision_tlv_is_source_bound_and_not_silently_replaced() -> TestResult
+{
+    let mut bytes = image(MLD_COMMANDS);
+    tlv(&mut bytes, 73, &[7, 4, 5, 4, 9, 1, 3, 2]);
+    let parsed = parse_ucode(&bytes).unwrap();
+    if parsed.api.bios_revision(1, 4, 7, 8) != 5
+        || parsed.api.bios_revision(2, 4, 7, 8) != 4
+        || parsed.api.bios_revision(2, 0, 9, 8) != 2
+        || parsed.api.bios_revision(0, 4, 7, 8) != 8
+        || parsed.api.bios_revision(1, 4, 99, 8) != 8
+    {
+        return TestResult::Fail("TLV73 lost BIOS source/command/group or revision fallback");
+    }
+    tlv(&mut bytes, 73, &[]);
+    if parse_ucode(&bytes).is_ok() {
+        return TestResult::Fail("duplicate BIOS command TLV replaced the installed table");
+    }
+    let mut malformed = image(MLD_COMMANDS);
+    tlv(&mut malformed, 73, &[7, 4, 5]);
+    if parse_ucode(&malformed).is_ok() {
+        return TestResult::Fail("partial BIOS command table became missing metadata");
+    }
+    let mut empty = image(MLD_COMMANDS);
+    tlv(&mut empty, 73, &[]);
+    tlv(&mut empty, 73, &[7, 4, 5, 4]);
+    if parse_ucode(&empty).is_ok() {
+        return TestResult::Fail("duplicate empty BIOS command table was treated as absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/firmware",
+    smoke_iwlwifi_bios_command_revision_tlv_is_source_bound_and_not_silently_replaced
+);
 
 fn smoke_iwlwifi_authored_tlv_sections_and_first_command_version() -> TestResult {
     let mut bytes = image(&[[0xd, 1, 18, 0], [0xd, 1, 29, 4]]);
@@ -130,12 +225,24 @@ fn smoke_iwlwifi_authored_tlv_truncation_and_invalid_shapes() -> TestResult {
             return TestResult::Fail("truncated TLV header, payload or padding admitted");
         }
     }
-    for (tag, payload) in [(48, &[1, 2, 3][..]), (30, &[0; 7][..]), (52, &[][..])] {
+    for (tag, payload) in [
+        (18, &[][..]),
+        (18, &[1, 2, 3][..]),
+        (18, &[0; 5][..]),
+        (48, &[1, 2, 3][..]),
+        (30, &[0; 7][..]),
+        (52, &[][..]),
+    ] {
         let mut bad = mvm_image();
         tlv(&mut bad, tag, payload);
         if parse_ucode(&bad).is_ok() {
             return TestResult::Fail("malformed known firmware API record admitted");
         }
+    }
+    let mut flags = mvm_image();
+    tlv(&mut flags, 18, &[128, 0, 0, 0, 255, 255, 255, 255]);
+    if !parse_ucode(&flags).is_ok_and(|parsed| parsed.api.flags == 128) {
+        return TestResult::Fail("firmware SHORT_BL flags used reserved future words");
     }
     TestResult::Pass
 }

@@ -1,4 +1,5 @@
-//! Live RTL8188EU power and firmware transport over vendor USB control.
+//! Live RTL8188EU/RTL8192EU power and firmware transport over vendor USB
+//! control. RTL8192EU chip steps live in `rtl8192e_init`.
 //!
 //! Linux references: `rtl8xxxu/8188e.c::{rtl8188eu_power_on,
 //! rtl8188e_emu_to_active,rtl8188eu_reset_8051}` and
@@ -11,7 +12,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_drivers_usb::device::{USBDevice, UsbError};
 use narf_firmware::FirmwareError;
@@ -22,9 +23,31 @@ use super::regs::*;
 const HEADER_LEN: usize = 32;
 const MAX_PAYLOAD: usize = 8 * RTL_FW_PAGE_SIZE;
 const CONTROL_CHUNK: usize = 196; // rtl8188eu_fops.writeN_block_size
+
+/// `rtl8xxxu_fileops.writeN_block_size` of the families with a native owner.
+fn control_chunk(chip: ChipFamily) -> usize {
+    match chip {
+        ChipFamily::Rtl8192eu => super::rtl8192e::WRITEN_BLOCK_SIZE,
+        ChipFamily::Rtl8723bu => super::rtl8723b_init::WRITEN_BLOCK_SIZE,
+        _ => CONTROL_CHUNK,
+    }
+}
+
+/// `rtl8xxxu_load_firmware` signature family accepted per chip.
+fn firmware_signature(chip: ChipFamily) -> Option<u16> {
+    match chip {
+        ChipFamily::Rtl8188eu => Some(0x88e0),
+        ChipFamily::Rtl8192eu => Some(0x92e0),
+        ChipFamily::Rtl8723bu => Some(super::rtl8723b_init::FIRMWARE_SIGNATURE),
+        _ => None,
+    }
+}
 const REG_LPLDO_CTRL: u16 = 0x23;
 const REG_AFE_XTAL_CTRL: u16 = 0x24;
 const MCU_RAM_SELECT: u8 = 1 << 7;
+
+#[path = "runtime_restart.rs"]
+mod runtime_restart;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -47,6 +70,7 @@ pub enum Error {
     PowerTimeout,
     ChecksumTimeout,
     StartTimeout,
+    MailboxBusy,
     Deadline,
     Cancelled,
 }
@@ -66,6 +90,9 @@ pub enum Stage {
     StartingReceive,
     Receiving,
     ReceiveStopped,
+    Parking,
+    Parked,
+    Restarting,
     Failed,
 }
 
@@ -73,6 +100,20 @@ pub enum Stage {
 pub struct Status {
     pub stage: Stage,
     pub error: Option<Error>,
+}
+
+/// RTL8192EU radio state retained at RadioReady.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Radio8192e {
+    pub iqk: super::rtl8192e_iqk::Iqk,
+    pub post: super::rtl8192e_radio::PostCalibration,
+}
+
+/// RTL8723BU radio state retained at RadioReady.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Radio8723b {
+    pub iqk: super::rtl8723b_iqk::Iqk,
+    pub post: super::rtl8723b_radio::PostCalibration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,16 +135,14 @@ pub struct FirmwareInfo {
 /// Validate the chip-bound header and exact RAM-code extent before any USB
 /// access. Other families have different power/reset/download requirements.
 pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]), Error> {
-    if chip != ChipFamily::Rtl8188eu {
-        return Err(Error::UnsupportedChip);
-    }
+    let family = firmware_signature(chip).ok_or(Error::UnsupportedChip)?;
     if blob.len() <= HEADER_LEN {
         return Err(Error::InvalidImage);
     }
     let signature = u16::from_le_bytes([blob[0], blob[1]]);
     let payload = &blob[HEADER_LEN..];
     let declared = u16::from_le_bytes([blob[12], blob[13]]) as usize;
-    if signature & 0xfff0 != 0x88e0 || payload.len() != declared || payload.len() > MAX_PAYLOAD {
+    if signature & 0xfff0 != family || payload.len() != declared || payload.len() > MAX_PAYLOAD {
         return Err(Error::InvalidImage);
     }
     Ok((
@@ -186,6 +225,18 @@ pub struct Owner<I: ControlIo> {
     endpoints: IrqSafeSpinLock<Option<super::device_init::Endpoints>>,
     runtime_taken: AtomicBool,
     executable: IrqSafeSpinLock<Option<Executable>>,
+    // Exact uploaded image; a restart invokes its original executable cap.
+    runtime_image: IrqSafeSpinLock<Option<Arc<[u8]>>>,
+    // RTL8192EU factory/queue facts and gen2 H2C mailbox state.
+    factory_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::Factory>>,
+    queues_8192e: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
+    radio_8192e: IrqSafeSpinLock<Option<Radio8192e>>,
+    // RTL8723BU factory/queue facts (`rtl8723b_init`).
+    factory_8723b: IrqSafeSpinLock<Option<super::rtl8723b_init::Factory>>,
+    queues_8723b: IrqSafeSpinLock<Option<super::rtl8192e_init::QueueMap>>,
+    radio_8723b: IrqSafeSpinLock<Option<Radio8723b>>,
+    h2c_next: AtomicU8,
+    h2c_busy: AtomicBool,
 }
 
 /// Identity of the exact immutable image uploaded by this retained owner.
@@ -288,6 +339,15 @@ impl<I: ControlIo> Owner<I> {
             endpoints: IrqSafeSpinLock::new(None),
             runtime_taken: AtomicBool::new(false),
             executable: IrqSafeSpinLock::new(None),
+            runtime_image: IrqSafeSpinLock::new(None),
+            factory_8192e: IrqSafeSpinLock::new(None),
+            queues_8192e: IrqSafeSpinLock::new(None),
+            radio_8192e: IrqSafeSpinLock::new(None),
+            factory_8723b: IrqSafeSpinLock::new(None),
+            queues_8723b: IrqSafeSpinLock::new(None),
+            radio_8723b: IrqSafeSpinLock::new(None),
+            h2c_next: AtomicU8::new(0),
+            h2c_busy: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -341,8 +401,8 @@ impl<I: ControlIo> Owner<I> {
         let authority = loader
             .derive()
             .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-        self.initialize_registered_from(&authority, "rtlwifi/rtl8188eufw.bin")
-            .await
+        let name = self.chip.firmware_name().ok_or(Error::UnsupportedChip)?;
+        self.initialize_registered_from(&authority, name).await
     }
     pub async fn wait_initialize_registered(&self) -> Result<FirmwareInfo, Error> {
         loop {
@@ -371,7 +431,7 @@ impl<I: ControlIo> Owner<I> {
         if self.started.load(Ordering::Acquire) {
             return Err(Error::AlreadyStarted);
         }
-        if self.chip != ChipFamily::Rtl8188eu {
+        if firmware_signature(self.chip).is_none() {
             return Err(Error::UnsupportedChip);
         }
         let asset = crate::firmware_asset::load(authority, name, HEADER_LEN + MAX_PAYLOAD, false)
@@ -421,6 +481,54 @@ impl<I: ControlIo> Owner<I> {
         *self.factory.lock()
     }
 
+    /// RTL8192EU identity/EFUSE facts once `FactoryReady` was reached.
+    pub fn factory_8192e(&self) -> Option<super::rtl8192e_init::Factory> {
+        *self.factory_8192e.lock()
+    }
+
+    /// RTL8192EU IQK outcome and post-calibration state once RadioReady.
+    pub fn radio_8192e(&self) -> Option<Radio8192e> {
+        *self.radio_8192e.lock()
+    }
+
+    /// RTL8192EU TX queue to bulk-OUT endpoint map installed before firmware.
+    pub fn queues_8192e(&self) -> Option<super::rtl8192e_init::QueueMap> {
+        *self.queues_8192e.lock()
+    }
+
+    /// RTL8723BU identity/EFUSE facts once `FactoryReady` was reached.
+    pub fn factory_8723b(&self) -> Option<super::rtl8723b_init::Factory> {
+        *self.factory_8723b.lock()
+    }
+
+    /// RTL8723BU IQK outcome and post-calibration state once RadioReady.
+    pub fn radio_8723b(&self) -> Option<Radio8723b> {
+        *self.radio_8723b.lock()
+    }
+
+    /// RTL8723BU TX queue to bulk-OUT endpoint map installed before firmware.
+    pub fn queues_8723b(&self) -> Option<super::rtl8192e_init::QueueMap> {
+        *self.queues_8723b.lock()
+    }
+
+    pub fn chip(&self) -> ChipFamily {
+        self.chip
+    }
+
+    /// Exclusive gen2 H2C mailbox claim; a concurrent command is refused.
+    pub(super) fn h2c_claim(&self) -> Result<super::rtl8192e_init::H2cClaim<'_>, Error> {
+        if !matches!(self.chip, ChipFamily::Rtl8192eu | ChipFamily::Rtl8723bu) {
+            return Err(Error::UnsupportedChip);
+        }
+        self.h2c_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::RuntimeBusy)?;
+        Ok(super::rtl8192e_init::H2cClaim {
+            next: &self.h2c_next,
+            busy: &self.h2c_busy,
+        })
+    }
+
     pub(super) fn executable(&self) -> Option<Executable> {
         *self.executable.lock()
     }
@@ -440,6 +548,28 @@ impl<I: ControlIo> Owner<I> {
         let base = super::wmm_runtime::Proof::registered(factory, vid, pid, permission)
             .map_err(|_| Error::RuntimeState)?;
         Ok(super::ht_runtime::request(&base, executable))
+    }
+
+    /// Resolve the signed v2 full20/40 program request for this primary and
+    /// secondary. This performs no radio I/O and grants no native HT mode.
+    pub fn ht40_request(&self, primary: u8, secondary: u8) -> Result<super::Ht40Request, Error> {
+        let geometry = super::ht_runtime::Geometry::new(primary, secondary)
+            .map_err(|_| Error::RuntimeState)?;
+        let executable = self.executable().ok_or(Error::RuntimeState)?;
+        executable.invoke(|| ())?;
+        let factory = self.factory().ok_or(Error::RuntimeState)?;
+        let (vid, pid) = self.usb_identity().ok_or(Error::RuntimeState)?;
+        let calibration = super::power_policy::Calibration::load_registered(factory, vid, pid)
+            .map_err(|_| Error::RuntimeState)?;
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::RuntimeState)?;
+        geometry.ceiling(&domain).map_err(|_| Error::RuntimeState)?;
+        let permission = calibration
+            .permission(&domain, primary)
+            .map_err(|_| Error::RuntimeState)?;
+        let base = super::wmm_runtime::Proof::registered(factory, vid, pid, permission)
+            .map_err(|_| Error::RuntimeState)?;
+        base.invoke(|| ()).map_err(|_| Error::RuntimeState)?;
+        Ok(super::ht_runtime::wide_request(&base, executable, geometry))
     }
 
     pub fn calibration(&self) -> Option<CalibrationInfo> {
@@ -478,6 +608,15 @@ impl<I: ControlIo> Owner<I> {
         blob: &[u8],
         deadline: narf_time::Deadline,
     ) -> Result<FirmwareInfo, Error> {
+        self.run_device_expected(blob, deadline, None).await
+    }
+
+    async fn run_device_expected(
+        &self,
+        blob: &[u8],
+        deadline: narf_time::Deadline,
+        expected: Option<(super::device_init::Factory, super::device_init::Endpoints)>,
+    ) -> Result<FirmwareInfo, Error> {
         let (info, payload) = parse_image(self.chip, blob)?;
         if self.executable.lock().is_none() {
             #[cfg(any(test, feature = "kernel-test"))]
@@ -485,6 +624,9 @@ impl<I: ControlIo> Owner<I> {
             #[cfg(not(any(test, feature = "kernel-test")))]
             let inert = false;
             *self.executable.lock() = Some(Executable::new(blob, None, inert));
+        }
+        if self.runtime_image.lock().is_none() {
+            *self.runtime_image.lock() = Some(Arc::from(blob));
         }
         self.stage(Stage::Validated);
         narf_time::timeout(deadline, async {
@@ -498,8 +640,17 @@ impl<I: ControlIo> Owner<I> {
                 return Err(Error::BadEndpoints);
             }
             let endpoints = super::device_init::endpoints(&config[..count])?;
-            *self.endpoints.lock() = Some(endpoints);
+            if self.chip == ChipFamily::Rtl8192eu {
+                return self.run_device_8192e(payload, endpoints, info).await;
+            }
+            if self.chip == ChipFamily::Rtl8723bu {
+                return self.run_device_8723b(payload, endpoints, info).await;
+            }
             let factory = super::device_init::factory(self).await?;
+            if expected.is_some_and(|old| old != (factory, endpoints)) {
+                return Err(Error::BadEfuse);
+            }
+            *self.endpoints.lock() = Some(endpoints);
             *self.factory.lock() = Some(factory);
             self.stage(Stage::FactoryReady);
             self.power_on().await?;
@@ -522,6 +673,94 @@ impl<I: ControlIo> Owner<I> {
         })
         .await
         .unwrap_or(Err(Error::Deadline))
+    }
+
+    /// RTL8192EU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
+    /// through firmware start, the MAC/BB/RF tables, the post-table MAC
+    /// stage, LC + two-path IQ calibration and the post-calibration tail, in
+    /// Linux order. Channel and packet stages belong to the station owner.
+    /// RadioReady is not packet readiness.
+    async fn run_device_8192e(
+        &self,
+        payload: &[u8],
+        endpoints: super::device_init::Endpoints,
+        info: FirmwareInfo,
+    ) -> Result<FirmwareInfo, Error> {
+        let factory = super::rtl8192e_init::factory(self, endpoints).await?;
+        // A parked restart (`restart_parked`) keeps the retained identity:
+        // a different EFUSE or endpoint geometry is terminal.
+        if let Some(old) = self.factory_8192e() {
+            if old != factory || self.endpoints() != Some(endpoints) {
+                return Err(Error::BadEfuse);
+            }
+        }
+        *self.endpoints.lock() = Some(endpoints);
+        *self.factory_8192e.lock() = Some(factory);
+        self.stage(Stage::FactoryReady);
+        self.power_on().await?;
+        let queues = super::rtl8192e_init::pre_firmware(self, factory).await?;
+        if self.queues_8192e().is_some_and(|old| old != queues) {
+            return Err(Error::BadEndpoints);
+        }
+        *self.queues_8192e.lock() = Some(queues);
+        self.stage(Stage::Powered);
+        self.download(payload).await?;
+        self.stage(Stage::InitializingTables);
+        super::rtl8192e_phy::mac_bb_rf(self, &factory).await?;
+        super::rtl8192e_radio::post_tables(self, &factory).await?;
+        self.stage(Stage::TablesReady);
+        self.stage(Stage::Calibrating);
+        let tx_paths = factory.identity.tx_paths;
+        super::rtl8192e_iqk::lc_calibrate(self, tx_paths).await?;
+        let iqk = super::rtl8192e_iqk::iq_calibrate(self, tx_paths).await?;
+        let post = super::rtl8192e_radio::post_calibration(self).await?;
+        *self.radio_8192e.lock() = Some(Radio8192e { iqk, post });
+        self.stage(Stage::RadioReady);
+        Ok(info)
+    }
+
+    /// RTL8723BU `rtl8xxxu_probe` identify/EFUSE then `rtl8xxxu_init_device`
+    /// through power-on, reserved pages/queue priority/RX boundary, firmware
+    /// download/start, the `init_reg_hmtfr` H2C init, antenna selection and
+    /// the MAC/BB/RF tables through HIMR, the post-table MAC stage (burst,
+    /// aggregation, DPDT handover, statistics), LC + path-A IQ calibration and
+    /// the post-calibration tail, in Linux order. RadioReady is not packet
+    /// readiness.
+    async fn run_device_8723b(
+        &self,
+        payload: &[u8],
+        endpoints: super::device_init::Endpoints,
+        info: FirmwareInfo,
+    ) -> Result<FirmwareInfo, Error> {
+        let factory = super::rtl8723b_init::factory(self, endpoints).await?;
+        // As RTL8192EU: a parked restart keeps the retained identity.
+        if let Some(old) = self.factory_8723b() {
+            if old != factory || self.endpoints() != Some(endpoints) {
+                return Err(Error::BadEfuse);
+            }
+        }
+        *self.endpoints.lock() = Some(endpoints);
+        *self.factory_8723b.lock() = Some(factory);
+        self.stage(Stage::FactoryReady);
+        self.power_on().await?;
+        let queues = super::rtl8723b_init::pre_firmware(self, factory).await?;
+        if self.queues_8723b().is_some_and(|old| old != queues) {
+            return Err(Error::BadEndpoints);
+        }
+        *self.queues_8723b.lock() = Some(queues);
+        self.stage(Stage::Powered);
+        self.download(payload).await?;
+        self.stage(Stage::InitializingTables);
+        super::rtl8723b_phy::mac_bb_rf(self, &factory).await?;
+        super::rtl8723b_radio::post_tables(self, &factory).await?;
+        self.stage(Stage::TablesReady);
+        self.stage(Stage::Calibrating);
+        super::rtl8723b_iqk::lc_calibrate(self).await?;
+        let iqk = super::rtl8723b_iqk::iq_calibrate(self).await?;
+        let post = super::rtl8723b_radio::post_calibration(self).await?;
+        *self.radio_8723b.lock() = Some(Radio8723b { iqk, post });
+        self.stage(Stage::RadioReady);
+        Ok(info)
     }
 
     async fn run_before(
@@ -616,6 +855,12 @@ impl<I: ControlIo> Owner<I> {
     }
 
     async fn power_on(&self) -> Result<(), Error> {
+        if self.chip == ChipFamily::Rtl8192eu {
+            return super::rtl8192e_init::power_on(self).await;
+        }
+        if self.chip == ChipFamily::Rtl8723bu {
+            return super::rtl8723b_init::power_on(self).await;
+        }
         let value = self.read16(REG_APS_FSMCO).await?;
         self.write16(REG_APS_FSMCO, value & !((1 << 11) | (1 << 12)))
             .await?;
@@ -657,6 +902,12 @@ impl<I: ControlIo> Owner<I> {
     }
 
     async fn reset_8051(&self) -> Result<(), Error> {
+        if self.chip == ChipFamily::Rtl8192eu {
+            return super::rtl8192e_init::reset_8051(self).await;
+        }
+        if self.chip == ChipFamily::Rtl8723bu {
+            return super::rtl8723b_init::reset_8051(self).await;
+        }
         let value = self.read16(REG_SYS_FUNC).await?;
         self.write16(REG_SYS_FUNC, value & !SYS_FUNC_CPU_ENABLE)
             .await?;
@@ -682,12 +933,13 @@ impl<I: ControlIo> Owner<I> {
         let value = self.read8(REG_MCU_FW_DL).await?;
         self.write8(REG_MCU_FW_DL, value | MCU_FW_DL_CSUM_REPORT)
             .await?;
+        let block = control_chunk(self.chip);
         for (page, bytes) in payload.chunks(RTL_FW_PAGE_SIZE).enumerate() {
             let value = self.read8(REG_MCU_FW_DL + 2).await?;
             self.write8(REG_MCU_FW_DL + 2, (value & 0xf8) | page as u8)
                 .await?;
-            for (chunk, bytes) in bytes.chunks(CONTROL_CHUNK).enumerate() {
-                let addr = REG_FW_START_ADDRESS + (chunk * CONTROL_CHUNK) as u16;
+            for (chunk, bytes) in bytes.chunks(block).enumerate() {
+                let addr = REG_FW_START_ADDRESS + (chunk * block) as u16;
                 self.write(addr, bytes).await?;
             }
         }
@@ -718,7 +970,12 @@ impl<I: ControlIo> Owner<I> {
             100,
             Error::StartTimeout,
         )
-        .await
+        .await?;
+        // `rtl8xxxu_start_firmware`: `init_reg_hmtfr` (RTL8723BU only here).
+        if self.chip == ChipFamily::Rtl8723bu {
+            self.write8(REG_HMTFR, 0x0f).await?;
+        }
+        Ok(())
     }
 }
 

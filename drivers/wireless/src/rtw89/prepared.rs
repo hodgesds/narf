@@ -129,6 +129,45 @@ pub fn load(files: &mut impl Files, chip: ChipId, cut: u8) -> Result<PreparedFir
     Err(FwError::BlobMissing)
 }
 
+/// The WoW image of the file the running normal image came from. Linux
+/// `fw.c::rtw89_fw_recognize` reads `RTW89_FW_WOWLAN` out of the same
+/// multi-firmware file it took the normal image from (`fw_info.req`), and
+/// `wow.c::rtw89_wow_swap_fw` downloads it with `rtw89_fw_download`. The
+/// name must be one of this chip's canonical names; the bytes come through
+/// the same [`Files`] authority (signature-verifying registry) as the
+/// normal image, never from a cache. A file without a WoW entry is
+/// `ImageMissing` (WoW is then unavailable, never a fallback image).
+pub fn load_wow(
+    files: &mut impl Files,
+    name: &'static str,
+    chip: ChipId,
+    cut: u8,
+) -> Result<PreparedFirmware, FwError> {
+    if !filenames(chip).contains(&name) {
+        return Err(FwError::UnsupportedFormat);
+    }
+    if cut > 15 {
+        return Err(FwError::BadFormat);
+    }
+    let bytes = files.load(name)?;
+    if bytes.len() > MAX_FILE_SIZE {
+        return Err(FwError::BadFormat);
+    }
+    let image = fwdl::select_image(&bytes, cut, fwdl::FW_TYPE_WOWLAN)?;
+    let start = image.as_ptr() as usize - bytes.as_ptr() as usize;
+    let range = start..start + image.len();
+    let mut sections = [EMPTY; FWDL_SECTION_MAX_NUM];
+    let header = fwdl::parse_auto(image, &mut sections)?;
+    Ok(PreparedFirmware {
+        bytes,
+        image: range,
+        sections,
+        header,
+        name,
+        chip,
+    })
+}
+
 fn prepare(
     bytes: Vec<u8>,
     name: &'static str,

@@ -10,7 +10,8 @@ fn frame(n: u8) -> Vec<u8> {
     bytes[12..14].copy_from_slice(&[8, 0]);
     bytes
 }
-fn joined(ht: bool, secured: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(ht: bool, secured: bool) -> Result<NativeSession, &'static str> {
     let (mut session, mut bss) = super::ht20_tests::prepared(6, secured);
     if !ht {
         session.backend.ht_reply = None;
@@ -124,8 +125,8 @@ fn failures() -> Result<(), &'static str> {
         if session.poll_data_tx() != Err(error)
             || !matches!(session.state, State::Failed { .. })
             || session.data_pending.len() != if timeout { 8 } else { 7 }
-            || session.security.is_some()
-            || session.station_permission.is_some()
+            || session.station.security.is_some()
+            || session.station.permission.is_some()
             || !session.backend.owner.published
             || session.start_ethernet(&frame(9)) != Err(Error::Busy)
         {
@@ -227,7 +228,7 @@ fn control_priority() -> Result<(), &'static str> {
         return Err("genuine rekey M3 receipt absent");
     }
     run(session.service_keys()).map_err(|_| "new native PTK receipts")?;
-    if session.security.is_none() || !matches!(session.state, State::Associated { .. }) {
+    if session.station.security.is_none() || !matches!(session.state, State::Associated { .. }) {
         return Err("terminal packet/control composition failed to restore associated owner");
     }
     Ok(())
@@ -252,8 +253,8 @@ fn cancellation() -> Result<(), &'static str> {
         }
     }
     if !matches!(session.state, State::Running(Stage::StaRecord))
-        || session.security.is_some()
-        || session.station_permission.is_some()
+        || session.station.security.is_some()
+        || session.station.permission.is_some()
         || session.data_pending.len() != 8
         || session.backend.frames.len() != before
         || !session.backend.owner.published

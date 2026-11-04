@@ -2,9 +2,10 @@
 //! WPA2-PMF and WPA3-SAE association material. SAE runs on the host over
 //! the initial management transport through the shared `JoinPlan` state
 //! machine (wpa_supplicant `sme_sae_auth` over mac80211 `ieee80211_auth`);
-//! robust management protection is the software CCMP/BIP owner's
-//! (`station_security::Security`), since this RAW image disables firmware
-//! crypto (Linux v7.2 core.c `ATH10K_CRYPT_MODE_SW`).
+//! robust management protection is the CCMP/BIP owner's
+//! (`station_security::Security`): software in the `ATH10K_CRYPT_MODE_SW`
+//! profile, firmware-decrypted unicast CCMP with a host PN check in the
+//! hardware key profile (`hw_keys`), and always software BIP.
 use super::*;
 use alloc::boxed::Box;
 use narf_wireless::association::{AkmSet, JoinOptions, JoinPlan, Pmf, SaeStep, SecurityMode};
@@ -99,8 +100,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), Error> {
         use narf_wireless::sae::SaeSession;
         let join = plan.sae().ok_or(Error::Unsupported)?;
-        let own = self.ready.ok_or(Error::Failed)?.mac;
-        let bssid = self.peer.as_ref().ok_or(Error::Failed)?.bssid;
+        let own = self.station_own()?;
+        let bssid = self.station.peer.as_ref().ok_or(Error::Failed)?.bssid;
         let session = if join.h2e() {
             SaeSession::new_h2e_bytes(ssid, password, own, bssid)
         } else {
@@ -135,7 +136,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 SaeStep::Associate(request) => {
                     let request = wire::owned(request)?;
                     let pmk = Zeroizing::new(*session.pmk().ok_or(Error::Malformed)?);
-                    self.peer.as_mut().ok_or(Error::Failed)?.exchange_stage = 1;
+                    self.station
+                        .peer
+                        .as_mut()
+                        .ok_or(Error::Failed)?
+                        .exchange_stage = 1;
                     self.failed = false;
                     return Ok((request, pmk));
                 }

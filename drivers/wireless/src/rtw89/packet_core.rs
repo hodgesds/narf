@@ -2,7 +2,7 @@
 //! Fresh RTL8852B BE0/MGMT8 TX rings attached to one retained RX/RPQ owner.
 //! Consumption and firmware release are separate ownership facts. No reset,
 //! diagnostic-ring reuse, guessed RF receipt, IRQ worker or sustained service.
-use super::{packet_format as format, power, rx_packet, tx_transport};
+use super::{mac::ChipId, packet_format as format, power, rx_packet, tx_transport};
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_io::DmaBuffer;
 
@@ -52,6 +52,9 @@ pub(super) struct RxStep {
 /// `peer_allowed` validates the exact current station_control::Peer token and
 /// its own-TA/peer-RA admission before allocation and actual publication. RX
 /// polling and initial radio start must remain independent of that peer token.
+/// `amsdu_allowed` invokes the original current companion full-program cap
+/// bound to that exact installed base record; only its explicit body ceiling
+/// admits the expanded TX shape, at both actual publication checks.
 /// `start` repeats that check and opens only BE0/MGMT8/WPDMA and qualified CMAC
 /// TX, preserving CH12/RX/RPQ and all inherited DMA fencing ownership.
 /// `receive` consumes actual retained DMA after device acquire, never fabricated
@@ -63,7 +66,32 @@ pub(super) unsafe trait Port: power::Io {
         operation: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error>;
     fn ordinary_allowed(&mut self) -> Result<(), Error>;
+    /// The exact retained chip: selects the ring registers
+    /// (`rtw89_pci_ch_dma_addr_set{,_v1}`) and the TXWD layout
+    /// (`rtw89_core_fill_txdesc{,_v1}`). Old fixtures are RTL8852B.
+    fn chip(&self) -> ChipId {
+        ChipId::Rtl8852B
+    }
     fn peer_allowed(&mut self, frame: &[u8]) -> Result<(), Error>;
+    /// Separate current full A-MSDU emitter. Default old profiles deny.
+    fn amsdu_allowed(&mut self) -> Result<Option<usize>, Error> {
+        Ok(None)
+    }
+    /// Enclose the final quiet-prefix proof, one-shot issue, descriptor writes
+    /// and doorbell in the SAME original device and full joint-program grants.
+    /// A refusal before issue is Busy; failures after issue retain ownership.
+    /// Last exact prefix/current part check AFTER every preceding callback/
+    /// virtual/current query and immediately before the one-shot part issue.
+    fn fragment_ready(&mut self, _part: &super::command_native::FragmentPart) -> Result<(), Error> {
+        Err(Error::Access)
+    }
+    fn fragment_publish<T>(
+        &mut self,
+        _part: &super::command_native::FragmentPart,
+        _operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        Err(Error::Access)
+    }
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error>;
     fn receive(&mut self) -> Result<RxStep, Error>;
     /// Clear exactly the `open` DMA stop bits (BE/MGMT/WPDMA, plus BK/VI/VO
@@ -76,6 +104,8 @@ pub(super) unsafe trait Port: power::Io {
 enum Phase {
     Prepared,
     Running,
+    /// Reversible WoW halt: rings published, producers refused.
+    Halted,
     Stopped,
     Failed,
 }
@@ -109,6 +139,9 @@ struct Pending {
     report: bool,
     /// Published with TXWD AGG_EN (an operational originator session).
     agg: bool,
+    fragment: Option<super::command_native::FragmentPart>,
+    /// TXWD MACID (always the owner MACID for a station).
+    mac_id: u8,
 }
 /// Most data MPDUs the aggregate emitter keeps in flight at once
 /// (`radio_policy::Program::Ampdu`). Every other frame is alone in flight.
@@ -149,9 +182,21 @@ pub(super) struct Step {
     pub(super) rssi: Option<u8>,
     /// IE01 CFO for this owner's MACID (`rtw89_phy_cfo_parse`).
     pub(super) cfo: Option<i16>,
+    /// AP role only: the long-RXD `AX_RXD_MAC_ID` of `frame` (zero for a
+    /// short RXD), the hardware address-CAM classification of the peer.
+    pub(super) rx_mac_id: Option<u8>,
+}
+struct Submission<'a> {
+    bytes: &'a [u8],
+    radio_report: bool,
+    rate: u8,
+    agg: Option<format::Agg>,
+    fragment: Option<&'a super::command_native::FragmentPart>,
 }
 pub(super) struct Core {
     phase: Phase,
+    /// RTL8852B or RTL8852C (ordinary station rings only).
+    chip: ChipId,
     own: [u8; 6],
     mac_id: u8,
     rings: Vec<Ring>,
@@ -167,6 +212,17 @@ pub(super) struct Core {
     completions: VecDeque<Receipt>,
     /// Signed aggregate emitter granted (`Program::Ampdu`).
     aggregate: bool,
+    amsdu: Option<usize>,
+    /// Last published A-Control form (`rtwvif_link->last_a_ctrl`).
+    last_a_ctrl: bool,
+    /// AP role (`prepare_ap`): multi-peer MACIDs, CH9 HIQ, unacknowledged
+    /// RPQ releases are ordinary TX status rather than a failure.
+    ap: bool,
+    /// RX bandwidth bound (`enum rtw89_bandwidth`) of the programmed
+    /// operating channel (`set_operating_width`); 0 = 20MHz.
+    rx_width: u8,
+    /// VHT PPDUs admitted (an HT-program owner on a 5GHz wide channel).
+    rx_vht: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
 /// Receive PHY admission granted by the signed operating programs.
@@ -259,10 +315,49 @@ impl Core {
         qos_all: bool,
         rx: RxPhy,
     ) -> Result<Self, Error> {
-        if own == [0; 6] || own[0] & 1 != 0 || mac_id != 0 {
+        Self::prepare_role(
+            port,
+            own,
+            mac_id,
+            format::Queue::ordinary(qos_all),
+            rx,
+            false,
+        )
+    }
+    /// AP role for the vif on MACID0/port0: the ordinary rings plus the CH9
+    /// high queue (pci.c `rtw89_pci_init_tx_ring` for `RTW89_TXCH_CH9`, the
+    /// RTL8852B `B0HIQ` HFC channel already sized by `mac_runtime`).
+    pub(super) fn prepare_ap(
+        port: &mut impl Port,
+        own: [u8; 6],
+        qos_all: bool,
+        rx: RxPhy,
+    ) -> Result<Self, Error> {
+        let queues = format::ap_queues(qos_all);
+        Self::prepare_role(port, own, 0, &queues, rx, true)
+    }
+    fn prepare_role(
+        port: &mut impl Port,
+        own: [u8; 6],
+        mac_id: u8,
+        queues: &[format::Queue],
+        rx: RxPhy,
+        ap: bool,
+    ) -> Result<Self, Error> {
+        let chip = port.chip();
+        if own == [0; 6]
+            || own[0] & 1 != 0
+            || mac_id != 0
+            || !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
+            // C and RTL8851B: the ordinary station rings only (BE0/MGMT8,
+            // plus ACH1..3 under the signed all-AC QoS program); no AP role.
+            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
+                && (ap
+                    || queues != format::Queue::ordinary(false)
+                        && queues != format::Queue::ordinary(true))
+        {
             return Err(Error::Packet);
         }
-        let queues = format::Queue::ordinary(qos_all);
         let stop = queues
             .iter()
             .fold(format::STOP_WPDMA, |mask, queue| mask | queue.stop_bit());
@@ -282,6 +377,7 @@ impl Core {
             };
             let mut owner = Self {
                 phase: Phase::Prepared,
+                chip,
                 own,
                 mac_id,
                 rings: {
@@ -298,9 +394,14 @@ impl Core {
                 pending: Vec::new(),
                 completions: VecDeque::new(),
                 aggregate: false,
+                amsdu: None,
+                last_a_ctrl: false,
+                ap,
+                rx_width: 0,
+                rx_vht: false,
             };
             for ring in &mut owner.rings {
-                let regs = ring.kind.regs();
+                let regs = ring.kind.regs_for(chip);
                 if port.read32(regs.idx as u32)? & 0x0fff_0fff != 0 {
                     return Err(Error::State);
                 }
@@ -325,7 +426,13 @@ impl Core {
     /// signed aggregate program (`Program::Ampdu`, which requires HT20)
     /// enables this, before `start`.
     pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Prepared || self.rx < RxPhy::Ht {
+        if self.phase != Phase::Prepared
+            || self.rx < RxPhy::Ht
+            || !matches!(
+                self.chip,
+                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
+        {
             return Err(Error::State);
         }
         self.aggregate = true;
@@ -362,6 +469,21 @@ impl Core {
             return Err(Error::State);
         }
         self.scan = scan;
+        Ok(())
+    }
+    pub(super) fn enable_amsdu(&mut self, limit: usize) -> Result<(), Error> {
+        if self.phase != Phase::Prepared
+            || self.rx < RxPhy::Ht
+            || !self.aggregate
+            // No C or RTL8851B A-MSDU path (`transmit_c`/`transmit_51`
+            // refuse A-MSDU subframes).
+            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
+            || limit == 0
+            || limit > super::tx_amsdu::MAX_BODY
+        {
+            return Err(Error::State);
+        }
+        self.amsdu = Some(limit);
         Ok(())
     }
     pub(super) fn ready(&self) -> bool {
@@ -402,14 +524,59 @@ impl Core {
         rate: u8,
         agg: Option<format::Agg>,
     ) -> Result<u64, Error> {
-        if self.phase != Phase::Running {
+        self.submit_inner(
+            port,
+            Submission {
+                bytes,
+                radio_report,
+                rate,
+                agg,
+                fragment: None,
+            },
+        )
+    }
+    pub(super) fn submit_fragment(
+        &mut self,
+        port: &mut impl Port,
+        part: &super::command_native::FragmentPart,
+        radio_report: bool,
+        rate: u8,
+    ) -> Result<u64, Error> {
+        self.submit_inner(
+            port,
+            Submission {
+                bytes: part.bytes(),
+                radio_report,
+                rate,
+                agg: None,
+                fragment: Some(part),
+            },
+        )
+    }
+    fn submit_inner<P: Port>(
+        &mut self,
+        port: &mut P,
+        submission: Submission<'_>,
+    ) -> Result<u64, Error> {
+        let Submission {
+            bytes,
+            radio_report,
+            rate,
+            agg,
+            fragment,
+        } = submission;
+        if self.phase != Phase::Running || self.ap {
             return Err(Error::State);
         }
-        if agg.is_some() && !self.aggregate {
+        if agg.is_some() && !self.aggregate
+            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && fragment.is_some()
+        {
             return Err(Error::Packet);
         }
         // HE extended-range SU TX belongs to the signed HE program only.
-        if rate & format::DATA_ER != 0 && self.rx < RxPhy::He {
+        if (rate & format::DATA_ER != 0 || bytes.get(1).is_some_and(|fc| fc & 0x80 != 0))
+            && self.rx < RxPhy::He
+        {
             return Err(Error::Packet);
         }
         if if agg.is_some() {
@@ -425,18 +592,40 @@ impl Core {
             Some(scan) if format::probe_request(bytes, scan) => scan,
             _ => self.own,
         };
-        let kind = format::classify(bytes, source)?;
+        let kind = if fragment.is_some() {
+            format::classify_fragment(bytes, source)?
+        } else {
+            format::classify_with(bytes, source, self.amsdu)?
+        };
+        let amsdu = format::amsdu(bytes);
+        let a_ctrl = bytes[1] & 0x80 != 0;
+        let break_aggregation = a_ctrl != self.last_a_ctrl;
         let id = self.next_id;
         let next_id = id.checked_add(1).ok_or(Error::State)?;
+        let mut issued = false;
         let result = port.current(|port| {
             port.ordinary_allowed()?;
+            if let Some(part) = fragment {
+                part.current().map_err(|_| Error::Access)?;
+                if part.bytes() != bytes {
+                    return Err(Error::Packet);
+                }
+            }
+            if amsdu && port.amsdu_allowed()? != self.amsdu {
+                return Err(Error::Access);
+            }
             // An active-scan probe request has no peer; everything else
             // needs the current peer token.
             if !format::probe_request(bytes, source) {
                 port.peer_allowed(bytes)?;
             }
+            let header_capacity = if self.chip == ChipId::Rtl8852C {
+                format::C_HEADER_MAX
+            } else {
+                format::HEADER
+            };
             let packet = Packet {
-                header: allocate(port, format::HEADER)?,
+                header: allocate(port, header_capacity)?,
                 body: allocate(port, bytes.len())?,
                 id,
                 length: bytes.len(),
@@ -456,15 +645,177 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (header, actual) = format::transmit_agg(
+                let (mut header, actual) = if self.chip == ChipId::Rtl8852C {
+                    format::transmit_c(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                        agg,
+                    )?
+                } else if self.chip == ChipId::Rtl8851B {
+                    format::transmit_51(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                        agg,
+                    )?
+                } else if fragment.is_some() {
+                    format::transmit_fragment(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                    )?
+                } else {
+                    format::transmit_profile(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                        agg,
+                        self.amsdu,
+                    )?
+                };
+                if actual != kind {
+                    return Err(Error::Packet);
+                }
+                // A-Control form changes must begin a fresh hardware
+                // aggregate (rtw89_core_tx_update_he_qos_htc desc_bk).
+                if break_aggregation {
+                    let body3 = u32::from_le_bytes(header[12..16].try_into().unwrap());
+                    header[12..16].copy_from_slice(&(body3 | 1 << 13).to_le_bytes());
+                }
+                copy_to(&packet.body, 0, bytes)?;
+                copy_to(&packet.header, 0, &header)?;
+                format::descriptor_len(packet.header.dma_addr().raw(), header.len())
+                    .map_err(Error::from)
+            })();
+            let descriptor = match preparation {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = ring.queue.abort(ticket)?;
+                    return Err(error);
+                }
+            };
+            let mut publish = |port: &mut P| {
+                port.ordinary_allowed()?;
+                if amsdu && port.amsdu_allowed()? != self.amsdu {
+                    return Err(Error::Access);
+                }
+                if !format::probe_request(bytes, source) {
+                    port.peer_allowed(bytes)?;
+                }
+                if let Some(part) = fragment {
+                    port.fragment_ready(part)?;
+                    part.issue().map_err(|_| Error::Access)?;
+                }
+                // Issue is recorded before the FIRST descriptor write. No Busy
+                // after this point may release or retry uncertain native DMA.
+                issued = true;
+                ring.queue.publish(ticket)?;
+                self.pending.push(Pending {
+                    id,
+                    ticket,
+                    queue: kind,
+                    started: port.now_us(),
+                    report: false,
+                    agg: agg.is_some(),
+                    fragment: fragment.cloned(),
+                    mac_id: self.mac_id,
+                });
+                copy_to(
+                    ring.descriptors.as_ref().ok_or(Error::State)?,
+                    usize::from(ticket.slot) * 8,
+                    &descriptor,
+                )?;
+                barrier();
+                let regs = kind.regs_for(self.chip);
+                port.write16(regs.idx as u32, ring.queue.write_pointer())?;
+                if port.read16(regs.idx as u32)? & 0x0fff != ring.queue.write_pointer() {
+                    return Err(Error::Access);
+                }
+                self.next_id = next_id;
+                self.last_a_ctrl = a_ctrl;
+                Ok(id)
+            };
+            let result = match fragment {
+                Some(part) => port.fragment_publish(part, publish),
+                None => publish(port),
+            };
+            if result.is_err() && !issued {
+                let _ = ring.queue.abort(ticket)?;
+            }
+            result
+        });
+        if result.is_err() && (fragment.is_none() || issued || result != Err(Error::Busy)) {
+            self.phase = Phase::Failed;
+            let _ = Self::close_dma(port, self.stop);
+        }
+        result
+    }
+    /// AP role: one frame on its `classify_ap` ring with the caller-resolved
+    /// peer MACID (`Port::peer_allowed` re-proves the binding at both
+    /// publication checks). Every frame is alone in flight.
+    pub(super) fn submit_ap<P: Port>(
+        &mut self,
+        port: &mut P,
+        bytes: &[u8],
+        tx: format::ApTx,
+    ) -> Result<u64, Error> {
+        if self.phase != Phase::Running || !self.ap {
+            return Err(Error::State);
+        }
+        if !self.ready() {
+            return Err(Error::Busy);
+        }
+        let kind = format::classify_ap(bytes, self.own, tx.after_dtim)?;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).ok_or(Error::State)?;
+        let mut issued = false;
+        let result = port.current(|port| {
+            port.ordinary_allowed()?;
+            port.peer_allowed(bytes)?;
+            let packet = Packet {
+                header: allocate(port, format::HEADER)?,
+                body: allocate(port, bytes.len())?,
+                id,
+                length: bytes.len(),
+            };
+            let ring = self
+                .rings
+                .iter_mut()
+                .find(|ring| ring.kind == kind)
+                .ok_or(Error::Packet)?;
+            let ticket = ring
+                .queue
+                .reserve(packet, tx.mac_id, kind.qsel())
+                .map_err(|(e, _)| Error::from(e))?;
+            if ticket.sequence >= format::IDENTITIES {
+                let _ = ring.queue.abort(ticket)?;
+                return Err(Error::State);
+            }
+            let packet = ring.queue.reserved_mut(ticket)?;
+            let preparation = (|| {
+                let (header, actual) = format::transmit_ap(
                     bytes,
-                    source,
-                    self.mac_id,
+                    self.own,
+                    tx,
                     ticket.sequence,
                     packet.body.dma_addr().raw(),
-                    radio_report,
-                    rate,
-                    agg,
                 )?;
                 if actual != kind {
                     return Err(Error::Packet);
@@ -480,39 +831,48 @@ impl Core {
                     return Err(error);
                 }
             };
-            port.ordinary_allowed()?;
-            if !format::probe_request(bytes, source) {
+            let result = (|| {
+                port.ordinary_allowed()?;
                 port.peer_allowed(bytes)?;
+                issued = true;
+                ring.queue.publish(ticket)?;
+                self.pending.push(Pending {
+                    id,
+                    ticket,
+                    queue: kind,
+                    started: port.now_us(),
+                    report: false,
+                    agg: false,
+                    fragment: None,
+                    mac_id: tx.mac_id,
+                });
+                copy_to(
+                    ring.descriptors.as_ref().ok_or(Error::State)?,
+                    usize::from(ticket.slot) * 8,
+                    &descriptor,
+                )?;
+                barrier();
+                port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
+                if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
+                    return Err(Error::Access);
+                }
+                self.next_id = next_id;
+                Ok(id)
+            })();
+            if result.is_err() && !issued {
+                let _ = ring.queue.abort(ticket)?;
             }
-            // Before the FIRST descriptor write, the queue holds both DMA maps
-            // as published; every uncertain failure retains them permanently.
-            ring.queue.publish(ticket)?;
-            self.pending.push(Pending {
-                id,
-                ticket,
-                queue: kind,
-                started: port.now_us(),
-                report: false,
-                agg: agg.is_some(),
-            });
-            copy_to(
-                ring.descriptors.as_ref().ok_or(Error::State)?,
-                usize::from(ticket.slot) * 8,
-                &descriptor,
-            )?;
-            barrier();
-            port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
-            if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
-                return Err(Error::Access);
-            }
-            self.next_id = next_id;
-            Ok(id)
+            result
         });
-        if result.is_err() {
+        if result.is_err() && (issued || result != Err(Error::Busy)) {
             self.phase = Phase::Failed;
             let _ = Self::close_dma(port, self.stop);
         }
         result
+    }
+    /// Whether this owner is the AP role.
+    pub(super) fn ap(&self) -> bool {
+        self.ap
     }
     /// Whether this owner published the ring for `queue`.
     pub(super) fn has_queue(&self, queue: format::Queue) -> bool {
@@ -521,9 +881,13 @@ impl Core {
     fn completed(&mut self, completion: tx_transport::Completion<Packet>) -> Result<(), Error> {
         // All non-success release statuses are terminal; ownership is no longer
         // ambiguous but the station must never consume a success receipt.
-        if completion.status != 0 {
+        // AP role: pci.c `rtw89_pci_tx_status` maps any non-TX_DONE release
+        // (retry limit, lifetime, MACID drop) to a frame without
+        // IEEE80211_TX_STAT_ACK; it is ordinary peer TX status.
+        if completion.status != 0 && !self.ap {
             return Err(Error::Packet);
         }
+        let acknowledged = completion.status == 0;
         let packet = completion.resource;
         let index = self
             .pending
@@ -531,13 +895,30 @@ impl Core {
             .position(|pending| pending.id == packet.id)
             .ok_or(Error::Packet)?;
         let bytes = copy_from(&packet.body, packet.length)?;
+        if let Some(part) = &self.pending[index].fragment {
+            part.terminal(&bytes).map_err(|_| Error::Packet)?;
+        }
         self.completions.push_back(Receipt {
             id: packet.id,
             bytes,
-            radio_acknowledged: true,
+            radio_acknowledged: acknowledged,
         });
         self.pending.remove(index);
         Ok(())
+    }
+    /// The programmed operating channel's RX bound: `width` (0/1/2/3 =
+    /// 20/40/80/160MHz; 160MHz only on RTL8852C, whose `support_bandwidths`
+    /// has it, RTL8852B is clamped to 80MHz) and whether VHT rates are
+    /// admitted (5GHz wide channel). Linux rtw89 reports every PPDU the tuned
+    /// BB decodes; this owner additionally never admits a bandwidth the radio
+    /// was not tuned to.
+    pub(super) fn set_operating_width(&mut self, width: u8, vht: bool) {
+        let max = if self.chip == ChipId::Rtl8852C { 3 } else { 2 };
+        self.rx_width = width.min(max);
+        self.rx_vht = vht && self.rx_width != 0;
+    }
+    fn admits_rate(&self, rate: u16) -> bool {
+        self.rx.admits(rate) || self.rx_vht && self.rx >= RxPhy::Ht && rx_packet::vht_rate(rate)
     }
     fn receive(&mut self, port: &mut impl Port, step: &mut Step) -> Result<(), Error> {
         let received = port.receive()?;
@@ -555,10 +936,13 @@ impl Core {
                 }
             }
             // A PPDU above the signed RX PHY program (HT without `Ht`, HE
-            // without `He`) is dropped exactly as the assembler dropped every
-            // non-legacy rate before, without closing the station.
+            // without `He`, VHT off a wide 5GHz channel) or wider than the
+            // programmed channel is dropped exactly as the assembler dropped
+            // every non-legacy rate before, without closing the station.
             Some(rx_packet::Event::Wifi(meta, _))
-                if !self.rx.admits(meta.rate) || meta.ampdu && self.rx < RxPhy::Ht => {}
+                if !self.admits_rate(meta.rate)
+                    || meta.bandwidth > self.rx_width
+                    || meta.ampdu && self.rx < RxPhy::Ht => {}
             // Linux forwards control frames to the host (RTW89_CTRL ->
             // RTW89_FWD_TO_HOST). Those shorter than an ordinary header are
             // surfaced from 16 bytes (PS-Poll/BAR); malformed ones are dropped.
@@ -569,10 +953,13 @@ impl Core {
                     && !meta.icv_error
                     && !meta.hardware_decrypted
                     && !meta.aggregate
-                    && meta.bandwidth == 0
+                    && meta.bandwidth <= self.rx_width
                     && (16..=format::MAX_MPDU).contains(&bytes.len())
                     && meta.size == bytes.len() + 4
                 {
+                    if self.ap {
+                        step.rx_mac_id = Some(meta.mac_id);
+                    }
                     step.frame = Some(Frame { bytes });
                 }
             }
@@ -581,15 +968,27 @@ impl Core {
                     || meta.icv_error
                     || meta.hardware_decrypted
                     || meta.aggregate
-                    || meta.bandwidth != 0
-                    || !self.rx.admits(meta.rate)
+                    || meta.bandwidth > self.rx_width
+                    || !self.admits_rate(meta.rate)
                     || bytes.len() < 24
-                    || bytes.len() > format::MAX_MPDU
+                    || bytes.len()
+                        > if super::fragment_rx::fragmented(&bytes) {
+                            format::FRAGMENT_MAX_MPDU
+                        } else {
+                            format::MAX_MPDU
+                        }
                     || meta.size != bytes.len() + 4
                 {
                     return Err(Error::Packet);
                 }
-                step.frame = Some(Frame { bytes });
+                // An actual A-MPDU subframe is DONTFRAG. Raw fragment
+                // numbers cannot enter ordinary BA reorder as equal-SN DATA.
+                if !meta.ampdu || !super::fragment_rx::fragmented(&bytes) {
+                    if self.ap {
+                        step.rx_mac_id = Some(meta.mac_id);
+                    }
+                    step.frame = Some(Frame { bytes });
+                }
             }
             Some(rx_packet::Event::Releases(reports)) => {
                 if reports.is_empty() || reports.len() > 256 {
@@ -599,7 +998,7 @@ impl Core {
                     // Multi-entry RPQ retirement: each report names exactly
                     // one unreported in-flight frame by WD sequence, queue
                     // and MACID; anything else is a stale/forged release.
-                    if report.mac_id != self.mac_id {
+                    if !self.ap && report.mac_id != self.mac_id {
                         return Err(Error::Packet);
                     }
                     let pending = self
@@ -607,6 +1006,7 @@ impl Core {
                         .iter_mut()
                         .find(|pending| {
                             !pending.report
+                                && report.mac_id == pending.mac_id
                                 && report.sequence == pending.ticket.sequence
                                 && report.channel == pending.queue.channel()
                                 && report.qsel == pending.queue.qsel()
@@ -637,7 +1037,7 @@ impl Core {
             self.receive(port, &mut step)?;
             for slot in 0..self.rings.len() {
                 let ring = &mut self.rings[slot];
-                let index = port.read32(ring.kind.regs().idx as u32)?;
+                let index = port.read32(ring.kind.regs_for(self.chip).idx as u32)?;
                 if index & 0x0fff != u32::from(ring.queue.write_pointer()) {
                     return Err(Error::Packet);
                 }
@@ -696,6 +1096,51 @@ impl Core {
                 .rings
                 .iter()
                 .all(|ring| !ring.armed && ring.descriptors.is_none())
+    }
+    /// `rtw89_wow_enable_trx_pre` host half: only a running, transmit-quiet
+    /// owner (no published frame awaiting BD consumption or RPQ release)
+    /// halts. Submission and polling are refused until [`Self::wow_resume`].
+    pub(super) fn wow_halt(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running || !self.pending.is_empty() {
+            return Err(Error::Busy);
+        }
+        self.phase = Phase::Halted;
+        Ok(())
+    }
+    /// `rtw89_pci_ops_reset` host half: every TX ring back to index zero
+    /// with zeroed descriptors; returns (channel, regs, base, depth) for
+    /// `rtw89_pci_reset_trx_rings`.
+    pub(super) fn wow_rewind(
+        &mut self,
+    ) -> Result<Vec<(usize, super::dma::TxRingRegs, u64, u16)>, Error> {
+        if self.phase != Phase::Halted {
+            return Err(Error::State);
+        }
+        let mut bases = Vec::new();
+        for ring in &mut self.rings {
+            ring.queue.rewind()?;
+            let memory = ring.descriptors.as_ref().ok_or(Error::State)?;
+            copy_to(memory, 0, &alloc::vec![0; usize::from(format::DEPTH) * 8])?;
+            bases.push((
+                usize::from(ring.kind.channel()),
+                ring.kind.regs_for(self.chip),
+                memory.dma_addr().raw(),
+                format::DEPTH,
+            ));
+        }
+        Ok(bases)
+    }
+    /// Halted -> Running once the restart sequence re-opened the channels.
+    pub(super) fn wow_resume(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Halted {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// The exact TX stop bits of the rings this owner published.
+    pub(super) fn stop_mask(&self) -> u32 {
+        self.stop
     }
     pub(super) fn stop(&mut self, port: &mut impl Port) -> Result<(), Error> {
         self.phase = Phase::Stopped;

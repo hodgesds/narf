@@ -10,8 +10,6 @@
 //! direct map. Expected register values are hand-derived from Linux
 //! `hal.c` / `ce.c` / `pcic.c` for WCN6855.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
@@ -19,7 +17,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
-use core::pin::pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -46,7 +43,7 @@ fn fake_clock() -> u64 {
 }
 
 fn run<F: Future>(f: F) -> F::Output {
-    let mut f = pin!(f);
+    let mut f = alloc::boxed::Box::pin(f);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..100_000 {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {

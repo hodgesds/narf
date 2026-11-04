@@ -28,8 +28,8 @@ pub enum Width {
 }
 
 /// Local encoding supports equal-modulation MCS0..31, optional directional LDPC
-/// and one-stream RX STBC, no TX STBC,
-/// HT-control, beamforming or optional large A-MSDU. RX/TX must include
+/// and one-stream RX STBC, explicit TX STBC and large RX A-MSDU,
+/// without HT-control or beamforming. RX/TX must include
 /// mandatory MCS0..7 (IEEE20.3.5; Linux ath10k/mac.c peer HT-rate check).
 /// An optional subset bounds TX selection without changing capability IEs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +47,8 @@ pub struct LocalHt {
     rx_greenfield: bool,
     tx_greenfield: bool,
     tx_stbc: bool,
+    rx_amsdu_7935: bool,
+    dsss_cck40: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -80,6 +82,8 @@ impl LocalHt {
             rx_greenfield: false,
             tx_greenfield: false,
             tx_stbc: false,
+            rx_amsdu_7935: false,
+            dsss_cck40: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -102,6 +106,8 @@ impl LocalHt {
             rx_greenfield: false,
             tx_greenfield: false,
             tx_stbc: false,
+            rx_amsdu_7935: false,
+            dsss_cck40: false,
         }
     }
     /// Advertised LDPC is a local RX promise. TX coding additionally needs
@@ -132,6 +138,20 @@ impl LocalHt {
         self.tx_stbc = enabled;
         self
     }
+    /// Advertise HT Capability Information bit11: the local RX owner can
+    /// retain and atomically decode an entire 7935-byte A-MSDU body. This is
+    /// independent of the AP's receive limit and grants no TX permission.
+    pub fn with_rx_amsdu_7935(mut self, enabled: bool) -> Self {
+        self.rx_amsdu_7935 = enabled;
+        self
+    }
+    /// Advertise HT Capability Information bit12 (DSSS/CCK Mode in 40MHz),
+    /// as Linux rtw88 `rtw_init_ht_cap` does with `SUP_WIDTH_20_40`. Only a
+    /// 20/40MHz capability may carry it.
+    pub fn with_dsss_cck40(mut self, enabled: bool) -> Self {
+        self.dsss_cck40 = enabled && self.width == HtWidth::TwentyForty;
+        self
+    }
     /// Bound TX rate selection to a subset of actual implemented TX support.
     /// This expresses policy facts only; native power/radio proofs remain
     /// mandatory at every enabling/publication boundary.
@@ -154,6 +174,8 @@ impl LocalHt {
             | (u16::from(self.rx_greenfield) << 4)
             | (u16::from(self.tx_stbc) << 7)
             | (u16::from(self.rx_stbc) << 8)
+            | (u16::from(self.rx_amsdu_7935) << 11)
+            | (u16::from(self.dsss_cck40) << 12)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
             | if self.gi.rx40 { 0x40 } else { 0 };
@@ -419,7 +441,7 @@ impl LocalPhy {
     }
     /// Opt into UHR (IEEE P802.11bn D1.3) on top of `with_eht`. UHR is only
     /// admitted for `LocalUhr::for_mld_association` on the
-    /// `Offer::from_elements` path (see `association::uhr`).
+    /// `Offer::from_elements` or explicit MLD JoinPlan path (see `association::uhr`).
     pub fn with_uhr(mut self, uhr: LocalUhr) -> Result<Self, Error> {
         if self.eht.is_none() {
             return Err(Error::UnsupportedRates);
@@ -679,6 +701,14 @@ pub struct HtNegotiation {
     basic: [u8; 10],
 }
 impl HtNegotiation {
+    /// Our advertised RX capacity, independent of the peer's RX capacity.
+    pub fn rx_amsdu_limit(&self) -> crate::amsdu::Limit {
+        if self.local.rx_amsdu_7935 {
+            crate::amsdu::Limit::Ht7935
+        } else {
+            crate::amsdu::Limit::Ht3839
+        }
+    }
     pub fn rx_greenfield(&self) -> bool {
         self.local.rx_greenfield
     }
@@ -869,7 +899,7 @@ macro_rules! selection_accessors {
         pub fn eht(&self) -> Option<&EhtNegotiation> {
             self.0.eht.as_ref()
         }
-        /// UHR facts for a native MLD association (never for `JoinPlan`).
+        /// UHR facts for a native or explicit single-link MLD association.
         pub fn uhr(&self) -> Option<&UhrNegotiation> {
             self.0.uhr.as_ref()
         }
@@ -917,9 +947,20 @@ impl Offer {
     /// The caller must already prove the actual response's peer/status and
     /// native completion. This does not build or authenticate a response.
     pub fn response_elements(&self, bytes: &[u8]) -> Result<Negotiated, Error> {
+        self.response_elements_with_sae_h2e(bytes, false)
+    }
+    /// As response_elements, permitting the SAE-H2E membership selector123
+    /// only when the native owner already negotiated SaeJoin::h2e(). This
+    /// parsing fact grants no security, PHY, channel or publication authority;
+    /// the selector is not interpreted as a PHY mode or a legacy bitrate.
+    pub fn response_elements_with_sae_h2e(
+        &self,
+        bytes: &[u8],
+        sae_h2e: bool,
+    ) -> Result<Negotiated, Error> {
         self.response(
             bytes,
-            element_selectors(bytes, self.0.ht.operation.primary())?,
+            element_selectors_with_sae_h2e(bytes, self.0.ht.operation.primary(), sae_h2e)?,
         )
     }
     pub(super) fn prepare(
@@ -929,6 +970,16 @@ impl Offer {
         selectors: u8,
     ) -> Result<Option<Self>, Error> {
         Self::prepare_from(local, bytes, primary, selectors, false)
+    }
+    /// Called only after JoinPlan's explicit Basic-ML identity admission.
+    pub(super) fn prepare_mld(
+        mut local: LocalPhy,
+        bytes: &[u8],
+        primary: u8,
+        selectors: u8,
+    ) -> Result<Option<Self>, Error> {
+        local.uhr = local.uhr.map(LocalUhr::for_mld_association);
+        Self::prepare_from(local, bytes, primary, selectors, true)
     }
     fn prepare_from(
         local: LocalPhy,
@@ -1066,12 +1117,15 @@ impl Negotiated {
 }
 
 fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
+    element_selectors_with_sae_h2e(bytes, primary, false)
+}
+fn element_selectors_with_sae_h2e(bytes: &[u8], primary: u8, sae_h2e: bool) -> Result<u8, Error> {
     let band = channel::band(primary).ok_or(Error::InvalidBss)?;
     if bytes.len() > 2048 {
         return Err(Error::InvalidBss);
     }
     let mut rates = super::RateElements {
-        allowed: super::SEL_PHY,
+        allowed: super::SEL_PHY | if sae_h2e { super::SEL_SAE_H2E } else { 0 },
         ..Default::default()
     };
     super::ies(bytes, |id, body| rates.observe(id, body))?;
@@ -1082,7 +1136,7 @@ fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
     {
         return Err(Error::UnsupportedRates);
     }
-    Ok(rates.selectors)
+    Ok(rates.selectors & !super::SEL_SAE_H2E)
 }
 
 /// Every mandatory PHY membership selector needs that PHY negotiated
@@ -1138,7 +1192,7 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8, native: bool) -> Result<
         he: None,
         eht: None,
         uhr: None,
-        // Only an MLD-asserting native owner differs from a JoinPlan offer.
+        // Only a native or explicit JoinPlan MLD opt-in sets this fact.
         native: native && local.uhr.is_some_and(|u| u.mld_association()),
         width: Width::Twenty,
         center: primary,

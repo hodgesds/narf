@@ -822,9 +822,12 @@ pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::Lifec
         // single code pointers is layout-compatible.
         // SAFETY: Valid memory or trusted environment
         let exit: ModuleExitFn = unsafe { core::mem::transmute(exit_addr) };
+        // Exit may invoke owner-scoped device/service cleanup exports just
+        // like a probe or poller callback. Bind those calls to this already
+        // identified module, and restore any enclosing callback owner.
+        let previous_owner = crate::symbols::swap_execution_context(module.id);
         // Same domain scope as init: the exit handler is module code and
         // runs under the module's own rights.
-        let previous_owner = crate::symbols::swap_execution_context(module.id);
         let domain_scope = crate::domain::enter(module.domain);
         // SAFETY: `exit` points at the module's relocated cleanup routine
         // (see above). The module is Live/Going with refcount zero, so no

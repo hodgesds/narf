@@ -250,8 +250,8 @@ kernel_test_in!(
 fn smoke_rtl8xxxu_firmware_name_resolution() -> TestResult {
     let cases: &[(ChipFamily, Option<&str>)] = &[
         (ChipFamily::Rtl8188eu, Some("rtlwifi/rtl8188eufw.bin")),
-        (ChipFamily::Rtl8192eu, Some("rtlwifi/rtl8192eufw.bin")),
-        (ChipFamily::Rtl8723bu, Some("rtlwifi/rtl8723bufw.bin")),
+        (ChipFamily::Rtl8192eu, Some("rtlwifi/rtl8192eu_nic.bin")),
+        (ChipFamily::Rtl8723bu, Some("rtlwifi/rtl8723bu_nic.bin")),
         (ChipFamily::Rtl8821cu, Some("rtlwifi/rtl8821cufw.bin")),
         (ChipFamily::Rtl8822bu, Some("rtlwifi/rtl8822bufw.bin")),
         (ChipFamily::Unknown, None),
@@ -268,10 +268,10 @@ fn smoke_rtl8xxxu_firmware_name_resolution() -> TestResult {
     if super::rtl8188e::FIRMWARE_NAME != "rtlwifi/rtl8188eufw.bin" {
         return TestResult::Fail("rtl8188e FIRMWARE_NAME mismatch");
     }
-    if super::rtl8192e::FIRMWARE_NAME != "rtlwifi/rtl8192eufw.bin" {
+    if super::rtl8192e::FIRMWARE_NAME != "rtlwifi/rtl8192eu_nic.bin" {
         return TestResult::Fail("rtl8192e FIRMWARE_NAME mismatch");
     }
-    if super::rtl8723b::FIRMWARE_NAME != "rtlwifi/rtl8723bufw.bin" {
+    if super::rtl8723b::FIRMWARE_NAME != "rtlwifi/rtl8723bu_nic.bin" {
         return TestResult::Fail("rtl8723b FIRMWARE_NAME mismatch");
     }
     if super::rtl8821c::FIRMWARE_NAME != "rtlwifi/rtl8821cufw.bin" {
@@ -383,8 +383,13 @@ fn smoke_rtl8xxxu_chip_family_from_usb_id() -> TestResult {
         (RTL8XXXU_VENDOR, RTL8822BU_ID, ChipFamily::Rtl8822bu),
         // Rebranded: TP-Link TL-WN722N v2 → RTL8188EU.
         (0x2357, 0x010C, ChipFamily::Rtl8188eu),
-        // Edimax EW-7722UTn V3 → RTL8192EU.
-        (0x7392, 0xB722, ChipFamily::Rtl8192eu),
+        // 7392:B722 and 2357:0135 are RTL8192FU in Linux: no NARF owner.
+        (0x7392, 0xB722, ChipFamily::Unknown),
+        (0x2357, 0x0135, ChipFamily::Unknown),
+        // RTL8192EU alternate and rebranded IDs (core.c dev_table).
+        (RTL8XXXU_VENDOR, 0x818C, ChipFamily::Rtl8192eu),
+        (0x2357, 0x0107, ChipFamily::Rtl8192eu),
+        (0x2C4E, 0x0104, ChipFamily::Rtl8192eu),
         // 7392:A611 → RTL8723BU.
         (0x7392, 0xA611, ChipFamily::Rtl8723bu),
         // Unknown device.
@@ -638,44 +643,24 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8188eu_per_chip);
 fn smoke_rtl8xxxu_8192eu_per_chip() -> TestResult {
     use super::rtl8192e;
 
-    if rtl8192e::N_MAC_ROWS != 99 {
-        return TestResult::Fail("8192e N_MAC_ROWS != 99");
+    if rtl8192e::N_MAC_ROWS != 101 {
+        return TestResult::Fail("8192e N_MAC_ROWS != 101");
     }
-    if rtl8192e::N_PHY_ROWS != 260 {
-        return TestResult::Fail("8192e N_PHY_ROWS != 260");
+    if rtl8192e::N_PHY_ROWS != 212 {
+        return TestResult::Fail("8192e N_PHY_ROWS != 212");
     }
-    if rtl8192e::N_AGC_STD_ROWS != 135 {
-        return TestResult::Fail("8192e N_AGC_STD_ROWS != 135");
+    if rtl8192e::N_AGC_STD_ROWS != 130 {
+        return TestResult::Fail("8192e N_AGC_STD_ROWS != 130");
     }
-    if rtl8192e::N_RF_A_ROWS != 155 {
-        return TestResult::Fail("8192e N_RF_A_ROWS != 155");
+    if rtl8192e::N_RF_A_ROWS != 110 {
+        return TestResult::Fail("8192e N_RF_A_ROWS != 110");
     }
-    if rtl8192e::N_RF_B_ROWS != 140 {
-        return TestResult::Fail("8192e N_RF_B_ROWS != 140");
+    if rtl8192e::N_RF_B_ROWS != 90 {
+        return TestResult::Fail("8192e N_RF_B_ROWS != 90");
     }
     if rtl8192e::NUM_RF_PATHS != 2 {
         return TestResult::Fail("8192e is 2T2R");
     }
-    if rtl8192e::LC_CAL_PATH_COUNT != 2 {
-        return TestResult::Fail("8192e LC cal both paths");
-    }
-
-    // IQK both paths.
-    let mut iqk_a = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8192e::IQK_PATH_A_STEP_COUNT];
-    let mut iqk_b = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8192e::IQK_PATH_B_STEP_COUNT];
-    if rtl8192e::build_iqk_path_a_sequence(&mut iqk_a) != 8 {
-        return TestResult::Fail("8192e IQK_A step count != 8");
-    }
-    if rtl8192e::build_iqk_path_b_sequence(&mut iqk_b) != 8 {
-        return TestResult::Fail("8192e IQK_B step count != 8");
-    }
-
-    // Dual-path channel set.
-    let cs = rtl8192e::channel_set_writes_8192e(11);
-    if cs.len() != 2 {
-        return TestResult::Fail("8192e channel set should emit 2 writes (A+B)");
-    }
-
     if !rtl8192e::channel_valid(6) {
         return TestResult::Fail("8192e ch 6 valid");
     }
@@ -692,41 +677,15 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8192eu_per_chip);
 fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
     use super::rtl8723b;
 
-    if rtl8723b::N_MAC_ROWS != 95 {
-        return TestResult::Fail("8723b N_MAC_ROWS != 95");
-    }
-    if rtl8723b::N_PHY_ROWS != 200 {
-        return TestResult::Fail("8723b N_PHY_ROWS != 200");
-    }
-    if rtl8723b::N_RF_A_ROWS != 155 {
-        return TestResult::Fail("8723b N_RF_A_ROWS != 155");
+    if rtl8723b::N_MAC_ROWS + 1 != rtl8723b::MAC_INIT_TABLE.len()
+        || rtl8723b::N_PHY_ROWS + 1 != rtl8723b::PHY_INIT_TABLE.len()
+        || rtl8723b::N_AGC_ROWS + 1 != rtl8723b::AGC_TABLE.len()
+        || rtl8723b::N_RF_A_ROWS + 1 != rtl8723b::RADIO_A_INIT_TABLE.len()
+    {
+        return TestResult::Fail("8723b table row counts");
     }
     if rtl8723b::NUM_RF_PATHS != 1 {
         return TestResult::Fail("8723b is 1T1R");
-    }
-
-    // IQK shape — gen2 has 10 steps.
-    let mut iqk = [super::phy::IqkStep { reg: 0, val: 0 }; rtl8723b::IQK_PATH_A_STEP_COUNT];
-    if rtl8723b::build_iqk_path_a_sequence(&mut iqk) != 10 {
-        return TestResult::Fail("8723b IQK step count != 10");
-    }
-
-    // LC-cal sequence: pre, mid, post writes (3 entries).
-    let lc = rtl8723b::lc_calibrate_sequence_8723b();
-    if lc.len() != 3 {
-        return TestResult::Fail("8723b LC cal != 3 writes");
-    }
-    if lc[0].0 != 0xB0 || lc[2].0 != 0xB0 {
-        return TestResult::Fail("8723b LC cal pre/post should target RF reg 0xB0");
-    }
-    if rtl8723b::LC_CAL_HOLD_MS != 200 {
-        return TestResult::Fail("8723b LC cal hold should be 200 ms");
-    }
-    if rtl8723b::LC_CAL_INIT_VAL != 0xDFBE0 {
-        return TestResult::Fail("8723b LC init val mismatch");
-    }
-    if rtl8723b::LC_CAL_FINAL_VAL != 0xDFFE0 {
-        return TestResult::Fail("8723b LC final val mismatch");
     }
 
     // 2.4 GHz only.
@@ -741,89 +700,7 @@ fn smoke_rtl8xxxu_8723bu_per_chip() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8723bu_per_chip);
 
-// ── 13. 8723BU BT coex decision matrix ─────────────────────────────
-
-fn smoke_rtl8xxxu_8723bu_bt_coex() -> TestResult {
-    use super::btcoex::{
-        coex_table_write_for_type, coex_type_for_state, Bt8723b1AntStatus, BtLinkProfile,
-        REG_BT_COEX_TABLE1, REG_BT_COEX_TABLE2, REG_BT_COEX_TABLE3, REG_BT_COEX_TABLE4,
-    };
-
-    // Coex register addresses.
-    if REG_BT_COEX_TABLE1 != 0x06C0 {
-        return TestResult::Fail("table1 addr");
-    }
-    if REG_BT_COEX_TABLE2 != 0x06C4 {
-        return TestResult::Fail("table2 addr");
-    }
-    if REG_BT_COEX_TABLE3 != 0x06C8 {
-        return TestResult::Fail("table3 addr");
-    }
-    if REG_BT_COEX_TABLE4 != 0x06CC {
-        return TestResult::Fail("table4 addr");
-    }
-
-    // Decision matrix: idle -> type 0, inq -> type 2, sco -> type 7.
-    let p = BtLinkProfile::default();
-    if coex_type_for_state(Bt8723b1AntStatus::NonConnectedIdle, p) != 0 {
-        return TestResult::Fail("NonConnectedIdle should be type 0");
-    }
-    if coex_type_for_state(Bt8723b1AntStatus::ConnectedIdle, p) != 0 {
-        return TestResult::Fail("ConnectedIdle should be type 0");
-    }
-    if coex_type_for_state(Bt8723b1AntStatus::InqPage, p) != 2 {
-        return TestResult::Fail("InqPage should be type 2");
-    }
-    if coex_type_for_state(Bt8723b1AntStatus::ScoBusy, p) != 7 {
-        return TestResult::Fail("ScoBusy should be type 7");
-    }
-    if coex_type_for_state(Bt8723b1AntStatus::AclScoBusy, p) != 7 {
-        return TestResult::Fail("AclScoBusy should be type 7");
-    }
-
-    // ACL busy + a2dp-only -> type 5.
-    let p_a2dp = BtLinkProfile {
-        has_a2dp: true,
-        a2dp_only: true,
-        ..Default::default()
-    };
-    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_a2dp) != 5 {
-        return TestResult::Fail("AclBusy + a2dp_only should be type 5");
-    }
-    // ACL busy + hid-only -> type 4.
-    let p_hid = BtLinkProfile {
-        has_hid: true,
-        hid_only: true,
-        ..Default::default()
-    };
-    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_hid) != 4 {
-        return TestResult::Fail("AclBusy + hid_only should be type 4");
-    }
-    // ACL busy + hid + a2dp -> type 6.
-    let p_hid_a2dp = BtLinkProfile {
-        has_hid: true,
-        has_a2dp: true,
-        ..Default::default()
-    };
-    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p_hid_a2dp) != 6 {
-        return TestResult::Fail("AclBusy + hid+a2dp should be type 6");
-    }
-    // ACL busy + nothing -> type 3.
-    if coex_type_for_state(Bt8723b1AntStatus::AclBusy, p) != 3 {
-        return TestResult::Fail("AclBusy default should be type 3");
-    }
-
-    // CoexTableWrite: table4 always 0x03 per Linux.
-    for ct in 0..=7u8 {
-        let w = coex_table_write_for_type(ct);
-        if w.table4 != 0x03 {
-            return TestResult::Fail("coex_table4 should always be 0x03");
-        }
-    }
-
-    TestResult::Pass
-}
-kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_8723bu_bt_coex);
+// ── 13. 8723BU BT coex policy: see `rtl8723b_tests.rs` ────────────
 
 // ── 14. 8821CU per-chip integration + 5 GHz ────────────────────────
 

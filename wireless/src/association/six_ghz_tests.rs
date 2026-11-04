@@ -54,7 +54,7 @@ fn ies(six: [u8; 5], with_6ghz_cap: bool) -> Vec<u8> {
 fn band_identity() -> Result<(), &'static str> {
     if channel::frequency_in(Band::Ghz6, 37) != Some(6135)
         || channel::frequency_in(Band::Ghz6, 2) != Some(5935)
-        || channel::frequency_in(Band::Ghz6, 235).is_some()
+        || channel::frequency_in(Band::Ghz6, 255).is_some()
         || channel::frequency_in(Band::Ghz5, 37).is_some()
         || channel::frequency_in(Band::Ghz5, 36) != Some(5180)
         || channel::frequency(36) != Some(5180)
@@ -69,6 +69,57 @@ fn band_identity() -> Result<(), &'static str> {
         || channel::from_frequency_band(7120).is_some()
     {
         return Err("frequency-to-band mapping");
+    }
+    for channel in [237, 241, 245, 249, 253] {
+        let mhz = 5950 + 5 * u32::from(channel);
+        if channel::frequency_in(Band::Ghz6, channel) != Some(mhz)
+            || channel::from_frequency_band(mhz) != Some((Band::Ghz6, channel))
+            || !channel::valid_6ghz(channel)
+            || admit(&ies([channel, 0, channel, 0, 6], true), channel).is_err()
+        {
+            return Err("source-supported UNII9 channel/planner geometry disagrees");
+        }
+        let restricted = crate::reg::RegRule {
+            freq_start_mhz: 5945,
+            freq_end_mhz: 7125,
+            max_bandwidth_mhz: 320,
+            max_power_dbm: 17,
+            flags: RegFlags::empty(),
+        };
+        if admit_with_rule(
+            &ies([channel, 0, channel, 0, 6], true),
+            channel,
+            &restricted,
+        )
+        .is_ok()
+        {
+            return Err("UNII9 geometry granted admission outside current regulatory rule");
+        }
+    }
+    let mut report = vec![0, 4, b'n', b'a', b'r', b'f', 201, 13, 0, 9, 131, 253, 0];
+    report.extend_from_slice(&[2, 9, 8, 7, 6, 5]);
+    report.extend_from_slice(&[0x52, 8]);
+    let colocated = crate::scan::parse_colocated_aps(&report);
+    let request = crate::scan::ScanRequest {
+        ssids: vec![b"narf".to_vec()],
+        frequencies_mhz: vec![7215],
+        channels: Vec::new(),
+        active: true,
+        random_mac: None,
+        colocated_6ghz: true,
+        duration_tu: None,
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let plan = crate::scan::plan_6ghz_scan(&request, &colocated, None);
+    if colocated.len() != 1
+        || colocated[0].channel != 253
+        || colocated[0].frequency_mhz != 7215
+        || plan.frequencies_mhz != [7215]
+        || plan.targets.len() != 1
+        || plan.targets[0].channel != 253
+    {
+        return Err("UNII9 RNR and scan planners disagreed with shared frequency geometry");
     }
     let mut bss = Bss {
         bssid: [2, 0, 0, 0, 0, 2],

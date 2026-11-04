@@ -14,24 +14,36 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::udp_ipv4;
 
+#[path = "ap_native_tests.rs"]
+mod ap_native_tests;
 #[path = "channel_station_tests.rs"]
 mod channel_station_tests;
+#[path = "chip_station_tests.rs"]
+mod chip_station_tests;
 #[path = "ht40_tests.rs"]
 mod ht40_tests;
 #[path = "ht_tests.rs"]
 mod ht_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
+#[path = "monitor_native_tests.rs"]
+mod monitor_native_tests;
 #[path = "optional_mfp_tests.rs"]
 mod optional_mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "prefix_station_tests.rs"]
+mod prefix_station_tests;
 #[path = "scan_ies_tests.rs"]
 mod scan_ies_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
+#[path = "vif_msgbuf_tests.rs"]
+mod vif_msgbuf_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
+#[path = "wowl_tests.rs"]
+mod wowl_tests;
 
 type ModelDevice = Device<TestAdapter>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
@@ -59,6 +71,9 @@ struct Configuration {
     phy: Option<(u32, u8)>,
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
     vht: Option<crate::cyw43439::phy_fixture::Vht80>,
+    prefix: u32,
+    /// Another covered chip identity (`station_model::create_chip`).
+    chip: Option<(u32, u16, u16)>,
 }
 /// The station shell the harness and the generation publisher build.
 fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
@@ -73,6 +88,7 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
     let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
     let ht_capabilities = station.ht_capabilities();
     let vht_capabilities = station.vht_capabilities();
+    let wowl = station.wowl();
     let (rx, consumer) = narf_ipc::channel();
     let (producer, tx) = narf_ipc::channel();
     let device = Arc::new(Device {
@@ -82,6 +98,13 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
             tx,
             pending: None,
             telemetry: telemetry.clone(),
+            ap: None,
+            ap_data_generation: 0,
+            ap_epoch_changed: false,
+            monitor: None,
+            vif: None,
+            secondaries: Vec::new(),
+            p2p: None,
         }),
         name: name.clone(),
         mac: OWN,
@@ -94,6 +117,9 @@ fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
         pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
         ht_capabilities,
         vht_capabilities,
+        wowl,
+        wowlan: IrqSafeSpinLock::new(None),
+        wakeup: IrqSafeSpinLock::new(None),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
         bssid: AtomicU64::new(0),
@@ -189,6 +215,8 @@ impl Harness {
                 phy: features.1,
                 wide: None,
                 vht: None,
+                prefix: 0,
+                chip: None,
             },
         )
     }
@@ -212,6 +240,8 @@ impl Harness {
                 phy: Some((7, 0)),
                 wide: Some(wide),
                 vht: None,
+                prefix: 0,
+                chip: None,
             },
         )
     }
@@ -236,6 +266,33 @@ impl Harness {
                 phy: Some((chains, 0)),
                 wide: None,
                 vht: Some(vht),
+                prefix: 0,
+                chip: None,
+            },
+        )
+    }
+    /// `new_vht` over the CR4 model discovered as another covered chip.
+    fn new_vht_chip(
+        version: u32,
+        channel: u8,
+        chains: u32,
+        vht: crate::cyw43439::phy_fixture::Vht80,
+        chip: (u32, u16, u16),
+    ) -> Result<Self, &'static str> {
+        Self::new_details(
+            version,
+            false,
+            false,
+            false,
+            channel,
+            None,
+            Configuration {
+                mfp: None,
+                phy: Some((chains, 0)),
+                wide: None,
+                vht: Some(vht),
+                prefix: 0,
+                chip: Some(chip),
             },
         )
     }
@@ -248,7 +305,17 @@ impl Harness {
         database: Option<Arc<narf_wireless::reg::db::Database>>,
         features: Configuration,
     ) -> Result<Self, &'static str> {
-        let (adapter, bus) = if selected {
+        let (adapter, bus) = if let Some(chip) = features.chip {
+            if selected || features.prefix != 0 {
+                return Err("chip fixture uses an explicit board profile");
+            }
+            firmware::create_chip(version, secured, chip)
+        } else if features.prefix != 0 {
+            if selected || version != 7 {
+                return Err("prefix fixture requires explicit v7 native geometry");
+            }
+            firmware::create_prefixed(secured, features.prefix)
+        } else if selected {
             let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
                 crate::brcmfmac::provision::Family::Pcie43602,
             )?;
@@ -267,7 +334,11 @@ impl Harness {
         }
         let mut domain = firmware::domain();
         let wide = features.wide.is_some() || features.vht.is_some();
-        let width = if features.vht.is_some() {
+        // A 160 MHz fixture BSS needs one 160 MHz rule over its span.
+        let wide160 = features.vht.as_ref().is_some_and(|v| v.is160());
+        let width = if wide160 {
+            160
+        } else if features.vht.is_some() {
             80
         } else if wide {
             40
@@ -283,11 +354,19 @@ impl Harness {
         }
         if channel > 14 {
             use narf_wireless::reg::{RegFlags, RegRule};
-            for (start, end, flags) in [
+            let rules160 = [
+                (5170, 5330, RegFlags::empty()),
+                (5735, 5835, RegFlags::empty()),
+            ];
+            let rules = [
                 (5170, 5250, RegFlags::empty()),
                 (5250, 5330, RegFlags::DFS),
                 (5735, 5835, RegFlags::empty()),
-            ] {
+            ];
+            for (start, end, flags) in if wide160 { &rules160[..] } else { &rules[..] }
+                .iter()
+                .copied()
+            {
                 domain.rules.push(RegRule {
                     freq_start_mhz: start,
                     freq_end_mhz: end,

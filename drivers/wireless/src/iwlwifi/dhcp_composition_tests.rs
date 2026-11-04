@@ -13,6 +13,40 @@ use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 #[path = "sc_source_tests.rs"]
 mod source_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "sc_power_tests.rs"]
+mod power_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "sc_security_tests.rs"]
+mod security_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "sc_he_tests.rs"]
+mod he_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "sc_rx_multi_tests.rs"]
+mod rx_multi_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "sc_tx_amsdu_tests.rs"]
+mod tx_amsdu_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "ap_native_tests.rs"]
+mod ap_native_tests;
+#[path = "gen3_station_tests.rs"]
+mod gen3_station_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "native_160_tests.rs"]
+mod native_160_tests;
+#[path = "sc_scheduled_tests.rs"]
+mod scheduled_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "six_ghz_native_tests.rs"]
+mod six_ghz_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -49,9 +83,124 @@ enum Fault {
     HoldRemoval,
     HoldRxFence,
     HoldGroupReply,
+    HoldScan,
+    HoldPower,
+    HoldSixPower,
+    SixResponseWithoutTpe,
+    SixResponseNarrow80,
+    SixRnrReport,
+    HoldIgtk,
+    WrongSaeSelector,
+    HoldHe,
+    HoldRfh,
+    MalformedRfh,
+    HoldSmem,
+    HoldData,
 }
 
+/// Authored firmware/NVM/AP facts, only for the native HE composition.
+#[derive(Clone, Copy)]
+struct PhyModel {
+    width: u8,
+    streams: u8,
+    rates: u8,
+    mcc_he: bool,
+    response_he: bool,
+}
+/// Independently authored6GHz firmware/AP facts, separate from numeric
+/// legacy PhyModel::channel and actual Hardware/Device policy fields.
+#[derive(Clone, Copy)]
+struct SixModel {
+    channel: u8,
+    regulatory: u8,
+    nvm_flags: u32,
+    mcc_flags: u32,
+    api59: bool,
+    tpe: i8,
+    alias: bool,
+}
+impl PhyModel {
+    fn channel(self) -> u8 {
+        if self.width >= 2 {
+            36
+        } else {
+            6
+        }
+    }
+    fn chains(self) -> u32 {
+        if self.streams == 2 {
+            3
+        } else {
+            1
+        }
+    }
+}
+
+/// Actual reported/default receive contracts are authored into firmware
+/// metadata; no production cache/admission field is supplied separately.
+#[derive(Clone, Copy)]
+enum ReceiveModel {
+    Single,
+    ExplicitV1,
+    NativeSc,
+    Unsupported,
+    Ap,
+    Client,
+    P2p,
+}
+impl From<bool> for ReceiveModel {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::ExplicitV1
+        } else {
+            Self::Single
+        }
+    }
+}
+impl ReceiveModel {
+    fn commands(self, versions: &mut Vec<u8>) {
+        match self {
+            Self::Single => {}
+            Self::ExplicitV1 => versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 1, 1, 0]),
+            Self::NativeSc => versions.extend_from_slice(&[0x0d, 5, 2, 0]),
+            Self::Unsupported => versions.extend_from_slice(&[0x0d, 5, 3, 0]),
+            // Exact installed Sc core103 beacon14/flush2 contracts. These
+            // additional commands neither invent RX capability nor a role.
+            Self::Ap | Self::Client => versions.extend_from_slice(&[0x91, 1, 14, 0, 0x1e, 1, 2, 1]),
+            Self::P2p => versions.extend_from_slice(&[
+                // The actual Sc AP contract is needed to exercise native
+                // parent-AP exclusion, rather than an unsupported role.
+                0x91, 1, 14, 0, 0x0e, 3, 6, 0, 0xf8, 3, 99, 1, 0x1e, 1, 2, 1, 0x1c, 1, 11, 9, 0x1c,
+                0, 11, 9, 0xc1, 0, 99, 8,
+            ]),
+        }
+    }
+    fn capability(self, image: &mut Vec<u8>) {
+        if matches!(self, Self::NativeSc | Self::Unsupported) {
+            image.extend_from_slice(&30u32.to_le_bytes());
+            image.extend_from_slice(&8u32.to_le_bytes());
+            image.extend_from_slice(&[2, 0, 0, 0, 0x10, 0, 0, 0]);
+        }
+    }
+    fn enabled(self) -> bool {
+        matches!(self, Self::ExplicitV1 | Self::NativeSc)
+    }
+}
+/// Test-authored firmware capability TLVs and the literal native SMEM
+/// response. Production cache fields are populated only by parsing/receipts.
+#[derive(Clone)]
+struct TxModel {
+    extended: bool,
+    cdb: bool,
+    version: u8,
+    memory: Vec<u8>,
+}
 struct Wire {
+    client: bool,
+    client_mac: u8,
+    client_public: Vec<Vec<u8>>,
+    hold_client_public: bool,
+    hold_client_filter: bool,
     firmware: model::Firmware,
     trace: TxTrace,
     versions: Vec<u8>,
@@ -75,6 +224,36 @@ struct Wire {
     held_rx: Option<u32>,
     m4: bool,
     error: Option<&'static str>,
+    power_expectation: Option<i16>,
+    security_fault_applied: bool,
+    sa_query_reply: Option<[u8; 4]>,
+    sae_h2e_only: bool,
+    group_replay: u64,
+    igtk_expected: Option<([u8; 16], u16, u64)>,
+    gtk_expected: Option<(u8, [u8; 16])>,
+    phy: Option<PhyModel>,
+    phy_requests: Vec<Vec<u8>>,
+    multi_receive: bool,
+    rx_queues: Vec<model::ReceiveFirmware>,
+    hold_rx_queue: Option<u8>,
+    held_markers: Vec<(u8, Vec<u8>)>,
+    baid_live: bool,
+    tx_model: Option<TxModel>,
+    aggregates: Vec<Vec<Vec<u8>>>,
+    held_data: Vec<(u16, u16)>,
+    scheduled: Option<scheduled_tests::Model>,
+    api89: Option<gen3_station_tests::Case>,
+    bz: Option<super::super::bz_fixture::Case>,
+    mcc_caps_override: Option<u32>,
+    mcc_permissions: Option<Vec<u32>>,
+    six: Option<SixModel>,
+    eht: Option<eht_tests::Model>,
+    wide_six: Option<wide_six_tests::Model>,
+    mld: Option<mlo_tests::Model>,
+    mld_m3: Option<Vec<u8>>,
+    mld_tx: mlo_tests::TxState,
+    native_ap: Option<ap_native_tests::Model>,
+    native_p2p: Option<p2p_tests::Model>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -163,25 +342,102 @@ impl Wire {
             .map(|entry| if entry[2] == 99 { 0 } else { entry[2] })
             .unwrap_or(0);
         require(
-            bytes[7] == 0
+            bytes[7]
+                == if self.api89.is_some() && (group, cmd) == (5, 8) {
+                    2
+                } else {
+                    0
+                }
                 && usize::from(half(bytes, 4)) + 8 == bytes.len()
                 && sequence == (p.pointer.wrapping_sub(1) & 0xff),
             "Sc bare/WIDE_ID command header",
         )?;
         let body = &bytes[8..];
         self.commands.push((group, cmd, body.to_vec()));
+        if let Some(p2p) = &mut self.native_p2p {
+            if let Some(response) = p2p.command(group, cmd, version, body, &mut self.firmware)? {
+                if p2p.hold == Some((group, cmd)) {
+                    p2p.held = Some(response);
+                    self.held = Some((cmd, if group == 1 { 0 } else { group }, sequence));
+                } else {
+                    self.firmware.inject(
+                        cmd,
+                        if group == 1 { 0 } else { group },
+                        sequence,
+                        &response,
+                    );
+                }
+                return Ok(());
+            }
+        }
+        if let Some(ap) = &mut self.native_ap {
+            if let Some(response) = ap.command(group, cmd, version, body)? {
+                if let Some(noa) = ap.take_initial_noa() {
+                    self.firmware.inject(0xfc, 3, 0x8000, &noa);
+                }
+                if ap.hold == Some((group, cmd)) {
+                    ap.held = Some(response);
+                    self.held = Some((cmd, if group == 1 { 0 } else { group }, sequence));
+                } else {
+                    self.firmware.inject(
+                        cmd,
+                        if group == 1 { 0 } else { group },
+                        sequence,
+                        &response,
+                    );
+                }
+                return Ok(());
+            }
+        }
         let mut response = Vec::new();
         match (group, cmd) {
+            (1, 0x25) | (2, 0) if self.tx_model.is_some() => {
+                let tx = self.tx_model.as_ref().unwrap();
+                require(
+                    body.is_empty()
+                        && bytes[6] == 0
+                        && ((group, cmd) == if tx.extended { (2, 0) } else { (1, 0x25) }),
+                    "Sc shared-memory command ignored actual firmware TLV capability",
+                )?;
+                response = tx.memory.clone();
+                if self.fault == Fault::HoldSmem {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
             (0xc, 2) => {
                 require(body == [0; 4] && version == 1, "Sc NVM request")?;
                 // The authored MLD table selects iwl_nvm_get_info_rsp v4:
                 // legacy-only single-chain NVM, 14 valid channels/110 entries.
                 response.resize(28 + 110 * 4, 0);
-                response[12..16].copy_from_slice(&1u32.to_le_bytes());
-                response[16..20].copy_from_slice(&1u32.to_le_bytes());
-                response[24..28].copy_from_slice(&14u32.to_le_bytes());
-                for i in 0..14 {
-                    response[28 + i * 4..32 + i * 4].copy_from_slice(&1u32.to_le_bytes());
+                let count = if self.six.is_some() {
+                    110u32
+                } else if self.phy.is_some() {
+                    51
+                } else {
+                    14
+                };
+                let chains = self.phy.map_or(1, PhyModel::chains);
+                response[8..12].copy_from_slice(&self.phy.map_or(0u32, |_| 28).to_le_bytes());
+                response[12..16].copy_from_slice(&chains.to_le_bytes());
+                response[16..20].copy_from_slice(&chains.to_le_bytes());
+                response[24..28].copy_from_slice(&count.to_le_bytes());
+                for i in 0..count as usize {
+                    let flags = if i >= 51 {
+                        self.wide_six.map_or_else(
+                            || self.six.map_or(0, |six| six.nvm_flags),
+                            |wide| wide.nvm_flags((i - 51) as u8),
+                        )
+                    } else {
+                        1u32 | if self.phy.is_some_and(|phy| phy.width == 3)
+                            && (14..22).contains(&i)
+                        {
+                            1 << 11
+                        } else {
+                            0
+                        }
+                    };
+                    response[28 + i * 4..32 + i * 4].copy_from_slice(&flags.to_le_bytes());
                 }
             }
             (1, 0xc8) => {
@@ -189,10 +445,70 @@ impl Wire {
                     body.len() == 28 && half(body, 0) == u16::from_be_bytes(*b"US") && body[2] == 2,
                     "Sc MCC source/country",
                 )?;
-                response.resize(24 + 14 * 4, 0);
-                response[20..24].copy_from_slice(&14u32.to_le_bytes());
-                for i in 0..14 {
-                    response[24 + i * 4..28 + i * 4].copy_from_slice(&13u32.to_le_bytes());
+                let count = if self.six.is_some() {
+                    110u32
+                } else if self.phy.is_some() {
+                    51
+                } else {
+                    14
+                };
+                let first = if self.api89.is_some() { 20 } else { 24 };
+                response.resize(first + count as usize * 4, 0);
+                response[4..6].copy_from_slice(&body[..2]);
+                let capabilities = (1u32 << 4)
+                    | (1 << 3)
+                    | if self.phy.is_some_and(|phy| !phy.mcc_he) {
+                        1 << 13
+                    } else {
+                        0
+                    };
+                if self.api89.is_some() {
+                    let bits: u16 = 0x118
+                        | if self.phy.is_some_and(|phy| !phy.mcc_he) {
+                            1 << 10
+                        } else {
+                            0
+                        };
+                    let bits = if let Some(value) = self.mcc_caps_override {
+                        u16::try_from(value).map_err(|_| "fixture MCC v6 cap word")?
+                    } else {
+                        bits
+                    };
+                    response[6..8].copy_from_slice(&bits.to_le_bytes());
+                } else {
+                    response[8..12].copy_from_slice(
+                        &self.mcc_caps_override.unwrap_or(capabilities).to_le_bytes(),
+                    );
+                }
+                response[first - 4..first].copy_from_slice(&count.to_le_bytes());
+                let permission = if self.phy.is_some() {
+                    13u32
+                        | (1 << 9)
+                        | (1 << 10)
+                        | if self.phy.is_some_and(|phy| phy.width == 3) {
+                            1 << 11
+                        } else {
+                            0
+                        }
+                } else {
+                    13
+                };
+                for i in 0..count as usize {
+                    let permission = self.mcc_permissions.as_ref().map_or_else(
+                        || {
+                            if i >= 51 {
+                                self.wide_six.map_or_else(
+                                    || self.six.map_or(permission, |six| six.mcc_flags),
+                                    |wide| wide.mcc_flags((i - 51) as u8),
+                                )
+                            } else {
+                                permission
+                            }
+                        },
+                        |flags| flags[i],
+                    );
+                    response[first + i * 4..first + 4 + i * 4]
+                        .copy_from_slice(&permission.to_le_bytes());
                 }
             }
             (5, 0x17) => {
@@ -203,7 +519,7 @@ impl Wire {
                 let tid = body[8];
                 if word(body, 0) == 0 {
                     require(
-                        matches!(tid, 0 | 15)
+                        (matches!(tid, 0 | 15) || self.phy.is_some() && matches!(tid, 1 | 4 | 6))
                             && word(body, 16) == 4
                             && body[20..28] != [0; 8]
                             && body[28..36] != [0; 8]
@@ -235,39 +551,242 @@ impl Wire {
             }
             (5, 0x18) => {
                 require(
-                    version == 1 && body.len() == 80 && word(body, 0) == 1 && word(body, 4) == 1,
+                    version == 1 && body.len() == 80 && word(body, 4) == 1,
                     "Sc native key command",
                 )?;
+                if word(body, 0) == 3 {
+                    require(
+                        self.ap.pmf()
+                            && ((word(body, 12) == 0x6a && (4..=5).contains(&word(body, 8)))
+                                || (self.mld.is_some()
+                                    && word(body, 12) == 0x22
+                                    && word(body, 8) == 0)
+                                || (self.gtk_expected.is_some()
+                                    && word(body, 12) == 0x4a
+                                    && word(body, 8) <= 3))
+                            && body[16..].iter().all(|b| *b == 0),
+                        "Sc IGTK removal native identity/flags",
+                    )?;
+                    self.firmware.inject(cmd, group, sequence, &[]);
+                    return Ok(());
+                }
+                require(word(body, 0) == 1, "Sc native key action")?;
                 match word(body, 12) {
-                    2 => require(
-                        word(body, 8) == 0 && self.key.as_deref() == Some(&body[16..32]),
+                    2 | 0x22 => require(
+                        word(body, 8) == 0
+                            && word(body, 12) == if self.ap.pmf() { 0x22 } else { 2 }
+                            && self.key.as_deref() == Some(&body[16..32]),
                         "Sc installed PTK differs from AP exchange",
                     )?,
                     0x4a => require(
-                        (word(body, 8) == 1 && body[16..32] == [0x77; 16])
-                            || self.group_rekey && word(body, 8) == 2 && body[16..32] == [0x88; 16],
+                        self.gtk_expected.map_or_else(
+                            || {
+                                (word(body, 8) == 1 && body[16..32] == [0x77; 16])
+                                    || self.group_rekey
+                                        && word(body, 8) == 2
+                                        && body[16..32] == [0x88; 16]
+                            },
+                            |(id, material)| {
+                                word(body, 8) == u32::from(id) && body[16..32] == material
+                            },
+                        ),
                         "Sc installed GTK differs from M3",
                     )?,
+                    0x6a => {
+                        let (material, id) = self
+                            .igtk_expected
+                            .map(|(material, id, _)| (material, id))
+                            .or_else(|| self.ap.igtk())
+                            .ok_or("Sc installed unnegotiated IGTK")?;
+                        require(
+                            word(body, 8) == u32::from(id)
+                                && body[16..32] == material
+                                && self
+                                    .igtk_expected
+                                    .is_none_or(|(_, _, pn)| body[64..72] == pn.to_le_bytes()),
+                            "Sc native IGTK differs from authenticated M3",
+                        )?;
+                        if self.fault == Fault::HoldIgtk {
+                            self.held = Some((cmd, group, sequence));
+                            return Ok(());
+                        }
+                    }
                     _ => return Err("Sc key flags"),
                 }
                 self.keys += 1;
             }
-            (5, 2) => require(
-                body.len() == 20
-                    && bytes[6] == 0
-                    && body[..16] == [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]
-                    && word(body, 16) != 0,
-                "Sc EMPTY single-RFH epoch native contract",
-            )?,
-            (3, 8) => require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?,
+            (5, 0x0d) if self.multi_receive => {
+                self.rx_queues.clear();
+                require(
+                    body.len() == 68 && body[..4] == [2, 0, 0, 0],
+                    "Sc additional RFH v1 extent/count",
+                )?;
+                for (index, entry) in body[4..].chunks_exact(32).enumerate() {
+                    require(
+                        entry[..4] == [index as u8 + 1, 0, 0, 0] && word(entry, 28) == 504,
+                        "Sc additional RFH queue/enable/write index",
+                    )?;
+                }
+            }
+            (1, 0xb3) if self.multi_receive => {
+                require(
+                    body.len() == 176
+                        && body[..8] == [1, 0, 0, 0, 0x3f, 0, 0, 0]
+                        && body[48..]
+                            .iter()
+                            .enumerate()
+                            .all(|(i, q)| *q == 1 + (i % 2) as u8),
+                    "Sc RSS v1 flags/hash/indirection",
+                )?;
+                let configuration = &self
+                    .commands
+                    .iter()
+                    .rev()
+                    .find(|(g, c, _)| (*g, *c) == (5, 0x0d))
+                    .ok_or("Sc RSS before RFH")?
+                    .2;
+                for queue in 1..=2 {
+                    // SAFETY: Guard retains Hardware until this Wire and all
+                    // views are destroyed; HARNESS serializes device injection
+                    // with every production host poll of the actual rings.
+                    let view = unsafe { self.trace.take_receive_queue(queue) }
+                        .ok_or("Sc missing posted RFH allocation view")?;
+                    let at = 4 + 32 * usize::from(queue - 1);
+                    require(
+                        view.queue == queue
+                            && view.free_write == 504
+                            && view.dma.iter().enumerate().all(|(i, dma)| {
+                                configuration[at + 4 + i * 8..at + 12 + i * 8] == dma.to_le_bytes()
+                            }),
+                        "Sc RFH command did not name retained allocations",
+                    )?;
+                    self.rx_queues.push(view);
+                }
+            }
+            (5, 0x16) if self.multi_receive => {
+                require(
+                    body.len() == 16 && word(body, 4) == 1 && word(body, 8) == 0,
+                    "Sc BAID command station/TID",
+                )?;
+                if word(body, 0) == 0 {
+                    require(
+                        !self.baid_live && half(body, 12) == 100 && half(body, 14) == 32,
+                        "Sc BAID allocation reuse/window",
+                    )?;
+                    self.baid_live = true;
+                } else {
+                    require(
+                        word(body, 0) == 2 && self.baid_live && body[12..] == [0; 4],
+                        "Sc BAID removal without owner",
+                    )?;
+                    self.baid_live = false;
+                }
+                response = 3u32.to_le_bytes().to_vec();
+            }
+            (5, 2) => {
+                let baid = body.get(12) == Some(&1);
+                let count = if baid { 12 } else { 8 };
+                let mask = if self.multi_receive { 7 } else { 1 };
+                require(
+                    body.len() == 12 + count
+                        && bytes[6] == 0
+                        && word(body, 0) == 0
+                        && word(body, 4) == mask
+                        && word(body, 8) == count as u32
+                        && word(body, 12)
+                            == u32::from(baid) | if self.api89.is_some() { 1 << 16 } else { 0 }
+                        && word(body, 16) != 0
+                        && (!baid || self.multi_receive && word(body, 20) == 3),
+                    "Sc all-owned-RFH epoch native contract",
+                )?;
+            }
+            (3, 8) => {
+                require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?;
+                if self.client {
+                    self.client_mac =
+                        crate::iwlwifi::p2p_client_fixture::mac(self.client_mac, body)?;
+                    if self.hold_client_filter
+                        && word(body, 4) == 2
+                        && body[36] == 1
+                        && word(body, 20) & 32 != 0
+                    {
+                        self.hold_client_filter = false;
+                        self.held = Some((cmd, group, sequence));
+                        return Ok(());
+                    }
+                }
+            }
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
-            (3, 10) => require(body.len() == 104 && body[8..14] == AP, "Sc peer identity")?,
-            (1, 8) => require(body.len() == 32 && word(body, 8) == 6, "Sc PHY channel")?,
-            (1, 0x9f) => require(
-                body.len() == 108 && half(body, 8) == 136,
-                "Sc TX power policy ceiling",
+            (3, 10) => {
+                require(
+                    body.len() == if self.api89.is_some() { 96 } else { 104 },
+                    "native peer identity/extent",
+                )?;
+                if let Some(mld) = self.mld {
+                    // An MLD STA carries logical AP-MLD at8 and the actual
+                    // physical AP link at16. Require the exact authored
+                    // context plus prior native MAC/LINK setup; never accept
+                    // either address as an interchangeable ordinary peer.
+                    mld.observed(&self.commands)?;
+                } else {
+                    require(body[8..14] == AP, "native ordinary peer identity")?;
+                }
+                if self.fault == Fault::HoldHe && word(body, 92) & 1 != 0 {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
+            (1, 8) => require(
+                body.len() == 32 && word(body, 8) == u32::from(self.channel()),
+                "Sc PHY channel",
             )?,
-            (5, 0xf) => require(body.len() == 44, "Sc TLC ABI")?,
+            (4, 0xc) if self.six.is_some() => {
+                let six = self.six.unwrap();
+                require(
+                    if let Some(wide) = self.wide_six {
+                        body == wide.expected_power().as_slice()
+                    } else {
+                        body.len() == 28
+                            && half(body, 0) == 0
+                            && half(body, 2) == u16::from(six.regulatory)
+                            && body[4] == six.tpe as u8
+                            && body[5..25].iter().all(|&b| b == 127)
+                            && body[25..] == [0; 3]
+                    },
+                    "6GHz actual AP_TX_POWER_CONSTRAINTS wire",
+                )?;
+                if self.fault == Fault::HoldSixPower {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
+            (1, 0x9f) => {
+                require(
+                    body.len() == if self.api89.is_some() { 120 } else { 108 }
+                        && half(body, 8) == self.power_expectation.unwrap_or(136) as u16,
+                    "Sc TX power policy ceiling",
+                )?;
+                if self.fault == Fault::HoldPower {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
+            (5, 0xf) => require(
+                body.len() == if self.api89.is_some() { 28 } else { 44 },
+                "native TLC ABI",
+            )?,
+            (5, 8) if self.api89.is_some() => require(
+                body.len() == 32
+                    && body[..4] == [0; 4]
+                    && word(body, 4)
+                        == if self.phy.map_or(1, PhyModel::chains) == 3 {
+                            0x2806
+                        } else {
+                            0x1402
+                        }
+                    && body[8..].iter().all(|b| *b == 0),
+                "API89 literal RLC2 profile",
+            )?,
             (3, 0xc) => require(
                 body == [0; 4] && self.queues.iter().all(|q| !q.2),
                 "Sc peer removal before queue receipts",
@@ -276,28 +795,95 @@ impl Wire {
                 body.len() == 24 && word(body, 4) == 1,
                 "Sc association residency",
             )?,
-            (1, 0xd) => require(
-                body.len() == 1948 && half(body, 8) == 0x802 && body[45] == 1 && body[52] == 6,
-                "Sc passive scan ABI",
+            (1, 0x6e) if self.scheduled.is_some() => {
+                self.scheduled.as_mut().unwrap().profiles(body)?
+            }
+            (1, 0xe) if self.scheduled.is_some() => {
+                response = self.scheduled.as_mut().unwrap().abort(body)?;
+            }
+            (1, 0xd) if word(body, 0) == 1 && self.scheduled.is_some() => {
+                self.scheduled.as_mut().unwrap().start(body)?;
+                if self.scheduled.as_ref().unwrap().hold_start {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
+            (1, 0xd) => {
+                require(
+                    body.len() == if self.api89.is_some() { 1940 } else { 1948 }
+                        && (half(body, 8) == 0x802
+                            || self.phy.is_some() && half(body, 8) == 2
+                            || self.six.is_some() && half(body, 8) == 0x42),
+                    "Sc passive scan ABI",
+                )?;
+                if self.six.is_some() {
+                    let count = usize::from(body[45]);
+                    require(
+                        count > 0 && count <= if self.api89.is_some() { 67 } else { 68 },
+                        "6GHz bounded native scan count",
+                    )?;
+                    for record in body[48..48 + count * 8].chunks_exact(8) {
+                        let band = if version < 17 {
+                            record[5]
+                        } else {
+                            (word(record, 0) >> 30) as u8
+                        };
+                        require(
+                            band <= 2 && (band != 2 || record[4] % 4 == 1 && record[4] <= 253),
+                            "6GHz actual UMAC band/channel",
+                        )?;
+                    }
+                } else {
+                    require(
+                        body[45] == 1 && body[52] == self.channel(),
+                        "Sc scan channel",
+                    )?;
+                }
+            }
+            (1, 0x98) => require(
+                body == self.phy.map_or(1, PhyModel::chains).to_le_bytes(),
+                "Sc NVM chain identity",
             )?,
-            (1, 0x98) => require(body == [1, 0, 0, 0], "Sc NVM chain identity")?,
             (1, 0x9b) => require(body == [1, 0, 0, 0, 17, 0, 0, 0], "Sc coexistence defaults")?,
             (2, 1) => require(
-                body == [10, 0, 0, 0, 224, 46, 0, 0],
+                body == self.bz.map_or_else(
+                    || {
+                        self.api89
+                            .map_or([10, 0, 0, 0, 224, 46, 0, 0], gen3_station_tests::Case::soc)
+                    },
+                    super::super::bz_fixture::Case::soc,
+                ),
                 "Sc integrated SoC defaults",
             )?,
             (1, 0xc) => require(
-                body == [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+                body == [
+                    0u32,
+                    self.phy.map_or(1, PhyModel::chains),
+                    self.phy.map_or(1, PhyModel::chains),
+                ]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
                 "Sc scan chain defaults",
             )?,
             (1, 0x77) => require(body == [0; 4], "Sc continuously awake defaults")?,
             _ => return Err("unexpected command in Sc composition"),
         }
+        if (group, cmd) == (5, 0x0d) && self.fault == Fault::HoldRfh {
+            self.held = Some((cmd, group, sequence));
+            return Ok(());
+        }
+        if (group, cmd) == (1, 0xd) && self.fault == Fault::HoldScan {
+            self.held = Some((cmd, group, sequence));
+            return Ok(());
+        }
+        if (group, cmd) == (5, 0x0d) && self.fault == Fault::MalformedRfh {
+            response.push(1);
+        }
         self.firmware
             .inject(cmd, if group == 1 { 0 } else { group }, sequence, &response);
         if (group, cmd) == (5, 2) {
-            let mut marker = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            marker[8..12].copy_from_slice(&body[16..20]);
+            let marker = body[8..].to_vec();
             if self.fault == Fault::HoldRxFence {
                 require(
                     self.held_rx.is_none(),
@@ -307,6 +893,13 @@ impl Wire {
             } else {
                 self.firmware.inject(0xff, 5, 0x8000, &marker);
             }
+            for queue in &mut self.rx_queues {
+                if self.hold_rx_queue == Some(queue.queue) {
+                    self.held_markers.push((queue.queue, marker.clone()));
+                } else {
+                    queue.inject(0xff, 5, 0x8000, &marker);
+                }
+            }
         } else if (group, cmd) == (3, 5) {
             self.firmware.inject(
                 0xfb,
@@ -315,16 +908,115 @@ impl Wire {
                 &[0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
             );
         } else if (group, cmd) == (1, 0xd) {
-            self.mpdu(&self.ap.beacon(), false);
+            if word(body, 0) == 1 {
+                // Actual autonomous periodic owner remains live after the
+                // correlated command ACK. Test code injects real posted-ring
+                // iteration/match/completion notifications independently.
+                return Ok(());
+            }
+            let mut beacon = self.ap.beacon();
+            if self.client {
+                beacon = crate::iwlwifi::p2p_client_fixture::beacon(beacon, 1, Some(0xa0));
+            }
+            let mut six_job = true;
+            if let Some(six) = self.six {
+                six_job = body[48..48 + usize::from(body[45]) * 8]
+                    .chunks_exact(8)
+                    .any(|record| {
+                        let band = if version < 17 {
+                            record[5]
+                        } else {
+                            (word(record, 0) >> 30) as u8
+                        };
+                        band == 2 && record[4] == six.channel
+                    });
+                if six_job {
+                    if let Some(wide) = self.wide_six {
+                        wide.complete_ap_frame(&mut beacon)?;
+                    } else {
+                        six_ghz_tests::complete_ap_frame(&mut beacon, six)?;
+                    }
+                }
+            } else if let Some(phy) = self.phy {
+                beacon.extend_from_slice(&he_tests::elements(phy, true));
+            }
+            if let Some(eht) = self.eht.filter(|_| self.wide_six.is_none()) {
+                beacon.extend_from_slice(&eht.elements(self.phy.unwrap(), false));
+            }
+            if self.sae_h2e_only {
+                // Actual BSS membership selector123; the AP's RSNXE and
+                // SAE Commit must independently confirm H2E.
+                beacon.extend_from_slice(&[50, 1, 0xfb]);
+            }
+            if self.fault == Fault::SixRnrReport && !six_job {
+                let six = self.six.ok_or("RNR fixture lost actual6GHz source")?;
+                beacon.extend_from_slice(&[201, 13, 0, 9, 131, six.channel, 0]);
+                beacon.extend_from_slice(&AP);
+                beacon.extend_from_slice(&[0x52, 8]);
+                self.mpdu_at(&beacon, false, 1, 5);
+            } else if self.six.is_none() || six_job {
+                self.mpdu(&beacon, false);
+            } else if self.six.is_some_and(|six| six.alias) {
+                self.mpdu_at(&beacon, false, 1, self.six.unwrap().channel);
+            }
             let mut done = [0; 16];
             done[..4].copy_from_slice(&body[..4]);
             done[6] = 1;
             self.firmware.inject(0xf, 0, 0x8000, &done);
+        } else if (group, cmd) == (1, 0xe) && self.scheduled.is_some() {
+            let scheduled = self.scheduled.as_mut().unwrap();
+            if !scheduled.hold_stop && scheduled.abort_status <= 1 {
+                scheduled.live = false;
+                let mut done = [0; 16];
+                done[..4].copy_from_slice(&1u32.to_le_bytes());
+                done[6] = 2;
+                self.firmware.inject(0xf, 0, 0x8000, &done);
+            }
         }
         Ok(())
     }
 
+    /// Real native key commands, rather than the total number of historical
+    /// installs, determine the current data key after authenticated rotation.
+    fn native_data_keys(&self) -> bool {
+        let installed = |flags: u32, id: u32, material: &[u8]| {
+            self.commands
+                .iter()
+                .rev()
+                .find(|(group, command, body)| {
+                    (*group, *command) == (5, 0x18)
+                        && body.len() == 80
+                        && word(body, 8) == id
+                        && word(body, 12) == flags
+                })
+                .is_some_and(|(_, _, body)| word(body, 0) == 1 && body[16..32] == *material)
+        };
+        let gtk = self.gtk_expected.unwrap_or((1, [0x77; 16]));
+        let ptk = self
+            .key
+            .as_deref()
+            .is_some_and(|material| installed(if self.ap.pmf() { 0x22 } else { 2 }, 0, material));
+        let igtk = !self.ap.pmf()
+            || self
+                .igtk_expected
+                .map(|(material, id, _)| (material, id))
+                .or_else(|| self.ap.igtk())
+                .is_some_and(|(material, id)| installed(0x6a, u32::from(id), &material));
+        self.keys >= if self.ap.pmf() { 3 } else { 2 }
+            && ptk
+            && installed(0x4a, u32::from(gtk.0), &gtk.1)
+            && igtk
+            && (!self.group_rekey || self.group_reply)
+            && self.held_tx.is_none()
+    }
+
     fn transmit(&mut self, p: Published) -> R {
+        if let Some(p2p) = &mut self.native_p2p {
+            return p2p.transmit(&p, &mut self.firmware);
+        }
+        if let Some(ap) = &mut self.native_ap {
+            return ap.transmit(&p, &mut self.firmware);
+        }
         require(
             self.queues
                 .iter()
@@ -338,9 +1030,17 @@ impl Wire {
         )?;
         let len = usize::from(half(bytes, 4));
         let header = ((word(bytes, 8) >> 8) & 31) as usize * 2;
+        let amsdu = word(bytes, 8) & 0x4000 != 0;
         require(
             matches!(header, 24 | 26)
-                && bytes.len() == 32 + len + header.next_multiple_of(4) - header,
+                && bytes.len()
+                    == 32
+                        + len
+                        + if amsdu {
+                            0
+                        } else {
+                            header.next_multiple_of(4) - header
+                        },
             "Sc TX length/padding",
         )?;
         require(
@@ -348,7 +1048,23 @@ impl Wire {
             "Sc TX sequence",
         )?;
         let mut frame = bytes[32..32 + header].to_vec();
-        frame.extend_from_slice(&bytes[32 + header.next_multiple_of(4)..]);
+        frame.extend_from_slice(
+            &bytes[32
+                + if amsdu {
+                    header
+                } else {
+                    header.next_multiple_of(4)
+                }..],
+        );
+        let radio = if let Some(mld) = self.mld {
+            mld.transmit(&self.commands, &mut frame)?;
+            Some(mld.radio_transmit(&self.commands, &frame, &mut self.mld_tx)?)
+        } else {
+            None
+        };
+        if self.phy.is_some() && matches!(frame[0], 0 | 0x20) {
+            self.phy_requests.push(frame.clone());
+        }
         let protected = frame[1] & 0x40 != 0;
         if self.air.len() < 64 {
             self.air
@@ -359,6 +1075,88 @@ impl Wire {
             "Sc native encryption flag",
         )?;
         let data = frame[0] & 0x0c == 8;
+        if self.client
+            && frame[0] == 0xd0
+            && frame.get(24..30) == Some(&[4, 9, 0x50, 0x6f, 0x9a, 9])
+        {
+            require(
+                self.client_mac == 2
+                    && self.ap.phase() == ApPhase::Authorized
+                    && self.keys != 0
+                    && self
+                        .queues
+                        .iter()
+                        .any(|(id, tid, live)| *id == p.queue && *tid == 15 && *live),
+                "P2P public FRAME lacked actual MAC7/key/port/management queue",
+            )?;
+            crate::iwlwifi::p2p_client_fixture::check_public(&frame, bytes, OWN, AP, false)?;
+            self.client_public.push(frame);
+            if self.hold_client_public {
+                self.hold_client_public = false;
+                self.held_tx = Some((p.queue, p.pointer));
+            } else {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            }
+            return Ok(());
+        }
+        if amsdu {
+            require(
+                self.tx_model.is_some()
+                    && data
+                    && header == 26
+                    && frame[16..22] == AP
+                    && frame[24] & 0x80 != 0
+                    && word(bytes, 8) == 0x4d00
+                    && protected == self.ap.protected(),
+                "Sc native A-MSDU flag/header/PAD/encryption geometry",
+            )?;
+            let mut at = 26;
+            let mut frames = Vec::new();
+            while at < frame.len() {
+                require(
+                    frame.len() - at >= 22,
+                    "Sc native A-MSDU literal subframe prefix",
+                )?;
+                let count = usize::from(u16::from_be_bytes([frame[at + 12], frame[at + 13]]));
+                let end = at + 14 + count;
+                require(
+                    count >= 8
+                        && end <= frame.len()
+                        && frame[at] & 1 == 0
+                        && frame[at + 6..at + 12] == OWN
+                        && frame[at + 14..at + 20] == [0xaa, 0xaa, 3, 0, 0, 0],
+                    "Sc native A-MSDU literal addresses/length/LLC",
+                )?;
+                let mut ethernet = frame[at..at + 12].to_vec();
+                ethernet.extend_from_slice(&frame[at + 20..end]);
+                require(
+                    ethernet[12..14] != [0x88, 0x8e],
+                    "Sc aggregated the private EAPOL port",
+                )?;
+                self.data.push((ethernet.clone(), protected));
+                frames.push(ethernet);
+                if end == frame.len() {
+                    break;
+                }
+                let next = end + (4 - ((14 + count) % 4)) % 4;
+                require(
+                    next < frame.len() && frame[end..next].iter().all(|byte| *byte == 0),
+                    "Sc A-MSDU inter-subframe padding/terminal extent",
+                )?;
+                at = next;
+            }
+            require(
+                frames.len() == 2 && frame.len() <= 3819,
+                "Sc native A-MSDU two-frame MPDU bound",
+            )?;
+            self.aggregates.push(frames);
+            if self.fault == Fault::HoldData {
+                self.held_data.push((p.queue, p.pointer));
+            } else {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            }
+            return Ok(());
+        }
         let eapol =
             data && frame.get(header..header + 8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
         if !data || eapol {
@@ -374,7 +1172,7 @@ impl Wire {
                 require(
                     protected
                         && reply.key_information == 0x302
-                        && reply.replay_counter == 3
+                        && reply.replay_counter == self.group_replay
                         && reply.key_data.is_empty()
                         && reply.key_mic.as_slice()
                             == super::super::handshake::compute_mic(
@@ -388,6 +1186,17 @@ impl Wire {
                     self.held_tx = Some((p.queue, p.pointer));
                     return Ok(());
                 }
+            } else if frame[0] == 0xd0 && self.multi_receive && frame.get(24..26) == Some(&[3, 1]) {
+                require(
+                    frame[24..] == [3, 1, 1, 0, 0, 2, 8, 0, 0],
+                    "Sc BA response immediate/window/AMSDU decline",
+                )?;
+            } else if frame[0] == 0xd0 && self.ap.pmf() {
+                require(
+                    protected && frame.get(24..26) == Some(&[8, 1]) && frame.len() == 28,
+                    "Sc SA Query response was not natively protected",
+                )?;
+                self.sa_query_reply = Some(frame[24..28].try_into().unwrap());
             } else if frame[0] == 0xa0 {
                 require(
                     self.ap.phase() == ApPhase::Authorized,
@@ -395,10 +1204,28 @@ impl Wire {
                 )?;
             } else {
                 let phase = self.ap.phase();
+                if self.client {
+                    crate::iwlwifi::p2p_client_fixture::check_request(&frame)?;
+                }
                 let responses = self
                     .ap
-                    .receive(&frame)
-                    .map_err(|_| "shared AP rejected native Sc management/EAPOL")?;
+                    .receive(radio.as_deref().unwrap_or(&frame))
+                    .map_err(|error| match (error, phase) {
+                        (narf_wifi_fixtures::ApError::Association, _) => {
+                            "Sc AP rejected association RSNE/RSNXE/rates"
+                        }
+                        (narf_wifi_fixtures::ApError::Mic, _) => "Sc AP rejected four-way MIC",
+                        (narf_wifi_fixtures::ApError::Key, ApPhase::Message2) => {
+                            "Sc AP rejected M2 association transcript/nonce/counter"
+                        }
+                        (narf_wifi_fixtures::ApError::Key, ApPhase::Message4) => {
+                            "Sc AP rejected M4 key information/counter"
+                        }
+                        (narf_wifi_fixtures::ApError::Key, ApPhase::Authentication) => {
+                            "Sc AP rejected SAE Commit/Confirm"
+                        }
+                        _ => "shared AP rejected native Sc management/EAPOL",
+                    })?;
                 if phase == ApPhase::Message2 {
                     use narf_wireless::eapol::{derive_ptk, HmacPrimitive, KeyFrame};
                     struct Sha1;
@@ -412,16 +1239,71 @@ impl Wire {
                     }
                     let m2 =
                         KeyFrame::decode(&frame[header + 12..], 16).ok_or("Sc M2 key frame")?;
-                    let ptk = derive_ptk(&Sha1, &PMK, &AP, &OWN, &ANONCE, &m2.key_nonce, 16);
-                    self.key = Some(ptk.tk.clone());
-                    self.ptk = Some(ptk);
+                    if matches!(
+                        self.ap.akm(),
+                        None | Some(narf_wireless::eapol::KeyMgmt::Psk)
+                    ) {
+                        let ptk = derive_ptk(&Sha1, &PMK, &AP, &OWN, &ANONCE, &m2.key_nonce, 16);
+                        self.key = Some(ptk.tk.clone());
+                        self.ptk = Some(ptk);
+                    } else {
+                        self.key = Some(
+                            self.ap
+                                .pairwise_tk()
+                                .ok_or("Sc AP did not derive negotiated TK")?
+                                .to_vec(),
+                        );
+                    }
                 }
-                for response in responses {
+                for mut response in responses {
+                    if self.client {
+                        crate::iwlwifi::p2p_client_fixture::response(&mut response);
+                    }
+                    if self.mld.is_some() && phase == ApPhase::Message2 {
+                        self.mld_m3 = Some(response.clone());
+                    }
+                    if matches!(response[0], 0x10 | 0x30) {
+                        if let Some(six) = self.six {
+                            if let Some(wide) = self.wide_six {
+                                wide.complete_response(&mut response, self.fault)?;
+                                if self.fault == Fault::SixResponseNarrow80 {
+                                    self.wide_six = Some(wide.response_width(2));
+                                }
+                            } else {
+                                six_ghz_tests::complete_ap_frame(&mut response, six)?;
+                                if self.fault == Fault::SixResponseWithoutTpe {
+                                    let ies = six_ghz_tests::without(&response[30..], 195, None);
+                                    response.truncate(30);
+                                    response.extend_from_slice(&ies);
+                                }
+                            }
+                        } else if let Some(phy) = self.phy {
+                            response.extend_from_slice(&he_tests::elements(phy, phy.response_he));
+                        }
+                        if let Some(eht) = self.eht.filter(|_| self.wide_six.is_none()) {
+                            response.extend_from_slice(&eht.elements(self.phy.unwrap(), true));
+                        }
+                    }
+                    if self.fault == Fault::WrongSaeSelector
+                        && response[0] == 0xb0
+                        && half(&response, 26) == 1
+                        && response.ends_with(&[255, 5, 114, 0, 15, 172, 24])
+                    {
+                        *response.last_mut().unwrap() = 8;
+                        self.security_fault_applied = true;
+                    }
                     self.mpdu(&response, false);
                 }
                 if phase == ApPhase::Message4 {
                     self.m4 = true;
-                    require(self.keys == 2, "Sc M4 before key receipts")?;
+                    require(
+                        if self.mld.is_some() {
+                            self.keys >= 3
+                        } else {
+                            self.keys == if self.ap.pmf() { 3 } else { 2 }
+                        },
+                        "Sc M4 before key receipts",
+                    )?;
                     if self.fault == Fault::HoldM4 {
                         self.held_tx = Some((p.queue, p.pointer));
                         return Ok(());
@@ -432,7 +1314,7 @@ impl Wire {
             require(
                 self.ap.phase() == ApPhase::Authorized
                     && protected == self.ap.protected()
-                    && (!protected || self.keys == 2),
+                    && (!protected || self.native_data_keys()),
                 "Sc controlled port/protection",
             )?;
             require(
@@ -450,25 +1332,138 @@ impl Wire {
             }
             self.data.push((ethernet, protected));
         }
-        self.firmware.tx_complete(p.queue, p.pointer);
+        if data && !eapol && self.fault == Fault::HoldData {
+            self.held_data.push((p.queue, p.pointer));
+        } else {
+            self.firmware.tx_complete(p.queue, p.pointer);
+        }
         Ok(())
     }
 
+    fn channel(&self) -> u8 {
+        self.six
+            .map_or_else(|| self.phy.map_or(6, PhyModel::channel), |six| six.channel)
+    }
     fn mpdu(&mut self, frame: &[u8], protected: bool) {
+        self.mpdu_at(
+            frame,
+            protected,
+            if self.six.is_some() {
+                2
+            } else if self.client && self.channel() <= 14 {
+                1
+            } else {
+                0
+            },
+            self.channel(),
+        );
+    }
+    fn mpdu_at(&mut self, frame: &[u8], protected: bool, band: u8, channel: u8) {
+        let translated;
+        let frame = if let Some(mld) = self.mld {
+            match mld.receive(&self.commands, frame, protected) {
+                Ok(frame) => {
+                    translated = frame;
+                    translated.as_slice()
+                }
+                Err(reason) => {
+                    self.error = Some(reason);
+                    return;
+                }
+            }
+        } else {
+            frame
+        };
+        let protected = protected || self.mld.is_some() && frame[1] & 0x40 != 0;
         if self.replies.len() < 64 {
             self.replies.push(frame[0]);
         }
         let mut payload = vec![0; 64];
+        payload[7] = band << 6;
+        if self.six.is_some() {
+            payload[36..40].copy_from_slice(&0x100u32.to_le_bytes());
+        }
         payload[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
         payload[12..16].copy_from_slice(&(if protected { 0x243u32 } else { 3 }).to_le_bytes());
+        if self.mld.is_some() && frame[0] & 12 == 8 {
+            payload[12] |= 4;
+        }
+        // Firmware follows the station's actual programmed TLC, not the
+        // AP's advertised maximum. M1 may precede TLC and use a legacy rate;
+        // a narrowed/non-HE association must not receive invented HE data.
+        let programmed_mode = self
+            .commands
+            .iter()
+            .rev()
+            .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+            .and_then(|(_, _, body)| body.get(if self.api89.is_some() { 5 } else { 9 }))
+            .copied();
+        let he_programmed = matches!(programmed_mode, Some(3 | 4));
+        if let Some(phy) = self.phy.filter(|_| he_programmed && frame[0] & 0xc == 8) {
+            let rate = (if programmed_mode == Some(4) {
+                0x500u32
+            } else {
+                0x400u32
+            }) | if phy.width == 3 || self.wide_six.is_some() {
+                self.commands
+                    .iter()
+                    .rev()
+                    .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+                    .map_or(0, |(_, _, body)| {
+                        u32::from(body[if self.api89.is_some() { 4 } else { 8 }]) << 11
+                    })
+            } else {
+                0
+            } | if phy.streams == 2 {
+                if phy.rates == 3 {
+                    32
+                } else {
+                    16
+                }
+            } else {
+                0
+            };
+            payload[36..40].copy_from_slice(&rate.to_le_bytes());
+        } else if let Some(phy) = self.phy.filter(|phy| phy.width == 3 && frame[0] & 0xc == 8) {
+            if let Some((_, _, body)) = self
+                .commands
+                .iter()
+                .rev()
+                .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+            {
+                let mode = body[if self.api89.is_some() { 5 } else { 9 }];
+                if mode == 2 {
+                    let width = body[if self.api89.is_some() { 4 } else { 8 }];
+                    let rate = 0x300u32
+                        | (u32::from(width) << 11)
+                        | if phy.streams == 2 {
+                            if phy.rates == 3 {
+                                32
+                            } else {
+                                16
+                            }
+                        } else {
+                            0
+                        };
+                    payload[36..40].copy_from_slice(&rate.to_le_bytes());
+                }
+            }
+        }
         payload[40] = 50;
         payload[41] = 60;
-        payload[42] = 6;
+        payload[42] = channel;
         payload.extend_from_slice(frame);
         self.firmware.inject(0xc1, 0, 0x8000, &payload);
     }
 
     fn ethernet(&mut self, ethernet: &[u8]) {
+        if self.mld.is_some() {
+            match self.ap.transmit_mld_data(ethernet) {
+                Ok(frame) => self.mpdu(&frame, false),
+                Err(_) => self.error = Some("native MLD AP protected data/PN owner refused"),
+            }
+            return;
+        }
         let protected = self.ap.protected();
         let mut frame = vec![0; 24];
         frame[0] = 8;
@@ -488,7 +1483,7 @@ impl Wire {
     }
 }
 
-static HARNESS: IrqSafeSpinLock<Option<(Arc<Device>, Wire)>> = IrqSafeSpinLock::new(None);
+static HARNESS: IrqSafeSpinLock<Option<(Arc<Device>, Box<Wire>)>> = IrqSafeSpinLock::new(None);
 
 fn service() -> R<bool> {
     HARNESS
@@ -541,8 +1536,16 @@ fn run<F: Future>(future: F, mut progress: impl FnMut() -> R<bool>) -> R<F::Outp
     }
 }
 
+struct NativeModel {
+    receive_model: ReceiveModel,
+    tx_model: Option<TxModel>,
+    api89: Option<gen3_station_tests::Case>,
+    bz: Option<super::super::bz_fixture::Case>,
+    six: Option<SixModel>,
+}
 struct Guard {
     device: Option<Arc<Device>>,
+    policy_db: Arc<narf_wireless::reg::db::Database>,
     #[cfg(feature = "kernel-test")]
     owner: Option<narf_wireless::nl80211::ConnectionOwnerFixture>,
 }
@@ -559,15 +1562,224 @@ impl Guard {
         name: Option<&'static str>,
         sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
     ) -> R<Self> {
+        Self::build(secured, fault, name, sources, None)
+    }
+    fn build(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+    ) -> R<Self> {
+        Self::build_receive(secured, fault, name, sources, phy, false)
+    }
+    fn build_receive(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        multi_receive: bool,
+    ) -> R<Self> {
+        Self::build_features(secured, fault, name, sources, phy, multi_receive, None)
+    }
+    fn build_features(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        receive_model: impl Into<ReceiveModel>,
+        tx_model: Option<TxModel>,
+    ) -> R<Self> {
+        Self::build_native_profile(
+            secured,
+            fault,
+            name,
+            sources,
+            phy,
+            NativeModel {
+                receive_model: receive_model.into(),
+                tx_model,
+                api89: None,
+                bz: None,
+                six: None,
+            },
+        )
+    }
+    #[inline(never)]
+    fn build_native_profile(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        model: NativeModel,
+    ) -> R<Self> {
+        Self::build_native_eht(secured, fault, name, sources, phy, model, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn build_native_eht(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        model: NativeModel,
+        eht: Option<eht_tests::Model>,
+    ) -> R<Self> {
+        Self::build_native_wide(secured, fault, name, sources, phy, model, eht, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn build_native_wide(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        model: NativeModel,
+        eht: Option<eht_tests::Model>,
+        wide_six: Option<wide_six_tests::Model>,
+    ) -> R<Self> {
+        let NativeModel {
+            receive_model,
+            tx_model,
+            api89,
+            bz,
+            six,
+        } = model;
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
                 && name.is_none_or(|name| narf_net::iface::lookup(name).is_none()),
             "live iwlwifi owner exists",
         )?;
-        let versions = super::super::firmware_parser_tests::mld_commands();
-        let (mut hardware, firmware, trace) = model::station_model();
-        model::versions(&mut hardware, &versions);
+        let mut versions = api89.map_or_else(
+            super::super::firmware_parser_tests::mld_commands,
+            gen3_station_tests::Case::commands,
+        );
+        if let Some(case) = bz {
+            versions = case.commands();
+        }
+        if api89.is_none() && bz.is_none() {
+            if phy.is_some() {
+                he_tests::versions(&mut versions);
+            }
+            receive_model.commands(&mut versions);
+        }
+        if six.is_some() {
+            versions.extend_from_slice(&[0xc, 4, 1, 0]);
+        }
+        if eht.is_some() && api89.is_none() && bz.is_none() {
+            // Actual Sc core103 ALIVE7 notification; omitted by the old
+            // deliberately post-ready station-only command inventory.
+            versions.extend_from_slice(&[1, 0, 99, 7]);
+        }
+        if api89.is_none() && bz.is_none() {
+            if let Some(tx) = &tx_model {
+                versions.extend_from_slice(&[0, 2, 0, tx.version]);
+            }
+        }
+        let (mut hardware, firmware, trace) = if let Some(case) = api89 {
+            let (mut hw, fw, trace) =
+                model::station_model_for_format(super::super::rx_rfh::CompletionFormat::Ax210);
+            model::native_station_identity(&mut hw, case.did(), case.revision(), case.radio())?;
+            (hw, fw, trace)
+        } else if let Some(case) = bz {
+            let (mut hw, fw, trace) =
+                model::station_model_for_format(super::super::rx_rfh::CompletionFormat::Bz);
+            model::native_station_identity(&mut hw, case.did(), case.revision(), case.radio())?;
+            (hw, fw, trace)
+        } else {
+            model::station_model()
+        };
+        let mut authored = if let Some(case) = api89 {
+            case.image()
+        } else if let Some(case) = bz {
+            case.image()
+        } else {
+            tx_amsdu_tests::image(&versions, tx_model.as_ref())?
+        };
+        receive_model.capability(&mut authored);
+        if matches!(receive_model, ReceiveModel::P2p) {
+            // All pinned admitted core103 images carry actual API59: the
+            // RFH band/link copy is source-qualified, including low channels.
+            authored.extend_from_slice(&29u32.to_le_bytes());
+            authored.extend_from_slice(&8u32.to_le_bytes());
+            authored.extend_from_slice(&1u32.to_le_bytes());
+            authored.extend_from_slice(&(1u32 << 27).to_le_bytes());
+            // Actual admitted Sc/Bz TLV resource facts, retained through the
+            // same decoder as native startup; no production cache override.
+            let stations = if api89.is_some_and(gen3_station_tests::Case::cdb) {
+                14u32
+            } else {
+                15
+            };
+            for (tag, count) in [(0x100u32, stations), (0x101, 4)] {
+                authored.extend_from_slice(&tag.to_le_bytes());
+                authored.extend_from_slice(&4u32.to_le_bytes());
+                authored.extend_from_slice(&count.to_le_bytes());
+            }
+            // Preserve the complete table when appending ROCv6/flush2.
+            authored.extend_from_slice(&48u32.to_le_bytes());
+            authored.extend_from_slice(&(versions.len() as u32).to_le_bytes());
+            authored.extend_from_slice(&versions);
+        }
+        if let Some(eht) = eht {
+            if bz.is_none() && api89.is_none() {
+                model::native_station_identity(&mut hardware, 0xe340, 0x480, eht.radio())?;
+            }
+            eht.pnvm_image(&mut authored, bz.map_or(0x48, |_| 0x46));
+        }
+        if six.is_some() {
+            if six.is_some_and(|six| !six.api59) {
+                // A factual API89 fixture may already carry API59. Remove
+                // that source bit, not merely omit an OR-only extra TLV.
+                let mut offset = 88;
+                while offset < authored.len() {
+                    let tag = word(&authored, offset);
+                    let length = word(&authored, offset + 4) as usize;
+                    if tag == 29 && length == 8 && word(&authored, offset + 8) == 1 {
+                        let bits = word(&authored, offset + 12) & !(1 << 27);
+                        authored[offset + 12..offset + 16].copy_from_slice(&bits.to_le_bytes());
+                    }
+                    offset += 8 + length.next_multiple_of(4);
+                }
+            }
+            // Actual API59 in TLV29, not a direct Hardware field override.
+            if six.is_some_and(|six| six.api59) {
+                authored.extend_from_slice(&29u32.to_le_bytes());
+                authored.extend_from_slice(&8u32.to_le_bytes());
+                authored.extend_from_slice(&1u32.to_le_bytes());
+                authored.extend_from_slice(&(1u32 << 27).to_le_bytes());
+            }
+            // Retain the complete authored command table. TLV48 replaces
+            // rather than appends to an earlier executable command table.
+            authored.extend_from_slice(&48u32.to_le_bytes());
+            authored.extend_from_slice(&(versions.len() as u32).to_le_bytes());
+            authored.extend_from_slice(&versions);
+        }
+        let parsed = super::super::parse_ucode(&authored)
+            .map_err(|_| "Sc fixture firmware metadata parse")?;
+        // Original API89/Bz images retain capability68, so AP startup
+        // actually configures additional RFH/RSS queues before replacing
+        // the inactive station. Keep their existing literal DMA/marker
+        // consumer enabled from that parsed fact, rather than mistaking
+        // the AP role for the authored single-queue Sc fixture.
+        let multi_receive = receive_model.enabled()
+            || matches!(
+                receive_model,
+                ReceiveModel::Ap | ReceiveModel::Client | ReceiveModel::P2p
+            ) && parsed.api.has_capability(68);
+        model::firmware_profile(&mut hardware, &parsed)?;
+        if api89.is_some() || bz.is_some() {
+            hardware.prepare_station_profile(&parsed)?;
+        }
+        if let Some(eht) = eht {
+            model::eht_boot(&mut hardware, &parsed, eht.subsystem, &eht.alive())?;
+        }
         if let Some((firmware, pnvm)) = sources {
             let parsed = super::super::parse_ucode(&firmware.bytes)
                 .map_err(|_| "Sc source fixture parse")?;
@@ -575,16 +1787,36 @@ impl Guard {
                 parsed.api.commands == versions,
                 "Sc source fixture executable/command table mismatch",
             )?;
+            model::firmware_profile(&mut hardware, &parsed)?;
+            if let Some(eht) = eht {
+                model::eht_boot(&mut hardware, &parsed, eht.subsystem, &eht.alive())?;
+            }
             hardware.bind_sources(firmware, Some(pnvm))?;
         }
         Device::validate_station_profile(&hardware)?;
+        let channel = six.map_or_else(|| phy.map_or(6, PhyModel::channel), |six| six.channel);
+        let legacy = if six.is_some() { 5 } else { channel };
         let ap = if secured {
-            FakeAp::wpa2(NETWORK, SSID, 6, 7, PMK, ANONCE)
+            FakeAp::wpa2(NETWORK, SSID, legacy, 7, PMK, ANONCE)
         } else {
-            FakeAp::open(NETWORK, SSID, 6, 7)
+            FakeAp::open(NETWORK, SSID, legacy, 7)
         }
+        .and_then(|ap| {
+            if matches!(receive_model, ReceiveModel::Client) {
+                ap.with_legacy_rates(&[0x8c, 0x98, 0xb0])
+            } else if six.is_some() {
+                ap.with_six_ghz_channel(channel)
+            } else {
+                Ok(ap)
+            }
+        })
         .map_err(|_| "shared Sc AP configuration")?;
-        let mut wire = Wire {
+        let mut wire = Box::new(Wire {
+            client: matches!(receive_model, ReceiveModel::Client),
+            client_mac: 0,
+            client_public: Vec::new(),
+            hold_client_public: false,
+            hold_client_filter: false,
             firmware,
             trace,
             versions,
@@ -608,7 +1840,43 @@ impl Guard {
             held_rx: None,
             m4: false,
             error: None,
-        };
+            power_expectation: None,
+            security_fault_applied: false,
+            sa_query_reply: None,
+            sae_h2e_only: false,
+            group_replay: 3,
+            igtk_expected: None,
+            gtk_expected: None,
+            phy,
+            phy_requests: Vec::new(),
+            multi_receive,
+            rx_queues: Vec::new(),
+            hold_rx_queue: None,
+            held_markers: Vec::new(),
+            baid_live: false,
+            tx_model,
+            aggregates: Vec::new(),
+            held_data: Vec::new(),
+            scheduled: None,
+            api89,
+            bz,
+            mcc_caps_override: wide_six.map(|wide| wide.mcc_caps()),
+            mcc_permissions: None,
+            six,
+            eht,
+            wide_six,
+            mld: None,
+            mld_m3: None,
+            mld_tx: mlo_tests::TxState::default(),
+            native_ap: matches!(receive_model, ReceiveModel::Ap).then(ap_native_tests::Model::new),
+            native_p2p: matches!(receive_model, ReceiveModel::P2p).then(|| {
+                p2p_tests::Model::profile(
+                    api89.is_some(),
+                    api89.is_some_and(gen3_station_tests::Case::cdb),
+                    parsed.api.has_capability(109),
+                )
+            }),
+        });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
             Ok(Ok(nvm)) => nvm,
@@ -624,14 +1892,21 @@ impl Guard {
         let mut state = State {
             hardware,
             scan_uid: 0,
+            scheduled: None,
             beacons: Vec::new(),
+            scan_seen: Vec::new(),
             connection: None,
+            ap: None,
+            ap_probes: VecDeque::new(),
             needs_reset: false,
+            stop_completed: false,
             producer: Some(rx_producer),
             receive_ipc: None,
+            receive_ap_data: None,
             eapol: VecDeque::new(),
             tx: core::array::from_fn(|_| None),
             pending: core::array::from_fn(|_| None),
+            pending_next: core::array::from_fn(|_| None),
             tx_progress: false,
         };
         let tx = core::array::from_fn(|category| {
@@ -640,25 +1915,60 @@ impl Guard {
             IrqSafeSpinLock::new(Some(producer))
         });
         let source = state.hardware.source_fence()?;
-        let device = Arc::new(Device {
+        let ap_capable = super::super::ap_session::supported(&state.hardware);
+        let go_capable = ap_capable
+            && matches!(
+                state.hardware.version(3, 0xfc).map(|version| version.1),
+                None | Some(1 | 99)
+            );
+        let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
+        policy_db.install(if six.is_some() {
+            six_ghz_tests::policy()
+        } else if phy.is_some_and(|phy| phy.width == 3) {
+            native_160_tests::policy()
+        } else if phy.is_some() {
+            he_tests::policy()
+        } else {
+            policy()
+        });
+        let device = Arc::new_cyclic(|me| Device {
             test_name: name,
+            me: me.clone(),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            scan_generation: Arc::new(super::super::scheduled_epoch::Epoch::new()),
+            mode: AtomicU32::new(2),
+            mode_generation: AtomicU64::new(1),
+            ap_capable,
+            go_capable,
+            ap_host: ap::Host::new(),
+            p2p: p2p::Host::new(),
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),
             source,
+            policy: super::super::mld_policy::Source::database(policy_db.clone()),
+            policy_fence: IrqSafeSpinLock::new(None),
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac: OWN,
             irq_vector: None,
             channels: nvm.channels,
+            six_channels: nvm.six_channels,
             tx_chains: nvm.tx_chains,
+            rx_chains: nvm.rx_chains,
             phy: nvm.phy,
-            firmware: Vec::new(),
+            firmware: if matches!(receive_model, ReceiveModel::P2p) {
+                authored
+            } else {
+                Vec::new()
+            },
             pnvm: None,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
+            mlo_report: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx,
         });
@@ -671,6 +1981,7 @@ impl Guard {
         narf_net::iface::install_rx_drain(drain);
         Ok(Self {
             device: Some(device),
+            policy_db,
             #[cfg(feature = "kernel-test")]
             owner: None,
         })
@@ -757,8 +2068,8 @@ fn request(secured: bool) -> AssociateRequest {
         ie: Vec::new(),
     }
 }
-fn scan(device: &Device) -> R {
-    let request = ScanRequest {
+fn scan_request() -> ScanRequest {
+    ScanRequest {
         ssids: vec![SSID.to_vec()],
         channels: vec![6],
         frequencies_mhz: vec![2437],
@@ -768,8 +2079,10 @@ fn scan(device: &Device) -> R {
         duration_tu: None,
         duration_mandatory: false,
         extra_ies: Vec::new(),
-    };
-    let bss = run(device.scan(request), service)?.map_err(|_| "Sc native scan failed")?;
+    }
+}
+fn scan(device: &Device) -> R {
+    let bss = run(device.scan(scan_request()), service)?.map_err(|_| "Sc native scan failed")?;
     require(
         bss.len() == 1 && bss[0].bssid == AP && bss[0].ssid == SSID && bss[0].channel == 6,
         "Sc native scan did not populate association identity",
@@ -1384,3 +2697,245 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/dhcp",
     smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down
 );
+
+fn smoke_sc_current_policy_mcc_epoch_and_pending_native_configuration() -> TestResult {
+    check(|| {
+        let guard = Guard::new(false, Fault::None)?;
+        let device = guard.device();
+        scan(device)?;
+        run(
+            device.associate_in_domain(request(false), &policy()),
+            service,
+        )?
+        .map_err(|_| "Sc policy association failed")?;
+        require(device.link_up(), "Sc policy fixture did not associate")?;
+        // Correlated MCC facts cannot survive a CHUB notification, even
+        // when the host's country and rules are unchanged.
+        HARNESS
+            .lock()
+            .as_mut()
+            .unwrap()
+            .1
+            .firmware
+            .inject(0xc9, 0, 0x8000, &[b'S', b'U', 2, 0]);
+        for _ in 0..4 {
+            device.step(None);
+        }
+        require(!device.link_up(), "Sc CHUB notification retained carrier")?;
+        {
+            let state = device
+                .state
+                .try_lock()
+                .ok_or("Sc policy stop not terminal")?;
+            require(
+                state.needs_reset && state.stop_completed && state.hardware.is_failed(),
+                "Sc MCC loss did not complete retained transport stop",
+            )?;
+        }
+        drop(guard);
+        let guard = Guard::new(true, Fault::HoldM4)?;
+        let device = guard.device();
+        scan(device)?;
+        let domain = policy();
+        let mut association = Box::pin(device.associate_in_domain(request(true), &domain));
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            if association
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return Err("Sc held-M4 policy fixture completed early");
+            }
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held_tx.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc policy test did not reach native M4");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        let mut replacement = policy();
+        replacement.rules[0].max_power_dbm -= 1;
+        guard.policy_db.install(replacement);
+        require(
+            matches!(
+                association
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            ),
+            "Sc configuration accepted changed installed policy",
+        )?;
+        drop(association);
+        for _ in 0..4 {
+            device.step(None);
+        }
+        require(
+            !device.link_up(),
+            "Sc policy change during M4 admitted carrier",
+        )?;
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc held-M4 stop still busy")?;
+        require(
+            state.needs_reset
+                && state.stop_completed
+                && super::super::runtime::model::retained(&state.hardware).2 > 0,
+            "Sc held native M4 DMA was released after policy loss",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_sc_current_policy_mcc_epoch_and_pending_native_configuration
+);
+
+fn smoke_sc_dropped_public_scan_retains_native_command_until_transport_stop() -> TestResult {
+    check(|| {
+        let guard = Guard::new(false, Fault::HoldScan)?;
+        let device = guard.device();
+        let mut scan = Box::pin(device.scan(scan_request()));
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            require(
+                scan.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "Sc held scan completed early",
+            )?;
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc held scan command was not published");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        drop(scan);
+        {
+            let state = device
+                .state
+                .try_lock()
+                .ok_or("Sc dropped scan retained caller lock")?;
+            require(
+                state.needs_reset && model::retained(&state.hardware).0 == 1,
+                "Sc dropped scan discarded pending native DMA",
+            )?;
+        }
+        let commands = HARNESS.lock().as_ref().unwrap().1.commands.len();
+        for _ in 0..4 {
+            device.step(None);
+        }
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc scan stop remains unowned")?;
+        require(
+            state.stop_completed
+                && state.hardware.is_failed()
+                && !device.link_up()
+                && model::retained(&state.hardware).0 == 1
+                && HARNESS.lock().as_ref().unwrap().1.commands.len() == commands,
+            "Sc scan cancellation resumed emission or released uncertain command DMA",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_sc_dropped_public_scan_retains_native_command_until_transport_stop
+);
+
+fn smoke_sc_dropped_close_waiter_after_m4_request_still_retires_native_station() -> TestResult {
+    check(|| {
+        let guard = Guard::new(true, Fault::HoldM4)?;
+        let device = guard.device();
+        scan(device)?;
+        let domain = policy();
+        let mut association = Box::pin(device.associate_in_domain(request(true), &domain));
+        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            require(
+                association.as_mut().poll(&mut cx).is_pending(),
+                "Sc close-drop setup completed before held M4",
+            )?;
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held_tx.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc close-drop fixture did not reach M4");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        let mut close = Box::pin(device.disassociate());
+        require(
+            close.as_mut().poll(&mut cx).is_pending(),
+            "Sc close did not wait for the native M4 owner",
+        )?;
+        drop(close);
+        require(
+            device.closing.load(Ordering::Acquire) && !device.link_up(),
+            "Sc dropped close waiter lost its terminal request",
+        )?;
+        {
+            let mut slot = HARNESS.lock();
+            let wire = &mut slot.as_mut().unwrap().1;
+            let (queue, pointer) = wire.held_tx.take().ok_or("Sc held M4 absent")?;
+            wire.fault = Fault::None;
+            wire.firmware.tx_complete(queue, pointer);
+        }
+        require(
+            run(association.as_mut(), service)?.is_err(),
+            "Sc dropped close admitted stale carrier",
+        )?;
+        drop(association);
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            service()?;
+            device.step(None);
+            if !device.closing.load(Ordering::Acquire) {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc retained close did not finish native retirement");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc retained close still owns state")?;
+        require(
+            state.connection.is_none()
+                && !state.needs_reset
+                && !state.hardware.is_failed()
+                && model::retained(&state.hardware) == (0, 0, 0)
+                && !device.link_up(),
+            "Sc dropped close waiter reset or leaked healthy native owners",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_sc_dropped_close_waiter_after_m4_request_still_retires_native_station
+);
+
+#[path = "bz_station_tests.rs"]
+mod bz_station_tests;
+#[path = "sc_eht_native_tests.rs"]
+mod eht_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "sc_mlo_native_tests.rs"]
+mod mlo_tests;
+#[path = "p2p_native_tests.rs"]
+mod p2p_tests;
+#[path = "six_ghz_wide_tests.rs"]
+mod wide_six_tests;

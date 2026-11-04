@@ -133,6 +133,9 @@ struct Model {
     stall_init: bool,
     factory: u32,
     ht: Option<u32>,
+    rf_chains: Option<u32>,
+    ap_services: bool,
+    vht: Option<(u32, u32)>,
 }
 impl Model {
     fn new(dialect: Dialect) -> Self {
@@ -152,6 +155,9 @@ impl Model {
             stall_init: false,
             factory: 0x64,
             ht: None,
+            rf_chains: None,
+            ap_services: false,
+            vht: None,
         }
     }
 }
@@ -186,6 +192,23 @@ impl Hif for Model {
                 self.rx.push_back((1, header(0, &[3, 0, 0, 3, 0, 1, 0, 1])));
             } else if bytes == [0, 0, 8, 0, 0, 1, 0, 0, 2, 0, 0, 1, 0, 32, 0, 0] {
                 let mut service = event_factory(self.dialect, false, self.factory);
+                if self.ap_services && self.dialect == Dialect::Tlv {
+                    // Actual SERVICE_READY TLV bitmap: base0/6 and extended
+                    // TLV service92(bit28), independently authored wire bits.
+                    for (at, bits) in [(156usize, 1 | (1 << 28)), (160, 4)] {
+                        let old = u32::from_le_bytes(service[at..at + 4].try_into().unwrap());
+                        u32at(&mut service, at, old | bits);
+                    }
+                }
+
+                if let Some(chains) = self.rf_chains {
+                    let at = match self.dialect {
+                        Dialect::Main | Dialect::TenFour => 4 + 84,
+                        Dialect::Tlv => 4 + 4 + 36,
+                        _ => 4 + 80,
+                    };
+                    u32at(&mut service, at, chains);
+                }
                 if let Some(ht) = self.ht {
                     // Literal SERVICE_READY WMI header + native fixed/TLV
                     // event offsets; exercise the production parser.
@@ -195,6 +218,23 @@ impl Hif for Model {
                         _ => 4 + 84,
                     };
                     u32at(&mut service, at, ht);
+                }
+                if let Some((caps, mcs)) = self.vht {
+                    let at = match self.dialect {
+                        Dialect::Main | Dialect::TenFour => 4 + 92,
+                        Dialect::Tlv => 4 + 4 + 44,
+                        _ => 4 + 88,
+                    };
+                    u32at(&mut service, at, caps);
+                    u32at(&mut service, at + 4, mcs);
+                    if self.dialect == Dialect::TenFour {
+                        // WMI_10_4_SERVICE_11AC=8: legacy four-bit service
+                        // words, bitmap starts at native body offset20.
+                        let bitmap = 4 + 20 + 8;
+                        let value =
+                            u32::from_le_bytes(service[bitmap..bitmap + 4].try_into().unwrap());
+                        u32at(&mut service, bitmap, value | 1);
+                    }
                 }
                 self.rx.push_back((2, header(2, &service)));
                 self.rx.push_back((1, header(0, &[3, 0, 0, 1, 0, 2, 0, 8])));

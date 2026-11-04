@@ -17,6 +17,15 @@ pub const ARGUMENT: u32 = 0x08;
 pub const TRANSFER_MODE: u32 = 0x0C;
 pub const COMMAND: u32 = 0x0E;
 
+/// Linux `SDHCI_MAKE_BLKSZ(dma, blksz)`: SDMA buffer boundary in [14:12].
+#[inline]
+pub const fn make_blksz(boundary: u16, block_size: u16) -> u16 {
+    ((boundary & 0x7) << 12) | (block_size & 0xFFF)
+}
+/// Linux `SDHCI_DEFAULT_BOUNDARY_ARG` (`ilog2(SZ_512K) - 12`): 512 KiB.
+pub const DEFAULT_BOUNDARY_ARG: u16 = 7;
+pub const DEFAULT_BOUNDARY_SIZE: u64 = 512 * 1024;
+
 // Transfer-mode bits
 pub const TRNS_DMA: u16 = 0x0001;
 pub const TRNS_BLK_CNT_EN: u16 = 0x0002;
@@ -74,6 +83,12 @@ pub const POWER_ON: u8 = 0x01;
 pub const POWER_180: u8 = 0x0A; // 1.8 V
 pub const POWER_300: u8 = 0x0C; // 3.0 V
 pub const POWER_330: u8 = 0x0E; // 3.3 V
+
+// ── Wakeup control (0x2B) ─────────────────────────────────────────────
+pub const WAKE_UP_CONTROL: u32 = 0x2B;
+pub const WAKE_ON_INT: u8 = 0x01;
+pub const WAKE_ON_INSERT: u8 = 0x02;
+pub const WAKE_ON_REMOVE: u8 = 0x04;
 
 // ── Clock control (0x2C–0x2D) ─────────────────────────────────────────
 pub const CLOCK_CONTROL: u32 = 0x2C;
@@ -151,16 +166,26 @@ pub const CAPS_CLOCK_BASE_SHIFT: u32 = 8;
 pub const CAPS_CLOCK_V3_BASE_MASK: u32 = 0x0000_FF00;
 pub const CAPS_MAX_BLOCK_MASK: u32 = 0x0003_0000;
 pub const CAPS_MAX_BLOCK_SHIFT: u32 = 16;
+pub const CAPS_CAN_DO_ADMA2: u32 = 0x0008_0000;
+pub const CAPS_CAN_DO_ADMA1: u32 = 0x0010_0000;
 pub const CAPS_CAN_DO_HISPD: u32 = 0x0020_0000;
 pub const CAPS_CAN_DO_SDMA: u32 = 0x0040_0000;
 pub const CAPS_CAN_VDD_330: u32 = 0x0100_0000;
 pub const CAPS_CAN_VDD_300: u32 = 0x0200_0000;
 pub const CAPS_CAN_VDD_180: u32 = 0x0400_0000;
+/// 64-bit system address support (non-v4 meaning; Linux `SDHCI_CAN_64BIT`).
+pub const CAPS_CAN_64BIT: u32 = 0x1000_0000;
 
 pub const CAPABILITIES_1: u32 = 0x44;
 pub const CAPS1_SUPPORT_SDR50: u32 = 0x0000_0001;
 pub const CAPS1_SUPPORT_SDR104: u32 = 0x0000_0002;
 pub const CAPS1_SUPPORT_DDR50: u32 = 0x0000_0004;
+
+// ── ADMA (0x54–0x5F) ───────────────────────────────────────────────────
+/// ADMA error status (state in [1:0], length mismatch in bit 2).
+pub const ADMA_ERROR: u32 = 0x54;
+pub const ADMA_ADDRESS: u32 = 0x58;
+pub const ADMA_ADDRESS_HI: u32 = 0x5C;
 
 // ── Host version (0xFE–0xFF) ───────────────────────────────────────────
 pub const HOST_VERSION: u32 = 0xFE;

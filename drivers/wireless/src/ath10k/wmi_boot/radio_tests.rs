@@ -1,6 +1,10 @@
 use super::*;
 use crate::ath10k::{bmi::BmiError, wmi_runtime as radio};
 include!("radio_golden.rs");
+#[path = "ap_native_tests.rs"]
+mod ap_native_tests;
+#[path = "host_power_tests.rs"]
+mod host_power_tests;
 
 // These pure protocol fixtures can yield after credit-only HTC progress.
 // Keep polling the SAME pinned operation; once() intentionally drops a
@@ -41,9 +45,37 @@ struct RadioModel {
     ce: Option<crate::ath10k::boot::CeFixture>,
     data: Option<data_tests::Fixture>,
     active: Option<active_scan_tests::Fixture>,
+    associated: Option<associated_scan_tests::Fixture>,
+    offchannel: Option<offchannel_native::Fixture>,
     ps: Option<power_save_tests::Fixture>,
     ps_default_off: bool,
     frequency: u16,
+    chain_mask: u8,
+    chain_sent: Vec<Vec<u8>>,
+    chain_stall: Option<u8>,
+    coexistence: Option<coexistence_native::Fixture>,
+    host_power: HostPowerFixture,
+    beacon_hint: BeaconHintFixture,
+    ap: Option<ap_native_tests::Fixture>,
+    wow: Option<wow_native::Fixture>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BeaconHintFixture {
+    #[default]
+    Off,
+    Beacon,
+    Probe,
+    NoForeign,
+    WrongScope,
+    WrongChannel,
+}
+#[derive(Debug, Default)]
+struct HostPowerFixture {
+    enabled: bool,
+    eligible: bool,
+    defer: bool,
+    deferred: bool,
+    polls: usize,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -56,6 +88,17 @@ impl HostMemory for RadioModel {
     }
 }
 impl htt::HttMemory for RadioModel {
+    fn supports_htt_pfc(&self) -> bool {
+        self.inner.supports_htt_pfc()
+    }
+    fn publish_htt_queue_state(&mut self, bytes: &[u8]) -> Result<(), htt::Error> {
+        self.check_current().map_err(|_| htt::Error::Failed)?;
+        self.inner.publish_htt_queue_state(bytes)
+    }
+    fn pending_htt_tx(&self) -> Result<usize, htt::Error> {
+        self.check_current().map_err(|_| htt::Error::Failed)?;
+        self.inner.pending_htt_tx()
+    }
     fn prepare_wmi_management(&mut self, bytes: &[u8]) -> Result<(u32, u64), htt::Error> {
         if self.management_memory.is_none() {
             self.management_memory = Some(radio::management::Pool::new()?);
@@ -158,7 +201,9 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
     if bad_ie {
         frame.push(0xff);
     }
-    if model.active.as_ref().is_some_and(|active| !active.done) {
+    if model.active.as_ref().is_some_and(|active| !active.done)
+        || model.beacon_hint == BeaconHintFixture::Probe
+    {
         // An active scan receives actual probe responses, including the native
         // unicast receiver, through the same management descriptor decoder.
         frame[0] = 0x50;
@@ -206,28 +251,122 @@ fn management_frame(model: &mut RadioModel, frame: Vec<u8>) {
     add_event(model, id, &body);
 }
 impl Hif for RadioModel {
+    fn runtime_idle_supported(&self) -> bool {
+        self.host_power.enabled
+    }
+    fn runtime_idle(&mut self, eligible: bool) {
+        self.host_power.eligible = eligible;
+    }
+    fn take_idle_deferred(&mut self) -> bool {
+        core::mem::take(&mut self.host_power.deferred)
+    }
+    fn nonblocking_wmi(&self) -> bool {
+        self.ce.is_some()
+    }
     fn current_sources(&self) -> Option<crate::ath10k::firmware_source::Source> {
         self.sources.clone()
     }
     fn source_ready(&mut self, pipe: u8) -> Result<bool, BmiError> {
+        if pipe == 3 {
+            if let Some(fixture) = &mut self.associated {
+                if let Some((remaining, bytes)) = &mut fixture.release_after_ready {
+                    let ce = self.ce.as_mut().ok_or(BmiError::Unsupported)?;
+                    if ce.source_bytes(3) != *bytes {
+                        return Err(BmiError::BadResponse);
+                    }
+                    if *remaining == 0 {
+                        ce.hold_source(false);
+                        fixture.release_after_ready = None;
+                    } else {
+                        *remaining -= 1;
+                    }
+                }
+            }
+        }
         match &mut self.ce {
             Some(ce) => ce.source_ready(pipe),
             None => Ok(true),
         }
     }
     fn begin_send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if pipe == 3 && self.ce.is_some() {
+            // Reuse the independent firmware parser/emitter below, with its
+            // blocking CE wrapper detached. The actual nonblocking source
+            // descriptor/bounce and terminal receipt are owned by CeFixture.
+            let chain_stage =
+                chains_tests::stage(self.inner.inner.dialect, bytes.get(8..).unwrap_or_default());
+            let stalled = if let Some(stage) = chain_stage {
+                self.chain_stall == Some(stage)
+            } else {
+                self.associated
+                    .as_ref()
+                    .is_some_and(associated_scan_tests::stall_next)
+                    || self
+                        .active
+                        .as_ref()
+                        .is_some_and(active_scan_tests::stall_next)
+                    || self.stall == Some(self.phase)
+            };
+            let mut ce = self.ce.take().unwrap();
+            let outcome = {
+                let mut emit = core::pin::pin!(self.send(pipe, bytes));
+                emit.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            };
+            let result = match outcome {
+                Poll::Ready(Ok(())) => Ok(()),
+                // Only the explicit model hold may suspend the emitter;
+                // its transport receipt is still the native CE below.
+                Poll::Pending if stalled => Ok(()),
+                Poll::Pending => Err(BmiError::BadResponse),
+                Poll::Ready(Err(error)) => Err(error),
+            };
+            if let Err(error) = result {
+                self.ce = Some(ce);
+                return Err(error);
+            }
+            if stalled {
+                ce.hold_source(true);
+            }
+            let result = ce.begin_send(pipe, bytes);
+            self.ce = Some(ce);
+            return result;
+        }
+        if pipe == 4 && self.ap.is_some() {
+            if let Some(ce) = &mut self.ce {
+                ce.begin_send(pipe, bytes)?;
+            }
+            return ap_native_tests::transmit(self, bytes);
+        }
         if pipe != 4 || self.data.is_none() {
             return Err(BmiError::Unsupported);
         }
         if let Some(ce) = &mut self.ce {
             ce.begin_send(pipe, bytes)?;
         }
+        if offchannel_native::is_htt(self, bytes) {
+            return offchannel_native::htt_send(self, bytes);
+        }
+        if let Some(result) = data_tests::pfc_response(self, bytes) {
+            return result;
+        }
         data_tests::send_now(self, bytes)
     }
     fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        self.host_power.deferred = false;
+        if self.host_power.enabled
+            && self.host_power.eligible
+            && self.host_power.defer
+            && self.inner.inner.rx.is_empty()
+        {
+            self.host_power.deferred = true;
+            return Ok(None);
+        }
+        self.host_power.polls += 1;
+        ap_native_tests::poll(self);
         if let Some(ce) = &mut self.ce {
             ce.poll_now()?;
         }
+        offchannel_native::poll(self)?;
         data_tests::poll(self)?;
         match self.inner.inner.rx.pop_front() {
             Some((pipe, bytes)) => match &mut self.ce {
@@ -238,6 +377,8 @@ impl Hif for RadioModel {
         }
     }
     async fn poll(&mut self, b: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        ap_native_tests::poll(self);
+        offchannel_native::poll(self)?;
         data_tests::poll(self)?;
         if self.mismatch_rx && self.inner.inner.rx.is_empty() {
             // Literal TLV management RX containing an otherwise valid Open
@@ -271,8 +412,24 @@ impl Hif for RadioModel {
         }
     }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        let hold_chain = pipe == 3
+            && self.chain_stall.is_some_and(|target| {
+                chains_tests::stage(self.inner.inner.dialect, bytes.get(8..).unwrap_or_default())
+                    == Some(target)
+            });
         if let Some(ce) = &mut self.ce {
+            if hold_chain {
+                ce.hold_source(true);
+            }
             ce.send(pipe, bytes).await?;
+        }
+        if pipe == 4 && offchannel_native::is_htt(self, bytes) {
+            return offchannel_native::htt_send(self, bytes);
+        }
+        if pipe == 4 {
+            if let Some(result) = data_tests::pfc_response(self, bytes) {
+                return result;
+            }
         }
         if pipe == 4 && self.data.is_some() {
             return data_tests::send(self, bytes).await;
@@ -292,11 +449,31 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.ap.is_some() {
+            return ap_native_tests::command(self, bytes);
+        }
+        if wow_native::handles(self, &bytes[8..]) {
+            return wow_native::send(self, bytes);
+        }
+        if let Some(stage) = chains_tests::stage(self.inner.inner.dialect, &bytes[8..]) {
+            return chains_tests::send(self, bytes, stage).await;
+        }
+        if offchannel_native::handles(self, &bytes[8..]) {
+            return offchannel_native::send(self, bytes);
+        }
+        if coexistence_native::handles(self, &bytes[8..]) {
+            return coexistence_native::send(self, bytes);
+        }
         if data_tests::protection_handles(self.inner.inner.dialect, &bytes[8..]) {
             return data_tests::protection_send(self, bytes).await;
         }
         if power_save_tests::handles(self.inner.inner.dialect, &bytes[8..]) {
             return power_save_tests::send(self, bytes).await;
+        }
+        if self.associated.as_ref().is_some_and(|fixture| {
+            associated_scan_tests::handles(fixture, self.inner.inner.dialect, &bytes[8..])
+        }) {
+            return associated_scan_tests::send(self, bytes).await;
         }
         if self.phase >= 2
             && self.active.as_ref().is_some_and(|active| {
@@ -304,6 +481,9 @@ impl Hif for RadioModel {
             })
         {
             return active_scan_tests::send(self, bytes).await;
+        }
+        if data_tests::install_handles(self, &bytes[8..]) {
+            return data_tests::install_key(self, bytes);
         }
         if data_tests::captures_management(self, &bytes[8..]) {
             return data_tests::capture_management(self, bytes);
@@ -423,6 +603,21 @@ impl Hif for RadioModel {
             scan_event(self, 2, 0xa000 | self.scan.saturating_sub(1), 0xa001);
             scan_event(self, 2, 0xa000 | self.scan, 0xa002); // wrong requestor
             scan_event(self, 1, 0xa000 | self.scan, 0xa001);
+            match self.beacon_hint {
+                BeaconHintFixture::Beacon | BeaconHintFixture::Probe => {
+                    scan_event(self, 8, 0xa000 | self.scan, 0xa001);
+                }
+                BeaconHintFixture::WrongScope => {
+                    scan_event(self, 8, 0xa000 | self.scan, 0xa002);
+                }
+                BeaconHintFixture::WrongChannel => {
+                    let frequency = self.frequency;
+                    self.frequency = 5200;
+                    scan_event(self, 8, 0xa000 | self.scan, 0xa001);
+                    self.frequency = frequency;
+                }
+                BeaconHintFixture::Off | BeaconHintFixture::NoForeign => {}
+            }
             management(self, true);
             management(self, false);
             if self.malformed {
@@ -473,6 +668,17 @@ fn radio_boot_country_ht(
     factory: u32,
     ht: Option<u32>,
 ) -> radio::Radio<RadioModel> {
+    radio_boot_country_ht_rf(version, dialect, features, major, factory, ht, 2)
+}
+fn radio_boot_country_ht_rf(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+    factory: u32,
+    ht: Option<u32>,
+    rf_chains: u32,
+) -> radio::Radio<RadioModel> {
     let hardware = if dialect == Dialect::Tlv {
         HwRev::Qca6174
     } else if dialect == Dialect::TenFour {
@@ -480,17 +686,91 @@ fn radio_boot_country_ht(
     } else {
         HwRev::Qca988x
     };
-    let htt_version = if dialect == Dialect::Tlv {
+    radio_boot_source(
+        version,
+        dialect,
+        features,
+        major,
+        factory,
+        ht,
+        RadioSource {
+            hardware,
+            rf_chains,
+            vht: None,
+        },
+    )
+}
+#[derive(Clone, Copy)]
+struct RadioSource {
+    hardware: HwRev,
+    rf_chains: u32,
+    vht: Option<(u32, u32)>,
+}
+fn radio_boot_source(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+    factory: u32,
+    ht: Option<u32>,
+    source: RadioSource,
+) -> radio::Radio<RadioModel> {
+    radio_boot_source_version(version, dialect, features, (major, 1), factory, ht, source)
+}
+fn radio_boot_source_version(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    htt_version: (u8, u8),
+    factory: u32,
+    ht: Option<u32>,
+    source: RadioSource,
+) -> radio::Radio<RadioModel> {
+    radio_boot_source_ap(
+        version,
+        dialect,
+        features,
+        htt_version,
+        factory,
+        ht,
+        (source, false),
+    )
+}
+fn radio_boot_source_ap(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    htt_version: (u8, u8),
+    factory: u32,
+    ht: Option<u32>,
+    profile: (RadioSource, bool),
+) -> radio::Radio<RadioModel> {
+    let (source, ap_services) = profile;
+    let RadioSource {
+        hardware,
+        rf_chains,
+        vht,
+    } = source;
+    let htt_dialect = if dialect == Dialect::Tlv {
         3
     } else if dialect == Dialect::TenFour {
         4
     } else {
         1
     };
-    let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
+    let c = htt::Config::new(hardware, version, htt_dialect, features & (1 << 13)).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
+    if dialect == Dialect::TenFour && hardware == HwRev::Qca9888 {
+        // Independent Linux resource words8/9: QCA9888 has two physical
+        // chains; the default frozen10.4 fixture is QCA9984's four.
+        u32at(&mut inner.inner.expected, 4 + 8 * 4, 3);
+        u32at(&mut inner.inner.expected, 4 + 9 * 4, 3);
+    }
     inner.inner.factory = factory;
+    inner.inner.ap_services = ap_services;
     inner.inner.ht = ht;
+    inner.inner.rf_chains = Some(rf_chains);
+    inner.inner.vht = vht;
     let raw = features & (1 << 10) != 0;
     inner.raw = raw;
     if raw {
@@ -502,7 +782,8 @@ fn radio_boot_country_ht(
         };
         inner.inner.expected[at..at + 4].fill(0);
     }
-    inner.version = major;
+    inner.version = htt_version.0;
+    inner.minor = htt_version.1;
     let model = RadioModel {
         sources: None,
         inner,
@@ -528,12 +809,28 @@ fn radio_boot_country_ht(
         data: None,
         active: None,
         ps: None,
+        wow: None,
         ps_default_off: false,
         frequency: 2412,
+        chain_mask: (((1u32 << rf_chains.min(4)) - 1)
+            & if dialect == Dialect::TenFour { 15 } else { 7 }) as u8,
+        chain_sent: Vec::new(),
+        chain_stall: None,
+        coexistence: None,
+        associated: None,
+        offchannel: None,
+        host_power: HostPowerFixture::default(),
+        beacon_hint: BeaconHintFixture::Off,
+        ap: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
-    let mut wmi = Runtime::new(htc, dialect, hardware, if raw { 1 << 10 } else { 0 });
+    let mut wmi = Runtime::new(
+        htc,
+        dialect,
+        hardware,
+        if raw { 1 << 10 } else { 0 } | (features & (1 << 13)),
+    );
     assert!(matches!(once(wmi.start()), Poll::Ready(Ok(_))));
     let mut htt = htt::Runtime::new(wmi, c);
     assert!(matches!(once(htt.start()), Poll::Ready(Ok(_))));
@@ -797,5 +1094,59 @@ mod data_tests;
 
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
+#[path = "associated_scan_tests.rs"]
+mod associated_scan_tests;
+#[path = "chains_tests.rs"]
+mod chains_tests;
+#[path = "coexistence_native.rs"]
+mod coexistence_native;
+#[path = "offchannel_native.rs"]
+mod offchannel_native;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "wow_native.rs"]
+mod wow_native;
+
+/// cfg80211 keeps one BSS table per wiphy (`scan.c::cfg80211_bss_update`):
+/// a P2P_DEVICE scan merges its GO beside the netdev's results (so the P2P
+/// client's station prepare finds it), while a netdev scan still replaces
+/// the table it observed.
+fn smoke_ath10k_p2p_device_scan_merges_shared_bss_table() -> TestResult {
+    let mut r = radio_boot(4, Dialect::Tlv);
+    let bss = |last: u8, frequency: u16, ie: u8| radio::ScanBss {
+        bssid: [2, 0, 0, 0, 0, last],
+        ssid: b"DIRECT-xy".to_vec(),
+        frequency,
+        snr: 30,
+        capability: 1,
+        beacon_interval: 100,
+        information_elements: vec![ie],
+    };
+    if r.publish_scan_cache(&[bss(1, 2412, 1)], None, false)
+        .is_err()
+    {
+        return TestResult::Fail("netdev scan");
+    }
+    if r.publish_scan_cache(&[bss(9, 2437, 9), bss(1, 2412, 7)], None, true)
+        .is_err()
+    {
+        return TestResult::Fail("p2p device scan");
+    }
+    if r.information_elements([2, 0, 0, 0, 0, 9]) != Some(vec![9])
+        || r.information_elements([2, 0, 0, 0, 0, 1]) != Some(vec![7])
+    {
+        return TestResult::Fail("p2p scan did not merge into the wiphy table");
+    }
+    if r.publish_scan_cache(&[bss(3, 2462, 3)], None, false)
+        .is_err()
+        || r.information_elements([2, 0, 0, 0, 0, 9]).is_some()
+        || r.information_elements([2, 0, 0, 0, 0, 3]) != Some(vec![3])
+    {
+        return TestResult::Fail("netdev scan replaces unbound entries");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/p2p",
+    smoke_ath10k_p2p_device_scan_merges_shared_bss_table
+);

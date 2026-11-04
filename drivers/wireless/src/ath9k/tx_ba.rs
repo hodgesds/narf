@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9285-only measured two-MPDU sender BA. Air protocol and original
+//! AR9285-only measured sender BA. Air protocol and original
 //! ownership precede native descriptor publication; no firmware offload exists.
 use super::{
     ht,
@@ -12,7 +12,11 @@ use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;
 #[path = "tx_ba/protocol.rs"]
 mod protocol;
-pub(super) use protocol::{Action, Owner, PairPermit};
+pub(super) use protocol::{Action, AggregatePermit, Owner};
+#[path = "tx_ba/large.rs"]
+mod large;
+pub(super) use large::request as large_request;
+pub(super) const MAX_MEMBERS: usize = 8;
 pub(super) const MAX_AIR: usize = 4095;
 pub(super) const RETRIES: u8 = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +28,18 @@ pub struct Request {
 pub(super) fn request(base: &ht::Grant) -> Request {
     let (identity, digest, mac) = base.ba_identity();
     let mut h = narf_crypto::sha256::Sha256::new();
-    h.update(b"NARF AR9285 N85T measured two-MPDU HT20 LGI sender BA v1");
+    if base.version() == 1 {
+        h.update(b"NARF AR9285 N85T measured two-MPDU HT20 LGI sender BA v1");
+    } else if base.version() == 2 {
+        h.update(b"NARF AR9285 N85T measured two-MPDU HT20 LGI sender BA exact-channel v2");
+        h.update(&base.frequency().to_le_bytes());
+        h.update(b"exact current per-channel HT/calibration/CTL/rate facts and original packet/key/BA/capture generation; no v1 channel1 receipt reused");
+    }
+    if base.version() == 3 {
+        h.update(b"NARF AR9285 N85T complete20/40 LGI/SGI40 exact qualified native program v3");
+        h.update(&base.geometry().body());
+        h.update(b"exact H3 complete signed payload and current fresh40 calibration/10power program; primary+secondary full40span; native TXwidth/GI and RXwidth/GI/STBC matches negotiated direction; noSGI20; narrow response requires actual cold20 reset/calibration/fresh join before keys/data; source v1/v2 protocol/ownership rules retained while literal narrow NDBPS/duration is replaced by actual20/40 and ceil3.6us");
+    }
     h.update(&identity);
     h.update(&digest);
     h.update(&mac);
@@ -33,10 +48,35 @@ pub(super) fn request(base: &ht::Grant) -> Request {
     Request {
         identity: h.finalize(),
         mac,
-        filename: format!(
-            "ath9k/ar9285-txba-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        ),
+        filename: if base.version() == 1 {
+            format!(
+                "ath9k/ar9285-txba-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            )
+        } else if base.version() == 2 {
+            format!(
+                "ath9k/ar9285-txba-v2-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                base.channel(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            )
+        } else {
+            format!(
+                "ath9k/ar9285-txba-v3-ch{}-ext{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                base.channel(),
+                base.geometry().secondary().expect("H3 exact extension"),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            )
+        },
     }
 }
 pub(super) struct Grant {
@@ -45,6 +85,8 @@ pub(super) struct Grant {
     peak: i16,
     ceiling: i16,
     window: u8,
+    members: usize,
+    max_air: usize,
 }
 pub(super) enum Source {
     Registered,
@@ -72,7 +114,10 @@ impl Source {
                 let loader = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive::<Read>().ok())
                     .ok_or(Error::Access)?;
-                let cap = narf_firmware::open(&request(&base).filename, &loader)
+                // An absent v4 record retains the exact accepted two-member
+                // contract. A present malformed v4 record is never downgraded.
+                let cap = narf_firmware::open(&large::request(&base).filename, &loader)
+                    .or_else(|_| narf_firmware::open(&request(&base).filename, &loader))
                     .map_err(|_| Error::Access)?;
                 cap.invoke(Decode(base)).map_err(|_| Error::Access)??
             }
@@ -84,6 +129,9 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn signed_ceiling(&self) -> i16 {
+        self.ceiling
+    }
     fn decode(
         b: &[u8],
         signer: Option<[u8; 32]>,
@@ -91,15 +139,18 @@ impl Grant {
         base: Arc<ht::Grant>,
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| Error::Access)?;
+        if b.get(4) == Some(&4) {
+            return large::decode(b, signer, cap, base);
+        }
         let r = request(&base);
         if signer.is_none()
             || b.len() != 96
-            || b[..8] != [b'N', b'8', b'5', b'T', 1, 0, 96, 0]
+            || b[..8] != [b'N', b'8', b'5', b'T', base.version(), 0, 96, 0]
             || b[8..12] != 96u32.to_le_bytes()
             || b[12..16] != [0x8c, 0x16, 0x2b, 0]
             || b[16..48] != r.identity
             || b[48..54] != r.mac
-            || b[54..58] != [1, 20, 1, 2]
+            || b[54..58] != base.child_geometry(2)
             || !(4..=64).contains(&b[60])
             || b[61] != RETRIES
             || b[64..] != [0; 32]
@@ -112,6 +163,8 @@ impl Grant {
             peak: i16::from_le_bytes([b[58], b[59]]),
             ceiling: i16::from_le_bytes([b[62], b[63]]),
             window: b[60],
+            members: 2,
+            max_air: MAX_AIR,
         };
         if !(-512..=256).contains(&g.peak) || !(-512..=256).contains(&g.ceiling) {
             return Err(Error::Packet);
@@ -128,7 +181,9 @@ impl Grant {
                     let mut limit = self.0.ceiling.min(base);
                     let d = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
                     for r in &d.rules {
-                        if r.freq_start_mhz < 2422 && r.freq_end_mhz > 2402 {
+                        if r.freq_start_mhz < self.0.base.span().1
+                            && r.freq_end_mhz > self.0.base.span().0
+                        {
                             limit = limit.min(i16::from(r.max_power_dbm) * 2);
                         }
                     }
@@ -153,6 +208,9 @@ impl Grant {
         }
         Ok(())
     }
+    pub(super) fn members(&self) -> usize {
+        self.members
+    }
     pub(super) fn window(&self) -> u8 {
         self.window
     }
@@ -160,3 +218,5 @@ impl Grant {
 #[cfg(feature = "kernel-test")]
 #[path = "tx_ba/tests.rs"]
 pub(super) mod tests;
+#[cfg(feature = "kernel-test")]
+pub(super) use large::tests as large_tests;

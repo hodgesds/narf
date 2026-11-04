@@ -97,6 +97,7 @@ fn inputs() -> (narf_bus::BusDevice, Identity, Prepared, Report) {
             big_endian_fields: false,
         },
         Prepared {
+            geometry: crate::ath9k::channel_width::Geometry::from_frequency(2412).unwrap(),
             reference_frequency: 2412,
             high_power_gain: false,
             xe2_gain: false,
@@ -118,14 +119,15 @@ fn facts() -> Facts {
     let (d, i, p, r) = inputs();
     Facts::new(d, i, p, r, &image()).unwrap()
 }
-fn record(f: &Facts, mcs: u8) -> Vec<u8> {
+pub(in crate::ath9k) fn record(f: &Facts, mcs: u8) -> Vec<u8> {
     let mut b = vec![0; 160];
     b[..8].copy_from_slice(&[b'N', b'8', b'5', b'H', 1, 0, 160, 0]);
     b[8..12].copy_from_slice(&160u32.to_le_bytes());
     b[12..16].copy_from_slice(&[0x8c, 0x16, 0x2b, 0]);
     b[16..48].copy_from_slice(&f.request.identity);
     b[48..54].copy_from_slice(&f.request.mac);
-    b[54..58].copy_from_slice(&[1, 20, 1, 0]);
+    b[4] = if f.report.frequency_mhz == 2412 { 1 } else { 2 };
+    b[54..58].copy_from_slice(&[((f.report.frequency_mhz - 2407) / 5) as u8, 20, 1, 0]);
     b[58..60].copy_from_slice(&4i16.to_le_bytes());
     b[60..62].copy_from_slice(&40i16.to_le_bytes());
     b[62] = mcs;
@@ -1178,3 +1180,7 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ht",
     smoke_ar9285_ht20_unowned_native_tx_queue_never_becomes_retryable_credit
 );
+
+pub(in crate::ath9k) fn model_device() -> narf_bus::BusDevice {
+    inputs().0
+}

@@ -46,3 +46,6 @@ This crate is `no_std`. It builds directly on `narf-acpi` for table
 discovery and headers, and ties into `narf-scheduler`, `narf-time`,
 `narf-capabilities`, `narf-event-bus`, `narf-console`, and `narf-memory`
 to run methods and deliver firmware events into the live kernel.
+
+The opt-in evaluator for bounded firmware-operation receipts is specified in
+[Strict bounded firmware evaluation](specification/strict-evaluation.md).

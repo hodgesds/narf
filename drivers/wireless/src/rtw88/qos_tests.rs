@@ -169,11 +169,15 @@ fn profile(acs: u8) -> DataProfile {
         rates: 0xff0,
         qos: true,
         mcs: 0,
+        rx_mcs: 0,
         sgi: false,
         ldpc: false,
         stbc: false,
         acs,
         fallback: false,
+        bw40: false,
+        band5: false,
+        vht: None,
     }
 }
 fn eth(tos: u8) -> Vec<u8> {

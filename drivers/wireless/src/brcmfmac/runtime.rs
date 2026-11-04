@@ -9,7 +9,10 @@ use super::{
     shared::{RingInfo, RINGINFO_SIZE},
 };
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "runtime/ap_ioctl.rs"]
+mod ap_ioctl;
 #[path = "runtime/mailbox.rs"]
 pub mod mailbox;
 #[path = "runtime/quiesce.rs"]
@@ -67,6 +70,11 @@ pub trait Bus: BootBus {
     fn park_dma(&mut self) -> Result<(), Error>;
     fn doorbell(&mut self) -> Result<(), Error>;
     fn host_ready(&mut self, db1: bool) -> Result<(), Error>;
+    /// Retain only this actual physical source; unsupported backends cannot
+    /// opt into native AP. The runtime supplies its original live generation.
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        None
+    }
     /// PCIe2-core mailbox registers (Linux `devinfo->reginfo`). `None`
     /// when no PCIe2 core is known: the owner then only services rings.
     fn mailbox(&self) -> Option<mailbox::Reginfo> {
@@ -83,6 +91,12 @@ pub trait Bus: BootBus {
     }
     /// Release a vector bound by [`Self::arm_interrupts`].
     fn disarm_interrupts(&mut self) {}
+    /// Linux `pcie.c` `bus->wowl_supported = pci_pme_capable(pdev,
+    /// PCI_D3hot)`: the function's PCI PM capability lists D3hot in
+    /// `PME_Support`. Backends without config access report false.
+    fn pme_d3hot(&mut self) -> bool {
+        false
+    }
     /// Config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
     fn link_control(&mut self) -> Result<u32, Error> {
         Err(Error::Protocol)
@@ -90,6 +104,22 @@ pub trait Bus: BootBus {
     /// Write config dword `BRCMF_PCIE_REG_LINK_STATUS_CTRL` (0xBC).
     fn set_link_control(&mut self, _value: u32) -> Result<(), Error> {
         Err(Error::Protocol)
+    }
+    /// Block the function's DMA at the IOMMU before published memory is
+    /// released (`narf_io::iommu::block_device_dma`, Linux
+    /// `pci_dev_reset_iommu_prepare` / the blocked release domain).
+    /// `Untranslated` (identity/disabled IOMMU, or a backend without one)
+    /// leaves the device-side proof as the only quiescence evidence; an
+    /// error means the device may still translate. Must not depend on
+    /// live firmware or BAR authority: dead-firmware stops call it.
+    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, Error> {
+        Ok(narf_io::iommu::DmaBlock::Untranslated)
+    }
+    /// Undo [`Self::block_dma`] before a fresh generation allocates
+    /// (Linux `pci_dev_reset_iommu_done`). Called by `Runtime::attach`
+    /// with BME verified clear.
+    fn restore_dma(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +185,9 @@ struct Flow<M: Memory> {
     destination: [u8; 6],
     priority: u8,
     outstanding: usize,
+    /// Firmware interface of this (ifidx, tid, da) flow ring
+    /// (`msgbuf.c` `create->msg.ifidx`); TX posts and status carry it.
+    ifidx: u8,
 }
 struct Tx<M: Memory> {
     memory: M,
@@ -166,8 +199,16 @@ struct Data<M: Memory> {
     flows: Vec<Flow<M>>,
     tx: Vec<Tx<M>>,
     received: VecDeque<Vec<u8>>,
+    /// Secondary-ifidx received frames (interface 0 keeps `received`).
+    vif: super::vif_demux::Demux,
     receipts: VecDeque<TxReceipt>,
     dropped: usize,
+    monitor: Option<alloc::boxed::Box<MonitorOwner>>,
+    monitored: VecDeque<super::monitor_scope::Received>,
+}
+struct MonitorOwner {
+    prepared: super::monitor_native::Prepared,
+    armed: Option<super::monitor_native::Armed>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pending {
@@ -187,6 +228,7 @@ pub struct Runtime<B: Bus> {
     resources: Option<Resources<B::Memory>>,
     published: bool,
     failed: bool,
+    ap_live: Arc<AtomicBool>,
     next_buffer: u32,
     next_transaction: u16,
     pending: Option<Pending>,
@@ -204,10 +246,16 @@ pub struct Runtime<B: Bus> {
     down: bool,
     /// Set only by a complete confirmed-stop proof (`quiesce.rs`).
     reclaimable: bool,
+    /// The IOMMU blocks this function (`Bus::block_dma` returned
+    /// `Blocked`): no device transaction translates, so published memory
+    /// may be released even without a device-side proof.
+    iommu_blocked: bool,
     hostrdy_db1: bool,
     /// Discovered AI cores of the booted chip (ChipCommon watchdog, PCIe2
     /// config shadow and ARM CR4 halt for `brcmf_pcie_reset_device`).
     cores: Vec<super::chip::Core>,
+    /// Discovered ChipCommon chip id of the booted dongle.
+    chip_id: u16,
 }
 impl<B: Bus> core::fmt::Debug for Runtime<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -219,19 +267,18 @@ impl<B: Bus> core::fmt::Debug for Runtime<B> {
 }
 impl<B: Bus> Drop for Runtime<B> {
     fn drop(&mut self) {
-        if self.published && !self.reclaimable {
-            self.stop_interrupts();
-            let _ = self.bus.park_dma();
+        self.ap_live.store(false, Ordering::Release);
+        if self.published && !self.release_dma() {
             // Without a confirmed stop (D3 ack, drained completions, verified
-            // BME clear and post-clear flush reads) BME readback alone cannot
-            // prove old posted PCI writes drained. Leak this bounded owner
-            // rather than returning live DMA pages.
+            // BME clear and post-clear flush reads) or an IOMMU block, BME
+            // readback alone cannot prove old posted PCI writes drained.
+            // Leak this bounded owner rather than returning live DMA pages.
             if let Some(resources) = self.resources.take() {
                 core::mem::forget(resources);
             }
         }
-        // A reclaimable owner drops its resources normally: the device can no
-        // longer master any of them.
+        // A reclaimable or IOMMU-blocked owner drops its resources normally:
+        // the device can no longer master any of them.
     }
 }
 impl<B: Bus> Runtime<B> {
@@ -246,9 +293,14 @@ impl<B: Bus> Runtime<B> {
         // Shared 7 (BRCMF_PCIE_SHARED_VERSION_7) keeps the v6 ring-info
         // layout and only widens the D2H TX/RX completion items to 24/40
         // bytes (pcie.c brcmf_ring_itemsize vs brcmf_ring_itemsize_pre_v7).
-        if bus.dma_enabled()? || !(5..=7).contains(&shared.version) || shared.rx_dataoffset != 0 {
+        let rx_offset = msgbuf::completion_prefix(shared.version, shared.rx_dataoffset)
+            .ok_or(Error::Protocol)?;
+        if bus.dma_enabled()? {
             return Err(Error::Protocol);
         }
+        // A reset generation was left IOMMU-blocked by its stop proof:
+        // re-attach before the first new mapping (BME is clear here).
+        bus.restore_dma()?;
         let mut bytes = [0; RINGINFO_SIZE];
         bus.read_tcm(shared.ring_info_addr, &mut bytes)?;
         let info = RingInfo::parse(&bytes).ok_or(Error::Protocol)?;
@@ -356,12 +408,13 @@ impl<B: Bus> Runtime<B> {
             }),
             published: false,
             failed: false,
+            ap_live: Arc::new(AtomicBool::new(true)),
             next_buffer: 1,
             next_transaction: 0,
             pending: None,
             response: None,
             events: VecDeque::new(),
-            rx_offset: shared.rx_dataoffset as usize,
+            rx_offset,
             h2d_write: info.h2d_w_idx_ptr,
             h2d_read: info.h2d_r_idx_ptr,
             max_flows: flows,
@@ -371,8 +424,10 @@ impl<B: Bus> Runtime<B> {
             delivered: false,
             down: false,
             reclaimable: false,
+            iommu_blocked: false,
             hostrdy_db1: shared.hostrdy_db1(),
             cores: chip.cores,
+            chip_id: chip.id,
         };
         if let Some(reg) = runtime.bus.mailbox() {
             for address in [shared.htod_mb_data_addr, shared.dtoh_mb_data_addr] {
@@ -445,7 +500,18 @@ impl<B: Bus> Runtime<B> {
         input: &[u8],
         maximum: usize,
     ) -> Result<Vec<u8>, Error> {
-        let ticket = self.begin_ioctl(command, input, maximum)?;
+        self.command_on(0, command, input, maximum).await
+    }
+    /// [`Self::command`] on firmware interface `ifidx` (`brcmf_fil_cmd_data`
+    /// passes `ifp->ifidx` into `brcmf_msgbuf_query_dcmd`'s `msg.ifidx`).
+    pub async fn command_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let ticket = self.begin_ioctl_on(ifidx, command, input, maximum)?;
         let mut transaction = Transaction {
             runtime: self,
             retired: false,
@@ -466,7 +532,65 @@ impl<B: Bus> Runtime<B> {
     pub fn is_failed(&self) -> bool {
         self.failed
     }
+    /// Discovered ChipCommon chip id (`chip_profile`).
+    pub fn chip_id(&self) -> u16 {
+        self.chip_id
+    }
+    pub(crate) fn ap_source(&self) -> Option<super::ap_source::Source> {
+        if self.failed || self.down {
+            return None;
+        }
+        self.bus
+            .ap_source()
+            .map(|source| source.retain(&self.ap_live))
+    }
+    pub(crate) fn ap_owns(&self, source: &super::ap_source::Source) -> bool {
+        !self.failed && !self.down && source.belongs_to(&self.ap_live)
+    }
+    /// AP publication rechecks actual producer indices after any RX/event
+    /// repost doorbells. A zero processed count alone could precede a
+    /// completion that those reposts made publishable in this same step.
+    pub(crate) fn ap_completed_idle(&mut self) -> Result<bool, Error> {
+        if self.failed || self.down {
+            return Err(Error::Failed);
+        }
+        let result = (|| {
+            let resources = self.resources.as_ref().ok_or(Error::Failed)?;
+            for ring in &resources.rings[2..5] {
+                let peer = read16(&mut self.bus, ring.wptr)?;
+                if peer >= ring.depth {
+                    return Err(Error::Protocol);
+                }
+                if peer != ring.read {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    pub(crate) fn monitor_control_idle(&mut self) -> Result<bool, Error> {
+        if self.failed || self.down {
+            return Err(Error::Failed);
+        }
+        let result = (|| {
+            let ring = &self.resources.as_ref().ok_or(Error::Failed)?.rings[2];
+            let producer = read16(&mut self.bus, ring.wptr)?;
+            if producer >= ring.depth {
+                return Err(Error::Protocol);
+            }
+            Ok(producer == ring.read)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     pub fn fail(&mut self) {
+        self.ap_live.store(false, Ordering::Release);
         self.failed = true;
         let _ = self.bus.park_dma();
     }
@@ -522,6 +646,18 @@ impl<B: Bus> Runtime<B> {
         input: &[u8],
         maximum: usize,
     ) -> Result<Ticket, Error> {
+        self.begin_ioctl_on(0, command, input, maximum)
+    }
+    pub fn begin_ioctl_on(
+        &mut self,
+        ifidx: u8,
+        command: u32,
+        input: &[u8],
+        maximum: usize,
+    ) -> Result<Ticket, Error> {
+        if ifidx >= super::vif_wire::MAX_IFS {
+            return Err(Error::Bounds);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -547,7 +683,7 @@ impl<B: Bus> Runtime<B> {
         let request = IoctlReq {
             hdr: CommonHdr {
                 msgtype: 9,
-                ifidx: 0,
+                ifidx,
                 flags: 0,
                 request_id: 0xfffe,
             },
@@ -652,10 +788,13 @@ impl<B: Bus> Runtime<B> {
                 // Before a handler can retire a TX DMA allocation, complete
                 // reads of its matching completion descriptor into owned memory.
                 ring.memory.release();
+                // The prefix is inside each original item. Never borrow the
+                // next descriptor or alter the firmware's stride/wrap index.
+                let entry = entry.get(self.rx_offset..).ok_or(Error::Protocol)?;
                 match ring_id {
-                    2 => self.control_completion(&entry)?,
-                    3 => self.tx_completion(&entry)?,
-                    4 => self.rx_completion(&entry)?,
+                    2 => self.control_completion(entry)?,
+                    3 => self.tx_completion(entry)?,
+                    4 => self.rx_completion(entry)?,
                     _ => return Err(Error::Protocol),
                 }
                 let ring = &mut self.resources.as_mut().unwrap().rings[ring_id];
@@ -673,12 +812,24 @@ impl<B: Bus> Runtime<B> {
         Ok(processed)
     }
     fn control_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
-        if entry.len() != 24 || entry[1] != 0 {
+        // IOCTL cmd ends at byte20; the final word of the 24-byte control
+        // slot is reserved. Admission proved the complete used field span.
+        if entry.len() < 20 {
             return Err(Error::Protocol);
         }
         let kind = entry[0];
         if matches!(kind, 4 | 6) {
             return self.flow_completion(entry);
+        }
+        // Only events address an interface (`brcmf_msgbuf_process_event`
+        // resolves `msg.ifidx` through `brcmf_get_ifp`); out-of-range event
+        // ifidx stays fatal here. Linux ignores the completion header ifidx
+        // of every other control completion: an IOCTL completion is matched
+        // by its transaction/request id (`brcmf_msgbuf_process_ioctl_complete`)
+        // and status messages carry no interface, so firmware that zeroes or
+        // rewrites `msg.ifidx` there is not a protocol error.
+        if kind == 0xe && entry[1] >= super::vif_wire::MAX_IFS {
+            return Err(Error::Protocol);
         }
         let status = i16::from_le_bytes(entry[8..10].try_into().unwrap());
         if matches!(kind, 1 | 2 | 0xa) {
@@ -808,6 +959,10 @@ fn publish_ring<B: Bus>(
     Ok(())
 }
 impl<B: Bus> Runtime<B> {
+    /// Linux `bus_if->wowl_supported` for this function ([`Bus::pme_d3hot`]).
+    pub fn wowl_supported(&mut self) -> bool {
+        !self.failed && self.bus.pme_d3hot()
+    }
     /// Data rings remain transport-only: a station must authorize the link and
     /// controlled port before exposing send/received Ethernet to the network.
     pub fn enable_data(&mut self) -> Result<(), Error> {
@@ -836,8 +991,11 @@ impl<B: Bus> Runtime<B> {
             flows: Vec::new(),
             tx: Vec::new(),
             received: VecDeque::new(),
+            vif: super::vif_demux::Demux::new(),
             receipts: VecDeque::new(),
             dropped: 0,
+            monitor: None,
+            monitored: VecDeque::new(),
         });
         if let Err(e) = self.replenish_rx() {
             self.fail();
@@ -882,6 +1040,24 @@ impl<B: Bus> Runtime<B> {
         destination: [u8; 6],
         priority: u8,
     ) -> Result<FlowToken, Error> {
+        self.open_flow_on(0, source, destination, priority)
+    }
+    /// Create a flow ring for firmware interface `ifidx`. Linux keys flow
+    /// rings by (ifidx, tid/fifo, da) (`flowring.c::brcmf_flowring_lookup`)
+    /// and the create request carries `msg.ifidx`.
+    pub fn open_flow_on(
+        &mut self,
+        ifidx: u8,
+        source: [u8; 6],
+        destination: [u8; 6],
+        priority: u8,
+    ) -> Result<FlowToken, Error> {
+        if ifidx >= super::vif_wire::MAX_IFS {
+            return Err(Error::Protocol);
+        }
+        if self.monitor_reserved() {
+            return Err(Error::Busy);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -896,6 +1072,7 @@ impl<B: Bus> Runtime<B> {
         };
         if data.flows.iter().any(|f| {
             f.state != FlowState::Closed
+                && f.ifidx == ifidx
                 && f.source == source
                 && f.destination == destination
                 && f.priority == priority
@@ -956,6 +1133,7 @@ impl<B: Bus> Runtime<B> {
                     destination,
                     priority,
                     outstanding: 0,
+                    ifidx,
                 });
         }
         let flow = &mut self
@@ -970,10 +1148,9 @@ impl<B: Bus> Runtime<B> {
             self.fail();
             return Err(Error::Protocol);
         }
-        // Closed is the terminal flow state: a matching create/delete
-        // completion retires the flow whether the firmware granted or
-        // refused the operation, and the retained mapping may be reused
-        // only after that completion has fenced the ring from firmware.
+        // Closed means a create was refused before ownership, or a
+        // successful delete fenced the mapping. Refused/timed-out deletes
+        // never permit zeroing or reusing a firmware-owned ring.
         zero(&mut flow.ring.memory)?;
         flow.generation = generation;
         flow.ring.read = 0;
@@ -983,11 +1160,13 @@ impl<B: Bus> Runtime<B> {
         flow.source = source;
         flow.destination = destination;
         flow.priority = priority;
+        flow.ifidx = ifidx;
         let address = flow.ring.memory.address();
         let wptr = flow.ring.wptr;
         let rptr = flow.ring.rptr;
         let mut entry = [0; 40];
         entry[0] = 3;
+        entry[1] = ifidx;
         entry[8..14].copy_from_slice(&destination);
         entry[14..20].copy_from_slice(&source);
         entry[20] = priority;
@@ -1065,6 +1244,7 @@ impl<B: Bus> Runtime<B> {
         flow.deadline = Some(narf_time::Deadline::after_ms(2000));
         let mut entry = [0; 40];
         entry[0] = 5;
+        entry[1] = flow.ifidx;
         entry[8..10].copy_from_slice(&token.id.to_le_bytes());
         if let Err(e) = self.publish(0, &entry) {
             self.fail();
@@ -1086,6 +1266,9 @@ impl<B: Bus> Runtime<B> {
             .flows
             .get_mut(usize::from(id.checked_sub(2).ok_or(Error::Protocol)?))
             .ok_or(Error::Protocol)?;
+        // Correlated by flow ring id only, as
+        // `brcmf_msgbuf_process_flow_ring_{create,delete}_response` do; the
+        // completion `msg.ifidx` is not consulted.
         match (entry[0], flow.state) {
             (4, FlowState::Creating) => {
                 flow.state = if status == 0 {
@@ -1094,17 +1277,21 @@ impl<B: Bus> Runtime<B> {
                     FlowState::Closed
                 }
             }
-            (6, FlowState::Deleting) if flow.outstanding == 0 => flow.state = FlowState::Closed,
+            (6, FlowState::Deleting) if flow.outstanding == 0 => {
+                if status != 0 {
+                    // A refusal is a command outcome, not a native mapping
+                    // retirement. Leave the original flow/mapping owned;
+                    // poll fail-stops and pins it until proven device stop.
+                    return Err(Error::Firmware(status as i16));
+                }
+                flow.state = FlowState::Closed;
+            }
             _ => return Err(Error::Protocol),
         }
         flow.deadline = None;
-        // A firmware refusal (status != 0) is a per-flow outcome, not a
-        // transport failure: the matching completion above is the terminal
-        // transition and the flow is retired as Closed. The refusal stays
-        // observable through flow_state, and callers such as
-        // station_transport evict Closed flows from a still-usable runtime.
-        // Fail-stop remains reserved for protocol/transport errors:
-        // mismatched completions (above), ring corruption, bus failures.
+        // A refused create owns no usable native flow. A refused delete
+        // instead returned above without retiring its original mapping;
+        // the outer poll fail-stops/parks and preserves it for device stop.
         Ok(())
     }
     pub fn send(&mut self, token: FlowToken, frame: &[u8]) -> Result<u32, Error> {
@@ -1127,6 +1314,9 @@ impl<B: Bus> Runtime<B> {
         frame: &[u8],
         packet_priority: Option<u8>,
     ) -> Result<u32, Error> {
+        if self.monitor_reserved() {
+            return Err(Error::Busy);
+        }
         if self.failed {
             return Err(Error::Failed);
         }
@@ -1164,6 +1354,7 @@ impl<B: Bus> Runtime<B> {
             Some(p) if p <= 7 && fifo(p) == fifo(flow.priority) => p,
             Some(_) => return Err(Error::Protocol),
         };
+        let flow_ifidx = flow.ifidx;
         let id = self.next_id()?;
         let mut memory = allocate(&mut self.bus, frame.len() - 14)?;
         memory.write(0, &frame[14..])?;
@@ -1171,7 +1362,7 @@ impl<B: Bus> Runtime<B> {
         let descriptor = msgbuf::TxPost {
             hdr: CommonHdr {
                 msgtype: 0xf,
-                ifidx: 0,
+                ifidx: flow_ifidx,
                 flags: 0,
                 request_id: id,
             },
@@ -1207,7 +1398,7 @@ impl<B: Bus> Runtime<B> {
     }
     fn tx_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
         let status = msgbuf::TxStatus::decode(entry).ok_or(Error::Protocol)?;
-        if status.hdr.ifidx != 0 || status.metadata_len != 0 {
+        if status.metadata_len != 0 {
             return Err(Error::Protocol);
         }
         let data = self
@@ -1228,6 +1419,10 @@ impl<B: Bus> Runtime<B> {
                 status.flow_ring_id.checked_sub(2).ok_or(Error::Protocol)?,
             ))
             .ok_or(Error::Protocol)?;
+        // Correlated by request id + flow ring id
+        // (`brcmf_msgbuf_process_txstatus`); Linux passes `msg.ifidx` only to
+        // `brcmf_txfinalize` statistics, so a zeroed or different completion
+        // ifidx is not a protocol error.
         if flow.state != FlowState::Open || flow.outstanding == 0 {
             return Err(Error::Protocol);
         }
@@ -1242,10 +1437,10 @@ impl<B: Bus> Runtime<B> {
     }
     fn rx_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
         let complete = msgbuf::RxComplete::decode(entry).ok_or(Error::Protocol)?;
-        if complete.hdr.ifidx != 0
+        if complete.hdr.ifidx >= super::vif_wire::MAX_IFS
             || complete.status != 0
             || complete.metadata_len != 0
-            || !matches!(complete.flags & 7, 0 | 1)
+            || !matches!(complete.flags & 7, 0..=2)
         {
             return Err(Error::Protocol);
         }
@@ -1261,22 +1456,59 @@ impl<B: Bus> Runtime<B> {
             .iter_mut()
             .find(|r| r.posted && r.id == complete.hdr.request_id)
             .ok_or(Error::Protocol)?;
-        let offset = usize::from(complete.data_offset);
+        // Linux's explicit offset overrides the shared prefix; these are
+        // alternatives, never an additive pull.
+        let offset = if complete.data_offset != 0 {
+            usize::from(complete.data_offset)
+        } else {
+            self.rx_offset
+        };
         let length = usize::from(complete.data_len);
-        if !(14..=1514).contains(&length)
-            || offset.checked_add(length).is_none_or(|end| end > RX_BYTES)
-        {
+        let raw = complete.flags & 7 == 2;
+        if raw && (data.monitor.is_none() || complete.hdr.ifidx != 0) {
+            return Err(Error::Protocol);
+        }
+        let admitted_length = if raw {
+            (2..=RX_BYTES).contains(&length)
+        } else {
+            (14..=1514).contains(&length)
+        };
+        if !admitted_length || offset.checked_add(length).is_none_or(|end| end > RX_BYTES) {
             return Err(Error::Bounds);
         }
         let mut frame = vec![0; length];
         slot.memory.sync_from_device(offset, length);
         slot.memory.read(offset, &mut frame)?;
         slot.posted = false;
+        if raw {
+            let owner = data.monitor.as_ref().ok_or(Error::Protocol)?;
+            if let Some(armed) = owner.armed.as_ref() {
+                if let Some(frame) = armed.receive(&frame).map_err(|_| Error::Protocol)? {
+                    if data.monitored.len() == 32 {
+                        data.dropped += 1;
+                    } else {
+                        data.monitored.push_back(frame);
+                    }
+                }
+            }
+            // A source-qualified reservation can drain actual raw records
+            // arriving alongside SET_MONITOR3 without granting publication
+            // before matching native mode/channel readback and activation.
+            return Ok(());
+        }
         if u16::from_be_bytes([frame[12], frame[13]]) < 0x600
             || frame[6..12] == [0; 6]
             || frame[6] & 1 != 0
         {
             return Err(Error::Protocol);
+        }
+        if data.monitor.is_some() {
+            return Ok(());
+        }
+        if complete.hdr.ifidx != 0 {
+            // `brcmf_msgbuf_process_rx_complete`: no `brcmf_if` -> drop.
+            data.vif.push_data(complete.hdr.ifidx, frame);
+            return Ok(());
         }
         if data.received.len() == 32 {
             data.dropped += 1;
@@ -1288,7 +1520,123 @@ impl<B: Bus> Runtime<B> {
     pub fn pop_received(&mut self) -> Option<Vec<u8>> {
         self.resources.as_mut()?.data.as_mut()?.received.pop_front()
     }
+    /// Admit received data for secondary `ifidx` (its owner's link is up).
+    pub fn vif_rx_open(&mut self, ifidx: u8) -> Result<(), Error> {
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        data.vif.open(ifidx).map_err(|_| Error::Protocol)
+    }
+    pub fn vif_rx_close(&mut self, ifidx: u8) {
+        if let Some(data) = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+        {
+            data.vif.close(ifidx);
+        }
+    }
+    pub fn pop_vif_received(&mut self, ifidx: u8) -> Option<Vec<u8>> {
+        self.resources.as_mut()?.data.as_mut()?.vif.pop_data(ifidx)
+    }
+    /// Firmware interface of a live flow token.
+    pub fn flow_ifidx(&self, token: FlowToken) -> Result<u8, Error> {
+        let index = token.id.checked_sub(2).ok_or(Error::Protocol)?;
+        self.resources
+            .as_ref()
+            .unwrap()
+            .data
+            .as_ref()
+            .and_then(|d| d.flows.get(usize::from(index)))
+            .filter(|f| f.generation == token.generation)
+            .map(|f| f.ifidx)
+            .ok_or(Error::Protocol)
+    }
     pub fn pop_tx_receipt(&mut self) -> Option<TxReceipt> {
         self.resources.as_mut()?.data.as_mut()?.receipts.pop_front()
+    }
+    pub(crate) fn monitor_reserved(&self) -> bool {
+        self.resources
+            .as_ref()
+            .and_then(|resources| resources.data.as_ref())
+            .is_some_and(|data| data.monitor.is_some())
+    }
+    pub(crate) fn monitor_reserve(
+        &mut self,
+        prepared: super::monitor_native::Prepared,
+    ) -> Result<(), Error> {
+        if self.failed || self.down || self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        let native = self.ap_source().ok_or(Error::Access)?;
+        if !prepared.belongs_to(&native) || prepared.original().command_current().is_err() {
+            return Err(Error::Access);
+        }
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        if data.monitor.is_some()
+            || !data.tx.is_empty()
+            || !data.receipts.is_empty()
+            || !data.received.is_empty()
+            || data.vif.has_data()
+            || data
+                .flows
+                .iter()
+                .any(|flow| flow.state != FlowState::Closed)
+        {
+            return Err(Error::Busy);
+        }
+        data.monitor = Some(alloc::boxed::Box::new(MonitorOwner {
+            prepared,
+            armed: None,
+        }));
+        Ok(())
+    }
+    pub(crate) fn monitor_arm(&mut self, armed: super::monitor_native::Armed) -> Result<(), Error> {
+        if self.failed || self.down || self.pending.is_some() || armed.original().current().is_err()
+        {
+            return Err(Error::Access);
+        }
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        let owner = data.monitor.as_mut().ok_or(Error::Protocol)?;
+        if owner.armed.is_some() || !owner.prepared.accepts(&armed) {
+            return Err(Error::Access);
+        }
+        owner.armed = Some(armed);
+        Ok(())
+    }
+    pub(crate) fn monitor_leave(
+        &mut self,
+        original: &super::monitor_scope::Capture,
+    ) -> Result<(), Error> {
+        let data = self
+            .resources
+            .as_mut()
+            .and_then(|resources| resources.data.as_mut())
+            .ok_or(Error::Protocol)?;
+        let owner = data.monitor.as_ref().ok_or(Error::Protocol)?;
+        if !owner.prepared.original().same_owner(original) {
+            return Err(Error::Access);
+        }
+        data.monitored.clear();
+        data.monitor = None;
+        Ok(())
+    }
+    pub(crate) fn pop_monitor(&mut self) -> Option<super::monitor_scope::Received> {
+        self.resources
+            .as_mut()?
+            .data
+            .as_mut()?
+            .monitored
+            .pop_front()
     }
 }

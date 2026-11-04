@@ -11,7 +11,10 @@ use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
-pub type NativeCard = Card<Mmio>;
+/// The owned aperture behind its Linux host front-end profile
+/// (`sdhci::port`); the generic profile is an exact passthrough.
+pub type NativeRegisters = crate::sdhci::port::Ported<Mmio>;
+pub type NativeCard = Card<NativeRegisters>;
 
 /// Private aperture + retained live PCI authority. Every register access
 /// checks revocation; the first failure permanently closes this adapter.
@@ -23,6 +26,11 @@ pub struct Mmio {
     identity: crate::pio::HostIdentity,
     /// This owner bound the oneshot INTx line and cleared INTx-disable.
     intx: bool,
+    source_live: alloc::sync::Arc<crate::source::Lifetime>,
+    source_intx: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    /// This owner granted host DMA and set (read back) bus mastering.
+    dma: bool,
+    source_dma: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
 }
 impl core::fmt::Debug for Mmio {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -41,7 +49,16 @@ fn invoke<T>(cap: &Cap<BusDeviceCap, Write>, operation: impl FnOnce() -> T) -> R
     }
     cap.invoke(Operation(operation))
 }
+impl Drop for Mmio {
+    fn drop(&mut self) {
+        self.source_live.retire();
+    }
+}
 impl Mmio {
+    fn close(&mut self) {
+        self.source_live.deny();
+        self.gone = true;
+    }
     fn access<T>(
         &mut self,
         offset: u32,
@@ -49,33 +66,46 @@ impl Mmio {
         operation: impl FnOnce(&MmioRegion) -> T,
     ) -> Option<T> {
         if self.gone
+            || !self.source_live.current()
             || offset % width != 0
             || u64::from(offset)
                 .checked_add(u64::from(width))
                 .is_none_or(|end| end > self.region.len)
         {
-            self.gone = true;
+            self.close();
             return None;
         }
-        let intx = self.intx;
+        let (intx, dma) = (self.intx, self.dma);
         match invoke(&self.authority, || {
             let command = narf_bus::pci::read_command(&self.authority, &self.device).ok()?;
-            if !command_live(command, intx) {
+            if !command_live(command, intx, dma) {
                 return None;
             }
             Some(operation(&self.region))
         }) {
             Ok(Some(value)) => Some(value),
             _ => {
-                self.gone = true;
+                self.close();
                 None
             }
         }
     }
 }
 impl Registers for Mmio {
+    fn source(&self) -> Option<crate::source::Source> {
+        if self.gone || !self.source_live.current() {
+            return None;
+        }
+        Some(crate::source::Source::pci(
+            self.authority,
+            self.device,
+            self.source_live.clone(),
+            self.source_intx.clone(),
+            self.source_dma.clone(),
+        ))
+    }
     fn enable_intx(&mut self) -> bool {
-        if self.gone || self.intx {
+        if self.gone || !self.source_live.current() || self.intx {
             return false;
         }
         let cleared = invoke(&self.authority, || {
@@ -84,18 +114,113 @@ impl Registers for Mmio {
             narf_bus::pci::read_command(&self.authority, &self.device).ok()
         });
         match cleared {
-            Ok(Some(command)) if command_live(command, true) => {
+            Ok(Some(command)) if command_live(command, true, self.dma) => {
                 self.intx = true;
+                self.source_intx
+                    .store(true, core::sync::atomic::Ordering::Release);
                 true
             }
             _ => {
-                self.gone = true;
+                self.close();
                 false
             }
         }
     }
     fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         Some(self.identity)
+    }
+    /// sdhci-pci-core.c `sdhci_pci_enable_dma`: `pci_set_master` (after
+    /// `sdhci_set_dma_mask`; NARF masks per allocation). Refused for a
+    /// vendor whose Linux `pci_ids` entries carry fixes this crate does
+    /// not model ([`dma_quirk_vendor`]); the host then stays PIO.
+    fn enable_dma(&mut self) -> Option<narf_io::DmaDevice> {
+        if self.gone || !self.source_live.current() || self.dma {
+            return None;
+        }
+        if dma_quirk_vendor(self.device.id.vendor) {
+            return None;
+        }
+        let device = narf_bus::dma::configure(&self.device).ok()?;
+        let set = invoke(&self.authority, || {
+            use narf_bus::pci::cmd::BUS_MASTER;
+            narf_bus::pci::set_command(&self.authority, &self.device, BUS_MASTER).ok()?;
+            narf_bus::pci::read_command(&self.authority, &self.device).ok()
+        });
+        match set {
+            Ok(Some(command)) if command_live(command, self.intx, true) => {
+                self.dma = true;
+                self.source_dma
+                    .store(true, core::sync::atomic::Ordering::Release);
+                Some(device)
+            }
+            _ => {
+                // Unknown bus-master state: close; the drop path still
+                // tries to clear it.
+                self.dma = true;
+                self.close();
+                None
+            }
+        }
+    }
+    /// Clear bus mastering with readback. Attempted even on a closed
+    /// adapter while the authority is current: it is the safe direction.
+    fn disable_dma(&mut self) -> bool {
+        if !self.dma {
+            return true;
+        }
+        let cleared = invoke(&self.authority, || {
+            use narf_bus::pci::cmd::BUS_MASTER;
+            narf_bus::pci::clear_command(&self.authority, &self.device, BUS_MASTER).ok()?;
+            narf_bus::pci::read_command(&self.authority, &self.device).ok()
+        });
+        match cleared {
+            Ok(Some(command))
+                if command != u16::MAX && command & narf_bus::pci::cmd::BUS_MASTER == 0 =>
+            {
+                self.dma = false;
+                self.source_dma
+                    .store(false, core::sync::atomic::Ordering::Release);
+                true
+            }
+            _ => {
+                self.close();
+                false
+            }
+        }
+    }
+    /// sdhci-pci-core.c `sdhci_pci_probe_slot`: `pm_caps =
+    /// MMC_PM_KEEP_POWER`, plus `MMC_PM_WAKE_SDIO_IRQ` when
+    /// `device_can_wakeup` — set by `pci.c::pci_pm_init` when the PM
+    /// capability's `PME_Support` field is non-zero. ACPI-only wake
+    /// capability is not modelled. Arming PME/the GPE route for a sleep
+    /// state is the system-PM owner's (`narf-power` `pci_wake`).
+    fn pm_caps(&mut self) -> crate::sdio::function::PmFlags {
+        use crate::sdio::function::PmFlags;
+        if self.gone || !self.source_live.current() {
+            return PmFlags::NONE;
+        }
+        let device = self.device;
+        let pme = invoke(&self.authority, || {
+            // SAFETY: bounded standard capability walk over this exact
+            // retained live function's configuration window.
+            let Ok(Some(offset)) = (unsafe {
+                narf_bus::pci_cap::find_cap(&device, narf_bus::pci_cap::id::POWER_MGMT)
+            }) else {
+                return false;
+            };
+            // PMC is the upper half of the first dword; `PME_Support` is
+            // PMC[15:11] (`PCI_PM_CAP_PME_MASK`).
+            u16::try_from(offset).ok().is_some_and(|offset| {
+                narf_bus::pci::read_config32(&self.authority, &device, offset)
+                    .is_ok_and(|dword| dword != u32::MAX && (dword >> 27) & 0x1f != 0)
+            })
+        })
+        .unwrap_or(false);
+        if pme {
+            PmFlags::KEEP_POWER.union(PmFlags::WAKE_SDIO_IRQ)
+        } else {
+            PmFlags::KEEP_POWER
+        }
     }
     fn read8(&mut self, offset: u32) -> u8 {
         self.access(offset, 1, |region| {
@@ -181,16 +306,45 @@ fn release_claim(claims: &mut Vec<narf_bus::BusAddr>, address: narf_bus::BusAddr
     }
 }
 
-/// Live owner command state: decode on, DMA off, and INTx-disable set
-/// unless this owner bound its oneshot INTx line (then it must be clear).
-fn command_live(command: u16, intx: bool) -> bool {
+/// Live owner command state: decode on, bus mastering exactly as this
+/// owner's DMA grant says (off for PIO), and INTx-disable set unless this
+/// owner bound its oneshot INTx line (then it must be clear).
+fn command_live(command: u16, intx: bool, dma: bool) -> bool {
     use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
-    let expected = if intx {
+    let mut expected = if intx {
         MEM_SPACE
     } else {
         MEM_SPACE | INTX_DISABLE
     };
+    if dma {
+        expected |= BUS_MASTER;
+    }
     command != u16::MAX && command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) == expected
+}
+
+/// PCI vendors with Linux `sdhci-pci-core.c` `pci_ids` entries (Ricoh,
+/// ENE, Marvell, JMicron, SysKonnect, VIA, Intel, O2 Micro, Arasan,
+/// Synopsys, Genesys Logic, Realtek). Their per-device fixes include
+/// `SDHCI_QUIRK_BROKEN_DMA`/`BROKEN_ADMA`, `32BIT_ADMA_SIZE`,
+/// `NO_ENDATTR_IN_NOPDESC`, `BROKEN_64_BIT_DMA` and vendor DMA ops that
+/// this crate does not carry, so the whole vendor stays PIO. AMD's class
+/// match (`sdhci_amd`) changes reset/tuning only and keeps generic DMA.
+pub fn dma_quirk_vendor(vendor: u16) -> bool {
+    matches!(
+        vendor,
+        0x1180
+            | 0x1524
+            | 0x11ab
+            | 0x197b
+            | 0x1148
+            | 0x1106
+            | 0x8086
+            | 0x1217
+            | 0x16e6
+            | 0x16c3
+            | 0x17a0
+            | 0x10ec
+    )
 }
 
 /// Disable inherited DMA and decode before enabling the owned register
@@ -376,23 +530,39 @@ fn probe_claimed(
     // masked. INTx-disable is cleared only after the card initialized, so
     // a failed probe leaves the function parked; polling is the fallback.
     let interrupt = bind_intx(&device, &authority);
-    let mut card = match Card::initialize(
-        Mmio {
-            region,
-            authority,
-            device,
-            gone: false,
-            identity: crate::pio::HostIdentity {
-                address: device.addr,
-                id: device.id,
-            },
-            intx: false,
-        },
-        Config::default(),
-    ) {
-        Ok(card) => card,
-        Err(e) => return Err(init_error_to_probe_error(e)),
+    // sdhci_pci_ids: a Linux per-device fixes object selects its profile;
+    // every other standard host keeps the generic passthrough.
+    let profile = crate::sdhci::port::pci(
+        device.id.vendor,
+        device.id.device,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+    )
+    .unwrap_or(crate::sdhci::port::Profile::GENERIC);
+    let config = Config {
+        non_removable: profile.non_removable,
+        ..Config::default()
     };
+    let mmio = Mmio {
+        region,
+        authority,
+        device,
+        gone: false,
+        source_live: crate::source::Lifetime::new(),
+        source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        dma: false,
+        source_dma: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        identity: crate::pio::HostIdentity {
+            address: device.addr,
+            id: device.id,
+        },
+        intx: false,
+    };
+    let mut card =
+        match Card::initialize(crate::sdhci::port::Ported::new(mmio, profile, None), config) {
+            Ok(card) => card,
+            Err(e) => return Err(init_error_to_probe_error(e)),
+        };
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: "sdhci-pio".into(),
         kind: narf_drivers::BoundKind::Other,
@@ -497,6 +667,10 @@ fn bind_intx(_: &BusDevice, _: &Cap<BusDeviceCap, Write>) -> Option<Bound> {
     None
 }
 
+#[cfg(feature = "kernel-test")]
+#[path = "native_publication_tests.rs"]
+mod publication_tests;
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
@@ -536,9 +710,24 @@ mod tests {
             authority,
             device,
             gone: false,
+            source_live: crate::source::Lifetime::new(),
+            source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            dma: false,
+            source_dma: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             identity,
             intx: false,
         };
+        let original = io
+            .source()
+            .unwrap()
+            .retain_controller(&crate::source::Lifetime::new())
+            .unwrap()
+            .retain_card(&crate::source::Lifetime::new())
+            .unwrap();
+        let mut published = false;
+        if original.invoke(|| published = true).is_ok() || published {
+            return TestResult::Fail("revoked native PCI source supplied final copy authority");
+        }
         let mut entered = false;
         if io
             .access(0x10, 4, |_| {
@@ -553,6 +742,9 @@ mod tests {
             return TestResult::Fail(
                 "revoked SDHCI owner reached PCI configuration or invalid MMIO",
             );
+        }
+        if original.current().is_ok() || io.source().is_some() {
+            return TestResult::Fail("failed native MMIO owner retained copied source");
         }
         io.write8(0x29, 0);
         io.write16(0x2c, 0);
@@ -585,12 +777,17 @@ mod tests {
             return TestResult::Fail("PIO decode enabled before DMA/decode parking readback");
         }
         // Per-access liveness follows the owner's INTx binding exactly.
-        if !command_live(MEM_SPACE | INTX_DISABLE, false)
-            || command_live(MEM_SPACE, false)
-            || !command_live(MEM_SPACE, true)
-            || command_live(MEM_SPACE | INTX_DISABLE, true)
-            || command_live(MEM_SPACE | BUS_MASTER, true)
-            || command_live(u16::MAX, true)
+        if !command_live(MEM_SPACE | INTX_DISABLE, false, false)
+            || command_live(MEM_SPACE, false, false)
+            || !command_live(MEM_SPACE, true, false)
+            || command_live(MEM_SPACE | INTX_DISABLE, true, false)
+            || command_live(MEM_SPACE | BUS_MASTER, true, false)
+            || command_live(u16::MAX, true, false)
+            // A DMA grant requires bus mastering and nothing else changes.
+            || !command_live(MEM_SPACE | BUS_MASTER, true, true)
+            || !command_live(MEM_SPACE | BUS_MASTER | INTX_DISABLE, false, true)
+            || command_live(MEM_SPACE, true, true)
+            || command_live(u16::MAX, false, true)
         {
             return TestResult::Fail("MMIO liveness ignores the owner's INTx binding");
         }

@@ -1,0 +1,699 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! AR9280 (`0x0029` PCI / `0x002a` PCIe) probe and dual-band 20 MHz legacy
+//! station owner.
+//!
+//! `pci.c::ath_pci_probe` → `hw.c::ath9k_hw_init` order: the chip is
+//! identified through its own revision and `ar5416_eeprom_def` map, prepared
+//! inactive for the 20 MHz primary (`phy::ar9280::prepare`), and admitted
+//! only by a signer-verified `N80A` board record bound to that exact map,
+//! preparation and closed-loop def power plan (with the live `AR_PHY_TPCRG5`
+//! overlap below EEPROM minor 2). Calibration (`calibration::ar9280`) runs
+//! under `Grant::ceiling` and the dual-band host permission; the shared
+//! native MAC/packet/station/interface owners then carry the two-chain
+//! profile with the band's MAC clock (`Clock::Fast5g` on 5 GHz).
+//!
+//! Every retune, recovery and resume is a cold generation reset
+//! (`hw.c::ath9k_hw_chip_reset` always selects `ATH9K_RESET_COLD` for a
+//! closed-loop AR9280; `ath9k_hw_do_fastcc` refuses the PCI part and this
+//! owner never uses fast channel change for either part). The target's own
+//! signed record and dual-band permission are proven before the old
+//! generation is retired. Linux `serialize_regmode` (`SER_REG_MODE_ON` for
+//! the non-PCIe `0x0029` part on SMP) is satisfied structurally: every BAR
+//! access of a generation happens under `CONTROL` or the station mutex and
+//! the MSI handler never touches the BAR. DFS, NO_IR and indoor-only 5 GHz
+//! channels are refused by `Permission::from_domain_dual`. HT stays
+//! AR9285-only.
+use super::{
+    admission, calibration, channels,
+    chips::{Chip, Revision},
+    identity, interface, mac, packet, packet_native, pcie_pm, phy, station, BringUpError,
+    RetainedRadio, CLAIMED_ADDRESS, CONTROL,
+};
+use alloc::{boxed::Box, sync::Arc};
+use core::fmt::Write as _;
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, Write};
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+
+/// The initial primary the signed record and calibration bind (channel 1).
+const PRIMARY: u16 = 2412;
+/// Live `AR_PHY_TPCRG5` (PD gain overlap in bits 0..3).
+const TPCRG5: u64 = 0xa26c;
+/// Terminal-generation and calibration-timer poll interval (the AR9285
+/// supervisor's); the AR9002 `calibration::ar9287::Periodic` owns the Linux
+/// `ath_ani_calibrate` intervals.
+const SUPERVISE_NS: u64 = 500_000_000;
+/// (PCI device, unique bus-match name). `hw.h::AR9280_DEVID_PCI` and
+/// `AR9280_DEVID_PCIE`.
+pub(super) const DEVICES: [(u16, &str); 2] = [
+    (phy::ar9280::DEVID_PCI, "ath9k-ar9280"),
+    (phy::ar9280::DEVID_PCIE, "ath9k-ar9280e"),
+];
+
+pub(super) struct Owner {
+    mmio: MmioRegion,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    revision: Revision,
+    identity: identity::Identity,
+    image: Box<[u8]>,
+    /// Linux `ah->aspm_enabled`: the PCIe part with upstream ASPM, read at
+    /// probe (`pci.c::ath_pci_aspm_init`).
+    aspm: bool,
+    /// Live `AR_PHY_TPCRG5` overlap after preparation (used below minor 2;
+    /// INI-defined, so every generation must read the same value).
+    overlap: u8,
+    /// Inactive preparation of the current physical generation.
+    prepared: phy::ar9280::Prepared,
+    /// Primary of the current generation; its record is `grant`.
+    primary: u16,
+    grant: Arc<admission::Grant>,
+    radio: calibration::ar9280::Calibration,
+    station: Option<RetainedRadio>,
+    attempted: bool,
+    /// Physical generation; bumped by each successful cold reset.
+    generation: u32,
+    removed: bool,
+    /// System suspend parked the chip in FULL_SLEEP; only resume reopens it.
+    suspended: bool,
+    /// Retirement could not prove DMA stopped; the address stays reserved.
+    pinned: bool,
+}
+pub(super) type Shared = Arc<Mutex<Owner>>;
+static OWNER: IrqSafeSpinLock<Option<Shared>> = IrqSafeSpinLock::new(None);
+
+/// The preparation `phy::ar9280::prepare` produces at `frequency`: the
+/// band's tune and its channel-independent INI row count.
+fn prepared_at(o: &Owner, frequency: u16) -> Result<phy::ar9280::Prepared, BringUpError> {
+    let tune = phy::ar9280::tune(&o.identity, &o.image, frequency)?;
+    Ok(phy::ar9280::Prepared {
+        tune,
+        ini_writes: phy::ar9280::ini_rows(&o.identity, &o.image, tune),
+    })
+}
+
+/// The signed `N80A` record keyed to `frequency` (its identity binds the
+/// channel, band, closed-loop def plan and the shared map/preparation).
+fn record(o: &Owner, frequency: u16) -> Result<Arc<admission::Grant>, BringUpError> {
+    let prepared = prepared_at(o, frequency)?;
+    let facts = admission::Facts::new_ar9280(
+        &o.device.id,
+        &o.revision,
+        &o.identity,
+        &prepared,
+        &o.image,
+        frequency,
+        o.overlap,
+    )?;
+    admission::Source::Registered.load(facts)
+}
+
+/// Every 2.4 GHz and 5 GHz primary (`channels::bit`) whose band the map
+/// enables and whose record verifies, plus the current primary.
+fn admitted_mask(o: &Owner) -> u64 {
+    let primary = channels::bit(o.primary).map_or(0, |bit| 1 << bit);
+    (0..channels::CHANNEL_BITS)
+        .filter(|bit| {
+            channels::bit_frequency(*bit).is_some_and(|frequency| record(o, frequency).is_ok())
+        })
+        .fold(primary, |mask, bit| mask | 1 << bit)
+}
+
+/// `ath9k_hw_def_set_power_cal_table`: below minor 2 the PD gain overlap is
+/// the live `AR_PHY_TPCRG5` field, otherwise the map's `pdGainOverlap`.
+fn live_overlap(
+    io: &mut impl identity::RegisterIo,
+    o_identity: &identity::Identity,
+) -> Result<u8, BringUpError> {
+    if phy::ar9280::minor(o_identity) >= 2 {
+        return Ok(0);
+    }
+    let value = io.read32(TPCRG5);
+    if value == u32::MAX || !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
+    Ok((value & 0xf) as u8)
+}
+
+fn matches(id: &narf_bus::DeviceId) -> bool {
+    id.vendor == 0x168c
+        && DEVICES.iter().any(|(device, _)| *device == id.device)
+        && Chip::for_device(id.device) == Some(Chip::Ar9280)
+}
+
+fn bad(stage: &str, error: BringUpError) -> narf_bus::ProbeError {
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath9k: AR9280 {} failed: {:?}",
+        stage,
+        error
+    );
+    narf_bus::ProbeError::BadDevice
+}
+
+pub(super) fn probe(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    if !matches(&device.id) {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    // Same singleton reservation as AR9285, before any hardware access.
+    let previous = {
+        let mut claimed = CLAIMED_ADDRESS.lock();
+        let previous = *claimed;
+        if previous.is_none() {
+            *claimed = Some(device.addr);
+        }
+        previous
+    };
+    let occupied = previous.is_some();
+    crate::qualcomm_pci::park(&device, &cap, false, previous)?;
+    if occupied {
+        return Err(narf_bus::ProbeError::Other(
+            "ath9k singleton already owns another radio",
+        ));
+    }
+    let mmio = crate::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
+    if mmio.len < phy::REQUIRED_BAR {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    let aspm = device.id.device == phy::ar9280::DEVID_PCIE
+        && pcie_pm::enabled(&device, &cap).map_err(|e| bad("PCIe ASPM read", e))?;
+    let mut io = identity::Registers::new(mmio, cap);
+    let (revision, identity, image) =
+        identity::identify_chip(&mut io, Chip::Ar9280).map_err(|e| bad("identification", e))?;
+    let prepared = phy::ar9280::prepare(
+        &mut io,
+        &revision,
+        &identity,
+        &image,
+        device.id.device,
+        PRIMARY,
+    )
+    .map_err(|e| bad("baseband preparation", e))?;
+    let overlap = live_overlap(&mut io, &identity).map_err(|e| bad("TPCRG5 overlap", e))?;
+    let facts = admission::Facts::new_ar9280(
+        &device.id, &revision, &identity, &prepared, &image, PRIMARY, overlap,
+    )
+    .map_err(|e| bad("admission facts", e))?;
+    let request = facts.request();
+    let grant = match admission::Source::Registered.load(facts) {
+        Ok(grant) => grant,
+        Err(_) => {
+            // Unprovisioned or foreign record: stay parked and unadmitted.
+            let _ = identity::disable_and_sleep(&mut io);
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath9k: AR9280 MAC {:02x?} unadmitted; signed board record {} absent or invalid",
+                identity.mac,
+                request.filename
+            );
+            return Err(narf_bus::ProbeError::Other(
+                "ath9k AR9280 board admission record absent or invalid",
+            ));
+        }
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath9k: AR9280 rev {} MAC {:02x?}, EEPROM {:#x}, chains {:#x}/{:#x}; admitted, calibration pending",
+        revision.mac_rev,
+        identity.mac,
+        identity.eeprom_version,
+        identity.rx_chainmask,
+        identity.tx_chainmask
+    );
+    let (vendor, device_id) = (device.id.vendor, device.id.device);
+    let owner = Arc::new(Mutex::new(Owner {
+        mmio,
+        device,
+        cap,
+        revision,
+        identity,
+        image,
+        aspm,
+        overlap,
+        prepared,
+        primary: PRIMARY,
+        grant,
+        radio: calibration::ar9280::Calibration::default(),
+        station: None,
+        attempted: false,
+        generation: 0,
+        removed: false,
+        suspended: false,
+        pinned: false,
+    }));
+    *OWNER.lock() = Some(owner.clone());
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name: alloc::string::String::from("ath9k-ar9280"),
+        kind: narf_drivers::BoundKind::Net,
+        pci_vid: Some(vendor),
+        pci_did: Some(device_id),
+        domain: narf_drivers::BoundKind::Net.default_domain(),
+    });
+    narf_scheduler::spawn(async move {
+        let mut result = Err(BringUpError::Policy);
+        for attempt in 0..120 {
+            if attempt > 0 {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
+            }
+            result = {
+                let _control = CONTROL.lock().await;
+                initialize(&owner).await
+            };
+            if !matches!(result, Err(BringUpError::Policy)) {
+                break;
+            }
+        }
+        match result {
+            Ok(report) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: AR9280 channel1 native station published: IQ {:?} NF {:?} dBm",
+                    report.iq,
+                    report.measured_noise_dbm
+                );
+                supervise(owner).await;
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: AR9280 channel1 bring-up closed: {:?}",
+                    error
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Calibrate under the signed ceiling, then compose the native owners.
+async fn initialize(owner: &Mutex<Owner>) -> Result<calibration::ar9280::Report, BringUpError> {
+    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+    if narf_net::trusted_net_authority().is_none() {
+        return Err(BringUpError::Policy);
+    }
+    let mut o = owner.lock().await;
+    if o.removed || o.attempted || o.radio.state() != calibration::State::New {
+        return Err(BringUpError::BadState);
+    }
+    let host = calibration::Permission::from_domain_dual(&domain, o.primary)?;
+    let grant = o.grant.clone();
+    let permission = host.with_ceiling(grant.invoke(|| Ok(grant.ceiling(host.budget())))?);
+    let command = identity::invoke(&o.cap, || narf_bus::pci::read_command(&o.cap, &o.device))
+        .map_err(|_| BringUpError::DeviceGone)?
+        .map_err(|_| BringUpError::DeviceGone)?;
+    let mask = narf_bus::pci::cmd::BUS_MASTER
+        | narf_bus::pci::cmd::MEM_SPACE
+        | narf_bus::pci::cmd::INTX_DISABLE;
+    if command & mask != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE) {
+        return Err(BringUpError::BadState);
+    }
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let image = o.image.clone();
+    let identity = o.identity;
+    let (rx, aspm, tune) = (o.identity.rx_chainmask, o.aspm, o.prepared.tune);
+    let report = {
+        // SAFETY: probe or the last cold reset identified this AR9280 and ran
+        // its complete inactive preparation for `tune`; PCI parking was
+        // verified above and no packet DMA exists. The async mutex
+        // serializes the whole attempt.
+        let future = unsafe {
+            o.radio
+                .run(&mut io, &identity, &image, tune, rx, aspm, permission)
+        };
+        let mut future = core::pin::pin!(future);
+        core::future::poll_fn(|cx| {
+            if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
+                return core::task::Poll::Ready(Err(BringUpError::Policy));
+            }
+            grant
+                .invoke(|| Ok(core::future::Future::poll(future.as_mut(), cx)))
+                .unwrap_or(core::task::Poll::Ready(Err(BringUpError::Policy)))
+        })
+        .await?
+    };
+    // The attempt is retained before any MAC mutation.
+    o.attempted = true;
+    let station = compose(&mut o, report).map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: AR9280 native station composition closed: {:?}",
+            error
+        );
+        BringUpError::BadState
+    })?;
+    drop(o);
+    interface::publish(station).map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: AR9280 native station publication closed: {:?}",
+            error
+        );
+        BringUpError::BadState
+    })?;
+    Ok(report)
+}
+
+fn compose(
+    o: &mut Owner,
+    report: calibration::ar9280::Report,
+) -> Result<RetainedRadio, packet::Error> {
+    let noise = report.noise_dbm[0].ok_or(packet::Error::State)?;
+    let mac = o.identity.mac;
+    let channel_mask = admitted_mask(o);
+    let tune = o.prepared.tune;
+    let profile = mac::Profile::ar9280(
+        o.identity.rx_chainmask,
+        o.identity.tx_chainmask,
+        tune.is_5ghz(),
+    );
+    // SAFETY: same sole calibrated AR9280 function, cap and BAR; the signed
+    // grant bounded calibration and no packet DMA was published.
+    let native = unsafe {
+        packet_native::Native::new_ar9280(
+            o.device,
+            o.cap,
+            o.mmio,
+            report,
+            o.grant.clone(),
+            &o.identity,
+            &o.image,
+            profile,
+            tune,
+            o.overlap,
+            channel_mask,
+        )
+    }?;
+    mac::prepare_chip(&native, &o.image, mac, profile)?;
+    let _ = native.arm_msi();
+    // SAFETY: complete parked MAC/key-cache/queue preparation succeeded on
+    // this same non-cloneable native adapter; prepare does not start DMA.
+    let packet = unsafe { packet::Packet::prepare(native, mac) }?;
+    // `channels` routes this generation's retunes (either band) to
+    // `transition`; HT40 requests fail closed (no AR9280 HT owner).
+    let station = Arc::new(Mutex::new(station::Radio::new(
+        packet.into(),
+        mac,
+        noise,
+        station::NativeEnvironment {
+            generation: o.generation,
+        },
+    )));
+    o.station = Some(station.clone());
+    Ok(station)
+}
+
+/// Driver-owned cold transition for `channels`: the retained AR9280 owner
+/// is cold-reset to `frequency` only while `generation` is still current.
+pub(super) fn transition(
+    frequency: u16,
+    generation: u32,
+) -> Option<impl core::future::Future<Output = Result<(), BringUpError>> + Send + 'static> {
+    let owner = OWNER.lock().clone()?;
+    Some(async move {
+        reset(&owner, Some(frequency), Some(generation))
+            .await
+            .map(|_| ())
+    })
+}
+
+/// Cold generation reset (Linux `ath_reset` / `ath9k_hw_reset`; power-on
+/// then the `ATH9K_RESET_COLD` `ath9k_hw_set_reset` that
+/// `ath9k_hw_chip_reset` selects for a closed-loop AR9280): `selected`
+/// retunes to another primary, `None` repeats the current one (recovery
+/// and resume). The target's signed record and host permission are proven
+/// before the old generation is retired; its DMA stop must then be proven
+/// and bus mastering must be off before the function is reset. Revision,
+/// identity and the factory map must match the probe, the inactive
+/// preparation must equal the record's, the live TPCRG5 overlap must equal
+/// the probe's, and calibration plus composition
+/// publish a fresh generation. A failed reset leaves a fresh, un-calibrated
+/// owner; old station authorities never reopen.
+async fn reset(
+    owner: &Mutex<Owner>,
+    selected: Option<u16>,
+    expected: Option<u32>,
+) -> Result<calibration::ar9280::Report, BringUpError> {
+    let _control = CONTROL.lock().await;
+    {
+        let mut o = owner.lock().await;
+        if o.removed || o.pinned || o.suspended {
+            return Err(BringUpError::DeviceGone);
+        }
+        if expected.is_some_and(|generation| generation != o.generation) {
+            return Err(BringUpError::BadState);
+        }
+        let target = selected.unwrap_or(o.primary);
+        if selected.is_some() {
+            let domain =
+                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+            calibration::Permission::from_domain_dual(&domain, target)?;
+        }
+        // An absent, unsigned or foreign record for the target never
+        // retires the current generation.
+        let grant = record(&o, target)?;
+        if !retire(&mut o).await {
+            return Err(BringUpError::BadState);
+        }
+        let command = identity::invoke(&o.cap, || narf_bus::pci::read_command(&o.cap, &o.device))
+            .map_err(|_| BringUpError::DeviceGone)?
+            .map_err(|_| BringUpError::DeviceGone)?;
+        if command == u16::MAX || command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+            o.pinned = true;
+            return Err(BringUpError::BadState);
+        }
+        // From here the old calibration/packet state is gone regardless of
+        // outcome.
+        o.radio = calibration::ar9280::Calibration::default();
+        o.attempted = true;
+        let mut io = identity::Registers::new(o.mmio, o.cap);
+        let (revision, identity, image) = identity::identify_chip(&mut io, Chip::Ar9280)?;
+        if revision != o.revision || identity != o.identity || image != o.image {
+            return Err(BringUpError::BadIdentity);
+        }
+        let prepared = phy::ar9280::prepare(
+            &mut io,
+            &revision,
+            &identity,
+            &image,
+            o.device.id.device,
+            target,
+        )?;
+        if prepared != prepared_at(&o, target)? || live_overlap(&mut io, &identity)? != o.overlap {
+            return Err(BringUpError::BadState);
+        }
+        o.prepared = prepared;
+        o.primary = target;
+        o.grant = grant;
+        o.generation = o.generation.checked_add(1).ok_or(BringUpError::BadState)?;
+        o.attempted = false;
+    }
+    initialize(owner).await
+}
+
+/// Rejoin supervisor and `link.c::ath_ani_calibrate` cadence. A terminal station generation (disassociation, link loss, fatal
+/// interrupt or failed DMA) is followed by a cold generation reset into a
+/// fresh passive station, exactly as the AR9285 supervisor does; a pinned
+/// or removed owner is never followed. Every tick the live station runs the
+/// due `ar9002_hw_calibrate` steps: short IQ per-calibrations while not
+/// `caldone`, the 20 min `ath9k_hw_reset_calvalid` restart, and every
+/// `ATH_LONG_CALINTERVAL` the NF history/load/restart plus
+/// no temperature step (`ar9280_hw_olc_temp_compensation` is open-loop
+/// only; PA offset calibration is AR9285/AR9271 only; ADC gain/DC are HT40
+/// per-calibrations and this owner is 20 MHz). A failed calibration closes the generation, which is then reset.
+async fn supervise(owner: Shared) {
+    let mut failures = 0u32;
+    loop {
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(SUPERVISE_NS)).await;
+        let station = {
+            let o = owner.lock().await;
+            if o.removed || o.pinned {
+                return;
+            }
+            if o.suspended {
+                continue;
+            }
+            match o.station.clone() {
+                Some(station) => station,
+                None => continue,
+            }
+        };
+        let terminal = {
+            let Some(mut radio) = station.try_lock() else {
+                continue;
+            };
+            if radio.terminal() {
+                true
+            } else {
+                // The native periodic owner decides which of the long,
+                // short and restart calibrations are due at this tick.
+                match radio.long_calibration() {
+                    Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
+                    Err(error) => {
+                        // The generation is now closed; the next tick resets.
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "ath9k: AR9280 periodic calibration closed: {:?}",
+                            error
+                        );
+                    }
+                }
+                false
+            }
+        };
+        if !terminal {
+            continue;
+        }
+        drop(station);
+        match reset(&owner, None, None).await {
+            Ok(_) => {
+                failures = 0;
+                let generation = owner.lock().await.generation;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: AR9280 station generation {} published after reset",
+                    generation
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: AR9280 generation reset closed: {:?}",
+                    error
+                );
+                // Bounded retries; a pinned or removed owner never resets.
+                if failures >= 3
+                    || matches!(error, BringUpError::DeviceGone | BringUpError::BadState)
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `ath_pci_remove`: withdraw, stop and reclaim DMA, then release the
+/// singleton address; an unproven stop keeps it reserved.
+pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
+    let Some(owner) = OWNER.lock().clone() else {
+        return;
+    };
+    narf_scheduler::spawn(async move {
+        let _control = CONTROL.lock().await;
+        let mut o = owner.lock().await;
+        if o.device.addr != device.addr {
+            return;
+        }
+        o.removed = true;
+        let reclaimed = retire(&mut o).await;
+        drop(o);
+        let mut retained = OWNER.lock();
+        if retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, &owner)) {
+            *retained = None;
+        }
+        drop(retained);
+        if reclaimed {
+            let mut claimed = CLAIMED_ADDRESS.lock();
+            if *claimed == Some(device.addr) {
+                *claimed = None;
+            }
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: AR9280 removed; DMA {}",
+            if reclaimed {
+                "reclaimed"
+            } else {
+                "pinned, address quarantined"
+            }
+        );
+    });
+}
+
+async fn retire(o: &mut Owner) -> bool {
+    let Some(station) = o.station.take() else {
+        return !o.pinned;
+    };
+    interface::retire(&station);
+    let reclaimed = station.lock().await.retire();
+    if !reclaimed {
+        o.pinned = true;
+    }
+    reclaimed
+}
+
+/// `ath_pci_suspend`: retire the station and its DMA, then COLD reset,
+/// `ath9k_hw_configpcipowersave(ah, true)` (`pcie_pm::configure_ar9280`
+/// D3 word, ASPM parts only) and FULL_SLEEP (`identity::sleep_ar9280`). A generation reset in flight
+/// holds `CONTROL` and reports Busy.
+pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let _control = CONTROL.try_lock().ok_or(DeviceSuspendError::Busy)?;
+    let Some(owner) = OWNER.lock().clone() else {
+        return Ok(());
+    };
+    let mut o = owner.try_lock().ok_or(DeviceSuspendError::Busy)?;
+    if o.removed {
+        return Ok(());
+    }
+    if o.pinned {
+        return Err(DeviceSuspendError::DriverError);
+    }
+    if let Some(station) = o.station.clone() {
+        let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        interface::retire(&station);
+        if !radio.retire() {
+            o.pinned = true;
+            return Err(DeviceSuspendError::DriverError);
+        }
+    }
+    o.station = None;
+    // No later initialization reuses this calibration or generation; only
+    // resume's generation reset re-identifies the chip.
+    o.radio = calibration::ar9280::Calibration::default();
+    o.attempted = true;
+    o.suspended = true;
+    identity::sleep_ar9280(o.mmio, o.cap, o.aspm).map_err(|_| DeviceSuspendError::DriverError)
+}
+
+/// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
+/// suspend reset, then a generation reset (power-on reset, identical
+/// revision/identity/map, INI/PLL/RF and board values, AR9280 TX power,
+/// calibration) republishes the station at the retained primary.
+pub(super) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let Some(owner) = OWNER.lock().clone() else {
+        return Ok(());
+    };
+    {
+        let mut o = owner.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        if !o.suspended || o.removed {
+            return Ok(());
+        }
+        let (cap, device) = (o.cap, o.device);
+        let value = identity::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x40))
+            .map_err(|_| DeviceSuspendError::DriverError)?
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        if value & 0xff00 != 0 {
+            identity::invoke(&cap, || {
+                narf_bus::pci::write_config32(&cap, &device, 0x40, value & 0xffff_00ff)
+            })
+            .map_err(|_| DeviceSuspendError::DriverError)?
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        }
+        o.suspended = false;
+    }
+    narf_scheduler::spawn(async move {
+        if let Err(error) = reset(&owner, None, None).await {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ath9k: AR9280 resume reset closed: {:?}",
+                error
+            );
+        }
+    });
+    Ok(())
+}

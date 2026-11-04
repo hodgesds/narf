@@ -6,6 +6,22 @@ use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::{udp_ipv4, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::reg::{db::Database, RegFlags, RegRule};
+#[path = "mvm_active_scan_tests.rs"]
+mod active_scan_tests;
+#[path = "mvm_ap_device_tests.rs"]
+mod ap_tests;
+#[path = "mvm_he_tests.rs"]
+mod he_tests;
+#[path = "mvm_p2p_device_tests.rs"]
+mod p2p_tests;
+#[path = "mvm_rx_multi_tests.rs"]
+mod rx_multi_tests;
+#[path = "mvm_scheduled_tests.rs"]
+mod scheduled_tests;
+#[path = "mvm_smem_tests.rs"]
+mod smem_tests;
+#[path = "mvm_tx_amsdu_tests.rs"]
+mod tx_amsdu_tests;
 const OWN: [u8; 6] = [2; 6];
 const AP: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const PMK: [u8; 32] = [0x55; 32];
@@ -49,12 +65,23 @@ fn image() -> Vec<u8> {
     let parsed = super::super::parse_ucode(&bytes).unwrap();
     let mut versions = parsed.api.commands.to_vec();
     versions.extend_from_slice(&[
-        2, 12, 1, 4, 0x98, 1, 1, 0, 0x9b, 1, 6, 0, 1, 2, 2, 0, 0x77, 1, 6, 0, 0x1c, 0, 9, 0, 0x1c,
-        1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2, 5, 1, 0, 0xff, 5, 0,
-        1,
+        2, 12, 1, 4, 0x98, 1, 1, 0, 0x9b, 1, 6, 0, 1, 2, 2, 0, 0x77, 1, 6, 0, 0x1c, 1, 9, 6, 0xc1,
+        0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2, 5, 1, 0, 0xff, 5, 0, 1,
     ]);
+    // Installed API77 WoWLAN/D3 inventory (`mvm_d3::D3Api::admit`).
+    versions.extend_from_slice(&[
+        0xe1, 1, 6, 0, 0xe0, 1, 3, 0, 0xe2, 1, 5, 0, 0xe4, 1, 4, 0, 0xd4, 1, 4, 0, 0xd3, 1, 4, 0,
+        0xfd, 0xb, 99, 1, 0xfc, 0xb, 99, 1, 0xfe, 0xb, 99, 1,
+    ]);
+    let flags = parsed.api.flags | 1 << 16; // NEW_NSOFFL_LARGE
     tlv(&mut bytes, 48, &versions);
     tlv(&mut bytes, 29, &[0, 0, 0, 0, 0, 0, 0x10, 0x20]);
+    // TLV29 API 53: TCP-SYN wake. TLV30 capabilities 17 (consolidated
+    // D3/D0 image) and 41 (D0I3_END_FIRST), as every installed -77 image.
+    tlv(&mut bytes, 29, &[1, 0, 0, 0, 0, 0, 0x20, 0]);
+    tlv(&mut bytes, 30, &[0, 0, 0, 0, 0, 0, 2, 0]);
+    tlv(&mut bytes, 30, &[1, 0, 0, 0, 0, 2, 0, 0]);
+    tlv(&mut bytes, 18, &flags.to_le_bytes());
     bytes
 }
 fn asset(name: &'static str, bytes: &[u8], signed: bool) -> Result<Asset, &'static str> {
@@ -135,8 +162,26 @@ fn ht_ies() -> Vec<u8> {
     out
 }
 struct Actor {
+    client: bool,
+    client_mac: u8,
+    client_public: Vec<Vec<u8>>,
+    hold_client_public: bool,
+    native_ap: Option<Box<ap_tests::Model>>,
+    native_p2p: Option<Box<p2p_tests::Model>>,
+    pno: Option<Box<scheduled_tests::Model>>,
+    multi_receive: bool,
+    rx_configuration: Vec<rx_multi_tests::Receipt>,
+    rx_queues: Vec<model::ReceiveFirmware>,
+    hold_rx_queue: Option<u8>,
+    held_markers: Vec<(u8, Vec<u8>)>,
     ht: bool,
+    he: bool,
     ba: bool,
+    /// BAID_ML_SUPPORT selects CONFIG v1/v2 instead of ADD_STA48.
+    ml_baid_version: u8,
+    tx_amsdu: bool,
+    amsdu_packets: Vec<Vec<u8>>,
+    hold_amsdu: bool,
     nested_downlink: bool,
     rx_ba: [Option<(u8, u16, u16)>; 8],
     retiring_baid: Option<u8>,
@@ -209,6 +254,16 @@ impl Actor {
             (1, 0x18) if b[17] == 8 => Some(4),
             (1, 0x18) if b[17] == 2 => Some(5),
             (1, 0x18) if b[17] == 16 => Some(6),
+            (1, 0x9f) if b[0] == 2 => Some(10),
+            // AP uses SET_LINK0; active scan uses SET_DEVICE1. Both retain
+            // their actual distinct payloads and share the power-wait fault.
+            (1, 0x9f) if matches!(b[0], 0 | 1) => Some(11),
+            (1, 0xd) => Some(12),
+            (1, 0x91) => Some(15),
+            (5, 0x16) if b[0] == 0 => Some(1),
+            (5, 0x16) if b[0] == 2 => Some(5),
+            (2, 0) | (1, 0x25) => Some(13),
+            (5, 7) => Some(14),
             _ => None,
         });
         if stage.is_some() && self.fail_phy == stage {
@@ -292,8 +347,9 @@ impl Actor {
         if self.stopped {
             return Ok(false);
         }
-        let mut progress = false;
+        let mut progress = self.capture_receive_queues()?;
         for _ in 0..128 {
+            progress |= self.capture_receive_queues()?;
             let Some(p) = self.trace.take() else { break };
             progress = true;
             self.react(p)?;
@@ -362,6 +418,32 @@ impl Actor {
             let s = u16::from_le_bytes([p.bytes[2], p.bytes[3]]);
             let b = &p.bytes[8..];
             self.commands.push((g, c, b.to_vec()));
+            if let Some(p2p) = &mut self.native_p2p {
+                if let Some(body) = p2p.command(g, c, b, &mut self.firmware)? {
+                    self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
+                    return Ok(());
+                }
+            }
+            if let Some(ap) = &mut self.native_ap {
+                if let Some(body) = ap.command(g, c, b)? {
+                    if let Some(noa) = ap.take_initial_noa() {
+                        self.inject(0xfc, 3, 0x8000, &noa);
+                    }
+                    if (g, c) == (5, 2) {
+                        let mut marker = vec![8, 0, 0, 0, 0, 0, 1, 0];
+                        marker.extend_from_slice(&b[16..20]);
+                        self.inject(0xff, 5, 0x8000, &marker);
+                    }
+                    self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
+                    return Ok(());
+                }
+            }
+            if self.pno.is_some() && self.scheduled_command(g, c, s, b)? {
+                return Ok(());
+            }
+            if self.multi_receive && self.receive_command(g, c, s, b)? {
+                return Ok(());
+            }
             if self.ba && g == 5 && c == 2 && b.get(12) == Some(&1) {
                 if b.len() != 24 || self.retiring_baid != Some(b[20]) {
                     return Err("DEL_BA fence without exact native removed BAID");
@@ -406,8 +488,14 @@ impl Actor {
                         return Err("MVM configure NVM body");
                     }
                     let mut nvm = nvm();
+                    if self.native_ap.is_some() || self.native_p2p.is_some() {
+                        nvm[20] = 1; // actual NVM LAR, not an AP-role boolean
+                    }
                     if self.ht {
                         nvm[8] = 4;
+                    }
+                    if self.he {
+                        nvm[8] |= 16;
                     }
                     if self.wide_nvm >= 2 {
                         // NVM_SKU_CAP_11N | 11AC; channels 36..=48 (indices
@@ -468,6 +556,10 @@ impl Actor {
                     if b.len() != 52 {
                         return Err("MVM native MAC extent");
                     }
+                    if self.client {
+                        self.client_mac =
+                            crate::iwlwifi::p2p_client_fixture::mac(self.client_mac, b)?;
+                    }
                     vec![]
                 }
                 (1, 0xd2) => {
@@ -494,11 +586,50 @@ impl Actor {
                     }
                     vec![]
                 }
+                (2, 0) | (1, 0x25) => {
+                    if !b.is_empty() {
+                        return Err("shared-memory query has a payload");
+                    }
+                    let mut memory = vec![0; 260];
+                    memory[32] = 2;
+                    memory[44..64].copy_from_slice(&[
+                        0, 12, 0, 0, 0, 16, 0, 0, 0, 20, 0, 0, 0, 24, 0, 0, 0, 28, 0, 0,
+                    ]);
+                    memory[116..132]
+                        .copy_from_slice(&[0, 4, 0, 0, 0, 8, 0, 0, 0, 12, 0, 0, 0, 16, 0, 0]);
+                    memory
+                }
                 (1, 0xd) => {
                     if b.len() != 1940 {
                         return Err("MVM native scan request extent");
                     }
+                    if b[8] & 0x08 == 0 && b[9] & 0x08 == 0 {
+                        // Active v15: PASS_ALL, dwell30TU, SSID bitmap1,
+                        // initial channel1, native probe SA and direct SSID.
+                        if b[8..10] != [2, 0]
+                            || b[12..14] != [30, 30]
+                            || b[48..52] != [1, 0, 0, 0]
+                            || b[52] != 1
+                            || b[626..632] != OWN
+                            || b[1132..1137] != [0, 3, b'n', b'e', b't']
+                            || self.data_added
+                        {
+                            return Err("MVM active probe template/default-power profile");
+                        }
+                        let previous = self
+                            .commands
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .ok_or("MVM scan lacks device power")?;
+                        if previous.0 != 1 || previous.1 != 0x9f || previous.2[0] != 1 {
+                            return Err("MVM active scan preceded global power programming");
+                        }
+                    }
                     let mut beacon = self.security.ap.beacon();
+                    if self.client {
+                        beacon = crate::iwlwifi::p2p_client_fixture::beacon(beacon, 1, Some(0xa0));
+                    }
                     if self.ht {
                         beacon.extend_from_slice(self.beacon_ies.as_ref().unwrap_or(&ht_ies()));
                     }
@@ -573,6 +704,66 @@ impl Actor {
                         vec![1, 0, 0, 0]
                     }
                 }
+                (5, 0x16) => {
+                    if !self.ba || !matches!(self.ml_baid_version, 1 | 2) || b.len() != 16 {
+                        return Err("ML BAID command profile or extent");
+                    }
+                    if b[..4] == [0; 4] {
+                        let tid = usize::from(b[8]);
+                        let ssn = u16::from_le_bytes([b[12], b[13]]);
+                        let window = u16::from_le_bytes([b[14], b[15]]);
+                        let mut expected = [0; 16];
+                        expected[4] = 1; // exact AP station0 mask.
+                        expected[8] = tid as u8;
+                        expected[12..14].copy_from_slice(&ssn.to_le_bytes());
+                        expected[14..16].copy_from_slice(&window.to_le_bytes());
+                        if b != expected
+                            || tid > 7
+                            || self.rx_ba[tid].is_some()
+                            || ssn >= 4096
+                            || !(1..=32).contains(&window)
+                        {
+                            return Err("ML BAID ADD native masks/identity/window");
+                        }
+                        let id = tid as u8 + 1;
+                        self.rx_ba[tid] = Some((id, ssn, window));
+                        u32::from(id).to_le_bytes().to_vec()
+                    } else if b[..4] == [2, 0, 0, 0] {
+                        let tid = if self.ml_baid_version == 1 {
+                            let id = u32::from_le_bytes(b[4..8].try_into().unwrap());
+                            self.rx_ba
+                                .iter()
+                                .position(|entry| {
+                                    entry.is_some_and(|entry| u32::from(entry.0) == id)
+                                })
+                                .ok_or("ML BAID v1 REMOVE unknown identity")?
+                        } else {
+                            usize::try_from(u32::from_le_bytes(b[8..12].try_into().unwrap()))
+                                .map_err(|_| "ML BAID v2 REMOVE TID width")?
+                        };
+                        if tid > 7 {
+                            return Err("ML BAID REMOVE TID outside map");
+                        }
+                        let id = self.rx_ba[tid]
+                            .ok_or("ML BAID REMOVE without allocation")?
+                            .0;
+                        let mut expected = [0; 16];
+                        expected[0] = 2;
+                        if self.ml_baid_version == 1 {
+                            expected[4] = id;
+                        } else {
+                            expected[4] = 1;
+                            expected[8] = tid as u8;
+                        }
+                        if b != expected {
+                            return Err("ML BAID REMOVE native geometry");
+                        }
+                        self.retiring_baid = self.rx_ba[tid].take().map(|entry| entry.0);
+                        vec![0; 4]
+                    } else {
+                        return Err("unsupported ML BAID operation");
+                    }
+                }
                 (5, 2) if self.ba && !self.protected => {
                     if b.len() != 20 || b[..16] != [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 1, 0]
                     {
@@ -623,7 +814,7 @@ impl Actor {
                                 return Err("MVM real signed SAR limit differs");
                             }
                         }
-                    } else if b[0] != 0 || b[8..10] != 64i16.to_le_bytes() {
+                    } else if !matches!(b[0], 0 | 1) || b[8..10] != 64i16.to_le_bytes() {
                         return Err("MVM real link power ceiling differs");
                     }
                     vec![]
@@ -636,9 +827,32 @@ impl Actor {
                             } else {
                                 1
                             }
-                        || self.channel <= 14 && b[10..12] != [1, 0]
+                        || self.channel <= 14
+                            && b[10..12] != if self.client { [0x50, 1] } else { [1, 0] }
                     {
                         return Err("MVM native response-bound TLC profile");
+                    }
+                    if self.tx_amsdu {
+                        let at = if self.tlc_version == 4 { 24 } else { 20 };
+                        if b[at..at + 2] != 3839u16.to_le_bytes()
+                            || self.tlc_version < 4 && b[7] != 1
+                        {
+                            return Err("TLC did not enable the qualified TX A-MSDU profile");
+                        }
+                        self.inject(
+                            0xf7,
+                            5,
+                            0x8000,
+                            &[
+                                0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe, 0, 0, 0xff, 0, 0, 0,
+                            ],
+                        );
+                    }
+                    vec![]
+                }
+                (5, 7) => {
+                    if !self.he || b.len() != 80 || b[..4] != [0, 1, 0, 0] {
+                        return Err("MVM HE station context native identity/extent");
                     }
                     vec![]
                 }
@@ -648,10 +862,23 @@ impl Actor {
                     }
                     vec![]
                 }
+                // WoWLAN/D3 (`mvm_d3`): exact API77 extents only.
+                (1, 0xe2) if b.len() == 200 => vec![],
+                (1, 0xe1) if b.len() == 28 => vec![],
+                (1, 0xe0) if b.len() >= 4 && b.len() == 4 + usize::from(b[0]) * 152 => vec![],
+                (1, 0xd4) if b.len() == 428 => vec![],
+                (1, 0xd3) if b.len() == 12 => vec![],
+                (1, 0xed) if b.is_empty() => vec![],
                 _ => return Err("unexpected MVM interface control publication"),
             };
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
             return Ok(());
+        }
+        if let Some(ap) = &mut self.native_ap {
+            return ap.transmit(&p, &mut self.firmware);
+        }
+        if let Some(p2p) = &mut self.native_p2p {
+            return p2p.transmit(&p, &mut self.firmware);
         }
         if !(matches!(p.queue, 23 | 24) || self.qos_tids && (25..32).contains(&p.queue))
             || p.bytes.len() < 48
@@ -659,7 +886,37 @@ impl Actor {
             return Err("MVM native interface packet queue/header");
         }
         let frame = &p.bytes[24..];
+        if self.client
+            && p.queue == 23
+            && frame[0] == 0xd0
+            && frame.get(24..30) == Some(&[4, 9, 0x50, 0x6f, 0x9a, 9])
+        {
+            if !(self.client_mac == 2
+                && self.security.ap.phase() == narf_wifi_fixtures::ApPhase::Authorized
+                && self.data_added
+                && self.m1_sent)
+            {
+                return Err("API77 P2P FRAME lacked actual MAC7/key/port/management queue");
+            }
+            crate::iwlwifi::p2p_client_fixture::check_public(frame, &p.bytes, OWN, AP, true)?;
+            self.client_public.push(frame.to_vec());
+            if self.hold_client_public {
+                self.hold_client_public = false;
+                let mut receipt = vec![0; 48];
+                receipt[0] = 1;
+                receipt[36] = 23;
+                receipt[40] = 1;
+                receipt[44..48].copy_from_slice(&u32::from(p.pointer).to_le_bytes());
+                self.held = Some((0x1c, 0, 0x8000, receipt));
+            } else {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            }
+            return Ok(());
+        }
         if p.queue == 23 && matches!(frame[0], 0 | 0xb0) {
+            if self.client {
+                crate::iwlwifi::p2p_client_fixture::check_request(frame)?;
+            }
             let replies = self
                 .security
                 .ap
@@ -667,6 +924,9 @@ impl Actor {
                 .map_err(|_| "independent AP rejected actual native MLME")?;
             self.firmware.tx_complete(23, p.pointer);
             for mut reply in replies {
+                if self.client {
+                    crate::iwlwifi::p2p_client_fixture::response(&mut reply);
+                }
                 if reply.first() == Some(&8) {
                     self.security.m1 = reply;
                 } else {
@@ -729,11 +989,22 @@ impl Actor {
             return Ok(());
         }
         if self.protected {
+            if p.queue != 23 && frame[0] == 0x88 && frame.get(24).is_some_and(|qos| qos & 0x80 != 0)
+            {
+                if !self.tx_amsdu {
+                    return Err("unqualified A-MSDU in native fixture");
+                }
+                self.amsdu_packets.push(p.bytes.clone());
+            }
             let m4 = p.queue == 23
                 && frame
                     .get(36..)
                     .and_then(|b| narf_wireless::eapol::KeyFrame::decode(b, 16))
-                    .is_some_and(|k| k.key_information == 0x30a);
+                    .is_some_and(|k| {
+                        k.key_information == 0x30a
+                            && k.key_nonce == [0; 32]
+                            && k.key_data.is_empty()
+                    });
             let held = (m4 && self.hold_m4).then_some(self.security.events.len());
             let before = self.security.data.len();
             if self.ba && p.queue == 24 && self.tx_ba_enabled {
@@ -744,42 +1015,70 @@ impl Actor {
                 self.security.react(p, &mut self.firmware, held, None)?;
             }
             if self.security.data.len() > before {
-                let frame = self.security.data.last().unwrap().clone();
-                if let Some(reply) = self.server.receive(&frame) {
-                    self.downlink(&reply)?;
+                let received = self.security.data[before..].to_vec();
+                for frame in received {
+                    if let Some(reply) = self.server.receive(&frame) {
+                        self.downlink(&reply)?;
+                    }
                 }
             }
         } else {
             let mut frame = frame.to_vec();
             let header = if self.ht { 26 } else { 24 };
             let mut tid = 0;
+            let mut amsdu = false;
             if self.ht {
-                tid = frame.get(24).copied().unwrap_or(0xff);
-                if frame.get(26..28) != Some(&[0, 0])
+                let qc = frame.get(24).copied().unwrap_or(0xff);
+                tid = qc & 15;
+                amsdu = qc & 0x80 != 0;
+                if !amsdu && frame.get(26..28) != Some(&[0, 0])
                     || frame.get(25) != Some(&0)
                     || tid > 7
+                    || qc & 0x70 != 0
+                    || amsdu && !self.tx_amsdu
                     || tid != 0 && !self.qos_tids
                 {
                     return Err("Open QoS padding/TID");
                 }
-                frame.drain(26..28);
+                if !amsdu {
+                    frame.drain(26..28);
+                }
             }
             if p.queue != 24 + u16::from(tid)
                 || frame[0..2] != [if self.ht { 0x88 } else { 8 }, 1]
                 || frame[4..10] != AP
                 || frame[10..16] != OWN
-                || frame.get(header..header + 6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0])
+                || !amsdu && frame.get(header..header + 6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0])
             {
                 return Err("MVM actual Open Ethernet header");
             }
-            let mut ethernet = frame[16..22].to_vec();
-            ethernet.extend_from_slice(&OWN);
-            ethernet.extend_from_slice(&frame[header + 6..]);
-            self.security.data.push(ethernet.clone());
-            if self.qos_tids {
-                self.tid_frames.push((tid, p.queue, ethernet.clone()));
+            let ethernet = if amsdu {
+                if p.bytes[6..8] != [0, 0x4d] {
+                    return Err("native A-MSDU TX offload flag");
+                }
+                self.amsdu_packets.push(p.bytes.clone());
+                super::super::mvm_boot::SecurityModel::decode_amsdu(&frame[header..])?
+            } else {
+                let mut ethernet = frame[16..22].to_vec();
+                ethernet.extend_from_slice(&OWN);
+                ethernet.extend_from_slice(&frame[header + 6..]);
+                vec![ethernet]
+            };
+            for frame in &ethernet {
+                self.security.data.push(frame.clone());
+                if self.qos_tids {
+                    self.tid_frames.push((tid, p.queue, frame.clone()));
+                }
             }
-            if tid != 0 {
+            if amsdu && self.hold_amsdu {
+                self.hold_amsdu = false;
+                let mut receipt = vec![0; 48];
+                receipt[0] = 1;
+                receipt[36..38].copy_from_slice(&p.queue.to_le_bytes());
+                receipt[40] = 1;
+                receipt[44..48].copy_from_slice(&u32::from(p.pointer).to_le_bytes());
+                self.held = Some((0x1c, 0, 0x8000, receipt));
+            } else if tid != 0 {
                 self.firmware.tx_complete(p.queue, p.pointer);
             } else if self.ba && self.tx_ba_enabled {
                 self.batch_dma.push((p.dma_base, p.pointer));
@@ -787,8 +1086,10 @@ impl Actor {
             } else {
                 self.firmware.tx_complete(24, p.pointer);
             }
-            if let Some(reply) = self.server.receive(&ethernet) {
-                self.downlink(&reply)?;
+            for frame in ethernet {
+                if let Some(reply) = self.server.receive(&frame) {
+                    self.downlink(&reply)?;
+                }
             }
         }
         Ok(())
@@ -800,8 +1101,11 @@ struct Harness {
     db: Arc<Database>,
     firmware: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     power: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    scan_power: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     available: Arc<AtomicBool>,
     clock: Arc<AtomicU64>,
+    ap_power:
+        Arc<IrqSafeSpinLock<Option<Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>>>,
 }
 type Endpoint = (Arc<Device>, Arc<IrqSafeSpinLock<Actor>>);
 static CURRENT: IrqSafeSpinLock<Option<Endpoint>> = IrqSafeSpinLock::new(None);
@@ -913,21 +1217,153 @@ impl Harness {
         features: u16,
         wide_nvm: u8,
     ) -> Result<Self, &'static str> {
+        Self::build_nvm_baid(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            1,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_baid(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+    ) -> Result<Self, &'static str> {
+        Self::build_nvm_he(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            ml_baid_version,
+            features & super::super::mvm_boot::feature_bits::HE != 0,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_he(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+        he_enabled: bool,
+    ) -> Result<Self, &'static str> {
+        Self::build_nvm_receive(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            ml_baid_version,
+            he_enabled,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_receive(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+        he_enabled: bool,
+        multi_receive: bool,
+    ) -> Result<Self, &'static str> {
+        Self::build_nvm_scheduled(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            ml_baid_version,
+            he_enabled,
+            multi_receive,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_scheduled(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+        he_enabled: bool,
+        multi_receive: bool,
+        pno: Option<scheduled_tests::Model>,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
         let mut image = image();
         let parsed = super::super::parse_ucode(&image).unwrap();
         let mut versions = parsed.api.commands.to_vec();
+        versions.extend_from_slice(&[7, 5, 1, 0]);
+        if let Some(model) = &pno {
+            if let Some(version) = model.profile.command {
+                versions.extend_from_slice(&[0x6e, 1, version, 0]);
+            }
+        }
+        // Real API77 reports capability68 and omits the fixed-layout
+        // RFH/RSS command entries. Native tests must exercise that default.
         if ba {
             versions.extend_from_slice(&[0xc2, 0, 0, 1, 0xc3, 0, 0, 1, 0xc5, 0, 0, 7]);
+        }
+        if ml_baid {
+            versions.extend_from_slice(&[0x16, 5, ml_baid_version, 0]);
         }
         for entry in versions.chunks_exact_mut(4) {
             if entry[0] == 15 && entry[1] == 5 {
                 entry[2] = tlc_version;
             }
         }
+        if matches!(emission, 7..=10) {
+            ap_tests::profile(&mut image, &mut versions)?;
+        }
+        if emission == 8 {
+            p2p_tests::profile(&mut image, &mut versions)?;
+        }
         tlv(&mut image, 48, &versions);
+        if let Some(model) = &pno {
+            let flags = 0xfbfb4b7fu32 | if model.profile.short { 1 << 7 } else { 0 };
+            tlv(&mut image, 18, &flags.to_le_bytes());
+        }
+        if multi_receive {
+            tlv(&mut image, 30, &[2, 0, 0, 0, 0x10, 0, 0, 0]);
+        }
         if ht {
             tlv(
                 &mut image,
@@ -938,13 +1374,39 @@ impl Harness {
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
-        model::versions(&mut hardware, parsed.api.commands);
+        if matches!(emission, 7..=10) {
+            model::native_station_identity(&mut hardware, 0xa0f0, 0x351, 0x10c000)?;
+        }
+        model::firmware_profile(&mut hardware, &parsed)?;
         let mut owner = Owner::model_after_alive(hardware, &executable.bytes);
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
-        security.ap = ap(protected)?;
+        security.ap = if emission == 10 {
+            ap(protected)?
+                .with_legacy_rates(&[0x8c, 0x98, 0xb0])
+                .map_err(|_| "MVM P2P client GO OFDM rates")?
+        } else {
+            ap(protected)?
+        };
         let mut actor = Actor {
+            client: emission == 10,
+            client_mac: 0,
+            client_public: Vec::new(),
+            hold_client_public: false,
+            native_ap: matches!(emission, 7 | 9).then(|| Box::new(ap_tests::Model::new())),
+            native_p2p: (emission == 8).then(|| Box::new(p2p_tests::Model::new())),
+            pno: pno.map(Box::new),
+            multi_receive,
+            rx_configuration: Vec::new(),
+            rx_queues: Vec::new(),
+            hold_rx_queue: None,
+            held_markers: Vec::new(),
             ht,
+            he: he_enabled,
             ba,
+            ml_baid_version: if ml_baid { ml_baid_version } else { 0 },
+            tx_amsdu: features & super::super::mvm_boot::feature_bits::TX_AMSDU != 0,
+            amsdu_packets: Vec::new(),
+            hold_amsdu: false,
             nested_downlink: false,
             rx_ba: [None; 8],
             retiring_baid: None,
@@ -1009,6 +1471,10 @@ impl Harness {
             limits[62..64].copy_from_slice(&features.to_le_bytes());
         }
         let signed = asset("narf-test/mvm-interface/power", &limits, true)?;
+        let mut scan_limits = power();
+        scan_limits[46] = 6;
+        let scan_signed = asset("narf-test/mvm-interface/scan-power", &scan_limits, true)?;
+        let scan_cap = scan_signed.cap;
         let cap = signed.cap;
         let digest = signed.digest;
         let signer = signed.signer;
@@ -1019,9 +1485,49 @@ impl Harness {
         let nonce = Arc::new(AtomicU64::new(0));
         let available = Arc::new(AtomicBool::new(true));
         let staged = available.clone();
+        let scan_staged = available.clone();
         let clock = Arc::new(AtomicU64::new(narf_time::now_cycles()));
         let observation_clock = clock.clone();
+        let ap_power = Arc::new(IrqSafeSpinLock::new(None));
+        let ap_cap = ap_power.clone();
+        let ap_staged = available.clone();
         let environment = Environment {
+            p2p_power: Arc::new(move |request| {
+                if emission != 8 {
+                    return Err("fixture has no staged tag8 P2P source");
+                }
+                let mut bytes = power();
+                bytes[8..40].copy_from_slice(&request.binding);
+                bytes[40..46].copy_from_slice(&p2p_tests::NODE);
+                bytes[46] = 8;
+                asset("narf-test/mvm-interface/p2p-power", &bytes, true)
+            }),
+            ap_power: Arc::new(move |request| {
+                if !matches!(emission, 7 | 9) || !ap_staged.load(Ordering::Acquire) {
+                    return Err("fixture has no staged tag7 AP source");
+                }
+                let mut bytes = power();
+                bytes[8..40].copy_from_slice(&request.binding);
+                bytes[46] = emission;
+                let signed = asset("narf-test/mvm-interface/ap-power", &bytes, true)?;
+                *ap_cap.lock() = Some(signed.cap);
+                Ok(signed)
+            }),
+            ap_policy: super::super::mld_policy::Source::database(db.clone()),
+            scan_power: Arc::new(move |_, _| {
+                if !scan_staged.load(Ordering::Acquire) {
+                    return Err("fixture measured scan power asset not staged");
+                }
+                Ok((
+                    Asset {
+                        bytes: scan_signed.bytes.clone(),
+                        cap: scan_signed.cap,
+                        signer: scan_signed.signer,
+                        digest: scan_signed.digest,
+                    },
+                    BINDING,
+                ))
+            }),
             observation_clock: Arc::new(move || observation_clock.load(Ordering::Acquire)),
             policy: Arc::new(move || {
                 policy
@@ -1037,6 +1543,15 @@ impl Harness {
             power: Arc::new(move |owner| {
                 if !staged.load(Ordering::Acquire) {
                     return Err("fixture measured power asset not staged");
+                }
+                if emission == 10 {
+                    let request = owner.station_power_request()?;
+                    let mut record = bytes.to_vec();
+                    record[8..40].copy_from_slice(&request.binding);
+                    return Ok((
+                        asset("narf-test/mvm-client/power-tag10", &record, true)?,
+                        request.binding,
+                    ));
                 }
                 let asset = Asset {
                     bytes: bytes.clone(),
@@ -1065,22 +1580,30 @@ impl Harness {
             *device.rx.lock() = Some(rxc);
             *device.tx.lock() = Some(txp);
         }
-        device.publication.store(true, Ordering::Release);
         let actor = Arc::new(IrqSafeSpinLock::new(actor));
         *CURRENT.lock() = Some((device.clone(), actor.clone()));
-        narf_net::iface::register(name, OWN, send);
-        narf_net::iface::set_link_state(name, true);
-        narf_net::iface::set_link_metadata(name, false, None, None);
-        narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
-        narf_net::iface::install_rx_drain(drain);
+        if emission == 8 {
+            // This path uses the actual publication frontend and retains
+            // its exact returned parent Write before any callbacks.
+            device.publish(&narf_net::bootstrap_authority(), false)?;
+        } else {
+            device.publication.store(true, Ordering::Release);
+            narf_net::iface::register(name, OWN, send);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_link_metadata(name, false, None, None);
+            narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
+            narf_net::iface::install_rx_drain(drain);
+        }
         Ok(Self {
             device,
             actor,
             db,
             firmware: executable.cap,
             power: cap,
+            scan_power: scan_cap,
             available,
             clock,
+            ap_power,
         })
     }
     fn scan(&self) -> Result<(), &'static str> {
@@ -1150,6 +1673,26 @@ impl Harness {
 }
 impl Drop for Harness {
     fn drop(&mut self) {
+        if self.device.p2p_capable && self.device.p2p.active() {
+            // A failed new control-child fixture retains its actual worker,
+            // posted buffers and inert peer. Never destroy Hardware while
+            // a native command/uncertain DMA owner can still reference it.
+            return;
+        }
+        if self.device.p2p_capable {
+            let old = {
+                let mut active = ACTIVE.lock();
+                if active
+                    .as_ref()
+                    .is_some_and(|device| Arc::ptr_eq(device, &self.device))
+                {
+                    active.take()
+                } else {
+                    None
+                }
+            };
+            drop(old);
+        }
         self.device.down(true);
         CURRENT.lock().take();
         narf_net::iface::unregister(self.device.name());
@@ -1901,3 +2444,5 @@ mod reconnect_tests;
 mod recovery_tests;
 #[path = "mvm_vht_tests.rs"]
 mod vht_tests;
+#[path = "mvm_wowlan_tests.rs"]
+mod wowlan_tests;

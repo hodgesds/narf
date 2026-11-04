@@ -1,13 +1,41 @@
 //! Exercise the production descriptor/doorbell backend on owned memory.
 use super::*;
+#[path = "p2p_management_hw_tests.rs"]
+mod p2p_management;
+#[path = "p2p_management_tx_hw_tests.rs"]
+mod p2p_management_tx;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "ap_management_hw_tests.rs"]
+mod ap_management_hw_tests;
+#[path = "ap_packet_hw_tests.rs"]
+mod ap_packet_hw_tests;
+#[path = "ap_timing_hw_tests.rs"]
+mod ap_timing_hw_tests;
+
+#[path = "firmware_transport_hw_iommu_tests.rs"]
+mod iommu_tests;
+#[path = "firmware_transport_hw_ncdma_tests.rs"]
+mod ncdma_tests;
 #[path = "tx_pipeline_hw_tests.rs"]
 mod tx_pipeline_hw_tests;
+#[path = "tx_sequence_hw_tests.rs"]
+mod tx_sequence_hw_tests;
 
 fn rig() -> Result<(Vec<u32>, Hardware), Error> {
+    rig_with(
+        &narf_io::DmaDevice::coherent(),
+        narf_bus::PcieAddr::new(0, 0, 0, 0),
+    )
+}
+
+/// [`rig`] for the function at `addr` with every ring allocated through
+/// `dma` (as `Transport::new` does after `narf_bus::dma::configure`).
+fn rig_with(
+    dma: &narf_io::DmaDevice,
+    addr: narf_bus::PcieAddr,
+) -> Result<(Vec<u32>, Hardware), Error> {
     let mut words = vec![0u32; 0x100000 / 4];
-    let addr = narf_bus::PcieAddr::new(0, 0, 0, 0);
     let device = BusDevice {
         addr: narf_bus::BusAddr::Pcie(addr),
         id: narf_bus::DeviceId {
@@ -31,19 +59,21 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         },
     };
     let storage = Storage {
-        wm: Ring::allocate(TX_WM, false)?,
-        fwdl: Ring::allocate(TX_FWDL, false)?,
-        data: Ring::allocate(TX_DATA, false)?,
+        wm: Ring::allocate_for(dma, TX_WM, false)?,
+        fwdl: Ring::allocate_for(dma, TX_FWDL, false)?,
+        data: Ring::allocate_for(dma, TX_DATA, false)?,
         data_dma: 0,
         tokens: packet_tx::Tokens::new(),
+        tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
         pending_events: VecDeque::new(),
         pending_data: VecDeque::new(),
         receive_epoch: 0,
         receive_open: false,
+        p2p_capture: super::super::p2p_management_capture::Queue::new(),
         rx: [
-            Ring::allocate(RX_PRE, true)?,
-            Ring::allocate(RX_POST, true)?,
-            Ring::allocate(RX_DATA, true)?,
+            Ring::allocate_for(dma, RX_PRE, true)?,
+            Ring::allocate_for(dma, RX_POST, true)?,
+            Ring::allocate_for(dma, RX_DATA, true)?,
         ],
     };
     Ok((
@@ -57,6 +87,8 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
                 published: false,
             },
             hw_amsdu: false,
+            sequence_reset: SequenceReset::None,
+            wake: wake::Wake::default(),
         },
     ))
 }
@@ -471,7 +503,12 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             let slot = turn % DEPTH;
             let next = (slot + 1) % DEPTH;
             if hw
-                .submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
+                .submit_management(
+                    crate::mt7921::vif_slots::Vif::HOME,
+                    &frame,
+                    19,
+                    crate::mt7921::association::LegacyRate::ONE_MBPS,
+                )
                 .is_err()
                 || words[(TX_DATA + 8) as usize / 4] != next as u32
             {
@@ -482,8 +519,12 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             if ring.word(slot, 1) != (64 << 16) | LAST {
                 return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
             }
-            if hw.submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
-                != Err(Error::Busy)
+            if hw.submit_management(
+                crate::mt7921::vif_slots::Vif::HOME,
+                &frame,
+                19,
+                crate::mt7921::association::LegacyRate::ONE_MBPS,
+            ) != Err(Error::Busy)
                 || !matches!(hw.management_complete(), Ok(None))
             {
                 return TestResult::Fail("pending token allowed reuse");
@@ -537,7 +578,14 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
         frame[..6].fill(0xff);
         frame[6..12].copy_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]);
         frame[12..14].copy_from_slice(&[8, 0]);
-        if hw.submit_data(&frame, protected, true).is_err()
+        if hw
+            .submit_data(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                protected,
+                true,
+            )
+            .is_err()
             || words[(TX_DATA + 8) as usize / 4] != 1
         {
             return TestResult::Fail("QoS descriptor did not reach hardware doorbell");
@@ -555,7 +603,12 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
             || bytes[44..46] != [18, 128]
             || bytes[64..] != frame
             || ring.word(0, 1) != (64 << 16) | LAST
-            || hw.submit_data(&frame, protected, true) != Err(Error::Busy)
+            || hw.submit_data(
+                crate::mt7921::vif_slots::Link::HOME,
+                &frame,
+                protected,
+                true,
+            ) != Err(Error::Busy)
         {
             return TestResult::Fail("native QoS queue/TID/subtype/security/TXP geometry");
         }
@@ -791,6 +844,7 @@ fn mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies() -> TestRe
     hw.owner.published = true;
     if hw
         .submit_management(
+            crate::mt7921::vif_slots::Vif::HOME,
             &management_frame(),
             1,
             crate::mt7921::association::LegacyRate::ONE_MBPS,
@@ -874,4 +928,45 @@ fn smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start() -> T
 kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start
+);
+
+fn mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata() -> TestResult {
+    for tid in 0..8u8 {
+        let mut frame = vec![0; 33];
+        frame[0] = 0xd0;
+        frame[24..26].copy_from_slice(&[3, 0]);
+        frame[26] = 1;
+        frame[27..29].copy_from_slice(&(0x1003u16 | u16::from(tid) << 2).to_le_bytes());
+        let header = packet_tx::management(
+            &frame,
+            0x12345040,
+            7,
+            1,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        )
+        .unwrap();
+        if header[4..8] != (0x8002_6001u32 | u32::from(tid) << 20).to_le_bytes()
+            || header[20..24] != [0, 0x40, 0, 0]
+            || header[12..16] != (1u32 << 28 | 15 << 11).to_le_bytes()
+        {
+            return TestResult::Fail("ADDBA management TXD omitted target TID/ADD_BA or changed native sequence ownership");
+        }
+        frame[25] = 1;
+        let response = packet_tx::management(
+            &frame,
+            0x12345040,
+            7,
+            1,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        )
+        .unwrap();
+        if response[20..24] != [0; 4] || response[4..8] != 0x8002_6001u32.to_le_bytes() {
+            return TestResult::Fail("ADDBA response inherited originator-only native metadata");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx_ba",
+    mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata
 );

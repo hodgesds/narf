@@ -56,6 +56,10 @@ pub struct Station<R: Fullmac> {
     probe_ies: Vec<u8>,
     /// Negotiated firmware WMM rank map for the authorized peer.
     ac_priority: [u8; 8],
+    /// Firmware WoWL features (`wowl::probe`); `None` without bus wake.
+    wowl: Option<wowl::Features>,
+    /// `cfg->wowl.active`: armed for the current suspend.
+    wowl_armed: Option<wowl::Armed>,
 }
 impl<R: Fullmac> core::fmt::Debug for Station<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -128,7 +132,7 @@ impl<R: Fullmac> Station<R> {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
-        set_var(&mut runtime, "event_msgs", &roam::event_mask(false)).await?;
+        write_events(&mut runtime, roam::event_mask(false), true).await?;
         let supplicant = match get_var(&mut runtime, "sup_wpa", 4).await {
             Ok(bytes) => bytes.len() == 4,
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
@@ -160,6 +164,7 @@ impl<R: Fullmac> Station<R> {
             Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
+        let wowl = wowl::probe(&mut runtime).await?;
         policy::check_initial(&mut runtime, &policy, &domain)?;
         policy::enable(&mut runtime, &policy, &domain).await?;
         policy::check_initial(&mut runtime, &policy, &domain)?;
@@ -214,6 +219,8 @@ impl<R: Fullmac> Station<R> {
             operation: false,
             probe_ies: Vec::new(),
             ac_priority: wmm::DEFAULT_AC_PRIORITY,
+            wowl,
+            wowl_armed: None,
         })
     }
 
@@ -624,7 +631,8 @@ impl<R: Fullmac> Station<R> {
             .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8, &self.channels))
             .transpose()?
             .flatten();
-        for _ in 0..2 {
+        // 160 -> primary80 -> 40 -> 20 (at most three narrowings).
+        for _ in 0..3 {
             if ht.is_some_and(|profile| {
                 profile.channel.width() > 20
                     && occupied_power(&self.domain, profile.channel).is_none()
@@ -680,7 +688,18 @@ impl<R: Fullmac> Station<R> {
                 .to_le_bytes(),
             )
             .await?;
-            self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
+            let wsec: u32 = if secure { 4 } else { 0 };
+            if R::BSSCFG {
+                // cfg80211.c brcmf_set_wsec_mode: brcmf_fil_bsscfg_int_set
+                // "wsec" (the adapter adds the `bsscfg:` prefix for its
+                // nonzero bsscfgidx); a WLC_SET_WSEC dcmd on the vif ifidx
+                // has no Linux counterpart for a secondary interface.
+                self.tx_var(grant, "wsec", &wsec.to_le_bytes()).await?;
+            } else {
+                // Primary bsscfg 0: brcmf_create_bsscfg sends plain "wsec";
+                // the established BRCMF_C_SET_WSEC path is kept unchanged.
+                self.tx_int(grant, 134, wsec).await?;
+            }
             if self.mfp_supported {
                 // WSEC can overwrite MFP state: Linux cfg80211.c places
                 // this after cipher configuration, including NONE on Open.
@@ -968,6 +987,10 @@ impl<R: Fullmac> Station<R> {
 #[path = "station_policy.rs"]
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
+#[path = "station_ap.rs"]
+pub(crate) mod ap;
+#[path = "station_monitor.rs"]
+mod monitor;
 
 #[path = "station_external.rs"]
 pub mod external;
@@ -981,17 +1004,23 @@ mod phy;
 pub mod pmksa;
 #[path = "station_roam.rs"]
 pub mod roam;
+#[path = "station_vif.rs"]
+pub(crate) mod vif;
 
 /// Firmware events consumed by the station (`brcmf_fweh` registrations):
 /// SET_SSID, AUTH, DEAUTH(_IND), DISASSOC(_IND), LINK, PSK_SUP,
 /// CHANNEL_ADOPTED (`63`) and ESCAN_RESULT.
 const EVENTS: [usize; 11] = [0, 3, 5, 6, 7, 11, 12, 16, 46, 63, 69];
+#[path = "station_p2p_scan.rs"]
+mod p2p_scan;
 #[path = "station_probe_ies.rs"]
 mod probe_ies;
 #[path = "station_sae.rs"]
 pub mod sae;
 #[path = "station_wmm.rs"]
 pub mod wmm;
+#[path = "station_wowl.rs"]
+pub mod wowl;
 
 const MAX_REPLY: usize = 1502;
 
@@ -1052,6 +1081,24 @@ async fn set_int<R: Fullmac>(runtime: &mut R, command: u32, value: u32) -> Resul
         .await
         .map(|_| ())
 }
+/// Declare this role owner's firmware events (`event_mask::Need::Primary`,
+/// a bsscfg view's own need) and write the device-wide union to
+/// `event_msgs`; `always` false skips a write that changes nothing. No
+/// writer sends a private mask over another owner's bits.
+pub(super) async fn write_events<R: Fullmac>(
+    runtime: &mut R,
+    events: crate::brcmfmac::event_mask::Mask,
+    always: bool,
+) -> Result<(), Error> {
+    let mask = runtime.events_compose(crate::brcmfmac::event_mask::Need::Primary, events);
+    if !always && runtime.events_current() == Some(mask) {
+        return Ok(());
+    }
+    set_var(runtime, "event_msgs", &mask).await?;
+    runtime.events_written(mask);
+    Ok(())
+}
+
 pub(super) async fn set_var<R: Fullmac>(
     runtime: &mut R,
     name: &str,

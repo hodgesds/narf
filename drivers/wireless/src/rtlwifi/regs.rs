@@ -40,6 +40,11 @@ pub const RTL_DEV_8192CE: u16 = 0x8178;
 /// the table but shares the 8192CE driver).
 pub const RTL_DEV_8192CE_ALT: u16 = 0x8176;
 
+/// RTL8192CE-family IDs `rtl8192ce/sw.c::rtl92ce_pci_ids` also binds
+/// (`0x8177`, `0x8191`).
+pub const RTL_DEV_8192CE_8177: u16 = 0x8177;
+pub const RTL_DEV_8192CE_8191: u16 = 0x8191;
+
 /// RTL8192DE — dual-band 2T2R 802.11n PCIe.
 /// Linux `pci.h`: `RTL_PCI_8192DE_DID = 0x8193`.
 pub const RTL_DEV_8192DE: u16 = 0x8193;
@@ -66,6 +71,8 @@ pub const ALL_DEV_IDS: &[u16] = &[
     RTL_DEV_8188EE,
     RTL_DEV_8192CE,
     RTL_DEV_8192CE_ALT,
+    RTL_DEV_8192CE_8177,
+    RTL_DEV_8192CE_8191,
     RTL_DEV_8192DE,
     RTL_DEV_8192EE,
     RTL_DEV_8723AE,

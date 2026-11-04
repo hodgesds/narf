@@ -19,9 +19,11 @@ static RUNTIME: Mutex<Option<runtime::Runtime<PcieBackplane>>> = Mutex::new(None
 static EVENTS: IrqSafeSpinLock<VecDeque<Vec<u8>>> = IrqSafeSpinLock::new(VecDeque::new());
 /// Register exact platform calibration policy before PCI matching runs.
 /// This kernel-only entry does not grant firmware access or override chip
-/// discovery. Multi-device NVRAM and newer Apple OTP selection remain gated.
+/// discovery. Multi-device NVRAM stays gated; Apple OTP chips need a signed selection.
 pub fn register_board_profile(profile: BoardProfile) -> bool {
-    if profile.chip != 43602
+    if super::chip_profile::covered(profile.chip).is_none()
+        // OTP chips need an OTP-bound signed selection, not a registration.
+        || super::chip_profile::linux_reads_otp(profile.chip)
         || profile.revision_mask == 0
         || profile.pci.vendor != 0x14e4
         || !super::pcie::ALL_DEV_IDS.contains(&profile.pci.device)
@@ -124,7 +126,7 @@ where
 pub(super) fn start(device: &mut BrcmfmacDevice) {
     // BAR mapping and immutable discovery need no board calibration guess.
     // Registry payloads arrive in Stage::Late, after synchronous PCI matching.
-    if device.chip.id != 43602
+    if super::chip_profile::covered(device.chip.id).is_none()
         || device
             .backplane
             .as_ref()
@@ -309,7 +311,11 @@ impl Reprovision {
                 super::provision::select_using(
                     authority,
                     &self.manifest,
-                    super::provision::Family::Pcie43602,
+                    if self.chip == super::chip_profile::BRCM_CC_43602 {
+                        super::provision::Family::Pcie43602
+                    } else {
+                        super::provision::Family::PcieFullmac
+                    },
                     host,
                     None,
                 )
@@ -474,6 +480,16 @@ impl Memory for narf_io::DmaBuffer {
     }
 }
 impl PcieBackplane {
+    /// IOMMU requester ID of this function (`narf_bus::dma::configure`
+    /// attaches only PCI segment 0).
+    fn iommu_bdf(&self) -> Result<narf_io::iommu::Bdf, runtime::Error> {
+        match self.device.kind {
+            narf_bus::BusKind::Pcie { addr, .. } if addr.segment == 0 => Ok(
+                narf_io::iommu::Bdf::new(addr.bus, addr.device, addr.function),
+            ),
+            _ => Err(runtime::Error::Access),
+        }
+    }
     fn aperture(&self, address: u32, length: usize) -> Result<narf_bus::MmioRegion, boot::Error> {
         // Called only inside the enclosing register CapOp. The command read
         // additionally verifies that the retained memory aperture is enabled.
@@ -585,6 +601,14 @@ impl boot::Bus for PcieBackplane {
     }
 }
 impl runtime::Bus for PcieBackplane {
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        self.qualified().ok()?;
+        Some(super::ap_source::Source::pci(
+            self.cap,
+            self.proof.clone(),
+            self.device,
+        ))
+    }
     type Memory = narf_io::DmaBuffer;
     fn allocate(&mut self, length: usize) -> Result<Self::Memory, runtime::Error> {
         self.qualified().map_err(|_| runtime::Error::Access)?;
@@ -594,14 +618,51 @@ impl runtime::Bus for PcieBackplane {
             if command == u16::MAX
                 || command & (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
                     != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
-                || narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
             {
                 return Err(runtime::Error::Access);
             }
-            narf_io::alloc_coherent(length, narf_lib::id::DomainId::DRIVER_0)
-                .map_err(|_| runtime::Error::Access)
+            if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+                return narf_io::alloc_coherent(length, narf_lib::id::DomainId::DRIVER_0)
+                    .map_err(|_| runtime::Error::Access);
+            }
+            // PerDomain: map into the function's default domain (Linux
+            // `iommu_dma_alloc`) with the PCI default 32-bit coherent mask
+            // (`pci_setup_device`; brcmfmac never widens it). A blocked
+            // function must be restored by `Runtime::attach` first.
+            if narf_io::iommu::device_dma_blocked(self.iommu_bdf()?) {
+                return Err(runtime::Error::Access);
+            }
+            let dev = narf_bus::dma::configure(&self.device).map_err(|_| runtime::Error::Access)?;
+            narf_io::alloc_coherent_for(
+                &dev,
+                length,
+                narf_lib::id::DomainId::DRIVER_0,
+                u64::from(u32::MAX),
+            )
+            .map_err(|_| runtime::Error::Access)
         })
         .map_err(|_| runtime::Error::Access)?
+    }
+    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, runtime::Error> {
+        // Deliberately ungated by the firmware/BAR proof: a dead or revoked
+        // generation must still be blockable. Identity mode reports
+        // `Untranslated` without touching the IOMMU.
+        if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+            return Ok(narf_io::iommu::DmaBlock::Untranslated);
+        }
+        narf_io::iommu::block_device_dma(self.iommu_bdf()?).map_err(|_| runtime::Error::Access)
+    }
+    fn restore_dma(&mut self) -> Result<(), runtime::Error> {
+        if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
+            return Ok(());
+        }
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        let bdf = self.iommu_bdf()?;
+        if !narf_io::iommu::device_dma_blocked(bdf) {
+            // First generation: create/attach the default domain.
+            narf_bus::dma::configure(&self.device).map_err(|_| runtime::Error::Access)?;
+        }
+        narf_io::iommu::restore_device_dma(bdf).map_err(|_| runtime::Error::Access)
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
         self.qualified().map_err(|_| runtime::Error::Access)?;
@@ -690,6 +751,28 @@ impl runtime::Bus for PcieBackplane {
     }
     fn disarm_interrupts(&mut self) {
         self.disarm_msi();
+    }
+    fn pme_d3hot(&mut self) -> bool {
+        if self.qualified().is_err() {
+            return false;
+        }
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            // SAFETY: bounded standard capability discovery over this exact
+            // retained function's validated live configuration window.
+            let Ok(Some(offset)) = (unsafe {
+                narf_bus::pci_cap::find_cap(&self.device, narf_bus::pci_cap::id::POWER_MGMT)
+            }) else {
+                return false;
+            };
+            // PMC is the upper half of the capability's first dword;
+            // `PCI_PM_CAP_PME_SHIFT` 11 + `PCI_D3hot` 3 = bit 14.
+            u16::try_from(offset).ok().is_some_and(|offset| {
+                narf_bus::pci::read_config32(&self.cap, &self.device, offset)
+                    .is_ok_and(|dword| dword != u32::MAX && (dword >> 16) & (1 << 14) != 0)
+            })
+        })
+        .unwrap_or(false)
     }
     fn link_control(&mut self) -> Result<u32, runtime::Error> {
         self.qualified().map_err(|_| runtime::Error::Access)?;

@@ -16,6 +16,7 @@ struct Source {
     cut: u8,
     xtal: u8,
     rfe: u8,
+    own: [u8; 6],
 }
 impl Io for Source {
     fn read8(&mut self, _: u32) -> Result<u8, Error> {
@@ -54,9 +55,9 @@ impl crate::rtw89::factory::Source for Source {
         if start == 0 {
             assert_eq!(bytes.len(), 1216);
             for (index, (offset, pair)) in [
-                (0x400, [2, 4]),
-                (0x402, [6, 8]),
-                (0x404, [10, 12]),
+                (0x400, [self.own[0], self.own[1]]),
+                (0x402, [self.own[2], self.own[3]]),
+                (0x404, [self.own[4], self.own[5]]),
                 (0x2b8, [255, self.xtal]),
                 (0x2ca, [self.rfe, b'U']),
                 (0x2cc, [b'S', 255]),
@@ -85,12 +86,22 @@ pub(in crate::rtw89) fn factory(secure: bool) -> Factory {
     factory_with_profile(1, 0x33, 5, secure)
 }
 pub(in crate::rtw89) fn factory_with_profile(cut: u8, xtal: u8, rfe: u8, secure: bool) -> Factory {
+    factory_with_mac(cut, xtal, rfe, secure, OWN)
+}
+pub(in crate::rtw89) fn factory_with_mac(
+    cut: u8,
+    xtal: u8,
+    rfe: u8,
+    secure: bool,
+    own: [u8; 6],
+) -> Factory {
     let mut factory = Factory::default();
     narf_scheduler::block_on(factory.read(&mut Source {
         secure,
         cut,
         xtal,
         rfe,
+        own,
     }))
     .unwrap();
     factory
@@ -836,7 +847,7 @@ fn smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile() -> TestResult
     // ext35 + MAC6 + PHY11 + rx80/tx80 only (20MHz, no PPE).
     if body.len() != 1 + 6 + 11 + 4
         || body[0] != 35
-        || body[1] & 0x01 != 0
+        || body[1] & 0x01 != 1
         || body[7] & 0x0e != 0
         || body[11] & 0x01 != 0
         || body[18..22] != [0xfa, 0xff, 0xfe, 0xff]
@@ -874,7 +885,687 @@ fn smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile() -> TestResult
     }
     TestResult::Pass
 }
+
+fn smoke_rtw8852b_he_htc_peer_requires_completed_he_ra_and_bound_tid() -> TestResult {
+    const WMM: [u8; 26] = [
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94,
+        0, 0x27, 0xa4, 0, 0,
+    ];
+    let mut controller = Controller::new(&factory(false)).unwrap();
+    let admission = Admission::new();
+    let mut model = Model::new();
+    narf_scheduler::block_on(controller.initialize(&mut model, &admission)).unwrap();
+    let peer =
+        narf_scheduler::block_on(controller.prepare_peer(&mut model, AP, &admission)).unwrap();
+    narf_scheduler::block_on(controller.commit_peer(&mut model, AP, 42, false, &admission))
+        .unwrap();
+    let wmm = narf_wireless::wmm::Parameters::parse(&WMM)
+        .unwrap()
+        .unwrap();
+    narf_scheduler::block_on(controller.configure_wmm(&mut model, wmm, false, &admission)).unwrap();
+    let mut frame = vec![0; 30];
+    frame[..2].copy_from_slice(&[0x88, 0x81]);
+    frame[4..10].copy_from_slice(&AP);
+    frame[10..16].copy_from_slice(&OWN);
+    frame[24..30].copy_from_slice(&[0x10, 0, 0x1b, 0, 0, 0]);
+    if peer.admits(&frame) {
+        return TestResult::Fail("WMM alone admitted an HE +HTC header");
+    }
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0, 0, 0],
+        sgi20: false,
+        ldpc: false,
+    };
+    let he = HeRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+        dcm: false,
+    };
+    narf_scheduler::block_on(controller.configure_ra(
+        &mut model,
+        0xfff,
+        Some(ht),
+        Some(he),
+        &admission,
+    ))
+    .unwrap();
+    if !peer.admits(&frame) {
+        return TestResult::Fail("completed HE RA did not admit bound +HTC TID0");
+    }
+    for (index, value) in [(0, 8), (24, 0x13), (24, 0), (26, 3)] {
+        let mut bad = frame.clone();
+        bad[index] = value;
+        if peer.admits(&bad) {
+            return TestResult::Fail("HE peer broadened TID/control/header admission");
+        }
+    }
+    if peer.admits(&frame[..29]) {
+        return TestResult::Fail("HE peer admitted an incomplete control field");
+    }
+    controller.invalidate();
+    if peer.admits(&frame) {
+        return TestResult::Fail("invalidated HE peer retained +HTC admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/htc",
+    smoke_rtw8852b_he_htc_peer_requires_completed_he_ra_and_bound_tid
+);
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile
+);
+
+#[path = "monitor_tests.rs"]
+mod monitor_tests;
+
+fn word_at(bytes: &[u8], index: usize) -> u32 {
+    u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+}
+
+fn smoke_rtw89_link_codec_macid_port_keeps_station_bytes() -> TestResult {
+    // Station MACID0/port0 bytes are the parameterised forms at (0, 0).
+    for paused in [false, true] {
+        assert_eq!(codec::pause(paused), codec::pause_at(0, paused));
+    }
+    assert_eq!(codec::default_cctl(), codec::default_cctl_at(0, false));
+    for ghz5 in [false, true] {
+        assert_eq!(
+            codec::fixed_cctl(ghz5),
+            codec::fixed_cctl_at(ghz5, 0, 0, None)
+        );
+    }
+    assert_eq!(
+        codec::ba_cam(true, 1, 5, 64, 0x123),
+        codec::ba_cam_at(0, true, 1, 5, 64, 0x123)
+    );
+    // mac.c rtw89_mac_set_macid_pause: grp = macid >> 5, sh = macid & 31.
+    let pause = codec::pause_at(37, true);
+    assert_eq!(word_at(&pause, 1), 1 << 5);
+    assert_eq!(word_at(&pause, 5), 1 << 5);
+    assert_eq!(word_at(&pause, 0) | word_at(&pause, 4), 0);
+    assert_eq!(word_at(&codec::pause_at(37, false), 1), 0);
+    assert_eq!(codec::pause_register(37), (0x9eb4, 1 << 5));
+    // fw.c rtw89_fw_h2c_assoc_cmac_tbl for an AP peer on port 2.
+    let peer = codec::fixed_cctl_at(false, 3, 2, Some(true));
+    assert_eq!(word_at(&peer, 0), 3 | 1 << 7);
+    assert_eq!(word_at(&peer, 5) & 7, 2);
+    assert_eq!(word_at(&peer, 7) & (1 << 17), 0); // ULDL 0
+    assert_ne!(word_at(&peer, 15) & (1 << 17), 0);
+    assert_ne!(word_at(&peer, 13) & (1 << 12), 0); // DATA_DCM mask
+    assert_ne!(word_at(&peer, 14) & (1 << 13), 0); // BSR format mask
+    let vif = codec::fixed_cctl_at(false, 0, 0, Some(false));
+    assert_eq!(word_at(&vif, 14) & (1 << 13), 0);
+    assert_ne!(word_at(&codec::default_cctl_at(9, true), 13) & (1 << 12), 0);
+    assert_eq!(word_at(&codec::default_cctl_at(9, true), 0), 9 | 1 << 7);
+    // cam.c AX v0 address CAM: idx/len, net type, W8 MACID/port, AID.
+    let cam = codec::cam_entry(&codec::Cam {
+        macid: 4,
+        port: 1,
+        addr_idx: 2,
+        bssid_idx: 0,
+        net_type: 3,
+        valid: true,
+        bssid_valid: true,
+        sma: OWN,
+        tma: AP,
+        bssid: OWN,
+        aid: 0x1234,
+    });
+    assert_eq!(word_at(&cam, 1), 2 | 0x40 << 16);
+    assert_eq!(word_at(&cam, 2) & 7, 1 | 3 << 1);
+    assert_eq!(word_at(&cam, 8), 4 | 1 << 8 | 1 << 11);
+    assert_eq!(word_at(&cam, 9), 2 << 16 | 0x234);
+    assert_eq!(
+        word_at(&cam, 13) >> 16,
+        u32::from(OWN[0]) | u32::from(OWN[1]) << 8
+    );
+    let (dmac, cmac, _) = codec::table_init(3);
+    assert_eq!(dmac, [0x1880_0030, 0x1880_0034, 0x1880_0038, 0x1880_003c]);
+    assert_eq!(cmac, 0x1884_0060);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/uapsd",
+    smoke_rtw89_link_codec_macid_port_keeps_station_bytes
+);
+fn smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1() -> TestResult {
+    // fw.h H2C_FUNC_MAC_CCTLINFO_UD_V1 (rtw8852c `h2c_cctl_func_id`).
+    if codec::CCTL_V1 != 0x0a {
+        return TestResult::Fail("C CCTL function is not CCTLINFO_UD_V1");
+    }
+    // Default: no TXPWR_MODE / TX path / ANTSEL setter under UD_V1; only
+    // MGQ_RPT_EN (W1 bit21), DOPPLER (W7 [19:18]), TOLERENCE (W7 [27:24]).
+    let d = codec::default_cctl_v1();
+    let b = codec::default_cctl();
+    if word_at(&d, 0) != word_at(&b, 0)
+        || word_at(&d, 5) | word_at(&d, 13) != 0
+        || word_at(&d, 6) | word_at(&d, 14) != 0
+        || word_at(&d, 9) != 1 << 21
+        || word_at(&d, 15) != 0x0f0c_0000
+        || word_at(&d, 1) | word_at(&d, 7) != 0
+    {
+        return TestResult::Fail("C default CCTL body differs from Linux UD_V1");
+    }
+    for ghz5 in [false, true] {
+        let v1 = codec::fixed_cctl_v1(ghz5);
+        let ud = codec::fixed_cctl(ghz5);
+        // Padding masks move from W7 [21:20]/[23:22]/[31:30] + W8 [29:28]
+        // to W7 [7:0]; every other setter is byte-identical.
+        let ud_pad7 = 3 << 20 | 3 << 22 | 3 << 30;
+        if word_at(&v1, 15) != (word_at(&ud, 15) & !ud_pad7) | 0xff
+            || word_at(&v1, 16) != word_at(&ud, 16) & !(3 << 28)
+            || word_at(&v1, 7) & 0xff != 0
+        {
+            return TestResult::Fail("C assoc CCTL padding not at UD_V1 positions");
+        }
+        for index in (0..17).filter(|i| ![7, 8, 15, 16].contains(i)) {
+            if word_at(&v1, index) != word_at(&ud, index) {
+                return TestResult::Fail("C assoc CCTL changed a shared setter");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_station_cctl_v1_follows_linux_cctlinfo_ud_v1
+);
+fn smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c() -> TestResult {
+    // rtw89_fw_h2c_ba_cam, RTW89_BACAM_V0_EXT: no W0 ENTRY_IDX, W1
+    // ENTRY_IDX_V1[31:28] | STD_EN; BAND 0 (mac_idx 0).
+    let v0 = codec::ba_cam(true, 1, 5, 64, 0x123);
+    let ext = codec::ba_cam_v0_ext(true, 7, 5, 64, 0x123);
+    if word_at(&ext, 0) != word_at(&v0, 0) & !(3 << 2)
+        || word_at(&ext, 1) != (7 << 28 | 1 << 8)
+        || word_at(&codec::ba_cam_v0_ext(true, 0, 0, 256, 0), 0) != (1 | 1 << 1 | 4 << 16)
+    {
+        return TestResult::Fail("C BA CAM V0_EXT body differs from fw.c");
+    }
+    // Invalidation: MACID 0 and W1 ENTRY_IDX_V1 only.
+    let off = codec::ba_cam_v0_ext(false, 6, 5, 64, 0x123);
+    if word_at(&off, 0) != 0 || word_at(&off, 1) != 6 << 28 {
+        return TestResult::Fail("C BA CAM invalidation differs");
+    }
+    // rtw89_fw_h2c_init_ba_cam_v0_ext: VALID, entry 8 + uid, uid.
+    for uid in 0..8u8 {
+        let init = codec::init_ba_cam_v0_ext(8 + uid, uid);
+        if word_at(&init, 0) != 1
+            || word_at(&init, 1) != (u32::from(8 + uid) << 28 | u32::from(uid))
+        {
+            return TestResult::Fail("C dynamic BA CAM init differs");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c
+);
+
+/// AP elements for a wide-channel BSS: rates, HT Capabilities (20/40, SGI20/
+/// SGI40, LDPC, RX MCS0..15), HT Operation (`secondary` 1 above / 3 below),
+/// and on 5GHz VHT Capabilities (2SS MCS0..9) and VHT Operation.
+fn wide_ap_ies(primary: u8, secondary: u8, vht: Option<(u8, u8)>) -> Vec<u8> {
+    let mut ies = if primary > 14 {
+        vec![1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]
+    } else {
+        vec![1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36]
+    };
+    let mut ht = [0u8; 26];
+    ht[0] = 0x63;
+    ht[2] = 3;
+    ht[3] = 255;
+    ht[4] = 255;
+    ht[15] = 1;
+    ies.extend_from_slice(&[45, 26]);
+    ies.extend_from_slice(&ht);
+    let mut op = [0u8; 22];
+    op[0] = primary;
+    op[1] = secondary | if secondary != 0 { 4 } else { 0 };
+    ies.extend_from_slice(&[61, 22]);
+    ies.extend_from_slice(&op);
+    if let Some((width, center)) = vht {
+        ies.extend_from_slice(&[191, 12, 0x30, 0, 0, 0, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]);
+        ies.extend_from_slice(&[192, 5, width, center, 0, 0xfc, 0xff]);
+    }
+    ies
+}
+
+fn smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef() -> TestResult {
+    use super::super::operating_channel::{Profile, Width};
+    // core.c rtw89_init_ht_cap width bits over the HT20 profile.
+    let Some(ht40) = local_ht40() else {
+        return TestResult::Fail("HT40 capability rejected by the shared API");
+    };
+    let body = ht40.capability_body();
+    let narrow = local_ht().capability_body();
+    if u16::from_le_bytes([body[0], body[1]]) != 0x116f || body[2..] != narrow[2..] {
+        return TestResult::Fail("HT40 capability is not rtw89_init_ht_cap width bits over HT20");
+    }
+    // rtw89_init_vht_cap restricted: RXLDPC|SGI80|RXSTBC1, no 160/TXSTBC/BF.
+    let Some(vht) = local_vht80() else {
+        return TestResult::Fail("VHT80 capability rejected by the shared API");
+    };
+    let vbody = vht.capability_body();
+    if u32::from_le_bytes([vbody[0], vbody[1], vbody[2], vbody[3]]) != 0x130
+        || vbody[4..6] != [0xfa, 0xff]
+        || vbody[8..10] != [0xfe, 0xff]
+    {
+        return TestResult::Fail("VHT80 capability differs from the restricted Linux profile");
+    }
+    // HE PHY cap0: 40MHz-in-2.4GHz / 40-80MHz-in-5GHz; rest is HE20's.
+    let (Some(he2), Some(he5), Some(he)) = (local_he_wide(false), local_he_wide(true), local_he())
+    else {
+        return TestResult::Fail("wide HE capability rejected");
+    };
+    let (b2, b5, b) = (
+        he2.capability_body(),
+        he5.capability_body(),
+        he.capability_body(),
+    );
+    if b2[7] != 0x02 || b5[7] != 0x04 || b2[8..] != b[8..] || b5[8..] != b[8..] || b2[..7] != b[..7]
+    {
+        return TestResult::Fail("wide HE PHY cap0 differs from rtw89_init_he_cap");
+    }
+    // 2.4GHz HT40+ on primary 1: offered only for the admitted HT40+ profile.
+    let ies = wide_ap_ies(1, 1, None);
+    let Some(plus) = Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("HT40+ profile missing");
+    };
+    if wide_phy(&ies, 1, true, false, &[]).is_some() {
+        return TestResult::Fail("wide PHY offered without an admitted profile");
+    }
+    let other = Profile::new_2ghz_40(5, false).unwrap();
+    if wide_phy(&ies, 1, true, false, &[other]).is_some() {
+        return TestResult::Fail("wide PHY offered for a different admitted chandef");
+    }
+    match wide_phy(&ies, 1, true, false, &[other, plus]) {
+        Some((local, profile)) if profile == plus => {
+            if local.he().map(|he| he.capability_body()) != Some(b2.clone()) {
+                return TestResult::Fail("2.4GHz HT40 join lacks the 40MHz HE capability");
+            }
+        }
+        _ => return TestResult::Fail("admitted HT40+ chandef not offered"),
+    }
+    // A 20MHz AP never maps to a wide profile.
+    if wide_phy(&wide_ap_ies(1, 0, None), 1, false, false, &[plus]).is_some() {
+        return TestResult::Fail("20MHz BSS offered a wide PHY");
+    }
+    // 5GHz VHT80 at center 42 (primary 40): 80MHz when admitted, else the
+    // admitted 40MHz half, else nothing.
+    let ies = wide_ap_ies(40, 3, Some((1, 42)));
+    let (Some(p80), Some(p40)) = (
+        Profile::new_5ghz(40, Width::Mhz80),
+        Profile::new_5ghz(40, Width::Mhz40),
+    ) else {
+        return TestResult::Fail("5GHz wide profiles missing");
+    };
+    if !matches!(wide_phy(&ies, 40, true, false, &[p40, p80]), Some((_, p)) if p == p80) {
+        return TestResult::Fail("admitted VHT80 chandef not offered");
+    }
+    if !matches!(wide_phy(&ies, 40, false, false, &[p40]), Some((_, p)) if p == p40) {
+        return TestResult::Fail("admitted 40MHz half of a VHT80 BSS not offered");
+    }
+    if wide_phy(
+        &ies,
+        40,
+        false,
+        false,
+        &[Profile::new_5ghz(44, Width::Mhz40).unwrap()],
+    )
+    .is_some()
+    {
+        return TestResult::Fail("wide PHY offered for a chandef not containing the primary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw89_b_wide_capability_offered_only_on_admitted_chandef
+);
+
+fn smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux() -> TestResult {
+    let w = |b: &[u8; 16], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0xff, 0, 0],
+        sgi20: true,
+        ldpc: true,
+    };
+    // get_mcs_ra_mask(map, 9, 1): MCS0..9 / 0..8 / 0..7 per NSS.
+    if codec::vht_mcs_mask(0xfffe) != 0x3ff000
+        || codec::vht_mcs_mask(0xfffd) != 0x1ff000
+        || codec::vht_mcs_mask(0xfffa) != 0x3ff_3ff000
+        || codec::vht_mcs_mask(0xffff) != 0
+    {
+        return TestResult::Fail("VHT MCS mask differs from get_mcs_ra_mask(.., 9, 1)");
+    }
+    // HT40 on 2.4GHz: HT branch body with BW_CAP=1 and SGI = HT SGI_40.
+    let wide = WideRa {
+        bw: 1,
+        sgi: false,
+        vht: None,
+        fix_giltf: None,
+    };
+    let (Some(narrow), Some(body)) = (
+        codec::ra_ht(0xfff, Some(ht)),
+        codec::ra_wide(0xfff, ht, None, wide),
+    ) else {
+        return TestResult::Fail("HT40 RA refused");
+    };
+    if w(&body, 0) != (w(&narrow, 0) & !(1 << 21)) | 1 << 6 || body[4..] != narrow[4..] {
+        return TestResult::Fail("HT40 RA differs from the HT branch with bw_cap 40");
+    }
+    // VHT80 on 5GHz (OFDM legacy 0xff0): mode VHT|OFDM, mask VHT1SS|SUBOFDM,
+    // BW_CAP=2, SGI80, LDPC from the peer RXLDPC, STBC0.
+    let vht = VhtRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+    };
+    let wide = WideRa {
+        bw: 2,
+        sgi: true,
+        vht: Some(vht),
+        fix_giltf: None,
+    };
+    let Some(body) = codec::ra_wide(0xff0, ht, None, wide) else {
+        return TestResult::Fail("VHT80 RA refused");
+    };
+    if w(&body, 0) != (0xa << 1 | 2 << 6 | 1 << 20 | 1 << 21 | 1 << 22)
+        || w(&body, 1) != 0x3ff010
+        || w(&body, 2) != 0
+    {
+        return TestResult::Fail("VHT80 RA_MACIDCFG differs from rtw89_phy_ra_sta_update");
+    }
+    // HE takes precedence over VHT (HE branch body, BW_CAP=2).
+    let he = HeRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+        dcm: false,
+    };
+    let (Some(narrow), Some(body)) = (
+        codec::ra_he(0xff0, ht, he),
+        codec::ra_wide(0xff0, ht, Some(he), wide),
+    ) else {
+        return TestResult::Fail("HE80 RA refused");
+    };
+    if w(&body, 0) != w(&narrow, 0) | 2 << 6 || body[4..] != narrow[4..] {
+        return TestResult::Fail("HE80 RA differs from the HE branch with bw_cap 80");
+    }
+    // 80MHz without VHT facts and a 20MHz "wide" RA are refused.
+    if codec::ra_wide(0xff0, ht, Some(he), WideRa { vht: None, ..wide }).is_some()
+        || codec::ra_wide(0xff0, ht, None, WideRa { bw: 0, ..wide }).is_some()
+    {
+        return TestResult::Fail("inconsistent wide RA accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw89_b_wide_ra_h2c_bw_sgi_and_vht_mask_match_linux
+);
+
+/// RTL8852C 160MHz: core.c `rtw89_init_vht_cap` / `rtw89_init_he_cap` 160MHz
+/// bits over the restricted wide profile, `wide_phy` offering VHT160/HE160
+/// only for an admitted 160MHz chandef (never on an RTL8852B-only admitted
+/// list), and phy.c `rtw89_phy_ra_sta_update` BW_CAP 160 / SHORT_GI_160 with
+/// `rtw89_phy_ra_gi_ltf`'s RTL8852C 160MHz fixed GI/LTF.
+fn smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux() -> TestResult {
+    use super::super::operating_channel::{Profile, Width};
+    let w = |b: &[u8; 16], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    // VHT160 = VHT80 | SUPP_CHAN_WIDTH_160MHZ (bit2) | SHORT_GI_160 (bit6),
+    // same MCS maps.
+    let (Some(v80), Some(v160)) = (local_vht80(), local_vht160()) else {
+        return TestResult::Fail("VHT160 capability rejected by the shared API");
+    };
+    let (a, b) = (v80.capability_body(), v160.capability_body());
+    if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) != 0x130 | 1 << 2 | 1 << 6 || a[4..] != b[4..] {
+        return TestResult::Fail("VHT160 differs from rtw89_init_vht_cap 160MHz bits");
+    }
+    // HE160: cap0 40/80 + 160MHz-in-5G, cap8 | 20/80MHz-in-160 HE PPDU, then
+    // the 80MHz maps followed by the 160MHz maps (= the 80MHz ones).
+    let (Some(he5), Some(he160)) = (local_he_wide(true), local_he160()) else {
+        return TestResult::Fail("HE160 capability rejected");
+    };
+    let (h5, h160) = (he5.capability_body(), he160.capability_body());
+    if h160[7] != 0x0c
+        || h160[15] != h5[15] | 0x0c
+        || h160[..7] != h5[..7]
+        || h160[8..15] != h5[8..15]
+        || h160.len() != h5.len() + 4
+        || h160[16..h5.len()] != h5[16..]
+        || h160[h5.len()..] != [0xfa, 0xff, 0xfe, 0xff]
+    {
+        return TestResult::Fail("HE160 differs from rtw89_init_he_cap 160MHz bits");
+    }
+    // AP: primary 40, 160MHz BSS 36..64 (VHT cap 160 + SGI160, revised VHT
+    // operation width 1, CCFS0 42 = primary80, CCFS1 50 = the 160 center).
+    let mut ies = wide_ap_ies(40, 3, None);
+    ies.extend_from_slice(&[191, 12, 0x74, 0, 0, 0, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]);
+    ies.extend_from_slice(&[192, 5, 1, 42, 50, 0xfc, 0xff]);
+    let (Some(p160), Some(p80)) = (
+        Profile::new_5ghz_160(40),
+        Profile::new_5ghz(40, Width::Mhz80),
+    ) else {
+        return TestResult::Fail("5GHz 160/80MHz profiles missing");
+    };
+    // chan.c rtw89_get_primary_chan_idx / phy.c rtw89_phy_get_txsc at 160.
+    if p160.center() != 50
+        || p160.pri_ch_idx() != 6
+        || p160.txsc(Width::Mhz20) != 6
+        || p160.txsc(Width::Mhz40) != 12
+        || p160.txsc(Width::Mhz80) != 14
+        || p160.occupied() != (5170, 5330)
+        || Profile::new_5ghz(40, Width::Mhz160).is_some()
+        || Profile::new_wide(40, Width::Mhz160, false).is_some()
+    {
+        return TestResult::Fail("160MHz geometry differs from Linux or B admitted 160MHz");
+    }
+    // An RTL8852B-style admitted list (no 160MHz profile): the 80MHz join,
+    // without any 160MHz capability bit.
+    match wide_phy(&ies, 40, true, false, &[p80]) {
+        Some((local, p)) if p == p80 => {
+            if local.he().map(|he| he.capability_body()) != Some(h5.clone()) {
+                return TestResult::Fail("80MHz join offered HE160");
+            }
+        }
+        _ => return TestResult::Fail("admitted 80MHz half of a 160MHz BSS not offered"),
+    }
+    // The admitted C 160MHz chandef: VHT160 + HE160, exactly that profile.
+    match wide_phy(&ies, 40, true, false, &[p80, p160]) {
+        Some((local, p)) if p == p160 => {
+            if local.he().map(|he| he.capability_body()) != Some(h160.clone()) {
+                return TestResult::Fail("160MHz join lacks the HE160 capability");
+            }
+        }
+        _ => return TestResult::Fail("admitted 160MHz chandef not offered"),
+    }
+    // An 80MHz BSS never selects the 160MHz candidate.
+    if !matches!(
+        wide_phy(&wide_ap_ies(40, 3, Some((1, 42))), 40, false, false, &[p80, p160]),
+        Some((_, p)) if p == p80
+    ) {
+        return TestResult::Fail("80MHz BSS joined at 160MHz");
+    }
+    // RA: BW_CAP 3 and SHORT_GI_160 on the VHT branch.
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0xff, 0, 0],
+        sgi20: true,
+        ldpc: true,
+    };
+    let vht = VhtRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+    };
+    let wide = WideRa {
+        bw: 3,
+        sgi: true,
+        vht: Some(vht),
+        fix_giltf: None,
+    };
+    let Some(body) = codec::ra_wide(0xff0, ht, None, wide) else {
+        return TestResult::Fail("VHT160 RA refused");
+    };
+    if w(&body, 0) != (0xa << 1 | 3 << 6 | 1 << 20 | 1 << 21 | 1 << 22)
+        || w(&body, 1) != 0x3ff010
+        || w(&body, 3) != 0
+    {
+        return TestResult::Fail("VHT160 RA_MACIDCFG differs from rtw89_phy_ra_sta_update");
+    }
+    // HE160: HE branch, BW_CAP 3, W3 FIX_GILTF_EN | FIX_GILTF (SGI_4XHE08 1
+    // or 2XHE08 3).
+    let he = HeRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+        dcm: false,
+    };
+    for giltf in [1u8, 3] {
+        let (Some(narrow), Some(body)) = (
+            codec::ra_he(0xff0, ht, he),
+            codec::ra_wide(
+                0xff0,
+                ht,
+                Some(he),
+                WideRa {
+                    fix_giltf: Some(giltf),
+                    ..wide
+                },
+            ),
+        ) else {
+            return TestResult::Fail("HE160 RA refused");
+        };
+        if w(&body, 0) != (w(&narrow, 0) & !(1 << 21)) | 3 << 6 | 1 << 21
+            || body[4..12] != narrow[4..12]
+            || w(&body, 3) != 1 << 11 | u32::from(giltf) << 12
+        {
+            return TestResult::Fail("HE160 RA differs from the HE branch with bw_cap 160");
+        }
+    }
+    // Fixed GI/LTF only on an HE 160MHz link with a defined value; 160MHz
+    // needs VHT facts; widths above 160 are refused.
+    if codec::ra_wide(
+        0xff0,
+        ht,
+        None,
+        WideRa {
+            fix_giltf: Some(1),
+            ..wide
+        },
+    )
+    .is_some()
+        || codec::ra_wide(
+            0xff0,
+            ht,
+            Some(he),
+            WideRa {
+                bw: 2,
+                fix_giltf: Some(1),
+                ..wide
+            },
+        )
+        .is_some()
+        || codec::ra_wide(
+            0xff0,
+            ht,
+            Some(he),
+            WideRa {
+                fix_giltf: Some(2),
+                ..wide
+            },
+        )
+        .is_some()
+        || codec::ra_wide(0xff0, ht, Some(he), WideRa { vht: None, ..wide }).is_some()
+        || codec::ra_wide(0xff0, ht, None, WideRa { bw: 4, ..wide }).is_some()
+    {
+        return TestResult::Fail("inconsistent 160MHz RA accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852c_160mhz_capability_wide_phy_and_ra_follow_linux
+);
+
+/// phy.c `rtw89_phy_ra_sta_update` on `RTW89_BAND_6G` for a 6GHz HE peer
+/// (no HT): `mode = HE|OFDM`, SGI clear, OFDM-only legacy, LDPC/DCM from
+/// HE; any CCK rate or no OFDM rate is refused.
+fn smoke_rtw8852c_6ghz_ra_is_he_only_ofdm() -> TestResult {
+    let he = codec::HeRa {
+        peer_rx_mcs: 0xfffa,
+        ldpc: true,
+        dcm: false,
+    };
+    let Some(bytes) = codec::ra_he6(0xff0, he) else {
+        return TestResult::Fail("6GHz HE-only RA refused");
+    };
+    let w0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // MODE[5:1] = HE (0x10) | OFDM (0x2); SGI BIT(21) clear; LDPC BIT(22).
+    if (w0 >> 1) & 0x1f != 0x12 || w0 & 1 << 21 != 0 || w0 & 1 << 22 == 0 {
+        return TestResult::Fail("6GHz RA mode/SGI/LDPC");
+    }
+    let mask = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if mask & 0xf != 0 || mask & 0xfff000 == 0 {
+        return TestResult::Fail("6GHz RA mask carries CCK or no HE MCS");
+    }
+    if codec::ra_he6(0xfff, he).is_some() || codec::ra_he6(0, he).is_some() {
+        return TestResult::Fail("6GHz RA admitted CCK or empty legacy rates");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_6ghz_ra_is_he_only_ofdm
+);
+/// RTL8851B (`rx_nss` = `tx_nss` = 1): the NSS1 HE/VHT bodies differ from
+/// the B/C ones only in the MCS maps, and the one-stream wide join offers
+/// them, never a 160MHz candidate.
+fn smoke_rtw8851b_station_offers_one_stream_he_vht() -> TestResult {
+    use super::super::operating_channel::{Profile, Width};
+    let (Some(he), Some(he1), Some(vht), Some(vht1)) =
+        (local_he(), local_he_1ss(), local_vht80(), local_vht80_1ss())
+    else {
+        return TestResult::Fail("one-stream capability rejected by the shared API");
+    };
+    let (b, b1) = (he.capability_body(), he1.capability_body());
+    let (v, v1) = (vht.capability_body(), vht1.capability_body());
+    if b1.len() != b.len()
+        || b1[..18] != b[..18]
+        || b1[18..22] != [0xfe, 0xff, 0xfe, 0xff]
+        || v1[..4] != v[..4]
+        || v1[4..6] != [0xfe, 0xff]
+        || v1[8..10] != [0xfe, 0xff]
+    {
+        return TestResult::Fail("one-stream bodies are not the NSS1 restriction");
+    }
+    for ghz5 in [false, true] {
+        let (Some(w), Some(w1)) = (local_he_wide(ghz5), local_he_wide_1ss(ghz5)) else {
+            return TestResult::Fail("one-stream wide HE rejected");
+        };
+        let (w, w1) = (w.capability_body(), w1.capability_body());
+        if w1[..18] != w[..18] || w1[18..22] != [0xfe, 0xff, 0xfe, 0xff] {
+            return TestResult::Fail("one-stream wide HE is not the NSS1 restriction");
+        }
+    }
+    if he_fingerprint_1ss() == he_fingerprint() || wide_fingerprint_1ss() == wide_fingerprint() {
+        return TestResult::Fail("one-stream programs share the two-stream identity");
+    }
+    let ies = wide_ap_ies(40, 3, Some((1, 42)));
+    let (Some(p80), Some(p160)) = (
+        Profile::new_5ghz(40, Width::Mhz80),
+        Profile::new_5ghz_160(40),
+    ) else {
+        return TestResult::Fail("5GHz wide profiles missing");
+    };
+    if !matches!(wide_phy(&ies, 40, true, true, &[p80]), Some((_, p)) if p == p80) {
+        return TestResult::Fail("one-stream VHT80 chandef not offered");
+    }
+    if wide_phy(&ies, 40, true, true, &[p160]).is_some() {
+        return TestResult::Fail("one-stream station offered a 160MHz chandef");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8851b_station_offers_one_stream_he_vht
 );

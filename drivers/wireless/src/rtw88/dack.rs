@@ -35,15 +35,15 @@ fn magnitude(v: u16) -> u16 {
 fn valid(v: u16) -> bool {
     magnitude(v) <= 100
 }
-fn measurement(io: &mut impl Io) -> Result<[u16; 2], Error> {
-    let v = read(io, 0x2dbc)? & 0x3fffff;
+async fn measurement(io: &mut impl Io) -> Result<[u16; 2], Error> {
+    let v = read(io, 0x2dbc).await? & 0x3fffff;
     Ok([((v >> 12) & 0x3ff) as u16, (v & 0x3ff) as u16])
 }
 async fn sample(io: &mut impl Io) -> Result<[u16; 2], Error> {
     let mut data = [[0u16; 100]; 2];
     let mut count = 0;
     for attempt in 0..10000 {
-        let v = measurement(io)?;
+        let v = measurement(io).await?;
         let accepted = v.into_iter().all(valid);
         if accepted {
             data[0][count] = v[0];
@@ -78,7 +78,7 @@ async fn sample(io: &mut impl Io) -> Result<[u16; 2], Error> {
             return Err(Error::Prerequisite);
         }
         for index in [0, 99] {
-            let v = measurement(io)?;
+            let v = measurement(io).await?;
             if !v.into_iter().all(valid) {
                 return Err(Error::Prerequisite);
             }
@@ -91,7 +91,7 @@ async fn sample(io: &mut impl Io) -> Result<[u16; 2], Error> {
 }
 async fn ready(io: &mut impl Io, reg: u16, bits: u32, wanted: u32) -> Result<(), Error> {
     for _ in 0..1000 {
-        if (read(io, reg)? & bits) >> bits.trailing_zeros() == wanted {
+        if (read(io, reg).await? & bits) >> bits.trailing_zeros() == wanted {
             return Ok(());
         }
         io.delay_us(10).await;
@@ -101,9 +101,9 @@ async fn ready(io: &mut impl Io, reg: u16, bits: u32, wanted: u32) -> Result<(),
 async fn adc(io: &mut impl Io, path: u8) -> Result<(u32, [u16; 2]), Error> {
     let (base, _) = bases(path);
     let selection = if path == 0 { 0xa0000 } else { 0x80000 };
-    mask(io, base + 0x30, 1 << 30, 0)?;
+    mask(io, base + 0x30, 1 << 30, 0).await?;
     if path == 1 {
-        io.write32(base + 0x30, 0x30db8041)?;
+        io.write32(base + 0x30, 0x30db8041).await?;
     }
     for (off, v) in [
         (0x60, 0xf0040ff0),
@@ -111,13 +111,13 @@ async fn adc(io: &mut impl Io, path: u8) -> Result<(u32, [u16; 2]), Error> {
         (0x10, 0x02dd08c4),
         (0x0c, 0x10000260),
     ] {
-        io.write32(base + off, v)?;
+        io.write32(base + off, v).await?;
     }
     for p in 0..2 {
         rf(io, p, 0, 0xfffff, 0x10000).await?;
     }
     for p in 0..2 {
-        if rf_read(io, p, 0)? >> 16 != 1 {
+        if rf_read(io, p, 0).await? >> 16 != 1 {
             return Err(Error::Prerequisite);
         }
     }
@@ -125,8 +125,8 @@ async fn adc(io: &mut impl Io, path: u8) -> Result<(u32, [u16; 2]), Error> {
     let mut converged = false;
     let mut code = 0;
     for _ in 0..10 {
-        io.write32(0x1c3c, selection + 0x8003)?;
-        io.write32(0x1c24, 0x10002)?;
+        io.write32(0x1c3c, selection + 0x8003).await?;
+        io.write32(0x1c24, 0x10002).await?;
         let before = sample(io).await?;
         // Source preserves a previous nonzero compensation when a later
         // before sample happens to be zero, but writes the actual new pair.
@@ -137,8 +137,8 @@ async fn adc(io: &mut impl Io, path: u8) -> Result<(u32, [u16; 2]), Error> {
             }
         }
         code = u32::from(next[0]) | u32::from(next[1]) << 10;
-        io.write32(base + 0x68, code)?;
-        io.write32(0x1c3c, selection + 0x8103)?;
+        io.write32(base + 0x68, code).await?;
+        io.write32(0x1c3c, selection + 0x8103).await?;
         let after = sample(io).await?;
         if after.into_iter().all(|v| magnitude(v) < 5) {
             converged = true;
@@ -148,19 +148,19 @@ async fn adc(io: &mut impl Io, path: u8) -> Result<(u32, [u16; 2]), Error> {
     if !converged {
         return Err(Error::Prerequisite);
     }
-    io.write32(0x1c3c, 3)?;
-    io.write32(base + 0x0c, 0x10000260)?;
-    io.write32(base + 0x10, 0x02d508c4)?;
+    io.write32(0x1c3c, 3).await?;
+    io.write32(base + 0x0c, 0x10000260).await?;
+    io.write32(base + 0x10, 0x02d508c4).await?;
     rf(io, path, 0x8f, 1 << 13, 1).await?;
     Ok((code, compensation))
 }
 async fn step1(io: &mut impl Io, path: u8, adc: u32) -> Result<(), Error> {
     let (base, result) = bases(path);
-    io.write32(base + 0x68, adc)?;
-    io.write32(base + 0x0c, 0xdff00220)?;
+    io.write32(base + 0x68, adc).await?;
+    io.write32(base + 0x0c, 0xdff00220).await?;
     if path == 0 {
-        io.write32(base + 0x60, 0xf0040ff0)?;
-        io.write32(0x1c38, u32::MAX)?;
+        io.write32(base + 0x60, 0xf0040ff0).await?;
+        io.write32(0x1c38, u32::MAX).await?;
     }
     for (reg, v) in [
         (base + 0x10, 0x02d508c5),
@@ -173,20 +173,20 @@ async fn step1(io: &mut impl Io, path: u8, adc: u32) -> Result<(), Error> {
         (base + 0xdc, 0x0003d208),
         (base + 0xb8, 0x60000000),
     ] {
-        io.write32(reg, v)?;
+        io.write32(reg, v).await?;
     }
     io.delay_us(2000).await;
-    io.write32(base + 0xbc, 0x000aff8d)?;
+    io.write32(base + 0xbc, 0x000aff8d).await?;
     io.delay_us(2000).await;
-    io.write32(base + 0xb0, 0x0a11fb89)?;
-    io.write32(base + 0xcc, 0x0a11fb89)?;
+    io.write32(base + 0xb0, 0x0a11fb89).await?;
+    io.write32(base + 0xcc, 0x0a11fb89).await?;
     io.delay_us(1000).await;
-    io.write32(base + 0xb8, 0x62000000)?;
-    io.write32(base + 0xd4, 0x62000000)?;
+    io.write32(base + 0xb8, 0x62000000).await?;
+    io.write32(base + 0xd4, 0x62000000).await?;
     io.delay_us(20000).await;
     ready(io, result + 8, 0x7fff80, 0xffff).await?;
     ready(io, result + 0x34, 0x7fff80, 0xffff).await?;
-    io.write32(base + 0xb8, 0x02000000)?;
+    io.write32(base + 0xb8, 0x02000000).await?;
     io.delay_us(1000).await;
     for (reg, v) in [
         (base + 0xbc, 0x0008ff87),
@@ -195,7 +195,7 @@ async fn step1(io: &mut impl Io, path: u8, adc: u32) -> Result<(), Error> {
         (base + 0xbc, 0x0008ff87),
         (base + 0x60, 0xf0000000),
     ] {
-        io.write32(reg, v)?;
+        io.write32(reg, v).await?;
     }
     Ok(())
 }
@@ -219,13 +219,13 @@ async fn step2(io: &mut impl Io, path: u8) -> Result<[u32; 2], Error> {
         (0xd8, 0xf0000000, 0),
         (0xdc, 15, 8),
     ] {
-        mask(io, base + off, bits, v)?;
+        mask(io, base + off, bits, v).await?;
     }
-    io.write32(0x1b00, 8)?;
-    io.write8(0x1bcc, 0x3f)?;
-    io.write32(base + 0x0c, 0xdff00220)?;
-    io.write32(base + 0x10, 0x02d508c5)?;
-    io.write32(0x1c3c, 0x88103)?;
+    io.write32(0x1b00, 8).await?;
+    io.write8(0x1bcc, 0x3f).await?;
+    io.write32(base + 0x0c, 0xdff00220).await?;
+    io.write32(base + 0x10, 0x02d508c5).await?;
+    io.write32(0x1c3c, 0x88103).await?;
     let v = sample(io).await?;
     Ok([compensation(v[0])?, compensation(v[1])?])
 }
@@ -245,59 +245,60 @@ async fn step3(
         (base + 0xbc, 0xc008ff81),
         (base + 0xc0, 0x0003d208),
     ] {
-        io.write32(reg, v)?;
+        io.write32(reg, v).await?;
     }
-    mask(io, base + 0xbc, 0xf0000000, ic & 15)?;
-    mask(io, base + 0xc0, 15, (ic >> 4) & 15)?;
-    io.write32(base + 0xcc, 0x0a11fb88)?;
-    io.write32(base + 0xd8, 0xe008ff81)?;
-    io.write32(base + 0xdc, 0x0003d208)?;
-    mask(io, base + 0xd8, 0xf0000000, qc & 15)?;
-    mask(io, base + 0xdc, 15, (qc >> 4) & 15)?;
-    io.write32(base + 0xb8, 0x60000000)?;
+    mask(io, base + 0xbc, 0xf0000000, ic & 15).await?;
+    mask(io, base + 0xc0, 15, (ic >> 4) & 15).await?;
+    io.write32(base + 0xcc, 0x0a11fb88).await?;
+    io.write32(base + 0xd8, 0xe008ff81).await?;
+    io.write32(base + 0xdc, 0x0003d208).await?;
+    mask(io, base + 0xd8, 0xf0000000, qc & 15).await?;
+    mask(io, base + 0xdc, 15, (qc >> 4) & 15).await?;
+    io.write32(base + 0xb8, 0x60000000).await?;
     io.delay_us(2000).await;
-    mask(io, base + 0xbc, 14, 6)?;
+    mask(io, base + 0xbc, 14, 6).await?;
     io.delay_us(2000).await;
-    io.write32(base + 0xb0, 0x0a11fb89)?;
-    io.write32(base + 0xcc, 0x0a11fb89)?;
+    io.write32(base + 0xb0, 0x0a11fb89).await?;
+    io.write32(base + 0xcc, 0x0a11fb89).await?;
     io.delay_us(1000).await;
-    io.write32(base + 0xb8, 0x62000000)?;
-    io.write32(base + 0xd4, 0x62000000)?;
+    io.write32(base + 0xb8, 0x62000000).await?;
+    io.write32(base + 0xd4, 0x62000000).await?;
     io.delay_us(20000).await;
     ready(io, result + 0x24, 0x07f80000, ic).await?;
     ready(io, result + 0x50, 0x07f80000, qc).await?;
-    io.write32(base + 0xb8, 0x02000000)?;
+    io.write32(base + 0xb8, 0x02000000).await?;
     io.delay_us(1000).await;
-    mask(io, base + 0xbc, 14, 3)?;
-    io.write32(0x9b4, 0xdb6db600)?;
+    mask(io, base + 0xbc, 14, 3).await?;
+    io.write32(0x9b4, 0xdb6db600).await?;
     io.write32(
         base + 0x68,
         u32::from((adc[0] + 16) & 0x3ff) | u32::from((adc[1] + 16) & 0x3ff) << 10,
-    )?;
-    io.write32(base + 0x10, 0x02d508c5)?;
-    io.write32(base + 0x60, 0xf0000000)?;
+    )
+    .await?;
+    io.write32(base + 0x10, 0x02d508c5).await?;
+    io.write32(base + 0x60, 0xf0000000).await?;
     Ok(sample(io).await?.map(|v| v.wrapping_sub(16) & 0x3ff))
 }
 pub(super) async fn calibrate(io: &mut impl Io) -> Result<Info, Error> {
     let mut backup = [0; 16];
     for (slot, reg) in backup.iter_mut().zip(BACKUP) {
-        *slot = read(io, reg)?;
+        *slot = read(io, reg).await?;
     }
     // Linux path*i+i aliases RF0x8f when DACK_RF==1. Retain both originals
     // independently; path-B's value must never overwrite path-A's backup.
-    let rf_backup = [rf_read(io, 0, 0x8f)?, rf_read(io, 1, 0x8f)?];
+    let rf_backup = [rf_read(io, 0, 0x8f).await?, rf_read(io, 1, 0x8f).await?];
     for (reg, bits, v) in [(0x1d58, 0xff8, 0x1ff), (0x1a00, 3, 2), (0x1a14, 0x300, 3)] {
-        mask(io, reg, bits, v)?;
+        mask(io, reg, bits, v).await?;
     }
-    io.write32(0x1d70, 0x7e7e7e7e)?;
-    mask(io, 0x180c, 3, 0)?;
-    mask(io, 0x410c, 3, 0)?;
-    io.write32(0x1b00, 8)?;
-    io.write8(0x1bcc, 0x3f)?;
-    io.write32(0x1b00, 10)?;
-    io.write8(0x1bcc, 0x3f)?;
-    mask(io, 0x1e24, 1 << 31, 0)?;
-    mask(io, 0x1e28, 15, 3)?;
+    io.write32(0x1d70, 0x7e7e7e7e).await?;
+    mask(io, 0x180c, 3, 0).await?;
+    mask(io, 0x410c, 3, 0).await?;
+    io.write32(0x1b00, 8).await?;
+    io.write8(0x1bcc, 0x3f).await?;
+    io.write32(0x1b00, 10).await?;
+    io.write8(0x1bcc, 0x3f).await?;
+    mask(io, 0x1e24, 1 << 31, 0).await?;
+    mask(io, 0x1e28, 15, 3).await?;
     let mut info = Info {
         adc: [0; 2],
         residual: [[0; 2]; 2],
@@ -320,18 +321,18 @@ pub(super) async fn calibrate(io: &mut impl Io) -> Result<Info, Error> {
             return Err(Error::Prerequisite);
         }
         let (base, _) = bases(path);
-        io.write32(base + 0x68, 0)?;
-        io.write32(base + 0x10, 0x02d508c4)?;
-        mask(io, base + 0xbc, 1, 0)?;
-        mask(io, base + 0x30, 1 << 30, 1)?;
+        io.write32(base + 0x68, 0).await?;
+        io.write32(base + 0x10, 0x02d508c4).await?;
+        mask(io, base + 0xbc, 1, 0).await?;
+        mask(io, base + 0x30, 1 << 30, 1).await?;
     }
-    io.write32(0x1b00, 8)?;
-    mask(io, 0x4130, 1 << 30, 1)?;
-    io.write8(0x1bcc, 0)?;
-    io.write32(0x1b00, 10)?;
-    io.write8(0x1bcc, 0)?;
+    io.write32(0x1b00, 8).await?;
+    mask(io, 0x4130, 1 << 30, 1).await?;
+    io.write8(0x1bcc, 0).await?;
+    io.write32(0x1b00, 10).await?;
+    io.write8(0x1bcc, 0).await?;
     for (reg, v) in BACKUP.into_iter().zip(backup) {
-        io.write32(reg, v)?;
+        io.write32(reg, v).await?;
     }
     for path in 0..2 {
         rf(io, path, 0x8f, 0xfffff, rf_backup[usize::from(path)]).await?;

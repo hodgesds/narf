@@ -21,18 +21,48 @@ pub fn dtim_period(beacon_body: &[u8]) -> u8 {
 /// Build a passive scan (including DFS channels without transmitting).
 /// Scanning SSIDs is a host-side filter for passive scans.
 pub fn passive(version: u8, uid: u32, channels: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let channels: Vec<_> = channels
+        .iter()
+        .map(|&number| {
+            super::native_band::Channel::legacy(number).ok_or("invalid legacy scan channel")
+        })
+        .collect::<Result<_, _>>()?;
+    passive_channels(version, uid, &channels)
+}
+
+pub(super) fn passive_channels(
+    version: u8,
+    uid: u32,
+    channels: &[super::native_band::Channel],
+) -> Result<Vec<u8>, &'static str> {
+    base_channels(version, uid, channels, false)
+}
+fn base_channels(
+    version: u8,
+    uid: u32,
+    channels: &[super::native_band::Channel],
+    periodic: bool,
+) -> Result<Vec<u8>, &'static str> {
     let capacity = match version {
         14..=17 => 67,
         18 => 68,
         _ => return Err("unsupported scan command version"),
     };
-    if channels.is_empty() || channels.len() > capacity || channels.contains(&0) {
+    if channels.is_empty() || channels.len() > capacity {
         return Err("invalid scan channels");
+    }
+    let six = channels[0].band == super::native_band::Band::Six;
+    if !periodic
+        && channels
+            .iter()
+            .any(|channel| (channel.band == super::native_band::Band::Six) != six)
+    {
+        return Err("6GHz requires its own native scan job");
     }
     // uid/ooc(8), general(36), channel(4+8*N), periodic(12),
     // probe(532+4+20*34+8*4+16*6). See fw/api/scan.h.
-    let periodic = 48 + capacity * 8;
-    let mut out = vec![0; periodic + 12 + 1344];
+    let periodic_at = 48 + capacity * 8;
+    let mut out = vec![0; periodic_at + 12 + 1344];
     put32(&mut out, 0, uid);
     put32(&mut out, 4, 6);
     put16(&mut out, 8, (1 << 1) | (1 << 11)); // PASS_ALL | FORCE_PASSIVE
@@ -40,23 +70,79 @@ pub fn passive(version: u8, uid: u32, channels: &[u8]) -> Result<Vec<u8>, &'stat
     put32(&mut out, 36, 6); // scan priority
     out[40..42].fill(110); // passive dwell per LMAC (TU)
     out[45] = channels.len() as u8;
+    if six && !periodic {
+        out[44] = 1 << 6;
+    } // 6G_PSC_NO_FILTER; no firmware SSID filter.
     for (i, &channel) in channels.iter().enumerate() {
         let start = 48 + i * 8;
         // Modern channel flags use PHY_BAND_24=1, PHY_BAND_5=0
         // (opposite the legacy scan v2 band's numbering).
-        let band = u8::from(channel <= 14);
+        let band = channel.band as u8;
+        let flags = if channel.band == super::native_band::Band::Six
+            && (periodic || channel.number % 16 != 5)
+        {
+            1 << 26
+        } else {
+            0
+        };
         if version < 17 {
             // SCAN_CHANNEL_CONFIG v2: band is the byte after channel.
             out[start + 5] = band;
+            put32(&mut out, start, flags);
         } else {
             // v5 moves band into flags and reuses that byte for PSD.
-            put32(&mut out, start, u32::from(band) << 30);
-            out[start + 5] = 127; // PSD reserved
+            put32(&mut out, start, (u32::from(band) << 30) | flags);
+            // RNR/scan unknown is -128; TPE's no-limit127 is a distinct
+            // namespace. Preserve ordinary legacy bytes.
+            out[start + 5] = if channel.band == super::native_band::Band::Six {
+                128
+            } else {
+                127
+            };
         }
-        out[start + 4] = channel;
+        out[start + 4] = channel.number;
         out[start + 6] = 1; // one iteration
     }
-    out[periodic + 2] = 1;
+    out[periodic_at + 2] = 1;
+    Ok(out)
+}
+
+/// Linux scheduled scans carry mixed typed bands but remove non-PSC6GHz
+/// channels and force every remaining6GHz channel passive. Only the actual
+/// legacy subset may own directed probe bits; no numeric6GHz alias is used.
+pub(super) fn periodic_channels(
+    version: u8,
+    uid: u32,
+    channels: &[super::native_band::Channel],
+    permitted: &[bool],
+    local: [u8; 6],
+    ssids: &[Vec<u8>],
+) -> Result<Vec<u8>, &'static str> {
+    if permitted.len() != channels.len() {
+        return Err("periodic native permissions differ from channels");
+    }
+    let mut out = base_channels(version, uid, channels, true)?;
+    let legacy: Vec<_> = channels
+        .iter()
+        .zip(permitted)
+        .filter(|(ch, _)| ch.band != super::native_band::Band::Six)
+        .collect();
+    if legacy.iter().any(|(_, allowed)| **allowed) {
+        let numbers: Vec<_> = legacy.iter().map(|(ch, _)| ch.number).collect();
+        let allowed: Vec<_> = legacy.iter().map(|(_, allowed)| **allowed).collect();
+        let probes = active(version, uid, &numbers, &allowed, local, ssids)?;
+        out[8..44].copy_from_slice(&probes[8..44]);
+        let at = 48 + if version == 18 { 68 * 8 } else { 67 * 8 } + 12;
+        out[at..].copy_from_slice(&probes[at..]);
+        let bitmap = (1u32 << ssids.len().max(1)) - 1;
+        for (i, (channel, &allowed)) in channels.iter().zip(permitted).enumerate() {
+            if allowed && channel.band != super::native_band::Band::Six {
+                let at = 48 + i * 8;
+                let flags = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+                put32(&mut out, at, flags | bitmap);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -126,7 +212,12 @@ pub fn active(
 pub struct Mpdu<'a> {
     pub frame: &'a [u8],
     pub channel: u8,
+    /// Copied mac_phy_band[7:6], independent of channel's numeric value.
+    pub(super) raw_band: u8,
+    /// Actual native MLD firmware link, independent of the AP spec id.
+    pub(super) raw_fw_link: u8,
     pub rssi: i8,
+    pub rate_n_flags: u32,
     pub status: u32,
     pub reorder: u32,
     padding: usize,
@@ -177,7 +268,10 @@ fn mpdu_layout(bytes: &[u8], prefix: usize, energy_offset: usize) -> Option<Mpdu
     Some(Mpdu {
         frame: &bytes[prefix..prefix + len],
         channel: bytes[energy_offset + 2],
+        raw_band: bytes[7] >> 6,
+        raw_fw_link: bytes[7] & 15,
         rssi: -(energy.min(127) as i8),
+        rate_n_flags: u32::from_le_bytes(bytes[energy_offset - 4..energy_offset].try_into().ok()?),
         status,
         reorder: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
         padding: if bytes[3] & 0x20 != 0 { 2 } else { 0 },
@@ -229,6 +323,12 @@ pub fn with_phy_capabilities(
             if let Some(vht) = caps.vht {
                 bytes.extend_from_slice(&[191, 12]);
                 bytes.extend_from_slice(&vht);
+            }
+            if local.he && (band == 2400 || local.vht) {
+                let he = super::sc_he::local(local, if band == 2400 { 1 } else { 36 })?
+                    .capability_body();
+                bytes.extend_from_slice(&[255, he.len() as u8]);
+                bytes.extend_from_slice(&he);
             }
         }
         segments.push((descriptor, bytes));

@@ -2,6 +2,7 @@
 //! Fixed awake channel1/20MHz CCK1, TX-A/RX-AB radio continuation.
 //! Linux rtw8822c.c: TRX selection, channel, factory trim and RF calibration.
 use super::{
+    band5::Width,
     efuse::Factory,
     firmware_transport::{Error, Io},
     power_policy,
@@ -23,24 +24,25 @@ pub(super) async fn prepare(
     gain: [u8; 2],
     gate: power_policy::Gate,
 ) -> Result<Info, Error> {
-    trx(io)?;
+    trx(io).await?;
     channel(io).await?;
-    gains(io, gain)?;
+    gains(io, gain).await?;
     let dack = super::dack::calibrate(io).await?;
     x2(io).await?;
     trims(io, factory).await?;
     // Fixed CCK1 operation disables the source low-rate DPD path entirely.
     // Unlike wideband GAPK/DPK, DACK and IQK run on the retained channel only.
     for path in 0..2 {
-        mask(io, 0x1b00, 6, path)?;
-        mask(io, 0x1b08, 1 << 31, 0)?;
+        mask(io, 0x1b00, 6, path).await?;
+        mask(io, 0x1b08, 1 << 31, 0).await?;
     }
-    mask(io, 0xa70, 0x3ff, 0x3ff)?;
+    mask(io, 0xa70, 0x3ff, 0x3ff).await?;
     let cck_gi = [
-        (((read(io, 0x1a98)? >> 6) & 3) << 4 | ((read(io, 0x1a70)? >> 24) & 15)) as u8,
-        ((((read(io, 0x1a98)? >> 14) & 3) << 4) | ((read(io, 0x1aa8)? >> 16) & 15)) as u8,
+        (((read(io, 0x1a98).await? >> 6) & 3) << 4 | ((read(io, 0x1a70).await? >> 24) & 15)) as u8,
+        ((((read(io, 0x1a98).await? >> 14) & 3) << 4) | ((read(io, 0x1aa8).await? >> 16) & 15))
+            as u8,
     ];
-    receive_policy(io)?;
+    receive_policy(io).await?;
     software_crypto(io).await?;
     awake(io).await?;
     io.begin_commands()?;
@@ -48,18 +50,18 @@ pub(super) async fn prepare(
     super::command::send(io, &super::command::phydm(phy, 1)?).await?;
     // RPT_CIP has no source host reset operation. Refuse a stale done value
     // before submission instead of manufacturing an acknowledgement.
-    let before = io.read8(0x2d9c)?;
+    let before = io.read8(0x2d9c).await?;
     if before == 255 {
         return Err(Error::Gone);
     }
     if before == 0xaa {
         return Err(Error::Prerequisite);
     }
-    rfk_power(io, true)?;
+    rfk_power(io, true).await?;
     super::command::send(io, &super::command::iqk(2)).await?;
     let mut complete = false;
     for attempt in 0..=15 {
-        let value = io.read8(0x2d9c)?;
+        let value = io.read8(0x2d9c).await?;
         if value == 255 {
             return Err(Error::Gone);
         }
@@ -74,16 +76,16 @@ pub(super) async fn prepare(
     if !complete {
         return Err(Error::Timeout);
     }
-    io.write8(0x1b10, 0)?;
-    rfk_power(io, false)?;
+    io.write8(0x1b10, 0).await?;
+    rfk_power(io, false).await?;
     // IQK must not silently reopen optional DPD or alter selected gains.
     for path in 0..2 {
-        mask(io, 0x1b00, 6, path)?;
-        mask(io, 0x1b08, 1 << 31, 0)?;
+        mask(io, 0x1b00, 6, path).await?;
+        mask(io, 0x1b08, 1 << 31, 0).await?;
     }
-    mask(io, 0xa70, 0x3ff, 0x3ff)?;
-    gains(io, gain)?;
-    verify(io, gain)?;
+    mask(io, 0xa70, 0x3ff, 0x3ff).await?;
+    gains(io, gain).await?;
+    verify(io, gain).await?;
     io.finish_radio(gate)?;
     Ok(Info {
         channel: 1,
@@ -93,15 +95,15 @@ pub(super) async fn prepare(
         cck_gi,
     })
 }
-pub(super) fn read(io: &mut impl Io, reg: u16) -> Result<u32, Error> {
-    let value = io.read32(reg)?;
+pub(super) async fn read(io: &mut impl Io, reg: u16) -> Result<u32, Error> {
+    let value = io.read32(reg).await?;
     if value == u32::MAX {
         Err(Error::Gone)
     } else {
         Ok(value)
     }
 }
-pub(super) fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
+pub(super) async fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
     if bits == 0
         || value
             .checked_shl(bits.trailing_zeros())
@@ -109,16 +111,17 @@ pub(super) fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<
     {
         return Err(Error::Unsupported);
     }
-    let old = read(io, reg)?;
+    let old = read(io, reg).await?;
     io.write32(reg, old & !bits | value << bits.trailing_zeros())
+        .await
 }
-pub(super) fn rf_read(io: &mut impl Io, path: u8, address: u8) -> Result<u32, Error> {
+pub(super) async fn rf_read(io: &mut impl Io, path: u8, address: u8) -> Result<u32, Error> {
     let base = match path {
         0 => 0x3c00,
         1 => 0x4c00,
         _ => return Err(Error::Unsupported),
     };
-    Ok(read(io, base + u16::from(address) * 4)? & 0xfffff)
+    Ok(read(io, base + u16::from(address) * 4).await? & 0xfffff)
 }
 pub(super) async fn rf(
     io: &mut impl Io,
@@ -140,9 +143,10 @@ pub(super) async fn rf(
         let data = if bits == 0xfffff {
             value
         } else {
-            rf_read(io, path, 0)? & !bits | shifted
+            rf_read(io, path, 0).await? & !bits | shifted
         };
-        io.write32(if path == 0 { 0x1808 } else { 0x4108 }, data)?;
+        io.write32(if path == 0 { 0x1808 } else { 0x4108 }, data)
+            .await?;
         io.delay_us(13).await;
     } else {
         mask(
@@ -150,33 +154,39 @@ pub(super) async fn rf(
             (if path == 0 { 0x3c00 } else { 0x4c00 }) + u16::from(address) * 4,
             bits,
             value,
-        )?;
+        )
+        .await?;
         io.delay_us(1).await;
     }
     Ok(())
 }
-fn reset(io: &mut impl Io) -> Result<(), Error> {
-    let old = io.read16(2)?;
+async fn reset(io: &mut impl Io) -> Result<(), Error> {
+    let old = io.read16(2).await?;
     if old == u16::MAX {
         return Err(Error::Gone);
     }
     for value in [old | 1, old & !1, old | 1] {
-        io.write16(2, value)?;
+        io.write16(2, value).await?;
     }
     Ok(())
 }
-fn toggle_igi(io: &mut impl Io) -> Result<(), Error> {
-    let igi = read(io, 0x1d70)? & 0x7f;
+/// `rtw8822c_bb_reset`: `BIT_FEN_BB_RSTB` set, clear, set.
+pub(super) async fn bb_reset(io: &mut impl Io) -> Result<(), Error> {
+    reset(io).await
+}
+/// `rtw8822c_toggle_igi`.
+pub(super) async fn toggle_igi(io: &mut impl Io) -> Result<(), Error> {
+    let igi = read(io, 0x1d70).await? & 0x7f;
     let lower = igi.checked_sub(2).ok_or(Error::Prerequisite)?;
     for value in [lower, igi] {
-        mask(io, 0x1d70, 0x7f, value)?;
-        mask(io, 0x1d70, 0x7f00, value)?;
+        mask(io, 0x1d70, 0x7f, value).await?;
+        mask(io, 0x1d70, 0x7f00, value).await?;
     }
     Ok(())
 }
-pub(super) fn trx(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn trx(io: &mut impl Io) -> Result<(), Error> {
     for reg in [0x1800, 0x4100] {
-        mask(io, reg, 0xfffff, 0x33312)?;
+        mask(io, reg, 0xfffff, 0x33312).await?;
     }
     // Source config_rx_path(AB), config_tx_path(A,A,A,false).
     for (reg, bits, value) in [
@@ -192,27 +202,186 @@ pub(super) fn trx(io: &mut impl Io) -> Result<(), Error> {
         (0x824, 0x000f0000, 3),
         (0x1a04, 0xf0000000, 8),
     ] {
-        mask(io, reg, bits, value)?;
+        mask(io, reg, bits, value).await?;
     }
-    reset(io)?;
-    mask(io, 0x820, 0xff, 0x11)?;
-    mask(io, 0x1e2c, 0xff, 0)?;
-    reset(io)?;
-    reset(io)?;
-    toggle_igi(io)
+    reset(io).await?;
+    mask(io, 0x820, 0xff, 0x11).await?;
+    mask(io, 0x1e2c, 0xff, 0).await?;
+    reset(io).await?;
+    reset(io).await?;
+    toggle_igi(io).await
 }
 pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
+    channel_to(io, 1).await
+}
+/// Linux `rtw8822c_set_channel` for one 2.4GHz/20MHz primary: `_bb`
+/// (SCOTRK/TXDFIR per channel, channel14 never admitted), `rtw_set_channel_mac`,
+/// `_rf` (RF18 channel byte) and `rtw8822c_toggle_igi`.
+pub(super) async fn channel_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    if !(1..=13).contains(&ch) {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, ch, Width::Twenty).await
+}
+/// `rtw8822c_set_channel(center, RTW_CHANNEL_WIDTH_40, sc)` on 2.4GHz:
+/// `sc` is `RTW_SC_20_UPPER` (1) or `RTW_SC_20_LOWER` (2).
+pub(super) async fn width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), Error> {
+    if !(3..=11).contains(&center) || !matches!(sc, 1 | 2) {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, center, Width::Forty(sc)).await
+}
+/// Linux `rtw8822c_set_channel(ch, RTW_CHANNEL_WIDTH_20, 0)` on a 5GHz
+/// primary: `_bb` 5GHz branch ([`BB_5G`]: CCK TX/RX checks on, RX IQ
+/// weight, TXF4 bit20 clear, CCAMSK 0x22, TXDFIR0 3, OFDM RXAGC and SCOTRK
+/// per band/channel), the BW20 tail, `rtw_set_channel_mac`, `_rf` (RF18 5GHz
+/// band bits16|8, RFSI bit17 on 100..=144 / bit18 on 149..=177) and
+/// `rtw8822c_toggle_igi`. A later 2.4GHz [`channel_to`] rewrites every
+/// field this branch changes.
+pub(super) async fn channel5_to(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    if !super::band5::primary(ch) {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, ch, Width::Twenty).await
+}
+/// `rtw8822c_set_channel(center, BW40|BW80, sc)` on 5GHz: the 5GHz `_bb`
+/// head of the *center* channel (OFDM RXAGC by band, SCOTRK of the center),
+/// the BW40 tail (CCKSB, TXBWCTL 5/sc, NBI on, SBD 1, PT_OPT 1) or BW80
+/// tail (TXBWCTL 0xa/sc, SBD 6, PT_OPT 1; CCKSB, NBI, DFIRBW and TXCLK
+/// untouched as in Linux), `rtw_set_channel_mac` (DATA_SC with TXSC_40M at
+/// 80MHz, RFMOD 40/80), `_rf` (RF18 BW40 bit13 / BW80 bit12 on the center,
+/// RXBB 0x10 / 0x8) and `rtw8822c_toggle_igi`. `center` must be the
+/// center of a 5GHz 40MHz pair ([`super::band5::center40`]) or 80MHz block
+/// ([`super::band5::center80`]).
+pub(super) async fn wide5_to(io: &mut impl Io, center: u8, width: Width) -> Result<(), Error> {
+    let ok = match width {
+        Width::Forty(_) => super::band5::is_center40(center),
+        Width::Eighty(_) => super::band5::is_center80(center),
+        Width::Twenty => false,
+    };
+    if !ok || !width.valid() {
+        return Err(Error::Unsupported);
+    }
+    set_channel(io, center, width).await
+}
+/// `rtw8822c_set_channel_bb` 5GHz head: (reg, mask, value).
+fn bb_5g(ch: u8) -> Option<[(u16, u32, u32); 9]> {
+    let ofdm = super::band5::rxagc_ofdm8822c(ch)?;
+    let scotrk = super::band5::scotrk8822c(ch)?;
+    Some([
+        (0x1a80, 1 << 18, 1),
+        (0x454, 1 << 7, 1),
+        (0x1a14, 0x300, 3),
+        (0x1a9c, 1 << 20, 0),
+        (0x1c80, 0x3f000000, 0x22),
+        (0x808, 0x70, 3),
+        (0x18ac, 0x1f0, ofdm),
+        (0x41ac, 0x1f0, ofdm),
+        (0xc30, 0xfff, scotrk),
+    ])
+}
+/// Readback of [`channel5_to`] plus the RRSR and IGI-independent fields.
+pub(super) async fn verify_channel5(io: &mut impl Io, ch: u8) -> Result<(), Error> {
+    let bb = bb_5g(ch).ok_or(Error::Unsupported)?;
+    for path in 0..2u8 {
+        if rf_read(io, path, 0x18).await? & 0x733ff != rf18_8822c(ch, 20) {
+            return Err(Error::Prerequisite);
+        }
+    }
+    for (reg, bits, value) in bb {
+        if read(io, reg).await? & bits != value << bits.trailing_zeros() {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x9b0).await? & 0xffcf != 0
+        || io.read8(0x483).await? != 0
+        || read(io, 0x668).await? & 0x180 != 0
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// Readback of [`wide5_to`]: RF18 of both paths, the center's 5GHz head,
+/// the width tail fields Linux writes and the MAC sideband/RFMOD.
+pub(super) async fn verify_wide5(io: &mut impl Io, center: u8, width: Width) -> Result<(), Error> {
+    let bb = bb_5g(center).ok_or(Error::Unsupported)?;
+    for path in 0..2u8 {
+        if rf_read(io, path, 0x18).await? & 0x733ff != rf18_8822c(center, width.mhz()) {
+            return Err(Error::Prerequisite);
+        }
+    }
+    for (reg, bits, value) in bb {
+        if read(io, reg).await? & bits != value << bits.trailing_zeros() {
+            return Err(Error::Prerequisite);
+        }
+    }
+    let sc = u32::from(width.sc());
+    let (txbw, sbd) = match width {
+        Width::Forty(_) => (5, 1),
+        Width::Eighty(_) => (0xa, 6),
+        Width::Twenty => return Err(Error::Unsupported),
+    };
+    if read(io, 0x9b0).await? & 0xffcf != txbw | (sc | sc << 4) << 8
+        || (read(io, 0x88c).await? >> 12) & 15 != sbd
+        || read(io, 0xcbc).await? & (1 << 21) == 0
+        || matches!(width, Width::Forty(_))
+            && ((read(io, 0x1a00).await? >> 4) & 1 != u32::from(sc == 1)
+                || read(io, 0x1abc).await? & (1 << 30) == 0)
+        || io.read8(0x483).await? != width.data_sc()
+        || (read(io, 0x668).await? >> 7) & 3 != width.rfmod()
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// RF18 bits under mask 0x733ff that Linux `rtw8822c_set_channel_rf`
+/// programs: band (5GHz bits16|8), channel byte, RFSI (`IS_CH_5G_BAND_3`
+/// bit17, `_4` bit18) and BW (20MHz bits13:12 = 3, 40MHz bit13, 80MHz
+/// bit12).
+pub(super) const fn rf18_8822c(ch: u8, bw_mhz: u8) -> u32 {
+    let band = if ch <= 14 { 0 } else { 1 << 16 | 1 << 8 };
+    let rfsi = match super::band5::band(ch) {
+        Some(4) => 1 << 18,
+        Some(3) => 1 << 17,
+        _ => 0,
+    };
+    let bw = match bw_mhz {
+        40 => 2 << 12,
+        80 => 1 << 12,
+        _ => 3 << 12,
+    };
+    band | rfsi | bw | ch as u32
+}
+async fn set_channel(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
+    if let Some(bb) = bb_5g(ch) {
+        for (reg, bits, value) in bb {
+            mask(io, reg, bits, value).await?;
+        }
+    } else {
+        if matches!(width, Width::Eighty(_)) {
+            return Err(Error::Unsupported);
+        }
+        bb_2g(io, ch, width != Width::Twenty).await?;
+    }
+    set_channel_tail(io, ch, width).await
+}
+async fn bb_2g(io: &mut impl Io, ch: u8, wide: bool) -> Result<(), Error> {
+    if !(1..=13).contains(&ch) {
+        return Err(Error::Unsupported);
+    }
+    // rtw8822c_set_channel_bb 2.4GHz: RXAGC CCK/OFDM 5/6 at BW20, 4/0 at BW40.
+    let (cck, ofdm) = if wide { (4, 0) } else { (5, 6) };
     for (reg, bits, value) in [
         (0x1a14, 0x300, 0),
         (0x1a9c, 1 << 20, 1),
         (0x454, 1 << 7, 0),
         (0x1a80, 1 << 18, 0),
         (0x1c80, 0x3f000000, 15),
-        (0x18ac, 0xf000, 5),
-        (0x41ac, 0xf000, 5),
-        (0x18ac, 0x1f0, 6),
-        (0x41ac, 0x1f0, 6),
-        (0xc30, 0xfff, 0x9aa),
+        (0x18ac, 0xf000, cck),
+        (0x41ac, 0xf000, cck),
+        (0x18ac, 0x1f0, ofdm),
+        (0x41ac, 0x1f0, ofdm),
+        (0xc30, 0xfff, super::channel_policy::scotrk(ch)),
         (0x1a20, 0xffff0000, 0x5284),
         (0x1a24, u32::MAX, 0x3e18fec8),
         (0x1a28, 0xffff, 0x0a88),
@@ -221,46 +390,124 @@ pub(super) async fn channel(io: &mut impl Io) -> Result<(), Error> {
         (0x1aa0, u32::MAX, 0x00faf0de),
         (0x1aac, u32::MAX, 0x00122344),
         (0x1ab0, u32::MAX, 0x0fffffff),
-        (0x808, 0x70, 1),
-        (0x810, 0x3ff0, 0x19b),
-        (0x9b0, 15, 0),
-        (0x9b0, 0xffc0, 0),
-        (0x9b4, 0x700, 7),
-        (0x9b4, 0x700000, 6),
-        (0x1abc, 1 << 30, 0),
-        (0x88c, 0xf000, 1),
-        (0xcbc, 1 << 21, 0),
+        (0x808, 0x70, super::channel_policy::txdfir(ch)),
     ] {
-        mask(io, reg, bits, value)?;
+        mask(io, reg, bits, value).await?;
     }
-    io.write8(0x483, 0)?;
-    mask(io, 0x668, 0x180, 0)?;
-    mask(io, 0x24, 3 << 20, 0)?;
-    io.write8(0x55c, 80)?;
-    io.write8(0x638, 80)?;
-    let check = io.read8(0x454)?;
+    Ok(())
+}
+async fn set_channel_tail(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
+    match width {
+        Width::Twenty => {
+            for (reg, bits, value) in [
+                (0x810, 0x3ff0, 0x19b),
+                (0x9b0, 15, 0),
+                (0x9b0, 0xffc0, 0),
+                (0x9b4, 0x700, 7),
+                (0x9b4, 0x700000, 6),
+                (0x1abc, 1 << 30, 0),
+                (0x88c, 0xf000, 1),
+                (0xcbc, 1 << 21, 0),
+            ] {
+                mask(io, reg, bits, value).await?;
+            }
+        }
+        Width::Eighty(sc) => {
+            let sc = u32::from(sc);
+            for (reg, bits, value) in [
+                (0x9b0, 15, 0xa),
+                (0x9b0, 0xc0, 0),
+                (0x9b0, 0xff00, sc | sc << 4),
+                (0x88c, 0xf000, 6),
+                (0xcbc, 1 << 21, 1),
+            ] {
+                mask(io, reg, bits, value).await?;
+            }
+        }
+        Width::Forty(sc) => {
+            let sc = u32::from(sc);
+            for (reg, bits, value) in [
+                (0x1a00, 1 << 4, u32::from(sc == 1)),
+                (0x9b0, 15, 5),
+                (0x9b0, 0xc0, 0),
+                (0x9b0, 0xff00, sc | sc << 4),
+                (0x1abc, 1 << 30, 1),
+                (0x88c, 0xf000, 1),
+                (0xcbc, 1 << 21, 1),
+            ] {
+                mask(io, reg, bits, value).await?;
+            }
+        }
+    }
+    // rtw_set_channel_mac: DATA_SC txsc20 (txsc40 only at 80MHz), RFMOD.
+    io.write8(0x483, width.data_sc()).await?;
+    mask(io, 0x668, 0x180, width.rfmod()).await?;
+    mask(io, 0x24, 3 << 20, 0).await?;
+    io.write8(0x55c, 80).await?;
+    io.write8(0x638, 80).await?;
+    let check = io.read8(0x454).await?;
     if check == 255 {
         return Err(Error::Gone);
     }
-    io.write8(0x454, check & !(1 << 7))?;
-    let reg18 = (rf_read(io, 0, 0x18)?
+    // BIT_CHECK_CCK_EN is set only on a 5GHz channel (`IS_CH_5G_BAND`).
+    let cck_check = u8::from(super::band5::band(ch).is_some()) << 7;
+    io.write8(0x454, (check & !(1 << 7)) | cck_check).await?;
+    // rtw8822c_set_channel_rf: RF18 BW 20M=bits13:12 3, 40M=bit13; RXBB.
+    // RF18 BW 80M=bit12, RXBB 0x8.
+    let (bw, rxbb) = match width {
+        Width::Twenty => (20, 0x18),
+        Width::Forty(_) => (40, 0x10),
+        Width::Eighty(_) => (80, 0x8),
+    };
+    let reg18 = (rf_read(io, 0, 0x18).await?
         & !((1 << 16) | (1 << 9) | (1 << 8) | 255 | (3 << 17) | (3 << 12)))
-        | 1
-        | 3 << 12;
-    mask(io, 0x1c90, 1 << 8, 0)?;
+        | rf18_8822c(ch, bw);
+    mask(io, 0x1c90, 1 << 8, 0).await?;
     for path in 0..2 {
         rf(io, path, 0xee, 4, 1).await?;
         rf(io, path, 0x33, 31, 0x12).await?;
-        rf(io, path, 0x3f, 0xfffff, 0x18).await?;
+        rf(io, path, 0x3f, 0xfffff, rxbb).await?;
         rf(io, path, 0xee, 4, 0).await?;
     }
     for path in 0..2 {
         rf(io, path, 0x18, 0xfffff, reg18).await?;
     }
-    mask(io, 0x1c90, 1 << 8, 1)?;
-    mask(io, 0x1830, 1 << 29, 1)?;
-    mask(io, 0x4130, 1 << 29, 1)?;
-    toggle_igi(io)
+    mask(io, 0x1c90, 1 << 8, 1).await?;
+    mask(io, 0x1830, 1 << 29, 1).await?;
+    mask(io, 0x4130, 1 << 29, 1).await?;
+    toggle_igi(io).await
+}
+/// Readback of [`width40`] plus the per-path CCK references.
+pub(super) async fn verify_width40(
+    io: &mut impl Io,
+    center: u8,
+    sc: u8,
+    gains: [u8; 2],
+) -> Result<(), Error> {
+    for (path, gain) in gains.into_iter().enumerate() {
+        if rf_read(io, path as u8, 0x18).await? & 0x733ff != 0x2000 | u32::from(center)
+            || (read(io, if path == 0 { 0x18a0 } else { 0x41a0 }).await? >> 16) & 127
+                != u32::from(gain)
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    let sc = u32::from(sc);
+    if read(io, 0xc30).await? & 0xfff != super::channel_policy::scotrk(center)
+        || (read(io, 0x808).await? >> 4) & 7 != super::channel_policy::txdfir(center)
+        || read(io, 0x9b0).await? & 0xffcf != 5 | (sc | sc << 4) << 8
+        || (read(io, 0x1a00).await? >> 4) & 1 != u32::from(sc == 1)
+        || read(io, 0x1abc).await? & (1 << 30) == 0
+        || read(io, 0xcbc).await? & (1 << 21) == 0
+        || u32::from(io.read8(0x483).await?) != sc
+        || read(io, 0x668).await? & 0x180 != 0x80
+        || read(io, 0x18ac).await? & 0xf1f0 != 0x4000
+        || read(io, 0x41ac).await? & 0xf1f0 != 0x4000
+        || read(io, 0x440).await? != 0x1f
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
 }
 pub(super) async fn trims(io: &mut impl Io, factory: &Factory) -> Result<(), Error> {
     let t = factory.trims();
@@ -308,7 +555,7 @@ pub(super) async fn trims(io: &mut impl Io, factory: &Factory) -> Result<(), Err
             rf(io, path, 0xee, 1 << 19, 0).await?;
         }
     }
-    mask(io, 0xa70, 0x3ff, 0x3ff)?;
+    mask(io, 0xa70, 0x3ff, 0x3ff).await?;
     for (path, raw) in t[15..17].iter().copied().enumerate() {
         if raw == 255 {
             return Ok(());
@@ -321,35 +568,92 @@ pub(super) async fn trims(io: &mut impl Io, factory: &Factory) -> Result<(), Err
     }
     Ok(())
 }
-pub(super) fn gains(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
+pub(super) async fn gains(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
     for (path, gain) in gains.into_iter().enumerate() {
-        mask(io, 0x1c90, 1 << 15, 0)?;
+        mask(io, 0x1c90, 1 << 15, 0).await?;
         mask(
             io,
             if path == 0 { 0x18a0 } else { 0x41a0 },
             0x7f0000,
             u32::from(gain),
-        )?;
+        )
+        .await?;
     }
     for path in 0..2 {
         // No OFDM/HT/VHT descriptor is admitted by this profile. Zero their
         // reference, and use zero relative difference for the four CCK slots.
-        mask(io, 0x1c90, 1 << 15, 0)?;
-        mask(io, if path == 0 { 0x18e8 } else { 0x41e8 }, 0x1fc00, 0)?;
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(io, if path == 0 { 0x18e8 } else { 0x41e8 }, 0x1fc00, 0).await?;
     }
     for reg in [0x3a00, 0x3a04, 0x3a08] {
-        mask(io, 0x1c90, 1 << 15, 0)?;
-        io.write32(reg, 0)?;
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        io.write32(reg, 0).await?;
     }
     // Original phy_get_rrsr_mask(DESC_RATE1M) &RRSR_INIT_2G. This admits
     // mandatory CCK/OFDM control responses; their full RF envelope is measured
     // separately in N22Cv2. Host RX rejection cannot suppress hardware ACKs.
-    io.write32(0x440, 0x1f)
+    io.write32(0x440, 0x1f).await
 }
-pub(super) fn rfk_power(io: &mut impl Io, active: bool) -> Result<(), Error> {
+/// 5GHz counterpart of [`gains`] for one N2xO record
+/// (`rtw8822c_set_write_tx_power_ref` + `rtw8822c_set_tx_power_diff`): CCK
+/// references zero (`rtw_phy_set_tx_power_level_by_path` skips CCK on
+/// 5GHz), per-path OFDM references, CCK differences zero, the two OFDM
+/// difference words, and `RRSR_INIT_5G & phy_get_rrsr_mask(DESC_RATE6M)`
+/// = 0x10 (OFDM6 response only).
+pub(super) async fn ofdm5(io: &mut impl Io, ofdm: [u8; 2], diffs: [u32; 2]) -> Result<(), Error> {
     for path in 0..2 {
-        mask(io, 0x1b00, 6, path)?;
-        mask(io, 0x1b08, 1 << 7, u32::from(active))?;
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(io, if path == 0 { 0x18a0 } else { 0x41a0 }, 0x7f0000, 0).await?;
+    }
+    for (path, reference) in ofdm.into_iter().enumerate() {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(
+            io,
+            if path == 0 { 0x18e8 } else { 0x41e8 },
+            0x1fc00,
+            u32::from(reference),
+        )
+        .await?;
+    }
+    for (reg, value) in [(0x3a00, 0), (0x3a04, diffs[0]), (0x3a08, diffs[1])] {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        io.write32(reg, value).await?;
+    }
+    io.write32(0x440, RRSR_OFDM6_5G).await
+}
+/// `RRSR_INIT_5G` (0x150) masked to the OFDM6 response order.
+pub(super) const RRSR_OFDM6_5G: u32 = 0x150 & 0x1f;
+/// Readback of [`ofdm5`].
+pub(super) async fn verify_ofdm5(
+    io: &mut impl Io,
+    ofdm: [u8; 2],
+    diffs: [u32; 2],
+) -> Result<(), Error> {
+    for (path, reference) in ofdm.into_iter().enumerate() {
+        let (cck, ofdm) = if path == 0 {
+            (0x18a0, 0x18e8)
+        } else {
+            (0x41a0, 0x41e8)
+        };
+        if read(io, cck).await? & 0x7f0000 != 0
+            || read(io, ofdm).await? & 0x1fc00 != u32::from(reference) << 10
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x3a00).await? != 0
+        || read(io, 0x3a04).await? != diffs[0]
+        || read(io, 0x3a08).await? != diffs[1]
+        || read(io, 0x440).await? != RRSR_OFDM6_5G
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+pub(super) async fn rfk_power(io: &mut impl Io, active: bool) -> Result<(), Error> {
+    for path in 0..2 {
+        mask(io, 0x1b00, 6, path).await?;
+        mask(io, 0x1b08, 1 << 7, u32::from(active)).await?;
     }
     Ok(())
 }
@@ -364,12 +668,12 @@ pub(super) struct Checked<'a, I, F> {
 }
 pub(super) async fn x2(io: &mut impl Io) -> Result<(), Error> {
     io.delay_us(1000).await;
-    if rf_read(io, 0, 0xb8)? & (1 << 15) != 0 {
+    if rf_read(io, 0, 0xb8).await? & (1 << 15) != 0 {
         for (reg, value) in [(0xb8, 0xc4440), (0xba, 0x6840d), (0xb8, 0x80440)] {
             rf(io, 0, reg, 0xfffff, value).await?;
         }
         io.delay_us(1000).await;
-        if rf_read(io, 0, 0xb8)? & (1 << 15) != 0 {
+        if rf_read(io, 0, 0xb8).await? & (1 << 15) != 0 {
             return Err(Error::Prerequisite);
         }
     }
@@ -381,7 +685,7 @@ pub(super) async fn software_crypto(io: &mut impl Io) -> Result<(), Error> {
     for index in 0..32 {
         let mut done = false;
         for _ in 0..1000 {
-            if read(io, 0x670)? & (1 << 31) == 0 {
+            if read(io, 0x670).await? & (1 << 31) == 0 {
                 done = true;
                 break;
             }
@@ -390,12 +694,12 @@ pub(super) async fn software_crypto(io: &mut impl Io) -> Result<(), Error> {
         if !done {
             return Err(Error::Timeout);
         }
-        io.write32(0x674, 0)?;
-        io.write32(0x670, 1 << 31 | 1 << 16 | index << 3)?;
+        io.write32(0x674, 0).await?;
+        io.write32(0x670, 1 << 31 | 1 << 16 | index << 3).await?;
     }
     let mut done = false;
     for _ in 0..1000 {
-        if read(io, 0x670)? & (1 << 31) == 0 {
+        if read(io, 0x670).await? & (1 << 31) == 0 {
             done = true;
             break;
         }
@@ -404,19 +708,19 @@ pub(super) async fn software_crypto(io: &mut impl Io) -> Result<(), Error> {
     if !done {
         return Err(Error::Timeout);
     }
-    let cr = io.read16(0x100)?;
+    let cr = io.read16(0x100).await?;
     if cr == u16::MAX {
         return Err(Error::Gone);
     }
-    io.write16(0x100, cr & !(1 << 9))?;
-    let security = io.read16(0x680)?;
+    io.write16(0x100, cr & !(1 << 9)).await?;
+    let security = io.read16(0x680).await?;
     if security == u16::MAX {
         return Err(Error::Gone);
     }
-    io.write16(0x680, security & !0xcf)?;
+    io.write16(0x680, security & !0xcf).await?;
     // Native MPDU with PHY status+FCS; no TCP offload/header conversion,
     // ICV/MIC stripping or BSSID filtering before host association admission.
-    let rcr = read(io, 0x608)?;
+    let rcr = read(io, 0x608).await?;
     let clear = (1 << 30)
         | (1 << 29)
         | (1 << 25)
@@ -428,22 +732,23 @@ pub(super) async fn software_crypto(io: &mut impl Io) -> Result<(), Error> {
         | (1 << 8)
         | (1 << 7)
         | (1 << 6);
-    io.write32(0x608, (rcr & !clear) | 1 << 31 | 1 << 28 | 1 << 10 | 15)?;
-    if io.read16(0x680)? & 0xcf != 0 || io.read16(0x100)? & (1 << 9) != 0 {
+    io.write32(0x608, (rcr & !clear) | 1 << 31 | 1 << 28 | 1 << 10 | 15)
+        .await?;
+    if io.read16(0x680).await? & 0xcf != 0 || io.read16(0x100).await? & (1 << 9) != 0 {
         return Err(Error::Prerequisite);
     }
     Ok(())
 }
 pub(super) async fn awake(io: &mut impl Io) -> Result<(), Error> {
-    let request = io.read8(0x3d9)?;
-    let confirm = io.read8(0x3da)?;
+    let request = io.read8(0x3d9).await?;
+    let confirm = io.read8(0x3da).await?;
     if request == 255 || confirm == 255 {
         return Err(Error::Gone);
     }
-    io.write8(0x3d9, (!request & 0x80) | 0x40)?;
+    io.write8(0x3d9, (!request & 0x80) | 0x40).await?;
     for _ in 0..150 {
         io.delay_us(100).await;
-        let value = io.read8(0x3da)?;
+        let value = io.read8(0x3da).await?;
         if value == 255 {
             return Err(Error::Gone);
         }
@@ -469,26 +774,50 @@ unsafe impl<I: Io, F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error
     fn claim_pristine(&mut self) -> Result<(), Error> {
         Err(Error::State)
     }
-    fn read8(&mut self, r: u16) -> Result<u8, Error> {
-        self.io.read8(r)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read8(&mut self, r: u16) -> impl core::future::Future<Output = Result<u8, Error>> + Send {
+        async move { self.io.read8(r).await }
     }
-    fn read16(&mut self, r: u16) -> Result<u16, Error> {
-        self.io.read16(r)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read16(&mut self, r: u16) -> impl core::future::Future<Output = Result<u16, Error>> + Send {
+        async move { self.io.read16(r).await }
     }
-    fn read32(&mut self, r: u16) -> Result<u32, Error> {
-        self.io.read32(r)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn read32(&mut self, r: u16) -> impl core::future::Future<Output = Result<u32, Error>> + Send {
+        async move { self.io.read32(r).await }
     }
-    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
-        self.check()?;
-        self.io.write8(r, v)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write8(
+        &mut self,
+        r: u16,
+        v: u8,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.check()?;
+            self.io.write8(r, v).await
+        }
     }
-    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
-        self.check()?;
-        self.io.write16(r, v)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write16(
+        &mut self,
+        r: u16,
+        v: u16,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.check()?;
+            self.io.write16(r, v).await
+        }
     }
-    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
-        self.check()?;
-        self.io.write32(r, v)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn write32(
+        &mut self,
+        r: u16,
+        v: u32,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.check()?;
+            self.io.write32(r, v).await
+        }
     }
     async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
         Err(Error::State)
@@ -506,11 +835,17 @@ unsafe impl<I: Io, F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error
         self.check()?;
         self.io.begin_commands()
     }
-    fn submit_h2c(&mut self, p: &[u8; 32]) -> Result<(), Error> {
-        self.check()?;
-        self.io.submit_h2c(p)
+    #[allow(clippy::manual_async_fn)] // `#[async_trait]` impl: an `async fn` here would be boxed
+    fn submit_h2c(
+        &mut self,
+        p: &[u8; 32],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send {
+        async move {
+            self.check()?;
+            self.io.submit_h2c(p).await
+        }
     }
-    fn poll_h2c(&mut self) -> Result<bool, Error> {
+    fn poll_h2c(&mut self) -> impl core::future::Future<Output = Result<bool, Error>> + Send {
         self.io.poll_h2c()
     }
     fn finish_radio(&mut self, gate: power_policy::Gate) -> Result<(), Error> {
@@ -522,42 +857,42 @@ unsafe impl<I: Io, F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error
     }
 }
 
-pub(super) fn receive_policy(io: &mut impl Io) -> Result<(), Error> {
+pub(super) async fn receive_policy(io: &mut impl Io) -> Result<(), Error> {
     // Source phy_init starts EDCCA at a disabled sentinel and its watchdog
     // later programs a real threshold. Keep the source maximum-coverage IGI
     // and the stricter adaptive40/33 threshold at that IGI; no disabled
     // sentinel or missing watchdog may leave unbounded energy detection.
-    mask(io, 0x1d70, 0x7f, 0x1c)?;
-    mask(io, 0x1d70, 0x7f00, 0x1c)?;
-    mask(io, 0x84c, 0x00ff0000, 40 + 0x80)?;
-    mask(io, 0x84c, 0xff000000, 33 + 0x80)?;
-    mask(io, 0x520, 1 << 15, 0)?;
-    mask(io, 0x524, 1 << 11, 1)?;
-    mask(io, 0x844, 3 << 29, 0)?;
+    mask(io, 0x1d70, 0x7f, 0x1c).await?;
+    mask(io, 0x1d70, 0x7f00, 0x1c).await?;
+    mask(io, 0x84c, 0x00ff0000, 40 + 0x80).await?;
+    mask(io, 0x84c, 0xff000000, 33 + 0x80).await?;
+    mask(io, 0x520, 1 << 15, 0).await?;
+    mask(io, 0x524, 1 << 11, 1).await?;
+    mask(io, 0x844, 3 << 29, 0).await?;
     Ok(())
 }
 
-fn verify(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
+async fn verify(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
     for (path, gain) in gains.into_iter().enumerate() {
-        if (read(io, if path == 0 { 0x18a0 } else { 0x41a0 })? >> 16) & 127 != u32::from(gain)
-            || read(io, if path == 0 { 0x18e8 } else { 0x41e8 })? & 0x1fc00 != 0
-            || rf_read(io, path as u8, 0x18)? & 0x733ff != 0x3001
+        if (read(io, if path == 0 { 0x18a0 } else { 0x41a0 }).await? >> 16) & 127 != u32::from(gain)
+            || read(io, if path == 0 { 0x18e8 } else { 0x41e8 }).await? & 0x1fc00 != 0
+            || rf_read(io, path as u8, 0x18).await? & 0x733ff != 0x3001
         {
             return Err(Error::Prerequisite);
         }
     }
     for reg in [0x3a00, 0x3a04, 0x3a08] {
-        if read(io, reg)? & 0x7f7f7f7f != 0 {
+        if read(io, reg).await? & 0x7f7f7f7f != 0 {
             return Err(Error::Prerequisite);
         }
     }
-    if read(io, 0x440)? != 0x1f
-        || read(io, 0x1a04)? & 0xff000000 != 0x81000000
-        || read(io, 0x820)? & 255 != 0x11
-        || read(io, 0x1d70)? & 0x7f7f != 0x1c1c
-        || read(io, 0x84c)? & 0xffff0000 != (168 << 16 | 161 << 24)
-        || io.read16(0x680)? & 0xcf != 0
-        || io.read16(0x100)? & (1 << 9) != 0
+    if read(io, 0x440).await? != 0x1f
+        || read(io, 0x1a04).await? & 0xff000000 != 0x81000000
+        || read(io, 0x820).await? & 255 != 0x11
+        || read(io, 0x1d70).await? & 0x7f7f != 0x1c1c
+        || read(io, 0x84c).await? & 0xffff0000 != (168 << 16 | 161 << 24)
+        || io.read16(0x680).await? & 0xcf != 0
+        || io.read16(0x100).await? & (1 << 9) != 0
     {
         return Err(Error::Prerequisite);
     }

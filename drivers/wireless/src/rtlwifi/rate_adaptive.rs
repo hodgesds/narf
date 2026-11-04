@@ -157,6 +157,27 @@ impl State {
         };
         (state != self.previous).then_some(state)
     }
+    /// `rtl8821ae/dm.c::rtl8821ae_dm_refresh_rate_adaptive_mask`
+    /// thresholds: high `high_rssi_thresh_for_ra` (50), low
+    /// `low2high_rssi_thresh_for_ra40m`, which `rtl8821ae_dm_init_rate_
+    /// adaptive_mask` never sets (it sets `low_rssi_thresh_for_ra40m`), so
+    /// the zeroed `rtl_priv` gives 0. `go_up_gap` 5 raises high for MIDDLE
+    /// and both for LOW. Returns the new level when it differs.
+    pub(super) fn refresh_rtl8821ae(&self) -> Option<u8> {
+        let (high, low) = match self.previous {
+            STA_MIDDLE => (55, 0),
+            STA_LOW => (55, 5),
+            _ => (50, 0),
+        };
+        let state = if self.smoothed > high {
+            STA_HIGH
+        } else if self.smoothed > low {
+            STA_MIDDLE
+        } else {
+            STA_LOW
+        };
+        (state != self.previous).then_some(state)
+    }
     /// `p_ra->pre_ratr_state = p_ra->ratr_state` after the update.
     pub(super) fn commit(&mut self, level: u8) {
         self.previous = level;
@@ -215,6 +236,22 @@ pub(super) fn rate_mask(legacy: u16, mcs: Option<u8>, level: u8, sgi: bool) -> [
         bytes[3],
         if short { 0x20 } else { 0 } | 0x80,
     ]
+}
+
+/// Source curtxbw_40mhz adds legacy OFDM6 to the INIT/LOW HT mask.
+/// Existing20MHz payloads remain byte-identical.
+pub(super) fn rate_mask_width(
+    legacy: u16,
+    mcs: Option<u8>,
+    level: u8,
+    sgi: bool,
+    wide: bool,
+) -> [u8; 5] {
+    let mut mask = rate_mask(legacy, mcs, level, sgi);
+    if wide && mcs.is_some() && !matches!(level, STA_HIGH | STA_MIDDLE) {
+        mask[0] |= (legacy & 0x10) as u8;
+    }
+    mask
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -313,6 +350,98 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/wireless/rtlwifi/rate",
         smoke_rtl8188ee_rx_pwdb_and_smoothing_match_linux
+    );
+
+    /// Written; not yet executed (no QEMU in this lane).
+    pub(crate) fn smoke_rtl8821ae_pwdb_ra_hysteresis_and_init_rate_match_linux() -> TestResult {
+        use crate::rtlwifi::rtl8821ae::{channel, trx};
+        // query_rxphystatus, 8821 branch: OFDM pwdb_all byte 4.
+        let mut phy = [0u8; trx::PHY_STATUS_PWDB_BYTES];
+        phy[4] = 0x8c;
+        if trx::rx_pwdb(&phy, false) != 60 {
+            return TestResult::Fail("8821AE OFDM PWDB differs from query_rxphystatus");
+        }
+        // CCK (cfosho[0]): (lna, vga, pwdb) with pout -6, no cck_high_power.
+        for (lna, vga, expected) in [
+            (0u8, 0u8, 100u8), // -6 + 21 = 15 -> >= 0 -> 100
+            (0, 12, 91),       // 15 - 24 = -9
+            (1, 3, 93),        // -6 + 5 - 6 = -7
+            (2, 10, 63),       // -6 - 11 - 20 = -37
+            (4, 4, 62),        // -6 - 24 - 8 = -38
+            (5, 31, 0),        // -6 - 32 - 62 = -100
+            (3, 9, 100),       // no case: rx_pwr_all stays 0
+            (6, 0, 100),
+            (7, 31, 100),
+        ] {
+            phy[5] = (lna << 5) | vga;
+            if trx::rx_pwdb(&phy, true) != expected {
+                return TestResult::Fail("8821AE CCK PWDB differs from query_rxphystatus");
+            }
+        }
+        if !trx::is_cck(3) || trx::is_cck(4) {
+            return TestResult::Fail("RTL8821AE_RX_HAL_IS_CCK_RATE");
+        }
+        // rtl8821ae_dm_refresh_rate_adaptive_mask: high 50 (+5 from MIDDLE/
+        // LOW), low low2high_rssi_thresh_for_ra40m = 0 (+5 from LOW).
+        let state = |smoothed, previous| State {
+            smoothed,
+            previous,
+            last_ms: None,
+        };
+        for (smoothed, previous, expected) in [
+            (51, STA_INIT, Some(STA_HIGH)),
+            (50, STA_INIT, Some(STA_MIDDLE)),
+            (1, STA_INIT, Some(STA_MIDDLE)),
+            (0, STA_INIT, Some(STA_LOW)),
+            (55, STA_MIDDLE, None),
+            (56, STA_MIDDLE, Some(STA_HIGH)),
+            (0, STA_MIDDLE, Some(STA_LOW)),
+            (5, STA_LOW, None),
+            (6, STA_LOW, Some(STA_MIDDLE)),
+            (56, STA_LOW, Some(STA_HIGH)),
+            (50, STA_HIGH, Some(STA_MIDDLE)),
+            (51, STA_HIGH, None),
+        ] {
+            if state(smoothed, previous).refresh_rtl8821ae() != expected {
+                return TestResult::Fail("8821AE RA hysteresis differs from dm.c");
+            }
+        }
+        // rtl8821ae_dm_txpwr_track_set_pwr limits (MGN_1M..MGN_11M is a
+        // numeric range in Linux, so 6M/9M take the CCK limit).
+        for (mgn, limit) in [
+            (0x02, 32),
+            (0x0c, 32),
+            (0x12, 32),
+            (0x16, 32),
+            (0x18, 30),
+            (0x60, 30),
+            (0x6c, 28),
+            (0x80, 34),
+            (0x84, 30),
+            (0x87, 28),
+            (0x88, 24),
+            (0x92, 34),
+            (0x97, 26),
+            (0x98, 24),
+            (0x99, 22),
+        ] {
+            if channel::pwr_tracking_limit(mgn) != limit {
+                return TestResult::Fail("pwr_tracking_limit differs from dm.c");
+            }
+        }
+        if channel::default_ofdm_index(0x200) != 24
+            || channel::default_ofdm_index(0x16a) != 18
+            || channel::default_ofdm_index(0x101) != 12
+            || channel::default_ofdm_index(0x0b6) != 6
+            || channel::default_ofdm_index(0x1234) != 24
+        {
+            return TestResult::Fail("default_ofdm_index differs from the swing lookup");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtlwifi/rate",
+        smoke_rtl8821ae_pwdb_ra_hysteresis_and_init_rate_match_linux
     );
 
     pub(crate) fn smoke_rtl8188ee_rate_mask_levels_match_linux() -> TestResult {

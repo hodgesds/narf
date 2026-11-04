@@ -24,6 +24,9 @@ macro_rules! smoke {
         kernel_test_in!("wireless/association/eht", $name);
     };
 }
+#[path = "mlo_tests.rs"]
+mod mlo_tests;
+
 fn ht40() -> LocalHt {
     let gi = HtGi {
         rx20: true,

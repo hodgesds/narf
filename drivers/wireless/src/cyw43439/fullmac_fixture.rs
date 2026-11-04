@@ -76,6 +76,16 @@ pub(crate) struct Firmware {
     pub assoc_req_ies: Vec<u8>,
     pub assoc_resp_ies: Vec<u8>,
     pub hook: Option<Hook>,
+    /// Secondary-interface seam (`Fullmac::VIF_DEMUX`): IF/secondary-bsscfg
+    /// events, admitted ifidx, per-ifidx commands and frames.
+    pub vif_events: VecDeque<Event>,
+    pub vif_listening: bool,
+    pub vif_open: u16,
+    pub vif_log: Vec<(u8, Command)>,
+    pub vif_sent: Vec<(u8, Vec<u8>, u8)>,
+    pub vif_data: VecDeque<(u8, Vec<u8>)>,
+    /// Transport `event_msgs` composition, as the real transports keep.
+    pub event_mask: crate::brcmfmac::event_mask::Composition,
 }
 impl Firmware {
     pub fn new() -> Self {
@@ -100,7 +110,80 @@ impl Firmware {
             assoc_req_ies: Vec::new(),
             assoc_resp_ies: Vec::new(),
             hook: None,
+            vif_events: VecDeque::new(),
+            vif_listening: false,
+            vif_open: 0,
+            vif_log: Vec::new(),
+            vif_sent: Vec::new(),
+            vif_data: VecDeque::new(),
+            event_mask: crate::brcmfmac::event_mask::Composition::new(),
         }
+    }
+    /// Native `BRCMF_E_IF` (`struct brcmf_if_event`) for the secondary
+    /// queue; dropped unless the host listens, as the transports do.
+    pub fn if_event(&mut self, action: u8, ifidx: u8, bsscfgidx: u8, role: u8, mac: [u8; 6]) {
+        self.if_event_flags(action, ifidx, bsscfgidx, 0, role, mac);
+    }
+    /// `brcmf_if_event` with explicit `flags` (e.g. `BRCMF_E_IF_FLAG_NOIF`).
+    pub fn if_event_flags(
+        &mut self,
+        action: u8,
+        ifidx: u8,
+        bsscfgidx: u8,
+        flags: u8,
+        role: u8,
+        mac: [u8; 6],
+    ) {
+        self.secondary_event(
+            54,
+            ifidx,
+            bsscfgidx,
+            mac,
+            &[ifidx, action, flags, bsscfgidx, role],
+        );
+    }
+    pub fn secondary_event(
+        &mut self,
+        kind: u32,
+        ifidx: u8,
+        bsscfgidx: u8,
+        source: [u8; 6],
+        payload: &[u8],
+    ) {
+        self.secondary_event_status(kind, ifidx, bsscfgidx, source, 0, 0, payload);
+    }
+    /// Secondary event with native `status`/`reason` header fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn secondary_event_status(
+        &mut self,
+        kind: u32,
+        ifidx: u8,
+        bsscfgidx: u8,
+        source: [u8; 6],
+        status: u32,
+        reason: u32,
+        payload: &[u8],
+    ) {
+        if !self.vif_listening {
+            return;
+        }
+        self.vif_events.push_back(Event {
+            header: EventHeader {
+                version: 2,
+                flags: 0,
+                event_type: kind,
+                status,
+                reason,
+                auth_type: 0,
+                datalen: payload.len() as u32,
+                source_mac: source,
+                if_name: [0; 16],
+                if_idx: ifidx,
+                bsscfg_idx: bsscfgidx,
+            },
+            payload: payload.to_vec(),
+        });
+        self.pending += 1;
     }
     pub fn event(&mut self, kind: u32, status: u32, flags: u16, source: [u8; 6], payload: &[u8]) {
         self.events.push_back(Event {
@@ -292,6 +375,76 @@ impl<const PCIE: bool> Fullmac for Mock<PCIE> {
     }
     fn firmware_vendor(&self) -> FirmwareVendor {
         self.fw.vendor
+    }
+    const VIF_DEMUX: bool = true;
+    fn events_compose(
+        &mut self,
+        need: crate::brcmfmac::event_mask::Need,
+        events: crate::brcmfmac::event_mask::Mask,
+    ) -> crate::brcmfmac::event_mask::Mask {
+        self.fw.event_mask.compose(need, events)
+    }
+    fn events_written(&mut self, mask: crate::brcmfmac::event_mask::Mask) {
+        self.fw.event_mask.written(mask)
+    }
+    fn events_current(&mut self) -> Option<crate::brcmfmac::event_mask::Mask> {
+        self.fw.event_mask.current()
+    }
+    fn vif_listen(&mut self, on: bool) {
+        self.fw.vif_listening = on;
+        if !on {
+            self.fw.vif_events.clear();
+        }
+    }
+    fn vif_open(&mut self, ifidx: u8) -> Result<(), Error> {
+        if self.fw.failed || ifidx == 0 || ifidx >= 16 {
+            return Err(Error::Failed);
+        }
+        self.fw.vif_open |= 1 << ifidx;
+        Ok(())
+    }
+    fn vif_close(&mut self, ifidx: u8) -> Result<bool, Error> {
+        if ifidx == 0 || ifidx >= 16 {
+            return Err(Error::Malformed);
+        }
+        self.fw.vif_open &= !(1 << ifidx);
+        self.fw.vif_data.retain(|(index, _)| *index != ifidx);
+        Ok(true)
+    }
+    fn pop_vif_event(&mut self) -> Option<Event> {
+        self.fw.vif_events.pop_front()
+    }
+    fn pop_vif_data(&mut self, ifidx: u8) -> Option<Vec<u8>> {
+        if self.fw.vif_open & (1 << (ifidx & 15)) == 0 {
+            return None;
+        }
+        let position = self.fw.vif_data.iter().position(|(i, _)| *i == ifidx)?;
+        self.fw.vif_data.remove(position).map(|(_, frame)| frame)
+    }
+    fn send_vif_data(&mut self, ifidx: u8, frame: &[u8], priority: u8) -> Result<(), Error> {
+        if self.fw.failed || self.fw.vif_open & (1 << (ifidx & 15)) == 0 {
+            return Err(Error::Failed);
+        }
+        self.fw.vif_sent.push((ifidx, frame.to_vec(), priority));
+        Ok(())
+    }
+    fn command_vif<'a>(
+        &'a mut self,
+        ifidx: u8,
+        direction: Direction,
+        command: u32,
+        input: &'a [u8],
+        maximum: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
+        self.fw.vif_log.push((
+            ifidx,
+            Command {
+                direction,
+                command,
+                body: input.to_vec(),
+            },
+        ));
+        Fullmac::command(self, direction, command, input, maximum)
     }
 }
 

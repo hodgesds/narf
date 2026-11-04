@@ -7,6 +7,8 @@ use core::future::Future;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// No autonomous entry was published; retained work must run first.
+    Busy,
     Access,
     Gone,
     Timeout,

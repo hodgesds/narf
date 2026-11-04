@@ -357,7 +357,7 @@ pub(super) fn netdev_up(iface: &dyn crate::WirelessNetIface) -> Result<(), i32> 
 /// `nl80211_key_allowed`: a station needs `wdev->connected`.
 fn key_allowed(iface: &dyn crate::WirelessNetIface) -> Result<(), i32> {
     match iface.current_iftype() {
-        IFTYPE_AP => Ok(()),
+        IFTYPE_AP | 9 => Ok(()),
         IFTYPE_STATION | 8 => {
             if iface.connected_bssid().is_some() {
                 Ok(())
@@ -441,6 +441,17 @@ struct KeyParse {
     def_uni: bool,
     def_multi: bool,
 }
+impl Drop for KeyParse {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(key) = &mut self.key {
+            key.zeroize();
+        }
+        if let Some(seq) = &mut self.seq {
+            seq.zeroize();
+        }
+    }
+}
 
 /// `nl80211_key_default_policy` nest: UNICAST (1) / MULTICAST (2) flags.
 fn default_types(raw: &[u8]) -> Result<(bool, bool), i32> {
@@ -451,11 +462,9 @@ fn default_types(raw: &[u8]) -> Result<(bool, bool), i32> {
 /// `nl80211_parse_key` (nested `NL80211_ATTR_KEY`, else the old top-level
 /// attributes), with the policies' bounds.
 fn parse_key(attrs: &[(u16, &[u8])]) -> Result<KeyParse, i32> {
-    let mut k = KeyParse {
-        idx: -1,
-        ktype: -1,
-        ..KeyParse::default()
-    };
+    let mut k = KeyParse::default();
+    k.idx = -1;
+    k.ktype = -1;
     if let Some(nest) = attr(attrs, 80) {
         // nl80211_key_policy
         let tb = attributes(nest)?;
@@ -575,7 +584,9 @@ fn parse_key(attrs: &[(u16, &[u8])]) -> Result<KeyParse, i32> {
 fn valid_key_idx(iface: &dyn crate::WirelessNetIface, idx: i32, pairwise: bool) -> bool {
     let max = if pairwise {
         3
-    } else if iface.supports_external_supplicant() {
+    } else if iface.supports_external_supplicant()
+        || matches!(iface.current_iftype(), 3 | 9) && iface.supports_ap_authenticator()
+    {
         5
     } else {
         3
@@ -701,15 +712,93 @@ fn errno_of(e: i32) -> i32 {
     e.abs()
 }
 
+/// Parse the exact native AP key operation before async admission. The
+/// owned secret is zeroizing even if reservation fails or the future is
+/// never polled. These bytes supply no installed-key/peer-port receipt.
+pub(super) fn native_ap_key(
+    command: u8,
+    iface: &dyn crate::WirelessNetIface,
+    attrs: &[(u16, &[u8])],
+) -> Result<super::ap_async::Operation, i32> {
+    use super::ap_async::Operation;
+    key_allowed(iface)?;
+    no_link_id(attrs)?;
+    if !iface.supports_ap_authenticator() {
+        return Err(EOPNOTSUPP);
+    }
+    let mut key = parse_key(attrs)?;
+    let peer = mac_of(attrs)?;
+    if key.ktype == -1 {
+        key.ktype = if peer.is_some() { 1 } else { 0 };
+    }
+    if !matches!(key.ktype, 0 | 1) {
+        return Err(EINVAL);
+    }
+    let pairwise = key.ktype == 1;
+    match command {
+        NEW_KEY => {
+            if key.mode != 0 {
+                return Err(EOPNOTSUPP);
+            }
+            if key.key.is_none() {
+                return Err(EINVAL);
+            }
+            validate_key_settings(iface, &key, pairwise, peer)?;
+            if key.def && (pairwise || !key.def_multi) || key.defbeacon {
+                return Err(EINVAL);
+            }
+            let default = key.def.then_some((key.def_uni, key.def_multi));
+            let params = crate::KeyParams {
+                idx: key.idx as u8,
+                pairwise,
+                peer,
+                cipher: key.cipher,
+                key: key.key.take().unwrap(),
+                seq: key.seq.take().unwrap_or_default(),
+                default_mgmt: key.defmgmt,
+            };
+            Ok(Operation::AddKey(crate::OwnedKey::new(params), default))
+        }
+        DEL_KEY => {
+            if !valid_key_idx(iface, key.idx, pairwise) {
+                return Err(EINVAL);
+            }
+            if !pairwise && peer.is_some() {
+                return Err(ENOENT);
+            }
+            Ok(Operation::DelKey(key.idx as u8, pairwise, peer))
+        }
+        SET_KEY => {
+            if key.idx < 0 || !key.def && !key.defmgmt && !key.defbeacon || key.mode == 2 {
+                return Err(EINVAL);
+            }
+            if !valid_key_idx(iface, key.idx, false)
+                || key.defmgmt && (key.def_uni || !key.def_multi)
+                || key.defbeacon && (key.def_uni || !key.def_multi)
+            {
+                return Err(EINVAL);
+            }
+            Ok(Operation::DefaultKey {
+                index: key.idx as u8,
+                unicast: key.def_uni,
+                multicast: key.def_multi,
+                management: key.defmgmt,
+                beacon: key.defbeacon,
+            })
+        }
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
 /// `nl80211_new_key`.
 pub(super) fn new_key(
     iface: Arc<dyn crate::WirelessNetIface>,
     attrs: &[(u16, &[u8])],
 ) -> Result<Vec<GenlReply>, i32> {
     let mut k = parse_key(attrs)?;
-    let Some(key) = k.key.clone() else {
+    if k.key.is_none() {
         return Err(EINVAL); // "no key"
-    };
+    }
     let mac = mac_of(attrs)?;
     if k.ktype == -1 {
         k.ktype = if mac.is_some() { 1 } else { 0 };
@@ -730,8 +819,8 @@ pub(super) fn new_key(
         pairwise,
         peer: mac,
         cipher: k.cipher,
-        key,
-        seq: k.seq.unwrap_or_default(),
+        key: k.key.take().unwrap(),
+        seq: k.seq.take().unwrap_or_default(),
         default_mgmt: k.defmgmt,
     };
     iface.add_key(params).map_err(errno_of)?;
@@ -1002,6 +1091,50 @@ fn pmksa_entry(attrs: &[(u16, &[u8])], pmkid: Option<&[u8]>) -> Result<crate::Pm
 /// Cookies for CONTROL_PORT_FRAME transmissions (`local->roc_cookie_counter`).
 static CONTROL_PORT_COOKIE: AtomicU64 = AtomicU64::new(1);
 
+pub(super) fn native_ap_control(
+    iface: &dyn crate::WirelessNetIface,
+    attrs: &[(u16, &[u8])],
+    context: &RequestContext<'_>,
+) -> Result<super::ap_async::Operation, i32> {
+    if !iface.supports_ap_authenticator() {
+        return Err(EOPNOTSUPP);
+    }
+    super::reject_unknown(attrs, &[3, 6, 51, 102, 103, 142, 313])?;
+    no_link_id(attrs)?;
+    let pdu = attr(attrs, 51).ok_or(EINVAL)?;
+    let dest = mac_of(attrs)?.ok_or(EINVAL)?;
+    let proto = u16::from_ne_bytes(int_le::<2>(attr(attrs, 102).ok_or(EINVAL)?)?);
+    if pdu.is_empty() || pdu.len() > 2304 || dest == [0; 6] || dest[0] & 1 != 0 {
+        return Err(EINVAL);
+    }
+    let cookie = if attr(attrs, 142).is_none() && iface.supports_control_port_tx_status() {
+        Some(
+            CONTROL_PORT_COOKIE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    if v == 0 {
+                        None
+                    } else {
+                        v.checked_add(1)
+                    }
+                })
+                .map_err(|_| EBUSY)?,
+        )
+    } else {
+        None
+    };
+    if let (Some(cookie), Some(cell)) = (cookie, context.ack_cookie) {
+        cell.set(Some(cookie));
+    }
+    let request = crate::ControlPortTxRequest::new(
+        dest,
+        proto,
+        pdu.to_vec(),
+        attr(attrs, 103).is_some(),
+        cookie.is_some(),
+    );
+    Ok(super::ap_async::Operation::ControlPort { request, cookie })
+}
+
 /// `nl80211_tx_control_port`.
 pub(super) fn tx_control_port(
     iface: Arc<dyn crate::WirelessNetIface>,
@@ -1017,8 +1150,9 @@ pub(super) fn tx_control_port(
     };
     let dest = mac_of(attrs)?.ok_or(EINVAL)?;
     let proto = u16::from_ne_bytes(int_le::<2>(proto)?);
+    // nl80211_tx_control_port: AP and P2P_GO need no connected BSS.
     match iface.current_iftype() {
-        IFTYPE_AP => {}
+        IFTYPE_AP | 9 => {}
         IFTYPE_STATION | 8 => {
             if iface.connected_bssid().is_none() {
                 return Err(ENOTCONN);
@@ -1253,6 +1387,8 @@ pub(super) fn regulatory_rule_flags(flags: crate::reg::RegFlags) -> u32 {
     u32::from(flags.contains(crate::reg::RegFlags::DFS)) << 4
         | u32::from(flags.contains(crate::reg::RegFlags::INDOOR_ONLY)) << 3
         | u32::from(flags.contains(crate::reg::RegFlags::NO_IR)) << 7
+        | u32::from(flags.contains(crate::reg::RegFlags::AUTO_BW)) << 11
+        | u32::from(flags.contains(crate::reg::RegFlags::NO_160MHZ)) << 16
         | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_VLP_CLIENT)) << 22
         | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_AFC_CLIENT)) << 23
 }

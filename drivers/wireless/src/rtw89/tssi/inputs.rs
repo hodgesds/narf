@@ -6,13 +6,29 @@ use crate::rtw89::radio_assets::Assets;
 pub(in crate::rtw89) struct Tracking {
     pub(super) up: [[i8; 30]; 2],
     pub(super) down: [[i8; 30]; 2],
+    /// 5GHz `[path][subband 1/3/4]` rows (types 5GA/5GB_P/N).
+    pub(super) up5: [[[i8; 30]; 3]; 2],
+    pub(super) down5: [[[i8; 30]; 3]; 2],
 }
 impl Tracking {
+    /// Linux `_tssi_set_tmeter_tbl` row selection by `chan->subband_type`.
+    pub(super) fn rows(
+        &self,
+        channel: crate::rtw89::operating_channel::Profile,
+        path: usize,
+    ) -> (&[i8; 30], &[i8; 30]) {
+        match channel.gain_band() {
+            0 => (&self.up[path], &self.down[path]),
+            band => (&self.up5[path][band - 1], &self.down5[path][band - 1]),
+        }
+    }
     pub(in crate::rtw89) fn from_assets(assets: &Assets) -> Result<Self, Error> {
         match assets.elements().iter().find(|element| element.id == 18) {
             None => Ok(Self {
                 up: [tables::A_P, tables::B_P],
                 down: [tables::A_N, tables::B_N],
+                up5: [tables::A_P_5G, tables::B_P_5G],
+                down5: [tables::A_N_5G, tables::B_N_5G],
             }),
             Some(element) => Self::parse(&element.bytes),
         }
@@ -33,6 +49,8 @@ impl Tracking {
         let mut result = Self {
             up: [[0; 30]; 2],
             down: [[0; 30]; 2],
+            up5: [[[0; 30]; 3]; 2],
+            down5: [[[0; 30]; 3]; 2],
         };
         let mut offset: usize = 8;
         for kind in 0..16 {
@@ -58,6 +76,20 @@ impl Tracking {
             if let Some(destination) = destination {
                 for (out, input) in destination.iter_mut().zip(data) {
                     *out = *input as i8;
+                }
+            }
+            let five = match kind {
+                4 => Some(&mut result.down5[1]),
+                5 => Some(&mut result.up5[1]),
+                6 => Some(&mut result.down5[0]),
+                7 => Some(&mut result.up5[0]),
+                _ => None,
+            };
+            if let Some(destination) = five {
+                for (row, chunk) in destination.iter_mut().zip(data.chunks_exact(30)) {
+                    for (out, input) in row.iter_mut().zip(chunk) {
+                        *out = *input as i8;
+                    }
                 }
             }
             offset = end;

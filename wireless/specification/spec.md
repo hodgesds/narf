@@ -105,6 +105,11 @@ mlme.c ieee80211_add_vht_ie does. HT TxBF stays zero, as in mac80211.
 Native NDPA/NDP feedback, steering, STBC encoding and the single MU-MIMO
 owner are backend responsibilities. Large A-MSDU limits are described with
 the shared A-MSDU owner below.
+`LocalHt::with_rx_amsdu_7935(enabled)` advertises bit11 only when the
+native RX owner can retain and atomically decode the entire7935-byte body.
+`HtNegotiation::rx_amsdu_limit()` preserves this local promise independently
+of the AP's receive capacity. Existing constructors retain3839; TX owners
+must continue to use the peer's separately advertised capacity.
 `LocalVht::with_160mhz(rx_sgi160, tx_sgi160)` opts into contiguous160 and
 directional SGI160. Existing constructors retain their80MHz ceiling;
 `LocalPhy::vht160` requires both this explicit promise and an HT40 companion,
@@ -149,6 +154,14 @@ directional TX maps/GI/LDPC and width limits. These APIs do not synthesize a
 BSS or response and do not prove peer/status, SSID, security, legacy-rate
 agreement, native channel, firmware completion, power, key or port authority.
 The FullMAC owner must retain and check those independent native facts.
+
+`offer.response_elements_with_sae_h2e(ies, sae_h2e)` is a narrow native
+response parser opt-in: `sae_h2e` must come from the owner's already
+negotiated `SaeJoin::h2e()`. It permits membership selector123 as a security
+fact and removes it from PHY selector checking; it never treats123 as a
+PHY mode or legacy rate. The bool supplies no security, PHY, channel,
+firmware-completion or publication authority. `response_elements` and
+`from_elements` remain strict; unsupported PHY selectors still fail.
 
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy
@@ -231,7 +244,108 @@ TX limited by AP RX, eht.c `ieee80211_eht_cap_ie_to_sta_eht_cap`),
 `su_beamformee()/su_beamformer()`, `peer_capability()`, `operation()` and
 `local_capability()`. The request carries EHT Capabilities only when EHT
 was negotiated; responses must keep EHT and cannot raise TX NSS or roles.
-Multi-link (MLO) association is not part of `JoinPlan`.
+Existing constructors retain ordinary station association. The explicit
+single-link MLD opt-in below supplies the separate MLO identity/key contract.
+
+**Software acceptance at `6813a24c6`.** Shared `mlo_station_association`
+passes the checkpoint release/native gates on x86_64 and aarch64, including
+the strict single-link JoinPlan, authenticated per-link key/crypto contract
+and reactive FakeAp fixtures. This supersedes implementation-time pending
+notes only for that shared single-associated-link scope; it grants no
+multiple-active-link native driver, AP/P2P role or physical RF qualification.
+
+**Single-link MLD (`association::mlo`).** `mlo::Local::single_link(own_mld)`
+validates a unicast logical address. `JoinPlan::prepare_mld(bss, own_link,
+ssid, security, phy, options, local)` and `prepare_mld_6ghz` opt into one
+associated link, require EHT and RSN with PMF, and retain a boxed immutable
+`mlo::Context` alongside the existing boxed 6GHz plan. `JoinPlan::mld()`
+reports that selected candidate; successful association and current native
+radio/key authority remain separate requirements. The context binds own/AP
+MLD addresses, own/AP physical link MACs and the beacon's IEEE Link ID. A
+scalar Link ID never selects a different peer, firmware link or key owner.
+
+`BasicMultiLink::{parse, from_ies}` checks the Basic ML Control type/presence
+bits, exact common-info lengths, unicast MLD MAC and optional Link ID, bounds
+affiliated Per-STA profiles and rejects duplicate/fragmented elements. Those
+profiles never supply the selected link's RSN or PHY. The association request
+contains one canonical Basic MLE (common length9, local MLD MAC and MLD
+Capabilities with Max Simultaneous Links0) before EHT Capabilities; it
+requests no additional link,
+EML, TID-to-link mapping or beacon protection. `Local::request_element()`
+exposes that same builder for native owners. `Context::response(ies)` requires
+the exact AP MLD, rejects extra link profiles and mismatched present Link IDs;
+an absent response Link ID preserves the beacon-selected link. Caller-supplied
+MLE/fragment IEs cannot replace the protocol-owned request element.
+
+Authentication/association headers and SAE sessions use logical MLD addresses.
+`Local::authentication_element()` supplies Linux's canonical Basic auth MLE
+(common length7, MLD MAC); `Context::authentication_body(bytes)` validates and
+strips the AP's exact trailer before SAE scalar/token/confirm parsing. An
+ordinary Open System authentication success must contain that trailer alone.
+SAE's password/PMK computation uses the MLD address pair; the physical link
+MACs remain separate throughout packet protection and native key binding.
+These validators create no association, RF, terminal-completion or key grant.
+
+**Multiple-link association request/response (`mlo`, software only).**
+`JoinPlan::prepare_mld_links(assoc, extra, ssid, security, options, local)`
+takes `MldLinkRequest { bss, own_link, phy: MldLinkPhy::{Phy, SixGhz} }`
+for the assoc link and1..14 further links. Each link is prepared from its own
+actual BSS by the single-link MLD rules and must name the same AP MLD with a
+distinct Link ID and distinct own/peer link MACs; AKM, PMF and RSNE must
+negotiate identically. The request then carries one Basic MLE (mac80211
+`ieee80211_assoc_add_ml_elem`): MLD MAC, EML Capabilities only when
+`Local::with_capabilities(mld_capa_ops, eml)` supplied EMLSR/EMLMR, MLD
+Capabilities, and per link a COMPLETE per-STA profile (STA MAC present,
+capability field, that link's rates and HT/VHT/HE/HE6/EHT/UHR capabilities)
+followed by Non-Inheritance for every tracked outer element the link lacks;
+over-long (sub)elements are fragmented as `ieee80211_fragment_element`.
+Every MLD request (single- and multiple-link, shared and native iwlwifi)
+places the Basic MLE where `ieee80211_add_link_elems` does: after HE/HE6 and
+immediately before EHT Capabilities (`mlo::insert_request_element`).
+
+`Context::multi_link_response(ies, requested)` (`ieee80211_assoc_success`/
+`ieee80211_assoc_config_link`) requires the exact AP MLD, a matching present
+Link ID and the common BSS Parameters Change Count; each requested link
+needs a COMPLETE profile with capability/status; a successful one also needs
+its own change count, may not nest a Basic MLE and, when STA MAC is present,
+must name that link's AP. A missing requested link fails the association;
+unrequested profiles are ignored. `mlo::link_elements(outer, profile)`
+builds the per-link view as `ieee802_11_parse_elems_full` does: outer
+elements are inherited unless listed in Non-Inheritance or repeated in the
+profile, and the outer MLE is never inherited. Each accepted link's view is
+negotiated by that link's own plan (rates, 6GHz, RSN, PHY) before anything
+commits; a non-zero per-STA status drops only that link.
+`JoinPlan::mld_links() -> &[MldLink]` exposes `context()`, `link_id()`,
+`channel()`, `status()`, `accepted()`, offered/negotiated PHY, 6GHz plan and
+legacy rates. `BasicMultiLink::from_ies` and the response path reassemble a
+Basic MLE from the Fragment elements following a255-octet MLE, and a
+per-STA profile from its Fragment subelements (`cfg80211_defragment_element`,
+`ieee80211_mle_get_sta_prof`); any other Fragment element is refused.
+
+A native owner that writes its own request bytes calls
+`JoinPlan::mld_request_element(outer)`: the same Basic MLE with per-STA
+profiles whose Non-Inheritance is computed against exactly the `outer`
+elements of that frame (a single-link plan returns its one-link element).
+After accepting its association link itself it calls
+`JoinPlan::accept_mld_links(response_ies, aid) -> Result<u16>`, which
+validates and commits only the affiliated links (same rules as above; the
+association link's plan state is untouched) and returns the accepted Link
+ID mask; a second call or invalid AID is `Busy`. `MldLink::response_elements()`
+is that accepted link's inherited response view (`None` otherwise).
+
+EAPOL (hostap wpa.c, re-verified against w1.fi master 2026-11-03):
+`eapol::mlo::message2_links(context, requested, ies)` appends, after the MLD
+MAC KDE, one MLO Link KDE (link id, own link MAC, no RSNE/RSNXE) per
+*requested* further link, accepted or rejected, in ascending link id order
+(`wpa_mlo_link_kde` over `req_links`), never for the association link.
+`eapol::mlo::authenticated_link_keys(context, further, rejected, kind, info,
+data, profile)` returns per-link `Keys` (association link, then `further`):
+every accepted link needs its MLO GTK KDE; M3 needs every requested link's
+MLO Link KDE, including each `rejected` one, with that link's own AP RSNE/
+RSNXE (`wpa_supplicant_validate_link_kde`). Per-link KDEs naming a link
+that was never requested are ignored (hostapd `wpa_auth_ml_kdes` names
+every affiliated AP); link id 15 is refused; reserved bits are ignored.
+MLO BIGTK stays refused (beacon protection is not negotiated).
 
 **UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
 `UhrCapability::parse(body, from_ap)` / `UhrOperation::parse` implement the
@@ -247,9 +361,10 @@ when the AP supports it on an80/160MHz channel with the NPCA primary in the
 opposite half and unpunctured (`cfg80211_chandef_add_npca` /
 `cfg80211_chandef_npca_valid`), and DBE operation consistent with the DBE
 bandwidth field and the AP's DBE capability (DBE widening is not applied).
-Because UHR operation is an MLD association, `JoinPlan` (single-link) never
-negotiates UHR and its UHR selector stays fail-closed; a native owner whose
-firmware associates as a non-AP MLD asserts
+Because UHR operation requires MLD association, ordinary `JoinPlan`
+constructors keep its selector fail-closed. `prepare_mld` supplies the strict
+single-link MLD/key-delivery contract and can negotiate UHR; a native owner
+whose firmware associates as a non-AP MLD asserts
 `LocalUhr::for_mld_association()` and uses `Offer::from_elements`, whose
 `Offer/Negotiated::uhr() -> Option<&UhrNegotiation>` reports the peer
 capability, operation and the usable `npca_channel()` (only when the local
@@ -299,6 +414,25 @@ MFPC|MFPR, SPP) and `Security::pmf()` is then true when both sides set
 MFPC: the IGTK is required in M3, BIP and unicast robust-frame CCMP apply as
 for SAE. `Security::new_sae` refuses non-SAE AKMs.
 
+**Explicit CCK-only channel14 planning.** `channel::frequency_in(Ghz2,14)`
+and `from_frequency_band(2484)` represent the typed2484MHz channel. Bare
+`band(14)`, `frequency(14)`, `from_frequency(2484)` and the ordinary channel
+lists keep their full-rate legacy refusal. `association::observe_cck14` and
+`JoinPlan::prepare_cck14(..., JoinOptions)` are separate opt-ins for original
+typed2.4GHz14 BSS facts. They accept only genuine CCK rates1/2/5.5/11Mbps,
+reject OFDM (including optional rates), HT/VHT/HE/EHT/MLD IEs/membership aliases,
+and preserve original raw RA/TA/BSSID/channel/SSID/RSN/PMF/SAE validation.
+The response cannot add a PHY or rate not in that CCK-only profile; appended
+SME IEs and the SPP A-MSDU opt-in cannot add those modes either. Ordinary
+observe/JoinPlan constructors remain unchanged and reject14. The helpers
+store no key and grant no peer/native/controlled-port or RF authority. A native
+adapter must independently prove actual channel14 CCK-only MAC/BB/RF/filter,
+factory/calibration/firmware, full occupied-span/current host permission and
+physical/source ownership before advertisement or emission. Native1–13 work
+can use existing shared planning without opting into14. Two additional
+unexecuted source cases cover original observation/association/PMF, typed
+geometry/default refusals, and wrong-band/rate/PHY/SSID/security/raw negatives.
+
 **6 GHz band identity (`association::{channel, six_ghz}`, `reg`).**
 `channel::Band` gains `Ghz6`. `channel::band(u8)` still classifies only the
 2.4/5 GHz legacy numbering and never returns it.
@@ -307,6 +441,13 @@ for SAE. `Security::new_sae` refuses non-SAE AKMs.
   5935 MHz).
 - `channel::from_frequency_band(mhz) -> Option<(Band, u8)>` is the inverse.
 - `channel::valid_6ghz(u8)` tests a 6 GHz channel number.
+
+The generic6GHz geometry now follows Linux's explicit253 upper bound,
+including the five237/241/245/249/253 entries of Intel's actual NVMv5
+64-channel tail. HE/EHT operating-channel and RNR/scan planners use this
+same conversion. Geometry remains separate from actual driver NVM/MCC and
+current host-policy admission; a rule ending at7125MHz still refuses
+those additional frequencies. Unqualified numeric channels remain legacy.
 
 `association::Bss` gains `band: Option<Band>`. `None` means the 2.4/5 GHz
 numbering, so existing literals add `band: None`. `Bss::band()` returns the
@@ -367,6 +508,12 @@ station-side admission facts.
   mac80211 `ieee80211_put_he_6ghz_cap` with SMPS off (SM PS = disabled).
   `regulatory_connectivity()` is `ieee80211_put_reg_conn` (LPI valid/set, SP
   valid, SP set unless `NO_6GHZ_AFC_CLIENT`).
+  `with_max_width(SixGhzWidth)` optionally limits actual HE/EHT channel
+  selection for native host/NVM/MCC planning. Omission preserves the previous
+  selection; an explicit40MHz ceiling downgrades to the real primary40 block
+  even though the HE capability bit jointly describes40/80. It grants no
+  regulatory or transmit authority: the native owner must validate the full
+  selected channel's actual constituent rules before I/O/publication.
 - `eht::LocalEht::with_320mhz([u8; 3])` adds the 6 GHz 320 MHz set and PHY
   B1 (it needs the 160 MHz set). `width320()` reports it, and
   `phy::LocalPhy::with_eht` (2.4/5 GHz) refuses such a profile.
@@ -558,7 +705,10 @@ Missing Basic flags retain beacon requirements. Malformed or duplicate rate
 elements fail the transaction; neither the AID nor rate bitmaps commit until
 all checks pass. A matching invalid response leaves the plan Failed and its
 old bitmaps unchanged. Response rates cannot grant PHY, key or port authority.
-`association::channel` exposes the existing 2.4/5GHz legacy 20MHz geometry.
+`association::channel` exposes legacy20MHz geometry, including full-rate
+2.4GHz channels1–13 (2412–2472MHz) and exact inverse frequency/band lookup.
+Channel14 stays absent. These physical coordinates grant no device, signed
+power-program, firmware, factory or current regulatory permission.
 Drivers retain their own rate-index mapping, radio/regulatory authority,
 firmware peer records, retained supplicant, key installation and controlled
 port. `Associated` alone grants none of those. MT76 preserves its existing
@@ -647,6 +797,437 @@ exact `NL80211_ATTR_WIPHY_FREQ`, not only its derived channel number, because
 `NL80211_ATTR_CHANNEL_WIDTH` channel definition. Drivers validate its
 geometry and every constituent regulatory channel; 20/40/80/160 and 80+80
 must never be silently reduced to a different on-air BSS.
+
+`ap_control_generation() -> Option<NonZeroU64>` opts into native terminal
+AP controls. The nonzero generation changes on every interface/mode replacement
+and never wraps to an older generation. `ApControlAuthority::bind` captures
+the existing interface-bound `AdminHandle`, exact registered interface, current
+namespace/ifindex, AP/GO mode and generation, plus the source socket's deferred
+reply liveness. It mints no grant. `current` invokes administrative authority
+and rechecks all identities; `check_for` also prevents replay against another
+concrete interface. Drivers retain a copy across cancellation cleanup and
+check it at native command/poll/publication boundaries. Socket closure,
+revocation, namespace transfer, mode replacement or interface replacement closes
+that request's authority even when a name/ifindex/port is reused.
+Binding retains the original request context's namespace and resolved ifindex;
+a transfer between lookup and admission cannot silently retarget the request.
+Trusted driver registration must pair the net and wireless registry entries
+for the same device, as on the existing interface-control path.
+The guard also captures the nonzero net-interface `ownership_epoch`. Register,
+namespace transfer, actual administrative DOWN and MAC replacement retire that
+epoch; namespace-away/back and DOWN/UP cannot revive an old request even if a
+driver's mode generation is unchanged. `require_up` additionally checks the
+original administrative-UP identity for native START/update publication;
+STOP cleanup remains callable after DOWN.
+`ApControlAuthority::identity` captures an `ApInterfaceIdentity` only through a
+current request. That type observes the exact registered interface, namespace,
+ifindex, ownership epoch, mode generation, MAC and administrative UP, independently
+of a finished request's socket lifetime. `current` and `check_for` recheck those
+facts. It is neither a capability nor proof of native command completion, and
+opens no carrier, key or controlled port. The trusted driver may retain it only
+as an additional fence after its real native receipts; current device, RF and
+peer/key/port owners still authorize every packet. A CLI closing after a completed
+AP command therefore does not itself cancel the configured device, while pending
+request cancellation still requires the retained native cleanup owner.
+`metadata_snapshot` observes that same current UP identity for the net layer's
+identity-fenced metadata setter. It carries no additional grant or native
+completion receipt; the setter rechecks its epoch under IFACES publication.
+
+`ApControlAuthority::reserve` calls the optional `reserve_ap_control` driver
+hook synchronously at deferred admission, before the first executor poll.
+A provided `ApControlReservation` serializes mutations; it grants no capability
+and its `current` predicate supplements all existing grant/identity checks.
+`ExclusiveControl` provides one current operation with nonwrapping nonce ownership;
+a competing request gets `Busy`. Cloned request guards retain the lease through
+native cancellation cleanup and the final ACK, so dropping a borrowed waiter
+cannot expose a still-owned BSS to a successor. An old lease's destructor cannot
+release a successor. Native implementations must include peer, key/default-key,
+management/control-port and other BSS mutations in their ordered admission.
+Drivers with their own ordering keep the default hook returning no additional
+reservation. Existing synchronous admission remains unchanged.
+
+`ap_control::RadioControlAuthority` is the typed native radio/CNM/P2P counterpart,
+with independent `radio_control_generation` / `reserve_radio_control` opt-in.
+Legacy ROC drivers retain their existing callbacks. The private current-grant,
+exact-socket, registered-object, namespace/index/ownership-epoch and nonwrapping
+mode-generation checks are shared; public AP binding remains limited to AP/GO.
+Radio binding permits actual station, AP, P2P-client/GO/device modes and exports
+no administrative/device cap or arbitrary evaluation callback. A physical owner
+shared with AP must share its actual serialization lease.
+`require_mode` checks the actual admitted role, and `check_identity` additionally
+matches a current request to the retained concrete interface, namespace/index,
+ownership epoch and mode generation. A valid grant for another same-MAC radio
+cannot commit or stop an existing native wdev through that observation.
+
+`require_link` and `RadioInterfaceIdentity` require administrative UP for netdev
+roles. A P2P-device wdev has no synthetic IFF_UP requirement: its native owner must
+separately prove the actual completed START_P2P_DEVICE state before ROC or frame
+use. Capturing that identity proves no started device, native CNM grant, RF right,
+key or controlled port. Its generation/registration/namespace observations remain
+current independently of a completed CLI's lifetime. `RadioEventAuthority` sheds
+only a completed control reservation and retains the actual source grants and
+exact socket. Typed ROC-ready/expired and management events require current source
+and role identity; the driver independently supplies exact native grant, finite
+timer/abort/packet retirement and copy/channel/filter proof. Neither queued
+acquire nor no-response abort becomes native success through this API. Closing
+or rebinding a source cannot retarget these notifications. The interface alone
+advertises no ROC or P2P role.
+
+`async_radio_management_tx_control()` separately opts an actual managed netdev
+(mode2) into source-bound native FRAME through `mgmt_tx_radio_async`. Its default
+is false. This route accepts the original IFINDEX (and consistent WDEV selector,
+when supplied), retains its exact current Radio authority/reservation, and defers
+the cookie/status until the native callback completes. It does not require a
+userspace SME. Status carries the original IFINDEX; the separate control-only
+P2P-device route carries its actual WDEV. The native result alone supplies ACK.
+Existing station and AP handlers retain their previous opt-ins and wire parsing.
+The typed route validates empty NO_CCK flag135 and supplied duration10..native
+maximum; each driver still refuses unsupported flags or interval semantics.
+
+`async_radio_management_rx_control()` independently opts a real managed netdev
+(mode2, default false) into typed `REGISTER_FRAME` through
+`register_mgmt_frame_radio_async`. It uses the original IFINDEX, source and
+reserved Radio authority, independently of userspace SME; control-only WDEV and
+legacy station/AP routes keep their existing opt-ins. The callback supplies its
+actual positive errno, including overlapping-registration `EALREADY`. Registration
+is subscription metadata only: it grants no RF channel, captured packet, native
+peer, key or controlled port. A driver may support directed Public Action only
+and refuse unsupported multicast reception instead of inventing a monitor vdev.
+
+Managed native RX may use
+`RadioEventAuthority::prepare_management_received` outside native State. It
+validates the original source/interface and serializes the original namespace,
+IFINDEX, WDEV, frequency and raw bytes, retaining that source's fixed Radio proof.
+After all dynamic callbacks finish, the driver rechecks current physical-device
+permission, channel/power policy, finite native interval and its actual copy/filter
+owner. `PreparedRadioManagementEvent::deliver(RadioReceiveFence)` then performs
+only fixed original source/registration/admin/receiver/mode-generation checks and
+an acquire read of the driver's nonwrapping copy epoch before actual delivery.
+The fence separately retains the registered receiver and originating ROC proofs;
+a live guard from another socket cannot replace the prepared source's lifetime.
+The driver closes that epoch before filter or RF transitions and host retirement,
+then retires owned copies/source metadata after unlocking State. This seam neither
+looks up a successor endpoint nor grants RF/packet authority. Ordinary typed WDEV
+management events retain their existing API and native proof requirements.
+
+`RadioControlAuthority::native_emission_for` captures a distinct
+`RadioEmissionAuthority` for an actual Radio-kind netdev in mode2,8 or9. It retains
+the original fixed administrative/source/registration lifetimes and concrete
+receiver/generation; unknown source providers refuse. Native `current`, role
+matching and optional owner-waker watching call no arbitrary source/interface
+callback under driver State. AP capture continues to require its AP-kind guard;
+its constructor keeps its original scope. Real netdev capture requires actual
+administrative UP. `matches_role` retains its mode2 rule; P2P native callers use
+`matches_mode` with their actual current role and nonwrapping generation. These
+capture helpers do not extend the existing public FRAME/REGISTER_FRAME opt-ins.
+The driver independently checks native RF/packet epochs, current channel/power,
+terminal DMA/ACK and mandatory stop ownership. A physical owner uses its retained
+pump waker or bounded timer for cleanup; short-lived request wakers are not
+silently accumulated as unbounded provider watches.
+
+`native_control_emission_for(receiver, actual_child_write_cap)` separately
+captures an actual mode10 control-WDEV proof. Full source/interface callbacks
+run outside native State. Capture requires the original current child Admin,
+explicit typed child Write grant, recorded actual physical-parent ancestry,
+exact registered WDEV/namespace and original socket's concrete native-source
+receipt. Parent and child wireless registrations are retained as weak exact
+provider observations; the net proof independently re-invokes the original
+parent/admin/daemon/child capability chain. There is no fabricated netdev,
+IFINDEX or UP requirement for the control-only child. Its actual completed
+native START, channel/RF grant and copied-notification epoch remain mandatory
+driver proofs. Parent/child replacement, namespace transfer, source close,
+same-name legacy representation and native role retirement cannot be replaced
+by another current provider. Provider wakes and a bounded capability timer
+drive retained physical cleanup after emission authority dies.
+
+`RadioEventAuthority::prepare_control_management_received` prepares the exact
+original control-WDEV event using that actual child capability outside State.
+The resulting `PreparedRadioManagementEvent` uses the existing fixed
+`RadioReceiveFence` after the driver rechecks physical source/policy/native
+copy ownership. `prepare_roc_ready` and `prepare_roc_expired` similarly retain
+the original fixed Radio proof in a `PreparedRadioRocEvent`; READY preparation
+requires the real matching successful START, and EXPIRED preparation requires
+actual native retirement. Their final fixed epoch/receiver/source checks deny
+events retired by a reentrant preparation callback. Actual socket delivery
+runs outside native State. These typed events do not convert a queued command,
+host timer or cancelled waiter into a native receipt or RF permission.
+
+`async_p2p_device_control` opts an actual control-only WDEV into
+`START_P2P_DEVICE`/`STOP_P2P_DEVICE` (89/90) and their async callbacks.
+The request names its real namespace-bound WDEV and carries no IFINDEX or
+IFF_UP substitute. `async_roc_control` independently selects terminal native
+`remain_on_channel_async`/`cancel_remain_on_channel_async`; legacy ROC callbacks
+keep their queued-work contract. Both selectors, when supplied for a netdev,
+must identify that exact same interface. Native ROC cookies never wrap.
+These opt-ins use the retained current Radio authority, real serialization
+lease and exact source socket. START/STOP ACKs and a ROC cookie reply follow
+the actual awaited completion, with authority rechecked on every poll and
+again at publication. A driver still proves its actual started native BSS,
+matching CNM event, channel policy and terminal cancellation/expiry ownership.
+Closed/rebound sockets, deleted/replaced registrations or revoked grants
+cannot publish old success or events to a successor. These shared defaults
+advertise no P2P mode and refuse unsupported native operations.
+
+`NL80211_CMD_TRIGGER_SCAN` (33) and `GET_SCAN` (32) also accept
+`NL80211_ATTR_WDEV` (153), as Linux `nl80211_trigger_scan`/`nl80211_dump_scan`
+take the wdev from it (`nl80211/p2p_scan_async.rs`). A netdev WDEV resolves to
+its IFINDEX (both selectors, when supplied, must name the same netdev) and is
+then exactly the IFINDEX request. An actual control-only WDEV is routed to
+`p2p_device_scan_async(authority, ScanRequest)` only when the iftype is
+P2P_DEVICE (10) and `async_p2p_device_scan_control()` opts in; the defaults
+(`false`, `NotSupported`) refuse it with `-EOPNOTSUPP`, so drivers without the
+hook (iwlwifi, mt76: discovery by ROC + management frames) are unchanged and
+every IFINDEX scan keeps `scan`/`scan_with_flags`. The request parses like an
+IFINDEX scan (no IFINDEX alias, no `ScanFlags` bit), one scan per WDEV is in
+flight (`-EBUSY`, Linux `rdev->scan_req`), and it runs under a reserved Radio
+authority bound to the source like the other control-WDEV operations, so the
+ACK follows native completion (Linux ACKs at `rdev_scan` acceptance). On
+success the WDEV's result cache (IEs from `scan_information_elements` on the
+same WDEV) is replaced and `NL80211_CMD_NEW_SCAN_RESULTS` with
+`NL80211_ATTR_WIPHY` + `NL80211_ATTR_WDEV` and no IFINDEX
+(`nl80211_prep_scan_msg` for a wdev without netdev) goes to the `scan` group
+before the ACK; a failure is the ACK errno only. A WDEV `GET_SCAN` dump returns
+that cache with the WDEV selector (`nl80211_send_bss`). Linux keeps one BSS list
+per wiphy; the netdev and WDEV caches here are separate. Written, unexecuted:
+`smoke_nl80211_wdev_scan_routing_keeps_ifindex_scans`
+(`nl80211/p2p_scan_tests.rs`).
+
+`async_p2p_management_rx_control` opts an actual control WDEV into the
+source-bound `REGISTER_FRAME` path and `register_mgmt_frame_radio_async`.
+The caller supplies its WDEV and explicit current child authority, without
+an IFINDEX or fabricated UP state. The callback returns its actual positive
+errno (including cfg80211 `EALREADY`) and receives a reserved Radio authority;
+the ACK follows completion with the same source/grant/mode checks as other
+native radio operations. Registration is host subscription metadata and may
+precede native START. It establishes no started BSS, channel/RF/capture grant,
+encryption or controlled port. Existing netdev SME/AP registration paths keep
+their existing behavior. Native raw RX publication additionally requires the
+driver's actual started WDEV, matching native channel owner and copy-time
+capture generation, valid RX metadata/header and current exact source filter.
+Old queued descriptors cannot acquire a new registration/source by late
+decoding. Typed `RadioEventAuthority::management_received` delivers only those
+actual raw bytes and observations to the original source; it grants no peer
+authentication, data interface or management-TX authority.
+
+`async_p2p_management_tx_control` separately opts a control-only WDEV into
+`FRAME` and `mgmt_tx_radio_async`. It uses the same exact delegated source,
+namespace/mode identity and retained Radio reservation as other native
+control requests. The driver must prove its actual started BSS, channel/RF
+owner, current transmit-power policy and terminal packet/ACK result. Cookie
+reply and `FRAME_TX_STATUS` follow that callback; status is MLME multicast
+group19 with actual WIPHY/WDEV/frame/cookie and an ACK flag only for a true
+native acknowledgement. A control WDEV adds no IFINDEX or synthetic UP bit.
+Queued work, elapsed time and token release alone are not ACK observations.
+`MgmtTxRequest::no_cck` retains the requested management no-CCK policy. The
+control-WDEV FRAME route accepts `NL80211_ATTR_TX_NO_CCK_RATE` (135) only as an
+empty flag; a driver must honor it in the actual 2.4GHz rate rather than using
+the unrelated home station's basic-rate state. An explicitly supplied
+`DURATION` must be between 10ms and the interface's actual maximum ROC duration.
+Omission preserves request duration 0; a driver's private management ROC uses
+the source ABI's finite default (MT76 requests 10ms). Legacy netdev/AP parsers
+continue their previous attribute acceptance and initialize no_cck=false.
+If the driver acquires a private management ROC, the exact native grant and
+finite lease remain owned through abort ordering, expiry and terminal packet
+retirement; host acquisition or abort progress establishes no RF/terminal
+receipt. Such a lease emits no public ROC-ready/expired events. A lost caller
+may suppress final FRAME publication while the retained no-transmit cleanup
+continues under the actual native owner and original home-power facts.
+Existing netdev SME/AP dispatch and default unsupported behavior remain.
+
+`async_control_interfaces` independently opts into control-only
+`new_control_interface_async` / `delete_control_interface_async`. NEW names the
+real physical wiphy and returns an actual registered P2P-device WDEV, without
+an IFINDEX, Ethernet entry or synthetic UP state. The current parent request
+reserves control order before polling and explicitly delegates the actual
+fresh child grant to its original source. Its publication guard retains that
+lease through successful response/ACK delivery; a lost or failed publication
+calls `release_control_metadata` for only the unpublished idle child, outside
+all registry locks. That trusted callback is idempotent metadata cleanup and
+may neither wait for hardware nor retire an uncertain native owner.
+
+`async_control_iftypes` (bitmask of `1 << NL80211_IFTYPE_*`, default
+`u32::MAX`) narrows which `NEW_INTERFACE` iftypes an opted-in radio routes
+to that control-only path; the rest keep `new_virtual_interface`. DEL tests
+the selected object's `current_iftype` against its own mask. The default
+mask leaves the dispatch exactly `async_control_interfaces()` (iwlwifi and
+mt76 unchanged); brcmfmac returns only P2P_DEVICE (10) so its STA/AP/
+P2P_CLIENT/P2P_GO netdevs stay on the legacy callbacks.
+(`nl80211::control::routes_async_control`; written, unexecuted
+`smoke_nl80211_async_control_iftype_mask_preserves_default_dispatch`.)
+
+DEL accepts the actual control WDEV and its explicit current child grant
+(including the creating socket's retained grant). Its native owner must retain
+stop/cancellation through actual firmware/RF/packet retirement even if the API
+waiter disappears. Only then may `RadioControlAuthority::retire_control` invoke
+`AdminHandle::retire_control_child` and produce `RadioControlRetirement`.
+Withdrawal immediately ends normal administration and hides the exact object
+from GET/list/selectors. A hidden exact WDEV/object/mode-generation entry and
+the original serialization lease remain until terminal ACK/drop. The receipt's
+only operation, `current`, checks that hidden identity, original grants and
+parent ownership epoch plus the exact current source socket. It cannot submit
+commands, administer a successor or use names/port ids for rebinding. Clones of
+that exact request share a private weak terminal-receipt observation, published
+at withdrawal before retained transport republication can become pending.
+Only the outstanding DEL waiter consults it; normal current/admin/native-command
+checks stay denied. The synchronous withdrawal transition may keep that waiter
+pending while its exact sink/lease remain current, but cannot produce success:
+the callback must still return the actual typed retirement receipt before ACK.
+Final
+receipt drop removes the old hidden entry and calls the driver's metadata-only
+cleanup outside registry/driver spinlocks. Legacy synchronous virtual-netdev
+callbacks preserve their existing behavior; these hooks advertise no full P2P
+roles and prove no native started wdev, CNM grant or management/data authority.
+
+The additive `start_ap_async`, `stop_ap_async`, `set_beacon_async` and
+`add_station_async`/`set_station_async`/`del_station_async` methods represent
+actual native terminal results. Their defaults adapt existing synchronous
+methods; generic netlink selects them only for an explicit generation opt-in,
+using the exact-socket deferred ACK path. An admitted queue entry never claims
+a completed native AP operation. Existing synchronous drivers retain their
+ordered admission contract below.
+
+Native AP `FRAME` and `REGISTER_FRAME` use `mgmt_tx_ap_async` and
+`register_mgmt_frame_ap_async` under the same current request guard and
+synchronous reservation. A FRAME cookie response is deferred until its native
+TX result; neither dispatch nor queue admission reports completion. The generic
+core frames that terminal response for the exact original socket and sequence.
+FRAME_TX_STATUS carries the actual returned ACK bool on the MLME group, after
+rechecking the original admin/source/interface ownership; false is a negative
+native observation, not a positive ACK inferred from freeing a packet token.
+Drivers check current occupied-channel/device authority and retain uncertain
+native TXS/DMA/FW ownership after waiter cancellation. Cookie exhaustion refuses
+new work rather than wrapping. Synchronous legacy MLME drivers retain their
+existing dispatch path, and these hooks add no AP/GO capability by themselves.
+
+`ApControlAuthority::event_authority` derives typed `ApEventAuthority` delivery
+from the existing current registration request. It sheds that completed
+operation's serialization lease and retains the actual administrative grant,
+exact original socket, namespace/ifindex, mode and ownership epoch. It creates
+no grant and exports no capability or arbitrary-message callback. Its
+registration may precede administrative UP, matching REGISTER_FRAME; capturing
+that identity opens no RX. Its
+`registration_current` checks the retained registration grant before UP so a
+driver can discard closed/revoked registrations without treating them as RX
+authority. Its
+`management_received` and `control_received` methods recheck current UP and
+those grants before typed nl80211 unicast to the exact source; closing/rebinding
+that socket, capability revocation, mode change, DOWN/UP or namespace/rebind
+retires delivery. The concrete native driver must separately check its copy
+epoch/current RF owner, registered frame filter, peer/cipher/replay facts and
+control-port configuration. The type supplies none of those hardware or packet
+receipts, and neither authorizes ordinary Ethernet/IP delivery nor injection.
+
+Native AP drivers may use `prepare_management_received` and
+`prepare_control_received` to complete all dynamic original source/interface
+checks and serialize exact namespace/IFINDEX/WDEV metadata outside native State.
+The opaque `PreparedApEvent` retains that event source's actual fixed AP emission
+proof; unknown native providers refuse. After preparation returns, the driver
+must re-invoke its original current physical/source/RF/key/receive-copy proof
+and any ordinary-DATA authorization generation. `PreparedApEvent::deliver`
+then checks only the fixed original source/admin/registration/receiver/mode
+proof and delivers to the same socket, without another dynamic current callback,
+successor lookup or recapture. Native management loss events retain physical
+receive/source proof while remaining independent of ordinary-DATA denial.
+Preparation supplies no packet, key, RX-prefix, RF or DATA admission.
+
+`ApControlAuthority::native_emission_for` and its event counterpart capture
+`ApEmissionAuthority` outside native State, while the full original request,
+UP identity and concrete receiver are current. Only an actual socket provider
+with a concrete native source is admitted; default/unknown providers and
+unsupported control-only ancestry refuse. Its final `current` invokes actual
+retained Admin/daemon/NetIface grants and weak exact source, wireless
+registration and netdev identity receipts, without arbitrary sink/interface
+callbacks or Registry/IFACES/socket locks. `matches_role` additionally compares
+the concrete receiver and supplied actual native mode/generation; drivers must
+retain their own concrete role-generation owner and retire it before role
+changes. No cached successful validation creates current authority. Provider
+retirement closes receipts before mutation/removal, then wakes the retained
+native owner outside provider locks. Native owners recheck on a bounded timer
+for capability-epoch revocation as well, and stop autonomous beacons when
+authority dies. Non-emitting flush/disable/remove or physical transport stop
+continues under the original current device authority even after START's
+admin/socket guard is dead; cancellation and a dropped borrowed waiter cannot
+release that owner or uncertain DMA before terminal stop. Full ACK/event
+callbacks remain outside native State, and native PCI/RF/copy/peer/key/port
+checks remain independently mandatory. These shared fences do not implement
+any firmware AP adapter by themselves.
+
+Native AP NEW/DEL/SET_KEY use `add_key_ap_async`, `del_key_ap_async` and
+`default_key_ap_async` under the same current exact-source guard/reservation.
+`OwnedKey` holds synchronous zeroizing key/RSC staging before constructing the
+async callback; rejection or unpolled cancellation erases it. Parsed key staging
+also erases temporary copies on every exit. The type exposes bytes, not proof
+of native installation or a peer controlled port. Defaults refuse unsupported
+native key callbacks, while existing station/synchronous key operations retain
+their driver path. Native errno is preserved. A NEW_KEY default choice follows
+successful installation in the same reserved operation; failed installation
+cannot select a transmit key. SET_KEY delegates the actual unicast/multicast/
+management/beacon selection instead of acknowledging a station-only no-op.
+
+Native AP/GO key-sequence queries opt in separately through
+`supports_ap_key_sequence()`. `NL80211_CMD_GET_KEY` is administrative and
+requires an UP netdev in mode3/9, the original `ApControlAuthority` and a
+current native AP generation. Its default-unsupported callback is
+`key_sequence_ap_async(authority, index, pairwise, peer) -> Result<KeySequence,
+i32>`, where `KeySequence { cipher: u32, seq: [u8;6] }` contains only an
+installed key's actual allocated transmit PN/IPN, including consumed unsent
+PNs, in six little-endian octets. A fresh installed unused key can report its
+actual zero; absent/staged keys and unsupported hardware counters must fail,
+never report a fabricated zero or an RX replay counter. The native provider
+retains the exact source/role/key lifetime through the snapshot. Default
+callbacks and capability advertisement remain unsupported.
+
+GET_KEY defaults the index to0; this bounded non-MLO profile admits group
+indices0..5 with no peer (actual GTK/IGTK lookup remains the driver's duty),
+or pairwise index0 with an actual unicast client. A group request with any
+MAC returns ENOENT without an IBSS_RSN peer namespace. BIGTK6/7, MLO link IDs,
+unsupported key types and key-material/nested install attributes are refused.
+Every deferred poll and the final reply recheck the original administrative
+grant, namespace/interface/mode generation and socket source, and publication
+requires the netdev still UP. The Linux-compatible NEW_KEY response includes
+top-level IFINDEX/KEY_IDX/WDEV, optional peer, cipher/sequence and an unflagged KEY
+nest with index/cipher/sequence. It has no KEY_DATA or key bytes.
+The original registry wiphy/wdev identity is captured at admission and retained
+through native callbacks; replies never retarget a freshly resolved receiver.
+Raw GET_WIPHY
+advertises GET_KEY only with the explicit native sequence capability and AP
+authenticator support. This supplies hostapd's GTK RSC query before M3/group
+rekey, not a key installation, selection, controlled-port or RF grant.
+Primary sources: Linux
+[`nl80211_get_key`/`get_key_callback`](https://codebrowser.dev/linux/linux/net/wireless/nl80211.c.html#nl80211_get_key)
+and hostap
+[`wpa_auth_get_seqnum`](https://chromium.googlesource.com/chromiumos/third_party/hostap/+/fb2d4c1a3971302455730191117b0e91ce9b8793/src/ap/wpa_auth.c).
+
+A source-qualified native AP may accept pre-START group keys as zeroizing
+software staging, following Linux's early-AP-key path. That ACK/default-choice
+record is staging metadata only: it grants no installed key, selected native
+default, controlled port or RF emission. The original exact source/interface/role
+authority remains retained; closure, revocation or role replacement erases stale
+staging, and a retired endpoint cannot be recaptured as a fresh source. START
+captures current callback-free emission guards from those original authorities
+outside native State, then requires actual multicast/broadcast station and
+key-install receipts before promoting any staged default choice or opening its
+controlled port. A failed or cancelled native install never promotes staged
+metadata.
+
+`supports_ap_authenticator` and `supports_ap_userspace_mlme` report the physical
+AP key/control and management paths independently of station external-supplicant
+and SME admission. GET_WIPHY reports the union of actual mode capabilities;
+station handshake offload/SAE admission remains derived from the station hooks.
+`supports_control_port_no_preauth` separately gates that ext feature. New native
+drivers do not gain its netdev-routing semantics merely by exposing AP EAPOL.
+`ApStartSettings` retains optional START_AP crypto attributes and the actual
+control-port configuration for `start_ap_with_settings_async`; a compatibility
+default refuses extra settings. The native owner checks agreement with its
+actual beacon/security profile before RF publication. SOCKET_OWNER and the
+actual control-port capability gate over-nl80211 configuration as in Linux.
+`ControlPortTxRequest` owns zeroizing staging before async admission. Native AP
+CONTROL_PORT_FRAME uses `tx_control_port_ap_async` with the same current guard
+and reservation. A requested status cookie is nonwrapping and its terminal
+extended ACK/status follows actual native completion. DONT_WAIT requests no
+peer-status receipt/event. Neither form is ordinary Ethernet/IP transmission;
+the native owner still validates configured EtherType, current peer and keys.
+
 `MbssidSupport` exposes a physical wiphy's
 `NL80211_ATTR_MBSSID_CONFIG` maxima. When present, `START_AP` accepts the
 nested MBSSID role (`INDEX`, optional self `TX_IFINDEX`, or a distinct
@@ -708,6 +1289,33 @@ an empty supplied vector clears that template piece). `WirelessNetIface`
 provides a down-only `set_iftype(NL80211_IFTYPE_*)` hook for drivers with
 multiple WMI vdev roles; it must reject a type change while a vdev exists.
 
+`WirelessNetIface::set_monitor_channel(monitor::Channel)` is an optional,
+synchronous down-only channel-selection hook. `Channel` carries the exact
+primary MHz, nl80211 width value, center1 MHz and center2 MHz; an unsupported
+geometry is refused rather than narrowed. `SET_WIPHY` routes WIPHY_FREQ,
+CHANNEL_WIDTH and CENTER_FREQ1/2 to this hook only in MONITOR iftype, under
+the same live delegated interface-admin authority used for SET_INTERFACE.
+An explicitly supplied MONITOR_FLAGS nested mask is passed to
+`validate_monitor_flags` before a type change; the default is unsupported,
+so active/injection, FCS/control and cooked-frame requests cannot be silently
+accepted by a driver which implements only its default capture profile.
+Admin UP starts the native capture asynchronously and carrier appears only
+after native sniffer/configuration receipts. A driver must close capture
+before role, down, removal, suspend or recovery transitions and must not
+reuse its station frame rings or station port/epoch for raw delivery.
+
+`monitor::encode(original_mpdu, Metadata)` produces version-0 radiotap plus
+the exact original MPDU. Metadata contains an observed primary frequency and
+optional observed dBm signal. The header has FLAGS and CHANNEL and includes
+dBm signal only when present; timestamp, PHY rate/GI, decryption and FCS
+validity are not fabricated. Minimum management/control/data headers,
+optional four-address/QoS/HT-Control bounds, frequency and allocation extents
+are checked. The adapter supplies an MPDU without trailing FCS and refuses
+translated, stripped or split representations that it cannot preserve.
+Radiotap formatting grants no device, mode or raw-socket authority. The
+consumable capture path is `narf_net::iface::on_monitor_frame_from` under its
+current monitor token; only already authorized AF_PACKET sockets can read.
+
 ### 3.1.1 Physical wiphys and virtual interfaces
 
 `WirelessNetIface::wiphy_id() -> u64` identifies the physical radio, not a
@@ -716,6 +1324,91 @@ netdev. The wireless registry groups every registered interface by that id:
 each visible netdev with that group's `WIPHY` value and an interface-unique
 `WDEV` id. The default `wiphy_id` is a stable name hash for simple drivers;
 multi-vdev hardware must override it with its physical-radio identity.
+
+An actual P2P-device is a control-only registered wdev, independently of an
+Ethernet netdev. `registry::register_control(parent, child)` pairs the actual
+still-registered physical parent with a same-wiphy mode10 child whose real
+typed net interface declares its immutable control namespace. It requires no
+legacy IFACES entry, invented ifindex, IFF_UP, carrier or packet rings. Trusted
+driver registration supplies actual registration/device/current-request grants;
+the registry's observations mint no capability. `ControlWdev` carries a
+nonwrapping opaque registration identifier and namespace; `control_for`,
+`control_by_id` and `unregister_control` compare the exact original object/id.
+The stored physical-parent object must remain registered; retiring it also
+invalidates child lookup/discovery, pending control publication and identity
+observations. An orphan child is never promoted to a physical wiphy.
+Rebind with the same name/MAC/mode cannot revive an old observation or remove
+the successor. The control-id space is disjoint from existing netdev WDEV
+encoding; the existing nonnegative signed wiphy-index bound follows Linux
+`wiphy_new_nm`. Existing netdev indices/WDEV values retain their shape.
+
+`RadioControlAuthority::bind_wdev(admin, iface, namespace, wdev, source)` binds
+the actual control-only identity with no ifindex parameter. The private target
+is explicitly Netdev or ControlWdev. Actual Admin/source/receiver/mode-generation
+checks still precede every native operation/publication; observations establish
+no started wdev, CNM grant, RF right, key or port. Ordinary netdev/AP/GO guards
+retain their existing UP/ownership-epoch contract. Typed control-wdev radio
+events omit IFINDEX and carry their actual WDEV id, while ordinary netdev and
+scheduled-scan event shapes remain unchanged. This registration facade itself
+advertises no P2P role or native control operation.
+
+`WirelessNetIface::p2p_interface_types()` selects the family's actual P2P
+interface-type subset for wiphy advertisement. Its default preserves the
+existing DEVICE10/CLIENT8/GO9 wire order. Serialization consults the subset
+only when that family's `WirelessModes::P2P` is present, ignores values outside
+8/9/10, and emits each selected type once. A native implementation that
+completes only control-device operations returns `[10]`; GO/client require
+their own implemented role owners. Interface combinations, actual typed
+registration/source authority, native START/ROC receipts, and per-operation
+RF/key/port admission remain independent requirements.
+
+`async_p2p_netdev_management_tx_control()` and
+`async_p2p_netdev_management_rx_control()` separately opt an implemented
+CLIENT8/GO9 netdev into `FRAME`/`REGISTER_FRAME` through the existing native
+Radio callbacks. Both default to false. The actual current type must be 8/9,
+selected in the family's P2P subset and backed by `WirelessModes::P2P`.
+The managed2 and control-only DEVICE10 opt-ins keep their original scopes.
+This extends the earlier capture-only mode8/9 seam with explicit public
+operations; a marker alone provides no native role, RF or peer authority.
+The original IFINDEX, delegated grant, source socket, administrative UP,
+reservation and mode/ownership generation remain bound through every poll
+and terminal publication. The driver retains native cancellation/cleanup
+when a source or external waiter disappears.
+
+`P2pGoPowerSave { ctwindow_tu: Option<u8>, opportunistic: Option<bool> }`
+is the bounded GO part of START_AP and SET_BSS. CTWindow is 0..127 TUs;
+OPPPS is a u8 wire 0/1. `ApStartSettings::p2p_go` carries explicitly supplied
+initial attributes 162/163. For live SET_BSS (command25), `None` leaves the
+corresponding value unchanged, while `Some(0)`/`Some(false)` resets it.
+The dispatcher rejects duplicates, malformed lengths/values, non-GO roles
+and fields other than IFINDEX/these two settings on this bounded SET_BSS
+route. Both operations require actual current GO9, the implemented P2P
+subset, native AP generation and `supports_p2p_go_power_save()`; that opt-in
+is false by default. Only such a provider advertises SET_BSS and feature
+bits 11/12. `set_p2p_go_power_save_ap_async` runs under the original reserved
+AP authority and returns only after the actual native update receipt.
+No success ACK or setting authority follows queue admission alone. A
+closed source, revoked grant, DOWN/UP or role-generation ABA suppresses
+promotion by the old owner. Existing AP drivers keep their previous
+default fields and callbacks. This interface supplies no Intel firmware
+field, NoA event, additional netdev or P2P feature completion by itself.
+
+`GET_INTERFACE` resolves a control-only target by its exact WDEV/namespace and
+emits no IFINDEX attribute; retired IDs cannot select another object. WDEV-based
+physical-wiphy lookup resolves the same registered control object rather than
+interpreting its opaque identifier as a fabricated netdev index.
+
+`RadioControlAuthority::retain_control_child(child, actual_child_cap)` checks
+the registered physical-parent/child objects and namespace, then delegates
+inside net's actual parent/daemon/typed-parent/typed-child invocation. Only the
+exact creating source may retain the resulting fresh child Admin; there is no
+raw daemon-cap export, name-derived authority or wire capability. The grant
+retains parent and child registration/grant lifetimes and original parent
+ownership epoch. The control-only native P2P handlers may consult that source's
+previously explicitly retained child grants; ordinary netdev/legacy handlers
+retain their existing context behavior. A closed/rebound source, retired child
+or replaced/transferred/revoked parent cannot lend its administration to a
+successor. Kernel namespace administration keeps its existing scope.
 
 Drivers which can create firmware vdevs opt in through
 `supports_virtual_interfaces`, `new_virtual_interface(name, iftype, mac)`,
@@ -767,6 +1460,57 @@ The default is `-EOPNOTSUPP` (ath11k keeps it because its target firmware
 cannot transmit More Fragments frames). A driver that implements the setter
 reports the retained value through `fragmentation_threshold()`, and a wiphy
 that reports one also advertises `SET_WIPHY`.
+
+The additive `packet_key::fragment` and `station_security::fragment` helpers
+implement explicit software fragment cryptography/protocol ownership; they
+advertise no native fragmentation or RF capability. Ordinary `Key` and
+`Security` entry points keep rejecting fragment headers. `Key::protect_fragment`
+and `unprotect_fragment` preserve the ORIGINAL More-Fragments and fragment
+number through CCMP AAD/nonce processing, retain the existing per-key/TID or
+management replay slot, and commit replay only after MIC. Group and MLD
+fragment crypto, A-MSDU/BlockAck/+HTC fragment forms remain refused.
+
+The opaque fixed `KeyIdentity` is denial-only: it exposes no key bytes,
+callbacks or install authority and cannot keep a key installed. Changed-key
+reinstall, drop and terminal `Security::fail` retire it; identical-key retries
+preserve it and PN state. `Security::transmit_ethernet_fragments` allocates and
+validates a complete bounded train before allocating one MSDU SN and a fresh
+PN per original fragment. `protect_management_fragments` uses its caller's
+one assigned management SN, PMF's management nonce and that same PTK TX PN
+namespace. `FragmentTrain` retains immutable ciphertext and its original key
+identity. Its consuming `with_durations(self, &[u16])` builder permits only
+an exact-count projection into CCMP-muted Duration/NAV with bit15 clear;
+it preserves ciphertext, PN/SN and original key identity, invokes no callback,
+and grants no RF emission. The native caller must perform actual current source/peer/profile/
+size/prefix/BA-window admission before crypto, retain bytes across Busy rather
+than regenerate PN/SN, serialize actual per-MPDU terminal ownership, and
+recheck original native/source/port/key proof at publication. Linux's threshold
+bounds plaintext header+body+FCS; CCMP overhead is added after splitting.
+Rate/NAV/descriptor sequencing, qualification and actual interface controls
+remain native responsibilities.
+
+The boxed opt-in RX cache shares FOUR total round-robin slots across plaintext
+EAPOL, protected DATA and original unicast management. It keeps a two-second first-fragment
+lifetime, 4096-byte complete bound, exact TA/RA/A3/frame-type/TID/SN/next-fragment
+identity, and no group fragments. Protected fragments additionally require
+one original current key identity and consecutive PN values. Plaintext and
+protected fragments never combine, and a plaintext sequence cannot cross
+initial-key installation or a changed-key epoch. `receive_fragment_with_nonce`
+requires each ORIGINAL `RawFrame` native peer/channel/profile/CRC/copy-epoch
+proof and passes a completed frame through the SAME retained EAPOL verifier:
+plaintext reassembly never opens a data port, nonce/MIC/replay/RSN checks and
+terminal reply/key installation remain mandatory. `receive_management_fragment`
+reassembles original plaintext management under the same pre-key/nonrobust PMF
+policy without fabricating a new original `RawFrame`: an installed PTK still
+denies every plaintext robust frame. Protected management authenticates with
+its retained PTK during rekey; plaintext and protected management share those
+same four slots and cannot mix. `fragment_pending(now_ms)` is only a work
+observation for the native worker/LPS owner. Native association/source changes
+must retire caches; these helpers grant no source, DMA, capture, port or RF
+authority. Corrupt, foreign, timed-out, mixed-key or nonconsecutive fragments
+cannot deliver an MSDU. Exact Linux7.3-rc4 source pins and six unexecuted
+cryptographic/protocol cases accompany the source handoff; native adapters
+and physical acceptance remain separate.
 
 `TxBitrateMask` / `TxBitrateBand` carry the complete nested
 `NL80211_ATTR_TX_RATES` request: the `nl80211_band` ordinal selects one band,
@@ -926,7 +1670,7 @@ HT/VHT capability + mask, `CONTROL_PORT`, `CONTROL_PORT_ETHERTYPE` = ETH_P_PAE,
 `CONTROL_PORT_NO_ENCRYPT`, `SOCKET_OWNER`, `EXTERNAL_AUTH_SUPPORT`, `SAE_PWE`,
 `MLO_SUPPORT`, `CONTROL_PORT_OVER_NL80211`, `CONTROL_PORT_NO_PREAUTH`) with
 `nl80211_connect` / `nl80211_crypto_settings`' checks; hints and overrides
-steer nothing. `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2).
+steer nothing (`MLO_SUPPORT` permits MLO: see the public MLO station surface below). `USE_MFP` is `enum nl80211_mfp` (REQUIRED = 1; OPTIONAL = 2).
 OPTIONAL requires explicit default-false `supports_optional_mfp()` plus PSK
 and required-PMF offload; a complete native owner advertises extended bit21.
 A PMK needs `4WAY_HANDSHAKE_STA_PSK` and a SAE
@@ -1024,6 +1768,14 @@ userspace over AUTHENTICATE as on Linux. The external mode is:
   preserves the associated firmware transport; absent WoW disconnects and
   cold-cycles the interface. `GET_WOWLAN` therefore reports configuration,
   not a promise that the platform is currently asleep.
+  `wowlan_net_detect_limits() -> Option<SchedScanSupport>` supplies the
+  family's NET_DETECT SSID, IE, match, frequency and scan-plan bounds for
+  both GET_WIPHY and SET_WOWLAN parsing. These bounds grant no capability:
+  `WowlanSupport` must separately advertise network detection, and the
+  parser intersects match/random-address support with that advertisement.
+  The default retains ath11k's existing 16-SSID, 512-byte IE, two-plan,
+  7200-second/100-iteration profile. CONNAC2 can provide its actual ten-SSID,
+  one-plan/65535-second profile without changing the other family.
 - **Scheduled scan.** A wiphy whose
   `WirelessNetIface::sched_scan_support() -> Option<SchedScanSupport>` is
   `Some` advertises `NL80211_CMD_START_SCHED_SCAN` / `STOP_SCHED_SCAN` (75 /
@@ -1043,6 +1795,42 @@ userspace over AUTHENTICATE as on Linux. The external mode is:
   "scan". STOP (an optional COOKIE must be the legacy request id 0, otherwise
   -ENOENT) calls `stop_sched_scan()` and multicasts SCHED_SCAN_STOPPED. Both
   driver hooks default to -EOPNOTSUPP.
+
+  `async_sched_scan_control()` explicitly opts a driver into native terminal
+  acknowledgements through `start_sched_scan_async` / `stop_sched_scan_async`.
+  These use `RadioControlAuthority`, the actual `radio_control_generation`
+  and synchronous `reserve_radio_control` lease; a callback or support flag
+  supplies no administrative, firmware, channel or RF grant. Admission binds
+  the original delegated grant, exact source socket, namespace/ifindex and
+  mode generation before queueing. Every poll and final publication require
+  continuing authority and administrative UP. The native callback retains
+  cancellation/repair independently of a dropped external waiter, and it
+  returns success only after the actual firmware start or terminal stop.
+  The original sequence receives its deferred ACK after that result; queue
+  admission alone sends no success or scan event. Drivers without this
+  opt-in retain the existing synchronous path and its default callbacks.
+
+  `sched_scan_pass_all()` separately opts into Linux's filterless/pass-all
+  requests and empty SSID match. Its default is false, preserving existing
+  WoWLAN network-detect restrictions. It changes parsing facts only; the
+  native owner still supplies every firmware, source and radio proof.
+
+  The native owner may retain typed `RadioEventAuthority` methods
+  `scheduled_scan_started`, `scheduled_scan_results` and
+  `scheduled_scan_stopped`. They check the actual registered source and
+  generation and publish to that namespace's scan group. Only matching
+  native UID/start/result/stop receipts, current filters and current radio
+  policy justify those calls; the type does not establish those hardware
+  facts. Event publication occurs outside native owner locks. Losing the
+  source suppresses later event/ACK delivery and still requires the driver's
+  retained physical stop or repair path for an autonomous firmware scan.
+
+  `scheduled_scan_results_with_bss` accepts the native owner's admitted
+  `(BssInfo, IEs)` snapshot, bounds it to256 entries and replaces only the
+  current namespace/ifindex cache before RESULTS. The cache rechecks the
+  exact source under its lock and refuses a competing foreground operation;
+  GET_SCAN then observes the same records. A control-only WDEV cannot use
+  this netdev cache method. Legacy notification-only hooks remain available.
 
   The driver reports matches with `nl80211::notify_sched_scan_results(name)`
   (`cfg80211_sched_scan_results`, CMD 77) and a firmware-initiated end with
@@ -1282,6 +2070,40 @@ ath11k supplies Linux's default, station, and AP records for extended channel
 switching, MBSSID, operating-mode notification, TWT requester/responder, and
 EMA capability.
 
+**Public MLO station surface (`mlo`).** `supports_mlo()` (default false) is
+`WIPHY_FLAG_SUPPORTS_MLO`: GET_WIPHY then emits the `NL80211_ATTR_MLO_SUPPORT`
+flag, and each `IftypeExtendedCapability` record additionally carries its
+`eml_capabilities` (`NL80211_ATTR_EML_CAPABILITY`, u16) and
+`mld_capa_and_ops` (`NL80211_ATTR_MLD_CAPA_AND_OPS`, u16), plus
+`ext_mld_capa_and_ops` (`NL80211_ATTR_EXT_MLD_CAPA_AND_OPS`) only when
+non-zero (nl80211.c `nl80211_send_wiphy`); a non-MLO wiphy emits none of
+them. CONNECT's `NL80211_ATTR_MLO_SUPPORT` is an empty flag (a payload is
+-EINVAL) decoded as `CONNECT_REQ_MLO_SUPPORT`: on an MLO wiphy a fresh
+connect calls `associate_mlo(AssociateRequest)` (default: `associate`),
+otherwise `associate` — the driver "shall disable MLO features" then. A
+roam stays `roam`. As in Linux, CONNECT does not take `NL80211_ATTR_MLO_LINKS`
+(the SME-offload driver selects the links itself and applies
+`cfg80211_mlme_check_mlo`'s same-AP-MLD/EML/MLD-capability checks);
+`AUTHENTICATE`/`ASSOCIATE` keep rejecting `MLO_LINKS`/`MLO_LINK_ID`
+(-EINVAL), since no driver offers both userspace MLME and MLO.
+`mlo_connection() -> Option<MloConnection { ap_mld, assoc_link_id, links:
+Vec<MloLink { link_id, address, bssid, status, channel: Option<LinkChannel
+{ frequency_mhz, width, center_freq1_mhz, center_freq2_mhz }> }> }>` (default
+None) is the current MLO connection, every requested link in link-id order.
+It drives (sme.c `__cfg80211_connect_result`): the successful CONNECT event's
+`MAC` and the following PORT_AUTHORIZED peer become the AP MLD, and
+`NL80211_ATTR_MLO_LINKS` nests entries 1..n per requested link with
+`MLO_LINK_ID`, `BSSID` (AP link), `MAC` (own link) and `STATUS_CODE`
+(`nl80211_send_connect_result`); GET_INTERFACE nests entry `link_id + 1` per
+*valid* (status 0) link with `MLO_LINK_ID`, `MAC` and `nl80211_send_chandef`'s
+`WIPHY_FREQ`, `WIPHY_FREQ_OFFSET` (0), `WIPHY_CHANNEL_TYPE` (20_NOHT/20/40
+only), `CHANNEL_WIDTH`, `CENTER_FREQ1`, `CENTER_FREQ2` when non-zero
+(`nl80211_send_iface`); GET_STATION keys the AP station by the AP MLD address
+and appends `MLO_LINK_ID` (association link) and `MLD_ADDR`
+(`sinfo->mlo_params_valid`). Per-link station statistics
+(`NL80211_ATTR_STA_DUMP_LINK_STATS`), per-link TX power and MLO ROAM events
+are not provided.
+
 `wiphy_mac_addresses()` supplies a multi-vdev radio's preallocated address
 pool; a pool with more than one member is emitted as nested
 `NL80211_ATTR_MAC_ADDRS`, alongside the physical base `MAC`. A nonzero
@@ -1368,6 +2190,13 @@ the MPDU as the equivalent 26-octet header with Order clear, which gives the
 same AAD and nonce, and drops the HT Control field. The `RawFrame` contract
 therefore keeps HT Control and Order unmodified, and advertising HTC_HE
 loses no AP traffic. Order on non-QoS DATA is still refused.
+`Security::transmit_ethernet_qos_htc(ethernet, tid, control)` builds the
+30-octet HE-variant QoS header, setting Order and EOSP before software CCMP
+protection. The four control octets follow QoS Control; they are excluded
+from AAD, while the ordinary key PN and per-TID sequence are shared with
+`transmit_ethernet_qos`. Invalid TIDs, non-HE control variants, EAPOL and
+closed ports are refused. Callers own HE negotiation, control contents,
+rate-fallback fencing and native RF/queue admission.
 `build_nonce` includes the transmitter address and big-endian 48-bit PN.
 `protect` / `unprotect` take an `AesCcm` backend and are both fallible: a
 backend seal/open refusal propagates as `CcmpError` (`TooLong` for a body
@@ -1507,11 +2336,81 @@ clear/retire/drop ownership.
 
 `station_security::{Security, RawFrame, Rx}` composes the shared WPA2-PSK
 supplicant with those keys. Drivers supply already-negotiated station/AP RSNEs
-and original descriptor-validated native MPDUs. `RawFrame::unmodified()` must
-reject hardware-decrypted/decapsulated packets and frames outside the adapter's
+and original descriptor-validated native MPDUs. Outside the `*_decrypted`
+entry points below, `RawFrame::unmodified()` must reject
+hardware-decrypted/decapsulated packets and frames outside the adapter's
 admitted peer/channel/PHY profile before nonce or key state can advance. The
 security owner additionally checks native addresses, DS direction, fragments,
 EAPOL envelope and negotiated crypto. It grants no radio or carrier authority.
+
+Device key offload (Interface addition; first user ath10k, Linux
+`rawmode=1 cryptmode=0`) is an additive pre-handshake opt-in,
+`Security::with_hardware_keys() -> Result<Self, Error>` (refused for MLD or
+after keys exist). The owner stays the RSNA, PN and replay authority:
+- `take_key_installs() -> Vec<KeyInstall { pairwise, key_id, material, token }>`
+  drains PTK/GTK entries committed at a reply's terminal delivery (only when
+  material changes; PTK before GTK; IGTK never, BIP stays software as in
+  ath10k/ath11k `set_key`). `key_installed(token) -> bool` marks a slot's
+  *current* material device-resident; `key_install_failed(token)` keeps it
+  software-only; any newer commit returns the slot to pending.
+- `pairwise_offloaded()`, `transmit_ethernet_offload(eth, tid)` and
+  `protect_management_offload(frame)` emit the mac80211
+  `IEEE80211_KEY_FLAG_GENERATE_IV{,_MGMT}` form (Protected header + CCMP
+  header + plaintext, PN from the shared counter; the device appends the MIC).
+- For a device that owns the transmit PN and has no software data crypto
+  (ath10k native-WiFi decap, `ath10k.md` §3.7): `transmit_ethernet_device(eth,
+  tid)` emits the Protected header + plaintext (no CCMP header, no PN
+  consumed) for the confirmed PTK, `pending_frame_device()` the pending
+  EAPOL reply in that form (plaintext before any PTK; Protected plaintext
+  only while the current PTK is confirmed, else `None`), and
+  `reply_delivered_device(native_bytes)` records its terminal delivery.
+- `receive_decrypted_with_nonce`, `receive_amsdu_decrypted_with` and
+  `receive_management_decrypted` admit a device-decrypted MPDU (Protected and
+  CCMP header kept, MIC removed by the driver) only for a confirmed slot, and
+  apply the PN check against the same per-key/TID (or management) replay
+  window as software CCMP (mac80211 `ieee80211_crypto_ccmp_decrypt` with
+  `RX_FLAG_DECRYPTED`). Software receive/transmit remain available per frame.
+`packet_key::Key` gains the matching `protect_header`,
+`protect_management_header`, `accept_decrypted`,
+`accept_decrypted_management` and `accept_decrypted_amsdu_with` (non-MLD).
+
+WoWLAN suspend snapshot (Interface addition; first users rtw88 and rtw89
+WoW): `Security::suspend_keys() -> Option<SuspendKeys { pairwise, groups }>`
+returns the zeroizing CCMP-128 PTK and live GTKs (never IGTK) of a settled
+open, non-MLD port with no handshake in flight. `Security::suspend_floors()
+-> Option<SuspendFloors { pairwise_tx, pairwise_rx, groups: Vec<(id, pn)> }>`
+returns, under the same preconditions and key set, the PTK's last transmit
+PN and each key's data replay floor (`packet_key::Key::data_replay_floor`,
+the highest PN accepted on any TID/non-QoS counter; `Key::transmit_pn`), for
+device firmware that checks replay itself while the host sleeps (Linux
+`rtw89/wow.c::rtw89_wow_get_key_info_iter` `ptk_tx_iv`/`ptk_rx_iv`/
+`gtk_rx_iv`, which reads TID 0 only; the maximum is the stricter floor of a
+single per-key peer PN sequence). Both are read-only: no PN, replay or key
+state changes, and the floors are wiped on drop.
+
+`Security::with_mld(context)` is an additive pre-handshake opt-in. Its
+constructor MACs must equal the context's physical link pair and PMF must be
+negotiated. `RawFrame::mld_context()` defaults to None; an MLD native adapter
+returns the exact context only after proving its current descriptor/link/peer
+owner. The security owner compares the full context before any crypto or PN
+work, and `reply_delivered_mld(&context, native_bytes)` requires it again at
+the exact native M2/M4/group terminal boundary. The ordinary receipt method
+cannot commit an MLD reply. Original physical 802.11 headers, PN windows and
+native key/peer slots remain source-bound. After that proof,
+`Context::data_crypto_header` supplies a separate bounded crypto header:
+unicast DATA A1/A2 and nonce A2 use MLD addresses; group DATA and management
+keep the physical link addresses. Ordinary MSDU A3 and FC/SC/QC are preserved.
+Only an exact unicast A-MSDU with raw A3 equal to the physical AP BSSID also
+uses AP MLD A3 for crypto. No original header is modified and no alternate
+address-form decryption is attempted. This follows pinned Linux7.2
+rx.c:5228..5250/wpa.c:574..587 (original address crypto is preserved only for
+non-data management), and Intel mld/tx.c:515..530 (A-MSDU BSSID translation
+occurs after encryption). Logical Ethernet source and local destination use
+the MLD MAC. The internal packet-key A-MSDU seam checks the physical outer
+receiver and exact link context first, then admits only
+the logical local/group subframe DA and legitimate external bridged SAs; it
+commits replay state only after the entire aggregate passes. An IEEE Link ID
+or translated frame address alone supplies none of these native proofs.
 
 `receive_with_nonce` lazily requests fallible secure SNonce material through
 the existing supplicant contract. `pending_frame` retains each exact M2/M4 or
@@ -1545,6 +2444,14 @@ replenishment and drain previous packets before using that sample as an ADDBA
 starting sequence. `transmit_ethernet_qos` consumes the selected counter while
 forming the original header before CCMP; protected headers are never rewritten.
 The sample alone grants no aggregation, native completion or transmit authority.
+
+`Security::reserve_plain_control_sequence()` reserves one slot in the same
+non-QoS DATA/EAPOL sequence space for an independently admitted plaintext
+control frame. It refuses a closed, failed or active-handshake owner, advances
+the checked 12-bit counter through wrap, and consumes no CCMP PN or key/replay
+state. A driver emitting a plaintext off-channel Null function must retain its
+own native peer, queue and current policy proofs; this helper grants none.
+QoS Null uses SN0 and does not call it, preserving all per-TID DATA counters.
 
 `Security::receive_amsdu(&impl RawFrame)` composes that aggregate key operation
 with the existing currently-open controlled port and installed pairwise/group
@@ -1608,6 +2515,55 @@ rekeys and discarded traffic never request fresh entropy. `None` returns
 caller aborts the attempted handshake/rekey. Production callers use the
 fallible hardware-seeded crypto API, with no timing fallback. Existing
 `rx_eapol` retains its fixed-byte interface through this same implementation.
+
+`Supplicant::configure_mld(context)` binds one PMF CCMP-128/BIP-CMAC-128
+association before M1, uses the logical MLD pair for PTK derivation and keeps
+ordinary handshakes unchanged. `eapol::mlo::message1` checks the AP MLD MAC KDE
+before consuming a fresh SNonce; `message2` adds the station MLD MAC KDE to
+the station RSNE/RSNXE. `authenticated_keys(context, kind, key_info, data,
+Profile)` is the shared native helper for already MIC-verified, AES-unwrapped
+M3/group data. It bounds the complete TLV stream and padding, requires
+encrypted key delivery and M3 Install+Secure, checks the exact AP MLD MAC,
+selected Link KDE/AP physical MAC and RSNE/RSNXE, and accepts only that link's
+ML GTK/IGTK KDEs. Duplicate, foreign-link, mixed legacy, Extended Key ID and
+unnegotiated BIGTK deliveries fail. Each ML GTK's own six-octet PN supplies
+its RSC; a descriptor-wide RSC cannot replace it. The checked records feed
+the existing install/reinstallation, retired-key history, old-key reply and
+exact M4/group terminal state machines. These pure helpers grant no MIC,
+firmware key-install, radio, controlled-port or completion authority. Multiple
+active links and other ciphers remain outside this explicit one-link profile.
+
+### 3.5.2 Reconnection profiles across recovery (`reconnect.rs`)
+
+Linux keeps the `net_device` across `ieee80211_restart_hw`; when a driver
+cannot keep the association (`IEEE80211_SDATA_DISCONNECT_HW_RESTART`),
+mac80211 `ieee80211_sta_restart` reports `ieee80211_sta_connection_lost` and
+wpa_supplicant reconnects from the network block it still holds. A NARF
+recovered generation is a new driver object behind the rebound `wlan%d`
+name, so the in-kernel connection owner keeps that block here, keyed by the
+netdev name:
+
+- `Profile::capture(&AssociateRequest) -> Option<Profile>` keeps BSSID,
+  SSID, frequency/channel, SME elements and the credential (PSK or SAE
+  password in `Zeroizing` storage). `SecurityConfig::External` and an empty
+  SAE password are never captured: an external supplicant owns its own
+  reconnection. Accessors expose only the non-secret identity;
+  `Profile::request()` rebuilds an `AssociateRequest` for the driver's own
+  associate path (no fresh authority: the driver still applies its
+  regulatory, scan and RSNA checks).
+- `Owner { family, permanent_mac }` binds a block to the radio that
+  retained it (mac80211 keeps `wiphy->perm_addr` across
+  `ieee80211_restart_hw`); a name alone is not an identity, since another
+  device or driver may later register the same `wlan%d`.
+- `retain(name, owner, profile)` after an association completed (replacing
+  an older block), `forget(name)` on operator disconnect,
+  `take(name, owner)` once by the successor generation, `retained(name,
+  owner)`. A `take` by a different owner removes and zeroizes the block and
+  returns nothing.
+
+Drivers replay with an ordinary scan for the retained SSID/BSS on its
+channel, then association and a fresh RSNA; no keys, PN or peer state cross
+generations. ath10k is the first user (`drivers/wireless/specification/ath10k.md`).
 
 ### 3.5.1 SAE commit entropy (`sae`)
 
@@ -1695,7 +2651,8 @@ regulatory database or a country inferred from AP advertisements.
 The byte format is `NRGD[4]`, version `u16=1`, uppercase country `[u8;2]`,
 rule count `u16`, reserved `u16=0`, followed by 1–64 rules of 16 bytes:
 start MHz `u32`, end MHz `u32`, maximum bandwidth MHz `u32`, power dBm
-`i8`, `RegFlags` `u8`, reserved `u16=0`. Integers are little-endian;
+`i8`, `RegFlags` `u8`, second `RegFlags` byte `u8` (bits 8..15), reserved
+`u8=0`. Integers are little-endian;
 unknown flags, malformed ranges and length mismatches are rejected.
 `RegFlags` assigns DFS=bit0, INDOOR_ONLY=bit1, NO_P2P=bit2 and NO_IR=bit3.
 NO_IR permits passive reception but denies active probes and host-initiated
@@ -1709,6 +2666,36 @@ and 23). Bit 6, WMM_ETSI, attaches wireless-regdb's `wmmrule=ETSI` (ETSI EN
 301 893), the only WMM rule in `db.txt`. The 6 GHz bits are described with
 6 GHz band identity in §3.
 
+Bit 7, `DEPLOYMENT_INDOOR`, is an explicit assertion by the trusted policy
+installer that the current installation is indoors. It is valid only together
+with `INDOOR_ONLY`; an unpaired assertion is a format error. Parsing establishes
+no trust: the ordinary signed firmware bootstrap or the existing trusted
+installer must supply authority. An AP advertisement, country code or firmware
+capability does not create this fact. A driver may admit an indoor-only rule
+only while its current installation fact and all other limits remain valid;
+every overlapping indoor-only rule needs its own fact. Replacement or clear
+must remove stale transmit admission through the family's live-policy path.
+The installer must update policy when the installation changes. `GET_REG`
+continues reporting `INDOOR_ONLY` as Linux `NO_OUTDOOR`; this NARF deployment
+metadata is not mapped to a Linux restriction bit or an automatic netlink hint.
+Older NRGD readers reject bit7 rather than discard its installation semantics.
+
+The second flag byte (rule byte 14, formerly reserved and therefore rejected
+by older readers when nonzero) holds `RegFlags` bit8 `AUTO_BW` and bit9
+`NO_160MHZ`; its other bits are rejected. `AUTO_BW` is cfg80211
+`NL80211_RRF_AUTO_BW` (wireless-regdb `AUTO-BW`, `FWDB_FLAG_AUTO_BW`) and
+`NO_160MHZ` is `NL80211_RRF_NO_160MHZ`; GET_REG reports them as Linux bits 11
+and 16. `RegulatoryDomain::max_bandwidth(index) -> u32` is
+`reg_get_max_bandwidth` as `handle_channel` applies it (net/wireless/reg.c):
+under AUTO_BW the span of the run of rules adjacent in policy order
+(`reg_get_max_bandwidth_from_range`), else the rule's own maximum; NO_160MHZ
+caps either at 80. `RegulatoryDomain::allows_bandwidth(low, high, width)`
+holds when every rule overlapping `low..high` allows `width`, so a 160 MHz
+channel crosses a rule boundary (US 5170-5250 / 5250-5330) only when both
+rules carry AUTO_BW. Coverage, DFS, NO_IR, indoor and power checks are
+unchanged and stay per rule. A driver that does not use these helpers must
+still reject an AUTO_BW or NO_160MHZ rule it does not understand.
+
 **Regulatory WMM rule (`reg::{WmmRule, WmmAcRule}`).** `RegRule::wmm_rule()
 -> Option<WmmRule>` is cfg80211 `ieee80211_reg_rule.wmm_rule` with
 `has_wmm`. `RegulatoryDomain::rule_for(mhz)` (`freq_reg_info`) and
@@ -1720,6 +2707,28 @@ the `db.txt` values. `WmmRule::limit(ac, ap, wmm::Ac) -> wmm::Ac` is mac80211
 the floor and caps TXOP at COT/32 us. `limit_parameters(ap, wmm::Parameters)`
 applies it in the parser's ACI order (BE, BK, VI, VO). A driver applies it to
 every EDCA set it programs on a channel whose rule carries the WMM rule.
+
+**Station passive-channel witness (`reg::witness`).** cfg80211 marks a
+20 MHz channel `IEEE80211_CHAN_RADAR` / `NO_IR` when an overlapping rule
+carries DFS / NO_IR (reg.c `handle_channel_single_rule`); mac80211 scans those
+passively (scan.c `ieee80211_scan_state_decision`, `ieee80211_prep_hw_scan`)
+and a station joins only a BSS it heard (scan.c `cfg80211_bss_update`, reg.c
+`regulatory_hint_found_beacon` / `beacon_found`). Driver-neutral helpers:
+`span_flags(domain, center) -> Option<RegFlags>` (union over rules overlapping
+`center±10`, open interval), `is_radar`, `passive_only` (DFS or NO_IR) and
+`may_probe` (covered and neither; no probe request otherwise).
+`BeaconWitness` holds per-20 MHz-center witnesses scoped to one policy
+snapshot (`Arc` identity) and to the latest scan generation covering each
+center: `begin_scan(&policy, centers) -> ScanGeneration` (new snapshot
+discards all; each covered center is retracted until re-heard),
+`beacon_found(generation, center) -> bool` (only the latest covering
+generation records; the caller validates the Beacon and its dwell),
+`heard(&policy, center)`, `clear()`, and `may_associate(&policy, centers)`:
+nonempty, every constituent covered, every passive-only constituent heard.
+The same query gates a station CSA target. A witness never authorizes probe,
+AP, IBSS, P2P or off-channel TX; bandwidth, power, indoor and inventory checks
+stay with the driver. Users: ath10k (`beacon_hints::Owner`, radar only) and
+rtw89 (station scan / association / CSA).
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 
@@ -1728,6 +2737,69 @@ and WPA2 state machine behind `WirelessNetIface`. That in-kernel placement
 is the approved architecture (decision §8.3, 2026-10-23), not an interim
 step toward a userspace-daemon split; the daemon design described in
 earlier revisions of this specification is dropped.
+
+The optional `RadioControlAuthority::go_ap_control_for` view is limited to
+an actual original GO9 netdev, administrative UP and a retained reservation.
+An opted-in backend must serialize its AP and radio controls through the
+same actual native control domain. The view requires the original current
+receiver/admin/socket/registration and equal original radio/AP generations,
+then rechecks the AP view. It retains the same typed caps, source, target and
+reservation; it never rebinds an endpoint or captures fresh authority. Native
+GO FRAME/REGISTER_FRAME may delegate that view to the existing real AP owner,
+whose channel, role, key, callback-free emission and native TX/copy receipts
+remain mandatory. NO_CCK and matching IFINDEX/WDEV request forms keep their
+normal strict parser and original-source terminal checks.
+
+
+`RadioControlAuthority::complete_frame_for` optionally records one native
+CLIENT FRAME completion proof on the same original authority clones, after
+actual terminal ACK/no-ACK and packet retirement. The one-shot slot requires
+that original reserved CLIENT8/netdev authority and exact receiver/cookie;
+it cannot rebind a source, admit RF, create a grant or reuse a completion for
+another request. A duplicate record or mismatched cookie refuses that query
+without retiring an otherwise current receipt. An observed false native
+proof latches denial on all original clones; false-to-true provider state
+cannot revive it. Providers without this optional receipt retain their
+existing contract.
+`RadioFrameCompletion::current` is strictly a fixed denial proof: only original
+retained capability invokes, concrete weak-provider lifetimes, native atomic
+epochs and concrete policy snapshots are permitted. It must not call virtual
+interface/socket/source providers, take native State, poll or wait. Full
+normal guard callbacks finish first, then this original proof is rechecked
+by `current`, `check_for` and `require_link`. FRAME additionally checks after
+its final virtual wiphy/selector queries immediately before TX_STATUS and
+cookie publication; the original deferred authority retains that same proof
+for final reply/ACK delivery. Late callbacks cannot turn a retired native
+association, physical source, port/copy epoch or RF policy into success.
+
+`WirelessNetIface::ap_sme_capabilities()` defaults to `None`. A driver may
+return `Some(capabilities)` only for an actual firmware/device AP SME; `Some(0)`
+reports that owner without optional offloads. GET_WIPHY requires actual AP
+support and encodes DEVICE_AP_SME141 as a native-endian u32, preserving only
+known SA_QUERY_OFFLOAD bit0. It is not an empty NLA flag and supplies no WPA
+authenticator, key, peer authorization or RF authority. Existing absent defaults
+and host-SME contracts are unchanged.
+
+`ApEventAuthority::prepare_station_associated(peer, generation, assoc_req_ies)`
+and `prepare_station_lost(peer, generation)` prepare actual native firmware-SME
+NEW_STATION19/DEL_STATION20 notifications on the original START event source.
+They retain the original IFINDEX3/WDEV153 and serialize MAC6, observed u32
+GENERATION46 and empty nested STA_INFO21 when no measured fields are supplied.
+NEW_STATION additionally carries nonempty complete IE42 bytes, bounded2304;
+DEL_STATION invents no IEs, key/port state or reason. Peer identities must be
+unicast and nonzero. The wire generation, IEs and preparation grant no native
+association, authentication, authorization, key, DATA or RF authority.
+
+Preparation performs all dynamic source/interface callbacks and serialization
+outside native State. Before consuming the existing opaque `PreparedApEvent`,
+the concrete driver rechecks its original native source/RX epoch, exact AP/peer
+generation and fixed emission proof. Native loss applies its denial first;
+genuine station events need no DATA-port grant. Final token delivery performs
+only original fixed checks without endpoint lookup, fresh source capture or
+arbitrary current callbacks. Linux7.3-rc4 `nl80211_send_station` and
+`cfg80211_new_sta`/`cfg80211_del_sta_sinfo` define the notification fields;
+FullMAC firmware association indications must not be converted into invented
+raw Authentication/Association management frames.
 
 ## 4. Architecture: SoftMAC vs. FullMAC
 

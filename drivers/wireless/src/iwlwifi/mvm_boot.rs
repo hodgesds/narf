@@ -9,7 +9,10 @@ pub enum Phase {
     New,
     Starting,
     Configured,
+    PreparingAp,
+    ApActive,
     Scanning,
+    ReadingSharedMemory,
     PreparingChannel,
     ChannelPrepared,
     ReleasingChannel,
@@ -142,8 +145,9 @@ impl Owner {
             .command(1, 0x9b, &defaults.coexistence)
             .await?;
         self.hardware.command(2, 1, &defaults.soc).await?;
-        // Queue0 is already described by context-v1. Additional RX queues/RSS and
-        // their PRPH allocations remain disabled in this single-queue boot profile.
+        // Context-v1 owns fallback0. Additional physical RFH rings/RSS
+        // require their exact reported v1 contracts and retained receipts.
+        self.hardware.prepare_receive_queues().await?;
         self.hardware.command(1, 0x77, &[0; 4]).await?;
         // DQA/LAR and the idle station MAC are owned by the scan preparation
         // transaction. SCAN_CFG is sent there after those prerequisites.
@@ -154,6 +158,10 @@ impl Owner {
                 .collect(),
         );
         self.mac = Some(mac);
+        if let Ok(parsed) = super::parse_ucode(&self.firmware) {
+            self.hardware.retain_gen2_ap_adapter(&parsed.api, &nvm);
+            self.hardware.retain_gen2_p2p_adapter(&parsed.api, &nvm);
+        }
         self.nvm = Some(nvm);
         // Private RAM fixtures share one MAC and must not leak key history
         // into each other; native owners adopt their radio's ledger.
@@ -201,8 +209,19 @@ fn configuration(profile: Profile) -> Configuration {
 #[path = "mvm_boot_tests.rs"]
 mod tests;
 
+#[path = "mvm_active_scan.rs"]
+mod active_scan;
+#[path = "mvm_scheduled.rs"]
+pub(super) mod scheduled;
+#[path = "mvm_smem.rs"]
+mod smem;
+pub type SharedMemory = smem::SharedMemory;
+#[path = "mvm_he.rs"]
+mod he;
 #[path = "mvm_scan.rs"]
 mod scan;
+#[path = "mvm_tx_amsdu.rs"]
+mod tx_amsdu;
 
 #[path = "mvm_channel.rs"]
 mod channel;
@@ -220,11 +239,25 @@ mod ba;
 #[path = "mvm_phy.rs"]
 mod phy;
 pub(super) use phy::local_ht;
+pub(super) use phy::{local_ht_for, local_vht_for};
+#[path = "mvm_ap_power.rs"]
+mod ap_power;
+#[path = "mvm_p2p_power.rs"]
+mod p2p_power;
 #[path = "mvm_power.rs"]
 mod power;
+pub(in crate::iwlwifi) type ApPower = ap_power::Fence;
+pub(in crate::iwlwifi) type ApPowerPlan = ap_power::Plan;
+pub(in crate::iwlwifi) type ApPreparedPower = power::Prepared;
+pub(in crate::iwlwifi) type P2pPower = p2p_power::Fence;
+pub(in crate::iwlwifi) type P2pPowerPlan = p2p_power::Plan;
+#[path = "mvm_ap.rs"]
+mod ap;
+#[path = "mvm_p2p.rs"]
+mod p2p;
+pub(in crate::iwlwifi) type P2pPreparation = p2p::Preparation;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
-#[cfg(any(test, feature = "kernel-test"))]
 pub(super) use power::feature as feature_bits;
 pub(super) use power::Emission as PowerEmission;
 
@@ -260,6 +293,15 @@ pub(super) fn passive_channel(domain: &narf_wireless::reg::RegulatoryDomain, cha
 }
 #[path = "mvm_station.rs"]
 mod station;
+#[path = "mvm_wowlan.rs"]
+mod wowlan;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) use rsna::tests::Device as SecurityModel;
 pub(in crate::iwlwifi) use station::Credential;
+pub(super) use wowlan::Resumed as WowlanResumed;
+
+#[path = "mvm_rx_multi.rs"]
+mod rx_multi;
+
+#[path = "mvm_client_control.rs"]
+mod client_control;

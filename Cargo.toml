@@ -219,7 +219,7 @@ panic           = "abort"
 # debug-only ELF sections from optimized artifacts. Debug profiles retain their
 # full debug information for GDB and crash diagnosis.
 strip           = "debuginfo"
-debug           = 2
+debug           = 0
 overflow-checks = false         # release trusts bounds; debug always checks
 incremental     = false
 

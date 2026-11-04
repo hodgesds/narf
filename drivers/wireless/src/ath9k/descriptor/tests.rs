@@ -311,3 +311,47 @@ kernel_test_in!(
     "drivers/wireless/ath9k/descriptor",
     smoke_ar9285_raw_rx_profile_fcs_and_decrypt_admission
 );
+
+fn smoke_ath9k_two_chain_descriptor_chain_selection() -> TestResult {
+    let series = Series {
+        rates: [11, 10, 9, 8],
+        tries: [4, 2, 2, 2],
+        basic: 0,
+    };
+    let Ok(one) = transmit_series(&frame(80, false), LOCAL, 0x12345000, series) else {
+        return TestResult::Fail("native MRR encode");
+    };
+    let mut two = one;
+    if select_chains(&mut two, 3).is_err() || two[9] != 0x01b6_318c || two[..9] != one[..9] {
+        return TestResult::Fail("AR_ChainSel0..3 not set to the two-chain mask");
+    }
+    let mut same = one;
+    if select_chains(&mut same, 1).is_err() || same != one {
+        return TestResult::Fail("one-chain selection changed the AR9285 descriptor");
+    }
+    let Ok(mut single) = transmit(&frame(80, false), LOCAL, 0x12345000, 11) else {
+        return TestResult::Fail("single-series encode");
+    };
+    const CHAINS: u32 = 0x1c | 0x380 | 0x7000 | 0xe_0000;
+    let before = single;
+    if select_chains(&mut single, 3).is_err()
+        || single[9] & CHAINS != 0xc
+        || single[9] & !CHAINS != before[9] & !CHAINS
+    {
+        return TestResult::Fail("unpopulated series received a chain selection");
+    }
+    let mut three = single;
+    if select_chains(&mut three, 7).is_err() || three[9] & CHAINS != 0x1c {
+        return TestResult::Fail("three-chain AR5008 TX mask not selected");
+    }
+    for bad in [0, 8, 0xff] {
+        if select_chains(&mut single.clone(), bad) != Err(Error::Profile) {
+            return TestResult::Fail("invalid TX chain mask accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/descriptor",
+    smoke_ath9k_two_chain_descriptor_chain_selection
+);

@@ -1,3 +1,7 @@
+#[path = "command_native_fragment_tests.rs"]
+mod fragment_tests;
+#[path = "command_native_rf_tracking_tests.rs"]
+mod rf_tracking_tests;
 use super::*;
 use alloc::{vec, vec::Vec};
 use core::{
@@ -93,6 +97,8 @@ impl Fixture {
             radio: super::super::rf_access::Rf::default(),
             runtime_sequence: 0,
             station_runtime: station::Runtime::default(),
+            sleep_blocked: false,
+            sleep_reset: None,
             calibration: None,
             coex_ready: false,
             nctl_ready: false,
@@ -103,6 +109,8 @@ impl Fixture {
             radio_shutdown: super::super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
+            qualification_c: None,
+            qualification_51: None,
             operating: Some(super::super::phy_operating::Operating::default()),
             irq: None,
             phycap: None,
@@ -110,6 +118,8 @@ impl Fixture {
             dma_idle: None,
             dma_reclaimed: false,
             lifecycle: super::super::radio_policy::Lifecycle::Initial,
+            channel: None,
+            wow_trx: None,
         };
         Ok(Self { native, words })
     }
@@ -207,9 +217,7 @@ fn smoke_rtw89_native_station_control_invokes_retained_rf_grant_and_keeps_cleanu
         // Explicit inert qualification boundary, not a fabricated physical
         // radio/attach receipt. Actual Native/Access/NativeIo and typed device
         // and signed-artifact capabilities execute the real MMIO transaction.
-        f.native.ordinary = Some(OrdinaryGrant {
-            qualification: Arc::new(qualification),
-        });
+        f.native.ordinary = Some(OrdinaryGrant::B(Arc::new(qualification)));
         let pending = f.native.queue.pending();
         let ring = f.native.ring.as_ref().unwrap().dma_addr().raw();
         let packet = f.native.queue.model_resource(0).unwrap().dma_addr().raw();
@@ -990,3 +998,13 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof
 );
+
+#[cfg(feature = "kernel-test")]
+#[path = "command_native_lps_tests.rs"]
+pub(in crate::rtw89) mod lps_tests;
+
+#[path = "command_native_monitor_tests.rs"]
+mod monitor_tests;
+pub(in crate::rtw89) fn monitor_boundary() -> Result<(), &'static str> {
+    monitor_tests::run()
+}

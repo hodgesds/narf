@@ -7,7 +7,8 @@
 //! thermal RF power tracking (with LCK) and EDCCA adaptivity, using the
 //! per-chip ops from `rtw8822c.c` (`false_alarm_statistics`, `cck_pd_set`,
 //! `cfo_track`, `pwr_track`, `adaptivity`, `config_tx_path`) and
-//! `rtw8821c.c` (`false_alarm_statistics`, `cck_pd_set`).
+//! `rtw8821c.c` (`false_alarm_statistics`, `cck_pd_set`). RTL8822C DPK
+//! calibration and `rtw8822c_dpk_track` live in [`super::dpk`] (bit 7).
 //!
 //! Nothing here runs without a separately signed `N2xD` continuation
 //! ([`KIND`]); its payload selects the mechanisms and their measured bounds.
@@ -25,8 +26,15 @@ pub(super) const PATH_DIV: u16 = 1 << 3;
 pub(super) const CFO: u16 = 1 << 4;
 pub(super) const PWR_TRACK: u16 = 1 << 5;
 pub(super) const EDCCA: u16 = 1 << 6;
+pub(super) const DPK: u16 = 1 << 7;
 const C21_MECHANISMS: u16 = DIG | CCK_PD | RA;
-const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDCCA;
+const C22_MECHANISMS: u16 = DIG | CCK_PD | RA | PATH_DIV | CFO | PWR_TRACK | EDCCA | DPK;
+/// RTL8822BE: `rtw8822b_dig` (0xc50/0xe50), the 8821C-identical
+/// `rtw8822b_false_alarm_statistics`, RA and `rtw8822b_pwr_track`
+/// ([`super::tracking8822b`]; its re-IQK needs the separate `N2BW`). 8822B
+/// has no `cck_pd_set`, no `config_tx_path`/CFO/DPK hooks. `rtw8822b_adaptivity`
+/// EDCCA writes 0x8a4 byte0/byte1 (`rtw8822b_edcca_th`, offset 0).
+const B22_MECHANISMS: u16 = DIG | RA | PWR_TRACK | EDCCA;
 /// Linux `RTW_WATCH_DOG_DELAY_TIME`.
 pub(super) const PERIOD_MS: u64 = 2000;
 
@@ -44,7 +52,16 @@ rtw_phy_ra_track H2C58 wl_phy_info, every4th RA_INFO40 no_update rssi masks fff0
 8822c tx path diversity path_a/b rssi avg 1a04 f0000000 8/4, 820 ff 31/32, 1e2c ffff 0400, bb reset 2 bit0; \
 8822c cfo tail*2.5 avg enable20 stop10 adj10 xcap 1040 23:10 x|x<<7, only BT disabled scoreboard aa bit1, single station else step to efuse; \
 8822c pwr_track type0 RF42 bit19 trigger then 7e EWMA thermal(10,4) delta<=29 type0 2g/cck swing tables 18a0/41a0 7f, lck>=8 bb/b0/ca/c9/cc; \
-8822c adaptivity normal l2h=max(igi+8,48) h2l-8, ETSI 45/JP60 l2h=igi+12 or ini h2l-7 84c byte2/3 +0x80; no DPK tracking without DPK";
+8822c adaptivity normal l2h=max(igi+8,48) h2l-8, ETSI 45/JP60 l2h=igi+12 or ini h2l-7 84c byte2/3 +0x80; \
+8822c phy_calibration rfk_power_save + do_dpk on rf18 channel change (reload same ch): bb backup 520..41a4 rf 0/1a/55/63/87/8f/de, \
+tx_pause 522=ff 1e70=2, dpk_mac_bb/afe_is_dpk/afe_no_dpk tables, pre_setting 1b08 1f100000|1f0d0000 1be4 3b23170b 1be8 775f5347, \
+gnt_wl 70 bit26 + ltecoex 38 byte1 77, one-shot 1b00 cmd 0x14/16/1a/1c +path (+2 bw80) <<8|48 then 2d9c==55, cal_pwr 1bb4 bit12 1bfc bit31, \
+gainloss rxbb dc 92 84800/1, dc corr 200/40..65, pas_agc dgain 1535/768 loss 0x4000000 log2 db 250/1000 txbb -2/+3 cnt6, \
+coef 20x 1bd4 tbl, saturate 1000/0fff fallback 1fff/04001fff, txagc-6 1b67, gs dgain*910>>10 /10 rounded, coef1 0x16c00/gs 1b18, \
+enable 1b08/1b60 bit31 gs; dpk_track ewma thermal(10,4) delta-k_delta 1b58[6:0] bounded by payload window; restore dpd off";
+
+/// RTL8822BE dm contract (`N2BD`), hashed with [`SOURCE`] for B22 requests.
+pub(super) const SOURCE8822B: &[u8] = b"RTL8822BE N2BD: rtw8822b.c rtw8822b_false_alarm_statistics 808 bit28 a5c/f48/f04/f14/f10/f0c/f08/fcc, reset 9a4 bit17 set-clr, a2c bit15 clr-set, b58 bit0 set-clr; rtw8822b_dig c50/e50 7f both paths, dig_min 0x1c; query_phy_status_page0 PWDB w0[15:8]-110 path A, page1 PWDB A w0[15:8] B w0[23:16] -110 rssi over 2 paths; RA H2C42/58/40 + rrsr; no cck_pd_set, no tx path diversity, no cfo, no dpk; rtw8822b_pwr_track type0 bit5: RF42[17:16]=3 trigger, next pass RF-A 42[15:10] inside N2BD and N2BP windows, EWMA thermal(10,4), init_trigger or avg!=sample, delta=min(|avg-efuse A|,29) one meter both paths, rtw8822b_pwrtrk_2g{a,b}_{p,n}/2g_cck tables (2.4GHz) or 5g{a,b}_{p,n} RTW_PWR_TRK_5G_1..3 (5GHz) bounded by N2BD power_up/down, a current DESC_RATE the committed program never wrote (beyond legacy12/HT/VHT words or zero on both paths) skips the pass, rtw8822b_pwrtrack_set with the committed channel TXAGC index offset 3f-index, txagc_swing_offset max 0xf upper default+10, c94/e94[29:25] c1c/e1c[31:21] rtw8822b_txscale_tbl, default_ofdm_index from c1c (rtw8822b_get_swing_index else 24), base fields restored; need_iqk threshold 8 only through N2BW; rtw8822b_adaptivity bit6: rtw_phy_adaptivity_set_mode ETSI l2h_th_ini_ad -14+50=36, JP l2h_th_ini_cs 10+50=60, else normal; normal l2h=max(igi+8,48) h2l=l2h-8, adaptivity l2h=min(igi,ini) h2l=l2h-7; rtw8822b_edcca_th 8a4 byte0 l2h byte1 h2l offset0; base 8a4[15:0] (rtw8822b_adaptivity_init 7f/7f) restored";
 
 fn admit(did: u16, p: &[u8; PAYLOAD]) -> bool {
     bounds(did, p).is_some()
@@ -65,12 +82,15 @@ pub(super) struct Bounds {
     pub(super) power_down: u8,
     /// Thermal-meter envelope [lo, hi] the program was measured over.
     pub(super) thermal: [u8; 2],
+    /// Largest |DPK PWSF offset| `rtw8822c_dpk_track` may apply (DPK only).
+    pub(super) dpk_window: u8,
 }
 
 pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
     let (allowed, dig_min) = match did {
         0xc821 => (C21_MECHANISMS, 0x1c),
         0xc822 => (C22_MECHANISMS, 0x20),
+        0xb822 => (B22_MECHANISMS, 0x1c),
         _ => return None,
     };
     let b = Bounds {
@@ -81,6 +101,7 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
         power_up: p[5],
         power_down: p[6],
         thermal: [p[7], p[8]],
+        dpk_window: p[9],
     };
     if b.enabled == 0
         || b.enabled & !allowed != 0
@@ -91,7 +112,9 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<Bounds> {
         || b.power_down > 0x3f
         || b.thermal[0] > b.thermal[1]
         || b.thermal[1] > 63
-        || p[9..].iter().any(|&v| v != 0)
+        || b.dpk_window > 0x3f
+        || (b.enabled & DPK == 0 && b.dpk_window != 0)
+        || p[10..].iter().any(|&v| v != 0)
     {
         return None;
     }
@@ -116,6 +139,9 @@ impl Facts {
     fn c22(&self) -> bool {
         self.did == 0xc822
     }
+    fn b22(&self) -> bool {
+        self.did == 0xb822
+    }
     fn paths(&self) -> usize {
         if self.c22() {
             2
@@ -135,6 +161,21 @@ impl Facts {
 /// Runs one register group under the current continuation/base authority.
 pub(super) trait Authority {
     fn run<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error>;
+    /// RTL8822BE committed per-path coded TXAGC indices `rtw8822b_pwrtrack_set`
+    /// offsets against, for DESC_RATE 0..count
+    /// (`power_policy::Gate::b22_rate_indices`).
+    fn b22_indices(&self) -> Option<([[u8; super::tracking8822b::RATES]; 2], usize)> {
+        None
+    }
+    /// RTL8822BE `N2BP` measured thermal windows.
+    fn b22_temperature(&self, _: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    /// RTL8822BE committed primary channel (`hal.current_channel`), which
+    /// selects the `rtw_phy_config_swing_table` band rows.
+    fn b22_channel(&self) -> Option<u8> {
+        None
+    }
 }
 
 const DIG_PERF_FA_TH_LOW: u16 = 250;
@@ -303,11 +344,11 @@ pub(super) fn rf_power_2_rssi(power: &[i8]) -> u8 {
 
 /// Linux `DECLARE_EWMA(name, 10, weight)` with `weight` a power of two.
 #[derive(Clone, Copy, Debug, Default)]
-struct Ewma {
+pub(super) struct Ewma {
     internal: u64,
 }
 impl Ewma {
-    fn add(&mut self, value: u8, shift: u32) {
+    pub(super) fn add(&mut self, value: u8, shift: u32) {
         let v = u64::from(value) << 10;
         self.internal = if self.internal == 0 {
             v
@@ -315,7 +356,7 @@ impl Ewma {
             ((self.internal << shift) - self.internal + v) >> shift
         };
     }
-    fn read(&self) -> u8 {
+    pub(super) fn read(&self) -> u8 {
         (self.internal >> 10).min(255) as u8
     }
 }
@@ -334,6 +375,29 @@ pub(super) struct Sample {
 pub(super) fn sample(facts: &Facts, rate: u8, status: &[u8; 32]) -> Option<Sample> {
     let page = status[0] & 15;
     let word = |w: usize| u32::from_le_bytes(status[w * 4..w * 4 + 4].try_into().unwrap());
+    if facts.b22() {
+        // `rtw8822b.c::query_phy_status_page0/1`: PWDB word0[15:8] (page 1
+        // path B word0[23:16]) - 110; CCK uses path A only.
+        let pwdb = |shift: u32| ((((word(0) >> shift) & 0xff) as i16) - 110) as i8;
+        return match page {
+            0 => Some(Sample {
+                rssi: rf_power_2_rssi(&[pwdb(8)]),
+                path_rssi: [None, None],
+                cfo_tail: None,
+                rate,
+            }),
+            1 => {
+                let power = [pwdb(8), pwdb(16)];
+                Some(Sample {
+                    rssi: rf_power_2_rssi(&power),
+                    path_rssi: [None, None],
+                    cfo_tail: None,
+                    rate,
+                })
+            }
+            _ => None,
+        };
+    }
     if facts.c22() {
         match page {
             0 => {
@@ -417,18 +481,28 @@ pub(super) enum EdccaMode {
     /// ETSI/JP adaptivity with the chip `l2h_th_ini_{ad,cs}`.
     Adaptivity(i16),
 }
-/// `phy.c::rtw_phy_adaptivity_set_mode` from the regulatory DFS region.
-/// The country→DFS region mapping follows wireless-regdb `DFS-ETSI`/`DFS-JP`.
+/// `phy.c::rtw_phy_adaptivity_set_mode` from the regulatory DFS region with
+/// the RTL8822C `l2h_th_ini_{cs,ad}` (60/45).
 pub(super) fn edcca_mode(country: [u8; 2]) -> EdccaMode {
+    edcca_mode_with(country, 60, 45)
+}
+/// RTL8822B `rtw8822b_hw_spec` `l2h_th_ini_cs` = 10 + `EDCCA_IGI_BASE` and
+/// `l2h_th_ini_ad` = -14 + `EDCCA_IGI_BASE` (50).
+pub(super) fn edcca_mode8822b(country: [u8; 2]) -> EdccaMode {
+    edcca_mode_with(country, 10 + 50, -14 + 50)
+}
+/// The country→DFS region mapping follows wireless-regdb `DFS-ETSI`/`DFS-JP`:
+/// ETSI takes `l2h_th_ini_ad`, JP `l2h_th_ini_cs`, others normal EDCCA.
+fn edcca_mode_with(country: [u8; 2], cs: i16, ad: i16) -> EdccaMode {
     const ETSI: &[[u8; 2]] = &[
         *b"AT", *b"BE", *b"BG", *b"CH", *b"CY", *b"CZ", *b"DE", *b"DK", *b"EE", *b"ES", *b"FI",
         *b"FR", *b"GB", *b"GR", *b"HR", *b"HU", *b"IE", *b"IS", *b"IT", *b"LI", *b"LT", *b"LU",
         *b"LV", *b"MT", *b"NL", *b"NO", *b"PL", *b"PT", *b"RO", *b"SE", *b"SI", *b"SK",
     ];
     if country == *b"JP" {
-        EdccaMode::Adaptivity(60)
+        EdccaMode::Adaptivity(cs)
     } else if ETSI.contains(&country) {
-        EdccaMode::Adaptivity(45)
+        EdccaMode::Adaptivity(ad)
     } else {
         EdccaMode::Normal
     }
@@ -442,6 +516,9 @@ pub(super) struct Period {
     pub(super) tx_bytes: u64,
     pub(super) rx_bytes: u64,
     pub(super) country: [u8; 2],
+    /// `hal.txrx_1ss` (coexistence `config_trx_mode(A, A)`) is in effect:
+    /// 1SS TX path diversity is held on path A.
+    pub(super) txrx_1ss: bool,
 }
 
 /// Linux `rtw_dm_info`/`rtw_cfo_track`/`rtw_path_div` subset.
@@ -485,6 +562,11 @@ pub(super) struct Tracker {
     delta_power: [i8; 2],
     base_igi: u8,
     base_edcca: u32,
+    dpk: Option<super::dpk::Dpk>,
+    /// RTL8822BE `rtw8822b_pwr_track` state and the base TXAGC/scale fields.
+    b22_power: Option<(super::tracking8822b::Tracker, super::tracking8822b::Base)>,
+    /// `rtw_phy_pwrtrack_need_iqk` fired: the caller runs the `N2BW` IQK.
+    iqk_due: bool,
 }
 
 impl Tracker {
@@ -529,7 +611,16 @@ impl Tracker {
             delta_power: [0; 2],
             base_igi: 0,
             base_edcca: 0,
+            dpk: (facts.c22() && bounds.enabled & DPK != 0)
+                .then(|| super::dpk::Dpk::new(bounds.dpk_window, bounds.thermal)),
+            b22_power: None,
+            iqk_due: false,
         }
+    }
+    /// Whether `rtw_phy_pwrtrack_need_iqk` fired in the last period; the
+    /// flag is consumed.
+    pub(super) fn take_iqk(&mut self) -> bool {
+        core::mem::take(&mut self.iqk_due)
     }
     pub(super) fn bounds(&self) -> Bounds {
         self.bounds
@@ -551,6 +642,10 @@ impl Tracker {
     }
     pub(super) fn delta_power(&self) -> [i8; 2] {
         self.delta_power
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn dpk(&self) -> Option<&super::dpk::Dpk> {
+        self.dpk.as_ref()
     }
     pub(super) fn pd_level(&self) -> u8 {
         self.cck_pd_lv[0][0]
@@ -583,21 +678,25 @@ impl Tracker {
         true
     }
 
-    fn read(io: &mut impl Io, reg: u16) -> Result<u32, Error> {
-        super::radio::read(io, reg)
+    async fn read(io: &mut impl Io, reg: u16) -> Result<u32, Error> {
+        super::radio::read(io, reg).await
     }
-    fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
-        super::radio::mask(io, reg, bits, value)
+    async fn mask(io: &mut impl Io, reg: u16, bits: u32, value: u32) -> Result<(), Error> {
+        super::radio::mask(io, reg, bits, value).await
     }
-    fn get(io: &mut impl Io, reg: u16, bits: u32) -> Result<u32, Error> {
-        Ok((Self::read(io, reg)? & bits) >> bits.trailing_zeros())
+    async fn get(io: &mut impl Io, reg: u16, bits: u32) -> Result<u32, Error> {
+        Ok((Self::read(io, reg).await? & bits) >> bits.trailing_zeros())
     }
-    fn dig_write(&self, io: &mut impl Io, igi: u8) -> Result<(), Error> {
+    async fn dig_write(&self, io: &mut impl Io, igi: u8) -> Result<(), Error> {
         if self.facts.c22() {
-            Self::mask(io, 0x1d70, 0x7f, u32::from(igi))?;
-            Self::mask(io, 0x1d70, 0x7f00, u32::from(igi))
+            Self::mask(io, 0x1d70, 0x7f, u32::from(igi)).await?;
+            Self::mask(io, 0x1d70, 0x7f00, u32::from(igi)).await
+        } else if self.facts.b22() {
+            // `rtw_phy_dig_write` over `rtw8822b_dig[]`, both paths.
+            Self::mask(io, 0xc50, 0x7f, u32::from(igi)).await?;
+            Self::mask(io, 0xe50, 0x7f, u32::from(igi)).await
         } else {
-            Self::mask(io, 0xc50, 0x7f, u32::from(igi))
+            Self::mask(io, 0xc50, 0x7f, u32::from(igi)).await
         }
     }
     async fn rf_write(
@@ -609,29 +708,33 @@ impl Tracker {
         value: u32,
     ) -> Result<(), Error> {
         let reg = (if path == 0 { 0x3c00 } else { 0x4c00 }) + u16::from(address) * 4;
-        auth.run(|| Self::mask(io, reg, bits, value))?;
+        crate::rtw88::firmware_transport::enclosed(
+            |op| auth.run(op),
+            Self::mask(io, reg, bits, value),
+        )
+        .await?;
         io.delay_us(1).await;
         Ok(())
     }
-    fn rf_read(io: &mut impl Io, path: u8, address: u8) -> Result<u32, Error> {
-        super::radio::rf_read(io, path, address)
+    async fn rf_read(io: &mut impl Io, path: u8, address: u8) -> Result<u32, Error> {
+        super::radio::rf_read(io, path, address).await
     }
 
     /// `phy.c::rtw_phy_init` subset plus `rtw8822c_cfo_init` and
     /// `rtw8821c` `cck_pd_default`, against the current retained registers.
-    fn init(&mut self, io: &mut impl Io, auth: &impl Authority) -> Result<(), Error> {
+    async fn init(&mut self, io: &mut impl Io, auth: &impl Authority) -> Result<(), Error> {
         let c22 = self.facts.c22();
-        auth.run(|| {
+        crate::rtw88::firmware_transport::enclosed(|op| auth.run(op), async {
             self.igi_history = [0; 4];
             self.fa_history = [0; 4];
             self.igi_bitmap = 0;
             self.igi_history[0] = if c22 {
-                Self::get(io, 0x1d70, 0x7f)? as u8
+                Self::get(io, 0x1d70, 0x7f).await? as u8
             } else {
-                Self::get(io, 0xc50, 0x7f)? as u8
+                Self::get(io, 0xc50, 0x7f).await? as u8
             };
-            if !c22 {
-                let v = io.read8(0xaaa)?;
+            if self.facts.did == 0xc821 {
+                let v = io.read8(0xaaa).await?;
                 if v == 255 {
                     return Err(Error::Gone);
                 }
@@ -639,11 +742,24 @@ impl Tracker {
             }
             self.base_igi = self.igi_history[0];
             if c22 {
-                self.base_edcca = Self::read(io, 0x84c)? & 0xffff_0000;
+                self.base_edcca = Self::read(io, 0x84c).await? & 0xffff_0000;
+            } else if self.facts.b22() {
+                self.base_edcca = Self::read(io, 0x8a4).await? & 0xffff;
             }
-            self.rrsr_init = Self::read(io, 0x440)?;
+            if self.facts.b22() && self.bounds.enabled & PWR_TRACK != 0 {
+                // rtw8822b_pwrtrack_init over the retained base program.
+                let default = super::radio8822b::pwrtrack_init(io).await?;
+                let base = super::tracking8822b::Base::capture(io).await?;
+                self.b22_power = Some((
+                    super::tracking8822b::Tracker::new(self.facts.thermal[0], default),
+                    base,
+                ));
+            }
+            self.rrsr_init = Self::read(io, 0x440).await?;
             Ok(())
-        })?;
+        })
+        .await?;
+        self.iqk_due = false;
         self.cck_pd_lv = [[0; 2]; 2];
         self.cck_fa_avg = CCK_FA_AVG_RESET;
         self.crystal = self.facts.crystal;
@@ -653,17 +769,17 @@ impl Tracker {
         Ok(())
     }
 
-    fn false_alarm(&mut self, io: &mut impl Io) -> Result<(), Error> {
+    async fn false_alarm(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.facts.c22() {
-            let cck_enable = Self::read(io, 0x1c3c)? & 2 != 0;
-            let cck = io.read16(0x1a5c)?;
+            let cck_enable = Self::read(io, 0x1c3c).await? & 2 != 0;
+            let cck = io.read16(0x1a5c).await?;
             if cck == u16::MAX {
                 return Err(Error::Gone);
             }
-            let w = [0x2d04, 0x2d08, 0x2d0c, 0x2d10, 0x2d20]
-                .map(|r| Self::read(io, r))
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut w = [0; 5];
+            for (v, r) in w.iter_mut().zip([0x2d04, 0x2d08, 0x2d0c, 0x2d10, 0x2d20]) {
+                *v = Self::read(io, r).await?;
+            }
             let lo = |v: u32| v & 0xffff;
             let hi = |v: u32| v >> 16;
             let ofdm = hi(w[0])
@@ -677,30 +793,30 @@ impl Tracker {
             self.cck_fa = u32::from(cck);
             let total = ofdm + if cck_enable { u32::from(cck) } else { 0 };
             self.total_fa = total.min(u32::from(u16::MAX)) as u16;
-            Self::mask(io, 0x1a2c, 0xc000, 0)?;
-            Self::mask(io, 0x1a2c, 0xc000, 2)?;
-            Self::mask(io, 0x1a2c, 0x3000, 0)?;
-            Self::mask(io, 0x1a2c, 0x3000, 2)?;
-            Self::mask(io, 0x1d2c, 1 << 31, 0)?;
-            Self::mask(io, 0x1eb4, 1 << 25, 1)?;
-            Self::mask(io, 0x1eb4, 1 << 25, 0)?;
-            Self::mask(io, 0x1d2c, 1 << 31, 1)?;
+            Self::mask(io, 0x1a2c, 0xc000, 0).await?;
+            Self::mask(io, 0x1a2c, 0xc000, 2).await?;
+            Self::mask(io, 0x1a2c, 0x3000, 0).await?;
+            Self::mask(io, 0x1a2c, 0x3000, 2).await?;
+            Self::mask(io, 0x1d2c, 1 << 31, 0).await?;
+            Self::mask(io, 0x1eb4, 1 << 25, 1).await?;
+            Self::mask(io, 0x1eb4, 1 << 25, 0).await?;
+            Self::mask(io, 0x1d2c, 1 << 31, 1).await?;
         } else {
-            let cck_enable = Self::read(io, 0x808)? & (1 << 28) != 0;
-            let cck = io.read16(0xa5c)?;
-            let ofdm = io.read16(0xf48)?;
+            let cck_enable = Self::read(io, 0x808).await? & (1 << 28) != 0;
+            let cck = io.read16(0xa5c).await?;
+            let ofdm = io.read16(0xf48).await?;
             if cck == u16::MAX || ofdm == u16::MAX {
                 return Err(Error::Gone);
             }
             self.cck_fa = u32::from(cck);
             let total = u32::from(ofdm) + if cck_enable { u32::from(cck) } else { 0 };
             self.total_fa = total.min(u32::from(u16::MAX)) as u16;
-            Self::mask(io, 0x9a4, 1 << 17, 1)?;
-            Self::mask(io, 0x9a4, 1 << 17, 0)?;
-            Self::mask(io, 0xa2c, 1 << 15, 0)?;
-            Self::mask(io, 0xa2c, 1 << 15, 1)?;
-            Self::mask(io, 0xb58, 1, 1)?;
-            Self::mask(io, 0xb58, 1, 0)?;
+            Self::mask(io, 0x9a4, 1 << 17, 1).await?;
+            Self::mask(io, 0x9a4, 1 << 17, 0).await?;
+            Self::mask(io, 0xa2c, 1 << 15, 0).await?;
+            Self::mask(io, 0xa2c, 1 << 15, 1).await?;
+            Self::mask(io, 0xb58, 1, 1).await?;
+            Self::mask(io, 0xb58, 1, 0).await?;
         }
         Ok(())
     }
@@ -763,7 +879,7 @@ impl Tracker {
     }
 
     /// `phy.c::rtw_phy_dig` with the signed upper bound applied to `DIG_PERF_MAX`.
-    fn dig(&mut self, io: &mut impl Io, linked: bool) -> Result<(), Error> {
+    async fn dig(&mut self, io: &mut impl Io, linked: bool) -> Result<(), Error> {
         if self.check_damping() {
             return Ok(());
         }
@@ -834,7 +950,7 @@ impl Tracker {
             self.fa_history[2],
         ];
         if igi != pre {
-            self.dig_write(io, igi)?;
+            self.dig_write(io, igi).await?;
         }
         Ok(())
     }
@@ -864,7 +980,7 @@ impl Tracker {
     }
 
     /// `phy.c::rtw_phy_cck_pd` (2.4GHz retained channel) + chip `cck_pd_set`.
-    fn cck_pd(&mut self, io: &mut impl Io, linked: bool) -> Result<(), Error> {
+    async fn cck_pd(&mut self, io: &mut impl Io, linked: bool) -> Result<(), Error> {
         let fa = self.cck_fa;
         self.cck_fa_avg = if self.cck_fa_avg == CCK_FA_AVG_RESET {
             fa
@@ -879,8 +995,8 @@ impl Tracker {
         if self.facts.c22() {
             const PD: [i32; 5] = [0, 2, 4, 6, 8];
             const CS: [i32; 5] = [0, 2, 2, 2, 4];
-            let nrx = Self::get(io, 0x1a2c, 0x60000)? as usize;
-            let bw = Self::get(io, 0x9b0, 0xc)? as usize;
+            let nrx = Self::get(io, 0x1a2c, 0x60000).await? as usize;
+            let bw = Self::get(io, 0x9b0, 0xc).await? as usize;
             if bw > 1 || nrx > 1 {
                 return Err(Error::Unsupported);
             }
@@ -890,8 +1006,8 @@ impl Tracker {
             }
             self.cck_fa_avg = CCK_FA_AVG_RESET;
             let (rpd, mpd, rcs, mcs) = CCK_PD_REG[bw][nrx];
-            let mut pd = Self::get(io, rpd, mpd)? as i32;
-            let mut cs = Self::get(io, rcs, mcs)? as i32;
+            let mut pd = Self::get(io, rpd, mpd).await? as i32;
+            let mut cs = Self::get(io, rcs, mcs).await? as i32;
             pd += PD[usize::from(level)] - PD[usize::from(cur)];
             cs += CS[usize::from(level)] - CS[usize::from(cur)];
             pd = pd.clamp(0, 255);
@@ -900,8 +1016,8 @@ impl Tracker {
             } else {
                 cs = cs.clamp(0, 31);
             }
-            Self::mask(io, rpd, mpd, pd as u32)?;
-            Self::mask(io, rcs, mcs, cs as u32)?;
+            Self::mask(io, rpd, mpd, pd as u32).await?;
+            Self::mask(io, rcs, mcs, cs as u32).await?;
             self.cck_pd_lv[bw][nrx] = level;
         } else {
             const PD: [u32; 5] = [3, 7, 13, 13, 13];
@@ -910,13 +1026,14 @@ impl Tracker {
             }
             self.cck_fa_avg = CCK_FA_AVG_RESET;
             self.cck_pd_lv[0][0] = level;
-            Self::mask(io, 0xa08, 0x3f0000, PD[usize::from(level)])?;
+            Self::mask(io, 0xa08, 0x3f0000, PD[usize::from(level)]).await?;
             Self::mask(
                 io,
                 0xaa8,
                 0x1f0000,
                 (u32::from(self.cck_pd_default) + u32::from(level) * 2).min(0x1f),
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -940,23 +1057,46 @@ impl Tracker {
 
     /// `rtw8822c_config_cck_tx_path`/`config_ofdm_tx_path` for 1SS
     /// diversity over the two-path TX configuration, then `bb_reset`.
-    fn set_tx_path(io: &mut impl Io, path: u8) -> Result<(), Error> {
-        let bb_reset = |io: &mut _| -> Result<(), Error> {
-            let old = io_read16(io, 2)?;
+    async fn set_tx_path(io: &mut impl Io, path: u8) -> Result<(), Error> {
+        async fn bb_reset(io: &mut impl Io) -> Result<(), Error> {
+            let old = io_read16(io, 2).await?;
             for v in [old | 1, old & !1, old | 1] {
-                Io::write16(io, 2, v)?;
+                Io::write16(io, 2, v).await?;
             }
             Ok(())
-        };
-        Self::mask(io, 0x1a04, 0xf000_0000, if path == 1 { 8 } else { 4 })?;
-        bb_reset(io)?;
-        Self::mask(io, 0x820, 0xff, if path == 1 { 0x31 } else { 0x32 })?;
-        Self::mask(io, 0x1e2c, 0xffff, 0x0400)?;
-        bb_reset(io)
+        }
+        Self::mask(io, 0x1a04, 0xf000_0000, if path == 1 { 8 } else { 4 }).await?;
+        bb_reset(io).await?;
+        Self::mask(io, 0x820, 0xff, if path == 1 { 0x31 } else { 0x32 }).await?;
+        Self::mask(io, 0x1e2c, 0xffff, 0x0400).await?;
+        bb_reset(io).await
+    }
+
+    /// Return 1SS TX path diversity to path A before coexistence programs
+    /// `config_trx_mode(A, A)`; [`Period::txrx_1ss`] then holds it there
+    /// until the 1SS fields are restored. Linux keeps running
+    /// `rtw_phy_tx_path_diversity` (it checks only `hal.antenna_rx`), which
+    /// could select path B while ORITXCODE2/RX run path A only; here the
+    /// two owners never write the same fields at once. Runs under the base
+    /// gate like [`Self::restore`].
+    pub(super) async fn hold_tx_path(
+        &mut self,
+        io: &mut impl Io,
+        base: &impl Authority,
+    ) -> Result<(), Error> {
+        self.path_sum = [0; 2];
+        self.path_cnt = [0; 2];
+        if !self.initialized || !self.facts.c22() || !self.on(PATH_DIV) || self.tx_path == 1 {
+            return Ok(());
+        }
+        crate::rtw88::firmware_transport::enclosed(|op| base.run(op), Self::set_tx_path(io, 1))
+            .await?;
+        self.tx_path = 1;
+        Ok(())
     }
 
     /// `rtw8822c_set_crystal_cap` bounded by the measured window.
-    fn set_crystal(&mut self, io: &mut impl Io, cap: u8) -> Result<(), Error> {
+    async fn set_crystal(&mut self, io: &mut impl Io, cap: u8) -> Result<(), Error> {
         let f = self.facts.crystal;
         let w = self.bounds.xtal_window;
         let cap = cap.clamp(f.saturating_sub(w), f.saturating_add(w).min(0x7f));
@@ -964,20 +1104,20 @@ impl Tracker {
             return Ok(());
         }
         let v = u32::from(cap) | (u32::from(cap) << 7);
-        Self::mask(io, 0x1040, 0x00ff_fc00, v)?;
+        Self::mask(io, 0x1040, 0x00ff_fc00, v).await?;
         self.crystal = cap;
         Ok(())
     }
 
-    fn cfo(&mut self, io: &mut impl Io, linked: bool) -> Result<(), Error> {
+    async fn cfo(&mut self, io: &mut impl Io, linked: bool) -> Result<(), Error> {
         if !linked {
             // rtw8822c_cfo_tracking_reset
             self.cfo_adjust = true;
             let f = self.facts.crystal;
             if self.crystal > f {
-                self.set_crystal(io, self.crystal - 1)?;
+                self.set_crystal(io, self.crystal - 1).await?;
             } else if self.crystal < f {
-                self.set_crystal(io, self.crystal + 1)?;
+                self.set_crystal(io, self.crystal + 1).await?;
             }
             return Ok(());
         }
@@ -1006,10 +1146,10 @@ impl Tracker {
             self.cfo_adjust = false;
         }
         // rtw_coex_disabled: scoreboard REG_WIFI_BT_INFO & ~BT_INT_EN, ONOFF bit1.
-        let score = io_read16(io, 0xaa)? & !(1 << 15);
+        let score = io_read16(io, 0xaa).await? & !(1 << 15);
         if score & 2 != 0 {
             self.cfo_adjust = false;
-            return self.set_crystal(io, self.facts.crystal);
+            return self.set_crystal(io, self.facts.crystal).await;
         }
         if self.cfo_adjust {
             let mut cap = i16::from(self.crystal);
@@ -1018,12 +1158,12 @@ impl Tracker {
             } else if avg < -CFO_TRK_ADJ_TH {
                 cap -= 1;
             }
-            self.set_crystal(io, cap.clamp(0, 0x7f) as u8)?;
+            self.set_crystal(io, cap.clamp(0, 0x7f) as u8).await?;
         }
         Ok(())
     }
 
-    fn adaptivity(&self, io: &mut impl Io, mode: EdccaMode) -> Result<(), Error> {
+    async fn adaptivity(&self, io: &mut impl Io, mode: EdccaMode) -> Result<(), Error> {
         let igi = i16::from(self.igi_history[0]);
         let (l2h, h2l) = match mode {
             EdccaMode::Normal => {
@@ -1040,8 +1180,32 @@ impl Tracker {
             }
         };
         let byte = |v: i16| ((v as i8 as i32 + 0x80) & 0xff) as u32;
-        Self::mask(io, 0x84c, 0x00ff_0000, byte(l2h))?;
-        Self::mask(io, 0x84c, 0xff00_0000, byte(h2l))
+        Self::mask(io, 0x84c, 0x00ff_0000, byte(l2h)).await?;
+        Self::mask(io, 0x84c, 0xff00_0000, byte(h2l)).await
+    }
+
+    /// `rtw8822b_adaptivity`: normal `max(igi + 8, 48)`/`- 8`, adaptivity
+    /// `min(igi, l2h_th_ini)`/`- 7`, through `rtw_phy_set_edcca_th` over
+    /// `rtw8822b_edcca_th` (0x8a4 byte0 L2H, byte1 H2L, offset 0).
+    pub(super) fn edcca8822b(igi: u8, mode: EdccaMode) -> (u8, u8) {
+        let igi = i16::from(igi);
+        let (l2h, h2l) = match mode {
+            EdccaMode::Normal => {
+                let l2h = (igi + EDCCA_IGI_L2H_DIFF).max(EDCCA_TH_L2H_LB);
+                (l2h, l2h - EDCCA_L2H_H2L_DIFF_NORMAL)
+            }
+            EdccaMode::Adaptivity(ini) => {
+                let l2h = igi.min(ini);
+                (l2h, l2h - EDCCA_L2H_H2L_DIFF)
+            }
+        };
+        // `s8` arguments to `u8 l2h, u8 h2l`.
+        (l2h as i8 as u8, h2l as i8 as u8)
+    }
+    async fn adaptivity8822b(&self, io: &mut impl Io, mode: EdccaMode) -> Result<(), Error> {
+        let (l2h, h2l) = Self::edcca8822b(self.igi_history[0], mode);
+        Self::mask(io, 0x8a4, 0xff, u32::from(l2h)).await?;
+        Self::mask(io, 0x8a4, 0xff00, u32::from(h2l)).await
     }
 
     fn swing(&self, path: usize) -> (&'static [u8; 30], &'static [u8; 30]) {
@@ -1068,7 +1232,14 @@ impl Tracker {
         Self::rf_write(io, auth, 0, 0xc9, full, 0x80001).await?;
         for _ in 0..100 {
             io.delay_us(1000).await;
-            if auth.run(|| Self::rf_read(io, 0, 0xca))? & 0x1000 == 0 {
+            if crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                Self::rf_read(io, 0, 0xca),
+            )
+            .await?
+                & 0x1000
+                == 0
+            {
                 break;
             }
         }
@@ -1100,7 +1271,13 @@ impl Tracker {
             if self.facts.thermal[path] == 0xff {
                 continue;
             }
-            let t = ((auth.run(|| Self::rf_read(io, path as u8, 0x42))? & 0x7e) >> 1) as u8;
+            let t = ((crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                Self::rf_read(io, path as u8, 0x42),
+            )
+            .await?
+                & 0x7e)
+                >> 1) as u8;
             if !(self.bounds.thermal[0]..=self.bounds.thermal[1]).contains(&t) {
                 return Err(Error::Prerequisite);
             }
@@ -1127,7 +1304,43 @@ impl Tracker {
             let index = index.clamp(-(self.bounds.power_down as i8), self.bounds.power_up as i8);
             self.delta_power[path] = index;
             let reg = if path == 0 { 0x18a0 } else { 0x41a0 };
-            auth.run(|| Self::mask(io, reg, 0x7f, (index as u8 & 0x7f).into()))?;
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                Self::mask(io, reg, 0x7f, (index as u8 & 0x7f).into()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// `rtw8822b_pwr_track` over the retained [`super::tracking8822b`]
+    /// state, for the RA-reported `dm_info->tx_rate`.
+    async fn pwr_track8822b(
+        &mut self,
+        io: &mut impl Io,
+        auth: &impl Authority,
+    ) -> Result<(), Error> {
+        let indices = auth.b22_indices().ok_or(Error::State)?;
+        let limits = super::tracking8822b::Limits {
+            thermal: self.bounds.thermal,
+            up: self.bounds.power_up,
+            down: self.bounds.power_down,
+        };
+        let tx_rate = self.tx_rate;
+        let (tracker, _) = self.b22_power.as_mut().ok_or(Error::State)?;
+        let pass = tracker
+            .pass(
+                io,
+                auth,
+                indices,
+                |t| auth.b22_temperature(t),
+                limits,
+                tx_rate,
+            )
+            .await?;
+        self.delta_power = tracker.delta_power();
+        if let super::tracking8822b::Pass::Tracked { iqk: true, .. } = pass {
+            self.iqk_due = true;
         }
         Ok(())
     }
@@ -1135,7 +1348,7 @@ impl Tracker {
     /// `rtw_update_sta_info(.., false)` RA_INFO refresh from the current
     /// qualified data profile with the RSSI-level mask (`main.c`).
     fn ra_info(&self, profile: DataProfile) -> [u8; 8] {
-        let bak = u32::from(profile.rates) | (u32::from(profile.mcs) << 12);
+        let bak = profile.ra_mask();
         let cck_only = profile.mcs == 0 && profile.rates & !0xf == 0;
         let level_mask: u32 = if cck_only {
             u32::MAX
@@ -1161,7 +1374,8 @@ impl Tracker {
             0x40,
             0,
             profile.rate_id() | (u8::from(profile.sgi) << 7),
-            0x48,
+            // DIS_PT | NO_UPDATE | BW_MODE (`si->bw_mode`, N2xB 40MHz).
+            0x48 | (u8::from(profile.vht.is_some()) << 4) | profile.bw_mode(),
             m[0],
             m[1],
             m[2],
@@ -1180,44 +1394,59 @@ impl Tracker {
             return Ok(());
         }
         let c22 = self.facts.c22();
-        base.run(|| {
+        crate::rtw88::firmware_transport::enclosed(|op| base.run(op), async {
             if self.on(DIG) {
-                self.dig_write(io, self.base_igi)?;
+                self.dig_write(io, self.base_igi).await?;
                 self.igi_history[0] = self.base_igi;
             }
             if c22 && self.on(EDCCA) {
-                Self::mask(io, 0x84c, 0xffff_0000, self.base_edcca >> 16)?;
+                Self::mask(io, 0x84c, 0xffff_0000, self.base_edcca >> 16).await?;
+            }
+            if self.facts.b22() && self.on(EDCCA) {
+                Self::mask(io, 0x8a4, 0xffff, self.base_edcca).await?;
             }
             if c22 && self.on(CFO) {
-                self.set_crystal(io, self.facts.crystal)?;
+                self.set_crystal(io, self.facts.crystal).await?;
             }
             if c22 && self.on(PATH_DIV) && self.tx_path != 1 {
-                Self::mask(io, 0x1a04, 0xf000_0000, 8)?;
-                Self::mask(io, 0x820, 0xff, 0x11)?;
-                Self::mask(io, 0x1e2c, 0xff, 0)?;
+                Self::mask(io, 0x1a04, 0xf000_0000, 8).await?;
+                Self::mask(io, 0x820, 0xff, 0x11).await?;
+                Self::mask(io, 0x1e2c, 0xff, 0).await?;
                 self.tx_path = 1;
             }
             if c22 && self.on(PWR_TRACK) {
-                Self::mask(io, 0x18a0, 0x7f, 0)?;
-                Self::mask(io, 0x41a0, 0x7f, 0)?;
+                Self::mask(io, 0x18a0, 0x7f, 0).await?;
+                Self::mask(io, 0x41a0, 0x7f, 0).await?;
+                self.delta_power = [0; 2];
+            }
+            if let Some((_, base)) = self.b22_power.take() {
+                base.restore(io).await?;
                 self.delta_power = [0; 2];
             }
             if self.on(RA) && self.rrsr_init != 0 {
-                io.write32(0x440, self.rrsr_init)?;
+                io.write32(0x440, self.rrsr_init).await?;
             }
             Ok(())
-        })?;
+        })
+        .await?;
         if self.on(CCK_PD) {
-            self.cck_pd_restore(io, base)?;
+            self.cck_pd_restore(io, base).await?;
+        }
+        if let Some(dpk) = self.dpk.as_mut() {
+            dpk.restore(io, base).await?;
         }
         self.initialized = false;
         Ok(())
     }
-    fn cck_pd_restore(&mut self, io: &mut impl Io, base: &impl Authority) -> Result<(), Error> {
+    async fn cck_pd_restore(
+        &mut self,
+        io: &mut impl Io,
+        base: &impl Authority,
+    ) -> Result<(), Error> {
         let saved = self.bounds.cck_pd_max;
         let avg = self.cck_fa_avg;
         // Return every tracked bw/nrx slot to level0 through the source delta path.
-        base.run(|| {
+        crate::rtw88::firmware_transport::enclosed(|op| base.run(op), async {
             if self.facts.c22() {
                 const PD: [i32; 5] = [0, 2, 4, 6, 8];
                 const CS: [i32; 5] = [0, 2, 2, 2, 4];
@@ -1227,22 +1456,23 @@ impl Tracker {
                         if cur == 0 {
                             continue;
                         }
-                        let pd =
-                            (Self::get(io, rpd, mpd)? as i32 - PD[usize::from(cur)]).clamp(0, 255);
-                        let cs =
-                            (Self::get(io, rcs, mcs)? as i32 - CS[usize::from(cur)]).clamp(0, 31);
-                        Self::mask(io, rpd, mpd, pd as u32)?;
-                        Self::mask(io, rcs, mcs, cs as u32)?;
+                        let pd = (Self::get(io, rpd, mpd).await? as i32 - PD[usize::from(cur)])
+                            .clamp(0, 255);
+                        let cs = (Self::get(io, rcs, mcs).await? as i32 - CS[usize::from(cur)])
+                            .clamp(0, 31);
+                        Self::mask(io, rpd, mpd, pd as u32).await?;
+                        Self::mask(io, rcs, mcs, cs as u32).await?;
                         self.cck_pd_lv[bw][nrx] = 0;
                     }
                 }
             } else if self.cck_pd_lv[0][0] != 0 {
-                Self::mask(io, 0xa08, 0x3f0000, 3)?;
-                Self::mask(io, 0xaa8, 0x1f0000, u32::from(self.cck_pd_default))?;
+                Self::mask(io, 0xa08, 0x3f0000, 3).await?;
+                Self::mask(io, 0xaa8, 0x1f0000, u32::from(self.cck_pd_default)).await?;
                 self.cck_pd_lv[0][0] = 0;
             }
             Ok(())
-        })?;
+        })
+        .await?;
         self.bounds.cck_pd_max = saved;
         self.cck_fa_avg = avg;
         Ok(())
@@ -1257,7 +1487,7 @@ impl Tracker {
         period: Period,
     ) -> Result<Vec<[u8; 8]>, Error> {
         if !self.initialized {
-            self.init(io, auth)?;
+            self.init(io, auth).await?;
         }
         let c22 = self.facts.c22();
         let mut h2c = Vec::new();
@@ -1277,12 +1507,20 @@ impl Tracker {
             self.pre_min_rssi = self.min_rssi;
             self.min_rssi = u8::MAX;
         }
-        auth.run(|| self.false_alarm(io))?;
+        crate::rtw88::firmware_transport::enclosed(|op| auth.run(op), self.false_alarm(io)).await?;
         if self.on(DIG) {
-            auth.run(|| self.dig(io, period.linked))?;
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                self.dig(io, period.linked),
+            )
+            .await?;
         }
         if self.on(CCK_PD) {
-            auth.run(|| self.cck_pd(io, period.linked))?;
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                self.cck_pd(io, period.linked),
+            )
+            .await?;
         }
         if self.on(RA) {
             // rtw_fw_update_wl_phy_info
@@ -1297,11 +1535,19 @@ impl Tracker {
                 let mask = Self::rrsr_mask(self.tx_rate).min(RRSR_RATE_ORDER_MAX);
                 let value = self.rrsr_init & mask;
                 if value != 0 {
-                    auth.run(|| io.write32(0x440, value))?;
+                    crate::rtw88::firmware_transport::enclosed(
+                        |op| auth.run(op),
+                        io.write32(0x440, value),
+                    )
+                    .await?;
                 }
             }
         }
-        if c22 && self.on(PATH_DIV) && period.linked {
+        if period.txrx_1ss {
+            // The coexistence 1SS owner holds the TX path (`hold_tx_path`).
+            self.path_sum = [0; 2];
+            self.path_cnt = [0; 2];
+        } else if c22 && self.on(PATH_DIV) && period.linked {
             // rtw_phy_tx_path_div_select
             let avg = |s: u32, c: u32| if c != 0 { s / c } else { 0 };
             let a = avg(self.path_sum[0], self.path_cnt[0]);
@@ -1313,27 +1559,54 @@ impl Tracker {
             self.path_sum = [0; 2];
             self.path_cnt = [0; 2];
             if path != self.tx_path {
-                auth.run(|| Self::set_tx_path(io, path))?;
+                crate::rtw88::firmware_transport::enclosed(
+                    |op| auth.run(op),
+                    Self::set_tx_path(io, path),
+                )
+                .await?;
                 self.tx_path = path;
             }
         }
         if c22 && self.on(CFO) {
-            auth.run(|| self.cfo(io, period.linked))?;
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                self.cfo(io, period.linked),
+            )
+            .await?;
+        }
+        // rtw_phy_dpk_track sits between CFO and power tracking.
+        if let Some(dpk) = self.dpk.as_mut() {
+            dpk.period(io, auth).await?;
         }
         if c22 && self.on(PWR_TRACK) {
             self.pwr_track(io, auth).await?;
         }
+        if self.facts.b22() && self.on(PWR_TRACK) && self.facts.power_track_type == 0 {
+            self.pwr_track8822b(io, auth).await?;
+        }
         if c22 && self.on(EDCCA) {
             let mode = edcca_mode(period.country);
-            auth.run(|| self.adaptivity(io, mode))?;
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                self.adaptivity(io, mode),
+            )
+            .await?;
+        }
+        if self.facts.b22() && self.on(EDCCA) {
+            let mode = edcca_mode8822b(period.country);
+            crate::rtw88::firmware_transport::enclosed(
+                |op| auth.run(op),
+                self.adaptivity8822b(io, mode),
+            )
+            .await?;
         }
         self.count = self.count.wrapping_add(1);
         Ok(h2c)
     }
 }
 
-fn io_read16(io: &mut impl Io, reg: u16) -> Result<u16, Error> {
-    let v = io.read16(reg)?;
+async fn io_read16(io: &mut impl Io, reg: u16) -> Result<u16, Error> {
+    let v = io.read16(reg).await?;
     if v == u16::MAX {
         Err(Error::Gone)
     } else {

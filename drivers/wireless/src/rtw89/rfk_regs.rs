@@ -108,3 +108,5 @@ pub(super) const R_P0_NRBW: u32 = 0x12b8;
 pub(super) const R_P1_DBGMOD: u32 = 0x32b8;
 pub(super) const R_PATH0_SAMPL_DLY_T_V1: u32 = 0xc0d4;
 pub(super) const R_PATH1_SAMPL_DLY_T_V1: u32 = 0xc1d4;
+pub(super) const R_P0_TSSI_TRK: u32 = 0x5818;
+pub(super) const B_P0_TSSI_TRK_EN: u32 = 1 << 30;

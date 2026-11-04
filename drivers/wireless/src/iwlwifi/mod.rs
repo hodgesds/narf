@@ -51,15 +51,30 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod aggregation;
+mod ap_gen2_wire;
+mod ap_host;
+mod ap_owner;
+mod ap_session;
+mod ap_wire;
 pub mod bcast;
 pub mod boot_context;
 mod bootstrap;
+pub use bootstrap::gen2_ap_transmit_power_request;
 pub use bootstrap::gen2_ba_transmit_power_request;
+pub use bootstrap::gen2_client_transmit_power_request;
+pub use bootstrap::gen2_go_transmit_power_request;
 pub use bootstrap::gen2_ht20_transmit_power_request;
 pub use bootstrap::gen2_nested_ba_transmit_power_request;
+pub use bootstrap::gen2_p2p_transmit_power_request;
+pub use bootstrap::gen2_scan_transmit_power_request;
+pub use bootstrap::gen2_shared_memory_configuration;
 pub use bootstrap::gen2_transmit_power_request;
 pub use bootstrap::{provision, provision_state, ProvisionState};
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
+pub use mvm_boot::SharedMemory as Gen2SharedMemory;
+#[cfg(any(test, feature = "kernel-test"))]
+mod bz_fixture;
+mod bz_profile;
 pub mod connection;
 mod context_v1;
 pub mod csum;
@@ -73,14 +88,37 @@ pub mod frame_api;
 pub mod fw_loader;
 mod gen2_prepare;
 mod gen2_profile;
+#[cfg(any(test, feature = "kernel-test"))]
+mod gen3_fixture;
+mod gen3_profile;
+mod gen3_wire;
 pub mod handshake;
 pub mod ht_vht;
 pub mod iwl_msix;
 pub mod mac_ctx;
+mod mld_platform;
+mod mld_policy;
+mod mld_power;
+mod mld_regulatory;
 pub mod mlme;
 mod mvm_boot;
+mod mvm_d3;
 mod mvm_device;
 mod mvm_publication;
+mod native_band;
+mod p2p_client;
+#[cfg(feature = "kernel-test")]
+mod p2p_client_fixture;
+mod p2p_client_request;
+mod p2p_client_rx;
+mod p2p_gen2_wire;
+mod p2p_go;
+#[cfg(feature = "kernel-test")]
+mod p2p_go_fixture;
+mod p2p_go_key;
+mod p2p_host;
+mod p2p_owner;
+mod p2p_wire;
 pub mod pnvm;
 mod progress;
 pub mod qos;
@@ -89,9 +127,24 @@ pub mod regs;
 pub mod rekey;
 pub mod runtime;
 pub mod rx;
+mod rx_multi;
 pub mod rx_rfh;
+mod sc_eht;
+mod sc_emlsr;
+mod sc_he;
+mod sc_mlo;
+mod sc_mlo_assoc;
+pub use sc_mlo_assoc::MldLinkCandidate;
+mod sc_security;
+mod sc_tx_amsdu;
 pub mod scan_api;
+mod scheduled_epoch;
+mod scheduled_wire;
 pub mod security;
+mod six_ghz_power;
+mod six_ghz_scan;
+mod six_ghz_span;
+mod six_ghz_station;
 pub mod sta;
 pub mod station_api;
 pub mod transport;
@@ -966,7 +1019,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
         // AX211 family. Linux 7.3 `pcie/drv.c` "So devices" binds 0x51F0
         // and 0x7AF0/0x7F70 (`iwl_so_mac_cfg`), 0x51F1/0x7A70
         // (`iwl_so_long_latency_imr_mac_cfg`) to the same So MAC.
-        0x51f0 | 0x51f1 | 0x7a70 | 0x7af0 | 0x7f70 => ChipConfig {
+        0x51f0 | 0x51f1 | 0x54f0 | 0x7a70 | 0x7af0 | 0x7f70 => ChipConfig {
             vid,
             did,
             display_name: "AX211 (so-a0)",
@@ -977,17 +1030,6 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             api_min: 89,
             api_prefix: "",
         },
-        0x54f0 => ChipConfig {
-            vid,
-            did,
-            display_name: "AX211 (ma-a0)",
-            generation: Generation::Gen3,
-            mac: MacFamily::MaA0,
-            rf_candidates: RF_GF_OR_GF4,
-            api_max: 100,
-            api_min: 100,
-            api_prefix: "",
-        },
         // "Ma devices": 0x2729 and 0x7E40 bind `iwl_ma_mac_cfg`.
         0x2729 | 0x7e40 => ChipConfig {
             vid,
@@ -996,8 +1038,8 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             generation: Generation::Gen3,
             mac: MacFamily::MaB0,
             rf_candidates: RF_GF_OR_GF4,
-            api_max: 100,
-            api_min: 100,
+            api_max: 89,
+            api_min: 89,
             api_prefix: "",
         },
         // BE200 — Wi-Fi 7 Bz MAC + GF / GF4 / FM RF. "Bz devices" also

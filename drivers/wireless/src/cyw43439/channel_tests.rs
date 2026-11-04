@@ -252,3 +252,40 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/channel",
     smoke_fullmac_d11ac_primary_rejects_center_sideband_and_band_confusion
 );
+
+/// brcmu_d11.c D11AC 160 MHz literals (BW_160 0x2800, sideband LLL..UUU)
+/// and the brcmfmac 5 GHz set: centers 50 and 114 only (163 needs 169..177).
+fn smoke_fullmac_occupied_vht160_literal_sidebands_and_exact_span() -> TestResult {
+    for (primary, center, spec, low, high, p80) in [
+        (36, 50, 0xe832, 5170, 5330, 0xe02a),
+        (48, 50, 0xeb32, 5170, 5330, 0xe32a),
+        (52, 50, 0xec32, 5170, 5330, 0xe03a),
+        (64, 50, 0xef32, 5170, 5330, 0xe33a),
+        (100, 114, 0xe872, 5490, 5650, 0xe06a),
+        (128, 114, 0xef72, 5490, 5650, 0xe37a),
+    ] {
+        let Some(value) = Operating::one_sixty(primary, center) else {
+            return TestResult::Fail("literal 160 MHz sideband rejected");
+        };
+        if value.width() != 160
+            || value.chanspec() != spec
+            || value.span() != (low, high)
+            || value.channels() != core::array::from_fn(|i| Some(center - 14 + i as u8 * 4))
+            || Operating::decode160(spec) != Some(value)
+            || value.primary80().map(Operating::chanspec) != Some(p80)
+            || Operating::decode80(spec).is_some()
+        {
+            return TestResult::Fail("160 MHz geometry differs from brcmu_d11.c");
+        }
+    }
+    for (primary, center) in [(149, 163), (36, 42), (100, 50), (36, 114)] {
+        if Operating::one_sixty(primary, center).is_some() {
+            return TestResult::Fail("unsupported 160 MHz center/primary promoted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/channel",
+    smoke_fullmac_occupied_vht160_literal_sidebands_and_exact_span
+);

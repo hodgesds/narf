@@ -1,17 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Retained RTL8852B channel1 host station state. The exact firmware Owner
+//! Retained RTL8852B 2.4GHz/20MHz host station state (channel1 initially;
+//! signed noninitial primaries 2..=13 through the native retune owner). The exact firmware Owner
 //! keeps its native backend; this state never owns or reconstructs hardware.
+use super::command_native::OperatingChannel;
 use super::{
     packet_core::{self as packet, Frame as Mpdu, Receipt},
     power,
     station_control::Admission,
 };
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
+use narf_wireless::reg::witness::{self, BeaconWitness, ScanGeneration};
+use narf_wireless::reg::RegulatoryDomain;
 use narf_wireless::{
     association::{self, AkmSet, JoinOptions, JoinPlan, ObservedBss, Pmf, SecurityMode},
     station_security::{self, RawFrame, Security},
 };
 use zeroize::Zeroizing;
+#[path = "station_fragment.rs"]
+mod fragment;
+#[path = "station_six_ghz.rs"]
+mod six;
+#[path = "station_tx_amsdu.rs"]
+mod tx_amsdu;
 
 /// Same retained cold/firmware/radio owner. Implementations must invoke
 /// current device and exact ordinary RF/response authority at publication;
@@ -24,6 +34,27 @@ use zeroize::Zeroizing;
 /// actual hardware publication, including after an asynchronous wait.
 #[async_trait::async_trait]
 pub(super) unsafe trait Io: Send {
+    fn monitor_capable(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    fn monitor_active(&self) -> bool {
+        false
+    }
+    // Default-unsupported receive-only owner. These methods never construct
+    // an ordinary packet Core or permit injection/autonomous responses.
+    async fn monitor_start(
+        &mut self,
+        _: Arc<super::monitor::Desired>,
+        _: Admission,
+    ) -> Result<super::monitor::Source, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn monitor_poll(&mut self) -> Result<Vec<Vec<u8>>, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn monitor_stop(&mut self) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     fn station_allowed(&mut self) -> Result<(), power::Error>;
     fn station_own(&mut self) -> Result<[u8; 6], power::Error>;
     fn station_wmm_allowed(&mut self) -> Result<bool, power::Error> {
@@ -43,6 +74,17 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<(), power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// [`Self::station_configure_ra`] on an admitted 40/80MHz channel.
+    async fn station_configure_ra_wide(
+        &mut self,
+        _: u16,
+        _: super::station_control::HtRa,
+        _: Option<super::station_control::HeRa>,
+        _: super::station_control::WideRa,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// `rtw89_fw_h2c_ba_cam` for a recipient session start/stop.
     async fn station_configure_ba(
         &mut self,
@@ -56,6 +98,11 @@ pub(super) unsafe trait Io: Send {
     }
     /// Signed HT20 program (`Program::Ht`).
     fn station_ht_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// Distinct current expanded full-radio A-MSDU companion, not the old
+    /// A-MPDU flag or HT enumeration. Optional prior profiles keep false.
+    fn station_amsdu_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
     }
     /// Signed originator BA / TX A-MPDU program (`Program::Ampdu`).
@@ -88,6 +135,56 @@ pub(super) unsafe trait Io: Send {
     }
     /// Track-work register read (`track::REGISTERS` only). `Unsupported`
     /// disables tracking, as `disabled_dm_bitmap` does.
+    /// Native opt-in comes only from the actual signed expanded LPS program.
+    fn station_sleep_capable(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    /// True includes an interrupted/uncertain transition; synchronous drain
+    /// may not read ordinary RX/BB until the retained async owner restores it.
+    fn station_sleep_blocked(&self) -> bool {
+        false
+    }
+    async fn station_sleep_service(
+        &mut self,
+        _: Option<narf_net::native_emission::Lifetime>,
+        _: bool,
+        _: bool,
+        _: bool,
+        _: &Admission,
+    ) -> Result<(bool, bool), power::Error> {
+        Ok((false, false))
+    }
+    /// RTL8852B WoW (`rtw89_wow_suspend`) is possible on this owner.
+    fn station_wow_capable(&mut self) -> bool {
+        false
+    }
+    /// `rtw89_wow_suspend` with the validated configuration and the
+    /// station's key snapshot; any error leaves the owner for the cold path.
+    async fn station_wow_suspend(
+        &mut self,
+        _: &narf_wireless::WowlanConfig,
+        _: Option<&station_security::SuspendKeys>,
+        _: Option<&station_security::SuspendFloors>,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// `rtw89_wow_resume`: the wake report (even on failure) and whether the
+    /// awake station was restored.
+    async fn station_wow_resume(
+        &mut self,
+        _: &Admission,
+    ) -> (
+        Option<super::wow_wire::WakeReport>,
+        Result<(), power::Error>,
+    ) {
+        (None, Err(power::Error::Unsupported))
+    }
+    /// One periodic RF tracking step (`rtw89_track_work` ->
+    /// `rtw89_chip_rfk_track`); never called while scanning.
+    async fn station_rf_tracking(&mut self, _: &Admission) -> Result<(), power::Error> {
+        Ok(())
+    }
     fn station_track_read(&mut self, _: u32) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
     }
@@ -99,6 +196,10 @@ pub(super) unsafe trait Io: Send {
     fn station_track_profile(&mut self) -> Result<super::track::Profile, power::Error> {
         Err(power::Error::Unsupported)
     }
+    /// Track-work chip register layout and 5 GHz operating band.
+    fn station_track_layout(&mut self) -> Result<(super::track::Layout, bool), power::Error> {
+        Ok((super::track::LAYOUT_B, false))
+    }
     /// CFO crystal-capacitor write through XTAL SI; returns the SC_XI readback.
     async fn station_track_crystal(&mut self, _: u8) -> Result<u8, power::Error> {
         Err(power::Error::Unsupported)
@@ -106,6 +207,90 @@ pub(super) unsafe trait Io: Send {
     /// Signed HE20 program (`Program::He`).
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
+    }
+    /// One RF path (RTL8851B `rx_nss` = `tx_nss` = 1): the station offers
+    /// the NSS1 VHT/HE capability bodies.
+    fn station_single_stream(&mut self) -> bool {
+        false
+    }
+    /// Retune the Ready radio to `primary` (2.4GHz or 5GHz 20MHz, signed
+    /// N52C record required except channel1) and return the new retune epoch. `Busy` is a
+    /// proven-unpublished refusal while TX/RX work is still pending.
+    async fn station_retune(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Signed-admitted RTL8852B 40/80MHz operating channels
+    /// (`Native::admitted_wide`). Default: none, so the station stays 20MHz.
+    fn station_wide_channels(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<super::operating_channel::Profile>, power::Error> {
+        Ok(alloc::vec::Vec::new())
+    }
+    /// Retune the Ready unassociated radio to one admitted 40/80MHz
+    /// `profile` (`Native::retune_full_radio_to`), same refusal contract as
+    /// [`Self::station_retune`].
+    async fn station_retune_wide(
+        &mut self,
+        _: super::operating_channel::Profile,
+        _: &Admission,
+    ) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Associated channel switch (CSA): retune the Ready radio to `primary`
+    /// keeping the installed peer, same admission/record rules as
+    /// [`Self::station_retune`]. `Busy` is a proven-unpublished refusal.
+    async fn station_switch_channel(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// RTL8852C 6GHz 20MHz channels with a current signed record under a
+    /// regd.c power context the host rule admits (`Native::admitted_six_ghz`).
+    /// Default: none, so no 6GHz scan, join or band advertisement exists.
+    fn station_six_ghz_channels(
+        &mut self,
+    ) -> Result<Vec<super::command_native::SixGhzChannel>, power::Error> {
+        Ok(Vec::new())
+    }
+    /// The host policy the 6GHz records are admitted under
+    /// (`Native::six_ghz_regulatory`); the 6GHz join takes its rule.
+    fn station_six_ghz_regulatory(
+        &mut self,
+    ) -> Result<Option<Arc<RegulatoryDomain>>, power::Error> {
+        Ok(None)
+    }
+    /// Retune the Ready radio to one admitted 6GHz 20MHz channel under its
+    /// power context and the regd.c TPE constraint (`tpe`, dBm, STD only)
+    /// (`Startup::retune_channel_c` with `Some((six, tpe))`). `linked` keeps
+    /// the installed peer (TPE update / channel switch). Same refusal
+    /// contract as [`Self::station_retune`].
+    async fn station_retune_6ghz(
+        &mut self,
+        _: super::command_native::SixGhzChannel,
+        _: Option<i8>,
+        _: bool,
+        _: &Admission,
+    ) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// `operating_channel::slot` mask (2.4GHz primary n = bit n, 5GHz from
+    /// bit 16) of primaries with a current signed full program (channel1 is
+    /// the base record). Default: channel1 only.
+    fn station_channels(&mut self) -> Result<u64, power::Error> {
+        Ok(1 << 1)
+    }
+    /// The host policy snapshot the native envelope checks run against,
+    /// classifying passive-only (DFS / NO_IR) primaries and scoping the
+    /// station's beacon witnesses. `None` (default): the native side admits
+    /// no passive-only primary, so every admitted primary is active.
+    fn station_regulatory(&mut self) -> Result<Option<Arc<RegulatoryDomain>>, power::Error> {
+        Ok(None)
+    }
+    /// Grant (`Some((primary, policy))`) or withdraw (`None`) native frame
+    /// TX on a passive-only primary the station admitted under a witness.
+    fn station_passive_tx(
+        &mut self,
+        _: Option<(u8, Arc<RegulatoryDomain>)>,
+    ) -> Result<(), power::Error> {
+        Ok(())
     }
     /// `rtw89_core_scan_start`/`_complete` address CAM update: a random scan
     /// SMA, or `None` to restore the own address.
@@ -163,6 +348,84 @@ pub(super) unsafe trait Io: Send {
         peer: [u8; 6],
         admission: &Admission,
     ) -> Result<(), power::Error>;
+    fn station_fragments_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    fn packet_fragment_binding(
+        &mut self,
+        _: &Admission,
+    ) -> Result<super::command_native::FragmentBinding, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn packet_submit_fragment(
+        &mut self,
+        _: &super::command_native::FragmentPart,
+        _: bool,
+    ) -> Result<u64, packet::Error> {
+        Err(packet::Error::State)
+    }
+    // AP role (`startup_ap.rs`): exclusive with the station owner. Default
+    // unsupported; no AP capability follows from these alone.
+    fn ap_allowed(&mut self) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Signed AP channel admission and retune (before `ap_prepare`).
+    async fn ap_channel(&mut self, _: u8, _: &Admission) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_prepare(&mut self, _: [u8; 6], _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_start(
+        &mut self,
+        _: super::ap_control::PortConfig,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_publish_beacon(
+        &mut self,
+        _: &[u8],
+        _: usize,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_add_peer(&mut self, _: [u8; 6], _: &Admission) -> Result<u8, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_associate_peer(
+        &mut self,
+        _: [u8; 6],
+        _: u16,
+        _: [u8; 16],
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_remove_peer(&mut self, _: [u8; 6], _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    async fn ap_stop(&mut self, _: &Admission) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    fn ap_packet_ready(&self) -> bool {
+        false
+    }
+    fn ap_lowest_rate(&mut self) -> Result<u8, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// One AP frame (`after_dtim`: CH9 HIQ); the native owner resolves the
+    /// peer MACID and refuses unbound unicast data.
+    fn packet_submit_ap(
+        &mut self,
+        _: &[u8],
+        _: bool,
+        _: bool,
+        _: u8,
+    ) -> Result<u64, packet::Error> {
+        Err(packet::Error::State)
+    }
     fn packet_prepare(&mut self, own: [u8; 6], macid: u8) -> Result<(), packet::Error>;
     fn packet_start(&mut self) -> Result<(), packet::Error>;
     fn packet_ready(&self) -> bool;
@@ -320,10 +583,14 @@ pub(super) struct Probe {
     /// (`IEEE80211_TX_CTRL_NO_SEQNO`).
     pub(super) random_sn: bool,
 }
-/// mac80211 `ieee80211_build_probe_req` for this 2.4GHz channel1 profile:
-/// SSID, Supported Rates (1,2,5.5,11,6,9,12,18), Extended Supported Rates
-/// (24,36,48,54), DS Parameter Set, then the caller's extra IEs.
-pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8]) -> Vec<u8> {
+/// mac80211 `ieee80211_build_probe_req` (`ieee80211_build_preq_ies_band`)
+/// for this 20MHz profile. 2.4GHz: SSID, Supported Rates
+/// (1,2,5.5,11,6,9,12,18), Extended Supported Rates (24,36,48,54), DS
+/// Parameter Set (the retained radio's actual primary). 5GHz: SSID and the
+/// eight OFDM Supported Rates (6..54) only; no Extended Supported Rates
+/// (nothing left over) and no DS Parameter Set (2.4GHz only). Then the
+/// caller's extra IEs.
+pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8], channel: u8) -> Vec<u8> {
     let mut frame = vec![0x40, 0, 0, 0];
     frame.extend_from_slice(&[0xff; 6]);
     frame.extend_from_slice(&own);
@@ -331,11 +598,46 @@ pub(super) fn probe_request(own: [u8; 6], ssid: &[u8], ies: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&[0, ssid.len() as u8]);
     frame.extend_from_slice(ssid);
-    frame.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
-    frame.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
-    frame.extend_from_slice(&[3, 1, 1]);
+    if ghz5(channel) {
+        frame.extend_from_slice(&[1, 8, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c]);
+    } else {
+        frame.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
+        frame.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
+        frame.extend_from_slice(&[3, 1, channel]);
+    }
     frame.extend_from_slice(ies);
     frame
+}
+/// A typed 5GHz primary (`operating_channel::GHZ5`).
+pub(super) fn ghz5(primary: u8) -> bool {
+    super::operating_channel::GHZ5.contains(&primary)
+}
+/// cfg80211 centre frequency of a typed primary (20 MHz witness key).
+fn center(primary: u8) -> u16 {
+    super::monitor_wire::frequency(primary) as u16
+}
+/// The primary is passive-only (cfg80211 RADAR / NO_IR) under `policy`.
+pub(super) fn passive_only(policy: Option<&Arc<RegulatoryDomain>>, primary: u8) -> bool {
+    policy.is_some_and(|p| witness::passive_only(p, center(primary)))
+}
+/// A typed 20MHz primary this station may tune: 2.4GHz 1..=13 or 5GHz.
+fn typed(primary: u8) -> bool {
+    (1..=13).contains(&primary) || ghz5(primary)
+}
+/// `primary` is set in an `operating_channel::slot` admission mask.
+pub(super) fn channel_admitted(mask: u64, primary: u8) -> bool {
+    typed(primary)
+        && super::operating_channel::slot(primary).is_some_and(|bit| mask & (1u64 << bit) != 0)
+}
+/// The station's own fixed management rate on `primary` (core.c
+/// `rtw89_core_get_mgmt_rate` band floor) must be a BSS basic rate:
+/// 1Mbps on 2.4GHz, 6Mbps on 5GHz, where no CCK rate may be basic.
+fn basic_ok(ofdm_only: bool, basic: u16) -> bool {
+    if ofdm_only {
+        basic & 0x10 != 0 && basic & 0xf == 0
+    } else {
+        basic & 1 != 0
+    }
 }
 enum BaOp {
     Start(super::block_ack::Request, u16),
@@ -385,6 +687,11 @@ pub(super) struct State {
     /// Frames in flight, oldest first. More than one only for aggregated
     /// QoS DATA on an operational originator session.
     pending: VecDeque<Pending>,
+    fragment_tx: Option<Box<fragment::Flight>>,
+    fragment_wait: Option<Box<fragment::Deferred>>,
+    fragment_policy: Option<Arc<super::monitor::Desired>>,
+    fragment_plain: Option<Box<super::fragment_rx::Plain>>,
+    fragment_rx_pending: bool,
     delivered_reply: Option<Pending>,
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
@@ -401,6 +708,12 @@ pub(super) struct State {
     ht: bool,
     /// HE20 was negotiated for this association.
     he: bool,
+    /// A current MACID0 RA report has ruled out legacy fallback.
+    htc_rate: bool,
+    /// Latest matching native RC body ceiling; None is Linux's initial no clamp.
+    amsdu_rc: Option<usize>,
+    /// Actual RX prefix was drained to idle by the last retained worker pass.
+    rx_idle: bool,
     /// Data TXWD `DATA_ER` (Linux `er_cap`: HE operation allows ER SU).
     er: bool,
     /// Random scan address live in the address CAM during an active scan.
@@ -423,6 +736,94 @@ pub(super) struct State {
     /// `rtw89_track_work` RSSI statistics and dynamic EDCCA.
     track: super::track::Tracker,
     scanning: bool,
+    /// cfg80211 `beacon_found` per 20MHz primary in its latest covering scan
+    /// (shared `reg::witness`): admits association / CSA onto a passive-only
+    /// (DFS / NO_IR) primary.
+    witness: BeaconWitness,
+    /// Witness generation of the dwell in progress, if any.
+    witness_scan: Option<ScanGeneration>,
+    /// Band-qualified actual channel of the retained radio (native retune
+    /// epoch below); 2.4/5GHz legacy numbering until a 6GHz retune exists.
+    channel: OperatingChannel,
+    /// The admitted 40/80MHz operating channel the radio is tuned to around
+    /// `channel`, if any (`None`: the 20MHz profile of `channel`).
+    wide: Option<super::operating_channel::Profile>,
+    /// RTL8852C 6GHz tuning: the admitted channel/power context and the
+    /// regd.c TPE constraint it was programmed with (`None` off 6GHz).
+    six: Option<(super::command_native::SixGhzChannel, Option<i8>)>,
+    /// Native retune epoch this state's channel-bound work was built for.
+    epoch: Option<u32>,
+    /// Accepted AP channel switch (mac80211 `link->csa`), if any.
+    csa: Option<Switch>,
+}
+/// mac80211 station CSA state for one link: target primary, switch time
+/// (`csa_time_tu` after the announcing beacon), `csa.blocked_tx` and
+/// `csa.waiting_bcn` once the radio is on the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Switch {
+    pub primary: u8,
+    pub at_ms: u64,
+    pub block_tx: bool,
+    pub switched: bool,
+}
+/// Parsed CSA/ECSA element of a beacon (`ieee80211_parse_ch_switch_ie`):
+/// ECSA (60) takes precedence over CSA (37) when its operating class is
+/// understood (`ieee80211_operating_class_to_band`: 81..=84 2.4GHz, 112 and
+/// 115..=130 5GHz, 131..=135/137 6GHz, 180 60GHz); otherwise the CSA element
+/// is used in the current band. `None` primary is a target this 20MHz
+/// station has no typed channel for (another band, channel 14, or a channel
+/// outside the band's primaries).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Announcement {
+    pub mode: bool,
+    pub primary: Option<u8>,
+    pub count: u8,
+}
+pub(super) fn channel_switch(ies: &[u8], current: u8) -> Option<Announcement> {
+    let mut csa = None;
+    let mut ecsa = None;
+    let mut rest = ies;
+    while let [id, len, tail @ ..] = rest {
+        let len = usize::from(*len);
+        let Some(body) = tail.get(..len) else {
+            break;
+        };
+        match (*id, body) {
+            (37, [mode, channel, count]) if csa.is_none() => csa = Some((*mode, *channel, *count)),
+            (60, [mode, class, channel, count]) if ecsa.is_none() => {
+                ecsa = Some((*mode, Some(*class), *channel, *count))
+            }
+            _ => {}
+        }
+        rest = &tail[len..];
+    }
+    // 0: 2.4GHz, 1: 5GHz, 2: a band without typed channels here.
+    let class_band = |class: u8| match class {
+        81..=84 => Some(0),
+        112 | 115..=130 => Some(1),
+        131..=135 | 137 | 180 => Some(2),
+        _ => None,
+    };
+    let current_band = u8::from(ghz5(current));
+    let (mode, band, channel, count) = match ecsa {
+        Some((mode, Some(class), channel, count)) if class_band(class).is_some() => {
+            (mode, class_band(class)?, channel, count)
+        }
+        _ => {
+            let (mode, channel, count) = csa?;
+            (mode, current_band, channel, count)
+        }
+    };
+    let primary = match band {
+        0 => (1..=13).contains(&channel),
+        1 => ghz5(channel),
+        _ => false,
+    };
+    Some(Announcement {
+        mode: mode == 1,
+        primary: primary.then_some(channel),
+        count,
+    })
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -453,6 +854,11 @@ impl State {
             incoming: VecDeque::new(),
             received: VecDeque::new(),
             pending: VecDeque::new(),
+            fragment_tx: None,
+            fragment_wait: None,
+            fragment_policy: None,
+            fragment_plain: None,
+            fragment_rx_pending: false,
             delivered_reply: None,
             initial_nonce: None,
             sequence: 1,
@@ -464,6 +870,9 @@ impl State {
             firmware_ra: false,
             ht: false,
             he: false,
+            htc_rate: false,
+            amsdu_rc: None,
+            rx_idle: false,
             er: false,
             scan: None,
             ba: core::array::from_fn(|_| None),
@@ -477,6 +886,13 @@ impl State {
             last_now: 0,
             track: super::track::Tracker::default(),
             scanning: false,
+            witness: BeaconWitness::new(),
+            witness_scan: None,
+            channel: OperatingChannel::legacy(1),
+            wide: None,
+            six: None,
+            epoch: None,
+            csa: None,
         }
     }
     pub(super) fn admission(&self) -> Admission {
@@ -499,8 +915,85 @@ impl State {
             None
         }
     }
+    pub(super) fn sleep_idle(&self) -> bool {
+        self.phase == Phase::Open
+            && self.ready()
+            && self.pending.is_empty()
+            && self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && !self.fragment_rx_pending
+            && self.delivered_reply.is_none()
+            && self.incoming.is_empty()
+            && self.received.is_empty()
+            && self.mgmt_out.is_empty()
+            && self.ba_ops.is_empty()
+            && self.edca_pending.is_none()
+            && self.csa.is_none()
+            && !self.scanning
+            && self.scan.is_none()
+            && self.rx_idle
+            && self
+                .ba
+                .iter()
+                .flatten()
+                .all(|session| session.reorder.buffered() == 0)
+            && (0..8).all(|tid| !self.originator.holding(tid))
+            && !self.sleep_timer_due()
+            && self.security.as_ref().is_none_or(|s| !s.handshake_active())
+            && !self.track.due(self.environment.now_ms())
+    }
+    /// `rtw89_wow_suspend` inputs from the associated, settled station
+    /// (no handshake, CSA, scan or management/packet work in flight): the
+    /// current temporal keys and their PN floors, both `None` for an open
+    /// BSS. Reading them consumes no PN or replay state.
+    pub(super) fn wow_snapshot(
+        &self,
+    ) -> Result<
+        (
+            Option<station_security::SuspendKeys>,
+            Option<station_security::SuspendFloors>,
+        ),
+        Error,
+    > {
+        if self.phase != Phase::Open
+            || self.peer().is_none()
+            || !self.ready()
+            || !self.pending.is_empty()
+            || self.csa.is_some()
+            || self.scanning
+            || self.scan.is_some()
+            || !self.mgmt_out.is_empty()
+            || !self.ba_ops.is_empty()
+            || self.edca_pending.is_some()
+        {
+            return Err(Error::State);
+        }
+        match self.security.as_ref() {
+            None => Ok((None, None)),
+            Some(security) => {
+                let keys = security.suspend_keys().ok_or(Error::State)?;
+                let floors = security.suspend_floors().ok_or(Error::State)?;
+                Ok((Some(keys), Some(floors)))
+            }
+        }
+    }
+    /// The link survived the WoW window (`rtw89_wow_resume` kept the
+    /// association): the AP was heard by the WoW firmware until now.
+    pub(super) fn wow_resumed(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Open || self.peer().is_none() {
+            return Err(Error::State);
+        }
+        self.last_peer = self.now()?;
+        Ok(())
+    }
+    pub(super) fn sleep_restored(&mut self) {
+        self.track.restored();
+    }
     pub(super) fn ready(&self) -> bool {
         self.peer().is_some()
+            && !self.csa_blocks_tx()
+            && self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
             && self.pending.iter().all(|pending| pending.agg)
             && self.delivered_reply.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
@@ -535,15 +1028,26 @@ impl State {
     }
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
         self.sae = None;
+        self.fragment_tx = None;
+        self.fragment_wait = None;
+        self.fragment_plain = None;
+        self.fragment_rx_pending = false;
         self.wmm = None;
 
         self.edca_pending = None;
+        self.csa = None;
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
         self.he = false;
+        self.htc_rate = false;
+        self.amsdu_rc = None;
+        self.rx_idle = false;
         self.er = false;
         self.scan = None;
+        self.witness.clear();
+        self.witness_scan = None;
+        let _ = io.station_passive_tx(None);
         self.clear_block_ack();
         self.admission.close();
         self.established = false;
@@ -573,13 +1077,21 @@ impl State {
             Some(self.admission.begin_disconnect()?)
         };
         self.admission.close();
+        self.fragment_tx = None;
+        self.fragment_wait = None;
+        self.fragment_plain = None;
+        self.fragment_rx_pending = false;
         self.established = false;
         self.wmm = None;
         self.edca_pending = None;
+        self.csa = None;
         self.qos_all = false;
         self.firmware_ra = false;
         self.ht = false;
         self.he = false;
+        self.htc_rate = false;
+        self.amsdu_rc = None;
+        self.rx_idle = false;
         self.er = false;
         self.scan = None;
         self.clear_block_ack();
@@ -619,8 +1131,11 @@ impl State {
     }
     /// `rtw89_track_work` (and the enhanced CFO timer) when due (`track.rs`).
     async fn track(&mut self, io: &mut impl Io) -> Result<(), Error> {
-        struct Hw<'a, I>(&'a mut I);
+        struct Hw<'a, I>(&'a mut I, &'a Admission);
         impl<I: Io> super::track::Hw for Hw<'_, I> {
+            async fn rfk(&mut self) -> Result<(), power::Error> {
+                self.0.station_rf_tracking(self.1).await
+            }
             fn read(&mut self, address: u32) -> Result<u32, power::Error> {
                 self.0.station_track_read(address)
             }
@@ -630,13 +1145,20 @@ impl State {
             fn profile(&mut self) -> Result<super::track::Profile, power::Error> {
                 self.0.station_track_profile()
             }
+            fn layout(&mut self) -> Result<(super::track::Layout, bool), power::Error> {
+                self.0.station_track_layout()
+            }
             async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
                 self.0.station_track_crystal(cap).await
             }
         }
         let now = self.now()?;
         let (peer, scanning) = (self.linked(), self.scanning);
-        match self.track.run(&mut Hw(io), now, peer, scanning).await {
+        match self
+            .track
+            .run(&mut Hw(io, &self.admission), now, peer, scanning)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(power::Error::Unsupported) => {
                 self.track.disable();
@@ -659,6 +1181,19 @@ impl State {
             .find(|candidate| candidate.bss.bssid == bssid)
             .map(|candidate| candidate.bss.information_elements)
     }
+    /// Exact station admission, shared by pre-crypto and final native send.
+    /// The peer BA window can be smaller than the packet core's global limit.
+    fn transmit_room(&self, kind: Kind, agg: Option<super::packet_format::Agg>) -> bool {
+        let joins = agg.is_some_and(|agg| {
+            kind == Kind::Data
+                && self.pending.iter().all(|pending| pending.agg)
+                && self.pending.len() < (usize::from(agg.num) + 1).min(packet::AGG_WINDOW)
+        });
+        self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && (self.pending.is_empty() || joins)
+            && self.delivered_reply.is_none()
+    }
     fn transmit(&mut self, io: &mut impl Io, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
         self.transmit_with(io, bytes, kind, true, None)
     }
@@ -676,15 +1211,11 @@ impl State {
         if self.admission.closed() {
             return Err(Error::State);
         }
-        // Only aggregated data joins other aggregated data in flight, within
-        // the session window (`agg.num` + 1) and the emitter window.
-        let joins = agg.is_some_and(|agg| {
-            kind == Kind::Data
-                && self.pending.iter().all(|pending| pending.agg)
-                && self.pending.len() < (usize::from(agg.num) + 1).min(packet::AGG_WINDOW)
-        });
-        if !self.pending.is_empty() && !joins || self.delivered_reply.is_some() {
+        if !self.transmit_room(kind, agg) {
             return Err(Error::Busy);
+        }
+        if self.fragment_management(io, &bytes, kind, assign)? {
+            return Ok(());
         }
         if assign && !matches!(kind, Kind::Security | Kind::Data) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
@@ -717,7 +1248,12 @@ impl State {
                 .find(|rate| rates & (1 << rate) != 0)
                 .ok_or(Error::Profile)?
         } else {
-            0
+            // rtw89_core_get_mgmt_rate: CCK1 on 2.4GHz, OFDM6 on 5GHz.
+            if self.channel.ofdm_only() {
+                super::packet_format::OFDM6
+            } else {
+                0
+            }
         };
         let id = match agg {
             Some(agg) => io.packet_submit_agg(&bytes, false, rate, agg)?,
@@ -746,10 +1282,23 @@ impl State {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
         let own = self.scan.unwrap_or(self.own);
-        let Ok(candidate) = association::observe(frame, 1, own, signal) else {
+        let observed = self.observe_tuned(frame, own, signal);
+        let Ok(candidate) = observed else {
             return;
         };
-        if candidate.basic_rates & 1 == 0 {
+        // cfg80211 `beacon_found` for this dwell's witness: an actual Beacon
+        // (not a probe response) observed on the tuned primary.
+        if let Some(generation) = self.witness_scan.filter(|_| self.scanning) {
+            if frame.bytes().first() == Some(&0x80)
+                && candidate.bss.channel == self.channel.primary()
+                && candidate.bss.beacon_interval != 0
+            {
+                let _ = self
+                    .witness
+                    .beacon_found(generation, center(self.channel.primary()));
+            }
+        }
+        if !basic_ok(self.channel.ofdm_only(), candidate.basic_rates) {
             return;
         }
         if self
@@ -803,11 +1352,26 @@ impl State {
     /// ignored. A new count on an established peer queues an EDCA update
     /// that the async owner applies; loss of WMM, an inadmissible set or a
     /// change before the link is open still closes the station.
+    /// `association::observe` on the tuned channel, band-qualified: a 6GHz
+    /// tuning observes with `band = Ghz6` (`observe_6ghz`).
+    fn observe_tuned(
+        &self,
+        frame: &Mpdu,
+        own: [u8; 6],
+        signal: Option<i8>,
+    ) -> Result<ObservedBss, association::Error> {
+        if self.channel.band() == super::operating_channel_c::Band::Ghz6 {
+            association::observe_6ghz(frame, self.channel.primary(), own, signal)
+        } else {
+            association::observe(frame, self.channel.primary(), own, signal)
+        }
+    }
     fn observe_wmm(&mut self, frame: &Mpdu) -> Result<(), Error> {
         let (Some(current), Some(peer)) = (self.wmm, &self.peer) else {
             return Ok(());
         };
-        let Some(candidate) = association::observe(frame, 1, self.own, None)
+        let Some(candidate) = self
+            .observe_tuned(frame, self.own, None)
             .ok()
             .filter(|candidate| candidate.bss.bssid == peer.bss.bssid)
         else {
@@ -828,12 +1392,189 @@ impl State {
         }
         if self.phase != Phase::Open
             || offered.uapsd != current.uapsd
-            || super::station_control::wmm_admit(offered, self.short_slot).is_err()
+            || super::station_control::wmm_admit(offered, self.short_slot, self.channel.ofdm_only())
+                .is_err()
         {
             return Err(Error::PeerLost);
         }
         self.edca_pending = Some(offered);
         Ok(())
+    }
+    /// mac80211 `ieee80211_sta_process_chanswitch` for a bound peer beacon
+    /// on the current primary (source BEACON). While a switch is active: the
+    /// first beacon after the switch ends it (`ieee80211_chswitch_post_beacon`,
+    /// TX unblocked) and is then treated as a fresh beacon; a beacon without
+    /// CSA before the switch aborts it (`ieee80211_sta_abort_chanswitch`);
+    /// otherwise it is disregarded. A new announcement to another band or an
+    /// unadmitted primary drops the connection ("switches to unsupported
+    /// channel"); one to the current primary is ignored. The 20MHz link
+    /// keeps 20MHz on the target (CSA chandef downgraded to the link's
+    /// connection mode), so secondary/wide-bandwidth elements are not used.
+    fn observe_csa(&mut self, io: &mut impl Io, frame: &Mpdu, now: u64) -> Result<(), Error> {
+        if self.phase != Phase::Open || frame.bytes().first() != Some(&0x80) {
+            return Ok(());
+        }
+        let Some(peer) = self.peer.as_ref().map(|peer| peer.bss.bssid) else {
+            return Ok(());
+        };
+        let six_ghz = self.channel.band() == super::operating_channel_c::Band::Ghz6;
+        let observed = self.observe_tuned(frame, self.own, None);
+        let Some(candidate) = observed
+            .ok()
+            .filter(|candidate| candidate.bss.bssid == peer)
+        else {
+            return Ok(());
+        };
+        // No native 6GHz channel-switch owner: like a wide link that cannot
+        // follow (`ieee80211_sta_process_chanswitch` -> connection loss), a
+        // 6GHz link drops on any switch announcement.
+        if six_ghz {
+            return match channel_switch(&candidate.bss.information_elements, 0) {
+                Some(_) => Err(Error::PeerLost),
+                None => Ok(()),
+            };
+        }
+        let announced = channel_switch(&candidate.bss.information_elements, self.channel.primary());
+        if let Some(active) = self.csa {
+            if active.switched {
+                self.csa = None;
+            } else {
+                if announced.is_none() {
+                    self.csa = None;
+                }
+                return Ok(());
+            }
+        }
+        let Some(announced) = announced else {
+            return Ok(());
+        };
+        let Some(primary) = announced.primary else {
+            return Err(Error::PeerLost);
+        };
+        if primary == self.channel.primary() {
+            return Ok(());
+        }
+        if !channel_admitted(io.station_channels()?, primary) {
+            return Err(Error::PeerLost);
+        }
+        // mac80211 `ieee80211_sta_process_chanswitch` drops the connection
+        // on an unusable target. A passive-only (RADAR / NO_IR) target is
+        // usable here only under a current beacon witness for it.
+        if let Some(policy) = io.station_regulatory()? {
+            if !self.witness.may_associate(&policy, &[center(primary)]) {
+                return Err(Error::PeerLost);
+            }
+        }
+        // csa_time_tu = (max(count, 1) - 1) * beacon_int.
+        let tu = u64::from(announced.count.max(1) - 1) * u64::from(candidate.bss.beacon_interval);
+        self.csa = Some(Switch {
+            primary,
+            at_ms: now.saturating_add((tu * 1024).div_ceil(1000)),
+            block_tx: announced.mode,
+            switched: false,
+        });
+        Ok(())
+    }
+    /// `csa.blocked_tx`, or the switch time has come (queues stopped for
+    /// `ieee80211_csa_switch_work`'s flush/retune).
+    fn csa_blocks_tx(&self) -> bool {
+        self.csa.is_some_and(|csa| {
+            csa.block_tx || !csa.switched && self.environment.now_ms() >= csa.at_ms
+        })
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn channel_switch(&self) -> Option<Switch> {
+        self.csa
+    }
+    fn channel_switch_due(&self) -> bool {
+        self.phase == Phase::Open
+            && self
+                .csa
+                .is_some_and(|csa| !csa.switched && self.environment.now_ms() >= csa.at_ms)
+    }
+    /// `ieee80211_csa_switch_work` -> rtw89 chanctx switch (`Io::station_switch_channel`)
+    /// once every TX in flight retired; the installed peer stays. A `Busy`
+    /// native refusal or TX still in flight retries on a later worker pass
+    /// within one second of the switch time, then the link fails like a
+    /// mac80211 switch failure. Afterwards the beacon monitor restarts
+    /// (`ieee80211_sta_reset_beacon_monitor`) and TX stays blocked (if
+    /// requested) until the first beacon on the target.
+    pub(super) async fn switch_channel(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        let Some(csa) = self.csa.filter(|csa| !csa.switched) else {
+            return Ok(());
+        };
+        if self.phase != Phase::Open || !typed(csa.primary) {
+            return Err(Error::State);
+        }
+        // A 40/80MHz link cannot follow the switch: the native CSA owner
+        // retunes 20MHz profiles only. mac80211 disconnects when it cannot
+        // use the new chandef (`ieee80211_sta_process_chanswitch` ->
+        // connection loss), so the link fails instead of narrowing silently.
+        if self.wide.is_some() {
+            if !self.admission.teardown_pending() {
+                self.fail(io);
+            }
+            return Err(Error::PeerLost);
+        }
+        let now = self.now()?;
+        let quiet = self.pending.is_empty()
+            && self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && self.delivered_reply.is_none();
+        // Re-check the witness at the switch: the target's passive TX grant
+        // follows only a still-current witness under the current policy.
+        let policy = io.station_regulatory()?;
+        let grant = match &policy {
+            Some(policy) if passive_only(Some(policy), csa.primary) => {
+                if !self.witness.may_associate(policy, &[center(csa.primary)]) {
+                    if !self.admission.teardown_pending() {
+                        self.fail(io);
+                    }
+                    return Err(Error::PeerLost);
+                }
+                Some((csa.primary, policy.clone()))
+            }
+            _ => None,
+        };
+        let result = if quiet {
+            io.station_switch_channel(csa.primary, &self.admission)
+                .await
+        } else {
+            Err(power::Error::Busy)
+        };
+        let result = match result {
+            Ok(epoch) if grant.is_some() => io.station_passive_tx(grant).map(|()| epoch),
+            other => other,
+        };
+        match result {
+            Ok(epoch) => {
+                self.channel = OperatingChannel::legacy(csa.primary);
+                self.epoch = Some(epoch);
+                if let Some(peer) = self.peer.as_mut() {
+                    // An ECSA may move the link to the other band.
+                    peer.bss.channel = csa.primary;
+                    peer.bss.band = association::channel::band(csa.primary);
+                }
+                // rtw89_track_work statistics belong to the old primary.
+                self.track = super::track::Tracker::default();
+                self.last_peer = now;
+                self.csa = Some(Switch {
+                    switched: true,
+                    ..csa
+                });
+                Ok(())
+            }
+            Err(power::Error::Busy) if now < csa.at_ms.saturating_add(1000) => Ok(()),
+            Err(error) => {
+                if !self.admission.teardown_pending() {
+                    self.fail(io);
+                }
+                Err(match error {
+                    power::Error::Busy => Error::State,
+                    error => Error::Native(error),
+                })
+            }
+        }
     }
     /// After `Originator::stop`: `TX_STOP_*` reaches the driver (RA limit),
     /// and a locally requested stop (`AGG_STOP_LOCAL_REQUEST`) sends DELBA
@@ -917,10 +1658,10 @@ impl State {
                     status,
                     tid,
                     buf_size,
-                    ..
+                    amsdu,
                 } => {
-                    // ieee80211_process_addba_resp. `amsdu` only matters to
-                    // A-MSDU-in-A-MPDU, which this emitter never builds.
+                    // Sticky directional peer denial also constrains a
+                    // separately qualified expanded A-MSDU emitter.
                     if self.ampdu {
                         let requested = matches!(
                             self.originator.tids.get(usize::from(tid)).copied().flatten(),
@@ -928,7 +1669,7 @@ impl State {
                         );
                         if self
                             .originator
-                            .response(token, status, tid, buf_size)
+                            .response(token, status, tid, buf_size, amsdu)
                             .is_some()
                         {
                             self.ba_ops.push_back(BaOp::TxOperational(tid));
@@ -1039,8 +1780,19 @@ impl State {
             .fold(0, |m, (tid, s)| if s.is_some() { m | 1 << tid } else { m })
     }
     /// Work that needs awaited firmware receipts (EDCA, BA CAM).
+    fn sleep_timer_due(&self) -> bool {
+        let now = self.environment.now_ms();
+        self.originator.expired(now).next().is_some()
+            || self.ba.iter().flatten().any(|session| {
+                session.timeout_tu != 0
+                    && now.saturating_sub(session.last_ms)
+                        > (u64::from(session.timeout_tu) * 1024).div_ceil(1000)
+            })
+    }
     pub(super) fn async_pending(&self) -> bool {
         self.edca_pending()
+            || self.channel_switch_due()
+            || self.sleep_timer_due()
             || self.phase == Phase::Open && !self.ba_ops.is_empty()
             || !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped)
                 && self.track.due(self.environment.now_ms())
@@ -1048,6 +1800,9 @@ impl State {
     pub(super) async fn apply_async(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.edca_pending() {
             self.apply_edca(io).await?;
+        }
+        if self.channel_switch_due() {
+            self.switch_channel(io).await?;
         }
         if !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped) {
             self.track(io).await?;
@@ -1176,6 +1931,7 @@ impl State {
             .iter()
             .position(|pending| pending.id == delivery.id)
             .ok_or(Error::State)?;
+        self.fragment_delivered(delivery.id)?;
         let pending = self.pending.remove(index).ok_or(Error::State)?;
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
@@ -1210,8 +1966,21 @@ impl State {
         io.station_allowed()?;
         let now = self.now()?;
         let mut idle = false;
+        self.rx_idle = false;
         for _ in 0..32 {
             let step = io.packet_poll()?;
+            if self.phase == Phase::Open {
+                if let Some(allowed) = step.c2h.as_deref().and_then(super::he_htc::rate_allows) {
+                    self.htc_rate = allowed;
+                }
+                if let Some(limit) = step
+                    .c2h
+                    .as_deref()
+                    .and_then(|bytes| super::tx_amsdu::rate_limit(bytes, self.he))
+                {
+                    self.amsdu_rc = Some(limit);
+                }
+            }
             if let Some(rssi) = step.rssi {
                 self.track.sample(self.linked(), rssi);
             }
@@ -1237,10 +2006,25 @@ impl State {
                     }
                 }
                 self.observe_wmm(&frame)?;
+                self.observe_csa(io, &frame, now)?;
                 if self.lost(&frame) {
                     return Err(Error::PeerLost);
                 }
-                let frame = match self.block_ack_rx(frame, now)? {
+                // Every fragment retains its original header until Security
+                // authenticates it. Never collapse equal-SN fragments in BA
+                // reorder/duplicate machinery before defragmentation.
+                let fragment = super::fragment_rx::fragmented(frame.bytes());
+                if fragment
+                    && super::packet_format::qos_tid(frame.bytes())
+                        .is_some_and(|tid| self.ba[usize::from(tid & 7)].is_some())
+                {
+                    continue;
+                }
+                let frame = match if fragment {
+                    Ok(Some(frame))
+                } else {
+                    self.block_ack_rx(frame, now)
+                }? {
                     Some(frame) => frame,
                     None => continue,
                 };
@@ -1253,6 +2037,7 @@ impl State {
                 }
             }
         }
+        self.rx_idle = idle;
         // A CRC/report descriptor is consumed input, never an RX-idle fence.
         // Inspect all queued peer loss before committing an exact M4 receipt.
         if idle {
@@ -1266,6 +2051,7 @@ impl State {
         }
         for _ in 0..64 {
             if !self.pending.is_empty()
+                || self.fragment_blocks_incoming()
                 || self.delivered_reply.is_some()
                 || self.peer_commit.is_some()
                 || self
@@ -1326,14 +2112,16 @@ impl State {
                         let peer = self.peer.as_ref().ok_or(Error::State)?;
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
-                        let short = peer.bss.capability & response_cap & 0x400 != 0;
+                        // mac80211: 5GHz always uses the short slot time.
+                        let short = self.channel.ofdm_only()
+                            || peer.bss.capability & response_cap & 0x400 != 0;
                         if self.wmm.is_some() {
                             let p = narf_wireless::wmm::Parameters::parse(
                                 frame.bytes().get(30..).ok_or(Error::Profile)?,
                             )
                             .map_err(|_| Error::Profile)?
                             .ok_or(Error::Profile)?;
-                            super::station_control::wmm_admit(p, short)?;
+                            super::station_control::wmm_admit(p, short, self.channel.ofdm_only())?;
                             self.wmm = Some(p);
                         }
                         self.peer_commit = Some((aid, short));
@@ -1346,9 +2134,13 @@ impl State {
                         let handshake_active = security.handshake_active();
                         let environment = &self.environment;
                         let initial = &mut self.initial_nonce;
-                        match security.receive_with_nonce(&frame, || {
-                            initial.take().or_else(|| environment.nonce())
-                        })? {
+                        let nonce = || initial.take().or_else(|| environment.nonce());
+                        let result = if super::fragment_rx::fragmented(frame.bytes()) {
+                            security.receive_fragment_with_nonce(&frame, now, nonce)
+                        } else {
+                            security.receive_with_nonce(&frame, nonce)
+                        }?;
+                        match result {
                             station_security::Rx::Data(bytes) => {
                                 if let Some(bytes) = ethernet(
                                     &bytes,
@@ -1369,23 +2161,42 @@ impl State {
                             }
                             station_security::Rx::Ignored => {}
                         }
-                    } else if let Some(bytes) = ethernet(
-                        frame.bytes(),
-                        self.own,
-                        self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
-                    ) {
-                        self.last_peer = now;
-                        if self.received.len() == 64 {
-                            return Err(Error::State);
+                    } else {
+                        let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        let bytes = if super::fragment_rx::fragmented(frame.bytes()) {
+                            self.fragment_plain
+                                .get_or_insert_with(super::fragment_rx::Plain::boxed)
+                                .push(frame.bytes(), self.own, peer, now)
+                        } else {
+                            Some(frame.bytes().to_vec())
+                        };
+                        if let Some(bytes) =
+                            bytes.as_deref().and_then(|b| ethernet(b, self.own, peer))
+                        {
+                            self.last_peer = now;
+                            if self.received.len() == 64 {
+                                return Err(Error::State);
+                            }
+                            self.received.push_back(bytes);
                         }
-                        self.received.push_back(bytes);
                     }
                 }
                 _ => {}
             }
         }
+        self.fragment_rx_pending = self
+            .security
+            .as_mut()
+            .is_some_and(|s| s.fragment_pending(now))
+            || self
+                .fragment_plain
+                .as_mut()
+                .is_some_and(|cache| cache.pending(now));
         self.block_ack_tick(now)?;
-        if self.pending.is_empty()
+        self.progress_fragments(io)?;
+        if self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && self.pending.is_empty()
             && self.delivered_reply.is_none()
             && self.phase == Phase::Open
             && self
@@ -1412,7 +2223,11 @@ impl State {
                 }
             }
         }
-        if self.pending.is_empty() && self.delivered_reply.is_none() {
+        if self.fragment_tx.is_none()
+            && self.fragment_wait.is_none()
+            && self.pending.is_empty()
+            && self.delivered_reply.is_none()
+        {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -1462,13 +2277,28 @@ impl State {
         let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) else {
             return Ok(Some(frame));
         };
-        let Some(security) = self.security.as_mut().filter(|s| s.pmf()) else {
-            return Ok(Some(frame));
-        };
         let bytes = frame.bytes();
         if bytes.first().is_none_or(|fc| fc & 0x0c != 0) || bytes.get(10..16) != Some(&peer[..]) {
             return Ok(Some(frame));
         }
+        if super::fragment_rx::fragmented(bytes) {
+            return Ok(match self.security.as_mut() {
+                Some(security) => {
+                    match security.receive_management_fragment(&frame, self.last_now)? {
+                        station_security::MgmtRx::Ignored => None,
+                        station_security::MgmtRx::Frame(bytes) => Some(Mpdu::new(bytes)),
+                    }
+                }
+                None => self
+                    .fragment_plain
+                    .get_or_insert_with(super::fragment_rx::Plain::boxed)
+                    .push(bytes, self.own, peer, self.last_now)
+                    .map(Mpdu::new),
+            });
+        }
+        let Some(security) = self.security.as_mut().filter(|s| s.pmf()) else {
+            return Ok(Some(frame));
+        };
         Ok(match security.receive_management(&frame)? {
             station_security::MgmtRx::Ignored => None,
             station_security::MgmtRx::Frame(bytes) => Some(Mpdu::new(bytes)),
@@ -1484,6 +2314,7 @@ impl State {
         let peer = self.peer.as_ref().ok_or(Error::State)?;
         let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
         let station_rsnxe = plan.sae().and_then(|sae| sae.station_rsnxe());
+        self.fragment_plain = None;
         self.security = Some(Security::new_sae(
             self.own,
             peer.bss.bssid,
@@ -1504,7 +2335,7 @@ impl State {
     ) -> Result<Vec<ObservedBss>, Error> {
         self.scan_with(io, dwell_ms, None).await
     }
-    /// Scan channel 1 for `dwell_ms`. An active scan first transmits one
+    /// Scan the current primary for `dwell_ms`. An active scan first transmits one
     /// probe request per SSID (wildcard when none) like mac80211's software
     /// scan, then listens for the dwell.
     pub(super) async fn scan_with(
@@ -1519,6 +2350,16 @@ impl State {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
+        // mac80211 `ieee80211_scan_state_decision`: a RADAR / NO_IR channel
+        // is dwelt passively; no probe request (nor random scan address).
+        let six_ghz = self.channel.band() == super::operating_channel_c::Band::Ghz6;
+        // 6GHz: the admitted record's own active/passive classification
+        // (no beacon witness: RTL8852C grants no passive-only TX).
+        let policy = io.station_regulatory()?.filter(|_| !six_ghz);
+        let probe = probe.filter(|_| match self.six {
+            Some((channel, _)) if six_ghz => channel.active,
+            _ => !passive_only(policy.as_ref(), self.channel.primary()),
+        });
         // ieee80211_send_scan_probe_req: one get_random_u16() per probe,
         // drawn before any address CAM or RF activity so missing entropy
         // fails the scan without a transmission.
@@ -1545,9 +2386,15 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(address))))??;
             self.scan = Some(address);
         }
+        // A new covering scan retracts this primary's earlier witness.
+        self.witness_scan = policy.as_ref().map(|policy| {
+            self.witness
+                .begin_scan(policy, &[center(self.channel.primary())])
+        });
         self.scanning = true;
         let result = self.scan_dwell(io, until, probe, random_sn).await;
         self.scanning = false;
+        self.witness_scan = None;
         // A failed dwell is terminal: the interface stops the station.
         if address.is_some() && result.is_ok() {
             // rtw89_core_scan_complete: restore the own address once the last
@@ -1568,6 +2415,176 @@ impl State {
             io.station_scan_address(None, &self.admission).await?;
         }
         result
+    }
+    /// Actual primary of the retained radio.
+    pub(super) fn channel(&self) -> u8 {
+        self.channel.primary()
+    }
+    /// Retune the unassociated station to `primary` through the native
+    /// owner (`Io::station_retune`). Like mac80211 `ieee80211_offchannel_stop_vifs`
+    /// plus `drv_flush`, every pending TX retires first; a `Busy` native
+    /// refusal (RX/H2C backlog) is retried after polling, bounded. Cached
+    /// candidates keep their own observed channel.
+    pub(super) async fn retune(&mut self, io: &mut impl Io, primary: u8) -> Result<(), Error> {
+        if !typed(primary) {
+            return Err(Error::Profile);
+        }
+        if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
+            return Err(Error::State);
+        }
+        if OperatingChannel::legacy(primary) == self.channel && self.wide.is_none() {
+            return Ok(());
+        }
+        let deadline = self.now()?.saturating_add(1000);
+        loop {
+            self.poll(io)?;
+            if self.pending.is_empty() {
+                match io.station_retune(primary, &self.admission).await {
+                    Ok(epoch) => {
+                        self.channel = OperatingChannel::legacy(primary);
+                        self.wide = None;
+                        self.six = None;
+                        self.epoch = Some(epoch);
+                        // rtw89_track_work statistics belong to the old primary.
+                        self.track = super::track::Tracker::default();
+                        return Ok(());
+                    }
+                    Err(power::Error::Busy) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if self.now()? >= deadline {
+                return Err(Error::State);
+            }
+            self.environment.pause().await;
+        }
+    }
+    /// [`Self::retune`] to one admitted 40/80MHz operating channel
+    /// (`Io::station_retune_wide`): mac80211 `ieee80211_prep_channel` with
+    /// the AP chandef the local capability selects (`wide_phy`).
+    async fn retune_wide(
+        &mut self,
+        io: &mut impl Io,
+        profile: super::operating_channel::Profile,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
+            return Err(Error::State);
+        }
+        if self.wide == Some(profile) {
+            return Ok(());
+        }
+        let deadline = self.now()?.saturating_add(1000);
+        loop {
+            self.poll(io)?;
+            if self.pending.is_empty() {
+                match io.station_retune_wide(profile, &self.admission).await {
+                    Ok(epoch) => {
+                        self.channel = OperatingChannel::legacy(profile.primary());
+                        self.wide = Some(profile);
+                        self.six = None;
+                        self.epoch = Some(epoch);
+                        self.track = super::track::Tracker::default();
+                        return Ok(());
+                    }
+                    Err(power::Error::Busy) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if self.now()? >= deadline {
+                return Err(Error::State);
+            }
+            self.environment.pause().await;
+        }
+    }
+    /// [`Self::retune`] to one admitted RTL8852C 6GHz 20MHz channel under
+    /// its regd.c power context and TPE constraint (`Io::station_retune_6ghz`).
+    /// A changed context or TPE is reprogrammed even on the same primary
+    /// (regd.c `rtw89_reg_6ghz_recalc` -> `rtw89_core_set_chip_txpwr`).
+    async fn retune_6ghz(
+        &mut self,
+        io: &mut impl Io,
+        channel: super::command_native::SixGhzChannel,
+        tpe: Option<i8>,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Passive || self.scan.is_some() || self.scanning {
+            return Err(Error::State);
+        }
+        if self.six == Some((channel, tpe)) {
+            return Ok(());
+        }
+        let deadline = self.now()?.saturating_add(1000);
+        loop {
+            self.poll(io)?;
+            if self.pending.is_empty() {
+                match io
+                    .station_retune_6ghz(channel, tpe, false, &self.admission)
+                    .await
+                {
+                    Ok(epoch) => {
+                        self.channel = OperatingChannel::new(
+                            super::operating_channel_c::Band::Ghz6,
+                            channel.primary,
+                        );
+                        self.wide = None;
+                        self.six = Some((channel, tpe));
+                        self.epoch = Some(epoch);
+                        self.track = super::track::Tracker::default();
+                        return Ok(());
+                    }
+                    Err(power::Error::Busy) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if self.now()? >= deadline {
+                return Err(Error::State);
+            }
+            self.environment.pause().await;
+        }
+    }
+    /// The 6GHz part of a cfg80211 scan (`cfg80211_scan_6ghz` as planned by
+    /// `narf_wireless::scan::plan_6ghz_scan`) over admitted RTL8852C 6GHz
+    /// channels, in order: each is tuned TPE-free under its own power
+    /// context and dwelt; a probe follows only on an active record (a
+    /// passive-only DFS/NO_IR span is listened to). Results accumulate in
+    /// the shared candidate cache with `band = Ghz6`.
+    pub(super) async fn scan_six_ghz(
+        &mut self,
+        io: &mut impl Io,
+        channels: &[super::command_native::SixGhzChannel],
+        dwell_ms: u64,
+        probe: impl Fn(&super::command_native::SixGhzChannel) -> Option<Probe>,
+    ) -> Result<Vec<ObservedBss>, Error> {
+        if channels.is_empty() || channels.len() > 59 * 3 {
+            return Err(Error::Profile);
+        }
+        for channel in channels {
+            self.retune_6ghz(io, *channel, None).await?;
+            self.scan_with(io, dwell_ms, probe(channel)).await?;
+        }
+        Ok(self.candidates())
+    }
+    /// mac80211 software scan (`ieee80211_scan_state_set_channel`,
+    /// `ieee80211_scan_state_send_probe`, then the dwell) over each listed
+    /// 2.4GHz or 5GHz primary in order (probe content per band), each retuned by the native owner. Results
+    /// from every channel accumulate in the shared candidate cache.
+    pub(super) async fn scan_channels(
+        &mut self,
+        io: &mut impl Io,
+        channels: &[u8],
+        dwell_ms: u64,
+        probe: impl Fn() -> Option<Probe>,
+    ) -> Result<Vec<ObservedBss>, Error> {
+        if channels.is_empty()
+            || channels.len() > 13 + super::operating_channel::GHZ5.len()
+            || channels.iter().any(|channel| !typed(*channel))
+        {
+            return Err(Error::Profile);
+        }
+        for &channel in channels {
+            self.retune(io, channel).await?;
+            self.scan_with(io, dwell_ms, probe()).await?;
+        }
+        Ok(self.candidates())
     }
     async fn scan_dwell(
         &mut self,
@@ -1594,7 +2611,11 @@ impl State {
                     }
                     self.environment.pause().await;
                 }
-                let mut frame = probe_request(source, &ssid, &probe.ies);
+                let mut frame = if self.channel.band() == super::operating_channel_c::Band::Ghz6 {
+                    six::probe_request(source, &ssid, &probe.ies).ok_or(Error::Profile)?
+                } else {
+                    probe_request(source, &ssid, &probe.ies, self.channel.primary())
+                };
                 let assign = match random_sn {
                     Some(random) => {
                         // IEEE80211_SN_TO_SEQ(get_random_u16()).
@@ -1633,62 +2654,149 @@ impl State {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if candidate.bss.channel != 1 || candidate.basic_rates & 1 == 0 {
+        let six_ghz = candidate.bss.band == Some(association::channel::Band::Ghz6);
+        if !(six_ghz || typed(candidate.bss.channel))
+            || !basic_ok(
+                six_ghz || ghz5(candidate.bss.channel),
+                candidate.basic_rates,
+            )
+        {
             return Err(Error::Profile);
         }
-        // rtw89 sets MFP_CAPABLE: WPA2 offers MFPC (`ieee80211w=1`, PMF and
-        // PSK-SHA256 admitted) to an AP that advertises MFPC; otherwise the
-        // legacy RSNE is kept. WPA3 is SAE with PMF required.
-        let ap_mfpc = candidate
-            .ap_rsne
-            .as_deref()
-            .and_then(narf_wireless::rsn::RsnIe::decode_body)
-            .is_some_and(|rsn| rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0);
-        let (mode, options) = match &credential {
-            Credential::Open => (SecurityMode::Open, JoinOptions::default()),
-            Credential::Psk(_) => (
-                SecurityMode::Wpa2Psk,
-                if ap_mfpc {
-                    JoinOptions::default()
-                        .with_akms(AkmSet::PSK.with(AkmSet::PSK_SHA256))
-                        .with_pmf(Pmf::Optional)
-                } else {
-                    JoinOptions::default()
-                },
-            ),
-            Credential::Sae(_) => (
-                SecurityMode::Wpa3Sae {
-                    pwe: narf_wireless::association::SaePwe::Both,
-                },
-                JoinOptions::default().with_akms(AkmSet::SAE),
-            ),
-        };
-        // HT is offered only with an AP WMM element and the signed HT20
-        // program (which itself requires WMM and firmware RA).
-        let ap_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
-            .ok()
-            .flatten()
-            .is_some();
-        let mut plan = if ap_wmm && io.station_wmm_allowed()? && io.station_ht_allowed()? {
-            let mut local =
-                narf_wireless::association::phy::LocalPhy::ht20(super::station_control::local_ht())
-                    .map_err(|_| Error::Profile)?;
-            // HE is offered only under the signed HE20 program (which
-            // itself requires HT20).
-            if io.station_he_allowed()? {
-                let he = super::station_control::local_he().ok_or(Error::Profile)?;
-                local = local.with_he(he).map_err(|_| Error::Profile)?;
-            }
-            JoinPlan::prepare_with_options(
-                &candidate.bss,
-                self.own,
-                ssid,
-                mode,
-                Some(local),
-                options,
-            )?
+        let mut plan = if six_ghz {
+            // RTL8852C 6GHz: plan first (the admitted power context follows
+            // the AP's power type), then tune under it and the AP's TPE.
+            let (plan, channel, tpe) = self.six_ghz_join(io, &candidate, ssid, &credential)?;
+            self.retune_6ghz(io, channel, tpe).await?;
+            plan
         } else {
-            JoinPlan::prepare_with_options(&candidate.bss, self.own, ssid, mode, None, options)?
+            // A passive-only (RADAR / NO_IR) primary is joined only under its
+            // beacon witness from the latest scan of it (cfg80211 `beacon_found`).
+            let policy = io.station_regulatory()?;
+            let grant = match &policy {
+                Some(policy) => {
+                    if !self
+                        .witness
+                        .may_associate(policy, &[center(candidate.bss.channel)])
+                    {
+                        return Err(Error::Profile);
+                    }
+                    passive_only(Some(policy), candidate.bss.channel)
+                        .then(|| (candidate.bss.channel, policy.clone()))
+                }
+                None => None,
+            };
+            // HT is offered only with an AP WMM element and the signed HT20
+            // program (which itself requires WMM and firmware RA).
+            let ap_wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+                .ok()
+                .flatten()
+                .is_some();
+            let ht_allowed = ap_wmm && io.station_wmm_allowed()? && io.station_ht_allowed()?;
+            let he_allowed = ht_allowed && io.station_he_allowed()?;
+            // A 40/80MHz join needs an admitted wide record for exactly the
+            // chandef the AP and local capability select, wholly active (no
+            // passive-only subchannel: no beacon witness covers a wide span).
+            let one_stream = io.station_single_stream();
+            let wide = if ht_allowed {
+                let admitted = io.station_wide_channels()?;
+                super::station_control::wide_phy(
+                    &candidate.bss.information_elements,
+                    candidate.bss.channel,
+                    he_allowed,
+                    one_stream,
+                    &admitted,
+                )
+                .filter(|(_, profile)| {
+                    profile
+                        .subchannels()
+                        .all(|ch| !passive_only(policy.as_ref(), ch))
+                })
+            } else {
+                None
+            };
+            // mac80211 ieee80211_prep_channel: the station joins on the BSS's
+            // own primary (or the selected wide chandef around it); the native
+            // owner retunes (signed record required).
+            match wide {
+                Some((_, profile)) => self.retune_wide(io, profile).await?,
+                None => self.retune(io, candidate.bss.channel).await?,
+            }
+            if grant.is_some() {
+                io.station_passive_tx(grant)?;
+            }
+            // rtw89 sets MFP_CAPABLE: WPA2 offers MFPC (`ieee80211w=1`, PMF and
+            // PSK-SHA256 admitted) to an AP that advertises MFPC; otherwise the
+            // legacy RSNE is kept. WPA3 is SAE with PMF required.
+            let ap_mfpc = candidate
+                .ap_rsne
+                .as_deref()
+                .and_then(narf_wireless::rsn::RsnIe::decode_body)
+                .is_some_and(|rsn| {
+                    rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0
+                });
+            let (mode, options) = match &credential {
+                Credential::Open => (SecurityMode::Open, JoinOptions::default()),
+                Credential::Psk(_) => (
+                    SecurityMode::Wpa2Psk,
+                    if ap_mfpc {
+                        JoinOptions::default()
+                            .with_akms(AkmSet::PSK.with(AkmSet::PSK_SHA256))
+                            .with_pmf(Pmf::Optional)
+                    } else {
+                        JoinOptions::default()
+                    },
+                ),
+                Credential::Sae(_) => (
+                    SecurityMode::Wpa3Sae {
+                        pwe: narf_wireless::association::SaePwe::Both,
+                    },
+                    JoinOptions::default().with_akms(AkmSet::SAE),
+                ),
+            };
+            let plan = if ht_allowed {
+                let local = match wide {
+                    Some((local, _)) => local,
+                    None => {
+                        let mut local = narf_wireless::association::phy::LocalPhy::ht20(
+                            super::station_control::local_ht(),
+                        )
+                        .map_err(|_| Error::Profile)?;
+                        // HE is offered only under the signed HE20 program
+                        // (which itself requires HT20).
+                        if he_allowed {
+                            let he = if one_stream {
+                                super::station_control::local_he_1ss()
+                            } else {
+                                super::station_control::local_he()
+                            }
+                            .ok_or(Error::Profile)?;
+                            local = local.with_he(he).map_err(|_| Error::Profile)?;
+                        }
+                        local
+                    }
+                };
+                JoinPlan::prepare_with_options(
+                    &candidate.bss,
+                    self.own,
+                    ssid,
+                    mode,
+                    Some(local),
+                    options,
+                )?
+            } else {
+                JoinPlan::prepare_with_options(&candidate.bss, self.own, ssid, mode, None, options)?
+            };
+            // The plan's own selection must be the chandef the radio was tuned to.
+            if let Some((_, profile)) = wide {
+                let offer = plan.offered_phy().ok_or(Error::Profile)?;
+                if offer.center_channel() != profile.center()
+                    || offer.occupied_channels().len() != 1 << profile.width() as usize
+                {
+                    return Err(Error::Profile);
+                }
+            }
+            plan
         };
         plan.append_sme_ies(ies)?;
         if let Credential::Sae(password) = &credential {
@@ -1720,6 +2828,8 @@ impl State {
         if let Credential::Psk(pmk) = credential {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
             let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
+            self.fragment_plain = None;
+            self.fragment_rx_pending = false;
             self.security = Some(Security::new(
                 self.own,
                 bssid,
@@ -1743,11 +2853,17 @@ impl State {
             None
         };
         if let Some(p) = self.wmm {
-            super::station_control::wmm_admit(p, candidate.bss.capability & 0x400 != 0)?;
+            let band5 = six_ghz || ghz5(candidate.bss.channel);
+            super::station_control::wmm_admit(
+                p,
+                band5 || candidate.bss.capability & 0x400 != 0,
+                band5,
+            )?;
         }
         self.qos_all = self.wmm.is_some() && io.station_qos_all_allowed()?;
         self.firmware_ra = self.wmm.is_some() && io.station_firmware_ra_allowed()?;
         io.station_prepare_peer(bssid, &self.admission).await?;
+        self.csa = None;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
         self.last_peer = self.last_now;
@@ -1770,7 +2886,14 @@ impl State {
                     io.station_configure_wmm(p, short, &self.admission).await?;
                     if self.firmware_ra {
                         let plan = self.plan.as_ref().ok_or(Error::State)?;
-                        let rates = plan.legacy_rates().0;
+                        // phy.c rtw89_phy_ra_sta_update: a 5GHz peer's
+                        // supp_rates[5GHz] << 4 is OFDM-only (no RA CCK mode).
+                        let rates = plan.legacy_rates().0
+                            & if self.channel.ofdm_only() {
+                                0xff0
+                            } else {
+                                0xfff
+                            };
                         let ht = plan.negotiated_phy().map(|phy| {
                             let ht = phy.ht();
                             let m = ht.peer_rx_mcs();
@@ -1780,17 +2903,24 @@ impl State {
                                 ldpc: ht.tx_ldpc(),
                             }
                         });
-                        let he = plan.negotiated_phy().and_then(|phy| phy.he()).map(|he| {
-                            let peer = he.peer_capability().phy_capability();
-                            (
-                                super::station_control::HeRa {
-                                    peer_rx_mcs: he.tx_mcs_map(),
-                                    ldpc: he.tx_ldpc(),
-                                    dcm: peer[3] & 0x18 != 0,
-                                },
-                                !he.operation().er_su_disabled(),
-                            )
-                        });
+                        // 6GHz: the HE negotiation of the 6GHz plan (no
+                        // HT/VHT; `rtw89_phy_ra_sta_update` HE branch on
+                        // RTW89_BAND_6G, `station_control::codec::ra_he6`).
+                        let he = plan
+                            .negotiated_phy()
+                            .and_then(|phy| phy.he())
+                            .or_else(|| plan.six_ghz().map(|six| six.he()))
+                            .map(|he| {
+                                let peer = he.peer_capability().phy_capability();
+                                (
+                                    super::station_control::HeRa {
+                                        peer_rx_mcs: he.tx_mcs_map(),
+                                        ldpc: he.tx_ldpc(),
+                                        dcm: peer[3] & 0x18 != 0,
+                                    },
+                                    !he.operation().er_su_disabled(),
+                                )
+                            });
                         self.ht = ht.is_some();
                         self.he = he.is_some();
                         self.density = plan
@@ -1798,8 +2928,68 @@ impl State {
                             .map_or(0, |phy| phy.ht().peer_mpdu_density());
                         self.ampdu = self.ht && io.station_ampdu_allowed()?;
                         self.er = he.is_some_and(|(_, er)| er);
-                        io.station_configure_ra(rates, ht, he.map(|(he, _)| he), &self.admission)
-                            .await?;
+                        let he = he.map(|(he, _)| he);
+                        match self.wide {
+                            // rtw89_phy_ra_sta_update on the tuned wide
+                            // chandef: bw_cap, bandwidth SGI, VHT branch
+                            // (160MHz: RTL8852C only, `admitted_wide`).
+                            Some(profile) => {
+                                let phy = plan.negotiated_phy().ok_or(Error::Profile)?;
+                                let bw = match phy.width() {
+                                    association::phy::Width::Forty => 1,
+                                    association::phy::Width::Eighty => 2,
+                                    association::phy::Width::OneSixty if !phy.discontiguous() => 3,
+                                    _ => return Err(Error::Profile),
+                                };
+                                // IEEE80211_STA_RX_BW_160 needs the HE
+                                // width (when HE) at 160MHz too.
+                                if bw != profile.width() as u8
+                                    || phy.center_channel() != profile.center()
+                                    || bw == 3
+                                        && phy.he().is_some_and(|he| {
+                                            he.width() != association::phy::Width::OneSixty
+                                        })
+                                {
+                                    return Err(Error::Profile);
+                                }
+                                let vht = phy.vht().map(|vht| super::station_control::VhtRa {
+                                    peer_rx_mcs: vht.tx_mcs_map(),
+                                    ldpc: vht.tx_ldpc(),
+                                });
+                                // phy.c rtw89_phy_ra_gi_ltf: RTL8852C at
+                                // RTW89_CHANNEL_WIDTH_160 fixes SGI_4XHE08
+                                // for a SU/MU 4xLTF+0.8us peer, else 2XHE08.
+                                let fix_giltf = (bw == 3).then(|| phy.he()).flatten().map(|he| {
+                                    if he.peer_capability().phy_capability()[7] & 0x04 != 0 {
+                                        1
+                                    } else {
+                                        3
+                                    }
+                                });
+                                let wide = super::station_control::WideRa {
+                                    bw,
+                                    sgi: match bw {
+                                        3 => phy.vht().is_some_and(|vht| vht.tx_sgi160()),
+                                        2 => phy.vht().is_some_and(|vht| vht.tx_sgi80()),
+                                        _ => phy.ht().tx_sgi40(),
+                                    },
+                                    vht,
+                                    fix_giltf,
+                                };
+                                io.station_configure_ra_wide(
+                                    rates,
+                                    ht.ok_or(Error::Profile)?,
+                                    he,
+                                    wide,
+                                    &self.admission,
+                                )
+                                .await?;
+                            }
+                            None => {
+                                io.station_configure_ra(rates, ht, he, &self.admission)
+                                    .await?
+                            }
+                        }
                     }
                 }
                 self.admission.run(|| {
@@ -1814,6 +3004,83 @@ impl State {
             }
             self.environment.pause().await;
         }
+    }
+    /// mac80211 `ieee80211_determine_chan_mode` + `ieee80211_prep_channel`
+    /// for an RTL8852C 6GHz BSS: SAE (H2E) with the HE20 profile under the
+    /// signed WMM/HT/HE programs; `six_ghz::admit_with_rule` against the rule
+    /// covering the primary in the host policy the records were admitted
+    /// under; `JoinPlan::prepare_6ghz` capped at 20MHz (the admitted 6GHz
+    /// records here are 20MHz); the admitted *active* channel record whose
+    /// client power type is the AP's (cfg80211 refuses a passive-only 6GHz
+    /// join without a TX grant, which RTL8852C has none of); and the regd.c
+    /// TPE constraint of the AP's elements (STD power only,
+    /// `rtw89_reg_6ghz_tpe_recalc`; below `RTW89_MIN_VALID_POWER_CONSTRAINT`
+    /// is refused here, as that recalculation fails with `-EINVAL`).
+    fn six_ghz_join(
+        &mut self,
+        io: &mut impl Io,
+        candidate: &ObservedBss,
+        ssid: &[u8],
+        credential: &Credential,
+    ) -> Result<(JoinPlan, super::command_native::SixGhzChannel, Option<i8>), Error> {
+        use narf_wireless::association::six_ghz;
+        if !matches!(credential, Credential::Sae(_)) {
+            return Err(Error::Profile);
+        }
+        let ies = &candidate.bss.information_elements;
+        let ap_wmm = narf_wireless::wmm::Parameters::parse(ies)
+            .ok()
+            .flatten()
+            .is_some();
+        if !(ap_wmm
+            && io.station_wmm_allowed()?
+            && io.station_ht_allowed()?
+            && io.station_he_allowed()?)
+        {
+            return Err(Error::Profile);
+        }
+        let primary = candidate.bss.channel;
+        let mhz = association::channel::frequency_in(association::channel::Band::Ghz6, primary)
+            .ok_or(Error::Profile)?;
+        let policy = io.station_six_ghz_regulatory()?.ok_or(Error::Profile)?;
+        let rule = policy.rule_for(mhz).ok_or(Error::Profile)?.clone();
+        let bss = six_ghz::admit_with_rule(ies, primary, &rule).map_err(|_| Error::Profile)?;
+        let power = bss.power_type.ok_or(Error::Profile)?;
+        let channel = io
+            .station_six_ghz_channels()?
+            .into_iter()
+            .find(|c| c.primary == primary && c.power == power && c.active)
+            .ok_or(Error::Profile)?;
+        let he = super::station_control::local_he().ok_or(Error::Profile)?;
+        let local = six_ghz::SixGhzLocal::new(he, six::capability(), rule)
+            .map_err(|_| Error::Profile)?
+            .with_max_width(six_ghz::SixGhzWidth::Twenty);
+        let plan = JoinPlan::prepare_6ghz(
+            &candidate.bss,
+            self.own,
+            ssid,
+            SecurityMode::Wpa3Sae {
+                pwe: narf_wireless::association::SaePwe::HashToElement,
+            },
+            &local,
+            JoinOptions::default().with_akms(AkmSet::SAE),
+        )?;
+        let selected = plan.six_ghz().ok_or(Error::Profile)?;
+        if selected.width() != six_ghz::SixGhzWidth::Twenty
+            || selected.channel().primary != primary
+            || selected.power_type() != power
+        {
+            return Err(Error::Profile);
+        }
+        let tpe = if channel.six.power() == 2 {
+            six::tpe(ies, &bss.channel).map_err(|()| Error::Profile)?
+        } else {
+            None
+        };
+        if tpe.is_some_and(|c| c < -10) {
+            return Err(Error::Profile);
+        }
+        Ok((plan, channel, tpe))
     }
     pub(super) fn send(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         let admission = self.admission.clone();
@@ -1839,6 +3106,42 @@ impl State {
             self.track.transmitted(frame.len());
         }
         result
+    }
+    /// The originals remain in the host queue until one actual MPDU was
+    /// published. A refusal/Busy never consumes a later prefix member.
+    pub(super) fn send_prefix(
+        &mut self,
+        io: &mut impl Io,
+        frames: &[&[u8]],
+    ) -> Result<usize, Error> {
+        let first = *frames.first().ok_or(Error::Profile)?;
+        let admission = self.admission.clone();
+        let result = admission
+            .run(|| Ok(self.send_amsdu_inner(io, frames)))
+            .map_err(Error::Native)
+            .and_then(|result| result);
+        match result {
+            Ok(Some(count)) => {
+                for frame in &frames[..count] {
+                    if frame[0] & 1 == 0 {
+                        self.track.transmitted(frame.len());
+                    }
+                }
+                Ok(count)
+            }
+            Ok(None) => self.send(io, first).map(|()| 1),
+            Err(error) => {
+                if !self.admission.teardown_pending()
+                    && !matches!(
+                        error,
+                        Error::Busy | Error::Profile | Error::Transport(packet::Error::Busy)
+                    )
+                {
+                    self.fail(io);
+                }
+                Err(error)
+            }
+        }
     }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
         if !self.ready() {
@@ -1866,14 +3169,23 @@ impl State {
         } else {
             None
         };
-        if agg.is_some() && !io.packet_ready_aggregate()
-            || agg.is_none() && (!self.pending.is_empty() || !io.packet_ready())
+        if !self.transmit_room(Kind::Data, agg)
+            || agg.is_some() && !io.packet_ready_aggregate()
+            || agg.is_none() && !io.packet_ready()
         {
             return Err(Error::Busy);
         }
+        if self.fragment_data(io, frame, tid, agg)? {
+            return Ok(());
+        }
+        let htc = self.he && self.htc_rate && super::he_htc::packet_allows(frame);
         let native = if let Some(security) = &mut self.security {
             if self.wmm.is_some() {
-                security.transmit_ethernet_qos(frame, tid)?
+                if htc {
+                    security.transmit_ethernet_qos_htc(frame, tid, super::he_htc::CONTROL)?
+                } else {
+                    security.transmit_ethernet_qos(frame, tid)?
+                }
             } else {
                 security.transmit_ethernet(frame)?
             }
@@ -1888,7 +3200,11 @@ impl State {
             bytes.extend_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
             if self.wmm.is_some() {
-                bytes.extend_from_slice(&[tid, 0]);
+                bytes.extend_from_slice(&[tid | if htc { 0x10 } else { 0 }, 0]);
+            }
+            if htc {
+                bytes[1] |= 0x80;
+                bytes.extend_from_slice(&super::he_htc::CONTROL);
             }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);
@@ -1915,9 +3231,10 @@ pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
         )
 }
 fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
-    if !(32..=1534).contains(&frame.len())
+    if !(32..=1538).contains(&frame.len())
         || !matches!(frame[0], 8 | 0x88)
-        || frame[1] & 0xc7 != 2
+        || frame[1] & 0x47 != 2
+        || frame[1] & 0x80 != 0 && frame[0] != 0x88
         || frame[22] & 15 != 0
         || frame[10..16] != peer
         || (frame[4..10] != own && frame[4] & 1 == 0)
@@ -1928,10 +3245,10 @@ fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
     }
     let offset = if frame[0] == 0x88 {
         let qos = frame.get(24..26)?;
-        if qos[0] & 0xf0 != 0 || qos[1] != 0 {
+        if qos[0] & 0xe0 != 0 || qos[1] != 0 {
             return None;
         }
-        26
+        26 + if frame[1] & 0x80 != 0 { 4 } else { 0 }
     } else {
         24
     };

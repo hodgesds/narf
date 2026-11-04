@@ -2136,3 +2136,15 @@ argument = "Linux policy changes retain the task's original CpuBudget capability
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Affinity inheritance distinguishes explicit runtime masks from native per-task bootstrap placement. Existing BSP-pinned init/getty/shell tasks retain their execution constraints; their workload children retain the existing SMP default unless a mask was explicitly requested. Requests and inherited descendants carry that marker in the existing affinity registry and prepared user control before runnable publication. Registry locking/generation, online/cgroup intersection and dispatch/migration mask checks remain authoritative. This avoids serializing every workload on the BSP while preserving explicit Linux pinning through fork/clone generations."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame/ edit only moves the existing narf_io::iommu::init() call from after the initcall stage loop to immediately before it in bare_main; no code, authority, capability, domain transition, mapping or TCB member is added. Without the iommu.passthrough=0 cmdline switch init still only reads IOMMU capabilities and selects Identity, so default boot behaviour is unchanged. Its inputs (ACPI IVRS/DMAR parsed earlier in boot, boot args, the kernel MMIO mapper) are all initialised before the new call site; an uncalibrated TSC only shortens the AMD-Vi completion timeout because cycles_to_ns is the identity until calibration, so polls stay bounded."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L167"
+argument = "Running IOMMU init before any initcall probes a driver is what lets the opt-in per-domain mode take effect: no device holds a physical DMA address yet, so every PCI function can be attached to its own translation domain before its first DMA mapping. This strengthens, and never weakens, confinement of device DMA to the domain authorised by its IOMMU context; with the opt-in absent, devices see the same identity-equivalent addresses as before."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L156"
+argument = "Malicious-device handling is unchanged in the default Identity mode and improved under the opt-in: the AMD-Vi backend keeps pass-through device-table entries for unattached devices (as before) and the move adds no path by which a device could reach memory it could not reach before."

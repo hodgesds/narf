@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One registered RTL8821CE/RTL8822CE shell and retained owner for control and packet
+//! Per-function RTL8821CE/RTL8822CE shells and retained owners for control and packet
 //! progress. Synchronous stack drains never wait for another executor task.
 use super::{
     firmware_lifecycle::Lifecycle,
@@ -8,7 +8,7 @@ use super::{
     station_control::Admission,
 };
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -46,18 +46,38 @@ pub(super) struct Device<I: Io> {
     local: [u8; 6],
     published: AtomicBool,
     withdrawn: AtomicBool,
+    metadata_retired: AtomicBool,
+    deliveries: AtomicUsize,
+    withdrawal: AtomicU8,
+    keep_name: AtomicBool,
+    name_retired: AtomicBool,
     activating: AtomicBool,
     admitted: AtomicBool,
     up: AtomicBool,
     port: AtomicBool,
     rts_capable: AtomicBool,
     rts: AtomicU32,
+    /// Asynchronous (`!Io::SYNCHRONOUS`) backends: the RTS threshold
+    /// `set_rts_threshold` accepted, applied by the station worker
+    /// (`RTS_PENDING | value`; 0 = none).
+    rts_pending: AtomicU64,
     bssid: AtomicU64,
     ht_capability: IrqSafeSpinLock<Option<[u8; 26]>>,
+    /// Admitted primaries: bit N = 2.4GHz channel N (channel 1 plus every
+    /// channel with a provisioned signed N2xO record over the current base),
+    /// bit 16 + i = 5GHz `channel_policy::PRIMARIES5[i]` with such a record.
+    channels: AtomicU64,
     receive_generation: AtomicU64,
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    /// cfg80211's retained `SET_WOWLAN` configuration (`wow::validate`d).
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// The WoW firmware owns the association until `wow_resume`; host
+    /// control and packet paths are closed (`admitted` is down) meanwhile.
+    wow_armed: AtomicBool,
+    /// The last resume's `ieee80211_report_wowlan_wakeup` subset.
+    wakeup: IrqSafeSpinLock<Option<super::wow::WakeReport>>,
 }
 impl<I: Io> core::fmt::Debug for Device<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -121,22 +141,138 @@ impl<I: Io + 'static> Device<I> {
             local,
             published: AtomicBool::new(false),
             withdrawn: AtomicBool::new(false),
+            metadata_retired: AtomicBool::new(false),
+            deliveries: AtomicUsize::new(0),
+            withdrawal: AtomicU8::new(0),
+            keep_name: AtomicBool::new(false),
+            name_retired: AtomicBool::new(false),
             activating: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
             port: AtomicBool::new(false),
             rts_capable: AtomicBool::new(false),
             rts: AtomicU32::new(u32::MAX),
+            rts_pending: AtomicU64::new(0),
             bssid: AtomicU64::new(0),
             ht_capability: IrqSafeSpinLock::new(None),
+            channels: AtomicU64::new(1 << 1),
             receive_generation: AtomicU64::new(0),
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            wowlan: IrqSafeSpinLock::new(None),
+            wow_armed: AtomicBool::new(false),
+            wakeup: IrqSafeSpinLock::new(None),
         }
+    }
+    /// The retained WoW configuration, carried across a cold system resume
+    /// into the fresh shell as cfg80211 keeps `wiphy->wowlan_config`.
+    pub(super) fn wowlan(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
+    }
+    pub(super) fn restore_wowlan(
+        &self,
+        config: Option<narf_wireless::WowlanConfig>,
+        wakeup: Option<super::wow::WakeReport>,
+    ) {
+        if config
+            .as_ref()
+            .is_none_or(|c| super::wow::validate(self.lifecycle.device_id(), c).is_ok())
+        {
+            *self.wowlan.lock() = config;
+        }
+        *self.wakeup.lock() = wakeup;
+    }
+    /// The last WoW resume's wake reason (`rtw_wow_show_wakeup_reason`).
+    pub(super) fn wakeup(&self) -> Option<super::wow::WakeReport> {
+        *self.wakeup.lock()
+    }
+    /// `rtw_ops_suspend` -> `rtw_wow_suspend` on the retained managed-linked
+    /// station while the interface stays published. `Ok(None)`: no WoW
+    /// configuration or no settled association, nothing was touched.
+    /// `Err`: WoW was attempted and failed; the caller must take the cold
+    /// path (`rtw_ops_suspend` returning 1 makes mac80211 fully stop).
+    pub(super) async fn wow_suspend(&self) -> Result<Option<super::wow::Armed>, ()> {
+        let Some(config) = self.wowlan() else {
+            return Ok(None);
+        };
+        let mut storage = self.lifecycle.retained.lock().await;
+        if self.closed()
+            || self.withdrawn()
+            || !self.published.load(Ordering::Acquire)
+            || !self.admitted.load(Ordering::Acquire)
+            || self.wow_armed.load(Ordering::Acquire)
+            || self.lifecycle.removed()
+            || self.lifecycle.status().stage != super::firmware_lifecycle::Stage::StationReady
+        {
+            return Ok(None);
+        }
+        let Some(owner) = storage.as_mut() else {
+            return Ok(None);
+        };
+        if owner.station_peer().is_none() || owner.wow_plan(&config).is_err() {
+            return Ok(None);
+        }
+        // mac80211 `ieee80211_suspend`: stop the queues and refuse host
+        // control before the driver op; nothing can reach the owner while
+        // `admitted` is down (`control_ready`, `enqueue`, `progress`,
+        // `watchdog`), and this mutex is held for the whole sequence.
+        self.wow_armed.store(true, Ordering::Release);
+        self.admitted.store(false, Ordering::Release);
+        {
+            self.rings.lock().await.clear();
+        }
+        *self.wakeup.lock() = None;
+        owner.wow_suspend(&config).await.map(Some).map_err(|_| ())
+    }
+    /// `rtw_ops_resume` -> `rtw_wow_resume`. Success reopens host control
+    /// and packets over the same association; an error (including a
+    /// disconnect or unknown wake reason, which Linux reports and mac80211
+    /// then drops the link for) leaves it closed for the cold path.
+    pub(super) async fn wow_resume(&self, armed: super::wow::Armed) -> Result<(), ()> {
+        let mut storage = self.lifecycle.retained.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            drop(armed);
+            return Err(());
+        };
+        let (report, result) = owner.wow_resume(armed).await;
+        *self.wakeup.lock() = report;
+        if result.is_err()
+            || !report.as_ref().is_some_and(super::wow::keeps_link)
+            || self.closed()
+            || self.withdrawn()
+            || owner.station_peer().is_none()
+            || owner.station_check().is_err()
+        {
+            return Err(());
+        }
+        self.wow_armed.store(false, Ordering::Release);
+        self.admitted.store(true, Ordering::Release);
+        if self.publish_link(owner).is_err() {
+            self.admitted.store(false, Ordering::Release);
+            return Err(());
+        }
+        Ok(())
     }
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
+    }
+    pub(super) fn cancel_control(&self) {
+        self.close();
+    }
+    pub(super) fn withdraw_for_rebind(self: &Arc<Self>) -> Result<(), Error> {
+        if self.withdrawn() {
+            return Err(Error::State);
+        }
+        self.keep_name.store(true, Ordering::Release);
+        self.withdraw();
+        Ok(())
+    }
+    pub(super) fn rebound_name(&self) -> Option<&'static str> {
+        self.name_retired
+            .load(Ordering::Acquire)
+            .then(|| narf_net::iface::rebind_name(&self.name))
+            .flatten()
     }
     /// Removal (`rtw_unregister_hw` in `rtw_pci_remove`): close every
     /// control and packet path, drop the link and withdraw the registered
@@ -153,26 +289,76 @@ impl<I: Io + 'static> Device<I> {
         if !self.published.swap(false, Ordering::AcqRel) {
             return;
         }
-        {
-            let mut active = ACTIVE.lock();
-            let this = Arc::as_ptr(self) as *const ();
-            if active
-                .as_ref()
-                .is_some_and(|a| Arc::as_ptr(a) as *const () == this)
-            {
-                *active = None;
-            }
-        }
+        self.link_inner(None, false, true);
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
-        narf_net::iface::unregister(&self.name);
-        CLAIMED.store(false, Ordering::Release);
+        self.withdrawal.store(1, Ordering::Release);
+        self.finish_withdrawal();
+    }
+    fn finish_withdrawal(&self) {
+        if self.deliveries.load(Ordering::Acquire) != 0
+            || self
+                .withdrawal
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        if self.keep_name.load(Ordering::Acquire) {
+            self.name_retired.store(
+                narf_net::iface::retire_for_rebind(&self.name),
+                Ordering::Release,
+            );
+        } else {
+            narf_net::iface::unregister(&self.name);
+        }
+        super::endpoints::remove(self as *const Self as *const ());
+        self.withdrawal.store(3, Ordering::Release);
+    }
+    pub(super) async fn wait_withdrawn(&self) {
+        while matches!(self.withdrawal.load(Ordering::Acquire), 1 | 2) {
+            self.environment.pause().await;
+        }
+    }
+    fn begin_delivery(&self) -> Option<Delivery<'_, I>> {
+        let _metadata = self.metadata.lock();
+        if self.withdrawn() || self.closed() {
+            return None;
+        }
+        self.deliveries.fetch_add(1, Ordering::AcqRel);
+        Some(Delivery(self))
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn delivery_for_test(&self) -> impl Drop + '_ {
+        self.begin_delivery().expect("live fixture ingress")
     }
     pub(super) fn withdrawn(&self) -> bool {
         self.withdrawn.load(Ordering::Acquire)
     }
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
+    }
+    /// Freeze actual unassociated IPS eligibility and original closure under
+    /// the real owner mutex. The reservation closure must not await or touch
+    /// station state; a pending join cannot start after this close.
+    pub(super) async fn idle_claim<T>(
+        &self,
+        reserve: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let retained = self.lifecycle.retained.lock().await;
+        if self.closed()
+            || self.lifecycle.removed()
+            || self.lifecycle.status().stage != super::firmware_lifecycle::Stage::StationReady
+            || retained.as_ref().is_none_or(|owner| {
+                owner.station_phase() != Some(station::Phase::Passive)
+                    || owner.station_peer().is_some()
+            })
+        {
+            return Err(Error::Busy);
+        }
+        let claim = reserve()?;
+        self.cancel_control();
+        Ok(claim)
     }
     /// Linux `rtw_watch_dog_work`: one dynamic-mechanism period under the
     /// retained owner mutex. A failed period closes the shell.
@@ -202,23 +388,52 @@ impl<I: Io + 'static> Device<I> {
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
-        let (authority, ht) = {
+        let (authority, ht, channels) = {
             let mut retained = self.lifecycle.retained.lock().await;
             let owner = retained.as_mut().ok_or(Error::State)?;
-            (owner.station_publication()?, owner.station_ht_capability())
+            (
+                owner.station_publication()?,
+                owner.station_ht_capability(),
+                owner.station_admitted_channels(),
+            )
         };
         self.admission.run(|| {
             authority.invoke(|| {
                 self.admitted.store(true, Ordering::Release);
                 *self.ht_capability.lock() = ht;
+                self.channels.store(channels, Ordering::Release);
                 Ok(())
             })
         })?;
         attempt.armed = false;
         Ok(())
     }
+    /// Admitted primaries, 2.4GHz first then 5GHz (channel numbers do not
+    /// overlap between the two bands).
+    fn admitted_channels(&self) -> Vec<u32> {
+        let mask = self.channels.load(Ordering::Acquire);
+        (1..=u32::from(super::channel_policy::LAST))
+            .filter(|c| mask & (1 << c) != 0)
+            .chain(
+                super::channel_policy::PRIMARIES5
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << (16 + i)) != 0)
+                    .map(|(_, c)| u32::from(c)),
+            )
+            .collect()
+    }
     fn link(&self, peer: Option<[u8; 6]>, port: bool) {
+        self.link_inner(peer, port, false);
+    }
+    fn link_inner(&self, peer: Option<[u8; 6]>, port: bool, retire: bool) {
         let _metadata = self.metadata.lock();
+        if self.metadata_retired.load(Ordering::Acquire) {
+            return;
+        }
+        if retire {
+            self.metadata_retired.store(true, Ordering::Release);
+        }
         if peer.is_none() {
             self.rts_capable.store(false, Ordering::Release);
         }
@@ -329,7 +544,27 @@ impl<I: Io + 'static> Device<I> {
         }
         result.map_err(|_| ())
     }
+    /// Synchronous shell progress: only for a backend whose every register
+    /// future completes in its first poll (PCI). An asynchronous (USB)
+    /// backend is driven by `publish`'s worker through [`Self::step`].
     fn progress(&self) -> Vec<(Vec<u8>, super::publication::Publication)> {
+        if !I::SYNCHRONOUS {
+            return Vec::new();
+        }
+        let step = core::pin::pin!(self.step());
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        match core::future::Future::poll(step, &mut cx) {
+            core::task::Poll::Ready(frames) => frames,
+            // Unreachable for a synchronous backend: every owner future in
+            // `step` goes through `ready_now`.
+            core::task::Poll::Pending => Vec::new(),
+        }
+    }
+    /// One station progress turn (poll, publish, one TX slot). Owner futures
+    /// are `ready_now` for a synchronous backend and awaited otherwise; the
+    /// shell locks are only ever `try_lock`ed, so a turn never waits on
+    /// another task.
+    async fn step(&self) -> Vec<(Vec<u8>, super::publication::Publication)> {
         let Some(mut storage) = self.lifecycle.retained.try_lock() else {
             return Vec::new();
         };
@@ -350,8 +585,8 @@ impl<I: Io + 'static> Device<I> {
         if !self.admitted.load(Ordering::Acquire) {
             return Vec::new();
         }
-        let result = (|| -> Result<Vec<(Vec<u8>, super::publication::Publication)>, Error> {
-            let frames = owner.station_poll()?;
+        let result: Result<Vec<(Vec<u8>, super::publication::Publication)>, Error> = async {
+            let frames = settle::<I, _>(owner.station_poll()).await?;
             self.publish_link(owner)?;
             if self.closed() {
                 rings.clear();
@@ -402,7 +637,7 @@ impl<I: Io + 'static> Device<I> {
                             .take(capacity.saturating_sub(1))
                             .map(Frame::payload),
                     );
-                    match owner.station_send_batch(&frames) {
+                    match settle::<I, _>(owner.station_send_batch(&frames)).await {
                         Ok(count) => {
                             if count == 0 || count > frames.len() {
                                 return Err(Error::State);
@@ -417,7 +652,7 @@ impl<I: Io + 'static> Device<I> {
                         Err(error) => return Err(error),
                     }
                 } else if let Some(frame) = rings.pending.as_ref() {
-                    match owner.station_send(frame.payload()) {
+                    match settle::<I, _>(owner.station_send(frame.payload())).await {
                         Ok(()) => rings.pending = None,
                         Err(Error::Busy)
                         | Err(Error::Transport(super::packet_core::Error::Busy)) => {}
@@ -445,7 +680,8 @@ impl<I: Io + 'static> Device<I> {
                 .into_iter()
                 .map(|frame| (frame, authority.clone()))
                 .collect())
-        })();
+        }
+        .await;
         match result {
             Ok(frames) => {
                 if self.closed() {
@@ -466,7 +702,61 @@ impl<I: Io + 'static> Device<I> {
         }
     }
     pub(super) fn drain(&self) -> bool {
-        let frames = self.progress();
+        if !I::SYNCHRONOUS {
+            return false;
+        }
+        self.deliver(self.progress())
+    }
+    /// The station worker's turn for an asynchronous backend: apply a
+    /// pending RTS threshold, run one [`Self::step`], then deliver.
+    pub(super) async fn drain_async(&self) -> bool {
+        self.apply_rts().await;
+        let frames = self.step().await;
+        self.deliver(frames)
+    }
+    /// Apply the RTS threshold `set_rts_threshold` accepted for an
+    /// asynchronous backend (Linux `mac80211.c::rtw_ops_set_rts_threshold`
+    /// records the value; the station programs it before the next TX).
+    async fn apply_rts(&self) {
+        let pending = self.rts_pending.swap(0, Ordering::AcqRel);
+        if pending & RTS_PENDING == 0 {
+            return;
+        }
+        let value = pending as u32;
+        let Some(mut storage) = self.lifecycle.retained.try_lock() else {
+            self.requeue_rts(pending);
+            return;
+        };
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        match owner.station_set_rts_threshold(value).await {
+            Ok(()) => {
+                let current = owner.station_rts_threshold();
+                self.rts
+                    .store(current.unwrap_or(u32::MAX), Ordering::Release);
+                self.rts_capable.store(current.is_some(), Ordering::Release);
+            }
+            Err(Error::Busy | Error::State) => self.requeue_rts(pending),
+            Err(Error::Profile | Error::Native(super::firmware_transport::Error::Unsupported)) => {
+                self.rts_capable
+                    .store(owner.station_rts_threshold().is_some(), Ordering::Release);
+            }
+            Err(_) => {
+                self.close();
+                if !self.admission.teardown_pending() {
+                    let _ = owner.station_stop();
+                }
+            }
+        }
+    }
+    /// Retry later unless a newer request superseded this one.
+    fn requeue_rts(&self, pending: u64) {
+        let _ = self
+            .rts_pending
+            .compare_exchange(0, pending, Ordering::AcqRel, Ordering::Acquire);
+    }
+    fn deliver(&self, frames: Vec<(Vec<u8>, super::publication::Publication)>) -> bool {
         let progressed = !frames.is_empty();
         // All retained-owner/ring/admission guards have dropped before the
         // stack can synchronously answer ARP/ND through this enqueue callback.
@@ -500,6 +790,9 @@ impl<I: Io + 'static> Device<I> {
             if !ready || !authority.current() {
                 continue;
             }
+            let Some(_delivery) = self.begin_delivery() else {
+                break;
+            };
             if authority
                 .invoke(|| {
                     if self.closed() || !self.port.load(Ordering::Acquire) || !authority.current() {
@@ -523,6 +816,19 @@ impl<I: Io + 'static> Device<I> {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn admit_for_test(&self) {
         self.published.store(true, Ordering::Release);
+    }
+}
+/// `Device::rts_pending` valid bit.
+const RTS_PENDING: u64 = 1 << 32;
+/// An owner future from [`Device::step`]: `ready_now` for a synchronous
+/// backend (unchanged PCI semantics), awaited for an asynchronous one.
+async fn settle<I: Io, T>(
+    operation: impl core::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    if I::SYNCHRONOUS {
+        super::firmware_transport::ready_now(operation)
+    } else {
+        operation.await
     }
 }
 fn offloads(meta: narf_net::TxMeta) -> bool {
@@ -570,9 +876,21 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         if self.closed() {
             return Err(ENODEV);
         }
+        if self.wow_armed.load(Ordering::Acquire) {
+            return Err(EBUSY);
+        }
+        if !I::SYNCHRONOUS {
+            // Every register access is a transfer: the worker applies it.
+            if !self.rts_capable.load(Ordering::Acquire) {
+                return Err(narf_wireless::EOPNOTSUPP);
+            }
+            self.rts_pending
+                .store(RTS_PENDING | u64::from(value), Ordering::Release);
+            return Ok(());
+        }
         let mut storage = self.lifecycle.retained.try_lock().ok_or(EBUSY)?;
         let owner = storage.as_mut().ok_or(EBUSY)?;
-        let result = owner.station_set_rts_threshold(value);
+        let result = super::firmware_transport::ready_now(owner.station_set_rts_threshold(value));
         match result {
             Ok(()) => {
                 let current = owner.station_rts_threshold();
@@ -610,6 +928,22 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn max_scan_ie_len(&self) -> u16 {
         super::scan::MAX_EXTRA_IES
     }
+    /// `rtw_wowlan_stub_8822c` (`wow::support`), RTL8822CE only.
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        super::wow::support(self.lifecycle.device_id())
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        let did = self.lifecycle.device_id();
+        super::wow::support(did).ok_or(narf_wireless::EOPNOTSUPP)?;
+        if let Some(config) = &config {
+            super::wow::validate(did, config).map_err(|_| EINVAL)?;
+        }
+        *self.wowlan.lock() = config;
+        Ok(())
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan()
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {
             return None;
@@ -632,10 +966,23 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.local,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: vec![1],
-            }],
+            bands: {
+                let (two, five): (Vec<u32>, Vec<u32>) = self
+                    .admitted_channels()
+                    .into_iter()
+                    .partition(|c| *c <= u32::from(super::channel_policy::LAST));
+                let mut bands = vec![WirelessBand {
+                    freq_mhz: 2400,
+                    channels: two,
+                }];
+                if !five.is_empty() {
+                    bands.push(WirelessBand {
+                        freq_mhz: 5000,
+                        channels: five,
+                    });
+                }
+                bands
+            },
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht_capability.lock().is_some(),
@@ -655,7 +1002,18 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let plan = super::scan::plan(&request, self.local)?;
+        let mut plan = super::scan::plan(&request, self.local)?;
+        let admitted = self.admitted_channels();
+        if plan
+            .channels
+            .iter()
+            .any(|c| !admitted.contains(&u32::from(*c)))
+        {
+            return Err(WirelessError::NotSupported);
+        }
+        if plan.channels.is_empty() && admitted.len() > 1 {
+            plan.channels = admitted.iter().map(|c| *c as u8).collect();
+        }
         self.control_ready()?;
         let mut attempt = Attempt {
             device: self,
@@ -669,7 +1027,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             return Err(WirelessError::Busy);
         }
         let result = owner
-            .station_scan(plan.dwell_ms, &plan.probes, plan.address)
+            .station_scan(plan.dwell_ms, &plan.probes, plan.address, &plan.channels)
             .await;
         attempt.armed = false;
         if result.is_err() {
@@ -694,9 +1052,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             })
             .map(|c| BssInfo {
                 bssid: c.bss.bssid,
+                frequency_mhz: super::channel_policy::any_frequency(c.bss.channel)
+                    .map_or(0, u32::from),
+                channel: u32::from(c.bss.channel),
                 ssid: c.bss.ssid,
-                channel: 1,
-                frequency_mhz: 2412,
                 rssi: i8::MIN,
                 security: if c.ap_rsne.is_some() {
                     narf_wireless::scan::BssSecurity::Wpa2
@@ -710,7 +1069,10 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         self.control_ready()?;
-        if request.channel != 1 || request.frequency_mhz != 2412 {
+        if !self.admitted_channels().contains(&request.channel)
+            || super::channel_policy::any_frequency(request.channel as u8).map(u32::from)
+                != Some(request.frequency_mhz)
+        {
             return Err(WirelessError::NotSupported);
         }
         let pmk = match request.security {
@@ -796,11 +1158,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
 }
 pub(super) type Native = Device<super::pci_firmware::Transport>;
-trait Endpoint: Send + Sync {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
-    fn drain(&self) -> bool;
-}
-impl<I: Io + 'static> Endpoint for Device<I> {
+impl<I: Io + 'static> super::endpoints::Endpoint for Device<I> {
     fn send(&self, b: &[u8], m: narf_net::TxMeta) -> Result<(), ()> {
         self.enqueue(b, m)
     }
@@ -808,43 +1166,66 @@ impl<I: Io + 'static> Endpoint for Device<I> {
         Device::drain(self)
     }
 }
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let device = ACTIVE.lock().clone().ok_or(())?;
-    device.send(bytes, meta)
+struct Delivery<'a, I: Io + 'static>(&'a Device<I>);
+impl<I: Io + 'static> Drop for Delivery<'_, I> {
+    fn drop(&mut self) {
+        if self.0.deliveries.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finish_withdrawal();
+        }
+    }
 }
-fn drain() -> bool {
-    let device = ACTIVE.lock().clone();
-    device.is_some_and(|d| d.drain())
-}
-pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
-    let driver = match device.lifecycle.device_id() {
-        0xc821 => "rtw8821ce",
-        0xc822 => "rtw8822ce",
+pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Error> {
+    if device.withdrawn() || device.published.load(Ordering::Acquire) {
+        return Err(Error::State);
+    }
+    let usb = matches!(
+        device.lifecycle.interface(),
+        super::phy8821c::Interface::Usb { .. }
+    );
+    let driver = match (device.lifecycle.device_id(), usb, I::SYNCHRONOUS) {
+        (0xc821, false, true) => "rtw8821ce",
+        (0xc822, false, true) => "rtw8822ce",
+        // Linux `rtw8822be.c` `rtw_8822be_driver.name`.
+        (0xb822, false, true) => "rtw8822be",
+        // Linux `rtw8821cu.c` `rtw_8821cu_driver.name`; the USB backend is
+        // asynchronous, so the worker drives it.
+        (0xc821, true, false) => "rtw8821cu",
+        // Linux `rtw8822bu.c` `rtw_8822bu_driver.name`.
+        (0xb822, true, false) => "rtw8822bu",
         _ => return Err(Error::State),
     };
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
-    CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::State)?;
-    narf_net::registry()
+    let cookie =
+        super::endpoints::insert(&device.name, device.clone()).map_err(|_| Error::State)?;
+    if narf_net::registry()
         .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Profile)?;
-    narf_net::iface::register(&device.name, device.local, send);
+        .is_err()
+    {
+        super::endpoints::remove(Arc::as_ptr(&device) as *const ());
+        return Err(Error::Profile);
+    }
+    narf_net::iface::register_with_context(
+        &device.name,
+        device.local,
+        cookie,
+        super::endpoints::send,
+    );
     narf_net::iface::set_driver_info(&device.name, driver, None, String::new());
     narf_net::iface::set_offloads(&device.name, narf_net::OffloadCapabilities::default());
     device.link(None, false);
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::install_rx_drain(drain);
+    narf_net::iface::install_rx_drain(super::endpoints::drain);
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
         let mut ticks = 0u32;
         while !device.withdrawn() {
-            device.drain();
+            if I::SYNCHRONOUS {
+                device.drain();
+            } else {
+                device.drain_async().await;
+            }
             ticks = ticks.wrapping_add(1);
             // The station rate-limits itself to the source 2s period.
             if ticks % 250 == 0 {
@@ -855,8 +1236,8 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     });
     Ok(())
 }
-struct Registered(Arc<Native>);
-impl Interface for Registered {
+struct Registered<I: Io>(Arc<Device<I>>);
+impl<I: Io + 'static> Interface for Registered<I> {
     fn name(&self) -> &str {
         self.0.name()
     }

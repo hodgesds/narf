@@ -29,6 +29,15 @@ pub struct Profile {
     identity: [u8; 32],
 }
 impl Profile {
+    /// Inert profile for owner-gating fixtures; never reaches radio I/O.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn gate_fixture() -> Self {
+        Self {
+            hp: false,
+            antenna: 0,
+            identity: [0; 32],
+        }
+    }
     pub(super) fn is_hp(self) -> bool {
         self.hp
     }
@@ -97,13 +106,13 @@ async fn bb(io: &impl Io, reg: u16, mask: u32, value: u32) -> Result<(), Error> 
     io.write32(reg, value)?;
     Ok(())
 }
-async fn rf_write(io: &impl Io, reg: u8, value: u32) -> Result<(), Error> {
+pub(super) async fn rf_write(io: &impl Io, reg: u8, value: u32) -> Result<(), Error> {
     // Eight address bits, twenty data bits. The older unused scaffold's
     // four-bit-address/twelve-bit-value encoding is not this device's LSSI.
     io.write32(0x840, (u32::from(reg) << 20) | (value & 0xfffff))?;
     Ok(())
 }
-async fn rf_read(io: &impl Io, reg: u8) -> Result<u32, Error> {
+pub(super) async fn rf_read(io: &impl Io, reg: u8) -> Result<u32, Error> {
     let original = read(io, 0x824)?;
     let request = (original & !0x7f800000) | (u32::from(reg) << 23) | (1 << 31);
     io.write32(0x824, original & !(1 << 31))?;
@@ -578,3 +587,94 @@ async fn lck(io: &impl Io) -> Result<(), Error> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "radio_tests.rs"]
 pub(super) mod tests;
+
+/// Live thermal recalibration reuses the actual retained source procedures,
+/// with ordinary MAC TX/RX closed by the caller. Failed/cancelled procedures
+/// leave that caller Failed; no packet owner or DMA receipt is reclaimed.
+pub(super) async fn recalibrate(
+    io: &impl Io,
+    report: &mut Report,
+    do_lck: bool,
+    do_iqk: bool,
+) -> Result<(), Error> {
+    if io.read8(0x100)? & 0xc0 != 0 || io.read8(0x522)? != 0xff {
+        return Err(Error::Gate);
+    }
+    let rf18 = rf_read(io, 0x18).await?;
+    if rf18 != report.channel_rf {
+        return Err(Error::Gate);
+    }
+    let rf0 = rf_read(io, 0).await?;
+    if do_lck {
+        lck(io).await?;
+    }
+    let calibration = if do_iqk {
+        let saved = backup(io)?;
+        let result = calibrate(io).await?;
+        for (reg, value) in ADDA.iter().zip(saved.adda) {
+            if read(io, *reg)? != value {
+                return Err(Error::Calibration);
+            }
+        }
+        for (reg, value) in BB_BACKUP.iter().zip(saved.bb) {
+            if read(io, *reg)? != value {
+                return Err(Error::Calibration);
+            }
+        }
+        for (reg, value) in [0x522, 0x550, 0x551].into_iter().zip(saved.mac) {
+            if u32::from(io.read8(reg)?) != value {
+                return Err(Error::Calibration);
+            }
+        }
+        if read(io, 0x40)? != saved.mac[3] {
+            return Err(Error::Calibration);
+        }
+        matrix_readback(io, result.0)?;
+        Some(result)
+    } else {
+        None
+    };
+    // IQK ends with Linux's pathA standby value. Restore and prove the exact
+    // pre-transition active RF mode before opening either ordinary MAC gate.
+    rf_write(io, 0, rf0).await?;
+    io.write8(0x522, 0xff)?;
+    if rf_read(io, 0).await? != rf0
+        || rf_read(io, 0x18).await? != rf18
+        || io.read8(0x522)? != 0xff
+        || io.read8(0x100)? & 0xc0 != 0
+    {
+        return Err(Error::Gate);
+    }
+    if let Some((iqk, recovery)) = calibration {
+        report.iqk = iqk;
+        report.recovery = recovery;
+    }
+    Ok(())
+}
+fn matrix_readback(io: &impl Io, iqk: [u16; 4]) -> Result<(), Error> {
+    let d = (read(io, 0xc80)? >> 22) & 1023;
+    let sign = |v: u16| {
+        if v & 0x200 != 0 {
+            i32::from(v) - 1024
+        } else {
+            i32::from(v)
+        }
+    };
+    let x = sign(iqk[0]) * d as i32;
+    let y = sign(iqk[1]) * d as i32;
+    for (reg, mask, value) in [
+        (0xc80, 0x3ff, (x >> 8) as u32 & 0x3ff),
+        (0xc4c, 1 << 31, ((x >> 7) as u32 & 1) << 31),
+        (0xc80, 0x3f0000, ((y >> 8) as u32 & 0x3f) << 16),
+        (0xc94, 0xf0000000, (((y >> 8) as u32 & 0x3c0) >> 6) << 28),
+        (0xc4c, 1 << 29, ((y >> 7) as u32 & 1) << 29),
+        (0xc14, 0x3ff, u32::from(iqk[2]) & 0x3ff),
+        (0xc14, 0xfc00, u32::from(iqk[3] & 0x3f) << 10),
+        (0xca0, 0xf0000000, u32::from((iqk[3] >> 6) & 15) << 28),
+    ] {
+        if read(io, reg)? & mask != value {
+            return Err(Error::Calibration);
+        }
+    }
+    Ok(())
+}

@@ -16,8 +16,19 @@ struct Model {
     pending: Option<usize>,
     ignore: Option<u32>,
     writes: Vec<(u32, u32)>,
+    c: bool,
 }
 impl Model {
+    /// RTL8852C after its CH12-only download: HAXI stops 0xbff00 (no RX stop
+    /// bits), TX HCI bit 7 only, `R_AX_HCI_FUNC_EN_V1` TX-only.
+    fn new_c() -> Self {
+        let mut m = Self::new();
+        m.c = true;
+        m.bytes[0x1010..0x1014].copy_from_slice(&0xbff00u32.to_le_bytes());
+        m.bytes[0x1000..0x1004].copy_from_slice(&(1u32 << 7).to_le_bytes());
+        m.bytes[0x7880..0x7884].copy_from_slice(&1u32.to_le_bytes());
+        m
+    }
     fn new() -> Self {
         let mut bytes = vec![0; 0x10100];
         bytes[0x1010..0x1014].copy_from_slice(&0xb0f03u32.to_le_bytes());
@@ -33,6 +44,7 @@ impl Model {
             pending: None,
             ignore: None,
             writes: Vec::new(),
+            c: false,
         }
     }
     fn read(&mut self, a: u32, width: usize) -> Result<u32, power::Error> {
@@ -66,9 +78,14 @@ impl Model {
     // bytes. A source packet is written only after proving the descriptor's
     // complete address/length belongs to that held allocation; never cast DMA.
     fn inject(&mut self, owner: &Rx, channel: usize, slot: usize, packet: &[u8]) -> bool {
+        let (rx, hci) = if self.c {
+            (1 << 15, 0x7880)
+        } else {
+            (1 << 13, 0x8380)
+        };
         if owner.state() != State::Polling
-            || self.raw(0x1000) & (1 << 13) == 0
-            || self.raw(0x8380) & 2 == 0
+            || self.raw(0x1000) & rx == 0
+            || self.raw(hci) & 2 == 0
             || self.raw(0x1010) & (1 << channel) != 0
         {
             return false;
@@ -599,4 +616,122 @@ fn smoke_rtw89_rx_reclaim_releases_both_rings_once_and_stays_terminal() -> TestR
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_reclaim_releases_both_rings_once_and_stays_terminal
+);
+
+/// Actual prepare/allocation/descriptor owner using the same inert source IO
+/// model; caller retains/fences every allocation before fixture destruction.
+pub(in crate::rtw89) fn native_fixture() -> Rx {
+    let mut rx = Rx::default();
+    let mut model = Model::new();
+    // SAFETY: exclusive private RAM/config/DMA model, no hardware/prefetch;
+    // the returned owner is reclaimed only by the caller's inert fence.
+    let prepared = unsafe { rx.prepare(&mut model, 4) };
+    assert!(matches!(ready(prepared), Some(Ok(()))));
+    rx
+}
+
+/// Inert device producer writes the ORIGINAL retained next RX buffer. Caller
+/// separately publishes its actual HCI producer index, then actual Native/Rx
+/// consumes/rearms this mapping; no fabricated receive/current-source receipt.
+pub(in crate::rtw89) fn native_publish_one(rx: &mut Rx, mpdu: &[u8]) {
+    let ring = &mut rx.rings.as_mut().unwrap()[0];
+    let buffer = &ring.buffers[usize::from(ring.wp)];
+    let mut wire = alloc::vec![0;20];
+    wire[..4].copy_from_slice(&((20 + mpdu.len() + 4) as u32 | 1 << 15 | 1 << 14).to_le_bytes());
+    wire[4..8].copy_from_slice(&((mpdu.len() + 4) as u32).to_le_bytes());
+    wire.extend_from_slice(mpdu);
+    wire.extend_from_slice(&[0; 4]);
+    assert!(wire.len() <= buffer.len());
+    // SAFETY: exclusive inert retained DMA buffer, exact checked extent; no
+    // real hardware, concurrent Native access, prefetch or Rust memory alias.
+    unsafe {
+        core::ptr::copy_nonoverlapping(wire.as_ptr(), buffer.as_mut_ptr(), wire.len());
+    }
+    buffer.sync(0, wire.len());
+}
+
+fn smoke_rtw8852c_rx_rings_follow_haxi_v1_geometry() -> TestResult {
+    let mut f = Fixture {
+        rx: Rx::default(),
+        model: Model::new_c(),
+    };
+    // SAFETY: private RAM model with no DMA/reset/IRQ producer; the fixture
+    // retains every allocation and fences it before destruction.
+    if ready(unsafe { f.rx.prepare_for(&mut f.model, ChipId::Rtl8852C, 4) }) != Some(Ok(()))
+        || f.rx.state() != State::Polling
+    {
+        return TestResult::Fail("C RXQ/RPQ preparation did not reach Polling");
+    }
+    let m = &f.model;
+    let wrote = |a: u32| m.writes.iter().any(|&(w, _)| w == a);
+    // rtw89_pci_ch_dma_addr_set_v1 bases, RX index clear V1, LTR v1, RX HCI
+    // V1 layers released; no B HCI/stop/address-info register touched.
+    let rings = f.rx.rings.as_ref().unwrap();
+    if rings[0].regs.desa_l != 0x1220
+        || rings[1].regs.desa_l != 0x1228
+        || m.raw(0x1220) as u64
+            != rings[0].descriptors.as_ref().unwrap().dma_addr().raw() & 0xffff_ffff
+        || m.raw(0x1200) & 3 != 3
+        || m.raw(0x1600) & 7 != 6
+        || m.raw(0x8410) & 0x703 != 0x703
+        || m.raw(0x8414) != 0x0028_0028
+        || m.raw(0x1610) != 0x9003_9003
+        || m.raw(0x1604) != 0x880b_880b
+        || m.raw(0x1000) & (1 << 15) == 0
+        || m.raw(0x7880) & 3 != 3
+        || m.raw(0x1010) != 0xbff00
+        || wrote(0x8380)
+        || wrote(0x8810)
+        || wrote(0x9a00)
+        || wrote(0x1018)
+        || wrote(0x8418)
+    {
+        return TestResult::Fail("C RX geometry differs from rtw8852c_pci_info");
+    }
+    let payload: Vec<u8> = (0..40).collect();
+    if !f.model.inject(&f.rx, 0, 0, &packet(0, &payload)) {
+        return TestResult::Fail("C device model did not follow actual V1 RXBD allocations");
+    }
+    let events = f.rx.poll(&mut f.model, 1).unwrap();
+    if !matches!(events.as_slice(), [Event::Wifi(_, bytes)] if bytes == &payload[..36]) {
+        return TestResult::Fail("C RXQ did not deliver the actual DMA frame");
+    }
+    // AX_RXD_BW_v1_MASK: dword1 bit 29 is C bandwidth, B INTER_PPDU.
+    let mut wide = packet(0, &payload);
+    wide[8..12].copy_from_slice(&(1u32 << 29).to_le_bytes());
+    if rx_packet::Descriptor::parse_v1(&wide).map(|d| d.bandwidth) != Ok(1)
+        || rx_packet::Descriptor::parse(&wide).map(|d| d.bandwidth) != Ok(0)
+    {
+        return TestResult::Fail("C RX descriptor bandwidth layout differs from AX_RXD_BW_v1_MASK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_rx_rings_follow_haxi_v1_geometry
+);
+fn smoke_rtw8852c_rx_refuses_open_rx_before_publication() -> TestResult {
+    for (address, value) in [
+        (0x1000u32, (1u32 << 7) | (1 << 15)),
+        (0x7880, 3),
+        (0x1010, 0xb0f00),
+    ] {
+        let mut f = Fixture {
+            rx: Rx::default(),
+            model: Model::new_c(),
+        };
+        f.model.bytes[address as usize..address as usize + 4].copy_from_slice(&value.to_le_bytes());
+        // SAFETY: as above; invalid prerequisite geometry must be refused.
+        if ready(unsafe { f.rx.prepare_for(&mut f.model, ChipId::Rtl8852C, 4) })
+            != Some(Err(Error::Register(power::Error::Access)))
+            || !f.model.writes.is_empty()
+        {
+            return TestResult::Fail("C RX published rings over open or B RX geometry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_rx_refuses_open_rx_before_publication
 );

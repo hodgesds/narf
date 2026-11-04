@@ -1,5 +1,13 @@
 //! Actual source controller and native packet model through public Device/DHCP.
 //! This fixture grants no production full-RF receipt or physical readiness.
+#[path = "station_amsdu_tests.rs"]
+mod amsdu_tests;
+#[path = "station_fragment_tests.rs"]
+mod fragment_tests;
+#[path = "station_htc_tests.rs"]
+mod htc_tests;
+#[path = "station_multi_tests.rs"]
+mod multi_tests;
 use crate::rtw89::{interface::Device, station::Environment, station_lifecycle::Lifecycle};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -121,6 +129,9 @@ pub(super) struct Peer {
     pub(super) probes: Vec<Vec<u8>>,
     /// Answer an ADDBA Request with (status, buffer size); `None` ignores it.
     pub(super) addba: Option<(u16, u16)>,
+    /// Independent AP receive opt-in; old peer bytes remain unchanged.
+    allow_amsdu: bool,
+    aggregates: Vec<usize>,
 }
 impl Peer {
     /// A peer around a caller-built AP (WPA3-SAE, PMF profiles).
@@ -130,8 +141,11 @@ impl Peer {
         peer
     }
     pub(super) fn new(protected: bool) -> Self {
+        Self::for_station(protected, OWN)
+    }
+    fn for_station(protected: bool, own: [u8; 6]) -> Self {
         let plan = NetworkPlan {
-            station: OWN,
+            station: own,
             bssid: AP,
             server_ip: [10, 88, 1, 1],
             lease_ip: [10, 88, 1, 42],
@@ -167,6 +181,8 @@ impl Peer {
             actions: Vec::new(),
             probes: Vec::new(),
             addba: None,
+            allow_amsdu: false,
+            aggregates: Vec::new(),
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -218,9 +234,9 @@ impl Peer {
                 (self.addba, frame.get(24..29))
             {
                 let tid = (u16::from_le_bytes([c0, c1]) >> 2) & 0xf;
-                let capab = 1u16 << 1 | tid << 2 | buf << 6;
+                let capab = u16::from(self.allow_amsdu) | 1u16 << 1 | tid << 2 | buf << 6;
                 let mut response = vec![0xd0, 0, 0, 0];
-                response.extend_from_slice(&OWN);
+                response.extend_from_slice(&self.plan.station);
                 response.extend_from_slice(&AP);
                 response.extend_from_slice(&AP);
                 response.extend_from_slice(&[0x20, 0, 3, 1, token]);
@@ -288,15 +304,29 @@ impl Peer {
         {
             return Err("native AP data protection/direction");
         }
+        let aggregate = frame[0] == 0x88 && frame.get(24).is_some_and(|q| q & 0x80 != 0);
+        if aggregate && (!self.allow_amsdu || frame[16..22] != AP || frame[1] & 0x80 != 0) {
+            return Err("AP unadmitted A-MSDU");
+        }
         let mut priority = 0;
         let header = if self.qos {
             let tid = frame.get(24).copied().ok_or("AP QoS control")?;
-            priority = tid;
-            if frame.get(25) != Some(&0) || tid > 7 || (!self.qos_all && tid != 0) {
+            priority = tid & 15;
+            let htc = frame[1] & 0x80 != 0;
+            if frame.get(25) != Some(&0)
+                || tid & if aggregate { 0x68 } else { 0xe8 } != 0
+                || (!self.qos_all && priority != 0)
+                || (tid & 0x10 != 0) != htc
+                || htc && (!self.station_he || frame.get(26..30) != Some(&[0x1b, 0, 0, 0]))
+            {
                 return Err("AP BE/TID0 QoS control");
             }
-            self.tids.push(tid);
-            26
+            self.tids.push(priority);
+            if htc {
+                30
+            } else {
+                26
+            }
         } else {
             24
         };
@@ -314,6 +344,28 @@ impl Peer {
             )
             .map_err(|_| "AP uplink CCMP/MIC/replay")?;
         }
+        if aggregate {
+            let ht = self.ht.as_deref().ok_or("AP aggregate without HT")?;
+            let limit =
+                narf_wireless::amsdu::Limit::from_ht_capability(u16::from_le_bytes([ht[2], ht[3]]));
+            if body.len() > 5000 {
+                return Err("AP chip A-MSDU limit");
+            }
+            let frames = narf_wireless::amsdu::decode_with_limit(&body, AP, AP, limit)
+                .map_err(|_| "AP aggregate body")?;
+            if frames.len() < 2 || frames.iter().any(|f| f[6..12] != self.plan.station) {
+                return Err("AP exact aggregate source/count");
+            }
+            self.aggregates.push(frames.len());
+            let mut replies = Vec::new();
+            for ethernet in frames {
+                self.uplink.push(ethernet.clone());
+                if let Some(reply) = self.server.receive(&ethernet) {
+                    replies.push(self.downlink(&reply)?);
+                }
+            }
+            return Ok((replies, self.hold_data));
+        }
         if body.get(..6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0]) {
             return Err("native AP RFC1042 extent");
         }
@@ -329,6 +381,14 @@ impl Peer {
     }
 }
 
+static NEXT_SLEEP: AtomicBool = AtomicBool::new(false);
+/// Signed-admitted primaries for the next DriverModel (0: channel1 only).
+static NEXT_CHANNELS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Signed-admitted 40/80MHz profiles for the next DriverModel (none).
+static NEXT_WIDE: IrqSafeSpinLock<Vec<crate::rtw89::operating_channel::Profile>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// HT elements the next HT harness AP advertises instead of `HT_IES`.
+static NEXT_HT: IrqSafeSpinLock<Option<Vec<u8>>> = IrqSafeSpinLock::new(None);
 struct DriverModel {
     controller: crate::rtw89::station_control::Controller,
     control: crate::rtw89::station_control::tests::Model,
@@ -344,11 +404,30 @@ struct DriverModel {
     he: bool,
     /// Signed originator BA / TX A-MPDU program (`Program::Ampdu`).
     ampdu: bool,
+    fragments: Option<Arc<crate::rtw89::radio_policy::Qualification>>,
     irq: Option<IrqModel>,
     /// HCI DMA stop/busy block behind `dma_stop::stop`.
     dma: crate::rtw89::dma_stop::tests::Model,
     reclaimed: Option<usize>,
+    sleep: Option<(
+        crate::rtw89::lps::Manager,
+        crate::rtw89::lps::tests::Firmware,
+    )>,
+    /// Admitted primaries mask and every native retune actually requested.
+    channels: u64,
+    retunes: Vec<u8>,
+    /// Admitted wide profiles and every wide retune actually requested.
+    wide: Vec<crate::rtw89::operating_channel::Profile>,
+    wide_retunes: Vec<crate::rtw89::operating_channel::Profile>,
+    /// Associated (CSA) channel switches requested of the native owner.
+    switches: Vec<u8>,
+    /// Host policy snapshot reported to the station (passive-only channels).
+    regulatory: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
+    /// Every passive-TX grant / withdrawal the station requested.
+    passive_grants: Vec<Option<u8>>,
 }
+static NEXT_REGULATORY: IrqSafeSpinLock<Option<Arc<narf_wireless::reg::RegulatoryDomain>>> =
+    IrqSafeSpinLock::new(None);
 /// AX v0 interrupt registers with write-1-clear status, behind the same
 /// `irq::Mask` programs the native binding runs.
 #[derive(Default)]
@@ -380,7 +459,11 @@ impl crate::rtw89::irq::Regs for IrqModel {
 }
 impl DriverModel {
     fn new() -> Self {
-        let factory = crate::rtw89::station_control::tests::factory(false);
+        Self::for_station(OWN)
+    }
+    fn for_station(own: [u8; 6]) -> Self {
+        let factory =
+            crate::rtw89::station_control::tests::factory_with_mac(1, 0x33, 5, false, own);
         Self {
             controller: crate::rtw89::station_control::Controller::new(&factory).unwrap(),
             control: crate::rtw89::station_control::tests::Model::new(),
@@ -395,9 +478,26 @@ impl DriverModel {
             ht: false,
             he: false,
             ampdu: false,
+            fragments: None,
             irq: None,
             dma: crate::rtw89::dma_stop::tests::Model::new(),
             reclaimed: None,
+            channels: NEXT_CHANNELS.swap(0, Ordering::AcqRel) | (1 << 1),
+            retunes: Vec::new(),
+            wide: core::mem::take(&mut *NEXT_WIDE.lock()),
+            wide_retunes: Vec::new(),
+            switches: Vec::new(),
+            regulatory: NEXT_REGULATORY.lock().take(),
+            passive_grants: Vec::new(),
+            sleep: NEXT_SLEEP.swap(false, Ordering::AcqRel).then(|| {
+                (
+                    crate::rtw89::lps::Manager::after_firmware(
+                        crate::rtw89::lps_wire::Profile::for_version([0, 29, 29, 15]).unwrap(),
+                    )
+                    .unwrap(),
+                    crate::rtw89::lps::tests::Firmware::new(),
+                )
+            }),
         }
     }
     fn packet<T>(
@@ -425,9 +525,128 @@ impl DriverModel {
 // Native OrdinaryGrant remains unconstructible by this fixture. Both adapters
 // invoke their actual typed fixture capability around published operations.
 unsafe impl crate::rtw89::station::Io for DriverModel {
+    fn station_channels(&mut self) -> Result<u64, crate::rtw89::power::Error> {
+        Ok(self.channels)
+    }
+    fn station_regulatory(
+        &mut self,
+    ) -> Result<Option<Arc<narf_wireless::reg::RegulatoryDomain>>, crate::rtw89::power::Error> {
+        Ok(self.regulatory.clone())
+    }
+    fn station_passive_tx(
+        &mut self,
+        grant: Option<(u8, Arc<narf_wireless::reg::RegulatoryDomain>)>,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        self.passive_grants.push(grant.map(|(primary, _)| primary));
+        Ok(())
+    }
+    /// Native retune owner model: refused (nothing published) unless the
+    /// primary is admitted and ordinary TX is drained, as `retune_full_radio`.
+    async fn station_retune(
+        &mut self,
+        primary: u8,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if !crate::rtw89::station::channel_admitted(self.channels, primary) {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_some_and(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        self.retunes.push(primary);
+        Ok(self.retunes.len() as u32 + 1)
+    }
+    fn station_wide_channels(
+        &mut self,
+    ) -> Result<Vec<crate::rtw89::operating_channel::Profile>, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wide.clone())
+    }
+    async fn station_retune_wide(
+        &mut self,
+        profile: crate::rtw89::operating_channel::Profile,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if !self.wide.contains(&profile) {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_some_and(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        // As `Native::retune_full_radio_to`: RX follows the programmed width.
+        if let Some(core) = self.core.as_mut() {
+            core.set_operating_width(profile.width() as u8, profile.is_5ghz());
+        }
+        self.wide_retunes.push(profile);
+        Ok(self.wide_retunes.len() as u32 + 1000)
+    }
+    /// Associated channel switch model: same refusals as the native owner
+    /// (`retune_full_radio(.., linked = true)`), peer retained.
+    async fn station_switch_channel(
+        &mut self,
+        primary: u8,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<u32, crate::rtw89::power::Error> {
+        admission.check()?;
+        if !crate::rtw89::station::channel_admitted(self.channels, primary) {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        if self.core.as_ref().is_none_or(|core| !core.ready()) {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        self.switches.push(primary);
+        Ok(self.retunes.len() as u32 + self.switches.len() as u32 + 1)
+    }
+    fn station_sleep_capable(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        Ok(self.sleep.is_some())
+    }
+    fn station_sleep_blocked(&self) -> bool {
+        self.sleep.as_ref().is_some_and(|(_, fw)| fw.blocked)
+    }
+    async fn station_sleep_service(
+        &mut self,
+        identity: Option<narf_net::native_emission::Lifetime>,
+        enabled: bool,
+        idle: bool,
+        force: bool,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(bool, bool), crate::rtw89::power::Error> {
+        let Some((manager, firmware)) = self.sleep.as_mut() else {
+            return Ok((false, false));
+        };
+        firmware.clock = self.clock.load(Ordering::Acquire) * 1000;
+        firmware.pending_native = self.packets.pending_receive();
+        firmware.idle = self
+            .core
+            .as_ref()
+            .is_some_and(crate::rtw89::packet_core::Core::ready);
+        let result = manager
+            .service(
+                firmware,
+                self.controller.peer(),
+                admission,
+                crate::rtw89::lps::Intent {
+                    identity,
+                    enabled,
+                    idle,
+                    force,
+                },
+            )
+            .await;
+        self.clock
+            .store(firmware.clock.div_ceil(1000), Ordering::Release);
+        result
+    }
     fn station_allowed(&mut self) -> Result<(), crate::rtw89::power::Error> {
         if self.stopped {
             return Err(crate::rtw89::power::Error::Terminal);
+        }
+        if let Some(grant) = &self.fragments {
+            grant
+                .current()
+                .map_err(|_| crate::rtw89::power::Error::Access)?;
         }
         self.packets
             .authority
@@ -468,6 +687,14 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_he_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.wmm && self.firmware_ra && self.ht && self.he)
+    }
+    fn station_amsdu_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm
+            && self.firmware_ra
+            && self.ht
+            && self.ampdu
+            && self.packets.amsdu == Some(5000))
     }
     fn station_ampdu_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
         self.station_allowed()?;
@@ -531,6 +758,24 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         }
         self.controller
             .configure_ra(&mut self.control, rates, ht, he, admission)
+            .await
+    }
+    async fn station_configure_ra_wide(
+        &mut self,
+        rates: u16,
+        ht: crate::rtw89::station_control::HtRa,
+        he: Option<crate::rtw89::station_control::HeRa>,
+        wide: crate::rtw89::station_control::WideRa,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        if !self.station_firmware_ra_allowed()?
+            || !self.ht
+            || he.is_some() && !self.station_he_allowed()?
+        {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .configure_ra_wide(&mut self.control, rates, ht, he, wide, admission)
             .await
     }
     fn station_qos_all_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
@@ -602,7 +847,11 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     ) -> Result<(), crate::rtw89::power::Error> {
         self.controller
             .commit_peer(&mut self.control, peer, aid, short, admission)
-            .await
+            .await?;
+        if let Some((manager, _)) = self.sleep.as_mut() {
+            manager.committed(aid)?;
+        }
+        Ok(())
     }
     async fn station_disconnect(
         &mut self,
@@ -630,6 +879,9 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         )?;
         if self.wmm && self.firmware_ra && self.ht && self.ampdu {
             core.enable_aggregation()?;
+            if self.packets.amsdu == Some(5000) {
+                core.enable_amsdu(5000)?;
+            }
         }
         self.core = Some(core);
         Ok(())
@@ -641,6 +893,40 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         self.core
             .as_ref()
             .is_some_and(crate::rtw89::packet_core::Core::ready)
+    }
+    fn station_fragments_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        self.fragments.as_ref().map_or(Ok(false), |f| {
+            f.fragments_allowed()
+                .map_err(|_| crate::rtw89::power::Error::Access)
+        })
+    }
+    fn packet_fragment_binding(
+        &mut self,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<crate::rtw89::command_native::FragmentBinding, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        if !self.packet_ready() || self.packets.pending_receive() {
+            return Err(crate::rtw89::power::Error::Busy);
+        }
+        crate::rtw89::command_native::FragmentBinding::model(
+            self.packets.authority,
+            self.fragments
+                .as_ref()
+                .ok_or(crate::rtw89::power::Error::Unsupported)?
+                .clone(),
+            self.controller
+                .peer()
+                .ok_or(crate::rtw89::power::Error::Terminal)?,
+            admission.clone(),
+        )
+    }
+    fn packet_submit_fragment(
+        &mut self,
+        part: &crate::rtw89::command_native::FragmentPart,
+        report: bool,
+    ) -> Result<u64, crate::rtw89::packet_core::Error> {
+        self.packet(|c, p| c.submit_fragment(p, part, report, 0))
     }
     fn packet_submit(
         &mut self,
@@ -758,6 +1044,7 @@ struct Harness {
     peer: Arc<IrqSafeSpinLock<Peer>>,
     env: Arc<Env>,
     plan: NetworkPlan,
+    native_dispatch: bool,
 }
 impl Harness {
     fn new(protected: bool) -> Self {
@@ -782,7 +1069,7 @@ impl Harness {
         ht: bool,
         he: Option<(bool, &[u8])>,
     ) -> Self {
-        Self::build_full(protected, wmm, qos_all, rates, ht, he, false)
+        Self::build_full(protected, wmm, qos_all, rates, ht, he, (false, false))
     }
     /// `ampdu`: the signed aggregate program is granted.
     fn build_full(
@@ -792,11 +1079,13 @@ impl Harness {
         rates: Option<&[u8]>,
         ht: bool,
         he: Option<(bool, &[u8])>,
-        ampdu: bool,
+        aggregation: (bool, bool),
     ) -> Self {
+        let (ampdu, amsdu) = aggregation;
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
         io.ampdu = ampdu;
+        io.packets.amsdu = amsdu.then_some(5000);
 
         io.wmm = wmm;
         io.qos_all = qos_all;
@@ -824,6 +1113,7 @@ impl Harness {
             peer.lock().wmm = Some(WMM.to_vec());
             peer.lock().qos_all = qos_all;
         }
+        peer.lock().allow_amsdu = amsdu;
         let plan = peer.lock().plan;
         let actor = peer.clone();
         io.packets.reaction = Some(Arc::new(move |bytes| {
@@ -832,11 +1122,25 @@ impl Harness {
                 .react(bytes)
                 .map_err(|_| crate::rtw89::packet_core::Error::Packet)
         }));
+        let sleep = io.sleep.is_some();
         let lifecycle = Arc::new(Lifecycle::new(io));
         let name = narf_net::iface::reserve_name("r89-source%d");
         let device = Arc::new(Device::new(name, OWN, lifecycle.clone(), env.clone()));
+        if sleep {
+            let mut retained = lifecycle.retained.try_lock().unwrap();
+            let io = &mut retained.as_mut().unwrap().io;
+            if let Some((_, firmware)) = io.sleep.as_mut() {
+                firmware.line = Some(device.line().clone());
+                let controls = io.packets.controls.clone();
+                firmware.pending_probe =
+                    Some(Arc::new(move || !controls.incoming.lock().is_empty()));
+            }
+        }
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::register(name, OWN, send);
+        if sleep {
+            assert!(Device::bind_sleep_target(&device));
+        }
         narf_net::iface::set_link_state(name, true); // operator IFF_UP, not PHY state
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
@@ -849,8 +1153,9 @@ impl Harness {
                 beacon.extend_from_slice(&WMM);
             }
             if ht {
-                beacon.extend_from_slice(&HT_IES);
-                peer.lock().ht = Some(HT_IES.to_vec());
+                let ies = NEXT_HT.lock().take().unwrap_or_else(|| HT_IES.to_vec());
+                beacon.extend_from_slice(&ies);
+                peer.lock().ht = Some(ies);
             }
             if let Some((_, ies)) = he {
                 beacon.extend_from_slice(ies);
@@ -871,6 +1176,7 @@ impl Harness {
             peer,
             env,
             plan,
+            native_dispatch: false,
         }
     }
     fn request(&self) -> AssociateRequest {
@@ -1018,8 +1324,18 @@ kernel_test_in!(
 );
 impl Drop for Harness {
     fn drop(&mut self) {
-        *ACTIVE_TEST.lock() = None;
-        narf_net::iface::unregister(self.device.name());
+        if self.native_dispatch {
+            crate::rtw89::interface::withdraw(&self.device);
+        } else {
+            narf_net::iface::unregister(self.device.name());
+        }
+        let mut active = ACTIVE_TEST.lock();
+        if active
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &self.device))
+        {
+            *active = None;
+        }
     }
 }
 fn smoke_rtw8852b_wmm_source_peer_commands_native_qos_ccmp_and_ip() -> TestResult {
@@ -2439,7 +2755,15 @@ kernel_test_in!(
 
 fn ampdu_harness(granted: bool, addba: Option<(u16, u16)>) -> Harness {
     const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
-    let h = Harness::build_full(false, true, false, Some(&RATES), true, None, granted);
+    let h = Harness::build_full(
+        false,
+        true,
+        false,
+        Some(&RATES),
+        true,
+        None,
+        (granted, false),
+    );
     h.peer.lock().addba = addba;
     h
 }
@@ -2789,4 +3113,450 @@ fn smoke_rtw8852b_pmf_wpa2_sa_query_bip_and_wpa3_sae() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89/pmf",
     smoke_rtw8852b_pmf_wpa2_sa_query_bip_and_wpa3_sae
+);
+
+#[path = "station_lps_tests.rs"]
+mod lps_tests;
+
+/// Scan over channels 1 and 6 with an AP on channel 6, then associate there.
+/// Exercises the station/interface retune order; the native register program
+/// is covered by radio_full and the N52C policy cases.
+fn smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial() -> TestResult {
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    NEXT_CHANNELS.store(1 << 6, Ordering::Release);
+    let h = Harness::new(false);
+    let advertised = h.device.get_wireless_info().bands[0].channels.clone();
+    if advertised != vec![1, 6] {
+        return TestResult::Fail("advertised channels differ from signed admission");
+    }
+    let request = |channels: Vec<u32>| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz: Vec::new(),
+        channels,
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    // An unadmitted primary is refused before any retune or probe.
+    if complete(h.device.scan(request(vec![1, 11]))).is_ok()
+        || !h.peer.lock().probes.is_empty()
+        || h.model(|io| io.retunes.clone()) != Vec::<u8>::new()
+    {
+        return TestResult::Fail("unadmitted channel scanned or retuned");
+    }
+    let Ok(seen) = complete(h.device.scan(request(vec![6, 1]))) else {
+        return TestResult::Fail("two-channel scan failed");
+    };
+    let ds: Vec<u8> = h
+        .peer
+        .lock()
+        .probes
+        .iter()
+        .map(|probe| probe[probe.len() - 1])
+        .collect();
+    if h.model(|io| io.retunes.clone()) != vec![6]
+        || ds != vec![1, 6]
+        || seen.len() != 1
+        || seen[0].bssid != AP
+        || seen[0].channel != 6
+        || seen[0].frequency_mhz != 2437
+    {
+        return TestResult::Fail("scan order, DS parameter or channel-6 result differs");
+    }
+    // Association on the BSS's channel6 joins without another retune.
+    let mut join = h.request();
+    join.channel = 6;
+    join.frequency_mhz = 2437;
+    if complete(h.device.associate(join)).is_err() {
+        return TestResult::Fail("channel6 association refused");
+    }
+    if h.model(|io| io.retunes.clone()) != vec![6] || h.device.connected_bssid() != Some(AP) {
+        return TestResult::Fail("association retuned again or did not join on channel6");
+    }
+    // Retune is refused while associated (no peer channel switch here).
+    if complete(h.device.scan(request(vec![1]))).is_ok()
+        || h.model(|io| io.retunes.clone()) != vec![6]
+    {
+        return TestResult::Fail("associated station retuned away");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_scan_retunes_admitted_channels_and_associates_on_noninitial
+);
+
+/// A signed-admitted 5GHz primary is advertised in its own band and an
+/// active scan there retunes to it and probes with OFDM-only rates and no
+/// DS Parameter Set; unadmitted 5GHz channels/frequencies are refused.
+fn smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted() -> TestResult {
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    NEXT_CHANNELS.store(1 << 16, Ordering::Release); // channel36
+    let h = Harness::new(false);
+    let bands = h.device.get_wireless_info().bands;
+    if bands.len() != 2
+        || bands[0].freq_mhz != 2400
+        || bands[0].channels != vec![1]
+        || bands[1].freq_mhz != 5000
+        || bands[1].channels != vec![36]
+    {
+        return TestResult::Fail("5GHz band not advertised with only admitted primaries");
+    }
+    let request = |channels: Vec<u32>, frequencies_mhz: Vec<u32>| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz,
+        channels,
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    if complete(h.device.scan(request(vec![40], Vec::new()))).is_ok()
+        || complete(h.device.scan(request(Vec::new(), vec![5200]))).is_ok()
+        || !h.model(|io| io.retunes.is_empty())
+    {
+        return TestResult::Fail("unadmitted 5GHz channel scanned");
+    }
+    if complete(h.device.scan(request(Vec::new(), vec![5180]))).is_err() {
+        return TestResult::Fail("admitted 5GHz scan refused");
+    }
+    let probes = h.peer.lock().probes.clone();
+    if h.model(|io| io.retunes.clone()) != vec![36]
+        || probes.len() != 1
+        || probes[0][24 + 2 + SSID.len()..] != [1, 8, 12, 18, 24, 36, 48, 72, 96, 108]
+    {
+        return TestResult::Fail("5GHz scan did not retune or probe per band");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_5ghz_band_advertised_and_scanned_when_admitted
+);
+
+/// A DFS (cfg80211 RADAR) 5GHz primary is admitted for passive scan only:
+/// mac80211 `ieee80211_scan_state_decision` dwells there without a probe
+/// request even when an active SSID scan is requested, while a plain 5GHz
+/// primary in the same request is still probed. Nothing is granted TX.
+fn smoke_rtw8852b_dfs_channel_scanned_passively_without_probe() -> TestResult {
+    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    let rule = |start, end, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: 80,
+        max_power_dbm: 23,
+        flags,
+    };
+    *NEXT_REGULATORY.lock() = Some(Arc::new(RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![
+            rule(2402, 2472, RegFlags::empty()),
+            rule(5170, 5250, RegFlags::AUTO_BW),
+            rule(5250, 5330, RegFlags::DFS | RegFlags::AUTO_BW),
+        ],
+    }));
+    // channel36 (slot 16) and channel52 (slot 20).
+    NEXT_CHANNELS.store(1 << 16 | 1 << 20, Ordering::Release);
+    let h = Harness::new(false);
+    let request = |frequencies_mhz: Vec<u32>| ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz,
+        channels: Vec::new(),
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    if complete(h.device.scan(request(vec![5260]))).is_err() {
+        return TestResult::Fail("admitted DFS primary not scanned passively");
+    }
+    if h.model(|io| io.retunes.clone()) != vec![52] || !h.peer.lock().probes.is_empty() {
+        return TestResult::Fail("DFS primary retune/probe differs from a passive dwell");
+    }
+    if complete(h.device.scan(request(vec![5180]))).is_err()
+        || h.model(|io| io.retunes.clone()) != vec![52, 36]
+        || h.peer.lock().probes.len() != 1
+    {
+        return TestResult::Fail("plain 5GHz primary not actively probed");
+    }
+    if h.model(|io| io.passive_grants.iter().any(Option::is_some)) {
+        return TestResult::Fail("passive TX granted without association");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_dfs_channel_scanned_passively_without_probe
+);
+
+/// mac80211 station CSA on an open link: an AP on channel6 announces a
+/// switch to channel1 (count1, quiet mode). The switch runs through the
+/// associated native owner with the peer kept, the beacon monitor restarts,
+/// TX stays blocked until the first beacon on channel1, and a later
+/// announcement to an unadmitted primary drops the connection.
+fn smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon() -> TestResult {
+    let plan = Peer::new(false).plan;
+    *NEXT_AP.lock() = Some(Box::new(
+        FakeAp::open(plan, SSID, 6, 42)
+            .unwrap()
+            .with_basic_1mbps()
+            .unwrap(),
+    ));
+    NEXT_CHANNELS.store(1 << 6, Ordering::Release);
+    let h = Harness::new(false);
+    let scan = ScanRequest {
+        ssids: vec![SSID.to_vec()],
+        frequencies_mhz: Vec::new(),
+        channels: vec![6],
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(20),
+        duration_mandatory: false,
+        extra_ies: Vec::new(),
+    };
+    let mut join = h.request();
+    join.channel = 6;
+    join.frequency_mhz = 2437;
+    if complete(h.device.scan(scan)).is_err() || complete(h.device.associate(join)).is_err() {
+        return TestResult::Fail("channel6 association fixture");
+    }
+    let switch = || {
+        h.lifecycle
+            .retained
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .station_channel_switch()
+    };
+    let beacon = |ds: u8, extra: &[u8]| {
+        let mut frame = h.peer.lock().ap.beacon();
+        let at = frame
+            .windows(3)
+            .rposition(|w| w == [3, 1, 6])
+            .expect("DS parameter set");
+        frame[at + 2] = ds;
+        frame.extend_from_slice(extra);
+        frame
+    };
+    let inject = |frame: Vec<u8>| h.model(|io| io.packets.inject(&frame).unwrap());
+    // Same-channel announcement is ignored (no switch scheduled).
+    inject(beacon(6, &[37, 3, 1, 6, 1]));
+    h.pump();
+    if switch() != Some((6, None)) {
+        return TestResult::Fail("CSA to the current primary was not ignored");
+    }
+    inject(beacon(6, &[37, 3, 1, 1, 1]));
+    h.pump();
+    let pending = switch();
+    if !matches!(pending, Some((6, Some(s))) if s.primary == 1 && s.block_tx && !s.switched)
+        || !h.model(|io| io.switches.is_empty())
+    {
+        return TestResult::Fail("count1 quiet CSA not accepted before the switch work");
+    }
+    complete(h.device.apply_edca());
+    if h.model(|io| io.switches.clone()) != vec![1]
+        || !matches!(switch(), Some((1, Some(s))) if s.switched)
+        || h.device.connected_bssid() != Some(AP)
+        || h.model(|io| io.retunes.clone()) != vec![6]
+    {
+        return TestResult::Fail("CSA did not retune the associated owner keeping the peer");
+    }
+    // First beacon on the target ends the switch (TX unblocked).
+    inject(beacon(1, &[]));
+    h.pump();
+    if switch() != Some((1, None)) || h.device.connected_bssid() != Some(AP) {
+        return TestResult::Fail("first target beacon did not complete the channel switch");
+    }
+    // Announcement to unadmitted channel11 drops the connection.
+    inject(beacon(1, &[37, 3, 1, 11, 5]));
+    h.pump();
+    if h.device.connected_bssid().is_some() || h.model(|io| io.switches.clone()) != vec![1] {
+        return TestResult::Fail("CSA to an unadmitted primary kept the link or retuned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_associated_csa_retunes_with_peer_and_unblocks_on_target_beacon
+);
+
+/// `ieee80211_parse_ch_switch_ie`: ECSA precedes CSA when its class is
+/// understood (`ieee80211_operating_class_to_band`: 81..=84 2.4GHz, 112 and
+/// 115..=130 5GHz); CSA targets the current band; monitor chandef/RF
+/// readback follow the actual primary (rtw8852b_rfk.c `_ch_setting`).
+fn smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux() -> TestResult {
+    use crate::rtw89::{monitor_wire, station::channel_switch};
+    let csa = channel_switch(&[0, 1, b'x', 37, 3, 1, 11, 4], 6);
+    let ecsa = channel_switch(&[37, 3, 0, 11, 4, 60, 4, 0, 81, 6, 2], 1);
+    let five = channel_switch(&[60, 4, 1, 115, 36, 3], 6);
+    if csa.map(|a| (a.mode, a.primary, a.count)) != Some((true, Some(11), 4))
+        || ecsa.map(|a| (a.mode, a.primary, a.count)) != Some((false, Some(6), 2))
+        || five.map(|a| (a.mode, a.primary, a.count)) != Some((true, Some(36), 3))
+        || channel_switch(&[60, 4, 0, 125, 149, 1], 36).map(|a| a.primary) != Some(Some(149))
+        || channel_switch(&[60, 4, 0, 112, 6, 1], 36).map(|a| a.primary) != Some(None)
+        || channel_switch(&[60, 4, 0, 131, 37, 1], 36).map(|a| a.primary) != Some(None)
+        // Unknown class: fall back to CSA in the current band, or nothing.
+        || channel_switch(&[37, 3, 0, 44, 1, 60, 4, 0, 99, 6, 1], 36).map(|a| a.primary)
+            != Some(Some(44))
+        || channel_switch(&[60, 4, 0, 99, 6, 1], 1).is_some()
+        || channel_switch(&[37, 3, 0, 36, 1], 6).map(|a| a.primary) != Some(None)
+        || channel_switch(&[37, 3, 0, 14, 1], 1).map(|a| a.primary) != Some(None)
+        || channel_switch(&[37, 2, 0, 6], 1).is_some()
+        || channel_switch(&[37, 9, 0, 6, 1], 1).is_some()
+    {
+        return TestResult::Fail("CSA/ECSA parse differs from mac80211");
+    }
+    let chandef = |mhz: u32, width: u32| narf_wireless::monitor::Channel {
+        frequency_mhz: mhz,
+        width,
+        center1_mhz: mhz,
+        center2_mhz: 0,
+    };
+    if monitor_wire::channel(chandef(2437, 1)) != Some(6)
+        || monitor_wire::channel(chandef(2472, 0)) != Some(13)
+        || monitor_wire::channel(chandef(2484, 1)).is_some()
+        || monitor_wire::channel(chandef(2437, 2)).is_some()
+        || monitor_wire::channel(chandef(5180, 1)) != Some(36)
+        || monitor_wire::channel(chandef(5825, 0)) != Some(165)
+        || monitor_wire::channel(chandef(5190, 1)).is_some()
+        || monitor_wire::channel(chandef(5180, 2)).is_some()
+        || monitor_wire::channel(chandef(5000 + 5 * 34, 1)).is_some()
+        || monitor_wire::frequency(36) != 5180
+        || !monitor_wire::observed_channel([0x11d24; 4], 36)
+        || monitor_wire::observed_channel([0x1c24; 4], 36)
+        || monitor_wire::observed_channel([0x11d06; 4], 6)
+        || monitor_wire::frequency(6) != 2437
+        || !monitor_wire::observed_channel([0x1c06; 4], 6)
+        || monitor_wire::observed_channel([0x1c01; 4], 6)
+        || monitor_wire::observed_channel([0x1c06, 0x1c06, 0x1c06, 0x1c01], 6)
+    {
+        return TestResult::Fail("monitor chandef/frequency/RF readback not per actual primary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_csa_parse_and_monitor_primary_follow_linux
+);
+
+/// 5GHz station facts: mac80211 `ieee80211_build_preq_ies_band` probe
+/// content (OFDM Supported Rates only, no Extended Rates/DS Parameter Set),
+/// the slot admission mask, and the band-floor basic-rate requirement.
+fn smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux() -> TestResult {
+    use crate::rtw89::station::{channel_admitted as admitted, ghz5, probe_request};
+    let own = [2, 0, 0, 0, 0, 1];
+    let two = probe_request(own, b"x", &[], 6);
+    let five = probe_request(own, b"x", &[221, 1, 7], 36);
+    if two[24..]
+        != [
+            0, 1, b'x', 1, 8, 2, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108, 3, 1, 6,
+        ]
+        || five[24..] != [0, 1, b'x', 1, 8, 12, 18, 24, 36, 48, 72, 96, 108, 221, 1, 7]
+    {
+        return TestResult::Fail("probe request IEs differ per band");
+    }
+    // 2.4GHz primary n = bit n; 5GHz from bit 16 in GHZ5 order.
+    let mask = 1u64 << 1 | 1 << 16 | 1 << 36;
+    if !admitted(mask, 1)
+        || !admitted(mask, 36)
+        || !admitted(mask, 149)
+        || admitted(mask, 40)
+        || admitted(mask, 14)
+        || admitted(1 << 16, 16)
+        || !ghz5(165)
+        || ghz5(13)
+    {
+        return TestResult::Fail("5GHz slot admission mask differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/station",
+    smoke_rtw8852b_5ghz_station_probe_rates_and_admission_follow_linux
+);
+
+fn smoke_rtw8852b_ht40_admitted_chandef_advertised_retuned_and_ra_bw40() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    let Some(plus) = crate::rtw89::operating_channel::Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("HT40+ profile missing");
+    };
+    // AP: HT_IES widened to 20/40MHz with SGI40 and secondary above.
+    let mut ht40 = HT_IES.to_vec();
+    ht40[2] |= 0x42;
+    ht40[31] = 0x05;
+    // Without an admitted wide record: 20MHz join, no width advertised.
+    *NEXT_HT.lock() = Some(ht40.clone());
+    let h = Harness::build(false, true, false, Some(&RATES), true);
+    if h.device.phy_capabilities(2400).is_some()
+        || h.device.get_wireless_info().hw_caps.ht_supported
+        || h.join().is_err()
+        || !h.model(|io| io.wide_retunes.is_empty())
+    {
+        return TestResult::Fail("wide capability without an admitted wide record");
+    }
+    drop(h);
+    // Admitted HT40+: advertised, retuned before authentication, RA bw 40.
+    *NEXT_WIDE.lock() = vec![plus];
+    *NEXT_HT.lock() = Some(ht40);
+    let h = Harness::build(false, true, false, Some(&RATES), true);
+    let ht = crate::rtw89::station_control::local_ht40().map(|ht| ht.capability_body());
+    if h.device.phy_capabilities(2400).map(|caps| caps.ht) != ht
+        || h.device.phy_capabilities(5000).is_some()
+        || !h.device.get_wireless_info().hw_caps.ht_supported
+        || h.device.get_wireless_info().hw_caps.vht_supported
+    {
+        return TestResult::Fail("2.4GHz HT40 capability not advertised exactly");
+    }
+    if h.join().is_err() {
+        return TestResult::Fail("HT40 association failed");
+    }
+    if h.model(|io| io.wide_retunes.clone()) != vec![plus] {
+        return TestResult::Fail("station did not retune to the admitted HT40+ chandef");
+    }
+    // CCK|OFDM|HT, BW_CAP 40, SGI40 and LDPC; mask as HT20.
+    let mut expected = [0u8; 16];
+    expected[..4].copy_from_slice(&0x0070_004eu32.to_le_bytes());
+    expected[4..8].copy_from_slice(&0x000f_f015u32.to_le_bytes());
+    let commands = h.model(|io| io.control.packets().to_vec());
+    if commands
+        .iter()
+        .filter(|p| p.len() == 24 && p[8..] == expected)
+        .count()
+        != 1
+    {
+        return TestResult::Fail("HT40 RA_MACIDCFG H2C missing or differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/rates",
+    smoke_rtw8852b_ht40_admitted_chandef_advertised_retuned_and_ra_bw40
 );

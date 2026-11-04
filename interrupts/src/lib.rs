@@ -23,6 +23,7 @@ pub mod its_fw;
 pub mod oneshot;
 pub mod vector;
 pub mod wait;
+pub mod wake;
 
 mod gic_dt_tests;
 mod gic_spi_tests;

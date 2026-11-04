@@ -72,6 +72,8 @@ const ISR_TXOK: u32 = 0x40;
 const ISR_TXDESC: u32 = 0x80;
 const ISR_TXERR: u32 = 0x100;
 const ISR_TXEOL: u32 = 0x400;
+const ISR_BMISS: u32 = 0x0004_0000;
+const S2_TSFOOR: u32 = 0x4000_0000;
 const ISR_BCNMISC: u32 = 0x0080_0000;
 const ISR_RXMINTR: u32 = 0x0100_0000;
 const ISR_GENTMR: u32 = 0x1000_0000;
@@ -115,6 +117,8 @@ pub(super) struct Events {
     pub rx_overrun: bool,
     pub fatal: bool,
     pub tim_timer: bool,
+    pub bmiss: bool,
+    pub tsf_oor: bool,
     pub sync_cause: u32,
 }
 
@@ -154,6 +158,34 @@ pub(super) fn enable(port: &impl Port, ht: bool, msi: bool) -> Result<Mask, Erro
 
 /// `ah->intr_txqs` for the additional data QCUs once the N85Q program is
 /// active: TXDESC (IMR_S0) and TXEOL (IMR_S1) for QCU0..3.
+/// Exact optional manual station-PS wake causes; base masks are unchanged.
+pub(super) fn power_save(port: &impl Port, mut mask: Mask, enabled: bool) -> Result<Mask, Error> {
+    mask.imr = if enabled {
+        mask.imr | ISR_BMISS | ISR_BCNMISC | ISR_GENTMR
+    } else {
+        mask.imr & !ISR_BMISS
+    };
+    let s2 = port.read(IMR_S2)?;
+    let s2 = if enabled {
+        s2 | S2_TSFOOR
+    } else {
+        s2 & !S2_TSFOOR
+    };
+    let s5 = port.read(IMR_S5)?;
+    let s5 = if enabled {
+        s5 | S5_TIM_TIMER
+    } else {
+        s5 & !S5_TIM_TIMER
+    };
+    port.write(IMR, mask.imr)?;
+    port.write(IMR_S2, s2)?;
+    port.write(IMR_S5, s5)?;
+    if port.read(IMR)? != mask.imr || port.read(IMR_S2)? != s2 || port.read(IMR_S5)? != s5 {
+        return Err(Error::Descriptor);
+    }
+    Ok(mask)
+}
+
 pub(super) fn data_queues(port: &impl Port) -> Result<(), Error> {
     port.write(IMR_S0, 0xf << 16)?;
     port.write(IMR_S1, 0xf << 16)?;
@@ -214,8 +246,9 @@ pub(super) fn cause(port: &impl Port, imr: u32) -> Result<Option<Events>, Error>
     let mut events = Events::default();
     if isr != 0 {
         if isr & ISR_BCNMISC != 0 {
-            // RAC clears the secondary; CST is consumed only as a cause.
-            let _ = port.read(ISR_S2)?;
+            // RAC clears secondary causes; retain qualified TSF resync facts.
+            let s2 = port.read(ISR_S2)?;
+            events.tsf_oor = s2 & S2_TSFOOR != 0 && port.read(IMR_S2)? & S2_TSFOOR != 0;
         }
         isr = port.read(ISR_RAC)?;
         if isr == u32::MAX {
@@ -231,6 +264,7 @@ pub(super) fn cause(port: &impl Port, imr: u32) -> Result<Option<Events>, Error>
             events.txqs =
                 ((s0 & 0x3ff) | ((s0 >> 16) & 0x3ff) | (s1 & 0x3ff) | ((s1 >> 16) & 0x3ff)) as u16;
         }
+        events.bmiss = isr & imr & ISR_BMISS != 0;
         events.rx_eol = isr & imr & ISR_RXEOL != 0;
         events.rx_overrun = isr & imr & ISR_RXORN != 0;
         if isr & ISR_GENTMR != 0 {

@@ -5,6 +5,12 @@
 //! Reference: Linux brcmfmac/{bcmsdh,sdio}.c. F1 words use CMD53 with
 //! the 32-bit backplane access flag. F2 RX uses fixed reads, TX follows
 //! incrementing writes; mailbox handling bounds readiness and flow control.
+//! Multi-byte F1/F2 extents follow Linux `sdio_io_rw_ext_helper` (the
+//! `sdio_memcpy_{from,to}io` / `sdio_readsb` path brcmfmac's
+//! `brcmf_sdiod_ramrw`, `brcmf_sdiod_recv_pkt` and `brcmf_sdiod_send_pkt`
+//! use): on a multi-block card, whole blocks go as block-mode CMD53, which
+//! the SDHCI host runs through ADMA2/SDMA when it admitted host DMA, and
+//! the remainder as byte-mode commands.
 
 #![allow(dead_code)]
 
@@ -13,6 +19,13 @@ use narf_drivers_sdio::sdio::function::{SdioError, SdioFunction};
 
 use super::transport::{Function, PacketTransport, Transport, TransportError};
 use super::{chipclk, sdio};
+
+#[path = "sdio_ap_packet.rs"]
+mod ap_packet;
+#[path = "sdio_pm.rs"]
+mod pm;
+#[path = "sdio_stop.rs"]
+mod stop;
 
 /// Maximum byte-mode CMD53 command extent (zero count encodes512).
 pub const CYW43439_F2_MAX_BURST: usize = 512;
@@ -49,6 +62,89 @@ pub fn bridge_cmd53_write_arg(function: Function, address: u32, len: u16) -> u32
 
 /// Map a `SdioError` onto a `TransportError` for the
 /// `Transport` trait surface.
+/// Linux `sdio_io_rw_ext_helper` blocks per command: 511 (CMD53 count
+/// field) bounded by the host's per-command transfer limit.
+fn max_blocks(block: usize) -> usize {
+    (narf_drivers_sdio::pio::MAX_TRANSFER / block).min(511)
+}
+
+/// Linux `sdio_io_rw_ext_helper` read side. `block` is the function's
+/// current block size, which is also its byte-mode maximum here
+/// (`sdio_max_byte_size`: F1 64, F2 512). `increment` false is
+/// `sdio_readsb` (fixed FIFO address).
+fn read_ext<F: SdioFunction>(
+    func: &mut F,
+    function: u8,
+    mut address: u32,
+    increment: bool,
+    block: usize,
+    buf: &mut [u8],
+) -> Result<(), SdioError> {
+    let mut done = 0;
+    if func.multi_block() && buf.len() > block {
+        while buf.len() - done >= block {
+            let blocks = ((buf.len() - done) / block).min(max_blocks(block));
+            let size = blocks * block;
+            let chunk = &mut buf[done..done + size];
+            if increment {
+                func.cmd53_block_read(function, address, block as u16, blocks as u16, chunk)?;
+            } else {
+                func.cmd53_block_read_fixed(function, address, block as u16, blocks as u16, chunk)?;
+            }
+            done += size;
+            if increment {
+                address += size as u32;
+            }
+        }
+    }
+    while done < buf.len() {
+        let size = (buf.len() - done).min(block);
+        let chunk = &mut buf[done..done + size];
+        if increment {
+            func.cmd53_read(function, address, chunk)?;
+            address += size as u32;
+        } else {
+            func.cmd53_read_fixed(function, address, chunk)?;
+        }
+        done += size;
+    }
+    Ok(())
+}
+
+/// Linux `sdio_io_rw_ext_helper` write side (incrementing, as
+/// `sdio_memcpy_toio`).
+fn write_ext<F: SdioFunction>(
+    func: &mut F,
+    function: u8,
+    mut address: u32,
+    block: usize,
+    buf: &[u8],
+) -> Result<(), SdioError> {
+    let mut done = 0;
+    if func.multi_block() && buf.len() > block {
+        while buf.len() - done >= block {
+            let blocks = ((buf.len() - done) / block).min(max_blocks(block));
+            let size = blocks * block;
+            func.cmd53_block_write(
+                function,
+                address,
+                block as u16,
+                blocks as u16,
+                &buf[done..done + size],
+            )?;
+            done += size;
+            address += size as u32;
+        }
+    }
+    while done < buf.len() {
+        let size = (buf.len() - done).min(block);
+        func.cmd53_write(function, address, &buf[done..done + size])?;
+        done += size;
+        address += size as u32;
+    }
+    Ok(())
+}
+
 fn map_err(e: SdioError) -> TransportError {
     match e {
         SdioError::ResponseError(_) => TransportError::BadFraming,
@@ -58,6 +154,8 @@ fn map_err(e: SdioError) -> TransportError {
         SdioError::NotEnabled => TransportError::NotReady,
         SdioError::AddressOverflow => TransportError::AddressOverflow,
         SdioError::Unsupported => TransportError::NotReady,
+        SdioError::Denied => TransportError::Denied,
+        SdioError::Busy => TransportError::Busy,
     }
 }
 
@@ -72,10 +170,13 @@ pub struct SdioTransport<F: SdioFunction> {
     rx_pending: bool,
     flow_stopped: bool,
     failed: bool,
+    stopped: bool,
     /// Card-interrupt wake when the host delivers F1/F2 interrupts.
     interrupt: Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>>,
     /// Save-restore idle dongle sleep (`brcmf_sdio_bus_sleep`), when enabled.
     sleep: Option<Sleep>,
+    /// System suspend held (`sdio_pm.rs`); the FIFO is not touched.
+    suspended: Option<pm::Suspended>,
 }
 
 /// `bus->sleeping` plus the watchdog idle accounting.
@@ -124,8 +225,10 @@ impl<F: SdioFunction> SdioTransport<F> {
             rx_pending: false,
             flow_stopped: false,
             failed: false,
+            stopped: false,
             interrupt: None,
             sleep: None,
+            suspended: None,
         }
     }
     pub(crate) fn qualify(
@@ -404,10 +507,16 @@ impl<F: SdioFunction> SdioTransport<F> {
         if physical > buffer.len() {
             return Err(TransportError::LengthOverflow);
         }
-        for chunk in buffer[64..physical].chunks_mut(512) {
-            self.func
-                .cmd53_read_fixed(2, 0x8000, chunk)
-                .map_err(map_err)?;
+        if physical > 64 {
+            read_ext(
+                &mut self.func,
+                2,
+                0x8000,
+                false,
+                usize::from(CYW43439_SDIO_BLOCK_SIZE),
+                &mut buffer[64..physical],
+            )
+            .map_err(map_err)?;
         }
         Ok(length)
     }
@@ -479,11 +588,8 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
             } else {
                 512
             };
-            for (i, chunk) in buf.chunks_mut(stride).enumerate() {
-                self.func
-                    .cmd53_read(function as u8, address + (i * stride) as u32, chunk)
-                    .map_err(map_err)?;
-            }
+            read_ext(&mut self.func, function as u8, address, true, stride, buf)
+                .map_err(map_err)?;
         }
         Ok(())
     }
@@ -518,21 +624,59 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
             } else {
                 512
             };
-            for (i, chunk) in buf.chunks(stride).enumerate() {
-                self.func
-                    .cmd53_write(function as u8, address + (i * stride) as u32, chunk)
-                    .map_err(map_err)?;
-            }
+            write_ext(&mut self.func, function as u8, address, stride, buf).map_err(map_err)?;
         }
         Ok(())
     }
 }
 impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
+    fn transmit_ap_packet(
+        &mut self,
+        packet: &[u8],
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        SdioTransport::transmit_ap_packet(self, packet, original)
+    }
+    fn transmit_ap_control(
+        &mut self,
+        packet: &[u8],
+        original: &crate::brcmfmac::ap_scope::Capture,
+    ) -> Result<(), TransportError> {
+        SdioTransport::transmit_ap_control(self, packet, original)
+    }
+    fn completed_prefix(&mut self) -> Result<bool, TransportError> {
+        self.check_qualification()?;
+        // A sleeping/no-IRQ fast return is not an actual FIFO observation.
+        self.wake()?;
+        self.mailbox()?;
+        Ok(!self.rx_pending)
+    }
+    fn ap_source(&self) -> Option<crate::brcmfmac::ap_source::Source> {
+        if self.failed || self.stopped {
+            return None;
+        }
+        crate::brcmfmac::ap_source::Source::sdio(self.func.source()?, self.proof.as_ref()?.clone())
+    }
+    fn confirmed_stop(&mut self) -> Result<(), TransportError> {
+        SdioTransport::confirmed_stop(self)
+    }
+    fn stop_dead(&mut self) -> Result<(), TransportError> {
+        SdioTransport::stop_dead(self)
+    }
+    fn suspend(&mut self, wake: bool) -> Result<(), TransportError> {
+        SdioTransport::suspend_bus(self, wake)
+    }
+    fn resume(&mut self) -> Result<(), TransportError> {
+        SdioTransport::resume_bus(self)
+    }
+    fn wowl_supported(&mut self) -> bool {
+        SdioTransport::wowl_supported(self)
+    }
     fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
         self.interrupt.clone()
     }
     fn interrupt_serviced(&mut self) {
-        if self.interrupt.is_some() && !self.failed {
+        if self.interrupt.is_some() && !self.failed && self.suspended.is_none() {
             self.func.rearm_card_interrupt();
         }
     }
@@ -542,7 +686,11 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
         let Some(sleep) = self.sleep else {
             return;
         };
-        if self.failed || sleep.asleep || now_ms().saturating_sub(sleep.active_ms) < IDLE_MS {
+        if self.failed
+            || self.suspended.is_some()
+            || sleep.asleep
+            || now_ms().saturating_sub(sleep.active_ms) < IDLE_MS
+        {
             return;
         }
         if self.enter_sleep().is_err() {
@@ -552,6 +700,9 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
     fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
         if self.failed {
             return Err(TransportError::NotReady);
+        }
+        if self.suspended.is_some() {
+            return Ok(0);
         }
         // A sleeping dongle raises a card interrupt when it has work; the
         // backstop timer alone must not wake it.
@@ -575,6 +726,9 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
         if self.failed {
             return Err(TransportError::NotReady);
         }
+        if self.suspended.is_some() {
+            return Err(TransportError::Busy);
+        }
         if packet.len() < 12 || packet.len() > super::runtime::MAX_PACKET || packet.len() % 4 != 0 {
             return Err(TransportError::LengthOverflow);
         }
@@ -587,16 +741,19 @@ impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
         }
         self.window(0x1800_0000)?;
         // Linux uses incrementing memcpy_toio for F2 TX and fixed readsb
-        // for F2 RX. Each byte-mode command is at most 512 bytes.
-        for (i, chunk) in packet.chunks(512).enumerate() {
-            if let Err(error) = self
-                .func
-                .cmd53_write(2, 0x8000 + (i * 512) as u32, chunk)
-                .map_err(map_err)
-            {
-                self.failed = true;
-                return Err(error);
-            }
+        // for F2 RX: whole blocks in block mode on a multi-block card, then
+        // byte-mode commands of at most 512 bytes.
+        if let Err(error) = write_ext(
+            &mut self.func,
+            2,
+            0x8000,
+            usize::from(CYW43439_SDIO_BLOCK_SIZE),
+            packet,
+        )
+        .map_err(map_err)
+        {
+            self.failed = true;
+            return Err(error);
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! SDHCI SDIO host controller driver for NARF.
 //!
-//! Owned standard SDHCI PIO execution, 3.3-V one-bit SDIO enumeration,
+//! Owned standard SDHCI PIO and ADMA2/SDMA execution, 3.3-V one-bit SDIO enumeration,
 //! checked function access and PCI function-driver dispatch. See
 //! `specification/spec.md` for the supported profile and remaining platform,
 //! vendor-quirk, DMA and hotplug work. CYW43439 consumes this live host.
@@ -21,11 +21,13 @@
 extern crate alloc;
 
 pub mod card;
+pub mod dma;
 pub mod host;
 pub mod native;
 pub mod pio;
 pub mod sdhci;
 pub mod sdio;
+pub mod source;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
@@ -36,4 +38,4 @@ pub use sdhci::probe::{probe_device, ProbeResult};
 pub use sdhci::regs::PCI_CLASS_SDHCI;
 pub use sdhci::voltage::SignalVoltage;
 pub use sdio::cccr::{CccrInfo, FBR_BLKSZ_0, FBR_CIS_PTR_0, FBR_STD_IF};
-pub use sdio::function::{SdioError, SdioFunction};
+pub use sdio::function::{PmFlags, SdioError, SdioFunction};

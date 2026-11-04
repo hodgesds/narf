@@ -89,6 +89,17 @@ impl<T> TxQueue<T> {
     pub fn write_pointer(&self) -> u16 {
         self.wp
     }
+    /// `rtw89_pci_reset_trx_rings` host half (`bd_ring->wp = rp = 0`) for a
+    /// reversible WoW halt. Only a queue with no reserved, published or
+    /// unreleased slot may rewind; Linux would release pending skbs instead.
+    pub(crate) fn rewind(&mut self) -> Result<(), Error> {
+        if self.slots.iter().any(Option::is_some) {
+            return Err(Error::Full);
+        }
+        self.wp = 0;
+        self.rp = 0;
+        Ok(())
+    }
     pub fn is_full(&self) -> bool {
         (self.wp + 1) % self.slots.len() as u16 == self.rp || self.slots[self.wp as usize].is_some()
     }
@@ -123,6 +134,15 @@ impl<T> TxQueue<T> {
             resource: Some(resource),
         });
         Ok(ticket)
+    }
+    /// Inert hardware fixture's read-only view of one actual retained map.
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn model_retained(&self, ticket: Ticket) -> Option<&T> {
+        let entry = self.slots.get(usize::from(ticket.slot))?.as_ref()?;
+        if entry.ticket != ticket {
+            return None;
+        }
+        entry.resource.as_ref()
     }
     pub fn reserved_mut(&mut self, ticket: Ticket) -> Result<&mut T, Error> {
         let entry = self
@@ -311,6 +331,49 @@ pub fn prepare_header(
     frame_dma: u64,
     frame: &[u8],
 ) -> Result<Vec<u8>, Error> {
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, false, false)
+}
+/// TX A-MSDU formatting only. The caller must prove the distinct actual
+/// native RF/peer/key/size program; no other chip or +HTC form is admitted.
+pub(super) fn prepare_header_amsdu(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if chip != ChipId::Rtl8852B
+        || frame.first() != Some(&0x88)
+        || frame.get(24).is_none_or(|q| q & 0x80 == 0)
+        || frame.get(1).is_some_and(|fc| fc & 0x80 != 0)
+    {
+        return Err(Error::BadFrame);
+    }
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, true, false)
+}
+/// Explicit RTL8852B software-fragment descriptor path. Ordinary transport
+/// keeps refusing fragments; same actual qualified native owner is mandatory.
+pub(super) fn prepare_header_fragment(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if chip != ChipId::Rtl8852B || frame.get(1).is_none_or(|fc| fc & 0x80 != 0) {
+        return Err(Error::BadFrame);
+    }
+    prepare_header_profile(chip, info, sequence, frame_dma, frame, false, true)
+}
+fn prepare_header_profile(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+    amsdu: bool,
+    fragments: bool,
+) -> Result<Vec<u8>, Error> {
     if chip == ChipId::Rtl8922A {
         return Err(Error::BadQueue);
     }
@@ -327,8 +390,10 @@ pub fn prepare_header(
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
     // Initial transport profile: native management or ordinary non-QoS
-    // three-address data, without fragmentation/HT-control extras. Only B's
-    // retained ordinary station path admits already encrypted host CCMP.
+    // three-address data, without fragmentation. Only the B and C retained
+    // ordinary station paths admit already encrypted host CCMP (no TXWD SEC
+    // fields: `sec_en` stays false, so neither the v0 nor the v1 body or
+    // `rtw89_build_txwd_info2_v1` FORCE_KEY_EN carries a key).
     if !matches!(
         fc & 0x00fc,
         0x0000
@@ -345,9 +410,14 @@ pub fn prepare_header(
             | 0x00d0
             | 0x0008
             | 0x0088
-    ) || fc & (0x8000 | 0x0400) != 0
+    ) || !fragments && fc & 0x0400 != 0
+        || fragments
+            && (fc & 0x0400 == 0 && frame[22] & 15 == 0 || fc & 0x0400 != 0 && frame[22] & 15 == 15)
+        || fc & 0x8000 != 0
+            && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
+                || fc & 0xfc != 0x88)
         || fc & 0x0300 == 0x0300
-        || frame[22] & 0xf != 0
+        || !fragments && frame[22] & 0xf != 0
     {
         return Err(Error::BadFrame);
     }
@@ -355,19 +425,32 @@ pub fn prepare_header(
         return Err(Error::BadFrame);
     }
     let header_length = if fc & 0xfc == 0x88 {
-        // TID0..7 with normal ack policy; EOSP/A-MSDU/TXOP bits unsupported.
-        if chip != ChipId::Rtl8852B
-            || frame.get(24).is_none_or(|control| control & 0xf8 != 0)
+        // TID0..7, normal ack policy; EOSP belongs to the HE +HTC form.
+        // RTL8852C and RTL8851B carry QoS data only without A-MSDU (WMM
+        // program).
+        if !(chip == ChipId::Rtl8852B
+            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && !amsdu)
+            || frame.get(24).is_none_or(|control| {
+                control & if amsdu { 0x68 } else { 0xe8 } != 0
+                    || (control & 0x10 != 0) != (fc & 0x8000 != 0)
+            })
             || frame.get(25) != Some(&0)
         {
             return Err(Error::BadFrame);
         }
-        26
+        if fc & 0x8000 != 0 {
+            if frame.get(26..30).is_none_or(|control| control[0] & 3 != 3) {
+                return Err(Error::BadFrame);
+            }
+            30
+        } else {
+            26
+        }
     } else {
         24
     };
     if fc & 0x4000 != 0
-        && (chip != ChipId::Rtl8852B
+        && (!matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
             // Host-CCMP data to the AP, or (PMF) a robust disassociation,
             // deauthentication or Action frame with no DS bits.
             || !(matches!(fc & 0x00fc, 8 | 0x88) && fc & 0x0300 == 0x0100
@@ -380,9 +463,84 @@ pub fn prepare_header(
     {
         return Err(Error::BadFrame);
     }
+    encode_header(chip, info, sequence, frame_dma, frame, header_length)
+}
+/// RTL8852B AP-role TXWD formatting (`rtw89_core_tx_update_desc_info` for
+/// an AP vif). Admits only the frames a host-SME AP emits: FromDS data,
+/// QoS data (EOSP allowed without +HTC, mac80211 `ieee80211_send_null_response`
+/// / `_deliver_response`), Null/QoS-Null, and the AP management subtypes
+/// with no DS bits. Host CCMP is admitted on FromDS data and robust
+/// management. The caller proves the actual AP peer/MACID binding.
+pub(super) fn prepare_header_ap(
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if sequence > 0x7fff
+        || info.channel >= 12
+        || info.mac_id >= 128
+        || channel_for_qsel(info.qsel) != Ok(info.channel)
+        || frame.len() < 24
+        || frame.len() > 0x3fff
+        || info.pkt_size as usize != frame.len()
+        || frame[0] & 3 != 0
+        || frame[22] & 0xf != 0
+    {
+        return Err(Error::BadFrame);
+    }
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    let ds = fc & 0x0300;
+    let subtype = fc & 0x00fc;
+    // No MoreFrag, PwrMgt (AP), Order/+HTC; Retry is hardware-owned.
+    if fc & (0x0400 | 0x0800 | 0x1000 | 0x8000) != 0 {
+        return Err(Error::BadFrame);
+    }
+    let header_length = match subtype {
+        0x10 | 0x30 | 0x50 | 0xa0 | 0xb0 | 0xc0 | 0xd0 if ds == 0 => 24,
+        0x08 | 0x48 if ds == 0x0200 => 24,
+        0x88 | 0xc8 if ds == 0x0200 => {
+            // TID0..7, normal ack policy, no A-MSDU; EOSP permitted.
+            if frame.len() < 26 || frame[24] & 0xe8 != 0 || frame[25] != 0 {
+                return Err(Error::BadFrame);
+            }
+            26
+        }
+        _ => return Err(Error::BadFrame),
+    };
+    if fc & 0x4000 != 0
+        && (!(matches!(subtype, 0x08 | 0x88) && ds == 0x0200
+            || matches!(subtype, 0xa0 | 0xc0 | 0xd0))
+            || frame.len() < header_length + if fc & 0x0c == 0 { 18 } else { 24 }
+            || frame[header_length + 2] != 0
+            || frame[header_length + 3] & 0x3f != 0x20)
+    {
+        return Err(Error::BadFrame);
+    }
+    if fc & 0x4000 == 0 && matches!(subtype, 0x48 | 0xc8) && frame.len() != header_length {
+        return Err(Error::BadFrame);
+    }
+    encode_header(
+        ChipId::Rtl8852B,
+        info,
+        sequence,
+        frame_dma,
+        frame,
+        header_length,
+    )
+}
+fn encode_header(
+    chip: ChipId,
+    info: TxwdInfo,
+    sequence: u16,
+    frame_dma: u64,
+    frame: &[u8],
+    header_length: usize,
+) -> Result<Vec<u8>, Error> {
     // B uses the AX baseline descriptor encoding, but its retained/native
     // device mask is36 bits. Encoding capacity is not device DMA authority.
-    let dma_mask = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) {
+    // RTL8851B shares B's AX v0 body and pci.c's 36-bit mask.
+    let dma_mask = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B) {
         0xf_ffff_ffff
     } else {
         0xff_ffff_ffff

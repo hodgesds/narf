@@ -92,8 +92,14 @@ pub(super) struct Model {
     cam_stalled: bool,
     iq_failure: bool,
     rf_read: u8,
-    rf: [u32; 256],
+    pub(super) rf: [u32; 256],
     pub(super) pending_write: Option<u16>,
+    pub(super) cold_generation: u64,
+    pub(super) rx_dma_stalled: bool,
+    pub(super) mac_off_stalled: bool,
+    pub(super) delayed_write: Option<u16>,
+    pub(super) delayed_complete: bool,
+    pub(super) delayed_waker: Option<Waker>,
 }
 
 impl Model {
@@ -127,6 +133,30 @@ impl Model {
             rf_read: 0,
             rf: [0; 256],
             pending_write: None,
+            cold_generation: 0,
+            rx_dma_stalled: false,
+            mac_off_stalled: false,
+            delayed_write: None,
+            delayed_complete: false,
+            delayed_waker: None,
+        }
+    }
+
+    fn register_write(&mut self, addr: u16, bytes: &[u8]) {
+        let previous_hssi = u32::from_le_bytes(self.regs[0x824..0x828].try_into().unwrap());
+        self.regs[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
+        if addr == 0x840 && bytes.len() == 4 {
+            let v = u32::from_le_bytes(bytes.try_into().unwrap());
+            self.rf[(v >> 20) as usize] = v & 0xfffff;
+        }
+        if addr == 0x824 && bytes.len() == 4 {
+            let v = u32::from_le_bytes(bytes.try_into().unwrap());
+            if v & 0x80000000 != 0 && previous_hssi & 0x80000000 == 0 {
+                self.rf_read = ((v >> 23) & 0xff) as u8;
+            }
+        }
+        if addr == REG_MCU_FW_DL && bytes[0] & MCU_FW_DL_CSUM_REPORT != 0 {
+            self.regs[addr as usize] &= !MCU_FW_DL_CSUM_REPORT;
         }
     }
 }
@@ -163,8 +193,27 @@ impl ControlIo for Fake {
             g.unsafe_reuses += 1;
         }
         g.ops.push(Op::Read(addr, out.len()));
+        if addr == 0x284 && out.len() == 4 && !g.rx_dma_stalled && g.regs[0x286] & 4 != 0 {
+            g.regs[0x286] |= 2;
+        }
         if addr == REG_APS_FSMCO && out.len() == 4 {
             g.regs[addr as usize + 1] &= !1; // MAC enable handshake completes.
+            if g.regs[addr as usize + 1] & 2 != 0
+                && !g.mac_off_stalled
+                && g.regs[0x1f] == 0
+                && g.regs[0x23] & 16 != 0
+                && g.regs[REG_SYS_FUNC as usize + 1] & 4 == 0
+            {
+                // The real power-FSM terminal, not an MCU reset or host epoch,
+                // invalidates MAC/RX FIFO ownership before cold reinitialization.
+                g.regs[addr as usize + 1] &= !2;
+                g.cold_generation += 1;
+                g.rf.fill(0);
+                for page in &mut g.pages {
+                    page.clear();
+                }
+                g.regs[0x284..0x288].fill(0);
+            }
         }
         if addr == REG_MCU_FW_DL && g.regs[addr as usize] & MCU_FW_DL_ENABLE == 0 {
             if g.checksum && g.pages.iter().any(|page| !page.is_empty()) {
@@ -208,6 +257,36 @@ impl ControlIo for Fake {
     }
 
     async fn write(&self, addr: u16, bytes: &[u8]) -> Result<usize, UsbError> {
+        let delayed = {
+            let mut g = self.0.lock();
+            if g.delayed_write == Some(addr) {
+                if g.active_td {
+                    g.unsafe_reuses += 1;
+                }
+                g.ops.push(Op::Write(addr, bytes.to_vec()));
+                g.writes += 1;
+                g.active_td = true;
+                true
+            } else {
+                false
+            }
+        };
+        if delayed {
+            return core::future::poll_fn(|cx| {
+                let mut g = self.0.lock();
+                if !g.delayed_complete {
+                    g.delayed_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                g.active_td = false;
+                g.delayed_write = None;
+                g.delayed_complete = false;
+                g.delayed_waker = None;
+                g.register_write(addr, bytes);
+                Poll::Ready(Ok(bytes.len()))
+            })
+            .await;
+        }
         let outcome = {
             let mut g = self.0.lock();
             if g.active_td {
@@ -249,21 +328,7 @@ impl ControlIo for Fake {
                     Some(Ok(bytes.len()))
                 }
             } else {
-                let previous_hssi = u32::from_le_bytes(g.regs[0x824..0x828].try_into().unwrap());
-                g.regs[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
-                if addr == 0x840 && bytes.len() == 4 {
-                    let v = u32::from_le_bytes(bytes.try_into().unwrap());
-                    g.rf[(v >> 20) as usize] = v & 0xfffff;
-                }
-                if addr == 0x824 && bytes.len() == 4 {
-                    let v = u32::from_le_bytes(bytes.try_into().unwrap());
-                    if v & 0x80000000 != 0 && previous_hssi & 0x80000000 == 0 {
-                        g.rf_read = ((v >> 23) & 0xff) as u8;
-                    }
-                }
-                if addr == REG_MCU_FW_DL && bytes[0] & MCU_FW_DL_CSUM_REPORT != 0 {
-                    g.regs[addr as usize] &= !MCU_FW_DL_CSUM_REPORT; // W1C.
-                }
+                g.register_write(addr, bytes);
                 Some(Ok(bytes.len()))
             }
         };
@@ -375,9 +440,22 @@ fn smoke_rtl8xxxu_live_firmware_header_preflight() -> TestResult {
             return TestResult::Fail("invalid RTL8188EU firmware touched USB or did not fail");
         }
     }
+    // RTL8192EU has its own owner path but must refuse an 88E-signed image.
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8192eu);
+    if narf_scheduler::block_on(owner.initialize(&valid)) != Err(Error::InvalidImage)
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("RTL8192EU owner accepted an RTL8188EU image");
+    }
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8723bu);
+    if narf_scheduler::block_on(owner.initialize(&valid)) != Err(Error::InvalidImage)
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("RTL8723BU owner accepted an RTL8188EU image");
+    }
     for chip in [
-        ChipFamily::Rtl8192eu,
-        ChipFamily::Rtl8723bu,
         ChipFamily::Rtl8821cu,
         ChipFamily::Rtl8822bu,
         ChipFamily::Unknown,

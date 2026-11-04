@@ -212,11 +212,15 @@ fn smoke_rtw88_unready_control_plane_fails_closed() -> TestResult {
         mac: [0x00, 0xE0, 0x4C, 0x68, 0x12, 0x34],
         firmware: None,
         sibling: None,
+        b22: None,
         interface: None,
         device_id: RTL_DEV_8822CE,
         link_up: core::sync::atomic::AtomicBool::new(false),
         rx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
         tx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
+        diagnostic_name: "rtw88-unready-fixture",
+        provisioning: narf_lib::mutex::Mutex::new(()),
+        reset_origin: None,
     };
     let request = AssociateRequest {
         bssid: [0x02, 0, 0, 0, 0, 1],

@@ -6,9 +6,34 @@ use alloc::vec::Vec;
 use alloc::{format, string::String};
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
-use narf_wireless::reg::{RegFlags, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 
 pub(super) const LENGTH: usize = 128;
+/// A measured calibration envelope that encloses each native operation in
+/// its capability and current policy (C21 `N21Q`, B22 `N2BQ`).
+pub(super) trait Enclosure: Sync {
+    fn invoke<T, F, Op>(
+        &self,
+        policy: &F,
+        operation: Op,
+    ) -> Result<T, super::firmware_transport::Error>
+    where
+        F: Fn() -> Result<RegulatoryDomain, super::firmware_transport::Error>,
+        Op: FnOnce() -> Result<T, super::firmware_transport::Error>;
+}
+impl Enclosure for Envelope {
+    fn invoke<T, F, Op>(
+        &self,
+        policy: &F,
+        operation: Op,
+    ) -> Result<T, super::firmware_transport::Error>
+    where
+        F: Fn() -> Result<RegulatoryDomain, super::firmware_transport::Error>,
+        Op: FnOnce() -> Result<T, super::firmware_transport::Error>,
+    {
+        Envelope::invoke(self, policy, operation)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Firmware(FirmwareError),
@@ -27,6 +52,8 @@ pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Host identity keying this board's records (`phy8821c::Host`).
+    pub host: phy8821c::Host,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Board {
@@ -34,6 +61,13 @@ pub(super) struct Board {
     mac: [u8; 6],
     thermal: u8,
     hardware: Features,
+    /// Cross-band `rtw8821c_set_channel` facts (`ch_param` CCK filters,
+    /// `rfe_btg`, raw factory swing bytes); covered by the identity through
+    /// the factory map and the hashed filters.
+    band: super::radio8821c::BandFacts,
+    /// `phy8821c::Info::interface`'s host: PCI 0x10ec:0xc821 or the claimed
+    /// RTL8821CU VID/PID. Covered by the identity (USB binds it).
+    host: phy8821c::Host,
 }
 impl Board {
     pub(super) fn new(
@@ -76,12 +110,21 @@ impl Board {
             hash.update(&value.to_le_bytes());
         }
         phy8821c::bind_tables(&mut hash, phy).map_err(|_| Error::Identity)?;
+        let host = phy.interface.host();
+        host.bind(&mut hash);
         super::radio8821c::bind_recipe(&mut hash);
         Ok(Self {
             identity: hash.finalize(),
             mac: factory.mac(),
             thermal: factory.thermal(),
             hardware,
+            band: super::radio8821c::BandFacts {
+                filters: phy.channel_filters,
+                btg: matches!(phy.rfe, 2 | 4),
+                swing_2g: factory.swing_2g(),
+                swing_5g: factory.swing_5g(),
+            },
+            host,
         })
     }
     pub(super) fn request(self) -> Request {
@@ -90,9 +133,16 @@ impl Board {
             identity: self.identity,
             mac: m,
             filename: format!(
-                "rtw88/rtw8821ce-iqk-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                m[0], m[1], m[2], m[3], m[4], m[5]
+                "rtw88/{}-iqk-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                self.host.family(),
+                m[0],
+                m[1],
+                m[2],
+                m[3],
+                m[4],
+                m[5]
             ),
+            host: self.host,
         }
     }
 }
@@ -164,6 +214,12 @@ impl Envelope {
     pub(super) fn hardware(&self) -> Features {
         self.board.hardware
     }
+    pub(super) fn band_facts(&self) -> super::radio8821c::BandFacts {
+        self.board.band
+    }
+    pub(super) fn host(&self) -> phy8821c::Host {
+        self.board.host
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,
@@ -177,8 +233,7 @@ impl Envelope {
             || half(raw, 4) != 1
             || half(raw, 6) != 128
             || u32::from_le_bytes(raw[8..12].try_into().unwrap()) != 128
-            || half(raw, 12) != 0x10ec
-            || half(raw, 14) != 0xc821
+            || raw[12..16] != board.host.header()
             || raw[54] != 1
             || raw[55] != 20
             || &raw[64..66] != b"US"
@@ -215,14 +270,11 @@ impl Envelope {
         }
         let mut covering = false;
         let mut limit = self.qualified.min(80);
-        for rule in &domain.rules {
+        for (i, rule) in domain.rules.iter().enumerate() {
             if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
                 continue;
             }
-            if rule.freq_start_mhz >= rule.freq_end_mhz
-                || rule.max_bandwidth_mhz < 20
-                || rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
-            {
+            if !super::channel_policy::plain_rule(domain, i, 20) {
                 return Err(Error::Policy);
             }
             covering |= rule.freq_start_mhz <= 2402 && rule.freq_end_mhz >= 2422;

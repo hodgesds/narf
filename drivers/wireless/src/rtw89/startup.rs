@@ -62,8 +62,21 @@ pub struct Startup {
     coex: super::coex_native::Coex,
     rfk: super::rfk::Rfk,
     full_radio: super::radio_full::Radio,
+    /// RTL8852C radio owner (`radio_c`), the C counterpart of `rfk` +
+    /// `full_radio`; unused on B.
+    radio_c: super::radio_c::Radio,
+    /// RTL8851B radio owner (`radio_51`); unused on B and C.
+    radio_51: super::radio_51::Radio,
     station_controller: Option<super::station_control::Controller>,
     station_binding: Option<[u8; 6]>,
+    /// AP-role control owner (`startup_ap.rs`); exclusive with the station.
+    ap_controller: Option<super::ap_control::ApController>,
+    sleep: Option<runtime_sleep::Runtime>,
+    monitor: Option<super::monitor::Controller>,
+    /// Running WoW image state (`startup_wow.rs`).
+    wow: Option<wow::Window>,
+    /// Wake inputs while the WoW image owns the radio.
+    wow_armed: Option<wow::Armed>,
     pub(super) lifecycle: super::radio_policy::Lifecycle,
 }
 impl core::fmt::Debug for Startup {
@@ -134,8 +147,15 @@ impl Startup {
             coex: super::coex_native::Coex::default(),
             rfk: super::rfk::Rfk::default(),
             full_radio: super::radio_full::Radio::default(),
+            radio_c: super::radio_c::Radio::default(),
+            radio_51: super::radio_51::Radio::default(),
             station_controller: None,
             station_binding: None,
+            ap_controller: None,
+            sleep: None,
+            monitor: None,
+            wow: None,
+            wow_armed: None,
             lifecycle: super::radio_policy::Lifecycle::Initial,
         })
     }
@@ -206,6 +226,128 @@ impl Startup {
         attempt.committed = result.is_ok();
         result
     }
+    /// RTL8852C radio bring-up for one typed `profile` after the C tables:
+    /// the pure `Native::preflight_radio_c` (C calibration `N5CB` v1, base
+    /// `N5CB` v2 and `N5CC` records; a missing record is retryable and
+    /// touches nothing), then `Native::prepare_radio_c` (phy.c
+    /// `rtw89_phy_dm_init` controls and DM sub-inits, `rtw8852c_rfk_init`,
+    /// power trim, cfg_txrx_path, `__rtw89_set_channel`,
+    /// `rtw8852c_rfk_channel`, RF_GET_MCCCH V0) admitted only when the
+    /// staged records admit exactly `profile`. Any failure after the
+    /// preflight terminalizes this owner. Success is `RadioReady` with no
+    /// ordinary grant (station admission stays B-only).
+    pub(super) async fn prepare_radio_c(
+        &mut self,
+        profile: super::operating_channel_c::Profile,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::RadioTablesLoaded
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852C)
+        {
+            return Err(Error::Terminal);
+        }
+        let firmware = self.firmware.as_mut().ok_or(Error::Terminal)?;
+        if firmware.phase() != firmware_boot::Phase::Running {
+            return Err(Error::Terminal);
+        }
+        let preflight = firmware
+            .transport_mut()
+            .preflight_radio_c(self.assets.as_ref().ok_or(Error::Terminal)?)
+            .map_err(Error::Register)?;
+        self.phase = Phase::FullRadioPreparing;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = attempt.owner_mut();
+            let firmware = owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            let assets = owner.assets.as_ref().ok_or(Error::Terminal)?;
+            // SAFETY: same retained actual cold/firmware/MAC/RX/table owner;
+            // the outer guard terminalizes Native and retains DMA on failure.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_radio_c(
+                        &mut owner.radio_c,
+                        &owner.radio,
+                        assets,
+                        &mut owner.coex,
+                        profile,
+                        preflight,
+                    )
+                    .await
+            }
+            .map_err(Error::Register)?;
+            owner.phase = Phase::RadioReady;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    /// RTL8851B radio bring-up for one typed `profile` after the RTL8851B
+    /// tables: the pure `Native::preflight_radio_51` (`N51B` v1
+    /// calibration, `N51B` v2 base and `N51C` records; a missing record is
+    /// retryable and touches nothing), then `Native::prepare_radio_51`
+    /// (WLAN-only coex init, phy.c `rtw89_phy_dm_init` with
+    /// `rtw8851b_bb_sethw`, `rtw8851b_rfk_init`, power trim, cfg_txrx_path,
+    /// `__rtw89_set_channel`, `rtw8851b_rfk_channel`) admitted only when the
+    /// staged records admit exactly `profile`. Any failure after the
+    /// preflight terminalizes this owner. Success is `RadioReady` with no
+    /// ordinary grant.
+    pub(super) async fn prepare_radio_51(
+        &mut self,
+        profile: super::operating_channel::Profile,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::RadioTablesLoaded
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8851B)
+        {
+            return Err(Error::Terminal);
+        }
+        let firmware = self.firmware.as_mut().ok_or(Error::Terminal)?;
+        if firmware.phase() != firmware_boot::Phase::Running {
+            return Err(Error::Terminal);
+        }
+        let preflight = firmware
+            .transport_mut()
+            .preflight_radio_51(self.assets.as_ref().ok_or(Error::Terminal)?)
+            .map_err(Error::Register)?;
+        self.phase = Phase::FullRadioPreparing;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = attempt.owner_mut();
+            let firmware = owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            let assets = owner.assets.as_ref().ok_or(Error::Terminal)?;
+            // SAFETY: same retained actual cold/firmware/MAC/RX/table owner;
+            // the outer guard terminalizes Native and retains DMA on failure.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_radio_51(
+                        &mut owner.radio_51,
+                        &owner.radio,
+                        assets,
+                        &mut owner.coex,
+                        profile,
+                        preflight,
+                    )
+                    .await
+            }
+            .map_err(Error::Register)?;
+            owner.phase = Phase::RadioReady;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
     /// Full channel/calibration/power preparation consumes the pure measured
     /// v2 preflight only after all exact external assets and policy are current.
     pub async fn prepare_full_radio(&mut self) -> Result<(), Error> {
@@ -249,6 +391,242 @@ impl Startup {
         }
         .await;
         attempt.committed = result.is_ok();
+        result
+    }
+    /// Retune the Ready radio to one signed-admitted 2.4GHz/20MHz primary
+    /// (`Native::retune_full_radio`). A refusal that withheld nothing (the
+    /// ordinary grant is still installed) is retryable; any failure after the
+    /// grant was withheld terminalizes this owner like the initial program.
+    /// `linked` retunes the associated station in place (channel switch);
+    /// it requires the retained station controller.
+    pub(super) async fn retune_channel(
+        &mut self,
+        primary: u8,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || (linked && self.station_controller.is_none())
+        {
+            return Err(power::Error::Terminal);
+        }
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C)
+        {
+            // RTL8852C: the 20MHz profile of `primary` (2.4GHz 1..=13 or a
+            // 5GHz primary); wide C profiles go through `retune_channel_c`.
+            let band = if primary <= 14 {
+                super::operating_channel_c::Band::Ghz2
+            } else {
+                super::operating_channel_c::Band::Ghz5
+            };
+            let profile = super::operating_channel_c::Profile::new20(band, primary)
+                .ok_or(power::Error::Unsupported)?;
+            return self.retune_channel_c(profile, None, linked).await;
+        }
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8851B)
+        {
+            // RTL8851B: the 20MHz profile of `primary`; wide profiles go
+            // through `retune_channel_51` from `retune_wide`.
+            let profile = super::operating_channel::Profile::from_primary(primary)
+                .ok_or(power::Error::Unsupported)?;
+            return self.retune_channel_51(profile, linked).await;
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: the same retained Startup prepared `full_radio` with these
+            // exact tables/basic RFK/assets; the Attempt terminalizes on loss.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_full_radio(
+                        &mut owner.full_radio,
+                        &owner.radio,
+                        &owner.rfk,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        primary,
+                        linked,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
+        result
+    }
+    /// RTL8852B retune of the Ready unassociated radio to one signed-admitted
+    /// 40/80MHz `profile` (`Native::retune_full_radio_to`), with
+    /// `retune_channel`'s retry/terminal split. RTL8852C takes the same
+    /// chandef as its typed profile through `retune_channel_c`.
+    pub(super) async fn retune_wide(
+        &mut self,
+        profile: super::operating_channel::Profile,
+    ) -> Result<u32, power::Error> {
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8852C)
+        {
+            // The same chandef as the C typed profile (unassociated retune).
+            let c = super::command_native::c_profile(profile).ok_or(power::Error::Unsupported)?;
+            return self.retune_channel_c(c, None, false).await;
+        }
+        if self
+            .identity
+            .is_some_and(|identity| identity.chip() == super::mac::ChipId::Rtl8851B)
+        {
+            return self.retune_channel_51(profile, false).await;
+        }
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852B)
+        {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: as `retune_channel`.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_full_radio_to(
+                        &mut owner.full_radio,
+                        &owner.radio,
+                        &owner.rfk,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        profile,
+                        false,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
+        result
+    }
+    /// RTL8852C retune of the Ready radio to one signed-admitted typed
+    /// `profile` (`Native::retune_radio_c`), with `retune_channel`'s
+    /// retry/terminal split: a refusal that withheld nothing (the C ordinary
+    /// grant is still installed) leaves this owner usable.
+    pub(super) async fn retune_channel_c(
+        &mut self,
+        profile: super::operating_channel_c::Profile,
+        six: Option<(super::radio_power_c::SixGhzPower, Option<i8>)>,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || (linked && self.station_controller.is_none())
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8852C)
+        {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: the same retained Startup prepared `radio_c` with these
+            // exact C tables/assets; the Attempt terminalizes on loss.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_radio_c(
+                        &mut owner.radio_c,
+                        &owner.radio,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        profile,
+                        six,
+                        linked,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
+        result
+    }
+    /// RTL8851B retune of the Ready radio to one signed-admitted typed
+    /// `profile` (`Native::retune_radio_51`), with `retune_channel`'s
+    /// retry/terminal split: a refusal that withheld nothing (the RTL8851B
+    /// ordinary grant is still installed) leaves this owner usable.
+    pub(super) async fn retune_channel_51(
+        &mut self,
+        profile: super::operating_channel::Profile,
+        linked: bool,
+    ) -> Result<u32, power::Error> {
+        if self.phase != Phase::RadioReady
+            || self.monitor.is_some()
+            || (linked && self.station_controller.is_none())
+            || self
+                .identity
+                .is_none_or(|identity| identity.chip() != super::mac::ChipId::Rtl8851B)
+        {
+            return Err(power::Error::Terminal);
+        }
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let owner = &mut *attempt.owner;
+            let firmware = owner.firmware.as_mut().ok_or(power::Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(power::Error::Terminal);
+            }
+            // SAFETY: the same retained Startup prepared `radio_51` with
+            // these exact RTL8851B tables/assets; the Attempt terminalizes
+            // on loss.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .retune_radio_51(
+                        &mut owner.radio_51,
+                        &owner.radio,
+                        owner.assets.as_ref().ok_or(power::Error::Terminal)?,
+                        profile,
+                        linked,
+                    )
+                    .await
+            }
+        }
+        .await;
+        attempt.committed = result.is_ok()
+            || attempt
+                .owner
+                .firmware
+                .as_ref()
+                .is_some_and(|firmware| firmware.transport().operating_channel().is_some());
         result
     }
     pub async fn prepare_radio_tables(&mut self) -> Result<(), Error> {
@@ -337,7 +715,7 @@ impl Startup {
         }
         result
     }
-    /// Complete B's post-WCPU MAC0/SCC setup on the same actual backend.
+    /// Complete B's or C's post-WCPU MAC0/SCC setup on the same actual backend.
     /// MAC preparation is not RF/channel, packet, IRQ or station readiness.
     pub async fn prepare_mac(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Running {
@@ -412,11 +790,19 @@ impl Startup {
         }
         let identity = self.identity.ok_or(Error::Terminal)?;
         // Selection follows ECV-corrected physical cut and actual secure fuses.
-        // A/51 programmed secure boot still requires authenticated host board
-        // blacklist policy; no all-clear default is created for those chips.
+        // RTL8852A programmed secure boot still requires authenticated host
+        // board blacklist policy. RTL8851B takes Linux's exact NULL
+        // `fw_blacklist` policy (signature selection only; secure.rs).
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
-        let assets = if identity.chip() == super::mac::ChipId::Rtl8852B {
+        // radio_assets admits the RTL8852B, RTL8852C and RTL8851B element
+        // layouts.
+        let assets = if matches!(
+            identity.chip(),
+            super::mac::ChipId::Rtl8852B
+                | super::mac::ChipId::Rtl8852C
+                | super::mac::ChipId::Rtl8851B
+        ) {
             Some(super::radio_assets::Assets::from_prepared(&image).map_err(Error::Assets)?)
         } else {
             None
@@ -470,8 +856,14 @@ impl Drop for Startup {
         self.fail();
     }
 }
+#[path = "startup_ap.rs"]
+mod ap;
+#[path = "startup_lps.rs"]
+mod runtime_sleep;
 #[path = "startup_station.rs"]
 mod station;
+#[path = "startup_wow.rs"]
+mod wow;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
@@ -530,3 +922,6 @@ mod tests {
         smoke_rtw89_cold_claim_revocation_precedes_unmapped_pci_and_dma
     );
 }
+
+#[path = "startup_monitor.rs"]
+mod monitor;

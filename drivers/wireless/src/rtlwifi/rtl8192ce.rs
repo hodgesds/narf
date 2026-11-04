@@ -10,8 +10,91 @@
 //! - `rtlwifi/rtl8192ce/reg.h`  — register offsets
 //! - `rtlwifi/rtl8192ce/def.h`  — chip-version and rate constants
 //! - `rtlwifi/rtl8192de/reg.h`  — minor offset additions (mostly identical)
+//!
+//! ## Retained runtime (`rtl8192ce/`)
+//!
+//! Exact Linux `rtl8192ce` + `rtl8192c` (common) pieces the retained
+//! RTL8192CE / RTL8188CE owner is built from. Probe retains an admissible
+//! `rtl92ce_pci_ids` function (qualified RF_1T1R / RF_2T2R version,
+//! provisioned map, no BT coexistence, TX power decodes) and admits it
+//! under its signed `N92C` envelope (`prepare_native::prepare_rtl8192ce`);
+//! the HT20/40 station is in [`ht`].
+//!
+//! - [`version`] — `_rtl92ce_read_chip_version`, the `fw_common.h` version
+//!   predicates, RF-type qualification (1T1R `CHIP_88C`, 2T2R `CHIP_92C`;
+//!   1T2R bonding, test chips and unknown cuts refused) and the
+//!   `rtl92c_init_sw_vars` firmware-name selection.
+//! - [`adapter`] — `rtl92ce_read_eeprom_info` / `_rtl92ce_read_adapter_info`
+//!   factory facts, BT-coexist EFUSE fields and the OEM rule.
+//! - [`power`] — the `_rtl92ce_init_mac` power-on prefix (no pwrseq table).
+//! - [`fw`] — `rtl8192cfw*.bin` header validation and `rtl92c_download_fw`
+//!   (normal-chip paged write, `_rtl92c_fw_free_to_go`,
+//!   `rtl92c_firmware_selfreset`).
+//! - [`trx`] — 64-byte linked TX ring entries (40-byte descriptor, next link
+//!   at dword 10) and 32-byte RX descriptors (`trx.{c,h}`); the ring owner
+//!   is `prepare::Chip::Rtl8192ce`.
+//! - [`tables`] — verbatim `table.c` MAC / PHY_REG (1T, 2T) / PHY_REG_PG /
+//!   AGC (1T, 2T) / RADIOA / RADIOB arrays (generated).
+//! - [`llt`] — `_rtl92ce_llt_table_init` (`LLT_CONFIG == 5`).
+//! - [`mac`] — the `_rtl92ce_init_mac` remainder, `_rtl92ce_hw_configure`
+//!   and the station address, with `REG_CR` and ring bases left to the
+//!   packet owner.
+//! - [`phy`] — BB/RF serial access, `rtl92c_phy_mac/bb/rf_config` over the
+//!   tables, UMC-cut RF fixups, 20/40 MHz bandwidth, `RF_CHNLBW` channel
+//!   step, `_rtl92ce_phy_lc_calibrate` and the RF path switch.
+//! - [`txpower`] — `_rtl92ce_read_txpower_info_from_hwpg` and the RF6052
+//!   CCK/OFDM TXAGC writes of `rtl92c_phy_set_txpower_level`.
+//! - [`iqk`] — `rtl92c_phy_iq_calibrate` for 1T1R and 2T2R.
+//! - [`channel`] — the `rtl_op_config` channel + bandwidth order.
+//! - [`h2c`] — `rtl92c_fill_h2c_cmd`, SETPWRMODE / JOINBSSRPT / RA-mask
+//!   payloads, RPWM and the 92C interrupt profile.
+//! - [`init`] — the `rtl92ce_hw_init` tail after the firmware download
+//!   (run by `Prepared::configure_rtl8192ce`).
+//! - [`ps`] — media status, AID, beacon control, `rtl92c_dm_rf_saving`,
+//!   false-alarm statistics and `_rtl92ce_poweroff_adapter`, composed by the
+//!   linked-ring packet owner branch (`rtl8192ce/packet_owner.rs`, mounted
+//!   as `prepare::packet::ce92`).
 
 #![allow(dead_code)]
+
+pub mod adapter;
+pub mod channel;
+pub mod envelope;
+pub mod fw;
+pub mod h2c;
+pub mod ht;
+pub mod init;
+pub mod iqk;
+pub mod llt;
+pub mod mac;
+pub mod phy;
+pub mod power;
+pub mod ps;
+pub mod station;
+pub mod tables;
+pub mod trx;
+pub mod txpower;
+pub mod version;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod phy_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod ps_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
+
+/// Further `rtl92ce_pci_ids` entries (`rtl8192ce/sw.c`) beside the two
+/// `regs.rs` IDs.
+pub const DEV_ID_8192CE_8177: u16 = super::regs::RTL_DEV_8192CE_8177;
+pub const DEV_ID_8192CE_8191: u16 = super::regs::RTL_DEV_8192CE_8191;
+
+/// Whether `did` is one of the `rtl92ce_pci_ids` (RTL8192CE / RTL8188CE).
+pub const fn is_8192ce(did: u16) -> bool {
+    matches!(
+        did,
+        DEV_ID_8192CE | DEV_ID_8192CE_ALT | DEV_ID_8192CE_8177 | DEV_ID_8192CE_8191
+    )
+}
 
 /// Primary PCI device ID for RTL8192CE.
 pub const DEV_ID_8192CE: u16 = super::regs::RTL_DEV_8192CE;

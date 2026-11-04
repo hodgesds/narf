@@ -1115,6 +1115,23 @@
       ]
     },
     {
+      "id": "rtl8822be",
+      "family": "rtw88",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw88/rtw8822b_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "RTL8822BE loads the authenticated rtw8822b_fw.bin into its retained native B22 owner; station operation additionally requires its own signed measured B22 (N2B*) board records named by the request APIs. RTL8822CE/RTL8821CE artifacts cannot substitute for this chip.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
       "id": "rtw8852a",
       "family": "rtw89",
       "assets": [

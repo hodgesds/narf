@@ -988,24 +988,44 @@ fn smoke_lifecycle_loading_to_live() -> TestResult {
 }
 kernel_test_in!("modules/lifecycle", smoke_lifecycle_loading_to_live);
 
+static EXIT_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+extern "C" fn record_exit_owner() {
+    EXIT_OWNER.store(
+        crate::symbols::current_execution_id().0,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 fn smoke_lifecycle_rmmod_clean_unload() -> TestResult {
     crate::registry::__reset_for_test();
     crate::symbols::__reset_for_test();
     crate::domain::__reset_for_test();
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xBEEF);
-    let m = arc_test_module("lc_unload", 0xBEEF);
+    let mut m = arc_test_module("lc_unload", 0xBEEF);
+    Arc::get_mut(&mut m).unwrap().exit_addr = Some(record_exit_owner as usize);
     // SAFETY: freshly built module in state `Loading` with `init_addr` =
     // `noop_init` (a real `extern "C"` fn), satisfying `invoke_init`.
     // SAFETY: Valid memory or trusted environment
     unsafe { crate::loader::invoke_init(&m) }.expect("init");
     // SAFETY: the module is now `Live` (init succeeded above) with refcount
-    // zero, and `exit_addr` = `noop_exit` (a real `extern "C"` fn), so
+    // zero, and `exit_addr` is a real `extern "C"` owner-recording callback, so
     // `invoke_exit`'s Live-state contract is met.
     // SAFETY: Valid memory or trusted environment
+    EXIT_OWNER.store(0, core::sync::atomic::Ordering::Release);
+    let enclosing = crate::symbols::ModuleId(0xffff_ffff_7311);
+    let previous = crate::symbols::swap_execution_context(enclosing);
+    // SAFETY: same real exit callback and Live/zero-refcount contract above.
     let r = unsafe { crate::loader::invoke_exit(&m) };
+    let restored = crate::symbols::current_execution_id();
+    crate::symbols::swap_execution_context(previous);
     if r.is_err() {
         return TestResult::Fail("invoke_exit failed");
+    }
+    if EXIT_OWNER.load(core::sync::atomic::Ordering::Acquire) != m.id.0 || restored != enclosing {
+        return TestResult::Fail(
+            "module exit cleanup used a foreign owner or failed to restore enclosing owner",
+        );
     }
     let state = *m.state.lock();
     if state == ModuleState::Dead {

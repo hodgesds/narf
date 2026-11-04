@@ -21,6 +21,9 @@ use narf_memory::PhysAddr;
 use crate::device::{BusDevice, BusKind};
 use crate::registry::BusDeviceCap;
 
+#[path = "pci_pme.rs"]
+pub mod pme;
+
 /// Cfg-space offset of the type-0 / type-1 Command register (PCIe spec
 /// §7.5.1.1.3).
 pub const COMMAND_OFFSET: u64 = 0x04;

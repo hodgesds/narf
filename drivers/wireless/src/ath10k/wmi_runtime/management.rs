@@ -84,6 +84,12 @@ pub(super) fn validate(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Result<(),
         // 2-byte transaction id; mac80211 ieee80211_process_sa_query_req).
         0xa0 | 0xc0 if protected && frame.len() == 24 + 8 + 2 + 8 => Ok(()),
         0xd0 if protected && frame.len() == 24 + 8 + 4 + 8 => Ok(()),
+        // Public Action 20/40 BSS Coexistence is non-robust (Linux
+        // ieee80211_is_robust_mgmt_frame); never CCMP-wrap or accept arbitrary
+        // public-action payloads through the initial management transport.
+        0xd0 if !protected && frame.get(24..26) == Some(&[4, 0]) => {
+            super::coexistence::validate_report(&frame[26..])
+        }
         // Association Request fixed capability/listen interval followed by IEs.
         0 if frame.len() >= 28 => {
             let mut ies = &frame[28..];
@@ -118,14 +124,19 @@ pub(super) fn validate(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Result<(),
         _ => Err(Error::Unsupported),
     }
 }
-pub(super) fn inline(command: u32, frame: &[u8]) -> Result<Vec<u8>, Error> {
+/// `wmi.c::ath10k_wmi_op_gen_mgmt_tx`: `hdr.vdev_id` is the sending
+/// interface's `arvif->vdev_id`.
+pub(super) fn inline(command: u32, vdev: u8, frame: &[u8]) -> Result<Vec<u8>, Error> {
     let mut out = wire::packet(command, 24 + frame.len().div_ceil(4) * 4)?;
+    wire::put(&mut out, 4, u32::from(vdev));
     out[8..14].copy_from_slice(&frame[4..10]); // padded wmi_mac_addr after vdev0.
     wire::put(&mut out, 24, frame.len() as u32);
     out[28..28 + frame.len()].copy_from_slice(frame);
     Ok(out)
 }
-pub(super) fn reference(id: u32, address: u64, frame: &[u8]) -> Result<Vec<u8>, Error> {
+/// `wmi-tlv.c::ath10k_wmi_tlv_op_gen_mgmt_tx_send`: `vdev_id` is the
+/// sending interface's `arvif->vdev_id`.
+pub(super) fn reference(vdev: u8, id: u32, address: u64, frame: &[u8]) -> Result<Vec<u8>, Error> {
     if address == 0
         || address
             .checked_add(frame.len() as u64)
@@ -136,6 +147,7 @@ pub(super) fn reference(id: u32, address: u64, frame: &[u8]) -> Result<Vec<u8>, 
     let prefix = frame.len().min(64).div_ceil(4) * 4;
     let mut out = wire::packet(0x7008, 36 + prefix)?;
     wire::put(&mut out, 4, (422 << 16) | 28);
+    wire::put(&mut out, 8, u32::from(vdev));
     wire::put(&mut out, 12, id);
     wire::put(&mut out, 20, address as u32);
     wire::put(&mut out, 24, (address >> 32) as u32);

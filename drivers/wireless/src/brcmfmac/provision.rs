@@ -15,6 +15,8 @@ const MAX_RECORDS: usize = 16;
 pub enum Family {
     Pcie43602,
     Sdio43439,
+    /// NBSP family 3: another `chip_profile` PCIe chip (CR4 or CA7).
+    PcieFullmac,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -90,6 +92,11 @@ pub struct Selection {
     card_vendor: u16,
     card_device: u16,
     board: String,
+    /// Family 3 OTP chips: Linux's `settings->antenna_sku` (bytes 96..112);
+    /// `board` is then Linux's `settings->board_type`.
+    antenna_sku: Option<String>,
+    /// Family 3: the `brcmf_pcie_fwnames` base every revision selects.
+    base: Option<&'static str>,
     assets: Vec<Asset>,
     source: Option<Receipt>,
 }
@@ -108,6 +115,30 @@ impl Selection {
     }
     pub(crate) fn admits_chip(&self, chip: u16, revision: u8) -> bool {
         chip == self.chip && revision < 16 && self.revisions & (1 << revision) != 0
+    }
+    /// The OTP read at claim (`brcmf_pcie_read_otp`) against the record.
+    /// A chip Linux reads no OTP for needs none and a record without an
+    /// antenna SKU. An OTP chip needs a valid OTP, and the record's keys
+    /// must be Linux `board_types` (`brcmf_pcie_prepare_fw_request`'s Apple
+    /// selection) for that OTP: NVRAM one of `board_types[0..=3]` (each
+    /// carries the OTP module), the executable any of `[0..=5]` or plain.
+    pub(crate) fn admits_otp(
+        &self,
+        chip: u16,
+        otp: Option<&super::chip_profile::OtpParams>,
+    ) -> bool {
+        use super::chip_profile::{apple_board_types, asset_board, linux_reads_otp};
+        match (&self.antenna_sku, self.base, otp) {
+            (None, _, None) => !linux_reads_otp(chip),
+            (Some(sku), Some(base), Some(otp)) if linux_reads_otp(chip) => {
+                let types = apple_board_types(&self.board, otp, sku);
+                asset_board(base, &self.assets[1].key, "txt")
+                    .is_some_and(|b| types[..4].iter().any(|t| t == b))
+                    && asset_board(base, &self.assets[0].key, "bin")
+                        .is_none_or(|b| types.iter().any(|t| t == b))
+            }
+            _ => false,
+        }
     }
     pub fn load(&self) -> Result<Assets, Error> {
         self.load_using(&authority()?)
@@ -302,6 +333,10 @@ fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 fn string(bytes: &[u8], key: bool) -> Result<String, Error> {
+    string_with(bytes, key, false)
+}
+/// `comma`: Linux board types (`apple,<board>`) for family 3 OTP chips.
+fn string_with(bytes: &[u8], key: bool, comma: bool) -> Result<String, Error> {
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
@@ -312,6 +347,7 @@ fn string(bytes: &[u8], key: bool) -> Result<String, Error> {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'_' | b'-' | b'.')
                 || key && *byte == b'/'
+                || comma && *byte == b','
         })
     {
         return Err(Error::Invalid);
@@ -332,7 +368,7 @@ fn string(bytes: &[u8], key: bool) -> Result<String, Error> {
 fn executable_shape(family: Family, length: usize) -> Result<(), Error> {
     if length == 0
         || match family {
-            Family::Pcie43602 => length < 4,
+            Family::Pcie43602 | Family::PcieFullmac => length < 4,
             Family::Sdio43439 => length > crate::cyw43439::firmware::MAX_IMAGE_SIZE,
         }
     {
@@ -340,7 +376,7 @@ fn executable_shape(family: Family, length: usize) -> Result<(), Error> {
     }
     Ok(())
 }
-fn parse_asset(bytes: &[u8], role: u8) -> Result<Asset, Error> {
+fn parse_asset(bytes: &[u8], role: u8, comma: bool) -> Result<Asset, Error> {
     if bytes[0] != role || bytes[1] & !1 != 0 || half(bytes, 2) != 0 || role != 1 && bytes[1] != 1 {
         return Err(Error::Invalid);
     }
@@ -355,10 +391,30 @@ fn parse_asset(bytes: &[u8], role: u8) -> Result<Asset, Error> {
     Ok(Asset {
         role,
         signed: bytes[1] != 0,
-        key: string(&bytes[40..168], true)?,
+        key: string_with(&bytes[40..168], true, comma)?,
         length,
         sha256: bytes[8..40].try_into().unwrap(),
     })
+}
+/// Family 3 admission from the Linux tables: a covered chip, a PCI identity
+/// `brcmf_pcie_devid_table` binds with an implemented vendor (WCC/BCA,
+/// seeded or not), and one `brcmf_pcie_fwnames` row for every revision in the
+/// record's mask. Returns that row's firmware base name.
+fn fullmac_firmware(
+    chip: u16,
+    revisions: u16,
+    host: &narf_bus::DeviceId,
+) -> Result<&'static str, Error> {
+    let mut base = None;
+    for revision in (0..16u8).filter(|r| revisions & (1 << r) != 0) {
+        let (profile, _) =
+            super::chip_profile::admit(chip, revision, host).ok_or(Error::Invalid)?;
+        if base.is_some_and(|b| b != profile.firmware.base) {
+            return Err(Error::Invalid);
+        }
+        base = Some(profile.firmware.base);
+    }
+    base.ok_or(Error::Invalid)
 }
 fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
     if bytes.len() < HEADER
@@ -382,9 +438,17 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
         let (family, chip) = match raw[0] {
             1 => (Family::Pcie43602, 43602),
             2 => (Family::Sdio43439, 43439),
+            // BCM43602 keeps its own family; others name the actual chip.
+            3 if half(raw, 2) != 43602 => (Family::PcieFullmac, half(raw, 2)),
             _ => return Err(Error::Invalid),
         };
-        if half(raw, 2) != chip || half(raw, 4) == 0 || raw[7] != 0 || raw[96..112] != [0; 16] {
+        // Family 3 OTP chips carry the Linux antenna SKU in 96..112.
+        let otp = family == Family::PcieFullmac && super::chip_profile::linux_reads_otp(chip);
+        if half(raw, 2) != chip
+            || half(raw, 4) == 0
+            || raw[7] != 0
+            || !otp && raw[96..112] != [0; 16]
+        {
             return Err(Error::Invalid);
         }
         let address = u64::from_le_bytes(raw[8..16].try_into().unwrap());
@@ -423,6 +487,14 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
         {
             return Err(Error::Invalid);
         }
+        let firmware = if family == Family::PcieFullmac {
+            Some(fullmac_firmware(chip, half(raw, 4), &host.id)?)
+        } else {
+            None
+        };
+        if family == Family::PcieFullmac && (raw[1] != 0 || raw[28..32] != [0; 4]) {
+            return Err(Error::Invalid);
+        }
         if family == Family::Sdio43439
             && (raw[1] != 1
                 || !matches!(
@@ -440,11 +512,34 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
         }
         let mut assets = Vec::new();
         assets.try_reserve_exact(3).map_err(|_| Error::Memory)?;
-        assets.push(parse_asset(&raw[112..112 + ASSET], 1)?);
+        assets.push(parse_asset(&raw[112..112 + ASSET], 1, otp)?);
         executable_shape(family, assets[0].length)?;
-        assets.push(parse_asset(&raw[112 + ASSET..112 + 2 * ASSET], 2)?);
+        assets.push(parse_asset(&raw[112 + ASSET..112 + 2 * ASSET], 2, otp)?);
+        if let Some(base) = firmware {
+            if !super::chip_profile::linux_asset_name(base, &assets[0].key, "bin")
+                || !super::chip_profile::linux_asset_name(base, &assets[1].key, "txt")
+            {
+                return Err(Error::Invalid);
+            }
+        }
+        let board = string_with(&raw[32..96], false, otp)?;
+        let antenna_sku = if otp {
+            // Shape only; the OTP identity itself is checked at claim.
+            let base = firmware.ok_or(Error::Invalid)?;
+            let prefix = alloc::format!("{board}-");
+            let nvram = super::chip_profile::asset_board(base, &assets[1].key, "txt");
+            let executable = super::chip_profile::asset_board(base, &assets[0].key, "bin");
+            if !nvram.is_some_and(|b| b.starts_with(&prefix))
+                || executable.is_some_and(|b| b != board && !b.starts_with(&prefix))
+            {
+                return Err(Error::Invalid);
+            }
+            Some(string(&raw[96..112], false)?)
+        } else {
+            None
+        };
         if family == Family::Sdio43439 {
-            assets.push(parse_asset(&raw[112 + 2 * ASSET..], 3)?);
+            assets.push(parse_asset(&raw[112 + 2 * ASSET..], 3, false)?);
         } else if raw[112 + 2 * ASSET..].iter().any(|byte| *byte != 0) {
             return Err(Error::Invalid);
         }
@@ -472,7 +567,9 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
             function: raw[1],
             card_vendor: half(raw, 28),
             card_device: half(raw, 30),
-            board: string(&raw[32..96], false)?,
+            board,
+            antenna_sku,
+            base: firmware,
             assets,
             source: None,
         });

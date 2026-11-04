@@ -24,7 +24,8 @@
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
 //! 5. TX descriptor layout (BE queue) + RX descriptor layout.
-//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner.
+//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner,
+//!    and the RTL8821AE 2.4 GHz legacy station profile (no BT coexistence).
 //!    Other silicon profiles remain diagnostic.
 //!
 //! ## Deferred
@@ -51,6 +52,7 @@
 
 extern crate alloc;
 
+mod aspm;
 pub mod btcoex;
 pub mod channel;
 pub mod channel_power;
@@ -63,7 +65,17 @@ pub mod fw;
 pub mod h2c;
 mod ht;
 mod interface;
+mod power_runtime;
+mod probe_scan;
+pub use fallback::Request as RateFallbackRequest;
 pub use ht::Request as Ht20Request;
+pub use ht::Request as Ht40Request;
+mod antenna;
+pub use antenna::Request as AntennaDiversityRequest;
+mod tracking;
+pub use tracking::Request as ThermalTrackingRequest;
+mod protection;
+pub use protection::Request as ProtectionRequest;
 pub mod irq;
 pub mod mac;
 mod packet_mac;
@@ -78,6 +90,7 @@ pub mod regs;
 pub mod rf;
 pub mod rx;
 mod station_control;
+mod station_power;
 pub mod tx;
 pub mod vht;
 pub(crate) mod wmm;
@@ -85,10 +98,13 @@ pub(crate) mod wmm;
 pub mod rtl8188ee;
 pub mod rtl8192ce;
 pub mod rtl8192ee;
+pub mod rtl8723ae;
 pub mod rtl8723be;
 pub mod rtl8821ae;
 
+pub use interface::set_inactive_power_save;
 pub use interface::set_leisure_power_save;
+pub use interface::set_pcie_aspm;
 pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
 pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
 

@@ -8,6 +8,8 @@ use alloc::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use runtime::Memory;
+#[path = "descriptor_prefix_tests.rs"]
+mod descriptor_prefix_tests;
 const BASE: u32 = 0x180000;
 const SIZE: u32 = 0x40000;
 const ARM: u32 = 0x18002000;
@@ -25,10 +27,18 @@ struct Firmware {
     completion_write: u16,
     responses: VecDeque<(u32, u64)>,
     commands: Vec<(u32, Vec<u8>, u16)>,
+    /// `msg.ifidx` of each IOCTL request, parallel to `commands`.
+    command_ifidx: Vec<u8>,
     station: Option<station_model::Firmware>,
 }
 #[derive(Default)]
 struct State {
+    /// CA7 layout (`ca7_layout`): the bus sees the RAM image this far up.
+    relocate: u32,
+    ap_authority: Option<Rc<core::sync::atomic::AtomicBool>>,
+    ap_program_down_at_control_read: Option<narf_net::AdminHandle>,
+    ap_program_fail_index_once: bool,
+    ap_program_loss_at_control_read: Option<[u8; 6]>,
     registers: BTreeMap<u32, u32>,
     tcm: BTreeMap<u32, u8>,
     dma: BTreeMap<u64, Vec<u8>>,
@@ -46,6 +56,8 @@ struct State {
     unreleased_read: bool,
     unsafe_free: usize,
     firmware: Option<Firmware>,
+    prefixed_completions: [usize; 3],
+    prefixed_rx_offsets: [usize; 2],
     /// MSI binding offered by the platform model.
     msi: bool,
     armed: usize,
@@ -70,16 +82,39 @@ struct State {
     generation_base: usize,
     /// The function fell off the bus: every BAR read returns all-ones.
     gone: bool,
+    /// PCI PM capability `PME_Support` includes D3hot.
+    pme: bool,
+    /// Requester ID whose DMA goes through the real `narf_io::iommu`
+    /// block/restore API (and, in `PerDomain`, real IOVA-mapped buffers
+    /// in its default domain). `None` = backend without an IOMMU hook.
+    iommu: Option<narf_io::iommu::Bdf>,
+    /// `Bus::block_dma` calls and their outcomes, `Bus::restore_dma` calls.
+    blocks: Vec<Result<narf_io::iommu::DmaBlock, ()>>,
+    restores: usize,
+    /// Watchdog resets already issued at the first successful block.
+    watchdogs_at_block: Option<usize>,
+    /// Mappings released while the IOMMU still let the function translate.
+    freed_while_attached: usize,
 }
 pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
 pub(crate) struct Mem {
     state: Rc<IrqSafeSpinLock<State>>,
     address: u64,
     len: usize,
+    /// Real IOVA-mapped backing in `PerDomain`; its own drop (after this
+    /// `Mem`'s) runs the strict unmap -> invalidate -> wait -> free.
+    iommu: Option<(narf_io::iommu::Bdf, narf_io::DmaBuffer)>,
 }
 impl Drop for Mem {
     fn drop(&mut self) {
+        let attached = self.iommu.as_ref().is_some_and(|(bdf, _)| {
+            narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
+                && !narf_io::iommu::device_dma_blocked(*bdf)
+        });
         let mut state = self.state.lock();
+        if attached {
+            state.freed_while_attached += 1;
+        }
         state.dropped += 1;
         state.dropped_addresses.insert(self.address);
         if state.unreleased_read {
@@ -153,23 +188,47 @@ impl chip::Backplane for Model {
             && s.writes.iter().any(|&(a, v)| a == 0 && v == 0x11223344)
         {
             s.started = true;
-            put(&mut s, BASE + SIZE - 4, &SHARED.to_le_bytes());
+            let shared = SHARED + s.relocate;
+            put(&mut s, BASE + SIZE - 4, &shared.to_le_bytes());
         }
         Ok(())
     }
 }
 impl boot::Bus for Model {
     fn tcm_extent(&self) -> u32 {
-        BASE + SIZE
+        BASE + SIZE + self.0.lock().relocate
     }
     fn read_tcm(&mut self, at: u32, bytes: &mut [u8]) -> Result<(), boot::Error> {
-        let s = self.0.lock();
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = *s.tcm.get(&(at + i as u32)).unwrap_or(&0);
+        let at = self.tcm_at(at);
+        let down = {
+            let mut s = self.0.lock();
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = *s.tcm.get(&(at + i as u32)).unwrap_or(&0);
+            }
+            if at == H2DR {
+                if let Some(peer) = s.ap_program_loss_at_control_read.take() {
+                    s.firmware
+                        .as_mut()
+                        .unwrap()
+                        .station
+                        .as_mut()
+                        .unwrap()
+                        .ap_peer_loss(peer);
+                    firmware_step(&mut s);
+                }
+                s.ap_program_down_at_control_read.take()
+            } else {
+                None
+            }
+        };
+        // Actual admin retirement after setup, outside the model IRQ guard.
+        if let Some(admin) = down {
+            admin.set_link(false).map_err(|_| boot::Error::Access)?;
         }
         Ok(())
     }
     fn write_tcm(&mut self, at: u32, bytes: &[u8]) -> Result<(), boot::Error> {
+        let at = self.tcm_at(at);
         let mut s = self.0.lock();
         if (D2HR..D2HR + 12).contains(&at) && s.unreleased_read {
             return Err(boot::Error::State);
@@ -178,6 +237,11 @@ impl boot::Bus for Model {
             return Err(boot::Error::Access);
         }
         put(&mut s, at, bytes);
+        if at == H2DW && s.ap_program_fail_index_once {
+            s.ap_program_fail_index_once = false;
+            // The posted index may already be visible. No completion is made.
+            return Err(boot::Error::Access);
+        }
         if at == 0 && bytes.len() == 4 {
             s.writes
                 .push((0, u32::from_le_bytes(bytes.try_into().unwrap())));
@@ -190,11 +254,37 @@ impl boot::Bus for Model {
 }
 impl runtime::Bus for Model {
     type Memory = Mem;
+    fn ap_source(&self) -> Option<super::ap_source::Source> {
+        self.0
+            .lock()
+            .ap_authority
+            .clone()
+            .map(super::ap_source::Source::fixture)
+    }
     fn allocate(&mut self, len: usize) -> Result<Mem, runtime::Error> {
         let mut s = self.0.lock();
         if s.fail_allocate == Some(s.allocated) {
             return Err(runtime::Error::Access);
         }
+        let iommu = match s.iommu {
+            Some(bdf) if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain => {
+                if narf_io::iommu::device_dma_blocked(bdf) {
+                    return Err(runtime::Error::Access);
+                }
+                let domain =
+                    narf_io::iommu::default_domain(bdf).map_err(|_| runtime::Error::Access)?;
+                let dev = narf_io::DmaDevice::coherent().with_iommu_domain(domain);
+                let buffer = narf_io::alloc_coherent_for(
+                    &dev,
+                    len,
+                    narf_lib::id::DomainId::DRIVER_0,
+                    u64::from(u32::MAX),
+                )
+                .map_err(|_| runtime::Error::Exhausted)?;
+                Some((bdf, buffer))
+            }
+            _ => None,
+        };
         s.allocated += 1;
         let at = s.next;
         s.next += ((len + 4095) & !4095) as u64;
@@ -203,7 +293,34 @@ impl runtime::Bus for Model {
             state: self.0.clone(),
             address: at,
             len,
+            iommu,
         })
+    }
+    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, runtime::Error> {
+        let bdf = self.0.lock().iommu;
+        let Some(bdf) = bdf else {
+            return Ok(narf_io::iommu::DmaBlock::Untranslated);
+        };
+        let result = narf_io::iommu::block_device_dma(bdf);
+        let mut s = self.0.lock();
+        s.blocks.push(result.map_err(|_| ()));
+        if result.is_ok() && s.watchdogs_at_block.is_none() {
+            s.watchdogs_at_block = Some(s.watchdogs);
+        }
+        result.map_err(|_| runtime::Error::Access)
+    }
+    fn restore_dma(&mut self) -> Result<(), runtime::Error> {
+        let bdf = self.0.lock().iommu;
+        let Some(bdf) = bdf else {
+            return Ok(());
+        };
+        self.0.lock().restores += 1;
+        if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
+            && !narf_io::iommu::device_dma_blocked(bdf)
+        {
+            narf_io::iommu::default_domain(bdf).map_err(|_| runtime::Error::Access)?;
+        }
+        narf_io::iommu::restore_device_dma(bdf).map_err(|_| runtime::Error::Access)
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
         let mut s = self.0.lock();
@@ -259,6 +376,9 @@ impl runtime::Bus for Model {
         let mut s = self.0.lock();
         s.disarmed += 1;
         s.signal = None;
+    }
+    fn pme_d3hot(&mut self) -> bool {
+        self.0.lock().pme
     }
     fn link_control(&mut self) -> Result<u32, runtime::Error> {
         Ok(self.0.lock().lsc)
@@ -377,8 +497,9 @@ fn firmware_step(state: &mut State) {
                 let input_dma = u64::from_le_bytes(descriptor[24..32].try_into().unwrap());
                 let input = state.dma[&input_dma][..usize::from(input_len)].to_vec();
                 firmware.commands.push((command, input.clone(), output_len));
+                firmware.command_ifidx.push(descriptor[1]);
                 let response = if let Some(station) = firmware.station.as_mut() {
-                    station.command(command, &input, output_len)
+                    station.command_on(descriptor[1], command, &input, output_len)
                 } else {
                     match command {
                         1 => 2u32.to_le_bytes().to_vec(),
@@ -445,6 +566,43 @@ fn firmware_step(state: &mut State) {
         firmware.station = Some(station);
     }
     state.firmware = Some(firmware);
+}
+impl Model {
+    /// Bus TCM address to the model's internal (0x180000-based) address.
+    fn tcm_at(&self, at: u32) -> u32 {
+        let relocate = self.0.lock().relocate;
+        if relocate != 0 && at >= BASE + relocate {
+            at - relocate
+        } else {
+            at
+        }
+    }
+}
+/// The same model as a CA7 chip (`chip.c::brcmf_chip_ca7_*`): ARM CA7
+/// (0x847) and SYS_MEM (0x849) in the CR4/SOCRAM EROM slots, SYS_MEM
+/// banks summing to the CR4 TCM size, and the RAM image at `rambase`: the
+/// bus translates TCM addresses and every TCM pointer the firmware
+/// publishes (shared mailbox/ring-info pointers, ring-info table) moves too.
+fn ca7_layout(s: &mut State, rambase: u32) {
+    for (slot, from, to) in [(9u32, 0x4bf83e01, 0x4bf84701), (13, 0x4bf80e01, 0x4bf84901)] {
+        assert_eq!(s.registers.insert(0x18100000 + slot * 4, to), Some(from));
+    }
+    s.registers.insert(0x18004000, 2 << 4);
+    s.registers.insert(0x18004040, 15);
+    s.relocate = rambase - BASE;
+    for at in [
+        SHARED + 40,
+        SHARED + 44,
+        SHARED + 48,
+        INFO,
+        INFO + 4,
+        INFO + 8,
+        INFO + 12,
+        INFO + 16,
+    ] {
+        let value = word(s, at) + s.relocate;
+        put(s, at, &value.to_le_bytes());
+    }
 }
 fn put(s: &mut State, at: u32, bytes: &[u8]) {
     for (i, &b) in bytes.iter().enumerate() {
@@ -569,8 +727,7 @@ fn complete(
     transaction: u16,
     command: u32,
 ) {
-    let at = pointer(s, RINGS + 2 * 16 + 8);
-    let entry = &mut s.dma.get_mut(&at).unwrap()[slot * 24..slot * 24 + 24];
+    let entry = completion_entry(s, 2, slot);
     entry[0] = kind;
     entry[4..8].copy_from_slice(&id.to_le_bytes());
     entry[8..10].copy_from_slice(&result.0.to_le_bytes());
@@ -578,6 +735,21 @@ fn complete(
     entry[14..16].copy_from_slice(&transaction.to_le_bytes());
     entry[16..20].copy_from_slice(&command.to_le_bytes());
     put(s, D2HW, &((slot + 1) as u16).to_le_bytes());
+}
+/// Firmware writes within the actual published stride, with an invalid
+/// message discriminator in every prefix byte. No runtime decoder is reused.
+fn completion_entry(s: &mut State, ring: u32, slot: usize) -> &mut [u8] {
+    let prefix = word(s, SHARED + 36) as usize;
+    if prefix != 0 {
+        s.prefixed_completions[(ring - 2) as usize] += 1;
+    }
+    let descriptor = RINGS + ring * 16;
+    let address = pointer(s, descriptor + 8);
+    let stride = (word(s, descriptor + 4) >> 16) as usize;
+    let entry = &mut s.dma.get_mut(&address).unwrap()[slot * stride..(slot + 1) * stride];
+    entry.fill(0);
+    entry[..prefix].fill(0xa5);
+    &mut entry[prefix..]
 }
 fn smoke_brcmf_cr4_board_policy_and_real_boot_transcript() -> TestResult {
     let (bus, s) = model();
@@ -828,8 +1000,8 @@ fn flow_reply(st: &mut State, slot: usize, kind: u8, flow: u16) {
 fn flow_reply_status(st: &mut State, slot: usize, kind: u8, flow: u16, status: i16) {
     complete(st, slot, kind, 0, (status, 0), 0, 0);
     let address = pointer(st, RINGS + 2 * 16 + 8);
-    st.dma.get_mut(&address).unwrap()[slot * 24 + 10..slot * 24 + 12]
-        .copy_from_slice(&flow.to_le_bytes());
+    let start = slot * 24 + word(st, SHARED + 36) as usize;
+    st.dma.get_mut(&address).unwrap()[start + 10..start + 12].copy_from_slice(&flow.to_le_bytes());
 }
 fn smoke_brcmf_actual_flow_tx_lifecycle_and_retirement() -> TestResult {
     let (bus, s) = model();
@@ -1346,21 +1518,66 @@ fn smoke_brcmf_refused_flow_ops_retire_flow_not_runtime() -> TestResult {
         return TestResult::Fail("TX after a refused create did not retire exactly");
     }
 
-    // A refused delete also retires the flow as Closed — this is the
-    // transition station_transport's flow-cache eviction relies on — and
-    // the runtime keeps working afterwards.
+    // Keep this historic registration: refused creates remain local
+    // outcomes, but a refused DELETE cannot prove native mapping retirement.
+    // Only the separate confirmed-delete case permits reuse after status0.
     owner.close_flow(flow).unwrap();
     if owner.flow_state(flow) != Ok(runtime::FlowState::Deleting) {
         return TestResult::Fail("flow not Deleting before refused delete completion");
     }
+    let (address, original, allocations, dropped) = {
+        let state = s.lock();
+        let control = pointer(&state, RINGS + 8);
+        let create = &state.dma[&control][17 * 40..18 * 40];
+        let address = u64::from_le_bytes(create[32..40].try_into().unwrap());
+        (
+            address,
+            state.dma[&address].clone(),
+            state.allocated,
+            state.dropped,
+        )
+    };
     flow_reply_status(&mut s.lock(), 2, 6, 2, 5);
-    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Closed) {
-        return TestResult::Fail("refused delete did not retire the flow as Closed");
+    if owner.poll() != Err(runtime::Error::Firmware(5))
+        || !owner.is_failed()
+        || owner.is_reclaimable()
+        || owner.flow_state(flow) != Ok(runtime::FlowState::Deleting)
+    {
+        return TestResult::Fail("refused delete fabricated native mapping retirement");
     }
-    let flow = owner.open_flow(source, destination, 3).unwrap();
-    flow_reply(&mut s.lock(), 3, 4, 2);
-    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Open) {
-        return TestResult::Fail("runtime unusable after a refused delete");
+    let doorbells = s.lock().doorbells;
+    if owner.open_flow(source, destination, 3) != Err(runtime::Error::Failed)
+        || owner.send(flow, &frame) != Err(runtime::Error::Failed)
+        || owner.close_flow(flow) != Err(runtime::Error::Failed)
+        || owner.poll() != Err(runtime::Error::Failed)
+    {
+        return TestResult::Fail("refused-delete owner admitted reuse or new native publication");
+    }
+    {
+        let state = s.lock();
+        if state.dma[&address] != original
+            || state.allocated != allocations
+            || state.dropped != dropped
+            || state.dropped_addresses.contains(&address)
+            || state.dma_enable
+            || state.doorbells != doorbells
+        {
+            return TestResult::Fail(
+                "refused DELETE zeroed/reused/freed its original native mapping",
+            );
+        }
+    }
+    drop(owner);
+    let state = s.lock();
+    if state.dma_enable
+        || state.dropped != dropped
+        || state.dropped_addresses.contains(&address)
+        || state.parks < 2
+        || state.unsafe_free != 0
+    {
+        return TestResult::Fail(
+            "failed-delete teardown invented quiescence or released uncertain DMA",
+        );
     }
     TestResult::Pass
 }

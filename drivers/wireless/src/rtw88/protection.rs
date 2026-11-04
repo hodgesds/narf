@@ -68,6 +68,9 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
     hash.update(&did.to_le_bytes());
     hash.update(&recipe);
     hash.update(&digest);
+    if did == 0xb822 {
+        hash.update(super::tx_ba_power::SOURCE8822B);
+    }
     match base {
         Base::H(_) => hash.update(b"H no BA"),
         Base::R(r) => {
@@ -88,15 +91,18 @@ pub(super) fn request(base: &Base) -> Result<Request, Error> {
     Ok(Request {
         identity: hash.finalize(),
         mac,
-        filename: format!(
-            "rtw88/rtw882{}ce-rts-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            if did == 0xc821 { 1 } else { 2 },
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+        filename: super::channel_policy::scoped_filename(
+            &format!(
+                "rtw88/{}-rts-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                h.host().family(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            ),
+            h.channel(),
         ),
     })
 }
@@ -134,6 +140,7 @@ pub(super) struct Grant {
     base: Base,
     request: Request,
     cap: Cap<FirmwareBlob, Read>,
+    digest: [u8; 32],
     antenna: i16,
     ceiling: i16,
     peaks: [i16; 4],
@@ -176,6 +183,12 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn limit(&self) -> Result<i16, Error> {
+        Ok(self.base.limit()?.min(self.ceiling))
+    }
+    pub(super) fn tracking_identity(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request.identity, self.digest)
+    }
     fn decode(
         b: &[u8],
         signer: Option<[u8; 32]>,
@@ -187,11 +200,10 @@ impl Grant {
         let did = base.ht().rx_ba_identity().2;
         if signer.is_none()
             || b.len() != 128
-            || b[..4] != *if did == 0xc821 { b"N21X" } else { b"N22X" }
+            || b[..4] != super::tx_ba_power::magic(did, b'X').ok_or(Error::Prerequisite)?
             || b[4..8] != [1, 0, 128, 0]
             || b[8..12] != 128u32.to_le_bytes()
-            || b[12..14] != [0xec, 0x10]
-            || b[14..16] != did.to_le_bytes()
+            || b[12..16] != base.ht().host().header()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [1, 20]
@@ -205,6 +217,11 @@ impl Grant {
             base,
             request,
             cap,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(b);
+                h.finalize()
+            },
             antenna: signed(56),
             ceiling: signed(58),
             peaks: core::array::from_fn(|i| signed(60 + i * 2)),

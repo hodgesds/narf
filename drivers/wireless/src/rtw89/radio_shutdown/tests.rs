@@ -23,6 +23,7 @@ struct Model {
     stuck: bool,
     wrong: bool,
     ignore: bool,
+    commands: Vec<u32>,
 }
 impl Model {
     fn new(seed: u8, busy: u8) -> Self {
@@ -42,6 +43,7 @@ impl Model {
             stuck: false,
             wrong: false,
             ignore: false,
+            commands: Vec::new(),
         }
     }
     fn access(&mut self) -> Result<(), Error> {
@@ -114,6 +116,7 @@ impl Io for Model {
         self.record(&[4, a, v]);
         self.bytes[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
         if a == 0x270 {
+            self.commands.push(v);
             self.command = v;
             self.left = self.busy;
         }
@@ -226,4 +229,54 @@ fn smoke_rtw89_b_xtal_shutdown_error_cancel_busy_and_echo_never_grant_reset() ->
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_xtal_shutdown_error_cancel_busy_and_echo_never_grant_reset
+);
+fn smoke_rtw8852c_terminal_shutdown_is_disable_bb_rf_then_rf00_rf10_masked_off() -> TestResult {
+    let mut io = Model::new(0xa5, 1);
+    let mut owner = Shutdown::default();
+    // SAFETY: owned inert C XTAL/RF model, no hardware or competing producer.
+    if ready(unsafe { owner.finish_c(&mut io, false) }) != Some(Ok(()))
+        || owner.state() != State::ShutdownAcknowledged
+    {
+        return TestResult::Fail("C terminal shutdown not acknowledged");
+    }
+    // rtw8852c_mac_disable_bb_rf: AFEDIG and both BB resets clear.
+    let wlrf = u32::from_le_bytes(io.bytes[0x2f0..0x2f4].try_into().unwrap());
+    if wlrf & 0x20000 != 0 || io.bytes[2] & 3 != 0 {
+        return TestResult::Fail("C disable_bb_rf clock/reset differs");
+    }
+    // rtw8852c_pwr_off_func: masked RF00/RF10 zero writes, then read proofs.
+    let expected = [
+        (1 << 31) | (1 << 16) | 0x80,
+        (1 << 31) | (1 << 16) | 0x81,
+        (1 << 31) | (1 << 24) | 0x80,
+        (1 << 31) | (1 << 24) | 0x81,
+    ];
+    if io.commands != expected || io.xtal[0x80] & 1 != 0 || io.xtal[0x81] & 1 != 0 {
+        return TestResult::Fail("C RF00/RF10 XTAL-SI sequence differs from pwr_off_func");
+    }
+    let n = io.operations;
+    // SAFETY: one-shot owner; replay is refused without bus traffic.
+    let replay = ready(unsafe { owner.finish_c(&mut io, false) });
+    if replay != Some(Err(Error::Terminal)) || io.operations != n {
+        return TestResult::Fail("C shutdown replayed");
+    }
+    for variant in 0..2 {
+        let mut io = Model::new(0xa5, 0);
+        if variant == 0 {
+            io.ignore = true;
+        } else {
+            io.wrong = true;
+        }
+        let mut owner = Shutdown::default();
+        // SAFETY: an ignored write or forged echo is no disable proof.
+        let result = ready(unsafe { owner.finish_c(&mut io, false) });
+        if !matches!(result, Some(Err(_))) || owner.state() != State::Stopping {
+            return TestResult::Fail("ignored/forged C RF disable accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852c_terminal_shutdown_is_disable_bb_rf_then_rf00_rf10_masked_off
 );

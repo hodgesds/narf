@@ -4,7 +4,8 @@ use crate::mt7921::association::{wmm::Parameters, Security};
 
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 
-fn joined(secured: bool) -> (Session<Model>, ScanBss) {
+#[inline(never)]
+fn joined(secured: bool) -> (NativeSession, ScanBss) {
     let (mut session, bss) = wmm_tests::prepared(true, secured);
     let security = if secured {
         Security::Wpa2Psk { psk: [0x55; 32] }
@@ -61,7 +62,7 @@ fn mt76_dynamic_wmm_open_wpa2_drain_and_native_progress_preserve_port() -> TestR
     for secured in [false, true] {
         let (mut session, bss) = joined(secured);
         let epoch = session.receive_epoch;
-        let old = session.wmm;
+        let old = session.station.wmm;
         if secured {
             for tid in [0, 3] {
                 let mut packet = ccmp_packet(41, 0, false);
@@ -81,9 +82,9 @@ fn mt76_dynamic_wmm_open_wpa2_drain_and_native_progress_preserve_port() -> TestR
         let packet = beacon(&session, &bss, &parameters);
         session.backend.packets.push_back(packet);
         if session.receive_ethernet() != Ok(None)
-            || session.wmm != old
-            || session.wmm_pending != Parameters::parse(&parameters).unwrap()
-            || session.peer_lost
+            || session.station.wmm != old
+            || session.station.wmm_pending != Parameters::parse(&parameters).unwrap()
+            || session.station.peer_lost
             || session.start_ethernet(&ethernet()) != Err(Error::Busy)
             || run(session.service_keys()).is_err()
             || session.backend.frames.len() != before
@@ -107,8 +108,8 @@ fn mt76_dynamic_wmm_open_wpa2_drain_and_native_progress_preserve_port() -> TestR
             || commands[0].1[104..108] != [0, 1, 0, 0]
             || !command(&commands[1].1, 0xc0)
             || commands[1].1[64..72] != [0, 0x80, 0x0c, 0x82, 0, 0, 0, 0]
-            || session.wmm_pending.is_some()
-            || session.wmm != Parameters::parse(&parameters).unwrap()
+            || session.station.wmm_pending.is_some()
+            || session.station.wmm != Parameters::parse(&parameters).unwrap()
             || session.receive_epoch != epoch
             || session.receive_current(epoch) != Ok(true)
             || session.start_ethernet(&ethernet()).is_err()
@@ -145,12 +146,12 @@ fn mt76_dynamic_wmm_counter_wrap_coalescing_and_exact_repeats() -> TestResult {
         let before = session.backend.frames.len();
         let parameters = updated(count);
         let expected = Parameters::parse(&parameters).unwrap();
-        let changed = session.wmm != expected;
+        let changed = session.station.wmm != expected;
         let packet = beacon(&session, &bss, &parameters);
         session.backend.packets.push_back(packet);
         session.receive_ethernet().unwrap();
         run(session.service_keys()).unwrap();
-        if session.wmm != expected
+        if session.station.wmm != expected
             || session.backend.frames.len() != before + if changed { 2 } else { 0 }
         {
             return TestResult::Fail(
@@ -166,7 +167,7 @@ fn mt76_dynamic_wmm_counter_wrap_coalescing_and_exact_repeats() -> TestResult {
     session.receive_ethernet().unwrap();
     run(session.service_keys()).unwrap();
     if session.backend.frames.len() != before + 2
-        || session.wmm != Parameters::parse(&updated(4)).unwrap()
+        || session.station.wmm != Parameters::parse(&updated(4)).unwrap()
     {
         return TestResult::Fail("bounded WMM update did not retain the latest complete AP set");
     }
@@ -184,7 +185,7 @@ fn mt76_dynamic_wmm_cancelled_dma_and_progress_retain_closed_owner() -> TestResu
         let packet = beacon(&session, &bss, &updated(2));
         session.backend.packets.push_back(packet);
         session.receive_ethernet().unwrap();
-        let old = session.wmm;
+        let old = session.station.wmm;
         let epoch = session.receive_epoch;
         session.backend.stall_edca = !at_progress;
         session.backend.rx_stall = at_progress;
@@ -199,8 +200,8 @@ fn mt76_dynamic_wmm_cancelled_dma_and_progress_retain_closed_owner() -> TestResu
             }
         }
         if session.state != State::Running(Stage::StaRecord)
-            || session.wmm != old
-            || session.wmm_pending.is_none()
+            || session.station.wmm != old
+            || session.station.wmm_pending.is_none()
             || session.receive_current(epoch) != Ok(false)
             || session.start_ethernet(&ethernet()) != Err(Error::Busy)
             || !session.backend.owner.published
@@ -235,9 +236,9 @@ fn mt76_dynamic_wmm_policy_loss_and_malformed_native_progress_fail_closed() -> T
         }
         if run(session.service_keys()).is_ok()
             || !matches!(session.state, State::Failed { .. })
-            || session.wmm.is_some()
-            || session.wmm_pending.is_some()
-            || session.station_permission.is_some()
+            || session.station.wmm.is_some()
+            || session.station.wmm_pending.is_some()
+            || session.station.permission.is_some()
             || session.receive_current(session.receive_epoch) != Ok(false)
             || session.start_ethernet(&ethernet()) != Err(Error::Busy)
             || fault < 3 && session.backend.frames.len() != before + fault
@@ -263,7 +264,7 @@ fn mt76_dynamic_wmm_foreign_and_legacy_beacons_never_grant_qos() -> TestResult {
     wrong_channel[13] = 11;
     session.backend.packets.push_back(wrong_channel);
     session.receive_ethernet().unwrap();
-    if session.wmm_pending.is_some() || session.peer_lost {
+    if session.station.wmm_pending.is_some() || session.station.peer_lost {
         return TestResult::Fail("foreign AP/channel scheduled a native contention update");
     }
     run(session.disassociate_station()).unwrap();
@@ -274,8 +275,8 @@ fn mt76_dynamic_wmm_foreign_and_legacy_beacons_never_grant_qos() -> TestResult {
     session.backend.packets.push_back(packet);
     session.receive_ethernet().unwrap();
     run(session.service_keys()).unwrap();
-    if session.wmm.is_some()
-        || session.wmm_pending.is_some()
+    if session.station.wmm.is_some()
+        || session.station.wmm_pending.is_some()
         || session.backend.frames.len() != before
     {
         return TestResult::Fail("unsolicited beacon promoted a legacy peer to WMM");
@@ -316,7 +317,7 @@ fn mt76_dynamic_wmm_rekey_runs_before_pending_contention_update() -> TestResult 
     session.receive_ethernet().unwrap();
     let before = session.backend.frames.len();
     run(session.service_keys()).unwrap();
-    if session.wmm_pending.is_none()
+    if session.station.wmm_pending.is_none()
         || session.backend.frames[before..]
             .iter()
             .any(|(_, frame)| command(frame, 0x1d))
@@ -326,7 +327,7 @@ fn mt76_dynamic_wmm_rekey_runs_before_pending_contention_update() -> TestResult 
     }
     session.receive_ethernet().unwrap();
     run(session.service_keys()).unwrap();
-    if session.wmm_pending.is_none()
+    if session.station.wmm_pending.is_none()
         || session.backend.frames[before..]
             .iter()
             .any(|(_, frame)| command(frame, 0x1d))
@@ -336,7 +337,7 @@ fn mt76_dynamic_wmm_rekey_runs_before_pending_contention_update() -> TestResult 
         return TestResult::Fail("replacement key receipts lost the pending native EDCA barrier");
     }
     run(session.service_keys()).unwrap();
-    if session.wmm_pending.is_some()
+    if session.station.wmm_pending.is_some()
         || session.backend.frames[before..]
             .iter()
             .filter(|(_, frame)| command(frame, 0x1d))

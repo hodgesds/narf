@@ -223,3 +223,68 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_download_no_insecure_fallback
 );
+
+fn smoke_rtw89_n51_secure_policy_is_linux_null_chip_blacklist() -> TestResult {
+    // rtw8851b_chip_info.fw_blacklist = NULL: fw.c __check_secure_blacklist
+    // returns -ENOENT and __parse_security_section only WARN_ONCEs, so the
+    // formatted MSS signature selection alone governs the secure section.
+    let policy = Blacklist::upstream(ChipId::Rtl8851B);
+    if policy.is_none_or(|p| p.has_chip_list())
+        || Blacklist::upstream(ChipId::Rtl8852B).is_none_or(|p| !p.has_chip_list())
+        || Blacklist::upstream(ChipId::Rtl8852A).is_some()
+    {
+        return TestResult::Fail("8851B/8852B/8852A upstream blacklist presence diverged");
+    }
+    let fuses = Fuses::decode(ChipId::Rtl8851B, 0xfc, 0xef).unwrap();
+    let mut listed = firmware(1, 2, true);
+    // The second (selected) candidate names a newer list version and bit 1.
+    let second = 48 + 16 * 3 + 960 + 32 + 256 + 2 * 512;
+    listed[second + 32] = 1;
+    listed[second + 33] = 7;
+    let original = listed.clone();
+    let plan = match DownloadPlan::new(prepare(listed.clone(), ChipId::Rtl8851B), fuses, policy) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("8851B secure image refused by absent chip list"),
+    };
+    let key = plan.chunk(0, 0).unwrap();
+    if plan.section_count() != 2
+        || key.len() != 960
+        || key[..448] != original[2368..2816]
+        || key[448..] != vec![0x42; 512]
+    {
+        return TestResult::Fail("8851B selected signature diverged from MSS selection");
+    }
+    if !matches!(
+        DownloadPlan::new(prepare(listed.clone(), ChipId::Rtl8851B), fuses, None),
+        Err(Error::Secure(secure::Error::UnknownBlacklist))
+    ) {
+        return TestResult::Fail("8851B accepted a missing policy owner");
+    }
+    let mut deny = [0; 32];
+    deny[0] = 2;
+    if !matches!(
+        DownloadPlan::new(
+            prepare(listed, ChipId::Rtl8851B),
+            fuses,
+            Some(Blacklist::authenticated(7, deny))
+        ),
+        Err(Error::Secure(secure::Error::Blacklisted))
+    ) {
+        return TestResult::Fail("authenticated 8851B board list was not enforced");
+    }
+    if !matches!(
+        DownloadPlan::new(
+            prepare(firmware(1, 0, false), ChipId::Rtl8851B),
+            fuses,
+            policy
+        ),
+        Err(Error::Secure(secure::Error::MissingSignature))
+    ) {
+        return TestResult::Fail("8851B secure hardware loaded an unsigned image");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_n51_secure_policy_is_linux_null_chip_blacklist
+);

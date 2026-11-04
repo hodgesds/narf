@@ -45,6 +45,12 @@ pub(super) trait Interface: Io {
     async fn end(&mut self, kind: Kind) -> Result<(), Error>;
     async fn pause(&mut self) -> Result<u32, Error>;
     async fn resume(&mut self, saved: u32) -> Result<(), Error>;
+    /// core.c `__rtw89_set_channel` band change ->
+    /// coex.c `rtw89_btc_ntfy_switch_band` (no DBCC) -> `_run_coex`
+    /// (`BTC_RSN_NTFY_SWBAND`). Default: no coexistence owner.
+    async fn coex_switch_band(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Results {
@@ -358,10 +364,15 @@ impl<I: Interface> Access<'_, I> {
         self.wr(0, RR_RSV1, RR_RSV1_RST, 1).await?;
         self.wr(1, RR_RSV1, RR_RSV1_RST, 1).await
     }
-    async fn rx_dck(&mut self) -> Result<(), Error> {
+    /// Linux `_rx_dck`; `tssi_mode` is `rtwdev->is_tssi_mode[path]`, true only
+    /// on a retune after a completed retained TSSI, pausing TSSI tracking.
+    async fn rx_dck(&mut self, tssi_mode: bool) -> Result<(), Error> {
         for path in 0..2 {
             let saved = self.rr(path, RR_RSV1, RFREG_MASK).await?;
             let tune = self.rr(path, RR_DCK, RR_DCK_FINE).await?;
+            if tssi_mode {
+                self.wm(R_P0_TSSI_TRK + (u32::from(path) << 13), B_P0_TSSI_TRK_EN, 1)?;
+            }
             self.wr(path, RR_RSV1, RR_RSV1_RST, 0).await?;
             self.wr(path, RR_DCK, RR_DCK_FINE, 0).await?;
             self.wr(path, RR_MOD, RR_MOD_MASK, RR_MOD_V_RX).await?;
@@ -371,10 +382,13 @@ impl<I: Interface> Access<'_, I> {
             self.delay(1000).await?;
             self.wr(path, RR_DCK, RR_DCK_FINE, tune).await?;
             self.wr(path, RR_RSV1, RFREG_MASK, saved).await?;
+            if tssi_mode {
+                self.wm(R_P0_TSSI_TRK + (u32::from(path) << 13), B_P0_TSSI_TRK_EN, 0)?;
+            }
         }
         Ok(())
     }
-    async fn channel_rxdck(&mut self) -> Result<(), Error> {
+    async fn channel_rxdck(&mut self, tssi_mode: bool) -> Result<(), Error> {
         self.0.admit()?;
         self.0.begin(Kind::Rxdck).await?;
         let saved = self.0.pause().await?;
@@ -390,7 +404,7 @@ impl<I: Interface> Access<'_, I> {
                 self.delay(2).await?;
             }
         }
-        self.rx_dck().await?;
+        self.rx_dck(tssi_mode).await?;
         self.0.resume(saved).await?;
         self.0.end(Kind::Rxdck).await?;
         Ok(())
@@ -431,7 +445,7 @@ impl Rfk {
         access.0.begin(Kind::Dack).await?;
         access.dac(&mut self.results).await?;
         access.0.end(Kind::Dack).await?;
-        access.channel_rxdck().await?;
+        access.channel_rxdck(false).await?;
         self.state = State::BasicCalibrated;
         Ok(())
     }
@@ -451,15 +465,60 @@ impl ChannelRxDck {
     /// actual WLAN-only/current measured full recipe, exclusive RF/reset state.
     /// Enclosing owner closes independent engines and retains DMA on drop/error.
     pub async unsafe fn prepare(&mut self, io: &mut impl Interface) -> Result<(), Error> {
+        // SAFETY: same contract; initial TSSI is still disabled.
+        unsafe { self.prepare_with_tssi(io, false).await }
+    }
+    /// # Safety
+    /// Same as [`Self::prepare`]. `tssi_mode` must be the actual retained TSSI
+    /// enable state: true only for a retune after a completed TSSI calibration.
+    pub async unsafe fn prepare_with_tssi(
+        &mut self,
+        io: &mut impl Interface,
+        tssi_mode: bool,
+    ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
         self.state = State::Calibrating;
-        Access(io).channel_rxdck().await?;
+        Access(io).channel_rxdck(tssi_mode).await?;
         self.state = State::BasicCalibrated;
         Ok(())
     }
 }
+
+/// RTL8852C `rtw8852c_rfk_init` (RCK/DACK/RX DCK).
+#[path = "rfk/c.rs"]
+pub(super) mod c;
+/// RTL8852C channel switch (`rtw8852c_set_channel_help`/`set_channel`) and
+/// the composed `rtw8852c_rfk_channel`.
+#[path = "rfk/c_channel.rs"]
+pub(super) mod c_channel;
+/// RTL8852C channel DPK (`rtw8852c_dpk`).
+#[path = "rfk/c_dpk.rs"]
+pub(super) mod c_dpk;
+/// RTL8852C channel IQK (`rtw8852c_iqk`).
+#[path = "rfk/c_iqk.rs"]
+pub(super) mod c_iqk;
+/// RTL8852C channel TSSI (`rtw8852c_tssi`).
+#[path = "rfk/c_tssi.rs"]
+pub(super) mod c_tssi;
+/// RTL8851B `rtw8851b_rfk_init` and channel RX DCK (path A).
+#[path = "rfk/n51.rs"]
+pub(super) mod n51;
+/// RTL8851B channel switch (`rtw8851b_set_channel_help`,
+/// `rtw8851b_set_channel`, `rtw8851b_set_txpwr`) and `rtw8851b_rfk_channel`.
+#[path = "rfk/n51_channel.rs"]
+pub(super) mod n51_channel;
+/// RTL8851B channel DPK (`rtw8851b_dpk`) and `rtw8851b_rfk_track`
+/// (`dpk_track` + `lck_track`, path A).
+#[path = "rfk/n51_dpk.rs"]
+pub(super) mod n51_dpk;
+/// RTL8851B channel IQK (`rtw8851b_iqk`, path A).
+#[path = "rfk/n51_iqk.rs"]
+pub(super) mod n51_iqk;
+/// RTL8851B channel TSSI (`rtw8851b_tssi`, `rtw8851b_tssi_scan`, path A).
+#[path = "rfk/n51_tssi.rs"]
+pub(super) mod n51_tssi;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "rfk/tests.rs"]

@@ -149,19 +149,543 @@ environment monitor) are implemented and their rows closed; rtw89 `tspec`,
 inapplicable or folded into chip rows, and `uapsd` narrowed to AP-side
 (`rtw89.md`).
 
+**Recount 2026-10-29** (current continuation): the inventory holds
+**132 `feature`** rows (131 driver,1 shared), **35 `chip`** and
+**0 `unknown`**. New software continuations close RTW89 HE +HTC;
+ath9k host-bus PM; RTL8188EE SGI20 and7935-byte RX A-MSDU; Intel active
+probes and alternate ML BAID; and MT76 associated/off-channel active scan
+and passive monitor/radiotap capture, all-TID transmit BA and native
+sequence-sampled midstream BA restart. They pass the coordinated native
+x86_64/aarch64 suites; signed deployment inputs and physical acceptance
+remain separate. Gen2 Intel HE and TX A-MSDU also pass, with their retained
+Gen3/Sc residuals still tracked. The audit also adds two previously omitted
+Gen2 security rows (WPA2-PSK with PMF and SAE-EXT-KEY), explicitly refused by
+the existing native profile despite Linux/shared support (§3.33). The corrected MT76 BA subgroup passes24
+native tests on each architecture. The all-Wi-Fi suites complete2939/0/9
+on x86_64 and2713/0/5 on aarch64 (pass/fail/environment skip).
+
+Intel cross-boot persistent key history is inapplicable: Linux retains live
+key/PN state for runtime restart and establishes fresh authenticated keys/RSC
+after reboot; the shared NARF invariant requires owner-lifetime history
+(§3.30 in `iwlwifi.md`). Existing in-boot history fences remain. The ath11k
+architecture unknown is resolved: its full subtree completes367/0/2
+(pass/fail/skip) on x86_64 and366/0/3 on aarch64 after reducing transient
+fixture/recovery stack use. Full branch build/validation gates remain separate.
+
+**Inventory audit 2026-10-29** (second checkpoint in progress): the ledger
+now holds **134 `feature`** rows (133 driver,1 shared), **35 `chip`** and
+**0 `unknown`**. Two additional omissions are Sc WPA2-PMF and Sc SAE-EXT-KEY
+(`iwlwifi.md` §3.35); the Gen2 rows above cover a different native owner.
+New implementations remain open until their coordinated validation passes.
+
+**Recount 2026-10-29** (second checkpoint): the ledger now holds
+**130 `feature`** rows (129 driver,1 shared), **35 `chip`** and
+**0 `unknown`**. Native x86_64/aarch64 validation closes Gen2 WPA2-PMF,
+Gen2 SAE-EXT-KEY, the retained Gen3/Sc live regulatory owner and ath10k
+associated scanning. Gen2 HE capability reporting is also complete; the HE
+row retains Gen3/Sc work. Intel completes450/0 on each architecture,
+including233/0 Gen2 and8/0 live-policy cases. Ath10k's twelve associated-scan
+conversations pass on both architectures; refreshed retirement and
+restart cases pass23/0 on x86_64 and are included in ARM's273/0 ath10k scope.
+The coordinated native coverage is3575/0/16 on x86_64 across the full run
+and deduplicated follow-up runs, and3185/0/12 in the full ARM run. These also
+exercise the new shared PCI PME, fixed-GPE, strict AML and async platform
+sleep foundations. Those foundations do not close a driver's native WoW row.
+Sc security, actual platform-power ownership, ROC and chip enablement remain
+tracked separately. Software fixtures confer no physical board acceptance.
+
+**Recount 2026-10-30** (validated Intel/MQ and native MT76 AP checkpoint):
+the ledger now holds **125 `feature`** rows (124 driver,1 shared),
+**35 `chip`** and **0 `unknown`**. Native validation closes Intel's actual
+platform-power owner, Sc WPA2-PMF and SAE-EXT-KEY, and MT76's bounded native
+WoW and AP profiles. Sc HE and multiple RFH queues/RSS are also implemented;
+their family rows retain parked Gen3 HE and Gen2 MVM queue/PN/BA work.
+The canonical runtime source in `ff6a01695` matches the fixed acceptance
+candidate: x86_64 **3824/0/9**, aarch64 **3598/0/5**, each including Intel481
+and MT76 AP22. Both production release boots, two btrfs postflight images
+per architecture, release Clippy contexts and formatting pass. Debug builds
+are omitted by the explicit release-by-default task instruction. These are
+software model/QEMU results; board RF acceptance remains separate.
+RTL8188EE operating-owner replacement was subsequently validated below.
+
+**Recount 2026-10-30** (validated RTL8188EE reset, system suspend and IPS):
+the ledger now holds **122 `feature`** rows (121 driver,1 shared),
+**35 `chip`** and **0 `unknown`**. Native checkpoint `73b90b62d` passes
+x86_64 **4174/0/13** and aarch64 **3815/0/7**, including four RTL recovery
+cases, eight RTL power cases, four active-probe cases and all Intel485 on
+each architecture. Sc TX A-MSDU is validated; its row retains parked Gen3.
+The behavior-preserving lint successor `127744339` passes both release
+Clippy contexts, formatting, ordinary production release boots and both
+btrfs postflight images per architecture. Release-only validation follows
+the explicit task instruction. Channel retune, broader scanning and later
+P2P/MQ batches retain separate pending checkpoints; software acceptance does
+not assert physical board RF qualification.
+
+**Follow-up acceptance 2026-10-30** (counts unchanged): native checkpoint
+`196e0a946` passes **4186/0/13** on x86_64 and **3827/0/7** on aarch64.
+Both pass all23 focused retune/private-P2P/metadata/admin-target cases,
+including the four RTL legacy-channel retunes. The validation-only one-line
+lint successor `32504f88d` passes both release Clippy contexts, formatting,
+ordinary boots and both btrfs postflight images per architecture. The
+canonical later scan implementation removes that redundant conversion too.
+Broader scan/HT, concrete P2P and subsequent MQ/ROC batches remain separate.
+
+**Recount 2026-10-30** (accepted RTL scans, channel profiles and multiple radios):
+the ledger holds **119 `feature`** rows (118 driver,1 shared), **35 `chip`**
+and **0 `unknown`**. The completed fixture-only `ed1946ffd` checkpoint passes
+x86_64 **4214/0/13** and aarch64 **3855/0/7**, including all39 focused radio/HE
+cases, both release Clippy contexts, formatting, ordinary boots and both
+btrfs postflight images per architecture. Three RTL rows close for the
+retained factory-qualified1–11 profiles. Intel queue/RSS rows remain open
+until the separately corrected wide-header command graph passes refreshed
+native and final gates; the earlier fixture graph alone is insufficient.
+
+**Recount 2026-10-30** (accepted native RFH/RSS and PCIe ASPM): the ledger
+holds **116 `feature`** rows (115 driver, 1 shared), **35 `chip`** and
+**0 `unknown`**. Production checkpoint `6e89e3ab3` passes both architectures'
+release CI, formatting, ordinary boots and both btrfs postflights. Its
+fixture-only successor `ab09f5d73` passes x86_64 **4259/0/13** and aarch64
+**3900/0/7**, including the corrected common heap-owned MT fixtures and
+refreshed Intel 505-case coverage; changed-fixture release CI also passes.
+Gen2/Sc physical RFH queues, per-queue replay/reorder and immutable RSS,
+plus RTL8188EE endpoint ASPM, close three rows. New exact API89 profiles,
+RTL8 channel continuations and independent P2P contexts retain their own
+pending native acceptance; these counts do not credit those drafts.
+
+**Recount 2026-10-31** (accepted exact Intel profiles and RTL channel scans):
+the ledger holds **112 `feature`** rows (111 driver,1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `62b62ea68` passes x86_64
+**4294/0/13** and aarch64 **3935/0/7**, all521 Intel cases and the eight
+RTL channel/passive cases included. All five affected packages' resolved
+release CI contexts pass on both architectures, as do formatting, ordinary
+boots and both btrfs postflights. Qualified Intel HE/TX A-MSDU, RTL legacy
+channels/passive scans and four exact Intel station chip rows close.
+Later administrative-PM, active-scan, periodic-scan and control-lifecycle
+changes retain separate pending gates. Physical RF/silicon acceptance is
+separate from these software results.
+
+**Recount 2026-10-31** (accepted RTL PM and idle active scans):
+the ledger holds **110 `feature`** rows (109 driver,1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `0eb084197` adds32 native cases over
+`62b62ea68` and passes x86_64 **4326/0/13** and aarch64 **3967/0/7**.
+All524 Intel cases, eight RTL administrative-PM cases, eight RTL active-scan
+cases and386 MT registrations (384 pass,2 skip) are included. Resolved
+release CI for all five affected packages passes on both architectures,
+as do formatting, ordinary boots and both btrfs postflights. RTL PM and
+idle active scanning close. Exact Intel API89/Bz idle PNO and forced-stop
+publication retirement are accepted partial scopes; associated MLD PNO,
+associated RTL scanning and MT P2P management/roles retain separate gates.
+Physical qualification remains separate from these software results.
+
+**Recount 2026-10-31** (accepted associated scans and management RX):
+the ledger holds **109 `feature`** rows (108 driver, 1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `a7797583a` passes **4,349/0/13** on
+x86_64 (five disjoint QEMU boots) and **3,990/0/7** on aarch64. Named-case
+comparison retains every case from `0eb084197` and adds exactly 23, including
+all 531 Intel cases, eight RTL associated-passive cases, one shared sequence
+case, five MT management-RX cases and two shared dispatcher cases. Resolved
+release CI, formatting, ordinary boots and both btrfs postflights pass on both
+architectures. Intel scheduled scanning and RTL Null/QoS Null close. The
+`expanded_active_scanning` row remains open for associated active scanning:
+the previous acceptance covered idle operation. MT management TX and client/GO
+contexts also remain open. Physical qualification remains separate.
+
+**Recount 2026-10-31** (accepted native160, associated active scans and current-ROC management TX):
+the ledger holds **107 `feature`** rows (106 driver, 1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `aa6b98463` passes **4,369/0/13** on
+x86_64 and **4,010/0/7** on aarch64. Named-case comparison retains every
+case/status from `a7797583a` and adds exactly20: six Intel native160, eight
+RTL associated-active, four MT management-TX and two shared FRAME cases.
+All537 Intel cases pass on both architectures. Six resolved release Clippy
+contexts, formatting, ordinary boots and both btrfs postflights pass. Intel
+contiguous160 and RTL associated active scanning close. Current-ROC MT
+management TX is accepted partial P2P scope; private ROC/NO_CCK, native
+client/GO contexts and the separately qualified RTL HT40 continuation retain
+their own gates. Physical qualification remains separate.
+
+**Source implementation recount 2026-10-31** (validation deferred by request):
+source-complete features now count as implemented before validation. The
+remaining ledger holds **101 `feature`** rows (100 driver, 1 shared),
+**31 `chip`** and **0 `unknown`**. Six implementations are tracked separately
+in `research/implemented-pending-validation.tsv`: Intel EHT for admitted
+Sc/Bz profiles; MT76 hosted loadable packet ABI; RTL8188EU HT40; and
+RTL8188EE HT40, RTS/CTS and RF gain tracking. This is an implementation
+count, not a claim that their deferred release/native gates passed. Partial
+6 GHz/P2P/MLO work remains in the remaining ledger. Full validation and the
+recorded ARM regression investigation remain outstanding.
+
+**Source implementation recount 2026-10-31** (native320 written, validation deferred):
+the remaining ledger holds **100 `feature`** rows (99 driver, 1 shared),
+**31 `chip`** and **0 `unknown`**. Seven source-complete features are now
+listed in `research/implemented-pending-validation.tsv`, including actual
+Sc/Bz contiguous6GHz320MHz ownership. Exact RF/SKU/bandwidth, constituent
+facts, MCC/host span, TPE/PSD and native PHY/TLC/RFH rules are implemented;
+six new native cases are written. This credits implementation without
+claiming their deferred compile/native/release matrix passed.
+
+**Source implementation recount 2026-10-31** (automatic antenna selection written):
+the remaining ledger holds **99 `feature`** rows (98 driver, 1 shared),
+**31 `chip`** and **0 `unknown`**. Eight source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. The
+RTL8188EE automatic source paths for factory types1/2 and SMART4 are now
+implemented with native PHY/TXD/training and per-mux/thermal qualification;
+no manual antenna control is advertised. Compilation/native/release gates
+remain deferred, and physical measurements are externally supplied.
+
+**Source implementation recount 2026-11-01** (shared single-link MLD written):
+the remaining ledger holds **98 `feature`** rows (98 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Nine source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. Shared
+single-link MLD association, MLD-address SAE/PTK, authenticated per-link
+GTK/IGTK delivery and exact native-context/terminal key ownership are now
+implemented, with additive encrypted FakeAp fixtures. This closes the
+shared contract. Admitted Intel Sc/Bz native single-link MLD is implemented
+as a partial driver scope; multiple active links remain open in its MLO row.
+Native execution and the full release matrix remain deferred.
+
+**Source implementation recount 2026-11-01** (ath9k exact-channel generations written):
+the remaining ledger holds **96 `feature`** rows (96 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Eleven source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. AR9285
+operation on admitted channels1–13 and cold channel retuning are implemented
+through fresh physical reset/calibration and actual successor interfaces.
+Retuning disconnects and replaces the interface name; old keys/BA/owners
+remain terminal. Six new native cases are written; execution and the full
+release matrix remain deferred. Japan channel14 is not advertised.
+
+**Source implementation recount 2026-11-01** (Intel6GHz, ath10k chains and ath9k40 written):
+the remaining ledger holds **91 `feature`** rows (91 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Sixteen source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. This batch
+completes admitted Intel6GHz active/RNR/periodic discovery, response refinement
+and live TPE receipts; ath10k spatial streams/TX STBC; and qualified AR9285
+HT40/directional SGI40 with actual calibration and physical20MHz fallback.
+Fifteen new native cases are written. Execution and the full release matrix
+remain deferred; source completion grants no physical board qualification.
+
+**Source implementation recount 2026-11-01** (coexistence, aggregates and factory fields written):
+the remaining ledger holds **87 `feature`** rows (87 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. This batch
+completes ath10k2.4GHz HT40/OBSS ownership, qualified AR9285 3–8-member TX
+aggregates and the admitted factory field/gain variants, including EEPROM fields
+in both byte orders while preserving raw qualification hashes.
+Nineteen driver-native and four shared AP-fence cases are written. The new
+callback-free source/admin/interface fence prepares native AP ownership;
+the family AP row remains open. Focused release checks pass; execution and
+the full release matrix remain deferred. Physical qualification is separate.
+
+**Source implementation recount 2026-11-01** (bounded ath10k80+80 written):
+the remaining ledger holds **86 `feature`** rows (86 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty-one source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. The bounded
+QCA9984/QCA9888 WMI10.4 owner now carries two actual occupied80MHz spans,
+source-wide NSS, center2 and native peer/copy receipts. Six new native cases
+are written and focused release checks pass. Validation of the preceding20
+implementations is underway in an isolated frozen checkout; source completion
+and software execution do not establish physical board qualification.
+
+**Source implementation recount 2026-11-01** (AR9285 station NETWORK_SLEEP written):
+the remaining ledger holds **85 `feature`** rows (85 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty-two source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. The new
+optional N85S1 owner drives actual PM notices, TIM/DTIM/CAB wake, PS-Poll and
+AWAKE/NETWORK_SLEEP readbacks without replacing original key/BA/DMA owners.
+Eight native cases are written and isolated release checks pass. Validation
+of the preceding21 implementations continues in a frozen checkout; this
+source addition remains in the next batch. Physical qualification is separate.
+
+**Source implementation recount 2026-11-01** (native AP, periodic calibration and bounded ROC written):
+the remaining ledger holds **82 `feature`** rows (82 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty-five source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. This source
+batch adds original Intel Sc/Bz/API89/API77 legacy20 AP control/data owners,
+qualified AR9285 periodic calibration/ANI and managed ath10k Public Action ROC.
+Twenty-nine new cases are written. Isolated release compile/lint checks pass;
+cross-architecture native acceptance remains pending. The station NETWORK_SLEEP
+IRQ/readback repair is included in the frozen source graph. Physical board
+measurements and the remaining family profiles retain their own qualification.
+
+**Software acceptance checkpoint 2026-11-01 —25 implementations.** Frozen source
+`6813a24c6` is accepted against retained-case baseline `aa6b98463`: x86_64
+**4524/0/13**, aarch64 **4165/0/7**, preserving every
+baseline case/status and adding exactly155 cases on each architecture.
+Supplementary `bus,modules,verification/wifi-fixtures` execution is
+**x86_64 189/0/1; aarch64 183/0/3**. Four release Clippy contexts per
+architecture, both MT76 standalone module-image builds, formatting, ordinary
+production boots and production btrfs postflights pass. Saved gate and
+retained-case proofs use `target/wifi-validation-evidence/wifi-chunk01-6813a24c6`.
+The exact25 accepted keys leave `research/implemented-pending-validation.tsv`,
+which now contains its header only. The remaining ledger stays at **82 `feature`**,
+**31 `chip`** and **0 `unknown`** rows. Earlier implementation-time pending notes
+are superseded only for these25 scopes. Later idle-FULL_SLEEP, host-bus-PM,
+P2P and other drafts receive no credit. Physical measurements, signed deployment
+programs and per-device RF/power/interoperability qualification remain separate.
+
+**Source implementation recount 2026-11-01** (D0 idle and host-bus power management):
+the remaining ledger holds **80 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Two source-complete implementations await native acceptance in
+`research/implemented-pending-validation.tsv`: AR9285 counted unassociated
+idle FULL_SLEEP/cold wake and QCA6174/QCA9377 counted host-bus wake/ASPM.
+Fourteen native cases are written. Shared P2P source/control emission fences,
+interface-type subsets and Intel firmware resource-count parsing add eight
+cases and no feature-row closure; native P2P roles remain open. Release metadata
+checks pass for the combined source graph. This is implementation accounting;
+native execution and the next full release matrix remain pending. Physical
+board measurements, signed programs and deployment qualification remain separate.
+
+**Source implementation recount 2026-11-02** (PFC, indoor policy and non-VO sender BA):
+the remaining ledger holds **77 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Five source-complete implementations now await full batch acceptance in
+`research/implemented-pending-validation.tsv`. This addition implements bounded
+ath10k RAW/PFC, explicit signed indoor installation admission, and qualified
+RTW88 originator BA on every non-VO TID. Native Intel Sc/Bz P2P DEVICE is a
+partial family scope; SESSION, CLIENT/GO and P2P power-save roles remain open.
+Thirty-three additional cases are written. Combined quick release checks pass;
+native execution and the full batch matrix remain pending for these additions.
+The previous two power implementations passed72 focused cases on each architecture
+but still await that matrix. Counting unvalidated features,82 remain. Physical
+measurements, signed programs and per-device acceptance remain separate.
+
+**Source implementation recount 2026-11-02** (native thermal tracking and Beacon hints):
+the remaining ledger holds **75 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Seven source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. This addition supplies admitted
+RTL8821CE thermal TXAGC/txscale and associated IQK under distinct measured-program
+qualification, and immutable native ath10k Beacon observations lifting only the
+factory World layer. Signed host restrictions and original native publication
+owners remain required. Intel API89 SESSION2 extends the partial P2P DEVICE
+milestone; API77 and CLIENT/GO/power-save roles remain open. Sixteen new cases
+are written and unexecuted. One combined release metadata check and scoped
+formatting pass; full release/native validation remains deferred to the next
+25-feature batch. The known T2/P2P repair selection passes21/0/0 on each
+architecture at `42df9b354`; this does not accept the new source extensions.
+Counting unvalidated implementations,82 remain. Real board measurements,
+signed programs and physical acceptance remain separate.
+
+**Source implementation recount 2026-11-02** (independent RTL8852B PCI functions):
+the remaining ledger holds **74 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Eight source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. The bounded four-function
+RTL8852B owner retains independent source, reset, firmware, packet/key and IRQ
+lifetimes, generation-specific endpoint dispatch and quiescent name retirement.
+System PM visits every retained function and rolls back failed or cancelled
+preparation. Six new cases are written and unexecuted. Scoped formatting and
+one release metadata check pass; full release/native gates remain at the next
+25-feature checkpoint. Counting unvalidated implementations,82 remain. Physical
+multi-board acceptance and genuine measured qualifications stay separate.
+
+**Source implementation recount 2026-11-02** (independent RTW88 PCI functions):
+the remaining ledger holds **73 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Nine source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTW88 now retains up to four
+exact-function controllers and selects provisioning explicitly by BDF when
+multiple radios are live. Original firmware/qualification/key/native-DMA
+owners remain separate, and old ingress retains its name until callback return
+before removal. Three new cases are written and unexecuted. Scoped formatting
+and one release metadata check pass; full release/native validation remains
+scheduled at25 completed features. Counting unvalidated implementations,82
+remain. Measured board qualifications and physical multi-board acceptance
+remain separate; operating reset, runtime sleep and system suspend stay open.
+
+**Source implementation recount 2026-11-02** (native TLV AP and client association):
+the remaining ledger holds **72 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Ten source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. Ath10k now owns bounded legacy20
+AP peer/key/port/data, native beacon/template/TIM receipts, applicable U-APSD and
+terminal restoration. Intel CLIENT8 association/data adds actual MAC7 and original
+NoA/CTWindow ownership as partial P2P scope; its public management worker remains
+open. Fourteen new cases are written and unexecuted. Scoped formatting and one
+combined release metadata context pass; full release/native validation remains
+at25 completed feature rows. Counting unvalidated implementations,82 remain.
+Physical firmware/board, RF/power and deployment qualification remain separate.
+
+**Source implementation recount 2026-11-02** (bounded native FullMAC prefixes):
+the remaining ledger holds **71 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Eleven source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. BCM43602 shared-v7 prefixes1..4
+compose with original fixed control/TX/RX ring strides, checked payload offsets,
+current source/key/port and real terminal ownership. Zero-prefix5/6/7 behavior
+is preserved; broader firmware geometry remains refused. Six native cases are
+written and unexecuted. Scoped formatting and one release metadata context
+pass; full release/native gates remain at25 completed rows. Counting
+unvalidated implementations,82 remain; physical firmware/board acceptance is
+separate.
+
+**2026-11-02 — admitted native P2P source recount.** The ledger now holds
+**70 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twelve source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. Intel DEVICE/SESSION1/SESSION2,
+bounded GO9/NoA and CLIENT8/MAC7 now compose actual public FRAME/REGISTER,
+association/security/data, original native-copy and terminal lifecycles. The
+probe filter follows current registrations and commits actual sent MAC7 bits
+only after their native receipts; source loss during a held enable requires a
+real successor clear. Unsupported legacy GO PS producer formats remain
+unadvertised. Seventeen native P2P registrations are retained, including four
+strengthened CLIENT cases; their new assertions are unexecuted. Scoped release
+metadata and formatting pass; full release/native gates
+remain at25 completed rows. Counting unvalidated implementations,82 remain;
+physical firmware/board acceptance is separate.
+
+**2026-11-02 — admitted TX aggregation source recount.** The ledger now
+holds **69 `feature`**, **31 `chip`** and **0 `unknown`** rows. Thirteen
+source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8852B standalone TX A-MSDU
+and nested A-MSDU-in-A-MPDU use original same-TID FIFO/native owners, separate
+full-program qualification, peer/chip/current-RC limits and sticky BA denial.
+Both single and batched sends check the exact station BA window before
+consuming PN/SN; held one-frame windows retain originals until real native
+terminals. Existing v2 profiles and receive promises stay unchanged. Five
+source/native cases are written and unexecuted; scoped formatting and one
+release metadata context pass. Full release/native gates remain at25 completed
+rows. Counting unvalidated implementations,82 remain; real signed measured
+inputs and physical firmware/board acceptance remain separate.
+
+**2026-11-02 — admitted RF tracking source recount.** The ledger now holds
+**68 `feature`**, **31 `chip`** and **0 `unknown`** rows. Fourteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8852B periodic DPK tracking
+uses the actual completed Radio thermal/PWSF/TSSI snapshot, retained2s owner
+and fixed native register read/write/readback. A separately signed joint
+program binds the original radio and optional aggregation record plus the
+measured PWSF window; no initial RFK gate or receive promise is broadened.
+Periodic IQK/TSSI reruns and thermal-duty quirks from other adapters are
+inapplicable. Four new cases are written and unexecuted; scoped formatting
+and one release metadata context pass. Full release/native gates remain at25
+completed rows. Counting unvalidated implementations,82 remain; signed actual
+measurements and physical firmware/board acceptance remain separate.
+
+**2026-11-02 — bounded FullMAC AP source recount.** The ledger now holds
+**67 `feature`**, **31 `chip`** and **0 `unknown`** rows. Fifteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. BCM43602 primary-bsscfg AP now
+composes actual firmware-SME, native BSS/TIM/DTIM configuration, per-peer
+key/port/flow/TX terminals and original source/policy/copy/queue ownership through
+the public common Device frontend. Cancelled native commands retain cleanup and
+uncertain DMA. CYW43439 AP remains open and receives no credit from this PCIe
+composition. Nine cases are written and unexecuted; scoped formatting and one
+release metadata context pass. Full release/native gates remain at25 completed
+rows. Counting unvalidated implementations,82 remain; physical firmware/board,
+RF and deployment acceptance remain separate.
+
+**2026-11-02 — FullMAC family applicability correction.** The ledger now
+holds **63 `feature`**, **31 `chip`** and **0 `unknown`** rows, with the same
+fifteen source-complete implementations awaiting full batch acceptance.
+Four brcmfmac entries for confirmed stop, transport reset, post-reset station
+rejoin and system resume duplicated CYW43439-only residuals. BCM43602 already
+owns those native PCIe paths; the existing stop, reset/rejoin and hot/cold-resume
+cases passed both architectures at the accepted `6813a24c6` checkpoint. The
+matching four CYW43439 SDIO rows remain open, as does the genuine BCM43602
+IOMMU-quiescence gap. This correction adds no implementation, test or batch
+credit. Counting unvalidated implementations,78 remain after removing the four
+wrong-family duplicates. Full release/native validation still waits for25
+completed rows; physical firmware/board and deployment acceptance are separate.
+
+**2026-11-02 — admitted runtime LPS source recount.** The ledger now holds
+**62 `feature`**, **31 `chip`** and **0 `unknown`** rows. Sixteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8852B clock-gated LPS now
+composes original admin-UP/device/peer authority, actual WCPU template and
+RPWM/CPWM receipts, closed wake/PHY/leave/coexistence restoration and native
+queue/prefix ownership. A separate full joint measured program is mandatory;
+source loss uses nonemitting device-authorized same-function FLR retirement.
+Seven cases are written and unexecuted; scoped formatting and one release
+metadata context pass. Full release/native gates remain at25 completed rows.
+Counting unvalidated implementations,78 remain; physical firmware/board and
+actual deployment qualification remain separate.
+
+**2026-11-02 — native FullMAC monitor source recount.** The ledger now holds
+**61 `feature`**, **31 `chip`** and **0 `unknown`** rows. Seventeen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. BCM43602 receive-only monitor now
+composes actual flagged-radiotap firmware/monitor/channel receipts, original
+native posted buffers and source/policy/admin/MAC/copy ownership through the
+public mode/channel frontend and AF_PACKET. Pending native control events
+cannot be bypassed by continuous raw traffic; cancellation and PM retain actual
+stop/terminal ownership. Seven cases are written and unexecuted; scoped format
+and one release metadata context pass. CYW43439 monitor remains open. Full
+release/native gates remain at25 completed rows. Counting unvalidated
+implementations,78 remain; physical firmware/board acceptance is separate.
+
+**2026-11-02 — admitted two-stream HT source recount.** The ledger now holds
+**60 `feature`**, **31 `chip`** and **0 `unknown`** rows. Eighteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8822CE HT20 two-stream operation
+now composes actual per-path factory/gain/antenna programming, native queue retirement and
+RX/TX parking/readbacks, original source/power ownership, independent local
+RX and peer TX selection, and native MCS8..15 through Open/WPA2 and kernel IP.
+Original one-stream record bytes and behavior remain unchanged. Five cases plus
+two separate SDIO-disable prerequisite cases are written and unexecuted; scoped
+formatting and one six-package release metadata context pass. The SDIO helper
+adds no completed feature credit. Full release/native gates remain at25 completed
+rows. Counting unvalidated implementations,78 remain; actual signed deployment
+measurements and physical firmware/board acceptance remain separate.
+
+**2026-11-02 — native lifecycle and monitor source recount.** The ledger now
+holds **56 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twenty-two
+source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. Four additional rows now have
+complete bounded source owners: CYW43439 confirmed SDIO stop, RTL8852B
+receive-only monitor, and C21/C22 operating reset and explicit safe rejoin.
+Original native receipts, current device/program/admin generations, old ingress
+retirement and uncertain ownership remain required. The reset path checks its
+original cap/reservation after waits and rejects already-off state; rejoin uses
+fresh caller credentials and key exchange. A separate typed SDIO source helper
+adds no feature credit. Eighteen new feature cases and two helper cases are
+written and unexecuted; scoped formatting and one six-package release metadata
+context pass. Full release/native gates remain at25 completed rows. Counting
+unvalidated implementations,78 remain; physical firmware/board and deployment
+acceptance are separate.
+
+**2026-11-02 — retained system-PM source recount.** The ledger now holds
+**55 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twenty-three
+source-complete implementations await batch acceptance in
+`research/implemented-pending-validation.tsv`. C21/C22 system suspend/resume now
+retains the original family snapshot and uncancelled hardware workers through
+actual old DMA retirement, source card-off, PCI D3hot/D0/config receipts and
+fresh cold provisioning on the preserved netdev. Cancellation requests rollback;
+old keys and credentials are not replayed. Six native source cases are written
+and unexecuted. Scoped formatting and one release metadata context pass; a small
+shared plaintext-management fragment continuation adds no feature credit. Full
+release/native validation remains at25 completed rows. Counting unvalidated
+implementations,78 remain; physical S3/firmware/board acceptance stays separate.
+
+**2026-11-02 — native AP control-publication correction.** Counts remain
+**55 `feature`**, **31 `chip`**, **0 `unknown`** and **23 source-complete
+implementations pending validation**. BCM AP Program IOCTLs now preserve their
+original authority through actual native control-ring publication after setup.
+Unissued refusal grants no command or DMA credit; uncertain index/doorbell
+issue closes and pins the original owner. One additional native case is written
+and unexecuted; scoped formatting and one release metadata context pass. This
+repair earns no completed-feature credit. Full release/native validation remains
+at25 completed rows; physical hardware acceptance stays separate.
+
+**2026-11-02 — native host-fragmentation source recount.** The ledger now holds
+**54 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twenty-four
+source-complete implementations await full batch acceptance. RTL8852B host
+fragmentation now composes the original native peer/device/full joint program,
+immutable SN/PN trains, exact DMA/RPQ terminals and native producer fences
+through the actual doorbell, plus bounded original-source defragmentation and
+public threshold ownership. Eight cases are written, with six separate RTW88
+PS-codec/IPS prerequisite cases and an existing AP-prefix regression strengthened.
+All14 new cases remain unexecuted. Scoped formatting and one release metadata
+context pass; helper and repair work earns no additional row credit. Full
+release/native validation remains at25 completed rows. Counting unvalidated
+implementations,78 remain; physical RF/firmware/board acceptance stays separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 18 | Gen2 active probes, broader rejoin/key history, PMF/richer PHY/QoS/BA/TX LDPC/STBC/recovery; remaining Gen3 command profiles and unlisted PCI IDs; 6 GHz/HE/EHT, additional roles, checksum/scheduled-scan offload, RX/RSS and system PM |
-| ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles; device-tree board variants and aarch64 composition |
-| mt76 | 12 | Associated/off-channel and richer scans, 6 GHz/HE and broader VHT beyond the retained20/40/80/actual7922-160 profile, richer TX/RX BA and TX A-MSDU, PMF/WPA3, TX fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
-| ath10k | 19 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
-| ath9k | 10 | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
-| rtlwifi | 17 | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
-| rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
-| rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
-| rtw89 | 14 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
-| brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
-| cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
+| iwlwifi | 0 | Multiple-active-link MLO; WoWLAN is implemented pending validation; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
+| ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
+| mt76 | 0 | P2P and per-domain IOMMU (io/ PerDomain mapping is unimplemented); non-coherent DMA is implemented pending validation; native old-key pipeline retirement is inapplicable (Linux in-place PTK0 replacement); hosted loadable packet ABI is software-accepted at `6813a24c6` |
+| ath10k | 0 | P2P; DT/NVMEM alternate calibration sources are implemented pending validation; wake offload (via a native-WiFi decap station) is implemented pending validation; contiguous VHT160 is implemented pending validation; station-client DFS is implemented pending validation (AP radar inapplicable: upstream DFS_CERTIFIED only); hardware keys and recovery credential replay are implemented pending validation; bounded legacy20 AP/U-APSD, host-bus PM, PFC, signed indoor admission and native Beacon hints are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
+| ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
+| rtlwifi | 1 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
+| rtl8xxxu | 0 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
+| rtw88 | 0 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and remaining reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking, bounded independent live functions, original operating reset, explicit safe rejoin and retained system suspend/resume are implemented pending validation |
+| rtw89 | 1 | Additional channels/bands/widths, AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking, admitted clock-gated runtime LPS and receive-only native monitor and source-qualified host fragmentation are implemented pending validation; other firmware and AX/BE chips are separate rows |
+| brcmfmac | 0 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
+| cyw43439 | 0 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions; confirmed original SDIO PIO stop and native primary-bsscfg SDIO AP are implemented pending validation |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
 through the common retained FullMAC owner; system suspend, wake offload and
@@ -797,6 +1321,423 @@ did debug/release builds on both architectures. The host xtask suite
 passed all 66 tests; trusted-key build-parser tests passed both cases.
 Formatting and Clippy on the affected kernel libraries and xtask passed.
 These results validate software contracts, not target-radio operation.
+
+RTL8188EE provisioning metadata exposes `ht20_request_on_channel(channel)`
+and `rate_fallback_request(channel)` for channels1–11. These return exact
+factory/NEPC/executable program bindings; they confer no transmit permission.
+Channel1 retains NEHT v2/NEFB v1, while channels2–11 require separately bound
+NEHT v3/NEFB v2 records as specified in `rtlwifi.md` §3. These continuations
+are implemented and software-validated in the retained profiles.
+
+RTL8188EE also exposes exact-function `pci::with_controller_at(BusAddr, f)`
+and async `pci::provision_at(BusAddr)`; the existing helpers select the first
+bound controller for compatibility. Independent radios retain per-function
+PCI, frontend, context-send and MSI ownership, software-validated above.
+
+`rtlwifi::set_pcie_aspm(bool)` selects next-preparation PCIe L0s/L1/CLKREQ
+policy. Actual enabled parent policy, endpoint capabilities and native
+hardware receipts gate endpoint entry; the shared bridge/common-clock
+configuration remains platform-owned. Software acceptance is recorded above.
+
+RTL8188EU registers its original receiver as an administrative open/stop
+target. Initial IFF_DOWN follows completed native USB/MAC/card park; UP
+queues retained exact-image wake, and bound control returns Busy until
+that transition finishes. DOWN closes admission immediately and retires
+the old association before parking. Netlink IFF_UP and SIOCSIFFLAGS use
+the existing current administrative handle; scan never creates UP. The
+family §3 records software acceptance at `0eb084197`.
+
+RTL8188EU idle active scan admits one directed SSID or a wildcard and
+up to2048 bytes of structurally checked extra IEs. Each occupied channel
+requires current transmit permission. Source pre/post-probe timing and
+whole basic1 frame airtime bound mandatory dwell admission; actual USB
+delivery and subsequent device TX-state retirement remain distinct. The
+family §3 records software acceptance of this private emitter at `0eb084197`.
+
+Sc/Bz MLD periodic scanning can retain the authorized serving station while
+its exact delegated requester owns the scan. Native link0 timing, current
+correlated MCC facts and unchanged home bounds fence data/key maintenance;
+healthy exact-UID termination restores home ownership. API89 MVM remains
+idle-only. Family §3.61 records software acceptance at `a7797583a`.
+
+RTL8188EU associated passive scanning retains the same station, software
+keys/replay/BA and host rings through qualified cold channel visits. Private
+plaintext Null/QoS Null uses the peer's actual profile and shared sequence
+ownership; native USB/device terminals remain distinct from AP reception.
+Eight composed driver cases and one shared sequence/CCMP case pass native
+release gates at `a7797583a` in the family §3. Associated active scans pass later release acceptance at `aa6b98463`.
+
+MT76's control-only P2P WDEV accepts source-bound REGISTER_FRAME before
+START as host subscription metadata. Native management RX additionally
+requires its actual started independent BSS, current finite ROC and a new
+capture epoch after the completed native RX-prefix cut. Home data owners
+remain separate. Five native MT cases and two shared dispatcher cases pass
+at `a7797583a`; management TX and client/GO data contexts remain open.
+
+RTL8188EU associated active scans retain the same home station, keys, BA
+and host rings. One directed SSID or wildcard and bounded extra IEs use the
+private native probe path after a real cold receive restart, including a
+same-channel visit. Current qualified power, source response timing and
+native USB/device terminals fence each visit; home PHY and peer state are
+restored before normal data resumes. Eight native cases pass release
+acceptance at `aa6b98463` in the family §3.
+
+The admitted API89/Sc/Bz Intel owner can select contiguous 5 GHz 160 MHz
+from actual raw NVM flags and the complete eight-channel current host/MCC
+span. Original shared PHY offers, source-specific VHT/HE TLC maps and native
+RX admission retain negotiated bounds; unavailable wide spans keep a genuine
+80 MHz offer. Six native cases and all537 Intel cases pass release
+acceptance at `aa6b98463`. The family §3.62 documents the interface.
+
+MT76's control WDEV can transmit unkeyed management frames on its actual
+current finite 2/5 GHz ROC. Fresh occupied-power bounds, native OMAC/BMC and
+PID/TXS plus DMA/TX_FREE receipts determine transmission and ACK status;
+MLME multicast status retains the original WDEV/source/cookie. Home packet,
+key and capture owners remain separate. Four native MT cases and two shared
+control cases pass release acceptance at `aa6b98463`. Private ROC/NO_CCK
+retains separate native gates, and client/GO contexts remain open. The
+family §3 records this accepted partial scope.
+
+RTL8188EU HT20/40 LGI uses a distinct signed N8HT v2 qualification covering
+the complete radio program and both emission spans. The retained owner
+selects factory power by primary channel and tunes RF to the center, binds
+each copied receive span to the current installed program, and cold-restores
+20 MHz before key/data traffic when association narrows the offer. Current
+host policy must admit the whole 40 MHz span even for a 20 MHz fallback.
+Existing v1 qualification remains valid for its original profile. Eight new
+native cases await release execution; source review and the combined release
+Clippy probe pass. The family §3 and `rtl8188eu-ht40.md` specify the contract;
+real per-device qualification data remains externally supplied.
+
+MT76 management FRAME can acquire a private native CNM lease when no public
+ROC is active. Only its exact unsolicited grant authorizes publication, and
+the granted finite response window survives TX status and borrower loss
+until native abort/packet retirement completes. This private lease publishes
+no public ROC events. Control-WDEV FRAME accepts the validated empty NO_CCK
+flag and retains its choice through the actual 2.4 GHz descriptor rate;
+legacy netdev/AP acceptance remains unchanged. Four additional native cases
+are wired for this continuation and await release acceptance. Independent
+client/GO contexts and qualified 6 GHz management TX remain open.
+
+Intel Sc/API89/Bz station owners retain explicit 6 GHz band identity through
+raw NVM tails, passive scan jobs, copied RFH descriptors and current host/MCC
+publication proofs. The initial AP20/STA20 HE profile requires SAE-H2E/PMF
+and exact AP power-type/TPE facts; the native AP power command completes
+after link activation and before peer queues or first transmission. Both
+native send paths recheck queued bound beacons at publication, including
+after an async credit wait. CDB FIFO sizing uses the explicit band. Six new
+native cases await release execution; the combined native-context release
+Clippy probe passes. Family §3.63 keeps active/RNR, wider/periodic operation
+and live AP-power replacement as separate open continuations.
+
+RTL8188EE HT40 uses a separately signed NEHT v4 full20/40 program while
+preserving accepted v2/v3 assets. EE wide power follows its source-specific
+center-channel factory lookup, intersected with primary-channel20 fallback
+limits and measured per-rate bounds. The retained owner pauses actual MAC
+transmission, reads back BB/RF/gains and restores20MHz before keys or DATA
+when association narrows. DMA OWN resources remain retained throughout.
+Eight native cases are written; source review and the quick release compile
+probe pass. Native execution is deferred to the combined validation pass.
+The family §3 and `rtl8188ee-ht40.md` specify the contract and external
+per-device qualification requirement.
+
+The admitted Sc/Bz EHT station, RTL8188EE RTS/CTS and conservative thermal
+gain tracking, and hosted MT76 module packet/control lifecycle are source-
+complete. Their immutable source snapshots retain actual native admission,
+current publication and terminal ownership. Optional unadvertised EHT
+capabilities and separate320/MLO work grant no additional operation. The
+MT76 native MCU/WFDMA engine remains permanently resident while the loadable
+frontend owns its real probe/service/control lifecycle. Full native, module
+and cross-architecture validation is deferred to the combined final pass.
+
+AR9285 exposes `Ath9k::power_save_qualification_request()` as
+`Result<PowerSaveQualificationRequest, BringUpError>` factual identity/MAC/
+filename metadata. The existing `WirelessNetIface` power-save SET/GET carries
+desired policy only. An optional current signed N85S1 full-program owner must
+observe actual PM notice/PS-Poll ACK and native idle receipts, fresh TIM/AID
+and actual clock/timer/RX-abort readbacks before NETWORK_SLEEP. Missing N85S1
+leaves existing awake operation and refuses unsupported requests. Original
+key/PN, BA, copied-frame and terminal DMA ownership remain independent.
+Idle FULL_SLEEP and periodic calibration are separate implementations; the
+family §3.9 and `ar9285-station-power-save.md` specify the exact contract.
+
+### 3.3 Additional qualified native control owners
+
+Admitted Intel Sc/Bz/API89/API77 profiles expose the existing typed AP public
+controls through their original device owner, with actual power/beacon/peer/key
+and terminal packet receipts. Prepared typed events complete arbitrary
+callbacks before rechecking the original source/native receive proof, then
+deliver using only the fixed original source and receiver. Optional unadvertised
+AP PHY/DFS/P2P/MLO capabilities remain separate; family §3.68–3.71 is normative.
+
+The managed ath10k Radio implements bounded1–500ms ROC and Public Action FRAME
+through matching native foreign-channel, air-terminal, STOP/COMPLETE and home
+receipts. Registered responses retain the original socket/filter/physical
+generation and callback-free final checks. This supplies no native P2P role.
+AR9285 exposes `periodic_calibration_request()` as factual
+`Result<PeriodicCalibrationRequest, BringUpError>` metadata for a separate signed
+N85P1 full program. Current P1 hardware receipts replace only calibration/ANI
+state; original key/PN/TX/copy owners persist. P1 remains always awake and
+refuses composition with N85S1. Family §3 and the measured-program documents
+define the narrower native and external qualification contracts.
+
+### 3.4 Counted native D0 power owners (validation pending)
+
+AR9285 exposes `request_idle_full_sleep`, `idle_full_sleep_status` and
+`acquire_idle_wake` through its original retained device. Only an admitted
+unassociated Passive owner may retire actual queues/RX/IRQs and enter D0
+FULL_SLEEP. Counted control users fence the transition; cold wake creates a
+fresh20MHz identity before republication. Family §3.11 specifies the exact
+receipt, cancellation and system-suspend barriers.
+
+QCA6174/QCA9377 host-bus power management uses counted actual RTC/SoC wake
+votes and retained MSI-driven quiet/grace ownership. ASPM restoration follows
+actual HIF and input admission. Deferred native polling cannot commit packet,
+key or copied-frame state, and non-MSI profiles keep the awake polling path.
+Family §3 specifies the original DMA/source/control and failure-cleanup rules.
+
+### 3.5 Additional queue and installation owners (validation pending)
+
+Ath10k admits the bounded coherent RAW/10.4 PFC profile only with its actual
+native qstate/peer/fetch/terminal owner. Its indoor-only channel continuation
+requires the current trusted deployment's explicit installation fact on every
+restrictive overlapping rule, preserving all original factory and host limits.
+RTW88 `TxBaRequest` additionally returns factual v2 identity/filename metadata
+for independently owned TIDs0–5; v1 remains unchanged. The public producer
+selects a current same-TID FIFO prefix before reserving PN/SN, and each native
+physical queue and terminal remains independently bound. Family §3 is normative.
+
+Intel Sc/Bz exposes a bounded real control DEVICE with no IFINDEX, UP bit or
+fabricated data endpoint. Original parent, Write/Admin/daemon and native owner
+receipts govern its public ROC/management lifecycle. API89 Ty/So/Ma uses actual
+PHY1/RLC/link1/broadcast-TID16 SESSION2 receipts; original API77 uses its physical
+MAC1/PHY1, legacy broadcast/TID16 and SESSION1 with distinct signed tag8 purpose.
+Both check the completed RFH prefix and original finite Frame Publication after
+credit waits before actual packet publication.
+
+The bounded GO9 continuation uses the retained AP/peer/key/data owner with
+OFDM-only legacy20 rates and distinct native power/role receipts. API77 GO
+requires its separate tag9 qualification. The original preparing GO capture
+retains real NoA received during MAC ADD waits; probe projection requires the
+same completed native prefix and open epoch. Actual software GTK/IGTK counters
+supply sequence-only GET_KEY. Public FRAME/REGISTER retains the original GO
+radio request/reservation through the same native AP owner, including WDEV and
+NO_CCK forms. Family §3.73–3.76 records the partial scope. Thirteen native cases
+are written, four new GO cases unexecuted. One release metadata context and
+scoped formatting pass; full batch acceptance remains pending. CLIENT and
+applicable native P2P power-save controls remain open.
+
+CLIENT8 association/data uses actual MAC7 with a protected OFDM-only legacy20
+program, original role/physical identity and bound P2P/WPS request/peer response.
+Queued native broadcast Beacon NoA changes require the actual CTWindow command
+receipt before packet publication after credit waits. API77 uses distinct tag10
+qualification and restores inactive MAC5 only after terminal peer/queue/PHY
+retirement. Four cases are written and unexecuted; family §3.77 defines this
+partial scope. The retained public CLIENT FRAME/REGISTER worker stays separate.
+
+### 3.6 Native observations and thermal maintenance (validation pending)
+
+Admitted C21 exposes factual `rtl8821c_power_tracking_request()` metadata for
+distinct signed N21W qualification. Actual meter samples, all-rate factory and
+original H/R/T/RTS ceilings, native queue/RX quiet and associated IQK receipts
+govern maintenance; metadata alone grants no RF access. Power-only restore
+retains original key/BA owners; loss after periodic IQK requires a fresh owner.
+The family §3 and `rtw8821ce-power-tracking.md` define the measured contract.
+
+Ath10k lifts only the admitted factory World passive layer using original
+native ESS Beacon and exact START/FOREIGN dwell observations. Immutable
+receipts retain original policy Arc, physical-radio lifetime and every occupied
+20MHz constituent through waits and copied publication. Signed host NO_IR,
+DFS, indoor and unknown restrictions stay independent. Family §3.2 is normative.
+
+### 3.7 Independent native PCI functions (validation pending)
+
+Admitted RTL8852B functions each retain their original BDF/source/reset,
+firmware, power, DMA, key and IRQ owner. A bounded four-entry registry and
+never-reused endpoint cookie route each netdev independently. Old ingress
+holds its name through callback return before removal or rebind; system PM
+blocks new probes and visits every original owner with rollback on failed or
+cancelled preparation. Family §3 defines the original reclamation and native
+receipt requirements; the feature grants no new chip or physical qualification.
+
+RTW88 additionally exposes `provision_function(BusAddr)` and
+`pci::with_controller_at(BusAddr, callback)` for an exact retained function.
+Implicit `provision`/`with_controller` refuse ambiguous live radios. Each
+original controller owns its provisioning mutex and worker; a nonwrapping
+endpoint cookie and ingress-quiescent removal retain the original source,
+key/PN, copied-frame and DMA-reclamation proofs. Family §3 is normative.
+
+### 3.8 Native TLV AP control and packet owner (validation pending)
+
+Ath10k's admitted RAW/HTT3 TLV owner uses the shared typed AP controls for
+legacy20 Open/WPA2 and actual service-qualified U-APSD. Start/key-before-start,
+peer/authorization, control/management, sequence-only GET_KEY and both packet
+endpoints retain the original source, policy Arc, role and native/copy epochs.
+Only actual synchronous native publication opens response windows; copied DATA
+and management retain original peer fences, and queued loss is drained before
+packet handoff without recapturing authority. Terminal cancellation cleanup
+retains native DMA until real receipts, restores NSS/DCF and continues the
+physical worker for a later explicitly admitted BSS. Unsupported protection,
+PHY/security/P2P profiles stay refused before native mutation. Family §3.3 is
+normative; ten native cases are written and unexecuted.
+
+### 3.9 Bounded native FullMAC descriptor prefixes (validation pending)
+
+BCM43602 shared7 admits prefixes1..4 within each original D2H ring item after
+checked geometry at CR4 readiness and runtime attach, before DMA allocation.
+Control/TX/RX retain their24/24/40-byte strides and original wrapped indices;
+owned descriptor copies precede decoding and terminal reclamation. Event
+buffers use the shared offset; DATA uses its explicit nonzero offset or that
+shared fallback, with checked original-buffer bounds. Original firmware/PCI,
+posted identities, transaction correlation, key/port and actual matching
+terminal proofs remain mandatory. Family §3 defines the bounded profile;
+six new native cases are written and unexecuted.
+
+### 3.10 Native primary-bsscfg FullMAC AP (validation pending)
+
+The exact BCM43602 PCIe `Fullmac` adapter exposes the common async AP frontend
+only with its retained native source. `PRIMARY_AP` and opaque original
+`ap_enter`/`ap_send`/`ap_leave`, completed-prefix and peer-retirement contracts
+default to unsupported for SDIO. Firmware owns AP SME and standard beacon/TIM/
+DTIM generation; userspace owns WPA2 authentication through actual key/SCB
+receipts. Prepared station/control events, DATA ring/stack copies and queued
+TX retain original source, policy Arc, role, peer/key/port and native epochs
+through final callbacks. Host staging, IOCTL completion or dropped waiters never
+supply native packet/ACK/PN credit. Failure/cancellation drives retained original
+physical teardown and pins uncertain mappings. Family `brcmfmac.md` §3 defines
+the bounded legacy20 Open/WPA2 CCMP profile and explicit unsupported features;
+CYW43439 keeps its independent AP row open. AP Program IOCTLs additionally
+retain the original `Capture` through input/descriptor/index/doorbell publication
+after native ring setup; definitely unissued refusal stays distinct from
+entered uncertain issue. Ordinary station and physical Stop paths are unchanged.
+Ten native cases are unexecuted. Program SET additionally checks actual
+completed native producers after H2D setup and preserves every queued transition;
+GET remains scoped/read-only, and Session/pending filters share the same
+native transition classifier. The existing case requires genuine loss delivery
+after a denied stale SET and a successful retained-record query.
+
+### 3.11 Original-owner runtime LPS (validation pending)
+
+The admitted RTL8852B station exposes power-save preference only when its
+current signed N52P joint operating program is loaded. The retained worker
+owns actual verified firmware template IDs, controller peer, native command/
+packet queues and RPWM/CPWM/restore receipts. Original source, peer, power and
+admin-UP identity remain required at publication and after waits. A completed
+native prefix and final HCI/backlog guard precede queue issue; unpublished Busy
+retains ordinary ownership, while ambiguous publication pins mappings.
+Ordinary DATA/control and BB tracking stay closed until actual wake restoration.
+A dead RF/interface source cannot authorize a NULL-emitting wake; only current
+original device authority and the sealed same-function temporal FLR receipt can
+retire uncertain DMA. `OpenStopEvent::observe` supplies a nongrant observation
+of the exact current original registration, including preserved-UP replacement;
+old owners never follow a new registration. Family §3 is normative. Seven new
+cases are written and unexecuted; physical measurements remain external.
+
+### 3.12 Native receive-only FullMAC monitor (validation pending)
+
+The exact BCM43602 msgbuf adapter opts into the default-denied common
+`PRIMARY_MONITOR`/Prepared/Armed/raw-copy seam. Actual firmware `rtap` evidence,
+monitor/filter and channel readbacks precede activation; a pending raw-drain
+reservation is no capture receipt. Only actual frame-type2 posted completions
+with bounded native radiotap and an observed matching CHANNEL can reach the
+original AF_PACKET monitor token. Original firmware/PCI, policy Arc, admin/
+registration/MAC, mode and copy generations remain required at final publication.
+Copied raw bytes never enter Ethernet or infer missing PHY/decryption facts.
+A completed control prefix precedes publication while continuous raw traffic
+need not become globally idle. DOWN/source loss/PM closes old copy/token first;
+uncertain cleanup pins native mappings. Family §3 defines the exclusive20MHz
+receive-only profile; CYW43439 remains default unsupported. Seven new cases are
+written and unexecuted.
+
+### 3.13 Separately qualified two-stream HT20 (validation pending)
+
+The RTL8822CE HT request may expose an optional `two_streams` child only from
+its original actual two-path hardware and complete factory fields. The child
+is a nongrant proposal for the distinct N22H256v2 asset; the original v1 proposal,
+record bytes and fallback remain unchanged. Actual source/backend queue-quiet
+proofs, TX/RX parking and gain/path/reset/readbacks precede current original
+source resume. Local RX16 and negotiated peer TX selection remain independent;
+native RA/TXWD/RXD and timing cover only qualified uncoded MCS0..15. Existing
+one-stream coding records cannot authorize coded two-stream emission. Family
+§3 defines the complete profile and measured envelope; five new cases remain
+unexecuted. The independent default-unsupported SDIO disable helper is specified
+in `drivers/sdio/specification/spec.md` §3 and supplies no standalone Wi-Fi
+stop/reset or feature credit.
+
+### 3.14 Original-owner stop, reset, rejoin and monitor (validation pending)
+
+CYW43439's native PIO transport supplies confirmed-stop success only after the
+actual original host/IRQ, F2, CM3/D11/RAM, clock and F1 receipts; generic or gSPI
+adapters remain unproved. SDPCM Runtime closes work before teardown and pins
+uncertain owners. The separate opaque SDIO source retains actual native PCI and
+nonreviving host/controller/card currentness; it grants no firmware, RF or DATA
+permission. Its fixed-copy scope excludes hardware waits and arbitrary callbacks.
+
+RTL8852B monitor uses fresh role7/NoLink with CMAC TX/autoresponses continuously
+closed. Native source RF/channel observations and completed raw prefix precede
+capture; only original current source/admission/admin/MAC/capture generations
+can publish to AF_PACKET. Pending fixed-channel metadata earns no native receipt,
+and no retune or new RF emitter is introduced. Existing signed v2 bytes remain
+unchanged. Other channels, optional metadata and injection stay unadvertised.
+
+RTW88 `reset_function` serializes its original BDF, retires old ingress and actual
+native DMA, then performs current source card reset and factory identity checks
+before a fresh cold firmware shell. `rejoin_function` preserves the original
+netdev and uses explicit zeroizing pending credentials for fresh provisioning,
+scan and native authentication; original new-UP identity remains a denial fence
+through real publication. No old peer/key/PN or automatic credentials are replayed.
+Family §3 sections are normative. Eighteen feature cases plus two SDIO helper
+cases are written and unexecuted; physical acceptance remains separate.
+
+### 3.15 Retained system suspend and cold resume (validation pending)
+
+The RTW88 async family hook retains the original function barrier and hardware
+worker through foreground cancellation. Only actual callback/DMA retirement,
+card-off, PCI power-state/config and original-source DBI receipts permit a fresh
+cold generation on the original netdev. Operating owners must earn new firmware,
+calibration and policy before resume succeeds; unqualified cold shells gain no
+RF admission. Old keys, PN/BA and queued packets stay retired, with fresh explicit
+association afterward. Six cases remain unexecuted. The independent shared
+management-fragment continuation preserves the original four-slot/key/PMF owner
+and grants no native or Wi-Fi feature credit. Family and wireless §3 contain
+the complete contracts; physical system sleep acceptance remains external.
+
+### 3.16 Source-qualified native host fragmentation (validation pending)
+
+RTL8852B may expose the existing fragmentation threshold control only when its
+original full joint N52F emitter is current. A retained native binding precedes
+crypto; every immutable train owns one MSDU SN, per-fragment PN and exact native
+terminal identity. Pre-issue refusal may defer without crypto retries; newly
+pending input after issue denies the actual doorbell while preserving uncertain
+DMA. Only matching DMA plus successful RPQ/body receipts advance the train.
+RX parsing adds no emission permission and retains the original native source,
+peer and cryptographic cache through complete reassembly. Family §3 defines the
+profile and eight unexecuted cases. Independent RTW88 firmware feature/wire and
+unassociated IPS continuations remain partial runtime-sleep work; they grant no
+new RF admission or completed-row credit.
+
+### 3.17 Native CYW43439 SDIO AP (validation pending)
+
+CYW43439 advertises the primary-bsscfg AP only through the actual Card/SDHCI,
+signed CM3 loader, F1/F2 and SDPCM/BCDC firmware-SME path with its original
+typed source, native `ap` token and GET_AP0 discovery. Program IOCTL/DATA is
+one whole zero-tailed F2 block COMMAND (padding inferred from Linux `sdio.c`,
+not a board measurement); a fresh mailbox with pending RX defers an unissued
+packet, and nothing is retried after issue. Ordinary RX denied at the ring is
+never delivered to the stack. Family `cyw43439.md` lists nine unexecuted cases.
+2026-11-02 recount: 53 open features plus 25 implemented pending validation
+(78 including unvalidated); the full release/native matrix is now due.
+
+### 3.18 RTW88 associated nondeep LPS (validation pending)
+
+RTW88 runtime sleep composes the committed unassociated IPS with associated
+nondeep LPS on C21 CCK1/channel1. LPS H2C commands use a PS-specific mailbox
+submission: after HMEBOX_EXT staging and immediately before the publishing
+low word it re-checks the original PS source and the native Core RX-prefix
+receipt; newly pending input leaves the command unissued for a bounded retry,
+and nothing is retried after publication. Family `rtw88.md` lists the cases.
+2026-11-02 recount: 52 open features plus 26 implemented pending validation.
+
 
 ## 4. Interaction with `narf-wireless`
 

@@ -13,6 +13,9 @@ use narf_capabilities::{Cap, Write};
 #[derive(Clone, Debug)]
 pub(in crate::iwlwifi) struct TxTrace(
     alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::collections::VecDeque<Published>>>,
+    alloc::sync::Arc<
+        narf_lib::sync::IrqSafeSpinLock<alloc::collections::VecDeque<ReceiveFirmware>>,
+    >,
 );
 
 #[derive(Debug)]
@@ -82,8 +85,101 @@ impl TxTrace {
         });
         Ok(())
     }
+    /// Capture CPU views only from rings retained by the native Resources
+    /// owner, after their native RFH configuration receipt. Its initial
+    /// free index publishes the posted prefix. Observed DMA addresses
+    /// are compared as integers, never converted into writable CPU views.
+    pub(super) fn receive_queue(&self, queue: &ReceiveQueue) -> Result<(), &'static str> {
+        let mut views = self.1.lock();
+        if views.len() == 15 || views.iter().any(|view| view.queue == queue.id) {
+            return Err("private additional RFH observation bound/duplicate");
+        }
+        views.push_back(ReceiveFirmware {
+            queue: queue.id,
+            dma: [
+                queue.status.dma_addr().raw(),
+                queue.free.dma_addr().raw(),
+                queue.used.dma_addr().raw(),
+            ],
+            free_write: (queue.write & !7) as u32,
+            buffers: queue
+                .buffers
+                .iter()
+                .map(|buffer| buffer.as_mut_ptr() as usize)
+                .collect(),
+            used: queue.used.as_mut_ptr() as usize,
+            status: queue.status.as_mut_ptr() as usize,
+            next: 0,
+            format: queue.format,
+        });
+        Ok(())
+    }
+    /// # Safety
+    /// The fixture must keep the native Hardware/rings alive and serialize
+    /// device injection with every host poll until this view is retired.
+    pub(in crate::iwlwifi) unsafe fn take_receive_queue(
+        &self,
+        queue: u8,
+    ) -> Option<ReceiveFirmware> {
+        let mut views = self.1.lock();
+        let index = views.iter().position(|view| view.queue == queue)?;
+        views.remove(index)
+    }
     pub(in crate::iwlwifi) fn take(&self) -> Option<Published> {
         self.0.lock().pop_front()
+    }
+}
+
+#[derive(Debug)]
+pub(in crate::iwlwifi) struct ReceiveFirmware {
+    pub queue: u8,
+    pub dma: [u64; 3], // actual retained status/free/used DMA identities
+    pub free_write: u32,
+    buffers: Vec<usize>,
+    used: usize,
+    status: usize,
+    next: u16,
+    format: rx_rfh::CompletionFormat,
+}
+impl ReceiveFirmware {
+    pub(in crate::iwlwifi) fn inject(
+        &mut self,
+        command: u8,
+        group: u8,
+        sequence: u16,
+        payload: &[u8],
+    ) {
+        let index = usize::from(self.next);
+        assert!(index < self.buffers.len() && index < self.free_write as usize);
+        assert!(8 + payload.len() <= RX_BUFFER_BYTES);
+        let mut header = [0; 8];
+        boot_context::put32(&mut header, 0, payload.len() as u32 + 4);
+        header[4] = command;
+        header[5] = group;
+        boot_context::put16(&mut header, 6, sequence);
+        // SAFETY: the constructor's fixture contract keeps these actual CPU
+        // allocation views live and excludes a concurrent host copy. The
+        // posted initial prefix and complete copied extents are checked above.
+        unsafe {
+            let buffer = self.buffers[index] as *mut u8;
+            core::ptr::write_bytes(buffer, 0, RX_BUFFER_BYTES);
+            core::ptr::copy_nonoverlapping(header.as_ptr(), buffer, 8);
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), buffer.add(8), payload.len());
+            let tag_offset = if self.format == rx_rfh::CompletionFormat::Ax210 {
+                4
+            } else {
+                0
+            };
+            core::ptr::write_volatile(
+                (self.used as *mut u8)
+                    .add(index * self.format.size() + tag_offset)
+                    .cast::<u16>(),
+                (self.next + 1).to_le(),
+            );
+            dma_barrier();
+            self.next += 1;
+            core::ptr::write_volatile((self.status as *mut u8).cast::<u16>(), self.next.to_le());
+        }
     }
 }
 
@@ -212,6 +308,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         mmio,
         resources: core::mem::ManuallyDrop::new(Resources {
             rx,
+            extra_rx: Vec::new(),
             commands: CommandQueue::new().unwrap(),
             boot: BootImage {
                 context: dma_alloc(4096).unwrap(),
@@ -246,14 +343,41 @@ pub(in crate::iwlwifi) fn create_for_format(
         responses: alloc::collections::VecDeque::new(),
         tx_completed: alloc::collections::VecDeque::new(),
         versions: Vec::new(),
+        band_in_rx: false,
+        scan_fixed_antenna: false,
+        scan_six_capabilities: 0,
+        six_tx_profile: None,
+        ap_owner: None,
+        p2p_go: None,
+        p2p_client: None,
+        client_request: None,
+        client_rx: None,
+        client_receiver: None,
+        client_rx_mvm: None,
+        client_copies: Vec::new(),
+        ap_request: None,
+        ap_gen2: None,
+        p2p: p2p::State::default(),
+        mld_link: None,
+        eht_source: None,
+        bios_versions: Vec::new(),
+        platform_power: platform_power::State::default(),
+        shared_memory: smem::State::default(),
         armed: false,
         failed: false,
+        in_d3: false,
         station_stop: None,
         protected_tx: 0,
         // This RAM constructor models an already admitted post-INIT owner.
         // Real association immediately closes/reserves its own generation.
         rx_epoch: rx_epoch::State::model(),
+        receive_queues: rx_multi::State::default(),
         sources: None,
+        rf_policy: None,
+        scan_mcc_watch: false,
+        api89: None,
+        bz: None,
+        mld_station: false,
     };
     (hardware, firmware)
 }
@@ -275,6 +399,21 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.responses);
         core::ptr::drop_in_place(&mut hardware.tx_completed);
         core::ptr::drop_in_place(&mut hardware.versions);
+        core::ptr::drop_in_place(&mut hardware.bios_versions);
+        core::ptr::drop_in_place(&mut hardware.platform_power);
+        core::ptr::drop_in_place(&mut hardware.shared_memory);
+        core::ptr::drop_in_place(&mut hardware.receive_queues);
+        core::ptr::drop_in_place(&mut hardware.ap_owner);
+        core::ptr::drop_in_place(&mut hardware.p2p_go);
+        core::ptr::drop_in_place(&mut hardware.p2p_client);
+        core::ptr::drop_in_place(&mut hardware.client_request);
+        core::ptr::drop_in_place(&mut hardware.client_rx);
+        core::ptr::drop_in_place(&mut hardware.client_receiver);
+        core::ptr::drop_in_place(&mut hardware.client_rx_mvm);
+        core::ptr::drop_in_place(&mut hardware.client_copies);
+        core::ptr::drop_in_place(&mut hardware.ap_request);
+        core::ptr::drop_in_place(&mut hardware.ap_gen2);
+        core::ptr::drop_in_place(&mut hardware.p2p);
     };
 }
 
@@ -282,11 +421,36 @@ pub(in crate::iwlwifi) fn versions(hardware: &mut Hardware, commands: &[u8]) {
     hardware.versions = commands.to_vec();
 }
 
+/// Consume the same decoded firmware facts as native Hardware::new.
+/// No production fields are supplied as a second synthetic profile.
+pub(in crate::iwlwifi) fn firmware_profile(
+    hardware: &mut Hardware,
+    parsed: &ParsedUcode<'_>,
+) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff || hardware.armed || !hardware.resources.data.is_empty()
+    {
+        return Err("model firmware metadata on a live/native station");
+    }
+    hardware.p2p.metadata(&parsed.api)?;
+    hardware.versions = parsed.api.commands.to_vec();
+    hardware.band_in_rx = parsed.api.api_changes[1] & (1 << 27) != 0;
+    hardware.scan_fixed_antenna = parsed.api.has_capability(111);
+    hardware.scan_six_capabilities =
+        u8::from(parsed.api.has_capability(59)) | (u8::from(parsed.api.has_capability(10)) << 1);
+    // A metadata inventory alone is not a new ALIVE/PNVM source proof.
+    hardware.eht_source = None;
+    hardware.ap_gen2 = None;
+    hardware.shared_memory = smem::State::new(parsed);
+    hardware.receive_queues = rx_multi::State::new(parsed);
+    Ok(())
+}
+
 /// Post-firmware-ready Sc model with no pre-created station queues. The
 /// composition must allocate and retain every queue through real commands.
 pub(in crate::iwlwifi) fn station_model() -> (Hardware, Firmware, TxTrace) {
     let (mut hardware, firmware, trace) = station_model_for_format(rx_rfh::CompletionFormat::Bz);
     hardware.device.id.device = 0xe340;
+    hardware.mld_station = true;
     (hardware, firmware, trace)
 }
 
@@ -295,9 +459,14 @@ pub(in crate::iwlwifi) fn station_model_for_format(
 ) -> (Hardware, Firmware, TxTrace) {
     let (mut hardware, firmware) = create_for_format(false, format);
     hardware.resources.data.clear();
-    let trace = TxTrace(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-        alloc::collections::VecDeque::new(),
-    )));
+    let trace = TxTrace(
+        alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+            alloc::collections::VecDeque::new(),
+        )),
+        alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+            alloc::collections::VecDeque::new(),
+        )),
+    );
     hardware.resources.commands.trace = Some(trace.clone());
     (hardware, firmware, trace)
 }
@@ -317,6 +486,16 @@ pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'stati
     let mut commands = CommandQueue::new()?;
     commands.trace = trace;
     hardware.resources.commands = commands;
+    hardware.platform_power = platform_power::State::default();
+    hardware.eht_source = None;
+    hardware.shared_memory.reset();
+    hardware.receive_queues.reset();
+    // This is the fixture's terminal DMA-stop boundary. Retire observation
+    // views before releasing any of the actual additional ring allocations.
+    if let Some(trace) = &hardware.resources.commands.trace {
+        trace.1.lock().clear();
+    }
+    hardware.resources.extra_rx.clear();
     hardware.resources.data.clear();
     hardware.rx_epoch.reset_after_dma_stop();
     hardware.failed = false;
@@ -360,9 +539,14 @@ mod trace_tests {
     fn smoke_iwl_trace_reads_actual_published_dma_slot_and_body() -> TestResult {
         let body = dma_alloc(24).unwrap();
         let descriptors = dma_alloc(1024).unwrap();
-        let trace = TxTrace(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-            alloc::collections::VecDeque::new(),
-        )));
+        let trace = TxTrace(
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                alloc::collections::VecDeque::new(),
+            )),
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                alloc::collections::VecDeque::new(),
+            )),
+        );
         // Independent packed TFH bytes, written to slot3 rather than slot0.
         let mut descriptor = [0u8; 256];
         descriptor[..2].copy_from_slice(&2u16.to_le_bytes());
@@ -412,4 +596,44 @@ mod trace_tests {
         "drivers/wireless/iwlwifi/runtime",
         smoke_iwl_trace_reads_actual_published_dma_slot_and_body
     );
+}
+
+/// RAM identity supplied by the native fixture's device side. Production
+/// profile admission still reads these actual owned MMIO registers and its
+/// retained executable; this creates no physical PCI or calibration grant.
+pub(in crate::iwlwifi) fn native_station_identity(
+    hardware: &mut Hardware,
+    did: u16,
+    revision: u32,
+    radio: u32,
+) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff
+        || hardware.armed
+        || !hardware.resources.data.is_empty()
+        || hardware.api89.is_some()
+    {
+        return Err("API89 model identity on live/native owner");
+    }
+    hardware.device.id.device = did;
+    hardware
+        .mmio
+        .write(super::super::regs::CSR_HW_REV, revision);
+    hardware.mmio.write(0x9c, radio);
+    Ok(())
+}
+
+/// Post-ready source fixture: supplied ALIVE/PNVM bytes pass the same
+/// production RF/SKU parser as native boot. No feature boolean is injected.
+pub(in crate::iwlwifi) fn eht_boot(
+    hardware: &mut Hardware,
+    parsed: &ParsedUcode<'_>,
+    subsystem: u16,
+    alive: &[u8],
+) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff || hardware.armed || !hardware.resources.data.is_empty()
+    {
+        return Err("model EHT source on live/native owner");
+    }
+    hardware.device.id.subsystem_id = subsystem;
+    hardware.retain_eht_boot(parsed, alive)
 }

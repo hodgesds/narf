@@ -1,0 +1,44 @@
+//! RTL8723AE (`rtl8723ae` + `rtl8723com`) retained runtime, in progress.
+//!
+//! RTL8723AE (PCI `0x8723`) is the 1T1R 802.11n + Bluetooth combo of the
+//! RTL8192C generation: 92CE-style linked TX rings, its own `pwrseq` flows,
+//! `rtl8723com` firmware download / PHY helpers and its own BT coexistence
+//! (`hal_btc.c` + `hal_bt_coexist.c`). It is not admitted yet (probe keeps it
+//! diagnostic).
+//!
+//! ## References (GPL-2.0; NARF is GPL-2.0-or-later)
+//!
+//! - `rtlwifi/rtl8723ae/{hw,sw,pwrseq,reg,def}.{c,h}`
+//! - `rtlwifi/rtl8723com/fw_common.{c,h}`
+//!
+//! ## Modules
+//!
+//! - [`version`] — `_rtl8723e_read_chip_version` (normal 8723-series parts
+//!   only), the `def.h` predicates and the `rtl8723e_init_sw_vars`
+//!   firmware selection (`rtl8723fw.bin` / `rtl8723fw_B.bin`).
+//! - [`adapter`] — `rtl8723e_read_eeprom_info` / `_rtl8723e_read_adapter_info`
+//!   factory facts, `rtl8723e_read_bt_coexist_info_from_hwpg` and the OEM
+//!   rule.
+//! - [`pwrseq`] — PCI rows of every `rtl8723A_*_flow` (`pwrseq.{c,h}`).
+//! - [`power`] — the `_rtl8712e_init_mac` segment after the enable flow
+//!   (PCIe/eMAC bits and the ePHY MDIO loop).
+//! - [`fw`] — header validation and `rtl8723_download_fw` with
+//!   `rtl8723ae_firmware_selfreset`.
+
+#![allow(dead_code)]
+
+pub mod adapter;
+pub mod fw;
+pub mod power;
+pub mod pwrseq;
+pub mod version;
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests;
+
+/// PCI device ID (`rtl8723ae/sw.c` `rtl8723e_pci_ids`).
+pub const DEV_ID: u16 = super::regs::RTL_DEV_8723AE;
+
+/// Mapped IO range size (`pci.h::RTL_MEM_MAPPED_IO_RANGE_8192CE`, used by
+/// every rtlwifi PCI chip of this generation).
+pub const MMIO_SIZE: usize = 0x4000;

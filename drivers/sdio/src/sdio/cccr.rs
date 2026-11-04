@@ -24,6 +24,8 @@ pub const CCCR_INT_ENABLE: u32 = 0x04;
 pub const CCCR_INT_PENDING: u32 = 0x05;
 /// I/O Abort (R/W).
 pub const CCCR_IO_ABORT: u32 = 0x06;
+/// CCCR I/O Abort RES: reset the card's I/O portion (`SDIO_CCCR_ABORT` 0x08).
+pub const IO_ABORT_RES: u8 = 0x08;
 /// Bus Interface Control — bus-width, CD disable, … (R/W).
 pub const CCCR_BUS_IFACE: u32 = 0x07;
 /// Card Capability (R).
@@ -58,9 +60,12 @@ pub const CCCR_INT_EXT: u32 = 0x16;
 pub const BUS_IFACE_BW_MASK: u8 = 0x03;
 pub const BUS_IFACE_BW_1BIT: u8 = 0x00;
 pub const BUS_IFACE_BW_4BIT: u8 = 0x02;
+/// `SDIO_BUS_ASYNC_INT`: asynchronous interrupt in 1-bit mode (SDIO 3.0).
+pub const BUS_IFACE_ASYNC_INT: u8 = 0x20;
 pub const BUS_IFACE_CD_DISABLE: u8 = 0x80;
 
 // CCCR_CARD_CAPABILITY bits
+pub const CARD_CAP_SMB: u8 = 0x02; // supports multi-block CMD53
 pub const CARD_CAP_LSC: u8 = 0x40; // low-speed card
 pub const CARD_CAP_4BLS: u8 = 0x80; // 4-bit low-speed card
 

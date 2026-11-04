@@ -249,3 +249,76 @@ kernel_test_in!(
     "drivers/wireless/rtw89/radio",
     smoke_rtw8852b_static_phy_current_policy_ignored_writes_and_cancel_fail_closed
 );
+
+/// phy.c dm_init sub-inits for RTL8852C: `rtw8852c_dig_regs` (R_SEG0R_PD
+/// 0x481c bit 29, `_V1` PAGCUGC 0x4c24/0x4c28/0x4ce8/0x4cec), CCK PD on every
+/// cut, XTAL SC_XO/SC_XI, `cfo_hw_comp = false` (R_DCFO 1, UL CFO cleared)
+/// and EDCCA; B-only registers stay untouched and chips never cross.
+fn smoke_rtw8852c_dm_subinit_physts_dig_cfo_edcca_follow_rtw8852c_regs() -> TestResult {
+    let c = crate::rtw89::factory::tests::c_identity();
+    if c.chip() != crate::rtw89::mac::ChipId::Rtl8852C
+        || !c.calibration().valid
+        || c.calibration().rfe_type == 255
+    {
+        return TestResult::Fail("C factory fixture is not a valid RTL8852C identity");
+    }
+    let seed = 0xa5u8;
+    let fill = u32::from(seed) * 0x0101_0101;
+    let mut model = Model::new(seed);
+    let mut operating = Operating::default();
+    // SAFETY: isolated model; B entry must refuse a C identity before access.
+    if ready(unsafe { operating.prepare(&mut model, c) }) != Some(Err(Error::Table))
+        || model.accesses != 0
+    {
+        return TestResult::Fail("B static PHY accepted an RTL8852C identity");
+    }
+    let mut operating = Operating::default();
+    // SAFETY: isolated C PHY0/channel1/20/no-link model.
+    if ready(unsafe { operating.prepare_c(&mut model, c) }) != Some(Ok(())) {
+        return TestResult::Fail("C DM sub-init failed");
+    }
+    let w = |a: u32| model.words[(0x10000 + a) as usize / 4];
+    let cap = c.xtal() & 0x7f;
+    if w(0x481c) & 0x7c0 != 0
+        || w(0x481c) & (1 << 29) != 0
+        || w(0x4b74) & (1 << 30) != 0
+        || w(0x4b64) >> 24 != 0x80
+        || [0x4c24, 0x4c28, 0x4ce8, 0x4cec]
+            .into_iter()
+            .any(|a| w(a) & 0x20 != 0)
+        || w(0x4494) & (1 << 29) == 0
+        || (w(0x4490) >> 24) & 15 != 8
+        || w(0x4264) & 0xff != 1
+        || model.words[0xd248 / 4] & 7 != 0
+        || (w(0xc70) >> 20) & 0x3f != 0x29
+        || model.xtal[5] != cap
+        || model.xtal[4] != cap
+        || w(0x738) & 0xc != 0xc
+    {
+        return TestResult::Fail("C DM sub-init values differ from rtw8852c/phy.c");
+    }
+    if [0x4860, 0x46e8, 0x46ec, 0x47a8, 0x47ac]
+        .into_iter()
+        .any(|a| w(a) != fill)
+    {
+        return TestResult::Fail("C DM sub-init wrote a B-only DIG register");
+    }
+    match operating.working() {
+        Some(state) if state.cck_pd && state.crystal_cap == cap && state.rfe == 5 => {}
+        _ => return TestResult::Fail("C DM sub-init retained state differs"),
+    }
+    let mut model = Model::new(seed);
+    let mut operating = Operating::default();
+    // SAFETY: isolated model; C entry must refuse a B identity before access.
+    if ready(unsafe { operating.prepare_c(&mut model, identity(1, 0x33)) })
+        != Some(Err(Error::Table))
+        || model.accesses != 0
+    {
+        return TestResult::Fail("C DM sub-init accepted an RTL8852B identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/radio",
+    smoke_rtw8852c_dm_subinit_physts_dig_cfo_edcca_follow_rtw8852c_regs
+);

@@ -1,4 +1,4 @@
-//! WPA2-PSK/CCMP EAPOL processing for the live station path.
+//! Negotiated PSK/SAE CCMP EAPOL processing for the live station path.
 //! Authenticate the original wire PDU before changing replay/key state.
 //! Retransmissions return cached replies without reinstalling keys.
 
@@ -6,6 +6,10 @@ use super::{handshake, rekey, wpa};
 use alloc::{boxed::Box, vec::Vec};
 use narf_wireless::eapol::*;
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "security_mlo_tests.rs"]
+mod mlo_tests;
 
 /// Production nonces require the guarded hardware entropy path. A partial
 /// failing sample stays private and is zeroized before returning an error.
@@ -28,9 +32,53 @@ pub struct KeyUpdate {
     pub group_id: u8,
     pub group_rx_pn: u64,
     /// 802.11w Integrity GTK (BIP-CMAC-128) + its key index, present only
-    /// when management-frame protection was negotiated (WPA3-SAE).
+    /// when management-frame protection was negotiated (PSK or SAE).
     /// IGTK material, key index and the KDE IPN (receive replay floor).
     pub igtk: Option<([u8; 16], u16, u64)>,
+    /// Each accepted further MLD link's own GTK/IGTK from its MLO GTK/IGTK
+    /// KDEs, in `Session::with_further_links` order. Empty otherwise.
+    pub links: Vec<LinkGroupKeys>,
+}
+
+/// One further link's group keys and their receive replay floors. They are
+/// installed only on that link's firmware STA (`iwl_mld_get_key_sta_mask`).
+pub struct LinkGroupKeys {
+    pub link_id: u8,
+    pub group: [u8; 16],
+    pub group_id: u8,
+    pub group_rx_pn: u64,
+    pub igtk: Option<([u8; 16], u16, u64)>,
+}
+
+impl core::fmt::Debug for LinkGroupKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LinkGroupKeys")
+            .field("link_id", &self.link_id)
+            .field("group_id", &self.group_id)
+            .field("mfp", &self.igtk.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LinkGroupKeys {
+    fn drop(&mut self) {
+        self.group.zeroize();
+        if let Some((igtk, _, _)) = &mut self.igtk {
+            igtk.zeroize();
+        }
+    }
+}
+
+/// A further requested MLD link's identity and its own AP RSNE/RSNXE
+/// bodies (from that link's beacon), which its M3 MLO Link KDE must repeat.
+/// A rejected link (`accepted == false`) still appears in M2 and needs its
+/// M3 Link KDE (hostap `sm->mlo.req_links`) but delivers no group keys.
+#[derive(Clone)]
+pub(super) struct FurtherLinkSecurity {
+    pub context: narf_wireless::association::mlo::Context,
+    pub ap_rsn: Vec<u8>,
+    pub ap_rsnxe: Option<Vec<u8>>,
+    pub accepted: bool,
 }
 
 impl core::fmt::Debug for KeyUpdate {
@@ -61,9 +109,13 @@ pub enum Akm {
     /// WPA2-Personal (00-0F-AC:2): HMAC-SHA1 PRF + HMAC-SHA1-128 MIC,
     /// Key Descriptor Version 2.
     Wpa2Psk,
+    /// PSK-SHA256 (AKM6), SHA-256 KDF and AES-CMAC MIC, descriptor3.
+    Wpa2PskSha256,
     /// WPA3-Personal SAE (00-0F-AC:8): SHA-256 KDF + AES-128-CMAC MIC,
     /// Key Descriptor Version 0, management-frame protection required.
     Wpa3Sae,
+    /// SAE-EXT-KEY group19 (AKM24): SHA-256 KDF and HMAC-SHA256-128 MIC.
+    Wpa3SaeExtKey,
 }
 
 impl Akm {
@@ -71,7 +123,8 @@ impl Akm {
     fn ki_version(self) -> u16 {
         match self {
             Akm::Wpa2Psk => KI_VERSION_HMAC_SHA1_AES,
-            Akm::Wpa3Sae => 0,
+            Akm::Wpa2PskSha256 => KI_VERSION_AES_128_CMAC,
+            Akm::Wpa3Sae | Akm::Wpa3SaeExtKey => 0,
         }
     }
 
@@ -87,21 +140,41 @@ impl Akm {
         match self {
             Akm::Wpa2Psk => wpa::derive_ptk_sha1(pmk, aa, sa, anonce, snonce, tk_len),
             Akm::Wpa3Sae => wpa::derive_ptk_sha256(pmk, aa, sa, anonce, snonce, tk_len),
+            Akm::Wpa2PskSha256 => {
+                wpa_pmk_to_ptk(KeyMgmt::PskSha256, pmk, aa, sa, anonce, snonce, tk_len)
+            }
+            Akm::Wpa3SaeExtKey => {
+                wpa_pmk_to_ptk(KeyMgmt::SaeExtKey, pmk, aa, sa, anonce, snonce, tk_len)
+            }
         }
     }
 
     fn mic(self, kck: &[u8], eapol_with_zero_mic: &[u8]) -> [u8; 16] {
         match self {
             Akm::Wpa2Psk => handshake::compute_mic(kck, eapol_with_zero_mic),
-            Akm::Wpa3Sae => wpa::compute_mic_cmac(kck, eapol_with_zero_mic),
+            Akm::Wpa3Sae | Akm::Wpa2PskSha256 => wpa::compute_mic_cmac(kck, eapol_with_zero_mic),
+            Akm::Wpa3SaeExtKey => narf_crypto::hkdf::hmac_sha256(kck, eapol_with_zero_mic)[..16]
+                .try_into()
+                .unwrap(),
         }
     }
 
     /// The STA's own RSN IE body, echoed in M2 and checked by the AP.
-    fn sta_rsn_ie(self) -> Vec<u8> {
+    pub(super) fn sta_rsn_ie(self) -> Vec<u8> {
         match self {
             Akm::Wpa2Psk => narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
             Akm::Wpa3Sae => narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body(),
+            Akm::Wpa2PskSha256 | Akm::Wpa3SaeExtKey => {
+                let mut rsn = if self == Akm::Wpa2PskSha256 {
+                    narf_wireless::rsn::RsnIe::wpa2_psk_ccmp()
+                } else {
+                    narf_wireless::rsn::RsnIe::wpa3_sae_ccmp()
+                };
+                rsn.akms = alloc::vec![narf_wireless::rsn::Suite::standard(
+                    if self == Akm::Wpa2PskSha256 { 6 } else { 24 }
+                )];
+                rsn.encode_body()
+            }
         }
     }
 }
@@ -349,6 +422,28 @@ mod tests {
         if m2.keys.is_some() || !session.complete() || session.ptk.as_ref().unwrap().tk != old_key {
             return TestResult::Fail("unauthenticated rekey M1 replaced the active PTK");
         }
+        let wire = KeyFrame::decode(&m2.bytes[4..], 16).unwrap();
+        let mut unsigned = m2.bytes.clone();
+        unsigned[81..97].fill(0);
+        if wire.key_information
+            != (KI_VERSION_HMAC_SHA1_AES | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC | KI_SECURE)
+            || wire.key_mic
+                != handshake::compute_mic(
+                    &session
+                        .pending_rekey
+                        .as_ref()
+                        .unwrap()
+                        .ptk
+                        .as_ref()
+                        .unwrap()
+                        .kck,
+                    &unsigned,
+                )
+        {
+            return TestResult::Fail(
+                "native pairwise rekey M2 lost installed-PTK Secure/MIC context",
+            );
+        }
         let retry = session
             .process_with_nonce(&rekey1, || panic!("duplicate M1 regenerated SNonce"))
             .unwrap();
@@ -444,10 +539,76 @@ mod tests {
         "drivers/wireless/iwlwifi/security",
         smoke_wpa3_sae_m1_m2_descriptor_and_cmac_mic
     );
+    fn smoke_negotiated_rsnxe_binds_m2_and_authenticated_m3_before_keys() -> TestResult {
+        (|| {
+            let (session, m1, m3) = fixture();
+            let mut session =
+                session.with_rsn_extensions(Some(alloc::vec![0x20]), Some(alloc::vec![0x20]))?;
+            let response = session.process(&m1)?;
+            let m2 = KeyFrame::decode(&response.bytes[4..], 16).ok_or("RSNXE M2 decode")?;
+            let mut expected = alloc::vec![48, session.ap_rsn.len() as u8];
+            expected.extend_from_slice(&session.ap_rsn);
+            expected.extend_from_slice(&[244, 1, 0x20]);
+            if m2.key_data != expected {
+                return Err("M2 omitted/changed negotiated station RSNXE");
+            }
+            let ptk = session.ptk.as_ref().unwrap();
+            let mut unsigned = response.bytes.clone();
+            unsigned[81..97].fill(0);
+            if m2.key_mic.as_slice() != handshake::compute_mic(&ptk.kck, &unsigned) {
+                return Err("M2 MIC did not authenticate RSNXE");
+            }
+            let kck = ptk.kck.clone();
+            let kek: [u8; 16] = ptk.kek.as_slice().try_into().unwrap();
+            // Independently authenticated, encrypted M3 variants: absent,
+            // changed and duplicate AP RSNXE must preserve M1's state.
+            for variants in [
+                alloc::vec![],
+                alloc::vec![0],
+                alloc::vec![0x20, 0x20],
+                alloc::vec![0x20],
+            ] {
+                let mut clear = alloc::vec![48, session.ap_rsn.len() as u8];
+                clear.extend_from_slice(&session.ap_rsn);
+                for value in &variants {
+                    clear.extend_from_slice(&[244, 1, *value]);
+                }
+                clear.extend_from_slice(&[221, 22, 0, 15, 172, 1, 1, 0]);
+                clear.extend_from_slice(&[0x77; 16]);
+                if clear.len() % 8 != 0 {
+                    clear.push(221);
+                }
+                while clear.len() % 8 != 0 {
+                    clear.push(0);
+                }
+                let mut challenge = KeyFrame::decode(&m3[4..], 16).ok_or("RSNXE M3 decode")?;
+                challenge.key_data =
+                    narf_crypto::aes_kw::aes_wrap(&kek, &clear).ok_or("RSNXE M3 wrap")?;
+                handshake::install_mic(&mut challenge, &kck);
+                let result = session.process(&challenge.into_eapol());
+                if variants == [0x20] {
+                    if result?.keys.is_none() || !session.complete() {
+                        return Err("valid authenticated AP RSNXE did not complete");
+                    }
+                } else if result.is_ok() || session.complete() || session.replay != 1 {
+                    return Err("authenticated RSNXE mismatch mutated replay/key owner");
+                }
+            }
+            Ok(())
+        })()
+        .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_negotiated_rsnxe_binds_m2_and_authenticated_m3_before_keys
+    );
 }
+
+pub(super) type RsnExtensions = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 pub struct Session {
     akm: Akm,
+    pmf: bool,
     pmk: [u8; 32],
     ap: [u8; 6],
     local: [u8; 6],
@@ -459,6 +620,14 @@ pub struct Session {
     /// Exact station RSNE body sent in the association request (SAE: with
     /// its PMKID). `None` keeps the AKM's default body.
     sta_rsn: Option<Vec<u8>>,
+    /// Exact Association station/AP RSNXE bodies when explicitly bound.
+    rsn_extensions: Option<RsnExtensions>,
+    /// Logical PTK/KDE identity is additive to the physical native peer.
+    /// The caller must retain the matching firmware/physical link owner.
+    mld: Option<Box<narf_wireless::association::mlo::Context>>,
+    /// Requested further links (accepted and rejected) of a multiple-link
+    /// association.
+    further: Vec<FurtherLinkSecurity>,
     last_request: Vec<u8>,
     last_response: Vec<u8>,
     initial_key_data: Vec<u8>,
@@ -497,6 +666,7 @@ impl Session {
     ) -> Self {
         Self {
             akm,
+            pmf: matches!(akm, Akm::Wpa3Sae | Akm::Wpa3SaeExtKey),
             pmk,
             ap,
             local,
@@ -506,6 +676,9 @@ impl Session {
             replay: 0,
             ap_rsn,
             sta_rsn: None,
+            rsn_extensions: None,
+            mld: None,
+            further: Vec::new(),
             last_request: Vec::new(),
             last_response: Vec::new(),
             initial_key_data: Vec::new(),
@@ -517,6 +690,60 @@ impl Session {
     pub fn complete(&self) -> bool {
         self.complete
     }
+    /// PMF is negotiated by the RSNE, independently of the PSK/SAE AKM.
+    pub(super) fn with_pmf(mut self, pmf: bool) -> Self {
+        self.pmf = pmf;
+        self
+    }
+
+    pub(super) fn with_mld(
+        mut self,
+        context: narf_wireless::association::mlo::Context,
+    ) -> Result<Self, &'static str> {
+        if self.ap != context.peer_link()
+            || self.local != context.own_link()
+            || !self.pmf
+            || !matches!(self.akm, Akm::Wpa3Sae | Akm::Wpa3SaeExtKey)
+            || self.ptk.is_some()
+            || !self.last_request.is_empty()
+        {
+            return Err("native MLD security context does not match physical peer");
+        }
+        self.mld = Some(Box::new(context));
+        Ok(self)
+    }
+
+    /// Bind every further link requested in a multiple-link association,
+    /// accepted or rejected, before the 4-way handshake starts. M2 names
+    /// each with an MLO Link KDE, M3 must carry each one's Link KDE, and
+    /// M3/group messages must deliver every accepted link's own GTK (and
+    /// IGTK with PMF).
+    pub(super) fn with_further_links(
+        &mut self,
+        links: Vec<FurtherLinkSecurity>,
+    ) -> Result<(), &'static str> {
+        let context = self
+            .mld
+            .as_deref()
+            .ok_or("native MLD further links without MLD")?;
+        if self.ptk.is_some()
+            || !self.last_request.is_empty()
+            || links.is_empty()
+            || links.len() >= 15
+            || links.iter().enumerate().any(|(at, link)| {
+                link.context.own_mld() != context.own_mld()
+                    || link.context.peer_mld() != context.peer_mld()
+                    || link.context.link_id() == context.link_id()
+                    || links[..at]
+                        .iter()
+                        .any(|other| other.context.link_id() == link.context.link_id())
+            })
+        {
+            return Err("native MLD further links do not match the association");
+        }
+        self.further = links;
+        Ok(())
+    }
 
     /// Echo `rsn` (the exact association-request RSNE body) in message 2
     /// instead of the AKM default, as wpa_supplicant echoes `assoc_wpa_ie`
@@ -524,6 +751,23 @@ impl Session {
     pub fn with_station_rsn(mut self, rsn: Vec<u8>) -> Self {
         self.sta_rsn = Some(rsn);
         self
+    }
+
+    /// wpa_supplicant assoc_rsnxe is repeated beside assoc_wpa_ie in
+    /// M2; AP RSNXE must match the authenticated M3 (rsn_supp/wpa.c).
+    /// Bodies come from the checked association plan and received AP IEs.
+    pub(super) fn with_rsn_extensions(
+        mut self,
+        station: Option<Vec<u8>>,
+        ap: Option<Vec<u8>>,
+    ) -> Result<Self, &'static str> {
+        for body in [station.as_deref(), ap.as_deref()].into_iter().flatten() {
+            if body.is_empty() || body.len() > 16 || usize::from(body[0] & 15) + 1 != body.len() {
+                return Err("invalid negotiated RSNXE body");
+            }
+        }
+        self.rsn_extensions = Some((station, ap));
+        Ok(self)
     }
 
     pub fn process(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
@@ -547,7 +791,7 @@ impl Session {
             if key.key_information == (self.akm.ki_version() | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE) {
                 if let Some(pending) = &mut self.pending_rekey {
                     if pdu == pending.last_request {
-                        return pending.process_inner(pdu);
+                        return pending.process_inner(pdu, true);
                     }
                 }
                 if key.replay_counter <= self.replay
@@ -555,6 +799,10 @@ impl Session {
                     || key.key_nonce == [0; 32]
                 {
                     return Err("stale pairwise rekey challenge");
+                }
+                if let Some(context) = self.mld.as_deref() {
+                    mlo::message1(*context, &key.key_data)
+                        .map_err(|_| "native MLD rekey M1 peer/context mismatch")?;
                 }
                 let mut candidate = Box::new(Session::new(
                     self.akm,
@@ -565,7 +813,11 @@ impl Session {
                     self.ap_rsn.clone(),
                 ));
                 candidate.sta_rsn = self.sta_rsn.clone();
-                let reply = candidate.process_inner(pdu)?;
+                candidate.rsn_extensions = self.rsn_extensions.clone();
+                candidate.pmf = self.pmf;
+                candidate.mld = self.mld.clone();
+                candidate.further = self.further.clone();
+                let reply = candidate.process_inner(pdu, true)?;
                 self.pending_rekey = Some(candidate);
                 return Ok(reply);
             }
@@ -579,7 +831,7 @@ impl Session {
                     return Err("stale rekey completion");
                 }
                 let pending = self.pending_rekey.as_mut().unwrap();
-                let response = pending.process_inner(pdu)?;
+                let response = pending.process_inner(pdu, true)?;
                 if pending.complete {
                     let replacement = self.pending_rekey.take().unwrap();
                     *self = *replacement; // Drop zeroizes the previous PTK.
@@ -587,10 +839,10 @@ impl Session {
                 return Ok(response);
             }
         }
-        self.process_inner(pdu)
+        self.process_inner(pdu, false)
     }
 
-    fn process_inner(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
+    fn process_inner(&mut self, pdu: &[u8], m2_secure: bool) -> Result<Response, &'static str> {
         if pdu.len() < 99
             || !matches!(pdu[0], 1..=3)
             || pdu[1] != 3
@@ -618,16 +870,27 @@ impl Session {
             {
                 return Err("invalid message 1");
             }
-            let ptk = self.akm.derive_ptk(
-                &self.pmk,
-                &self.ap,
-                &self.local,
-                &key.key_nonce,
-                &self.snonce,
-                16,
-            );
+            if let Some(context) = self.mld.as_deref() {
+                mlo::message1(*context, &key.key_data)
+                    .map_err(|_| "native MLD M1 peer/context mismatch")?;
+            }
+            let (ap, local) = self
+                .mld
+                .as_deref()
+                .map_or((self.ap, self.local), |context| {
+                    (context.peer_mld(), context.own_mld())
+                });
+            let ptk = self
+                .akm
+                .derive_ptk(&self.pmk, &ap, &local, &key.key_nonce, &self.snonce, 16);
             let mut reply = KeyFrame::empty(16);
-            reply.key_information = self.akm.ki_version() | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
+            // hostap wpa_supplicant_send_2_of_4 sets Secure when the
+            // current PTK remains installed. A fresh candidate must retain
+            // that outer owner fact without replacing its active key.
+            reply.key_information = self.akm.ki_version()
+                | KI_KEY_TYPE_PAIRWISE
+                | KI_KEY_MIC
+                | if m2_secure { KI_SECURE } else { 0 };
             reply.replay_counter = key.replay_counter;
             reply.key_nonce = self.snonce;
             let rsn = self
@@ -636,6 +899,21 @@ impl Session {
                 .unwrap_or_else(|| self.akm.sta_rsn_ie());
             reply.key_data.extend_from_slice(&[48, rsn.len() as u8]);
             reply.key_data.extend_from_slice(&rsn);
+            if let Some(station) = self
+                .rsn_extensions
+                .as_ref()
+                .and_then(|(station, _)| station.as_ref())
+            {
+                reply
+                    .key_data
+                    .extend_from_slice(&[244, station.len() as u8]);
+                reply.key_data.extend_from_slice(station);
+            }
+            if let Some(context) = self.mld.as_deref() {
+                let requested: Vec<_> = self.further.iter().map(|link| link.context).collect();
+                reply.key_data = mlo::message2_links(*context, &requested, &reply.key_data)
+                    .map_err(|_| "native MLD M2 association/context mismatch")?;
+            }
             self.ptk = Some(ptk);
             self.anonce = key.key_nonce;
             (reply, None)
@@ -679,19 +957,118 @@ impl Session {
             let clear = Zeroizing::new(
                 rekey::aes_key_unwrap(&kek, &key.key_data).ok_or("invalid encrypted key data")?,
             );
-            if pairwise_message && !contains_ie(&clear, 48, &self.ap_rsn) {
+            if self.mld.is_none() && pairwise_message && !contains_ie(&clear, 48, &self.ap_rsn) {
                 return Err("AP RSN changed during handshake");
+            }
+            if self.mld.is_none()
+                && pairwise_message
+                && self
+                    .rsn_extensions
+                    .as_ref()
+                    .is_some_and(|(_, ap)| !matches_rsnxe(&clear, ap.as_deref()))
+            {
+                return Err("AP RSNXE changed during handshake");
             }
             if pairwise_message && self.complete && *clear != self.initial_key_data {
                 return Err("retransmitted M3 changed key data");
             }
-            let gtk = rekey::parse_gtk_kde(&clear).ok_or("message lacks GTK")?;
-            let group_id = gtk.key_id;
-            let gtk = Zeroizing::new(gtk.gtk);
-            let group = gtk
-                .as_slice()
-                .try_into()
-                .map_err(|_| "invalid CCMP GTK length")?;
+            let mut further_keys = Vec::new();
+            let (group, group_id, pn, selected_igtk) = if let Some(context) = self.mld.as_deref() {
+                let mut rsne = alloc::vec![48, self.ap_rsn.len() as u8];
+                rsne.extend_from_slice(&self.ap_rsn);
+                let rsnxe = self.rsn_extensions.as_ref().and_then(|(_, ap)| {
+                    ap.as_ref().map(|body| {
+                        let mut ie = alloc::vec![244, body.len() as u8];
+                        ie.extend_from_slice(body);
+                        ie
+                    })
+                });
+                let ies: Vec<_> = self
+                    .further
+                    .iter()
+                    .map(|link| {
+                        let mut rsne = alloc::vec![48, link.ap_rsn.len() as u8];
+                        rsne.extend_from_slice(&link.ap_rsn);
+                        let rsnxe = link.ap_rsnxe.as_ref().map(|body| {
+                            let mut ie = alloc::vec![244, body.len() as u8];
+                            ie.extend_from_slice(body);
+                            ie
+                        });
+                        (rsne, rsnxe)
+                    })
+                    .collect();
+                let profiles = |accepted: bool| -> Vec<_> {
+                    self.further
+                        .iter()
+                        .zip(&ies)
+                        .filter(|(link, _)| link.accepted == accepted)
+                        .map(|(link, (rsne, rsnxe))| {
+                            (
+                                link.context,
+                                mlo::Profile {
+                                    rsne,
+                                    rsnxe: rsnxe.as_deref(),
+                                    gtk_len: 16,
+                                    igtk_len: Some(16),
+                                },
+                            )
+                        })
+                        .collect()
+                };
+                let (further, rejected) = (profiles(true), profiles(false));
+                let mut keys = mlo::authenticated_link_keys(
+                    *context,
+                    &further,
+                    &rejected,
+                    if pairwise_message {
+                        mlo::Kind::Pairwise3
+                    } else {
+                        mlo::Kind::Group1
+                    },
+                    key.key_information,
+                    &clear,
+                    mlo::Profile {
+                        rsne: &rsne,
+                        rsnxe: rsnxe.as_deref(),
+                        gtk_len: 16,
+                        igtk_len: Some(16),
+                    },
+                )
+                .map_err(|_| "native MLD authenticated per-link key data invalid")?
+                .into_iter();
+                let selected = keys
+                    .next()
+                    .ok_or("native MLD association-link keys absent")?;
+                let (group, group_id, pn, igtk) = mld_link_material(selected)?;
+                for link in keys {
+                    let link_id = link.link_id;
+                    let (group, group_id, group_rx_pn, igtk) = mld_link_material(link)?;
+                    if group_rx_pn >> 48 != 0 {
+                        return Err("invalid further-link GTK replay counter");
+                    }
+                    if self.pmf && igtk.is_none() && pairwise_message && !self.complete {
+                        return Err("PMF message 3 lacks a further-link IGTK");
+                    }
+                    further_keys.push(LinkGroupKeys {
+                        link_id,
+                        group,
+                        group_id,
+                        group_rx_pn,
+                        igtk: if self.pmf { igtk } else { None },
+                    });
+                }
+                (group, group_id, pn, igtk)
+            } else {
+                let gtk = rekey::parse_gtk_kde(&clear).ok_or("message lacks GTK")?;
+                let group_id = gtk.key_id;
+                let gtk = Zeroizing::new(gtk.gtk);
+                let group = gtk
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "invalid CCMP GTK length")?;
+                let igtk = rekey::parse_igtk_kde(&clear).map(|key| (key.igtk, key.key_id, key.ipn));
+                (group, group_id, u64::from_le_bytes(key.key_rsc), igtk)
+            };
             let pairwise = if self.complete {
                 None
             } else {
@@ -702,18 +1079,16 @@ impl Session {
                         .map_err(|_| "invalid TK length")?,
                 )
             };
-            let pn = u64::from_le_bytes(key.key_rsc);
             if pn >> 48 != 0 {
                 return Err("invalid GTK replay counter");
             }
-            // WPA3 negotiates management-frame protection, so the initial
-            // M3 must carry the IGTK (BIP-CMAC-128). Group rekeys may omit
-            // it. WPA2 never installs an IGTK.
-            let igtk = if self.akm == Akm::Wpa3Sae {
-                match rekey::parse_igtk_kde(&clear) {
-                    Some(kde) => Some((kde.igtk, kde.key_id, kde.ipn)),
+            // A PMF association requires its initial IGTK irrespective of
+            // AKM. Group rekeys may retain the already-installed IGTK.
+            let igtk = if self.pmf {
+                match selected_igtk {
+                    Some(key) => Some(key),
                     None if pairwise_message && !self.complete => {
-                        return Err("WPA3 message 3 lacks IGTK")
+                        return Err("PMF message 3 lacks IGTK")
                     }
                     None => None,
                 }
@@ -739,6 +1114,7 @@ impl Session {
                     group_id,
                     group_rx_pn: pn,
                     igtk,
+                    links: further_keys,
                 })
             };
             if pairwise_message && !self.complete {
@@ -775,4 +1151,56 @@ fn contains_ie(bytes: &[u8], tag: u8, expected: &[u8]) -> bool {
         offset += 2 + len;
     }
     false
+}
+
+/// Bounded singleton RSNXE in authenticated key data, allowing only the
+/// standard0xdd/zero AES-wrap padding after the final complete element.
+fn matches_rsnxe(mut bytes: &[u8], expected: Option<&[u8]>) -> bool {
+    let mut found = None;
+    while !bytes.is_empty() {
+        if bytes[0] == 221 && (bytes.len() == 1 || bytes[1] == 0) {
+            if bytes[1..].iter().any(|byte| *byte != 0) {
+                return false;
+            }
+            break;
+        }
+        if bytes.len() < 2 || bytes.len() < 2 + usize::from(bytes[1]) {
+            return false;
+        }
+        let body = &bytes[2..2 + usize::from(bytes[1])];
+        if bytes[0] == 244 {
+            if found.is_some() {
+                return false;
+            }
+            found = Some(body);
+        }
+        bytes = &bytes[2 + usize::from(bytes[1])..];
+    }
+    found == expected
+}
+
+/// One link's authenticated MLO GTK/IGTK as native key material.
+type LinkMaterial = ([u8; 16], u8, u64, Option<([u8; 16], u16, u64)>);
+fn mld_link_material(keys: mlo::Keys) -> Result<LinkMaterial, &'static str> {
+    let group_id = keys.gtk.key_id;
+    let pn = u64::from_le_bytes(keys.gtk.rsc);
+    let gtk = Zeroizing::new(keys.gtk.key);
+    let group = gtk
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid native MLD GTK length")?;
+    let igtk = keys
+        .igtk
+        .map(|key| -> Result<([u8; 16], u16, u64), &'static str> {
+            let material = Zeroizing::new(key.key);
+            let material = material
+                .as_slice()
+                .try_into()
+                .map_err(|_| "invalid native MLD IGTK length")?;
+            let mut ipn = [0; 8];
+            ipn[..6].copy_from_slice(&key.ipn);
+            Ok((material, key.key_id, u64::from_le_bytes(ipn)))
+        })
+        .transpose()?;
+    Ok((group, group_id, pn, igtk))
 }

@@ -372,6 +372,78 @@ pub(super) struct Front {
 }
 
 impl Supplicant {
+    /// Configure exactly one negotiated MLD link before receiving any M1.
+    /// PTK identities become logical MLD addresses; physical packet/key
+    /// identities stay in the caller's immutable Context.
+    pub fn configure_mld(
+        &mut self,
+        context: crate::association::mlo::Context,
+    ) -> Result<(), super::mlo::Error> {
+        let profile = self.rsna.as_ref().ok_or(super::mlo::Error::Profile)?;
+        let physical = self.aa == context.peer_link() && self.sa == context.own_link();
+        let logical = self.aa == context.peer_mld() && self.sa == context.own_mld();
+        if self.mlo.is_some()
+            || self.state != FourWayState::WaitM1
+            || self.ptk.is_some()
+            || self.tptk.is_some()
+            || self.rx_replay_counter_set
+            || self.gtk.is_some()
+            || self.igtk.is_some()
+            || !physical && !logical
+            || !profile.pmf
+            || profile.pairwise_key_len != 16
+            || profile.group_key_len != 16
+            || profile.mgmt_group_key_len != Some(16)
+            || profile.assoc_ie.len() > 4084
+        {
+            return Err(super::mlo::Error::Profile);
+        }
+        // Validate the retained M2 profile before a later M1 may consume
+        // fresh SNonce material. Internal malformed IEs cannot fail late.
+        super::mlo::message2(context, &profile.assoc_ie)?;
+        self.aa = context.peer_mld();
+        self.sa = context.own_mld();
+        self.mlo = Some(alloc::boxed::Box::new(context));
+        Ok(())
+    }
+    pub fn mld(&self) -> Option<&crate::association::mlo::Context> {
+        self.mlo.as_deref()
+    }
+
+    pub(super) fn mlo_front(
+        &self,
+        frame: &Front,
+        kind: super::mlo::Kind,
+    ) -> Result<Option<Front>, super::mlo::Error> {
+        let Some(context) = self.mlo.as_deref() else {
+            return Ok(None);
+        };
+        let r = self.rsna.as_ref().ok_or(super::mlo::Error::Profile)?;
+        let profile = super::mlo::Profile {
+            rsne: &r.ap_rsn_ie,
+            rsnxe: r.ap_rsnxe.as_deref(),
+            gtk_len: r.group_key_len,
+            igtk_len: r.mgmt_group_key_len,
+        };
+        let keys = super::mlo::authenticated_keys(
+            *context,
+            kind,
+            frame.key_info,
+            &frame.key_data,
+            profile,
+        )?;
+        let mut tmp = frame.tmp.clone();
+        // MLO GTK owns its own six-octet PN; the descriptor's global RSC
+        // is not a substitute for that selected link's receive counter.
+        tmp[4 + 61..4 + 69].copy_from_slice(&keys.gtk.rsc);
+        Ok(Some(Front {
+            tmp,
+            key_info: frame.key_info,
+            ver: frame.ver,
+            replay_counter: frame.replay_counter,
+            key_data: keys.legacy_data(profile),
+        }))
+    }
     /// Configure the association (`wpa_sm_set_param` … before the first
     /// EAPOL-Key frame); the SNonce is renewed on the first M1
     /// (`wpa_sm_notify_assoc` sets `renew_snonce`).
@@ -585,6 +657,13 @@ impl Supplicant {
             // "Discard EAPOL-Key msg 1/4 with invalid IEs/KDEs"
             return Err(EapolRxError::Drop(GroupKeyDrop::KeyData));
         }
+        if self
+            .mlo
+            .as_deref()
+            .is_some_and(|context| super::mlo::message1(*context, &f.key_data).is_err())
+        {
+            return Err(EapolRxError::Drop(GroupKeyDrop::KeyData));
+        }
         if self.renew_snonce {
             self.snonce = fresh_snonce().ok_or(EapolRxError::NonceUnavailable)?;
             self.renew_snonce = false;
@@ -608,7 +687,11 @@ impl Supplicant {
         m2.key_length = 0;
         m2.replay_counter = f.replay_counter;
         m2.key_nonce = self.snonce;
-        m2.key_data = r.assoc_ie.clone();
+        m2.key_data = match self.mlo.as_deref() {
+            Some(context) => super::mlo::message2(*context, &r.assoc_ie)
+                .map_err(|_| EapolRxError::Drop(GroupKeyDrop::KeyData))?,
+            None => r.assoc_ie.clone(),
+        };
         let reply = self.build_reply(m2, f.ver, &tptk.kck);
         self.tptk = Some(tptk);
         self.anonce = anonce;
@@ -625,6 +708,10 @@ impl Supplicant {
             reason: WLAN_REASON_UNSPECIFIED,
             why,
         };
+        let normalized = self
+            .mlo_front(f, super::mlo::Kind::Pairwise3)
+            .map_err(|_| fail(PairwiseFail::KeyData))?;
+        let f = normalized.as_ref().unwrap_or(f);
         let ie = parse_kde_ies(&f.key_data).map_err(|_| fail(PairwiseFail::KeyData))?;
         let encr = f.key_info & KI_ENCRYPTED_KEY_DATA != 0;
         if ie.gtk.is_some() && !encr {

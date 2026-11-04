@@ -6,6 +6,63 @@ struct Case {
     e: Extended,
     cap: Cap<FirmwareBlob, Read>,
 }
+fn smoke_rtw8821ce_tx_ba_all_tids_wrong_tid_response_and_held_native_control() -> TestResult {
+    check(crate::rtw88::tx_ba_tid_tests::wrong_tid_held_control::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_wrong_tid_response_and_held_native_control
+);
+fn smoke_rtw8821ce_tx_ba_all_tids_open_all_non_vo_tids_native_rings_and_dhcp() -> TestResult {
+    check(|| crate::rtw88::tx_ba_tid_tests::composition::<Case>(false))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_open_all_non_vo_tids_native_rings_and_dhcp
+);
+
+fn smoke_rtw8821ce_tx_ba_all_tids_wpa2_all_non_vo_tids_native_rings_and_dhcp() -> TestResult {
+    check(|| crate::rtw88::tx_ba_tid_tests::composition::<Case>(true))
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_wpa2_all_non_vo_tids_native_rings_and_dhcp
+);
+
+fn smoke_rtw8821ce_tx_ba_all_tids_mixed_ipc_prefix_native_ring_and_no_pn_consumption() -> TestResult
+{
+    check(crate::rtw88::tx_ba_tid_tests::mixed_prefix::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_mixed_ipc_prefix_native_ring_and_no_pn_consumption
+);
+
+fn smoke_rtw8821ce_tx_ba_all_tids_distinct_source_bounds_and_original_v1() -> TestResult {
+    check(crate::rtw88::tx_ba_tid_tests::v1_and_invalid::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_distinct_source_bounds_and_original_v1
+);
+
+fn smoke_rtw8821ce_tx_ba_all_tids_per_tid_tu_delba_and_actual_key_epoch() -> TestResult {
+    check(crate::rtw88::tx_ba_tid_tests::timeout_delba_and_key::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_per_tid_tu_delba_and_actual_key_epoch
+);
+
+fn smoke_rtw8821ce_tx_ba_all_tids_current_q_fallback_and_partial_native_publication() -> TestResult
+{
+    check(crate::rtw88::tx_ba_tid_tests::current_q_and_partial::<Case>)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c",
+    smoke_rtw8821ce_tx_ba_all_tids_current_q_fallback_and_partial_native_publication
+);
+
 fn smoke_rtw8821ce_rts_open_native_dhcp_ip_and_h_r_t() -> TestResult {
     check(|| crate::rtw88::protection_tests::composition::<Case>(false))
 }
@@ -582,3 +639,6 @@ kernel_test_in!(
     "drivers/wireless/rtw88/ht/rtl8821c",
     smoke_rtw8821ce_ht_descriptor_rx_current_policy_publication_fences
 );
+
+#[path = "tracking8821c/native_tests.rs"]
+mod power_tracking_tests;
