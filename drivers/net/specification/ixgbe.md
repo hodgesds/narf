@@ -19,7 +19,7 @@ simplicity), one MSI-X vector for link / RX completion, and a
 `HwNic` adapter exposing the same surface the e1000/mlx5 drivers
 do.
 
-Does NOT own: DCB, FCoE, SR-IOV, RSS, VMDq.
+Does NOT own: FCoE, SR-IOV, RSS, VMDq.
 
 ## 2. PCI match
 
@@ -280,6 +280,49 @@ is split into two 32-bit writes (hash, then command) because
 `RegBank` is 32-bit. Section number is letter-suffixed so it
 merges cleanly against §13b regardless of landing order.
 
+## 13d. DCB (Refs #1263)
+
+`drivers/net/ixgbe/src/ixgbe/dcb.rs` programs Data Center
+Bridging, opt-in via `Ixgbe::configure_dcb` (call before bringing
+up traffic: the MTQC write reinterprets the queue layout).
+Surface, all transcribed from Linux ixgbe @ cbbddb6 (see the
+module header for the full grounding note): MTQC mode (non-VT
+rows only: RT_ENA|8TC_8TQ = 0xD, RT_ENA|4TC_4TQ = 0x9, with the
+TX descriptor arbiter disabled around the write and
+SECTXMINIFG |= 0x1F00); packet-buffer partitioning, EQUAL
+strategy (RX (512 or 384 KiB)/num << 10, TX 160 KiB/num,
+TXPBTHRESH = TX/1024 - 10, unused TCs zeroed); RX packet
+arbiter (RTRPCS disable, RTRUP2TC UP map, RTRPT4C per-TC
+credits with LSP only, RTRPCS enable); TX descriptor arbiter
+(128 per-queue credits cleared, RTTDT2C per-TC credits,
+RTTDCS = TDPAC|TDRM); TX packet arbiter (RTTPCS disable with
+ARBD_DCB, RTTUP2TC UP map, RTTPT2C per-TC credits, RTTPCS
+enable); PFC (FCCFG priority FC, MFLCN per-TC bits on X540+
+else the single RPFCE bit, per-TC FCRTL/FCRTH watermarks with
+the RXPBSIZE-24 KiB guard for disabled TCs, FCTTV pause time,
+FCRTV refresh); TC statistics (RQSMR 16 queues per TC, TQSM
+32/32/16/16/8/8/8/8). The config struct carries explicit
+per-TC credits; the pure `ieee_credits` helper ports Linux's
+IEEE 802.1Qaz credit computation for callers starting from
+bandwidth percentages. Queue plan: TX 32/32/16/16/8/8/8/8, RX
+16 per TC; with the 1/1 probe, queue 0 belongs to TC0.
+
+⚠️ Grounding status (do not soften): Linux-only. Issue #1263
+asks for datasheet grounding for the DCB/TC registers + MTQC
+DCB rows, and no 82599/X540/X550 datasheet copy exists in this
+workspace; the sole in-tree corroboration is MTQC's address
+0x08120 (§3 table). Re-grounding against the datasheet is a
+follow-up. Composition notes: MTQC VT rows belong to #1398
+(SR-IOV, unmerged) — whoever lands second reconciles MTQC
+into one setup covering VT×DCB combos; RSS composition is
+unvalidated (different queue-layout assumptions — callers
+pick one mode); DCBx negotiation, CEE bandwidth-group
+credits, IPv6-style extras, and a DCB disable path are NOT
+implemented (re-probe restores non-DCB mode).
+
+Lettering note: §13d anticipates #1398's §13b (VMDq) and
+#1400's §13c (FlowDirector), so the three sections merge
+cleanly regardless of landing order.
 ## 13f. EEE control/status (Linux model, no MAC registers)
 
 EEE in Linux ixgbe has no MAC register programming: `get_eee`
@@ -407,7 +450,9 @@ Per the v0.1 exclusion list, still open after this stream:
   (packet parser + sample-rate policy + queue binding), IPv6
   perfect filters, persistent filter list with restore on
   reinit, cloud / MACVLAN filter modes.
-- DCB (MTQC RT_Ena, RTRUP2TC, packet-buffer partitioning).
+- DCB — see §13d (Refs #1263; Linux-grounded, datasheet
+  re-grounding + MTQC VT×DCB reconciliation + DCBx + CEE
+  credits + disable path remain).
 - FCoE (FCRETA, FCRXCTRL) — out of the Ethernet scope.
 - EEE: model + capability gate + FW-PHY decode + ACI cap
   computation landed (§13f); remainders are datasheet
