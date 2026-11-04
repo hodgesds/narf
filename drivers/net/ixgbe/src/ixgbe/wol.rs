@@ -1,4 +1,4 @@
-//! ixgbe Wake-on-LAN — WUFC / WUC / WUS (+ IP4AT/IP6AT).
+//! ixgbe Wake-on-LAN — WUFC / WUC / WUS / IPAV (+ IP4AT/IP6AT).
 //!
 //! Grounding: Intel 82599 Datasheet rev. 2.0 §8.2.3.24.1 (WUC at
 //! 0x05800: PME_En bit 1, PME_Status bit 2 write-1-to-clear),
@@ -7,7 +7,26 @@
 //! (WUS at 0x05810, RW1C, same bits + MNG 8), §8.2.3.24.5
 //! (IP4AT at 0x05840 + 8*n, n = 0..3), §8.2.3.24.6 (IP6AT at
 //! 0x05880 + 4*n, 4 words per address). No Linux ixgbe source
-//! consulted.
+//! consulted for those values.
+//!
+//! IPAV (resolved by #1267): Datasheet rev. 2.0 §8.2.3.24.4,
+//! printed as 0x5838 in the PDF text — the leading zero is
+//! dropped in extraction, as with the neighbouring 0x058xx
+//! registers. Linux normalizes it to 0x05838 (ixgbe_type.h:508;
+//! e1000_hw.h:990 and igb e1000_regs.h:304 agree, "IP Address
+//! Valid - RW"). Bits: V40..V43 = IPv4 slots 0..3 valid (bits
+//! 0..3), V60 = IPv6 address 0 valid (bit 16); V40 init comes
+//! from EEPROM. Linux never writes IPAV (it appears only in
+//! ethtool register dumps); NARF programs it per the datasheet
+//! because the valid bits are what make a table entry count
+//! for wake matching.
+//!
+//! IPAV programming: `program_ipv4` sets the slot's valid bit
+//! (V40..V43) alongside the table write, `program_ipv6` sets
+//! V60, and `invalidate_ipv4` / `invalidate_ipv6` clear them.
+//! `arm` / `disarm` do not touch IPAV: validity is per-entry
+//! state, and with WUFC = 0 no filter can fire regardless of
+//! the valid bits.
 //!
 //! Per-part support:
 //! * 82599EB — supported: the 82599 datasheet's §8.2.3.24 + power
@@ -24,22 +43,22 @@
 //!   board that does not opt in never wakes. The driver therefore
 //!   never arms X550 WoL on its own.
 //!
-//! Deliberately NOT programmed: IPAV. The datasheet text extracted
-//! as "0x5838", which is one hex digit short of the neighbouring
-//! 0x058xx registers (expected 0x05838); that ambiguity is a
-//! remainder, not a value to guess — directed-IP wake-up works
-//! without it on the 82599 path the driver enables (magic packet
-//! + link change), and IP4AT/IP6AT programming below is provided
-//!   for the caller that supplies the addresses.
-
 use super::queues::RegBank;
 
 /// Wake-up registers (datasheet §8.2.3.24).
 pub const REG_WUC: u64 = 0x05800;
 pub const REG_WUFC: u64 = 0x05808;
 pub const REG_WUS: u64 = 0x05810;
+pub const REG_IPAV: u64 = 0x05838;
 pub const REG_IP4AT_BASE: u64 = 0x05840;
 pub const REG_IP6AT_BASE: u64 = 0x05880;
+
+/// IPAV valid bits (datasheet §8.2.3.24.4).
+pub const IPAV_V40: u32 = 1 << 0;
+pub const IPAV_V41: u32 = 1 << 1;
+pub const IPAV_V42: u32 = 1 << 2;
+pub const IPAV_V43: u32 = 1 << 3;
+pub const IPAV_V60: u32 = 1 << 16;
 
 /// WUC bits.
 pub const WUC_PME_EN: u32 = 1 << 1;
@@ -255,17 +274,21 @@ pub fn wol_allowed(device_id: u16, board: WolBoardCap) -> bool {
 }
 
 /// Program one directed-IPv4 wake address (IP4AT[n], n = 0..3).
-/// The address is stored as a single little-endian word.
+/// The address is stored as a single little-endian word, and the
+/// slot's IPAV valid bit (V40..V43) is set alongside the write:
+/// without the valid bit the entry does not count for wake.
+/// Out-of-range slots are rejected and touch nothing.
 pub fn program_ipv4(bank: &mut impl RegBank, slot: usize, addr: [u8; 4]) -> bool {
     if slot >= 4 {
         return false;
     }
     bank.write32(REG_IP4AT_BASE + 8 * slot as u64, u32::from_le_bytes(addr));
+    bank.set_bits(REG_IPAV, 1 << slot);
     true
 }
 
 /// Program the directed-IPv6 wake address (IP6AT, 4 words, LS byte
-/// of word 0 first on the wire).
+/// of word 0 first on the wire) and set the IPAV V60 valid bit.
 pub fn program_ipv6(bank: &mut impl RegBank, addr: [u8; 16]) {
     for n in 0..4 {
         bank.write32(
@@ -278,4 +301,21 @@ pub fn program_ipv6(bank: &mut impl RegBank, addr: [u8; 16]) {
             ]),
         );
     }
+    bank.set_bits(REG_IPAV, IPAV_V60);
+}
+
+/// Clear one IPv4 slot's IPAV valid bit. The table entry stays
+/// programmed but no longer counts for wake. Out-of-range slots
+/// are rejected and touch nothing.
+pub fn invalidate_ipv4(bank: &mut impl RegBank, slot: usize) -> bool {
+    if slot >= 4 {
+        return false;
+    }
+    bank.clear_bits(REG_IPAV, 1 << slot);
+    true
+}
+
+/// Clear the IPv6 IPAV valid bit (V60).
+pub fn invalidate_ipv6(bank: &mut impl RegBank) {
+    bank.clear_bits(REG_IPAV, IPAV_V60);
 }

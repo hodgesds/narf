@@ -825,6 +825,67 @@ fn smoke_ixgbe_wol_board_cap() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol_board_cap);
 
+fn smoke_ixgbe_wol_ipav() -> TestResult {
+    use super::queues::RegBank;
+    use super::wol::{
+        invalidate_ipv4, invalidate_ipv6, program_ipv4, program_ipv6, IPAV_V40, IPAV_V41, IPAV_V42,
+        IPAV_V43, IPAV_V60, REG_IPAV,
+    };
+    if REG_IPAV != 0x05838 {
+        return TestResult::Fail("REG_IPAV wrong");
+    }
+    if IPAV_V40 != 0x1
+        || IPAV_V41 != 0x2
+        || IPAV_V42 != 0x4
+        || IPAV_V43 != 0x8
+        || IPAV_V60 != 0x1_0000
+    {
+        return TestResult::Fail("IPAV valid-bit constants wrong");
+    }
+    let mut bank = FakeBank::new();
+    if !program_ipv4(&mut bank, 0, [192, 168, 0, 1]) {
+        return TestResult::Fail("program_ipv4 slot 0 failed");
+    }
+    if bank.read32(REG_IPAV) != IPAV_V40 {
+        return TestResult::Fail("program_ipv4 slot 0 did not set V40");
+    }
+    if !program_ipv4(&mut bank, 3, [10, 0, 0, 3]) {
+        return TestResult::Fail("program_ipv4 slot 3 failed");
+    }
+    if bank.read32(REG_IPAV) != IPAV_V40 | IPAV_V43 {
+        return TestResult::Fail("program_ipv4 slot 3 did not set V43");
+    }
+    if program_ipv4(&mut bank, 4, [10, 0, 0, 4]) {
+        return TestResult::Fail("program_ipv4 accepted slot 4");
+    }
+    if bank.read32(REG_IPAV) != IPAV_V40 | IPAV_V43 {
+        return TestResult::Fail("rejected slot 4 touched IPAV");
+    }
+    let mut v6 = [0u8; 16];
+    for (i, b) in v6.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    program_ipv6(&mut bank, v6);
+    if bank.read32(REG_IPAV) != IPAV_V40 | IPAV_V43 | IPAV_V60 {
+        return TestResult::Fail("program_ipv6 did not set V60");
+    }
+    if !invalidate_ipv4(&mut bank, 0) {
+        return TestResult::Fail("invalidate_ipv4 slot 0 failed");
+    }
+    if bank.read32(REG_IPAV) != IPAV_V43 | IPAV_V60 {
+        return TestResult::Fail("invalidate_ipv4 slot 0 did not clear V40 only");
+    }
+    if invalidate_ipv4(&mut bank, 4) {
+        return TestResult::Fail("invalidate_ipv4 accepted slot 4");
+    }
+    invalidate_ipv6(&mut bank);
+    if bank.read32(REG_IPAV) != IPAV_V43 {
+        return TestResult::Fail("invalidate_ipv6 did not clear V60 only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol_ipav);
+
 // ── PM fixtures (commit 5) ───────────────────────────────────────
 
 fn smoke_ixgbe_pm_plans() -> TestResult {
