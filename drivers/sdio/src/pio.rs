@@ -84,6 +84,16 @@ pub trait Registers {
     fn disable_dma(&mut self) -> bool {
         true
     }
+    /// Host base clock when CAPABILITIES reports none: Linux
+    /// `sdhci_setup_host` -> `ops->get_max_clock` (a platform clock rate).
+    /// Default: none, and such a host stays unsupported.
+    fn base_clock_hz(&mut self) -> Option<u32> {
+        None
+    }
+    /// The SD clock just requested (Linux `host->clock` after
+    /// `ops->set_clock`); front-ends whose register ops depend on it
+    /// observe it here. Default: no effect.
+    fn clock_changed(&mut self, _hz: u32) {}
 }
 
 #[derive(Clone, Copy, Debug)]

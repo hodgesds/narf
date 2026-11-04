@@ -176,7 +176,7 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
     }
 }
 static NATIVE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::sync::Arc<Provisioner<narf_drivers_sdio::native::Mmio>>>,
+    Option<alloc::sync::Arc<Provisioner<narf_drivers_sdio::native::NativeRegisters>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 pub(super) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
     max_attempts: usize,

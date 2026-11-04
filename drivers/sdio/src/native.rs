@@ -11,7 +11,10 @@ use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
-pub type NativeCard = Card<Mmio>;
+/// The owned aperture behind its Linux host front-end profile
+/// (`sdhci::port`); the generic profile is an exact passthrough.
+pub type NativeRegisters = crate::sdhci::port::Ported<Mmio>;
+pub type NativeCard = Card<NativeRegisters>;
 
 /// Private aperture + retained live PCI authority. Every register access
 /// checks revocation; the first failure permanently closes this adapter.
@@ -527,27 +530,39 @@ fn probe_claimed(
     // masked. INTx-disable is cleared only after the card initialized, so
     // a failed probe leaves the function parked; polling is the fallback.
     let interrupt = bind_intx(&device, &authority);
-    let mut card = match Card::initialize(
-        Mmio {
-            region,
-            authority,
-            device,
-            gone: false,
-            source_live: crate::source::Lifetime::new(),
-            source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            dma: false,
-            source_dma: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            identity: crate::pio::HostIdentity {
-                address: device.addr,
-                id: device.id,
-            },
-            intx: false,
-        },
-        Config::default(),
-    ) {
-        Ok(card) => card,
-        Err(e) => return Err(init_error_to_probe_error(e)),
+    // sdhci_pci_ids: a Linux per-device fixes object selects its profile;
+    // every other standard host keeps the generic passthrough.
+    let profile = crate::sdhci::port::pci(
+        device.id.vendor,
+        device.id.device,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+    )
+    .unwrap_or(crate::sdhci::port::Profile::GENERIC);
+    let config = Config {
+        non_removable: profile.non_removable,
+        ..Config::default()
     };
+    let mmio = Mmio {
+        region,
+        authority,
+        device,
+        gone: false,
+        source_live: crate::source::Lifetime::new(),
+        source_intx: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        dma: false,
+        source_dma: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        identity: crate::pio::HostIdentity {
+            address: device.addr,
+            id: device.id,
+        },
+        intx: false,
+    };
+    let mut card =
+        match Card::initialize(crate::sdhci::port::Ported::new(mmio, profile, None), config) {
+            Ok(card) => card,
+            Err(e) => return Err(init_error_to_probe_error(e)),
+        };
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: "sdhci-pio".into(),
         kind: narf_drivers::BoundKind::Other,

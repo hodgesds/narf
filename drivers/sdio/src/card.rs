@@ -236,6 +236,7 @@ impl<R: Registers> Card<R> {
             .registers()
             .write16(CLOCK_CONTROL, word | CLK_CARD_EN);
         self.host.current_clock_hz = self.host.clock_base_hz / divisor;
+        self.controller.registers().clock_changed(target);
         Ok(())
     }
     /// Linux `mmc_power_up` + `mmc_attach_sdio`/`mmc_sdio_init_card`.
@@ -266,6 +267,12 @@ impl<R: Registers> Card<R> {
             return Err(Error::Unsupported);
         }
         self.host = SdhciHost::new(0, version, caps, caps1);
+        if self.host.clock_base_hz == 0 {
+            // sdhci_setup_host: no CAPABILITIES base clock -> get_max_clock.
+            if let Some(hz) = self.controller.registers().base_clock_hz() {
+                self.host.clock_base_hz = hz;
+            }
+        }
         // sdhci_setup_host: DMA admission (and the platform's bus-master
         // grant) before the card is touched; failure keeps PIO.
         self.host.dma = self.controller.setup_dma(version, caps);

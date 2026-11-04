@@ -4,11 +4,13 @@
 //! - [`adma`]    — DMA mode selection and ADMA2 descriptor table.
 //! - [`regs`]    — MMIO register offsets and bit constants.
 //! - [`cmd`]     — Command-word encoders for CMD0/3/5/7/52/53.
+//! - [`port`]    — Linux SDHCI front-end profiles (sdhci-pci/acpi/iproc).
 //! - [`probe`]   — PCI class 0x080500 device-match logic.
 //! - [`voltage`] — 1.8 V signalling switch helpers.
 
 pub mod adma;
 pub mod cmd;
+pub mod port;
 pub mod probe;
 pub mod regs;
 pub mod voltage;
