@@ -307,6 +307,13 @@ pub(in crate::ath9k) fn expected(
     last_cl(tables.rx_gain, 1, &mut cl);
     last_cl(tables.tx_gain, modes_index, &mut cl);
     let mut writes = (tables.rx_gain.len() as u16).wrapping_add(tables.tx_gain.len() as u16);
+    // RX-gain overrides are written with the gain arrays (see `prepare`);
+    // the sys2ant postamble is a `prog_ini` array and carries no
+    // `AR_PHY_CL_CAL_CTL` row, so it changes neither count nor leak bit.
+    writes = writes
+        .wrapping_add(tables.rxgain_bb_core.len() as u16)
+        .wrapping_add(tables.rxgain_bb_postamble.len() as u16)
+        .wrapping_add(tables.rxgain_xlna.len() as u16);
     if five {
         last_cl(tables.fast_clock, modes_index, &mut cl);
         writes = writes.wrapping_add(tables.fast_clock.len() as u16);
@@ -369,9 +376,18 @@ pub(in crate::ath9k) fn prepare(
     prog_ini(io, tables.mac_post, modes_index);
     prog_ini(io, tables.bb_post, modes_index);
     prog_ini(io, tables.radio_post, modes_index);
+    // `ar9003_phy.c` programs `ini_radio_post_sys2ant` here for
+    // `AR_SREV_9462_20_OR_LATER`; empty for the AR9300/AR9580.
+    prog_ini(io, tables.radio_post_sys2ant, modes_index);
     doubler_fix(io)?;
     let mut writes = 0;
     write_array(io, tables.rx_gain, 1, &mut writes);
+    // `ar9003_phy.c` RXGAIN overrides: the mix baseband core (column 1)
+    // and postamble (modes column) for RX mode 2, and the XLNA array
+    // (modes column) for RX modes 2/3; empty for every other mode.
+    write_array(io, tables.rxgain_bb_core, 1, &mut writes);
+    write_array(io, tables.rxgain_bb_postamble, modes_index, &mut writes);
+    write_array(io, tables.rxgain_xlna, modes_index, &mut writes);
     write_array(io, tables.tx_gain, modes_index, &mut writes);
     if five {
         // IS_CHAN_A_FAST_CLOCK: ATH9K_HW_CAP_FASTCLOCK on every AR9300.

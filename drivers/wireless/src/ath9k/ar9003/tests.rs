@@ -770,3 +770,346 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9580_revision_split_and_ini_selection
 );
+
+/// AR9462 2.0 `AR_SREV`: macVersion 0x280, macRev 2, PCIe.
+/// 2.1 is macRev 3; 1.0 has no Linux tables.
+const SREV_9462_20: u32 = 0x0028_02ff;
+const SREV_9462_21: u32 = 0x0028_03ff;
+
+fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
+    // The AR9462 has its own macVersion, so no split against the AR9300
+    // is needed; only shipped 2.0/2.1 silicon is accepted.
+    if Revision::decode(SREV_9462_20, Chip::Ar9462)
+        != Some(Revision {
+            chip: Chip::Ar9462,
+            mac_rev: 2,
+            pcie: true,
+        })
+        || Revision::decode(SREV_9462_21, Chip::Ar9462)
+            != Some(Revision {
+                chip: Chip::Ar9462,
+                mac_rev: 3,
+                pcie: true,
+            })
+        || Revision::decode(SREV_9462_20, Chip::Ar9300).is_some()
+        || Revision::decode(SREV_9462_20, Chip::Ar9580).is_some()
+        || Revision::decode(SREV_9462_21, Chip::Ar9300).is_some()
+        || Revision::decode(0x0028_01ff, Chip::Ar9462).is_some()
+        || Revision::decode(0x0028_04ff, Chip::Ar9462).is_some()
+        || Revision::decode(SREV_9300_22, Chip::Ar9462).is_some()
+        || !Revision::decode(SREV_9462_21, Chip::Ar9462).is_some_and(|r| r.ar9462_21())
+        || Revision::decode(SREV_9462_20, Chip::Ar9462).is_some_and(|r| r.ar9462_21())
+        || Revision::decode(SREV_9462_20, Chip::Ar9462).is_some_and(|r| r.ar9300_22())
+        || Revision::decode(SREV_9462_20, Chip::Ar9462).is_some_and(|r| r.ar9580())
+        || Chip::for_device(0x0034) != Some(Chip::Ar9462)
+        || Chip::Ar9462.mac_version() != 0x280
+        || Chip::Ar9462.chip_chainmask() != 3
+        || Limits::for_chip(Chip::Ar9462) != Limits::for_chip(Chip::Ar9300)
+    {
+        return TestResult::Fail("AR_SREV_9462 revision differs");
+    }
+    // AR9300 silicon behind 0x0034 is refused before any write.
+    let mut io = Chip9300::new(SREV_9300_22);
+    if identify(&mut io, 0x0034).err() != Some(BringUpError::UnsupportedRevision)
+        || io.ops.iter().any(|op| matches!(op, Op::Write(..)))
+    {
+        return TestResult::Fail("AR9300 silicon not refused behind 0x0034");
+    }
+    let mut stores = Stores::blank();
+    Stores::place(&mut stores.eeprom, 0x3ff, &block(3, 5, &mac_runs()));
+    let Ok(mut restored) = restore(&mut stores, Limits::for_chip(Chip::Ar9462)) else {
+        return TestResult::Fail("restore failed");
+    };
+    let rev20 = Revision {
+        chip: Chip::Ar9462,
+        mac_rev: 2,
+        pcie: true,
+    };
+    let rev21 = Revision {
+        mac_rev: 3,
+        ..rev20
+    };
+    let mut tables_for = |gain: u8, revision: &Revision| {
+        // A genuine AR9462 board carries two-chain EEPROM masks; the
+        // shared AR9300 template's three-chain mask (0x77) is foreign to
+        // this chip and `Identity::decode` rightly refuses it.
+        restored.image[eeprom::field::TXRX_MASK] = 0x33;
+        restored.image[eeprom::field::TXRX_GAIN] = gain;
+        let identity = eeprom::Identity::decode(Chip::Ar9462, &restored).ok()?;
+        Some(Tables::for_revision(revision, &identity))
+    };
+    // FNV-1a oracle over the Linux order mac/bb/radio/soc core+post,
+    // sys2ant postamble, rx, tx gain at 2G HT20 (computed from the local
+    // ar9462_2p0/2p1_initvals.h with their `#define` aliases resolved).
+    let oracle = |tables: &Tables| {
+        let mut rows: Vec<(u32, u32)> = Vec::new();
+        let two = |t: &[[u32; 2]], rows: &mut Vec<(u32, u32)>| {
+            rows.extend(t.iter().map(|r| (r[0], r[1])))
+        };
+        let five = |t: &[[u32; 5]], rows: &mut Vec<(u32, u32)>| {
+            rows.extend(t.iter().map(|r| (r[0], r[4])))
+        };
+        two(tables.mac_core, &mut rows);
+        five(tables.mac_post, &mut rows);
+        two(tables.bb_core, &mut rows);
+        five(tables.bb_post, &mut rows);
+        two(tables.radio_core, &mut rows);
+        five(tables.radio_post, &mut rows);
+        five(tables.radio_post_sys2ant, &mut rows);
+        two(tables.soc_pre, &mut rows);
+        five(tables.soc_post, &mut rows);
+        two(tables.rx_gain, &mut rows);
+        five(tables.tx_gain, &mut rows);
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for (addr, value) in &rows {
+            for byte in addr.to_le_bytes().into_iter().chain(value.to_le_bytes()) {
+                h ^= u64::from(byte);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        (h, rows.len())
+    };
+    use super::initvals as i;
+    use super::initvals_ar9462 as t;
+    let Some(default20) = tables_for(0x00, &rev20) else {
+        return TestResult::Fail("identity refused");
+    };
+    if oracle(&default20) != (0x6b83_5b40_4777_8dd5, 755)
+        || default20.tx_gain_kind != TxGain::LowestObDb
+        || default20.rx_gain_kind != RxGain::Common
+        || !core::ptr::eq(
+            default20.radio_post_sys2ant,
+            t::AR9462_2P0_RADIO_POSTAMBLE_SYS2ANT,
+        )
+        || default20.radio_post_sys2ant.len() != 3
+        || !default20.rxgain_bb_core.is_empty()
+        || !default20.rxgain_bb_postamble.is_empty()
+        || !default20.rxgain_xlna.is_empty()
+        || default20.pcie_serdes.len() != 3
+        || default20.pcie_serdes_low_power.len() != 3
+        || default20.fast_clock.len() != 9
+        || default20.cck_fir_japan_2484.len() != 3
+        || !default20.dfs.is_empty()
+    {
+        return TestResult::Fail("AR9462 2p0 default INI selection differs from Linux");
+    }
+    let Some(default21) = tables_for(0x00, &rev21) else {
+        return TestResult::Fail("identity refused");
+    };
+    if oracle(&default21) != (0xf5f2_6f37_ac39_d73d, 755)
+        || !core::ptr::eq(default21.mac_core, t::AR9462_2P1_MAC_CORE)
+        || !core::ptr::eq(default21.bb_post, t::AR9462_2P1_BASEBAND_POSTAMBLE)
+        || !core::ptr::eq(default21.soc_pre, t::AR9462_2P1_SOC_PREAMBLE)
+        || !core::ptr::eq(
+            default21.radio_post_sys2ant,
+            t::AR9462_2P1_RADIO_POSTAMBLE_SYS2ANT,
+        )
+    {
+        return TestResult::Fail("AR9462 2p1 default INI selection differs from Linux");
+    }
+    // txrxgain: TX table + kind + 2G HT20 oracle, RX kind + oracle, and
+    // the RX mode 2/3 override arrays (empty unless the mode selects them).
+    type Case = (
+        u8,
+        &'static [[u32; 5]],
+        TxGain,
+        (u64, usize),
+        RxGain,
+        (u64, usize),
+        (&'static [[u32; 2]], (u64, usize)),
+        (&'static [[u32; 5]], (u64, usize)),
+        (&'static [[u32; 5]], (u64, usize)),
+    );
+    let empty2: &'static [[u32; 2]] = &[];
+    let empty5: &'static [[u32; 5]] = &[];
+    let rx_common = (0x2274_57b8_a1e1_b8c3, 256);
+    let rx_wo = (0xbb9a_58a3_35ae_42e9, 256);
+    let rx_mixed = (0x2ede_ba7e_a1a8_ab2c, 256);
+    let tx_low = (0xc725_5bf6_6eeb_8307, 65);
+    let tx_9300 = (0x5806_46c6_4c21_cafe, 102);
+    let mix_core = (
+        t::AR9462_2P0_BASEBAND_CORE_MIX_RXGAIN,
+        (0xff13_faa7_45bd_9db1, 1),
+    );
+    let mix_post = (
+        t::AR9462_2P0_BASEBAND_POSTAMBLE_MIX_RXGAIN,
+        (0x93b2_fa31_583a_fc69, 6),
+    );
+    let xlna = (
+        t::AR9462_2P0_BASEBAND_POSTAMBLE_5G_XLNA,
+        (0x1db8_1dcc_096c_a46b, 1),
+    );
+    let none = (empty2, (0xcbf2_9ce4_8422_2325, 0));
+    let none5 = (empty5, (0xcbf2_9ce4_8422_2325, 0));
+    let checks: [Case; 10] = [
+        (
+            0x11,
+            t::AR9462_2P0_MODES_HIGH_OB_DB_TX_GAIN,
+            TxGain::HighObDb,
+            (0x189d_5b99_b888_b56b, 65),
+            RxGain::WithoutXlna,
+            rx_wo,
+            none,
+            none5,
+            none5,
+        ),
+        // Modes 2/3 fall through to the AR9300 2p2 tables.
+        (
+            0x20,
+            i::AR9300_MODES_LOW_OB_DB_TX_GAIN_TABLE_2P2,
+            TxGain::LowObDb,
+            tx_9300,
+            RxGain::Common,
+            rx_common,
+            none,
+            none5,
+            none5,
+        ),
+        (
+            0x30,
+            i::AR9300_MODES_HIGH_POWER_TX_GAIN_TABLE_2P2,
+            TxGain::HighPower,
+            tx_9300,
+            RxGain::Common,
+            rx_common,
+            none,
+            none5,
+            none5,
+        ),
+        (
+            0x40,
+            t::AR9462_2P0_MODES_MIX_OB_DB_TX_GAIN,
+            TxGain::MixedObDb,
+            (0xd925_af69_5551_4821, 59),
+            RxGain::Common,
+            rx_common,
+            none,
+            none5,
+            none5,
+        ),
+        // Modes 5/6/7 and index >= 8 keep the mode-0 low-ob/db default.
+        (
+            0x50,
+            t::AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+            TxGain::LowestObDb,
+            tx_low,
+            RxGain::Common,
+            rx_common,
+            none,
+            none5,
+            none5,
+        ),
+        (
+            0x70,
+            t::AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+            TxGain::LowestObDb,
+            tx_low,
+            RxGain::Common,
+            rx_common,
+            none,
+            none5,
+            none5,
+        ),
+        // RX mode 2: mixed table plus all three overrides.
+        (
+            0x02,
+            t::AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+            TxGain::LowestObDb,
+            tx_low,
+            RxGain::Mixed,
+            rx_mixed,
+            mix_core,
+            mix_post,
+            xlna,
+        ),
+        // RX mode 3: 5G-XLNA-only table (an alias of the mixed table)
+        // plus only the XLNA array.
+        (
+            0x03,
+            t::AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+            TxGain::LowestObDb,
+            tx_low,
+            RxGain::FiveGXlnaOnly,
+            rx_mixed,
+            none,
+            none5,
+            xlna,
+        ),
+        // RX index >= 4 keeps the common default.
+        (
+            0x04,
+            t::AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+            TxGain::LowestObDb,
+            tx_low,
+            RxGain::Common,
+            rx_common,
+            none,
+            none5,
+            none5,
+        ),
+        // Index >= 8 is mode 0 on the TX side; the RX nibble still selects.
+        (
+            0x82,
+            t::AR9462_2P0_MODES_LOW_OB_DB_TX_GAIN,
+            TxGain::LowestObDb,
+            tx_low,
+            RxGain::Mixed,
+            rx_mixed,
+            mix_core,
+            mix_post,
+            xlna,
+        ),
+    ];
+    for (
+        gain,
+        table,
+        tx,
+        tx_hash,
+        rx,
+        rx_hash,
+        (core, core_hash),
+        (post, post_hash),
+        (x, x_hash),
+    ) in checks
+    {
+        let Some(tables) = tables_for(gain, &rev20) else {
+            return TestResult::Fail("identity refused");
+        };
+        // Empty override arrays compare by emptiness: two distinct `&[]`
+        // values have no guaranteed pointer identity.
+        let same = |got: &[[u32; 2]], want: &[[u32; 2]]| {
+            if want.is_empty() {
+                got.is_empty()
+            } else {
+                core::ptr::eq(got, want)
+            }
+        };
+        let same5 = |got: &[[u32; 5]], want: &[[u32; 5]]| {
+            if want.is_empty() {
+                got.is_empty()
+            } else {
+                core::ptr::eq(got, want)
+            }
+        };
+        if tables.tx_gain_kind != tx
+            || !core::ptr::eq(tables.tx_gain, table)
+            || tables.rx_gain_kind != rx
+            || fnv(&[], &[tables.tx_gain]) != tx_hash
+            || fnv(&[tables.rx_gain], &[]) != rx_hash
+            || !same(tables.rxgain_bb_core, core)
+            || fnv(&[tables.rxgain_bb_core], &[]) != core_hash
+            || !same5(tables.rxgain_bb_postamble, post)
+            || fnv(&[], &[tables.rxgain_bb_postamble]) != post_hash
+            || !same5(tables.rxgain_xlna, x)
+            || fnv(&[], &[tables.rxgain_xlna]) != x_hash
+        {
+            return TestResult::Fail("AR9462 txrxgain table selection differs from ar9003_hw.c");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_revision_and_ini_selection
+);

@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9380/AR9390 (`0x0030` PCIe, `hw.h::AR9300_DEVID_PCIE`) and AR9580
-//! (`0x0033`, `hw.h::AR9300_DEVID_AR9580`) probe and dual-band 20 MHz
+//! AR9380/AR9390 (`0x0030` PCIe, `hw.h::AR9300_DEVID_PCIE`), AR9580
+//! (`0x0033`, `hw.h::AR9300_DEVID_AR9580`) and AR9462 (`0x0034`,
+//! `hw.h::AR9300_DEVID_AR9462`) probe and dual-band 20 MHz
 //! legacy station owner.
 //!
 //! The AR9580 runs the AR9300 path unchanged (Linux `AR_SREV_9300` is true
 //! for it): only its `AR_SREV` revision split, the `ar9580_1p0` INI and
 //! gain tables (`ar9003::ini::Tables::for_revision`) and its `N95A`
-//! record differ.
+//! record differ. The AR9462 likewise runs the shared AR9003 path: only
+//! its own macVersion, the `ar9462_2p0`/`ar9462_2p1` INI and gain tables
+//! (plus the sys2ant postamble and RX-gain mode 2/3 overrides), its
+//! two-chain masks and its `N46A` record differ.
 //!
 //! `pci.c::ath_pci_probe` → `hw.c::ath9k_hw_init` order: the chip is
 //! identified through its `AR_SREV` and restored `ar9300_eeprom`
 //! (`ar9003::identify`), prepared inactive for the 20 MHz primary
 //! (`ar9003::phy::prepare`, `ath9k_regd_get_ctl` over the map's
-//! `regDmn[0]`) and admitted only by a signer-verified `N93A` board record
+//! `regDmn[0]`) and admitted only by a signer-verified `N93A`/`N95A`/
+//! `N46A` board record
 //! bound to that exact map and preparation. Calibration
 //! (`ar9003::calib::Calibration::run`) runs after the power plan is
 //! re-planned and programmed at the signed ceiling under the dual-band
@@ -60,7 +65,11 @@ const AR_Q_TXE: u64 = 0x0840;
 /// `ath_ani_calibrate` intervals.
 const SUPERVISE_NS: u64 = 500_000_000;
 /// (PCI device, unique bus-match name).
-pub(super) const DEVICES: [(u16, &str); 2] = [(0x0030, "ath9k-ar9300"), (0x0033, "ath9k-ar9580")];
+pub(super) const DEVICES: [(u16, &str); 3] = [
+    (0x0030, "ath9k-ar9300"),
+    (0x0033, "ath9k-ar9580"),
+    (0x0034, "ath9k-ar9462"),
+];
 
 pub(super) struct Owner {
     mmio: MmioRegion,

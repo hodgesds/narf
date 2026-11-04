@@ -2289,6 +2289,52 @@ unchanged. Smoke (written, not executed):
 the 886 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers).
 
+**AR9462 (`ar9462_enablement`, in progress — not claimed).** Step 1
+(identity and INI, plus owner probe and admission record):
+`ar9003::Chip::Ar9462` is PCIe `0x0034`
+(`hw.h::AR9300_DEVID_AR9462`, chip_chainmask 3, two chains). It has
+its own macVersion `AR_SREV_VERSION_9462` 0x280, so no macRev split
+against the AR9300 is needed; `Revision::decode` accepts only macRev
+2 (`AR_SREV_REVISION_9462_20`, the 2.0 tables) and 3
+(`AR_SREV_REVISION_9462_21`, the 2.1 tables) — the 1.0 tables were
+removed from Linux as unavailable silicon. The EEPROM restore limits
+are the AR9300's. `ar9003/initvals_ar9462.rs` is every table of
+`ar9462_2p0_initvals.h` and `ar9462_2p1_initvals.h` (44 names: 22
+transcribed tables of 1373 rows — 18 from 2.0, 3 from 2.1, and the 2.0
+mac postamble from 9331 — generated verbatim in file order; the 2.0
+mac-postamble `#define` is transcribed from
+`ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble`, the other 2.0
+aliases point at the `ar9003/initvals.rs` 2p2 tables, and every 2.1
+alias points at its 2.0 table). `ini::Tables::for_revision` dispatches
+`ar9003_hw_init_mode_regs` on the 2.1/2.0 branches:
+`Tables::ar9462` is the 2.0 set (2.1 swaps only its MAC core,
+baseband postamble and SoC preamble) plus `ar9003_tx_gain_table_apply`
+(modes 0/1/4 are the 9462 low/high/mix-ob/db tables; modes 2/3 fall
+through to the AR9300 2p2 low-ob/db and high-power tables; modes
+5/6/7 and index >= 8 keep the mode-0 low-ob/db default) and
+`ar9003_rx_gain_table_apply` (mode 1 is the AR9300 2p2 wo-XLNA table;
+mode 2 is the mixed table with the mix baseband core/postamble
+overrides and the 5G-XLNA array; mode 3 is the 5G-XLNA-only table — an
+alias of the mixed table — with the 5G-XLNA array; index >= 4 keeps
+the common default). `phy::prepare`/`expected` program the sys2ant
+postamble (9462-only in Linux) and the RX-gain overrides, and count
+the override writes; Linux sets no DFS array for the AR9462, so
+`dfs` stays empty, and the PCIe SerDes arrays are the
+`pciephy_clkreq_disable_L1` table in both slots (Linux gates them on
+`pll_pwrsave`, not modeled here). The owner matches `0x0034` as
+`ath9k-ar9462` and the admission record is `N46A` v1 (two-chain) under
+`ath9k/ar9462-admit-v1-ch<N>-<mac>.bin`, binding the 2p0/2p1 INI
+preparation. AR9300/AR9580 tables and streams are unchanged. Smokes
+(written, not executed):
+`smoke_ath9k_ar9462_revision_and_ini_selection` (FNV-1a oracle over
+the 755 default-selected 2 GHz HT20 rows for each of 2.0 and 2.1, and
+every TX/RX gain mode with the mode 2/3 override arrays, computed
+from the local Linux headers) and
+`smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
+Remainder, not in this step: MCI Bluetooth coexistence, WoW
+(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
+deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,
