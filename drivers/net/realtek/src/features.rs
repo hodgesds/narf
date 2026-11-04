@@ -787,7 +787,10 @@ pub const fn mtu_transition(
     mac_version: Option<u32>,
     new_mtu: u32,
 ) -> Result<MtuProgram, MtuError> {
-    let ver = mac_version.unwrap_or(0);
+    let ver = match mac_version {
+        Some(v) => v,
+        None => 0,
+    };
     let max = jumbo_max_mtu(ver);
     if new_mtu < MIN_MTU || new_mtu > max {
         return Err(MtuError::OutOfRange);

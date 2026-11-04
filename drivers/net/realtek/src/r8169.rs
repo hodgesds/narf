@@ -1385,7 +1385,6 @@ impl narf_net::iface::DeviceControl for RtlMtuControl {
     }
 }
 
-
 impl narf_net::Interface for Rtl8168Nic {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
