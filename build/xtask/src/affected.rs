@@ -58,6 +58,32 @@ const MUSL_CRATES: &[&str] = &[
 /// that `net-smoke` covers.
 const NET_CRATES: &[&str] = &["narf-net", "narf-ipc", "narf-io", "narf-drivers-net"];
 
+/// Crates whose kernel-test registrations partition cleanly by directory,
+/// so a change confined to one partition cell narrows the kernel-test
+/// filter to that cell's tags instead of the crate's whole tag set.
+/// Each entry is (crate, segments below the crate dir that define one
+/// cell). Soundness condition, verified before allowlisting: every tag
+/// registered in the crate is registered only inside a single cell, and
+/// no test outside a cell carries a cell-scoped tag (a parent-dir test
+/// file registering a subdir tag is the failure mode that rules out
+/// deeper splits).
+///
+/// `narf-drivers-wireless`: cells are `src/<family>/` (depth 2).
+/// Verified against the tree at authoring time: 0 leaks at family
+/// level, but 14 leaks at subdir level (e.g. a family-root test file
+/// registering a `drivers/wireless/rtw88/usb` tag), so depth 2 is the
+/// deepest sound split for this crate. Dependents (notably `narf-frame`)
+/// always keep their full tag sets, so the composition census and other
+/// frame tests still run on every narrowed run.
+///
+/// Surveyed and deliberately NOT allowlisted: `narf-drivers-net` needs
+/// no narrowing (each vendor is already a nested crate, so a vendor-dir
+/// change maps to that vendor's crate alone); `narf-drivers-gpu` and
+/// `narf-drivers-usb` have flat `src/` layouts whose tags do not mirror
+/// directories, so directory narrowing cannot split them — they need a
+/// filename-prefix map or a crate split, not this mechanism.
+const DIR_NARROW_CRATES: &[(&str, usize)] = &[("narf-drivers-wireless", 2)];
+
 /// A change reaching any of these must run the dedicated GPU kernel-test
 /// job: the GPU driver crate owns every `drivers/gpu` test registration,
 /// and `narf-boot` parses the kernel cmdline keys (`test_subsystem=`,
@@ -99,6 +125,13 @@ fn is_ignorable_path(rel: &str) -> bool {
         base,
         "LICENSE" | "README.md" | "ROADMAP.md" | "STATUS.md" | "AGENTS.md"
     ) || base.ends_with(".md")
+        // Root safety-argument.toml changes no build output and CI has
+        // no checker for it today, so it seeds nothing on its own. A
+        // code + safety-entry diff is scoped by the code; the
+        // safety-only case is forced full explicitly in `plan` (an
+        // all-ignored diff is not the empty diff, so it needs its own
+        // rule — see there).
+        || rel == "safety-argument.toml"
 }
 
 /// One workspace crate: its cargo package name, its directory relative to
@@ -267,12 +300,56 @@ fn collapse_tags(tags: BTreeSet<String>) -> BTreeSet<String> {
         .collect()
 }
 
+/// Directory-partition narrowing for allowlisted crates (see
+/// `DIR_NARROW_CRATES`). Returns the narrowed tag set for `crate_name`
+/// when every changed file in that crate falls in a single partition
+/// cell, else `None` (caller falls back to the crate's full tag set).
+/// A file at the crate root or above the cell depth, files in different
+/// cells, and a missing/empty cell entry all fall back to the full set.
+fn narrowed_tags(
+    crate_name: &str,
+    changed_files: &[String],
+    crates: &[CrateInfo],
+    dir_tag_map: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) -> Option<BTreeSet<String>> {
+    let (_, depth) = DIR_NARROW_CRATES.iter().find(|(n, _)| *n == crate_name)?;
+    let crate_dir = crates.iter().find(|c| c.name == crate_name)?.dir.clone();
+    let mut cell: Option<String> = None;
+    for f in changed_files {
+        if file_to_crate(f, crates) != Some(crate_name) {
+            continue;
+        }
+        let rel = f.strip_prefix(&format!("{crate_dir}/"))?;
+        let dir = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.len() < *depth {
+            return None;
+        }
+        let this_cell = segments[..*depth].join("/");
+        match &cell {
+            None => cell = Some(this_cell),
+            Some(c) if *c == this_cell => {}
+            Some(_) => return None,
+        }
+    }
+    let cell = cell?;
+    let tags = dir_tag_map.get(crate_name)?.get(&cell)?;
+    if tags.is_empty() {
+        None
+    } else {
+        Some(tags.clone())
+    }
+}
+
 /// The pure decision function. `tag_map` maps crate name → the kernel-test
-/// subsystem tags registered in that crate.
+/// subsystem tags registered in that crate; `dir_tag_map` maps crate name
+/// → directory (relative to the crate dir) → the tags registered in that
+/// directory's subtree, used only for `DIR_NARROW_CRATES` narrowing.
 pub fn plan(
     changed_files: &[String],
     crates: &[CrateInfo],
     tag_map: &BTreeMap<String, BTreeSet<String>>,
+    dir_tag_map: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     event: &str,
     force_full: bool,
 ) -> Plan {
@@ -350,6 +427,24 @@ pub fn plan(
                 lint_all = true;
             }
         }
+    }
+
+    // safety-argument.toml is ignorable (it seeds nothing), but a diff
+    // touching ONLY it must not come out as a minimal doc-only run:
+    // the empty-set rule above keys on the raw diff, and an
+    // all-ignored diff is not empty, so this case needs its own rule.
+    // A safety-entry change riding along with code is unaffected — the
+    // code still scopes the run. lint_all keeps the full run honest:
+    // every other full path lints all crates, and a "full" run that
+    // skipped clippy would not be full.
+    if !changed_files.is_empty()
+        && seeds.is_empty()
+        && changed_files.iter().any(|f| f == "safety-argument.toml")
+    {
+        p.full = true;
+        lint_all = true;
+        p.reasons
+            .push("safety-argument-only change — running full as a safe default".into());
     }
 
     // Hub crate directly touched ⇒ full.
@@ -444,9 +539,23 @@ pub fn plan(
 
     // Preserve all dependent test tags, then compact equivalent prefixes.
     // Fall back to the whole suite only if the byte budget is exceeded.
+    // Seed crates on the directory-narrow allowlist contribute only
+    // their partition cell's tags when the change is confined to one
+    // cell; every other crate in the closure (dependents included, so
+    // `narf-frame` and its composition tests always ride along)
+    // contributes its full tag set. Narrowing only ever removes tags
+    // from the selected set, and prefix collapse still requires the
+    // whole universe under a prefix to be selected, so a narrowed
+    // filter can never silently broaden.
     if p.run_kernel_test {
         let mut tags: BTreeSet<String> = BTreeSet::new();
         for c in &closure {
+            if p.changed_crates.contains(c) {
+                if let Some(narrowed) = narrowed_tags(c, changed_files, crates, dir_tag_map) {
+                    tags.extend(narrowed);
+                    continue;
+                }
+            }
             if let Some(t) = tag_map.get(c) {
                 tags.extend(t.iter().cloned());
             }
@@ -636,28 +745,45 @@ fn git_changed_files(root: &Path, base: &str, head: &str, event: &str) -> Result
 /// Scan the tree for `kernel_test_in!("<tag>", …)` (and `kernel_test!` ⇒
 /// `verification`) and attribute each tag to its owning crate. This is the
 /// zero-maintenance crate→subsystem map: it reads the same call sites the
-/// kernel test registry does.
-fn scan_test_tags(root: &Path, crates: &[CrateInfo]) -> Result<BTreeMap<String, BTreeSet<String>>> {
+/// kernel test registry does. Also returns, per crate, the tags in each
+/// subdirectory's subtree (keyed by the directory relative to the crate
+/// dir, crate root excluded) for `DIR_NARROW_CRATES` narrowing.
+fn scan_test_tags(
+    root: &Path,
+    crates: &[CrateInfo],
+) -> Result<(
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+)> {
     let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut dir_map: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
     for c in crates {
         let dir = root.join(&c.dir);
-        let mut tags: BTreeSet<String> = BTreeSet::new();
-        collect_tags_in_dir(&dir, crates, &c.dir, &mut tags)?;
+        let mut crate_dirs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let tags = collect_tags_in_dir(&dir, crates, &c.dir, "", &mut crate_dirs)?;
         if !tags.is_empty() {
             map.entry(c.name.clone()).or_default().extend(tags);
         }
+        if !crate_dirs.is_empty() {
+            dir_map.insert(c.name.clone(), crate_dirs);
+        }
     }
-    Ok(map)
+    Ok((map, dir_map))
 }
 
 /// Walk `.rs` files under `dir`, but do not descend into a nested crate's
 /// directory (those tags belong to the nested crate, matched separately).
+/// Returns the tags in this directory's subtree and records every visited
+/// subdirectory's subtree set in `dir_out` (keyed by the directory
+/// relative to the crate dir).
 fn collect_tags_in_dir(
     dir: &Path,
     crates: &[CrateInfo],
     owner_dir: &str,
-    out: &mut BTreeSet<String>,
-) -> Result<()> {
+    rel: &str,
+    dir_out: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<BTreeSet<String>> {
+    let mut local: BTreeSet<String> = BTreeSet::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("scan {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -670,13 +796,21 @@ fn collect_tags_in_dir(
             if is_other_crate_dir(&path, crates, owner_dir) {
                 continue;
             }
-            collect_tags_in_dir(&path, crates, owner_dir, out)?;
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let sub_rel = if rel.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let sub = collect_tags_in_dir(&path, crates, owner_dir, &sub_rel, dir_out)?;
+            dir_out.insert(sub_rel, sub.clone());
+            local.extend(sub);
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             let text = std::fs::read_to_string(&path)?;
-            extract_tags(&text, out).with_context(|| format!("scan {}", path.display()))?;
+            extract_tags(&text, &mut local).with_context(|| format!("scan {}", path.display()))?;
         }
     }
-    Ok(())
+    Ok(local)
 }
 
 /// True if `path` is the root directory of a workspace crate other than the
@@ -781,11 +915,11 @@ fn plan_to_github(p: &Plan) -> String {
 /// `cargo xtask affected` entry point.
 pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
     let crates = load_workspace(root)?;
-    let (tag_map, scan_failed) = match scan_test_tags(root, &crates) {
-        Ok(tags) => (tags, false),
+    let ((tag_map, dir_map), scan_failed) = match scan_test_tags(root, &crates) {
+        Ok(maps) => (maps, false),
         Err(e) => {
             eprintln!("xtask affected: test inventory failed ({e:#}); using full matrix");
-            (BTreeMap::new(), true)
+            ((BTreeMap::new(), BTreeMap::new()), true)
         }
     };
 
@@ -808,7 +942,7 @@ pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
     };
 
     let force_full = args.force_full || diff_failed || scan_failed;
-    let p = plan(&changed, &crates, &tag_map, &event, force_full);
+    let p = plan(&changed, &crates, &tag_map, &dir_map, &event, force_full);
 
     let github = args.github || matches!(args.format, OutputFormat::Github);
     if github {
@@ -925,6 +1059,7 @@ mod tests {
             &["filesystem/src/page_cache.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -952,6 +1087,7 @@ mod tests {
             &["drivers/gpu/src/lib.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -977,6 +1113,7 @@ mod tests {
             &["drivers/gpu/src/lib.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -986,6 +1123,7 @@ mod tests {
             &["filesystem/src/page_cache.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -997,6 +1135,7 @@ mod tests {
             &["drivers/gpu/src/lib.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             true,
         );
@@ -1019,6 +1158,7 @@ mod tests {
             &["graphics/src/lib.rs".to_string()],
             &crates,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1033,6 +1173,7 @@ mod tests {
             &["userspace/src/syscall.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1051,6 +1192,7 @@ mod tests {
             &["lib/src/x.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1068,7 +1210,14 @@ mod tests {
             "build/xtask/src/main.rs",
             "rust-toolchain.toml",
         ] {
-            let p = plan(&[f.to_string()], &cr, &tags(), "pull_request", false);
+            let p = plan(
+                &[f.to_string()],
+                &cr,
+                &tags(),
+                &BTreeMap::new(),
+                "pull_request",
+                false,
+            );
             assert!(p.full, "{f} must force full");
         }
     }
@@ -1080,6 +1229,7 @@ mod tests {
             &["some_new_toplevel_thing/x.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1089,6 +1239,7 @@ mod tests {
             &["docs/design.md".to_string(), "README.md".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1104,6 +1255,7 @@ mod tests {
             &["filesystem/src/page_cache.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "push",
             false,
         );
@@ -1117,6 +1269,7 @@ mod tests {
             &["userspace/Cargo.toml".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1131,6 +1284,7 @@ mod tests {
             &["drivers/net/src/rx.rs".to_string()],
             &cr,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1153,6 +1307,7 @@ mod tests {
             &["filesystem/src/x.rs".to_string()],
             &cr,
             &tm,
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1190,7 +1345,14 @@ mod tests {
             ("filesystem/src/lib.rs", "narf-filesystem"),
             ("lib/src/lib.rs", "narf-lib"),
         ] {
-            let p = plan(&[file.into()], &fixture(), &tags(), "pull_request", false);
+            let p = plan(
+                &[file.into()],
+                &fixture(),
+                &tags(),
+                &BTreeMap::new(),
+                "pull_request",
+                false,
+            );
             assert_eq!(p.clippy_crates, strings(&[package]));
             assert_eq!(p.changed_crates, strings(&[package]));
             assert!(p.crates.contains("narf-frame"));
@@ -1203,6 +1365,7 @@ mod tests {
             &["drivers/gpu/src/lib.rs".into()],
             &fixture(),
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1212,6 +1375,7 @@ mod tests {
             &["filesystem/src/lib.rs".into()],
             &fixture(),
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1222,18 +1386,33 @@ mod tests {
     #[test]
     fn full_matrix_escape_hatches() {
         for event in ["schedule", "workflow_dispatch"] {
-            let p = plan(&["README.md".into()], &fixture(), &tags(), event, false);
+            let p = plan(
+                &["README.md".into()],
+                &fixture(),
+                &tags(),
+                &BTreeMap::new(),
+                event,
+                false,
+            );
             assert!(
                 p.full && p.run_large_memory && p.run_xapic && p.run_user_mode && p.run_virtio_mmio
             );
             assert_eq!(p.clippy_crates.len(), fixture().len());
         }
-        let p = plan(&[], &fixture(), &tags(), "pull_request", false);
+        let p = plan(
+            &[],
+            &fixture(),
+            &tags(),
+            &BTreeMap::new(),
+            "pull_request",
+            false,
+        );
         assert!(p.full);
         let p = plan(
             &["README.md".into()],
             &fixture(),
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             true,
         );
@@ -1247,7 +1426,14 @@ mod tests {
             "userspace/login-core/src/lib.rs",
             "narf-libc/src/lib.rs",
         ] {
-            let p = plan(&[path.into()], &fixture(), &tags(), "pull_request", false);
+            let p = plan(
+                &[path.into()],
+                &fixture(),
+                &tags(),
+                &BTreeMap::new(),
+                "pull_request",
+                false,
+            );
             assert!(!p.full, "{path}");
             assert!(p.crates.contains(VERIFICATION));
             assert!(p.run_kernel_test && p.run_musl_demo && p.run_user_mode);
@@ -1263,6 +1449,7 @@ mod tests {
             &["user-runtime/src/lib.rs".into()],
             &crates,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1274,13 +1461,21 @@ mod tests {
     #[test]
     fn assets_are_build_inputs_and_deleted_manifests_force_full() {
         for path in ["filesystem/fixture.txt", "drivers/gpu/cursor.png"] {
-            let p = plan(&[path.into()], &fixture(), &tags(), "pull_request", false);
+            let p = plan(
+                &[path.into()],
+                &fixture(),
+                &tags(),
+                &BTreeMap::new(),
+                "pull_request",
+                false,
+            );
             assert!(p.run_kernel_test && p.run_clippy);
         }
         let p = plan(
             &["drivers/gpu/deleted/Cargo.toml".into()],
             &fixture(),
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1296,6 +1491,7 @@ mod tests {
             &["build/xtask/src/main.rs".into()],
             &crates,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1306,6 +1502,7 @@ mod tests {
             &["build/uefi-loader/src/main.rs".into()],
             &crates,
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1346,6 +1543,7 @@ mod tests {
             &["filesystem/src/lib.rs".into()],
             &cr,
             &tm,
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1378,6 +1576,7 @@ mod tests {
             &["filesystem/src/lib.rs".into()],
             &fixture(),
             &tags(),
+            &BTreeMap::new(),
             "pull_request",
             false,
         );
@@ -1423,5 +1622,178 @@ mod tests {
             strings(&["root", "child", "leaf"])
         );
         assert!(!crates[0].deps.contains(&"external".into()));
+    }
+
+    /// Fixture graph for directory narrowing: wireless crate with two
+    /// family tag sets, frame depending on it (so frame tags ride along
+    /// on every narrowed run, as in production).
+    fn wireless_crates() -> Vec<CrateInfo> {
+        vec![
+            ci("narf-lib", "lib", &[]),
+            ci("narf-drivers-wireless", "drivers/wireless", &["narf-lib"]),
+            ci("narf-frame", "frame", &["narf-drivers-wireless"]),
+        ]
+    }
+
+    fn wireless_tags() -> BTreeMap<String, BTreeSet<String>> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "narf-drivers-wireless".to_string(),
+            strings(&[
+                "drivers/wireless/rtw88",
+                "drivers/wireless/rtw88/usb",
+                "drivers/wireless/ath9k",
+            ]),
+        );
+        m.insert("narf-frame".to_string(), strings(&["frame"]));
+        m
+    }
+
+    fn wireless_dir_tags() -> BTreeMap<String, BTreeMap<String, BTreeSet<String>>> {
+        let mut cells = BTreeMap::new();
+        cells.insert(
+            "src/rtw88".to_string(),
+            strings(&["drivers/wireless/rtw88", "drivers/wireless/rtw88/usb"]),
+        );
+        cells.insert(
+            "src/ath9k".to_string(),
+            strings(&["drivers/wireless/ath9k"]),
+        );
+        cells.insert(
+            "src".to_string(),
+            strings(&[
+                "drivers/wireless/rtw88",
+                "drivers/wireless/rtw88/usb",
+                "drivers/wireless/ath9k",
+            ]),
+        );
+        let mut m = BTreeMap::new();
+        m.insert("narf-drivers-wireless".to_string(), cells);
+        m
+    }
+
+    #[test]
+    fn single_family_wireless_change_narrows_to_family_plus_frame() {
+        let cr = wireless_crates();
+        let p = plan(
+            &["drivers/wireless/src/rtw88/reserved_page_tests.rs".into()],
+            &cr,
+            &wireless_tags(),
+            &wireless_dir_tags(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert!(p.run_kernel_test);
+        // rtw88/usb folds into rtw88 (strict prefix present); ath9k and
+        // every other family drop out; frame rides along via the closure.
+        assert_eq!(p.subsystems, strings(&["drivers/wireless/rtw88", "frame"]));
+    }
+
+    #[test]
+    fn deeper_file_in_same_family_stays_at_family_level() {
+        // The cell is the first two segments below the crate dir, so a
+        // file in a family subdir narrows to the family, not the subdir
+        // (family-root test files register subdir-scoped tags).
+        let cr = wireless_crates();
+        let p = plan(
+            &["drivers/wireless/src/rtw88/mac/x.rs".into()],
+            &cr,
+            &wireless_tags(),
+            &wireless_dir_tags(),
+            "pull_request",
+            false,
+        );
+        assert_eq!(p.subsystems, strings(&["drivers/wireless/rtw88", "frame"]));
+    }
+
+    #[test]
+    fn cross_family_and_shared_wireless_changes_stay_full_family_set() {
+        let cr = wireless_crates();
+        for files in [
+            vec![
+                "drivers/wireless/src/rtw88/x.rs",
+                "drivers/wireless/src/ath9k/y.rs",
+            ],
+            vec!["drivers/wireless/src/lib.rs"],
+            vec!["drivers/wireless/Cargo.toml"],
+        ] {
+            let p = plan(
+                &files.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+                &cr,
+                &wireless_tags(),
+                &wireless_dir_tags(),
+                "pull_request",
+                false,
+            );
+            assert!(!p.full);
+            // Both families selected, so prefix collapse folds them all
+            // the way to drivers (the whole wireless universe under that
+            // prefix is selected); frame still rides along.
+            assert!(p.subsystems.contains("drivers"));
+            assert!(p.subsystems.contains("frame"));
+        }
+    }
+
+    #[test]
+    fn non_allowlisted_crate_ignores_dir_map() {
+        // A dir map entry for a crate outside DIR_NARROW_CRATES must not
+        // narrow it: the crate keeps its full tag set.
+        let cr = fixture();
+        let mut dirs: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+        let mut gpu_cells = BTreeMap::new();
+        gpu_cells.insert("src/amdgpu".to_string(), strings(&["drivers/gpu/amdgpu"]));
+        dirs.insert("narf-drivers-gpu".to_string(), gpu_cells);
+        let p = plan(
+            &["drivers/gpu/src/amdgpu/x.rs".into()],
+            &cr,
+            &tags(),
+            &dirs,
+            "pull_request",
+            false,
+        );
+        assert!(p.subsystems.contains("drivers"));
+        assert!(
+            !p.subsystems.contains("drivers/gpu/amdgpu"),
+            "non-allowlisted crate must not narrow"
+        );
+    }
+
+    #[test]
+    fn safety_argument_toml_is_ignorable_except_when_alone() {
+        let cr = fixture();
+        // Code + safety entry: scoped by the code.
+        let p = plan(
+            &[
+                "filesystem/src/page_cache.rs".into(),
+                "safety-argument.toml".into(),
+            ],
+            &cr,
+            &tags(),
+            &BTreeMap::new(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full, "safety entry must not force full alongside code");
+        assert!(p.subsystems.contains("filesystem"));
+        // Safety entry alone: full, via its own rule (not the empty-diff rule).
+        let p = plan(
+            &["safety-argument.toml".into()],
+            &cr,
+            &tags(),
+            &BTreeMap::new(),
+            "pull_request",
+            false,
+        );
+        assert!(p.full, "safety-only diff must stay full");
+        assert!(
+            p.reasons.iter().any(|r| r.contains("safety-argument")),
+            "reasons: {:?}",
+            p.reasons
+        );
+        // A "full" run that skipped clippy would not be full: like every
+        // other full path, the safety-only run lints all crates.
+        assert!(p.run_clippy);
+        assert_eq!(p.clippy_crates.len(), cr.len());
     }
 }
