@@ -369,21 +369,70 @@ const MDIC_READY: u32 = 1 << 28;
 /// `E1000_MDIC_ERROR` — transaction-error bit (read path only).
 const MDIC_ERROR: u32 = 1 << 30;
 
-// IEEE 802.3 Clause 22 PHY registers (standard, not vendor-specific):
-// 1 = BMSR (status), 2 = PHYSID1, 3 = PHYSID2. (BMCR, register 0, is
-// intentionally not defined here: autoneg programming is a follow-up
-// item, and an unused constant would trip the dead-code lint.)
+// IEEE 802.3 Clause 22 PHY registers (standard, not vendor-specific)
+// and Clause 28/40 auto-negotiation words. Register numbers and bit
+// values match Linux `include/linux/mii.h` (MII_BMCR 0, MII_BMSR 1,
+// MII_PHYSID1 2, MII_PHYSID2 3, MII_ADVERTISE 4, MII_LPA 5,
+// MII_CTRL1000 9, MII_STAT1000 0x0a); BMCR bits match the igb
+// crate's in-tree constants too. No fresh SDM read was done for
+// these — see the lane disclosure in the PR body.
+/// PHY basic-mode control register.
+const PHY_BMCR: u32 = 0;
 /// PHY basic-mode status register.
 const PHY_BMSR: u32 = 1;
 /// PHY identifier register 1 (OUI bits 3–18).
 const PHY_ID1: u32 = 2;
 /// PHY identifier register 2 (OUI bits 19–24, model, revision).
 const PHY_ID2: u32 = 3;
+/// PHY auto-negotiation advertisement register.
+const PHY_ANAR: u32 = 4;
+/// PHY link-partner ability register.
+const PHY_LPA: u32 = 5;
+/// PHY 1000BASE-T control register.
+const PHY_GBCR: u32 = 9;
+/// PHY 1000BASE-T status register.
+const PHY_STAT1000: u32 = 10;
+/// BMCR auto-negotiation enable bit.
+const BMCR_ANENABLE: u16 = 1 << 12;
+/// BMCR auto-negotiation restart bit.
+const BMCR_ANRESTART: u16 = 1 << 9;
 /// BMSR link-status bit. Latch-low per IEEE 802.3 §22.2.4.2: once the
 /// link drops the bit sticks at 0 until read, so a single read can
 /// report a stale down — readers take two consecutive reads and
 /// trust the second.
 const BMSR_LINK: u16 = 1 << 2;
+/// BMSR auto-negotiation complete bit. Same latch-low discipline as
+/// LINK: readers take two consecutive reads and trust the second.
+const BMSR_ANCOMPLETE: u16 = 1 << 5;
+/// ANAR/LPA selector field value for IEEE 802.3 CSMA (bits 4:0).
+const ANAR_SELECTOR_CSMA: u16 = 0x0001;
+/// ANAR/LPA 10BASE-T half-duplex bit.
+const ANAR_10HALF: u16 = 1 << 5;
+/// ANAR/LPA 10BASE-T full-duplex bit.
+const ANAR_10FULL: u16 = 1 << 6;
+/// ANAR/LPA 100BASE-TX half-duplex bit.
+const ANAR_100HALF: u16 = 1 << 7;
+/// ANAR/LPA 100BASE-TX full-duplex bit.
+const ANAR_100FULL: u16 = 1 << 8;
+/// ANAR/LPA symmetric pause bit. Cleared by this lane (gap 7 owns
+/// pause advertisement — see `aneg_anar_next`).
+const ANAR_PAUSE: u16 = 1 << 10;
+/// ANAR/LPA asymmetric pause bit (same gap-7 note).
+const ANAR_PAUSE_ASYM: u16 = 1 << 11;
+/// ANAR 10/100 speed bits — the field `aneg_anar_next` rewrites.
+const ANAR_SPEED_MASK: u16 = ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL;
+/// ANAR pause bits — cleared with the speed field until gap 7.
+const ANAR_PAUSE_MASK: u16 = ANAR_PAUSE | ANAR_PAUSE_ASYM;
+/// 1000BASE-T control 1000BASE-T half-duplex advertisement bit.
+const GBCR_1000HALF: u16 = 1 << 8;
+/// 1000BASE-T control 1000BASE-T full-duplex advertisement bit.
+const GBCR_1000FULL: u16 = 1 << 9;
+/// 1000BASE-T control speed bits — the field `aneg_gbcr_next` rewrites.
+const GBCR_SPEED_MASK: u16 = GBCR_1000HALF | GBCR_1000FULL;
+/// 1000BASE-T status link-partner 1000BASE-T half-duplex bit.
+const STAT1000_1000HALF: u16 = 1 << 10;
+/// 1000BASE-T status link-partner 1000BASE-T full-duplex bit.
+const STAT1000_1000FULL: u16 = 1 << 11;
 
 // EEE (Energy Efficient Ethernet) — IEEE 802.3az. On I218/I219 the
 // MAC negotiates EEE LPI with its link partner; when the partner
@@ -1325,6 +1374,119 @@ fn bmsr_link(bmsr: u16) -> bool {
     bmsr & BMSR_LINK != 0
 }
 
+/// Auto-negotiation complete from a BMSR sample (same latch-low
+/// double-read discipline as `bmsr_link`).
+fn bmsr_ancomplete(bmsr: u16) -> bool {
+    bmsr & BMSR_ANCOMPLETE != 0
+}
+
+/// Negotiated link mode from auto-negotiation (IEEE 802.3 Annex 28B
+/// priority order, highest first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkMode {
+    Speed10Half,
+    Speed10Full,
+    Speed100Half,
+    Speed100Full,
+    Speed1000Half,
+    Speed1000Full,
+}
+
+/// This driver's auto-negotiation advertisement as (ANAR, GBCR):
+/// 10/100 half+full in ANAR, 1000 full only in GBCR, pause bits
+/// clear. 1000 half is denied exactly as Linux does ("We do not
+/// allow the Phy to advertise 1000 Mb Half Duplex",
+/// `e1000_phy_setup_autoneg`); pause is denied because flow
+/// control is audit gap 7 — advertising pause without FCRTL/FCRTH
+/// + RFCE/TFCE would promise a capability the datapath does not
+/// honor. The flow-control lane sets the pause bits when it lands.
+fn aneg_advertisement() -> (u16, u16) {
+    (
+        ANAR_SELECTOR_CSMA | ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL,
+        GBCR_1000FULL,
+    )
+}
+
+/// Next ANAR value from the current one, Linux
+/// `e1000_phy_setup_autoneg` shape: clear the 10/100 speed bits and
+/// the pause bits, then set this driver's speeds. The selector is
+/// forced to CSMA rather than preserved from the read: a zero
+/// selector is invalid, so forcing is strictly safer than copying
+/// a broken read. Remote-fault, acknowledge, and next-page bits
+/// are preserved (the PHY owns acknowledge; software must not
+/// clear it mid-negotiation).
+fn aneg_anar_next(current: u16) -> u16 {
+    (current & !(ANAR_SPEED_MASK | ANAR_PAUSE_MASK))
+        | ANAR_SELECTOR_CSMA
+        | ANAR_10HALF
+        | ANAR_10FULL
+        | ANAR_100HALF
+        | ANAR_100FULL
+}
+
+/// Next GBCR value from the current one: clear both 1000 speed
+/// bits, set 1000 full only (1000 half denied, see
+/// `aneg_advertisement`).
+fn aneg_gbcr_next(current: u16) -> u16 {
+    (current & !GBCR_SPEED_MASK) | GBCR_1000FULL
+}
+
+/// Next BMCR value from the current one: set ANENABLE + ANRESTART,
+/// preserving every other bit (Linux `e1000_copper_link_autoneg`
+/// read-modify-write shape; a blind write would drop power-down,
+/// loopback, and forced speed/duplex bits).
+fn aneg_bmcr_restart(current: u16) -> u16 {
+    current | BMCR_ANENABLE | BMCR_ANRESTART
+}
+
+/// Resolve the negotiated mode from our advertisement and the link
+/// partner's ability words (ANAR/LPA share speed-bit positions;
+/// 1000BASE-T lives in GBCR/STAT1000). Priority per IEEE 802.3
+/// Annex 28B: 1000F > 1000H > 100F > 100H > 10F > 10H. 100BASE-T4
+/// is not considered: neither side advertises it (Linux e1000e
+/// does not either), so it can never be the common mode. `None`
+/// means no common mode — the link cannot come up on these
+/// advertisements.
+fn resolve_negotiated_mode(
+    our_anar: u16,
+    our_gbcr: u16,
+    lp_anar: u16,
+    lp_stat1000: u16,
+) -> Option<LinkMode> {
+    if our_gbcr & GBCR_1000FULL != 0 && lp_stat1000 & STAT1000_1000FULL != 0 {
+        Some(LinkMode::Speed1000Full)
+    } else if our_gbcr & GBCR_1000HALF != 0 && lp_stat1000 & STAT1000_1000HALF != 0 {
+        Some(LinkMode::Speed1000Half)
+    } else if our_anar & ANAR_100FULL != 0 && lp_anar & ANAR_100FULL != 0 {
+        Some(LinkMode::Speed100Full)
+    } else if our_anar & ANAR_100HALF != 0 && lp_anar & ANAR_100HALF != 0 {
+        Some(LinkMode::Speed100Half)
+    } else if our_anar & ANAR_10FULL != 0 && lp_anar & ANAR_10FULL != 0 {
+        Some(LinkMode::Speed10Full)
+    } else if our_anar & ANAR_10HALF != 0 && lp_anar & ANAR_10HALF != 0 {
+        Some(LinkMode::Speed10Half)
+    } else {
+        None
+    }
+}
+
+/// Link-partner ability as read from LPA + STAT1000.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartnerAbility {
+    /// LPA word (register 5): 10/100 speed bits + pause bits, same
+    /// positions as ANAR.
+    pub anar: u16,
+    /// 1000BASE-T status word (register 10): partner 1000 halves.
+    pub stat1000: u16,
+}
+
+impl PartnerAbility {
+    /// Negotiated mode against our advertisement words.
+    pub const fn negotiated_mode(&self, our_anar: u16, our_gbcr: u16) -> Option<LinkMode> {
+        resolve_negotiated_mode(our_anar, our_gbcr, self.anar, self.stat1000)
+    }
+}
+
 /// Read a 16-bit register from the internal PHY via MDIC.
 ///
 /// Linux: classic `e1000_read_phy_reg` MDIC branch
@@ -1380,6 +1542,24 @@ fn mdic_write(mmio: &MmioRegion, reg: u32, data: u16) -> Result<(), E1000Error> 
     if !ready {
         return Err(E1000Error::PhyMdioTimeout);
     }
+    Ok(())
+}
+
+/// Program auto-negotiation advertisement and restart negotiation
+/// (Linux `e1000_copper_link_autoneg` minus the wait: bring-up
+/// must not block on link — the LSC drain reports the transition).
+/// ANAR, then GBCR, then BMCR restart, each read-modify-write.
+/// Callers own SWFLAG scoping: bring_up holds it across init (so
+/// it calls this directly), and `E1000::autoneg_setup` takes it
+/// for the sequence. Must NOT be called with no SWFLAG held on a
+/// PCH part with an active ME.
+fn autoneg_setup_mmio(mmio: &MmioRegion) -> Result<(), E1000Error> {
+    let anar = mdic_read(mmio, PHY_ANAR)?;
+    mdic_write(mmio, PHY_ANAR, aneg_anar_next(anar))?;
+    let gbcr = mdic_read(mmio, PHY_GBCR)?;
+    mdic_write(mmio, PHY_GBCR, aneg_gbcr_next(gbcr))?;
+    let bmcr = mdic_read(mmio, PHY_BMCR)?;
+    mdic_write(mmio, PHY_BMCR, aneg_bmcr_restart(bmcr))?;
     Ok(())
 }
 
@@ -1637,6 +1817,21 @@ impl E1000 {
         if pch_part {
             disable_eee_pchlan(&mmio);
         }
+
+        // 1c. Program auto-negotiation advertisement and restart
+        //    negotiation, before the rings and CTRL.SLU: starting AN
+        //    here gives it the whole bring-up window to complete
+        //    before the STATUS.LU sample at step 6 (the LSC drain
+        //    reports the transition if it completes later).
+        //    Best-effort: a PHY that does not answer MDIC keeps its
+        //    reset-default advertisement, which still negotiates —
+        //    failing bring-up here would brick a NIC whose only
+        //    fault is an unreadable PHY register. Post-bring-up,
+        //    `autoneg_setup()` re-runs this with errors propagated.
+        //    SWFLAG is already held (step 0) on PCH parts, so the
+        //    raw mmio sequence is correct here; the `E1000`
+        //    method must NOT be used (it would release early).
+        let _ = autoneg_setup_mmio(&mmio);
 
         // 2. Read MAC from RAL/RAH.
         // SAFETY: `mmio` was mapped from BAR0; `REG_RAL0` is a valid 32-bit
@@ -2776,8 +2971,9 @@ impl E1000 {
     // suspend (only the EN bits gate DMA), so in-flight descriptor
     // state survives and resume is a control-word restore, not a
     // bring-up replay; (3) no PHY power-down on suspend and no PHY
-    // power-up on resume — e1000 has no MDIC access (audit gap 5),
-    // so the igb-style BMCR power-down is not expressible here;
+    // power-up on resume — deliberate: the PHY is never powered
+    // down, so its autoneg advertisement persists across suspend
+    // and resume re-links without an AN restart;
     // (4) no WoL arming on suspend — WoL (audit gap 6) needs this
     // contract first and lands as its own item, so suspend is
     // always unarmed (no WUC/WUFC programming exists to clear).
@@ -3641,6 +3837,60 @@ impl E1000 {
         let bmsr = self.phy_read(PHY_BMSR)?;
         Ok(bmsr_link(bmsr))
     }
+
+    /// Program auto-negotiation advertisement and restart
+    /// negotiation (post-bring-up entry to `autoneg_setup_mmio`).
+    /// The ANAR+GBCR+BMCR triple is one logical programming
+    /// operation, so the SWFLAG is held across the sequence
+    /// rather than per register (tighter than bring_up's
+    /// whole-init hold, safer than per-register against ME
+    /// interleaving mid-sequence).
+    ///
+    /// Must NOT be called during `bring_up`: bring-up holds SWFLAG
+    /// across init, and this method's release would drop that hold
+    /// early. Bring-up calls `autoneg_setup_mmio` directly.
+    pub fn autoneg_setup(&self) -> Result<(), E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = autoneg_setup_mmio(&self.mmio);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    /// Auto-negotiation complete sample: two consecutive BMSR
+    /// reads (latch-low), trust the second — same discipline as
+    /// `phy_link_up`. Same do-not-call-during-bring_up constraint
+    /// as `phy_read`.
+    pub fn autoneg_complete(&self) -> Result<bool, E1000Error> {
+        let _ = self.phy_read(PHY_BMSR)?;
+        let bmsr = self.phy_read(PHY_BMSR)?;
+        Ok(bmsr_ancomplete(bmsr))
+    }
+
+    /// Link-partner ability: LPA + 1000BASE-T status. Same
+    /// do-not-call-during-bring_up constraint as `phy_read`.
+    pub fn link_partner_ability(&self) -> Result<PartnerAbility, E1000Error> {
+        Ok(PartnerAbility {
+            anar: self.phy_read(PHY_LPA)?,
+            stat1000: self.phy_read(PHY_STAT1000)?,
+        })
+    }
+
+    /// Negotiated mode against the live advertisement words: our
+    /// ANAR/GBCR as programmed plus the partner's ability. `None`
+    /// means no common mode (or the partner has not answered yet —
+    /// callers distinguish via `autoneg_complete`).
+    pub fn negotiated_mode(&self) -> Result<Option<LinkMode>, E1000Error> {
+        let our_anar = self.phy_read(PHY_ANAR)?;
+        let our_gbcr = self.phy_read(PHY_GBCR)?;
+        let partner = self.link_partner_ability()?;
+        Ok(partner.negotiated_mode(our_anar, our_gbcr))
+    }
 }
 
 mod tests {
@@ -3697,6 +3947,101 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_link_sample_from_status_decodes);
+
+    fn smoke_aneg_advertisement_shape() -> TestResult {
+        // ANAR = selector + 10/100 half+full = 0x01E1; GBCR = 1000
+        // full only = 0x0200; pause bits clear (gap 7 owns them).
+        let (anar, gbcr) = super::aneg_advertisement();
+        if anar != 0x01E1 || gbcr != 0x0200 {
+            return TestResult::Fail("e1000 autoneg advertisement word mismatch");
+        }
+        if anar & super::ANAR_PAUSE_MASK != 0 {
+            return TestResult::Fail("e1000 autoneg advertisement sets pause bits");
+        }
+        if anar & 0x001F != super::ANAR_SELECTOR_CSMA {
+            return TestResult::Fail("e1000 autoneg advertisement selector is not CSMA");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_aneg_advertisement_shape);
+
+    fn smoke_aneg_next_rewrites_only_its_fields() -> TestResult {
+        // From zero: exactly the advertisement words.
+        if super::aneg_anar_next(0x0000) != 0x01E1 {
+            return TestResult::Fail("e1000 aneg_anar_next(0) is not the advertisement");
+        }
+        if super::aneg_gbcr_next(0x0000) != 0x0200 {
+            return TestResult::Fail("e1000 aneg_gbcr_next(0) is not 1000 full");
+        }
+        // From all-ones: speeds + pause rewritten, selector forced,
+        // reserved/remote-fault/ack/next-page bits preserved.
+        if super::aneg_anar_next(0xFFFF) != 0xF3FF {
+            return TestResult::Fail("e1000 aneg_anar_next(0xFFFF) preserved the wrong bits");
+        }
+        if super::aneg_gbcr_next(0xFFFF) != 0xFEFF {
+            return TestResult::Fail("e1000 aneg_gbcr_next(0xFFFF) preserved the wrong bits");
+        }
+        // BMCR restart sets only ANENABLE + ANRESTART.
+        if super::aneg_bmcr_restart(0x0000) != 0x1200 {
+            return TestResult::Fail("e1000 aneg_bmcr_restart(0) missed ANENABLE/ANRESTART");
+        }
+        if super::aneg_bmcr_restart(0x0800) != 0x1A00 {
+            return TestResult::Fail("e1000 aneg_bmcr_restart dropped the power-down bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_aneg_next_rewrites_only_its_fields
+    );
+
+    fn smoke_aneg_resolve_priority_and_no_common() -> TestResult {
+        let ours = super::aneg_advertisement();
+        // Full agreement at 1000 full.
+        if super::resolve_negotiated_mode(ours.0, ours.1, 0x01E1, 0x0800)
+            != Some(super::LinkMode::Speed1000Full)
+        {
+            return TestResult::Fail("e1000 aneg resolve missed 1000 full agreement");
+        }
+        // Partner 1000 full but we do not offer 1000: fall to 100 full.
+        if super::resolve_negotiated_mode(0x01E1, 0x0000, 0x01E1, 0x0800)
+            != Some(super::LinkMode::Speed100Full)
+        {
+            return TestResult::Fail("e1000 aneg resolve did not fall through missing 1000");
+        }
+        // 1000 half resolves only when both sides offer it (general
+        // resolver; this driver never advertises it).
+        if super::resolve_negotiated_mode(0x01E1, 0x0100, 0x01E1, 0x0400)
+            != Some(super::LinkMode::Speed1000Half)
+        {
+            return TestResult::Fail("e1000 aneg resolve missed 1000 half agreement");
+        }
+        // Partner 1000 full, we offer 1000 half only: fall to 100 full.
+        if super::resolve_negotiated_mode(0x01E1, 0x0100, 0x01E1, 0x0800)
+            != Some(super::LinkMode::Speed100Full)
+        {
+            return TestResult::Fail("e1000 aneg resolve confused 1000 half/full");
+        }
+        // Partner 10 half only: lowest common mode.
+        if super::resolve_negotiated_mode(ours.0, ours.1, 0x0020, 0x0000)
+            != Some(super::LinkMode::Speed10Half)
+        {
+            return TestResult::Fail("e1000 aneg resolve missed 10 half agreement");
+        }
+        // No common mode: partner answers nothing we offer.
+        if super::resolve_negotiated_mode(ours.0, ours.1, 0x0000, 0x0000).is_some() {
+            return TestResult::Fail("e1000 aneg resolve invented a mode with no overlap");
+        }
+        // BMSR complete bit.
+        if !super::bmsr_ancomplete(0x0020) || super::bmsr_ancomplete(0x0000) {
+            return TestResult::Fail("e1000 bmsr_ancomplete misread the complete bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_aneg_resolve_priority_and_no_common
+    );
 
     fn smoke_vlan_vfta_mapping() -> TestResult {
         // Boundary VIDs: first/last bit of the first word, first bit
