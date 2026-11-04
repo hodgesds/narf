@@ -102,20 +102,52 @@ memory-window ownership and do not use this control-register path.
   advertisement is honest (#841). A device that does not offer flush is
   treated as write-through, and a non-S_OK flush status surfaces as an
   error rather than silent success.
-- VirtIO sound PCI queries PCM_INFO and registers its implemented stream-0
-  playback endpoint with `drivers/sound`, including the actual PCI parent.
-  `PcmDevice::capabilities` derives its format/rate/channel sets from PCM_INFO
-  and supplies period/buffer bounds to side-effect-free ALSA negotiation.
-  The PCM lease supports the advertised subset of S16LE mono/stereo at
-  44.1/48 kHz, configuration, prepare/start/stop, cumulative frame position,
-  writes and drain. Other opens and kernel convenience submits
-  cannot bypass an active lease. Capture, MIDI and mixer controls are not
-  advertised without a backend. Playback copies into coherent controller-owned
-  scratch and splits long writes at whole-frame boundaries; the 4024-byte
-  payload area ends before the completion status. Configuration changes issue
-  STOP/RELEASE before SET_PARAMS/PREPARE/START. Timeout poisons the controller
-  and requires acknowledged reset before caller-owned DMA storage can be freed;
-  unacknowledged reset is fatal rather than returning live DMA to an allocator.
+- VirtIO sound PCI queries PCM_INFO for every stream and registers the
+  first viable output stream as playback device 0 and, when the device
+  reports one, the first viable input stream as capture device 0 with
+  `drivers/sound`, including the actual PCI parent. "Viable" means S16
+  plus 44.1/48 kHz plus sane channel bounds; later streams of the same
+  direction are not exposed. `PcmDevice::capabilities` derives its
+  format/rate/channel sets from the direction's PCM_INFO and supplies
+  period/buffer bounds to side-effect-free ALSA negotiation. Each PCM
+  lease supports the advertised subset of S16LE mono/stereo at 44.1/48
+  kHz, configuration, prepare/start/stop, cumulative frame position,
+  and drain; playback additionally supports writes, capture
+  additionally supports reads, and the other direction's operation
+  fails closed (playback `read` and capture `write` return BadState).
+  Other opens and kernel convenience submits cannot bypass an active
+  lease. MIDI is not advertised. Playback copies into coherent
+  controller-owned scratch and splits long writes at whole-frame
+  boundaries; the 4024-byte payload area ends before the completion
+  status. Capture pre-posts empty period buffers on a 32-entry rx
+  queue (10 three-descriptor messages) and reports each completion's
+  recorded frames from the used-ring length minus the 8-byte status.
+  Configuration changes issue STOP/RELEASE before SET_PARAMS/PREPARE/
+  START; a merely-prepared stream takes RELEASE alone. Timeout poisons
+  the controller and requires acknowledged reset before caller-owned
+  DMA storage can be freed; unacknowledged reset is fatal rather than
+  returning live DMA to an allocator.
+- VirtIO sound services its event queue lazily, on every PCM pointer
+  read and every control read: there is no pump task and no MSI-X on
+  this driver, so polling at those points is the service model. Jack
+  connect/disconnect events update per-jack state exposed as JackSense
+  controls (seeded from JACK_INFO at probe); PCM period/xrun and
+  control-notify events are consumed and reposted, and unknown or
+  malformed events are dropped without touching state. Control
+  elements exist only under the control-element extension (absent from
+  VirtIO 1.2, verified against 1.4 §5.14.6.10): the driver negotiates
+  VIRTIO_SND_F_CTLS only when the device offers it and reads the
+  `controls` config field only then. Reported elements map role-first
+  onto mixer kinds (output volume → MasterVolume, input volume →
+  CaptureVolume, output mute → MasterMute, input gain → MicBoost);
+  elements with no mixer kind (input mute, output gain, undefined
+  role), unmapped types (INTEGER64, ENUMERATED, BYTES, IEC958), and
+  uncarryable shapes (INTEGER with more than 2 members, BOOLEAN with
+  more than 1) stay unadvertised rather than mislabeled. Control reads
+  always round-trip live; control writes range-check against the
+  device's own bounds. TLV metadata and enumerated item names are not
+  surfaced. A device without CTL support still probes and plays (and
+  captures, when it has an input stream) with an empty control list.
 
 Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 `queue_packed`, `class_blk`, `class_net`, `class_console`.

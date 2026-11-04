@@ -1477,6 +1477,464 @@ kernel_test_in!(
     smoke_virtio_snd_pci_playback_queues_async
 );
 
+/// Event decoding is pinned byte-for-byte against the spec-shaped
+/// frame (1.2 §5.14.6 events; CTL_NOTIFY per 1.4 §5.14.6.10.4).
+/// No device is needed: the decoder is pure.
+fn virtio_snd_event_decode() -> TestResult {
+    use crate::snd_pci::{decode_event, SndEvent};
+    // Jack connected: code 0x1000, data = jack id.
+    let mut bytes = [0u8; 8];
+    bytes[0..4].copy_from_slice(&0x1000u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    if decode_event(&bytes) != Some(SndEvent::JackConnected(3)) {
+        return TestResult::Fail("jack connected decode");
+    }
+    // Jack disconnected: code 0x1001.
+    bytes[0..4].copy_from_slice(&0x1001u32.to_le_bytes());
+    if decode_event(&bytes) != Some(SndEvent::JackDisconnected(3)) {
+        return TestResult::Fail("jack disconnected decode");
+    }
+    // PCM period elapsed / xrun: codes 0x1100 / 0x1101, data = stream id.
+    bytes[0..4].copy_from_slice(&0x1100u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+    if decode_event(&bytes) != Some(SndEvent::PcmPeriodElapsed(1)) {
+        return TestResult::Fail("pcm period decode");
+    }
+    bytes[0..4].copy_from_slice(&0x1101u32.to_le_bytes());
+    if decode_event(&bytes) != Some(SndEvent::PcmXrun(1)) {
+        return TestResult::Fail("pcm xrun decode");
+    }
+    // CTL notify: code 0x1200, data word splits into control_id
+    // (low u16) + mask (high u16).
+    bytes[0..4].copy_from_slice(&0x1200u32.to_le_bytes());
+    bytes[4..6].copy_from_slice(&0x0007u16.to_le_bytes());
+    bytes[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+    if decode_event(&bytes)
+        != Some(SndEvent::CtlNotify {
+            control_id: 7,
+            mask: 1,
+        })
+    {
+        return TestResult::Fail("ctl notify decode");
+    }
+    // Unknown codes and short buffers decode to None, never to a
+    // misapplied event.
+    bytes[0..4].copy_from_slice(&0x9999u32.to_le_bytes());
+    if decode_event(&bytes).is_some() {
+        return TestResult::Fail("unknown event code decoded");
+    }
+    if decode_event(&bytes[..7]).is_some() || decode_event(&[]).is_some() {
+        return TestResult::Fail("short event buffer decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/snd-pci", virtio_snd_event_decode);
+
+/// Jack-event application against a fake state slice: connect sets,
+/// disconnect clears, out-of-range ids and non-jack events are
+/// ignored rather than flipping state.
+fn virtio_snd_jack_apply() -> TestResult {
+    use crate::snd_pci::{apply_jack_event, SndEvent};
+    let mut state = [false; 2];
+    apply_jack_event(&mut state, SndEvent::JackConnected(1));
+    if state != [false, true] {
+        return TestResult::Fail("connect did not set jack 1");
+    }
+    apply_jack_event(&mut state, SndEvent::JackConnected(9));
+    if state != [false, true] {
+        return TestResult::Fail("out-of-range connect flipped state");
+    }
+    apply_jack_event(&mut state, SndEvent::PcmPeriodElapsed(1));
+    if state != [false, true] {
+        return TestResult::Fail("pcm event flipped jack state");
+    }
+    apply_jack_event(&mut state, SndEvent::JackDisconnected(1));
+    if state != [false, false] {
+        return TestResult::Fail("disconnect did not clear jack 1");
+    }
+    apply_jack_event(&mut state, SndEvent::JackDisconnected(0));
+    if state != [false, false] {
+        return TestResult::Fail("disconnect of clear jack changed state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/snd-pci", virtio_snd_jack_apply);
+
+/// CTL role encoding and mixer-kind mapping (1.4 §5.14.6.10.1):
+/// role = (base << 1) | direction; UNDEFINED and out-of-range roles
+/// map to nothing; input mutes and output gains have no mixer kind
+/// and stay unadvertised rather than mislabeled.
+fn virtio_snd_ctl_role_mapping() -> TestResult {
+    use crate::snd_pci::{ctl_kind_for, split_ctl_role};
+    use narf_drivers_sound::mixer::ControlKind;
+    // (role, expected split, expected kind). Roles 0, 1, and 8 do
+    // not split; roles 5 (input mute) and 6 (output gain) split
+    // but have no mixer kind.
+    type RoleCase = (u32, Option<(u32, u32)>, Option<ControlKind>);
+    let cases: [RoleCase; 9] = [
+        (2, Some((1, 0)), Some(ControlKind::MasterVolume)),
+        (3, Some((1, 1)), Some(ControlKind::CaptureVolume)),
+        (4, Some((2, 0)), Some(ControlKind::MasterMute)),
+        (5, Some((2, 1)), None),
+        (6, Some((3, 0)), None),
+        (7, Some((3, 1)), Some(ControlKind::MicBoost)),
+        (0, None, None),
+        (1, None, None),
+        (8, None, None),
+    ];
+    for (role, split, kind) in cases {
+        if split_ctl_role(role) != split {
+            return TestResult::Fail("role split mismatch");
+        }
+        let Some((base, direction)) = split else {
+            continue;
+        };
+        if ctl_kind_for(base, direction) != kind {
+            return TestResult::Fail("role kind mapping mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/snd-pci", virtio_snd_ctl_role_mapping);
+
+/// `virtio_snd_ctl_info` parsing (1.4 §5.14.6.10.1, 92 bytes):
+/// a volume element with role (VOLUME << 1) | OUTPUT, INTEGER type,
+/// READ|WRITE access, count 2, and min/max/step parses field-exact;
+/// malformed records (zero count, count above the type maximum,
+/// undefined role/type/access bits, wrong length) parse to None.
+fn virtio_snd_ctl_info_parse() -> TestResult {
+    use crate::snd_pci::parse_ctl_info_record;
+    let mut record = [0u8; 92];
+    record[0..4].copy_from_slice(&0u32.to_le_bytes());
+    record[4..8].copy_from_slice(&2u32.to_le_bytes());
+    record[8..12].copy_from_slice(&1u32.to_le_bytes());
+    record[12..16].copy_from_slice(&0b11u32.to_le_bytes());
+    record[16..20].copy_from_slice(&2u32.to_le_bytes());
+    record[20..24].copy_from_slice(&0u32.to_le_bytes());
+    record[24..28].copy_from_slice(b"Vol\0");
+    record[68..72].copy_from_slice(&0i32.to_le_bytes());
+    record[72..76].copy_from_slice(&87i32.to_le_bytes());
+    record[76..80].copy_from_slice(&1i32.to_le_bytes());
+    let Some(info) = parse_ctl_info_record(&record) else {
+        return TestResult::Fail("valid ctl info record rejected");
+    };
+    if info.role != 2
+        || info.ctype != 1
+        || info.access != 0b11
+        || info.count != 2
+        || info.min != 0
+        || info.max != 87
+        || info.step != 1
+    {
+        return TestResult::Fail("ctl info fields mismatch");
+    }
+    // INTEGER64 form: min/max/step are 64-bit at 68/76/84.
+    let mut record64 = [0u8; 92];
+    record64[8..12].copy_from_slice(&2u32.to_le_bytes());
+    record64[12..16].copy_from_slice(&0b01u32.to_le_bytes());
+    record64[16..20].copy_from_slice(&1u32.to_le_bytes());
+    record64[68..76].copy_from_slice(&(-100i64).to_le_bytes());
+    record64[76..84].copy_from_slice(&100i64.to_le_bytes());
+    record64[84..92].copy_from_slice(&5i64.to_le_bytes());
+    let Some(info64) = parse_ctl_info_record(&record64) else {
+        return TestResult::Fail("valid integer64 record rejected");
+    };
+    if info64.min != -100 || info64.max != 100 || info64.step != 5 {
+        return TestResult::Fail("integer64 fields mismatch");
+    }
+    // Malformed variants.
+    let mut bad = record;
+    bad[16..20].copy_from_slice(&0u32.to_le_bytes());
+    if parse_ctl_info_record(&bad).is_some() {
+        return TestResult::Fail("zero-count record accepted");
+    }
+    let mut bad = record;
+    bad[16..20].copy_from_slice(&129u32.to_le_bytes());
+    if parse_ctl_info_record(&bad).is_some() {
+        return TestResult::Fail("over-count record accepted");
+    }
+    let mut bad = record;
+    bad[4..8].copy_from_slice(&8u32.to_le_bytes());
+    if parse_ctl_info_record(&bad).is_some() {
+        return TestResult::Fail("undefined role accepted");
+    }
+    let mut bad = record;
+    bad[8..12].copy_from_slice(&6u32.to_le_bytes());
+    if parse_ctl_info_record(&bad).is_some() {
+        return TestResult::Fail("undefined type accepted");
+    }
+    let mut bad = record;
+    bad[12..16].copy_from_slice(&0x80u32.to_le_bytes());
+    if parse_ctl_info_record(&bad).is_some() {
+        return TestResult::Fail("undefined access bit accepted");
+    }
+    if parse_ctl_info_record(&record[..91]).is_some() {
+        return TestResult::Fail("short record accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/snd-pci", virtio_snd_ctl_info_parse);
+
+/// `virtio_snd_pcm_info` direction split (1.2 §5.14.6.6.2): given
+/// output-then-input records, the first output id and first input id
+/// are selected; a wrong-direction record is never accepted as the
+/// other direction, and non-viable records are skipped.
+fn virtio_snd_pcm_info_direction_split() -> TestResult {
+    use crate::snd_pci::{split_stream_records, PlaybackInfo};
+    let output = PlaybackInfo {
+        formats: 1 << 5,
+        rates: (1 << 6) | (1 << 7),
+        direction: 0,
+        channels_min: 1,
+        channels_max: 2,
+    };
+    let input = PlaybackInfo {
+        formats: 1 << 5,
+        rates: 1 << 7,
+        direction: 1,
+        channels_min: 1,
+        channels_max: 1,
+    };
+    let broken = PlaybackInfo {
+        formats: 0,
+        rates: 1 << 7,
+        direction: 1,
+        channels_min: 1,
+        channels_max: 1,
+    };
+    // Input first, then output, then a non-viable input: selection
+    // is by direction in device order, skipping the broken record.
+    let records = [(3, input), (1, output), (2, broken)];
+    if split_stream_records(&records) != (Some(1), Some(3)) {
+        return TestResult::Fail("direction split mismatch");
+    }
+    // Output only: no input id.
+    if split_stream_records(&[(0, output)]) != (Some(0), None) {
+        return TestResult::Fail("output-only split mismatch");
+    }
+    // Input only: no output id (probe would fail, not misbind).
+    if split_stream_records(&[(0, input)]) != (None, Some(0)) {
+        return TestResult::Fail("input-only split mismatch");
+    }
+    // Non-viable only: neither.
+    if split_stream_records(&[(0, broken)]) != (None, None) {
+        return TestResult::Fail("broken-only split mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/snd-pci",
+    virtio_snd_pcm_info_direction_split
+);
+
+/// `virtio_snd_jack_info` parsing (1.2 §5.14.6.4.1, 24 bytes):
+/// the `connected` byte at offset 16 reads 0/1; any other value
+/// parses to None rather than being guessed.
+fn virtio_snd_jack_info_parse() -> TestResult {
+    use crate::snd_pci::parse_jack_info_record;
+    let mut record = [0u8; 24];
+    record[16] = 1;
+    if parse_jack_info_record(&record) != Some(true) {
+        return TestResult::Fail("connected jack parsed wrong");
+    }
+    record[16] = 0;
+    if parse_jack_info_record(&record) != Some(false) {
+        return TestResult::Fail("disconnected jack parsed wrong");
+    }
+    record[16] = 2;
+    if parse_jack_info_record(&record).is_some() {
+        return TestResult::Fail("undefined connected value accepted");
+    }
+    if parse_jack_info_record(&record[..23]).is_some() {
+        return TestResult::Fail("short jack record accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/snd-pci", virtio_snd_jack_info_parse);
+
+/// Live capture path against the QEMU virtio-snd device: open the
+/// capture device, configure/prepare/start, and read at least one
+/// period of frames, with the same stall-bounded wait the playback
+/// test uses (the kernel-test boot never calibrates the TSC, so a
+/// total-time budget is meaningless; a stall budget is not).
+/// Skips when the device has no capture stream.
+fn smoke_virtio_snd_pci_capture_queues_async() -> TestResult {
+    use crate::snd_pci;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    use narf_drivers_sound::format::{HwParams, SampleFormat};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !devices().iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    }) {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
+    snd_pci::__reset_for_test();
+    __reset_for_test();
+    snd_pci::register_pci_driver();
+    if probe_all_pci(&bootstrap_registry_authority()).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let Some(card) = snd_pci::__card_index_for_test() else {
+        return TestResult::Fail("virtio-snd card not registered");
+    };
+    let mut stream = match narf_drivers_sound::open_capture(card, 0) {
+        Ok(stream) => stream,
+        Err(narf_drivers_sound::SoundError::NoSuchDevice) => {
+            return TestResult::Skip("no virtio-snd capture stream");
+        }
+        Err(_) => return TestResult::Fail("open_capture"),
+    };
+    let Ok(caps) = narf_drivers_sound::pcm_capabilities(card, true) else {
+        return TestResult::Fail("pcm_capabilities(capture)");
+    };
+    let (Some(&rate), Some(&channels)) = (caps.rates.last(), caps.channels.last()) else {
+        return TestResult::Fail("virtio-snd advertises no S16 capture rate or channel count");
+    };
+    let params = HwParams {
+        format: SampleFormat::S16LE,
+        rate,
+        channels,
+        period_size: 1024,
+        periods: 4,
+    };
+    if stream.hw_params(params).is_err() || stream.prepare().is_err() {
+        return TestResult::Fail("capture hw_params/prepare");
+    }
+    if stream.start().is_err() {
+        return TestResult::Fail("capture start");
+    }
+    let period_bytes = params.period_bytes();
+    let mut buf = alloc::vec![0u8; period_bytes * 2];
+    let mut got = 0usize;
+    let mut last = 0usize;
+    let mut progressed_at = narf_time::wall::monotonic_ns();
+    let mut stalled = false;
+    const STALL_NS: u64 = 3_000_000_000;
+    let filled = narf_scheduler::responsive_spin_until(
+        || {
+            match stream.read(&mut buf) {
+                Ok(n) => got += n,
+                Err(_) => return true,
+            }
+            if got < last {
+                return true;
+            }
+            let t = narf_time::wall::monotonic_ns();
+            if got != last {
+                progressed_at = t;
+            } else if t - progressed_at > STALL_NS {
+                stalled = true;
+                return true;
+            }
+            last = got;
+            got >= period_bytes
+        },
+        narf_time::Deadline::after_ms(60_000),
+    );
+    let _ = stream.stop();
+    if stalled {
+        return TestResult::Fail("capture produced no frames before stalling");
+    }
+    if !filled || got < period_bytes {
+        return TestResult::Fail("capture did not fill one period");
+    }
+    if stream.pointer() < u64::from(params.period_size) {
+        return TestResult::Fail("capture pointer did not advance a period");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/snd-pci",
+    smoke_virtio_snd_pci_capture_queues_async
+);
+
+/// Live mixer surface against the QEMU virtio-snd device: every
+/// jack id the topology reports has exactly one JackSense control
+/// that reads as a boolean, and every advertised CTL control
+/// round-trips its own value back through a write of the value just
+/// read (a no-op write, so the device state is unchanged). A
+/// read-only CTL control reports NoSuchControl on write, which is
+/// accepted. Skips nothing: the jack surface exists whenever the
+/// device reports jacks, and the CTL part is vacuous (but still
+/// executed) when the device offers no control elements.
+fn smoke_virtio_snd_pci_controls_surface() -> TestResult {
+    use crate::snd_pci;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    use narf_drivers_sound::mixer::ControlKind;
+    use narf_drivers_sound::SoundError;
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !devices().iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    }) {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
+    snd_pci::__reset_for_test();
+    __reset_for_test();
+    snd_pci::register_pci_driver();
+    if probe_all_pci(&bootstrap_registry_authority()).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let Some(card) = snd_pci::__card_index_for_test() else {
+        return TestResult::Fail("virtio-snd card not registered");
+    };
+    let Some((jacks, _, _)) = snd_pci::topology() else {
+        return TestResult::Fail("topology missing after probe");
+    };
+    let Ok(mixer) = narf_drivers_sound::mixer(card) else {
+        return TestResult::Fail("mixer(card)");
+    };
+    let controls = mixer.list_controls();
+    let jack_controls: alloc::vec::Vec<u32> = controls
+        .iter()
+        .filter(|id| id.kind == ControlKind::JackSense)
+        .map(|id| id.index)
+        .collect();
+    if jack_controls.len() != jacks as usize {
+        return TestResult::Fail("jack control count does not match topology jacks");
+    }
+    for jack in 0..jacks {
+        if !jack_controls.contains(&jack) {
+            return TestResult::Fail("jack id missing its JackSense control");
+        }
+        let id = narf_drivers_sound::mixer::ControlId {
+            index: jack,
+            kind: ControlKind::JackSense,
+        };
+        match mixer.get_control_value(id) {
+            Ok(narf_drivers_sound::mixer::ControlValue::Boolean(_)) => {}
+            _ => return TestResult::Fail("JackSense did not read as boolean"),
+        }
+    }
+    for id in controls
+        .iter()
+        .filter(|id| id.kind != ControlKind::JackSense)
+    {
+        let Ok(value) = mixer.get_control_value(*id) else {
+            return TestResult::Fail("CTL control did not read");
+        };
+        match mixer.set_control_value(*id, value) {
+            Ok(()) => {}
+            Err(SoundError::NoSuchControl) => {}
+            Err(_) => return TestResult::Fail("CTL control write failed unexpectedly"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/snd-pci",
+    smoke_virtio_snd_pci_controls_surface
+);
+
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use crate::balloon_pci;
     use narf_bus::driver_match::__reset_for_test;
