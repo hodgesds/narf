@@ -355,6 +355,7 @@ kernel_test_in!(
 
 /// A native Xe backend that reports only its LNL GT profile.
 #[derive(Debug)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct ProfileBackend(bool);
 impl crate::intel_gpu_user::UserBackend for ProfileBackend {
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
@@ -378,6 +379,7 @@ impl crate::intel_gpu_user::UserBackend for ProfileBackend {
 
 /// `DRM_IOCTL_XE_GEM_CREATE` of an 8 KiB system object with `flags` and
 /// `cpu_caching` (1 WB, 2 WC); the new handle.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn xe_gem_create(
     info: &crate::intel_gpu_render::DeviceInfo,
     gem: &crate::intel_gpu_gem::GemState,

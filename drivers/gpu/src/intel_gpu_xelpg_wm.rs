@@ -209,6 +209,7 @@ struct Params {
     linetime_us: u64,
 }
 
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 fn params(timing: Timing, surface: Surface) -> Result<Params, WmError> {
     if !matches!(surface.cpp, 1 | 2 | 4 | 8)
         || surface.width == 0
@@ -385,6 +386,7 @@ fn transition(wp: &Params, wm0: Level) -> Level {
 }
 
 /// `skl_build_plane_wm_single` for display 14: levels, transition, SAGV.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(crate) fn plane(
     timing: Timing,
     surface: Surface,
@@ -486,6 +488,7 @@ pub(crate) fn linetime(timing: Timing) -> Result<u32, WmError> {
 }
 
 /// `skl_cursor_allocation`.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(crate) fn cursor_allocation(
     timing: Timing,
     latency: &Latency,
@@ -684,6 +687,7 @@ pub(crate) fn check_vblank(
 
 /// `skl_wm_check_vblank` (see `check_vblank`) for a pipe that compresses
 /// (`dsc`) or not.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(crate) fn check_vblank_dsc(
     timing: Timing,
     latency: &Latency,

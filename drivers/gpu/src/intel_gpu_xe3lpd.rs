@@ -80,6 +80,8 @@
 //! compressed primaries, the Xe `SCANOUT` create flag, DC states, system
 //! suspend and relight, and Wildcat Lake (30.02).
 
+#![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_xe2lpd::{DisplayIp, IpError, DFSM_PIPE_A_DISABLE, SKL_DFSM};

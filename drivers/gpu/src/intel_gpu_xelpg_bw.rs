@@ -125,6 +125,7 @@ pub(crate) struct Group {
 }
 
 /// `tgl_get_bw_info(.., &mtl_sa_info)`; `None` for a zero row-cycle time.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(crate) fn bw_info(q: &Qgv) -> Option<[Group; GROUPS]> {
     bw_info_limit(q, DEPROGBWLIMIT_GBPS)
 }

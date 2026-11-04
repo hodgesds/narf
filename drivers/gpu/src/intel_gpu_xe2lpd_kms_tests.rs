@@ -13,6 +13,7 @@ use super::*;
 
 /// FLIP_DONE | PLANE1_FAULT | PIPEDMC_FAULT | FIFO_UNDERRUN | plane ATS |
 /// PIPEDMC ATS: every DE pipe status bit any profile may own.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const ALL_OWNED: u32 = 0x8304_0088;
 
 fn lunar(platform: &MockPlatform) -> Device<MockPlatform> {

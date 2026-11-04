@@ -348,7 +348,7 @@ impl Pipes {
     /// its share of the layout (its planes are off), as a reserved pipe that
     /// is not yet enabled does.
     fn sync_panel(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), PipeEnableError> {
-        if !self.state.is_some_and(|s| s.requests[0].is_some()) {
+        if self.state.is_none_or(|s| s.requests[0].is_none()) {
             return Ok(());
         }
         let conf = read(io, Pipe::A.base() + PIPECONF_OFFSET)?;

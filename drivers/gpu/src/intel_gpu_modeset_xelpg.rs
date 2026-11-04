@@ -3613,7 +3613,7 @@ pub mod tests {
         }
         // VDD was forced on for the power-off write (intel_pps_vdd_on).
         let vdd = at(&|o, v| o == PP_CONTROL && v & 8 != 0);
-        if !vdd.is_some_and(|i| i < steps[8].unwrap()) {
+        if vdd.is_none_or(|i| i >= steps[8].unwrap()) {
             return TestResult::Fail("intel_pps_off must follow intel_pps_vdd_on");
         }
         // The sink goes to D3 after the transcoder and before the DDI.
@@ -3718,7 +3718,7 @@ pub mod tests {
         // The function is configured without ENABLE, enabled before the
         // transcoder (intel_ddi_enable).
         let func_on = at(func_off, &|o, v| o == 0x60400 && v & (1 << 31) != 0);
-        if !func_on.is_some_and(|i| i < conf) {
+        if func_on.is_none_or(|i| i >= conf) {
             return TestResult::Fail("TRANS_DDI_FUNC_CTL must be enabled just before TRANSCONF");
         }
         // The console image is back on the plane, VDD no longer forced, and

@@ -59,6 +59,7 @@ fn get_priority(file: &RenderFile, card: u32, user: &Cpu, id: u32) -> i64 {
 /// UPDATE_CONTEXT_POLICIES pending in the host CT, before the model consumes
 /// them: full registration policies and priority-only updates, each as
 /// (GuC context id, SCHEDULING_PRIORITY).
+#[allow(clippy::type_complexity)]
 fn priority_policies(w: &Window) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
     let (mut full, mut updates) = (Vec::new(), Vec::new());
     for request in pending(w) {

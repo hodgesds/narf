@@ -1148,6 +1148,7 @@ kernel_test_in!(
 /// UPDATE_CONTEXT_POLICIES (0x100b) requests pending in the host CT, before
 /// the model consumes them: full policies as (id, priority, quantum) and
 /// priority-only updates as (id, priority).
+#[allow(clippy::type_complexity)]
 fn context_policies(w: &Window) -> (Vec<(u32, u32, u32)>, Vec<(u32, u32)>) {
     let memory = ct_memory(w);
     let words = memory.borrow();
@@ -1174,6 +1175,7 @@ fn context_policies(w: &Window) -> (Vec<(u32, u32, u32)>, Vec<(u32, u32)>) {
 
 /// Poll `range` (stopping once `fence` completes), collecting every
 /// UPDATE_CONTEXT_POLICIES the scheduler queued.
+#[allow(clippy::type_complexity)]
 fn drive_policies(
     gt: &mut GuCGt<Window, Arena>,
     w: &Window,
