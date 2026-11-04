@@ -1148,11 +1148,19 @@ fn color_blob(idx: u32, data: &[u8]) -> u32 {
     );
     u32::from_le_bytes(b[12..16].try_into().unwrap())
 }
+/// libdrm's drmModeGetPropertyBlob: a length pass, then a copy pass with
+/// exactly that length (drm_mode_getblob_ioctl copies on no other).
 fn color_blob_bytes(idx: u32, id: u32) -> Option<alloc::vec::Vec<u8>> {
-    let mut data = alloc::vec![0u8; 0x8000];
     let mut b = [0u8; 16];
     b[0..4].copy_from_slice(&id.to_le_bytes());
-    b[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        b.as_mut_ptr() as usize,
+        false,
+    )
+    .ok()?;
+    let mut data = alloc::vec![0u8; u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize];
     b[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     dispatch_card(
         idx,
@@ -1161,8 +1169,7 @@ fn color_blob_bytes(idx: u32, id: u32) -> Option<alloc::vec::Vec<u8>> {
         false,
     )
     .ok()?;
-    data.truncate(u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize);
-    Some(data)
+    (u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize == data.len()).then_some(data)
 }
 /// A GAMMA_LUT / legacy ramp of `n` equal-channel entries.
 fn color_lut(n: usize) -> alloc::vec::Vec<u8> {
@@ -4850,10 +4857,13 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     }
     // IN_FORMATS through GETPROPBLOB: a version-1 drm_format_modifier_blob
     // of the native formats and the 17 GFX12 modifiers.
-    let mut data = alloc::vec![0u8; 512];
+    let want =
+        (24 + crate::amdgpu_navi48_kms::PLANE_FORMATS.len() * 4).next_multiple_of(8) + 17 * 24;
+    let mut data = alloc::vec![0u8; want];
     let mut gb = [0u8; 16];
     gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
-    gb[4..8].copy_from_slice(&512u32.to_le_bytes());
+    // drm_mode_getblob_ioctl copies only into exactly the blob's length.
+    gb[4..8].copy_from_slice(&(want as u32).to_le_bytes());
     gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     let r = dispatch_card(
         idx,
@@ -5387,10 +5397,10 @@ fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
         return TestResult::Fail("cursor zpos property");
     }
     // IN_FORMATS: ARGB8888 under DRM_FORMAT_MOD_LINEAR alone.
-    let mut data = [0u8; 128];
+    let mut data = [0u8; 56];
     let mut gb = [0u8; 16];
     gb[0..4].copy_from_slice(&(blob as u32).to_le_bytes());
-    gb[4..8].copy_from_slice(&128u32.to_le_bytes());
+    gb[4..8].copy_from_slice(&56u32.to_le_bytes());
     gb[8..16].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     let r = dispatch_card(
         idx,

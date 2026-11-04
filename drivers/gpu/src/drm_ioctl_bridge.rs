@@ -4611,9 +4611,8 @@ fn handle_gamma(
 
 /// DRM_IOCTL_MODE_GETFB (`struct drm_mode_fb_cmd`, 28 bytes) and GETFB2
 /// (`struct drm_mode_fb_cmd2`, 104 bytes): drm_mode_getfb / getfb2_ioctl.
-/// An unknown id is ENOENT. GEM handles are reported as 0, as Linux does
-/// for a caller that is neither the framebuffer's owner nor CAP_SYS_ADMIN
-/// (LINUX-GAP: the owner would get a fresh handle).
+/// An unknown id is ENOENT. GEM handles are reported as 0 here;
+/// [`amdgpu_getfb_bo`] fills them in for the master on the native card.
 fn handle_getfb(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
@@ -4991,10 +4990,11 @@ fn handle_getpropblob(
         }
     };
 
-    // Second pass: copy the bytes out when the caller sized its buffer.
-    // LINUX-GAP: drm_mode_getblob_ioctl copies only on an exact length.
-    if data_ptr != 0 && user_len as usize >= edid.len() {
-        // SAFETY: user-supplied `data_ptr` the caller sized for >= edid.len().
+    // Second pass: drm_mode_getblob_ioctl copies only when the caller's
+    // length is exactly the blob's (a first pass with any other length,
+    // usually 0, just learns it).
+    if user_len as usize == edid.len() && !edid.is_empty() {
+        // SAFETY: user-supplied `data_ptr` the caller sized for edid.len().
         unsafe { copy_out(data_ptr as usize, &edid)? };
     }
     // Always report the true length (drives the caller's allocation).
