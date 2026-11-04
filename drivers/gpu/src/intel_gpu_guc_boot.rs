@@ -3179,12 +3179,18 @@ mod tests {
             assert!(gt.poll(7).is_pending());
             let words = if failure == 2 { [7, 2, 8] } else { [7, 1, 8] };
             let base = hwconfig_device_write(&window, &words);
+            // Failure 0 is a true timeout: no reply ever arrives. A reply
+            // already posted when a late poll runs wins over the expired
+            // deadline (condition before deadline, as Linux's waits do).
             let response = match failure {
-                1 => 0xe0000001,
-                5 => u32::MAX,
-                _ => 0xf0000000,
+                0 => None,
+                1 => Some(0xe0000001),
+                5 => Some(u32::MAX),
+                _ => Some(0xf0000000),
             };
-            window.0.borrow_mut().regs.insert(0x190240, response);
+            if let Some(response) = response {
+                window.0.borrow_mut().regs.insert(0x190240, response);
+            }
             if failure == 3 {
                 window.0.borrow_mut().fail_cpu_sync = true;
             }
