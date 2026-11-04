@@ -272,10 +272,24 @@ impl SourcePort {
     /// resolves the pending entry to Succeeded or Failed. Until a
     /// discovery task drives this, entry fails closed: an unknown
     /// cable never yields Enter Succeeded.
+    ///
+    /// Driven by `cable_discovery::CableDiscoveryPort::step` on
+    /// terminal discovery outcomes (see its `report_epr` mapping
+    /// table); detach clears back to unknown.
     pub fn set_cable_epr_capability(&self, known: bool, capable: bool) {
         self.cable_epr_known.store(known as u8, Ordering::Release);
         self.cable_epr_capable
             .store(capable as u8, Ordering::Release);
+    }
+
+    /// Test-only readback of the cable EPR hook state, for the
+    /// cable-discovery wiring tests. Not a public interface.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub fn cable_epr_capability(&self) -> (bool, bool) {
+        (
+            self.cable_epr_known.load(Ordering::Acquire) != 0,
+            self.cable_epr_capable.load(Ordering::Acquire) != 0,
+        )
     }
 
     /// Set the data-role flag directly. Used by the port driver to

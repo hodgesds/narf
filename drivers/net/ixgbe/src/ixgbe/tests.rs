@@ -766,3 +766,223 @@ fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ethtool_snapshot);
+
+// ── EEE control/status (§13f) ──────────────────────────────────────
+
+fn smoke_ixgbe_eee_capability_table() -> TestResult {
+    use super::eee::{
+        eee_capable, DEV_E610_10G_T, DEV_E610_2_5G_T, DEV_E610_BACKPLANE, DEV_E610_SFP,
+        DEV_X550EM_A_1G_T, DEV_X550EM_A_1G_T_L,
+    };
+    // No in-tree device id is EEE-capable per Linux's switch.
+    for did in [
+        IXGBE_DEV_82599EB,
+        IXGBE_DEV_X540,
+        IXGBE_DEV_X550,
+        IXGBE_DEV_X550EM_X,
+    ] {
+        if eee_capable(did) {
+            return TestResult::Fail("in-tree device id reported EEE-capable");
+        }
+    }
+    // In-tree X550EM_X (0x15AB) is a different part from
+    // X550EM_A_1G_T (0x15E4) and must not be confused with it.
+    if IXGBE_DEV_X550EM_X == DEV_X550EM_A_1G_T {
+        return TestResult::Fail("X550EM_X collides with X550EM_A_1G_T");
+    }
+    for did in [
+        DEV_X550EM_A_1G_T,
+        DEV_X550EM_A_1G_T_L,
+        DEV_E610_BACKPLANE,
+        DEV_E610_SFP,
+        DEV_E610_10G_T,
+        DEV_E610_2_5G_T,
+    ] {
+        if !eee_capable(did) {
+            return TestResult::Fail("Linux-capable device id reported incapable");
+        }
+    }
+    if eee_capable(0xFFFF) {
+        return TestResult::Fail("unknown device id reported EEE-capable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_capability_table);
+
+fn smoke_ixgbe_eee_defaults() -> TestResult {
+    use super::eee::{
+        e610_defaults, x550em_a_defaults, EeeSpeeds, EEE_SPEED_100M, EEE_SPEED_10G, EEE_SPEED_1G,
+        EEE_SPEED_2_5G, EEE_SPEED_5G,
+    };
+    let (sup, adv) = x550em_a_defaults();
+    if sup != EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G) || adv != sup {
+        return TestResult::Fail("X550EM_A defaults are not 100M|1G supported+advertised");
+    }
+    let (sup, adv) = e610_defaults(true);
+    if sup != EeeSpeeds(EEE_SPEED_2_5G) || adv != sup {
+        return TestResult::Fail("E610 2.5G_T defaults are not {2.5G}");
+    }
+    let (sup, adv) = e610_defaults(false);
+    if sup != EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G) || adv != sup {
+        return TestResult::Fail("E610 defaults are not {2.5G,5G,10G}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_defaults);
+
+fn smoke_ixgbe_eee_state_machine() -> TestResult {
+    use super::eee::{
+        EeeSpeeds, EeeState, LpModes, EEE_SPEED_100M, EEE_SPEED_10G, EEE_SPEED_1G, LP_10000BASE_KR,
+        LP_1000BASE_T, LP_100BASE_T,
+    };
+    let supported = EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G);
+    let mut state = EeeState::new(supported, supported);
+    if !state.enabled() || !state.tx_lpi_enabled() || state.active() {
+        return TestResult::Fail("enabled state wrong with no partner modes");
+    }
+    state.lp_advertised = LpModes(LP_100BASE_T | LP_1000BASE_T);
+    if !state.active() {
+        return TestResult::Fail("advertised∩partner should be active");
+    }
+    // A 10G partner bit alone cannot activate a 100M|1G advertisement.
+    state.lp_advertised = LpModes(LP_10000BASE_KR);
+    if state.active() {
+        return TestResult::Fail("KR partner mode wrongly activates T advertisement");
+    }
+    // Disabling clears the advertised set (Linux set_eee semantics).
+    state.set_enabled(false);
+    if state.enabled() || state.tx_lpi_enabled() || !state.advertised.is_empty() {
+        return TestResult::Fail("disable did not clear advertised set");
+    }
+    state.lp_advertised = LpModes(LP_100BASE_T);
+    if state.active() {
+        return TestResult::Fail("disabled state wrongly active");
+    }
+    // Re-enabling restores advertised = supported, and a 10G
+    // advertisement intersects a 10G partner bit.
+    state.set_enabled(true);
+    let mut state10 = EeeState::new(EeeSpeeds(EEE_SPEED_10G), EeeSpeeds(EEE_SPEED_10G));
+    state10.lp_advertised = LpModes(LP_10000BASE_KR);
+    if state10.active() {
+        return TestResult::Fail("10G T advertisement wrongly active on KR partner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_state_machine);
+
+fn smoke_ixgbe_eee_ud2_decode() -> TestResult {
+    use super::eee::{
+        lp_mode_names, lp_modes_from_ud2, LpModes, LP_10000BASE_KR, LP_1000BASE_T, LP_100BASE_T,
+        UD_2_100M_TX_EEE, UD_2_10G_KR_EEE, UD_2_1G_T_EEE,
+    };
+    let modes = lp_modes_from_ud2(UD_2_100M_TX_EEE | UD_2_1G_T_EEE | UD_2_10G_KR_EEE);
+    if modes != LpModes(LP_100BASE_T | LP_1000BASE_T | LP_10000BASE_KR) {
+        return TestResult::Fail("UD_2 decode wrong");
+    }
+    let names = lp_mode_names(modes);
+    if names != ["100baseT", "1000baseT", "10000baseKR"] {
+        return TestResult::Fail("UD_2 mode names wrong");
+    }
+    if !lp_modes_from_ud2(0).is_empty() || !lp_mode_names(LpModes::EMPTY).is_empty() {
+        return TestResult::Fail("empty UD_2 word decodes non-empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_ud2_decode);
+
+fn smoke_ixgbe_eee_validate() -> TestResult {
+    use super::eee::{
+        validate_request, EeeError, EeeRequest, EeeSpeeds, EeeState, EEE_SPEED_100M, EEE_SPEED_1G,
+    };
+    let supported = EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G);
+    let stored = EeeState::new(supported, supported);
+    let base = EeeRequest {
+        enabled: false,
+        tx_lpi_enabled: true,
+        tx_lpi_timer: 0,
+        advertised: supported,
+    };
+    // Only the enabled flag may move.
+    if validate_request(true, &stored, &base) != Ok(()) {
+        return TestResult::Fail("valid disable request rejected");
+    }
+    if validate_request(false, &stored, &base) != Err(EeeError::NotCapable) {
+        return TestResult::Fail("incapable device not rejected first");
+    }
+    let mut req = base;
+    req.tx_lpi_enabled = false;
+    if validate_request(true, &stored, &req) != Err(EeeError::TxLpiMismatch) {
+        return TestResult::Fail("TX-LPI enable change not rejected");
+    }
+    req = base;
+    req.tx_lpi_timer = 7;
+    if validate_request(true, &stored, &req) != Err(EeeError::TxLpiTimerMismatch) {
+        return TestResult::Fail("TX-LPI timer change not rejected");
+    }
+    req = base;
+    req.advertised = EeeSpeeds(EEE_SPEED_100M);
+    if validate_request(true, &stored, &req) != Err(EeeError::AdvertisedMismatch) {
+        return TestResult::Fail("advertised-set change not rejected");
+    }
+    req = base;
+    req.enabled = true;
+    if validate_request(true, &stored, &req) != Err(EeeError::AlreadyEnabled) {
+        return TestResult::Fail("no-op enable not reported already-enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_validate);
+
+fn smoke_ixgbe_eee_aci_cap() -> TestResult {
+    use super::eee::{
+        aci_eee_cap, EeeSpeeds, ACI_EEE_EN_10GBASE_T, ACI_EEE_EN_2_5GBASE_T, ACI_EEE_EN_5GBASE_T,
+        EEE_SPEED_100M, EEE_SPEED_10G, EEE_SPEED_1G, EEE_SPEED_2_5G, EEE_SPEED_5G,
+    };
+    let full = EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G);
+    if aci_eee_cap(full) != ACI_EEE_EN_2_5GBASE_T | ACI_EEE_EN_5GBASE_T | ACI_EEE_EN_10GBASE_T
+        || aci_eee_cap(full) != 0x1804
+    {
+        return TestResult::Fail("ACI cap for {2.5G,5G,10G} is not 0x1804");
+    }
+    // E610 maps nothing below 2.5G, even when advertised.
+    if aci_eee_cap(EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G)) != 0 {
+        return TestResult::Fail("ACI cap wrongly maps 100M/1G");
+    }
+    if aci_eee_cap(EeeSpeeds::EMPTY) != 0 {
+        return TestResult::Fail("ACI cap non-zero for empty set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_aci_cap);
+
+fn smoke_ixgbe_eee_ls_modes() -> TestResult {
+    use super::eee::{
+        speed_mode_names, EeeSpeeds, EEE_SPEED_100M, EEE_SPEED_10G, EEE_SPEED_10M, EEE_SPEED_1G,
+        EEE_SPEED_2_5G, EEE_SPEED_5G,
+    };
+    let all = EeeSpeeds(
+        EEE_SPEED_10M
+            | EEE_SPEED_100M
+            | EEE_SPEED_1G
+            | EEE_SPEED_2_5G
+            | EEE_SPEED_5G
+            | EEE_SPEED_10G,
+    );
+    if speed_mode_names(all)
+        != [
+            "10baseT",
+            "100baseT",
+            "1000baseT",
+            "2500baseT",
+            "5000baseT",
+            "10000baseT",
+        ]
+    {
+        return TestResult::Fail("LS mode names wrong or out of order");
+    }
+    if !speed_mode_names(EeeSpeeds::EMPTY).is_empty() {
+        return TestResult::Fail("empty speed set names non-empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_ls_modes);

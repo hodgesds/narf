@@ -19,7 +19,7 @@ simplicity), one MSI-X vector for link / RX completion, and a
 `HwNic` adapter exposing the same surface the e1000/mlx5 drivers
 do.
 
-Does NOT own: DCB, FCoE, SR-IOV, RSS, FlowDirector, EEE, VMDq.
+Does NOT own: DCB, FCoE, SR-IOV, RSS, FlowDirector, VMDq.
 
 ## 2. PCI match
 
@@ -245,6 +245,60 @@ into frame metadata), TSO claims no bound (the send path caps
 frames at 1518 bytes), and VLAN insertion is NOT claimed (RX
 filtering only).
 
+## 13f. EEE control/status (Linux model, no MAC registers)
+
+EEE in Linux ixgbe has no MAC register programming: `get_eee`
+returns `-EOPNOTSUPP` unless the device is EEE-capable AND its
+PHY is firmware-controlled. The driver-side model lives in
+`drivers/net/ixgbe/src/ixgbe/eee.rs` (`EeeSpeeds`,
+`LpModes`, `EeeState`, `EeeStatus`, `EeeRequest`,
+`validate_request`), wired as `Ixgbe::configure_eee` /
+`Ixgbe::eee_status` / `Ixgbe::eee_capable` with stored state
+in `eee_state`:
+
+- Capability gate, exactly Linux's `ixgbe_set_eee_capable`
+  switch: only X550EM_A_1G_T (0x15E4), X550EM_A_1G_T_L
+  (0x15E5), and E610_BACKPLANE (0x57AE), E610_SFP (0x57AF),
+  E610_10G_T (0x57B0), E610_2_5G_T (0x57B1) are capable. No
+  in-tree device id (82599EB, X540, X550, X550EM_X — note
+  X550EM_X 0x15AB is a different part from X550EM_A_1G_T)
+  is capable, so `configure_eee` returns `UnsupportedDevice`
+  on every in-tree part today.
+- Enable semantics (Linux `set_eee`): enabled stores
+  advertised = supported, disabled stores advertised = empty.
+  Validation (Linux `validate_keee`, in check order):
+  capability → TX-LPI enable → TX-LPI timer → advertised
+  set → already-enabled. Only the enabled flag may move.
+- Status derivations (Linux `get_eee_fw`): enabled =
+  advertised non-empty, TX-LPI enabled = enabled, active =
+  advertised ∩ link-partner non-empty over link modes.
+- FW-PHY decode: `FW_PHY_ACT_UD_2` (0x1002) info word →
+  partner modes via the `ixgbe_lp_map` (100M_TX/1G_T/10G_T/
+  1G_KX/10G_KX4/10G_KR bits 1..6). X550 FW-PHY defaults are
+  100M + 1G, supported and advertised.
+- ACI computation: `aci_eee_cap` maps advertised speeds to
+  the E610 capability word exactly as `setup_eee_e610`
+  does (2.5G → BIT(12), 5G → BIT(11), 10G → BIT(2));
+  100M/1G map to nothing. E610 defaults: 2.5G_T →
+  {2.5G}, other E610 → {2.5G, 5G, 10G}.
+
+⚠️ Datasheet grounding NOT met (see the `eee.rs` header):
+no 82599/X540/X550 datasheet copy exists locally; every
+value here is Linux-transcribed. Re-grounding stays a
+follow-up, and the maintainer may bounce this section on
+that ground alone.
+
+Remainders: the FW-PHY activity transport (host-interface
+command) and the ACI transport do not exist in-tree, so
+live link-partner queries and live re-application after a
+set (Linux resets the link; the setup-link activity carries
+`FW_PHY_ACT_SETUP_LINK_EEE` BIT(20)) are follow-ups, as is
+landing X550EM_A / E610 device support so any part can
+actually enable EEE. `EthtoolInfo` is unchanged: the
+snapshot cannot populate EEE state from hardware without
+those transports, so EEE status is reported through
+`eee_status()`, not the snapshot.
+
 ## 14. Sequenced follow-ups (not silently dropped)
 
 Per the v0.1 exclusion list, still open after this stream:
@@ -255,7 +309,11 @@ Per the v0.1 exclusion list, still open after this stream:
   complexity; the RSS path covers flow steering for now.
 - DCB (MTQC RT_Ena, RTRUP2TC, packet-buffer partitioning).
 - FCoE (FCRETA, FCRXCTRL) — out of the Ethernet scope.
-- EEE (energy-efficient Ethernet link modes).
+- EEE: model + capability gate + FW-PHY decode + ACI cap
+  computation landed (§13f); remainders are datasheet
+  re-grounding, the FW-PHY activity + ACI transports, live
+  link re-application after a set, and X550EM_A / E610
+  device support.
 - Per-queue DMA rings + pumps for queues 1..63, and per-queue
   MSI-X vectors beyond the shared misc vector.
 - X540 / X550EM_x WoL grounding (X540 datasheet not consulted;

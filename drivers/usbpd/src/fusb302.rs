@@ -47,29 +47,43 @@
 //!   0x43 FIFOS          RW  TX/RX FIFO data window
 //! ```
 //!
-//! ## BMC FIFO tokens (datasheet §"BMC PHY")
+//! ## BMC FIFO tokens (datasheet §"BMC PHY", Tables 41–42)
 //!
 //! ```text
-//!   0x12 SYNC1
-//!   0x13 SYNC2
-//!   0x1B SYNC3 (used in SOP'/SOP'' sequences)
-//!   0x15 RESET1
-//!   0x16 RESET2
+//!   0x12 SYNC1 (SOP1) — Sync-1 symbol
+//!   0x13 SYNC2 (SOP2) — Sync-2 symbol
+//!   0x1B SYNC3 (SOP3) — Sync-3 symbol
+//!   0x15 RESET1, 0x16 RESET2
 //!   0x80 | n  PACKSYM(n)   — next n bytes are PD payload
-//!   0xA1 JAM_CRC           — append BMC CRC + EOP
-//!   0xFE TXON
-//!   0xFF TXOFF
+//!   0xFF JAM_CRC           — append BMC CRC (datasheet Table 41)
+//!   0xA1 TXON              — start transmitter (datasheet Table 41)
+//!   0x14 EOP, 0xFE TXOFF
 //! ```
 //!
-//! SOP frame on TX: SYNC1, SYNC1, SYNC1, SYNC2, PACKSYM(n), <n bytes>,
-//! JAM_CRC, EOP, TXOFF.
+//! NOTE on JAM_CRC: the `TX_TOKEN_JAM_CRC` constant below is 0xA1,
+//! diverging from datasheet Table 41 (0xFF). That value is preserved
+//! for the existing SOP path deliberately — changing it alters every
+//! SOP transmission and needs its own routed change with hardware
+//! validation, not a drive-by. The SOP' / SOP'' path added for cable
+//! discovery uses the datasheet 0xFF value.
+//!
+//! SOP ordered sets (USB-PD spec Tables 5-5/5-6/5-7) as TX token
+//! sequences, before PACKSYM:
+//!   SOP:   SYNC1, SYNC1, SYNC1, SYNC2
+//!   SOP':  SYNC1, SYNC1, SYNC3, SYNC3
+//!   SOP'': SYNC1, SYNC3, SYNC1, SYNC3
+//!
+//! RX FIFO tokens (datasheet Table 42): the FIRST byte of a received
+//! packet names its SOP* target in the top three bits — 111 = SOP,
+//! 110 = SOP', 101 = SOP''. SOP'/SOP'' packets are only queued when
+//! CONTROL1 ENSOP1/ENSOP2 are set (see `init`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
+use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, SopTarget, Tcpc, TcpcError};
 
 // ── I²C address ────────────────────────────────────────────────────
 
@@ -137,7 +151,10 @@ pub const POWER_ALL: u8 = POWER_BANDGAP_WAKE | POWER_RX_BANDGAP_OSC | POWER_MEAS
 pub const RESET_SW_RES: u8 = 1 << 0;
 pub const RESET_PD_RESET: u8 = 1 << 1;
 
-// STATUS0 bits.
+// CONTROL1 bits (datasheet Table 23).
+pub const CONTROL1_ENSOP1: u8 = 1 << 0;
+pub const CONTROL1_ENSOP2: u8 = 1 << 1;
+pub const CONTROL1_RX_FLUSH: u8 = 1 << 2;
 pub const STATUS0_VBUSOK: u8 = 1 << 7;
 pub const STATUS0_ACTIVITY: u8 = 1 << 6;
 pub const STATUS0_COMP: u8 = 1 << 5;
@@ -163,6 +180,10 @@ pub const TX_TOKEN_RESET2: u8 = 0x16;
 /// PACKSYM(n): low 5 bits encode `n` (PD message length in bytes).
 pub const TX_TOKEN_PACKSYM_BASE: u8 = 0x80;
 pub const TX_TOKEN_JAM_CRC: u8 = 0xA1;
+/// Datasheet Table 41 JAM_CRC value, used by the SOP'/SOP'' path.
+/// (See the header note: the SOP path's `TX_TOKEN_JAM_CRC` is
+/// preserved at 0xA1 pending a routed fix.)
+pub const TX_TOKEN_JAM_CRC_DS: u8 = 0xFF;
 pub const TX_TOKEN_EOP: u8 = 0x14;
 pub const TX_TOKEN_TXON: u8 = 0xA1; // duplicate per §; kept distinct to JAM_CRC by call-site
 pub const TX_TOKEN_TXOFF: u8 = 0xFE;
@@ -215,11 +236,15 @@ impl Fusb302 {
     ///   1. SW_RES
     ///   2. POWER = all banks on
     ///   3. CONTROL0 = clear TX_FLUSH | INT_MASK
-    ///   4. caller follows up with `set_role`.
+    ///   4. CONTROL1 = ENSOP1 | ENSOP2 — without these the chip
+    ///      never queues SOP'/SOP'' packets, so cable-plug traffic
+    ///      is invisible to `receive_sop` (datasheet Table 23).
+    ///   5. caller follows up with `set_role`.
     pub fn init(&self) -> Result<(), TcpcError> {
         self.write(REG_RESET, RESET_SW_RES)?;
         self.write(REG_POWER, POWER_ALL)?;
         self.write(REG_CONTROL0, 0)?; // clear TX_FLUSH + INT_MASK
+        self.write(REG_CONTROL1, CONTROL1_ENSOP1 | CONTROL1_ENSOP2)?;
         Ok(())
     }
 
@@ -281,20 +306,63 @@ impl Fusb302 {
     /// into the FIFO. `body` is the encoded PD frame from
     /// `narf_usbpd::message::encode_message`.
     fn tx_sop(&self, body: &[u8]) -> Result<(), TcpcError> {
+        self.tx_frame(
+            body,
+            &[
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC2,
+            ],
+            TX_TOKEN_JAM_CRC,
+        )
+    }
+
+    /// SOP' TX packet: ordered set SYNC1, SYNC1, SYNC3, SYNC3 (USB-PD
+    /// spec Table 5-6), then the same PACKSYM/body/EOP/TXOFF shape
+    /// as SOP. Uses the datasheet Table 41 JAM_CRC value (see the
+    /// header note on the SOP path's divergent constant).
+    fn tx_sop_prime(&self, body: &[u8]) -> Result<(), TcpcError> {
+        self.tx_frame(
+            body,
+            &[
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC3,
+                TX_TOKEN_SYNC3,
+            ],
+            TX_TOKEN_JAM_CRC_DS,
+        )
+    }
+
+    /// SOP'' TX packet: ordered set SYNC1, SYNC3, SYNC1, SYNC3
+    /// (USB-PD spec Table 5-7).
+    fn tx_sop_double_prime(&self, body: &[u8]) -> Result<(), TcpcError> {
+        self.tx_frame(
+            body,
+            &[
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC3,
+                TX_TOKEN_SYNC1,
+                TX_TOKEN_SYNC3,
+            ],
+            TX_TOKEN_JAM_CRC_DS,
+        )
+    }
+
+    /// Shared TX FIFO frame builder: sync ordered set, PACKSYM(n),
+    /// body, JAM_CRC, EOP, TXOFF, then kick the engine.
+    fn tx_frame(&self, body: &[u8], sync: &[u8], jam_crc: u8) -> Result<(), TcpcError> {
         if body.len() > 30 {
             return Err(TcpcError::TransmitFailed);
         }
         let mut frame = Vec::with_capacity(8 + body.len());
-        // SYNC1, SYNC1, SYNC1, SYNC2 — SOP signal sequence.
-        frame.push(TX_TOKEN_SYNC1);
-        frame.push(TX_TOKEN_SYNC1);
-        frame.push(TX_TOKEN_SYNC1);
-        frame.push(TX_TOKEN_SYNC2);
+        frame.extend_from_slice(sync);
         // PACKSYM(n) — the low 5 bits hold the byte count.
         frame.push(TX_TOKEN_PACKSYM_BASE | ((body.len() as u8) & 0x1F));
         frame.extend_from_slice(body);
         // JAM_CRC + EOP + TXOFF.
-        frame.push(TX_TOKEN_JAM_CRC);
+        frame.push(jam_crc);
         frame.push(TX_TOKEN_EOP);
         frame.push(TX_TOKEN_TXOFF);
 
@@ -305,10 +373,11 @@ impl Fusb302 {
         self.write(REG_CONTROL0, c0)
     }
 
-    /// Drain one RX message from the FIFO. Returns the PD body bytes
-    /// (the `MESSAGE_HEADER + DATA_OBJECT_*` portion); SOP framing
+    /// Drain one RX message from the FIFO, reporting the SOP* target
+    /// it arrived on. Returns the PD body bytes (the
+    /// `MESSAGE_HEADER + DATA_OBJECT_*` portion); SOP framing
     /// tokens and CRC bytes are stripped.
-    fn rx_drain(&self) -> Result<Vec<u8>, TcpcError> {
+    fn rx_drain_sop(&self) -> Result<(SopTarget, Vec<u8>), TcpcError> {
         let s1 = self.read(REG_STATUS1)?;
         if s1 & STATUS1_RX_EMPTY != 0 {
             return Err(TcpcError::NoMessage);
@@ -321,9 +390,25 @@ impl Fusb302 {
         // the rest including the 4-byte CRC the chip appends.
         let mut sop = [0u8; 1];
         self.bus.read_burst(self.addr, REG_FIFOS, &mut sop)?;
-        // sop[0] in {0xE0..=0xE3} per "RX FIFO Token" section: bit
-        // pattern 111x_x000 with low bits encoding SOP/SOP'/SOP''.
-        // We accept any and proceed.
+        // Datasheet Table 42: the top three bits of the RX FIFO
+        // token byte name the target — 111 = SOP, 110 = SOP',
+        // 101 = SOP''. Debug/reserved patterns cannot arrive (their
+        // ENSOP*DB enables are never set); if one ever does, flush
+        // the FIFO to resync rather than misrouting the stream —
+        // the flush write re-asserts ENSOP1/ENSOP2 so cable-plug
+        // reception survives the resync.
+        let target = match sop[0] >> 5 {
+            0b111 => SopTarget::Sop,
+            0b110 => SopTarget::SopPrime,
+            0b101 => SopTarget::SopDoublePrime,
+            _ => {
+                self.write(
+                    REG_CONTROL1,
+                    CONTROL1_ENSOP1 | CONTROL1_ENSOP2 | CONTROL1_RX_FLUSH,
+                )?;
+                return Err(TcpcError::NoMessage);
+            }
+        };
         let mut hdr = [0u8; 2];
         self.bus.read_burst(self.addr, REG_FIFOS, &mut hdr)?;
         // PD header bits: num_data_objects at bits 12..14 of the LE
@@ -344,7 +429,14 @@ impl Fusb302 {
         let mut out = Vec::with_capacity(2 + payload_len);
         out.extend_from_slice(&hdr);
         out.extend_from_slice(&payload);
-        Ok(out)
+        Ok((target, out))
+    }
+
+    /// Drain one RX message from the FIFO. Returns the PD body bytes
+    /// (the `MESSAGE_HEADER + DATA_OBJECT_*` portion); SOP framing
+    /// tokens and CRC bytes are stripped.
+    fn rx_drain(&self) -> Result<Vec<u8>, TcpcError> {
+        Ok(self.rx_drain_sop()?.1)
     }
 }
 
@@ -384,8 +476,20 @@ impl Tcpc for Fusb302 {
         self.tx_sop(msg)
     }
 
+    fn transmit_sop(&self, target: SopTarget, msg: &[u8]) -> Result<(), TcpcError> {
+        match target {
+            SopTarget::Sop => self.tx_sop(msg),
+            SopTarget::SopPrime => self.tx_sop_prime(msg),
+            SopTarget::SopDoublePrime => self.tx_sop_double_prime(msg),
+        }
+    }
+
     fn receive(&self) -> Result<Vec<u8>, TcpcError> {
         self.rx_drain()
+    }
+
+    fn receive_sop(&self) -> Result<(SopTarget, Vec<u8>), TcpcError> {
+        self.rx_drain_sop()
     }
 
     fn hard_reset(&self) -> Result<(), TcpcError> {

@@ -112,6 +112,10 @@ impl Model {
                         (9, 0xf09, _) if self.line_plugged => reply = 0xc000_0000,
                         // The ADC selector reaches the line pin too,
                         // appended last so the mic trace is unchanged.
+                        // Its list length is 3: the word below carries
+                        // three entries, and length 2 would drop the
+                        // line pin from the enumerated graph.
+                        (8, 0xf00, 0xe) => reply = 3,
                         (8, 0xf02, _) => reply = 0x090708,
                         _ => {}
                     }

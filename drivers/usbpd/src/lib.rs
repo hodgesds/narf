@@ -32,6 +32,7 @@ extern crate alloc;
 
 pub mod altmode_dp;
 pub mod altmode_usb4;
+pub mod cable_discovery;
 pub mod dp_gpu_bridge;
 pub mod fusb302;
 pub mod i2c_bridge;
@@ -188,7 +189,13 @@ fn register_port(bus_name: &str, i2c_addr: u8, tcpc: Arc<dyn Tcpc>) {
         typec.clone(),
     ));
     altmode_dp::register_port(alt.clone());
+    let cable = Arc::new(cable_discovery::CableDiscoveryPort::new(
+        port.clone(),
+        dp_gpu_bridge::ConnectorId::from_index(connector_idx),
+    ));
+    cable_discovery::register_port(cable.clone());
     spawn_tcpm_task(port, label.clone(), typec);
+    cable_discovery::spawn_discovery_task(cable, label.clone());
     altmode_dp::spawn_discovery_task(alt, label);
 }
 
