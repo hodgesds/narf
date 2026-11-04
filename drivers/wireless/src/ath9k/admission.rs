@@ -25,7 +25,10 @@
 //! IEEE channel (2.4 GHz 1..14 or 5 GHz 36..165), its chain-mask bytes the
 //! effective masks up to 0x7, and its identity binds the restored
 //! `ar9300_eeprom`, the AR9003 preparation and the AR9300 transmit-power
-//! plan of that channel.
+//! plan of that channel. The AR9580 (`0x0033`) record `N95A` v1 is the
+//! same format under its own magic, label and file name
+//! (`ath9k/ar9580-admit-v1-ch<N>-<mac>.bin`); its identity binds the
+//! `ar9580_1p0` INI preparation.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{
@@ -361,7 +364,8 @@ impl Facts {
             channel,
         })
     }
-    /// AR9300 (`0x0030`) facts for one 20 MHz channel in a band the
+    /// AR9003 facts — AR9300 (`0x0030`, record `N93A`) or AR9580
+    /// (`0x0033`, record `N95A`, the same layout) — for one 20 MHz channel in a band the
     /// map's `opFlags` enables: the PCI function, `AR_SREV` revision and
     /// host mode, the restored 1088-byte `ar9300_eeprom` (template and
     /// version bytes included), the effective (`fixup_chainmask`) masks up
@@ -371,7 +375,7 @@ impl Facts {
     /// for `ctl` (`ath9k_regd_get_ctl`). The channel byte is the IEEE
     /// channel (2.4 GHz 1..14, 5 GHz 36..165); the factory antenna gain is
     /// the band's `antennaGain` (a negative value counts as zero).
-    pub(super) fn new_ar9300(
+    pub(super) fn new_ar9003(
         id: &narf_bus::DeviceId,
         revision: &super::ar9003::Revision,
         identity: &super::ar9003::eeprom::Identity,
@@ -393,8 +397,7 @@ impl Facts {
             ((frequency - 2407) / 5) as u8
         };
         if id.vendor != 0x168c
-            || Chip::for_device(id.device) != Some(Chip::Ar9300)
-            || revision.chip != Chip::Ar9300
+            || Chip::for_device(id.device) != Some(revision.chip)
             || prepared.frequency != frequency
             || prepared.modes_index != if five { 1 } else { 4 }
             || !(1..=7).contains(&identity.rx_chainmask)
@@ -403,12 +406,26 @@ impl Facts {
             return Err(BringUpError::BadIdentity);
         }
         let plan = power::plan(image, frequency, ctl, 40, identity.tx_chainmask)?;
+        // Each part has its own magic, domain label and file name, so an
+        // AR9300 record can never admit an AR9580 or the reverse.
+        let (magic, label, recipe, file): (&[u8; 4], &[u8], &[u8], &str) = match revision.chip {
+            Chip::Ar9300 => (
+                b"N93A",
+                b"NARF AR9300 N93A three-chain ar9300_eeprom legacy20 dual-band board admission v1",
+                b"ar9300_eeprom_restore_internal image; ar9003_2p2 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
+                "ar9300",
+            ),
+            Chip::Ar9580 => (
+                b"N95A",
+                b"NARF AR9580 N95A three-chain ar9300_eeprom legacy20 dual-band board admission v1",
+                b"ar9300_eeprom_restore_internal image; ar9580_1p0 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
+                "ar9580",
+            ),
+        };
         let mut h = narf_crypto::sha256::Sha256::new();
-        h.update(b"N93A");
-        h.update(
-            b"NARF AR9300 N93A three-chain ar9300_eeprom legacy20 dual-band board admission v1",
-        );
-        h.update(b"ar9300_eeprom_restore_internal image; ar9003_2p2 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA");
+        h.update(magic);
+        h.update(label);
+        h.update(recipe);
         for v in [
             id.vendor,
             id.device,
@@ -461,14 +478,14 @@ impl Facts {
                 device: id.device,
                 frequency_mhz: frequency,
                 filename: format!(
-                    "ath9k/ar9300-admit-v1-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                    channel, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                    "ath9k/{}-admit-v1-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    file, channel, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
                 ),
             },
             factory_antenna: gain.max(0) as u8,
             rx_chainmask: identity.rx_chainmask,
             tx_chainmask: identity.tx_chainmask,
-            magic: *b"N93A",
+            magic: *magic,
             channel,
         })
     }

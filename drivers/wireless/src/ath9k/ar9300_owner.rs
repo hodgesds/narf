@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9380/AR9390 (`0x0030` PCIe, `hw.h::AR9300_DEVID_PCIE`) probe and
-//! dual-band 20 MHz legacy station owner.
+//! AR9380/AR9390 (`0x0030` PCIe, `hw.h::AR9300_DEVID_PCIE`) and AR9580
+//! (`0x0033`, `hw.h::AR9300_DEVID_AR9580`) probe and dual-band 20 MHz
+//! legacy station owner.
+//!
+//! The AR9580 runs the AR9300 path unchanged (Linux `AR_SREV_9300` is true
+//! for it): only its `AR_SREV` revision split, the `ar9580_1p0` INI and
+//! gain tables (`ar9003::ini::Tables::for_revision`) and its `N95A`
+//! record differ.
 //!
 //! `pci.c::ath_pci_probe` → `hw.c::ath9k_hw_init` order: the chip is
 //! identified through its `AR_SREV` and restored `ar9300_eeprom`
@@ -39,8 +45,8 @@ use super::identity::{self, RegisterIo};
 
 /// The initial primary the signed record and calibration bind (channel 1).
 const PRIMARY: u16 = 2412;
-/// The highest AR9300 register this owner touches is the last
-/// `ar9300_2p2_radio_core` row (`0x16bd4`).
+/// The highest AR9003 register this owner touches is the last
+/// `ar9300_2p2_radio_core` / `ar9580_1p0_radio_core` row (`0x16bd4`).
 const REQUIRED_BAR: u64 = 0x1_6bd8;
 /// `reg.h::AR_CFG_LED`.
 const AR_CFG_LED: u64 = 0x1f04;
@@ -54,7 +60,7 @@ const AR_Q_TXE: u64 = 0x0840;
 /// `ath_ani_calibrate` intervals.
 const SUPERVISE_NS: u64 = 500_000_000;
 /// (PCI device, unique bus-match name).
-pub(super) const DEVICES: [(u16, &str); 1] = [(0x0030, "ath9k-ar9300")];
+pub(super) const DEVICES: [(u16, &str); 2] = [(0x0030, "ath9k-ar9300"), (0x0033, "ath9k-ar9580")];
 
 pub(super) struct Owner {
     mmio: MmioRegion,
@@ -110,11 +116,11 @@ fn prepared_at(o: &Owner, frequency: u16) -> Result<ar9003::phy::Prepared, Bring
     ar9003::phy::expected(&o.revision, &o.identity, &o.image, frequency, ctl, 0)
 }
 
-/// The signed `N93A` record keyed to `frequency`.
+/// The signed `N93A` (AR9580: `N95A`) record keyed to `frequency`.
 fn record(o: &Owner, frequency: u16) -> Result<Arc<admission::Grant>, BringUpError> {
     let prepared = prepared_at(o, frequency)?;
     let ctl = ctl_at(&o.identity, frequency)?;
-    let facts = admission::Facts::new_ar9300(
+    let facts = admission::Facts::new_ar9003(
         &o.device.id,
         &o.revision,
         &o.identity,
@@ -152,13 +158,13 @@ fn read_led(io: &mut impl RegisterIo) -> Result<u32, BringUpError> {
 fn matches(id: &narf_bus::DeviceId) -> bool {
     id.vendor == 0x168c
         && DEVICES.iter().any(|(device, _)| *device == id.device)
-        && ar9003::Chip::for_device(id.device) == Some(ar9003::Chip::Ar9300)
+        && ar9003::Chip::for_device(id.device).is_some()
 }
 
 fn bad(stage: &str, error: BringUpError) -> narf_bus::ProbeError {
     let _ = writeln!(
         narf_console::Writer,
-        "  ath9k: AR9300 {} failed: {:?}",
+        "  ath9k: AR9003 {} failed: {:?}",
         stage,
         error
     );
@@ -209,7 +215,7 @@ pub(super) fn probe(
     if prepared != expected {
         return Err(bad("preparation facts", BringUpError::BadState));
     }
-    let facts = admission::Facts::new_ar9300(
+    let facts = admission::Facts::new_ar9003(
         &device.id, &revision, &identity, &prepared, &image, PRIMARY, ctl,
     )
     .map_err(|e| bad("admission facts", e))?;
@@ -221,18 +227,20 @@ pub(super) fn probe(
             let _ = ar9003::disable_and_sleep(&mut io, identified.powered.wa);
             let _ = writeln!(
                 narf_console::Writer,
-                "  ath9k: AR9300 MAC {:02x?} unadmitted; signed board record {} absent or invalid",
+                "  ath9k: {} MAC {:02x?} unadmitted; signed board record {} absent or invalid",
+                revision.chip.name(),
                 identity.mac,
                 request.filename
             );
             return Err(narf_bus::ProbeError::Other(
-                "ath9k AR9300 board admission record absent or invalid",
+                "ath9k AR9003 board admission record absent or invalid",
             ));
         }
     };
     let _ = writeln!(
         narf_console::Writer,
-        "  ath9k: AR9300 rev {} MAC {:02x?}, EEPROM {:#x}, chains {:#x}/{:#x}; admitted, calibration pending",
+        "  ath9k: {} rev {} MAC {:02x?}, EEPROM {:#x}, chains {:#x}/{:#x}; admitted, calibration pending",
+        revision.chip.name(),
         revision.mac_rev,
         identity.mac,
         identity.eeprom_version,
@@ -264,7 +272,12 @@ pub(super) fn probe(
     }));
     *OWNER.lock() = Some(owner.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("ath9k-ar9300"),
+        name: alloc::string::String::from(
+            DEVICES
+                .iter()
+                .find(|(device, _)| *device == device_id)
+                .map_or("ath9k-ar9300", |(_, name)| *name),
+        ),
         kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(vendor),
         pci_did: Some(device_id),
@@ -288,7 +301,7 @@ pub(super) fn probe(
             Ok(report) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "ath9k: AR9300 channel1 native station published: peak CALDAC {:?} default NF {:?} dBm",
+                    "ath9k: AR9003 channel1 native station published: peak CALDAC {:?} default NF {:?} dBm",
                     report.peak_caldac,
                     report.default_nf
                 );
@@ -297,7 +310,7 @@ pub(super) fn probe(
             Err(error) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "ath9k: AR9300 channel1 bring-up closed: {:?}",
+                    "ath9k: AR9003 channel1 bring-up closed: {:?}",
                     error
                 );
             }
@@ -366,7 +379,7 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     let station = compose(&mut o, report, permission).map_err(|error| {
         let _ = writeln!(
             narf_console::Writer,
-            "ath9k: AR9300 native station composition closed: {:?}",
+            "ath9k: AR9003 native station composition closed: {:?}",
             error
         );
         BringUpError::BadState
@@ -375,7 +388,7 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     interface::publish(station).map_err(|error| {
         let _ = writeln!(
             narf_console::Writer,
-            "ath9k: AR9300 native station publication closed: {:?}",
+            "ath9k: AR9003 native station publication closed: {:?}",
             error
         );
         BringUpError::BadState
@@ -578,7 +591,7 @@ async fn supervise(owner: Shared) {
                         // The generation is now closed; the next tick resets.
                         let _ = writeln!(
                             narf_console::Writer,
-                            "ath9k: AR9300 periodic calibration closed: {:?}",
+                            "ath9k: AR9003 periodic calibration closed: {:?}",
                             error
                         );
                     }
@@ -596,7 +609,7 @@ async fn supervise(owner: Shared) {
                 let generation = owner.lock().await.generation;
                 let _ = writeln!(
                     narf_console::Writer,
-                    "ath9k: AR9300 station generation {} published after reset",
+                    "ath9k: AR9003 station generation {} published after reset",
                     generation
                 );
             }
@@ -604,7 +617,7 @@ async fn supervise(owner: Shared) {
                 failures += 1;
                 let _ = writeln!(
                     narf_console::Writer,
-                    "ath9k: AR9300 generation reset closed: {:?}",
+                    "ath9k: AR9003 generation reset closed: {:?}",
                     error
                 );
                 // Bounded retries; a pinned or removed owner never resets.
@@ -646,7 +659,7 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         }
         let _ = writeln!(
             narf_console::Writer,
-            "ath9k: AR9300 removed; DMA {}",
+            "ath9k: AR9003 removed; DMA {}",
             if reclaimed {
                 "reclaimed"
             } else {
@@ -736,7 +749,7 @@ pub(super) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendErro
         if let Err(error) = reset(&owner, None, None).await {
             let _ = writeln!(
                 narf_console::Writer,
-                "ath9k: AR9300 resume reset closed: {:?}",
+                "ath9k: AR9003 resume reset closed: {:?}",
                 error
             );
         }

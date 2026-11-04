@@ -105,6 +105,14 @@ impl Chip {
         }
     }
 
+    /// The part name used in logs and record labels.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ar9300 => "AR9300",
+            Self::Ar9580 => "AR9580",
+        }
+    }
+
     /// `ath9k_hw_fill_cap_info`'s `chip_chainmask`.
     pub fn chip_chainmask(self) -> u8 {
         match self {

@@ -61,8 +61,8 @@ pub(super) enum Calibrated {
         profile: super::mac::Profile,
         periodic: narf_lib::mutex::Mutex<super::calibration::ar5008::Periodic>,
     },
-    /// AR9380/AR9390 (either band `opFlags` enables): the signed `N93A`
-    /// per-channel record, the host permission calibration ran under
+    /// AR9380/AR9390 or AR9580 (either band `opFlags` enables): the signed
+    /// `N93A` / `N95A` per-channel record, the host permission calibration ran under
     /// (country, frequency and the signed ceiling the power plan used),
     /// the band's `ath9k_hw_set_clockrate` clock, `ah->txchainmask`,
     /// `ATH9K_HW_CAP_APM`, the `EEP_RF_SILENT` input and the
@@ -486,12 +486,12 @@ impl Native {
         ))
     }
     /// # Safety
-    /// Caller retains the sole AR9380/AR9390 function and exact mapped BAR
+    /// Caller retains the sole AR9380/AR9390 or AR9580 function and exact mapped BAR
     /// after `ar9003::phy::prepare` for `prepared` (its power plan computed
     /// at `permission`'s ceiling, which `grant` may only lower) and
     /// `ar9003::calib::Calibration::run` produced `report`; no packet DMA
     /// was published. `channel_mask` (`channels::bit`) names the primaries
-    /// whose signed `N93A` record verified.
+    /// whose signed `N93A` (AR9580: `N95A`) record verified.
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn new_ar9300(
         device: BusDevice,
@@ -515,8 +515,7 @@ impl Native {
         // EEP_CHAIN_MASK_REDUCE (miscConfiguration bit 3).
         let apm = image[super::ar9003::eeprom::field::MISC_CONFIGURATION] & 0x8 != 0;
         if device.id.vendor != 0x168c
-            || super::ar9003::Chip::for_device(device.id.device)
-                != Some(super::ar9003::Chip::Ar9300)
+            || super::ar9003::Chip::for_device(device.id.device).is_none()
             || request.device != device.id.device
             || request.frequency_mhz != frequency
             || request.mac != identity.mac
