@@ -21,6 +21,7 @@ use crate::ixgbe::queues::RegBank;
 
 pub mod eee;
 pub mod ethtool;
+pub mod fdir;
 pub mod pm;
 pub mod queues;
 pub mod rss;
@@ -329,6 +330,8 @@ pub struct Ixgbe {
     pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
     /// Programmed VLAN filter, if `configure_vlan` ran.
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
+    /// Programmed Flow Director config, if `configure_fdir` ran.
+    pub fdir_cfg: IrqSafeSpinLock<Option<fdir::FdirConfig>>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Programmed EEE state, if `configure_eee` ran. Always `None`
@@ -544,6 +547,7 @@ impl Ixgbe {
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
+            fdir_cfg: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
             quiesced: IrqSafeSpinLock::new(false),
@@ -873,6 +877,100 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// Initialize Flow Director (signature or perfect mode).
+    /// Opt-in like `configure_rss`: probe still brings up 1/1 and
+    /// the datapath is untouched until filters are added. A missed
+    /// INIT_DONE poll is not an error (Linux debugs only); the
+    /// config is recorded regardless.
+    pub fn configure_fdir(&self, cfg: fdir::FdirConfig) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            match cfg.mode {
+                fdir::FdirMode::Signature => {
+                    fdir::init_signature(&mut bank, cfg.pballoc);
+                }
+                fdir::FdirMode::Perfect => {
+                    fdir::init_perfect(&mut bank, cfg.pballoc);
+                }
+            }
+        }
+        *self.fdir_cfg.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Program a perfect-filter input mask. The SCTP mask register
+    /// is written only for X550-family parts (Linux gates it by MAC
+    /// type); other parts program TCP/UDP only.
+    pub fn configure_fdir_mask(&self, mask: &fdir::FdirMask) -> Result<(), IxgbeError> {
+        let sctp = self.did == IXGBE_DEV_X550 || self.did == IXGBE_DEV_X550EM_X;
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::set_input_mask(&mut bank, mask, sctp)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Add a perfect-match filter (IPv4 only; see fdir.rs docs).
+    pub fn fdir_add_perfect(
+        &self,
+        input: &fdir::FdirPerfectInput,
+        soft_id: u16,
+        queue: u8,
+    ) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::add_perfect(&mut bank, input, soft_id, queue)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Erase a perfect-match filter (query first, remove if present).
+    pub fn fdir_erase_perfect(&self, bkt_hash: u16, soft_id: u16) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::erase_perfect(&mut bank, bkt_hash, soft_id)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Add a signature filter — the ATR primitive (see fdir.rs docs).
+    /// `input` is the flow/vm/VLAN word, `common` the compressed
+    /// dword, `flow_type` carries the tunnel bit (0x10).
+    pub fn fdir_add_signature(
+        &self,
+        input: u32,
+        common: u32,
+        flow_type: u8,
+        queue: u8,
+    ) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::add_signature(&mut bank, input, common, flow_type, queue)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Reinitialize the Flow Director tables. NOTE: programmed
+    /// filters do not survive a reinit (no filter list is kept);
+    /// callers must re-add afterwards.
+    pub fn fdir_reinit(&self) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::reinit_tables(&mut bank).map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Read Flow Director statistics (registers read to clear).
+    pub fn fdir_stats(&self) -> fdir::FdirStats {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        fdir::stats(&mut bank)
+    }
+
     /// Arm Wake-on-LAN. 82599EB only (`wol_supported`); other
     /// parts return `UnsupportedDevice` — X540 is ungrounded and
     /// X550 WoL is LOM/board-gated (see wol.rs header).
@@ -944,16 +1042,92 @@ impl Ixgbe {
         Ok(())
     }
 
-    /// Resume: re-enable queue 0 + RX + the misc vector, refresh
-    /// link state. Ring contents are NOT rebuilt here — a suspend
-    /// that lost DMA state needs a full re-probe (caller decision).
-    pub fn resume(&self) {
-        let mut bank = queues::MmioBank::new(&self.mmio);
-        pm::resume_plan(&mut bank);
+    /// Resume: REBUILD the DMA rings in place from the retained
+    /// host buffers, then unquiesce and refresh link state (spec
+    /// §13l decision — rebuild, not re-probe, following Linux's
+    /// resume shape of reset → reconfigure → open, minus the reset:
+    /// a reset would wipe RAR/RSS/VLAN/IVAR state this rebuild
+    /// does not restore, while the rebuild overwrites exactly the
+    /// datapath state it owns, so it is correct whether or not
+    /// the suspend actually lost device state).
+    ///
+    /// Fail-closed: every validation runs before any register or
+    /// ring memory is touched. On `Err` the device stays quiesced
+    /// (pumps keep refusing work) and the caller may re-probe;
+    /// a half-rebuilt datapath is never re-enabled.
+    pub fn resume(&self) -> Result<(), IxgbeError> {
+        let cfg = &self.queue_config;
+        cfg.validate()
+            .map_err(|_| IxgbeError::Other("invalid queue config"))?;
+        // The rebuild programs cfg.ring_len descriptors per queue
+        // into the rings bring-up allocated; a mismatch would
+        // over- or under-fill ring memory, so refuse rather than
+        // guess.
+        if cfg.ring_len != TX_RING_LEN || cfg.ring_len != RX_RING_LEN {
+            return Err(IxgbeError::Other(
+                "queue ring length != allocated ring length",
+            ));
+        }
+        // A slot-count mismatch means the ring and the slot table
+        // disagree; refuse before touching anything rather than
+        // arm a descriptor with no backing buffer.
+        if self.rx_slots.lock().len() != RX_RING_LEN {
+            return Err(IxgbeError::Other("rx slot count != ring length"));
+        }
+        // 1. Zero the TX ring: stale descriptors must not reach
+        // the device after re-enable.
+        // SAFETY: identity-mapped DMA ring page.
+        unsafe {
+            for i in 0..(TX_RING_LEN * 16) {
+                core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            }
+        }
+        // 2. Re-arm every RX descriptor from the buffer its slot
+        // currently owns (slots rotate as frames are handed up, so
+        // the current contents — not the bring-up pool order — are
+        // the truth).
+        let rx_phys = self.rx_ring.dma_addr().raw();
+        {
+            let slots = self.rx_slots.lock();
+            for (i, buf) in slots.iter().enumerate() {
+                let desc = RxDesc {
+                    addr: buf.dma_addr().raw(),
+                    length: 0,
+                    csum: 0,
+                    status: 0,
+                    errors: 0,
+                    special: 0,
+                };
+                // SAFETY: identity-mapped DMA ring page.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                            .kernel_mut_ptr::<RxDesc>(),
+                        desc,
+                    );
+                }
+            }
+        }
+        // Descriptor writes must be visible before the device
+        // reads the rebuilt rings (same fence discipline as the
+        // RX pump's re-arm path).
+        compiler_fence(Ordering::SeqCst);
+        // 3. Reprogram rings + enables, one entry per queue.
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::resume_rebuild_plan(&mut bank, cfg, &[self.tx_ring.dma_addr().raw()], &[rx_phys])
+                .map_err(IxgbeError::Other)?;
+        }
+        // 4. Reset the pump cursors to the rebuilt state, then
+        // unquiesce last, so no pump runs against a half-rebuilt
+        // ring.
+        *self.tx_tail.lock() = 0;
+        *self.rx_head.lock() = 0;
         *self.quiesced.lock() = false;
         // SAFETY: identity-mapped MMIO.
         let links = unsafe { self.mmio.read32(REG_LINKS) };
         *self.link_up.lock() = links & LINKS_UP != 0;
+        Ok(())
     }
 
     /// Prepare detach: suspend with no WoL + clear DRV_LOAD, and

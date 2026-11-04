@@ -5,7 +5,10 @@
 //! (v2 layout — every 8125-family chip is csum-v2), VLAN tag
 //! insertion on TX, RX checksum decode, jumbo-sized rings / RMS /
 //! MTPS, WoL register programming (including the 8125-family
-//! MAC-OCP steps), the EEE TX LPI idle timer, and per-variant
+//! MAC-OCP steps), the EEE TX LPI idle timer, EEE PHY
+//! advertisement through the OCP window (emulated AN MMD
+//! registers, with an auto-negotiation restart when the
+//! advertisement changes), and per-variant
 //! PHY-config tables applied from a `Stage::Late` hook (firmware
 //! first, except 8125A where Linux runs firmware mid-table —
 //! see [`phy_table_for`]). Deliberate asymmetries, shared with
@@ -14,8 +17,8 @@
 //! with offloads advertised (Linux's `rtl8169_fix_features`
 //! disables CSUM + TSO when MTU > 1500 on MAC > VER_06), and
 //! RSS stays off (Linux enables RSS only on VER_80). Still
-//! missing: EEE PHY advertisement (Clause 45 MMD through the
-//! OCP window) and GMII auto-negotiation tuning.
+//! missing: GMII auto-negotiation tuning (the EEE step's single
+//! BMCR restart bit is not general autonegotiation control).
 //!
 //! ## Reference
 //!
@@ -1145,18 +1148,25 @@ impl RtlNic {
         TX_BUF_LEN as u32
     }
 
-    /// EEE LPI capabilities for this chip's MAC version (Linux's
-    /// `rtl8169_get_lpi_caps` shape; 8125A gets 100/1000 only,
-    /// later variants add 2500FD).
-    pub fn eee_caps(&self) -> crate::features::EeeCaps {
-        crate::features::eee_lpi_caps(match self.chip_kind {
+    /// MAC version for a chip kind — shared by [`Self::eee_caps`]
+    /// and the late PHY pass, so the two can never disagree
+    /// about which caps a chip advertises.
+    fn mac_version_for_kind(kind: ChipKind) -> u32 {
+        match kind {
             ChipKind::Rtl8125A => 61,
             ChipKind::Rtl8125B => 63,
             ChipKind::Rtl8125D | ChipKind::Rtl8125K | ChipKind::Rtl9151A => 64,
             ChipKind::Rtl8125Cp => 65,
             ChipKind::Rtl8125Bp => 66,
             ChipKind::Unknown(_) => 0,
-        })
+        }
+    }
+
+    /// EEE LPI capabilities for this chip's MAC version (Linux's
+    /// `rtl8169_get_lpi_caps` shape; 8125A gets 100/1000 only,
+    /// later variants add 2500FD).
+    pub fn eee_caps(&self) -> crate::features::EeeCaps {
+        crate::features::eee_lpi_caps(Self::mac_version_for_kind(self.chip_kind))
     }
 
     /// Program Wake-on-LAN options (Linux's `__rtl8169_set_wol`
@@ -1586,6 +1596,49 @@ fn configure_phy(mmio: &MmioRegion, xid: u32, kind: ChipKind) {
             "  rtl8125: PHY config table aborted: {:?}",
             e
         );
+    }
+
+    // EEE PHY advertisement (#1274): program the emulated AN MMD
+    // advertisement registers for this chip's LPI caps, then
+    // restart auto-negotiation iff the advertisement changed so
+    // the link partner negotiates EEE on the next exchange.
+    // This runs last so the advertisement is the final PHY-page
+    // programming before the link is used. A failure here is
+    // logged, not fatal: the interface still works, just
+    // without EEE advertisement.
+    let caps = crate::features::eee_lpi_caps(RtlNic::mac_version_for_kind(kind));
+    match access.advertise_eee(caps) {
+        Ok(true) => match access.restart_aneg() {
+            Ok(true) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8125: EEE advertisement programmed; autonegotiation restarted",
+                );
+            }
+            Ok(false) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8125: EEE advertisement programmed; autonegotiation disabled, \
+                     takes effect at the next autonegotiation",
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8125: EEE advertisement programmed but autonegotiation restart \
+                     failed: {:?}",
+                    e
+                );
+            }
+        },
+        Ok(false) => {}
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8125: EEE advertisement failed: {:?}; link partner will not negotiate EEE",
+                e
+            );
+        }
     }
 }
 

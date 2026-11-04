@@ -716,6 +716,38 @@ pub unsafe fn apply_eee_txidle<R: RegFile>(regs: &mut R, mtu: u32) {
     unsafe { regs.write16(REG_EEE_TXIDLE_TIMER_8125, eee_txidle_timer(mtu)) };
 }
 
+/// AN MMD EEE advertisement / link-partner ability (registers
+/// 7.60 / 7.61) bit 1: 100BASE-TX EEE (IEEE 802.3az Clause 45).
+pub const EEE_ADV_100TX: u16 = 0x0002;
+/// Registers 7.60 / 7.61 bit 2: 1000BASE-T EEE.
+pub const EEE_ADV_1000T: u16 = 0x0004;
+/// Registers 7.60 / 7.61 bit 3: 10GBASE-T EEE.
+pub const EEE_ADV_10GT: u16 = 0x0008;
+/// AN MMD EEE advertisement 2 / link-partner ability 2 (registers
+/// 7.62 / 7.63) bit 0: 2.5GBASE-T EEE (IEEE 802.3bz §45.2.7.14aa).
+pub const EEE_ADV2_2500T: u16 = 0x0001;
+/// Registers 7.62 / 7.63 bit 1: 5GBASE-T EEE.
+pub const EEE_ADV2_5000T: u16 = 0x0002;
+
+/// AN MMD EEE advertisement word (register 7.60) for a capability
+/// set. The capability (3.20), advertisement (7.60), and
+/// link-partner ability (7.61) registers share this bit layout,
+/// so the same word also decodes what a partner advertised.
+pub const fn eee_adv(caps: EeeCaps) -> u16 {
+    (if caps.fd_100 { EEE_ADV_100TX } else { 0 })
+        | (if caps.fd_1000 { EEE_ADV_1000T } else { 0 })
+        | (if caps.fd_10000 { EEE_ADV_10GT } else { 0 })
+}
+
+/// AN MMD EEE advertisement 2 word (register 7.62) for a
+/// capability set. 2.5G/5G EEE lives in this second register, not
+/// in 7.60 — advertising only 7.60 would leave the NBase-T speeds
+/// unnegotiated.
+pub const fn eee_adv2(caps: EeeCaps) -> u16 {
+    (if caps.fd_2500 { EEE_ADV2_2500T } else { 0 })
+        | (if caps.fd_5000 { EEE_ADV2_5000T } else { 0 })
+}
+
 // ── Jumbo frames ────────────────────────────────────────────────────
 
 /// Ethernet header + FCS overhead used by Linux's `JUMBO_*`
@@ -850,6 +882,86 @@ pub unsafe fn apply_jumbo_config<R: RegFile>(regs: &mut R, mac_version: u32, jum
         // SAFETY: as above.
         unsafe { regs.write8(REG_CONFIG4, v) };
     }
+}
+
+// ── Runtime MTU switch (#1276) ──────────────────────────────────────
+
+/// Minimum interface MTU (`ETH_MIN_MTU`, the `ether_setup`
+/// default Linux keeps for this family; the core validates
+/// against min/max before calling `ndo_change_mtu`, so the
+/// driver hook must validate the same range).
+pub const MIN_MTU: u32 = 68;
+
+/// A validated runtime MTU change, planned by
+/// [`mtu_transition`] (Linux `rtl8169_change_mtu` +
+/// `rtl8169_fix_features` shape, pure so fixtures can pin it
+/// without hardware). The hardware program is deliberately
+/// small: Config bits via [`jumbo_config`] plus the MTPS
+/// override when present (VER_31..33 only — other versions
+/// keep the bring-up jumbo-max MTPS, which already covers any
+/// MTU up to the version max). RMS is NOT part of the program:
+/// it stays at the 16383 buffer bound, which covers every MTU
+/// up to the version max, and Linux's change_mtu does not touch
+/// it either (`rtl_set_rx_max_size` runs at hw-start only).
+/// Rings are NOT resized for the same reason (RX buffers 16383,
+/// TX slots 16384 already cover the version max).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MtuProgram {
+    /// New interface MTU (validated).
+    pub mtu: u32,
+    /// Whether the new MTU is jumbo (`> 1500`, Linux
+    /// `ETH_DATA_LEN`).
+    pub jumbo: bool,
+    /// Config-bit program for the new jumbo state.
+    pub config: JumboConfig,
+    /// TX checksum advertisement after the switch (Linux
+    /// `fix_features` rule 2: withdrawn when jumbo on MAC >
+    /// VER_06; RX checksum is never touched by that rule).
+    pub tx_checksum: bool,
+    /// TSO advertisement after the switch (rule 1: withdrawn
+    /// when MTU > `MSS_MAX` (2047), any version; rule 2:
+    /// withdrawn with TX checksum when jumbo on MAC > VER_06).
+    pub tso: bool,
+}
+
+/// [`mtu_transition`] rejection: the MTU is outside the
+/// version range.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MtuError {
+    OutOfRange,
+}
+
+/// Validate `new_mtu` for `mac_version` (`None` = unknown XID)
+/// and plan the reprogram. Range: 68..=`jumbo_max_mtu`
+/// (unknown versions take the 9K default arm, as
+/// [`jumbo_max_mtu`] does). Unknown versions are treated as
+/// modern (> VER_06) for the offload gate — fail-closed: do
+/// not advertise an offload the driver cannot attribute to a
+/// pre-06 chip. (The XID table never yields version 0, so the
+/// `None` arm is the only unknown case.)
+pub const fn mtu_transition(
+    mac_version: Option<u32>,
+    new_mtu: u32,
+) -> Result<MtuProgram, MtuError> {
+    let ver = match mac_version {
+        Some(v) => v,
+        None => 0,
+    };
+    let max = jumbo_max_mtu(ver);
+    if new_mtu < MIN_MTU || new_mtu > max {
+        return Err(MtuError::OutOfRange);
+    }
+    let jumbo = new_mtu > 1500;
+    let modern = mac_version.is_none() || ver > 6;
+    let tx_checksum = !(jumbo && modern);
+    let tso = new_mtu <= MSS_MAX as u32 && tx_checksum;
+    Ok(MtuProgram {
+        mtu: new_mtu,
+        jumbo,
+        config: jumbo_config(ver, jumbo),
+        tx_checksum,
+        tso,
+    })
 }
 
 // ── RSS (VER_80 only) ───────────────────────────────────────────────
@@ -1839,6 +1951,49 @@ mod tests {
     }
     kernel_test_in!("drivers/net/realtek-features", smoke_features_eee_caps);
 
+    fn smoke_features_eee_adv_words() -> TestResult {
+        // Expectations come from the IEEE layouts, not from the
+        // helpers: 7.60 bits 1/2/3 = 100TX/1000T/10GT, 7.62 bits
+        // 0/1 = 2500T/5000T.
+        if eee_adv(eee_lpi_caps(61)) != 0x0006 || eee_adv2(eee_lpi_caps(61)) != 0x0000 {
+            return TestResult::Fail("VER_61 must advertise 100/1000 only (7.60=0x0006)");
+        }
+        if eee_adv(eee_lpi_caps(63)) != 0x0006 || eee_adv2(eee_lpi_caps(63)) != 0x0001 {
+            return TestResult::Fail("VER_63 must add 2500T (7.62=0x0001)");
+        }
+        if eee_adv(eee_lpi_caps(70)) != 0x0006 || eee_adv2(eee_lpi_caps(70)) != 0x0003 {
+            return TestResult::Fail("VER_70 must add 5000T (7.62=0x0003)");
+        }
+        if eee_adv(eee_lpi_caps(80)) != 0x000e || eee_adv2(eee_lpi_caps(80)) != 0x0003 {
+            return TestResult::Fail("VER_80 must add 10GT (7.60=0x000e)");
+        }
+        // Each bit independently: a single-speed set maps to exactly
+        // one bit, and an all-false set (EEE-off board, or the
+        // Unknown chip's version 0) advertises nothing.
+        let only_100 = EeeCaps {
+            fd_100: true,
+            ..EeeCaps::default()
+        };
+        if eee_adv(only_100) != 0x0002 || eee_adv2(only_100) != 0 {
+            return TestResult::Fail("100TX-only caps must map to 7.60 bit 1 alone");
+        }
+        let only_5000 = EeeCaps {
+            fd_5000: true,
+            ..EeeCaps::default()
+        };
+        if eee_adv(only_5000) != 0 || eee_adv2(only_5000) != 0x0002 {
+            return TestResult::Fail("5000T-only caps must map to 7.62 bit 1 alone");
+        }
+        if eee_adv(EeeCaps::default()) != 0 || eee_adv2(EeeCaps::default()) != 0 {
+            return TestResult::Fail("all-false caps must advertise nothing");
+        }
+        if eee_adv(eee_lpi_caps(0)) != 0 || eee_adv2(eee_lpi_caps(0)) != 0 {
+            return TestResult::Fail("unsupported version must advertise nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-features", smoke_features_eee_adv_words);
+
     fn smoke_features_jumbo() -> TestResult {
         if jumbo_max_mtu(17) != 4 * 1024 - 22 {
             return TestResult::Fail("VER_17 jumbo max is not 4K");
@@ -1878,6 +2033,116 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/realtek-features", smoke_features_jumbo);
+
+    fn smoke_features_mtu_switch() -> TestResult {
+        // Range: floor 68, ceiling = version max.
+        if mtu_transition(Some(17), 67).is_ok() {
+            return TestResult::Fail("MTU 67 accepted below the 68 floor");
+        }
+        if mtu_transition(Some(17), 68).is_err() {
+            return TestResult::Fail("MTU 68 rejected");
+        }
+        if mtu_transition(Some(17), 4 * 1024 - 22).is_err() {
+            return TestResult::Fail("VER_17 max MTU rejected");
+        }
+        if mtu_transition(Some(17), 4 * 1024 - 21).is_ok() {
+            return TestResult::Fail("VER_17 MTU above max accepted");
+        }
+        if mtu_transition(Some(2), 7 * 1024 - 22).is_err() {
+            return TestResult::Fail("VER_02 max MTU rejected");
+        }
+        if mtu_transition(Some(61), 16 * 1024 - 22).is_err() {
+            return TestResult::Fail("VER_61 max MTU rejected");
+        }
+        if mtu_transition(None, 9 * 1024 - 22).is_err() {
+            return TestResult::Fail("unknown-version max MTU rejected");
+        }
+        if mtu_transition(None, 9 * 1024 - 21).is_ok() {
+            return TestResult::Fail("unknown-version MTU above max accepted");
+        }
+        // Jumbo boundary + fix_features matrix.
+        let plain = match mtu_transition(Some(20), 1500) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("1500 rejected"),
+        };
+        if plain.jumbo || !plain.tx_checksum || !plain.tso {
+            return TestResult::Fail("1500 must be non-jumbo with full TX offload");
+        }
+        let jumbo_modern = match mtu_transition(Some(20), 1501) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("1501 rejected"),
+        };
+        if !jumbo_modern.jumbo || jumbo_modern.tx_checksum || jumbo_modern.tso {
+            return TestResult::Fail("jumbo on modern MAC must drop CSUM + TSO");
+        }
+        // Pre-06 chips keep offloads at jumbo MTU (rule 2 is gated).
+        let jumbo_old = match mtu_transition(Some(6), 2000) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("2000 rejected on VER_06"),
+        };
+        if !jumbo_old.jumbo || !jumbo_old.tx_checksum || !jumbo_old.tso {
+            return TestResult::Fail("jumbo on VER_06 must keep CSUM + TSO");
+        }
+        // Rule 1: MTU > 2047 drops TSO on every version, CSUM
+        // stays on pre-06 chips.
+        let big_old = match mtu_transition(Some(6), 2048) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("2048 rejected on VER_06"),
+        };
+        if big_old.tso || !big_old.tx_checksum {
+            return TestResult::Fail("2048 on VER_06 must drop TSO only");
+        }
+        let big_modern = match mtu_transition(Some(20), 2048) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("2048 rejected on VER_20"),
+        };
+        if big_modern.tso || big_modern.tx_checksum {
+            return TestResult::Fail("2048 on modern MAC must drop CSUM + TSO");
+        }
+        // Unknown version is treated as modern (fail-closed).
+        let jumbo_unknown = match mtu_transition(None, 1501) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("1501 rejected for unknown version"),
+        };
+        if jumbo_unknown.tx_checksum || jumbo_unknown.tso {
+            return TestResult::Fail("unknown version must not advertise TX offload at jumbo");
+        }
+        // Config program follows jumbo_config: VER_31 jumbo forces
+        // MTPS 0x24, non-jumbo restores 0x3F; VER_20 carries no
+        // MTPS override.
+        if jumbo_modern.config.mtps_override.is_some() {
+            return TestResult::Fail("VER_20 must not carry an MTPS override");
+        }
+        let cfg31j = match mtu_transition(Some(31), 9000) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("9000 rejected on VER_31"),
+        };
+        if cfg31j.config.mtps_override != Some(0x24) {
+            return TestResult::Fail("VER_31 jumbo must force MTPS 0x24");
+        }
+        let cfg31p = match mtu_transition(Some(31), 1500) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("1500 rejected on VER_31"),
+        };
+        if cfg31p.config.mtps_override != Some(0x3F) {
+            return TestResult::Fail("VER_31 non-jumbo must restore MTPS 0x3F");
+        }
+        // Fixture register conversation: the VER_20 jumbo program
+        // writes Config3 EN0 + Config4 EN1 and nothing else.
+        let mut regs = RegLog::new();
+        // SAFETY: RegLog fixture — no hardware is touched.
+        unsafe { apply_jumbo_config(&mut regs, 20, true) };
+        match regs.last_write_to(REG_CONFIG3) {
+            Some(w) if w.value == CONFIG3_JUMBO_EN0 as u32 => {}
+            _ => return TestResult::Fail("jumbo Config3 write missing"),
+        }
+        match regs.last_write_to(REG_CONFIG4) {
+            Some(w) if w.value == CONFIG4_JUMBO_EN1 as u32 => {}
+            _ => return TestResult::Fail("jumbo Config4 write missing"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-features", smoke_features_mtu_switch);
 
     fn smoke_features_rss_ver80() -> TestResult {
         if !rss_queues_valid(8) || rss_queues_valid(3) || rss_queues_valid(16) {

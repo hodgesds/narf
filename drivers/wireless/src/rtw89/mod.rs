@@ -118,6 +118,7 @@ mod mac_runtime;
 mod mac_runtime_regs;
 mod monitor;
 mod monitor_wire;
+mod nhm;
 mod operating_channel;
 mod operating_channel_c;
 mod packet_core;
@@ -268,6 +269,9 @@ mod ra_v1_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod txrx_be_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod nhm_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

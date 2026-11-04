@@ -408,11 +408,16 @@ frame itself and builds its descriptors from the shared builders.
   (16383), TX slots are 16 KiB, and MTPS is sized from the
   chip's jumbo tagged frame (with Linux's VER_31..33 override).
   Jumbo frames are therefore receivable and transmittable
-  through the driver API. The interface MTU stays 1500 with
-  offloads advertised: Linux's `rtl8169_fix_features` disables
-  CSUM + TSO when MTU > 1500 on MAC > VER_06, so a jumbo MTU
-  and TX offload cannot coexist on this family; a runtime MTU
-  switch is future work.
+  through the driver API. The runtime MTU switch (#1276) is
+  wired for the r8169 family: `try_set_mtu` validates
+  68..=version-max, programs the jumbo Config bits (+ MTPS
+  override on VER_31..33; RMS and rings already cover the
+  version max, so neither moves), and republishes the offload
+  advertisement exactly where Linux's `rtl8169_fix_features`
+  withdraws it (jumbo MTU on MAC > VER_06 drops CSUM + TSO;
+  MTU > 2047 drops TSO on every version), so advertised caps
+  always match the programmed hardware. The 8125/8126/8127
+  drivers share the transition logic but are not wired yet.
 - **WoL.** Each driver exposes `set_wol_opts` programming
   Linux's `__rtl8169_set_wol` shape: Config3 LinkUp/MagicPacket,
   Config5 UWF/BWF/MWF/LanWake, and the version-selected PME
@@ -429,9 +434,15 @@ frame itself and builds its descriptors from the shared builders.
   everywhere EEE is supported, +2500FD from VER_63, +5000FD
   from VER_70, +10000FD on VER_80 only). The 8125 family
   programs the TX LPI idle timer register (0x6048 =
-  MTU + 14 + 0x20) at bring-up. EEE PHY advertisement through
-  the OCP window is future work; the PHY tables already contain
-  the EEE PHY clears.
+  MTU + 14 + 0x20) at bring-up. EEE PHY advertisement is
+  programmed from the `Stage::Late` PHY pass through the OCP
+  window: the emulated AN MMD advertisement registers
+  (7.60 → page 0xa5d reg 0x10, 7.62 → page 0xa6d reg 0x12)
+  carry the chip's LPI caps, written only when they differ
+  and read back for verification, and auto-negotiation
+  restarts when the advertisement changes so the link partner
+  negotiates EEE; the PHY tables already contain the EEE
+  PHY clears.
 - **PHY configuration.** The shared OCP accessor
   (`phy_access.rs`: paged C22 access, MMD VEND2 parameters,
   firmware interpreter) serves the whole family. RTL8125 has

@@ -148,6 +148,9 @@ pub enum PhyError {
     BadFirmwareOpcode(u32),
     /// A paged access named a register below the paged window.
     BadPagedRegister(u16),
+    /// An EEE advertisement write did not read back the value
+    /// written — the PHY did not accept the advertisement.
+    EeeAdvertMismatch,
 }
 
 /// `rtl_ocp_reg_failure` — an OCP address must be even and fit 16
@@ -624,3 +627,167 @@ pub const R8168G_PARAM_SEL_REG: u16 = 0x13;
 pub const RTL8125_PARAM_SEL_ADDR: u32 = 0xB87C;
 /// MMD VEND2 register `rtl8125_phy_param` modifies.
 pub const RTL8125_PARAM_DATA_ADDR: u32 = 0xB87E;
+
+// ── EEE advertisement (emulated AN MMD registers) ─────────────────
+// The RTL8125/RTL8126 internal PHYs expose no MMD registers, so
+// Linux's realtek PHY driver emulates the standard AN MMD EEE
+// registers on vendor-specific paged registers and the generic
+// EEE path drives them. The same mapping, through this crate's
+// paged OCP window:
+
+/// Page of the emulated AN MMD EEE advertisement register
+/// (7.60): `rtlgen_read_mmd` / `rtlgen_write_mmd` select page
+/// 0xa5d, register 0x10.
+pub const EEE_ADV_PAGE: u16 = 0x0A5D;
+/// Register of the emulated AN MMD EEE advertisement (7.60).
+pub const EEE_ADV_REG: u16 = 0x10;
+/// Page of the emulated AN MMD EEE advertisement 2 register
+/// (7.62) for the NBase-T PHY: `rtl8125_read_mmd` /
+/// `rtl8125_write_mmd` select page 0xa6d, register 0x12.
+/// (The sibling 7.63 link-partner ability 2 lives at page 0xa6d,
+/// register 0x10, and 7.61 at page 0xa5d, register 0x11 — both
+/// read-only here, so no writer names them.)
+pub const EEE_ADV2_PAGE: u16 = 0x0A6D;
+/// Register of the emulated AN MMD EEE advertisement 2 (7.62).
+pub const EEE_ADV2_REG: u16 = 0x12;
+/// Clause 22 control register (page 0, register 0).
+pub const MII_BMCR_REG: u16 = 0;
+/// BMCR bit 12: auto-negotiation enable (IEEE 802.3 Clause 22).
+pub const BMCR_ANENABLE: u16 = 0x1000;
+/// BMCR bit 9: restart auto-negotiation. Self-clearing; only
+/// takes effect while auto-negotiation is enabled.
+pub const BMCR_ANRESTART: u16 = 0x0200;
+
+/// BMCR value that restarts auto-negotiation, or `None` when
+/// auto-negotiation is disabled (bit 12 clear): setting the
+/// restart bit alone would be a no-op there, and forcing
+/// auto-negotiation on would override a forced-speed link.
+/// Every other BMCR bit passes through untouched.
+pub const fn bmcr_restart_value(bmcr: u16) -> Option<u16> {
+    if bmcr & BMCR_ANENABLE == 0 {
+        None
+    } else {
+        Some(bmcr | BMCR_ANRESTART)
+    }
+}
+
+impl PhyAccess<'_> {
+    /// Program the emulated AN MMD EEE advertisement registers
+    /// for `caps`: read each register, write it only when it
+    /// differs from the target word, and read back every written
+    /// register to confirm it stuck.
+    ///
+    /// Returns whether any register changed. The caller restarts
+    /// auto-negotiation only then — mirroring phylib's
+    /// `genphy_config_eee_advert` changed-check — so re-running
+    /// over already-programmed registers is a silent no-op, and
+    /// an EEE-off board (all-false caps over reset-default
+    /// registers) sees no writes at all.
+    pub fn advertise_eee(&self, caps: crate::features::EeeCaps) -> Result<bool, PhyError> {
+        let adv = crate::features::eee_adv(caps);
+        let adv2 = crate::features::eee_adv2(caps);
+        let mut changed = false;
+        for (page, reg, target) in [
+            (EEE_ADV_PAGE, EEE_ADV_REG, adv),
+            (EEE_ADV2_PAGE, EEE_ADV2_REG, adv2),
+        ] {
+            let addr = Self::paged_addr(page, reg)?;
+            if self.phy_ocp_read(addr)? != target {
+                self.phy_ocp_write(addr, target)?;
+                if self.phy_ocp_read(addr)? != target {
+                    return Err(PhyError::EeeAdvertMismatch);
+                }
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Restart auto-negotiation so a changed EEE advertisement is
+    /// carried in the next exchange. Reads BMCR through the
+    /// page-0 window and restarts only when auto-negotiation is
+    /// enabled; a forced-speed link keeps its configuration and
+    /// picks the advertisement up at its next autonegotiation
+    /// instead. Returns whether autonegotiation was restarted.
+    pub fn restart_aneg(&self) -> Result<bool, PhyError> {
+        let addr = Self::paged_addr(0, MII_BMCR_REG)?;
+        let bmcr = self.phy_ocp_read(addr)?;
+        match bmcr_restart_value(bmcr) {
+            Some(next) => {
+                self.phy_ocp_write(addr, next)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+// ── Fixtures ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::*;
+
+    fn smoke_phy_eee_paged_addrs() -> TestResult {
+        // The page/register constants must equal the mapping
+        // Linux's realtek PHY driver emulates — the test pins
+        // literals, not the constants, so a wrong constant fails
+        // here instead of agreeing with itself.
+        if EEE_ADV_PAGE != 0x0a5d || EEE_ADV_REG != 0x10 {
+            return TestResult::Fail("EEE ADV mapping is not page 0xa5d reg 0x10");
+        }
+        if EEE_ADV2_PAGE != 0x0a6d || EEE_ADV2_REG != 0x12 {
+            return TestResult::Fail("EEE ADV2 mapping is not page 0xa6d reg 0x12");
+        }
+        // Paged address arithmetic: page << 4, register rebased
+        // by 0x10 and doubled (two bytes per register).
+        if PhyAccess::paged_addr(0x0a5d, 0x10) != Ok(0xa5d0) {
+            return TestResult::Fail("7.60 emulation must land at OCP 0xa5d0");
+        }
+        if PhyAccess::paged_addr(0x0a6d, 0x12) != Ok(0xa6d4) {
+            return TestResult::Fail("7.62 emulation must land at OCP 0xa6d4");
+        }
+        // Page 0 selects the standard base with no rebase — the
+        // BMCR restart reads/writes OCP 0xA400.
+        if PhyAccess::paged_addr(0, MII_BMCR_REG) != Ok(OCP_STD_PHY_BASE as u32) {
+            return TestResult::Fail("BMCR must land at OCP_STD_PHY_BASE");
+        }
+        // A register below the paged window is rejected, not
+        // silently wrapped.
+        if PhyAccess::paged_addr(0x0a5d, 0x0f) != Err(PhyError::BadPagedRegister(0x0f)) {
+            return TestResult::Fail("paged_addr admitted a register below 0x10");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-phy-access", smoke_phy_eee_paged_addrs);
+
+    fn smoke_phy_bmcr_restart_value() -> TestResult {
+        // Auto-negotiation enabled: restart bit set, every other
+        // bit preserved.
+        if bmcr_restart_value(0x1000) != Some(0x1200) {
+            return TestResult::Fail("BMCR restart must set bit 9 on AN-enabled BMCR");
+        }
+        if bmcr_restart_value(0x1140) != Some(0x1340) {
+            return TestResult::Fail("BMCR restart must preserve unrelated bits");
+        }
+        if bmcr_restart_value(0x1200) != Some(0x1200) {
+            return TestResult::Fail("BMCR restart must be idempotent");
+        }
+        // Auto-negotiation disabled: no restart, even when the
+        // restart bit itself is already set — forcing AN on
+        // would override a forced-speed link.
+        if bmcr_restart_value(0x0000).is_some() || bmcr_restart_value(0x0200).is_some() {
+            return TestResult::Fail("BMCR restart must refuse AN-disabled BMCR");
+        }
+        if BMCR_ANENABLE != 0x1000 || BMCR_ANRESTART != 0x0200 {
+            return TestResult::Fail("BMCR bits are not 12 (AN enable) / 9 (restart)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_bmcr_restart_value
+    );
+}
