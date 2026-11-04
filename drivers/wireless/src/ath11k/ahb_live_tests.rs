@@ -1462,7 +1462,11 @@ fn smoke_ath11k_ahb_live_wcn6750_wlfw_server() -> TestResult {
         .maps
         .contains_key(&(SRV_BAR_ADDR, ATH11K_QMI_DEVICE_BAR_SIZE as u64)));
     // firmware_start's QMI went out over the server: the WLFW phase
-    // ran to completion through the real bring-up path.
+    // ran to completion through the real bring-up path, and the
+    // stranded core's unwind told the firmware wlan_mode OFF
+    // (firmware_stop in firmware_ready_inner's error path, as Linux
+    // does on core-start failure) — that trailing WLAN_MODE is the
+    // unwind's, not a second firmware_start.
     kt_assert_eq!(
         s.reqs,
         alloc::vec![
@@ -1474,6 +1478,9 @@ fn smoke_ath11k_ahb_live_wcn6750_wlfw_server() -> TestResult {
             QMI_WLANFW_BDF_DOWNLOAD_REQ_V01,
             QMI_WLANFW_BDF_DOWNLOAD_REQ_V01,
             QMI_WLANFW_WLAN_CFG_REQ_V01,
+            QMI_WLANFW_WLAN_MODE_REQ_V01,
+            // Unwind: firmware_stop's wlan_mode OFF after the
+            // stranded core-start failure.
             QMI_WLANFW_WLAN_MODE_REQ_V01,
         ]
     );
