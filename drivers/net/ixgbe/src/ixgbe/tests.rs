@@ -670,8 +670,8 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol);
 // ── PM fixtures (commit 5) ───────────────────────────────────────
 
 fn smoke_ixgbe_pm_plans() -> TestResult {
-    use super::pm::{detach_plan, resume_plan, suspend_plan};
-    use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
+    use super::pm::{detach_plan, resume_rebuild_plan, suspend_plan};
+    use super::queues::{rx_queue_regs, tx_queue_regs, QueueConfig, RegBank};
     use super::wol::WolConfig;
     use super::{RXDCTL_ENABLE, TXDCTL_ENABLE};
     let tx = match tx_queue_regs(0) {
@@ -700,7 +700,9 @@ fn smoke_ixgbe_pm_plans() -> TestResult {
     if bank.read32(0x05808) != 0 {
         return TestResult::Fail("suspend without WoL left filters armed");
     }
-    resume_plan(&mut bank);
+    if resume_rebuild_plan(&mut bank, &QueueConfig::single(), &[0x1000], &[0x2000]).is_err() {
+        return TestResult::Fail("resume rebuild failed on the 1/1 config");
+    }
     if bank.read32(tx.txdctl) & TXDCTL_ENABLE == 0
         || bank.read32(rx.rxdctl) & RXDCTL_ENABLE == 0
         || bank.read32(0x03000) & 1 == 0
@@ -720,6 +722,111 @@ fn smoke_ixgbe_pm_plans() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_plans);
+
+// ── Resume-rebuild fixtures (§13l) ───────────────────────────────
+
+fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
+    use super::pm::resume_rebuild_plan;
+    use super::queues::{rx_queue_regs, tx_queue_regs, QueueConfig, RegBank};
+    use super::{FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, RXDCTL_ENABLE, SRRCTL_BSIZE_2K, TXDCTL_ENABLE};
+    let tx0 = match tx_queue_regs(0) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(0) is None"),
+    };
+    let rx0 = match rx_queue_regs(0) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(0) is None"),
+    };
+    let tx1 = match tx_queue_regs(1) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(1) is None"),
+    };
+    let rx1 = match rx_queue_regs(1) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(1) is None"),
+    };
+    let tx2 = match tx_queue_regs(2) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(2) is None"),
+    };
+    // 1. 1/1 rebuild programs bases, lengths, heads, tails,
+    // enables, SRRCTL, FCTRL, RXEN, and the misc vector.
+    let mut bank = FakeBank::new();
+    if resume_rebuild_plan(&mut bank, &QueueConfig::single(), &[0x1000], &[0x2000]).is_err() {
+        return TestResult::Fail("1/1 rebuild failed");
+    }
+    if bank.read32(tx0.tdbal) != 0x1000
+        || bank.read32(tx0.tdbah) != 0
+        || bank.read32(tx0.tdlen) != 32 * 16
+        || bank.read32(tx0.tdh) != 0
+        || bank.read32(tx0.tdt) != 0
+        || bank.read32(tx0.txdctl) & TXDCTL_ENABLE == 0
+        || bank.read32(rx0.rdbal) != 0x2000
+        || bank.read32(rx0.rdbah) != 0
+        || bank.read32(rx0.rdlen) != 32 * 16
+        || bank.read32(rx0.rdh) != 0
+        || bank.read32(rx0.rdt) != 31
+        || bank.read32(rx0.srrctl) != SRRCTL_BSIZE_2K
+        || bank.read32(rx0.rxdctl) & RXDCTL_ENABLE == 0
+        || bank.read32(0x05080) != (FCTRL_BAM | FCTRL_UPE | FCTRL_MPE)
+        || bank.read32(0x03000) & 1 == 0
+        || bank.read32(0x00880) != 1
+    {
+        return TestResult::Fail("1/1 rebuild programmed wrong registers");
+    }
+    // 2. Per-queue composition: a 2/2 config programs queue 1
+    // from its own bases and leaves queue 2 untouched (never a
+    // hardcoded queue 0).
+    let cfg2 = QueueConfig {
+        num_tx: 2,
+        num_rx: 2,
+        ring_len: 32,
+    };
+    let mut bank = FakeBank::new();
+    if resume_rebuild_plan(&mut bank, &cfg2, &[0x1000, 0x3000], &[0x2000, 0x4000]).is_err() {
+        return TestResult::Fail("2/2 rebuild failed");
+    }
+    if bank.read32(tx1.tdbal) != 0x3000
+        || bank.read32(tx1.tdlen) != 32 * 16
+        || bank.read32(tx1.txdctl) & TXDCTL_ENABLE == 0
+        || bank.read32(rx1.rdbal) != 0x4000
+        || bank.read32(rx1.rdt) != 31
+        || bank.read32(rx1.rxdctl) & RXDCTL_ENABLE == 0
+        || bank.read32(tx2.tdbal) != 0
+        || bank.read32(tx2.txdctl) & TXDCTL_ENABLE != 0
+    {
+        return TestResult::Fail("2/2 rebuild did not program per-queue rings");
+    }
+    // 3. Fail-closed: bad configs and base-count mismatches
+    // return Err AND leave the bank untouched (sentinel survives).
+    let bad = QueueConfig {
+        num_tx: 0,
+        num_rx: 1,
+        ring_len: 32,
+    };
+    let mut bank = FakeBank::new();
+    bank.write32(tx0.tdbal, 0xDEAD);
+    if resume_rebuild_plan(&mut bank, &bad, &[], &[0x2000]).is_ok()
+        || bank.read32(tx0.tdbal) != 0xDEAD
+    {
+        return TestResult::Fail("zero-queue config was not fail-closed");
+    }
+    let mut bank = FakeBank::new();
+    bank.write32(tx0.tdbal, 0xDEAD);
+    if resume_rebuild_plan(
+        &mut bank,
+        &QueueConfig::single(),
+        &[0x1000, 0x3000],
+        &[0x2000],
+    )
+    .is_ok()
+        || bank.read32(tx0.tdbal) != 0xDEAD
+    {
+        return TestResult::Fail("base-count mismatch was not fail-closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_resume_rebuild);
 
 // ── Ethtool fixtures (commit 6) ──────────────────────────────────
 
