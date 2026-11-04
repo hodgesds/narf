@@ -46,6 +46,7 @@ pub mod kvm_pv;
 pub mod mempolicy;
 pub mod memtype;
 pub mod migrate;
+pub mod mmu_notifier;
 pub mod module_text;
 pub mod numa_tier;
 pub mod oom;
@@ -73,10 +74,16 @@ pub mod vmalloc;
 pub mod wx;
 pub mod zpool;
 
+mod device_revoke_tests;
+mod dma_pin_tests;
 mod guard_tests;
 mod memtype_tests;
+mod mmu_notifier_tests;
 mod pageattr_tests;
 mod remote_access_tests;
+// Drives the swap-out kernel-test seam, which exists only with this feature.
+#[cfg(feature = "kernel-test")]
+mod swap_order_tests;
 mod tests;
 
 pub use address_space::{

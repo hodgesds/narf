@@ -30,6 +30,32 @@ pub(crate) fn io_error() -> FsError {
     FsError::Io(narf_block::BlockError::IOError)
 }
 
+/// intel_guc_fwif.h GUC_CLIENT_PRIORITY_*: a lower value is a higher
+/// priority. Userspace reaches HIGH..=NORMAL only.
+pub(crate) const GUC_PRIORITY_KMD_HIGH: u32 = 0;
+pub(crate) const GUC_PRIORITY_HIGH: u32 = 1;
+pub(crate) const GUC_PRIORITY_KMD_NORMAL: u32 = 2;
+pub(crate) const GUC_PRIORITY_NORMAL: u32 = 3;
+/// i915_priolist_types.h: I915_PRIORITY_NORMAL is
+/// I915_CONTEXT_DEFAULT_PRIORITY (0); I915_PRIORITY_DISPLAY follows
+/// I915_PRIORITY_MAX (1024) and I915_PRIORITY_HEARTBEAT (1025).
+const I915_PRIORITY_NORMAL: i32 = 0;
+const I915_PRIORITY_DISPLAY: i32 = 1026;
+
+/// intel_guc_submission.c::map_i915_prio_to_guc_prio. guc_context_init
+/// applies it to ctx->sched.priority, so a default context is KMD_NORMAL.
+pub(crate) const fn map_i915_prio_to_guc_prio(priority: i32) -> u32 {
+    if priority == I915_PRIORITY_NORMAL {
+        GUC_PRIORITY_KMD_NORMAL
+    } else if priority < I915_PRIORITY_NORMAL {
+        GUC_PRIORITY_NORMAL
+    } else if priority < I915_PRIORITY_DISPLAY {
+        GUC_PRIORITY_HIGH
+    } else {
+        GUC_PRIORITY_KMD_HIGH
+    }
+}
+
 /// A backend advertises only a live, primed and execution-tested RCS0 owner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct UserStatus {
@@ -65,6 +91,10 @@ pub struct DeviceFacts {
     pub graphics_version: u16,
     pub graphics_step: u8,
     pub reference_clock: u32,
+    /// i915_perf_oa_timestamp_frequency: the reference clock with
+    /// Wa_18013179988's RPM_CONFIG0 CTC shift on 12.55 and 12.70..12.74,
+    /// sampled with the clock and independent of the OA opt-in.
+    pub oa_timestamp_frequency: u32,
 }
 
 /// Trusted metadata-only smallbar publication transaction. Faultable output
@@ -91,6 +121,13 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     /// passive query cannot start or authenticate firmware; default refusal.
     fn huc_version(&self) -> FsFuture<'_, (u8, u8, u8)> {
         Box::pin(async { Err(FsError::NoDevice) })
+    }
+    /// A runtime-PM reference for a kernel CPU access to this card's LMEM
+    /// BAR (Linux i915/xe `pm_runtime_get` around a CPU copy): the function is
+    /// in D0 with a running GT, and the pool's CPU access open, until the
+    /// returned guard drops. The default has no runtime PM to hold.
+    fn cpu_vram_wakeref(&self) -> FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async { Ok(Box::new(()) as Box<dyn core::any::Any + Send>) })
     }
     /// Cached physical BMG/LNL main-GT layout; no read-triggered hardware access.
     fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
@@ -128,6 +165,13 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     }
     /// Stable ABI selection for this card, independent of temporary readiness.
     fn native_xe(&self) -> bool {
+        false
+    }
+    /// This function's GT owner runs beside a display it preserves (the
+    /// Lunar Lake display-20 route's `DisplayPreserving` profile), so its
+    /// objects may be created for scanout. Default: headless or not an
+    /// integrated Xe2 profile.
+    fn display_preserving(&self) -> bool {
         false
     }
     fn device_facts(&self) -> Option<DeviceFacts> {
@@ -286,7 +330,18 @@ struct State {
     lost_pending: u32,
     /// Jobs of this context that hung and were removed from their engine.
     guilty: u32,
+    /// GuC SCHEDULING_PRIORITY (GUC_CLIENT_PRIORITY_*) and EXECUTION_QUANTUM
+    /// (us) for the next request: native Xe queue properties, or an i915
+    /// context's mapped ctx->sched.priority.
     policy: (u32, u32),
+    /// The same pair for the job in flight, fixed at its claim except that
+    /// a later request on this context raises its priority (queue_request).
+    job_policy: (u32, u32),
+    /// i915 requests queued and not yet staged, per GuC band.
+    queued: [u32; 4],
+    /// The band of the i915 request whose submission attempt is next to
+    /// claim this context; serialized by `serial`.
+    staged: Option<u32>,
     /// Immutable queue-create intent; retained with the private context image
     /// through repeated registration, cancellation and verified reset.
     low_latency: bool,
@@ -337,16 +392,21 @@ impl UserContext {
         )
     }
 
+    /// One hardware member of an i915 context whose ctx->sched.priority is
+    /// `priority`.
     pub(crate) fn for_i915_engine(
         engine: crate::intel_gpu_engine::Engine,
         policy: Arc<CapturePolicy>,
+        priority: i32,
     ) -> Arc<Self> {
-        Self::with_placements(
+        let context = Self::with_placements(
             engine,
             crate::intel_gpu_engine::EngineSet::of(&[engine]),
             None,
             Some(policy),
-        )
+        );
+        context.set_i915_priority(priority);
+        context
     }
 
     /// Width-one GuC virtual context. The representative supplies only the
@@ -360,8 +420,11 @@ impl UserContext {
     pub(crate) fn for_i915_placements(
         placements: crate::intel_gpu_engine::EngineSet,
         policy: Arc<CapturePolicy>,
+        priority: i32,
     ) -> Result<Arc<Self>, FsError> {
-        Self::placements_with_policy(placements, Some(policy))
+        let context = Self::placements_with_policy(placements, Some(policy))?;
+        context.set_i915_priority(priority);
+        Ok(context)
     }
 
     fn placements_with_policy(
@@ -443,7 +506,10 @@ impl UserContext {
                 last: None,
                 lost_pending: 0,
                 guilty: 0,
-                policy: (3, 1000),
+                policy: (GUC_PRIORITY_NORMAL, 1000),
+                job_policy: (GUC_PRIORITY_NORMAL, 1000),
+                queued: [0; 4],
+                staged: None,
                 low_latency: false,
             }),
         })
@@ -471,19 +537,55 @@ impl UserContext {
     /// GuC priority 1..3 and the EXECUTION_QUANTUM (0x2001) KLV value in
     /// microseconds: init_policies passes q->sched_props.timeslice_us
     /// unchanged, so the whole exec_queue_set_timeslice range reaches GuC.
+    /// Like Linux's setters it never refuses a claimed context: the policy
+    /// applies from the next registration, and a job in flight keeps the
+    /// policy it was claimed with.
     pub(crate) fn configure_schedule(&self, priority: u32, timeslice: u32) -> Result<(), FsError> {
         use crate::intel_gpu_xe::{TIMESLICE_MAX_US, TIMESLICE_MIN_US};
-        if !(1..=3).contains(&priority)
+        if !(GUC_PRIORITY_HIGH..=GUC_PRIORITY_NORMAL).contains(&priority)
             || !(TIMESLICE_MIN_US..=TIMESLICE_MAX_US).contains(&u64::from(timeslice))
         {
             return Err(FsError::InvalidData);
         }
-        let mut state = self.state.lock();
-        if state.epoch != 0 || state.busy {
-            return Err(FsError::Busy);
-        }
-        state.policy = (priority, timeslice);
+        self.state.lock().policy = (priority, timeslice);
         Ok(())
+    }
+    /// Store an i915 ctx->sched.priority (guc_context_init and add_to_context
+    /// map it through map_i915_prio_to_guc_prio). Like
+    /// i915_gem_context.c::set_priority it sends GuC nothing: requests
+    /// queued from now on carry it, and earlier ones keep their own.
+    pub(crate) fn set_i915_priority(&self, priority: i32) {
+        self.state.lock().policy.0 = map_i915_prio_to_guc_prio(priority);
+    }
+    /// The GuC priority a request queued now would carry.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn guc_priority(&self) -> u32 {
+        self.state.lock().policy.0
+    }
+    /// Queue an i915 request at the context's current priority
+    /// (rq->sched.attr from ctx->sched), counted per band until it is staged
+    /// for its claim, as add_to_context counts ce->guc_state.prio_count. It
+    /// depends on every earlier job on this timeline:
+    /// i915_scheduler.c::__i915_schedule bumps them to its priority, and
+    /// guc_bump_inflight_request_prio raises a job's GuC priority only when
+    /// the band is higher (a lower value), so no job is ever demoted. A job
+    /// in flight takes the raise now; one not yet claimed takes it at claim.
+    pub(crate) fn queue_request(self: &Arc<Self>) -> QueuedRequest {
+        let band = {
+            let mut state = self.state.lock();
+            let band = state.policy.0;
+            let count = &mut state.queued[band as usize];
+            *count = count.saturating_add(1);
+            if state.busy && band < state.job_policy.0 {
+                state.job_policy.0 = band;
+            }
+            band
+        };
+        QueuedRequest {
+            context: self.clone(),
+            band,
+            staged: false,
+        }
     }
     /// Configure only before this unpublished context has ever been claimed.
     /// No runtime ioctl mutates this create-only flag.
@@ -502,7 +604,7 @@ impl UserContext {
     pub(crate) fn request_ban(&self) {
         self.state.lock().banned = true;
     }
-    #[cfg(feature = "kernel-test")]
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn busy(&self) -> bool {
         self.state.lock().busy
     }
@@ -565,6 +667,16 @@ impl UserContext {
             return Err(io_error());
         }
         state.busy = true;
+        // The staged i915 request's own band, raised by every request queued
+        // behind it (update_context_prio takes the highest band counted);
+        // any other claim takes the stored policy.
+        let own = state.staged.take().unwrap_or(state.policy.0);
+        let behind = state
+            .queued
+            .iter()
+            .position(|count| *count != 0)
+            .map_or(own, |band| band as u32);
+        state.job_policy = (own.min(behind), state.policy.1);
         Ok(ContextClaim {
             context: self.clone(),
             epoch,
@@ -576,6 +688,41 @@ impl UserContext {
 impl Drop for UserContext {
     fn drop(&mut self) {
         STATE_BYTES.fetch_sub(self.state.lock().image.len() * 4, Ordering::AcqRel);
+    }
+}
+
+/// An i915 execbuffer request between its ioctl and its claim
+/// (UserContext::queue_request).
+#[derive(Debug)]
+pub(crate) struct QueuedRequest {
+    context: Arc<UserContext>,
+    band: u32,
+    staged: bool,
+}
+impl QueuedRequest {
+    /// Before each submission attempt, with the context's `serial` held:
+    /// this request is the one the next claim takes, at its own band raised
+    /// by the requests still queued behind it.
+    pub(crate) fn stage(&mut self) {
+        let mut state = self.context.state.lock();
+        if !self.staged {
+            let count = &mut state.queued[self.band as usize];
+            *count = count.saturating_sub(1);
+            self.staged = true;
+        }
+        state.staged = Some(self.band);
+    }
+}
+impl Drop for QueuedRequest {
+    /// An unstaged request that fails or is abandoned stops counting. A
+    /// staged band that no claim took is replaced by the next request's
+    /// stage before any later claim.
+    fn drop(&mut self) {
+        if !self.staged {
+            let mut state = self.context.state.lock();
+            let count = &mut state.queued[self.band as usize];
+            *count = count.saturating_sub(1);
+        }
     }
 }
 
@@ -641,9 +788,14 @@ impl UserJob {
             .as_ref()
             .is_some_and(|policy| policy.protected())
     }
+    /// GuC priority, execution quantum and low-latency intent of this job.
     pub(crate) fn policy(&self) -> (u32, u32, bool) {
         let state = self.context.state.lock();
-        (state.policy.0, state.policy.1, state.low_latency)
+        (state.job_policy.0, state.job_policy.1, state.low_latency)
+    }
+    /// This job's current GuC priority, raised by later submissions.
+    pub(crate) fn priority(&self) -> u32 {
+        self.context.state.lock().job_policy.0
     }
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.

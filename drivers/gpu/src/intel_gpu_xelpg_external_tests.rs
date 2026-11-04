@@ -2491,8 +2491,8 @@ fn dsc_monitor(fec: bool) -> Sink {
 
 fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
     use crate::intel_gpu_xelpg_dsc::{
-        decide_dp, DpDscSink, DscDpcd, DscSink, LinkLimits, DP_TP_CTL_FEC_ENABLE,
-        DP_TP_STATUS_FEC_ENABLE_LIVE,
+        decide_dp, DpDscSink, DscDpcd, DscSink, LinkDecision, LinkLimits, DP_TP_CTL_FEC_ENABLE,
+        DP_TP_STATUS_FEC_ENABLE_LIVE, PIPE_BPP,
     };
     // 594 MHz needs 1782000 kBps at 24 bpp and 1336500 at 18; one HBR3
     // lane carries 810000. Linux compresses with FEC: 169/16 bpp, two
@@ -2511,7 +2511,12 @@ fn smoke_mtl_external_dp_dsc_with_fec_lights_and_stops() -> TestResult {
         },
         branch: false,
     };
-    let Ok(Some(plan)) = decide_dp(&sink, &LinkLimits::standard(810_000, 1), &probe.mode) else {
+    let Ok(LinkDecision::Dsc(plan)) = decide_dp(
+        &sink,
+        &LinkLimits::standard(810_000, 1),
+        &probe.mode,
+        PIPE_BPP,
+    ) else {
         return TestResult::Fail("the monitor must need DSC");
     };
     if probe.dsc != Some(plan)
@@ -2623,14 +2628,17 @@ fn smoke_mtl_external_dp_dsc_refusals_precede_programming() -> TestResult {
     {
         return TestResult::Fail("a sink without FEC must refuse DSC at probe");
     }
-    // Two HBR3 lanes carry 18 bpp: Linux's 6 bpc, not this pipe's.
+    // Two HBR3 lanes carry 18 bpp: Linux drives 6 bpc uncompressed before
+    // it tries DSC (intel_dp_compute_link_config_wide's bpp descent).
     let mut sink = dsc_monitor(true);
     sink.caps[2] = 2 | 0x40 | 0x80;
     let io = ExtFake::new(XeLpgPort::B, sink);
-    if probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false).err()
-        != Some(ExternalError::Dsc(DscRefusal::SixBpcUnqualified))
-    {
-        return TestResult::Fail("an 18 bpp fit must refuse as unqualified");
+    match probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+        Ok(probe)
+            if probe.dsc.is_none()
+                && probe.pipe_bpp == 18
+                && (probe.negotiated.rate, probe.negotiated.lanes) == (TrainRate::Hbr3, 2) => {}
+        _ => return TestResult::Fail("an 18 bpp fit must take 6 bpc before DSC"),
     }
     // A sink that does not decompress keeps the uncompressed refusal.
     let mut sink = dsc_monitor(true);
@@ -2656,6 +2664,79 @@ fn smoke_mtl_external_dp_dsc_refusals_precede_programming() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dp_dsc_refusals_precede_programming
+);
+
+fn smoke_mtl_external_dp_six_bpc_route_from_edid_bpc() -> TestResult {
+    use crate::intel_gpu_xelpg_dsc::link_m_n;
+    // An EDID 1.4 digital 6 bpc 1080p sink on HBR2 x4: compute_sink_pipe_bpp
+    // limits the pipe to 18 bpp, and intel_dp_compute_link_config_wide
+    // takes the slowest, narrowest link carrying 334125 kBps: RBR x4.
+    let mut edid = edid_1080();
+    edid[20] = 0x90;
+    edid[127] = edid[127].wrapping_sub(0x90);
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid));
+    let probe = match probe_sink(&io, Generation::MeteorLake, XeLpgPort::B, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the 6 bpc sink must probe"),
+    };
+    if probe.pipe_bpp != 18
+        || probe.dsc.is_some()
+        || (probe.negotiated.rate, probe.negotiated.lanes) != (TrainRate::Rbr, 4)
+    {
+        return TestResult::Fail("the probe must take 18 bpp on Linux's RBR x4");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the 6 bpc route must light"),
+    };
+    // TRANS_DDI_FUNC_CTL BPC_6, the Pipes owner's dithered PIPE_MISC, the
+    // 6 bpc MSA and intel_link_compute_m_n at 18 bpp, TU 64.
+    let mn = link_m_n(18 * 16, 4, 148_500, 162_000, false);
+    if io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != 2 << 20
+        || io.writes_to(0x7_1030) != [0x150]
+        || io.writes_to(0x6_1410) != [0x01]
+        || io.writes_to(0x6_1030) != [mn[0]]
+        || io.writes_to(0x6_1044) != [mn[3]]
+    {
+        return TestResult::Fail("Pipe B must run 6 bpc with its MSA and M/N");
+    }
+    // The MSA follows the normal pattern and precedes TRANSCONF.
+    let writes = io.writes.borrow().clone();
+    let pos = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(o, v)| f(o, v));
+    match (
+        pos(&|o, v| o == DP_TP_CTL_B && v & (7 << 8) == 3 << 8),
+        pos(&|o, _| o == 0x6_1410),
+        pos(&|o, v| o == PIPECONF_B && v & ENABLE != 0),
+    ) {
+        (Some(n), Some(m), Some(e)) if n < m && m < e => {}
+        _ => return TestResult::Fail("intel_ddi_set_dp_msa must end the pre-enable"),
+    }
+    // The stop leaves the MSA at 8 bpc for the next route.
+    if route.stop(&io).is_err()
+        || route.state() != RouteState::Stopped
+        || io.read32(0x6_1410) != 0x21
+    {
+        return TestResult::Fail("the 6 bpc route must stop and restore an 8 bpc MSA");
+    }
+    // An 8 bpc sink on the same port keeps the existing route: no MSA write
+    // and PIPE_MISC BPC_8.
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid_1080()));
+    match live_route(&io, XeLpgPort::B) {
+        Ok(route) if route.probe.pipe_bpp == 24 => {}
+        _ => return TestResult::Fail("the 8 bpc sink must light at 24 bpp"),
+    }
+    if !io.writes_to(0x6_1410).is_empty()
+        || io.writes_to(0x7_1030) != [0x100]
+        || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != 0
+    {
+        return TestResult::Fail("the 8 bpc route must keep its write stream");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_six_bpc_route_from_edid_bpc
 );
 
 fn smoke_mtl_external_route_arm_runs_inside_irq_masked_evasion() -> TestResult {

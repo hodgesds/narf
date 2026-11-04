@@ -1608,6 +1608,9 @@ mod tests {
         // Every PC_SLPC_REQUEST (0x3003) and SETUP_PC_GUCRC (0x3004) the
         // model's CT consumed, action word first, in order.
         slpc_h2g: Vec<Vec<u32>>,
+        // Every priority-only UPDATE_CONTEXT_POLICIES the model's CT
+        // consumed, as (GuC context id, priority), in order.
+        priority_updates: Vec<(u32, u32)>,
         profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,

@@ -88,6 +88,11 @@ struct State {
     power_ready: u64,
     /// User epoch to continue after a runtime resume (clean idle stop only).
     parked_epoch: Option<(u64, crate::intel_gpu_engine::EngineSet, (u8, u8))>,
+    /// CPU access to local memory while runtime-suspended: the LMEM BAR's
+    /// user mappings revoked and kernel access closed. Ended when a resumed
+    /// GT is published running again (xe_pm_runtime_suspend's
+    /// vram_userfault release and __xe_bo_cpu_fault's resume).
+    vram_cpu: Option<VramCpuRevocation>,
     /// The SLPC outcome of this GT incarnation has been logged.
     slpc_reported: bool,
     /// Immutable boot choice initially; changed only by a client-free reset
@@ -193,7 +198,70 @@ struct Pending {
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
     smallbar: bool,
+    /// Installed by the opted-in Lunar Lake display-20 route after its owned
+    /// modeset (`narf.intel.lnl_display=1`): the display-preserving profile.
+    lnl_display: bool,
+    /// Installed by the opted-in Panther Lake display-30 route after its
+    /// owned modeset (`narf.intel.ptl_display=1`): the display-preserving
+    /// profile.
+    ptl_display: bool,
     window: AuthorizedWindow,
+}
+
+/// The integrated Xe2/Xe3 GT profile of one function (§17 10.5).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LnlProfile {
+    /// Headless main GT: client-free cold start through a driver FLR, which
+    /// also resets display and stolen memory. Unchanged by the display route.
+    Headless,
+    /// Lunar Lake display-20 function: the route's lit panel is preserved.
+    /// No driver FLR; `lnl::Receipt::admit_display`, then the GT-only reset
+    /// `HardwareInit` runs before the first PTE.
+    DisplayPreserving,
+}
+
+/// Select the integrated GT profile. `None` is either not an integrated
+/// Xe2/Xe3 profile or a refused combination (a display route on anything but
+/// Lunar Lake, or one without a lit panel mode).
+pub(crate) fn lnl_profile(
+    platform: GtPlatform,
+    lnl_display: bool,
+    has_mode: bool,
+) -> Option<LnlProfile> {
+    if !platform.is_headless_integrated() {
+        return None;
+    }
+    match (lnl_display, platform.is_lnl() && has_mode) {
+        (false, _) => Some(LnlProfile::Headless),
+        (true, true) => Some(LnlProfile::DisplayPreserving),
+        (true, false) => None,
+    }
+}
+
+/// [`lnl_profile`] for the Panther Lake display-30 route: the
+/// display-preserving profile only for Panther Lake with the route and a lit
+/// mode; `Headless` for every other LNL/PTL function. Lunar Lake's
+/// selection is [`lnl_profile`]'s, unchanged.
+pub(crate) fn ptl_profile(
+    platform: GtPlatform,
+    ptl_display: bool,
+    has_mode: bool,
+) -> Option<LnlProfile> {
+    if !platform.is_headless_integrated() {
+        return None;
+    }
+    match (ptl_display, platform.is_ptl() && has_mode) {
+        (false, _) => Some(LnlProfile::Headless),
+        (true, true) => Some(LnlProfile::DisplayPreserving),
+        (true, false) => None,
+    }
+}
+
+/// The display-preserving profile is D0-only: system suspend would lose the
+/// panel's GGTT surface and display-20 relight is not owned, so suspend is
+/// refused (the BMG small-BAR profile's precedent).
+pub(crate) fn system_suspend_admitted(smallbar: bool, lnl_display: bool) -> bool {
+    !smallbar && !lnl_display
 }
 
 struct Owner {
@@ -238,6 +306,16 @@ struct Backend {
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
+    fn cpu_vram_wakeref(&self) -> narf_filesystem::FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let awake = owner.vram_wakeref().await?;
+            Ok(Box::new(awake) as Box<dyn core::any::Any + Send>)
+        })
+    }
     fn reset_availability_epoch(&self) -> Option<u64> {
         let owner = self.owner.upgrade()?;
         if owner.suspended.load(Ordering::Acquire) {
@@ -932,6 +1010,18 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     fn native_xe(&self) -> bool {
         true
     }
+    fn display_preserving(&self) -> bool {
+        self.owner.upgrade().is_some_and(|owner| {
+            lnl_profile(
+                self.platform,
+                owner.pending.lnl_display,
+                owner.pending.mode.is_some(),
+            ) == Some(LnlProfile::DisplayPreserving)
+                || (owner.pending.ptl_display
+                    && ptl_profile(self.platform, true, owner.pending.mode.is_some())
+                        == Some(LnlProfile::DisplayPreserving))
+        })
+    }
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
         *self.facts.lock()
     }
@@ -1208,6 +1298,44 @@ impl Drop for Awake {
     }
 }
 
+/// Local memory closed to the CPU for a runtime suspend: kernel BAR access
+/// refused and every user mapping of the BAR window revoked. Dropping it
+/// ends the user revocation, then reopens kernel access.
+struct VramCpuRevocation {
+    pool: Arc<crate::intel_gpu_vram::Vram>,
+    revocation: Option<narf_filesystem::mmap_relocation::DeviceFrameRevocation>,
+}
+impl Drop for VramCpuRevocation {
+    fn drop(&mut self) {
+        drop(self.revocation.take());
+        self.pool.open_cpu_access();
+    }
+}
+
+/// `__xe_bo_cpu_fault` for a revoked VRAM mapping: take a runtime-PM
+/// reference, which resumes the function, and wait until the resumed GT is
+/// published running; that publication drops the revocation first, so the
+/// retried access maps the same frame. A failed resume is `Bus` (SIGBUS),
+/// as xe reports a lost device.
+struct VramRefault(Weak<Owner>);
+impl narf_filesystem::mmap_relocation::DeviceFrameRefault for VramRefault {
+    fn refault(
+        &self,
+        _phys: narf_memory::PhysAddr,
+    ) -> narf_filesystem::mmap_relocation::DeviceRefaultFuture {
+        let owner = self.0.clone();
+        Box::pin(async move {
+            use narf_filesystem::mmap_relocation::DeviceRefaultError;
+            let owner = owner.upgrade().ok_or(DeviceRefaultError::Bus)?;
+            owner
+                .vram_wakeref()
+                .await
+                .map(drop)
+                .map_err(|_| DeviceRefaultError::Bus)
+        })
+    }
+}
+
 static PENDING: IrqSafeSpinLock<Vec<Pending>> = IrqSafeSpinLock::new(Vec::new());
 static OWNERS: IrqSafeSpinLock<Vec<Arc<Owner>>> = IrqSafeSpinLock::new(Vec::new());
 
@@ -1220,6 +1348,58 @@ pub(crate) fn install(
     cap: Cap<BusDeviceCap, Write>,
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
+) -> bool {
+    install_profile(index, card, device, cap, bar, mode, false, false)
+}
+
+/// The Lunar Lake display-20 route's GT owner: the display-preserving
+/// profile beside the route's lit panel `mode`. Refused for anything that is
+/// not Lunar Lake with a lit mode.
+pub(crate) fn install_lnl_display(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+) -> bool {
+    let profile = GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(|platform| lnl_profile(platform, true, mode.is_some()));
+    if profile != Some(LnlProfile::DisplayPreserving) {
+        return false;
+    }
+    install_profile(index, card, device, cap, bar, mode, true, false)
+}
+
+/// The Panther Lake display-30 route's GT owner: the display-preserving
+/// profile beside the route's lit panel `mode`. Refused for anything that is
+/// not Panther Lake with a lit mode.
+pub(crate) fn install_ptl_display(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+) -> bool {
+    let profile = GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(|platform| ptl_profile(platform, true, mode.is_some()));
+    if profile != Some(LnlProfile::DisplayPreserving) {
+        return false;
+    }
+    install_profile(index, card, device, cap, bar, mode, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_profile(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+    lnl_display: bool,
+    ptl_display: bool,
 ) -> bool {
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
@@ -1250,6 +1430,8 @@ pub(crate) fn install(
         bar,
         mode,
         smallbar,
+        lnl_display,
+        ptl_display,
         window,
     });
     true
@@ -1332,6 +1514,7 @@ pub(crate) fn start_pending() {
                 saved: None,
                 power_ready: 0,
                 parked_epoch: None,
+                vram_cpu: None,
                 slpc_reported: false,
                 ccs_mode: ccs_boot_mode(narf_boot::args()),
                 lnl_flr: None,
@@ -1660,6 +1843,47 @@ impl Owner {
                 GgttArena::for_smallbar_gt(p.bar, mmio.clone(), authority)
                     .map_err(|_| RuntimeError::State)?,
             )
+        } else if lnl_profile(platform, p.lnl_display, p.mode.is_some())
+            == Some(LnlProfile::DisplayPreserving)
+        {
+            // §17 10.5: never the headless driver FLR, which would reset the
+            // route's lit panel. Each cold start re-admits from current
+            // hardware; HardwareInit's GT-only reset precedes every PTE. The
+            // boot framebuffer and any KMS display stay live, so neither the
+            // headless boot-scanout exclusion nor its client gate applies.
+            if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
+                return Err(RuntimeError::Configuration);
+            }
+            let receipt =
+                crate::intel_gpu_gt::lnl::Receipt::admit_display(p.device, p.bar, &mmio, || {
+                    validate_pci(p, &mmio).is_ok()
+                })
+                .map_err(RuntimeError::Takeover)?;
+            SharedArena::new(
+                GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
+                    .map_err(|_| RuntimeError::State)?,
+            )
+        } else if p.ptl_display
+            && ptl_profile(platform, true, p.mode.is_some()) == Some(LnlProfile::DisplayPreserving)
+        {
+            // The Panther Lake display-30 route: the same display-preserving
+            // cold start, admitted against display 30.00.
+            if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
+                return Err(RuntimeError::Configuration);
+            }
+            let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_ptl(
+                p.device,
+                p.bar,
+                &mmio,
+                || validate_pci(p, &mmio).is_ok(),
+            )
+            .map_err(RuntimeError::Takeover)?;
+            SharedArena::new(
+                GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
+                    .map_err(|_| RuntimeError::State)?,
+            )
+        } else if p.lnl_display || p.ptl_display {
+            return Err(RuntimeError::Configuration);
         } else if platform.is_headless_integrated() {
             if self.user_epoch.load(Ordering::Acquire) != 0
                 || p.mode.is_some()
@@ -2337,6 +2561,9 @@ impl Owner {
                                     log_incarnation,
                                 );
                                 state.parked_epoch = None;
+                                // Local memory reopens before Running is
+                                // observable: refault waiters see it ended.
+                                drop(state.vram_cpu.take());
                                 state.phase = Phase::Running;
                                 if let Some(clients) = state.lnl_clients.take() {
                                     clients.release();
@@ -2941,12 +3168,14 @@ impl Owner {
     }
 
     /// Runtime suspend: refuse unless the GT is running and provably idle,
-    /// no VRAM object exists (CPU BAR mappings cannot be revoked), no
-    /// display wakeref is held and no system sleep owns the function
-    /// ([`display_rpm::park_refusal`]; system-memory CPU mappings never
-    /// refuse). Then stop the GT exactly as for reset, keeping the user
-    /// epoch published for the resume.
-    async fn park(&self) -> Result<(), RpmError> {
+    /// no display wakeref is held and no system sleep owns the function.
+    /// Local memory stays allocated (D3hot preserves it), but the LMEM BAR does
+    /// not decode outside D0, so kernel CPU access closes and every user CPU
+    /// mapping of the BAR is revoked first (xe_pm_runtime_suspend's
+    /// vram_userfault release); a later CPU access refaults through runtime resume.
+    /// Then stop the GT exactly as for reset, keeping the user epoch published
+    /// for the resume. Every refusal below leaves the function in D0 with CPU access open.
+    async fn park(self: &Arc<Self>) -> Result<(), RpmError> {
         let mut state = self.state.lock().await;
         // xe_display_pm_runtime_suspend{,_late}: the display wakerefs already
         // kept the RPM core from calling here; re-read the holds (lit pipes,
@@ -2957,17 +3186,14 @@ impl Owner {
             None
         };
         let local = self.pending.card.intel_vram_used();
-        if display_rpm::park_refusal(
-            self.suspended.load(Ordering::Acquire),
-            state.phase == Phase::Running,
-            self.profile,
-            local,
-            display,
-        )
-        .is_some()
+        if self.suspended.load(Ordering::Acquire)
+            || state.phase != Phase::Running
+            || !self.autosuspend_eligible()
+            || display.is_some()
         {
             return Err(RpmError::Busy);
         }
+        let vram_cpu = self.close_vram_cpu().map_err(|()| RpmError::Busy)?;
         // The media GuC shares GT0's GGTT: prove its stop before GT0 parks.
         // A refusal leaves GT0 running; an unproven stop forbids D3.
         if !self.stop_media(&mut state).await {
@@ -3010,6 +3236,7 @@ impl Owner {
         // Verified stopped: reclaim its GGTT owners before D3hot.
         state.gt.take();
         state.parked_epoch = Some((epoch, engines, compute));
+        state.vram_cpu = vram_cpu;
         state.phase = Phase::Parked;
         if self.display_profile() {
             // The DMC program and DC target stay across D3hot; the first
@@ -3029,6 +3256,45 @@ impl Owner {
             &alloc::format!("runtime suspended (idle) to D3hot; D3cold {d3cold:?}"),
         );
         Ok(())
+    }
+
+    /// Close this card's local memory to the CPU for a runtime suspend:
+    /// refuse kernel BAR access (refused while one is in flight), then revoke
+    /// the BAR window's user mappings (refused while a fork or an unseen
+    /// alias is in flight). `None` without a published VRAM pool.
+    fn close_vram_cpu(self: &Arc<Self>) -> Result<Option<VramCpuRevocation>, ()> {
+        let Some(pool) = crate::drm_registry::DrmCard::intel_vram(&*self.pending.card) else {
+            return Ok(None);
+        };
+        if !pool.close_cpu_access() {
+            return Err(());
+        }
+        let mut closed = VramCpuRevocation {
+            pool,
+            revocation: None,
+        };
+        let (start, len) = closed.pool.cpu_window();
+        let refault = Arc::new(VramRefault(Arc::downgrade(self)));
+        // On refusal `closed` drops here and reopens kernel access.
+        closed.revocation = Some(
+            crate::intel_gpu_gem::cpu_mapping::revoke_window(start, len, refault)
+                .map_err(|_| ())?,
+        );
+        Ok(Some(closed))
+    }
+
+    /// A runtime-PM reference under which this card's LMEM BAR is CPU
+    /// accessible: the function is in D0 and any runtime-resume bring-up has
+    /// finished, its publication having reopened local memory. A resume that
+    /// failed leaves local memory closed: `NoDevice`.
+    async fn vram_wakeref(&self) -> Result<Awake, narf_filesystem::FsError> {
+        let awake = Awake::take(self).await?;
+        let state = self.lock_running().await;
+        if state.vram_cpu.is_some() {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        drop(state);
+        Ok(awake)
     }
 
     /// Runtime resume: the PCI layer restored D0 and config space; restart
@@ -3127,7 +3393,10 @@ impl Owner {
 impl narf_power::device_pm::DevicePmOps for Owner {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
         use narf_power::device_pm::DeviceSuspendError as E;
-        if self.pending.smallbar {
+        if !system_suspend_admitted(
+            self.pending.smallbar,
+            self.pending.lnl_display || self.pending.ptl_display,
+        ) {
             return Err(E::Busy);
         }
         let state = self.state.try_lock().ok_or(E::Busy)?;
@@ -3153,8 +3422,13 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
             // Initial opted-in whole-device incarnation is deliberately D0-only.
-            // No repeated driver-FLR may wipe retained BO/fd/VM state.
-            if self.pending.smallbar {
+            // No repeated driver-FLR may wipe retained BO/fd/VM state. The
+            // Lunar Lake display-20 profile is D0-only as well: display-20
+            // relight after S3 is not owned; neither is display-30 relight.
+            if !system_suspend_admitted(
+                self.pending.smallbar,
+                self.pending.lnl_display || self.pending.ptl_display,
+            ) {
                 return Err(E::Busy);
             }
             // pci_pm_suspend runtime-resumes a suspended function before the
@@ -3455,6 +3729,57 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_compute_boot_selection_is_unambiguous_and_immutable
+    );
+
+    /// The runtime-suspend local-memory guard reopens the pool when it ends,
+    /// whether or not a user revocation was taken, and a refault whose owner
+    /// is gone fails (SIGBUS) instead of waiting.
+    fn smoke_gt_vram_cpu_revocation_reopens_pool_and_orphan_refault_fails() -> TestResult {
+        use crate::intel_gpu_vram::{Vram, VramLayout};
+        use core::task::{Context, Poll};
+        use narf_filesystem::mmap_relocation::{DeviceFrameRefault, DeviceRefaultError};
+        let frame = match narf_memory::frame::alloc_pages_on(0, 4) {
+            Ok(frame) => frame,
+            Err(_) => return TestResult::Skip("64 KiB fixture allocation"),
+        };
+        let bar = narf_bus::bar::MmioRegion {
+            phys: frame.start_address(),
+            virt: frame.start_address().kernel_mut_ptr::<u8>() as u64,
+            len: 65536,
+            kind: narf_bus::bar::BarKind::Mmio64 { prefetchable: true },
+        };
+        // SAFETY: private fixture RAM stands in for one exclusively owned BAR.
+        let pool = unsafe {
+            Vram::new(
+                bar,
+                VramLayout {
+                    tile_size: 65536,
+                    tile_offset: 0,
+                    usable: 65536,
+                },
+            )
+        }
+        .unwrap();
+        assert!(pool.close_cpu_access());
+        let guard = VramCpuRevocation {
+            pool: pool.clone(),
+            revocation: None,
+        };
+        assert!(pool.cpu_access().is_none());
+        drop(guard);
+        assert!(pool.cpu_access().is_some());
+        let mut refault = VramRefault(Weak::new()).refault(bar.phys);
+        let outcome = refault
+            .as_mut()
+            .poll(&mut Context::from_waker(core::task::Waker::noop()));
+        assert_eq!(outcome, Poll::Ready(Err(DeviceRefaultError::Bus)));
+        drop(pool);
+        narf_memory::frame::free_pages(frame, 4);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_gt_vram_cpu_revocation_reopens_pool_and_orphan_refault_fails
     );
 
     fn smoke_gt_private_startup_probes_cover_every_sparse_physical_engine() -> TestResult {

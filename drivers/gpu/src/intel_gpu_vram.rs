@@ -156,11 +156,32 @@ pub struct Vram {
     unmapped: Option<UnmappedPool>,
     grant: Option<Arc<crate::intel_gpu_gt::smallbar::DpaGrant>>,
     allocation_gate: IrqSafeSpinLock<()>,
+    /// Kernel CPU access to the LMEM BAR. The GT owner closes it before the
+    /// function may leave D0 (the BAR does not decode in D3) and reopens it
+    /// once a resumed GT is running again.
+    cpu_gate: IrqSafeSpinLock<CpuGate>,
     pub layout: VramLayout,
     /// LMEM BAR physical base: device address `d` is CPU address `bar + d`
     /// (xe_vram.c dpa_base 0, io_start + tile offset).
     bar: u64,
     page_size: u64,
+}
+
+#[derive(Debug, Default)]
+struct CpuGate {
+    closed: bool,
+    users: usize,
+}
+
+/// One kernel CPU access to a pool's LMEM BAR; the pool cannot be closed for
+/// runtime suspend while it lives.
+#[derive(Debug)]
+pub(crate) struct CpuAccess<'a>(&'a Vram);
+
+impl Drop for CpuAccess<'_> {
+    fn drop(&mut self) {
+        self.0.cpu_gate.lock().users -= 1;
+    }
 }
 
 impl Vram {
@@ -220,6 +241,7 @@ impl Vram {
             unmapped: None,
             grant: None,
             allocation_gate: IrqSafeSpinLock::new(()),
+            cpu_gate: IrqSafeSpinLock::new(CpuGate::default()),
             layout,
             bar: bar.phys.raw(),
             page_size,
@@ -309,6 +331,39 @@ impl Vram {
         self.usage().0
     }
 
+    /// The CPU physical window every visible allocation's frames lie in:
+    /// `[bar, bar + tile_offset + visible)`.
+    pub(crate) fn cpu_window(&self) -> (u64, u64) {
+        (self.bar, self.layout.tile_offset + self.visible())
+    }
+
+    /// Admit one kernel CPU access to the BAR, or `None` while the GT owner
+    /// has closed it for runtime suspend.
+    pub(crate) fn cpu_access(&self) -> Option<CpuAccess<'_>> {
+        let mut gate = self.cpu_gate.lock();
+        if gate.closed {
+            return None;
+        }
+        gate.users += 1;
+        Some(CpuAccess(self))
+    }
+
+    /// Close kernel CPU access before the function may leave D0. Refused
+    /// (`false`, nothing changed) while an access is in flight.
+    pub(crate) fn close_cpu_access(&self) -> bool {
+        let mut gate = self.cpu_gate.lock();
+        if gate.users != 0 {
+            return false;
+        }
+        gate.closed = true;
+        true
+    }
+
+    /// Reopen kernel CPU access once the function is in D0 with a running GT.
+    pub(crate) fn open_cpu_access(&self) {
+        self.cpu_gate.lock().closed = false;
+    }
+
     /// Reserve `size` bytes without accessing the BAR. The returned device
     /// range is exclusive, but its prior contents are not yet initialized.
     pub fn allocate(self: &Arc<Self>, size: u64) -> Result<VramAllocation, FsError> {
@@ -378,6 +433,10 @@ impl VramAllocation {
     }
     pub(crate) fn requires_ccs_clear(&self) -> bool {
         self.vram.requires_ccs_clear()
+    }
+    /// See [`Vram::cpu_access`].
+    pub(crate) fn cpu_access(&self) -> Option<CpuAccess<'_>> {
+        self.vram.cpu_access()
     }
     fn reservation(&self) -> &LocalRange {
         self.reservation.as_ref().expect("live VRAM reservation")

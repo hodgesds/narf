@@ -599,7 +599,7 @@ fn smoke_i915_xe_shared_wb_reservations_syncobjs_and_private_vm_lifetimes() -> T
     assert!(context.busy() && legacy.result().is_none());
     assert!(weak.iter().all(|object| object.upgrade().is_some()));
     let mut registered = BTreeMap::new();
-    finish_policy(&mut gt, &w, &legacy, &mut registered, 601, 3);
+    finish(&mut gt, &w, &legacy, &mut registered, 601);
     assert!(output.is_signalled());
     assert!(!context.busy());
     assert_eq!(context.reset_stats(), (0, 0));
@@ -758,7 +758,8 @@ fn smoke_i915_xe_exact_dispatch_discovery_sseu_and_wc_refusal() -> TestResult {
             (33, topology.dss_count()),
             (34, topology.eu_count()),
             (51, 25_000_000),
-            (41, u32::from(live)),
+            // I915_SCHEDULER_CAP_ENABLED | I915_SCHEDULER_CAP_PRIORITY.
+            (41, if live { 3 } else { 0 }),
         ] {
             let mut wire = [0; 16];
             put32(&mut wire, 0, parameter);

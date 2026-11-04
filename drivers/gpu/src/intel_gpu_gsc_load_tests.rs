@@ -1064,3 +1064,88 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gsc_er_complete_wedges_only_on_an_expired_timer
 );
+
+struct TestGscOps {
+    connected: core::sync::atomic::AtomicBool,
+    sent: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+}
+
+impl narf_drivers::gsc_proxy::GscProxyOps for TestGscOps {
+    fn send(&self, message: &[u8]) -> Result<usize, i32> {
+        self.sent.lock().push(message.to_vec());
+        Ok(message.len())
+    }
+    fn recv(&self, buffer: &mut [u8]) -> Result<usize, i32> {
+        if buffer.len() >= 4 {
+            buffer[..4].copy_from_slice(&[1, 2, 3, 4]);
+            Ok(4)
+        } else {
+            Err(-28) // ENOSPC
+        }
+    }
+    fn connected(&self) -> bool {
+        self.connected.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The MEI↔GSC join: pull registration from narf_drivers::gsc_proxy,
+/// verify liveness, send/recv routing, rebind on generation change, and unbind.
+fn smoke_media_gsc_proxy_registered_mei_binding() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::Ordering;
+
+    narf_drivers::gsc_proxy::__reset_for_test();
+    let _ = unregister_csme_proxy();
+
+    let test_ops = Arc::new(TestGscOps {
+        connected: core::sync::atomic::AtomicBool::new(true),
+        sent: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+    });
+
+    let gen1 = narf_drivers::gsc_proxy::register_master(narf_drivers::gsc_proxy::GscProxyMaster {
+        name: "test_mei_gsc_proxy",
+        matches: |disp| disp.vendor == 0x8086 && disp.bus == 0,
+        ops: test_ops.clone(),
+    });
+
+    kt_assert!(csme_bound());
+    let sent_len = with_csme(|csme| {
+        let csme = csme.expect("csme must be bound");
+        csme.send(b"ping csme")
+    });
+    kt_assert_eq!(sent_len, Ok(9));
+    kt_assert_eq!(test_ops.sent.lock().as_slice(), &[b"ping csme".to_vec()]);
+
+    let mut recv_buf = [0u8; 16];
+    let recv_len = with_csme(|csme| {
+        let csme = csme.expect("csme must be bound");
+        csme.recv(&mut recv_buf)
+    });
+    kt_assert_eq!(recv_len, Ok(4));
+    kt_assert_eq!(&recv_buf[..4], &[1, 2, 3, 4]);
+
+    // Disconnect: client no longer connected, lookup returns None, unbinds.
+    test_ops.connected.store(false, Ordering::Release);
+    kt_assert!(!csme_bound());
+
+    // Reconnect with new generation: treated as a rebind.
+    test_ops.connected.store(true, Ordering::Release);
+    let gen2 = narf_drivers::gsc_proxy::register_master(narf_drivers::gsc_proxy::GscProxyMaster {
+        name: "test_mei_gsc_proxy_2",
+        matches: |disp| disp.vendor == 0x8086 && disp.bus == 0,
+        ops: test_ops.clone(),
+    });
+    kt_assert!(gen2 > gen1);
+    kt_assert!(csme_bound());
+
+    // Unregister master: cleanly unbinds.
+    narf_drivers::gsc_proxy::unregister_master(gen2);
+    kt_assert!(!csme_bound());
+
+    narf_drivers::gsc_proxy::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gsc_proxy_registered_mei_binding
+);

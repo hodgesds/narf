@@ -22,6 +22,8 @@ use core::cell::Cell;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "device_revoke.rs"]
+mod device_revoke;
 #[path = "region_index.rs"]
 mod region_index;
 #[path = "remote_access.rs"]
@@ -29,6 +31,11 @@ mod remote_access;
 #[path = "shared_relocation.rs"]
 mod shared_relocation;
 use crate::region_backing::RegionBacking;
+pub use device_revoke::{
+    install_refault_wait, is_revoked as is_device_frame_revoked, revoke_device_frames,
+    DeviceAliasCensus, DeviceFrameRefault, DeviceFrameRevocation, DeviceRefaultError,
+    DeviceRefaultFuture, DeviceRefaultWait, MAX_DEVICE_REVOCATIONS,
+};
 use region_index::RegionIndex;
 pub use remote_access::{RemoteAccess, RemoteBuf};
 pub use shared_relocation::with_revoked_shared_frames;
@@ -211,20 +218,37 @@ fn retain_shared_frames(region: &Region) {
 /// zeroed. Leaf installers treat a zero slot as lazy and leave it unmapped,
 /// so a guarded SHARED page — which keeps its borrowed frame until
 /// MADV_GUARD_REMOVE — is never mapped again by materialize or mprotect.
+/// In a SHARED region (`shared`) a frame of a live device revocation is
+/// zeroed too: it is mapped again only by a fault after the revocation ends.
 fn guard_masked<'a>(
     guards: &BTreeSet<u64>,
     base: u64,
     slots: &'a [PhysAddr],
+    shared: bool,
 ) -> alloc::borrow::Cow<'a, [PhysAddr]> {
     let end = base.saturating_add((slots.len() as u64) << 12);
-    if guards.range(base..end).next().is_none() {
-        return alloc::borrow::Cow::Borrowed(slots);
+    let masked = if guards.range(base..end).next().is_none() {
+        alloc::borrow::Cow::Borrowed(slots)
+    } else {
+        let mut masked = slots.to_vec();
+        for &page in guards.range(base..end) {
+            masked[((page - base) >> 12) as usize] = PhysAddr::new(0);
+        }
+        alloc::borrow::Cow::Owned(masked)
+    };
+    if shared {
+        device_revoke::masked(masked)
+    } else {
+        masked
     }
-    let mut masked = slots.to_vec();
-    for &page in guards.range(base..end) {
-        masked[((page - base) >> 12) as usize] = PhysAddr::new(0);
-    }
-    alloc::borrow::Cow::Owned(masked)
+}
+
+/// True when `new` removes READ or WRITE that `old` grants: the protection
+/// changes interval notifiers report, because a device mirror may no longer
+/// read, or write through, pages it collected under the old protection.
+fn access_downgrade(old: RegionPerms, new: RegionPerms) -> bool {
+    (old.contains(RegionPerms::READ) && !new.contains(RegionPerms::READ))
+        || (old.contains(RegionPerms::WRITE) && !new.contains(RegionPerms::WRITE))
 }
 
 fn release_shared_phys(phys: PhysAddr) {
@@ -1251,8 +1275,16 @@ impl Default for RegionTable {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 enum SwapPageState {
-    /// Backend write is in progress; the region still owns `phys`.
-    Evicting(PhysAddr),
+    /// A swap-out batch holds the page; the region still owns `phys`. Its
+    /// leaf may already be a committed swap entry whose backend write is in
+    /// flight, so a fault waits (retries) until the batch publishes
+    /// `Swapped` or restores the leaf, and the structural operations
+    /// (munmap, mprotect, MADV_DONTNEED, mremap, fork, migration,
+    /// `remap_page`, the OOM reaper) refuse the page. `refused` is set when
+    /// a pin or a kernel write reaches
+    /// `phys` through this metadata after the batch selected the page: the
+    /// snapshot may predate it, so publication keeps the page resident.
+    Evicting { phys: PhysAddr, refused: bool },
     /// PTE owns a swap slot and the corresponding `Region::phys` entry is 0.
     Swapped,
     /// Backend read is in progress; another fault should retry.
@@ -1310,6 +1342,20 @@ impl RegionTable {
     #[inline]
     fn invalidate_region_caches(&self) {
         self.stack_chain_cache.set(None);
+    }
+
+    /// Make an in-flight swap-out keep the page at `va`. Called, under this
+    /// lock, by every path that reaches a page's frame through `Region::phys`
+    /// to pin it or to write it through the kernel alias: while the page is
+    /// `Evicting` its leaf no longer maps the frame, the backend snapshot may
+    /// already be taken, and the batch would otherwise free the frame with
+    /// the pinned view or the store still in it. A no-op for any other state
+    /// (aarch64 never has a swap record).
+    #[inline]
+    fn refuse_swap_out(&mut self, va: u64) {
+        if let Some(SwapPageState::Evicting { refused, .. }) = self.swap_pages.get_mut(&va) {
+            *refused = true;
+        }
     }
 
     /// Test invariant: recompute [`RegionAcct`] from a full walk. Any
@@ -1916,6 +1962,9 @@ enum DemandPageClaim {
     /// observe a half-published frame because publication also takes the
     /// region lock.
     InProgress,
+    /// The page's SHARED backing frame is in a live device revocation: the
+    /// caller waits for the driver's refault with no lock held, then retries.
+    Revoked(PhysAddr),
     /// This caller owns the slow path and may leave the region lock.
     Owner {
         ticket: u64,
@@ -2019,6 +2068,20 @@ impl Drop for UserPagePin {
             UserPageOwner::Huge(frame) => crate::hugepage::free_hugepage(frame),
         }
     }
+}
+
+/// Pin markers of up to 64 consecutive backing slots (bit `i` for
+/// `slots[i]`), gathered under the region lock before a page-table walk:
+/// the walk's predicate runs under the root lock, where reading a spill pin
+/// marker (behind its own lock) is not allowed.
+#[cfg(target_arch = "x86_64")]
+fn pinned_slots_mask(slots: &[PhysAddr]) -> u64 {
+    debug_assert!(slots.len() <= 64);
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, phys)| phys.raw() != 0 && crate::frame::cow::is_pinned(**phys))
+        .fold(0, |mask, (index, _)| mask | 1 << index)
 }
 
 /// Non-owning NUMA residency summary for one registered virtual region.
@@ -2315,7 +2378,8 @@ pub enum AddressSpaceError {
     InvalidNode,
     /// The mapping borrows externally-owned backing and cannot be migrated.
     SharedMapping,
-    /// An external physical-page pin prevents migration of the backing.
+    /// An external physical-page pin, or an in-flight swap-out batch,
+    /// prevents migration of the backing (move_pages reports it -EBUSY).
     Pinned,
     /// No online, allowed node exists in a strictly slower memory tier.
     NoDemotionTarget,
@@ -2715,6 +2779,31 @@ impl AddressSpace {
         ) {
             Ok(_) => candidate,
             Err(installed) => installed,
+        }
+    }
+
+    /// Fire the interval notifiers registered on this address space over
+    /// `[start, end)` (see [`crate::mmu_notifier`]). Callers hold the mapping
+    /// lock that serializes the translation change they are making and fire
+    /// before releasing any frame that change retires.
+    #[inline]
+    fn notify_invalidate(
+        &self,
+        start: u64,
+        end: u64,
+        event: crate::mmu_notifier::MmuNotifierEvent,
+    ) {
+        if crate::mmu_notifier::active() {
+            crate::mmu_notifier::invalidate_range(self.identity(), start, end, event);
+        }
+    }
+
+    /// Fire `Release` on every interval notifier of this address space and
+    /// retire them; see [`crate::mmu_notifier`].
+    #[inline]
+    fn notify_release(&self) {
+        if crate::mmu_notifier::active() {
+            crate::mmu_notifier::release_address_space(self.identity());
         }
     }
 
@@ -4458,7 +4547,11 @@ impl AddressSpace {
         new_phys: PhysAddr,
     ) -> Result<usize, AddressSpaceError> {
         let mut regions = self.regions.lock();
-        if crate::frame::cow::is_pinned(old_phys) {
+        // A revoked device frame, old or new, gets no leaf until its refault.
+        if crate::frame::cow::is_pinned(old_phys)
+            || device_revoke::is_revoked(old_phys)
+            || device_revoke::is_revoked(new_phys)
+        {
             return Err(AddressSpaceError::Pinned);
         }
         let aliases: Vec<(u64, usize, VirtAddr, RegionPerms)> = regions
@@ -4920,6 +5013,14 @@ impl AddressSpace {
                 .iter()
                 .position(|r| r.base == base)
                 .ok_or(AddressSpaceError::Unmapped)?;
+            // Huge pins are taken under this lock; fire before the leaves and
+            // backing are released below.
+            let lo = huge[idx].base.as_u64();
+            self.notify_invalidate(
+                lo,
+                lo.saturating_add(huge[idx].len),
+                crate::mmu_notifier::MmuNotifierEvent::Unmap,
+            );
             huge.swap_remove(idx)
         };
         let page_size = match region.size {
@@ -5643,6 +5744,11 @@ impl AddressSpace {
                 }
             }
         }
+        // The move is committed (the only fallible step, destination leaf
+        // installation, has succeeded). The source range stops translating
+        // here, in the same region-lock hold, before truncated backing is
+        // freed below (Linux move_page_tables' MMU_NOTIFY_UNMAP).
+        self.notify_invalidate(old_lo, old_hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         let _source = regions
             .remove(source_region_base)
             .expect("relocation source disappeared under region lock");
@@ -5965,6 +6071,9 @@ impl AddressSpace {
         // Retire the old VMA generation and publish its optional prefix. The
         // suffix and destination nodes were already published before the PTE
         // commit, so no operation returning a recoverable error follows.
+        // The source interval stops translating in this region-lock hold,
+        // before truncated shared backing is released below.
+        self.notify_invalidate(old_lo, old_hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         if head_pages == 0 {
             let _source = regions
                 .remove(source_region_base)
@@ -6348,6 +6457,9 @@ impl AddressSpace {
                 );
             }
         }
+        // Committed: the source keeps its VMA but no longer translates to the
+        // moved frames. Fire in the same region-lock hold.
+        self.notify_invalidate(old_lo, old_hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         let source = regions
             .get_mut(old_lo)
             .expect("DONTUNMAP source disappeared before publication");
@@ -7042,7 +7154,10 @@ impl AddressSpace {
             let lo = region.base.as_u64();
             let hi = lo.saturating_add(region.len);
             if regions.swap_pages.range(lo..hi).any(|(_, state)| {
-                matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+                matches!(
+                    state,
+                    SwapPageState::Evicting { .. } | SwapPageState::Loading
+                )
             }) {
                 return Err(AddressSpaceError::NotImplemented);
             }
@@ -7062,6 +7177,13 @@ impl AddressSpace {
             }
             entries
         };
+        if let Some(region) = regions.get(base.as_u64()) {
+            // Same region-lock hold as the removal below; before any frame
+            // of the region is released.
+            let lo = region.base.as_u64();
+            let hi = lo.saturating_add(region.len);
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
+        }
         let region = {
             let region = regions
                 .remove(base.as_u64())
@@ -7143,6 +7265,10 @@ impl AddressSpace {
         if self.root.as_u64() == 0 || self.is_vm_shared() {
             return 0;
         }
+
+        // Linux exit_mmap's mmu_notifier_release, before any frame below is
+        // released. Device mirrors of this address space are retired.
+        self.notify_release();
 
         // A deferred-unmap quarantine owns regions and detached table frames
         // which are absent from the live region tables. Drain it first so this
@@ -7319,6 +7445,9 @@ impl AddressSpace {
             re > lo && rb < hi
         }) && regions.get(lo).is_some_and(|region| region.len == len);
         if exact_regular {
+            // Interval notifiers learn of the removal in the same region-lock
+            // hold as the table change, before any frame below is released.
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
             let region = regions
                 .remove(lo)
                 .expect("exact VMA disappeared under region lock");
@@ -7499,6 +7628,10 @@ impl AddressSpace {
                 });
             }
         }
+        // Every fallible step is behind us. Interval notifiers learn of the
+        // punch while both table locks still exclude pins and before any
+        // reverse-map owner, leaf or frame of the window is retired.
+        self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Unmap);
         for &key in &overlap_keys {
             let old = regions
                 .get(key)
@@ -7866,6 +7999,9 @@ impl AddressSpace {
         // pass: a claimed page's slot is still zero here, so there is no
         // leaf to retire, and its lock-free fill may already have fetched
         // a pre-shrink frame it would otherwise publish past the new EOF.
+        // Both release batches are reserved; the commit below cannot fail.
+        // Fire in the same lock hold, before any leaf, slot or frame retires.
+        self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Clear);
         let mut retired = 0u64;
         regions.for_each_overlapping_mut(lo, hi, |region| {
             let rb = region.base.as_u64();
@@ -8307,7 +8443,9 @@ impl AddressSpace {
     ///     alias a subsequently reused frame.
     ///
     /// SHARED (borrowed) regions, huge regions, and swap slots are left for the
-    /// victim's own exit. LOCKED does not exempt a condemned process: like
+    /// victim's own exit. While a swap-out batch holds any page (`Evicting`)
+    /// the call returns `Blocked`: that batch still owns those frames and
+    /// frees them itself. LOCKED does not exempt a condemned process: like
     /// Linux's OOM reaper, this path may tear down private `mlock` mappings
     /// after SIGKILL. `mlock` prevents ordinary reclaim, not final OOM teardown.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -8329,6 +8467,18 @@ impl AddressSpace {
             // Lock transiently held; a later pass retries.
             return ReapOutcome::Blocked;
         };
+        // A swap-out batch in flight still names its victims' frames in
+        // `Region::phys` (Evicting) while it writes them to the backend, and
+        // frees them itself after publishing. Freeing them here would hand
+        // the batch freed frames to read and free again. The batch is
+        // bounded and needs no task of this space, so retry after it.
+        if regions
+            .swap_pages
+            .values()
+            .any(|state| matches!(state, SwapPageState::Evicting { .. }))
+        {
+            return ReapOutcome::Blocked;
+        }
 
         // Pass 1: tear down every reapable leaf PTE with local invalidation.
         let mut reaped_any = false;
@@ -8336,6 +8486,14 @@ impl AddressSpace {
             if r.perms.contains(RegionPerms::SHARED) {
                 continue;
             }
+            // Linux __oom_reap_task_mm's non-blocking MMU_NOTIFY_UNMAP, in the
+            // same lock hold as the pass-2 frees below.
+            let lo = r.base.as_u64();
+            self.notify_invalidate(
+                lo,
+                lo.saturating_add(r.len),
+                crate::mmu_notifier::MmuNotifierEvent::Unmap,
+            );
             // SAFETY: identity-mapped root; the region was materialized through
             // it and the table lock pins its backing during the walk.
             unsafe { self.unmap_region_leaves_local(r) };
@@ -8919,6 +9077,11 @@ impl AddressSpace {
                 else {
                     break;
                 };
+                // A revoked device frame is not accessible (its device may be
+                // in D3); like an absent page, it ends the copy.
+                if region.perms.contains(RegionPerms::SHARED) && device_revoke::is_revoked(phys) {
+                    break;
+                }
                 let amount = (4096 - in_page).min(dst.len() - copied);
                 // SAFETY: the region lock retains ownership of this resident
                 // frame; PhysAddr::kernel_ptr addresses its direct mapping.
@@ -9113,6 +9276,11 @@ impl AddressSpace {
             (index, phys, region.perms)
         };
         if phys.raw() != 0 {
+            // xe_bo_cpu_fault: a revoked device page is mapped again only
+            // through its driver, which resumes the device first.
+            if perms.contains(RegionPerms::SHARED) && device_revoke::is_revoked(phys) {
+                return Ok(DemandPageClaim::Revoked(phys));
+            }
             repair_backed(phys, perms)?;
             return Ok(DemandPageClaim::Resolved);
         }
@@ -9356,8 +9524,12 @@ impl AddressSpace {
                         let va = rb + (i as u64) * 4096;
                         next_cursor = va.saturating_add(4096);
                         // Skip holes (unbacked) and pages mid-swap-transition — no
-                        // agable PTE there.
-                        if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&va) {
+                        // agable PTE there — and pinned pages, which the swap
+                        // executor keeps resident (folio_maybe_dma_pinned).
+                        if region.phys[i].raw() == 0
+                            || table.swap_pages.contains_key(&va)
+                            || crate::frame::cow::is_pinned(region.phys[i])
+                        {
                             i += 1;
                             continue;
                         }
@@ -9379,7 +9551,10 @@ impl AddressSpace {
                         i += 1;
                         while i < last && collected + run_len < max_pages {
                             let cva = rb + (i as u64) * 4096;
-                            if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&cva) {
+                            if region.phys[i].raw() == 0
+                                || table.swap_pages.contains_key(&cva)
+                                || crate::frame::cow::is_pinned(region.phys[i])
+                            {
                                 break;
                             }
                             next_cursor = cva.saturating_add(4096);
@@ -9436,11 +9611,22 @@ impl AddressSpace {
     /// Swap one bounded run of private resident pages with a single backend
     /// vector operation and one TLB retirement.
     ///
-    /// The region table records `Evicting` before backend I/O begins. On PTE
-    /// commit the swap layer calls back before invalidation/free, allowing this
-    /// method to clear authoritative `Region::phys` ownership and publish
-    /// `Swapped` atomically under the region lock. Shared, COW, file-backed,
-    /// locked, lazy, and already-transitioning pages are rejected.
+    /// The region table records `Evicting` before the swap layer touches a
+    /// leaf. The swap layer then commits the swap entries, completes the TLB
+    /// shootdown and only then writes the frames to the backend, so no store
+    /// can land in a victim after its snapshot (Linux `shrink_folio_list`:
+    /// unmap, flush, `pageout`). A fault in that window sees `Evicting` and
+    /// waits for the batch. After a successful write the swap layer calls
+    /// back before any frame is freed, allowing this method to clear
+    /// authoritative `Region::phys` ownership and publish `Swapped`
+    /// atomically under the region lock; a failed write restores every leaf
+    /// and the records are dropped. Shared, COW, file-backed, locked, lazy,
+    /// and already-transitioning pages are rejected. A page pinned for device
+    /// or kernel access is skipped and stays resident with its leaf, whether
+    /// the pin predates the batch or arrives before its publication (Linux
+    /// `folio_maybe_dma_pinned`), and so does a page that a pin or a kernel
+    /// write (`access_remote`) reached while it was `Evicting`, even if the
+    /// pin is already gone; the count returned excludes them.
     ///
     /// # Safety
     ///
@@ -9486,6 +9672,15 @@ impl AddressSpace {
                 if phys.raw() == 0 {
                     return Err(SwapError::InvalidBatch);
                 }
+                // Linux shrink_folio_list: a folio_maybe_dma_pinned folio is
+                // kept resident (`keep_locked`) and the rest of the batch
+                // proceeds. A pinned frame's later device writes would never
+                // reach the swapped copy. Pins are taken under this lock, so
+                // the test is exact here; a pin that arrives while the batch
+                // is in flight marks the record below `refused`.
+                if crate::frame::cow::is_pinned(phys) {
+                    continue;
+                }
                 victims.push((
                     SwapVictim {
                         pml4_phys: self.root,
@@ -9495,27 +9690,74 @@ impl AddressSpace {
                 ));
             }
             for (victim, phys) in &victims {
-                table
-                    .swap_pages
-                    .insert(victim.virt.as_u64(), SwapPageState::Evicting(*phys));
+                table.swap_pages.insert(
+                    victim.virt.as_u64(),
+                    SwapPageState::Evicting {
+                        phys: *phys,
+                        refused: false,
+                    },
+                );
             }
+        }
+        if victims.is_empty() {
+            return Ok(0);
         }
 
         let bare_victims: Vec<SwapVictim> = victims.iter().map(|(victim, _)| *victim).collect();
         // SAFETY: the transition table above pins metadata ownership. The
-        // callback clears it before the swap primitive invalidates/frees.
+        // callback clears it before the swap primitive frees any frame.
         let result = unsafe {
             crate::swap::swap_out_batch_owned(
                 &bare_victims,
                 Some(self.translation_tag()),
-                |resolved| {
+                |resolved, keep| {
                     let mut table = self.regions.lock();
-                    for (victim, phys) in resolved {
+                    // Linux try_to_unmap_one backs off after the PTE is
+                    // cleared when folio_try_share_anon_rmap_pte finds a DMA
+                    // pin. A pin is taken under this lock from the Region
+                    // slot, which still names the frame while it is Evicting,
+                    // so this is the last point one can arrive; after the
+                    // slot is cleared below no pin can reach the frame. The
+                    // backend snapshot was taken before this point, so a
+                    // victim that a pin or a kernel write reached at any time
+                    // since its selection is kept too (`refused`), even if
+                    // that pin is already gone. A refused victim keeps its
+                    // slot, rmap owner and frame, and the swap layer restores
+                    // its leaf.
+                    for ((victim, phys), keep) in resolved.iter().zip(keep.iter_mut()) {
+                        let reached = matches!(
+                            table.swap_pages.get(&victim.virt.as_u64()),
+                            Some(SwapPageState::Evicting { refused: true, .. })
+                        );
+                        *keep = reached || crate::frame::cow::is_pinned(*phys);
+                    }
+                    let swapped = || {
+                        resolved
+                            .iter()
+                            .zip(keep.iter())
+                            .filter(|(_, keep)| !**keep)
+                            .map(|((victim, _), _)| victim.virt.as_u64())
+                    };
+                    // Before the slots are cleared below and before the swap
+                    // primitive frees any victim frame.
+                    if let (Some(lo), Some(hi)) = (swapped().min(), swapped().max()) {
+                        self.notify_invalidate(
+                            lo,
+                            hi.saturating_add(4096),
+                            crate::mmu_notifier::MmuNotifierEvent::Clear,
+                        );
+                    }
+                    for ((victim, phys), _) in
+                        resolved.iter().zip(keep.iter()).filter(|(_, keep)| !**keep)
+                    {
                         let va = victim.virt.as_u64();
                         assert_eq!(
                             table.swap_pages.get(&va),
-                            Some(&SwapPageState::Evicting(*phys)),
-                            "swap ownership transition changed before PTE commit"
+                            Some(&SwapPageState::Evicting {
+                                phys: *phys,
+                                refused: false,
+                            }),
+                            "swap ownership transition changed before publication"
                         );
                         {
                             let region = table
@@ -9537,11 +9779,16 @@ impl AddressSpace {
             )
         };
 
-        // Remove reservations for an aborted transaction or for a backed page
-        // whose leaf was already absent and therefore was skipped.
+        // Remove the records of an aborted transaction (including a failed
+        // backend write, whose leaves are already restored), of a refused
+        // victim, or of a backed page whose leaf was already absent and
+        // therefore was skipped.
         let mut table = self.regions.lock();
         for (victim, phys) in victims {
-            if table.swap_pages.get(&victim.virt.as_u64()) == Some(&SwapPageState::Evicting(phys)) {
+            if matches!(
+                table.swap_pages.get(&victim.virt.as_u64()),
+                Some(SwapPageState::Evicting { phys: held, .. }) if *held == phys
+            ) {
                 table.swap_pages.remove(&victim.virt.as_u64());
             }
         }
@@ -9666,6 +9913,13 @@ impl AddressSpace {
         // Swap faults are resolved before anonymous/file demand allocation.
         // Evicting/Loading means another CPU owns the transition; returning Ok
         // retries the instruction until that bounded batch publishes a leaf.
+        // An Evicting page's leaf may already be its swap entry while the
+        // backend write is still pending (the swap-out snapshots the frame
+        // only after unmapping it and retiring every translation). Its slot
+        // is not readable yet, so the fault must not page in: it waits, as a
+        // Linux fault waits on the locked swap-cache folio, and retries until
+        // the batch publishes Swapped (the slot then holds the data) or
+        // restores the leaf (a failed write or a refused page).
         let swap_requests = {
             let mut table = self.regions.lock();
             // A guard marker wins over any swap state (see claim_demand_page).
@@ -9673,7 +9927,9 @@ impl AddressSpace {
                 return Err(AddressSpaceError::GuardPage);
             }
             match table.swap_pages.get(&v).copied() {
-                Some(SwapPageState::Evicting(_)) | Some(SwapPageState::Loading) => return Ok(()),
+                Some(SwapPageState::Evicting { .. }) | Some(SwapPageState::Loading) => {
+                    return Ok(())
+                }
                 Some(SwapPageState::Swapped) => {
                     let region = table.containing(v).ok_or(AddressSpaceError::Unmapped)?;
                     // Swap-in publishes a leaf with the VMA's permissions,
@@ -9829,7 +10085,11 @@ impl AddressSpace {
             // `map_4kb_demand`.
             match unsafe { map_4kb_demand(self.root, va, phys, flags) } {
                 Ok(()) => {
-                    crate::rmap::add(phys, self.root, va);
+                    // A leaf a PROT_NONE re-protect or a device revocation
+                    // left absent may still have its owner: add it once.
+                    if !crate::rmap::contains_owner(phys, self.root, va) {
+                        crate::rmap::add(phys, self.root, va);
+                    }
                     Ok(())
                 }
                 Err(MapError::AlreadyMapped) => {
@@ -9843,6 +10103,9 @@ impl AddressSpace {
                 Err(error) => Err(demand_map_error(error)),
             }
         })?;
+        if let DemandPageClaim::Revoked(phys) = claim {
+            return device_revoke::await_refault(phys);
+        }
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
@@ -10160,7 +10423,10 @@ impl AddressSpace {
             // contract as the fresh-allocation path below).
             match unsafe { map_4kb(self.root, va, phys, flags) } {
                 Ok(()) => {
-                    crate::rmap::add(phys, self.root, va);
+                    // As the x86_64 twin: add a surviving owner only once.
+                    if !crate::rmap::contains_owner(phys, self.root, va) {
+                        crate::rmap::add(phys, self.root, va);
+                    }
                     Ok(())
                 }
                 Err(MapError::AlreadyMapped) => {
@@ -10174,6 +10440,9 @@ impl AddressSpace {
                 Err(error) => Err(demand_map_error(error)),
             }
         })?;
+        if let DemandPageClaim::Revoked(phys) = claim {
+            return device_revoke::await_refault(phys);
+        }
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
@@ -10979,7 +11248,10 @@ impl AddressSpace {
             }
             let covered_hi = Self::mappings_covered_prefix_end(&huge, &g, lo, hi);
             let transitioning = g.swap_pages.range(lo..covered_hi).any(|(_, state)| {
-                matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+                matches!(
+                    state,
+                    SwapPageState::Evicting { .. } | SwapPageState::Loading
+                )
             });
             // Linux's do_mlock applies VM_LOCKED before __mm_populate and does
             // not roll it back when population later fails. Publishing the
@@ -11143,13 +11415,18 @@ impl AddressSpace {
         // ack-wait itself services peer shootdowns (see `remap_page`,
         // which has always broadcast under this lock).
         let mut g = self.regions.lock();
-        if g.swap_pages
-            .range(lo..hi)
-            .any(|(_, state)| matches!(state, SwapPageState::Loading))
-        {
-            // A page-in commit has already captured the old PTE flags. Let
-            // that bounded transaction finish rather than publish those old
-            // flags after this permission change.
+        if g.swap_pages.range(lo..hi).any(|(_, state)| {
+            matches!(
+                state,
+                SwapPageState::Evicting { .. } | SwapPageState::Loading
+            )
+        }) {
+            // A page-in commit has already captured the old PTE flags, and a
+            // page-out batch has captured the old leaf it restores on a
+            // failed write or a refused page. Let that bounded transaction
+            // finish rather than publish those old flags after this
+            // permission change. (Rewriting an Evicting page's leaf here
+            // would also map a frame the batch then frees.)
             return Err(AddressSpaceError::NotImplemented);
         }
         let mut hits = Vec::new();
@@ -11157,6 +11434,7 @@ impl AddressSpace {
         // accounting primitives — replay each hit's flat contribution.
         let mut acct_delta = RegionAcct::default();
         let mut acct_sub = RegionAcct::default();
+        let mut downgrade = false;
         g.for_each_overlapping_mut(lo, hi, |r| {
             let rb = r.base.as_u64();
             let re = rb.saturating_add(r.len);
@@ -11164,6 +11442,7 @@ impl AddressSpace {
                 return;
             }
             acct_sub.add_flat(r.perms, r.len);
+            downgrade |= access_downgrade(r.perms, new_perms);
             r.perms = new_perms;
             acct_delta.add_flat(r.perms, r.len);
             hits.push(r.clone());
@@ -11190,6 +11469,11 @@ impl AddressSpace {
             .saturating_sub(acct_sub.wnx_bytes);
         if hits.is_empty() {
             return Err(AddressSpaceError::Unmapped);
+        }
+        if downgrade {
+            // Linux change_protection's MMU_NOTIFY_PROTECTION_VMA, limited to
+            // READ/WRITE removal: same region-lock hold as the new perms.
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::ProtectionVma);
         }
         // SAFETY: same identity-mapping precondition as
         // `materialize`. Each touched region's pages were
@@ -11360,10 +11644,14 @@ impl AddressSpace {
         if Self::mappings_covered_prefix_end(&huge, &g, lo, hi) < hi {
             return Err(AddressSpaceError::Unmapped);
         }
-        if g.swap_pages
-            .range(lo..hi)
-            .any(|(_, state)| matches!(state, SwapPageState::Loading))
-        {
+        // As in `change_perms_range`: an in-flight swap-in or swap-out has
+        // captured leaf flags it may republish.
+        if g.swap_pages.range(lo..hi).any(|(_, state)| {
+            matches!(
+                state,
+                SwapPageState::Evicting { .. } | SwapPageState::Loading
+            )
+        }) {
             return Err(AddressSpaceError::NotImplemented);
         }
         let mut split_count = 0usize;
@@ -11400,6 +11688,22 @@ impl AddressSpace {
             )?);
         }
         g.try_reserve_nodes(additional_nodes)?;
+
+        // Linux change_protection's MMU_NOTIFY_PROTECTION_VMA, limited to
+        // READ/WRITE removal. Both table locks are held from here through
+        // the leaf rewrite. (A refused partial huge cut below makes this a
+        // spurious, harmless invalidation.)
+        if g.overlapping(lo, hi)
+            .any(|region| access_downgrade(region.perms, prot))
+            || huge.iter().any(|region| {
+                let rb = region.base.as_u64();
+                rb < hi
+                    && lo < rb.saturating_add(region.len)
+                    && access_downgrade(region.perms, prot)
+            })
+        {
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::ProtectionVma);
+        }
 
         let huge_touched = {
             if huge.iter().any(|region| {
@@ -11638,7 +11942,10 @@ impl AddressSpace {
             #[cfg(target_arch = "x86_64")]
             {
                 if g.swap_pages.range(lo..hi).any(|(_, state)| {
-                    matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+                    matches!(
+                        state,
+                        SwapPageState::Evicting { .. } | SwapPageState::Loading
+                    )
                 }) {
                     return Err(AddressSpaceError::NotImplemented);
                 }
@@ -11658,6 +11965,9 @@ impl AddressSpace {
                     g.swap_pages.remove(&va.as_u64());
                 }
             }
+            // Swap records are taken; nothing below fails. Fire in this
+            // region-lock hold, before any leaf or frame of the range retires.
+            self.notify_invalidate(lo, hi, crate::mmu_notifier::MmuNotifierEvent::Clear);
             g.for_each_overlapping_mut(lo, hi, |r| {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
@@ -11897,6 +12207,9 @@ impl AddressSpace {
                 for page in (start..end).step_by(4096) {
                     g.guard_pages.insert(page);
                 }
+                // A marked page refuses pins from here on and loses its leaf
+                // below (Linux MADV_GUARD_INSTALL zaps the range).
+                self.notify_invalidate(start, end, crate::mmu_notifier::MmuNotifierEvent::Clear);
             }
             (spans, walk)
         };
@@ -12038,18 +12351,28 @@ impl AddressSpace {
                         if self.root.as_u64() == 0 {
                             break;
                         }
-                        let backed_v = rb + first as u64 * 4096;
-                        // SAFETY: identity-mapped; the run lies in a bookkept
-                        // region of this AS and the region lock keeps it
-                        // stable through the batched walk.
-                        marked += unsafe {
-                            crate::x86_64::paging::lazyfree_mark_4kb_local_range(
-                                self.root,
-                                VirtAddr::new(backed_v),
-                                slots.len() as u64,
-                            )
+                        for (window, run) in slots.chunks(64).enumerate() {
+                            let backed_v = rb + (first + window * 64) as u64 * 4096;
+                            // A pinned page is not marked: a device may write
+                            // it after this call without setting DIRTY, and
+                            // the pin carries no dirty mark for its release
+                            // (Linux's unpinner marks the folio dirty
+                            // instead). Pins are taken under the region lock
+                            // held here.
+                            let pinned = pinned_slots_mask(run);
+                            // SAFETY: identity-mapped; the run lies in a
+                            // bookkept region of this AS and the region lock
+                            // keeps it stable through the batched walk.
+                            marked += unsafe {
+                                crate::x86_64::paging::lazyfree_mark_4kb_local_range(
+                                    self.root,
+                                    VirtAddr::new(backed_v),
+                                    run.len() as u64,
+                                    |page| pinned & (1 << page) == 0,
+                                )
+                            }
+                            .unwrap_or(0);
                         }
-                        .unwrap_or(0);
                     }
                 });
             }
@@ -12072,8 +12395,10 @@ impl AddressSpace {
     /// space's private anonymous regions and retires every leaf whose
     /// `LAZYFREE` bit survives with DIRTY still clear (see
     /// `lazyfree_take_clean_4kb_range` for the walker-race contract);
-    /// rewritten pages lose the mark and stay resident. Returns the number
-    /// of pages freed, stopping once `max_pages` have been collected.
+    /// rewritten pages lose the mark and stay resident, and so do pages
+    /// pinned for device or kernel access, which a device may have written
+    /// without setting DIRTY. Returns the number of pages freed, stopping
+    /// once `max_pages` have been collected.
     #[cfg(target_arch = "x86_64")]
     pub fn discard_lazyfree_pages(&self, max_pages: usize) -> usize {
         if self.root.as_u64() == 0 || max_pages == 0 {
@@ -12107,16 +12432,36 @@ impl AddressSpace {
                     return;
                 }
                 for (first, slots) in r.phys.chunks(0, r.phys.len()) {
-                    // SAFETY: identity-mapped; this allocated backing block
-                    // stays stable under the region lock.
-                    let _ = unsafe {
-                        crate::x86_64::paging::lazyfree_take_clean_4kb_range(
-                            root,
-                            VirtAddr::new(rb + first as u64 * 4096),
-                            slots.len() as u64,
-                            |phys, va| taken.push((phys, va.as_u64())),
-                        )
-                    };
+                    for (window, run) in slots.chunks(64).enumerate() {
+                        // Never discard a page pinned for device access
+                        // (Linux try_to_unmap_one: an extra reference
+                        // restores the PTE). Pins are taken under the region
+                        // lock held here, so the mask is exact.
+                        let pinned = pinned_slots_mask(run);
+                        // SAFETY: identity-mapped; this allocated backing
+                        // block stays stable under the region lock.
+                        let _ = unsafe {
+                            crate::x86_64::paging::lazyfree_take_clean_4kb_range(
+                                root,
+                                VirtAddr::new(rb + (first + window * 64) as u64 * 4096),
+                                run.len() as u64,
+                                |page| pinned & (1 << page) == 0,
+                                |phys, va| taken.push((phys, va.as_u64())),
+                            )
+                        };
+                    }
+                }
+                // The discarded pages leave this region's translation in the
+                // same lock hold that zeroes their slots; their frames are
+                // freed only after the lock drops.
+                let first = taken.iter().map(|&(_, va)| va).min();
+                let last = taken.iter().map(|&(_, va)| va).max();
+                if let (Some(first), Some(last)) = (first, last) {
+                    self.notify_invalidate(
+                        first,
+                        last.saturating_add(4096),
+                        crate::mmu_notifier::MmuNotifierEvent::Clear,
+                    );
                 }
                 // Every taken page must be retired — the helper walks whole
                 // regions, and leaving one unmapped but bookkept would strand
@@ -12207,7 +12552,12 @@ impl AddressSpace {
                 // other callers keep the exact per-page writability decision.
                 for (first, slots) in r.phys.chunks(0, r.phys.len()) {
                     let base = VirtAddr::new(r.base.as_u64() + first as u64 * 4096);
-                    let slots = guard_masked(guards, base.as_u64(), slots);
+                    let slots = guard_masked(
+                        guards,
+                        base.as_u64(),
+                        slots,
+                        r.perms.contains(RegionPerms::SHARED),
+                    );
                     let slots: &[PhysAddr] = &slots;
                     let cow_counts = if cow_readonly {
                         None
@@ -12280,7 +12630,12 @@ impl AddressSpace {
             // read-only — skip the per-page COW refcount lookup and force RO.
             for (first, slots) in r.phys.chunks(0, r.phys.len()) {
                 let base = VirtAddr::new(r.base.as_u64() + first as u64 * 4096);
-                let slots = guard_masked(guards, base.as_u64(), slots);
+                let slots = guard_masked(
+                    guards,
+                    base.as_u64(),
+                    slots,
+                    r.perms.contains(RegionPerms::SHARED),
+                );
                 let slots: &[PhysAddr] = &slots;
                 let cow_counts = if cow_readonly {
                     None
@@ -12773,6 +13128,7 @@ impl AddressSpace {
                     &regions.guard_pages,
                     r.base.as_u64() + ((first as u64) << 12),
                     slice,
+                    r.perms.contains(RegionPerms::SHARED),
                 );
                 let slice: &[PhysAddr] = &slice;
                 let cow_counts = r
@@ -12893,6 +13249,7 @@ impl AddressSpace {
                     &regions.guard_pages,
                     r.base.as_u64() + ((first as u64) << 12),
                     slice,
+                    r.perms.contains(RegionPerms::SHARED),
                 );
                 let slice: &[PhysAddr] = &slice;
                 let cow_counts = r
@@ -13452,6 +13809,10 @@ impl AddressSpace {
                 splittable(region.perms) && region.phys.get(page_idx).copied() == Some(old_phys)
             });
             if owns_ticket && current_matches {
+                // Linux wp_page_copy's MMU_NOTIFY_CLEAR: the page is about to
+                // translate to its private copy. Same region-lock hold as the
+                // backing update, before the old frame's references drop.
+                self.notify_invalidate(v, v + 4096, crate::mmu_notifier::MmuNotifierEvent::Clear);
                 let region = regions
                     .containing_backing_mut(v)
                     .expect("COW region disappeared under its lock");
@@ -13513,6 +13874,10 @@ impl AddressSpace {
         let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
         let mut regions = self.regions.lock();
         let v = page_va.as_u64();
+        // A swap-out batch holds a resident page it is evicting (its leaf may
+        // already be the swap entry, and the batch frees the frame itself
+        // once it publishes).
+        let in_swap_transition = regions.swap_pages.contains_key(&v);
         let region = regions
             .containing_backing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
@@ -13534,6 +13899,14 @@ impl AddressSpace {
         }
 
         if crate::frame::cow::is_pinned(old_phys) {
+            return Err(AddressSpaceError::Pinned);
+        }
+        // Moving a page a swap-out batch holds would free its frame under the
+        // batch and overwrite its swap entry. Linux cannot isolate a folio
+        // reclaim holds (`__add_folio_for_migration`: `folio_isolate_lru`
+        // fails after the node check), so move_pages reports it busy
+        // (-EBUSY), as for a pin.
+        if in_swap_transition {
             return Err(AddressSpaceError::Pinned);
         }
 
@@ -13672,6 +14045,13 @@ impl AddressSpace {
             }
             return Err(());
         }
+        // Every caller holds the region lock and updates `Region.phys` to
+        // `new_phys` in the same hold, then frees `old_phys` after it drops.
+        self.notify_invalidate(
+            page_va.as_u64(),
+            page_va.as_u64() + 4096,
+            crate::mmu_notifier::MmuNotifierEvent::Migrate,
+        );
         Ok(())
     }
 
@@ -13775,6 +14155,11 @@ impl AddressSpace {
                 return Err(AddressSpaceError::Unmapped);
             }
         }
+        // A pinned frame stays put (its pin reference would also fail the
+        // single-owner test below; name the reason).
+        if crate::frame::cow::is_pinned(old_phys) {
+            return Err(AddressSpaceError::Pinned);
+        }
         // A COW-shared frame has other owners; relocating it here would leave
         // their PTEs pointing at the freed source. Refuse — multi-owner
         // migration (rmap-walk every owner) is a follow-up.
@@ -13827,7 +14212,8 @@ impl AddressSpace {
     /// pre-copied, shared `dst` frame — one step of multi-owner
     /// [`crate::migrate::migrate_frame`]. Under the region lock: verifies the
     /// page still maps `expected_src` (else the owner raced — COW-split or
-    /// unmapped — and `Err(())` is returned so the caller drops this owner),
+    /// unmapped — and `Err(())` is returned so the caller drops this owner)
+    /// and that `expected_src` is not pinned (same `Err(())`),
     /// installs a READ-ONLY leaf for `dst` (so a later write still faults into a
     /// proper COW split against `dst`'s shared refcount), repoints `Region.phys`
     /// and the reverse map, and flushes. Does NOT copy, allocate, free, or touch
@@ -13856,6 +14242,13 @@ impl AddressSpace {
             if region.phys.get(page_idx).copied() != Some(expected_src) {
                 return Err(()); // raced: no longer maps the source
             }
+            // A pin taken through this space since the caller's check: this
+            // owner keeps the pinned frame (Linux try_to_migrate_one backs
+            // off a folio_maybe_dma_pinned page). Pins are taken under this
+            // lock, so none can arrive before the repoint commits.
+            if crate::frame::cow::is_pinned(expected_src) {
+                return Err(());
+            }
             (page_idx, region.perms)
         };
         // Install a READ-ONLY leaf for `dst`: the page stays COW-shared, so a
@@ -13878,6 +14271,9 @@ impl AddressSpace {
             }
             return Err(());
         }
+        // Same region-lock hold as the backing update; the caller drops the
+        // source's references only after every owner has been repointed.
+        self.notify_invalidate(v, v + 4096, crate::mmu_notifier::MmuNotifierEvent::Migrate);
         regions
             .containing_backing_mut(v)
             .expect("region vanished under its own lock")
@@ -14024,6 +14420,13 @@ impl AddressSpace {
                 Err(_) => Err(AddressSpaceError::NotImplemented),
             });
         }
+        // Same huge-lock hold as the backing update; before the old frame is
+        // returned to the pool.
+        self.notify_invalidate(
+            leaf_va.as_u64(),
+            leaf_va.as_u64().saturating_add(bytes),
+            crate::mmu_notifier::MmuNotifierEvent::Migrate,
+        );
         huge[region_idx].frames[frame_idx] = new;
         drop(huge);
 
@@ -14272,6 +14675,14 @@ impl AddressSpace {
         if g.guard_pages.contains(&v) {
             return Err(AddressSpaceError::GuardPage);
         }
+        // Nor over a swap entry: map_4kb overwrites any non-present leaf, so
+        // this would drop a Swapped page's slot (mapping its zero backing
+        // sentinel) or give an Evicting page back a translation of a frame
+        // its swap-out batch is about to free. The swap fault path owns
+        // those pages; a NUMA hint fault that lands here falls back to it.
+        if g.swap_pages.contains_key(&v) {
+            return Err(AddressSpaceError::NotImplemented);
+        }
         let region = g
             .iter()
             .find(|r| {
@@ -14461,7 +14872,7 @@ impl AddressSpace {
         // acquisition until its complete cross-address-space move commits.
         let _shared = lock_address_space_shared_mapping_transaction(self.identity());
         let address = vaddr.raw();
-        let regions = self.regions.lock();
+        let mut regions = self.regions.lock();
         if let Some(region) = regions.containing(address) {
             if !region.perms.contains(RegionPerms::READ)
                 || (region.perms.contains(RegionPerms::LOCK_EXEMPT)
@@ -14479,6 +14890,29 @@ impl AddressSpace {
             if phys.raw() == 0 {
                 return None;
             }
+            // A pinned page is never a clean MADV_FREE page: the device may
+            // write it without setting the leaf's DIRTY bit, so drop the
+            // mark now, under the lock lazy-free discard also holds (Linux
+            // marks the folio dirty at a FOLL_WRITE pin). Only private
+            // regions are ever marked.
+            #[cfg(target_arch = "x86_64")]
+            if self.root.raw() != 0 && !region.perms.contains(RegionPerms::SHARED) {
+                // SAFETY: this live root owns the region found above and the
+                // region lock keeps its leaf-table path stable.
+                unsafe {
+                    crate::x86_64::paging::lazyfree_cancel_4kb(
+                        self.root,
+                        VirtAddr::new(address & !0xFFF),
+                    )
+                };
+            }
+            // A swap-out batch may hold this page with its backend snapshot
+            // already taken. The pin reaches the frame through this slot, so
+            // the batch must keep the page even if the pin is dropped before
+            // it publishes: the device may write through the pin meanwhile
+            // (Linux: GUP on the swap entry refaults the swap-cache folio,
+            // which reclaim then keeps).
+            regions.refuse_swap_out(address & !0xFFF);
             // Shared-memory/file owners also retire RAM via free_frame. Hold
             // the physical allocation itself, independent of their mapping
             // registries (which may disappear after close + munmap).
@@ -14643,6 +15077,9 @@ impl Drop for AddressSpace {
     /// allocator slot can be reused; tag-0 switches flush on root changes.
     /// Kernel-half PML4 entries on x86_64 are never reclaimed.
     fn drop(&mut self) {
+        // Retire interval notifiers before any frame is released (Linux
+        // mmu_notifier_release). Idempotent after reclaim_unshared_on_exit.
+        self.notify_release();
         // Release any deferred-flush quarantine first: its regions own data
         // frames (and detached page tables) that the region-table walk below
         // will never see — without this drain they would leak at every

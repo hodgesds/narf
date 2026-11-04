@@ -3,12 +3,24 @@
 //! intel_color.c::icl_load_luts, skl_watermark.c::mtl_read_wm_latency,
 //! intel_vblank.c (eDP scanline offset), xe/display/xe_dsb_buffer.c.
 //! No IRQ delivery is needed: fresh engine status is polled by the KMS owner.
+//!
+//! Display 20 (Lunar Lake) runs the display-14 transport: intel_dsb.c's
+//! version branches are `DSB_ATS_FAULT_INT_*` from display 14 and
+//! `DSB_GOSUB_INT_*` from display 30, and `mtl_read_wm_latency` serves
+//! display >= 14. Its command pages take the IP's display GGTT profile
+//! ([`crate::intel_gpu_scanout_io::display_pte`], Xe2 PAT3). xe maps its
+//! own DSB BO (xe_dsb_buffer.c: `XE_BO_FLAG_SCANOUT | XE_BO_FLAG_GGTT`,
+//! CPU WC) through the BO's GGTT node at `idx[XE_CACHE_WB]`
+//! (xe_ggtt.c::__xe_ggtt_insert_bo_at); these pages are CPU-WC and fenced
+//! before the PTEs are written, so the uncached display index reads the
+//! same bytes and the owner keeps the one PAT entry its admission proves.
 use crate::{
+    intel_gpu::Generation,
     intel_gpu_aux::MmioWindow,
     intel_gpu_gem::{GemObject, GemState, Placement},
     intel_gpu_ggtt_ranges::{Lease, Ledger},
     intel_gpu_gtt::{PteFormat, GGTT_ARRAY_BASE},
-    intel_gpu_scanout_io::DisplayAccess,
+    intel_gpu_scanout_io::{display_pat_programmed, display_pte, DisplayAccess},
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{fence, Ordering};
@@ -72,23 +84,22 @@ impl Timing {
     fn hw(self, line: u32) -> u32 {
         (line + u32::from(self.vtotal) - 1) % u32::from(self.vtotal)
     }
+    /// The timing proof. `vblank_start` proves `TRANS_VBLANK`'s start
+    /// field too: only display 12 (TGL, ADL-S) writes it. Display 13
+    /// (ADL-P, ADL-N) and 14 write it 0 (`intel_set_transcoder_timings`
+    /// clears it on display 13+, where the hardware ignores it), so only
+    /// VBLANK_END is proved there.
     pub(crate) fn check(
         self,
         io: &impl MmioWindow,
         gen12_latencies: Option<[u16; 6]>,
+        vblank_start: bool,
     ) -> Result<u32, FsError> {
         if !self.valid() {
             return Err(FsError::Unsupported);
         }
         let packed = |high: u16, low: u16| (u32::from(high) - 1) << 16 | (u32::from(low) - 1);
-        // Display 14 (no Gen12 table) writes TRANS_VBLANK's start field 0:
-        // intel_set_transcoder_timings clears it on display 13+, where the
-        // hardware ignores it. Only VBLANK_END is proved there.
-        let vblank_mask = if gen12_latencies.is_some() {
-            u32::MAX
-        } else {
-            0xFFFF_0000
-        };
+        let vblank_mask = if vblank_start { u32::MAX } else { 0xFFFF_0000 };
         if io.read32(0x60000) != packed(self.htotal, self.width)
             || io.read32(0x6000c) != packed(self.vtotal, self.height)
             || io.read32(0x60010) & vblank_mask != packed(self.vtotal, self.height) & vblank_mask
@@ -188,26 +199,61 @@ pub(crate) struct Owner<M: DisplayAccess + Clone> {
     deadline: u64,
     complete: bool,
     gen12_latencies: Option<[u16; 6]>,
+    /// The timing proof covers `TRANS_VBLANK`'s start field (display 12).
+    vblank_start: bool,
     ints: u32,
     errors: u32,
     gen12_color: Option<crate::intel_gpu_color::Profile>,
+    /// The GGTT PTE format and PAT index of the command pages.
+    pte: (PteFormat, u8),
 }
 impl<M: DisplayAccess + Clone> Owner<M> {
+    /// The display-14 (Meteor Lake) transport.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn reserve(io: M, bar_len: u64) -> Result<Self, FsError> {
-        Self::reserve_profile(io, bar_len, None)
+        Self::reserve_for(io, bar_len, Generation::MeteorLake)
     }
-    pub(crate) fn reserve_gen12(io: M, bar_len: u64, latencies: [u16; 6]) -> Result<Self, FsError> {
+    /// The non-Gen12 transport of `generation`'s display: 14 (Meteor Lake)
+    /// or 20 (Lunar Lake). Any other generation is refused before a read.
+    pub(crate) fn reserve_for(
+        io: M,
+        bar_len: u64,
+        generation: Generation,
+    ) -> Result<Self, FsError> {
+        if !matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
+            return Err(FsError::Unsupported);
+        }
+        Self::reserve_profile(io, bar_len, None, generation, false)
+    }
+    /// A Gen12 owner; `display13` (ADL-P, ADL-N) proves `TRANS_VBLANK`
+    /// without its start field.
+    pub(crate) fn reserve_gen12(
+        io: M,
+        bar_len: u64,
+        latencies: [u16; 6],
+        display13: bool,
+    ) -> Result<Self, FsError> {
         if latencies[0] == 0 {
             return Err(FsError::Unsupported);
         }
-        Self::reserve_profile(io, bar_len, Some(latencies))
+        // Every Gen12 family shares one GGTT PTE profile without a PAT field.
+        Self::reserve_profile(
+            io,
+            bar_len,
+            Some(latencies),
+            Generation::TigerLake,
+            !display13,
+        )
     }
     fn reserve_profile(
         io: M,
         bar_len: u64,
         gen12_latencies: Option<[u16; 6]>,
+        generation: Generation,
+        vblank_start: bool,
     ) -> Result<Self, FsError> {
-        if !io.access_ok() || (gen12_latencies.is_none() && io.read32(0x4804) != 4) {
+        let pte = display_pte(generation).ok_or(FsError::Unsupported)?;
+        if !io.access_ok() || !display_pat_programmed(&io, generation) {
             return Err(FsError::NoDevice);
         }
         let key = io.ggtt_key().ok_or(FsError::Unsupported)?;
@@ -278,6 +324,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             deadline: 0,
             complete: false,
             gen12_latencies,
+            vblank_start,
             gen12_color: None,
             ints: if gen12_latencies.is_some() {
                 0x0f
@@ -289,6 +336,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             } else {
                 ERRORS
             },
+            pte,
         })
     }
     pub(crate) fn qualify_gen12_color(
@@ -368,7 +416,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if !self.io.access_ok() {
             return Err(FsError::NoDevice);
         }
-        let timing_check = timing.check(&self.io, self.gen12_latencies);
+        let timing_check = timing.check(&self.io, self.gen12_latencies, self.vblank_start);
         // An unavailable read is a hard authority/power failure, even when
         // its all-ones value also resembles unsupported live timing flags.
         if !self.io.access_ok() {
@@ -553,12 +601,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             return Err(FsError::NoDevice);
         }
         // Validate every DMA address before the first mapping mutation.
-        let format = if self.gen12_latencies.is_some() {
-            PteFormat::Gen12
-        } else {
-            PteFormat::XeLpg
-        };
-        let pat = if self.gen12_latencies.is_some() { 0 } else { 1 };
+        let (format, pat) = self.pte;
         let pages: Vec<u64> = object
             .pages()
             .map(|phys| {

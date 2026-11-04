@@ -1,6 +1,11 @@
 //! Synchronous device-owner bridge to CPU alias revocation.
 use crate::FsError;
+use alloc::sync::Arc;
 use narf_lib::sync::IrqSafeSpinLock;
+pub use narf_memory::address_space::{
+    DeviceAliasCensus, DeviceFrameRefault, DeviceFrameRevocation, DeviceRefaultError,
+    DeviceRefaultFuture,
+};
 
 pub type RelocationHook = fn(
     &[u64],
@@ -100,6 +105,68 @@ pub fn relocate(
 ) -> Result<(), FsError> {
     let hook = (*HOOK.lock()).ok_or(FsError::Unsupported)?;
     hook(old, new, aliases, commit)
+}
+
+/// `(start, len, census, refault)`: see [`revoke`].
+pub type RevocationHook = fn(
+    u64,
+    u64,
+    DeviceAliasCensus,
+    Arc<dyn DeviceFrameRefault>,
+) -> Result<DeviceFrameRevocation, FsError>;
+static REVOCATION: IrqSafeSpinLock<Option<RevocationHook>> = IrqSafeSpinLock::new(None);
+
+/// The VM owner installs this beside [`install`].
+pub fn install_revocation(hook: RevocationHook) {
+    *REVOCATION.lock() = Some(hook);
+}
+
+/// Swap the revocation hook, returning the previous one, for tests that
+/// substitute a VM owner.
+pub fn replace_revocation(hook: Option<RevocationHook>) -> Option<RevocationHook> {
+    core::mem::replace(&mut *REVOCATION.lock(), hook)
+}
+
+/// Linux `unmap_mapping_range` over a device aperture for runtime suspend:
+/// remove every user CPU translation of `[start, start + len)` in every
+/// process and keep the range revoked until the returned handle drops; new
+/// mappings of the range stay unmapped too. A later CPU access calls
+/// `refault`, which must resume the device and drop the handle before its
+/// future completes. `census` reports every aliased frame of the range with
+/// its metadata-alias count (the provider's alias registry), from inside the
+/// VM transaction; it may take only leaf locks and must not allocate. `Busy`
+/// means an alias the snapshot could not see (retry later).
+///
+/// Before any device mapping exists the VM owner has not installed its hook
+/// (it does so on the first device mmap). The revocation is then taken over
+/// an empty address-space snapshot, which the census proves complete: any
+/// alias of the range would be reported and refused as unseen.
+pub fn revoke(
+    start: u64,
+    len: u64,
+    census: DeviceAliasCensus,
+    refault: Arc<dyn DeviceFrameRefault>,
+) -> Result<DeviceFrameRevocation, FsError> {
+    let hook = *REVOCATION.lock();
+    if let Some(hook) = hook {
+        return hook(start, len, census, refault);
+    }
+    // SAFETY: the caller owns the aperture for the handle's lifetime; with
+    // no address space named, the census refuses any existing alias.
+    unsafe {
+        narf_memory::address_space::revoke_device_frames(
+            &[],
+            narf_memory::PhysAddr::new(start),
+            len,
+            census,
+            refault,
+        )
+    }
+    .map_err(|error| match error {
+        narf_memory::AddressSpaceError::AllocationFailed => FsError::OutOfMemory,
+        narf_memory::AddressSpaceError::AlignmentMismatch => FsError::InvalidData,
+        _ => FsError::Busy,
+    })
 }
 
 #[path = "mmap_relocation_tests.rs"]

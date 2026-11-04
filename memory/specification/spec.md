@@ -438,6 +438,136 @@ impl UserPagePin {
 /// (the CVE-2020-29374 class), even across a later mprotect(PROT_WRITE).
 /// Physical migration to another node rejects pinned backing with
 /// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
+/// Reclaim and compaction never move or drop a pinned base page (Linux
+/// folio_maybe_dma_pinned; NARF's pin count is exact, `cow::is_pinned`):
+///   - swap_out_private_batch skips it and swaps the rest of the batch; the
+///     collect_anon_reclaim_candidates scan never offers it. A pin landing
+///     while the batch holds the page (`Evicting`, from selection to
+///     publication) marks its record under the region lock and refuses that
+///     victim at publication, even if the pin was dropped again in between
+///     (the backend snapshot may predate the device's writes): its exact
+///     leaf is restored, its slot discarded and uncharged, its frame kept,
+///     no Clear fires for it, and the count excludes it (try_to_unmap_one's
+///     anon-exclusive back-off). An access_remote write does the same.
+///   - madvise_free does not mark it; pin_user_page drops an existing
+///     LAZYFREE mark (follow_page_pte's FOLL_TOUCH folio_mark_dirty); and
+///     discard_lazyfree_pages keeps a pinned page and clears its mark
+///     (try_to_unmap_one's MADV_FREE reference test). Device writes never
+///     set DIRTY and pins carry no dirty mark, so a marked page is never
+///     pinned under the region lock.
+///   - migrate::migrate_frame returns MigrateError::Pinned for a pinned
+///     frame, single- or multi-owner, and repoint_shared_page refuses a
+///     pinned source under the owner's region lock.
+/// These reclaim paths are x86_64-only; aarch64 MADV_FREE is eager
+/// MADV_DONTNEED.
+
+// ── Interval notifiers over user ranges (`mmu_notifier`) ─────────────────
+// Linux mm/mmu_notifier.c interval API for device mirrors of user memory.
+pub enum MmuNotifierEvent { Unmap, Clear, ProtectionVma, Migrate, Release }
+pub struct MmuNotifierRange {
+    pub address_space_id: u64, pub start: u64, pub end: u64,
+    pub event: MmuNotifierEvent,
+}
+impl MmuNotifierRange { pub const fn blockable(&self) -> bool; /* always false */ }
+pub trait MmuIntervalNotifierOps: Send + Sync {
+    /// Runs with the address space's IRQ-masked mapping lock held, after the
+    /// registry stored `cur_seq`. Must not block, await, fault on user
+    /// memory, allocate infallibly, take an address-space lock, pin, or
+    /// insert/remove/drop a notifier; it may take only its own leaf lock.
+    fn invalidate(&self, interval: &MmuInterval, range: &MmuNotifierRange, cur_seq: u64);
+}
+pub enum MmuNotifierError { InvalidRange, OutOfMemory }
+pub struct MmuInterval { /* address space, [start, end), seq, released */ }
+impl MmuInterval {
+    pub fn address_space_id(&self) -> u64;
+    pub fn start(&self) -> u64;
+    pub fn end(&self) -> u64;
+    pub fn read_begin(&self) -> u64;              // mmu_interval_read_begin
+    pub fn read_retry(&self, seq: u64) -> bool;   // mmu_interval_read_retry
+    pub fn check_retry(&self, seq: u64) -> bool;  // mmu_interval_check_retry
+    pub fn set_seq(&self, cur_seq: u64);          // mmu_interval_set_seq
+    pub fn is_released(&self) -> bool;            // address space torn down
+}
+/// Owning registration; Deref<Target = MmuInterval>. Drop removes it, and no
+/// callback for it runs after the drop returns.
+pub struct MmuIntervalNotifier { /* Arc<MmuInterval> */ }
+impl MmuIntervalNotifier {
+    /// Empty, overflowing or past USER_HALF_END ranges are InvalidRange.
+    pub fn insert(space: &AddressSpace, start: u64, length: u64,
+                  ops: Arc<dyn MmuIntervalNotifierOps>)
+        -> Result<Self, MmuNotifierError>;
+    pub fn interval(&self) -> &MmuInterval;
+}
+/// Registered intervals across every address space (test census).
+pub fn registered_intervals() -> usize;
+
+/// Firing operations, each called while the lock that serializes the change
+/// is held and before any frame it retires is released:
+///   Unmap         punch_fixed* (munmap, MAP_FIXED, brk shrink, mremap
+///                 target), unmap_region, unmap_huge_region, the mremap and
+///                 MREMAP_DONTUNMAP source (relocate_*, dontunmap_*), the
+///                 OOM reaper;
+///   Clear         zap_mapping_range* (truncate), madvise_dontneed,
+///                 madvise_guard_install, COW break (cow_split_mode),
+///                 swap-out, lazy-free discard;
+///   ProtectionVma mprotect_range* / change_perms_range removing READ or WRITE;
+///   Migrate       relocate_leaf (compaction, NUMA migration), huge-page
+///                 migration, multi-owner repoint_shared_page;
+///   Release       reclaim_unshared_on_exit and AddressSpace::drop, once per
+///                 interval, which is then removed and marked released.
+/// Fork, NUMA-hint protection, growth and new mappings do not fire: none
+/// changes the frame a pinned page translates to. Lock order:
+/// VMA transaction -> shared-mapping shard -> huge regions -> regions ->
+/// notifier registry shard -> consumer leaf lock. Consumers reach user
+/// memory only through UserPagePins collected after insert, inside
+/// read_begin/read_retry; mirrors without pins are not supported.
+
+// ── Device-frame revocation and refault (`address_space::device_revoke`) ──
+// Linux ttm_bo_unmap_virtual -> unmap_mapping_range, and the xe CPU fault
+// (__xe_bo_cpu_fault) that resumes the device before re-inserting the PFN.
+pub enum DeviceRefaultError { Bus }
+pub type DeviceRefaultFuture =
+    Pin<Box<dyn Future<Output = Result<(), DeviceRefaultError>> + Send>>;
+pub trait DeviceFrameRefault: Send + Sync {
+    /// No address-space lock held. Completes once the device is accessible
+    /// and the driver has dropped its revocation, or with an error.
+    fn refault(&self, phys: PhysAddr) -> DeviceRefaultFuture;
+}
+/// Parks the faulting task until the future completes; None = cannot wait.
+pub type DeviceRefaultWait = fn(DeviceRefaultFuture) -> Option<Result<(), DeviceRefaultError>>;
+pub fn install_refault_wait(wait: Option<DeviceRefaultWait>) -> Option<DeviceRefaultWait>;
+pub const MAX_DEVICE_REVOCATIONS: usize = 16;
+/// Live until dropped; dropping ends the revocation.
+pub struct DeviceFrameRevocation { /* registry id, range */ }
+impl DeviceFrameRevocation { pub fn range(&self) -> (PhysAddr, u64); }
+pub fn is_device_frame_revoked(phys: PhysAddr) -> bool;
+/// The provider's census: report (frame, metadata aliases) for every frame
+/// of [start, end) with a nonzero count. Runs inside the global shared
+/// transaction with every named region table locked; leaf locks only, no
+/// allocation.
+pub type DeviceAliasCensus = fn(u64, u64, &mut dyn FnMut(u64, usize));
+/// Remove every present leaf of [start, start + len) in `spaces` (and its
+/// rmap owner), fire Clear per space, complete every TLB invalidation, and
+/// keep the range revoked: VMAs, slots and alias references stay. Refused
+/// with nothing changed on a census mismatch (a reported frame whose found
+/// aliases differ, or a found frame never reported), an unowned present
+/// leaf or a pinned frame (Pinned), a private alias, inexact leaf or
+/// overlapping revocation (Overlap), a bad range (AlignmentMismatch), or a
+/// full registry (AllocationFailed). With an empty `spaces` it succeeds only
+/// if the provider reports no alias at all.
+pub unsafe fn revoke_device_frames(spaces: &[Arc<AddressSpace>], start: PhysAddr,
+    len: u64, census: DeviceAliasCensus,
+    refault: Arc<dyn DeviceFrameRefault>) -> Result<DeviceFrameRevocation, AddressSpaceError>;
+/// While a revocation lives: materialize (mmap, fork child), mprotect and
+/// with_revoked_shared_frames/replace_shared_frame never map a frame of it in
+/// a SHARED region; copy_user_bytes_nofault stops at one; a fault on one
+/// calls its refault with no lock held and waits through the installed
+/// waiter. Ok retries the access (once the revocation is dropped, the
+/// ordinary repair installs the same frame and adds its rmap owner once);
+/// no waiter, a refused wait or a refault error is AddressSpaceError::Bus.
+/// mremap moves only resident leaves, so a revoked alias stays unmapped.
+/// Lock order: shared transaction -> region tables -> revocation registry
+/// (a leaf lock).
 
 /// Metadata only: cloning does not retain frames; dropping does not free them.
 /// A sorted 64-page-bucket directory provides logarithmic lookup and amortized
@@ -776,7 +906,10 @@ impl AddressSpace {
     /// and hardware-huge VMAs. Base-page index capacity, sparse-backing
     /// boundary windows, and swap state are preflighted before any permission
     /// or huge-leaf change; allocation failure leaves the VMA tree unchanged,
-    /// and internal VMA flags survive a successful split.
+    /// and internal VMA flags survive a successful split. A page in the range
+    /// that a swap-in or swap-out batch holds (`Loading`/`Evicting`) refuses
+    /// the call with `NotImplemented` (as `change_perms_range` does): the
+    /// batch has captured leaf flags it may republish.
     pub fn mprotect_range(
         &self, base: VirtAddr, len: u64, new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError>;
@@ -1453,6 +1586,48 @@ x86_64 is rejected at runtime.
   domain id + PKRS snapshot in `CpuLocal` on entry and restore on
   exit; a re-entrant call from within the same domain context is a
   bug, caught by an assertion.
+- **Interval notifiers fire inside the change, before the release.** Every
+  operation listed in §3 that changes or removes the frame a user VA
+  translates to (or removes READ/WRITE from it) calls the notifier registry
+  in the same hold of the region lock (huge-region lock for huge pages) that
+  publishes the change, and before any frame it retires reaches
+  `free_frame`, the huge pool, or an external release hook. The registry
+  stores a fresh odd sequence in each overlapping interval before calling its
+  consumer, so a `read_begin`/`read_retry` section that spans the change
+  always retries, and a reader that observes the new sequence cannot pin
+  until the change is committed (pins take the same lock). Release fires
+  once per interval at exit or final drop, before any frame of the space is
+  freed. Callbacks are non-blocking and take no address-space lock; nothing
+  in the registry takes one either, so the order mapping locks -> registry
+  shard -> consumer leaf lock has no cycle. Device access is bounded by
+  pins, not by the callback: a consumer reaches memory only through
+  `UserPagePin`s collected inside a section, so a frame the device can reach
+  is never freed or reused before the consumer drops its pins. When no
+  interval is registered every site costs one atomic load.
+- **A revoked device range has no user leaf.** From the moment a
+  `revoke_device_frames` call publishes its range (under the global shared
+  transaction and every named region table, after its alias census) until
+  its handle drops, no path installs a leaf for a frame of the range in a
+  SHARED region: the call removes every present one and completes the TLB
+  invalidation of each space before it returns, the leaf installers mask
+  the range, and a fault waits for the driver's refault. Revocation only
+  removes translations; it never frees, rebinds or grants access to a frame,
+  and the census (provider alias counts, reverse-map owners, pins) refuses
+  any alias it cannot see, so no translation of the range survives in an
+  address space outside the snapshot.
+- **Reclaim never moves or drops a pinned page.** A frame with a
+  `UserPagePin` (`cow::is_pinned`) keeps its translation and backing through
+  swap-out, lazy-free discard and every migration path, so the frame a
+  device writes through its pin is always the frame the mapping shows
+  (Linux `folio_maybe_dma_pinned`). Pins are taken under the region lock,
+  and each path decides under that lock: swap at selection and again at
+  publication, where a pin taken at any point while the batch held the page
+  refuses it even if already dropped (the committed leaf comes back and no
+  frame is freed),
+  lazy-free at mark, pin and discard time (no pinned page carries an
+  unconsumed `LAZYFREE` mark), and multi-owner migration per owner before
+  its repoint. The frame itself was already safe (the pin holds a
+  reference); this invariant keeps the device's writes visible.
 - A private fork preserves each VMA's logical POSIX WRITE bit and marks it
   COW. Hardware leaves remain read-only while their backing-frame refcount is
   greater than one. Pinned writable private pages are instead copied for the
@@ -1922,11 +2097,28 @@ x86_64 is rejected at runtime.
   intermediate descriptor only after proving the destination leaf absent;
   requirements are derived independently per leaf, failed maps leave existing
   permissions unchanged, and leaf flags remain the final authority.
-- A swap-out batch reserves one contiguous slot run, performs one backend
-  vector write, validates every same-root leaf before publishing any swap PTE,
-  and retires stale translations once before returning any victim frame to the
-  allocator. Failure before PTE publication leaves every mapping resident and
-  releases the complete slot run.
+- **A swap-out batch snapshots a victim only once no CPU can store to it.**
+  It reserves one contiguous slot run, validates every same-root leaf before
+  publishing any swap PTE, replaces each leaf with an atomic exchange that
+  keeps every hardware A/D update in the recorded old leaf, and completes one
+  TLB shootdown for the batch; only then does it perform its one backend
+  vector write, and it frees a victim frame only after that write succeeded
+  and the owner published (Linux `shrink_folio_list`: `try_to_unmap`,
+  `try_to_unmap_flush_dirty`, `pageout`, free). A store that raced the unmap
+  through a stale translation is therefore in the swapped copy. Failure
+  before the commit leaves every mapping resident and releases the complete
+  slot run; a failed backend write restores every victim's exact leaf (no
+  frame was freed, so no store is lost) and releases the run. A victim its
+  owner refuses at publication (a pin is held, or a pin or kernel write
+  reached its frame through `Region::phys` while the batch held it) gets its
+  exact leaf back under the root lock and only its slot is released; the
+  rest of the batch completes. Every restore happens while the page's
+  `Evicting` record makes mprotect, munmap, MADV_DONTNEED, mremap, fork,
+  compaction and NUMA migration (`Pinned`, move_pages -EBUSY) refuse it, so
+  the restored leaf's permissions are still the VMA's. Nothing else frees or
+  remaps an in-flight victim's frame: the OOM reaper returns `Blocked` while
+  any page is `Evicting`, and `remap_page` (NUMA-hint restore, COW break)
+  never installs a leaf over a swap entry.
 - A swap-in batch validates and reads every requested slot into unpublished
   frames before atomically replacing the same-root swap leaves. Failure leaves
   all PTEs and slots unchanged. Backend I/O runs without the global swap-device
@@ -1936,9 +2128,13 @@ x86_64 is rejected at runtime.
   the fault path restores `Loading -> Swapped`, parks, and retries the batch
   only after that ticket's kswapd cycle completes.
 - Live anonymous-private x86_64 swap uses region-table transitions
-  `Evicting -> Swapped -> Loading -> Resident`. PTE publication transfers the
-  corresponding `Region::phys` ownership before TLB invalidation/free; page-in
-  republishes Region ownership before retiring slots. A fault on `Swapped`
+  `Evicting -> Swapped -> Loading -> Resident`. Publication transfers the
+  corresponding `Region::phys` ownership after the backend write and before
+  any frame is freed; page-in republishes Region ownership before retiring
+  slots. A fault on `Evicting` (its swap entry may be committed with the
+  write still pending, so its slot is unreadable) or `Loading` neither reads
+  a slot nor maps a page: it returns for a retry until the batch publishes
+  or restores the leaf. A fault on `Swapped`
   collects consecutive leaves ahead of the fault for one vector read/PTE
   commit. Teardown atomically clears all stable swap leaves and discards their
   slots as one backend batch. Shared, COW, file-backed, and locked pages are

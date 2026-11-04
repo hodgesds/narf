@@ -199,6 +199,37 @@ MSR access. Later sensor reads repeat admission on the executing CPU and
 return unavailable on recoverable MSR faults. Non-x86_64 probes return
 `NotPresent` without a hardware access.
 
+### 3.6 GSC proxy component hand-off (`narf_drivers::gsc_proxy`)
+
+Linux binds the MEI GSC proxy client to the Intel display driver
+through the component framework and the shared ops table of
+`include/drm/intel/i915_gsc_proxy_mei_interface.h`; neither driver
+links the other. NARF keeps that split in this crate, which both
+`narf-drivers-platform` (MEI) and `narf-drivers-gpu` already depend on:
+
+- `trait GscProxyOps: Send + Sync` — `send(&[u8]) -> Result<usize, i32>`,
+  `recv(&mut [u8]) -> Result<usize, i32>` (bytes, or a negative errno),
+  `connected() -> bool` (`mei_cldev_enabled`).
+- `register_master(GscProxyMaster { name, matches, ops }) -> u64` and
+  `unregister_master(generation) -> bool` — the MEI side's
+  `component_master_add_with_match` / `component_master_del`. One master
+  at a time; a stale generation cannot withdraw a newer master.
+- `lookup(&DisplayComponent) -> Option<GscProxyBinding>` — the display
+  side's bind. `DisplayComponent` carries the PCI segment/bus/device/
+  function, vendor and 24-bit class code. The master's `matches`
+  (`mei_gsc_proxy_component_match`: Intel, class `0x030000`, bus 0)
+  decides, and a master whose client is no longer connected is not
+  returned. `GscProxyBinding::{send, recv, connected}` forward to the
+  ops; `generation` changes on every re-registration (rebind after
+  resume).
+
+The display side looks the binding up whenever it needs the proxy
+instead of receiving bind/unbind callbacks. Ops on a binding whose MEI
+client has gone away fail with `-ENODEV` without touching hardware, so
+holding a stale binding is safe. The MEI implementation, its errnos and
+limits are documented in `drivers/platform/src/mei_gsc_proxy.rs` and
+`drivers/platform/src/mei.rs`.
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

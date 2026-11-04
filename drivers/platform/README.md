@@ -22,7 +22,11 @@ vendor laptop driver — ThinkPad, IdeaPad, Dell, HP, ASUS, Samsung,
 Surface, System76 — so that only the driver appropriate to the
 running hardware activates. The rest (SMBus, TPM, thermal, fan,
 backlight, IPMI, watchdog, and the Intel/AMD chipset features)
-register independently.
+register independently. The Intel management-engine (MEI/HECI) driver
+goes beyond link bring-up: it walks the firmware client properties,
+connects host clients with per-client flow control, and carries the
+GSC proxy client that the Intel display driver binds through
+`narf_drivers::gsc_proxy` on Meteor Lake and Arrow Lake.
 
 All of these are wired into the kernel through the staged initcall
 registry: the crate exposes a single entry point that registers its

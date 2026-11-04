@@ -2,13 +2,24 @@
 //! i9xx_cursor_update_arm (CTL,POS,BASE ordering), intel_cursor_regs.h,
 //! skl_watermark.c::skl_cursor_allocation. DSB terminal+next-vblank and live
 //! cursor base/readbacks are independent of primary/GT retirement.
+//!
+//! Display 20 (Lunar Lake) runs the display-14 owner: intel_cursor.c has no
+//! display-20 branch (`i9xx_cursor_ctl`'s ARB_SLOTS is display 13 only,
+//! `CUR_FBC_CTL` ends at display 13, `HAS_HW_SAGV_WM` covers both). Its
+//! private image pages take the IP's display GGTT profile
+//! ([`crate::intel_gpu_scanout_io::display_pte`]: Xe2 PTEs at
+//! `idx[XE_CACHE_NONE]` = PAT3, the index xe_fb_pin.c maps a cursor
+//! framebuffer with) and its fault mask follows
+//! `intel_display_irq.c::gen8_de_pipe_fault_mask` (display >= 20 drops both
+//! PIPEDMC faults).
 use crate::{
+    intel_gpu::Generation,
     intel_gpu_display_resources::Profile,
     intel_gpu_dsb::Timing,
     intel_gpu_gem::{GemObject, GemState, Placement},
     intel_gpu_ggtt_ranges::{Lease, Ledger},
     intel_gpu_gtt::{PteFormat, GGTT_ARRAY_BASE},
-    intel_gpu_scanout_io::DisplayAccess,
+    intel_gpu_scanout_io::{display_pat_programmed, display_pte, DisplayAccess},
 };
 use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
@@ -40,10 +51,22 @@ pub(crate) struct Owner<M: DisplayAccess + Clone> {
     gen12: bool,
     visible_control: u32,
     faults: u32,
+    /// The GGTT PTE format and PAT index of the private image pages.
+    pte: (PteFormat, u8),
 }
 impl<M: DisplayAccess + Clone> Owner<M> {
-    pub(crate) fn new(io: M, bar_len: u64, timing: Timing) -> Result<Self, FsError> {
-        Self::new_profile(io, bar_len, timing, None)
+    /// The non-Gen12 owner of `generation`'s display: 14 (Meteor Lake) or
+    /// 20 (Lunar Lake). Any other generation is refused before a read.
+    pub(crate) fn new_for(
+        io: M,
+        bar_len: u64,
+        timing: Timing,
+        generation: Generation,
+    ) -> Result<Self, FsError> {
+        if !matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
+            return Err(FsError::Unsupported);
+        }
+        Self::new_profile(io, bar_len, timing, None, generation)
     }
     pub(crate) fn new_gen12(
         io: M,
@@ -51,15 +74,22 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         timing: Timing,
         family: crate::intel_gpu_gt::Gen12Platform,
     ) -> Result<Self, FsError> {
-        Self::new_profile(io, bar_len, timing, Some(family))
+        let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        Self::new_profile(io, bar_len, timing, Some(family), generation)
     }
     fn new_profile(
         io: M,
         bar_len: u64,
         timing: Timing,
         family: Option<crate::intel_gpu_gt::Gen12Platform>,
+        generation: Generation,
     ) -> Result<Self, FsError> {
-        if !io.access_ok() || (family.is_none() && io.read32(0x4804) != 4) {
+        let pte = display_pte(generation).ok_or(FsError::Unsupported)?;
+        if !io.access_ok() || !display_pat_programmed(&io, generation) {
             return Err(FsError::NoDevice);
         }
         if io.read32(0x70080) != 0 || (family.is_some() && io.read32(0x700a0) != 0) {
@@ -101,16 +131,18 @@ impl<M: DisplayAccess + Clone> Owner<M> {
                 0x27
             },
             // intel_display_regs.h: primary7, cursor11, DMC25, underrun31.
-            // ATS primary/DMC status exists only on display14+.
+            // ATS primary/DMC status exists only on display14+; display 20
+            // (gen8_de_pipe_fault_mask, DISPLAY_VER >= 20) keeps the plane
+            // ATS fault and has neither PIPEDMC fault.
             faults: (1 << 7)
                 | (1 << 11)
-                | (1 << 25)
                 | (1 << 31)
-                | if family.is_none() {
-                    (1 << 18) | (1 << 24)
-                } else {
-                    0
+                | match generation {
+                    Generation::MeteorLake => (1 << 25) | (1 << 18) | (1 << 24),
+                    Generation::LunarLake => 1 << 18,
+                    _ => 1 << 25,
                 },
+            pte,
         })
     }
     fn read(&self, r: u64) -> Result<u32, FsError> {
@@ -171,12 +203,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if !object.publish_for_device() {
             return Err(FsError::NoDevice);
         }
-        let format = if self.gen12 {
-            PteFormat::Gen12
-        } else {
-            PteFormat::XeLpg
-        };
-        let pat = if self.gen12 { 0 } else { 1 };
+        let (format, pat) = self.pte;
         let pages: Vec<u64> = object
             .pages()
             .map(|phys| {

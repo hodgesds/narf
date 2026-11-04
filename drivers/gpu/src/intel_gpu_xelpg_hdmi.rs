@@ -577,6 +577,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         &fb,
         probe.pll.port_clock_khz,
         None,
+        crate::intel_gpu_xelpg_dsc::PIPE_BPP,
     ) {
         Ok(ext) => ext,
         Err(e) => return Err((Err(probe), e.into())),

@@ -29,25 +29,38 @@ use crate::{
 };
 
 type Wait<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type PanelWait<'a> = Pin<Box<dyn Future<Output = Result<(), FsError>> + Send + 'a>>;
+type DisplayWakeref = crate::intel_gpu_gt_runtime::display_rpm::Wakeref;
+type RpmWait<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<DisplayWakeref>, FsError>> + Send + 'a>>;
 
 fn x_tiled_profile(
     io: &impl Platform,
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
 ) -> Result<(), FsError> {
-    tiled_profile(io, geometry, timing, crate::intel_gpu_scanout::Layout::X)
+    tiled_profile(io, geometry, timing, crate::intel_gpu_scanout::Layout::X).map(|_| ())
 }
+/// The display IP the KMS owner of `generation` proves its resources on.
+fn resource_ip(generation: Generation) -> crate::intel_gpu_xe2lpd::DisplayIp {
+    if generation == Generation::LunarLake {
+        crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd
+    } else {
+        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp
+    }
+}
+/// The tiled primary's admission; the proved display IP, `None` on Gen12.
 fn tiled_profile(
     io: &impl Platform,
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
     layout: crate::intel_gpu_scanout::Layout,
-) -> Result<(), FsError> {
+) -> Result<Option<crate::intel_gpu_xe2lpd::DisplayIp>, FsError> {
     if !io.console_access_ok() {
         return Err(FsError::NoDevice);
     }
     if let Some(family) = io.gen12_family() {
-        return gen12_primary::view_profile(io, geometry, timing, family, layout);
+        return gen12_primary::view_profile(io, geometry, timing, family, layout).map(|()| None);
     }
     crate::intel_gpu_scanout::View {
         origin: Default::default(),
@@ -56,31 +69,40 @@ fn tiled_profile(
     }
     .footprint(geometry)
     .map_err(scanout_error)?;
-    crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
-    let chicken = io.read32(0x7026c);
-    if chicken == u32::MAX {
-        return Err(FsError::NoDevice);
-    }
-    if chicken & (1 << 19) == 0 {
+    let profile = crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
+    // Display 14 scans the tiled primary out directly behind the owned
+    // PLANE_CHICKEN no-DPT bit. Display 20 has none (intel_dpt_configure):
+    // the presenter fetches it through its own DPT, whose POT-remapped
+    // layout must hold for this geometry.
+    if profile.ip.has_no_dpt_chicken() {
+        let chicken = io.read32(0x7026c);
+        if chicken == u32::MAX {
+            return Err(FsError::NoDevice);
+        }
+        if chicken & (1 << 19) == 0 {
+            return Err(FsError::Unsupported);
+        }
+    } else if crate::intel_gpu_scanout::DptLayout::new(geometry, layout).is_none() {
         return Err(FsError::Unsupported);
     }
     if !io.console_access_ok() {
         return Err(FsError::NoDevice);
     }
-    Ok(())
+    Ok(Some(profile.ip))
 }
 pub(crate) fn tile4_profile(
     io: &impl Platform,
     geometry: Geometry,
     timing: crate::intel_gpu_dsb::Timing,
 ) -> Result<(), FsError> {
-    tiled_profile(
+    let ip = tiled_profile(
         io,
         geometry,
         timing,
         crate::intel_gpu_scanout::Layout::Tile4,
-    )?;
-    crate::intel_gpu_display_resources::Primary::capture(io, timing)?;
+    )?
+    .ok_or(FsError::Unsupported)?;
+    crate::intel_gpu_display_resources::Primary::capture_ip(io, timing, ip)?;
     Ok(())
 }
 
@@ -104,7 +126,7 @@ fn xr30_resource_profile(
         .footprint(geometry)
         .map_err(scanout_error)?;
     crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
-    timing.check(io, None)?;
+    timing.check(io, None, false)?;
     if io.read32(0x70188) != geometry.pitch / 64
         || io.read32(0x70190) != ((geometry.height - 1) << 16) | (geometry.width - 1)
     {
@@ -167,6 +189,16 @@ pub(crate) fn xr30_discovery_profile(
     };
     crate::intel_gpu_color::Owner::capture(io, Generation::MeteorLake).is_ok()
         && io.published_epoch() == Some(epoch)
+}
+
+/// Display 13 (ADL-P, ADL-N): the Gen12 orchestrator writes
+/// `TRANS_VBLANK` without its start field there.
+fn gen12_display13(io: &impl Platform) -> bool {
+    use crate::intel_gpu_gt::Gen12Platform;
+    matches!(
+        io.gen12_family(),
+        Some(Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN)
+    )
 }
 
 /// The production implementation retains PCI authority and a permanent UC
@@ -250,6 +282,27 @@ pub(crate) trait Platform:
     fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
         crate::intel_gpu_psr::VbtPsr::Missing
     }
+    /// PCI device, subsystem vendor and subsystem device, which
+    /// `QUIRK_FW_SYNC_LEN` matches. Default: unknown, which refuses PSR2.
+    fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
+        None
+    }
+    /// `intel_display_rpm_get` for one KMS session
+    /// (`xe_pm_runtime_resume_and_get`): a runtime-PM reference that
+    /// resumes the function first, held for the session. Default: none.
+    fn display_rpm(&self) -> RpmWait<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// The panel's crtc off after the owner's pre-plane update: planes,
+    /// backlight, transcoder, port, PPS, PLL, pipe DMC, post-plane settle.
+    /// Default: the platform cannot turn its panel off.
+    fn panel_off(&self) -> PanelWait<'_> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// The panel's crtc on again at its mode, scanning out `console`.
+    fn panel_on<'a>(&'a self, _console: &'a ActiveScanout) -> PanelWait<'a> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
 }
 
 /// The Pipe-A eDP sink as an AUX channel over a platform window.
@@ -295,6 +348,9 @@ pub(crate) struct Physical {
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     window: crate::intel_gpu_gt_hw::AuthorizedWindow,
     generation: Generation,
+    /// Panther Lake only: the install proved display 30.00 behind the
+    /// opted-in route. `None` on every other generation.
+    display30: Option<Display30>,
     /// Shared by every retained PollIo clone. A GT reset invalidates all
     /// outstanding display/cache witnesses; reset alone never retires DMA.
     reset_lost: Arc<AtomicBool>,
@@ -302,6 +358,14 @@ pub(crate) struct Physical {
     /// The off-path FBC CFB carve, shared by every clone.
     fbc_carve: Arc<crate::intel_gpu_stolen::CarveSlot>,
 }
+/// What a Panther Lake KMS owner's install proved about display 30.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Display30 {
+    /// Wa_15015404425 still applies (`intel_gpu_xe3lpd::wa_15015404425`:
+    /// a media GT before B0).
+    flush: bool,
+}
+
 impl Physical {
     fn read64(&self, offset: u64) -> u64 {
         u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32)
@@ -412,6 +476,16 @@ impl MmioWindow for Physical {
         if self.reset_lost() && !self.recovering {
             u32::MAX
         } else {
+            // xe_mmio.c::mmio_flush_pending_writes, Wa_15015404425
+            // (xe_device_wa_oob.rules: PLATFORM(LUNARLAKE)): four dummy
+            // writes precede every read, display reads included.
+            if self.generation == Generation::LunarLake
+                || self.display30.is_some_and(|display| display.flush)
+            {
+                for _ in 0..4 {
+                    self.window.write32(0x130030, 0);
+                }
+            }
             self.window.read32(offset)
         }
     }
@@ -431,8 +505,22 @@ unsafe impl DisplayAccess for Physical {
     }
 
     fn access_ok(&self) -> bool {
+        // The GEM scanout PAT index (`display_pte`) must be the GT owner's
+        // programmed entry: MTL PAT1 = XELPG_PAT_1_WT, Xe2 PAT3 =
+        // XE2_PAT(0, 0, 0, 3, 3, 0), and display 30's Xe3 PAT3 (the same
+        // entry in xe3_lpg_pat_table).
         self.console_access_ok()
-            && (self.generation != Generation::MeteorLake || self.read32(0x4804) == 4)
+            && match self.generation {
+                Generation::MeteorLake => self.read32(0x4804) == 4,
+                Generation::LunarLake => self.read32(0x480c) == 0x3c,
+                Generation::PantherLake => self.display30.is_some() && self.read32(0x480c) == 0x3c,
+                _ => true,
+            }
+    }
+
+    fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        self.display30
+            .map(|_| crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
     }
 }
 impl Physical {
@@ -544,7 +632,10 @@ impl Physical {
             }
             card.intel_x_tiled = gen12_x;
             card.intel_tile4 = false;
-            if self.generation == Generation::MeteorLake {
+            if matches!(
+                self.generation,
+                Generation::MeteorLake | Generation::LunarLake
+            ) {
                 if let Some(mode) = card.crtcs.first().and_then(|c| c.mode) {
                     if (mode.width, mode.height) != (geometry.width, geometry.height) {
                         return;
@@ -627,7 +718,7 @@ impl Platform for Physical {
         if !self.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
+        fetchers_with_cursor(self, fetcher_generation(self), false, owned_cursor)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
             return Err(FsError::NoDevice);
         }
@@ -645,7 +736,7 @@ impl Platform for Physical {
         if !self.console_access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
+        fetchers_with_cursor(self, fetcher_generation(self), false, owned_cursor)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
             return Err(FsError::NoDevice);
         }
@@ -763,6 +854,118 @@ impl Platform for Physical {
     fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
         crate::intel_gpu_psr::installed_vbt()
     }
+    fn psr_pci_ids(&self) -> Option<(u16, u16, u16)> {
+        Some((
+            self.device.id.device,
+            self.device.id.subsystem_vendor,
+            self.device.id.subsystem_id,
+        ))
+    }
+    fn display_rpm(&self) -> RpmWait<'_> {
+        Box::pin(async move {
+            crate::intel_gpu_gt_runtime::display_rpm::wakeref_resume(self.bar.phys.raw())
+                .await
+                .map_err(|_| FsError::NoDevice)
+        })
+    }
+    fn panel_off(&self) -> PanelWait<'_> {
+        Box::pin(async move {
+            if self.generation != Generation::MeteorLake {
+                return Err(FsError::Unsupported);
+            }
+            panel_power_off(self).await
+        })
+    }
+    fn panel_on<'a>(&'a self, console: &'a ActiveScanout) -> PanelWait<'a> {
+        Box::pin(async move {
+            if self.generation != Generation::MeteorLake {
+                return Err(FsError::Unsupported);
+            }
+            panel_power_on(self, console).await
+        })
+    }
+}
+
+/// A modeset failure on the panel's crtc disable or enable.
+fn panel_modeset_error(_: crate::intel_gpu_modeset::ModesetError) -> FsError {
+    crate::intel_gpu_user::io_error()
+}
+
+/// The owned display-14 panel's crtc off, after the KMS owner's pre-plane
+/// update: `intel_crtc_disable_planes`, then `intel_ddi_disable_dp`'s
+/// `intel_edp_backlight_off` (the DPCD backlight off and the PPS gate
+/// closed, T9 waited without spinning), then the rest of `hsw_crtc_disable`
+/// and the post-plane settle (`XeLpgModeset::panel_off`).
+async fn panel_power_off(io: &Physical) -> Result<(), FsError> {
+    use crate::intel_gpu_modeset_xelpg::XeLpgModeset;
+    use crate::intel_gpu_xelpg::XeLpgPort;
+    XeLpgModeset::new(io, XeLpgPort::A)
+        .disable_planes()
+        .map_err(panel_modeset_error)?;
+    crate::intel_dpcd_bl::suspend_complete_for_bar(&io.bar)
+        .await
+        .map_err(|_| crate::intel_gpu_user::io_error())?;
+    XeLpgModeset::new(io, XeLpgPort::A)
+        .panel_off()
+        .map(|_| ())
+        .map_err(panel_modeset_error)
+}
+
+/// The panel's crtc on again with `console` scanned out, as the system
+/// resume relight does: the DPCD backlight owner powers the panel with its
+/// gate closed, the owned modeset runs its full enable at the recorded
+/// mode, then the owner relights the backlight after T8. Without a DPCD
+/// owner the PPS gate opens after T8 here (`intel_pps_backlight_on`).
+async fn panel_power_on(io: &Physical, console: &ActiveScanout) -> Result<(), FsError> {
+    use crate::intel_gpu_modeset_xelpg::{panel_off_record, XeLpgModeset};
+    use crate::intel_gpu_pm::PmPlatform as _;
+    use crate::intel_gpu_xelpg::XeLpgPort;
+    let record = panel_off_record().ok_or(FsError::Busy)?;
+    let mode = record
+        .mode
+        .or_else(|| crate::intel_gpu_pm::ProductionPlatform.display_state().0)
+        .ok_or_else(crate::intel_gpu_user::io_error)?;
+    let aux = crate::intel_dpcd_bl::installed(&io.bar);
+    if aux {
+        crate::intel_dpcd_bl::prepare_relight_for_bar(&io.bar)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+    }
+    let fb = crate::intel_gpu_modeset::Framebuffer {
+        phys_addr: u64::from(console.gtt_offset),
+        stride_bytes: console.stride_bytes,
+        format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+    };
+    XeLpgModeset::new(io, XeLpgPort::A)
+        .modeset_fixed(&fb, &mode)
+        .map_err(panel_modeset_error)?;
+    if aux {
+        return crate::intel_dpcd_bl::resume_for_bar(&io.bar)
+            .map_err(|_| crate::intel_gpu_user::io_error());
+    }
+    let delays = crate::intel_gpu_edp::panel_delays();
+    narf_time::SleepUntil::new(
+        narf_time::Deadline::after_ns(u64::from(delays.t8) * 100_000).as_instant(),
+    )
+    .await;
+    crate::intel_gpu_edp::PanelPowerSequencer::with_delays(io, delays)
+        .backlight_on()
+        .map_err(|_| crate::intel_gpu_user::io_error())
+}
+
+/// FBIOBLANK on the Intel console: [`Device::console_dpms`] on the
+/// display of `bar`, with the card's KMS master as the refusal.
+pub(crate) async fn console_dpms_for_bar(
+    bar: &narf_bus::MmioRegion,
+    on: bool,
+) -> Result<(), FsError> {
+    let display = display_for_bar(bar).ok_or(FsError::NoDevice)?;
+    let index = display.platform.index;
+    display
+        .console_dpms(on, || {
+            crate::drm_registry::mode_state(index)
+                .is_some_and(|card| card.lock().current_master.is_some())
+        })
+        .await
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -783,6 +986,16 @@ fn fetchers_idle(
 ) -> Result<(), FsError> {
     fetchers_with_cursor(mmio, generation, owned_dsb, false)
 }
+/// The inventory a KMS owner's fetcher proofs read: a Panther Lake owner is
+/// display 30.00, whose `xe2_lpd_display` inventory (FBC A–D, five
+/// universal planes) is display 20's.
+fn fetcher_generation(platform: &Physical) -> Generation {
+    if platform.display30.is_some() {
+        Generation::LunarLake
+    } else {
+        platform.generation
+    }
+}
 fn fetchers_with_cursor(
     mmio: &impl MmioWindow,
     generation: Generation,
@@ -792,10 +1005,11 @@ fn fetchers_with_cursor(
     // MIT Linux intel_cursor_regs.h, intel_fbc.c and intel_display_device.c:
     // neither cursor DMA nor FBC compression tracking belongs to this owner.
     // Refuse them rather than treating a primary latch as their retirement.
-    let fbc_count = if generation == Generation::MeteorLake {
-        2
-    } else {
-        1
+    let fbc_count = match generation {
+        Generation::MeteorLake => 2,
+        // xe2_lpd_display.fbc_mask: FBC A–D.
+        Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd.fbc_instances(),
+        _ => 1,
     };
     for fbc in 0..fbc_count {
         let ctl = mmio.read32(0x43208 + fbc * 0x40);
@@ -807,9 +1021,10 @@ fn fetchers_with_cursor(
         }
     }
     // All admitted ADL-S/P/N source families have four sprites; TGL has
-    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION.
+    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION. Display 13+
+    // (MTL's 14, LNL's 20) has four.
     let count = match generation {
-        Generation::MeteorLake | Generation::AlderLake => 5,
+        Generation::MeteorLake | Generation::AlderLake | Generation::LunarLake => 5,
         _ => 7,
     };
     // Display 14: a Pipe B–D primary the MTL external route lit through the
@@ -923,6 +1138,12 @@ struct State<M: Platform> {
     psr_sink: Option<crate::intel_gpu_psr::Sink>,
     /// A refusal that holds for the card's lifetime.
     psr_refused: Option<crate::intel_gpu_psr::Refusal>,
+    /// Why the last PSR qualification fell back to PSR1 (`None` when it
+    /// selected PSR2 or did not reach selective update).
+    psr2_refused: Option<crate::intel_gpu_psr::Psr2Refusal>,
+    /// The panel's crtc is off ([`Guard::panel_off`]): Pipe A is dark and
+    /// holds no display wakeref until [`Guard::panel_on`].
+    panel_off: bool,
 }
 
 #[derive(Debug)]
@@ -952,6 +1173,9 @@ pub(crate) struct Guard<'a, M: Platform> {
     state: MutexGuard<'a, State<M>>,
     /// DC_off for the whole session; released after the mutex.
     _power: crate::intel_gpu_dc_states::DcRef,
+    /// The session's runtime-PM reference (`intel_display_rpm_get`),
+    /// released last.
+    _rpm: Option<DisplayWakeref>,
 }
 
 impl<M: Platform> Drop for Guard<'_, M> {
@@ -999,9 +1223,26 @@ pub(crate) fn install(
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     console: ActiveScanout,
 ) {
-    if matches!(generation, Generation::LunarLake | Generation::PantherLake) {
-        return;
-    }
+    // Panther Lake is owned only as display 30.00 behind the opted-in
+    // route, which holds Pipe A for its eDP panel: linear primary flips on
+    // the console's Pipe A. Cursor, CTM/LUTs (double-buffered on display
+    // >= 30), DSB, tiled primaries, XR30, FBC and PSR are not offered.
+    let display30 = if generation == Generation::PantherLake {
+        if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
+            return;
+        }
+        let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
+        let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
+        if crate::intel_gpu_xe2lpd::DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(
+            &window, flush,
+        )) != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
+        {
+            return;
+        }
+        Some(Display30 { flush })
+    } else {
+        None
+    };
     let platform = Physical {
         index,
         bar,
@@ -1009,10 +1250,20 @@ pub(crate) fn install(
         cap,
         window: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
         generation,
+        display30,
         reset_lost: Arc::new(AtomicBool::new(false)),
         recovering: false,
         fbc_carve: Arc::new(crate::intel_gpu_stolen::CarveSlot::new()),
     };
+    // Lunar Lake is owned only as display 20.00 (§17 10.5): primary flips
+    // on the console's Pipe A, with the display-14 cursor, CTM/LUTs and DSB
+    // transactions. XR30, FBC and PSR stay unadvertised and refused.
+    if generation == Generation::LunarLake
+        && crate::intel_gpu_xe2lpd::DisplayIp::read(&platform)
+            != Ok(crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd)
+    {
+        return;
+    }
     let display = Arc::new(Device::new(platform, generation, bar.len, console.clone()));
     let mut displays = DISPLAYS.lock();
     if displays
@@ -1039,7 +1290,7 @@ pub(crate) fn install(
         let mut card = card.lock();
         card.native_atomic = true;
         card.intel_display = true;
-        if generation == Generation::MeteorLake {
+        if matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
             if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
                 card.intel_ctm = true;
                 if card.crtc_color(crtc).is_none() {
@@ -1074,14 +1325,20 @@ pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoc
     let Some(display) = display_for_bar(bar) else {
         return true;
     };
-    if display.generation != Generation::MeteorLake
-        || display.platform.published_epoch() != Some(epoch)
+    if !matches!(
+        display.generation,
+        Generation::MeteorLake | Generation::LunarLake
+    ) || display.platform.published_epoch() != Some(epoch)
     {
         return true;
     }
     let Some(state) = display.state.try_lock() else {
         return false;
     };
+    if state.panel_off {
+        // Nothing scans out: the formats are qualified again once lit.
+        return true;
+    }
     if state.failed
         || state.blocked
         || state.paused
@@ -1239,6 +1496,8 @@ impl<M: Platform> Device<M> {
                 psr: None,
                 psr_sink: None,
                 psr_refused: None,
+                psr2_refused: None,
+                panel_off: false,
             }),
         }
     }
@@ -1410,11 +1669,8 @@ impl<M: Platform> Device<M> {
             }
         }
         let format = io.format();
-        let pat = if self.generation == Generation::MeteorLake {
-            1
-        } else {
-            0
-        };
+        let pat = crate::intel_gpu_scanout_io::display_pte_ip(self.generation, fresh.display_ip())
+            .map_or(0, |(_, pat)| pat);
         // SAFETY: all old current/pending owners remain in state.presenter;
         // retained console pages are outside their arena. No pre-reset
         // completion is consumed by this independent fresh transaction.
@@ -1490,6 +1746,20 @@ impl<M: Platform> Device<M> {
         Ok(())
     }
     pub(crate) async fn session(&self) -> Result<Guard<'_, M>, FsError> {
+        self.session_for(false).await
+    }
+    /// A session for one primary present: an active PSR2 selective update
+    /// keeps running, and the present programs the commit's selective
+    /// fetch ([`Guard::present_damaged`]). PSR1, and PSR2 not active, are
+    /// paused as by [`Device::session`].
+    pub(crate) async fn selective_session(&self) -> Result<Guard<'_, M>, FsError> {
+        self.session_for(true).await
+    }
+    async fn session_for(&self, selective: bool) -> Result<Guard<'_, M>, FsError> {
+        // intel_atomic_commit's intel_display_rpm_get: a runtime-suspended
+        // function (a dark panel let it park) resumes before the session
+        // touches a register, and stays active until the session ends.
+        let rpm = self.platform.display_rpm().await?;
         let mut state = self.state.lock().await;
         if state.blocked || state.failed || self.platform.reset_lost() {
             return Err(FsError::NoDevice);
@@ -1500,34 +1770,24 @@ impl<M: Platform> Device<M> {
         if let Some(fbc) = state.fbc.as_mut() {
             fbc.invalidate(&self.platform);
         }
-        // intel_psr_pause: PSR exits and reaches idle before this session
-        // can change any frame (flip, DIRTYFB, cursor, color/DSB, console).
-        // A latched error or a failed exit disables PSR instead.
-        if let Some(Err(refusal)) = state.psr.as_mut().map(|psr| psr.pause(&self.platform)) {
-            psr_disable(&mut state, &self.platform, Some(refusal));
-        } else if state.psr.is_some() {
-            use crate::intel_gpu_psr::{idle, Refusal, PSR_EXIT_TIMEOUT_MS};
-            let deadline = self
-                .platform
-                .now()
-                .saturating_add(PSR_EXIT_TIMEOUT_MS * 1_000_000);
-            let exited = loop {
-                match idle(&self.platform) {
-                    Ok(true) => break Ok(()),
-                    Ok(false) if self.platform.now() < deadline => self.platform.tick().await,
-                    Ok(false) => break Err(Refusal::ExitTimeout),
-                    Err(refusal) => break Err(refusal),
-                }
-            };
-            if let Err(refusal) = exited {
-                psr_disable(&mut state, &self.platform, Some(refusal));
-            }
-        }
-        Ok(Guard {
+        let mut guard = Guard {
             device: self,
             state,
             _power,
-        })
+            _rpm: rpm,
+        };
+        // intel_psr_pause: PSR exits and reaches idle before this session
+        // can change any frame (flip, DIRTYFB, cursor, color/DSB, console),
+        // unless a selective update keeps running through a present.
+        if !(selective
+            && guard
+                .state
+                .psr
+                .is_some_and(|psr| psr.selective() && psr.active()))
+        {
+            guard.psr_pause().await;
+        }
+        Ok(guard)
     }
     pub(crate) async fn quiesce(&self) -> Result<(), FsError> {
         let state = self.state.lock().await;
@@ -1536,6 +1796,7 @@ impl<M: Platform> Device<M> {
             device: self,
             state,
             _power,
+            _rpm: None,
         };
         guard.restore_console().await?;
         self.platform.color_restored();
@@ -1543,6 +1804,34 @@ impl<M: Platform> Device<M> {
         Ok(())
     }
 }
+impl<M: Platform> Device<M> {
+    /// `drm_client_modeset_dpms` for the kernel console (Linux b90c984d
+    /// `drm_client_modeset.c`, reached from `drm_fb_helper_blank`): `on` is
+    /// `mode == DRM_MODE_DPMS_ON`. With a KMS master (`master`) the console
+    /// does not own the crtc and nothing changes (`Busy`, as
+    /// `drm_master_internal_acquire` refuses). Otherwise the console's crtc
+    /// goes off (the console restored first, so no KMS surface remains) or
+    /// back on.
+    pub(crate) async fn console_dpms(
+        &self,
+        on: bool,
+        master: impl Fn() -> bool,
+    ) -> Result<(), FsError> {
+        let mut guard = self.session().await?;
+        if master() {
+            return Err(FsError::Busy);
+        }
+        if on {
+            guard.panel_on().await
+        } else {
+            if !guard.panel_dark() {
+                guard.restore_console().await?;
+            }
+            guard.panel_off().await
+        }
+    }
+}
+
 impl<M: Platform> Device<M> {
     /// Stop-only external owner keeps all existing presenters/color/DMA in
     /// place. It cannot arm or adopt them; fresh authority is checked by its IO.
@@ -1653,6 +1942,7 @@ impl<M: Platform> Device<M> {
             device: self,
             state,
             _power,
+            _rpm: None,
         };
         guard.idle_dsb()?;
         let state = &guard.state;
@@ -1737,10 +2027,7 @@ impl<M: Platform> ExternalPass<'_, M> {
             let platform = &guard.device.platform;
             let paused = guard.state.psr.as_mut().map(|psr| {
                 psr.pause(platform).and_then(|()| {
-                    crate::intel_gpu_psr::wait_idle(
-                        platform,
-                        crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS,
-                    )
+                    psr.wait_idle(platform, crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS)
                 })
             });
             if let Some(Err(refusal)) = paused {
@@ -1867,11 +2154,15 @@ impl<M: Platform> Guard<'_, M> {
     /// Recheck before publishing a hardware transaction. The synchronous GT
     /// loss path can poison a busy session without acquiring this mutex.
     pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
-        if self.state.failed
-            || self.state.blocked
-            || self.device.platform.reset_lost()
-            || !self.device.platform.console_access_ok()
-        {
+        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        // A dark panel has no console scanout to prove: its retained owners
+        // re-prove themselves after the panel is on again.
+        if self.state.panel_off {
+            return Ok(());
+        }
+        if !self.device.platform.console_access_ok() {
             return Err(FsError::NoDevice);
         }
         if let Some(timing) = self.state.xr30_timing {
@@ -2125,11 +2416,11 @@ impl<M: Platform> Guard<'_, M> {
             io.qualify_xr30().map_err(|_| FsError::NoDevice)?;
         }
         let format = io.format();
-        let pat = if self.device.generation == Generation::MeteorLake {
-            1
-        } else {
-            0
-        };
+        let pat = crate::intel_gpu_scanout_io::display_pte_ip(
+            self.device.generation,
+            self.device.platform.display_ip(),
+        )
+        .map_or(0, |(_, pat)| pat);
         // SAFETY: startup owns the empty display-only arena and the original
         // console allocation remains retained by the registered IntelGpu.
         let mut presenter = unsafe {
@@ -2221,6 +2512,19 @@ impl<M: Platform> Guard<'_, M> {
         object: Arc<GemObject>,
         geometry: Geometry,
     ) -> Result<FlipStamp, FsError> {
+        self.present_damaged(object, geometry, &crate::drm::fb_cmd::Damage::Full)
+            .await
+    }
+    /// [`Guard::present`] for a commit whose primary-plane damage is
+    /// `damage` (FB_DAMAGE_CLIPS or DIRTYFB clips). An active PSR2 runs a
+    /// selective update: the commit's selective fetch is programmed around
+    /// the arm ([`Guard::psr_su_prepare`]).
+    pub(crate) async fn present_damaged(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+        damage: &crate::drm::fb_cmd::Damage,
+    ) -> Result<FlipStamp, FsError> {
         self.reconcile_unexposed_xr30();
         self.check(geometry)?;
         if self.state.color_unpublished || self.state.mixed_unpublished {
@@ -2232,10 +2536,14 @@ impl<M: Platform> Guard<'_, M> {
         self.finish_color().await?;
         self.finish_pending().await?;
         self.start().await?;
+        let selective = self.psr_su_prepare(damage).await;
         let id = self.prepare_surface(object.clone(), geometry, Default::default())?;
         let ticket = self.ticket()?;
         // Record the new owner before arming. Cancellation never unpins it.
         self.state.pending = Some((object, id));
+        if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
+            psr.program_sel_fetch_arm(&self.device.platform, sf);
+        }
         if let Err(error) = self.state.presenter.as_mut().expect("presenter").arm(
             id,
             ticket,
@@ -2260,6 +2568,10 @@ impl<M: Platform> Guard<'_, M> {
             }
             self.state.failed = true;
             return Err(scanout_error(error));
+        }
+        // The cursor's arm follows the primary's in the same commit.
+        if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
+            psr.program_sel_fetch_cursor(&self.device.platform, sf);
         }
         let stamp = self
             .finish_pending()
@@ -2287,12 +2599,39 @@ impl<M: Platform> Guard<'_, M> {
             return;
         }
         let refusal = match self.psr_qualify() {
-            Ok(config) => {
+            Ok((config, su)) => {
                 if let Some(fbc) = self.state.fbc.as_mut() {
                     fbc.disable(&self.device.platform);
                 }
                 let platform = &self.device.platform;
-                match crate::intel_gpu_psr::Psr::enable(platform, &mut PsrAux(platform), config) {
+                let enabled = match su {
+                    // The commit that qualified PSR2 damaged the whole plane.
+                    Some(su) => self.psr_su_facts().and_then(|(scaled, cursor)| {
+                        let src = crate::drm::fb_cmd::Rect::new(
+                            0,
+                            0,
+                            i32::from(su.width),
+                            i32::from(su.height),
+                        );
+                        crate::intel_gpu_psr::Psr::enable_su(
+                            platform,
+                            &mut PsrAux(platform),
+                            config,
+                            su,
+                            &crate::intel_gpu_psr::SuCommit {
+                                damage: &crate::drm::fb_cmd::Damage::Full,
+                                old_src: src,
+                                src,
+                                pipe_supported: !scaled,
+                                cursor,
+                            },
+                        )
+                    }),
+                    None => {
+                        crate::intel_gpu_psr::Psr::enable(platform, &mut PsrAux(platform), config)
+                    }
+                };
+                match enabled {
                     Ok(psr) => {
                         self.state.psr = Some(psr);
                         return;
@@ -2308,15 +2647,29 @@ impl<M: Platform> Guard<'_, M> {
     }
     /// `intel_psr_compute_config` against the live fixed timing, the VBT,
     /// the (cached) sink capability and the `wm_level_disabled` of the
-    /// Pipe-A watermarks proved programmed just now.
-    fn psr_qualify(&mut self) -> Result<crate::intel_gpu_psr::Psr1, crate::intel_gpu_psr::Refusal> {
-        use crate::intel_gpu_psr::{compute_psr1, Refusal, Sink, DRM_MODE_FLAG_INTERLACE};
+    /// Pipe-A watermarks proved programmed just now; then
+    /// `intel_sel_update_config_valid`, whose refusal (recorded in
+    /// `psr2_refused`) falls back to PSR1.
+    #[allow(clippy::type_complexity)]
+    fn psr_qualify(
+        &mut self,
+    ) -> Result<
+        (
+            crate::intel_gpu_psr::Psr1,
+            Option<crate::intel_gpu_psr::Psr2>,
+        ),
+        crate::intel_gpu_psr::Refusal,
+    > {
+        use crate::intel_gpu_psr::{
+            compute_psr1, compute_psr2, psr2_source, Psr2Refusal, Refusal, Sink,
+            DRM_MODE_FLAG_INTERLACE,
+        };
         let platform = &self.device.platform;
         let timing = platform.psr_timing().ok_or(Refusal::NoTiming)?;
         // psr_global_enabled comes first: no sink conversation for a panel
         // the VBT does not enable.
         let vbt = platform.psr_vbt();
-        vbt.enabled()?;
+        let panel = vbt.enabled()?;
         if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
             return Err(Refusal::Interlaced);
         }
@@ -2353,7 +2706,145 @@ impl<M: Platform> Guard<'_, M> {
                     crate::intel_gpu_display_resources::Profile::capture_timing(platform, timing);
             }
         }
-        compute_psr1(&sink, &timing, &vbt, platform.psr_wm_level_disabled())
+        let config = compute_psr1(&sink, &timing, &vbt, platform.psr_wm_level_disabled())?;
+        // has_sel_update: a sink without SU support needs no source facts.
+        let su = if sink.su_support() {
+            psr2_source(
+                platform,
+                &mut PsrAux(platform),
+                &sink,
+                platform.psr_pci_ids(),
+            )
+            .and_then(|source| compute_psr2(&sink, &timing, &panel, &source))
+        } else {
+            Err(Psr2Refusal::NoSinkSu)
+        };
+        self.state.psr2_refused = su.err();
+        Ok((config, su.ok()))
+    }
+    /// The live pipe facts a selective-fetch commit needs: whether a pipe
+    /// or plane scaler is engaged, and the visible cursor.
+    #[allow(clippy::type_complexity)]
+    fn psr_su_facts(
+        &self,
+    ) -> Result<(bool, Option<crate::intel_gpu_psr::CursorPlane>), crate::intel_gpu_psr::Refusal>
+    {
+        let platform = &self.device.platform;
+        Ok((
+            crate::intel_gpu_psr::pipe_scaled(platform)?,
+            crate::intel_gpu_psr::CursorPlane::read(platform)?,
+        ))
+    }
+    /// `intel_psr_pause` and `intel_psr_wait_exit_locked` within
+    /// [`crate::intel_gpu_psr::PSR_EXIT_TIMEOUT_MS`] for this PSR's mode. A
+    /// latched error or a failed exit disables PSR instead.
+    async fn psr_pause(&mut self) {
+        use crate::intel_gpu_psr::{Refusal, PSR_EXIT_TIMEOUT_MS};
+        let device = self.device;
+        let platform = &device.platform;
+        match self.state.psr.as_mut().map(|psr| psr.pause(platform)) {
+            None => return,
+            Some(Err(refusal)) => {
+                psr_disable(&mut self.state, platform, Some(refusal));
+                return;
+            }
+            Some(Ok(())) => {}
+        }
+        let Some(psr) = self.state.psr else {
+            return;
+        };
+        let deadline = platform
+            .now()
+            .saturating_add(PSR_EXIT_TIMEOUT_MS * 1_000_000);
+        let exited = loop {
+            match psr.idle(platform) {
+                Ok(true) => break Ok(()),
+                Ok(false) if platform.now() < deadline => platform.tick().await,
+                Ok(false) => break Err(Refusal::ExitTimeout),
+                Err(refusal) => break Err(refusal),
+            }
+        };
+        if let Err(refusal) = exited {
+            psr_disable(&mut self.state, platform, Some(refusal));
+        }
+    }
+    /// The PSR half of a primary commit before its arm, for an active PSR2
+    /// selective update (`intel_psr2_sel_fetch_update`, then the pipe
+    /// update): compute the SU area from `damage` and the live cursor,
+    /// write the primary's no-arm selective-fetch registers, raise the
+    /// frame-change event and wait (bounded at `PSR_IDLE_TIMEOUT_MS`) for
+    /// PSR2 to leave deep sleep. The caller writes the arm half around the
+    /// plane arm. Linux proceeds after a timed-out wait; here PSR2 also
+    /// exits then (the guard's drop re-arms it), because no vblank
+    /// interrupt can wake it. Anything in flight on the pipe (DSB, cursor
+    /// or color) exits PSR as every other session does. A latched error or
+    /// a register that reads all-ones disables PSR. `None` when no
+    /// selective update runs.
+    async fn psr_su_prepare(
+        &mut self,
+        damage: &crate::drm::fb_cmd::Damage,
+    ) -> Option<crate::intel_gpu_psr::SelFetch> {
+        use crate::intel_gpu_psr::{frame_change_event, Psr, SuCommit, PSR_IDLE_TIMEOUT_MS};
+        let device = self.device;
+        let platform = &device.platform;
+        let psr = self.state.psr?;
+        if !psr.active() {
+            return None;
+        }
+        if !psr.selective() {
+            self.psr_pause().await;
+            return None;
+        }
+        if let Err(refusal) = Psr::error(platform) {
+            psr_disable(&mut self.state, platform, Some(refusal));
+            return None;
+        }
+        let state = &self.state;
+        if state.joint.is_some()
+            || state.dsb.as_ref().is_some_and(|d| d.armed())
+            || state.cursor.as_ref().is_some_and(|c| c.pending())
+            || state.color.as_ref().is_some_and(|c| c.pending())
+        {
+            self.psr_pause().await;
+            return None;
+        }
+        let (scaled, cursor) = match self.psr_su_facts() {
+            Ok(facts) => facts,
+            Err(refusal) => {
+                psr_disable(&mut self.state, platform, Some(refusal));
+                return None;
+            }
+        };
+        let geometry = self.console_geometry();
+        let src =
+            crate::drm::fb_cmd::Rect::new(0, 0, geometry.width as i32, geometry.height as i32);
+        let sf = psr.sel_fetch(&SuCommit {
+            damage,
+            old_src: src,
+            src,
+            pipe_supported: !scaled,
+            cursor,
+        })?;
+        psr.program_sel_fetch_noarm(platform, &sf);
+        frame_change_event(platform);
+        let deadline = platform
+            .now()
+            .saturating_add(PSR_IDLE_TIMEOUT_MS * 1_000_000);
+        loop {
+            match psr.ready_for_update(platform) {
+                Ok(true) => break,
+                Ok(false) if platform.now() < deadline => platform.tick().await,
+                Ok(false) => {
+                    self.psr_pause().await;
+                    break;
+                }
+                Err(refusal) => {
+                    psr_disable(&mut self.state, platform, Some(refusal));
+                    return None;
+                }
+            }
+        }
+        Some(sf)
     }
     /// `intel_psr_pre_plane_update`'s Wa_14015648006 half: before a staged
     /// primary image whose `wm_level_disabled` is true can latch, an
@@ -2422,8 +2913,10 @@ impl<M: Platform> Guard<'_, M> {
     /// plane disables.
     fn fbc_after_latch(&mut self, geometry: Geometry) {
         use crate::intel_gpu_fbc::{cfb_size, check_plane, min_limit, override_stride, Fbc};
-        // has_psr (enabled, even while paused) refuses FBC: PSR wins.
+        // has_psr (enabled, even while paused) refuses FBC: PSR wins, and
+        // has_sel_update refuses it first ("Selective update enabled").
         let psr = self.state.psr.is_some();
+        let selective_update = self.state.psr.is_some_and(|p| p.selective());
         let plane = crate::intel_gpu_fbc::Plane {
             kms_owned: self.state.current.is_some(),
             format: if self.state.xr30_timing.is_some() || self.state.xr30_epoch.is_some() {
@@ -2440,7 +2933,7 @@ impl<M: Platform> Guard<'_, M> {
             rotated_90: false,
             interlaced: false,
             psr1: psr,
-            selective_update: false,
+            selective_update,
         };
         if self.state.fbc.is_none() && !self.state.fbc_refused && check_plane(&plane).is_ok() {
             // Only polled: the carve and its GGTT survey run off this path,
@@ -2466,6 +2959,69 @@ impl<M: Platform> Guard<'_, M> {
         if let Some(fbc) = self.state.fbc.as_mut() {
             let _ = fbc.flush(&self.device.platform, &plane);
         }
+    }
+    /// Whether the panel's crtc is off.
+    pub(crate) fn panel_dark(&self) -> bool {
+        self.state.panel_off
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn psr(&self) -> Option<crate::intel_gpu_psr::Psr> {
+        self.state.psr
+    }
+    /// The panel's crtc off (display 14): `intel_atomic_commit_tail` for
+    /// the crtc going inactive. The caller has restored the console, so no
+    /// client surface, cursor, colour or DSB stream remains; a frame change
+    /// still unlatched refuses `Busy` before anything is touched. The
+    /// pre-plane update disables PSR (`intel_psr_pre_plane_update` for a
+    /// modeset) and FBC (`intel_fbc_pre_update`, then `intel_fbc_disable`),
+    /// then the platform runs the crtc disable. Idempotent.
+    pub(crate) async fn panel_off(&mut self) -> Result<(), FsError> {
+        if self.state.panel_off {
+            return Ok(());
+        }
+        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        let state = &self.state;
+        if state.pending.is_some()
+            || state.joint.is_some()
+            || state.presenter.is_some()
+            || state.color_unpublished
+            || state.mixed_unpublished
+            || state.dsb.as_ref().is_some_and(|d| d.armed())
+            || state
+                .cursor
+                .as_ref()
+                .is_some_and(|c| c.active() || c.pending())
+            || state.color.as_ref().is_some_and(|c| c.pending())
+            || state
+                .primary_resources
+                .as_ref()
+                .is_some_and(|p| p.pending())
+        {
+            return Err(FsError::Busy);
+        }
+        psr_disable(&mut self.state, &self.device.platform, None);
+        if let Some(fbc) = self.state.fbc.as_mut() {
+            fbc.disable(&self.device.platform);
+        }
+        self.device.platform.panel_off().await?;
+        self.state.panel_off = true;
+        Ok(())
+    }
+    /// The panel's crtc on again (the owned modeset at the panel's mode
+    /// with the console surface). Idempotent while the panel is lit.
+    pub(crate) async fn panel_on(&mut self) -> Result<(), FsError> {
+        if !self.state.panel_off {
+            return Ok(());
+        }
+        if self.state.failed || self.state.blocked || self.device.platform.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        let console = self.state.console.clone();
+        self.device.platform.panel_on(&console).await?;
+        self.state.panel_off = false;
+        Ok(())
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
         // Console reclaim: PSR (source, then sink) and FBC are fully
@@ -2708,7 +3264,10 @@ impl<M: Platform> Guard<'_, M> {
         self.ownership_valid()?;
         if !matches!(
             self.device.generation,
-            Generation::MeteorLake | Generation::TigerLake | Generation::AlderLake
+            Generation::MeteorLake
+                | Generation::LunarLake
+                | Generation::TigerLake
+                | Generation::AlderLake
         ) || !timing.valid()
         {
             return Err(FsError::Unsupported);
@@ -2743,7 +3302,10 @@ impl<M: Platform> Guard<'_, M> {
                 .check(&self.device.platform, family)?;
             None
         } else {
-            if self.device.generation != Generation::MeteorLake {
+            if !matches!(
+                self.device.generation,
+                Generation::MeteorLake | Generation::LunarLake
+            ) {
                 return Err(FsError::Unsupported);
             }
             Some(crate::intel_gpu_display_resources::Profile::capture_timing(
@@ -2761,10 +3323,11 @@ impl<M: Platform> Guard<'_, M> {
                     family,
                 )?
             } else {
-                crate::intel_gpu_cursor::Owner::new(
+                crate::intel_gpu_cursor::Owner::new_for(
                     self.device.platform.clone(),
                     self.device.bar_len,
                     timing,
+                    self.device.generation,
                 )?
             };
             self.state.cursor = Some(cursor);
@@ -2779,11 +3342,13 @@ impl<M: Platform> Guard<'_, M> {
                     self.device.platform.clone(),
                     self.device.bar_len,
                     profile.latencies,
+                    gen12_display13(&self.device.platform),
                 )
             } else {
-                crate::intel_gpu_dsb::Owner::reserve(
+                crate::intel_gpu_dsb::Owner::reserve_for(
                     self.device.platform.clone(),
                     self.device.bar_len,
+                    self.device.generation,
                 )
             };
             match reserved {
@@ -3160,14 +3725,15 @@ impl<M: Platform> Guard<'_, M> {
             return Err(FsError::InvalidData);
         }
         if view.layout != crate::intel_gpu_scanout::Layout::Linear {
-            tiled_profile(&self.device.platform, geometry, timing, view.layout)?;
+            let ip = tiled_profile(&self.device.platform, geometry, timing, view.layout)?;
             if view.layout == crate::intel_gpu_scanout::Layout::Tile4
                 && self.state.primary_resources.is_none()
             {
                 // Prove target WM/min-DDB fit before any new GEM mapping.
-                crate::intel_gpu_display_resources::Primary::capture(
+                crate::intel_gpu_display_resources::Primary::capture_ip(
                     &self.device.platform,
                     timing,
+                    ip.ok_or(FsError::Unsupported)?,
                 )?;
             }
         }
@@ -3224,12 +3790,14 @@ impl<M: Platform> Guard<'_, M> {
         // Gen12 joint qualification is fixed linear/origin-zero only. The
         // worker still acquires exact family, route, DDB/WM and console proofs;
         // a Card capability alone cannot authorize a command or scanout write.
-        if self.device.generation != Generation::MeteorLake
-            && (self.device.platform.gen12_family().is_none()
-                || primary.as_ref().is_some_and(|target| {
-                    target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
-                        || target.view.input != crate::intel_gpu_scanout::InputFormat::Xrgb8888
-                }))
+        if !matches!(
+            self.device.generation,
+            Generation::MeteorLake | Generation::LunarLake
+        ) && (self.device.platform.gen12_family().is_none()
+            || primary.as_ref().is_some_and(|target| {
+                target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
+                    || target.view.input != crate::intel_gpu_scanout::InputFormat::Xrgb8888
+            }))
         {
             return Err(FsError::Unsupported);
         }
@@ -3323,11 +3891,13 @@ impl<M: Platform> Guard<'_, M> {
                             self.device.platform.clone(),
                             self.device.bar_len,
                             resources.latencies,
+                            gen12_display13(&self.device.platform),
                         )
                     } else {
-                        crate::intel_gpu_dsb::Owner::reserve(
+                        crate::intel_gpu_dsb::Owner::reserve_for(
                             self.device.platform.clone(),
                             self.device.bar_len,
+                            self.device.generation,
                         )
                     }
                     .map_err(|error| {
@@ -3408,9 +3978,10 @@ impl<M: Platform> Guard<'_, M> {
                         && self.state.primary_resources.is_none()
                     {
                         self.state.primary_resources =
-                            Some(crate::intel_gpu_display_resources::Primary::capture(
+                            Some(crate::intel_gpu_display_resources::Primary::capture_ip(
                                 &self.device.platform,
                                 timing,
+                                resource_ip(self.device.generation),
                             )?);
                     }
                     let id = self.prepare_surface(object.clone(), *geometry, *view)?;

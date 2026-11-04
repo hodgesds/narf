@@ -181,6 +181,7 @@ pub(crate) fn hold(index: u32, bar: &narf_bus::MmioRegion) -> Option<Hold> {
 }
 
 /// Why a runtime park is refused.
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkRefusal {
     /// A system sleep owns the function.
@@ -198,6 +199,7 @@ pub(crate) enum ParkRefusal {
 
 /// The runtime-park admission. CPU mappings of system-memory objects are
 /// never an input: they stay valid across D3hot (`xe_bo.c`, module header).
+#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(crate) fn park_refusal(
     system_suspended: bool,
     running: bool,
@@ -379,6 +381,28 @@ impl Registry {
         }
     }
 
+    /// `intel_display_rpm_get` (`xe_pm_runtime_resume_and_get`): a wakeref
+    /// that first resumes a runtime-suspended function, for a display
+    /// conversation that must reach the hardware (a KMS commit, the console
+    /// lighting its panel). `Ok(None)` before the function is bound; `Err`
+    /// when the resume failed, with the reference given back.
+    pub(crate) async fn wakeref_resume(&self, bar: u64) -> Result<Option<Wakeref>, Suspended> {
+        let device = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.bar == bar)
+            .and_then(|entry| entry.device.clone());
+        let Some(device) = device else {
+            return Ok(None);
+        };
+        if device.resume_and_get().await.is_err() {
+            let _ = device.put_autosuspend();
+            return Err(Suspended);
+        }
+        Ok(Some(Wakeref(device)))
+    }
+
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn forget(&self, bar: u64) {
         self.entries.lock().retain(|entry| entry.bar != bar);
@@ -400,6 +424,10 @@ pub(crate) fn bind(bar: u64, device: Arc<RuntimePmDevice>) -> u32 {
 /// [`Registry::wakeref_if_active`] on the production registry.
 pub(crate) fn wakeref_if_active(bar: u64) -> Result<Option<Wakeref>, Suspended> {
     REGISTRY.wakeref_if_active(bar)
+}
+/// [`Registry::wakeref_resume`] on the production registry.
+pub(crate) async fn wakeref_resume(bar: u64) -> Result<Option<Wakeref>, Suspended> {
+    REGISTRY.wakeref_resume(bar).await
 }
 
 // ── Hotplug polling while runtime-suspended ─────────────────────

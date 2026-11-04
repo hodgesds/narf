@@ -27,7 +27,103 @@ const IER: u64 = 0x4440c;
 const FLIP_DONE: u32 = 1 << 3;
 const COMMON_STATUS: u32 = FLIP_DONE | (1 << 7) | (1 << 25) | (1 << 31);
 const MTL_ATS_STATUS: u32 = (1 << 18) | (1 << 24);
+/// `GEN12_PIPEDMC_FAULT` (tgl–mtl) and `MTL_PLANE_ATS_FAULT` (mtl+).
+const PIPEDMC_FAULT: u32 = 1 << 25;
+const PLANE_ATS_FAULT: u32 = 1 << 18;
 const FRAME_COUNT: u64 = 0x40;
+
+/// The owned DE pipe status: flip done, the FIFO underrun and the
+/// `intel_display_irq.c::gen8_de_pipe_fault_mask` bits for the primary
+/// plane. Display 20 keeps the plane ATS fault but drops both PIPEDMC
+/// faults (`MTL_PIPEDMC_ATS_FAULT`, `GEN12_PIPEDMC_FAULT`).
+pub(crate) const fn owned_status(generation: Generation) -> u32 {
+    match generation {
+        Generation::MeteorLake => COMMON_STATUS | MTL_ATS_STATUS,
+        Generation::LunarLake => (COMMON_STATUS & !PIPEDMC_FAULT) | PLANE_ATS_FAULT,
+        _ => COMMON_STATUS,
+    }
+}
+
+/// The GEM scanout PTE format and GGTT PAT index the KMS owner maps with,
+/// once the GT owner has programmed that index: Gen12 has no PAT field;
+/// Xe-LPG uses `XELPG_PAT_1_WT`; Xe2 uses xe_pat.c's display
+/// `idx[XE_CACHE_NONE]` = 3 (`XE2_PAT(0, 0, 0, 3, 3, 0)`, uncached), which
+/// xe_fb_pin.c::__xe_pin_fb_vma_ggtt encodes into the GGTT PTE. `None` for a
+/// generation without a KMS owner.
+pub(crate) const fn display_pte(generation: Generation) -> Option<(PteFormat, u8)> {
+    match generation {
+        Generation::TigerLake | Generation::AlderLake => Some((PteFormat::Gen12, 0)),
+        Generation::MeteorLake => Some((PteFormat::XeLpg, 1)),
+        Generation::LunarLake => Some((PteFormat::Xe2, 3)),
+        Generation::PantherLake => None,
+    }
+}
+
+/// [`display_pte`] for an owner whose install proved its display IP:
+/// Panther Lake is owned only as display 30.00 (the opted-in route), whose
+/// GEM scanout PTEs are the Xe2 format at xe_pat.c's display
+/// `idx[XE_CACHE_NONE]` = 3 (`xe3_lpg_pat_table[3]` =
+/// `XE2_PAT(0, 0, 0, 3, 3, 0)`, the same uncached entry as Xe2). Every
+/// other generation keeps [`display_pte`].
+pub(crate) const fn display_pte_ip(
+    generation: Generation,
+    ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
+) -> Option<(PteFormat, u8)> {
+    match (generation, ip) {
+        (Generation::PantherLake, Some(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)) => {
+            Some((PteFormat::Xe2, 3))
+        }
+        _ => display_pte(generation),
+    }
+}
+
+/// [`owned_status`] for an owner whose install proved its display IP:
+/// display 30.00 takes `gen8_de_pipe_fault_mask`'s display >= 20 set.
+pub(crate) const fn owned_status_ip(
+    generation: Generation,
+    ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
+) -> u32 {
+    match (generation, ip) {
+        (Generation::PantherLake, Some(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)) => {
+            owned_status(Generation::LunarLake)
+        }
+        _ => owned_status(generation),
+    }
+}
+
+/// [`display_pat_programmed`] for an owner whose install proved its display
+/// IP: display 30.00 requires the GT owner's `PAT_INDEX(3)` to read 0x3c.
+#[allow(dead_code)]
+pub(crate) fn display_pat_programmed_ip(
+    io: &(impl MmioWindow + ?Sized),
+    generation: Generation,
+    ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
+) -> bool {
+    match (generation, ip) {
+        (Generation::PantherLake, Some(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)) => {
+            io.read32(0x480c) == 0x3c
+        }
+        _ => display_pat_programmed(io, generation),
+    }
+}
+
+/// Whether the GT owner has programmed the PAT entry behind
+/// [`display_pte`]'s index, read through `io`: MTL `PAT_INDEX(1)` (0x4804)
+/// holds `XELPG_PAT_1_WT` (4); Xe2 `PAT_INDEX(3)` (0x480c) holds
+/// `XE2_PAT(0, 0, 0, 3, 3, 0)` (0x3c, xe_pat.c `xe2_pat_table`). Gen12 GGTT
+/// PTEs carry no PAT field, so nothing is read. Every display owner that
+/// maps GGTT pages (primary, cursor, DSB) gates on this.
+pub(crate) fn display_pat_programmed(
+    io: &(impl MmioWindow + ?Sized),
+    generation: Generation,
+) -> bool {
+    match generation {
+        Generation::TigerLake | Generation::AlderLake => true,
+        Generation::MeteorLake => io.read32(0x4804) == 4,
+        Generation::LunarLake => io.read32(0x480c) == 0x3c,
+        Generation::PantherLake => false,
+    }
+}
 
 /// Current PCI capability invocation plus retained D0/display-well ownership.
 ///
@@ -44,6 +140,12 @@ pub(crate) unsafe trait DisplayAccess: MmioWindow {
     /// Stable physical PCI BAR identity; isolated native register vectors may
     /// omit it, but production DMA reservations always supply the shared key.
     fn ggtt_key(&self) -> Option<u64> {
+        None
+    }
+    /// The display IP the owner's install proved, where its generation
+    /// alone does not determine it (Panther Lake's display 30.00). `None`
+    /// keeps every generation-level profile.
+    fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
         None
     }
 }
@@ -119,10 +221,11 @@ impl<M: DisplayAccess> PollIo<M> {
         pipe: Pipe,
         bar_len: u64,
     ) -> Result<Self, IoError> {
-        let format = match generation {
-            Generation::TigerLake | Generation::AlderLake => PteFormat::Gen12,
-            Generation::MeteorLake => PteFormat::XeLpg,
-            Generation::LunarLake | Generation::PantherLake => return Err(IoError::Unsupported),
+        // Lunar Lake is admitted only as display 20.00, which the KMS owner
+        // verified (GMD_ID_DISPLAY) before installing; Panther Lake only as
+        // the display 30.00 its install proved (`display_ip`).
+        let Some((format, _)) = display_pte_ip(generation, mmio.display_ip()) else {
+            return Err(IoError::Unsupported);
         };
         if pipe != Pipe::A {
             return Err(IoError::Unsupported);
@@ -145,12 +248,7 @@ impl<M: DisplayAccess> PollIo<M> {
             }
         }
 
-        let status = COMMON_STATUS
-            | if format == PteFormat::XeLpg {
-                MTL_ATS_STATUS
-            } else {
-                0
-            };
+        let status = owned_status_ip(generation, mmio.display_ip());
         let mut owner = Self {
             mmio,
             bar_len,
@@ -219,13 +317,15 @@ impl<M: DisplayAccess> PollIo<M> {
                 }
                 crate::intel_gpu_pipes::gen12_xrgb_control(family)
             }
-            (PteFormat::XeLpg, None) => 0x84000000,
+            // skl_plane_ctl has no display-20 branch for a linear XRGB8888
+            // primary: the display-14 console control applies unchanged.
+            (PteFormat::XeLpg | PteFormat::Xe2, None) => 0x84000000,
             _ => return Err(IoError::Unsupported),
         };
         // Preserve already-admitted MTL's original harmless trickle/clear
         // controls. Format and arbitration stay source-exact; Gen12's
         // stronger primary owner admits only the exact family literal.
-        let harmless = if self.format == PteFormat::XeLpg {
+        let harmless = if matches!(self.format, PteFormat::XeLpg | PteFormat::Xe2) {
             (1 << 14) | (1 << 13)
         } else {
             0
@@ -284,12 +384,7 @@ impl<M: DisplayAccess> PollIo<M> {
         if ier == u32::MAX || !mmio.access_ok() {
             return Err(IoError::Unavailable);
         }
-        let status = COMMON_STATUS
-            | if generation == Generation::MeteorLake {
-                MTL_ATS_STATUS
-            } else {
-                0
-            };
+        let status = owned_status_ip(generation, mmio.display_ip());
         Ok(SavedStatus {
             ier: ier & status,
             imr: imr & status,

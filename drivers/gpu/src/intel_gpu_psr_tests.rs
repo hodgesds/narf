@@ -706,3 +706,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_psr",
     smoke_psr_wm_optimization_wa_follows_pre_and_post_plane_update
 );
+
+#[path = "intel_gpu_psr2_tests.rs"]
+mod psr2;

@@ -1145,6 +1145,201 @@ kernel_test_in!(
     smoke_userspace_job_finishing_at_its_deadline_retires
 );
 
+/// UPDATE_CONTEXT_POLICIES (0x100b) requests pending in the host CT, before
+/// the model consumes them: full policies as (id, priority, quantum) and
+/// priority-only updates as (id, priority).
+#[allow(clippy::type_complexity)]
+fn context_policies(w: &Window) -> (Vec<(u32, u32, u32)>, Vec<(u32, u32)>) {
+    let memory = ct_memory(w);
+    let words = memory.borrow();
+    let (mut head, tail) = (words[0], words[1]);
+    let (mut full, mut updates) = (Vec::new(), Vec::new());
+    while head != tail {
+        let count = words[1024 + head as usize] & 255;
+        let request: Vec<u32> = (1..=count)
+            .map(|n| words[1024 + ((head + n) & 1023) as usize])
+            .collect();
+        if request[0] as u16 == 0x100b {
+            // GUC_CONTEXT_POLICIES_KLV_ID_SCHEDULING_PRIORITY, length 1.
+            assert_eq!(request[2], 0x20030001);
+            match request.len() {
+                10 => full.push((request[1], request[3], request[5])),
+                4 => updates.push((request[1], request[3])),
+                n => panic!("{n}-word UPDATE_CONTEXT_POLICIES"),
+            }
+        }
+        head = (head + count + 1) & 1023;
+    }
+    (full, updates)
+}
+
+/// Poll `range` (stopping once `fence` completes), collecting every
+/// UPDATE_CONTEXT_POLICIES the scheduler queued.
+#[allow(clippy::type_complexity)]
+fn drive_policies(
+    gt: &mut GuCGt<Window, Arena>,
+    w: &Window,
+    registered: &mut BTreeMap<u32, u32>,
+    range: core::ops::Range<u64>,
+    execute: bool,
+    fence: Option<&CompletionFence>,
+) -> (Vec<(u32, u32, u32)>, Vec<(u32, u32)>) {
+    let (mut full, mut updates) = (Vec::new(), Vec::new());
+    for now in range {
+        ready(gt, now);
+        let (f, u) = context_policies(w);
+        full.extend(f);
+        updates.extend(u);
+        service_contexts(w, registered, execute);
+        if fence.is_some_and(|fence| fence.result().is_some()) {
+            break;
+        }
+    }
+    (full, updates)
+}
+
+/// MIT Linux b90c984d intel_guc_submission.c::guc_context_set_prio through
+/// the real scheduler: a priority raised before the Policy request is stored
+/// and registered; one raised while GuC holds the registration reaches it
+/// once, as __guc_context_set_prio's priority-only UPDATE_CONTEXT_POLICIES; a
+/// lower request never demotes a job (guc_bump_inflight_request_prio); a job
+/// being disabled gets no update; a staged request is raised at its claim by
+/// the requests queued behind it; configure_schedule never refuses a claimed
+/// context and applies from the next registration.
+fn smoke_userspace_priority_update_follows_guc_context_set_prio() -> TestResult {
+    use narf_filesystem::DrmFence;
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let baseline = arena.live_allocations();
+    let context = UserContext::new();
+    let mut registered = BTreeMap::new();
+
+    // A raise before the Policy request: stored, and registered with it.
+    context.set_i915_priority(0);
+    let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(100, context.clone(), UserBatch(batch))
+        .unwrap();
+    context.set_i915_priority(-3);
+    drop(context.queue_request());
+    context.set_i915_priority(9);
+    drop(context.queue_request());
+    let (full, updates) =
+        drive_policies(&mut gt, &w, &mut registered, 101..200, true, Some(&fence));
+    assert_eq!(full, [(u32::from(id), 1, 1000)]);
+    assert!(updates.is_empty());
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert_eq!(result.verify(), Ok(()));
+    drop(result);
+
+    // A job registered at NORMAL3, enabled but not yet executed.
+    context.set_i915_priority(-3);
+    let (batch, unexecuted) = PpgttProbeResult::prepare(platform).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(300, context.clone(), UserBatch(batch))
+        .unwrap();
+    let id = u32::from(id);
+    let (full, updates) = drive_policies(&mut gt, &w, &mut registered, 301..330, false, None);
+    assert_eq!(full, [(id, 3, 1000)]);
+    assert!(updates.is_empty());
+    assert!(fence.is_submit_ready() && fence.result().is_none());
+    let base = registered[&id];
+    // ctx_setparam alone sends GuC nothing.
+    context.set_i915_priority(0);
+    let (full, updates) = drive_policies(&mut gt, &w, &mut registered, 330..335, false, None);
+    assert!(full.is_empty() && updates.is_empty());
+    // The next request raises the registered job, once.
+    let raise = context.queue_request();
+    let (full, updates) = drive_policies(&mut gt, &w, &mut registered, 335..340, false, None);
+    assert!(full.is_empty());
+    assert_eq!(updates, [(id, 2)]);
+    assert_eq!(w.0.borrow().priority_updates, [(id, 2)]);
+    // A lower request never demotes it.
+    context.set_i915_priority(-1);
+    let lower = context.queue_request();
+    let (full, updates) = drive_policies(&mut gt, &w, &mut registered, 340..345, false, None);
+    assert!(full.is_empty() && updates.is_empty());
+    // configure_schedule stores for the next registration, busy or not.
+    assert!(context.busy());
+    assert_eq!(context.configure_schedule(3, 2000), Ok(()));
+    // Once the breadcrumb lands the job is disabled: a raise then is not
+    // sent, and retirement follows.
+    complete_by_hand(&w, base);
+    ready(&mut gt, 345);
+    context.set_i915_priority(1023);
+    let late = context.queue_request();
+    let (full, updates) = drive_policies(
+        &mut gt,
+        &w,
+        &mut registered,
+        346..400,
+        false,
+        Some(&fence),
+    );
+    assert!(full.is_empty() && updates.is_empty());
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert!(!context.busy());
+    assert_eq!(w.0.borrow().priority_updates, [(id, 2)]);
+    drop((raise, lower, late));
+
+    // The next job takes the stored HIGH1 and configure_schedule's quantum.
+    let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(500, context.clone(), UserBatch(batch))
+        .unwrap();
+    let (full, updates) =
+        drive_policies(&mut gt, &w, &mut registered, 501..600, true, Some(&fence));
+    assert_eq!(full, [(u32::from(id), 1, 2000)]);
+    assert!(updates.is_empty());
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert_eq!(result.verify(), Ok(()));
+    drop(result);
+
+    // A staged request at NORMAL3 is raised at its claim by a HIGH1 request
+    // queued behind it; once both are gone the stored band applies again.
+    context.set_i915_priority(-1);
+    let mut first = context.queue_request();
+    context.set_i915_priority(5);
+    let behind = context.queue_request();
+    context.set_i915_priority(-1);
+    first.stage();
+    let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(700, context.clone(), UserBatch(batch))
+        .unwrap();
+    drop((first, behind));
+    let (full, updates) =
+        drive_policies(&mut gt, &w, &mut registered, 701..800, true, Some(&fence));
+    assert_eq!(full, [(u32::from(id), 1, 2000)]);
+    assert!(updates.is_empty());
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert_eq!(result.verify(), Ok(()));
+    drop(result);
+    let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(900, context.clone(), UserBatch(batch))
+        .unwrap();
+    let (full, updates) =
+        drive_policies(&mut gt, &w, &mut registered, 901..1000, true, Some(&fence));
+    assert_eq!(full, [(u32::from(id), 3, 2000)]);
+    assert!(updates.is_empty());
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert_eq!(result.verify(), Ok(()));
+    drop((result, unexecuted));
+    assert!(registered.is_empty());
+    assert_eq!(w.0.borrow().priority_updates.len(), 1);
+    assert_eq!(arena.live_allocations(), baseline);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_priority_update_follows_guc_context_set_prio
+);
+
 /// What recovery cannot isolate still resets the GT: a disable GuC never
 /// answers, a kernel job overrunning its deadline, and GuC resetting an
 /// engine under a kernel job.

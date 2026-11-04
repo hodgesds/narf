@@ -1931,6 +1931,12 @@ pub unsafe fn unmap_4kb_local_range(
 /// on the cleared D bits: a remote CPU whose TLB cached the leaf with D
 /// already set skips the assist and its stores would go unrecorded.
 ///
+/// A leaf at a page index (from `base`) that `markable` rejects is left
+/// exactly as it is: the address-space caller rejects frames pinned for
+/// device access, whose device writes never set this leaf's DIRTY bit (see
+/// [`lazyfree_cancel_4kb`]). `markable` runs under the root lock, so it must
+/// take no lock; callers decide from state they gathered beforehand.
+///
 /// Returns the number of leaves marked.
 ///
 /// # Safety
@@ -1940,6 +1946,7 @@ pub unsafe fn lazyfree_mark_4kb_local_range(
     pml4_phys: PhysAddr,
     base: VirtAddr,
     pages: u64,
+    mut markable: impl FnMut(u64) -> bool,
 ) -> Result<u64, MapError> {
     if !is_canonical(base) {
         return Err(MapError::NonCanonical);
@@ -1995,7 +2002,7 @@ pub unsafe fn lazyfree_mark_4kb_local_range(
         // lock prevents replacement during the batch.
         let pt = unsafe { &mut *cached_pt };
         let leaf = pt.entries[idx.pt];
-        if !leaf.is_present() {
+        if !leaf.is_present() || !markable(page) {
             continue;
         }
         let flags = PtFlags(
@@ -2017,6 +2024,31 @@ pub unsafe fn lazyfree_mark_4kb_local_range(
     Ok(marked)
 }
 
+/// Drop the [`PtFlags::LAZYFREE`] mark of the present 4 KiB leaf mapping
+/// `virt`, if it has one, returning whether it did. Called when a page is
+/// pinned: a device may write it through the pin without ever setting this
+/// leaf's DIRTY bit, which is what Linux covers by marking the folio dirty
+/// at a `FOLL_WRITE` pin (`follow_page_pte`, `FOLL_TOUCH`). Only the software
+/// bit changes, atomically, so a concurrent hardware A/D update is kept and
+/// no TLB invalidation is needed (bit 9 is ignored by the MMU).
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+pub unsafe fn lazyfree_cancel_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> bool {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // SAFETY: forwarded to the caller's identity-reachability guarantee.
+    unsafe {
+        with_leaf_mut(pml4_phys, virt, |leaf| {
+            // `PageTableEntry` is a `repr(transparent)` u64 in a 4 KiB-aligned
+            // table kept live by the walk lock (as in test_and_clear_accessed).
+            let atomic = &*(leaf as *mut PageTableEntry as *const AtomicU64);
+            atomic.fetch_and(!PtFlags::LAZYFREE.bits(), Ordering::AcqRel) & PtFlags::LAZYFREE.bits()
+                != 0
+        })
+    }
+    .unwrap_or(false)
+}
+
 /// Retire the still-clean [`PtFlags::LAZYFREE`] leaves in the run: each such
 /// leaf is atomically swapped to EMPTY and reported through `take(phys, va)`;
 /// a leaf whose DIRTY bit came back (the page was stored to after MADV_FREE)
@@ -2025,6 +2057,15 @@ pub unsafe fn lazyfree_mark_4kb_local_range(
 /// lands first is visible in the swapped-out entry (the page is kept), one
 /// that starts after the swap finds the leaf empty and takes the ordinary
 /// demand-fault path instead of writing. Non-LAZYFREE leaves are untouched.
+///
+/// A clean leaf at a page index (from `base`) that `discardable` rejects is
+/// never retired: its LAZYFREE bit is cleared and it stays mapped, as for a
+/// dirty leaf. The address-space caller rejects frames pinned for device
+/// access; like `markable` above, the predicate runs under the root lock and
+/// must take no lock. Linux backs off such a page in `try_to_unmap_one`
+/// (`ref_count != 1 + map_count`) and relies on the pinner marking the folio
+/// dirty; a device write never sets this leaf's DIRTY bit and NARF pins
+/// carry no dirty mark, so the mark is dropped instead.
 ///
 /// LOCAL invalidation only. The caller MUST broadcast an invalidation
 /// covering the run before freeing any reported frame — a remote CPU may
@@ -2038,6 +2079,7 @@ pub unsafe fn lazyfree_take_clean_4kb_range(
     pml4_phys: PhysAddr,
     base: VirtAddr,
     pages: u64,
+    mut discardable: impl FnMut(u64) -> bool,
     mut take: impl FnMut(PhysAddr, VirtAddr),
 ) -> Result<u64, MapError> {
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -2114,6 +2156,14 @@ pub unsafe fn lazyfree_take_clean_4kb_range(
         let slot = unsafe {
             &*(core::ptr::addr_of_mut!(pt.entries[idx.pt]) as *mut u64 as *const AtomicU64)
         };
+        if !discardable(page) {
+            // Possibly written by a device since MADV_FREE: keep it. Clear
+            // only the software bit atomically, so a concurrent D-assist on
+            // this clean leaf is not lost. Bit 9 is ignored by the MMU, so
+            // no cached translation needs invalidating.
+            slot.fetch_and(!PtFlags::LAZYFREE.bits(), Ordering::AcqRel);
+            continue;
+        }
         let old = PageTableEntry::from_raw(slot.swap(0, Ordering::AcqRel));
         if old.flags().contains(PtFlags::DIRTY) {
             // A store's D-assist landed between the read above and the swap:

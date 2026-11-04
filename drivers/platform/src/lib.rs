@@ -55,6 +55,14 @@ pub mod lid;
 /// that only appear on Intel PCHs.
 #[cfg(target_arch = "x86_64")]
 pub mod mei;
+/// MEI GSC proxy client: the CSME end of the Intel GSC proxy, handed
+/// to the display driver through `narf_drivers::gsc_proxy`.
+#[cfg(target_arch = "x86_64")]
+pub mod mei_gsc_proxy;
+/// Register-level CSME HECI model driving the MEI smokes.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub mod mei_model;
 /// Power-service composition: wires lid/button events, snapshot
 /// providers, and the action executor into `narf_power::service`.
 #[cfg(target_arch = "x86_64")]
@@ -143,6 +151,8 @@ pub mod surface_acpi;
 #[cfg(target_arch = "x86_64")]
 pub mod system76_acpi;
 
+#[cfg(target_arch = "x86_64")]
+mod mei_tests;
 mod tests;
 mod tpm_fixture;
 

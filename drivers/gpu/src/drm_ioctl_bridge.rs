@@ -3211,6 +3211,11 @@ const PLANE_CRTC_X_PROP_ID: u32 = 0x5b;
 const PLANE_CRTC_Y_PROP_ID: u32 = 0x5c;
 const PLANE_CRTC_W_PROP_ID: u32 = 0x5d;
 const PLANE_CRTC_H_PROP_ID: u32 = 0x5e;
+/// The plane "FB_DAMAGE_CLIPS" blob (drm_mode_config's
+/// prop_fb_damage_clips, `DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_BLOB`),
+/// attached to Intel display 12+ planes by
+/// `drm_plane_enable_fb_damage_clips`.
+const PLANE_FB_DAMAGE_CLIPS_PROP_ID: u32 = 0x74;
 const DRM_PLANE_TYPE_OVERLAY: u64 = 0;
 const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
 const DRM_PLANE_TYPE_CURSOR: u64 = 2;
@@ -3476,6 +3481,11 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             b"FB_ID".as_slice(),
             DRM_MODE_PROP_OBJECT | DRM_MODE_PROP_ATOMIC,
             [0xfbfb_fbfb, 0],
+        )),
+        PLANE_FB_DAMAGE_CLIPS_PROP_ID => Some((
+            b"FB_DAMAGE_CLIPS".as_slice(),
+            DRM_MODE_PROP_BLOB | DRM_MODE_PROP_ATOMIC,
+            [0, 0],
         )),
         PLANE_SRC_X_PROP_ID => Some((
             b"SRC_X".as_slice(),
@@ -5149,8 +5159,16 @@ fn handle_obj_getproperties(
                     (-1i64) as u64,
                 ],
             );
-            #[cfg(feature = "amdgpu")]
+            #[cfg(any(feature = "amdgpu", feature = "intel"))]
             let (mut props, mut values) = (props, values);
+            // skl_universal_plane_create: display 12+ planes carry
+            // FB_DAMAGE_CLIPS. It reads back 0: the blob is per commit, and
+            // this driver keeps no committed plane state holding it.
+            #[cfg(feature = "intel")]
+            if fixed_intel_view {
+                props.push(PLANE_FB_DAMAGE_CLIPS_PROP_ID);
+                values.push(0);
+            }
             #[cfg(feature = "amdgpu")]
             if crate::amdgpu_native_kms::linear_gem_card(&card) {
                 // GBM must choose LINEAR explicitly for the DCN30 copy
@@ -7722,22 +7740,17 @@ fn handle_dirty_fb(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
+    // drm_ioctl copies the 24-byte struct drm_mode_fb_dirty_cmd { fb_id,
+    // flags, color, num_clips: u32; clips_ptr: u64 } (-EFAULT) before
+    // drm_ioctl_permit refuses a non-master (-EACCES).
+    // SAFETY: `arg` is the user drm_mode_fb_dirty_cmd pointer.
+    let raw = unsafe { copy_in(arg, 24)? };
     if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
-    // struct drm_mode_fb_dirty_cmd { fb_id, flags, color, num_clips: u32;
-    // clips_ptr: u64 } is 24 bytes.
-    // SAFETY: `arg` is the user drm_mode_fb_dirty_cmd pointer.
-    let raw = unsafe { copy_in(arg, 24)? };
-    let cmd = crate::drm::fb_cmd::DirtyCmd::parse(&raw).ok_or(invalid_at(line!()))?;
-    let clips = if cmd.num_clips == 0 {
-        Vec::new()
-    } else {
-        let len = cmd.num_clips as usize * crate::drm::fb_cmd::CLIP_RECT_BYTES;
-        // SAFETY: `clips_ptr` is the user drm_clip_rect array of
-        // `num_clips` entries (at most DIRTY_MAX_CLIPS, so 2 KiB).
-        unsafe { copy_in(cmd.clips_ptr as usize, len)? }
-    };
+    let cmd = crate::drm::fb_cmd::DirtyCmd::decode(&raw).ok_or(FsError::InvalidData)?;
+    // drm_mode_dirtyfb_ioctl: the framebuffer lookup (-ENOENT) precedes the
+    // clip checks (-EINVAL) and the clip copy (-EFAULT).
     let (crtcs, frame, intel) = {
         let card = mode_state.lock();
         let fb = card.framebuffer(cmd.fb_id).map_err(|_| FsError::NotFound)?;
@@ -7754,6 +7767,14 @@ fn handle_dirty_fb(
                 .map(|b| fb_frame(fb, b.phys))
         };
         (crtcs, frame, intel_frame(fb))
+    };
+    cmd.validate().map_err(|()| FsError::InvalidData)?;
+    let clips = if cmd.num_clips == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: `clips_ptr` is the user drm_clip_rect array of
+        // `num_clips` entries (at most DIRTY_MAX_CLIPS, so 2 KiB).
+        unsafe { copy_in(cmd.clips_ptr as usize, cmd.clips_len())? }
     };
     // An Intel GEM framebuffer is copied whole: the copy keeps no damage.
     if let Some(frame) = intel.filter(|_| !crtcs.is_empty()) {

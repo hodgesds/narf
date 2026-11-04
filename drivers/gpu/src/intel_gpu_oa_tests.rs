@@ -14,6 +14,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 const MTL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
 const LNL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
 const BASE: u32 = 0x0100_0000;
+/// Host page addresses reported by [`Hw::with_host_pages`].
+const HOST: u64 = 0x0000_0040_0000_0000;
 
 struct Hw {
     regs: IrqSafeSpinLock<BTreeMap<u64, u32>>,
@@ -22,6 +24,8 @@ struct Hw {
     live: AtomicUsize,
     freed: AtomicUsize,
     coherent: AtomicBool,
+    /// Nonzero: the next allocation reports host pages from this address.
+    host: AtomicU64,
 }
 impl Hw {
     fn new() -> Arc<Self> {
@@ -32,7 +36,15 @@ impl Hw {
             live: AtomicUsize::new(0),
             freed: AtomicUsize::new(0),
             coherent: AtomicBool::new(true),
+            host: AtomicU64::new(0),
         })
+    }
+    /// A model whose reservation reports host page addresses. The OA
+    /// fixtures never dereference them; sys_mmap's fixtures map real ones.
+    fn with_host_pages() -> Arc<Self> {
+        let hw = Self::new();
+        hw.host.store(HOST, Ordering::Relaxed);
+        hw
     }
     fn set(&self, reg: u64, value: u32) {
         self.regs.lock().insert(reg, value);
@@ -78,10 +90,14 @@ struct Memory {
     hw: Arc<Hw>,
     pages: u32,
     coherent: bool,
+    host: u64,
 }
 impl GpuBacking for Arc<Memory> {
     fn coherent_for_device(&self) -> bool {
         self.coherent
+    }
+    fn host_frame(&self, page: u32) -> Option<u64> {
+        (self.host != 0 && page < self.pages).then(|| self.host + u64::from(page) * 4096)
     }
     fn ggtt_offset(&self) -> u32 {
         BASE
@@ -107,6 +123,7 @@ impl GpuAllocator for Allocator {
             hw: self.0.clone(),
             pages,
             coherent: self.0.coherent.load(Ordering::Relaxed),
+            host: self.0.host.load(Ordering::Relaxed),
         }))
     }
     fn free(&mut self, _: Self::Backing) {
@@ -236,7 +253,9 @@ impl core::fmt::Debug for Backend {
 }
 impl Backend {
     fn new(device: Device) -> Arc<Self> {
-        let hw = Hw::new();
+        Self::over(device, Hw::new())
+    }
+    fn over(device: Device, hw: Arc<Hw>) -> Arc<Self> {
         let unit = Unit::new(
             Allocator(hw.clone()),
             device.platform,
@@ -1282,9 +1301,10 @@ kernel_test_in!(
 );
 
 /// xe_oa_mmap: EACCES, then whole-buffer length, then read-only
-/// MAP_PRIVATE. A mapping passing all three is NARF's ENODEV, never a
-/// read()-backed private copy that would consume reports.
-fn smoke_oa_mmap_source_checks_and_private_pfn_refusal() -> TestResult {
+/// MAP_PRIVATE. A mapping passing all three becomes a private PFN mapping
+/// (VM_DONTCOPY) of the buffer pages, never a read()-backed private copy
+/// that would consume reports. A backing without host pages is ENODEV.
+fn smoke_oa_mmap_source_checks_then_private_pfn_backing() -> TestResult {
     const READ: u32 = 1;
     const PRIVATE: u32 = 2;
     let backend = Backend::new(device(47, MTL, 1270));
@@ -1298,14 +1318,16 @@ fn smoke_oa_mmap_source_checks_and_private_pfn_refusal() -> TestResult {
     );
     assert_eq!(file.mmap_max_prot(0), READ);
     assert_eq!(
-        file.validate_mmap(0, size, READ, PRIVATE),
-        Err(FsError::NoDevice)
+        file.mmap_private_pfn(0),
+        Some(PrivatePfnMap { dont_copy: true })
     );
+    assert_eq!(file.validate_mmap(0, size, READ, PRIVATE), Ok(READ));
     // The source never inspects vm_pgoff.
-    assert_eq!(
-        file.validate_mmap(1 << 20, size, READ, PRIVATE),
-        Err(FsError::NoDevice)
-    );
+    assert_eq!(file.validate_mmap(1 << 20, size, READ, PRIVATE), Ok(READ));
+    // A PROT_NONE private mapping passes the source checks too.
+    assert_eq!(file.validate_mmap(0, size, 0, PRIVATE), Ok(0));
+    // The model backing has no host pages to remap.
+    assert!(matches!(file.mmap_backing(0, size), Err(FsError::NoDevice)));
     for len in [size - 4096, size + 4096, 16 << 20] {
         assert_eq!(
             file.validate_mmap(0, len, READ, PRIVATE),
@@ -1341,7 +1363,116 @@ fn smoke_oa_mmap_source_checks_and_private_pfn_refusal() -> TestResult {
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
-    smoke_oa_mmap_source_checks_and_private_pfn_refusal
+    smoke_oa_mmap_source_checks_then_private_pfn_backing
+);
+
+/// remap_pfn_range of the stream's buffer pages: the first buffer-size
+/// pages of the reservation from the VMA start whatever vm_pgoff is, mapped
+/// write-back. Each mapping holds the pages: a descriptor close while mapped
+/// keeps the stream (the VMA holds the file), the last unmap ends it and the
+/// unit admits the next stream, and a GT release while mapped never returns
+/// the reservation to its allocator.
+fn smoke_oa_mmap_pages_hold_stream_and_survive_unit_release() -> TestResult {
+    let size = 256usize << 10;
+    let pages = size / 4096;
+    let hw = Hw::with_host_pages();
+    let backend = Backend::over(device(44, MTL, 1270), hw.clone());
+    let wire = Wire::new();
+    let first = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let props = [(2, 1), (4, A24U40), (3, first), (5, 5), (12, size as u64)];
+    let file = open_stream(&backend, &wire, &props);
+    let session = session_of(&backend);
+    let expected: Vec<u64> = (0..pages as u64).map(|page| HOST + page * 4096).collect();
+    let one = file.mmap_backing(0, size).unwrap();
+    assert_eq!(one.frames, expected);
+    assert_eq!(one.memory_type, narf_memory::MemoryType::WriteBack);
+    assert!(one.lifetime.is_some());
+    let two = file.mmap_backing(7 << 20, size).unwrap();
+    assert_eq!(two.frames, expected);
+    assert!(matches!(
+        file.mmap_backing(0, size + 4096),
+        Err(FsError::InvalidData)
+    ));
+    let held = session.pages.lock().clone().unwrap();
+    assert_eq!(held.live_maps(), 2);
+    drop(two);
+    assert_eq!(held.live_maps(), 1);
+
+    // close(fd) while mapped: the mapping's file reference keeps the stream.
+    let mapping_file = file.clone();
+    drop(file);
+    assert!(!session.stop.load(Ordering::Acquire));
+    assert!(session.enabled());
+    assert!(matches!(
+        ready(open(
+            Some(backend.clone()),
+            wire.chain(0x1000, &props),
+            &wire,
+            &none,
+            ALLOW
+        )),
+        Err(Error::Fs(FsError::Busy))
+    ));
+    // munmap: the token and the last file reference go; the next exclusive
+    // open tears the old stream down and attaches to the same reservation.
+    drop(one);
+    drop(mapping_file);
+    assert_eq!(held.live_maps(), 0);
+    assert!(session.stop.load(Ordering::Acquire));
+    drop(session);
+    backend.poll(1);
+    let file = open_stream(&backend, &wire, &props);
+    let session = session_of(&backend);
+    assert!(Arc::ptr_eq(&session.pages.lock().clone().unwrap(), &held));
+
+    // A verified GT reset while mapped: the stream is terminal, new
+    // mappings are ENODEV, the live one keeps its pages and the reservation
+    // is never freed.
+    let mapping = file.mmap_backing(0, size).unwrap();
+    let mut unit = backend.unit.lock().take().unwrap();
+    unit.invalidate();
+    unit.halt(&Window(hw.clone()), || true);
+    // SAFETY: the model's OA unit is stopped and no DMA remains.
+    unsafe { unit.release_after_reset() };
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (1, 0)
+    );
+    assert!(matches!(file.mmap_backing(0, size), Err(FsError::NoDevice)));
+    assert_eq!(held.live_maps(), 1);
+    assert_eq!(mapping.frames, expected);
+    drop(mapping);
+    assert_eq!(held.live_maps(), 0);
+    assert_eq!(hw.freed.load(Ordering::Relaxed), 0);
+    drop(file);
+    drop(session);
+
+    // Without a live mapping the same release frees the reservation.
+    let hw = Hw::with_host_pages();
+    let (mut unit, session) = unit_with_stream(43, &hw);
+    let probe = session.pages.lock().clone().unwrap();
+    assert_eq!(probe.live_maps(), 0);
+    unit.invalidate();
+    unit.halt(&Window(hw.clone()), || true);
+    // SAFETY: the model's OA unit is stopped and no DMA remains.
+    unsafe { unit.release_after_reset() };
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (0, 1)
+    );
+    assert!(matches!(probe.map(32), Err(FsError::NoDevice)));
+    drop(session);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_mmap_pages_hold_stream_and_survive_unit_release
 );
 
 /// create_dynamic_oa_sysfs_entry / sysfs_remove_group: metrics/<uuid>/id

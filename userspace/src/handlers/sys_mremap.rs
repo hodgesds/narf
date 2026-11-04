@@ -268,6 +268,35 @@ fn check_mremap_params(
     Ok((old_len, new_len))
 }
 
+/// `mm/mremap.c::check_prep_vma` for a read-only private PFN VMA
+/// (`FileOps::mmap_private_pfn`), whose region is borrowed-frame `SHARED`
+/// in NARF but is a private `VM_PFNMAP | VM_DONTEXPAND` VMA in Linux:
+///
+/// ```text
+///     if (!old_len && !(vma->vm_flags & (VM_SHARED | VM_MAYSHARE)))
+///             return -EINVAL;
+///     if ((vrm->flags & MREMAP_DONTUNMAP) &&
+///                     (vma->vm_flags & (VM_DONTEXPAND | VM_PFNMAP)))
+///             return -EINVAL;
+/// ```
+///
+/// Growth reaches the later `VM_DONTEXPAND | VM_PFNMAP` EFAULT through the
+/// shared path's LOCK_EXEMPT rule; shrink and same-size moves proceed. The
+/// caller holds the VMA transaction.
+fn private_pfn_refusal(
+    as_ref: &AddressSpace,
+    old_addr: u64,
+    old_len: u64,
+    flags: u64,
+) -> Result<(), i64> {
+    if (old_len == 0 || flags & MREMAP_DONTUNMAP != 0)
+        && crate::mapped_file::private_pfn_at(as_ref.identity(), old_addr)
+    {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mremap_core_limited(
     as_ref: &AddressSpace,
@@ -306,6 +335,7 @@ fn mremap_core_limited(
             // mmap-write transaction. A CLONE_VM peer cannot replace the VMA
             // between validation and the fixed punch.
             let old_end = old_addr.checked_add(old_len).ok_or(EFAULT)?;
+            private_pfn_refusal(as_ref, old_addr, old_len, flags)?;
             // SAFETY: the enclosing closure holds the VMA transaction. Shared
             // aliases and ordinary private relocation may cover a subrange. A
             // zero old length identifies the containing shared VMA for
@@ -470,6 +500,7 @@ fn mremap_core_limited(
         // NARF's region table is the VMA authority. Keep source validation and
         // every accepted operation atomic with CLONE_VM peers.
         let old_end = old_addr.checked_add(old_len).ok_or(EFAULT)?;
+        private_pfn_refusal(as_ref, old_addr, old_len, flags)?;
         // SAFETY: the enclosing closure holds the VMA transaction. Shared
         // aliases and ordinary private remaps may cover a subrange, while
         // old_len==0 identifies the VMA at old_addr.

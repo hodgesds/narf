@@ -234,6 +234,16 @@ pub trait MmioWindow {
     fn display_access_ok(&self) -> bool {
         true
     }
+    /// Whether this window drives display-30 (Xe3_LPD) Cx0 PHYs:
+    /// `intel_cx0_phy.c::__intel_cx0_{read,write}_once` reset the message
+    /// bus after every completed transaction only on display < 30, and
+    /// `intel_cx0_phy_regs.h::XELPDP_DDI_CLOCK_SELECT_MASK` widens to 16:12
+    /// on display >= 30. Only the Panther Lake display view
+    /// (`intel_gpu_xe3lpd::PortView`) answers `true`; every wrapper that
+    /// sits between it and the PHY code forwards it.
+    fn cx0_xe3(&self) -> bool {
+        false
+    }
     /// Read a 32-bit register at byte offset `off` within the
     /// MMIO window.
     fn read32(&self, off: u64) -> u32;

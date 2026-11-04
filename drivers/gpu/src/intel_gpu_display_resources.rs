@@ -20,9 +20,24 @@
 //! modeset passes the planned term; every later proof reads it back from
 //! Pipe A's engines (`intel_dsc_get_config`), so the KMS owners compute the
 //! same layout the modeset programmed.
+//!
+//! Display 20 (Xe2_LPD, [`crate::intel_gpu_xe2lpd`]) runs the same
+//! single-pipe ownership with its resource state ([`res::compute_ip`]):
+//! no `PLANE_CHICKEN` no-DPT bit and no 14.00 stepping workaround. Its X and
+//! Tile4 primaries are fetched through the presenter's display page table
+//! and take the same tiled watermark images (skl_watermark.c has no DPT
+//! term); the multi-pipe layout stays display 14.
+//!
+//! Display 30 (Xe3_LPD, [`crate::intel_gpu_xe3lpd`]) runs the single-pipe
+//! ownership too: its vblank prefill budget is the VRR timing generator's
+//! guardband ([`crate::intel_gpu_xe3lpd::vrr_guardband`]), its PM demand is
+//! proved in the Xe3 layout, its CDCLK against the display-30 ceiling and
+//! voltage level, and the primary image adds the level-0/SAGV auto minimum
+//! allocation bit and `PLANE_MIN_BUF_CFG`.
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
+    intel_gpu_xe2lpd::DisplayIp,
     intel_gpu_xelpg_dsc::DscTerm,
     intel_gpu_xelpg_pipes::Layout,
     intel_gpu_xelpg_resources::{self as res, ResourceError},
@@ -76,16 +91,19 @@ fn wait(io: &(impl MmioWindow + ?Sized), r: u64, mask: u32, want: u32) -> Result
         Err(FsError::TimedOut)
     }
 }
-fn idle(io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
+fn idle_ip(io: &(impl MmioWindow + ?Sized), ip: DisplayIp) -> Result<(), FsError> {
     // The owner cannot reset/allocate behind FBC, DSB or a foreign cursor.
-    res::require_idle(io).map_err(|e| match e {
+    res::require_idle_ip(io, ip).map_err(|e| match e {
         ResourceError::Busy => FsError::Unsupported,
         _ => FsError::NoDevice,
     })
 }
-fn display14(io: &(impl MmioWindow + ?Sized)) -> Result<bool, FsError> {
+/// The display IP this owner programs: 14.00, 20.00 or 30.00 (`None` for
+/// every other GMD, which keeps the inherited layout). Display 30 is only
+/// reached through the opted-in Panther Lake route.
+fn display_ip(io: &(impl MmioWindow + ?Sized)) -> Result<Option<DisplayIp>, FsError> {
     let gmd = read(io, 0x510a0)?;
-    Ok(gmd >> 22 == 14 && (gmd >> 14) & 255 == 0)
+    Ok(DisplayIp::decode_all(gmd).ok())
 }
 /// The owned modeset's pipe-A configuration: one full-screen XRGB8888
 /// primary, the budgeted hidden cursor and the combo PHY of DDI A/B.
@@ -143,6 +161,8 @@ pub(crate) struct Profile {
     /// It depends only on Pipe A's own planes and timing, so every layout
     /// gives the same value for the same primary tiling.
     pub(crate) wm_level_disabled: bool,
+    /// The display IP this layout was proved on.
+    pub(crate) ip: DisplayIp,
 }
 impl Profile {
     /// Pipe A's share of `state` for `mode`: its primary ends where the
@@ -164,14 +184,31 @@ impl Profile {
         let wm0 = alloc.wm[0].levels[0]
             .lines
             .max(alloc.cursor_wm.levels[0].lines);
+        let wm_level_disabled = match state.ip {
+            // The VRR guardband is display 30's vblank prefill budget.
+            DisplayIp::Xe3Lpd => wm::wm_level_disabled_dsc_ip(
+                state.ip,
+                wm::Timing {
+                    vblank_start: u32::from(state.vblank_start[0].unwrap_or(mode.v_active)),
+                    ..timing
+                },
+                latency,
+                wm0,
+                dsc.is_some(),
+            ),
+            DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => {
+                wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
+            }
+        }
+        .map_err(|_| FsError::Unsupported)?;
         let profile = Self {
             primary: alloc.wm[0],
             cursor: alloc.cursor_wm,
             cursor_start: alloc.cursor.start,
             cursor_ddb: alloc.cursor.reg(),
             primary_ddb: alloc.planes[0].reg(),
-            wm_level_disabled: wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
-                .map_err(|_| FsError::Unsupported)?,
+            wm_level_disabled,
+            ip: state.ip,
         };
         if state.dbuf.active_pipes & 1 == 0
             || alloc.planes[0].size() == 0
@@ -204,6 +241,7 @@ impl Profile {
     /// depend on the CDCLK floor, only the clock/PM demand parts do.
     fn compute_state(
         io: &(impl MmioWindow + ?Sized),
+        ip: DisplayIp,
         mode: &Mode,
         tiling: Tiling,
         min_cdclk_khz: u32,
@@ -211,8 +249,21 @@ impl Profile {
     ) -> Result<(Self, res::State), FsError> {
         Self::valid_mode(mode)?;
         let latency = Latency::read(io)?;
-        let state = res::compute(&request_dsc(mode, tiling, min_cdclk_khz, dsc), &latency)
-            .map_err(|_| FsError::Unsupported)?;
+        // Display 30 always scans out through the VRR timing generator:
+        // the vblank prefill budget is its guardband.
+        let mut vblank_start = [None; res::PIPES];
+        if ip == DisplayIp::Xe3Lpd {
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+                .map_err(|_| FsError::Unsupported)?;
+            vblank_start[0] = Some(mode.v_total - guardband);
+        }
+        let state = res::compute_ip_vblank(
+            ip,
+            &request_dsc(mode, tiling, min_cdclk_khz, dsc),
+            &latency,
+            vblank_start,
+        )
+        .map_err(|_| FsError::Unsupported)?;
         let profile = Self::share(mode, &latency, &state, dsc)?;
         // The fixed owner's single-pipe layout is the joined one, with the
         // whole DBUF behind Pipe A.
@@ -254,13 +305,14 @@ impl Profile {
     /// layout.
     fn compute_for_layout(
         io: &(impl MmioWindow + ?Sized),
+        ip: DisplayIp,
         mode: &Mode,
         tiling: Tiling,
         layout: Option<&Layout>,
         dsc: Option<DscTerm>,
     ) -> Result<Self, FsError> {
         match layout {
-            None => Ok(Self::compute_state(io, mode, tiling, 0, dsc)?.0),
+            None => Ok(Self::compute_state(io, ip, mode, tiling, 0, dsc)?.0),
             Some(layout) => {
                 let latency = Latency::read(io)?;
                 let state = Self::multi_state(mode, tiling, layout, &latency, dsc)?;
@@ -301,10 +353,18 @@ impl Profile {
     pub(crate) fn capture(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<Self, FsError> {
         let dsc = pipe_a_dsc(io, mode)?;
         let profile = Self::capture_layout(io, mode, dsc)?;
-        Self::check_cdclk(io, mode)?;
+        Self::check_cdclk(io, profile.ip, mode)?;
         Ok(profile)
     }
-    fn check_cdclk(io: &(impl MmioWindow + ?Sized), mode: &Mode) -> Result<(), FsError> {
+    /// The running CDCLK covers `mode` and the acknowledged PM demand covers
+    /// the clock: `ip`'s ceiling (691.2 MHz on display 30) and voltage level
+    /// (`xe3lpd_calc_voltage_level` is 0); both PM demand layouts keep the
+    /// voltage and CDCLK fields in place.
+    fn check_cdclk(
+        io: &(impl MmioWindow + ?Sized),
+        ip: DisplayIp,
+        mode: &Mode,
+    ) -> Result<(), FsError> {
         let pll = read(io, 0x46070)?;
         let ctl = read(io, 0x46000)?;
         let squash = read(io, 0x46008)?;
@@ -315,10 +375,12 @@ impl Profile {
             return Err(FsError::Unsupported);
         }
         let actual = crate::intel_gpu_modeset_xelpg::cdclk_current_khz(io);
-        if !(1..=652800).contains(&actual) || mode.pixel_clock_khz > actual * 2 {
+        if !(1..=crate::intel_gpu_xelpg_cdclk::max_cdclk_khz(ip)).contains(&actual)
+            || mode.pixel_clock_khz > actual * 2
+        {
             return Err(FsError::Unsupported);
         }
-        let voltage = crate::intel_gpu_xelpg_cdclk::voltage_level(actual);
+        let voltage = crate::intel_gpu_xelpg_cdclk::voltage_level_ip(ip, actual);
         let req0 = read(io, REQUEST0)?;
         let req1 = read(io, REQUEST1)?;
         if ((req0 >> 12) & 7) < u32::from(voltage) || ((req1 >> 20) & 2047) < actual.div_ceil(1000)
@@ -335,18 +397,43 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
         dsc: Option<DscTerm>,
-    ) -> Result<(Self, Option<Layout>), FsError> {
-        if !display14(io)? {
-            return Err(FsError::Unsupported);
-        }
-        match Self::capture_single(io, mode, dsc) {
-            Ok(profile) => return Ok((profile, None)),
+    ) -> Result<(Self, Option<Layout>, DisplayIp), FsError> {
+        let ip = display_ip(io)?.ok_or(FsError::Unsupported)?;
+        match Self::capture_single(io, ip, mode, dsc) {
+            Ok(profile) => return Ok((profile, None, ip)),
             Err(FsError::Unsupported) => {}
             Err(error) => return Err(error),
         }
+        // Only the display-14 Pipe B–D owner publishes multi-pipe layouts.
+        if ip != DisplayIp::Xelpdp {
+            return Err(FsError::Unsupported);
+        }
         let layout =
             crate::intel_gpu_xelpg_pipes::published_layout().ok_or(FsError::Unsupported)?;
-        Ok((Self::capture_multi(io, mode, &layout, dsc)?, Some(layout)))
+        Ok((
+            Self::capture_multi(io, mode, &layout, dsc)?,
+            Some(layout),
+            ip,
+        ))
+    }
+    /// Display 20's MBUS throttle and DBUF minimum trackers follow the
+    /// MDCLK/CDCLK ratio of the clock actually running (a caller floor may
+    /// have raised it past the computed minimum), so its proof takes that
+    /// known rung; it must cover the computed one. Display 14 is unchanged.
+    fn running_clock(
+        io: &(impl MmioWindow + ?Sized),
+        mut state: res::State,
+    ) -> Result<res::State, FsError> {
+        if state.ip.xe2_plus() {
+            let current = crate::intel_gpu_xelpg_cdclk::Current::read_ip(io, state.ip)
+                .map_err(|_| FsError::NoDevice)?;
+            let rung = current.known.ok_or(FsError::Unsupported)?;
+            if rung.cdclk_khz < state.cdclk.cdclk_khz {
+                return Err(FsError::Unsupported);
+            }
+            state.cdclk = rung;
+        }
+        Ok(state)
     }
     /// The PM demand, MBUS/DBOX, IPC and DBUF slice proof shared by both
     /// layouts, against `state`.
@@ -360,10 +447,13 @@ impl Profile {
         // Every acknowledged PM demand field covers the computed state, and
         // the QGV peak bandwidth is exactly the computed SAGV decision
         // (0xffff keeps SAGV masked).
-        let held = crate::intel_gpu_pmdemand::Params::decode(req0, req1);
+        let held = crate::intel_gpu_pmdemand::Params::decode_for(
+            crate::intel_gpu_pmdemand::Layout::for_ip(state.ip),
+            req0,
+            req1,
+        );
         let need = state.pmdemand;
-        let mbus = read(io, crate::intel_gpu_xelpg_dbuf::MBUS_CTL)?
-            & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK;
+        let mbus = read(io, crate::intel_gpu_xelpg_dbuf::MBUS_CTL)? & state.mbus_ctl_mask();
         if held.qclk_gv_bw != need.qclk_gv_bw
             || held.max(&need) != held
             || read(io, 0x44468)? & (1 << 27) != 0
@@ -376,15 +466,16 @@ impl Profile {
         }
         for pipe in 0..res::PIPES {
             if state.dbuf.active_pipes & (1 << pipe) != 0
-                && read(io, crate::intel_gpu_xelpg_dbuf::dbox_ctl(pipe))? != state.dbuf.dbox(pipe)
+                && read(io, crate::intel_gpu_xelpg_dbuf::dbox_ctl(pipe))? != state.dbox(pipe)
             {
                 return Err(FsError::Unsupported);
             }
         }
+        let mask = state.dbuf_ctl_mask();
         for (slice, r) in DBUFS.into_iter().enumerate() {
-            let want = state.dbuf.dbuf_ctl(slice, 0, state.dbuf.enabled_slices);
+            let want = state.dbuf_ctl(slice, 0, state.dbuf.enabled_slices);
             let want = want | ((want >> 1) & (1 << 30));
-            if read(io, r)? & 0xc0ff0000 != want & 0xc0ff0000 {
+            if read(io, r)? & mask != want & mask {
                 return Err(FsError::Unsupported);
             }
         }
@@ -394,6 +485,7 @@ impl Profile {
     /// allocation and one-active-pipe PM demand of Pipe A alone.
     fn capture_single(
         io: &(impl MmioWindow + ?Sized),
+        ip: DisplayIp,
         mode: &Mode,
         dsc: Option<DscTerm>,
     ) -> Result<Self, FsError> {
@@ -404,14 +496,15 @@ impl Profile {
                 return Err(FsError::Unsupported);
             }
         }
-        let (profile, state) = Self::compute_state(io, mode, Tiling::Linear, 0, dsc)?;
+        let (profile, state) = Self::compute_state(io, ip, mode, Tiling::Linear, 0, dsc)?;
+        let state = Self::running_clock(io, state)?;
         // mbus_ctl_join_update selects the joined pipe when it stays lit
         // without a modeset (intel_mbus_joined_pipe) and NONE otherwise: the
         // owned modeset joins with NONE, while a live repartition that
         // re-joins around a lit Pipe A selects Pipe A. Linux's MBUS readout
         // takes only MBUS_JOIN, so either select is the joined profile.
         Self::check_shared_globals(io, &state, |mbus| {
-            mbus == state.dbuf.mbus_ctl() || mbus == state.dbuf.mbus_ctl_select(Some(0))
+            mbus == state.mbus_ctl_select(None) || mbus == state.mbus_ctl_select(Some(0))
         })?;
         if read(io, res::plane_buf_cfg(0, 0))? != profile.primary_ddb
             || read(io, res::cursor_buf_cfg(0))? != profile.cursor_ddb
@@ -482,8 +575,11 @@ impl Profile {
         mode: &Mode,
         dsc: Option<DscTerm>,
     ) -> Result<Self, FsError> {
-        let (mut profile, layout) = Self::capture_globals(io, mode, dsc)?;
+        let (mut profile, layout, ip) = Self::capture_globals(io, mode, dsc)?;
         // X-tiled takes the linear watermark arithmetic on display >= 10.
+        // A display-20 tiled primary is fetched through the presenter's DPT
+        // (no no-DPT chicken, intel_dpt_configure); its watermarks are the
+        // same tiled images.
         let tiling = match read(io, 0x70180)? & (7 << 10) {
             0 => None,
             0x400 => Some(Tiling::X),
@@ -491,20 +587,35 @@ impl Profile {
             _ => return Err(FsError::Unsupported),
         };
         if let Some(tiling) = tiling {
-            let share = Self::compute_for_layout(io, mode, tiling, layout.as_ref(), dsc)?;
+            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_ref(), dsc)?;
             profile.primary = share.primary;
             profile.wm_level_disabled = share.wm_level_disabled;
         }
-        verify_primary(io, profile.primary)?;
+        verify_primary(io, ip, profile.primary)?;
         Ok(profile)
     }
 }
 
-fn primary_registers(wm: PlaneWm) -> Result<[(u64, u32); 9], FsError> {
-    res::plane_wm_image(0, 0, &wm).ok_or(FsError::Unsupported)
+/// Pipe A primary's watermark image on `ip`; display 30 adds the auto
+/// minimum allocation bits and `PLANE_MIN_BUF_CFG` (`skl_write_plane_wm`).
+fn primary_registers(ip: DisplayIp, wm: PlaneWm) -> Result<alloc::vec::Vec<(u64, u32)>, FsError> {
+    let mut image = res::plane_wm_image_ip(ip, 0, 0, &wm)
+        .ok_or(FsError::Unsupported)?
+        .to_vec();
+    if ip == DisplayIp::Xe3Lpd {
+        image.push((
+            res::plane_min_buf_cfg(0, 0),
+            res::min_ddb_value(&wm).ok_or(FsError::Unsupported)?,
+        ));
+    }
+    Ok(image)
 }
-fn verify_primary(io: &(impl MmioWindow + ?Sized), wm: PlaneWm) -> Result<(), FsError> {
-    for (r, value) in primary_registers(wm)? {
+fn verify_primary(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    wm: PlaneWm,
+) -> Result<(), FsError> {
+    for (r, value) in primary_registers(ip, wm)? {
         if read(io, r)? != value {
             return Err(FsError::Unsupported);
         }
@@ -528,11 +639,26 @@ pub(crate) struct Primary {
     wm_level_disabled: [bool; 2],
     current_tile4: bool,
     pending: Option<bool>,
+    /// The display IP every proof must find again.
+    ip: DisplayIp,
 }
 impl Primary {
+    /// The display-14 owner ([`Self::capture_ip`] on 14.00).
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn capture(
         io: &(impl MmioWindow + ?Sized),
         timing: crate::intel_gpu_dsb::Timing,
+    ) -> Result<Self, FsError> {
+        Self::capture_ip(io, timing, DisplayIp::Xelpdp)
+    }
+    /// Retained primary watermark ownership on `ip`. Display 14 requires
+    /// the owned `PLANE_CHICKEN` no-DPT bit; display 20 has none (its tiled
+    /// primary is fetched through the presenter's DPT), so nothing extra is
+    /// read there. The proved layout must be `ip`'s.
+    pub(crate) fn capture_ip(
+        io: &(impl MmioWindow + ?Sized),
+        timing: crate::intel_gpu_dsb::Timing,
+        ip: DisplayIp,
     ) -> Result<Self, FsError> {
         let mode = Mode {
             pixel_clock_khz: timing.clock,
@@ -547,15 +673,19 @@ impl Primary {
         if !matches!(read(io, 0x70180)? & (7 << 10), 0 | 0x400) {
             return Err(FsError::Unsupported);
         }
-        if read(io, 0x7026c)? & (1 << 19) == 0 {
+        if ip.has_no_dpt_chicken() && read(io, 0x7026c)? & (1 << 19) == 0 {
             return Err(FsError::Unsupported);
         }
         let original = Profile::capture(io, &mode)?;
+        if original.ip != ip {
+            return Err(FsError::Unsupported);
+        }
         let mut primary = Self {
             mode,
             wm_level_disabled: [original.wm_level_disabled; 2],
             current_tile4: false,
             pending: None,
+            ip,
         };
         let [_, tile4] = primary.images(io)?;
         primary.wm_level_disabled[1] = tile4.wm_level_disabled;
@@ -565,13 +695,16 @@ impl Primary {
     /// now (globals and CDCLK included).
     fn images(&self, io: &(impl MmioWindow + ?Sized)) -> Result<[Profile; 2], FsError> {
         let dsc = pipe_a_dsc(io, &self.mode)?;
-        let (linear, layout) = Profile::capture_globals(io, &self.mode, dsc)?;
-        Profile::check_cdclk(io, &self.mode)?;
-        if read(io, 0x7026c)? & (1 << 19) == 0 {
+        let (linear, layout, ip) = Profile::capture_globals(io, &self.mode, dsc)?;
+        Profile::check_cdclk(io, ip, &self.mode)?;
+        if ip != self.ip {
+            return Err(FsError::Unsupported);
+        }
+        if ip.has_no_dpt_chicken() && read(io, 0x7026c)? & (1 << 19) == 0 {
             return Err(FsError::Unsupported);
         }
         let tile4 =
-            Profile::compute_for_layout(io, &self.mode, Tiling::Tile4, layout.as_ref(), dsc)?;
+            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_ref(), dsc)?;
         Ok([linear, tile4])
     }
     /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.
@@ -608,7 +741,7 @@ impl Primary {
             } {
                 return Err(FsError::Unsupported);
             }
-            verify_primary(io, images[usize::from(self.current_tile4)].primary)?;
+            verify_primary(io, self.ip, images[usize::from(self.current_tile4)].primary)?;
         }
         Ok(())
     }
@@ -621,10 +754,10 @@ impl Primary {
             return Err(FsError::Busy);
         }
         self.check_current(io)?;
-        let image = primary_registers(self.images(io)?[usize::from(tile4)].primary)?;
+        let image = primary_registers(self.ip, self.images(io)?[usize::from(tile4)].primary)?;
         self.pending = Some(tile4);
         wm::publish_pipe_a(None);
-        Ok(image.to_vec())
+        Ok(image)
     }
     /// A staged image was never armed: the current image stays programmed.
     pub(crate) fn rollback(&mut self) {
@@ -637,7 +770,7 @@ impl Primary {
     pub(crate) fn complete(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
         let images = self.images(io)?;
         let target = self.pending.ok_or(FsError::Busy)?;
-        verify_primary(io, images[usize::from(target)].primary)?;
+        verify_primary(io, self.ip, images[usize::from(target)].primary)?;
         self.current_tile4 = target;
         self.pending = None;
         wm::publish_pipe_a(self.current_wm_level_disabled());
@@ -648,7 +781,7 @@ impl Primary {
     /// console SURF latch plus readback completes restoration.
     pub(crate) fn restore(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<Profile, FsError> {
         let [original, _] = self.images(io)?;
-        let image = primary_registers(original.primary)?;
+        let image = primary_registers(self.ip, original.primary)?;
         self.pending = Some(false); // retained before the first possible write
         wm::publish_pipe_a(None);
         for (r, value) in image {
@@ -683,16 +816,16 @@ pub(crate) fn initialize_dsc(
     min_cdclk_khz: u32,
     dsc: Option<DscTerm>,
 ) -> Result<Option<Profile>, ResourceError> {
-    if !display14(io)? {
+    let Some(ip) = display_ip(io)? else {
         return Ok(None);
-    }
-    match idle(io) {
+    };
+    match idle_ip(io, ip) {
         Ok(()) => {}
         Err(FsError::Unsupported) => return Ok(None),
         Err(e) => return Err(e.into()),
     }
     let (profile, state) =
-        match Profile::compute_state(io, mode, Tiling::Linear, min_cdclk_khz, dsc) {
+        match Profile::compute_state(io, ip, mode, Tiling::Linear, min_cdclk_khz, dsc) {
             Ok(v) => v,
             Err(FsError::Unsupported) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -709,14 +842,18 @@ pub(crate) fn initialize_dsc(
     wait(io, INFLIGHT, 1 << 26, 0)?;
     // intel_dpt_common.c::intel_dpt_configure, display14 no-DPT profile.
     // Only our primary changes, with every pipe/fetcher proved off above.
-    let chicken = read(io, 0x7026c)?;
-    checked(io, 0x7026c, chicken | (1 << 19))?;
-    // Wa_14016740474 (intel_pmdemand_init): display14.00 A0..<C0. STEP_*
-    // enumerates four substeps per letter; GMD stepping is the offset.
-    let gmd = read(io, 0x510a0)?;
-    if gmd & 63 < 8 {
-        let v = read(io, 0x46438)?;
-        checked(io, 0x46438, v | (1 << 19))?;
+    // Display 20 programs no PLANE_CHICKEN: its tiled primaries use a DPT.
+    if ip == DisplayIp::Xelpdp {
+        let chicken = read(io, 0x7026c)?;
+        checked(io, 0x7026c, chicken | (1 << 19))?;
+        // Wa_14016740474 (intel_pmdemand_init): display14.00 A0..<C0.
+        // STEP_* enumerates four substeps per letter; GMD stepping is the
+        // offset.
+        let gmd = read(io, 0x510a0)?;
+        if gmd & 63 < 8 {
+            let v = read(io, 0x46438)?;
+            checked(io, 0x46438, v | (1 << 19))?;
+        }
     }
     // skl_watermark_ipc_update: transition watermarks require IPC. Own its
     // enable while the pipes are off instead of inheriting firmware policy.

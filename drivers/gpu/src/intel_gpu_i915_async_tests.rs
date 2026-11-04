@@ -268,7 +268,7 @@ fn smoke_i915_object_async_real_overlap_prime_cpu_exclusion_and_retirement() -> 
     assert_eq!(context_b.engine(), Engine::Bcs8);
     assert!(!Arc::ptr_eq(&context_a, &context_b));
     assert_eq!(object.dma_buf.resv.fences(DmaResvUsage::Write).len(), 2);
-    finish_policy(&mut gt, &w, &fence_b, &mut registered, 521, 3);
+    finish_policy(&mut gt, &w, &fence_b, &mut registered, 521, 2);
     assert_eq!(registered.get(&guc_a), Some(&base_a));
     assert_eq!(device_word(&object, 0x80), 0);
     assert_eq!(device_word(&object, 0x84), 0x18180002);
@@ -325,7 +325,7 @@ fn smoke_i915_object_async_real_overlap_prime_cpu_exclusion_and_retirement() -> 
         assert!(mailbox.pending.lock().is_empty());
     }
     execute_copy(&w, base_a);
-    finish_policy(&mut gt, &w, &fence_a, &mut registered, 600, 3);
+    finish_policy(&mut gt, &w, &fence_a, &mut registered, 600, 2);
     assert!(registered.is_empty());
     assert_eq!(device_word(&object, 0x80), 0x18180001);
     assert_eq!(object.busy(), 0);
@@ -656,7 +656,7 @@ fn smoke_i915_object_async_explicit_inputs_snapshot_and_same_context_order() -> 
             "ASYNC silently waited for an implicit dependency"
         );
         let mut registered = BTreeMap::new();
-        finish_policy(&mut gt, &w, &fence, &mut registered, 501 + kind * 100, 3);
+        finish_policy(&mut gt, &w, &fence, &mut registered, 501 + kind * 100, 2);
         if let Some(output) = output {
             assert!(output
                 .find_fence(if kind == 1 { 0 } else { 11 })
@@ -684,7 +684,7 @@ fn smoke_i915_object_async_explicit_inputs_snapshot_and_same_context_order() -> 
         );
     }
     execute_copy(&w, base);
-    finish_policy(&mut gt, &w, &producer, &mut registered, 920, 3);
+    finish_policy(&mut gt, &w, &producer, &mut registered, 920, 2);
     hardware_stop(&mut gt, &w, ack);
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);
@@ -1035,7 +1035,7 @@ fn smoke_i915_object_async_raw_mixed_final_conflict_retries_without_partial_fenc
         Poll::Ready(Some(Ok(0)))
     );
     let mut registered = BTreeMap::new();
-    finish_policy(&mut gt, &w, &fence, &mut registered, 601, 3);
+    finish_policy(&mut gt, &w, &fence, &mut registered, 601, 2);
     assert_eq!(device_word(&object, 0x80), 0x18180007);
     assert_eq!(code.busy(), 0);
     assert_eq!(object.busy(), 0);

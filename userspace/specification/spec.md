@@ -1671,6 +1671,28 @@ This permits a multiplexed device such as DRM to remove a closed GEM handle
 and quiesce its host resource immediately while deferring DMA-page reuse until
 the final mapping disappears.
 
+A `MAP_PRIVATE` mapping of a file whose `FileOps::mmap_private_pfn` returns
+`Some` is a read-only private PFN mapping (Linux `remap_pfn_range` into a VMA
+without `VM_MAYWRITE`/`VM_MAYEXEC`, as `xe_oa_mmap` builds). After
+`validate_mmap`, `sys_mmap` refuses with ENODEV a provider whose request or
+`mmap_max_prot` admits write or exec, then maps the `mmap_backing` frames as a
+borrowed `SHARED | LOCK_EXEMPT` region with the same owner row (file plus
+lifetime) as a shared device mapping; nothing is copied through `read`. The
+owner row records the flags and keeps them across splits and moves:
+
+- `mremap` returns EINVAL for `MREMAP_DONTUNMAP` and for an `old_len` of 0 (a
+  private duplicate). Growth returns EFAULT (`VM_DONTEXPAND`). Shrinking and
+  same-size moves proceed, as in `check_prep_vma`.
+- With `dont_copy` (`VM_DONTCOPY`), memory's fork hook withholds the owner row
+  from the child and records the range. Every `clone_for_fork` caller that
+  publishes a child (`sys_fork`, non-`CLONE_VM` clone) calls
+  `mapped_file::finish_fork_address_space` before the child can run. It
+  punches those ranges from the child's region copy, as `dup_mmap` clears the
+  VMA; the punch frees no borrowed frame. A failure refuses the fork with
+  ENOMEM, and a child dropped first discards its record.
+- mprotect stays bounded by `mmap_max_prot` (EACCES). Shared futex keying
+  treats the range as private.
+
 Generic filesystem mappings that cannot expose page-cache frames retain one
 canonical fallback page per filesystem device, anchored file identity and offset, plus an
 exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that

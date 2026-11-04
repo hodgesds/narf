@@ -1,9 +1,13 @@
-//! Display-14 Panel Self Refresh (PSR1) on the KMS-owned Pipe-A eDP.
+//! Display-14 Panel Self Refresh (PSR1, and PSR2 with selective fetch) on
+//! the KMS-owned Pipe-A eDP.
 //!
 //! Pinned source: Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! `i915/display/intel_psr.c`, `intel_psr_regs.h`, `intel_alpm.c`,
-//! `intel_fbc.c`, `intel_dp.c`, `intel_crtc.c`, `intel_bios.c`,
-//! `intel_display_params.h`, `skl_watermark.c`, `i915_reg.h`,
+//! `intel_fbc.c`, `intel_dp.c`, `intel_dp_aux.c`, `intel_quirks.c`,
+//! `intel_crtc.c`, `intel_display.c`, `intel_bios.c`,
+//! `intel_display_params.h`, `intel_display_device.c`, `intel_vdsc_regs.h`,
+//! `skl_universal_plane.c` / `_regs.h`, `intel_cursor.c` / `_regs.h`,
+//! `skl_watermark.c`, `i915_reg.h`, `drm/drm_damage_helper.c`,
 //! `drm/display/drm_dp_helper.c` and `include/drm/display/drm_dp.h`.
 //!
 //! What is modelled, for display 14 (Meteor Lake / Arrow Lake), eDP on
@@ -18,7 +22,19 @@
 //!   with the default debug mode: the VBT's `psr.enable` for the panel),
 //!   then no interlace, a valid setup time that
 //!   fits `vtotal - vdisplay - 1` lines (display < 20 has no entry setup
-//!   frames). Panel Replay and selective update are not offered here.
+//!   frames). Then selective update ([`compute_psr2`], from
+//!   `intel_sel_update_config_valid`): the sink's SU support, the display
+//!   12–14 bpp limit, `intel_alpm_compute_params` (with `QUIRK_FW_SYNC_LEN`),
+//!   the vblank fit, the SDP prior-scanline indication, SU granularity and
+//!   `intel_psr_compute_config_late`. A refusal ([`Psr2Refusal`]) falls back
+//!   to PSR1. Panel Replay is not offered (`PANEL_REPLAY_CAP` is never read).
+//! - PSR2 (`intel_alpm_enable_sink`, `_psr_enable_sink`,
+//!   `intel_psr_enable_source` with Wa_16014451276 and Wa_16012604467 on
+//!   display 14.00 A0..A3, `hsw_activate_psr2`) and selective fetch per
+//!   commit ([`sel_fetch_update`] from `intel_psr2_sel_fetch_update` and
+//!   `psr2_man_trk_ctl_calc`; `PSR2_MAN_TRK_CTL`, `SEL_FETCH_PLANE_*` for the
+//!   primary and `SEL_FETCH_CUR_CTL`). Display 14 has no PSR2 HW tracking,
+//!   no early transport and no DC3CO (its exit line is disabled in Linux).
 //! - Enable (`intel_psr_enable_locked`): `psr_interrupt_error_check`, then
 //!   `intel_psr_enable_sink` (PSR1 needs no ALPM: `intel_psr_needs_alpm`),
 //!   then `intel_psr_enable_source` (PSR_MASK, `psr_irq_control`,
@@ -208,6 +224,115 @@ pub const DP_MAX_RESYNC_FRAME_COUNT_MASK: u8 = 0xf;
 pub const NO_PSR_SINK_OUI: [u8; 3] = [0x00, 0x10, 0xfa];
 /// `DRM_MODE_FLAG_INTERLACE`.
 pub const DRM_MODE_FLAG_INTERLACE: u32 = 1 << 4;
+
+// ── PSR2 / selective fetch (display 14, transcoder A, pipe A) ─────
+
+/// `EDP_PSR2_STATUS_STATE_DEEP_SLEEP` (`_psr2_ready_for_pipe_update_locked`
+/// waits for this bit pattern to clear).
+pub const EDP_PSR2_STATUS_STATE_DEEP_SLEEP: u32 = 8 << 28;
+/// `PSR2_MAN_TRK_CTL(TRANSCODER_A)`.
+pub const PSR2_MAN_TRK_CTL: u64 = 0x60910;
+/// `ADLP_PSR2_MAN_TRK_CTL_SF_PARTIAL_FRAME_UPDATE` (display 14 has no
+/// separate `PSR2_MAN_TRK_CTL_ENABLE`: `man_trk_ctl_enable_bit_get` is 0).
+pub const MAN_TRK_SF_PARTIAL_FRAME_UPDATE: u32 = 1 << 31;
+/// `ADLP_PSR2_MAN_TRK_CTL_SF_SINGLE_FULL_FRAME`.
+pub const MAN_TRK_SF_SINGLE_FULL_FRAME: u32 = 1 << 14;
+/// `ADLP_PSR2_MAN_TRK_CTL_SF_CONTINUOS_FULL_FRAME`.
+pub const MAN_TRK_SF_CONTINUOUS_FULL_FRAME: u32 = 1 << 13;
+/// `ADLP_PSR2_MAN_TRK_CTL_SU_REGION_START_ADDR_MASK` (28:16) and
+/// `..._END_ADDR_MASK` (12:0) are both 13 bits wide.
+const MAN_TRK_SU_REGION_ADDR_MASK: u32 = 0x1fff;
+/// `TGL_EDP_PSR2_BLOCK_COUNT_NUM_3` (`..._NUM_2` is 0).
+pub const EDP_PSR2_BLOCK_COUNT_NUM_3: u32 = 1 << 28;
+/// `EDP_PSR2_SU_SDP_SCANLINE` (display 13+).
+pub const EDP_PSR2_SU_SDP_SCANLINE: u32 = 1 << 25;
+/// `TGL_EDP_PSR2_IO_BUFFER_WAKE_MIN_LINES` / `TGL_EDP_PSR2_FAST_WAKE_MIN_LINES`.
+const TGL_EDP_PSR2_WAKE_MIN_LINES: u32 = 5;
+/// `EDP_PSR2_TP2_TIME_500us`.
+pub const EDP_PSR2_TP2_TIME_500US: u32 = 0;
+/// `EDP_PSR2_TP2_TIME_100us`.
+pub const EDP_PSR2_TP2_TIME_100US: u32 = 1 << 8;
+/// `EDP_PSR2_TP2_TIME_2500us`.
+pub const EDP_PSR2_TP2_TIME_2500US: u32 = 2 << 8;
+/// `EDP_PSR2_TP2_TIME_50us`.
+pub const EDP_PSR2_TP2_TIME_50US: u32 = 3 << 8;
+/// `SEL_FETCH_PLANE_CTL(PIPE_A, PLANE_1)`.
+pub const SEL_FETCH_PLANE_CTL: u64 = 0x70890;
+/// `SEL_FETCH_PLANE_POS(PIPE_A, PLANE_1)`.
+pub const SEL_FETCH_PLANE_POS: u64 = 0x70894;
+/// `SEL_FETCH_PLANE_SIZE(PIPE_A, PLANE_1)`.
+pub const SEL_FETCH_PLANE_SIZE: u64 = 0x70898;
+/// `SEL_FETCH_PLANE_OFFSET(PIPE_A, PLANE_1)`.
+pub const SEL_FETCH_PLANE_OFFSET: u64 = 0x7089c;
+/// `SEL_FETCH_PLANE_CTL_ENABLE`.
+pub const SEL_FETCH_PLANE_CTL_ENABLE: u32 = 1 << 31;
+/// `SEL_FETCH_CUR_CTL(PIPE_A)`.
+pub const SEL_FETCH_CUR_CTL: u64 = 0x70880;
+/// `CURCNTR(PIPE_A)`.
+pub const CURCNTR: u64 = 0x70080;
+/// `CURBASE(PIPE_A)`.
+pub const CURBASE: u64 = 0x70084;
+/// `CURPOS(PIPE_A)`.
+pub const CURPOS: u64 = 0x70088;
+/// `CURSURFLIVE(PIPE_A)`: a write is the PSR "Frame Change" event
+/// (`intel_psr_trigger_frame_change_event`, Display WA #0884).
+pub const CURSURFLIVE: u64 = 0x700ac;
+/// `MCURSOR_MODE_MASK`.
+pub const MCURSOR_MODE_MASK: u32 = 0x27;
+/// `MCURSOR_MODE_64_ARGB_AX`.
+pub const MCURSOR_MODE_64_ARGB_AX: u32 = 0x27;
+/// `CHICKEN_TRANS(TRANSCODER_A)` on display 14 (`_MTL_CHICKEN_TRANS_A`).
+pub const MTL_CHICKEN_TRANS_A: u64 = 0x604e0;
+/// `ADLP_1_BASED_X_GRANULARITY`.
+pub const ADLP_1_BASED_X_GRANULARITY: u32 = 1 << 18;
+/// `MTL_CLKGATE_DIS_TRANS(TRANSCODER_A)`.
+pub const MTL_CLKGATE_DIS_TRANS_A: u64 = 0x604e8;
+/// `MTL_CLKGATE_DIS_TRANS_DMASC_GATING_DIS`.
+pub const MTL_CLKGATE_DIS_TRANS_DMASC_GATING_DIS: u32 = 1 << 7;
+/// `GMD_ID_DISPLAY`: architecture 31:22, release 21:14, step 5:0.
+pub const GMD_ID_DISPLAY: u64 = 0x510a0;
+/// `PIPE_MISC(PIPE_A)`; `PIPE_MISC_BPC_MASK` is 7:5.
+pub const PIPE_MISC_A: u64 = 0x70030;
+/// `TRANS_DDI_FUNC_CTL(TRANSCODER_A)`; `DDI_PORT_WIDTH_MASK` is 3:1.
+pub const TRANS_DDI_FUNC_CTL_A: u64 = 0x60400;
+/// `TRANS_SET_CONTEXT_LATENCY(TRANSCODER_A)` (15:0).
+pub const TRANS_SET_CONTEXT_LATENCY_A: u64 = 0x6007c;
+/// `ICL_PIPE_DSS_CTL1(PIPE_A)`.
+pub const PIPE_DSS_CTL1_A: u64 = 0x78000;
+/// `ICL_PIPE_DSS_CTL2(PIPE_A)`.
+pub const PIPE_DSS_CTL2_A: u64 = 0x78004;
+/// `SPLITTER_ENABLE | JOINER_ENABLE | BIG_JOINER_ENABLE |
+/// ULTRA_JOINER_ENABLE | UNCOMPRESSED_JOINER_PRIMARY | _SECONDARY`.
+const DSS_CTL1_SPLIT: u32 = (1 << 31) | (1 << 30) | (1 << 29) | (1 << 23) | (1 << 21) | (1 << 20);
+/// `VDSC0_ENABLE | VDSC2_ENABLE | VDSC1_ENABLE`.
+const DSS_CTL2_VDSC: u32 = (1 << 31) | (1 << 30) | (1 << 15);
+/// `SKL_PS_CTRL(PIPE_A, 0)` and `(PIPE_A, 1)`.
+pub const PS_CTRL_A: [u64; 2] = [0x68180, 0x68280];
+/// `PS_SCALER_EN`.
+pub const PS_SCALER_EN: u32 = 1 << 31;
+/// `DP_SUPPORTED_LINK_RATES` (eDP 1.4, eight LE16 entries in 200 kHz).
+pub const DP_SUPPORTED_LINK_RATES: u32 = 0x010;
+/// `DP_LINK_BW_SET`.
+pub const DP_LINK_BW_SET: u32 = 0x100;
+/// `DP_LINK_RATE_SET` (eDP 1.4); `DP_LINK_RATE_SET_MASK` is 2:0.
+pub const DP_LINK_RATE_SET: u32 = 0x115;
+/// `DP_RECEIVER_ALPM_CONFIG`.
+pub const DP_RECEIVER_ALPM_CONFIG: u32 = 0x116;
+/// `DP_ALPM_ENABLE`.
+pub const DP_ALPM_ENABLE: u8 = 1 << 0;
+/// `DP_ALPM_LOCK_ERROR_IRQ_HPD_ENABLE`.
+pub const DP_ALPM_LOCK_ERROR_IRQ_HPD_ENABLE: u8 = 1 << 1;
+/// `DP_PSR_SU_REGION_SCANLINE_CAPTURE`.
+pub const DP_PSR_SU_REGION_SCANLINE_CAPTURE: u8 = 1 << 4;
+/// `DP_PSR_IRQ_HPD_WITH_CRC_ERRORS`.
+pub const DP_PSR_IRQ_HPD_WITH_CRC_ERRORS: u8 = 1 << 5;
+/// `DP_PSR_ENABLE_PSR2`.
+pub const DP_PSR_ENABLE_PSR2: u8 = 1 << 6;
+/// `DP_EDP_14b`.
+pub const DP_EDP_14B: u8 = 0x05;
+/// `intel_dpcd_quirks[]`'s `QUIRK_FW_SYNC_LEN` (Dell Precision 5490):
+/// PCI device, subsystem vendor and device, and sink OUI.
+pub const FW_SYNC_QUIRK: (u16, u16, u16, [u8; 3]) = (0x7d55, 0x1028, 0x0cc7, [0x38, 0xec, 0x11]);
 
 /// `drm_dp_psr_setup_time`'s table, in µs, by `DP_PSR_SETUP_TIME` code.
 const PSR_SETUP_TIME_US: [u32; 7] = [330, 275, 220, 165, 110, 55, 0];
@@ -579,6 +704,497 @@ pub fn sink_cfg_psr1() -> u8 {
     DP_PSR_CRC_VERIFICATION
 }
 
+// ── PSR2 qualification (intel_sel_update_config_valid) ────────────
+
+/// Why selective update (PSR2) is not offered; PSR1 runs instead. Like
+/// Linux's `has_sel_update` it is decided per enable, so every refusal is
+/// retried at the next qualification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Psr2Refusal {
+    /// `psr_caps.su_support` is false (`_psr_init_dpcd`): PSR version 3,
+    /// the Y-coordinate requirement and AUX-wake ALPM are not all present.
+    NoSinkSu,
+    /// A source or link fact could not be read: a register read all-ones,
+    /// the display IP is not 14.00, the PCI identity behind
+    /// `QUIRK_FW_SYNC_LEN` is unknown, or the sink's link setting is.
+    Unknown,
+    /// DSC, a joiner or the MSO splitter is engaged on Pipe A. Linux
+    /// aligns the SU area to the DSC slice height and applies
+    /// Wa_14014971492 under the splitter; this driver models neither.
+    StreamSplit,
+    /// `pipe_bpp` above 30, the display 12–14 limit.
+    PipeBpp,
+    /// `intel_alpm_compute_params`: an IO or fast wake time above 12 lines.
+    WakeTime,
+    /// The PSR2 block-count lines do not fit the vblank
+    /// (`wake_lines_fit_into_vblank`, `intel_psr_compute_config_late`).
+    Vblank,
+    /// `_compute_psr2_sdp_prior_scanline_indication`: the SDP does not fit
+    /// hblank and the sink is older than eDP 1.4b.
+    SdpPriorScanline,
+    /// `psr2_granularity_check`.
+    Granularity,
+}
+
+/// The source and link facts PSR2 qualification reads from the live Pipe A
+/// (Linux takes them from the computed crtc state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Psr2Source {
+    /// The display 14.00 stepping (`GMD_ID_DISPLAY` 5:0; 0..3 is A0..A3,
+    /// 4 is B0, as `STEP_A0 + gmd_id.step`).
+    pub step: u8,
+    /// `pipe_bpp` (`PIPE_MISC` BPC × 3).
+    pub pipe_bpp: u32,
+    /// `lane_count` (`TRANS_DDI_FUNC_CTL` port width + 1).
+    pub lane_count: u32,
+    /// `port_clock`: the link rate in 10 kbit/s (270000 for HBR).
+    pub port_clock: u32,
+    /// The live `TRANS_SET_CONTEXT_LATENCY`.
+    pub set_context_latency: u32,
+    /// DSC, a joiner or the splitter is engaged ([`Psr2Refusal::StreamSplit`]).
+    pub stream_split: bool,
+    /// `QUIRK_FW_SYNC_LEN` applies (`intel_dp_aux_fw_sync_len` + 2).
+    pub fw_sync_quirk: bool,
+}
+
+/// A qualified PSR2 configuration with selective fetch (display 14 has no
+/// PSR2 HW tracking, so `enable_psr2_sel_fetch` is the only SU mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Psr2 {
+    /// `alpm_state.io_wake_lines`.
+    pub io_wake_lines: u8,
+    /// `alpm_state.fast_wake_lines`.
+    pub fast_wake_lines: u8,
+    /// `req_psr2_sdp_prior_scanline`.
+    pub req_sdp_prior_scanline: bool,
+    /// `su_y_granularity` (display 14 takes the sink's).
+    pub su_y_granularity: u16,
+    /// `frames_before_su_entry` (no entry setup frames below display 20).
+    pub frames_before_su: u8,
+    /// The VBT's `psr.psr2_tp2_tp3_wakeup_time_us`.
+    pub tp2_wakeup_us: u32,
+    /// Display 14.00 A0..A3 (`IS_DISPLAY_VERx100_STEP(1400, A0, B0)`):
+    /// Wa_16014451276 and Wa_16012604467.
+    pub a0_to_b0: bool,
+    /// The pipe source width (`pipe_src`).
+    pub width: u16,
+    /// The pipe source height.
+    pub height: u16,
+}
+
+/// `psr2_block_count_lines`.
+pub fn psr2_block_count_lines(io_wake_lines: u8, fast_wake_lines: u8) -> u32 {
+    if io_wake_lines < 9 && fast_wake_lines < 9 {
+        8
+    } else {
+        12
+    }
+}
+
+/// `intel_sel_update_config_valid` for display 14 eDP PSR, after
+/// [`compute_psr1`] succeeded: `intel_psr2_config_valid` (sink SU, the
+/// display 12–14 bpp limit, `alpm_config_valid`), then
+/// `_compute_psr2_sdp_prior_scanline_indication` and
+/// `psr2_granularity_check`, then `intel_psr_compute_config_late`'s
+/// vblank check. Defaults hold: `enable_psr` -1 and
+/// `enable_psr2_sel_fetch` true, `psr_safest_params` false, no pipe CRC,
+/// no VRR (so `_intel_psr_min_set_context_latency` is 0), no early
+/// transport below display 20, and no DC3CO (its exit line is disabled).
+pub(crate) fn compute_psr2(
+    sink: &Sink,
+    timing: &crate::intel_gpu_dsb::Timing,
+    panel: &crate::intel_gpu_vbt::PsrPanel,
+    source: &Psr2Source,
+) -> Result<Psr2, Psr2Refusal> {
+    if !sink.su_support() {
+        return Err(Psr2Refusal::NoSinkSu);
+    }
+    // transcoder_has_psr2: transcoder A on display 14. DSC is allowed with
+    // PSR2 on display 14, but its slice alignment is not modelled.
+    if source.stream_split {
+        return Err(Psr2Refusal::StreamSplit);
+    }
+    if source.pipe_bpp > 30 {
+        return Err(Psr2Refusal::PipeBpp);
+    }
+    // intel_alpm_compute_params: tfw_exit_latency 20, phy_wake 4, preamble
+    // 8, precharge intel_dp_aux_fw_sync_len() - preamble, and the TGL+
+    // 10 µs IO buffer wake.
+    let precharge = 10 + if source.fw_sync_quirk { 2 } else { 0 };
+    let io_time = precharge.max(10) + 8 + 4 + 20;
+    let fast_time = precharge + 8 + 4 + 20;
+    let io = usecs_to_scanlines(timing, io_time);
+    let fast = usecs_to_scanlines(timing, fast_time);
+    if io > 12 || fast > 12 {
+        return Err(Psr2Refusal::WakeTime);
+    }
+    // According to Bspec the lower limit is 7 lines.
+    let io_wake_lines = io.max(7) as u8;
+    let fast_wake_lines = fast.max(7) as u8;
+    let wake = psr2_block_count_lines(io_wake_lines, fast_wake_lines);
+    // wake_lines_fit_into_vblank before req_psr2_sdp_prior_scanline is
+    // known: crtc_vblank_end - crtc_vblank_start, less the 0 SCL.
+    let vblank = u32::from(timing.vtotal).saturating_sub(u32::from(timing.height));
+    if vblank < wake {
+        return Err(Psr2Refusal::Vblank);
+    }
+    // _compute_psr2_sdp_prior_scanline_indication, in Linux's u32
+    // arithmetic (a hblank shorter than the request wraps and passes).
+    if source.lane_count == 0 || source.port_clock < 1000 || timing.clock == 0 {
+        return Err(Psr2Refusal::Unknown);
+    }
+    let hblank_total = u64::from(timing.htotal.saturating_sub(timing.width));
+    let hblank_ns = (1_000_000 * hblank_total / u64::from(timing.clock)) as u32;
+    let req_ns = ((60 / source.lane_count) + 11) * 1000 / (source.port_clock / 1000);
+    let req_sdp_prior_scanline = if hblank_ns.wrapping_sub(req_ns) > 100 {
+        false
+    } else if sink.edp[0] < DP_EDP_14B {
+        return Err(Psr2Refusal::SdpPriorScanline);
+    } else {
+        true
+    };
+    // psr2_granularity_check: PSR2 HW sends full lines; selective fetch on
+    // display 14 has 1-line granularity, so the sink's Y granularity holds.
+    let (hdisplay, vdisplay) = (u32::from(timing.width), u32::from(timing.height));
+    let y = u32::from(sink.su_y_granularity);
+    if u32::from(sink.su_w_granularity) == 0
+        || hdisplay % u32::from(sink.su_w_granularity) != 0
+        || y == 0
+        || vdisplay % y != 0
+    {
+        return Err(Psr2Refusal::Granularity);
+    }
+    // intel_psr_compute_config_late: intel_crtc_vblank_length is
+    // crtc_vtotal - crtc_vblank_start, the start moved by the set context
+    // latency (Linux computes 0; the live value is taken here).
+    let mut late = vblank.saturating_sub(source.set_context_latency);
+    if req_sdp_prior_scanline {
+        late = late.saturating_sub(1);
+    }
+    if late < wake {
+        return Err(Psr2Refusal::Vblank);
+    }
+    Ok(Psr2 {
+        io_wake_lines,
+        fast_wake_lines,
+        req_sdp_prior_scanline,
+        su_y_granularity: y as u16,
+        frames_before_su: (sink.sync_latency + 1).max(2),
+        tp2_wakeup_us: panel.table.map_or(0, |t| t.psr2_tp2_tp3_wakeup_time_us),
+        a0_to_b0: source.step < 4,
+        width: timing.width,
+        height: timing.height,
+    })
+}
+
+/// `intel_psr2_get_tp_time` (`psr_safest_params` false).
+pub fn psr2_tp_time(tp2_wakeup_us: u32) -> u32 {
+    match tp2_wakeup_us {
+        0..=50 => EDP_PSR2_TP2_TIME_50US,
+        51..=100 => EDP_PSR2_TP2_TIME_100US,
+        101..=500 => EDP_PSR2_TP2_TIME_500US,
+        _ => EDP_PSR2_TP2_TIME_2500US,
+    }
+}
+
+/// `hsw_activate_psr2`'s `EDP_PSR2_CTL` for display 14: enable, idle
+/// frames (`psr_compute_idle_frames`), frames before SU, the PSR2 TP2
+/// time, the TGL block count, IO buffer and fast wake lines, and the SU
+/// SDP scanline indication. Display 14 sets neither `EDP_SU_TRACK_ENABLE`
+/// nor `EDP_Y_COORDINATE_ENABLE`.
+pub fn psr2_ctl(config: &Psr1, su: &Psr2) -> u32 {
+    let mut value = EDP_PSR2_ENABLE;
+    value |= config.idle_frames & 0xf;
+    value |= (u32::from(su.frames_before_su) & 0xf) << 4;
+    value |= psr2_tp_time(su.tp2_wakeup_us);
+    if psr2_block_count_lines(su.io_wake_lines, su.fast_wake_lines) / 4 > 2 {
+        value |= EDP_PSR2_BLOCK_COUNT_NUM_3;
+    }
+    value |= ((u32::from(su.io_wake_lines) - TGL_EDP_PSR2_WAKE_MIN_LINES) & 7) << 13;
+    value |= ((u32::from(su.fast_wake_lines) - TGL_EDP_PSR2_WAKE_MIN_LINES) & 7) << 10;
+    if su.req_sdp_prior_scanline {
+        value |= EDP_PSR2_SU_SDP_SCANLINE;
+    }
+    value
+}
+
+/// `_psr_enable_sink`'s PSR2 `DP_PSR_EN_CFG` byte before `DP_PSR_ENABLE`.
+pub fn sink_cfg_psr2(su: &Psr2) -> u8 {
+    DP_PSR_ENABLE_PSR2
+        | DP_PSR_IRQ_HPD_WITH_CRC_ERRORS
+        | if su.req_sdp_prior_scanline {
+            DP_PSR_SU_REGION_SCANLINE_CAPTURE
+        } else {
+            0
+        }
+}
+
+/// `intel_alpm_enable_sink` for PSR2 on eDP (AUX-wake ALPM).
+pub const SINK_ALPM_PSR2: u8 = DP_ALPM_ENABLE | DP_ALPM_LOCK_ERROR_IRQ_HPD_ENABLE;
+
+/// The link rate the sink was trained at, in `port_clock` units: a
+/// `DP_LINK_BW_SET` code times 27000, or (eDP 1.4 rate select) the
+/// `DP_SUPPORTED_LINK_RATES` entry `DP_LINK_RATE_SET` names, times 20
+/// (`intel_edp_init_dpcd`'s `(val * 200) / 10`). `None` when unreadable or
+/// unset.
+pub fn sink_link_rate<A: AuxChannel + ?Sized>(aux: &mut A) -> Option<u32> {
+    let mut bw = [0u8; 1];
+    read(aux, DP_LINK_BW_SET, &mut bw).ok()?;
+    if bw[0] != 0 {
+        return Some(u32::from(bw[0]) * 27000);
+    }
+    let mut index = [0u8; 1];
+    read(aux, DP_LINK_RATE_SET, &mut index).ok()?;
+    let mut rate = [0u8; 2];
+    read(
+        aux,
+        DP_SUPPORTED_LINK_RATES + 2 * u32::from(index[0] & 7),
+        &mut rate,
+    )
+    .ok()?;
+    match u32::from(u16::from_le_bytes(rate)) * 20 {
+        0 => None,
+        rate => Some(rate),
+    }
+}
+
+/// Read the live Pipe-A facts [`compute_psr2`] needs. `pci` is the device
+/// and subsystem identity behind `QUIRK_FW_SYNC_LEN`.
+pub fn psr2_source<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
+    regs: &M,
+    aux: &mut A,
+    sink: &Sink,
+    pci: Option<(u16, u16, u16)>,
+) -> Result<Psr2Source, Psr2Refusal> {
+    let get = |register| match regs.read32(register) {
+        u32::MAX => Err(Psr2Refusal::Unknown),
+        value => Ok(value),
+    };
+    let gmd = get(GMD_ID_DISPLAY)?;
+    if gmd >> 22 != 14 || (gmd >> 14) & 0xff != 0 {
+        return Err(Psr2Refusal::Unknown);
+    }
+    // bdw_get_pipe_misc_bpp for display 13+.
+    let pipe_bpp = match (get(PIPE_MISC_A)? >> 5) & 7 {
+        0 => 24,
+        1 => 30,
+        2 => 18,
+        4 => 36,
+        _ => return Err(Psr2Refusal::Unknown),
+    };
+    let lane_count = ((get(TRANS_DDI_FUNC_CTL_A)? >> 1) & 7) + 1;
+    let set_context_latency = get(TRANS_SET_CONTEXT_LATENCY_A)? & 0xffff;
+    let stream_split =
+        get(PIPE_DSS_CTL1_A)? & DSS_CTL1_SPLIT != 0 || get(PIPE_DSS_CTL2_A)? & DSS_CTL2_VDSC != 0;
+    let (device, vendor, subsystem) = pci.ok_or(Psr2Refusal::Unknown)?;
+    let (q_device, q_vendor, q_subsystem, q_oui) = FW_SYNC_QUIRK;
+    let fw_sync_quirk =
+        (device, vendor, subsystem) == (q_device, q_vendor, q_subsystem) && sink.oui == q_oui;
+    let port_clock = sink_link_rate(aux).ok_or(Psr2Refusal::Unknown)?;
+    Ok(Psr2Source {
+        step: (gmd & 0x3f) as u8,
+        pipe_bpp,
+        lane_count,
+        port_clock,
+        set_context_latency,
+        stream_split,
+        fw_sync_quirk,
+    })
+}
+
+// ── Selective fetch (intel_psr2_sel_fetch_update) ─────────────────
+
+pub use crate::drm::fb_cmd::{Damage, Rect};
+
+/// A plane's `psr2_sel_fetch_area` as plane-relative rows `y1..y2`;
+/// `None` is Linux's `{-1, -1}`.
+pub type Area = Option<(i32, i32)>;
+
+fn area_height(area: Area) -> i32 {
+    area.map_or(0, |(y1, y2)| y2 - y1)
+}
+
+/// The cursor plane on Pipe A as selective fetch sees it: visible, with
+/// its unclipped `uapi.dst` and `CURCNTR` (`plane_state->ctl`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPlane {
+    pub dst: Rect,
+    pub ctl: u32,
+}
+
+impl CursorPlane {
+    /// The visible Pipe-A cursor from `CURCNTR` and `CURPOS`
+    /// (`intel_cursor_position`'s sign-magnitude encoding). The KMS cursor
+    /// is 64x64 ARGB; any other enabled mode gets an empty destination,
+    /// for which selective fetch takes a full update.
+    pub fn read<M: MmioWindow + ?Sized>(regs: &M) -> Result<Option<Self>, Refusal> {
+        let ctl = readable(regs, CURCNTR)?;
+        if ctl & MCURSOR_MODE_MASK == 0 {
+            return Ok(None);
+        }
+        let pos = readable(regs, CURPOS)?;
+        let coord = |magnitude: u32, negative: bool| {
+            if negative {
+                -(magnitude as i32)
+            } else {
+                magnitude as i32
+            }
+        };
+        let x = coord(pos & 0x7fff, pos & (1 << 15) != 0);
+        let y = coord((pos >> 16) & 0x7fff, pos & (1 << 31) != 0);
+        let size = if ctl & MCURSOR_MODE_MASK == MCURSOR_MODE_64_ARGB_AX {
+            64
+        } else {
+            0
+        };
+        Ok(Some(Self {
+            dst: Rect::new(x, y, x + size, y + size),
+            ctl,
+        }))
+    }
+    /// `psr2_sel_fetch_plane_state_supported`: no negative position (a
+    /// cursor has no scaler and no rotation here).
+    fn supported(&self) -> bool {
+        self.dst.x1 >= 0 && self.dst.y1 >= 0
+    }
+}
+
+/// One commit's selective-fetch input for the fixed full-screen primary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuCommit<'a> {
+    /// The primary's FB_DAMAGE_CLIPS (or DIRTYFB clips).
+    pub damage: &'a Damage,
+    /// The primary's previous framebuffer source.
+    pub old_src: Rect,
+    /// The primary's new framebuffer source.
+    pub src: Rect,
+    /// `psr2_sel_fetch_pipe_state_supported`: no pipe or plane scaler is
+    /// engaged (there are no async flips here).
+    pub pipe_supported: bool,
+    /// The visible cursor on the pipe, if any.
+    pub cursor: Option<CursorPlane>,
+}
+
+/// What one commit programs (`intel_psr2_sel_fetch_update`,
+/// `psr2_man_trk_ctl_calc`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelFetch {
+    /// The SU area could not be used: continuous full frame.
+    pub full_update: bool,
+    /// `psr2_su_area` rows after alignment (`-1, -1` when unset).
+    pub su: (i32, i32),
+    /// `psr2_man_track_ctl`.
+    pub man_trk_ctl: u32,
+    /// The primary's `psr2_sel_fetch_area`. The primary is always in the
+    /// commit; a full update keeps its previous area.
+    pub primary: Area,
+    /// The cursor's new area and `CURCNTR` when the cursor joined the
+    /// commit's `update_planes`.
+    pub cursor: Option<(Area, u32)>,
+}
+
+/// `psr2_man_trk_ctl_calc` for display 14 (ADL-P layout, no enable bit;
+/// SF partial frame update is set even for a full update).
+pub fn man_trk_ctl(full_update: bool, su: (i32, i32)) -> u32 {
+    let value = MAN_TRK_SF_PARTIAL_FRAME_UPDATE;
+    if full_update {
+        return value | MAN_TRK_SF_CONTINUOUS_FULL_FRAME;
+    }
+    value
+        | ((su.0 as u32 & MAN_TRK_SU_REGION_ADDR_MASK) << 16)
+        | ((su.1 - 1) as u32 & MAN_TRK_SU_REGION_ADDR_MASK)
+}
+
+/// `intel_psr_configure_full_frame_update` below display 20: single and
+/// continuous full frame, written before `intel_psr_force_update` by a
+/// frontbuffer flush. Every frame change here is a commit, so the driver
+/// has no frontbuffer origin and never writes it; it is the reference
+/// value for that path.
+pub fn man_trk_ctl_full_frame_update() -> u32 {
+    MAN_TRK_SF_PARTIAL_FRAME_UPDATE
+        | MAN_TRK_SF_SINGLE_FULL_FRAME
+        | MAN_TRK_SF_CONTINUOUS_FULL_FRAME
+}
+
+/// `clip_area_update`.
+fn clip_area_update(su: &mut Option<(i32, i32)>, damage: &Rect, pipe_src: &Rect) {
+    let mut damage = *damage;
+    if !damage.intersect(pipe_src) {
+        return;
+    }
+    *su = Some(match *su {
+        None => (damage.y1, damage.y2),
+        Some((y1, y2)) => (y1.min(damage.y1), y2.max(damage.y2)),
+    });
+}
+
+/// `intel_psr2_sel_fetch_update` for the fixed full-screen primary
+/// (`dst` = `pipe_src` = `0, 0, width, height`, always visible, alpha and
+/// position unchanged) on a PSR2 with `su`, given the planes' previous
+/// areas `(primary, cursor)`. No early transport (display < 20), no DSC,
+/// and Wa_14014971492 needs the splitter, which qualification refuses.
+pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)) -> SelFetch {
+    let pipe_src = Rect::new(0, 0, i32::from(su.width), i32::from(su.height));
+    let dst = pipe_src;
+    let mut result = SelFetch {
+        full_update: true,
+        su: (-1, -1),
+        man_trk_ctl: 0,
+        primary: previous.0,
+        cursor: None,
+    };
+    let mut area = None;
+    if commit.pipe_supported {
+        // The first loop sees only the planes in the commit: the primary,
+        // through drm_atomic_helper_damage_merged.
+        if let Some(mut damaged) = commit.damage.merged(&commit.old_src, &commit.src) {
+            damaged.translate(dst.x1 - commit.src.x1, dst.y1 - commit.src.y1);
+            clip_area_update(&mut area, &damaged, &pipe_src);
+        }
+    }
+    // "Selective fetch area calculation failed" (or an unsupported pipe):
+    // a full update that skips the plane loop.
+    if let Some((mut y1, mut y2)) = area {
+        result.full_update = false;
+        // intel_psr2_sel_fetch_pipe_alignment without DSC.
+        let g = i32::from(su.su_y_granularity);
+        y1 -= y1 % g;
+        if y2 % g != 0 {
+            y2 = (y2 / g + 1) * g;
+        }
+        result.su = (y1, y2);
+        let su_rect = Rect::new(0, y1, pipe_src.x2, y2);
+        // drm_atomic_add_affected_planes brought in the cursor; every
+        // visible plane that intersects the SU area fetches its rows.
+        let mut inter = su_rect;
+        result.primary = inter
+            .intersect(&dst)
+            .then_some((inter.y1 - dst.y1, inter.y2 - dst.y1));
+        if let Some(cursor) = commit.cursor {
+            let mut inter = su_rect;
+            if !cursor.dst.visible() {
+                // A cursor mode this driver does not size has no exact
+                // fetch area (NARF policy).
+                result.full_update = true;
+            } else if !inter.intersect(&cursor.dst) {
+                // A previously enabled cursor fetch is disabled.
+                if area_height(previous.1) > 0 {
+                    result.cursor = Some((None, cursor.ctl));
+                }
+            } else if !cursor.supported() {
+                result.full_update = true;
+            } else {
+                result.cursor = Some((
+                    Some((inter.y1 - cursor.dst.y1, inter.y2 - cursor.dst.y1)),
+                    cursor.ctl,
+                ));
+            }
+        }
+    }
+    result.man_trk_ctl = man_trk_ctl(result.full_update, result.su);
+    result
+}
+
 // ── The owner ─────────────────────────────────────────────────────
 
 fn readable<M: MmioWindow + ?Sized>(regs: &M, register: u64) -> Result<u32, Refusal> {
@@ -595,10 +1211,21 @@ pub fn idle<M: MmioWindow + ?Sized>(regs: &M) -> Result<bool, Refusal> {
 
 /// `intel_de_wait_for_clear_ms(EDP_PSR_STATUS, STATE_MASK, timeout_ms)`.
 pub fn wait_idle<M: MmioWindow + ?Sized>(regs: &M, timeout_ms: u64) -> Result<(), Refusal> {
+    wait_clear(regs, PSR_STATUS, EDP_PSR_STATUS_STATE_MASK, timeout_ms)
+}
+
+/// `intel_de_wait_for_clear_ms(register, mask, timeout_ms)`; a timeout is
+/// [`Refusal::ExitTimeout`].
+fn wait_clear<M: MmioWindow + ?Sized>(
+    regs: &M,
+    register: u64,
+    mask: u32,
+    timeout_ms: u64,
+) -> Result<(), Refusal> {
     let mut error = None;
     let done = narf_scheduler::responsive_spin_until(
-        || match idle(regs) {
-            Ok(idle) => idle,
+        || match readable(regs, register) {
+            Ok(value) => value & mask == 0,
             Err(refusal) => {
                 error = Some(refusal);
                 true
@@ -613,11 +1240,39 @@ pub fn wait_idle<M: MmioWindow + ?Sized>(regs: &M, timeout_ms: u64) -> Result<()
     }
 }
 
-/// The PSR1 owner on the KMS-owned Pipe-A eDP. It only ever programs what
-/// it enabled.
+/// Whether a pipe or plane scaler is engaged on Pipe A (`SKL_PS_CTRL`):
+/// `psr2_sel_fetch_pipe_state_supported` then forces a full update.
+pub fn pipe_scaled<M: MmioWindow + ?Sized>(regs: &M) -> Result<bool, Refusal> {
+    let mut scaled = false;
+    for register in PS_CTRL_A {
+        scaled |= readable(regs, register)? & PS_SCALER_EN != 0;
+    }
+    Ok(scaled)
+}
+
+/// `intel_psr_trigger_frame_change_event`: a `CURSURFLIVE` write raises the
+/// PSR "Frame Change" event, which takes PSR2 out of deep sleep. Linux
+/// display 14 gets the same exit from enabling the vblank interrupt in
+/// `intel_pipe_update_start`; this driver has no display interrupt.
+pub fn frame_change_event<M: MmioWindow + ?Sized>(regs: &M) {
+    regs.write32(CURSURFLIVE, 0);
+}
+
+/// A running selective update: its configuration and the planes'
+/// persisted `psr2_sel_fetch_area` (primary, cursor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Su {
+    config: Psr2,
+    primary: Area,
+    cursor: Area,
+}
+
+/// The PSR owner on the KMS-owned Pipe-A eDP: PSR1, or PSR2 with selective
+/// fetch. It only ever programs what it enabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Psr {
     config: Psr1,
+    su: Option<Su>,
     active: bool,
 }
 
@@ -631,6 +1286,32 @@ impl Psr {
         regs: &M,
         aux: &mut A,
         config: Psr1,
+    ) -> Result<Psr, Refusal> {
+        Self::enable_with(regs, aux, config, None)
+    }
+
+    /// [`Psr::enable`] for PSR2 with selective fetch. The sink gets ALPM
+    /// and the PSR2 configuration; then the selective fetch of the commit
+    /// that qualified PSR2 is programmed (`commit`, normally the whole
+    /// plane: `intel_psr2_program_trans_man_trk_ctl` and the plane updates
+    /// run in that commit before `intel_psr_post_plane_update` enables
+    /// PSR); then the source, with Wa_16014451276 and Wa_16012604467 on
+    /// display 14.00 A0..A3.
+    pub fn enable_su<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
+        regs: &M,
+        aux: &mut A,
+        config: Psr1,
+        su: Psr2,
+        commit: &SuCommit<'_>,
+    ) -> Result<Psr, Refusal> {
+        Self::enable_with(regs, aux, config, Some((su, commit)))
+    }
+
+    fn enable_with<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
+        regs: &M,
+        aux: &mut A,
+        config: Psr1,
+        su: Option<(Psr2, &SuCommit<'_>)>,
     ) -> Result<Psr, Refusal> {
         if (readable(regs, PSR_CTL)? & EDP_PSR_ENABLE)
             | (readable(regs, PSR2_CTL)? & EDP_PSR2_ENABLE)
@@ -647,14 +1328,45 @@ impl Psr {
             return Err(Refusal::SinkNotReliable);
         }
         let dcpr = readable(regs, CHICKEN_DCPR_1)?;
-        // intel_psr_enable_sink → _psr_enable_sink, then DP_SET_POWER D0.
-        let cfg = sink_cfg_psr1();
-        let sink = write(aux, DP_PSR_EN_CFG, cfg)
+        let chickens = match su {
+            Some((su, _)) if su.a0_to_b0 => Some((
+                readable(regs, MTL_CHICKEN_TRANS_A)?,
+                readable(regs, MTL_CLKGATE_DIS_TRANS_A)?,
+            )),
+            _ => None,
+        };
+        // intel_psr_enable_sink: intel_alpm_enable_sink (PSR2 only), then
+        // _psr_enable_sink, then DP_SET_POWER D0.
+        let cfg = su.map_or_else(sink_cfg_psr1, |(su, _)| sink_cfg_psr2(&su));
+        let alpm = match su {
+            Some(_) => write(aux, DP_RECEIVER_ALPM_CONFIG, SINK_ALPM_PSR2),
+            None => Ok(()),
+        };
+        let sink = alpm
+            .and_then(|()| write(aux, DP_PSR_EN_CFG, cfg))
             .and_then(|()| write(aux, DP_PSR_EN_CFG, cfg | DP_PSR_ENABLE))
             .and_then(|()| write(aux, DP_SET_POWER, DP_SET_POWER_D0));
         if let Err(error) = sink {
             let _ = write(aux, DP_PSR_EN_CFG, 0);
+            if su.is_some() {
+                let _ = write(aux, DP_RECEIVER_ALPM_CONFIG, 0);
+            }
             return Err(Refusal::Aux(error));
+        }
+        let mut psr = Psr {
+            config,
+            su: su.map(|(config, _)| Su {
+                config,
+                primary: None,
+                cursor: None,
+            }),
+            active: false,
+        };
+        if let Some((su, commit)) = su {
+            let first = sel_fetch_update(&su, commit, (None, None));
+            psr.program_sel_fetch_noarm(regs, &first);
+            psr.program_sel_fetch_arm(regs, &first);
+            psr.program_sel_fetch_cursor(regs, &first);
         }
         // intel_psr_enable_source.
         regs.write32(PSR_DEBUG, PSR_DEBUG_MASK);
@@ -669,14 +1381,34 @@ impl Psr {
                 dcpr & !LATENCY_REPORTING_REMOVED_PIPE_A
             },
         );
-        Ok(Psr {
-            config,
-            active: false,
-        })
+        // Wa_16014451276 and Wa_16012604467 (mtl[a0,b0], not Panel Replay).
+        if let Some((chicken, clkgate)) = chickens {
+            regs.write32(MTL_CHICKEN_TRANS_A, chicken | ADLP_1_BASED_X_GRANULARITY);
+            regs.write32(
+                MTL_CLKGATE_DIS_TRANS_A,
+                clkgate | MTL_CLKGATE_DIS_TRANS_DMASC_GATING_DIS,
+            );
+        }
+        Ok(psr)
     }
 
     pub fn config(&self) -> Psr1 {
         self.config
+    }
+
+    /// The PSR2 configuration when selective update runs.
+    pub fn psr2(&self) -> Option<Psr2> {
+        self.su.map(|su| su.config)
+    }
+
+    /// Whether this is PSR2 with selective fetch (`sel_update_enabled`).
+    pub fn selective(&self) -> bool {
+        self.su.is_some()
+    }
+
+    /// The persisted `psr2_sel_fetch_area` of the primary and the cursor.
+    pub fn areas(&self) -> (Area, Area) {
+        self.su.map_or((None, None), |su| (su.primary, su.cursor))
     }
 
     /// `wm_optimization_wa` for a new `wm_level_disabled` while PSR is
@@ -706,30 +1438,74 @@ impl Psr {
         self.active
     }
 
-    /// `hsw_activate_psr1`: RMW keeping only the context-restore bit.
+    /// `hsw_activate_psr1` (RMW keeping only the context-restore bit) or
+    /// `hsw_activate_psr2`: `EDP_PSR_CTL` written 0 (BSpec: keep
+    /// `EDP_PSR_TP1_TP3_SEL` unset while PSR2 is enabled), then
+    /// `EDP_PSR2_CTL`.
     fn activate<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), Refusal> {
-        let ctl = readable(regs, PSR_CTL)?;
-        regs.write32(
-            PSR_CTL,
-            (ctl & EDP_PSR_RESTORE_PSR_ACTIVE_CTX) | psr1_ctl(&self.config),
-        );
+        match self.su {
+            Some(su) => {
+                readable(regs, PSR2_CTL)?;
+                regs.write32(PSR_CTL, 0);
+                regs.write32(PSR2_CTL, psr2_ctl(&self.config, &su.config));
+            }
+            None => {
+                let ctl = readable(regs, PSR_CTL)?;
+                regs.write32(
+                    PSR_CTL,
+                    (ctl & EDP_PSR_RESTORE_PSR_ACTIVE_CTX) | psr1_ctl(&self.config),
+                );
+            }
+        }
         self.active = true;
         Ok(())
     }
 
-    /// `intel_psr_exit` for PSR1.
+    /// `intel_psr_exit`: clear `EDP_PSR_ENABLE` (PSR1) or
+    /// `EDP_PSR2_ENABLE` (PSR2; DC3CO is never allowed here).
     fn exit<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), Refusal> {
         if !self.active {
             return Ok(());
         }
-        let ctl = readable(regs, PSR_CTL)?;
-        regs.write32(PSR_CTL, ctl & !EDP_PSR_ENABLE);
+        let (register, enable) = if self.su.is_some() {
+            (PSR2_CTL, EDP_PSR2_ENABLE)
+        } else {
+            (PSR_CTL, EDP_PSR_ENABLE)
+        };
+        let ctl = readable(regs, register)?;
+        regs.write32(register, ctl & !enable);
         self.active = false;
         Ok(())
     }
 
+    /// `intel_psr_wait_exit_locked`'s status: `EDP_PSR2_STATUS` for
+    /// selective update, else `EDP_PSR_STATUS`.
+    fn status(&self) -> (u64, u32) {
+        if self.su.is_some() {
+            (PSR2_STATUS, EDP_PSR2_STATUS_STATE_MASK)
+        } else {
+            (PSR_STATUS, EDP_PSR_STATUS_STATE_MASK)
+        }
+    }
+
+    /// The PSR state machine of this mode is idle.
+    pub fn idle<M: MmioWindow + ?Sized>(&self, regs: &M) -> Result<bool, Refusal> {
+        let (register, mask) = self.status();
+        Ok(readable(regs, register)? & mask == 0)
+    }
+
+    /// `intel_psr_wait_exit_locked` for this mode, bounded at `timeout_ms`.
+    pub fn wait_idle<M: MmioWindow + ?Sized>(
+        &self,
+        regs: &M,
+        timeout_ms: u64,
+    ) -> Result<(), Refusal> {
+        let (register, mask) = self.status();
+        wait_clear(regs, register, mask, timeout_ms)
+    }
+
     /// `TRANS_PSR_IIR & TGL_PSR_ERROR`, polled.
-    fn error<M: MmioWindow + ?Sized>(regs: &M) -> Result<(), Refusal> {
+    pub fn error<M: MmioWindow + ?Sized>(regs: &M) -> Result<(), Refusal> {
         if readable(regs, PSR_IIR)? & TGL_PSR_ERROR != 0 {
             Err(Refusal::SinkNotReliable)
         } else {
@@ -738,7 +1514,7 @@ impl Psr {
     }
 
     /// `intel_psr_pause`'s exit (frontbuffer invalidate before any frame
-    /// change). The caller then waits for [`idle`] within
+    /// change). The caller then waits for [`Psr::idle`] within
     /// [`PSR_EXIT_TIMEOUT_MS`] (`intel_psr_wait_exit_locked`). A latched
     /// error is returned before any write; the caller then disables.
     pub fn pause<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), Refusal> {
@@ -755,17 +1531,86 @@ impl Psr {
             return Ok(true);
         }
         Self::error(regs)?;
-        if !idle(regs)? {
+        if !self.idle(regs)? {
             return Ok(false);
         }
         self.activate(regs)?;
         Ok(true)
     }
 
-    /// `intel_psr_disable_locked` for PSR1: exit, wait, undo
-    /// Wa_14015648006, then clear the sink. Every step runs; the first
-    /// failure is returned. `wake` adds `intel_psr_handle_irq`'s
-    /// `DP_SET_POWER_D0`.
+    /// `_psr2_ready_for_pipe_update_locked`: PSR2 is out of deep sleep, so
+    /// a pipe update may run while it stays enabled.
+    pub fn ready_for_update<M: MmioWindow + ?Sized>(&self, regs: &M) -> Result<bool, Refusal> {
+        Ok(readable(regs, PSR2_STATUS)? & EDP_PSR2_STATUS_STATE_DEEP_SLEEP == 0)
+    }
+
+    /// `intel_psr2_sel_fetch_update` against this owner's persisted areas;
+    /// `None` without selective update.
+    pub fn sel_fetch(&self, commit: &SuCommit<'_>) -> Option<SelFetch> {
+        self.su
+            .map(|su| sel_fetch_update(&su.config, commit, (su.primary, su.cursor)))
+    }
+
+    /// `icl_plane_update_sel_fetch_noarm` for the full-screen primary
+    /// (destination and source origin 0): `SEL_FETCH_PLANE_POS`, `_OFFSET`
+    /// and `_SIZE` from its area. Written before the update waits for PSR.
+    pub fn program_sel_fetch_noarm<M: MmioWindow + ?Sized>(&self, regs: &M, sf: &SelFetch) {
+        let Some(su) = self.su else {
+            return;
+        };
+        let (y1, y2) = sf.primary.unwrap_or((-1, -1));
+        regs.write32(SEL_FETCH_PLANE_POS, (y1 as u32) << 16);
+        regs.write32(SEL_FETCH_PLANE_OFFSET, (y1 as u32) << 16);
+        regs.write32(
+            SEL_FETCH_PLANE_SIZE,
+            ((y2.wrapping_sub(y1).wrapping_sub(1) as u32) << 16)
+                | u32::from(su.config.width).wrapping_sub(1),
+        );
+    }
+
+    /// The commit's arm half for the primary: `PSR2_MAN_TRK_CTL`
+    /// (`commit_pipe_pre_planes`), then `icl_plane_update_sel_fetch_arm`'s
+    /// `SEL_FETCH_PLANE_CTL`, ahead of the plane's surface write.
+    pub fn program_sel_fetch_arm<M: MmioWindow + ?Sized>(&mut self, regs: &M, sf: &SelFetch) {
+        let Some(su) = self.su.as_mut() else {
+            return;
+        };
+        regs.write32(PSR2_MAN_TRK_CTL, sf.man_trk_ctl);
+        regs.write32(
+            SEL_FETCH_PLANE_CTL,
+            if area_height(sf.primary) > 0 {
+                SEL_FETCH_PLANE_CTL_ENABLE
+            } else {
+                0
+            },
+        );
+        su.primary = sf.primary;
+    }
+
+    /// `i9xx_cursor_update_sel_fetch_arm` when the cursor joined the
+    /// commit: `SEL_FETCH_CUR_CTL` (its `CURCNTR` while it fetches, else
+    /// 0), then `CURBASE` rewritten unchanged, the write that arms every
+    /// cursor register (`i9xx_cursor_update_arm` always writes it).
+    pub fn program_sel_fetch_cursor<M: MmioWindow + ?Sized>(&mut self, regs: &M, sf: &SelFetch) {
+        let (Some(su), Some((area, ctl))) = (self.su.as_mut(), sf.cursor) else {
+            return;
+        };
+        regs.write32(
+            SEL_FETCH_CUR_CTL,
+            if area_height(area) > 0 { ctl } else { 0 },
+        );
+        let base = regs.read32(CURBASE);
+        if base != u32::MAX {
+            regs.write32(CURBASE, base);
+        }
+        su.cursor = area;
+    }
+
+    /// `intel_psr_disable_locked`: exit, wait, undo Wa_14015648006 (and,
+    /// for PSR2 on A0..A3, Wa_16012604467), then clear the sink
+    /// (`DP_PSR_EN_CFG`, and `DP_RECEIVER_ALPM_CONFIG` after PSR2). Every
+    /// step runs; the first failure is returned. `wake` adds
+    /// `intel_psr_handle_irq`'s `DP_SET_POWER_D0`.
     pub fn disable<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
         &mut self,
         regs: &M,
@@ -774,15 +1619,29 @@ impl Psr {
         wake: bool,
     ) -> Result<(), Refusal> {
         let mut first = self.exit(regs).err();
-        if let Err(refusal) = wait_idle(regs, timeout_ms) {
+        if let Err(refusal) = self.wait_idle(regs, timeout_ms) {
             first.get_or_insert(refusal);
         }
         let dcpr = regs.read32(CHICKEN_DCPR_1);
         if dcpr != u32::MAX {
             regs.write32(CHICKEN_DCPR_1, dcpr & !LATENCY_REPORTING_REMOVED_PIPE_A);
         }
+        if self.su.is_some_and(|su| su.config.a0_to_b0) {
+            let clkgate = regs.read32(MTL_CLKGATE_DIS_TRANS_A);
+            if clkgate != u32::MAX {
+                regs.write32(
+                    MTL_CLKGATE_DIS_TRANS_A,
+                    clkgate & !MTL_CLKGATE_DIS_TRANS_DMASC_GATING_DIS,
+                );
+            }
+        }
         if let Err(error) = write(aux, DP_PSR_EN_CFG, 0) {
             first.get_or_insert(Refusal::Aux(error));
+        }
+        if self.su.is_some() {
+            if let Err(error) = write(aux, DP_RECEIVER_ALPM_CONFIG, 0) {
+                first.get_or_insert(Refusal::Aux(error));
+            }
         }
         if wake {
             let _ = write(aux, DP_SET_POWER, DP_SET_POWER_D0);

@@ -87,6 +87,31 @@ fn release_cpu_frame(phys: u64) -> bool {
     true
 }
 
+/// The metadata-alias census of `[start, end)` (address-space slots,
+/// including fork children not yet scheduler-visible): every frame with a
+/// nonzero count. Takes only `FRAMES` and never allocates.
+fn vram_alias_census(start: u64, end: u64, report: &mut dyn FnMut(u64, usize)) {
+    for (&phys, (_, count)) in FRAMES.lock().range(start..end) {
+        if *count != 0 {
+            report(phys, *count);
+        }
+    }
+}
+
+/// Linux `xe_bo_runtime_pm_release_mmap_offset` over every VRAM CPU mapping
+/// of one card at once: revoke every user translation of the card's LMEM
+/// BAR window `[start, start + len)` until the returned handle drops. New
+/// mappings made meanwhile stay unmapped too, and a CPU access calls
+/// `refault`, which resumes the device. `Busy` means an alias the snapshot
+/// could not see (a fork in flight); the caller retries later.
+pub(crate) fn revoke_window(
+    start: u64,
+    len: u64,
+    refault: Arc<dyn narf_filesystem::mmap_relocation::DeviceFrameRefault>,
+) -> Result<narf_filesystem::mmap_relocation::DeviceFrameRevocation, FsError> {
+    narf_filesystem::mmap_relocation::revoke(start, len, vram_alias_census, refault)
+}
+
 pub(super) fn backing(
     object: Arc<GemObject>,
     offset: u64,

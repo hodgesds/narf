@@ -32,7 +32,9 @@
 //! ```
 //!
 //! At each step the source:
-//! 1. Writes `LINK_BW_SET` + `LANE_COUNT_SET` (Idle → CR start).
+//! 1. Writes `LINK_BW_SET` + `LANE_COUNT_SET` (Idle → CR start), or, for
+//!    an eDP 1.4+ sink with a `DP_SUPPORTED_LINK_RATES` table,
+//!    `LANE_COUNT_SET` + `LINK_RATE_SET` ([`RateSelect::Table`]).
 //! 2. Sets `TRAINING_PATTERN_SET = TPS1` and zero voltage swing /
 //!    pre-emphasis on each lane.
 //! 3. Reads `LANE0_1_STATUS` + `LANE2_3_STATUS` from the sink
@@ -58,6 +60,10 @@ use crate::dp_aux::{AuxChannel, AuxError};
 // DPCD register addresses we touch (DPCD §3.3).
 const DPCD_LINK_BW_SET: u32 = 0x0_0100;
 const DPCD_LANE_COUNT_SET: u32 = 0x0_0101;
+/// `DP_SUPPORTED_LINK_RATES` (eDP 1.4+), eight little-endian entries.
+const DPCD_SUPPORTED_LINK_RATES: u32 = 0x0_0010;
+/// `DP_LINK_RATE_SET` (eDP 1.4+): the index into the supported rates.
+const DPCD_LINK_RATE_SET: u32 = 0x0_0115;
 const DPCD_TRAINING_PATTERN_SET: u32 = 0x0_0102;
 const DPCD_TRAINING_LANE0_SET: u32 = 0x0_0103;
 const DPCD_LANE0_1_STATUS: u32 = 0x0_0202;
@@ -503,14 +509,81 @@ pub fn train_clock_recovery<A: AuxChannel>(
     lanes: u8,
     delay_us: impl Fn(u32),
 ) -> Result<VSwingPe, LinkError> {
+    train_clock_recovery_select(aux, RateSelect::LinkBw(rate), lanes, delay_us)
+}
+
+/// How the source sets the link rate (Linux `intel_dp_compute_rate`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RateSelect {
+    /// DP and eDP 1.3 and earlier: `DP_LINK_BW_SET` with this code.
+    LinkBw(LinkRate),
+    /// eDP 1.4+ with a `DP_SUPPORTED_LINK_RATES` table
+    /// (`intel_dp->use_rate_select`): `DP_LINK_RATE_SET` = `index` into
+    /// that table; `link_rate` is the rate it names (Linux link units,
+    /// kHz of the symbol clock: 162000 = RBR).
+    Table {
+        /// `intel_dp_rate_select`: the rate's index in the sink table.
+        index: u8,
+        /// The rate at `index`.
+        link_rate: u32,
+    },
+}
+
+impl RateSelect {
+    /// The equalization pattern for this rate: the same rule as
+    /// [`eq_pattern_for_rate`] (TPS3 from 5.4 Gbps up).
+    fn eq_pattern(self) -> TrainingPattern {
+        match self {
+            RateSelect::LinkBw(rate) => eq_pattern_for_rate(rate),
+            RateSelect::Table { link_rate, .. } if link_rate >= 540_000 => TrainingPattern::Tps3,
+            RateSelect::Table { .. } => TrainingPattern::Tps2,
+        }
+    }
+}
+
+/// `intel_dp_prepare_link_train`'s rate step and
+/// `intel_dp_link_training_set_bw` (Linux b90c984d
+/// `intel_dp_link_training.c`). `DP_LINK_BW_SET` keeps the order this
+/// module always used (rate, then lane count). The rate-select method
+/// first re-reads `DP_SUPPORTED_LINK_RATES` (WaEdpLinkRateDataReload: a
+/// Parade PS8461E mux re-snoops the table), then writes
+/// `DP_LANE_COUNT_SET` and `DP_LINK_RATE_SET`, never `DP_LINK_BW_SET`
+/// (an eDP 1.4x sink ignores `DP_LINK_RATE_SET` once `DP_LINK_BW_SET` is
+/// set).
+fn set_link_rate<A: AuxChannel>(
+    aux: &mut A,
+    select: RateSelect,
+    lanes: u8,
+) -> Result<(), AuxError> {
+    let lane_count = (lanes & 0x1F) | 0x80;
+    match select {
+        RateSelect::LinkBw(rate) => {
+            aux.dpcd_write(DPCD_LINK_BW_SET, &[rate as u8])?;
+            aux.dpcd_write(DPCD_LANE_COUNT_SET, &[lane_count])
+        }
+        RateSelect::Table { index, .. } => {
+            let mut reload = [0u8; 16];
+            aux.dpcd_read(DPCD_SUPPORTED_LINK_RATES, &mut reload)?;
+            aux.dpcd_write(DPCD_LANE_COUNT_SET, &[lane_count])?;
+            aux.dpcd_write(DPCD_LINK_RATE_SET, &[index])
+        }
+    }
+}
+
+/// [`train_clock_recovery`] with the rate set by `select`.
+pub fn train_clock_recovery_select<A: AuxChannel>(
+    aux: &mut A,
+    select: RateSelect,
+    lanes: u8,
+    delay_us: impl Fn(u32),
+) -> Result<VSwingPe, LinkError> {
     let n_lanes = lanes as usize;
     if n_lanes == 0 || n_lanes > MAX_LANES {
         return Err(LinkError::Aborted);
     }
 
-    // Program LINK_BW_SET + LANE_COUNT_SET + enhanced framing.
-    aux.dpcd_write(DPCD_LINK_BW_SET, &[rate as u8])?;
-    aux.dpcd_write(DPCD_LANE_COUNT_SET, &[(lanes & 0x1F) | 0x80])?;
+    // Program the link rate + LANE_COUNT_SET + enhanced framing.
+    set_link_rate(aux, select, lanes)?;
 
     // Start with level-0 drive on every lane and pattern TPS1.
     let mut vswing_pe = VSwingPe::default();
@@ -571,16 +644,31 @@ pub fn train_channel_equalization<A: AuxChannel>(
     start_vswing_pe: VSwingPe,
     delay_us: impl Fn(u32),
 ) -> Result<VSwingPe, LinkError> {
+    train_channel_equalization_select(
+        aux,
+        RateSelect::LinkBw(rate),
+        lanes,
+        start_vswing_pe,
+        delay_us,
+    )
+}
+
+/// [`train_channel_equalization`] for a link whose rate was set by
+/// `select` (the pattern follows the rate it names).
+pub fn train_channel_equalization_select<A: AuxChannel>(
+    aux: &mut A,
+    select: RateSelect,
+    lanes: u8,
+    start_vswing_pe: VSwingPe,
+    delay_us: impl Fn(u32),
+) -> Result<VSwingPe, LinkError> {
     let n_lanes = lanes as usize;
     if n_lanes == 0 || n_lanes > MAX_LANES {
         return Err(LinkError::Aborted);
     }
     let mut vswing_pe = start_vswing_pe;
 
-    aux.dpcd_write(
-        DPCD_TRAINING_PATTERN_SET,
-        &[eq_pattern_for_rate(rate) as u8],
-    )?;
+    aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[select.eq_pattern() as u8])?;
     write_vswing_pe(aux, &vswing_pe, n_lanes)?;
 
     for _ in 0..MAX_PHASE_ATTEMPTS {
@@ -611,6 +699,30 @@ pub fn train_channel_equalization<A: AuxChannel>(
 
     let status = read_lane_status(aux)?;
     Err(LinkError::EqFailed(status[0]))
+}
+
+/// One training attempt at exactly `select` x `lanes`, without the
+/// fallback ladder: `DP_SET_POWER` D0, CR, EQ; a failed attempt leaves
+/// `TRAINING_PATTERN_SET` 0. Linux trains one configuration per modeset
+/// (`intel_dp_link_train_all_phys`) and leaves any fallback to a modeset
+/// retry the caller computes (`intel_dp_get_link_train_fallback_values`).
+/// Returns the converged drive levels.
+pub fn train_link_select<A: AuxChannel>(
+    aux: &mut A,
+    select: RateSelect,
+    lanes: u8,
+    delay_us: impl Fn(u32) + Copy,
+) -> Result<VSwingPe, LinkError> {
+    if !matches!(lanes, 1 | 2 | 4) {
+        return Err(LinkError::Aborted);
+    }
+    aux.dpcd_write(DPCD_SET_POWER, &[DP_SET_POWER_D0 & DP_SET_POWER_MASK])?;
+    let result = train_clock_recovery_select(aux, select, lanes, delay_us)
+        .and_then(|levels| train_channel_equalization_select(aux, select, lanes, levels, delay_us));
+    if result.is_err() {
+        let _ = aux.dpcd_write(DPCD_TRAINING_PATTERN_SET, &[TrainingPattern::None as u8]);
+    }
+    result
 }
 
 /// Walk a single (rate, lanes) attempt: power on, CR, EQ. On any

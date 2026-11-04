@@ -68,6 +68,11 @@ pub enum MigrateError {
     Raced,
     /// The relocation itself failed (frame allocation or page-table install).
     Failed,
+    /// The frame is pinned for device or kernel access (a `UserPagePin`), so
+    /// it stays where it is, as Linux refuses folios that are
+    /// `folio_maybe_dma_pinned` or carry extra references (`move_pages`
+    /// reports `-EBUSY`).
+    Pinned,
 }
 
 /// Relocate physical frame `src` to a fresh frame, repointing every mapping of
@@ -111,6 +116,7 @@ fn migrate_frame_single(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     match unsafe { aspace.relocate_frame_at(owner.va, src) } {
         Ok(new) => Ok(new),
         Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
+        Err(crate::address_space::AddressSpaceError::Pinned) => Err(MigrateError::Pinned),
         Err(_) => Err(MigrateError::Failed),
     }
 }
@@ -126,8 +132,19 @@ fn migrate_frame_single(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
 /// dropped and it keeps its own copy. `src`'s refcount is then released once per
 /// moved owner, and the physical frame is freed by whichever caller drops its
 /// last reference (the atomic `dec_ref` 1→0 transition, so never double-freed).
+///
+/// A pinned `src` is refused ([`MigrateError::Pinned`]): repointing its owners
+/// would leave a device writing through the pin into a frame no mapping
+/// shows. Linux refuses the same folio twice, in `try_to_migrate_one`
+/// (`folio_try_share_anon_rmap_pte` sees `folio_maybe_dma_pinned`) and in
+/// `folio_migrate_mapping`'s expected-refcount test. Here the frame-level
+/// test runs before any copy, and each owner rechecks under its own region
+/// lock, the lock its pins are taken under, before it is repointed.
 #[cfg(target_arch = "x86_64")]
 fn migrate_frame_multi(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
+    if crate::frame::cow::is_pinned(src) {
+        return Err(MigrateError::Pinned);
+    }
     let mut owners: alloc::vec::Vec<crate::rmap::Owner> = alloc::vec::Vec::new();
     crate::rmap::for_each_owner(src, |o| owners.push(o));
     let n = owners.len();
@@ -198,7 +215,11 @@ fn migrate_frame_multi(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     if moved == 0 {
         // Nobody moved; `dst` (now refcount 0) is unused.
         crate::frame::free_frame(dst_frame);
-        return Err(MigrateError::Raced);
+        return Err(if crate::frame::cow::is_pinned(src) {
+            MigrateError::Pinned
+        } else {
+            MigrateError::Raced
+        });
     }
 
     // Release `src`: one `free_frame` per owner we moved off it (repoint did not
@@ -535,6 +556,7 @@ pub fn migrate_frame_to(src: PhysAddr, dst: PhysAddr) -> Result<(), MigrateError
     match unsafe { aspace.relocate_frame_to(owner.va, src, dst) } {
         Ok(()) => Ok(()),
         Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
+        Err(crate::address_space::AddressSpaceError::Pinned) => Err(MigrateError::Pinned),
         Err(_) => Err(MigrateError::Failed),
     }
 }
@@ -1176,6 +1198,117 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_migrate_frame_multi_owner);
+
+    /// A COW-shared frame pinned for device access is not migrated: the
+    /// frame-level refusal leaves both owners, the refcount and the leaves
+    /// alone, and an owner's repoint refuses the pinned source on its own.
+    /// The device's writes through the pin stay visible to the owners, and
+    /// once the pin is gone the frame migrates with those bytes.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_migrate_frame_multi_refuses_pinned() -> TestResult {
+        use super::{migrate_frame, MigrateError};
+        use crate::frame::cow;
+        use crate::{Region, RegionPerms, VirtAddr};
+
+        __reset_resolver_for_test();
+        TEST_AS_LIST.lock().clear();
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let parent = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let p = match crate::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: identity-mapped fresh frame, sole owner.
+        unsafe { *(p.kernel_mut_ptr::<u32>()) = 0x0BAD_F00D };
+        let va = VirtAddr::new(0x0000_0080_00B4_0000);
+        if parent
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![p].into(),
+            })
+            .is_err()
+        {
+            return TestResult::Fail("map_region parent failed");
+        }
+        // SAFETY: aspace owns a live root and the validated region.
+        if unsafe { parent.materialize() }.is_err() {
+            return TestResult::Fail("materialize parent failed");
+        }
+        // SAFETY: fork's documented contract; paging is live.
+        let child = match unsafe { parent.clone_for_fork() } {
+            Ok(c) => Arc::new(c),
+            Err(_) => return TestResult::Fail("clone_for_fork failed"),
+        };
+        // SAFETY: child owns a fresh root; materialize maps its COW-shared page.
+        if unsafe { child.materialize() }.is_err() {
+            return TestResult::Fail("materialize child failed");
+        }
+        *TEST_AS_LIST.lock() = alloc::vec![parent.clone(), child.clone()];
+        register_address_space_resolver(&LIST_AS_RESOLVER);
+
+        let result = (|| {
+            // Pinned after the fork, so the frame stays COW-shared.
+            let Some(pin) = parent.pin_user_page(va) else {
+                return TestResult::Fail("pin refused");
+            };
+            if crate::rmap::owner_count(p) != 2 || cow::count(p) != 3 || !cow::is_pinned(p) {
+                return TestResult::Fail("setup: a pinned frame with two owners");
+            }
+            if migrate_frame(p) != Err(MigrateError::Pinned) {
+                return TestResult::Fail("a pinned COW-shared frame was not refused");
+            }
+            if crate::rmap::owner_count(p) != 2
+                || cow::count(p) != 3
+                || parent.regions_snapshot()[0].phys[0] != p
+                || child.regions_snapshot()[0].phys[0] != p
+                // SAFETY: both roots are live test roots.
+                || unsafe { crate::x86_64::paging::translate(parent.root, va) } != Some(p)
+                // SAFETY: as above.
+                || unsafe { crate::x86_64::paging::translate(child.root, va) } != Some(p)
+            {
+                return TestResult::Fail("the refusal changed an owner");
+            }
+            // The per-owner recheck, which covers a pin landing after the
+            // frame-level test: the owner keeps the pinned source.
+            let dst = match crate::alloc_frame() {
+                Ok(f) => f,
+                Err(_) => return TestResult::Skip("frame allocator drained"),
+            };
+            // SAFETY: live child root; `dst` is a fresh frame the call would
+            // only map, and the refusal leaves it with this test.
+            let repointed = unsafe { child.repoint_shared_page(va, p, dst.start_address()) };
+            crate::frame::free_frame(dst);
+            if repointed.is_ok() || child.regions_snapshot()[0].phys[0] != p {
+                return TestResult::Fail("an owner was repointed off a pinned frame");
+            }
+            // SAFETY: the pin retains `p`; the device-side store.
+            unsafe { *(pin.phys().kernel_mut_ptr::<u32>()) = 0xD5D5_D5D5 };
+            drop(pin);
+            let new = match migrate_frame(p) {
+                Ok(new) => new,
+                Err(_) => return TestResult::Fail("the unpinned frame did not migrate"),
+            };
+            // SAFETY: `new` is the live migrated frame.
+            if unsafe { *(new.kernel_ptr::<u32>()) } != 0xD5D5_D5D5
+                || parent.regions_snapshot()[0].phys[0] != new
+                || child.regions_snapshot()[0].phys[0] != new
+            {
+                return TestResult::Fail("the device's bytes did not migrate with the frame");
+            }
+            TestResult::Pass
+        })();
+
+        TEST_AS_LIST.lock().clear();
+        __reset_resolver_for_test();
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_migrate_frame_multi_refuses_pinned);
 
     #[cfg(target_arch = "x86_64")]
     fn smoke_compact_block_evacuates_movable() -> TestResult {

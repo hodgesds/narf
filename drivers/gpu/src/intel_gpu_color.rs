@@ -4,6 +4,13 @@
 //! intel_color_regs.h / skl_universal_plane_regs.h. Precision LUT preload
 //! follows icl_load_luts/bdw_load_lut_10/intel_can_preload_luts; active/combined
 //! updates use the separately retained intel_gpu_dsb transport.
+//!
+//! Display 20 (Lunar Lake) takes the display-14 profile: `xe2_lpd_display`
+//! carries `XE_LPDP_FEATURES`' color sizes (degamma 129, gamma 1024),
+//! `intel_color_init_hooks` selects `tgl_color_funcs` for every display >=
+//! 12, and intel_color.c's version branches fall at 13 (10-bit gamma, 131
+//! degamma entries), 14 (`mtl_degamma_lut`), 30 (`HAS_DOUBLE_BUFFERED_LUT`)
+//! and 35 (no `SKL_BOTTOM_COLOR`), none between 14 and 20.
 use crate::{drm::card::FlipStamp, intel_gpu::Generation, intel_gpu_aux::MmioWindow};
 use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
@@ -487,7 +494,9 @@ impl Owner {
             Generation::TigerLake => {
                 Self::capture_gen12(io, crate::intel_gpu_gt::Gen12Platform::TigerLake)
             }
-            Generation::MeteorLake => Self::capture_control(io, generation, None, 0x84000000),
+            Generation::MeteorLake | Generation::LunarLake => {
+                Self::capture_control(io, generation, None, 0x84000000)
+            }
             // AlderLake alone cannot distinguish display12 ADLS from
             // display13 ADLP/N. Actual callers must supply the PCI family.
             _ => Err(FsError::Unsupported),
@@ -537,7 +546,8 @@ impl Owner {
             original_primary_control: primary_control,
             primary_control,
             gen12_family,
-            profile: (generation == Generation::MeteorLake).then_some(Profile::Mtl),
+            profile: matches!(generation, Generation::MeteorLake | Generation::LunarLake)
+                .then_some(Profile::Mtl),
             gamma,
             expected: original,
             expected_gamma: gamma,

@@ -909,6 +909,17 @@ impl core::fmt::Debug for MmapBacking {
     }
 }
 
+/// A driver `f_op->mmap` that clears `VM_MAYWRITE | VM_MAYEXEC` on a
+/// `MAP_PRIVATE` VMA and `remap_pfn_range`s its own pages into it
+/// (`VM_PFNMAP | VM_DONTEXPAND`), as `xe_oa_mmap` does for the OA buffer.
+/// See [`FileOps::mmap_private_pfn`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrivatePfnMap {
+    /// `VM_DONTCOPY`: a fork child does not inherit the mapping
+    /// (`mm/mmap.c::dup_mmap`).
+    pub dont_copy: bool,
+}
+
 impl From<CapError> for FsError {
     /// Cap-side errors collapse to `PermissionDenied` at the FS layer.
     /// Spec §4: a revoked mount cap should refuse further access via
@@ -972,6 +983,27 @@ pub trait IoctlContext: Sync {
         _writable: bool,
     ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
         Err(FsError::Unsupported)
+    }
+    /// Linux `mmu_interval_notifier_insert(current->mm, ...)`: watch
+    /// `[address, address + length)` of the calling process's address space.
+    /// A driver that mirrors user memory into a device inserts before
+    /// pinning and brackets every [`Self::pin_user_pages`] with the
+    /// interval's `read_begin`/`read_retry`. A range that cannot be mapped is
+    /// `BadAddress`, as the pin over it would be. The default has no address
+    /// space.
+    fn mmu_interval_notifier(
+        &self,
+        _address: u64,
+        _length: u64,
+        _ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// [`narf_memory::AddressSpace::identity`] of the calling process's
+    /// address space, so a driver can tell whether the caller may re-collect
+    /// a range another process registered. `None` without one.
+    fn address_space_identity(&self) -> Option<u64> {
+        None
     }
     /// Resolve a descriptor in the calling process without exposing its table
     /// to a driver. The retained open description also handles dup/fork.
@@ -1758,6 +1790,18 @@ pub trait FileOps: Send + Sync {
             lifetime,
             memory_type: narf_memory::MemoryType::WriteBack,
         })
+    }
+
+    /// `Some` selects a read-only private PFN mapping for a `MAP_PRIVATE`
+    /// request that passed [`Self::validate_mmap`]: the frames and lifetime
+    /// of [`Self::mmap_backing`] are aliased read-only (never copied through
+    /// `read`), the VMA cannot grow by `mremap` and, with `dont_copy`, is not
+    /// inherited by a fork child. The provider must refuse write and execute
+    /// in `validate_mmap` and exclude them from [`Self::mmap_max_prot`]; the
+    /// syscall layer has no copy-on-write over device frames. `None` (the
+    /// default) keeps the generic private-file path.
+    fn mmap_private_pfn(&self, _offset: u64) -> Option<PrivatePfnMap> {
+        None
     }
 
     /// Called after shared device PTEs and their lifetime owner are published,

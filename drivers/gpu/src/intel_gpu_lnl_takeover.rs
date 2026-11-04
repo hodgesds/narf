@@ -6,6 +6,10 @@
 //! GT arena, then performs complete GT initialization with no inherited image.
 //! xe_ggtt.c::ggtt_update_access_counter and xe_wa_oob.rules select the media
 //! 20.00/all steps or30.00/preB0 WA at63 PTEs. No HuC or media scheduling is admitted here.
+//!
+//! The opted-in Lunar Lake display-20 function never runs that FLR: its
+//! receipt comes from [`Receipt::admit_display`], which preserves the lit
+//! panel and leaves the GT-only reset to `HardwareInit` (see there).
 use crate::intel_gpu_aux::MmioWindow;
 use core::task::Poll;
 
@@ -43,8 +47,39 @@ pub(crate) struct Receipt {
     len: u64,
     incarnation: u64,
     display: Option<u32>,
+    fresh: Fresh,
 }
+
+/// How a [`Receipt`] established its fresh incarnation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Fresh {
+    /// `__xe_driver_flr`: GT, display and stolen memory were reset.
+    DriverFlr,
+    /// No driver FLR: the display-20 route owns the lit display and the GT
+    /// is reset alone (GRDOM_GUC, GRDOM_FULL) before any PTE.
+    DisplayOwned,
+}
+
 static NEXT_FLR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// `GU_CNTL` / `DRIVERFLR` and `GU_DEBUG` / `DRIVERFLR_STATUS` (xe_regs.h;
+/// both flags are bit 31).
+const GU_CNTL: u64 = 0x101010;
+const GU_DEBUG: u64 = 0x101018;
+const DRIVERFLR: u32 = 1 << 31;
+/// `VF_CAP_REG`.
+const VF_CAP: u64 = 0x1901f8;
+
+fn next_incarnation() -> Result<u64, Error> {
+    NEXT_FLR
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .map_err(|_| Error::State)
+}
+
 impl Receipt {
     pub(crate) fn matches(
         &self,
@@ -57,11 +92,213 @@ impl Receipt {
             && self.bar == bar.phys.raw()
             && self.len == bar.len
             && self.incarnation != 0
-            && pf(mmio).is_ok()
-            && read(mmio, 0x101010).is_ok_and(|v| v & 0x80000000 == 0)
-            && read(mmio, 0x101018).is_ok_and(|v| v & 0x80000000 == 0)
-            && post_flr_display(mmio, self.device).is_ok_and(|gmd| gmd == self.display)
+            && match self.fresh {
+                Fresh::DriverFlr => {
+                    pf(mmio).is_ok()
+                        && read(mmio, GU_CNTL).is_ok_and(|v| v & DRIVERFLR == 0)
+                        && read(mmio, GU_DEBUG).is_ok_and(|v| v & DRIVERFLR == 0)
+                        && post_flr_display(mmio, self.device).is_ok_and(|gmd| gmd == self.display)
+                }
+                Fresh::DisplayOwned => display_owned_current(mmio, self.display),
+            }
     }
+
+    /// Whether this receipt preserved the display (no driver FLR).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn display_preserving(&self) -> bool {
+        self.fresh == Fresh::DisplayOwned
+    }
+
+    /// The display-preserving fresh-GT admission of the opted-in Lunar Lake
+    /// display-20 function. No driver FLR runs.
+    ///
+    /// MIT Linux b90c984d: `xe_device_probe` never triggers
+    /// `__xe_driver_flr`; it only arms it for `xe_driver_flr_fini` (failed
+    /// probe), `xe_device_shutdown` and a wedged device. Probe freshens the
+    /// GT with `xe_uc_init_post_hwconfig` → `xe_uc_sanitize_reset` →
+    /// `xe_guc_reset` (`GDRST` = `GRDOM_GUC`), and `xe_gt.c::do_gt_reset`
+    /// (`GDRST` = `GRDOM_FULL`) is the reset `gt_reset_worker` and
+    /// `xe_gt_shutdown` run while display keeps scanning out. NARF's
+    /// `HardwareInit` runs `GRDOM_GUC` then `GRDOM_FULL` on the primary GT,
+    /// and `MediaQuiesce` the same pair on the media GT, before its cache
+    /// policy may publish the first GGTT PTE. That GT-only reset meets the
+    /// headless FLR's inherited-GT rationale (GuC, engines, contexts).
+    /// Wa_14015076503 around `do_gt_reset` is media 13.00 only.
+    ///
+    /// What the FLR also provided is proved here instead, read-only:
+    /// - no FLR is in flight (`GU_CNTL.DRIVERFLR`); a stale
+    ///   `GU_DEBUG.DRIVERFLR_STATUS` is acknowledged once (W1C, the only
+    ///   write, as `__xe_driver_flr` does before its trigger), so any later
+    ///   FLR fails every PTE write's [`Self::matches`];
+    /// - the display is the qualified 20.00 IP with Pipe A fused in and lit
+    ///   (the route's owned panel);
+    /// - no inherited display DMA producer exists outside that primary:
+    ///   Pipes B–D dark, every other universal plane and every cursor off,
+    ///   every DSB idle, FBC A–D off, no pipe-DMC flip queue armed and no
+    ///   pipe B–D DMC enabled. A powered-down well reads zero, which is
+    ///   accepted: an unpowered pipe cannot fetch.
+    ///
+    /// Stolen memory is not wiped: the boot framebuffer stays live and the
+    /// GT arena never maps DSM. `GU_CNTL_PROTECTED.DRIVERINT_FLR_DIS` is not
+    /// required clear, since no FLR is requested.
+    pub(crate) fn admit_display(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        mmio: &impl MmioWindow,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Self, Error> {
+        Self::admit_route(
+            device,
+            bar,
+            mmio,
+            current,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd,
+        )
+    }
+
+    /// [`Self::admit_display`] for the opted-in Panther Lake display-30
+    /// function: the same read-only proofs against display 30.00, whose
+    /// `xe2_lpd_display` inventory (four pipes, five universal planes, three
+    /// DSBs per pipe, FBC A–D, the pipe-DMC flip queues) is display 20's.
+    pub(crate) fn admit_display_ptl(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        mmio: &impl MmioWindow,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Self, Error> {
+        Self::admit_route(
+            device,
+            bar,
+            mmio,
+            current,
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+        )
+    }
+
+    /// The display-preserving admission of `ip`'s route: Lunar Lake with
+    /// display 20.00, or Panther Lake with display 30.00.
+    fn admit_route(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        mmio: &impl MmioWindow,
+        current: impl FnOnce() -> bool,
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    ) -> Result<Self, Error> {
+        use crate::intel_gpu_xe2lpd::DisplayIp;
+        if !current() {
+            return Err(Error::Unavailable);
+        }
+        if device.id.vendor != 0x8086
+            || !matches!(device.addr, narf_bus::BusAddr::Pcie(_))
+            || !crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+                .is_some_and(|p| match ip {
+                    DisplayIp::Xe2Lpd => p.is_lnl(),
+                    DisplayIp::Xe3Lpd => p.is_ptl(),
+                    DisplayIp::Xelpdp => false,
+                })
+            || bar.phys.raw() == 0
+            || bar.phys.raw() & 4095 != 0
+            || bar.len < 16 * 1024 * 1024
+        {
+            return Err(Error::Unsupported);
+        }
+        if read(mmio, VF_CAP)? & 1 != 0 {
+            return Err(Error::Unsupported);
+        }
+        if read(mmio, GU_CNTL)? & DRIVERFLR != 0 {
+            return Err(Error::Busy);
+        }
+        let gmd = read(mmio, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY)?;
+        if gmd != read(mmio, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY)?
+            || DisplayIp::decode_all(gmd) != Ok(ip)
+        {
+            return Err(Error::Unsupported);
+        }
+        if read(mmio, crate::intel_gpu_xe2lpd::SKL_DFSM)?
+            & crate::intel_gpu_xe2lpd::DFSM_PIPE_A_DISABLE
+            != 0
+        {
+            return Err(Error::Unsupported);
+        }
+        if read(mmio, 0x70008)? & 0xc0000000 != 0xc0000000 {
+            return Err(Error::State);
+        }
+        display_producers_idle(mmio)?;
+        if read(mmio, GU_DEBUG)? & DRIVERFLR != 0 {
+            mmio.write32(GU_DEBUG, DRIVERFLR);
+            if read(mmio, GU_DEBUG)? & DRIVERFLR != 0 {
+                return Err(Error::State);
+            }
+        }
+        Ok(Self {
+            device: device.id.device,
+            function: device.addr,
+            bar: bar.phys.raw(),
+            len: bar.len,
+            incarnation: next_incarnation()?,
+            display: Some(gmd),
+            fresh: Fresh::DisplayOwned,
+        })
+    }
+}
+
+/// The per-PTE proof of a display-preserving receipt: still a PF, no FLR in
+/// flight or completed since admission, and the same display IP.
+fn display_owned_current(m: &impl MmioWindow, display: Option<u32>) -> bool {
+    read(m, VF_CAP).is_ok_and(|v| v & 1 == 0)
+        && read(m, GU_CNTL).is_ok_and(|v| v & DRIVERFLR == 0)
+        && read(m, GU_DEBUG).is_ok_and(|v| v & DRIVERFLR == 0)
+        && display.is_some_and(|gmd| {
+            read(m, crate::intel_gpu_xe2lpd::GMD_ID_DISPLAY).is_ok_and(|v| v == gmd)
+        })
+}
+
+/// Display 20.00 (`xe2_lpd_display`) inventory: four pipes, the primary and
+/// four sprites per pipe (`num_sprites` is 4 on display >= 13), three DSBs
+/// per pipe and FBC A–D. Only Pipe A's primary (the route's surface) may
+/// fetch. Every access is a read.
+fn display_producers_idle(m: &impl MmioWindow) -> Result<(), Error> {
+    for pipe in 0..4u64 {
+        let base = 0x70000 + pipe * 0x1000;
+        // TRANSCONF(B–D): enable | state.
+        if pipe != 0 && read(m, base + 0x8)? & 0xc0000000 != 0 {
+            return Err(Error::Busy);
+        }
+        // CUR_CTL: MCURSOR_MODE_MASK.
+        if read(m, base + 0x80)? & 0x27 != 0 {
+            return Err(Error::Busy);
+        }
+        // PLANE_CTL(pipe, 1..=5): PLANE_CTL_ENABLE.
+        for plane in 1..=5u64 {
+            if pipe == 0 && plane == 1 {
+                continue;
+            }
+            if read(m, base + 0x80 + plane * 0x100)? & (1 << 31) != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        // DSB_CTRL(pipe, 0..3): DSB_ENABLE | DSB_STATUS_BUSY.
+        for dsb in 0..3u64 {
+            if read(m, base + 0xb08 + dsb * 0x100)? & ((1 << 31) | 1) != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        // PIPEDMC_FQ_CTRL(pipe): PIPEDMC_FQ_CTRL_ENABLE.
+        if read(m, 0x5f078 + pipe * 0x400)? & (1 << 31) != 0 {
+            return Err(Error::Busy);
+        }
+    }
+    // ILK_DPFC_CONTROL(FBC A–D): DPFC_CTL_EN.
+    for fbc in 0..4u64 {
+        if read(m, 0x43208 + fbc * 0x40)? & (1 << 31) != 0 {
+            return Err(Error::Busy);
+        }
+    }
+    // MTL_PIPEDMC_CONTROL: PIPEDMC_ENABLE_MTL(B–D).
+    if read(m, 0x45250)? & 0x1110 != 0 {
+        return Err(Error::Busy);
+    }
+    Ok(())
 }
 
 /// Polling has separate source 3s bounds for pending, teardown and reinit.
@@ -114,13 +351,7 @@ impl DriverFlr {
         {
             return Err(Error::Unsupported);
         }
-        let incarnation = NEXT_FLR
-            .fetch_update(
-                core::sync::atomic::Ordering::Relaxed,
-                core::sync::atomic::Ordering::Relaxed,
-                |value| value.checked_add(1),
-            )
-            .map_err(|_| Error::State)?;
+        let incarnation = next_incarnation()?;
         Ok(Self {
             device: device.id.device,
             function: device.addr,
@@ -195,6 +426,7 @@ impl DriverFlr {
                     len: self.len,
                     incarnation: self.incarnation,
                     display,
+                    fresh: Fresh::DriverFlr,
                 }))
             }
             _ => Poll::Ready(Err(Error::State)),

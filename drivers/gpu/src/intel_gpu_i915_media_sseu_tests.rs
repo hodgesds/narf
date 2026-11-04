@@ -224,7 +224,7 @@ fn smoke_i915_media_sseu_retained_snapshot_survives_stop_but_cannot_submit() -> 
     let (context, fence) = submit(&file, card, &user, &mailbox, &mut gt, 30_000_000);
     assert_eq!(context.engine(), Engine::Vcs6);
     let mut active = BTreeMap::new();
-    finish_policy(&mut gt, &w, &fence, &mut active, 30_000_001, 3);
+    finish_policy(&mut gt, &w, &fence, &mut active, 30_000_001, 2);
     assert_eq!(fence.result(), Some(Ok(())));
     assert!(active.is_empty());
     let mut value = [0; 4];

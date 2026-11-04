@@ -103,6 +103,8 @@ const PP_POWER_CYCLE_DELAY_MASK: u32 = 0x1F << 4;
 const PP_POWER_CYCLE_DELAY_SHIFT: u32 = 4;
 const EDP_FORCE_VDD: u32 = 1 << 3;
 const EDP_BLC_ENABLE: u32 = 1 << 2;
+/// `PANEL_POWER_RESET` (ILK+ `PP_CONTROL` bit 1).
+const PANEL_POWER_RESET: u32 = 1 << 1;
 const PANEL_POWER_ON: u32 = 1 << 0;
 
 // Delay fields (all in 100 µs units, per the PRM).
@@ -433,6 +435,35 @@ impl<'a, M: MmioWindow + ?Sized> PanelPowerSequencer<'a, M> {
             }
             Err(status) => Err(PpsError::PowerOffTimeout { status }),
         }
+    }
+
+    /// `intel_ddi_post_disable_dp`'s `intel_pps_vdd_on` then
+    /// `intel_pps_off_unlocked` (Linux b90c984d `intel_pps.c`): force VDD
+    /// on, then one `PP_CONTROL` write that drops the power target, the
+    /// panel reset bit, the VDD force and the backlight gate together ("We
+    /// need to switch off panel power _and_ force vdd"), then wait for the
+    /// off state (`wait_panel_off`) and stamp the power-off time.
+    pub fn vdd_on_then_off(&mut self) -> Result<(), PpsError> {
+        self.vdd_on()?;
+        self.pp_control_rmw(
+            PANEL_POWER_ON | PANEL_POWER_RESET | EDP_FORCE_VDD | EDP_BLC_ENABLE,
+            0,
+        );
+        self.backlight_on = false;
+        match self.poll_status(IDLE_OFF_MASK, IDLE_OFF_VALUE) {
+            Ok(_) => {
+                self.powered_on = false;
+                self.last_power_off_cycles = Some(narf_time::now_cycles());
+                Ok(())
+            }
+            Err(status) => Err(PpsError::PowerOffTimeout { status }),
+        }
+    }
+
+    /// Whether the PPS backlight gate (`EDP_BLC_ENABLE`) is open.
+    pub fn backlight_gate_open(&self) -> bool {
+        let control = self.mmio.read32(PP_CONTROL);
+        control != u32::MAX && control & EDP_BLC_ENABLE != 0
     }
 
     /// Wait out the power-cycle delay: the software remainder of
@@ -1478,6 +1509,11 @@ impl<M: MmioWindow> MmioWindow for CheckedPps<'_, M> {
             self.io.write32(reg, value);
         }
     }
+}
+/// The panel's power-sequence delays decoded at probe, or the eDP spec
+/// limits when none were recorded.
+pub(crate) fn panel_delays() -> PanelDelays {
+    aux_panel_delays()
 }
 fn aux_panel_delays() -> PanelDelays {
     EDP_RUNTIME

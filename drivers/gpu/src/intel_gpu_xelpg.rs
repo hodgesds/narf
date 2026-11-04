@@ -349,6 +349,18 @@ pub const fn lane_pclk_refclk_ack(lane: u32) -> u32 {
 }
 /// `XELPDP_DDI_CLOCK_SELECT` field (PORT_CLOCK_CTL bits 15:12).
 pub const DDI_CLOCK_SELECT_MASK: u32 = 0xF << 12;
+/// `_XE3_DDI_CLOCK_SELECT_MASK` (bits 16:12, display >= 30: the TBT
+/// 312.5/625 MHz selects need the fifth bit).
+pub const XE3_DDI_CLOCK_SELECT_MASK: u32 = 0x1F << 12;
+
+/// `XELPDP_DDI_CLOCK_SELECT_MASK(display)` for the window's display.
+fn ddi_clock_select_mask<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
+    if mmio.cx0_xe3() {
+        XE3_DDI_CLOCK_SELECT_MASK
+    } else {
+        DDI_CLOCK_SELECT_MASK
+    }
+}
 /// Clock select for a PHY PLL output (maxPCLK): the DP value.
 pub const DDI_CLOCK_SELECT_MAXPCLK: u32 = 0x8 << 12;
 /// `XELPDP_FORWARD_CLOCK_UNGATE` (PORT_CLOCK_CTL bit 10).
@@ -455,6 +467,9 @@ pub struct Cx0Phy<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
     /// The port this transport talks to.
     pub port: XeLpgPort,
+    /// `DISPLAY_VER < 30`: reset the bus after every completed
+    /// transaction ([`MmioWindow::cx0_xe3`]).
+    settle_reset: bool,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Cx0Phy<'a, M> {
@@ -474,7 +489,11 @@ pub const LANE1: u8 = 0b10;
 impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
     /// Create a transport for `port` over the BAR0 window `mmio`.
     pub fn new(mmio: &'a M, port: XeLpgPort) -> Self {
-        Self { mmio, port }
+        Self {
+            mmio,
+            port,
+            settle_reset: !mmio.cx0_xe3(),
+        }
     }
 
     fn m2p_ctl(&self, lane: u32) -> u64 {
@@ -584,9 +603,11 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
             return Err(Cx0Error::PhyError);
         }
         self.clear_response_ready(lane);
-        // Pre-Xe3 settle workaround (DISPLAY_VER < 30 covers MTL):
+        // Pre-Xe3 settle workaround (DISPLAY_VER < 30 covers MTL and LNL):
         // reset the bus after every transaction.
-        self.bus_reset(lane);
+        if self.settle_reset {
+            self.bus_reset(lane);
+        }
         Ok(())
     }
 
@@ -610,7 +631,10 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
         compiler_fence(Ordering::SeqCst);
         let val = self.wait_for_ack(lane, P2M_COMMAND_READ_ACK)?;
         self.clear_response_ready(lane);
-        self.bus_reset(lane);
+        // __intel_cx0_read_once: the same DISPLAY_VER < 30 settle reset.
+        if self.settle_reset {
+            self.bus_reset(lane);
+        }
         Ok(((val & P2M_DATA_MASK) >> M2P_DATA_SHIFT) as u8)
     }
 
@@ -1408,6 +1432,22 @@ pub fn enable_port_pll_owned<M: MmioWindow + ?Sized>(
         return Err(Cx0Error::UnsupportedRate);
     }
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    enable_port_pll_khz(mmio, port, port_clock_khz, lane_count, dp_alt)
+}
+
+/// [`enable_port_pll_owned`] for a DP port clock in kHz, which may be one
+/// of the eDP intermediate rates the C10 eDP table carries (216, 243,
+/// 324, 432 and 675 MHz, `mtl_c10_edp_tables`).
+pub fn enable_port_pll_khz<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    port_clock_khz: u32,
+    lane_count: u8,
+    dp_alt: bool,
+) -> Result<(), Cx0Error> {
+    if !matches!(lane_count, 1 | 2 | 4) {
+        return Err(Cx0Error::UnsupportedRate);
+    }
     let phy = Cx0Phy::new(mmio, port);
     // 1. Port clock control: forward-clock ungate + maxPCLK clock
     //    select + SSC on PLLB (the MPLLB tables are SSC tables).
@@ -1417,7 +1457,7 @@ pub fn enable_port_pll_owned<M: MmioWindow + ?Sized>(
         port.port_clock_ctl(),
         LANE1_PHY_CLOCK_SELECT
             | FORWARD_CLOCK_UNGATE
-            | DDI_CLOCK_SELECT_MASK
+            | ddi_clock_select_mask(mmio)
             | SSC_ENABLE_PLLA
             | SSC_ENABLE_PLLB,
         FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK | SSC_ENABLE_PLLB,
@@ -1511,7 +1551,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
         port.port_clock_ctl(),
         LANE1_PHY_CLOCK_SELECT
             | FORWARD_CLOCK_UNGATE
-            | DDI_CLOCK_SELECT_MASK
+            | ddi_clock_select_mask(mmio)
             | SSC_ENABLE_PLLA
             | SSC_ENABLE_PLLB,
         FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK | if req.ssc { SSC_ENABLE_PLLB } else { 0 },
@@ -1664,6 +1704,16 @@ pub fn reprogram_pll_rate<M: MmioWindow + ?Sized>(
     rate: LinkRate,
 ) -> Result<(), Cx0Error> {
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    reprogram_pll_khz(mmio, port, port_clock_khz)
+}
+
+/// [`reprogram_pll_rate`] for a DP port clock in kHz (eDP intermediate
+/// rates included).
+pub fn reprogram_pll_khz<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    port_clock_khz: u32,
+) -> Result<(), Cx0Error> {
     let phy = Cx0Phy::new(mmio, port);
     set_pclk_pll_request(mmio, port, false)?;
     phy.program_msgbus_timer();
@@ -1740,7 +1790,7 @@ pub fn disable_port_pll_complete<M: MmioWindow + ?Sized>(
     if !wait_for(mmio, clock_ctl, acks, false, PCLK_PLL_DISABLE_TIMEOUT_NS) {
         return Err(Cx0Error::Timeout);
     }
-    rmw(mmio, clock_ctl, DDI_CLOCK_SELECT_MASK, 0);
+    rmw(mmio, clock_ctl, ddi_clock_select_mask(mmio), 0);
     rmw(mmio, clock_ctl, FORWARD_CLOCK_UNGATE, 0);
     Ok(())
 }
@@ -1849,6 +1899,17 @@ pub fn set_signal_levels<M: MmioWindow + ?Sized>(
     levels: &[(u8, u8); 4],
 ) -> Result<(), Cx0Error> {
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    set_signal_levels_khz(phy, port_clock_khz, lane_count, levels)
+}
+
+/// [`set_signal_levels`] for a DP port clock in kHz (eDP intermediate
+/// rates included).
+pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    port_clock_khz: u32,
+    lane_count: u8,
+    levels: &[(u8, u8); 4],
+) -> Result<(), Cx0Error> {
     let table = trans_table(phy.port.phy());
     phy.program_msgbus_timer();
     phy.msgbus_access_begin(BOTH_LANES)?;

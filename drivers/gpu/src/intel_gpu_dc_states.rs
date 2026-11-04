@@ -87,6 +87,16 @@
 //! MTL modeset reports Pipe A around its own disable/enable and the
 //! Pipe B–D owner reports each external pipe.
 //!
+//! Display 20 (Lunar Lake, KMS-owned through the opted-in display-20
+//! route): the same service under [`DmcPlatform::Xe2Lpd`] —
+//! `i915/xe2lpd_dmc.bin` with its 0x8000 payload ceiling, no
+//! Wa_16015201720, `DMC_FQ_W2_PTS_CFG_SEL` after each load and the pipe-DMC
+//! flip-queue reset and `PIPEDMC_INTERRUPT` programming around each pipe
+//! enable/disable (`intel_gpu_dmc`) — targeting DC6 (`get_allowed_dc_mask`
+//! caps display >= 20 at `max_dc` 2, no DC3CO). Its register view applies
+//! Wa_15015404425 (four dummy writes before every read). The display-20 GT
+//! profile is D0-only, so the suspend half is not reached there.
+//!
 //! Stricter than the pinned tree, and why: re-entry is refused (not
 //! merely warned about) with the utility pin in PWM mode, with a pipe
 //! DMC enabled that this driver did not enable, while an external route
@@ -105,10 +115,29 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dmc::{
-    disable_pipe, disable_program, enable_pipe, load_program, parse_dmc_firmware_xelpdp,
-    pipedmc_enable_mtl, verify_loaded, verify_program, DmcError, DmcFirmware, DmcId,
-    DmcVerifyError, DC_STATE_EN, DG1_DMC_DEBUG_DC5_COUNT, MTL_DMC_FIRMWARE, MTL_PIPEDMC_CONTROL,
+    disable_pipe, disable_program, enable_pipe, load_program, parse_dmc_firmware_xe2lpd,
+    parse_dmc_firmware_xelpdp, pipedmc_enable_mtl, verify_loaded, verify_program, DmcError,
+    DmcFirmware, DmcId, DmcPlatform, DmcVerifyError, DC_STATE_EN, DG1_DMC_DEBUG_DC5_COUNT,
+    MTL_DMC_FIRMWARE, MTL_PIPEDMC_CONTROL,
 };
+
+/// Parse a retained container under `platform`'s rules: display 14
+/// (`mtl_dmc.bin`) or display 20 (`xe2lpd_dmc.bin`, 0x8000 ceiling).
+/// Stepping selection is wildcard on both.
+fn parse_for(platform: DmcPlatform, blob: &[u8]) -> Result<DmcFirmware<'_>, DmcError> {
+    match platform {
+        DmcPlatform::Xe2Lpd => parse_dmc_firmware_xe2lpd(blob, b'*', b'*'),
+        _ => parse_dmc_firmware_xelpdp(blob, b'*', b'*'),
+    }
+}
+
+/// `dmc_firmware_default` for the service's platform.
+fn firmware_path(platform: DmcPlatform) -> &'static str {
+    match platform {
+        DmcPlatform::Xe2Lpd => crate::intel_gpu_xe2lpd::XE2LPD_DMC_FIRMWARE,
+        _ => MTL_DMC_FIRMWARE,
+    }
+}
 
 // ── Register facts (intel_display_regs.h, intel_backlight_regs.h) ─
 
@@ -145,6 +174,9 @@ pub const DC_REENABLE_DELAY_NS: u64 = 17_000_000;
 /// feature this driver does not configure) and DC9 (the display-core
 /// uninit path this driver does not run) are never targeted.
 pub const XELPDP_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
+/// The display-20 targets: `get_allowed_dc_mask` caps display >= 20 at
+/// `max_dc` 2 (DC6, no DC3CO); DC9 stays untargeted as on display 14.
+pub const XE2LPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
 /// Upper bound on the retained container copy: 32 FW-info entries of
 /// a 256-byte v3 header plus a 0x7000-byte payload, plus the CSS and
 /// package headers, fit well below this.
@@ -351,6 +383,8 @@ pub struct DcCore {
     /// The function went through runtime D3hot with a loaded program: the
     /// next publication re-verifies it under `DC_off` before trusting it.
     recheck: bool,
+    /// The container rules: display 14 or display 20.
+    platform: DmcPlatform,
 }
 
 /// `MTL_PIPEDMC_CONTROL` bits for a pipe mask.
@@ -361,9 +395,14 @@ fn pipedmc_bits(pipes: u32) -> u32 {
 }
 
 impl DcCore {
-    /// A core with no references, nothing loaded and the target
+    /// A display-14 core with no references, nothing loaded and the target
     /// sanitized against `allowed` (from DC6 down).
     pub fn new(allowed: u32) -> Self {
+        Self::new_for(DmcPlatform::Xelpdp, allowed)
+    }
+
+    /// [`Self::new`] under `platform`'s container rules (display 14 or 20).
+    pub fn new_for(platform: DmcPlatform, allowed: u32) -> Self {
         Self {
             refs: [0; USER_COUNT],
             tracked: 0,
@@ -381,7 +420,13 @@ impl DcCore {
             pipes_lit: 0,
             pipes_enabled: 0,
             recheck: false,
+            platform,
         }
+    }
+
+    /// The container rules this core loads under.
+    pub fn platform(&self) -> DmcPlatform {
+        self.platform
     }
 
     /// Total DC_off references.
@@ -455,7 +500,7 @@ impl DcCore {
         let Some(blob) = self.blob.clone() else {
             return false;
         };
-        let Ok(firmware) = parse_dmc_firmware_xelpdp(&blob, b'*', b'*') else {
+        let Ok(firmware) = parse_for(self.platform, &blob) else {
             return false;
         };
         self.enable_one(regs, &firmware, pipe)
@@ -473,7 +518,7 @@ impl DcCore {
             return;
         }
         if let Some(blob) = self.blob.clone() {
-            if let Ok(firmware) = parse_dmc_firmware_xelpdp(&blob, b'*', b'*') {
+            if let Ok(firmware) = parse_for(self.platform, &blob) {
                 if disable_pipe(regs, &firmware, pipe).is_ok() {
                     self.pipes_enabled &= !(1 << pipe);
                 }
@@ -502,7 +547,7 @@ impl DcCore {
     /// After a (re)load: `intel_dmc_enable_pipe` for every lit pipe, as
     /// the crtc enable / sanitize paths do once the program is back.
     pub fn enable_lit_pipes<M: MmioWindow + ?Sized>(&mut self, regs: &M, blob: &[u8]) {
-        let Ok(firmware) = parse_dmc_firmware_xelpdp(blob, b'*', b'*') else {
+        let Ok(firmware) = parse_for(self.platform, blob) else {
             return;
         };
         for pipe in 0..4 {
@@ -670,8 +715,7 @@ impl DcCore {
         // pipe C/D DMC state is not kept across DC6 by design
         // (need_pipedmc_load_mmio re-applies it at pipe enable).
         let blob = self.blob.clone().ok_or(ArmBlock::NoProgram)?;
-        let firmware =
-            parse_dmc_firmware_xelpdp(&blob, b'*', b'*').map_err(|_| ArmBlock::NoProgram)?;
+        let firmware = parse_for(self.platform, &blob).map_err(|_| ArmBlock::NoProgram)?;
         if verify_program(regs, &firmware, DmcId::Main).is_err() {
             self.program = ProgramState::Lost;
             return Err(ArmBlock::ProgramLost);
@@ -767,7 +811,7 @@ impl DcCore {
             return;
         }
         if let (ProgramState::Loaded { .. }, Some(blob)) = (self.program, self.blob.clone()) {
-            if let Ok(firmware) = parse_dmc_firmware_xelpdp(&blob, b'*', b'*') {
+            if let Ok(firmware) = parse_for(self.platform, &blob) {
                 // The pipes go dark before display-core uninit
                 // (intel_dmc_disable_pipe at crtc disable); they stay
                 // recorded lit and are re-enabled after the reload.
@@ -840,7 +884,18 @@ impl DcCore {
 /// followed by `assert_dmc_loaded`, as a refusal). The caller holds a
 /// DC_off reference; no core lock is needed.
 pub fn load_and_verify<M: MmioWindow + ?Sized>(regs: &M, blob: &[u8]) -> Result<u32, DcRefusal> {
-    let firmware = parse_dmc_firmware_xelpdp(blob, b'*', b'*').map_err(DcRefusal::Parse)?;
+    load_and_verify_for(DmcPlatform::Xelpdp, regs, blob)
+}
+
+/// [`load_and_verify`] under `platform`'s container rules: display 20
+/// skips Wa_16015201720 and writes `DMC_FQ_W2_PTS_CFG_SEL` after the load
+/// (`intel_dmc_load_program`).
+pub fn load_and_verify_for<M: MmioWindow + ?Sized>(
+    platform: DmcPlatform,
+    regs: &M,
+    blob: &[u8],
+) -> Result<u32, DcRefusal> {
+    let firmware = parse_for(platform, blob).map_err(DcRefusal::Parse)?;
     load_program(regs, &firmware);
     verify_loaded(regs, &firmware).map_err(DcRefusal::Verify)?;
     Ok(firmware.version)
@@ -862,9 +917,10 @@ pub fn publication_step<M: MmioWindow + ?Sized>(
     // A runtime resume re-verifies the retained program first; a lost one
     // is reloaded just below, before the Init/Suspend release.
     let mut deadline = core.lock().runtime_resume_verify(regs, now).ok().flatten();
+    let platform = core.lock().platform();
     let blob = core.lock().begin_load(regs).ok().flatten();
     if let Some(blob) = blob {
-        let result = load_and_verify(regs, &blob);
+        let result = load_and_verify_for(platform, regs, &blob);
         let mut core = core.lock();
         // Under the Load reference, before it is released.
         if result.is_ok() {
@@ -887,9 +943,10 @@ pub fn arm_step<M: MmioWindow + ?Sized>(
     if result != Err(ArmBlock::ProgramLost) {
         return result;
     }
+    let platform = core.lock().platform();
     let blob = core.lock().begin_load(regs).ok().flatten();
     if let Some(blob) = blob {
-        let loaded = load_and_verify(regs, &blob);
+        let loaded = load_and_verify_for(platform, regs, &blob);
         let mut core = core.lock();
         if loaded.is_ok() {
             core.enable_lit_pipes(regs, &blob);
@@ -901,22 +958,22 @@ pub fn arm_step<M: MmioWindow + ?Sized>(
 
 // ── Firmware acquisition ────────────────────────────────────────
 
-struct OpenContainer;
+struct OpenContainer(DmcPlatform);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenContainer {
     type Output = Result<Arc<Vec<u8>>, DcRefusal>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(MTL_DMC_FIRMWARE, cap) {
+        let blob = match narf_firmware::open(firmware_path(self.0), cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(DcRefusal::Registry(error))),
         };
-        blob.invoke(CopyContainer)
+        blob.invoke(CopyContainer(self.0))
     }
 }
 
-struct CopyContainer;
+struct CopyContainer(DmcPlatform);
 impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyContainer {
     type Output = Result<Arc<Vec<u8>>, DcRefusal>;
     fn execute(
@@ -930,7 +987,7 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyContainer {
             }
             // Validate before retaining: a refused container is never
             // copied, and nothing is written to hardware here.
-            parse_dmc_firmware_xelpdp(view.bytes, b'*', b'*').map_err(DcRefusal::Parse)?;
+            parse_for(self.0, view.bytes).map_err(DcRefusal::Parse)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(view.bytes.len())
@@ -948,18 +1005,27 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyContainer {
 pub fn open_firmware(
     authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
 ) -> Result<Arc<Vec<u8>>, DcRefusal> {
+    open_firmware_for(DmcPlatform::Xelpdp, authority)
+}
+
+/// [`open_firmware`] for `platform`'s container: `i915/mtl_dmc.bin` under
+/// the display-14 rules, `i915/xe2lpd_dmc.bin` under the display-20 rules.
+pub fn open_firmware_for(
+    platform: DmcPlatform,
+    authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+) -> Result<Arc<Vec<u8>>, DcRefusal> {
     authority
-        .invoke(OpenContainer)
+        .invoke(OpenContainer(platform))
         .map_err(|_| DcRefusal::Authority)?
 }
 
-fn acquire_firmware() -> Result<Arc<Vec<u8>>, DcRefusal> {
+fn acquire_firmware(platform: DmcPlatform) -> Result<Arc<Vec<u8>>, DcRefusal> {
     let authority: Cap<narf_firmware::FirmwareRegistry, Read> =
         narf_firmware::trusted_loader_authority()
             .ok_or(DcRefusal::Authority)?
             .derive()
             .map_err(|_| DcRefusal::Authority)?;
-    open_firmware(&authority)
+    open_firmware_for(platform, &authority)
 }
 
 // ── Production service ──────────────────────────────────────────
@@ -968,13 +1034,38 @@ fn acquire_firmware() -> Result<Arc<Vec<u8>>, DcRefusal> {
 /// (the controller is a singleton), so one service does too.
 #[derive(Debug)]
 pub(crate) struct DcService {
-    window: crate::intel_gpu_gt_hw::AuthorizedWindow,
+    window: ServiceWindow,
     bar: narf_bus::MmioRegion,
     core: IrqSafeSpinLock<DcCore>,
     arming: AtomicBool,
 }
 
 static SERVICE: IrqSafeSpinLock<Option<Arc<DcService>>> = IrqSafeSpinLock::new(None);
+
+/// The service's register view: the PCI-authorized BAR, plus, on display
+/// 20, Wa_15015404425 (xe_device_wa_oob.rules `PLATFORM(LUNARLAKE)`;
+/// xe_mmio.c::mmio_flush_pending_writes): four dummy writes before every
+/// read.
+#[derive(Clone, Debug)]
+struct ServiceWindow {
+    window: crate::intel_gpu_gt_hw::AuthorizedWindow,
+    flush_reads: bool,
+}
+
+impl MmioWindow for ServiceWindow {
+    fn read32(&self, off: u64) -> u32 {
+        if self.flush_reads {
+            for _ in 0..4 {
+                self.window
+                    .write32(crate::intel_gpu_xe2lpd::MMIO_FLUSH_DUMMY, 0);
+            }
+        }
+        self.window.read32(off)
+    }
+    fn write32(&self, off: u64, val: u32) {
+        self.window.write32(off, val);
+    }
+}
 
 impl DcService {
     fn gates(&self) -> ArmGates {
@@ -1274,24 +1365,46 @@ async fn arm_task(service: Arc<DcService>) {
     }
 }
 
-/// KMS install for a display-14 function: create the service and hold
-/// the Init reference (DC states exited) until the program is loaded.
+/// The service profile a KMS-owned generation installs: display 14 on
+/// Meteor/Arrow Lake, display 20 on Lunar Lake (whose KMS install has
+/// already verified `GMD_ID_DISPLAY` 20.00). `(container rules, allowed DC
+/// mask, Wa_15015404425 read flush)`; `None` installs nothing.
+pub(crate) fn service_profile(
+    generation: crate::intel_gpu::Generation,
+) -> Option<(DmcPlatform, u32, bool)> {
+    match generation {
+        crate::intel_gpu::Generation::MeteorLake => {
+            Some((DmcPlatform::Xelpdp, XELPDP_ALLOWED_DC_MASK, false))
+        }
+        crate::intel_gpu::Generation::LunarLake => {
+            Some((DmcPlatform::Xe2Lpd, XE2LPD_ALLOWED_DC_MASK, true))
+        }
+        _ => None,
+    }
+}
+
+/// KMS install for a display-14 or display-20 function: create the service
+/// and hold the Init reference (DC states exited) until the program is
+/// loaded.
 pub(crate) fn install(
     generation: crate::intel_gpu::Generation,
     bar: narf_bus::MmioRegion,
     cap: Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) {
-    if generation != crate::intel_gpu::Generation::MeteorLake {
+    let Some((platform, allowed, flush_reads)) = service_profile(generation) else {
         return;
-    }
+    };
     let mut slot = SERVICE.lock();
     if slot.is_some() {
         return;
     }
     let service = DcService {
-        window: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
+        window: ServiceWindow {
+            window: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
+            flush_reads,
+        },
         bar,
-        core: IrqSafeSpinLock::new(DcCore::new(XELPDP_ALLOWED_DC_MASK)),
+        core: IrqSafeSpinLock::new(DcCore::new_for(platform, allowed)),
         arming: AtomicBool::new(false),
     };
     {
@@ -1318,11 +1431,12 @@ pub(crate) fn service_after_publication(bar: &narf_bus::MmioRegion) {
     else {
         return;
     };
+    let platform = service.core.lock().platform();
     if publication_step(
         &service.core,
         &service.window,
         narf_time::monotonic_ns(),
-        acquire_firmware,
+        || acquire_firmware(platform),
     )
     .is_some()
     {
@@ -1385,3 +1499,7 @@ pub(crate) fn suspend_finish_for_bar(bar: &narf_bus::MmioRegion, prepared: bool)
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_dc_states_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_xe2lpd_dc_tests.rs"]
+mod xe2lpd_dc_tests;

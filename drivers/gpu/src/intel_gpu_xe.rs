@@ -328,9 +328,24 @@ impl XeFile {
                 // Region bit 0 is system memory, bit 1 the published VRAM.
                 let regions = if info.vram.is_some() { 3 } else { 1 };
                 // SCANOUT (2) is admitted where a WC system object satisfies
-                // it: the iGPU. Arc display is not supported.
+                // it: the iGPU. Arc display is not supported. An integrated
+                // Xe2/Xe3 function has no scanout (or FlatCCS) representation
+                // on its headless profile; the Lunar Lake display-20 route's
+                // display-preserving profile takes XE_BO_FLAG_SCANOUT
+                // (xe_bo.c::xe_gem_create_ioctl) as a WC system object.
                 let supported_flags = match info.platform {
-                    _ if info.platform.is_headless_integrated() => 0, // no scanout/FlatCCS representation
+                    _ if info.platform.is_headless_integrated() => {
+                        if info.platform.is_lnl()
+                            && info
+                                .backend
+                                .as_ref()
+                                .is_some_and(|backend| backend.display_preserving())
+                        {
+                            2
+                        } else {
+                            0
+                        }
+                    }
                     crate::intel_gpu_gt::GtPlatform::Battlemage => {
                         8 | if info.vram.is_some() { 4 } else { 0 }
                     }
@@ -950,6 +965,13 @@ impl XeFile {
             user.write_u64_release(address, value)?;
         }
         state.publish(mappings);
+        // Adopt the new MAP_USERPTR bindings and forget the replaced ones
+        // under the same VM lock, so exec always checks what it maps.
+        let fresh = binds
+            .iter_mut()
+            .filter_map(|bind| bind.mirror.take())
+            .collect();
+        vm.adopt_userptrs(&state.mappings, fresh);
         sync.publish(so::stub());
         Ok(())
     }
@@ -1007,6 +1029,9 @@ impl XeFile {
         let mut state = queue.vm.state.lock().await;
         loop {
             queue.check()?;
+            // xe_vm_userptr_pin: re-collect invalidated MAP_USERPTR bindings
+            // before this job's private tables are built from the mappings.
+            queue.vm.revalidate_userptrs(&mut state, user)?;
             let status = backend
                 .status()
                 .filter(|s| s.platform == info.platform)
@@ -1039,6 +1064,12 @@ impl XeFile {
                     sync.user_fence,
                 )?
             };
+            // __xe_vm_userptr_needs_repin at the point of no return: a binding
+            // invalidated while the tables were built is re-collected and the
+            // tables rebuilt (xe_exec_ioctl's -EAGAIN retry).
+            if queue.vm.userptrs_stale() {
+                continue;
+            }
             match backend
                 .submit(queue.context.clone(), UserBatch(resident))
                 .await

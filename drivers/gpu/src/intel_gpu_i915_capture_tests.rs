@@ -405,8 +405,14 @@ fn smoke_i915_capture_query_source_parameter_sizes_values_and_faults() -> TestRe
     user.store(64, &other);
     assert_eq!(
         node(&*file, &user, abi::GEM_CONTEXT_SETPARAM),
-        Err(FsError::InvalidData),
-        "unrelated boolean ABI broadened"
+        Ok(0),
+        "unrelated boolean accepts nonzero as true in Linux i915"
+    );
+    put32(&mut other, 4, 8);
+    user.store(64, &other);
+    assert_eq!(
+        node(&*file, &user, abi::GEM_CONTEXT_SETPARAM),
+        Err(FsError::InvalidData)
     );
     let handles = make_buffers(&user, |cmd| assert_eq!(node(&*file, &user, cmd), Ok(0)));
     legacy_exec(&user, handles, 0);

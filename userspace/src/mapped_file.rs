@@ -197,6 +197,56 @@ pub(crate) fn relocate_device_frames(
     })
 }
 
+/// The device-revocation half of the same bridge (Linux
+/// `unmap_mapping_range` for a runtime-suspending device): every process
+/// root, plus the active one, is the snapshot the memory census checks.
+/// Installs the refault waiter first, so a fault on the range can park.
+pub(crate) fn revoke_device_frames(
+    start: u64,
+    len: u64,
+    census: narf_memory::address_space::DeviceAliasCensus,
+    refault: Arc<dyn narf_memory::address_space::DeviceFrameRefault>,
+) -> Result<narf_memory::address_space::DeviceFrameRevocation, FsError> {
+    install_device_refault_wait();
+    let mut spaces = crate::handlers::all_address_spaces();
+    if let Some(current) = crate::handlers::active_user_as() {
+        if !spaces.iter().any(|space| Arc::ptr_eq(space, &current)) {
+            spaces.push(current);
+        }
+    }
+    // SAFETY: the driver owns the aperture and its alias census for as long
+    // as the returned handle lives; the snapshot's Arcs keep roots live and
+    // the census covers unpublished fork metadata.
+    unsafe {
+        narf_memory::address_space::revoke_device_frames(
+            &spaces,
+            PhysAddr::new(start),
+            len,
+            census,
+            refault,
+        )
+    }
+    .map_err(|error| match error {
+        AddressSpaceError::AllocationFailed => FsError::OutOfMemory,
+        AddressSpaceError::AlignmentMismatch => FsError::InvalidData,
+        _ => FsError::Busy,
+    })
+}
+
+/// Make faults on revoked device frames park instead of failing. Installed
+/// on the device mmap path and before every revocation.
+pub(crate) fn install_device_refault_wait() {
+    narf_memory::address_space::install_refault_wait(Some(wait_device_refault));
+}
+
+/// Parks the faulting own-stack task on the driver's refault, exactly as a
+/// file fault parks on its read (`demand_frame`).
+fn wait_device_refault(
+    future: narf_memory::address_space::DeviceRefaultFuture,
+) -> Option<Result<(), narf_memory::address_space::DeviceRefaultError>> {
+    crate::handlers::poll_io_to_completion(future)
+}
+
 #[derive(Clone)]
 struct FileWriteback {
     offset: u64,
@@ -265,6 +315,10 @@ struct MappingOwner {
     /// whose identity lives in the exec image table). Shared by `Arc` so
     /// splits, moves and fork copy it without allocating.
     provenance: Option<Arc<MappingProvenance>>,
+    /// A read-only private PFN mapping (`FileOps::mmap_private_pfn`): the
+    /// VMA is `VM_PFNMAP | VM_DONTEXPAND` without `VM_MAYSHARE`, and with
+    /// `dont_copy` also `VM_DONTCOPY`. Splits and moves keep it.
+    pfn: Option<narf_filesystem::PrivatePfnMap>,
 }
 
 /// The file identity Linux's `show_map_vma` prints for a VMA with a
@@ -369,7 +423,7 @@ pub(crate) fn shared_file_at(address_space_id: u64, va: u64) -> Option<(Arc<dyn 
     let owners = bucket.lock();
     owners
         .iter()
-        .find(|m| m.base <= va && va - m.base < m.len && !m.private_copy)
+        .find(|m| m.base <= va && va - m.base < m.len && !m.private_copy && m.pfn.is_none())
         .map(|m| (Arc::clone(&m.ops), m.file_offset + (va - m.base)))
 }
 
@@ -404,6 +458,8 @@ pub(crate) fn drop_address_space(address_space_id: u64) {
     drop(retired);
     // The space's recorded batches die with it (#737 step 2).
     drop_advice_records(address_space_id);
+    // A fork child dropped before `finish_fork_address_space` ran.
+    let _ = FORK_DONT_COPY.lock().remove(&address_space_id);
 }
 
 /// Distinct files with a non-private mapping of `address_space_id`
@@ -479,6 +535,28 @@ pub(crate) fn publish_current_mapping(
     publish: impl FnOnce() -> Result<MappingReceipt, AddressSpaceError>,
     finish: impl FnOnce(MappingReceipt) -> Result<(), AddressSpaceError>,
 ) -> Result<MappingReceipt, AddressSpaceError> {
+    publish_mapping_owner(address_space_id, registration, None, publish, finish)
+}
+
+/// [`publish_current_mapping`] for a read-only private PFN VMA. The owner row
+/// carries `pfn` through splits and moves; fork honours its `dont_copy`.
+pub(crate) fn publish_current_pfn_mapping(
+    address_space_id: u64,
+    registration: MappingOwnerRegistration,
+    pfn: narf_filesystem::PrivatePfnMap,
+    publish: impl FnOnce() -> Result<MappingReceipt, AddressSpaceError>,
+    finish: impl FnOnce(MappingReceipt) -> Result<(), AddressSpaceError>,
+) -> Result<MappingReceipt, AddressSpaceError> {
+    publish_mapping_owner(address_space_id, registration, Some(pfn), publish, finish)
+}
+
+fn publish_mapping_owner(
+    address_space_id: u64,
+    registration: MappingOwnerRegistration,
+    pfn: Option<narf_filesystem::PrivatePfnMap>,
+    publish: impl FnOnce() -> Result<MappingReceipt, AddressSpaceError>,
+    finish: impl FnOnce(MappingReceipt) -> Result<(), AddressSpaceError>,
+) -> Result<MappingReceipt, AddressSpaceError> {
     let MappingOwnerRegistration {
         base,
         len,
@@ -510,6 +588,7 @@ pub(crate) fn publish_current_mapping(
         }),
         zero_from,
         provenance,
+        pfn,
     });
     // Publication and owner registration are now atomic with respect to
     // faults. Release the IRQ-safe global table before PTE materialization,
@@ -2578,6 +2657,7 @@ fn register(
         // Not an ELF segment: no `padzero` window.
         zero_from: None,
         provenance: None,
+        pfn: None,
     });
 }
 
@@ -2688,6 +2768,7 @@ fn prepare_aliases_locked(
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
             provenance: mapping.provenance.clone(),
+            pfn: mapping.pfn,
             writeback,
         });
     }
@@ -2821,6 +2902,7 @@ fn prepare_relocated_owners_locked(
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
             provenance: mapping.provenance.clone(),
+            pfn: mapping.pfn,
             writeback,
         });
     }
@@ -2916,6 +2998,7 @@ fn prepare_punch_suffixes_locked(
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
             provenance: mapping.provenance.clone(),
+            pfn: mapping.pfn,
             writeback,
         });
     }
@@ -3024,6 +3107,7 @@ fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
                     private_copy: mapping.private_copy,
                     zero_from: mapping.zero_from,
                     provenance: mapping.provenance.clone(),
+                    pfn: mapping.pfn,
                     writeback: mapping.writeback.clone(),
                 };
                 if let Some(wb) = suffix.writeback.as_mut() {
@@ -3065,9 +3149,20 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
     let Some(parent_bucket) = existing_mapping_owners(parent_id) else {
         return;
     };
+    let mut skipped = Vec::new();
     let inherited: Vec<_> = parent_bucket
         .lock()
         .iter()
+        .filter(|mapping| {
+            // mm/mmap.c::dup_mmap: a VM_DONTCOPY VMA is cleared from the
+            // child's tree and never duplicated. Its range is removed from
+            // the child's region copy by `finish_fork_address_space`.
+            let dont_copy = mapping.pfn.is_some_and(|pfn| pfn.dont_copy);
+            if dont_copy {
+                skipped.push((mapping.base, mapping.len));
+            }
+            !dont_copy
+        })
         .map(|mapping| MappingOwner {
             base: mapping.base,
             len: mapping.len,
@@ -3077,6 +3172,7 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
             private_copy: mapping.private_copy,
             zero_from: mapping.zero_from,
             provenance: mapping.provenance.clone(),
+            pfn: mapping.pfn,
             writeback: mapping.writeback.clone(),
         })
         .collect();
@@ -3085,6 +3181,45 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
     // child somehow already holds, so a parent's advise can never
     // install pages in the child's space.
     drop_advice_records(child_id);
+    if !skipped.is_empty() {
+        FORK_DONT_COPY.lock().insert(child_id, skipped);
+    }
+}
+
+/// `VM_DONTCOPY` ranges a fork child's region copy still holds, keyed by the
+/// child's address-space identity. Memory's fork snapshot copies every
+/// region; [`fork_address_space`] (run from its fork hook while the child is
+/// unpublished) withholds their owners and records the ranges here.
+static FORK_DONT_COPY: IrqSafeSpinLock<BTreeMap<u64, Vec<(u64, u64)>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Complete a fork's address-space copy before the child can run: remove
+/// every `VM_DONTCOPY` region its owner row was withheld for, as
+/// `dup_mmap`'s `vma_iter_clear_gfp` does. The regions are borrowed device
+/// frames (`RegionPerms::SHARED`), so the punch frees nothing and the child,
+/// never scheduled yet, has no leaf to invalidate. Every `clone_for_fork`
+/// caller that publishes a child must call this; failure refuses the fork.
+pub(crate) fn finish_fork_address_space(
+    child: &narf_memory::AddressSpace,
+) -> Result<(), AddressSpaceError> {
+    let Some(ranges) = FORK_DONT_COPY.lock().remove(&child.identity()) else {
+        return Ok(());
+    };
+    for (base, len) in ranges {
+        child.punch_fixed(narf_memory::VirtAddr::new(base), len)?;
+    }
+    Ok(())
+}
+
+/// Whether the owner row covering `va` is a private PFN mapping. `mremap`
+/// applies `check_prep_vma`'s private-VMA and `VM_DONTEXPAND` refusals to it.
+pub(crate) fn private_pfn_at(address_space_id: u64, va: u64) -> bool {
+    existing_mapping_owners(address_space_id).is_some_and(|bucket| {
+        bucket
+            .lock()
+            .iter()
+            .any(|m| m.pfn.is_some() && m.base <= va && va - m.base < m.len)
+    })
 }
 
 fn owner_count(address_space_id: u64) -> usize {

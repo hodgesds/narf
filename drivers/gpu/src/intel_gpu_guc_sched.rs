@@ -163,6 +163,9 @@ struct Context<B: GpuBacking> {
     reset: bool,
     primary_finished: bool,
     parallel: Option<parallel::Group<B>>,
+    /// The SCHEDULING_PRIORITY GuC last accepted for this registration:
+    /// none until the Policy request is queued.
+    sent_priority: Option<u32>,
 }
 
 impl<B: GpuBacking> Context<B> {
@@ -1433,6 +1436,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             reset: false,
             primary_finished: false,
             parallel,
+            sent_priority: None,
         });
         if mutating {
             self.pristine = false;
@@ -1710,6 +1714,34 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 }
             }
             let id = u32::from(context.id);
+            // intel_guc_submission.c::guc_context_set_prio: GuC gets a
+            // priority-only UPDATE_CONTEXT_POLICIES (__guc_context_set_prio)
+            // only for a registered context whose priority changed; before
+            // the Policy request the change is stored and that request
+            // carries it. NARF's registration of a job ends with its
+            // schedule disable, and a job GuC took off or reset is retiring.
+            if let (Some(sent), Some(user), false) = (
+                context.sent_priority,
+                context.user.as_ref(),
+                context.timed_out || context.reset,
+            ) {
+                let priority = user.priority();
+                if priority != sent
+                    && matches!(
+                        context.phase,
+                        Phase::Enable | Phase::Enabling | Phase::Dispatch | Phase::Running
+                    )
+                {
+                    // SCHEDULING_PRIORITY key 0x2003, one value.
+                    match ct.send(context.id, 0x100b, 0, &[id, 0x20030001, priority], true) {
+                        Ok(()) => context.sent_priority = Some(priority),
+                        // CT full: the next poll compares again.
+                        Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+                        Err(error) => return Err(SchedulingError::Transport(error)),
+                    }
+                }
+            }
+            let mut policy_priority = None;
             let (action, payload, next): (u16, Vec<u32>, Phase) = match context.phase {
                 Phase::Invalidate => (
                     0x7000,
@@ -1784,6 +1816,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             .user
                             .as_ref()
                             .map_or((3, 1000, false), |user| user.policy());
+                        policy_priority = Some(priority);
                         // xe_guc_submit.c init_policies + guc_klvs_abi.h:
                         // SLPM_GT_FREQUENCY key 0x2005, one value, COMPUTE
                         // strategy bit 28. This fast request is ordered before
@@ -1814,6 +1847,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             match ct.send(context.id, action, 0, &payload, true) {
                 Ok(()) => {
                     context.phase = next;
+                    if policy_priority.is_some() {
+                        context.sent_priority = policy_priority;
+                    }
                     if next == Phase::Running {
                         context.fence.mark_submitted();
                         context.deadline =

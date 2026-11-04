@@ -284,7 +284,10 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// operation. `slots` and `pages` are parallel and equal-length;
     /// `slots` is guaranteed contiguous and ascending by the slot
     /// allocator. Each `pages[i]` is the physical frame whose 4 KiB
-    /// contents must be preserved under `slots[i]`.
+    /// contents must be preserved under `slots[i]`. The kernel calls this
+    /// only after it has unmapped every page and completed the TLB
+    /// shootdown, so no CPU stores to them through a user mapping during the
+    /// call; the frames stay allocated until it returns.
     ///
     /// On `Err`, the backend must leave *no* slot populated (all-or-
     /// nothing) so the caller can roll the run back cleanly.
@@ -456,8 +459,9 @@ impl SwapBackend for ZramBackend {
             let idx = slot.raw() as usize;
             // Read the 4 KiB frame contents through the kernel's RAM
             // window (identity on x86_64; direct-map offset for high
-            // frames). The frame is still live — the caller unmaps it
-            // only after a successful write.
+            // frames). The caller has already unmapped the frame and
+            // retired its translations, and frees it only after this
+            // write returns.
             let src = phys.kernel_ptr::<u8>();
             // SAFETY: `phys` is a live, exclusively-borrowed 4 KiB frame
             // for the duration of this batched write; `kernel_ptr`
@@ -949,6 +953,10 @@ struct SwapOutCommit {
     virt: crate::VirtAddr,
     expected_phys: PhysAddr,
     raw: u64,
+    /// The present leaf the commit replaced, as its atomic exchange returned
+    /// it (with every hardware A/D update up to the exchange), so a victim
+    /// whose write fails or whose owner refuses it is restored exactly.
+    previous: u64,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -961,20 +969,28 @@ struct SwapInCommit {
 }
 
 /// Atomically replace a same-root set of present 4 KiB leaves with
-/// non-present swap entries under one page-table lock acquisition.
+/// non-present swap entries under one page-table lock acquisition — the
+/// unmap step of Linux `try_to_unmap_one`.
 ///
 /// The first pass validates every expected physical frame; only then does the
-/// second pass publish any swap entry. TLB invalidation is deliberately left
-/// to the caller, which performs one full/range batch before freeing backing.
+/// second pass publish any swap entry. Each leaf is replaced with an atomic
+/// exchange, which orders against the page walker's locked A/D assist on
+/// other CPUs: an assist that lands first is in the returned `previous`
+/// (Linux `ptep_get_and_clear` handing the dirty bit to the folio), and one
+/// that starts after it finds a non-present leaf and faults instead of
+/// writing. A CPU that cached the old translation can still store to the
+/// frame until the caller's TLB shootdown completes, so the caller must not
+/// read any victim for the backend before that.
 #[cfg(target_arch = "x86_64")]
 unsafe fn commit_swap_out_batch(
     pml4_phys: PhysAddr,
-    entries: &[SwapOutCommit],
+    entries: &mut [SwapOutCommit],
 ) -> Result<(), SwapError> {
     use crate::paging::PageTableEntry;
+    use core::sync::atomic::AtomicU64;
 
     let _guard = crate::paging::pt_lock_for(pml4_phys).lock();
-    for entry in entries {
+    for entry in entries.iter() {
         let leaf = walk_to_leaf(pml4_phys, entry.virt).ok_or(SwapError::MapFailed)?;
         // SAFETY: the root lock is held and walk_to_leaf returned a live slot.
         let current = PageTableEntry::from_raw(unsafe { core::ptr::read_volatile(leaf) });
@@ -982,13 +998,57 @@ unsafe fn commit_swap_out_batch(
             return Err(SwapError::MapFailed);
         }
     }
-    for entry in entries {
+    for entry in entries.iter_mut() {
         let leaf = walk_to_leaf(pml4_phys, entry.virt).ok_or(SwapError::MapFailed)?;
         // SAFETY: the validation pass proved the leaf exists and the root lock
-        // prevents replacement between validation and this commit pass.
-        unsafe { core::ptr::write_volatile(leaf, entry.raw) };
+        // excludes every software mutator between that pass and this one. A
+        // leaf is an 8-byte-aligned u64 slot in a live table, so it can be
+        // accessed as an AtomicU64 (as the lazy-free walkers do).
+        let slot = unsafe { &*(leaf as *const AtomicU64) };
+        // Under the root lock only the hardware A/D assist can have changed
+        // the validated leaf, so the frame and permissions are unchanged.
+        entry.previous = slot.swap(entry.raw, Ordering::AcqRel);
     }
     Ok(())
+}
+
+/// Put back the present leaf of every committed victim marked in `keep`: one
+/// the owner refused after the commit, as Linux `try_to_unmap_one` restores
+/// `pteval` when `folio_try_share_anon_rmap_pte` finds a DMA pin, or every
+/// victim of a batch whose backend write failed. Only a leaf still holding
+/// this batch's swap entry is restored. The restored leaf is the exact value
+/// the commit exchanged out (same frame, attributes and A/D bits), and its
+/// frame was never freed, so no shootdown is needed for it. The owner's
+/// transition records make mprotect, munmap, MADV_DONTNEED, mremap, fork,
+/// migration and `remap_page` refuse these pages until the batch returns, so
+/// the permissions the restored leaf grants are still the VMA's. Returns the
+/// number of leaves restored.
+///
+/// # Safety
+/// Same root contract as [`commit_swap_out_batch`]; `keep` is index-aligned
+/// with `entries`, which that call committed.
+#[cfg(target_arch = "x86_64")]
+unsafe fn restore_swap_out_leaves(
+    pml4_phys: PhysAddr,
+    entries: &[SwapOutCommit],
+    keep: &[bool],
+) -> usize {
+    let _guard = crate::paging::pt_lock_for(pml4_phys).lock();
+    let mut restored = 0;
+    for (entry, _) in entries.iter().zip(keep).filter(|(_, keep)| **keep) {
+        let Some(leaf) = walk_to_leaf(pml4_phys, entry.virt) else {
+            continue;
+        };
+        // SAFETY: the root lock is held and walk_to_leaf returned a live slot.
+        if unsafe { core::ptr::read_volatile(leaf) } != entry.raw {
+            continue;
+        }
+        // SAFETY: as above; the slot still holds this batch's swap entry and
+        // the owner's transition record still excludes every other mutator.
+        unsafe { core::ptr::write_volatile(leaf, entry.previous) };
+        restored += 1;
+    }
+    restored
 }
 
 /// Atomically replace a same-root set of expected swap leaves with restored
@@ -1043,16 +1103,23 @@ unsafe fn commit_swap_in_batch(
 ///   2. Allocates a **contiguous run** of swap slots for the batch.
 ///   3. Charges the cgroup swap counter for the whole run (roll back
 ///      + bail if over `memory.swap.max`).
-///   4. Writes every frame to its slot in **one** `write_batch` call.
-///   5. Replaces every victim PTE with a non-present swap entry in one
+///   4. Replaces every victim PTE with a non-present swap entry in one
 ///      same-root page-table transaction.
-///   6. Issues one TLB invalidation for the complete batch.
+///   5. Issues one TLB invalidation for the complete batch. From here on no
+///      CPU can store to a victim through its user mapping.
+///   6. Writes every frame to its slot in **one** `write_batch` call.
 ///   7. Frees the now-evicted physical frames back to the buddy.
 ///
+/// This is Linux's reclaim order (`shrink_folio_list`: `try_to_unmap`, then
+/// `try_to_unmap_flush_dirty`, then `pageout`, then the free): the backend
+/// snapshot is taken only once no stale translation can still write the
+/// frame, so a store that raced the unmap is in the swapped copy instead of
+/// being freed with the frame.
+///
 /// Returns the number of pages actually paged out (0 if the batch was
-/// empty or every victim was already unmapped). On a mid-batch backend
-/// failure the whole run is rolled back and `Err` is returned with no
-/// frames freed and no PTEs disturbed.
+/// empty or every victim was already unmapped). On a backend failure every
+/// victim's exact leaf is restored, the whole run is released and `Err` is
+/// returned with no frame freed.
 ///
 /// The caller keeps the returned `SwapSlot` run out of band only if it
 /// wants explicit readahead; the swap entries themselves live in the
@@ -1072,17 +1139,52 @@ pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>
     // SAFETY: forwarded from the public primitive's ownership contract. The
     // no-op publisher is correct only because that contract requires the
     // caller to have detached ownership metadata itself.
-    unsafe { swap_out_batch_owned(victims, None, |_| {}) }
+    unsafe { swap_out_batch_owned(victims, None, |_, _| {}) }
+}
+
+/// One-shot callback run by the next [`swap_out_batch_owned`] after its PTE
+/// commit and TLB shootdown and before its backend write (so also before its
+/// publication), with no lock held, so a test can land a pin, a store or a
+/// fault in that window deterministically.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+static AFTER_SWAP_COMMIT: IrqSafeSpinLock<Option<fn()>> = IrqSafeSpinLock::new(None);
+
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+pub(crate) fn __test_after_swap_commit(hook: Option<fn()>) {
+    *AFTER_SWAP_COMMIT.lock() = hook;
 }
 
 /// Ownership-integrated implementation used by `AddressSpace` reclaim.
-/// `publish` runs after every swap PTE is committed but before the one TLB
-/// retirement and before any victim frame is freed.
+///
+/// The order is Linux's (`shrink_folio_list` -> `try_to_unmap` ->
+/// `try_to_unmap_flush_dirty` -> `pageout` -> free): every swap PTE is
+/// committed, then one TLB shootdown retires every cached translation of the
+/// batch, and only then is any victim read for the backend. A CPU store that
+/// raced the unmap through a stale translation has therefore landed in the
+/// frame before the snapshot, and no later CPU store can reach the frame
+/// through the mapping. A fault in the window finds the owner's in-flight
+/// transition record and waits for it (see `AddressSpace::demand_page_in`).
+///
+/// `publish` runs after the backend write succeeded and before any victim
+/// frame is freed, under the owner's lock: it transfers ownership to the swap
+/// entry, or refuses a victim by setting its `keep` entry. A frame pinned for
+/// device or kernel access (`frame::cow::is_pinned`) is never swapped: it is
+/// skipped when the batch resolves its victims (Linux `shrink_folio_list`'s
+/// `folio_maybe_dma_pinned` -> `keep_locked`), and `publish` refuses a
+/// committed victim that a pin, or a kernel write through the owner's
+/// metadata, reached after resolution (Linux `try_to_unmap_one` backing off
+/// after `folio_try_share_anon_rmap_pte`; a GUP that refaults a swap-cache
+/// folio keeps it mapped). A refused victim gets its exact leaf back, its slot
+/// is discarded and uncharged, its frame is not freed, and it is not counted.
+/// `publish` must leave a refused victim's ownership exactly as it was.
+///
+/// A failed backend write restores every victim's exact leaf and releases
+/// the whole run without calling `publish`; no frame is freed.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn swap_out_batch_owned(
     victims: &[SwapVictim],
     context_tag: Option<u16>,
-    publish: impl FnOnce(&[(SwapVictim, PhysAddr)]),
+    publish: impl FnOnce(&[(SwapVictim, PhysAddr)], &mut [bool]),
 ) -> Result<usize, SwapError> {
     use crate::paging::translate;
 
@@ -1102,13 +1204,17 @@ pub(crate) unsafe fn swap_out_batch_owned(
     }
 
     // ── 1. Resolve live frames. Skip victims that aren't currently
-    //       mapped to a 4 KiB page (already unmapped / huge). ──
+    //       mapped to a 4 KiB page (already unmapped / huge), and frames a
+    //       device or the kernel holds a pin on: swapping one would let the
+    //       pinned frame's later writes diverge from the swapped copy. ──
     let mut resolved: Vec<(SwapVictim, PhysAddr)> = Vec::with_capacity(batch);
     for v in victims {
         // SAFETY: `pml4_phys` is a live, identity-reachable AS root
         // (the caller owns it); `translate` only reads the tables.
         if let Some(phys) = unsafe { translate(v.pml4_phys, v.virt) } {
-            resolved.push((*v, phys));
+            if !crate::frame::cow::is_pinned(phys) {
+                resolved.push((*v, phys));
+            }
         }
     }
     if resolved.is_empty() {
@@ -1142,22 +1248,11 @@ pub(crate) unsafe fn swap_out_batch_owned(
         return Err(SwapError::SwapLimit);
     }
 
-    // ── 4. One batched write to the chosen area's backend. ──
+    // Everything the post-commit paths need is allocated here: from the
+    // commit on, the owner's transition records hold the victims, and the
+    // write-failure and refusal paths below allocate nothing.
     let frames: Vec<PhysAddr> = resolved.iter().map(|(_, p)| *p).collect();
-    {
-        if let Err(e) = backend.write_batch(&slot_run, &frames) {
-            // Roll back: uncharge + return the slots. No PTE touched yet.
-            swap_uncharge(n as u64);
-            let mut swap = SWAP.lock();
-            for k in 0..n as u64 {
-                swap.free_slot(swap_type, base + k);
-            }
-            return Err(e);
-        }
-    }
-
-    // ── 5. Atomically stamp the complete same-root PTE batch. ──
-    let commits: Vec<SwapOutCommit> = resolved
+    let mut commits: Vec<SwapOutCommit> = resolved
         .iter()
         .enumerate()
         .map(|(index, (victim, phys))| SwapOutCommit {
@@ -1168,12 +1263,17 @@ pub(crate) unsafe fn swap_out_batch_owned(
                 offset: base + index as u64,
             }
             .encode(),
+            previous: 0,
         })
         .collect();
+    let mut keep = alloc_crate::vec![false; n];
+    let mut kept_slots: Vec<SwapSlot> = Vec::with_capacity(n);
+
+    // ── 4. Unmap: atomically stamp the complete same-root PTE batch. ──
     // SAFETY: every commit names the one validated root, unique aligned VAs,
     // and the expected frames resolved immediately above.
-    if unsafe { commit_swap_out_batch(root, &commits) }.is_err() {
-        backend.discard_batch(&slot_run);
+    if unsafe { commit_swap_out_batch(root, &mut commits) }.is_err() {
+        // Nothing was written or unmapped: no slot holds data.
         let mut swap = SWAP.lock();
         for slot in &slot_run {
             swap.free_slot(swap_type, slot.raw());
@@ -1183,26 +1283,86 @@ pub(crate) unsafe fn swap_out_batch_owned(
         return Err(SwapError::MapFailed);
     }
 
-    // Publish VMA/backing ownership while every old frame is still allocated.
-    // The AddressSpace transition table blocks concurrent teardown and faults
-    // until this callback changes Evicting -> Swapped.
-    publish(&resolved);
-
-    // ONE local + residency-filtered peer invalidation for the entire batch,
-    // before any old frame can return to the allocator. AddressSpace-owned
-    // callers supply its lifetime PCID; the raw compatibility entry point has
-    // no root→tag ownership proof and therefore takes the safe all-context
-    // fallback.
+    // ── 5. ONE local + residency-filtered peer invalidation for the entire
+    //       batch, BEFORE any victim is read for the backend: once it
+    //       returns, no CPU holds a translation through which it could store
+    //       to a victim, so the snapshot below cannot miss a store (Linux
+    //       `try_to_unmap_flush_dirty` before `pageout`). AddressSpace-owned
+    //       callers supply its lifetime PCID; the raw compatibility entry
+    //       point has no root→tag ownership proof and therefore takes the
+    //       safe all-context fallback. ──
     crate::tlb_shootdown::shootdown(context_tag.map_or_else(
         crate::tlb_shootdown::ShootdownRequest::full,
         crate::tlb_shootdown::ShootdownRequest::for_tag,
     ));
 
-    // ── 6. Only after the batch flush, free all evicted frames. ──
-    for (_, phys) in &resolved {
+    // Test seam: a pin, store or fault that arrives after the unmap, while
+    // the backend write is still pending.
+    #[cfg(feature = "kernel-test")]
+    {
+        let hook = AFTER_SWAP_COMMIT.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    // ── 6. One batched write of the now-unreachable frames to the chosen
+    //       area's backend. The frames stay allocated: only the owner's
+    //       metadata still names them, and it keeps them Evicting. ──
+    if let Err(e) = backend.write_batch(&slot_run, &frames) {
+        // The backend left no slot populated (its all-or-nothing contract).
+        // Put every victim's exact leaf back: the frames were never freed
+        // and still hold the data, so no CPU loses a store and no further
+        // shootdown is needed.
+        keep.fill(true);
+        // SAFETY: `commits` were committed under this root above and the
+        // owner still holds every victim's transition record.
+        unsafe { restore_swap_out_leaves(root, &commits, &keep) };
+        let mut swap = SWAP.lock();
+        for slot in &slot_run {
+            swap.free_slot(swap_type, slot.raw());
+        }
+        drop(swap);
+        swap_uncharge(n as u64);
+        return Err(e);
+    }
+
+    // ── 7. Publish VMA/backing ownership while every old frame is still
+    //       allocated. The owner's transition records keep faults waiting
+    //       and structural operations out until this callback changes
+    //       Evicting -> Swapped (a fault then reads the slot just written),
+    //       or refuses a victim a pin or a kernel write reached after
+    //       resolution. ──
+    publish(&resolved, &mut keep);
+
+    let kept = keep.iter().filter(|keep| **keep).count();
+    if kept != 0 {
+        // SAFETY: `commits` were committed under this root above and the
+        // owner still holds every refused victim's transition record.
+        unsafe { restore_swap_out_leaves(root, &commits, &keep) };
+        kept_slots.extend(
+            slot_run
+                .iter()
+                .zip(&keep)
+                .filter(|(_, keep)| **keep)
+                .map(|(slot, _)| *slot),
+        );
+        backend.discard_batch(&kept_slots);
+        let mut swap = SWAP.lock();
+        for slot in &kept_slots {
+            swap.free_slot(swap_type, slot.raw());
+        }
+        drop(swap);
+        swap_uncharge(kept as u64);
+    }
+
+    // ── 8. Free the evicted frames. The batch shootdown above already
+    //       retired every translation of them. A refused victim's frame
+    //       stays with its owner (and its pin). ──
+    for ((_, phys), _) in resolved.iter().zip(&keep).filter(|(_, keep)| !**keep) {
         crate::frame::free_frame(crate::frame::PhysFrame::new(*phys));
     }
-    let done = resolved.len();
+    let done = n - kept;
 
     {
         let mut swap = SWAP.lock();

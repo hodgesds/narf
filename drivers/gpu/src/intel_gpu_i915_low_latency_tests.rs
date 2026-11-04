@@ -121,6 +121,8 @@ fn pending(w: &Window) -> Vec<Vec<u32>> {
     }
     requests
 }
+/// Every default-priority i915 context registers at
+/// GUC_CLIENT_PRIORITY_KMD_NORMAL (map_i915_prio_to_guc_prio(0)).
 fn policy(w: &Window, hint: bool) -> bool {
     let mut seen = false;
     for request in pending(w) {
@@ -130,7 +132,7 @@ fn policy(w: &Window, hint: bool) -> bool {
                 &request[2..],
                 &[
                     0x20030001,
-                    3,
+                    2,
                     0x20010001,
                     1000,
                     0x20020001,
@@ -1274,3 +1276,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_i915_balance",
     smoke_i915_context_freq_hint_pending_capacity_and_failed_copyout_reclaim_slot
 );
+
+mod priority {
+    include!("intel_gpu_i915_priority_tests.rs");
+}

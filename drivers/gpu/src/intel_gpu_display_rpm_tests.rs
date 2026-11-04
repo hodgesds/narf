@@ -449,3 +449,103 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_power",
     smoke_display_rpm_hpd_poll_waits_one_period_per_detect
 );
+
+/// The panel's crtc disable reports Pipe A dark into this fixture's
+/// registry, as `ServicePipeDmc` does into the production one.
+struct RegistryDmc<'a>(&'a Registry);
+impl crate::intel_gpu_dc_states::PipeDmc for RegistryDmc<'_> {
+    fn enable_pipe(&self, pipe: u32) {
+        self.0.pipe_lit(BAR, pipe);
+    }
+    fn disable_pipe(&self, pipe: u32) {
+        self.0.pipe_dark(BAR, pipe);
+    }
+}
+
+/// The panel-off producer: the owned MTL modeset's crtc disable drops the
+/// lit panel's wakeref, the park admission then sees nothing lit and the
+/// function autosuspends one delay later. A runtime resume (a polled
+/// detect) brings the GT back with the panel still off. Lighting it again
+/// takes `intel_display_rpm_get` first (resume-and-get), then the lit pipe
+/// holds the function in D0 on its own.
+fn smoke_display_rpm_panel_off_parks_and_resume_keeps_the_panel_dark() -> TestResult {
+    use crate::intel_gpu_aux::MmioWindow as _;
+    use crate::intel_gpu_modeset::{Framebuffer, Mode, PixelFormat};
+    use crate::intel_gpu_modeset_xelpg::tests::MtlFake;
+    use crate::intel_gpu_modeset_xelpg::{forget_panel_off, panel_off_record, XeLpgModeset};
+    use crate::intel_gpu_xelpg::XeLpgPort;
+    let f = Fixture::new(true);
+    let dmc = RegistryDmc(&f.registry);
+    let fake = MtlFake::new(XeLpgPort::A);
+    fake.model_panel_power();
+    forget_panel_off();
+    let fb = Framebuffer {
+        phys_addr: 0x100_0000,
+        stride_bytes: 1024 * 4,
+        format: PixelFormat::Xrgb8888,
+    };
+    let mode = Mode::VESA_1024X768_60;
+    if XeLpgModeset::new(&fake, XeLpgPort::A)
+        .with_pipe_dmc(&dmc)
+        .modeset_fixed(&fb, &mode)
+        != Ok(mode)
+    {
+        return TestResult::Fail("the panel must light");
+    }
+    assert_eq!(f.usage(), 1, "the lit panel holds exactly one wakeref");
+    let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_pipe_dmc(&dmc);
+    if ms.disable_planes().is_err() || ms.panel_off().is_err() {
+        return TestResult::Fail("the panel must turn off");
+    }
+    assert_eq!(f.usage(), 0, "the dark panel must give its wakeref back");
+    assert_eq!(f.registry.lit(BAR), 0);
+    assert_eq!(
+        park_refusal(
+            false,
+            true,
+            Ok(Profile::Display),
+            None,
+            classify(Facts {
+                lit: f.registry.lit(BAR),
+                ..Facts::default()
+            })
+        ),
+        None,
+        "the park admission must see nothing lit"
+    );
+    f.after(1000);
+    assert_eq!(f.status(), RpmStatus::Suspended);
+    assert_eq!(f.owner.parks.load(Ordering::Relaxed), 1);
+    // A polled detect resumes the function; the panel stays off.
+    run(f.node.device.resume_and_get()).unwrap();
+    assert_eq!(f.owner.resumes.load(Ordering::Relaxed), 1);
+    assert!(panel_off_record().is_some());
+    assert_eq!(f.registry.lit(BAR), 0);
+    assert_eq!(fake.read32(0x70008) & (1 << 31), 0);
+    f.node.device.put_autosuspend().unwrap();
+    f.after(1000);
+    assert_eq!(f.status(), RpmStatus::Suspended);
+    // A KMS commit lighting it again resumes first, then the lit pipe holds
+    // the function by itself.
+    let wakeref = run(f.registry.wakeref_resume(BAR)).unwrap().unwrap();
+    assert_eq!(f.status(), RpmStatus::Active);
+    if XeLpgModeset::new(&fake, XeLpgPort::A)
+        .with_pipe_dmc(&dmc)
+        .modeset_fixed(&fb, &mode)
+        != Ok(mode)
+    {
+        return TestResult::Fail("the panel must light again");
+    }
+    drop(wakeref);
+    assert_eq!(f.usage(), 1);
+    f.after(60_000);
+    assert_eq!(f.status(), RpmStatus::Active);
+    assert_eq!(f.owner.parks.load(Ordering::Relaxed), 2);
+    assert!(panel_off_record().is_none());
+    forget_panel_off();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_power",
+    smoke_display_rpm_panel_off_parks_and_resume_keeps_the_panel_dark
+);

@@ -50,6 +50,7 @@ fn external(pipe: Pipe) -> ExternalPipe {
         port_clock_khz: 270_000,
         combo_phy: Some(1),
         dsc: None,
+        pipe_bpp: 24,
     }
 }
 

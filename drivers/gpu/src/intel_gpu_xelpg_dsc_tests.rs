@@ -75,9 +75,11 @@ fn e1_plan() -> DscPlan {
     match decide_edp(
         &edp_caps(0x14, 2, 0x05, E1_DSC),
         &EdpVbt::Missing,
+        0,
         &e1_mode(),
+        false,
     ) {
-        Ok(EdpDecision::Dsc(plan)) => plan,
+        Ok(LinkDecision::Dsc(plan)) => plan,
         other => panic!("E1 must compress: {other:?}"),
     }
 }
@@ -308,9 +310,11 @@ fn smoke_xelpg_dsc_edp_single_slice_dsc11_matches_linux() -> TestResult {
     let plan = match decide_edp(
         &edp_caps(0x06, 1, 0x03, E2_DSC),
         &EdpVbt::Missing,
+        0,
         &e2_mode(),
+        false,
     ) {
-        Ok(EdpDecision::Dsc(plan)) => plan,
+        Ok(LinkDecision::Dsc(plan)) => plan,
         _ => return TestResult::Fail("E2 must compress"),
     };
     if (
@@ -428,8 +432,8 @@ fn smoke_xelpg_dsc_dp_fec_config_matches_linux() -> TestResult {
     // kBps and 18 bpp 2430000, HBR3 x2 carries 1620000. DP DSC enables FEC;
     // the highest bpp that fits with its 1028530 ppm overhead is 186/16.
     let limits = LinkLimits::standard(810_000, 2);
-    let plan = match decide_dp(&d1_sink(true, false), &limits, &d1_mode()) {
-        Ok(Some(plan)) => plan,
+    let plan = match decide_dp(&d1_sink(true, false), &limits, &d1_mode(), PIPE_BPP) {
+        Ok(LinkDecision::Dsc(plan)) => plan,
         _ => return TestResult::Fail("D1 must compress"),
     };
     if (
@@ -513,26 +517,38 @@ fn smoke_xelpg_dsc_edp_decision_and_refusals() -> TestResult {
     let with = |f: fn(&mut [u8; 16])| {
         let mut d = E1_DSC;
         f(&mut d);
-        decide_edp(&edp_caps(0x14, 2, 0x05, d), &vbt, &m)
+        decide_edp(&edp_caps(0x14, 2, 0x05, d), &vbt, 0, &m, false)
     };
     let cases: [(
-        Result<EdpDecision, DscRefusal>,
-        Result<EdpDecision, DscRefusal>,
+        Result<LinkDecision, DscRefusal>,
+        Result<LinkDecision, DscRefusal>,
     ); 9] = [
-        // An eDP 1.3 panel never reads DSC caps: the unchanged path.
+        // An eDP 1.3 panel never reads DSC caps: HBR2 x2 carries neither
+        // 24 nor 18 bpp, so Linux refuses ("DSC required but not
+        // available").
         (
-            decide_edp(&edp_caps(0x14, 2, 0x02, E1_DSC), &vbt, &m),
-            Ok(EdpDecision::NotCapable),
+            decide_edp(&edp_caps(0x14, 2, 0x02, E1_DSC), &vbt, 0, &m, false),
+            Err(DscRefusal::SinkUnsupported),
         ),
-        // HBR3 x4 carries 24 bpp.
+        // HBR3 x4 carries 24 bpp; the lowest rate that does is HBR2 x4
+        // (1950048 <= 2160000 kBps).
         (
-            decide_edp(&edp_caps(0x1e, 4, 0x05, E1_DSC), &vbt, &m),
-            Ok(EdpDecision::Uncompressed),
+            decide_edp(&edp_caps(0x1e, 4, 0x05, E1_DSC), &vbt, 0, &m, false),
+            Ok(LinkDecision::Uncompressed(UncompressedLink {
+                pipe_bpp: 24,
+                link_rate: 540_000,
+                lanes: 4,
+            })),
         ),
-        // HBR3 x2 carries 18 bpp (1462536 <= 1620000): Linux's 6 bpc.
+        // HBR3 x2 carries 18 bpp (1462536 <= 1620000): Linux's 6 bpc,
+        // tried before DSC.
         (
-            decide_edp(&edp_caps(0x1e, 2, 0x05, E1_DSC), &vbt, &m),
-            Err(DscRefusal::SixBpcUnqualified),
+            decide_edp(&edp_caps(0x1e, 2, 0x05, E1_DSC), &vbt, 0, &m, false),
+            Ok(LinkDecision::Uncompressed(UncompressedLink {
+                pipe_bpp: 18,
+                link_rate: 810_000,
+                lanes: 2,
+            })),
         ),
         (
             decide_edp(
@@ -540,13 +556,22 @@ fn smoke_xelpg_dsc_edp_decision_and_refusals() -> TestResult {
                 &EdpVbt::Panel {
                     dsc_disable: true,
                     max_link_rate: 0,
+                    bpp: 0,
                 },
+                0,
                 &m,
+                false,
             ),
             Err(DscRefusal::VbtDisabled),
         ),
         (
-            decide_edp(&edp_caps(0x14, 2, 0x05, E1_DSC), &EdpVbt::PanelByPnpId, &m),
+            decide_edp(
+                &edp_caps(0x14, 2, 0x05, E1_DSC),
+                &EdpVbt::PanelByPnpId,
+                0,
+                &m,
+                false,
+            ),
             Err(DscRefusal::VbtPanelUnknown),
         ),
         // eDP 1.5 eight slices: beyond two engines.
@@ -574,23 +599,26 @@ fn smoke_xelpg_dsc_edp_decision_and_refusals() -> TestResult {
         &EdpVbt::Panel {
             dsc_disable: false,
             max_link_rate: 540_000,
+            bpp: 0,
         },
+        0,
         &m,
+        false,
     );
-    if capped != Ok(EdpDecision::Dsc(e1_plan())) {
+    if capped != Ok(LinkDecision::Dsc(e1_plan())) {
         return TestResult::Fail("the VBT eDP rate must cap the link");
     }
     // A link-rate table: 1.62/2.7/5.4 behaves as MAX_LINK_RATE HBR2; a
     // table topping at 4.32 Gbps is unqualified for DSC.
     let mut table = edp_caps(0x00, 2, 0x05, E1_DSC);
     table.link_rates[..3].copy_from_slice(&[8100, 13500, 27000]);
-    if decide_edp(&table, &vbt, &m) != Ok(EdpDecision::Dsc(e1_plan())) {
+    if decide_edp(&table, &vbt, 0, &m, false) != Ok(LinkDecision::Dsc(e1_plan())) {
         return TestResult::Fail("a standard rate table must compress like HBR2");
     }
     table.link_rates[..6].copy_from_slice(&[8100, 10800, 12150, 13500, 16200, 21600]);
     let l = table.limits(0);
     if l.rates[..7] != [162_000, 216_000, 243_000, 270_000, 324_000, 432_000, 0]
-        || decide_edp(&table, &vbt, &m) != Err(DscRefusal::LinkRateUnqualified)
+        || decide_edp(&table, &vbt, 0, &m, false) != Err(DscRefusal::LinkRateUnqualified)
     {
         return TestResult::Fail("an intermediate maximum rate must refuse");
     }
@@ -615,28 +643,37 @@ fn smoke_xelpg_dsc_dp_decision_and_refusals() -> TestResult {
                 &d1_sink(true, false),
                 &LinkLimits::standard(540_000, 4),
                 &uhd60,
+                PIPE_BPP,
             ),
-            Ok(None),
+            Ok(LinkDecision::Uncompressed(UncompressedLink {
+                pipe_bpp: 24,
+                link_rate: 540_000,
+                lanes: 4,
+            })),
         ),
-        // 4K60 on HBR3 x2: 18 bpp fits (1336500 kBps).
+        // 4K60 on HBR3 x2: 18 bpp fits (1336500 kBps), before DSC.
         (
-            decide_dp(&d1_sink(true, false), &hbr3x2, &uhd60),
-            Err(DscRefusal::SixBpcUnqualified),
+            decide_dp(&d1_sink(true, false), &hbr3x2, &uhd60, PIPE_BPP),
+            Ok(LinkDecision::Uncompressed(UncompressedLink {
+                pipe_bpp: 18,
+                link_rate: 810_000,
+                lanes: 2,
+            })),
         ),
         (
-            decide_dp(&d1_sink(false, false), &hbr3x2, &d1_mode()),
+            decide_dp(&d1_sink(false, false), &hbr3x2, &d1_mode(), PIPE_BPP),
             Err(DscRefusal::FecUnsupported),
         ),
         (
-            decide_dp(&d1_sink(true, true), &hbr3x2, &d1_mode()),
+            decide_dp(&d1_sink(true, true), &hbr3x2, &d1_mode(), PIPE_BPP),
             Err(DscRefusal::BranchDevice),
         ),
         (
-            decide_dp(&no_dsc, &hbr3x2, &d1_mode()),
+            decide_dp(&no_dsc, &hbr3x2, &d1_mode(), PIPE_BPP),
             Err(DscRefusal::SinkUnsupported),
         ),
         (
-            decide_dp(&no_width, &hbr3x2, &d1_mode()),
+            decide_dp(&no_width, &hbr3x2, &d1_mode(), PIPE_BPP),
             Err(DscRefusal::NoSliceCount),
         ),
     ];
@@ -648,6 +685,7 @@ fn smoke_xelpg_dsc_dp_decision_and_refusals() -> TestResult {
         &d1_sink(true, false),
         &LinkLimits::standard(540_000, 2),
         &d1_mode(),
+        PIPE_BPP,
     ) != Err(DscRefusal::NoLinkConfig)
     {
         return TestResult::Fail("no bpp fitting any link must refuse");
@@ -657,6 +695,214 @@ fn smoke_xelpg_dsc_dp_decision_and_refusals() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_dsc",
     smoke_xelpg_dsc_dp_decision_and_refusals
+);
+
+/// A base EDID block: revision 1.`rev`, video input byte `input`, panel
+/// `vendor` / `product`.
+fn edid_block(rev: u8, input: u8, vendor: &[u8; 3], product: u16) -> [u8; 128] {
+    let mut e = [0u8; 128];
+    e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    let mfr = (u16::from(vendor[0] - b'@') << 10)
+        | (u16::from(vendor[1] - b'@') << 5)
+        | u16::from(vendor[2] - b'@');
+    e[8] = (mfr >> 8) as u8;
+    e[9] = mfr as u8;
+    e[10] = product as u8;
+    e[11] = (product >> 8) as u8;
+    e[18] = 1;
+    e[19] = rev;
+    e[20] = input;
+    e
+}
+
+fn smoke_xelpg_dsc_edid_bpc_follows_update_display_info() -> TestResult {
+    // drm_edid.c update_display_info: below 1.3 or analog, 0; 1.3 digital
+    // DFP 1.x, 8; 1.4 the depth field (1 => 6 .. 6 => 16, 0/7 => 0);
+    // then the edid_quirk_list bpc entries by panel ID.
+    let cases = [
+        (edid_block(2, 0x90, b"NAR", 0), 0),
+        (edid_block(4, 0x10, b"NAR", 0), 0),
+        (edid_block(3, 0x81, b"NAR", 0), 8),
+        (edid_block(3, 0x80, b"NAR", 0), 0),
+        (edid_block(4, 0x81, b"NAR", 0), 0),
+        (edid_block(4, 0x90, b"NAR", 0), 6),
+        (edid_block(4, 0xa5, b"NAR", 0), 8),
+        (edid_block(4, 0xb0, b"NAR", 0), 10),
+        (edid_block(4, 0xc0, b"NAR", 0), 12),
+        (edid_block(4, 0xe0, b"NAR", 0), 16),
+        (edid_block(4, 0xf0, b"NAR", 0), 0),
+        // BOE 0x0771 reports 8 bpc but is a 6 bpc panel.
+        (edid_block(4, 0xa0, b"BOE", 0x0771), 6),
+        // AEO model 0, even without a digital depth.
+        (edid_block(4, 0x00, b"AEO", 0), 6),
+        // The Samsung NP700G7A panel reports 6 bpc; FORCE_8BPC.
+        (edid_block(4, 0x90, b"SEC", 0xd033), 8),
+        // LGD 764 reports no bpc: FORCE_10BPC.
+        (edid_block(4, 0x80, b"LGD", 764), 10),
+        // A neighbouring product ID is not a quirk.
+        (edid_block(4, 0xa0, b"BOE", 0x0772), 8),
+    ];
+    for (edid, want) in cases {
+        if edid_display_bpc(&edid) != want {
+            return TestResult::Fail("display_info.bpc must follow update_display_info");
+        }
+    }
+    if edid_display_bpc(&[0u8; 16]) != 0 {
+        return TestResult::Fail("a truncated EDID has no bpc");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_dsc",
+    smoke_xelpg_dsc_edid_bpc_follows_update_display_info
+);
+
+fn smoke_xelpg_dsc_six_bpc_pipe_bpp_and_register_values() -> TestResult {
+    // compute_sink_pipe_bpp with max bpc 8, then intel_dp_max_bpp's VBT
+    // clamp, which applies only when the EDID has no bpc.
+    let max_cases = [
+        ((0, 0), 24),
+        ((6, 0), 18),
+        ((7, 0), 18),
+        ((8, 0), 24),
+        ((10, 0), 24),
+        ((0, 18), 18),
+        ((0, 24), 24),
+        ((0, 30), 24),
+        ((8, 18), 24),
+        ((6, 30), 18),
+    ];
+    for ((bpc, vbt), want) in max_cases {
+        if max_pipe_bpp(bpc, vbt) != want {
+            return TestResult::Fail("the pipe maximum must follow intel_dp_max_bpp");
+        }
+    }
+    // 1024x768@60 (65 MHz): 24 bpp needs 195000 kBps, 18 bpp 146250. One
+    // RBR lane (162000) carries only 18; two carry 24.
+    let m = mode(65_000, 1024, 1344, 768, 806);
+    let link = |max_rate, lanes, max_bpp| {
+        uncompressed_link(&LinkLimits::standard(max_rate, lanes), &m, max_bpp)
+    };
+    let want = |pipe_bpp, link_rate, lanes| {
+        Some(UncompressedLink {
+            pipe_bpp,
+            link_rate,
+            lanes,
+        })
+    };
+    if link(162_000, 1, 24) != want(18, 162_000, 1)
+        || link(162_000, 2, 24) != want(24, 162_000, 2)
+        // A 6 bpc sink stays at 18 on the slowest, narrowest link.
+        || link(810_000, 4, 18) != want(18, 162_000, 1)
+        // Slow and wide: the lowest rate wins over fewer lanes.
+        || link(540_000, 4, 24) != want(24, 162_000, 2)
+        || link(162_000, 1, 18).is_none()
+    {
+        return TestResult::Fail("the link must follow intel_dp_compute_link_config_wide");
+    }
+    // use_max_params: only the maximum rate and lane count.
+    let mut max = LinkLimits::standard(540_000, 4);
+    max.use_max = true;
+    if uncompressed_link(&max, &m, 24) != want(24, 540_000, 4) {
+        return TestResult::Fail("use_max_params must take the maximum link");
+    }
+    // bdw_set_pipe_misc: BPC_8 | TRUNC, or BPC_6 | DITHER_ENABLE | TRUNC.
+    if pipe_misc(24) != 0x100
+        || pipe_misc(18) != 0x150
+        || trans_ddi_bpc(24) != 0
+        || trans_ddi_bpc(18) != 2 << 20
+        || msa_misc(24) != 0x21
+        || msa_misc(18) != 0x01
+    {
+        return TestResult::Fail("PIPE_MISC, TRANS_DDI BPC and MSA must follow Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_dsc",
+    smoke_xelpg_dsc_six_bpc_pipe_bpp_and_register_values
+);
+
+fn smoke_xelpg_dsc_edp_vbt_bpp_clamp_rate_table_and_fixup() -> TestResult {
+    // 1024x768@60 on an eDP 1.4 panel at HBR2 x4: 24 bpp fits easily.
+    let m = mode(65_000, 1024, 1344, 768, 806);
+    let mut caps = edp_caps(0x14, 4, 0x03, [0; 16]);
+    let vbt18 = EdpVbt::Panel {
+        dsc_disable: false,
+        max_link_rate: 0,
+        bpp: 18,
+    };
+    let decide = |caps: &EdpCaps, vbt: &EdpVbt, bpc| decide_edp(caps, vbt, bpc, &m, false);
+    let uncompressed = |pipe_bpp, link_rate, lanes| {
+        Ok(LinkDecision::Uncompressed(UncompressedLink {
+            pipe_bpp,
+            link_rate,
+            lanes,
+        }))
+    };
+    // The VBT's 18 bpp clamps a panel whose EDID has no bpc, even where 24
+    // would fit; an EDID bpc overrides the VBT.
+    if decide(&caps, &vbt18, 0) != uncompressed(18, 162_000, 1)
+        || decide(&caps, &vbt18, 8) != uncompressed(24, 162_000, 2)
+        || decide(&caps, &EdpVbt::Missing, 6) != uncompressed(18, 162_000, 1)
+        || decide(&caps, &EdpVbt::Missing, 0) != uncompressed(24, 162_000, 2)
+    {
+        return TestResult::Fail("the eDP pipe bpp must follow intel_dp_max_bpp");
+    }
+    // An eDP 1.3 panel uses its maximum parameters.
+    let old = edp_caps(0x14, 4, 0x02, [0; 16]);
+    if decide(&old, &EdpVbt::Missing, 0) != uncompressed(24, 540_000, 4)
+        || !old.limits(0).use_max
+        || caps.limits(0).use_max
+    {
+        return TestResult::Fail("eDP below 1.4 must take use_max_params");
+    }
+    // A rate table (DP_MAX_LINK_RATE 0): 1.62/2.16/2.43/2.7 Gbps on two
+    // lanes. 24 bpp at 140 MHz needs 420000 kBps: 2.16 Gbps x2 (432000).
+    caps = edp_caps(0x00, 2, 0x03, [0; 16]);
+    caps.link_rates[..4].copy_from_slice(&[8100, 10800, 12150, 13500]);
+    let m140 = mode(140_000, 1024, 1344, 768, 806);
+    if !caps.has_rate_table()
+        || caps.sink_rates() != ([162_000, 216_000, 243_000, 270_000, 0, 0, 0, 0], 4)
+        || decide_edp(&caps, &EdpVbt::Missing, 0, &m140, false) != uncompressed(24, 216_000, 2)
+        || caps.rate_select(216_000) != Some(1)
+        || caps.rate_select(540_000).is_some()
+        || edp_caps(0x14, 4, 0x03, [0; 16])
+            .rate_select(540_000)
+            .is_some()
+    {
+        return TestResult::Fail("a rate table must select by intel_dp_rate_select");
+    }
+    // Invalid DPCD: no rates and a lane count of 3 take Linux's RBR x1.
+    let invalid = edp_caps(0x00, 3, 0x03, [0; 16]);
+    let l = invalid.limits(0);
+    if l.rates[..2] != [162_000, 0] || l.max_lanes != 1 {
+        return TestResult::Fail("an invalid DPCD must take Linux's defaults");
+    }
+    // intel_edp_fixup_vbt_bpp: a lit 24 bpp pipe raises the VBT's 18; a
+    // lower pipe bpp or a VBT without bpp is left alone.
+    let previous = installed_edp_vbt();
+    install_edp_vbt(vbt18);
+    fixup_vbt_bpp(18);
+    let kept = installed_edp_vbt().edp_bpp();
+    fixup_vbt_bpp(24);
+    let raised = installed_edp_vbt().edp_bpp();
+    install_edp_vbt(EdpVbt::Panel {
+        dsc_disable: false,
+        max_link_rate: 0,
+        bpp: 0,
+    });
+    fixup_vbt_bpp(24);
+    let none = installed_edp_vbt().edp_bpp();
+    install_edp_vbt(previous);
+    if (kept, raised, none) != (18, 24, 0) {
+        return TestResult::Fail("the VBT bpp must follow intel_edp_fixup_vbt_bpp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_dsc",
+    smoke_xelpg_dsc_edp_vbt_bpp_clamp_rate_table_and_fixup
 );
 
 /// A register file that logs every write.

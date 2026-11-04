@@ -249,6 +249,180 @@ kernel_test_in!(
     smoke_intel_cpu_mapping_cpu_bar_census_retains_local_allocation
 );
 
+/// The VM owner substituted for the window-revocation smoke: exactly the
+/// address spaces the test names.
+static REVOCATION_SPACES: IrqSafeSpinLock<Vec<Arc<AddressSpace>>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn revoke_named_spaces(
+    start: u64,
+    len: u64,
+    census: narf_filesystem::mmap_relocation::DeviceAliasCensus,
+    refault: Arc<dyn narf_filesystem::mmap_relocation::DeviceFrameRefault>,
+) -> Result<narf_filesystem::mmap_relocation::DeviceFrameRevocation, FsError> {
+    let spaces = REVOCATION_SPACES.lock().clone();
+    // SAFETY: the fixture owns the fake aperture for the handle's lifetime
+    // and every named root is a live, never-activated fixture root.
+    unsafe {
+        narf_memory::address_space::revoke_device_frames(
+            &spaces,
+            PhysAddr::new(start),
+            len,
+            census,
+            refault,
+        )
+    }
+    .map_err(|_| FsError::Busy)
+}
+
+struct NoRefault;
+impl narf_filesystem::mmap_relocation::DeviceFrameRefault for NoRefault {
+    fn refault(&self, _: PhysAddr) -> narf_filesystem::mmap_relocation::DeviceRefaultFuture {
+        alloc::boxed::Box::pin(async {
+            Err(narf_filesystem::mmap_relocation::DeviceRefaultError::Bus)
+        })
+    }
+}
+
+fn leaf(space: &AddressSpace, va: u64) -> Option<PhysAddr> {
+    // SAFETY: a fixture-owned live root, not concurrently mutated.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            narf_memory::x86_64::paging::translate(space.root, VirtAddr::new(va))
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            narf_memory::aarch64::paging::translate(space.root, VirtAddr::new(va))
+        }
+    }
+}
+
+/// Runtime suspend with VRAM mapped (xe_pm_runtime_suspend): closing the
+/// pool refuses kernel BAR copies and is itself refused while one is in
+/// flight; the window revocation is refused while an alias outside the
+/// snapshot exists, then removes every user leaf of the BAR window, keeps
+/// the alias census, and leaves a mapping made meanwhile unmapped. Ending it
+/// lets the fault map the same BAR frame and reopens kernel access.
+fn smoke_intel_vram_runtime_suspend_revokes_bar_mappings_and_gates_copies() -> TestResult {
+    use crate::intel_gpu_vram::{Vram, VramLayout};
+    let frame = match narf_memory::frame::alloc_pages_on(0, 4) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("64 KiB fixture allocation"),
+    };
+    // SAFETY: paging is live; the fixture exclusively owns never-activated roots.
+    let spaces = match unsafe {
+        (
+            AddressSpace::new_for_user(),
+            AddressSpace::new_for_user(),
+            AddressSpace::new_for_user(),
+        )
+    } {
+        (Ok(a), Ok(b), Ok(c)) => [Arc::new(a), Arc::new(b), Arc::new(c)],
+        _ => {
+            narf_memory::frame::free_pages(frame, 4);
+            return TestResult::Skip("address-space allocation");
+        }
+    };
+    let bar = narf_bus::bar::MmioRegion {
+        phys: frame.start_address(),
+        virt: frame.start_address().kernel_mut_ptr::<u8>() as u64,
+        len: 65536,
+        kind: narf_bus::bar::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: private fixture RAM stands in for one exclusively owned BAR.
+    let pool = unsafe {
+        Vram::new(
+            bar,
+            VramLayout {
+                tile_size: 65536,
+                tile_offset: 0,
+                usable: 65536,
+            },
+        )
+    }
+    .unwrap();
+    assert_eq!(pool.cpu_window(), (bar.phys.raw(), 65536));
+    let gem = GemState::new();
+    let pending = gem.prepare_vram(65536, None, &pool).unwrap();
+    let object = pending.object();
+    let mut clear = object.begin_cpu_vram_clear().unwrap();
+    // SAFETY: test-owned RAM is not hardware and outlives clear and every BO.
+    let fence = unsafe { clear.clear_next() }.unwrap();
+    drop(clear);
+    let handle = gem.publish_vram(pending, &fence, |_, _| Ok(())).unwrap();
+    let mapping = object.backing(0, 4096).unwrap();
+    let phys = mapping.frames[0];
+    const VA: u64 = 0x4102_0000_0000;
+    map(&spaces[0], VA, &mapping.frames, mapping.memory_type);
+    map(&spaces[1], VA, &mapping.frames, mapping.memory_type);
+    published(mapping.lifetime.as_ref());
+    assert_eq!(aliases(phys), 2);
+    assert_eq!(leaf(&spaces[0], VA), Some(PhysAddr::new(phys)));
+
+    // Kernel BAR copies run while the pool is open; one in flight refuses
+    // the close; a closed pool refuses copies without touching the BAR.
+    object.write(0, &[0x5a]).unwrap();
+    let in_flight = pool.cpu_access().unwrap();
+    assert!(!pool.close_cpu_access());
+    drop(in_flight);
+    assert!(pool.close_cpu_access());
+    let mut byte = [0u8];
+    assert_eq!(object.read(0, &mut byte), Err(FsError::Busy));
+    assert_eq!(object.write(0, &[0xa5]), Err(FsError::Busy));
+    assert!(pool.cpu_access().is_none());
+
+    let previous = narf_filesystem::mmap_relocation::replace_revocation(Some(revoke_named_spaces));
+    let (start, len) = pool.cpu_window();
+    // spaces[1] is outside the snapshot: refused, every leaf intact.
+    *REVOCATION_SPACES.lock() = alloc::vec![spaces[0].clone()];
+    assert_eq!(
+        revoke_window(start, len, Arc::new(NoRefault)).err(),
+        Some(FsError::Busy)
+    );
+    assert_eq!(leaf(&spaces[0], VA), Some(PhysAddr::new(phys)));
+    assert_eq!(leaf(&spaces[1], VA), Some(PhysAddr::new(phys)));
+    *REVOCATION_SPACES.lock() = alloc::vec![spaces[0].clone(), spaces[1].clone()];
+    let revocation = revoke_window(start, len, Arc::new(NoRefault)).unwrap();
+    narf_filesystem::mmap_relocation::replace_revocation(previous);
+    assert_eq!(leaf(&spaces[0], VA), None);
+    assert_eq!(leaf(&spaces[1], VA), None);
+    assert_eq!(aliases(phys), 2);
+    assert!(narf_memory::address_space::is_device_frame_revoked(
+        PhysAddr::new(phys)
+    ));
+    // A mapping made while suspended stays unmapped until a fault.
+    map(&spaces[2], VA, &mapping.frames, mapping.memory_type);
+    assert_eq!(aliases(phys), 3);
+    assert_eq!(leaf(&spaces[2], VA), None);
+
+    // Resume: end the revocation, reopen kernel access; a fault maps the
+    // same BAR frame and copies see the bytes written before suspend.
+    drop(revocation);
+    pool.open_cpu_access();
+    // SAFETY: the fixture's live root; the ordinary demand-fault path.
+    unsafe { spaces[2].demand_alloc_page(VirtAddr::new(VA)) }.unwrap();
+    assert_eq!(leaf(&spaces[2], VA), Some(PhysAddr::new(phys)));
+    object.read(0, &mut byte).unwrap();
+    assert_eq!(byte, [0x5a]);
+
+    REVOCATION_SPACES.lock().clear();
+    drop(spaces);
+    gem.close(handle).unwrap();
+    drop(mapping);
+    let weak = Arc::downgrade(&object);
+    drop(object);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(pool.used(), 0);
+    drop(pool);
+    narf_memory::frame::free_pages(frame, 4);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gem",
+    smoke_intel_vram_runtime_suspend_revokes_bar_mappings_and_gates_copies
+);
+
 #[cfg(feature = "amdgpu")]
 fn smoke_intel_and_amd_cpu_alias_providers_coexist_without_cross_release() -> TestResult {
     let amd = crate::amdgpu_gem::GemState::for_card(0xfee9);
@@ -256,7 +430,7 @@ fn smoke_intel_and_amd_cpu_alias_providers_coexist_without_cross_release() -> Te
     let (handle, _) = amd.create_kernel_system(PAGE, &gate).unwrap();
     drop(gate);
     let a = amd
-        .mmap_backing(u64::from(handle) << 12, PAGE as usize)
+        .mmap_backing(crate::amdgpu_gem::mmap_offset(handle), PAGE as usize)
         .unwrap();
     let intel = GemState::new();
     let (_, object) = create(&intel, 1);
