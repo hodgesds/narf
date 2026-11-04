@@ -157,7 +157,13 @@ impl Source for Hardware {
                 output.fill(255);
                 output[0x69..0x6e].copy_from_slice(&[255, (self.cut << 4) | 15, 255, 255, 255]);
             }
-            _ => panic!("incomplete physical factory read"),
+            // RTL8852C reads its whole PHY-cap window 0x590..0x5f0 instead;
+            // 0x5e9..0x5ee sits at offset 0x59.
+            (0x590, 0x60) => {
+                output.fill(255);
+                output[0x59..0x5e].copy_from_slice(&[255, (self.cut << 4) | 15, 255, 255, 255]);
+            }
+            _ => return Err(Error::Access),
         };
         Ok(())
     }

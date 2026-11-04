@@ -448,14 +448,17 @@ kernel_test_in!(
 fn smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently() -> TestResult {
     let p = htt::tx::Parameters {
         kind: htt::tx::Kind::Ethernet,
-        vdev: 1,
+        // The fixture boots only vdev 0; the orphan path keys on the MSDU id.
+        vdev: 0,
         tid: 16,
         hardware_crypto: false,
     };
     let frame = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 8, 0];
     let mut r = htt_boot(HwRev::Qca6174, Dialect::Tlv, 4, 3, false);
     assert!(matches!(once(r.start()), Poll::Ready(Ok(_))));
-    assert_eq!(once(r.transmit(p, &frame)), Poll::Ready(Ok(0)));
+    if once(r.transmit(p, &frame)) != Poll::Ready(Ok(0)) {
+        return TestResult::Fail("orphan test HTT transmit did not allocate MSDU id 0");
+    }
     if r.orphan_tx(0).is_err()
         || r.complete_tx(&[7, 0, 1, 0, 0, 0]) != Ok(0)
         || r.wmi.htc.transport.storage.as_ref().unwrap().tx.pending() != 0
@@ -465,14 +468,18 @@ fn smoke_ath10k_htt_orphaned_tx_completion_frees_dma_silently() -> TestResult {
     }
     // Completed before the owner was dropped: the queued receipt goes now
     // and a later reuse of the id is delivered normally.
-    assert_eq!(once(r.transmit(p, &frame)), Poll::Ready(Ok(1)));
+    if once(r.transmit(p, &frame)) != Poll::Ready(Ok(1)) {
+        return TestResult::Fail("orphan test HTT transmit did not allocate MSDU id 1");
+    }
     if r.complete_tx(&[7, 0, 1, 0, 1, 0]) != Ok(0)
         || r.orphan_tx(1).is_err()
         || r.take_tx_receipt().is_some()
     {
         return TestResult::Fail("queued receipt of a dropped owner was delivered");
     }
-    assert_eq!(once(r.transmit(p, &frame)), Poll::Ready(Ok(2)));
+    if once(r.transmit(p, &frame)) != Poll::Ready(Ok(2)) {
+        return TestResult::Fail("orphan test HTT transmit did not allocate MSDU id 2");
+    }
     if r.complete_tx(&[7, 0, 1, 0, 2, 0]) != Ok(0)
         || r.take_tx_receipt().map(|receipt| receipt.id) != Some(2)
     {

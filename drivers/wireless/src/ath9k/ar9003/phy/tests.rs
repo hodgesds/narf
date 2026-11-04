@@ -348,7 +348,7 @@ fn smoke_ath9k_ar9300_expected_preparation_matches_prepare() -> TestResult {
             return TestResult::Fail("AR9300 expected preparation differs from prepare");
         }
     }
-    if expected(&revision, &id, &image, 2467, 0xe0, 0) != Err(BringUpError::Policy) {
+    if expected(&revision, &id, &image, 2465, 0xe0, 0) != Err(BringUpError::Policy) {
         return TestResult::Fail("AR9300 expected preparation admitted an off-raster channel");
     }
     TestResult::Pass

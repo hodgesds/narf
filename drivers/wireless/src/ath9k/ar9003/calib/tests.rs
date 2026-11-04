@@ -282,7 +282,9 @@ fn smoke_ath9k_ar9300_calibration_refusals() -> TestResult {
     {
         return TestResult::Fail("AR9300 AGC timeout not handled as Linux");
     }
-    if iq_coefficients(0, 16000, 1).is_some()
+    // Linux skips the update only when a denominator is zero:
+    // (0/2 + 63/2) / 256 == 0.
+    if iq_coefficients(0, 63, 1).is_some()
         || iq_coefficients(u32::MAX, 64, 0x8000_0000) != Some((65, 65))
     {
         return TestResult::Fail("AR9300 IQ arithmetic boundary differs");
