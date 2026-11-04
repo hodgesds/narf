@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod attach;
+pub mod ax88179;
 mod boot_root;
 pub mod btusb;
 mod btusb_bcm;
@@ -110,6 +111,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "usb-r8152", || {
         r8152::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-ax88179", || {
+        ax88179::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-cdc-ncm", || {
@@ -235,6 +240,10 @@ pub fn register_initcalls() {
     // as keyboard and mouse. Removed cleanly per the no-shims rule.
     narf_init::register(Stage::Subsys, "usb-r8152", || {
         r8152::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-ax88179", || {
+        ax88179::register();
         InitResult::Ok
     });
 }
