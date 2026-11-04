@@ -20,7 +20,7 @@ impl Kms {
             return false;
         };
         let connector = &mut self.connectors[index];
-        if connector.port.signal != Signal::Hdmi {
+        if !color_settable(connector.port.signal, request.colorspace, hdr.is_some()) {
             return false;
         }
         let next = OutputSettings {
@@ -44,7 +44,9 @@ impl Kms {
             return false;
         };
         let c = &mut self.connectors[index];
-        if c.port.signal != Signal::Hdmi || c.output.max_bpc == bpc {
+        // amdgpu_dm attaches "max bpc" to every non-MST connector. A DP
+        // stream is 8 bpc RGB, within any cap from 8 to 16.
+        if c.output.max_bpc == bpc {
             return false;
         }
         c.output.max_bpc = bpc;
@@ -76,9 +78,16 @@ impl Kms {
             { return false; }
             let Some(index) = connector_of(self, request.connector) else { return false; };
             let c = &self.connectors[index];
-            if c.port.signal != Signal::Hdmi || !c.lightable() { return false; }
             let max_bpc = request.max_bpc.unwrap_or(c.output.max_bpc);
-            if !(8..=16).contains(&max_bpc) { return false; }
+            if !c.lightable() || !(8..=16).contains(&max_bpc) { return false; }
+            // DP: 8 bpc RGB on the verified link (LINUX-GAP: no deeper
+            // color or YCbCr over DP yet), which any cap admits.
+            if c.port.signal == Signal::DisplayPort {
+                return matches!(
+                    request.color_format,
+                    crate::amdgpu_hdr::ColorFormat::Auto | crate::amdgpu_hdr::ColorFormat::Rgb
+                );
+            }
             let crtc = self.crtc_at(usize::from(request.display));
             let timing = match request.mode {
                 Some(mode) => self.find_mode_at(usize::from(request.display), Some(index), &mode),
@@ -110,10 +119,24 @@ pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> 
     };
     let c = &kms.connectors[index];
     colorspace_valid(u64::from(colorspace))
-        && c.port.signal == Signal::Hdmi
-        && (!c.present
+        && color_settable(c.port.signal, colorspace, hdr)
+        && (c.port.signal != Signal::Hdmi
+            || !c.present
             || crate::amdgpu_navi48_boot::hdmi_caps(&c.edid).hdmi
             || (colorspace == 0 && !hdr))
+}
+/// Which Colorspace / HDR_OUTPUT_METADATA values a connector of `signal`
+/// can carry. amdgpu_dm attaches both to HDMI and non-MST DP connectors.
+/// HDMI sends them in the AVI and DRM infoframes; DP would send them in
+/// the VSC SDP (colorimetry) and the HDR metadata SDP, which this DCN30
+/// path does not program yet (LINUX-GAP), so a DP connector takes only the
+/// defaults (Default colorimetry, no metadata) rather than accept values it
+/// would not put on the wire.
+fn color_settable(signal: Signal, colorspace: u32, hdr: bool) -> bool {
+    match signal {
+        Signal::Hdmi => true,
+        Signal::DisplayPort => colorspace == 0 && !hdr,
+    }
 }
 pub fn output_formats_supported(requests: &[OutputFormatRequest], routes: &[OutputRoute]) -> bool {
     KMS.lock().formats_supported(requests, routes)

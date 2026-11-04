@@ -583,14 +583,22 @@ fn apply_card_vrr(
     // connector controls must not import DCN401 CRTC/plane capabilities.
     let previous = card.native.clone();
     crate::amdgpu_navi48_kms::apply_routed_vrr(card, crtcs, connectors, vrr);
+    // amdgpu_dm_connector_init_helper: "max bpc" on every non-MST
+    // connector (Navi22 publishes no MST ones), Colorspace and
+    // HDR_OUTPUT_METADATA on HDMI and DP.
     for (native, connector) in card.native.iter_mut().zip(connectors) {
-        if connector.kind != ConnectorType::HdmiA {
-            continue;
-        }
         let kept = previous.iter().find(|n| n.connector == native.connector);
-        native.colorspace = Some(kept.and_then(|n| n.colorspace).unwrap_or(0));
-        native.hdr_output_metadata = Some(kept.and_then(|n| n.hdr_output_metadata).unwrap_or(0));
-        native.color_format = Some(kept.and_then(|n| n.color_format).unwrap_or_default());
+        if matches!(
+            connector.kind,
+            ConnectorType::HdmiA | ConnectorType::DisplayPort
+        ) {
+            native.colorspace = Some(kept.and_then(|n| n.colorspace).unwrap_or(0));
+            native.hdr_output_metadata =
+                Some(kept.and_then(|n| n.hdr_output_metadata).unwrap_or(0));
+        }
+        if connector.kind == ConnectorType::HdmiA {
+            native.color_format = Some(kept.and_then(|n| n.color_format).unwrap_or_default());
+        }
         native.max_bpc = Some(
             kept.and_then(|n| n.max_bpc)
                 .unwrap_or_else(crate::amdgpu_navi48_boot::max_bpc),

@@ -781,3 +781,57 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_atomic_modeset_to_offered_cta_4k60
 );
+
+/// amdgpu_dm_connector_init_helper on DCN3.0: a non-MST DP connector has
+/// "max bpc", Colorspace and HDR_OUTPUT_METADATA too (not the HDMI-only
+/// color format). A DP cap is stored like HDMI's; until the VSC/HDR SDPs
+/// are programmed, DP takes only the default colorimetry and no metadata.
+fn navi22_kms_dp_connector_output_properties() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    use crate::amdgpu_native_kms::ConnectorColorRequest;
+    let mut card = Card::new("amdgpu", "DCN30 DP fixture", (3, 60, 0));
+    let crtcs: [Option<crate::amdgpu_navi48_kms::Sink>; 1] = [None];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 0,
+        kind: ConnectorType::DisplayPort,
+        edid: None,
+        offered: &[],
+        crtc: None,
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    let native = &card.native[0];
+    if native.colorspace != Some(0)
+        || native.hdr_output_metadata != Some(0)
+        || native.max_bpc.is_none()
+        || native.color_format.is_some()
+    {
+        return TestResult::Fail("DP connector output properties differ from amdgpu_dm's");
+    }
+    let mut k = Kms::new();
+    k.reconcile(&reports(true, 1), admitted);
+    let dp = crate::amdgpu_navi48_kms::connector_id(0);
+    if !k.set_max_bpc(dp, 10) || k.connectors[0].output.max_bpc != 10 {
+        return TestResult::Fail("DP max bpc not stored");
+    }
+    let before = k.connectors[0].output;
+    let mut color = ConnectorColorRequest {
+        connector: dp,
+        color_format: ColorFormat::Auto,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        hdr_output_metadata: None,
+    };
+    if k.set_color(&color) {
+        return TestResult::Fail("DP accepted a colorimetry it cannot signal");
+    }
+    color.colorspace = 0;
+    color.hdr_output_metadata = Some(alloc::vec![0; 32]);
+    if k.set_color(&color) || k.connectors[0].output != before {
+        return TestResult::Fail("DP accepted HDR metadata it cannot send");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_dp_connector_output_properties
+);
