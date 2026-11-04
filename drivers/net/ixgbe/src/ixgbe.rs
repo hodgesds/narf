@@ -21,6 +21,7 @@ use crate::ixgbe::queues::RegBank;
 
 pub mod eee;
 pub mod ethtool;
+pub mod fdir;
 pub mod pm;
 pub mod queues;
 pub mod rss;
@@ -329,6 +330,8 @@ pub struct Ixgbe {
     pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
     /// Programmed VLAN filter, if `configure_vlan` ran.
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
+    /// Programmed Flow Director config, if `configure_fdir` ran.
+    pub fdir_cfg: IrqSafeSpinLock<Option<fdir::FdirConfig>>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Programmed EEE state, if `configure_eee` ran. Always `None`
@@ -544,6 +547,7 @@ impl Ixgbe {
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
+            fdir_cfg: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
             quiesced: IrqSafeSpinLock::new(false),
@@ -871,6 +875,100 @@ impl Ixgbe {
         }
         *self.vlan_filter.lock() = Some(filter);
         Ok(())
+    }
+
+    /// Initialize Flow Director (signature or perfect mode).
+    /// Opt-in like `configure_rss`: probe still brings up 1/1 and
+    /// the datapath is untouched until filters are added. A missed
+    /// INIT_DONE poll is not an error (Linux debugs only); the
+    /// config is recorded regardless.
+    pub fn configure_fdir(&self, cfg: fdir::FdirConfig) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            match cfg.mode {
+                fdir::FdirMode::Signature => {
+                    fdir::init_signature(&mut bank, cfg.pballoc);
+                }
+                fdir::FdirMode::Perfect => {
+                    fdir::init_perfect(&mut bank, cfg.pballoc);
+                }
+            }
+        }
+        *self.fdir_cfg.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Program a perfect-filter input mask. The SCTP mask register
+    /// is written only for X550-family parts (Linux gates it by MAC
+    /// type); other parts program TCP/UDP only.
+    pub fn configure_fdir_mask(&self, mask: &fdir::FdirMask) -> Result<(), IxgbeError> {
+        let sctp = self.did == IXGBE_DEV_X550 || self.did == IXGBE_DEV_X550EM_X;
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::set_input_mask(&mut bank, mask, sctp)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Add a perfect-match filter (IPv4 only; see fdir.rs docs).
+    pub fn fdir_add_perfect(
+        &self,
+        input: &fdir::FdirPerfectInput,
+        soft_id: u16,
+        queue: u8,
+    ) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::add_perfect(&mut bank, input, soft_id, queue)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Erase a perfect-match filter (query first, remove if present).
+    pub fn fdir_erase_perfect(&self, bkt_hash: u16, soft_id: u16) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::erase_perfect(&mut bank, bkt_hash, soft_id)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Add a signature filter — the ATR primitive (see fdir.rs docs).
+    /// `input` is the flow/vm/VLAN word, `common` the compressed
+    /// dword, `flow_type` carries the tunnel bit (0x10).
+    pub fn fdir_add_signature(
+        &self,
+        input: u32,
+        common: u32,
+        flow_type: u8,
+        queue: u8,
+    ) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::add_signature(&mut bank, input, common, flow_type, queue)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Reinitialize the Flow Director tables. NOTE: programmed
+    /// filters do not survive a reinit (no filter list is kept);
+    /// callers must re-add afterwards.
+    pub fn fdir_reinit(&self) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::reinit_tables(&mut bank).map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Read Flow Director statistics (registers read to clear).
+    pub fn fdir_stats(&self) -> fdir::FdirStats {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        fdir::stats(&mut bank)
     }
 
     /// Arm Wake-on-LAN. 82599EB only (`wol_supported`); other

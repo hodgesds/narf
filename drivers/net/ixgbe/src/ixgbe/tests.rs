@@ -986,3 +986,389 @@ fn smoke_ixgbe_eee_ls_modes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_ls_modes);
+// ── Flow Director ────────────────────────────────────────────────────
+
+// Test bank modeling documented hardware completion behavior: FDIRCTRL
+// reads report INIT_DONE set (hardware sets it when init completes),
+// FDIRCMD reads report the command field cleared (hardware clears it
+// when the command completes) plus FILTER_VALID when the query flag is
+// set (hardware reports a present filter). Raw stored values stay
+// readable via `stored` so the write conversation is still pinned.
+struct FdirBank {
+    inner: FakeBank,
+    query_valid: bool,
+}
+
+impl FdirBank {
+    fn new(query_valid: bool) -> Self {
+        Self {
+            inner: FakeBank::new(),
+            query_valid,
+        }
+    }
+
+    fn stored(&self, offset: u64) -> u32 {
+        self.inner.read32(offset)
+    }
+}
+
+impl super::queues::RegBank for FdirBank {
+    fn read32(&self, offset: u64) -> u32 {
+        use super::fdir::{FDIRCMD_CMD_MASK, FDIRCMD_FILTER_VALID, FDIRCTRL_INIT_DONE};
+        use super::fdir::{REG_FDIRCMD, REG_FDIRCTRL};
+        let v = self.inner.read32(offset);
+        if offset == REG_FDIRCTRL {
+            v | FDIRCTRL_INIT_DONE
+        } else if offset == REG_FDIRCMD {
+            (v & !FDIRCMD_CMD_MASK)
+                | if self.query_valid {
+                    FDIRCMD_FILTER_VALID
+                } else {
+                    0
+                }
+        } else {
+            v
+        }
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        self.inner.write32(offset, value);
+    }
+}
+
+fn smoke_ixgbe_fdir_hash_oracles() -> TestResult {
+    use super::fdir::{perfect_bucket_hash, perfect_stream, sig_hash, FdirPerfectInput};
+    // Python oracles, re-implemented independently from the Linux
+    // macro text (see lane notes): sig = combined signature+bucket.
+    if sig_hash(0x0002_0000, 0x0000_0003) != 0x1b79_58a1 {
+        return TestResult::Fail("sig hash oracle 1 mismatch");
+    }
+    if sig_hash(0x0305_0123, 0xDEAD_BEEF) != 0x7c87_3ba7 {
+        return TestResult::Fail("sig hash oracle 2 mismatch");
+    }
+    if sig_hash(0x0002_0000, 0x0000_0000) != 0x6a12_4a52 {
+        return TestResult::Fail("sig hash oracle 3 mismatch");
+    }
+    // Perfect bucket oracles (same Python implementation).
+    let input = FdirPerfectInput {
+        vm_pool: 0,
+        flow_type: super::fdir::FLOW_TYPE_TCPV4,
+        vlan_id: 100,
+        src_ip: 0xC0A8_010A,
+        dst_ip: 0xC0A8_0114,
+        src_port: 12345,
+        dst_port: 80,
+        flex_bytes: 0,
+        bkt_hash: 0,
+    };
+    if perfect_bucket_hash(&perfect_stream(&input)) != 0x1f6c {
+        return TestResult::Fail("perfect bucket oracle 1 mismatch");
+    }
+    let mut words = [0u32; 11];
+    words[0] = 0x0503_0000;
+    if perfect_bucket_hash(&words) != 0x03bd {
+        return TestResult::Fail("perfect bucket oracle 2 mismatch");
+    }
+    let words = [0xFFFF_FFFFu32; 11];
+    if perfect_bucket_hash(&words) != 0x0318 {
+        return TestResult::Fail("perfect bucket oracle 3 mismatch");
+    }
+    // Mask application is word-wise AND.
+    let masked = super::fdir::apply_mask(&[0xFFFF_FFFFu32; 11], &[0x0F0F_0F0Fu32; 11]);
+    if masked != [0x0F0F_0F0Fu32; 11] {
+        return TestResult::Fail("apply_mask is not word-wise AND");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_hash_oracles);
+
+fn smoke_ixgbe_fdir_ctrl_words() -> TestResult {
+    use super::fdir::{fdirctrl_perfect, fdirctrl_signature, FdirPballoc};
+    // Signature: pballoc 1 + flex 6<<16 + maxlen 0xA<<24 + thresh 4<<28.
+    if fdirctrl_signature(FdirPballoc::K64) != 0x4A06_0001 {
+        return TestResult::Fail("signature FDIRCTRL word wrong");
+    }
+    // Perfect adds PERFECT_MATCH + drop queue 127<<8.
+    if fdirctrl_perfect(FdirPballoc::K64) != 0x4A06_7F11 {
+        return TestResult::Fail("perfect FDIRCTRL word wrong");
+    }
+    if fdirctrl_signature(FdirPballoc::K256) & 0x3 != 0x3 {
+        return TestResult::Fail("256K pballoc bits wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_ctrl_words);
+
+fn smoke_ixgbe_fdir_init_conversation() -> TestResult {
+    use super::fdir::{init_perfect, init_signature, FdirPballoc};
+    use super::fdir::{REG_FDIRCTRL, REG_FDIRHKEY, REG_FDIRSKEY};
+    let mut bank = FdirBank::new(false);
+    if !init_signature(&mut bank, FdirPballoc::K64) {
+        return TestResult::Fail("signature init never observed INIT_DONE");
+    }
+    if bank.stored(REG_FDIRHKEY) != 0x3DAD_14E2 || bank.stored(REG_FDIRSKEY) != 0x174D_3614 {
+        return TestResult::Fail("FDIR hash keys not primed");
+    }
+    if bank.stored(REG_FDIRCTRL) != 0x4A06_0001 {
+        return TestResult::Fail("signature FDIRCTRL write wrong");
+    }
+    if !init_perfect(&mut bank, FdirPballoc::K64) {
+        return TestResult::Fail("perfect init never observed INIT_DONE");
+    }
+    if bank.stored(REG_FDIRCTRL) != 0x4A06_7F11 {
+        return TestResult::Fail("perfect FDIRCTRL write wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_init_conversation);
+
+fn smoke_ixgbe_fdir_mask_words() -> TestResult {
+    use super::fdir::{mask_words, set_input_mask, FdirMask};
+    use super::fdir::{
+        REG_FDIRDIP4M, REG_FDIRM, REG_FDIRSCTPM, REG_FDIRSIP4M, REG_FDIRTCPM, REG_FDIRUDPM,
+    };
+    // Match-everything mask: only DIPv6 set; port/IP registers zero.
+    let all_match = FdirMask {
+        vm_pool: 0x7F,
+        flow_type: 0x03,
+        vlan_id: 0xEFFF,
+        src_port: 0xFFFF,
+        dst_port: 0xFFFF,
+        flex_bytes: 0xFFFF,
+        src_ip: 0xFFFF_FFFF,
+        dst_ip: 0xFFFF_FFFF,
+    };
+    let (fdirm, port, src, dst) = match mask_words(&all_match) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("match-all mask rejected"),
+    };
+    if fdirm != 0x20 || port != 0 || src != 0 || dst != 0 {
+        return TestResult::Fail("match-all mask words wrong");
+    }
+    // Mask-everything mask: all FDIRM bits; inverted registers all ones.
+    let all_masked = FdirMask {
+        vm_pool: 0x00,
+        flow_type: 0x00,
+        vlan_id: 0x0000,
+        src_port: 0,
+        dst_port: 0,
+        flex_bytes: 0x0000,
+        src_ip: 0,
+        dst_ip: 0,
+    };
+    let (fdirm, port, src, dst) = match mask_words(&all_masked) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("mask-all mask rejected"),
+    };
+    if fdirm != 0x3F || port != 0xFFFF_FFFF || src != 0xFFFF_FFFF || dst != 0xFFFF_FFFF {
+        return TestResult::Fail("mask-all mask words wrong");
+    }
+    // Validation rejects each bad field.
+    let mut bad = all_match;
+    bad.vm_pool = 0x40;
+    if mask_words(&bad).is_ok() {
+        return TestResult::Fail("bad vm_pool mask accepted");
+    }
+    let mut bad = all_match;
+    bad.flow_type = 0x01;
+    if mask_words(&bad).is_ok() {
+        return TestResult::Fail("bad flow_type mask accepted");
+    }
+    let mut bad = all_match;
+    bad.vlan_id = 0x0123;
+    if mask_words(&bad).is_ok() {
+        return TestResult::Fail("bad vlan mask accepted");
+    }
+    let mut bad = all_match;
+    bad.flex_bytes = 0x1234;
+    if mask_words(&bad).is_ok() {
+        return TestResult::Fail("bad flex mask accepted");
+    }
+    let mut bad = all_match;
+    bad.flow_type = 0x00;
+    bad.src_port = 1;
+    if mask_words(&bad).is_ok() {
+        return TestResult::Fail("ports with masked L4 accepted");
+    }
+    // Conversation: SCTP register written only when sctp=true. The
+    // mask-all mask makes the port register all-ones, so a written
+    // SCTP register is distinguishable from a never-written one.
+    let mut bank = FdirBank::new(false);
+    if set_input_mask(&mut bank, &all_masked, false).is_err() {
+        return TestResult::Fail("set_input_mask failed");
+    }
+    if bank.stored(REG_FDIRM) != 0x3F
+        || bank.stored(REG_FDIRTCPM) != 0xFFFF_FFFF
+        || bank.stored(REG_FDIRUDPM) != 0xFFFF_FFFF
+        || bank.stored(REG_FDIRSIP4M) != 0xFFFF_FFFF
+        || bank.stored(REG_FDIRDIP4M) != 0xFFFF_FFFF
+        || bank.stored(REG_FDIRSCTPM) != 0
+    {
+        return TestResult::Fail("mask register conversation wrong (no SCTP)");
+    }
+    let mut bank = FdirBank::new(false);
+    if set_input_mask(&mut bank, &all_masked, true).is_err() {
+        return TestResult::Fail("set_input_mask (SCTP) failed");
+    }
+    if bank.stored(REG_FDIRSCTPM) != 0xFFFF_FFFF {
+        return TestResult::Fail("SCTP mask register not written");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_mask_words);
+
+fn smoke_ixgbe_fdir_perfect_conversation() -> TestResult {
+    use super::fdir::REG_FDIRSIPV6_BASE;
+    use super::fdir::{add_perfect, FdirPerfectInput, FLOW_TYPE_TCPV4};
+    use super::fdir::{
+        REG_FDIRCMD, REG_FDIRHASH, REG_FDIRIPDA, REG_FDIRIPSA, REG_FDIRPORT, REG_FDIRVLAN,
+    };
+    let input = FdirPerfectInput {
+        vm_pool: 0,
+        flow_type: FLOW_TYPE_TCPV4,
+        vlan_id: 100,
+        src_ip: 0xC0A8_010A,
+        dst_ip: 0xC0A8_0114,
+        src_port: 12345,
+        dst_port: 80,
+        flex_bytes: 0,
+        bkt_hash: 0x1f6c,
+    };
+    let mut bank = FdirBank::new(false);
+    if add_perfect(&mut bank, &input, 7, 3).is_err() {
+        return TestResult::Fail("add_perfect failed");
+    }
+    if bank.stored(REG_FDIRSIPV6_BASE) != 0xC0A8_010A
+        || bank.stored(REG_FDIRSIPV6_BASE + 4) != 0
+        || bank.stored(REG_FDIRSIPV6_BASE + 8) != 0
+        || bank.stored(REG_FDIRIPSA) != 0xC0A8_010A
+        || bank.stored(REG_FDIRIPDA) != 0xC0A8_0114
+        || bank.stored(REG_FDIRPORT) != 0x0050_3039
+        || bank.stored(REG_FDIRVLAN) != 0x0000_0064
+        || bank.stored(REG_FDIRHASH) != 0x0007_1f6c
+        || bank.stored(REG_FDIRCMD) != 0x0003_8849
+    {
+        return TestResult::Fail("perfect add register conversation wrong");
+    }
+    // Drop-queue add sets the DROP bit.
+    let mut bank = FdirBank::new(false);
+    if add_perfect(&mut bank, &input, 0, 127).is_err() {
+        return TestResult::Fail("drop-queue add failed");
+    }
+    if bank.stored(REG_FDIRCMD) != 0x007F_8A49 {
+        return TestResult::Fail("drop-queue FDIRCMD wrong");
+    }
+    // Guards: IPv6 flow type and queue > 127 rejected.
+    let mut bad = input;
+    bad.flow_type = super::fdir::FLOW_TYPE_TCPV6;
+    let mut bank = FdirBank::new(false);
+    if add_perfect(&mut bank, &bad, 0, 3).is_ok() {
+        return TestResult::Fail("IPv6 perfect add accepted");
+    }
+    let mut bank = FdirBank::new(false);
+    if add_perfect(&mut bank, &input, 0, 128).is_ok() {
+        return TestResult::Fail("queue 128 perfect add accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_perfect_conversation);
+
+fn smoke_ixgbe_fdir_erase_conversation() -> TestResult {
+    use super::fdir::{erase_perfect, REG_FDIRCMD, REG_FDIRHASH};
+    // Absent filter: query issued, no remove.
+    let mut bank = FdirBank::new(false);
+    if erase_perfect(&mut bank, 0x1f6c, 7).is_err() {
+        return TestResult::Fail("erase (absent) failed");
+    }
+    if bank.stored(REG_FDIRCMD) != 0x0000_0003 || bank.stored(REG_FDIRHASH) != 0x0007_1f6c {
+        return TestResult::Fail("erase (absent) conversation wrong");
+    }
+    // Present filter: query then remove.
+    let mut bank = FdirBank::new(true);
+    if erase_perfect(&mut bank, 0x1f6c, 7).is_err() {
+        return TestResult::Fail("erase (present) failed");
+    }
+    if bank.stored(REG_FDIRCMD) != 0x0000_0002 || bank.stored(REG_FDIRHASH) != 0x0007_1f6c {
+        return TestResult::Fail("erase (present) conversation wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_erase_conversation);
+
+fn smoke_ixgbe_fdir_signature_conversation() -> TestResult {
+    use super::fdir::{add_signature, REG_FDIRCMD, REG_FDIRHASH};
+    // Oracle input: pool 0, TCPV4, vlan 0; common = 10.0.0.1 ^ 10.0.0.2.
+    let mut bank = FdirBank::new(false);
+    if add_signature(&mut bank, 0x0002_0000, 0x0000_0003, 0x02, 5).is_err() {
+        return TestResult::Fail("add_signature failed");
+    }
+    if bank.stored(REG_FDIRHASH) != 0x1b79_58a1 || bank.stored(REG_FDIRCMD) != 0x0005_8849 {
+        return TestResult::Fail("signature add conversation wrong");
+    }
+    // Tunnel bit sets TUNNEL_FILTER; base type still TCPV4.
+    let mut bank = FdirBank::new(false);
+    if add_signature(&mut bank, 0x0002_0000, 0x0000_0003, 0x12, 5).is_err() {
+        return TestResult::Fail("tunnel signature add failed");
+    }
+    if bank.stored(REG_FDIRCMD) != 0x0085_8849 {
+        return TestResult::Fail("tunnel FDIRCMD wrong");
+    }
+    // Guards: bare IPv4, bare IPv6, queue > 127 rejected.
+    let mut bank = FdirBank::new(false);
+    if add_signature(&mut bank, 0x0002_0000, 0x0000_0003, 0x00, 5).is_ok() {
+        return TestResult::Fail("bare IPv4 signature accepted");
+    }
+    let mut bank = FdirBank::new(false);
+    if add_signature(&mut bank, 0x0002_0000, 0x0000_0003, 0x04, 5).is_ok() {
+        return TestResult::Fail("bare IPv6 signature accepted");
+    }
+    let mut bank = FdirBank::new(false);
+    if add_signature(&mut bank, 0x0002_0000, 0x0000_0003, 0x02, 200).is_ok() {
+        return TestResult::Fail("queue 200 signature accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_signature_conversation);
+
+fn smoke_ixgbe_fdir_reinit_conversation() -> TestResult {
+    use super::fdir::{reinit_tables, REG_FDIRCMD, REG_FDIRCTRL, REG_FDIRFREE, REG_FDIRHASH};
+    let mut bank = FdirBank::new(false);
+    bank.write32(REG_FDIRCTRL, 0x4A06_7F11);
+    bank.write32(REG_FDIRCMD, 0x0000_8001);
+    if reinit_tables(&mut bank).is_err() {
+        return TestResult::Fail("reinit failed");
+    }
+    // INIT_DONE cleared from the restored CTRL; hash + free cleared;
+    // CLEARHT toggled away, CMD field cleared by the completion model.
+    if bank.stored(REG_FDIRCTRL) != 0x4A06_7F11
+        || bank.stored(REG_FDIRHASH) != 0
+        || bank.stored(REG_FDIRFREE) != 0
+        || bank.stored(REG_FDIRCMD) != 0x0000_8000
+    {
+        return TestResult::Fail("reinit register conversation wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_reinit_conversation);
+
+fn smoke_ixgbe_fdir_stats() -> TestResult {
+    use super::fdir::{
+        stats, REG_FDIRFREE, REG_FDIRFSTAT, REG_FDIRLEN, REG_FDIRMATCH, REG_FDIRMISS, REG_FDIRUSTAT,
+    };
+    let mut bank = FdirBank::new(false);
+    bank.write32(REG_FDIRMATCH, 11);
+    bank.write32(REG_FDIRMISS, 22);
+    bank.write32(REG_FDIRUSTAT, 33);
+    bank.write32(REG_FDIRFSTAT, 44);
+    bank.write32(REG_FDIRLEN, 5);
+    bank.write32(REG_FDIRFREE, 0x0003_1234);
+    let s = stats(&mut bank);
+    if s.matched != 11 || s.missed != 22 || s.ustat != 33 || s.fstat != 44 || s.len != 5 {
+        return TestResult::Fail("stats values wrong");
+    }
+    if s.free_count() != 0x1234 || s.collision_count() != 0x0003 {
+        return TestResult::Fail("FDIRFREE decomposition wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_stats);
