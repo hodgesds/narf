@@ -66,6 +66,12 @@ impl RegisterIo for Model {
         }
         if register == 0x9920 {
             self.values.insert(register, value & !0x10000);
+            // Like the 0x9860 arm above, the clearing read itself observes
+            // clear: hardware finishes DO_CAL within microseconds, far inside
+            // the 1 s periodic tick, so the first post-setup tick must see
+            // it clear or samples advance every other tick and the 30 s
+            // CAL_MAX timeout resets before 64 samples accumulate.
+            return value & !0x10000;
         }
         value
     }

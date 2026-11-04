@@ -156,7 +156,12 @@ fn smoke_ath9k_ar9287_two_chain_masks_hwwar2_and_cck_fir() -> TestResult {
     if !wrote(0x99a4, 3) || !wrote(0xa39c, 3) || !wrote(0x832c, 1) {
         return TestResult::Fail("AR9287 chain masks differ from ar5008_hw_init_chain_masks");
     }
-    if io.regs.get(&0x8344) != Some(&0x80) {
+    // MISC_MODE2 is an RMW over the post-INI register, not a zeroing write:
+    // the COMMON table writes (0x8344, 0x01c81043) during process_ini
+    // (initvals_ar9287.rs:266, = Linux ar9002_initvals.h:1946), and the
+    // override RMW (channel.rs prepare_tune) clears HWWAR1/HWWAR2/KEYID and
+    // sets CFP_IGNORE, yielding (0x01c81043 & !0x02100040) | 0x80.
+    if io.regs.get(&0x8344) != Some(&0x01c8_1083) {
         return TestResult::Fail("AR9287 HWWAR1/HWWAR2/KEYID not cleared");
     }
     if io.writes.iter().any(|&(reg, _)| reg == 0xa204)

@@ -108,13 +108,25 @@ fn fnv(pairs: &[(u64, u32)]) -> u64 {
 }
 
 /// The `process_ini` rows: everything after `AR_PHY_SEL_EXTERNAL_RADIO`
-/// except the `AR_PHY_SEL_INTERNAL_ADDAC` switch.
+/// except the `AR_PHY_SEL_INTERNAL_ADDAC` switch. Only the switch write is
+/// skipped: the COMMON table itself writes `(0x9830, 0)` (row 195 of both
+/// `AR5416_COMMON_9160` and `AR5416_COMMON`, matching Linux
+/// `ar5416Common_9160`/`ar5416Common`), so filtering every `0x9830` write
+/// drops a genuine INI row and pulls a post-INI write into the window.
 fn ini(writes: &[(u64, u32)], rows: usize) -> Option<Vec<(u64, u32)>> {
     let first = writes.iter().position(|&w| w == (0x9830, 1))?;
+    let mut switch_skipped = false;
     let out: Vec<_> = writes[first + 1..]
         .iter()
         .copied()
-        .filter(|&(reg, _)| reg != 0x9830)
+        .filter(|&(reg, _)| {
+            if reg == 0x9830 && !switch_skipped {
+                switch_skipped = true;
+                false
+            } else {
+                true
+            }
+        })
         .take(rows)
         .collect();
     (out.len() == rows).then_some(out)
