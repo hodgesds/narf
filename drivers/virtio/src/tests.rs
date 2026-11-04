@@ -1081,6 +1081,128 @@ kernel_test_in!(
     smoke_virtio_net_pci_registers_iface
 );
 
+// ── virtio-net RSS (audit gap 8) ────────────────────────────────────
+// Pure-encoder smokes: the RSS/HASH config builders + RX header
+// length selection, exercised without PCI, DMA, or a live QEMU
+// NIC (default QEMU does not offer F_RSS, so no live-device
+// coverage exists in CI either — the wire bytes are pinned here
+// and the device behavior is CI/silicon-verified).
+
+fn smoke_virtio_net_rss_config_encoding() -> TestResult {
+    use crate::net_pci::{build_hash_config, build_rss_config, rx_header_len};
+    use crate::net_pci::{VIRTIO_NET_HDR_HASH_LEN, VIRTIO_NET_HDR_LEN};
+
+    // Header lengths: 12 base, 20 with HASH_REPORT.
+    if VIRTIO_NET_HDR_LEN != 12 || VIRTIO_NET_HDR_HASH_LEN != 20 {
+        return TestResult::Fail("RX header length constants wrong");
+    }
+    if rx_header_len(false) != 12 || rx_header_len(true) != 20 {
+        return TestResult::Fail("rx_header_len selection wrong");
+    }
+
+    // Full config: device advertises all 9 hash types (incl. _EX)
+    // + 128-entry table max + 52-byte key max, 4 live pairs.
+    // Expect: _EX masked out (0x3f), table capped at 64 (mask 63),
+    // entries i % 4, max_tx_vq 4, key clamped to 40.
+    let payload = match build_rss_config(0x1ff, 4, 128, 52) {
+        Some(p) => p,
+        None => return TestResult::Fail("valid RSS config returned None"),
+    };
+    // 11 fixed bytes + 2*64 table + 40 key = 179.
+    if payload.len() != 179 {
+        return TestResult::Fail("RSS config length wrong");
+    }
+    let hash_types = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if hash_types != 0x3f {
+        return TestResult::Fail("RSS hash types not masked to base six");
+    }
+    let mask = u16::from_le_bytes([payload[4], payload[5]]);
+    if mask != 63 {
+        return TestResult::Fail("RSS indirection mask not 63");
+    }
+    let unclassified = u16::from_le_bytes([payload[6], payload[7]]);
+    if unclassified != 0 {
+        return TestResult::Fail("RSS unclassified queue not pair 0");
+    }
+    for i in 0..64u16 {
+        let off = 8 + 2 * i as usize;
+        let entry = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        if entry != i % 4 {
+            return TestResult::Fail("RSS indirection entry not i % num_pairs");
+        }
+    }
+    let max_tx_vq = u16::from_le_bytes([payload[136], payload[137]]);
+    if max_tx_vq != 4 {
+        return TestResult::Fail("RSS max_tx_vq not live pair count");
+    }
+    if payload[138] != 40 {
+        return TestResult::Fail("RSS key length not clamped to 40");
+    }
+    // Key pinned from an independent splitmix64 computation: an
+    // accidental key change silently re-steers every flow.
+    let expected_key: [u8; 8] = [0xc6, 0xb4, 0x50, 0xbb, 0x39, 0x33, 0xb8, 0x21];
+    if payload[139..147] != expected_key {
+        return TestResult::Fail("RSS key bytes changed from pinned splitmix64 output");
+    }
+
+    // Non-power-of-two device max rounds DOWN (5 -> 4, mask 3).
+    let small = match build_rss_config(0x3f, 2, 5, 40) {
+        Some(p) => p,
+        None => return TestResult::Fail("small-table RSS config returned None"),
+    };
+    if u16::from_le_bytes([small[4], small[5]]) != 3 || small.len() != 11 + 8 + 40 {
+        return TestResult::Fail("RSS table size not rounded down to power of two");
+    }
+
+    // Degenerate inputs fail closed (caller skips the command).
+    if build_rss_config(0x3f, 0, 128, 40).is_some()
+        || build_rss_config(0x3f, 4, 0, 40).is_some()
+        || build_rss_config(0x3f, 4, 128, 0).is_some()
+    {
+        return TestResult::Fail("degenerate RSS config not rejected");
+    }
+    // Zero advertised types fall back to the base six, not zero.
+    let fallback = match build_rss_config(0, 1, 1, 40) {
+        Some(p) => p,
+        None => return TestResult::Fail("fallback RSS config returned None"),
+    };
+    if u32::from_le_bytes([fallback[0], fallback[1], fallback[2], fallback[3]]) != 0x3f {
+        return TestResult::Fail("RSS hash types did not fall back to base six");
+    }
+
+    // HASH_CONFIG: hash_types + 8 reserved zero bytes + key.
+    let hash = match build_hash_config(0x1ff, 40) {
+        Some(p) => p,
+        None => return TestResult::Fail("valid HASH config returned None"),
+    };
+    if hash.len() != 53
+        || u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]) != 0x3f
+        || hash[4..12] != [0u8; 8]
+        || hash[12] != 40
+        || hash[13..21] != expected_key
+    {
+        return TestResult::Fail("HASH config layout wrong");
+    }
+    if build_hash_config(0x3f, 0).is_some() {
+        return TestResult::Fail("zero-key HASH config not rejected");
+    }
+
+    // Strip math: a max-size frame fits under both header forms,
+    // and a header-only buffer strips to an empty payload.
+    let total_hash = (20 + 1518) as u32;
+    if total_hash.saturating_sub(rx_header_len(true) as u32) != 1518 {
+        return TestResult::Fail("hash-report strip math wrong");
+    }
+    if (20u32).saturating_sub(rx_header_len(true) as u32) != 0 {
+        return TestResult::Fail("header-only frame did not strip to empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_rss_config_encoding
+);
+
 fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
     // The TCP stack consumes from narf_net::iface (fn-pointer
     // registry), not the ring-based narf_net::registry. virtio-net

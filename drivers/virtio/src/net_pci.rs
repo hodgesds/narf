@@ -138,6 +138,16 @@ const VIRTIO_NET_F_CTRL_MAC_ADDR: u64 = 23;
 /// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_MQ (bit 22). Device supports
 /// multi-queue with auto receive-steering across `max_virtqueue_pairs`.
 const VIRTIO_NET_F_MQ: u64 = 22;
+/// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_HASH_REPORT (bit 57). Device
+/// reports the RSS hash in the RX header (`virtio_net_hdr_v1_hash`:
+/// the 12-byte header + hash_value + hash_report + padding = 20
+/// bytes). Negotiated independently of F_RSS; the hash fields are
+/// device-written on RX only, so the TX header stays 12 bytes.
+const VIRTIO_NET_F_HASH_REPORT: u64 = 57;
+/// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_RSS (bit 60). Device steers
+/// RX flows to queues per the RSS config sent via
+/// `VIRTIO_NET_CTRL_MQ_RSS_CONFIG`. Requires F_CTRL_VQ like F_MQ.
+const VIRTIO_NET_F_RSS: u64 = 60;
 /// VIRTIO_RING_F_EVENT_IDX (bit 29, transport). Enables the fine-grained
 /// avail_event/used_event notification protocol — the driver suppresses a
 /// TX-notify VM-exit unless the device's published `avail_event` says it wants
@@ -199,6 +209,58 @@ const VIRTIO_NET_CTRL_MQ: u8 = 4;
 /// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET.
 /// Payload is a `__virtio16` (2-byte LE) count of pairs to enable.
 const VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET: u8 = 0;
+/// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ_RSS_CONFIG.
+/// Payload is a `virtio_net_rss_config`: hash_types, indirection
+/// table mask + table, unclassified queue, max TX virtqueues,
+/// hash key length + key. Has the same pair-count effect as
+/// VQ_PAIRS_SET (via max_tx_vq) plus the steering config.
+const VIRTIO_NET_CTRL_MQ_RSS_CONFIG: u8 = 1;
+/// VirtIO 1.2 §5.1.6.5.5 — VIRTIO_NET_CTRL_MQ_HASH_CONFIG.
+/// Payload is a `virtio_net_hash_config`: hash_types, reserved,
+/// hash key length + key. Requests the device include the hash
+/// value + report type in the RX header; requires F_HASH_REPORT
+/// negotiated. Sent when HASH_REPORT is negotiated without RSS
+/// (mirroring Linux's commit choice: RSS_CONFIG iff has_rss, else
+/// HASH_CONFIG).
+const VIRTIO_NET_CTRL_MQ_HASH_CONFIG: u8 = 2;
+
+/// RSS hash-type bits (uapi `VIRTIO_NET_RSS_HASH_TYPE_*`, bits
+/// 0–8). The `_EX` variants cover IPv6 extension headers.
+const RSS_HASH_TYPE_IPV4: u32 = 1 << 0;
+const RSS_HASH_TYPE_TCPV4: u32 = 1 << 1;
+const RSS_HASH_TYPE_UDPV4: u32 = 1 << 2;
+const RSS_HASH_TYPE_IPV6: u32 = 1 << 3;
+const RSS_HASH_TYPE_TCPV6: u32 = 1 << 4;
+const RSS_HASH_TYPE_UDPV6: u32 = 1 << 5;
+const RSS_HASH_TYPE_IP_EX: u32 = 1 << 6;
+const RSS_HASH_TYPE_TCP_EX: u32 = 1 << 7;
+const RSS_HASH_TYPE_UDP_EX: u32 = 1 << 8;
+/// All hash-type bits the driver knows how to interpret.
+const RSS_HASH_TYPE_ALL_KNOWN: u32 = (1 << 9) - 1;
+/// Extension-header variants, masked out of the programmed config
+/// exactly as Linux does (`virtio_net.c` clears the `_EX` bits from
+/// the device-advertised set): extension-header hashing is device
+/// behavior we do not need to steer on.
+const RSS_HASH_TYPE_EX_MASK: u32 =
+    RSS_HASH_TYPE_IP_EX | RSS_HASH_TYPE_TCP_EX | RSS_HASH_TYPE_UDP_EX;
+/// Fallback hash types when the device advertises none we know:
+/// the base IPv4/IPv6 TCP/UDP set.
+const RSS_HASH_TYPE_BASE: u32 = RSS_HASH_TYPE_IPV4
+    | RSS_HASH_TYPE_TCPV4
+    | RSS_HASH_TYPE_UDPV4
+    | RSS_HASH_TYPE_IPV6
+    | RSS_HASH_TYPE_TCPV6
+    | RSS_HASH_TYPE_UDPV6;
+/// Largest indirection table we will program. The control queue's
+/// `submit_control` caps payloads at 240 bytes; a 64-entry table
+/// with a 40-byte key is 11 + 128 + 40 = 179 bytes, comfortably
+/// inside. A larger device-advertised max is simply not fully
+/// used — the mask defines the table length, not the device max.
+const RSS_MAX_INDIR_TABLE: u16 = 64;
+/// Toeplitz key length programmed into the device. 40 bytes is the
+/// minimum for full IPv6 Toeplitz (36-byte input + 32-bit output
+/// window); a smaller device-advertised max clamps it down.
+const RSS_KEY_LEN: usize = 40;
 
 const VIRTIO_NET_OK: u8 = 0;
 
@@ -214,6 +276,14 @@ const CFG_STATUS: u64 = 6;
 /// supports. Spec guarantees 1 ≤ value ≤ 0x8000.
 const CFG_MAX_VIRTQUEUE_PAIRS: u64 = 8;
 const CFG_MTU: u64 = 10;
+/// RSS device-cfg fields (packed `virtio_net_config`, valid when
+/// F_RSS or F_HASH_REPORT is offered): max key size (u8) at 17,
+/// max indirection-table length (u16 LE) at 18, supported hash
+/// types (u32 LE) at 20. Offsets follow the packed layout past
+/// speed (u32, 12–15) and duplex (u8, 16).
+const CFG_RSS_MAX_KEY_SIZE: u64 = 17;
+const CFG_RSS_MAX_INDIR_LEN: u64 = 18;
+const CFG_SUPPORTED_HASH_TYPES: u64 = 20;
 
 /// Upper bound on how many queue pairs we'll actually bring up,
 /// regardless of what `max_virtqueue_pairs` reports. Keeps DMA-page
@@ -224,7 +294,10 @@ const MAX_QUEUE_PAIRS: u16 = 4;
 
 /// virtio-net header (VirtIO 1.2 §5.1.6.1). 12 bytes when
 /// VIRTIO_F_VERSION_1 is negotiated and VIRTIO_NET_F_MRG_RXBUF /
-/// VIRTIO_NET_F_HASH_REPORT are *not* — the form we use.
+/// VIRTIO_NET_F_HASH_REPORT are *not* — the TX form, which is
+/// always 12 bytes (the hash fields are device-written on RX
+/// only). The RX header is 12 bytes, or 20 with HASH_REPORT
+/// (`VIRTIO_NET_HDR_HASH_LEN`); see `rx_hdr_len`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VirtioNetHdr {
@@ -237,12 +310,19 @@ pub struct VirtioNetHdr {
     pub num_buffers: u16,
 }
 
-const VIRTIO_NET_HDR_LEN: usize = core::mem::size_of::<VirtioNetHdr>();
+pub(crate) const VIRTIO_NET_HDR_LEN: usize = core::mem::size_of::<VirtioNetHdr>();
 pub(crate) const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 /// RX header flag (VirtIO 1.2 §5.1.6.1): the device validated the
 /// packet's checksum and it is valid. Mutually exclusive with
 /// NEEDS_CSUM (a partial checksum is, by definition, not validated).
 pub(crate) const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
+/// RX header length with VIRTIO_NET_F_HASH_REPORT negotiated
+/// (`virtio_net_hdr_v1_hash`: the 12-byte header + hash_value
+/// (u32) + hash_report (u16) + padding (u16)). The hash fields
+/// are parsed-and-skipped: no stack consumer reads them yet (a
+/// future RFS lane can read hash_value at offset 12 and
+/// hash_report at offset 16 of the RX header).
+pub(crate) const VIRTIO_NET_HDR_HASH_LEN: usize = VIRTIO_NET_HDR_LEN + 8;
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
 const ETH_HDR_LEN: usize = 14;
@@ -255,6 +335,11 @@ const TCP_ECE_OR_CWR: u8 = 0xc0;
 /// Maximum frame we'll accept on RX. Standard MTU + Ethernet header + the
 /// virtio-net header. RX GSO is deliberately not negotiated yet.
 pub const MAX_RX_FRAME: usize = 1518 + VIRTIO_NET_HDR_LEN;
+/// Largest Ethernet payload (frame minus virtio-net header) an RX
+/// buffer must hold. RX descriptor lengths are `rx_hdr_len +
+/// MAX_RX_FRAME_PAYLOAD` so a max-size frame still fits when the
+/// RX header grows to 20 bytes with HASH_REPORT.
+const MAX_RX_FRAME_PAYLOAD: usize = MAX_RX_FRAME - VIRTIO_NET_HDR_LEN;
 
 /// Largest complete Ethernet frame accepted by the bounded virtio TX GSO
 /// profile. It is deliberately the same 64 KiB order used by the TCP stack's
@@ -430,6 +515,26 @@ pub struct VirtioNetPci {
     /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
     /// the spec says treat link as always up.
     has_status: bool,
+    /// True when `VIRTIO_NET_F_RSS` was negotiated (requires
+    /// F_CTRL_VQ; the steering config goes through the control
+    /// queue). Device-side RX steering replaces the host-backend
+    /// replay the software TX affinity relied on; the affinity
+    /// itself stays as the fallback and still spreads TX.
+    has_rss: bool,
+    /// True when `VIRTIO_NET_F_HASH_REPORT` was negotiated
+    /// (requires F_CTRL_VQ). The RX header is then 20 bytes, not
+    /// 12 — see `rx_hdr_len`. The hash fields themselves are
+    /// parsed-and-skipped: no stack consumer reads them yet.
+    has_hash_report: bool,
+    /// True when the RSS_CONFIG (or HASH_CONFIG, when only hash
+    /// report was negotiated) command was accepted by the device.
+    /// Diagnostic only: a refused config costs steering, never
+    /// the device — all pairs still deliver to one Interface.
+    rss_configured: bool,
+    /// RX header length in bytes: 20 with HASH_REPORT, else 12.
+    /// Drives RX descriptor lengths and both strip sites; the TX
+    /// header is always 12 bytes.
+    rx_hdr_len: usize,
     /// TX offloads actually negotiated with this device. The legacy interface
     /// advertises exactly this profile to TCP after registration; no caller can
     /// request a partial checksum or GSO packet the transport did not accept.
@@ -539,6 +644,127 @@ impl TxOffloadProfile {
             vlan_insert: true,
         }
     }
+}
+
+/// One splitmix64 step (Stafford's constants). Used only to derive
+/// the fixed RSS Toeplitz key below — not a security primitive.
+const fn splitmix64_next(state: u64) -> (u64, u64) {
+    let next = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = next;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (next, z ^ (z >> 31))
+}
+
+/// Fixed 40-byte Toeplitz key programmed into the device's RSS
+/// config, derived at compile time from a splitmix64 stream.
+/// Deliberately fixed, not random: the key travels in plaintext
+/// over the control queue (the host sees it by design), so
+/// randomness buys no secrecy — and a fixed key makes steering
+/// reproducible across boots, which is what debugging wants.
+/// The test pins the derived bytes so an accidental key change
+/// (which would silently re-steer every flow) fails loudly.
+const fn rss_key() -> [u8; RSS_KEY_LEN] {
+    let mut key = [0u8; RSS_KEY_LEN];
+    let mut state: u64 = 0x51AB_3C7D_9E2F_4601;
+    let mut i = 0;
+    while i < RSS_KEY_LEN {
+        let (next, word) = splitmix64_next(state);
+        state = next;
+        let mut b = 0;
+        while b < 8 && i + b < RSS_KEY_LEN {
+            key[i + b] = (word >> (8 * b)) as u8;
+            b += 1;
+        }
+        i += 8;
+    }
+    key
+}
+const RSS_KEY: [u8; RSS_KEY_LEN] = rss_key();
+
+/// RX header length for a negotiated feature set: 20 bytes with
+/// HASH_REPORT, else the 12-byte base header. Pure so the strip
+/// math is testable without MMIO.
+pub(crate) const fn rx_header_len(hash_report: bool) -> usize {
+    if hash_report {
+        VIRTIO_NET_HDR_HASH_LEN
+    } else {
+        VIRTIO_NET_HDR_LEN
+    }
+}
+
+/// Hash types to program: the device-advertised set, restricted
+/// to known bits, with extension-header variants masked out
+/// (Linux's choice). Falls back to the base six when nothing
+/// known remains — a device advertising zero usable types still
+/// gets a valid config rather than a zero-type one.
+fn rss_program_hash_types(supported: u32) -> u32 {
+    let types = supported & RSS_HASH_TYPE_ALL_KNOWN & !RSS_HASH_TYPE_EX_MASK;
+    if types == 0 {
+        RSS_HASH_TYPE_BASE
+    } else {
+        types
+    }
+}
+
+/// Build a `VIRTIO_NET_CTRL_MQ_RSS_CONFIG` payload
+/// (`virtio_net_rss_config` wire layout): hash_types (LE32),
+/// indirection_table_mask (LE16), unclassified_queue (LE16 =
+/// 0, Linux's choice: unhashable frames land on pair 0),
+/// indirection_table (LE16 per entry, `i % num_pairs` — the
+/// `ethtool_rxfh_indir_default` rule), max_tx_vq (LE16 = live
+/// pair count, Linux's rule), hash_key_length, hash_key_data.
+/// Returns `None` (fail-closed: caller skips the command and
+/// keeps software affinity) when no valid config exists: zero
+/// pairs, zero key budget, or zero indirection budget from the
+/// device. Table size is the largest power of two ≤ the device
+/// max, capped at `RSS_MAX_INDIR_TABLE` by the control-queue
+/// payload ceiling; the mask is size − 1.
+pub(crate) fn build_rss_config(
+    supported_hash_types: u32,
+    num_pairs: u16,
+    indir_max: u16,
+    key_size: u8,
+) -> Option<Vec<u8>> {
+    if num_pairs == 0 || key_size == 0 || indir_max == 0 {
+        return None;
+    }
+    let mut table_size: u16 = 1;
+    let capped = indir_max.min(RSS_MAX_INDIR_TABLE);
+    while table_size * 2 <= capped {
+        table_size *= 2;
+    }
+    let key_len = (key_size as usize).min(RSS_KEY_LEN);
+    let mut payload = Vec::with_capacity(11 + 2 * table_size as usize + key_len);
+    payload.extend_from_slice(&rss_program_hash_types(supported_hash_types).to_le_bytes());
+    payload.extend_from_slice(&(table_size - 1).to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    for i in 0..table_size {
+        payload.extend_from_slice(&(i % num_pairs).to_le_bytes());
+    }
+    payload.extend_from_slice(&num_pairs.to_le_bytes());
+    payload.push(key_len as u8);
+    payload.extend_from_slice(&RSS_KEY[..key_len]);
+    Some(payload)
+}
+
+/// Build a `VIRTIO_NET_CTRL_MQ_HASH_CONFIG` payload
+/// (`virtio_net_hash_config` wire layout): hash_types (LE32),
+/// reserved[4] (8 zero bytes, for compatibility with the RSS
+/// config layout), hash_key_length, hash_key_data. Same
+/// fail-closed `None` rule as `build_rss_config` (minus the
+/// indirection table, which hash-only config does not have).
+pub(crate) fn build_hash_config(supported_hash_types: u32, key_size: u8) -> Option<Vec<u8>> {
+    if key_size == 0 {
+        return None;
+    }
+    let key_len = (key_size as usize).min(RSS_KEY_LEN);
+    let mut payload = Vec::with_capacity(13 + key_len);
+    payload.extend_from_slice(&rss_program_hash_types(supported_hash_types).to_le_bytes());
+    payload.extend_from_slice(&[0u8; 8]);
+    payload.push(key_len as u8);
+    payload.extend_from_slice(&RSS_KEY[..key_len]);
+    Some(payload)
 }
 
 /// Encode a native Rust representation of a virtio-net header into its packed
@@ -875,10 +1101,17 @@ impl VirtioNetPci {
         // VLAN_DEL. Same F_CTRL_VQ dependency.
         let want_ctrl_rx = (feats & (1u64 << VIRTIO_NET_F_CTRL_RX) != 0) && want_ctrl_vq;
         let want_ctrl_vlan = (feats & (1u64 << VIRTIO_NET_F_CTRL_VLAN) != 0) && want_ctrl_vq;
+        // F_RSS / F_HASH_REPORT gate on the control queue too: the
+        // steering + hash params travel via CTRL_MQ commands. Both
+        // live in the high feature half (bits 57/60), unlike the
+        // low-half bits above — see drv_hi.
+        let want_rss = (feats & (1u64 << VIRTIO_NET_F_RSS) != 0) && want_ctrl_vq;
+        let want_hash_report = (feats & (1u64 << VIRTIO_NET_F_HASH_REPORT) != 0) && want_ctrl_vq;
         let want_event_idx = feats & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         // virtio-net F_* bits we care about live in the low 32
-        // (max is F_CTRL_MAC_ADDR = 23; RING_F_EVENT_IDX = 29); only
-        // F_VERSION_1 = 32 is in the high half.
+        // (max is F_CTRL_MAC_ADDR = 23; RING_F_EVENT_IDX = 29) except
+        // F_HASH_REPORT = 57 and F_RSS = 60, which live in the high
+        // half; only F_VERSION_1 = 32 is also up there.
         let drv_lo = ((1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32))
             | ((1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32))
             | ((1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32))
@@ -891,7 +1124,9 @@ impl VirtioNetPci {
             | ((1u32 << VIRTIO_NET_F_CTRL_RX) * (want_ctrl_rx as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VLAN) * (want_ctrl_vlan as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32));
-        let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
+        let drv_hi = (1u32 << (VIRTIO_F_VERSION_1 - 32))
+            | ((1u32 << (VIRTIO_NET_F_HASH_REPORT - 32)) * (want_hash_report as u32))
+            | ((1u32 << (VIRTIO_NET_F_RSS - 32)) * (want_rss as u32));
         // SAFETY: same.
         unsafe {
             common.write32(CC_DRIVER_FEATURE_SELECT, 0);
@@ -1022,6 +1257,12 @@ impl VirtioNetPci {
             );
         }
 
+        // RX header length for this device: 20 bytes with
+        // HASH_REPORT, else 12. RX descriptor lengths below are
+        // `rx_hdr_len + MAX_RX_FRAME_PAYLOAD` so a max-size frame
+        // still fits under the extended header.
+        let rx_hdr_len = rx_header_len(want_hash_report);
+
         // Build the per-pair Virtqueue instances and pre-populate
         // each RX with RX_POOL_LEN empty buffers. Per-pair buffer
         // tables so refills in `rx_take` find the slot they came
@@ -1063,7 +1304,7 @@ impl VirtioNetPci {
                 let phys = buf.dma_addr().raw();
                 let descs = [VirtqDesc {
                     addr: phys,
-                    len: MAX_RX_FRAME as u32,
+                    len: (rx_hdr_len + MAX_RX_FRAME_PAYLOAD) as u32,
                     flags: VIRTQ_DESC_F_WRITE,
                     next: 0,
                 }];
@@ -1134,6 +1375,11 @@ impl VirtioNetPci {
         let mut mac = [0u8; 6];
         let mut mtu: u32 = 1500;
         let mut link_up_init = true;
+        // RSS device-cfg inputs (zero unless RSS/hash-report was
+        // offered — the fields are only valid then).
+        let mut rss_max_key_size: u8 = 0;
+        let mut rss_max_indir_len: u16 = 0;
+        let mut rss_supported_hash_types: u32 = 0;
         if let Some(r) = device_cfg.as_ref() {
             if want_mac {
                 for i in 0..6u64 {
@@ -1152,6 +1398,14 @@ impl VirtioNetPci {
                 if m >= 64 {
                     mtu = m as u32;
                 }
+            }
+            if want_rss || want_hash_report {
+                // SAFETY: same. RSS fields at packed offsets 17
+                // (u8), 18 (u16 LE), 20 (u32 LE); only valid when
+                // the device offered RSS or HASH_REPORT.
+                rss_max_key_size = unsafe { r.read8(CFG_RSS_MAX_KEY_SIZE) };
+                rss_max_indir_len = unsafe { r.read16(CFG_RSS_MAX_INDIR_LEN) };
+                rss_supported_hash_types = unsafe { r.read32(CFG_SUPPORTED_HASH_TYPES) };
             }
         }
         // Stash an initial link-state guess on the controller so
@@ -1180,6 +1434,10 @@ impl VirtioNetPci {
             has_ctrl_vlan: want_ctrl_vlan,
             mtu,
             has_status: want_status,
+            has_rss: want_rss,
+            has_hash_report: want_hash_report,
+            rss_configured: false,
+            rx_hdr_len,
             tx_checksum: want_csum,
             tx_tso4: want_tso4,
             rx_guest_csum: want_guest_csum,
@@ -1216,6 +1474,47 @@ impl VirtioNetPci {
                     // to a single pair — the extra rings stay
                     // allocated but unused, which is fine for now.
                     this.pairs.truncate(1);
+                }
+            }
+        }
+        // VirtIO 1.2 §5.1.6.5.5: device RSS steering. RSS_CONFIG
+        // also (re)sets the pair count via max_tx_vq, so it runs
+        // AFTER VQ_PAIRS_SET — if the device refuses RSS, the pair
+        // count from VQ_PAIRS_SET already stands and software
+        // affinity keeps working. Best-effort like VQ_PAIRS_SET: a
+        // refused config only costs steering, never the device
+        // (all pairs still deliver to the same Interface; a flow
+        // landing on a non-pair-0 forwarder just bypasses software
+        // GRO, the gap-9 limitation MQ already has). The pair
+        // count programmed is the LIVE count (`this.pairs.len()`),
+        // not the pre-truncation request, so a refused pairs-set
+        // that truncated to pair 0 cannot resurrect dead pairs
+        // through the RSS command. With RSS negotiated, TX
+        // affinity no longer implies RX queue correspondence
+        // (the device, not the TX queue, picks the RX queue) — it
+        // stays purely as TX-side spreading + the fallback when
+        // RSS was not negotiated.
+        if want_rss {
+            if let Some(payload) = build_rss_config(
+                rss_supported_hash_types,
+                this.pairs.len() as u16,
+                rss_max_indir_len,
+                rss_max_key_size,
+            ) {
+                if let Ok(VIRTIO_NET_OK) =
+                    this.submit_control(VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_RSS_CONFIG, &payload)
+                {
+                    this.rss_configured = true;
+                }
+            }
+        } else if want_hash_report {
+            if let Some(payload) = build_hash_config(rss_supported_hash_types, rss_max_key_size) {
+                if let Ok(VIRTIO_NET_OK) = this.submit_control(
+                    VIRTIO_NET_CTRL_MQ,
+                    VIRTIO_NET_CTRL_MQ_HASH_CONFIG,
+                    &payload,
+                ) {
+                    this.rss_configured = true;
                 }
             }
         }
@@ -1661,6 +1960,28 @@ impl VirtioNetPci {
         self.mtu
     }
 
+    /// True when `VIRTIO_NET_F_RSS` was negotiated.
+    pub fn has_rss(&self) -> bool {
+        self.has_rss
+    }
+
+    /// True when `VIRTIO_NET_F_HASH_REPORT` was negotiated.
+    pub fn has_hash_report(&self) -> bool {
+        self.has_hash_report
+    }
+
+    /// True when the device accepted the RSS_CONFIG (or
+    /// HASH_CONFIG) command. Diagnostic: a refused config only
+    /// costs steering, never the device.
+    pub fn rss_configured(&self) -> bool {
+        self.rss_configured
+    }
+
+    /// RX header length in bytes: 20 with HASH_REPORT, else 12.
+    pub fn rx_hdr_len(&self) -> usize {
+        self.rx_hdr_len
+    }
+
     /// Live link state. Reads the status word from device-cfg every
     /// call when `VIRTIO_NET_F_STATUS` was negotiated; returns
     /// `true` unconditionally otherwise (spec: absence of the
@@ -2041,10 +2362,11 @@ impl VirtioNetPci {
 
     /// Take ownership of one device-filled RX frame from the given
     /// pair. Zero-copy: returns the actual `DmaBuffer` the device
-    /// wrote into + total bytes (including the 12-byte virtio-net
-    /// header). Allocates a replacement buffer and re-posts it in
-    /// the avail ring before returning so the device always has a
-    /// place to land the next frame.
+    /// wrote into + total bytes (including the virtio-net header:
+    /// 12 bytes, or 20 with HASH_REPORT negotiated). Allocates a
+    /// replacement buffer and re-posts it in the avail ring before
+    /// returning so the device always has a place to land the next
+    /// frame.
     ///
     /// Returns `None` if the pair index is out of range, the used
     /// ring is empty, or the replacement allocation fails (in which
@@ -2119,7 +2441,7 @@ impl VirtioNetPci {
             q.free_chain(head);
             let descs = [VirtqDesc {
                 addr: rep_phys,
-                len: MAX_RX_FRAME as u32,
+                len: (self.rx_hdr_len + MAX_RX_FRAME_PAYLOAD) as u32,
                 flags: VIRTQ_DESC_F_WRITE,
                 next: 0,
             }];
@@ -2636,11 +2958,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                             if let Some(b) = to_recycle.take() {
                                 c.rx_buf_release_on(pair_idx, b);
                             }
-                            c.rx_take_on(pair_idx)
+                            (c.rx_hdr_len(), c.rx_take_on(pair_idx))
                         }) {
                             Some(t) => t,
                             None => return, // controller vanished
                         };
+                        let (rx_hdr_len, taken) = taken;
                         let (mut buf, total_len) = match taken {
                             Some(t) => t,
                             None => break,
@@ -2648,10 +2971,11 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                         // Saw a used-ring entry → the NIC is active; stay in
                         // fast-poll mode.
                         processed_any = true;
-                        // virtio-net always prepends a 12-byte header to
-                        // every RX frame. Strip it via Frame::with_offset
-                        // — the bytes stay where the device wrote them.
-                        let payload_len = total_len.saturating_sub(12);
+                        // virtio-net prepends a header to every RX frame
+                        // (12 bytes, 20 with HASH_REPORT). Strip it via
+                        // Frame::with_offset — the bytes stay where the
+                        // device wrote them.
+                        let payload_len = total_len.saturating_sub(rx_hdr_len as u32);
                         if payload_len == 0 {
                             // Empty frame (just header): recycle the buffer (on the
                             // next take's with_at) and keep draining.
@@ -2680,12 +3004,14 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                         // RX handler. Only installed for the primary controller
                         // (idx 0) — the TCP stack hooked itself there at boot via
                         // `install_rx_drain` / `on_rx_frame_from`. virtio-net
-                        // prepends a 12-byte header; dispatch the payload slice
+                        // prepends a header (12 bytes, 20 with HASH_REPORT);
+                        // dispatch the payload slice
                         // directly (no `Frame`) so the consumed DmaBuffer can be
                         // RECYCLED into the RX frame pool instead of freed — keeping
                         // the buddy allocator + per-frame 4 KiB zero-fill off the
                         // hot path.
                         if idx == 0 {
+                            let end = (rx_hdr_len + payload_len as usize).min(buf.len());
                             // `&mut`: an attached XDP program may rewrite header
                             // bytes in place. `buf` is a DmaBuffer this pump owns
                             // for the duration (recycled into the RX pool on the
@@ -2693,7 +3019,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                             // in-place write before dispatch is sound.
                             narf_net::iface::on_rx_frame_from(
                                 primary_iface_name(),
-                                &mut buf.as_mut_slice()[12..end],
+                                &mut buf.as_mut_slice()[rx_hdr_len..end],
                             );
                             // The tap consumed the frame synchronously + completely.
                             // (The legacy rx_prod/rx_cons channel is NOT drained in
@@ -2702,8 +3028,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                             to_recycle = Some(buf);
                             continue;
                         }
-                        let frame =
-                            Frame::with_offset_on_queue(buf, 12, payload_len, pair_idx as u16);
+                        let frame = Frame::with_offset_on_queue(
+                            buf,
+                            rx_hdr_len as u32,
+                            payload_len,
+                            pair_idx as u16,
+                        );
                         // Secondary controllers (idx != 0) have no
                         // synchronous tap, so the channel IS their delivery
                         // path. Push best-effort: on a full ring DROP the
@@ -3094,20 +3424,24 @@ fn vnet0_drain_fn() -> bool {
         let start = (DRAIN_PAIR_RR.fetch_add(1, Ordering::Relaxed) as usize) % pairs;
         (0..pairs).find_map(|offset| {
             let pair_idx = (start + offset) % pairs;
-            c.rx_take_on(pair_idx).map(|frame| (pair_idx, frame))
+            c.rx_take_on(pair_idx)
+                .map(|frame| (pair_idx, c.rx_hdr_len(), frame))
         })
     })
     .flatten();
-    let (pair_idx, (mut buf, total_len)) = match taken {
+    let (pair_idx, rx_hdr_len, (mut buf, total_len)) = match taken {
         Some(t) => t,
         None => return false,
     };
-    let payload_len = total_len.saturating_sub(12);
-    let end = (12 + payload_len as usize).min(buf.len());
+    let payload_len = total_len.saturating_sub(rx_hdr_len as u32);
+    let end = (rx_hdr_len + payload_len as usize).min(buf.len());
     if payload_len != 0 {
         // `&mut`: as in the async pump, the program may rewrite header bytes in
         // place. `buf` is owned here until it is recycled below.
-        narf_net::iface::on_rx_frame_from(primary_iface_name(), &mut buf.as_mut_slice()[12..end]);
+        narf_net::iface::on_rx_frame_from(
+            primary_iface_name(),
+            &mut buf.as_mut_slice()[rx_hdr_len..end],
+        );
     }
     // Recycle the consumed buffer into the RX frame pool instead of freeing.
     with_controller(|c| {
