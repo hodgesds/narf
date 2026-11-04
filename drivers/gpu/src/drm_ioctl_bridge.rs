@@ -3640,7 +3640,14 @@ fn connector_properties(
     crtc_id: u32,
 ) -> (Vec<u32>, Vec<u64>) {
     let mut props = alloc::vec![EDID_PROP_ID, CONNECTOR_CRTC_ID_PROP_ID];
-    let mut values = alloc::vec![edid_blob_id(connector_id) as u64, crtc_id as u64];
+    // drm_connector_update_edid_property: the EDID blob exists only while
+    // the connector has an EDID; the property reads 0 otherwise.
+    let edid = if connector_edid(card, connector_id).is_some() {
+        edid_blob_id(connector_id)
+    } else {
+        0
+    };
+    let mut values = alloc::vec![edid as u64, crtc_id as u64];
     if let Some(value) = card
         .native_output(connector_id)
         .and_then(|n| n.broadcast_rgb)
@@ -4694,10 +4701,10 @@ fn handle_getpropblob(
             }
             (None, Some(data)) => data,
             (None, None) => {
-                let connector_id =
-                    connector_id_from_edid_blob(blob_id).ok_or(invalid_at(line!()))?;
+                // drm_mode_getblob_ioctl: an unknown blob is ENOENT.
+                let connector_id = connector_id_from_edid_blob(blob_id).ok_or(FsError::NotFound)?;
                 connector_edid(&card, connector_id)
-                    .ok_or(invalid_at(line!()))?
+                    .ok_or(FsError::NotFound)?
                     .to_vec()
             }
         }
@@ -5314,6 +5321,23 @@ fn handle_atomic(
             &props,
             &values,
         );
+    }
+    // Bring-up: the outcome of the first real (non-TEST_ONLY) commits, so
+    // a compositor's failed modeset can be told apart from a successful
+    // commit followed by a userspace-side failure.
+    if req.flags & crate::drm::atomic::DRM_MODE_ATOMIC_TEST_ONLY == 0 {
+        static REAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if REAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: ATOMIC commit flags={:#x} objs={} props={} -> {:?}",
+                req.flags,
+                objects.len(),
+                props.len(),
+                result
+            );
+        }
     }
     result
 }

@@ -5706,3 +5706,65 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_hdmi_color_format_property
 );
+
+/// A native connector with no EDID (a disconnected port) exposes an EDID
+/// property of 0, as drm_connector_update_edid_property leaves it, and an
+/// unknown blob id is ENOENT from GETPROPBLOB (drm_mode_getblob_ioctl).
+/// KWin read the advertised-but-missing blob and got EINVAL during modeset.
+fn smoke_drm_native_connector_without_edid_has_no_edid_blob() -> TestResult {
+    use crate::drm::card::NativeOutput;
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx).unwrap();
+    ms.lock().native.push(NativeOutput {
+        connector: 31,
+        edid: None,
+        timings: vec![],
+        color_format: None,
+        broadcast_rgb: None,
+        vrr_capable: None,
+        colorspace: None,
+        hdr_output_metadata: None,
+        max_bpc: None,
+    });
+    let mut props = [0u32; 8];
+    let mut vals = [0u64; 8];
+    let mut og = [0u8; 32];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&8u32.to_le_bytes());
+    og[20..24].copy_from_slice(&31u32.to_le_bytes());
+    og[24..28].copy_from_slice(&0xc0c0_c0c0u32.to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xB9, 32),
+        og.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("OBJ_GETPROPERTIES(connector) failed");
+    }
+    let count = u32::from_le_bytes(og[16..20].try_into().unwrap()) as usize;
+    let edid = props[..count.min(8)]
+        .iter()
+        .position(|&p| p == 0x51) // EDID_PROP_ID
+        .map(|i| vals[i]);
+    if edid != Some(0) {
+        return TestResult::Fail("EDID property of a connector without EDID is not 0");
+    }
+    let mut blob = [0u8; 16];
+    blob[0..4].copy_from_slice(&(0x1000u32 | 31).to_le_bytes());
+    if dispatch_card(
+        idx,
+        iowr(DRM_IOCTL_BASE, 0xAC, 16),
+        blob.as_mut_ptr() as usize,
+        false,
+    ) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("GETPROPBLOB of a missing EDID blob is not ENOENT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_native_connector_without_edid_has_no_edid_blob
+);
