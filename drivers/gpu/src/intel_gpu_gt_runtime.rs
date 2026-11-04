@@ -3185,13 +3185,11 @@ impl Owner {
         } else {
             None
         };
+        let local = self.pending.card.intel_vram_used();
         if self.suspended.load(Ordering::Acquire)
             || state.phase != Phase::Running
             || !self.autosuspend_eligible()
             || display.is_some()
-        {
-            return Err(RpmError::Busy);
-        }
         {
             return Err(RpmError::Busy);
         }
