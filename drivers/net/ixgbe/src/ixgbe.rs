@@ -1413,7 +1413,8 @@ impl Ixgbe {
 
     /// Build the ethtool-visible snapshot: identity, queues,
     /// caps word, filter state, and the interval counters
-    /// (GPRC/GPTC are read-clear — see ethtool.rs header).
+    /// (GPRC/GPTC and QPRC/QPTC are read-clear — see
+    /// ethtool.rs header; one call consumes every interval).
     pub fn ethtool_info(&self) -> ethtool::EthtoolInfo {
         let bank = queues::MmioBank::new(&self.mmio);
         ethtool::EthtoolInfo {
@@ -1430,6 +1431,11 @@ impl Ixgbe {
             wol_supported: wol::wol_allowed(self.did, *self.wol_board_cap.lock()),
             wol_armed: self.wol_armed.lock().is_some(),
             stats: ethtool::read_stats(&bank),
+            queue_stats: ethtool::read_queue_stats(
+                &bank,
+                self.queue_config.num_rx,
+                self.queue_config.num_tx,
+            ),
         }
     }
 

@@ -6,7 +6,9 @@
 //! This module adds the driver-side snapshot the control plane
 //! reads back: identity, configured queues/caps, filter state, and
 //! the hardware counters. Grounding: 82599 Datasheet §8.2.3.23
-//! (GPRC at 0x04074, GPTC at 0x04080). Both counters are RC
+//! (GPRC at 0x04074, GPTC at 0x04080) and §8.2.3.23.74/.78
+//! (QPRC at 0x01030 + 0x40*n, QPTC at 0x06030 + 0x40*n,
+//! n = 0..15). All four counters are RC
 //! (read-clear): a snapshot consumes the interval since the last
 //! read, so snapshots are interval counters, not monotonic totals
 //! — the struct documents that, and callers must not present them
@@ -38,6 +40,44 @@ pub const ETHTOOL_VERSION: &str = "0.1.0";
 pub const REG_GPRC: u64 = 0x04074;
 pub const REG_GPTC: u64 = 0x04080;
 
+/// Number of per-queue packet counters in hardware (datasheet
+/// §8.2.3.23.74/.78; Linux ixgbe_type.h "16 of these"). Queues
+/// >= 16 have no per-queue packet counter: their traffic still
+/// counts in the GPRC/GPTC totals, but no QPRC/QPTC register
+/// exists for them.
+pub const NUM_QUEUE_COUNTERS: usize = 16;
+/// QPRC base: queue n's received-packet counter, RC
+/// (datasheet §8.2.3.23.74; Linux IXGBE_QPRC).
+pub const REG_QPRC_BASE: u64 = 0x01030;
+/// QPTC base: queue n's transmitted-packet counter, RC
+/// (datasheet §8.2.3.23.78; Linux IXGBE_QPTC). The datasheet
+/// also maps QPTC at 0x08680 + 0x4*n; this driver reads the
+/// 82598-compatible 0x06030 + 0x40*n mapping, which is the one
+/// Linux reads.
+pub const REG_QPTC_BASE: u64 = 0x06030;
+/// Per-queue counter stride (same as the queue-block stride).
+pub const QUEUE_COUNTER_STRIDE: u64 = 0x40;
+
+/// QPRC address for queue `q`, or `None` when the hardware has
+/// no per-queue receive counter for it (q >= 16).
+pub const fn qprc_addr(q: usize) -> Option<u64> {
+    if q < NUM_QUEUE_COUNTERS {
+        Some(REG_QPRC_BASE + (q as u64) * QUEUE_COUNTER_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// QPTC address for queue `q`, or `None` when the hardware has
+/// no per-queue transmit counter for it (q >= 16).
+pub const fn qptc_addr(q: usize) -> Option<u64> {
+    if q < NUM_QUEUE_COUNTERS {
+        Some(REG_QPTC_BASE + (q as u64) * QUEUE_COUNTER_STRIDE)
+    } else {
+        None
+    }
+}
+
 /// Interval statistics snapshot (RC semantics — see header).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct NicStats {
@@ -53,6 +93,48 @@ pub fn read_stats(bank: &impl RegBank) -> NicStats {
         rx_good_packets: bank.read32(REG_GPRC),
         tx_good_packets: bank.read32(REG_GPTC),
     }
+}
+
+/// Per-queue interval packet counters (RC semantics — see header).
+/// Entries at index >= `rx_valid` / `tx_valid` were not read and
+/// are 0; a 64-queue bring-up still reports only the first 16
+/// queues here (see `NUM_QUEUE_COUNTERS`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueueStats {
+    /// Interval RX packet counts for queues 0..`rx_valid`.
+    pub rx_packets: [u32; NUM_QUEUE_COUNTERS],
+    /// Interval TX packet counts for queues 0..`tx_valid`.
+    pub tx_packets: [u32; NUM_QUEUE_COUNTERS],
+    /// Valid entries in `rx_packets` = min(num_rx_queues, 16).
+    pub rx_valid: usize,
+    /// Valid entries in `tx_packets` = min(num_tx_queues, 16).
+    pub tx_valid: usize,
+}
+
+/// Read the per-queue interval counters for the configured queues
+/// (each read clears). Reads min(num_rx_queues, 16) QPRC and
+/// min(num_tx_queues, 16) QPTC registers; a snapshot that reads
+/// both `read_stats` and this consumes every interval counter in
+/// one interval.
+pub fn read_queue_stats(
+    bank: &impl RegBank,
+    num_rx_queues: usize,
+    num_tx_queues: usize,
+) -> QueueStats {
+    let mut stats = QueueStats::default();
+    stats.rx_valid = num_rx_queues.min(NUM_QUEUE_COUNTERS);
+    stats.tx_valid = num_tx_queues.min(NUM_QUEUE_COUNTERS);
+    for q in 0..stats.rx_valid {
+        if let Some(addr) = qprc_addr(q) {
+            stats.rx_packets[q] = bank.read32(addr);
+        }
+    }
+    for q in 0..stats.tx_valid {
+        if let Some(addr) = qptc_addr(q) {
+            stats.tx_packets[q] = bank.read32(addr);
+        }
+    }
+    stats
 }
 
 /// The full ethtool-visible snapshot for one device.
@@ -74,6 +156,10 @@ pub struct EthtoolInfo {
     pub wol_supported: bool,
     pub wol_armed: bool,
     pub stats: NicStats,
+    /// Per-queue interval packet counters (first 16 queues; see
+    /// `QueueStats`). Read by the same snapshot as `stats`, so
+    /// one `ethtool_info` call consumes every interval counter.
+    pub queue_stats: QueueStats,
 }
 
 impl EthtoolInfo {
