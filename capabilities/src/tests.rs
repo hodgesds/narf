@@ -301,6 +301,8 @@ fn smoke_cap_error_variants_distinct() -> TestResult {
         CapError::DomainMismatch,
         CapError::TypeMismatch,
         CapError::RightsTooWeak,
+        CapError::CapTableFull,
+        CapError::ObjectMismatch,
     ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
@@ -473,3 +475,265 @@ fn smoke_cap_empty_slot_helper() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_cap_empty_slot_helper);
+
+// ── per-task cap tables (#1283) ─────────────────────────────────────
+
+fn smoke_cap_table_new_sentinel() -> TestResult {
+    // A fresh table has INITIAL_SLOTS empty slots; position 0 is the
+    // null-cap sentinel and out-of-range positions are Revoked.
+    use crate::{CapSlot, CapTable};
+    let t = CapTable::new();
+    if t.capacity() != CapTable::INITIAL_SLOTS {
+        return TestResult::Fail("new table capacity != INITIAL_SLOTS");
+    }
+    if t.capacity() != 256 {
+        return TestResult::Fail("INITIAL_SLOTS != 256 (spec §9.7)");
+    }
+    if CapTable::MAX_SLOTS != 131_072 {
+        return TestResult::Fail("MAX_SLOTS != 131072 (spec §9.7)");
+    }
+    if CapTable::RESERVED_SLOTS != 16 {
+        return TestResult::Fail("RESERVED_SLOTS != 16 (spec §9.7)");
+    }
+    // Position 0, empty sentinel: any presentation is Revoked.
+    let probe = CapSlot::new(1, 0, 1, 0x0042);
+    if t.lookup(probe).is_ok() {
+        return TestResult::Fail("null-cap sentinel resolved");
+    }
+    // Out of range.
+    let oob = CapSlot::new(1, 256, 1, 0x0042);
+    if t.lookup(oob).is_ok() {
+        return TestResult::Fail("out-of-range lookup resolved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_new_sentinel);
+
+fn smoke_cap_table_bootstrap_region() -> TestResult {
+    // Bootstrap installs land in 0..16 in order; the 17th is
+    // CapTableFull. Each installed slot resolves through lookup.
+    use crate::{Cap, CapError, CapKind, CapSlot, CapTable, CapType, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let mut t = CapTable::new();
+    for expect in 0..16u32 {
+        let cap: Cap<TestObj, Read> = Cap::bootstrap();
+        match t.install_bootstrap(&cap) {
+            Ok(at) if at == expect => {}
+            Ok(_) => return TestResult::Fail("bootstrap slot out of order"),
+            Err(_) => return TestResult::Fail("bootstrap install failed early"),
+        }
+        let s = cap.slot();
+        let presented = CapSlot::new(s.generation, expect, s.rights, s.type_tag);
+        match t.lookup(presented) {
+            Ok(entry) if entry.index == s.index => {}
+            Ok(_) => return TestResult::Fail("lookup resolved wrong object"),
+            Err(_) => return TestResult::Fail("installed bootstrap slot did not resolve"),
+        }
+    }
+    let extra: Cap<TestObj, Read> = Cap::bootstrap();
+    if t.install_bootstrap(&extra) != Err(CapError::CapTableFull) {
+        return TestResult::Fail("17th bootstrap install did not report CapTableFull");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_bootstrap_region);
+
+fn smoke_cap_table_transfer() -> TestResult {
+    // Grant-gated transfer: receiver slot >= 16, sender retains its
+    // slot (sharing), receiver lookup resolves to the same object.
+    // Mismatched objects, revoked caps, and revoked grants refuse.
+    use crate::{Cap, CapError, CapKind, CapSlot, CapTable, CapType, Grant, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    let mut target = CapTable::new();
+    let at = match grant.transfer(&read, &mut target) {
+        Ok(at) => at,
+        Err(_) => return TestResult::Fail("Grant transfer failed"),
+    };
+    if at < 16 {
+        return TestResult::Fail("transfer landed in the bootstrap region");
+    }
+    // Sender retains: sharing semantics, both still live.
+    if !grant.is_live() || !read.is_live() {
+        return TestResult::Fail("transfer revoked the sender");
+    }
+    // Receiver lookup resolves to the same object.
+    let s = read.slot();
+    let presented = CapSlot::new(s.generation, at, s.rights, s.type_tag);
+    match target.lookup(presented) {
+        Ok(entry) if entry.index == s.index && entry.generation == s.generation => {}
+        Ok(_) => return TestResult::Fail("transfer lookup resolved wrong object"),
+        Err(_) => return TestResult::Fail("transferred slot did not resolve"),
+    }
+    // Mismatched objects: a Grant for A cannot hand out B's cap.
+    let other_grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let other_read: Cap<TestObj, Read> = other_grant.derive().unwrap();
+    let mut target2 = CapTable::new();
+    if grant.transfer(&other_read, &mut target2) != Err(CapError::ObjectMismatch) {
+        return TestResult::Fail("cross-object transfer did not report ObjectMismatch");
+    }
+    // Revoked transferred cap refuses (grant still live, cap dead).
+    let grant3: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read3: Cap<TestObj, Read> = grant3.derive().unwrap();
+    let dead = read3;
+    dead.revoke();
+    let mut target3 = CapTable::new();
+    if grant3.transfer(&read3, &mut target3) != Err(CapError::Revoked) {
+        return TestResult::Fail("revoked-cap transfer did not report Revoked");
+    }
+    // Revoked grant refuses.
+    let grant4: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read4: Cap<TestObj, Read> = grant4.derive().unwrap();
+    let dead_grant = grant4;
+    dead_grant.revoke();
+    let mut target4 = CapTable::new();
+    if grant4.transfer(&read4, &mut target4) != Err(CapError::Revoked) {
+        return TestResult::Fail("revoked-grant transfer did not report Revoked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_transfer);
+
+fn smoke_cap_table_cross_task_isolation() -> TestResult {
+    // The #1283 core property: a slot installed in table A is not
+    // usable from table B. Presenting A's bytes to B either hits an
+    // empty entry (Revoked) or resolves to B's OWN entry at that
+    // position — never to A's object.
+    use crate::{Cap, CapKind, CapSlot, CapTable, CapType, Grant, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant_a: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read_a: Cap<TestObj, Read> = grant_a.derive().unwrap();
+    let mut table_a = CapTable::new();
+    let at_a = grant_a.transfer(&read_a, &mut table_a).unwrap();
+    let s_a = read_a.slot();
+    let presented_a = CapSlot::new(s_a.generation, at_a, s_a.rights, s_a.type_tag);
+    // B empty at that position: Revoked.
+    let table_b_empty = CapTable::new();
+    if table_b_empty.lookup(presented_a).is_ok() {
+        return TestResult::Fail("A's slot resolved in an empty B table");
+    }
+    // B with its own entry at the same position: resolves to B's
+    // object, never A's.
+    let grant_b: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read_b: Cap<TestObj, Read> = grant_b.derive().unwrap();
+    let mut table_b = CapTable::new();
+    let at_b = grant_b.transfer(&read_b, &mut table_b).unwrap();
+    if at_b != at_a {
+        return TestResult::Fail("transfer slot numbering diverged between tables");
+    }
+    match table_b.lookup(presented_a) {
+        Ok(entry) if entry.index == read_b.slot().index => {}
+        Ok(_) => return TestResult::Fail("A's bytes resolved to A's object in B's table"),
+        Err(_) => return TestResult::Fail("B's own entry did not resolve"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_cross_task_isolation);
+
+fn smoke_cap_table_lookup_validation() -> TestResult {
+    // Dispatch validation order and errors: wrong generation →
+    // Revoked, wrong type → TypeMismatch, superset rights →
+    // RightsTooWeak, subset rights (downgrade) → Ok, revoked object
+    // → Revoked.
+    use crate::{Cap, CapError, CapKind, CapSlot, CapTable, CapType, Grant, Read, Rights, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    let mut t = CapTable::new();
+    let at = grant.transfer(&read, &mut t).unwrap();
+    let s = read.slot();
+    // Wrong generation.
+    let bad_gen = CapSlot::new(s.generation + 1, at, s.rights, s.type_tag);
+    if t.lookup(bad_gen) != Err(CapError::Revoked) {
+        return TestResult::Fail("wrong generation did not report Revoked");
+    }
+    // Wrong type tag.
+    let bad_type = CapSlot::new(s.generation, at, s.rights, CapKind::Domain as u32);
+    if t.lookup(bad_type) != Err(CapError::TypeMismatch) {
+        return TestResult::Fail("wrong type tag did not report TypeMismatch");
+    }
+    // Superset rights (claiming Write on a Read entry).
+    let wide = CapSlot::new(s.generation, at, Write::BITS, s.type_tag);
+    if t.lookup(wide) != Err(CapError::RightsTooWeak) {
+        return TestResult::Fail("superset rights did not report RightsTooWeak");
+    }
+    // Subset rights (downgrade to nothing held... rights=0 is a
+    // subset of any entry) resolves.
+    let narrow = CapSlot::new(s.generation, at, 0, s.type_tag);
+    if t.lookup(narrow).is_err() {
+        return TestResult::Fail("subset-rights presentation refused");
+    }
+    // Revoked object: lookup fails even with correct presentation.
+    let grant2: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read2: Cap<TestObj, Read> = grant2.derive().unwrap();
+    let mut t2 = CapTable::new();
+    let at2 = grant2.transfer(&read2, &mut t2).unwrap();
+    let killer = read2;
+    killer.revoke();
+    let s2 = read2.slot();
+    let presented2 = CapSlot::new(s2.generation, at2, s2.rights, s2.type_tag);
+    if t2.lookup(presented2) != Err(CapError::Revoked) {
+        return TestResult::Fail("revoked object's table entry still resolved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_lookup_validation);
+
+fn smoke_cap_table_growth_and_cap() -> TestResult {
+    // Growth doubles capacity (256 → 512 → …) and installing past
+    // MAX_SLOTS reports CapTableFull. Transfers are O(1) via the
+    // install cursor, so filling the table is a loop, not a scan.
+    use crate::{Cap, CapError, CapKind, CapTable, CapType, Grant, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    let mut t = CapTable::new();
+    // Fill the general region to the first growth boundary: 240
+    // installs (16..256), then the next install grows to 512.
+    for _ in 0..240 {
+        if grant.transfer(&read, &mut t).is_err() {
+            return TestResult::Fail("transfer failed before first growth");
+        }
+    }
+    if t.capacity() != 256 {
+        return TestResult::Fail("capacity moved before growth boundary");
+    }
+    if grant.transfer(&read, &mut t).is_err() {
+        return TestResult::Fail("transfer at growth boundary failed");
+    }
+    if t.capacity() != 512 {
+        return TestResult::Fail("capacity did not double at growth boundary");
+    }
+    // Fill to the hard cap: 131072 - 16 general slots total, 241
+    // already installed.
+    let remaining = (CapTable::MAX_SLOTS - 16) - 241;
+    for _ in 0..remaining {
+        if grant.transfer(&read, &mut t).is_err() {
+            return TestResult::Fail("transfer failed before hard cap");
+        }
+    }
+    if t.capacity() != CapTable::MAX_SLOTS {
+        return TestResult::Fail("capacity did not reach MAX_SLOTS");
+    }
+    if grant.transfer(&read, &mut t) != Err(CapError::CapTableFull) {
+        return TestResult::Fail("install past MAX_SLOTS did not report CapTableFull");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_growth_and_cap);

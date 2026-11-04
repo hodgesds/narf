@@ -58,7 +58,35 @@ impl<T, R: Rights> Cap<T, R> {
     pub fn revoke(self);
 }
 
-pub enum CapError { Revoked, DomainMismatch, TypeMismatch, RightsTooWeak }
+impl<T: CapType> Cap<T, Grant> {
+    /// Grant-gated cross-task transfer (§9.1). Installs `cap`'s slot
+    /// into `target`'s table; returns the receiver's task-local slot
+    /// number. Both caps must be live and name the same object, else
+    /// `ObjectMismatch`. The sender retains its slot (sharing).
+    pub fn transfer<R: Rights>(&self, cap: &Cap<T, R>, target: &mut CapTable) -> Result<u32, CapError>;
+}
+
+/// One task's capability table (§9.7). Dense slots; a position is the
+/// task-local slot number. Stored entries carry the global object
+/// index, so epoch revocation still invalidates all holders in O(1).
+pub struct CapTable { /* 256 slots initially, doubling to 131072 */ }
+
+impl CapTable {
+    pub const INITIAL_SLOTS: usize = 256;
+    pub const MAX_SLOTS: usize = 131_072;
+    pub const RESERVED_SLOTS: usize = 16; // bootstrap region 0..16
+
+    pub fn new() -> Self;
+    /// Task-creation install into the reserved region (creator-held
+    /// `&mut` is the gate; no prior Grant holder exists at mint).
+    pub fn install_bootstrap<T: CapType, R: Rights>(&mut self, cap: &Cap<T, R>) -> Result<u32, CapError>;
+    /// Task-boundary dispatch validation (§8 steps 1–4). Returns the
+    /// stored entry on success; the resolved object always comes
+    /// from the table, never from the presented bytes.
+    pub fn lookup(&self, presented: CapSlot) -> Result<CapSlot, CapError>;
+}
+
+pub enum CapError { Revoked, DomainMismatch, TypeMismatch, RightsTooWeak, CapTableFull, ObjectMismatch }
 ```
 
 **Epoch revocation mechanics.** Every capability-addressable object
@@ -230,6 +258,16 @@ and, where relevant, the badge value separately.
   CDT-shaped parent/child graph is maintained per-object for audit and
   for per-subtree mass revoke, but the *authority check* is always the
   epoch comparison. Hybrid model: CDT for audit, epoch for authority.
+- **Per-task table entries have exactly two provenances.** An entry
+  appears only via task creation (`CapTable::install_bootstrap`,
+  gated by possession of `&mut` to that task's table) or via
+  Grant-gated transfer (`Cap<T, Grant>::transfer`, both caps live,
+  same object). There is no ungated insert, and slot numbers are
+  never reused within a table's lifetime, so a stale presented slot
+  can never alias a new grant. A wire slot copied across tasks
+  resolves only against the submitting task's table (§8 step 2) —
+  the resolved object comes from the table, never from the
+  presented bytes.
 
 ## 5. Architecture notes
 
