@@ -52,12 +52,15 @@ MODULE_VA_BASE_LD = 0xFFFFFF7FE8000000;
  * after the link; the header magic is what the apply pass keys on, so an
  * unfilled reserve is a skipped slide rather than a slide by garbage.
  *
- * aarch64 needs far less than the x86_64 table: under `code-model=small` the only
- * class a slide touches is R_AARCH64_ABS64 (~86k sites, 4 bytes each), because
- * every other absolute reference is a PC-relative ADRP+ADD pair. x86_64 must
- * additionally carry ~150k R_X86_64_32S sites. 1M leaves better than 2x
- * headroom; `xtask` fails the build if the table outgrows it. */
-KASLR_RELOC_RESERVE = 1M;
+ * aarch64 still needs far less than the x86_64 table: under `code-model=small` the only
+ * class a slide touches is R_AARCH64_ABS64, because every other absolute
+ * reference is a PC-relative ADRP+ADD pair. But the site count is no longer
+ * ~86k: the wifi + Intel merges roughly tripled it to ~270k sites
+ * (1,079,276 bytes on main), past the old 1M reserve. 4M leaves ~3.9x
+ * headroom over that table; a bare bump to 2M would be only ~1.9x, less
+ * than the growth one merge wave just demonstrated. `xtask` fails the build
+ * if the table outgrows it. */
+KASLR_RELOC_RESERVE = 4M;
 
 
 
