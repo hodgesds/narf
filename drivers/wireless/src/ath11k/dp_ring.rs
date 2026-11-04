@@ -3515,7 +3515,7 @@ impl Dp {
             }
             for c in cookies {
                 let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, c);
-                let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, c) as u32;
+                let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, c);
                 if self.rx_err_buf(hal, io, &d, mac_id, buf_id, drop) {
                     tot_n_bufs_reaped += 1;
                     Self::bump_reaped(&mut reaped, mac_id);
@@ -3743,7 +3743,7 @@ impl Dp {
                 Some((cookies, _rbm)) => {
                     for c in cookies {
                         let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, c);
-                        let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, c) as u32;
+                        let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, c);
                         if self.take_rx_buf_for(mac_id, buf_id).is_some() {
                             num_buf_freed += 1;
                             Self::bump_reaped(&mut reaped, mac_id);
