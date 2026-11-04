@@ -2,9 +2,8 @@
 //! bound for the SoundWire configurations of 1022:15e2 rev 0x63 that
 //! [`crate::acp63`] leaves unbound (its probe requires the PDM mux;
 //! SoundWire-only pin configurations decline there and this driver is
-//! the next candidate — reachable once the candidate-walking probe
-//! dispatcher, PR #852, is on main; until then this binding is
-//! registered but inert, see audio spec §3.2).
+//! the next candidate under the candidate-walking probe dispatcher,
+//! PR #852, which is on main — see audio spec §3.2).
 //!
 //! The manager register model and the immediate-command framing are
 //! the ACP SDW manager's, as in Linux `drivers/soundwire/amd_manager.c`
@@ -16,9 +15,14 @@
 //! Scope notes, stated plainly:
 //! - Only the SDW0 manager instance is bound (the instance the ACP
 //!   pin configurations wire to the codec link on Phoenix laptops).
-//! - Pin configurations where PDM and SoundWire coexist are *not*
-//!   claimed here: the PDM driver owns the function then. Composing
-//!   both on one function is a follow-up to #780.
+//! - Pin configurations where PDM and SoundWire coexist are composed
+//!   by the PDM probe, not by this probe: `probe` still declines them
+//!   (the PDM driver owns the function then), but after claiming the
+//!   function the PDM probe calls `bind_composed`, which runs the
+//!   manager init + enumeration on the already-powered block and
+//!   publishes any codecs found alongside the PDM capture card
+//!   (#871). SDW presence on a PDM wiring is determined by
+//!   enumeration alone — there is no SDW pin bit to consult.
 //! - Enumerated codecs are published as sound cards with the generic
 //!   codec conversation; the ACP SDW DMA engine that moves PCM
 //!   payload between host memory and the manager lives in
@@ -331,7 +335,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
     if BOUND.lock().is_some() || crate::acp63::is_probed() {
         // Already bound, or the PDM driver owns the function (a
-        // coexisting PDM+SDW wiring; composing both is a follow-up).
+        // coexisting PDM+SDW wiring composes through the PDM probe,
+        // #871 — this probe still declines it).
         return Err(ProbeError::NotForThisDriver);
     }
     crate::native_pci::power_on(&device, &cap)?;
@@ -359,8 +364,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if crate::acp63::pin_config_has_pdm(unsafe { mmio.read32(PIN_CONFIG) }) {
         // PDM wiring present: the PDM binding owns this configuration
         // (it declined only on firmware grounds; SDW coexistence on a
-        // PDM mux is the follow-up composition, not a silent claim).
+        // PDM mux composes through the PDM probe, #871, not a silent
+        // claim here).
         return Err(ProbeError::NotForThisDriver);
+    }
+    let cards = compose_cards(mmio)?;
+    *BOUND.lock() = Some(register_cards(cards, device.addr));
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name: "acp63-sdw".into(),
+        kind: narf_drivers::BoundKind::Audio,
+        pci_vid: Some(crate::acp63::VENDOR),
+        pci_did: Some(crate::acp63::DEVICE),
+        domain: narf_drivers::BoundKind::Audio.default_domain(),
+    });
+    Ok(())
+}
+
+/// Initialise the SDW0 manager on `mmio` and build one codec card per
+/// enumerated peripheral, without publishing anything. Shared by the
+/// standalone probe and by the PDM probe's composed bind, so a codec
+/// bound either way behaves identically. On any failure the manager
+/// is disabled and no card is returned (fail closed); an empty
+/// enumeration is `NotForThisDriver`, not an error — the caller
+/// decides whether that means "decline" (standalone probe) or
+/// "PDM-only" (composed bind).
+fn compose_cards(
+    mmio: MmioRegion,
+) -> Result<Vec<Arc<CodecCard<AcpSdwTransport>>>, narf_bus::ProbeError> {
+    use narf_bus::ProbeError;
+    if mmio.len < regs::MANAGER_OFFSET + regs::SW_ERROR_INTR_MASK + 4 {
+        return Err(ProbeError::BadDevice);
     }
     let transport = AcpSdwTransport::new(mmio);
     if transport.init_manager().is_err() {
@@ -396,11 +429,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     let shared = Arc::new(IrqSafeSpinLock::new(bus));
     let mut cards = Vec::new();
-    let mut capture_card = None;
     for dev_num in enumerated {
         let mut card = CodecCard::new(shared.clone(), dev_num, GENERIC_CODEC_PROFILE, stream);
         card.set_payload_engine(Arc::new(AcpSdwDmaFactory::new(mmio)));
-        let card = Arc::new(card);
+        cards.push(Arc::new(card));
+    }
+    Ok(cards)
+}
+
+/// Publish `cards` through the sound registry under the standard SDW
+/// card identity, returning the `Bound` record the caller stores. The
+/// registry assigns distinct indices itself (`index: 0` below is
+/// overwritten); the first card's index becomes the capture card.
+fn register_cards(cards: Vec<Arc<CodecCard<AcpSdwTransport>>>, addr: narf_bus::BusAddr) -> Bound {
+    let mut capture_card = None;
+    let mut registered = Vec::new();
+    for card in cards {
         let info = narf_drivers_sound::CardInfo {
             index: 0,
             driver: "acp63-sdw",
@@ -409,17 +453,37 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             playback_count: u32::from(GENERIC_CODEC_PROFILE.sink.is_some()),
             capture_count: u32::from(GENERIC_CODEC_PROFILE.source.is_some()),
         };
-        let index =
-            narf_drivers_sound::register_hardware_card_at(info, card.clone(), Some(device.addr));
+        let index = narf_drivers_sound::register_hardware_card_at(info, card.clone(), Some(addr));
         if capture_card.is_none() {
             capture_card = Some(index);
         }
-        cards.push(card);
+        registered.push(card);
     }
-    *BOUND.lock() = Some(Bound {
-        cards,
+    Bound {
+        cards: registered,
         capture_card: capture_card.unwrap_or(0),
-    });
+    }
+}
+
+/// Bind SoundWire codecs on an ACP function the PDM probe already
+/// owns (#871): the block is already powered and reset by
+/// `acp63::Controller::init`, so this skips the standalone probe's
+/// power-on, BAR mapping, power-up, and both ownership/pin declines.
+/// SDW presence is determined by enumeration alone — there is no SDW
+/// pin bit to consult, and a PDM pin value must not veto the bind.
+/// On failure (no codecs, stuck manager) nothing is published and the
+/// error tells the PDM probe the outcome is PDM-only, not an error.
+/// Declines when this binding already bound (idempotence guard).
+pub(crate) fn bind_composed(
+    mmio: MmioRegion,
+    addr: narf_bus::BusAddr,
+) -> Result<(), narf_bus::ProbeError> {
+    use narf_bus::ProbeError;
+    if BOUND.lock().is_some() {
+        return Err(ProbeError::NotForThisDriver);
+    }
+    let cards = compose_cards(mmio)?;
+    *BOUND.lock() = Some(register_cards(cards, addr));
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: "acp63-sdw".into(),
         kind: narf_drivers::BoundKind::Audio,
@@ -740,4 +804,67 @@ mod tests {
         "audio/acp63-sdw",
         absent_peripheral_and_stuck_manager_fail_closed
     );
+
+    fn composed_bind_publishes_codecs_despite_pdm_pin_config() -> TestResult {
+        let fixture = Fixture::new(true, false);
+        // The shared BAR window as the PDM probe leaves it: block
+        // powered, PDM pin value present. The composed bind must not
+        // consult the pin value and must not disturb the block.
+        fixture.model.write(POWER_STATUS, 0);
+        fixture.model.write(CONTROL, 1);
+        fixture.model.write(PIN_CONFIG, 4);
+        let cards = match compose_cards(fixture.model.mmio) {
+            Ok(cards) => cards,
+            Err(_) => return TestResult::Fail("composed bind failed with answering codec"),
+        };
+        if cards.len() != 1 {
+            return TestResult::Fail("composed bind must yield exactly one card");
+        }
+        if fixture.model.assigned != Some(1) {
+            return TestResult::Fail("enumeration did not assign device 1");
+        }
+        if fixture.model.read(POWER_STATUS) != 0
+            || fixture.model.read(CONTROL) != 1
+            || fixture.model.read(RESET) != 0
+            || fixture.model.read(PIN_CONFIG) != 4
+        {
+            return TestResult::Fail("composed bind disturbed PDM block registers");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/acp63-sdw",
+        composed_bind_publishes_codecs_despite_pdm_pin_config
+    );
+
+    fn composed_bind_empty_bus_fails_closed() -> TestResult {
+        let fixture = Fixture::new(false, false);
+        if !matches!(
+            compose_cards(fixture.model.mmio),
+            Err(narf_bus::ProbeError::NotForThisDriver)
+        ) {
+            return TestResult::Fail("empty bus must decline composed bind");
+        }
+        // Manager disabled again: no powered-but-dead manager left behind.
+        if fixture.model.read(regs::MANAGER_OFFSET + regs::SW_EN) != 0 {
+            return TestResult::Fail("empty bus must disable the manager");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp63-sdw", composed_bind_empty_bus_fails_closed);
+
+    fn composed_bind_stuck_manager_fails_closed() -> TestResult {
+        let fixture = Fixture::new(true, true);
+        if !matches!(
+            compose_cards(fixture.model.mmio),
+            Err(narf_bus::ProbeError::BadDevice)
+        ) {
+            return TestResult::Fail("stuck manager must fail composed bind");
+        }
+        if fixture.model.read(regs::MANAGER_OFFSET + regs::SW_EN) != 0 {
+            return TestResult::Fail("stuck manager must be disabled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp63-sdw", composed_bind_stuck_manager_fails_closed);
 }

@@ -728,6 +728,13 @@ fn probe_63(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf
         Some(device.addr),
     );
     *CONTROLLER.lock() = Some((dev.clone(), card));
+    // Compose SoundWire alongside PDM when the function is wired for
+    // both (#871): the manager init + enumeration runs on the block
+    // this probe already powered, and any codecs found are published
+    // as SDW cards next to the PDM capture card. Failure here is not
+    // a PDM error — it just means PDM-only, exactly as before — so
+    // the result is deliberately swallowed.
+    let _ = crate::acp63_sdw::bind_composed(dev.mmio, device.addr);
     let weak = Arc::downgrade(&dev);
     narf_scheduler::spawn(async move {
         loop {
