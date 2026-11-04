@@ -294,6 +294,18 @@ const REG_TDT: u64 = 0x3818;
 const REG_RAL0: u64 = 0x5400;
 const REG_RAH0: u64 = 0x5404;
 
+// VLAN filtering (802.1Q) — 8254x SDM §3.2.9 + §13 register block.
+// VET holds the ethertype a packet must match to count as VLAN;
+// VFTA is the 4096-bit VID filter (128 words of 32 bits). The
+// 0x038 / 0x5600 bases are the shared 8254x register map, the same
+// bases NARF's igb driver programs for its family (see
+// drivers/net/igb/src/igb.rs); the 82540EP datasheet confirms
+// 802.1Q filtering "for up to 4096 VLAN tags".
+const REG_VET: u64 = 0x038; // VLAN Ether Type
+const VET_8021Q: u32 = 0x8100;
+const REG_VFTA_BASE: u64 = 0x5600; // VLAN Filter Table Array
+const VFTA_WORDS: usize = 128; // 4096 VIDs / 32 bits per word
+
 // PCH (Lynx Point onward) — Management Engine PHY-ownership
 // handshake. The Intel ME shares the integrated PHY with the host
 // on I217/I218/I219 (`drivers/net/ethernet/intel/e1000e/ich8lan.c`
@@ -352,6 +364,16 @@ pub const EEER_LPI_MASK: u32 = EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC;
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6; // Set Link Up
+// VLAN Mode Enable (8254x SDM §13.4.1). The single VLAN-mode gate
+// for both directions: on RX, a VET-matching packet has its 4-byte
+// tag stripped and the TCI recorded in the descriptor's `special`
+// field (SDM §3.2); on TX, it enables VLE tag insertion (SDM
+// §3.3.3.1: "otherwise VLE capability is ignored"). NOTE: SDM §3.2
+// prose writes "RCTL.VME", but the §13 register tables place VME
+// only in CTRL bit 30, and §3.3.3.1 confirms CTRL.VME gates VLE —
+// this driver treats CTRL.VME as the one gate, and the RX path
+// re-inserts stripped tags, so leaving it set once enabled is safe.
+const CTRL_VME: u32 = 1 << 30; // VLAN Mode Enable
 
 // TCTL bits.
 const TCTL_EN: u32 = 1 << 1;
@@ -366,6 +388,11 @@ const TIPG_COPPER_DEFAULT: u32 = 8 | (8 << 10) | (6 << 20);
 const TXD_CMD_EOP: u8 = 1 << 0;
 const TXD_CMD_IFCS: u8 = 1 << 1; // Insert FCS
 const TXD_CMD_RS: u8 = 1 << 3; // Report Status
+// VLAN Packet Enable (8254x SDM §3.3.3.1, Table 3-10): when set on
+// a legacy data descriptor, hardware inserts the 802.1Q tag (VET
+// ethertype + the descriptor's `special` TCI) into the transmitted
+// frame. Requires CTRL.VME set, and is valid only when EOP is set.
+const TXD_CMD_VLE: u8 = 1 << 6; // VLAN Packet Enable
 const TXD_STAT_DD: u8 = 1 << 0; // Done
 
 // TX checksum / TSO bits for the legacy e1000 descriptor.
@@ -414,6 +441,10 @@ const RCTL_UPE: u32 = 1 << 3; // Unicast Promiscuous
 const RCTL_MPE: u32 = 1 << 4; // Multicast Promiscuous
 const RCTL_BAM: u32 = 1 << 15; // Broadcast Accept
 const RCTL_BSIZE_2K: u32 = 0 << 16; // Buffer Size = 2048
+// VLAN Filter Enable (8254x SDM §13.4.22). When set, a received
+// 802.1Q frame (type matches VET) is accepted only if its VID bit
+// is set in the VFTA; otherwise it is dropped (SDM §3.2.9).
+const RCTL_VFE: u32 = 1 << 18; // VLAN Filter Enable
 const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC
 
 // RX descriptor status flags.
@@ -673,6 +704,124 @@ impl TxDesc {
             special: 0,
         }
     }
+
+    /// Build a legacy (non-offload) data descriptor. `vlan_tag` is
+    /// `Some(tci)` for a VLAN-inserted frame: hardware adds the VET
+    /// ethertype + tag (SDM §3.3.3.1) and the caller must have set
+    /// CTRL.VME first; `None` is the plain descriptor the TX path
+    /// has always built (VLE clear, `special` zero).
+    pub fn legacy_data(addr: u64, len: u16, vlan_tag: Option<u16>) -> Self {
+        let mut cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
+        let mut special = 0u16;
+        if let Some(tci) = vlan_tag {
+            // VLE is valid only when EOP is set (SDM Table 3-10);
+            // legacy_data always marks EOP, so this is safe here.
+            cmd |= TXD_CMD_VLE;
+            special = tci;
+        }
+        TxDesc {
+            addr,
+            length: len,
+            cso: 0,
+            cmd,
+            status: 0,
+            css: 0,
+            special,
+        }
+    }
+}
+
+// ── VLAN filtering (802.1Q) ────────────────────────────────────────
+// 8254x SDM §3.2.9: the VFTA is a 4096-bit vector indexed by VID.
+// `VlanFilter` is the driver's shadow of that table: every register
+// write the driver performs is computed from this shadow, so the
+// fixture tests pin the exact word/value pairs the hardware sees.
+
+/// VFTA word holding `vid`'s bit (VIDs 0..=4095 map onto words
+/// 0..=127, 32 VIDs per word).
+fn vfta_word(vid: u16) -> usize {
+    vid as usize / 32
+}
+
+/// Bit within its VFTA word for `vid`.
+fn vfta_bit(vid: u16) -> u32 {
+    1u32 << (vid % 32)
+}
+
+/// Shadow of the hardware VFTA plus the count of programmed VIDs.
+/// `add`/`remove` return `true` iff the shadow changed; duplicates
+/// and out-of-range VIDs are no-ops (the caller distinguishes them
+/// with [`VlanFilter::contains`]).
+#[derive(Clone, Debug, Default)]
+pub struct VlanFilter {
+    words: [u32; VFTA_WORDS],
+    count: usize,
+}
+
+impl VlanFilter {
+    pub const fn new() -> Self {
+        Self {
+            words: [0; VFTA_WORDS],
+            count: 0,
+        }
+    }
+
+    pub fn add(&mut self, vid: u16) -> bool {
+        if vid > 4095 || self.contains(vid) {
+            return false;
+        }
+        self.words[vfta_word(vid)] |= vfta_bit(vid);
+        self.count += 1;
+        true
+    }
+
+    pub fn remove(&mut self, vid: u16) -> bool {
+        if !self.contains(vid) {
+            return false;
+        }
+        self.words[vfta_word(vid)] &= !vfta_bit(vid);
+        self.count -= 1;
+        true
+    }
+
+    pub fn contains(&self, vid: u16) -> bool {
+        vid <= 4095 && self.words[vfta_word(vid)] & vfta_bit(vid) != 0
+    }
+
+    pub fn word(&self, word: usize) -> u32 {
+        self.words[word]
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Split a descriptor `special` field (the stripped 802.1Q TCI,
+/// SDM §3.2 Table 3-4) into (VID, user priority, CFI).
+fn vlan_tci_parts(tci: u16) -> (u16, u8, bool) {
+    (tci & 0x0FFF, ((tci >> 13) & 0x7) as u8, tci & 0x1000 != 0)
+}
+
+/// Restore the wire format of a VLAN frame the hardware stripped:
+/// shift the payload (everything after the 12-byte MAC header)
+/// right by 4 bytes and write the TPID + TCI in the gap. `buf` is
+/// the caller's buffer holding `len` stripped bytes; returns the
+/// new length, or `None` when the frame is shorter than an Ethernet
+/// header or the buffer has no room for the 4 re-inserted bytes
+/// (caller then delivers the stripped frame as-is).
+fn vlan_reinsert_tag(buf: &mut [u8], len: usize, tci: u16) -> Option<usize> {
+    if len < 14 || buf.len() < len + 4 {
+        return None;
+    }
+    buf.copy_within(12..len, 16);
+    buf[12..14].copy_from_slice(&(VET_8021Q as u16).to_be_bytes());
+    buf[14..16].copy_from_slice(&tci.to_be_bytes());
+    Some(len + 4)
 }
 
 impl TxContextDesc {
@@ -1001,6 +1150,11 @@ pub struct E1000 {
     /// completion). The hardware writes to RDT and we lag behind
     /// reading at this index.
     rx_head: IrqSafeSpinLock<u32>,
+    /// Shadow of the hardware VLAN filter table (VFTA). VLAN mode
+    /// is opt-in: the first VID added programs VET + RCTL.VFE +
+    /// CTRL.VME; the last VID removed clears RCTL.VFE (CTRL.VME
+    /// stays set — see `vlan_filter_remove`).
+    vlan_filter: IrqSafeSpinLock<VlanFilter>,
     /// MAC address read from RAL/RAH at bring-up.
     pub mac: [u8; 6],
     /// True after CTRL_SLU has been set + STATUS reports link up.
@@ -1400,6 +1554,7 @@ impl E1000 {
             rx_ring,
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
+            vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
             mac,
             link_up,
             _msix: msix,
@@ -1505,7 +1660,7 @@ impl E1000 {
     /// path is what bring-up tests run, and it's also the synchronous
     /// fallback for callers that can't await.
     pub fn tx(&self, frame: &[u8]) -> Result<(), E1000Error> {
-        let ticket = self.tx_enqueue(frame, true)?;
+        let ticket = self.tx_enqueue(frame, true, None)?;
         let done = narf_scheduler::responsive_spin_until(
             || self.tx_slot_done(ticket),
             narf_time::Deadline::after_ms(250),
@@ -1570,16 +1725,9 @@ impl E1000 {
         dma_addr: u64,
         len: usize,
         kick: bool,
+        vlan_tag: Option<u16>,
     ) {
-        let desc = TxDesc {
-            addr: dma_addr,
-            length: len as u16,
-            cso: 0,
-            cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
-            status: 0,
-            css: 0,
-            special: 0,
-        };
+        let desc = TxDesc::legacy_data(dma_addr, len as u16, vlan_tag);
         let desc_off = (ticket.slot * core::mem::size_of::<TxDesc>()) as u64;
         // SAFETY: the cursor only reserves slots in `[0, TX_RING_LEN)` and the
         // descriptor ring is exactly `TX_RING_LEN * size_of::<TxDesc>()` bytes.
@@ -1669,7 +1817,12 @@ impl E1000 {
 
     /// Copy into a persistent per-slot buffer and enqueue. Ring-full waits are
     /// exceptional and bounded; normal traffic publishes immediately.
-    fn tx_enqueue(&self, frame: &[u8], kick: bool) -> Result<TxTicket, E1000Error> {
+    fn tx_enqueue(
+        &self,
+        frame: &[u8],
+        kick: bool,
+        vlan_tag: Option<u16>,
+    ) -> Result<TxTicket, E1000Error> {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(E1000Error::FrameTooLong);
         }
@@ -1699,6 +1852,7 @@ impl E1000 {
                     self.tx_pool[slot].dma_addr().raw(),
                     frame.len(),
                     kick,
+                    vlan_tag,
                 );
                 ticket = Some(reserved);
                 true
@@ -1738,7 +1892,7 @@ impl E1000 {
                 };
                 debug_assert!(state.owned[reserved.slot].is_none());
                 state.owned[reserved.slot] = owned.take();
-                self.post_tx_locked(&mut state, reserved, buf_phys, len, kick);
+                self.post_tx_locked(&mut state, reserved, buf_phys, len, kick, None);
                 ticket = Some(reserved);
                 true
             },
@@ -1751,6 +1905,97 @@ impl E1000 {
             return Err(E1000Error::TxTimeout);
         }
         ticket.ok_or(E1000Error::Other("TX reservation lost"))
+    }
+
+    /// Enable VLAN mode in hardware: program VET to 802.1Q, then
+    /// set RCTL.VFE (filter) and CTRL.VME (strip/insert gate).
+    /// Called on the first VID add; VET is programmed before the
+    /// enable bits so no frame is filtered against a stale
+    /// ethertype.
+    fn vlan_mode_enable(&self) {
+        // SAFETY: mapped MMIO; VET/RCTL/CTRL are valid 32-bit
+        // register offsets within BAR0.
+        unsafe {
+            self.mmio.write32(REG_VET, VET_8021Q);
+            let rctl = self.mmio.read32(REG_RCTL);
+            self.mmio.write32(REG_RCTL, rctl | RCTL_VFE);
+            let ctrl = self.mmio.read32(REG_CTRL);
+            self.mmio.write32(REG_CTRL, ctrl | CTRL_VME);
+        }
+    }
+
+    /// Opt a VID into the hardware VLAN filter (shadow + the one
+    /// VFTA word; enabling VLAN mode on the first VID). Returns
+    /// `true` iff the VID is now in the filter (`false` only for
+    /// VID > 4095). Duplicate adds are no-ops that still return
+    /// `true`.
+    pub fn vlan_filter_add(&self, vid: u16) -> bool {
+        let mut filter = self.vlan_filter.lock();
+        let changed = filter.add(vid);
+        if !changed {
+            return filter.contains(vid);
+        }
+        let word = vfta_word(vid);
+        let value = filter.word(word);
+        let first = filter.count() == 1;
+        drop(filter);
+        // SAFETY: mapped MMIO; VFTA word `word` is within the
+        // 128-word table for any valid VID.
+        unsafe {
+            self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+        }
+        if first {
+            self.vlan_mode_enable();
+        }
+        true
+    }
+
+    /// Remove a VID from the hardware VLAN filter. Returns `true`
+    /// iff the VID was present (and is now removed). Clearing the
+    /// last VID clears RCTL.VFE so VLAN frames pass unfiltered;
+    /// CTRL.VME stays set: it only affects VET-matching packets,
+    /// and the RX path re-inserts their tags, so leaving it set
+    /// cannot corrupt untagged traffic — while clearing it
+    /// mid-stream could un-strip a frame already in flight.
+    pub fn vlan_filter_remove(&self, vid: u16) -> bool {
+        let mut filter = self.vlan_filter.lock();
+        if !filter.remove(vid) {
+            return false;
+        }
+        let word = vfta_word(vid);
+        let value = filter.word(word);
+        let empty = filter.is_empty();
+        drop(filter);
+        // SAFETY: mapped MMIO; see `vlan_filter_add`.
+        unsafe {
+            self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+            if empty {
+                let rctl = self.mmio.read32(REG_RCTL);
+                self.mmio.write32(REG_RCTL, rctl & !RCTL_VFE);
+            }
+        }
+        true
+    }
+
+    /// Number of VIDs currently in the hardware VLAN filter.
+    pub fn vlan_filter_count(&self) -> usize {
+        self.vlan_filter.lock().count()
+    }
+
+    /// Transmit one frame with an 802.1Q tag inserted by hardware
+    /// (VLE + `special` TCI, SDM §3.3.3.1). Ensures CTRL.VME is set
+    /// first — without it VLE is ignored. Same single-descriptor
+    /// 1518-byte bound as `tx_enqueue`; the stack's untagged path
+    /// is untouched.
+    pub fn tx_send_vlan(&self, frame: &[u8], tci: u16) -> Result<TxTicket, E1000Error> {
+        // SAFETY: mapped MMIO; CTRL is a valid 32-bit register.
+        unsafe {
+            let ctrl = self.mmio.read32(REG_CTRL);
+            if ctrl & CTRL_VME == 0 {
+                self.mmio.write32(REG_CTRL, ctrl | CTRL_VME);
+            }
+        }
+        self.tx_enqueue(frame, true, Some(tci))
     }
 
     /// Zero-copy synchronous compatibility path. The caller retains the DMA
@@ -1858,6 +2103,16 @@ impl E1000 {
                 )
             };
         }
+        // VLAN: hardware stripped the tag and recorded the TCI in
+        // `special` (SDM §3.2). Restore the wire format in the
+        // caller's buffer when it has room; otherwise deliver the
+        // stripped frame (documented corner — the polled path's
+        // caller owns the buffer size).
+        let len = if desc.special != 0 {
+            vlan_reinsert_tag(out, len, desc.special).unwrap_or(len)
+        } else {
+            len
+        };
         // Rearm the descriptor: clear status, leave addr as-is.
         let new_desc = RxDesc {
             addr: buf_phys,
@@ -1922,9 +2177,25 @@ impl E1000 {
             // written (we re-arm only after `f` returns); it is identity-mapped
             // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
             // the buffer. An XDP rewrite in `f` writes the DMA page we own.
-            let frame = unsafe {
-                core::slice::from_raw_parts_mut(self.rx_pool[head].cpu_mut_ptr_at::<u8>(0), len)
+            // VLAN: when CTRL.VME is set, hardware strips the tag and
+            // records the TCI in `special` (SDM §3.2). Re-tag in place
+            // before the stack sees the frame; the DMA page holds
+            // RX_BUF_LEN bytes, so a stripped frame with room for 4
+            // more bytes is restored to wire format. `special == 0`
+            // is delivered as-is: either untagged, or a priority-only
+            // tag (VID 0, priority 0, CFI 0), which carries no VLAN
+            // membership and is indistinguishable from untagged in
+            // the legacy descriptor. A frame that exactly fills the
+            // buffer cannot be re-tagged in place and is delivered
+            // stripped (documented corner).
+            let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
+            let deliver_len = if desc.special != 0 {
+                let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
+                vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
+            } else {
+                len
             };
+            let frame = unsafe { core::slice::from_raw_parts_mut(page, deliver_len) };
             f(frame);
             // Re-arm the descriptor: clear status, keep the same buffer
             // address. The final compiler fence orders every descriptor write
@@ -2222,7 +2493,7 @@ fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
             .tx_tso_owned(buf, frame.len(), context, !meta.more)
             .map_err(|_| ());
     }
-    ctrl.tx_enqueue(frame, !meta.more)
+    ctrl.tx_enqueue(frame, !meta.more, None)
         .map(|_| ())
         .map_err(|_| ())
 }
@@ -2530,7 +2801,7 @@ impl crate::HwNic for E1000Nic {
         crate::NicModel::IntelE1000
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM
+        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM | crate::NicCaps::VLAN_TAGGING
     }
     fn ring_capacity(&self) -> usize {
         RX_RING_LEN
@@ -2629,7 +2900,7 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // normally; if it doesn't, the IRQ isn't wired right and we
     // should bail rather than stall.
     let waiter = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500));
-    let ticket = match with_controller(|c| c.tx_enqueue(frame, true))
+    let ticket = match with_controller(|c| c.tx_enqueue(frame, true, None))
         .unwrap_or(Err(E1000Error::UnsupportedDevice))
     {
         Ok(s) => s,
@@ -2654,7 +2925,10 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
 mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use super::{TxQueueState, TX_RING_USABLE};
+    use super::{
+        vlan_reinsert_tag, vlan_tci_parts, vfta_bit, vfta_word, TxDesc, TxQueueState, VlanFilter,
+        TXD_CMD_EOP, TXD_CMD_IFCS, TXD_CMD_RS, TXD_CMD_VLE, TX_RING_USABLE,
+    };
 
     fn smoke_partial_tso_ring_requires_deferred_batch_flush() -> TestResult {
         let mut state = TxQueueState::new();
@@ -2701,4 +2975,117 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_link_sample_from_status_decodes);
+
+    fn smoke_vlan_vfta_mapping() -> TestResult {
+        // Boundary VIDs: first/last bit of the first word, first bit
+        // of the second word, last VID of the table.
+        if vfta_word(0) != 0 || vfta_bit(0) != 1 {
+            return TestResult::Fail("e1000 VFTA mapping wrong for VID 0");
+        }
+        if vfta_word(31) != 0 || vfta_bit(31) != (1 << 31) {
+            return TestResult::Fail("e1000 VFTA mapping wrong for VID 31");
+        }
+        if vfta_word(32) != 1 || vfta_bit(32) != 1 {
+            return TestResult::Fail("e1000 VFTA mapping wrong for VID 32");
+        }
+        if vfta_word(4095) != 127 || vfta_bit(4095) != (1 << 31) {
+            return TestResult::Fail("e1000 VFTA mapping wrong for VID 4095");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_vlan_vfta_mapping);
+
+    fn smoke_vlan_filter_shadow() -> TestResult {
+        let mut filter = VlanFilter::new();
+        if !filter.is_empty() || filter.count() != 0 {
+            return TestResult::Fail("e1000 VlanFilter not empty on creation");
+        }
+        if filter.add(4096) || filter.contains(4096) {
+            return TestResult::Fail("e1000 VlanFilter accepted VID > 4095");
+        }
+        if !filter.add(0) || !filter.add(32) || !filter.add(1) {
+            return TestResult::Fail("e1000 VlanFilter rejected a valid VID");
+        }
+        if filter.add(0) || filter.count() != 3 {
+            return TestResult::Fail("e1000 VlanFilter duplicate add changed the shadow");
+        }
+        // Word 0 holds VIDs 0 and 1; word 1 holds VID 32.
+        if filter.word(0) != 0b11 || filter.word(1) != 1 {
+            return TestResult::Fail("e1000 VlanFilter shadow words wrong");
+        }
+        if !filter.remove(0) || filter.contains(0) || filter.word(0) != 0b10 {
+            return TestResult::Fail("e1000 VlanFilter remove did not clear VID 0");
+        }
+        if filter.remove(0) || filter.remove(4096) {
+            return TestResult::Fail("e1000 VlanFilter remove of absent VID reported success");
+        }
+        if !filter.remove(1) || !filter.remove(32) || !filter.is_empty() {
+            return TestResult::Fail("e1000 VlanFilter did not empty after removing all VIDs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_vlan_filter_shadow);
+
+    fn smoke_vlan_tci_parts() -> TestResult {
+        // TCI layout (SDM Table 3-4): PRI[15:13], CFI[12], VID[11:0].
+        if vlan_tci_parts(0x0000) != (0, 0, false) {
+            return TestResult::Fail("e1000 TCI decode wrong for 0x0000");
+        }
+        if vlan_tci_parts(0xF123) != (0x123, 7, true) {
+            return TestResult::Fail("e1000 TCI decode wrong for 0xF123");
+        }
+        if vlan_tci_parts(0x0064) != (100, 0, false) {
+            return TestResult::Fail("e1000 TCI decode wrong for VID 100");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_vlan_tci_parts);
+
+    fn smoke_vlan_reinsert_tag() -> TestResult {
+        // Stripped frame: dst(6) + src(6) + ethertype(2) + "ABCD".
+        let mut buf = [0u8; 32];
+        buf[0..6].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        buf[6..12].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        buf[12..14].copy_from_slice(&[0x08, 0x00]);
+        buf[14..18].copy_from_slice(b"ABCD");
+        let new_len = vlan_reinsert_tag(&mut buf, 18, 0x0064);
+        if new_len != Some(22) {
+            return TestResult::Fail("e1000 VLAN reinsert returned wrong length");
+        }
+        if buf[12..14] != [0x81, 0x00] || buf[14..16] != [0x00, 0x64] {
+            return TestResult::Fail("e1000 VLAN reinsert wrote wrong TPID/TCI");
+        }
+        if buf[16..18] != [0x08, 0x00] || buf[18..22] != *b"ABCD" {
+            return TestResult::Fail("e1000 VLAN reinsert misplaced the payload");
+        }
+        // No room for the 4 bytes: refuses, buffer untouched.
+        let mut tight = [0u8; 20];
+        tight[0..18].copy_from_slice(&buf[0..18]);
+        if vlan_reinsert_tag(&mut tight, 18, 0x0064).is_some() {
+            return TestResult::Fail("e1000 VLAN reinsert grew a too-small buffer");
+        }
+        // Shorter than an Ethernet header: refuses.
+        let mut short = [0u8; 32];
+        if vlan_reinsert_tag(&mut short, 10, 0x0064).is_some() {
+            return TestResult::Fail("e1000 VLAN reinsert accepted a runt frame");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_vlan_reinsert_tag);
+
+    fn smoke_vlan_tx_descriptor() -> TestResult {
+        let plain = TxDesc::legacy_data(0x1000, 64, None);
+        if plain.cmd != (TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS) || plain.special != 0 {
+            return TestResult::Fail("e1000 plain TX descriptor changed shape");
+        }
+        let tagged = TxDesc::legacy_data(0x1000, 64, Some(0x0064));
+        if tagged.cmd & TXD_CMD_VLE == 0 || tagged.special != 0x0064 {
+            return TestResult::Fail("e1000 VLAN TX descriptor missing VLE/TCI");
+        }
+        if tagged.cmd & TXD_CMD_EOP == 0 {
+            return TestResult::Fail("e1000 VLAN TX descriptor missing EOP (VLE requires it)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_vlan_tx_descriptor);
 }
