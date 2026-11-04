@@ -1267,7 +1267,9 @@ exclusive; flags, reserved fields, unknown extensions and same-point
 timeline WAIT|SIGNAL fail before publication. A cycle is walked to the 513th
 link (E2BIG), as is any longer chain. Each array follows
 add_fence_array/add_timeline_fence_array: the overflow bound (EINVAL), access_ok
-of each user array (EFAULT) and the eb->fences krealloc (ENOMEM once more than
+of each user array (EFAULT unless `ptr + size` neither wraps nor exceeds Linux's
+USER_PTR_MAX: `(1 << 47) - 4096` on x86_64, TASK_SIZE_MAX `1 << 48` on
+aarch64) and the eb->fences krealloc (ENOMEM once more than
 KMALLOC_MAX_SIZE/32 = 131072 entries are added across the request; skipped
 timeline entries do not count) precede the entries. Each entry is then copied
 (EFAULT), flag-checked (EINVAL), its point read (EFAULT), its syncobj found

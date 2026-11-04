@@ -26,9 +26,16 @@ const FENCE_ENTRIES_MAX: u64 = u64::MAX / EB_FENCE_BYTES;
 /// so at most 131072 entries are ever added: the only fence bound Linux
 /// has, and the one NARF keeps. Allocation failure below it is -ENOMEM too.
 const KMALLOC_MAX_SIZE: u64 = 1 << 22;
-/// The first address above the user half: NARF's split, as
-/// drm_ioctl_bridge's USER_VA_LIMIT.
-const USER_VA_LIMIT: u64 = 1 << 47;
+/// The highest `ptr + size` access_ok admits. x86_64:
+/// arch/x86/kernel/cpu/common.c sets USER_PTR_MAX = TASK_SIZE_MAX, which
+/// page_64.h::task_size_max makes `(1 << 47) - PAGE_SIZE` with 4-level
+/// paging; uaccess_64.h::valid_user_address compares `<=` it.
+#[cfg(not(target_arch = "aarch64"))]
+const USER_PTR_MAX: u64 = (1 << 47) - 4096;
+/// aarch64: asm-generic/access_ok.h::__access_ok's limit is TASK_SIZE_MAX,
+/// `1 << VA_BITS` (processor.h), 48-bit here; `addr <= limit - size`.
+#[cfg(target_arch = "aarch64")]
+const USER_PTR_MAX: u64 = 1 << 48;
 
 struct Dependency {
     fence: Arc<dyn DrmFence>,
@@ -70,13 +77,15 @@ fn element(user: &dyn IoctlContext, array: u64, n: u64) -> Result<[u8; 8], FsErr
     Ok(bytes)
 }
 
-/// x86_64 `__access_ok` for a non-constant size: `ptr + size` must not wrap
-/// and must stay a user address. Null passes, as in Linux; its first
-/// element copy faults instead.
+/// `__access_ok` for a non-constant size: `ptr + size` must not wrap and
+/// must not pass USER_PTR_MAX (x86_64's `valid_user_address(sum) && sum >=
+/// ptr`; arm64's u65 `addr + size <= TASK_SIZE_MAX`). Null passes, as in
+/// Linux; its first element copy faults instead. LINUX-GAP: arm64 untags a
+/// TIF_TAGGED_ADDR pointer first; NARF has no tagged-address ABI.
 fn access_ok(address: u64, size: u64) -> bool {
     address
         .checked_add(size)
-        .is_some_and(|end| end <= USER_VA_LIMIT)
+        .is_some_and(|end| end <= USER_PTR_MAX)
 }
 
 /// drm_syncobj_find: the object behind `handle`, referenced; -ENOENT.

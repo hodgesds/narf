@@ -407,7 +407,13 @@ kernel_test_in!(
 fn smoke_explicit_fence_arrays_resolve_entry_by_entry() -> TestResult {
     use crate::intel_gpu_exec_sync::SyncRequest;
     const END: u64 = 32768; // first unreadable fixture byte
-    const USER_LIMIT: u64 = 1 << 47; // NARF's user half, as access_ok's
+    // access_ok's bound, spelled out: x86_64 USER_PTR_MAX = TASK_SIZE_MAX =
+    // (1 << 47) - PAGE_SIZE; arm64 TASK_SIZE_MAX = 1 << 48.
+    const USER_LIMIT: u64 = if cfg!(target_arch = "aarch64") {
+        1 << 48
+    } else {
+        (1 << 47) - 4096
+    };
     let file = RenderFile::new();
     let user = Fds::new();
     let handle = file.syncobjs.lock().create(0).unwrap();
@@ -478,6 +484,26 @@ fn smoke_explicit_fence_arrays_resolve_entry_by_entry() -> TestResult {
         link(1536, 0, count, 1024, values);
         assert_eq!(timeline(1536), Err(expected), "preamble {count}");
     }
+    // access_ok admits an array ending exactly at the bound (the krealloc
+    // then fails) and refuses one byte more, for either array. On x86_64
+    // the last page below 1 << 47 is past USER_PTR_MAX.
+    const BIG: u64 = 131_073;
+    let at_limit = USER_LIMIT - BIG * 8;
+    let page_below_half = if cfg!(target_arch = "aarch64") {
+        FsError::OutOfMemory
+    } else {
+        FsError::BadAddress
+    };
+    for (handles, values, expected) in [
+        (1024, at_limit, FsError::OutOfMemory),
+        (at_limit, 2048, FsError::OutOfMemory),
+        (1024, at_limit + 1, FsError::BadAddress),
+        (at_limit + 1, 2048, FsError::BadAddress),
+        (1024, (1 << 47) - BIG * 8, page_below_half),
+    ] {
+        link(1536, 0, BIG, handles, values);
+        assert_eq!(timeline(1536), Err(expected), "access_ok {values:#x}");
+    }
     // eb->num_fences spans the chain's extensions; a skipped (fence-less,
     // flag-less) entry is not added, an added SIGNAL entry is.
     for (flags, expected) in [(0, FsError::NotFound), (2, FsError::OutOfMemory)] {
@@ -527,6 +553,14 @@ fn smoke_explicit_fence_arrays_resolve_entry_by_entry() -> TestResult {
     assert_eq!(binary(0, 131_073, 1024, 0), Err(FsError::OutOfMemory));
     assert_eq!(binary(0, 131_072, 1024, 0), Err(FsError::NotFound));
     assert_eq!(binary(0, 2, USER_LIMIT - 8, 0), Err(FsError::BadAddress));
+    assert_eq!(
+        binary(0, BIG as u32, at_limit, 0),
+        Err(FsError::OutOfMemory)
+    );
+    assert_eq!(
+        binary(0, BIG as u32, at_limit + 1, 0),
+        Err(FsError::BadAddress)
+    );
     assert_eq!(binary(0, 1000, 4096, 0), Ok(()));
     // The array is parsed before the IN/SUBMIT sync_file and its checks.
     for inputs in [
