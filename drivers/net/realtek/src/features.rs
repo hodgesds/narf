@@ -579,12 +579,7 @@ pub const ERI_POLL_ITERS: usize = 100_000;
 ///
 /// The caller must own the register window exclusively; the
 /// `RegFile` contract of `regs` applies.
-pub unsafe fn eri_write<R: RegFile>(
-    regs: &mut R,
-    addr: u32,
-    mask: u32,
-    val: u32,
-) {
+pub unsafe fn eri_write<R: RegFile>(regs: &mut R, addr: u32, mask: u32, val: u32) {
     if addr & 3 != 0 || mask == 0 {
         return;
     }
@@ -1659,8 +1654,7 @@ mod tests {
                         let mut cur = self.shadow(addr);
                         for lane in 0..4 {
                             if mask & (1 << lane) != 0 {
-                                let byte =
-                                    (self.eridr >> (lane * 8)) & 0xff;
+                                let byte = (self.eridr >> (lane * 8)) & 0xff;
                                 cur &= !(0xff << (lane * 8));
                                 cur |= byte << (lane * 8);
                             }
@@ -1686,8 +1680,7 @@ mod tests {
         // SAFETY: EriRegs fixture — no hardware is touched.
         unsafe { eri_set_bits(&mut regs, ERI_MAGIC_ADDR, ERI_MAGIC_PACKET_V2) };
         let expect_read = ERI_READ_CMD | ERI_TYPE_EXGMAC | ERI_MASK_1111 | ERI_MAGIC_ADDR;
-        let expect_write =
-            ERI_WRITE_CMD | ERI_TYPE_EXGMAC | ERI_MASK_1111 | ERI_MAGIC_ADDR;
+        let expect_write = ERI_WRITE_CMD | ERI_TYPE_EXGMAC | ERI_MASK_1111 | ERI_MAGIC_ADDR;
         if regs.eriar_log != [expect_read, expect_write] {
             return TestResult::Fail("ERI set_bits did not issue Linux's command words");
         }
@@ -1745,9 +1738,13 @@ mod tests {
         if unsafe { eri_read(&mut plain, ERI_MAGIC_ADDR + 1) } != u32::MAX {
             return TestResult::Fail("ERI misaligned read did not return all-ones");
         }
-        // SAFETY: as above.
-        unsafe { eri_write(&mut plain, ERI_MAGIC_ADDR + 1, ERI_MASK_1111, 0x1234_5678) };
-        if plain.last_write_to(ERI_ADDR_REG).is_some() {
+        // A misaligned write must issue no ERIAR command at all: check
+        // it on a fresh fixture, since the aligned reads above already
+        // wrote their command words to ERIAR on `plain`.
+        let mut plain_misaligned = RegLog::new();
+        // SAFETY: RegLog fixture — no hardware is touched.
+        unsafe { eri_write(&mut plain_misaligned, ERI_MAGIC_ADDR + 1, ERI_MASK_1111, 0x1234_5678) };
+        if plain_misaligned.last_write_to(ERI_ADDR_REG).is_some() {
             return TestResult::Fail("ERI misaligned write touched ERIAR");
         }
         TestResult::Pass
