@@ -416,6 +416,19 @@ pub const fn switch_antispoof_off_word(current: u32) -> u32 {
     current & !(DTXSWC_MAC_SPOOF_MASK | DTXSWC_VLAN_SPOOF_MASK)
 }
 
+/// Switch-control word with VF `vf`'s spoof bits set or cleared
+/// (Linux anti-spoofing bit positions, proved by
+/// `igb_vmdq_set_anti_spoofing_pf`'s `BIT(pf) | BIT(pf + 8)`
+/// toggle: MAC-spoof bit `vf`, VLAN-spoof bit `vf + 8`).
+pub const fn switch_spoofchk_word(current: u32, vf: usize, enable: bool) -> u32 {
+    let bits = (1 << vf) | (1 << (vf + 8));
+    if enable {
+        current | bits
+    } else {
+        current & !bits
+    }
+}
+
 /// RAR register pair for `mac` steered to `pool` (Linux
 /// `igb_rar_set_index`: low = MAC bytes 0..4 little-endian, high =
 /// bytes 4..6 plus AV when valid, plus the pool encoding whenever
