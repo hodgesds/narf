@@ -32,7 +32,11 @@
 //! is the same format under its own magic, label and file name
 //! (`ath9k/ar9462-admit-v1-ch<N>-<mac>.bin`); its chain-mask bytes are
 //! the two-chain masks up to 0x3 and its identity binds the
-//! `ar9462_2p0`/`ar9462_2p1` INI preparation.
+//! `ar9462_2p0`/`ar9462_2p1` INI preparation. The AR9565 (`0x0036`)
+//! record `N65A` v1 is the same format under its own magic, label and
+//! file name (`ath9k/ar9565-admit-v1-ch<N>-<mac>.bin`); its chain-mask
+//! bytes are the one-chain masks up to 0x1 and its identity binds the
+//! `ar9565_1p0`/`ar9565_1p1` INI preparation.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{
@@ -369,8 +373,9 @@ impl Facts {
         })
     }
     /// AR9003 facts — AR9300 (`0x0030`, record `N93A`), AR9580
-    /// (`0x0033`, record `N95A`, the same layout) or AR9462 (`0x0034`,
-    /// record `N46A`, the same layout) — for one 20 MHz channel in a band the
+    /// (`0x0033`, record `N95A`, the same layout), AR9462 (`0x0034`,
+    /// record `N46A`, the same layout) or AR9565 (`0x0036`, record
+    /// `N65A`, the same layout) — for one 20 MHz channel in a band the
     /// map's `opFlags` enables: the PCI function, `AR_SREV` revision and
     /// host mode, the restored 1088-byte `ar9300_eeprom` (template and
     /// version bytes included), the effective (`fixup_chainmask`) masks up
@@ -412,7 +417,8 @@ impl Facts {
         }
         let plan = power::plan(image, frequency, ctl, 40, identity.tx_chainmask)?;
         // Each part has its own magic, domain label and file name, so an
-        // AR9300 record can never admit an AR9580 or AR9462 or the reverse.
+        // AR9300 record can never admit an AR9580 or AR9462 or AR9565 or
+        // the reverse.
         let (magic, label, recipe, file): (&[u8; 4], &[u8], &[u8], &str) = match revision.chip {
             Chip::Ar9300 => (
                 b"N93A",
@@ -431,6 +437,12 @@ impl Facts {
                 b"NARF AR9462 N46A two-chain ar9300_eeprom legacy20 dual-band board admission v1",
                 b"ar9300_eeprom_restore_internal image; ar9462_2p0/2p1 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR, sys2ant postamble, rx-gain mode 2/3 mix/5G-XLNA overrides; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
                 "ar9462",
+            ),
+            Chip::Ar9565 => (
+                b"N65A",
+                b"NARF AR9565 N65A one-chain ar9300_eeprom legacy20 dual-band board admission v1",
+                b"ar9300_eeprom_restore_internal image; ar9565_1p0/1p1 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
+                "ar9565",
             ),
         };
         let mut h = narf_crypto::sha256::Sha256::new();

@@ -6,10 +6,13 @@
 //! (`AR_SREV_9580`) takes the `ar9580_1p0_initvals.h` set instead, and the
 //! AR9462 (`AR_SREV_9462`) the `ar9462_2p0`/`ar9462_2p1` set (2.1 owns only
 //! its MAC core, baseband postamble and SoC preamble; the rest aliases
-//! 2.0).
+//! 2.0). The AR9565 (`AR_SREV_9565`) takes the `ar9565_1p0`/
+//! `ar9565_1p1` set (1.1 owns only its radio postamble; the rest aliases
+//! 1.0).
 
 use super::initvals::*;
 use super::initvals_ar9462::*;
+use super::initvals_ar9565::*;
 use super::initvals_ar9580::*;
 use super::{eeprom::Identity, Chip, Revision};
 
@@ -83,6 +86,7 @@ impl Tables {
             Chip::Ar9300 => Self::ar9300(revision, identity),
             Chip::Ar9580 => Self::ar9580(identity),
             Chip::Ar9462 => Self::ar9462(revision, identity),
+            Chip::Ar9565 => Self::ar9565(revision, identity),
         }
     }
 
@@ -311,6 +315,69 @@ impl Tables {
             pcie_serdes_low_power: serdes,
             fast_clock,
             cck_fir_japan_2484: txfir,
+            dfs: &[],
+            tx_gain_kind,
+            rx_gain_kind,
+        }
+    }
+
+    /// `ar9003_hw_init_mode_regs`' `AR_SREV_9565_11_OR_LATER` (1.1) and
+    /// `AR_SREV_9565` (1.0) branches, then `ar9003_tx_gain_table_apply`
+    /// (index `>= 8` is mode 0; modes 0/2 are the 9565 low-ob/db table,
+    /// mode 1 the high-ob/db table, mode 3 the high-power table, mode 4
+    /// falls through to the AR9300 2p2 mixed-ob/db table, and modes 5/6/7
+    /// have no 9565 arm and no default, so they keep the mode-regs
+    /// lowest-ob/db value — which is the low-ob/db table by `#define` —
+    /// and the same low-ob/db table is the mode-0 selection) and
+    /// `ar9003_rx_gain_table_apply` (mode 1 is the 9565 wo-XLNA table;
+    /// modes 2/3 are AR9462-only and keep the common default). The 1.1
+    /// set differs from 1.0 only in its radio postamble (every other 1.1
+    /// name `#define`-aliases its 1.0 table), so only that array is
+    /// selected on `ar9565_11_or_later`; the gain tables are the 1.0
+    /// constants for both revisions. Linux sets no `ini_dfs` for the
+    /// AR9565, so `dfs` stays empty; the PCIe SerDes arrays are the
+    /// `pciephy_clkreq_disable_L1` table in both slots (Linux gates them
+    /// on `pll_pwrsave`, which this preparation does not model yet, like
+    /// the AR9462's).
+    pub fn ar9565(revision: &Revision, identity: &Identity) -> Self {
+        let radio_post = if revision.ar9565_11_or_later() {
+            AR9565_1P1_RADIO_POSTAMBLE
+        } else {
+            AR9565_1P0_RADIO_POSTAMBLE
+        };
+        let (tx_gain, tx_gain_kind) = match identity.tx_gain {
+            1 => (AR9565_1P0_MODES_HIGH_OB_DB_TX_GAIN_TABLE, TxGain::HighObDb),
+            2 => (AR9565_1P0_MODES_LOW_OB_DB_TX_GAIN_TABLE, TxGain::LowObDb),
+            3 => (AR9565_1P0_MODES_HIGH_POWER_TX_GAIN_TABLE, TxGain::HighPower),
+            4 => (
+                AR9300_MODES_MIXED_OB_DB_TX_GAIN_TABLE_2P2,
+                TxGain::MixedObDb,
+            ),
+            _ => (AR9565_1P0_MODES_LOW_OB_DB_TX_GAIN_TABLE, TxGain::LowObDb),
+        };
+        let (rx_gain, rx_gain_kind) = match identity.rx_gain {
+            1 => (AR9565_1P0_COMMON_WO_XLNA_RX_GAIN_TABLE, RxGain::WithoutXlna),
+            _ => (AR9565_1P0_COMMON_RX_GAIN_TABLE, RxGain::Common),
+        };
+        Self {
+            mac_core: AR9565_1P0_MAC_CORE,
+            mac_post: AR9565_1P0_MAC_POSTAMBLE,
+            bb_core: AR9565_1P0_BASEBAND_CORE,
+            bb_post: AR9565_1P0_BASEBAND_POSTAMBLE,
+            radio_core: AR9565_1P0_RADIO_CORE,
+            radio_post,
+            radio_post_sys2ant: &[],
+            soc_pre: AR9565_1P0_SOC_PREAMBLE,
+            soc_post: AR9565_1P0_SOC_POSTAMBLE,
+            rx_gain,
+            tx_gain,
+            rxgain_bb_core: &[],
+            rxgain_bb_postamble: &[],
+            rxgain_xlna: &[],
+            pcie_serdes: AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
+            pcie_serdes_low_power: AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
+            fast_clock: AR9565_1P0_MODES_FAST_CLOCK,
+            cck_fir_japan_2484: AR9565_1P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             dfs: &[],
             tx_gain_kind,
             rx_gain_kind,
