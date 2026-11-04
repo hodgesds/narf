@@ -1897,6 +1897,84 @@ pub(crate) mod tests {
         smoke_tcpm_back_to_back_negotiate_detach_renegotiate
     );
 
+    /// Back-to-back USB4 entry (#1194): after the two production
+    /// ports negotiate a live contract, the host-side entry port
+    /// discovers the dock, confirms USB4 capability, and transmits
+    /// Enter_USB; the dock-side entry port answers discovery and
+    /// records the entry. The received parameters must equal the
+    /// transmitted ones byte-for-byte, and both contracts must
+    /// still be live afterwards.
+    fn smoke_tcpm_back_to_back_usb4_entry() -> TestResult {
+        use crate::altmode_usb4::Usb4EntryPort;
+        use narf_usbpd::message::{
+            CableCurrent, CableSpeed, CableType, EnterUsbDataObject, UsbMode,
+        };
+        use narf_usbpd::vdm::Usb4EntryState;
+
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let cable = Cable::new();
+        let src = Arc::new(TcpmPort::new(
+            Arc::new(cable.end(CableSide::A)),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("host"),
+        ));
+        let snk = Arc::new(TcpmPort::new(
+            Arc::new(cable.end(CableSide::B)),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("dock"),
+        ));
+        for _ in 0..100 {
+            let _ = src.step(&cap);
+            let _ = snk.step(&cap);
+            if src.contract_live() && snk.contract_live() {
+                break;
+            }
+        }
+        if !src.contract_live() || !snk.contract_live() {
+            return TestResult::Fail("usb4-entry: contracts never went live");
+        }
+        let eudo = EnterUsbDataObject {
+            usb_mode: UsbMode::Usb4,
+            usb4_drd: true,
+            usb3_drd: false,
+            cable_speed: CableSpeed::Usb4Gen3,
+            cable_type: CableType::Passive,
+            cable_current: CableCurrent::Current3A,
+            pcie_support: true,
+            dp_support: true,
+            tbt_support: true,
+            host_present: true,
+        };
+        let host = Arc::new(Usb4EntryPort::new(src.clone(), eudo, 0x8087));
+        let dock = Arc::new(Usb4EntryPort::new(snk.clone(), eudo, 0x8087));
+        for _ in 0..100 {
+            let _ = host.step(&cap);
+            let _ = dock.step(&cap);
+            if host.state() == Usb4EntryState::Active && dock.usb4_entered() {
+                break;
+            }
+        }
+        if host.state() != Usb4EntryState::Active {
+            return TestResult::Fail("usb4-entry: host never reached Active");
+        }
+        if !dock.usb4_entered() {
+            return TestResult::Fail("usb4-entry: dock never recorded EnterUsb");
+        }
+        if dock.entered_eudo() != Some(eudo) {
+            return TestResult::Fail("usb4-entry: dock params differ from host params");
+        }
+        if !src.contract_live() || !snk.contract_live() {
+            return TestResult::Fail("usb4-entry: contract dropped during entry");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/altmode-usb4",
+        smoke_tcpm_back_to_back_usb4_entry
+    );
+
     // ── Helpers shared across Stage-2 swap/BIST tests ─────────────
 
     /// Build a partner-originated Control message frame (the "wire" a

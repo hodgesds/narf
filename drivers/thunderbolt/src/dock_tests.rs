@@ -3,10 +3,13 @@
 //! production paths in a single flow, with assertions at every
 //! stage boundary:
 //!
-//! P. **PD contract** — two production `TcpmPort`s negotiate a
-//!    5 V / 3 A contract over a fixture cable (the usbpd/TCPM
-//!    stage, #1188); the link-training state the scan consumes
-//!    is derived from that live contract, not hardcoded. The
+//! P. **PD contract + USB4 entry** — two production `TcpmPort`s
+//!    negotiate a 5 V / 3 A contract over a fixture cable (the
+//!    usbpd/TCPM stage, #1188), then the host-side entry port
+//!    drives USB4 entry (Discover Identity → Enter_USB, #1194)
+//!    and the dock-side entry port records it; the link-training
+//!    state the scan consumes follows contract-live AND
+//!    entry-recorded, not the contract alone. The
 //!    detach/reattach half of the PD story — engines reset, a
 //!    new partner renegotiates fresh — is proven by drivers/
 //!    usbpd's own back-to-back test, which owns it.
@@ -65,17 +68,12 @@
 //! the PM verdicts come from the production fan-out (lane 2's
 //! harness shape).
 //!
-//! One hop of the dock story is still a named boundary, not a
-//! driven stage: **USB4 alt-mode entry (EnterUSB, #1194)** —
-//! no production code carries a port from "explicit contract
-//! live" to "USB4 alt mode entered", so this fixture derives
-//! link training from the live contract explicitly instead of
-//! driving that hop. Everything else the two cross-crate stages
-//! need is composed here through test-only optional deps
-//! (kernel-test feature) on the crates that own them — no
-//! production dependency of the CM changes:
-//! - **USB PD contract (usbpd/TCPM):** stage P drives the
-//!   negotiation live; `usb4_dock_untrained_link_is_no_fabric`
+//! The two cross-crate stages are composed here through test-only
+//! optional deps (kernel-test feature) on the crates that own
+//! them — no production dependency of the CM changes:
+//! - **USB PD contract + USB4 entry (usbpd/TCPM):** stage P drives
+//!   the negotiation live and the Enter_USB exchange through the
+//!   production entry ports; `usb4_dock_untrained_link_is_no_fabric`
 //!   pins the negative side (untrained links enumerate as no
 //!   fabric and reconcile programs nothing).
 //! - **USB class cascades (drivers/usb):** stage 3b runs the
@@ -105,11 +103,14 @@ use narf_drivers_usb::class_registry::{
     UsbProbeError,
 };
 use narf_drivers_usb::hub::{find_hub_interface, HubDescriptor};
+use narf_drivers_usbpd::altmode_usb4::Usb4EntryPort;
 use narf_drivers_usbpd::policy::{SinkPolicy, SourcePolicy};
 use narf_drivers_usbpd::tcpm::TcpmPort;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_usbpd::message::{CableCurrent, CableSpeed, CableType, EnterUsbDataObject, UsbMode};
 use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
+use narf_usbpd::vdm::Usb4EntryState;
 
 /// The composed scenario's domain (the native CM's NHI) and the
 /// peer host's domain, as published in the tunnel / peer
@@ -954,12 +955,35 @@ impl Tcpc for CableEnd {
     }
 }
 
+/// Fixture USB4 entry parameters for Stage P: USB4 mode, USB4-DRD
+/// host, USB4 Gen3 passive 3 A cable, PCIe + DP + TBT3 tunneling,
+/// host present. Fixture assumptions (a real host supplies its own
+/// capabilities and the SOP' cable parameters); Stage P pins that
+/// the dock records exactly these parameters.
+fn fixture_entry_eudo() -> EnterUsbDataObject {
+    EnterUsbDataObject {
+        usb_mode: UsbMode::Usb4,
+        usb4_drd: true,
+        usb3_drd: false,
+        cable_speed: CableSpeed::Usb4Gen3,
+        cable_type: CableType::Passive,
+        cable_current: CableCurrent::Current3A,
+        pcie_support: true,
+        dp_support: true,
+        tbt_support: true,
+        host_present: true,
+    }
+}
+
 /// Stage P: negotiate a 5 V / 3 A contract between two production
-/// TcpmPorts over the fixture cable; returns the sink's
-/// negotiated (voltage_mv, op_current_ma), or `None` if no live
-/// contract results. This is the contract the dock scenario's
-/// link training derives from.
-fn pd_contract_terms() -> Option<(u32, u32)> {
+/// TcpmPorts over the fixture cable, then drive USB4 entry
+/// (Discover Identity → Enter_USB, #1194) through the production
+/// entry ports. Returns the sink's negotiated (voltage_mv,
+/// op_current_ma) plus the entry parameters the dock recorded, or
+/// `None` if no live contract or no recorded entry results. Link
+/// training derives from BOTH halves, never from the contract
+/// alone.
+fn pd_contract_and_usb4_entry() -> Option<((u32, u32), EnterUsbDataObject)> {
     let cap = narf_usbpd::bootstrap_usbpd_authority();
     let cable = Cable::new();
     let src = Arc::new(TcpmPort::new(
@@ -984,9 +1008,24 @@ fn pd_contract_terms() -> Option<(u32, u32)> {
     if !src.contract_live() || !snk.contract_live() {
         return None;
     }
-    snk.sink()
+    let terms = snk
+        .sink()
         .contract()
-        .map(|c| (c.voltage_mv, c.op_current_ma))
+        .map(|c| (c.voltage_mv, c.op_current_ma))?;
+    let eudo = fixture_entry_eudo();
+    let host = Arc::new(Usb4EntryPort::new(src.clone(), eudo, 0x8087));
+    let dock = Arc::new(Usb4EntryPort::new(snk.clone(), eudo, 0x8087));
+    for _ in 0..100 {
+        let _ = host.step(&cap);
+        let _ = dock.step(&cap);
+        if host.state() == Usb4EntryState::Active && dock.usb4_entered() {
+            break;
+        }
+    }
+    if host.state() != Usb4EntryState::Active || !dock.usb4_entered() {
+        return None;
+    }
+    dock.entered_eudo().map(|entered| (terms, entered))
 }
 
 /// Registry probe for the cascade stage's fixture entries. Never
@@ -1094,8 +1133,8 @@ fn cascade_behind_tunnel(endpoint: super::tunnel::Endpoint) -> bool {
 }
 
 /// The composed dock scenario. See this module's documentation
-/// for the stage list and the one remaining cross-crate boundary
-/// (EnterUSB, #1194).
+/// for the stage list, including the cross-crate stages (PD
+/// contract + USB4 entry, #1194).
 fn usb4_dock_composed_end_to_end() -> TestResult {
     use super::icm::{classify, CmMode, FW_STS_ICM_EN, FW_STS_NVM_AUTH_DONE};
     use super::tunnel::{displays, pcie_tunnels, usb3_tunnels, Endpoint, Protocol};
@@ -1106,16 +1145,28 @@ fn usb4_dock_composed_end_to_end() -> TestResult {
     let _pm_registry = narf_power::device_pm::__test_isolate_registry();
     reset_world();
 
-    // ── Stage P: the PD contract that trains the link ────────
+    // ── Stage P: the PD contract + USB4 entry that train the link
     // On hardware, a negotiated contract and USB4 alt-mode
-    // entry are what train the link. The alt-mode hop is still
-    // unbuilt (#1194), so the fixture drives the contract live
-    // through production TcpmPorts and derives link training
-    // from it explicitly below: contract live => trained links.
-    let pd_live = pd_contract_terms()
-        .is_some_and(|(voltage_mv, op_current_ma)| voltage_mv == 5000 && op_current_ma == 3000);
+    // entry are what train the link. Both hops are driven here
+    // through production ports: the contract negotiates live
+    // over the fixture cable, then the host-side entry port
+    // discovers the dock and transmits Enter_USB (#1194), and
+    // the dock-side entry port records it. Link training below
+    // follows contract-live AND entry-recorded, never the
+    // contract alone.
+    let (pd_terms, entered) = match pd_contract_and_usb4_entry() {
+        Some(v) => v,
+        None => {
+            return TestResult::Fail(
+                "dock: PD negotiation did not reach a live contract with USB4 entry",
+            );
+        }
+    };
+    let pd_live = pd_terms == (5000, 3000) && entered == fixture_entry_eudo();
     if !pd_live {
-        return TestResult::Fail("dock: PD negotiation did not reach a live 5V/3A contract");
+        return TestResult::Fail(
+            "dock: PD terms are not 5V/3A or the dock recorded different entry params",
+        );
     }
 
     // ── Stage 0: the ICM gate ────────────────────────────────
@@ -1156,9 +1207,10 @@ fn usb4_dock_composed_end_to_end() -> TestResult {
     super::icm::__reset_for_test();
 
     // ── Stage 1: enumeration of the native domain ────────────
-    // Link training follows Stage P's contract: live => trained
-    // links (2); the dead-contract half is the untrained model
-    // (0) pinned by usb4_dock_untrained_link_is_no_fabric.
+    // Link training follows Stage P's contract + USB4 entry:
+    // live + entered => trained links (2); the dead-contract
+    // half is the untrained model (0) pinned by
+    // usb4_dock_untrained_link_is_no_fabric.
     let mut m = dock_model(if pd_live { 2 } else { 0 });
     let previous = Domain {
         id: LOCAL_DOMAIN,

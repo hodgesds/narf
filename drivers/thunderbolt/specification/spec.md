@@ -356,13 +356,12 @@ the crates that own them, which change no production dependency
 of the CM: the USB PD contract is negotiated live by two
 production `TcpmPort`s over a fixture cable (stage P; the
 detach/reattach proof lives in drivers/usbpd's own back-to-back
-test, with the detach-reset fix #1193), and the USB class-device
+test, with the detach-reset fix #1193), USB4 alt-mode entry is
+driven through the production entry ports (Discover Identity →
+Enter_USB, #1194; link training follows contract-live AND
+entry-recorded, never the contract alone), and the USB class-device
 cascade runs from the published USB3 tunnel through the
 production hub walkers and class-registry matching (stage 3b).
-One hop remains a named boundary, not a driven stage: USB4
-alt-mode entry (EnterUSB, #1194) — no production code carries a
-port from "explicit contract live" to "USB4 alt mode entered",
-so the fixture derives link training from the live contract
-explicitly; probe execution itself (control/bulk transfers)
-stays the USB programme's xHCI-bound surface, as does the
+Probe execution itself (control/bulk transfers) stays the USB
+programme's xHCI-bound surface, as does the
 interface-triple dispatch inside drivers/usb's `match_entry`.

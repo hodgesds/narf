@@ -39,6 +39,8 @@
 
 use alloc::vec::Vec;
 
+use super::message::EnterUsbDataObject;
+
 // ── SVIDs ──────────────────────────────────────────────────────────
 
 /// USB-IF Standard ID (used by Discover Identity).
@@ -481,4 +483,137 @@ impl DpAltModeDriver {
             }
         }
     }
+}
+
+// ── USB4 entry driver (EnterUSB, #1194) ────────────────────────────
+
+/// Phase of USB4 entry on a port, initiator side. Unlike DP Alt Mode
+/// there is no Enter Mode exchange: USB4 has no SVID, so entry is
+/// Discover Identity (confirming the partner's USB4 capability) and
+/// then the Enter_USB data message itself (USB PD 3.1 §6.4.9).
+/// EnterUSB has no response VDM — GoodCRC is link-layer, handled by
+/// the TCPC/PHY — so transmission is the completion signal: the
+/// driver reports `TransmitEnterUsb` from `EnteringUsb`, and the
+/// caller moves it to `Active` once the transmit succeeds.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Usb4EntryState {
+    Idle,
+    DiscoveringIdentity,
+    EnteringUsb,
+    Active,
+    Failed,
+}
+
+/// Outcome of a single USB4 entry step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Usb4EntryOutcome {
+    /// Caller should transmit these VDOs as a VendorDefined message
+    /// and wait for the reply.
+    TransmitVdm(Vec<u32>),
+    /// Caller should transmit this EUDO as an EnterUsb data message.
+    /// No reply is expected; call `mark_entered` once it is sent.
+    TransmitEnterUsb(EnterUsbDataObject),
+    /// Entry failed (NAK / partner not USB4-capable / malformed).
+    Failed,
+}
+
+/// Bare-bones USB4 entry driver, initiator side. The TCPM passes
+/// received VDOs in via [`feed_response`]; the state machine returns
+/// the next frame to transmit. The responder half — answering
+/// Discover Identity and recording an inbound Enter_USB — lives in
+/// the port wrapper (`narf-drivers-usbpd::altmode_usb4`), which
+/// owns the TCPC.
+#[derive(Debug)]
+pub struct Usb4EntryDriver {
+    pub state: Usb4EntryState,
+    /// Entry parameters transmitted in the Enter_USB message once
+    /// the partner's USB4 capability is confirmed.
+    pub entry_params: EnterUsbDataObject,
+}
+
+impl Usb4EntryDriver {
+    pub fn new(entry_params: EnterUsbDataObject) -> Self {
+        Self {
+            state: Usb4EntryState::Idle,
+            entry_params,
+        }
+    }
+
+    /// Kick off entry from `Idle`.
+    pub fn start(&mut self) -> Usb4EntryOutcome {
+        self.state = Usb4EntryState::DiscoveringIdentity;
+        Usb4EntryOutcome::TransmitVdm(build_discover_identity_req())
+    }
+
+    /// Feed a partner response (header + VDOs) into the state machine.
+    /// Returns the next action.
+    pub fn feed_response(&mut self, vdos: &[u32]) -> Usb4EntryOutcome {
+        if vdos.is_empty() {
+            self.state = Usb4EntryState::Failed;
+            return Usb4EntryOutcome::Failed;
+        }
+        let h = VdmHeader::decode(vdos[0]);
+        if h.command_type != CommandType::Ack {
+            self.state = Usb4EntryState::Failed;
+            return Usb4EntryOutcome::Failed;
+        }
+        match (self.state, VdmCommand::from_u8(h.command)) {
+            (Usb4EntryState::DiscoveringIdentity, Some(VdmCommand::DiscoverIdentity)) => {
+                // Discover Identity ACK for a UFP carries ID header,
+                // cert stat, product, then UFP VDO1 at index 4; the
+                // entry decision keys on its USB4 capability bit
+                // alone (other fields are the partner's, not ours
+                // to interpret here).
+                if vdos.len() < 5 || !ufp_vdo1_usb4_capable(vdos[4]) {
+                    self.state = Usb4EntryState::Failed;
+                    return Usb4EntryOutcome::Failed;
+                }
+                self.state = Usb4EntryState::EnteringUsb;
+                Usb4EntryOutcome::TransmitEnterUsb(self.entry_params)
+            }
+            _ => {
+                self.state = Usb4EntryState::Failed;
+                Usb4EntryOutcome::Failed
+            }
+        }
+    }
+
+    /// Record that the Enter_USB message was transmitted. Only
+    /// valid from `EnteringUsb`; a no-op elsewhere.
+    pub fn mark_entered(&mut self) {
+        if self.state == Usb4EntryState::EnteringUsb {
+            self.state = Usb4EntryState::Active;
+        }
+    }
+}
+
+/// USB4 capability bit of a UFP VDO1: device-capability nibble
+/// (bits 27:24) bit 3. See the UFP VDO1 layout in Linux
+/// `include/linux/usb/pd_vdo.h` (`VDO_UFP_DEVCAP`,
+/// `VDO_UFP_DEVCAP_USB4`).
+pub fn ufp_vdo1_usb4_capable(vdo1: u32) -> bool {
+    (vdo1 >> 24) & 0xF & 0x8 != 0
+}
+
+/// Build a minimal Discover Identity ACK for a USB4-capable UFP:
+/// VDM header + ID header + cert stat + product + UFP VDO1. Only
+/// the fields the entry decision reads are populated — the ID
+/// header claims device capability + modal operation with the
+/// caller's vendor id, and UFP VDO1 carries only the USB4
+/// capability bit; every other field is zero. The caller supplies
+/// the vendor id (a fixture value in tests; the device's real VID
+/// on hardware).
+pub fn build_usb4_identity_ack(vid: u16) -> Vec<u32> {
+    let id_header: u32 = (1 << 30) // device capable
+        | (1 << 26) // modal operation supported
+        | (vid as u32);
+    let ufp_vdo1: u32 = 0x8 << 24; // device-capability USB4 bit
+    alloc::vec![
+        VdmHeader::structured(SVID_PD, VdmCommand::DiscoverIdentity, CommandType::Ack).encode(),
+        id_header,
+        0, // cert stat
+        0, // product
+        ufp_vdo1,
+    ]
 }

@@ -1038,3 +1038,166 @@ fn smoke_sop_prime_discover_identity_request() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_discover_identity_request);
+
+// ── Enter_USB (EUDO, §6.4.9) + USB4 entry driver ────────────────
+
+use crate::message::{CableCurrent, CableSpeed, CableType, EnterUsbDataObject, UsbMode};
+use crate::vdm::{
+    build_usb4_identity_ack, Usb4EntryDriver, Usb4EntryOutcome, Usb4EntryState, VdmHeader,
+};
+
+/// Fixture entry parameters: USB4 mode, USB4-DRD host, USB4 Gen3
+/// passive 3 A cable, PCIe + DP + TBT3 tunneling, host present.
+/// The values are fixture assumptions (a real host supplies its own
+/// capabilities and the SOP' cable parameters); the test pins that
+/// the codec and the exchange carry exactly these values.
+fn fixture_eudo() -> EnterUsbDataObject {
+    EnterUsbDataObject {
+        usb_mode: UsbMode::Usb4,
+        usb4_drd: true,
+        usb3_drd: false,
+        cable_speed: CableSpeed::Usb4Gen3,
+        cable_type: CableType::Passive,
+        cable_current: CableCurrent::Current3A,
+        pcie_support: true,
+        dp_support: true,
+        tbt_support: true,
+        host_present: true,
+    }
+}
+
+fn smoke_enter_usb_message_byte_pin() -> TestResult {
+    let eudo = fixture_eudo();
+    // Byte-pin the EUDO against the §6.4.9 field layout, computed
+    // by hand: mode 2<<28 | drd 1<<26 | speed 3<<21 | current 2<<17
+    // | pcie 1<<16 | dp 1<<15 | tbt 1<<14 | host 1<<13.
+    if eudo.encode() != 0x2465_E000 {
+        return TestResult::Fail("EUDO encode drift from §6.4.9 layout");
+    }
+    // Byte-pin the full EnterUsb frame: 2-byte LE header
+    // (msg 0x08, DFP, R3.0, Source, id 0, 1 object = 0x11A8)
+    // followed by the 4-byte LE EUDO.
+    let h = Header::data(
+        DataMsg::EnterUsb,
+        DataRole::Dfp,
+        PowerRole::Source,
+        SpecRev::R3_0,
+        0,
+        1,
+    );
+    let frame = encode_message(h, &[eudo.encode()]);
+    if frame.as_slice() != [0xA8, 0x11, 0x00, 0xE0, 0x65, 0x24] {
+        return TestResult::Fail("EnterUsb frame bytes drift from spec-shaped frame");
+    }
+    let (back_h, back_objs) = match decode_message(&frame) {
+        Some(p) => p,
+        None => return TestResult::Fail("decode_message returned None"),
+    };
+    if DataMsg::from_u8(back_h.msg_type) != Some(DataMsg::EnterUsb) {
+        return TestResult::Fail("EnterUsb must decode to DataMsg::EnterUsb");
+    }
+    if back_objs.len() != 1 || EnterUsbDataObject::decode(back_objs[0]) != Some(eudo) {
+        return TestResult::Fail("EUDO round-trip drift");
+    }
+    // The remaining undecodable data types stay undecodable; only
+    // 0x08 was fixed by this lane.
+    if DataMsg::from_u8(0x05).is_some() || DataMsg::from_u8(0x07).is_some() {
+        return TestResult::Fail("BatteryStatus/GetCountryInfo must still decode to None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_enter_usb_message_byte_pin);
+
+fn smoke_enter_usb_eudo_reserved_bits() -> TestResult {
+    let eudo = fixture_eudo();
+    let clean = eudo.encode();
+    // Masking-defeating case: reserved bits (31, 27, 24, 12:0) set
+    // must decode to the same EUDO, and re-encode must zero them.
+    let tainted = clean | (1 << 31) | (1 << 27) | (1 << 24) | 0x1FFF;
+    if EnterUsbDataObject::decode(tainted) != Some(eudo) {
+        return TestResult::Fail("reserved EUDO bits must be ignored on decode");
+    }
+    if EnterUsbDataObject::decode(tainted).unwrap().encode() != clean {
+        return TestResult::Fail("encode must zero reserved EUDO bits");
+    }
+    // Reserved field values must be rejected: mode 3, current 1,
+    // speed 4 (no USB mode / current / speed with that value).
+    let mode_reserved = (clean & !(0x7 << 28)) | (3 << 28);
+    if EnterUsbDataObject::decode(mode_reserved).is_some() {
+        return TestResult::Fail("EUDO mode 3 (reserved) must fail decode");
+    }
+    let current_reserved = (clean & !(0x3 << 17)) | (1 << 17);
+    if EnterUsbDataObject::decode(current_reserved).is_some() {
+        return TestResult::Fail("EUDO current 1 (reserved) must fail decode");
+    }
+    let speed_reserved = (clean & !(0x7 << 21)) | (4 << 21);
+    if EnterUsbDataObject::decode(speed_reserved).is_some() {
+        return TestResult::Fail("EUDO speed 4 (reserved) must fail decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_enter_usb_eudo_reserved_bits);
+
+fn smoke_usb4_entry_driver_walk() -> TestResult {
+    let eudo = fixture_eudo();
+    let mut sm = Usb4EntryDriver::new(eudo);
+    let first = sm.start();
+    let req = match first {
+        Usb4EntryOutcome::TransmitVdm(v) => v,
+        _ => return TestResult::Fail("start must transmit Discover Identity"),
+    };
+    if sm.state != Usb4EntryState::DiscoveringIdentity {
+        return TestResult::Fail("start must land in DiscoveringIdentity");
+    }
+    if req.len() != 1 {
+        return TestResult::Fail("Discover Identity REQ is a single VDO");
+    }
+    let rh = VdmHeader::decode(req[0]);
+    if rh.svid != 0xFF00 || rh.command != 1 {
+        return TestResult::Fail("REQ must be SVID 0xFF00, DiscoverIdentity");
+    }
+    // USB4-capable ACK → EnterUsb transmission, then Active.
+    let ack = build_usb4_identity_ack(0x8087);
+    match sm.feed_response(&ack) {
+        Usb4EntryOutcome::TransmitEnterUsb(sent) => {
+            if sent != eudo {
+                return TestResult::Fail("EnterUsb must carry the configured params");
+            }
+        }
+        _ => return TestResult::Fail("USB4-capable ACK must yield EnterUsb"),
+    }
+    if sm.state != Usb4EntryState::EnteringUsb {
+        return TestResult::Fail("ACK must land in EnteringUsb");
+    }
+    sm.mark_entered();
+    if sm.state != Usb4EntryState::Active {
+        return TestResult::Fail("mark_entered must land in Active");
+    }
+    // Negative: ACK without the USB4 capability bit → Failed, and
+    // no EnterUsb is offered.
+    let mut sm2 = Usb4EntryDriver::new(eudo);
+    let _ = sm2.start();
+    let mut ack_no_usb4 = build_usb4_identity_ack(0x8087);
+    ack_no_usb4[4] = 0;
+    if !matches!(sm2.feed_response(&ack_no_usb4), Usb4EntryOutcome::Failed)
+        || sm2.state != Usb4EntryState::Failed
+    {
+        return TestResult::Fail("non-USB4 ACK must fail without EnterUsb");
+    }
+    // Negative: a REQ (not ACK) and an empty response both fail.
+    let mut sm3 = Usb4EntryDriver::new(eudo);
+    let req_frame = match sm3.start() {
+        Usb4EntryOutcome::TransmitVdm(v) => v,
+        _ => return TestResult::Fail("start must transmit"),
+    };
+    if !matches!(sm3.feed_response(&req_frame), Usb4EntryOutcome::Failed) {
+        return TestResult::Fail("REQ fed as response must fail");
+    }
+    let mut sm4 = Usb4EntryDriver::new(eudo);
+    let _ = sm4.start();
+    if !matches!(sm4.feed_response(&[]), Usb4EntryOutcome::Failed) {
+        return TestResult::Fail("empty response must fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/vdm", smoke_usb4_entry_driver_walk);

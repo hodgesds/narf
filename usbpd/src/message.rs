@@ -119,6 +119,7 @@ impl DataMsg {
             0x03 => DataMsg::Bist,
             0x04 => DataMsg::SinkCapabilities,
             0x06 => DataMsg::Alert,
+            0x08 => DataMsg::EnterUsb,
             0x09 => DataMsg::EprRequest,
             0x0A => DataMsg::EprMode,
             0x0F => DataMsg::VendorDefined,
@@ -717,6 +718,149 @@ impl BistDataObject {
     pub fn decode(raw: u32) -> Option<Self> {
         let mode = BistMode::from_u8(((raw >> 28) & 0xF) as u8)?;
         Some(Self { mode })
+    }
+}
+
+// ── Enter_USB Data Object (EUDO, §6.4.9) ───────────────────────────
+
+/// USB mode carried in an Enter_USB message (§6.4.9).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UsbMode {
+    Usb2 = 0,
+    Usb3 = 1,
+    Usb4 = 2,
+}
+
+impl UsbMode {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => UsbMode::Usb2,
+            1 => UsbMode::Usb3,
+            2 => UsbMode::Usb4,
+            _ => return None,
+        })
+    }
+}
+
+/// Cable speed carried in an Enter_USB message (§6.4.9).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CableSpeed {
+    Usb2 = 0,
+    Usb3Gen1 = 1,
+    Usb4Gen2 = 2,
+    Usb4Gen3 = 3,
+}
+
+/// Cable type carried in an Enter_USB message (§6.4.9).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CableType {
+    Passive = 0,
+    ReTimer = 1,
+    ReDriver = 2,
+    Optical = 3,
+}
+
+/// Cable current rating carried in an Enter_USB message (§6.4.9).
+/// Value 1 is reserved by the spec and rejected on decode.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CableCurrent {
+    NotSupported = 0,
+    Current3A = 2,
+    Current5A = 3,
+}
+
+impl CableCurrent {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => CableCurrent::NotSupported,
+            2 => CableCurrent::Current3A,
+            3 => CableCurrent::Current5A,
+            _ => return None,
+        })
+    }
+}
+
+/// Enter_USB Data Object (EUDO, USB PD 3.1 §6.4.9): the single data
+/// object of an EnterUsb message, carrying the USB4 entry parameters
+/// (mode, DRD capability, cable speed/type/current, and the PCIe /
+/// DisplayPort / TBT3 tunneling and host-present flags).
+///
+/// Bit layout (bit 31, bit 27, bit 24, and bits 12:0 are reserved):
+/// - bits 30:28 — USB mode (0 = USB2, 1 = USB3, 2 = USB4; 3 reserved)
+/// - bit 26 — USB4 DRD capable; bit 25 — USB3 DRD capable
+/// - bits 23:21 — cable speed (0 = USB2, 1 = USB3 Gen1, 2 = USB4 Gen2,
+///   3 = USB4 Gen3)
+/// - bits 20:19 — cable type (0 = passive, 1 = re-timer, 2 = re-driver,
+///   3 = optical)
+/// - bits 18:17 — cable current (0 = not supported, 2 = 3 A, 3 = 5 A;
+///   1 reserved)
+/// - bit 16 — PCIe tunneling supported; bit 15 — DP supported;
+///   bit 14 — TBT3 supported; bit 13 — host present.
+///
+/// Decode is strict on the two reserved field values (mode 3,
+/// current 1) and ignores reserved bits, matching the repo's
+/// `BistDataObject::decode` convention; encode zeroes reserved bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EnterUsbDataObject {
+    pub usb_mode: UsbMode,
+    pub usb4_drd: bool,
+    pub usb3_drd: bool,
+    pub cable_speed: CableSpeed,
+    pub cable_type: CableType,
+    pub cable_current: CableCurrent,
+    pub pcie_support: bool,
+    pub dp_support: bool,
+    pub tbt_support: bool,
+    pub host_present: bool,
+}
+
+impl EnterUsbDataObject {
+    pub fn encode(&self) -> u32 {
+        ((self.usb_mode as u32) << 28)
+            | ((self.usb4_drd as u32) << 26)
+            | ((self.usb3_drd as u32) << 25)
+            | ((self.cable_speed as u32) << 21)
+            | ((self.cable_type as u32) << 19)
+            | ((self.cable_current as u32) << 17)
+            | ((self.pcie_support as u32) << 16)
+            | ((self.dp_support as u32) << 15)
+            | ((self.tbt_support as u32) << 14)
+            | ((self.host_present as u32) << 13)
+    }
+
+    pub fn decode(raw: u32) -> Option<Self> {
+        let usb_mode = UsbMode::from_u8(((raw >> 28) & 0x7) as u8)?;
+        let cable_current = CableCurrent::from_u8(((raw >> 17) & 0x3) as u8)?;
+        let cable_speed = match (raw >> 21) & 0x7 {
+            0 => CableSpeed::Usb2,
+            1 => CableSpeed::Usb3Gen1,
+            2 => CableSpeed::Usb4Gen2,
+            3 => CableSpeed::Usb4Gen3,
+            _ => return None,
+        };
+        let cable_type = match (raw >> 19) & 0x3 {
+            0 => CableType::Passive,
+            1 => CableType::ReTimer,
+            2 => CableType::ReDriver,
+            3 => CableType::Optical,
+            _ => return None,
+        };
+        Some(Self {
+            usb_mode,
+            usb4_drd: (raw >> 26) & 0x1 != 0,
+            usb3_drd: (raw >> 25) & 0x1 != 0,
+            cable_speed,
+            cable_type,
+            cable_current,
+            pcie_support: (raw >> 16) & 0x1 != 0,
+            dp_support: (raw >> 15) & 0x1 != 0,
+            tbt_support: (raw >> 14) & 0x1 != 0,
+            host_present: (raw >> 13) & 0x1 != 0,
+        })
     }
 }
 
