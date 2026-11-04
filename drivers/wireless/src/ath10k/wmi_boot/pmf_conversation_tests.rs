@@ -54,7 +54,8 @@ fn protected(h: &Harness, subtype: u8, body: &[u8], pn: u64) -> Vec<u8> {
     header.extend_from_slice(&[0, 0]);
     let tk = h.model(|m| m.data.as_ref().unwrap().ap.pairwise_tk().unwrap());
     let mut plain = body.to_vec();
-    let wire = narf_wireless::ccmp::protect(&Ccm, &header, &tk, pn, 0, 0, true, &mut plain).unwrap();
+    let wire =
+        narf_wireless::ccmp::protect(&Ccm, &header, &tk, pn, 0, 0, true, &mut plain).unwrap();
     header.extend_from_slice(&wire);
     header
 }
@@ -155,7 +156,8 @@ fn smoke_ath10k_pmf_drops_unprotected_robust_frames_and_answers_protected_sa_que
                 inject(&h, frame);
                 let _ = drive(h.device.flush_management());
             }
-            if !h.device.link_up() || h.model(|m| !m.data.as_ref().unwrap().management_tx.is_empty())
+            if !h.device.link_up()
+                || h.model(|m| !m.data.as_ref().unwrap().management_tx.is_empty())
             {
                 return Err("unprotected robust frame acted on under PMF");
             }
@@ -167,7 +169,9 @@ fn smoke_ath10k_pmf_drops_unprotected_robust_frames_and_answers_protected_sa_que
                 return Err("queued SA Query response publication failed");
             }
             let sent = h.model(|m| m.data.as_ref().unwrap().management_tx.clone());
-            if sent.len() != 1 || sent[0][0] != 0xd0 || opened(&h, &sent[0]).as_deref() != Some(&[8, 1, 0x34, 0x12])
+            if sent.len() != 1
+                || sent[0][0] != 0xd0
+                || opened(&h, &sent[0]).as_deref() != Some(&[8, 1, 0x34, 0x12])
             {
                 return Err("protected SA Query not answered with a protected response");
             }
