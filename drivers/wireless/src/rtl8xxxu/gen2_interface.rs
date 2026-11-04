@@ -120,11 +120,16 @@ fn remember(cache: &mut Vec<Entry>, candidate: Candidate, seen: u64, generation:
 
 /// Poll one receiving radio for `ms`: every admitted beacon/probe response
 /// becomes a cached observation of this physical stream. No MPDU reaches a
-/// station, key or replay owner from here.
+/// station, key or replay owner from here. Queued BT-info records drain
+/// through `Radio::drain_bt` every iteration — `assoc` is the caller's
+/// association state (`false` for an unbound radio, `true` for a
+/// station's off-channel visit) — so BT info is programmed while idle,
+/// not only while a station is serviced.
 async fn listen<C: ControlIo, B: PacketIo>(
     radio: &mut Radio<C, B>,
     cache: &mut Vec<Entry>,
     ms: u64,
+    assoc: bool,
 ) -> Result<(), gen2_radio::Error> {
     let deadline = now_ms().saturating_add(ms);
     while now_ms() < deadline {
@@ -146,20 +151,24 @@ async fn listen<C: ControlIo, B: PacketIo>(
             }
             None => pause().await,
         }
+        radio.drain_bt(assoc).await?;
     }
     Ok(())
 }
 
 /// One active visit on the current (unbound, receiving) radio: the source
 /// pre-probe delay, the native broadcast Probe Request on the management
-/// pipe, its exact host USB receipt, then the response window.
+/// pipe, its exact host USB receipt, then the response window. `assoc`
+/// is the caller's association state, forwarded to `listen` and to the
+/// transmit-wait drain below.
 async fn probe_visit<C: ControlIo, B: PacketIo>(
     radio: &mut Radio<C, B>,
     cache: &mut Vec<Entry>,
     probe: Probe<'_>,
     sequence: u16,
+    assoc: bool,
 ) -> Result<(), gen2_radio::Error> {
-    listen(radio, cache, probe.timing.0).await?;
+    listen(radio, cache, probe.timing.0, assoc).await?;
     let prepared = super::probe_runtime::Prepared::new(
         radio.local(),
         radio.channel(),
@@ -193,8 +202,9 @@ async fn probe_visit<C: ControlIo, B: PacketIo>(
         } else {
             pause().await;
         }
+        radio.drain_bt(assoc).await?;
     }
-    listen(radio, cache, probe.timing.1).await
+    listen(radio, cache, probe.timing.1, assoc).await
 }
 
 impl<C: ControlIo, B: PacketIo> State<C, B> {
@@ -241,8 +251,8 @@ impl<C: ControlIo, B: PacketIo> State<C, B> {
                 radio.retune(*grant).await?;
             }
             match probe {
-                Some(probe) => probe_visit(radio, &mut self.cache, probe, sequence).await?,
-                None => listen(radio, &mut self.cache, dwell).await?,
+                Some(probe) => probe_visit(radio, &mut self.cache, probe, sequence, false).await?,
+                None => listen(radio, &mut self.cache, dwell, false).await?,
             }
         }
         let Slot::Idle(radio) = &mut self.slot else {
@@ -307,9 +317,9 @@ impl<C: ControlIo, B: PacketIo> State<C, B> {
                 radio.retune(*grant).await?;
                 match (probe, sequence) {
                     (Some(probe), Some(sequence)) => {
-                        probe_visit(radio, &mut self.cache, probe, sequence).await
+                        probe_visit(radio, &mut self.cache, probe, sequence, true).await
                     }
-                    _ => listen(radio, &mut self.cache, dwell).await,
+                    _ => listen(radio, &mut self.cache, dwell, true).await,
                 }
             }
             .await;
@@ -880,7 +890,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
                     extra: &[],
                     timing,
                 };
-                probe_visit(radio, cache, probe, sequence).await?;
+                probe_visit(radio, cache, probe, sequence, false).await?;
             }
             let deadline = now_ms().saturating_add(FRESH_MS);
             loop {
@@ -890,7 +900,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
                 if now_ms() >= deadline {
                     return Ok(None);
                 }
-                listen(radio, cache, 10).await?;
+                listen(radio, cache, 10, false).await?;
             }
         }
         .await;

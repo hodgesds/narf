@@ -943,6 +943,37 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             Error::Control(error)
         })
     }
+    /// Idle BT-info drain: the `rtl8xxxu_c2hcmd_callback` half of
+    /// `maintain` for a radio with no station serviced — the scan/listen
+    /// path, where `poll` queues `C2H_8723B_BT_INFO` records but no
+    /// station `maintain` runs. `assoc` is the caller's association
+    /// state, not `self.ra`: `false` for an unbound radio, `true` for a
+    /// station's off-channel visit (Linux `rtl8xxxu_is_assoc` stays true
+    /// through a scan, while NARF's `leave` takes `ra`, so the radio
+    /// alone cannot answer it). No RA watchdog, no recovery: the caller
+    /// owns those, exactly as `listen` already runs `maintain` for
+    /// recovery before polling.
+    pub async fn drain_bt(&mut self, assoc: bool) -> Result<(), Error> {
+        self.current()?;
+        if self.phase() != Phase::Receiving {
+            return Err(Error::State);
+        }
+        let mut attempt = self.attempt();
+        let result = async {
+            while let Some(record) = self.bt.pop_front() {
+                if let Some(coex) = &mut self.coex {
+                    self.firmware.c2h_bt_8723b(coex, &record, assoc).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        result.map_err(|error| {
+            self.fail_terminal();
+            Error::Control(error)
+        })
+    }
     /// `BSS_CHANGED_ASSOC` without association (`ra_disconnect_8192e`), then
     /// `rtl8xxxu_stop`: `REG_TXPAUSE = 0xff`, RX filter maps cleared, the
     /// host transfers retired, `REG_TXPAUSE = 0xff`, `disable_rf`.

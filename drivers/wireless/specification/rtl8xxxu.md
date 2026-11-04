@@ -1552,6 +1552,12 @@ rate authority.
   (`ra_watchdog_8192e`/`ra_watchdog_8723b` with `-ewma_rssi_read`) and the
   queued BT records through `Owner::c2h_bt_8723b(coex, record, assoc)`
   where `assoc` (`rtl8xxxu_is_assoc`) is the station's association.
+  While no station is serviced, the scan/listen path drains the same
+  queue through `Radio::drain_bt(assoc)`: `assoc = false` for an
+  unbound radio, `assoc = true` for a station's off-channel visit
+  (Linux `rtl8xxxu_is_assoc` stays true through a scan, while NARF's
+  `leave` takes `ra`, so the radio alone cannot answer it) — BT info
+  is programmed while idle, not only while a station is serviced.
   `stop` is `ra_disconnect_8192e` then `rtl8xxxu_stop` (`REG_TXPAUSE`,
   RX filter maps cleared, host transfers retired, `REG_TXPAUSE`,
   `disable_rf`); `park` is `park_stopped` (`rtl8192eu_power_off` /

@@ -859,6 +859,65 @@ kernel_test_in!(
     smoke_rtl8723bu_bt_coex_policy
 );
 
+fn smoke_rtl8723bu_bt_coex_idle() -> TestResult {
+    use super::btcoex::Coex;
+    // The idle drain's exact call: `c2h_bt_8723b` with `assoc = false`.
+    // Linux `rtl8723bu_handle_bt_inquiry` / `rtl8723bu_handle_bt_info`
+    // take the non-associated branch (TDMA_WIFI + coex type 0) and never
+    // consult the 0x770 high-priority counters: seed them with
+    // 0xffff_ffff, which would flip an associated idle verdict to type
+    // 7, and assert the idle verdict stays type 0.
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    io.0.lock().regs[0x770..0x774].copy_from_slice(&(0xffff_ffffu32).to_le_bytes());
+    let mut coex = Coex::default();
+    // Connected idle, no inquiry: info path, unassociated.
+    let record = super::rtl8192e_packet::C2h::Other {
+        id: 9,
+        seq: 0,
+        payload: vec![0, 0x01],
+    };
+    match narf_scheduler::block_on(owner.c2h_bt_8723b(&mut coex, &record, false)) {
+        Ok(Some(a)) if a.tdma == [0x08, 0, 0, 0, 0] && a.coex_type == 0 => {}
+        _ => return TestResult::Fail("8723bu idle BT info dispatch"),
+    }
+    if h2c_words(&io) != vec![vec![0x60, 0x08, 0, 0]]
+        || io.writes(0x06c0) != vec![0x5555_5555u32.to_le_bytes().to_vec()]
+        || io.writes(0x06c4) != vec![0x5555_5555u32.to_le_bytes().to_vec()]
+        || io.writes(0x06c8) != vec![0x00ff_ffffu32.to_le_bytes().to_vec()]
+        || io.writes(0x06cc) != vec![vec![0x03]]
+    {
+        return TestResult::Fail("8723bu idle coex programming");
+    }
+    // Connected + inquiry page: inquiry path, unassociated — the same
+    // TDMA_WIFI + type 0 programming.
+    let Some((io, owner)) = ready_owner() else {
+        return TestResult::Fail("8723bu did not reach RadioReady");
+    };
+    let mut coex = Coex::default();
+    let record = super::rtl8192e_packet::C2h::Other {
+        id: 9,
+        seq: 0,
+        payload: vec![0, 0x01 | 0x04],
+    };
+    match narf_scheduler::block_on(owner.c2h_bt_8723b(&mut coex, &record, false)) {
+        Ok(Some(a)) if a.tdma == [0x08, 0, 0, 0, 0] && a.coex_type == 0 => {}
+        _ => return TestResult::Fail("8723bu idle BT inquiry dispatch"),
+    }
+    if !coex.c2h_bt_inquiry
+        || h2c_words(&io) != vec![vec![0x60, 0x08, 0, 0]]
+        || io.writes(0x06c0) != vec![0x5555_5555u32.to_le_bytes().to_vec()]
+    {
+        return TestResult::Fail("8723bu idle inquiry programming");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/8723bu",
+    smoke_rtl8723bu_bt_coex_idle
+);
+
 fn smoke_rtl8723bu_admission_and_start() -> TestResult {
     use super::rtl8192e_policy::tests::domain;
     use super::rtl8192e_radio::Width;
