@@ -114,8 +114,10 @@ impl ProbeError {
 /// live PCI start-up has never run end to end, not even against a composed
 /// fixture. Probe refuses them so a real card does not enter an unexercised
 /// runtime; remove an entry only together with a composed start-up smoke.
-/// QCN9074: no composed PCI start-up fixture; full-monitor DP missing.
-pub(super) const UNVERIFIED_RUNTIME: &[HwRev] = &[HwRev::Qcn9074Hw10];
+/// QCN9074 was admitted by `smoke_ath11k_qcn9074_pci_startup`
+/// (integration_tests.rs); the list is empty until the next such family
+/// appears.
+pub(super) const UNVERIFIED_RUNTIME: &[HwRev] = &[];
 
 /// Table-level completeness only: register map, core config, DP params and
 /// MHI config all exist for `hw_rev`. Probe additionally requires the family

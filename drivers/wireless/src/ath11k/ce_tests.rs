@@ -123,12 +123,16 @@ impl FakeChip {
     }
     /// Independently literal Linux CE windows, not copied from the HAL under
     /// test. QCA6390 and WCN6855 share stride/layout but not the CE aperture.
+    /// QCN9074 shares the WCN6855 aperture: its `qcn9074_regs` CE0
+    /// source/destination are 0x01b8_0000/0x01b8_1000, the same pair.
     pub(super) fn for_revision(revision: HwRev, shadow: &[u32]) -> Self {
         let (ce_source, ce_destination) = match revision {
             HwRev::Qca6390Hw20 => (0x00a0_0000, 0x00a0_1000),
-            HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
-                (0x01b8_0000, 0x01b8_1000)
-            }
+            HwRev::Wcn6855Hw20
+            | HwRev::Wcn6855Hw21
+            | HwRev::Qca2066Hw21
+            | HwRev::Qca6698aqHw21
+            | HwRev::Qcn9074Hw10 => (0x01b8_0000, 0x01b8_1000),
             _ => panic!("unmodeled CE profile"),
         };
         let chip = FakeChip {

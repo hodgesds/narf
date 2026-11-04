@@ -597,42 +597,78 @@ impl Dev {
     fn learn_rings(&self, st: &mut DevState) {
         let c = self.chip();
         let r = &mut st.rings;
-        if r.tcl.is_none() {
-            r.tcl = umac(
-                c,
-                if self.revision == HwRev::Qca6390Hw20 {
-                    0x00a4_4684
-                } else {
-                    TCL1_R0
-                },
+        // (tcl_r0, tcl_host, wbm_r0, wbm_host, reo_r0, reo_host,
+        //  cmd_r0, cmd_host, status_r0, status_host). SRC rings use
+        //  their HP register as the host pointer; DST rings use their
+        //  dedicated TP register where `HalRegs` has one, else HP + 4
+        //  (WBM release, REO status). QCN9074's pairs are derived from
+        //  its own regs table (Linux `qcn9074_regs`): the UMAC block
+        //  bases plus the chip's `hal_*_ring_base_lsb` fields, giving
+        //  TCL 0x00a4_44f0/0x00a4_6000, WBM 0x00a3_4924/0x00a3_70c4,
+        //  REO2SW1 0x00a3_829c/0x00a3_b03c, CMD 0x00a3_8194/0x00a3_b020,
+        //  STATUS 0x00a3_8504/0x00a3_b074. The other revisions keep
+        //  their existing literal constants unchanged.
+        let a: (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) = if self.revision
+            == HwRev::Qcn9074Hw10
+        {
+            let regs = self
+                .revision
+                .params()
+                .and_then(|p| p.regs)
+                .expect("QCN9074 regs");
+            (
+                super::hal::HAL_SEQ_WCSS_UMAC_TCL_REG + regs.hal_tcl1_ring_base_lsb,
+                super::hal::HAL_SEQ_WCSS_UMAC_TCL_REG + super::hal::HAL_TCL1_RING_HP,
+                super::hal::HAL_SEQ_WCSS_UMAC_WBM_REG + regs.hal_wbm0_release_ring_base_lsb,
+                super::hal::HAL_SEQ_WCSS_UMAC_WBM_REG + super::hal::HAL_WBM0_RELEASE_RING_HP + 4,
+                super::hal::HAL_SEQ_WCSS_UMAC_REO_REG + regs.hal_reo1_ring_base_lsb,
+                super::hal::HAL_SEQ_WCSS_UMAC_REO_REG + regs.hal_reo1_ring_tp,
+                super::hal::HAL_SEQ_WCSS_UMAC_REO_REG + regs.hal_reo_cmd_ring_base_lsb,
+                super::hal::HAL_SEQ_WCSS_UMAC_REO_REG + regs.hal_reo_cmd_ring_hp,
+                super::hal::HAL_SEQ_WCSS_UMAC_REO_REG + regs.hal_reo_status_ring_base_lsb,
+                super::hal::HAL_SEQ_WCSS_UMAC_REO_REG + regs.hal_reo_status_hp + 4,
+            )
+        } else if self.revision == HwRev::Qca6390Hw20 {
+            (
+                0x00a4_4684,
                 TCL1_HP,
-                false,
-            );
+                0x00a3_4910,
+                WBM2SW0_TP,
+                REO2SW1_R0,
+                REO2SW1_TP,
+                REO_CMD_R0,
+                REO_CMD_HP,
+                0x00a3_84ac,
+                0x00a3_b06c,
+            )
+        } else {
+            (
+                TCL1_R0,
+                TCL1_HP,
+                WBM2SW0_R0,
+                WBM2SW0_TP,
+                REO2SW1_R0,
+                REO2SW1_TP,
+                REO_CMD_R0,
+                REO_CMD_HP,
+                REO_STATUS_R0,
+                REO_STATUS_TP,
+            )
+        };
+        if r.tcl.is_none() {
+            r.tcl = umac(c, a.0, a.1, false);
         }
         if r.wbm.is_none() {
-            r.wbm = umac(
-                c,
-                if self.revision == HwRev::Qca6390Hw20 {
-                    0x00a3_4910
-                } else {
-                    WBM2SW0_R0
-                },
-                WBM2SW0_TP,
-                true,
-            );
+            r.wbm = umac(c, a.2, a.3, true);
         }
         if r.reo.is_none() {
-            r.reo = umac(c, REO2SW1_R0, REO2SW1_TP, true);
+            r.reo = umac(c, a.4, a.5, true);
         }
         if r.reo_cmd.is_none() {
-            r.reo_cmd = umac(c, REO_CMD_R0, REO_CMD_HP, false);
+            r.reo_cmd = umac(c, a.6, a.7, false);
         }
         if r.reo_status.is_none() {
-            r.reo_status = if self.revision == HwRev::Qca6390Hw20 {
-                umac(c, 0x00a3_84ac, 0x00a3_b06c, true)
-            } else {
-                umac(c, REO_STATUS_R0, REO_STATUS_TP, true)
-            };
+            r.reo_status = umac(c, a.8, a.9, true);
         }
     }
 
@@ -920,7 +956,11 @@ fn rig_for_rev(
 ) -> (TCore, DpHooks, Arc<Dev>) {
     let params = revision.params().expect("checked production profile");
     NOW.store(0, Ordering::Relaxed);
-    let ce = Ce::alloc(&params, msi(&MSI_CONFIG_QCA6390), clock).expect("Ce::alloc");
+    // The rig uses the revision's own MSI layout: QCN9074's 16 vectors
+    // (MHI 3 / CE 5 / DP 8), the QCA6390/WCN6855 family's 32. The
+    // QCA6390 layout was previously hardcoded here; the other chips'
+    // params point at it, so their rig behavior is unchanged.
+    let ce = Ce::alloc(&params, msi(params.msi), clock).expect("Ce::alloc");
     let chip = Arc::new(Chip(FakeChip::for_revision(revision, ce.shadow_reg_v2())));
     let dev = Dev::new(chip.clone(), script, cfg, revision);
     let hif = CeHif {
@@ -942,7 +982,7 @@ fn rig_for_rev(
         DpHwParams::for_rev(revision),
         revision as u32,
         sizes,
-        Some(msi(&MSI_CONFIG_QCA6390)),
+        Some(msi(params.msi)),
     );
     (core, hooks, dev)
 }
@@ -1051,6 +1091,29 @@ impl Drop for Up {
 /// next runtime pass).
 fn up(cfg: FwCfg) -> Result<Up, &'static str> {
     up_caps(cfg, |_| {})
+}
+
+/// [`up_caps`] for a named revision: the same bring-up through mac
+/// start + vif 0, but on that chip's production profile, CE aperture,
+/// MSI layout, and DP parameters instead of the WCN6855 defaults.
+#[inline(never)]
+fn up_for_rev(
+    cfg: FwCfg,
+    adjust: impl FnOnce(&mut super::mac::DeviceCaps),
+    revision: HwRev,
+) -> Result<Up, &'static str> {
+    let u = up_down_caps_for_rev(cfg, adjust, revision)?;
+    ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
+    let (_, err, _, _) = latched(|| pump(&u, 1));
+    ensure!(err == 0, "mac start over the runtime");
+    ensure!(
+        run!(u.netdev.mac.lock())
+            .vif()
+            .is_some_and(|v| v.vdev_id == 0),
+        "vif 0"
+    );
+    LINK_SEEN.lock().clear();
+    Ok(u)
 }
 
 /// [`up`] with the mac layer's device capabilities adjusted first.
@@ -1387,6 +1450,130 @@ kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_int_bring_up_to_netdev
 );
+
+/// QCN9074's composed PCI startup smoke: the admission gate for the
+/// chip (see `pci::UNVERIFIED_RUNTIME`). It runs the same bring-up
+/// the WCN6855/QCA6390 smokes run — QMI firmware ready, DP up, mac
+/// start, vif 0, `wlan%d` registered — on QCN9074's own production
+/// profile: its 16-vector MSI layout, its `qcn9074_regs` UMAC ring
+/// addresses, its 1-radio / 8-vdev / 128-peer core, and its
+/// multi-pdev DpHwParams (rxdma1, peer-map v2, full monitor mode).
+/// Pdev 0 only: the RX service, mac, and WMI layers still cover pdev 0
+/// alone (see the remaining-features row), so the smoke pins exactly
+/// that — one pdev, mac_id 0, no extra pdevs. Fixture-validated only;
+/// nothing here ran on silicon, and the PCI probe path itself (MHI
+/// start, static-window selection) is not reachable from this rig —
+/// the static windows stay covered by the regs/windows unit test.
+fn smoke_ath11k_qcn9074_pci_startup() -> TestResult {
+    check(|| {
+        // Admission first: probe accepts the chip before any
+        // MMIO/MSI/DMA, so the composed bring-up below is the gate
+        // the refusal was waiting on.
+        ensure!(
+            super::pci::validate_runtime_profile(HwRev::Qcn9074Hw10).is_ok(),
+            "QCN9074 admitted by probe"
+        );
+        let u = up_for_rev(wpa2_cfg(), |_| {}, HwRev::Qcn9074Hw10)?;
+        let params = HwRev::Qcn9074Hw10
+            .params()
+            .expect("checked production profile");
+        ensure!(
+            params.msi == &MSI_CONFIG_QCN9074 && params.msi.total_vectors == 16,
+            "QCN9074 MSI: 16 vectors (MHI 3 / CE 5 / DP 8)"
+        );
+        let st = u.dev.st.borrow();
+        // HTT: VERSION_REQ, the six SRING_SETUPs in Linux's order
+        // (refill 1, no rx_mac_buf ring, 1 rxdma error dst, rxdma1
+        // monitor buf/dst/desc 3, 1 monitor-status reap), the PPDU
+        // stats config (×1 rxdma), the one monitor-status filter.
+        let types: Vec<u8> = st.htt_h2t.iter().map(|m| m[0]).collect();
+        ensure!(
+            types == [0x0, 0xb, 0xb, 0xb, 0xb, 0xb, 0xb, 0x11, 0xc],
+            "HTT: VERSION_REQ, 6 × SRING_SETUP, PPDU_STATS_CFG, RX_RING_SELECTION_CFG"
+        );
+        ensure!(
+            st.rings.lmac.len() == 6,
+            "LMAC rings learned from SRING_SETUP"
+        );
+        ensure!(
+            st.rings.tcl.is_some() && st.rings.reo.is_some() && st.rings.wbm.is_some(),
+            "UMAC rings programmed"
+        );
+        ensure!(
+            st.wmi
+                .iter()
+                .any(|c| c.cmd_id == wmi::WMI_VDEV_CREATE_CMDID),
+            "vdev created over the real WMI endpoint"
+        );
+        drop(st);
+        let snap = narf_net::iface::lookup(u.name).ok_or("registered with the stack")?;
+        ensure!(
+            snap.mac == FW_MAC && snap.link_up && !snap.carrier,
+            "MAC from WMI READY, IFF_UP, carrier off"
+        );
+        ensure!(u.name.starts_with("wlan"), "wlan%d name");
+        let nd = &u.netdev;
+        ensure!(
+            nd.mac() == FW_MAC && nd.mtu() == 1500 && !nd.link_up(),
+            "Interface view"
+        );
+        let info = nd.get_wireless_info();
+        ensure!(info.base_mac == FW_MAC, "wireless info MAC");
+        ensure!(
+            info.bands
+                .iter()
+                .any(|b| b.freq_mhz == 2400 && b.channels.contains(&6)),
+            "2.4 GHz band from hal_reg_cap + the regulatory rules"
+        );
+        ensure!(
+            info.bands
+                .iter()
+                .any(|b| b.freq_mhz == 5000 && b.channels.contains(&36)),
+            "5 GHz band"
+        );
+        // The fixture's MAC/PHY caps carry no HT capability bits
+        // (`ht_cap_info` 0) but a 5 GHz VHT capability.
+        ensure!(
+            !info.hw_caps.ht_supported
+                && info.hw_caps.ht_supported == nd.radio().ht
+                && info.hw_caps.vht_supported == nd.radio().vht
+                && info.hw_caps.he_supported
+                && nd.radio().he,
+            "HT / VHT from the firmware caps; HE on every supported band \
+             (ath11k_mac_copy_he_cap sets has_he unconditionally)"
+        );
+        let g = run!(u.shared.lock());
+        ensure!(g.vdev(0).unwrap().link.vif.is_some(), "DP vdev TX attach");
+        ensure!(
+            g.mon_reap_at.is_some(),
+            "monitor reap timer armed by mac start"
+        );
+        ensure!(g.core.state == CoreState::Ready, "core ready");
+        ensure!(
+            g.core.cfg.max_radios == 1
+                && g.core.cfg.num_vdevs == 8
+                && g.core.cfg.num_peers == 128
+                && !g.core.cfg.single_pdev_only,
+            "QCN9074 core: 1 radio, 8 vdevs, 128 peers, multi-pdev shape"
+        );
+        ensure!(
+            g.dp.cfg.hal_desc_sz == super::qcn9074::HalRxDescQcn9074::SIZE
+                && g.dp.cfg.rxdma1_enable
+                && g.dp.cfg.htt_peer_map_v2
+                && g.dp.cfg.full_monitor_mode
+                && g.dp.cfg.num_rxdma_per_pdev == 1
+                && !g.dp.cfg.rx_mac_buf_ring,
+            "QCN9074 DP: qcn9074 RX descriptor, rxdma1, peer-map v2, \
+             full monitor mode, 1 rxdma, no rx_mac_buf ring"
+        );
+        ensure!(
+            g.dp.pdev.as_ref().is_some_and(|p| p.mac_id == 0) && g.dp.extra_pdevs.is_empty(),
+            "pdev 0 only: no extra pdevs"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_qcn9074_pci_startup);
 
 /// A passive scan through WMI events over the CE rings.
 fn smoke_ath11k_int_scan() -> TestResult {
