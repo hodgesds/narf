@@ -1500,8 +1500,8 @@ fn smoke_ixgbe_dcb_register_conversation_8tc() -> TestResult {
     use super::queues::RegBank;
     use super::IXGBE_DEV_82599EB;
     let mut tc = [dcb_tc(32, 256, 0, PrioType::None); MAX_TRAFFIC_CLASS];
-    for i in 0..MAX_TRAFFIC_CLASS {
-        tc[i] = dcb_tc(
+    for (i, slot) in tc.iter_mut().enumerate() {
+        *slot = dcb_tc(
             32 * (i as u16 + 1),
             256 * (i as u16 + 1),
             i as u8,

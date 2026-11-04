@@ -339,10 +339,10 @@ pub const RX_QUEUES_PER_TC: usize = 16;
 /// in 64-byte units. `max_frame` is the maximum frame size in bytes.
 /// TCs with zero bandwidth still get the minimum credit.
 pub fn ieee_credits(bw: &[u8; MAX_TRAFFIC_CLASS], max_frame: u32) -> ([u16; 8], [u16; 8]) {
-    let min_credit = ((max_frame / 2) + DCB_CREDIT_QUANTUM - 1) / DCB_CREDIT_QUANTUM;
+    let min_credit = (max_frame / 2).div_ceil(DCB_CREDIT_QUANTUM);
     let mut min_percent: u32 = 100;
-    for i in 0..MAX_TRAFFIC_CLASS {
-        let b = bw[i] as u32;
+    for b in bw.iter() {
+        let b = *b as u32;
         if b != 0 && b < min_percent {
             min_percent = b;
         }
@@ -570,8 +570,8 @@ impl DcbConfig {
 pub fn read_up_to_tc(bank: &impl RegBank) -> [u8; MAX_USER_PRIORITY] {
     let reg = bank.read32(REG_RTRUP2TC);
     let mut map = [0u8; MAX_USER_PRIORITY];
-    for up in 0..MAX_USER_PRIORITY {
-        map[up] = ((reg >> (up as u32 * UP2TC_UP_SHIFT)) & 0x7) as u8;
+    for (up, slot) in map.iter_mut().enumerate() {
+        *slot = ((reg >> (up as u32 * UP2TC_UP_SHIFT)) & 0x7) as u8;
     }
     map
 }
