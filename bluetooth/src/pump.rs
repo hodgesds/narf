@@ -6192,19 +6192,37 @@ mod tests {
             .iter()
             .find(|(h, f)| *h == SMP888_HANDLE && f.cid == CID_SMP)
             .map(|(_, f)| f.payload.clone());
-        // Byte-exact Pairing Request: NoInputNoOutput, bonding|SC,
-        // IdKey|Sign offered and requested.
-        if req != Some(alloc::vec![0x01, 0x00, 0x00, 0x09, 16, 0x06, 0x06]) {
+        // Byte-exact Pairing Request: NoInputNoOutput (0x03 per
+        // Part H §3.5.1 — NOT 0x00, which is DisplayOnly),
+        // bonding|SC, IdKey|Sign offered and requested.
+        if req
+            != Some(alloc::vec![
+                0x01,
+                smp::IoCapability::NoInputNoOutput as u8,
+                0x00,
+                0x09,
+                16,
+                0x06,
+                0x06
+            ])
+        {
             return fail("initiator Pairing Request bytes wrong");
         }
-        // Peer (responder) answers: NoInputNoOutput, bonding|SC,
-        // IdKey|Sign both directions.
+        // Peer (responder) answers: NoInputNoOutput (0x03 per
+        // Part H §3.5.1), bonding|SC, IdKey|Sign both directions.
         let rsp = smp888_step_acls(
             &fake,
             &[smp888_acl(
                 SMP888_HANDLE,
                 smp::SMP_PAIRING_RESPONSE,
-                &[0x00, 0x00, 0x09, 16, 0x06, 0x06],
+                &[
+                    smp::IoCapability::NoInputNoOutput as u8,
+                    0x00,
+                    0x09,
+                    16,
+                    0x06,
+                    0x06,
+                ],
             )],
             SMP888_HANDLE,
         );
@@ -6288,7 +6306,11 @@ mod tests {
             &SMP888_LOCAL_ADDR,
             &SMP888_PEER_ADDR,
         );
-        let iocap_a: [u8; 3] = [0x09, 0x00, 0x00];
+        let iocap_a: [u8; 3] = [
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            0x00,
+            smp::IoCapability::NoInputNoOutput as u8,
+        ];
         let want_ea = peer_f6(
             &sbox,
             &mac_key,
@@ -6306,7 +6328,11 @@ mod tests {
         }
         // Peer answers with Eb. The initiator parks at
         // AuthComplete and auto-starts encryption — no bond yet.
-        let iocap_b: [u8; 3] = [0x09, 0x00, 0x00];
+        let iocap_b: [u8; 3] = [
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            0x00,
+            smp::IoCapability::NoInputNoOutput as u8,
+        ];
         let eb = peer_f6(
             &sbox,
             &mac_key,
@@ -6557,7 +6583,11 @@ mod tests {
             &SMP888_PEER_ADDR,
             &SMP888_LOCAL_ADDR,
         );
-        let iocap_a: [u8; 3] = [0x09, 0x00, 0x00];
+        let iocap_a: [u8; 3] = [
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            0x00,
+            smp::IoCapability::NoInputNoOutput as u8,
+        ];
         let ea = peer_f6(
             &sbox,
             &mac_key,
@@ -6749,7 +6779,18 @@ mod tests {
             )],
             SMP888_HANDLE,
         );
-        if out.len() != 1 || out[0] != alloc::vec![0x01, 0x00, 0x00, 0x09, 16, 0x06, 0x06] {
+        if out.len() != 1
+            || out[0]
+                != alloc::vec![
+                    0x01,
+                    smp::IoCapability::NoInputNoOutput as u8,
+                    0x00,
+                    0x09,
+                    16,
+                    0x06,
+                    0x06
+                ]
+        {
             return fail("Security Request did not produce the initiator Pairing Request");
         }
         if smp_initiate_pairing(0, SMP888_HANDLE) != Some(Err(SmpInitiateError::AlreadyPairing)) {
@@ -7032,7 +7073,11 @@ mod tests {
                 &SMP888_PEER_ADDR,
                 &SMP888_LOCAL_ADDR,
             );
-            let iocap_a: [u8; 3] = [0x09, 0x00, 0x00];
+            let iocap_a: [u8; 3] = [
+                smp::AUTH_BONDING | smp::AUTH_SC,
+                0x00,
+                smp::IoCapability::NoInputNoOutput as u8,
+            ];
             let ea = peer_f6(
                 sbox,
                 &mac_key,

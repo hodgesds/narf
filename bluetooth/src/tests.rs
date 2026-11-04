@@ -855,6 +855,42 @@ fn run_loopback_exchange() -> Result<(), &'static str> {
     let out = init.feed(&step[0]).map_err(|_| "initiator rejected Eb")?;
     let _ = xfer(out, 0)?;
 
+    // #888: a bonded exchange parks at AuthComplete after Eb —
+    // distribution needs an encrypted link, and the Peripheral
+    // (responder) distributes first (§3.6.1). Drive Phase 3 to
+    // Done instead of expecting Done straight after Eb.
+    if init.state != PairingState::AuthComplete || resp.state != ResponderState::AuthComplete {
+        return Err("loopback did not park at AuthComplete after Eb");
+    }
+    let out = init.begin_distribution();
+    if !out.is_empty() || init.state != PairingState::WaitDistribution {
+        return Err("loopback initiator did not wait for responder keys");
+    }
+    let r_dist = resp.begin_distribution();
+    if r_dist.len() != 3 {
+        return Err("loopback responder distribution wrong");
+    }
+    let mut i_out = Vec::new();
+    for pdu in &r_dist {
+        match init.feed(pdu) {
+            Ok(out) => i_out = out,
+            Err(_) => return Err("initiator rejected a responder distribution PDU"),
+        }
+    }
+    if i_out.len() != 3 {
+        return Err("loopback initiator distribution wrong");
+    }
+    for pdu in &i_out {
+        match resp.feed(pdu) {
+            Ok(out) => {
+                if !out.is_empty() {
+                    return Err("responder emitted PDUs on distribution intake");
+                }
+            }
+            Err(_) => return Err("responder rejected an initiator distribution PDU"),
+        }
+    }
+
     if init.state != PairingState::Done || resp.state != ResponderState::Done {
         return Err("loopback did not complete on both sides");
     }
