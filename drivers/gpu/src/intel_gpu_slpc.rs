@@ -1,9 +1,18 @@
-//! GuC main-GT frequency limits and acknowledged SLPC controls.
+//! GuC frequency limits and acknowledged SLPC controls, per GuC.
 //!
 //! Source: MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! xe_guc_pc.c, regs/xe_regs.h, abi/guc_actions_slpc_abi.h,
 //! xe_wa_oob.rules, xe_device_wa_oob.rules and intel/pciids.h.
-//! Media GTs and dynamic MERT/L2-flush cap removal are not owned here.
+//! xe_guc_pc.c runs one PC instance per GT. The main GT keeps its existing
+//! start sequence. The MTL/Arrow standalone media GuC (`Slpc::start` with
+//! `media`) reads the media fuses (`Limits::read_media`) and follows
+//! xe_guc_pc_start's per-GT tail: pc_adjust_freq_bounds, GUCRC firmware
+//! control, the compute strategy and the cached power profile. Qualified BMG
+//! MERT promotion requires the separate retained host-L2 owner and its
+//! startup/stop/flush proofs.
+
+#[path = "intel_gpu_slpc_mert.rs"]
+pub(crate) mod mert;
 
 use crate::{
     intel_gpu_aux::MmioWindow,
@@ -83,23 +92,24 @@ impl Limits {
         device: u16,
     ) -> Result<Self, SlpcError> {
         let ip = GraphicsIp::read(mmio, platform).map_err(|_| SlpcError::Unavailable)?;
-        let (rpn_mhz, rpe_mhz, rp0_mhz) = if platform == GtPlatform::Alchemist {
-            let cap = stable(mmio, 0x145998)?;
-            let efficient = stable(mmio, 0x145ef0)?;
-            (
-                ((cap >> 16) & 255) * 50,
-                ((efficient >> 8) & 255) * 50,
-                (cap & 255) * 50,
-            )
-        } else {
-            let cap = stable(mmio, 0x138000)?;
-            let efficient = stable(mmio, 0x13800c)?;
-            (
-                decode((cap >> 16) & 511),
-                decode(efficient & 511),
-                decode(cap & 511),
-            )
-        };
+        let (rpn_mhz, rpe_mhz, rp0_mhz) =
+            if platform == GtPlatform::Alchemist || platform.is_gen12() {
+                let cap = stable(mmio, 0x145998)?;
+                let efficient = stable(mmio, 0x145ef0)?;
+                (
+                    ((cap >> 16) & 255) * 50,
+                    ((efficient >> 8) & 255) * 50,
+                    (cap & 255) * 50,
+                )
+            } else {
+                let cap = stable(mmio, 0x138000)?;
+                let efficient = stable(mmio, 0x13800c)?;
+                (
+                    decode((cap >> 16) & 511),
+                    decode(efficient & 511),
+                    decode(cap & 511),
+                )
+            };
         // xe_device_wa_oob.rules: Wa_14022085890, exactly BMG G21.
         let g21 = platform == GtPlatform::Battlemage
             && matches!(
@@ -108,8 +118,8 @@ impl Limits {
             );
         let min_mhz = if g21 { rpn_mhz.max(1200) } else { rpn_mhz };
         // xe_wa_oob.rules: Wa_22019338487 on graphics 20.01, all steps.
-        // Retain the boot MERT cap for this owner's entire lifetime: raising it
-        // needs the source's separate flush/actual-frequency protocol.
+        // Bootstrap at the MERT cap. Only GuCGt's independently prepared
+        // host-L2/flush owner may lift it after verified execution startup.
         let max_mhz = if ip.version == 2001 {
             rp0_mhz.min(2133)
         } else {
@@ -124,6 +134,34 @@ impl Limits {
             rp0_mhz,
             min_mhz,
             max_mhz,
+        })
+    }
+
+    /// Standalone media GT (MTL/Arrow GT1, media 13.00), with GT1 forcewake
+    /// held: xe_guc_pc.c::mtl_init_fused_rp_values reads RP0 [8:0] and RPn
+    /// [24:16] of MTL_MEDIAP_STATE_CAP (0x138020) and mtl_get_rpe_freq reads
+    /// RPe [8:0] of MTL_MPE_FREQUENCY (0x13802c) for xe_gt_is_media_type.
+    /// Both lie above MEDIA_GT_GSI_LENGTH, so xe_mmio_adjusted_addr leaves
+    /// them absolute through GT1's window. No conservative bound applies:
+    /// Wa_22019338487 is MEDIA_VERSION(2000) (pc_max_freq_cap) and
+    /// Wa_14022085890 is BMG G21 only.
+    pub(crate) fn read_media(mmio: &impl MmioWindow) -> Result<Self, SlpcError> {
+        let cap = stable(mmio, 0x138020)?;
+        let efficient = stable(mmio, 0x13802c)?;
+        let (rpn_mhz, rpe_mhz, rp0_mhz) = (
+            decode((cap >> 16) & 511),
+            decode(efficient & 511),
+            decode(cap & 511),
+        );
+        if rpn_mhz == 0 || rpn_mhz > rpe_mhz || rpe_mhz > rp0_mhz {
+            return Err(SlpcError::Unavailable);
+        }
+        Ok(Self {
+            rpn_mhz,
+            rpe_mhz,
+            rp0_mhz,
+            min_mhz: rpn_mhz,
+            max_mhz: rp0_mhz,
         })
     }
 
@@ -157,7 +195,14 @@ enum Command {
     Profile(PowerProfile),
     QueryFinal,
     Gucrc,
+    EnableDcc(bool),
+    DisableDcc(bool),
+    /// SLPC_PARAM_STRATEGIES (media GuC start only).
+    Strategy(u32),
 }
+
+/// abi/guc_actions_slpc_abi.h SLPC_OPTIMIZED_STRATEGY_COMPUTE.
+const STRATEGY_COMPUTE: u32 = 1;
 
 pub(crate) struct Slpc {
     state: SlpcState,
@@ -172,6 +217,12 @@ pub(crate) struct Slpc {
     pending: Option<u16>,
     acked: bool,
     deadline: u64,
+    mert_range: Option<FrequencyRange>,
+    disable_dcc: bool,
+    /// The standalone media GuC's start sequence (xe_guc_pc_start per GT).
+    media: bool,
+    /// SETUP_PC_GUCRC(GUCRC_FIRMWARE_CONTROL) was sent: firmware may own RC6.
+    gucrc: bool,
 }
 
 impl Slpc {
@@ -189,6 +240,10 @@ impl Slpc {
             pending: None,
             acked: false,
             deadline: 0,
+            mert_range: None,
+            disable_dcc: false,
+            media: false,
+            gucrc: false,
         }
     }
     pub(crate) fn state(&self) -> SlpcState {
@@ -201,9 +256,20 @@ impl Slpc {
             profile: self.profile,
         })
     }
-    pub(crate) fn start(&mut self, limits: Limits, now: u64) -> Result<(), SlpcError> {
+    /// `media` selects the standalone media GuC's start sequence; the main
+    /// GT's sequence is unchanged.
+    pub(crate) fn start(
+        &mut self,
+        limits: Limits,
+        now: u64,
+        platform: GtPlatform,
+        media: bool,
+    ) -> Result<(), SlpcError> {
         self.deadline = now.checked_add(TIMEOUT).ok_or(SlpcError::Timeout)?;
         self.limits = Some(limits);
+        self.media = media;
+        // pc_modify_defaults is XE_PANTHERLAKE only.
+        self.disable_dcc = platform.is_ptl() && !media;
         self.state = SlpcState::Resetting {
             deadline: self.deadline,
         };
@@ -250,6 +316,18 @@ impl Slpc {
         self.commands.push(Command::Profile(profile));
         Ok(())
     }
+    /// Only GuCGt's qualified, prepared host-L2 owner may call this. The
+    /// limits remain unpublished until the ordinary ACK/query transaction.
+    pub(crate) fn lift_mert_cap(&mut self, now: u64) -> Result<(), SlpcError> {
+        let range = self.mert_range.ok_or(SlpcError::State)?;
+        self.begin(now)?;
+        self.limits.as_mut().ok_or(SlpcError::State)?.max_mhz =
+            self.limits.ok_or(SlpcError::State)?.rp0_mhz;
+        self.target_profile = self.profile;
+        self.range_commands(range);
+        self.mert_range = None;
+        Ok(())
+    }
     fn unavailable(&mut self) {
         self.state = SlpcState::Unavailable;
         self.range = None;
@@ -279,12 +357,68 @@ impl Slpc {
         }
         match message.kind {
             7 if message.auxiliary == 0 => self.acked = true,
+            // xe_guc_pc_start overwrites pc_action_set_strategy's result with
+            // the power profile's: a refused strategy does not fail the start.
+            6 if matches!(self.commands.get(self.index), Some(Command::Strategy(_))) => {
+                self.acked = true
+            }
             3 => {} // BUSY is progress, not completion and not a new deadline.
             5 => self.pending = None, // RETRY the same command with a fresh fence.
             _ => self.unavailable(),
         }
         true
     }
+    /// The media GuC's start after its first task-state query, as
+    /// xe_guc_pc_start runs for a media GT on MTL/Arrow:
+    /// - pc_init_freqs -> pc_adjust_freq_bounds lowers only a firmware
+    ///   default above RP0: the max first, then the min through
+    ///   pc_set_min_freq (IGNORE_EFFICIENT_FREQUENCY, then the min).
+    ///   pc_adjust_requested_freq has no user request on a fresh GuC, and
+    ///   pc_init_pcode_freq returns early without has_llc (mtl_desc).
+    /// - SETUP_PC_GUCRC(GUCRC_FIRMWARE_CONTROL), SLPC_PARAM_STRATEGIES =
+    ///   SLPC_OPTIMIZED_STRATEGY_COMPUTE and the cached Base power profile.
+    ///
+    /// A programmed bound is acknowledged by a final readback. Bounds left
+    /// as firmware set them are confirmed by this query and the fused limits.
+    fn media_bounds(&mut self, current: FrequencyRange) -> bool {
+        let limits = self.limits.expect("limits");
+        let mut range = current;
+        if current.max_mhz > limits.rp0_mhz {
+            self.commands.push(Command::Max(limits.rp0_mhz));
+            range.max_mhz = limits.rp0_mhz;
+        }
+        if current.min_mhz > limits.rp0_mhz {
+            self.commands.extend([
+                Command::IgnoreEfficient(limits.rp0_mhz < limits.rpe_mhz),
+                Command::Min(limits.rp0_mhz),
+            ]);
+            range.min_mhz = limits.rp0_mhz;
+        }
+        if range != current {
+            self.commands.push(Command::QueryFinal);
+        } else if limits.validate(current).is_err() {
+            return false;
+        }
+        self.target_range = Some(range);
+        self.commands.extend([
+            Command::Gucrc,
+            Command::Strategy(STRATEGY_COMPUTE),
+            Command::Profile(PowerProfile::Base),
+        ]);
+        true
+    }
+
+    /// xe_guc_pc.c::xe_guc_pc_gucrc_disable's H2G before a stop:
+    /// SETUP_PC_GUCRC(GUCRC_HOST_CONTROL), only after this owner handed RC6
+    /// to firmware. As xe_uc_gucrc_disable (XE_WARN_ON) a refused send is
+    /// not an error: the GuC reset that follows ends firmware control.
+    pub(crate) fn release_gucrc<M: MmioWindow, A: BootAllocator>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+    ) -> bool {
+        core::mem::take(&mut self.gucrc) && ct.send(RESET_FENCE, 0x3004, 0, &[0], true).is_ok()
+    }
+
     fn query<B: GpuBacking>(&self, shared: &B) -> Option<FrequencyRange> {
         let word = shared.read32(132);
         let range = FrequencyRange {
@@ -319,26 +453,51 @@ impl Slpc {
             }
             return Ok(());
         }
-        if now >= self.deadline {
-            self.unavailable();
-            return Ok(());
-        }
+        // wait_for_pc_state's poll_timeout_us evaluates the state once more
+        // after expiry, and a reply drained through event() before this poll
+        // is consumed: a late poll that finds either progresses. The bound is
+        // enforced on what is still unsatisfied, and before any new command.
+        let expired = now >= self.deadline;
         if global != 3 {
+            if expired {
+                self.unavailable();
+            }
             return Ok(());
         }
         if self.commands.is_empty() {
+            if self.disable_dcc {
+                self.commands
+                    .extend([Command::EnableDcc(false), Command::DisableDcc(true)]);
+            }
             self.commands.push(Command::QueryInitial);
         }
         if self.acked {
             self.acked = false;
             self.pending = None;
             match self.commands[self.index] {
+                Command::QueryInitial if self.media => {
+                    let Some(current) = self.query(shared) else {
+                        self.unavailable();
+                        return Ok(());
+                    };
+                    if !self.media_bounds(current) {
+                        self.unavailable();
+                        return Ok(());
+                    }
+                }
                 Command::QueryInitial => {
                     let Some(current) = self.query(shared) else {
                         self.unavailable();
                         return Ok(());
                     };
                     let limits = self.limits.expect("limits");
+                    if limits.max_mhz < limits.rp0_mhz {
+                        let max_mhz = current.max_mhz.clamp(limits.min_mhz, limits.rp0_mhz);
+                        self.mert_range = Some(FrequencyRange {
+                            min_mhz: current.min_mhz.clamp(limits.min_mhz, max_mhz),
+                            max_mhz,
+                        });
+                    }
                     let max_mhz = current.max_mhz.clamp(limits.min_mhz, limits.max_mhz);
                     let range = FrequencyRange {
                         min_mhz: current.min_mhz.clamp(limits.min_mhz, max_mhz),
@@ -373,6 +532,11 @@ impl Slpc {
             self.state = SlpcState::Running;
             return Ok(());
         }
+        // A reply still owed, or a command not yet issued, past the bound.
+        if expired {
+            self.unavailable();
+            return Ok(());
+        }
         if self.pending.is_some() {
             return Ok(());
         }
@@ -380,10 +544,15 @@ impl Slpc {
         if matches!(command, Command::Gucrc) {
             match ct.send(RESET_FENCE, 0x3004, 0, &[1], true) {
                 Ok(()) => {
+                    self.gucrc = true;
                     self.index += 1;
-                    self.range = self.target_range;
-                    self.profile = self.target_profile;
-                    self.state = SlpcState::Running;
+                    // The main GT ends here; the media start continues with
+                    // its strategy and power profile (xe_guc_pc_start).
+                    if self.index == self.commands.len() {
+                        self.range = self.target_range;
+                        self.profile = self.target_profile;
+                        self.state = SlpcState::Running;
+                    }
                 }
                 Err(TransportError::Ct(GuCError::Full)) => {}
                 Err(error) => return Err(error),
@@ -400,6 +569,9 @@ impl Slpc {
             Command::Min(value) => vec![0x602, 6, value],
             Command::Max(value) => vec![0x602, 7, value],
             Command::Profile(value) => vec![0x602, 27, value as u32],
+            Command::EnableDcc(value) => vec![0x602, 4, u32::from(value)],
+            Command::DisableDcc(value) => vec![0x602, 5, u32::from(value)],
+            Command::Strategy(value) => vec![0x602, 26, value],
             Command::Gucrc => unreachable!(),
         };
         match ct.send(self.next_fence, 0x3003, 0, &payload, false) {

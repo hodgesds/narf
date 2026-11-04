@@ -63,10 +63,13 @@ impl DrmFence for Completion {
         let deadline =
             narf_time::monotonic_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
         loop {
+            // poll_timeout_us: expiry is sampled before the condition, so a
+            // fence signalled by the deadline is never reported unsignalled.
+            let expired = narf_time::monotonic_ns() >= deadline;
             if self.is_signalled() {
                 return true;
             }
-            if narf_time::monotonic_ns() >= deadline {
+            if expired {
                 return false;
             }
             narf_scheduler::sleep_pumps::run();
@@ -134,7 +137,7 @@ impl Drop for Job {
 struct Projection {
     owner: u64,
     crtc: Crtc,
-    color: (u32, u32),
+    color: (u32, u32, u32),
     completion: Arc<Completion>,
 }
 struct State {
@@ -259,7 +262,7 @@ impl Queue {
             // Pin both resulting properties, including an unchanged CTM/LUT
             // inherited from a queued predecessor. Users may destroy blobs as
             // soon as admission returns; every pending job owns its own pins.
-            for id in [plan.next_ctm, plan.next_gamma]
+            for id in [plan.next_ctm, plan.next_gamma, plan.next_degamma]
                 .into_iter()
                 .filter(|&id| id != 0)
             {
@@ -327,7 +330,7 @@ impl Queue {
         state.projected = Some(Projection {
             owner: open,
             crtc: plan.next.clone(),
-            color: (plan.next_ctm, plan.next_gamma),
+            color: (plan.next_ctm, plan.next_gamma, plan.next_degamma),
             completion: completion.clone(),
         });
         state.jobs.push_back(Job {

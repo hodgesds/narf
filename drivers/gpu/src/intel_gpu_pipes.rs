@@ -333,6 +333,29 @@ pub const PLANE_SURF_OFFSET: u64 = 0x001C;
 /// `PLANE_OFFSET` — pan-and-scan offset within `PLANE_SURF`.
 pub const PLANE_OFFSET_OFFSET: u64 = 0x0024;
 
+/// Source implemented planes, including primary. MIT Linux b90c984d
+/// intel_display_device.c:1788-1793 and HAS_D12_PLANE_MINIMIZATION:
+/// ADL-S has four sprites despite display12; ADL-P/N display13 also has four.
+pub(crate) const fn gen12_plane_count(family: crate::intel_gpu_gt::Gen12Platform) -> u64 {
+    use crate::intel_gpu_gt::Gen12Platform::*;
+    match family {
+        TigerLake => 7,
+        AlderLakeS | AlderLakeP | AlderLakeN => 5,
+    }
+}
+
+/// Exact uncompressed XR24 control for each admitted Gen12 family.
+/// Linux b90c984d skl_universal_plane.c::adlp_plane_ctl_arb_slots and
+/// skl_plane_ctl require Wa_22012358565 on display13: cpp4 selects
+/// PLANE_CTL[30:28]=1. Display12 keeps field value0.
+pub(crate) fn gen12_xrgb_control(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
+    use crate::intel_gpu_gt::Gen12Platform;
+    match family {
+        Gen12Platform::TigerLake | Gen12Platform::AlderLakeS => 0x84000000,
+        Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => 0x94000000,
+    }
+}
+
 /// `PLANE_CTL[31]` — plane enable.
 pub const PLANE_CTL_ENABLE: u32 = 1 << 31;
 
@@ -408,6 +431,17 @@ pub struct TranscoderProgram {
     pub vtotal: u32,
     pub vblank: u32,
     pub vsync: u32,
+}
+
+impl TranscoderProgram {
+    /// `TRANS_VBLANK` for display 13+: `intel_set_transcoder_timings`
+    /// sets `crtc_vblank_start = 1` there (the hardware ignores
+    /// VBLANK_START; `TRANS_SET_CONTEXT_LATENCY` places the pipe vblank),
+    /// so the start field is 0 and only VBLANK_END is kept. Display 12
+    /// keeps [`TranscoderProgram::vblank`] (start at vactive − 1 + SCL).
+    pub const fn vblank_display13(&self) -> u32 {
+        self.vblank & 0xFFFF_0000
+    }
 }
 
 /// One programmed pipe.

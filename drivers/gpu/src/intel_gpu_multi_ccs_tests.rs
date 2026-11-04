@@ -1,7 +1,7 @@
 // Production multi-CCS conversations. Independent literal vectors from MIT
 // Linux b90c984d xe_gt_ccs_mode.c, xe_hw_engine.c, xe_lrc.c and GuC ADS ABI.
 use super::*;
-use crate::intel_gpu_engine::{ccs_mode, compute_selection, Engine};
+use crate::intel_gpu_engine::{Engine, ccs_mode, compute_selection};
 
 fn discover(platform: GtPlatform, mask: u8) -> (Window, Arena, GuCGt<Window, Arena>, u64) {
     let ack = if platform == GtPlatform::Alchemist {
@@ -130,12 +130,20 @@ fn smoke_multi_ccs_ads_defaults_per_instance_private_execution_and_retirement() 
                     let map = (ads[(0x123c + 128) / 4] >> (logical * 8)) & 255;
                     assert_eq!(map, physical as u32);
                     logical += 1;
-                    assert_eq!(ads[header + 1], 3);
-                    let saves = (ads[header] - 0x20001000) as usize / 4;
                     assert_eq!(
-                        [ads[saves], ads[saves + 4], ads[saves + 8]],
-                        [base + 0x29c, base + 0x80, base + 0xa8]
+                        ads[header + 1],
+                        if platform == GtPlatform::Battlemage {
+                            18
+                        } else {
+                            16
+                        }
                     );
+                    let engine = [Engine::Ccs0, Engine::Ccs1, Engine::Ccs2, Engine::Ccs3][physical];
+                    let saves = ads_registers(&w, engine);
+                    assert_eq!(saves[&(base + 0x29c)].1, 0);
+                    assert_eq!(saves[&(base + 0xc4)].1, 1);
+                    assert_eq!(saves[&(base + 0x80)], (d.regs[&u64::from(base + 0x80)], 0));
+                    assert_eq!(saves[&(base + 0xa8)].1, 0);
                     assert_eq!(d.regs[&u64::from(base + 0x4d0)], 0x1000dafc);
                     for n in 3..12 {
                         assert_eq!(d.regs[&u64::from(base + 0x4d0 + n * 4)], base + 0x94);
@@ -203,10 +211,11 @@ fn smoke_multi_ccs_sparse_xe_query_queue_submission_and_timestamp() -> TestResul
         let queue = create_queue_instance(&file, &info, &user, vm, 4, logical);
         exec_wire(&user, queue, true, &[]);
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
-        assert!(call
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (context, fence) = mailbox.accept(&mut gt, 700);
         assert_eq!(context.engine(), physical);
         assert_eq!(ready(call.as_mut()), Some(Ok(0)));

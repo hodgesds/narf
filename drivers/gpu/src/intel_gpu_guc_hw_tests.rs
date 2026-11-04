@@ -1,9 +1,16 @@
+mod huc_native {
+    include!("intel_gpu_huc_hw_tests.rs");
+}
+
 // Native Rust hardware conversations over the real GuCGt/CT/scheduler owners.
 // Reference vectors: MIT Linux xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c,
 // xe_mocs.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 
 mod userspace {
     include!("intel_gpu_user_tests.rs");
+    mod recovery_native {
+        include!("intel_gpu_gt_recovery_hw_tests.rs");
+    }
 }
 
 // Observation-only MCR bank around the unchanged GuC/GT model. All other
@@ -12,6 +19,7 @@ mod userspace {
 struct EuStallRegisters {
     values: BTreeMap<(usize, u64), u32>,
     lost: bool,
+    lose_media_on_read: Option<u64>,
 }
 #[derive(Clone)]
 struct EuStallWindow {
@@ -24,11 +32,15 @@ impl MmioWindow for EuStallWindow {
             let selector = self.inner.read32(0xfd4);
             let dss = ((selector >> 8) & 15) as usize * 4 + (selector & 15) as usize;
             let bank = self.samplers.borrow();
-            return if bank.lost {
+            let value = if bank.lost {
                 u32::MAX
             } else {
                 *bank.values.get(&(dss, offset)).unwrap_or(&0)
             };
+            if bank.lose_media_on_read == Some(offset) {
+                self.inner.0.borrow_mut().regs.insert(0x380dfc, 0);
+            }
+            return value;
         }
         self.inner.read32(offset)
     }
@@ -423,10 +435,39 @@ kernel_test_in!(
 fn hardware_model(platform: GtPlatform, ack: u64) -> (Window, Arena, GuCGt<Window, Arena>) {
     hardware_model_with_interface(platform, ack, 1)
 }
+
+/// Read the production ADS wire by class/physical-instance header. The
+/// register page and KLV page are disjoint, and firmware scratch is explicit.
+fn ads_registers(w: &Window, engine: crate::intel_gpu_engine::Engine) -> BTreeMap<u32, (u32, u32)> {
+    let d = w.0.borrow();
+    let ads = d.memory[&0x20001000].borrow();
+    let header = (engine.guc_class() * 256 + engine.physical_instance() * 8) as usize / 4;
+    let offset = (ads[header] - 0x20001000) as usize;
+    let count = ads[header + 1] as usize;
+    assert!(offset >= 0x2000 && count != 0 && offset + count * 16 <= 0x3000);
+    let mut registers = BTreeMap::new();
+    let mut last = None;
+    for entry in ads[offset / 4..offset / 4 + count * 4].chunks_exact(4) {
+        assert_eq!(entry[3], 0);
+        assert!(last.is_none_or(|last| last < entry[0]));
+        assert!(registers.insert(entry[0], (entry[1], entry[2])).is_none());
+        last = Some(entry[0]);
+    }
+    registers
+}
+
 fn hardware_model_with_interface(
     platform: GtPlatform,
     ack: u64,
     version: u8,
+) -> (Window, Arena, GuCGt<Window, Arena>) {
+    hardware_model_with_identity(platform, ack, version, None)
+}
+fn hardware_model_with_identity(
+    platform: GtPlatform,
+    ack: u64,
+    version: u8,
+    device_id: Option<u16>,
 ) -> (Window, Arena, GuCGt<Window, Arena>) {
     let (window, arena) = model();
     {
@@ -441,6 +482,27 @@ fn hardware_model_with_interface(
         d.regs.insert(0x9134, 5);
         d.regs.insert(0x9114, 0x10);
         d.regs.insert(0x9118, 1);
+        if platform.is_headless_integrated() {
+            d.regs.extend([
+                (0x38a188, 0),
+                (0x380dfc, 0),
+                (
+                    0x380d8c,
+                    if platform.is_ptl() {
+                        30 << 22
+                    } else {
+                        20 << 22
+                    },
+                ),
+                (0x38941c, 0),
+                (0x38c000, 1),
+                (0x38c314, 0),
+                (0x9114, 0xf0010),
+            ]);
+        }
+        if platform.is_gen12() {
+            d.regs.insert(0x9140, 0x000f00ff); // no physical media engines
+        }
         // xe_guc_pc.c fused RPn/RPe/RP0: 300/1500/3000 MHz.
         d.regs.insert(0x138000, (18 << 16) | 180);
         d.regs.insert(0x13800c, 90);
@@ -448,7 +510,13 @@ fn hardware_model_with_interface(
         d.regs.insert(0x145ef0, 30 << 8);
         d.regs.insert(
             0xd8c,
-            if platform == GtPlatform::Battlemage {
+            if platform.is_gen12() {
+                u32::MAX // pre-GMD hardware must never read this absent register
+            } else if platform.is_ptl() {
+                30 << 22
+            } else if platform.is_lnl() {
+                (20 << 22) | (4 << 14)
+            } else if platform == GtPlatform::Battlemage {
                 (20 << 22) | (1 << 14)
             } else {
                 (12 << 22) | (70 << 14)
@@ -456,15 +524,93 @@ fn hardware_model_with_interface(
         );
     }
     let mut boot = stage(window.clone(), arena.clone(), platform);
+    if let Some(device_id) = device_id {
+        boot.config.device_id = device_id;
+    }
     boot.submission_version = (version, 0, 0);
-    if platform == GtPlatform::Battlemage {
+    if platform.is_xe2() {
         boot.config.uncached_mocs = Some(3);
     }
     let gt = GuCGt::from_staged_hardware(boot).unwrap();
     (window, arena, gt)
 }
 
+// Independent source-generation discriminator for shared Xe2/Xe3 ring
+// literals. PTL30.00/30.01 uses this path as well as existing gfx20 profiles.
+fn model_has_xe2_ring(gmd: u32) -> bool {
+    gmd >> 22 == 20 || (gmd >> 22 == 30 && (gmd >> 14) & 255 <= 1)
+}
+
+fn lnl_progress(w: &Window) {
+    if w.0.borrow().regs.get(&0x941c).is_some_and(|v| *v != 0) {
+        reset_done(w);
+    }
+    let mut d = w.0.borrow_mut();
+    let gt = d.regs[&0xa188] & 1;
+    let render = d.regs[&0xa278] & 1;
+    let media = d.regs[&0x38a188] & 1;
+    d.regs
+        .extend([(0xdfc, gt), (0xd84, render), (0x380dfc, media)]);
+    if d.regs.get(&0x38941c).is_some_and(|v| *v != 0) {
+        d.regs.extend([(0x38941c, 0), (0x38c000, 1), (0x38c314, 0)]);
+    }
+    if d.regs.get(&0xc314).is_some_and(|v| v & 1 != 0) {
+        d.regs.extend([(0xc314, 0x10), (0xc000, 0x8000f000)]);
+    }
+}
+
 fn hardware_discovery<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window, ack: u64) {
+    if w.0
+        .borrow()
+        .profile
+        .is_some_and(GtPlatform::is_headless_integrated)
+    {
+        gt.begin(0).unwrap();
+        for now in 1..=8 {
+            for _ in 0..4 {
+                lnl_progress(w);
+                let result = gt.poll(now);
+                assert!(!matches!(result, Poll::Ready(Err(_))), "{result:?}");
+                if gt.state() == GtState::Ready {
+                    break;
+                }
+            }
+            if gt.state() == GtState::Ready {
+                break;
+            }
+        }
+        assert_eq!(gt.state(), GtState::Ready);
+        gt.begin_hwconfig(9).unwrap();
+        let ptl = w.0.borrow().profile.is_some_and(GtPlatform::is_ptl);
+        w.0.borrow_mut()
+            .regs
+            .insert(0x190240, if ptl { 0xf0000018 } else { 0xf000000c });
+        assert!(gt.poll(10).is_pending());
+        hwconfig_device_write(
+            w,
+            if ptl {
+                &[1, 1, 12, 70, 1, 96]
+            } else {
+                &[7, 1, 8]
+            },
+        );
+        w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+        assert_eq!(gt.poll(11), Poll::Ready(Ok(GtState::Ready)));
+        return;
+    }
+    if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        gt.begin(0).unwrap();
+        gen12_until(gt, w, 10_000, GtState::Ready);
+        if gt.has_hwconfig() {
+            gt.begin_hwconfig(1_000_000).unwrap();
+            w.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+            assert!(gt.poll(1_010_000).is_pending());
+            hwconfig_device_write(w, &[7, 1, 8]);
+            w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+            assert_eq!(gt.poll(1_020_000), Poll::Ready(Ok(GtState::Ready)));
+        }
+        return;
+    }
     gt.begin(0).unwrap();
     assert!(gt.poll(1).is_pending());
     w.0.borrow_mut().regs.insert(ack, 1);
@@ -485,12 +631,64 @@ fn hardware_discovery<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Windo
     assert!(gt.poll(7).is_pending());
     w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
     assert_eq!(gt.poll(8), Poll::Ready(Ok(GtState::Ready)));
-    gt.begin_hwconfig(9).unwrap();
-    w.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
-    assert!(gt.poll(10).is_pending());
-    hwconfig_device_write(w, &[7, 1, 8]);
-    w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
-    assert_eq!(gt.poll(11), Poll::Ready(Ok(GtState::Ready)));
+    if gt.has_hwconfig() {
+        gt.begin_hwconfig(9).unwrap();
+        w.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+        assert!(gt.poll(10).is_pending());
+        hwconfig_device_write(w, &[7, 1, 8]);
+        w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+        assert_eq!(gt.poll(11), Poll::Ready(Ok(GtState::Ready)));
+    }
+}
+
+fn gen12_progress(w: &Window) {
+    if w.0
+        .borrow()
+        .regs
+        .get(&0x941c)
+        .is_some_and(|reset| *reset != 0)
+    {
+        reset_done(w);
+    }
+    let mut d = w.0.borrow_mut();
+    let gt = d.regs[&0xa188] & 1;
+    let render = d.regs[&0xa278] & 1;
+    d.regs.insert(0x130044, gt);
+    d.regs.insert(0xd84, render);
+    for (request, ack, count) in [(0xa540, 0xd50, 8), (0xa560, 0xd70, 4)] {
+        for instance in 0..count {
+            let held = d.regs.get(&(request + instance * 4)).copied().unwrap_or(0) & 1;
+            d.regs.insert(ack + instance * 4, held);
+        }
+    }
+    if d.regs.get(&0xc314).is_some_and(|dma| dma & 1 != 0) {
+        if d.regs[&0xc314] & 0x200 != 0 {
+            huc_native::complete_dma(&mut d);
+        } else {
+            d.regs.insert(0xc314, 0x10);
+            d.regs.insert(0xc000, 0x8000f000);
+        }
+    }
+}
+fn gen12_until<M: MmioWindow + Clone>(
+    gt: &mut GuCGt<M, Arena>,
+    w: &Window,
+    start: u64,
+    expected: GtState,
+) -> u64 {
+    for now in (start..start + 1_000_000).step_by(10_000) {
+        gen12_progress(w);
+        let result = gt.poll(now);
+        assert!(
+            !matches!(result, Poll::Ready(Err(_))),
+            "Gen12 state={:?} now={now} result={result:?}",
+            gt.state()
+        );
+        if gt.state() == expected {
+            return now;
+        }
+    }
+    panic!("Gen12 did not reach {expected:?}; state={:?}", gt.state());
 }
 
 fn smoke_hardware_topology_publication_and_card_queries() -> TestResult {
@@ -671,6 +869,11 @@ fn hardware_scheduling_reload_mode<M: MmioWindow + Clone>(
     w: &Window,
     mode: u8,
 ) {
+    if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        gt.begin_scheduling_with_ccs_mode(2_000_000, mode).unwrap();
+        gen12_until(gt, w, 2_000_000, GtState::Ready);
+        return;
+    }
     // Firmware's old incarnation left bytes in this exact retained log BO.
     // Scheduling reload must clear them only after proving GuC reset.
     let logs = {
@@ -710,19 +913,35 @@ fn hardware_scheduling_reload_mode<M: MmioWindow + Clone>(
         assert_eq!(d.regs[&0xc188], before.0);
         assert_eq!(&ads[0x11a4 / 4..0x11b0 / 4], before.1.as_slice());
         assert_eq!(&ads[0x3000 / 4..0x4000 / 4], before.2.as_slice());
-        assert_eq!(ads[0x2000 / 4], 0x229c); // KLVs did not overlap register saves
+        assert_eq!(ads[0], 0x20003000);
+        // Source engine saves may precede HWS_PGA (e.g. BMG PSMI_CTL).
+        // Check the complete sorted wire list rather than its former first
+        // entry, so KLV overlap still cannot corrupt the register-save image.
+        assert!(ads_registers(w, crate::intel_gpu_engine::Engine::Rcs0).contains_key(&0x2080));
     }
 }
 
 fn hardware_scheduling<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window) {
     hardware_scheduling_reload(gt, w);
-    gt.begin_ct(18).unwrap();
-    for now in 19..25 {
+    hardware_enable_ct(gt, w);
+}
+
+fn hardware_enable_ct<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window) {
+    let (start, step) = if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        (3_000_000, 10_000)
+    } else {
+        (18, 1)
+    };
+    gt.begin_ct(start).unwrap();
+    for tick in 1..=6 {
         w.0.borrow_mut().regs.insert(0x190240, 0xf0000001);
-        assert!(gt.poll(now).is_pending());
+        assert_eq!(gt.poll(start + tick * step), Poll::Pending);
     }
     w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
-    assert_eq!(gt.poll(25), Poll::Ready(Ok(GtState::SchedulingReady)));
+    assert_eq!(
+        gt.poll(start + 7 * step),
+        Poll::Ready(Ok(GtState::SchedulingReady))
+    );
 }
 
 fn smoke_hardware_nonpriv_profiles_before_ring_and_reload() -> TestResult {
@@ -968,6 +1187,127 @@ kernel_test_in!(
     smoke_hardware_register_initialization_gates_scheduling
 );
 
+fn smoke_hardware_grdom_full_cleared_before_late_poll_is_not_a_timeout() -> TestResult {
+    // xe_mmio_wait32(GDRST, GRDOM_FULL, 0, 5000) reads once more after its
+    // deadline: a self-cleared GRDOM_FULL first observed by a poll delayed
+    // past 5 ms is success. One that never clears still fails at the bound.
+    for late in [true, false] {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling(&mut gt, &w);
+        gt.begin_stop(10_000_000_000).unwrap();
+        assert!(gt.poll(10_000_000_001).is_pending());
+        reset_done(&w);
+        w.0.borrow_mut().regs.insert(0xc314, 0);
+        assert!(gt.poll(10_000_000_002).is_pending());
+        assert_eq!(gt.state(), GtState::ResettingEngines);
+        assert_eq!(w.0.borrow().regs.get(&0x941c), Some(&1));
+        let mut now = 10_000_000_002 + 5_000_000;
+        if late {
+            reset_done(&w);
+            now += 3;
+            assert!(gt.poll(now).is_pending());
+        } else {
+            assert!(gt.poll(now - 1).is_pending());
+            assert_eq!(
+                gt.poll(now),
+                Poll::Ready(Err(GtError::Boot(BootError::Timeout)))
+            );
+            assert_eq!(gt.state(), GtState::Lost);
+            // Recovery re-asserts GRDOM_FULL; only its proof retires DMA.
+            now += 100;
+            gt.begin_stop(now).unwrap();
+            assert_eq!(gt.state(), GtState::ResettingEngines);
+            reset_done(&w);
+            now += 1;
+            assert!(gt.poll(now).is_pending());
+        }
+        assert_eq!(gt.state(), GtState::ReleasingRender);
+        assert!(gt.poll(now + 1).is_pending());
+        w.0.borrow_mut().regs.insert(0xd84, 0);
+        assert!(gt.poll(now + 2).is_pending());
+        w.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(gt.poll(now + 3), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_grdom_full_cleared_before_late_poll_is_not_a_timeout
+);
+
+fn smoke_hardware_late_polls_after_settled_ack_reset_and_semaphore() -> TestResult {
+    // __wait_for / xe_mmio_wait32's final read: HardwareInit's GT ACK
+    // (50 ms) and inherited GRDOM_FULL (5 ms), and RegisterInit's steering
+    // semaphore (50 ms), each settle before a poll delayed past the bound.
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    gt.begin(0).unwrap();
+    w.0.borrow_mut().regs.insert(0xdfc, 1);
+    assert!(gt.poll(1).is_pending());
+    assert_eq!(gt.state(), GtState::PreparingHardware);
+    w.0.borrow_mut().regs.insert(0xd84, 1);
+    let mut now = 1 + 50_000_000 + 3;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(w.0.borrow().regs.get(&0x941c), Some(&8));
+    reset_done(&w);
+    w.0.borrow_mut().regs.insert(0xc314, 0);
+    now += 1;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(w.0.borrow().regs.get(&0x941c), Some(&1));
+    reset_done(&w);
+    now += 5_000_000 + 3;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(gt.state(), GtState::Booting);
+    reset_done(&w);
+    now += 1;
+    assert!(gt.poll(now).is_pending());
+    w.0.borrow_mut().regs.insert(0xc314, 0x10);
+    now += 1;
+    assert!(gt.poll(now).is_pending());
+    w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+    now += 1;
+    assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::Ready)));
+    if gt.has_hwconfig() {
+        gt.begin_hwconfig(now + 1).unwrap();
+        w.0.borrow_mut().regs.insert(0x190240, 0xf000000c);
+        assert!(gt.poll(now + 2).is_pending());
+        hwconfig_device_write(&w, &[7, 1, 8]);
+        w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+        assert_eq!(gt.poll(now + 3), Poll::Ready(Ok(GtState::Ready)));
+        now += 3;
+    }
+    now += 1;
+    let start = now;
+    gt.begin_scheduling(start).unwrap();
+    w.0.borrow_mut().regs.insert(0xfd0, 0);
+    assert!(gt.poll(start + 1).is_pending());
+    assert_eq!(gt.state(), GtState::PreparingScheduling);
+    w.0.borrow_mut().regs.insert(0xfd0, 1);
+    now = start + 50_000_000 + 3;
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(gt.state(), GtState::StartingScheduling);
+    // The scheduling reload then completes under its own fresh bounds.
+    assert!(gt.poll(now + 1).is_pending());
+    reset_done(&w);
+    assert!(gt.poll(now + 2).is_pending());
+    reset_done(&w);
+    assert!(gt.poll(now + 3).is_pending());
+    w.0.borrow_mut().regs.insert(0xc314, 0x10);
+    assert!(gt.poll(now + 4).is_pending());
+    w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+    assert_eq!(gt.poll(now + 5), Poll::Ready(Ok(GtState::Ready)));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_late_polls_after_settled_ack_reset_and_semaphore
+);
+
 fn smoke_hardware_workaround_ip_change_blocks_reload() -> TestResult {
     let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
     hardware_discovery(&mut gt, &w, 0xdfc);
@@ -1056,7 +1396,27 @@ kernel_test_in!(
 );
 
 fn hardware_stop(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
+    if w.0
+        .borrow()
+        .profile
+        .is_some_and(GtPlatform::is_headless_integrated)
+    {
+        gt.begin_stop(100_000_000).unwrap();
+        for now in 100_000_001..100_000_200 {
+            lnl_progress(w);
+            let r = gt.poll(now);
+            assert!(!matches!(r, Poll::Ready(Err(_))), "{r:?}");
+            if gt.state() == GtState::Stopped {
+                return;
+            }
+        }
+        panic!("LNL stop did not retire media wake");
+    }
     gt.begin_stop(10_000_000_000).unwrap();
+    if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        gen12_until(gt, w, 10_000_010_000, GtState::Stopped);
+        return;
+    }
     assert!(gt.poll(10_000_000_001).is_pending());
     reset_done(w);
     w.0.borrow_mut().regs.insert(0xc314, 0);
@@ -1095,7 +1455,8 @@ fn event(memory: &Words, action: u32, payload: &[u32]) {
     words[513] = (tail + 2 + payload.len() as u32) & 4095;
 }
 /// GuC SLPC model: 0 publishes RUNNING, 1 ERROR, 2 a RESPONSE_FAILURE to
-/// the reset request, 3 never answers.
+/// the reset request, 3 never answers. 11 refuses only the media GuC's
+/// SLPC_PARAM_STRATEGIES.
 static SLPC_FIXTURE_MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn failure_response(memory: &Words, fence: u16) {
@@ -1122,7 +1483,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             let control_fence = (words[1024 + head as usize] >> 16) as u16;
             assert_eq!(
                 request[0] >> 28,
-                if matches!(request[0] as u16, 0x40 | 0x302)
+                if matches!(request[0] as u16, 0x40 | 0x302 | 0x4000)
                     || (request[0] as u16 == 0x3003 && request[1] != 2)
                 {
                     0
@@ -1139,6 +1500,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
     for (control_fence, request) in requests {
         let action = request[0] as u16;
         actions.push(action);
+        if matches!(action, 0x3003 | 0x3004) {
+            w.0.borrow_mut().slpc_h2g.push(request.clone());
+        }
         match action {
             0x7000 => {
                 assert_eq!(request.len(), 3);
@@ -1148,7 +1512,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x4502 => {
                 // GUC_RENDER/BLITTER/COMPUTE_CLASS for the admitted engines;
                 // physical BCS0/BCS8 share BLITTER with logical COPY0/COPY1.
-                assert!(matches!(request[3], 0 | 3 | 4));
+                // GUC_GSC_OTHER_CLASS (5) only for the media GT's GSCCS0.
+                assert!(matches!(request[3], 0..=5));
                 assert_eq!(
                     &request[1..10],
                     &[1, request[2], request[3], request[4], 0, 0, 0, 0, 0]
@@ -1157,27 +1522,40 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
                 assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
-                let base = match request[3] {
-                    3 if request[4] & 1 == 0 => 0x3ee244,
-                    3 => 0x22244,
-                    4 => {
-                        assert!(request[4] != 0 && request[4] <= 15);
-                        let logical = request[4].trailing_zeros() as usize;
-                        let ads = w.0.borrow().memory[&0x20001000].clone();
-                        let physical = (ads.borrow()[(0x123c + 128 + logical / 4 * 4) / 4]
-                            >> (logical % 4 * 8))
-                            & 255;
-                        [0x1a244, 0x1c244, 0x1e244, 0x26244][physical as usize]
-                    }
-                    _ => 0x2244,
-                };
+                let logical = request[4].trailing_zeros() as usize;
+                assert_ne!(request[4], 0);
                 assert!(
-                    request[4] == 1
-                        || (request[3] == 3 && matches!(request[4], 2 | 3))
-                        || (request[3] == 4 && request[4] != 0 && request[4] <= 15)
+                    request[4]
+                        < 1 << if request[3] == 1 {
+                            8
+                        } else if request[3] == 2 || request[3] == 4 {
+                            4
+                        } else if request[3] == 5 {
+                            1
+                        } else {
+                            2
+                        }
                 );
+                let physical = {
+                    let d = w.0.borrow();
+                    let ads = d.memory[&0x20001000].borrow();
+                    (ads[(0x123c + request[3] as usize * 32 + logical / 4 * 4) / 4]
+                        >> (logical % 4 * 8))
+                        & 255
+                };
+                let base = model_engine_base(request[3], physical) + 0x244;
                 assert_eq!(image.borrow()[1024 + 2], base);
-                assert_eq!(request[11], 0);
+                assert_eq!(
+                    request[11],
+                    if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+                        // Source LRC_ENGINE_CLASS and LRC_ENGINE_INSTANCE
+                        // occupy descriptor bits63:61 and53:48. The ADS map
+                        // above independently identifies the physical lane.
+                        (request[3] << 29) | (physical << 16)
+                    } else {
+                        0
+                    }
+                );
                 if request[4].count_ones() > 1 {
                     assert!(w
                         .0
@@ -1197,7 +1575,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 assert_eq!(request.len(), 11 + width * 2);
                 assert_eq!(request[1], 1);
                 assert!(matches!(request[3], 3 | 4));
-                assert_eq!(request[4].count_ones(), 1);
+                assert!(request[4] != 0 && request[4] << (width - 1) < 16);
                 assert_eq!([request[6], request[8]], [0; 2]);
                 assert_eq!([request[7], request[9]], [request[5] + 1024, 1024]);
                 let images: Vec<_> = request[11..]
@@ -1234,6 +1612,15 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         assert_eq!(image[1026], bank + 0x244);
                         assert_ne!(image[1024 + 0x33], 0);
                         assert!(registered.insert(request[2] + lane as u32, base).is_none());
+                    }
+                }
+                if request[4].count_ones() > 1 {
+                    let mut d = w.0.borrow_mut();
+                    for (lane, base) in images.iter().copied().enumerate() {
+                        assert!(d
+                            .virtual_contexts
+                            .insert(base, (request[3], request[4] << lane))
+                            .is_none());
                     }
                 }
                 assert!(w
@@ -1286,12 +1673,28 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 }
             }
             0x100b => {
-                assert!(matches!(request[3], 2 | 3));
-                assert!((1..=100_000).contains(&request[5]));
+                // User HIGH1, KMD_NORMAL2 and NORMAL3; KMD_HIGH0 remains
+                // unavailable to the native userspace queue profile.
+                assert!((1..=3).contains(&request[3]));
+                // EXECUTION_QUANTUM: exec_queue_set_timeslice's 1..10000000 us.
+                assert!((1..=10_000_000).contains(&request[5]));
+                assert_eq!(request.len(), 10);
+                // xe_hw_engine.c raises class OTHER's preempt timeout to at
+                // least 600 ms; every other class keeps NARF's 500 ms.
+                let gsc = registered.get(&request[1]).is_some_and(|base| {
+                    w.0.borrow().memory[base].borrow()[1024 + 2] == 0x11a244
+                });
                 assert_eq!(
-                    [request[2], request[4], request[6], request[7]],
-                    [0x20030001, 0x20010001, 0x20020001, 500000]
+                    [request[2], request[4], request[6], request[7], request[8]],
+                    [
+                        0x20030001,
+                        0x20010001,
+                        0x20020001,
+                        if gsc { 600_000 } else { 500_000 },
+                        0x20050001
+                    ]
                 );
+                assert!(matches!(request[9], 0 | 0x10000000));
             }
             0x1001 => {
                 let id = request[1];
@@ -1315,9 +1718,14 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     continue;
                 }
                 if request[2] == 1 && execute {
+                    execute_gen12_restore(w, base, true);
                     execute_virtual_restore(w, base, true);
                 }
-                if request[2] == 1 && execute && matches!(first, 0x22244 | 0x3ee244) {
+                if request[2] == 1
+                    && execute
+                    && (matches!(first, 0x22244 | 0x3ee244)
+                        || (0x1c0244..=0x1f8244).contains(&first))
+                {
                     execute_copy(w, base);
                 } else if request[2] == 1
                     && execute
@@ -1326,6 +1734,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     execute_compute(w, base);
                 } else if request[2] == 1 && execute {
                     let mut d = w.0.borrow_mut();
+                    let gen12 = d.profile.is_some_and(GtPlatform::is_gen12);
+                    let ptl = d.profile.is_some_and(GtPlatform::is_ptl);
                     assert!(d.synced.contains(&base));
                     let image = d.memory[&base].clone();
                     let ring_base = image.borrow()[1024 + 9];
@@ -1333,16 +1743,24 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         let data = image.borrow();
                         assert_eq!(
                             &data[1024..1031],
-                            &[0, 0x1108101d, 0x2244, data[1027], 0x2034, 0, 0x2030]
+                            &[
+                                0,
+                                if gen12 { 0x11081019 } else { 0x1108101d },
+                                0x2244,
+                                data[1027],
+                                0x2034,
+                                0,
+                                0x2030
+                            ]
                         );
                         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
                         assert_eq!(data[1032], 0x2038);
                         assert_eq!(data[1024 + 33], 0x11081011);
                         assert_eq!(data[1024 + 65], 0x11080001);
-                        assert_eq!(data[1024 + 68], 0x05000001);
+                        assert_eq!(data[1024 + if gen12 { 0xb9 } else { 68 }], 0x05000001);
                         // xe_lrc.c::reset_stop_ring, graphics IP >= 12.50.
-                        assert_eq!(data[1024 + 0x71], 0x01000000);
-                        assert_eq!(data[1024 + 0x72], 0);
+                        assert_eq!(data[1024 + if gen12 { 0x61 } else { 0x71 }], 0x01000000);
+                        assert_eq!(data[1024 + 0x72], if gen12 { 0x241c } else { 0 });
                     }
                     assert!(d.synced.contains(&ring_base));
                     let ring_backing = d.memory[&ring_base].clone();
@@ -1362,24 +1780,50 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     } else if tail != 32 {
                         let (svg, used) =
                             crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
-                        assert_eq!(svg.len(), 50);
-                        assert_eq!(
-                            svg[49],
-                            if d.regs[&0xd8c] >> 22 == 20 {
-                                0x78000002
-                            } else {
-                                0x79000002
-                            }
-                        );
+                        // A privileged OA configuration job: LRI groups to
+                        // source OA/NOA registers, then the owned breadcrumb.
+                        let gmd = d.regs.get(&0xd8c).copied().unwrap_or(0);
+                        let oa = ring[1] & 0xff00_0000 == 0x1100_0000
+                            && crate::intel_gpu_oa::valid_register(
+                                ((gmd >> 22) * 100 + ((gmd >> 14) & 255)) as u16,
+                                ring[2],
+                            );
+                        if oa {
+                            assert!(svg.is_empty(), "OA jobs carry no state commands");
+                        } else if gen12 || ptl {
+                            // Source Wa14019789679 ends at graphics20.04;
+                            // neither Gen12 nor PTL uses this SVG seed.
+                            assert!(svg.is_empty(), "Gen12/PTL seed has no XeHP SVG commands");
+                        } else {
+                            assert_eq!(svg.len(), 50);
+                            assert_eq!(
+                                svg[49],
+                                if model_has_xe2_ring(d.regs[&0xd8c]) {
+                                    0x78000002
+                                } else {
+                                    0x79000002
+                                }
+                            );
+                        }
                         assert_eq!(ring[0], 0x04000001);
                         assert_eq!(ring[used + 1] & 0xfffffdff, 0x7a000004);
                         // Opaque device-saved state, outside the hand-written
                         // register restore groups. The driver must copy it.
                         image.borrow_mut()[0x2000 / 4] = 0xc01dcafe;
-                        image.borrow_mut()[0x2004 / 4] = d.regs[&0x7044];
+                        image.borrow_mut()[0x2004 / 4] = d.regs[&if gen12 {
+                            0x7018
+                        } else if ptl {
+                            // PTL has no legacy 0x7044 workaround. Its
+                            // common seed resets this actual RCS selector.
+                            0x20cc
+                        } else {
+                            0x7044
+                        }];
                         // Fixture-only opaque save area, not a claimed hardware
                         // SVG layout. Capture proves every header reaches clones.
-                        image.borrow_mut()[0x2100 / 4..0x2100 / 4 + 50].copy_from_slice(&svg);
+                        if !gen12 && !ptl && !oa {
+                            image.borrow_mut()[0x2100 / 4..0x2100 / 4 + 50].copy_from_slice(&svg);
+                        }
                     } else {
                         assert_eq!(
                             &ring[..8],
@@ -1409,6 +1853,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     assert!(!group.enabled);
                     for (index, base) in group.images.iter().enumerate().skip(1) {
                         assert_eq!(registered.remove(&(request[1] + index as u32)), Some(*base));
+                        w.0.borrow_mut().virtual_contexts.remove(base);
                     }
                 }
                 let d = w.0.borrow();
@@ -1421,9 +1866,21 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 drop(d);
                 event(&memory, 0x4600, &[request[1] + lane]);
             }
+            // GuC error capture: LOG_BUFFER_FILE_FLUSH_COMPLETE(STATE_CAPTURE).
+            0x30 if request.get(1) == Some(&2) => {
+                w.0.borrow_mut()
+                    .stream_controls
+                    .push((0x30, control_fence, 2))
+            }
             0x40 | 0x302 | 0x30 => bcs8::stream_hw::service(w, &memory, control_fence, &request),
+            0x4000 => huc_native::service_auth(w, &memory, control_fence, &request),
             0x3003 => service_slpc(w, &memory, control_fence, &request),
-            0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
+            // GUCRC_FIRMWARE_CONTROL; only the media GuC's stop hands RC6
+            // back with GUCRC_HOST_CONTROL (xe_guc_pc_gucrc_disable).
+            0x3004 if w.0.borrow().media_tlb.is_some() => {
+                assert!(matches!(&request[1..], [0] | [1]))
+            }
+            0x3004 => assert_eq!(&request[1..], &[1]),
             _ => panic!("unexpected action {action:x}"),
         }
     }
@@ -1455,6 +1912,7 @@ fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
             image.borrow_mut()[1031] = split as u32 * 4;
         }
         w.0.borrow_mut().parallel_starts.push((id, base));
+        execute_parallel_restore(w, id, base, true);
         if matches!(first, 0x22244 | 0x3ee244) {
             execute_copy(w, base);
         } else {
@@ -1463,6 +1921,20 @@ fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
         image.borrow_mut()[1031] = tail;
     }
     execute_parallel_join(w, id);
+}
+
+fn execute_parallel_restore(w: &Window, id: u32, base: u32, start: bool) {
+    let old = w.0.borrow().virtual_pick;
+    let lane = w.0.borrow().parallel_contexts[&id]
+        .images
+        .iter()
+        .position(|image| *image == base)
+        .unwrap();
+    if let Some(first) = old {
+        w.0.borrow_mut().virtual_pick = Some(first + lane as u32);
+    }
+    execute_virtual_restore(w, base, start);
+    w.0.borrow_mut().virtual_pick = old;
 }
 
 fn execute_parallel_join(w: &Window, id: u32) {
@@ -1523,7 +1995,11 @@ fn execute_parallel_join(w: &Window, id: u32) {
     assert!(words[i + 3..].iter().all(|word| *word == 0));
     let mut page = root & 0x0000_3fff_ffff_f000;
     assert_eq!(address & 7, 0);
-    for shift in [39, 30, 21, 12] {
+    for &shift in if d.profile.is_some_and(GtPlatform::is_headless_integrated) {
+        &[48, 39, 30, 21, 12][..]
+    } else {
+        &[39, 30, 21, 12][..]
+    } {
         let table = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
         // SAFETY: real resident production PPGTT pages remain owned by the
         // group; this independent decoder never dereferences user pointers.
@@ -1555,6 +2031,9 @@ fn execute_parallel_join(w: &Window, id: u32) {
 // driver supplies only the logical mask; the model chooses the last allowed
 // engine by default, deliberately different from the first LRC template.
 fn execute_virtual_restore(w: &Window, base: u32, start_ring: bool) {
+    if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        return;
+    }
     let mut d = w.0.borrow_mut();
     let Some(&(class, mask)) = d.virtual_contexts.get(&base) else {
         return;
@@ -1590,7 +2069,7 @@ fn execute_virtual_restore(w: &Window, base: u32, start_ring: bool) {
             1,
         ]
     );
-    if d.regs[&0xd8c] >> 22 == 20 {
+    if model_has_xe2_ring(d.regs[&0xd8c]) {
         assert_eq!(
             &image[0x920 / 4..0x934 / 4],
             &[0x10400002, base + 0x1094, 0, 0, 0x05000000,]
@@ -1629,18 +2108,135 @@ fn execute_virtual_restore(w: &Window, base: u32, start_ring: bool) {
     d.virtual_restores.push((base, receipt));
 }
 
+// Execute the independently decoded Gen12 timestamp/post/mid-restore WAs.
+// Their sources/targets are the retained private ring and saved image only.
+fn model_engine_base(class: u32, physical: u32) -> u32 {
+    match class {
+        0 => {
+            assert_eq!(physical, 0);
+            0x2000
+        }
+        1 => [
+            0x1c0000, 0x1c4000, 0x1d0000, 0x1d4000, 0x1e0000, 0x1e4000, 0x1f0000, 0x1f4000,
+        ][physical as usize],
+        2 => [0x1c8000, 0x1d8000, 0x1e8000, 0x1f8000][physical as usize],
+        3 => match physical {
+            0 => 0x22000,
+            8 => 0x3ee000,
+            _ => panic!("COPY physical"),
+        },
+        4 => [0x1a000, 0x1c000, 0x1e000, 0x26000][physical as usize],
+        5 => {
+            assert_eq!(physical, 6, "OTHER_GSC_INSTANCE");
+            0x11a000
+        }
+        _ => panic!("class"),
+    }
+}
+fn execute_gen12_restore(w: &Window, base: u32, start_ring: bool) {
+    let mut d = w.0.borrow_mut();
+    if !d.profile.is_some_and(GtPlatform::is_gen12) {
+        return;
+    }
+    let image = d.memory[&base].clone();
+    let mut image = image.borrow_mut();
+    let render = image[1026] == 0x2244;
+    let mut engine = image[1026] - 0x244;
+    let ring_base = image[1024 + 9];
+    assert!(d.synced.contains(&base) && d.synced.contains(&ring_base));
+    let ring = d.memory[&ring_base].borrow().clone();
+    assert!(image[1024 + 7] <= 4096);
+    assert_eq!(image[1024 + 0x13], (ring_base + 4096) | 1);
+    let timestamp = [
+        0x14e80002,
+        0x3a8,
+        base + 0x108c,
+        0,
+        0x14e80002,
+        0x3a8,
+        base + 0x108c,
+        0,
+        0x14c80002,
+        0x3a8,
+        base + 0x108c,
+        0,
+    ];
+    assert_eq!(&ring[1024..1036], &timestamp);
+    let old_timestamp = image[0x108c / 4];
+    let mut cursor = 1036;
+    if render {
+        assert_eq!(&ring[cursor..cursor + 3], &[0x11000001, 0xd8, 0x00400040]);
+        cursor += 3;
+        assert_eq!(image[1024 + 0x15], (ring_base + 4224) | 1);
+        assert_eq!(&ring[1056..1068], &timestamp);
+        assert_eq!(&ring[1068..1072], &[0; 4]);
+        let old = *d.regs.get(&0x20d8).unwrap_or(&0);
+        d.regs.insert(0x20d8, old | 0x40);
+    } else {
+        assert_eq!(image[1024 + 0x15], 0);
+    }
+    if let Some(&(class, mask)) = d.virtual_contexts.get(&base) {
+        let logical = d.virtual_pick.unwrap_or(31 - mask.leading_zeros());
+        assert_ne!(mask & (1 << logical), 0);
+        let physical = {
+            let ads = d.memory[&0x20001000].borrow();
+            (ads[(0x123c + class as usize * 32 + logical as usize / 4 * 4) / 4]
+                >> (logical % 4 * 8))
+                & 255
+        };
+        assert_eq!(
+            &ring[cursor..cursor + 4],
+            &[0x12480002, 0x8c, base + 0x818, 0]
+        );
+        cursor += 4;
+        image[0x818 / 4] = physical << 4 | class;
+        engine = model_engine_base(class, physical);
+        d.virtual_restores.push((base, physical << 4 | class));
+    }
+    let user = ring[cursor] == 0x10400002;
+    if user {
+        assert_eq!(
+            &ring[cursor..cursor + 4],
+            &[0x10400002, base + 0x108c, 0, 1]
+        );
+        cursor += 4;
+        image[0x108c / 4] = 1;
+    }
+    assert_eq!(ring[cursor], 0x05000000);
+    if start_ring && user {
+        assert_eq!(&ring[..4], &[0x12480002, 0x3a8, base + 0x810, 0]);
+        image[0x810 / 4] = old_timestamp;
+        let stamp = if render {
+            assert_eq!(&ring[4..7], &[0x10400002, base + 0x808, 0]);
+            ring[7]
+        } else {
+            let aux = if engine >= 0x1c0000 { 4 } else { 0 };
+            assert_eq!(ring[6 + aux], 0x13044002);
+            ring[9 + aux]
+        };
+        image[0x808 / 4] = stamp;
+    }
+    d.regs.insert(u64::from(engine) + 0x240, base);
+    d.regs.insert(u64::from(engine) + 0x3a8, old_timestamp);
+    d.gen12_restores
+        .push((base, image[1024 + 0x13], image[1024 + 0x15]));
+}
+
 // Independent BCS0 model from Linux xe_lrc.c {gen12_xcs,xe2_bcs}_offsets,
 // xe_ring_ops.c::__emit_job_gen12_simple and xe_gt.c::emit_wa_job literals.
 fn execute_copy(w: &Window, base: u32) {
     let mut d = w.0.borrow_mut();
     assert!(d.synced.contains(&base));
-    let xe2 = d.regs[&0xd8c] >> 22 == 20;
+    let xe2 = model_has_xe2_ring(d.regs[&0xd8c]);
+    let gen12 = d.profile.is_some_and(GtPlatform::is_gen12);
     let image = d.memory[&base].clone();
     let engine = match image.borrow()[1026] {
         0x22244 => 0x22000,
         0x3ee244 if xe2 => 0x3ee000,
+        reg if gen12 && (0x1c0244..=0x1f8244).contains(&reg) => reg - 0x244,
         _ => panic!("unsupported copy register bank"),
     };
+    let media = gen12 && engine >= 0x1c0000;
     let (tail, ring_base) = {
         let data = image.borrow();
         assert_eq!(data.len(), 2048);
@@ -1658,13 +2254,13 @@ fn execute_copy(w: &Window, base: u32) {
         );
         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
         assert_eq!((data[1032], data[1024 + 0x21]), (engine + 0x38, 0x11081011));
-        assert_eq!(data[1024 + 0x71], 0x01000000);
+        assert_eq!(data[1024 + if gen12 { 0x61 } else { 0x71 }], 0x01000000);
         (data[1024 + 7], data[1024 + 9])
     };
     assert!(d.synced.contains(&ring_base));
     let ring = d.memory[&ring_base].borrow().clone();
     let mut words = &ring[..tail as usize / 4];
-    if image.borrow()[1024 + 0x13] != 0 {
+    if words[0] == 0x12480002 {
         assert_eq!(&words[..4], &[0x12480002, 0x3a8, base + 0x810, 0]);
         words = &words[4..];
     }
@@ -1689,6 +2285,31 @@ fn execute_copy(w: &Window, base: u32) {
     let root =
         (u64::from(image.borrow()[1024 + 0x31]) << 32) | u64::from(image.borrow()[1024 + 0x33]);
     if root != 0 {
+        // Media AUX invalidation precedes the common start-stamp flush.
+        let normalized;
+        if media {
+            assert_eq!(
+                &words[..6],
+                &[
+                    0x04000001,
+                    0x02800101,
+                    0x11020001,
+                    if (engine & 0xc000) == 0x8000 {
+                        0x4238
+                    } else {
+                        0x4218
+                    },
+                    1,
+                    0
+                ]
+            );
+            normalized = words[..2]
+                .iter()
+                .chain(&words[6..])
+                .copied()
+                .collect::<Vec<_>>();
+            words = &normalized;
+        }
         // A PPGTT copy job begins with a TLB-invalidating start stamp.
         assert_eq!(
             &words[..7],
@@ -1702,17 +2323,57 @@ fn execute_copy(w: &Window, base: u32) {
                 0x02800100
             ]
         );
-        execute_copy_ppgtt(root, &words[7..]);
+        execute_copy_ppgtt(
+            root,
+            &words[7..],
+            d.profile.is_some_and(GtPlatform::is_headless_integrated),
+        );
     } else if tail != 32 {
+        let seed_at = if gen12 {
+            assert_eq!(
+                &words[1..11],
+                &[
+                    0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040,
+                    0x7304, 0x02000200
+                ]
+            );
+            let mut saved = [0; 4];
+            for (index, (reg, word)) in [
+                (0x2580, 0x00060002),
+                (0x7018, 0x20002000),
+                (0x7300, 0x00400040),
+                (0x7304, 0x02000200),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let old = d.regs.get(&reg).copied().unwrap_or(0);
+                let next = old & !(word >> 16) | word & (word >> 16);
+                d.regs.insert(reg, next);
+                // Fixture-only opaque capture; no claimed hardware offset.
+                image.borrow_mut()[0x1800 / 4 + index] = next;
+                saved[index] = next;
+            }
+            d.nonrender_seeds.push((base, saved));
+            11
+        } else {
+            1
+        };
+        if media {
+            assert_eq!(words[seed_at], 0x13004002);
+            image.borrow_mut()[0x800 / 4] = stamp;
+            image.borrow_mut()[1024 + 5] = tail;
+            return;
+        }
         // emit_wa_job's non-MCR RMW of BLIT_CCTL to the uncached MOCS.
         // RING_CMD_CCTL is pinned per platform by the RCS tests; BCS0's ring
         // and BLIT_CCTL must use the same uncached MOCS index.
         let cctl = d.regs[&0x20c4];
         assert_eq!(d.regs[&u64::from(engine + 0xc4)], cctl);
         let uc = (cctl >> 1) & 0x3f;
-        assert_eq!(cctl, 0x3f7e0000 | uc << 8 | uc << 1);
+        assert_eq!(cctl, uc << 8 | uc << 1);
         assert_eq!(
-            &words[1..28],
+            &words[seed_at..seed_at + 27],
             &[
                 0x15080001,
                 (engine + 0x204),
@@ -1761,10 +2422,14 @@ fn execute_copy(w: &Window, base: u32) {
 
 // Walk the production page tables for a copy job: an optional PPGTT batch
 // whose literal MI_STORE_DATA_IMM is executed, then an optional user fence.
-fn execute_copy_ppgtt(root: u64, words: &[u32]) {
+fn execute_copy_ppgtt(root: u64, words: &[u32], lnl: bool) {
     let walk = |va: u64| -> u64 {
         let mut page = root & 0x0000_3fff_ffff_f000;
-        for shift in [39, 30, 21, 12] {
+        for &shift in if lnl {
+            &[48, 39, 30, 21, 12][..]
+        } else {
+            &[39, 30, 21, 12][..]
+        } {
             let address = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
             // SAFETY: the fixture's production tables stay resident until
             // terminal completion; this walk never dereferences user memory.
@@ -1773,9 +2438,13 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
             assert_eq!(entry & 1, 1);
             page = entry & 0x0000_3fff_ffff_f000;
             if shift == 12 && entry & (1 << 11) != 0 {
-                let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
-                assert_ne!(base, 0, "DM leaf without fixture VRAM");
-                page += base;
+                if let Some(pointer) = crate::intel_gpu_exec::vram_clear::fixture_pointer(page) {
+                    page = pointer;
+                } else {
+                    let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+                    assert_ne!(base, 0, "DM leaf without fixture VRAM");
+                    page += base;
+                }
             }
         }
         page | (va & 4095)
@@ -1783,7 +2452,7 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
     let mut i = 0;
     if words[0] == 0x18800101 {
         let batch = u64::from(words[1]) | u64::from(words[2]) << 32;
-        if !crate::intel_gpu_exec::vram_clear::execute_fixture(root, batch) {
+        if lnl || !crate::intel_gpu_exec::vram_clear::execute_fixture(root, batch) {
             let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
             // SAFETY: translated page is an owned resident batch BO.
             let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
@@ -1883,7 +2552,12 @@ fn execute_compute(w: &Window, base: u32) {
             .iter()
             .position(|w| *w == 0x7a000204)
             .expect("compute flush");
-        let commands = &seed[..flush - if d.regs[&0xd8c] >> 22 == 20 { 0 } else { 6 }];
+        let commands = &seed[..flush
+            - if model_has_xe2_ring(d.regs[&0xd8c]) {
+                0
+            } else {
+                6
+            }];
         assert!(commands.is_empty() || commands == [0x11000001, engine + 0x580, 0x00060002]);
         assert_eq!(seed[flush + 1], 0x001000a0);
     }
@@ -1899,6 +2573,9 @@ fn execute_ppgtt_probe(
     base: u32,
     compute: bool,
 ) {
+    let lnl = regs.get(&0xd8c).is_some_and(|g| {
+        (g >> 22 == 20 && (g >> 14) & 255 == 4) || (g >> 22 == 30 && (g >> 14) & 255 <= 1)
+    });
     let pat = if regs.get(&0x480c) == Some(&2) {
         3
     } else if regs.get(&0x4808) == Some(&0xf) {
@@ -1918,7 +2595,11 @@ fn execute_ppgtt_probe(
     assert_eq!(root & 0xfff, 3 | table_pat << 3);
     let walk = |va: u64, writable: bool| -> u64 {
         let mut page = root & 0x0000_3fff_ffff_f000;
-        for shift in [39, 30, 21, 12] {
+        for &shift in if lnl {
+            &[48, 39, 30, 21, 12][..]
+        } else {
+            &[39, 30, 21, 12][..]
+        } {
             let address = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
             // SAFETY: this fixture built and retains all four physical tables;
             // the independent walk never uses an external/raw user pointer.
@@ -1932,9 +2613,13 @@ fn execute_ppgtt_probe(
             assert_eq!(entry & 2 != 0, shift != 12 || writable);
             page = entry & 0x0000_3fff_ffff_f000;
             if shift == 12 && entry & (1 << 11) != 0 {
-                let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
-                assert_ne!(base, 0, "DM leaf without fixture VRAM");
-                page += base;
+                if let Some(pointer) = crate::intel_gpu_exec::vram_clear::fixture_pointer(page) {
+                    page = pointer;
+                } else {
+                    let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+                    assert_ne!(base, 0, "DM leaf without fixture VRAM");
+                    page += base;
+                }
             }
         }
         page | (va & 4095)
@@ -1945,7 +2630,7 @@ fn execute_ppgtt_probe(
         (0x7a000404, 0x20344c1c)
     };
     let mut expected = Vec::new();
-    if image[1024 + 0x13] != 0 {
+    if ring[0] == 0x12480002 {
         expected.extend_from_slice(&[
             0x12480002,
             0x3a8,
@@ -1974,12 +2659,19 @@ fn execute_ppgtt_probe(
             0x04000000,
         ]);
     }
-    if pat == 0 || pat == 3 {
+    let gen12 = regs.get(&0xd8c) == Some(&u32::MAX);
+    if !gen12 && (pat == 0 || pat == 3) {
         expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
     expected.extend_from_slice(&[
         0x7a000204,
-        if compute { 0x001000a0 } else { 0x101010a1 },
+        if compute {
+            0x001000a0
+        } else if gen12 {
+            0x101030a1
+        } else {
+            0x101010a1
+        },
         0,
         0,
         0,
@@ -2176,13 +2868,12 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 )
             );
             assert_eq!(ads[0x1060 / 4], 8192 - 4096 - 384);
-            assert_eq!(ads[0x300 / 4 + 1], 3);
-            let saves = (ads[0x300 / 4] - 0x20001000) as usize / 4;
-            assert_eq!(
-                [ads[saves], ads[saves + 2], ads[saves + 4], ads[saves + 8]],
-                [0x2229c, 1, 0x22080, 0x220a8]
-            );
-            assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x22080]);
+            assert_eq!(ads[0x300 / 4 + 1], if xe2 { 18 } else { 16 });
+            let saves = ads_registers(&w, crate::intel_gpu_engine::Engine::Bcs0);
+            assert_eq!(saves[&0x2229c].1, 0);
+            assert_eq!(saves[&0x220c4].1, 1);
+            assert_eq!(saves[&0x22080], (w.0.borrow().regs[&0x22080], 0));
+            assert_eq!(saves[&0x220a8].1, 0);
             if !xe2 {
                 assert_eq!((ads[0x340 / 4], ads[0x340 / 4 + 1]), (0, 0));
             }
@@ -2203,18 +2894,16 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 (ads[(0x123c + 128) / 4], ads[(0x123c + 528) / 4]),
                 (0x20202000, 1)
             );
-            assert_eq!(ads[0x400 / 4 + 1], 3);
+            assert_eq!(ads[0x400 / 4 + 1], if xe2 { 18 } else { 16 });
             // GuC follows the class/physical-instance header, not adjacency
             // to another engine's save list. An absent BCS8 leaves its own
             // reserved save range empty before CCS0's range.
-            let saves = (ads[0x400 / 4] - 0x20001000) as usize / 4;
             assert_ne!(ads[0x400 / 4], ads[0x300 / 4]);
-            assert_eq!(
-                [ads[saves], ads[saves + 4], ads[saves + 8]],
-                [0x1a29c, 0x1a080, 0x1a0a8]
-            );
-            assert_eq!(ads[saves + 2], 1);
-            assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x1a080]);
+            let saves = ads_registers(&w, crate::intel_gpu_engine::Engine::Ccs0);
+            assert_eq!(saves[&0x1a29c].1, 0);
+            assert_eq!(saves[&0x1a0c4].1, 1);
+            assert_eq!(saves[&0x1a080], (w.0.borrow().regs[&0x1a080], 0));
+            assert_eq!(saves[&0x1a0a8].1, 0);
             assert_eq!(w.0.borrow().regs[&0x14800] & 1, 1, "RCU_MODE_CCS_ENABLE");
         }
         // A fresh PPGTT context must inherit the device's saved opaque state,
@@ -2378,12 +3067,16 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
                     ExecObject {
                         object: weak[0].upgrade().unwrap(),
                         va: 0x1234_0000_0000,
-                        writable: false
+                        writable: false,
+                        asynchronous: false,
+                        capture: false,
                     },
                     ExecObject {
                         object: weak[1].upgrade().unwrap(),
                         va: 0x2345_0000_0000,
-                        writable: true
+                        writable: true,
+                        asynchronous: false,
+                        capture: false,
                     },
                 ],
             }
@@ -2463,12 +3156,16 @@ fn smoke_hardware_reservation_cache_failure_releases_before_retry() -> TestResul
             ExecObject {
                 object: weak[0].upgrade().unwrap(),
                 va: 0x1234_0000_0000,
-                writable: false
+                writable: false,
+                asynchronous: false,
+                capture: false,
             },
             ExecObject {
                 object: weak[1].upgrade().unwrap(),
                 va: 0x2345_0000_0000,
-                writable: true
+                writable: true,
+                asynchronous: false,
+                capture: false,
             },
         ],
     }
@@ -2965,10 +3662,65 @@ mod slpc_controls {
     include!("intel_gpu_slpc_tests.rs");
 }
 
+mod mert {
+    use super::*;
+    include!("intel_gpu_mert_hw_tests.rs");
+}
+
 fn service_slpc(w: &Window, memory: &Words, control_fence: u16, request: &[u32]) {
     slpc_controls::service(w, memory, control_fence, request);
 }
 
 mod bcs8 {
     include!("intel_gpu_bcs8_tests.rs");
+}
+
+mod media_gt_sched {
+    include!("intel_gpu_media_gt_sched_tests.rs");
+}
+
+mod media_huc {
+    include!("intel_gpu_media_huc_tests.rs");
+}
+
+mod media_gt_power {
+    include!("intel_gpu_media_gt_power_tests.rs");
+}
+
+mod media_gt_gsc {
+    include!("intel_gpu_media_gt_gsc_tests.rs");
+}
+
+mod media_gt_gsccs {
+    include!("intel_gpu_media_gt_gsccs_tests.rs");
+}
+
+mod coredump_exec {
+    use super::*;
+    include!("intel_gpu_coredump_exec_hw_tests.rs");
+}
+
+mod copy_jobs {
+    include!("intel_gpu_copy_tests.rs");
+}
+
+mod gen12 {
+    include!("intel_gpu_gen12_hw_tests.rs");
+}
+
+mod reset_policy {
+    include!("intel_gpu_reset_policy_tests.rs");
+}
+
+mod lnl_eu_stall {
+    include!("intel_gpu_eu_stall_hw_tests.rs");
+}
+
+mod oa_native {
+    include!("intel_gpu_oa_hw_tests.rs");
+}
+
+mod ggtt_tlb_hw {
+    use super::*;
+    include!("intel_gpu_ggtt_tlb_hw_tests.rs");
 }

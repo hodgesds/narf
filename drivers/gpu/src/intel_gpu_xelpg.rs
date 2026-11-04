@@ -4,7 +4,7 @@
 //! model with two SerDes PHYs hanging off a per-port message bus:
 //!
 //! - **C10 PHY** — behind DDI A and DDI B (the "combo" ports).
-//! - **C20 PHY** — behind the Type-C ports TC1 / TC2.
+//! - **C20 PHY** — behind the Type-C ports TC1–TC4.
 //!
 //! Both PHYs are programmed the same way at the transport level:
 //! the display engine issues 8-bit reads/writes to PHY-internal
@@ -53,9 +53,12 @@
 //! - HDMI PLL states (C10/C20 carry separate HDMI tables) land
 //!   with the HDMI lane; this module's lookups return `None` for
 //!   non-DP rates.
-//! - Lane reversal and DP-alt single-lane ownership are not
-//!   modelled: both PHY lanes are always owned (the shape every
-//!   MTL SKU's DDI A / TC1 wiring presents at boot).
+//! - Lane reversal and DP-alt single-lane (pin assignment D)
+//!   ownership are not modelled: both PHY lanes are always owned.
+//!   Type-C callers admit only pin assignments that hand display
+//!   both PHY lanes (`intel_gpu_xelpg_tc`); DP-alt mode only
+//!   changes the one-lane TX-disable pattern
+//!   ([`enable_port_pll_owned`]).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -69,7 +72,7 @@ use crate::intel_gpu_pll::LinkRate;
 pub enum PhyKind {
     /// C10 — DDI A / DDI B.
     C10,
-    /// C20 — TC1 / TC2.
+    /// C20 — TC1–TC4.
     C20,
 }
 
@@ -84,10 +87,14 @@ pub enum XeLpgPort {
     A,
     /// DDI B — second combo port (C10 PHY).
     B,
-    /// TC1 — first Type-C port (C20 PHY).
+    /// TC1 — first Type-C port (C20 PHY; i915 `PORT_TC1` = 3).
     Tc1,
-    /// TC2 — second Type-C port (C20 PHY).
+    /// TC2 — second Type-C port (C20 PHY; `PORT_TC2` = 4).
     Tc2,
+    /// TC3 — third Type-C port (C20 PHY; `PORT_TC3` = 5).
+    Tc3,
+    /// TC4 — fourth Type-C port (C20 PHY; `PORT_TC4` = 6).
+    Tc4,
 }
 
 impl XeLpgPort {
@@ -98,6 +105,8 @@ impl XeLpgPort {
             XeLpgPort::B => 0x6_4104,
             XeLpgPort::Tc1 => 0x16_F200,
             XeLpgPort::Tc2 => 0x16_F400,
+            XeLpgPort::Tc3 => 0x16_F600,
+            XeLpgPort::Tc4 => 0x16_F800,
         }
     }
     /// `XELPDP_PORT_BUF_CTL2` (BUF_CTL1 + 4 on every port).
@@ -117,6 +126,8 @@ impl XeLpgPort {
             XeLpgPort::B => 0x6_4140,
             XeLpgPort::Tc1 => 0x16_F240,
             XeLpgPort::Tc2 => 0x16_F440,
+            XeLpgPort::Tc3 => 0x16_F640,
+            XeLpgPort::Tc4 => 0x16_F840,
         }
     }
     /// `XELPDP_PORT_MSGBUS_TIMER` for PHY lane 0 (+4 per lane).
@@ -126,6 +137,8 @@ impl XeLpgPort {
             XeLpgPort::B => 0x6_41D8,
             XeLpgPort::Tc1 => 0x16_F258,
             XeLpgPort::Tc2 => 0x16_F458,
+            XeLpgPort::Tc3 => 0x16_F658,
+            XeLpgPort::Tc4 => 0x16_F858,
         }
     }
     /// `XELPDP_PORT_CLOCK_CTL` absolute offset.
@@ -135,6 +148,8 @@ impl XeLpgPort {
             XeLpgPort::B => 0x6_41E0,
             XeLpgPort::Tc1 => 0x16_F260,
             XeLpgPort::Tc2 => 0x16_F460,
+            XeLpgPort::Tc3 => 0x16_F660,
+            XeLpgPort::Tc4 => 0x16_F860,
         }
     }
     /// `XELPDP_DP_AUX_CH_CTL` absolute offset (DATA at +4). The TC
@@ -146,6 +161,8 @@ impl XeLpgPort {
             XeLpgPort::B => 0x6_4110,
             XeLpgPort::Tc1 => 0x16_F210,
             XeLpgPort::Tc2 => 0x16_F410,
+            XeLpgPort::Tc3 => 0x16_F610,
+            XeLpgPort::Tc4 => 0x16_F810,
         }
     }
     /// BAR0 base of this port's AUX register block (CTL at +0x10,
@@ -154,56 +171,76 @@ impl XeLpgPort {
     pub const fn aux_base(self) -> u64 {
         self.aux_ctl() - 0x10
     }
-    /// `DDI_CLK_VALFREQ` — present on the combo (C10) ports only.
-    /// The C20 ports carry their rate in the PHY's serdes-rate VDR
-    /// instead, so there is no register to write.
-    pub const fn clk_valfreq(self) -> Option<u64> {
+    /// i915 `enum port` value for this port (`intel_display_limits.h`:
+    /// `PORT_A` = 0, `PORT_B` = 1, `PORT_TC1` = `PORT_D` = 3 …
+    /// `PORT_TC4` = 6). Every `_MMIO_PORT` register (DDI_BUF_CTL,
+    /// DDI_CLK_VALFREQ) and the TGL `TRANS_DDI_FUNC_CTL` port select
+    /// are keyed by it.
+    pub const fn port_enum(self) -> u32 {
         match self {
-            XeLpgPort::A => Some(0x6_4030),
-            XeLpgPort::B => Some(0x6_4130),
-            XeLpgPort::Tc1 | XeLpgPort::Tc2 => None,
+            XeLpgPort::A => 0,
+            XeLpgPort::B => 1,
+            XeLpgPort::Tc1 => 3,
+            XeLpgPort::Tc2 => 4,
+            XeLpgPort::Tc3 => 5,
+            XeLpgPort::Tc4 => 6,
+        }
+    }
+    /// `DDI_CLK_VALFREQ(port)` = `_MMIO_PORT(port, 0x64030, 0x64130)`.
+    /// `intel_cx0_phy.c::intel_cx0pll_enable` step 8 writes it for
+    /// every Cx0 port, C20 Type-C ports included (TC1 = 0x64330).
+    pub const fn clk_valfreq(self) -> Option<u64> {
+        Some(0x6_4030 + 0x100 * self.port_enum() as u64)
+    }
+    /// `DDI_BUF_CTL(port)` — "DDI_CTL_DE" on MTL —
+    /// `_MMIO_PORT(port, 0x64000, 0x64100)` (`intel_display_regs.h`).
+    pub const fn ddi_buf_ctl(self) -> u64 {
+        0x6_4000 + 0x100 * self.port_enum() as u64
+    }
+    /// Type-C port index (`enum tc_port`, TC_PORT_1 = 0) for the four
+    /// C20 Type-C ports; `None` on the combo ports.
+    pub const fn tc_index(self) -> Option<u8> {
+        match self {
+            XeLpgPort::A | XeLpgPort::B => None,
+            XeLpgPort::Tc1 => Some(0),
+            XeLpgPort::Tc2 => Some(1),
+            XeLpgPort::Tc3 => Some(2),
+            XeLpgPort::Tc4 => Some(3),
         }
     }
     /// The PHY behind this port.
     pub const fn phy(self) -> PhyKind {
         match self {
             XeLpgPort::A | XeLpgPort::B => PhyKind::C10,
-            XeLpgPort::Tc1 | XeLpgPort::Tc2 => PhyKind::C20,
+            _ => PhyKind::C20,
         }
     }
-    /// PHY index for `TRANS_CLK_SEL` (i915 `enum phy`: A=0, B=1,
-    /// TC1=C=2, TC2=D=3 on MTL).
+    /// PHY index for `TRANS_CLK_SEL` — `TGL_TRANS_CLK_SEL_PORT(phy)`
+    /// on display ver >= 13 (`intel_ddi.c::
+    /// intel_ddi_enable_transcoder_clock`), where
+    /// `intel_display.c::intel_port_to_phy` maps PORT_TC1..TC4 to
+    /// PHY_F..PHY_I (5..8) and A/B to PHY_A/PHY_B.
     pub const fn phy_index(self) -> u32 {
         match self {
             XeLpgPort::A => 0,
             XeLpgPort::B => 1,
-            XeLpgPort::Tc1 => 2,
-            XeLpgPort::Tc2 => 3,
+            XeLpgPort::Tc1 => 5,
+            XeLpgPort::Tc2 => 6,
+            XeLpgPort::Tc3 => 7,
+            XeLpgPort::Tc4 => 8,
         }
     }
     /// Port index for `TRANS_DDI_FUNC_CTL`'s DDI-select field,
-    /// which carries i915's `enum port` value (the shared builder
-    /// adds the +1 the TGL field encoding wants): A=0, B=1,
-    /// TC1=9, TC2=10.
+    /// `TGL_TRANS_DDI_SELECT_PORT(port)` = (port + 1) << 27 with
+    /// i915's `enum port` (the shared builder adds the +1): A=0,
+    /// B=1, TC1..TC4 = 3..6.
     pub const fn func_ctl_index(self) -> u8 {
-        match self {
-            XeLpgPort::A => 0,
-            XeLpgPort::B => 1,
-            XeLpgPort::Tc1 => 9,
-            XeLpgPort::Tc2 => 10,
-        }
+        self.port_enum() as u8
     }
-    /// Index of this port's AUX power well inside
-    /// `PWR_WELL_CTL_AUX2` (0x45444): AUX_A=0, AUX_B=1 (ICL
-    /// numbering), AUX_USBC1=3, AUX_USBC2=4 (TGL TC numbering).
-    pub const fn aux_well_index(self) -> u32 {
-        match self {
-            XeLpgPort::A => 0,
-            XeLpgPort::B => 1,
-            XeLpgPort::Tc1 => 3,
-            XeLpgPort::Tc2 => 4,
-        }
-    }
+    // There is no PWR_WELL_CTL_AUX2 index: every display-14 AUX well
+    // (A, B, USBC1-4) is the XELPDP_DP_AUX_CH_CTL power request at
+    // `aux_ctl()` (`intel_display_power_map.c::xelpdp_power_wells_aux`,
+    // `intel_gpu_xelpg_tc::aux_power_enable`).
     /// Whether this port can carry an eDP panel (DDI A only on
     /// MTL platforms this driver targets).
     pub const fn is_edp(self) -> bool {
@@ -229,6 +266,18 @@ pub const PORT_BUF_SOC_PHY_READY: u32 = 1 << 24;
 pub const PORT_BUF_PORT_DATA_WIDTH_MASK: u32 = 0x3 << 18;
 /// `XELPDP_PORT_REVERSAL` (BUF_CTL1 bit 16).
 pub const PORT_BUF_REVERSAL: u32 = 1 << 16;
+/// `XELPDP_PORT_BUF_IO_SELECT_TBT` (BUF_CTL1 bit 11) — set only for
+/// a Thunderbolt-alt route (`mtl_port_buf_ctl_io_selection`).
+pub const PORT_BUF_IO_SELECT_TBT: u32 = 1 << 11;
+/// `XELPDP_PORT_BUF_PHY_IDLE` (BUF_CTL1 bit 7) — the MTL DDI buffer
+/// idle status (`intel_ddi.c::intel_ddi_buf_status_reg`).
+pub const PORT_BUF_PHY_IDLE: u32 = 1 << 7;
+/// `XELPDP_TC_PHY_OWNERSHIP` (BUF_CTL1 bit 6).
+pub const TC_PHY_OWNERSHIP: u32 = 1 << 6;
+/// `XELPDP_TCSS_POWER_REQUEST` (BUF_CTL1 bit 5).
+pub const TCSS_POWER_REQUEST: u32 = 1 << 5;
+/// `XELPDP_TCSS_POWER_STATE` (BUF_CTL1 bit 4).
+pub const TCSS_POWER_STATE: u32 = 1 << 4;
 /// `XELPDP_PORT_WIDTH` field (BUF_CTL1 bits 3:1).
 pub const PORT_WIDTH_MASK: u32 = 0x7 << 1;
 /// `XELPDP_PORT_WIDTH(width)`: 3 lanes encodes as 4, else width-1.
@@ -275,6 +324,11 @@ pub const P2_STATE_READY: u32 = 0x2;
 pub const P2_STATE_RESET: u32 = 0x2;
 /// Powerdown state: P0 = fully active.
 pub const P0_STATE_ACTIVE: u32 = 0x0;
+/// `XELPDP_P2PG_STATE_DISABLE` — the C10 disable state
+/// (`cx0_power_control_disable_val`).
+pub const P2PG_STATE_DISABLE: u32 = 0x9;
+/// `XELPDP_P4PG_STATE_DISABLE` — the MTL C20 disable state.
+pub const P4PG_STATE_DISABLE: u32 = 0xC;
 
 /// `XELPDP_LANE_PCLK_PLL_REQUEST(lane)` (PORT_CLOCK_CTL
 /// bits 31/27).
@@ -374,11 +428,14 @@ fn wait_for<M: MmioWindow + ?Sized>(
     let budget = narf_time::wall::ns_to_cycles(timeout_ns);
     let start = narf_time::now_cycles();
     loop {
+        // read_poll_timeout: sample expiry before the read, so the read
+        // that ends a timed-out wait follows the deadline.
+        let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
         let v = mmio.read32(off);
         if (v & mask != 0) == want_set {
             return true;
         }
-        if narf_time::now_cycles().wrapping_sub(start) > budget {
+        if expired {
             return false;
         }
         core::hint::spin_loop();
@@ -460,11 +517,14 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
         let budget = narf_time::wall::ns_to_cycles(MSGBUS_TIMEOUT_NS);
         let start = narf_time::now_cycles();
         let val = loop {
+            // read_poll_timeout: an ACK posted before the deadline is read
+            // after expiry is sampled, never discarded by a bus reset.
+            let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
             let v = self.mmio.read32(status_off);
             if v & P2M_RESPONSE_READY != 0 {
                 break v;
             }
-            if narf_time::now_cycles().wrapping_sub(start) > budget {
+            if expired {
                 self.bus_reset(lane);
                 return Err(Cx0Error::Timeout);
             }
@@ -992,11 +1052,74 @@ fn c20_pll_program<M: MmioWindow + ?Sized>(
     state: &C20PllState,
     port_clock_khz: u32,
 ) -> Result<(), Cx0Error> {
-    let rate_idx = c20_dp_rate_index(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
+    let vdr = C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
+    c20_pll_program_vdr(phy, state, &vdr, false)
+}
+
+/// C20 VDR protocol parameters (`intel_c20_calc_vdr_params`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct C20Vdr {
+    /// `PHY_C20_VDR_CUSTOM_WIDTH` value (0 = DP 1.4 / HDMI TMDS).
+    pub custom_width: u8,
+    /// Serdes-rate byte bits under `C20_SERDES_RATE_MASK`.
+    pub serdes_rate: u8,
+    /// `PHY_C20_VDR_HDMI_RATE` value; `None` for DP (not written).
+    pub hdmi_rate: Option<u8>,
+}
+
+impl C20Vdr {
+    /// DP 1.4: width 0, `IS_DP | DP_RATE(intel_c20_get_dp_rate)`.
+    pub fn dp(port_clock_khz: u32) -> Option<Self> {
+        let rate = c20_dp_rate_index(port_clock_khz)?;
+        Some(Self {
+            custom_width: 0,
+            serdes_rate: C20_SERDES_IS_DP | (rate << 1),
+            hdmi_rate: None,
+        })
+    }
+    /// HDMI TMDS (25.175–600 MHz, not an FRL rate): width 0, no
+    /// serdes bits, `intel_c20_get_hdmi_rate` = 0.
+    pub const fn hdmi_tmds() -> Self {
+        Self {
+            custom_width: 0,
+            serdes_rate: 0,
+            hdmi_rate: Some(0),
+        }
+    }
+}
+
+/// `PHY_C20_VDR_HDMI_RATE`.
+pub const C20_VDR_HDMI_RATE: u16 = 0xD01;
+/// `PHY_C20_HDMI_RATE_MASK`.
+pub const C20_HDMI_RATE_MASK: u8 = 0x3;
+/// `RAWLANEAONX_DIG_TX_MPLLB_CAL_DONE_BANK(idx)` = 0x303D + idx.
+pub const fn c20_mpllb_cal_done_bank(idx: u16) -> u16 {
+    0x303D + idx
+}
+
+/// `intel_c20_pll_program` with explicit VDR parameters. With
+/// `protocol_switch` (`intel_c20_protocol_switch_valid`: a Type-C port in
+/// legacy mode) step 2 clears the lane-0 MPLLB CAL_DONE banks and waits
+/// 4 ms before the context write.
+fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    state: &C20PllState,
+    vdr: &C20Vdr,
+    protocol_switch: bool,
+) -> Result<(), Cx0Error> {
     // Step 1: current context selection (toggle bit of the
     // serdes-rate byte, read on lane 0).
     let serdes = phy.read(LANE0, C20_VDR_CUSTOM_SERDES_RATE)?;
     let cntx = serdes & C20_CONTEXT_TOGGLE != 0;
+    if protocol_switch {
+        for i in 0..4u16 {
+            phy.sram_write(LANE0, c20_mpllb_cal_done_bank(i), 0)?;
+        }
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ns(4_000_000),
+        );
+    }
     // Step 3: write the context the toggle bit does *not*
     // currently select (i915 writes context A when the bit reads
     // set, context B when it reads clear), then flip the bit in
@@ -1015,22 +1138,31 @@ fn c20_pll_program<M: MmioWindow + ?Sized>(
     for (i, word) in state.mpllb.iter().enumerate() {
         phy.sram_write(LANE0, mpllb_base - i as u16, *word)?;
     }
-    // Steps 4-6: VDR parameters — custom width 0 (DP 1.4) and the
-    // serdes rate byte (IS_DP | rate index), both lanes.
+    // Steps 4-6: VDR parameters (`intel_c20_program_vdr_params`) —
+    // custom width, the serdes rate byte and, for HDMI, the HDMI rate.
     phy.rmw(
         BOTH_LANES,
         C20_VDR_CUSTOM_WIDTH,
         C20_CUSTOM_WIDTH_MASK,
-        0,
+        vdr.custom_width,
         true,
     )?;
     phy.rmw(
         BOTH_LANES,
         C20_VDR_CUSTOM_SERDES_RATE,
         C20_SERDES_RATE_MASK,
-        C20_SERDES_IS_DP | (rate_idx << 1),
+        vdr.serdes_rate,
         true,
     )?;
+    if let Some(rate) = vdr.hdmi_rate {
+        phy.rmw(
+            BOTH_LANES,
+            C20_VDR_HDMI_RATE,
+            C20_HDMI_RATE_MASK,
+            rate & C20_HDMI_RATE_MASK,
+            true,
+        )?;
+    }
     // Step 7: toggle the context selection to load the new state.
     phy.rmw(
         BOTH_LANES,
@@ -1092,6 +1224,11 @@ fn powerdown_change<M: MmioWindow + ?Sized>(
 const XELPDP_PORT_POWERDOWN_UPDATE_TIMEOUT_NS: u64 = 2_000_000;
 /// `XELPDP_PCLK_PLL_ENABLE_TIMEOUT_US` = 3200 µs.
 const PCLK_PLL_ENABLE_TIMEOUT_NS: u64 = 3_200_000;
+/// `XELPDP_PCLK_PLL_DISABLE_TIMEOUT_US` = 20 µs.
+const PCLK_PLL_DISABLE_TIMEOUT_NS: u64 = 20_000;
+/// DDI buffer active/idle bound: `intel_wait_ddi_buf_active` /
+/// `intel_wait_ddi_buf_idle` wait 10 ms on MTL.
+const DDI_BUF_STATUS_TIMEOUT_NS: u64 = 10_000_000;
 /// `XELPDP_PORT_BUF_SOC_READY_TIMEOUT_US` = 100 µs.
 const SOC_READY_TIMEOUT_NS: u64 = 100_000;
 /// `XELPDP_PORT_RESET_START_TIMEOUT_US` = 10 µs.
@@ -1160,14 +1297,20 @@ fn phy_lane_reset<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(
 
 /// Program the enabled/disabled state of the four TXes from the
 /// active lane count (`intel_cx0_program_phy_lane`, non-reversed,
-/// non-DP-alt): TXes past `lane_count` are disabled via
-/// `PHY_CX0_TX_CONTROL(tx, 2)`.
+/// both PHY lanes owned): TXes past `lane_count` are disabled via
+/// `PHY_CX0_TX_CONTROL(tx, 2)`. In DP-alt mode a one-lane link keeps
+/// TX1 of PHY lane 0 and disables TX0 (the TCSS mux pattern
+/// `disables[1:0] = 0b01`).
 fn program_phy_lane<M: MmioWindow + ?Sized>(
     phy: &Cx0Phy<'_, M>,
     lane_count: u8,
+    dp_alt: bool,
 ) -> Result<(), Cx0Error> {
     // GENMASK8(3, 0) << lane_count, per-TX bit i.
-    let disables: u8 = 0x0F << lane_count;
+    let mut disables: u8 = 0x0F << lane_count;
+    if dp_alt && lane_count == 1 {
+        disables = (disables & !0x3) | 0x1;
+    }
     phy.msgbus_access_begin(BOTH_LANES)?;
     for i in 0..4u16 {
         let tx = i % 2 + 1;
@@ -1248,6 +1391,22 @@ pub fn enable_port_pll<M: MmioWindow + ?Sized>(
     rate: LinkRate,
     lane_count: u8,
 ) -> Result<(), Cx0Error> {
+    enable_port_pll_owned(mmio, port, rate, lane_count, false)
+}
+
+/// [`enable_port_pll`] for a port whose route mode is known: `dp_alt`
+/// selects the DP-alt one-lane TX-disable pattern of step 6. Both PHY
+/// lanes must be owned by display (no pin-assignment-D route).
+pub fn enable_port_pll_owned<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    rate: LinkRate,
+    lane_count: u8,
+    dp_alt: bool,
+) -> Result<(), Cx0Error> {
+    if !matches!(lane_count, 1 | 2 | 4) {
+        return Err(Cx0Error::UnsupportedRate);
+    }
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
     let phy = Cx0Phy::new(mmio, port);
     // 1. Port clock control: forward-clock ungate + maxPCLK clock
@@ -1269,7 +1428,7 @@ pub fn enable_port_pll<M: MmioWindow + ?Sized>(
     // 4-6. Timer, PLL state, TX enables.
     phy.program_msgbus_timer();
     program_pll_state(&phy, port_clock_khz)?;
-    program_phy_lane(&phy, lane_count)?;
+    program_phy_lane(&phy, lane_count, dp_alt)?;
     // 7. DDI_CLK_VALFREQ (combo ports only).
     if let Some(off) = port.clk_valfreq() {
         mmio.write32(off, port_clock_khz);
@@ -1299,6 +1458,201 @@ fn program_pll_state<M: MmioWindow + ?Sized>(
     }
 }
 
+/// A complete Cx0 PLL state for one port enable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Cx0PllState {
+    /// C10 bytes (DDI A/B).
+    C10(C10PllState),
+    /// C20 SRAM context words plus VDR protocol parameters (TC ports).
+    C20(C20PllState, C20Vdr),
+}
+
+/// Everything `intel_cx0pll_enable` needs beyond the port.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PllRequest {
+    /// PLL state for the port's PHY kind.
+    pub state: Cx0PllState,
+    /// Port clock in kHz (`DDI_CLK_VALFREQ`).
+    pub port_clock_khz: u32,
+    /// Active TX lanes (1, 2 or 4).
+    pub lane_count: u8,
+    /// DP-alt one-lane TX pattern.
+    pub dp_alt: bool,
+    /// `pll_state->ssc_enabled` (PORT_CLOCK_CTL SSC on PLLB).
+    pub ssc: bool,
+    /// HDMI protocol: C10 Wa_13013502646 powerdown toggle after lock.
+    pub hdmi: bool,
+    /// C20 legacy-mode protocol-switch CAL_DONE bank clear.
+    pub protocol_switch: bool,
+}
+
+/// `intel_cx0pll_enable` for an explicit PLL state (DP or HDMI TMDS):
+/// PORT_CLOCK_CTL (forward ungate, maxPCLK — FRL's DIV18CLK is not
+/// admitted — SSC on PLLB only when requested), lane reset, P2 ready,
+/// message-bus timer, PLL state, TX enables, `DDI_CLK_VALFREQ`, PCLK PLL
+/// request/ACK and, for HDMI on C10, the Wa_13013502646 P0→P2 toggle.
+pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    req: &PllRequest,
+) -> Result<(), Cx0Error> {
+    if !matches!(req.lane_count, 1 | 2 | 4) {
+        return Err(Cx0Error::UnsupportedRate);
+    }
+    let c10 = match (&req.state, port.phy()) {
+        (Cx0PllState::C10(_), PhyKind::C10) => true,
+        (Cx0PllState::C20(..), PhyKind::C20) => false,
+        _ => return Err(Cx0Error::UnsupportedRate),
+    };
+    let phy = Cx0Phy::new(mmio, port);
+    rmw(mmio, port.buf_ctl1(), PORT_BUF_REVERSAL, 0);
+    rmw(
+        mmio,
+        port.port_clock_ctl(),
+        LANE1_PHY_CLOCK_SELECT
+            | FORWARD_CLOCK_UNGATE
+            | DDI_CLOCK_SELECT_MASK
+            | SSC_ENABLE_PLLA
+            | SSC_ENABLE_PLLB,
+        FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK | if req.ssc { SSC_ENABLE_PLLB } else { 0 },
+    );
+    phy_lane_reset(mmio, port)?;
+    powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
+    phy.program_msgbus_timer();
+    match &req.state {
+        Cx0PllState::C10(state) => c10_pll_program(&phy, state)?,
+        Cx0PllState::C20(state, vdr) => c20_pll_program_vdr(&phy, state, vdr, req.protocol_switch)?,
+    }
+    program_phy_lane(&phy, req.lane_count, req.dp_alt)?;
+    if let Some(off) = port.clk_valfreq() {
+        mmio.write32(off, req.port_clock_khz);
+        compiler_fence(Ordering::SeqCst);
+    }
+    set_pclk_pll_request(mmio, port, true)?;
+    if req.hdmi && c10 {
+        powerdown_change(mmio, port, BOTH_LANES, P0_STATE_ACTIVE)?;
+        powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
+    }
+    Ok(())
+}
+
+/// The DP 1.4 PLL request for `rate` on `port` (C10 DP/eDP table or C20
+/// MPLLB table with DP VDR parameters). `ssc` is
+/// `intel_cx0pll_update_ssc`'s decision
+/// ([`crate::intel_gpu_vbt::dp_ssc_enabled`]); without it the C10 state
+/// takes `intel_c10pll_update_pll`'s non-SSC form (PLL bytes 4..8 zeroed)
+/// and PORT_CLOCK_CTL leaves `SSC_ENABLE_PLLB` clear. The C20 tables are
+/// used as shipped either way; only the PORT_CLOCK_CTL bit follows `ssc`.
+pub fn dp_pll_request(
+    port: XeLpgPort,
+    rate: LinkRate,
+    lane_count: u8,
+    dp_alt: bool,
+    protocol_switch: bool,
+    ssc: bool,
+) -> Result<PllRequest, Cx0Error> {
+    let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
+    let state = match port.phy() {
+        PhyKind::C10 => {
+            let mut state =
+                *c10_pll_state(port_clock_khz, port.is_edp()).ok_or(Cx0Error::UnsupportedRate)?;
+            if !ssc {
+                for byte in &mut state.pll[4..9] {
+                    *byte = 0;
+                }
+            }
+            Cx0PllState::C10(state)
+        }
+        PhyKind::C20 => Cx0PllState::C20(
+            *c20_pll_state(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
+            C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
+        ),
+    };
+    Ok(PllRequest {
+        state,
+        port_clock_khz,
+        lane_count,
+        dp_alt,
+        ssc,
+        hdmi: false,
+        protocol_switch,
+    })
+}
+
+/// HDMI TX levels (`intel_cx0_phy_set_signal_levels` for an HDMI
+/// encoder): C10 stages TX vboost 5 / termination 6
+/// (`intel_c10_get_tx_vboost_lvl` / `_term_ctl`, HDMI branch); all four
+/// TX lanes take the HDMI default entry — the last `mtl_c10_trans_dp14`
+/// preset on C10, `mtl_c20_trans_hdmi` preset 0 on C20.
+pub fn set_signal_levels_hdmi<M: MmioWindow + ?Sized>(phy: &Cx0Phy<'_, M>) -> Result<(), Cx0Error> {
+    let entry = match phy.port.phy() {
+        PhyKind::C10 => C10_TRANS_DP14[9],
+        PhyKind::C20 => C20_TRANS_HDMI[0],
+    };
+    phy.program_msgbus_timer();
+    phy.msgbus_access_begin(BOTH_LANES)?;
+    if phy.port.phy() == PhyKind::C10 {
+        phy.rmw(
+            BOTH_LANES,
+            c10_vdr_cmn(3),
+            C10_CMN3_TXVBOOST_MASK,
+            5 << 5,
+            false,
+        )?;
+        phy.rmw(
+            BOTH_LANES,
+            c10_vdr_tx(1),
+            C10_TX1_TERMCTL_MASK,
+            6 << 5,
+            true,
+        )?;
+    }
+    for ln in 0..4u16 {
+        let lane = ln / 2;
+        let tx = ln % 2;
+        let lane_mask = 1u8 << lane;
+        phy.rmw(
+            lane_mask,
+            cx0_vdrovrd_ctl(lane, tx, 0),
+            CX0_OVRD_LEVEL_MASK,
+            entry.pre_cursor,
+            true,
+        )?;
+        phy.rmw(
+            lane_mask,
+            cx0_vdrovrd_ctl(lane, tx, 1),
+            CX0_OVRD_LEVEL_MASK,
+            entry.vswing,
+            true,
+        )?;
+        phy.rmw(
+            lane_mask,
+            cx0_vdrovrd_ctl(lane, tx, 2),
+            CX0_OVRD_LEVEL_MASK,
+            entry.post_cursor,
+            true,
+        )?;
+    }
+    phy.rmw(
+        BOTH_LANES,
+        C10_VDR_OVRD,
+        0,
+        C10_VDR_OVRD_TX1 | C10_VDR_OVRD_TX2,
+        true,
+    )?;
+    phy.msgbus_access_commit(BOTH_LANES, false)?;
+    Ok(())
+}
+
+/// `mtl_c20_trans_hdmi` (`intel_ddi_buf_trans.c`), five presets.
+pub const C20_TRANS_HDMI: [SnpsTrans; 5] = [
+    snps(48, 0, 0),
+    snps(38, 4, 6),
+    snps(36, 4, 8),
+    snps(34, 4, 10),
+    snps(32, 4, 12),
+];
+
 /// Re-program the port PLL for a new rate after link training
 /// settled below the rate the PLL was first enabled at: drop the
 /// PCLK request, swap the PLL state, raise the request again.
@@ -1327,6 +1681,68 @@ pub fn reprogram_pll_rate<M: MmioWindow + ?Sized>(
 /// step; the PHY power state is left for the next enable.
 pub fn disable_port_pll<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(), Cx0Error> {
     set_pclk_pll_request(mmio, port, false)
+}
+
+/// Reprogram only the per-TX enables after link training settled
+/// on a different lane count (the step-6 programming of
+/// `intel_cx0pll_enable` for the trained width).
+pub fn reprogram_phy_lanes<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    lane_count: u8,
+    dp_alt: bool,
+) -> Result<(), Cx0Error> {
+    if !matches!(lane_count, 1 | 2 | 4) {
+        return Err(Cx0Error::UnsupportedRate);
+    }
+    let phy = Cx0Phy::new(mmio, port);
+    phy.program_msgbus_timer();
+    program_phy_lane(&phy, lane_count, dp_alt)
+}
+
+/// Complete port-PLL disable — `intel_cx0_phy.c::intel_cx0pll_disable`:
+///
+/// 1. Owned PHY lanes to the disable power state (P2PG on C10,
+///    P4PG on MTL C20).
+/// 2. Drop the PCLK PLL *and* refclk requests on both lanes.
+/// 3. `DDI_CLK_VALFREQ` = 0.
+/// 4. Poll PLL + refclk ACKs clear (20 µs).
+/// 5. Clear the DDI clock select, then gate the forward clock.
+///
+/// Unlike [`disable_port_pll`] this leaves the PHY powered down,
+/// which an owned external route needs before Type-C ownership is
+/// released.
+pub fn disable_port_pll_complete<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+) -> Result<(), Cx0Error> {
+    let phy = Cx0Phy::new(mmio, port);
+    phy.program_msgbus_timer();
+    let state = match port.phy() {
+        PhyKind::C10 => P2PG_STATE_DISABLE,
+        PhyKind::C20 => P4PG_STATE_DISABLE,
+    };
+    powerdown_change(mmio, port, BOTH_LANES, state)?;
+    let clock_ctl = port.port_clock_ctl();
+    let requests = lane_pclk_pll_request(0)
+        | lane_pclk_pll_request(1)
+        | lane_pclk_refclk_request(0)
+        | lane_pclk_refclk_request(1);
+    rmw(mmio, clock_ctl, requests, 0);
+    if let Some(off) = port.clk_valfreq() {
+        mmio.write32(off, 0);
+        compiler_fence(Ordering::SeqCst);
+    }
+    let acks = lane_pclk_pll_ack(0)
+        | lane_pclk_pll_ack(1)
+        | lane_pclk_refclk_ack(0)
+        | lane_pclk_refclk_ack(1);
+    if !wait_for(mmio, clock_ctl, acks, false, PCLK_PLL_DISABLE_TIMEOUT_NS) {
+        return Err(Cx0Error::Timeout);
+    }
+    rmw(mmio, clock_ctl, DDI_CLOCK_SELECT_MASK, 0);
+    rmw(mmio, clock_ctl, FORWARD_CLOCK_UNGATE, 0);
+    Ok(())
 }
 
 // ── TX translation tables + signal levels ────────────────────────
@@ -1517,6 +1933,62 @@ pub fn enable_d2d<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(
     Ok(())
 }
 
+/// Disable the die-to-die link and wait for it to report down
+/// (`intel_ddi.c::mtl_ddi_disable_d2d`, 100 µs budget).
+pub fn disable_d2d<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(), Cx0Error> {
+    rmw(mmio, port.buf_ctl1(), PORT_BUF_D2D_LINK_ENABLE, 0);
+    if !wait_for(
+        mmio,
+        port.buf_ctl1(),
+        PORT_BUF_D2D_LINK_STATE,
+        false,
+        SOC_READY_TIMEOUT_NS,
+    ) {
+        return Err(Cx0Error::Timeout);
+    }
+    Ok(())
+}
+
+/// Wait for the port's DDI buffer to leave idle after DDI_CTL_DE was
+/// enabled (`intel_ddi.c::intel_wait_ddi_buf_active`: PORT_BUF_CTL1
+/// PHY_IDLE clear, 10 ms on MTL).
+pub fn wait_port_buf_active<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+) -> Result<(), Cx0Error> {
+    if wait_for(
+        mmio,
+        port.buf_ctl1(),
+        PORT_BUF_PHY_IDLE,
+        false,
+        DDI_BUF_STATUS_TIMEOUT_NS,
+    ) {
+        Ok(())
+    } else {
+        Err(Cx0Error::Timeout)
+    }
+}
+
+/// Wait for the port's DDI buffer to report idle after DDI_CTL_DE was
+/// cleared (`intel_ddi.c::intel_wait_ddi_buf_idle`: PHY_IDLE set,
+/// 10 ms on MTL).
+pub fn wait_port_buf_idle<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+) -> Result<(), Cx0Error> {
+    if wait_for(
+        mmio,
+        port.buf_ctl1(),
+        PORT_BUF_PHY_IDLE,
+        true,
+        DDI_BUF_STATUS_TIMEOUT_NS,
+    ) {
+        Ok(())
+    } else {
+        Err(Cx0Error::Timeout)
+    }
+}
+
 /// Program PORT_BUF_CTL1's lane-count and data-width fields
 /// (`mtl_port_buf_ctl_program`): `lane_count` main-link lanes,
 /// 10-bit port data width (DP 1.4), no reversal.
@@ -1568,6 +2040,17 @@ pub mod tests {
         fail: Cell<u8>,
         /// When set, PORT_CLOCK_CTL reads never mirror ACKs.
         pub no_clock_ack: Cell<bool>,
+        /// When set, BUF_CTL1 D2D_LINK_STATE follows D2D_LINK_ENABLE
+        /// instead of always reading up.
+        pub model_d2d: Cell<bool>,
+        /// When set, BUF_CTL1 PHY_IDLE reads set while this port's
+        /// DDI_CTL_DE enable (bit 31) is clear.
+        pub model_ddi_idle: Cell<bool>,
+        /// When set, BUF_CTL1 TCSS_POWER_STATE follows
+        /// TCSS_POWER_REQUEST (unless `tcss_power_stuck`).
+        pub model_tcss: Cell<bool>,
+        /// TCSS power never acknowledges a request.
+        pub tcss_power_stuck: Cell<bool>,
     }
 
     impl FakePhy {
@@ -1581,6 +2064,10 @@ pub mod tests {
                 p2m: RefCell::new([0; 2]),
                 fail: Cell::new(0),
                 no_clock_ack: Cell::new(false),
+                model_d2d: Cell::new(false),
+                model_ddi_idle: Cell::new(false),
+                model_tcss: Cell::new(false),
+                tcss_power_stuck: Cell::new(false),
             }
         }
         pub fn set_fail(&self, f: Fail) {
@@ -1697,7 +2184,32 @@ pub mod tests {
                 return v;
             }
             if off == self.port.buf_ctl1() {
-                return self.stored(off) | PORT_BUF_SOC_PHY_READY | PORT_BUF_D2D_LINK_STATE;
+                let s = self.stored(off);
+                if !self.model_d2d.get() && !self.model_ddi_idle.get() && !self.model_tcss.get() {
+                    return s | PORT_BUF_SOC_PHY_READY | PORT_BUF_D2D_LINK_STATE;
+                }
+                // Status bits are hardware-owned: a read-modify-write
+                // carrying them back must not latch them.
+                let mut v = (s & !(PORT_BUF_D2D_LINK_STATE | PORT_BUF_PHY_IDLE | TCSS_POWER_STATE))
+                    | PORT_BUF_SOC_PHY_READY;
+                if !self.model_d2d.get() || s & PORT_BUF_D2D_LINK_ENABLE != 0 {
+                    v |= PORT_BUF_D2D_LINK_STATE;
+                }
+                if self.model_ddi_idle.get() {
+                    if self.stored(self.port.ddi_buf_ctl()) & (1 << 31) == 0 {
+                        v |= PORT_BUF_PHY_IDLE;
+                    }
+                } else {
+                    v |= s & PORT_BUF_PHY_IDLE;
+                }
+                if self.model_tcss.get() {
+                    if s & TCSS_POWER_REQUEST != 0 && !self.tcss_power_stuck.get() {
+                        v |= TCSS_POWER_STATE;
+                    }
+                } else {
+                    v |= s & TCSS_POWER_STATE;
+                }
+                return v;
             }
             if off == self.port.buf_ctl2() {
                 let s = self.stored(off);
@@ -1794,17 +2306,34 @@ pub mod tests {
         {
             return TestResult::Fail("TC1 port block offsets wrong");
         }
+        // intel_cx0pll_enable step 8 writes DDI_CLK_VALFREQ(port) for
+        // every Cx0 port: _MMIO_PORT(PORT_TC1 = 3) = 0x64330.
         if tc.msgbus_timer_ln0() != 0x16_F258
             || tc.aux_ctl() != 0x16_F210
-            || tc.clk_valfreq().is_some()
+            || tc.clk_valfreq() != Some(0x6_4330)
         {
-            return TestResult::Fail("TC1 timer/aux/valfreq wrong (TC has no VALFREQ)");
+            return TestResult::Fail("TC1 timer/aux/valfreq wrong");
         }
         if a.phy() != PhyKind::C10 || tc.phy() != PhyKind::C20 {
             return TestResult::Fail("PHY mapping wrong");
         }
-        if tc.phy_index() != 2 || tc.func_ctl_index() != 9 || tc.aux_well_index() != 3 {
+        // intel_port_to_phy: PORT_TC1 -> PHY_F (5) on display >= 13;
+        // TGL_TRANS_DDI_SELECT_PORT keys on enum port (PORT_TC1 = 3).
+        if tc.phy_index() != 5 || tc.func_ctl_index() != 3 {
             return TestResult::Fail("TC1 indices wrong");
+        }
+        // _XELPDP_DP_AUX_CH_CTL: every AUX power well is the channel's
+        // own control register (A/B combo range, USBC range at 0x200).
+        let aux = [
+            (XeLpgPort::A, 0x6_4010u64),
+            (XeLpgPort::B, 0x6_4110),
+            (XeLpgPort::Tc1, 0x16_F210),
+            (XeLpgPort::Tc2, 0x16_F410),
+            (XeLpgPort::Tc3, 0x16_F610),
+            (XeLpgPort::Tc4, 0x16_F810),
+        ];
+        if aux.iter().any(|(port, off)| port.aux_ctl() != *off) {
+            return TestResult::Fail("XELPDP_DP_AUX_CH_CTL offsets wrong");
         }
         TestResult::Pass
     }
@@ -2115,4 +2644,216 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_xelpg", smoke_preset_index_map);
+
+    fn smoke_xelpg_tc3_tc4_source_register_map() -> TestResult {
+        // _PICK_EVEN_2RANGES(port, PORT_TC1, A, B, USBC1, USBC2): the
+        // TC range strides 0x200 from USBC1.
+        let rows = [
+            (
+                XeLpgPort::Tc3,
+                0x16_F600u64,
+                0x16_F640u64,
+                0x16_F660u64,
+                0x16_F610u64,
+            ),
+            (XeLpgPort::Tc4, 0x16_F800, 0x16_F840, 0x16_F860, 0x16_F810),
+        ];
+        for (port, buf, bus, clock, aux) in rows {
+            if port.buf_ctl1() != buf
+                || port.msgbus_ctl_ln0() != bus
+                || port.port_clock_ctl() != clock
+                || port.aux_ctl() != aux
+                || port.msgbus_timer_ln0() != bus + 0x18
+                || port.phy() != PhyKind::C20
+            {
+                return TestResult::Fail("TC3/TC4 port block offsets wrong");
+            }
+        }
+        // enum port PORT_TC1..TC4 = 3..6 keys DDI_BUF_CTL/VALFREQ and
+        // the TRANS_DDI select; intel_port_to_phy gives PHY_F..PHY_I.
+        let enums = [
+            (XeLpgPort::A, 0u32, 0x6_4000u64, 0u32, None),
+            (XeLpgPort::B, 1, 0x6_4100, 1, None),
+            (XeLpgPort::Tc1, 3, 0x6_4300, 5, Some(0u8)),
+            (XeLpgPort::Tc2, 4, 0x6_4400, 6, Some(1)),
+            (XeLpgPort::Tc3, 5, 0x6_4500, 7, Some(2)),
+            (XeLpgPort::Tc4, 6, 0x6_4600, 8, Some(3)),
+        ];
+        for (port, e, ddi, phy, tc) in enums {
+            if port.port_enum() != e
+                || port.ddi_buf_ctl() != ddi
+                || port.phy_index() != phy
+                || port.tc_index() != tc
+                || port.func_ctl_index() as u32 != e
+                || port.clk_valfreq() != Some(0x6_4030 + 0x100 * e as u64)
+            {
+                return TestResult::Fail("port enum / DDI / PHY / TC index mapping wrong");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_xelpg_tc3_tc4_source_register_map
+    );
+
+    fn tx_disable_bits(fake: &FakePhy) -> [bool; 4] {
+        let mut out = [false; 4];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let tx = (i % 2 + 1) as u16;
+            let lane = if i < 2 { 0 } else { 1 };
+            *slot = fake.vdr_get(lane, cx0_tx_control(tx, 2)) & TX_CONTROL2_DISABLE_SINGLE_TX != 0;
+        }
+        out
+    }
+
+    fn smoke_xelpg_dp_alt_one_lane_tx_pattern() -> TestResult {
+        // Native/legacy one-lane: GENMASK8(3,0) << 1 disables TX1..3.
+        let native = FakePhy::new(XeLpgPort::Tc3);
+        if enable_port_pll_owned(&native, XeLpgPort::Tc3, LinkRate::DpHbr2, 1, false).is_err() {
+            return TestResult::Fail("one-lane native enable failed");
+        }
+        if tx_disable_bits(&native) != [false, true, true, true] {
+            return TestResult::Fail("native one-lane must keep TX0 only");
+        }
+        // DP-alt one-lane: disables[1:0] forced to 0b01 — TX0 off, TX1 on.
+        let alt = FakePhy::new(XeLpgPort::Tc3);
+        if enable_port_pll_owned(&alt, XeLpgPort::Tc3, LinkRate::DpHbr2, 1, true).is_err() {
+            return TestResult::Fail("one-lane DP-alt enable failed");
+        }
+        if tx_disable_bits(&alt) != [true, false, true, true] {
+            return TestResult::Fail("DP-alt one-lane must use the TCSS mux pattern");
+        }
+        // Four lanes: identical in both modes (nothing disabled).
+        let four = FakePhy::new(XeLpgPort::Tc4);
+        if enable_port_pll_owned(&four, XeLpgPort::Tc4, LinkRate::DpHbr3, 4, true).is_err()
+            || tx_disable_bits(&four) != [false; 4]
+        {
+            return TestResult::Fail("four-lane DP-alt must enable every TX");
+        }
+        // Three lanes is not a DP width and must refuse before MMIO.
+        let bad = FakePhy::new(XeLpgPort::Tc4);
+        if enable_port_pll_owned(&bad, XeLpgPort::Tc4, LinkRate::DpHbr3, 3, true)
+            != Err(Cx0Error::UnsupportedRate)
+            || !bad.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("three-lane request must refuse without writes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_xelpg_dp_alt_one_lane_tx_pattern
+    );
+
+    fn smoke_xelpg_complete_pll_disable_sequence() -> TestResult {
+        for (port, state) in [
+            (XeLpgPort::B, P2PG_STATE_DISABLE),
+            (XeLpgPort::Tc2, P4PG_STATE_DISABLE),
+        ] {
+            let fake = FakePhy::new(port);
+            if enable_port_pll(&fake, port, LinkRate::DpHbr2, 4).is_err() {
+                return TestResult::Fail("enable before complete disable failed");
+            }
+            if disable_port_pll_complete(&fake, port).is_err() {
+                return TestResult::Fail("complete disable failed against healthy PHY");
+            }
+            let staged = lane_powerdown_new_state(0, state) | lane_powerdown_new_state(1, state);
+            if !fake
+                .writes_to(port.buf_ctl2())
+                .iter()
+                .any(|w| w & POWERDOWN_NEW_STATE_MASK_BOTH == staged)
+            {
+                return TestResult::Fail("PHY disable power state not staged on both lanes");
+            }
+            let clock = fake.stored(port.port_clock_ctl());
+            if clock & 0xAA00_0000 != 0
+                || clock & DDI_CLOCK_SELECT_MASK != 0
+                || clock & FORWARD_CLOCK_UNGATE != 0
+            {
+                return TestResult::Fail("requests, clock select or forward ungate left set");
+            }
+            let valfreq = fake.writes_to(port.clk_valfreq().unwrap());
+            if valfreq.first() != Some(&540_000) || valfreq.last() != Some(&0) {
+                return TestResult::Fail("VALFREQ must be programmed then zeroed");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_xelpg_complete_pll_disable_sequence
+    );
+
+    fn smoke_xelpg_d2d_disable_and_buffer_status_waits() -> TestResult {
+        let fake = FakePhy::new(XeLpgPort::Tc1);
+        fake.model_d2d.set(true);
+        fake.model_ddi_idle.set(true);
+        if enable_d2d(&fake, XeLpgPort::Tc1).is_err() {
+            return TestResult::Fail("D2D enable must see the modelled state");
+        }
+        if disable_d2d(&fake, XeLpgPort::Tc1).is_err()
+            || fake.read32(XeLpgPort::Tc1.buf_ctl1()) & PORT_BUF_D2D_LINK_STATE != 0
+        {
+            return TestResult::Fail("D2D disable must clear and observe the link state");
+        }
+        // DDI_CTL_DE off: idle observed, active wait times out.
+        if wait_port_buf_idle(&fake, XeLpgPort::Tc1).is_err() {
+            return TestResult::Fail("idle buffer must be observed while DDI is off");
+        }
+        if wait_port_buf_active(&fake, XeLpgPort::Tc1) != Err(Cx0Error::Timeout) {
+            return TestResult::Fail("active wait must time out while DDI is off");
+        }
+        fake.write32(XeLpgPort::Tc1.ddi_buf_ctl(), 1 << 31);
+        if wait_port_buf_active(&fake, XeLpgPort::Tc1).is_err()
+            || wait_port_buf_idle(&fake, XeLpgPort::Tc1) != Err(Cx0Error::Timeout)
+        {
+            return TestResult::Fail("enabled DDI must read active and never idle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_xelpg_d2d_disable_and_buffer_status_waits
+    );
+
+    /// A wait whose first read stalls past the whole budget (as if the
+    /// task were preempted there) and still sees the bit clear; the bit is
+    /// set by the time of the next read.
+    struct StalledRead {
+        reads: Cell<u32>,
+    }
+    impl MmioWindow for StalledRead {
+        fn read32(&self, _off: u64) -> u32 {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            if n > 0 {
+                return 1;
+            }
+            let stall = narf_time::wall::ns_to_cycles(4_000_000);
+            let start = narf_time::now_cycles();
+            while narf_time::now_cycles().wrapping_sub(start) <= stall {
+                core::hint::spin_loop();
+            }
+            0
+        }
+        fn write32(&self, _off: u64, _val: u32) {}
+    }
+
+    fn smoke_xelpg_wait_reads_once_more_after_its_deadline() -> TestResult {
+        // read_poll_timeout (iopoll.h) samples expiry before each read and
+        // xe_mmio_wait32 reads once more after its loop: a bit set before
+        // the post-deadline read is success, not a timeout.
+        let stalled = StalledRead {
+            reads: Cell::new(0),
+        };
+        if !wait_for(&stalled, 0x1234, 1, true, 2_000_000) || stalled.reads.get() != 2 {
+            return TestResult::Fail("a bit set before the post-deadline read must be observed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_xelpg_wait_reads_once_more_after_its_deadline
+    );
 }

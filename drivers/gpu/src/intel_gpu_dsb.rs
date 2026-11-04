@@ -1,4 +1,4 @@
-//! Fixed MTL/Arrow Pipe-A DSB color transport. MIT Linux b90c984d:
+//! Fixed Gen12/13 and MTL/Arrow Pipe-A DSB transport. MIT Linux b90c984d:
 //! intel_dsb.c (evasion, chain, DEwake, interrupt, idle/disable),
 //! intel_color.c::icl_load_luts, skl_watermark.c::mtl_read_wm_latency,
 //! intel_vblank.c (eDP scanline offset), xe/display/xe_dsb_buffer.c.
@@ -46,7 +46,7 @@ fn cursor_watermark(register: u64) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Timing {
     pub(crate) clock: u32,
     pub(crate) width: u16,
@@ -72,14 +72,26 @@ impl Timing {
     fn hw(self, line: u32) -> u32 {
         (line + u32::from(self.vtotal) - 1) % u32::from(self.vtotal)
     }
-    fn check(self, io: &impl MmioWindow) -> Result<u32, FsError> {
+    pub(crate) fn check(
+        self,
+        io: &impl MmioWindow,
+        gen12_latencies: Option<[u16; 6]>,
+    ) -> Result<u32, FsError> {
         if !self.valid() {
             return Err(FsError::Unsupported);
         }
         let packed = |high: u16, low: u16| (u32::from(high) - 1) << 16 | (u32::from(low) - 1);
+        // Display 14 (no Gen12 table) writes TRANS_VBLANK's start field 0:
+        // intel_set_transcoder_timings clears it on display 13+, where the
+        // hardware ignores it. Only VBLANK_END is proved there.
+        let vblank_mask = if gen12_latencies.is_some() {
+            u32::MAX
+        } else {
+            0xFFFF_0000
+        };
         if io.read32(0x60000) != packed(self.htotal, self.width)
             || io.read32(0x6000c) != packed(self.vtotal, self.height)
-            || io.read32(0x60010) != packed(self.vtotal, self.height)
+            || io.read32(0x60010) & vblank_mask != packed(self.vtotal, self.height) & vblank_mask
             || io.read32(0x60420) & (ENABLE | (1 << 28) | (1 << 27)) != 0
             || io.read32(0x70008) & ((3 << 21) | (3 << 30)) != 3 << 30
             || io.read32(0x60800) & ENABLE != 0
@@ -87,30 +99,35 @@ impl Timing {
         {
             return Err(FsError::Unsupported);
         }
-        // MTL uses six 13-bit MMIO latencies, not the Gen12 pcode mailbox.
+        // Gen12 retains the adjusted PCODE table qualified with its DDB
+        // reservation. MTL alone uses six 13-bit MMIO latencies.
         let mut latency = [0u32; 6];
-        for (pair, register) in [0x45780, 0x45784, 0x45788].into_iter().enumerate() {
-            let value = io.read32(register);
-            if value == u32::MAX {
-                return Err(FsError::NoDevice);
+        if let Some(table) = gen12_latencies {
+            latency = table.map(u32::from);
+        } else {
+            for (pair, register) in [0x45780, 0x45784, 0x45788].into_iter().enumerate() {
+                let value = io.read32(register);
+                if value == u32::MAX {
+                    return Err(FsError::NoDevice);
+                }
+                latency[pair * 2] = value & 0x1fff;
+                latency[pair * 2 + 1] = (value >> 16) & 0x1fff;
             }
-            latency[pair * 2] = value & 0x1fff;
-            latency[pair * 2 + 1] = (value >> 16) & 0x1fff;
-        }
-        let first_zero = latency
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, v)| **v == 0)
-            .map_or(6, |(i, _)| i);
-        latency[first_zero..].fill(0);
-        for i in 1..first_zero {
-            latency[i] = latency[i].max(latency[i - 1]);
-        }
-        if latency[0] == 0 {
-            latency[0] = 6;
-            for v in &mut latency[1..first_zero] {
-                *v += 6;
+            let first_zero = latency
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, v)| **v == 0)
+                .map_or(6, |(i, _)| i);
+            latency[first_zero..].fill(0);
+            for i in 1..first_zero {
+                latency[i] = latency[i].max(latency[i - 1]);
+            }
+            if latency[0] == 0 {
+                latency[0] = 6;
+                for v in &mut latency[1..first_zero] {
+                    *v += 6;
+                }
             }
         }
         let latency_lines = self.lines(*latency.iter().max().unwrap());
@@ -170,10 +187,27 @@ pub(crate) struct Owner<M: DisplayAccess + Clone> {
     frame: u32,
     deadline: u64,
     complete: bool,
+    gen12_latencies: Option<[u16; 6]>,
+    ints: u32,
+    errors: u32,
+    gen12_color: Option<crate::intel_gpu_color::Profile>,
 }
 impl<M: DisplayAccess + Clone> Owner<M> {
     pub(crate) fn reserve(io: M, bar_len: u64) -> Result<Self, FsError> {
-        if !io.access_ok() || io.read32(0x4804) != 4 {
+        Self::reserve_profile(io, bar_len, None)
+    }
+    pub(crate) fn reserve_gen12(io: M, bar_len: u64, latencies: [u16; 6]) -> Result<Self, FsError> {
+        if latencies[0] == 0 {
+            return Err(FsError::Unsupported);
+        }
+        Self::reserve_profile(io, bar_len, Some(latencies))
+    }
+    fn reserve_profile(
+        io: M,
+        bar_len: u64,
+        gen12_latencies: Option<[u16; 6]>,
+    ) -> Result<Self, FsError> {
+        if !io.access_ok() || (gen12_latencies.is_none() && io.read32(0x4804) != 4) {
             return Err(FsError::NoDevice);
         }
         let key = io.ggtt_key().ok_or(FsError::Unsupported)?;
@@ -193,6 +227,11 @@ impl<M: DisplayAccess + Clone> Owner<M> {
                 io.read32(reg(id, 0x38)),
                 io.read32(reg(id, 0x3c)),
             ];
+            // Nonexistent Gen12 ATS status/enables are plain RW bits. Refuse
+            // inherited state rather than copying them into a W1C write.
+            if gen12_latencies.is_some() && io.read32(reg(id, 0x28)) & ((1 << 4) | (1 << 20)) != 0 {
+                return Err(FsError::Unsupported);
+            }
             if values.contains(&u32::MAX)
                 || values[0] & (ENABLE | BUSY) != 0
                 || values[4] & (1 << 23) != 0
@@ -238,7 +277,39 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             frame: 0,
             deadline: 0,
             complete: false,
+            gen12_latencies,
+            gen12_color: None,
+            ints: if gen12_latencies.is_some() {
+                0x0f
+            } else {
+                INTS
+            },
+            errors: if gen12_latencies.is_some() {
+                0x0e
+            } else {
+                ERRORS
+            },
         })
+    }
+    pub(crate) fn qualify_gen12_color(
+        &mut self,
+        profile: crate::intel_gpu_color::Profile,
+    ) -> Result<(), FsError> {
+        if self.gen12_latencies.is_none()
+            || self.armed
+            || profile == crate::intel_gpu_color::Profile::Mtl
+        {
+            return Err(FsError::Unsupported);
+        }
+        self.gen12_color = Some(profile);
+        Ok(())
+    }
+    pub(crate) fn check_gen12_latencies(&self, latencies: [u16; 6]) -> Result<(), FsError> {
+        if self.gen12_latencies == Some(latencies) {
+            Ok(())
+        } else {
+            Err(FsError::NoDevice)
+        }
     }
     pub(crate) fn armed(&self) -> bool {
         self.armed
@@ -281,20 +352,56 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         lut: Option<&[u32]>,
         now: u64,
     ) -> Result<(), FsError> {
+        self.arm_color(timing, registers, lut, None, now)
+    }
+    pub(crate) fn arm_color(
+        &mut self,
+        timing: Timing,
+        registers: &[(u64, u32)],
+        lut: Option<&[u32]>,
+        degamma: Option<&[u32]>,
+        now: u64,
+    ) -> Result<(), FsError> {
         if self.armed {
             return Err(FsError::Busy);
         }
         if !self.io.access_ok() {
             return Err(FsError::NoDevice);
         }
-        let timing_check = timing.check(&self.io);
+        let timing_check = timing.check(&self.io, self.gen12_latencies);
         // An unavailable read is a hard authority/power failure, even when
         // its all-ones value also resembles unsupported live timing flags.
         if !self.io.access_ok() {
             return Err(FsError::NoDevice);
         }
         let dewake = timing_check?;
-        if lut.is_some_and(|lut| ![256, 1024].contains(&lut.len())) {
+        if self.gen12_latencies.is_some()
+            && self.gen12_color.is_none()
+            && (lut.is_some() || degamma.is_some())
+        {
+            return Err(FsError::Unsupported);
+        }
+        if lut.is_some_and(|lut| {
+            ![
+                256,
+                if self.gen12_color == Some(crate::intel_gpu_color::Profile::Display12) {
+                    crate::intel_gpu_color::DISPLAY12_WORDS
+                } else {
+                    1024
+                },
+            ]
+            .contains(&lut.len())
+        }) {
+            return Err(FsError::InvalidData);
+        }
+        if degamma.is_some_and(|lut| {
+            lut.len()
+                != if self.gen12_color == Some(crate::intel_gpu_color::Profile::Display12) {
+                    35
+                } else {
+                    131
+                }
+        }) {
             return Err(FsError::InvalidData);
         }
         for id in 0..2 {
@@ -307,11 +414,35 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         self.saved_imr = self.read(IMR)? & PIPE_BITS;
         let lease = self.lease.as_ref().ok_or(FsError::NoDevice)?;
         self.heads = [lease.start as u32, (lease.start + HALF) as u32];
-        self.chain = lut.is_some();
+        self.chain = lut.is_some() || degamma.is_some();
         let mut sub = Commands(Vec::new());
+        if let Some(lut) = degamma {
+            sub.write(0x4a484, 0);
+            sub.write(0x4a484, 1 << 10);
+            sub.emit(lut.len() as u32, (9 << 24) | 0x4a488);
+            sub.0.extend_from_slice(lut);
+            sub.write(0x4a484, 0);
+        }
         if let Some(lut) = lut {
             sub.write(0x4a400, 0);
-            if lut.len() == 256 {
+            if lut.len() == crate::intel_gpu_color::DISPLAY12_WORDS {
+                sub.write(0x4a408, 0);
+                sub.write(0x4a408, 1 << 15);
+                sub.emit(18, (9 << 24) | 0x4a40c);
+                sub.0.extend_from_slice(&lut[..18]);
+                sub.write(0x4a408, 0);
+                sub.write(0x4a400, 0);
+                sub.write(0x4a400, 1 << 15);
+                sub.emit(1024, (9 << 24) | 0x4a404);
+                sub.0.extend_from_slice(&lut[18..1042]);
+                sub.write(0x4a400, 0);
+                for (r, v) in [0x4a410, 0x4a414, 0x4a418].into_iter().zip(&lut[1042..]) {
+                    sub.write(r, *v);
+                }
+                for r in [0x4a420, 0x4a424, 0x4a428, 0x4a430, 0x4a434, 0x4a438] {
+                    sub.write(r, 1 << 16);
+                }
+            } else if lut.len() == 256 {
                 // intel_color.c::ilk_load_lut_8: palette anti-collision may
                 // drop a posted write, so issue each LGC_PALETTE write twice.
                 // Non-posted accesses would stall competing CPU MMIO instead.
@@ -328,6 +459,8 @@ impl<M: DisplayAccess + Clone> Owner<M> {
                     sub.write(r, 1 << 16);
                 }
             }
+        }
+        if self.chain {
             sub.emit(1, 2 << 24); // +1us, mode's delayed-vblank interval is zero
             sub.emit(0, 7 << 24);
             sub.finish();
@@ -339,7 +472,15 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             !cursor_watermark(r)
                 && !matches!(
                     r,
-                    0x49028 | 0x4a480 | 0x701a4 | 0x7019c | 0x70080 | 0x70088 | 0x70084
+                    0x49028
+                        | 0x4a480
+                        | 0x701a4
+                        | 0x70180
+                        | 0x7019c
+                        | 0x700a0
+                        | 0x70080
+                        | 0x70088
+                        | 0x70084
                 )
         }) {
             main.write(r, v);
@@ -357,10 +498,15 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             main.write(r, v);
         }
         // intel_atomic_dsb_finish: color arm precedes plane arm within the
-        // same evaded safe window. skl_plane_update_arm emits the linear
+        // same evaded safe window. skl_plane_update_arm emits the source
         // source OFFSET before SURF; it must not escape into the earlier
         // non-arming coefficient prefix when the viewport changes.
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x701a4) {
+            main.write(r, v);
+        }
+        // skl_plane_update_arm: enabled primary CTL immediately precedes
+        // SURF; it must stay in the same evaded arm window as OFFSET.
+        for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x70180) {
             main.write(r, v);
         }
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x7019c) {
@@ -373,7 +519,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             main.write(r, v);
         }
         // CTL may arm cursor enable; POS/BASE retain the source ordering.
-        for register in [0x70080, 0x70088, 0x70084] {
+        for register in [0x700a0, 0x70080, 0x70088, 0x70084] {
             for &(r, v) in registers.iter().filter(|&&(r, _)| r == register) {
                 main.write(r, v);
             }
@@ -381,7 +527,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if self.chain {
             main.write(reg(1, 8), ENABLE | (1 << 28));
             main.write(reg(1, 0xf0), 0);
-            main.write(reg(1, 0x28), INTS | (INTS << 16));
+            main.write(reg(1, 0x28), self.ints | (self.ints << 16));
             main.write(reg(1, 0x38), ENABLE | timing.hw(dewake));
             main.write(reg(1, 0), self.heads[1]);
             main.write(reg(1, 4), self.tails[1]);
@@ -406,13 +552,23 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if !object.publish_for_device() {
             return Err(FsError::NoDevice);
         }
-        let pages: Vec<u64> = object.pages().collect();
+        // Validate every DMA address before the first mapping mutation.
+        let format = if self.gen12_latencies.is_some() {
+            PteFormat::Gen12
+        } else {
+            PteFormat::XeLpg
+        };
+        let pat = if self.gen12_latencies.is_some() { 0 } else { 1 };
+        let pages: Vec<u64> = object
+            .pages()
+            .map(|phys| {
+                crate::intel_gpu_gtt::encode_display_pte(format, phys, pat)
+                    .map_err(|_| FsError::InvalidData)
+            })
+            .collect::<Result<_, _>>()?;
         // From the first PTE write every failure retains the BO and lease.
         self.installed = true;
-        for (page, phys) in pages.into_iter().enumerate() {
-            let pte = PteFormat::XeLpg
-                .encode_ggtt(phys, 1)
-                .map_err(|_| FsError::InvalidData)?;
+        for (page, pte) in pages.into_iter().enumerate() {
             let r = GGTT_ARRAY_BASE + (lease.start / PAGE + page as u64) * 8;
             if self.read(r)? != 0 && self.read(r)? != pte as u32 {
                 return Err(FsError::NoDevice);
@@ -427,8 +583,8 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         self.checked(IMR, self.read(IMR)? | PIPE_BITS)?;
         self.checked(IER, self.read(IER)? | PIPE_BITS)?;
         for id in 0..2 {
-            self.write(reg(id, 0x28), INTS | (INTS << 16))?;
-            if self.read(reg(id, 0x28))? & INTS != 0 {
+            self.write(reg(id, 0x28), self.ints | (self.ints << 16))?;
+            if self.read(reg(id, 0x28))? & self.ints != 0 {
                 return Err(FsError::NoDevice);
             }
         }
@@ -469,7 +625,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             return Err(FsError::Busy);
         }
         for id in 0..=usize::from(self.chain) {
-            if self.read(reg(id, 0x28))? & ERRORS != 0 {
+            if self.read(reg(id, 0x28))? & self.errors != 0 {
                 return Err(FsError::NoDevice);
             }
         }
@@ -528,7 +684,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             for id in 0..2 {
                 self.checked(reg(id, 8), self.saved[id][0])?;
                 self.checked(reg(id, 0xf0), self.saved[id][1])?;
-                self.write(reg(id, 0x28), INTS | self.saved[id][2])?;
+                self.write(reg(id, 0x28), self.ints | self.saved[id][2])?;
                 self.checked(reg(id, 0x38), self.saved[id][3])?;
                 self.checked(reg(id, 0x3c), self.saved[id][4])?;
             }

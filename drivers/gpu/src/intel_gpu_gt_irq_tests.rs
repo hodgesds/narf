@@ -21,6 +21,7 @@ struct Registers {
     enable_fail: bool,
     disable_fail: bool,
     reject: Option<u64>,
+    no_tile: bool,
 }
 #[derive(Clone)]
 struct Window(Arc<IrqSafeSpinLock<Registers>>);
@@ -51,7 +52,10 @@ impl Window {
         .collect();
         Self(Arc::new(IrqSafeSpinLock::new(Registers {
             words,
-            writes: Vec::new(),
+            // The actual hard-IRQ dispatcher calls this register model.
+            // Reserve its bounded trace before interrupt context; recording
+            // the posted master-mask write must never grow a vector there.
+            writes: Vec::with_capacity(256),
             events: Vec::new(),
             vector: None,
             identity: 0,
@@ -61,6 +65,7 @@ impl Window {
             enable_fail: false,
             disable_fail: false,
             reject: None,
+            no_tile: false,
         })))
     }
     fn raise(&self, bits: u32) {
@@ -68,7 +73,9 @@ impl Window {
             let mut r = self.0.lock();
             *r.words.get_mut(&0x190018).unwrap() |= bits;
             *r.words.get_mut(&0x190010).unwrap() |= 1;
-            *r.words.get_mut(&0x190008).unwrap() |= 1;
+            if !r.no_tile {
+                *r.words.get_mut(&0x190008).unwrap() |= 1;
+            }
             r.vector
         };
         narf_interrupts::dispatch::on_irq(vector.expect("installed MSI route"));
@@ -77,16 +84,24 @@ impl Window {
 impl MmioWindow for Window {
     fn read32(&self, offset: u64) -> u32 {
         let r = self.0.lock();
+        assert!(
+            !(r.no_tile && offset == 0x190008),
+            "Gen12 has no tile interrupt register"
+        );
         if r.unavailable {
             return u32::MAX;
         }
-        if offset == 0x190060 {
+        if matches!(offset, 0x190060 | 0x190064) {
             return if r.delay { 0 } else { r.identity };
         }
         *r.words.get(&offset).unwrap_or(&0)
     }
     fn write32(&self, offset: u64, value: u32) {
         let mut r = self.0.lock();
+        assert!(
+            !(r.no_tile && offset == 0x190008),
+            "Gen12 has no tile interrupt register"
+        );
         r.writes.push((offset, value));
         if r.unavailable || r.reject == Some(offset) {
             return;
@@ -97,7 +112,7 @@ impl MmioWindow for Window {
                 r.words
                     .insert(offset, (old & !value & 0x7fffffff) | (value & 0x80000000));
             }
-            0x190018 => {
+            0x190018 | 0x19001c => {
                 assert!(r.identity == 0, "bank ack preceded identity ack");
                 let old = *r.words.get(&offset).unwrap_or(&0);
                 r.words.insert(offset, old & !value);
@@ -112,7 +127,21 @@ impl MmioWindow for Window {
                     0x40 => 0x80250001,
                     0x80 => 0x80350001,       // valid COMPUTE0 MI_USER_INTERRUPT
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
+                    0x40000000 => 0x80344000, // valid OTHER3 (GSC HECI2) GSC_IRQ_INTF(1)
+                    0x80000000 => 0x80640021, // valid OTHER6 (GSCCS0) ER_COMPLETE | USER
                     _ => panic!("selected an unowned interrupt"),
+                };
+            }
+            0x190064 => {
+                assert_eq!(value, r.identity);
+                r.identity = 0;
+            }
+            0x190074 => {
+                r.identity = match value {
+                    2 => 0x80110001,
+                    0x40 => 0x80610010,
+                    0x20000000 => 0x80220001,
+                    _ => panic!("unowned media selector"),
                 };
             }
             0x190060 => {
@@ -141,7 +170,10 @@ impl MessageRoute for Route {
         let mut r = self.0 .0.lock();
         let vector = r.vector.unwrap();
         assert!(narf_interrupts::dispatch::installed_handler_names(vector).contains(&"intel-gt"));
-        assert_eq!(r.words[&0x190008] & 0x80000000, 0);
+        assert_eq!(
+            r.words[&if r.no_tile { 0x190010 } else { 0x190008 }] & 0x80000000,
+            0
+        );
         r.events.push("enable");
         if r.enable_fail {
             Err(IrqError::Route)
@@ -153,7 +185,7 @@ impl MessageRoute for Route {
         let mut r = self.0 .0.lock();
         if !r.unavailable {
             assert_eq!(
-                r.words[&0x190008] & 0x80000000,
+                r.words[&if r.no_tile { 0x190010 } else { 0x190008 }] & 0x80000000,
                 0,
                 "MSI disabled before device mask"
             );
@@ -293,7 +325,7 @@ kernel_test_in!(
 fn smoke_gt_irq_multi_compute_physical_masks_and_foreign_identity() -> TestResult {
     for engines in [
         EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs1, Engine::Ccs3]),
-        EngineSet::of(&Engine::ALL),
+        EngineSet::of(&Engine::GRAPHICS),
     ] {
         let w = Window::new();
         let saved = w.0.lock().words.clone();
@@ -544,4 +576,481 @@ fn smoke_gt_irq_uncertain_teardown_keeps_vector_and_cookie() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gt_irq",
     smoke_gt_irq_uncertain_teardown_keeps_vector_and_cookie
+);
+
+// Xe-LP xelp_irq_handler has a graphics master and no master-tile register.
+// The model traps any tile access; real dispatch still owns the MSI cookie.
+fn gen12_window() -> Window {
+    let w = Window::new();
+    w.0.lock().no_tile = true;
+    w
+}
+fn gen12_irq(w: &Window) -> Delivery<Window, Route> {
+    Delivery::install_hierarchy(
+        w.clone(),
+        Route(w.clone()),
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]),
+        false,
+    )
+    .unwrap()
+}
+fn smoke_gen12_irq_real_dispatch_masks_graphics_until_all_identities_retire() -> TestResult {
+    let w = gen12_window();
+    let saved = w.0.lock().words.clone();
+    let irq = gen12_irq(&w);
+    let vector = irq.vector();
+    assert_eq!(irq.service(0), Ok(false));
+    w.raise(0x02008001);
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    assert_eq!(irq.service(10), Ok(true));
+    w.0.lock().delay = true;
+    assert_eq!(irq.service(20), Ok(true));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    w.0.lock().delay = false;
+    assert_eq!(irq.service(30), Ok(true));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    assert_eq!(irq.service(40), Ok(true));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    assert_eq!(irq.service(50), Ok(false));
+    assert_eq!(w.read32(0x190010), 0x80000000);
+    assert_eq!(w.read32(0x190018), 0);
+    drop(irq);
+    assert!(!narf_interrupts::dispatch::installed_handler_names(vector).contains(&"intel-gt"));
+    let r = w.0.lock();
+    for register in [
+        0x190010, 0x190030, 0x190090, 0x1900a0, 0x190038, 0x1900e8, 0x20a8, 0x220a8,
+    ] {
+        assert_eq!(r.words[&register], saved[&register]);
+    }
+    assert!(!r.writes.iter().any(|(reg, _)| *reg == 0x190008));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gen12_irq_real_dispatch_masks_graphics_until_all_identities_retire
+);
+
+fn smoke_gen12_irq_refuses_inherited_master_and_unowned_sources() -> TestResult {
+    for inherited in [0x80000000, 0x01000000] {
+        let w = gen12_window();
+        w.0.lock().words.insert(0x190010, inherited);
+        assert!(matches!(
+            Controller::with_hierarchy(
+                w.clone(),
+                EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]),
+                false
+            ),
+            Err(IrqError::Conflict)
+        ));
+        assert!(w.0.lock().writes.is_empty());
+    }
+    let w = gen12_window();
+    assert!(matches!(
+        Controller::with_hierarchy(
+            w.clone(),
+            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
+            false
+        ),
+        Err(IrqError::Identity)
+    ));
+    assert!(w.0.lock().writes.is_empty());
+    let irq = gen12_irq(&w);
+    assert_eq!(irq.service(0), Ok(false));
+    w.0.lock().words.insert(0x190010, 0x81000000);
+    assert_eq!(irq.service(1), Err(IrqError::Conflict));
+    assert_eq!(w.read32(0x190010), 0x01000000);
+    drop(irq);
+    let w = gen12_window();
+    let irq = gen12_irq(&w);
+    irq.service(0).unwrap();
+    w.raise(2);
+    assert_eq!(irq.service(1), Err(IrqError::Conflict));
+    assert_eq!(w.read32(0x190018), 2);
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gen12_irq_refuses_inherited_master_and_unowned_sources
+);
+
+fn smoke_gen12_irq_identity_deadline_and_rearm_failure_keep_master_masked() -> TestResult {
+    let w = gen12_window();
+    let irq = gen12_irq(&w);
+    irq.service(0).unwrap();
+    w.raise(1);
+    w.0.lock().delay = true;
+    assert_eq!(irq.service(10), Ok(true));
+    assert_eq!(irq.service(100009), Ok(true));
+    assert_eq!(irq.service(100010), Err(IrqError::Timeout));
+    assert_eq!(w.read32(0x190018), 1);
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    drop(irq);
+    let w = gen12_window();
+    let irq = gen12_irq(&w);
+    w.0.lock().reject = Some(0x190010);
+    assert_eq!(irq.service(0), Err(IrqError::Route));
+    assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gen12_irq_identity_deadline_and_rearm_failure_keep_master_masked
+);
+
+fn smoke_gen12_media_irq_bank_sparse_routes_and_owned_restore() -> TestResult {
+    let w = Window::new();
+    {
+        let mut r = w.0.lock();
+        r.no_tile = true;
+        r.words.insert(0x190034, 0x22224444);
+        for reg in [0x1900a8, 0x1900ac, 0x1900b0, 0x1900b4, 0x1900d0, 0x1900d4] {
+            r.words.insert(reg, 0xa5a55a5a);
+        }
+        for base in [0x1c4000, 0x1f0000, 0x1e8000] {
+            r.words.insert(base + 0xa8, 0xffffaaaa);
+        }
+    }
+    let before = w.0.lock().words.clone();
+    let set = EngineSet::of(&[
+        Engine::Rcs0,
+        Engine::Bcs0,
+        Engine::Vcs1,
+        Engine::Vcs6,
+        Engine::Vecs2,
+    ]);
+    let delivery = Delivery::install_hierarchy(w.clone(), Route(w.clone()), set, false).unwrap();
+    assert_eq!(w.read32(0x190034), 0x22334455);
+    assert_eq!(w.read32(0x1900a8), 0xa5a55a4a); // odd VCS1 low half
+    assert_eq!(w.read32(0x1900b4), 0xa5a45a5a); // even VCS6 high half
+    assert_eq!(w.read32(0x1900d4), 0xa5a45a5a); // even VECS2 high half
+    for reg in [0x1900ac, 0x1900b0, 0x1900d0] {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190018, 0x02000000);
+        r.words.insert(0x19001c, 0x20000042);
+        r.words.insert(0x190010, 3);
+    }
+    delivery.controller.hard_irq();
+    for now in 0..10 {
+        if !delivery.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(w.read32(0x19001c), 0);
+    assert_eq!(w.read32(0x190010), 0x80000000);
+    let writes = w.0.lock().writes.clone();
+    let media: Vec<_> = writes
+        .iter()
+        .copied()
+        .filter(|(reg, _)| matches!(*reg, 0x190074 | 0x190064 | 0x19001c))
+        .collect();
+    assert_eq!(
+        media,
+        [
+            (0x190074, 2),
+            (0x190064, 0x80110001),
+            (0x19001c, 2),
+            (0x190074, 0x40),
+            (0x190064, 0x80610010),
+            (0x19001c, 0x40),
+            (0x190074, 0x20000000),
+            (0x190064, 0x80220001),
+            (0x19001c, 0x20000000)
+        ]
+    );
+    drop(delivery);
+    for reg in [
+        0x190034, 0x1900a8, 0x1900b4, 0x1900d4, 0x1c40a8, 0x1f00a8, 0x1e80a8,
+    ] {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen12",
+    smoke_gen12_media_irq_bank_sparse_routes_and_owned_restore
+);
+
+fn smoke_gen12_media_irq_foreign_fused_source_and_identity_timeout_fail_closed() -> TestResult {
+    for timeout in [false, true] {
+        let w = Window::new();
+        w.0.lock().no_tile = true;
+        let set = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Vcs1]);
+        let delivery =
+            Delivery::install_hierarchy(w.clone(), Route(w.clone()), set, false).unwrap();
+        {
+            let mut r = w.0.lock();
+            r.words.insert(0x190010, 2);
+            r.words.insert(0x19001c, if timeout { 2 } else { 1 });
+            r.delay = timeout;
+        }
+        delivery.controller.hard_irq();
+        if timeout {
+            assert_eq!(delivery.service(0), Ok(true));
+            assert_eq!(delivery.service(100_000), Err(IrqError::Timeout));
+        } else {
+            assert_eq!(delivery.service(0), Err(IrqError::Conflict));
+        }
+        assert_eq!(w.read32(0x190010) & 0x80000000, 0);
+        assert!(!w.0.lock().writes.iter().any(|(reg, _)| *reg == 0x19001c));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen12",
+    smoke_gen12_media_irq_foreign_fused_source_and_identity_timeout_fail_closed
+);
+
+/// MTL/Arrow: the standalone media GT's VCS/VECS join GT0's tiled delivery
+/// only after publication (xe_irq.c media-GT VCS_VECS_INTR_ENABLE and
+/// VCSn/VECSn masks), decode in bank 1 as VIDEO_DECODE/VIDEO_ENHANCE, keep
+/// GT0's halves untouched and restore exactly their own bits when unrouted.
+fn smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits() -> TestResult {
+    let w = Window::new();
+    let media_regs = [
+        0x190034u64,
+        0x1900a8,
+        0x1900ac,
+        0x1900b0,
+        0x1900b4,
+        0x1900d0,
+        0x1900d4,
+    ];
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190034, 0x22224444);
+        for reg in &media_regs[1..] {
+            r.words.insert(*reg, 0xa5a55a5a);
+        }
+        for base in [0x1c4000, 0x1f0000, 0x1e8000] {
+            r.words.insert(base + 0xa8, 0xffffaaab);
+        }
+    }
+    let before = w.0.lock().words.clone();
+    let irq = install(&w);
+    let vector = irq.vector();
+    assert_eq!(irq.service(0), Ok(false));
+    // GT0 activation never touches a media source.
+    for reg in media_regs {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    let gt0 = [
+        0x190030u64,
+        0x190090,
+        0x1900a0,
+        0x190038,
+        0x1900e8,
+        0x20a8,
+        0x220a8,
+    ]
+    .map(|reg| (reg, w.read32(reg)));
+    let media = EngineSet::of(&[Engine::Vcs1, Engine::Vcs6, Engine::Vecs2]);
+    assert_eq!(
+        irq.route_media(EngineSet::of(&[Engine::Rcs0])),
+        Err(IrqError::Identity)
+    );
+    assert_eq!(
+        irq.route_media(EngineSet::default()),
+        Err(IrqError::Identity)
+    );
+    irq.route_media(media).unwrap();
+    assert_eq!(irq.route_media(media), Err(IrqError::Identity));
+    assert_eq!(w.read32(0x190034), 0x22334455);
+    assert_eq!(w.read32(0x1900a8), 0xa5a55a4a); // odd VCS1 low half
+    assert_eq!(w.read32(0x1900b4), 0xa5a45a5a); // even VCS6 high half
+    assert_eq!(w.read32(0x1900d4), 0xa5a45a5a); // even VECS2 high half
+    for reg in [0x1900ac, 0x1900b0, 0x1900d0] {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    for base in [0x1c4000u64, 0x1f0000, 0x1e8000] {
+        assert_eq!(w.read32(base + 0xa8), 0xffffaaab & !0x11);
+    }
+    for (reg, value) in gt0 {
+        assert_eq!(w.read32(reg), value, "GT0 half changed by media routing");
+    }
+    // Bank-1 media causes through the real dispatcher and identity decoder.
+    let raise_media = |bits: u32| {
+        {
+            let mut r = w.0.lock();
+            r.words.insert(0x19001c, bits);
+            *r.words.get_mut(&0x190010).unwrap() |= 2;
+            *r.words.get_mut(&0x190008).unwrap() |= 1;
+        }
+        narf_interrupts::dispatch::on_irq(vector);
+    };
+    raise_media(0x20000042);
+    assert_eq!(w.read32(0x190008) & 0x80000000, 0);
+    for now in 1..20 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x19001c), 0);
+    assert_eq!(w.read32(0x190008) & 0x80000000, 0x80000000);
+    let selected: Vec<_> =
+        w.0.lock()
+            .writes
+            .iter()
+            .copied()
+            .filter(|(reg, _)| matches!(*reg, 0x190074 | 0x190064 | 0x19001c))
+            .collect();
+    assert_eq!(
+        selected,
+        [
+            (0x190074, 2),
+            (0x190064, 0x80110001),
+            (0x19001c, 2),
+            (0x190074, 0x40),
+            (0x190064, 0x80610010),
+            (0x19001c, 0x40),
+            (0x190074, 0x20000000),
+            (0x190064, 0x80220001),
+            (0x19001c, 0x20000000)
+        ]
+    );
+    // Unrouting masks the sources again; a latched identity stays owned.
+    irq.unroute_media();
+    for reg in media_regs {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    for base in [0x1c4000u64, 0x1f0000, 0x1e8000] {
+        assert_eq!(w.read32(base + 0xa8), before[&(base + 0xa8)]);
+    }
+    raise_media(2);
+    for now in 30..40 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x19001c), 0);
+    // Re-publication of the same engines routes them again.
+    irq.route_media(media).unwrap();
+    assert_eq!(w.read32(0x190034), 0x22334455);
+    drop(irq);
+    for reg in media_regs {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    for (reg, _) in gt0 {
+        assert_eq!(w.read32(reg), before[&reg]);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_mtl_media_gt_irq_routes_published_engines_and_restores_owned_bits
+);
+
+/// MTL/Arrow media GT with GSCCS0: xe_irq.c::xe_irq_enable_hwe's
+/// GUNIT_GSC_INTR_ENABLE / _MASK and HECI2_RSVD_INTR_MASK values, bank-0
+/// INTR_GSC (31) and HECI_2 (30) identities decoded as class OTHER instances
+/// 6 and 3 into latched GSC events, and gt_irq_reset's 0 / ~0 / ~0 on
+/// unrouting. GT0's sources are untouched throughout.
+fn smoke_mtl_media_gt_gsc_irq_enables_decodes_and_resets() -> TestResult {
+    let w = Window::new();
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190044, 0x0000_1234);
+        r.words.insert(0x1900f4, 0x5678_0000);
+        r.words.insert(0x1900e4, 0x0000_9abc);
+    }
+    let irq = install(&w);
+    assert_eq!(irq.service(0), Ok(false));
+    // GT0 activation never touches a GSC source.
+    assert_eq!(
+        [0x190044u64, 0x1900f4, 0x1900e4].map(|reg| w.read32(reg)),
+        [0x1234, 0x5678_0000, 0x9abc]
+    );
+    let gt0 = [
+        0x190030u64,
+        0x190090,
+        0x1900a0,
+        0x190038,
+        0x1900e8,
+        0x20a8,
+        0x220a8,
+    ]
+    .map(|reg| (reg, w.read32(reg)));
+    assert!(!irq.gsc_routed());
+    irq.route_gsc().unwrap();
+    assert!(irq.gsc_routed());
+    assert_eq!(irq.route_gsc(), Err(IrqError::Identity));
+    // GSCCS MI_USER_INTERRUPT | FLUSH_COMPLETE | GSC_ER_COMPLETE plus HECI2
+    // GSC_IRQ_INTF(1); only the GSCCS causes unmasked in GUNIT_GSC_INTR_MASK;
+    // HECI2's own mask unmasks GSC_IRQ_INTF(1) in its ENGINE1 half.
+    assert_eq!(w.read32(0x190044), 0x0000_4031);
+    assert_eq!(w.read32(0x1900f4), !0x31);
+    assert_eq!(w.read32(0x1900e4), !0x4000_0000);
+    for (reg, value) in gt0 {
+        assert_eq!(w.read32(reg), value, "GT0 source changed by GSC routing");
+    }
+    let from = w.0.lock().writes.len();
+    w.raise(0xc000_0000);
+    for now in 1..20 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(
+        irq.take_gsc_events(),
+        GSC_EVENT_ER_COMPLETE | GSC_EVENT_PROXY
+    );
+    assert_eq!(irq.take_gsc_events(), 0);
+    let selected: Vec<_> = w.0.lock().writes[from..]
+        .iter()
+        .copied()
+        .filter(|(reg, _)| matches!(*reg, 0x190070 | 0x190060 | 0x190018))
+        .collect();
+    assert_eq!(
+        selected,
+        [
+            (0x190070, 0x4000_0000),
+            (0x190060, 0x8034_4000),
+            (0x190018, 0x4000_0000),
+            (0x190070, 0x8000_0000),
+            (0x190060, 0x8064_0021),
+            (0x190018, 0x8000_0000),
+        ]
+    );
+    // gt_irq_reset: sources off, every cause masked; decoding ownership stays
+    // so a late latched identity is still acknowledged.
+    irq.unroute_gsc();
+    assert!(!irq.gsc_routed());
+    assert_eq!(
+        [0x190044u64, 0x1900f4, 0x1900e4].map(|reg| w.read32(reg)),
+        [0, u32::MAX, u32::MAX]
+    );
+    w.raise(0x8000_0000);
+    for now in 20..40 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(irq.take_gsc_events(), GSC_EVENT_ER_COMPLETE);
+    // Routing again after unrouting is allowed; teardown resets the GSC
+    // registers exactly as gt_irq_reset.
+    irq.route_gsc().unwrap();
+    let writes = w.0.lock().writes.len();
+    drop(irq);
+    assert_eq!(
+        [0x190044u64, 0x1900f4, 0x1900e4].map(|reg| w.read32(reg)),
+        [0, u32::MAX, u32::MAX]
+    );
+    assert!(w.0.lock().writes[writes..].contains(&(0x190044, 0)));
+    // check_gsc_availability's pair leaves HECI2's mask alone.
+    let other = Window::new();
+    other.0.lock().words.insert(0x1900e4, 0x77);
+    crate::intel_gpu_gt::media::gsc::disable_unavailable_interrupts(&other);
+    assert_eq!(other.0.lock().writes, [(0x190044, 0), (0x1900f4, u32::MAX)]);
+    assert_eq!(other.read32(0x1900e4), 0x77);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_mtl_media_gt_gsc_irq_enables_decodes_and_resets
 );

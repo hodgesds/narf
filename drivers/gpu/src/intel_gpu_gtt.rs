@@ -131,6 +131,9 @@ pub const PTE_PRESENT: u64 = 1 << 0;
 /// Read/write bit — display plane scanout sets this clear (RO);
 /// 3D/compute engines may set it.
 pub const PTE_RW: u64 = 1 << 1;
+/// regs/xe_gtt_defs.h XE_GGTT_PTE_DM: the GGTT entry maps device memory
+/// (stolen DSM on graphics >= 12.70), shares bit 1 with the PPGTT RW bit.
+pub const PTE_DM: u64 = 1 << 1;
 /// PPGTT PAT index bit 0 (Gen12+).
 pub const PTE_PAT0: u64 = 1 << 3;
 /// PPGTT PAT index bit 1 (Gen12+).
@@ -139,6 +142,8 @@ pub const PTE_PAT1: u64 = 1 << 4;
 pub const PTE_PAT2: u64 = 1 << 7;
 /// PPGTT PAT index bit 3 (Meteor Lake / Xe-LPG).
 pub const PTE_PAT3: u64 = 1 << 62;
+/// Xe2 PPGTT PAT index bit 4 (MIT xe_gtt_defs.h: XELPG_PPGTT_PTE_PAT4).
+pub const PTE_PAT4: u64 = 1 << 61;
 /// Conservative common system-memory address field (bits 45:12).
 /// Source: MIT i915 gt/intel_gtt.h GEN12_GGTT_PTE_ADDR_MASK.
 pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
@@ -149,6 +154,8 @@ pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
 pub enum PteFormat {
     Gen12,
     XeLpg,
+    /// Xe2 five-bit PPGTT PAT; GGTT still has only two PAT bits.
+    Xe2,
 }
 
 impl PteFormat {
@@ -159,9 +166,24 @@ impl PteFormat {
         }
         let pat = match self {
             Self::Gen12 => 0, // Gen8/Gen12 GGTT has no PAT index fields.
-            Self::XeLpg => ((pat_index as u64 & 1) << 52) | ((pat_index as u64 & 2) << 52),
+            Self::XeLpg | Self::Xe2 => {
+                ((pat_index as u64 & 1) << 52) | ((pat_index as u64 & 2) << 52)
+            }
         };
         Ok(phys | PTE_PRESENT | pat)
+    }
+
+    /// xe_ggtt.c::xelpg_ggtt_pte_flags for a stolen BO on graphics >= 12.70
+    /// (xe_bo_is_stolen_devmem): XE_PAGE_PRESENT | XE_GGTT_PTE_DM, the two
+    /// GGTT PAT bits, and as address the device-memory offset that
+    /// xe_ggtt_map_bo prepends (vram_region_gpu_offset: the stolen manager's
+    /// `stolen_base`, 8 MiB above GSMBASE, plus the DSM offset). Only the
+    /// GSC private object is mapped this way; earlier formats have no DM bit.
+    pub fn encode_ggtt_stolen(self, gsm_offset: u64, pat_index: u8) -> Result<u64, GttError> {
+        if self == Self::Gen12 {
+            return Err(GttError::InvalidPatIndex);
+        }
+        Ok(self.encode_ggtt(gsm_offset, pat_index)? | PTE_DM)
     }
 
     pub fn encode_ppgtt(self, phys: u64, pat_index: u8, writable: bool) -> Result<u64, GttError> {
@@ -169,6 +191,7 @@ impl PteFormat {
         let max = match self {
             Self::Gen12 => 7,
             Self::XeLpg => 15,
+            Self::Xe2 => 31,
         };
         if pat_index > max {
             return Err(GttError::InvalidPatIndex);
@@ -176,7 +199,8 @@ impl PteFormat {
         let pat = ((pat_index as u64 & 1) << 3)
             | ((pat_index as u64 & 2) << 3)
             | ((pat_index as u64 & 4) << 5)
-            | ((pat_index as u64 & 8) << 59);
+            | ((pat_index as u64 & 8) << 59)
+            | ((pat_index as u64 & 16) << 57);
         Ok(phys | PTE_PRESENT | if writable { PTE_RW } else { 0 } | pat)
     }
 }
@@ -237,6 +261,16 @@ pub enum GttError {
     OutOfBounds,
     /// PAT index cannot be represented by this generation/table format.
     InvalidPatIndex,
+}
+
+/// Display-only address policy. Gen12 integrated scanout shares the PCI
+/// function's39-bit DMA mask (xe_pci.c / xe_set_dma_info). The common codec
+/// stays wider for DG2 execution; this helper never admits Arc display.
+pub(crate) fn encode_display_pte(format: PteFormat, phys: u64, pat: u8) -> Result<u64, GttError> {
+    if format == PteFormat::Gen12 && phys >> 39 != 0 {
+        return Err(GttError::PhysOutOfRange);
+    }
+    format.encode_ggtt(phys, pat)
 }
 
 /// Gen12 system-memory GGTT entry. `pat` is ignored because this format
@@ -534,9 +568,22 @@ pub fn alloc_contiguous_scanout_with_format(
     };
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
+    // Validate the entire contiguous extent before exposing its first PTE.
+    // On refusal the old console window remains unchanged.
+    let preflight = base
+        .checked_add((pages - 1) * GTT_PAGE_SIZE)
+        .ok_or(GttError::PhysOutOfRange)
+        .and_then(|last| {
+            encode_display_pte(format, base, pat_index)?;
+            encode_display_pte(format, last, pat_index)
+        });
+    if let Err(error) = preflight {
+        narf_memory::frame::free_pages(head, order);
+        return Err(error);
+    }
     for i in 0..pages {
         let phys = base + i * GTT_PAGE_SIZE;
-        let pte = match format.encode_ggtt(phys, pat_index) {
+        let pte = match encode_display_pte(format, phys, pat_index) {
             Ok(p) => p,
             Err(e) => {
                 narf_memory::frame::free_pages(head, order);
@@ -578,6 +625,34 @@ pub fn free_contiguous_scanout(alloc: &ContiguousScanout) {
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_gen12_display_dma_mask_is_independent_of_common_pte_width() -> TestResult {
+        assert_eq!(
+            encode_display_pte(PteFormat::Gen12, 0x7ffffff000, 0),
+            Ok(0x7ffffff001)
+        );
+        assert_eq!(
+            encode_display_pte(PteFormat::Gen12, 0x8000000000, 0),
+            Err(GttError::PhysOutOfRange)
+        );
+        assert_eq!(
+            encode_display_pte(PteFormat::Gen12, 0x7ffffff001, 0),
+            Err(GttError::UnalignedPhys)
+        );
+        assert_eq!(
+            PteFormat::Gen12.encode_ggtt(0x8000000000, 0),
+            Ok(0x8000000001)
+        );
+        assert_eq!(
+            encode_display_pte(PteFormat::XeLpg, 0x8000000000, 3),
+            Ok(0x0030008000000001)
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gtt",
+        smoke_gen12_display_dma_mask_is_independent_of_common_pte_width
+    );
 
     fn smoke_scanout_order_sizing() -> TestResult {
         if scanout_order_for(4096) != Some(0) {

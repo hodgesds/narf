@@ -23,12 +23,108 @@ const MAX_COPY: usize = 1024 * 1024;
 const MAX_QUERIES: usize = 64;
 const MAX_CONTEXTS: usize = 64;
 const MAX_VMS: usize = 64;
-const MAX_EXTENSIONS: usize = 16;
+/// The proto-context's key inside CREATE's private, unshared Namespaces.
+/// It is never a visible name: publication re-keys it to the reserved ID.
+const PROTO_NAME: u32 = u32::MAX;
+/// include/uapi/linux/capability.h.
+const CAP_SYS_ADMIN: u32 = 21;
+const CAP_SYS_NICE: u32 = 23;
+/// I915_SCHEDULER_CAP_ENABLED, _PRIORITY and _PREEMPTION.
+const SCHEDULER_CAP_ENABLED: i32 = 1 << 0;
+const SCHEDULER_CAP_PRIORITY: i32 = 1 << 1;
+const SCHEDULER_CAP_PREEMPTION: i32 = 1 << 2;
+/// I915_CONTEXT_MAX_USER_PRIORITY; I915_CONTEXT_MIN_USER_PRIORITY is its
+/// negation and I915_CONTEXT_DEFAULT_PRIORITY is 0.
+const CONTEXT_MAX_USER_PRIORITY: i64 = 1023;
+
+/// i915->caps.scheduler, as GETPARAM HAS_SCHEDULER reports it and as
+/// validate_priority and proto_context_set_persistence test it. Linux's
+/// intel_engine_user.c::set_scheduler_caps gives every GuC device ENABLED
+/// and PRIORITY (sched_engine->schedule), and PREEMPTION, ENGINE_BUSY_STATS
+/// and STATIC_PRIORITY_MAP from its engine flags; with no uabi engine the
+/// caps are 0. NARF advertises ENABLED only while a live owner admits
+/// submission. PRIORITY stays clear until a context priority reaches the
+/// GuC registration (map_i915_prio_to_guc_prio): an unsupported capability
+/// stays unadvertised, so validate_priority returns -ENODEV for every
+/// PRIORITY set, exactly as Linux does on a device without CAP_PRIORITY.
+/// PREEMPTION, BUSY_STATS and STATIC_PRIORITY_MAP stay clear because no
+/// preempt-to-idle cancellation, busy-stat or priority-map contract exists.
+fn scheduler_caps(info: &DeviceInfo) -> i32 {
+    if info.submission_ready() {
+        SCHEDULER_CAP_ENABLED
+    } else {
+        0
+    }
+}
+
+/// What set_proto_ctx_param and ctx_setparam consult beyond the argument,
+/// sampled before the namespace's IRQ-safe lock. capable() is asked exactly
+/// where Linux asks it: CAP_SYS_ADMIN for a size-0 BANNABLE (the left
+/// operand of `!capable(CAP_SYS_ADMIN) && !args->value`), CAP_SYS_NICE for
+/// an in-range PRIORITY above I915_CONTEXT_DEFAULT_PRIORITY.
+#[derive(Copy, Clone, Debug)]
+struct ParamFacts {
+    /// set_proto_ctx_param's intel_uc_uses_guc_submission for LOW_LATENCY.
+    low_latency: bool,
+    scheduler: i32,
+    sys_admin: bool,
+    sys_nice: bool,
+}
+
+impl ParamFacts {
+    /// GETPARAM (`set` false) asks no capability.
+    fn sample(info: &DeviceInfo, param: &[u8], set: bool, low_latency: bool) -> Self {
+        let size = u32_at(param, 4);
+        let value = u64_at(param, 16);
+        let scheduler = scheduler_caps(info);
+        let (sys_admin, sys_nice) = match u64_at(param, 8) {
+            _ if !set => (false, false),
+            abi::CONTEXT_PARAM_BANNABLE if size == 0 => {
+                (narf_filesystem::caller_capable(CAP_SYS_ADMIN), false)
+            }
+            // validate_priority asks CAP_SYS_NICE only after its size,
+            // capability and range checks have passed.
+            abi::CONTEXT_PARAM_PRIORITY
+                if size == 0
+                    && scheduler & SCHEDULER_CAP_PRIORITY != 0
+                    && (1..=CONTEXT_MAX_USER_PRIORITY).contains(&(value as i64)) =>
+            {
+                (false, narf_filesystem::caller_capable(CAP_SYS_NICE))
+            }
+            _ => (false, false),
+        };
+        Self {
+            low_latency,
+            scheduler,
+            sys_admin,
+            sys_nice,
+        }
+    }
+}
+
+/// i915_gem_context.c::validate_priority:173, in its order.
+fn validate_priority(size: u32, value: u64, facts: ParamFacts) -> Result<(), FsError> {
+    let priority = value as i64;
+    if size != 0 {
+        return Err(FsError::InvalidData);
+    }
+    if facts.scheduler & SCHEDULER_CAP_PRIORITY == 0 {
+        return Err(FsError::NoDevice);
+    }
+    if !(-CONTEXT_MAX_USER_PRIORITY..=CONTEXT_MAX_USER_PRIORITY).contains(&priority) {
+        return Err(FsError::InvalidData);
+    }
+    if priority > 0 && !facts.sys_nice {
+        return Err(FsError::OperationNotPermitted);
+    }
+    Ok(())
+}
 
 /// A submission profile, deliberately separate from display generation gates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SubmissionProfile {
     Gen12Execlists,
+    Gen12GuC,
     XeLpgGuC,
     Unsupported,
 }
@@ -36,9 +132,9 @@ pub enum SubmissionProfile {
 impl SubmissionProfile {
     pub const fn for_generation(generation: Generation) -> Self {
         match generation {
-            Generation::TigerLake | Generation::AlderLake => Self::Gen12Execlists,
+            Generation::TigerLake | Generation::AlderLake => Self::Gen12GuC,
             Generation::MeteorLake => Self::XeLpgGuC,
-            Generation::PantherLake => Self::Unsupported,
+            Generation::LunarLake | Generation::PantherLake => Self::Unsupported,
         }
     }
 }
@@ -79,6 +175,13 @@ impl DeviceInfo {
     pub fn submission_ready(&self) -> bool {
         self.user_status().is_some()
     }
+    fn object_async_ready(&self) -> bool {
+        crate::intel_gpu_exec::object_async_profile(self.platform)
+            && self
+                .user_status()
+                .is_some_and(|status| status.engines.bits() != 0)
+    }
+
     pub fn native_xe(&self) -> bool {
         self.platform.guc().is_some()
             && self
@@ -108,52 +211,110 @@ type EngineMap = Vec<Option<crate::intel_gpu_engine::EngineSet>>;
 struct Context {
     user: Arc<crate::intel_gpu_user::UserContext>,
     copy: Arc<crate::intel_gpu_user::UserContext>,
+    media: BTreeMap<crate::intel_gpu_engine::Engine, Arc<crate::intel_gpu_user::UserContext>>,
+    /// Host-only legacy SSEU lookup inventory observed from this context's
+    /// matching live Gen12 publication. It never admits execution after stop.
+    sseu_media: Option<(GtPlatform, crate::intel_gpu_engine::EngineSet)>,
     engines: Option<Vec<Option<Arc<crate::intel_gpu_user::UserContext>>>>,
     /// i915 GRAPHICS_VER 12 contexts stay proto-contexts until first lookup;
     /// only then is the engine map immutable.
     finalized: bool,
     vm: Arc<Vm>,
-    no_error_capture: bool,
+    no_error_capture: Arc<crate::intel_gpu_user::CapturePolicy>,
+    /// Proto/create-only intent, inherited by every retained engine context.
+    low_latency: bool,
+    /// LINUX-GAP: stored and reported only. A reset bans every context it
+    /// finds (UserContext::check_epoch), bannable or not.
     bannable: bool,
+    /// LINUX-GAP: stored and reported only. No context is ever recovered
+    /// across a reset, whatever this says.
     recoverable: bool,
+    /// Always true: clearing it needs I915_SCHEDULER_CAP_PREEMPTION, which
+    /// NARF does not advertise (scheduler_caps).
     persistence: bool,
+    /// ctx->sched.priority, I915_CONTEXT_MIN..=MAX_USER_PRIORITY. LINUX-GAP:
+    /// map_i915_prio_to_guc_prio never reaches GuC; every registration keeps
+    /// UserContext's fixed policy, and no SET_CONTEXT_PRIORITY is sent.
+    priority: i32,
 }
 
 impl Context {
     fn new(vm: Arc<Vm>, finalized: bool) -> Self {
         use crate::intel_gpu_engine::Engine;
+        let no_error_capture = Arc::new(crate::intel_gpu_user::CapturePolicy::default());
         Self {
-            user: crate::intel_gpu_user::UserContext::new(),
-            copy: crate::intel_gpu_user::UserContext::for_engine(Engine::Bcs0),
+            user: crate::intel_gpu_user::UserContext::for_i915_engine(
+                Engine::Rcs0,
+                no_error_capture.clone(),
+            ),
+            copy: crate::intel_gpu_user::UserContext::for_i915_engine(
+                Engine::Bcs0,
+                no_error_capture.clone(),
+            ),
+            media: BTreeMap::new(),
+            sseu_media: None,
             engines: None,
             finalized,
             vm,
-            no_error_capture: false,
+            no_error_capture,
+            low_latency: false,
             bannable: true,
             recoverable: false,
             persistence: true,
+            priority: 0,
         }
     }
 
     fn users(&self) -> Vec<Arc<crate::intel_gpu_user::UserContext>> {
         let mut users = alloc::vec![self.user.clone(), self.copy.clone()];
         users.extend(self.engines.iter().flatten().flatten().cloned());
+        users.extend(self.media.values().cloned());
         users
     }
 
-    /// i915_gem_execbuffer.c::eb_select_engine. Legacy DEFAULT/RENDER select
-    /// RCS0 and BLT selects BCS0; BSD/VEBOX name absent engines (EINVAL).
-    fn select(&mut self, ring: u32) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
+    fn retain_sseu_media(&mut self, info: &DeviceInfo) {
+        if self.sseu_media.is_none() && info.platform.is_gen12() {
+            // user_status verifies the nonzero epoch and matching platform;
+            // this is an already-published engine set, never raw fuse guesses.
+            self.sseu_media = info
+                .user_status()
+                .filter(|status| status.engines.bits() != 0)
+                .map(|status| (status.platform, status.engines));
+        }
+    }
+
+    /// An indexed map uses only RING_MASK; legacy media is selected from the
+    /// current published dense class map before a context state is allocated.
+    fn select(
+        &mut self,
+        ring: u32,
+        media: Option<crate::intel_gpu_engine::Engine>,
+    ) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
         self.finalized = true;
         match &self.engines {
             Some(map) => map
-                .get(ring as usize)
+                .get((ring & 0x3f) as usize)
                 .cloned()
                 .flatten()
                 .ok_or(FsError::InvalidData),
-            None => match u64::from(ring) {
+            None => match u64::from(ring & 0x3f) {
                 0 | abi::EXEC_RENDER => Ok(self.user.clone()),
                 abi::EXEC_BLT => Ok(self.copy.clone()),
+                abi::EXEC_BSD | abi::EXEC_VEBOX => {
+                    let engine = media.ok_or(FsError::InvalidData)?;
+                    if let Some(user) = self.media.get(&engine) {
+                        return Ok(user.clone());
+                    }
+                    let user = crate::intel_gpu_user::UserContext::for_i915_engine(
+                        engine,
+                        self.no_error_capture.clone(),
+                    );
+                    if self.low_latency {
+                        user.configure_low_latency()?;
+                    }
+                    self.media.insert(engine, user.clone());
+                    Ok(user)
+                }
                 _ => Err(FsError::InvalidData),
             },
         }
@@ -191,7 +352,7 @@ fn read_engines(
         map.push(Some(crate::intel_gpu_engine::EngineSet::of(&[engine])));
     }
     let extensions_at = u64_at(&read(user, value, 8)?, 0);
-    extensions(user, extensions_at, |address, name| match name {
+    abi::user_extensions(user, extensions_at, |address, name| match name {
         abi::CONTEXT_ENGINES_EXT_LOAD_BALANCE => {
             // i915_gem_context.c::set_proto_ctx_engines_balance checks the
             // destination slot before reading sibling count, flags or data.
@@ -204,9 +365,18 @@ fn read_engines(
             }
             let count = read(user, at.checked_add(2).ok_or(FsError::BadAddress)?, 2)?;
             let count = u16::from_le_bytes(count[..].try_into().unwrap());
-            let reserved = read(user, at.checked_add(4).ok_or(FsError::BadAddress)?, 12)?;
-            if reserved.iter().any(|byte| *byte != 0) {
-                return Err(FsError::InvalidData);
+            // check_user_mbz(&ext->flags), then check_user_mbz(&ext->mbz64):
+            // two get_users, so a nonzero flags word is -EINVAL even when
+            // mbz64 is unreadable.
+            for (offset, size) in [(4, 4), (8, 8)] {
+                let field = read(
+                    user,
+                    at.checked_add(offset).ok_or(FsError::BadAddress)?,
+                    size,
+                )?;
+                if field.iter().any(|byte| *byte != 0) {
+                    return Err(FsError::InvalidData);
+                }
             }
             if count == 0 {
                 return Ok(());
@@ -247,16 +417,131 @@ fn read_engines(
 #[derive(Debug)]
 struct Namespaces {
     next_context: u32,
+    next_context_nonce: u64,
+    /// Reserved names are capacity charged but absent from the visible map.
+    pending_contexts: BTreeMap<u32, u64>,
     next_vm: u32,
     contexts: BTreeMap<u32, Context>,
     vms: BTreeMap<u32, Arc<Vm>>,
+    bsd_default: Option<crate::intel_gpu_engine::Engine>,
 }
 
 impl Namespaces {
+    const fn new() -> Self {
+        Self {
+            next_context: 1,
+            next_context_nonce: 1,
+            pending_contexts: BTreeMap::new(),
+            next_vm: 1,
+            contexts: BTreeMap::new(),
+            vms: BTreeMap::new(),
+            bsd_default: None,
+        }
+    }
+
+    fn reserve_context(&mut self) -> Result<(u32, u64), FsError> {
+        // Context0 counts even before its lazy initialization. Every pending
+        // copyout consumes exactly one additional slot, excluding overcommit.
+        let occupied = self.contexts.len()
+            + self.pending_contexts.len()
+            + usize::from(!self.contexts.contains_key(&0));
+        if occupied >= MAX_CONTEXTS {
+            return Err(FsError::OutOfMemory);
+        }
+        let id = self.next_context;
+        let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
+        let nonce = self.next_context_nonce;
+        let next_nonce = nonce.checked_add(1).ok_or(FsError::OutOfMemory)?;
+        self.pending_contexts.insert(id, nonce);
+        self.next_context = next;
+        self.next_context_nonce = next_nonce;
+        Ok((id, nonce))
+    }
+
+    fn cancel_context(&mut self, id: u32, nonce: u64) {
+        if self.pending_contexts.get(&id) != Some(&nonce) {
+            return;
+        }
+        self.pending_contexts.remove(&id);
+        // Preserve the ordinary failed-create ID behavior when no later
+        // reservation exists. Concurrent successes may leave opaque ID gaps.
+        if id.checked_add(1) == Some(self.next_context) {
+            self.next_context = id;
+        }
+    }
+
     fn initialize(&mut self) {
         self.contexts
             .entry(0)
             .or_insert_with(|| Context::new(Arc::new(Vm { _identity: 0 }), true));
+    }
+
+    /// Pinned i915_gem_execbuffer.c::eb_select_legacy_ring: explicit maps
+    /// ignore BSD flags; legacy non-BSD rejects them. With one VIDEO engine,
+    /// Linux ignores BSD selector bits; with multiple, only DEFAULT/1/2 exist.
+    fn select(
+        &mut self,
+        id: u32,
+        ring: u32,
+        info: &DeviceInfo,
+    ) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
+        self.initialize();
+        let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
+        context.finalized = true;
+        if context.engines.is_some() {
+            return context.select(ring, None);
+        }
+        let selector = (u64::from(ring) & abi::EXEC_BSD_MASK) >> abi::EXEC_BSD_SHIFT;
+        let legacy = u64::from(ring & 0x3f);
+        if legacy != abi::EXEC_BSD && selector != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let media = if matches!(legacy, abi::EXEC_BSD | abi::EXEC_VEBOX) {
+            if !info.platform.is_gen12() {
+                return Err(FsError::InvalidData);
+            }
+            let present = info.user_status().ok_or(FsError::NoDevice)?.engines;
+            context.retain_sseu_media(info);
+            let class = if legacy == abi::EXEC_BSD { 2 } else { 3 };
+            let count = present.iter().filter(|e| e.xe_class() == class).count();
+            if count == 0 {
+                return Err(FsError::InvalidData);
+            }
+            Some(if legacy == abi::EXEC_BSD && count > 1 {
+                match selector {
+                    0 => {
+                        // Linux retains one default VIDEO per open. NARF's
+                        // bounded scheduling choice rotates between opens;
+                        // neither random balancing nor fairness is UAPI.
+                        static NEXT: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        let engine = *self.bsd_default.get_or_insert_with(|| {
+                            let logical = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                                as usize
+                                % count;
+                            present
+                                .from_class_instance(2, logical as u16)
+                                .expect("published VIDEO")
+                        });
+                        if !present.contains(engine) {
+                            return Err(FsError::NoDevice);
+                        }
+                        engine
+                    }
+                    1 | 2 => present
+                        .from_class_instance(2, selector as u16 - 1)
+                        .ok_or(FsError::InvalidData)?,
+                    _ => return Err(FsError::InvalidData),
+                }
+            } else {
+                present
+                    .from_class_instance(class, 0)
+                    .expect("nonempty class")
+            })
+        } else {
+            None
+        };
+        context.select(ring, media)
     }
 
     /// ENGINES may only be set once, on a proto-context.
@@ -269,11 +554,17 @@ impl Namespaces {
         Ok(())
     }
 
+    /// GEM_CONTEXT_GETPARAM and SETPARAM on a copied
+    /// drm_i915_gem_context_param, SSEU excepted (sseu_parameter).
+    /// i915_gem_context_getparam_ioctl:2527 and setparam_ioctl:2600 look the
+    /// context up first (-ENOENT); SET then applies set_proto_ctx_param:877
+    /// to a proto-context and ctx_setparam:2190 to a finalized one.
     fn parameter(
         &mut self,
         bytes: &mut [u8],
         set: bool,
         engines: Option<EngineMap>,
+        facts: ParamFacts,
     ) -> Result<(), FsError> {
         let id = u32_at(bytes, 0);
         let size = u32_at(bytes, 4);
@@ -286,56 +577,172 @@ impl Namespaces {
             context.engines = Some(
                 map.into_iter()
                     .map(|slot| {
-                        slot.map(crate::intel_gpu_user::UserContext::for_placements)
-                            .transpose()
+                        slot.map(|placements| {
+                            let user = crate::intel_gpu_user::UserContext::for_i915_placements(
+                                placements,
+                                context.no_error_capture.clone(),
+                            )?;
+                            if context.low_latency {
+                                user.configure_low_latency()?;
+                            }
+                            Ok::<_, FsError>(user)
+                        })
+                        .transpose()
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
             return Ok(());
         }
-        if size != 0 {
-            return Err(FsError::InvalidData);
-        }
         self.initialize();
         let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
         if !set {
-            // i915_gem_context_lookup finalizes a proto-context.
+            // i915_gem_context_lookup finalizes a proto-context, even for a
+            // parameter (LOW_LATENCY, ENGINES) that GETPARAM then refuses.
+            // GETPARAM never reads the input size; it reports size 0.
             context.finalized = true;
-        }
-        match (param, set) {
-            (3, false) => put64(bytes, 16, 1 << 48),
-            (4 | 5 | 8 | 11, _) => {
-                let target = match param {
-                    4 => &mut context.no_error_capture,
-                    5 => &mut context.bannable,
-                    8 => &mut context.recoverable,
-                    _ => &mut context.persistence,
-                };
-                if set {
-                    if value > 1 {
-                        return Err(FsError::InvalidData);
-                    }
-                    // Disabling banning requires authority this UAPI does not grant.
-                    if param == 5 && value == 0 {
-                        return Err(FsError::OperationNotPermitted);
-                    }
-                    if (param == 8 && value == 1) || (param == 11 && value == 0) {
-                        return Err(FsError::NotImplemented);
-                    }
-                    *target = value != 0;
-                } else {
-                    put64(bytes, 16, u64::from(*target));
+            let value = match param {
+                abi::CONTEXT_PARAM_GTT_SIZE => 1 << 48,
+                abi::CONTEXT_PARAM_NO_ERROR_CAPTURE => {
+                    u64::from(context.no_error_capture.protected())
                 }
-            }
-            (6, _) => {
-                // The userspace path currently supports only normal priority.
-                if set && value != 0 {
+                abi::CONTEXT_PARAM_BANNABLE => u64::from(context.bannable),
+                abi::CONTEXT_PARAM_RECOVERABLE => u64::from(context.recoverable),
+                // `args->value = ctx->sched.priority`: an int, sign-extended.
+                abi::CONTEXT_PARAM_PRIORITY => i64::from(context.priority) as u64,
+                abi::CONTEXT_PARAM_VM => {
+                    let vm = context.vm.clone();
+                    let existing = self
+                        .vms
+                        .iter()
+                        .find(|(_, entry)| Arc::ptr_eq(entry, &vm))
+                        .map(|(id, _)| *id);
+                    let id = if let Some(id) = existing {
+                        id
+                    } else {
+                        if self.vms.len() >= MAX_VMS {
+                            return Err(FsError::OutOfMemory);
+                        }
+                        let id = self.next_vm;
+                        self.next_vm = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
+                        self.vms.insert(id, vm);
+                        id
+                    };
+                    u64::from(id)
+                }
+                abi::CONTEXT_PARAM_PERSISTENCE => u64::from(context.persistence),
+                // get_protected: without PXP no context uses protected
+                // content.
+                abi::CONTEXT_PARAM_PROTECTED_CONTENT => 0,
+                // NO_ZEROMAP, BAN_PERIOD, ENGINES, RINGSIZE, CONTEXT_IMAGE,
+                // LOW_LATENCY and unknown parameters.
+                _ => return Err(FsError::InvalidData),
+            };
+            put32(bytes, 4, 0);
+            put64(bytes, 16, value);
+            return Ok(());
+        }
+        let proto = !context.finalized;
+        match param {
+            abi::CONTEXT_PARAM_NO_ERROR_CAPTURE => {
+                if size != 0 {
                     return Err(FsError::InvalidData);
                 }
-                put64(bytes, 16, 0);
+                // Source live SET accepts any nonzero value, including after
+                // finalization/claim. Every retained hardware member sees it.
+                context.no_error_capture.set(value);
             }
-            (9, true) => {
+            abi::CONTEXT_PARAM_BANNABLE => {
+                // Both tables: size, then `!capable(CAP_SYS_ADMIN) &&
+                // !args->value`; any nonzero value sets it. The
+                // uses_protected_content -EPERM for clearing it cannot apply:
+                // no context uses protected content without PXP.
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                if !facts.sys_admin && value == 0 {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                context.bannable = value != 0;
+            }
+            abi::CONTEXT_PARAM_RECOVERABLE => {
+                // Both tables: size, then 0 clears and any other value sets
+                // it (its uses_protected_content -EPERM cannot apply).
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                context.recoverable = value != 0;
+            }
+            abi::CONTEXT_PARAM_PRIORITY => {
+                // set_proto_ctx_param stores it; ctx_setparam's set_priority
+                // also retunes semaphore use, which GuC submission never has.
+                validate_priority(size, value, facts)?;
+                context.priority = value as i64 as i32;
+            }
+            abi::CONTEXT_PARAM_PERSISTENCE => {
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                let persist = value != 0;
+                // __context_set_persistence:1560 returns early when a live
+                // context is already in the requested state.
+                if !proto && context.persistence == persist {
+                    return Ok(());
+                }
+                // Setting it requires i915.enable_hangcheck (-EINVAL without):
+                // NARF's job watchdog is always armed. Clearing it requires
+                // I915_SCHEDULER_CAP_PREEMPTION, then intel_has_reset_engine;
+                // NARF has no preempt-to-idle cancellation and does not
+                // advertise the capability, so the first is -ENODEV.
+                if !persist && facts.scheduler & SCHEDULER_CAP_PREEMPTION == 0 {
+                    return Err(FsError::NoDevice);
+                }
+                context.persistence = persist;
+            }
+            // proto_context_set_protected:253 has no size check: 0 clears
+            // it; anything else needs intel_pxp_is_enabled, which no NARF
+            // i915 device is. ctx_setparam refuses it (-EINVAL).
+            abi::CONTEXT_PARAM_PROTECTED_CONTENT if proto => {
+                if value != 0 {
+                    return Err(FsError::NoDevice);
+                }
+            }
+            // set_proto_ctx_param only; ctx_setparam refuses it (-EINVAL).
+            abi::CONTEXT_PARAM_LOW_LATENCY if proto => {
+                if !facts.low_latency {
+                    return Err(FsError::InvalidData);
+                }
+                // Pinned set_proto_ctx_param ignores size/value for this
+                // one-way enable: even value 0 enables it, with no payload
+                // dereference.
+                if context.low_latency {
+                    return Ok(());
+                }
+                let users = context.users();
+                if users.iter().any(|user| !user.can_rebind()) {
+                    return Err(FsError::Busy);
+                }
+                // No claim-capable UserContext escapes before finalization.
+                // Internal SSEU SET clones immediately refuse without a claim.
+                // This context is either namespace serialized or an
+                // unpublished private proto, so no claim can race the
+                // complete preflight and none of these enables can fail
+                // midway.
+                for user in users {
+                    user.configure_low_latency()?;
+                }
+                context.low_latency = true;
+            }
+            // set_proto_ctx_vm:366: size, then upper_32_bits and the lookup
+            // (-ENOENT). ctx_setparam refuses VM (-EINVAL): a finalized
+            // context's VM is immutable.
+            abi::CONTEXT_PARAM_VM if proto => {
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
                 let vm_id = u32::try_from(value).map_err(|_| FsError::NotFound)?;
+                // Defensive only: no claim-capable UserContext of a
+                // proto-context exists (select() finalizes before claiming,
+                // under this lock), so this preflight never refuses.
                 let users = context.users();
                 let mut idle = Vec::new();
                 for user in &users {
@@ -346,29 +753,65 @@ impl Namespaces {
                 }
                 context.vm = self.vms.get(&vm_id).cloned().ok_or(FsError::NotFound)?;
             }
-            (9, false) => {
-                let vm = context.vm.clone();
-                let existing = self
-                    .vms
-                    .iter()
-                    .find(|(_, entry)| Arc::ptr_eq(entry, &vm))
-                    .map(|(id, _)| *id);
-                let id = if let Some(id) = existing {
-                    id
-                } else {
-                    if self.vms.len() >= MAX_VMS {
-                        return Err(FsError::OutOfMemory);
-                    }
-                    let id = self.next_vm;
-                    self.next_vm = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
-                    self.vms.insert(id, vm);
-                    id
-                };
-                put64(bytes, 16, id as u64);
-            }
+            // GTT_SIZE, NO_ZEROMAP, BAN_PERIOD, RINGSIZE and unknown
+            // parameters in both tables (and VM in ctx_setparam's);
+            // CONTEXT_IMAGE needs
+            // CONFIG_DRM_I915_REPLAY_GPU_HANGS_API (set_context_image).
             _ => return Err(FsError::InvalidData),
         }
         Ok(())
+    }
+}
+
+/// A private, non-Copy reservation. Only this exact nonce may publish or
+/// roll back its slot; a pending name is never in the claimable context map.
+struct PendingContext<'a> {
+    namespaces: &'a IrqSafeSpinLock<Namespaces>,
+    id: u32,
+    nonce: u64,
+}
+
+impl PendingContext<'_> {
+    fn publish(self, context: Context, default: Context) -> Result<(), FsError> {
+        let mut context = Some(context);
+        let mut default = Some(default);
+        let published = {
+            let mut namespaces = self.namespaces.lock();
+            if namespaces.pending_contexts.get(&self.id) != Some(&self.nonce)
+                || namespaces.contexts.contains_key(&self.id)
+            {
+                false
+            } else {
+                // Vacant entries do not replace/drop any other owned graph.
+                if let alloc::collections::btree_map::Entry::Vacant(slot) =
+                    namespaces.contexts.entry(0)
+                {
+                    slot.insert(default.take().expect("owned context0"));
+                }
+                if let alloc::collections::btree_map::Entry::Vacant(slot) =
+                    namespaces.contexts.entry(self.id)
+                {
+                    slot.insert(context.take().expect("owned proto"));
+                }
+                namespaces.pending_contexts.remove(&self.id);
+                true
+            }
+        };
+        // Unused default/proto references are destroyed after the IRQ guard.
+        drop(context);
+        drop(default);
+        if published {
+            Ok(())
+        } else {
+            Err(FsError::NoDevice)
+        }
+    }
+}
+
+impl Drop for PendingContext<'_> {
+    fn drop(&mut self) {
+        // Metadata only: never remove/drop a published Context or VM graph.
+        self.namespaces.lock().cancel_context(self.id, self.nonce);
     }
 }
 
@@ -392,12 +835,7 @@ impl RenderFile {
             gem: GemState::new(),
             xe: crate::intel_gpu_xe::XeFile::new(),
             syncobjs: IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
-            namespaces: IrqSafeSpinLock::new(Namespaces {
-                next_context: 1,
-                next_vm: 1,
-                contexts: BTreeMap::new(),
-                vms: BTreeMap::new(),
-            }),
+            namespaces: IrqSafeSpinLock::new(Namespaces::new()),
         }
     }
 
@@ -410,6 +848,10 @@ impl RenderFile {
     ) -> Option<Result<u64, FsError>> {
         if crate::drm_registry::driver_name(card) != Some("intel-gpu") {
             return None;
+        }
+        if let Some(result) = crate::drm_ioctl_bridge::intel_get_modifiers_cap(card, cmd, arg, user)
+        {
+            return Some(result);
         }
         let info = match DeviceInfo::for_card(card) {
             Some(info) => info,
@@ -427,6 +869,10 @@ impl RenderFile {
     ) -> Option<Result<u64, FsError>> {
         if crate::drm_registry::driver_name(card) != Some("intel-gpu") {
             return None;
+        }
+        if let Some(result) = crate::drm_ioctl_bridge::intel_get_modifiers_cap(card, cmd, arg, user)
+        {
+            return Some(result);
         }
         let Some(info) = DeviceInfo::for_card(card) else {
             return Some(Err(FsError::NoDevice));
@@ -513,19 +959,25 @@ impl RenderFile {
         user: &dyn IoctlContext,
     ) -> Result<u64, FsError> {
         use crate::intel_gpu_user::{OutputError, UserOutput};
-        let (request, sync) =
-            crate::intel_gpu_exec::ExecRequest::read_submission(user, arg, &self.gem)?;
+        // Syncobjs and payloads are found and retained while the fence
+        // arrays are parsed, as i915_gem_do_execbuffer's eb->fences are.
+        let (request, sync) = crate::intel_gpu_exec::ExecRequest::read_submission(
+            user,
+            arg,
+            &self.gem,
+            &self.syncobjs,
+        )?;
+        request.validate_for_gt(info.platform)?;
+        if request.has_async() && !info.object_async_ready() {
+            return Err(FsError::NoDevice);
+        }
         let output = sync.output;
         let input_word = sync.input_word;
-        let sync = sync.resolve(&self.syncobjs)?;
+        let sync = sync.resolve();
         let context = {
             let mut namespaces = self.namespaces.lock();
             namespaces.initialize();
-            namespaces
-                .contexts
-                .get_mut(&request.context_id)
-                .ok_or(FsError::NotFound)?
-                .select(request.ring)?
+            namespaces.select(request.context_id, request.ring, info)?
         };
         let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
         let _order = context.serial.lock().await;
@@ -539,11 +991,17 @@ impl RenderFile {
         loop {
             let status = backend
                 .status()
-                .filter(|status| status.platform == info.platform)
+                .filter(|status| {
+                    status.platform == info.platform
+                        && (!request.has_async()
+                            || (status.epoch != 0 && status.engines.bits() != 0))
+                })
                 .ok_or(FsError::NoDevice)?;
             context.check_epoch(status.epoch)?;
             for entry in &request.objects {
-                entry.object.wait_idle(entry.writable, None).await?;
+                if !entry.asynchronous {
+                    entry.object.wait_idle(entry.writable, None).await?;
+                }
             }
             let batch = request.prepare_user(status.platform)?;
             let result = if output {
@@ -576,10 +1034,10 @@ impl RenderFile {
                 }
                 Err(OutputError::Io(error)) => return Err(error),
                 Err(OutputError::Install(narf_filesystem::InstallFdError::NoDescriptor)) => {
-                    return Ok((-24i64) as u64)
+                    return Ok((-24i64) as u64);
                 }
                 Err(OutputError::Install(narf_filesystem::InstallFdError::Report(error))) => {
-                    return Err(error)
+                    return Err(error);
                 }
             }
         }
@@ -744,16 +1202,13 @@ impl RenderFile {
                 .ok_or(FsError::NotFound)?;
             if !set {
                 context.finalized = true;
+                context.retain_sseu_media(info);
             }
             context.clone()
         };
         let size = u32_at(request, 4);
         if set {
-            return Err(if size < 32 {
-                FsError::InvalidData
-            } else {
-                FsError::NoDevice
-            });
+            return Err(sseu_set_refusal(size));
         }
         if size == 0 {
             put32(request, 4, 32);
@@ -777,9 +1232,25 @@ impl RenderFile {
                     .ok_or(FsError::InvalidData)?;
             }
             None if flags == 0 && matches!((class, instance), (0 | 1, 0)) => {}
+            None if flags == 0 && matches!(class, 2 | 3) && info.platform.is_gen12() => {
+                // Linux lookup_user_engine uses the published class/instance
+                // map; every engine inherits whole-device default SSEU. Keep
+                // this immutable host query usable after stop only if this
+                // context actually observed a qualified publication earlier.
+                let (platform, present) = context.sseu_media.ok_or(FsError::NoDevice)?;
+                if platform != info.platform {
+                    return Err(FsError::NoDevice);
+                }
+                present
+                    .from_class_instance(class, instance)
+                    .ok_or(FsError::InvalidData)?;
+            }
             _ => return Err(FsError::InvalidData),
         }
         let topology = observed_topology(info)?;
+        if info.platform.is_ptl() {
+            return Err(FsError::NoDevice);
+        }
         let eus = match topology.eu_type() {
             crate::intel_gpu_topology::EuType::Simd8 => 16u16,
             crate::intel_gpu_topology::EuType::Simd16 => 8,
@@ -790,7 +1261,7 @@ impl RenderFile {
         put64(
             &mut wire,
             16,
-            u64::from((topology.geometry_dss() | topology.compute_dss()) & 0xff),
+            ((topology.geometry_dss() | topology.compute_dss()) & 0xff) as u64,
         );
         wire[24..26].copy_from_slice(&eus.to_le_bytes());
         wire[26..28].copy_from_slice(&eus.to_le_bytes());
@@ -814,13 +1285,28 @@ impl RenderFile {
             }
             abi::GEM_CREATE | abi::GEM_CREATE_EXT => {
                 let mut request = read(user, arg, if cmd == abi::GEM_CREATE { 16 } else { 24 })?;
+                let mut pat = false;
                 if cmd == abi::GEM_CREATE_EXT {
-                    if u32_at(&request, 12) != 0 {
+                    // i915_gem_create_ext_ioctl: unknown flags, then the
+                    // chain, then I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS,
+                    // which `n_placements == 1` refuses. SYSTEM is the only
+                    // region NARF reports, so every request has one.
+                    let flags = u32_at(&request, 12);
+                    if flags & !GEM_CREATE_EXT_NEEDS_CPU_ACCESS != 0 {
                         return Err(FsError::InvalidData);
                     }
-                    create_extensions(user, u64_at(&request, 16))?;
+                    pat = create_extensions(info, user, u64_at(&request, 16))?;
+                    if flags & GEM_CREATE_EXT_NEEDS_CPU_ACCESS != 0 {
+                        return Err(FsError::InvalidData);
+                    }
                 }
                 self.gem.create(u64_at(&request, 0), |handle, size| {
+                    // LINUX-GAP: Linux sets the object's PAT index here, after
+                    // __i915_gem_object_create_user_ext; NARF objects carry no
+                    // per-object PAT, so the object is not published.
+                    if pat {
+                        return Err(FsError::NotImplemented);
+                    }
                     put64(&mut request, 0, size);
                     put32(&mut request, 8, handle);
                     user.write(arg, &request)
@@ -871,13 +1357,17 @@ impl RenderFile {
             }
             abi::GEM_MMAP_GTT | abi::GEM_MMAP_OFFSET => {
                 let mut request = read(user, arg, if cmd == abi::GEM_MMAP_GTT { 16 } else { 32 })?;
-                if u32_at(&request, 4) != 0 {
-                    return Err(FsError::InvalidData);
-                }
                 if cmd == abi::GEM_MMAP_OFFSET {
+                    // i915_gem_mmap_offset_ioctl never checks pad or offset
+                    // ("if (args->pad) return -EINVAL; is verbotten!") and
+                    // walks extensions against an empty table: a link is
+                    // refused (-EINVAL) after its own copies and checks.
+                    abi::user_extensions(user, u64_at(&request, 24), |_, _| {
+                        Err(FsError::InvalidData)
+                    })?;
                     // Compatibility supports only WB system mappings; native
                     // Xe handles retain their own cache/memory placement.
-                    if u64_at(&request, 16) != 2 || u64_at(&request, 24) != 0 {
+                    if u64_at(&request, 16) != 2 {
                         return Err(FsError::InvalidData);
                     }
                 } else {
@@ -936,10 +1426,10 @@ impl RenderFile {
                 }
                 match cmd {
                     abi::GEM_SET_TILING if u32_at(&request, 4) != 0 || u32_at(&request, 8) != 0 => {
-                        return Err(FsError::InvalidData)
+                        return Err(FsError::InvalidData);
                     }
                     abi::GEM_SET_CACHING if u32_at(&request, 4) != 1 => {
-                        return Err(FsError::InvalidData)
+                        return Err(FsError::InvalidData);
                     }
                     abi::GEM_GET_CACHING => put32(&mut request, 4, 1),
                     abi::GEM_GET_TILING | abi::GEM_SET_TILING => request[4..].fill(0),
@@ -1003,9 +1493,20 @@ impl RenderFile {
                 } else {
                     None
                 };
+                // GRAPHICS_VER >12 finalizes at create in pinned i915. DG2
+                // 12.55 and MTL/ARL 12.70/12.74 still permit late proto SET.
+                // Keep backend and credential callbacks outside the namespace
+                // IRQ lock.
+                let low_latency_admitted = matches!(
+                    info.platform,
+                    GtPlatform::Gen12(_)
+                        | GtPlatform::Alchemist
+                        | GtPlatform::Integrated(Generation::MeteorLake)
+                ) && crate::intel_gpu_xe::low_latency_supported(info);
+                let facts = ParamFacts::sample(info, &request, set, low_latency_admitted);
                 self.namespaces
                     .lock()
-                    .parameter(&mut request, set, engines)?;
+                    .parameter(&mut request, set, engines, facts)?;
                 user.write(arg, &request)
             }
             abi::GEM_VM_CREATE | abi::GEM_VM_DESTROY => {
@@ -1094,61 +1595,113 @@ impl RenderFile {
         if (cmd == abi::GEM_CONTEXT_CREATE && flags != 0) || flags & !3 != 0 {
             return Err(FsError::InvalidData);
         }
-        let mut params = Vec::new();
+        // CREATE_EXT applies proto parameters before source finalization on
+        // every admitted generation. Sample cached admission before locking.
+        let low_latency_admitted = crate::intel_gpu_xe::low_latency_supported(info);
+        // i915_gem_context_create_ioctl makes the proto-context before the
+        // chain and create_setparam applies each SETPARAM link through
+        // set_proto_ctx_param as i915_user_extensions reaches it, so a link's
+        // error ends the walk before any later link is read. The proto is an
+        // unshared host-only container under a private name, never the
+        // visible namespace: even reentrant copyout cannot find or
+        // finalize/claim either of its context graphs. An error discards it,
+        // as err_pc's proto_context_close does, before any name is reserved;
+        // its contexts, maps and Arc drops all happen outside the guard.
+        let mut proto = Namespaces::new();
+        proto.initialize();
+        proto.contexts.insert(
+            PROTO_NAME,
+            Context::new(
+                Arc::new(Vm {
+                    _identity: PROTO_NAME,
+                }),
+                false,
+            ),
+        );
         if cmd == abi::GEM_CONTEXT_CREATE_EXT && flags & 1 != 0 {
-            let mut engines_set = false;
-            extensions(user, u64_at(&request, 8), |address, name| {
+            abi::user_extensions(user, u64_at(&request, 8), |address, name| {
+                // create_extensions[]: SETPARAM; CLONE is invalid_ext.
                 if name != 0 {
                     return Err(FsError::InvalidData);
                 }
                 let ext = read(user, address, 56)?;
-                let param = ext[32..].to_vec();
+                let mut param = ext[32..].to_vec();
                 if u32_at(&param, 0) != 0 {
                     return Err(FsError::InvalidData);
                 }
-                // set_proto_ctx_param applies each extension in chain order.
-                let engines = if u64_at(&param, 8) == abi::CONTEXT_PARAM_ENGINES {
-                    if engines_set {
-                        return Err(FsError::InvalidData);
-                    }
-                    engines_set = true;
-                    Some(read_engines(
-                        info,
-                        user,
-                        u32_at(&param, 4),
-                        u64_at(&param, 16),
-                    )?)
-                } else {
-                    None
-                };
-                params.push((param, engines));
-                Ok(())
+                self.proto_parameter(info, user, &mut proto, &mut param, low_latency_admitted)
             })?;
         }
-        let mut namespaces = self.namespaces.lock();
-        namespaces.initialize();
-        if namespaces.contexts.len() >= MAX_CONTEXTS {
-            return Err(FsError::OutOfMemory);
-        }
-        let id = namespaces.next_context;
-        let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
-        namespaces
+        let context = proto
             .contexts
-            .insert(id, Context::new(Arc::new(Vm { _identity: id }), false));
-        let result = (|| {
-            for (mut param, engines) in params {
-                put32(&mut param, 0, id);
-                namespaces.parameter(&mut param, true, engines)?;
+            .remove(&PROTO_NAME)
+            .expect("owned private proto");
+        let default = proto.contexts.remove(&0).expect("private context0");
+        drop(proto);
+        // Linux allocates the context ID only after the chain applied.
+        let reserved = self.namespaces.lock().reserve_context();
+        let (id, nonce) = reserved?;
+        let pending = PendingContext {
+            namespaces: &self.namespaces,
+            id,
+            nonce,
+        };
+        put32(&mut request, 0, id);
+        user.write(arg, &request)?;
+        pending.publish(context, default)
+    }
+
+    /// One CREATE_EXT SETPARAM link, i915_gem_context.c::set_proto_ctx_param
+    /// on the private proto. Only lookups that Linux makes at the link
+    /// itself touch the visible namespace.
+    fn proto_parameter(
+        &self,
+        info: &DeviceInfo,
+        user: &dyn IoctlContext,
+        proto: &mut Namespaces,
+        param: &mut [u8],
+        low_latency_admitted: bool,
+    ) -> Result<(), FsError> {
+        put32(param, 0, PROTO_NAME);
+        let size = u32_at(param, 4);
+        let value = u64_at(param, 16);
+        let engines = match u64_at(param, 8) {
+            // set_proto_ctx_sseu, as GEM_CONTEXT_SETPARAM's.
+            7 => return Err(sseu_set_refusal(size)),
+            abi::CONTEXT_PARAM_ENGINES => {
+                // set_proto_ctx_engines: "Cannot set engines twice" precedes
+                // the size check and every copy.
+                proto.engines_settable(PROTO_NAME)?;
+                Some(read_engines(info, user, size, value)?)
             }
-            put32(&mut request, 0, id);
-            user.write(arg, &request)
-        })();
-        if result.is_err() {
-            namespaces.contexts.remove(&id);
-        } else {
-            namespaces.next_context = next;
-        }
-        result
+            9 => {
+                // set_proto_ctx_vm takes its i915_gem_vm_lookup reference at
+                // this link. The clone is side-effect free, so parameter()
+                // still checks size first; a replaced or unused reference is
+                // dropped after the guard.
+                if let Ok(vm_id) = u32::try_from(value) {
+                    let vm = self.namespaces.lock().vms.get(&vm_id).cloned();
+                    if let Some(vm) = vm {
+                        drop(proto.vms.insert(vm_id, vm));
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        let facts = ParamFacts::sample(info, param, true, low_latency_admitted);
+        proto.parameter(param, true, engines, facts)
+    }
+}
+
+/// set_proto_ctx_sseu / set_sseu: `args->size < sizeof(user_sseu)` is
+/// -EINVAL, then `GRAPHICS_VER(i915) != 11` (every NARF i915 profile) is
+/// -ENODEV, before the payload is copied.
+fn sseu_set_refusal(size: u32) -> FsError {
+    if size < 32 {
+        FsError::InvalidData
+    } else {
+        FsError::NoDevice
     }
 }
 
@@ -1216,44 +1769,81 @@ fn read(user: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, F
     Ok(bytes)
 }
 
-fn extensions(
-    user: &dyn IoctlContext,
-    mut address: u64,
-    mut consume: impl FnMut(u64, u32) -> Result<(), FsError>,
-) -> Result<(), FsError> {
-    let mut seen = [0; MAX_EXTENSIONS];
-    let mut count = 0;
-    while address != 0 {
-        if count == MAX_EXTENSIONS || seen[..count].contains(&address) {
-            return Err(FsError::InvalidData);
-        }
-        seen[count] = address;
-        count += 1;
-        let extension = read(user, address, 32)?;
-        if extension[12..].iter().any(|byte| *byte != 0) {
-            return Err(FsError::InvalidData);
-        }
-        consume(address, u32_at(&extension, 8))?;
-        address = u64_at(&extension, 0);
-    }
-    Ok(())
-}
+/// I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS.
+const GEM_CREATE_EXT_NEEDS_CPU_ACCESS: u32 = 1;
+/// ARRAY_SIZE(i915->mm.regions): INTEL_REGION_UNKNOWN.
+const REGION_IDS: u32 = 7;
+/// mtl_info.max_pat_index.
+const MAX_PAT_INDEX: u32 = 4;
 
-fn create_extensions(user: &dyn IoctlContext, address: u64) -> Result<(), FsError> {
-    extensions(user, address, |address, name| {
-        if name != 0 {
-            return Err(FsError::InvalidData);
+/// i915_gem_create.c's create_extensions[] table under i915_user_extensions.
+/// Returns whether SET_PAT asked for a PAT index.
+fn create_extensions(
+    info: &DeviceInfo,
+    user: &dyn IoctlContext,
+    address: u64,
+) -> Result<bool, FsError> {
+    let mut placements = false;
+    let mut pat = false;
+    abi::user_extensions(user, address, |address, name| match name {
+        // I915_GEM_CREATE_EXT_MEMORY_REGIONS: ext_set_placements copies the
+        // 48-byte drm_i915_gem_create_ext_memory_regions; set_placements
+        // folds a nonzero pad, zero regions and more than INTEL_REGION_UNKNOWN
+        // into one -EINVAL, then copies each region in turn. SYSTEM/0 is the
+        // only region NARF reports, so any other entry is missing and a
+        // second one a duplicate (-EINVAL). A second MEMORY_REGIONS
+        // extension is refused only after its regions validate.
+        0 => {
+            let extension = read(user, address, 48)?;
+            let count = u32_at(&extension, 36);
+            if u32_at(&extension, 32) != 0 || count == 0 || count > REGION_IDS {
+                return Err(FsError::InvalidData);
+            }
+            let regions = u64_at(&extension, 40);
+            for n in 0..u64::from(count) {
+                let at = regions.checked_add(n * 4).ok_or(FsError::BadAddress)?;
+                if read(user, at, 4)? != [0, 0, 0, 0] || n != 0 {
+                    return Err(FsError::InvalidData);
+                }
+            }
+            if placements {
+                return Err(FsError::InvalidData);
+            }
+            placements = true;
+            Ok(())
         }
-        let extension = read(user, address, 48)?;
-        if u32_at(&extension, 32) != 0 || u32_at(&extension, 36) != 1 {
-            return Err(FsError::InvalidData);
+        // I915_GEM_CREATE_EXT_PROTECTED_CONTENT: ext_set_protected copies the
+        // 36-byte extension and refuses nonzero flags; no NARF device enables
+        // PXP, so intel_pxp_is_enabled is false: -ENODEV.
+        1 => {
+            if u32_at(&read(user, address, 36)?, 32) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            Err(FsError::NoDevice)
         }
-        let region = read(user, u64_at(&extension, 40), 4)?;
-        if region != [0, 0, 0, 0] {
-            return Err(FsError::InvalidData);
+        // I915_GEM_CREATE_EXT_SET_PAT: ext_set_pat refuses
+        // `GRAPHICS_VER_FULL(i915) < IP_VER(12, 70)` before its copy, then
+        // checks pat_index against max_pat_index (rsvd is unchecked). Linux
+        // i915 has no descriptor past MTL; NARF's i915 ABI on later cards
+        // keeps MTL's.
+        2 => {
+            if matches!(
+                info.platform,
+                GtPlatform::Gen12(_)
+                    | GtPlatform::Alchemist
+                    | GtPlatform::Integrated(Generation::TigerLake | Generation::AlderLake)
+            ) {
+                return Err(FsError::NoDevice);
+            }
+            if u32_at(&read(user, address, 40)?, 32) > MAX_PAT_INDEX {
+                return Err(FsError::InvalidData);
+            }
+            pat = true;
+            Ok(())
         }
-        Ok(())
-    })
+        _ => Err(FsError::InvalidData),
+    })?;
+    Ok(pat)
 }
 
 /// Immutable observed facts stay queryable after an owned GT stop; no query
@@ -1271,7 +1861,23 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         1..=3 | 14 => return Err(FsError::NoDevice),
         4 => info.device_id as i32,
         5 => 1, // GEM storage is available independently of acceleration.
-        9 | 11 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
+        9 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
+        // i915_getparam.c queries published logical engines, not raw fuse
+        // presence or a different native profile's unadmitted media GT.
+        10 | 11 | 22 | 31 => {
+            let (class, logical) = match param {
+                10 => (2, 0),
+                11 => (1, 0),
+                22 => (3, 0),
+                _ => (2, 1),
+            };
+            i32::from(
+                (param == 11 || info.platform.is_gen12())
+                    && info.user_status().is_some_and(|status| {
+                        status.engines.from_class_instance(class, logical).is_some()
+                    }),
+            )
+        }
         18 => {
             if info.submission_ready() {
                 3
@@ -1290,10 +1896,48 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         ),
         33 => i32::try_from(observed_topology(info)?.dss_count()).map_err(|_| FsError::NoDevice)?,
         34 => i32::try_from(observed_topology(info)?.eu_count()).map_err(|_| FsError::NoDevice)?,
+        // Linux i915_getparam.c: full automatic reset is level1, not a
+        // bitmask. A retained physical worker must qualify this exact epoch.
+        35 => i32::from(info.user_status().is_some_and(|status| {
+            info.platform.guc().is_some()
+                && status.submission_version.0 == 1
+                && status.engines.iter().next().is_some()
+                && info
+                    .backend
+                    .as_ref()
+                    .and_then(|backend| backend.reset_availability_epoch())
+                    == Some(status.epoch)
+        })),
         40 => 4, // MMAP_OFFSET
-        // Only ENABLED: i915 priority configuration, busy stats, semaphore and
-        // preemption capability bits require their own implemented contracts.
-        41 => i32::from(info.submission_ready()),
+        43 => i32::from(info.object_async_ready()),
+        // Bounded NARF capability: Linux advertises this unconditionally.
+        // Cached callbacks only; raw capture still needs its independent owner.
+        45 => i32::from(
+            info.platform.guc().is_some()
+                && info.user_status().is_some_and(|status| {
+                    status.submission_version.0 == 1 && status.engines.bits() != 0
+                }),
+        ),
+        // i915_getparam.c writes value=-EINVAL (not an ioctl error) when
+        // GuC submission is unavailable, then uses the common put_user path.
+        59 => {
+            if crate::intel_gpu_xe::low_latency_supported(info) {
+                1
+            } else {
+                -22
+            }
+        }
+        // ENABLED and PRIORITY while live; busy-stat, semaphore, preemption
+        // and static-map bits require their own implemented contracts.
+        41 => scheduler_caps(info),
+        46 | 47 if info.platform.is_gen12() => {
+            let topology = observed_topology(info)?;
+            if param == 46 {
+                1
+            } else {
+                i32::try_from(topology.geometry_dss()).map_err(|_| FsError::NoDevice)?
+            }
+        }
         46 | 47 => {
             // xehp_sseu_info_init's software slice is not a legacy power-gating
             // mask. Linux requires full topology queries from Xe_HP onward.
@@ -1315,22 +1959,20 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             }
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
-        // Explicitly absent features; do not advertise media, perf, USERPTR,
+        // Explicitly absent features; do not advertise perf, USERPTR,
         // secure dispatch, CPU coherency or unimplemented scheduler controls.
         6..=8
-        | 10
         | 12..=13
         | 15..=17
-        | 20..=24
+        | 20..=21
+        | 23..=24
         | 27..=29
-        | 31
-        | 35..=36
+        | 36
         | 38..=39
-        | 42..=43
-        | 45
+        | 42
         | 52
         | 54
-        | 56..=59 => 0,
+        | 56..=58 => 0,
         _ => return Err(FsError::InvalidData),
     })
 }
@@ -1483,6 +2125,12 @@ pub(crate) mod tests {
         }
         pub(crate) fn load(&self, address: u64, len: usize) -> Vec<u8> {
             read(self, address, len).expect("fixture load")
+        }
+        pub(crate) fn fault_read_at(&self, address: Option<u64>) {
+            *self.fail_read.lock() = address;
+        }
+        pub(crate) fn fault_write_at(&self, address: Option<u64>) {
+            *self.fail_write.lock() = address;
         }
     }
     impl IoctlContext for User {
@@ -1673,6 +2321,8 @@ pub(crate) mod tests {
                     0x913c => 5,
                     0x9144 => 6,
                     0x9134 => 5,
+                    0x9118 => 1,    // MEML3_EN node 0
+                    0x9114 => 0x10, // GT_L3_EXC_MASK pair 0
                     _ => panic!("topology register"),
                 }
             }
@@ -2116,7 +2766,12 @@ pub(crate) mod tests {
             {
                 return Err("destroyed VM handle invalidated the context VM owner");
             }
-            put32(&mut parameter, 0, 0);
+            // A proto-context of the other open, which is the only kind
+            // whose VM is settable, cannot name this open's VM.
+            user.store(64, &[0; 8]);
+            invoke(&other, &user, abi::GEM_CONTEXT_CREATE).map_err(|_| "other create")?;
+            put32(&mut parameter, 0, u32_at(&user.load(64, 8), 0));
+            put64(&mut parameter, 16, u64::from(new_vm));
             user.store(64, &parameter);
             if invoke(&other, &user, abi::GEM_CONTEXT_SETPARAM) != Err(FsError::NotFound) {
                 return Err("foreign VM resolved");
@@ -2127,6 +2782,65 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_context_vm_lifetime_and_foreign_ids
+    );
+
+    /// MIT Linux b90c984d i915_gem_context.c: set_proto_ctx_vm:366 checks
+    /// size (-EINVAL), upper_32_bits and the lookup (-ENOENT) on a
+    /// proto-context; ctx_setparam:2190 refuses VM on a finalized one
+    /// (-EINVAL) before reading size or value.
+    fn smoke_i915_setparam_vm_only_on_a_proto_context() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+            user.store(64, &[0; 16]);
+            invoke(&file, &user, abi::GEM_VM_CREATE).map_err(|_| "VM create")?;
+            let vm = u64::from(u32_at(&user.load(64, 16), 12));
+            user.store(64, &[0; 8]);
+            invoke(&file, &user, abi::GEM_CONTEXT_CREATE).map_err(|_| "create")?;
+            let proto = u32_at(&user.load(64, 8), 0);
+            let set = |id: u32, size: u32, value: u64| {
+                let mut parameter = [0; 24];
+                put32(&mut parameter, 0, id);
+                put32(&mut parameter, 4, size);
+                put64(&mut parameter, 8, abi::CONTEXT_PARAM_VM);
+                put64(&mut parameter, 16, value);
+                user.store(64, &parameter);
+                invoke(&file, &user, abi::GEM_CONTEXT_SETPARAM)
+            };
+            // Context 0 is finalized at open.
+            for (size, value) in [(0, vm), (1, vm), (0, vm + 1), (0, 1 << 32)] {
+                if set(0, size, value) != Err(FsError::InvalidData) {
+                    return Err("ctx_setparam accepted VM");
+                }
+            }
+            for (size, value, expected, why) in [
+                (1, vm, Err(FsError::InvalidData), "proto size"),
+                (0, vm | 1 << 32, Err(FsError::NotFound), "upper_32_bits"),
+                (0, vm + 1, Err(FsError::NotFound), "lookup"),
+                (0, vm, Ok(0), "proto VM"),
+            ] {
+                if set(proto, size, value) != expected {
+                    return Err(why);
+                }
+            }
+            // GETPARAM's lookup finalizes the proto: its VM is now fixed.
+            let mut get = [0; 24];
+            put32(&mut get, 0, proto);
+            put64(&mut get, 8, abi::CONTEXT_PARAM_VM);
+            user.store(64, &get);
+            invoke(&file, &user, abi::GEM_CONTEXT_GETPARAM).map_err(|_| "get VM")?;
+            if u64_at(&user.load(64, 24), 16) != vm {
+                return Err("bound VM");
+            }
+            if set(proto, 0, vm) != Err(FsError::InvalidData) {
+                return Err("finalized context rebound its VM");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_setparam_vm_only_on_a_proto_context
     );
 
     fn smoke_intel_extension_validation_is_transactional() -> TestResult {
@@ -2142,7 +2856,11 @@ pub(crate) mod tests {
             put64(&mut extension, 48, 1);
             user.store(64, &request);
             user.store(256, &extension);
-            if invoke(&file, &user, abi::GEM_CONTEXT_CREATE_EXT) != Err(FsError::InvalidData) {
+            // i915_user_extensions keeps no visited set: the self-referencing
+            // SETPARAM is applied 512 times and the 513th link is -E2BIG.
+            if invoke(&file, &user, abi::GEM_CONTEXT_CREATE_EXT)
+                != Err(FsError::ArgumentListTooLong)
+            {
                 return Err("cyclic context extension");
             }
             if file.namespaces.lock().next_context != 1 {
@@ -2159,6 +2877,7 @@ pub(crate) mod tests {
                 .get(&1)
                 .expect("context")
                 .no_error_capture
+                .protected()
             {
                 return Err("context creation extension ignored");
             }
@@ -2170,15 +2889,317 @@ pub(crate) mod tests {
         smoke_intel_extension_validation_is_transactional
     );
 
+    /// Destroys one VM handle from inside the outer ioctl's first copy-in of
+    /// the extension link at `at`.
+    struct DestroyVmOnRead<'a> {
+        file: &'a RenderFile,
+        user: &'a User,
+        at: u64,
+        vm: u32,
+        done: core::sync::atomic::AtomicBool,
+    }
+    impl IoctlContext for DestroyVmOnRead<'_> {
+        fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError> {
+            if address == self.at && !self.done.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                let nested = User::new();
+                let mut destroy = [0; 16];
+                put32(&mut destroy, 12, self.vm);
+                nested.store(64, &destroy);
+                invoke(self.file, &nested, abi::GEM_VM_DESTROY).expect("nested VM destroy");
+            }
+            self.user.read(address, destination)
+        }
+        fn write(&self, address: u64, source: &[u8]) -> Result<(), FsError> {
+            self.user.write(address, source)
+        }
+        fn nonblocking(&self) -> bool {
+            false
+        }
+    }
+
+    /// MIT Linux b90c984d i915_gem_context.c::create_setparam:2265 applies
+    /// each SETPARAM link through set_proto_ctx_param:877 as
+    /// i915_user_extensions reaches it, and i915_gem_context_create_ioctl
+    /// allocates the ID only after the chain. A link's own errno therefore
+    /// wins over a later unreadable link, and set_proto_ctx_vm's lookup
+    /// happens at its link.
+    fn smoke_i915_context_create_ext_applies_each_setparam_at_its_link() -> TestResult {
+        check(|| {
+            const UNREADABLE: u64 = 0x7fff_0000;
+            let file = RenderFile::new();
+            let user = User::new();
+            user.store(64, &[0; 16]);
+            invoke(&file, &user, abi::GEM_VM_CREATE).map_err(|_| "VM create")?;
+            let vm = u32_at(&user.load(64, 16), 12);
+            // A SETPARAM link: next_extension, then drm_i915_gem_context_param.
+            let link = |at: u64, next: u64, size: u32, param: u64, value: u64| {
+                let mut ext = [0; 56];
+                put64(&mut ext, 0, next);
+                put32(&mut ext, 36, size);
+                put64(&mut ext, 40, param);
+                put64(&mut ext, 48, value);
+                user.store(at, &ext);
+            };
+            let request = |chain: u64| {
+                let mut request = [0; 16];
+                put32(&mut request, 4, 1);
+                put64(&mut request, 8, chain);
+                user.store(64, &request);
+            };
+            let create = |chain: u64| {
+                request(chain);
+                invoke(&file, &user, abi::GEM_CONTEXT_CREATE_EXT)
+            };
+            // Each refusal is set_proto_ctx_param's at the first link; the
+            // second link's address is unreadable and is never reached.
+            for (size, param, value, expected, why) in [
+                (1, 4, 1, FsError::InvalidData, "NO_ERROR_CAPTURE size"),
+                (1, 9, u64::from(vm), FsError::InvalidData, "VM size"),
+                (0, 9, 1 << 32, FsError::NotFound, "VM upper_32_bits"),
+                (0, 9, u64::from(vm) + 1, FsError::NotFound, "VM lookup"),
+                (31, 7, 0, FsError::InvalidData, "SSEU size"),
+                (32, 7, 0, FsError::NoDevice, "SSEU GRAPHICS_VER != 11"),
+                (
+                    0,
+                    abi::CONTEXT_PARAM_LOW_LATENCY,
+                    0,
+                    FsError::InvalidData,
+                    "LOW_LATENCY",
+                ),
+                (
+                    4,
+                    abi::CONTEXT_PARAM_ENGINES,
+                    0,
+                    FsError::InvalidData,
+                    "ENGINES size",
+                ),
+                (0, u64::MAX, 0, FsError::InvalidData, "unknown parameter"),
+            ] {
+                link(256, UNREADABLE, size, param, value);
+                if create(256) != Err(expected) {
+                    return Err(why);
+                }
+            }
+            // A link that applies continues the walk into the unreadable one.
+            link(256, UNREADABLE, 0, 4, 1);
+            if create(256) != Err(FsError::BadAddress) {
+                return Err("an applied link did not continue the walk");
+            }
+            // The first refusing link wins over a later refusing one.
+            link(256, 512, 0, 4, 1);
+            link(512, 768, 32, 7, 0);
+            link(768, UNREADABLE, 0, 9, u64::from(vm) + 1);
+            if create(256) != Err(FsError::NoDevice) {
+                return Err("a later link's errno won");
+            }
+            if file.namespaces.lock().next_context != 1 {
+                return Err("a failed chain reserved a context name");
+            }
+            // set_proto_ctx_vm took its reference at the VM link, so the
+            // handle's destruction while a later link is read leaves the
+            // proto bound to that VM.
+            let original = file.namespaces.lock().vms.get(&vm).cloned().ok_or("VM")?;
+            link(256, 512, 0, 9, u64::from(vm));
+            link(512, 0, 0, 4, 1);
+            request(256);
+            let reentrant = DestroyVmOnRead {
+                file: &file,
+                user: &user,
+                at: 512 + 12,
+                vm,
+                done: core::sync::atomic::AtomicBool::new(false),
+            };
+            file.dispatch(
+                &info(Generation::MeteorLake),
+                abi::GEM_CONTEXT_CREATE_EXT,
+                64,
+                &reentrant,
+            )
+            .expect("Intel command")
+            .map_err(|_| "VM destroyed after its link")?;
+            let id = u32_at(&user.load(64, 16), 0);
+            let namespaces = file.namespaces.lock();
+            if namespaces.vms.contains_key(&vm)
+                || !Arc::ptr_eq(
+                    &namespaces.contexts.get(&id).ok_or("context")?.vm,
+                    &original,
+                )
+            {
+                return Err("VM was not resolved at its own link");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_context_create_ext_applies_each_setparam_at_its_link
+    );
+
+    /// MIT Linux b90c984d i915_gem_create.c::{i915_gem_create_ext_ioctl,
+    /// ext_set_placements,set_placements,ext_set_protected,ext_set_pat}.
+    fn smoke_intel_gem_create_ext_follows_linux_table() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+            let create = |info: &DeviceInfo, flags: u32, extensions: u64, size: u64| {
+                let mut request = [0; 24];
+                put64(&mut request, 0, size);
+                put32(&mut request, 12, flags);
+                put64(&mut request, 16, extensions);
+                user.store(64, &request);
+                file.dispatch(info, abi::GEM_CREATE_EXT, 64, &user)
+                    .expect("Intel command")
+                    .map(|_| u32_at(&user.load(64, 24), 8))
+            };
+            let mtl = info(Generation::MeteorLake);
+            let tgl = info(Generation::TigerLake);
+            // A link at `at` naming `name`, with `next` and its body words.
+            let link = |at: u64, next: u64, name: u32, words: &[(usize, u64)]| {
+                let mut extension = [0; 48];
+                put64(&mut extension, 0, next);
+                put32(&mut extension, 8, name);
+                for (offset, value) in words {
+                    extension[*offset..*offset + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                user.store(at, &extension);
+            };
+            // drm_i915_gem_memory_class_instance SYSTEM/0 at 4096.
+            user.store(4096, &[0; 8]);
+            let regions = |at: u64, next: u64, count: u64, array: u64| {
+                link(at, next, 0, &[(32, count << 32), (40, array)]);
+            };
+            let first = create(&mtl, 0, 0, 4096).map_err(|_| "plain create")?;
+
+            // Unknown flags precede the chain; NEEDS_CPU_ACCESS follows it
+            // and, with SYSTEM the only placement, is -EINVAL.
+            if create(&mtl, 2, 40000, 4096) != Err(FsError::InvalidData)
+                || create(&mtl, 1, 40000, 4096) != Err(FsError::BadAddress)
+            {
+                return Err("GEM_CREATE_EXT flag order");
+            }
+            regions(1024, 0, 1, 4096);
+            if create(&mtl, 1, 1024, 4096) != Err(FsError::InvalidData)
+                || create(&mtl, 1, 0, 4096) != Err(FsError::InvalidData)
+            {
+                return Err("NEEDS_CPU_ACCESS with one placement");
+            }
+
+            // MEMORY_REGIONS: pad, zero and more than INTEL_REGION_UNKNOWN
+            // regions are -EINVAL; each region is copied in turn, so a
+            // second region is -EFAULT when unreadable and otherwise a
+            // missing or duplicate SYSTEM/0 (-EINVAL).
+            for (count, pad, array) in [(0, 0, 4096), (8, 0, 4096), (1, 1, 4096)] {
+                link(1024, 0, 0, &[(32, count << 32 | pad), (40, array)]);
+                if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                    return Err("memory-regions header");
+                }
+            }
+            for (array, expected) in [(32764, FsError::BadAddress), (4096, FsError::InvalidData)] {
+                user.store(32764, &[0; 4]);
+                regions(1024, 0, 2, array);
+                if create(&mtl, 0, 1024, 4096) != Err(expected) {
+                    return Err("second region copy");
+                }
+            }
+            user.store(4100, &[1, 0, 0, 0]);
+            regions(1024, 0, 1, 4100);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("missing region");
+            }
+            // A second MEMORY_REGIONS extension validates its regions
+            // first, then finds the placements already set: -EINVAL, as
+            // is the same extension visited twice.
+            regions(1024, 1088, 1, 4096);
+            regions(1088, 0, 1, 32766);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::BadAddress) {
+                return Err("second extension's regions");
+            }
+            regions(1088, 0, 1, 4096);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("second placement extension");
+            }
+            regions(1024, 1024, 1, 4096);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("revisited placement extension");
+            }
+            regions(1024, 0, 1, 4096);
+            let placed = create(&mtl, 0, 1024, 4096).map_err(|_| "SYSTEM placement")?;
+            if placed != first + 1 {
+                return Err("a refused create consumed a handle");
+            }
+
+            // PROTECTED_CONTENT copies 36 bytes, refuses flags, then has no
+            // enabled PXP: -ENODEV.
+            for (at, flags, expected) in [
+                (1024, 1, FsError::InvalidData),
+                (1024, 0, FsError::NoDevice),
+                (32768 - 32, 0, FsError::BadAddress),
+            ] {
+                user.store(at, &[0; 32]);
+                user.store(at + 8, &1u32.to_le_bytes());
+                if at == 1024 {
+                    user.store(1056, &(flags as u32).to_le_bytes());
+                }
+                if create(&mtl, 0, at, 4096) != Err(expected) {
+                    return Err("protected content");
+                }
+            }
+
+            // SET_PAT: before IP 12.70 it is -ENODEV without a copy; on
+            // MTL the 40-byte body is copied (-EFAULT) and pat_index above
+            // max_pat_index (4) is -EINVAL. The chain goes on past an
+            // accepted index, and the object's own size check precedes the
+            // index's application.
+            user.store(32768 - 32, &[0; 32]);
+            user.store(32768 - 24, &2u32.to_le_bytes());
+            if create(&tgl, 0, 32768 - 32, 4096) != Err(FsError::NoDevice)
+                || create(&mtl, 0, 32768 - 32, 4096) != Err(FsError::BadAddress)
+            {
+                return Err("SET_PAT gate and copy");
+            }
+            link(1024, 0, 2, &[(32, 5)]);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("pat_index above max_pat_index");
+            }
+            link(1024, 1088, 2, &[(32, 4)]);
+            link(1088, 0, 1, &[]);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::NoDevice) {
+                return Err("link after SET_PAT");
+            }
+            link(1024, 0, 2, &[(32, 4)]);
+            if create(&mtl, 0, 1024, 0) != Err(FsError::InvalidData) {
+                return Err("object size before PAT");
+            }
+            // LINUX-GAP: Linux sets the index on the new object; NARF has
+            // no per-object PAT and publishes nothing.
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::NotImplemented) {
+                return Err("SET_PAT refusal");
+            }
+            // Names past SET_PAT have no table entry.
+            link(1024, 0, 3, &[]);
+            if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
+                return Err("unknown create extension");
+            }
+            if create(&mtl, 0, 0, 4096) != Ok(placed + 1) {
+                return Err("a refused create consumed a handle");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_intel_gem_create_ext_follows_linux_table
+    );
+
     fn smoke_intel_generation_admission_is_independent_of_display() -> TestResult {
         check(|| {
             for entry in crate::intel_gpu::DEVICE_TABLE {
                 let expected = match entry.generation {
-                    Generation::TigerLake | Generation::AlderLake => {
-                        SubmissionProfile::Gen12Execlists
-                    }
+                    Generation::TigerLake | Generation::AlderLake => SubmissionProfile::Gen12GuC,
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
-                    Generation::PantherLake => SubmissionProfile::Unsupported,
+                    Generation::LunarLake | Generation::PantherLake => {
+                        SubmissionProfile::Unsupported
+                    }
                 };
                 if SubmissionProfile::for_generation(entry.generation) != expected {
                     return Err("submission generation dispatch");
@@ -2428,6 +3449,27 @@ pub(crate) mod tests {
             if u64_at(&reply, 8) != file.gem.mmap_offset(handle).map_err(|_| "offset")? {
                 return Err("mmap wire offset");
             }
+            // Linux never checks pad. Extensions are walked with an empty
+            // table before the flags: an unreadable link is -EFAULT, a
+            // readable one -EINVAL, even under an unsupported flags value.
+            put32(&mut request, 4, 0xa5a5_a5a5);
+            user.store(64, &request);
+            invoke(&file, &user, abi::GEM_MMAP_OFFSET).map_err(|_| "mmap offset pad")?;
+            put32(&mut request, 4, 0);
+            user.store(30000, &[0; 32]);
+            for (flags, extensions, expected) in [
+                (2, 40000, FsError::BadAddress),
+                (7, 40000, FsError::BadAddress),
+                (2, 30000, FsError::InvalidData),
+            ] {
+                put64(&mut request, 16, flags);
+                put64(&mut request, 24, extensions);
+                user.store(64, &request);
+                if invoke(&file, &user, abi::GEM_MMAP_OFFSET) != Err(expected) {
+                    return Err("mmap offset extensions");
+                }
+            }
+            put64(&mut request, 24, 0);
             put64(&mut request, 16, 1); // WC cannot be implemented by a WB RAM alias.
             user.store(64, &request);
             if invoke(&file, &user, abi::GEM_MMAP_OFFSET) != Err(FsError::InvalidData) {

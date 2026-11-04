@@ -968,8 +968,17 @@ child suspend queues an idle check on the parent. `put_autosuspend` marks
 the device busy, as in current Linux. The state lock is never held across
 an await: callbacks run unlocked and synchronous callers park on a waker
 list. Dropping a future while its device callback runs records the sticky
-`Cancelled` error and wakes every waiter; `set_active`/`set_suspended`
-while disabled clear it. `RpmActiveRef` is the RAII
+`Cancelled` error and wakes every waiter. `disable()` can retire this
+abandoned transition because the owned callback future has already been
+dropped; it preserves the uncertain transitional status and error rather than
+claiming a hardware power state. Stale work/timers cannot restart the disabled
+device. `set_active`/`set_suspended` while disabled clear the error after the
+caller independently establishes that hardware state.
+`state()` also samples saturating `active_time_ns` and `suspended_time_ns`
+without waking the device. Time counts only while runtime PM is enabled;
+only `Suspended` contributes to suspended time, and transitions or failures
+contribute to active time. Disabled intervals are excluded, with no double
+counting across snapshots, transitions or nested enable/disable. `RpmActiveRef` is the RAII
 `get_sync … put_autosuspend` pair.
 
 `runtime_pm_pci` is the PCI bus layer (`pci_pm_runtime_*`):

@@ -203,3 +203,152 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dsb",
     smoke_dsb_timeout_drop_retains_real_dma_pages_and_exclusive_lease
 );
+
+fn smoke_gen12_dsb_native_timing_w1c_mask_pat_free_and_same_va_retention() -> TestResult {
+    let p = MockPlatform::new();
+    let timing = p.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::AlderLakeP);
+    p.set(IER, 8 | (1 << 5));
+    p.set(IMR, u32::MAX & !8);
+    p.set(IIR, 8 | (1 << 7));
+    let mut owner = match Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16]) {
+        Ok(owner) => owner,
+        Err(FsError::NotImplemented) => {
+            assert!(cfg!(target_arch = "aarch64"));
+            return TestResult::Pass;
+        }
+        Err(e) => panic!("Gen12 DSB reserve: {e:?}"),
+    };
+    assert_eq!(owner.ints, 0x0f);
+    assert_eq!(owner.errors, 0x0e);
+    assert_eq!(timing.check(&p, Some([6, 8, 10, 12, 14, 16])), Ok(31));
+    assert_eq!(
+        timing.check(&p, Some([65535; 6])),
+        Err(FsError::Unsupported)
+    );
+    assert_eq!(
+        owner.arm_color(timing, &[], Some(&[0; 1024]), None, p.now()),
+        Err(FsError::Unsupported)
+    );
+    assert!(p.dsb_mappings().is_empty());
+    owner.arm(timing, &[(0x700a0, 0)], None, p.now()).unwrap();
+    let mapping = p.dsb_mappings();
+    assert!(!mapping.is_empty());
+    for &(r, v) in &mapping {
+        if r % 8 == 0 {
+            assert_eq!(v & 4095, 1);
+            assert!(p.read32(r + 4) < 128);
+        } else {
+            assert!(v < 128);
+        }
+    }
+    for _ in 0..8 {
+        if owner.poll(p.now()).unwrap() {
+            break;
+        }
+        p.step();
+    }
+    assert!(owner.poll(p.now()).unwrap());
+    owner.shutdown().unwrap();
+    assert_eq!(p.read32(IER), 8 | (1 << 5));
+    assert_eq!(p.read32(IMR), u32::MAX & !8);
+    assert_eq!(p.read32(IIR) & (8 | (1 << 7)), 8 | (1 << 7));
+    assert!(p
+        .dsb_writes()
+        .iter()
+        .filter(|&&(r, _)| r == reg(0, 0x28) || r == reg(1, 0x28))
+        .all(|&(_, v)| v & ((1 << 4) | (1 << 20)) == 0));
+    assert_eq!(
+        p.read32(reg(0, 0x28)) & (1 << 4),
+        0,
+        "nonexistent status bit must never be set by W1C"
+    );
+    owner.arm(timing, &[(0x700a0, 0)], None, p.now()).unwrap();
+    for _ in 0..8 {
+        if owner.poll(p.now()).unwrap() {
+            break;
+        }
+        p.step();
+    }
+    owner.shutdown().unwrap();
+    assert_eq!(p.dsb_mappings(), mapping);
+    assert_eq!(p.forbidden_display_reads(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dsb",
+    smoke_gen12_dsb_native_timing_w1c_mask_pat_free_and_same_va_retention
+);
+
+fn smoke_gen12_dsb_reserved_ats_state_and_unsafe_timing_refuse_before_dma() -> TestResult {
+    for (r, v) in [(reg(0, 0x28), 1 << 4), (reg(1, 0x28), 1 << 20)] {
+        let p = MockPlatform::new();
+        p.set(r, v);
+        assert!(matches!(
+            Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16]),
+            Err(FsError::Unsupported)
+        ));
+        assert!(p.dsb_mappings().is_empty());
+        assert!(p.dsb_writes().is_empty());
+    }
+    for (r, v) in [
+        (0x60800, ENABLE),
+        (0x60420, 1 << 27),
+        (0x60010, 0),
+        (0x70008, 3 << 30 | 1 << 21),
+    ] {
+        let p = MockPlatform::new();
+        let timing = p.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        let mut owner = match Owner::reserve_gen12(p.clone(), 0x1000000, [6, 8, 10, 12, 14, 16]) {
+            Ok(owner) => owner,
+            Err(FsError::NotImplemented) => return TestResult::Pass,
+            Err(e) => panic!("{e:?}"),
+        };
+        p.set(r, v);
+        assert!(owner.arm(timing, &[], None, p.now()).is_err());
+        assert!(!owner.exposed());
+        assert!(p.dsb_mappings().is_empty());
+        assert!(p.dsb_writes().is_empty());
+        assert_eq!(p.forbidden_display_reads(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dsb",
+    smoke_gen12_dsb_reserved_ats_state_and_unsafe_timing_refuse_before_dma
+);
+
+fn smoke_dsb_display14_timing_proves_vblank_end_only() -> TestResult {
+    // intel_set_transcoder_timings clears TRANS_VBLANK's start field on
+    // display 13+ (the hardware ignores it), so the display-14 proof (no
+    // Gen12 latency table) compares VBLANK_END alone. The Gen12 proof keeps
+    // the full value the Gen12 orchestrator writes.
+    let p = MockPlatform::new();
+    let t = p.dsb_timing();
+    let inherited = t.check(&p, None);
+    if inherited.is_err() {
+        return TestResult::Fail("the inherited display-14 timing must prove");
+    }
+    p.set(0x60010, 76 << 16);
+    if t.check(&p, None) != inherited {
+        return TestResult::Fail("a cleared VBLANK_START must prove on display 14");
+    }
+    p.set(0x60010, 75 << 16);
+    if t.check(&p, None) != Err(FsError::Unsupported) {
+        return TestResult::Fail("a moved VBLANK_END must still refuse on display 14");
+    }
+    let lat = [6, 8, 10, 12, 14, 16];
+    let g = MockPlatform::new();
+    let timing = g.gen12_cursor_resources(crate::intel_gpu_gt::Gen12Platform::AlderLakeP);
+    if timing.check(&g, Some(lat)) != Ok(31) {
+        return TestResult::Fail("the Gen12 timing must prove");
+    }
+    g.set(0x60010, 76 << 16);
+    if timing.check(&g, Some(lat)) != Err(FsError::Unsupported) {
+        return TestResult::Fail("Gen12 keeps proving VBLANK_START");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dsb",
+    smoke_dsb_display14_timing_proves_vblank_end_only
+);

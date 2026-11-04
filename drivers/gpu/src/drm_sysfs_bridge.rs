@@ -390,6 +390,8 @@ fn populate_card_node(
     // Linux tools (`/sys/class/drm/card<N>/device/pp_features`) look.
     add_power_controls(&kobj, &card);
     add_power_controls(&dev_kobj, &card);
+    #[cfg(feature = "intel")]
+    crate::intel_gpu_power_controls::runtime::populate_card(idx, &dev_kobj);
 
     // ── /sys/class/drm/card<N> + /sys/dev/char/226:<N> symlinks → the node ──
     class_drm.add_symlink(card_name.clone(), format!("{minor_prefix}/{card_name}"));

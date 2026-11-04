@@ -32,13 +32,37 @@ impl queue::Worker for Worker {
     }
 }
 fn run<F: Future>(future: F) -> F::Output {
+    // Queue::wait_dependencies re-checks fences after a real-time 100us
+    // SleepUntil, so a fixed poll count finishes before that sleep expires on
+    // a fast KVM host. Bound the noop-waker loop by elapsed time instead.
+    let deadline = narf_time::monotonic_ns().saturating_add(1_000_000_000);
     let mut f = Box::pin(future);
-    for _ in 0..256 {
+    loop {
         if let Poll::Ready(r) = f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             return r;
         }
+        if narf_time::monotonic_ns() >= deadline {
+            panic!("cursor worker did not finish")
+        }
     }
-    panic!("cursor worker did not finish")
+}
+#[cfg(target_arch = "x86_64")]
+fn poll_cursor_armed<F: Future>(p: &MockPlatform, mut task: core::pin::Pin<&mut F>) {
+    // The caller stalls DSB0 so that preparation cannot pass through the
+    // actual DMA exposure before cancellation/fault injection observes it.
+    for _ in 0..32 {
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        if p.read32(0x70b08) & (1 << 31) != 0
+            && !p.dsb_mappings().is_empty()
+            && !p.cursor_mappings().is_empty()
+        {
+            return;
+        }
+    }
+    panic!("cursor fixture did not expose its retained DMA arm");
 }
 fn request(cpu: &Cpu, flags: u32, handle: u32, x: i32, y: i32) {
     let values = [flags, 1, x as u32, y as u32, 64, 64, handle, 7, 9];
@@ -417,6 +441,9 @@ fn smoke_intel_cursor_unowned_resources_and_missing_live_latch_never_publish_suc
     let p = MockPlatform::new();
     p.dsb_timing();
     let mode = mode();
+    // Advertised support does not substitute for the runtime resource proof.
+    // This case deliberately omits the hardware cursor resource setup.
+    mode.lock().intel_hw_cursor = true;
     let q = queue::Queue::new(mode);
     let mut worker = Worker {
         device: Arc::new(p.meteor()),
@@ -512,4 +539,38 @@ fn smoke_intel_cursor_writer_dependency_and_handle_close_keep_only_owned_resourc
 kernel_test_in!(
     "drivers/gpu/intel_gpu_cursor",
     smoke_intel_cursor_writer_dependency_and_handle_close_keep_only_owned_resources
+);
+
+mod gen12 {
+    include!("intel_gpu_gen12_cursor_ioctl_tests.rs");
+}
+
+fn smoke_intel_cursor_mtl_raw_cursor_fault_retains_dma_and_refuses_success() -> TestResult {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (p, _, q, mut worker, cpu) = fixture();
+        let (gem, handle) = make_gem();
+        p.stall_dsb(0, true);
+        request(&cpu, 3, handle, 1, 2);
+        let done = submit(&q, &cpu, &gem);
+        let mut task = Box::pin(q.run(&mut worker));
+        poll_cursor_armed(&p, task.as_mut());
+        let dsb = p.dsb_mappings();
+        let cursor = p.cursor_mappings();
+        assert!(!dsb.is_empty() && !cursor.is_empty());
+        // intel_display_regs.h GEN9_PIPE_CURSOR_FAULT is bit 11 on MTL too.
+        p.set(0x44408, 1 << 11);
+        p.stall_dsb(0, false);
+        run(task);
+        assert!(done.status() < 0);
+        assert_eq!(p.dsb_mappings(), dsb);
+        assert_eq!(p.cursor_mappings(), cursor);
+        assert_ne!(p.read32(0x44408) & (1 << 11), 0);
+        assert!(run(worker.device.session()).is_err());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_cursor",
+    smoke_intel_cursor_mtl_raw_cursor_fault_retains_dma_and_refuses_success
 );

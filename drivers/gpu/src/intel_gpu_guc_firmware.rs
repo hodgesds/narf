@@ -82,7 +82,16 @@ impl GuCFirmware {
         generation: Generation,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        Self::open_for_platform(GtPlatform::Integrated(generation), authority)
+        let platform = match generation {
+            Generation::TigerLake => {
+                GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
+            }
+            // ADL spans different firmware families; an ambiguous generation
+            // cannot choose ADL-P versus ADL-S/N's asset. Use PCI identity.
+            Generation::AlderLake => return Err(FirmwareError::Unsupported),
+            _ => GtPlatform::Integrated(generation),
+        };
+        Self::open_for_platform(platform, authority)
     }
 
     pub fn open_for_platform(
@@ -106,6 +115,19 @@ impl GuCFirmware {
         )
         .expect("immutable authorized GuC image")
     }
+
+    /// Native-test image from fixture bytes, with the registry path's exact
+    /// profile/version/signature validation. Not reachable in production.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn from_fixture(platform: GtPlatform, bytes: &[u8]) -> Result<Self, FirmwareError> {
+        validate(platform.guc().ok_or(FirmwareError::Unsupported)?, bytes)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            platform,
+            digest: [0; 32],
+            signer: None,
+        })
+    }
 }
 
 #[cfg(feature = "kernel-test")]
@@ -122,7 +144,7 @@ mod tests {
             Err(FirmwareError::Revoked)
         ) || !matches!(
             GuCFirmware::open(Generation::PantherLake, &read),
-            Err(FirmwareError::Unsupported)
+            Err(FirmwareError::Revoked)
         ) {
             return TestResult::Fail("firmware acquisition bypassed authority or generation");
         }

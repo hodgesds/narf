@@ -315,18 +315,31 @@ fn smoke_i915_balanced_extension_order_rollback_and_bounds() -> TestResult {
         );
     }
     // A later bad extension cannot publish the first extension's valid slot.
+    // i915_user_extensions keeps no visited set, so a link that names itself
+    // is applied again and, like a second link for the same slot, finds it
+    // occupied: -EEXIST (this pinned -EINVAL for the self-reference).
     for later in [7168u64, 7296] {
         balanced_map(&user.wire, id, &[(0xffff, 0xffff)], 0, &[(4, 0), (4, 1)]);
         balance(&user.wire, 7296, 0, &[(4, 0)]);
         user.wire.store(7168, &later.to_le_bytes());
         assert_eq!(
             file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
-            Some(Err(if later == 7168 {
-                FsError::InvalidData
-            } else {
-                FsError::AlreadyExists
-            }))
+            Some(Err(FsError::AlreadyExists))
         );
+    }
+    // next_extension is read only after the handler: with it unreadable, the
+    // occupied-slot -EEXIST wins, and a handler that succeeds leaves -EFAULT.
+    for (entries, expected) in [
+        (alloc::vec![(1, 0)], FsError::AlreadyExists),
+        (alloc::vec![(0xffff, 0xffff)], FsError::BadAddress),
+    ] {
+        balanced_map(&user.wire, id, &entries, 0, &[(4, 0), (4, 1)]);
+        user.wire.fault_read_at(Some(7168));
+        assert_eq!(
+            file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+            Some(Err(expected))
+        );
+        user.wire.fault_read_at(None);
     }
     // Destination errors precede an unreadable sibling count/body.
     for (entries, index, expected) in [
@@ -358,22 +371,24 @@ fn smoke_i915_balanced_extension_order_rollback_and_bounds() -> TestResult {
         file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
         Some(Err(FsError::BadAddress))
     );
-    // Sixteen no-op extensions are bounded; a seventeenth is refused.
-    for count in [17u64, 16] {
-        let param = engines_param(&user.wire, id, &[(0xffff, 0xffff)], 8192);
+    // i915_user_extensions' stackdepth is 512: 512 no-op links are walked and
+    // a 513th is -E2BIG (this pinned a 16-link bound and -EINVAL). The map
+    // sits above the 48-byte links.
+    for count in [513u64, 512] {
+        let param = engines_param(&user.wire, id, &[(0xffff, 0xffff)], 32000);
         for n in 0..count {
-            let at = 10000 + n * 64;
+            let at = 128 + n * 48;
             balance(&user.wire, at, 0, &[]);
             if n + 1 < count {
-                user.wire.store(at, &(at + 64).to_le_bytes());
+                user.wire.store(at, &(at + 48).to_le_bytes());
             }
         }
-        user.wire.store(8192, &10000u64.to_le_bytes());
+        user.wire.store(32000, &128u64.to_le_bytes());
         user.wire.store(64, &param);
         assert_eq!(
             file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
-            Some(if count == 17 {
-                Err(FsError::InvalidData)
+            Some(if count == 513 {
+                Err(FsError::ArgumentListTooLong)
             } else {
                 Ok(0)
             })
@@ -770,7 +785,7 @@ fn smoke_i915_xe_exact_dispatch_discovery_sseu_and_wc_refusal() -> TestResult {
         assert_eq!(u64_at(&sseu, 8), 1);
         assert_eq!(
             u64_at(&sseu, 16),
-            u64::from((topology.geometry_dss() | topology.compute_dss()) & 255)
+            ((topology.geometry_dss() | topology.compute_dss()) & 255) as u64
         );
         let mut version = [0; 64];
         put64(&mut version, 16, 8);
@@ -911,3 +926,19 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_i915_balance",
     smoke_i915_native_vram_handle_keeps_placement_and_refuses_wb_compatibility
 );
+
+mod media {
+    include!("intel_gpu_i915_media_tests.rs");
+}
+
+mod object_async {
+    include!("intel_gpu_i915_async_tests.rs");
+}
+
+mod low_latency {
+    include!("intel_gpu_i915_low_latency_tests.rs");
+}
+
+mod capture {
+    include!("intel_gpu_i915_capture_tests.rs");
+}

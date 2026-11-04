@@ -319,6 +319,7 @@ mod tests {
                 0xa5a55a5a | if release == 1 { 0x04002000 } else { 0x2000 }
             );
             assert_eq!(r[&0xe7cc], 0xa5a55a5a | 0x9000);
+            assert_eq!(r[&0xe48c], 0xa5a55a5a | 0x200);
             assert_eq!(r[&0x20d4], 0xa5a55a5a | 0xc080);
             assert_eq!(r[&0x3ee0d4], 0xa5a55a5a | 0xc080);
             assert_eq!(r[&0x3ee050], 0xa5a55a5a | 0x1000);
@@ -407,12 +408,21 @@ mod tests {
                 w.unavailable.set(0xe7cc);
             }
             if failure == 2 {
+                // The default sentinel already has DISABLE_TDL_PUSH bit9
+                // set. Require an actual change before rejecting the write.
+                w.regs.borrow_mut().insert(0xe48c, 0);
                 w.reject.set(0xe48c);
             }
             if failure == 3 {
                 w.reject.set(0xfd4);
             }
-            assert!(matches!(init.poll(&w, 11), Poll::Ready(Err(_))));
+            let error = match failure {
+                1 => RegisterError::Unavailable,
+                2 => RegisterError::Verify(0xe48c),
+                3 => RegisterError::Verify(0xfd4),
+                _ => unreachable!(),
+            };
+            assert_eq!(init.poll(&w, 11), Poll::Ready(Err(error)));
             assert_eq!(w.regs.borrow()[&0xfd4], 0x80000101);
             assert_eq!(w.writes.borrow().last(), Some(&(0xfd0, 1)));
             if failure == 1 {
@@ -457,6 +467,8 @@ pub(crate) struct RegisterInit {
     /// Physically present CCS instances (bit n = CCSn).
     compute: u8,
     compute_mode: u8,
+    media: crate::intel_gpu_engine::EngineSet,
+    media_fuse: Option<u32>,
     deadline: u64,
 }
 
@@ -473,12 +485,12 @@ impl RegisterInit {
         Self::with_ccs_mode(mmio, platform, device, topology, config, now, 1)
     }
 
-    pub(crate) fn with_ccs_mode(
+    pub(crate) fn with_ccs_mode<'a>(
         mmio: &impl MmioWindow,
         platform: GtPlatform,
         device: u16,
         topology: &GtTopology,
-        config: &HardwareConfig,
+        config: impl Into<Option<&'a HardwareConfig>>,
         now: u64,
         mode: u8,
     ) -> Result<Self, RegisterError> {
@@ -492,8 +504,8 @@ impl RegisterInit {
         let mut last = None;
         let mut discontiguous = false;
         let live = topology.geometry_dss() | topology.compute_dss();
-        for i in 0..32 {
-            if live & (1 << i) == 0 {
+        for i in 0..if platform.is_ptl() { 96 } else { 32 } {
+            if live & (1u128 << i) == 0 {
                 continue;
             }
             let group = i / u32::from(seed.per_group);
@@ -508,10 +520,22 @@ impl RegisterInit {
             seed.fuse4,
         );
         if crate::intel_gpu_engine::compute_selection(compute, mode).is_none()
-            || (!platform.is_discrete() && mode != 1)
+            || (!platform.multiple_ccs() && mode != 1)
         {
             return Err(RegisterError::ComputeMode);
         }
+        let media_fuse = if platform.is_gen12() {
+            let fuse = mmio.read32(0x9140);
+            if fuse == u32::MAX || fuse != mmio.read32(0x9140) {
+                return Err(RegisterError::Unavailable);
+            }
+            Some(fuse)
+        } else {
+            None
+        };
+        let media = media_fuse
+            .map(crate::intel_gpu_engine::gen12_media)
+            .unwrap_or_default();
         Ok(Self {
             platform,
             device,
@@ -519,12 +543,41 @@ impl RegisterInit {
             discontiguous,
             compute,
             compute_mode: mode,
+            media,
+            media_fuse,
             deadline: now.checked_add(50_000_000).ok_or(RegisterError::Timeout)?,
         })
     }
 
+    pub(crate) fn reset_policy(&self) -> Option<crate::intel_gpu_reset_policy::ResetPolicy> {
+        crate::intel_gpu_reset_policy::ResetPolicy::new(
+            self.platform,
+            self.device,
+            self.seed.graphics,
+            self.seed.step,
+            self.seed.dss,
+            self.compute,
+            self.engines(),
+            self.discontiguous,
+        )
+    }
+
+    pub(crate) fn engine_policy(
+        &self,
+    ) -> Result<crate::intel_gpu_nonpriv::EnginePolicy, RegisterError> {
+        crate::intel_gpu_nonpriv::EnginePolicy::for_step(
+            self.platform,
+            self.engines(),
+            self.seed.step,
+        )
+    }
+
     pub(crate) fn compute_configuration(&self) -> (u8, u8) {
         (self.compute, self.compute_mode)
+    }
+
+    pub(crate) fn mert_required(&self) -> bool {
+        self.platform == GtPlatform::Battlemage && self.seed.graphics == 2001
     }
 
     /// RCS0/BCS0 always, BCS8 on BMG, then the selected physical CCSs. Linux
@@ -532,12 +585,12 @@ impl RegisterInit {
     pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {
         use crate::intel_gpu_engine::{Engine, EngineSet};
         let mut engines = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]);
-        if self.platform == GtPlatform::Battlemage {
+        if self.platform.is_xe2() {
             engines = EngineSet::from_bits(engines.bits() | EngineSet::of(&[Engine::Bcs8]).bits());
         }
         let selected = crate::intel_gpu_engine::compute_selection(self.compute, self.compute_mode)
             .expect("validated partition");
-        engines = EngineSet::from_bits(engines.bits() | selected.bits());
+        engines = EngineSet::from_bits(engines.bits() | selected.bits() | self.media.bits());
         engines
     }
 
@@ -548,17 +601,26 @@ impl RegisterInit {
         mmio: &impl MmioWindow,
         now: u64,
     ) -> Poll<Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError>> {
-        if now >= self.deadline {
-            return Poll::Ready(Err(RegisterError::Timeout));
+        if self
+            .media_fuse
+            .is_some_and(|fuse| mmio.read32(0x9140) != fuse)
+        {
+            return Poll::Ready(Err(RegisterError::Identity));
         }
-        let modern = self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
         if modern {
             let semaphore = mmio.read32(0xfd0);
             if semaphore == u32::MAX {
                 return Poll::Ready(Err(RegisterError::Unavailable));
             }
             if semaphore & 1 == 0 {
-                return Poll::Pending;
+                // mcr_lock's xe_mmio_wait32 reads once more after expiry: a
+                // late poll that is granted the semaphore programs.
+                return if now >= self.deadline {
+                    Poll::Ready(Err(RegisterError::Timeout))
+                } else {
+                    Poll::Pending
+                };
             }
         }
         let selector = if modern { 0xfd4 } else { 0xfdc };
@@ -583,7 +645,7 @@ impl RegisterInit {
         selector: u64,
         target: Target,
     ) -> Result<(), RegisterError> {
-        let modern = self.platform != GtPlatform::Alchemist;
+        let modern = !self.platform.is_gen12() && self.platform != GtPlatform::Alchemist;
         let (group, instance) = match target {
             Target::Direct | Target::Implicit => return Ok(()),
             Target::Dss => ((self.seed.dss >> 23) & 127, (self.seed.dss >> 16) & 127),
@@ -638,7 +700,18 @@ impl RegisterInit {
                 vram = Some(crate::intel_gpu_vram::VramRegisters::Dg2(a));
             }
         }
-        let flat = if self.platform == GtPlatform::Battlemage {
+        let flat = if self.platform.is_headless_integrated() {
+            self.steer(mmio, selector, Target::Instance0)?;
+            let a = mmio.read32(0x8800);
+            let b = mmio.read32(0x8800);
+            if a == u32::MAX || b == u32::MAX {
+                return Err(RegisterError::Unavailable);
+            }
+            if a != b {
+                return Err(RegisterError::Verify(0x8800));
+            }
+            a & 1 != 0
+        } else if self.platform == GtPlatform::Battlemage {
             self.steer(mmio, selector, Target::Instance0)?;
             let a = mmio.read32(0x8800);
             let b = mmio.read32(0x8800);
@@ -700,8 +773,7 @@ impl RegisterInit {
                 }
             }
         }
-        crate::intel_gpu_nonpriv::EnginePolicy::new(self.platform, self.engines())?
-            .install(mmio)?;
+        self.engine_policy()?.install(mmio)?;
         Ok(vram)
     }
 
@@ -725,6 +797,39 @@ impl RegisterInit {
             add(0x14804, 0xfff, mode & 0xfff, true, Direct);
         }
         match self.platform {
+            GtPlatform::Gen12(family) => {
+                // WA14011060649, media1200: per-even-VIDEO GT state.
+                // The retained reset owner holds every present media well.
+                for engine in self
+                    .media
+                    .iter()
+                    .filter(|engine| engine.is_decode() && engine.physical_instance() % 2 == 0)
+                {
+                    add(
+                        u64::from(engine.base()) + 0x3f10,
+                        1 << 22,
+                        1 << 22,
+                        false,
+                        Direct,
+                    );
+                }
+                add(0x9550, 0x200, 0x200, false, Dss); // 14011059788
+                add(0x9424, 2, 0, false, Direct); // 14015795083
+                add(0xb004, 0x80, 0, false, Direct); // L3 hashing tuning
+                add(0x20a0, 0x80000, 0x80000, false, Direct);
+                add(0xe4f4, 0x4100, 0x4100, true, Dss);
+                add(0xe48c, 0x200, 0x200, true, Dss);
+                add(0x20ec, 2, 2, true, Direct);
+                add(0xe18c, 0x8001, 0x8001, true, Dss);
+                add(0x20e0, 0x4000, 0x4000, true, Direct);
+                if matches!(
+                    family,
+                    crate::intel_gpu_gt::Gen12Platform::TigerLake
+                        | crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                ) {
+                    add(0x2050, 0x1080, 0x1080, true, Direct);
+                }
+            }
             GtPlatform::Alchemist => {
                 add(0x9424, 2, 0, false, Direct); // 14015795083
                 if matches!(
@@ -786,6 +891,82 @@ impl RegisterInit {
                     }); // Wa_14012342262 forbids readback
                 }
             }
+            _ if self.platform.is_ptl() => {
+                // PTL GT lifetime (not hwe.reg_sr / ADS).
+                if self.seed.graphics == 3000 && self.seed.step < 4 {
+                    add(0x9454, 0x10, 0x10, false, Direct);
+                }
+                add(0xc50c, 2, 2, false, Direct);
+                add(0xb158, 0x3ff, 0x7f, false, Instance0);
+                if flat {
+                    add(0x8828, 0x840000, 0x800000, false, Instance0);
+                    add(0xb104, 0x100000, 0x100000, false, Instance0);
+                }
+                add(0xb108, 0x10000000, 0x10000000, false, Instance0);
+                add(0x4148, 15, 0, false, Instance0);
+                // Source engine WAs/tuning: first RCS owns shared state.
+                add(0xe194, 0x40, 0x40, true, Dss);
+                if self.seed.graphics == 3000 && self.seed.step < 4 {
+                    add(0xe48c, 0x200, 0x200, true, Dss);
+                    add(0xe18c, 0xc00, 0x400, true, Dss);
+                }
+                let tdl = 0x1000
+                    | if self.seed.graphics == 3000 && self.discontiguous {
+                        0x20
+                    } else {
+                        0
+                    };
+                add(0xe5f4, tdl, tdl, true, Dss);
+                add(0xe4c4, 0x40, 0x40, true, Dss);
+                add(0xe4f0, 2, 2, true, Dss);
+                add(0xe530, 0x400, 0x400, false, Dss);
+                for engine in self.engines().iter() {
+                    add(u64::from(engine.base()) + 0xd4, 0x80, 0x80, true, Direct);
+                    add(
+                        u64::from(engine.base()) + 0x50,
+                        0x1000,
+                        0x1000,
+                        true,
+                        Direct,
+                    );
+                }
+            }
+            _ if self.platform.is_lnl() => {
+                // xe_tuning.c gt_tunings: Xe2 common and LNL RWFLUSHALLEN.
+                add(0xb158, 0x3ff, 0x7f, false, Instance0);
+                if flat {
+                    add(0x8828, 0x840000, 0x800000, false, Instance0);
+                    add(0xb104, 0x100000, 0x100000, false, Instance0);
+                }
+                add(0xb108, 0x10000000, 0x10000000, false, Instance0);
+                add(0x4148, 15, 0, false, Instance0);
+                add(0xb154, 0x20000, 0x20000, false, Instance0);
+                // xe_wa.c engine_was + xe_tuning.c engine_tunings.
+                add(0xe7c8, 0x2000, 0x2000, false, Dss);
+                add(0xe7cc, 0x9000, 0x9000, false, Dss);
+                add(0xe49c, 0x4000, 0x4000, true, Dss);
+                add(0xe48c, 0x200, 0x200, true, Dss);
+                add(0xe4f0, 2, 2, true, Dss);
+                add(0xe4c4, 0x840, 0x840, true, Dss);
+                add(0xe194, 0x40, 0x40, true, Dss);
+                add(0xe530, 0x400, 0x400, false, Dss);
+                for engine in self.engines().iter() {
+                    add(
+                        u64::from(engine.base()) + 0xd4,
+                        0xc080,
+                        0xc080,
+                        true,
+                        Direct,
+                    );
+                    add(
+                        u64::from(engine.base()) + 0x50,
+                        0x1000,
+                        0x1000,
+                        true,
+                        Direct,
+                    );
+                }
+            }
             GtPlatform::Integrated(_) => {
                 if self.seed.graphics <= 1271 && self.seed.step < 4 {
                     add(0x9424, 2, 0, false, Direct); // 14015795083 before B0
@@ -810,7 +991,7 @@ impl RegisterInit {
                 }
                 add(0xb108, 0x10000000, 0x10000000, false, Instance0);
                 add(0x4148, 15, 0, false, Instance0);
-                add(0xe48c, 0x8000, 0x8000, true, Dss); // 18034896535
+                add(0xe48c, 0x200, 0x200, true, Dss); // 18034896535: DISABLE_TDL_PUSH bit9
                 add(0xe7cc, 0x9000, 0x9000, false, Dss); // 16018712365 + 14018471104
                 add(0xe4f0, 2, 2, true, Dss); // 16018737384
                 add(0xe49c, 0x4000, 0x4000, true, Dss); // 14020338487

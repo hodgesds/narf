@@ -1611,6 +1611,1063 @@ aarch64 QEMU is omitted under the maintainer's iteration policy. The ledger
 records 32 implemented checkpoint rows and ten broad open workstreams;
 hardware and Mesa acceptance remain separate, unrun gates.
 
+After merge #1308, `codex/intel-software-next` continues from `693d03ed9`.
+The next checkpoint adds real GuC placement matrices with per-lane physical
+receipts/migration watchdogs, qualified MTL/Arrow pre-CSC degamma with owned
+DSB/FIFO restoration, full BMG EU-stall thresholds with per-invocation
+blocking status, and bounded retained execution data in privileged version-two
+failure bundles. Shared filesystem/userspace read adapters preserve current
+dup/F_SETFL status and ordinary-file defaults. Physical engine limits remain
+refusals; GuC CGP multi-queue groups are separate unfinished software.
+
+All 22 new fixtures pass. Selected Intel/DRM/framebuffer/backlight groups pass
+967 unique x86_64 tests with zero failures or skips, including all 31 shared
+backlight regressions. The filesystem group passes 628 tests with one existing
+RNG-registration skip; syscall ABI reports 2259 passing executions with four
+existing task-identity/address-discrimination harness skips. Production boot
+and both btrfs postflights pass. Target CI Clippy passes all three feature
+contexts on both architectures, all four host GPU configurations and host
+filesystem/userspace pass all-target Clippy, and debug/release builds and
+formatting pass. aarch64 QEMU is omitted under the maintainer's iteration
+policy. The ledger now records 36 implemented rows and ten broad open
+workstreams; Intel silicon and Mesa acceptance remain unrun.
+
+The same branch now adds caller-authorized Xe HIGH priority and CONFIG
+discovery, version-three privileged failure bundles with bounded retained VM
+tables and DUMPABLE system/USERPTR BO prefixes, qualified fixed MTL/Arrow
+X-tiled primary presentation, and physical BMG 20.01 MERT cap removal with
+host-L2 coordination. X/linear changes retain both windows through independent
+DSB/primary evidence and exact console restoration. CPU-VRAM clears retain
+their target and PM hold before the first BAR write through their own fresh
+flush; cancellation or execution reset alone cannot release that ownership.
+Failed post-reset cap/flush/L2-disable proof retains the pending allocation.
+Pinned Linux currently gives all supported platform descriptors a zero CGP
+multi-queue class mask, so broader queue protocols await separate qualification.
+
+All 25 new fixtures pass. Selected Intel/DRM/framebuffer/backlight groups pass
+992 unique x86_64 tests, including all 31 shared backlight regressions, with
+zero failures or skips. The production boot and both btrfs postflights pass.
+GPU/fb CI Clippy passes all three contexts on both targets; all four host GPU
+configurations pass all-target Clippy. GPU/fb debug/release builds, formatting,
+diff and source-integrity checks pass. aarch64 QEMU is omitted under the
+maintainer's iteration policy. The ledger records 40 implemented rows and ten
+broad open workstreams; Intel silicon and Mesa acceptance remain unrun.
+
+The next Intel checkpoint adds source-qualified Gen12 GuC execution and fixed
+internal linear primary flips, MTL/Arrow Tile4 and integer X-tiled panning,
+retained DG2/BMG GPU range copies and PCI runtime-power policy/accounting.
+Full isolated-reset register saves preserve the applied engine policy and
+nonprivileged grants; persistent PCI/BAR claims exclude legacy/GuC overlap.
+Gen12 uses its actual firmware families, optional HWCONFIG, 39-bit DMA,
+non-tile MSI and owned pre-reset engine/media sequence. Display and copy
+cancellation retain potentially live DMA through native retirement or reset;
+copy support does not yet implement migration or CPU alias revocation.
+
+All 49 new fixtures pass. Selected Intel/DRM/framebuffer/backlight and
+runtime-power groups pass 1048 unique x86_64 tests, including all 31 shared
+backlight regressions, with zero failures or skips. Production boot and both
+btrfs postflights pass. GPU/fb/power target CI Clippy passes all three contexts
+on both architectures, and all four host GPU configurations pass all-target
+Clippy. Debug/release builds pass on both targets; formatting, diff and final
+source-integrity checks pass. aarch64 QEMU is omitted under the maintainer's
+iteration policy. The ledger records 45 implemented rows and ten broad open
+workstreams; Intel silicon and Mesa acceptance remain unrun.
+
+The next Intel checkpoint adds fixed Gen12 CTM, independently qualified
+64x64 hardware cursor, exact display12/13 native LUT profiles and legacy gamma.
+Gen12 pre data uses Q16 while MTL retains Q24. Display12's unreadable fine/coarse
+post-LUT RAM uses complete canonical DSB writes and readable hardware witnesses
+under exclusive bypass ownership; clear/reset restores visible bypass and new
+activation rewrites the full table. Large color blobs have bounded stored and
+concurrent-copy budgets. The legacy Gen12 arena/root paths now enforce DMA39.
+
+GuC log v2 shares one source actor among four retained reader FIFOs, preserves
+partial records and atomically accounts for overwritten host wire records.
+Firmware overflow counters remain observed lower bounds. Actual firmware-log
+incarnation plus nonreused publication serial prevents queued-open replay
+across park, reset and republication; descriptors read host copies under current
+admin/syslog authority. All 39 new native fixtures and four rewritten log
+fixtures pass. Selected Intel/DRM/framebuffer/backlight and runtime-power groups
+pass 1087 unique x86_64 tests, including 31 shared backlight regressions, with
+zero failures or skips. The x86_64 production boot and both btrfs postflights
+pass. GPU/fb target CI Clippy passes all three feature contexts on both
+architectures, all four host GPU feature configurations pass all-target
+Clippy, debug/release builds pass on both targets, and formatting/diff/source
+integrity checks pass. aarch64 QEMU is omitted because no aarch64-specific
+production behavior changes. The ledger has 49 implemented checkpoint rows
+and ten broad open workstreams; Intel silicon and Mesa acceptance are unrun.
+
+The next Intel batch implements Gen12 joint primary/color, fixed X/integer
+views and mandatory ADLP/N alignment/arbitration plus exact console restore;
+exact-family external metadata; serial/headless LNL/PTL main-GT execution;
+fuse-present Gen12 main-GuC VIDEO/ENHANCE including legacy i915 selection;
+and mixed-vendor CPU-alias lifetime retention through unpublished fork state.
+All 58 new fixtures pass in the debug kernel: 1,144 selected Intel/DRM/fb/
+backlight tests and 670 shared filesystem/graphics/AMD tests pass, with
+one existing RNG-registration skip and no failures or duplicate names.
+All previous 1,087 Intel fixtures and 31 shared backlight regressions are
+preserved. Host all-target Clippy, format/diff and source hashes pass.
+The x86 debug relocation reserve grows to 8 MiB for the 6.2 MB table.
+The ledger has 56 implemented checkpoint rows and ten broad open workstreams.
+Release native, production boot/btrfs and cross-target gates remain pending
+for the combined follow-on branch; merge readiness is not claimed. Graphical
+LNL/PTL takeover, separate media GTs, HuC outside the exact TGL opt-in,
+full display resource transactions,
+placement migration and invalidate-aware USERPTR remain separate work.
+
+The following Intel slice implements current-epoch native Xe low-latency
+queue hints and exact headless LNL EU-stall sampling, preserving the existing
+single GuC/SLPC actor and DMA/reset lifetimes. All ten new fixtures pass in
+debug and release native kernels. The combined branch passes 1,154 selected
+Intel/DRM/fb/backlight and 670 shared filesystem/graphics/AMD tests per profile,
+with no failures or duplicate names and one existing shared RNG-registration
+skip. All 68 new fixture names, all 1,087 prior Intel fixture names and 31
+backlight regressions are covered. Release production boot and both btrfs
+postflights pass, closing the preceding batch's pending gates. GPU/fb/
+filesystem/graphics CI Clippy passes all three feature contexts on both
+targets; all four host GPU configurations pass all-target Clippy. Both-target
+changed-package debug/release builds, formatting, diff and final source hashes
+pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
+changes. The ledger has 58 implemented checkpoint rows and ten broad open
+workstreams; physical Intel/Mesa acceptance remains unrun. The subsequent
+v0.34 checkpoint adds retained external-DP teardown,
+per-object i915 ASYNC and exact-TGL HuC, with validation recorded below.
+
+The reviewed v0.34 Intel batch implements retained Gen12 combo-B SST stop
+and observed SDE/SHOT HPD, BMG per-object i915 EXEC_OBJECT_ASYNC and default-off
+exact physical TGL HuC upload/auth/query. All 37 new fixtures (21+8+8)
+pass in debug and release native kernels. Each profile passes 1,861 selected
+tests: 1,191 Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD
+fixtures, with no failures or duplicate names, no Intel skips and one existing
+shared RNG-registration skip. All 1,087 prior Intel names, 105 cumulative new
+names and 31 backlight regressions remain covered. Release production boot
+and both btrfs postflights pass. Both-target CI Clippy passes all three feature
+contexts, all four host GPU vendor configurations pass all-target Clippy, and
+both-target changed-package debug/release builds pass. Formatting, diff and
+all 103 frozen source/linker hashes pass. aarch64 QEMU is omitted because no
+aarch64-specific production behavior changes. The ledger contains 61
+implemented checkpoint rows and ten broad open workstreams.
+
+SST stop keeps current per-operation authority, observed PCH policy, fresh HPD
+status, serial publication and retained PM/reset ownership; stopped or
+quarantined resources remain reserved. HDMI/MST drain, reconnect and general
+output/resource transactions remain separate. BMG ASYNC permits only ordinary
+WB softpin/same-card WB imports, keeps mixed implicit and explicit dependencies,
+per-context order, terminal tracking and CPU access exclusion, and refuses
+local/WC/VM-owned/pinned-user storage and other platforms. GETPARAM43 reports
+only live admission. Arbitrary CPU mmap stores remain client ordered.
+
+The HuC opt-in narf.intel.huc=1 acquires the actual canonical firmware before
+WOPCM planning, retains real DMA backing through both boot passes and requires
+SLPC Running, zero-result typed GuC authentication and fresh independent status.
+Xe query7/type1 reports only the running release under the current owner;
+unavailable/reset/lost/unsupported cases return ENODEV. Full Gen12 reset/media
+retirement gates exposed backing reclamation; TGL runtime autosuspend remains
+refused. Newer no-HuC profiles, default-off policies and GuC version ABI remain
+unchanged. I915 GETPARAM42, other HuC profiles, media-GT/GSC/PXP and codecs are
+outside this slice. The new HuC fixtures do not execute positive Firmware::open/
+registry/stage_with_huc acquisition or actual RuntimeOwner/PCI/system-PM
+coordinator callbacks. Their firmware-reset coverage uses full stop and fresh
+GuCGt owners; production PM/acquisition wiring is manually reviewed only.
+No physical Intel/S3, Mesa or codec acceptance is claimed.
+
+The following v0.35 Intel batch adds i915 context-frequency hints through
+the retained GuC policy, nonce-bound context publication with copyout outside
+the namespace IRQ lock, and published Gen12 media SSEU defaults. GETPARAM59
+preserves its signed -22 unsupported value; LOW_LATENCY enables by presence
+with the source proto/create phase distinction. Current execution, global
+SLPC, cache publication and terminal/reset lifetimes remain owned by the
+existing backend. All seventeen new fixtures (eleven frequency/publication
+and six SSEU) pass. Debug and release each pass 1,878 selected native tests:
+1,208 Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD cases.
+All 1,087 prior Intel names, 122 cumulative new names and 31 backlight
+regressions remain covered, with no failures or duplicate names, no Intel
+skips and one existing shared RNG-registration skip. Release production boot
+and both btrfs postflights pass. Both-target CI Clippy passes all three feature
+contexts; all four host GPU vendor configurations pass all-target Clippy.
+Both-target changed-package debug/release builds, workspace formatting, diff
+checks and all 105 frozen source/linker hashes pass. aarch64 QEMU is omitted
+because no aarch64-specific production behavior changes. The ledger contains
+62 implemented checkpoint rows and ten broad open workstreams. Physical Intel/
+Mesa/codec and actual RuntimeOwner/PCI/S3 acceptance remain unrun. Small-BAR
+GPU-only allocation and OA are separate isolated work.
+
+The following v0.36 Intel batch adds three bounded features: default-off exact
+BMG20.01/20.02 headless small-BAR GPU-only storage; selected retained i915 WB/
+import capture payload with live per-context NO_ERROR_CAPTURE protection; and
+cached automatic whole-GT reset availability level1 only with a distinct current
+worker/every-engine qualification witness. Hidden backing has no CPU alias;
+actual GPU zero, retained preterminal quota and off-lock copyout/current-owner
+exact-VM publication precede handles. Opted-in PM initially refuses and ordinary
+GT reset never repeats destructive FLR. Capture suppresses the entire new raw
+bundle before reads when any retained i915 policy protects it, preserving normal
+state saves and terminal ownership. Reset discovery adds no level2/3, manual
+reset or replay. The ledger has 65 implemented checkpoint rows, with all ten broad
+workstreams open.
+
+All thirty new fixtures pass: fifteen small-BAR, nine capture/protection and six
+reset-availability cases. Debug and release each pass 1,908 selected tests:
+1,238 Intel/DRM/fb/backlight plus all 670 shared filesystem/graphics/AMD fixtures.
+All 1,878 prior selected names, 1,087 original Intel names, 152 cumulative new
+names and 31 backlight regressions remain, with no failures or duplicate names,
+no Intel skips and one existing shared RNG-registration skip. Release production
+boot and both btrfs postflights pass. Target CI Clippy passes all three feature
+contexts on both architectures; all four host GPU vendor configurations pass
+all-target Clippy. Changed-package debug/release builds pass on both targets;
+workspace formatting, diff checks and the exact frozen source/linker hashes
+pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
+changes. These results are native models, not the physical acceptance below.
+
+The BO fixtures drive actual raw Xe/GT/CT/LRC/PPGTT, cache/MERT, copy, terminal
+and reset ownership; their publication transport substitutes for the physical
+RuntimeOwner PM/reset mutex. Three physical-path fixtures exercise actual
+retained capability/PCI/BAR AuthorizedWindow, driver-FLR/media conversation and
+cache-to-first-PTE code using owned fake config/MMIO RAM. Capture fixtures use
+actual raw i915 selection, retained job payload, live policy and descriptor
+capability paths. Reset fixtures exercise the common recovery coordinator with
+real GT execution models. These are not positive full RuntimeOwner/firmware
+registry/physical PCI power callbacks or S3 executions. Physical Intel, Mesa,
+codec and performance acceptance remain unrun. No silicon or full physical
+owner result is claimed; OA and all ten broad workstreams remain open.
+
+### MTL legacy modeset failure correction — software gates recorded
+
+This corrects false success in the existing MTL/Arrow legacy modeset path; it
+adds no feature row. The ledger remains at 65 rows with all ten broad workstreams
+open. Local stop/clock/current and final source/primary/fresh-frame failures now
+abort later programming. The inherited clock fast path uses the actual locked
+clock and programmed squash window; an unmet floor refuses. Already-on DDI
+ownership is required, and unqualified direct TC1/TC2 routes refuse before MMIO.
+No DDI-off initialization, new await, resource allocator, retirement receipt or
+scanout reclamation is added. Pre-stop fixed GGTT/cache/bootstrap, full source/
+sink training, inherited producer exclusion and general resource/clock ownership
+remain software work.
+
+Four fixtures are added. The existing misleading
+`smoke_mtl_modeset_tc1_full_run` is replaced, with no count increase, by
+`smoke_mtl_modeset_tc_ports_refuse_unqualified_route`. Expected inventories are
+1,912 selected tests (1,242 Intel/DRM/fb/backlight plus 670 shared), including all
+1,907 unchanged NEXT9 names and this exact replacement. The original baseline
+retains 1,086 names unchanged plus the replacement. All prior 152 cumulative new
+labels remain; four additions and one replacement make 157 new-or-replacement
+labels, not five added tests. Group 3 grows to 189; group 5 stays at 197.
+
+All seven debug and release groups each pass 1,912 unique tests with zero failures or duplicate names, no Intel skips and one existing shared RNG-registration skip. The four additions, exact TC replacement, preserved baseline/cumulative inventories and 31 backlight regressions pass. Release production boot and both btrfs postflights, both-target CI Clippy, four host vendor all-target Clippy configurations, both-target changed-package debug/release builds, formatting, diff and exact 119 source/linker hashes pass. aarch64 QEMU is omitted under the existing iteration policy; no aarch64-native execution result is claimed.
+
+The fixtures use actual dispatch and an actual scheduler task over modeled
+hardware. Full physical RuntimeOwner, positive firmware registry, PCI power
+callbacks, S3 and controller/console publication remain manually traced rather
+than executed by these new fixtures. Silicon, visible-pixel, complete-link,
+Mesa, codec and performance acceptance remain unrun. No broad workstream closes.
+
+### Fixed opaque XR30 input — software gates recorded
+
+The bounded opaque XR30 slice adds LINEAR four-byte XRGB2101010 input to the existing exact fixed MTL/Arrow internal profile, with integer panning, real projected FIFO state and retained joint primary/color restoration. Current backend epoch publication and explicit reconciliation preserve owner authority. Output depth/HDR, other formats/platforms, global bandwidth policy and broader display work remain outside this slice. The ten broad workstreams remain Open.
+
+The expected selection is 1,918 tests: 1,248 Intel/DRM/framebuffer/backlight plus 670 shared. All 1,912 NEXT10 names remain unchanged; six new registrations bring the cumulative new-or-replacement labels from 157 to 163. All 31 backlight regressions remain. The six additions belong to the existing intel_gpu_dsb namespace in group0 (369); group4 remains135 and group5 remains197.
+
+All seven debug and release groups each pass 1,918 unique tests with zero failures/duplicates, no Intel skips and one existing shared RNG-registration skip. All six additions, all prior names,163 cumulative labels and31 backlight regressions pass. Release production boot/both btrfs postflights, both-target CI Clippy, four host vendor all-target Clippy contexts, both-target debug plus aarch64 release package builds, formatting, diff and all125 frozen source/linker hashes pass. The release native path supplies the x86_64 production release build. aarch64 QEMU is omitted under the existing iteration policy; no aarch64-native result is claimed. Version v0.37 has66 implemented rows and ten broad workstreams remain Open.
+
+The new fixtures exercise shared GETPLANE/IN_FORMATS/GET_CAP query helpers,
+real Card::addfb2_intel and raw atomic/PAGE_FLIP/DIRTYFB/cursor/master FIFO
+conversations through actual Device/Guard/Presenter/PollIo/color/DSB owners and
+PTE-decoded command backing. They do not execute the full DriCardFile/registry
+user-copy GETPLANE/ADDFB entry or physical backend-publication refresh. Their
+held-Device Pending seam exercises the shared owner directly; it does not
+execute the physical scanout_access drain. Actual RuntimeOwner/ECAM, positive
+firmware registry, physical startup/full system-PM coordinator, sink training,
+visible pixels, Mesa/codec and performance acceptance remain unexecuted by these
+fixtures. Supported WC backing is required for positive DMA conversations;
+unsupported architectures retain conservative source/metadata/WB refusal.
+Native register/CT models are not physical Intel or ARM-native acceptance.
+
+### MTL/Arrow standalone media GT owner — release gates recorded
+
+Meteor Lake and Arrow Lake have a second GT for media: GT1, with Xe_LPM+ media
+IP 13.00. NARF now brings it up beside a running GT0. The new owner checks
+GT1's exact identity and reads which video engines are present. It holds GT1
+awake, resets the media GuC and then the whole media GT. If GSC firmware is
+already loaded, it applies Wa_14015076503 around the reset. It then programs
+GT1's PAT, MOCS and media 13.00 workarounds and releases every wake request.
+A refusal at any step releases what the owner took and never becomes a GT0
+error. Every GT0 stop, park, suspend or fault abandons the owner first. The
+media GuC stays in reset, and no GT1 engine, interrupt or UAPI GT is published.
+GT0's MTL MOCS values moved to shared constants unchanged.
+
+Twelve new tests under `drivers/gpu/intel_gpu_media_gt` run in group 6. All
+seven release groups pass 1,930 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave.
+
+Still to do: media GuC load with its ADS and CT channel, GGTT invalidation for
+both GuCs, VCS/VECS enablement and interrupts, gt_id 1 in the Xe UAPI, and
+GSC-loaded HuC. None of this has run on physical Intel hardware.
+
+### Display-14 DMC and DC states — release gates recorded
+
+Meteor Lake and Arrow Lake now load the display DMC (`i915/mtl_dmc.bin`) and
+can enter DC5/DC6 with a lit panel. The DMC container is checked against the
+display-14 rules, loaded, verified, and disabled and reloaded across system
+suspend. Pipe DMC programs are skipped. Display power is reference-counted
+through the `DC_off` well: KMS sessions, legacy guards, recovery, the MTL
+modeset, PSR notifications and every full-AUX backlight conversation leave
+DC5/DC6 before touching hardware. Re-entry happens 17 ms after the last user
+lets go. Any firmware, verification or `DC_STATE_EN` failure keeps the display
+in DC0. A path-by-path audit in the spec lists the reference or gate for every
+display register access that can run while DC6 is allowed. Gen12 is unchanged.
+
+Eighteen new tests run: four DMC tests, thirteen in
+`drivers/gpu/intel_gpu_dc_states` (now in group 6) and one AUX-backlight test.
+All seven release groups pass 1,948 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave.
+
+Still to do: pipe DMC programs, per-well references beyond `DC_off`, DC3CO,
+DC9 and display-core uninit at suspend, and FBC, which needs a stolen-memory
+owner and a console frontbuffer flush. None of this has run on physical Intel
+hardware.
+
+### Display-14 resource transactions — release gates recorded
+
+Meteor Lake and Arrow Lake modesets now compute their own display resources
+instead of using a fixed profile: watermarks, DBUF slices and MBUS joining,
+CDCLK and PM demand, following Linux. A commit with every pipe off can raise or
+lower CDCLK. It restores everything it touched if any step fails, and the PM
+demand always covers the clock during the restore. A live repartition moves
+resources between pipes while others stay lit. A new Pipe B-D owner reserves
+resources and turns extra pipes on and off for external outputs. SAGV is enabled
+when the memory reports controllable QGV points, with the PM demand bandwidth
+taken from the chosen point.
+
+Twenty-five new tests run in group 6 under `intel_gpu_xelpg_resources`,
+`intel_gpu_display_resources`, `intel_gpu_xelpg_live`, `intel_gpu_xelpg_pipes`
+and `intel_gpu_xelpg_bw`. All seven release groups pass 1,973 unique tests, with
+no failures and only the existing shared RNG-registration skip. The release
+production boot and both btrfs postflights also pass. The debug group pass is
+deferred to the end of this integration wave.
+
+The live and Pipe B-D modules now have their production caller, the MTL external
+route, and no longer carry a temporary dead-code allowance. Pipe scalers,
+planar formats, bigjoiner, DSC and VRR remain open. None of this has run on
+physical Intel hardware.
+
+### MTL external outputs — release gates recorded
+
+Meteor Lake and Arrow Lake can now drive an external monitor over DP SST on
+DDI B and the four Type-C ports, and over HDMI TMDS up to 340 MHz using the
+Linux C10/C20 PLL tables. NARF owns the Type-C PHY handoff and the PICA and
+south hotplug interrupts. AUX power uses the display-14 per-channel request.
+The Type-C port map was corrected to match Linux. The runtime polls hotplug,
+brings a route up or down, and publishes or withdraws its scanout. Suspend and
+GT reset retire the route.
+
+Integration found one ordering bug, now fixed: the internal MTL modeset read
+the panel EDID before raising the AUX power request. All eight release groups
+pass 2,008 unique tests, with no failures and only the existing shared
+RNG-registration skip. A new eighth group holds the Type-C, hotplug, external
+and HDMI tests. The release production boot and both btrfs postflights also
+pass. The debug group pass is deferred to the end of this integration wave.
+
+Still open: the external route does not yet hold its own DC_off reference
+(the join with the DC-state service comes next). It also does not yet run on
+the Pipe B-D resource owner. HDMI above 340 MHz, Thunderbolt-alt and DP
+UHBR/MST remain. None of this has run on physical Intel hardware.
+
+### Display-14 FBC and the external-route DC join — release gates recorded
+
+Meteor Lake and Arrow Lake now run frame buffer compression on a KMS-owned
+Pipe-A framebuffer. The compressed buffer is placed in stolen memory (DSM)
+following Linux's MTL layout. The placement avoids the WOPCM, the BIOS GSC
+region and every page the boot framebuffer can reach through the aperture, and
+it refuses any page the kernel page allocator could own. Compression stops at
+the start of every KMS session and before console reclaim, suspend and GPU
+reset recovery.
+
+The MTL external outputs are now joined to the DC-state service. Every
+external hardware pass holds a display power reference, and a live or stuck
+route keeps the display out of DC5/DC6 between passes. Integration fixed one
+fixture whose test arithmetic was wrong (the stolen-memory RAM-page check) and
+added a fixture that drives the real external bracket with the DC state
+machine.
+
+All eight release groups pass 2,019 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. The first eligible flip scans the GGTT aperture once,
+about 10^5 register reads; that one-time cost runs on the present path. None of
+this has run on physical Intel hardware.
+
+### MTL HDMI 2.0, GMBUS pins and the VBT parser — release gates recorded
+
+The MTL hotplug service now picks HDMI when a port has no DP sink and publishes
+HDMI routes. HDMI TMDS runs up to 594 MHz with source and sink scrambling over
+SCDC. NARF stops the activation if an SCDC write fails, where Linux only logs it.
+A bounds-checked VBT parser reads the board's VBT read-only from the ACPI
+OpRegion and supplies the MTL port policy, legacy Type-C ports, HDMI DDC pins
+and the SSC preference.
+
+Real behaviour changes, including on Gen12 (Tiger Lake and Alder Lake):
+- HDMI DDC pins now follow Linux. The old encoding (DDI A..F as GMBUS pins
+  2..7) drove the wrong wires: DDI B used "dpc". ADL-S has no DDI B or C pin.
+- Gen12 HDMI DDC now uses the shared GMBUS transport, which follows Linux's
+  `do_gmbus_xfer`: repeated START, a single STOP, and E-DDC segments.
+- A GMBUS transport bug that issued INDEX without WAIT is fixed. It would have
+  timed out MTL HDMI EDID and SCDC reads on silicon.
+- DP spread-spectrum clocking is on only when the VBT allows it and the sink
+  advertises 0.5% downspread (DP_MAX_DOWNSPREAD bit 0), per Linux. Sinks
+  without downspread no longer get SSC, even when there is no VBT.
+
+All eight release groups pass 2,052 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Remaining: VBT panel consumers (PPS, eDP link, PSR,
+backlight), VBT AUX remap and lane reversal, HDMI 2.1 FRL, and computed HDMI
+PLLs. None of this has run on physical Intel hardware.
+
+### Display-14 PSR1 and pipe DMC — release gates recorded
+
+Meteor Lake and Arrow Lake run panel self-refresh (PSR1) on the KMS-owned
+Pipe-A eDP panel. It follows Linux's enable, exit and re-arm order around
+flips, DIRTYFB, cursor and color updates, and it is turned off before console
+reclaim, legacy guards, suspend and reset. PSR takes precedence over FBC. PSR
+holds no DC_off reference while active, as Linux PSR1 with DC5/DC6 does. Until
+the watermark lane supplies the Wa_14015648006 input, PSR is refused on
+hardware and no PSR register is written. The console-time PSR path now skips
+display 14; Gen12 is unchanged.
+
+The pipe DMC programs are now loaded and enabled for lit pipes, following
+Linux. Each program must fit its slot window, a NARF limit taken from the
+shipped `mtl_dmc.bin` because Linux sets no bound. A program outside its
+window is skipped, and DC behaviour is then as before.
+
+All eight release groups pass 2,066 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Still to do: the watermark provider for PSR, PSR2
+selective fetch, Panel Replay, and the Pipe B-D and modeset calls into the
+pipe-DMC lifetime hooks. None of this has run on physical Intel hardware.
+
+### MTL/Arrow media GuC, default-off — release gates recorded
+
+The whole media GT path (GT1) is now off unless the kernel command line has
+`narf.intel.media_gt=1`. Without it nothing changes for GT0. With it, probe
+only resets the media GuC after programming the GT, as Linux does; it no
+longer full-resets GT1. The full reset with the GSC workaround is kept for a
+recovery path that runs once per GT0 incarnation, after a failed media GuC has
+proved it stopped. The media GuC boots on its own mailbox with a polled CT
+channel. While it runs, every shared-GGTT update also invalidates the media
+GuC's TLB. GT0 will not rebuild its GGTT, park or suspend until the media GuC's
+stop is proven. The HuC and BMG small-BAR options now share the same option
+parser, with unchanged grammar.
+
+All eight release groups pass 2,071 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Media engines, their interrupts and the gt_id 1 UAPI land
+in the next units. None of this has run on physical Intel hardware.
+
+### MTL/Arrow media engines and native Xe gt_id 1 — release gates recorded
+
+With `narf.intel.media_gt=1`, the media GuC now schedules GT1's video decode
+and video enhance engines. Their interrupts route onto GT0's tiled MSI, and
+native Xe publishes the media GT as gt_id 1: the GT list, the engine query and
+exec queues on VCS/VECS. Unknown GT ids and bad placements are refused in Linux's
+order. Video jobs use the media GT's AUX invalidation registers, and scheduling
+is refused while GSC firmware reports loaded. Without the option, GT0 interrupts,
+scheduling, the GGTT arena and the UAPI are unchanged.
+
+Integration fixed one fixture that never configured GT0's cache policy, so its
+GGTT invalidation checks could not fire. All eight release groups pass 2,077
+unique tests, with no failures and only the existing shared RNG-registration
+skip. The release production boot and both btrfs postflights also pass. The
+debug group pass is deferred to the end of this integration wave. None of this
+has run on physical Intel hardware.
+
+### Display-14 PSR inputs, VBT gate and off-path FBC carve — release gates recorded
+
+Display-14 PSR1 can now enable on hardware. The watermark code publishes the
+Pipe-A `wm_level_disabled` input for Wa_14015648006, and PSR applies it before
+and after plane updates as Linux does. Real behaviour changes:
+- PSR now needs a VBT that enables it, as in Linux, and takes its wake times
+  and idle frames from that VBT. With no VBT, PSR stays off. This replaces the
+  earlier safest-parameters fallback.
+- The FBC stolen-memory carve now runs as a spawned job that scans the GGTT
+  aperture in chunks and yields between them. A flip only checks whether the
+  job has finished, so it no longer stalls the first flip.
+- The BIOS GSC carve-out is applied only when the media GT version takes
+  Wa_14019821291 (13.00, 13.01 or 20.00), as Linux does.
+The SAGV fixture now pins Linux's one-QGV-point case, and zero points stays a
+documented NARF policy.
+
+All eight release groups pass 2,093 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. Known limitation: PSR is refused while any external pipe
+is lit. The external-route pipe join must revisit that. None of this has run on
+physical Intel hardware.
+
+### MTL media GT engine cycles, topology and GSC/HuC formats — release gates recorded
+
+With the default-off media GT published, DRM_XE_DEVICE_QUERY_ENGINE_CYCLES now
+samples GT1's VCS/VECS engines. GT_TOPOLOGY also lists GT1's own fuse masks
+after GT0's. Engine-cycles errnos follow Linux:
+- An unknown or unpublished gt_id is EINVAL.
+- An engine absent from GT1 is EINVAL.
+- A lost GT1 wake is EIO. It also unpublishes GT1 and starts the media GuC's
+  verified stop.
+
+A new data-only module models the MTL GSC firmware, GSC-headered HuC images and
+GSC HECI packets; no owner loads them yet. Until a GSC/HuC owner uses it, the
+module carries a temporary dead-code allowance outside kernel-test builds. The
+production lint contexts are clean.
+
+Two topology gaps remain against Linux at this checkpoint:
+- GT1 omits the L3 bank entry; the HuC unit adds it.
+- GT0 has never reported an L3 bank entry. That predates this work.
+
+All eight release groups pass 2,100 unique tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
+### MTL external outputs on Pipes B–D beside the lit panel — release gates recorded
+
+On MTL, external DP and HDMI monitors now run on Pipes B–D, next to the lit
+laptop panel. Previously they took Pipe A and needed the panel dark.
+- Each activation picks the lowest free pipe. Watermarks, DBUF, CDCLK and PM
+  demand are repartitioned live around the lit panel. The panel is never
+  blanked.
+- Enable and disable follow Linux's `hsw_crtc_enable` and `hsw_crtc_disable`.
+  The pipe DMC is enabled first and disabled last, and PW_2 powers Pipes B–D.
+- Removing the monitor gives Pipe A its whole profile back.
+- Every pipe-arm write now runs inside vblank evasion with interrupts masked,
+  as Linux does.
+- PM demand uses the route's own port clock.
+- The external route's state is published for lock-free readers.
+
+Integration needed one production fix. When a monitor was removed, the
+repartition re-joined the display memory bus with Pipe A selected, as Linux
+does. The panel's fixed-profile check accepted only the modeset's "no pipe"
+selection. As a result, after any external monitor was unplugged, KMS flips,
+the cursor and PSR on the panel refused until the next modeset. The check now
+accepts either selection, matching Linux's readout, and a new test pins it.
+
+These items are still open and go to a follow-up worker:
+- KMS flips and the cursor on Pipe A refuse while an external monitor is lit,
+  because their profile is single-pipe.
+- PSR refuses while an external monitor is lit.
+- An active FBC or DSB on the panel refuses the external monitor with Busy.
+- Linetime watermarks, pipe chicken and frame-start delay are not programmed
+  for Pipes B–D.
+- CDCLK and PM demand stay raised after the last pipe is released with no
+  panel.
+
+All eight release groups pass 2,113 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
+### MTL media-GT HuC and GT1's L3 bank entry — release gates recorded
+
+On Meteor Lake and Arrow Lake, the media GuC now loads and authenticates the
+HuC, as Linux xe does without the GSC. The HuC is DMA-loaded before the GuC
+upload, then authenticated through the GuC after the default contexts are
+recorded. The existing HuC owner now serves both GuCs, so TGL keeps its HuC
+on GT0. On MTL the HuC needs both `narf.intel.media_gt=1` and
+`narf.intel.huc=1`. If the image is unusable, allocation fails or
+authentication is rejected, GT1 still publishes, just without a HuC. The Xe
+HuC version query reports the media GT's running HuC, and returns ENODEV
+otherwise. GT1's topology now includes the L3 bank entry Linux reports for
+media versions below 30. The GSC-only formats moved to a separate module. That
+module keeps the temporary dead-code allowance, while the HuC parts are now
+production.
+
+Integration fixed one fixture defect. A HuC smoke restarted GT1 on a model
+whose allocator had just failed, without resetting GGTT placement, so its CT
+model panicked and aborted the group. The fixture's existing reset is now
+called; every assertion is unchanged. All eight release groups pass 2,117
+tests, with no failures and only the existing shared RNG-registration skip.
+The TGL HuC group is unchanged, and the release production boot and both
+btrfs postflights pass. GT0 still has no L3 bank entry; a queued unit adds
+it. The debug group pass is deferred to the end of this integration wave.
+None of this has run on physical Intel hardware.
+
+### Shared-GGTT GuC TLB invalidation on both GTs — release gates recorded
+
+NARF now invalidates every GuC's GGTT TLB after each GGTT update, as Linux's
+`xe_ggtt_invalidate` does. Before this, nothing invalidated GT0's GuC TLB, so
+a freed and reused range could leave the GuC holding a stale translation. This
+changes behaviour on every GuC platform:
+- Before CT is up, GT0's arena now writes its invalidation register on every
+  PTE update. That is 0xcee8 on MTL, DG2 and Gen12. On BMG, LNL and PTL it is
+  0xcf80 then 0xcf7c, after the VF_CAP barrier read.
+- Once scheduling is ready, each GuC's scheduler sends a CT TLB_INVALIDATION
+  {seqno, 0x80000003}. Only one request per GuC is in flight, and it completes
+  only on the matching DONE seqno.
+- A freed GGTT range keeps its frames until every GuC has invalidated past
+  the clear. This is stricter than Linux, which reuses the range before
+  invalidating and frees the backing afterwards. Under heavy churn, freed
+  memory can therefore wait one extra GuC round trip.
+- A 2.25 s timeout or a stray DONE loses the GT, which goes through the normal
+  reset, and the ranges stay retained. Linux signals -ETIME and frees them.
+
+All eight release groups pass 2,129 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. One Clippy naming fix was needed. No existing test
+relied on a freed range being reused at once. The debug group pass is deferred
+to the end of this integration wave. None of this has run on physical Intel
+hardware.
+
+### GT0 L3 bank topology entry — release gates recorded
+
+The native Xe GT_TOPOLOGY query now includes GT0's L3 bank entry, as Linux
+always does for a primary GT, and Mesa reads it for its L3 bank count. The
+mask follows each platform branch of Linux's `load_l3_bank_mask`:
+- TGL and ADL: inverted MIRROR_FUSE3 bits.
+- DG2: eight banks per node.
+- MTL and Arrow: the pair rule.
+- BMG and LNL: the mode nibble per node.
+- PTL: 32 bank bits per node.
+
+The entry sits between the compute and EU entries. On PTL it is omitted only
+for a node above 1, where Linux's result is undefined. This is an intentional
+ABI correction: GT0's topology reply grows by 16 bytes. The media GT now
+shares the MTL computation, and the i915 topology queries are unchanged.
+Integration updated one more fixture that pinned BMG's topology without L3.
+
+All eight release groups pass 2,132 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
+### Panel KMS, PSR and FBC beside a lit MTL external — release gates recorded
+
+This unit closes the follow-ups left by the Pipes B–D join (listed in the
+external-outputs entry above):
+- With an external monitor lit, KMS flips, the cursor and color on the laptop
+  panel now work. Each proves the panel's share of the multi-pipe layout.
+- PSR enables beside a lit external.
+- The external pass brackets the panel's FBC and PSR around each
+  repartition, as Linux's pre- and post-plane updates do. FBC is always
+  deactivated for the repartition, and an in-flight panel DSB stream is retired
+  first.
+- Pipes B–D are now programmed with the crtc registers Linux sets:
+  - PIPE_MISC;
+  - set-context latency, vsync shift, VRR and MULT;
+  - the frame-start delay;
+  - the line-time watermark;
+  - the pipe chicken bits;
+  - the FEC-jitter and DSC-EOL workaround bits.
+- Releasing the last external pipe with no lit panel now lowers DBUF to S1,
+  CDCLK to 172.8 MHz and PM demand to the no-pipe request. If that fails
+  partway, the original demand is re-requested.
+
+**Fixed regression.** Since the MTL external route was wired into the display
+runtime, the runtime actor's MTL pass took the panel's KMS owner through
+`legacy_drain()` on every iteration. That disabled PSR and FBC and blocked the
+owner for good. From the first runtime iteration, every KMS session on Meteor
+Lake failed with NoDevice, whether or not a monitor was attached. Probe-time
+MTL hotplug events also suspended the owner. The pass now holds the owner
+without blocking it. No fixture had driven the runtime wrapper. Integration
+moved its owner hold into a helper that production calls, and added a
+regression fixture that drives it. With the old `legacy_drain` body restored,
+the fixture fails.
+
+Integration also sets PIPE_MISC's HDR mode precision bit on Pipes B–D, as
+Linux does for a primary-only pipe. Pipe A never writes PIPE_MISC, so Gen12
+and the panel path are unchanged. One deliberate difference from Linux
+remains: FBC is always deactivated around a repartition, even where Linux
+could keep it.
+
+All eight release groups pass 2,142 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
+### MTL media GT SLPC, RC6 and powergating — release gates recorded
+
+With `narf.intel.media_gt=1`, GT1 now gets power management the way Linux
+runs it for every GT:
+- Media powergating is enabled for VCS0, VCS2 and VECS0.
+- The media GuC starts SLPC with GT1's own frequency fuses, then hands RC6 to
+  firmware.
+- GT1 publishes only once SLPC is running. A failed SLPC start stops GT1
+  unpublished, as Linux fails the uC load.
+- Every stop returns RC6 and powergating to the host first.
+
+Linux disables powergating only at suspend. NARF does it at every stop, which
+is harmless because each stop ends in a GuC reset or a park. The GT0 SLPC path
+is unchanged, and its 21 fixtures pass as before.
+
+All eight release groups pass 2,146 tests, with no failures and only the
+existing shared RNG-registration skip. The release production boot and both
+btrfs postflights also pass. The debug group pass is deferred to the end of
+this integration wave. None of this has run on physical Intel hardware.
+
+### Display-14 DSC, FEC and the panel-fitter model — targeted release gates recorded
+
+Meteor Lake now supports Display Stream Compression (DSC):
+- **eDP panel:** compressed with DSC when its link needs it. The sink's DSC
+  enable is set before link training.
+- **External DP:** compressed with DSC and Forward Error Correction (FEC). FEC
+  is set ready before training and enabled in DP_TP_CTL afterwards, followed by
+  the PPS SDP. A FEC status timeout is only logged, as in Linux.
+- **Resources:** the CDCLK minimum and the 1.5-line prefill account for
+  compression.
+- **Shared helpers:** the `drm_dsc` helpers now serve both AMD and Intel, and
+  AMD's behaviour is byte-identical.
+- **Panel fitter:** the display-14 pipe scaler is modelled for panel fitting.
+- **Register fix:** TRANS_VBLANK's start field is cleared on display 14, as
+  Linux does.
+
+Behaviour notes:
+- 6 bpc output is not supported yet. A panel that Linux would drive uncompressed
+  at 18 bpp is refused with `SixBpcUnqualified`; a follow-up worker is adding
+  6 bpc.
+- A failed FEC_READY AUX write refuses the external route. Linux only logs it.
+
+Targeted release runs passed 627 tests with no failures. They covered the new
+DSC, scaler and `drm_dsc` prefixes, every touched display-14 and KMS prefix
+(including the fail-closed modeset fixtures), and the AMD DSC, DCN401 and
+Navi48 prefixes. One Clippy fix was needed. The production boot was not run,
+because the only probe change (VBT eDP facts) cannot be reached in QEMU. None
+of this has run on physical Intel hardware.
+
+### Display runtime-PM wakerefs, integrated autosuspend and D3cold — targeted release gates recorded
+
+Display power now takes part in PCI runtime PM, as Linux's display wakerefs
+do:
+- Every lit pipe, every display-14 `DC_off` reference and the pending DC
+  re-entry hold a usage reference on the function's runtime-PM device.
+- Autosuspend is now armed on MTL/Arrow and Gen12 owners that have a display.
+  The lit panel's wakeref keeps the function in D0. The owned modeset holds a
+  `DC_off` reference across its crtc disable/enable, so the panel's count never
+  reaches zero mid-modeset.
+- While the function is suspended, HPD is polled every 10 s, and each detect
+  takes a wakeref.
+- Display work started during suspend fails closed before any MMIO.
+- Runtime D3cold now names its refusal reason, following Linux's checks: no
+  root port, no PME from D3cold, no `_PR3`, or 300 MiB or more of VRAM in use
+  (rounded up per MiB).
+
+Hardware-test caveat: the `modeset_xelpg` kernel-test fixtures use the default
+pipe-DMC sink. On real MTL hardware they reach the production DC service and
+move the panel's display wakeref. QEMU is unaffected.
+
+Each code commit compiles on its own. One targeted release run with the
+production boot passed 241 tests with no failures, and both btrfs postflights
+passed. The run covered the runtime-power, DC-state, display-14 modeset, pipes
+and external, KMS, HuC and GT prefixes, plus `power/runtime`. None of this has
+run on physical Intel hardware.
+
+### MTL GSC worker, Wa_14015076503 and native Xe PXP refusals — targeted release gates recorded
+
+`narf.intel.gsc=1` is a new default-off option. With it, the media GuC's stop
+honours Wa_14015076503 around its GRDOM_FULL, and media scheduling is admitted
+beside loaded GSC firmware. A GSC worker (firmware load, HuC authentication via
+the GSC, proxy start) runs on native models only. It carries a temporary
+dead-code allowance outside kernel-test builds until a platform owner supplies
+its GSCCS queue, stolen object and CSME component.
+
+**Real UAPI changes on every native Xe device**, following Linux with PXP
+absent:
+- Query 9 (PXP status): size 0 now reports 8, other sizes are EINVAL, and the
+  exact size is ENODEV. It used to be EINVAL.
+- Exec-queue PXP_TYPE: NONE is accepted, HWDRM is ENODEV, and anything else is
+  EINVAL. It used to be ENOSYS.
+- GEM_CREATE now walks its extension chain in Linux's check order and applies
+  the result only after the argument, VM and allocation checks. It used to
+  refuse every extension with EINVAL.
+
+One errno gap remained: more than 16 GEM_CREATE extensions was EINVAL, where
+Linux returns E2BIG. The E2BIG unit below closes it.
+
+The integration combined this unit with the media-GT power unit's stop path:
+RC6 and powergating are returned first, then the GuC stops, then the
+workaround-bracketed reset runs. That is Linux's order. One targeted release
+run passed 188 tests with no failures. It covered the media-GT, media, user,
+Xe, BCS8, GuC-GT, GT, GT-recovery and HuC prefixes. None of this has run on
+physical Intel hardware.
+
+### MTL GSCCS0, the stolen GSC object and the production GSC worker — targeted release gates recorded
+
+With `narf.intel.media_gt=1` and `narf.intel.gsc=1`:
+- GSCCS0 is a kernel-only engine of the media GuC; no UAPI query or
+  placement can name it.
+- The 4 MiB GSC private object lives in stolen memory behind a fixed GGTT
+  DM window, which the FBC carve and the claim registry avoid.
+- The GSC worker runs in production: firmware load, compatibility query, HuC
+  authentication, then proxy start. Proxy start ends at LOAD_FAIL (ENODEV)
+  until the MEI GSC proxy joins, as Linux does without the proxy.
+
+Known stall: the one-time 4 MiB image copy is about 1M uncached BAR2 writes in
+a single GT-worker poll. It is off any present path.
+
+The integration fixed two production bugs and one fixture defect in this
+unit, which had never been run:
+- Registering the kernel GSCCS0 context would have panicked the kernel on
+  the first GSC job. It now registers with its own logical instance, as
+  Linux does.
+- Re-routing GSC interrupts after any GT reset always failed. All-ones was
+  read as lost MMIO, but it is the masks' valid reset value.
+- The GSC owner fixtures restarted the media GuC on the wrong clock, and
+  their model kept stale contexts across restarts.
+
+Open item, not caused by this unit: the GuC GT wake poll checked its deadline
+before the acknowledgement, so a late poll with the ack already present timed
+out. Linux re-checks the condition once after the timeout. The
+condition-before-deadline unit below closes this.
+
+One targeted release run passed 198 tests with no failures. It covered the
+media-GT, stolen, FBC, GT-IRQ, engine, RCS, GTT, GGTT-TLB, GuC-GT, Gen12,
+multi-CCS and HuC prefixes. None of this has run on physical Intel hardware.
+
+### FsError E2BIG and the Xe extension limits — targeted release gates recorded
+
+`FsError::ArgumentListTooLong` now carries Linux's E2BIG (7) through the errno
+mappers: sys_ioctl (direct and FUSE-relayed), unlink, bind, rmdir, rename,
+xattr, mount, umount, chown, metadata, quota and the ALSA errno.
+
+UAPI changes:
+- Xe GEM_CREATE and EXEC_QUEUE_CREATE return E2BIG past 16 extensions. The
+  check runs before the extension is copied, as in Linux; these used to
+  return EINVAL.
+- A self-referencing EXEC_QUEUE_CREATE extension chain now applies 16 times
+  and then returns E2BIG, as in Linux. It used to be refused at the first
+  revisit.
+- FUSE `-7` replies now surface as E2BIG.
+
+One targeted release run passed 754 tests with no failures. The only skip was
+the existing shared RNG-registration skip. The run covered `filesystem` (whose
+FUSE round-trip test registers at the top level), `syscall_abi/drm_prime`, and
+the media-GT, user and Xe GPU prefixes. No narrower `syscall_abi` groups exist
+for the unlink/rename/xattr/mount/chown/quota/ioctl errno paths; they live in
+the top-level ABI suite and were not run. The CI Clippy contexts for
+`narf-userspace` and `narf-drivers-sound` were added for this unit. A
+follow-up worker is aligning the remaining EXEC_QUEUE and i915 extension
+mismatches.
+
+### Xe and i915 extension walkers in Linux's order — targeted release gates recorded
+
+The Xe EXEC_QUEUE_CREATE, EU-stall and i915 user-extension walkers now
+follow Linux's check order and errnos. UAPI changes:
+- **Xe EXEC_QUEUE_CREATE:**
+  - The extension header is checked first (EINVAL), and the reserved-field
+    check is gone.
+  - An unknown property is EINVAL; it used to be ENOSYS.
+  - MULTI_GROUP is ENODEV, and a MULTI_QUEUE_PRIORITY above 2 is EINVAL.
+  - HANG_REPLAY is copied and then refused with ENOSYS (LINUX-GAP).
+  - The parallel-row and VM checks now come before the extension chain.
+- **i915 user extensions:** the walk follows `i915_user_extensions`, with a
+  512-link depth and then E2BIG, and no refusal for revisiting an
+  extension.
+- **Xe EU-stall:** at most 5 extensions, then E2BIG. An open stream is EBUSY
+  before the wait-report range is checked, as in Linux.
+- **i915 GEM_CREATE_EXT:** applied in Linux's table order. SET_PAT is ENODEV
+  before graphics 12.70, and an accepted SET_PAT index is ENOSYS
+  (LINUX-GAP).
+- **i915 MMAP_OFFSET:** the pad is no longer checked, as Linux leaves it.
+
+Integration corrected two fixtures that still pinned the old behaviour:
+- The EU-stall FIFO-capacity smoke now expects EBUSY while its stream is
+  open, then EINVAL once the stream is dropped.
+- The i915 context frequency-hint smoke now expects E2BIG for a
+  self-referencing extension.
+
+One targeted release run passed 171 tests with no failures. It covered the
+Xe, UAPI, render, user, i915-balance, EU-stall, media-GT and context
+prefixes. A follow-up worker is fixing the remaining mismatches: the i915
+context CREATE_EXT apply order, the execbuffer timeline-fence interleaving
+and cap, and the Xe timeslice bound.
+
+### i915 CREATE_EXT order, execbuffer fence arrays and the Xe timeslice bound — targeted release gates recorded
+
+These close the mismatches left open by the extension-walker unit. UAPI
+changes:
+- i915 GEM_CONTEXT_CREATE_EXT applies each SETPARAM at its own link, as
+  `create_setparam` does. A create-time SSEU payload of 32 bytes or more is
+  now ENODEV.
+- i915 execbuffer fence arrays are resolved entry by entry, in Linux's errno
+  order. The 4096-entry caps are gone; only arrays beyond 131072 entries
+  (KMALLOC_MAX_SIZE) are ENOMEM.
+- The Xe exec-queue timeslice is bounded to Linux's Kconfig defaults,
+  1..10000000 µs.
+
+Both this unit and the extension-walker integration corrected the same
+self-referencing LOW_LATENCY fixture to E2BIG. One version is kept, with this
+unit's comment. One targeted release run passed 162 tests with no failures.
+It covered the render, user, i915-balance, i915-async, GuC-GT, GT-IRQ, Xe and
+context prefixes.
+
+### Condition before deadline in Intel GPU waits, and the spin helper — targeted release gates recorded
+
+Intel GPU waits now evaluate their condition before treating an expired
+deadline as a timeout. They follow Linux's `__wait_for`, `xe_mmio_wait32`
+and `read_poll_timeout`. A late reply, status or acknowledgement now wins over
+an expired deadline in all of these:
+- the GuC GT wake and GRDOM_FULL waits;
+- GuC boot status and the MMIO mailbox replies;
+- GT hardware-init and register-init waits;
+- driver-FLR and media-quiesce waits;
+- HuC and SLPC CT replies;
+- GuC log-stream sends;
+- display busy-polls;
+- fence busy-waits.
+
+Some limits stay:
+- HuC Send and new SLPC commands are still refused once their total bound
+  has passed.
+- A late GuC boot that shows a firmware error returns Firmware, not Timeout.
+- A late RegisterInit with a changed media identity returns Identity.
+
+This closes the GuCGt wake-deadline open item recorded above.
+
+`narf_scheduler::responsive_spin_until` now evaluates its condition once more
+after the deadline, as `read_poll_timeout` does. Before, a condition that
+became true between the condition read and the deadline read timed out, and
+most display waits go through this helper. It is a free synchronous polling
+helper, not executor core. A new `scheduler/spin` test covers a condition
+that becomes true at the expiry, which must succeed, and one that never
+holds, which must still time out.
+
+Each of the unit's 9 new tests targets the old ordering. Targeted release runs
+passed 660 tests with no failures; the 4 skips were existing environmental
+scheduler skips. The runs covered the `scheduler` prefix, the GuC-GT,
+GuC-boot, GuC-transport, GT, HuC, SLPC, small-BAR, GuC-log, XeLPG, AUX,
+Gen12, media-GT and fence prefixes, and the display prefixes that use the
+spin helper: PSR, display-14 modeset, pcode, Type-C, DSC, resources, WM and
+KMS. The existing true-timeout tests still time out.
+
+### Xe OA observation streams on the main-GT OAG unit — targeted release gates recorded
+
+`narf.intel.oa=1` is a new default-off option. It enables Xe OA observation
+streams on the main-GT OAG unit for DG2, MTL/Arrow, BMG and LNL. These cover
+query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO, and
+read/poll, all in Linux's errno order. The OA configuration runs as
+kernel-ring LRI jobs through a privileged `submit_commands`, which only the OA
+unit reaches, with addresses validated by `xe_oa_is_valid_config_reg_addr`. An
+open stream blocks runtime park. Stop, reset or suspend returns ENODEV, halts
+the counters and undoes the metric set. Wa_18013179988 (the CTC shift) now
+also applies to MTL/Arrow; `xe_wa_oob.rules` lists 12.55 and 12.70..12.74. EU-
+stall open now returns ENODEV before EACCES, as Linux does.
+
+UAPI change on every native Xe device: query 8 (OA units) used to be EINVAL.
+It now answers in Linux's format, with zero units unless an OAG owner is
+published. Like Linux, it answers even with the option off.
+
+One Clippy fix was needed. The OA and PXP query arms were merged in numeric
+order, and EU-stall keeps both the extension-walker property chain and this
+unit's ENODEV-then-EACCES open. One targeted release run passed 250 tests with
+no failures. It covered the OA, EU-stall, user, Xe, GuC-GT, GuC-boot, RCS, GT,
+media-GT and render prefixes. None of this has run on physical Intel
+hardware.
+
+### i915 context parameter errnos and execbuffer2 argument order — targeted release gates recorded
+
+i915 now follows Linux in these places:
+- **GEM_CONTEXT_GETPARAM/SETPARAM:** per-parameter errnos. The context lookup
+  comes first, then size, capability, range and `capable()`, each only where
+  Linux asks.
+- **SETPARAM VM on a finalized context:** EINVAL, as Linux's `ctx_setparam`
+  has no VM case. NARF's live VM rebinding is gone.
+- **execbuffer2:** its arguments are checked and copied before any fence is
+  touched. `rsvd2` is ignored without the fence flags.
+- **Fence arrays:** `access_ok` is bounded by Linux's per-arch `USER_PTR_MAX`.
+
+I915_SCHEDULER_CAP_PRIORITY stays unadvertised. HAS_SCHEDULER reports
+ENABLED only, so every in-size PRIORITY set is ENODEV, as on a Linux device
+without CAP_PRIORITY. Open items:
+- The i915 priority → GuC mapping is not wired, and CAP_PRIORITY stays
+  unadvertised until it is.
+- NARF's default i915 GuC priority (3) differs from Linux's
+  `map_i915_prio_to_guc_prio`, which maps I915_PRIORITY_NORMAL to
+  GUC_CLIENT_PRIORITY_KMD_NORMAL (2).
+
+The integration made three changes:
+- Restored ENABLED-only HAS_SCHEDULER, per the coordinator.
+- CAP_SYS_NICE is now asked only after the PRIORITY capability check, as in
+  `validate_priority`.
+- Two fixtures were fixed: a capability-record reset between the
+  context-param passes, and a Clippy type alias.
+
+Open `access_ok` findings, not changed by this unit:
+- `drm_ioctl_bridge.rs` `USER_VA_LIMIT = 1 << 47` is one page past
+  x86_64's `USER_PTR_MAX` and half of arm64's. It also refuses null, which
+  Linux's `access_ok` accepts.
+- `userspace/src/handlers/compat.inc.rs` has the same limit.
+
+One targeted release run passed 117 tests with no failures. It covered the
+render, user, i915-balance, UAPI, BCS8, i915-async and context prefixes.
+The `intel_gpu_i915_info` prefix holds no tests of its own; that file's tests
+register under render.
+
+### GuC error capture, coredump text and the OA remainder — targeted release gates recorded
+
+`narf.intel.devcoredump=1` now registers Xe's GuC error-capture lists on the
+primary GuC, following `xe_guc_capture.c`:
+- **Lists:** the XeLP/XeHPG global, class and engine-instance lists, plus the
+  steered INSTDONE extension per fused DSS. They are laid out as
+  `guc_capture_prep_lists` does, in a worst-size GGTT object referenced from
+  `guc_ads.capture_*`, and written only during the stopped-GuC submission
+  reload.
+- **STATE_CAPTURE_NOTIFICATION (0x8002):** handled only when lists are
+  registered. It is parsed into four preallocated nodes, then acknowledged
+  with LOG_BUFFER_FILE_FLUSH_COMPLETE (0x30, type 2). Without registered
+  lists it stays a protocol loss.
+- **Manual capture:** at a context timeout with no GuC node, the scheduler
+  takes `xe_engine_manual_capture` under its forcewake proof before the
+  schedule disable.
+
+The coredump wire format is now version 4. It adds a bounded NARFXETX text
+section in `__xe_devcoredump_read` order. Earlier section offsets are
+unchanged; the bundle grows from 0x275380 to 0x27d3c0 bytes, so a consumer
+that checks the version or the length must accept 4.
+
+The OA remainder:
+- **OA fd mmap:** `xe_oa_mmap`'s checks apply in Linux's order: EACCES
+  without privilege, EINVAL unless the length is the whole buffer, and
+  EINVAL for write, exec or MAP_SHARED. A mapping that passes every check
+  returns ENODEV, because the syscall layer has no read-only private
+  device-PFN path. No OA mapping reaches the read()-backed fallback any
+  more, which would have consumed reports.
+- **Metrics sysfs:** with `narf.intel.oa=1`, the card node gains `metrics/`,
+  and ADD/REMOVE_CONFIG publish and remove `<uuid>/id`.
+- **New sysctl `dev.xe.observation_paranoid`:** 0644, range 0..1, default 1,
+  registered with the first Intel card. At 0, every OA and EU-stall
+  privilege gate admits the caller.
+
+Deliberate bounds: four capture nodes, 256 register groups, the list object
+kept outside the ADS, and a manual capture without the steered list (its
+unicast reads would need MCR steering writes in the failure path).
+
+The integration made these changes:
+- **Production fix:** the manual capture refused any register that read
+  0xffffffff. RING_HWSTAM and RING_IMR are ~0 once the ring is enabled, so
+  every manual capture stopped at the first instance register. Values are
+  now reported as read, as Linux does. The forcewake request and
+  acknowledgements are still re-read before every capture read, so a
+  function that drops off the bus is still detected.
+- **Fixtures:** two fixtures still expected wire version 3 or the old end of
+  file, and now expect version 4. A Clippy allowance was added on the
+  coredump text printer.
+- **HWCONFIG fixture:** the timeout case had been broken since the
+  condition-before-deadline unit above, whose targeted run did not cover the
+  `intel_gpu_hwconfig` prefix. It posted a reply before a late poll, and the
+  reply now wins. It now posts none, so it still times out.
+- **sysfs (failure already on origin/main):** `dcf524ecf` moved the
+  attribute `show()` into the read future, so an attribute updated between
+  `read()` and its first poll returned the newer value. The value is now
+  taken when `read()` is called, after the per-open event cursor, so
+  `kernfs_seq_show`'s ordering is kept.
+
+Targeted release runs passed 343 tests with no failures. They covered the
+error, HWCONFIG, EU-stall, OA, GuC-GT, GuC-boot, user, GT, media-GT, BCS8,
+parallel, Gen12, GT-IRQ and GuC-log prefixes, plus `filesystem/sysfs` and
+`sysfs_e2e`. The devcoredump and VM-dump tests register under the error
+prefix. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

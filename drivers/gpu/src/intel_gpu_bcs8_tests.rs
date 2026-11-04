@@ -36,16 +36,14 @@ fn smoke_bcs8_discovery_ads_private_probe_and_retirement() -> TestResult {
             // Logical [0,1] -> hardware [0,8]; other mappings remain invalid.
             assert_eq!(ads[(0x123c + 96) / 4], 0x20200800);
             assert_eq!(ads[(0x123c + 524) / 4], 0x101);
-            assert_eq!(ads[0x340 / 4 + 1], 3);
+            assert_eq!(ads[0x340 / 4 + 1], 18);
             assert_ne!(ads[0x300 / 4], ads[0x340 / 4]);
-            let saves = (ads[0x340 / 4] - 0x20001000) as usize / 4;
-            assert_eq!(
-                [ads[saves], ads[saves + 4], ads[saves + 8]],
-                [0x3ee29c, 0x3ee080, 0x3ee0a8]
-            );
-            assert_eq!(ads[saves + 2], 1);
-            assert_eq!(ads[saves + 5], d.regs[&0x3ee080]);
-            assert_eq!(d.regs[&0x3ee0c4], 0x3f7e0306);
+            let saves = ads_registers(&w, Engine::Bcs8);
+            assert_eq!(saves[&0x3ee29c].1, 0);
+            assert_eq!(saves[&0x3ee0c4].1, 1);
+            assert_eq!(saves[&0x3ee080], (d.regs[&0x3ee080], 0));
+            assert_eq!(saves[&0x3ee0a8].1, 0);
+            assert_eq!(d.regs[&0x3ee0c4], 0x306);
             assert_eq!(d.regs[&0x3ee0d4] & 0xc080, 0xc080);
             assert_eq!(d.regs[&0x3ee050] & 0x1000, 0x1000);
             for slot in 0..12 {
@@ -257,30 +255,33 @@ fn smoke_guc_log_live_owner_snapshot_and_reload_incarnation() -> TestResult {
     {
         // A wake/MMIO read would reborrow this register bank and panic.
         let _exclusive = w.0.borrow_mut();
-        assert!(gt
-            .snapshot_guc_log(refused, epoch, 0, [0; 32], || false)
-            .is_err());
-        assert!(gt
-            .snapshot_guc_log(
+        assert!(
+            gt.snapshot_guc_log(refused, epoch, 0, [0; 32], || false)
+                .is_err()
+        );
+        assert!(
+            gt.snapshot_guc_log(
                 CaptureBuffer::reserve_for_test(54).unwrap(),
                 epoch + 1,
                 0,
                 [0; 32],
                 || true
             )
-            .is_err());
+            .is_err()
+        );
     }
     drop(snapshot);
     hardware_stop(&mut gt, &w, 0xdfc);
-    assert!(gt
-        .snapshot_guc_log(
+    assert!(
+        gt.snapshot_guc_log(
             CaptureBuffer::reserve_for_test(54).unwrap(),
             epoch,
             0,
             [0; 32],
             || true
         )
-        .is_err());
+        .is_err()
+    );
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);
     // A fresh firmware upload must not relabel previous-incarnation bytes.
@@ -317,7 +318,7 @@ kernel_test_in!(
 );
 
 fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
-    use crate::intel_gpu_error::{coredump, Reason};
+    use crate::intel_gpu_error::{Reason, coredump};
     let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
     prime_copy8(&mut gt, &w);
     let epoch = gt.user_epoch().unwrap();
@@ -339,7 +340,23 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
     assert_eq!(arena.live_allocations(), live);
     let dump = coredump::take_for_test(54);
     assert_eq!(&dump[..8], b"NARFCDMP");
-    assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 7);
+    // Wire version 4 (the Xe text section); its length moved with it.
+    assert_eq!(u32::from_le_bytes(dump[8..12].try_into().unwrap()), 4);
+    assert_eq!(dump.len(), 0x27d3c0);
+    assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 31);
+    assert_eq!(
+        u32::from_le_bytes(dump[144..148].try_into().unwrap()),
+        0x11c100
+    );
+    assert_eq!(&dump[0x11c100..0x11c108], b"NARFEXEC");
+    // The live scheduler has no retained job: the directory proves a valid
+    // empty snapshot rather than unavailable execution storage.
+    assert!(dump[0x11c118..0x11c124].iter().all(|byte| *byte == 0));
+    assert_eq!(u32::from_le_bytes(dump[152..156].try_into().unwrap()), 0);
+    assert!(dump[0x11c140..0x1b4540].iter().all(|byte| *byte == 0));
+    assert_eq!(&dump[0x1b4540..0x1b4548], b"NARFVMEM");
+    assert!(dump[0x1b4558..0x1b4568].iter().all(|byte| *byte == 0));
+    assert!(dump[0x1b4580..].iter().all(|byte| *byte == 0));
     assert_eq!(u64::from_le_bytes(dump[32..40].try_into().unwrap()), epoch);
     assert_eq!(u64::from_le_bytes(dump[40..48].try_into().unwrap()), 1234);
     assert_eq!(u64::from_le_bytes(dump[48..56].try_into().unwrap()), 1235);
@@ -357,8 +374,24 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
         );
     }
     let denied = coredump::take_for_test(54);
-    assert_eq!(u32::from_le_bytes(denied[72..76].try_into().unwrap()), 1);
-    assert!(denied[4352..].iter().all(|byte| *byte == 0));
+    assert_eq!(u32::from_le_bytes(denied[72..76].try_into().unwrap()), 25);
+    assert!(denied[4352..0x11c100].iter().all(|byte| *byte == 0));
+    assert_eq!(&denied[0x11c100..0x11c108], b"NARFEXEC");
+    assert!(denied[0x11c118..0x11c124].iter().all(|byte| *byte == 0));
+    assert_eq!(u32::from_le_bytes(denied[152..156].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(denied[0x11c124..0x11c128].try_into().unwrap()),
+        2
+    );
+    assert!(denied[0x11c140..0x1b4540].iter().all(|byte| *byte == 0));
+    assert_eq!(&denied[0x1b4540..0x1b4548], b"NARFVMEM");
+    assert!(denied[0x1b4558..0x1b4564].iter().all(|byte| *byte == 0));
+    assert_eq!(u32::from_le_bytes(denied[168..172].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(denied[0x1b4564..0x1b4568].try_into().unwrap()),
+        2
+    );
+    assert!(denied[0x1b4580..].iter().all(|byte| *byte == 0));
     hardware_stop(&mut gt, &w, 0xdfc);
     let stopped_allocations = arena.live_allocations();
     assert!(stopped_allocations > 0 && stopped_allocations < live);
@@ -373,6 +406,7 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
     );
     let stopped = coredump::take_for_test(54);
     assert_eq!(u32::from_le_bytes(stopped[72..76].try_into().unwrap()), 1);
+    assert!(stopped[0x11c100..].iter().all(|byte| *byte == 0));
     assert_eq!(arena.live_allocations(), stopped_allocations);
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);

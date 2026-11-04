@@ -5835,3 +5835,27 @@ kernel_test_in!(
     "scheduler/policy",
     smoke_scheduler_waker_identity_survives_clone
 );
+
+/// `responsive_spin_until` evaluates the condition once more after the
+/// deadline has passed, as Linux's `read_poll_timeout` does. A condition
+/// that becomes true exactly at the expiry therefore always succeeds:
+/// either the regular check sees it, or the final one after the helper
+/// observed the expiry does (expiry is monotonic). Before, an expiry that
+/// fell between the condition read and the deadline read timed out. A
+/// condition that never holds still times out.
+fn smoke_responsive_spin_until_rechecks_after_the_deadline() -> TestResult {
+    let deadline = narf_time::Deadline::after_us(200);
+    let late = crate::responsive_spin_until(|| deadline.expired(), deadline);
+    if !late {
+        return TestResult::Fail("a condition true after the expiry must not time out");
+    }
+    let never = crate::responsive_spin_until(|| false, narf_time::Deadline::after_us(200));
+    if never {
+        return TestResult::Fail("a condition that never holds must time out");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/spin",
+    smoke_responsive_spin_until_rechecks_after_the_deadline
+);

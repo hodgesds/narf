@@ -4,7 +4,9 @@
 //! intel_display_irq.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
-use crate::intel_gpu_scanout::{Geometry, Viewport};
+use crate::intel_gpu_scanout::{
+    Geometry, InputFormat, Layout, View, Viewport, TILE4_MODIFIER, X_TILED_MODIFIER,
+};
 use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
 
@@ -263,8 +265,10 @@ enum Action {
     SetMaster,
     Color {
         primary: bool,
+        view: View,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb: Option<crate::intel_gpu_dsb::Timing>,
     },
     Cursor {
@@ -291,6 +295,8 @@ struct Plan {
     next_ctm: u32,
     previous_gamma: u32,
     next_gamma: u32,
+    previous_degamma: u32,
+    next_degamma: u32,
     legacy_store: Option<Vec<u16>>,
 }
 
@@ -357,7 +363,7 @@ impl Plan {
         request: Request,
         geometry: Geometry,
         previous: Option<Crtc>,
-        previous_color: Option<(u32, u32)>,
+        previous_color: Option<(u32, u32, u32)>,
     ) -> Result<Self, FsError> {
         let mut legacy_store = None;
         let request = match request {
@@ -371,9 +377,13 @@ impl Plan {
                     flags: 0,
                     cookie: 0,
                     objects: vec![crtc],
-                    counts: vec![2],
-                    props: vec![CRTC_CTM_PROP_ID, CRTC_GAMMA_LUT_PROP_ID],
-                    values: vec![0, u64::from(blob)],
+                    counts: vec![3],
+                    props: vec![
+                        CRTC_CTM_PROP_ID,
+                        CRTC_GAMMA_LUT_PROP_ID,
+                        CRTC_DEGAMMA_LUT_PROP_ID,
+                    ],
+                    values: vec![0, u64::from(blob), 0],
                 })
             }
             Request::Property {
@@ -408,15 +418,18 @@ impl Plan {
             })
             .ok_or(FsError::NoDevice)?;
         let wire = card.mode_wire(&fixed);
-        let (previous_ctm, previous_gamma) = previous_color.unwrap_or_else(|| {
-            card.crtc_color(previous.id)
-                .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
-        });
+        let (previous_ctm, previous_gamma, previous_degamma) =
+            previous_color.unwrap_or_else(|| {
+                card.crtc_color(previous.id)
+                    .map_or((0, 0, 0), |c| (c.ctm, c.gamma_lut, c.degamma_lut))
+            });
         let mut p = Self {
             previous_ctm,
             next_ctm: previous_ctm,
             previous_gamma,
             next_gamma: previous_gamma,
+            previous_degamma,
+            next_degamma: previous_degamma,
             next: previous.clone(),
             previous,
             framebuffer: None,
@@ -435,6 +448,7 @@ impl Plan {
         let mut primary_changed = false;
         let mut color = None;
         let mut gamma = None;
+        let mut degamma = None;
         let mut color_compatible = true;
         let mut color_primary = false;
         let mut rect = [
@@ -458,6 +472,7 @@ impl Plan {
             Request::DropMaster => {
                 p.next_ctm = 0;
                 p.next_gamma = 0;
+                p.next_degamma = 0;
                 p.action = Action::DropMaster;
                 return Ok(p);
             }
@@ -467,6 +482,7 @@ impl Plan {
                 if p.next.primary_fb == Some(id) {
                     p.next_ctm = 0;
                     p.next_gamma = 0;
+                    p.next_degamma = 0;
                     p.next.primary_fb = None;
                     p.next.enabled = false;
                     p.next.mode = None;
@@ -474,6 +490,9 @@ impl Plan {
                 return Ok(p);
             }
             Request::Cursor(bytes, object, hardware) => {
+                if hardware && !card.intel_cursor_supported(p.next.id) {
+                    return Err(FsError::Unsupported);
+                }
                 if !hardware && (p.next.x != 0 || p.next.y != 0) {
                     return Err(FsError::Unsupported);
                 }
@@ -594,6 +613,7 @@ impl Plan {
                                 prop,
                                 CRTC_CTM_PROP_ID
                                     | CRTC_GAMMA_LUT_PROP_ID
+                                    | CRTC_DEGAMMA_LUT_PROP_ID
                                     | CRTC_OUT_FENCE_PTR_PROP_ID
                             ))
                             || (object == PLANE_ID_BASE
@@ -651,7 +671,7 @@ impl Plan {
                         } else if object == p.next.id {
                             match prop {
                                 CRTC_CTM_PROP_ID => {
-                                    if !card.intel_color(p.next.id) {
+                                    if !card.intel_ctm_supported(p.next.id) {
                                         return Err(FsError::Unsupported);
                                     }
                                     let blob = u32_value(value)?;
@@ -671,11 +691,32 @@ impl Plan {
                                     if id != 0 {
                                         let bytes =
                                             card.property_blob(id).ok_or(FsError::NotFound)?;
-                                        if ![256 * 8, 1024 * 8].contains(&bytes.len()) {
+                                        if ![
+                                            256 * 8,
+                                            card.intel_lut_sizes(p.next.id)
+                                                .ok_or(FsError::Unsupported)?
+                                                .0
+                                                * 8,
+                                        ]
+                                        .contains(&bytes.len())
+                                        {
                                             return Err(FsError::InvalidData);
                                         }
                                     }
                                     gamma = Some(id);
+                                }
+                                CRTC_DEGAMMA_LUT_PROP_ID => {
+                                    if !card.intel_color(p.next.id) {
+                                        return Err(FsError::Unsupported);
+                                    }
+                                    let id = u32_value(value)?;
+                                    if id != 0 {
+                                        crate::intel_gpu_color::DegammaLut::decode_profile(
+                                            card.property_blob(id).ok_or(FsError::NotFound)?,
+                                            card.intel_lut_profile(),
+                                        )?;
+                                    }
+                                    degamma = Some(id);
                                 }
                                 CRTC_ACTIVE_PROP_ID => {
                                     if value > 1 {
@@ -742,14 +783,46 @@ impl Plan {
             x: rect[0] >> 16,
             y: rect[1] >> 16,
         };
-        let panning = (primary_changed || color_primary || (color.is_none() && gamma.is_none()))
+        let panning = (primary_changed
+            || color_primary
+            || (color.is_none() && gamma.is_none() && degamma.is_none()))
             && (viewport != Viewport::default() || p.previous.x != 0 || p.previous.y != 0)
             && p.next.enabled
             && fb.is_some()
             && route.is_some();
-        color_primary |= panning;
-        if color.is_some() || gamma.is_some() || panning {
-            if !card.intel_color(p.next.id) {
+        let tiling = p.next.enabled
+            && fb.is_some()
+            && route.is_some()
+            && [p.previous.primary_fb, fb]
+                .into_iter()
+                .flatten()
+                .any(|id| card.framebuffer(id).is_ok_and(|f| f.modifier != 0));
+        let format_activity = p.next.enabled
+            && fb.is_some()
+            && route.is_some()
+            && [p.previous.primary_fb, fb].into_iter().flatten().any(|id| {
+                card.framebuffer(id)
+                    .is_ok_and(|f| f.format == PixelFormat::Xrgb2101010)
+            });
+        if format_activity && (!card.intel_xr30 || tiling) {
+            return Err(FsError::Unsupported);
+        }
+        color_primary |= panning || tiling || format_activity;
+        let mut view = View::from(viewport);
+        if color.is_some()
+            || gamma.is_some()
+            || degamma.is_some()
+            || panning
+            || tiling
+            || format_activity
+        {
+            let joint_qualified = card.intel_ctm
+                || (card.intel_gen12_joint
+                    && ((!panning && !tiling) || card.intel_gen12_views.is_some()));
+            if !card.intel_ctm_supported(p.next.id)
+                || (color_primary && !joint_qualified)
+                || (!card.intel_color(p.next.id) && (gamma.is_some() || degamma.is_some()))
+            {
                 return Err(FsError::Unsupported);
             }
             if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
@@ -775,8 +848,13 @@ impl Plan {
                 let target = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
                 if target.pitch != geometry.pitch
-                    || target.format != PixelFormat::Xrgb8888
-                    || target.modifier != 0
+                    || !(target.format == PixelFormat::Xrgb8888
+                        || (target.format == PixelFormat::Xrgb2101010
+                            && card.intel_xr30
+                            && target.modifier == 0))
+                    || (target.modifier != 0
+                        && !(target.modifier == X_TILED_MODIFIER && card.intel_x_tiled
+                            || target.modifier == TILE4_MODIFIER && card.intel_tile4))
                     || target.offsets != [0, 0]
                     || target.chroma_pitch != 0
                     || !object.object.is_wc()
@@ -785,6 +863,16 @@ impl Plan {
                     || object.object.is_userptr()
                 {
                     return Err(FsError::Unsupported);
+                }
+                view.input = if target.format == PixelFormat::Xrgb2101010 {
+                    InputFormat::Xrgb2101010
+                } else {
+                    InputFormat::Xrgb8888
+                };
+                if target.modifier == X_TILED_MODIFIER {
+                    view.layout = Layout::X;
+                } else if target.modifier == TILE4_MODIFIER {
+                    view.layout = Layout::Tile4;
                 }
                 if viewport
                     .x
@@ -797,8 +885,16 @@ impl Plan {
                 {
                     return Err(FsError::NoSpace);
                 }
-                let (_, _, extent) = viewport
-                    .layout(geometry)
+                let alignment = card
+                    .intel_gen12_views
+                    .map_or(4096, crate::intel_gpu_scanout::gen12_alignment);
+                if card.intel_gen12_views.is_some_and(|family| {
+                    geometry.pitch > crate::intel_gpu_scanout::gen12_max_stride(family)
+                }) {
+                    return Err(FsError::Unsupported);
+                }
+                let (_, _, extent) = view
+                    .footprint_aligned(geometry, alignment)
                     .map_err(|_| FsError::InvalidData)?;
                 if extent > object.object.size() {
                     return Err(FsError::InvalidData);
@@ -814,9 +910,21 @@ impl Plan {
             if let Some(id) = gamma {
                 p.next_gamma = id;
             }
+            if let Some(id) = degamma {
+                p.next_degamma = id;
+            }
             // MTL's single-buffered LUT and independent color arms require
             // the owned DSB chain for active replacement/combined changes.
-            let needs_dsb = color_primary
+            let needs_dsb = (card.intel_gen12_lut.is_some()
+                && (p.next_gamma != 0
+                    || p.previous_gamma != 0
+                    || p.next_degamma != 0
+                    || p.previous_degamma != 0))
+                || color_primary
+                || ((p.previous_gamma != 0 || p.previous_degamma != 0)
+                    && ((p.next_degamma != p.previous_degamma && p.next_degamma != 0)
+                        || (p.next_gamma != p.previous_gamma && p.next_gamma != 0)))
+                || ((p.next_ctm != p.previous_ctm) && (p.next_degamma != p.previous_degamma))
                 || (p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma)
                 || (p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma);
             let dsb = needs_dsb.then_some(crate::intel_gpu_dsb::Timing {
@@ -846,14 +954,26 @@ impl Plan {
             let lut = if p.next_gamma == 0 {
                 None
             } else {
-                Some(crate::intel_gpu_color::Lut::decode(
+                Some(crate::intel_gpu_color::Lut::decode_profile(
                     card.property_blob(p.next_gamma).ok_or(FsError::NotFound)?,
+                    card.intel_lut_profile(),
+                )?)
+            };
+            let degamma = if p.next_degamma == 0 {
+                None
+            } else {
+                Some(crate::intel_gpu_color::DegammaLut::decode_profile(
+                    card.property_blob(p.next_degamma)
+                        .ok_or(FsError::NotFound)?,
+                    card.intel_lut_profile(),
                 )?)
             };
             p.action = Action::Color {
                 primary: color_primary,
+                view,
                 coefficients,
                 lut,
+                degamma,
                 dsb,
             };
             return Ok(p);
@@ -885,6 +1005,7 @@ impl Plan {
         } else if !p.next.enabled || fb.is_none() || route.is_none() {
             p.next_ctm = 0;
             p.next_gamma = 0;
+            p.next_degamma = 0;
             p.next.primary_fb = None;
             p.next.enabled = false;
             p.next.mode = None;
@@ -939,8 +1060,12 @@ impl Plan {
         }
         if card
             .crtc_color(self.previous.id)
-            .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
-            != (self.previous_ctm, self.previous_gamma)
+            .map_or((0, 0, 0), |c| (c.ctm, c.gamma_lut, c.degamma_lut))
+            != (
+                self.previous_ctm,
+                self.previous_gamma,
+                self.previous_degamma,
+            )
         {
             return false;
         }
@@ -1016,6 +1141,7 @@ trait Backend {
         &mut self,
         _coefficients: Option<[u64; 9]>,
         _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         _dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
@@ -1024,9 +1150,9 @@ trait Backend {
         &mut self,
         _object: Arc<crate::intel_gpu_gem::GemObject>,
         _geometry: Geometry,
-        _viewport: Viewport,
+        _view: View,
         _coefficients: Option<[u64; 9]>,
-        _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _luts: crate::intel_gpu_color::Luts,
         _timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
@@ -1079,20 +1205,21 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         &mut self,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.set_color_with_dsb(coefficients, lut, dsb))
+        Box::pin(self.set_color_with_dsb(coefficients, lut, degamma, dsb))
     }
     fn present_color(
         &mut self,
         object: Arc<crate::intel_gpu_gem::GemObject>,
         geometry: Geometry,
-        viewport: Viewport,
+        view: View,
         coefficients: Option<[u64; 9]>,
-        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        luts: crate::intel_gpu_color::Luts,
         timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.present_color(object, geometry, viewport, coefficients, lut, timing))
+        Box::pin(self.present_color(object, geometry, view, coefficients, luts, timing))
     }
     fn cursor(
         &mut self,
@@ -1152,7 +1279,10 @@ where
     Q: FnOnce() -> Option<crate::drm_fb_hook::ScanoutGeom> + Send,
     C: FnOnce() + Send,
 {
-    if !matches!(frame.format, PixelFormat::Xrgb8888 | PixelFormat::Argb8888)
+    // This fallback is a linear row copy. Native X/Tile4 presentation uses
+    // the owned DSB path; never reinterpret a tiled object as linear pixels.
+    if frame.modifier != 0
+        || !matches!(frame.format, PixelFormat::Xrgb8888 | PixelFormat::Argb8888)
         || frame.width < console.width
         || frame.height < console.height
         || console.bpp != 32
@@ -1342,8 +1472,10 @@ async fn execute_plan<B: Backend>(
         }
         Action::Color {
             primary,
+            view,
             coefficients,
             lut,
+            degamma,
             dsb,
         } => {
             stamp = Some(if *primary {
@@ -1352,17 +1484,19 @@ async fn execute_plan<B: Backend>(
                     .present_color(
                         object,
                         plan.geometry,
-                        Viewport {
-                            x: plan.next.x,
-                            y: plan.next.y,
-                        },
+                        *view,
                         *coefficients,
-                        lut.clone(),
+                        crate::intel_gpu_color::Luts {
+                            post: lut.clone(),
+                            pre: degamma.clone(),
+                        },
                         dsb.ok_or(FsError::Unsupported)?,
                     )
                     .await?
             } else {
-                backend.color(*coefficients, lut.clone(), *dsb).await?
+                backend
+                    .color(*coefficients, lut.clone(), degamma.clone(), *dsb)
+                    .await?
             });
         }
         Action::Present => {
@@ -1482,6 +1616,7 @@ async fn execute_plan<B: Backend>(
             if let Some(color) = card.crtc_color.iter_mut().find(|c| c.crtc == plan.next.id) {
                 color.ctm = plan.next_ctm;
                 color.gamma_lut = plan.next_gamma;
+                color.degamma_lut = plan.next_degamma;
                 if let Some(store) = &plan.legacy_store {
                     color.gamma_store = store.clone();
                 }
@@ -1674,7 +1809,11 @@ pub(crate) async fn dispatch(
 ) -> Option<Result<u64, FsError>> {
     if drm_uapi::ioc_nr(cmd) == 0xa4 {
         let mode = crate::drm_registry::mode_state(index)?;
-        if mode.lock().intel_ctm {
+        let has_legacy_gamma = {
+            let card = mode.lock();
+            card.intel_ctm || card.intel_gen12_lut.is_some()
+        };
+        if has_legacy_gamma {
             return Some(get_legacy_gamma(&mode, arg, context));
         }
     }
@@ -1696,8 +1835,11 @@ pub(crate) async fn dispatch(
                 events,
                 geometry,
                 display.epoch(),
-                (crate::drm_registry::mode_state(index).is_some_and(|card| card.lock().intel_ctm))
-                    .then_some(gem),
+                (crate::drm_registry::mode_state(index).is_some_and(|card| {
+                    let card = card.lock();
+                    card.intel_ctm || card.intel_hw_cursor
+                }))
+                .then_some(gem),
             )
             .await
             {

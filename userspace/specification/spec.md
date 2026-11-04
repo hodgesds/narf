@@ -734,6 +734,14 @@ preserve exact filesystem errors before progress, return an accepted prefix
 after progress, and distinguish blocking, `O_NONBLOCK`/`EAGAIN`, interrupting
 signals/`EINTR`, and broken-pipe `SIGPIPE`/`EPIPE`. A writev no larger than
 `PIPE_BUF` reaches a pipe as one write transaction across iovec boundaries.
+Scalar and vector reads, including positioned reads, invoke
+`FileOps::read_with_options` with current retained-description `O_NONBLOCK`
+status immediately before each call. Aliased `dup`/`F_SETFL` changes after
+lookup therefore affect the invocation; a previous lookup's cached flags do
+not select blocking behavior. The same snapshot chooses `EAGAIN` versus
+readiness parking. A stream's single-poll hint does not make a blocking
+`readv` nonblocking. Ordinary-file defaults and generic zero-length shortcuts
+retain their existing behavior.
 Anonymous-pipe and named-FIFO reads retain each page-buffer prefix until its
 complete guarded scalar/vector copy succeeds. A fault in the current buffer
 leaves that buffer queued; earlier completed buffers remain consumed and the

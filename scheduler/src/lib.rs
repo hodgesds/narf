@@ -7689,8 +7689,10 @@ pub fn cooperative_yield() -> bool {
 /// e.g. spec-defined "controller must respond within 100 ms" or
 /// "hub reset takes max 50 ms".
 ///
-/// Returns true if `done` succeeded before the deadline, false
-/// on timeout.
+/// Returns true if `done` succeeded, false on timeout. As Linux's
+/// `read_poll_timeout` does, the condition is evaluated once more after
+/// the deadline has passed, so one that became true between the last
+/// check and the expiry is not reported as a timeout.
 #[inline]
 pub fn responsive_spin_until<F: FnMut() -> bool>(
     mut done: F,
@@ -7703,7 +7705,11 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
             return true;
         }
         if deadline.expired() {
-            return false;
+            let done = done();
+            if done {
+                note_forward_progress();
+            }
+            return done;
         }
         if i & 0xFFF == 0 {
             sleep_pumps::run();

@@ -1862,13 +1862,20 @@ pub fn dispatch_virtgpu_mmap(
 /// The caller must hold the syscall trap context (not IRQ context, the
 /// calling task's address space active). `uptr` itself may be hostile.
 pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
-    if len > IOCTL_MAX_BUF {
+    // SAFETY: forwards the identical user-copy contract with generic bound.
+    unsafe { copy_in_bounded(uptr, len, IOCTL_MAX_BUF) }
+}
+unsafe fn copy_in_bounded(uptr: usize, len: usize, limit: usize) -> Result<Vec<u8>, FsError> {
+    if len > limit {
         return Err(FsError::InvalidData);
     }
     if !access_ok(uptr as u64, len) {
         return Err(FsError::BadAddress);
     }
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| FsError::OutOfMemory)?;
+    out.resize(len, 0);
     // SAFETY: `out` is a live kernel buffer of `len` bytes; the user side
     // is range-checked above and the guarded copy survives a fault on it.
     unsafe { guarded_copy(out.as_mut_ptr(), uptr as *const u8, len)? };
@@ -2098,7 +2105,7 @@ pub(crate) fn dispatch_card_for_file(
     // 3. Look up the per-cmd handler.
     let nr = drm_uapi::ioc_nr(cmd);
     #[cfg(feature = "intel")]
-    if crate::intel_gpu_kms::available(card_index) {
+    if crate::intel_gpu_kms::available(card_index) || mode_state.lock().intel_xr30 {
         if intel_kms::mutates(cmd) {
             return Err(if mode_state.lock().intel_transaction_busy() {
                 FsError::Busy
@@ -2921,9 +2928,11 @@ fn handle_getcrtc(
         out[20..24].copy_from_slice(&crtc.x.to_le_bytes());
         out[24..28].copy_from_slice(&crtc.y.to_le_bytes());
         // drm_crtc::gamma_size: the legacy LUT's, on CRTCs that have one.
-        let gamma_size = card
-            .crtc_color(crtc_id)
-            .map_or(0, |_| crate::drm::card::LEGACY_GAMMA_SIZE as u32);
+        let gamma_size = if card.legacy_gamma_supported(crtc_id) {
+            crate::drm::card::LEGACY_GAMMA_SIZE as u32
+        } else {
+            0
+        };
         out[28..32].copy_from_slice(&gamma_size.to_le_bytes());
         let mode_valid: u32 = crtc.mode.is_some() as u32;
         out[32..36].copy_from_slice(&mode_valid.to_le_bytes());
@@ -3054,6 +3063,8 @@ const CRTC_VRR_ENABLED_PROP_ID: u32 = 0x63;
 const CRTC_CTM_PROP_ID: u32 = 0x64;
 const CRTC_GAMMA_LUT_PROP_ID: u32 = 0x65;
 const CRTC_GAMMA_LUT_SIZE_PROP_ID: u32 = 0x66;
+const CRTC_DEGAMMA_LUT_PROP_ID: u32 = 0x82;
+const CRTC_DEGAMMA_LUT_SIZE_PROP_ID: u32 = 0x83;
 /// MAX_COLOR_LUT_ENTRIES, the GAMMA_LUT_SIZE value.
 const GAMMA_LUT_SIZE: u64 = 4096;
 /// `sizeof(struct drm_color_ctm)`: nine S31.32 sign-magnitude u64s.
@@ -3236,7 +3247,15 @@ fn handle_getplane(
         {
             Some((_, crtc_idx)) => (
                 1u32 << crtc_idx,
-                card.plane_formats.unwrap_or(&[DRM_FORMAT_XRGB8888]),
+                {
+                    #[cfg(feature = "intel")]
+                    let native = card.intel_primary_formats();
+                    #[cfg(not(feature = "intel"))]
+                    let native: Option<&'static [u32]> = None;
+                    native
+                        .or(card.plane_formats)
+                        .unwrap_or(&[DRM_FORMAT_XRGB8888])
+                },
                 (0, 0),
             ),
             // amdgpu_dm's overlays: possible on every CRTC (0xff), with
@@ -3305,8 +3324,8 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     // GETPROPBLOB using the blob id GETCONNECTOR reported as this prop's value.
     let blob_name: Option<&[u8]> = match prop_id {
         EDID_PROP_ID => Some(b"EDID"),
-        #[cfg(feature = "amdgpu")]
-        crate::drm_native_planes::IN_FORMATS_PROP_ID => Some(b"IN_FORMATS"),
+        #[cfg(any(feature = "amdgpu", feature = "intel"))]
+        0x6e => Some(b"IN_FORMATS"),
         #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::IN_FORMATS_ASYNC_PROP_ID => Some(b"IN_FORMATS_ASYNC"),
         _ => None,
@@ -3434,6 +3453,12 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         // 0..UINT_MAX range.
         CRTC_CTM_PROP_ID => Some((b"CTM".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
         CRTC_GAMMA_LUT_PROP_ID => Some((b"GAMMA_LUT".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
+        CRTC_DEGAMMA_LUT_PROP_ID => Some((b"DEGAMMA_LUT".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
+        CRTC_DEGAMMA_LUT_SIZE_PROP_ID => Some((
+            b"DEGAMMA_LUT_SIZE".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE,
+            [0, u32::MAX as u64],
+        )),
         CRTC_GAMMA_LUT_SIZE_PROP_ID => Some((
             b"GAMMA_LUT_SIZE".as_slice(),
             DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE,
@@ -3635,14 +3660,24 @@ fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>,
     let Some(color) = card.crtc_color(crtc) else {
         return (Vec::new(), Vec::new());
     };
-    if card.intel_color(crtc) {
+    if card.intel_ctm_supported(crtc) && !card.intel_color(crtc) {
+        (vec![CRTC_CTM_PROP_ID], vec![u64::from(color.ctm)])
+    } else if card.intel_color(crtc) {
         (
             vec![
                 CRTC_CTM_PROP_ID,
                 CRTC_GAMMA_LUT_PROP_ID,
                 CRTC_GAMMA_LUT_SIZE_PROP_ID,
+                CRTC_DEGAMMA_LUT_PROP_ID,
+                CRTC_DEGAMMA_LUT_SIZE_PROP_ID,
             ],
-            vec![u64::from(color.ctm), u64::from(color.gamma_lut), 1024],
+            vec![
+                u64::from(color.ctm),
+                u64::from(color.gamma_lut),
+                card.intel_lut_sizes(crtc).expect("Intel color profile").0 as u64,
+                u64::from(color.degamma_lut),
+                card.intel_lut_sizes(crtc).expect("Intel color profile").1 as u64,
+            ],
         )
     } else {
         (
@@ -3666,6 +3701,7 @@ fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>,
 struct CrtcColorChange {
     ctm: Option<u32>,
     gamma_lut: Option<u32>,
+    degamma_lut: Option<u32>,
 }
 
 /// Decode one CRTC color property into `change`: EINVAL on a CRTC without
@@ -3679,7 +3715,10 @@ fn crtc_color_property(
     value: u64,
     change: &mut CrtcColorChange,
 ) -> Result<bool, FsError> {
-    if !matches!(prop, CRTC_CTM_PROP_ID | CRTC_GAMMA_LUT_PROP_ID) {
+    if !matches!(
+        prop,
+        CRTC_CTM_PROP_ID | CRTC_GAMMA_LUT_PROP_ID | CRTC_DEGAMMA_LUT_PROP_ID
+    ) {
         return Ok(false);
     }
     if card.crtc_color(crtc).is_none() {
@@ -3689,13 +3728,37 @@ fn crtc_color_property(
         change.ctm = Some(blob_value(card, value, Some(CTM_BLOB_SIZE), None)?);
         return Ok(true);
     }
+    if card.intel_ctm_supported(crtc) && !card.intel_color(crtc) {
+        return Err(FsError::InvalidData);
+    }
+    if prop == CRTC_DEGAMMA_LUT_PROP_ID {
+        if !card.intel_color(crtc) {
+            return Err(FsError::InvalidData);
+        }
+        let id = blob_value(
+            card,
+            value,
+            Some(card.intel_lut_sizes(crtc).ok_or(FsError::InvalidData)?.1 * COLOR_LUT_ENTRY_SIZE),
+            None,
+        )?;
+        #[cfg(feature = "intel")]
+        if id != 0 {
+            crate::intel_gpu_color::DegammaLut::decode_profile(
+                card.property_blob(id).ok_or(FsError::InvalidData)?,
+                card.intel_lut_profile(),
+            )?;
+        }
+        change.degamma_lut = Some(id);
+        return Ok(true);
+    }
     let id = blob_value(card, value, None, Some(COLOR_LUT_ENTRY_SIZE))?;
     if id != 0 {
         let entries = card
             .property_blob(id)
             .map_or(0, |b| b.len() / COLOR_LUT_ENTRY_SIZE);
         let valid = if card.intel_color(crtc) {
-            entries == 1024 || entries == crate::drm::card::LEGACY_GAMMA_SIZE
+            entries == card.intel_lut_sizes(crtc).expect("Intel color profile").0
+                || entries == crate::drm::card::LEGACY_GAMMA_SIZE
         } else {
             entries == GAMMA_LUT_SIZE as usize || entries == crate::drm::card::LEGACY_GAMMA_SIZE
         };
@@ -3724,6 +3787,9 @@ fn apply_crtc_color(
     }
     if let Some(id) = change.gamma_lut {
         color.gamma_lut = id;
+    }
+    if let Some(id) = change.degamma_lut {
+        color.degamma_lut = id;
     }
     let (ctm, gamma_lut) = (color.ctm, color.gamma_lut);
     card.collect_blobs();
@@ -4358,6 +4424,15 @@ fn handle_gamma(
     let (red, green, blue) = (ptr(8), ptr(16), ptr(24));
     let card = mode_state.lock();
     card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
+    if card.intel_ctm_supported(crtc_id) && !card.legacy_gamma_supported(crtc_id) {
+        return if set {
+            Err(FsError::NotImplemented)
+        } else if size == 0 {
+            Ok(0)
+        } else {
+            Err(FsError::InvalidData)
+        };
+    }
     if set && card.intel_color(crtc_id) {
         // Intel SET must traverse its async owned color FIFO. A missing
         // display owner or synchronous caller cannot publish software-only
@@ -4420,6 +4495,7 @@ fn handle_gamma(
     let change = CrtcColorChange {
         ctm: Some(0),
         gamma_lut: Some(blob),
+        degamma_lut: None,
     };
     let _request = apply_crtc_color(card_index, &mut card, crtc_id, change);
     // drm_property_blob_put: only the committed GAMMA_LUT holds it now.
@@ -4439,6 +4515,98 @@ fn handle_gamma(
 /// blobs, regenerated from the connector's preferred mode.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_property.c::drm_mode_getblob_ioctl`.
+#[cfg(feature = "intel")]
+const INTEL_PRIMARY_FORMATS_BLOB: u32 = 0x4000_0040;
+#[cfg(feature = "intel")]
+fn intel_modifiers_cap(
+    mode: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+) -> Option<Result<u64, FsError>> {
+    let qualified = {
+        let card = mode.lock();
+        card.intel_x_tiled || card.intel_tile4 || card.intel_xr30
+    };
+    if cmd != drm_uapi::DRM_IOCTL_GET_CAP || !qualified {
+        return None;
+    }
+    let result = (|| {
+        let mut request = [0; 16];
+        context.read(arg, &mut request)?;
+        if u64::from_le_bytes(request[..8].try_into().unwrap())
+            != crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
+        {
+            return Ok(None);
+        }
+        request[8..].copy_from_slice(&1u64.to_le_bytes());
+        context.write(arg, &request)?;
+        Ok(Some(0))
+    })();
+    match result {
+        Ok(None) => None,
+        Ok(Some(value)) => Some(Ok(value)),
+        Err(error) => Some(Err(error)),
+    }
+}
+/// The same installed display capability on primary and render opens. Other
+/// cards/capabilities retain their existing dispatcher and payload handling.
+#[cfg(feature = "intel")]
+pub(crate) fn intel_get_modifiers_cap(
+    card_index: u32,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+) -> Option<Result<u64, FsError>> {
+    let mode = crate::drm_registry::mode_state(card_index)?;
+    intel_modifiers_cap(&mode, cmd, arg, context)
+}
+#[cfg(feature = "intel")]
+fn intel_primary_formats_blob(card: &crate::drm::card::Card, id: u32) -> Option<Vec<u8>> {
+    if id != INTEL_PRIMARY_FORMATS_BLOB
+        || !(card.intel_x_tiled || card.intel_tile4 || card.intel_xr30)
+    {
+        return None;
+    }
+    // LINEAR supports both opaque inputs; existing tiled rows remain XR24.
+    let mut modifiers = alloc::vec![0];
+    if card.intel_x_tiled {
+        modifiers.push(crate::intel_gpu_scanout::X_TILED_MODIFIER);
+    }
+    if card.intel_tile4 {
+        modifiers.push(crate::intel_gpu_scanout::TILE4_MODIFIER);
+    }
+    let formats = card
+        .intel_primary_formats()
+        .unwrap_or(&[DRM_FORMAT_XRGB8888]);
+    let modifier_offset = (24 + formats.len() * 4 + 7) & !7;
+    let mut bytes = Vec::new();
+    for word in [
+        1u32,
+        0,
+        formats.len() as u32,
+        24,
+        modifiers.len() as u32,
+        modifier_offset as u32,
+    ] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for format in formats {
+        bytes.extend_from_slice(&format.to_le_bytes());
+    }
+    bytes.resize(modifier_offset, 0);
+    for modifier in modifiers {
+        let mask: u64 = if modifier == 0 && card.intel_xr30 {
+            3
+        } else {
+            1
+        };
+        bytes.extend_from_slice(&mask.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&modifier.to_le_bytes());
+    }
+    Some(bytes)
+}
 fn handle_getpropblob(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
@@ -4450,6 +4618,11 @@ fn handle_getpropblob(
     let user_len = u32::from_le_bytes(out[4..8].try_into().unwrap());
     let data_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
 
+    let reserved_len = mode_state
+        .lock()
+        .property_blob(blob_id)
+        .map_or(0, |data| data.len());
+    let _copy_budget = reserve_property_blob_copy(mode_state, reserved_len)?;
     // A userspace blob (MODE_ID, CTM, GAMMA_LUT, HDR_OUTPUT_METADATA), or a
     // connector's EDID.
     let edid = {
@@ -4459,8 +4632,19 @@ fn handle_getpropblob(
         let native_blob = crate::drm_native_planes::in_formats_blob(&card, blob_id);
         #[cfg(not(feature = "amdgpu"))]
         let native_blob: Option<Vec<u8>> = None;
+        #[cfg(feature = "intel")]
+        let native_blob = native_blob.or_else(|| intel_primary_formats_blob(&card, blob_id));
         match (card.property_blob(blob_id), native_blob) {
-            (Some(data), _) => data.to_vec(),
+            (Some(data), _) => {
+                if data.len() > reserved_len {
+                    return Err(FsError::InvalidData);
+                }
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(data.len())
+                    .map_err(|_| FsError::OutOfMemory)?;
+                copy.extend_from_slice(data);
+                copy
+            }
             (None, Some(data)) => data,
             (None, None) => {
                 let connector_id =
@@ -4555,8 +4739,15 @@ fn handle_obj_getproperties(
                 u64::from(p.crtc_h),
                 (-1i64) as u64,
             ];
-            #[cfg(feature = "amdgpu")]
+            #[cfg(any(feature = "amdgpu", feature = "intel"))]
             let (mut props, mut values) = (props, values);
+            #[cfg(feature = "intel")]
+            if (card.intel_x_tiled || card.intel_tile4 || card.intel_xr30)
+                && obj_id == PLANE_ID_BASE
+            {
+                props.push(0x6e);
+                values.push(u64::from(INTEL_PRIMARY_FORMATS_BLOB));
+            }
             #[cfg(feature = "amdgpu")]
             if let Some((ids, vals)) = crate::drm_native_planes::object_properties(&card, obj_id) {
                 props.extend(ids);
@@ -4689,6 +4880,73 @@ fn handle_obj_getproperties(
     Ok(0)
 }
 
+struct PropertyBlobCopyBudget {
+    mode: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    bytes: usize,
+}
+impl Drop for PropertyBlobCopyBudget {
+    fn drop(&mut self) {
+        #[cfg(feature = "intel")]
+        self.mode.lock().intel_release_blob_copy(self.bytes);
+        #[cfg(not(feature = "intel"))]
+        {
+            let _ = (&self.mode, self.bytes);
+        }
+    }
+}
+fn reserve_property_blob_copy(
+    mode: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    bytes: usize,
+) -> Result<Option<PropertyBlobCopyBudget>, FsError> {
+    #[cfg(feature = "intel")]
+    if mode
+        .lock()
+        .intel_reserve_blob_copy(bytes)
+        .map_err(|_| FsError::OutOfMemory)?
+    {
+        return Ok(Some(PropertyBlobCopyBudget {
+            mode: mode.clone(),
+            bytes,
+        }));
+    }
+    let _ = (mode, bytes);
+    Ok(None)
+}
+fn property_blob_limit(card: &crate::drm::card::Card) -> usize {
+    #[cfg(feature = "intel")]
+    if card.intel_gen12_lut == Some(crate::intel_gpu_color::Profile::Display12) {
+        return crate::intel_gpu_color::MAX_COLOR_BLOB;
+    }
+    let _ = card;
+    IOCTL_MAX_BUF
+}
+fn create_property_blob_owned(
+    mode: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    bytes: &mut [u8],
+    copy: impl FnOnce(u64, usize) -> Result<Vec<u8>, FsError>,
+) -> Result<(), FsError> {
+    if bytes.len() != 16 {
+        return Err(FsError::InvalidData);
+    }
+    let data_ptr = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let limit = property_blob_limit(&mode.lock());
+    if len == 0 || len > limit {
+        return Err(FsError::InvalidData);
+    }
+    let _copy_budget = reserve_property_blob_copy(mode, len)?;
+    let data = copy(data_ptr, len)?;
+    if data.len() != len {
+        return Err(FsError::InvalidData);
+    }
+    let result = {
+        let mut card = mode.lock();
+        card.create_property_blob(data)
+    };
+    let id = result.map_err(|_| FsError::OutOfMemory)?;
+    bytes[12..16].copy_from_slice(&id.to_le_bytes());
+    Ok(())
+}
 /// DRM_IOCTL_MODE_CREATEPROPBLOB — copy an opaque userspace payload into a
 /// per-card blob and return its id. Atomic modesets use a 68-byte modeinfo.
 fn handle_create_property_blob(
@@ -4703,18 +4961,15 @@ fn handle_create_property_blob(
     // SAFETY: `arg` is the ioctl's fixed 16-byte in/out structure; `copy_in`
     // validates the complete userspace range before returning owned bytes.
     let mut bytes = unsafe { copy_in(arg, 16)? };
-    let data_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    if len == 0 || len > IOCTL_MAX_BUF {
-        return Err(FsError::InvalidData);
-    }
-    // SAFETY: length is non-zero and capped; copy_in returns EFAULT for NULL.
-    let data = unsafe { copy_in(data_ptr as usize, len)? };
-    let blob_id = mode_state
-        .lock()
-        .create_property_blob(data)
-        .map_err(|_| FsError::OutOfMemory)?;
-    bytes[12..16].copy_from_slice(&blob_id.to_le_bytes());
+    create_property_blob_owned(mode_state, &mut bytes, |ptr, len| {
+        let limit = {
+            let card = mode_state.lock();
+            property_blob_limit(&card)
+        };
+        // SAFETY: helper validates the color-specific bound and this transfer
+        // validates the full user range; generic copy_in retains its 1MiB cap.
+        unsafe { copy_in_bounded(ptr as usize, len, limit) }
+    })?;
     // SAFETY: fixed 16-byte in/out structure.
     unsafe { copy_out(arg, &bytes)? };
     Ok(0)
@@ -8124,6 +8379,7 @@ pub fn intel_addfb2_bo(
 #[cfg(feature = "intel")]
 #[derive(Clone)]
 struct IntelFrame {
+    format: crate::drm::card::PixelFormat,
     object: Arc<crate::intel_gpu_gem::GemObject>,
     pitch: u32,
     width: u32,
@@ -8137,6 +8393,7 @@ struct IntelFrame(core::convert::Infallible);
 #[cfg(feature = "intel")]
 fn intel_frame(fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
     fb.intel.as_ref().map(|intel| IntelFrame {
+        format: fb.format,
         object: intel.object.clone(),
         pitch: fb.pitch,
         width: fb.width,
@@ -8156,6 +8413,10 @@ fn intel_frame(_fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
 /// the object's scattered pages. Only 32-bpp frames match the scanout.
 #[cfg(feature = "intel")]
 fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
+    // Native-only input: refuse before fence waits, CPU sync or console copy.
+    if frame.format == crate::drm::card::PixelFormat::Xrgb2101010 {
+        return Err(FsError::Unsupported);
+    }
     const GPU_FENCE_TIMEOUT_MS: u64 = 15_000;
     let object = &frame.object;
     for fence in object.dma_buf.resv.fences(DmaResvUsage::Write) {

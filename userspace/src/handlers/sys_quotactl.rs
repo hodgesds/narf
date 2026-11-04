@@ -51,7 +51,7 @@ const _: () = assert!(EBADF == -9 && EPERM == -1 && EDQUOT == -122);
 // conventions returned +9, which userspace reads as a successful
 // `quotactl_fd` that wrote nothing.
 use crate::errno::wire::{
-    EBADF, EDQUOT, EFAULT, EINVAL, EIO, ENODEV, ENOENT, ENOSPC, EPERM, ESRCH,
+    E2BIG, EBADF, EDQUOT, EFAULT, EINVAL, EIO, ENODEV, ENOENT, ENOSPC, EPERM, ESRCH,
 };
 
 /// Map a filesystem error to the `quotactl(2)` errno. The quota fs methods only
@@ -69,6 +69,7 @@ fn quota_errno(error: FsError) -> i64 {
         FsError::NoSpace => ENOSPC,
         FsError::InvalidData | FsError::InvalidPath => EINVAL,
         FsError::PermissionDenied => EPERM,
+        FsError::ArgumentListTooLong => E2BIG,
         _ => EIO,
     }
 }

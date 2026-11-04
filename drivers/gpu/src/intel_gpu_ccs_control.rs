@@ -104,6 +104,24 @@ pub(crate) fn client_open(index: u32) -> Result<Option<ClientLease>, FsError> {
     gate.open().map(Some)
 }
 
+/// Initial driver-FLR excludes even clients opened before backend publication.
+/// Cancellation/failure keeps this gate closed; only verified ready reopens it.
+#[derive(Debug)]
+pub(crate) struct TakeoverClients(Arc<ClientGate>);
+impl TakeoverClients {
+    pub(crate) fn release(self) {
+        self.0.reopen();
+    }
+}
+pub(crate) fn takeover_clients(index: u32) -> Result<TakeoverClients, FsError> {
+    let gate = {
+        let mut cards = CARDS.lock();
+        gate(&mut cards, index)
+    };
+    gate.close_if_empty()?;
+    Ok(TakeoverClients(gate))
+}
+
 fn gate(cards: &mut Vec<Entry>, index: u32) -> Arc<ClientGate> {
     if let Some(entry) = cards.iter().find(|entry| entry.index == index) {
         return entry.gate.clone();

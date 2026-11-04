@@ -238,6 +238,7 @@ impl BootAllocator for Allocator {
 fn info(dss: u32, per_group: u8) -> Info {
     Info {
         card: 61,
+        platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
         dss,
         per_group,
     }
@@ -630,37 +631,85 @@ fn smoke_eu_stall_query_properties_record_bounds_and_malformed_cursors() -> Test
     ] {
         assert_eq!(query(bad), Err(FsError::Unsupported));
     }
+    // MIT Linux b90c984d xe_eu_stall.c::{xe_eu_stall_user_extensions,
+    // xe_eu_stall_user_ext_set_property,xe_eu_stall_stream_open,
+    // xe_eu_stall_stream_open_locked,xe_eu_stall_stream_init}.
     let wire = Wire::new();
     wire.opening();
-    assert_eq!(
-        properties(layout, 128, &wire),
-        Ok(Config { rate: 2, wait: 1 })
-    );
-    assert_eq!(properties(layout, 0, &wire), Err(FsError::InvalidData));
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 2, wait: 1 }));
+    // `if (!props.gt) return -EINVAL;` after the chain.
+    assert_eq!(properties(0, &wire), Err(FsError::InvalidData));
+    // Property 0 has no setter and 4 is past ARRAY_SIZE (-EINVAL), as are
+    // sampling rates outside 251..=1757 and (LINUX-GAP) the media GT 1 that
+    // Linux would accept.
     for (key, value, error) in [
+        (0, 0, FsError::InvalidData),
         (1, 1, FsError::InvalidData),
         (2, 250, FsError::InvalidData),
         (2, 2008, FsError::InvalidData),
-        (3, 0, FsError::InvalidData),
-        (3, layout.reports() + 1, FsError::InvalidData),
-        (3, 2, FsError::Unsupported),
         (4, 0, FsError::InvalidData),
     ] {
         wire.property(128, 160, 1, 0);
         wire.property(160, 0, key, value);
-        assert_eq!(properties(layout, 128, &wire), Err(error));
+        assert_eq!(properties(128, &wire), Err(error));
     }
+    // xe_device_get_gt takes a u8 gt_id: GT 0x100 is GT 0.
+    wire.property(128, 0, 1, 0x100);
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait: 1 }));
+    // WAIT_NUM_REPORTS is only stored, in an int (its low 32 bits). These
+    // pinned -EINVAL from the chain for 0 and reports + 1; Linux checks the
+    // range in xe_eu_stall_stream_init, after the EBUSY of an open stream.
+    for (value, wait) in [
+        (0, 0),
+        (layout.reports() + 1, layout.reports() + 1),
+        (1 << 32 | 1, 1),
+    ] {
+        wire.property(128, 160, 1, 0);
+        wire.property(160, 0, 3, value);
+        assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait }));
+    }
+    for wait in [0, layout.reports() + 1] {
+        let bad = Config { rate: 4, wait };
+        assert_eq!(Session::new(layout, bad).unwrap_err(), FsError::InvalidData);
+        let held = Session::new(layout, config()).unwrap();
+        assert_eq!(Session::new(layout, bad).unwrap_err(), FsError::Busy);
+        drop(held);
+    }
+    // MAX_USER_EXTENSIONS is 5 and Linux keeps no visited set: five links
+    // are walked, a sixth is -E2BIG before it is read (here unreadable), and
+    // a self-reference ends at the same bound. This pinned -EINVAL.
+    for link in 0..5u64 {
+        let next = if link == 4 { 0 } else { 128 + 64 * (link + 1) };
+        wire.property(128 + 64 * link, next, 1, 0);
+    }
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait: 1 }));
+    wire.property(128 + 64 * 4, 2048, 1, 0);
+    assert_eq!(properties(128, &wire), Err(FsError::ArgumentListTooLong));
     wire.property(128, 128, 1, 0);
-    assert_eq!(properties(layout, 128, &wire), Err(FsError::InvalidData));
+    assert_eq!(properties(128, &wire), Err(FsError::ArgumentListTooLong));
+    // The 16-byte header is copied and refused before the 48-byte body: at
+    // the end of the range a bad name is -EINVAL, a good header -EFAULT.
     wire.property(128, 1008, 1, 0);
-    assert_eq!(properties(layout, 128, &wire), Err(FsError::BadAddress));
+    assert_eq!(properties(128, &wire), Err(FsError::BadAddress));
+    wire.write(1016, &1u32.to_le_bytes()).unwrap();
+    assert_eq!(properties(128, &wire), Err(FsError::InvalidData));
+    wire.write(1016, &0u32.to_le_bytes()).unwrap();
+    // The body is the whole drm_xe_ext_set_property: unreadable reserved[]
+    // words are -EFAULT, readable ones are not checked.
+    wire.property(1024 - 32, 0, 1, 0);
+    assert_eq!(properties(1024 - 32, &wire), Err(FsError::BadAddress));
     wire.property(128, 0, 1, 0);
+    wire.write(160, &[0xa5; 16]).unwrap();
+    assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait: 1 }));
     wire.write(140, &1u32.to_le_bytes()).unwrap();
-    assert_eq!(properties(layout, 128, &wire), Err(FsError::InvalidData));
-    assert_eq!(
-        Session::new(layout, Config { rate: 4, wait: 2 }).unwrap_err(),
-        FsError::Unsupported
-    );
+    assert_eq!(properties(128, &wire), Err(FsError::InvalidData));
+    for wait in [1, 2, layout.reports()] {
+        wire.property(128, 160, 1, 0);
+        wire.property(160, 0, 3, wait);
+        assert_eq!(properties(128, &wire), Ok(Config { rate: 4, wait }));
+        let session = Session::new(layout, Config { rate: 4, wait }).unwrap();
+        assert_eq!(session.room(), HOST_BYTES.max(wait as usize * 64));
+    }
     let (shared, io, mut collector) = fixture(layout);
     let session = Session::new(layout, config()).unwrap();
     collector.attach(session.clone()).unwrap();
@@ -712,11 +761,14 @@ impl Backend {
         })
     }
     fn poll(&self) {
+        self.poll_at(0);
+    }
+    fn poll_at(&self, now: u64) {
         self.collector
             .lock()
             .as_mut()
             .unwrap()
-            .poll(&self.io, 0, || true)
+            .poll(&self.io, now, || true)
             .unwrap();
     }
     fn reset(&self) {
@@ -768,7 +820,7 @@ fn smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close() -
     ALLOWED.store(false, Ordering::Release);
     assert_eq!(
         ready(open_with_gate(backend.clone(), 32, &wire, gate)),
-        Err(FsError::OperationNotPermitted)
+        Err(FsError::PermissionDenied)
     );
     assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     ALLOWED.store(true, Ordering::Release);
@@ -870,4 +922,436 @@ fn smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close() -
 kernel_test_in!(
     "drivers/gpu/intel_gpu_eu_stall",
     smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close
+);
+
+// Pinned xe_eu_stall_stream_read waits on sampled pollin only for blocking
+// readers, allows record-aligned short reads, and clears pollin after reading.
+fn smoke_eu_stall_threshold_descriptor_blocking_nonblocking_and_short_reads() -> TestResult {
+    ALLOWED.store(true, Ordering::Release);
+    let backend = Backend::new();
+    let wire = Wire::new();
+    wire.opening();
+    wire.property(192, 0, 3, 3);
+    assert_eq!(
+        ready(open_with_gate(
+            backend.clone(),
+            32,
+            &wire,
+            Gate { capable: allowed }
+        )),
+        Ok(37)
+    );
+    let file = wire.installed.lock().take().unwrap();
+    ready(file.ioctl_user(ENABLE, 0, &wire)).unwrap();
+    let memory = backend.shared.memory();
+    let records: Vec<_> = (0..7)
+        .map(|i| memory.record(0, i * 64, 16 + i as u8))
+        .collect();
+    backend.shared.pointer(0, 128, false);
+    backend.poll_at(0);
+    assert_eq!(file.poll_readiness(), 0, "two records do not satisfy wait3");
+    assert_eq!(ready(file.read(0, &mut [0; 64])), Err(FsError::WouldBlock));
+    let nonblock = ReadOptions { nonblocking: true };
+    let mut output = [0; 80];
+    assert_eq!(
+        ready(file.read_with_options(0, &mut output, nonblock)),
+        Ok(64)
+    );
+    assert_eq!(&output[..64], &records[0]);
+    assert_eq!(&output[64..], &[0; 16]);
+    backend.shared.pointer(0, 256, false);
+    backend.poll_at(POLL_NS - 1);
+    assert_eq!(
+        file.poll_readiness(),
+        0,
+        "source readiness is sampled at 5ms"
+    );
+    backend.poll_at(POLL_NS);
+    assert_ne!(
+        file.poll_readiness() & POLL_IN,
+        0,
+        "host1 + source2 meet wait3"
+    );
+    assert_eq!(ready(file.read(0, &mut output)), Ok(64));
+    assert_eq!(&output[..64], &records[1]);
+    assert_eq!(file.poll_readiness(), 0, "short read clears source latch");
+    assert_eq!(ready(file.read(0, &mut output)), Err(FsError::WouldBlock));
+    backend.poll_at(2 * POLL_NS);
+    assert_eq!(
+        file.poll_readiness(),
+        0,
+        "two remaining records cannot rearm wait3"
+    );
+    assert_eq!(
+        ready(file.read_with_options(0, &mut output, nonblock)),
+        Ok(64)
+    );
+    assert_eq!(&output[..64], &records[2]);
+    backend.shared.pointer(0, 384, false);
+    backend.poll_at(3 * POLL_NS);
+    assert_ne!(file.poll_readiness() & POLL_IN, 0);
+    assert_eq!(ready(file.read(0, &mut [0; 63])), Err(FsError::InvalidData));
+    assert_ne!(
+        file.poll_readiness() & POLL_IN,
+        0,
+        "invalid count never consumes latch"
+    );
+    let mut output = [0xa5; 208];
+    assert_eq!(ready(file.read(0, &mut output)), Ok(192));
+    for (i, record) in records[3..6].iter().enumerate() {
+        assert_eq!(&output[i * 64..i * 64 + 64], record);
+    }
+    assert_eq!(&output[192..], &[0xa5; 16]);
+    ready(file.ioctl_user(DISABLE, 0, &wire)).unwrap();
+    assert_eq!(
+        ready(file.read_with_options(0, &mut [0; 64], nonblock)),
+        Err(FsError::InvalidData)
+    );
+    drop(file);
+    backend.poll_at(4 * POLL_NS);
+    backend.reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_threshold_descriptor_blocking_nonblocking_and_short_reads
+);
+
+fn smoke_eu_stall_threshold_sparse_sources_no_copy_double_count() -> TestResult {
+    let layout = info(9, 2);
+    let (shared, io, mut collector) = fixture(layout);
+    let session = Session::new(layout, Config { rate: 4, wait: 100 }).unwrap();
+    collector.attach(session.clone()).unwrap();
+    collector.control(&io, &session, true, || true).unwrap();
+    let memory = shared.memory();
+    for n in 0..64 {
+        memory.record(0, n * 64, 1);
+    }
+    for n in 0..36 {
+        memory.record(3, n * 64, 2);
+    }
+    shared.pointer(0, 4096, false);
+    shared.pointer(3, 2304, false);
+    collector.poll(&io, 0, || true).unwrap();
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    assert_eq!(session.queue.lock().len, 4096);
+    assert_eq!(shared.get(3, 0xe52c), 0, "one DSS is copied per tick");
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Ok(64)
+    );
+    collector.poll(&io, POLL_NS, || true).unwrap();
+    assert_eq!(session.ready.mask(), 0, "host63 + source36 is 99, not 163");
+    assert_eq!(session.queue.lock().len, 99 * 64);
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Err(FsError::WouldBlock)
+    );
+    collector.poll(&io, 2 * POLL_NS, || true).unwrap();
+    assert_eq!(
+        session.ready.mask(),
+        0,
+        "moving source into host does not add reports"
+    );
+    memory.record(3, 2304, 3);
+    shared.pointer(3, 2368, false);
+    collector.poll(&io, 3 * POLL_NS, || true).unwrap();
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    assert_eq!(session.queue.lock().len, 100 * 64);
+    assert_eq!(
+        session.read_with_options(&mut [0; 65], ReadOptions::default()),
+        Ok(64)
+    );
+    reset(collector, &shared);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_threshold_sparse_sources_no_copy_double_count
+);
+
+fn smoke_eu_stall_large_threshold_fifo_capacity_and_unacknowledged_backpressure() -> TestResult {
+    let layout = info(1, 4);
+    let (shared, io, mut collector) = fixture(layout);
+    let session = Session::new(
+        layout,
+        Config {
+            rate: 4,
+            wait: 1025,
+        },
+    )
+    .unwrap();
+    assert_eq!(session.room(), 65600);
+    collector.attach(session.clone()).unwrap();
+    collector.control(&io, &session, true, || true).unwrap();
+    let memory = shared.memory();
+    for n in 0..1026 {
+        memory.record(0, n * 64, (n % 251) as u8);
+    }
+    shared.pointer(0, 65600, false);
+    for tick in 0..17 {
+        collector.poll(&io, tick * POLL_NS, || true).unwrap();
+    }
+    assert_eq!(session.room(), 0);
+    assert_eq!(collector.read[0], 65600);
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    shared.pointer(0, 65664, false);
+    let reads = memory.reads.load(Ordering::Relaxed);
+    collector.poll(&io, 17 * POLL_NS, || true).unwrap();
+    assert_eq!(memory.reads.load(Ordering::Relaxed), reads);
+    assert_eq!(
+        collector.read[0], 65600,
+        "host full must retain source ownership"
+    );
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Ok(64)
+    );
+    assert_eq!(session.ready.mask(), 0);
+    collector.poll(&io, 18 * POLL_NS, || true).unwrap();
+    assert_eq!(session.room(), 0);
+    assert_eq!(collector.read[0], 65664);
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Ok(64)
+    );
+    collector.poll(&io, 19 * POLL_NS, || true).unwrap();
+    assert_eq!(
+        session.ready.mask(),
+        0,
+        "1024 retained records are below wait1025"
+    );
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Err(FsError::WouldBlock)
+    );
+    assert_eq!(session.read(&mut [0; 64]), Ok(64));
+    reset(collector, &shared);
+    drop(session);
+    // Exact source maximum, including its hard 32-DSS/16MiB host bound.
+    let maximum = info(u32::MAX, 4);
+    let session = Session::new(
+        maximum,
+        Config {
+            rate: 7,
+            wait: 262144,
+        },
+    )
+    .unwrap();
+    assert_eq!(session.room(), 16 * 1024 * 1024);
+    let above = Config {
+        rate: 7,
+        wait: 262145,
+    };
+    // xe_eu_stall_stream_open_locked refuses an open stream with -EBUSY
+    // before xe_eu_stall_stream_init checks the wait range.
+    assert_eq!(Session::new(maximum, above).unwrap_err(), FsError::Busy);
+    drop(session);
+    assert_eq!(
+        Session::new(maximum, above).unwrap_err(),
+        FsError::InvalidData
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_large_threshold_fifo_capacity_and_unacknowledged_backpressure
+);
+
+fn smoke_eu_stall_threshold_cancel_reset_and_capability_loss() -> TestResult {
+    ALLOWED.store(true, Ordering::Release);
+    let backend = Backend::new();
+    let wire = Wire::new();
+    wire.opening();
+    wire.property(192, 0, 3, 8192);
+    backend.pending_attach.store(true, Ordering::Release);
+    {
+        let mut future = Box::pin(open_with_gate(
+            backend.clone(),
+            32,
+            &wire,
+            Gate { capable: allowed },
+        ));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    backend.poll_at(0);
+    assert!(!ACTIVE[61].load(Ordering::Acquire));
+    backend.pending_attach.store(false, Ordering::Release);
+    assert_eq!(
+        ready(open_with_gate(
+            backend.clone(),
+            32,
+            &wire,
+            Gate { capable: allowed }
+        )),
+        Ok(37)
+    );
+    let file = wire.installed.lock().take().unwrap();
+    ready(file.ioctl_user(ENABLE, 0, &wire)).unwrap();
+    let record = backend.shared.memory().record(0, 0, 0x27);
+    backend.shared.pointer(0, 64, false);
+    backend.poll_at(0);
+    assert_eq!(ready(file.read(0, &mut [0; 64])), Err(FsError::WouldBlock));
+    backend.reset();
+    assert_ne!(file.poll_readiness() & (POLL_HUP | POLL_ERR), 0);
+    let accesses = backend.shared.state.lock().accesses;
+    let mut bytes = [0; 64];
+    assert_eq!(
+        ready(file.read(0, &mut bytes)),
+        Ok(64),
+        "only immutable host records survive reset"
+    );
+    assert_eq!(bytes, record);
+    assert_eq!(ready(file.read(0, &mut bytes)), Err(FsError::NoDevice));
+    ALLOWED.store(false, Ordering::Release);
+    assert_eq!(
+        ready(file.read_with_options(0, &mut bytes, ReadOptions { nonblocking: true })),
+        Err(FsError::OperationNotPermitted)
+    );
+    assert_eq!(backend.shared.state.lock().accesses, accesses);
+    drop(file);
+    assert!(!ACTIVE[61].load(Ordering::Acquire));
+    ALLOWED.store(true, Ordering::Release);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_threshold_cancel_reset_and_capability_loss
+);
+
+fn smoke_eu_stall_exact_lnl_source_profile_sparse_dss_and_cache_refusal() -> TestResult {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_gt::GtPlatform;
+    struct Fuses;
+    impl MmioWindow for Fuses {
+        fn read32(&self, reg: u64) -> u32 {
+            match reg {
+                0x913c => 0x80000001,
+                0x9144 => 4,
+                0x9134 => 0x81,
+                0x9118 => 0x0001_00f0, // Xe2 L3: one node, four banks
+                _ => panic!("unqualified topology read {reg:x}"),
+            }
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("topology wrote MMIO")
+        }
+    }
+    let lnl = GtPlatform::Integrated(Generation::LunarLake);
+    let topology = crate::intel_gpu_topology::GtTopology::read(&Fuses, lnl).unwrap();
+    let config = crate::intel_gpu_hwconfig::HardwareConfig::parse(
+        [1u32, 1, 8, 70, 1, 32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+    )
+    .unwrap();
+    for did in [0x6420, 0x64a0, 0x64b0] {
+        assert_eq!(GtPlatform::from_pci(0x8086, did), Some(lnl));
+        let layout = Info::from_tables(61, lnl, &topology, &config).unwrap();
+        assert_eq!(
+            (
+                layout.dss,
+                layout.per_group,
+                layout.last(),
+                layout.reports()
+            ),
+            (0x80000005, 4, 32, 24576)
+        );
+        let bytes = query(layout).unwrap();
+        assert_eq!(
+            &bytes[8..32],
+            &[1u64, 64, 524288]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+    for platform in [
+        GtPlatform::Integrated(Generation::PantherLake),
+        GtPlatform::Integrated(Generation::MeteorLake),
+        GtPlatform::Alchemist,
+    ] {
+        assert!(!supported(platform));
+        assert!(Info::from_tables(61, platform, &topology, &config).is_none());
+        assert_eq!(
+            query(Info {
+                platform,
+                ..info(1, 4)
+            }),
+            Err(FsError::Unsupported)
+        );
+    }
+    let bmg_topology =
+        crate::intel_gpu_topology::GtTopology::read(&Fuses, GtPlatform::Battlemage).unwrap();
+    assert!(Info::from_tables(61, lnl, &bmg_topology, &config).is_none());
+    for cache in [true, false] {
+        let layout = Info {
+            platform: lnl,
+            ..info(5, 4)
+        };
+        let (shared, io, mut collector) = fixture(layout);
+        shared.put(0, 0x400c, 0x13c); // source UC MOCS3
+        shared.put(0, 0x4808, if cache { 0xf } else { 0xe }); // exact PAT2
+        let session = Session::new(layout, config_for_lnl()).unwrap();
+        collector.attach(session.clone()).unwrap();
+        if cache {
+            collector.control(&io, &session, true, || true).unwrap();
+            assert_eq!(shared.get(0, 0xe53c), 0x34);
+            assert_eq!(shared.get(2, 0xe520), 0x10000012);
+            let record = shared.memory().record(2, 0, 0x79);
+            shared.pointer(2, 64, false);
+            collector.poll(&io, 0, || true).unwrap();
+            let mut output = [0; 64];
+            assert_eq!(session.read_for_test(&mut output), Ok(64));
+            assert_eq!(output, record);
+        } else {
+            assert_eq!(
+                collector.control(&io, &session, true, || true),
+                Err(FsError::Unsupported)
+            );
+            assert!(!shared
+                .state
+                .lock()
+                .writes
+                .iter()
+                .any(|(_, r, _)| *r == 0xe520));
+            assert_eq!(session.read_for_test(&mut [0; 64]), Err(FsError::NoDevice));
+        }
+        shared.restored();
+        assert_eq!(shared.live.load(Ordering::Relaxed), 1);
+        reset(collector, &shared);
+    }
+    TestResult::Pass
+}
+fn config_for_lnl() -> Config {
+    Config { rate: 4, wait: 1 }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_exact_lnl_source_profile_sparse_dss_and_cache_refusal
+);
+
+/// dev.xe.observation_paranoid: proc_dointvec_minmax over [0, 1] and the
+/// `paranoid && !perfmon_capable()` gate every OA/EU-stall check uses.
+fn smoke_observation_paranoid_sysctl_range_and_gate() -> TestResult {
+    assert!(observation_allowed(1, true));
+    assert!(!observation_allowed(1, false));
+    assert!(observation_allowed(0, false));
+    assert_eq!(read_paranoid(), "1\n");
+    for bad in ["2", "-1", "", "x", "1x", "4294967297"] {
+        assert_eq!(write_paranoid(bad), Err(FsError::InvalidData));
+        assert_eq!(read_paranoid(), "1\n");
+    }
+    assert_eq!(write_paranoid("1"), Ok(()));
+    assert_eq!(read_paranoid(), "1\n");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_observation_paranoid_sysctl_range_and_gate
 );

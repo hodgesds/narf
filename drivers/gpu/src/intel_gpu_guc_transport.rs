@@ -15,8 +15,6 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{fence, Ordering};
 use core::task::Poll;
 
-const SCRATCH: u64 = 0x190240;
-const NOTIFY: u64 = 0x1901f0;
 const GUC_STATUS: u64 = 0xc000;
 const MMIO_TIMEOUT_NS: u64 = 10_000_000;
 const PAGES: u32 = 6;
@@ -77,8 +75,33 @@ impl<B: GpuBacking> CtMemory for SharedCtb<B> {
     }
 }
 
+/// The MMIO mailbox of one GuC. Both register blocks sit above the media GSI
+/// range, so they are absolute offsets for either GT (xe_mmio_adjusted_addr).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MailboxRegisters {
+    scratch: u64,
+    notify: u64,
+}
+
+impl MailboxRegisters {
+    /// Primary GuC: VF_SW_FLAG(0..3) / GUC_HOST_INTERRUPT (i915
+    /// GEN11_SOFT_SCRATCH / GEN11_GUC_HOST_INTERRUPT).
+    pub(crate) const PRIMARY: Self = Self {
+        scratch: 0x190240,
+        notify: 0x1901f0,
+    };
+    /// Standalone media GuC: MED_VF_SW_FLAG(0..3) / MED_GUC_HOST_INTERRUPT
+    /// (xe_guc.c::{xe_guc_comm_init_early,xe_guc_mmio_send_recv}; i915
+    /// MEDIA_SOFT_SCRATCH / MEDIA_GUC_HOST_INTERRUPT with GUC_SEND_TRIGGER).
+    pub(crate) const MEDIA: Self = Self {
+        scratch: 0x190310,
+        notify: 0x190304,
+    };
+}
+
 pub(crate) struct Mailbox<M: MmioWindow> {
     mmio: M,
+    registers: MailboxRegisters,
     request: [u32; 4],
     length: usize,
     deadline: Option<u64>,
@@ -88,8 +111,13 @@ pub(crate) struct Mailbox<M: MmioWindow> {
 
 impl<M: MmioWindow> Mailbox<M> {
     pub(crate) fn new(mmio: M) -> Self {
+        Self::with_registers(mmio, MailboxRegisters::PRIMARY)
+    }
+
+    pub(crate) fn with_registers(mmio: M, registers: MailboxRegisters) -> Self {
         Self {
             mmio,
+            registers,
             request: [0; 4],
             length: 0,
             deadline: None,
@@ -117,17 +145,18 @@ impl<M: MmioWindow> Mailbox<M> {
     }
 
     fn publish(&self) {
+        let scratch = self.registers.scratch;
         for i in 0..self.length {
-            self.mmio.write32(SCRATCH + i as u64 * 4, self.request[i]);
+            self.mmio.write32(scratch + i as u64 * 4, self.request[i]);
         }
-        let _ = self.mmio.read32(SCRATCH + (self.length as u64 - 1) * 4);
+        let _ = self.mmio.read32(scratch + (self.length as u64 - 1) * 4);
         self.notify();
     }
 
     fn notify(&self) {
         fence(Ordering::Release);
-        self.mmio.write32(NOTIFY, 1);
-        let _ = self.mmio.read32(NOTIFY);
+        self.mmio.write32(self.registers.notify, 1);
+        let _ = self.mmio.read32(self.registers.notify);
     }
 
     /// One bounded sample per call. BUSY/RETRY never starts a new timeout.
@@ -135,18 +164,21 @@ impl<M: MmioWindow> Mailbox<M> {
         let Some(deadline) = self.deadline else {
             return Poll::Ready(Err(TransportError::State));
         };
-        let header = self.mmio.read32(SCRATCH);
+        let header = self.mmio.read32(self.registers.scratch);
         if header == u32::MAX {
             self.poisoned = true;
             self.deadline = None;
             return Poll::Ready(Err(TransportError::Unavailable));
         }
-        if now >= deadline {
-            self.poisoned = true;
-            self.deadline = None;
-            return Poll::Ready(Err(TransportError::Timeout));
-        }
         if header & (1 << 31) == 0 || (header >> 28) & 7 == 3 {
+            // xe_guc_mmio_send_recv's xe_mmio_wait32 reads the reply once
+            // more after its deadline: a reply already posted when a late
+            // poll arrives is consumed, not reported as a timeout.
+            if now >= deadline {
+                self.poisoned = true;
+                self.deadline = None;
+                return Poll::Ready(Err(TransportError::Timeout));
+            }
             return Poll::Pending;
         }
         fence(Ordering::Acquire);
@@ -204,6 +236,17 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
     pub fn allocate_for_platform(
         platform: GtPlatform,
         mmio: M,
+        allocator: A,
+    ) -> Result<Self, TransportError> {
+        Self::allocate_with_mailbox(platform, MailboxRegisters::PRIMARY, mmio, allocator)
+    }
+
+    /// The CT's GuC is selected by its window and its MMIO mailbox. The
+    /// enclosing GT owner pairs a media GSI window only with the media mailbox.
+    pub(crate) fn allocate_with_mailbox(
+        platform: GtPlatform,
+        registers: MailboxRegisters,
+        mmio: M,
         mut allocator: A,
     ) -> Result<Self, TransportError> {
         if platform.guc().is_none() {
@@ -244,7 +287,7 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
         })
         .expect("fresh G2H CTB");
         Ok(Self {
-            mailbox: Mailbox::new(mmio),
+            mailbox: Mailbox::with_registers(mmio, registers),
             resources: ManuallyDrop::new(CtResources {
                 allocator,
                 blob,
@@ -694,6 +737,43 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_transport",
         smoke_transport_timeout_quarantines
+    );
+
+    fn smoke_transport_late_poll_consumes_posted_reply() -> TestResult {
+        // xe_guc_mmio_send_recv: xe_mmio_wait32 reads the reply register
+        // once more after its 50 ms bound. A reply already posted when a
+        // poll arrives past the 10 ms bound completes the request.
+        let (model, arena) = Model::new();
+        let mut transport = model.allocate(arena);
+        model.ready();
+        transport.begin_enable(0).unwrap();
+        model.reply(0xf000_0001);
+        if transport.poll_transition(10_000_005).is_ready() {
+            return TestResult::Fail("late poll discarded an already posted reply");
+        }
+        for i in 1..6 {
+            model.reply(0xf000_0001);
+            assert!(transport.poll_transition(10_000_005 + i).is_pending());
+        }
+        model.reply(0xf000_0000);
+        if transport.poll_transition(30_000_000) != Poll::Ready(Ok(TransportState::Enabled)) {
+            return TestResult::Fail("late CONTROL_CTB reply not consumed");
+        }
+        transport.begin_disable(30_000_001).unwrap();
+        model.reply(0xf000_0000);
+        assert_eq!(
+            transport.poll_transition(30_000_002),
+            Poll::Ready(Ok(TransportState::Disabled))
+        );
+        transport.release().unwrap();
+        if model.live.get() != 0 {
+            return TestResult::Fail("disabled CT memory leaked");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_transport",
+        smoke_transport_late_poll_consumes_posted_reply
     );
 
     fn smoke_transport_rejected_key_and_retry_bound() -> TestResult {

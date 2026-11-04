@@ -18,6 +18,8 @@ use crate::{
     intel_gpu_guc_gt::GtState,
 };
 
+#[path = "intel_gpu_guc_capture.rs"]
+pub(crate) mod capture;
 #[path = "intel_gpu_devcoredump.rs"]
 pub(crate) mod coredump;
 
@@ -282,15 +284,37 @@ fn engine_name(engine: Engine) -> &'static str {
         Engine::Ccs1 => "ccs1",
         Engine::Ccs2 => "ccs2",
         Engine::Ccs3 => "ccs3",
+        Engine::Vcs0 => "vcs0",
+        Engine::Vcs1 => "vcs1",
+        Engine::Vcs2 => "vcs2",
+        Engine::Vcs3 => "vcs3",
+        Engine::Vcs4 => "vcs4",
+        Engine::Vcs5 => "vcs5",
+        Engine::Vcs6 => "vcs6",
+        Engine::Vcs7 => "vcs7",
+        Engine::Vecs0 => "vecs0",
+        Engine::Vecs1 => "vecs1",
+        Engine::Vecs2 => "vecs2",
+        Engine::Vecs3 => "vecs3",
+        Engine::Gsccs0 => "gsccs0",
     }
 }
 impl Snapshot {
     fn write_text(&self, out: &mut impl Write) {
         let report = &self.report;
         let capture = report.capture;
-        let _ = writeln!(out, "narf-intel-error-v1\ngeneration={}\nreason={:?}\nepoch={}\nmonotonic_ns={}\nplatform={:?}\ngt_state={:?}\nregister_access={:?}\nsuppressed_errors={}",
-            report.generation(), capture.reason, capture.epoch, capture.now_ns, capture.platform,
-            capture.state, report.access, self.suppressed);
+        let _ = writeln!(
+            out,
+            "narf-intel-error-v1\ngeneration={}\nreason={:?}\nepoch={}\nmonotonic_ns={}\nplatform={:?}\ngt_state={:?}\nregister_access={:?}\nsuppressed_errors={}",
+            report.generation(),
+            capture.reason,
+            capture.epoch,
+            capture.now_ns,
+            capture.platform,
+            capture.state,
+            report.access,
+            self.suppressed
+        );
         let retained = report.contexts.entries().count();
         let _ = writeln!(
             out,
@@ -397,8 +421,10 @@ pub(crate) fn show(index: u32) -> String {
         |report| report.text(),
     )
 }
-pub(crate) fn populate_card(index: u32, node: &narf_filesystem::sysfs::Kobject) {
+pub(crate) fn populate_card(index: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
     narf_filesystem::sysfs::kobject_add_attr(node, "error", move || show(index));
+    crate::intel_gpu_eu_stall::register_sysctl();
+    crate::intel_gpu_oa::populate_card(index, node);
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

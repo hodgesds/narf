@@ -10,7 +10,7 @@ use crate::{
     intel_gpu_rcs::GpuBacking,
 };
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use narf_filesystem::{FsError, FsFuture, InstallFdError, IoctlContext};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
@@ -40,6 +40,23 @@ pub struct UserStatus {
     pub engines: crate::intel_gpu_engine::EngineSet,
 }
 
+/// The MTL/Arrow standalone media GT as native Xe gt_id 1 (type MEDIA).
+/// Published only with `narf.intel.media_gt=1`, after every engine executed
+/// and retired a private PPGTT job on the media GuC, and only while GT0 is
+/// live. Its engines are VCS/VECS with dense logical instances on GT1.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MediaGtStatus {
+    /// GT1's own scheduler epoch; contexts on its engines carry it.
+    pub epoch: u64,
+    pub engines: crate::intel_gpu_engine::EngineSet,
+    /// Raw media GMD_ID (query_gt_list ip_ver_major/minor/rev).
+    pub gmd: u32,
+    /// GT1's command-streamer timestamp clock (xe_gt_clock_init on GT1).
+    pub reference_clock: u32,
+    /// GT1's own topology fuses (query_gt_topology for gt_id 1).
+    pub topology: crate::intel_gpu_gt::media::MediaTopology,
+}
+
 /// Observed PF/graphics-GT facts for the native Xe discovery ABI. Published
 /// before live admission; a PCI ID alone cannot supply the clock or GMD step.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -50,9 +67,32 @@ pub struct DeviceFacts {
     pub reference_clock: u32,
 }
 
+/// Trusted metadata-only smallbar publication transaction. Faultable output
+/// has already completed without any owner/namespace/GEM lock. The callback
+/// calls `current` immediately before identity-safe VM/handle commit. The owner
+/// retains PM/reset exclusion across the metadata call; no user callback,
+/// Vm.state acquisition, await or executor bridge is permitted here.
+pub type VramPublish<'a> =
+    Box<dyn FnOnce(&mut dyn FnMut() -> Result<(), FsError>) -> Result<(), FsError> + Send + 'a>;
+
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
-    /// Cached physical BMG main-GT layout; no read-triggered hardware access.
+    /// The published standalone media GT (native Xe gt_id 1). Default: none,
+    /// as on every backend without `narf.intel.media_gt=1`.
+    fn media_gt(&self) -> Option<MediaGtStatus> {
+        None
+    }
+    /// Cached physical automatic global-reset availability for this live user
+    /// epoch. Default refusal; discovery alone is not a recovery owner. No I/O.
+    fn reset_availability_epoch(&self) -> Option<u64> {
+        None
+    }
+    /// Actual HuC release under the retained reset/D0/wake/auth owner. This
+    /// passive query cannot start or authenticate firmware; default refusal.
+    fn huc_version(&self) -> FsFuture<'_, (u8, u8, u8)> {
+        Box::pin(async { Err(FsError::NoDevice) })
+    }
+    /// Cached physical BMG/LNL main-GT layout; no read-triggered hardware access.
     fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
         None
     }
@@ -63,6 +103,28 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
         _operation: crate::intel_gpu_eu_stall::Operation,
     ) -> FsFuture<'_, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// Cached main-GT OAG facts for this live epoch; no read-triggered I/O.
+    fn oa_device(&self) -> Option<crate::intel_gpu_oa::Device> {
+        None
+    }
+    /// The GT owner serializes OA programming and configuration jobs with
+    /// reset, power and its other DMA owners.
+    fn oa_control(
+        &self,
+        _session: Arc<crate::intel_gpu_oa::Session>,
+        _request: crate::intel_gpu_oa::Request,
+    ) -> FsFuture<'_, ()> {
+        Box::pin(async { Err(FsError::NoDevice) })
+    }
+    /// Copy landed OA reports under the GT owner and advance the head.
+    fn oa_read<'a>(
+        &'a self,
+        _session: Arc<crate::intel_gpu_oa::Session>,
+        _output: &'a mut [u8],
+        _blocking: bool,
+    ) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::NoDevice) })
     }
     /// Stable ABI selection for this card, independent of temporary readiness.
     fn native_xe(&self) -> bool {
@@ -79,6 +141,30 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn clear_vram(
         &self,
         _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _epoch: u64,
+    ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// Revalidate terminal initialization and current whole-DPA ownership at
+    /// actual handle publication. Only opted-in smallbar callers use this;
+    /// unsupported backends cannot publish by returning a cached epoch.
+    fn publish_vram<'a>(
+        &'a self,
+        _epoch: u64,
+        _pool: Arc<crate::intel_gpu_vram::Vram>,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _fence: Arc<CompletionFence>,
+        _publish: VramPublish<'a>,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// Submit a trusted retained copy under this card's current GT/PM owner.
+    /// Err publishes no DMA; Ok transfers the private batch and both BOs to
+    /// the GT until terminal completion/reset, independently of caller Drop.
+    /// Callers exclude uncontrolled CPU aliases while the job is pending.
+    fn copy_objects(
+        &self,
+        _request: crate::intel_gpu_exec::copy::CopyRequest,
         _epoch: u64,
     ) -> FsFuture<'_, Arc<CompletionFence>> {
         Box::pin(async { Err(FsError::Unsupported) })
@@ -110,6 +196,15 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     /// Correlate a live engine counter with one supported CPU clock while the
     /// owner retains PCI D0, render forcewake and its reset mutex.
     fn engine_cycles(
+        &self,
+        _engine: crate::intel_gpu_engine::Engine,
+        _clock: i32,
+    ) -> FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// The same correlation for a published media GT (gt_id 1) engine, under
+    /// the media GuC's GT1 wake and engine wells. Default: no media GT.
+    fn media_engine_cycles(
         &self,
         _engine: crate::intel_gpu_engine::Engine,
         _clock: i32,
@@ -192,6 +287,28 @@ struct State {
     /// Jobs of this context that hung and were removed from their engine.
     guilty: u32,
     policy: (u32, u32),
+    /// Immutable queue-create intent; retained with the private context image
+    /// through repeated registration, cancellation and verified reset.
+    low_latency: bool,
+}
+
+#[derive(Debug)]
+struct ParallelPlacements {
+    engines: Vec<crate::intel_gpu_engine::Engine>,
+    lanes: Vec<crate::intel_gpu_engine::EngineSet>,
+}
+
+/// One live compatibility policy shared by all hardware members of a logical
+/// i915 context. Jobs retain it after the namespace name is destroyed.
+#[derive(Debug, Default)]
+pub(crate) struct CapturePolicy(AtomicBool);
+impl CapturePolicy {
+    pub(crate) fn set(&self, value: u64) {
+        self.0.store(value != 0, Ordering::Release);
+    }
+    pub(crate) fn protected(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
@@ -200,7 +317,8 @@ pub struct UserContext {
     pub(crate) serial: Mutex<()>,
     engine: crate::intel_gpu_engine::Engine,
     placements: crate::intel_gpu_engine::EngineSet,
-    parallel: Option<Vec<crate::intel_gpu_engine::Engine>>,
+    parallel: Option<ParallelPlacements>,
+    capture_policy: Option<Arc<CapturePolicy>>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -215,6 +333,19 @@ impl UserContext {
             engine,
             crate::intel_gpu_engine::EngineSet::of(&[engine]),
             None,
+            None,
+        )
+    }
+
+    pub(crate) fn for_i915_engine(
+        engine: crate::intel_gpu_engine::Engine,
+        policy: Arc<CapturePolicy>,
+    ) -> Arc<Self> {
+        Self::with_placements(
+            engine,
+            crate::intel_gpu_engine::EngineSet::of(&[engine]),
+            None,
+            Some(policy),
         )
     }
 
@@ -223,6 +354,20 @@ impl UserContext {
     pub(crate) fn for_placements(
         placements: crate::intel_gpu_engine::EngineSet,
     ) -> Result<Arc<Self>, FsError> {
+        Self::placements_with_policy(placements, None)
+    }
+
+    pub(crate) fn for_i915_placements(
+        placements: crate::intel_gpu_engine::EngineSet,
+        policy: Arc<CapturePolicy>,
+    ) -> Result<Arc<Self>, FsError> {
+        Self::placements_with_policy(placements, Some(policy))
+    }
+
+    fn placements_with_policy(
+        placements: crate::intel_gpu_engine::EngineSet,
+        capture_policy: Option<Arc<CapturePolicy>>,
+    ) -> Result<Arc<Self>, FsError> {
         let engine = placements.iter().next().ok_or(FsError::InvalidData)?;
         if placements
             .iter()
@@ -230,17 +375,28 @@ impl UserContext {
         {
             return Err(FsError::InvalidData);
         }
-        Ok(Self::with_placements(engine, placements, None))
+        Ok(Self::with_placements(
+            engine,
+            placements,
+            None,
+            capture_policy,
+        ))
     }
 
     pub(crate) fn for_parallel(
-        lanes: impl AsRef<[crate::intel_gpu_engine::Engine]>,
+        lanes: Vec<crate::intel_gpu_engine::EngineSet>,
     ) -> Result<Arc<Self>, FsError> {
-        let lanes = lanes.as_ref();
+        let first = lanes
+            .first()
+            .and_then(|set| set.iter().next())
+            .ok_or(FsError::InvalidData)?;
         if !(2..=MAX_PARALLEL_WIDTH).contains(&lanes.len())
-            || !(lanes[0].is_copy() || lanes[0].is_compute())
-            || lanes.iter().enumerate().any(|(i, engine)| {
-                engine.xe_class() != lanes[0].xe_class() || lanes[..i].contains(engine)
+            || !(first.is_copy() || first.is_compute())
+            || lanes.iter().any(|set| {
+                set.iter().next().is_none()
+                    || set
+                        .iter()
+                        .any(|engine| engine.xe_class() != first.xe_class())
             })
         {
             return Err(FsError::InvalidData);
@@ -249,24 +405,35 @@ impl UserContext {
         owned
             .try_reserve_exact(lanes.len())
             .map_err(|_| FsError::OutOfMemory)?;
-        owned.extend_from_slice(lanes);
+        owned.extend(
+            lanes
+                .iter()
+                .map(|set| set.iter().next().expect("validated lane")),
+        );
+        let placements = lanes[0];
         Ok(Self::with_placements(
-            lanes[0],
-            crate::intel_gpu_engine::EngineSet::of(lanes),
-            Some(owned),
+            first,
+            placements,
+            Some(ParallelPlacements {
+                engines: owned,
+                lanes,
+            }),
+            None,
         ))
     }
 
     fn with_placements(
         engine: crate::intel_gpu_engine::Engine,
         placements: crate::intel_gpu_engine::EngineSet,
-        parallel: Option<Vec<crate::intel_gpu_engine::Engine>>,
+        parallel: Option<ParallelPlacements>,
+        capture_policy: Option<Arc<CapturePolicy>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
             engine,
             placements,
             parallel,
+            capture_policy,
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -277,6 +444,7 @@ impl UserContext {
                 lost_pending: 0,
                 guilty: 0,
                 policy: (3, 1000),
+                low_latency: false,
             }),
         })
     }
@@ -288,13 +456,26 @@ impl UserContext {
         self.placements
     }
     pub(crate) fn parallel(&self) -> Option<&[crate::intel_gpu_engine::Engine]> {
-        self.parallel.as_deref()
+        self.parallel
+            .as_ref()
+            .map(|parallel| parallel.engines.as_slice())
+    }
+    pub(crate) fn parallel_placements(&self) -> Option<&[crate::intel_gpu_engine::EngineSet]> {
+        self.parallel
+            .as_ref()
+            .map(|parallel| parallel.lanes.as_slice())
     }
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
     }
+    /// GuC priority 1..3 and the EXECUTION_QUANTUM (0x2001) KLV value in
+    /// microseconds: init_policies passes q->sched_props.timeslice_us
+    /// unchanged, so the whole exec_queue_set_timeslice range reaches GuC.
     pub(crate) fn configure_schedule(&self, priority: u32, timeslice: u32) -> Result<(), FsError> {
-        if !matches!(priority, 2 | 3) || !(1..=100_000).contains(&timeslice) {
+        use crate::intel_gpu_xe::{TIMESLICE_MAX_US, TIMESLICE_MIN_US};
+        if !(1..=3).contains(&priority)
+            || !(TIMESLICE_MIN_US..=TIMESLICE_MAX_US).contains(&u64::from(timeslice))
+        {
             return Err(FsError::InvalidData);
         }
         let mut state = self.state.lock();
@@ -302,6 +483,16 @@ impl UserContext {
             return Err(FsError::Busy);
         }
         state.policy = (priority, timeslice);
+        Ok(())
+    }
+    /// Configure only before this unpublished context has ever been claimed.
+    /// No runtime ioctl mutates this create-only flag.
+    pub(crate) fn configure_low_latency(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        if state.epoch != 0 || state.busy {
+            return Err(FsError::Busy);
+        }
+        state.low_latency = true;
         Ok(())
     }
     pub(crate) fn banned(&self) -> bool {
@@ -400,6 +591,9 @@ impl ContextClaim {
     pub(crate) fn parallel(&self) -> Option<&[crate::intel_gpu_engine::Engine]> {
         self.context.parallel()
     }
+    pub(crate) fn parallel_placements(&self) -> Option<&[crate::intel_gpu_engine::EngineSet]> {
+        self.context.parallel_placements()
+    }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);
     }
@@ -441,8 +635,15 @@ pub(crate) struct UserJob {
     epoch: u64,
 }
 impl UserJob {
-    pub(crate) fn policy(&self) -> (u32, u32) {
-        self.context.state.lock().policy
+    pub(crate) fn diagnostic_protected(&self) -> bool {
+        self.context
+            .capture_policy
+            .as_ref()
+            .is_some_and(|policy| policy.protected())
+    }
+    pub(crate) fn policy(&self) -> (u32, u32, bool) {
+        let state = self.context.state.lock();
+        (state.policy.0, state.policy.1, state.low_latency)
     }
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.

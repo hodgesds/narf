@@ -1,0 +1,1405 @@
+//! OA conversations against literal Linux b90c984d xe_oa.c register,
+//! report and UAPI vectors: errno order, LRI emission, buffer landing,
+//! wrap/clear/head, status loss, authority and reset/suspend teardown.
+use super::*;
+use crate::intel_gpu_guc_boot::BootError;
+use crate::intel_gpu_rcs::{GpuAllocator, SubmitError};
+use core::{
+    future::Future,
+    sync::atomic::{AtomicU64, AtomicUsize},
+    task::{Context, Poll, Waker},
+};
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+const MTL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+const LNL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
+const BASE: u32 = 0x0100_0000;
+
+struct Hw {
+    regs: IrqSafeSpinLock<BTreeMap<u64, u32>>,
+    writes: IrqSafeSpinLock<Vec<(u64, u32)>>,
+    memory: IrqSafeSpinLock<BTreeMap<u32, u32>>,
+    live: AtomicUsize,
+    freed: AtomicUsize,
+    coherent: AtomicBool,
+}
+impl Hw {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            regs: IrqSafeSpinLock::new(BTreeMap::new()),
+            writes: IrqSafeSpinLock::new(Vec::new()),
+            memory: IrqSafeSpinLock::new(BTreeMap::new()),
+            live: AtomicUsize::new(0),
+            freed: AtomicUsize::new(0),
+            coherent: AtomicBool::new(true),
+        })
+    }
+    fn set(&self, reg: u64, value: u32) {
+        self.regs.lock().insert(reg, value);
+    }
+    fn get(&self, reg: u64) -> u32 {
+        *self.regs.lock().get(&reg).unwrap_or(&0)
+    }
+    fn take(&self) -> Vec<(u64, u32)> {
+        core::mem::take(&mut *self.writes.lock())
+    }
+    fn word(&self, at: u32, value: u32) {
+        let mut memory = self.memory.lock();
+        if value == 0 {
+            memory.remove(&at);
+        } else {
+            memory.insert(at, value);
+        }
+    }
+    fn peek(&self, at: u32) -> u32 {
+        *self.memory.lock().get(&at).unwrap_or(&0)
+    }
+    /// A report whose words are tag+i; word 0/1 carry the id/timestamp.
+    fn report(&self, at: u32, size: u32, tag: u32, circ: u32) {
+        for i in 0..size / 4 {
+            self.word((at + i * 4) % circ, tag.wrapping_add(i) | 0x100);
+        }
+    }
+}
+#[derive(Clone)]
+struct Window(Arc<Hw>);
+impl MmioWindow for Window {
+    fn read32(&self, offset: u64) -> u32 {
+        self.0.get(offset)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        self.0.writes.lock().push((offset, value));
+        // The OA TLB invalidation completes as soon as it is requested.
+        let stored = if offset == OA_TLB_INV_CR { 0 } else { value };
+        self.0.set(offset, stored);
+    }
+}
+struct Memory {
+    hw: Arc<Hw>,
+    pages: u32,
+    coherent: bool,
+}
+impl GpuBacking for Arc<Memory> {
+    fn coherent_for_device(&self) -> bool {
+        self.coherent
+    }
+    fn ggtt_offset(&self) -> u32 {
+        BASE
+    }
+    fn size_pages(&self) -> u32 {
+        self.pages
+    }
+    fn read32(&self, offset: u64) -> u32 {
+        assert_eq!(offset & 3, 0);
+        self.hw.peek(offset as u32)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        self.hw.word(offset as u32, value);
+    }
+}
+#[derive(Clone)]
+struct Allocator(Arc<Hw>);
+impl GpuAllocator for Allocator {
+    type Backing = Arc<Memory>;
+    fn alloc(&mut self, pages: u32) -> Result<Self::Backing, SubmitError> {
+        assert_eq!(self.0.live.swap(1, Ordering::Relaxed), 0);
+        Ok(Arc::new(Memory {
+            hw: self.0.clone(),
+            pages,
+            coherent: self.0.coherent.load(Ordering::Relaxed),
+        }))
+    }
+    fn free(&mut self, _: Self::Backing) {
+        assert_eq!(self.0.live.swap(0, Ordering::Relaxed), 1);
+        self.0.freed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn live_allocations(&self) -> usize {
+        self.0.live.load(Ordering::Relaxed)
+    }
+    fn live_pages(&self) -> u32 {
+        0
+    }
+}
+impl BootAllocator for Allocator {
+    fn sync_for_device(&mut self, _: &Self::Backing) -> Result<(), BootError> {
+        Ok(())
+    }
+}
+
+struct Wire {
+    bytes: IrqSafeSpinLock<Vec<u8>>,
+    installed: IrqSafeSpinLock<Option<Arc<dyn FileOps>>>,
+}
+impl Wire {
+    fn new() -> Self {
+        Self {
+            bytes: IrqSafeSpinLock::new(vec![0; 0x20000]),
+            installed: IrqSafeSpinLock::new(None),
+        }
+    }
+    fn put(&self, at: u64, bytes: &[u8]) {
+        self.write(at, bytes).unwrap();
+    }
+    /// A drm_xe_ext_set_property chain, one 48-byte record per 64 bytes.
+    fn chain(&self, at: u64, properties: &[(u32, u64)]) -> u64 {
+        for (i, &(property, value)) in properties.iter().enumerate() {
+            let here = at + i as u64 * 64;
+            let next = if i + 1 == properties.len() {
+                0
+            } else {
+                here + 64
+            };
+            let mut record = [0u8; 48];
+            record[..8].copy_from_slice(&next.to_le_bytes());
+            record[16..20].copy_from_slice(&property.to_le_bytes());
+            record[24..32].copy_from_slice(&value.to_le_bytes());
+            self.put(here, &record);
+        }
+        at
+    }
+    fn file(&self) -> Arc<dyn FileOps> {
+        self.installed.lock().take().expect("installed OA stream")
+    }
+}
+impl IoctlContext for Wire {
+    fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError> {
+        let at = usize::try_from(address).map_err(|_| FsError::BadAddress)?;
+        let end = at
+            .checked_add(destination.len())
+            .ok_or(FsError::BadAddress)?;
+        destination.copy_from_slice(self.bytes.lock().get(at..end).ok_or(FsError::BadAddress)?);
+        Ok(())
+    }
+    fn write(&self, address: u64, source: &[u8]) -> Result<(), FsError> {
+        let at = usize::try_from(address).map_err(|_| FsError::BadAddress)?;
+        let end = at.checked_add(source.len()).ok_or(FsError::BadAddress)?;
+        self.bytes
+            .lock()
+            .get_mut(at..end)
+            .ok_or(FsError::BadAddress)?
+            .copy_from_slice(source);
+        Ok(())
+    }
+    fn nonblocking(&self) -> bool {
+        false
+    }
+    fn install_file(&self, file: Arc<dyn FileOps>, cloexec: bool) -> Result<i32, FsError> {
+        assert!(!cloexec);
+        assert!(self.installed.lock().replace(file).is_none());
+        Ok(41)
+    }
+}
+
+fn ready<T>(future: impl Future<Output = T>) -> T {
+    let mut future = Box::pin(future);
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("OA fixture transactions are synchronous"),
+    }
+}
+fn allow() -> bool {
+    true
+}
+fn deny() -> bool {
+    false
+}
+const ALLOW: Gate = Gate { capable: allow };
+const DENY: Gate = Gate { capable: deny };
+
+fn device(card: u32, platform: GtPlatform, graphics: u16) -> Device {
+    Device {
+        card,
+        platform,
+        graphics,
+        timestamp: 19_200_000,
+        engines: EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
+        reserve: DEFAULT_BUFFER,
+    }
+}
+
+/// UserBackend over a real Unit; configuration jobs execute as the ring's
+/// MI_LOAD_REGISTER_IMM writes against the same register model.
+struct Backend {
+    device: Device,
+    hw: Arc<Hw>,
+    unit: IrqSafeSpinLock<Option<Unit<Allocator>>>,
+    jobs: IrqSafeSpinLock<Vec<Vec<u32>>>,
+    now: AtomicU64,
+}
+impl core::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("OaFixtureBackend")
+    }
+}
+impl Backend {
+    fn new(device: Device) -> Arc<Self> {
+        let hw = Hw::new();
+        let unit = Unit::new(
+            Allocator(hw.clone()),
+            device.platform,
+            device.graphics,
+            &Window(hw.clone()),
+            || true,
+        )
+        .unwrap();
+        hw.take();
+        Arc::new(Self {
+            device,
+            hw,
+            unit: IrqSafeSpinLock::new(Some(unit)),
+            jobs: IrqSafeSpinLock::new(Vec::new()),
+            now: AtomicU64::new(0),
+        })
+    }
+    fn poll(&self, now: u64) {
+        self.unit
+            .lock()
+            .as_mut()
+            .unwrap()
+            .poll(&Window(self.hw.clone()), now, || true);
+    }
+    fn execute(&self, words: &[u32]) {
+        let mut at = 0;
+        while at < words.len() {
+            assert_eq!(words[at] & 0xffff_ff00, 0x1100_0000);
+            let n = (words[at] & 0xff) as usize / 2 + 1;
+            for pair in words[at + 1..at + 1 + 2 * n].chunks_exact(2) {
+                Window(self.hw.clone()).write32(u64::from(pair[0]), pair[1]);
+            }
+            at += 1 + 2 * n;
+        }
+    }
+}
+impl UserBackend for Backend {
+    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+        None
+    }
+    fn oa_device(&self) -> Option<Device> {
+        Some(self.device)
+    }
+    fn oa_control(&self, session: Arc<Session>, request: Request) -> FsFuture<'_, ()> {
+        Box::pin(async move {
+            let now = self.now.load(Ordering::Relaxed);
+            let io = Window(self.hw.clone());
+            let jobs =
+                self.unit
+                    .lock()
+                    .as_mut()
+                    .unwrap()
+                    .begin(&io, &session, &request, now, || true)?;
+            for job in &jobs {
+                self.jobs.lock().push(job.words().to_vec());
+                self.execute(job.words());
+            }
+            self.unit
+                .lock()
+                .as_mut()
+                .unwrap()
+                .finish(&io, &session, &request, now, || true)
+        })
+    }
+    fn oa_read<'a>(
+        &'a self,
+        session: Arc<Session>,
+        output: &'a mut [u8],
+        blocking: bool,
+    ) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            self.unit.lock().as_mut().unwrap().read(
+                &Window(self.hw.clone()),
+                &session,
+                output,
+                blocking,
+                || true,
+            )
+        })
+    }
+    fn submit<'a>(
+        &'a self,
+        _: Arc<crate::intel_gpu_user::UserContext>,
+        _: crate::intel_gpu_user::UserBatch,
+    ) -> FsFuture<'a, Arc<crate::intel_gpu_fence::CompletionFence>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+}
+fn none(_: u32) -> Option<(u16, usize)> {
+    None
+}
+fn render_queue(id: u32) -> Option<(u16, usize)> {
+    match id {
+        3 => Some((0, 1)),
+        4 => Some((4, 2)),
+        _ => None,
+    }
+}
+fn uuid(n: u8) -> [u8; 36] {
+    let mut uuid = *b"01234567-89ab-cdef-0123-456789abcde0";
+    uuid[35] = b"0123456789abcdef"[usize::from(n & 15)];
+    uuid
+}
+/// drm_xe_oa_config at `at` with registers at `at + 64`.
+fn config_wire(wire: &Wire, at: u64, uuid: [u8; 36], regs: &[(u32, u32)]) -> u64 {
+    let mut head = [0u8; 56];
+    head[8..44].copy_from_slice(&uuid);
+    head[44..48].copy_from_slice(&(regs.len() as u32).to_le_bytes());
+    head[48..56].copy_from_slice(&(at + 64).to_le_bytes());
+    wire.put(at, &head);
+    for (i, &(addr, value)) in regs.iter().enumerate() {
+        wire.put(at + 64 + i as u64 * 8, &addr.to_le_bytes());
+        wire.put(at + 68 + i as u64 * 8, &value.to_le_bytes());
+    }
+    at
+}
+fn add(backend: &Backend, wire: &Wire, n: u8, regs: &[(u32, u32)]) -> u64 {
+    let at = config_wire(wire, 0x10000, uuid(n), regs);
+    add_config(Some(backend), at, wire, ALLOW).unwrap()
+}
+const A24U40: u64 = 5 << 8;
+const OAC192: u64 = 3 | 2 << 8;
+const PEC64U64: u64 = 5 | 1 << 8 | 1 << 16;
+
+fn smoke_oa_query_units_formats_and_timestamp() -> TestResult {
+    let mtl = device(50, MTL, 1270);
+    assert_eq!(query(None), vec![0; 16]);
+    assert_eq!(query(Some(device(50, MTL, 1280))), vec![0; 16]);
+    let reply = query(Some(mtl));
+    assert_eq!(reply.len(), 16 + 72 + 2 * 8);
+    assert_eq!(u32_at(&reply, 8), 1);
+    assert_eq!((u32_at(&reply, 16 + 8), u32_at(&reply, 16 + 12)), (0, 0));
+    assert_eq!(u64_at(&reply, 16 + 16), 0x2d);
+    assert_eq!(u64_at(&reply, 16 + 24), 19_200_000);
+    assert_eq!(u64_at(&reply, 16 + 64), 2);
+    // RENDER/0 then COMPUTE/0 on gt 0; BCS0 has no OA unit.
+    assert_eq!(
+        &reply[88..104],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0]
+    );
+    for (platform, graphics, profile) in [
+        (GtPlatform::Alchemist, 1255, Some(Profile::Dg2)),
+        (MTL, 1270, Some(Profile::Mtl)),
+        (MTL, 1271, Some(Profile::Mtl)),
+        (MTL, 1274, Some(Profile::Mtl)),
+        (MTL, 1260, None),
+        (GtPlatform::Battlemage, 2001, Some(Profile::Xe2)),
+        (LNL, 2004, Some(Profile::Xe2)),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+            3000,
+            None,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake),
+            1200,
+            None,
+        ),
+    ] {
+        assert_eq!(Profile::of(platform, graphics), profile);
+    }
+    // decode_oa_format: exact (type, select, counter size, BC) per platform.
+    assert_eq!(Profile::Mtl.decode(1 | 5 << 8), Some(4));
+    assert_eq!(Profile::Mtl.decode(A24U40), Some(5));
+    assert_eq!(Profile::Mtl.decode(3 | 1 << 8), Some(6));
+    assert_eq!(Profile::Mtl.decode(OAC192), Some(7));
+    assert_eq!(Profile::Mtl.decode(4 | 2 << 8), Some(9));
+    assert_eq!(Profile::Mtl.decode(PEC64U64), None);
+    assert_eq!(Profile::Mtl.decode(0), None);
+    assert_eq!(Profile::Dg2.decode(4 | 1 << 8), None);
+    assert_eq!(Profile::Xe2.decode(PEC64U64), Some(10));
+    assert_eq!(
+        Profile::Xe2.decode(5 | 1 << 8 | 1 << 16 | 1 << 24),
+        Some(11)
+    );
+    assert_eq!(Profile::Xe2.decode(A24U40), None);
+    assert_eq!(FORMATS[11].wire(), 5 | 1 << 8 | 1 << 16 | 1 << 24);
+    // xe_oa_timestamp_frequency: Wa_18013179988 scales by 3 - CTC shift.
+    assert_eq!(timestamp_frequency(1255, 19_200_000, 1 << 1), 76_800_000);
+    assert_eq!(timestamp_frequency(1255, 19_200_000, 3 << 1), 19_200_000);
+    // The workaround's continuation covers MTL/Arrow 12.70..12.74.
+    assert_eq!(timestamp_frequency(1270, 19_200_000, 1 << 1), 76_800_000);
+    assert_eq!(timestamp_frequency(1274, 19_200_000, 2 << 1), 38_400_000);
+    assert_eq!(timestamp_frequency(1260, 19_200_000, 1 << 1), 19_200_000);
+    assert_eq!(timestamp_frequency(2001, 19_200_000, 1 << 1), 19_200_000);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_query_units_formats_and_timestamp
+);
+
+fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
+    let backend = Backend::new(device(51, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let open_at = |props: &[(u32, u64)], gate: Gate, queues: QueueLookup<'_>| {
+        let at = wire.chain(0x1000, props);
+        ready(open(Some(backend.clone()), at, &wire, queues, gate))
+    };
+    let invalid = Err(Error::Fs(FsError::InvalidData));
+    assert_eq!(
+        ready(open(None, 0x1000, &wire, &none, ALLOW)),
+        Err(Error::Fs(FsError::NoDevice))
+    );
+    // Seventeen chained extensions are E2BIG; the walk reads before parsing.
+    let many: Vec<_> = (0..17).map(|_| (2u32, 1u64)).collect();
+    assert_eq!(open_at(&many, ALLOW, &none), Err(Error::Errno(E2BIG)));
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            0x7fff_0000,
+            &wire,
+            &none,
+            ALLOW
+        )),
+        Err(Error::Fs(FsError::BadAddress))
+    );
+    let at = wire.chain(0x1000, &[(2, 1)]);
+    wire.put(at + 8, &1u32.to_le_bytes());
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW)),
+        invalid
+    );
+    let at = wire.chain(0x1000, &[(2, 1)]);
+    wire.put(at + 20, &1u32.to_le_bytes());
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW)),
+        invalid
+    );
+    for props in [
+        &[(0u32, 0u64)][..],
+        &[(14, 0)],
+        &[(1, 1)],
+        &[(4, 1 << 8)],
+        &[(5, 32)],
+        &[(12, 3 << 17)],
+        &[(12, 64 << 10)],
+        &[(12, 256 << 20)],
+        &[(13, 0)],
+        &[(10, 1025)],
+        // NO_PREEMPT without an exec queue precedes the privilege check.
+        &[(9, 1)],
+    ] {
+        assert_eq!(open_at(props, DENY, &none), invalid);
+    }
+    assert_eq!(
+        open_at(&[(7, 5)], DENY, &render_queue),
+        Err(Error::Fs(FsError::NotFound))
+    );
+    assert_eq!(
+        open_at(&[(7, 4)], DENY, &render_queue),
+        Err(Error::Errno(EOPNOTSUPP))
+    );
+    assert_eq!(
+        open_at(&[(2, 1)], DENY, &none),
+        Err(Error::Fs(FsError::PermissionDenied))
+    );
+    // A global stream without sampling, then a missing format.
+    assert_eq!(open_at(&[(4, A24U40)], ALLOW, &none), invalid);
+    assert_eq!(open_at(&[(2, 1)], ALLOW, &none), invalid);
+    // An exec queue without sampling is unprivileged until the exponent.
+    assert_eq!(
+        open_at(&[(7, 3), (4, A24U40), (5, 5)], DENY, &render_queue),
+        invalid
+    );
+    // A non-OAG logical engine of the queue's class.
+    assert_eq!(
+        open_at(&[(7, 3), (8, 1), (4, A24U40)], DENY, &render_queue),
+        invalid
+    );
+    let base = [(2u32, 1u64), (4, A24U40), (3, config), (12, 128 << 10)];
+    let with = |extra: &[(u32, u64)]| {
+        let mut props = base.to_vec();
+        props.extend_from_slice(extra);
+        props
+    };
+    assert_eq!(open_at(&with(&[(13, 513)]), ALLOW, &none), invalid);
+    let busy = Permit::take(51).unwrap();
+    assert_eq!(
+        open_at(&with(&[]), ALLOW, &none),
+        Err(Error::Fs(FsError::Busy))
+    );
+    drop(busy);
+    assert_eq!(open_at(&with(&[(10, 1)]), ALLOW, &none), invalid);
+    assert_eq!(
+        open_at(&with(&[(10, 1), (11, 0x4000)]), ALLOW, &none),
+        Err(Error::Errno(EOPNOTSUPP))
+    );
+    assert_eq!(open_at(&with(&[(3, 99)]), ALLOW, &none), invalid);
+    assert_eq!(
+        open_at(&with(&[(12, 32 << 20)]), ALLOW, &none),
+        Err(Error::Fs(FsError::OutOfMemory))
+    );
+    assert_eq!(
+        open_at(&[(7, 3), (4, A24U40), (3, config)], DENY, &render_queue),
+        Err(Error::Errno(EOPNOTSUPP))
+    );
+    assert!(
+        backend.hw.take().is_empty(),
+        "refusals never touch the unit"
+    );
+    // C truncation: a 2^32 wait becomes 0 and then the default of one; the
+    // unit id and metric set are u32 as in the source.
+    assert_eq!(
+        open_at(
+            &with(&[(13, 1 << 32), (1, 1 << 32), (3, config | 1 << 32)]),
+            ALLOW,
+            &none
+        ),
+        Ok(41)
+    );
+    let file = wire.file();
+    assert_eq!(
+        open_at(&with(&[]), ALLOW, &none),
+        Err(Error::Fs(FsError::Busy))
+    );
+    drop(file);
+    backend.poll(1);
+    assert_eq!(open_at(&with(&[]), ALLOW, &none), Ok(41));
+    drop(wire.file());
+    backend.poll(2);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_open_property_privilege_and_errno_order
+);
+
+fn smoke_oa_config_registry_errno_order_ids_and_whitelists() -> TestResult {
+    let backend = Backend::new(device(52, MTL, 1270));
+    let wire = Wire::new();
+    let invalid = Err(Error::Fs(FsError::InvalidData));
+    let at = config_wire(&wire, 0x10000, uuid(1), &[(0x9888, 1)]);
+    assert_eq!(
+        add_config(None, at, &wire, ALLOW),
+        Err(Error::Fs(FsError::NoDevice))
+    );
+    assert_eq!(
+        add_config(Some(&*backend), 0x7fff_0000, &wire, DENY),
+        Err(Error::Fs(FsError::PermissionDenied))
+    );
+    assert_eq!(
+        add_config(Some(&*backend), 0x7fff_0000, &wire, ALLOW),
+        Err(Error::Fs(FsError::BadAddress))
+    );
+    for (offset, value) in [(0u64, 1u64), (48, 0)] {
+        config_wire(&wire, 0x10000, uuid(1), &[(0x9888, 1)]);
+        wire.put(at + offset, &value.to_le_bytes());
+        assert_eq!(add_config(Some(&*backend), at, &wire, ALLOW), invalid);
+    }
+    config_wire(&wire, 0x10000, uuid(1), &[]);
+    assert_eq!(add_config(Some(&*backend), at, &wire, ALLOW), invalid);
+    for (index, byte) in [(8usize, b'0'), (0, b'g')] {
+        let mut bad = uuid(1);
+        bad[index] = byte;
+        config_wire(&wire, 0x10000, bad, &[(0x9888, 1)]);
+        assert_eq!(add_config(Some(&*backend), at, &wire, ALLOW), invalid);
+    }
+    let mut head = [0u8; 4];
+    config_wire(&wire, 0x10000, uuid(1), &[(0x9888, 1)]);
+    head.copy_from_slice(&(MAX_CONFIG_REGS + 1).to_le_bytes());
+    wire.put(at + 44, &head);
+    assert_eq!(
+        add_config(Some(&*backend), at, &wire, ALLOW),
+        Err(Error::Fs(FsError::OutOfMemory))
+    );
+    // Per register: address fault, then address validity, then value fault.
+    let edge: u64 = 0x20000 - 4;
+    let mut config = [0u8; 56];
+    config[8..44].copy_from_slice(&uuid(1));
+    config[44..48].copy_from_slice(&1u32.to_le_bytes());
+    config[48..56].copy_from_slice(&edge.to_le_bytes());
+    wire.put(at, &config);
+    wire.put(edge, &0x9888u32.to_le_bytes());
+    assert_eq!(
+        add_config(Some(&*backend), at, &wire, ALLOW),
+        Err(Error::Fs(FsError::BadAddress))
+    );
+    wire.put(edge, &0x9890u32.to_le_bytes());
+    assert_eq!(add_config(Some(&*backend), at, &wire, ALLOW), invalid);
+    let first = add(&backend, &wire, 1, &[(0x9888, 1), (0xd04, 0x200)]);
+    let second = add(&backend, &wire, 2, &[(0xe458, 3)]);
+    assert_eq!((first, second), (1, 2));
+    assert_eq!(
+        add_config(
+            Some(&*backend),
+            config_wire(&wire, 0x10000, uuid(1), &[(0x9888, 1)]),
+            &wire,
+            ALLOW
+        ),
+        Err(Error::Errno(EADDRINUSE))
+    );
+    assert_eq!(
+        lookup(52, 1).unwrap().regs(),
+        &[(0x9888, 1), (0xd04, 0x200)]
+    );
+    let remove = |id: u64, gate| {
+        wire.put(0x3000, &id.to_le_bytes());
+        remove_config(Some(&*backend), 0x3000, &wire, gate)
+    };
+    assert_eq!(remove(1, DENY), Err(Error::Fs(FsError::PermissionDenied)));
+    assert_eq!(
+        remove_config(Some(&*backend), 0x7fff_0000, &wire, ALLOW),
+        Err(Error::Fs(FsError::BadAddress))
+    );
+    assert_eq!(
+        remove(1 << 32 | 1, ALLOW),
+        Err(Error::Fs(FsError::NotFound))
+    );
+    assert_eq!(remove(1, ALLOW), Ok(0));
+    assert_eq!(remove(1, ALLOW), Err(Error::Fs(FsError::NotFound)));
+    // idr_alloc(.., 1, 0) reuses the lowest free id.
+    assert_eq!(add(&backend, &wire, 3, &[(0x9884, 0)]), 1);
+    assert_eq!(remove(1, ALLOW), Ok(0));
+    assert_eq!(remove(2, ALLOW), Ok(0));
+    // xe_oa_is_valid_config_reg_addr per graphics version.
+    for (graphics, addr, valid) in [
+        (1270, 0x38d100, true),
+        (2004, 0x38d100, false),
+        (2004, 0x13000, true),
+        (1270, 0x13000, false),
+        (1255, 0x20cc, true),
+        (1270, 0x20cc, false),
+        (1255, 0x394200, false),
+        (2001, 0x394200, true),
+        (1255, 0x393200, true),
+        (1255, 0xe45c, true),
+        (2004, 0xe758, true),
+        (1270, 0xdd48, true),
+        (1270, 0xdd4c, false),
+        (1270, 0xd04, true),
+        (2004, 0xd04, false),
+    ] {
+        assert_eq!(
+            valid_register(graphics, addr),
+            valid,
+            "{graphics} {addr:#x}"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_config_registry_errno_order_ids_and_whitelists
+);
+
+fn smoke_oa_lri_groups_and_ordered_ring_jobs() -> TestResult {
+    let regs: Vec<(u32, u32)> = (0..379u32).map(|i| (0x9888, i)).collect();
+    assert_eq!(lri(&regs[..1]), vec![0x1100_0001, 0x9888, 0]);
+    let one = lri(&regs[..126]);
+    assert_eq!((one.len(), one[0]), (253, 0x1100_00fb));
+    let two = lri(&regs[..127]);
+    assert_eq!(
+        (two[0], two[253], two.len()),
+        (0x1100_00fb, 0x1100_0001, 256)
+    );
+    let jobs = config_jobs(&regs);
+    assert_eq!(jobs.len(), 2);
+    let words = jobs[0].words();
+    assert_eq!(words.len(), 3 + 2 * 378);
+    assert_eq!(
+        (words[0], words[253], words[506]),
+        (0x1100_00fb, 0x1100_00fb, 0x1100_00fb)
+    );
+    assert_eq!(&words[757..759], &[0x9888, 377]);
+    assert_eq!(jobs[1].words(), &[0x1100_0001, 0x9888, 378]);
+    // One job, its ARB word and completion fit the smallest ring budget.
+    assert!(words.len() + 1 + 32 <= 1024);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_lri_groups_and_ordered_ring_jobs
+);
+
+fn open_stream(backend: &Arc<Backend>, wire: &Wire, props: &[(u32, u64)]) -> Arc<dyn FileOps> {
+    let at = wire.chain(0x1000, props);
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, wire, &none, ALLOW)),
+        Ok(41)
+    );
+    wire.file()
+}
+fn session_of(backend: &Backend) -> Arc<Session> {
+    backend
+        .unit
+        .lock()
+        .as_ref()
+        .unwrap()
+        .session
+        .clone()
+        .unwrap()
+}
+
+fn smoke_oa_source_register_sequences_per_profile() -> TestResult {
+    // MTL 12.70: metric set, LRI job, buffer, control, TLB invalidate, close.
+    let backend = Backend::new(device(53, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(
+        &backend,
+        &wire,
+        1,
+        &[(0x9888, 0x1234), (0xd04, GT_NOA_ENABLE)],
+    );
+    backend.hw.set(SQCNT1, 0x11);
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, A24U40), (3, config), (5, 5), (12, 128 << 10)],
+    );
+    let gtt = BASE;
+    assert_eq!(
+        backend.hw.take(),
+        vec![
+            (OA_DEBUG, 0x5062_0060),
+            (OAGLBCTXCTRL, 0x17),
+            (SQCNT1, 0x6000_0011),
+            (0x9888, 0x1234),
+            (RPM_CONFIG1, GT_NOA_ENABLE),
+            (OASTATUS, 0),
+            (OAHEADPTR, gtt),
+            (OABUFFER, gtt | 1),
+            (OATAILPTR, gtt),
+            (OACONTROL, 0x15),
+        ]
+    );
+    assert_eq!(
+        *backend.jobs.lock(),
+        vec![vec![0x1100_0003, 0x9888, 0x1234, 0xd04, GT_NOA_ENABLE]]
+    );
+    let info = |file: &Arc<dyn FileOps>| {
+        assert_eq!(ready(file.ioctl_user(INFO, 0x5000, &wire)), Ok(0));
+        let mut bytes = [0u8; 40];
+        wire.read(0x5000, &mut bytes).unwrap();
+        u64_at(&bytes, 8)
+    };
+    assert_eq!(info(&file), 128 << 10);
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert!(
+        backend.hw.take().is_empty(),
+        "ENABLE on an enabled stream is a no-op"
+    );
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert_eq!(backend.hw.take(), vec![(OACONTROL, 0), (OA_TLB_INV_CR, 1)]);
+    drop(file);
+    backend.poll(10);
+    assert_eq!(
+        backend.hw.take(),
+        vec![(OA_DEBUG, 0x4000_4000), (RPM_CONFIG1, 0), (SQCNT1, 0x11)]
+    );
+    assert!(backend.unit.lock().as_ref().unwrap().idle());
+
+    // MTL 12.71 skips the OA TLB invalidation; 256 KiB encodes field 1.
+    for (size, field) in [
+        (128 << 10, 0),
+        (256 << 10, 1),
+        (16 << 20, 7),
+        (32 << 20, 5),
+        (128 << 20, 7),
+    ] {
+        assert_eq!(buffer_field(size), field);
+    }
+    let backend = Backend::new(device(54, MTL, 1271));
+    let config = add(&backend, &wire, 1, &[(0x9888, 0)]);
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, OAC192), (3, config), (12, 256 << 10)],
+    );
+    let writes = backend.hw.take();
+    assert!(writes.contains(&(OABUFFER, BASE | 1 | 1 << 3)));
+    assert!(writes.contains(&(OACONTROL, (2 << 2) | 1)));
+    assert!(writes.contains(&(OAGLBCTXCTRL, 1)));
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert_eq!(backend.hw.take(), vec![(OACONTROL, 0)]);
+    drop(file);
+    backend.poll(1);
+
+    // Xe2 LNL: PEC counters need the three trigger bits, PES disaggregation
+    // and a report-multiple circular size.
+    let backend = Backend::new(device(55, LNL, 2004));
+    let config = add(&backend, &wire, 1, &[(0x13000, 5)]);
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, PEC64U64), (3, config), (12, 128 << 10)],
+    );
+    let writes = backend.hw.take();
+    assert_eq!(writes[0], (OA_DEBUG, 0x5062_0060 | 0x2180 << 16 | 0x2180));
+    assert!(writes.contains(&(OACONTROL, PES_DISAG_EN | 0x104 | 1)));
+    assert_eq!(session_of(&backend).circ, 131_072 - 131_072 % 576);
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert_eq!(backend.hw.take(), vec![(OACONTROL, 0)]);
+    drop(file);
+    backend.poll(1);
+
+    // DG2 12.55: Wa_1508761755 DOP gating around the metric set.
+    let backend = Backend::new(device(56, GtPlatform::Alchemist, 1255));
+    let config = add(&backend, &wire, 1, &[(0x20cc, 5)]);
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, A24U40), (3, config), (6, 1), (12, 128 << 10)],
+    );
+    let writes = backend.hw.take();
+    assert_eq!(
+        &writes[..2],
+        &[(ROW_CHICKEN, 0x0020_0020), (ROW_CHICKEN2, 0x0001_0001)]
+    );
+    assert!(
+        !writes.iter().any(|(reg, _)| *reg == OACONTROL),
+        "opened disabled"
+    );
+    drop(file);
+    backend.poll(1);
+    let writes = backend.hw.take();
+    assert_eq!(
+        &writes[..2],
+        &[(ROW_CHICKEN, 0x0020_0000), (ROW_CHICKEN2, 0x0001_0000)]
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_source_register_sequences_per_profile
+);
+
+fn smoke_oa_tail_landing_partial_reports_and_wait_threshold() -> TestResult {
+    let backend = Backend::new(device(57, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 0)]);
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[
+            (2, 1),
+            (4, A24U40),
+            (3, config),
+            (5, 5),
+            (12, 128 << 10),
+            (13, 2),
+        ],
+    );
+    let session = session_of(&backend);
+    let hw = &backend.hw;
+    let circ = 128 << 10;
+    hw.report(0, 256, 0x10, circ);
+    hw.report(256, 256, 0x20, circ);
+    hw.set(OATAILPTR, BASE + 512);
+    // Not yet due: the 5 ms period starts at enable.
+    backend.poll(POLL_NS - 1);
+    assert_eq!(session.ready.mask(), 0);
+    // The second report is held until the following header lands.
+    backend.poll(POLL_NS);
+    assert_eq!(backend.unit.lock().as_ref().unwrap().tail, 256);
+    assert_eq!(
+        session.ready.mask(),
+        0,
+        "one landed report < WAIT_NUM_REPORTS"
+    );
+    hw.word(512, 0x30);
+    // 64 bytes of a fourth report are a partial report and are subtracted.
+    hw.set(OATAILPTR, BASE + 768 + 64);
+    backend.poll(2 * POLL_NS);
+    assert_eq!(backend.unit.lock().as_ref().unwrap().tail, 512);
+    assert_eq!(session.ready.mask(), POLL_IN);
+    let mut out = vec![0u8; 4096];
+    let read = |out: &mut [u8], nonblocking| {
+        ready(file.read_with_options(0, out, ReadOptions { nonblocking }))
+    };
+    assert_eq!(read(&mut out, false), Ok(512));
+    assert_eq!(u32_at(&out, 0), 0x110);
+    assert_eq!(u32_at(&out, 256 + 4), 0x121);
+    // Report id/timestamp words are cleared; the head follows the copy.
+    assert_eq!((hw.peek(0), hw.peek(4), hw.peek(8)), (0, 0, 0x112));
+    assert_eq!((hw.peek(256), hw.peek(260)), (0, 0));
+    assert_eq!(hw.get(OAHEADPTR), BASE + 512);
+    assert_eq!(session.ready.mask(), 0);
+    // Below the threshold: blocking waits, nonblocking returns EAGAIN.
+    assert_eq!(read(&mut out, false), Err(FsError::WouldBlock));
+    assert_eq!(read(&mut out, true), Err(FsError::WouldBlock));
+    assert_eq!(hw.get(OAHEADPTR), BASE + 512);
+    drop(file);
+    backend.poll(3 * POLL_NS);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_tail_landing_partial_reports_and_wait_threshold
+);
+
+fn smoke_oa_read_wrap_clear_enospc_status_eio_and_info() -> TestResult {
+    let backend = Backend::new(device(58, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 0)]);
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, OAC192), (3, config), (12, 128 << 10)],
+    );
+    let session = session_of(&backend);
+    let hw = &backend.hw;
+    let circ: u32 = 128 << 10;
+    assert_ne!(circ % 192, 0);
+    // A 192-byte report straddles the ring end; the next header lands at 64.
+    let start = circ - 128;
+    {
+        let mut unit = backend.unit.lock();
+        let unit = unit.as_mut().unwrap();
+        unit.head = start;
+        unit.tail = start;
+    }
+    hw.report(start, 192, 0x40, circ);
+    hw.report(64, 192, 0x80, circ);
+    hw.set(OATAILPTR, BASE + 256);
+    let mut small = vec![0u8; 100];
+    let read =
+        |out: &mut [u8]| ready(file.read_with_options(0, out, ReadOptions { nonblocking: true }));
+    assert_eq!(read(&mut small), Err(FsError::NoSpace));
+    assert_eq!(session.ready.mask(), POLL_IN, "ENOSPC keeps pollin");
+    assert_eq!(hw.get(OAHEADPTR), BASE, "nothing was consumed");
+    let mut out = vec![0u8; 4096];
+    assert_eq!(read(&mut out), Ok(192));
+    for i in 0..48u32 {
+        assert_eq!(u32_at(&out, i as usize * 4), (0x40 + i) | 0x100);
+    }
+    // The whole straddling report is zeroed, both before and after the end.
+    assert!((0..48).all(|i| hw.peek((start + i * 4) % circ) == 0));
+    assert_ne!(hw.peek(64), 0, "the following report is untouched");
+    assert_eq!(hw.get(OAHEADPTR), BASE + 64);
+    // Relevant status bits are cleared, others kept; EIO keeps pollin.
+    hw.set(OASTATUS, (1 << 2) | (1 << 6) | (1 << 8));
+    hw.set(OATAILPTR, BASE + 256 + 192);
+    hw.word(256, 0xc0);
+    assert_eq!(read(&mut out), Err(crate::intel_gpu_user::io_error()));
+    assert_eq!(hw.get(OASTATUS), 1 << 8);
+    assert_eq!(session.ready.mask(), POLL_IN);
+    assert_eq!(ready(file.ioctl_user(STATUS, 0x5000, &wire)), Ok(0));
+    let mut status = [0u8; 40];
+    wire.read(0x5000, &mut status).unwrap();
+    assert_eq!(u64_at(&status, 8), (1 << 2) | (1 << 3));
+    assert_eq!(
+        ready(file.ioctl_user(STATUS, 0x7fff_0000, &wire)),
+        Err(FsError::BadAddress)
+    );
+    assert_eq!(read(&mut out), Ok(192));
+    assert_eq!(hw.get(OAHEADPTR), BASE + 256);
+    drop(file);
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_read_wrap_clear_enospc_status_eio_and_info
+);
+
+static AUTHORITY: AtomicBool = AtomicBool::new(true);
+fn authority() -> bool {
+    AUTHORITY.load(Ordering::Acquire)
+}
+
+fn smoke_oa_descriptor_authority_blocking_config_and_reopen() -> TestResult {
+    let backend = Backend::new(device(59, MTL, 1270));
+    let wire = Wire::new();
+    let first = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let second = add(&backend, &wire, 2, &[(0x9884, 2), (0x9888, 3)]);
+    // Opened disabled and without a period: reads are EINVAL.
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, A24U40), (3, first), (6, 1), (12, 128 << 10)],
+    );
+    let read = |file: &Arc<dyn FileOps>, nonblocking| {
+        let mut out = [0u8; 512];
+        ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking }))
+    };
+    assert_eq!(read(&file, true), Err(FsError::InvalidData));
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert_eq!(read(&file, false), Err(FsError::InvalidData), "no period");
+    assert_eq!(read(&file, true), Err(FsError::WouldBlock));
+    assert_eq!(ready(file.write(0, &[0])), Err(FsError::BadFd));
+    assert_eq!(
+        ready(file.ioctl_user(0x6905, 0, &wire)),
+        Err(FsError::InvalidData)
+    );
+    // CONFIG: open-only properties are EINVAL, unknown sets ENODEV, success
+    // returns the previous id after the new jobs retire.
+    backend.jobs.lock().clear();
+    let at = wire.chain(0x2000, &[(2, 1)]);
+    assert_eq!(
+        ready(file.ioctl_user(CONFIG, at, &wire)),
+        Err(FsError::InvalidData)
+    );
+    let at = wire.chain(0x2000, &[(3, 77)]);
+    assert_eq!(
+        ready(file.ioctl_user(CONFIG, at, &wire)),
+        Err(FsError::NoDevice)
+    );
+    let at = wire.chain(0x2000, &[(3, second), (10, 1)]);
+    assert_eq!(
+        ready(file.ioctl_user(CONFIG, at, &wire)),
+        Err(FsError::InvalidData)
+    );
+    assert!(backend.jobs.lock().is_empty());
+    let at = wire.chain(0x2000, &[(3, second)]);
+    assert_eq!(ready(file.ioctl_user(CONFIG, at, &wire)), Ok(first));
+    assert_eq!(
+        *backend.jobs.lock(),
+        vec![vec![0x1100_0003, 0x9884, 2, 0x9888, 3]]
+    );
+    assert_eq!(ready(file.ioctl_user(CONFIG, at, &wire)), Ok(second));
+    drop(file);
+    backend.poll(1);
+    // Current authority is required at every read and control.
+    AUTHORITY.store(true, Ordering::Release);
+    let gate = Gate { capable: authority };
+    let at = wire.chain(
+        0x1000,
+        &[(2, 1), (4, A24U40), (3, first), (5, 9), (12, 128 << 10)],
+    );
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &none, gate)),
+        Ok(41)
+    );
+    let installed = wire.file();
+    drop(installed);
+    backend.poll(2);
+    // A fresh descriptor whose authority is revoked after installation.
+    let session_file = {
+        let at = wire.chain(
+            0x1000,
+            &[(2, 1), (4, A24U40), (3, first), (5, 9), (12, 128 << 10)],
+        );
+        ready(open(Some(backend.clone()), at, &wire, &none, gate)).unwrap();
+        wire.file()
+    };
+    let session = session_of(&backend);
+    AUTHORITY.store(false, Ordering::Release);
+    let file = File {
+        session: session.clone(),
+        backend: backend.clone(),
+        gate,
+    };
+    assert_eq!(file.poll_readiness(), POLL_ERR | POLL_HUP);
+    let mut out = [0u8; 256];
+    assert_eq!(
+        ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking: true })),
+        Err(FsError::PermissionDenied)
+    );
+    assert_eq!(
+        ready(file.ioctl_user(DISABLE, 0, &wire)),
+        Err(FsError::PermissionDenied)
+    );
+    AUTHORITY.store(true, Ordering::Release);
+    assert_eq!(session.ready.mask(), POLL_IN | POLL_ERR | POLL_HUP);
+    assert_eq!(
+        ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking: true })),
+        Err(FsError::PermissionDenied)
+    );
+    drop(file);
+    drop(session_file);
+    drop(session);
+    backend.poll(3);
+    assert!(backend.unit.lock().as_ref().unwrap().idle());
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, A24U40), (3, first), (12, 128 << 10)],
+    );
+    drop(file);
+    backend.poll(4);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_descriptor_authority_blocking_config_and_reopen
+);
+
+fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) {
+    let mut unit = Unit::new(
+        Allocator(hw.clone()),
+        MTL,
+        1270,
+        &Window(hw.clone()),
+        || true,
+    )
+    .unwrap();
+    let config = Arc::new(Config {
+        id: 1,
+        uuid: uuid(1),
+        regs: vec![(0x9888, 1)],
+    });
+    let session = Session::new(
+        device(card, MTL, 1270),
+        FORMATS[5],
+        true,
+        Some(5),
+        1,
+        128 << 10,
+        Engine::Rcs0,
+        Permit::take(card).unwrap(),
+        config,
+    );
+    let request = Request::Open { enable: true };
+    let io = Window(hw.clone());
+    assert_eq!(
+        unit.begin(&io, &session, &request, 0, || true)
+            .unwrap()
+            .len(),
+        1
+    );
+    unit.finish(&io, &session, &request, 0, || true).unwrap();
+    (unit, session)
+}
+
+fn smoke_oa_reset_suspend_loss_and_buffer_retention() -> TestResult {
+    // begin_stop (reset or system suspend): terminal stream, halt, release.
+    let hw = Hw::new();
+    let (mut unit, session) = unit_with_stream(60, &hw);
+    assert!(!unit.idle(), "an open stream holds the GT awake");
+    unit.invalidate();
+    assert_eq!(session.precheck(false), Err(FsError::NoDevice));
+    let mut out = [0u8; 512];
+    assert_eq!(
+        unit.read(&Window(hw.clone()), &session, &mut out, false, || true),
+        Err(FsError::NoDevice)
+    );
+    hw.take();
+    unit.halt(&Window(hw.clone()), || true);
+    assert_eq!(
+        hw.take(),
+        vec![
+            (OACONTROL, 0),
+            (OA_DEBUG, 0x4000_4000),
+            (RPM_CONFIG1, 0),
+            (SQCNT1, 0)
+        ]
+    );
+    assert!(unit.idle());
+    // SAFETY: the model's OA unit is stopped and no DMA remains.
+    unsafe { unit.release_after_reset() };
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (0, 1)
+    );
+    drop(session);
+
+    // An exposed buffer without a reset proof is never returned.
+    let hw = Hw::new();
+    let (unit, session) = unit_with_stream(61, &hw);
+    drop(unit);
+    assert_eq!(session.precheck(false), Err(FsError::NoDevice));
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (1, 0)
+    );
+    drop(session);
+
+    // An unexposed reservation is freed; incoherent storage is refused.
+    let hw = Hw::new();
+    drop(
+        Unit::new(
+            Allocator(hw.clone()),
+            MTL,
+            1270,
+            &Window(hw.clone()),
+            || true,
+        )
+        .unwrap(),
+    );
+    assert_eq!(hw.freed.load(Ordering::Relaxed), 1);
+    hw.coherent.store(false, Ordering::Relaxed);
+    assert!(matches!(
+        Unit::new(
+            Allocator(hw.clone()),
+            MTL,
+            1270,
+            &Window(hw.clone()),
+            || true
+        ),
+        Err(FsError::Unsupported)
+    ));
+    assert_eq!(hw.freed.load(Ordering::Relaxed), 2);
+    assert!(matches!(
+        Unit::new(Allocator(Hw::new()), MTL, 1260, &Window(Hw::new()), || true),
+        Err(FsError::Unsupported)
+    ));
+
+    // Access loss during the tail check poisons the unit and the stream.
+    let hw = Hw::new();
+    let (mut unit, session) = unit_with_stream(62, &hw);
+    unit.poll(&Window(hw.clone()), POLL_NS, || false);
+    assert!(!unit.idle());
+    assert_eq!(session.precheck(false), Err(FsError::NoDevice));
+    assert_eq!(
+        unit.begin(&Window(hw.clone()), &session, &Request::Enable, 0, || true)
+            .map(|jobs| jobs.len()),
+        Err(FsError::NoDevice)
+    );
+    unit.halt(&Window(hw.clone()), || true);
+    // SAFETY: the model's OA unit is stopped and no DMA remains.
+    unsafe { unit.release_after_reset() };
+    drop(session);
+
+    // A tail outside the owned ring is malformed occupancy, not data.
+    let hw = Hw::new();
+    let (mut unit, session) = unit_with_stream(63, &hw);
+    hw.set(OATAILPTR, BASE + (128 << 10));
+    unit.poll(&Window(hw.clone()), POLL_NS, || true);
+    assert_eq!(session.ready.mask(), POLL_IN | POLL_ERR | POLL_HUP);
+    assert_eq!(
+        unit.read(&Window(hw.clone()), &session, &mut out, false, || true),
+        Err(FsError::NoDevice)
+    );
+    // An all-ones MMIO read is device loss.
+    unit.halt(&Window(hw.clone()), || true);
+    // SAFETY: the model's OA unit is stopped and no DMA remains.
+    unsafe { unit.release_after_reset() };
+    drop(session);
+    let hw = Hw::new();
+    let (mut unit, session) = unit_with_stream(60, &hw);
+    hw.set(OATAILPTR, u32::MAX);
+    assert_eq!(
+        unit.read(&Window(hw.clone()), &session, &mut out, false, || true),
+        Err(FsError::NoDevice)
+    );
+    assert!(!unit.idle());
+    unit.halt(&Window(hw.clone()), || true);
+    // SAFETY: the model's OA unit is stopped and no DMA remains.
+    unsafe { unit.release_after_reset() };
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_reset_suspend_loss_and_buffer_retention
+);
+
+/// xe_oa_mmap: EACCES, then whole-buffer length, then read-only
+/// MAP_PRIVATE. A mapping passing all three is NARF's ENODEV, never a
+/// read()-backed private copy that would consume reports.
+fn smoke_oa_mmap_source_checks_and_private_pfn_refusal() -> TestResult {
+    const READ: u32 = 1;
+    const PRIVATE: u32 = 2;
+    let backend = Backend::new(device(47, MTL, 1270));
+    let wire = Wire::new();
+    let first = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let size = 128 << 10;
+    let file = open_stream(
+        &backend,
+        &wire,
+        &[(2, 1), (4, A24U40), (3, first), (6, 1), (12, size as u64)],
+    );
+    assert_eq!(file.mmap_max_prot(0), READ);
+    assert_eq!(
+        file.validate_mmap(0, size, READ, PRIVATE),
+        Err(FsError::NoDevice)
+    );
+    // The source never inspects vm_pgoff.
+    assert_eq!(
+        file.validate_mmap(1 << 20, size, READ, PRIVATE),
+        Err(FsError::NoDevice)
+    );
+    for len in [size - 4096, size + 4096, 16 << 20] {
+        assert_eq!(
+            file.validate_mmap(0, len, READ, PRIVATE),
+            Err(FsError::InvalidData)
+        );
+    }
+    // VM_WRITE, VM_EXEC, MAP_SHARED and MAP_SHARED_VALIDATE (VM_MAYSHARE).
+    for (prot, flags) in [
+        (READ | 2, PRIVATE),
+        (READ | 4, PRIVATE),
+        (READ, 1),
+        (READ, 3),
+        (0, 1),
+    ] {
+        assert_eq!(
+            file.validate_mmap(0, size, prot, flags),
+            Err(FsError::InvalidData)
+        );
+    }
+    // Privilege precedes the size and VMA checks.
+    let denied = File {
+        session: session_of(&backend),
+        backend: backend.clone(),
+        gate: DENY,
+    };
+    assert_eq!(
+        denied.validate_mmap(0, 4096, READ | 2, 1),
+        Err(FsError::PermissionDenied)
+    );
+    drop(denied);
+    drop(file);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_mmap_source_checks_and_private_pfn_refusal
+);
+
+/// create_dynamic_oa_sysfs_entry / sysfs_remove_group: metrics/<uuid>/id
+/// follows the registry, including lowest-free id reuse.
+fn smoke_oa_metrics_sysfs_uuid_id_follows_registry() -> TestResult {
+    use narf_filesystem::sysfs::Kobject;
+    let backend = Backend::new(device(46, MTL, 1270));
+    let wire = Wire::new();
+    let card = Kobject::new_root("card46");
+    install_metrics_for_test(46, &card);
+    install_metrics_for_test(46, &card);
+    assert_eq!(card.child_names(), ["metrics"]);
+    let metrics = card.get_child("metrics").unwrap();
+    assert!(metrics.child_names().is_empty());
+    let name = |n| alloc::string::String::from_utf8(uuid(n).to_vec()).unwrap();
+    let id = |n| {
+        metrics
+            .get_child(&name(n))
+            .and_then(|entry| entry.attr_show("id"))
+    };
+    assert_eq!(add(&backend, &wire, 1, &[(0x9888, 1)]), 1);
+    assert_eq!(add(&backend, &wire, 2, &[(0x9888, 2)]), 2);
+    assert_eq!(id(1).as_deref(), Some("1\n"));
+    assert_eq!(id(2).as_deref(), Some("2\n"));
+    assert_eq!(metrics.get_child(&name(1)).unwrap().attr_names(), ["id"]);
+    // A refused duplicate publishes nothing.
+    assert_eq!(
+        add_config(
+            Some(&*backend),
+            config_wire(&wire, 0x10000, uuid(1), &[(0x9888, 1)]),
+            &wire,
+            ALLOW
+        ),
+        Err(Error::Errno(EADDRINUSE))
+    );
+    assert_eq!(metrics.child_names().len(), 2);
+    let remove = |id: u64| {
+        wire.put(0x3000, &id.to_le_bytes());
+        remove_config(Some(&*backend), 0x3000, &wire, ALLOW)
+    };
+    assert_eq!(remove(1), Ok(0));
+    assert_eq!(id(1), None);
+    assert_eq!(remove(1), Err(Error::Fs(FsError::NotFound)));
+    assert_eq!(metrics.child_names(), [name(2)]);
+    // The lowest free id is reused under the new uuid's directory.
+    assert_eq!(add(&backend, &wire, 3, &[(0x9888, 3)]), 1);
+    assert_eq!(id(3).as_deref(), Some("1\n"));
+    for n in [1, 2] {
+        assert_eq!(remove(n), Ok(0));
+    }
+    assert!(metrics.child_names().is_empty());
+    // A card without the published directory keeps the registry alone.
+    let other = Backend::new(device(45, MTL, 1270));
+    assert_eq!(add(&other, &wire, 4, &[(0x9888, 4)]), 1);
+    assert!(metrics.child_names().is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_metrics_sysfs_uuid_id_follows_registry
+);

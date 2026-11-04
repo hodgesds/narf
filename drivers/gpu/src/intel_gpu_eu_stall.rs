@@ -1,4 +1,4 @@
-//! BMG EU-stall observation, pinned MIT Linux b90c984d xe_eu_stall.c,
+//! BMG and exact LNL EU-stall observation, pinned MIT Linux b90c984d xe_eu_stall.c,
 //! xe_observation.c and regs/xe_eu_stall_regs.h. Fixed host bounds, current
 //! perf authority, MCR ownership and retained DMA are part of the interface.
 use crate::{
@@ -11,7 +11,8 @@ use core::{
     sync::atomic::{fence, AtomicBool, Ordering},
 };
 use narf_filesystem::{
-    FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, Stat, POLL_ERR, POLL_HUP, POLL_IN,
+    FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, ReadOptions, Stat, POLL_ERR,
+    POLL_HUP, POLL_IN,
 };
 use narf_lib::{readiness::Readiness, sync::IrqSafeSpinLock};
 
@@ -24,16 +25,19 @@ const DISABLE: u32 = 0x6901;
 const POLL_NS: u64 = 5_000_000;
 static ACTIVE: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
 
-/// Cached physical main-GT topology, published only by an admitted BMG PF.
+/// Cached physical main-GT topology, published only by an admitted BMG/LNL PF.
+/// The platform binds a session to its collector; it is not live MMIO authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
     pub card: u32,
+    pub platform: crate::intel_gpu_gt::GtPlatform,
     pub dss: u32,
     pub per_group: u8,
 }
 impl Info {
     pub(crate) fn validate(self) -> Result<Self, FsError> {
-        if self.card >= 64
+        if !supported(self.platform)
+            || self.card >= 64
             || self.dss == 0
             || self.per_group == 0
             || self.per_group > 16
@@ -49,9 +53,7 @@ impl Info {
         topology: &crate::intel_gpu_topology::GtTopology,
         config: &crate::intel_gpu_hwconfig::HardwareConfig,
     ) -> Option<Self> {
-        if platform != crate::intel_gpu_gt::GtPlatform::Battlemage
-            || topology.platform() != platform
-        {
+        if !supported(platform) || topology.platform() != platform {
             return None;
         }
         let slices = config.lookup_u32(1).ok().flatten();
@@ -62,7 +64,10 @@ impl Info {
         };
         let info = Self {
             card,
-            dss: topology.geometry_dss() | topology.compute_dss(),
+            platform,
+            dss: (topology.geometry_dss() | topology.compute_dss())
+                .try_into()
+                .ok()?,
             per_group: u8::try_from(per_group).ok()?,
         };
         info.validate().ok()
@@ -73,6 +78,11 @@ impl Info {
     fn reports(self) -> u64 {
         u64::from(self.dss.count_ones()) * (PER_CORE / RECORD) as u64
     }
+}
+/// Exact admitted observation profiles. PTL is deliberately excluded:
+/// xe_wa.c Wa18041344222 disables EU-stall on affected graphics30.00 layouts.
+pub(crate) const fn supported(platform: crate::intel_gpu_gt::GtPlatform) -> bool {
+    matches!(platform, crate::intel_gpu_gt::GtPlatform::Battlemage) || platform.is_lnl()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -85,8 +95,46 @@ pub enum Operation {
     Enable,
     Disable,
 }
+/// xe_observation.c xe_observation_paranoid: `dev.xe.observation_paranoid`,
+/// proc_dointvec_minmax over 0..=1, default 1.
+static OBSERVATION_PARANOID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+static SYSCTL_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// `xe_observation_paranoid && !perfmon_capable()` refuses; perfmon_capable
+/// is CAP_PERFMON or CAP_SYS_ADMIN. Every OA and EU-stall gate uses this.
 pub(crate) fn capable() -> bool {
-    narf_filesystem::caller_capable(38) || narf_filesystem::caller_capable(21)
+    observation_allowed(
+        OBSERVATION_PARANOID.load(Ordering::Acquire),
+        narf_filesystem::caller_capable(38) || narf_filesystem::caller_capable(21),
+    )
+}
+fn observation_allowed(paranoid: u32, perfmon: bool) -> bool {
+    paranoid == 0 || perfmon
+}
+fn read_paranoid() -> alloc::string::String {
+    alloc::format!("{}\n", OBSERVATION_PARANOID.load(Ordering::Acquire))
+}
+/// proc_dointvec_minmax: one decimal int in [0, 1], else EINVAL.
+fn write_paranoid(value: &str) -> Result<(), FsError> {
+    let value: i32 = value.parse().map_err(|_| FsError::InvalidData)?;
+    if !(0..=1).contains(&value) {
+        return Err(FsError::InvalidData);
+    }
+    OBSERVATION_PARANOID.store(value as u32, Ordering::Release);
+    Ok(())
+}
+/// xe_observation_sysctl_register (`dev/xe`, mode 0644), once, when the
+/// first Intel card is published. A write needs the procfs owner's DAC.
+pub(crate) fn register_sysctl() {
+    if SYSCTL_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_filesystem::procfs::sys::register_sysctl(narf_filesystem::procfs::sys::SysctlEntry {
+        path: "dev/xe/observation_paranoid",
+        read: read_paranoid,
+        write: Some(write_paranoid),
+        perms: 0o644,
+    });
 }
 #[derive(Clone, Copy)]
 struct Gate {
@@ -94,11 +142,12 @@ struct Gate {
 }
 impl Gate {
     const PHYSICAL: Self = Self { capable };
+    /// xe_eu_stall_stream_open: paranoid && !perfmon_capable() is EACCES.
     fn check(self) -> Result<(), FsError> {
         if (self.capable)() {
             Ok(())
         } else {
-            Err(FsError::OperationNotPermitted)
+            Err(FsError::PermissionDenied)
         }
     }
 }
@@ -121,6 +170,7 @@ struct Queue {
     head: usize,
     len: usize,
     overflow: bool,
+    pollin: bool,
     terminal: Option<FsError>,
 }
 /// One open description; hardware never writes this bounded host FIFO.
@@ -141,21 +191,26 @@ impl core::fmt::Debug for Session {
 impl Session {
     pub(crate) fn new(info: Info, config: Config) -> Result<Arc<Self>, FsError> {
         let info = info.validate()?;
-        if !(1..=7).contains(&config.rate) || config.wait == 0 || config.wait > info.reports() {
+        if !(1..=7).contains(&config.rate) {
             return Err(FsError::InvalidData);
         }
-        if config.wait != 1 {
-            return Err(FsError::Unsupported);
-        }
+        // xe_eu_stall_stream_open_locked: an open stream is -EBUSY before
+        // xe_eu_stall_stream_init bounds wait by all active physical rings.
         ACTIVE[info.card as usize]
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| FsError::Busy)?;
         let permit = Permit(info.card);
+        if config.wait == 0 || config.wait > info.reports() {
+            return Err(FsError::InvalidData);
+        }
+        // Reserve enough private host space for the accepted threshold before
+        // exposing any sampler. At 32 DSS this is at most 16 MiB/card.
+        let capacity = HOST_BYTES.max(config.wait as usize * RECORD);
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(HOST_BYTES)
+            .try_reserve_exact(capacity)
             .map_err(|_| FsError::OutOfMemory)?;
-        bytes.resize(HOST_BYTES, 0);
+        bytes.resize(capacity, 0);
         Ok(Arc::new(Self {
             info,
             config,
@@ -165,6 +220,7 @@ impl Session {
                 head: 0,
                 len: 0,
                 overflow: false,
+                pollin: false,
                 terminal: None,
             }),
             ready: Readiness::new(0),
@@ -173,7 +229,9 @@ impl Session {
         }))
     }
     fn level(&self, q: &Queue) {
-        let mask = if q.len != 0 && (self.enabled.load(Ordering::Acquire) || q.terminal.is_some()) {
+        let mask = if q.len != 0
+            && ((q.pollin && self.enabled.load(Ordering::Acquire)) || q.terminal.is_some())
+        {
             POLL_IN
         } else {
             0
@@ -197,11 +255,11 @@ impl Session {
     }
     fn push(&self, data: &[u8]) -> bool {
         let mut q = self.queue.lock();
-        if data.len() > HOST_BYTES - q.len || q.terminal.is_some() {
+        if data.len() > q.bytes.len() - q.len || q.terminal.is_some() {
             return false;
         }
         for &value in data {
-            let at = (q.head + q.len) % HOST_BYTES;
+            let at = (q.head + q.len) % q.bytes.len();
             q.bytes[at] = value;
             q.len += 1;
         }
@@ -209,37 +267,60 @@ impl Session {
         true
     }
     fn room(&self) -> usize {
-        HOST_BYTES - self.queue.lock().len
+        let q = self.queue.lock();
+        q.bytes.len() - q.len
+    }
+    fn observe(&self, source_reports: u64) {
+        let mut q = self.queue.lock();
+        // The source's pollin is a sampled latch, cleared by read rather than
+        // by falling below the threshold. Count each report once: either in
+        // the acknowledged host FIFO or still behind a hardware read pointer.
+        q.pollin |= q.len as u64 / RECORD as u64 + source_reports >= self.config.wait;
+        self.level(&q);
     }
     fn dropped(&self) {
         let mut q = self.queue.lock();
         q.overflow = true;
         self.level(&q);
     }
-    fn read(&self, out: &mut [u8]) -> Result<usize, FsError> {
+    fn read_with_options(&self, out: &mut [u8], options: ReadOptions) -> Result<usize, FsError> {
         if out.len() < RECORD {
             return Err(FsError::InvalidData);
         }
         let mut q = self.queue.lock();
-        if q.overflow {
-            q.overflow = false;
-            self.level(&q);
-            return Err(crate::intel_gpu_user::io_error());
-        }
         if !self.enabled.load(Ordering::Acquire) && q.terminal.is_none() {
             return Err(FsError::InvalidData);
         }
+        // xe_eu_stall_stream_read: O_NONBLOCK bypasses wait_num_reports;
+        // blocking readers wait for the sampled pollin latch. Known loss and
+        // drop errors remain observable even when the threshold was not met.
+        if !options.nonblocking && !q.pollin && !q.overflow && q.terminal.is_none() {
+            return Err(FsError::WouldBlock);
+        }
+        if q.overflow {
+            q.overflow = false;
+            q.pollin = false;
+            self.level(&q);
+            return Err(crate::intel_gpu_user::io_error());
+        }
         let count = out.len().min(q.len).min(CHUNK) / RECORD * RECORD;
         if count == 0 {
+            q.pollin = false;
+            self.level(&q);
             return Err(q.terminal.unwrap_or(FsError::WouldBlock));
         }
         for byte in &mut out[..count] {
             *byte = q.bytes[q.head];
-            q.head = (q.head + 1) % HOST_BYTES;
+            q.head = (q.head + 1) % q.bytes.len();
             q.len -= 1;
         }
+        q.pollin = false;
         self.level(&q);
         Ok(count)
+    }
+    #[cfg(feature = "kernel-test")]
+    fn read(&self, out: &mut [u8]) -> Result<usize, FsError> {
+        self.read_with_options(out, ReadOptions { nonblocking: true })
     }
     #[cfg(feature = "kernel-test")]
     pub(crate) fn read_for_test(&self, out: &mut [u8]) -> Result<usize, FsError> {
@@ -264,37 +345,61 @@ pub(crate) fn query(info: Info) -> Result<Vec<u8>, FsError> {
     }
     Ok(bytes)
 }
-fn properties(info: Info, mut address: u64, user: &dyn IoctlContext) -> Result<Config, FsError> {
+/// xe_eu_stall.c's MAX_USER_EXTENSIONS.
+const MAX_USER_EXTENSIONS: usize = 5;
+/// ARRAY_SIZE(xe_set_eu_stall_property_funcs): GT_ID 1, SAMPLE_RATE 2,
+/// WAIT_NUM_REPORTS 3; property 0 has no setter.
+const PROPERTIES: u32 = 4;
+
+/// xe_eu_stall.c::xe_eu_stall_user_extensions, then the `!props.gt` check
+/// of xe_eu_stall_stream_open, in their order. Per link: the
+/// MAX_USER_EXTENSIONS bound (-E2BIG, before any copy; there is no visited
+/// set), the 16-byte drm_xe_user_extension copy and its pad/name, then
+/// xe_eu_stall_user_ext_set_property: the 48-byte drm_xe_ext_set_property
+/// copy (reserved[] unchecked), the property bound, property 0 and the pad,
+/// then the setter. WAIT_NUM_REPORTS is only stored here: its range is
+/// xe_eu_stall_stream_init's, checked by `Session::new` after EBUSY.
+fn properties(mut address: u64, user: &dyn IoctlContext) -> Result<Config, FsError> {
     let mut config = Config { rate: 4, wait: 1 };
     let mut found = false;
-    let mut seen = [0; 5];
-    let mut count = 0;
+    let mut ext_number = 0;
     while address != 0 {
-        if count == 5 || seen[..count].contains(&address) {
+        if ext_number >= MAX_USER_EXTENSIONS {
+            return Err(FsError::ArgumentListTooLong);
+        }
+        ext_number += 1;
+        // struct drm_xe_user_extension: next_extension 0, name 8, pad 12.
+        let mut header = [0; 16];
+        user.read(address, &mut header)?;
+        let u32_at =
+            |wire: &[u8], at: usize| u32::from_le_bytes(wire[at..at + 4].try_into().unwrap());
+        if u32_at(&header, 12) != 0 || u32_at(&header, 8) >= 1 {
             return Err(FsError::InvalidData);
         }
-        seen[count] = address;
-        count += 1;
-        let mut wire = [0; 32];
+        // struct drm_xe_ext_set_property: property 16, pad 20, value 24.
+        let mut wire = [0; 48];
         user.read(address, &mut wire)?;
-        let u32_at = |at| u32::from_le_bytes(wire[at..at + 4].try_into().unwrap());
-        let value = u64::from_le_bytes(wire[24..32].try_into().unwrap());
-        if u32_at(8) != 0 || u32_at(12) != 0 || u32_at(20) != 0 {
+        let property = u32_at(&wire, 16);
+        if property >= PROPERTIES || property == 0 || u32_at(&wire, 20) != 0 {
             return Err(FsError::InvalidData);
         }
-        match u32_at(16) {
-            1 if value == 0 => found = true,
+        let value = u64::from_le_bytes(wire[24..32].try_into().unwrap());
+        match property {
+            // set_prop_eu_stall_gt_id: xe_device_get_gt(xe, value) takes a
+            // u8 gt_id, so only the low byte names the GT. LINUX-GAP: Linux
+            // also accepts the standalone media GT (1) that BMG and LNL
+            // have; NARF samples only the primary GT and refuses it.
+            1 if value as u8 == 0 => found = true,
             2 if (1..=7).contains(&(value / 251)) => config.rate = (value / 251) as u32,
-            3 if value != 0 && value <= info.reports() => config.wait = value,
+            // set_prop_eu_stall_wait_num_reports stores the value in an
+            // int, which stream_init compares as unsigned: its low 32 bits.
+            3 => config.wait = u64::from(value as u32),
             _ => return Err(FsError::InvalidData),
         }
-        address = u64::from_le_bytes(wire[..8].try_into().unwrap());
+        address = u64::from_le_bytes(header[..8].try_into().unwrap());
     }
     if !found {
         return Err(FsError::InvalidData);
-    }
-    if config.wait != 1 {
-        return Err(FsError::Unsupported);
     }
     Ok(config)
 }
@@ -311,18 +416,17 @@ async fn open_with_gate(
     user: &dyn IoctlContext,
     gate: Gate,
 ) -> Result<u64, FsError> {
+    // xe_eu_stall_stream_open: platform support (ENODEV), then privilege.
+    let info = backend.eu_stall_info().ok_or(FsError::NoDevice)?;
     gate.check()?;
-    let info = backend
-        .eu_stall_info()
-        .ok_or(FsError::NoDevice)?
-        .validate()?;
+    let info = info.validate()?;
     let mut wire = [0; 32];
     user.read(address, &mut wire)?;
     let value = |at| u64::from_le_bytes(wire[at..at + 8].try_into().unwrap());
     if value(0) != 0 || value(8) != 1 || value(16) != 0 {
         return Err(FsError::InvalidData);
     }
-    let session = Session::new(info, properties(info, value(24), user)?)?;
+    let session = Session::new(info, properties(value(24), user)?)?;
     let mut pending = PendingOpen {
         session: session.clone(),
         committed: false,
@@ -372,12 +476,20 @@ impl Drop for File {
 }
 impl FileOps for File {
     fn read<'a>(&'a self, _: u64, output: &'a mut [u8]) -> FsFuture<'a, usize> {
+        self.read_with_options(0, output, ReadOptions::default())
+    }
+    fn read_with_options<'a>(
+        &'a self,
+        _: u64,
+        output: &'a mut [u8],
+        options: ReadOptions,
+    ) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if !(self.gate.capable)() {
                 self.session.fail(FsError::OperationNotPermitted);
                 return Err(FsError::OperationNotPermitted);
             }
-            self.session.read(output)
+            self.session.read_with_options(output, options)
         })
     }
     fn write<'a>(&'a self, _: u64, _: &'a [u8]) -> FsFuture<'a, usize> {
@@ -524,7 +636,18 @@ impl<A: BootAllocator> Collector<A> {
             return Err(FsError::WouldBlock);
         }
         let old = mcr.raw_read(0xfd4)?;
-        let result = operation(&mcr);
+        let result = (|| {
+            if self.info.platform.is_lnl() {
+                // xe_gt_mcr.c xe2lpg_instance0_steering_table: MOCS/PAT are
+                // GAM instance (0,0), independent of fused DSS0. Verify the
+                // retained UC MOCS3 and coherent GGTT PAT2, never reprogram.
+                mcr.select(0, true)?;
+                if mcr.raw_read(0x400c)? != 0x13c || mcr.raw_read(0x4808)? != 0xf {
+                    return Err(FsError::Unsupported);
+                }
+            }
+            operation(&mcr)
+        })();
         if mcr.lost.get() {
             return Err(FsError::NoDevice);
         }
@@ -575,7 +698,7 @@ impl<A: BootAllocator> Collector<A> {
                         0xfffc0000 | (status & 0xfffc),
                         Some((0xfffc, status & 0xfffc)),
                     )?;
-                    // BMG UC MOCS3, source encodes index<<1 in CTRL[9:3].
+                    // LNL/BMG UC MOCS3: source encodes index<<1 in CTRL[9:3].
                     mcr.write(
                         i,
                         0xe53c,
@@ -610,6 +733,7 @@ impl<A: BootAllocator> Collector<A> {
                 queue.head = 0;
                 queue.len = 0;
                 queue.overflow = false;
+                queue.pollin = false;
                 session.enabled.store(true, Ordering::Release);
                 session.level(&queue);
                 Ok(())
@@ -719,7 +843,8 @@ impl<A: BootAllocator> Collector<A> {
             .filter(|i| self.info.dss & (1 << i) != 0)
             .map(|i| distance(self.read[i], self.write[i]) as u64 / RECORD as u64)
             .sum();
-        if available < session.config.wait || session.room() < RECORD {
+        session.observe(available);
+        if session.room() < RECORD {
             return Ok(());
         }
         let Some(i) = (0..32)

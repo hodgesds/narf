@@ -27,11 +27,11 @@ KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
  * of corrupting module text at run time. */
 KERNEL_IMAGE_SIZE = 0x40000000;   /* 1 GiB. LLD takes K/M, not G. */
 
-/* Space reserved for the KASLR relocation table. A debug build currently
- * needs ~1.6 MiB (399k sites x 4 bytes + header); 4 MiB leaves room to grow
+/* Space reserved for the KASLR relocation table. The full debug kernel
+ * needs ~6 MiB (1.56M sites x 4 bytes + header); 8 MiB leaves room to grow
  * before the reservation has to be revisited. `xtask relocs` errors out if a
  * table does not fit rather than writing a short one. */
-KASLR_RELOC_RESERVE = 4M;
+KASLR_RELOC_RESERVE = 8M;
 
 /* Largest slide the kernel window may take, as a mask of the low bits.
  *

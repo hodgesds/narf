@@ -110,7 +110,7 @@ fn smoke_intel_ctm_inherited_color_paths_refuse_without_writes() -> TestResult {
         assert_eq!(*io.0.lock(), before);
     }
     assert!(matches!(
-        Owner::capture(&registers(), Generation::TigerLake),
+        Owner::capture(&registers(), Generation::PantherLake),
         Err(FsError::Unsupported)
     ));
     TestResult::Pass
@@ -166,7 +166,58 @@ fn lut_bytes(reverse: bool) -> alloc::vec::Vec<u8> {
         })
         .collect()
 }
+
+fn smoke_intel_gen12_ctm_owner_refuses_lut_and_dsb_without_register_writes() -> TestResult {
+    for generation in [Generation::TigerLake, Generation::AlderLake] {
+        let io = registers();
+        let mut owner = if generation == Generation::AlderLake {
+            Owner::capture_gen12(&io, crate::intel_gpu_gt::Gen12Platform::AlderLakeS)
+        } else {
+            Owner::capture(&io, generation)
+        }
+        .unwrap();
+        let lut = Lut::decode(&lut_bytes(false)).unwrap();
+        let before = io.0.lock().clone();
+        assert_eq!(
+            owner.arm_color(&io, Some(identity()), Some(lut.clone()), 100),
+            Err(FsError::Unsupported)
+        );
+        assert!(matches!(
+            owner.prepare_stages(&io, Some(identity()), None, None),
+            Err(FsError::Unsupported)
+        ));
+        assert_eq!(*io.0.lock(), before);
+        assert!(!owner.pending());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_color",
+    smoke_intel_gen12_ctm_owner_refuses_lut_and_dsb_without_register_writes
+);
 fn smoke_intel_gamma_native_size_rounding_channels_and_reserved_word() -> TestResult {
+    let pre: Vec<u8> = (0..129)
+        .flat_map(|i| {
+            let v: u16 = match i {
+                0 => 0,
+                1 => 1,
+                2 => 128,
+                3 => 32768,
+                _ => 65535,
+            };
+            [
+                v.to_le_bytes(),
+                v.to_le_bytes(),
+                v.to_le_bytes(),
+                [0xaa, 0x55],
+            ]
+            .concat()
+        })
+        .collect();
+    let pre = DegammaLut::decode(&pre).unwrap();
+    assert_eq!(&pre.entries[..5], &[0, 0x100, 0x8000, 0x800080, 0xffffff]);
+    assert_eq!(pre.entries.len(), 131);
+    assert_eq!(&pre.entries[129..], &[1 << 24, 1 << 24]);
     let bytes = lut_bytes(false);
     let lut = Lut::decode(&bytes).unwrap();
     assert_eq!(lut.entries[0], 1023 << 10);
@@ -247,6 +298,17 @@ fn smoke_intel_gamma_inactive_preload_disable_replacement_and_original_restore()
     assert_eq!(io.palette_writes(), writes + LUT_SIZE);
     assert_eq!(io.read32(GAMMA), 0);
     assert_eq!(io.read32(MODE), 0);
+    // Retaining the original snapshot is not a pending restoration. Later
+    // CTM-only commits keep this already-restored RAM untouched.
+    let restored_writes = io.palette_writes();
+    owner.arm_color(&io, Some(identity()), None, 113).unwrap();
+    io.set(FRAME, 46);
+    owner.poll(&io, 114).unwrap().unwrap();
+    owner.arm_color(&io, None, None, 115).unwrap();
+    io.set(FRAME, 47);
+    owner.poll(&io, 116).unwrap().unwrap();
+    assert_eq!(io.palette_writes(), restored_writes);
+    assert!(!owner.palette_dirty);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -263,6 +325,7 @@ fn smoke_intel_gamma_failed_preload_retains_original_for_fresh_recovery() -> Tes
         Err(FsError::NoDevice)
     );
     assert!(owner.original_palette.is_some());
+    assert!(owner.palette_dirty);
     assert!(owner.failed);
     assert_eq!(io.read32(GAMMA), 0);
     io.refuse_palette(false);
@@ -272,6 +335,7 @@ fn smoke_intel_gamma_failed_preload_retains_original_for_fresh_recovery() -> Tes
     io.set(FRAME, 41);
     assert!(owner.poll(&io, 103).unwrap().is_some());
     assert_eq!(io.palette_writes(), writes + LUT_SIZE);
+    assert!(!owner.palette_dirty);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -292,17 +356,140 @@ fn smoke_intel_gamma_control_arm_crossing_frame_fails_and_retains_owner() -> Tes
             }
         }
     }
-    let io = FrameRace(registers());
-    let mut owner = Owner::capture(&io, Generation::MeteorLake).unwrap();
-    assert_eq!(
-        owner.arm(&io, Some(identity()), 100),
-        Err(FsError::NoDevice)
-    );
-    assert!(owner.pending());
-    assert_eq!(owner.poll(&io, 101), Err(FsError::NoDevice));
+    for generation in [
+        Generation::TigerLake,
+        Generation::AlderLake,
+        Generation::MeteorLake,
+    ] {
+        let io = FrameRace(registers());
+        let mut owner = if generation == Generation::AlderLake {
+            Owner::capture_gen12(&io, crate::intel_gpu_gt::Gen12Platform::AlderLakeS)
+        } else {
+            Owner::capture(&io, generation)
+        }
+        .unwrap();
+        assert_eq!(
+            owner.arm(&io, Some(identity()), 100),
+            Err(FsError::NoDevice)
+        );
+        assert!(owner.pending());
+        assert_eq!(owner.poll(&io, 101), Err(FsError::NoDevice));
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_color",
     smoke_intel_gamma_control_arm_crossing_frame_fails_and_retains_owner
+);
+
+fn smoke_gen12_lut_profile_codec_literal_boundaries_and_endpoint_padding() -> TestResult {
+    for profile in [Profile::Display12, Profile::Display13, Profile::Mtl] {
+        let count = profile.sizes().1;
+        let mut bytes = alloc::vec![0;count*8];
+        for i in 0..count {
+            let v = if i == 0 { 1u16 } else { 65535 };
+            for c in 0..3 {
+                bytes[i * 8 + c * 2..i * 8 + c * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let lut = DegammaLut::decode_profile(&bytes, profile).unwrap();
+        assert_eq!(
+            lut.entries.len(),
+            if profile == Profile::Display12 {
+                35
+            } else {
+                131
+            }
+        );
+        assert_eq!(
+            lut.entries[0],
+            if profile == Profile::Mtl { 256 } else { 1 }
+        );
+        assert_eq!(
+            lut.entries[count - 1],
+            if profile == Profile::Mtl {
+                0xffffff
+            } else {
+                65535
+            }
+        );
+        assert_eq!(
+            &lut.entries[count..],
+            &[if profile == Profile::Mtl {
+                1 << 24
+            } else {
+                1 << 16
+            }; 2]
+        );
+    }
+    assert_eq!(Profile::Display12.sizes(), (262145, 33));
+    assert_eq!(Profile::Display13.sizes(), (1024, 129));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_color",
+    smoke_gen12_lut_profile_codec_literal_boundaries_and_endpoint_padding
+);
+
+// Wa_22012358565 must remain immutable through CTM/LUT/profile operations.
+fn smoke_color_gen12_arb_slots_capture_retention_and_profile_refusal() -> TestResult {
+    use crate::intel_gpu_gt::Gen12Platform;
+    for (family, expected) in [
+        (Gen12Platform::TigerLake, 0x84000000),
+        (Gen12Platform::AlderLakeS, 0x84000000),
+        (Gen12Platform::AlderLakeP, 0x94000000),
+        (Gen12Platform::AlderLakeN, 0x94000000),
+    ] {
+        let io = registers();
+        io.write32(0x70180, expected);
+        let mut owner = Owner::capture_gen12(&io, family).unwrap();
+        let wrong_profile = if expected == 0x94000000 {
+            Profile::Display12
+        } else {
+            Profile::Display13
+        };
+        assert_eq!(
+            owner.qualify_gen12(wrong_profile),
+            Err(FsError::Unsupported)
+        );
+        owner.qualify_gen12(Profile::gen12(family)).unwrap();
+        owner.arm(&io, Some(identity()), 100).unwrap();
+        assert_eq!(io.read32(0x70180), expected);
+        // A dropped/replaced arbitration image is not an acceptable source
+        // family switch, including after the color arm was already exposed.
+        io.write32(0x70180, expected ^ 0x10000000);
+        io.write32(FRAME, 11);
+        assert_eq!(owner.poll(&io, 101), Err(FsError::NoDevice));
+        assert!(owner.pending());
+        assert_eq!(owner.recover_original(&io, 102), Err(FsError::NoDevice));
+        for wrong in [
+            expected ^ 0x10000000,
+            expected | 0x20000000,
+            expected | 0x40000000,
+        ] {
+            let bad = registers();
+            bad.write32(0x70180, wrong);
+            let before = bad.0.lock().clone();
+            assert!(matches!(
+                Owner::capture_gen12(&bad, family),
+                Err(FsError::Unsupported)
+            ));
+            assert_eq!(*bad.0.lock(), before);
+        }
+    }
+    let io = registers();
+    assert!(matches!(
+        Owner::capture(&io, Generation::AlderLake),
+        Err(FsError::Unsupported)
+    ));
+    io.write32(0x70180, 0x94000000);
+    assert!(matches!(
+        Owner::capture(&io, Generation::MeteorLake),
+        Err(FsError::Unsupported)
+    ));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_color",
+    smoke_color_gen12_arb_slots_capture_retention_and_profile_refusal
 );

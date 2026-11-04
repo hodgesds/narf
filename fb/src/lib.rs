@@ -445,7 +445,29 @@ static BOOT_GENERIC: narf_lib::sync::IrqSafeSpinLock<
     Option<narf_graphics_driver::generic::GenericFb>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+static BOOT_ADMISSION: narf_lib::sync::IrqSafeSpinLock<
+    narf_graphics::console::BootFramebufferAdmission,
+> = narf_lib::sync::IrqSafeSpinLock::new(narf_graphics::console::BootFramebufferAdmission::new());
+#[cfg(feature = "intel")]
+fn exclude_boot_framebuffer_for_lnl() -> bool {
+    let mut admission = BOOT_ADMISSION.lock();
+    if admission.is_closed() {
+        return true;
+    }
+    let clear = !drawing_paused() && BOOT_GENERIC.lock().is_none() && select_active().is_none();
+    if !clear || !narf_graphics::console::close_boot_framebuffer_console() {
+        return false;
+    }
+    admission.close_if_never(true)
+}
+
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
+    // Same gate as exclusion, held through the entire publication. No future
+    // boot framebuffer can race into a driver-FLR or its GT-only lifetime.
+    let mut admission = BOOT_ADMISSION.lock();
+    if !admission.publish() {
+        return;
+    }
     #[cfg(feature = "amdgpu")]
     narf_drivers_gpu::amdgpu_platform::record_boot_framebuffer(fb);
     // A GOP console inside an Intel LMEM BAR stays out of the VRAM pool.
@@ -1284,6 +1306,13 @@ impl FbWriter {
 /// an mmap'd DrawRing; only the page-source differs.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    #[cfg(feature = "intel")]
+    narf_init::register(Stage::Subsys, "fb-intel-lnl-reset-exclusion", || {
+        narf_drivers_gpu::intel_gpu::install_lnl_boot_scanout_exclusion(
+            exclude_boot_framebuffer_for_lnl,
+        );
+        InitResult::Ok
+    });
     // Register the actual handoff during Subsys so it follows the firmware
     // scans, console installation and other statically registered Late calls.
     // It still runs before executor polling and all userspace framebuffer maps.

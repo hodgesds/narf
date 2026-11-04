@@ -175,10 +175,9 @@ fn smoke_submit_fence_composites_keep_foreign_and_syncobj_completion() -> TestRe
     let mut wire = [0; 64];
     put64(&mut wire, 40, abi::EXEC_FENCE_SUBMIT);
     put64(&mut wire, 56, 9);
-    let submit = SyncRequest::read(&user, &wire)
+    let submit = SyncRequest::read(&user, &wire, &file.syncobjs)
         .unwrap()
-        .resolve(&file.syncobjs)
-        .unwrap();
+        .resolve();
     let mut submit_wait = core::pin::pin!(submit.wait());
     assert!(submit_wait
         .as_mut()
@@ -196,10 +195,9 @@ fn smoke_submit_fence_composites_keep_foreign_and_syncobj_completion() -> TestRe
     // Ordinary IN, binary WAIT and timeline WAIT remain completion gates,
     // even when combined with SUBMIT on that same native input fence.
     put64(&mut wire, 40, abi::EXEC_FENCE_IN);
-    let normal = SyncRequest::read(&user, &wire)
+    let normal = SyncRequest::read(&user, &wire, &file.syncobjs)
         .unwrap()
-        .resolve(&file.syncobjs)
-        .unwrap();
+        .resolve();
     let mut waits = alloc::vec![normal];
     for timeline in [false, true] {
         let handle = file.syncobjs.lock().create(0).unwrap();
@@ -239,10 +237,9 @@ fn smoke_submit_fence_composites_keep_foreign_and_syncobj_completion() -> TestRe
             put64(&mut wire, 32, 1024);
         }
         waits.push(
-            SyncRequest::read(&user, &wire)
+            SyncRequest::read(&user, &wire, &file.syncobjs)
                 .unwrap()
-                .resolve(&file.syncobjs)
-                .unwrap(),
+                .resolve(),
         );
         file.syncobjs.lock().destroy(handle).unwrap();
     }
@@ -282,10 +279,9 @@ fn smoke_submit_fence_loss_before_ack_waits_for_proven_reset() -> TestResult {
     let mut wire = [0; 64];
     put64(&mut wire, 40, abi::EXEC_FENCE_SUBMIT);
     put64(&mut wire, 56, 9);
-    let resolved = SyncRequest::read(&user, &wire)
+    let resolved = SyncRequest::read(&user, &wire, &file.syncobjs)
         .unwrap()
-        .resolve(&file.syncobjs)
-        .unwrap();
+        .resolve();
     let mut wait = core::pin::pin!(resolved.wait());
     assert!(wait
         .as_mut()
@@ -332,21 +328,20 @@ fn smoke_submit_fence_rejects_conflicting_inputs_and_bad_descriptors() -> TestRe
         put64(&mut wire, 56, 9);
         user.files.lock().insert(9, Vec::new());
         assert!(matches!(
-            SyncRequest::read(&user, &wire),
+            SyncRequest::read(&user, &wire, &file.syncobjs),
             Err(FsError::InvalidData)
         ));
         put64(&mut wire, 40, abi::EXEC_FENCE_SUBMIT | output);
         user.files.lock().clear();
         assert!(matches!(
-            SyncRequest::read(&user, &wire),
+            SyncRequest::read(&user, &wire, &file.syncobjs),
             Err(FsError::InvalidData)
         ));
         // Signalled stub sync_files still satisfy SUBMIT immediately.
         user.files.lock().insert(9, Vec::new());
-        let resolved = SyncRequest::read(&user, &wire)
+        let resolved = SyncRequest::read(&user, &wire, &file.syncobjs)
             .unwrap()
-            .resolve(&file.syncobjs)
-            .unwrap();
+            .resolve();
         let mut wait = core::pin::pin!(resolved.wait());
         assert!(wait
             .as_mut()

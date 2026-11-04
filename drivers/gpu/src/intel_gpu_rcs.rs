@@ -663,7 +663,8 @@ pub enum SubmitError {
     /// `wait_seqno` budget expired before the breadcrumb landed.
     Timeout,
     /// Production glue only: no Intel controller has been
-    /// probed, or it is not a Gen12 part.
+    /// probed, it is not a Gen12 part, or its PCI function/BAR
+    /// belongs to another GT submission owner.
     NoEngine,
     /// A PPGTT root physical address failed validation
     /// (unaligned, or outside the supported 46-bit address field) at
@@ -840,7 +841,32 @@ pub struct GgttArena {
     policy: Option<crate::intel_gpu_gt_hw::CachePolicy>,
     authority: Option<crate::intel_gpu_gt_hw::AuthorizedWindow>,
     gt_platform: Option<crate::intel_gpu_gt::GtPlatform>,
+    lnl_receipt: Option<crate::intel_gpu_gt::lnl::Receipt>,
+    bmg_authority: Option<Arc<crate::intel_gpu_gt::smallbar::Authority>>,
+    lnl_device: Option<narf_bus::BusDevice>,
+    lnl_pte_count: core::cell::Cell<u8>,
+    retired: bool,
+    live_ranges: alloc::collections::BTreeMap<u32, u32>,
     ggtt_ledger: Option<alloc::sync::Arc<crate::intel_gpu_ggtt_ranges::Ledger>>,
+    /// Every GuC that may cache translations of this GGTT, and the cleared
+    /// ranges held until each has invalidated past the clear
+    /// (xe_ggtt.c::xe_ggtt_invalidate, both GTs). GT0's GuC is an MMIO client
+    /// of every authorized arena from construction until its proven reset.
+    /// No PTE is published before its owner holds the GT wake. The MTL/Arrow
+    /// media GuC (GT1) registers before its firmware DMA and leaves after its
+    /// verified stop. In `Mode::Ct` that GuC's scheduler invalidates over its
+    /// CT.
+    tlb: GuCTlbTracker,
+}
+
+type GuCTlbTracker = crate::intel_gpu_ggtt_tlb::Tracker<RetainedRange>;
+
+/// A cleared GGTT range, kept out of the free list with its frames until
+/// every GuC that may cache it has invalidated past the clear.
+struct RetainedRange {
+    ggtt: u32,
+    pages: u32,
+    frames: Vec<narf_memory::frame::PhysFrame>,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -849,6 +875,7 @@ impl core::fmt::Debug for GgttArena {
             .field("free_blocks", &self.free_list.len())
             .field("live_allocations", &self.live)
             .field("live_pages", &self.live_pages)
+            .field("tlb", &self.tlb)
             .finish()
     }
 }
@@ -856,13 +883,19 @@ impl core::fmt::Debug for GgttArena {
 impl GgttArena {
     fn encode_pte(&self, phys: u64) -> Result<u64, crate::intel_gpu_gtt::GttError> {
         match self.policy {
-            None => encode_scanout_pte(phys, PatSlot::Slot0),
+            None => {
+                // The unqualified arena belongs to the legacy Gen12 engine.
+                // Its DMA mask is narrower than the shared GGTT wire format.
+                if phys >> 39 != 0 {
+                    return Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange);
+                }
+                encode_scanout_pte(phys, PatSlot::Slot0)
+            }
             Some(policy) => {
-                let format = if policy.platform() == crate::intel_gpu_gt::GtPlatform::Alchemist {
-                    crate::intel_gpu_gtt::PteFormat::Gen12
-                } else {
-                    crate::intel_gpu_gtt::PteFormat::XeLpg
-                };
+                if phys >> policy.platform().physical_bits() != 0 {
+                    return Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange);
+                }
+                let format = policy.platform().pte_format();
                 format.encode_ggtt(phys, policy.ggtt_pat())
             }
         }
@@ -889,9 +922,26 @@ impl GgttArena {
             policy: None,
             authority: None,
             gt_platform: None,
+            lnl_receipt: None,
+            bmg_authority: None,
+            lnl_device: None,
+            lnl_pte_count: core::cell::Cell::new(0),
+            retired: false,
+            live_ranges: alloc::collections::BTreeMap::new(),
             ggtt_ledger: crate::intel_gpu_ggtt_ranges::Ledger::for_bar(bar.phys.raw(), bar.len)
                 .ok(),
+            tlb: crate::intel_gpu_ggtt_tlb::Tracker::new(),
         }
+    }
+
+    /// GT0's GuC owns this arena's GGTT: xe_ggtt_invalidate always reaches
+    /// the primary GT, by MMIO until its submission is enabled.
+    fn gt0_guc_client(&mut self) {
+        let released = self.tlb.set_mode(
+            crate::intel_gpu_ggtt_tlb::GuCTlb::Primary,
+            crate::intel_gpu_ggtt_tlb::Mode::Mmio,
+        );
+        debug_assert!(released.is_empty());
     }
 
     pub(crate) fn for_gt(
@@ -902,13 +952,89 @@ impl GgttArena {
         let mut arena = Self::new(bar);
         arena.authority = Some(crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap));
         arena.gt_platform = Some(platform);
+        arena.gt0_guc_client();
         arena
     }
 
+    pub(crate) fn for_smallbar_gt(
+        bar: narf_bus::MmioRegion,
+        mmio: crate::intel_gpu_gt_hw::AuthorizedWindow,
+        authority: Arc<crate::intel_gpu_gt::smallbar::Authority>,
+    ) -> Result<Self, SubmitError> {
+        if !authority.matches_window(&mmio, bar) {
+            return Err(SubmitError::NoEngine);
+        }
+        authority
+            .current(&mmio)
+            .map_err(|_| SubmitError::NoEngine)?;
+        let mut arena = Self::new(bar);
+        arena.authority = Some(mmio);
+        arena.gt_platform = Some(crate::intel_gpu_gt::GtPlatform::Battlemage);
+        arena.bmg_authority = Some(authority);
+        arena.gt0_guc_client();
+        Ok(arena)
+    }
+
+    pub(crate) fn for_lnl_gt(
+        bar: narf_bus::bar::MmioRegion,
+        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        device: narf_bus::BusDevice,
+        receipt: crate::intel_gpu_gt::lnl::Receipt,
+    ) -> Result<Self, SubmitError> {
+        let platform =
+            crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+                .filter(|p| p.is_headless_integrated())
+                .ok_or(SubmitError::NoEngine)?;
+        let mut arena = Self::for_gt(bar, cap, platform);
+        arena.authority = Some(crate::intel_gpu_gt_hw::AuthorizedWindow::for_device(
+            bar, cap, device,
+        ));
+        arena.lnl_device = Some(device);
+        arena.lnl_receipt = Some(receipt);
+        if !arena.lnl_takeover_ready() {
+            return Err(SubmitError::NoEngine);
+        }
+        Ok(arena)
+    }
+
+    fn lnl_takeover_ready(&self) -> bool {
+        !self.retired
+            && self.authority.as_ref().is_some_and(|mmio| {
+                self.lnl_receipt.as_ref().is_some_and(|r| {
+                    self.lnl_device
+                        .is_some_and(|device| r.matches(device, self.bar, mmio))
+                })
+            })
+    }
+
     /// Write one GGTT PTE (or zero to invalidate) at `ggtt_off`.
-    fn write_pte(&self, ggtt_off: u32, pte: u64) {
+    fn write_pte(&self, ggtt_off: u32, pte: u64) -> Result<(), SubmitError> {
+        if self.retired {
+            return Err(SubmitError::NoEngine);
+        }
+        let lnl = self.gt_platform.is_some_and(|p| p.is_headless_integrated());
+        if lnl && !self.lnl_takeover_ready() {
+            return Err(SubmitError::NoEngine);
+        }
         let pte_byte = GGTT_ARRAY_BASE + (ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
         if let Some(window) = &self.authority {
+            if let Some(authority) = &self.bmg_authority {
+                authority
+                    .current(window)
+                    .map_err(|_| SubmitError::NoEngine)?;
+            }
+            let media = if lnl {
+                Some(
+                    self.policy
+                        .and_then(|p| p.media)
+                        .ok_or(SubmitError::NoEngine)?,
+                )
+            } else {
+                None
+            };
+            if let Some(proof) = media {
+                proof.current(window).map_err(|_| SubmitError::NoEngine)?;
+            }
             window.write32(pte_byte, pte as u32);
             window.write32(pte_byte + 4, (pte >> 32) as u32);
             // Wa_22019338487: RO GMD_ID write drains G-unit PTE writes.
@@ -916,7 +1042,12 @@ impl GgttArena {
             if self.gt_platform == Some(crate::intel_gpu_gt::GtPlatform::Battlemage) {
                 window.write32(0xd8c, 0);
             }
-            return;
+            if let Some(proof) = media {
+                proof
+                    .after_pte(window, &self.lnl_pte_count)
+                    .map_err(|_| SubmitError::NoEngine)?;
+            }
+            return Ok(());
         }
         // SAFETY: `self.bar` is the probe-mapped BAR0 owned by
         // this driver; `pte_byte` is an 8-byte-aligned slot inside
@@ -928,17 +1059,94 @@ impl GgttArena {
             self.bar.write32(pte_byte, (pte & 0xFFFF_FFFF) as u32);
             self.bar.write32(pte_byte + 4, (pte >> 32) as u32);
         }
+        Ok(())
+    }
+
+    /// xe_ggtt.c::xe_ggtt_map_bo for the MTL/Arrow media GT's GSC private
+    /// object (XE_BO_FLAG_STOLEN | XE_BO_FLAG_GGTT): one DM PTE per page,
+    /// `encode_ggtt_stolen(stolen_base + DSM offset, WB index)`, at the
+    /// ledger's fixed GSC window above this arena. Without
+    /// XE_BO_FLAG_GGTT_INVALIDATE Linux invalidates no TLB on that insert, and
+    /// no GuC ever touches the object. The window and its DSM pages are the
+    /// function's for its lifetime: the arena never allocates, clears or
+    /// retires them, and each GT0 incarnation rewrites the same entries. Every
+    /// entry is read back.
+    fn map_gsc_stolen(&self, dsm_offset: u64, pages: u32) -> Result<u32, SubmitError> {
+        let platform = self.gt_platform.ok_or(SubmitError::NoEngine)?;
+        let policy = self.policy.ok_or(SubmitError::NoEngine)?;
+        let window = crate::intel_gpu_stolen::GSC_GGTT;
+        let bytes = u64::from(pages) * GTT_PAGE_SIZE;
+        if !crate::intel_gpu_gt::media::profile_eligible(platform)
+            || policy.platform() != platform
+            || self.authority.is_none()
+            || bytes != crate::intel_gpu_stolen::GSC_BYTES
+            || dsm_offset % GTT_PAGE_SIZE != 0
+            || !self.ggtt_ledger.as_ref().is_some_and(|ledger| {
+                ledger.allows(crate::intel_gpu_ggtt_ranges::Kind::Gsc, window, bytes)
+            })
+            || (self.ggtt_va_size != 0 && window + bytes > self.ggtt_va_size)
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        let format = platform.pte_format();
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(pages as usize)
+            .map_err(|_| SubmitError::OutOfMemory)?;
+        for page in 0..u64::from(pages) {
+            let gsm = crate::intel_gpu_stolen::DSM_GSM_OFFSET + dsm_offset + page * GTT_PAGE_SIZE;
+            entries.push(
+                format
+                    .encode_ggtt_stolen(gsm, policy.ggtt_pat())
+                    .map_err(|_| SubmitError::OutOfMemory)?,
+            );
+        }
+        for (page, pte) in entries.iter().enumerate() {
+            self.write_pte(window as u32 + page as u32 * GTT_PAGE_SIZE as u32, *pte)?;
+        }
+        compiler_fence(Ordering::SeqCst);
+        let mmio = self.authority.as_ref().ok_or(SubmitError::NoEngine)?;
+        for (page, pte) in entries.iter().enumerate() {
+            let slot = GGTT_ARRAY_BASE + (window / GTT_PAGE_SIZE + page as u64) * 8;
+            let read = u64::from(mmio.read32(slot)) | u64::from(mmio.read32(slot + 4)) << 32;
+            if read != *pte {
+                return Err(SubmitError::NoEngine);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        Ok(window as u32)
     }
 
     /// Posting flush for a burst of arena PTE writes: fence,
     /// then read back the slot at `last_ggtt_off` so the writes
     /// are visible before the backing is handed to an engine.
-    fn flush_pte_writes(&self, last_ggtt_off: u32) {
+    /// Then xe_ggtt.c::xe_ggtt_invalidate: the VF_CAP_REG barrier, then
+    /// each GuC's GGTT TLB. MMIO-mode GuCs are invalidated here (GT0 through
+    /// its own registers, GT1 at the media GSI offset), under the GT wakes
+    /// their owners retain. CT-mode GuCs see a new pending generation that
+    /// their scheduler invalidates from its poll.
+    fn flush_pte_writes(&mut self, last_ggtt_off: u32) {
+        use crate::intel_gpu_ggtt_tlb as tlb;
         compiler_fence(Ordering::SeqCst);
         let pte_byte = GGTT_ARRAY_BASE + (last_ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
+        let mmio = self.tlb.publish();
         if let Some(window) = &self.authority {
             let _ = window.read32(pte_byte);
-            let _ = window.read32(0x1901f8);
+            tlb::barrier(window);
+            let xe2 = self
+                .gt_platform
+                .is_some_and(crate::intel_gpu_gt::GtPlatform::is_xe2);
+            for (gt, invalidate) in tlb::GuCTlb::ALL.into_iter().zip(mmio) {
+                match (invalidate, gt) {
+                    (false, _) => {}
+                    (true, tlb::GuCTlb::Primary) => tlb::invalidate_mmio(window, xe2),
+                    (true, tlb::GuCTlb::Media) => tlb::invalidate_mmio(
+                        &crate::intel_gpu_gt::media::MediaWindow::new(window),
+                        xe2,
+                    ),
+                }
+            }
+            compiler_fence(Ordering::SeqCst);
             return;
         }
         // SAFETY: same BAR ownership and in-arena argument as
@@ -954,6 +1162,9 @@ impl GpuAllocator for GgttArena {
     type Backing = FrameBacking;
 
     fn alloc(&mut self, pages: u32) -> Result<FrameBacking, SubmitError> {
+        if self.retired {
+            return Err(SubmitError::NoEngine);
+        }
         if pages == 0 {
             return Err(SubmitError::OutOfMemory);
         }
@@ -1020,35 +1231,90 @@ impl GpuAllocator for GgttArena {
             coherent: self.policy.is_some() && cfg!(target_arch = "x86_64"),
             mapped: self.authority.is_none() || self.policy.is_some(),
         };
+        self.live_ranges.insert(off, pages);
+        self.live += 1;
+        self.live_pages += pages;
         if backing.mapped {
+            let mut failed = false;
             for (p, frame) in backing.frames.iter().enumerate() {
                 let pte = self
                     .encode_pte(frame.start_address().raw())
                     .expect("validated frame extent");
-                self.write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte);
+                if self
+                    .write_pte(off + (p as u32) * GTT_PAGE_SIZE as u32, pte)
+                    .is_err()
+                {
+                    // A partially published allocation remains retained and its
+                    // range reserved. Authority loss is not DMA retirement.
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                core::mem::forget(backing);
+                return Err(SubmitError::NoEngine);
             }
             self.flush_pte_writes(off + (pages - 1) * GTT_PAGE_SIZE as u32);
         }
         backing.zero_fill();
-        self.live += 1;
-        self.live_pages += pages;
         Ok(backing)
     }
 
+    /// xe_ggtt.c::ggtt_node_remove: clear the PTEs, then invalidate every
+    /// GuC TLB before the backing is freed. A CT-mode GuC cannot complete that
+    /// here, so the range and its frames stay out of the free list until its
+    /// scheduler observes the covering TLB_INVALIDATION_DONE, or until that
+    /// GuC's reset is proven. A range that never had live PTEs has nothing to
+    /// invalidate. After whole-arena retirement the reset already covers it.
     fn free(&mut self, backing: FrameBacking) {
-        if backing.mapped {
+        let published = backing.mapped && !self.retired;
+        if published {
             for p in 0..backing.pages {
-                self.write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0);
+                if self
+                    .write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0)
+                    .is_err()
+                {
+                    core::mem::forget(backing);
+                    return;
+                }
             }
             self.flush_pte_writes(backing.ggtt + (backing.pages - 1) * GTT_PAGE_SIZE as u32);
         }
-        for f in backing.frames {
+        let range = RetainedRange {
+            ggtt: backing.ggtt,
+            pages: backing.pages,
+            frames: backing.frames,
+        };
+        if !published {
+            self.release(range);
+            return;
+        }
+        let generation = self.tlb.generation();
+        if let Some(range) = self.tlb.remove(generation, range) {
+            self.release(range);
+        }
+    }
+
+    fn live_allocations(&self) -> usize {
+        self.live
+    }
+    fn live_pages(&self) -> u32 {
+        self.live_pages
+    }
+}
+
+impl GgttArena {
+    /// Return a range whose clear every GuC has invalidated: its frames to
+    /// the frame allocator and its GGTT pages to the free list.
+    fn release(&mut self, range: RetainedRange) {
+        for f in range.frames {
             narf_memory::frame::free_frame(f);
         }
         self.live -= 1;
-        self.live_pages -= backing.pages;
+        self.live_pages -= range.pages;
+        self.live_ranges.remove(&range.ggtt);
         // Reinsert and coalesce with neighbours.
-        self.free_list.push((backing.ggtt, backing.pages));
+        self.free_list.push((range.ggtt, range.pages));
         self.free_list.sort_by_key(|&(off, _)| off);
         let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.free_list.len());
         for (off, len) in self.free_list.drain(..) {
@@ -1064,11 +1330,11 @@ impl GpuAllocator for GgttArena {
         self.free_list = merged;
     }
 
-    fn live_allocations(&self) -> usize {
-        self.live
-    }
-    fn live_pages(&self) -> u32 {
-        self.live_pages
+    /// Apply one GuC-TLB bookkeeping step and release what it made safe.
+    fn guc_tlb_step(&mut self, step: impl FnOnce(&mut GuCTlbTracker) -> Vec<RetainedRange>) {
+        for range in step(&mut self.tlb) {
+            self.release(range);
+        }
     }
 }
 
@@ -1098,6 +1364,139 @@ impl SharedArena {
         }
     }
 
+    pub(crate) fn lnl_takeover_ready(&self) -> bool {
+        self.inner.lock().lnl_takeover_ready()
+    }
+
+    /// Register (`true`) the MTL/Arrow media GuC as a second GGTT TLB of this
+    /// arena before its firmware can translate, or unregister it after its
+    /// verified stop. Unregistering releases ranges held only for GT1.
+    /// Only an authorized MTL-classified arena qualifies. GT0's own GuC TLB
+    /// is invalidated on every update either way.
+    pub(crate) fn set_media_guc_tlb(&self, live: bool) -> Result<(), SubmitError> {
+        use crate::intel_gpu_ggtt_tlb::{GuCTlb, Mode};
+        let mut arena = self.inner.lock();
+        if arena.retired
+            || arena.authority.is_none()
+            || !arena
+                .gt_platform
+                .is_some_and(crate::intel_gpu_gt::media::profile_eligible)
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        let mode = if live { Mode::Mmio } else { Mode::Off };
+        arena.guc_tlb_step(|tlb| tlb.set_mode(GuCTlb::Media, mode));
+        Ok(())
+    }
+
+    /// Switch the registered media GuC between MMIO (`false`) and CT (`true`)
+    /// GGTT invalidation. Equivalent to `set_guc_tlb_ct(GuCTlb::Media, ..)`.
+    pub(crate) fn set_media_guc_submission(&self, enabled: bool) -> Result<(), SubmitError> {
+        self.set_guc_tlb_ct(crate::intel_gpu_ggtt_tlb::GuCTlb::Media, enabled)
+    }
+
+    /// Select a registered GuC's GGTT invalidation: MMIO GUC_TLB_INV_CR /
+    /// PVC_GUC_TLB_INV_DESC (`false`) or its CT TLB_INVALIDATION (`true`).
+    /// This follows send_tlb_inval_ggtt's
+    /// `xe_guc_ct_enabled && submission_state.enabled` test. Leaving CT keeps
+    /// any range still owed a CT invalidation until that GuC's reset is proven.
+    pub(crate) fn set_guc_tlb_ct(
+        &self,
+        gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+        enabled: bool,
+    ) -> Result<(), SubmitError> {
+        use crate::intel_gpu_ggtt_tlb::Mode;
+        let mut arena = self.inner.lock();
+        if arena.retired || arena.authority.is_none() || arena.tlb.mode(gt) == Mode::Off {
+            return Err(SubmitError::NoEngine);
+        }
+        let mode = if enabled { Mode::Ct } else { Mode::Mmio };
+        arena.guc_tlb_step(|tlb| tlb.set_mode(gt, mode));
+        Ok(())
+    }
+
+    /// The generation a CT-mode GuC must still invalidate, if any. The
+    /// scheduler sends the TLB_INVALIDATION after this returns, with no
+    /// arena lock held.
+    pub(crate) fn guc_tlb_pending(&self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+        self.inner.lock().tlb.pending(gt)
+    }
+
+    /// TLB_INVALIDATION_DONE for a request issued at `generation`: release
+    /// every retained range all GuCs have now invalidated.
+    pub(crate) fn guc_tlb_complete(&self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb, generation: u64) {
+        self.inner
+            .lock()
+            .guc_tlb_step(|tlb| tlb.complete(gt, generation));
+    }
+
+    /// The GuC's reset (or a full GT reset) was proven.
+    /// xe_tlb_inval_reset releases what was waiting on it.
+    pub(crate) fn guc_tlb_reset(&self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {
+        self.inner.lock().guc_tlb_step(|tlb| tlb.reset(gt));
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn guc_tlb_mode(
+        &self,
+        gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+    ) -> crate::intel_gpu_ggtt_tlb::Mode {
+        self.inner.lock().tlb.mode(gt)
+    }
+
+    /// Cleared ranges (GGTT offset, pages) still awaiting an invalidation.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn guc_tlb_retained(&self) -> Vec<(u32, u32)> {
+        self.inner
+            .lock()
+            .tlb
+            .retained_items()
+            .map(|range| (range.ggtt, range.pages))
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn media_guc_tlb(&self) -> bool {
+        self.guc_tlb_mode(crate::intel_gpu_ggtt_tlb::GuCTlb::Media)
+            != crate::intel_gpu_ggtt_tlb::Mode::Off
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn media_guc_ct(&self) -> bool {
+        self.guc_tlb_mode(crate::intel_gpu_ggtt_tlb::GuCTlb::Media)
+            == crate::intel_gpu_ggtt_tlb::Mode::Ct
+    }
+
+    pub(crate) fn retire_ggtt(&self) -> Result<(), SubmitError> {
+        let mut arena = self.inner.lock();
+        if !arena
+            .gt_platform
+            .is_some_and(|p| p.is_headless_integrated())
+            || arena.retired
+        {
+            return Ok(());
+        }
+        let ranges: Vec<(u32, u32)> = arena
+            .live_ranges
+            .iter()
+            .map(|(&offset, &pages)| (offset, pages))
+            .collect();
+        for (offset, pages) in ranges {
+            for page in 0..pages {
+                arena.write_pte(offset + page * 4096, 0)?;
+            }
+            arena.flush_pte_writes(offset + (pages - 1) * 4096);
+        }
+        arena.retired = true;
+        Ok(())
+    }
+
+    /// Map the GSC private object's claimed DSM range at the fixed GSC GGTT
+    /// window (`GgttArena::map_gsc_stolen`); returns the window's GGTT base.
+    pub(crate) fn map_gsc_stolen(&self, dsm_offset: u64, pages: u32) -> Result<u32, SubmitError> {
+        self.inner.lock().map_gsc_stolen(dsm_offset, pages)
+    }
+
     pub(crate) fn configure_cache(
         &self,
         backing: &mut FrameBacking,
@@ -1115,12 +1514,19 @@ impl SharedArena {
         }) {
             return Err(SubmitError::NoEngine);
         }
+        if policy.platform().is_headless_integrated()
+            && (!arena.lnl_takeover_ready() || policy.media.is_none())
+        {
+            return Err(SubmitError::NoEngine);
+        }
         arena.policy = Some(policy);
+        // Retain the backing on every partially published failure path.
+        backing.mapped = true;
         for (i, frame) in backing.frames.iter().enumerate() {
             let pte = arena
                 .encode_pte(frame.start_address().raw())
                 .map_err(|_| SubmitError::OutOfMemory)?;
-            arena.write_pte(backing.ggtt + i as u32 * 4096, pte);
+            arena.write_pte(backing.ggtt + i as u32 * 4096, pte)?;
         }
         arena.flush_pte_writes(backing.ggtt + (backing.pages - 1) * 4096);
         // The hardware policy requests snooped system-memory access. The ARM
@@ -1321,6 +1727,9 @@ struct Request<A: GpuAllocator> {
     fence: Arc<CompletionFence>,
 }
 
+// Retain the residency graph inline: boxing it adds a fallible allocation to
+// admission and complicates the manual quarantine lifetime for uncertain DMA.
+#[allow(clippy::large_enum_variant)]
 enum RequestBatch<A: GpuAllocator> {
     Ggtt(BatchBuf<A>),
     // Dropping an engine is not proof that DMA stopped. Deliberately retain
@@ -1808,7 +2217,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// behind either root stay owned by their `Ppgtt`.
     pub fn attach_ppgtt(&mut self, id: ContextId, root_phys: u64) -> Result<(), SubmitError> {
         encode_table_entry(root_phys).map_err(|_| SubmitError::InvalidPpgttRoot)?;
-        if root_phys == 0 {
+        if root_phys == 0 || root_phys >> 39 != 0 {
             return Err(SubmitError::InvalidPpgttRoot);
         }
         let slot = self.context(id)?.slot;
@@ -2180,6 +2589,13 @@ impl BarWindow {
     pub fn new(bar: narf_bus::bar::MmioRegion) -> Self {
         Self { bar }
     }
+
+    pub(crate) fn matches_legacy(
+        &self,
+        lease: &crate::intel_gpu_gt::ownership::LegacyLease,
+    ) -> bool {
+        lease.matches(self.bar)
+    }
 }
 
 impl core::fmt::Debug for BarWindow {
@@ -2270,12 +2686,26 @@ pub fn production_idle() -> bool {
     }
 }
 
-fn attach_default() -> Result<(), SubmitError> {
-    let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
+pub(crate) fn legacy_submission_lease(
+) -> Result<crate::intel_gpu_gt::ownership::LegacyLease, SubmitError> {
+    crate::intel_gpu::with_controller(|gpu| {
         if !matches!(
             gpu.chip_info().generation,
             crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
         ) {
+            return Err(SubmitError::NoEngine);
+        }
+        // Capture identity and reserve while the same controller guard is
+        // held. A GuC claim can never overtake legacy allocation or MMIO.
+        crate::intel_gpu_gt::ownership::claim_legacy(gpu.function_addr(), gpu.gtt_mmadr)
+            .map_err(|_| SubmitError::NoEngine)
+    })
+    .ok_or(SubmitError::NoEngine)?
+}
+
+fn attach_default(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(), SubmitError> {
+    let (engine, fw_window) = crate::intel_gpu::with_controller(|gpu| {
+        if !lease.matches_function(gpu.function_addr(), gpu.gtt_mmadr) {
             return None;
         }
         let arena = production_arena(gpu.gtt_mmadr);
@@ -2297,19 +2727,24 @@ fn attach_default() -> Result<(), SubmitError> {
 /// probed Gen12 controller, attaching the RCS0 engine on first
 /// use. Returns the engine-wide request id; completion is
 /// observed through [`poll_default_completions`].
+/// A pending, failed or stopped GuC owner still excludes this legacy path.
 pub fn submit_dwords(dwords: &[u32]) -> Result<u64, SubmitError> {
     // PM gate first: a gated submission must not attach the
     // engine or touch hardware on its way to refusal.
     if submissions_gated() {
         return Err(SubmitError::Suspended);
     }
+    let lease = legacy_submission_lease()?;
     let mut guard = RCS_STATE.lock();
     if guard.is_none() {
         drop(guard);
-        attach_default()?;
+        attach_default(&lease)?;
         guard = RCS_STATE.lock();
     }
     let (engine, default_ctx, fw, fw_window) = guard.as_mut().expect("attached above");
+    if !lease.matches(fw_window.bar) {
+        return Err(SubmitError::NoEngine);
+    }
     // The submission conversation programs RCS0 registers
     // (ELSP, ring registers) — render-domain registers gated
     // on forcewake. Take the hold for exactly the
@@ -2790,7 +3225,9 @@ pub mod tests {
             objects: alloc::vec![ExecObject {
                 object,
                 va,
-                writable: false
+                writable: false,
+                asynchronous: false,
+                capture: false,
             }],
         };
         let batch = request
@@ -3574,6 +4011,43 @@ pub mod tests {
         smoke_ppgtt_batch_start_encoding
     );
 
+    fn smoke_legacy_arena_gen12_dma39_and_qualified_dg2_dma46() -> TestResult {
+        // The encoder never dereferences this sentinel BAR. Exercise the real
+        // arena admission path without requiring a particular physical allocator.
+        let mut arena = GgttArena::new(narf_bus::bar::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 0,
+            kind: narf_bus::bar::BarKind::Mmio64 {
+                prefetchable: false,
+            },
+        });
+        let last_gen12_page = (1u64 << 39) - 4096;
+        if arena.encode_pte(last_gen12_page) != Ok(last_gen12_page | 1)
+            || arena.encode_pte(1u64 << 39) != Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange)
+            || arena.encode_pte(4097).is_ok()
+        {
+            return TestResult::Fail("legacy arena did not enforce Gen12 DMA39 before mapping");
+        }
+        arena.policy = Some(crate::intel_gpu_gt_hw::CachePolicy {
+            platform: crate::intel_gpu_gt::GtPlatform::Alchemist,
+            ggtt_pat: 0,
+            media: None,
+        });
+        let last_dg2_page = (1u64 << 46) - 4096;
+        if arena.encode_pte(1u64 << 39) != Ok((1u64 << 39) | 1)
+            || arena.encode_pte(last_dg2_page) != Ok(last_dg2_page | 1)
+            || arena.encode_pte(1u64 << 46) != Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange)
+        {
+            return TestResult::Fail("qualified DG2 arena lost its distinct DMA46 encoding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_arena_gen12_dma39_and_qualified_dg2_dma46
+    );
+
     fn smoke_attach_ppgtt_programs_pdp0() -> TestResult {
         let (mut engine, hw) = match make_engine() {
             Ok(p) => p,
@@ -3607,9 +4081,16 @@ pub mod tests {
             Err(SubmitError::InvalidPpgttRoot) => {}
             _ => return TestResult::Fail("unaligned root must be refused"),
         }
-        match engine.attach_ppgtt(ctx, 1u64 << 46) {
-            Err(SubmitError::InvalidPpgttRoot) => {}
-            _ => return TestResult::Fail(">46-bit root must be refused"),
+        for invalid in [1u64 << 39, 1u64 << 46] {
+            match engine.attach_ppgtt(ctx, invalid) {
+                Err(SubmitError::InvalidPpgttRoot) => {}
+                _ => return TestResult::Fail("root outside Gen12 DMA mask must be refused"),
+            }
+            if engine.ppgtt_root(ctx) != Ok(None)
+                || (0..4).any(|pair| pdp_val(pair, true) != 0 || pdp_val(pair, false) != 0)
+            {
+                return TestResult::Fail("invalid DMA root mutated the retained context image");
+            }
         }
         // Attach: PDP0 carries the raw PML4 root address
         // (raw phys = 0x4000_0000 here); PDP1-3 stay zero.

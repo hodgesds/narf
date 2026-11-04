@@ -67,17 +67,24 @@ pub(crate) struct Bind {
 /// PAT indices coherent with CPU caches that this driver programs.
 pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
     match platform {
-        GtPlatform::Alchemist => pat == 0,
-        GtPlatform::Battlemage => matches!(pat, 1 | 2 | 4 | 5 | 7),
+        GtPlatform::Alchemist | GtPlatform::Gen12(_) => pat == 0,
+        _ if platform.is_xe2() => matches!(pat, 1 | 2 | 4 | 5 | 7),
+        GtPlatform::Battlemage => unreachable!("Xe2 handled above"),
         GtPlatform::Integrated(_) => matches!(pat, 3 | 4),
     }
 }
 
-/// Programmed XE_COH_NONE indices: Xe-LPG PAT1 (WT) and PAT2 (UC). Linux
+/// Programmed XE_COH_NONE indices: Gen12 PAT1/2/3 (WC/WT/UC), and
+/// Xe-LPG PAT1 (WT) and PAT2 (UC). Linux
 /// also admits PAT0, whose definition this driver leaves to firmware for the
 /// inherited display, so it stays refused.
 pub(crate) fn pat_noncoherent(platform: GtPlatform, pat: u16) -> bool {
-    matches!(platform, GtPlatform::Integrated(_)) && matches!(pat, 1 | 2)
+    match platform {
+        GtPlatform::Gen12(_) => matches!(pat, 1..=3),
+        _ if platform.is_headless_integrated() => pat == 3, // noncompressed UC, xe_pat.c
+        GtPlatform::Integrated(_) => matches!(pat, 1 | 2),
+        _ => false,
+    }
 }
 
 impl Bind {
@@ -148,6 +155,7 @@ impl Bind {
                 length,
                 op: 0,
                 mapping: Some(VmMapping {
+                    dumpable: flags & 8 != 0,
                     object: None,
                     va: address,
                     offset: 0,
@@ -198,6 +206,7 @@ impl Bind {
             length,
             op,
             mapping: Some(VmMapping {
+                dumpable: flags & 8 != 0,
                 object: object_arc,
                 va: address,
                 offset,
@@ -368,6 +377,7 @@ mod tests {
             active: Vec::new(),
         };
         state.publish(alloc::vec![VmMapping {
+            dumpable: false,
             object: Some(gem.object(handle).unwrap()),
             va: 0x10000,
             offset: 0,
@@ -404,6 +414,7 @@ mod tests {
             length: 8192,
             op: 0,
             mapping: Some(VmMapping {
+                dumpable: false,
                 object: None,
                 va: 0x11000,
                 offset: 0,

@@ -35,11 +35,11 @@ pub(crate) struct ContextSeed {
 }
 
 impl ContextSeed {
-    pub(crate) fn read(
+    pub(crate) fn read<'a>(
         mmio: &impl MmioWindow,
         platform: GtPlatform,
         topology: &GtTopology,
-        config: &HardwareConfig,
+        config: impl Into<Option<&'a HardwareConfig>>,
     ) -> Result<Self, ContextError> {
         platform.guc().ok_or(ContextError::Unsupported)?;
         if topology.platform() != platform || !topology.has_render() {
@@ -52,8 +52,41 @@ impl ContextSeed {
                 crate::intel_gpu_gt::GraphicsError::Unsupported => ContextError::Unsupported,
             })?;
         let (graphics, step) = (ip.version, ip.step);
-        let slices = config.lookup_u32(1).map_err(|_| ContextError::Hwconfig)?;
-        let subs = config.lookup_u32(70).map_err(|_| ContextError::Hwconfig)?;
+        let config = config.into();
+        let slices = config
+            .map(|c| c.lookup_u32(1))
+            .transpose()
+            .map_err(|_| ContextError::Hwconfig)?
+            .flatten();
+        let subs = config
+            .map(|c| c.lookup_u32(70))
+            .transpose()
+            .map_err(|_| ContextError::Hwconfig)?
+            .flatten();
+        if platform.is_gen12() {
+            let per_group = match (slices, subs) {
+                (Some(s), Some(d)) if s != 0 && d != 0 => d.div_ceil(s),
+                _ => 6,
+            };
+            if per_group == 0 || per_group > 8 {
+                return Err(ContextError::Hwconfig);
+            }
+            let first = topology.geometry_dss().trailing_zeros();
+            return Ok(Self {
+                platform,
+                dss: steering(first / per_group, first % per_group)?,
+                l3: 0,
+                disable_wmtp: true,
+                fuse4: 0,
+                graphics,
+                step,
+                mslice: 0,
+                per_group: per_group as u8,
+            });
+        }
+        if config.is_none() {
+            return Err(ContextError::Hwconfig);
+        }
         // xe_gt_mcr.c uses the physical layout maxima, not live DSS counts.
         let per_group = match (slices, subs) {
             (Some(s), Some(d)) if s != 0 && d != 0 => d.div_ceil(s),
@@ -61,6 +94,25 @@ impl ContextSeed {
         };
         if per_group == 0 || per_group > 32 {
             return Err(ContextError::Hwconfig);
+        }
+        if platform.is_ptl() {
+            // Source says modern GuC must supply physical-layout maxima.
+            // Refuse missing values and any live DSS whose exact selector
+            // would overflow the source four-bit group/instance fields.
+            if !matches!((slices, subs), (Some(s), Some(d)) if s != 0 && d != 0) {
+                return Err(ContextError::Hwconfig);
+            }
+            let live = topology.geometry_dss() | topology.compute_dss();
+            for index in 0..96u32 {
+                if live & (1u128 << index) != 0
+                    && (index >= subs.expect("validated layout")
+                        || index / per_group >= slices.expect("validated layout")
+                        || index / per_group > 15
+                        || index % per_group > 15)
+                {
+                    return Err(ContextError::Topology);
+                }
+            }
         }
         let first = (topology.geometry_dss() | topology.compute_dss()).trailing_zeros();
         let dss = steering(first / per_group, first % per_group)?;
@@ -72,7 +124,7 @@ impl ContextSeed {
         if a != b {
             return Err(ContextError::Unstable);
         }
-        let l3 = if platform == GtPlatform::Battlemage {
+        let l3 = if platform.is_xe2() {
             0 // no L3SQCREG5 tuning on Xe2
         } else {
             let mslices = a[1] & 15;
@@ -103,6 +155,19 @@ impl ContextSeed {
 
     /// Direct privileged ring commands, only while priming owns RCS0.
     pub(crate) fn commands(self) -> Vec<u32> {
+        if self.platform.is_gen12() {
+            // xe_wa.c lrc_was for graphics1200: no XeHP SVG or L3SQCREG5.
+            let mut words = vec![
+                0, 0x11000007, 0x2580, 0x00060002, 0x7018, 0x20002000, 0x7300, 0x00400040, 0x7304,
+                0x02000200,
+            ];
+            // Wa16011163337/1604555607: nonmasked FF_MODE2, preserve low16.
+            rmw(&mut words, 0x6604, 0xffff0000, 0xe0040000, 0);
+            words.extend_from_slice(&[
+                0, 0x11080005, 0x600, 0, 0x608, 0, 0x610, 0, 0, 0x11000001, 0x20cc, 0,
+            ]);
+            return words;
+        }
         let mut masked = match self.platform {
             GtPlatform::Alchemist => vec![
                 (0x6208, 0x00200020), // TBIMR tuning
@@ -111,6 +176,27 @@ impl ContextSeed {
                 (0x7044, 0x00200020), // 14019877138
                 (0x731c, 0x40004000), // 16013271637
                 (0x83a4, 0xffff4000), // 14014947963
+            ],
+            _ if self.platform.is_ptl() => {
+                let mut entries = vec![
+                    (0x6208, 0x00200020),
+                    (0x7300, 0x10001000),
+                    (0x731c, 0x20002000),
+                ];
+                if self.graphics == 3000 && self.step < 4 {
+                    entries.extend_from_slice(&[(0x6204, 0x00400040), (0x62a8, 0x02400240)]);
+                }
+                entries.sort_unstable_by_key(|entry| entry.0);
+                entries
+            }
+            _ if self.platform.is_lnl() => vec![
+                (0x6204, 0x00400040),
+                (0x6208, 0x00200020),
+                (0x7044, 0x04200420),
+                (0x83a8, 0x20002000),
+                (0x5588, 0x04000400),
+                (0x7010, 0x40004000),
+                (0x62a8, 0x02400240),
             ],
             GtPlatform::Battlemage => vec![
                 (
@@ -136,17 +222,21 @@ impl ContextSeed {
             ]);
             masked.sort_unstable_by_key(|pair| pair.0);
         }
-        if self.platform == GtPlatform::Battlemage && self.disable_wmtp {
+        if self.platform.is_xe2() && self.disable_wmtp {
             masked.insert(0, (0x2580, 0x00060002));
         }
         let mut words = vec![0, 0x11000000 | (masked.len() as u32 * 2 - 1)];
         for (reg, value) in masked {
             words.extend_from_slice(&[reg, value]);
         }
-        if self.graphics == 2001 {
+        if self.platform.is_lnl()
+            || (self.platform.is_ptl() && self.graphics == 3000 && self.step < 4)
+        {
+            rmw(&mut words, 0x6210, 0x18000, 0x18000, self.dss);
+        } else if self.graphics == 2001 {
             // FF_MODE is NOT a masked register; preserve all unrelated bits.
             rmw(&mut words, 0x6210, 0x03f18000, 0x03f18000, self.dss);
-        } else if self.platform != GtPlatform::Battlemage {
+        } else if self.platform != GtPlatform::Battlemage && !self.platform.is_ptl() {
             if self.platform == GtPlatform::Alchemist {
                 rmw(&mut words, 0x6604, 0x00ff0000, 0x00040000, self.dss);
             }
@@ -158,7 +248,7 @@ impl ContextSeed {
         ]);
         // Wa_14019789679 also covers Xe-LPG and Xe2. Omitted headers
         // otherwise let a later context inherit the previous context's state.
-        for &(subopcode, size) in SVG {
+        for &(subopcode, size) in if self.platform.is_ptl() { &[][..] } else { SVG } {
             let opcode = if self.graphics >= 2000 && subopcode == 0x100 {
                 0 // Xe2 replaces DRAWING_RECTANGLE with pipelined _FAST.
             } else {
@@ -259,8 +349,10 @@ pub(crate) mod tests {
         fn read32(&self, offset: u64) -> u32 {
             let reads = self.reads.get();
             self.reads.set(reads + 1);
+            // ContextSeed samples XEHP_FUSE4/MIRROR_FUSE3 twice; an unstable
+            // window changes MIRROR_FUSE3 in its second sample.
             self.regs.get(&offset).copied().unwrap_or(0)
-                ^ if self.unstable && reads >= 8 && offset == 0x9118 {
+                ^ if self.unstable && reads >= 2 && offset == 0x9118 {
                     1
                 } else {
                     0
@@ -309,6 +401,8 @@ pub(crate) mod tests {
                     let masked = matches!(
                         reg,
                         0x2580
+                            | 0x7018
+                            | 0x7304
                             | 0x5588
                             | 0x6204
                             | 0x6208
@@ -456,6 +550,50 @@ pub(crate) mod tests {
         smoke_context_workaround_and_steering_vectors
     );
 
+    fn smoke_gen12_context_hwconfig_absence_and_malformed_refusal() -> TestResult {
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        let mut w = window();
+        w.regs.insert(0x913c, 0x20);
+        w.regs.insert(0x9134, 0xfa);
+        w.regs.insert(0xd8c, u32::MAX);
+        w.regs.insert(0x9114, u32::MAX);
+        w.regs.insert(0x9118, u32::MAX);
+        let topo = GtTopology::read(&w, platform).unwrap();
+        let seed = ContextSeed::read(&w, platform, &topo, None).unwrap();
+        assert_eq!(
+            (seed.graphics, seed.per_group, seed.dss),
+            (1200, 6, 0x40050000)
+        );
+        // These tables are syntactically valid KLVs but the singleton values
+        // are malformed. They must never choose the absent-table fallback.
+        for words in [vec![1u32, 2, 4, 4], vec![70, 2, 6, 6]] {
+            let config =
+                HardwareConfig::parse(words.into_iter().flat_map(u32::to_le_bytes).collect())
+                    .unwrap();
+            assert_eq!(
+                ContextSeed::read(&w, platform, &topo, &config).unwrap_err(),
+                ContextError::Hwconfig
+            );
+        }
+        let mut regs = BTreeMap::from([(0x6604, 0xa5a55aa5)]);
+        let (svg, _) = execute(&seed.commands(), &mut regs);
+        assert!(svg.is_empty());
+        for (reg, value) in [
+            (0x2580, 2),
+            (0x7018, 0x2000),
+            (0x7300, 0x40),
+            (0x7304, 0x200),
+            (0x6604, 0xe0045aa5),
+        ] {
+            assert_eq!(regs[&reg], value);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_context",
+        smoke_gen12_context_hwconfig_absence_and_malformed_refusal
+    );
+
     fn smoke_context_seed_refuses_bad_fuses_and_layout() -> TestResult {
         for (reg, value, error) in [
             (0x9118, 0, ContextError::Topology),
@@ -470,9 +608,12 @@ pub(crate) mod tests {
                 error
             );
         }
+        // GtTopology now samples MIRROR_FUSE3 too (its L3 bank mask), so the
+        // fuses change only once the seed's own samples begin.
         let mut w = window();
-        w.unstable = true;
         let topo = GtTopology::read(&w, GtPlatform::Alchemist).unwrap();
+        w.unstable = true;
+        w.reads.set(0);
         assert_eq!(
             ContextSeed::read(&w, GtPlatform::Alchemist, &topo, &hwconfig()).unwrap_err(),
             ContextError::Unstable
@@ -493,5 +634,105 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_context",
         smoke_context_seed_refuses_bad_fuses_and_layout
+    );
+    fn smoke_ptl_96_dss_steering_lrc_literals_and_profile_refusal() -> TestResult {
+        let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
+        let config = HardwareConfig::parse(
+            [1u32, 1, 12, 70, 1, 96]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        )
+        .unwrap();
+        for (release, step) in [(0, 0), (0, 4), (1, 0)] {
+            let mut w = window();
+            w.regs.extend([
+                (0xd8c, 30 << 22 | release << 14 | step),
+                (0x913c, 0),
+                (0x9144, 0),
+                (0x9150, 0),
+                (0x9154, 0x80000000),
+                (0x9148, 0x80000000),
+                (0x914c, 0),
+            ]);
+            let topology = GtTopology::read(&w, platform).unwrap();
+            assert_eq!(
+                (topology.geometry_dss(), topology.compute_dss()),
+                (1u128 << 95, 1u128 << 63)
+            );
+            assert_eq!((topology.dss_count(), topology.eu_count()), (2, 2));
+            let wire = topology.i915_bytes(false);
+            assert_eq!(wire.len(), 125); // header16 + slice1 + DSS12 +96 SIMD16 masks
+            assert_eq!(&wire[4..8], &[96, 0, 8, 0]);
+            assert_eq!(wire[17 + 7], 0x80);
+            assert_eq!(wire[17 + 11], 0x80);
+            assert_eq!((wire[29 + 63], wire[29 + 95]), (1, 1));
+            let seed = ContextSeed::read(&w, platform, &topology, &config).unwrap();
+            assert_eq!((seed.per_group, seed.dss), (8, 0x43870000)); // union's first live DSS63 =>7/7
+            let mut regs = BTreeMap::from([(0x6210, 0xa4000001), (0x731c, 1)]);
+            let words = seed.commands();
+            let (svg, used) = execute(&words, &mut regs);
+            assert!(svg.is_empty()); // Wa14019789679 ends at graphics20.04
+            assert_eq!(used, words.len());
+            assert_eq!(
+                (regs[&0x6208], regs[&0x7300], regs[&0x731c]),
+                (0x20, 0x1000, 0x2001)
+            );
+            assert_eq!(regs[&0x2580], 2); // source WMTP-disabled fuse
+            let early = release == 0 && step < 4;
+            assert_eq!(regs[&0x6210], if early { 0xa4018001 } else { 0xa4000001 });
+            assert_eq!(
+                regs.get(&0x6204).copied().unwrap_or(0),
+                if early { 0x40 } else { 0 }
+            );
+            assert_eq!(
+                regs.get(&0x62a8).copied().unwrap_or(0),
+                if early { 0x240 } else { 0 }
+            );
+            assert!(
+                !regs.contains_key(&0x7044)
+                    && !regs.contains_key(&0x5588)
+                    && !regs.contains_key(&0xb158)
+            );
+            // Sole DSS95 exercises the third word through host and ADS selectors.
+            w.regs.insert(0x9148, 0);
+            let high = GtTopology::read(&w, platform).unwrap();
+            let high_seed = ContextSeed::read(&w, platform, &high, &config).unwrap();
+            assert_eq!(high_seed.dss, 0x45870000); //11/7 fits four-bit hardware fields
+            let absent = HardwareConfig::parse(
+                [7u32, 1, 8]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            )
+            .unwrap();
+            assert_eq!(
+                ContextSeed::read(&w, platform, &high, &absent).unwrap_err(),
+                ContextError::Hwconfig
+            );
+            let overflow = HardwareConfig::parse(
+                [1u32, 1, 24, 70, 1, 96]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            )
+            .unwrap();
+            assert_eq!(
+                ContextSeed::read(&w, platform, &high, &overflow).unwrap_err(),
+                ContextError::Topology
+            );
+            for gmd in [30 << 22 | 2 << 14, 30 << 22 | 3 << 14, 20 << 22 | 4 << 14] {
+                w.regs.insert(0xd8c, gmd);
+                assert_eq!(
+                    ContextSeed::read(&w, platform, &high, &config).unwrap_err(),
+                    ContextError::Unsupported
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_context",
+        smoke_ptl_96_dss_steering_lrc_literals_and_profile_refusal
     );
 }

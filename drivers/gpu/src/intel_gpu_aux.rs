@@ -126,6 +126,66 @@ pub const AUX_CTL_SYNC_PULSES_32: u32 = 32 << 16;
 /// programmed CD_CLK above the boot default.
 pub const AUX_CTL_BITCLK_DIVIDER_DEFAULT: u32 = 2222;
 
+/// Control-word profile for one AUX transport.
+///
+/// `Gen12` is the historical TGL/ADL encoding this transport has always
+/// written (bit-for-bit unchanged). `XeLpdp` is the Meteor Lake source
+/// encoding, `intel_dp_aux.c::skl_get_aux_send_ctl` for display ver 14:
+/// SKL+ sync-pulse fields instead of the pre-SKL precharge/bit-clock
+/// fields, `TBT_IO` only for a Thunderbolt-alt route, and
+/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` preserved on every write ("Power
+/// request bit is already set during aux power well enable. Preserve the
+/// bit across aux transactions.").
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AuxCtlProfile {
+    /// Historical Gen12 control word.
+    Gen12,
+    /// Xe-LPDP (MTL) control word; `tbt_io` selects the TBT AUX IO.
+    XeLpdp {
+        /// `DP_AUX_CH_CTL_TBT_IO` (bit 11): set only in TBT-alt mode.
+        tbt_io: bool,
+    },
+}
+
+/// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` (bit 19, MTL+).
+pub const XELPDP_AUX_CH_CTL_POWER_REQUEST: u32 = 1 << 19;
+/// `XELPDP_DP_AUX_CH_CTL_POWER_STATUS` (bit 18, MTL+).
+pub const XELPDP_AUX_CH_CTL_POWER_STATUS: u32 = 1 << 18;
+/// `DP_AUX_CH_CTL_TBT_IO` (bit 11, ICL+).
+pub const AUX_CTL_TBT_IO: u32 = 1 << 11;
+/// `DP_AUX_CH_CTL_FW_SYNC_PULSE_SKL(c)` field (bits 9:5) holds c - 1.
+const fn aux_fw_sync_pulse_skl(count: u32) -> u32 {
+    ((count - 1) & 0x1F) << 5
+}
+/// `DP_AUX_CH_CTL_SYNC_PULSE_SKL(c)` field (bits 4:0) holds c - 1.
+const fn aux_sync_pulse_skl(count: u32) -> u32 {
+    (count - 1) & 0x1F
+}
+/// `intel_dp_aux_sync_len()`: precharge 16 + preamble 16.
+const XELPDP_AUX_SYNC_LEN: u32 = 32;
+/// `intel_dp_aux_fw_sync_len()` without the AUO-panel DPCD quirk:
+/// precharge 10 + preamble 8.
+const XELPDP_AUX_FW_SYNC_LEN: u32 = 18;
+
+/// Build the Xe-LPDP AUX control word for a `send_bytes` request.
+/// `DP_AUX_CH_CTL_INTERRUPT` (bit 29) is deliberately left clear: this
+/// transport polls completion and owns no AUX interrupt consumer.
+pub const fn xelpdp_aux_send_ctl(send_bytes: u32, tbt_io: bool) -> u32 {
+    let mut ctl = AUX_CTL_SEND_BUSY
+        | AUX_CTL_DONE
+        | AUX_CTL_TIMEOUT_ERROR
+        | AUX_CTL_TIMEOUT_1600US
+        | AUX_CTL_RECEIVE_ERROR
+        | ((send_bytes << AUX_CTL_MSGSIZE_SHIFT) & AUX_CTL_MSGSIZE_MASK)
+        | aux_fw_sync_pulse_skl(XELPDP_AUX_FW_SYNC_LEN)
+        | aux_sync_pulse_skl(XELPDP_AUX_SYNC_LEN)
+        | XELPDP_AUX_CH_CTL_POWER_REQUEST;
+    if tbt_io {
+        ctl |= AUX_CTL_TBT_IO;
+    }
+    ctl
+}
+
 /// Maximum hardware-retry attempts on TIMEOUT / RECEIVE error.
 /// Beyond 3 we surface the error to the caller; DEFER-status
 /// retries are handled by the dp_aux layer above.
@@ -143,6 +203,8 @@ pub struct IntelAux<'a, M: MmioWindow + ?Sized> {
     /// own AUX bases (#1016) and construct via
     /// [`IntelAux::with_base`].
     base: u64,
+    /// Control-word encoding (Gen12 unless built by [`IntelAux::xelpdp`]).
+    profile: AuxCtlProfile,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
@@ -156,6 +218,22 @@ impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
 /// `Bar0` type. Real callers wrap `narf_drivers_pci`'s mapped BAR
 /// in an adapter that implements this.
 pub trait MmioWindow {
+    /// Immutable source-family metadata for this exact owned PCI mapping.
+    /// Physical adapters derive it from the known PCI-ID table, never broad
+    /// Generation::AlderLake. None permits diagnostics, but source-dependent
+    /// external activation must refuse. This is not current MMIO authority.
+    fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        None
+    }
+    /// Observed native ISA-bridge identity selects this source HPD bank.
+    /// Family metadata alone never synthesizes a south-display controller.
+    fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
+        None
+    }
+    /// Current authority for mask registers where all-ones is a valid value.
+    fn display_access_ok(&self) -> bool {
+        true
+    }
     /// Read a 32-bit register at byte offset `off` within the
     /// MMIO window.
     fn read32(&self, off: u64) -> u32;
@@ -170,24 +248,43 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             base: ddi.base(),
             mmio,
             ddi,
+            profile: AuxCtlProfile::Gen12,
         }
     }
 
-    /// Create a transport over an explicit AUX register base.
+    /// Create a display-14 (Xe-LPG/MTL) transport over an explicit AUX
+    /// register base, non-TBT IO.
     ///
-    /// Xe-LPG (MTL) ports do not share the Gen12 DDI register
-    /// stride: their AUX blocks sit at per-port absolute offsets
-    /// (see `intel_gpu_xelpg::XeLpgPort::aux_base`). The AUX
-    /// transaction protocol itself — CTL/DATA fields, message
-    /// packing, timeout/poll discipline — is unchanged from
-    /// Gen12, so only the base differs. `ddi` is retained for
-    /// diagnostics only.
+    /// Xe-LPG ports do not share the Gen12 DDI register stride: their
+    /// AUX blocks sit at per-port absolute offsets (see
+    /// `intel_gpu_xelpg::XeLpgPort::aux_base`). Every caller of this
+    /// constructor is a display-14 port, so it writes the
+    /// [`AuxCtlProfile::XeLpdp`] control word: the channel's
+    /// `XELPDP_DP_AUX_CH_CTL_POWER_REQUEST` (bit 19, raised by
+    /// `xelpdp_aux_power_well_enable`) is preserved on every write, as
+    /// `intel_dp_aux.c::skl_get_aux_send_ctl` does for DISPLAY_VER >= 14.
+    /// Gen12 callers use [`IntelAux::new`], whose word is unchanged.
     pub fn with_base(mmio: &'a M, base: u64) -> Self {
+        Self::xelpdp(mmio, base, false)
+    }
+
+    /// Create an Xe-LPDP (MTL) transport over an explicit AUX base with
+    /// the source control-word encoding ([`AuxCtlProfile::XeLpdp`]). The
+    /// caller owns the port's AUX power request
+    /// (`intel_gpu_xelpg_tc::aux_power_enable`); every control write here
+    /// keeps it asserted.
+    pub fn xelpdp(mmio: &'a M, base: u64, tbt_io: bool) -> Self {
         Self {
             mmio,
             ddi: Ddi::A,
             base,
+            profile: AuxCtlProfile::XeLpdp { tbt_io },
         }
+    }
+
+    /// The control-word profile this transport writes.
+    pub fn profile(&self) -> AuxCtlProfile {
+        self.profile
     }
 
     /// Absolute MMIO offset of this port's `DDI_AUX_CTL`.
@@ -260,11 +357,15 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         let start = narf_time::now_cycles();
         let mut ctl = ctl_initial;
         while ctl & AUX_CTL_SEND_BUSY != 0 {
-            if narf_time::now_cycles().wrapping_sub(start) > budget {
-                break;
-            }
+            // read_poll_timeout: sample expiry before the read, so the read
+            // that ends a timed-out wait follows the deadline. A transfer
+            // done by then is returned, not reported as still busy.
+            let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
             core::hint::spin_loop();
             ctl = self.mmio.read32(self.aux_ctl_off());
+            if expired {
+                break;
+            }
         }
         ctl
     }
@@ -283,21 +384,31 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         }
         // Clear any latched done/error bits from a prior transaction.
         // RW1C — write the bits we want cleared (don't clear SEND_BUSY).
+        // Xe-LPDP keeps its AUX power request asserted on every write.
+        let keep = match self.profile {
+            AuxCtlProfile::Gen12 => 0,
+            AuxCtlProfile::XeLpdp { .. } => XELPDP_AUX_CH_CTL_POWER_REQUEST,
+        };
         self.mmio.write32(
             self.aux_ctl_off(),
-            AUX_CTL_DONE | AUX_CTL_TIMEOUT_ERROR | AUX_CTL_RECEIVE_ERROR,
+            AUX_CTL_DONE | AUX_CTL_TIMEOUT_ERROR | AUX_CTL_RECEIVE_ERROR | keep,
         );
 
         self.write_data(wire);
         compiler_fence(Ordering::SeqCst);
 
         // Compose the control register: send + msgsize + timing.
-        let msgsize = ((wire.len() as u32) << AUX_CTL_MSGSIZE_SHIFT) & AUX_CTL_MSGSIZE_MASK;
-        let ctl = AUX_CTL_SEND_BUSY
-            | msgsize
-            | AUX_CTL_TIMEOUT_1600US
-            | AUX_CTL_PRECHARGE_16
-            | AUX_CTL_BITCLK_DIVIDER_DEFAULT;
+        let ctl = match self.profile {
+            AuxCtlProfile::Gen12 => {
+                let msgsize = ((wire.len() as u32) << AUX_CTL_MSGSIZE_SHIFT) & AUX_CTL_MSGSIZE_MASK;
+                AUX_CTL_SEND_BUSY
+                    | msgsize
+                    | AUX_CTL_TIMEOUT_1600US
+                    | AUX_CTL_PRECHARGE_16
+                    | AUX_CTL_BITCLK_DIVIDER_DEFAULT
+            }
+            AuxCtlProfile::XeLpdp { tbt_io } => xelpdp_aux_send_ctl(wire.len() as u32, tbt_io),
+        };
         self.mmio.write32(self.aux_ctl_off(), ctl);
 
         // Poll for completion.
@@ -679,5 +790,83 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_aux",
         smoke_aux_timeout_retries_exactly_three_times
+    );
+
+    fn smoke_aux_xelpdp_profile_preserves_power_request_and_gen12_word() -> TestResult {
+        // Gen12 transports keep the historical control word exactly.
+        let gen12 = MockMmio::default();
+        gen12.set_read(ctl_off(), AUX_CTL_DONE | (1 << AUX_CTL_MSGSIZE_SHIFT));
+        let req = AuxRequest {
+            cmd: AuxCommand::NativeWrite,
+            address: 0x600,
+            data: &[0x01],
+        };
+        let mut reply = [0u8; 17];
+        let mut aux = IntelAux::new(&gen12, Ddi::A);
+        if aux.profile() != AuxCtlProfile::Gen12 || aux.transact(&req, &mut reply).is_err() {
+            return TestResult::Fail("Gen12 transport must keep its profile and succeed");
+        }
+        // Display-14 base transports (DDI A eDP, backlight owner) use the
+        // power-preserving Xe-LPDP word.
+        if IntelAux::with_base(&gen12, 0x6_4000).profile()
+            != (AuxCtlProfile::XeLpdp { tbt_io: false })
+        {
+            return TestResult::Fail("display-14 base transport must preserve AUX power");
+        }
+        let gen12_writes = gen12.writes_to(ctl_off());
+        let historical = AUX_CTL_SEND_BUSY
+            | (5 << AUX_CTL_MSGSIZE_SHIFT)
+            | AUX_CTL_TIMEOUT_1600US
+            | AUX_CTL_PRECHARGE_16
+            | AUX_CTL_BITCLK_DIVIDER_DEFAULT;
+        if gen12_writes
+            != [
+                AUX_CTL_DONE | AUX_CTL_TIMEOUT_ERROR | AUX_CTL_RECEIVE_ERROR,
+                historical,
+            ]
+        {
+            return TestResult::Fail("Gen12 AUX control words changed");
+        }
+        // Xe-LPDP TC1 (0x16f210): every write keeps POWER_REQUEST, the
+        // send word is skl_get_aux_send_ctl with fw-sync 18 / sync 32,
+        // and TBT_IO is only set for a TBT-alt route.
+        let base = 0x16_F200;
+        for tbt in [false, true] {
+            let mtl = MockMmio::default();
+            mtl.set_read(base + 0x10, AUX_CTL_DONE | (1 << AUX_CTL_MSGSIZE_SHIFT));
+            let mut aux = IntelAux::xelpdp(&mtl, base, tbt);
+            if aux.transact(&req, &mut reply).is_err() {
+                return TestResult::Fail("Xe-LPDP transport must succeed on ACK");
+            }
+            let writes = mtl.writes_to(base + 0x10);
+            if writes.len() != 2
+                || writes
+                    .iter()
+                    .any(|w| w & XELPDP_AUX_CH_CTL_POWER_REQUEST == 0)
+            {
+                return TestResult::Fail("Xe-LPDP writes must preserve the AUX power request");
+            }
+            let expected = AUX_CTL_SEND_BUSY
+                | AUX_CTL_DONE
+                | AUX_CTL_TIMEOUT_ERROR
+                | (0b11 << 26)
+                | AUX_CTL_RECEIVE_ERROR
+                | (5 << 20)
+                | (17 << 5)
+                | 31
+                | (1 << 19)
+                | if tbt { 1 << 11 } else { 0 };
+            if writes[1] != expected || xelpdp_aux_send_ctl(5, tbt) != expected {
+                return TestResult::Fail("Xe-LPDP send word must match skl_get_aux_send_ctl");
+            }
+            if writes[1] & (1 << 29) != 0 {
+                return TestResult::Fail("polled transport must not request the done interrupt");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_xelpdp_profile_preserves_power_request_and_gen12_word
     );
 }

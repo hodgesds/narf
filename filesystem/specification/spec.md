@@ -377,7 +377,9 @@ pub trait DirOps {
         gid: u32,
     ) -> FsFuture<'_, Arc<dyn FileOps>>;
 }
+pub struct ReadOptions { pub nonblocking: bool } // Default: false
 pub trait FileOps {
+    fn read_with_options<'a>(&'a self, offset: u64, buf: &'a mut [u8], options: ReadOptions) -> FsFuture<'a, usize>;
     fn ioctl_user(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> FsFuture<'_, u64>;
     fn has_flush(&self) -> bool;
     fn anon_name(&self) -> Option<&'static str>; // anon_inodefs name, e.g. "[eventfd]"
@@ -460,6 +462,8 @@ pub mod mmap_relocation {
     pub fn replace(hook: Option<RelocationHook>) -> Option<RelocationHook>; // tests
     pub fn relocate(old: &[u64], new: &[u64], aliases: fn(u64) -> usize,
                     commit: &mut dyn FnMut() -> Result<(), FsError>) -> Result<(), FsError>;
+    pub fn register_alias_hooks(retain: fn(u64) -> bool, release: fn(u64) -> bool)
+        -> Result<(), FsError>;
     pub fn install_alias_hooks(retain: fn(u64) -> bool, release: fn(u64) -> bool);
     pub fn retain_alias(phys: u64) -> bool;   // false: not a device alias
     pub fn release_alias(phys: u64) -> bool;
@@ -496,6 +500,14 @@ pub fn unmap_mapping_range(file: &dyn FileOps, new_len: u64) -> Result<(), FsErr
 mode as one create operation when the backend supports it. The default adapts
 legacy backends by creating first and applying both metadata updates; tmpfs /
 `MemFs` initialises the inode and its quota charge atomically before insertion.
+
+`FileOps::read_with_options` receives a `ReadOptions { nonblocking }` snapshot
+for one invocation. The default delegates to `read`, preserving ordinary files.
+Streams with different blocking thresholds may override it; forwarding wrappers
+must pass the options unchanged. The syscall layer reads current shared
+open-description status immediately before invoking the operation, including
+after descriptor lookup and on subsequent calls. Neither numeric descriptors
+nor the stream object cache this status. Current-TTY forwarding preserves it.
 
 All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.
@@ -660,9 +672,17 @@ CPU alias of `old`, runs `commit`, then rebinds to `new` on success or restores
 `old` on error. Neither hook nor commit may await, and commit must not
 allocate. `aliases(phys)` must count every retained metadata alias of a device
 frame, including fork children not yet scheduler-visible; it runs with every
-affected region table locked and may take only leaf locks. The alias hooks are a
-single-provider registry (currently amdgpu); installing a different provider
-panics. `DmaResv::generation` counts fence additions without allocating or
+affected region table locked and may take only leaf locks. The alias registry
+admits eight permanent providers with disjoint physical frames. Registration
+before mapping publication is fallible: identical callback pairs are
+idempotent, a changed release partner returns InvalidData, and capacity
+exhaustion returns NoSpace. Providers cannot unregister or replace a pair and
+must retain claimed frames through the final metadata alias. Dispatch copies
+the fixed table under its short lock, then calls providers in permanent order
+after dropping that lock. AMD and Intel providers coexist. `install_alias_hooks`
+is the compatibility wrapper and panics on failed registration. The existing
+synchronous, allocation-free, no-await relocation contract is unchanged.
+`DmaResv::generation` counts fence additions without allocating or
 sampling driver fences, so a caller that saw no unsignalled fence can later
 prove none was added.
 
@@ -1439,13 +1459,24 @@ caller can distinguish policy exhaustion from exhausted backing storage.
 `FsError::FileTooLarge` is a size past what the filesystem can represent
 (`s_maxbytes`: `inode_newsize_ok`, `ext4_insert_range`) and maps to Linux
 `EFBIG`, distinct from a malformed range (`InvalidData`/`EINVAL`).
+`FsError::ArgumentListTooLong` is a well-formed caller-supplied list or record
+longer than the interface accepts and maps to Linux `E2BIG` (7 on every
+architecture, `include/uapi/asm-generic/errno-base.h`) — for example an Xe
+user-extension chain past `MAX_USER_EXTENSIONS`
+(`xe_bo.c::gem_create_user_extensions`,
+`xe_exec_queue.c::__exec_queue_user_extensions`). It stays distinct from
+`InvalidData`/`EINVAL`, a malformed request. Every `FsError` → errno
+translator in the syscall layer (the direct and relayed ioctl paths, open/
+create, copy, unlink/rmdir/rename, xattr, metadata, mount, quota) and the
+ALSA PCM translator pass it through as `E2BIG`; a FUSE daemon's `-E2BIG`
+reply maps to it.
 `FsError::OperationNotPermitted` represents an operation prohibited by object
 state and maps to Linux `EPERM`; it remains distinct from access-mode or
 credential denial (`PermissionDenied`/`EACCES`) and a read-only filesystem
 (`ReadOnly`/`EROFS`). Memfd seal violations use this variant.
 Device ioctl implementations may also return `BadAddress` (`EFAULT`),
-`OutOfMemory` (`ENOMEM`), `NotImplemented` (`ENOSYS`), and `AlreadyExists`
-(`EEXIST`). These remain distinct from `InvalidData` (`EINVAL`) and
+`OutOfMemory` (`ENOMEM`), `NotImplemented` (`ENOSYS`), `AlreadyExists`
+(`EEXIST`), and `ArgumentListTooLong` (`E2BIG`). These remain distinct from `InvalidData` (`EINVAL`) and
 `Unsupported`, whose direct-ioctl meaning is an unknown command (`ENOTTY`), so
 Linux UAPI error precedence survives the `FileOps` boundary.
 

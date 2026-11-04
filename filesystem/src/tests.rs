@@ -3870,6 +3870,52 @@ fn smoke_fs_fuse_syncfs_enosys_is_cached() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_syncfs_enosys_is_cached);
 
+/// A daemon's `-errno` reply becomes the `FsError` the syscall layer turns
+/// back into that same errno: Linux FUSE hands `out.h.error` to the caller
+/// unchanged (`fuse_simple_request`). E2BIG (7) once fell into the
+/// catch-all and came back as `Unsupported`; EINVAL is the control.
+fn smoke_fs_fuse_reply_errno_e2big_round_trips() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader};
+    use crate::fuse_conn::FuseConnection;
+    use crate::FsError;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    for (errno, expected) in [
+        (-7, FsError::ArgumentListTooLong),
+        (-22, FsError::InvalidData),
+    ] {
+        let conn = Arc::new(FuseConnection::new());
+        let mut future = alloc::boxed::Box::pin(conn.request_syncfs());
+        let mut cx = Context::from_waker(Waker::noop());
+        if !matches!(future.as_mut().poll(&mut cx), Poll::Pending) {
+            return TestResult::Fail("FUSE_SYNCFS completed before the daemon replied");
+        }
+        let Some(request) = conn.dequeue_request() else {
+            return TestResult::Fail("FUSE_SYNCFS request was not queued");
+        };
+        let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+            return TestResult::Fail("FUSE_SYNCFS request header malformed");
+        };
+        if conn
+            .complete_reply(&fuse_reply(header.unique, errno, &[]))
+            .is_none()
+        {
+            return TestResult::Fail("FUSE error reply was not accepted");
+        }
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) if error == expected => {}
+            Poll::Ready(_) => {
+                return TestResult::Fail("a daemon -errno reply did not map to its FsError")
+            }
+            Poll::Pending => return TestResult::Fail("completed FUSE reply stayed pending"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_reply_errno_e2big_round_trips);
+
 fn smoke_fs_fuse_reply_wakes_exact_waiter() -> TestResult {
     use crate::fuse_conn::{FuseConnection, FuseFs};
     use alloc::sync::Arc;

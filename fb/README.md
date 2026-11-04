@@ -12,9 +12,9 @@ A scanout backend is any device that can present a linear buffer to
 the display. This crate defines the trait each backend implements —
 exposing dimensions, pixel format, and a flush hook that is a no-op on
 bochs but becomes a transfer-and-flush sequence on virtio-gpu — and a
-picker that chooses among the available backends. The picker prefers
-bochs when its BAR is reachable, because it has the lowest latency and
-no command queue, and falls back to virtio-gpu otherwise. On top of
+picker that chooses among the available backends. After pause/test policy,
+it prefers the generic boot/adopted mapping and native AMD scanout, then
+reachable bochs, ready virtio-gpu and native Intel. On top of
 the active scanout it provides a writer offering bounds-checked fill,
 blit, and flush primitives.
 
@@ -75,3 +75,13 @@ lease. This supports a UEFI GOP selected ahead of a virtual display driver;
 it does not expose a userspace mmap. Adopted external displays continue to
 require the native owner's live publication, and boot GPU quarantine refuses
 all copy targets.
+
+Serial/headless Intel LNL/PTL takeover uses a permanent boot-publication gate.
+Boot framebuffer registration records history before publication; withdrawal
+and pause cannot erase it. Exclusion succeeds only before any boot framebuffer
+or graphics console was published, with no paused/current boot backend, and
+prevents subsequent generic boot registration. The Subsys installer runs before
+Late GT startup; initial graphical-boot takeover is refused. Later independently
+owned GPU adoption keeps its existing publisher/backing checks. See the
+[publication interface](../graphics/specification/spec.md#3-public-interface)
+and [GPU contract](../drivers/gpu/specification/spec.md#intel-headless-lnlptl-main-gt-execution).

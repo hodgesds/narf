@@ -46,44 +46,48 @@
 //!   `gmbus_wait` folds into every wait and reports as the
 //!   NAK / no-such-slave outcome. Same bit, correct name.
 //!
+//! ## Pin numbering correction (2026-11, Linux b90c984d)
+//!
+//! [`PinPair`] encoded DDI A..F as GMBUS pins 2..7. The source numbering
+//! (`intel_gmbus.h` `GMBUS_PIN_*`, tables in `intel_gmbus.c`) is DDI A/B/C
+//! = 1/2/3 and TC1..TC6 = 9..14, so every Gen12 DDC transfer selected the
+//! wrong wires (DDI B drove "dpc"). The per-PCH table is
+//! [`GmbusPinTable`] (`get_gmbus_pin`: icp for TGP/ADP, dg1, dg2, mtp
+//! for Meteor Lake and later); the Gen12 DDI default is
+//! [`gen12_ddc_pin`] (`intel_hdmi_default_ddc_pin`).
+//!
 //! ## Transport protocol (implemented by [`GmbusBus`])
 //!
-//! One call = one I²C transfer, shaped after i915's
-//! `do_gmbus_xfer` for a single message:
+//! [`GmbusBus::xfer`] is `intel_gmbus.c::do_gmbus_xfer` for a list of
+//! I²C messages (`struct i2c_msg`), one combined transfer with a single
+//! trailing STOP:
 //!
 //! 1. Write `GMBUS0` = rate | pin pair (bus select).
-//! 2. (2-byte-index transfers only) write `GMBUS5` with
-//!    [`GMBUS5_2BYTE_INDEX_EN`] + the index, before the program.
-//! 3. Write transfers preload the first `GMBUS3` dword *before*
-//!    the command (i915 `gmbus_xfer_write_chunk`); then write
-//!    `GMBUS1` = `SW_RDY` | cycle | byte count | slave | dir.
-//!    The data cycle is [`GMBUS1_CYCLE_WAIT`]; a 1-byte index
-//!    rides in the same program as [`GMBUS1_CYCLE_INDEX`] with
-//!    the index byte at `GMBUS1[15:8]` — the controller emits
-//!    it as the write segment and repeated-STARTs into the
-//!    data segment, which is the entire point of the INDEX
-//!    cycle. (The codec's original single-program shape set
-//!    `SW_CLR_INT` + `ENT` + the STOP cycle on the data
-//!    program itself; none of the three belongs there —
-//!    `SW_CLR_INT` is the post-NAK controller-reset toggle,
-//!    i915 does not arm `ENT`, and STOP is its own trailing
-//!    cycle so messages can chain.)
-//! 4. Data phase: poll `GMBUS2` for `HW_RDY` (poll-counted
-//!    budget, [`GMBUS_POLL_BUDGET`] — the #879 discipline:
-//!    wall-clock budgets misfire under TCG), draining /
-//!    filling `GMBUS3` little-endian per chunk (first byte in
-//!    bits `[7:0]`). Every wait also watches `SATOER` (→
-//!    [`GmbusError::SlaveNack`]) and `STALL_TIMEOUT` (→
-//!    [`GmbusError::HardwareTimeout`]).
-//! 5. Completion: poll for `HW_WAIT_PHASE`, then issue the
-//!    STOP cycle (`GMBUS1` = [`GMBUS1_CYCLE_STOP`] |
-//!    `SW_RDY`), wait for `ACTIVE` to clear (bus idle), and
+//! 2. Per message (`gmbus_xfer_read`/`gmbus_xfer_write`): the program is
+//!    `SW_RDY | CYCLE_WAIT | count | slave | dir`; a write preloads its
+//!    first `GMBUS3` dword before the program (`gmbus_xfer_write_chunk`).
+//!    A 1- or 2-byte write followed by a message to the same slave is an
+//!    index transfer (`gmbus_is_index_xfer`/`gmbus_index_xfer`): a 1-byte
+//!    index rides the second message's program as `CYCLE_INDEX` with the
+//!    byte at `GMBUS1[15:8]` (the program is `CYCLE_INDEX | CYCLE_WAIT`),
+//!    a 2-byte index goes through `GMBUS5` (`2BYTE_INDEX_EN`, cleared
+//!    right after the data phase).
+//! 3. Data phase: poll `GMBUS2` for `HW_RDY` (poll-counted budget,
+//!    [`GMBUS_POLL_BUDGET`] — the #879 discipline: wall-clock budgets
+//!    misfire under TCG), draining / filling `GMBUS3` little-endian.
+//!    Every wait also watches `SATOER` (→ [`GmbusError::SlaveNack`]) and
+//!    `STALL_TIMEOUT` (→ [`GmbusError::HardwareTimeout`]).
+//! 4. After each message, wait for `HW_WAIT_PHASE`: the controller holds
+//!    the bus, so the next message starts with a repeated START. This is
+//!    what lets the E-DDC segment pointer, the offset and the read share
+//!    one transfer ([`read_edid_eddc`]).
+//! 5. After the last message: the STOP cycle (`GMBUS1` =
+//!    [`GMBUS1_CYCLE_STOP`] | `SW_RDY`), wait for `ACTIVE` to clear and
 //!    restore `GMBUS0` = 0.
-//! 6. On `SATOER`: wait for idle first, then toggle
-//!    `SW_CLR_INT` (`GMBUS1` = `SW_CLR_INT`, then `GMBUS1` =
-//!    0) to reset the controller and clear the bus error, and
-//!    restore `GMBUS0` = 0 (i915's `clear_err` path). On any
-//!    other error, restore `GMBUS0` = 0 (i915's timeout path).
+//! 6. On `SATOER`: wait for idle first, then toggle `SW_CLR_INT` (`GMBUS1`
+//!    = `SW_CLR_INT`, then 0) and restore `GMBUS0` = 0 (`clear_err`); a
+//!    NAK on the first message is retried once from the bus select. On a
+//!    timeout, restore `GMBUS0` = 0.
 //!
 //! [`GmbusStatus::classify`] is retained as the snapshot
 //! decoder the codec documented; the transport polls the
@@ -97,6 +101,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_gt::Gen12Platform;
 
 // ── Register offsets (TGL PRM Vol. 12 §"GMBUS Registers") ────────
 
@@ -135,52 +140,152 @@ pub const GMBUS0_HOLD_EXT: u32 = 1 << 7;
 /// bytes and never set it.
 pub const GMBUS0_BYTE_CNT_OVERRIDE: u32 = 1 << 6;
 
-/// GMBUS pin pair encoding (bits[2:0] of `GMBUS0`). Each value
-/// selects which DDI's I²C lines the controller drives.
+/// A GMBUS pin number, the value `intel_gmbus.c` writes into `GMBUS0`
+/// with the rate (`bus->reg0 = pin | GMBUS_RATE_100KHZ`). Names and
+/// values are `intel_gmbus.h`'s `GMBUS_PIN_*` for the BXT/CNP-and-later
+/// numbering every display this driver programs uses. What a pin is
+/// wired to depends on the PCH pin table ([`GmbusPinTable`]); this type
+/// is only the number.
 ///
-/// Source: TGL PRM Vol. 12 §"GMBUS0 — Pin Pair Selection".
+/// Correction (Linux b90c984d): this enum used to encode DDI A..F as
+/// 2..7 (a PRM pair-index reading). The source numbering is DDI A/B/C =
+/// 1/2/3 (`GMBUS_PIN_1_BXT`..`GMBUS_PIN_3_BXT`, "dpa"/"dpb"/"dpc" in
+/// `gmbus_pins_icp`) and Type-C TC1..TC6 = 9..14
+/// (`GMBUS_PIN_9_TC1_ICP`..`GMBUS_PIN_14_TC6_TGP`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PinPair {
-    /// Disable GMBUS (default at reset).
+    /// `GMBUS_PIN_DISABLED`.
     Disabled = 0,
-    /// Dedicated CRT/VGA legacy I²C — pre-Gen11 only; reserved on
-    /// TGL+. Listed for completeness.
-    LegacyCrt = 1,
-    /// DDI A (combo PHY pair 1).
-    DdiA = 2,
-    /// DDI B.
-    DdiB = 3,
-    /// DDI C.
-    DdiC = 4,
-    /// DDI D / TC1 on USB-C boards.
-    DdiD = 5,
-    /// DDI E / TC2.
-    DdiE = 6,
-    /// DDI F / TC3.
-    DdiF = 7,
+    /// `GMBUS_PIN_1_BXT` ("dpa" on ICP/DG1/DG2/MTP).
+    Pin1Bxt = 1,
+    /// `GMBUS_PIN_2_BXT` ("dpb").
+    Pin2Bxt = 2,
+    /// `GMBUS_PIN_3_BXT` ("dpc").
+    Pin3Bxt = 3,
+    /// `GMBUS_PIN_4_CNP` ("dpd" on DG1/DG2/MTP).
+    Pin4Cnp = 4,
+    /// `GMBUS_PIN_5_MTP` ("dpe" on MTP).
+    Pin5Mtp = 5,
+    /// `GMBUS_PIN_9_TC1_ICP` ("tc1").
+    Pin9Tc1 = 9,
+    /// `GMBUS_PIN_10_TC2_ICP` ("tc2").
+    Pin10Tc2 = 10,
+    /// `GMBUS_PIN_11_TC3_ICP` ("tc3").
+    Pin11Tc3 = 11,
+    /// `GMBUS_PIN_12_TC4_ICP` ("tc4").
+    Pin12Tc4 = 12,
+    /// `GMBUS_PIN_13_TC5_TGP` ("tc5" on ICP-table PCHs).
+    Pin13Tc5 = 13,
+    /// `GMBUS_PIN_14_TC6_TGP` ("tc6" on ICP-table PCHs).
+    Pin14Tc6 = 14,
 }
 
 impl PinPair {
-    /// Pack into bits[2:0] of `GMBUS0`.
+    /// The `GMBUS0` pin value (ORed with the rate field).
     pub const fn encode(self) -> u32 {
         self as u32
     }
+
+    /// The Type-C DDC pin for `enum tc_port` index `tc` (TC1 = 0), as
+    /// `icl_encoder_to_ddc_pin` computes it: `GMBUS_PIN_9_TC1_ICP + tc`.
+    pub const fn type_c(tc: u8) -> Option<Self> {
+        Some(match tc {
+            0 => PinPair::Pin9Tc1,
+            1 => PinPair::Pin10Tc2,
+            2 => PinPair::Pin11Tc3,
+            3 => PinPair::Pin12Tc4,
+            4 => PinPair::Pin13Tc5,
+            5 => PinPair::Pin14Tc6,
+            _ => return None,
+        })
+    }
 }
 
-/// The GMBUS pin pair a DDI's DDC lines hang off (PRM Vol. 12
-/// GMBUS0 pin-pair table: DDI A..F = pairs 2..7). DDI G/H have
-/// no GMBUS-addressable DDC pair on Gen12 and return `None`.
-pub fn pin_pair_for(ddi: Ddi) -> Option<PinPair> {
-    Some(match ddi {
-        Ddi::A => PinPair::DdiA,
-        Ddi::B => PinPair::DdiB,
-        Ddi::C => PinPair::DdiC,
-        Ddi::D => PinPair::DdiD,
-        Ddi::E => PinPair::DdiE,
-        Ddi::F => PinPair::DdiF,
-        _ => return None,
-    })
+/// The PCH pin table `intel_gmbus.c::get_gmbus_pin` selects (newest
+/// first: `PCH_MTL` and later → `gmbus_pins_mtp`, `PCH_DG2` →
+/// `gmbus_pins_dg2`, `PCH_DG1` → `gmbus_pins_dg1`, `PCH_ICP` and later →
+/// `gmbus_pins_icp`). Older tables (CNP, BXT, SKL, BDW, gen4) belong to
+/// displays this driver never programs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GmbusPinTable {
+    /// `gmbus_pins_icp` (PCH_ICP, PCH_TGP, PCH_ADP).
+    Icp,
+    /// `gmbus_pins_dg1`.
+    Dg1,
+    /// `gmbus_pins_dg2`.
+    Dg2,
+    /// `gmbus_pins_mtp` (PCH_MTL, PCH_LNL).
+    Mtp,
+}
+
+impl GmbusPinTable {
+    /// The table for a display generation. Tiger Lake (PCH_TGP) and
+    /// Alder/Raptor Lake S/P/N (PCH_ADP, `intel_pch.c::intel_pch_type`)
+    /// are `>= PCH_ICP` and below `PCH_DG1`; Meteor/Arrow Lake fake
+    /// `PCH_MTL` and display 20+ fakes `PCH_LNL`
+    /// (`intel_pch_fake_for_south_display`), both `>= PCH_MTL`.
+    pub const fn for_generation(generation: crate::intel_gpu::Generation) -> Self {
+        use crate::intel_gpu::Generation;
+        match generation {
+            Generation::TigerLake | Generation::AlderLake => GmbusPinTable::Icp,
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
+                GmbusPinTable::Mtp
+            }
+        }
+    }
+
+    /// `gmbus_pins_*[pin].name`, or `None` when the table has no such
+    /// pin (`intel_gmbus_is_valid_pin` false).
+    pub const fn name(self, pin: PinPair) -> Option<&'static str> {
+        use GmbusPinTable::{Dg1, Dg2, Icp, Mtp};
+        Some(match (self, pin) {
+            (_, PinPair::Pin1Bxt) => "dpa",
+            (_, PinPair::Pin2Bxt) => "dpb",
+            (_, PinPair::Pin3Bxt) => "dpc",
+            (Dg1 | Dg2 | Mtp, PinPair::Pin4Cnp) => "dpd",
+            (Mtp, PinPair::Pin5Mtp) => "dpe",
+            (Icp | Dg2 | Mtp, PinPair::Pin9Tc1) => "tc1",
+            (Icp | Mtp, PinPair::Pin10Tc2) => "tc2",
+            (Icp | Mtp, PinPair::Pin11Tc3) => "tc3",
+            (Icp | Mtp, PinPair::Pin12Tc4) => "tc4",
+            (Icp, PinPair::Pin13Tc5) => "tc5",
+            (Icp, PinPair::Pin14Tc6) => "tc6",
+            _ => return None,
+        })
+    }
+
+    /// `intel_gmbus_is_valid_pin`.
+    pub const fn is_valid(self, pin: PinPair) -> bool {
+        self.name(pin).is_some()
+    }
+}
+
+/// The default DDC pin of a Gen12 DDI, `intel_hdmi.c` b90c984d
+/// `intel_hdmi_default_ddc_pin` with no VBT pin: Alder Lake S uses
+/// `adls_encoder_to_ddc_pin` (PHY A → pin 1, every other port →
+/// `GMBUS_PIN_9_TC1_ICP + phy - PHY_B`, its TC1..TC4 being PHY B..E);
+/// Tiger Lake and Alder Lake P/N use `icl_encoder_to_ddc_pin` (combo
+/// PHY A/B → `GMBUS_PIN_1_BXT + port`, Type-C → `GMBUS_PIN_9_TC1_ICP +
+/// tc`). Combo is PHY A/B on display 12 and on ADL-P
+/// (`intel_phy_is_combo`); Type-C is PORT_TC1..TC6 (DDI D..I) on Tiger
+/// Lake and TC1..TC4 (DDI D..G) on ADL-P/N, per the platform port masks
+/// in `intel_display_device.c`. A DDI the platform does not have (the
+/// source's WARN paths) has no pin. Every result is valid in
+/// `gmbus_pins_icp`, the table these PCHs select.
+pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
+    match (family, ddi) {
+        (_, Ddi::A) => Some(PinPair::Pin1Bxt),
+        (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H) => None,
+        (_, Ddi::B) => Some(PinPair::Pin2Bxt),
+        (_, Ddi::C) => None,
+        (_, Ddi::D) => Some(PinPair::Pin9Tc1),
+        (_, Ddi::E) => Some(PinPair::Pin10Tc2),
+        (_, Ddi::F) => Some(PinPair::Pin11Tc3),
+        (_, Ddi::G) => Some(PinPair::Pin12Tc4),
+        (Gen12Platform::TigerLake, Ddi::H) => Some(PinPair::Pin13Tc5),
+        (_, Ddi::H) => None,
+    }
 }
 
 // ── GMBUS1 — command (TGL PRM Vol. 12 §"GMBUS1") ─────────────────
@@ -353,7 +458,7 @@ impl EdidReadProgram {
 /// driving the registers by hand must reproduce that sequence
 /// (see the module header's "Transport protocol").
 pub fn build_edid_read(pin_pair: PinPair, bytes: u16) -> Result<EdidReadProgram, GmbusError> {
-    if matches!(pin_pair, PinPair::Disabled | PinPair::LegacyCrt) {
+    if matches!(pin_pair, PinPair::Disabled) {
         return Err(GmbusError::InvalidPinPair);
     }
     if bytes == 0 || bytes > 0x1FF {
@@ -408,16 +513,22 @@ impl GmbusStatus {
 
 impl TryFrom<u32> for PinPair {
     type Error = GmbusError;
+    /// Decode a pin number (exactly a `GMBUS_PIN_*` value; 6..8 and
+    /// 15+ name no pin in the BXT+ numbering).
     fn try_from(v: u32) -> Result<Self, Self::Error> {
-        Ok(match v & 0x7 {
+        Ok(match v {
             0 => PinPair::Disabled,
-            1 => PinPair::LegacyCrt,
-            2 => PinPair::DdiA,
-            3 => PinPair::DdiB,
-            4 => PinPair::DdiC,
-            5 => PinPair::DdiD,
-            6 => PinPair::DdiE,
-            7 => PinPair::DdiF,
+            1 => PinPair::Pin1Bxt,
+            2 => PinPair::Pin2Bxt,
+            3 => PinPair::Pin3Bxt,
+            4 => PinPair::Pin4Cnp,
+            5 => PinPair::Pin5Mtp,
+            9 => PinPair::Pin9Tc1,
+            10 => PinPair::Pin10Tc2,
+            11 => PinPair::Pin11Tc3,
+            12 => PinPair::Pin12Tc4,
+            13 => PinPair::Pin13Tc5,
+            14 => PinPair::Pin14Tc6,
             _ => return Err(GmbusError::InvalidPinPair),
         })
     }
@@ -432,12 +543,58 @@ impl TryFrom<u32> for PinPair {
 /// allows a phase on silicon.
 pub const GMBUS_POLL_BUDGET: u32 = 100_000;
 
+/// One message of a combined transfer (`struct i2c_msg`).
+#[derive(Debug)]
+pub enum I2cMsg<'b> {
+    /// Write `data` to the 7-bit slave `addr`.
+    Write {
+        /// 7-bit slave address.
+        addr: u8,
+        /// Bytes to send.
+        data: &'b [u8],
+    },
+    /// Read `buf.len()` bytes from the 7-bit slave `addr`.
+    Read {
+        /// 7-bit slave address.
+        addr: u8,
+        /// Destination.
+        buf: &'b mut [u8],
+    },
+}
+
+impl I2cMsg<'_> {
+    fn addr(&self) -> u8 {
+        match self {
+            I2cMsg::Write { addr, .. } | I2cMsg::Read { addr, .. } => *addr,
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            I2cMsg::Write { data, .. } => data.len(),
+            I2cMsg::Read { buf, .. } => buf.len(),
+        }
+    }
+    fn is_read(&self) -> bool {
+        matches!(self, I2cMsg::Read { .. })
+    }
+}
+
+/// `gmbus_is_index_xfer`: a 1- or 2-byte write followed by a non-empty
+/// message to the same slave.
+fn is_index_xfer(msgs: &[I2cMsg<'_>], i: usize) -> bool {
+    i + 1 < msgs.len()
+        && msgs[i].addr() == msgs[i + 1].addr()
+        && !msgs[i].is_read()
+        && matches!(msgs[i].len(), 1 | 2)
+        && msgs[i + 1].len() > 0
+}
+
 /// MMIO transport for one GMBUS pin pair — the DDC/I²C engine
 /// behind EDID reads and SCDC register traffic. Borrows the
 /// BAR0 window (via the crate's shared [`MmioWindow`]) and
 /// holds no state across transfers: every method runs one
-/// complete transfer (select → program → data → wait phase →
-/// STOP → idle) per the module header's protocol.
+/// complete [`GmbusBus::xfer`] (select → messages, each ending in
+/// the wait phase → STOP → idle) per the module header's protocol.
 pub struct GmbusBus<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
     pin: PinPair,
@@ -497,13 +654,15 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    /// Compose a data-segment program.
-    fn program(&self, slave: u8, len: usize, read: bool, cycle: u32, index: Option<u8>) -> u32 {
-        let mut gmbus1 =
-            GMBUS1_SW_RDY | cycle | gmbus1_byte_count(len as u16) | gmbus1_slave_addr(slave);
-        if let Some(index) = index {
-            gmbus1 |= gmbus1_index_byte(index);
-        }
+    /// Compose a data-segment program
+    /// (`gmbus_xfer_read_chunk`/`gmbus_xfer_write_chunk`):
+    /// `gmbus1_index | CYCLE_WAIT | count | slave | dir | SW_RDY`.
+    fn program(&self, slave: u8, len: usize, read: bool, gmbus1_index: u32) -> u32 {
+        let mut gmbus1 = GMBUS1_SW_RDY
+            | gmbus1_index
+            | GMBUS1_CYCLE_WAIT
+            | gmbus1_byte_count(len as u16)
+            | gmbus1_slave_addr(slave);
         if read {
             gmbus1 |= GMBUS1_DIR_READ;
         }
@@ -551,22 +710,6 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
         }
     }
 
-    /// Route a failed transfer through its exit path: a NAK
-    /// gets the controller-reset recovery; anything else just
-    /// parks the bus.
-    fn abort(&self, err: GmbusError) -> GmbusError {
-        match err {
-            GmbusError::SlaveNack => match self.nak_recovery() {
-                Ok(()) => err,
-                Err(recovery_err) => recovery_err,
-            },
-            _ => {
-                self.idle_bus();
-                err
-            }
-        }
-    }
-
     /// The post-NAK recovery (i915 `clear_err`): wait for the
     /// bus to idle *before* clearing the NAK — clearing while
     /// the bus is still active leaves it active and poisons
@@ -583,27 +726,95 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
         idle
     }
 
-    /// Success-path completion: wait phase → STOP cycle →
-    /// idle wait → park.
-    fn finish(&self) -> Result<(), GmbusError> {
-        match self.wait_bits(GMBUS2_HW_WAIT_PHASE) {
-            Ok(_) => {
-                self.mmio.write32(GMBUS1, GMBUS1_CYCLE_STOP | GMBUS1_SW_RDY);
-                compiler_fence(Ordering::SeqCst);
-                let idle = self.wait_idle();
-                self.idle_bus();
-                idle
+    /// One message's data phase (`gmbus_xfer_read`/`gmbus_xfer_write`)
+    /// with an optional `GMBUS1` index field.
+    fn message(&self, msg: &mut I2cMsg<'_>, gmbus1_index: u32) -> Result<(), GmbusError> {
+        match msg {
+            I2cMsg::Read { addr, buf } => {
+                let gmbus1 = self.program(*addr, buf.len(), true, gmbus1_index);
+                self.read_data_phase(gmbus1, buf)
             }
-            Err(e) => Err(self.abort(e)),
+            I2cMsg::Write { addr, data } => {
+                let gmbus1 = self.program(*addr, data.len(), false, gmbus1_index);
+                self.write_data_phase(gmbus1, data)
+            }
         }
     }
 
-    /// Run a data phase, then the completion / abort routing
-    /// shared by every transfer shape.
-    fn run(&self, phase: Result<(), GmbusError>) -> Result<(), GmbusError> {
-        match phase {
-            Ok(()) => self.finish(),
-            Err(e) => Err(self.abort(e)),
+    /// `gmbus_index_xfer`: `pair[0]` is the 1- or 2-byte index write,
+    /// `pair[1]` the message it indexes.
+    fn index_message(&self, pair: &mut [I2cMsg<'_>]) -> Result<(), GmbusError> {
+        let (index, rest) = pair.split_at_mut(1);
+        let index = match &index[0] {
+            I2cMsg::Write { data, .. } => *data,
+            I2cMsg::Read { .. } => return Err(GmbusError::TooManyBytes),
+        };
+        let (gmbus5, gmbus1_index) = match index.len() {
+            2 => (gmbus5_two_byte_index(index[0], index[1]), 0),
+            _ => (0, GMBUS1_CYCLE_INDEX | gmbus1_index_byte(index[0])),
+        };
+        if gmbus5 != 0 {
+            self.mmio.write32(GMBUS5, gmbus5);
+            compiler_fence(Ordering::SeqCst);
+        }
+        let result = self.message(&mut rest[0], gmbus1_index);
+        if gmbus5 != 0 {
+            self.mmio.write32(GMBUS5, 0);
+            compiler_fence(Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// `do_gmbus_xfer`: run `msgs` as one combined transfer (see the
+    /// module header): each message (or index pair) ends in the wait
+    /// phase so the next one starts with a repeated START; one STOP
+    /// follows the last. A NAK on the first message is retried once.
+    /// Messages must be 1..=511 bytes and the pin a real pin; both are
+    /// checked before any register access.
+    pub fn xfer(&self, msgs: &mut [I2cMsg<'_>]) -> Result<(), GmbusError> {
+        if self.pin == PinPair::Disabled {
+            return Err(GmbusError::InvalidPinPair);
+        }
+        for msg in msgs.iter() {
+            Self::check_len(msg.len())?;
+        }
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let mut retried = false;
+        'retry: loop {
+            self.select_bus();
+            let mut i = 0;
+            while i < msgs.len() {
+                let (result, inc) = if is_index_xfer(msgs, i) {
+                    (self.index_message(&mut msgs[i..i + 2]), 2)
+                } else {
+                    (self.message(&mut msgs[i], 0), 1)
+                };
+                match result.and_then(|()| self.wait_bits(GMBUS2_HW_WAIT_PHASE).map(|_| ())) {
+                    Ok(()) => i += inc,
+                    Err(GmbusError::SlaveNack) => {
+                        let err = match self.nak_recovery() {
+                            Ok(()) => GmbusError::SlaveNack,
+                            Err(e) => e,
+                        };
+                        if err == GmbusError::SlaveNack && i == 0 && !retried {
+                            retried = true;
+                            continue 'retry;
+                        }
+                        return Err(err);
+                    }
+                    Err(e) => {
+                        self.idle_bus();
+                        return Err(e);
+                    }
+                }
+            }
+            self.mmio.write32(GMBUS1, GMBUS1_CYCLE_STOP | GMBUS1_SW_RDY);
+            compiler_fence(Ordering::SeqCst);
+            let idle = self.wait_idle();
+            self.idle_bus();
+            return idle;
         }
     }
 
@@ -662,72 +873,126 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
     /// Read `out.len()` bytes from `slave`, starting at the
     /// slave's current internal pointer.
     pub fn read(&self, slave: u8, out: &mut [u8]) -> Result<(), GmbusError> {
-        Self::check_len(out.len())?;
-        self.select_bus();
-        let gmbus1 = self.program(slave, out.len(), true, GMBUS1_CYCLE_WAIT, None);
-        self.run(self.read_data_phase(gmbus1, out))
+        self.xfer(&mut [I2cMsg::Read {
+            addr: slave,
+            buf: out,
+        }])
     }
 
-    /// Read `out.len()` bytes from `slave` at byte `index`,
-    /// via a [`GMBUS1_CYCLE_INDEX`] program (the controller
-    /// emits `index` as the write segment, then repeated-STARTs
-    /// into the read). This is the EDID block-offset and SCDC
-    /// register-address mechanism.
+    /// Read `out.len()` bytes from `slave` at byte `index`: the
+    /// offset write and the read as one index transfer (the
+    /// controller emits `index` as the write segment, then
+    /// repeated-STARTs into the read). This is the EDID
+    /// block-offset and SCDC register-address mechanism
+    /// (`drm_scdc_readb`).
     pub fn read_indexed(&self, slave: u8, index: u8, out: &mut [u8]) -> Result<(), GmbusError> {
-        Self::check_len(out.len())?;
-        self.select_bus();
-        let gmbus1 = self.program(slave, out.len(), true, GMBUS1_CYCLE_INDEX, Some(index));
-        self.run(self.read_data_phase(gmbus1, out))
+        self.xfer(&mut [
+            I2cMsg::Write {
+                addr: slave,
+                data: &[index],
+            },
+            I2cMsg::Read {
+                addr: slave,
+                buf: out,
+            },
+        ])
     }
 
     /// Read `out.len()` bytes from `slave` at the 2-byte index
-    /// `index` (first-emitted byte first), via `GMBUS5`. The
-    /// register is cleared back to 0 after the transfer,
-    /// whatever its outcome.
+    /// `index` (first-emitted byte first), via `GMBUS5`, which is
+    /// cleared right after the data phase whatever its outcome.
     pub fn read_indexed2(
         &self,
         slave: u8,
         index: [u8; 2],
         out: &mut [u8],
     ) -> Result<(), GmbusError> {
-        Self::check_len(out.len())?;
-        self.select_bus();
-        self.mmio
-            .write32(GMBUS5, gmbus5_two_byte_index(index[0], index[1]));
-        compiler_fence(Ordering::SeqCst);
-        let gmbus1 = self.program(slave, out.len(), true, GMBUS1_CYCLE_WAIT, None);
-        let result = self.run(self.read_data_phase(gmbus1, out));
-        self.mmio.write32(GMBUS5, 0);
-        result
+        self.xfer(&mut [
+            I2cMsg::Write {
+                addr: slave,
+                data: &index,
+            },
+            I2cMsg::Read {
+                addr: slave,
+                buf: out,
+            },
+        ])
     }
 
     /// Write `data` to `slave`.
     pub fn write(&self, slave: u8, data: &[u8]) -> Result<(), GmbusError> {
-        Self::check_len(data.len())?;
-        self.select_bus();
-        let gmbus1 = self.program(slave, data.len(), false, GMBUS1_CYCLE_WAIT, None);
-        self.run(self.write_data_phase(gmbus1, data))
+        self.xfer(&mut [I2cMsg::Write { addr: slave, data }])
     }
 
-    /// Write `data` to `slave` at byte `index`, via a
-    /// [`GMBUS1_CYCLE_INDEX`] program.
+    /// Write `data` to `slave` at byte `index` (an index transfer
+    /// whose second message is a write).
     pub fn write_indexed(&self, slave: u8, index: u8, data: &[u8]) -> Result<(), GmbusError> {
-        Self::check_len(data.len())?;
-        self.select_bus();
-        let gmbus1 = self.program(slave, data.len(), false, GMBUS1_CYCLE_INDEX, Some(index));
-        self.run(self.write_data_phase(gmbus1, data))
+        self.xfer(&mut [
+            I2cMsg::Write {
+                addr: slave,
+                data: &[index],
+            },
+            I2cMsg::Write { addr: slave, data },
+        ])
     }
 
     /// Read one 128-byte E-EDID base block from this bus's pin
-    /// pair — the codec's own [`build_edid_read`] program run
-    /// through the full transport sequence. (The program's
-    /// `GMBUS0` value is the 100 kHz default; a bus built with
-    /// [`GmbusBus::with_rate`] selects its own rate instead —
-    /// the `GMBUS1` program is rate-independent.)
+    /// pair with the codec's own [`build_edid_read`] program shape
+    /// (a plain `CYCLE_WAIT` read at the slave's current pointer).
     pub fn read_edid(&self, out: &mut [u8; 128]) -> Result<(), GmbusError> {
-        let program = build_edid_read(self.pin, 128)?;
-        self.select_bus();
-        self.run(self.read_data_phase(program.gmbus1, out))
+        build_edid_read(self.pin, 128)?;
+        self.read(DDC_SLAVE_EDID, out)
+    }
+
+    /// `drm_do_probe_ddc_edid` for EDID `block`: the E-DDC segment
+    /// pointer (`block >> 1`, only when non-zero), the offset
+    /// (`block * 128` truncated to a byte) and the 128-byte read as one
+    /// combined transfer, so the segment write reaches the read across
+    /// repeated STARTs. Retried up to five times; a NAK (no such
+    /// adapter/slave) ends the retries at once.
+    pub fn read_edid_block(&self, block: u8, out: &mut [u8; 128]) -> Result<(), GmbusError> {
+        let segment = [block >> 1];
+        let start = [block.wrapping_mul(128)];
+        let mut retries = 5;
+        loop {
+            let result = if segment[0] != 0 {
+                self.xfer(&mut [
+                    I2cMsg::Write {
+                        addr: DDC_SLAVE_SEGMENT,
+                        data: &segment,
+                    },
+                    I2cMsg::Write {
+                        addr: DDC_SLAVE_EDID,
+                        data: &start,
+                    },
+                    I2cMsg::Read {
+                        addr: DDC_SLAVE_EDID,
+                        buf: &mut out[..],
+                    },
+                ])
+            } else {
+                self.xfer(&mut [
+                    I2cMsg::Write {
+                        addr: DDC_SLAVE_EDID,
+                        data: &start,
+                    },
+                    I2cMsg::Read {
+                        addr: DDC_SLAVE_EDID,
+                        buf: &mut out[..],
+                    },
+                ])
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(GmbusError::SlaveNack) => return Err(GmbusError::SlaveNack),
+                Err(e) => {
+                    retries -= 1;
+                    if retries == 0 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -763,6 +1028,32 @@ pub fn gmbus_write<M: MmioWindow + ?Sized>(
     GmbusBus::new(mmio, pin).write(slave, data)
 }
 
+/// Largest EDID the DDC readers keep: the base block plus three
+/// extensions.
+pub const EDID_MAX_BYTES: usize = 512;
+
+/// Read a sink's EDID over DDC the way `drm_edid.c` does: the base
+/// block, then each extension block `edid[126]` announces (bounded by
+/// [`EDID_MAX_BYTES`]), every block through
+/// [`GmbusBus::read_edid_block`] (E-DDC segments for blocks 2 and 3).
+/// Returns the valid byte count.
+pub fn read_edid_eddc<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    pin: PinPair,
+    out: &mut [u8; EDID_MAX_BYTES],
+) -> Result<usize, GmbusError> {
+    let bus = GmbusBus::new(mmio, pin);
+    let mut block = [0u8; 128];
+    bus.read_edid_block(0, &mut block)?;
+    out[..128].copy_from_slice(&block);
+    let blocks = 1 + (out[126] as usize).min(EDID_MAX_BYTES / 128 - 1);
+    for index in 1..blocks {
+        bus.read_edid_block(index as u8, &mut block)?;
+        out[index * 128..(index + 1) * 128].copy_from_slice(&block);
+    }
+    Ok(blocks * 128)
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     extern crate alloc;
@@ -775,10 +1066,18 @@ pub mod tests {
     // ── Codec smokes ─────────────────────────────────────────
 
     fn smoke_pin_pair_round_trip() -> TestResult {
-        for v in 0u32..=7 {
-            let pp = PinPair::try_from(v).expect("valid range");
+        // intel_gmbus.h b90c984d: GMBUS_PIN_DISABLED, GMBUS_PIN_1_BXT..
+        // GMBUS_PIN_5_MTP, GMBUS_PIN_9_TC1_ICP..GMBUS_PIN_14_TC6_TGP. The
+        // former 0..=7 range encoded DDI A..F as 2..7, which is wrong.
+        for v in [0u32, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14] {
+            let pp = PinPair::try_from(v).expect("GMBUS_PIN_* value");
             if pp.encode() != v {
                 return TestResult::Fail("pin pair encode round-trip");
+            }
+        }
+        for v in [6u32, 7, 8, 15, 0x202] {
+            if PinPair::try_from(v) != Err(GmbusError::InvalidPinPair) {
+                return TestResult::Fail("non-GMBUS_PIN values must not decode");
             }
         }
         TestResult::Pass
@@ -786,12 +1085,13 @@ pub mod tests {
     kernel_test_in!("drivers/gpu/intel_gpu_gmbus", smoke_pin_pair_round_trip);
 
     fn smoke_edid_read_program_layout() -> TestResult {
-        let p = match build_edid_read(PinPair::DdiB, 128) {
+        let p = match build_edid_read(PinPair::Pin2Bxt, 128) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("clean inputs rejected"),
         };
-        if p.gmbus0 & 0x7 != PinPair::DdiB.encode() {
-            return TestResult::Fail("pin pair not in GMBUS0[2:0]");
+        // reg0 = pin | GMBUS_RATE_100KHZ (intel_gmbus.c gmbus setup).
+        if p.gmbus0 != GMBUS0_RATE_100KHZ | 2 {
+            return TestResult::Fail("GMBUS0 must be GMBUS_RATE_100KHZ | pin");
         }
         if p.gmbus1 & GMBUS1_DIR_READ == 0 {
             return TestResult::Fail("read direction not set");
@@ -846,7 +1146,7 @@ pub mod tests {
     );
 
     fn smoke_edid_read_rejects_oversize() -> TestResult {
-        match build_edid_read(PinPair::DdiB, 600) {
+        match build_edid_read(PinPair::Pin2Bxt, 600) {
             Err(GmbusError::TooManyBytes) => TestResult::Pass,
             _ => TestResult::Fail("oversize byte count must be rejected"),
         }
@@ -977,10 +1277,15 @@ pub mod tests {
         segment: usize,
         scdc: [u8; 256],
         scdc_present: bool,
+        answer_pin: Option<u32>,
         wedge: bool,
         stall: bool,
         writes: Vec<(u64, u32)>,
         gmbus3_reads: usize,
+        /// The running program selected `CYCLE_WAIT`: its completion
+        /// enters the wait phase. Without it the controller releases the
+        /// bus and `HW_WAIT_PHASE` never rises.
+        wait_cycle: bool,
     }
 
     impl FakeState {
@@ -1000,10 +1305,12 @@ pub mod tests {
                 segment: 0,
                 scdc: [0u8; 256],
                 scdc_present: true,
+                answer_pin: None,
                 wedge: false,
                 stall: false,
                 writes: Vec::new(),
                 gmbus3_reads: 0,
+                wait_cycle: false,
             }
         }
 
@@ -1042,9 +1349,12 @@ pub mod tests {
                     }
                 }
                 SCDC_ADDR => {
-                    if self.sink.len() >= 2 {
+                    // Only the programmed byte count reaches the slave;
+                    // the rest of the last GMBUS3 dword is padding.
+                    let n = self.sink_expected.min(self.sink.len());
+                    if n >= 2 {
                         let base = self.sink[0] as usize;
-                        for (i, v) in self.sink[1..].iter().enumerate() {
+                        for (i, v) in self.sink[1..n].iter().enumerate() {
                             self.scdc[(base + i) & 0xFF] = *v;
                         }
                     }
@@ -1053,7 +1363,15 @@ pub mod tests {
             }
             self.sink.clear();
             self.sink_expected = 0;
-            self.phase = Phase::Wait;
+            self.phase = self.after_data();
+        }
+
+        fn after_data(&self) -> Phase {
+            if self.wait_cycle {
+                Phase::Wait
+            } else {
+                Phase::Idle
+            }
         }
 
         fn on_gmbus1(&mut self, val: u32) {
@@ -1067,23 +1385,29 @@ pub mod tests {
             if val & GMBUS1_SW_RDY == 0 {
                 return;
             }
-            let cycle = val & (0b111 << 25);
             let count = ((val >> 16) & 0x1FF) as usize;
-            if cycle == GMBUS1_CYCLE_STOP && count == 0 {
+            if val & GMBUS1_CYCLE_STOP != 0 && count == 0 {
                 if self.phase == Phase::Wait {
                     self.phase = Phase::Idle;
                 }
+                // E-DDC: the segment pointer only reaches the read that
+                // follows it within one transfer; a STOP resets it.
+                self.segment = 0;
                 return;
             }
+            let indexed = val & GMBUS1_CYCLE_INDEX != 0;
+            self.wait_cycle = val & GMBUS1_CYCLE_WAIT != 0;
             // A data program.
             let addr = ((val >> 1) & 0x7F) as u8;
             let read = val & GMBUS1_DIR_READ != 0;
-            let present = match addr {
-                DDC_SLAVE_EDID => self.edid_present,
-                DDC_SLAVE_SEGMENT => true,
-                SCDC_ADDR => self.scdc_present,
-                _ => false,
-            };
+            let wired = self.answer_pin.is_none_or(|pin| self.gmbus0 & 0x3F == pin);
+            let present = wired
+                && match addr {
+                    DDC_SLAVE_EDID => self.edid_present,
+                    DDC_SLAVE_SEGMENT => true,
+                    SCDC_ADDR => self.scdc_present,
+                    _ => false,
+                };
             if !present {
                 self.sink.clear();
                 self.phase = Phase::Nak;
@@ -1108,14 +1432,14 @@ pub mod tests {
                         if self.gmbus5 & GMBUS5_2BYTE_INDEX_EN != 0 {
                             (((self.gmbus5 >> 8) & 0xFF) as usize) * 256
                                 + (self.gmbus5 & 0xFF) as usize
-                        } else if cycle == GMBUS1_CYCLE_INDEX {
+                        } else if indexed {
                             self.segment * 256 + index_byte
                         } else {
                             self.segment * 256
                         }
                     }
                     _ => {
-                        if cycle == GMBUS1_CYCLE_INDEX {
+                        if indexed {
                             index_byte
                         } else {
                             0
@@ -1165,7 +1489,7 @@ pub mod tests {
             }
             self.serve_pos += 4;
             if self.serve_pos >= self.serve.len() && self.phase == Phase::Data {
-                self.phase = Phase::Wait;
+                self.phase = self.after_data();
             }
             dword
         }
@@ -1211,16 +1535,56 @@ pub mod tests {
         state: RefCell<FakeState>,
     }
 
+    impl Default for FakeGmbus {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl FakeGmbus {
-        fn new() -> Self {
+        /// The default device image: EDID and SCDC slaves present.
+        pub fn new() -> Self {
             Self {
                 state: RefCell::new(FakeState::new()),
             }
         }
-        fn writes(&self) -> Vec<(u64, u32)> {
+        /// A bus whose EDID slave serves `edid` (zero-padded to 512).
+        pub fn with_edid(edid: &[u8]) -> Self {
+            let fake = Self::new();
+            {
+                let mut st = fake.state.borrow_mut();
+                st.edid = [0u8; 512];
+                let n = edid.len().min(512);
+                st.edid[..n].copy_from_slice(&edid[..n]);
+            }
+            fake
+        }
+        /// A bus with no slave behind any pin (every address NAKs).
+        pub fn absent() -> Self {
+            let fake = Self::new();
+            fake.set_edid_present(false);
+            fake.set_scdc_present(false);
+            fake
+        }
+        /// Only answer on this GMBUS0 pin number (the bits below
+        /// `GMBUS_BYTE_CNT_OVERRIDE`); any other pin NAKs.
+        pub fn set_pin(&self, pin: u32) {
+            self.state.borrow_mut().answer_pin = Some(pin);
+        }
+        /// Whether the SCDC slave (0x54) answers.
+        pub fn set_scdc_present(&self, present: bool) {
+            self.state.borrow_mut().scdc_present = present;
+        }
+        /// Preload one SCDC register.
+        pub fn set_scdc(&self, reg: u8, value: u8) {
+            self.state.borrow_mut().scdc[reg as usize] = value;
+        }
+        /// Every recorded GMBUS register write.
+        pub fn writes(&self) -> Vec<(u64, u32)> {
             self.state.borrow().writes.clone()
         }
-        fn writes_to(&self, off: u64) -> Vec<u32> {
+        /// Recorded writes to one GMBUS register.
+        pub fn writes_to(&self, off: u64) -> Vec<u32> {
             self.state
                 .borrow()
                 .writes
@@ -1232,10 +1596,12 @@ pub mod tests {
         fn gmbus3_reads(&self) -> usize {
             self.state.borrow().gmbus3_reads
         }
-        fn scdc_at(&self, reg: u8) -> u8 {
+        /// One SCDC register's current value.
+        pub fn scdc_at(&self, reg: u8) -> u8 {
             self.state.borrow().scdc[reg as usize]
         }
-        fn set_edid_present(&self, present: bool) {
+        /// Whether the EDID slave (0x50) answers.
+        pub fn set_edid_present(&self, present: bool) {
             self.state.borrow_mut().edid_present = present;
         }
         fn set_wedge(&self, wedge: bool) {
@@ -1311,7 +1677,7 @@ pub mod tests {
 
     fn smoke_transport_edid_base_block_read() -> TestResult {
         let fake = FakeGmbus::new();
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 128];
         if bus.read_edid(&mut out).is_err() {
             return TestResult::Fail("base EDID read must succeed against the fake sink");
@@ -1329,9 +1695,11 @@ pub mod tests {
             return TestResult::Fail("128 bytes must drain as exactly 32 GMBUS3 reads");
         }
         // The complete register conversation, pinned:
-        // select (100 kHz | DDI B) → program → STOP cycle → park.
+        // select (100 kHz | GMBUS_PIN_2_BXT) → program → STOP cycle →
+        // park. (The select used to be pinned as 3, DDI B's number before
+        // the GMBUS_PIN_* correction.)
         let expected: [(u64, u32); 4] = [
-            (GMBUS0, 3),
+            (GMBUS0, 2),
             (GMBUS1, 0x4280_00A1),
             (GMBUS1, 0x4800_0000),
             (GMBUS0, 0),
@@ -1347,51 +1715,72 @@ pub mod tests {
     );
 
     fn smoke_transport_segment_and_index_reads() -> TestResult {
-        // The masking-defeating case: a multi-block EDID read
-        // where the segment pointer and the byte index must
-        // compose — a transport that drops either lands on the
-        // wrong block and the distinct block bytes expose it.
+        // E-DDC (drm_do_probe_ddc_edid): the segment pointer, the offset
+        // and the read are ONE i2c_transfer, so do_gmbus_xfer chains them
+        // with wait phases (repeated STARTs) and a single trailing STOP.
+        // The fake resets the segment pointer on STOP, so a transport
+        // that stops after the segment write lands on segment 0.
         let fake = FakeGmbus::new();
         let image = test_edid_image();
-        // E-DDC segment pointer: block group 256..511 is
-        // segment 1 (VESA E-EDID §"Segment Pointer").
-        if gmbus_write(&fake, PinPair::DdiB, DDC_SLAVE_SEGMENT, &[1]).is_err() {
+        if gmbus_write(&fake, PinPair::Pin2Bxt, DDC_SLAVE_SEGMENT, &[1]).is_err() {
             return TestResult::Fail("segment pointer write must succeed");
         }
-        let seg_writes: [(u64, u32); 5] = [
-            (GMBUS0, 3),
-            (GMBUS3, 0x0000_0001), // preload precedes the program
+        let mut stale = [0u8; 128];
+        if gmbus_read(&fake, PinPair::Pin2Bxt, DDC_SLAVE_EDID, 0, &mut stale).is_err()
+            || stale != image[0..128]
+        {
+            return TestResult::Fail("a STOP between segment and read must reset the segment");
+        }
+        let fake = FakeGmbus::new();
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
+        let mut block2 = [0u8; 128];
+        if bus.read_edid_block(2, &mut block2).is_err() || block2 != image[256..384] {
+            return TestResult::Fail("block 2 must come from segment 1 + offset 0");
+        }
+        // The pinned conversation: select, segment write (preload, WAIT
+        // program), offset+read as one INDEX|WAIT program, STOP, park.
+        let expected: [(u64, u32); 6] = [
+            (GMBUS0, 2),
+            (GMBUS3, 0x0000_0001),
             (GMBUS1, 0x4201_0060),
+            (GMBUS1, 0x4680_00A1),
             (GMBUS1, 0x4800_0000),
             (GMBUS0, 0),
         ];
-        if fake.writes() != seg_writes {
-            return TestResult::Fail("segment write conversation differs from the pinned sequence");
+        if fake.writes() != expected {
+            return TestResult::Fail("E-DDC conversation differs from do_gmbus_xfer");
         }
-        // Block 2 (image bytes 256..384): segment 1, index 0.
-        let mut block2 = [0u8; 128];
-        if gmbus_read(&fake, PinPair::DdiB, DDC_SLAVE_EDID, 0, &mut block2).is_err() {
-            return TestResult::Fail("block 2 read must succeed");
-        }
-        if block2 != image[256..384] {
-            return TestResult::Fail("block 2 must come from segment 1 + index 0");
-        }
-        // Block 3 (image bytes 384..512): segment persists,
-        // index 128.
+        // Block 3: segment 1, offset 128 (block * 128 truncated to a byte).
         let mut block3 = [0u8; 128];
-        if gmbus_read(&fake, PinPair::DdiB, DDC_SLAVE_EDID, 128, &mut block3).is_err() {
-            return TestResult::Fail("block 3 read must succeed");
+        if bus.read_edid_block(3, &mut block3).is_err() || block3 != image[384..512] {
+            return TestResult::Fail("block 3 must come from segment 1 + offset 128");
         }
-        if block3 != image[384..512] {
-            return TestResult::Fail("block 3 must come from segment 1 + index 128");
+        if !fake.writes_to(GMBUS1).contains(&0x4680_80A1) {
+            return TestResult::Fail("block 3 must index offset 128 in GMBUS1[15:8]");
         }
-        // The index rode the GMBUS1 programs as CYCLE_INDEX
-        // with the byte at [15:8] — and GMBUS5 was never
-        // touched (a 1-byte index does not belong there).
-        let programs = fake.writes_to(GMBUS1);
-        if !programs.contains(&0x4480_00A1) || !programs.contains(&0x4480_80A1) {
-            return TestResult::Fail("indexed reads must program CYCLE_INDEX + index byte");
+        // Blocks 0/1 send no segment write ("avoid sending the segment
+        // addr to not upset non-compliant DDC monitors").
+        let fake = FakeGmbus::new();
+        let mut block1 = [0u8; 128];
+        if GmbusBus::new(&fake, PinPair::Pin2Bxt)
+            .read_edid_block(1, &mut block1)
+            .is_err()
+            || block1 != image[128..256]
+            || fake
+                .writes_to(GMBUS1)
+                .iter()
+                .any(|p| (p >> 1) & 0x7F == 0x30)
+        {
+            return TestResult::Fail("blocks 0/1 must not write the segment pointer");
         }
+        // The whole EDID: base block announces one extension.
+        let fake = FakeGmbus::new();
+        let mut edid = [0u8; EDID_MAX_BYTES];
+        match read_edid_eddc(&fake, PinPair::Pin2Bxt, &mut edid) {
+            Ok(256) if edid[..256] == image[..256] => {}
+            _ => return TestResult::Fail("read_edid_eddc must read base + announced extension"),
+        }
+        // 1-byte indices never touch GMBUS5.
         if !fake.writes_to(GMBUS5).is_empty() {
             return TestResult::Fail("1-byte indexed reads must not write GMBUS5");
         }
@@ -1402,9 +1791,44 @@ pub mod tests {
         smoke_transport_segment_and_index_reads
     );
 
+    fn smoke_transport_eddc_four_blocks_survive_stop_reset() -> TestResult {
+        // A 4-block EDID image: the base announces three extensions; the
+        // last two need the segment pointer across a repeated START.
+        let mut image = test_edid_image();
+        image[126] = 3;
+        fix_checksum(&mut image[0..128]);
+        let fake = FakeGmbus::with_edid(&image);
+        let mut edid = [0u8; EDID_MAX_BYTES];
+        match read_edid_eddc(&fake, PinPair::Pin2Bxt, &mut edid) {
+            Ok(512) if edid == image => {}
+            _ => return TestResult::Fail("all four EDID blocks must arrive verbatim"),
+        }
+        // Every segment-pointer program is followed by the EDID program
+        // with no STOP in between.
+        let programs = fake.writes_to(GMBUS1);
+        let mut segment_writes = 0;
+        for (i, p) in programs.iter().enumerate() {
+            if (p >> 1) & 0x7F == u32::from(DDC_SLAVE_SEGMENT) {
+                segment_writes += 1;
+                match programs.get(i + 1) {
+                    Some(next) if next & GMBUS1_CYCLE_STOP == 0 && (next >> 1) & 0x7F == 0x50 => {}
+                    _ => return TestResult::Fail("segment write must chain into the read"),
+                }
+            }
+        }
+        if segment_writes != 2 {
+            return TestResult::Fail("blocks 2 and 3 each write the segment pointer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gmbus",
+        smoke_transport_eddc_four_blocks_survive_stop_reset
+    );
+
     fn smoke_transport_two_byte_index_uses_gmbus5() -> TestResult {
         let fake = FakeGmbus::new();
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let image = test_edid_image();
         let mut out = [0u8; 64];
         if bus
@@ -1418,14 +1842,15 @@ pub mod tests {
         }
         // GMBUS5 carries EN + the index before the program;
         // the program itself is a plain CYCLE_WAIT (no
-        // CYCLE_INDEX); GMBUS5 is cleared after the transfer.
+        // CYCLE_INDEX); gmbus_index_xfer clears GMBUS5 right
+        // after the data phase, before the STOP.
         let expected: [(u64, u32); 6] = [
-            (GMBUS0, 3),
+            (GMBUS0, 2),
             (GMBUS5, 0x8000_0180),
             (GMBUS1, 0x4240_00A1),
+            (GMBUS5, 0),
             (GMBUS1, 0x4800_0000),
             (GMBUS0, 0),
-            (GMBUS5, 0),
         ];
         if fake.writes() != expected {
             return TestResult::Fail("2-byte index conversation differs from the pinned sequence");
@@ -1440,7 +1865,7 @@ pub mod tests {
     fn smoke_transport_nak_refusal_and_recovery() -> TestResult {
         let fake = FakeGmbus::new();
         fake.set_edid_present(false);
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 128];
         match bus.read_edid(&mut out) {
             Err(GmbusError::SlaveNack) => {}
@@ -1448,9 +1873,16 @@ pub mod tests {
         }
         // The recovery conversation, pinned: program, then —
         // after the idle wait — the SW_CLR_INT toggle, then
-        // park. No STOP cycle is issued on the error path.
-        let expected: [(u64, u32); 5] = [
-            (GMBUS0, 3),
+        // park; do_gmbus_xfer retries a NAK on the first
+        // message once from the bus select. No STOP cycle is
+        // issued on the error path.
+        let expected: [(u64, u32); 10] = [
+            (GMBUS0, 2),
+            (GMBUS1, 0x4280_00A1),
+            (GMBUS1, GMBUS1_SW_CLR_INT),
+            (GMBUS1, 0),
+            (GMBUS0, 0),
+            (GMBUS0, 2),
             (GMBUS1, 0x4280_00A1),
             (GMBUS1, GMBUS1_SW_CLR_INT),
             (GMBUS1, 0),
@@ -1474,7 +1906,7 @@ pub mod tests {
     fn smoke_transport_bus_timeout() -> TestResult {
         let fake = FakeGmbus::new();
         fake.set_wedge(true);
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 16];
         match bus.read(DDC_SLAVE_EDID, &mut out) {
             Err(GmbusError::Timeout) => {}
@@ -1496,7 +1928,7 @@ pub mod tests {
     fn smoke_transport_stall_timeout() -> TestResult {
         let fake = FakeGmbus::new();
         fake.set_stall(true);
-        let bus = GmbusBus::new(&fake, PinPair::DdiB);
+        let bus = GmbusBus::new(&fake, PinPair::Pin2Bxt);
         let mut out = [0u8; 16];
         match bus.read(DDC_SLAVE_EDID, &mut out) {
             Err(GmbusError::HardwareTimeout) => {}
@@ -1514,7 +1946,7 @@ pub mod tests {
         // 0x20 TMDS_CONFIG — the drm_scdc_helper map the HDMI
         // session consumes): write [0x20, 0x03], read back.
         let fake = FakeGmbus::new();
-        if gmbus_write(&fake, PinPair::DdiB, SCDC_ADDR, &[0x20, 0x03]).is_err() {
+        if gmbus_write(&fake, PinPair::Pin2Bxt, SCDC_ADDR, &[0x20, 0x03]).is_err() {
             return TestResult::Fail("SCDC register write must succeed");
         }
         if fake.scdc_at(0x20) != 0x03 {
@@ -1530,21 +1962,38 @@ pub mod tests {
             _ => return TestResult::Fail("write preload must precede the GMBUS1 program"),
         }
         let mut out = [0u8; 1];
-        if gmbus_read(&fake, PinPair::DdiB, SCDC_ADDR, 0x20, &mut out).is_err() {
+        if gmbus_read(&fake, PinPair::Pin2Bxt, SCDC_ADDR, 0x20, &mut out).is_err() {
             return TestResult::Fail("SCDC register read must succeed");
         }
         if out != [0x03] {
             return TestResult::Fail("SCDC readback must return the written value");
         }
-        if !fake.writes_to(GMBUS1).contains(&0x4401_20A9) {
-            return TestResult::Fail("SCDC read must program CYCLE_INDEX with index 0x20");
+        if !fake.writes_to(GMBUS1).contains(&0x4601_20A9) {
+            return TestResult::Fail("SCDC read must program CYCLE_INDEX | CYCLE_WAIT, index 0x20");
+        }
+        // Without CYCLE_WAIT the controller never enters the wait phase:
+        // a hand-composed INDEX-only program stalls the completion wait.
+        let fake = FakeGmbus::new();
+        fake.write32(GMBUS0, 2);
+        fake.write32(
+            GMBUS1,
+            GMBUS1_SW_RDY
+                | GMBUS1_CYCLE_INDEX
+                | gmbus1_index_byte(0x20)
+                | gmbus1_byte_count(1)
+                | gmbus1_slave_addr(SCDC_ADDR)
+                | GMBUS1_DIR_READ,
+        );
+        let _ = fake.read32(GMBUS3);
+        if fake.read32(GMBUS2) & GMBUS2_HW_WAIT_PHASE != 0 {
+            return TestResult::Fail("an INDEX-only program has no wait phase");
         }
         // A multi-chunk write (6 bytes = a preloaded dword plus
         // a waited dword) lands its payload across consecutive
         // SCDC registers.
         if gmbus_write(
             &fake,
-            PinPair::DdiB,
+            PinPair::Pin2Bxt,
             SCDC_ADDR,
             &[0x20, 0x03, 0xAA, 0xBB, 0xCC, 0xDD],
         )
@@ -1568,47 +2017,196 @@ pub mod tests {
     );
 
     fn smoke_transport_pin_pair_selection() -> TestResult {
-        // DDI A..F map to pin pairs 2..7 (PRM Vol. 12 pin-pair
-        // table); DDI G/H have no GMBUS pair.
-        let table = [
-            (Ddi::A, PinPair::DdiA),
-            (Ddi::B, PinPair::DdiB),
-            (Ddi::C, PinPair::DdiC),
-            (Ddi::D, PinPair::DdiD),
-            (Ddi::E, PinPair::DdiE),
-            (Ddi::F, PinPair::DdiF),
+        // Corrected against Linux b90c984d intel_hdmi.c
+        // intel_hdmi_default_ddc_pin (was DDI A..F = 2..7):
+        // icl_encoder_to_ddc_pin on TGL/ADL-P/ADL-N (combo A/B =
+        // GMBUS_PIN_1_BXT + port, TC = GMBUS_PIN_9_TC1_ICP + tc),
+        // adls_encoder_to_ddc_pin on ADL-S (A = 1, TC1..4 = 9..12).
+        use Gen12Platform::{AlderLakeN, AlderLakeP, AlderLakeS, TigerLake};
+        let ddis = [
+            Ddi::A,
+            Ddi::B,
+            Ddi::C,
+            Ddi::D,
+            Ddi::E,
+            Ddi::F,
+            Ddi::G,
+            Ddi::H,
         ];
-        for (ddi, pair) in table {
-            if pin_pair_for(ddi) != Some(pair) {
-                return TestResult::Fail("DDI → pin pair mapping wrong");
+        let rows: [(Gen12Platform, [Option<u32>; 8]); 4] = [
+            (
+                TigerLake,
+                [
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    Some(13),
+                ],
+            ),
+            (
+                AlderLakeP,
+                [
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    None,
+                ],
+            ),
+            (
+                AlderLakeN,
+                [
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    None,
+                ],
+            ),
+            (
+                AlderLakeS,
+                [
+                    Some(1),
+                    None,
+                    None,
+                    Some(9),
+                    Some(10),
+                    Some(11),
+                    Some(12),
+                    None,
+                ],
+            ),
+        ];
+        for (family, want) in rows {
+            for (ddi, pin) in ddis.iter().zip(want) {
+                let got = gen12_ddc_pin(family, *ddi);
+                if got.map(PinPair::encode) != pin {
+                    return TestResult::Fail("Gen12 DDI -> DDC pin differs from Linux");
+                }
+                // Every resolved pin exists in gmbus_pins_icp.
+                if got.is_some_and(|p| !GmbusPinTable::Icp.is_valid(p)) {
+                    return TestResult::Fail("Gen12 DDC pin must be valid in gmbus_pins_icp");
+                }
             }
         }
-        if pin_pair_for(Ddi::G).is_some() || pin_pair_for(Ddi::H).is_some() {
-            return TestResult::Fail("DDI G/H must have no GMBUS pin pair");
-        }
-        // The select write carries rate | pair: DDI E at the
-        // default rate is 6; DDI C at 400 kHz is 0x204.
+        // The select write carries rate | pin: TC4 (12) at the
+        // default rate is 0x0C; DDI B ("dpb", 2) at 400 kHz is 0x202.
         let fake = FakeGmbus::new();
-        let bus = GmbusBus::new(&fake, PinPair::DdiE);
+        fake.set_pin(12);
+        let bus = GmbusBus::new(&fake, PinPair::Pin12Tc4);
         let mut out = [0u8; 4];
         if bus.read(DDC_SLAVE_EDID, &mut out).is_err() {
-            return TestResult::Fail("DDI E read must succeed");
+            return TestResult::Fail("TC4 DDC read must succeed on pin 12");
         }
-        if fake.writes().first() != Some(&(GMBUS0, 6)) {
-            return TestResult::Fail("select write must be rate | DdiE (6)");
+        if fake.writes().first() != Some(&(GMBUS0, 0x0C)) {
+            return TestResult::Fail("select write must be rate | GMBUS_PIN_12_TC4_ICP");
         }
         let fake2 = FakeGmbus::new();
-        let bus2 = GmbusBus::with_rate(&fake2, PinPair::DdiC, GMBUS0_RATE_400KHZ);
+        fake2.set_pin(2);
+        let bus2 = GmbusBus::with_rate(&fake2, PinPair::Pin2Bxt, GMBUS0_RATE_400KHZ);
         if bus2.read(DDC_SLAVE_EDID, &mut out).is_err() {
-            return TestResult::Fail("DDI C read must succeed");
+            return TestResult::Fail("DDI B DDC read must succeed on pin 2");
         }
-        if fake2.writes().first() != Some(&(GMBUS0, 0x204)) {
-            return TestResult::Fail("select write must be 400 kHz | DdiC (0x204)");
+        if fake2.writes().first() != Some(&(GMBUS0, 0x202)) {
+            return TestResult::Fail("select write must be 400 kHz | GMBUS_PIN_2_BXT");
+        }
+        // The old encoding (DDI B = 3) drives "dpc": nothing answers.
+        let fake3 = FakeGmbus::new();
+        fake3.set_pin(2);
+        if GmbusBus::new(&fake3, PinPair::Pin3Bxt).read(DDC_SLAVE_EDID, &mut out)
+            != Err(GmbusError::SlaveNack)
+        {
+            return TestResult::Fail("a sink wired to dpb must not answer on dpc");
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gmbus",
         smoke_transport_pin_pair_selection
+    );
+
+    fn smoke_gmbus_pin_tables_match_linux() -> TestResult {
+        // intel_gmbus.c b90c984d gmbus_pins_icp/dg1/dg2/mtp.
+        let all = [0u32, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14];
+        let tables: [(GmbusPinTable, &[(u32, &str)]); 4] = [
+            (
+                GmbusPinTable::Icp,
+                &[
+                    (1, "dpa"),
+                    (2, "dpb"),
+                    (3, "dpc"),
+                    (9, "tc1"),
+                    (10, "tc2"),
+                    (11, "tc3"),
+                    (12, "tc4"),
+                    (13, "tc5"),
+                    (14, "tc6"),
+                ],
+            ),
+            (
+                GmbusPinTable::Dg1,
+                &[(1, "dpa"), (2, "dpb"), (3, "dpc"), (4, "dpd")],
+            ),
+            (
+                GmbusPinTable::Dg2,
+                &[(1, "dpa"), (2, "dpb"), (3, "dpc"), (4, "dpd"), (9, "tc1")],
+            ),
+            (
+                GmbusPinTable::Mtp,
+                &[
+                    (1, "dpa"),
+                    (2, "dpb"),
+                    (3, "dpc"),
+                    (4, "dpd"),
+                    (5, "dpe"),
+                    (9, "tc1"),
+                    (10, "tc2"),
+                    (11, "tc3"),
+                    (12, "tc4"),
+                ],
+            ),
+        ];
+        for (table, named) in tables {
+            for v in all {
+                let pin = match PinPair::try_from(v) {
+                    Ok(pin) if pin.encode() == v => pin,
+                    _ => return TestResult::Fail("GMBUS_PIN_* values must round-trip"),
+                };
+                let want = named.iter().find(|(n, _)| *n == v).map(|(_, name)| *name);
+                if table.name(pin) != want || table.is_valid(pin) != want.is_some() {
+                    return TestResult::Fail("pin table differs from intel_gmbus.c");
+                }
+            }
+        }
+        // get_gmbus_pin table selection by display generation.
+        use crate::intel_gpu::Generation;
+        if GmbusPinTable::for_generation(Generation::TigerLake) != GmbusPinTable::Icp
+            || GmbusPinTable::for_generation(Generation::AlderLake) != GmbusPinTable::Icp
+            || GmbusPinTable::for_generation(Generation::MeteorLake) != GmbusPinTable::Mtp
+            || GmbusPinTable::for_generation(Generation::LunarLake) != GmbusPinTable::Mtp
+        {
+            return TestResult::Fail("table selection must follow get_gmbus_pin");
+        }
+        if PinPair::type_c(0) != Some(PinPair::Pin9Tc1)
+            || PinPair::type_c(5) != Some(PinPair::Pin14Tc6)
+            || PinPair::type_c(6).is_some()
+        {
+            return TestResult::Fail("Type-C pin must be GMBUS_PIN_9_TC1_ICP + tc");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gmbus",
+        smoke_gmbus_pin_tables_match_linux
     );
 }

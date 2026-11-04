@@ -16,12 +16,24 @@ use core::{
 use narf_filesystem::{FsError, FsFuture};
 use narf_lib::sync::IrqSafeSpinLock;
 
+mod vm_dump {
+    include!("intel_gpu_vm_dump_hw_tests.rs");
+}
+mod guc_capture {
+    include!("intel_gpu_guc_capture_hw_tests.rs");
+}
+
 fn prime(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
     hardware_discovery(gt, w, ack);
     hardware_scheduling(gt, w);
-    let fence = gt.begin_context_defaults(26).unwrap();
+    let origin = if w.0.borrow().profile.is_some_and(GtPlatform::is_gen12) {
+        10_000_000
+    } else {
+        0
+    };
+    let fence = gt.begin_context_defaults(origin + 26).unwrap();
     let mut registered = BTreeMap::new();
-    for now in 27..95 {
+    for now in origin + 27..origin + 95 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
         service_contexts(w, &mut registered, true);
         if fence.result().is_some() {
@@ -241,9 +253,9 @@ impl UserBackend for Mailbox {
     }
 }
 impl Mailbox {
-    fn accept(
+    fn accept<M: MmioWindow, A: BootAllocator>(
         &self,
-        gt: &mut GuCGt<Window, Arena>,
+        gt: &mut GuCGt<M, A>,
         now: u64,
     ) -> (Arc<UserContext>, Arc<CompletionFence>) {
         let pending = self
@@ -351,14 +363,16 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
     assert!(info.submission_ready());
     let file = RenderFile::new();
     let user = User::new();
-    for (param, value) in [(8, 1), (11, 0)] {
+    // ctx_setparam on the finalized default context: RECOVERABLE is stored;
+    // clearing PERSISTENCE needs I915_SCHEDULER_CAP_PREEMPTION (-ENODEV).
+    for (param, value, expected) in [(8, 1, Ok(0)), (11, 0, Err(FsError::NoDevice))] {
         let mut request = [0; 24];
         put64(&mut request, 8, param);
         put64(&mut request, 16, value);
         user.store(64, &request);
         assert_eq!(
             file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
-            Some(Err(FsError::NotImplemented))
+            Some(expected)
         );
     }
     // Live engine/version discovery uses Linux's exact sizes and field order.
@@ -410,7 +424,8 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
     let handles = buffers(&file, &info, &user);
     exec(&user, handles, 0);
     let mut cx = Context::from_waker(Waker::noop());
-    // Secure dispatch is rejected before the backend sees any work.
+    // Secure dispatch is rejected before the backend sees any work:
+    // i915_gem_do_execbuffer's -ENODEV for GRAPHICS_VER >= 11.
     let mut hostile = user.load(64, 64);
     let flags = u64_at(&hostile, 40);
     put64(&mut hostile, 40, flags | (1 << 9));
@@ -419,7 +434,7 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
         let mut call = core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2, 64, &user));
         assert_eq!(
             call.as_mut().poll(&mut cx),
-            Poll::Ready(Some(Err(FsError::InvalidData)))
+            Poll::Ready(Some(Err(FsError::NoDevice)))
         );
         assert!(backend.pending.lock().is_empty());
     }
@@ -436,12 +451,13 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
         fence.result().is_none(),
         "ioctl acceptance is not GPU completion"
     );
+    // ctx_setparam refuses VM on the finalized default context, busy or not.
     let mut rebind = [0; 24];
     put64(&mut rebind, 8, 9);
     user.store(64, &rebind);
     assert_eq!(
         file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
-        Some(Err(FsError::Busy))
+        Some(Err(FsError::InvalidData))
     );
     exec(&user, handles, 0);
     // A second submission on the same context waits before backend publication;

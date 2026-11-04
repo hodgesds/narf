@@ -301,6 +301,7 @@ pub(crate) fn mount_error_errno(error: FsError) -> i64 {
         // A writable mount of a write-protected device: libmount retries
         // read-only ("source write-protected, mounted read-only").
         FsError::ReadOnly => EROFS,
+        FsError::ArgumentListTooLong => E2BIG,
         _ => EINVAL,
     }
 }

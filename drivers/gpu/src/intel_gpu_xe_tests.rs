@@ -90,10 +90,15 @@ impl IoctlContext for Cpu {
 struct Native {
     mailbox: Arc<Mailbox>,
     facts: crate::intel_gpu_user::DeviceFacts,
+    /// A published standalone media GT (native Xe gt_id 1), if any.
+    media: Option<crate::intel_gpu_user::MediaGtStatus>,
 }
 impl UserBackend for Native {
     fn status(&self) -> Option<UserStatus> {
         self.mailbox.status()
+    }
+    fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
+        self.media
     }
     fn native_xe(&self) -> bool {
         true
@@ -130,10 +135,18 @@ impl UserBackend for Native {
         self.mailbox.submit(context, batch)
     }
 }
-fn setup(
-    gt: &mut GuCGt<Window, Arena>,
+fn setup<M: MmioWindow, A: BootAllocator>(
+    gt: &mut GuCGt<M, A>,
     w: &Window,
     platform: GtPlatform,
+) -> (Arc<Mailbox>, DeviceInfo) {
+    setup_media(gt, w, platform, None)
+}
+fn setup_media<M: MmioWindow, A: BootAllocator>(
+    gt: &mut GuCGt<M, A>,
+    w: &Window,
+    platform: GtPlatform,
+    media: Option<crate::intel_gpu_user::MediaGtStatus>,
 ) -> (Arc<Mailbox>, DeviceInfo) {
     w.0.borrow_mut().regs.insert(0xd00, 0x1e); // 25MHz crystal, timestamp /1
     let facts = gt.device_facts().unwrap();
@@ -149,7 +162,13 @@ fn setup(
     });
     let info = DeviceInfo {
         device_id: match platform {
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake) => 0x9a49,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP) => 0x46a6,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS) => 0x4680,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,
             GtPlatform::Battlemage => 0xe20b,
+            _ if platform.is_ptl() => 0xb080,
+            _ if platform.is_lnl() => 0x6420,
             GtPlatform::Alchemist => 0x56a0,
             _ => 0x7d55,
         },
@@ -165,6 +184,7 @@ fn setup(
         backend: Some(Arc::new(Native {
             mailbox: mailbox.clone(),
             facts,
+            media,
         })),
     };
     assert!(info.native_xe());
@@ -356,7 +376,8 @@ fn buffers(file: &RenderFile, info: &DeviceInfo, user: &Cpu, vm: u32) -> [u32; 2
     file.gem.object(code).unwrap().write(4096, &bytes).unwrap();
     *user.mapping.lock() = Some(file.gem.object(data).unwrap().backing(0, 4096).unwrap());
     let pat = match info.platform {
-        GtPlatform::Alchemist => 0,
+        GtPlatform::Alchemist | GtPlatform::Gen12(_) => 0,
+        _ if info.platform.is_headless_integrated() => 2,
         GtPlatform::Battlemage => 2,
         _ => 3,
     };
@@ -382,8 +403,8 @@ fn finish(
     finish_policy(gt, w, fence, registered, start, 2);
 }
 
-fn finish_policy(
-    gt: &mut GuCGt<Window, Arena>,
+fn finish_policy<M: MmioWindow, A: BootAllocator>(
+    gt: &mut GuCGt<M, A>,
     w: &Window,
     fence: &CompletionFence,
     registered: &mut BTreeMap<u32, u32>,
@@ -392,8 +413,8 @@ fn finish_policy(
 ) {
     for now in start..start + 60 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
-        // Native queues request normal2; trusted probes and direct contexts
-        // use low3. Keep the exact caller-selected policy and KLV checks.
+        // Native queues retain their selected high1/normal2/low3 policy;
+        // trusted probes use low3. Keep the literal policy and KLV checks.
         {
             let memory = ct_memory(w);
             let words = memory.borrow();
@@ -432,6 +453,22 @@ fn ready<F: Future + ?Sized>(mut future: core::pin::Pin<&mut F>) -> F::Output {
 fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
     // RENDER, then COPY: the same PPGTT batch and user fence on BCS0.
     for (platform, ack, class, logical) in [
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake),
+            0x130044,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP),
+            0x130044,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS),
+            0x130044,
+        ),
+        (
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN),
+            0x130044,
+        ),
         (GtPlatform::Battlemage, 0xdfc),
         (GtPlatform::Alchemist, 0x130044),
         (
@@ -461,6 +498,21 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         let (mailbox, info) = setup(&mut gt, &w, platform);
         let file = RenderFile::new();
         let user = Cpu::new();
+        if platform.is_gen12() && !platform.has_hwconfig() {
+            let mut query = [0; 40];
+            put32(&mut query, 8, 4);
+            put64(&mut query, 16, u64::MAX);
+            user.wire.store(64, &query);
+            assert_eq!(invoke(&file, &info, &user, xe::DEVICE_QUERY), Ok(0));
+            assert_eq!(u32_at(&user.wire.load(64, 40), 12), 0);
+            put32(&mut query, 12, 4);
+            user.wire.store(64, &query);
+            assert_eq!(
+                invoke(&file, &info, &user, xe::DEVICE_QUERY),
+                Err(FsError::InvalidData)
+            );
+        }
+        let origin = if platform.is_gen12() { 20_000_000 } else { 0 };
         let vm = create_vm(&file, &info, &user);
         // VIDEO_DECODE, VIDEO_ENHANCE, unknown classes, and COMPUTE when
         // CCS0 is fused off are not admitted engines.
@@ -496,7 +548,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
-        let (_, fence) = mailbox.accept(&mut gt, 100);
+        let (_, fence) = mailbox.accept(&mut gt, origin + 100);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Some(Ok(0)))
@@ -521,7 +573,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
         assert!(objects.iter().all(|object| object.upgrade().is_some()));
         let mut registered = BTreeMap::new();
-        for now in 101..120 {
+        for now in origin + 101..origin + 120 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
             service_contexts(&w, &mut registered, true);
             if user.read_u64_acquire(0x4090).unwrap() == value {
@@ -559,7 +611,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
             )),
             Some(Ok(0))
         );
-        finish(&mut gt, &w, &fence, &mut registered, 120);
+        finish(&mut gt, &w, &fence, &mut registered, origin + 120);
         assert!(registered.is_empty());
         assert!(payload.is_signalled());
         assert!(objects[0].upgrade().is_none());
@@ -787,7 +839,7 @@ fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
         ],
         [bytes as u64, 0, bytes as u64]
     );
-    assert_eq!(u64_at(&xe_query(&file, &info, &user, 2), 16), 9);
+    assert_eq!(u64_at(&xe_query(&file, &info, &user, 2), 16), 11);
     let gt_list = xe_query(&file, &info, &user, 3);
     assert_eq!((u64_at(&gt_list, 24), u64_at(&gt_list, 32)), (2, 1));
     // xe_gem_create_ioctl EINVAL classes.
@@ -1263,7 +1315,10 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
     );
     assert_eq!(user.wire.load(4096, 2), b"xe");
     assert_eq!(u64_at(&user.wire.load(64, 64), 16), 2);
-    for (query, size) in [(0, 104), (1, 96), (2, 48), (3, 104), (5, 34)] {
+    // GT_TOPOLOGY: geometry and compute (header8 + mask4 each), GT0's L3 bank
+    // entry (header8 + mask8, always reported for a primary GT), then EU per
+    // DSS (header8 + mask2).
+    for (query, size) in [(0, 104), (1, 96), (2, 48), (3, 104), (5, 50)] {
         let mut wire = [0; 40];
         put32(&mut wire, 8, query);
         put64(&mut wire, 16, u64::MAX);
@@ -1303,8 +1358,15 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             }
             2 => {
                 assert_eq!(u64_at(&reply, 8) & 65535, 0xe20b);
-                assert_eq!(u64_at(&reply, 16), 8);
-                assert_eq!(u64_at(&reply, 40), 1);
+                assert_eq!(u64_at(&reply, 16), 10);
+                assert_eq!(
+                    u64_at(&reply, 40),
+                    if narf_filesystem::caller_capable(23) {
+                        2
+                    } else {
+                        1
+                    }
+                );
             }
             3 => {
                 assert_eq!(u32_at(&reply, 20), 25_000_000);
@@ -1314,7 +1376,13 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             _ => {
                 assert_eq!(&reply[..4], &[0, 0, 1, 0]);
                 assert_eq!(u32_at(&reply, 4), 4);
-                assert_eq!(&reply[24..28], &[0, 0, 5, 0]);
+                // load_l3_bank_mask's Xe2 branch: the model's MIRROR_FUSE3
+                // (1) enables no XE2_NODE_ENABLE_MASK node, so the mask is
+                // empty, and query_gt_topology still reports it.
+                assert_eq!(&reply[24..28], &[0, 0, 3, 0]);
+                assert_eq!(u32_at(&reply, 28), 8);
+                assert_eq!(&reply[32..40], &[0; 8]);
+                assert_eq!(&reply[40..44], &[0, 0, 5, 0]);
             }
         }
     }
@@ -1452,10 +1520,658 @@ mod timestamps {
 mod waits {
     include!("intel_gpu_xe_wait_tests.rs");
 }
+mod pxp {
+    include!("intel_gpu_xe_pxp_tests.rs");
+}
 
 mod multi_ccs {
     include!("intel_gpu_multi_ccs_tests.rs");
 }
 mod dg2_vram {
     include!("intel_gpu_dg2_vram_tests.rs");
+}
+
+// Read the actual pending host CT without consuming ENABLE or inventing its ACK.
+// Preparatory invalidate/register/policy messages may still be serviced below.
+fn pending_native_enable(
+    w: &Window,
+    registered: &BTreeMap<u32, u32>,
+    engine: crate::intel_gpu_engine::Engine,
+) -> bool {
+    let memory = ct_memory(w);
+    let words = memory.borrow();
+    let mut head = words[0];
+    let tail = words[1];
+    let mut enabled = None;
+    while head != tail {
+        let count = words[1024 + head as usize] & 255;
+        assert_ne!(count, 0);
+        if words[1024 + ((head + 1) & 1023) as usize] as u16 == 0x1001 {
+            assert_eq!(count, 3);
+            assert_eq!(words[1024 + ((head + 3) & 1023) as usize], 1);
+            let id = words[1024 + ((head + 2) & 1023) as usize];
+            assert!(enabled.replace(id).is_none());
+        }
+        head = (head + count + 1) & 1023;
+    }
+    let Some(id) = enabled else {
+        return false;
+    };
+    assert_eq!(registered.len(), 1);
+    let base = registered[&id];
+    let d = w.0.borrow();
+    assert!(d.synced.contains(&base));
+    let image = d.memory[&base].borrow();
+    assert_eq!(image[1024 + 2], engine.base() + 0x244);
+    assert_ne!(image[1024 + 0x33], 0); // retained private VM root
+    assert_eq!(image[1024 + 5], 0); // no native head advance yet
+    assert_eq!(image[0x800 / 4], 0); // no device breadcrumb yet
+    true
+}
+
+fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -> TestResult {
+    use crate::intel_gpu_engine::Engine;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
+    for device in [0x6420, 0x64a0, 0x64b0] {
+        let (w, arena, mut gt) = hardware_model_with_identity(platform, 0xdfc, 1, Some(device));
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling_reload_mode(&mut gt, &w, 4);
+        hardware_enable_ct(&mut gt, &w);
+        let defaults = gt.begin_context_defaults(26).unwrap();
+        let mut registered = BTreeMap::new();
+        for now in 27..500 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            if defaults.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(defaults.result(), Some(Ok(())));
+        assert_eq!(
+            gt.engines().unwrap().iter().collect::<Vec<_>>(),
+            [
+                Engine::Rcs0,
+                Engine::Bcs0,
+                Engine::Bcs8,
+                Engine::Ccs0,
+                Engine::Ccs1,
+                Engine::Ccs2,
+                Engine::Ccs3
+            ]
+        );
+        assert!(gt.vram_layout().is_none());
+        {
+            let d = w.0.borrow();
+            for (reg, value) in [
+                (0x4804, 0xe),
+                (0x4808, 0xf),
+                (0x480c, 0x3c),
+                (0x4810, 0x32),
+                (0x4814, 0x3e),
+                (0x481c, 0x33),
+            ] {
+                assert_eq!(d.regs[&reg], value);
+            }
+            for index in 0..16 {
+                assert_eq!(
+                    d.regs[&(0x4000 + index * 4)],
+                    *[0xc, 0x10c, 0x130, 0x13c, 0x100]
+                        .get(index as usize)
+                        .unwrap_or(&0x100)
+                );
+            }
+            assert_eq!(d.regs[&0xc188], 0x00400000);
+            assert_eq!(
+                (d.regs[&0xc340] & 0xffffc000) + (d.regs[&0xc050] & 0xfffff000),
+                0x1f7000
+            ); //2MiB minus source reserve
+            let ads = d.memory[&0x20001000].borrow();
+            assert_eq!(
+                &ads[0x3000 / 4..0x3000 / 4 + 6],
+                &[0x90050000, 0x90070000, 0x90080001, 0xc40, 0x90090000, 0x900b0000]
+            );
+            assert_eq!(d.regs[&0xe48c] & 0x200, 0x200);
+            assert_eq!(d.regs[&0xe4c4] & 0x1840, 0x840);
+            assert_eq!(d.regs[&0x24d0], 0x23fc);
+            for reg in [0x220c4, 0x3ee0c4, 0x1a0c4, 0x1c0c4, 0x1e0c4, 0x260c4] {
+                assert_eq!(d.regs[&reg], 0x306);
+            }
+        }
+        for engine in gt.engines().unwrap().iter() {
+            assert_eq!(
+                ads_registers(&w, engine).len(),
+                if engine == Engine::Rcs0 { 28 } else { 18 }
+            );
+        }
+
+        let (mailbox, mut info) = setup(&mut gt, &w, platform);
+        info.device_id = device;
+        let file = RenderFile::new();
+        let user = Cpu::new();
+        let vm = create_vm(&file, &info, &user);
+        let handles = buffers(&file, &info, &user, vm);
+        let data = file.gem.object(handles[1]).unwrap();
+        for (index, engine) in gt.engines().unwrap().iter().enumerate() {
+            let logical = gt.engines().unwrap().logical_instance(engine).unwrap();
+            let queue = create_queue_instance(&file, &info, &user, vm, engine.xe_class(), logical);
+            data.write(0x80, &[0; 4]).unwrap();
+            exec_wire(&user, queue, true, &[]);
+            let mut call = Box::pin(file.dispatch_user(&info, xe::EXEC, 64, &user));
+            assert!(call
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            let start = 1_000_000 + index as u64 * 1000;
+            let (context, fence) = mailbox.accept(&mut gt, start);
+            assert_eq!(context.engine(), engine);
+            // Dropping the syscall waiter cannot abandon the accepted VM.
+            drop(call);
+            let owned = arena.live_allocations();
+            for now in start + 1..start + 10 {
+                assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+                // Withhold ENABLE and its ACK until finish executes the GPU.
+                if !pending_native_enable(&w, &registered, engine) {
+                    service_contexts(&w, &mut registered, false);
+                }
+            }
+            assert!(pending_native_enable(&w, &registered, engine));
+            assert!(context.busy());
+            assert!(fence.result().is_none());
+            assert!(arena.live_allocations() >= owned);
+            finish(&mut gt, &w, &fence, &mut registered, start + 10);
+            let mut value = [0; 4];
+            data.read(0x80, &mut value).unwrap();
+            assert_eq!(u32::from_le_bytes(value), 0x4e415246);
+            assert_eq!(
+                close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+                Ok(0)
+            );
+        }
+        // LNL exposes only programmed noncompressed coherent policies.
+        for pat in [0, 3, 6, 8, 15, 16, 31] {
+            assert!(!crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
+        }
+        for pat in [1, 2, 4, 5, 7] {
+            assert!(crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
+        }
+        hardware_stop(&mut gt, &w, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe",
+    smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion
+);
+
+fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -> TestResult {
+    use crate::intel_gpu_engine::Engine;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
+    for device in [
+        0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
+        0xb0b0,
+    ] {
+        for (release, step) in [(0u32, 0u32), (0, 4), (1, 0)] {
+            let (w, arena, mut gt) = hardware_model_with_identity(platform, 0xdfc, 1, Some(device));
+            {
+                let mut d = w.0.borrow_mut();
+                d.regs.extend([
+                    (0xd8c, 30 << 22 | release << 14 | step),
+                    (0x913c, 0),
+                    (0x9150, 0),
+                    (0x9154, 0x80000000),
+                    (0x9144, 0),
+                    (0x9148, 0x80000000),
+                    (0x914c, 0),
+                    (0x380d8c, 30 << 22 | step),
+                    // XE2_NODE_ENABLE_MASK nodes 0-1 over the harness's
+                    // MEML3 nibble; MIRROR_L3BANK_ENABLE without bank 1.
+                    (0x9118, 0x0003_0001),
+                    (0x9130, 0xfd),
+                ]);
+            }
+            hardware_discovery(&mut gt, &w, 0xdfc);
+            hardware_scheduling_reload_mode(&mut gt, &w, 4);
+            hardware_enable_ct(&mut gt, &w);
+            let defaults = gt.begin_context_defaults(26).unwrap();
+            let mut registered = BTreeMap::new();
+            for now in 27..500 {
+                assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+                service_contexts(&w, &mut registered, true);
+                if defaults.result().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(defaults.result(), Some(Ok(())));
+            assert_eq!(
+                gt.engines().unwrap().iter().collect::<Vec<_>>(),
+                [
+                    Engine::Rcs0,
+                    Engine::Bcs0,
+                    Engine::Bcs8,
+                    Engine::Ccs0,
+                    Engine::Ccs1,
+                    Engine::Ccs2,
+                    Engine::Ccs3
+                ]
+            );
+            assert!(gt.vram_layout().is_none());
+            {
+                let d = w.0.borrow();
+                for (reg, value) in [
+                    (0x4804, 0xe),
+                    (0x4808, 0xf),
+                    (0x480c, 0x3c),
+                    (0x4810, 0x32),
+                    (0x4814, 0x3e),
+                    (0x481c, 0x33),
+                ] {
+                    assert_eq!(d.regs[&reg], value);
+                }
+                for index in 0..16 {
+                    assert_eq!(
+                        d.regs[&(0x4000 + index * 4)],
+                        *[0xc, 0x10c, 0x130, 0x13c, 0x100]
+                            .get(index as usize)
+                            .unwrap_or(&0x100)
+                    );
+                }
+                assert_eq!(d.regs[&0xc188], 0x00400000);
+                assert_eq!(
+                    (d.regs[&0xc340] & 0xffffc000) + (d.regs[&0xc050] & 0xfffff000),
+                    0x1f7000
+                ); //2MiB minus source reserve
+                let ads = d.memory[&0x20001000].borrow();
+                let expected_klvs: &[u32] = if release == 0 && step < 4 {
+                    &[0x900a0000, 0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                } else {
+                    &[0x90080001, 0xc40, 0x90090000, 0x900b0000]
+                };
+                assert_eq!(
+                    &ads[0x3000 / 4..0x3000 / 4 + expected_klvs.len()],
+                    expected_klvs
+                );
+                assert_eq!(
+                    d.regs.get(&0xe48c).copied().unwrap_or(0) & 0x200,
+                    if release == 0 && step < 4 { 0x200 } else { 0 }
+                );
+                assert_eq!(d.regs[&0xe4c4] & 0x1840, 0x40);
+                assert_eq!(
+                    d.regs[&0xe5f4] & 0x1020,
+                    if release == 0 { 0x1020 } else { 0x1000 }
+                );
+                assert_eq!(d.regs[&0xc50c] & 2, 2);
+                assert_eq!(
+                    d.regs.get(&0x9454).copied().unwrap_or(0) & 0x10,
+                    if release == 0 && step < 4 { 0x10 } else { 0 }
+                );
+                assert_eq!(
+                    (
+                        d.regs[&0x24d0],
+                        d.regs[&0x24d4],
+                        d.regs[&0x24d8],
+                        d.regs[&0x24dc],
+                        d.regs[&0x24e0]
+                    ),
+                    (0x6210, 0x62a8, 0x1000dafc, 0x1000db01, 0xdb1c)
+                );
+                assert_eq!(d.regs[&0x20d4] & 0xc080, 0x80);
+                assert!(!d.regs.contains_key(&0xb154)); // no LNL-only RW flush tuning
+                for reg in [0x220c4, 0x3ee0c4, 0x1a0c4, 0x1c0c4, 0x1e0c4, 0x260c4] {
+                    assert_eq!(d.regs[&reg], 0x306);
+                }
+            }
+            for engine in gt.engines().unwrap().iter() {
+                assert_eq!(
+                    ads_registers(&w, engine).len(),
+                    if engine == Engine::Rcs0 {
+                        if release == 0 && step < 4 {
+                            27
+                        } else {
+                            25
+                        }
+                    } else {
+                        18
+                    }
+                );
+            }
+
+            let (mailbox, mut info) = setup(&mut gt, &w, platform);
+            info.device_id = device;
+            assert_eq!(info.topology.as_ref().unwrap().geometry_dss(), 1u128 << 95);
+            assert_eq!(info.topology.as_ref().unwrap().compute_dss(), 1u128 << 63);
+            let query_file = RenderFile::new();
+            let query_user = Cpu::new();
+            let config = xe_query(&query_file, &info, &query_user, 2);
+            assert_eq!(u64_at(&config, 16), 2); // low latency only; no VRAM/USM/compression
+            for flags in [2, 8] {
+                assert_eq!(
+                    create_placed(&query_file, &info, &query_user, 4096, 1, flags, 1),
+                    Err(FsError::InvalidData)
+                );
+            }
+            assert_eq!(
+                create_placed(&query_file, &info, &query_user, 4096, 2, 0, 1),
+                Err(FsError::InvalidData)
+            );
+            let topo = xe_query(&query_file, &info, &query_user, 5);
+            // Independent Xe topology records: header8+mask12 twice, the
+            // L3 bank header8+mask8, then EU header8+mask2. The L3 entry is
+            // new: query_gt_topology always reports the primary GT's.
+            assert_eq!(topo.len(), 66);
+            assert_eq!(
+                (&topo[..8], &topo[8..20]),
+                (
+                    &[0, 0, 1, 0, 12, 0, 0, 0][..],
+                    &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80][..]
+                )
+            );
+            assert_eq!(
+                (&topo[20..28], &topo[28..40]),
+                (
+                    &[0, 0, 2, 0, 12, 0, 0, 0][..],
+                    &[0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0][..]
+                )
+            );
+            // load_l3_bank_mask's Xe3 branch: banks 0xfd on nodes 0 and 1.
+            assert_eq!(
+                &topo[40..],
+                &[
+                    0, 0, 3, 0, 8, 0, 0, 0, 0xfd, 0, 0, 0, 0xfd, 0, 0, 0, // L3_BANK
+                    0, 0, 5, 0, 2, 0, 0, 0, 5, 0, // SIMD16_EU_PER_DSS
+                ][..]
+            );
+            let file = RenderFile::new();
+            let user = Cpu::new();
+            let vm = create_vm(&file, &info, &user);
+            let handles = buffers(&file, &info, &user, vm);
+            let data = file.gem.object(handles[1]).unwrap();
+            for (index, engine) in gt.engines().unwrap().iter().enumerate() {
+                let logical = gt.engines().unwrap().logical_instance(engine).unwrap();
+                let queue =
+                    create_queue_instance(&file, &info, &user, vm, engine.xe_class(), logical);
+                data.write(0x80, &[0; 4]).unwrap();
+                exec_wire(&user, queue, true, &[]);
+                let mut call = Box::pin(file.dispatch_user(&info, xe::EXEC, 64, &user));
+                assert!(call
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+                let start = 1_000_000 + index as u64 * 1000;
+                let (context, fence) = mailbox.accept(&mut gt, start);
+                assert_eq!(context.engine(), engine);
+                // Dropping the syscall waiter cannot abandon the accepted VM.
+                drop(call);
+                let owned = arena.live_allocations();
+                for now in start + 1..start + 10 {
+                    assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+                    // Withhold ENABLE and its ACK until finish executes the GPU.
+                    if !pending_native_enable(&w, &registered, engine) {
+                        service_contexts(&w, &mut registered, false);
+                    }
+                }
+                assert!(pending_native_enable(&w, &registered, engine));
+                assert!(context.busy());
+                assert!(fence.result().is_none());
+                assert!(arena.live_allocations() >= owned);
+                finish(&mut gt, &w, &fence, &mut registered, start + 10);
+                let mut value = [0; 4];
+                data.read(0x80, &mut value).unwrap();
+                assert_eq!(u32::from_le_bytes(value), 0x4e415246);
+                assert_eq!(
+                    close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+                    Ok(0)
+                );
+            }
+            // LNL exposes only programmed noncompressed coherent policies.
+            for pat in [0, 3, 6, 8, 15, 16, 31] {
+                assert!(!crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
+            }
+            for pat in [1, 2, 4, 5, 7] {
+                assert!(crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
+            }
+            hardware_stop(&mut gt, &w, 0xdfc);
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe",
+    smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion
+);
+
+/// Negative publication: without `narf.intel.media_gt=1` (or before its
+/// engines executed) the backend publishes no media GT. The GT list and
+/// engine query stay GT0-only, and every media or gt_id 1 placement refuses
+/// with EINVAL before any queue, context or GGTT allocation (Linux
+/// xe_device_get_gt/xe_hw_engine_lookup find no GT or engine for it).
+fn smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation() -> TestResult {
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (_, info) = setup(&mut gt, &w, platform);
+    assert_eq!(info.backend.as_ref().unwrap().media_gt(), None);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let gts = xe_query(&file, &info, &user, 3);
+    assert_eq!(gts.len(), 8 + 96);
+    assert_eq!(u32_at(&gts, 0), 1, "only GT0 is published");
+    assert_eq!(&gts[8..14], &[0u8; 6], "type MAIN, tile 0, gt_id 0");
+    let engines = xe_query(&file, &info, &user, 0);
+    let count = u32_at(&engines, 0) as usize;
+    assert_eq!(engines.len(), 8 + count * 32);
+    for entry in engines[8..].chunks_exact(32) {
+        let class = u16::from_le_bytes([entry[0], entry[1]]);
+        assert!(!matches!(class, 2 | 3), "no VCS/VECS engine is published");
+        assert_eq!(&entry[4..6], &[0, 0], "every engine is on GT0");
+    }
+    let vm = create_vm(&file, &info, &user);
+    let before = arena.live_allocations();
+    for (class, gt_id) in [(2u8, 1u8), (3, 1), (2, 0), (3, 0), (0, 1), (1, 1), (4, 1), (5, 1)] {
+        user.wire.store(512, &[class, 0, 0, 0, gt_id, 0, 0, 0]);
+        let mut queue = [0; 48];
+        put32(&mut queue, 8, 0x00010001);
+        put32(&mut queue, 12, vm);
+        put64(&mut queue, 24, 512);
+        user.wire.store(64, &queue);
+        assert_eq!(
+            invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
+            Err(FsError::InvalidData)
+        );
+        assert_eq!(u32_at(&user.wire.load(64, 48), 20), 0, "no queue id");
+    }
+    assert_eq!(arena.live_allocations(), before);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation
+);
+
+/// Positive publication: once the media GuC scheduled GT1 and every engine
+/// retired its private PPGTT job, native Xe reports a media GT (type MEDIA,
+/// gt_id 1) with its own clock and GMD_ID, lists VCS/VECS with gt_id 1 and
+/// dense GT1 logical instances after GT0's engines, and an exec queue on
+/// gt_id 1 runs a real GuC submission in GT1's epoch. Unknown GT, wrong-GT
+/// class, absent instance, mixed GT, width and VM refusals keep Linux's
+/// xe_exec_queue_create_ioctl errnos and order, before any allocation.
+fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
+    use super::super::media_gt_sched::{media_until, start_media, Hw};
+    use crate::intel_gpu_engine::{Engine, EngineSet};
+    use crate::intel_gpu_gt::media::MediaGucState;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    // GT1 on its own media GuC model: VCS0, VCS2 and VECS0 fused in.
+    let (mw, marena) = media_model();
+    let mut guc = start_media(&mw, &marena);
+    let mut hw = Hw::default();
+    let (mut now, polled) = media_until(&mut guc, &mw, &mut hw, 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+    let publication = guc.publication().unwrap();
+    let status = crate::intel_gpu_user::MediaGtStatus {
+        epoch: publication.epoch,
+        engines: publication.engines,
+        gmd: publication.gmd,
+        reference_clock: publication.reference_clock,
+        topology: publication.topology,
+    };
+    assert_eq!(
+        status.engines,
+        EngineSet::of(&[Engine::Vcs0, Engine::Vcs2, Engine::Vecs0])
+    );
+    let (mailbox, info) = setup_media(&mut gt, &w, platform, Some(status));
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    // query_gt_list: GT0 MAIN, then GT1 MEDIA with its clock and IP 13.00.
+    let gts = xe_query(&file, &info, &user, 3);
+    assert_eq!(gts.len(), 8 + 2 * 96);
+    assert_eq!(u32_at(&gts, 0), 2);
+    assert_eq!(&gts[8..14], &[0u8; 6], "type MAIN, tile 0, gt_id 0");
+    assert_eq!(&gts[104..110], &[1, 0, 0, 0, 1, 0], "type MEDIA, tile 0, gt_id 1");
+    assert_eq!(u32_at(&gts, 116), 19_200_000);
+    assert_eq!(u64_at(&gts, 120), 1, "near: system memory");
+    assert_eq!(u64_at(&gts, 128), 0, "far: none on the iGPU");
+    assert_eq!(&gts[136..142], &[13, 0, 0, 0, 2, 0], "GMD_ID 13.00 revid 2");
+    // query_engines: GT0 engines on gt_id 0, then VCS/VECS on gt_id 1.
+    let engines = xe_query(&file, &info, &user, 0);
+    let count = u32_at(&engines, 0) as usize;
+    let gt0 = gt.engines().unwrap().iter().count();
+    assert_eq!(count, gt0 + 3);
+    for entry in engines[8..8 + gt0 * 32].chunks_exact(32) {
+        assert!(!matches!(entry[0], 2 | 3));
+        assert_eq!(&entry[4..6], &[0, 0]);
+    }
+    let media: Vec<_> = engines[8 + gt0 * 32..]
+        .chunks_exact(32)
+        .map(|entry| (entry[0], entry[2], entry[4]))
+        .collect();
+    assert_eq!(media, [(2, 0, 1), (2, 1, 1), (3, 0, 1)]);
+    let vm = create_vm(&file, &info, &user);
+    let before = (arena.live_allocations(), marena.live_allocations());
+    let try_queue = |instances: &[[u8; 8]], width: u32, vm: u32| {
+        user.wire.store(512, &instances.concat());
+        let mut queue = [0; 48];
+        put32(&mut queue, 8, width | (instances.len() as u32 / width) << 16);
+        put32(&mut queue, 12, vm);
+        put64(&mut queue, 24, 512);
+        user.wire.store(64, &queue);
+        let result = invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE);
+        (result, u32_at(&user.wire.load(64, 48), 20))
+    };
+    let eci = |class: u8, instance: u8, gt_id: u8| [class, 0, instance, 0, gt_id, 0, 0, 0];
+    for (instances, width, vm, errno) in [
+        (alloc::vec![eci(2, 0, 0)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(3, 0, 0)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(0, 0, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(1, 0, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(4, 0, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(2, 2, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(3, 1, 1)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(2, 0, 2)], 1, vm, FsError::InvalidData),
+        (alloc::vec![eci(5, 0, 2)], 1, vm, FsError::InvalidData),
+        (
+            alloc::vec![eci(2, 0, 1), eci(2, 1, 0)],
+            1,
+            vm,
+            FsError::InvalidData,
+        ),
+        (
+            alloc::vec![eci(2, 0, 1), eci(3, 0, 1)],
+            1,
+            vm,
+            FsError::InvalidData,
+        ),
+        (
+            alloc::vec![eci(2, 0, 1), eci(2, 1, 1)],
+            2,
+            vm,
+            FsError::InvalidData,
+        ),
+        // Unknown GT precedes the VM lookup; a valid GT1 engine reaches it.
+        (alloc::vec![eci(2, 0, 2)], 1, 999, FsError::InvalidData),
+        (alloc::vec![eci(2, 0, 1)], 1, 999, FsError::NotFound),
+    ] {
+        assert_eq!(try_queue(&instances, width, vm), (Err(errno), 0));
+    }
+    assert_eq!(
+        (arena.live_allocations(), marena.live_allocations()),
+        before
+    );
+    // A VM_BIND queue may name the published GT1, as in Linux.
+    let (bind, bind_id) = try_queue(&[eci(5, 0, 1)], 1, vm);
+    assert_eq!(bind, Ok(0));
+    assert_ne!(bind_id, 0);
+    // VCS logical 1 on GT1 is physical VCS2; it runs a real media GuC job.
+    let (result, queue) = try_queue(&[eci(2, 1, 1)], 1, vm);
+    assert_eq!(result, Ok(0));
+    assert_ne!(queue, 0);
+    let _buffers = buffers(&file, &info, &user, vm);
+    exec_wire(&user, queue, true, &[]);
+    let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+    assert!(call
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let pending = mailbox
+        .pending
+        .lock()
+        .pop()
+        .expect("userspace queued a media job");
+    assert_eq!(pending.context.engine(), Engine::Vcs2);
+    now += 1_000_000;
+    let (_, fence) = guc
+        .submit_user(now, pending.context.clone(), pending.batch, None)
+        .unwrap();
+    *pending.reply.result.lock() = Some(Ok(fence.clone()));
+    if let Some(waker) = pending.reply.waker.lock().take() {
+        waker.wake();
+    }
+    assert_eq!(
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Some(Ok(0)))
+    );
+    let (now, _) = media_until(&mut guc, &mw, &mut hw, now + 1, |_| {
+        fence.result().is_some()
+    });
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert!(hw_ran_on(&hw, 0x1d0000));
+    assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+    assert_eq!(pending.context.check_epoch(status.epoch), Ok(()));
+    user.mapping.lock().take();
+    for id in [queue, bind_id] {
+        assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, id), Ok(0));
+    }
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    guc.begin_stop(now + 1);
+    let (_, polled) = media_until(&mut guc, &mw, &mut hw, now + 2, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Stopped)));
+    drop(guc);
+    assert_eq!(marena.live_allocations(), 0);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_xe_mtl_media_gt1_published_queries_queues_and_exec
+);
+
+fn hw_ran_on(hw: &super::super::media_gt_sched::Hw, base: u32) -> bool {
+    hw.ppgtt_engines().contains(&base)
+}
+
+mod gen12_media {
+    include!("intel_gpu_gen12_media_ioctl_tests.rs");
+}
+
+mod bmg_smallbar {
+    include!("intel_gpu_bmg_smallbar_tests.rs");
 }

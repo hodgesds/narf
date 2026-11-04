@@ -18,12 +18,24 @@ use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, Xe
 use crate::intel_gpu_hwconfig::HardwareConfig;
 use crate::intel_gpu_nonpriv::EnginePolicy;
 use crate::intel_gpu_rcs::GpuBacking;
+use crate::intel_gpu_slpc::SlpcState;
 use crate::intel_gpu_topology::{GtTopology, TopologyError};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::task::Poll;
 
-fn observation_awake(io: &impl MmioWindow) -> bool {
+fn observation_awake(
+    io: &impl MmioWindow,
+    platform: GtPlatform,
+    hardware: Option<&HardwareInit>,
+) -> bool {
+    // The LNL sampler shares the existing GT owner and its held media proof.
+    // Recheck that proof before every MCR read/write and DMA copy. The window
+    // separately invokes current PF/PCI/BAR/D0 authority for each raw access,
+    // including the mandatory four root dummy writes before every MMIO read.
+    if platform.is_lnl() && !hardware.is_some_and(|hw| hw.ready() && hw.awake(io).is_ok()) {
+        return false;
+    }
     [0xa188, 0xdfc, 0xa278, 0xd84].into_iter().all(|reg| {
         let value = io.read32(reg);
         value != u32::MAX && value & 1 != 0
@@ -54,6 +66,12 @@ pub enum GtState {
     Releasing,
     Stopped,
     Lost,
+    /// Execution DMA is retired; host-L2/wake handoff still needs proof.
+    StoppingMert,
+    /// GuC stopped; drain all present Gen12 command streamers before reset.
+    StoppingGen12Cs,
+    /// Full reset/DMA idle proven; retain graph until media wake ACK release.
+    ReleasingGen12Media,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -79,6 +97,10 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
     scheduler: Option<GuCScheduler<A>>,
     topology: Option<Arc<GtTopology>>,
     eu_stall: Option<crate::intel_gpu_eu_stall::Collector<A>>,
+    oa: Option<crate::intel_gpu_oa::Unit<A>>,
+    mert: Option<crate::intel_gpu_slpc::mert::Mert>,
+    /// Opt-in GuC error capture (`narf.intel.devcoredump=1`).
+    capture: Option<crate::intel_gpu_error::capture::State>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -92,12 +114,32 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     released: bool,
     hardware: Option<HardwareInit>,
     registers: Option<RegisterInit>,
+    engine_policy: Option<EnginePolicy>,
     compute_configuration: Option<(u8, u8)>,
     /// Battlemage tile-0 local memory, probed under register steering. A
     /// malformed layout leaves VRAM unpublished, never guessed.
     vram: Option<crate::intel_gpu_vram::VramLayout>,
     log_stream: Option<crate::intel_gpu_guc_log::stream::Actor>,
     log_fence: u16,
+    mert_required: bool,
+    smallbar_grant: Option<Arc<crate::intel_gpu_gt::smallbar::DpaGrant>>,
+    smallbar_busy_deadline: Option<u64>,
+    gen12_reset: Option<crate::intel_gpu_gt::gen12::reset::Reset>,
+    /// Standalone media GT: VDBOX/VEBOX forcewake domains (media_gt domain
+    /// bits) whose kernel wake the enclosing media owner holds while engines
+    /// are programmed and scheduled. Every wake proof also checks them.
+    media_wells: u16,
+    /// Standalone media GT power management started (`begin_media_power`):
+    /// the next reset first returns RC6 and powergating to the host.
+    media_power: bool,
+    /// Standalone media GT with `narf.intel.gsc=1`: the stop's GRDOM_FULL is
+    /// bracketed by Wa_14015076503 while GSC firmware reports loaded
+    /// (xe_gt.c::do_gt_reset), so scheduling is admitted beside it.
+    gsc_reset_wa: bool,
+    /// HECI_H_GS1 ER_PREP was set and is still owed its clear.
+    gsc_prepared: bool,
+    /// GRDOM_FULL waits for the GSC's reset preparation until this time.
+    gsc_prepare_until: Option<u64>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -130,14 +172,112 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         firmware: &GuCFirmware,
         config: BootConfig,
     ) -> Result<Self, GtError> {
-        if firmware.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage
-            && config.uncached_mocs != Some(3)
-        {
+        if firmware.platform().is_headless_integrated() && !allocator.lnl_takeover_ready() {
+            return Err(GtError::Boot(BootError::State));
+        }
+        if firmware.platform().is_xe2() && config.uncached_mocs != Some(3) {
             return Err(GtError::Boot(BootError::Device));
         }
         Self::from_staged_hardware(
             GuCBoot::stage(mmio, allocator, firmware, config).map_err(GtError::Boot)?,
         )
+    }
+
+    pub(crate) fn stage_hardware_with_huc(
+        mmio: M,
+        allocator: A,
+        firmware: &GuCFirmware,
+        huc: &crate::intel_gpu_huc::Firmware,
+        config: BootConfig,
+    ) -> Result<Self, GtError> {
+        Self::from_staged_hardware(
+            GuCBoot::stage_with_huc(mmio, allocator, firmware, huc, config)
+                .map_err(GtError::Boot)?,
+        )
+    }
+
+    /// Finish HuC through the existing single scheduler/CT owner before public
+    /// epoch admission. Optional PC failure never pretends HuC is available.
+    /// `MediaGuc` reaches this only after GT1's SLPC is Running (a failed
+    /// media xe_guc_pc_start stops GT1 instead), so the media HuC
+    /// authenticates at once, after the default LRCs, as xe_uc_load_hw does.
+    pub(crate) fn prepare_huc(&mut self, now: u64) -> Result<bool, GtError> {
+        let Some(image) = self.parts.boot.huc_upload() else {
+            return Ok(true);
+        };
+        let media = matches!(
+            self.parts.boot.role(),
+            crate::intel_gpu_guc_boot::GuCRole::Media(_)
+        );
+        let loadable = self.parts.boot.huc_loadable();
+        self.admit_scheduling()?;
+        let scheduler = self.parts.scheduler.as_mut().ok_or(GtError::State)?;
+        if scheduler.huc.started() {
+            return Ok(scheduler.huc.done());
+        }
+        if !loadable || !scheduler.engines().iter().any(|engine| engine.is_decode()) {
+            scheduler.huc.invalidate();
+            return Ok(true);
+        }
+        if media {
+            scheduler.huc.begin(image, now);
+            return Ok(false);
+        }
+        match scheduler.slpc() {
+            SlpcState::Running => {
+                scheduler.huc.begin(image, now);
+                Ok(false)
+            }
+            SlpcState::Off | SlpcState::Unavailable => {
+                scheduler.huc.invalidate();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn huc_version(
+        &self,
+        epoch: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Option<(u8, u8, u8)> {
+        if !crate::intel_gpu_huc::profile(self.parts.boot.platform(), self.parts.boot.role())
+            || self.state != GtState::SchedulingReady
+            || epoch == 0
+            || self.user_epoch() != Some(epoch)
+            || !current()
+            || self.awake().is_err()
+        {
+            return None;
+        }
+        self.parts
+            .scheduler
+            .as_ref()?
+            .huc
+            .version(self.parts.boot.window())
+    }
+
+    /// The staged HuC object (GGTT address, object size), if any.
+    pub(crate) fn huc_object(&self) -> Option<(u64, u32)> {
+        self.parts.boot.huc_object()
+    }
+
+    /// xe_huc_auth(XE_HUC_AUTH_VIA_GSC) failed after the GuC authenticated
+    /// the HuC: huc->fw is LOAD_FAIL, so the HuC is no longer RUNNING and
+    /// query_uc_fw_version answers ENODEV.
+    pub(crate) fn invalidate_huc(&mut self) {
+        if let Some(scheduler) = self.parts.scheduler.as_mut() {
+            scheduler.huc.invalidate();
+        }
+    }
+
+    /// The staged HuC's terminal outcome on this owner, without MMIO:
+    /// `Some(true)` RUNNING, `Some(false)` unavailable, `None` while pending
+    /// or when no HuC is staged.
+    pub(crate) fn huc_outcome(&self) -> Option<bool> {
+        self.parts.boot.huc_upload()?;
+        let huc = &self.parts.scheduler.as_ref()?.huc;
+        huc.done().then_some(huc.running())
     }
 
     pub(crate) fn from_staged_hardware(boot: GuCBoot<M, A>) -> Result<Self, GtError> {
@@ -157,6 +297,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 scheduler: None,
                 topology: None,
                 eu_stall: None,
+                oa: None,
+                mert: None,
+                capture: None,
             }),
             state: GtState::Staged,
             deadline: 0,
@@ -164,11 +307,46 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             released: false,
             hardware: None,
             registers: None,
+            engine_policy: None,
             compute_configuration: None,
             vram: None,
             log_stream: None,
             log_fence: crate::intel_gpu_guc_log::stream::FIRST_FENCE,
+            mert_required: false,
+            smallbar_grant: None,
+            smallbar_busy_deadline: None,
+            gen12_reset: None,
+            media_wells: 0,
+            media_power: false,
+            gsc_reset_wa: false,
+            gsc_prepared: false,
+            gsc_prepare_until: None,
         }
+    }
+
+    /// `narf.intel.gsc=1` on the standalone media GT, before scheduling:
+    /// honour Wa_14015076503 around the stop's GRDOM_FULL instead of refusing
+    /// to schedule while GSC firmware reports loaded. The primary GT has no
+    /// GSC and refuses.
+    pub(crate) fn honour_gsc_reset_workaround(&mut self) -> Result<(), GtError> {
+        let crate::intel_gpu_guc_boot::GuCRole::Media(_) = self.parts.boot.role() else {
+            return Err(GtError::State);
+        };
+        if self.parts.scheduler.is_some() {
+            return Err(GtError::State);
+        }
+        self.gsc_reset_wa = true;
+        Ok(())
+    }
+
+    /// xe_gsc_wa_14015076503(gt, false), owed once ER_PREP was set.
+    fn clear_gsc_prepare(&mut self) -> Result<(), GtError> {
+        if self.gsc_prepared {
+            crate::intel_gpu_gt::media::gsc::wa_14015076503_clear(self.parts.boot.window())
+                .ok_or(GtError::Unavailable)?;
+            self.gsc_prepared = false;
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> GtState {
@@ -259,6 +437,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         firmware_digest: [u8; 32],
         mut access: impl FnMut() -> bool,
     ) {
+        // Linux samples NO_ERROR_CAPTURE at error capture. Our bundle shares
+        // global log/CT and other jobs, so skip it completely before any raw
+        // source read when a retained compatibility policy is protected.
+        if self
+            .parts
+            .scheduler
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.diagnostic_protected())
+        {
+            return;
+        }
         let log = self.parts.boot.live_log();
         let identity = log.as_ref().map(|log| crate::intel_gpu_guc_log::Identity {
             epoch: self.user_epoch().unwrap_or(0),
@@ -268,7 +457,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             firmware_version: log.firmware_version,
             firmware_digest,
         });
-        buffer.capture(
+        buffer.capture_with_text(
             report,
             identity,
             log.as_ref().map(|log| log.backing),
@@ -276,8 +465,103 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 .ct
                 .as_ref()
                 .and_then(XeLpgTransport::diagnostic_backing),
+            |destination, access| {
+                self.parts.scheduler.as_ref().map(|scheduler| {
+                    scheduler.diagnostic_backings(
+                        access,
+                        |info, parent, lane, image, ring, scratch, access| {
+                            destination.push(info, parent, lane, image, ring, scratch, access);
+                        },
+                    )
+                })
+            },
+            |destination, access| {
+                self.parts.scheduler.as_ref().map(|scheduler| {
+                    scheduler.diagnostic_vms(access, |id, stamp, batch, access| {
+                        destination.push(id, stamp, batch, access);
+                    })
+                })
+            },
+            |out, report, access| self.coredump_text(out, report, access),
             || access() && self.awake().is_ok(),
         );
+    }
+
+    /// The version-4 Xe text: header facts, the guilty queue, its batch
+    /// addresses and one engine snapshot. A GuC capture node for the queue's
+    /// class, GuC id and LRCA wins over the manual node taken at its timeout
+    /// (xe_hw_engine_snapshot_capture); the consumed node is released later.
+    fn coredump_text(
+        &self,
+        out: &mut crate::intel_gpu_error::coredump::XeText<'_>,
+        report: &crate::intel_gpu_error::Report,
+        access: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        use crate::intel_gpu_error::{capture, coredump};
+        let Some(state) = self.parts.capture.as_ref() else {
+            return false;
+        };
+        let scheduler = self.parts.scheduler.as_ref();
+        let queue = scheduler.and_then(|scheduler| scheduler.capture_queue(access));
+        let engines = self.engines().unwrap_or_default();
+        let wake_ref = u32::from(access());
+        let facts = |engine| capture::Facts {
+            engine,
+            logical: engines.logical_instance(engine).unwrap_or(0),
+            wake_ref,
+        };
+        let matched = queue.as_ref().and_then(|queue| {
+            state.pool.find_match(
+                queue.engine.guc_class(),
+                |instance| {
+                    queue
+                        .placements
+                        .iter()
+                        .any(|engine| engine.physical_instance() == instance)
+                },
+                u32::from(queue.id),
+                queue.lrca,
+            )
+        });
+        let guc = matched.and_then(|index| {
+            let node = state.pool.node(index);
+            engines
+                .iter()
+                .find(|engine| {
+                    engine.guc_class() == node.class && engine.physical_instance() == node.instance
+                })
+                .map(|engine| (facts(engine), node))
+        });
+        let manual = queue
+            .as_ref()
+            .and_then(|queue| scheduler?.manual_capture(queue.id))
+            .map(|(node, engine)| (facts(engine), node));
+        if queue.is_some() {
+            out.flags |= coredump::XE_QUEUE;
+        }
+        let engine = if guc.is_some() {
+            out.flags |= coredump::XE_GUC;
+            guc
+        } else {
+            if manual.is_some() {
+                out.flags |= coredump::XE_MANUAL;
+            }
+            manual
+        };
+        let _ = capture::print_dump(
+            out,
+            &state.device,
+            report,
+            queue.as_ref(),
+            engine,
+            &state.lists,
+            scheduler.map_or(0, GuCScheduler::capture_nospace),
+            state.pool.errors,
+        );
+        if let (Some(index), true) = (matched, guc.is_some()) {
+            state.consumed(index);
+        }
+        true
     }
 
     /// Last validated firmware table. It describes hardware capabilities, not
@@ -295,16 +579,90 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.vram
     }
 
+    pub(crate) fn smallbar_grant(
+        &mut self,
+        authority: &Arc<crate::intel_gpu_gt::smallbar::Authority>,
+    ) -> Result<Arc<crate::intel_gpu_gt::smallbar::DpaGrant>, GtError> {
+        let epoch = self.user_epoch().ok_or(GtError::State)?;
+        self.vram_access(epoch)?;
+        self.admit_scheduling()?;
+        let grant = authority
+            .derive(self.parts.boot.window(), self.vram.ok_or(GtError::State)?)
+            .map_err(Self::smallbar_access_error)?;
+        self.smallbar_grant = Some(grant.clone());
+        Ok(grant)
+    }
+
     pub(crate) fn vram_needs_ccs_clear(&self) -> bool {
         self.parts.boot.platform() == GtPlatform::Alchemist
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn vram_cpu_access(&self, epoch: u64) -> bool {
-        self.state == GtState::SchedulingReady
-            && self.parts.boot.platform() == GtPlatform::Battlemage
-            && epoch != 0
-            && self.user_epoch() == Some(epoch)
-            && self.awake().is_ok()
+        self.vram_access(epoch).is_ok()
+    }
+    fn smallbar_access_error(error: crate::intel_gpu_gt::lnl::Error) -> GtError {
+        if error == crate::intel_gpu_gt::lnl::Error::Busy {
+            GtError::Busy
+        } else {
+            GtError::Unavailable
+        }
+    }
+    fn current_region(&self) -> Result<(), GtError> {
+        if let Some(grant) = &self.smallbar_grant {
+            grant
+                .current(self.parts.boot.window())
+                .map_err(Self::smallbar_access_error)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn vram_access(&self, epoch: u64) -> Result<(), GtError> {
+        if self.state != GtState::SchedulingReady
+            || (self.mert_required
+                && !self
+                    .parts
+                    .mert
+                    .as_ref()
+                    .is_some_and(|owner| owner.sanitizing()))
+            || self.parts.boot.platform() != GtPlatform::Battlemage
+            || epoch == 0
+            || self.user_epoch() != Some(epoch)
+        {
+            return Err(GtError::State);
+        }
+        self.awake()?;
+        self.current_region()
+    }
+
+    /// Cached qualification identity for the physical recovery coordinator.
+    /// A software-only/bare GuCGt cannot qualify a physical reset service.
+    pub(crate) fn recovery_identity(
+        &self,
+    ) -> Option<(GtPlatform, crate::intel_gpu_engine::EngineSet, u64)> {
+        let platform = self.parts.boot.platform();
+        if platform.guc().is_none()
+            || !self.hardware.as_ref().is_some_and(HardwareInit::ready)
+            || !self.context_defaults_ready()
+            || self.user_epoch().is_none_or(|epoch| epoch == 0)
+            || self.submission_version().0 != 1
+        {
+            return None;
+        }
+        let engines = self
+            .engines()
+            .filter(|engines| engines.iter().next().is_some())?;
+        let incarnation = self
+            .log_incarnation()
+            .filter(|incarnation| *incarnation != 0)?;
+        Some((platform, engines, incarnation))
+    }
+
+    /// Cached identity of this exact live firmware log upload; no MMIO.
+    pub(crate) fn log_incarnation(&self) -> Option<u64> {
+        if self.state != GtState::SchedulingReady {
+            return None;
+        }
+        self.parts.boot.live_log().map(|log| log.incarnation)
     }
 
     pub(crate) fn attach_log_stream(
@@ -315,6 +673,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         digest: [u8; 32],
     ) -> Result<(), narf_filesystem::FsError> {
         use narf_filesystem::FsError;
+        let session = session.source_owner();
+        if !session.source_open() {
+            return Err(FsError::NoDevice);
+        }
         if self.state != GtState::SchedulingReady || epoch == 0 || self.user_epoch() != Some(epoch)
         {
             return Err(FsError::NoDevice);
@@ -328,6 +690,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.awake().map_err(|_| FsError::NoDevice)?;
         let log = self.parts.boot.live_log().ok_or(FsError::NoDevice)?;
+        if !session.matches_incarnation(log.incarnation) {
+            return Err(FsError::NoDevice);
+        }
         if !log.backing.coherent_for_device() {
             return Err(FsError::Unsupported);
         }
@@ -346,6 +711,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             firmware_version: log.firmware_version,
             firmware_digest: digest,
         };
+        if !crate::intel_gpu_guc_log::stream::supported(
+            identity.platform,
+            identity.firmware_version,
+        ) {
+            return Err(FsError::Unsupported);
+        }
         self.log_stream = Some(crate::intel_gpu_guc_log::stream::Actor::new(
             session,
             identity,
@@ -421,6 +792,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             return Err(FsError::Unsupported);
         }
         self.awake().map_err(|_| FsError::NoDevice)?;
+        if self.parts.boot.platform().is_lnl()
+            && (!observation_awake(
+                self.parts.boot.window(),
+                self.parts.boot.platform(),
+                self.hardware.as_ref(),
+            ) || crate::intel_gpu_gt::GraphicsIp::read(
+                self.parts.boot.window(),
+                self.parts.boot.platform(),
+            )
+            .is_err())
+        {
+            return Err(FsError::NoDevice);
+        }
         let info = crate::intel_gpu_eu_stall::Info::from_tables(
             card,
             self.parts.boot.platform(),
@@ -453,7 +837,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.admit_scheduling()
             .map_err(|_| narf_filesystem::FsError::NoDevice)?;
+        let hardware = self.hardware.as_ref();
         let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
         let collector = parts
             .eu_stall
             .as_mut()
@@ -463,7 +849,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         let window = parts.boot.window();
         collector.control(window, &session, operation == Operation::Enable, || {
-            access() && observation_awake(window)
+            access() && observation_awake(window, platform, hardware)
         })
     }
     pub(crate) fn poll_eu_stall(&mut self, now: u64, mut access: impl FnMut() -> bool) {
@@ -476,10 +862,258 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
             return;
         }
+        let hardware = self.hardware.as_ref();
         let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
         if let Some(collector) = parts.eu_stall.as_mut() {
             let window = parts.boot.window();
-            let _ = collector.poll(window, now, || access() && observation_awake(window));
+            let _ = collector.poll(window, now, || {
+                access() && observation_awake(window, platform, hardware)
+            });
+        }
+    }
+
+    /// Preallocate the OAG buffer before scheduling, as EU-stall sampling
+    /// does, and leave the unit's counters and MMIO trigger disabled.
+    pub(crate) fn prepare_oa(&mut self) -> Result<(), narf_filesystem::FsError>
+    where
+        A: Clone,
+    {
+        use narf_filesystem::FsError;
+        if self.state != GtState::Ready || self.parts.scheduler.is_some() || self.parts.oa.is_some()
+        {
+            return Err(FsError::Unsupported);
+        }
+        self.awake().map_err(|_| FsError::NoDevice)?;
+        let hardware = self.hardware.as_ref();
+        let platform = self.parts.boot.platform();
+        let window = self.parts.boot.window();
+        if !observation_awake(window, platform, hardware) {
+            return Err(FsError::NoDevice);
+        }
+        let ip = crate::intel_gpu_gt::GraphicsIp::read(window, platform)
+            .map_err(|_| FsError::NoDevice)?;
+        let unit = crate::intel_gpu_oa::Unit::new(
+            self.parts.boot.diagnostic_allocator(),
+            platform,
+            ip.version,
+            window,
+            || observation_awake(window, platform, hardware),
+        )?;
+        self.parts.oa = Some(unit);
+        Ok(())
+    }
+    /// Register the GuC error-capture lists (xe_guc_capture_init and the ADS
+    /// capture lists) before scheduling starts, on the primary GuC only. The
+    /// list object, parsed-node pool and manual node are preallocated here;
+    /// the device header facts are sampled once under the current wake.
+    pub(crate) fn prepare_error_capture(&mut self) -> Result<(), narf_filesystem::FsError> {
+        use crate::intel_gpu_error::capture::{Device, Family, Lists, State};
+        use narf_filesystem::FsError;
+        if self.state != GtState::Ready
+            || self.parts.scheduler.is_some()
+            || self.parts.capture.is_some()
+            || self.parts.boot.role() != crate::intel_gpu_guc_boot::GuCRole::Primary
+        {
+            return Err(FsError::Unsupported);
+        }
+        self.awake().map_err(|_| FsError::NoDevice)?;
+        let platform = self.parts.boot.platform();
+        let family = Family::for_platform(platform).ok_or(FsError::Unsupported)?;
+        let topology = self.topology().ok_or(FsError::NoDevice)?;
+        // xe_gt_mcr.c::dss_per_group: HWCONFIG max slices/subslices, else
+        // the typical layouts (4 from graphics 12.50, 6 before).
+        let per_group = self
+            .hwconfig()
+            .and_then(|config| {
+                let slices = config.lookup_u32(1).ok().flatten()?;
+                let dss = config.lookup_u32(70).ok().flatten()?;
+                (slices != 0 && dss != 0).then(|| dss.div_ceil(slices))
+            })
+            .unwrap_or(if platform.is_gen12() { 6 } else { 4 });
+        let lists = Arc::new(
+            Lists::new(
+                family,
+                topology.has_render(),
+                topology.geometry_dss(),
+                topology.compute_dss(),
+                per_group,
+            )
+            .map_err(|_| FsError::OutOfMemory)?,
+        );
+        let window = self.parts.boot.window();
+        let stable = |offset| {
+            let value = window.read32(offset);
+            (value != u32::MAX && value == window.read32(offset)).then_some(value)
+        };
+        // GMD_ID exists from graphics 12.70; gt->info.gmdid is 0 before it.
+        let gmd_id = if platform.is_gen12() || platform == GtPlatform::Alchemist {
+            0
+        } else {
+            stable(0xd8c).ok_or(FsError::NoDevice)?
+        };
+        let device = Device {
+            device_id: self.parts.boot.device_id(),
+            revision: self.parts.boot.revision(),
+            gmd_id,
+            reference_clock: stable(0xd00).and_then(reference_clock),
+        };
+        let state = State::new(lists.clone(), device).map_err(|_| FsError::OutOfMemory)?;
+        self.parts
+            .boot
+            .prepare_error_capture(lists)
+            .map_err(|_| FsError::OutOfMemory)?;
+        self.parts.capture = Some(state);
+        Ok(())
+    }
+
+    /// Cached OAG facts for publication with the live user epoch.
+    pub(crate) fn oa_device(
+        &self,
+        card: u32,
+        facts: &crate::intel_gpu_user::DeviceFacts,
+    ) -> Option<crate::intel_gpu_oa::Device> {
+        let unit = self.parts.oa.as_ref()?;
+        let rpm = if crate::intel_gpu_oa::ctc_shift_applies(facts.graphics_version) {
+            let rpm = self
+                .parts
+                .boot
+                .window()
+                .read32(crate::intel_gpu_oa::RPM_CONFIG0_REG);
+            if rpm == u32::MAX {
+                return None;
+            }
+            rpm
+        } else {
+            0
+        };
+        unit.device(card, self.engines()?, facts.reference_clock, rpm)
+    }
+    fn oa_unit(
+        &mut self,
+        mut access: impl FnMut() -> bool,
+        light: bool,
+    ) -> Result<(), narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        if !access() {
+            if let Some(unit) = self.parts.oa.as_mut() {
+                unit.lost();
+            }
+            return Err(FsError::NoDevice);
+        }
+        if light {
+            if self.state != GtState::SchedulingReady || self.awake().is_err() {
+                return Err(FsError::NoDevice);
+            }
+        } else {
+            self.admit_scheduling().map_err(|_| FsError::NoDevice)?;
+        }
+        if self.parts.oa.is_none() {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
+    /// The register phase of an OA stream request under the GT owner.
+    pub(crate) fn oa_begin(
+        &mut self,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        request: &crate::intel_gpu_oa::Request,
+        now: u64,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<alloc::vec::Vec<crate::intel_gpu_oa::Job>, narf_filesystem::FsError> {
+        self.oa_unit(&mut access, false)?;
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        let window = parts.boot.window();
+        let unit = parts.oa.as_mut().expect("checked OA unit");
+        unit.begin(window, session, request, now, || {
+            access() && observation_awake(window, platform, hardware)
+        })
+    }
+    /// Queue one ordered configuration job on the stream's OAG engine.
+    pub(crate) fn submit_oa_job(
+        &mut self,
+        now: u64,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        job: &crate::intel_gpu_oa::Job,
+    ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        if !self
+            .parts
+            .oa
+            .as_ref()
+            .is_some_and(|unit| unit.owns(session))
+        {
+            return Err(FsError::NoDevice);
+        }
+        self.admit_scheduling().map_err(|_| FsError::NoDevice)?;
+        let scheduler = self.parts.scheduler.as_mut().ok_or(FsError::NoDevice)?;
+        // SAFETY: Jobs are built only by intel_gpu_oa from source LRI groups
+        // whose addresses passed xe_oa_is_valid_config_reg_addr: OA/NOA
+        // flex, boolean-counter and mux registers, never GGTT, PPGTT, ring,
+        // context, access-policy or breadcrumb state.
+        match unsafe { scheduler.submit_commands(now, session.engine(), job.words()) } {
+            Ok((_, fence)) => Ok(fence),
+            Err(SchedulingError::Busy | SchedulingError::Full) => Err(FsError::WouldBlock),
+            Err(_) => Err(FsError::NoDevice),
+        }
+    }
+    /// The register phase after the configuration jobs retired.
+    pub(crate) fn oa_finish(
+        &mut self,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        request: &crate::intel_gpu_oa::Request,
+        now: u64,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<(), narf_filesystem::FsError> {
+        self.oa_unit(&mut access, false)?;
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        let window = parts.boot.window();
+        let unit = parts.oa.as_mut().expect("checked OA unit");
+        unit.finish(window, session, request, now, || {
+            access() && observation_awake(window, platform, hardware)
+        })
+    }
+    /// Copy landed reports and advance the hardware head.
+    pub(crate) fn oa_read(
+        &mut self,
+        session: &Arc<crate::intel_gpu_oa::Session>,
+        output: &mut [u8],
+        blocking: bool,
+        mut access: impl FnMut() -> bool,
+    ) -> Result<usize, narf_filesystem::FsError> {
+        self.oa_unit(&mut access, true)?;
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        let window = parts.boot.window();
+        let unit = parts.oa.as_mut().expect("checked OA unit");
+        unit.read(window, session, output, blocking, || {
+            access() && observation_awake(window, platform, hardware)
+        })
+    }
+    /// The 200 Hz tail check and close teardown.
+    pub(crate) fn poll_oa(&mut self, now: u64, mut access: impl FnMut() -> bool) {
+        if self.parts.oa.is_none() {
+            return;
+        }
+        if !access() || self.awake().is_err() {
+            if let Some(unit) = self.parts.oa.as_mut() {
+                unit.lost();
+            }
+            return;
+        }
+        let hardware = self.hardware.as_ref();
+        let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
+        if let Some(unit) = parts.oa.as_mut() {
+            let window = parts.boot.window();
+            unit.poll(window, now, || {
+                access() && observation_awake(window, platform, hardware)
+            });
         }
     }
 
@@ -491,17 +1125,76 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         object: Arc<crate::intel_gpu_gem::GemObject>,
         epoch: u64,
     ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
-        if self.parts.boot.platform() != GtPlatform::Alchemist
-            || epoch == 0
+        let gpu_only = object.is_gpu_only();
+        if gpu_only {
+            self.vram_access(epoch)?;
+            object
+                .gpu_only_access(self.parts.boot.window())
+                .map_err(Self::smallbar_access_error)?;
+        }
+        if epoch == 0
             || self.user_epoch() != Some(epoch)
+            || if gpu_only {
+                self.parts.boot.platform() != GtPlatform::Battlemage
+                    || self.user_epoch() != Some(epoch)
+            } else {
+                self.parts.boot.platform() != GtPlatform::Alchemist
+            }
         {
             return Err(GtError::State);
         }
         self.admit_scheduling()?;
-        let batch = crate::intel_gpu_exec::prepare_vram_clear(object)
-            .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        let batch = if gpu_only {
+            crate::intel_gpu_exec::prepare_smallbar_clear(object)
+        } else {
+            crate::intel_gpu_exec::prepare_vram_clear(object)
+        }
+        .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
         // SAFETY: factory retains all private mappings and zero source, emits
         // only source-qualified BCS0 CCS clear/flush, and excludes user writes.
+        let (_, fence) = unsafe {
+            self.parts
+                .scheduler
+                .as_mut()
+                .ok_or(GtError::State)?
+                .submit_resident_on(now, crate::intel_gpu_engine::Engine::Bcs0, batch)
+                .map_err(GtError::Scheduling)?
+        };
+        Ok(fence)
+    }
+
+    /// Copy only the retained owned ranges on this device; a raw address or
+    /// foreign local-memory pool cannot select a DMA source/destination.
+    pub(crate) fn copy_objects(
+        &mut self,
+        now: u64,
+        request: crate::intel_gpu_exec::copy::CopyRequest,
+        epoch: u64,
+        pool: Option<&Arc<crate::intel_gpu_vram::Vram>>,
+    ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
+            return Err(GtError::State);
+        }
+        request
+            .validate_pool(pool)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        if request.uses_vram() && pool.is_none_or(|pool| self.vram_layout() != Some(pool.layout)) {
+            return Err(GtError::Unavailable);
+        }
+        if request.uses_gpu_only() {
+            self.vram_access(epoch)?;
+            pool.ok_or(GtError::Unavailable)?
+                .smallbar_access(self.parts.boot.window())
+                .map_err(Self::smallbar_access_error)?;
+        }
+        self.admit_scheduling()?;
+        let batch = request
+            .prepare(self.parts.boot.platform())
+            .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        // SAFETY: the private factory emits only bounded copies among its
+        // immutable PPGTT mappings, auxiliary copy/flush and BB_END. Implicit
+        // reservations exclude conflicting kernel/dma-buf copies until the
+        // complete resident graph retires; no user batch controls commands.
         let (_, fence) = unsafe {
             self.parts
                 .scheduler
@@ -531,18 +1224,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if rpm == u32::MAX || rpm != window.read32(0xd00) {
             return Err(GtError::Unavailable);
         }
-        let crystal = match (rpm >> 3) & 7 {
-            0 => 24_000_000,
-            1 => 19_200_000,
-            2 => 38_400_000,
-            3 => 25_000_000,
-            _ => return Err(GtError::Unavailable),
-        };
         Ok(crate::intel_gpu_user::DeviceFacts {
             revision: self.parts.boot.revision(),
             graphics_version: ip.version,
             graphics_step: ip.step,
-            reference_clock: crystal >> (3 - ((rpm >> 1) & 3)),
+            reference_clock: reference_clock(rpm).ok_or(GtError::Unavailable)?,
         })
     }
 
@@ -570,7 +1256,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         crate::intel_gpu_timestamp::sample(
             self.parts.boot.window(),
             engine,
-            if self.parts.boot.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage {
+            if self.parts.boot.platform().is_xe2() {
                 64
             } else {
                 36
@@ -594,9 +1280,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         &mut self,
         device_id: u16,
     ) -> Result<Arc<GtTopology>, GtError> {
-        // Reuse the live state, current wake, actual PCI ID and acquired
-        // HWCONFIG gate; a numeric PCI ID alone cannot authorize publication.
-        self.hwconfig_for_device(device_id)?;
+        // Validate this live owner even on pre-XeHP families whose firmware
+        // has no HWCONFIG table. The fuse snapshot is independently acquired.
+        if self.parts.boot.platform().has_hwconfig() {
+            self.hwconfig_for_device(device_id)?;
+        } else {
+            if !matches!(
+                self.state,
+                GtState::Ready | GtState::CtReady | GtState::SchedulingReady
+            ) || self.parts.boot.device_id() != device_id
+            {
+                return Err(GtError::Boot(BootError::Device));
+            }
+            self.awake()?;
+        }
         self.parts.topology.clone().ok_or(GtError::State)
     }
 
@@ -623,6 +1320,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .ok_or(GtError::Boot(BootError::Device))
     }
 
+    pub fn has_hwconfig(&self) -> bool {
+        self.parts.boot.platform().has_hwconfig()
+    }
+
     /// Issue the zero-address size query before CT owns the MMIO mailbox.
     /// Exactly one table may be acquired per bootstrap lifetime.
     pub fn begin_hwconfig(&mut self, now: u64) -> Result<(), GtError>
@@ -635,6 +1336,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if let Err(error) = self.awake() {
             self.state = GtState::Lost;
             return Err(error);
+        }
+        if !self.has_hwconfig() {
+            return Err(GtError::Unavailable);
         }
         let mut mailbox = Mailbox::new(self.parts.boot.window().clone());
         if let Err(error) = mailbox.begin(&[0x4100, 0, 0, 0], now) {
@@ -677,6 +1381,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         if !self.requested || request & 1 == 0 || self.read_ack()? == 0 {
             return Err(GtError::WakeLost);
+        }
+        for domain in (1..=crate::intel_gpu_gt::media::GSC_DOMAIN)
+            .filter(|domain| self.media_wells & 1 << domain != 0)
+        {
+            let (request, ack) = crate::intel_gpu_gt::media::domain_registers(domain);
+            let (request, ack) = (
+                self.parts.boot.window().read32(request),
+                self.parts.boot.window().read32(ack),
+            );
+            if request == u32::MAX || ack == u32::MAX {
+                return Err(GtError::Unavailable);
+            }
+            if request & 1 == 0 || ack & 1 == 0 {
+                return Err(GtError::WakeLost);
+            }
         }
         if !matches!(
             self.state,
@@ -723,7 +1442,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 }
             }
         }
-        EnginePolicy::new(self.parts.boot.platform(), engines)
+        let media = matches!(
+            self.parts.boot.role(),
+            crate::intel_gpu_guc_boot::GuCRole::Media(_)
+        );
+        let policy = if self.parts.boot.platform().is_headless_integrated() || media {
+            self.engine_policy
+                .ok_or(GtError::State)
+                .map_err(|_| RegisterError::Identity)
+        } else {
+            EnginePolicy::new(self.parts.boot.platform(), engines)
+        };
+        policy
             .and_then(|policy| policy.verify(self.parts.boot.window()))
             .map_err(GtError::Registers)
     }
@@ -732,8 +1462,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if self.state != GtState::SchedulingReady {
             return Err(GtError::State);
         }
-        let result = self.awake().and_then(|()| self.verify_register_policy());
-        if result.is_err() {
+        let result = self
+            .awake()
+            .and_then(|()| self.current_region())
+            .and_then(|()| self.verify_register_policy());
+        if result.is_err() && !matches!(result, Err(GtError::Busy)) {
             self.state = GtState::Lost;
         }
         result
@@ -790,9 +1523,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn start_reset(&mut self, now: u64) -> Result<(), GtError> {
+        // Every caller holds a proven GT wake. A no-op unless the media GT's
+        // power management was started on this owner.
+        self.media_power_down();
         // Stop observation first; a busy MCR semaphore is retried by poll,
         // with all DMA owners retained and wake still held.
-        if self.parts.eu_stall.is_some() && self.parts.boot.state() != BootState::Stopping {
+        if (self.parts.eu_stall.is_some() || self.parts.oa.is_some())
+            && self.parts.boot.state() != BootState::Stopping
+        {
             self.deadline = now.saturating_add(WAKE_NS);
             self.state = GtState::Stopping;
             return Ok(());
@@ -818,13 +1556,30 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 | GtState::ResettingEngines
                 | GtState::ReleasingRender
                 | GtState::Releasing
+                | GtState::StoppingMert
+                | GtState::StoppingGen12Cs
+                | GtState::ReleasingGen12Media
         ) {
             return Err(GtError::State);
         }
+        if let Some(scheduler) = self.parts.scheduler.as_mut() {
+            scheduler.huc.invalidate();
+        }
+        // Submission stops being serviced: GGTT invalidation returns to MMIO,
+        // as send_tlb_inval_ggtt does once submission is disabled. Ranges
+        // still owed a CT invalidation stay retained until the reset proof.
+        // Best effort: a refusal leaves CT mode, which only retains more.
+        let _ = self.parts.boot.ggtt_tlb_ct(false);
         // Close admission before any fallible reset/recovery operation.
         self.log_stream.take();
         if let Some(collector) = self.parts.eu_stall.as_mut() {
             collector.invalidate();
+        }
+        if let Some(unit) = self.parts.oa.as_mut() {
+            unit.invalidate();
+        }
+        if let Some(mert) = &mut self.parts.mert {
+            mert.closing();
         }
         self.state = GtState::Lost;
         self.parts.boot.cancel_reload();
@@ -862,7 +1617,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if self.state != GtState::Ready
             || self.parts.ct.is_some()
             || self.hardware.is_none()
-            || self.hwconfig().is_none()
+            || (self.has_hwconfig() && self.hwconfig().is_none())
         {
             return Err(GtError::State);
         }
@@ -878,18 +1633,28 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             self.parts.boot.platform(),
             self.parts.boot.device_id(),
             self.topology().ok_or(GtError::State)?,
-            self.hwconfig().ok_or(GtError::State)?,
+            self.hwconfig(),
             now,
             mode,
         )
         .map_err(GtError::Registers)?;
-        let scheduler = self
+        self.mert_required = registers.mert_required();
+        let mut scheduler = self
             .parts
             .boot
             .scheduler(registers.engines())
             .map_err(GtError::Boot)?;
+        scheduler
+            .set_reset_policy(registers.reset_policy().ok_or(GtError::State)?)
+            .map_err(GtError::Scheduling)?;
+        if let Some(capture) = &self.parts.capture {
+            // Optional: an allocation failure only loses the manual fallback.
+            let _ =
+                scheduler.enable_error_capture(capture.lists.family(), capture.lists.max_regs());
+        }
         self.parts.scheduler = Some(scheduler);
         self.compute_configuration = Some(registers.compute_configuration());
+        self.engine_policy = Some(registers.engine_policy().map_err(GtError::Registers)?);
         self.registers = Some(registers);
         self.state = GtState::PreparingScheduling;
         Ok(())
@@ -930,7 +1695,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             self.parts.boot.window(),
             self.parts.boot.platform(),
             self.topology().ok_or(GtError::State)?,
-            self.hwconfig().ok_or(GtError::State)?,
+            self.hwconfig(),
         )
         .map_err(|error| GtError::Scheduling(SchedulingError::Defaults(error)))?;
         // Revalidate current authority, wake holds and policy after fuse reads.
@@ -959,13 +1724,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     /// Start GuC SLPC/GUCRC. Optional: errors leave scheduling untouched.
+    /// The media GuC reads GT1's own fuses (xe_guc_pc.c per GT).
     pub fn begin_slpc(&mut self, now: u64) -> Result<(), GtError> {
         self.admit_scheduling()?;
-        let limits = crate::intel_gpu_slpc::Limits::read(
-            self.parts.boot.window(),
-            self.parts.boot.platform(),
-            self.parts.boot.device_id(),
-        )
+        let limits = match self.parts.boot.role() {
+            crate::intel_gpu_guc_boot::GuCRole::Primary => crate::intel_gpu_slpc::Limits::read(
+                self.parts.boot.window(),
+                self.parts.boot.platform(),
+                self.parts.boot.device_id(),
+            ),
+            crate::intel_gpu_guc_boot::GuCRole::Media(_) => {
+                crate::intel_gpu_slpc::Limits::read_media(self.parts.boot.window())
+            }
+        }
         .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
         self.admit_scheduling()?;
         let parts = &mut *self.parts;
@@ -990,6 +1761,128 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         (self.state == GtState::SchedulingReady)
             .then(|| self.parts.scheduler.as_ref()?.slpc_status())
             .flatten()
+    }
+
+    /// Post-probe BMG20.01 PF sanitize. Bootstrap limits remain in force
+    /// until actual frequency, host-L2 and initial invalidation are proven.
+    /// Keep polling under the reset/PM owner before publishing user admission.
+    pub(crate) fn prepare_mert(
+        &mut self,
+        now: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Result<bool, GtError> {
+        use crate::intel_gpu_slpc::{mert, SlpcState};
+        let map = |error| GtError::Scheduling(SchedulingError::Slpc(error));
+        if self.parts.boot.platform() != GtPlatform::Battlemage || self.hardware.is_none() {
+            return Ok(true);
+        }
+        if !current() {
+            return Err(GtError::Unavailable);
+        }
+        self.admit_scheduling()?;
+        let epoch = self.user_epoch().ok_or(GtError::State)?;
+        if self.parts.mert.is_none() {
+            if !mert::qualified(self.parts.boot.window(), &mut current).map_err(map)? {
+                return Ok(true);
+            }
+            self.mert_required = true;
+            match self.slpc() {
+                SlpcState::Off | SlpcState::Unavailable => {
+                    return Err(map(crate::intel_gpu_slpc::SlpcError::Unavailable));
+                }
+                SlpcState::Running => {}
+                _ => return Ok(false),
+            }
+            let limits = self.slpc_status().ok_or(GtError::State)?.limits;
+            self.parts.mert = Some(mert::Mert::new(limits, epoch, now).map_err(map)?);
+        }
+        let parts = &mut *self.parts;
+        let owner = parts.mert.as_mut().expect("MERT owner");
+        match owner.prepare(parts.boot.window(), now, epoch, &mut current) {
+            Poll::Pending => return Ok(false),
+            Poll::Ready(result) => result.map_err(map)?,
+        }
+        if !owner.sanitizing() {
+            let status = parts
+                .scheduler
+                .as_ref()
+                .and_then(|s| s.slpc_status())
+                .ok_or(GtError::State)?;
+            if status.limits.max_mhz < status.limits.rp0_mhz {
+                parts
+                    .scheduler
+                    .as_mut()
+                    .expect("scheduler")
+                    .lift_mert_cap(now)
+                    .map_err(GtError::Scheduling)?;
+            }
+            owner.mark_sanitizing();
+        }
+        Ok(matches!(
+            self.slpc(),
+            SlpcState::Running | SlpcState::Unavailable
+        ))
+    }
+
+    /// Exercise raw flush-ticket ownership without a CPU-clear lease.
+    /// Production CPU clears must retain their target before any BAR write.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn begin_vram_flush(&mut self, epoch: u64, now: u64) -> Result<u64, GtError> {
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
+            return Err(GtError::State);
+        }
+        let Some(owner) = &mut self.parts.mert else {
+            return if self.mert_required {
+                Err(GtError::State)
+            } else {
+                Ok(0)
+            };
+        };
+        owner
+            .request_flush(epoch, now)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))
+    }
+
+    /// Reserve the single retained CPU-write transaction before its first
+    /// BAR store. Busy callers have not written and may safely be cancelled.
+    /// The caller transfers its PM hold to the returned completion fence.
+    pub(crate) fn retain_cpu_vram_clear(
+        &mut self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+        now: u64,
+    ) -> Result<Option<crate::intel_gpu_slpc::mert::CpuClearLease>, GtError> {
+        self.vram_access(epoch)?;
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
+            return Err(GtError::State);
+        }
+        let Some(owner) = &mut self.parts.mert else {
+            return if self.mert_required {
+                Err(GtError::State)
+            } else {
+                Ok(None)
+            };
+        };
+        owner
+            .retain_cpu_clear(object, epoch, now)
+            .map(Some)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))
+    }
+
+    pub(crate) fn vram_flush_done(&self, epoch: u64, id: u64) -> Result<bool, GtError> {
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
+            return Err(GtError::State);
+        }
+        let Some(owner) = &self.parts.mert else {
+            return if id == 0 && !self.mert_required {
+                Ok(true)
+            } else {
+                Err(GtError::State)
+            };
+        };
+        owner
+            .flush_done(epoch, id)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))
     }
 
     /// Begin a bounded update; the owner must keep driving `poll` until SLPC
@@ -1025,12 +1918,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// SchedulingReady with no registered, running or retiring context.
     pub fn idle(&self) -> bool {
         self.state == GtState::SchedulingReady
+            && self
+                .parts
+                .mert
+                .as_ref()
+                .is_none_or(|owner| owner.flush_idle())
             && self.log_stream.is_none()
             && self
                 .parts
                 .eu_stall
                 .as_ref()
                 .is_none_or(|collector| collector.idle())
+            && self.parts.oa.as_ref().is_none_or(|unit| unit.idle())
             && self
                 .parts
                 .scheduler
@@ -1176,8 +2075,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.begin(narf_time::monotonic_ns())?;
         self.wait().await?;
-        self.begin_hwconfig(narf_time::monotonic_ns())?;
-        self.wait().await?;
+        if self.has_hwconfig() {
+            self.begin_hwconfig(narf_time::monotonic_ns())?;
+            self.wait().await?;
+        }
         self.begin_scheduling(narf_time::monotonic_ns())?;
         self.wait().await?;
         self.begin_ct(narf_time::monotonic_ns())?;
@@ -1188,6 +2089,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn release_wake(&mut self, now: u64) -> Result<(), GtError> {
+        if self.parts.boot.platform().is_headless_integrated() {
+            self.parts.boot.retire_ggtt().map_err(GtError::Boot)?;
+        }
+        if self
+            .gen12_reset
+            .as_ref()
+            .is_some_and(|reset| !reset.released())
+        {
+            return Err(GtError::State);
+        }
+        if self
+            .parts
+            .mert
+            .as_ref()
+            .is_some_and(|owner| !owner.stopped())
+        {
+            return Err(GtError::State);
+        }
         if let Some(hw) = &mut self.hardware {
             hw.begin_release(self.parts.boot.window(), now)
                 .map_err(GtError::Hardware)?;
@@ -1207,7 +2126,65 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn after_boot_stop(&mut self, now: u64) -> Result<(), GtError> {
-        if self.parts.scheduler.is_some() {
+        // GuCBoot proved MIA in reset and firmware DMA idle (or never booted):
+        // this GuC's GGTT TLB holds nothing live, and its next boot
+        // invalidates before use. Release ranges held for it
+        // (xe_tlb_inval_reset), before the stop frees scheduler and CT memory.
+        self.parts.boot.ggtt_tlb_reset();
+        if self.parts.boot.platform().is_gen12() {
+            if self
+                .gen12_reset
+                .as_ref()
+                .is_none_or(|reset| reset.released())
+            {
+                // The inherited-reset attempt may already own media wake
+                // bits when boot never started. Transfer, never duplicate
+                // or forget that uncertain request ownership.
+                if let Some(reset) = self
+                    .hardware
+                    .as_mut()
+                    .and_then(HardwareInit::take_gen12_reset)
+                {
+                    self.gen12_reset = Some(reset);
+                }
+            }
+            if let Some(reset) = &mut self.gen12_reset {
+                reset.restart(now).map_err(GtError::Hardware)?;
+            } else {
+                self.gen12_reset = Some(
+                    crate::intel_gpu_gt::gen12::reset::Reset::new(now)
+                        .map_err(GtError::Hardware)?,
+                );
+            }
+            self.state = GtState::StoppingGen12Cs;
+            return Ok(());
+        }
+        if self.parts.scheduler.is_some() || self.parts.mert.is_some() {
+            // xe_gt.c::do_gt_reset brackets a media GRDOM_FULL with
+            // Wa_14015076503 while GSC firmware is loaded. Without
+            // `narf.intel.gsc=1` NARF admits media scheduling only without
+            // loaded GSC firmware, and a GSC load that appears later keeps
+            // this owner retained instead.
+            if matches!(
+                self.parts.boot.role(),
+                crate::intel_gpu_guc_boot::GuCRole::Media(_)
+            ) && crate::intel_gpu_gt::media::gsc_firmware_loaded(self.parts.boot.window())?
+            {
+                if !self.gsc_reset_wa {
+                    return Err(GtError::State);
+                }
+                // xe_gsc_wa_14015076503(gt, true): alert the GSC, then hold
+                // GRDOM_FULL for its 200 ms preparation.
+                let until = now
+                    .checked_add(crate::intel_gpu_gt::media::gsc::RESET_PREPARE_NS)
+                    .ok_or(GtError::State)?;
+                self.gsc_prepared = true;
+                crate::intel_gpu_gt::media::gsc::wa_14015076503_prepare(self.parts.boot.window())
+                    .ok_or(GtError::Unavailable)?;
+                self.gsc_prepare_until = Some(until);
+                self.state = GtState::ResettingEngines;
+                return Ok(());
+            }
             self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
             self.parts.boot.window().write32(0x941c, 1);
             let _ = self.parts.boot.window().read32(0x941c);
@@ -1218,9 +2195,75 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.release_wake(now)
     }
 
+    fn engine_stop_complete(&mut self, now: u64) -> Result<(), GtError> {
+        // Full Gen12 engine reset and media ACK release have retired HuC.
+        self.parts.boot.huc_full_reset_complete();
+        if let Some(collector) = self.parts.eu_stall.take() {
+            // SAFETY: GuC reset/DMA idle and GRDOM_FULL self-clear
+            // precede release of all observation GGTT storage.
+            unsafe { collector.release_after_reset() };
+        }
+        if let Some(unit) = self.parts.oa.take() {
+            // SAFETY: the same proofs stop the OA unit's buffer writes.
+            unsafe { unit.release_after_reset() };
+        }
+        if let Some(scheduler) = self.parts.scheduler.take() {
+            // SAFETY: GuC reset/DMA idle preceded GRDOM_FULL self-clear.
+            // Admission is closed and no child scheduler escapes.
+            unsafe { scheduler.release_after_reset() };
+        }
+        self.retire_ct();
+        if let Some(mert) = &mut self.parts.mert {
+            let map = |error| GtError::Scheduling(SchedulingError::Slpc(error));
+            mert.after_reset(now).map_err(map)?;
+            self.state = GtState::StoppingMert;
+            return Ok(());
+        }
+        self.release_wake(now)?;
+        Ok(())
+    }
+
     pub fn poll(&mut self, now: u64) -> Poll<Result<GtState, GtError>> {
-        let result = self.poll_inner(now);
+        self.poll_with_access(now, || true)
+    }
+
+    /// Physical runtime supplies current PCI D0/authority for every new MERT
+    /// register operation. Generic callers retain the enclosing D0 contract.
+    pub(crate) fn poll_with_access(
+        &mut self,
+        now: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Poll<Result<GtState, GtError>> {
+        let region_current = if self.state == GtState::SchedulingReady {
+            match self.current_region() {
+                Ok(()) => {
+                    self.smallbar_busy_deadline = None;
+                    true
+                }
+                Err(GtError::Busy) => {
+                    let deadline = *self
+                        .smallbar_busy_deadline
+                        .get_or_insert(now.saturating_add(50_000_000));
+                    if now < deadline && current() {
+                        return Poll::Pending;
+                    }
+                    false
+                }
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
+        let result = if current() && region_current {
+            self.poll_inner(now, &mut current)
+        } else {
+            Poll::Ready(Err(GtError::Unavailable))
+        };
         if matches!(result, Poll::Ready(Err(_))) && self.state != GtState::Staged {
+            // do_gt_reset clears the GSC notification even when GRDOM_FULL
+            // failed; lost MMIO leaves it unclearable.
+            let _ = self.clear_gsc_prepare();
+            self.gsc_prepare_until = None;
             self.state = GtState::Lost;
             if let Some(actor) = &mut self.log_stream {
                 actor.lost();
@@ -1228,22 +2271,32 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             if let Some(collector) = self.parts.eu_stall.as_mut() {
                 collector.lost();
             }
+            if let Some(unit) = self.parts.oa.as_mut() {
+                unit.lost();
+            }
         }
         result
     }
 
-    fn poll_inner(&mut self, now: u64) -> Poll<Result<GtState, GtError>> {
+    fn poll_inner(
+        &mut self,
+        now: u64,
+        current: &mut impl FnMut() -> bool,
+    ) -> Poll<Result<GtState, GtError>> {
         match self.state {
             GtState::Staged => return Poll::Ready(Err(GtError::State)),
             GtState::Lost => return Poll::Ready(Err(GtError::Poisoned)),
             GtState::Stopped => return Poll::Ready(Ok(self.state)),
             GtState::Waking | GtState::Recovering | GtState::Releasing => {
-                let ack = self.read_ack()?;
-                if now >= self.deadline {
-                    return Poll::Ready(Err(GtError::WakeTimeout));
-                }
-                if ack != u32::from(self.requested) {
-                    return Poll::Pending;
+                // i915 __wait_for / xe_mmio_wait32: the ACK is evaluated
+                // before the deadline, so a late poll that finds it already
+                // settled progresses instead of reporting WakeTimeout.
+                if self.read_ack()? != u32::from(self.requested) {
+                    return if now >= self.deadline {
+                        Poll::Ready(Err(GtError::WakeTimeout))
+                    } else {
+                        Poll::Pending
+                    };
                 }
                 if self.state == GtState::Releasing {
                     self.state = GtState::Stopped;
@@ -1275,19 +2328,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.awake()?;
         match self.state {
             GtState::PreparingScheduling => {
-                match self
-                    .registers
-                    .as_ref()
-                    .expect("owned register initialization")
-                    .poll(self.parts.boot.window(), now)
-                {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => {
-                        let registers = result.map_err(GtError::Registers)?;
-                        self.vram = registers.and_then(|r| {
-                            crate::intel_gpu_vram::VramLayout::from_registers(r).ok()
-                        });
+                // The standalone media GT has no RegisterInit: its engine
+                // policy was installed and verified by begin_media_scheduling.
+                if let Some(registers) = self.registers.as_ref() {
+                    match registers.poll(self.parts.boot.window(), now) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => {
+                            let registers = result.map_err(GtError::Registers)?;
+                            self.vram = registers.and_then(|r| {
+                                crate::intel_gpu_vram::VramLayout::from_registers(r).ok()
+                            });
+                        }
                     }
+                } else if self.media_wells == 0 {
+                    return Poll::Ready(Err(GtError::State));
                 }
                 self.awake()?;
                 self.registers = None;
@@ -1309,7 +2363,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     .hardware
                     .as_mut()
                     .expect("hardware owner")
-                    .poll(self.parts.boot.window(), now)
+                    .poll_with_access(self.parts.boot.window(), now, &mut *current)
                 {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result.map_err(GtError::Hardware)?,
@@ -1351,35 +2405,107 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 return Poll::Pending;
             }
             GtState::ResettingEngines => {
+                if let Some(until) = self.gsc_prepare_until {
+                    // Wa_14015076503: the alerted GSC prepares for up to
+                    // 200 ms before do_gt_reset writes GRDOM_FULL.
+                    if now < until {
+                        return Poll::Pending;
+                    }
+                    self.gsc_prepare_until = None;
+                    self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
+                    self.parts.boot.window().write32(0x941c, 1);
+                    let _ = self.parts.boot.window().read32(0x941c);
+                    return Poll::Pending;
+                }
+                // xe_mmio_wait32(GDRST, GRDOM_FULL, 0, 5000): the register
+                // is read before the deadline is enforced, so a late poll
+                // that finds the reset complete still succeeds. The same
+                // bound covers the GuC-reset and DMA-idle proofs below.
                 let reset = self.parts.boot.window().read32(0x941c);
                 if reset == u32::MAX {
                     return Poll::Ready(Err(GtError::Unavailable));
                 }
-                if now >= self.deadline {
-                    return Poll::Ready(Err(GtError::Boot(BootError::Timeout)));
-                }
                 if reset & 1 != 0 {
-                    return Poll::Pending;
+                    return if now >= self.deadline {
+                        Poll::Ready(Err(GtError::Boot(BootError::Timeout)))
+                    } else {
+                        Poll::Pending
+                    };
                 }
+                // do_gt_reset: xe_gsc_wa_14015076503(gt, false) once
+                // GRDOM_FULL has self-cleared.
+                self.clear_gsc_prepare()?;
                 let status = self.parts.boot.window().read32(0xc000);
                 let dma = self.parts.boot.window().read32(0xc314);
                 if status == u32::MAX || dma == u32::MAX {
                     return Poll::Ready(Err(GtError::Unavailable));
                 }
                 if status & 1 == 0 || dma & 1 != 0 {
-                    return Poll::Pending;
+                    return if now >= self.deadline {
+                        Poll::Ready(Err(GtError::Boot(BootError::Timeout)))
+                    } else {
+                        Poll::Pending
+                    };
                 }
-                if let Some(collector) = self.parts.eu_stall.take() {
-                    // SAFETY: GuC reset/DMA idle and GRDOM_FULL self-clear
-                    // precede release of all observation GGTT storage.
-                    unsafe { collector.release_after_reset() };
+                if let Some(reset) = &mut self.gen12_reset {
+                    // SAFETY: GRDOM_FULL self-clear, GuC reset and firmware
+                    // DMA idle were freshly verified above. Keep every DMA
+                    // graph/fence and both base wells through media ACK release.
+                    unsafe {
+                        reset
+                            .begin_release_after_full_reset(
+                                self.parts.boot.window(),
+                                now,
+                                &mut *current,
+                            )
+                            .map_err(GtError::Hardware)?;
+                    }
+                    self.state = GtState::ReleasingGen12Media;
+                } else {
+                    self.engine_stop_complete(now)?;
                 }
-                if let Some(scheduler) = self.parts.scheduler.take() {
-                    // SAFETY: GuC reset/DMA idle preceded GRDOM_FULL self-clear.
-                    // Admission is closed and no child scheduler escapes.
-                    unsafe { scheduler.release_after_reset() };
+                return Poll::Pending;
+            }
+            GtState::StoppingGen12Cs => {
+                match self
+                    .gen12_reset
+                    .as_mut()
+                    .expect("owned Gen12 reset")
+                    .poll_prepare(self.parts.boot.window(), now, &mut *current)
+                {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map_err(GtError::Hardware)?,
                 }
-                self.retire_ct();
+                self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
+                self.parts.boot.window().write32(0x941c, 1);
+                if self.parts.boot.window().read32(0x941c) == u32::MAX {
+                    return Poll::Ready(Err(GtError::Unavailable));
+                }
+                self.state = GtState::ResettingEngines;
+                return Poll::Pending;
+            }
+            GtState::ReleasingGen12Media => {
+                match self
+                    .gen12_reset
+                    .as_mut()
+                    .expect("owned Gen12 media release")
+                    .poll_release(self.parts.boot.window(), now, &mut *current)
+                {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map_err(GtError::Hardware)?,
+                }
+                self.engine_stop_complete(now)?;
+                return Poll::Pending;
+            }
+            GtState::StoppingMert => {
+                let parts = &mut *self.parts;
+                let mert = parts.mert.as_mut().expect("stopping host-L2 owner");
+                match mert.finish_stopped(parts.boot.window(), now, &mut *current) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => {
+                        result.map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?
+                    }
+                }
                 self.release_wake(now)?;
                 return Poll::Pending;
             }
@@ -1439,6 +2565,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     Poll::Ready(Ok(TransportState::Enabled)) => {
                         if self.parts.scheduler.is_some() {
                             self.verify_register_policy()?;
+                            // CT enabled with submission enabled: from now on
+                            // send_tlb_inval_ggtt reaches this GuC over its
+                            // CT, and the scheduler sends those requests.
+                            self.parts.boot.ggtt_tlb_ct(true).map_err(GtError::Boot)?;
                         }
                         self.state = if self.parts.scheduler.is_some() {
                             GtState::SchedulingReady
@@ -1451,16 +2581,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
             GtState::Stopping => {
                 if self.parts.boot.state() != BootState::Stopping {
+                    let hardware = self.hardware.as_ref();
                     let parts = &mut *self.parts;
+                    let platform = parts.boot.platform();
                     if let Some(collector) = parts.eu_stall.as_mut() {
                         let window = parts.boot.window();
-                        match collector.disable(window, || observation_awake(window)) {
+                        match collector
+                            .disable(window, || observation_awake(window, platform, hardware))
+                        {
                             Err(narf_filesystem::FsError::WouldBlock) if now < self.deadline => {
-                                return Poll::Pending
+                                return Poll::Pending;
                             }
                             Err(_) => collector.lost(),
                             Ok(()) => {}
                         }
+                    }
+                    if let Some(unit) = parts.oa.as_mut() {
+                        let window = parts.boot.window();
+                        unit.halt(window, || observation_awake(window, platform, hardware));
                     }
                     // A lost/stuck steering owner cannot prevent whole-GT
                     // reset escalation. Storage stays retained through GuC
@@ -1480,12 +2618,32 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             GtState::Ready | GtState::CtReady => {}
             GtState::SchedulingReady => {
                 let parts = &mut *self.parts;
-                parts
-                    .scheduler
-                    .as_mut()
-                    .expect("owned scheduler")
-                    .poll(parts.ct.as_mut().expect("owned CT"), now)
-                    .map_err(GtError::Scheduling)?;
+                let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
+                let ct = parts.ct.as_mut().expect("owned CT");
+                scheduler.poll(ct, now).map_err(GtError::Scheduling)?;
+                // xe_guc_error_capture_handler -> xe_guc_capture_process,
+                // then __guc_capture_flushlog_complete (retried while full).
+                if let Some(capture) = parts.capture.as_mut() {
+                    if scheduler.take_capture_notification() {
+                        if let Some(log) = parts.boot.live_log() {
+                            capture.notified(log.backing, &mut *current);
+                        }
+                    }
+                    if capture.ack_pending() {
+                        use crate::intel_gpu_error::capture::{
+                            FLUSH_COMPLETE, LOG_TYPE_STATE_CAPTURE,
+                        };
+                        match ct.send(0, FLUSH_COMPLETE, 0, &[LOG_TYPE_STATE_CAPTURE], true) {
+                            Ok(()) => capture.acknowledged(),
+                            Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+                            Err(error) => return Poll::Ready(Err(GtError::Transport(error))),
+                        }
+                    }
+                }
+                if let Some(mert) = &mut parts.mert {
+                    mert.service_flush(parts.boot.window(), now, &mut *current)
+                        .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
+                }
             }
             _ => return Poll::Ready(Err(GtError::State)),
         }
@@ -1493,8 +2651,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     pub async fn wait(&mut self) -> Result<GtState, GtError> {
+        self.wait_with_access(|| true).await
+    }
+
+    pub(crate) async fn wait_with_access(
+        &mut self,
+        mut current: impl FnMut() -> bool,
+    ) -> Result<GtState, GtError> {
         loop {
-            if let Poll::Ready(result) = self.poll(narf_time::monotonic_ns()) {
+            if let Poll::Ready(result) =
+                self.poll_with_access(narf_time::monotonic_ns(), &mut current)
+            {
                 return result;
             }
             // Even if a short timer expires before its first poll, a clock
@@ -1544,9 +2711,16 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// # Safety
     /// The PCI owner proved a full GT reset stopped all engines and GuC/firmware
     /// DMA, invalidated stale HWS/LRC/GGTT addresses and released/reset both the
-    /// render-well and graphics-GT kernel wake requests.
+    /// render-well, graphics-GT and every owned Gen12 media kernel wake request.
+    /// If MERT host-L2 was exposed, the external owner also proved its manual
+    /// requested/actual cap, fresh GLOBAL_INVAL drain and host-L2 disable before
+    /// releasing those wells.
     /// Neither unreadable registers nor elapsed time supplies that proof.
+    /// Any exposed TGL HuC image additionally requires full media-engine
+    /// reset/idle and retained media-wake release, never GuC-only Stopped.
     pub unsafe fn release_after_gt_reset(mut self) {
+        // The caller's full-reset proof also covers this GuC's GGTT TLB.
+        self.parts.boot.ggtt_tlb_reset();
         self.released = true;
         // SAFETY: consumed once under the caller's full-reset proof.
         let Parts {
@@ -1554,11 +2728,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             ct,
             scheduler,
             eu_stall,
+            oa,
+            mert,
             ..
         } = unsafe { ManuallyDrop::take(&mut self.parts) };
+        if let Some(mert) = mert {
+            // SAFETY: the external proof also covers host-L2 shutdown.
+            unsafe { mert.release_after_reset() };
+        }
         if let Some(collector) = eu_stall {
             // SAFETY: the caller's full graphics-GT/DMA reset proof covers it.
             unsafe { collector.release_after_reset() };
+        }
+        if let Some(unit) = oa {
+            // SAFETY: the same full-reset proof stops OA buffer writes.
+            unsafe { unit.release_after_reset() };
         }
         if let Some(scheduler) = scheduler {
             // SAFETY: the external full-reset proof covers HWS and engines too.
@@ -1570,6 +2754,209 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         // SAFETY: the same proof covers firmware, ADS and logs.
         unsafe { boot.release_after_gt_reset() };
+    }
+}
+
+impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi<W>, A> {
+    /// MTL/Arrow standalone media GuC (GT1). This is the bare GuCGt path:
+    /// no render well, MCR, topology, HWCONFIG, MERT or scheduler. Its wake
+    /// request/ACK, GuC reset, WOPCM, DMA, ADS and CT all resolve through the
+    /// media GSI window and media mailbox. `policy` proves the media PAT that
+    /// gives the shared GGTT PTE index its meaning on this GT.
+    /// `huc` optionally stages the media GT's HuC with its adopt policy
+    /// (`GuCBoot::stage_media`).
+    pub(crate) fn stage_media(
+        mmio: crate::intel_gpu_gt::media::MediaGsi<W>,
+        allocator: A,
+        firmware: &GuCFirmware,
+        huc: Option<(&crate::intel_gpu_huc::Firmware, bool)>,
+        config: BootConfig,
+        ip: crate::intel_gpu_gt::media::MediaIp,
+        policy: crate::intel_gpu_gt_hw::CachePolicy,
+    ) -> Result<Self, GtError> {
+        let mut boot = GuCBoot::stage_media(mmio, allocator, firmware, huc, config, ip)
+            .map_err(GtError::Boot)?;
+        boot.configure_cache(policy).map_err(GtError::Boot)?;
+        Ok(Self::from_staged(boot))
+    }
+
+    /// Prepare media scheduling on the booted media GuC, before CT. `wells`
+    /// are the VDBOX/VEBOX forcewake domains (`media::engine_domains`) whose
+    /// kernel wake the caller holds and keeps until this owner is Stopped.
+    /// As Linux xe on GT1: engines come from the media fuses, the NONPRIV
+    /// whitelist (hwe->reg_whitelist) is applied before ring enable, the ADS
+    /// is populated from that list and the GuC reloads with submission
+    /// enabled. No HWCONFIG, render well, MCR steering or SLPC is involved.
+    pub(crate) fn begin_media_scheduling(
+        &mut self,
+        engines: crate::intel_gpu_engine::EngineSet,
+        wells: u16,
+    ) -> Result<(), GtError>
+    where
+        A: Clone,
+    {
+        let crate::intel_gpu_guc_boot::GuCRole::Media(_) = self.parts.boot.role() else {
+            return Err(GtError::State);
+        };
+        if self.state != GtState::Ready
+            || self.parts.ct.is_some()
+            || self.parts.scheduler.is_some()
+            || wells == 0
+            || wells != crate::intel_gpu_gt::media::engine_domains(engines)
+        {
+            return Err(GtError::State);
+        }
+        let platform = self.parts.boot.platform();
+        let policy = EnginePolicy::media(platform, engines).map_err(GtError::Registers)?;
+        let reset = crate::intel_gpu_reset_policy::ResetPolicy::media(
+            platform,
+            self.parts.boot.device_id(),
+            engines,
+        )
+        .ok_or(GtError::State)?;
+        self.media_wells = wells;
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        // Without Wa_14015076503 around the stop's GRDOM_FULL, loaded GSC
+        // firmware refuses scheduling (`honour_gsc_reset_workaround`).
+        if !self.gsc_reset_wa
+            && crate::intel_gpu_gt::media::gsc_firmware_loaded(self.parts.boot.window())?
+        {
+            return Err(GtError::Busy);
+        }
+        let mut scheduler = self.parts.boot.scheduler(engines).map_err(GtError::Boot)?;
+        scheduler
+            .set_reset_policy(reset)
+            .map_err(GtError::Scheduling)?;
+        // Engines are idle in the GuC-sanitized GT1 with every well held. An
+        // unpublished scheduler is dropped (freed) on refusal.
+        policy
+            .install(self.parts.boot.window())
+            .map_err(GtError::Registers)?;
+        self.parts.scheduler = Some(scheduler);
+        self.engine_policy = Some(policy);
+        self.state = GtState::PreparingScheduling;
+        Ok(())
+    }
+
+    /// Record GT1's default LRCs: one empty media 13.00 WA job per engine,
+    /// switched out and captured. Its fence completes after the last capture.
+    pub(crate) fn begin_media_context_defaults(
+        &mut self,
+        now: u64,
+    ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .expect("owned scheduler")
+            .begin_media_defaults(now)
+            .map_err(GtError::Scheduling)
+    }
+
+    /// One GSC kernel job on GSCCS0 (`GuCScheduler::submit_gsc`), under the
+    /// same wake, region and register-policy proof as every submission.
+    pub(crate) fn submit_gsc(
+        &mut self,
+        now: u64,
+        commands: &[u32],
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .submit_gsc(now, commands)
+            .map_err(GtError::Scheduling)
+    }
+
+    /// GT1's own command-streamer timestamp clock (xe_gt_clock.c on the media
+    /// GT reads RPM_CONFIG0 through the GSI window).
+    pub(crate) fn media_reference_clock(&self) -> Result<u32, GtError> {
+        self.awake()?;
+        let window = self.parts.boot.window();
+        let rpm = window.read32(0xd00);
+        if rpm == u32::MAX || rpm != window.read32(0xd00) {
+            return Err(GtError::Unavailable);
+        }
+        reference_clock(rpm).ok_or(GtError::Unavailable)
+    }
+
+    /// GT1 power management, as Linux runs it for the media GT: powergating
+    /// (xe_gt_idle.c::xe_gt_idle_enable_pg through GT1's window, without the
+    /// skip_guc_pc hysteresis writes) and then xe_guc_pc_start on the media
+    /// GuC, whose SETUP_PC_GUCRC(GUCRC_FIRMWARE_CONTROL) hands media C6 to
+    /// firmware. Only once per owner, with scheduling ready and GT1's wake
+    /// proven. From here every stop first returns C6 and powergating to the
+    /// host (`media_power_down`).
+    pub(crate) fn begin_media_power(&mut self, now: u64) -> Result<(), GtError> {
+        if self.media_power {
+            return Err(GtError::State);
+        }
+        self.admit_scheduling()?;
+        let engines = self.engines().ok_or(GtError::State)?;
+        self.media_power = true;
+        self.parts.boot.window().write32(
+            crate::intel_gpu_gt::media::POWERGATE_ENABLE,
+            crate::intel_gpu_gt::media::powergate_enable(engines),
+        );
+        // begin_slpc re-proves wake and access after the write.
+        self.begin_slpc(now)
+    }
+}
+
+/// xe_gt_clock.c::read_crystal_clock + xe_gt_clock_init: crystal selector
+/// [5:3] and the CTC shift [2:1] of RPM_CONFIG0.
+fn reference_clock(rpm: u32) -> Option<u32> {
+    let crystal: u32 = match (rpm >> 3) & 7 {
+        0 => 24_000_000,
+        1 => 19_200_000,
+        2 => 38_400_000,
+        3 => 25_000_000,
+        _ => return None,
+    };
+    Some(crystal >> (3 - ((rpm >> 1) & 3)))
+}
+
+impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
+    /// A handle to this GT's GGTT allocator, for a second GuC of the same
+    /// tile whose firmware memory must come from the same shared GGTT.
+    pub(crate) fn shared_allocator(&self) -> A
+    where
+        A: Clone,
+    {
+        self.parts.boot.diagnostic_allocator()
+    }
+
+    /// Which GuC of the tile this owner boots.
+    // Read only by native fixtures.
+    #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
+    pub(crate) fn guc_role(&self) -> crate::intel_gpu_guc_boot::GuCRole {
+        self.parts.boot.role()
+    }
+
+    /// Before the GuC reset of a GT whose media power management started,
+    /// with its wake held: xe_uc.c::xe_uc_gucrc_disable ->
+    /// xe_guc_pc_gucrc_disable (SETUP_PC_GUCRC(GUCRC_HOST_CONTROL), then
+    /// xe_gt_idle_disable_c6: RC_CONTROL = 0, RC_STATE = 0), as
+    /// gt_reset_worker does before xe_uc_stop, and xe_gt_idle_disable_pg
+    /// (POWERGATE_ENABLE = 0), as xe_gt_suspend does. NARF uses one verified
+    /// stop for media recovery, park and suspend, so each runs the whole
+    /// teardown; the next owner enables both again.
+    fn media_power_down(&mut self) {
+        if !core::mem::take(&mut self.media_power) {
+            return;
+        }
+        let parts = &mut *self.parts;
+        if let (Some(scheduler), Some(ct)) = (parts.scheduler.as_mut(), parts.ct.as_mut()) {
+            scheduler.release_gucrc(ct);
+        }
+        let window = parts.boot.window();
+        window.write32(crate::intel_gpu_gt::media::RC_CONTROL, 0);
+        window.write32(crate::intel_gpu_gt::media::RC_STATE, 0);
+        window.write32(crate::intel_gpu_gt::media::POWERGATE_ENABLE, 0);
     }
 }
 

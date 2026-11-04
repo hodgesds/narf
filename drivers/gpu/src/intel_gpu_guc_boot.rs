@@ -9,7 +9,7 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gt::{GtPlatform, GUC_GGTT_MIN};
 use crate::intel_gpu_guc::CssImage;
 use crate::intel_gpu_guc_firmware::GuCFirmware;
-use crate::intel_gpu_guc_transport::{TransportError, XeLpgTransport};
+use crate::intel_gpu_guc_transport::{MailboxRegisters, TransportError, XeLpgTransport};
 use crate::intel_gpu_guc_wa::GuCWorkarounds;
 use crate::intel_gpu_hwconfig::{HardwareConfig, HwconfigError};
 use crate::intel_gpu_rcs::{GpuAllocator, GpuBacking, SubmitError};
@@ -30,15 +30,8 @@ const SYSINFO: u64 = 0x123c;
 const WA_KLVS: u64 = 0x3000; // reserved ADS page, separate from register saves/private data
 
 fn invalidate_guc_tlb(mmio: &impl MmioWindow, platform: GtPlatform) {
-    let _ = mmio.read32(0x1901f8);
-    if platform == GtPlatform::Battlemage {
-        mmio.write32(0xcf80, 1 << 6);
-        mmio.write32(0xcf7c, 1);
-        let _ = mmio.read32(0xcf7c);
-    } else {
-        mmio.write32(0xcee8, 1);
-        let _ = mmio.read32(0xcee8);
-    }
+    crate::intel_gpu_ggtt_tlb::barrier(mmio);
+    crate::intel_gpu_ggtt_tlb::invalidate_mmio(mmio, platform.is_xe2());
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -67,6 +60,7 @@ pub enum BootError {
 pub enum BootState {
     Staged,
     Resetting,
+    HucDma,
     Dma,
     Authenticating,
     Ready,
@@ -78,6 +72,55 @@ pub enum BootState {
 /// Memory publication must clean dirty CPU cache lines as well as order
 /// stores. Discrete GPUs cannot inherit an integrated-GPU LLC assumption.
 pub trait BootAllocator: GpuAllocator {
+    /// Physical LNL adapters require a fresh driver-FLR receipt before staging.
+    fn lnl_takeover_ready(&self) -> bool {
+        false
+    }
+    /// LNL seals and invalidates the whole arena before releasing media wake.
+    /// Other profiles retain their existing per-backing retirement contract.
+    fn retire_ggtt(&mut self) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
+    /// Register (`true`) or unregister the standalone media GuC as a second
+    /// TLB of this allocator's shared GGTT. Allocators without one refuse.
+    fn register_media_guc_tlb(&mut self, _live: bool) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
+    /// Select CT (`true`) or MMIO GGTT TLB invalidation for the registered
+    /// media GuC once its submission is enabled or disabled again.
+    fn media_guc_submission(&mut self, _enabled: bool) -> Result<(), BootError> {
+        Err(BootError::Cache)
+    }
+    /// Map the media GT's GSC private object (`pages` of DSM at
+    /// `dsm_offset`) at this GGTT's fixed GSC window with DM PTEs; returns
+    /// the window's GGTT base. Allocators without such a window refuse.
+    fn map_gsc_stolen(&mut self, _dsm_offset: u64, _pages: u32) -> Result<u32, BootError> {
+        Err(BootError::Cache)
+    }
+
+    /// Shared-GGTT GuC TLB protocol (`crate::intel_gpu_ggtt_tlb`). An
+    /// allocator with no GGTT shared with a GuC has no TLB to invalidate.
+    /// These defaults keep it a no-op.
+    ///
+    /// Select CT (`true`) or MMIO GGTT invalidation for `gt`'s GuC, as
+    /// send_tlb_inval_ggtt does on CT-and-submission enabled.
+    fn ggtt_tlb_ct(
+        &mut self,
+        _gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+        _enabled: bool,
+    ) -> Result<(), BootError> {
+        Ok(())
+    }
+    /// `gt`'s GuC reset (or a full GT reset) is proven: nothing it cached
+    /// survives, so ranges held for it are released.
+    fn ggtt_tlb_reset(&mut self, _gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {}
+    /// The arena generation a CT-mode `gt` must still invalidate.
+    fn ggtt_tlb_pending(&mut self, _gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+        None
+    }
+    /// `gt`'s TLB_INVALIDATION_DONE for a request issued at `generation`.
+    fn ggtt_tlb_complete(&mut self, _gt: crate::intel_gpu_ggtt_tlb::GuCTlb, _generation: u64) {}
+
     fn configure_cache(
         &mut self,
         _backing: &mut Self::Backing,
@@ -96,6 +139,41 @@ pub trait BootAllocator: GpuAllocator {
 }
 
 impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
+    fn lnl_takeover_ready(&self) -> bool {
+        crate::intel_gpu_rcs::SharedArena::lnl_takeover_ready(self)
+    }
+    fn retire_ggtt(&mut self) -> Result<(), BootError> {
+        crate::intel_gpu_rcs::SharedArena::retire_ggtt(self).map_err(BootError::Allocation)
+    }
+    fn register_media_guc_tlb(&mut self, live: bool) -> Result<(), BootError> {
+        self.set_media_guc_tlb(live).map_err(BootError::Allocation)
+    }
+    fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
+        self.set_media_guc_submission(enabled)
+            .map_err(BootError::Allocation)
+    }
+    fn map_gsc_stolen(&mut self, dsm_offset: u64, pages: u32) -> Result<u32, BootError> {
+        crate::intel_gpu_rcs::SharedArena::map_gsc_stolen(self, dsm_offset, pages)
+            .map_err(BootError::Allocation)
+    }
+    fn ggtt_tlb_ct(
+        &mut self,
+        gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+        enabled: bool,
+    ) -> Result<(), BootError> {
+        self.set_guc_tlb_ct(gt, enabled)
+            .map_err(BootError::Allocation)
+    }
+    fn ggtt_tlb_reset(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {
+        self.guc_tlb_reset(gt);
+    }
+    fn ggtt_tlb_pending(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+        self.guc_tlb_pending(gt)
+    }
+    fn ggtt_tlb_complete(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb, generation: u64) {
+        self.guc_tlb_complete(gt, generation);
+    }
+
     fn configure_cache(
         &mut self,
         backing: &mut Self::Backing,
@@ -161,13 +239,17 @@ impl WopcmLayout {
     }
 
     fn plan(upload: u32, huc: u32) -> Result<Self, BootError> {
+        Self::plan_total(upload, huc, 0x400000)
+    }
+
+    fn plan_total(upload: u32, huc: u32, total: u32) -> Result<Self, BootError> {
         let base = huc.checked_add(0x7fff).ok_or(BootError::Wopcm)? & !0x3fff;
-        let size = 0x400000u32
+        let size = total
             .checked_sub(0x9000)
             .and_then(|top| top.checked_sub(base))
             .ok_or(BootError::Wopcm)?
             & !0xfff;
-        Self { base, size }.validate(0x400000, upload, huc)
+        Self { base, size }.validate(total, upload, huc)
     }
 }
 
@@ -176,20 +258,60 @@ struct HwconfigDma<B: GpuBacking> {
     bytes: u32,
 }
 
+struct HucDma<B: GpuBacking> {
+    backing: B,
+    upload: u32,
+    /// uc_fw->css_offset: the DMA source within the object.
+    css_offset: u32,
+    /// xe_uc_fw_rsa_offset within the object.
+    rsa: u32,
+    version: (u8, u8, u8),
+    adopt: bool,
+}
+
 struct Resources<A: BootAllocator> {
     allocator: A,
     image: A::Backing,
     ads: A::Backing,
     logs: A::Backing,
     hwconfig: Option<HwconfigDma<A::Backing>>,
+    huc: Option<HucDma<A::Backing>>,
+    /// GuC error-capture register lists (xe_guc_ads.c capture lists), in a
+    /// separate GGTT allocation the ADS points at.
+    capture: Option<A::Backing>,
 }
 impl<A: BootAllocator> Resources<A> {
     fn free(mut self) {
         self.allocator.free(self.image);
         self.allocator.free(self.ads);
         self.allocator.free(self.logs);
+        if let Some(capture) = self.capture {
+            self.allocator.free(capture);
+        }
+        if let Some(huc) = self.huc {
+            self.allocator.free(huc.backing);
+        }
         if let Some(output) = self.hwconfig {
             self.allocator.free(output.backing);
+        }
+    }
+}
+
+/// Which GuC of the tile this bootstrap owns. The media role is constructed
+/// only over a `MediaGsi` window (see `GuCBoot::stage_media`), so its
+/// GSI-translated GuC registers and its media mailbox cannot be mismatched.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GuCRole {
+    Primary,
+    Media(crate::intel_gpu_gt::media::MediaIp),
+}
+
+impl GuCRole {
+    /// This GuC's slot in the shared GGTT's TLB bookkeeping.
+    pub(crate) const fn tlb(self) -> crate::intel_gpu_ggtt_tlb::GuCTlb {
+        match self {
+            Self::Primary => crate::intel_gpu_ggtt_tlb::GuCTlb::Primary,
+            Self::Media(_) => crate::intel_gpu_ggtt_tlb::GuCTlb::Media,
         }
     }
 }
@@ -198,7 +320,12 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     mmio: M,
     resources: ManuallyDrop<Resources<A>>,
     platform: GtPlatform,
+    role: GuCRole,
     config: BootConfig,
+    huc_exposed: bool,
+    huc_dma_done: bool,
+    /// A locked media WOPCM cannot host the staged HuC: it is never uploaded.
+    huc_blocked: bool,
     upload: u32,
     state: BootState,
     deadline: u64,
@@ -210,6 +337,7 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     firmware_version: (u8, u8, u8),
     incarnation: u64,
     workarounds: Option<GuCWorkarounds>,
+    capture_lists: Option<Arc<crate::intel_gpu_error::capture::Lists>>,
 }
 
 pub(crate) struct LiveLog<'a, B> {
@@ -273,13 +401,75 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         )
     }
 
+    pub(crate) fn stage_with_huc(
+        mmio: M,
+        allocator: A,
+        firmware: &GuCFirmware,
+        huc: &crate::intel_gpu_huc::Firmware,
+        mut config: BootConfig,
+    ) -> Result<Self, BootError> {
+        if firmware.platform() != crate::intel_gpu_huc::PLATFORM
+            || huc.platform() != crate::intel_gpu_huc::PLATFORM
+        {
+            return Err(BootError::Unsupported);
+        }
+        let huc = huc.load();
+        config.huc_upload_bytes = huc.upload;
+        Self::stage_loads(
+            mmio,
+            allocator,
+            firmware.platform(),
+            firmware.image(),
+            config,
+            Some(huc),
+            false,
+        )
+    }
+
     fn stage_image(
+        mmio: M,
+        allocator: A,
+        platform: GtPlatform,
+        image: CssImage<'_>,
+        config: BootConfig,
+    ) -> Result<Self, BootError> {
+        Self::stage_loads(mmio, allocator, platform, image, config, None, false)
+    }
+
+    /// The exact-TGL main-GT HuC profile over a parsed CSS image.
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn stage_images(
+        mmio: M,
+        allocator: A,
+        platform: GtPlatform,
+        image: CssImage<'_>,
+        config: BootConfig,
+        huc: Option<crate::intel_gpu_huc::Image<'_>>,
+    ) -> Result<Self, BootError> {
+        if huc.is_some() && platform != crate::intel_gpu_huc::PLATFORM {
+            return Err(BootError::Unsupported);
+        }
+        let huc = huc.map(crate::intel_gpu_huc::Load::from);
+        Self::stage_loads(mmio, allocator, platform, image, config, huc, false)
+    }
+
+    /// `adopt` lets this owner's HuC authentication accept a bit that is
+    /// already set (see `intel_gpu_huc::Upload::adopt`).
+    fn stage_loads(
         mmio: M,
         mut allocator: A,
         platform: GtPlatform,
         image: CssImage<'_>,
         config: BootConfig,
+        huc: Option<crate::intel_gpu_huc::Load<'_>>,
+        adopt: bool,
     ) -> Result<Self, BootError> {
+        if huc
+            .as_ref()
+            .is_some_and(|h| config.huc_upload_bytes != h.upload)
+        {
+            return Err(BootError::Unsupported);
+        }
         let profile = platform.guc().ok_or(BootError::Unsupported)?;
         if GtPlatform::from_pci(0x8086, config.device_id) != Some(platform)
             || image.version < profile.minimum_version
@@ -287,21 +477,35 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         {
             return Err(BootError::Device);
         }
-        if (platform == GtPlatform::Battlemage
-            && config.uncached_mocs.is_none_or(|index| index > 15))
-            || (platform != GtPlatform::Battlemage && config.uncached_mocs.is_some())
+        if (platform.is_xe2() && config.uncached_mocs.is_none_or(|index| index > 15))
+            || (!platform.is_xe2() && config.uncached_mocs.is_some())
         {
             return Err(BootError::Cache);
         }
         let upload = u32::try_from(image.upload.len()).map_err(|_| BootError::Address)?;
-        WopcmLayout::plan(upload, config.huc_upload_bytes)?;
+        if platform.is_gen12() || platform.is_headless_integrated() {
+            WopcmLayout::plan_total(upload, config.huc_upload_bytes, 0x200000)?;
+        } else {
+            WopcmLayout::plan(upload, config.huc_upload_bytes)?;
+        }
         let image_pages = (upload + 384).div_ceil(PAGE);
         let ads_pages = (ADS_PRIVATE + image.private_data_bytes).div_ceil(PAGE);
         let mut allocations: Vec<A::Backing> = Vec::new();
         allocations
-            .try_reserve_exact(3)
+            .try_reserve_exact(3 + usize::from(huc.is_some()))
             .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
-        for pages in [image_pages, ads_pages, LOG_BYTES / PAGE] {
+        let huc_pages = huc
+            .as_ref()
+            .map(|h| h.object.len().div_ceil(PAGE as usize) as u32);
+        for pages in [
+            Some(image_pages),
+            Some(ads_pages),
+            Some(LOG_BYTES / PAGE),
+            huc_pages,
+        ]
+        .into_iter()
+        .flatten()
+        {
             let backing = match allocator.alloc(pages).map_err(BootError::Allocation) {
                 Ok(backing) => backing,
                 Err(error) => {
@@ -332,6 +536,25 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             }
             allocations.push(backing);
         }
+        let huc = huc.map(|h| {
+            let backing = allocations.pop().expect("HuC image");
+            backing.zero_fill();
+            // xe_uc_fw.c::uc_fw_copy: the whole object at the BO base; a
+            // trailing partial dword keeps the zero fill.
+            for (i, word) in h.object.chunks(4).enumerate() {
+                let mut dword = [0; 4];
+                dword[..word.len()].copy_from_slice(word);
+                backing.write32(i as u64 * 4, u32::from_le_bytes(dword));
+            }
+            HucDma {
+                backing,
+                upload: config.huc_upload_bytes,
+                css_offset: h.css_offset,
+                rsa: h.rsa,
+                version: h.version,
+                adopt,
+            }
+        });
         let logs = allocations.pop().expect("logs");
         let ads = allocations.pop().expect("ADS");
         let backing = allocations.pop().expect("image");
@@ -369,9 +592,15 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 ads,
                 logs,
                 hwconfig: None,
+                huc,
+                capture: None,
             }),
             platform,
+            role: GuCRole::Primary,
             config,
+            huc_exposed: false,
+            huc_dma_done: false,
+            huc_blocked: false,
             upload,
             state: BootState::Staged,
             deadline: 0,
@@ -383,6 +612,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             firmware_version: image.version,
             incarnation: 0,
             workarounds: None,
+            capture_lists: None,
         })
     }
 
@@ -392,6 +622,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
     pub(crate) fn platform(&self) -> GtPlatform {
         self.platform
+    }
+
+    pub(crate) fn role(&self) -> GuCRole {
+        self.role
     }
 
     pub(crate) fn device_id(&self) -> u16 {
@@ -420,6 +654,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.configure_cache(&mut r.image, policy)?;
         r.allocator.configure_cache(&mut r.ads, policy)?;
         r.allocator.configure_cache(&mut r.logs, policy)?;
+        if let Some(huc) = &mut r.huc {
+            r.allocator.configure_cache(&mut huc.backing, policy)?;
+        }
         Ok(())
     }
 
@@ -431,17 +668,33 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         A: Clone,
     {
         if self.state != BootState::Ready
-            || self.hwconfig.is_none()
+            || (self.needs_hwconfig() && self.hwconfig.is_none())
             || self.submission_version.0 != 1
         {
             return Err(BootError::Unsupported);
         }
-        crate::intel_gpu_guc_sched::GuCScheduler::allocate(
-            self.resources.allocator.clone(),
-            self.platform,
-            engines,
-        )
+        let allocator = self.resources.allocator.clone();
+        match self.role {
+            GuCRole::Primary => crate::intel_gpu_guc_sched::GuCScheduler::allocate(
+                allocator,
+                self.platform,
+                engines,
+            ),
+            // xe_hw_engine.c builds GT1's engines from the media fuses and
+            // xe_guc_ads.c its ADS from that list; HWCONFIG is GT0-only.
+            GuCRole::Media(_) => crate::intel_gpu_guc_sched::GuCScheduler::allocate_media(
+                allocator,
+                self.platform,
+                engines,
+            ),
+        }
         .map_err(BootError::Scheduling)
+    }
+
+    /// xe_guc_hwconfig_init skips every non-GT0 GuC: only the primary GuC of
+    /// a HWCONFIG platform must hold the table before scheduling.
+    fn needs_hwconfig(&self) -> bool {
+        self.role == GuCRole::Primary && self.platform.has_hwconfig()
     }
 
     pub(crate) fn begin_scheduling(
@@ -449,7 +702,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         ads: crate::intel_gpu_guc_sched::SchedulingAds,
         now: u64,
     ) -> Result<(), BootError> {
-        if self.state != BootState::Ready || self.hwconfig.is_none() || self.scheduling.is_some() {
+        if self.state != BootState::Ready
+            || (self.needs_hwconfig() && self.hwconfig.is_none())
+            || self.scheduling.is_some()
+        {
             return Err(BootError::State);
         }
         if self.submission_version.0 != 1 {
@@ -469,6 +725,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.awake()?;
         invalidate_guc_tlb(&self.mmio, self.platform);
         Ok(())
+    }
+
+    /// Switch this GuC's shared-GGTT invalidation to its CT once submission
+    /// is enabled, or back to MMIO when submission stops.
+    pub(crate) fn ggtt_tlb_ct(&mut self, enabled: bool) -> Result<(), BootError> {
+        if self.released {
+            return Err(BootError::State);
+        }
+        let gt = self.role.tlb();
+        self.resources.allocator.ggtt_tlb_ct(gt, enabled)
+    }
+
+    /// This GuC's reset is proven: release ranges held for its TLB.
+    pub(crate) fn ggtt_tlb_reset(&mut self) {
+        if !self.released {
+            let gt = self.role.tlb();
+            self.resources.allocator.ggtt_tlb_reset(gt);
+        }
     }
 
     pub(crate) fn window(&self) -> &M {
@@ -496,10 +770,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         let backing = r.allocator.alloc(pages).map_err(BootError::Allocation)?;
         let base = backing.ggtt_offset();
         let checked = extent(&backing, pages).and_then(|()| {
-            if [&r.image, &r.ads, &r.logs].iter().any(|old| {
-                (base as u64) < old.ggtt_offset() as u64 + old.size_pages() as u64 * 4096
-                    && (old.ggtt_offset() as u64) < base as u64 + pages as u64 * 4096
-            }) {
+            if [&r.image, &r.ads, &r.logs]
+                .into_iter()
+                .chain(r.huc.as_ref().map(|h| &h.backing))
+                .any(|old| {
+                    (base as u64) < old.ggtt_offset() as u64 + old.size_pages() as u64 * 4096
+                        && (old.ggtt_offset() as u64) < base as u64 + pages as u64 * 4096
+                })
+            {
                 Err(BootError::Address)
             } else {
                 Ok(())
@@ -519,6 +797,52 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.hwconfig = Some(HwconfigDma { backing, bytes });
         invalidate_guc_tlb(&self.mmio, self.platform);
         Ok(base)
+    }
+
+    /// Allocate the GuC error-capture list object while the GuC runs, before
+    /// the submission reload. The lists and the ADS capture pointers are
+    /// written only while the GuC is proven stopped (`poll`'s reload), as
+    /// xe_guc_ads_populate's guc_capture_prep_lists. Primary GuC only.
+    pub(crate) fn prepare_error_capture(
+        &mut self,
+        lists: Arc<crate::intel_gpu_error::capture::Lists>,
+    ) -> Result<(), BootError> {
+        if self.state != BootState::Ready
+            || self.role != GuCRole::Primary
+            || self.scheduling.is_some()
+            || self.resources.capture.is_some()
+        {
+            return Err(BootError::State);
+        }
+        self.awake()?;
+        let pages = u32::try_from(lists.bytes() / PAGE as usize).map_err(|_| BootError::Address)?;
+        let r = &mut *self.resources;
+        let backing = r.allocator.alloc(pages).map_err(BootError::Allocation)?;
+        let base = backing.ggtt_offset();
+        let checked = extent(&backing, pages).and_then(|()| {
+            if [&r.image, &r.ads, &r.logs]
+                .into_iter()
+                .chain(r.huc.as_ref().map(|h| &h.backing))
+                .chain(r.hwconfig.as_ref().map(|h| &h.backing))
+                .any(|old| {
+                    u64::from(base)
+                        < u64::from(old.ggtt_offset()) + u64::from(old.size_pages()) * 4096
+                        && u64::from(old.ggtt_offset()) < u64::from(base) + u64::from(pages) * 4096
+                })
+            {
+                Err(BootError::Address)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = checked {
+            r.allocator.free(backing);
+            return Err(error);
+        }
+        backing.zero_fill();
+        r.capture = Some(backing);
+        self.capture_lists = Some(lists);
+        Ok(())
     }
 
     pub(crate) fn finish_hwconfig(&mut self) -> Result<(), BootError> {
@@ -553,8 +877,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::State);
         }
         self.awake()?;
-        XeLpgTransport::allocate_for_platform(
+        XeLpgTransport::allocate_with_mailbox(
             self.platform,
+            match self.role {
+                GuCRole::Primary => MailboxRegisters::PRIMARY,
+                GuCRole::Media(_) => MailboxRegisters::MEDIA,
+            },
             self.mmio.clone(),
             self.resources.allocator.clone(),
         )
@@ -584,12 +912,40 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::State);
         }
         self.awake()?;
+        self.huc_dma_done = false;
         if self.mmio.read32(GDRST) != 0 || self.mmio.read32(DMA_CTRL) & 1 != 0 {
             return Err(BootError::Busy);
         }
-        let ip = crate::intel_gpu_gt::GraphicsIp::read(&self.mmio, self.platform)
-            .map_err(BootError::Graphics)?;
-        let workarounds = GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
+        let workarounds = match self.role {
+            GuCRole::Primary => {
+                let ip = crate::intel_gpu_gt::GraphicsIp::read(&self.mmio, self.platform)
+                    .map_err(BootError::Graphics)?;
+                let mut workarounds =
+                    GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
+                if self.platform.is_headless_integrated() {
+                    let fuse = self.mmio.read32(0x9114);
+                    if fuse == u32::MAX || fuse != self.mmio.read32(0x9114) {
+                        return Err(BootError::Unavailable);
+                    }
+                    if fuse & 0x000f0000 != 0 {
+                        workarounds.flags |= 0x00400000;
+                    }
+                }
+                workarounds
+            }
+            GuCRole::Media(ip) => {
+                // The staged GT1 identity must still be current under media
+                // wake. The GSI window reads GMD_ID at MEDIA_GT_GSI_OFFSET.
+                let gmd = self.mmio.read32(0xd8c);
+                if gmd == u32::MAX {
+                    return Err(BootError::Unavailable);
+                }
+                if gmd != ip.gmd || self.mmio.read32(0xd8c) != gmd {
+                    return Err(BootError::Device);
+                }
+                GuCWorkarounds::for_media(self.platform, ip).ok_or(BootError::Unsupported)?
+            }
+        };
         if self.workarounds.is_some_and(|old| old != workarounds) {
             return Err(BootError::Device);
         }
@@ -602,23 +958,50 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Ok(())
     }
 
-    fn layout(&self) -> Result<WopcmLayout, BootError> {
+    fn layout(&mut self) -> Result<WopcmLayout, BootError> {
         let size = self.mmio.read32(0xc050);
         let offset = self.mmio.read32(0xc340);
         if size == u32::MAX || offset == u32::MAX {
             return Err(BootError::Unavailable);
         }
         if size & 1 != 0 || offset & 1 != 0 {
+            // Conservative ownership requirement for an enabled HuC: the
+            // locked partition must select GuC as loading agent. Linux masks
+            // this bit in its inherited-layout path; never rewrite its lock.
+            // The media GuC fails closed for its HuC only: GT1 still boots.
+            if self.resources.huc.is_some() && offset & 2 == 0 {
+                if self.role == GuCRole::Primary {
+                    return Err(BootError::Wopcm);
+                }
+                self.huc_blocked = true;
+            }
             if size & 1 == 0 || offset & 1 == 0 {
                 return Err(BootError::Wopcm);
             }
-            return WopcmLayout {
+            let locked = WopcmLayout {
                 base: offset & 0xffffc000,
                 size: size & 0xfffff000,
-            }
-            .validate(0x800000, self.upload, self.config.huc_upload_bytes);
+            };
+            let huc = if self.huc_blocked {
+                0
+            } else {
+                self.config.huc_upload_bytes
+            };
+            return match locked.validate(0x800000, self.upload, huc) {
+                // A locked GuC base below the HuC reservation is -E2BIG in
+                // xe_wopcm.c::__check_layout; the media GuC drops the HuC.
+                Err(BootError::Wopcm) if huc != 0 && matches!(self.role, GuCRole::Media(_)) => {
+                    self.huc_blocked = true;
+                    locked.validate(0x800000, self.upload, 0)
+                }
+                result => result,
+            };
         }
-        let layout = WopcmLayout::plan(self.upload, self.config.huc_upload_bytes)?;
+        let layout = if self.platform.is_gen12() || self.platform.is_headless_integrated() {
+            WopcmLayout::plan_total(self.upload, self.config.huc_upload_bytes, 0x200000)?
+        } else {
+            WopcmLayout::plan(self.upload, self.config.huc_upload_bytes)?
+        };
         self.mmio.write32(0xc050, layout.size);
         if self.mmio.read32(0xc050) != layout.size | 1 {
             return Err(BootError::Wopcm);
@@ -635,8 +1018,76 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Ok(layout)
     }
 
+    fn wa_offset(&self) -> u64 {
+        if self.platform.is_gen12()
+            && self.scheduling.is_some_and(|config| {
+                config.engines.iter().enumerate().any(|(index, state)| {
+                    state.is_some() && crate::intel_gpu_engine::Engine::ALL[index].is_media()
+                })
+            })
+        {
+            0x5000
+        } else {
+            WA_KLVS
+        }
+    }
+
     fn upload(&mut self, now: u64) -> Result<(), BootError> {
+        let wa_offset = self.wa_offset();
         self.layout()?;
+        // xe_uc.c::xe_uc_load_hw uploads the HuC before the GuC, while
+        // xe_guc_min_load_for_hwconfig (the media GuC's minimal first boot)
+        // uploads none. The TGL owner keeps its HuC DMA before both loads.
+        let huc_load = match self.role {
+            GuCRole::Primary => true,
+            GuCRole::Media(_) => self.scheduling.is_some(),
+        };
+        if !self.huc_dma_done && self.resources.huc.is_some() && huc_load && !self.huc_blocked {
+            if self.role == GuCRole::Primary {
+                // TGL's HuC never survives the full reset preceding this
+                // owner: a set bit is stale state. The media-GT HuC survives
+                // GuC/GT reset (i915 intel_huc.c DOC) and Linux uploads it
+                // regardless; authentication rechecks the bit first.
+                let status = self.mmio.read32(0xc1dc);
+                if status == u32::MAX {
+                    return Err(BootError::Unavailable);
+                }
+                if status & 1 != 0 {
+                    return Err(BootError::Reset);
+                }
+            }
+            let r = &mut *self.resources;
+            let huc = r.huc.as_ref().expect("owned HuC");
+            let source = huc
+                .backing
+                .ggtt_offset()
+                .checked_add(huc.css_offset)
+                .ok_or(BootError::Address)?;
+            r.allocator.sync_for_device(&huc.backing)?;
+            invalidate_guc_tlb(&self.mmio, self.platform);
+            if self.role == GuCRole::Primary {
+                // Sticky before the first hardware address publication until
+                // the enclosing full Gen12 reset. The media-GT object is read
+                // only by this DMA and the media GuC's AUTHENTICATE_HUC (NARF
+                // issues no GSC authentication), so the verified GuC stop
+                // (MIA in reset, DMA idle) preceding reclamation ends both.
+                self.huc_exposed = true;
+            }
+            // uc_fw_xfer: source GGTT base + css_offset, WOPCM offset 0.
+            self.mmio.write32(0xc300, source);
+            self.mmio.write32(0xc304, 8 << 16);
+            self.mmio.write32(0xc308, 0);
+            self.mmio.write32(0xc30c, 7 << 16);
+            self.mmio.write32(0xc310, huc.upload);
+            self.deadline = now.checked_add(100_000_000).ok_or(BootError::Timeout)?;
+            self.state = BootState::HucDma;
+            // This lower-level boot owner cannot reclaim this graph on
+            // GuC-only Stopped. The enclosing full Gen12 reset retires it.
+            fence(Ordering::SeqCst);
+            self.mmio.write32(DMA_CTRL, 0x02010201);
+            let _ = self.mmio.read32(DMA_CTRL);
+            return Ok(());
+        }
         let power_mask = self.mmio.read32(0xa168);
         if power_mask == u32::MAX {
             return Err(BootError::Unavailable);
@@ -648,15 +1099,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         // bytes as output from the firmware about to start.
         r.logs.zero_fill();
         self.incarnation = crate::intel_gpu_guc_log::next_incarnation();
-        // GuC is proven in reset. Publish bounded zero-length 16:16 KLVs,
+        if workarounds.klvs.len() > PAGE as usize / 4
+            || wa_offset + u64::from(PAGE) > u64::from(ADS_PRIVATE)
+        {
+            return Err(BootError::Address);
+        }
+        // GuC is proven in reset. Publish bounded 16:16 KLVs including source length-one payloads,
         // the complete 64-bit ADS pointer and its byte count before DMA.
         for i in 0..PAGE / 4 {
-            r.ads.write32(WA_KLVS + u64::from(i) * 4, 0);
+            r.ads.write32(wa_offset + u64::from(i) * 4, 0);
         }
         for (i, word) in workarounds.klvs.iter().copied().enumerate() {
-            r.ads.write32(WA_KLVS + i as u64 * 4, word);
+            r.ads.write32(wa_offset + i as u64 * 4, word);
         }
-        r.ads.write32(0x11a4, r.ads.ggtt_offset() + WA_KLVS as u32);
+        r.ads
+            .write32(0x11a4, r.ads.ggtt_offset() + wa_offset as u32);
         r.ads.write32(0x11a8, 0);
         r.ads.write32(0x11ac, workarounds.klvs.len() as u32 * 4);
         if !self.platform.is_discrete() {
@@ -670,6 +1127,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.sync_for_device(&r.image)?;
         r.allocator.sync_for_device(&r.ads)?;
         r.allocator.sync_for_device(&r.logs)?;
+        if let Some(capture) = &r.capture {
+            r.allocator.sync_for_device(capture)?;
+        }
         let mut params = [0u32; 14];
         params[0] = r.logs.ggtt_offset() | 0x3f5;
         if crate::intel_gpu_guc_log::stream::enabled() {
@@ -749,9 +1209,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Poll::Ready(Err(BootError::Poisoned));
         }
         self.awake()?;
-        if now >= self.deadline {
-            return Poll::Ready(Err(BootError::Timeout));
+        // xe_mmio_wait32 and guc_wait_ucode's poll_timeout_us: the GDRST,
+        // DMA_CTRL and GUC_STATUS reads below precede the deadline. A late
+        // poll that finds the awaited state progresses; only a still
+        // unsatisfied wait fails. Every transition re-arms the deadline.
+        match self.advance(now) {
+            Poll::Pending if now >= self.deadline => Poll::Ready(Err(BootError::Timeout)),
+            result => result,
         }
+    }
+
+    fn advance(&mut self, now: u64) -> Poll<Result<BootState, BootError>> {
         match self.state {
             BootState::Resetting | BootState::Stopping => {
                 let reset = self.mmio.read32(GDRST);
@@ -780,6 +1248,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                     if self.reload {
                         self.reload = false;
                         let config = self.scheduling.expect("scheduling reload");
+                        let wa_offset = self.wa_offset();
                         let ads = &self.resources.ads;
                         let base = ads.ggtt_offset();
                         // Populate only while GuC is proven stopped. Mapping
@@ -787,10 +1256,6 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         // register-state headers use physical instances.
                         // xe_guc_ads.c mapping/enable masks, golden LRCA with
                         // its post-register state size, and per-engine saves.
-                        // guc_policies_init: global_flags 0 lets GuC reset an
-                        // engine whose context fails to preempt in time; the
-                        // scheduler retires that context alone.
-                        ads.write32(POLICIES + 76, 0);
                         let engines = crate::intel_gpu_engine::EngineSet::from_bits(
                             config
                                 .engines
@@ -800,13 +1265,91 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                                     bits | if state.is_some() { 1 << i } else { 0 }
                                 }),
                         );
-                        for engine in crate::intel_gpu_engine::Engine::ALL {
-                            let Some(state) = config.engines[engine.index()] else {
-                                continue;
-                            };
+                        let policy = config.reset_policy.ok_or(BootError::State)?;
+                        if !policy.matches(self.platform, engines)
+                            || policy.device_id() != self.config.device_id
+                        {
+                            return Poll::Ready(Err(BootError::Device));
+                        }
+                        // Precompute and bound every engine's complete save
+                        // list before changing any ADS header. The register
+                        // page ends at the separate firmware-WA KLV page.
+                        let mut regsets = Vec::new();
+                        regsets
+                            .try_reserve_exact(engines.iter().count())
+                            .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
+                        let protected = [
+                            Some(&self.resources.ads),
+                            Some(&self.resources.image),
+                            Some(&self.resources.logs),
+                            self.resources.huc.as_ref().map(|h| &h.backing),
+                            self.resources.capture.as_ref(),
+                        ]
+                        .map(|backing| {
+                            backing.map(|backing| {
+                                let start = u64::from(backing.ggtt_offset());
+                                (
+                                    start,
+                                    start + u64::from(backing.size_pages()) * u64::from(PAGE),
+                                )
+                            })
+                        });
+                        let mut state_ranges = Vec::new();
+                        state_ranges
+                            .try_reserve_exact(engines.iter().count() * 2)
+                            .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
+                        let mut next_save = 0x2000u64;
+                        for engine in engines.iter() {
+                            let registers = policy.registers(engine).ok_or(BootError::State)?;
+                            let end = next_save
+                                .checked_add(registers.len() as u64 * 16)
+                                .ok_or(BootError::Address)?;
+                            let state = config.engines[engine.index()].ok_or(BootError::State)?;
+                            if end > wa_offset
+                                || wa_offset + u64::from(PAGE) > u64::from(ADS_PRIVATE)
+                                || u64::from(ADS_PRIVATE)
+                                    > u64::from(ads.size_pages()) * u64::from(PAGE)
+                                || state.bytes != engine.lrc_pages(self.platform) * PAGE
+                                || state.bytes < PAGE + 96 * 4
+                                || state.golden % PAGE != 0
+                                || state.hwsp % PAGE != 0
+                                || state.golden.checked_add(state.bytes).is_none()
+                            {
+                                return Poll::Ready(Err(BootError::Address));
+                            }
+                            // Golden images and HWSPs remain separately owned
+                            // DMA allocations, never ADS/private/KLV storage or
+                            // another engine's writable state. Check every
+                            // interval before publishing even the first header.
+                            for (start, bytes) in [(state.golden, state.bytes), (state.hwsp, PAGE)]
+                            {
+                                let start = u64::from(start);
+                                let end = start + u64::from(bytes);
+                                if start < u64::from(GUC_GGTT_MIN)
+                                    || end > 0xfee00000
+                                    || protected
+                                        .iter()
+                                        .flatten()
+                                        .chain(state_ranges.iter())
+                                        .any(|&(other, limit)| start < limit && other < end)
+                                {
+                                    return Poll::Ready(Err(BootError::Address));
+                                }
+                                state_ranges.push((start, end));
+                            }
+                            regsets.push((engine, next_save, registers));
+                            next_save = end;
+                        }
+                        // All class/physical headers and state pointers are now
+                        // bounded. Saves end before the KLV page; that full page
+                        // ends before firmware-private storage at 0x6000.
+                        // guc_policies_init: allow firmware to reset an
+                        // engine whose context fails to preempt in time.
+                        ads.write32(POLICIES + 76, 0);
+                        for (engine, saves, registers) in regsets {
+                            let state = config.engines[engine.index()].ok_or(BootError::State)?;
                             let class = u64::from(engine.guc_class());
                             let base_reg = engine.base();
-                            let saves = 0x2000 + engine.index() as u64 * 48;
                             let logical = u64::from(
                                 engines.logical_instance(engine).expect("published engine"),
                             );
@@ -827,19 +1370,35 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             }
                             let header = class * 256 + u64::from(physical) * 8;
                             ads.write32(header, base + saves as u32);
-                            ads.write32(header + 4, 3);
-                            for (i, (reg, value, flags)) in [
-                                (base_reg + 0x29c, 0, 1),
-                                (base_reg + 0x80, state.hwsp, 0),
-                                (base_reg + 0xa8, 0, 0),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            {
-                                ads.write32(saves + i as u64 * 16, reg);
-                                ads.write32(saves + i as u64 * 16 + 4, value);
-                                ads.write32(saves + i as u64 * 16 + 8, flags);
+                            ads.write32(header + 4, registers.len() as u32);
+                            for (i, register) in registers.iter().enumerate() {
+                                let entry = saves + i as u64 * 16;
+                                ads.write32(entry, register.offset);
+                                // The firmware owns value as save scratch;
+                                // retain the initial HWS value for the ring.
+                                ads.write32(
+                                    entry + 4,
+                                    if register.offset == base_reg + 0x80 {
+                                        state.hwsp
+                                    } else {
+                                        0
+                                    },
+                                );
+                                ads.write32(entry + 8, register.flags);
+                                ads.write32(entry + 12, 0);
                             }
+                        }
+                        // guc_capture_prep_lists, from the published engines'
+                        // per-capture-class enabled masks.
+                        if let (Some(lists), Some(backing)) =
+                            (&self.capture_lists, &self.resources.capture)
+                        {
+                            let mut masks = [0; crate::intel_gpu_error::capture::CLASSES];
+                            for engine in engines.iter() {
+                                masks[crate::intel_gpu_error::capture::capture_class(engine)] |=
+                                    1 << engine.physical_instance();
+                            }
+                            lists.write_ads(ads, backing, masks);
                         }
                         self.state = BootState::Staged;
                         self.begin(now)?;
@@ -848,6 +1407,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                     self.state = BootState::Stopped;
                     return Poll::Ready(Ok(self.state));
                 }
+                self.upload(now)?;
+            }
+            BootState::HucDma => {
+                let control = self.mmio.read32(DMA_CTRL);
+                if control == u32::MAX {
+                    return Poll::Ready(Err(BootError::Unavailable));
+                }
+                if control & 1 != 0 {
+                    return Poll::Pending;
+                }
+                fence(Ordering::Acquire);
+                self.mmio.write32(DMA_CTRL, 0x02000000);
+                self.huc_dma_done = true;
                 self.upload(now)?;
             }
             BootState::Dma => {
@@ -897,6 +1469,43 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         }
     }
 
+    pub(crate) fn retire_ggtt(&mut self) -> Result<(), BootError> {
+        if !matches!(self.state, BootState::Stopped | BootState::Staged) {
+            return Err(BootError::State);
+        }
+        self.resources.allocator.retire_ggtt()
+    }
+
+    /// The staged HuC object as xe_huc.c::huc_auth_via_gsccs names it:
+    /// xe_bo_ggtt_addr(huc->fw.bo) and xe_bo_size(huc->fw.bo).
+    pub(crate) fn huc_object(&self) -> Option<(u64, u32)> {
+        let h = self.resources.huc.as_ref()?;
+        Some((
+            u64::from(h.backing.ggtt_offset()),
+            h.backing.size_pages().checked_mul(PAGE)?,
+        ))
+    }
+
+    pub(crate) fn huc_upload(&self) -> Option<crate::intel_gpu_huc::Upload> {
+        let h = self.resources.huc.as_ref()?;
+        Some(crate::intel_gpu_huc::Upload {
+            rsa: h.backing.ggtt_offset().checked_add(h.rsa)?,
+            version: h.version,
+            adopt: h.adopt,
+        })
+    }
+
+    /// The staged HuC can still be uploaded: a locked WOPCM did not block it.
+    pub(crate) fn huc_loadable(&self) -> bool {
+        self.resources.huc.is_some() && !self.huc_blocked
+    }
+
+    /// Only the enclosing Gen12 owner calls this after full engine reset and
+    /// release of every retained media wake ACK, never GuC-only reset.
+    pub(crate) fn huc_full_reset_complete(&mut self) {
+        self.huc_exposed = false;
+    }
+
     fn free(&mut self) {
         if self.released {
             return;
@@ -908,6 +1517,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 
     /// # Safety
+    /// For HuC, the proof additionally covers full Gen12 engine reset and
+    /// media-wake ACK retirement; GuC-only Stopped is insufficient.
     /// The GT owner proved every GuC/firmware-DMA agent stopped and invalidated
     /// stale firmware/ADS/log addresses. A timeout or unreadable BAR is no proof.
     pub unsafe fn release_after_gt_reset(mut self) {
@@ -915,9 +1526,54 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 }
 
+impl<W: MmioWindow, A: BootAllocator> GuCBoot<crate::intel_gpu_gt::media::MediaGsi<W>, A> {
+    /// Stage the MTL/Arrow standalone media GuC with the same GuC firmware
+    /// family as GT0 (xe_uc_fw.c: METEORLAKE GT_TYPE_ANY mtl_guc_70). WOPCM,
+    /// reset, DMA, status and ADS registers go through the media GSI window;
+    /// HWCONFIG is never queried (xe_guc_hwconfig_init: GT0 only).
+    ///
+    /// `huc` optionally stages the media GT's HuC (xe_huc.c::xe_huc_init:
+    /// above graphics 12.55 the HuC lives on the media GT) with its `adopt`
+    /// policy. xe_wopcm.c then reserves the HuC upload below the GuC WOPCM
+    /// and names GuC the HuC loading agent; the HuC DMA precedes only the
+    /// submission load. Without it no HuC image is reserved.
+    pub(crate) fn stage_media(
+        mmio: crate::intel_gpu_gt::media::MediaGsi<W>,
+        allocator: A,
+        firmware: &GuCFirmware,
+        huc: Option<(&crate::intel_gpu_huc::Firmware, bool)>,
+        mut config: BootConfig,
+        ip: crate::intel_gpu_gt::media::MediaIp,
+    ) -> Result<Self, BootError> {
+        if !crate::intel_gpu_gt::media::profile_eligible(firmware.platform())
+            || config.huc_upload_bytes != 0
+            || GuCWorkarounds::for_media(firmware.platform(), ip).is_none()
+            || huc.is_some_and(|(huc, _)| huc.platform() != firmware.platform())
+        {
+            return Err(BootError::Unsupported);
+        }
+        let adopt = huc.is_some_and(|(_, adopt)| adopt);
+        let huc = huc.map(|(huc, _)| huc.load());
+        if let Some(huc) = &huc {
+            config.huc_upload_bytes = huc.upload;
+        }
+        let mut boot = Self::stage_loads(
+            mmio,
+            allocator,
+            firmware.platform(),
+            firmware.image(),
+            config,
+            huc,
+            adopt,
+        )?;
+        boot.role = GuCRole::Media(ip);
+        Ok(boot)
+    }
+}
+
 impl<M: MmioWindow, A: BootAllocator> Drop for GuCBoot<M, A> {
     fn drop(&mut self) {
-        if matches!(self.state, BootState::Staged | BootState::Stopped) {
+        if !self.huc_exposed && matches!(self.state, BootState::Staged | BootState::Stopped) {
             self.free();
         }
     }
@@ -940,6 +1596,19 @@ mod tests {
     }
     #[derive(Default)]
     struct Device {
+        // Opt-in independent whole-device model. Old fixture behavior is
+        // unchanged unless a smallbar test explicitly enables these semantics.
+        smallbar: bool,
+        smallbar_flrs: usize,
+        smallbar_guc_retired: bool,
+        smallbar_engines_retired: bool,
+        smallbar_reject: Option<u64>,
+        smallbar_hold_flr: bool,
+        slpc_dcc: Vec<(u32, u32)>,
+        // Every PC_SLPC_REQUEST (0x3003) and SETUP_PC_GUCRC (0x3004) the
+        // model's CT consumed, action word first, in order.
+        slpc_h2g: Vec<Vec<u32>>,
+        profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,
         memory: BTreeMap<u32, Words>,
@@ -961,6 +1630,8 @@ mod tests {
         virtual_contexts: BTreeMap<u32, (u32, u32)>,
         virtual_pick: Option<u32>,
         virtual_restores: Vec<(u32, u32)>,
+        gen12_restores: Vec<(u32, u32, u32)>,
+        nonrender_seeds: Vec<(u32, [u32; 4])>,
         parallel_contexts: BTreeMap<u32, ParallelContext>,
         parallel_lanes: Option<u8>,
         parallel_reply_child: bool,
@@ -975,6 +1646,49 @@ mod tests {
         stream_drop: Option<(u16, u32)>,
         stream_overwrite: bool,
         mmio_reads: Cell<usize>,
+        // Media GuC second-TLB registration and the write index at which
+        // it was first registered (before any firmware address publication).
+        media_tlb: Option<bool>,
+        media_tlb_at: Option<usize>,
+        // Media GuC GGTT invalidation mode: CT (submission enabled) or MMIO.
+        media_ct: Option<bool>,
+        // GSC private-object DM mappings: (DSM offset, pages).
+        gsc_maps: Vec<(u64, u32)>,
+        // Opt-in shared-GGTT GuC TLB bookkeeping: the production Tracker over
+        // model backings, keyed by base. `None` keeps earlier fixtures exact.
+        ggtt_tlb: Option<crate::intel_gpu_ggtt_tlb::Tracker<u32>>,
+        // GuCs invalidated by MMIO, in publication order (opt-in only).
+        ggtt_tlb_mmio: Vec<crate::intel_gpu_ggtt_tlb::GuCTlb>,
+        // Every GuC-TLB protocol call the owners made, in order.
+        ggtt_tlb_events: Vec<(crate::intel_gpu_ggtt_tlb::GuCTlb, TlbEvent)>,
+    }
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum TlbEvent {
+        Ct,
+        Mmio,
+        Reset,
+        Complete(u64),
+    }
+    impl Device {
+        /// Publish one model PTE burst to the opt-in tracker.
+        fn tlb_publish(&mut self) -> Option<u64> {
+            let tlb = self.ggtt_tlb.as_mut()?;
+            let mmio = tlb.publish();
+            let generation = tlb.generation();
+            for (gt, invalidate) in crate::intel_gpu_ggtt_tlb::GuCTlb::ALL.into_iter().zip(mmio) {
+                if invalidate {
+                    self.ggtt_tlb_mmio.push(gt);
+                }
+            }
+            Some(generation)
+        }
+        /// Return released model backings to the free state.
+        fn tlb_release(&mut self, released: Vec<u32>) {
+            for base in released {
+                self.memory.remove(&base);
+                self.cpu_ready.remove(&base);
+            }
+        }
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
@@ -995,7 +1709,104 @@ mod tests {
         fn write32(&self, offset: u64, value: u32) {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
+            if device.smallbar && device.smallbar_reject == Some(offset) {
+                return;
+            }
+            let media = [
+                0x1c0000u64,
+                0x1c4000,
+                0x1d0000,
+                0x1d4000,
+                0x1e0000,
+                0x1e4000,
+                0x1f0000,
+                0x1f4000,
+                0x1c8000,
+                0x1d8000,
+                0x1e8000,
+                0x1f8000,
+            ]
+            .into_iter()
+            .find(|base| offset == base + 0x9c || offset == base + 0x29c || offset == base + 0xc4);
             let actual = match offset {
+                0x101018 if device.smallbar => *device.regs.get(&offset).unwrap_or(&0) & !value,
+                0x101010 if device.smallbar && value & 0x80000000 != 0 => {
+                    assert_eq!(device.allocations, 0, "destructive FLR after arena DMA");
+                    assert_eq!(device.regs[&0x101018] & 0x80000000, 0, "stale ACK");
+                    device.smallbar_flrs += 1;
+                    device.smallbar_guc_retired = false;
+                    device.smallbar_engines_retired = false;
+                    device.regs.extend([
+                        (0xa188, 2),
+                        (0xa278, 2),
+                        (0xdfc, 0),
+                        (0xd84, 0),
+                        (0x38a188, 0),
+                        (0x380dfc, 0),
+                        (0x38941c, 0),
+                        (0x38c000, 1),
+                        (0x38c314, 0),
+                    ]);
+                    for reg in (0x4800..0x4880).step_by(4) {
+                        device.regs.insert(reg, 0);
+                    }
+                    if device.smallbar_hold_flr {
+                        value
+                    } else {
+                        device.regs.insert(0x101018, 0x80000000);
+                        value & !0x80000000
+                    }
+                }
+                0x38941c if device.smallbar => {
+                    assert_eq!(device.smallbar_flrs, 1);
+                    assert_eq!(device.regs[&0x38a188] & 1, 1);
+                    assert_eq!(device.regs[&0x380dfc] & 1, 1);
+                    match value {
+                        8 => device.smallbar_guc_retired = true,
+                        1 => {
+                            assert!(device.smallbar_guc_retired);
+                            device.smallbar_engines_retired = true;
+                        }
+                        _ => panic!("unqualified media reset"),
+                    }
+                    0
+                }
+                _ if device.profile.is_some_and(GtPlatform::is_gen12) && media.is_some() => {
+                    let base = media.unwrap_or_default();
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    let mut next = (old & !(value >> 16)) | (value & (value >> 16));
+                    if offset == base + 0x9c {
+                        if next & 0x100 != 0 {
+                            next |= 0x200;
+                        } else {
+                            next &= !0x200;
+                        }
+                    }
+                    next
+                }
+                _ if device.profile.is_some_and(GtPlatform::is_gen12)
+                    && ((0xa540..=0xa55c).contains(&offset)
+                        || (0xa560..=0xa56c).contains(&offset)) =>
+                {
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    (old & !(value >> 16)) | (value & (value >> 16))
+                }
+                0x209c | 0x2209c | 0x229c | 0x2229c
+                    if device.profile.is_some_and(GtPlatform::is_gen12) =>
+                {
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    let mut next = (old & !(value >> 16)) | (value & (value >> 16));
+                    if matches!(offset, 0x209c | 0x2209c) {
+                        // Stopping the otherwise idle modeled CS exposes its
+                        // read-only MODE_IDLE bit in MI_MODE, not RING_MODE.
+                        if next & 0x100 != 0 {
+                            next |= 0x200;
+                        } else {
+                            next &= !0x200;
+                        }
+                    }
+                    next
+                }
                 0x190008 | 0x190010 => {
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     (old & !value & 0x7fffffff) | (value & 0x80000000)
@@ -1012,12 +1823,13 @@ mod tests {
                     );
                     value
                 }
-                0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
-                0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
-                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050
-                | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 | 0x1c0d4
-                | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804 => {
+                0xd8c | 0x380d8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
+                0xc050 | 0xc340 | 0x38c050 | 0x38c340 if !device.reject_wopcm => value | 1,
+                0xc314 | 0x38c314 | 0xa188 | 0xa278 | 0x38a188 | 0x20ec | 0x83b4 | 0xe48c
+                | 0xe18c | 0xe4f4 | 0xe5f0 | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194
+                | 0xe4c4 | 0xe5f4 | 0x2050 | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4
+                | 0x1a050 | 0x1c0d4 | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800
+                | 0x14804 | 0x20c4 | 0x220c4 | 0x3ee0c4 | 0x1a0c4 | 0x1c0c4 | 0x1e0c4 | 0x260c4 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
@@ -1030,6 +1842,9 @@ mod tests {
                 _ => value,
             };
             device.regs.insert(offset, actual);
+            if device.smallbar && offset == 0x38a188 {
+                device.regs.insert(0x380dfc, actual & 1);
+            }
         }
     }
     struct Backing {
@@ -1069,6 +1884,15 @@ mod tests {
         type Backing = Backing;
         fn alloc(&mut self, pages: u32) -> Result<Backing, SubmitError> {
             let mut device = self.0.borrow_mut();
+            if device.smallbar {
+                assert_eq!(device.smallbar_flrs, 1, "first PTE before fresh FLR");
+                assert!(
+                    device.smallbar_guc_retired && device.smallbar_engines_retired,
+                    "first PTE before independent media retirement"
+                );
+                assert_eq!(device.regs[&0x38a188] & 1, 1);
+                assert_eq!(device.regs[&0x380dfc] & 1, 1);
+            }
             device.allocations += 1;
             if device.fail_at == Some(device.allocations) {
                 return Err(SubmitError::OutOfMemory);
@@ -1079,6 +1903,7 @@ mod tests {
             let cpu_ready = Rc::new(Cell::new(true));
             device.cpu_ready.insert(base, cpu_ready.clone());
             device.memory.insert(base, words.clone());
+            device.tlb_publish();
             Ok(Backing {
                 base,
                 words,
@@ -1088,6 +1913,13 @@ mod tests {
         }
         fn free(&mut self, backing: Backing) {
             let mut device = self.0.borrow_mut();
+            if let Some(generation) = device.tlb_publish() {
+                // Opt-in: a cleared range stays live until every GuC covers it.
+                let tlb = device.ggtt_tlb.as_mut().expect("opted-in tracker");
+                if tlb.remove(generation, backing.base).is_none() {
+                    return;
+                }
+            }
             device.memory.remove(&backing.base);
             device.cpu_ready.remove(&backing.base);
         }
@@ -1104,6 +1936,90 @@ mod tests {
         }
     }
     impl BootAllocator for Arena {
+        fn retire_ggtt(&mut self) -> Result<(), BootError> {
+            Ok(())
+        } // model has no GGTT PTE window
+
+        fn register_media_guc_tlb(&mut self, live: bool) -> Result<(), BootError> {
+            use crate::intel_gpu_ggtt_tlb::{GuCTlb, Mode};
+            let mut device = self.0.borrow_mut();
+            if live && device.media_tlb_at.is_none() {
+                device.media_tlb_at = Some(device.writes.len());
+            }
+            device.media_tlb = Some(live);
+            device.media_ct = None;
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let mode = if live { Mode::Mmio } else { Mode::Off };
+                let released = tlb.set_mode(GuCTlb::Media, mode);
+                device.tlb_release(released);
+            }
+            Ok(())
+        }
+
+        fn media_guc_submission(&mut self, enabled: bool) -> Result<(), BootError> {
+            use crate::intel_gpu_ggtt_tlb::{GuCTlb, Mode};
+            let mut device = self.0.borrow_mut();
+            if device.media_tlb != Some(true) {
+                return Err(BootError::Cache);
+            }
+            device.media_ct = Some(enabled);
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let mode = if enabled { Mode::Ct } else { Mode::Mmio };
+                let released = tlb.set_mode(GuCTlb::Media, mode);
+                device.tlb_release(released);
+            }
+            Ok(())
+        }
+
+        fn ggtt_tlb_ct(
+            &mut self,
+            gt: crate::intel_gpu_ggtt_tlb::GuCTlb,
+            enabled: bool,
+        ) -> Result<(), BootError> {
+            use crate::intel_gpu_ggtt_tlb::Mode;
+            let mut device = self.0.borrow_mut();
+            let event = if enabled {
+                TlbEvent::Ct
+            } else {
+                TlbEvent::Mmio
+            };
+            device.ggtt_tlb_events.push((gt, event));
+            let Some(tlb) = device.ggtt_tlb.as_mut() else {
+                return Ok(());
+            };
+            // As SharedArena: only a registered GuC changes transport.
+            if tlb.mode(gt) == Mode::Off {
+                return Err(BootError::Cache);
+            }
+            let released = tlb.set_mode(gt, if enabled { Mode::Ct } else { Mode::Mmio });
+            device.tlb_release(released);
+            Ok(())
+        }
+
+        fn ggtt_tlb_reset(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) {
+            let mut device = self.0.borrow_mut();
+            device.ggtt_tlb_events.push((gt, TlbEvent::Reset));
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let released = tlb.reset(gt);
+                device.tlb_release(released);
+            }
+        }
+
+        fn ggtt_tlb_pending(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb) -> Option<u64> {
+            self.0.borrow().ggtt_tlb.as_ref()?.pending(gt)
+        }
+
+        fn ggtt_tlb_complete(&mut self, gt: crate::intel_gpu_ggtt_tlb::GuCTlb, generation: u64) {
+            let mut device = self.0.borrow_mut();
+            device
+                .ggtt_tlb_events
+                .push((gt, TlbEvent::Complete(generation)));
+            if let Some(tlb) = device.ggtt_tlb.as_mut() {
+                let released = tlb.complete(gt, generation);
+                device.tlb_release(released);
+            }
+        }
+
         fn configure_cache(
             &mut self,
             _backing: &mut Backing,
@@ -1122,6 +2038,16 @@ mod tests {
             }
             device.synced.insert(backing.base);
             Ok(())
+        }
+
+        /// The model GGTT has no PTE array: record each GSC mapping.
+        fn map_gsc_stolen(&mut self, dsm_offset: u64, pages: u32) -> Result<u32, BootError> {
+            let mut device = self.0.borrow_mut();
+            if device.fail_sync {
+                return Err(BootError::Cache);
+            }
+            device.gsc_maps.push((dsm_offset, pages));
+            Ok(crate::intel_gpu_stolen::GSC_GGTT as u32)
         }
 
         fn sync_for_cpu(&mut self, backing: &Backing) -> Result<(), BootError> {
@@ -1167,19 +2093,30 @@ mod tests {
         bytes
     }
     fn stage(window: Window, arena: Arena, platform: GtPlatform) -> GuCBoot<Window, Arena> {
+        window.0.borrow_mut().profile = Some(platform);
         window
             .0
             .borrow_mut()
             .regs
             .entry(0xd8c)
-            .or_insert(if platform == GtPlatform::Battlemage {
+            .or_insert(if platform.is_ptl() {
+                30 << 22
+            } else if platform.is_lnl() {
+                (20 << 22) | (4 << 14)
+            } else if platform == GtPlatform::Battlemage {
                 (20 << 22) | (1 << 14)
             } else {
                 (12 << 22) | (70 << 14)
             });
         let device_id = match platform {
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake) => 0x9a49,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeP) => 0x46a6,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeS) => 0x4680,
+            GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::AlderLakeN) => 0x46d1,
             GtPlatform::Alchemist => 0x56a0,
             GtPlatform::Battlemage => 0xe20b,
+            _ if platform.is_ptl() => 0xb080,
+            _ if platform.is_lnl() => 0x6420,
             _ => 0x7d55,
         };
         GuCBoot::stage_image(
@@ -1191,13 +2128,24 @@ mod tests {
                 device_id,
                 revision: 3,
                 huc_upload_bytes: 0,
-                uncached_mocs: (platform == GtPlatform::Battlemage).then_some(2),
+                uncached_mocs: platform.is_xe2().then_some(2),
             },
         )
         .unwrap()
     }
     fn reset_done(window: &Window) {
         let mut device = window.0.borrow_mut();
+        if device.profile.is_some_and(GtPlatform::is_gen12) && device.regs.get(&0x941c) == Some(&1)
+        {
+            for base in [
+                0x2000, 0x22000, 0x1c0000, 0x1c4000, 0x1d0000, 0x1d4000, 0x1e0000, 0x1e4000,
+                0x1f0000, 0x1f4000, 0x1c8000, 0x1d8000, 0x1e8000, 0x1f8000,
+            ] {
+                for offset in [0x9c, 0x29c] {
+                    device.regs.insert(base + offset, 0);
+                }
+            }
+        }
         device.regs.insert(0x941c, 0);
         device.regs.insert(0xc000, 1);
         device.regs.insert(0xc314, 0);
@@ -1216,6 +2164,55 @@ mod tests {
         reset_done(window);
         assert_eq!(boot.poll(101), Poll::Ready(Ok(BootState::Stopped)));
     }
+
+    fn smoke_gen12_media_ads_rejects_state_alias_before_any_header_write() -> TestResult {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        use crate::intel_gpu_guc_sched::{EngineAds, SchedulingAds};
+        use crate::intel_gpu_reset_policy::ResetPolicy;
+        let platform = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        for failure in 0..4 {
+            let (w, arena) = model();
+            let mut boot = stage(w.clone(), arena.clone(), platform);
+            ready(&mut boot, &w);
+            let engines = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Vcs1]);
+            let mut config = SchedulingAds {
+                engines: [None; Engine::COUNT],
+                reset_policy: ResetPolicy::new(
+                    platform, 0x9a49, 1200, 0, 0x40000000, 0, engines, false,
+                ),
+            };
+            for (index, engine) in engines.iter().enumerate() {
+                config.engines[engine.index()] = Some(EngineAds {
+                    golden: 0x30000000 + index as u32 * 0x10000,
+                    bytes: engine.lrc_pages(platform) * 4096,
+                    hwsp: 0x31000000 + index as u32 * 4096,
+                });
+            }
+            let ads = boot.resources.ads.ggtt_offset();
+            let state = config.engines[Engine::Vcs1.index()].as_mut().unwrap();
+            match failure {
+                0 => state.golden = ads + 0x5000, // future KLV page
+                1 => state.hwsp = ads + 0x6000,   // firmware-private page
+                2 => state.golden = 0x30010000,   // existing BCS golden
+                _ => state.bytes = 4096,          // under-sized class image
+            }
+            boot.begin_scheduling(config, 10).unwrap();
+            assert_eq!(boot.wa_offset(), 0x5000);
+            let before = w.0.borrow().memory[&ads].borrow().clone();
+            reset_done(&w);
+            assert_eq!(boot.poll(11), Poll::Ready(Err(BootError::Address)));
+            assert_eq!(*w.0.borrow().memory[&ads].borrow(), before);
+            assert!(boot.resources.ads.size_pages() >= 6);
+            stop(&mut boot, &w);
+            drop(boot);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12",
+        smoke_gen12_media_ads_rejects_state_alias_before_any_header_write
+    );
 
     fn smoke_boot_workaround_wire_profiles() -> TestResult {
         let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
@@ -1495,6 +2492,42 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_boot",
         smoke_boot_failure_and_stop_proof
+    );
+
+    fn smoke_boot_late_polls_observe_completed_reset_dma_and_auth() -> TestResult {
+        // xe_mmio_wait32's final read: each of GuC reset (5 ms), firmware
+        // DMA (100 ms), authentication (10 s) and the stop proof (5 ms)
+        // completes before a poll delayed past its bound. Each is success.
+        let (window, arena) = model();
+        let mut boot = stage(window.clone(), arena.clone(), GtPlatform::Alchemist);
+        boot.begin(0).unwrap();
+        reset_done(&window);
+        let mut now = 5_000_000 + 1;
+        assert!(boot.poll(now).is_pending());
+        assert_eq!(boot.state(), BootState::Dma);
+        window.0.borrow_mut().regs.insert(0xc314, 0x10);
+        now += 100_000_000 + 1;
+        assert!(boot.poll(now).is_pending());
+        assert_eq!(boot.state(), BootState::Authenticating);
+        window.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+        now += 10_000_000_000 + 1;
+        assert_eq!(boot.poll(now), Poll::Ready(Ok(BootState::Ready)));
+        now += 1;
+        boot.begin_stop(now).unwrap();
+        reset_done(&window);
+        assert_eq!(
+            boot.poll(now + 5_000_000 + 1),
+            Poll::Ready(Ok(BootState::Stopped))
+        );
+        drop(boot);
+        if arena.live_allocations() != 0 {
+            return TestResult::Fail("late stop proof retained firmware resources");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_boot_late_polls_observe_completed_reset_dma_and_auth
     );
 
     fn smoke_boot_prepublication_and_allocation_rollback() -> TestResult {
@@ -1777,6 +2810,64 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_gt",
         smoke_gt_wake_admission_and_timeouts
+    );
+
+    fn smoke_gt_late_poll_after_settled_ack_is_not_a_timeout() -> TestResult {
+        // i915 __wait_for, xe_mmio_wait32's final read and read_poll_timeout
+        // all check the condition once more after the timeout: a poll that
+        // arrives past the 50 ms bound with the ACK already settled is
+        // progress, never WakeTimeout. A true timeout still fails.
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        gt.begin(0).unwrap();
+        window.0.borrow_mut().regs.insert(0xdfc, 1);
+        let late = 50_000_000 + 7;
+        assert!(gt.poll(late).is_pending());
+        assert_eq!(gt.state(), GtState::Booting);
+        reset_done(&window);
+        assert!(gt.poll(late + 1).is_pending());
+        window.0.borrow_mut().regs.insert(0xc314, 0x10);
+        assert!(gt.poll(late + 2).is_pending());
+        window.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+        assert_eq!(gt.poll(late + 3), Poll::Ready(Ok(GtState::Ready)));
+        // The release ACK clears before a poll delayed past its own bound.
+        let stop = late + 100;
+        gt.begin_stop(stop).unwrap();
+        assert!(gt.poll(stop + 1).is_pending());
+        reset_done(&window);
+        assert!(gt.poll(stop + 2).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        window.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(
+            gt.poll(stop + 2 + 50_000_000 + 9),
+            Poll::Ready(Ok(GtState::Stopped))
+        );
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        // A release ACK that never clears still times out at the same bound.
+        let (window, arena, mut gt) = gt_model(GtPlatform::Battlemage, 0xdfc);
+        gt_ready(&mut gt, &window, 0xdfc);
+        gt.begin_stop(100).unwrap();
+        assert!(gt.poll(101).is_pending());
+        reset_done(&window);
+        assert!(gt.poll(102).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        assert!(gt.poll(102 + 50_000_000 - 1).is_pending());
+        assert_eq!(
+            gt.poll(102 + 50_000_000),
+            Poll::Ready(Err(GtError::WakeTimeout))
+        );
+        assert_eq!(gt.state(), GtState::Lost);
+        // Recovery re-requests the release; only a cleared ACK retires DMA.
+        gt.begin_stop(50_000_200).unwrap();
+        window.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(gt.poll(50_000_201), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_gt_late_poll_after_settled_ack_is_not_a_timeout
     );
 
     fn smoke_gt_loss_recovery_retains_dma() -> TestResult {
@@ -2088,12 +3179,18 @@ mod tests {
             assert!(gt.poll(7).is_pending());
             let words = if failure == 2 { [7, 2, 8] } else { [7, 1, 8] };
             let base = hwconfig_device_write(&window, &words);
+            // Failure 0 is a true timeout: no reply ever arrives. A reply
+            // already posted when a late poll runs wins over the expired
+            // deadline (condition before deadline, as Linux's waits do).
             let response = match failure {
-                1 => 0xe0000001,
-                5 => u32::MAX,
-                _ => 0xf0000000,
+                0 => None,
+                1 => Some(0xe0000001),
+                5 => Some(u32::MAX),
+                _ => Some(0xf0000000),
             };
-            window.0.borrow_mut().regs.insert(0x190240, response);
+            if let Some(response) = response {
+                window.0.borrow_mut().regs.insert(0x190240, response);
+            }
             if failure == 3 {
                 window.0.borrow_mut().fail_cpu_sync = true;
             }
@@ -2261,6 +3358,387 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hwconfig",
         smoke_hwconfig_card_refuses_wake_loss
+    );
+
+    const MTL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    /// Media GMD_ID 13.00 step 2 behind the GSI base.
+    const MEDIA_GMD: u32 = (13 << 22) | 2;
+
+    fn media_model() -> (Window, Arena) {
+        let (window, arena) = model();
+        {
+            let mut device = window.0.borrow_mut();
+            device.profile = Some(MTL);
+            // GT0 owns its own wake/GMD; the media GuC must never touch them.
+            device.regs.insert(0xd8c, (12 << 22) | (70 << 14));
+            device.regs.insert(0xa188, 1);
+            device.regs.insert(0x380d8c, MEDIA_GMD);
+            device.regs.insert(0x380dfc, 0);
+            device.regs.insert(0x38a188, 0);
+            device.regs.insert(0x1900e8, 0x8000_0000);
+            // GT1's MTL_MEDIAP_STATE_CAP (RPn 100, RP0 1150 MHz) and
+            // MTL_MPE_FREQUENCY (RPe 500 MHz). GT0's frequency fuses stay
+            // unset, so a media SLPC that read them would fail.
+            device.regs.insert(0x138020, (6 << 16) | 69);
+            device.regs.insert(0x13802c, 30);
+        }
+        (window, arena)
+    }
+
+    fn media_config() -> BootConfig {
+        BootConfig {
+            device_id: 0x7d55,
+            revision: 3,
+            huc_upload_bytes: 0,
+            uncached_mocs: None,
+        }
+    }
+
+    fn media_policy() -> crate::intel_gpu_gt_hw::CachePolicy {
+        crate::intel_gpu_gt_hw::CachePolicy {
+            platform: MTL,
+            ggtt_pat: 3,
+            media: None,
+        }
+    }
+
+    fn media_reset_done(window: &Window) {
+        let mut device = window.0.borrow_mut();
+        device.regs.insert(0x38941c, 0);
+        device.regs.insert(0x38c000, 1);
+        device.regs.insert(0x38c314, 0);
+    }
+
+    /// Offsets a media GuC owner may write: GSI-translated GT1 registers,
+    /// the absolute media mailbox/doorbell, the shared GT_PM_CONFIG doorbell
+    /// enable (xe_guc.c writes it through either GT's window) and the media
+    /// half of GUC_SG_INTR_MASK.
+    fn media_owned(offset: u64) -> bool {
+        (0x380000..0x3c0000).contains(&offset)
+            || (0x190304..=0x19031c).contains(&offset)
+            || matches!(offset, 0x13816c | 0x1900e8)
+    }
+
+    type MediaWindow = crate::intel_gpu_gt::media::MediaGsi<Window>;
+
+    fn media_ready(gt: &mut GuCGt<MediaWindow, Arena>, window: &Window) {
+        gt.begin(0).unwrap();
+        assert_eq!(window.0.borrow().regs[&0x38a188] & 1, 1);
+        assert!(gt.poll(1).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        assert!(gt.poll(2).is_pending());
+        media_reset_done(window);
+        assert!(gt.poll(3).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c314, 0x10);
+        assert!(gt.poll(4).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c000, 0x8000f000);
+        assert_eq!(gt.poll(5), Poll::Ready(Ok(GtState::Ready)));
+    }
+
+    fn media_ct(gt: &mut GuCGt<MediaWindow, Arena>, window: &Window) {
+        gt.begin_ct(6).unwrap();
+        for i in 0..6 {
+            window.0.borrow_mut().regs.insert(0x190310, 0xf0000001);
+            assert!(gt.poll(7 + i).is_pending());
+        }
+        window.0.borrow_mut().regs.insert(0x190310, 0xf0000000);
+        assert_eq!(gt.poll(13), Poll::Ready(Ok(GtState::CtReady)));
+    }
+
+    fn media_stop(gt: &mut GuCGt<MediaWindow, Arena>, window: &Window) {
+        gt.begin_stop(100).unwrap();
+        assert!(gt.poll(101).is_pending());
+        media_reset_done(window);
+        assert!(gt.poll(102).is_pending());
+        assert_eq!(gt.state(), GtState::Releasing);
+        assert_eq!(window.0.borrow().regs[&0x38a188] & 1, 0);
+        assert!(gt.poll(103).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 0);
+        assert_eq!(gt.poll(104), Poll::Ready(Ok(GtState::Stopped)));
+    }
+
+    fn smoke_media_guc_boot_ct_and_stop_touch_only_gt1_registers() -> TestResult {
+        let (window, arena) = media_model();
+        let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
+        let ip = crate::intel_gpu_gt::media::MediaIp::decode(MEDIA_GMD);
+        let mut gt = GuCGt::stage_media(
+            crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
+            arena.clone(),
+            &firmware,
+            None,
+            media_config(),
+            ip,
+            media_policy(),
+        )
+        .unwrap();
+        assert_eq!(gt.guc_role(), GuCRole::Media(ip));
+        media_ready(&mut gt, &window);
+        {
+            let device = window.0.borrow();
+            // Same firmware family and wire sequence as GT0, at the GSI base.
+            for pair in [
+                (0x38941c, 8),
+                (0x38c050, 0x3f3000),
+                (0x38c340, 0x4000),
+                (0x38c300, 0x20000000),
+                (0x38c310, 144),
+                (0x38c314, 0x00110011),
+                (0x38cee8, 1),
+            ] {
+                assert!(device.writes.contains(&pair), "media GuC wire sequence");
+            }
+            // Media 13.00 GuC flags and ADS WA KLVs (Wa_14018913170,
+            // Wa_16021333562, Wa_16026508708), scheduling still disabled.
+            assert_eq!(device.regs[&0x38c188], 0x0040_0000);
+            assert_eq!(device.regs[&0x38c18c], 0x4000);
+            assert_eq!(device.regs[&0x38c198] >> 16, 0x7d55);
+            let ads = device.memory[&0x20001000].borrow();
+            assert_eq!(&ads[0x11a4 / 4..0x11b0 / 4], &[0x20004000, 0, 8]);
+            assert_eq!(&ads[0x3000 / 4..0x3000 / 4 + 2], &[0x90020000, 0x900b0000]);
+            assert!(ads[0x3000 / 4 + 2..0x4000 / 4].iter().all(|v| *v == 0));
+            // Minimal ADS: no engine is enabled before media scheduling.
+            assert!(ads[0x123c / 4..0x143c / 4].iter().all(|v| *v == 0x20202020));
+            assert!(ads[0x143c / 4..0x147c / 4].iter().all(|v| *v == 0));
+            assert_eq!(device.gmd_reads, 0, "GT0 GMD_ID is not the media identity");
+        }
+        media_ct(&mut gt, &window);
+        {
+            let device = window.0.borrow();
+            assert!(device.writes.iter().any(|(reg, _)| *reg == 0x190304));
+            assert!(device.writes.iter().any(|(reg, _)| *reg == 0x190310));
+        }
+        media_stop(&mut gt, &window);
+        drop(gt);
+        let device = window.0.borrow();
+        assert!(
+            device.writes.iter().all(|(reg, _)| media_owned(*reg)),
+            "a media GuC owner wrote a GT0 register"
+        );
+        assert_eq!(device.regs[&0xa188], 1, "GT0 wake untouched");
+        drop(device);
+        assert_eq!(arena.live_allocations(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media_gt",
+        smoke_media_guc_boot_ct_and_stop_touch_only_gt1_registers
+    );
+
+    fn smoke_media_guc_staging_and_identity_refusals_publish_nothing() -> TestResult {
+        let ip = crate::intel_gpu_gt::media::MediaIp::decode(MEDIA_GMD);
+        // Media workaround profile is exact to MTL/Arrow Xe_LPM+ 13.00.
+        let wa = GuCWorkarounds::for_media(MTL, ip).unwrap();
+        assert_eq!(
+            (wa.flags, wa.klvs),
+            (0x0040_0000, &[0x90020000, 0x900b0000][..])
+        );
+        assert!(GuCWorkarounds::for_media(
+            MTL,
+            crate::intel_gpu_gt::media::MediaIp::decode((13 << 22) | (1 << 14))
+        )
+        .is_none());
+        assert!(GuCWorkarounds::for_media(GtPlatform::Battlemage, ip).is_none());
+        // Non-MTL firmware or another media IP: refused before allocation.
+        for (platform, gmd) in [(GtPlatform::Battlemage, MEDIA_GMD), (MTL, 20 << 22)] {
+            let (window, arena) = media_model();
+            let firmware = GuCFirmware::from_fixture(platform, &image()).unwrap();
+            let staged = GuCGt::stage_media(
+                crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
+                arena.clone(),
+                &firmware,
+                None,
+                media_config(),
+                crate::intel_gpu_gt::media::MediaIp::decode(gmd),
+                media_policy(),
+            );
+            assert!(matches!(
+                staged.err(),
+                Some(GtError::Boot(BootError::Unsupported))
+            ));
+            assert_eq!(arena.live_allocations(), 0);
+            assert!(window.0.borrow().writes.is_empty());
+        }
+        // The staged identity changed before GuC reset: no reset, no DMA.
+        let (window, arena) = media_model();
+        let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
+        let mut gt = GuCGt::stage_media(
+            crate::intel_gpu_gt::media::MediaGsi::new(window.clone()),
+            arena.clone(),
+            &firmware,
+            None,
+            media_config(),
+            ip,
+            media_policy(),
+        )
+        .unwrap();
+        gt.begin(0).unwrap();
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        window.0.borrow_mut().regs.insert(0x380d8c, MEDIA_GMD + 1);
+        assert_eq!(
+            gt.poll(1),
+            Poll::Ready(Err(GtError::Boot(BootError::Device)))
+        );
+        assert!(!window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .any(|(reg, _)| matches!(reg, 0x38941c | 0x38c314 | 0x941c | 0xc314)));
+        // The lost owner still proves its stop before releasing memory.
+        gt.begin_stop(2).unwrap();
+        assert!(gt.poll(3).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 0);
+        assert_eq!(gt.poll(4), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        assert!(window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .all(|(reg, _)| media_owned(*reg)));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media_gt",
+        smoke_media_guc_staging_and_identity_refusals_publish_nothing
+    );
+
+    fn smoke_media_guc_owner_registers_tlb_masks_irq_and_retains_on_unproven_stop() -> TestResult {
+        use crate::intel_gpu_gt::media::{MediaGt, MediaGuc, MediaGucError, MediaGucState};
+        let firmware = GuCFirmware::from_fixture(MTL, &image()).unwrap();
+        let media = MediaGt::initialized_for_test(MTL, MEDIA_GMD, 0x0001_0005);
+        // An uninitialized media GT cannot start a GuC.
+        let (window, arena) = media_model();
+        let fresh = MediaGt::new(MTL, 1274);
+        assert!(matches!(
+            MediaGuc::start(
+                window.clone(),
+                arena.clone(),
+                &firmware,
+                None,
+                media_config(),
+                &fresh,
+                0
+            )
+            .err(),
+            Some(MediaGucError::State)
+        ));
+        assert!(window.0.borrow().writes.is_empty());
+        assert_eq!(arena.live_allocations(), 0);
+        // Positive start: interrupt half masked and TLB registered before
+        // the media wake request, then boot and CT through the GT1 owner.
+        let mut guc = MediaGuc::start(
+            window.clone(),
+            arena.clone(),
+            &firmware,
+            None,
+            media_config(),
+            &media,
+            0,
+        )
+        .unwrap();
+        {
+            let device = window.0.borrow();
+            assert_eq!(device.regs[&0x1900e8], 0x8000_8000, "GT0 half preserved");
+            assert_eq!(device.media_tlb, Some(true));
+            let wake = device
+                .writes
+                .iter()
+                .position(|pair| *pair == (0x38a188, 0x0001_0001))
+                .unwrap();
+            assert!(device.media_tlb_at.unwrap() <= wake);
+        }
+        assert_eq!(guc.state(), MediaGucState::Starting);
+        assert!(guc.poll(1, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        assert!(guc.poll(2, || true).is_pending());
+        media_reset_done(&window);
+        assert!(guc.poll(3, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c314, 0x10);
+        assert!(guc.poll(4, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x38c000, 0x8000f000);
+        // Ready -> the fused VDBOX0 and VEBOX0 wells are requested for
+        // media scheduling; no CT is enabled before the scheduling reload
+        // and nothing is published while starting.
+        assert!(guc.poll(5, || true).is_pending());
+        {
+            let device = window.0.borrow();
+            assert_eq!(device.regs[&0x38a540], 0x0001_0001);
+            assert_eq!(device.regs[&0x38a560], 0x0001_0001);
+            assert!(!device.writes.iter().any(|(reg, _)| *reg == 0x190304));
+        }
+        assert_eq!(guc.state(), MediaGucState::Starting);
+        assert_eq!(guc.publication(), None);
+        // Current loss is a GT error; the owner then proves its stop.
+        assert!(matches!(
+            guc.poll(14, || false),
+            Poll::Ready(Err(MediaGucError::Gt(GtError::Unavailable)))
+        ));
+        assert_eq!(guc.state(), MediaGucState::Stopping);
+        assert!(guc.poll(15, || true).is_pending());
+        media_reset_done(&window);
+        assert!(guc.poll(16, || true).is_pending());
+        window.0.borrow_mut().regs.insert(0x380dfc, 0);
+        assert_eq!(
+            guc.poll(17, || true),
+            Poll::Ready(Ok(MediaGucState::Stopped))
+        );
+        assert!(guc.reclaimable());
+        // Engine wells are released only after the proven GuC stop.
+        {
+            let device = window.0.borrow();
+            assert_eq!(device.regs[&0x38a540], 0x0001_0000);
+            assert_eq!(device.regs[&0x38a560], 0x0001_0000);
+        }
+        assert_eq!(window.0.borrow().media_tlb, Some(false));
+        assert_eq!(guc.error(), Some(MediaGucError::Gt(GtError::Unavailable)));
+        drop(guc);
+        assert_eq!(arena.live_allocations(), 0);
+        assert!(window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .all(|(reg, _)| media_owned(*reg)));
+        // A GuC reset that never completes cannot prove stop: the owner,
+        // its firmware memory and the second-TLB registration stay retained.
+        let (window, arena) = media_model();
+        let mut guc = MediaGuc::start(
+            window.clone(),
+            arena.clone(),
+            &firmware,
+            None,
+            media_config(),
+            &media,
+            0,
+        )
+        .unwrap();
+        window.0.borrow_mut().regs.insert(0x380dfc, 1);
+        assert!(guc.poll(1, || true).is_pending());
+        media_reset_done(&window);
+        assert!(guc.poll(2, || true).is_pending());
+        // Firmware DMA is armed; the stop's GuC reset never self-clears.
+        guc.begin_stop(3);
+        assert_eq!(guc.state(), MediaGucState::Stopping);
+        let mut outcome = Poll::Pending;
+        for now in 4..64 {
+            outcome = guc.poll(now * 1_000_000, || true);
+            if outcome.is_ready() {
+                break;
+            }
+        }
+        assert_eq!(outcome, Poll::Ready(Err(MediaGucError::Retained)));
+        assert_eq!(guc.state(), MediaGucState::Retained);
+        assert!(!guc.reclaimable());
+        assert_eq!(window.0.borrow().media_tlb, Some(true));
+        assert!(arena.live_allocations() > 0);
+        core::mem::forget(guc); // fixture: retained firmware memory is never freed
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media_gt",
+        smoke_media_guc_owner_registers_tlb_masks_irq_and_retains_on_unproven_stop
     );
 
     mod hardware_tests {

@@ -11,17 +11,16 @@
 //!
 //! ## Seams consumed (built by other lanes — not re-implemented)
 //!
-//! - **GMBUS codec** (`intel_gpu_gmbus`, lane 1 / Q3 #1018):
-//!   the base-block EDID read runs the codec's own
-//!   [`build_edid_read`] program verbatim, and every other DDC
-//!   transfer is composed from the codec's documented field
-//!   encodings and caller sequence (write GMBUS0, write
-//!   GMBUS1, poll GMBUS2 via [`GmbusStatus::classify`], drain /
-//!   fill GMBUS3, restore GMBUS0 = 0). Q3 owns the transport
-//!   hardening (and the `GMBUS_BASE` / `GMBUS2_HW_DONE`
-//!   corrections); when its transport lands, the transfer
-//!   engine below is the swap-out point — the session logic
-//!   above it does not change.
+//! - **GMBUS transport** (`intel_gpu_gmbus`): every DDC transfer runs
+//!   through [`GmbusBus`] (`intel_gmbus.c::do_gmbus_xfer`): EDID blocks
+//!   as `drm_do_probe_ddc_edid` sends them (offset write + read as one
+//!   index transfer, the E-DDC segment pointer chained ahead of blocks 2
+//!   and 3 by repeated START, [`crate::intel_gpu_gmbus::read_edid_eddc`]),
+//!   SCDC as `drm_scdc_readb`/`drm_scdc_writeb`. This replaced an older
+//!   engine that ran each program as a single STOP cycle and then waited
+//!   for bus idle, wrote the byte index to GMBUS5 without
+//!   `GMBUS_2BYTE_INDEX_EN`, and read SCDC SCRAMBLER_STATUS before any
+//!   scrambled data flowed.
 //! - **Shared display-audio sink**
 //!   (`narf_drivers_sound::display_audio`, built by Q4 #1092):
 //!   this lane is its second publisher, with
@@ -45,7 +44,10 @@
 //!   drm_scdc_helper.h`): slave 0x54, TMDS_CONFIG 0x20
 //!   (bit 0 scrambling enable, bit 1 clock ratio 1/40),
 //!   SCRAMBLER_STATUS 0x21 bit 0; >340 Mcsc requires ratio
-//!   1/40 + scrambling, <=340 Mcsc requires neither.
+//!   1/40 + scrambling, <=340 Mcsc requires neither. The
+//!   enable sequence is `intel_hdmi_handle_sink_scrambling`
+//!   ([`handle_sink_scrambling`]); the scrambler status is only
+//!   sampled once the stream runs ([`scrambler_status`]).
 //! - Intel PRM Vol. 2c (TRANS_DDI_FUNC_CTL HDMI bits), Vol. 11
 //!   (WRPLL — see `intel_gpu_pll::hdmi_wrpll_coeffs`), Vol. 12
 //!   (VIDEO_DIP_* HSW bank map + the hsw_write_infoframe
@@ -77,225 +79,55 @@ use crate::intel_gpu_audio;
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_dp::sink_id_for;
-use crate::intel_gpu_gmbus::{
-    build_edid_read, gmbus1_byte_count, gmbus1_slave_addr, GmbusError, GmbusStatus, PinPair,
-    DDC_SLAVE_EDID, DDC_SLAVE_SEGMENT, GMBUS0, GMBUS0_RATE_100KHZ, GMBUS1, GMBUS1_DIR_READ,
-    GMBUS1_ENT, GMBUS1_STO, GMBUS1_SW_CLR_INT, GMBUS1_SW_RDY, GMBUS2, GMBUS3, GMBUS5,
-};
+use crate::intel_gpu_gmbus::{GmbusBus, GmbusError, PinPair};
 use crate::intel_gpu_modeset::{Framebuffer, Mode, Modeset, ModesetError};
 use crate::intel_gpu_pipes::Transcoder;
+use crate::intel_gpu_vbt::Gen12DdcOverrides;
 
 // ── DDC over GMBUS ─────────────────────────────────────────────
 
-/// Poll budget for one GMBUS transaction phase. Poll-counted,
-/// not time-based (the #879 discipline: aarch64 cycle counters
-/// crawl and x86 TSC leaps under TCG, so wall-clock budgets
-/// misfire; the GMBUS ENT bit also bounds a wedged transfer at
-/// ~30 ms on silicon).
-const GMBUS_POLL_BUDGET: u32 = 100_000;
-
-/// Errors from the DDC transfer engine.
+/// Errors from the DDC transfers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DdcError {
-    /// The GMBUS codec rejected the program shape.
+    /// The GMBUS transport refused the transfer shape or pin.
     Gmbus(GmbusError),
     /// The addressed slave NACKed (no sink, or not that slave).
     SlaveNack,
-    /// The poll budget ran out before the transfer completed.
+    /// The controller did not reach the expected state in time.
     Timeout,
-    /// The transfer completed with fewer bytes than requested.
-    ShortTransfer,
-    /// The DDI has no GMBUS pin pair (Type-C DDIs D+ on the
-    /// GEN11 HPD path are not GMBUS-addressable here).
+    /// The platform has no such DDI, so it has no DDC pin
+    /// ([`crate::intel_gpu_gmbus::gen12_ddc_pin`]).
     NoPinPair,
 }
 
 impl From<GmbusError> for DdcError {
     fn from(e: GmbusError) -> Self {
-        DdcError::Gmbus(e)
+        match e {
+            GmbusError::SlaveNack => DdcError::SlaveNack,
+            GmbusError::Timeout | GmbusError::HardwareTimeout => DdcError::Timeout,
+            other => DdcError::Gmbus(other),
+        }
     }
-}
-
-/// The GMBUS pin pair a DDI's DDC lines hang off (PRM Vol. 12
-/// GMBUS0 pin-pair table: DDI A..F = pairs 2..7).
-pub fn pin_pair_for(ddi: Ddi) -> Option<PinPair> {
-    Some(match ddi {
-        Ddi::A => PinPair::DdiA,
-        Ddi::B => PinPair::DdiB,
-        Ddi::C => PinPair::DdiC,
-        Ddi::D => PinPair::DdiD,
-        Ddi::E => PinPair::DdiE,
-        Ddi::F => PinPair::DdiF,
-        _ => return None,
-    })
-}
-
-fn gmbus_idle<M: MmioWindow + ?Sized>(mmio: &M) {
-    mmio.write32(GMBUS0, 0);
-    compiler_fence(Ordering::SeqCst);
-}
-
-/// Run one read transfer whose GMBUS0/GMBUS1 program the
-/// caller composed (the codec's EDID program, or the generic
-/// shape in [`gmbus_read`]). Drains GMBUS3 little-endian —
-/// the PRM packs the first-received byte in bits[7:0].
-fn run_read_program<M: MmioWindow + ?Sized>(
-    mmio: &M,
-    gmbus0: u32,
-    gmbus1: u32,
-    out: &mut [u8],
-) -> Result<(), DdcError> {
-    mmio.write32(GMBUS0, gmbus0);
-    mmio.write32(GMBUS1, gmbus1);
-    compiler_fence(Ordering::SeqCst);
-    let mut received = 0usize;
-    let mut budget = GMBUS_POLL_BUDGET;
-    let result = loop {
-        if budget == 0 {
-            break Err(DdcError::Timeout);
-        }
-        budget -= 1;
-        match GmbusStatus::classify(mmio.read32(GMBUS2)) {
-            GmbusStatus::SlaveNack => break Err(DdcError::SlaveNack),
-            GmbusStatus::DataReady => {
-                let dword = mmio.read32(GMBUS3);
-                for b in 0..4 {
-                    if received < out.len() {
-                        out[received] = (dword >> (8 * b)) as u8;
-                        received += 1;
-                    }
-                }
-            }
-            GmbusStatus::Done => {
-                if received == out.len() {
-                    break Ok(());
-                }
-                break Err(DdcError::ShortTransfer);
-            }
-            GmbusStatus::Pending => core::hint::spin_loop(),
-        }
-    };
-    gmbus_idle(mmio);
-    result
-}
-
-/// Read `out.len()` bytes from DDC `slave`, starting at byte
-/// `index` (programmed into GMBUS5, the block's byte-index
-/// register — this is both the EDID block offset mechanism and
-/// the SCDC register-address mechanism).
-pub fn gmbus_read<M: MmioWindow + ?Sized>(
-    mmio: &M,
-    pin: PinPair,
-    slave: u8,
-    index: u16,
-    out: &mut [u8],
-) -> Result<(), DdcError> {
-    if out.is_empty() || out.len() > 0x1FF {
-        return Err(DdcError::Gmbus(GmbusError::TooManyBytes));
-    }
-    mmio.write32(GMBUS5, index as u32);
-    compiler_fence(Ordering::SeqCst);
-    let gmbus0 = GMBUS0_RATE_100KHZ | pin.encode();
-    let gmbus1 = GMBUS1_SW_CLR_INT
-        | GMBUS1_SW_RDY
-        | GMBUS1_ENT
-        | GMBUS1_STO
-        | gmbus1_byte_count(out.len() as u16)
-        | gmbus1_slave_addr(slave)
-        | GMBUS1_DIR_READ;
-    run_read_program(mmio, gmbus0, gmbus1, out)
-}
-
-/// Write `data` to DDC `slave` (an SCDC register write is
-/// `[register, value]`; the E-DDC segment pointer is one
-/// byte). Data leaves through GMBUS3 little-endian as the
-/// controller raises HW_RDY per 4-byte chunk.
-pub fn gmbus_write<M: MmioWindow + ?Sized>(
-    mmio: &M,
-    pin: PinPair,
-    slave: u8,
-    data: &[u8],
-) -> Result<(), DdcError> {
-    if data.is_empty() || data.len() > 0x1FF {
-        return Err(DdcError::Gmbus(GmbusError::TooManyBytes));
-    }
-    let gmbus0 = GMBUS0_RATE_100KHZ | pin.encode();
-    let gmbus1 = GMBUS1_SW_CLR_INT
-        | GMBUS1_SW_RDY
-        | GMBUS1_ENT
-        | GMBUS1_STO
-        | gmbus1_byte_count(data.len() as u16)
-        | gmbus1_slave_addr(slave);
-    mmio.write32(GMBUS0, gmbus0);
-    mmio.write32(GMBUS1, gmbus1);
-    compiler_fence(Ordering::SeqCst);
-    let mut sent = 0usize;
-    let mut budget = GMBUS_POLL_BUDGET;
-    let result = loop {
-        if budget == 0 {
-            break Err(DdcError::Timeout);
-        }
-        budget -= 1;
-        match GmbusStatus::classify(mmio.read32(GMBUS2)) {
-            GmbusStatus::SlaveNack => break Err(DdcError::SlaveNack),
-            GmbusStatus::DataReady => {
-                let mut dword = 0u32;
-                for b in 0..4 {
-                    if sent < data.len() {
-                        dword |= (data[sent] as u32) << (8 * b);
-                        sent += 1;
-                    }
-                }
-                mmio.write32(GMBUS3, dword);
-                compiler_fence(Ordering::SeqCst);
-            }
-            GmbusStatus::Done => {
-                if sent == data.len() {
-                    break Ok(());
-                }
-                break Err(DdcError::ShortTransfer);
-            }
-            GmbusStatus::Pending => core::hint::spin_loop(),
-        }
-    };
-    gmbus_idle(mmio);
-    result
 }
 
 // ── EDID over DDC ──────────────────────────────────────────────
 
 /// Largest EDID this session buffers: base + 3 extensions —
 /// the same capacity as the DP session.
-pub const EDID_CAPACITY: usize = 512;
+pub const EDID_CAPACITY: usize = crate::intel_gpu_gmbus::EDID_MAX_BYTES;
 
-/// Read the sink's complete EDID: the base block runs the
-/// GMBUS codec's own [`build_edid_read`] program; extension
-/// blocks are byte-indexed reads, crossing the 256-byte
-/// boundary with the E-DDC segment pointer (slave 0x30)
-/// exactly as VESA E-EDID prescribes. Returns the buffer and
-/// the valid byte count.
+/// Read the sink's complete EDID over DDC as `drm_edid.c` does
+/// ([`crate::intel_gpu_gmbus::read_edid_eddc`]): the base block and
+/// every extension it announces up to [`EDID_CAPACITY`], blocks 2 and 3
+/// through the E-DDC segment pointer in the same transfer as the read.
+/// Returns the buffer and the valid byte count.
 pub fn read_edid<M: MmioWindow + ?Sized>(
     mmio: &M,
     pin: PinPair,
 ) -> Result<([u8; EDID_CAPACITY], usize), DdcError> {
     let mut edid = [0u8; EDID_CAPACITY];
-    let program = build_edid_read(pin, 128)?;
-    run_read_program(mmio, program.gmbus0, program.gmbus1, &mut edid[..128])?;
-    let extensions = (edid[126] as usize).min(EDID_CAPACITY / 128 - 1);
-    for block in 1..=extensions {
-        let offset = block * 128;
-        if offset >= 256 {
-            gmbus_write(mmio, pin, DDC_SLAVE_SEGMENT, &[(offset / 256) as u8])?;
-        }
-        gmbus_read(
-            mmio,
-            pin,
-            DDC_SLAVE_EDID,
-            (offset % 256) as u16,
-            &mut edid[offset..offset + 128],
-        )?;
-    }
-    Ok((edid, (extensions + 1) * 128))
+    let len = crate::intel_gpu_gmbus::read_edid_eddc(mmio, pin, &mut edid)?;
+    Ok((edid, len))
 }
 
 // ── CTA HF-VSDB (SCDC capability discovery) ────────────────────
@@ -382,35 +214,74 @@ pub const TMDS_CONFIG_SCRAMBLING_ENABLE: u8 = 1 << 0;
 pub const TMDS_CONFIG_CLOCK_RATIO_1_40: u8 = 1 << 1;
 /// SCDC SCRAMBLER_STATUS register; bit 0 = scrambling active.
 pub const SCDC_SCRAMBLER_STATUS: u8 = 0x21;
+/// `SCDC_SCRAMBLING_STATUS` (SCRAMBLER_STATUS bit 0).
+pub const SCDC_SCRAMBLING_STATUS: u8 = 1 << 0;
 
 /// The character rate above which the HDMI spec mandates
 /// SCDC scrambling + the 1/40 clock ratio (340 Mcsc).
 pub const SCRAMBLING_THRESHOLD_KHZ: u32 = 340_000;
 
-/// Read one SCDC register (byte-indexed read at slave 0x54).
+/// `drm_scdc_readb`: one SCDC register, the offset write and the read
+/// as one index transfer at slave 0x54.
 pub fn scdc_read<M: MmioWindow + ?Sized>(mmio: &M, pin: PinPair, reg: u8) -> Result<u8, DdcError> {
     let mut byte = [0u8; 1];
-    gmbus_read(mmio, pin, DDC_SLAVE_SCDC, reg as u16, &mut byte)?;
+    GmbusBus::new(mmio, pin).read_indexed(DDC_SLAVE_SCDC, reg, &mut byte)?;
     Ok(byte[0])
 }
 
-/// Write one SCDC register (`[register, value]`).
+/// `drm_scdc_writeb`: one write message `[register, value]`.
 pub fn scdc_write<M: MmioWindow + ?Sized>(
     mmio: &M,
     pin: PinPair,
     reg: u8,
     value: u8,
 ) -> Result<(), DdcError> {
-    gmbus_write(mmio, pin, DDC_SLAVE_SCDC, &[reg, value])
+    GmbusBus::new(mmio, pin)
+        .write(DDC_SLAVE_SCDC, &[reg, value])
+        .map_err(DdcError::from)
 }
 
-/// Configure SCDC scrambling for a >340 Mcsc stream:
-/// read-modify-write TMDS_CONFIG with scrambling enabled and
-/// the 1/40 clock ratio, observe the spec's settle window
-/// (1 ms minimum after the ratio write, poll-counted), then
-/// verify the sink reports scrambling active in
-/// SCRAMBLER_STATUS. Callers driving <=340 Mcsc must not call
-/// this at all — SCDC stays untouched there.
+/// `intel_hdmi_handle_sink_scrambling` for a scrambling-capable sink:
+/// `drm_scdc_set_high_tmds_clock_ratio` (read-modify-write of
+/// TMDS_CONFIG bit 1, then at least 1 ms — "a source should wait minimum
+/// 1ms and maximum 100ms after writing the TMDS config for clock ratio")
+/// and `drm_scdc_set_scrambling` (read-modify-write of bit 0). The
+/// scrambler status is not read here: the sink can only report it once
+/// scrambled data flows ([`scrambler_status`]).
+pub fn handle_sink_scrambling<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    pin: PinPair,
+    high_tmds_clock_ratio: bool,
+    scrambling: bool,
+) -> Result<(), DdcError> {
+    let config = scdc_read(mmio, pin, SCDC_TMDS_CONFIG)?;
+    let config = if high_tmds_clock_ratio {
+        config | TMDS_CONFIG_CLOCK_RATIO_1_40
+    } else {
+        config & !TMDS_CONFIG_CLOCK_RATIO_1_40
+    };
+    scdc_write(mmio, pin, SCDC_TMDS_CONFIG, config)?;
+    let _ =
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ns(1_000_000));
+    let config = scdc_read(mmio, pin, SCDC_TMDS_CONFIG)?;
+    let config = if scrambling {
+        config | TMDS_CONFIG_SCRAMBLING_ENABLE
+    } else {
+        config & !TMDS_CONFIG_SCRAMBLING_ENABLE
+    };
+    scdc_write(mmio, pin, SCDC_TMDS_CONFIG, config)
+}
+
+/// `drm_scdc_get_scrambling_status`: SCRAMBLER_STATUS bit 0. Only
+/// meaningful while the source transmits scrambled data.
+pub fn scrambler_status<M: MmioWindow + ?Sized>(mmio: &M, pin: PinPair) -> Result<bool, DdcError> {
+    Ok(scdc_read(mmio, pin, SCDC_SCRAMBLER_STATUS)? & SCDC_SCRAMBLING_STATUS != 0)
+}
+
+/// Configure SCDC for a >340 Mcsc stream: the sink must declare SCDC in
+/// its HF-VSDB, then [`handle_sink_scrambling`] sets the 1/40 ratio and
+/// scrambling. Callers driving <=340 Mcsc do not call this at all — SCDC
+/// stays untouched there.
 pub fn configure_scdc<M: MmioWindow + ?Sized>(
     mmio: &M,
     pin: PinPair,
@@ -419,23 +290,7 @@ pub fn configure_scdc<M: MmioWindow + ?Sized>(
     if !hf_vsdb.scdc_present {
         return Err(HdmiError::ScramblingUnsupported);
     }
-    let config = scdc_read(mmio, pin, SCDC_TMDS_CONFIG)?;
-    scdc_write(
-        mmio,
-        pin,
-        SCDC_TMDS_CONFIG,
-        config | TMDS_CONFIG_SCRAMBLING_ENABLE | TMDS_CONFIG_CLOCK_RATIO_1_40,
-    )?;
-    // The sink needs 1 ms (spec minimum) to apply the clock
-    // ratio before the status is meaningful.
-    for _ in 0..100_000 {
-        core::hint::spin_loop();
-    }
-    let status = scdc_read(mmio, pin, SCDC_SCRAMBLER_STATUS)?;
-    if status & TMDS_CONFIG_SCRAMBLING_ENABLE == 0 {
-        return Err(HdmiError::ScramblingVerifyFailed);
-    }
-    Ok(())
+    handle_sink_scrambling(mmio, pin, true, true).map_err(HdmiError::Ddc)
 }
 
 // ── Infoframes ─────────────────────────────────────────────────
@@ -634,9 +489,6 @@ pub enum HdmiError {
     /// HF-VSDB does not declare SCDC — the mode cannot be
     /// driven legally, and is refused rather than degraded.
     ScramblingUnsupported,
-    /// SCDC was configured but the sink did not report
-    /// scrambling active in SCRAMBLER_STATUS.
-    ScramblingVerifyFailed,
 }
 
 impl From<DdcError> for HdmiError {
@@ -647,7 +499,7 @@ impl From<DdcError> for HdmiError {
 
 impl From<GmbusError> for HdmiError {
     fn from(e: GmbusError) -> Self {
-        HdmiError::Ddc(DdcError::Gmbus(e))
+        HdmiError::Ddc(e.into())
     }
 }
 
@@ -663,6 +515,9 @@ impl From<ModesetError> for HdmiError {
 pub struct HdmiSinkProbe {
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
+    /// The DDC pin the probe used (`intel_hdmi_ddc_pin`: the VBT pin or
+    /// the platform default); SCDC traffic uses the same pin.
+    pub pin: PinPair,
     /// The sink's preferred mode (first detailed timing).
     pub mode: Mode,
     /// The complete EDID bytes (`edid_len` valid).
@@ -679,6 +534,8 @@ pub struct HdmiSinkProbe {
 /// A live HDMI connection.
 #[derive(Clone, Debug)]
 pub struct HdmiConnection {
+    /// Exact source family retained through disconnect.
+    pub family: crate::intel_gpu_gt::Gen12Platform,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
     /// The mode being scanned out.
@@ -687,6 +544,13 @@ pub struct HdmiConnection {
     pub audio_published: bool,
     /// Whether SCDC scrambling is active for this stream.
     pub scrambling: bool,
+    /// The DDC pin of the sink (SCDC reset on disconnect).
+    pub pin: PinPair,
+    /// SCRAMBLER_STATUS sampled once the scrambled stream ran
+    /// (`drm_scdc_get_scrambling_status`); `None` when the stream is not
+    /// scrambled or the read failed. Linux never gates a modeset on it,
+    /// so neither does this session.
+    pub scrambler_status: Option<bool>,
     /// The audio infoframe for this stream, packed for the
     /// HDA-side consumer that synthesises it on this hardware
     /// (see the module docs); `None` when the sink reported
@@ -718,14 +582,25 @@ fn mode_from_edid(edid_raw: &[u8]) -> Result<Mode, HdmiError> {
 /// Phase 1 of a connect: run the DDC conversation — read the
 /// complete EDID over GMBUS and derive the mode and the
 /// sink's SCDC capabilities. No display registers are touched
-/// beyond the GMBUS block.
-pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<HdmiSinkProbe, HdmiError> {
-    let pin = pin_pair_for(ddi).ok_or(DdcError::NoPinPair)?;
+/// beyond the GMBUS block. The DDC pin is the VBT's
+/// (`ddc`, resolved by `intel_hdmi_ddc_pin`) or the family's default
+/// ([`crate::intel_gpu_gmbus::gen12_ddc_pin`]); a DDI with neither
+/// refuses before any access.
+pub fn probe_sink<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+    ddc: &Gen12DdcOverrides,
+) -> Result<HdmiSinkProbe, HdmiError> {
+    let family = mmio
+        .gen12_display_family()
+        .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
+    let pin = ddc.pin(family, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
     Ok(HdmiSinkProbe {
         ddi,
+        pin,
         mode,
         edid,
         edid_len,
@@ -739,26 +614,38 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<HdmiSink
 /// publication. Ordering follows the hardware rules: SCDC is
 /// programmed while the port is still disabled (the
 /// TRANS_DDI_FUNC_CTL scrambling bits are written inside the
-/// modeset and must not change while the port is enabled),
-/// and the ELD lands in the shared sink *before* the codec
-/// path enables and ELD_VALID rises — the same invariant the
-/// DP session keeps.
+/// modeset and must not change while the port is enabled; Linux
+/// also writes it before `intel_ddi_buf_enable`), the scrambler
+/// status is sampled only after the stream runs, and the ELD
+/// lands in the shared sink *before* the codec path enables and
+/// ELD_VALID rises — the same invariant the DP session keeps.
 pub fn activate<M: MmioWindow + ?Sized>(
     mmio: &M,
     probe: &HdmiSinkProbe,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
-    let pin = pin_pair_for(probe.ddi).ok_or(DdcError::NoPinPair)?;
+    let family = mmio
+        .gen12_display_family()
+        .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
+    let pin = probe.pin;
     let mut scrambling = false;
     if probe.scrambling_required {
         configure_scdc(mmio, pin, &probe.hf_vsdb)?;
         scrambling = true;
     }
     let mut modeset = Modeset::new(mmio, probe.ddi);
+    modeset.set_gen12_family(family);
     let mode = modeset.modeset_hdmi(fb, &probe.mode, scrambling, scrambling)?;
 
     let frame = pack_avi_infoframe(&mode);
     write_avi_infoframe(mmio, Transcoder::A, &frame);
+    // The stream is scrambled from here on; only now can the sink report
+    // its scrambler status.
+    let scrambler_status = if scrambling {
+        scrambler_status(mmio, pin).ok()
+    } else {
+        None
+    };
 
     let mut audio_published = false;
     let mut audio_infoframe = None;
@@ -776,10 +663,13 @@ pub fn activate<M: MmioWindow + ?Sized>(
     }
 
     Ok(HdmiConnection {
+        family,
         ddi: probe.ddi,
         mode,
         audio_published,
         scrambling,
+        pin,
+        scrambler_status,
         audio_infoframe,
     })
 }
@@ -789,24 +679,38 @@ pub fn activate<M: MmioWindow + ?Sized>(
 pub fn connect<M: MmioWindow + ?Sized>(
     mmio: &M,
     ddi: Ddi,
+    ddc: &Gen12DdcOverrides,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
-    let probe = probe_sink(mmio, ddi)?;
+    mmio.gen12_display_family()
+        .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
+    let probe = probe_sink(mmio, ddi, ddc)?;
     activate(mmio, &probe, fb)
 }
 
 /// Disconnect: silence audio (codec disable + sink clear) and
 /// stop the infoframes before the pipeline comes down — the
 /// DP session's ordering, for the same reason: no consumer
-/// may act on an ELD whose display is already gone.
-pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) {
+/// may act on an ELD whose display is already gone. A scrambled
+/// stream's sink gets its 1/10 ratio and scrambling reset first
+/// (`intel_ddi_disable_hdmi`, best effort as in Linux). False means
+/// source refusal or an unobserved/partial local stop; retain the
+/// complete session.
+pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bool {
+    if mmio.gen12_display_family() != Some(conn.family) {
+        return false;
+    }
     if conn.audio_published {
         intel_gpu_audio::hdmi_audio_codec_disable(mmio, Transcoder::A);
         clear_display_audio(sink_id_for(conn.ddi));
     }
     disable_infoframes(mmio, Transcoder::A);
+    if conn.scrambling {
+        let _ = handle_sink_scrambling(mmio, conn.pin, false, false);
+    }
     let mut modeset = Modeset::new(mmio, conn.ddi);
-    modeset.teardown();
+    modeset.set_gen12_family(conn.family);
+    modeset.try_teardown().is_ok()
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -833,7 +737,11 @@ pub mod tests {
 
     use super::*;
     use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
-    use crate::intel_gpu_gmbus::{GMBUS2_ACTIVE, GMBUS2_HW_RDY, GMBUS2_SATOER};
+    use crate::intel_gpu_gmbus::{
+        build_edid_read, GMBUS0, GMBUS0_RATE_100KHZ, GMBUS1, GMBUS1_CYCLE_INDEX, GMBUS1_CYCLE_STOP,
+        GMBUS1_CYCLE_WAIT, GMBUS1_SW_CLR_INT, GMBUS1_SW_RDY, GMBUS2, GMBUS2_ACTIVE, GMBUS2_HW_RDY,
+        GMBUS2_HW_WAIT_PHASE, GMBUS2_SATOER, GMBUS3, GMBUS5, GMBUS5_2BYTE_INDEX_EN,
+    };
     use crate::intel_gpu_modeset::PixelFormat;
     use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPECONF_OFFSET, TRANS_DDI_FUNC_CTL_OFFSET};
     use crate::intel_gpu_pll::{dpll_cfgcr1, DPLL_CFGCR0_DPLL1};
@@ -844,6 +752,15 @@ pub mod tests {
 
     // ── The sink ────────────────────────────────────────────────
 
+    /// One DDC slave set behind a GMBUS controller, speaking the
+    /// controller protocol `intel_gmbus.c` drives: a `SW_RDY` program
+    /// starts a message (`CYCLE_INDEX` carries a 1-byte index in
+    /// `GMBUS1[15:8]`, `GMBUS5` with `2BYTE_INDEX_EN` a 2-byte one), a
+    /// write's first dword is preloaded into GMBUS3 before its program,
+    /// a completed `CYCLE_WAIT` message holds the bus in the wait phase
+    /// (the next program is a repeated START), and the `CYCLE_STOP`
+    /// program releases the bus. The E-DDC segment pointer only reaches
+    /// the read that follows it in the same transfer: STOP resets it.
     #[derive(Debug)]
     struct GmbusSink {
         edid: Vec<u8>,
@@ -852,23 +769,29 @@ pub mod tests {
         /// `ignore_scrambling` is set.
         scdc: [u8; 256],
         segment: u8,
-        index: u16,
+        gmbus5: u32,
         nack_all: bool,
         ignore_scrambling: bool,
         /// Active read: bytes still to deliver.
         read_queue: VecDeque<u8>,
         reading: bool,
-        /// Active write: bytes collected so far.
+        /// GMBUS3 dwords written ahead of (or during) a write message.
+        tx: Vec<u8>,
         write_slave: u8,
-        write_buf: Vec<u8>,
         write_expected: usize,
         writing: bool,
+        /// The running program asked for a wait cycle.
+        wait_cycle: bool,
+        /// The bus is held in the wait phase.
+        waiting: bool,
         nack: bool,
-        /// Every GMBUS1 program, in order.
+        /// Every GMBUS1 write, in order (programs, STOP, SW_CLR_INT).
         programs: Vec<u32>,
         /// SCDC writes actually applied: (register, value).
         scdc_applied: Vec<(u8, u8)>,
-        /// Every GMBUS5 index write.
+        /// SCDC registers read: (register).
+        scdc_reads: Vec<u8>,
+        /// Every GMBUS5 write.
         gmbus5_log: Vec<u32>,
     }
 
@@ -878,53 +801,82 @@ pub mod tests {
                 edid,
                 scdc: [0u8; 256],
                 segment: 0,
-                index: 0,
+                gmbus5: 0,
                 nack_all: false,
                 ignore_scrambling: false,
                 read_queue: VecDeque::new(),
                 reading: false,
+                tx: Vec::new(),
                 write_slave: 0,
-                write_buf: Vec::new(),
                 write_expected: 0,
                 writing: false,
+                wait_cycle: false,
+                waiting: false,
                 nack: false,
                 programs: Vec::new(),
                 scdc_applied: Vec::new(),
+                scdc_reads: Vec::new(),
                 gmbus5_log: Vec::new(),
             }
         }
 
         fn on_gmbus5(&mut self, v: u32) {
-            self.index = v as u16;
+            self.gmbus5 = v;
             self.gmbus5_log.push(v);
         }
 
-        /// Decode a GMBUS1 program (fields per the PRM layout:
-        /// slave [7:1], direction [0], byte count [24:16]) and
-        /// stage the transfer.
+        /// Decode a GMBUS1 write (fields per `intel_gmbus_regs.h`:
+        /// slave [7:1], direction [0], index [15:8], byte count
+        /// [24:16], cycle bits WAIT 25 / INDEX 26 / STOP 27, SW_RDY 30,
+        /// SW_CLR_INT 31).
         fn on_gmbus1(&mut self, program: u32) {
             self.programs.push(program);
+            if program & GMBUS1_SW_CLR_INT != 0 {
+                self.nack = false;
+                return;
+            }
+            if program & GMBUS1_SW_RDY == 0 {
+                return;
+            }
+            let count = ((program >> 16) & 0x1FF) as usize;
+            if program & GMBUS1_CYCLE_STOP != 0 && count == 0 {
+                self.waiting = false;
+                self.reading = false;
+                self.writing = false;
+                self.segment = 0;
+                return;
+            }
             let slave = ((program >> 1) & 0x7F) as u8;
             let dir_read = program & 1 != 0;
-            let count = ((program >> 16) & 0x1FF) as usize;
+            self.wait_cycle = program & GMBUS1_CYCLE_WAIT != 0;
+            self.waiting = false;
             self.nack = self.nack_all || !matches!(slave, 0x50 | 0x54 | 0x30);
             self.reading = false;
             self.writing = false;
             if self.nack {
+                self.tx.clear();
                 return;
             }
+            let index = if program & GMBUS1_CYCLE_INDEX != 0 {
+                Some(((program >> 8) & 0xFF) as usize)
+            } else if self.gmbus5 & GMBUS5_2BYTE_INDEX_EN != 0 {
+                Some((self.gmbus5 & 0xFFFF) as usize)
+            } else {
+                None
+            };
             if dir_read {
                 self.read_queue.clear();
                 match slave {
                     0x50 => {
-                        let start = (self.segment as usize) * 256 + (self.index as usize);
+                        let start = (self.segment as usize) * 256 + index.unwrap_or(0);
                         for i in 0..count {
                             self.read_queue
                                 .push_back(self.edid.get(start + i).copied().unwrap_or(0));
                         }
                     }
                     0x54 => {
-                        let start = self.index as usize;
+                        let start = index.unwrap_or(0);
+                        self.scdc_reads.push(start as u8);
                         for i in 0..count {
                             self.read_queue
                                 .push_back(self.scdc.get(start + i).copied().unwrap_or(0));
@@ -935,26 +887,28 @@ pub mod tests {
                 self.reading = true;
             } else {
                 self.write_slave = slave;
-                self.write_buf.clear();
                 self.write_expected = count;
                 self.writing = true;
-                if count == 0 {
-                    self.apply_write();
-                }
+                self.try_complete_write();
             }
         }
 
         fn gmbus2(&self) -> u32 {
             if self.nack {
-                return GMBUS2_SATOER | GMBUS2_ACTIVE;
+                // The aborted transfer has quiesced (ACTIVE clear);
+                // SATOER stays latched until SW_CLR_INT.
+                return GMBUS2_SATOER;
             }
             if self.reading && !self.read_queue.is_empty() {
                 return GMBUS2_HW_RDY | GMBUS2_ACTIVE;
             }
-            if self.writing && self.write_buf.len() < self.write_expected {
+            if self.writing {
                 return GMBUS2_HW_RDY | GMBUS2_ACTIVE;
             }
-            0 // ACTIVE clear: done
+            if self.waiting {
+                return GMBUS2_HW_WAIT_PHASE | GMBUS2_HW_RDY | GMBUS2_ACTIVE;
+            }
+            0
         }
 
         fn on_gmbus3_read(&mut self) -> u32 {
@@ -964,28 +918,32 @@ pub mod tests {
                     v |= (byte as u32) << (8 * b);
                 }
             }
+            if self.reading && self.read_queue.is_empty() {
+                self.reading = false;
+                self.waiting = self.wait_cycle;
+            }
             v
         }
 
         fn on_gmbus3_write(&mut self, v: u32) {
-            if !self.writing {
-                return;
-            }
             for b in 0..4 {
-                if self.write_buf.len() < self.write_expected {
-                    self.write_buf.push((v >> (8 * b)) as u8);
-                }
+                self.tx.push((v >> (8 * b)) as u8);
             }
-            if self.write_buf.len() == self.write_expected {
-                self.apply_write();
-            }
+            self.try_complete_write();
         }
 
-        fn apply_write(&mut self) {
+        fn try_complete_write(&mut self) {
+            if !self.writing || self.tx.len() < self.write_expected {
+                return;
+            }
+            let data: Vec<u8> = self.tx[..self.write_expected].to_vec();
+            self.tx.clear();
+            self.writing = false;
+            self.waiting = self.wait_cycle;
             match self.write_slave {
                 0x54 => {
-                    if self.write_buf.len() >= 2 {
-                        let (reg, value) = (self.write_buf[0], self.write_buf[1]);
+                    if data.len() >= 2 {
+                        let (reg, value) = (data[0], data[1]);
                         self.scdc[reg as usize] = value;
                         self.scdc_applied.push((reg, value));
                         if reg == 0x20 && !self.ignore_scrambling {
@@ -996,19 +954,29 @@ pub mod tests {
                     }
                 }
                 0x30 => {
-                    if !self.write_buf.is_empty() {
-                        self.segment = self.write_buf[0];
+                    if let Some(segment) = data.first() {
+                        self.segment = *segment;
                     }
                 }
                 _ => {}
             }
         }
 
-        /// Slave addresses of every staged program, in order.
+        /// Slave addresses of every data program, in order.
         fn slaves_touched(&self) -> Vec<u8> {
             self.programs
                 .iter()
+                .filter(|p| *p & GMBUS1_SW_RDY != 0 && (*p >> 16) & 0x1FF != 0)
                 .map(|p| ((p >> 1) & 0x7F) as u8)
+                .collect()
+        }
+
+        /// Data programs only (no STOP, no recovery toggles).
+        fn data_programs(&self) -> Vec<u32> {
+            self.programs
+                .iter()
+                .copied()
+                .filter(|p| *p & GMBUS1_SW_RDY != 0 && (*p >> 16) & 0x1FF != 0)
                 .collect()
         }
     }
@@ -1023,6 +991,7 @@ pub mod tests {
 
     #[derive(Debug)]
     pub struct HdmiSinkMmio {
+        family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
         regs: RefCell<BTreeMap<u64, u32>>,
         pub writes: RefCell<Vec<(u64, u32)>>,
         sink: RefCell<GmbusSink>,
@@ -1037,6 +1006,7 @@ pub mod tests {
             let mut regs = BTreeMap::new();
             regs.insert(crate::intel_gpu_pll::DSSM, 1u32 << 29);
             Self {
+                family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
                 regs: RefCell::new(regs),
                 writes: RefCell::new(Vec::new()),
                 sink: RefCell::new(sink),
@@ -1063,6 +1033,9 @@ pub mod tests {
     }
 
     impl MmioWindow for HdmiSinkMmio {
+        fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+            *self.family.borrow()
+        }
         fn read32(&self, off: u64) -> u32 {
             if off == GMBUS2 {
                 return self.sink.borrow().gmbus2();
@@ -1354,28 +1327,48 @@ pub mod tests {
     fn smoke_hdmi_1080p_connect_no_scdc_traffic() -> TestResult {
         let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Scdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        let conn = match connect(&mmio, Ddi::B, &test_fb(8192)) {
+        let conn = match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(8192)) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("1080p connect over the sink model must succeed"),
         };
         if conn.mode.h_active != 1920 || conn.mode.v_active != 1080 || conn.scrambling {
             return TestResult::Fail("1080p connection must carry the EDID mode, unscrambled");
         }
-        // The base-block read ran the GMBUS codec's own
-        // program for DDI B / 128 bytes, byte-for-byte:
-        // SW_RDY|CYCLE_WAIT|count 128|slave 0x50|read.
+        // drm_do_probe_ddc_edid writes the block offset before every
+        // block read; gmbus_xfer runs offset + read as one INDEX
+        // transfer: the codec's 128-byte read program plus
+        // CYCLE_INDEX with offset 0 in GMBUS1[15:8], byte-for-byte
+        // SW_RDY|INDEX|WAIT|count 128|slave 0x50|read. (The older
+        // engine sent the bare codec program with no offset.)
         let sink = mmio.sink.borrow();
-        let codec = build_edid_read(PinPair::DdiB, 128).map(|p| p.gmbus1);
-        if codec != Ok(0x4280_00A1) || sink.programs.first() != codec.as_ref().ok() {
-            return TestResult::Fail("first GMBUS program must be the codec EDID read");
+        let codec = build_edid_read(PinPair::Pin2Bxt, 128).map(|p| p.gmbus1);
+        let first = sink.data_programs().first().copied();
+        if codec != Ok(0x4280_00A1)
+            || first != Some(0x4280_00A1 | GMBUS1_CYCLE_INDEX)
+            || first != Some(0x4680_00A1)
+        {
+            return TestResult::Fail("first EDID program must index offset 0");
+        }
+        // Each transfer ends with its own STOP program before the next
+        // select (the older engine never issued STOP and waited for an
+        // idle bus that cannot come).
+        let stop = GMBUS1_SW_RDY | GMBUS1_CYCLE_STOP;
+        if sink.programs.iter().filter(|p| **p == stop).count() != 2 {
+            return TestResult::Fail("each EDID block transfer must end with a STOP");
+        }
+        // Tiger Lake DDI B's DDC is GMBUS_PIN_2_BXT ("dpb" in
+        // gmbus_pins_icp), selected at 100 kHz (Linux b90c984d).
+        if mmio.writes_to(GMBUS0).first() != Some(&(GMBUS0_RATE_100KHZ | 2)) {
+            return TestResult::Fail("DDI B DDC must select GMBUS pin 2 (dpb)");
         }
         // A <=340 Mcsc mode must not touch SCDC at all.
         if sink.slaves_touched().contains(&DDC_SLAVE_SCDC) || !sink.scdc_applied.is_empty() {
             return TestResult::Fail("HDMI 1.4-rate mode must not touch SCDC");
         }
-        // The extension read was byte-indexed at 128.
-        if !sink.gmbus5_log.contains(&128) {
-            return TestResult::Fail("extension EDID read must program GMBUS5 index 128");
+        // The extension read was byte-indexed at 128 through
+        // GMBUS1[15:8]; GMBUS5 (2-byte indices only) is untouched.
+        if sink.data_programs().get(1) != Some(&0x4680_80A1) || !sink.gmbus5_log.is_empty() {
+            return TestResult::Fail("extension EDID read must index 128 in GMBUS1");
         }
         drop(sink);
         // TRANS_DDI_FUNC_CTL: HDMI binding for DDI B, no
@@ -1459,7 +1452,7 @@ pub mod tests {
     fn smoke_hdmi_4k60_scdc_scrambling() -> TestResult {
         let edid = fixture_edid_hdmi(594_000, 3840, 560, 2160, 90, HfFixture::Scdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        let probe = match probe_sink(&mmio, Ddi::B) {
+        let probe = match probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("4K60 probe must succeed"),
         };
@@ -1473,14 +1466,35 @@ pub mod tests {
         if !conn.scrambling {
             return TestResult::Fail("4K60 connection must record scrambling");
         }
-        // SCDC: TMDS_CONFIG written once with scrambling +
-        // 1/40 ratio (0x03), before the modeset bound the
-        // transcoder.
+        // SCDC (intel_hdmi_handle_sink_scrambling): TMDS_CONFIG
+        // read-modify-written twice — the 1/40 ratio
+        // (drm_scdc_set_high_tmds_clock_ratio), then scrambling
+        // (drm_scdc_set_scrambling) — before the modeset bound the
+        // transcoder. (The older engine wrote 0x03 in one step.)
         let sink = mmio.sink.borrow();
-        if sink.scdc_applied != alloc::vec![(SCDC_TMDS_CONFIG, 0x03)] {
-            return TestResult::Fail("SCDC TMDS_CONFIG must be written 0x03 exactly once");
+        if sink.scdc_applied != alloc::vec![(SCDC_TMDS_CONFIG, 0x02), (SCDC_TMDS_CONFIG, 0x03)] {
+            return TestResult::Fail("SCDC must set the ratio, then scrambling");
         }
         drop(sink);
+        // SCRAMBLER_STATUS is read only once the stream runs: after
+        // TRANS_DDI_FUNC_CTL and the DDI buffer enable.
+        let status_read = mmio.writes.borrow().iter().position(|(o, v)| {
+            *o == GMBUS1
+                && ((*v >> 1) & 0x7F) == DDC_SLAVE_SCDC as u32
+                && *v & 1 != 0
+                && (*v >> 8) & 0xFF == SCDC_SCRAMBLER_STATUS as u32
+        });
+        let buf_on = mmio.writes.borrow().iter().position(|(o, v)| {
+            *o == Ddi::B.base() + DDI_BUF_CTL_OFFSET
+                && *v & crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE != 0
+        });
+        match (buf_on, status_read) {
+            (Some(b), Some(st)) if b < st => {}
+            _ => return TestResult::Fail("scrambler status must be read after the stream starts"),
+        }
+        if conn.scrambler_status != Some(true) {
+            return TestResult::Fail("a locking sink must report scrambling after the stream runs");
+        }
         let scdc_pos = mmio
             .writes
             .borrow()
@@ -1515,7 +1529,7 @@ pub mod tests {
     fn smoke_hdmi_4k60_without_scdc_refused() -> TestResult {
         let edid = fixture_edid_hdmi(594_000, 3840, 560, 2160, 90, HfFixture::NoScdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        match connect(&mmio, Ddi::B, &test_fb(16384)) {
+        match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(16384)) {
             Err(HdmiError::ScramblingUnsupported) => {}
             _ => return TestResult::Fail(">340 Mcsc without SCDC must be refused"),
         }
@@ -1539,28 +1553,93 @@ pub mod tests {
         smoke_hdmi_4k60_without_scdc_refused
     );
 
-    fn smoke_hdmi_scdc_verify_failure() -> TestResult {
+    fn smoke_hdmi_scdc_status_sampled_after_stream() -> TestResult {
+        // Corrected from smoke_hdmi_scdc_verify_failure: the older
+        // engine read SCRAMBLER_STATUS right after the TMDS_CONFIG write,
+        // before any scrambled data flowed, and failed the connect. Linux
+        // (intel_hdmi_handle_sink_scrambling) never reads it at enable;
+        // the status is sampled once the stream runs and does not gate
+        // the connect.
         let edid = fixture_edid_hdmi(594_000, 3840, 560, 2160, 90, HfFixture::Scdc);
         let mut sink = GmbusSink::new(edid);
         sink.ignore_scrambling = true; // never reports status
         let mmio = HdmiSinkMmio::new(Ddi::B, sink);
-        match connect(&mmio, Ddi::B, &test_fb(16384)) {
-            Err(HdmiError::ScramblingVerifyFailed) => {}
-            _ => return TestResult::Fail("unverified scrambling must fail the connect"),
+        let conn = match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(16384)) {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("an unlocked scrambler must not fail the connect"),
+        };
+        if !conn.scrambling || conn.scrambler_status != Some(false) {
+            return TestResult::Fail("the post-stream status must report the sink unlocked");
         }
-        if mmio.sink.borrow().scdc_applied != alloc::vec![(SCDC_TMDS_CONFIG, 0x03)] {
-            return TestResult::Fail("the config write must have been attempted");
+        let sink = mmio.sink.borrow();
+        if sink.scdc_applied != alloc::vec![(SCDC_TMDS_CONFIG, 0x02), (SCDC_TMDS_CONFIG, 0x03)] {
+            return TestResult::Fail("the config writes must have been made");
+        }
+        // TMDS_CONFIG is read for each read-modify-write; STATUS last.
+        if sink.scdc_reads != alloc::vec![SCDC_TMDS_CONFIG, SCDC_TMDS_CONFIG, SCDC_SCRAMBLER_STATUS]
+        {
+            return TestResult::Fail("SCDC reads must be config, config, then status");
+        }
+        drop(sink);
+        // Disconnect resets the sink to 1/10 and no scrambling before the
+        // pipeline comes down (intel_ddi_disable_hdmi).
+        let _ = disconnect(&mmio, &conn);
+        clear_display_audio(sink_id_for(Ddi::B));
+        let applied = mmio.sink.borrow().scdc_applied.clone();
+        if applied.len() != 4
+            || applied[2..] != [(SCDC_TMDS_CONFIG, 0x01), (SCDC_TMDS_CONFIG, 0x00)]
+        {
+            return TestResult::Fail("disconnect must reset the ratio, then scrambling");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_scdc_verify_failure);
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_scdc_status_sampled_after_stream
+    );
+
+    fn smoke_hdmi_ddc_uses_index_cycle_and_gmbus5_enable() -> TestResult {
+        // The older engine wrote the byte index to GMBUS5 without
+        // GMBUS_2BYTE_INDEX_EN, so indexed reads were not indexed.
+        // intel_gmbus.c::gmbus_index_xfer: a 1-byte index rides GMBUS1
+        // (CYCLE_INDEX, [15:8]); a 2-byte index sets 2BYTE_INDEX_EN.
+        let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(alloc::vec![0u8; 512]));
+        mmio.sink.borrow_mut().scdc[0x21] = 0x01;
+        match scdc_read(&mmio, PinPair::Pin2Bxt, SCDC_SCRAMBLER_STATUS) {
+            Ok(0x01) => {}
+            _ => return TestResult::Fail("SCDC register read must be indexed"),
+        }
+        if mmio.sink.borrow().data_programs() != alloc::vec![0x4601_21A9]
+            || !mmio.sink.borrow().gmbus5_log.is_empty()
+        {
+            return TestResult::Fail("1-byte index must be CYCLE_INDEX|CYCLE_WAIT in GMBUS1");
+        }
+        let mut edid = alloc::vec![0u8; 512];
+        edid[0x180] = 0x5A;
+        let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
+        let mut out = [0u8; 1];
+        if crate::intel_gpu_gmbus::gmbus_read(&mmio, PinPair::Pin2Bxt, 0x50, 0x0180, &mut out)
+            .is_err()
+            || out != [0x5A]
+        {
+            return TestResult::Fail("2-byte index read must reach byte 0x180");
+        }
+        if mmio.sink.borrow().gmbus5_log != alloc::vec![GMBUS5_2BYTE_INDEX_EN | 0x0180, 0] {
+            return TestResult::Fail("GMBUS5 must carry 2BYTE_INDEX_EN and be cleared");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_ddc_uses_index_cycle_and_gmbus5_enable
+    );
 
     fn smoke_hdmi_sink_nack() -> TestResult {
         let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Scdc);
         let mut sink = GmbusSink::new(edid);
         sink.nack_all = true;
         let mmio = HdmiSinkMmio::new(Ddi::B, sink);
-        match probe_sink(&mmio, Ddi::B) {
+        match probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) {
             Err(HdmiError::Ddc(DdcError::SlaveNack)) => TestResult::Pass,
             _ => TestResult::Fail("a NACKing sink must surface SlaveNack"),
         }
@@ -1586,15 +1665,30 @@ pub mod tests {
             edid[start + 127] = ((256 - (sum % 256)) % 256) as u8;
         }
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid.clone()));
-        let probe = match probe_sink(&mmio, Ddi::B) {
+        let probe = match probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("4-block EDID probe must succeed"),
         };
         if probe.edid_len != 512 || probe.edid[..512] != edid[..] {
             return TestResult::Fail("all four EDID blocks must arrive verbatim");
         }
-        if mmio.sink.borrow().segment != 1 {
-            return TestResult::Fail("reads past 256 bytes must set segment pointer 1");
+        // drm_do_probe_ddc_edid: segment write, offset write and read in
+        // one transfer — the segment program is followed by the EDID
+        // program with no STOP in between, and STOP resets the pointer.
+        let sink = mmio.sink.borrow();
+        let mut chained = 0;
+        for (i, p) in sink.programs.iter().enumerate() {
+            if *p & GMBUS1_SW_RDY != 0 && (p >> 1) & 0x7F == 0x30 {
+                match sink.programs.get(i + 1) {
+                    Some(next) if next & GMBUS1_CYCLE_STOP == 0 && (next >> 1) & 0x7F == 0x50 => {
+                        chained += 1
+                    }
+                    _ => return TestResult::Fail("segment write must chain into the read"),
+                }
+            }
+        }
+        if chained != 2 || sink.segment != 0 {
+            return TestResult::Fail("blocks 2 and 3 each chain a segment write; STOP resets it");
         }
         TestResult::Pass
     }
@@ -1606,7 +1700,7 @@ pub mod tests {
     fn smoke_hdmi_disconnect_tears_down() -> TestResult {
         let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Scdc);
         let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
-        let conn = match connect(&mmio, Ddi::B, &test_fb(8192)) {
+        let conn = match connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(8192)) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("connect must succeed"),
         };
@@ -1640,5 +1734,83 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_disconnect_tears_down
+    );
+
+    fn smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        // Alder Lake S has no DDI B (port mask A + TC1..TC4,
+        // intel_display_device.c), so it has no DDC pin there
+        // (intel_gpu_gmbus::gen12_ddc_pin) and its row runs on DDI A.
+        let no_b = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(alloc::vec![0u8; 128]));
+        *no_b.family.borrow_mut() = Some(Gen12Platform::AlderLakeS);
+        if !matches!(
+            probe_sink(&no_b, Ddi::B, &Gen12DdcOverrides::NONE),
+            Err(HdmiError::Ddc(DdcError::NoPinPair))
+        ) || !no_b.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("ADL-S DDI B must refuse without a DDC pin");
+        }
+        for (family, ddi, expected) in [
+            (Gen12Platform::TigerLake, Ddi::B, 0x84000000),
+            (Gen12Platform::AlderLakeS, Ddi::A, 0x84000000),
+            (Gen12Platform::AlderLakeP, Ddi::B, 0x94000000),
+            (Gen12Platform::AlderLakeN, Ddi::B, 0x94000000),
+        ] {
+            let mmio = HdmiSinkMmio::new(
+                ddi,
+                GmbusSink::new(fixture_edid_hdmi(
+                    148_500,
+                    1920,
+                    280,
+                    1080,
+                    45,
+                    HfFixture::Scdc,
+                )),
+            );
+            *mmio.family.borrow_mut() = Some(family);
+            let conn = connect(&mmio, ddi, &Gen12DdcOverrides::NONE, &test_fb(8192)).unwrap();
+            assert_eq!(conn.family, family);
+            assert_eq!(mmio.writes_to(0x70180).last(), Some(&expected));
+            let before = mmio.writes.borrow().len();
+            *mmio.family.borrow_mut() = Some(if family == Gen12Platform::AlderLakeP {
+                Gen12Platform::AlderLakeN
+            } else {
+                Gen12Platform::AlderLakeP
+            });
+            assert!(!disconnect(&mmio, &conn));
+            *mmio.family.borrow_mut() = None;
+            assert!(!disconnect(&mmio, &conn));
+            assert_eq!(mmio.writes.borrow().len(), before);
+            *mmio.family.borrow_mut() = Some(family);
+            assert!(disconnect(&mmio, &conn));
+            assert_eq!(
+                mmio.writes_to(0x70180).last().unwrap() & 0x70000000,
+                expected & 0x70000000
+            );
+        }
+        let mmio = HdmiSinkMmio::new(
+            Ddi::B,
+            GmbusSink::new(fixture_edid_hdmi(
+                594_000,
+                3840,
+                560,
+                2160,
+                90,
+                HfFixture::Scdc,
+            )),
+        );
+        *mmio.family.borrow_mut() = None;
+        assert!(matches!(
+            connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(15360)),
+            Err(HdmiError::Modeset(ModesetError::UnsupportedGeneration))
+        ));
+        assert!(mmio.writes.borrow().is_empty());
+        assert!(mmio.sink.borrow().programs.is_empty());
+        assert!(mmio.sink.borrow().scdc_applied.is_empty());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal
     );
 }

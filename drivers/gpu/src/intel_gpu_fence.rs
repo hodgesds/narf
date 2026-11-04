@@ -105,10 +105,13 @@ impl narf_filesystem::DrmFence for CompletionFence {
         let deadline =
             narf_time::monotonic_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
         loop {
+            // poll_timeout_us: expiry is sampled before the condition, so a
+            // fence signalled by the deadline is never reported unsignalled.
+            let expired = narf_time::monotonic_ns() >= deadline;
             if self.result().is_some() {
                 return true;
             }
-            if narf_time::monotonic_ns() >= deadline {
+            if expired {
                 return false;
             }
             narf_scheduler::sleep_pumps::run();

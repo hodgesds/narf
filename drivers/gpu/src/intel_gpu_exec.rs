@@ -23,27 +23,68 @@ const PAGE: u64 = 4096;
 
 #[path = "intel_gpu_vram_clear.rs"]
 pub(crate) mod vram_clear;
-pub(crate) use vram_clear::prepare_vram_clear;
+pub(crate) use vram_clear::{prepare_smallbar_clear, prepare_vram_clear};
+
+#[path = "intel_gpu_copy.rs"]
+pub mod copy;
 
 #[derive(Debug)]
 pub struct ExecObject {
     pub object: Arc<GemObject>,
     pub va: u64,
     pub writable: bool,
+    /// i915 EXEC_OBJECT_ASYNC: skip prior implicit GPU dependencies only.
+    /// The terminal READ/WRITE reservation and mandatory publication remain.
+    pub asynchronous: bool,
+    /// i915 EXEC_OBJECT_CAPTURE: retained diagnostic payload selection only.
+    pub capture: bool,
 }
 
 #[derive(Debug)]
 pub struct ExecRequest {
     pub context_id: u32,
-    /// I915_EXEC_RING_MASK: a legacy ring or an index into the context's
-    /// engine map. Selection belongs to the context, as in eb_select_engine.
+    /// Legacy ring/index plus BSD selector bits. The context resolves its
+    /// engine-map index before interpreting legacy-only selector flags.
     pub ring: u32,
     pub batch_va: u64,
     pub batch_len: u64,
     pub objects: Vec<ExecObject>,
 }
 
+/// First qualified object-ASYNC profile: source Xe2 PAT2 is uncompressed,
+/// two-way coherent WB. Other families require independent qualification.
+pub(crate) fn object_async_profile(platform: GtPlatform) -> bool {
+    platform == GtPlatform::Battlemage
+}
+
 impl ExecRequest {
+    pub(crate) fn has_async(&self) -> bool {
+        self.objects.iter().any(|entry| entry.asynchronous)
+    }
+
+    fn validate_storage(&self) -> Result<(), FsError> {
+        let asynchronous = self.has_async();
+        if self.objects.iter().any(|entry| {
+            entry.object.is_vram()
+                || entry.object.is_wc()
+                || entry.object.vm_owner().is_some()
+                || (asynchronous && entry.object.is_userptr())
+        }) {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
+    }
+
+    /// Check imports and the immutable profile before context finalization,
+    /// dependency waits or any private page-table/reservation publication.
+    pub(crate) fn validate_for_gt(&self, platform: GtPlatform) -> Result<(), FsError> {
+        self.validate_storage()?;
+        if self.has_async() && !object_async_profile(platform) {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
+    }
+
     pub fn prepare_user(
         &self,
         platform: GtPlatform,
@@ -64,8 +105,9 @@ impl ExecRequest {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
         self.prepare_inner(format, pat, table_pat, Some(platform))
@@ -78,6 +120,10 @@ impl ExecRequest {
         table_pat: u8,
         platform: Option<GtPlatform>,
     ) -> Result<ResidentBatch, FsError> {
+        self.validate_storage()?;
+        if self.has_async() && !platform.is_some_and(object_async_profile) {
+            return Err(FsError::InvalidData);
+        }
         if self.objects.is_empty()
             || self.objects.len() > MAX_OBJECTS
             || self.objects.iter().any(|entry| {
@@ -109,8 +155,12 @@ impl ExecRequest {
         {
             return Err(FsError::InvalidData);
         }
+        let space = self.address_space_inner(format, pat_index, table_pat)?;
+        if platform.is_some_and(|p| !space.within_dma_bits(p)) {
+            return Err(FsError::InvalidData);
+        }
         Ok(ResidentBatch {
-            space: self.address_space_inner(format, pat_index, table_pat)?,
+            space,
             format,
             platform,
             address: self.batch_va,
@@ -125,34 +175,52 @@ impl ExecRequest {
     /// Admit the modern no-relocation, fixed-placement subset. Rejection
     /// changes no object, VM or context and never writes an output offset.
     pub fn read(user: &dyn IoctlContext, address: u64, gem: &GemState) -> Result<Self, FsError> {
-        let mut request = [0; 64];
-        user.read(address, &mut request)?;
-        Self::read_wire(user, &request, gem, false)
+        ExecWire::read(user, address, false)?.resolve(gem)
     }
 
+    /// i915_gem_execbuffer2_ioctl:3555 and i915_gem_do_execbuffer:3339 in
+    /// their order: the argument checks and the exec-object copy
+    /// (ExecWire::read), then the fences (parse_execbuf2_extensions,
+    /// add_fence_array, the IN/SUBMIT sync_file), and only then the objects
+    /// eb_lookup_vmas resolves.
     pub(crate) fn read_submission(
         user: &dyn IoctlContext,
         address: u64,
         gem: &GemState,
+        syncobjs: &narf_lib::sync::IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
     ) -> Result<(Self, crate::intel_gpu_exec_sync::SyncRequest), FsError> {
+        let wire = ExecWire::read(user, address, true)?;
+        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &wire.request, syncobjs)?;
+        Ok((wire.resolve(gem)?, sync))
+    }
+}
+
+/// The copied drm_i915_gem_execbuffer2 and its exec-object array: what
+/// i915_gem_execbuffer2_ioctl hands i915_gem_do_execbuffer.
+struct ExecWire {
+    request: [u8; 64],
+    objects: Vec<u8>,
+}
+
+impl ExecWire {
+    /// i915_gem_execbuffer2_ioctl's check_buffer_count:3541 and
+    /// i915_gem_check_execbuffer:2180 (each -EINVAL), the exec-object copy
+    /// (-EFAULT), then i915_gem_do_execbuffer's first refusal: I915_EXEC_SECURE
+    /// is -ENODEV on GRAPHICS_VER >= 11. No fence, handle or context is read.
+    fn read(user: &dyn IoctlContext, address: u64, explicit: bool) -> Result<Self, FsError> {
         let mut request = [0; 64];
         user.read(address, &mut request)?;
-        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &request)?;
-        Ok((Self::read_wire(user, &request, gem, true)?, sync))
-    }
-
-    fn read_wire(
-        user: &dyn IoctlContext,
-        request: &[u8; 64],
-        gem: &GemState,
-        explicit: bool,
-    ) -> Result<Self, FsError> {
-        let count = u32_at(request, 8) as usize;
-        let start = u32_at(request, 12) as u64;
-        let length = u32_at(request, 16) as u64;
-        let flags = u64_at(request, 40);
-        let mut supported =
-            0x3f | abi::EXEC_NO_RELOC | abi::EXEC_HANDLE_LUT | abi::EXEC_BATCH_FIRST;
+        let count = u32_at(&request, 8) as usize;
+        let flags = u64_at(&request, 40);
+        // __I915_EXEC_ILLEGAL_FLAGS is every unknown bit, CONSTANTS_MASK and
+        // RESOURCE_STREAMER. IS_PINNED only steers gen2 dispatch.
+        let mut supported = 0x3f
+            | abi::EXEC_BSD_MASK
+            | abi::EXEC_SECURE
+            | abi::EXEC_IS_PINNED
+            | abi::EXEC_NO_RELOC
+            | abi::EXEC_HANDLE_LUT
+            | abi::EXEC_BATCH_FIRST;
         if explicit {
             supported |= abi::EXEC_FENCE_IN
                 | abi::EXEC_FENCE_OUT
@@ -160,35 +228,59 @@ impl ExecRequest {
                 | abi::EXEC_FENCE_SUBMIT
                 | abi::EXEC_USE_EXTENSIONS;
         }
+        // DRI1 cliprects: FENCE_ARRAY and USE_EXTENSIONS reuse the fields.
+        let cliprects = flags & (abi::EXEC_FENCE_ARRAY | abi::EXEC_USE_EXTENSIONS) == 0
+            && (u32_at(&request, 28) != 0 || u64_at(&request, 32) != 0);
+        // "UXA submitting garbage DR4, fixing up": 0xffffffff counts as 0.
+        let dr4 = u32_at(&request, 24);
+        // check_buffer_count refuses no buffers (NARF bounds the list at
+        // MAX_OBJECTS beside it), then i915_gem_check_execbuffer's illegal
+        // flags, cliprects, DR1/DR4 and batch alignment. NARF also refuses
+        // here what it cannot execute: relocations, and on the synchronous
+        // kernel path fences. rsvd1's upper half is ignored, as
+        // i915_gem_context_lookup takes a u32, and rsvd2 is read only by
+        // the fence flags.
         if count == 0
             || count > MAX_OBJECTS
             || flags & !supported != 0
             || flags & abi::EXEC_NO_RELOC == 0
-            || u32_at(request, 20) != 0
-            || u32_at(request, 24) != 0
-            || (!explicit
-                && (u32_at(request, 28) != 0
-                    || u64_at(request, 32) != 0
-                    || u64_at(request, 56) != 0))
-            || u64_at(request, 48) > u32::MAX as u64
-            || start % 8 != 0
-            || length % 8 != 0
+            || cliprects
+            || u32_at(&request, 20) != 0
+            || (dr4 != 0 && dr4 != u32::MAX)
+            || (u32_at(&request, 12) | u32_at(&request, 16)) % 8 != 0
         {
             return Err(FsError::InvalidData);
         }
-        let mut wire = vec![0; count * 56];
-        user.read(u64_at(request, 0), &mut wire)?;
+        let mut objects = vec![0; count * 56];
+        user.read(u64_at(&request, 0), &mut objects)?;
+        if flags & abi::EXEC_SECURE != 0 {
+            return Err(FsError::NoDevice);
+        }
+        Ok(Self { request, objects })
+    }
+
+    /// eb_lookup_vmas and the batch selection, after the fences.
+    fn resolve(self, gem: &GemState) -> Result<ExecRequest, FsError> {
+        let request = &self.request;
+        let count = u32_at(request, 8) as usize;
+        let start = u32_at(request, 12) as u64;
+        let length = u32_at(request, 16) as u64;
+        let flags = u64_at(request, 40);
         let mut handles = BTreeSet::new();
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(count)
             .map_err(|_| FsError::OutOfMemory)?;
-        for entry in wire.chunks_exact(56) {
+        for entry in self.objects.chunks_exact(56) {
             let handle = u32_at(entry, 0);
             let alignment = u64_at(entry, 16);
             let offset = u64_at(entry, 24);
             let object_flags = u64_at(entry, 32);
-            let allowed = abi::OBJECT_WRITE | abi::OBJECT_SUPPORTS_48B | abi::OBJECT_PINNED;
+            let allowed = abi::OBJECT_WRITE
+                | abi::OBJECT_SUPPORTS_48B
+                | abi::OBJECT_PINNED
+                | abi::OBJECT_ASYNC
+                | abi::OBJECT_CAPTURE;
             if !handles.insert(handle)
                 || u32_at(entry, 4) != 0
                 || u64_at(entry, 8) != 0
@@ -215,6 +307,8 @@ impl ExecRequest {
                 object,
                 va,
                 writable: object_flags & abi::OBJECT_WRITE != 0,
+                asynchronous: object_flags & abi::OBJECT_ASYNC != 0,
+                capture: object_flags & abi::OBJECT_CAPTURE != 0,
             });
         }
         // Detect overlap without sorting the original residency order: batch
@@ -249,19 +343,24 @@ impl ExecRequest {
         {
             return Err(FsError::InvalidData);
         }
-        Ok(Self {
+        Ok(ExecRequest {
             context_id: u64_at(request, 48) as u32,
-            ring: (flags & 0x3f) as u32,
+            ring: (flags & (0x3f | abi::EXEC_BSD_MASK)) as u32,
             batch_va: batch.va + start,
             batch_len,
             objects,
         })
     }
+}
 
+impl ExecRequest {
     /// Build private tables without touching any engine or existing VM. A
     /// failed build drops all table pages; successful ownership includes all
     /// leaf objects and survives GEM_CLOSE or the submitting fd's destruction.
     pub fn address_space(&self, format: PteFormat, pat_index: u8) -> Result<AddressSpace, FsError> {
+        if self.has_async() {
+            return Err(FsError::InvalidData); // this entry has no qualified GT profile
+        }
         self.address_space_inner(format, pat_index, 0)
     }
 
@@ -271,13 +370,26 @@ impl ExecRequest {
         pat_index: u8,
         table_pat: u8,
     ) -> Result<AddressSpace, FsError> {
+        self.validate_storage()?;
         let mut memory = FramePtMemory::new();
-        let tables = Ppgtt::with_table_pat(&mut memory, format, table_pat).map_err(map_error)?;
+        let tables = Ppgtt::with_root_level(
+            &mut memory,
+            format,
+            table_pat,
+            if format == PteFormat::Xe2 { 4 } else { 3 },
+        )
+        .map_err(map_error)?;
         let mut space = AddressSpace {
             tables: Some(tables),
             memory,
             objects: Vec::new(),
+            asynchronous: Vec::new(),
+            dumpable: Vec::new(),
         };
+        space
+            .dumpable
+            .try_reserve_exact(self.objects.iter().filter(|entry| entry.capture).count())
+            .map_err(|_| FsError::OutOfMemory)?;
         for entry in &self.objects {
             // Compatibility owns a separate private VM and uses one WB host
             // PAT for every leaf. Shared Xe handles retain explicit native
@@ -287,6 +399,18 @@ impl ExecRequest {
                 return Err(FsError::InvalidData);
             }
             space.objects.push((entry.object.clone(), entry.writable));
+            space.asynchronous.push(entry.asynchronous);
+            if entry.capture {
+                space.dumpable.push(VmMapping {
+                    object: Some(entry.object.clone()),
+                    va: entry.va,
+                    offset: 0,
+                    length: entry.object.size(),
+                    writable: entry.writable,
+                    pat: pat_index,
+                    dumpable: true,
+                });
+            }
             for (i, phys) in entry.object.pages().enumerate() {
                 space
                     .tables
@@ -331,6 +455,17 @@ pub(crate) struct VmMapping {
     pub length: u64,
     pub writable: bool,
     pub pat: u8,
+    /// DRM_XE_VM_BIND_FLAG_DUMPABLE; copied with every split/replacement.
+    pub dumpable: bool,
+}
+
+pub(crate) struct DiagnosticVm<'a> {
+    pub address: u64,
+    pub length: u64,
+    pub root: u64,
+    pub flags: u32,
+    pub memory: &'a FramePtMemory,
+    pub mappings: &'a [VmMapping],
 }
 
 impl ResidentBatch {
@@ -345,8 +480,9 @@ impl ResidentBatch {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
-            GtPlatform::Alchemist => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Alchemist | GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            _ if platform.is_headless_integrated() => (PteFormat::Xe2, 2, 2),
             _ => return Err(FsError::NotImplemented),
         };
         if mappings.len() > 4096 {
@@ -367,6 +503,9 @@ impl ResidentBatch {
                     .checked_add(m.length)
                     .is_none_or(|end| end > object.size())
                 {
+                    return Err(FsError::InvalidData);
+                }
+                if (platform.is_gen12() || platform.is_headless_integrated()) && object.is_vram() {
                     return Err(FsError::InvalidData);
                 }
                 if object.is_vram()
@@ -398,6 +537,11 @@ impl ResidentBatch {
         };
         if let Some((addr, _)) = user_fence {
             if addr & 7 != 0
+                || mappings.iter().any(|m| {
+                    m.object.as_ref().is_some_and(|o| o.is_gpu_only())
+                        && addr >= m.va
+                        && addr < m.va + m.length
+                })
                 || !mappings.iter().any(|m| {
                     m.object.is_some()
                         && m.writable
@@ -412,16 +556,36 @@ impl ResidentBatch {
         }
         let mut memory = FramePtMemory::new();
         let tables = if scratch {
-            Ppgtt::with_scratch(&mut memory, format, table_pat, leaf_pat)
+            Ppgtt::with_scratch_root_level(
+                &mut memory,
+                format,
+                table_pat,
+                leaf_pat,
+                platform.ppgtt_root_level(),
+            )
         } else {
-            Ppgtt::with_table_pat(&mut memory, format, table_pat)
+            Ppgtt::with_root_level(
+                &mut memory,
+                format,
+                table_pat,
+                if format == PteFormat::Xe2 { 4 } else { 3 },
+            )
         }
         .map_err(map_error)?;
         let mut space = AddressSpace {
             tables: Some(tables),
             memory,
             objects: Vec::new(),
+            asynchronous: Vec::new(),
+            dumpable: Vec::new(),
         };
+        space
+            .dumpable
+            .try_reserve_exact(mappings.iter().filter(|m| m.dumpable).count())
+            .map_err(|_| FsError::OutOfMemory)?;
+        space
+            .dumpable
+            .extend(mappings.iter().filter(|m| m.dumpable).cloned());
         for mapping in mappings {
             if let Some(object) = &mapping.object {
                 if let Some((_, writable)) = space
@@ -481,6 +645,9 @@ impl ResidentBatch {
                         .map_err(map_error)?;
                 }
             }
+        }
+        if !space.within_dma_bits(platform) {
+            return Err(FsError::InvalidData);
         }
         Ok(Self {
             space,
@@ -572,7 +739,13 @@ impl ResidentBatch {
         &self,
         completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
     ) -> Result<(), FsError> {
-        if self.implicit_sync {
+        if self.implicit_sync && self.space.asynchronous.iter().any(|value| *value) {
+            crate::intel_gpu_gem::reserve_gpu_mixed(
+                &self.space.objects,
+                &self.space.asynchronous,
+                completion,
+            )
+        } else if self.implicit_sync {
             crate::intel_gpu_gem::reserve_gpu(&self.space.objects, completion)
         } else {
             crate::intel_gpu_gem::reserve_gpu_explicit(&self.space.objects, completion);
@@ -590,6 +763,34 @@ impl ResidentBatch {
                 .objects
                 .iter()
                 .all(|(object, _)| object.publish_for_device())
+    }
+
+    /// The execution owns this immutable graph even after VM/GEM close.
+    /// No VM mutex, allocation, device read or reservation wait is needed.
+    pub(crate) fn diagnostic_vm(&self) -> DiagnosticVm<'_> {
+        DiagnosticVm {
+            address: self.address,
+            length: self.length,
+            root: self.space.root_phys(),
+            flags: u32::from(self.skip_batch) | u32::from(self.parallel.is_some()) << 1,
+            memory: &self.space.memory,
+            mappings: &self.space.dumpable,
+        }
+    }
+
+    /// Per-lane batch addresses (xe_sched_job_snapshot_capture), lane zero
+    /// first; none for a batchless submission.
+    pub(crate) fn diagnostic_batches(&self) -> impl Iterator<Item = u64> + '_ {
+        (!self.skip_batch)
+            .then_some(self.address)
+            .into_iter()
+            .chain(
+                self.parallel
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .filter(|_| !self.skip_batch),
+            )
     }
 }
 
@@ -642,12 +843,16 @@ impl PpgttProbeResult {
                 ExecObject {
                     object: code.clone(),
                     va: PROBE_CODE,
-                    writable: false
+                    writable: false,
+                    asynchronous: false,
+                    capture: false,
                 },
                 ExecObject {
                     object: data.clone(),
                     va: PROBE_DATA,
-                    writable: true
+                    writable: true,
+                    asynchronous: false,
+                    capture: false,
                 },
             ],
         }
@@ -705,9 +910,25 @@ pub struct AddressSpace {
     tables: Option<Ppgtt>,
     memory: FramePtMemory,
     objects: Vec<(Arc<GemObject>, bool)>,
+    // Aligned with objects for compatibility; native Xe uses its existing
+    // globally explicit path and leaves this empty.
+    asynchronous: Vec<bool>,
+    dumpable: Vec<VmMapping>,
 }
 
 impl AddressSpace {
+    // The common PTE format admits more bits than the Gen12 PCI DMA mask.
+    // Validate the entire owned graph before publishing its root to GuC.
+    fn within_dma_bits(&self, platform: GtPlatform) -> bool {
+        let bits = platform.physical_bits();
+        self.memory
+            .diagnostic_tables()
+            .all(|phys| phys >> bits == 0)
+            && self.objects.iter().all(|(object, _)| {
+                (!platform.is_gen12() || !object.is_vram())
+                    && object.pages().all(|phys| phys >> bits == 0)
+            })
+    }
     pub fn root_phys(&self) -> u64 {
         self.tables.as_ref().expect("owned tables").root_phys()
     }

@@ -84,6 +84,7 @@ fn errno(error: FsError) -> i64 {
         FsError::OperationNotPermitted => 1,
         FsError::NotFound => 2,
         FsError::NoDeviceAddress => 6,
+        FsError::ArgumentListTooLong => 7,
         FsError::BadFd => 9,
         FsError::WouldBlock => 11,
         FsError::OutOfMemory => 12,

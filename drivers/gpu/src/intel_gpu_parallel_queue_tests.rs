@@ -867,3 +867,10 @@ kernel_test_in!(
 mod wider {
     include!("intel_gpu_parallel_wide_tests.rs");
 }
+mod priority {
+    include!("intel_gpu_xe_priority_tests.rs");
+}
+
+mod low_latency {
+    include!("intel_gpu_xe_low_latency_tests.rs");
+}

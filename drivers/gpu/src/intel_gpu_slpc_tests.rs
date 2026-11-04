@@ -70,6 +70,30 @@ pub(super) fn service(w: &Window, memory: &Words, control_fence: u16, request: &
                     let old = shared.borrow()[33];
                     shared.borrow_mut()[33] = (old & !255) | raw;
                 }
+                4 | 5 => {
+                    let mut d = w.0.borrow_mut();
+                    assert!(d.profile.is_some_and(GtPlatform::is_ptl));
+                    if request[2] == 5 {
+                        // The prior success packet must have been consumed by
+                        // the host before it may publish the second request.
+                        assert_eq!(memory.borrow()[512], memory.borrow()[513]);
+                    }
+                    let expected = if d.slpc_dcc.is_empty() {
+                        (4, 0)
+                    } else {
+                        (5, 1)
+                    };
+                    assert_eq!((request[2], request[3]), expected);
+                    d.slpc_dcc.push((request[2], request[3]));
+                }
+                // SLPC_OPTIMIZED_STRATEGY_COMPUTE: the media GuC's start only.
+                26 if w.0.borrow().media_tlb.is_some() => {
+                    assert_eq!(request[3], 1);
+                    if mode == 11 {
+                        failure_response(memory, control_fence);
+                        return;
+                    }
+                }
                 27 | 28 => assert!(request[3] <= 1),
                 _ => panic!("unknown SLPC parameter"),
             }
@@ -308,6 +332,37 @@ kernel_test_in!(
     smoke_slpc_ct_full_retries_without_publishing_success
 );
 
+fn smoke_slpc_reply_before_late_poll_completes_update() -> TestResult {
+    // guc_ct_send_recv's wait_event_timeout counts a fence completed by the
+    // time the timeout expires as success: a reply already posted when a
+    // poll arrives past the 1.005 s bound completes the update.
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    hardware_discovery(&mut gt, &w, 0xdfc);
+    hardware_scheduling(&mut gt, &w);
+    SLPC_FIXTURE_MODE.store(0, core::sync::atomic::Ordering::Relaxed);
+    gt.begin_slpc(30).unwrap();
+    drive(&mut gt, &w, 31);
+    gt.begin_slpc_power_profile(PowerProfile::PowerSaving, 100)
+        .unwrap();
+    assert_eq!(gt.poll(101), Poll::Ready(Ok(GtState::SchedulingReady)));
+    assert_eq!(gt.slpc(), SlpcState::Updating);
+    service_contexts(&w, &mut BTreeMap::new(), true);
+    assert_eq!(
+        gt.poll(100 + 1_005_000_000 + 1),
+        Poll::Ready(Ok(GtState::SchedulingReady))
+    );
+    assert_eq!(gt.slpc(), SlpcState::Running);
+    assert_eq!(gt.slpc_status().unwrap().profile, PowerProfile::PowerSaving);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_slpc",
+    smoke_slpc_reply_before_late_poll_completes_update
+);
+
 fn smoke_slpc_stable_ip_qualified_fused_vectors() -> TestResult {
     use crate::intel_gpu_slpc::Limits;
     let (w, _) = model();
@@ -396,4 +451,113 @@ fn smoke_slpc_buffer_remains_disjoint_from_later_contexts() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_slpc",
     smoke_slpc_buffer_remains_disjoint_from_later_contexts
+);
+
+fn smoke_gen12_slpc_uses_pre_gmd_frequency_fuses() -> TestResult {
+    use crate::intel_gpu_gt::Gen12Platform;
+    use crate::intel_gpu_slpc::Limits;
+    struct PreGmd {
+        cap: u32,
+        efficient: u32,
+    }
+    impl MmioWindow for PreGmd {
+        fn read32(&self, register: u64) -> u32 {
+            match register {
+                0x145998 => self.cap,
+                0x145ef0 => self.efficient,
+                _ => panic!("unexpected Gen12 frequency register {register:x}"),
+            }
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("frequency discovery wrote MMIO");
+        }
+    }
+    for family in [
+        Gen12Platform::TigerLake,
+        Gen12Platform::AlderLakeP,
+        Gen12Platform::AlderLakeS,
+        Gen12Platform::AlderLakeN,
+    ] {
+        let platform = GtPlatform::Gen12(family);
+        let limits = Limits::read(
+            &PreGmd {
+                cap: (6 << 16) | 30,
+                efficient: 18 << 8,
+            },
+            platform,
+            0x9a49,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                limits.rpn_mhz,
+                limits.rpe_mhz,
+                limits.rp0_mhz,
+                limits.min_mhz,
+                limits.max_mhz
+            ),
+            (300, 900, 1500, 300, 1500)
+        );
+        for cap in [u32::MAX, 30, (31 << 16) | 30] {
+            assert!(Limits::read(
+                &PreGmd {
+                    cap,
+                    efficient: 18 << 8
+                },
+                platform,
+                0x9a49
+            )
+            .is_err());
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_slpc",
+    smoke_gen12_slpc_uses_pre_gmd_frequency_fuses
+);
+
+fn smoke_ptl_slpc_dcc_order_ack_failure_and_timeout() -> TestResult {
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
+    for mode in [0, 4, 9] {
+        let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling(&mut gt, &w);
+        SLPC_FIXTURE_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
+        gt.begin_slpc(30).unwrap();
+        let mut contexts = BTreeMap::new();
+        for now in 31..100 {
+            service_contexts(&w, &mut contexts, true);
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            if gt.slpc_status().is_some() || gt.slpc() == SlpcState::Unavailable {
+                break;
+            }
+        }
+        if mode == 0 {
+            assert_eq!(w.0.borrow().slpc_dcc, [(4, 0), (5, 1)]);
+            let status = gt.slpc_status().unwrap();
+            assert_eq!((status.limits.min_mhz, status.limits.max_mhz), (300, 3000));
+        } else {
+            // A failed or merely busy first command cannot send the second,
+            // and cannot publish a confirmed frequency-control status.
+            assert_eq!(w.0.borrow().slpc_dcc, [(4, 0)]);
+            assert!(gt.slpc_status().is_none());
+            if mode == 9 {
+                assert_eq!(
+                    gt.poll(1_005_000_030),
+                    Poll::Ready(Ok(GtState::SchedulingReady))
+                );
+            }
+            assert_eq!(gt.slpc(), SlpcState::Unavailable);
+        }
+        SLPC_FIXTURE_MODE.store(0, core::sync::atomic::Ordering::Relaxed);
+        hardware_stop(&mut gt, &w, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_ptl_slpc_dcc_order_ack_failure_and_timeout
 );

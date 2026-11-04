@@ -1,4 +1,4 @@
-//! Owned linear GEM scanout windows and primary-surface latch tracking.
+//! Owned linear/no-DPT X/Tile4 GEM scanout and primary-surface latch tracking.
 //!
 //! References: MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! xe/display/xe_fb_pin.c, i915/display/{skl_universal_plane_regs.h,
@@ -37,6 +37,8 @@ const CTL_FORMAT_MASK: u32 = 0x1f << 23;
 const CTL_TILED_MASK: u32 = 7 << 10;
 const CTL_RGB_ORDER: u32 = 1 << 20;
 const CTL_XRGB8888: u32 = 8 << 23;
+pub(crate) const X_TILED_MODIFIER: u64 = 0x0100_0000_0000_0001;
+pub(crate) const TILE4_MODIFIER: u64 = 0x0100_0000_0000_0009;
 // ICL+ arbitration slots and the harmless trickle-feed/clear-color disable
 // controls may be inherited. All auxiliary/YUV/keying, compression, async,
 // horizontal-flip and rotation bits must be clear for this linear surface.
@@ -46,6 +48,25 @@ const AUX_OFFSET_OFFSET: u64 = 0x44;
 const CUS_CTL_OFFSET: u64 = 0x48;
 const COLOR_CTL_OFFSET: u64 = 0x4c;
 const FLIP_TIMEOUT_NS: u64 = 1_000_000_000;
+
+pub(crate) fn gen12_alignment(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
+    if matches!(
+        family,
+        crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+            | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+    ) {
+        16384
+    } else {
+        4096
+    }
+}
+pub(crate) fn gen12_max_stride(family: crate::intel_gpu_gt::Gen12Platform) -> u32 {
+    if gen12_alignment(family) == 16384 {
+        128 * 1024
+    } else {
+        32 * 1024
+    }
+}
 
 /// MMIO and GGTT invalidation retained for as long as any scanout may fetch.
 ///
@@ -57,6 +78,27 @@ const FLIP_TIMEOUT_NS: u64 = 1_000_000_000;
 /// successful zero-valued MMIO. It must not re-enter this presenter.
 pub unsafe trait ScanoutIo: MmioWindow {
     fn invalidate_ggtt(&self) -> bool;
+
+    /// A source-qualified fixed display14 opaque linear XR30 input profile.
+    /// This is a retained current display/resource proof, not format discovery.
+    fn supports_xr30(&self) -> bool {
+        false
+    }
+
+    /// Retain only the exact original/current/pending primary controls owned
+    /// by this presenter. Required before an XR30 DSB can be exposed and before
+    /// fresh console recovery; it grants no arbitrary CPU format writes.
+    fn retain_primary_controls(
+        &self,
+        _original: u32,
+        _current: u32,
+        _pending: Option<u32>,
+    ) -> bool {
+        false
+    }
+    fn retained_primary_control(&self, _control: u32) -> bool {
+        false
+    }
 
     /// Restore only the status bits owned by this presentation service.
     ///
@@ -72,8 +114,8 @@ pub unsafe trait ScanoutIo: MmioWindow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SurfaceId(u64);
 
-/// A LINEAR XRGB8888 visible rectangle. Surface-only flips retain the
-/// existing timing, watermark, stride, format and primary-plane geometry.
+/// An opaque cpp4 visible rectangle. Native format changes use the retained
+/// joint DSB; surface-only flips retain the original XR24 format and geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     pub width: u32,
@@ -104,7 +146,7 @@ impl Geometry {
 
 /// Integer source origin; destination geometry and bandwidth stay unchanged.
 /// Linux intel_fb.c::intel_compute_aligned_offset splits a linear address
-/// into a 4-KiB-aligned TGL+ SURF and residual PLANE_OFFSET coordinates.
+/// or tile address into a 4-KiB-aligned TGL+ SURF and residual PLANE_OFFSET.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Viewport {
     pub x: u32,
@@ -139,6 +181,147 @@ impl Viewport {
     }
 }
 
+/// Fixed primary layout. X/Tile4 use the source-qualified MTL no-DPT path;
+/// neither auxiliary compression nor a display page-table pointer is accepted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Layout {
+    #[default]
+    Linear,
+    X,
+    Tile4,
+}
+/// Opaque 32-bit primary input. Output link depth and colorimetry are unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InputFormat {
+    #[default]
+    Xrgb8888,
+    Xrgb2101010,
+}
+impl InputFormat {
+    pub(crate) fn control(self) -> u32 {
+        match self {
+            Self::Xrgb8888 => CTL_XRGB8888,
+            Self::Xrgb2101010 => 0x02000000,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct View {
+    pub(crate) origin: Viewport,
+    pub(crate) layout: Layout,
+    pub(crate) input: InputFormat,
+}
+impl From<Viewport> for View {
+    fn from(origin: Viewport) -> Self {
+        Self {
+            origin,
+            layout: Layout::Linear,
+            input: InputFormat::Xrgb8888,
+        }
+    }
+}
+impl View {
+    pub(crate) fn footprint(self, geometry: Geometry) -> Result<(u32, u32, u64), ScanoutError> {
+        if self.input == InputFormat::Xrgb2101010 && self.layout != Layout::Linear {
+            return Err(ScanoutError::Unsupported);
+        }
+        if self.layout == Layout::Linear {
+            return self.origin.layout(geometry);
+        }
+        geometry.extent()?;
+        let tile_width = if self.layout == Layout::X { 512 } else { 128 };
+        let tile_height = 4096 / tile_width;
+        let tile_pixels = tile_width / 4;
+        // intel_tile_width_bytes and intel_tile_height for plain X/Tile4.
+        // The no-DPT surface alignment is exactly one tile. Decompose the
+        // source as intel_compute_aligned_offset, without stride remapping.
+        if geometry.pitch % tile_width != 0
+            || geometry.pitch > 128 * 1024
+            || !(4..=5120).contains(&geometry.width)
+            || geometry.height > 4320
+        {
+            return Err(ScanoutError::Unsupported);
+        }
+        if self.origin.x > 0xffff
+            || self.origin.y > 0xffff
+            || self
+                .origin
+                .x
+                .checked_add(geometry.width)
+                .is_none_or(|end| end > geometry.pitch / 4)
+        {
+            // In particular residualX+width cannot exceed the tile stride
+            // (skl_calc_main_surface_offset's X-tile overfetch restriction).
+            return Err(ScanoutError::Bounds);
+        }
+        let rows = (u64::from(self.origin.y) + u64::from(geometry.height))
+            .div_ceil(u64::from(tile_height))
+            * u64::from(tile_height);
+        let bytes = rows * u64::from(geometry.pitch);
+        if bytes > GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START {
+            return Err(ScanoutError::Bounds);
+        }
+        let tile = u64::from(self.origin.y / tile_height) * u64::from(geometry.pitch / tile_width)
+            + u64::from(self.origin.x / tile_pixels);
+        Ok((
+            (tile * GTT_PAGE_SIZE) as u32,
+            (self.origin.y % tile_height) << 16 | (self.origin.x % tile_pixels),
+            bytes,
+        ))
+    }
+    /// Linux intel_compute_aligned_offset + intel_adjust_tile_offset. ADLP/N
+    /// use 16KiB SURF alignment even for synchronous linear/X replacements.
+    pub(crate) fn footprint_aligned(
+        self,
+        geometry: Geometry,
+        alignment: u32,
+    ) -> Result<(u32, u32, u64), ScanoutError> {
+        let (base, offset, bytes) = self.footprint(geometry)?;
+        if ![4096, 16384].contains(&alignment) {
+            return Err(ScanoutError::Unsupported);
+        }
+        let aligned = base & !(alignment - 1);
+        if self.layout == Layout::Linear {
+            let start =
+                u64::from(self.origin.y) * u64::from(geometry.pitch) + u64::from(self.origin.x) * 4;
+            let residual = start - u64::from(aligned);
+            let y = residual / u64::from(geometry.pitch);
+            let x = residual % u64::from(geometry.pitch) / 4;
+            if x > 0xffff || y > 0xffff {
+                return Err(ScanoutError::Bounds);
+            }
+            return Ok((aligned, (y as u32) << 16 | x as u32, bytes));
+        }
+        let tile_width = if self.layout == Layout::X { 128 } else { 32 };
+        let tile_height = if self.layout == Layout::X { 8 } else { 32 };
+        let pitch_tiles = geometry.pitch / (tile_width * 4);
+        let delta = (base - aligned) / 4096;
+        let mut y = (offset >> 16) + (delta / pitch_tiles) * tile_height;
+        let mut x = (offset & 0xffff) + (delta % pitch_tiles) * tile_width;
+        y += x / (pitch_tiles * tile_width) * tile_height;
+        x %= pitch_tiles * tile_width;
+        if x + geometry.width > geometry.pitch / 4 || x > 0xffff || y > 0xffff {
+            return Err(ScanoutError::Bounds);
+        }
+        Ok((aligned, y << 16 | x, bytes))
+    }
+    pub(crate) fn stride(self, geometry: Geometry) -> u32 {
+        geometry.pitch
+            / match self.layout {
+                Layout::Linear => 64,
+                Layout::X => 512,
+                Layout::Tile4 => 128,
+            }
+    }
+    pub(crate) fn tiled(self) -> u32 {
+        match self.layout {
+            Layout::Linear => 0,
+            Layout::X => 1 << 10,
+            Layout::Tile4 => 5 << 10,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanoutError {
     Unsupported,
@@ -154,13 +337,14 @@ struct Surface {
     offset: u32,
     pages: u32,
     geometry: Geometry,
-    viewport: Viewport,
+    view: View,
 }
 #[derive(Clone, Copy)]
 struct Pending {
     id: SurfaceId,
     offset: u32,
     geometry: Geometry,
+    view: View,
     plane_offset: u32,
     ticket: u64,
     frame: u32,
@@ -171,6 +355,7 @@ struct Pending {
 struct Target {
     offset: u32,
     geometry: Geometry,
+    view: View,
     plane_offset: u32,
 }
 
@@ -193,6 +378,8 @@ pub struct Presenter<M: ScanoutIo> {
     pipe: Pipe,
     format: PteFormat,
     pat: u8,
+    alignment: u32,
+    gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
     free: Vec<(u32, u32)>,
     surfaces: BTreeMap<SurfaceId, Surface>,
     next_id: u64,
@@ -201,6 +388,8 @@ pub struct Presenter<M: ScanoutIo> {
     console_geometry: Option<Geometry>,
     expected_surface: u32,
     expected_offset: u32,
+    console_ctl: u32,
+    expected_view: View,
     pending: Option<Pending>,
     failed: bool,
     closed: bool,
@@ -256,11 +445,17 @@ impl<M: ScanoutIo> Presenter<M> {
         {
             return Err(ScanoutError::Bounds);
         }
+        let console_ctl = io.read32(pipe.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET);
+        if console_ctl & CTL_TILED_MASK != 0 {
+            return Err(ScanoutError::Unsupported);
+        }
         let owner = Self {
             io: Some(io),
             pipe,
             format,
             pat,
+            alignment: 4096,
+            gen12_family: None,
             free: alloc::vec![(
                 GEM_SCANOUT_GTT_START as u32,
                 ((GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START) / GTT_PAGE_SIZE) as u32,
@@ -272,6 +467,8 @@ impl<M: ScanoutIo> Presenter<M> {
             console_geometry: None,
             expected_surface: initial_surface,
             expected_offset: 0,
+            console_ctl,
+            expected_view: View::default(),
             pending: None,
             failed: false,
             closed: false,
@@ -291,6 +488,41 @@ impl<M: ScanoutIo> Presenter<M> {
     pub(crate) fn retained_io(&self) -> &M {
         self.io()
     }
+    pub(crate) fn console_control(&self) -> u32 {
+        self.console_ctl
+    }
+    fn control(&self, view: View) -> u32 {
+        (self.console_ctl & !(CTL_FORMAT_MASK | CTL_TILED_MASK))
+            | view.input.control()
+            | view.tiled()
+    }
+    pub(crate) fn tracks_xr30(&self) -> bool {
+        self.expected_view.input == InputFormat::Xrgb2101010
+            || self
+                .pending
+                .is_some_and(|p| p.view.input == InputFormat::Xrgb2101010)
+    }
+    pub(crate) fn retained_primary_controls(&self) -> (u32, u32, Option<u32>) {
+        (
+            self.console_ctl,
+            self.control(self.expected_view),
+            self.pending.map(|p| self.control(p.view)),
+        )
+    }
+    fn retain_controls(&self, pending: Option<View>) -> Result<(), ScanoutError> {
+        if (self.expected_view.input == InputFormat::Xrgb2101010
+            || pending.is_some_and(|v| v.input == InputFormat::Xrgb2101010))
+            && (!self.io().supports_xr30()
+                || !self.io().retain_primary_controls(
+                    self.console_ctl,
+                    self.control(self.expected_view),
+                    pending.map(|v| self.control(v)),
+                ))
+        {
+            return Err(ScanoutError::Unavailable);
+        }
+        Ok(())
+    }
 
     /// Start a fresh console transaction without accepting any pre-loss
     /// SURF/SURFLIVE sample as retirement of the previous owner's pages.
@@ -300,6 +532,8 @@ impl<M: ScanoutIo> Presenter<M> {
     /// The caller retains every old current/pending allocation and the
     /// console allocation, exclusively owns this plane/arena, has restored
     /// and verified GT cache policy and supplies a new live status owner.
+    /// For Gen12 X, the caller also retains the exact family/no-DPT witness
+    /// before this temporary parser accepts an old owned tiled plane image.
     /// Only a successful fresh console latch permits reclaiming old pages.
     pub(crate) unsafe fn recover_console(
         io: M,
@@ -307,9 +541,12 @@ impl<M: ScanoutIo> Presenter<M> {
         pipe: Pipe,
         format: PteFormat,
         pat: u8,
-        target: (u32, Geometry, u64),
+        target: (u32, Geometry, u32, u64),
     ) -> Result<Self, ScanoutError> {
-        let (console, geometry, now) = target;
+        let (console, geometry, console_ctl, now) = target;
+        if console_ctl == u32::MAX || console_ctl & CTL_TILED_MASK != 0 {
+            return Err(ScanoutError::Unsupported);
+        }
         check_ggtt_range(
             bar_len,
             GEM_SCANOUT_GTT_START,
@@ -330,6 +567,8 @@ impl<M: ScanoutIo> Presenter<M> {
             pipe,
             format,
             pat,
+            alignment: 4096,
+            gen12_family: None,
             free: alloc::vec![],
             surfaces: BTreeMap::new(),
             next_id: 1,
@@ -338,11 +577,36 @@ impl<M: ScanoutIo> Presenter<M> {
             console_geometry: Some(geometry),
             expected_surface: console,
             expected_offset: 0,
+            console_ctl,
+            expected_view: View::default(),
             pending: None,
             failed: false,
             closed: false,
         };
-        if !owner.geometry_matches(geometry) {
+        let ctl = owner.io().read32(owner.plane() + PLANE_CTL_OFFSET);
+        if ctl & CTL_TILED_MASK == 1 << 10 {
+            owner.expected_view.layout = Layout::X;
+        } else if ctl & CTL_TILED_MASK == 5 << 10 {
+            owner.expected_view.layout = Layout::Tile4;
+        }
+        if ctl & CTL_FORMAT_MASK == InputFormat::Xrgb2101010.control() {
+            if owner.format != PteFormat::XeLpg
+                || !owner.io().supports_xr30()
+                || !owner.io().retained_primary_control(ctl)
+            {
+                return Err(ScanoutError::Unsupported);
+            }
+            owner.expected_view.input = InputFormat::Xrgb2101010;
+        }
+        let stride = owner.io().read32(owner.plane() + PLANE_STRIDE_OFFSET);
+        // An interrupted owned arm may have changed STRIDE but not CTL (or
+        // vice versa). Only the retained fixed layout pitches are admissible;
+        // neither mixed readback is accepted as completion/retirement.
+        if !(stride == geometry.pitch / 64
+            || (geometry.pitch % 512 == 0 && stride == geometry.pitch / 512)
+            || (geometry.pitch % 128 == 0 && stride == geometry.pitch / 128))
+            || !owner.geometry_matches_stride(geometry, owner.expected_view, stride)
+        {
             return Err(ScanoutError::Unsupported);
         }
         owner.arm_observed(
@@ -350,6 +614,7 @@ impl<M: ScanoutIo> Presenter<M> {
             Target {
                 offset: console,
                 geometry,
+                view: View::default(),
                 plane_offset: 0,
             },
             0,
@@ -357,6 +622,46 @@ impl<M: ScanoutIo> Presenter<M> {
             false,
         )?;
         Ok(owner)
+    }
+    pub(crate) fn qualify_gen12(
+        &mut self,
+        family: crate::intel_gpu_gt::Gen12Platform,
+    ) -> Result<(), ScanoutError> {
+        if self.format != PteFormat::Gen12
+            || self.pending.is_some()
+            || !self.surfaces.is_empty()
+            || self.current.is_some()
+        {
+            return Err(ScanoutError::Busy);
+        }
+        if self.console_ctl != crate::intel_gpu_pipes::gen12_xrgb_control(family) {
+            return Err(ScanoutError::Unsupported);
+        }
+        self.alignment = gen12_alignment(family);
+        self.gen12_family = Some(family);
+        Ok(())
+    }
+    fn no_dpt(&self, layout: Layout) -> bool {
+        if layout == Layout::Linear {
+            return true;
+        }
+        if self.format == PteFormat::Gen12 {
+            if layout != Layout::X {
+                return false;
+            }
+            return self.gen12_family.is_none_or(|family| {
+                !matches!(
+                    family,
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                        | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+                ) || {
+                    let v = self.io().read32(0x42084);
+                    v != u32::MAX && v & (1 << 30) != 0
+                }
+            });
+        }
+        let v = self.io().read32(0x7026c);
+        v != u32::MAX && v & (1 << 19) != 0
     }
     fn plane(&self) -> u64 {
         self.pipe.base() + PLANE_PRIMARY_OFFSET
@@ -387,28 +692,54 @@ impl<M: ScanoutIo> Presenter<M> {
         self.prepare_object(object, geometry)
     }
 
-    pub(crate) fn prepare_view(
+    pub(crate) fn prepare_layout(
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
-        viewport: Viewport,
+        view: View,
     ) -> Result<SurfaceId, ScanoutError> {
-        self.ready()?;
+        if view.input == InputFormat::Xrgb2101010
+            && (self.format != PteFormat::XeLpg
+                || view.layout != Layout::Linear
+                || !self.io().supports_xr30())
+        {
+            return Err(ScanoutError::Unsupported);
+        }
+        if view.layout != Layout::Linear
+            && (!self.no_dpt(view.layout)
+                || (self.format == PteFormat::Gen12 && self.gen12_family.is_none()))
+        {
+            return Err(ScanoutError::Unsupported);
+        }
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(ScanoutError::Unsupported);
         }
-        self.prepare_object_view(object, geometry, viewport)
+        self.prepare_object_view(object, geometry, view)
     }
 
-    pub(crate) fn matches_view(
-        &self,
-        id: SurfaceId,
-        geometry: Geometry,
-        viewport: Viewport,
-    ) -> bool {
+    pub(crate) fn linear_surface(&self, id: SurfaceId) -> bool {
         self.surfaces
             .get(&id)
-            .is_some_and(|surface| surface.geometry == geometry && surface.viewport == viewport)
+            .is_some_and(|s| s.view.layout == Layout::Linear)
+    }
+    pub(crate) fn check_current(&self, geometry: Geometry) -> Result<(), ScanoutError> {
+        self.ready()?;
+        if self.pending.is_some() {
+            return Err(ScanoutError::Busy);
+        }
+        if !self.geometry_matches(geometry, self.expected_view)
+            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
+            || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.expected_surface
+            || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
+        {
+            return Err(ScanoutError::Unavailable);
+        }
+        Ok(())
+    }
+    pub(crate) fn matches_view(&self, id: SurfaceId, geometry: Geometry, view: View) -> bool {
+        self.surfaces
+            .get(&id)
+            .is_some_and(|surface| surface.geometry == geometry && surface.view == view)
     }
 
     fn prepare_object(
@@ -416,17 +747,17 @@ impl<M: ScanoutIo> Presenter<M> {
         object: Arc<GemObject>,
         geometry: Geometry,
     ) -> Result<SurfaceId, ScanoutError> {
-        self.prepare_object_view(object, geometry, Viewport::default())
+        self.prepare_object_view(object, geometry, View::default())
     }
 
     fn prepare_object_view(
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
-        viewport: Viewport,
+        view: View,
     ) -> Result<SurfaceId, ScanoutError> {
         self.ready()?;
-        let (_, _, extent) = viewport.layout(geometry)?;
+        let (_, _, extent) = view.footprint_aligned(geometry, self.alignment)?;
         if extent > object.size() {
             return Err(ScanoutError::Bounds);
         }
@@ -437,28 +768,36 @@ impl<M: ScanoutIo> Presenter<M> {
         let ptes: Vec<u64> = object
             .pages()
             .take(pages as usize)
-            .map(|phys| self.format.encode_ggtt(phys, self.pat))
+            .map(|phys| crate::intel_gpu_gtt::encode_display_pte(self.format, phys, self.pat))
             .collect::<Result<_, _>>()
             .map_err(|_| ScanoutError::Bounds)?;
         if ptes.len() != pages as usize {
             return Err(ScanoutError::Bounds);
         }
-        let slot = self
+        let (slot, offset, prefix) = self
             .free
             .iter()
-            .position(|&(_, n)| n >= pages)
+            .enumerate()
+            .find_map(|(slot, &(start, n))| {
+                let aligned = (start + self.alignment - 1) & !(self.alignment - 1);
+                let prefix = (aligned - start) / 4096;
+                (n >= pages + prefix).then_some((slot, aligned, prefix))
+            })
             .ok_or(ScanoutError::Busy)?;
         if !object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
         let id = SurfaceId(self.next_id);
         let next = self.next_id.checked_add(1).ok_or(ScanoutError::Busy)?;
-        let offset = self.free[slot].0;
-        self.free[slot].0 += pages * 4096;
-        self.free[slot].1 -= pages;
-        if self.free[slot].1 == 0 {
-            self.free.remove(slot);
+        let (start, available) = self.free.remove(slot);
+        if prefix != 0 {
+            self.free.push((start, prefix));
         }
+        if available > pages + prefix {
+            self.free
+                .push((offset + pages * 4096, available - pages - prefix));
+        }
+        self.free.sort_unstable_by_key(|&(base, _)| base);
         self.next_id = next;
         // Ownership precedes the first hardware-visible write, including on
         // unavailable/readback/invalidation failure.
@@ -469,7 +808,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 offset,
                 pages,
                 geometry,
-                viewport,
+                view,
             },
         );
         for (i, &pte) in ptes.iter().enumerate() {
@@ -497,14 +836,20 @@ impl<M: ScanoutIo> Presenter<M> {
         let available = self.io().read32(reg) != u32::MAX && self.io().read32(reg + 4) != u32::MAX;
         available && self.io().invalidate_ggtt()
     }
-    fn geometry_matches(&self, geometry: Geometry) -> bool {
+    fn geometry_matches(&self, geometry: Geometry, view: View) -> bool {
+        self.geometry_matches_stride(geometry, view, view.stride(geometry))
+    }
+    fn geometry_matches_stride(&self, geometry: Geometry, view: View, stride: u32) -> bool {
         let ctl = self.io().read32(self.plane() + PLANE_CTL_OFFSET);
         let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
+
         ctl != u32::MAX
-            && ctl & !ALLOWED_CTL == 0
+            && ctl & !(ALLOWED_CTL | CTL_TILED_MASK) == 0
             && ctl & (PLANE_CTL_ENABLE | CTL_FORMAT_MASK | CTL_TILED_MASK | CTL_RGB_ORDER)
-                == PLANE_CTL_ENABLE | CTL_XRGB8888
-            && self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) == geometry.pitch / 64
+                == PLANE_CTL_ENABLE | view.input.control() | view.tiled()
+            && ctl == self.control(view)
+            && self.no_dpt(view.layout)
+            && self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) == stride
             && self.io().read32(self.plane() + PLANE_SIZE_OFFSET)
                 == ((geometry.height - 1) << 16) | (geometry.width - 1)
             && self.io().read32(self.plane() + AUX_DIST_OFFSET) == 0
@@ -535,7 +880,10 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Busy);
         }
         let surface = self.surfaces.get(&id).ok_or(ScanoutError::UnknownSurface)?;
-        if surface.viewport != Viewport::default() {
+        if surface.view != View::default()
+            || self.expected_view.input != InputFormat::Xrgb8888
+            || self.expected_view.layout != Layout::Linear
+        {
             return Err(ScanoutError::Unsupported);
         }
         if !surface.object.idle(false) {
@@ -544,13 +892,16 @@ impl<M: ScanoutIo> Presenter<M> {
         if !surface.object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
-        let (base, plane_offset, _) = surface.viewport.layout(surface.geometry)?;
+        let (base, plane_offset, _) = surface
+            .view
+            .footprint_aligned(surface.geometry, self.alignment)?;
         let (offset, geometry) = (surface.offset + base, surface.geometry);
         self.arm_target(
             id,
             Target {
                 offset,
                 geometry,
+                view: surface.view,
                 plane_offset,
             },
             ticket,
@@ -567,7 +918,7 @@ impl<M: ScanoutIo> Presenter<M> {
         id: SurfaceId,
         ticket: u64,
         now: u64,
-    ) -> Result<[(u64, u32); 2], ScanoutError> {
+    ) -> Result<Vec<(u64, u32)>, ScanoutError> {
         self.ready()?;
         let surface = self.surfaces.get(&id).ok_or(ScanoutError::UnknownSurface)?;
         if !surface.object.idle(false) {
@@ -576,23 +927,37 @@ impl<M: ScanoutIo> Presenter<M> {
         if !surface.object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
-        let (base, plane_offset, _) = surface.viewport.layout(surface.geometry)?;
+        let (base, plane_offset, _) = surface
+            .view
+            .footprint_aligned(surface.geometry, self.alignment)?;
+        let view = surface.view;
         let (offset, geometry) = (surface.offset + base, surface.geometry);
         self.arm_target(
             id,
             Target {
                 offset,
                 geometry,
+                view,
                 plane_offset,
             },
             ticket,
             now,
             true,
         )?;
-        Ok([
+        let mut registers = alloc::vec![
             (self.plane() + PLANE_OFFSET_OFFSET, plane_offset),
             (self.plane() + PLANE_SURF_OFFSET, offset),
-        ])
+        ];
+        if self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) != view.stride(geometry)
+            || self.io().read32(self.plane() + PLANE_CTL_OFFSET) != self.control(view)
+        {
+            registers.insert(
+                0,
+                (self.plane() + PLANE_STRIDE_OFFSET, view.stride(geometry)),
+            );
+            registers.insert(2, (self.plane() + PLANE_CTL_OFFSET, self.control(view)));
+        }
+        Ok(registers)
     }
     /// Roll back only an externally staged target whose DSB was never armed.
     ///
@@ -608,11 +973,16 @@ impl<M: ScanoutIo> Presenter<M> {
         if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
             || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.expected_surface
             || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
+            || !self.geometry_matches(
+                self.console_geometry.ok_or(ScanoutError::Unsupported)?,
+                self.expected_view,
+            )
         {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
         self.pending = None;
+        self.retain_controls(None)?;
         Ok(())
     }
 
@@ -625,6 +995,7 @@ impl<M: ScanoutIo> Presenter<M> {
             Target {
                 offset: self.console_surface,
                 geometry,
+                view: View::default(),
                 plane_offset: 0,
             },
             ticket,
@@ -644,6 +1015,7 @@ impl<M: ScanoutIo> Presenter<M> {
             && self.pending.is_none()
             && self.expected_surface == self.console_surface
             && self.expected_offset == 0
+            && self.expected_view == View::default()
     }
 
     fn arm_target(
@@ -658,7 +1030,7 @@ impl<M: ScanoutIo> Presenter<M> {
         if self.pending.is_some() {
             return Err(ScanoutError::Busy);
         }
-        if !self.geometry_matches(target.geometry)
+        if !self.geometry_matches(target.geometry, self.expected_view)
             || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
         {
             return Err(ScanoutError::Unsupported);
@@ -683,8 +1055,10 @@ impl<M: ScanoutIo> Presenter<M> {
         let Target {
             offset,
             geometry,
+            view,
             plane_offset,
         } = target;
+        self.retain_controls(Some(view))?;
         let iir = self.io().read32(self.iir());
         let frame = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
         if frame == u32::MAX || iir & self.faults() != 0 {
@@ -702,6 +1076,7 @@ impl<M: ScanoutIo> Presenter<M> {
             id,
             offset,
             geometry,
+            view,
             plane_offset,
             ticket,
             frame,
@@ -712,6 +1087,21 @@ impl<M: ScanoutIo> Presenter<M> {
             return Ok(());
         }
         compiler_fence(Ordering::SeqCst);
+        if self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) != view.stride(geometry)
+            || self.io().read32(self.plane() + PLANE_CTL_OFFSET) != self.control(view)
+        {
+            // Internal console restoration only: STRIDE and CTL are shadowed
+            // until SURF while the primary remains enabled. No client mixed
+            // transaction uses CPU layout changes.
+            self.io()
+                .write32(self.plane() + PLANE_STRIDE_OFFSET, view.stride(geometry));
+            self.io()
+                .write32(self.plane() + PLANE_CTL_OFFSET, self.control(view));
+            if !self.geometry_matches(geometry, view) {
+                self.failed = true;
+                return Err(ScanoutError::Unavailable);
+            }
+        }
         // PLANE_OFFSET is double-buffered with the final SURF arm. CPU use
         // here is limited to zero-origin flips/restoration; panning is emitted
         // through the DSB's source-qualified common safe window.
@@ -753,14 +1143,17 @@ impl<M: ScanoutIo> Presenter<M> {
         {
             if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != pending.offset
                 || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != pending.plane_offset
-                || !self.geometry_matches(pending.geometry)
+                || !self.geometry_matches(pending.geometry, pending.view)
             {
                 self.failed = true;
                 return Err(ScanoutError::Unavailable);
             }
             self.io().write32(self.iir(), PRIMARY_FLIP_DONE);
+            let xr30_transition = self.expected_view.input == InputFormat::Xrgb2101010
+                || pending.view.input == InputFormat::Xrgb2101010;
             self.expected_surface = pending.offset;
             self.expected_offset = pending.plane_offset;
+            self.expected_view = pending.view;
             let retired = if pending.id == SurfaceId(0) {
                 self.current.take()
             } else {
@@ -769,6 +1162,17 @@ impl<M: ScanoutIo> Presenter<M> {
                     .filter(|old| *old != pending.id)
             };
             self.pending = None;
+            // Retain the exact completed image through later console restore.
+            if xr30_transition
+                && !self.io().retain_primary_controls(
+                    self.console_ctl,
+                    self.control(self.expected_view),
+                    None,
+                )
+            {
+                self.failed = true;
+                return Err(ScanoutError::Unavailable);
+            }
             return Ok(Some(Completion {
                 surface: pending.id,
                 ticket: pending.ticket,
@@ -784,6 +1188,41 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Timeout);
         }
         Ok(None)
+    }
+
+    /// Reobserve an independently completed surface without consuming another
+    /// flip-done or releasing the old mapping. The KMS joint owner retains the
+    /// original Completion and brackets this with its color/DSB observation.
+    pub(crate) fn observe_completed(
+        &self,
+        completion: &Completion,
+        now: u64,
+    ) -> Result<Option<crate::drm::card::FlipStamp>, ScanoutError> {
+        self.ready()?;
+        if self.pending.is_some() || self.current != Some(completion.surface) {
+            return Err(ScanoutError::Busy);
+        }
+        let geometry = self.console_geometry.ok_or(ScanoutError::Unsupported)?;
+        let before = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
+        let live = self.io().read32(self.plane() + SURFLIVE_OFFSET);
+        let status = self.io().read32(self.iir());
+        if before == u32::MAX
+            || status & self.faults() != 0
+            || live != self.expected_surface
+            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
+            || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
+            || !self.geometry_matches(geometry, self.expected_view)
+        {
+            return Err(ScanoutError::Unavailable);
+        }
+        let after = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
+        if after == u32::MAX {
+            return Err(ScanoutError::Unavailable);
+        }
+        Ok((before == after).then_some(crate::drm::card::FlipStamp {
+            ns: now,
+            sequence: after,
+        }))
     }
 
     /// Unmap a prepared or retired surface. Current/pending buffers stay
@@ -889,6 +1328,9 @@ impl<M: ScanoutIo> Presenter<M> {
             || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.console_surface
             || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.console_surface
             || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != 0
+            || self
+                .console_geometry
+                .is_some_and(|geometry| !self.geometry_matches(geometry, View::default()))
         {
             return Err(ScanoutError::Busy);
         }

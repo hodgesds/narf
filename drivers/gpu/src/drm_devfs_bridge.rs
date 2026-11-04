@@ -328,9 +328,11 @@ impl FileOps for DriCardFile {
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "intel")]
+        crate::intel_gpu_gem::cpu_mapping::published(lifetime);
         #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
-        #[cfg(not(feature = "amdgpu"))]
+        #[cfg(not(any(feature = "intel", feature = "amdgpu")))]
         let _ = lifetime;
     }
     /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
@@ -1034,6 +1036,9 @@ impl FileOps for IntelPrimeDmaBufFile {
     ) -> Result<narf_filesystem::MmapBacking, FsError> {
         self.object.backing(offset, len)
     }
+    fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        crate::intel_gpu_gem::cpu_mapping::published(lifetime);
+    }
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         Ok(self.object.backing(offset, len)?.frames)
     }
@@ -1524,9 +1529,11 @@ impl FileOps for DriRenderFile {
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "intel")]
+        crate::intel_gpu_gem::cpu_mapping::published(lifetime);
         #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
-        #[cfg(not(feature = "amdgpu"))]
+        #[cfg(not(any(feature = "intel", feature = "amdgpu")))]
         let _ = lifetime;
     }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -2265,6 +2272,38 @@ impl IntelGpuCard {
         self.lmem_bar.lock().get_or_insert(bar);
     }
 
+    pub(crate) fn local_bar(&self) -> Option<narf_bus::MmioRegion> {
+        *self.lmem_bar.lock()
+    }
+    pub(crate) fn publish_smallbar_vram<M, A>(
+        &self,
+        gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>,
+        grant: Arc<crate::intel_gpu_gt::smallbar::DpaGrant>,
+    ) -> Result<(), FsError>
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        let layout = gt.vram_layout().ok_or(FsError::NoDevice)?;
+        let bar = self.local_bar().ok_or(FsError::NoDevice)?;
+        if !grant.matches(bar, layout) || gt.vram_needs_ccs_clear() {
+            return Err(FsError::NoDevice);
+        }
+        let mut slot = self.vram.lock();
+        if let Some(pool) = slot.as_ref() {
+            if !pool.matches_smallbar(&grant) {
+                return Err(FsError::NoDevice);
+            }
+        } else {
+            // SAFETY: the grant was derived from this retained fresh full-device
+            // incarnation, source geometry and current physical PF/BAR owner.
+            *slot = Some(
+                unsafe { crate::intel_gpu_vram::Vram::new_smallbar(bar, layout, grant) }
+                    .map_err(|_| FsError::NoDevice)?,
+            );
+        }
+        Ok(())
+    }
     /// Bytes currently allocated from this card's VRAM pool, if published.
     pub(crate) fn intel_vram_used(&self) -> Option<u64> {
         self.vram.lock().as_ref().map(|vram| vram.used())

@@ -88,3 +88,22 @@ adapter that calls into the dedicated EDID parser.
   the bytestream those blocks expect.
 - DSC (Display Stream Compression) bitstream encoder — landed only
   if a target panel demands it.
+
+## 3. Public interface
+
+`console::BootFramebufferAdmission` serializes monotonic boot publication
+history with permanent exclusion. `new()` starts open; `publish()` records
+history and refuses after closure. `close_if_never(clear)` closes only before
+any successful publication and with a positive current exclusion; `is_closed()`
+observes the result. Closure has no reopen operation. Withdrawing a mapping or
+resetting a test console cannot erase publication history.
+
+`console::close_boot_framebuffer_console()` uses the same admission lock as
+`install_fb_console`. It refuses a currently or previously installed boot
+console; successful closure prevents subsequent boot-console publication.
+The framebuffer owner separately closes its boot-mapping publication under
+its own shared history gate before acknowledging serial/headless reset
+exclusion. No lock spans a hardware reset wait. These gates do not revoke
+previous raw framebuffer pointers or authorize destructive GPU reset: callers
+must independently own the function, backing and reset protocol. Tests use
+local gate instances and never close or reset the actual global gates.

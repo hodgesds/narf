@@ -778,6 +778,18 @@ pub enum FsError {
     /// Maps to Linux `EFBIG`, distinct from a range the caller got wrong
     /// (`EINVAL`).
     FileTooLarge,
+    /// A caller-supplied list or record is longer than the interface accepts.
+    /// Maps to Linux `E2BIG` (7 on every architecture,
+    /// `include/uapi/asm-generic/errno-base.h`).
+    ///
+    /// Linux uses it well beyond `execve`'s argument list: a user extension
+    /// chain past its bound (`xe_bo.c::gem_create_user_extensions`:
+    /// `if (ext_number >= MAX_USER_EXTENSIONS) return -E2BIG;`), an xattr
+    /// value over `XATTR_SIZE_MAX`, an extensible struct with a non-zero
+    /// tail. Distinct from [`FsError::InvalidData`] on purpose: `EINVAL` says
+    /// the request is malformed, `E2BIG` says it is well-formed but too long,
+    /// and callers that probe a limit branch on exactly that.
+    ArgumentListTooLong,
     /// A subsystem the operation depends on is not switched on for this
     /// filesystem. Maps to Linux `ENOTCONN`, which btrfs returns from every
     /// qgroup ioctl when quotas are disabled (`fs/btrfs/ioctl.c`:
@@ -1165,6 +1177,14 @@ pub trait DrmFence: Send + Sync {
     }
 }
 
+/// Status of the retained open file description for one read invocation.
+/// The syscall boundary snapshots current shared status flags; implementations
+/// must not cache this value in the file or in a numeric descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub nonblocking: bool,
+}
+
 /// Per-file async op surface. Methods take `&self` because a file
 /// node may be looked up concurrently from multiple tasks; per-file
 /// state (e.g. an offset cursor) lives in the *handle*, not here.
@@ -1178,6 +1198,19 @@ pub trait FileOps: Send + Sync {
     /// FSes; Stage 4 disk-backed FSes may also short-read on a torn
     /// page boundary and the caller is expected to loop.
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize>;
+
+    /// Read using this invocation's open-description status. Ordinary files
+    /// retain their existing read behavior. Streams whose blocking threshold
+    /// differs from their nonblocking availability override this hook; wrappers
+    /// that forward such streams must forward the options unchanged.
+    fn read_with_options<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+        _options: ReadOptions,
+    ) -> FsFuture<'a, usize> {
+        self.read(offset, buf)
+    }
 
     /// Write `buf` at `offset`. Returns `FsError::ReadOnly` for the
     /// initramfs and the virtiofs skeleton.

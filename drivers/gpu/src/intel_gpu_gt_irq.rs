@@ -1,4 +1,4 @@
-//! Graphics GuC/render/copy/compute delivery for single-tile physical functions.
+//! Main GuC/render/copy/compute and qualified Gen12 media IRQ delivery.
 //! MIT Linux xe_irq.c and xe_guc.c, b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 //! The hard handler only masks the tile master. Identity waits and GuC work
 //! run in task context; IRQ notification never proves DMA retirement.
@@ -40,6 +40,74 @@ const CCS_ENABLE: u64 = 0x190048;
 const CCS_MASK: u64 = 0x190100;
 const CCS_MASKS: [u64; 2] = [CCS_MASK, 0x190104];
 const CCS_BASES: [u64; 4] = [0x1a000, 0x1c000, 0x1e000, 0x26000];
+const MEDIA_ENABLE: u64 = 0x190034;
+// regs/xe_irq_regs.h: GUNIT_GSC_INTR_ENABLE / _MASK and HECI2_RSVD_INTR_MASK.
+// On the MTL/Arrow media GT, xe_irq.c::xe_irq_enable_hwe enables GSCCS0's
+// MI_USER_INTERRUPT | FLUSH_COMPLETE | GSC_ER_COMPLETE plus the HECI2
+// GSC_IRQ_INTF(1) cause in GUNIT_GSC_INTR_ENABLE, unmasks the GSCCS causes in
+// GUNIT_GSC_INTR_MASK and HECI2's (shifted into ENGINE1) in its own mask.
+// Their bank-0 bits are i915's GEN11_CSME (31, INTR_GSC) and GEN12_HECI_2
+// (30); identities decode as class OTHER, OTHER_GSC_INSTANCE (6) and
+// OTHER_GSC_HECI2_INSTANCE (3).
+pub(crate) const GSC_ENABLE: u64 = 0x190044;
+pub(crate) const GSC_MASK: u64 = 0x1900f4;
+pub(crate) const HECI2_MASK: u64 = 0x1900e4;
+const GSC_ER_COMPLETE: u32 = 1 << 5;
+const GSC_ENGINE_EVENTS: u32 = RCS | GSC_ER_COMPLETE;
+const HECI2_EVENT: u32 = 1 << 14; // GSC_IRQ_INTF(1)
+const GSC_BIT: u32 = 1 << 31;
+const HECI2_BIT: u32 = 1 << 30;
+/// `take_gsc_events`: xe_gsc_hwe_irq_handler saw GSC_ER_COMPLETE.
+pub(crate) const GSC_EVENT_ER_COMPLETE: u32 = 1 << 0;
+/// `take_gsc_events`: xe_gsc_proxy_irq_handler saw the HECI2 cause.
+pub(crate) const GSC_EVENT_PROXY: u32 = 1 << 1;
+const MEDIA_MASKS: [u64; 6] = [0x1900a8, 0x1900ac, 0x1900b0, 0x1900b4, 0x1900d0, 0x1900d4];
+const MEDIA: [Engine; 12] = [
+    Engine::Vcs0,
+    Engine::Vcs1,
+    Engine::Vcs2,
+    Engine::Vcs3,
+    Engine::Vcs4,
+    Engine::Vcs5,
+    Engine::Vcs6,
+    Engine::Vcs7,
+    Engine::Vecs0,
+    Engine::Vecs1,
+    Engine::Vecs2,
+    Engine::Vecs3,
+];
+fn media_pair_mask(engines: EngineSet, pair: usize) -> u32 {
+    (if engines.contains(MEDIA[pair * 2]) {
+        RCS_EVENTS
+    } else {
+        0
+    }) | if engines.contains(MEDIA[pair * 2 + 1]) {
+        RCS
+    } else {
+        0
+    }
+}
+fn media_enable(engines: EngineSet) -> u32 {
+    (if engines.iter().any(|e| e.is_decode()) {
+        RCS_EVENTS
+    } else {
+        0
+    }) | if engines.iter().any(|e| e.xe_class() == 3) {
+        RCS
+    } else {
+        0
+    }
+}
+fn media_bits(engines: EngineSet) -> u32 {
+    engines.iter().fold(0, |bits, e| {
+        bits | (1
+            << if e.is_decode() {
+                e.physical_instance()
+            } else {
+                31 - e.physical_instance()
+            })
+    })
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum IrqError {
@@ -65,6 +133,9 @@ struct Saved {
     ccs_enable: u32,
     ccs: [u32; 2],
     ccs_ring: [u32; 4],
+    media_enable: u32,
+    media_masks: [u32; 6],
+    media_ring: [u32; 12],
 }
 
 struct State<M> {
@@ -73,9 +144,23 @@ struct State<M> {
     /// CCS0 is a published engine and owns its sources.
     compute: u8,
     copy8: bool,
+    media: EngineSet,
+    /// The media sources are enabled. On a tiled (MTL/Arrow) controller the
+    /// standalone media GT's engines join `media` when routed and stay owned
+    /// for identity decoding after unrouting, so a late pending identity is
+    /// still acknowledged rather than read as a foreign cause.
+    media_routed: bool,
+    /// GSCCS0 and HECI2 bank-0 identities belong to this controller (set by
+    /// `route_gsc`, kept for decoding after `unroute_gsc`).
+    gsc: bool,
+    gsc_routed: bool,
+    /// GSC causes decoded since the last `take_gsc_events`.
+    gsc_events: u32,
+    tiled: bool,
     active: bool,
     pending: bool,
-    bits: u32,
+    bits: [u32; 2],
+    bank: usize,
     selected: u32,
     deadline: u64,
 }
@@ -119,16 +204,30 @@ impl<M: MmioWindow> Controller<M> {
         Self::with_engines(mmio, engines)
     }
 
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn with_engines(mmio: M, engines: EngineSet) -> Result<Self, IrqError> {
+        Self::with_hierarchy(mmio, engines, true)
+    }
+
+    fn with_hierarchy(mmio: M, engines: EngineSet, tiled: bool) -> Result<Self, IrqError> {
         let compute = engines
             .compute()
             .fold(0u8, |mask, engine| mask | 1 << engine.physical_instance());
         let copy8 = engines.contains(Engine::Bcs8);
+        let media = EngineSet::of(&MEDIA).bits() & engines.bits();
+        let media = EngineSet::from_bits(media);
         // No other owner may have delivery enabled. Never commandeer firmware
         // MSI or enable a master with an unhandled display/media indication.
-        let tile = read(&mmio, TILE)?;
+        if !tiled && (compute != 0 || copy8) {
+            return Err(IrqError::Identity);
+        }
+        let tile = if tiled { read(&mmio, TILE)? } else { 0 };
         let master = read(&mmio, MASTER)?;
-        if tile & ENABLE != 0 || tile & !(ENABLE | 1) != 0 || master & !(ENABLE | 1) != 0 {
+        if tile & ENABLE != 0
+            || tile & !(ENABLE | 1) != 0
+            || master & !(ENABLE | 1 | if media_enable(media) != 0 { 2 } else { 0 }) != 0
+            || (!tiled && master & ENABLE != 0)
+        {
             return Err(IrqError::Conflict);
         }
         let saved = Saved {
@@ -158,6 +257,25 @@ impl<M: MmioWindow> Controller<M> {
                     0
                 }
             }),
+            media_enable: if media_enable(media) != 0 {
+                read(&mmio, MEDIA_ENABLE)?
+            } else {
+                0
+            },
+            media_masks: core::array::from_fn(|pair| {
+                if media_pair_mask(media, pair) != 0 {
+                    mmio.read32(MEDIA_MASKS[pair])
+                } else {
+                    0
+                }
+            }),
+            media_ring: core::array::from_fn(|index| {
+                if media.contains(MEDIA[index]) {
+                    mmio.read32(u64::from(MEDIA[index].base()) + 0xa8)
+                } else {
+                    0
+                }
+            }),
             ccs_ring: core::array::from_fn(|i| {
                 if compute & (1 << i) != 0 {
                     mmio.read32(CCS_BASES[i] + 0xa8)
@@ -171,9 +289,16 @@ impl<M: MmioWindow> Controller<M> {
             saved,
             compute,
             copy8,
+            media,
+            media_routed: media.bits() != 0,
+            gsc: false,
+            gsc_routed: false,
+            gsc_events: 0,
+            tiled,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
-            bits: 0,
+            bits: [0; 2],
+            bank: 0,
             selected: 0,
             deadline: 0,
         })))
@@ -206,6 +331,19 @@ impl<M: MmioWindow> Controller<M> {
                 }
             }
         }
+        if media_enable(s.media) != 0 {
+            let enabled = media_enable(s.media);
+            routes.push((MEDIA_ENABLE, enabled, enabled));
+            for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+                let mask = media_pair_mask(s.media, pair);
+                if mask != 0 {
+                    routes.push((reg, mask, 0));
+                }
+            }
+            for engine in s.media.iter() {
+                routes.push((u64::from(engine.base()) + 0xa8, RCS, 0));
+            }
+        }
         if s.copy8 {
             routes.extend_from_slice(&[(BCS8_MASK, RCS, 0), (BCS8_RING_MASK, RCS, 0)]);
         }
@@ -221,13 +359,157 @@ impl<M: MmioWindow> Controller<M> {
         read(&s.mmio, MASTER).map(|_| ())
     }
 
+    /// Route the MTL/Arrow standalone media GT's published VCS/VECS onto this
+    /// tile's shared banks, as xe_irq.c::xe_irq_enable_hwe does for a media
+    /// GT: VCS (ENGINE1) and VECS (ENGINE0) halves of VCS_VECS_INTR_ENABLE,
+    /// the per-pair VCSn/VECSn mask halves and each engine's RING_IMR, all
+    /// for MI_USER_INTERRUPT | FLUSH_COMPLETE. GT0's bank-0 sources, the
+    /// GuC halves and every other bit keep their values. Bank-1 identities
+    /// decode as VIDEO_DECODE/VIDEO_ENHANCE (pick_engine_gt -> media GT) and
+    /// only wake the polled media owner; they never prove DMA retirement.
+    pub(crate) fn route_media(&self, engines: EngineSet) -> Result<(), IrqError> {
+        let mut s = self.0.lock();
+        if !s.active
+            || !s.tiled
+            || s.media_routed
+            || engines.bits() == 0
+            || engines.bits() & !EngineSet::of(&MEDIA).bits() != 0
+            || (s.media.bits() != 0 && s.media != engines)
+        {
+            return Err(IrqError::Identity);
+        }
+        let enabled = media_enable(engines);
+        let saved_enable = read(&s.mmio, MEDIA_ENABLE)?;
+        let saved_masks: [u32; 6] = core::array::from_fn(|pair| {
+            if media_pair_mask(engines, pair) != 0 {
+                s.mmio.read32(MEDIA_MASKS[pair])
+            } else {
+                0
+            }
+        });
+        let saved_ring: [u32; 12] = core::array::from_fn(|index| {
+            if engines.contains(MEDIA[index]) {
+                s.mmio.read32(u64::from(MEDIA[index].base()) + 0xa8)
+            } else {
+                0
+            }
+        });
+        s.saved.media_enable = saved_enable;
+        s.saved.media_masks = saved_masks;
+        s.saved.media_ring = saved_ring;
+        s.media = engines;
+        s.media_routed = true;
+        let mut routes = alloc::vec![(MEDIA_ENABLE, enabled, enabled)];
+        for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+            let mask = media_pair_mask(engines, pair);
+            if mask != 0 {
+                routes.push((reg, mask, 0));
+            }
+        }
+        for engine in engines.iter() {
+            routes.push((u64::from(engine.base()) + 0xa8, RCS, 0));
+        }
+        for &(offset, mask, value) in &routes {
+            restore_bits(&s.mmio, offset, mask, value);
+        }
+        for (offset, mask, expected) in routes {
+            if s.mmio.read32(offset) & mask != expected {
+                return Err(IrqError::Route);
+            }
+        }
+        Ok(())
+    }
+
+    /// Mask the media sources again before the media GuC stops: restore the
+    /// saved halves of exactly the bits `route_media` owned. The engines stay
+    /// owned for decoding, so an identity already latched is acknowledged.
+    pub(crate) fn unroute_media(&self) {
+        let mut s = self.0.lock();
+        if !s.tiled || !s.media_routed {
+            return;
+        }
+        s.media_routed = false;
+        for (index, engine) in MEDIA.into_iter().enumerate() {
+            if s.media.contains(engine) {
+                restore_bits(
+                    &s.mmio,
+                    u64::from(engine.base()) + 0xa8,
+                    RCS,
+                    s.saved.media_ring[index],
+                );
+            }
+        }
+        for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+            let mask = media_pair_mask(s.media, pair);
+            if mask != 0 {
+                restore_bits(&s.mmio, reg, mask, s.saved.media_masks[pair]);
+            }
+        }
+        restore_bits(
+            &s.mmio,
+            MEDIA_ENABLE,
+            media_enable(s.media),
+            s.saved.media_enable,
+        );
+    }
+
+    /// Enable the media GT's GSC sources as xe_irq.c::xe_irq_enable_hwe does
+    /// when GSCCS0 exists (`other_fuse_mask`): GUNIT_GSC_INTR_ENABLE =
+    /// GSCCS events | HECI2 GSC_IRQ_INTF(1), GUNIT_GSC_INTR_MASK = ~GSCCS
+    /// events, HECI2_RSVD_INTR_MASK = ~(GSC_IRQ_INTF(1) << 16). Decoded causes
+    /// only latch `take_gsc_events`; GSC job completion stays fence-polled.
+    pub(crate) fn route_gsc(&self) -> Result<(), IrqError> {
+        let mut s = self.0.lock();
+        if !s.active || !s.tiled || s.gsc_routed {
+            return Err(IrqError::Identity);
+        }
+        // Access is proven on the enable register alone: all-ones is the
+        // valid gt_irq_reset value of both mask registers (`gsc_reset`), so
+        // reading them as an access probe would refuse every re-route.
+        read(&s.mmio, GSC_ENABLE)?;
+        s.gsc = true;
+        s.gsc_routed = true;
+        let routes = [
+            (GSC_ENABLE, GSC_ENGINE_EVENTS | HECI2_EVENT),
+            (GSC_MASK, !GSC_ENGINE_EVENTS),
+            (HECI2_MASK, !(HECI2_EVENT << 16)),
+        ];
+        for (reg, value) in routes {
+            s.mmio.write32(reg, value);
+        }
+        for (reg, value) in routes {
+            if s.mmio.read32(reg) != value {
+                return Err(IrqError::Route);
+            }
+        }
+        Ok(())
+    }
+
+    /// xe_irq.c::gt_irq_reset for a media GT with GSCCS0: GUNIT_GSC_INTR_ENABLE
+    /// 0, GUNIT_GSC_INTR_MASK and HECI2_RSVD_INTR_MASK all ones. Decoding
+    /// ownership stays, so an identity already latched is acknowledged.
+    pub(crate) fn unroute_gsc(&self) {
+        let mut s = self.0.lock();
+        if !s.gsc_routed {
+            return;
+        }
+        s.gsc_routed = false;
+        gsc_reset(&s.mmio);
+    }
+
+    /// The GSC causes decoded since the last call (`GSC_EVENT_*`).
+    pub(crate) fn take_gsc_events(&self) -> u32 {
+        core::mem::take(&mut self.0.lock().gsc_events)
+    }
+
     pub(crate) fn hard_irq(&self) -> narf_interrupts::dispatch::IrqStatus {
         let mut s = self.0.lock();
         if !s.active {
             return narf_interrupts::dispatch::IrqStatus::None;
         }
-        s.mmio.write32(TILE, 0);
-        let _ = s.mmio.read32(TILE); // posted mask before EOI
+        let outer = if s.tiled { TILE } else { MASTER };
+        s.mmio.write32(outer, 0);
+        let _ = s.mmio.read32(outer); // posted mask before EOI
         s.pending = true;
         narf_interrupts::dispatch::IrqStatus::Handled
     }
@@ -243,12 +525,13 @@ impl<M: MmioWindow> Controller<M> {
         if !s.pending {
             // The watchdog also drains a lost MSI edge. Mask before inspecting
             // the hierarchy, exactly as the hard handler would have done.
-            s.mmio.write32(TILE, 0);
-            let _ = read(&s.mmio, TILE)?;
+            let outer = if s.tiled { TILE } else { MASTER };
+            s.mmio.write32(outer, 0);
+            let _ = read(&s.mmio, outer)?;
             s.pending = true;
         }
         if s.selected != 0 {
-            let identity = read(&s.mmio, IDENTITY)?;
+            let identity = read(&s.mmio, IDENTITY + s.bank as u64 * 4)?;
             if identity & ENABLE == 0 {
                 return if now >= s.deadline {
                     Err(IrqError::Timeout)
@@ -256,12 +539,23 @@ impl<M: MmioWindow> Controller<M> {
                     Ok(true)
                 };
             }
-            let (expected, class, instance) = match s.selected {
-                RCS0 => (RCS, 0, 0),
-                BCS0 => (RCS, 3, 0),
-                BCS8 => (RCS, 3, 8),
-                bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
-                _ => (0x8000, 4, 0),
+            let (expected, class, instance) = if s.bank == 1 {
+                let bit = s.selected.trailing_zeros();
+                if bit < 8 {
+                    (RCS, 1, bit)
+                } else {
+                    (RCS, 2, 31 - bit)
+                }
+            } else {
+                match s.selected {
+                    RCS0 => (RCS, 0, 0),
+                    BCS0 => (RCS, 3, 0),
+                    BCS8 => (RCS, 3, 8),
+                    GSC_BIT => (GSC_ENGINE_EVENTS, 4, 6),
+                    HECI2_BIT => (HECI2_EVENT, 4, 3),
+                    bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
+                    _ => (0x8000, 4, 0),
+                }
             };
             if (identity >> 20) & 0x3f != instance
                 || (identity >> 16) & 7 != class
@@ -270,43 +564,70 @@ impl<M: MmioWindow> Controller<M> {
             {
                 return Err(IrqError::Identity);
             }
+            if s.bank == 0 && s.selected == GSC_BIT && identity & GSC_ER_COMPLETE != 0 {
+                s.gsc_events |= GSC_EVENT_ER_COMPLETE;
+            }
+            if s.bank == 0 && s.selected == HECI2_BIT {
+                s.gsc_events |= GSC_EVENT_PROXY;
+            }
             // Identity acknowledgement must precede the bank acknowledgement.
-            s.mmio.write32(IDENTITY, identity);
-            s.mmio.write32(DW, s.selected);
-            s.bits &= !s.selected;
+            s.mmio.write32(IDENTITY + s.bank as u64 * 4, identity);
+            s.mmio.write32(DW + s.bank as u64 * 4, s.selected);
+            let bank = s.bank;
+            let selected = s.selected;
+            s.bits[bank] &= !selected;
             s.selected = 0;
         }
-        if s.bits == 0 {
-            let tile = read(&s.mmio, TILE)?;
+        if s.bits == [0; 2] {
+            let tile = if s.tiled { read(&s.mmio, TILE)? } else { 0 };
             let master = read(&s.mmio, MASTER)?;
-            if tile & !(ENABLE | 1) != 0 || master & !(ENABLE | 1) != 0 {
+            let banks = 1 | if media_enable(s.media) != 0 { 2 } else { 0 };
+            if tile & !(ENABLE | 1) != 0 || master & !(ENABLE | banks) != 0 {
                 return Err(IrqError::Conflict);
             }
             if tile & 1 != 0 {
                 s.mmio.write32(TILE, 1);
             }
-            if master & 1 != 0 {
-                let bits = read(&s.mmio, DW)?;
-                let owned = OWNED | (u32::from(s.compute) << 4) | if s.copy8 { BCS8 } else { 0 };
-                if bits & !owned != 0 {
-                    return Err(IrqError::Conflict);
+            for bank in 0..2 {
+                if master & (1 << bank) != 0 {
+                    let bits = read(&s.mmio, DW + bank as u64 * 4)?;
+                    let owned = if bank == 0 {
+                        OWNED
+                            | (u32::from(s.compute) << 4)
+                            | if s.copy8 { BCS8 } else { 0 }
+                            | if s.gsc { GSC_BIT | HECI2_BIT } else { 0 }
+                    } else {
+                        media_bits(s.media)
+                    };
+                    if bits & !owned != 0 {
+                        return Err(IrqError::Conflict);
+                    }
+                    s.bits[bank] = bits;
                 }
-                // GFX master is RW1C status plus its persistent enable bit.
-                s.mmio.write32(MASTER, ENABLE | 1);
-                s.bits = bits;
+            }
+            if master & banks != 0 {
+                // On Gen12 there is no outer tile mask. Keep the master
+                // disabled while identities in either bank are outstanding.
+                s.mmio.write32(
+                    MASTER,
+                    (if s.tiled { ENABLE } else { 0 }) | (master & banks),
+                );
             }
         }
-        if s.bits != 0 {
-            s.selected = 1 << s.bits.trailing_zeros();
+        if let Some(bank) = s.bits.iter().position(|bits| *bits != 0) {
+            s.bank = bank;
+            s.selected = 1 << s.bits[bank].trailing_zeros();
             s.deadline = now.checked_add(100_000).ok_or(IrqError::Timeout)?;
-            s.mmio.write32(SELECTOR, s.selected);
+            s.mmio.write32(SELECTOR + bank as u64 * 4, s.selected);
             return Ok(true);
         }
         // Lower status is quiet; enabling the master generates a fresh edge
         // for any cause arriving between the final read and this write.
         s.mmio.write32(MASTER, ENABLE);
-        s.mmio.write32(TILE, ENABLE);
-        if read(&s.mmio, TILE)? & ENABLE == 0 || read(&s.mmio, MASTER)? & ENABLE == 0 {
+        if s.tiled {
+            s.mmio.write32(TILE, ENABLE);
+        }
+        if (s.tiled && read(&s.mmio, TILE)? & ENABLE == 0) || read(&s.mmio, MASTER)? & ENABLE == 0 {
             return Err(IrqError::Route);
         }
         s.pending = false;
@@ -318,8 +639,9 @@ impl<M: MmioWindow> Controller<M> {
         if !s.active {
             return true;
         }
-        s.mmio.write32(TILE, 0);
-        let quiet = read(&s.mmio, TILE).is_ok_and(|value| value & ENABLE == 0);
+        let outer = if s.tiled { TILE } else { MASTER };
+        s.mmio.write32(outer, 0);
+        let quiet = read(&s.mmio, outer).is_ok_and(|value| value & ENABLE == 0);
         s.active = false;
         // Restore only our source bits. The media GuC shares ENABLE but owns
         // its separate mask half; all unrelated masks/status stay untouched.
@@ -347,9 +669,37 @@ impl<M: MmioWindow> Controller<M> {
             }
             restore_bits(&s.mmio, CCS_ENABLE, RCS_EVENTS, s.saved.ccs_enable);
         }
+        if s.media_routed && media_enable(s.media) != 0 {
+            s.media_routed = false;
+            for (index, engine) in MEDIA.into_iter().enumerate() {
+                if s.media.contains(engine) {
+                    restore_bits(
+                        &s.mmio,
+                        u64::from(engine.base()) + 0xa8,
+                        RCS,
+                        s.saved.media_ring[index],
+                    );
+                }
+            }
+            for (pair, reg) in MEDIA_MASKS.into_iter().enumerate() {
+                let mask = media_pair_mask(s.media, pair);
+                if mask != 0 {
+                    restore_bits(&s.mmio, reg, mask, s.saved.media_masks[pair]);
+                }
+            }
+            restore_bits(
+                &s.mmio,
+                MEDIA_ENABLE,
+                media_enable(s.media),
+                s.saved.media_enable,
+            );
+        }
         if s.copy8 {
             restore_bits(&s.mmio, BCS8_RING_MASK, RCS, s.saved.bcs8_ring);
             restore_bits(&s.mmio, BCS8_MASK, RCS, s.saved.bcs8);
+        }
+        if core::mem::take(&mut s.gsc_routed) {
+            gsc_reset(&s.mmio);
         }
         // The primary/media GuCs share this enable bit. An independently
         // unmasked media GuC still needs it, even if it was clear at takeover.
@@ -360,6 +710,14 @@ impl<M: MmioWindow> Controller<M> {
         let _ = s.mmio.read32(MASTER);
         quiet
     }
+}
+
+/// xe_irq.c::gt_irq_reset's GSC registers (and check_gsc_availability's
+/// pair): sources disabled and every cause masked.
+pub(crate) fn gsc_reset(mmio: &impl MmioWindow) {
+    mmio.write32(GSC_ENABLE, 0);
+    mmio.write32(GSC_MASK, u32::MAX);
+    mmio.write32(HECI2_MASK, u32::MAX);
 }
 
 pub(crate) trait MessageRoute {
@@ -387,8 +745,18 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
         Self::install_with(mmio, route, EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]))
     }
 
-    fn install_with(mmio: M, mut route: R, engines: EngineSet) -> Result<Self, IrqError> {
-        let controller = Arc::new(Controller::with_engines(mmio, engines)?);
+    #[cfg(feature = "kernel-test")]
+    fn install_with(mmio: M, route: R, engines: EngineSet) -> Result<Self, IrqError> {
+        Self::install_hierarchy(mmio, route, engines, true)
+    }
+
+    fn install_hierarchy(
+        mmio: M,
+        mut route: R,
+        engines: EngineSet,
+        tiled: bool,
+    ) -> Result<Self, IrqError> {
+        let controller = Arc::new(Controller::with_hierarchy(mmio, engines, tiled)?);
         let vector = narf_interrupts::vector::alloc().map_err(|_| IrqError::Route)?;
         if let Err(error) = route.program(vector) {
             if route.disable() {
@@ -421,6 +789,41 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
 
     pub(crate) fn service(&self, now: u64) -> Result<bool, IrqError> {
         self.controller.service(now)
+    }
+
+    /// See `Controller::route_media`.
+    pub(crate) fn route_media(&self, engines: EngineSet) -> Result<(), IrqError> {
+        self.controller.route_media(engines)
+    }
+
+    /// See `Controller::unroute_media`.
+    pub(crate) fn unroute_media(&self) {
+        self.controller.unroute_media()
+    }
+
+    /// Whether media sources are currently enabled on this delivery graph.
+    pub(crate) fn media_routed(&self) -> bool {
+        self.controller.0.lock().media_routed
+    }
+
+    /// See `Controller::route_gsc`.
+    pub(crate) fn route_gsc(&self) -> Result<(), IrqError> {
+        self.controller.route_gsc()
+    }
+
+    /// See `Controller::unroute_gsc`.
+    pub(crate) fn unroute_gsc(&self) {
+        self.controller.unroute_gsc()
+    }
+
+    /// Whether the GSC sources are currently enabled on this delivery graph.
+    pub(crate) fn gsc_routed(&self) -> bool {
+        self.controller.0.lock().gsc_routed
+    }
+
+    /// See `Controller::take_gsc_events`.
+    pub(crate) fn take_gsc_events(&self) -> u32 {
+        self.controller.take_gsc_events()
     }
 }
 
@@ -622,7 +1025,16 @@ impl GtIrq {
         if !cfg!(target_arch = "x86_64") {
             return Err(IrqError::Route);
         }
-        Self::install_with(mmio, PciMsi::new(cap, device)?, engines)
+        let platform =
+            crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
+                .filter(|platform| platform.guc().is_some())
+                .ok_or(IrqError::Identity)?;
+        Self::install_hierarchy(
+            mmio,
+            PciMsi::new(cap, device)?,
+            engines,
+            !platform.is_gen12(),
+        )
     }
 }
 

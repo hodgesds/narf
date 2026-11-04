@@ -35,6 +35,9 @@
 //!   0x138128, `GEN6_PCODE_DATA1` 0x13812C)
 
 use core::sync::atomic::{compiler_fence, Ordering};
+// Every current iGPU PCODE client (modeset and retained cursor/DSB profile)
+// uses this port exclusion. BMG hwmon owns a different PCI function/port.
+static TRANSACTION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
 
 use crate::intel_gpu_aux::MmioWindow;
 
@@ -111,6 +114,7 @@ pub fn pcode_read<M: MmioWindow + ?Sized>(
     data0_in: u32,
     data1_in: u32,
 ) -> Result<(u32, u32), PcodeError> {
+    let _transaction = TRANSACTION.try_lock().ok_or(PcodeError::Busy)?;
     if mmio.read32(PCODE_MAILBOX) & PCODE_READY != 0 {
         return Err(PcodeError::Busy);
     }
@@ -119,21 +123,18 @@ pub fn pcode_read<M: MmioWindow + ?Sized>(
     mmio.write32(PCODE_MAILBOX, mailbox_word(cmd, param1, param2));
     compiler_fence(Ordering::SeqCst);
 
-    // Poll for READY to clear — 20 ms, i915's slow-timeout for
-    // reads. Cycle-budget spin, same shape as the modeset's
-    // power-well polls.
-    let budget = narf_time::wall::ns_to_cycles(20_000_000);
-    let start = narf_time::now_cycles();
-    let final_mailbox = loop {
-        let v = mmio.read32(PCODE_MAILBOX);
-        if v & PCODE_READY == 0 {
-            break v;
-        }
-        if narf_time::now_cycles().wrapping_sub(start) > budget {
-            return Err(PcodeError::Timeout);
-        }
-        core::hint::spin_loop();
-    };
+    // The port is polled and never depends on another executor task. Keep
+    // the bounded source timeout while servicing the common console pumps.
+    let mut final_mailbox = PCODE_READY;
+    if !narf_scheduler::responsive_spin_until(
+        || {
+            final_mailbox = mmio.read32(PCODE_MAILBOX);
+            final_mailbox & PCODE_READY == 0
+        },
+        narf_time::Deadline::after_ms(20),
+    ) {
+        return Err(PcodeError::Timeout);
+    }
     check_status(final_mailbox)?;
     Ok((mmio.read32(PCODE_DATA0), mmio.read32(PCODE_DATA1)))
 }

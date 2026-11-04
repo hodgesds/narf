@@ -35,6 +35,11 @@ struct Hardware {
     actions: Vec<Action>,
     palette: [u32; 1024],
     palette_writes: usize,
+    superfine: [u32; 18],
+    superfine_writes: usize,
+    unreadable_prec_reads: usize,
+    pre_palette: [u32; 131],
+    pre_writes: usize,
     legacy_collisions: bool,
     legacy_posted: usize,
     refuse_palette: bool,
@@ -46,6 +51,7 @@ struct Hardware {
     pending_cursor: Option<u32>,
     flips: bool,
     frames: bool,
+    tear_visible_frame: bool,
     now: u64,
     tick_ns: u64,
     deliveries: u32,
@@ -54,18 +60,57 @@ struct Hardware {
     refuse_ptes: bool,
     refuse_console: bool,
     refuse_status_restore: bool,
+    refuse_layout: u64,
     dsb_pc: [u32; 2],
     dsb_wait: [Option<u32>; 2],
     dsb_delay: [bool; 2],
     dsb_stalled: [bool; 2],
     dsb_writes: Vec<(u64, u32)>,
     poison_dsb_read: bool,
+    gen12_display: bool,
+    gen12_planes: u64,
+    display13: bool,
+    pcode_latencies: [u8; 8],
+    pcode_block_time: u32,
+    pcode_status: u32,
+    forbidden_display_reads: usize,
+    writes: Vec<(u64, u32)>,
+    xr30_pci: Option<u16>,
+    xr30_epoch: u64,
+    xr30_epoch_on_read: Option<(u64, u64)>,
+    /// Pipe-A eDP sink DPCD for PSR; `None` answers no AUX at all.
+    psr_dpcd: Option<BTreeMap<u32, u8>>,
+    psr_timing: Option<crate::intel_gpu_dsb::Timing>,
+    psr_wm: Option<bool>,
+    /// Answer `psr_wm_level_disabled` through the registered PSR provider
+    /// (the production route) instead of `psr_wm`.
+    psr_wm_provider: bool,
+    /// The Pipe-A eDP PSR VBT facts.
+    psr_vbt: crate::intel_gpu_psr::VbtPsr,
+    /// DSM offset an FBC CFB is placed at (1:1); `None` places nothing.
+    fbc_offset: Option<u32>,
+    /// The off-path carve has not finished: `fbc_carve` answers `Pending`.
+    fbc_carve_pending: bool,
+    /// `fbc_carve` polls (each is non-blocking and runs no survey).
+    fbc_carve_polls: usize,
+    /// Reading this register first runs the next display tick, so
+    /// synchronous waiters (the live repartition, the external pass) see
+    /// frames, latches and DSB progress without an executor.
+    step_on_read: Option<u64>,
 }
+/// Sink AUX writes are logged in the MMIO write log at this pseudo offset
+/// plus the DPCD address, so register and sink order can be compared.
+pub(crate) const AUX_LOG: u64 = 1 << 40;
 #[derive(Clone, Debug)]
-pub(crate) struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>, bool);
+pub(crate) struct MockPlatform(
+    Arc<IrqSafeSpinLock<Hardware>>,
+    Arc<AtomicBool>,
+    bool,
+    Option<crate::intel_gpu_gt::Gen12Platform>,
+);
 impl MockPlatform {
     pub(crate) fn new() -> Self {
-        Self(
+        let platform = Self(
             Arc::new(IrqSafeSpinLock::new(Hardware {
                 ggtt_key: NEXT_GGTT_KEY.fetch_add(1, Ordering::Relaxed),
                 regs: [
@@ -86,6 +131,11 @@ impl MockPlatform {
                 actions: Vec::new(),
                 palette: core::array::from_fn(|i| i as u32),
                 palette_writes: 0,
+                superfine: [0; 18],
+                superfine_writes: 0,
+                unreadable_prec_reads: 0,
+                pre_palette: core::array::from_fn(|i| i as u32 + 17),
+                pre_writes: 0,
                 legacy_collisions: false,
                 legacy_posted: 0,
                 refuse_palette: false,
@@ -97,6 +147,7 @@ impl MockPlatform {
                 pending_cursor: None,
                 flips: true,
                 frames: true,
+                tear_visible_frame: false,
                 now: 1000,
                 tick_ns: 250_000,
                 deliveries: 0,
@@ -105,19 +156,146 @@ impl MockPlatform {
                 refuse_ptes: false,
                 refuse_console: false,
                 refuse_status_restore: false,
+                refuse_layout: u64::MAX,
                 dsb_pc: [0; 2],
                 dsb_wait: [None; 2],
                 dsb_delay: [false; 2],
                 dsb_stalled: [false; 2],
                 dsb_writes: Vec::new(),
                 poison_dsb_read: false,
+                gen12_display: false,
+                gen12_planes: 7,
+                display13: false,
+                pcode_latencies: [6, 8, 10, 12, 14, 16, 0, 0],
+                pcode_block_time: 10,
+                pcode_status: 0,
+                forbidden_display_reads: 0,
+                writes: Vec::new(),
+                xr30_pci: None,
+                xr30_epoch: 0,
+                xr30_epoch_on_read: None,
+                psr_dpcd: None,
+                psr_timing: None,
+                psr_wm: None,
+                psr_wm_provider: false,
+                psr_vbt: crate::intel_gpu_psr::VbtPsr::Missing,
+                fbc_offset: None,
+                fbc_carve_pending: false,
+                fbc_carve_polls: 0,
+                step_on_read: None,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
-        )
+            None,
+        );
+        platform.gen12_defaults();
+        platform
     }
     pub(crate) fn tiger(&self) -> Device<Self> {
-        Device::new(self.clone(), Generation::TigerLake, 0x1000000, console())
+        self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
+    }
+    pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
+        // Select a literal source family when converting the initial generic
+        // linear fixture. Preserve deliberately corrupted non-baseline CTLs.
+        if self.read32(0x70180) == 0x84000000 {
+            self.set(
+                0x70180,
+                match family {
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                    | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => 0x94000000,
+                    _ => 0x84000000,
+                },
+            );
+        }
+        let mut platform = self.clone();
+        platform.3 = Some(family);
+        self.0.lock().gen12_display = true;
+        self.0.lock().gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
+        self.0.lock().display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
+        let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        Device::new(platform, generation, 0x1000000, console())
+    }
+    pub(crate) fn gen12_pitch(
+        &self,
+        family: crate::intel_gpu_gt::Gen12Platform,
+        pitch: u32,
+    ) -> Device<Self> {
+        self.set(0x70188, pitch / 64);
+        for page in 0..(u64::from(pitch) * 32).div_ceil(4096) {
+            let r = GGTT_ARRAY_BASE + (u64::from(CONSOLE) / 4096 + page) * 8;
+            self.set(r, 0x100001 + page as u32 * 4096);
+            self.set(r + 4, 0);
+        }
+        // Select a literal source family when converting the initial generic
+        // linear fixture. Preserve deliberately corrupted non-baseline CTLs.
+        if self.read32(0x70180) == 0x84000000 {
+            self.set(
+                0x70180,
+                match family {
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                    | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => 0x94000000,
+                    _ => 0x84000000,
+                },
+            );
+        }
+        let mut platform = self.clone();
+        platform.3 = Some(family);
+        self.0.lock().display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
+        self.0.lock().gen12_display = true;
+        self.0.lock().gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
+        let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            Generation::TigerLake
+        } else {
+            Generation::AlderLake
+        };
+        let mut saved = console();
+        saved.stride_bytes = pitch;
+        Device::new(platform, generation, 0x1000000, saved)
+    }
+    fn gen12_defaults(&self) {
+        for (r, value) in [
+            (0x70008, 0xc0000000),
+            (0x60400, 0x8a000006),
+            (0x64000, 0x80000006),
+            (0xc7200, 0x80000008),
+            (0xc7204, 1),
+            (0x6001c, 63 << 16 | 31),
+            (0x60000, 223 << 16 | 63),
+            (0x6000c, 76 << 16 | 31),
+            (0x46070, 0xc0000010),
+            (0x46000, 612),
+            (0x45008, 0xc0000000),
+            (0x44fe8, 0xc0000000),
+            (0x70240, 0x80004003),
+            (0x7027c, 2047 << 16),
+        ] {
+            self.set(r, value);
+        }
+        for page in 0..2 {
+            let r = GGTT_ARRAY_BASE + (u64::from(CONSOLE) / 4096 + page) * 8;
+            self.set(r, 0x100001 + page as u32 * 4096);
+            self.set(r + 4, 0);
+        }
     }
     pub(crate) fn meteor(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
@@ -127,6 +305,31 @@ impl MockPlatform {
         let mut saved = console();
         saved.stride_bytes = pitch;
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, saved)
+    }
+    pub(crate) fn xr30_source(&self, device: Option<u16>) {
+        self.0.lock().xr30_pci = device;
+        self.0.lock().xr30_epoch = if device.is_some() { 1 } else { 0 };
+        for (register, value) in [
+            (0x60400, 0x8a000006),
+            (0x46140, 0x10000000),
+            (0x60540, 0x80040300),
+            (0x64000, 0x80000006),
+            (0x64004, 0x31000006),
+        ] {
+            self.set(register, value);
+        }
+    }
+    pub(crate) fn xr30_change_epoch_on_read(&self, register: u64, epoch: u64) {
+        self.0.lock().xr30_epoch_on_read = Some((register, epoch));
+    }
+    pub(crate) fn all_writes(&self) -> Vec<(u64, u32)> {
+        self.0.lock().writes.clone()
+    }
+    pub(crate) fn block_pause(&self, blocked: bool) {
+        self.0.lock().pause_blocked = blocked;
+    }
+    pub(crate) fn xr30_epoch(&self, epoch: u64) {
+        self.0.lock().xr30_epoch = epoch;
     }
     pub(crate) fn primary_updates(&self) -> Vec<(u64, u32)> {
         self.0
@@ -145,6 +348,25 @@ impl MockPlatform {
     }
     pub(crate) fn palette_writes(&self) -> usize {
         self.0.lock().palette_writes
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn superfine(&self) -> [u32; 18] {
+        self.0.lock().superfine
+    }
+    pub(crate) fn precision(&self) -> [u32; 1024] {
+        self.0.lock().palette
+    }
+    pub(crate) fn unreadable_prec_reads(&self) -> usize {
+        self.0.lock().unreadable_prec_reads
+    }
+    pub(crate) fn superfine_writes(&self) -> usize {
+        self.0.lock().superfine_writes
+    }
+    pub(crate) fn pre_writes(&self) -> usize {
+        self.0.lock().pre_writes
+    }
+    pub(crate) fn pre_palette(&self) -> [u32; 131] {
+        self.0.lock().pre_palette
     }
     pub(crate) fn refuse_palette(&self, refuse: bool) {
         self.0.lock().refuse_palette = refuse;
@@ -200,8 +422,113 @@ impl MockPlatform {
         self.set(0x70180, 0x84000000);
         timing
     }
+    pub(crate) fn gen12_cursor_resources(
+        &self,
+        family: crate::intel_gpu_gt::Gen12Platform,
+    ) -> crate::intel_gpu_dsb::Timing {
+        let timing = self.dsb_timing();
+        self.0.lock().gen12_display = true;
+        self.0.lock().gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
+        self.0.lock().display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
+        self.set(0x70008, 0);
+        self.set(0x70180, 0);
+        let mode = crate::intel_gpu_modeset::Mode {
+            pixel_clock_khz: timing.clock,
+            h_active: timing.width,
+            h_total: timing.htotal,
+            v_active: timing.height,
+            v_total: timing.vtotal,
+            ..crate::intel_gpu_modeset::Mode::VESA_1024X768_60
+        };
+        crate::intel_gpu_gen12_cursor_resources::setup(self, &mode, family)
+            .unwrap()
+            .unwrap();
+        self.set(0x70008, 3 << 30);
+        self.set(
+            0x70180,
+            match family {
+                crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => 0x94000000,
+                _ => 0x84000000,
+            },
+        );
+        timing
+    }
+    pub(crate) fn pcode_values(&self, latencies: [u8; 8], block_time: u32, status: u32) {
+        let mut hw = self.0.lock();
+        hw.pcode_latencies = latencies;
+        hw.pcode_block_time = block_time;
+        hw.pcode_status = status;
+    }
+    pub(crate) fn deny_absent_gen12_planes(&self, family: crate::intel_gpu_gt::Gen12Platform) {
+        let mut hw = self.0.lock();
+        hw.gen12_display = true;
+        hw.gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
+        hw.display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
+    }
+    pub(crate) fn forbidden_display_reads(&self) -> usize {
+        self.0.lock().forbidden_display_reads
+    }
+    pub(crate) fn writes(&self) -> Vec<(u64, u32)> {
+        self.0.lock().writes.clone()
+    }
+    pub(crate) fn cursor_mappings(&self) -> Vec<(u64, u32)> {
+        let hw = self.0.lock();
+        // Command and cursor owners share144..160MiB. Observe the real first
+        // HEAD0 write to identify the command BO's two8KiB buffers; the other
+        // present mappings belong to this Device's private32KiB cursor BO.
+        // Write history survives source/leaf shutdown and reset recovery.
+        let Some(command_base) = hw.writes.iter().find_map(|&(r, value)| {
+            (r == 0x70b00 && (144 * 1024 * 1024..160 * 1024 * 1024).contains(&value))
+                .then_some(u64::from(value))
+        }) else {
+            return Vec::new();
+        };
+        let start = GGTT_ARRAY_BASE + 144 * 1024 * 1024 / 4096 * 8;
+        let end = GGTT_ARRAY_BASE + 160 * 1024 * 1024 / 4096 * 8;
+        let command = GGTT_ARRAY_BASE + command_base / 4096 * 8;
+        hw.regs
+            .range(start..end)
+            .filter(|&(&r, _)| !(command..command + 4 * 8).contains(&r))
+            .map(|(&r, &v)| (r, v))
+            .collect()
+    }
+    pub(crate) fn advance_time(&self, ns: u64) {
+        let mut hw = self.0.lock();
+        hw.now = hw.now.saturating_add(ns);
+    }
+    pub(crate) fn allow_frames(&self, enabled: bool) {
+        self.0.lock().frames = enabled;
+    }
+    /// Only the x86_64 multi-pipe fixtures tick on a register read.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn step_on_read(&self, register: Option<u64>) {
+        self.0.lock().step_on_read = register;
+    }
+    pub(crate) fn tear_visible_frame(&self, enabled: bool) {
+        self.0.lock().tear_visible_frame = enabled;
+    }
     pub(crate) fn allow_flips(&self, enabled: bool) {
         self.0.lock().flips = enabled;
+    }
+    pub(crate) fn refuse_layout(&self, register: u64) {
+        self.0.lock().refuse_layout = register;
     }
     pub(crate) fn arm_order(&self) -> Vec<u64> {
         self.0
@@ -273,7 +600,24 @@ impl MockPlatform {
             .count()
     }
     pub(crate) fn step(&self) {
-        let mut hw = self.0.lock();
+        self.0.lock().step();
+    }
+    fn actions(&self) -> Vec<Action> {
+        self.0.lock().actions.clone()
+    }
+    fn mapping_count(&self) -> usize {
+        self.0
+            .lock()
+            .regs
+            .range(PTE_START..)
+            .filter(|(offset, value)| **offset % 8 == 0 && **value != 0)
+            .count()
+    }
+}
+impl Hardware {
+    /// The next display tick (see [`MockPlatform::step`]).
+    fn step(&mut self) {
+        let hw = self;
         hw.now = hw.now.saturating_add(hw.tick_ns);
         if !hw.allowed || !hw.powered {
             return;
@@ -304,21 +648,17 @@ impl MockPlatform {
         hw.execute_dsb(0);
         hw.execute_dsb(1);
     }
-    fn actions(&self) -> Vec<Action> {
-        self.0.lock().actions.clone()
-    }
-    fn mapping_count(&self) -> usize {
-        self.0
-            .lock()
-            .regs
-            .range(PTE_START..)
-            .filter(|(offset, value)| **offset % 8 == 0 && **value != 0)
-            .count()
-    }
 }
 impl MmioWindow for MockPlatform {
     fn read32(&self, offset: u64) -> u32 {
         let mut hw = self.0.lock();
+        if let Some((register, epoch)) = hw.xr30_epoch_on_read {
+            if offset == register {
+                hw.xr30_epoch = epoch;
+                hw.xr30_epoch_on_read = None;
+            }
+        }
+
         if offset == 0x70b08 && hw.poison_dsb_read {
             hw.poison_dsb_read = false;
             self.1.store(true, Ordering::Release);
@@ -326,8 +666,67 @@ impl MmioWindow for MockPlatform {
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return u32::MAX;
         }
+        if hw.gen12_display
+            && hw.gen12_planes == 5
+            && (0x70000..0x74000).contains(&offset)
+            && [0x680, 0x780].contains(&(offset & 0xfff))
+        {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
+        if hw.gen12_display && !hw.display13 && offset == 0x42084 {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
+        // Independently force the final visible-arm/primary observation to
+        // cross a real frame, after the source has armed a non-console target.
+        if offset == crate::intel_gpu_color::MODE
+            && hw.tear_visible_frame
+            && hw.regs.get(&SURF).copied().unwrap_or(CONSOLE) != CONSOLE
+        {
+            let count = hw.regs[&FRAME].wrapping_add(1);
+            hw.regs.insert(FRAME, count);
+        }
+        // Gen12 has no MTL display PAT, MMIO latency or PM_DEMAND port.
+        // Reads fail and are counted, even if the caller later falls back.
+        if hw.gen12_display
+            && matches!(
+                offset,
+                0x4804 | 0x45780 | 0x45784 | 0x45788 | 0x45230 | 0x45234 | 0x7026c
+            )
+        {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
+        if offset == 0x4a40c {
+            let index = hw.regs.get(&0x4a408).copied().unwrap_or(0);
+            let value = hw.superfine[(index & 31) as usize];
+            if index & (1 << 15) != 0 {
+                hw.regs.insert(0x4a408, (1 << 15) | ((index + 1) & 31));
+            }
+            return value;
+        }
+        if offset == 0x4a404
+            && hw.gen12_display
+            && hw
+                .regs
+                .get(&crate::intel_gpu_color::GAMMA)
+                .copied()
+                .unwrap_or(0)
+                & 3
+                == 3
+        {
+            hw.unreadable_prec_reads += 1;
+            return 0xdeadbeef; // real source forbids fine/coarse readback
+        }
         if offset == 0x4a404 {
             return hw.palette[(hw.regs.get(&0x4a400).copied().unwrap_or(0) & 1023) as usize];
+        }
+        if hw.step_on_read == Some(offset) {
+            hw.step();
+        }
+        if offset == 0x4a488 {
+            return hw.pre_palette[(hw.regs.get(&0x4a484).copied().unwrap_or(0) & 255) as usize];
         }
         hw.regs.get(&offset).copied().unwrap_or(0)
     }
@@ -341,6 +740,10 @@ impl MmioWindow for MockPlatform {
 }
 impl Hardware {
     fn write(&mut self, offset: u64, value: u32) {
+        self.writes.push((offset, value));
+        if offset == self.refuse_layout {
+            return;
+        }
         if (0x4a000..0x4a400).contains(&offset) {
             if self.refuse_palette {
                 return;
@@ -351,6 +754,32 @@ impl Hardware {
                     return;
                 }
             }
+        }
+        if offset == crate::intel_gpu_pcode::PCODE_MAILBOX && value & (1 << 31) != 0 {
+            use crate::intel_gpu_pcode::*;
+            let result = match value & 255 {
+                PCODE_CMD_READ_MEM_LATENCY => {
+                    let set = self.regs.get(&PCODE_DATA0).copied().unwrap_or(0) as usize;
+                    if set > 1 {
+                        self.regs.insert(offset, 3);
+                        return;
+                    }
+                    u32::from_le_bytes(
+                        self.pcode_latencies[set * 4..set * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    )
+                }
+                PCODE_CMD_READ_SAGV_BLOCK_TIME_US => self.pcode_block_time,
+                _ => {
+                    self.regs.insert(offset, 1);
+                    return;
+                }
+            };
+            self.regs.insert(PCODE_DATA0, result);
+            self.regs.insert(PCODE_DATA1, 0);
+            self.regs.insert(offset, self.pcode_status);
+            return;
         }
         if offset == 0x45234 {
             self.regs.insert(offset, value & !(1 << 31));
@@ -379,8 +808,13 @@ impl Hardware {
                 self.dsb_writes.push((offset, value));
                 if offset == base + 0x28 {
                     let old = self.regs.get(&offset).copied().unwrap_or(0);
-                    self.regs
-                        .insert(offset, (value & 0xffff0000) | ((old & 0xffff) & !value));
+                    let status = if self.gen12_display {
+                        // Linux intel_dsb.c: nonexistent status bits are RW.
+                        ((old & 0x0f) & !value) | (value & 0xfff0)
+                    } else {
+                        (old & 0xffff) & !value
+                    };
+                    self.regs.insert(offset, (value & 0xffff0000) | status);
                     return;
                 }
                 if offset == base + 8 {
@@ -405,7 +839,25 @@ impl Hardware {
                 return;
             }
         }
-        if offset == 0x4a404 {
+        if offset == 0x4a40c {
+            self.superfine_writes += 1;
+            if !self.refuse_palette {
+                let index = self.regs.get(&0x4a408).copied().unwrap_or(0);
+                self.superfine[(index & 31) as usize] = value;
+                if index & (1 << 15) != 0 {
+                    self.regs.insert(0x4a408, (1 << 15) | ((index + 1) & 31));
+                }
+            }
+        } else if offset == 0x4a488 {
+            self.pre_writes += 1;
+            if !self.refuse_palette {
+                let index = self.regs.get(&0x4a484).copied().unwrap_or(0);
+                self.pre_palette[(index & 255) as usize] = value;
+                if index & (1 << 10) != 0 {
+                    self.regs.insert(0x4a484, (1 << 10) | ((index + 1) & 255));
+                }
+            }
+        } else if offset == 0x4a404 {
             self.palette_writes += 1;
             if !self.refuse_palette {
                 let index = self.regs.get(&0x4a400).copied().unwrap_or(0);
@@ -451,8 +903,8 @@ impl Hardware {
             return None;
         }
         let pte = GGTT_ARRAY_BASE + u64::from(address) / 4096 * 8;
-        let value =
-            u64::from(*self.regs.get(&pte)?) | (u64::from(*self.regs.get(&(pte + 4))?) << 32);
+        let value = u64::from(*self.regs.get(&pte)?)
+            | (u64::from(self.regs.get(&(pte + 4)).copied().unwrap_or(0)) << 32);
         if value & 1 == 0 {
             return None;
         }
@@ -580,6 +1032,31 @@ unsafe impl DisplayAccess for MockPlatform {
     }
 }
 impl Platform for MockPlatform {
+    fn published_epoch(&self) -> Option<u64> {
+        let epoch = self.0.lock().xr30_epoch;
+        (epoch != 0).then_some(epoch)
+    }
+    fn xr30_device(&self) -> bool {
+        self.3.is_none()
+            && matches!(
+                self.0.lock().xr30_pci,
+                Some(
+                    0x7d40
+                        | 0x7d45
+                        | 0x7d55
+                        | 0x7d60
+                        | 0x7dd5
+                        | 0x7d41
+                        | 0x7d51
+                        | 0x7d67
+                        | 0x7dd1
+                        | 0xb640
+                )
+            )
+    }
+    fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        self.3
+    }
     fn takeover(&self, _owned_cursor: bool) -> Result<(), FsError> {
         if self.reset_lost() {
             return Err(FsError::NoDevice);
@@ -616,11 +1093,92 @@ impl Platform for MockPlatform {
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
-        fetchers_with_cursor(&fresh, Generation::MeteorLake, owned_dsb, owned_cursor)?;
+        fetchers_with_cursor(
+            &fresh,
+            match self.3 {
+                Some(crate::intel_gpu_gt::Gen12Platform::TigerLake) => Generation::TigerLake,
+                Some(_) => Generation::AlderLake,
+                None => Generation::MeteorLake,
+            },
+            owned_dsb,
+            owned_cursor,
+        )?;
         Ok(fresh)
     }
     fn recovery_complete(&self) {
         self.1.store(false, Ordering::Release);
+    }
+    fn psr_timing(&self) -> Option<crate::intel_gpu_dsb::Timing> {
+        self.0.lock().psr_timing
+    }
+    fn psr_aux<'a>(
+        &self,
+        request: &crate::dp_aux::AuxRequest<'_>,
+        reply: &'a mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
+        use crate::dp_aux::{AuxCommand, AuxError, AuxResponse, AuxStatus};
+        let lost = self.reset_lost() && !self.2;
+        let mut hw = self.0.lock();
+        if lost || !hw.allowed || !hw.powered {
+            return Err(AuxError::ShortReply);
+        }
+        let hw = &mut *hw;
+        let dpcd = hw.psr_dpcd.as_mut().ok_or(AuxError::Nacked)?;
+        match request.cmd {
+            AuxCommand::NativeWrite => {
+                for (i, byte) in request.data.iter().enumerate() {
+                    let address = request.address + i as u32;
+                    dpcd.insert(address, *byte);
+                    hw.writes
+                        .push((AUX_LOG | u64::from(address), u32::from(*byte)));
+                }
+                reply[0] = 0;
+                Ok(AuxResponse {
+                    status: AuxStatus::Ack,
+                    data: &reply[..0],
+                })
+            }
+            AuxCommand::NativeRead => {
+                let n = request.data.len();
+                reply[0] = 0;
+                for i in 0..n {
+                    reply[1 + i] = dpcd
+                        .get(&(request.address + i as u32))
+                        .copied()
+                        .unwrap_or(0);
+                }
+                Ok(AuxResponse {
+                    status: AuxStatus::Ack,
+                    data: &reply[1..1 + n],
+                })
+            }
+            _ => Err(AuxError::UnknownStatus),
+        }
+    }
+    fn psr_wm_level_disabled(&self) -> Option<bool> {
+        let hw = self.0.lock();
+        if hw.psr_wm_provider {
+            drop(hw);
+            crate::intel_gpu_psr::wm_level_disabled()
+        } else {
+            hw.psr_wm
+        }
+    }
+    fn psr_vbt(&self) -> crate::intel_gpu_psr::VbtPsr {
+        self.0.lock().psr_vbt
+    }
+    fn fbc_carve(&self, size: u64, min_limit: u32) -> Poll<Option<(u32, u64, u32)>> {
+        let mut hw = self.0.lock();
+        hw.fbc_carve_polls += 1;
+        if hw.fbc_carve_pending {
+            return Poll::Pending;
+        }
+        Poll::Ready(hw.fbc_offset.map(|offset| (offset, size, min_limit)))
+    }
+    fn fbc_recovery_view(&self) -> Option<Self> {
+        let mut view = self.clone();
+        view.2 = true;
+        view.access_ok().then_some(view)
     }
     fn tick(&self) -> Wait<'_> {
         let mut yielded = false;
@@ -653,12 +1211,7 @@ fn geometry() -> Geometry {
     }
 }
 fn device(platform: &MockPlatform) -> Device<MockPlatform> {
-    Device::new(
-        platform.clone(),
-        Generation::TigerLake,
-        0x1000000,
-        console(),
-    )
+    platform.tiger()
 }
 fn once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
@@ -1350,3 +1903,9 @@ kernel_test_in!(
 
 #[path = "intel_gpu_color_kms_tests.rs"]
 mod color;
+#[cfg(target_arch = "x86_64")]
+#[path = "intel_gpu_kms_multipipe_tests.rs"]
+mod multipipe;
+#[cfg(target_arch = "x86_64")]
+#[path = "intel_gpu_psr_kms_tests.rs"]
+mod psr;

@@ -13,6 +13,8 @@ pub const EXEC_QUEUE_GET_PROPERTY: u32 = iowr(D, 0x48, 40);
 pub const EXEC: u32 = iow(D, 0x49, 56);
 pub const WAIT_USER_FENCE: u32 = iowr(D, 0x4a, 72);
 pub const OBSERVATION: u32 = iow(D, 0x4b, 32);
+pub(crate) const EXEC_QUEUE_LOW_LATENCY_HINT: u32 = 1;
+pub(crate) const QUERY_CONFIG_HAS_LOW_LATENCY: u64 = 1 << 1;
 
 pub(crate) fn driver_ioctl(cmd: u32) -> bool {
     matches!(

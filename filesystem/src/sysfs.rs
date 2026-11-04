@@ -3782,16 +3782,19 @@ impl FileOps for SysAttrFile {
         sysfs_attrs()
     }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Capture before show(), as kernfs_seq_show does. A notification
+        // concurrent with generating the value must remain pending. Both
+        // happen when the read is issued, as Linux's synchronous read does:
+        // the future owns that snapshot, so a later attribute update cannot
+        // change a read already in flight.
+        if offset == 0 && !buf.is_empty() {
+            self.observed.store(
+                self.events.generation.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+        let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
         Box::pin(async move {
-            // Capture before show(), as kernfs_seq_show does. A notification
-            // concurrent with generating the value must remain pending.
-            if offset == 0 && !buf.is_empty() {
-                self.observed.store(
-                    self.events.generation.load(Ordering::Acquire),
-                    Ordering::Release,
-                );
-            }
-            let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
             let bytes = content.as_bytes();
             let start = offset as usize;
             if start >= bytes.len() {

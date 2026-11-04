@@ -52,7 +52,7 @@ MODULE_VA_BASE_LD = 0xFFFFFF7FE8000000;
  * after the link; the header magic is what the apply pass keys on, so an
  * unfilled reserve is a skipped slide rather than a slide by garbage.
  *
- * aarch64 needs far less than x86_64's 4M: under `code-model=small` the only
+ * aarch64 needs far less than the x86_64 table: under `code-model=small` the only
  * class a slide touches is R_AARCH64_ABS64 (~86k sites, 4 bytes each), because
  * every other absolute reference is a PC-relative ADRP+ADD pair. x86_64 must
  * additionally carry ~150k R_X86_64_32S sites. 1M leaves better than 2x

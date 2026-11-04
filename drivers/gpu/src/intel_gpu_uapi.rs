@@ -51,11 +51,26 @@ pub const QUERY_GUC_SUBMISSION_VERSION: u64 = 7;
 
 pub const EXEC_RENDER: u64 = 1;
 pub const EXEC_BLT: u64 = 3;
+pub const EXEC_BSD: u64 = 2;
+pub const EXEC_VEBOX: u64 = 4;
+pub const EXEC_BSD_SHIFT: u32 = 13;
+pub const EXEC_BSD_MASK: u64 = 3 << EXEC_BSD_SHIFT;
+pub const CONTEXT_PARAM_GTT_SIZE: u64 = 0x3;
+pub const CONTEXT_PARAM_NO_ERROR_CAPTURE: u64 = 0x4;
+pub const CONTEXT_PARAM_BANNABLE: u64 = 0x5;
+pub const CONTEXT_PARAM_PRIORITY: u64 = 0x6;
+pub const CONTEXT_PARAM_RECOVERABLE: u64 = 0x8;
+pub const CONTEXT_PARAM_VM: u64 = 0x9;
 pub const CONTEXT_PARAM_ENGINES: u64 = 0xa;
+pub const CONTEXT_PARAM_PERSISTENCE: u64 = 0xb;
+pub const CONTEXT_PARAM_PROTECTED_CONTENT: u64 = 0xd;
+pub const CONTEXT_PARAM_LOW_LATENCY: u64 = 0xe;
 pub const CONTEXT_ENGINES_EXT_LOAD_BALANCE: u32 = 0;
 /// I915_ENGINE_CLASS_INVALID with I915_ENGINE_CLASS_INVALID_NONE: an empty
 /// engine-map slot.
 pub const ENGINE_INVALID: u16 = 0xffff;
+pub const EXEC_SECURE: u64 = 1 << 9;
+pub const EXEC_IS_PINNED: u64 = 1 << 10;
 pub const EXEC_NO_RELOC: u64 = 1 << 11;
 pub const EXEC_HANDLE_LUT: u64 = 1 << 12;
 pub const EXEC_FENCE_IN: u64 = 1 << 16;
@@ -68,6 +83,10 @@ pub const OBJECT_WRITE: u64 = 1 << 2;
 pub const OBJECT_SUPPORTS_48B: u64 = 1 << 3;
 pub const OBJECT_PINNED: u64 = 1 << 4;
 pub const OBJECT_PAD_TO_SIZE: u64 = 1 << 5;
+/// Skip only this object's prior implicit GPU dependencies; retain CPU fencing.
+pub const OBJECT_ASYNC: u64 = 1 << 6;
+/// Retain this BO range for bounded error-state payload capture.
+pub const OBJECT_CAPTURE: u64 = 1 << 7;
 
 /// Exact wire encodings accepted alongside Xe on a production GuC card.
 /// Number-only routing is ambiguous (for example GETPARAM/QUEUE_CREATE).
@@ -121,9 +140,61 @@ pub(crate) fn put64(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// i915_user_extensions.c::i915_user_extensions' `stackdepth`: 512 links
+/// are walked and the 513th is -E2BIG.
+pub(crate) const USER_EXTENSIONS_DEPTH: usize = 512;
+
+/// get_user of one `struct i915_user_extension` field.
+fn extension_field<const N: usize>(
+    user: &dyn narf_filesystem::IoctlContext,
+    extension: u64,
+    offset: u64,
+) -> Result<[u8; N], narf_filesystem::FsError> {
+    let mut field = [0; N];
+    let address = extension
+        .checked_add(offset)
+        .ok_or(narf_filesystem::FsError::BadAddress)?;
+    user.read(address, &mut field)?;
+    Ok(field)
+}
+
+/// i915_user_extensions.c::i915_user_extensions over a chain of
+/// `struct i915_user_extension { u64 next_extension; u32 name; u32 flags;
+/// u32 rsvd[4]; }`, in its order. Per link: the stack-depth bound (-E2BIG;
+/// there is no visited set, so a cycle ends here), check_user_mbz of flags
+/// then of each rsvd word (each its own get_user: -EFAULT, then -EINVAL if
+/// nonzero), get_user(name), the handler, and only then get_user of
+/// next_extension. `handler(address, name)` is the caller's table: like
+/// Linux it must answer -EINVAL for a name it has no entry for.
+pub(crate) fn user_extensions(
+    user: &dyn narf_filesystem::IoctlContext,
+    mut extension: u64,
+    mut handler: impl FnMut(u64, u32) -> Result<(), narf_filesystem::FsError>,
+) -> Result<(), narf_filesystem::FsError> {
+    use narf_filesystem::FsError;
+    let mut stackdepth = USER_EXTENSIONS_DEPTH;
+    while extension != 0 {
+        if stackdepth == 0 {
+            return Err(FsError::ArgumentListTooLong);
+        }
+        stackdepth -= 1;
+        // flags at 12, then rsvd[0..4] at 16, 20, 24 and 28.
+        for offset in [12, 16, 20, 24, 28] {
+            if extension_field::<4>(user, extension, offset)? != [0; 4] {
+                return Err(FsError::InvalidData);
+            }
+        }
+        let name = u32::from_le_bytes(extension_field(user, extension, 8)?);
+        handler(extension, name)?;
+        extension = u64::from_le_bytes(extension_field(user, extension, 0)?);
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use narf_filesystem::{FsError, IoctlContext};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_i915_ioctl_wire_numbers() -> TestResult {
@@ -156,4 +227,143 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_uapi", smoke_i915_ioctl_wire_numbers);
+
+    const BASE: u64 = 0x10000;
+    /// A synthetic user range from BASE to `limit`: `links` chained
+    /// extensions 64 bytes apart (the last pointing back to BASE when
+    /// `cycle`), every other byte zero except one `word` at an offset from
+    /// BASE. Reads outside the range fault.
+    struct Chain {
+        links: u64,
+        cycle: bool,
+        limit: u64,
+        word: Option<(u64, u32)>,
+    }
+    impl Chain {
+        fn byte(&self, at: u64) -> u8 {
+            let offset = at - BASE;
+            if let Some((word, value)) = self.word {
+                if (word..word + 4).contains(&offset) {
+                    return value.to_le_bytes()[(offset - word) as usize];
+                }
+            }
+            let (link, field) = (offset / 64, offset % 64);
+            if link >= self.links || field >= 8 {
+                return 0;
+            }
+            let next = if link + 1 < self.links {
+                BASE + 64 * (link + 1)
+            } else if self.cycle {
+                BASE
+            } else {
+                0
+            };
+            next.to_le_bytes()[field as usize]
+        }
+        fn walk(&self, at: u64, verdict: Result<(), FsError>) -> (Result<(), FsError>, u32) {
+            let mut calls = 0;
+            let result = user_extensions(self, at, |address, name| {
+                assert_eq!(address, BASE + 64 * u64::from(calls) % (64 * self.links));
+                calls += 1;
+                if name != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                verdict
+            });
+            (result, calls)
+        }
+    }
+    impl IoctlContext for Chain {
+        fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), FsError> {
+            let end = address
+                .checked_add(bytes.len() as u64)
+                .ok_or(FsError::BadAddress)?;
+            if address < BASE || end > self.limit {
+                return Err(FsError::BadAddress);
+            }
+            for (at, byte) in (address..end).zip(bytes.iter_mut()) {
+                *byte = self.byte(at);
+            }
+            Ok(())
+        }
+        fn write(&self, _: u64, _: &[u8]) -> Result<(), FsError> {
+            Err(FsError::BadAddress)
+        }
+        fn nonblocking(&self) -> bool {
+            false
+        }
+    }
+
+    /// MIT Linux b90c984d i915_user_extensions.c::i915_user_extensions.
+    fn smoke_i915_user_extensions_follow_linux_walk() -> TestResult {
+        let chain = |links, cycle, limit, word| Chain {
+            links,
+            cycle,
+            limit,
+            word,
+        };
+        let open = BASE + 64 * 1024;
+        // `if (!stackdepth--) return -E2BIG;` from 512: 512 links are
+        // walked, the 513th is -E2BIG before any of it is read (here it is
+        // unreadable), and there is no visited set, so a cycle of one or
+        // two links also ends at -E2BIG after 512 handler calls.
+        assert_eq!(
+            chain(512, false, open, None).walk(BASE, Ok(())),
+            (Ok(()), 512)
+        );
+        assert_eq!(
+            chain(513, false, BASE + 64 * 512, None).walk(BASE, Ok(())),
+            (Err(FsError::ArgumentListTooLong), 512)
+        );
+        for links in [1, 2] {
+            assert_eq!(
+                chain(links, true, open, None).walk(BASE, Ok(())),
+                (Err(FsError::ArgumentListTooLong), 512)
+            );
+        }
+        // check_user_mbz(&ext->flags) and then each rsvd word are separate
+        // get_users: a nonzero word is -EINVAL even when a later one is
+        // unreadable, an unreadable word -EFAULT; neither reaches the
+        // handler.
+        for (word, limit, expected) in [
+            (Some((12, 1)), BASE + 16, FsError::InvalidData),
+            (None, BASE + 16, FsError::BadAddress),
+            (Some((16, 1)), BASE + 20, FsError::InvalidData),
+            (None, BASE + 20, FsError::BadAddress),
+            (Some((28, 1)), open, FsError::InvalidData),
+        ] {
+            assert_eq!(
+                chain(1, false, limit, word).walk(BASE, Ok(())),
+                (Err(expected), 0)
+            );
+        }
+        // The name goes to the caller's table, whose missing entry is
+        // -EINVAL; a later link is never read.
+        assert_eq!(
+            chain(2, false, BASE + 64, Some((8, 3))).walk(BASE, Ok(())),
+            (Err(FsError::InvalidData), 1)
+        );
+        // next_extension is read only after the handler ran: an extension
+        // whose first eight bytes are unreadable reaches its handler, whose
+        // error wins, and is otherwise -EFAULT.
+        let straddle = chain(0, false, open, None);
+        let mut calls = 0;
+        let result = user_extensions(&straddle, BASE - 8, |address, name| {
+            assert_eq!((address, name), (BASE - 8, 0));
+            calls += 1;
+            Err(FsError::AlreadyExists)
+        });
+        assert_eq!((result, calls), (Err(FsError::AlreadyExists), 1));
+        calls = 0;
+        let result = user_extensions(&straddle, BASE - 8, |_, _| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!((result, calls), (Err(FsError::BadAddress), 1));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_uapi",
+        smoke_i915_user_extensions_follow_linux_walk
+    );
 }

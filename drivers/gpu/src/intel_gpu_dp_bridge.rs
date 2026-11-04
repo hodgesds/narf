@@ -88,15 +88,19 @@ pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
 /// for the whole driver lifetime.
 struct MmioRegionWindow<'a> {
     region: &'a MmioRegion,
+    family: crate::intel_gpu_gt::Gen12Platform,
 }
 
 impl<'a> MmioRegionWindow<'a> {
-    fn new(region: &'a MmioRegion) -> Self {
-        Self { region }
+    fn new(region: &'a MmioRegion, family: crate::intel_gpu_gt::Gen12Platform) -> Self {
+        Self { region, family }
     }
 }
 
 impl<'a> MmioWindow for MmioRegionWindow<'a> {
+    fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        Some(self.family)
+    }
     fn read32(&self, off: u64) -> u32 {
         // SAFETY: BAR0 is mapped for the lifetime of `IntelGpu`.
         unsafe { self.region.read32(off) }
@@ -169,6 +173,8 @@ impl IntelDpBridge {
         if !gpu.chip.generation.external_display_supported() {
             return Err(DpBridgeError::NoSuchConnector);
         }
+        let family = crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip)
+            .ok_or(DpBridgeError::NoSuchConnector)?;
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -182,7 +188,7 @@ impl IntelDpBridge {
             gpu.gmd_id,
         );
 
-        let mmio = MmioRegionWindow::new(&gpu.gtt_mmadr);
+        let mmio = MmioRegionWindow::new(&gpu.gtt_mmadr, family);
 
         // Try an EDID readback over AUX. AUX may not yet be reachable
         // (DPRX side could still be waking up); a failure here isn't

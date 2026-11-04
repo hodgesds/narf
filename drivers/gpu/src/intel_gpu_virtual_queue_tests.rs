@@ -349,7 +349,7 @@ fn smoke_virtual_queue_watchdog_uses_every_physical_engine_and_terminal_retireme
             Engine::Ccs1 => "ccs1",
             Engine::Ccs2 => "ccs2",
             Engine::Ccs3 => "ccs3",
-            Engine::Rcs0 => unreachable!(),
+            _ => unreachable!("this fixture's placements contain graphics engines"),
         };
         assert!(text.contains(&alloc::format!(
             "context {} placements=0x{:02x}",

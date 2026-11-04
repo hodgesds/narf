@@ -441,6 +441,8 @@ pub struct CrtcColor {
     pub crtc: u32,
     pub ctm: u32,
     pub gamma_lut: u32,
+    /// Intel's 129-entry pre-CSC LUT (absent on the AMD profile).
+    pub degamma_lut: u32,
     /// `drm_crtc::gamma_store`: `LEGACY_GAMMA_SIZE` red, then green, then
     /// blue entries, initialised to the identity ramp (`i << 8`).
     pub gamma_store: Vec<u16>,
@@ -452,6 +454,7 @@ impl CrtcColor {
             crtc,
             ctm: 0,
             gamma_lut: 0,
+            degamma_lut: 0,
             gamma_store: ramp.clone().chain(ramp.clone()).chain(ramp).collect(),
         }
     }
@@ -933,6 +936,32 @@ pub struct Card {
     /// Installed fixed-mode Intel color owner (native CTM, gamma1024/legacy256).
     #[cfg(feature = "intel")]
     pub(crate) intel_ctm: bool,
+    /// Qualified Gen12 fixed CTM only; LUT capability remains separate.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_ctm_only: bool,
+    /// Source-qualified fixed hardware cursor, independent of LUT stages.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_hw_cursor: bool,
+    /// Exact Gen12 native color profile; independent of cursor and joint DSB.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_gen12_lut: Option<crate::intel_gpu_color::Profile>,
+    /// Qualified fixed linear Gen12 same-window primary/color DSB transaction.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_gen12_joint: bool,
+    /// Source-qualified bounded Gen12 panning; family also fixes SURF alignment.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_gen12_views: Option<crate::intel_gpu_gt::Gen12Platform>,
+    #[cfg(feature = "intel")]
+    intel_blob_copy_bytes: usize,
+    /// Fixed display14 primary with owned no-DPT + linear-equivalent X WMs.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_x_tiled: bool,
+    /// Fixed display14 Tile4 with retained primary WM/resource ownership.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_tile4: bool,
+    /// Fixed MTL/Arrow opaque XR30 LINEAR native input; no output-depth claim.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_xr30: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
     /// A released master still owns hardware until serialized restoration.
@@ -1210,6 +1239,24 @@ impl Card {
             intel_deferred_owners: Vec::new(),
             #[cfg(feature = "intel")]
             intel_ctm: false,
+            #[cfg(feature = "intel")]
+            intel_ctm_only: false,
+            #[cfg(feature = "intel")]
+            intel_hw_cursor: false,
+            #[cfg(feature = "intel")]
+            intel_gen12_lut: None,
+            #[cfg(feature = "intel")]
+            intel_gen12_joint: false,
+            #[cfg(feature = "intel")]
+            intel_gen12_views: None,
+            #[cfg(feature = "intel")]
+            intel_blob_copy_bytes: 0,
+            #[cfg(feature = "intel")]
+            intel_x_tiled: false,
+            #[cfg(feature = "intel")]
+            intel_tile4: false,
+            #[cfg(feature = "intel")]
+            intel_xr30: false,
             #[cfg(feature = "intel")]
             intel_display: false,
             #[cfg(feature = "intel")]
@@ -1665,16 +1712,50 @@ impl Card {
         true
     }
 
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_reserve_blob_copy(&mut self, bytes: usize) -> Result<bool, CardError> {
+        if !self.intel_display {
+            return Ok(false);
+        }
+        let total = self
+            .intel_blob_copy_bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= crate::intel_gpu_color::MAX_COLOR_BLOB_TOTAL)
+            .ok_or(CardError::TooManyFbs)?;
+        self.intel_blob_copy_bytes = total;
+        Ok(true)
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_release_blob_copy(&mut self, bytes: usize) {
+        self.intel_blob_copy_bytes -= bytes;
+    }
     /// Register a userspace KMS property blob and return its object id.
     pub(crate) fn create_property_blob(&mut self, data: Vec<u8>) -> Result<u32, CardError> {
         if data.is_empty() {
             return Err(CardError::InvalidDimensions);
         }
+        #[cfg(feature = "intel")]
+        if self.intel_display {
+            if data.len() > crate::intel_gpu_color::MAX_COLOR_BLOB {
+                return Err(CardError::InvalidDimensions);
+            }
+            let used = self
+                .property_blobs
+                .iter()
+                .try_fold(0usize, |n, b| n.checked_add(b.data.len()))
+                .ok_or(CardError::TooManyFbs)?;
+            if used
+                .checked_add(data.len())
+                .is_none_or(|n| n > crate::intel_gpu_color::MAX_COLOR_BLOB_TOTAL)
+            {
+                return Err(CardError::TooManyFbs);
+            }
+        }
         if self.property_blobs.len() >= 4096 {
             return Err(CardError::TooManyFbs);
         }
         let mut id = self.next_property_blob_id.max(1);
-        while self.property_blobs.iter().any(|blob| blob.id == id) {
+        while id == 0x4000_0040 || self.property_blobs.iter().any(|blob| blob.id == id) {
             id = id.wrapping_add(1).max(1);
         }
         self.next_property_blob_id = id.wrapping_add(1).max(1);
@@ -1724,23 +1805,66 @@ impl Card {
             && (self
                 .crtc_color
                 .iter()
-                .any(|c| c.ctm == id || c.gamma_lut == id)
+                .any(|c| c.ctm == id || c.gamma_lut == id || c.degamma_lut == id)
                 || self
                     .native
                     .iter()
                     .any(|n| n.hdr_output_metadata == Some(id)))
     }
 
-    pub(crate) fn intel_color(&self, crtc: u32) -> bool {
+    /// CTM authority is independent of native/legacy LUT and cursor support.
+    pub(crate) fn intel_ctm_supported(&self, crtc: u32) -> bool {
         #[cfg(feature = "intel")]
         {
-            self.intel_ctm && self.crtc_color(crtc).is_some()
+            (self.intel_ctm || self.intel_ctm_only || self.intel_gen12_lut.is_some())
+                && self.crtc_color(crtc).is_some()
         }
         #[cfg(not(feature = "intel"))]
         {
             let _ = crtc;
             false
         }
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_cursor_supported(&self, crtc: u32) -> bool {
+        (self.intel_hw_cursor || (self.intel_ctm && self.crtc_color(crtc).is_some()))
+            && self.crtcs.iter().any(|c| c.id == crtc)
+    }
+    pub(crate) fn legacy_gamma_supported(&self, crtc: u32) -> bool {
+        #[cfg(feature = "intel")]
+        if self.intel_ctm_only && !self.intel_ctm && self.intel_gen12_lut.is_none() {
+            return false;
+        }
+        self.crtc_color(crtc).is_some()
+    }
+
+    pub(crate) fn intel_color(&self, crtc: u32) -> bool {
+        #[cfg(feature = "intel")]
+        {
+            (self.intel_ctm || self.intel_gen12_lut.is_some()) && self.crtc_color(crtc).is_some()
+        }
+        #[cfg(not(feature = "intel"))]
+        {
+            let _ = crtc;
+            false
+        }
+    }
+    pub(crate) fn intel_lut_sizes(&self, crtc: u32) -> Option<(usize, usize)> {
+        #[cfg(feature = "intel")]
+        if self.intel_color(crtc) {
+            return Some(
+                self.intel_gen12_lut
+                    .unwrap_or(crate::intel_gpu_color::Profile::Mtl)
+                    .sizes(),
+            );
+        }
+        let _ = crtc;
+        None
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_lut_profile(&self) -> crate::intel_gpu_color::Profile {
+        self.intel_gen12_lut
+            .unwrap_or(crate::intel_gpu_color::Profile::Mtl)
     }
     #[cfg(feature = "intel")]
     pub(crate) fn intel_retain_blob(&mut self, id: u32) -> bool {
@@ -1789,10 +1913,11 @@ impl Card {
     }
     #[cfg(feature = "intel")]
     pub(crate) fn intel_clear_ctm(&mut self) {
-        if self.intel_ctm {
+        if self.intel_ctm || self.intel_ctm_only || self.intel_gen12_lut.is_some() {
             for color in &mut self.crtc_color {
                 color.ctm = 0;
                 color.gamma_lut = 0;
+                color.degamma_lut = 0;
             }
         }
         self.collect_blobs();
@@ -2138,12 +2263,19 @@ impl Card {
         Ok(id)
     }
 
+    /// Native Intel discovery is separate from the generic legacy-copy formats.
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_primary_formats(&self) -> Option<&'static [u32]> {
+        self.intel_xr30.then_some(&[0x34325258, 0x30335258])
+    }
+
     /// ADDFB2 naming one of open `owner`'s Intel GEM handles: drm core's
     /// framebuffer_check and Linux intel_framebuffer_init, in their order.
-    /// Only LINEAR is taken (no tiled presentation exists here); plane 0 has
-    /// no offset; the pitch is 64-byte aligned (4 KiB past the plane's
+    /// LINEAR and qualified Gen12/13/display14 no-DPT X (MTL Tile4) are taken; plane0
+    /// has no offset. Linear pitch is64-byte aligned (4KiB past the plane's
     /// 128 KiB native limit) and at most 256 KiB; the object holds every
-    /// line. On native Xe (`xe`), an object not created SCANOUT may not be
+    /// line. Tiling is XR24 only: X pitch512/rows8, Tile4 pitch128/rows32.
+    /// On native Xe (`xe`), an object not created SCANOUT may not be
     /// VM-bound and becomes SCANOUT (intel_fb_bo_framebuffer_init).
     #[cfg(feature = "intel")]
     pub fn addfb2_intel(
@@ -2155,14 +2287,34 @@ impl Card {
     ) -> Result<u32, CardError> {
         use crate::drm::fb_cmd::{FB_INTERLACED, FB_MODIFIERS};
         // framebuffer_check.
+        let modifier = if cmd.flags & FB_MODIFIERS != 0 {
+            cmd.modifier[0]
+        } else {
+            0
+        };
+        let x_tiled = modifier == crate::intel_gpu_scanout::X_TILED_MODIFIER && self.intel_x_tiled;
+        let tile4 = modifier == crate::intel_gpu_scanout::TILE4_MODIFIER && self.intel_tile4;
+        let tiled = x_tiled || tile4;
         if cmd.flags & !(FB_INTERLACED | FB_MODIFIERS) != 0
-            || (cmd.flags & FB_MODIFIERS != 0 && cmd.modifier[0] != 0)
+            || (modifier != 0 && !tiled)
+            || (tiled && (cmd.flags & FB_INTERLACED != 0 || cmd.pixel_format != 0x3432_5258))
         {
             return Err(CardError::UnknownFormat);
         }
         let legacy = matches!(cmd.pixel_format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
+        let xr30 = cmd.pixel_format == 0x30335258;
+        if xr30
+            && (!self.intel_xr30
+                || modifier != 0
+                || cmd.flags & FB_INTERLACED != 0
+                || !object.is_wc()
+                || object.is_userptr()
+                || object.is_vram())
+        {
+            return Err(CardError::UnknownFormat);
+        }
         let format = PixelFormat::from_fourcc(cmd.pixel_format)
-            .filter(|_| legacy)
+            .filter(|_| legacy || xr30)
             .ok_or(CardError::UnknownFormat)?;
         if cmd.width == 0 || cmd.height == 0 {
             return Err(CardError::InvalidDimensions);
@@ -2186,7 +2338,7 @@ impl Card {
         if object.is_vram() {
             return Err(CardError::InvalidDimensions);
         }
-        if xe && !object.scanout() {
+        if xe && !xr30 && !object.scanout() {
             if object.vm_bound() {
                 return Err(CardError::InvalidDimensions);
             }
@@ -2195,15 +2347,49 @@ impl Card {
         let pitch = cmd.pitches[0];
         const MAX_STRIDE: u32 = 256 * 1024; // intel_fb_max_stride, remapped
         const PLANE_STRIDE: u32 = 128 * 1024; // adl_plane_max_stride bytes
-        let alignment = if pitch > PLANE_STRIDE { 4096 } else { 64 };
-        if pitch > MAX_STRIDE || cmd.offsets[0] != 0 || pitch % alignment != 0 {
+        let alignment = if tile4 {
+            128
+        } else if tiled {
+            512
+        } else if pitch > PLANE_STRIDE {
+            4096
+        } else {
+            64
+        };
+        let tiled_stride_limit = self
+            .intel_gen12_views
+            .map_or(PLANE_STRIDE, crate::intel_gpu_scanout::gen12_max_stride);
+        if pitch
+            > (if tiled {
+                tiled_stride_limit
+            } else {
+                MAX_STRIDE
+            })
+            || cmd.offsets[0] != 0
+            || pitch % alignment != 0
+            || (tiled && (!(4..=5120).contains(&cmd.width) || cmd.height > 4320))
+        {
             return Err(CardError::InvalidDimensions);
         }
-        if u64::from(pitch) * u64::from(cmd.height) > object.size() {
+        let height = if tile4 {
+            cmd.height.div_ceil(32) * 32
+        } else if tiled {
+            cmd.height.div_ceil(8) * 8
+        } else {
+            cmd.height
+        };
+        if u64::from(pitch) * u64::from(height) > object.size() {
             return Err(CardError::InvalidDimensions);
         }
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);
+        }
+        // XR30 refusals precede even the Xe framebuffer storage attribute.
+        if xr30 && !object.scanout() {
+            if !xe || object.vm_bound() {
+                return Err(CardError::InvalidDimensions);
+            }
+            object.mark_scanout();
         }
         let id = self.next_fb_id;
         self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
@@ -2216,7 +2402,7 @@ impl Card {
             gem_handle: cmd.handles[0],
             offsets: [0, 0],
             chroma_pitch: 0,
-            modifier: 0,
+            modifier,
             bo: None,
             intel: Some(IntelFb { object, owner }),
         });
@@ -2519,6 +2705,7 @@ pub mod tests {
             offset: 0,
             length: 4096,
             writable: true,
+            dumpable: false,
             pat: 3,
         }]);
         let mut bound_cmd = cmd(256, 256, 1024);
@@ -2556,6 +2743,7 @@ pub mod tests {
             offset: 0,
             length: 4096,
             writable: true,
+            dumpable: false,
             pat: 3,
         }]);
         if card
