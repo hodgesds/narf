@@ -1820,8 +1820,8 @@ pub mod tests {
     // fake xhci exists); the pump decision itself is pinned
     // once in the r8152 module via the shared helper.
     fn smoke_ecm_suspended_hub_ports() -> TestResult {
-        let mk = |slot: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| {
-            CdcEcmDevice {
+        let mk =
+            |slot: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| CdcEcmDevice {
                 slot_id: slot,
                 comm_iface: 0,
                 data_iface: 1,
@@ -1841,8 +1841,7 @@ pub mod tests {
                 hub_port,
                 suspended,
                 wakeup_armed: suspended,
-            }
-        };
+            };
         {
             let mut g = CDC_ECM_DEVICES.lock();
             g.push(mk(7, Some((2, 3)), true, false));

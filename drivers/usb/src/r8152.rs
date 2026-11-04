@@ -2436,12 +2436,11 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
         match device.bulk_in(bulk_in_dci, &mut buf).await {
             Ok(n) if n > 0 => {
                 errors = 0;
-                let (name, hub_port) = {
+                let dev = {
                     let g = RTL_DEVICES.lock();
-                    g.get(idx)
-                        .map(|d| (d.iface_name.clone(), d.hub_port))
+                    g.get(idx).map(|d| (d.iface_name.clone(), d.hub_port))
                 };
-                if let Some(name) = name {
+                if let Some((name, hub_port)) = dev {
                     let mut delivered = 0usize;
                     for seg in parse_rx_aggregate(&buf[..n]) {
                         let raw = &buf[seg.offset..seg.offset + seg.len];
@@ -2579,9 +2578,10 @@ async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
     // (a detach in between wins; the pass's gating of a
     // device-less port is harmless).
     let mut g = RTL_DEVICES.lock();
-    match g.iter_mut().find(|d| {
-        !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id
-    }) {
+    match g
+        .iter_mut()
+        .find(|d| !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id)
+    {
         Some(rec) => {
             rec.suspended = true;
             rec.wakeup_armed = armed;
@@ -2597,16 +2597,11 @@ async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
 /// non-parked port returns `false` (nothing was resumed) —
 /// callers that need "awake" semantics re-check the flag.
 /// Never holds the record lock across the resume await.
-pub async fn resume_r8152_port(
-    xhci_dev: &crate::xhci::Xhci,
-    hub_slot: u8,
-    port: u8,
-) -> bool {
+pub async fn resume_r8152_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u8) -> bool {
     let idx = {
         let g = RTL_DEVICES.lock();
-        g.iter().position(|d| {
-            !d.detached && d.suspended && d.hub_port == Some((hub_slot, port))
-        })
+        g.iter()
+            .position(|d| !d.detached && d.suspended && d.hub_port == Some((hub_slot, port)))
     };
     let Some(idx) = idx else {
         return false;
@@ -4481,8 +4476,8 @@ pub mod tests {
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_remote_wakeup_setup);
 
     fn smoke_r8152_suspended_hub_ports() -> TestResult {
-        let mk = |slot_id: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| {
-            RtlDevice {
+        let mk =
+            |slot_id: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| RtlDevice {
                 slot_id,
                 generation: RtlGen::GbE,
                 version: RtlVersion::Ver03,
@@ -4499,8 +4494,7 @@ pub mod tests {
                 speed: crate::xhci::PortSpeed::High,
                 suspended,
                 wakeup_armed: suspended,
-            }
-        };
+            };
         {
             let mut g = RTL_DEVICES.lock();
             g.push(mk(7, Some((2, 3)), true, false));

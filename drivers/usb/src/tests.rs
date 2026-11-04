@@ -2917,36 +2917,24 @@ kernel_test_in!(
 
 // ── Class suspend hooks (#1256) ────────────────────────────────────
 
-static SUSPEND_PARKED_CALLS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-static SUSPEND_FAILED_CALLS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-static SUSPEND_NOTMINE_CALLS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static SUSPEND_PARKED_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SUSPEND_FAILED_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SUSPEND_NOTMINE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // Each dummy hook is its own fn: the outcome is a
 // compile-time value per fn (a closure capturing its outcome
 // could not coerce to the hook fn-pointer type).
-fn suspend_hook_parked(
-    _slot: u8,
-    _port: u8,
-) -> crate::class_registry::SuspendFuture {
+fn suspend_hook_parked(_slot: u8, _port: u8) -> crate::class_registry::SuspendFuture {
     SUSPEND_PARKED_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::Parked })
 }
 
-fn suspend_hook_failed(
-    _slot: u8,
-    _port: u8,
-) -> crate::class_registry::SuspendFuture {
+fn suspend_hook_failed(_slot: u8, _port: u8) -> crate::class_registry::SuspendFuture {
     SUSPEND_FAILED_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::ParkFailed })
 }
 
-fn suspend_hook_notmine(
-    _slot: u8,
-    _port: u8,
-) -> crate::class_registry::SuspendFuture {
+fn suspend_hook_notmine(_slot: u8, _port: u8) -> crate::class_registry::SuspendFuture {
     SUSPEND_NOTMINE_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::NotMine })
 }
@@ -3008,7 +2996,10 @@ fn smoke_usb_suspend_change_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usb/class-registry", smoke_usb_suspend_change_decode);
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_suspend_change_decode
+);
 
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
     use crate::uac::{
