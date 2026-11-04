@@ -987,7 +987,7 @@ impl GlinkBus for PumpBus {
 fn pump_to_ready<F: Future>(fut: F, server: &mut GlinkWlfwServer<'_>) -> Option<F::Output> {
     let mut fut = pin!(fut);
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
     for _ in 0..200_000 {
         if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
             return Some(v);
@@ -1410,7 +1410,7 @@ fn smoke_ath11k_ahb_live_wcn6750_wlfw_server() -> TestResult {
     let out = {
         let mut fut = pin!(bring_up(&p, &mut *live));
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         let mut out = None;
         for _ in 0..200_000 {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
