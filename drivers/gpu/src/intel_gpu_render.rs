@@ -42,14 +42,16 @@ const CONTEXT_MAX_USER_PRIORITY: i64 = 1023;
 /// intel_engine_user.c::set_scheduler_caps gives every GuC device ENABLED
 /// and PRIORITY (sched_engine->schedule), and PREEMPTION, ENGINE_BUSY_STATS
 /// and STATIC_PRIORITY_MAP from its engine flags; with no uabi engine the
-/// caps are 0. NARF advertises ENABLED and PRIORITY while a live owner
-/// admits submission. LINUX-GAP: the stored PRIORITY reaches no GuC
-/// registration (see Context::priority), and PREEMPTION, BUSY_STATS and
-/// STATIC_PRIORITY_MAP stay clear because no preempt-to-idle cancellation,
-/// busy-stat or priority-map contract exists.
+/// caps are 0. NARF advertises ENABLED only while a live owner admits
+/// submission. PRIORITY stays clear until a context priority reaches the
+/// GuC registration (map_i915_prio_to_guc_prio): an unsupported capability
+/// stays unadvertised, so validate_priority returns -ENODEV for every
+/// PRIORITY set, exactly as Linux does on a device without CAP_PRIORITY.
+/// PREEMPTION, BUSY_STATS and STATIC_PRIORITY_MAP stay clear because no
+/// preempt-to-idle cancellation, busy-stat or priority-map contract exists.
 fn scheduler_caps(info: &DeviceInfo) -> i32 {
     if info.submission_ready() {
-        SCHEDULER_CAP_ENABLED | SCHEDULER_CAP_PRIORITY
+        SCHEDULER_CAP_ENABLED
     } else {
         0
     }

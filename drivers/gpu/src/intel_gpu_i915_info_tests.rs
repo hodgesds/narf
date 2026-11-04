@@ -140,8 +140,7 @@ fn smoke_i915_observed_discovery_and_immutable_facts_after_loss() -> TestResult 
                     },
                 ),
                 (51, 19_200_000),
-                // I915_SCHEDULER_CAP_ENABLED | PRIORITY, or 0.
-                (41, if live { 3 } else { 0 }),
+                (41, i32::from(live)),
             ] {
                 assert_eq!(parameter(&file, &info, &user, param), Ok(value));
             }
@@ -405,8 +404,9 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         context_param(&file, &info, &user, false, id, 0, param, 0).map(|(_, value)| value)
     };
     let neg = |value: i64| value as u64;
-    // I915_SCHEDULER_CAP_ENABLED | PRIORITY while live.
-    assert_eq!(parameter(&file, &info, &user, 41), Ok(3));
+    // I915_SCHEDULER_CAP_ENABLED only while live: PRIORITY is unadvertised
+    // until a context priority reaches the GuC registration.
+    assert_eq!(parameter(&file, &info, &user, 41), Ok(1));
     // The lookup precedes every size and parameter check.
     for param in [4, 5, 6, 8, 9, 11, 13, u64::MAX] {
         assert_eq!(set(99, 1, param, 0), Err(FsError::NotFound));
@@ -471,39 +471,20 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(set(id, 99, 13, 0), Err(FsError::InvalidData));
     }
 
-    // PRIORITY: size, I915_SCHEDULER_CAP_PRIORITY, the s64 range, then
-    // CAP_SYS_NICE above I915_CONTEXT_DEFAULT_PRIORITY.
+    // PRIORITY: size, then I915_SCHEDULER_CAP_PRIORITY (validate_priority).
+    // The capability is unadvertised, so every in-size set is -ENODEV
+    // before the s64 range and CAP_SYS_NICE checks, as on a Linux device
+    // without CAP_PRIORITY; GETPARAM still reports the default 0.
     for live in [false, true] {
         let id = if live { 0 } else { context(&file, &info, &user) };
-        credentials.grant(&[]);
-        credentials.asked();
-        for (size, value, expected) in [
-            (1, 0, FsError::InvalidData),
-            (0, 1024, FsError::InvalidData),
-            (0, neg(-1024), FsError::InvalidData),
-            (0, 1 << 32, FsError::InvalidData),
-            (0, 1, FsError::OperationNotPermitted),
-            (0, 1023, FsError::OperationNotPermitted),
-        ] {
-            assert_eq!(set(id, size, 6, value), Err(expected), "{size} {value:#x}");
-        }
-        assert_eq!(credentials.asked(), 1 << NICE);
-        for value in [0, neg(-1), neg(-1023)] {
-            assert_eq!(set(id, 0, 6, value), Ok(()));
-        }
-        assert_eq!(credentials.asked(), 0, "capable() for a priority <= 0");
         credentials.grant(&[NICE]);
-        assert_eq!(set(id, 0, 6, 1024), Err(FsError::InvalidData));
-        assert_eq!(credentials.asked(), 0, "capable() before the range check");
-        assert_eq!(set(id, 0, 6, 1023), Ok(()));
-        assert_eq!(credentials.asked(), 1 << NICE);
-        assert_eq!(get(id, 6), Ok(1023));
-        // ctx_setparam's set_priority; GETPARAM sign-extends the int.
-        assert_eq!(set(id, 0, 6, neg(-7)), Ok(()));
-        assert_eq!(get(id, 6), Ok(neg(-7)));
-        credentials.grant(&[]);
-        assert_eq!(set(id, 0, 6, 2), Err(FsError::OperationNotPermitted));
-        assert_eq!(get(id, 6), Ok(neg(-7)));
+        credentials.asked();
+        assert_eq!(set(id, 1, 6, 0), Err(FsError::InvalidData));
+        for value in [0, 1, 1023, 1024, neg(-1), neg(-1024), 1 << 32] {
+            assert_eq!(set(id, 0, 6, value), Err(FsError::NoDevice), "{value:#x}");
+        }
+        assert_eq!(credentials.asked(), 0, "capable() before the capability check");
+        assert_eq!(get(id, 6), Ok(0));
     }
     // With no uabi engine i915->caps.scheduler is 0: PRIORITY is -ENODEV
     // after the size check, whatever its value.
@@ -532,7 +513,7 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
     credentials.grant(&[]);
     for (size, param, value, expected) in [
         (0, 5, 0, FsError::OperationNotPermitted),
-        (0, 6, 5, FsError::OperationNotPermitted),
+        (0, 6, 5, FsError::NoDevice),
         (1, 6, 0, FsError::InvalidData),
         (0, 11, 0, FsError::NoDevice),
         (7, 13, 1, FsError::NoDevice),
@@ -540,8 +521,7 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(create_ext(size, param, value), Err(expected));
     }
     credentials.grant(&[ADMIN, NICE]);
-    for (size, param, value, expected) in [(0, 5, 0, 0), (0, 6, 5, 5), (0, 8, 1, 1), (7, 13, 0, 0)]
-    {
+    for (size, param, value, expected) in [(0, 5, 0, 0), (0, 8, 1, 1), (7, 13, 0, 0)] {
         let id = create_ext(size, param, value).expect("applied link");
         assert_eq!(get(id, param), Ok(expected));
     }

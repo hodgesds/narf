@@ -758,8 +758,7 @@ fn smoke_i915_xe_exact_dispatch_discovery_sseu_and_wc_refusal() -> TestResult {
             (33, topology.dss_count()),
             (34, topology.eu_count()),
             (51, 25_000_000),
-            // I915_SCHEDULER_CAP_ENABLED | PRIORITY, or 0.
-            (41, if live { 3 } else { 0 }),
+            (41, u32::from(live)),
         ] {
             let mut wire = [0; 16];
             put32(&mut wire, 0, parameter);

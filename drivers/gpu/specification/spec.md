@@ -1016,6 +1016,9 @@ value 0 without CAP_SYS_ADMIN EPERM; any nonzero value sets it. RECOVERABLE:
 size EINVAL, then 0 clears and any other value sets it. PRIORITY
 (validate_priority): size EINVAL, ENODEV without I915_SCHEDULER_CAP_PRIORITY,
 EINVAL outside -1023..=1023 as an s64, EPERM above 0 without CAP_SYS_NICE.
+CAP_PRIORITY is unadvertised until a context priority reaches the GuC
+registration, so every in-size PRIORITY set is ENODEV today, as on a Linux
+device without CAP_PRIORITY.
 PERSISTENCE: size EINVAL; a finalized context already in the requested state
 succeeds; setting succeeds (the job watchdog is hangcheck); clearing is ENODEV
 (no I915_SCHEDULER_CAP_PREEMPTION). PROTECTED_CONTENT on a proto has no size
@@ -1056,8 +1059,9 @@ The i915 compatibility GETPARAM discovery path reports observed PCI revision
 (32), union DSS count (33), actual fused EU count (34) and timestamp frequency
 (51). Missing or mismatched topology/facts return ENODEV, never zero; immutable
 facts survive a stopped GT without MMIO or wake. HAS_SCHEDULER (41) reports
-ENABLED|PRIORITY while live and 0 otherwise, leaving
-preemption/semaphore/busy-stat/static-priority-map capability bits clear;
+ENABLED while live and 0 otherwise, leaving the
+priority/preemption/semaphore/busy-stat/static-priority-map capability bits
+clear;
 context PRIORITY and PERSISTENCE checks read the same value. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
 slice/subslice masks 46/47 return EINVAL on Xe_HP-and-later profiles, as in
 Linux; callers use full topology queries.
