@@ -2383,9 +2383,7 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_vector_for);
 // ── VMDq / SR-IOV fixtures (issue #1261) ───────────────────────────
 
 fn smoke_ixgbe_vmdq_pool_mapping() -> TestResult {
-    use super::vmdq::{
-        mtqc_vt_word, pool_for_vf, pool_queues, primary_rar, qde_word, vt_ctl_word,
-    };
+    use super::vmdq::{mtqc_vt_word, pool_for_vf, pool_queues, primary_rar, qde_word, vt_ctl_word};
     if pool_for_vf(0) != Some(1) || pool_for_vf(62) != Some(63) || pool_for_vf(63).is_some() {
         return TestResult::Fail("pool_for_vf mapping wrong (PF pool 0, VF i -> i+1)");
     }
@@ -2491,7 +2489,8 @@ fn smoke_ixgbe_vmdq_mpsar_rar() -> TestResult {
     if read_rar(&bank, 1) != (mac, false) {
         return TestResult::Fail("clear_rar disturbed MAC bytes");
     }
-    if assign_rar_pool(&mut bank, 128, 0).is_ok() || program_rar(&mut bank, 0, &mac, 64, true).is_ok()
+    if assign_rar_pool(&mut bank, 128, 0).is_ok()
+        || program_rar(&mut bank, 0, &mac, 64, true).is_ok()
     {
         return TestResult::Fail("out-of-range RAR/pool accepted");
     }
@@ -2502,9 +2501,7 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_mpsar_rar);
 fn smoke_ixgbe_vmdq_pool_vlan() -> TestResult {
     use super::queues::RegBank;
     use super::vlan::REG_VFTA_BASE;
-    use super::vmdq::{
-        clear_pool_vlan, find_vlvf_slot, set_pool_vlan, vlvfb, vlvf, VLVF_VIEN,
-    };
+    use super::vmdq::{clear_pool_vlan, find_vlvf_slot, set_pool_vlan, vlvf, vlvfb, VLVF_VIEN};
     let mut bank = FakeBank::new();
     if set_pool_vlan(&mut bank, 100, 5).is_err() {
         return TestResult::Fail("set_pool_vlan failed");
@@ -2555,9 +2552,9 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_pool_vlan);
 fn smoke_ixgbe_vmdq_vf_state_regs() -> TestResult {
     use super::queues::RegBank;
     use super::vmdq::{
-        clear_vmvir, clear_vf_reset_event, pvftdwbah, pvftdwbal, qde_word, reset_vf_tx_addrs,
-        set_pool_queue_drop, set_spoof_count, set_vf_rx_tx, set_vmvir, set_vmolr, vfre, vfte,
-        vf_reset_pending, vflrec, vflre, vmecm, vmolr, vmvir, REG_QDE, VMOLR_AUPE, VMOLR_BAM,
+        clear_vf_reset_event, clear_vmvir, pvftdwbah, pvftdwbal, qde_word, reset_vf_tx_addrs,
+        set_pool_queue_drop, set_spoof_count, set_vf_rx_tx, set_vmolr, set_vmvir, vf_reset_pending,
+        vflre, vflrec, vfre, vfte, vmecm, vmolr, vmvir, REG_QDE, VMOLR_AUPE, VMOLR_BAM,
     };
     let mut bank = FakeBank::new();
     if set_vmolr(&mut bank, 3, true).is_err() || bank.read32(vmolr(3)) != (VMOLR_BAM | VMOLR_AUPE) {
@@ -2620,9 +2617,9 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_vf_state_regs);
 fn smoke_ixgbe_vmdq_mailbox_transport() -> TestResult {
     use super::queues::RegBank;
     use super::vmdq::{
-        mailbox_clear, mailbox_has_ack, mailbox_has_msg, mailbox_lock, mailbox_read,
-        mailbox_write, mbvficr, pfmailbox, pfmbmem, MBVFICR_VFACK_VF1, MBVFICR_VFREQ_VF1,
-        PFMAILBOX_ACK, PFMAILBOX_PFU, PFMAILBOX_STS,
+        mailbox_clear, mailbox_has_ack, mailbox_has_msg, mailbox_lock, mailbox_read, mailbox_write,
+        mbvficr, pfmailbox, pfmbmem, MBVFICR_VFACK_VF1, MBVFICR_VFREQ_VF1, PFMAILBOX_ACK,
+        PFMAILBOX_PFU, PFMAILBOX_STS,
     };
     let mut bank = FakeBank::new();
     // Lock: PFU written, echoed back, accepted.
@@ -2722,10 +2719,9 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_dispatch_reset);
 fn smoke_ixgbe_vmdq_dispatch_messages() -> TestResult {
     use super::queues::RegBank;
     use super::vmdq::{
-        dispatch_vf_message, pfmbmem, rah, ral, vlvf, vlvfb, DispatchOutcome, VfTable,
-        VF_API_NEGOTIATE, VF_GET_QUEUES, VF_SET_LPE, VF_SET_MACVLAN, VF_SET_MAC_ADDR,
-        VF_SET_MULTICAST, VF_SET_VLAN, REG_MAXFRS, VLVF_VIEN, VT_MSGTYPE_ACK, VT_MSGTYPE_CTS,
-        VT_MSGTYPE_NACK,
+        dispatch_vf_message, pfmbmem, rah, ral, vlvf, vlvfb, DispatchOutcome, VfTable, REG_MAXFRS,
+        VF_API_NEGOTIATE, VF_GET_QUEUES, VF_RESET, VF_SET_LPE, VF_SET_MACVLAN, VF_SET_MAC_ADDR,
+        VF_SET_MULTICAST, VF_SET_VLAN, VLVF_VIEN, VT_MSGTYPE_ACK, VT_MSGTYPE_CTS, VT_MSGTYPE_NACK,
     };
     let mut bank = FakeBank::new();
     let mut table = VfTable::new();

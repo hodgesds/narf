@@ -517,10 +517,7 @@ impl VmdqConfig {
 /// own rings stay where bring-up put them (pool 0, queues 0/1);
 /// enabling VT does not move them — pool 0 is the PF's pool, and
 /// VF `i` owns pool `i+1`.
-pub fn enable_virtualization(
-    bank: &mut impl RegBank,
-    cfg: &VmdqConfig,
-) -> Result<(), VmdqError> {
+pub fn enable_virtualization(bank: &mut impl RegBank, cfg: &VmdqConfig) -> Result<(), VmdqError> {
     cfg.validate()?;
     // 1. TX pool layout: disable the arbiter, program MTQC, re-enable
     // (ixgbe_setup_mtqc). The SECTXMINIFG step is DCB-only; skipped.
@@ -534,7 +531,8 @@ pub fn enable_virtualization(
     let mrqc = bank.read32(REG_MRQC);
     bank.write32(REG_MRQC, (mrqc & !MRQC_MRQE_MASK) | MRQC_VMDQEN);
     // 3. Default pool + replication (ixgbe_main.c VT_CTL programming).
-    let vt = (bank.read32(REG_VT_CTL) & !VT_CTL_POOL_MASK) | vt_ctl_word(cfg.default_pool, cfg.replication);
+    let vt = (bank.read32(REG_VT_CTL) & !VT_CTL_POOL_MASK)
+        | vt_ctl_word(cfg.default_pool, cfg.replication);
     bank.write32(REG_VT_CTL, vt);
     // 4. VEB switching: VF-to-VF traffic stays on the device
     // (ixgbe_enable_sriov writes the constant directly).
@@ -546,11 +544,7 @@ pub fn enable_virtualization(
 
 /// Add `pool` to RAR `rar`'s pool bitmap (OR semantics, per
 /// `ixgbe_set_vmdq_generic`).
-pub fn assign_rar_pool(
-    bank: &mut impl RegBank,
-    rar: usize,
-    pool: usize,
-) -> Result<(), VmdqError> {
+pub fn assign_rar_pool(bank: &mut impl RegBank, rar: usize, pool: usize) -> Result<(), VmdqError> {
     if rar >= RAR_ENTRIES {
         return Err(VmdqError::BadRar);
     }
@@ -568,11 +562,7 @@ pub fn assign_rar_pool(
 }
 
 /// Remove `pool` from RAR `rar`'s pool bitmap.
-pub fn clear_rar_pool(
-    bank: &mut impl RegBank,
-    rar: usize,
-    pool: usize,
-) -> Result<(), VmdqError> {
+pub fn clear_rar_pool(bank: &mut impl RegBank, rar: usize, pool: usize) -> Result<(), VmdqError> {
     if rar >= RAR_ENTRIES {
         return Err(VmdqError::BadRar);
     }
@@ -654,7 +644,14 @@ pub fn read_rar(bank: &impl RegBank, rar: usize) -> ([u8; 6], bool) {
     }
     let lo = bank.read32(ral(rar)).to_le_bytes();
     let hi = bank.read32(rah(rar));
-    let mac = [lo[0], lo[1], lo[2], lo[3], (hi & 0xFF) as u8, ((hi >> 8) & 0xFF) as u8];
+    let mac = [
+        lo[0],
+        lo[1],
+        lo[2],
+        lo[3],
+        (hi & 0xFF) as u8,
+        ((hi >> 8) & 0xFF) as u8,
+    ];
     (mac, hi & RAH_AV != 0)
 }
 
@@ -692,23 +689,16 @@ pub fn find_vlvf_exact(bank: &impl RegBank, vlan: u16) -> Option<usize> {
             None
         };
     }
-    for i in (1..VLVF_ENTRIES).rev() {
-        if bank.read32(vlvf(i)) == want {
-            return Some(i);
-        }
-    }
-    None
+    (1..VLVF_ENTRIES)
+        .rev()
+        .find(|&i| bank.read32(vlvf(i)) == want)
 }
 
 /// Add `pool` to `vlan`'s pool set: allocate a VLVF slot if needed,
 /// set the pool's VLVFB bit, write the slot valid, and set the
 /// VLAN's VFTA bit (additive OR; see module docs for the VFTA
 /// composition rule).
-pub fn set_pool_vlan(
-    bank: &mut impl RegBank,
-    vlan: u16,
-    pool: usize,
-) -> Result<(), VmdqError> {
+pub fn set_pool_vlan(bank: &mut impl RegBank, vlan: u16, pool: usize) -> Result<(), VmdqError> {
     if vlan > 4095 {
         return Err(VmdqError::BadVlan);
     }
@@ -728,11 +718,7 @@ pub fn set_pool_vlan(
 /// VLVF entry (mirrors Linux: clearing an absent VLAN fails). When
 /// the slot's last pool leaves, the slot itself is disabled. VFTA
 /// is deliberately untouched (see module docs).
-pub fn clear_pool_vlan(
-    bank: &mut impl RegBank,
-    vlan: u16,
-    pool: usize,
-) -> Result<(), VmdqError> {
+pub fn clear_pool_vlan(bank: &mut impl RegBank, vlan: u16, pool: usize) -> Result<(), VmdqError> {
     if vlan > 4095 {
         return Err(VmdqError::BadVlan);
     }
@@ -790,12 +776,7 @@ pub fn set_vmolr(bank: &mut impl RegBank, vf: usize, aupe: bool) -> Result<(), V
 
 /// Program VF `vf`'s VLAN-insert register: tag `vid` with `qos`,
 /// always using the default VLAN (mirror `ixgbe_set_vmvir`).
-pub fn set_vmvir(
-    bank: &mut impl RegBank,
-    vf: usize,
-    vid: u16,
-    qos: u16,
-) -> Result<(), VmdqError> {
+pub fn set_vmvir(bank: &mut impl RegBank, vf: usize, vid: u16, qos: u16) -> Result<(), VmdqError> {
     if vf >= MAX_VFS {
         return Err(VmdqError::BadVf);
     }
@@ -815,11 +796,7 @@ pub fn clear_vmvir(bank: &mut impl RegBank, vf: usize) -> Result<(), VmdqError> 
 
 /// Enable or disable VF `vf`'s receive + transmit (VFRE/VFTE bits,
 /// mirror `ixgbe_set_vf_rx_tx` without the commented-out jumbo rule).
-pub fn set_vf_rx_tx(
-    bank: &mut impl RegBank,
-    vf: usize,
-    enable: bool,
-) -> Result<(), VmdqError> {
+pub fn set_vf_rx_tx(bank: &mut impl RegBank, vf: usize, enable: bool) -> Result<(), VmdqError> {
     if vf >= MAX_VFS {
         return Err(VmdqError::BadVf);
     }
@@ -851,11 +828,7 @@ pub fn set_pool_queue_drop(
 }
 
 /// Enable or disable spoofed-packet counting for VF `vf` (VMECM bit).
-pub fn set_spoof_count(
-    bank: &mut impl RegBank,
-    vf: usize,
-    enable: bool,
-) -> Result<(), VmdqError> {
+pub fn set_spoof_count(bank: &mut impl RegBank, vf: usize, enable: bool) -> Result<(), VmdqError> {
     if vf >= MAX_VFS {
         return Err(VmdqError::BadVf);
     }
@@ -917,11 +890,7 @@ pub fn mailbox_lock(bank: &mut impl RegBank, vf: usize) -> Result<(), VmdqError>
 /// Write `msg` into VF `vf`'s mailbox and ring the VF (STS bit).
 /// At most the 16-word buffer is written; longer messages are
 /// truncated to it. Callers pass 4 (RESET reply) or 16 words.
-pub fn mailbox_write(
-    bank: &mut impl RegBank,
-    vf: usize,
-    msg: &[u32],
-) -> Result<(), VmdqError> {
+pub fn mailbox_write(bank: &mut impl RegBank, vf: usize, msg: &[u32]) -> Result<(), VmdqError> {
     mailbox_lock(bank, vf)?;
     let base = pfmbmem(vf);
     for (i, w) in msg.iter().take(MBX_WORDS).enumerate() {
@@ -933,11 +902,7 @@ pub fn mailbox_write(
 
 /// Read `out.len()` words (capped at the 16-word buffer) from VF
 /// `vf`'s mailbox and acknowledge (ACK bit).
-pub fn mailbox_read(
-    bank: &mut impl RegBank,
-    vf: usize,
-    out: &mut [u32],
-) -> Result<(), VmdqError> {
+pub fn mailbox_read(bank: &mut impl RegBank, vf: usize, out: &mut [u32]) -> Result<(), VmdqError> {
     mailbox_lock(bank, vf)?;
     let base = pfmbmem(vf);
     for (i, slot) in out.iter_mut().take(MBX_WORDS).enumerate() {
@@ -1300,10 +1265,7 @@ fn negotiate_api_msg(st: &mut VfState, msg: &[u32; MBX_WORDS]) -> Result<(), Vmd
 /// `GET_QUEUES`: fill the reply's queue words (mirror
 /// `ixgbe_get_vf_queues` with no traffic classes and no PF QoS:
 /// transport-VLAN is 1 iff the VF has a PF VLAN).
-fn get_vf_queues_msg(
-    st: &VfState,
-    reply: &mut [u32; MBX_WORDS],
-) -> Result<(), VmdqError> {
+fn get_vf_queues_msg(st: &VfState, reply: &mut [u32; MBX_WORDS]) -> Result<(), VmdqError> {
     if !get_queues_accepted(st.api as u32) {
         return Err(VmdqError::BadApi);
     }
