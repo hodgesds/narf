@@ -237,8 +237,9 @@ impl ExecWire {
         // MAX_OBJECTS beside it), then i915_gem_check_execbuffer's illegal
         // flags, cliprects, DR1/DR4 and batch alignment. NARF also refuses
         // here what it cannot execute: relocations, and on the synchronous
-        // kernel path fences, with rsvd2 then zero. rsvd1's upper half is
-        // ignored: i915_gem_context_lookup takes a u32.
+        // kernel path fences. rsvd1's upper half is ignored, as
+        // i915_gem_context_lookup takes a u32, and rsvd2 is read only by
+        // the fence flags.
         if count == 0
             || count > MAX_OBJECTS
             || flags & !supported != 0
@@ -246,7 +247,6 @@ impl ExecWire {
             || cliprects
             || u32_at(&request, 20) != 0
             || (dr4 != 0 && dr4 != u32::MAX)
-            || (!explicit && u64_at(&request, 56) != 0)
             || (u32_at(&request, 12) | u32_at(&request, 16)) % 8 != 0
         {
             return Err(FsError::InvalidData);

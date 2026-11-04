@@ -141,9 +141,9 @@ impl SyncRequest {
                 .sync_file_fences(input_word as i32)
                 .ok_or(FsError::InvalidData)?;
             result.depend(fences, inputs == abi::EXEC_FENCE_SUBMIT)?;
-        } else if !result.output && u64_at(wire, 56) != 0 {
-            return Err(FsError::InvalidData);
         }
+        // Without FENCE_IN, FENCE_SUBMIT or FENCE_OUT, i915_gem_do_execbuffer
+        // never reads rsvd2: any value is ignored.
         Ok(result)
     }
 

@@ -1213,7 +1213,8 @@ flags, DRI1 cliprects without FENCE_ARRAY/USE_EXTENSIONS, DR1, DR4 other than
 UXA's 0xffffffff, batch start/length alignment), then the exec-object copy
 (EFAULT), then SECURE (ENODEV); IS_PINNED is accepted and rsvd1's upper half
 ignored. Relocations, more than 4096 objects and, on the synchronous path,
-fence flags are refused (EINVAL) with the header checks.
+fence flags are refused (EINVAL) with the header checks. rsvd2 is read only
+for FENCE_IN/SUBMIT/OUT; otherwise any value is ignored.
 `read_submission` then copies explicit synchronization once, and only after
 it resolves the objects (eb_lookup_vmas);
 `address_space(format, pat_index)` constructs immutable private PPGTT

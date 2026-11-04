@@ -666,6 +666,53 @@ kernel_test_in!(
     smoke_explicit_execbuffer_checks_and_copies_before_fences
 );
 
+/// MIT Linux b90c984d i915_gem_execbuffer.c::i915_gem_do_execbuffer:3339
+/// reads rsvd2 only for I915_EXEC_FENCE_IN/SUBMIT (lower_32_bits, the
+/// sync_file) and FENCE_OUT (the reported fd); with none of them any
+/// value is ignored, and i915_gem_check_execbuffer never looks at it.
+fn smoke_explicit_execbuffer_ignores_rsvd2_without_fence_flags() -> TestResult {
+    use crate::intel_gpu_exec::ExecRequest;
+    let file = RenderFile::new();
+    let user = Fds::new();
+    let object = file.gem.create(4096, |_, _| Ok(())).unwrap();
+    let mut entry = [0; 56];
+    put32(&mut entry, 0, object);
+    put64(&mut entry, 24, 0x20_0000);
+    put64(&mut entry, 32, 0x18);
+    user.user.store(256, &entry);
+    let store = |flags: u64| {
+        let mut request = [0; 64];
+        put64(&mut request, 0, 256);
+        put32(&mut request, 8, 1);
+        put32(&mut request, 16, 8);
+        put64(&mut request, 40, abi::EXEC_NO_RELOC | flags);
+        put64(&mut request, 56, 0xdead_beef_0000_0063);
+        user.user.store(64, &request);
+    };
+    store(0);
+    let (_, sync) = ExecRequest::read_submission(&user, 64, &file.gem, &file.syncobjs)
+        .expect("rsvd2 without fence flags");
+    assert!(!sync.output);
+    assert!(ExecRequest::read(&user, 64, &file.gem).is_ok(), "synchronous path");
+    // FENCE_OUT keeps the low half for its report.
+    store(abi::EXEC_FENCE_OUT);
+    let (_, sync) = ExecRequest::read_submission(&user, 64, &file.gem, &file.syncobjs)
+        .expect("FENCE_OUT");
+    assert!(sync.output);
+    assert_eq!(sync.input_word, 0x63);
+    // FENCE_IN does read it: fd 0x63 is no sync_file.
+    store(abi::EXEC_FENCE_IN);
+    assert_eq!(
+        ExecRequest::read_submission(&user, 64, &file.gem, &file.syncobjs).map(|_| ()),
+        Err(FsError::InvalidData)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_explicit_execbuffer_ignores_rsvd2_without_fence_flags
+);
+
 mod submit {
     include!("intel_gpu_submit_tests.rs");
 }
