@@ -425,6 +425,15 @@ impl Request {
                         object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_GFX12_DCC)
                             != 0,
                         object.byte_len,
+                        if crate::amdgpu_native_kms::linear_gem_card(&c) {
+                            let config = crate::amdgpu_info::navi22_gb_addr_config().unwrap_or(0);
+                            crate::amdgpu_dm_modifiers::TilingFlags::Gfx10_3 {
+                                pipes_log2: config & 0x7,
+                                packers_log2: (config >> 8) & 0x7,
+                            }
+                        } else {
+                            crate::amdgpu_dm_modifiers::TilingFlags::Gfx12
+                        },
                     )
                     .map_err(|_| FsError::InvalidData)?;
                     crate::drm_native_planes::check_cursor(

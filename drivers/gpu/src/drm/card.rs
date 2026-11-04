@@ -2098,8 +2098,16 @@ impl Card {
                     .find(|t| t.0 == gem_handle)
                     .map_or((0, false), |t| (t.1, t.2));
                 let formats = self.plane_formats.unwrap_or(&[]);
-                let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
-                    .map_err(|_| CardError::UnknownFormat)?;
+                let modifier = m::check_amdgpu_fb(
+                    cmd,
+                    &info,
+                    formats,
+                    tiling,
+                    dcc,
+                    bo_size,
+                    m::TilingFlags::Gfx12,
+                )
+                .map_err(|_| CardError::UnknownFormat)?;
                 let two = info.num_planes == 2;
                 (
                     [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
@@ -2225,6 +2233,17 @@ impl Card {
         let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
         let dcc = object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_GFX12_DCC) != 0;
         let formats = self.plane_formats.unwrap_or(&[]);
+        // The linear-primary card is GFX10.3 (Navi22): its BOs carry the
+        // GFX9+ tiling-flag layout, not GFX12's.
+        let layout = if linear {
+            let config = crate::amdgpu_info::navi22_gb_addr_config().unwrap_or(0);
+            m::TilingFlags::Gfx10_3 {
+                pipes_log2: config & 0x7,
+                packers_log2: (config >> 8) & 0x7,
+            }
+        } else {
+            m::TilingFlags::Gfx12
+        };
         let modifier = m::check_amdgpu_fb(
             cmd,
             &info,
@@ -2232,6 +2251,7 @@ impl Card {
             object.tiling_flags(),
             dcc,
             object.byte_len,
+            layout,
         )
         .map_err(|_| CardError::UnknownFormat)?;
         if linear
