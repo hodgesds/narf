@@ -1054,18 +1054,29 @@ static int r_zwin_tx(void) {
     static uint8_t buf[65536];
     uint64_t off = 0;
     long longest = 0;
-    int stalls = 0, max_outq = 0;
+    int stalls = 0, max_outq = 0, drained = 0;
     while (off < total) {
         size_t n = (size_t)(total - off < sizeof buf ? total - off : sizeof buf);
         rfill(buf, n, off, seed);
         long m = write(c, buf, n);
         if (m > 0) {
             off += (uint64_t)m;
+            drained = 0;
             continue;
         }
         if (m < 0 && errno != EAGAIN) return failf("zwin-tx write", (unsigned long)off, 0);
         int q = r_outq(c);
-        if (q <= 0) return failf("zwin-tx EAGAIN with an empty send queue; SIOCOUTQ", (unsigned long)q, off);
+        if (q <= 0) {
+            // EAGAIN means the queue was full at write(); SIOCOUTQ is a
+            // separate syscall, and the host may reopen its window and ACK
+            // the whole queue in between (a descheduled guest on a slow
+            // runner). Retry the write; only a queue that stays empty
+            // while writes keep failing is a real error.
+            if (++drained > 3)
+                return failf("zwin-tx EAGAIN with an empty send queue; SIOCOUTQ", (unsigned long)q, off);
+            continue;
+        }
+        drained = 0;
         if (q > max_outq) max_outq = q;
         struct pollfd p = {.fd = c, .events = POLLOUT};
         long t0 = r_ms();
