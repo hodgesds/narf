@@ -268,7 +268,7 @@ mod x86_64 {
     /// before the unmap. Before this order the store was read by nobody and
     /// freed with the frame.
     fn smoke_swap_out_store_racing_unmap_lands_in_swapped_copy() -> TestResult {
-        const BASE: u64 = 0x0000_0080_7100_0000;
+        const BASE: u64 = 0x0000_0080_3100_0000;
         if let Err(result) = swap_ready() {
             return result;
         }
@@ -359,7 +359,7 @@ mod x86_64 {
     /// completes. The retried fault after publication reads the written slot
     /// back. A remote read in the window does not keep the page.
     fn smoke_swap_out_fault_during_pending_write_waits() -> TestResult {
-        const BASE: u64 = 0x0000_0080_7120_0000;
+        const BASE: u64 = 0x0000_0080_3120_0000;
         if let Err(result) = swap_ready() {
             return result;
         }
@@ -438,7 +438,7 @@ mod x86_64 {
     /// holds), and `remap_page` refuses to rebuild a leaf over the swap
     /// entry. The batch then completes and both pages round-trip.
     fn smoke_swap_out_inflight_victim_refuses_reap_migrate_remap() -> TestResult {
-        const BASE: u64 = 0x0000_0080_7180_0000;
+        const BASE: u64 = 0x0000_0080_3180_0000;
         if let Err(result) = swap_ready() {
             return result;
         }
@@ -499,7 +499,7 @@ mod x86_64 {
     /// resident in swap, no invalidation fires, and mprotect, refused while
     /// the batch held the pages, works again; a later swap round-trips.
     fn smoke_swap_out_write_failure_restores_leaves() -> TestResult {
-        const BASE: u64 = 0x0000_0080_7140_0000;
+        const BASE: u64 = 0x0000_0080_3140_0000;
         if let Err(result) = swap_ready() {
             return result;
         }
@@ -616,7 +616,7 @@ mod x86_64 {
     /// resident with their exact leaves (the snapshot misses those bytes),
     /// releases their slots, and swaps only the untouched page.
     fn smoke_swap_out_keeps_page_reached_after_snapshot() -> TestResult {
-        const BASE: u64 = 0x0000_0080_7160_0000;
+        const BASE: u64 = 0x0000_0080_3160_0000;
         if let Err(result) = swap_ready() {
             return result;
         }

@@ -29,8 +29,20 @@ struct Seen {
     /// The interval's sequence observed inside the callback.
     stored_seq: u64,
     blockable: bool,
-    /// `cow::count` of the sampled frame inside the callback.
+    /// Reference count of the sampled frame inside the callback.
     frame_refs: u32,
+}
+
+/// The effective reference count on a frame: `cow::count` for shared or pinned
+/// frames; for an unpinned sole-owned frame, `cow::count` reports 0 (the
+/// sole owner is implicit), so fall back to `rmap::owner_count`.
+fn frame_refs(phys: PhysAddr) -> u32 {
+    let count = cow::count(phys);
+    if count == 0 && crate::rmap::owner_count(phys) > 0 {
+        1
+    } else {
+        count
+    }
 }
 
 /// Records invalidations without allocating: the callback runs with the
@@ -78,7 +90,7 @@ impl MmuIntervalNotifierOps for Recorder {
             frame_refs: if frame == 0 {
                 0
             } else {
-                cow::count(PhysAddr::new(frame))
+                frame_refs(PhysAddr::new(frame))
             },
         };
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -124,7 +136,7 @@ fn saw(seen: Option<Seen>, event: MmuNotifierEvent, start: u64, end: u64) -> boo
 }
 
 fn smoke_mmu_notifier_registration_range_filter_and_removal() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6e00_0000;
+    const BASE: u64 = 0x0000_0080_2e00_0000;
     let baseline = registered_intervals();
     let a = AddressSpace::empty();
     let b = AddressSpace::empty();
@@ -205,7 +217,7 @@ kernel_test_in!(
 /// `MAX_INTERVALS_PER_SPACE` while another still can.
 fn smoke_mmu_notifier_sorted_scan_and_per_space_cap() -> TestResult {
     use crate::mmu_notifier::MAX_INTERVALS_PER_SPACE;
-    const BASE: u64 = 0x0000_0080_6f00_0000;
+    const BASE: u64 = 0x0000_0080_2f00_0000;
     let baseline = registered_intervals();
     let a = AddressSpace::empty();
     let b = AddressSpace::empty();
@@ -262,7 +274,7 @@ fn smoke_mmu_notifier_sorted_scan_and_per_space_cap() -> TestResult {
 kernel_test_in!("memory", smoke_mmu_notifier_sorted_scan_and_per_space_cap);
 
 fn smoke_mmu_notifier_seq_read_begin_retry_protocol() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6e10_0000;
+    const BASE: u64 = 0x0000_0080_2e10_0000;
     let baseline = registered_intervals();
     let a = AddressSpace::empty();
     if a.map_region(lazy(BASE, 4, RegionPerms::READ | RegionPerms::WRITE))
@@ -327,7 +339,7 @@ kernel_test_in!("memory", smoke_mmu_notifier_seq_read_begin_retry_protocol);
 /// do not fire.
 fn smoke_mmu_notifier_fires_for_each_mapping_operation() -> TestResult {
     use MmuNotifierEvent::{Clear, ProtectionVma, Unmap};
-    const BASE: u64 = 0x0000_0080_6e20_0000;
+    const BASE: u64 = 0x0000_0080_2e20_0000;
     const MOVED: u64 = BASE + 0x40 * PAGE;
     const KEPT: u64 = BASE + 0x80 * PAGE;
     let baseline = registered_intervals();
@@ -474,7 +486,7 @@ fn frame() -> Result<PhysAddr, TestResult> {
 /// pinned frame is never returned to the allocator under its consumer.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_mmu_notifier_invalidates_before_frame_release() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6e40_0000;
+    const BASE: u64 = 0x0000_0080_2e40_0000;
     let baseline = registered_intervals();
     for pinned in [false, true] {
         let phys = match frame() {
@@ -496,7 +508,7 @@ fn smoke_mmu_notifier_invalidates_before_frame_release() -> TestResult {
         let recorder = Recorder::new();
         recorder.sample.store(phys.raw(), Ordering::SeqCst);
         let n = watch(&space, BASE, PAGE, &recorder);
-        let mapped_refs = cow::count(phys);
+        let mapped_refs = frame_refs(phys);
         if space.punch_fixed(VirtAddr::new(BASE), PAGE).is_err() {
             return TestResult::Fail("munmap");
         }
@@ -543,7 +555,7 @@ kernel_test_in!(
 /// never reach the parent's interval.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_mmu_notifier_fork_cow_break_and_child_isolation() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6e60_0000;
+    const BASE: u64 = 0x0000_0080_2e60_0000;
     let baseline = registered_intervals();
     let (f0, f1) = match (frame(), frame()) {
         (Ok(f0), Ok(f1)) => (f0, f1),
@@ -621,7 +633,7 @@ kernel_test_in!(
 /// interval once, before the space's frames are freed.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_mmu_notifier_exit_and_drop_release_intervals() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6e80_0000;
+    const BASE: u64 = 0x0000_0080_2e80_0000;
     let baseline = registered_intervals();
     let phys = match frame() {
         Ok(phys) => phys,
@@ -689,7 +701,7 @@ kernel_test_in!("memory", smoke_mmu_notifier_exit_and_drop_release_intervals);
 /// post-unmap state; none lets a stale collection pass the retry check.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_mmu_notifier_racing_reader_every_interleaving() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6ea0_0000;
+    const BASE: u64 = 0x0000_0080_2ea0_0000;
     let baseline = registered_intervals();
     // Writer position: 0 before read_begin, 1 after it, 2 between the two
     // pins, 3 after both pins, 4 after the retry check.
@@ -761,7 +773,7 @@ kernel_test_in!(
 /// invalidated by it; an unpinned move fires `Migrate` on its page.
 #[cfg(target_arch = "x86_64")]
 fn smoke_mmu_notifier_migration_refuses_pins_and_fires_on_move() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6ec0_0000;
+    const BASE: u64 = 0x0000_0080_2ec0_0000;
     let baseline = registered_intervals();
     let phys = match frame() {
         Ok(phys) => phys,
@@ -819,7 +831,7 @@ kernel_test_in!(
 /// `Clear` fires on it before its frame is freed.
 #[cfg(target_arch = "x86_64")]
 fn smoke_mmu_notifier_lazyfree_discard_fires_clear() -> TestResult {
-    const BASE: u64 = 0x0000_0080_6ee0_0000;
+    const BASE: u64 = 0x0000_0080_2ee0_0000;
     let baseline = registered_intervals();
     let phys = match frame() {
         Ok(phys) => phys,

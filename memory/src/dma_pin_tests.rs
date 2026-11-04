@@ -122,7 +122,7 @@ mod x86_64 {
     /// writes through the pin stay visible in the mapping. Once unpinned the
     /// page swaps and faults back with those bytes.
     fn smoke_dma_pin_swap_out_skips_pinned_page() -> TestResult {
-        const BASE: u64 = 0x0000_0080_6f00_0000;
+        const BASE: u64 = 0x0000_0080_2f00_0000;
         if let Err(result) = swap_ready() {
             return result;
         }
@@ -208,7 +208,7 @@ mod x86_64 {
     /// writes stay visible. The other page of the batch is swapped.
     #[cfg(feature = "kernel-test")]
     fn smoke_dma_pin_swap_commit_refuses_racing_pin() -> TestResult {
-        const BASE: u64 = 0x0000_0080_6f20_0000;
+        const BASE: u64 = 0x0000_0080_2f20_0000;
         if let Err(result) = swap_ready() {
             return result;
         }
@@ -280,7 +280,7 @@ mod x86_64 {
     /// C: the unpinned control, discarded. After the pins are released no
     /// mark survives, so a later pass keeps the device's bytes.
     fn smoke_dma_pin_lazyfree_never_discards_pinned_page() -> TestResult {
-        const BASE: u64 = 0x0000_0080_6f40_0000;
+        const BASE: u64 = 0x0000_0080_2f40_0000;
         let (space, frames) = match filled_space(BASE, &[0x51, 0x52, 0x53, 0x54]) {
             Ok(fixture) => fixture,
             Err(result) => return result,
