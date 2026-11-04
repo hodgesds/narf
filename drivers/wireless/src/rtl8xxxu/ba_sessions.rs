@@ -288,22 +288,26 @@ impl<T> Sessions<T> {
     /// single-TID BAR (`tid`, `ssn` from the BAR Control / Starting
     /// Sequence Control; the caller validates peer binding, HT
     /// association and port state): a session releases buffered MPDUs up
-    /// to the SSN and refreshes its inactivity timer; a TID without a
-    /// session returns one recipient DELBA (QSTA_REQUIRE_SETUP) per TID,
-    /// never one per BAR. Returns (released items, DELBA bodies).
+    /// to the SSN and, only when the BAR advances the session head,
+    /// refreshes its inactivity timer; a stale BAR behind the head is
+    /// ignored in full, so it must not postpone the QSTA_TIMEOUT purge.
+    /// A TID without a session returns one recipient DELBA
+    /// (QSTA_REQUIRE_SETUP) per TID, never one per BAR. Returns
+    /// (released items, DELBA bodies).
     pub(super) fn bar(&mut self, tid: u8, ssn: u16, now: u64) -> (Vec<T>, Vec<Vec<u8>>) {
         if tid >= 8 {
             return (Vec::new(), Vec::new());
         }
         let i = usize::from(tid);
         if let Some(session) = self.rx[i].as_mut() {
-            if session.timeout_tu != 0 {
-                session.last_rx = now;
-            }
+            let head_before = session.reorder.head();
             let released = session
                 .reorder
                 .advance(ssn, now.saturating_mul(1_000_000))
                 .unwrap_or_default();
+            if session.timeout_tu != 0 && session.reorder.head() != head_before {
+                session.last_rx = now;
+            }
             return (released, Vec::new());
         }
         if self.unexpected_ba & (1 << tid) != 0 {
