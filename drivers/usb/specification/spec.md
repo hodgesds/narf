@@ -393,8 +393,18 @@ also consult upstream Linux GPL sources.
   maxpacket == 0`); RX parses concatenated-frame bulk buffers with
   a trailing `rx_hdr` (`pkt_cnt`/`hdr_off`) and per-packet metadata
   (CRC/DROP errors and runts dropped, dummy headers skipped).
-  Link-status interrupt, offload advertisement, multicast filter,
-  VLAN, and jumbo frames are follow-ups, not v1.
+  Audit item 2 is implemented on top: the interrupt-IN endpoint
+  (found by the shared r8152 finder walk) feeds a status task
+  that decodes the link bit (first word, bit 16) and, on
+  link-up, runs the Linux link-change sequence (TX FIFO quiesce
+  poll, PHYSICAL_LINK_STATUS + PHYSR read, bulkin/medium
+  programming, speed + duplex reporting); TX checksum offload
+  is advertised (`tx_checksum`, RX checksum deliberately not —
+  no verdict channel in `on_rx_frame_from`) and the multicast
+  filter is programmed via the stack's `DeviceControl` hook
+  (Linux `set_multicast` semantics, `ether_crc` filter hash).
+  VLAN and jumbo frames remain follow-ups (ungrounded per
+  audit §6).
 - `r8152` installs an `iface::DeviceControl` at bind, so registry
   MTU changes validate against the chip version (68..=1500 for
   FE / unknown versions, 68..=9194 / 15338 / 16362 for the GbE
